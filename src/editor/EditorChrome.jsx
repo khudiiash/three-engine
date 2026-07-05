@@ -7,7 +7,7 @@ import {
   duplicateSelection,
   deleteSelection,
 } from "./clipboard.js";
-import { newScene, openScene, saveScene, restoreLastScene, hasScenePath } from "./sceneIO.js";
+import { openScene, saveScene, restoreLastScene, hasScenePath } from "./sceneIO.js";
 import { useSceneStore } from "./store/sceneStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { useProjectStore } from "./store/projectStore.js";
@@ -34,8 +34,17 @@ export function EditorChrome() {
         // deserializes, or module components load as inert "missing" data.
         const { syncProjectModules } = await import("./modules.js");
         await syncProjectModules().catch((err) => console.error(`Modules: ${err.message ?? err}`));
+        // Apply saved input config (if any) before scene load so scripts
+        // can read bindings during their first onUpdate.
+        const { useProjectStore } = await import("./store/projectStore.js");
+        const input = useProjectStore.getState().projectMeta?.input;
+        if (input) engine.applyInput(input);
         const restored = await restoreLastScene();
-        if (!restored) await newScene();
+        // If nothing can be restored, leave the engine empty — the user picks
+        // the opening scene via File → New Scene or Open Scene…. Auto-creating
+        // a scene here silently spawned stray "Main 1.scene"/"Main 2.scene"
+        // files whenever the saved main/last scene was missing or moved.
+        void restored;
         console.log("Editor ready");
       }
       // Project settings (script hot reload, pixel ratio cap, grid/snap…)

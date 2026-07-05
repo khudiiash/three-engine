@@ -98,6 +98,7 @@ export function MenuBar() {
       { label: "Scene Settings", action: () => openPanel("sceneSettings") },
       { label: "Project Settings", action: () => openPanel("projectSettings") },
       { label: "Modules", action: () => openPanel("modules") },
+      { label: "Input", action: () => openPanel("input") },
       { separator: true },
       { label: "Reset Layout", action: () => resetLayout() },
     ],

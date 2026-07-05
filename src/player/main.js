@@ -18,7 +18,7 @@ const scriptCache = new Map();
 setScriptLoader(async (path) => {
   let entry = scriptCache.get(path);
   if (!entry) {
-    const code = linkEngineImports(await (await fetch(path)).text());
+    const code = await linkEngineImports(await (await fetch(path)).text());
     const url = URL.createObjectURL(new Blob([code], { type: "text/javascript" }));
     try {
       const mod = await import(/* @vite-ignore */ url);
@@ -47,6 +47,9 @@ async function boot() {
   const scene = await (await fetch("scene.json")).json();
   // Modules first: their components must exist before entities instantiate.
   await applyEngineModules(engine, scene.modules ?? []);
+  // Input config next — the manager is attached during init(), so swapping
+  // the snapshot detaches/re-attaches to keep listeners consistent.
+  if (scene.input) engine.applyInput(scene.input);
   deserializeScene(engine, scene);
 
   // Project settings embedded at export time.

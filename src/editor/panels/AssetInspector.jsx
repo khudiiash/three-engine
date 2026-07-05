@@ -9,6 +9,7 @@ import { TEXTURE_META_DEFAULTS } from "../../engine/textureMeta.js";
 import { refreshMaterialsUsingTexture } from "../../engine/materialAsset.js";
 import { MaterialEditor } from "./MaterialPanel.jsx";
 import { openPanel } from "../EditorShell.jsx";
+import { syncScriptClassNameAfterRename } from "../scriptClassSync.js";
 
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
 const stemOf = (name) => name.replace(/\.[^.]+$/, "");
@@ -45,6 +46,9 @@ async function renameAsset(path, newStem) {
     await invoke("rename_path", { from: path, to: newPath });
     // Keep texture import settings attached across the rename.
     await invoke("rename_path", { from: `${path}.meta`, to: `${newPath}.meta` }).catch(() => {});
+    // Scripts: keep the default-exported class name in sync with the new
+    // filename stem, and inject `extends Script` if missing.
+    await syncScriptClassNameAfterRename(newPath, name);
     await useProjectStore.getState().refresh();
     useSelectionStore.getState().selectAsset(newPath);
     console.log(`Renamed to ${fileName(newPath)}`);

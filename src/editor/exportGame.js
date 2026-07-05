@@ -31,6 +31,8 @@ export async function exportGame() {
   // deserializing (their components must be registered to instantiate).
   const { useModulesStore } = await import("./modules.js");
   scene.modules = [...useModulesStore.getState().enabled];
+  // Input config rides along — the player applies it on boot.
+  scene.input = engine.input.toJSON();
   const assets = new Map(); // absolute source -> relative dest
   const scriptPaths = new Set(); // scripts ship transpiled, not copied
   const materialPaths = new Set(); // .mat files ship with rewritten texture paths

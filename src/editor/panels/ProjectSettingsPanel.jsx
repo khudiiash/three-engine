@@ -1,7 +1,44 @@
 import { useEffect, useState } from "react";
-import { Save } from "lucide-react";
+import { Save, X } from "lucide-react";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { getProjectSettings, saveProjectSettings } from "../projectSettings.js";
+import { currentScenePath } from "../sceneIO.js";
+
+const MAIN_SCENE_KEY = "mainScene";
+
+/** Project-relative path used as the boot scene. Stored on projectMeta
+ *  alongside lastScene (same shape), not in `settings`. */
+function projectRelative(root, absPath) {
+  const norm = (p) => p.replaceAll("\\", "/");
+  const r = norm(root);
+  const p = norm(absPath);
+  return p.toLowerCase().startsWith(`${r.toLowerCase()}/`) ? p.slice(r.length + 1) : absPath;
+}
+
+/** Normalize a user-typed main-scene path into the form we store and boot from:
+ *  forward slashes, no leading "./" or "/", no trailing slash, lowercase
+ *  extension preserved (the editor treats both .scene and .json as scenes). */
+function normalizeMainPath(raw) {
+  if (!raw) return "";
+  let p = String(raw).replaceAll("\\", "/").trim();
+  while (p.startsWith("./")) p = p.slice(2);
+  while (p.startsWith("/")) p = p.slice(1);
+  while (p.endsWith("/") && p.length > 1) p = p.slice(0, -1);
+  return p;
+}
+
+/** Async stat — does the file exist at this path? Catches both stale saved
+ *  values and user typos before the editor silently fails on boot. */
+async function pathExists(absPath) {
+  if (!absPath) return false;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("stat_file", { path: absPath });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function Row({ label, children }) {
   return (
@@ -37,12 +74,42 @@ function Num({ value, onChange, min, max, step = 0.1 }) {
 export function ProjectSettingsPanel() {
   const rootPath = useProjectStore((s) => s.rootPath);
   const projectName = useProjectStore((s) => s.projectMeta?.name);
+  const mainScene = useProjectStore((s) => s.projectMeta?.mainScene ?? "");
   const [settings, setSettings] = useState(null);
   const [dirty, setDirty] = useState(false);
+  const [mainDraft, setMainDraft] = useState(mainScene);
+  const [mainDirty, setMainDirty] = useState(false);
+  // null = unknown/checking, true = exists, false = missing
+  const [mainValid, setMainValid] = useState(null);
 
   useEffect(() => {
     if (rootPath) setSettings(getProjectSettings());
   }, [rootPath]);
+
+  useEffect(() => {
+    setMainDraft(mainScene);
+    setMainDirty(false);
+  }, [mainScene, rootPath]);
+
+  // Live-validate the typed (or saved) path so the user sees "missing" before
+  // they hit Save — and so they understand why the editor refuses to open it.
+  useEffect(() => {
+    if (!rootPath) return;
+    const value = normalizeMainPath(mainDirty ? mainDraft : mainScene);
+    if (!value) {
+      setMainValid(null); // empty = cleared, not an error
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      const ok = await pathExists(`${rootPath}/${value}`);
+      if (!cancelled) setMainValid(ok);
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [mainDraft, mainScene, mainDirty, rootPath]);
 
   if (!rootPath) {
     return <div className="inspector-panel empty">Open a project to edit its settings.</div>;
@@ -64,7 +131,51 @@ export function ProjectSettingsPanel() {
     }
   };
 
+  const saveMainScene = async () => {
+    const value = normalizeMainPath(mainDraft);
+    try {
+      await useProjectStore.getState().updateMeta({ [MAIN_SCENE_KEY]: value });
+      setMainDraft(value);
+      setMainDirty(false);
+      console.log(value ? `Main scene set: ${value}` : "Main scene cleared");
+    } catch (err) {
+      console.error(`Failed to set main scene: ${err}`);
+    }
+  };
+
+  const useCurrentAsMain = async () => {
+    const abs = currentScenePath();
+    if (!abs) return;
+    const rel = projectRelative(rootPath, abs);
+    setMainDraft(rel);
+    try {
+      await useProjectStore.getState().updateMeta({ [MAIN_SCENE_KEY]: rel });
+      setMainDirty(false);
+      console.log(`Main scene set to current: ${rel}`);
+    } catch (err) {
+      console.error(`Failed to set main scene: ${err}`);
+    }
+  };
+
+  const clearMainScene = async () => {
+    setMainDraft("");
+    try {
+      await useProjectStore.getState().updateMeta({ [MAIN_SCENE_KEY]: "" });
+      setMainDirty(false);
+    } catch (err) {
+      console.error(`Failed to clear main scene: ${err}`);
+    }
+  };
+
   const { editor, scripts, rendering, game } = settings;
+  const mainValue = normalizeMainPath(mainDirty ? mainDraft : mainScene);
+  const mainHint = !mainValue
+    ? "No main scene set — boot will fall back to the last-edited scene."
+    : mainValid === false
+      ? `File not found: ${rootPath}/${mainValue}`
+      : mainValid === true
+        ? `Opens on editor boot: ${mainValue}`
+        : "Checking…";
 
   return (
     <div className="inspector-panel scene-settings-panel">
@@ -130,6 +241,59 @@ export function ProjectSettingsPanel() {
             placeholder={projectName ?? basename(rootPath)}
             onChange={(e) => patch("game", { title: e.target.value })}
           />
+        </Row>
+        <Row label="Main scene">
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, width: "100%" }}>
+            <div style={{ display: "flex", gap: 4, width: "100%" }}>
+              <input
+                className="text-field"
+                type="text"
+                value={mainDraft}
+                placeholder="scenes/main.scene"
+                onChange={(e) => {
+                  setMainDraft(e.target.value);
+                  setMainDirty(normalizeMainPath(e.target.value) !== normalizeMainPath(mainScene));
+                }}
+                style={{ flex: 1 }}
+              />
+              {mainDirty ? (
+                <button
+                  className="toolbar-btn"
+                  title="Save the typed path as the main scene"
+                  disabled={mainValid === false}
+                  onClick={saveMainScene}
+                >
+                  <Save size={13} />
+                </button>
+              ) : null}
+              <button
+                className="toolbar-btn"
+                title="Use the currently open scene as the main scene"
+                disabled={!currentScenePath()}
+                onClick={useCurrentAsMain}
+              >
+                Use current
+              </button>
+              {mainScene ? (
+                <button
+                  className="toolbar-btn"
+                  title="Clear main scene (boot will fall back to last-edited scene)"
+                  onClick={clearMainScene}
+                >
+                  <X size={13} />
+                </button>
+              ) : null}
+            </div>
+            <span
+              className="asset-hint"
+              style={{
+                color: mainValid === false ? "var(--danger, #e26d6d)" : undefined,
+                padding: "0 2px",
+              }}
+            >
+              {mainHint}
+            </span>
+          </div>
         </Row>
       </div>
 

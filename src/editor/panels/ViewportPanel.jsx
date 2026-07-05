@@ -38,6 +38,7 @@ const viewport = {
   gizmo: null,
   selectionBox: null,
   cameraHelper: null,
+  lightHelper: null,
   cameraPreview: null,
   helpers: null,
   grid: null,
@@ -99,12 +100,25 @@ async function ensureViewport() {
         viewport.orbit.update();
         viewport.selectionBox?.update();
         viewport.cameraHelper?.update();
+        // The light helper samples the live THREE.Light on every update(), so
+        // calling it each frame keeps the cone / arrow aligned with the
+        // entity's current transform and the spot angle in sync with the
+        // component props. Per-frame is overkill for static lights, but
+        // cost is negligible (a handful of vector writes).
+        viewport.lightHelper?.update();
         // Re-resolve "follow target" before the main render so the
         // PIP preview and the orbit view both see the post-follow
         // camera pose. In play mode the engine.camera is the scene
         // camera itself; in editor mode it's the orbit camera (which
         // isn't affected). Cheap enough to run unconditionally.
         applyCameraFollow();
+        // Refresh the camera matrix and the gizmo helper's matrix world here
+        // so pointer events received between this tick and the render still see
+        // fresh transform data. Without this, a pointermove fired right after
+        // a `dragging-changed` toggle could raycast against a camera matrix
+        // from two frames ago, missing the picker meshes entirely.
+        viewport.camera.updateMatrixWorld();
+        viewport.gizmo?.getHelper()?.updateMatrixWorld();
       });
 
       engine.start();
@@ -140,9 +154,22 @@ function setupGizmo(canvas) {
   // gizmo's own raycaster — pointerHover finds nothing, `axis` stays
   // null, pointerDown bails out, and the visible arrows never react.
   gizmo.getRaycaster().layers.enableAll();
-  engine.scene.add(gizmo.getHelper());
-  gizmo.getHelper().userData.editorOnly = true;
-  putOnEditorLayer(gizmo.getHelper());
+  const helper = gizmo.getHelper();
+  // The helper's `updateMatrixWorld` cancels out the parent's transform so
+  // the gizmo stays world-aligned, which depends on its parent (engine.scene)
+  // having a current matrixWorld. Scene defaults to identity so this is fine,
+  // but we still call it once so the first `pointermove` doesn't have to wait
+  // a frame before the picker positions are at the entity location.
+  helper.matrixAutoUpdate = true;
+  helper.updateMatrixWorld(true);
+  engine.scene.add(helper);
+  helper.userData.editorOnly = true;
+  putOnEditorLayer(helper);
+  // Force the camera matrix to be fresh so the gizmo's internal raycaster
+  // uses the latest view the very first time pointerHover runs. Cheap, but
+  // prevents any "stale matrixWorld between init and the first pointer event"
+  // class of bug from blocking axis detection.
+  viewport.camera.updateMatrixWorld(true);
 
   let beforeTransform = null;
   gizmo.addEventListener("dragging-changed", (e) => {
@@ -172,6 +199,21 @@ function setupGizmo(canvas) {
 
   useSelectionStore.subscribe((state) => attachSelection(state.ids[0] ?? null));
   engine.on("play-changed", () => attachSelection(useSelectionStore.getState().ids[0] ?? null));
+  // Rebuild the light helper when the selected light's `kind` changes —
+  // the component replaces its underlying THREE.Light instance on kind
+  // change (onPropChanged detaches+reattaches), so any helper bound to
+  // the previous light would render against stale geometry. Other prop
+  // changes (color, angle, distance, intensity) mutate the existing
+  // light in place and are picked up by the per-frame helper.update().
+  engine.on("component-changed", ({ entityId, componentType, key }) => {
+    if (componentType !== "light" || key !== "kind") return;
+    const selectedId = useSelectionStore.getState().ids[0];
+    if (entityId !== selectedId) return;
+    const entity = engine.getEntity(entityId);
+    const lightComponent = entity?.getComponent?.("light");
+    if (lightComponent) attachLightHelper(lightComponent);
+    else detachLightHelper();
+  });
 }
 
 /** First entity (depth-first) carrying a camera component, or null. */
@@ -194,6 +236,7 @@ function setupPlayCamera() {
     if (viewport.helpers) viewport.helpers.visible = !playing;
     viewport.gizmo?.getHelper() && (viewport.gizmo.getHelper().visible = !playing);
     if (viewport.cameraHelper) viewport.cameraHelper.visible = !playing;
+    if (viewport.lightHelper) viewport.lightHelper.visible = !playing;
     if (viewport.cameraPreview) viewport.cameraPreview.setVisible(!playing);
 
     if (playing) {
@@ -483,6 +526,7 @@ function attachSelection(entityId) {
     viewport.selectionBox = null;
   }
   detachCameraHelper();
+  detachLightHelper();
   // UI entities get a 2D rect outline (drawn by the UiSystem overlay pass)
   // instead of the 3D gizmo + bounding box.
   const uiSystem = getUiSystem(engine, { create: false });
@@ -492,15 +536,27 @@ function attachSelection(entityId) {
     viewport.cameraPreview?.setCamera(null);
     return;
   }
+  // Make sure the entity's matrixWorld is current before we attach. Without
+  // this, the very first frame after selection would show the gizmo arrows
+  // at the entity's OLD world position (wherever it was on the previous
+  // render), and any pointermove fired before the next render would raycast
+  // against that stale position — making the gizmo look broken for one
+  // frame after every selection change.
+  entity.object3D.updateMatrixWorld(true);
   viewport.gizmo.attach(entity.object3D);
+  // Pull the gizmo helper's matrix world up to date immediately so its
+  // picker meshes are at the entity's position right away, instead of
+  // one frame later.
+  viewport.gizmo.getHelper().updateMatrixWorld(true);
   const cameraComponent = entity.getComponent?.("camera");
+  const lightComponent = entity.getComponent?.("light");
   // Cameras skip the bounding-box outline: the entity itself is a single
   // Object3D whose only children are the PerspectiveCamera and the
   // editor-only model mesh, so a Box3 over the subtree just brackets the
   // lens/body silhouette and clutters the view. The frustum helper
   // (attached below) already shows the camera's position + facing, which
   // is the visual cue users actually want for a camera entity.
-  if (!cameraComponent?.camera) {
+  if (!cameraComponent?.camera && !lightComponent?.light) {
     const bounds = new THREE.Box3().setFromObject(entity.object3D);
     if (!bounds.isEmpty()) {
       viewport.selectionBox = new THREE.BoxHelper(entity.object3D, 0x4da3ff);
@@ -524,6 +580,9 @@ function attachSelection(entityId) {
   } else {
     viewport.cameraPreview?.setCamera(null);
   }
+  if (lightComponent?.light) {
+    attachLightHelper(lightComponent);
+  }
 }
 
 /** Adds a CameraHelper (frustum lines) for the given three.js camera. */
@@ -545,6 +604,52 @@ function detachCameraHelper() {
   engine.scene.remove(viewport.cameraHelper);
   viewport.cameraHelper.dispose();
   viewport.cameraHelper = null;
+}
+
+/**
+ * Builds the editor-only visualization for the currently selected light
+ * entity. The shape depends on the light's kind, matching what three.js's
+ * built-in helpers were designed for:
+ *
+ *   - directional -> DirectionalLightHelper (arrow + planes)
+ *   - spot        -> SpotLightHelper        (cone)
+ *   - point       -> PointLightHelper       (small wireframe sphere)
+ *   - ambient     -> no helper (no spatial meaning)
+ *
+ * The helper is parented to `engine.scene` (not the entity) because the
+ * underlying three.js helpers reach up to the *light's* matrixWorld when
+ * `update()` runs; an extra indirection through the entity would just
+ * duplicate the same transform without buying anything. Tagging
+ * `userData.entityId` lets `findEntityId` resolve a click on the helper
+ * back to the owning entity so users can re-select it.
+ */
+function attachLightHelper(lightComponent) {
+  detachLightHelper();
+  const light = lightComponent.light;
+  if (!light) return;
+  const kind = lightComponent.props.kind;
+  let helper = null;
+  if (kind === "directional" && light.isDirectionalLight) {
+    helper = new THREE.DirectionalLightHelper(light, 5);
+  } else if (kind === "spot" && light.isSpotLight) {
+    helper = new THREE.SpotLightHelper(light, 5);
+  } else if (kind === "point" && light.isPointLight) {
+    helper = new THREE.PointLightHelper(light, 0.3);
+  }
+  if (!helper) return;
+  helper.userData.editorOnly = true;
+  helper.userData.entityId = lightComponent.entity.id;
+  helper.update();
+  putOnEditorLayer(helper);
+  engine.scene.add(helper);
+  viewport.lightHelper = helper;
+}
+
+function detachLightHelper() {
+  if (!viewport.lightHelper) return;
+  engine.scene.remove(viewport.lightHelper);
+  viewport.lightHelper.dispose?.();
+  viewport.lightHelper = null;
 }
 
 function setupPicking(canvas) {

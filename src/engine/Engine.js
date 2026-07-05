@@ -2,6 +2,8 @@ import * as THREE from "three/webgpu";
 import { EventEmitter } from "./EventEmitter.js";
 import { Entity } from "./Entity.js";
 import { SCENE_SETTINGS_DEFAULTS, mergeSettings, applySettingsToScene } from "./sceneSettings.js";
+import { InputManager } from "./input/index.js";
+import { createDefaultMaps } from "./input/defaultMaps.js";
 
 /**
  * Runtime core: owns the renderer, the three.js scene (source of truth)
@@ -30,6 +32,26 @@ export class Engine extends EventEmitter {
     // Host-tunable runtime behavior (the editor writes project settings here).
     this.config = { scriptHotReload: true, scriptReloadIntervalMs: 750 };
 
+    // Input: built by default with the Player/UI maps enabled; an editor-
+    // provided snapshot (applyInput) replaces it. Attached once the canvas
+    // exists (see init()).
+    // Vector2 factory passed to the InputManager so `readValue("Move")` returns a
+    // real `THREE.Vector2` instance (with `.length()`, `.normalize()`, …) instead
+    // of a plain `{ x, y }` object. The factory is also threaded through
+    // `applyInput()` below so a deserialized snapshot behaves the same way.
+    this.input = new InputManager({
+      Vector2: THREE.Vector2,
+      // Vec2 actions with `space: "camera"` are rotated by `engine.camera`
+      // each tick. The provider is a closure so swapping `engine.camera`
+      // (e.g. on scene change) takes effect immediately — no need to
+      // re-register the manager.
+      cameraProvider: () => this.camera,
+    });
+    for (const m of createDefaultMaps()) this.input.addActionMap(m);
+    this.input.enableMap("Player");
+    this.input.enableMap("UI");
+    this._inputTickUnsub = null; // tracked so applyInput can swap it cleanly
+
     // Scene environment settings (serialized with the scene). The ambient
     // light is engine-owned — not an entity, so it never serializes twice.
     this.settings = structuredClone(SCENE_SETTINGS_DEFAULTS);
@@ -50,7 +72,40 @@ export class Engine extends EventEmitter {
   setPlaying(playing) {
     if (playing === this.playing) return;
     this.playing = playing;
+    if (!playing) this.input.reset();
     this.emit("play-changed", playing);
+  }
+
+  /**
+   * Replaces the engine's input maps with a JSON snapshot (the form
+   * InputManager.toJSON() produces). If `json` is null, restores the
+   * built-in Player/UI defaults. Existing map definitions are removed.
+   */
+  applyInput(json) {
+    const old = this.input;
+    old.detach();
+    this._inputTickUnsub?.();
+    this._inputTickUnsub = null;
+    const next = json
+      ? InputManager.fromJSON(json, { Vector2: THREE.Vector2, cameraProvider: () => this.camera })
+      : new InputManager({
+          virtualJoysticks: "auto",
+          virtualJoystickTheme: "dark",
+          Vector2: THREE.Vector2,
+          cameraProvider: () => this.camera,
+        });
+    if (!json) {
+      for (const m of createDefaultMaps()) next.addActionMap(m);
+      next.enableMap("Player");
+      next.enableMap("UI");
+    } else {
+      // Restore the stack too — fromJSON carries it.
+      for (const name of next.stack) next.enableMap(name);
+    }
+    next.attach(this.renderer?.domElement ?? this.canvas);
+    this._inputTickUnsub = this.onUpdate((dt) => next.tick(dt));
+    this.input = next;
+    this.emit("input-changed", next);
   }
 
   async init(canvas) {
@@ -68,6 +123,11 @@ export class Engine extends EventEmitter {
     // Renderer-side settings (tone mapping, shadows) couldn't apply earlier.
     applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
     this.rendererReady = true;
+    // Wire input once the canvas exists (the manager listens on it directly).
+    if (!this.input.attached) {
+      this.input.attach(canvas);
+      this._inputTickUnsub = this.onUpdate((dt) => this.input.tick(dt));
+    }
     return this.getBackendName();
   }
 
@@ -166,6 +226,9 @@ export class Engine extends EventEmitter {
   dispose() {
     this.stop();
     this.clear();
+    this._inputTickUnsub?.();
+    this._inputTickUnsub = null;
+    this.input.detach();
     this.rendererReady = false;
     this.renderer?.dispose();
     this.renderer = null;

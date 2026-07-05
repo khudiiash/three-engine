@@ -18,6 +18,7 @@ const AnimatorPanel = lazy(() => import("./panels/AnimatorPanel.jsx").then((m) =
 const SceneSettingsPanel = lazy(() => import("./panels/SceneSettingsPanel.jsx").then((m) => ({ default: m.SceneSettingsPanel })));
 const ProjectSettingsPanel = lazy(() => import("./panels/ProjectSettingsPanel.jsx").then((m) => ({ default: m.ProjectSettingsPanel })));
 const ModulesPanel = lazy(() => import("./panels/ModulesPanel.jsx").then((m) => ({ default: m.ModulesPanel })));
+const InputPanel = lazy(() => import("./panels/InputPanel.jsx").then((m) => ({ default: m.InputPanel })));
 
 const panelComponents = {
   viewport: ViewportPanel,
@@ -32,6 +33,7 @@ const panelComponents = {
   sceneSettings: SceneSettingsPanel,
   projectSettings: ProjectSettingsPanel,
   modules: ModulesPanel,
+  input: InputPanel,
 };
 
 // The chrome (menu bar + scene/keyboard bootstrap) is lazy-loaded behind a
@@ -58,6 +60,7 @@ export const PANEL_SPECS = {
   sceneSettings: { title: "Scene Settings", position: { referencePanel: "inspector", direction: "within" } },
   projectSettings: { title: "Project Settings", position: { referencePanel: "inspector", direction: "within" } },
   modules: { title: "Modules", position: { referencePanel: "inspector", direction: "within" } },
+  input: { title: "Input", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 280 },
 };
 
 let dockApi = null;

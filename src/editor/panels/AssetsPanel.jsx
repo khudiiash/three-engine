@@ -29,6 +29,8 @@ import {
 import { MATERIAL_DEFAULTS } from "../../engine/materialAsset.js";
 import { openScenePath } from "../sceneIO.js";
 import { armAssetDrag, useAssetDrop, consumeAssetDragClick } from "../assetDrag.js";
+import { stemToClassName, syncScriptClassNameAfterRename } from "../scriptClassSync.js";
+import { scaffoldProjectTypes } from "../projectTypes.js";
 
 const ICON_BY_EXT = {
   glb: Box,
@@ -103,10 +105,18 @@ async function renameEntry(entry, newName) {
   const name = newName.trim();
   if (!name || name === entry.name) return;
   const dir = entry.path.slice(0, entry.path.length - entry.name.length);
+  const newPath = `${dir}${name}`;
   try {
-    await invoke("rename_path", { from: entry.path, to: `${dir}${name}` });
+    await invoke("rename_path", { from: entry.path, to: newPath });
     // Keep texture import settings attached across the rename.
-    await invoke("rename_path", { from: `${entry.path}.meta`, to: `${dir}${name}.meta` }).catch(() => {});
+    await invoke("rename_path", { from: `${entry.path}.meta`, to: `${newPath}.meta` }).catch(() => {});
+
+    // Scripts: rewrite the default-exported class name to match the new
+    // filename stem, and inject `extends Script` if the script predates the
+    // engine base class.
+    const newStem = name.replace(/\.(ts|js)$/i, "");
+    await syncScriptClassNameAfterRename(newPath, newStem);
+
     await useProjectStore.getState().refresh();
   } catch (err) {
     console.error(`Rename failed: ${err}`);
@@ -131,10 +141,12 @@ async function moveIntoFolder(sourcePath, destDir) {
   }
 }
 
-const SCRIPT_TEMPLATE = `import { attribute } from "engine";
+/** Template with a placeholder for the class name; filled in by createScript(). */
+const SCRIPT_TEMPLATE = (className) => `import { Script, attribute } from "engine";
 
-// this.entity, this.engine and this.THREE are injected before any hook runs.
-export default class NewScript {
+// this.entity, this.engine, this.THREE and this.input are injected before
+// any hook runs. Extending Script gives them full TypeScript autocomplete.
+export default class ${className} extends Script {
   @attribute({ type: "number", default: 1, min: 0, max: 10, step: 0.1 })
   speed = 1;
 
@@ -150,7 +162,17 @@ export default class NewScript {
 }
 `;
 
-const createScript = () => createAssetFile("NewScript.ts", SCRIPT_TEMPLATE);
+const createScript = () => {
+  const { entries } = useProjectStore.getState();
+  // Reserve a unique filename first so we can derive a matching class name
+  // (the filename's stem drives the class name on disk + in autocomplete).
+  const baseStem = "NewScript";
+  const baseName = `${baseStem}.ts`;
+  const finalName = uniqueName(baseName, entries);
+  const stem = finalName.replace(/\.(ts|js)$/i, "");
+  const className = stemToClassName(stem);
+  return createAssetFile(baseName, SCRIPT_TEMPLATE(className));
+};
 const createMaterial = () =>
   createAssetFile("NewMaterial.mat", JSON.stringify(MATERIAL_DEFAULTS, null, 2));
 
@@ -393,6 +415,18 @@ export function AssetsPanel() {
 
   useEffect(() => {
     if (!rootPath) useProjectStore.getState().restoreLastFolder();
+  }, [rootPath]);
+
+  // Ensure the engine's .d.ts files are present in the project root so the
+  // user's IDE provides `this.entity` / `this.engine` autocomplete when they
+  // open a script. Idempotent — only writes files that are missing or stale.
+  // Runs on every Assets-panel mount so newly-opened projects (and ones
+  // opened before the bootstrap was added) get up to date types.
+  useEffect(() => {
+    if (!rootPath) return;
+    scaffoldProjectTypes(rootPath).catch((err) => {
+      console.warn(`Could not scaffold engine types into ${rootPath}: ${err}`);
+    });
   }, [rootPath]);
 
   // OS-file drag-drop import. Tauri intercepts native file drags (HTML5 drop

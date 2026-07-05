@@ -63,12 +63,13 @@ export class ScriptComponent extends Component {
     }
   }
 
-  /** Scripts are their own context: this.entity / this.engine / this.THREE. */
+  /** Scripts are their own context: this.entity / this.engine / this.THREE / this.input. */
   #bind(instance) {
     if (!instance) return instance;
     instance.entity = this.entity;
     instance.engine = this.entity.engine;
     instance.THREE = THREE;
+    instance.input = this.entity.engine.input;
     return instance;
   }
 

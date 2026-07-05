@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { scaffoldProjectTypes } from "../projectTypes.js";
 
 const ROOT_KEY = "engine.projectRoot.v1";
 
@@ -49,6 +50,12 @@ export const useProjectStore = create((set, get) => ({
       // Not a project created by the hub (or unreadable) — treat as empty meta.
     }
     set({ rootPath: path, recent, projectMeta });
+    // Make sure the engine's TS typings are present so the user's IDE
+    // provides `this.entity` / `this.engine` autocomplete when they open
+    // a script. Idempotent — safe to call on every open.
+    scaffoldProjectTypes(path).catch((err) => {
+      console.warn(`Could not scaffold engine types into ${path}: ${err}`);
+    });
     await get().navigate(path);
     return true;
   },

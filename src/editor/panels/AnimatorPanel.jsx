@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Plus, Save, Play, Trash2 } from "lucide-react";
+import { Plus, Save, Play, Trash2, Zap } from "lucide-react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -217,6 +217,121 @@ function ParamAddButton({ onPick }) {
         </>
       )}
     </>
+  );
+}
+
+/**
+ * Live parameter playground: edits flow straight into the bound entity's
+ * animator runtime, so the user can verify their transition conditions by
+ * typing values and watching the active state change. The section re-reads
+ * param values on every animation frame so consumed triggers and script
+ * writes are reflected immediately.
+ */
+function ParamValuesSection({ parameters, component, options, onPickComponent }) {
+  // rAF tick to refresh displayed values. Triggers get consumed by the
+  // runtime after a transition fires; we need to see that "true → false"
+  // transition without manual refresh.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!component?.runtime) return;
+    let alive = true;
+    const loop = () => {
+      if (!alive) return;
+      setTick((t) => (t + 1) & 0xffff);
+      requestAnimationFrame(loop);
+    };
+    const id = requestAnimationFrame(loop);
+    return () => {
+      alive = false;
+      cancelAnimationFrame(id);
+    };
+  }, [component]);
+
+  if (!component) {
+    return (
+      <div className="inspector-section">
+        <div className="section-header">Live Values</div>
+        <div className="asset-hint">No entity in the scene uses this controller — add an Animation component first.</div>
+      </div>
+    );
+  }
+  if (!component.runtime) {
+    return (
+      <div className="inspector-section">
+        <div className="section-header">Live Values</div>
+        <div className="asset-hint">Waiting for the bound model to finish loading…</div>
+      </div>
+    );
+  }
+
+  const currentState = component.currentState ?? "—";
+
+  return (
+    <div className="inspector-section">
+      <div className="section-header">
+        Live Values
+        {options.length > 1 && (
+          <select
+            className="select-field animator-target-select"
+            value={component.entity.id}
+            onChange={(e) => onPickComponent(e.target.value)}
+            title="Pick which bound entity these values drive"
+          >
+            {options.map(({ id, name }) => (
+              <option key={id} value={id}>
+                {name}
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+      <div className="animator-current-state">
+        State: <span className="animator-current-state-name">{currentState}</span>
+      </div>
+      {parameters.length === 0 && <div className="asset-hint">No parameters to drive</div>}
+      {parameters.map((p) => {
+        const value = component.getParam(p.name);
+        if (p.type === "number") {
+          return (
+            <div className="field-row animator-param-row" key={p.name}>
+              <span className="animator-param-label">{p.name}</span>
+              <input
+                className="number-field"
+                type="number"
+                step={0.1}
+                value={typeof value === "number" ? value : 0}
+                onChange={(e) => component.setNumber(p.name, parseFloat(e.target.value) || 0)}
+              />
+            </div>
+          );
+        }
+        if (p.type === "boolean") {
+          return (
+            <div className="field-row animator-param-row" key={p.name}>
+              <span className="animator-param-label">{p.name}</span>
+              <input
+                type="checkbox"
+                checked={!!value}
+                onChange={(e) => component.setBool(p.name, e.target.checked)}
+              />
+            </div>
+          );
+        }
+        // trigger
+        return (
+          <div className="field-row animator-param-row" key={p.name}>
+            <span className="animator-param-label">{p.name}</span>
+            <button
+              className={`toolbar-btn tiny${value ? " active" : ""}`}
+              onClick={() => component.setTrigger(p.name)}
+              title="Fire trigger (auto-cleared after a transition consumes it)"
+            >
+              {value ? "set" : "fire"}
+            </button>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -459,6 +574,23 @@ function AnimatorEditor({ animPath }) {
   const [dirty, setDirty] = useState(false);
   const { screenToFlowPosition } = useReactFlow();
   const [canvasMenu, setCanvasMenu] = useState(null);
+  const [pickedEntityId, setPickedEntityId] = useState(null);
+  const [autosave, setAutosave] = useState(() => {
+    try {
+      return localStorage.getItem("engine.autosave.animator") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleAutosave = () => {
+    setAutosave((cur) => {
+      const next = !cur;
+      try {
+        localStorage.setItem("engine.autosave.animator", next ? "1" : "0");
+      } catch {}
+      return next;
+    });
+  };
 
   useEffect(() => {
     let live = true;
@@ -491,6 +623,39 @@ function AnimatorEditor({ animPath }) {
 
   const selectedNode = nodes.find((n) => n.selected && n.type === "animState");
   const selectedEdge = !selectedNode && edges.find((e) => e.selected);
+
+  // Re-scan the scene every frame so the param-values playground tracks adds
+  // and removes of Animation components referencing this controller.
+  const [boundComponents, setBoundComponents] = useState([]);
+  useEffect(() => {
+    let alive = true;
+    const refresh = () => {
+      if (!alive) return;
+      setBoundComponents(componentsUsing(animPath));
+      requestAnimationFrame(refresh);
+    };
+    const id = requestAnimationFrame(refresh);
+    return () => {
+      alive = false;
+      cancelAnimationFrame(id);
+    };
+  }, [animPath]);
+
+  const drivenComponent = useMemo(() => {
+    if (!boundComponents.length) return null;
+    const picked = boundComponents.find((c) => c.entity.id === pickedEntityId);
+    return picked ?? boundComponents[0];
+  }, [boundComponents, pickedEntityId]);
+  // Reset the picker if the previously-chosen entity disappears.
+  useEffect(() => {
+    if (pickedEntityId && boundComponents.length && !boundComponents.some((c) => c.entity.id === pickedEntityId)) {
+      setPickedEntityId(null);
+    }
+  }, [boundComponents, pickedEntityId]);
+  const drivenOptions = useMemo(
+    () => boundComponents.map((c) => ({ id: c.entity.id, name: c.entity.name ?? c.entity.id })),
+    [boundComponents],
+  );
 
   // Entry badge + condition labels are derived — refresh node/edge data.
   const decoratedNodes = useMemo(
@@ -574,6 +739,18 @@ function AnimatorEditor({ animPath }) {
     console.log(`Animator saved: ${animPath}`);
   };
 
+  // Autosave: when enabled, commit every change. Debounced so transient
+  // mutations (e.g. dragging a node, which fires onNodesChange on every
+  // intermediate position) collapse into a single write at the end of the
+  // gesture. Selection-only updates and the initial load keep `dirty` false
+  // and never reach the timer.
+  useEffect(() => {
+    if (!autosave) return;
+    if (!dirty) return;
+    const id = setTimeout(save, 150);
+    return () => clearTimeout(id);
+  }, [autosave, nodes, edges, parameters, entry, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const preview = (stateName) => {
     const bound = componentsUsing(animPath);
     if (!bound.length) {
@@ -598,7 +775,14 @@ function AnimatorEditor({ animPath }) {
         <span className="asset-path" title={animPath}>
           {animPath.split(/[\\/]/).pop()}
         </span>
-        <button className="toolbar-btn" disabled={!dirty} onClick={save}>
+        <button
+          className={`toolbar-btn icon-only${autosave ? " active" : ""}`}
+          title={autosave ? "Autosave on — changes save instantly" : "Autosave off — click Save to commit"}
+          onClick={toggleAutosave}
+        >
+          <Zap size={14} />
+        </button>
+        <button className="toolbar-btn" disabled={!dirty || autosave} onClick={save}>
           <Save size={13} />
           Save{dirty ? " •" : ""}
         </button>
@@ -611,6 +795,12 @@ function AnimatorEditor({ animPath }) {
               setParameters(next);
               setDirty(true);
             }}
+          />
+          <ParamValuesSection
+            parameters={parameters}
+            component={drivenComponent}
+            options={drivenOptions}
+            onPickComponent={setPickedEntityId}
           />
           {selectedNode && (
             <StateSection

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Plus, Check } from "lucide-react";
+import { Plus, Check, Zap } from "lucide-react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -308,6 +308,22 @@ function ShaderGraphEditor({ matPath }) {
   const [dirty, setDirty] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [canvasMenu, setCanvasMenu] = useState(null); // {x, y} — right-click position
+  const [autosave, setAutosave] = useState(() => {
+    try {
+      return localStorage.getItem("engine.autosave.shader") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleAutosave = () => {
+    setAutosave((cur) => {
+      const next = !cur;
+      try {
+        localStorage.setItem("engine.autosave.shader", next ? "1" : "0");
+      } catch {}
+      return next;
+    });
+  };
   const { screenToFlowPosition } = useReactFlow();
 
   useEffect(() => {
@@ -417,6 +433,18 @@ function ShaderGraphEditor({ matPath }) {
     console.log(`Shader graph applied: ${matPath}`);
   };
 
+  // Autosave: when enabled, commit every change. Debounced so transient
+  // mutations (e.g. dragging a node, which fires onNodesChange on every
+  // intermediate position) collapse into a single write at the end of the
+  // gesture. Selection-only updates and the initial load keep `dirty` false
+  // and never reach the timer.
+  useEffect(() => {
+    if (!autosave) return;
+    if (!dirty) return;
+    const id = setTimeout(apply, 150);
+    return () => clearTimeout(id);
+  }, [autosave, nodes, edges, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <div className="shader-graph-panel">
       <div className="panel-toolbar">
@@ -430,7 +458,14 @@ function ShaderGraphEditor({ matPath }) {
         <span className="asset-path" title={matPath}>
           {matPath.split(/[\\/]/).pop()}
         </span>
-        <button className="toolbar-btn" disabled={!dirty} onClick={apply}>
+        <button
+          className={`toolbar-btn icon-only${autosave ? " active" : ""}`}
+          title={autosave ? "Autosave on — changes apply instantly" : "Autosave off — click Apply to commit"}
+          onClick={toggleAutosave}
+        >
+          <Zap size={14} />
+        </button>
+        <button className="toolbar-btn" disabled={!dirty || autosave} onClick={apply}>
           <Check size={13} />
           Apply{dirty ? " •" : ""}
         </button>

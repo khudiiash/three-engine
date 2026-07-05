@@ -15,7 +15,30 @@ export const MATERIAL_EXTENSIONS = ["mat"];
 export const PREFAB_EXTENSIONS = ["entity"];
 export const ANIMATOR_EXTENSIONS = ["anim"];
 
-/** Recursively lists project files matching the extensions (for asset pickers). */
+/** TypeScript declaration files (`.d.ts` / `.d.mts` / `.d.cts`) are never
+ *  runtime scripts — they're ambient type-only declarations the editor
+ *  scaffolds into the project root so the user's IDE can resolve
+ *  `import { Script } from "engine"`. Always exclude them from the script
+ *  picker regardless of the requested extensions. */
+function isDeclarationFile(name) {
+  // Matches .d.ts, .d.mts, .d.cts (the three TypeScript declaration file
+  // flavors). The script-ext list intentionally accepts ".ts" so we have
+  // to filter declaration files out by suffix — they're ambient types
+  // only and can't be loaded as runtime modules.
+  return /\.d\.(?:c|m)?ts$/i.test(name);
+}
+
+/** The `engine-types/` directory holds ambient TypeScript declarations copied
+ *  in by `projectTypes.scaffoldProjectTypes` (see that module for the full
+ *  rationale). None of its contents are valid script assets. */
+function isEngineTypesPath(path) {
+  return /[\\/]engine-types(?:[\\/]|$)/i.test(path);
+}
+
+/** Recursively lists project files matching the extensions (for asset pickers).
+ *  Always skips TypeScript declaration files (`.d.ts` and friends) and anything
+ *  inside the editor-scaffolded `engine-types/` directory — those are never
+ *  runtime scripts. */
 export async function listProjectAssets(rootPath, exts, depth = 4) {
   const { invoke } = await import("@tauri-apps/api/core");
   const out = [];
@@ -28,27 +51,52 @@ export async function listProjectAssets(rootPath, exts, depth = 4) {
       return;
     }
     for (const e of entries) {
-      if (e.is_dir) await walk(e.path, d - 1);
-      else if (exts.includes(e.ext)) out.push(e.path);
+      if (e.is_dir) {
+        // Skip the editor-scaffolded declarations directory entirely.
+        if (isEngineTypesPath(e.path)) continue;
+        await walk(e.path, d - 1);
+      } else if (exts.includes(e.ext) && !isDeclarationFile(e.name) && !isEngineTypesPath(e.path)) {
+        out.push(e.path);
+      }
     }
   }
   if (rootPath) await walk(rootPath, depth);
   return out;
 }
 
-let esbuildReady = null;
+// esbuild-wasm's `initialize()` throws "Cannot call 'initialize' more than
+// once" if called twice in the same VM. Vite's HMR can re-evaluate this
+// module on dependency changes (e.g. when scriptRuntime.js gains a new
+// import), which would reset the module-local `esbuildReady` cache while
+// leaving the underlying esbuild-wasm module — and its own initialize
+// state — untouched. Pin the cache to the global scope so the second
+// evaluation reads the same promise the first one stored.
+const ESBUILD_CACHE_KEY = Symbol.for("three-engine.esbuildReady");
+const esbuildState = (globalThis[ESBUILD_CACHE_KEY] ??= { ready: null });
 
-/** Lazily boots esbuild-wasm once (used to transpile TS + decorators). */
+/** Lazily boots esbuild-wasm once per VM (used to transpile TS + decorators).
+ *  Subsequent calls — including from HMR-reloaded instances of this module —
+ *  return the same in-flight or settled promise. */
 function getEsbuild() {
-  if (!esbuildReady) {
-    esbuildReady = (async () => {
+  if (!esbuildState.ready) {
+    esbuildState.ready = (async () => {
       const esbuild = await import("esbuild-wasm");
       const wasmURL = (await import("esbuild-wasm/esbuild.wasm?url")).default;
-      await esbuild.initialize({ wasmURL });
+      try {
+        await esbuild.initialize({ wasmURL });
+      } catch (err) {
+        // `initialize` throws "Cannot call 'initialize' more than once"
+        // when esbuild-wasm has already been initialized in this VM — a
+        // legit case under Vite HMR when this module is re-evaluated
+        // alongside its dependencies. Treat that as success and reuse
+        // the loaded module. Re-throw only for genuine init failures.
+        const msg = String(err?.message ?? "");
+        if (!/cannot call .initialize. more than once/i.test(msg)) throw err;
+      }
       return esbuild;
     })();
   }
-  return esbuildReady;
+  return esbuildState.ready;
 }
 
 /** TS/decorators -> plain JS with "engine" imports linked to the runtime blob. */
@@ -111,7 +159,7 @@ export async function loadScriptModule(path) {
 
   const raw = await invoke("read_text_file", { path });
   const { linkEngineImports } = await import("../engine/scriptRuntime.js");
-  const code = linkEngineImports(await transpileScript(raw));
+  const code = await linkEngineImports(await transpileScript(raw));
   const blob = new Blob([code], { type: "text/javascript" });
   const url = URL.createObjectURL(blob);
   try {

@@ -10,6 +10,7 @@ const SCENE_FILTERS = [{ name: "Scene", extensions: ["scene", "json"] }];
 const LAST_SCENE_KEY = "engine.lastScene.v1"; // legacy fallback when no project is open
 
 export const hasScenePath = () => !!currentPath;
+export const currentScenePath = () => currentPath;
 
 const projectRoot = () => useProjectStore.getState().rootPath;
 const isAbsolute = (p) => /^([a-zA-Z]:[\\/]|\/)/.test(p);
@@ -40,29 +41,49 @@ function rememberScene(path) {
   }
 }
 
-/** Reloads the scene from the previous session; false if none/unreadable. */
+/** Resolves the boot-time scene path from projectMeta: mainScene wins over
+ *  lastScene (the user's chosen entry point always takes precedence over the
+ *  last-edited scene). Returns absolute path or null. */
+function resolveBootPath() {
+  const root = projectRoot();
+  if (!root) return null;
+  const meta = useProjectStore.getState().projectMeta ?? {};
+  const candidate = meta.mainScene || meta.lastScene;
+  if (!candidate) return null;
+  return isAbsolute(candidate) ? candidate : `${root}/${candidate}`;
+}
+
+/** Reloads the scene the editor should boot into. Validates the path exists
+ *  before loading — a stale/missing mainScene silently failed before and then
+ *  triggered an unwanted `newScene()` that polluted the project with auto-saved
+ *  "Main 1"/"Main 2" files. Returns true on success, false (with a logged
+ *  warning) when nothing could be restored. The caller decides what to do
+ *  with that — see EditorChrome. */
 export async function restoreLastScene() {
   const engine = await ensureEngine();
-  const root = projectRoot();
-  let path = null;
-  if (root) {
-    const last = useProjectStore.getState().projectMeta?.lastScene;
-    if (last) path = isAbsolute(last) ? last : `${root}/${last}`;
-  }
+  let path = resolveBootPath();
   if (!path) path = localStorage.getItem(LAST_SCENE_KEY);
   if (!path) return false;
+
+  const { invoke } = await import("@tauri-apps/api/core");
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("stat_file", { path });
+  } catch {
+    console.warn(`Saved scene not found on disk: ${path} — leaving editor empty. Use File → New Scene or Open Scene…`);
+    return false;
+  }
+
+  try {
     const { deserializeScene } = await import("../engine/index.js");
     const contents = await invoke("load_scene", { path });
     deserializeScene(engine, JSON.parse(contents));
     engine.sceneName = sceneNameFromPath(path);
     currentPath = path;
     afterSceneSwap();
-    console.log(`Restored last scene: ${path}`);
+    console.log(`Restored scene: ${path}`);
     return true;
   } catch (err) {
-    console.warn(`Couldn't restore last scene (${path}): ${err}`);
+    console.warn(`Couldn't restore scene (${path}): ${err}`);
     return false;
   }
 }
@@ -89,7 +110,6 @@ export async function newScene() {
   const camera = engine.createEntity({ name: "Main Camera" });
   camera.addComponent("camera");
   camera.object3D.position.set(0, 2, 6);
-  camera.object3D.lookAt(0, 0.5, 0);
 
   const box = engine.createEntity({ name: "Box" });
   box.addComponent("mesh", { geometry: "box" });

@@ -24,8 +24,9 @@ import { useAssetDrop } from "../assetDrag.js";
 import { instantiatePrefab } from "../prefab.js";
 import { extOf, PREFAB_EXTENSIONS, MODEL_EXTENSIONS } from "../assetLoader.js";
 import { basename } from "../store/projectStore.js";
-import { isFollowPickArmed, disarmFollowPick } from "./InspectorPanel.jsx";
+import { isFollowPickArmed, disarmFollowPick, isSurfacePickArmed, disarmSurfacePick } from "./InspectorPanel.jsx";
 import { engine } from "../engineInstance.js";
+import { newScene } from "../sceneIO.js";
 
 const DROPPABLE_ASSET_EXTENSIONS = [...PREFAB_EXTENSIONS, ...MODEL_EXTENSIONS];
 
@@ -45,20 +46,31 @@ function dropAssetOnEntity(path, parentId) {
   }
 }
 
-const CREATE_PRESETS = [
+// Common base entities that live directly in the world. Always shown.
+const COMMON_PRESETS = [
   { label: "Empty", spec: { name: "Entity", components: [] } },
-  { label: "Box", spec: { name: "Box", components: [{ type: "mesh", props: { geometry: "box" } }] } },
-  { label: "Sphere", spec: { name: "Sphere", components: [{ type: "mesh", props: { geometry: "sphere" } }] } },
-  { label: "Plane", spec: { name: "Plane", components: [{ type: "mesh", props: { geometry: "plane" } }] } },
-  { label: "Cylinder", spec: { name: "Cylinder", components: [{ type: "mesh", props: { geometry: "cylinder" } }] } },
-  { label: "Cone", spec: { name: "Cone", components: [{ type: "mesh", props: { geometry: "cone" } }] } },
-  { label: "Torus", spec: { name: "Torus", components: [{ type: "mesh", props: { geometry: "torus" } }] } },
-  { label: "Directional Light", spec: { name: "Directional Light", components: [{ type: "light", props: { kind: "directional" } }] } },
-  { label: "Point Light", spec: { name: "Point Light", components: [{ type: "light", props: { kind: "point" } }] } },
-  { label: "Spot Light", spec: { name: "Spot Light", components: [{ type: "light", props: { kind: "spot" } }] } },
+  // Mesh defaults to a box; the inspector's Geometry dropdown still exposes
+  // sphere/plane/cylinder/cone/torus so users can pick the shape there.
+  { label: "Mesh", spec: { name: "Mesh", components: [{ type: "mesh", props: { geometry: "box" } }] } },
+  // Light defaults to directional; the inspector's kind dropdown exposes
+  // point/spot/ambient so users can pick the type there.
+  { label: "Light", spec: { name: "Light", components: [{ type: "light", props: { kind: "directional" } }] } },
   { label: "Camera", spec: { name: "Camera", components: [{ type: "camera" }] } },
-  { divider: true, label: "UI" },
-  { label: "UI Screen", spec: { name: "UI Screen", components: [{ type: "uiscreen" }] } },
+];
+
+// UI Screen — top-level UI container. Always shown so the user can add one
+// from anywhere in the scene.
+const UI_SCREEN_PRESET = {
+  label: "UI Screen",
+  spec: { name: "UI Screen", components: [{ type: "uiscreen" }] },
+};
+
+// UI elements (Panel / Image / Text / Button / Layout / Scroll View) only
+// make sense inside a UI Screen. The hierarchy menu reveals them only when
+// the active parent (currently selected entity, or the implicit scene root
+// for the no-selection case) is a UI Screen, so users can't spawn an orphan
+// Button at the scene root by accident.
+const UI_ELEMENT_PRESETS = [
   {
     label: "UI Panel",
     spec: {
@@ -143,6 +155,15 @@ const CREATE_PRESETS = [
     },
   },
 ];
+
+/** True iff `parentId` refers to a UI Screen entity (or is null — the scene
+ *  root, which is *not* a UI Screen). Used to gate UI element presets so
+ *  they only appear when the user is adding inside a UI Screen. */
+function isParentUiScreen(parentId) {
+  if (!parentId) return false;
+  const entity = useSceneStore.getState().entities[parentId];
+  return !!entity?.components?.uiscreen;
+}
 
 // Tauri's `dragDropEnabled` (default true, needed by the Assets panel for OS
 // file imports) intercepts the webview's native drag-and-drop wholesale —
@@ -241,6 +262,20 @@ function handleRowClick(e, id, rootIds, entities) {
     // Use a direct SetComponentPropCommand so the change is undoable and
     // matches every other prop change in the inspector.
     commandBus.execute(new SetComponentPropCommand(cameraId, "camera", "followTarget", id));
+    return;
+  }
+  // If the inspector armed a "pick surface entity" gesture, this click
+  // resolves it: assign `id` as the scatterSurfaceEntity on whichever
+  // Instancer component is on the currently selected entity.
+  if (isSurfacePickArmed()) {
+    disarmSurfacePick();
+    const instancerEntityId = useSelectionStore.getState().ids[0];
+    if (!instancerEntityId) return;
+    const instancerEntity = engine.getEntity(instancerEntityId);
+    if (!instancerEntity || !instancerEntity.getComponent("instancer")) return;
+    commandBus.execute(
+      new SetComponentPropCommand(instancerEntityId, "instancer", "scatterSurfaceEntity", id),
+    );
     return;
   }
   const sel = useSelectionStore.getState();
@@ -483,7 +518,9 @@ export function HierarchyPanel() {
   // (elementFromPoint) since HTML5 DnD events don't reach us in Tauri.
   useEffect(() => {
     const onKey = (e) => {
-      if (e.key === "Escape" && isFollowPickArmed()) disarmFollowPick();
+      if (e.key !== "Escape") return;
+      if (isFollowPickArmed()) disarmFollowPick();
+      else if (isSurfacePickArmed()) disarmSurfacePick();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -583,6 +620,14 @@ export function HierarchyPanel() {
     }
   };
 
+  /** Creates and opens a fresh scene. Reuses sceneIO.newScene so the new
+   *  scene follows the same path it does from File → New Scene (baseline
+   *  content + autosave when a project is open). Errors are logged there. */
+  const createScene = () => {
+    setMenuOpen(false);
+    newScene().catch((err) => console.warn(`Couldn't create new scene: ${err}`));
+  };
+
   const onRowContextMenu = (e, id) => {
     e.preventDefault();
     e.stopPropagation();
@@ -601,15 +646,30 @@ export function HierarchyPanel() {
             <>
               <div className="dropdown-overlay" onClick={() => setMenuOpen(false)} />
               <div className="dropdown-menu">
-                {CREATE_PRESETS.map((p) =>
-                  p.divider ? (
-                    <div key={p.label} className="dropdown-section-label">{p.label}</div>
-                  ) : (
+                <div className="dropdown-section-label">Scene</div>
+                <button key="New Scene" className="dropdown-item" onClick={createScene}>
+                  New Scene
+                </button>
+                <div className="dropdown-section-label">Entity</div>
+                {COMMON_PRESETS.map((p) => (
+                  <button key={p.label} className="dropdown-item" onClick={() => createEntity(p.spec)}>
+                    {p.label}
+                  </button>
+                ))}
+                <div className="dropdown-section-label">UI</div>
+                <button
+                  key={UI_SCREEN_PRESET.label}
+                  className="dropdown-item"
+                  onClick={() => createEntity(UI_SCREEN_PRESET.spec)}
+                >
+                  {UI_SCREEN_PRESET.label}
+                </button>
+                {isParentUiScreen(useSelectionStore.getState().ids[0] ?? null) &&
+                  UI_ELEMENT_PRESETS.map((p) => (
                     <button key={p.label} className="dropdown-item" onClick={() => createEntity(p.spec)}>
                       {p.label}
                     </button>
-                  ),
-                )}
+                  ))}
               </div>
             </>
           )}

@@ -50,6 +50,48 @@ export function disarmFollowPick() {
   followPickArmed = false;
 }
 
+/**
+ * Independent pick-flag for the InstancerComponent "Surface Entity" picker.
+ * Separate from the camera-follow flag so the two pickers don't fight each
+ * other. The hierarchy panel polls all pick-armed flags and treats the first
+ * one set as the active consumer.
+ */
+let surfacePickArmed = false;
+export function isSurfacePickArmed() {
+  return surfacePickArmed;
+}
+export function armSurfacePick() {
+  surfacePickArmed = true;
+}
+export function disarmSurfacePick() {
+  surfacePickArmed = false;
+}
+/** Read whether any picker is currently armed (used by HierarchyPanel). */
+export function isAnyPickArmed() {
+  return followPickArmed || surfacePickArmed;
+}
+
+/**
+ * UI components (`uielement`, `uiimage`, `uitext`, `uibutton`, `uilayout`,
+ * `uiscroll`, `uimask`) only make sense as descendants of a UI Screen. Walks
+ * the parent chain of `entityId` (inclusive) and returns true if any entity
+ * along the way carries a `uiscreen` component. Used to gate the Add
+ * Component dropdown so non-UI entities don't see UI-only options.
+ *
+ * Reads the live engine (not the scene mirror) because the helper can be
+ * called for ids not yet mirrored in React state, and the engine is the
+ * source of truth anyway.
+ */
+export function isInsideUiScreen(entityId) {
+  if (!entityId) return false;
+  let entity = engine.getEntity(entityId);
+  while (entity) {
+    if (entity.getComponent?.("uiscreen")) return true;
+    entity = entity.parent;
+  }
+  return false;
+}
+
 const RAD2DEG = 180 / Math.PI;
 const DEG2RAD = Math.PI / 180;
 
@@ -342,6 +384,83 @@ function CameraFollowSection({ entityId, props }) {
   );
 }
 
+/**
+ * Instancer-only section: appears when scatterShape === "onMesh". Renders a
+ * Pick / Clear pair for the surface entity, plus helper text describing the
+ * current radius-mode center. Mirrors the camera-follow picker UX so users
+ * have one mental model for "pick from hierarchy".
+ */
+function InstancerSurfaceSection({ entityId, props }) {
+  const [, force] = useState(0);
+  // Mirror the live prop so the picker row reflects the picked entity name
+  // (and any entity-deletion events).
+  useEffect(() => {
+    const onChange = (info) => {
+      if (info.entityId === entityId && info.componentType === "instancer") force((v) => v + 1);
+    };
+    const onHierarchy = () => force((v) => v + 1);
+    return () => {}; // noop cleanup; force is idempotent
+  }, [entityId]);
+
+  const targetId = props.scatterSurfaceEntity;
+  const target = targetId ? engine.getEntity(targetId) : null;
+  const targetLabel = target ? target.name : targetId || "";
+  const targetMissing = !!targetId && !target;
+  const surfaceShape = props.scatterSurfaceShape ?? "whole";
+
+  const commitProp = (key, value) =>
+    commandBus.execute(new SetComponentPropCommand(entityId, "instancer", key, value));
+
+  return (
+    <>
+      <div className="inspector-subheader">Surface</div>
+      <div className="camera-follow-row">
+        <input
+          className={`text-field ${targetMissing ? "missing-ref" : ""}`}
+          type="text"
+          value={targetLabel}
+          placeholder="(self)"
+          readOnly
+          title={
+            targetMissing
+              ? "Referenced entity no longer exists — falling back to this entity's mesh"
+              : target
+                ? "Mesh whose surface is scattered on"
+                : "Empty = use this entity's own MeshComponent"
+          }
+        />
+        <button
+          className="toolbar-btn"
+          title="Pick an entity from the hierarchy to scatter on its surface"
+          onClick={() => {
+            if (isSurfacePickArmed()) disarmSurfacePick();
+            else armSurfacePick();
+            force((v) => v + 1);
+          }}
+        >
+          {isSurfacePickArmed() ? "Cancel" : "Pick"}
+        </button>
+        <button
+          className="toolbar-btn"
+          title="Clear — scatter on this entity's own mesh"
+          disabled={!targetId}
+          onClick={() => commitProp("scatterSurfaceEntity", "")}
+        >
+          Clear
+        </button>
+      </div>
+      {surfaceShape === "radius" && (
+        <div className="field-row" style={{ opacity: 0.75 }}>
+          <span className="field-label" />
+          <span className="inspector-hint">
+            Triangles within radius of the center point are kept.
+          </span>
+        </div>
+      )}
+    </>
+  );
+}
+
 /** Two-number field (anchors, pivot, pos, size). */
 function Vec2PropField({ value, onCommit, labels = ["X", "Y"], step = 1 }) {
   const values = Array.isArray(value) ? value : [0, 0];
@@ -551,6 +670,9 @@ function ComponentSection({ entityId, type, props }) {
       {type === "camera" && (
         <CameraFollowSection entityId={entityId} props={props} />
       )}
+      {type === "instancer" && props.scatterShape === "onMesh" && (
+        <InstancerSurfaceSection entityId={entityId} props={props} />
+      )}
       {type === "camera" && (
         <button
           className="toolbar-btn wide"
@@ -601,7 +723,26 @@ export function InspectorPanel() {
     return <div className="inspector-panel empty">No entity selected</div>;
   }
 
-  const availableTypes = getComponentTypes().filter((t) => !(t in entity.components));
+  const availableTypes = getComponentTypes()
+    .filter((t) => !(t in entity.components))
+    // UI components only exist inside a UI Screen subtree. Without an
+    // ancestor `uiscreen`, the dropdown hides everything except `uiscreen`
+    // itself (which is what *creates* the UI subtree). UI Screen itself is
+    // always available so the user can start a UI hierarchy from anywhere.
+    .filter((t) => {
+      if (!t.startsWith("ui")) return true;
+      if (t === "uiscreen") return true;
+      return isInsideUiScreen(entity.id);
+    });
+
+  /**
+   * Components that depend on other components being present. The entry is
+   * kept visible in the dropdown but disabled, with a tooltip explaining the
+   * missing prerequisite so the user knows what to add.
+   *   { "instancer": "mesh" }  — Instancer requires a MeshComponent on the
+   *   same entity to read the source geometry from.
+   */
+  const componentRequires = { instancer: "mesh" };
 
   const commitName = (value) => {
     const name = value.trim();
@@ -646,18 +787,31 @@ export function InspectorPanel() {
             <>
               <div className="dropdown-overlay" onClick={() => setAddMenuOpen(false)} />
               <div className="dropdown-menu up">
-                {availableTypes.map((type) => (
-                  <button
-                    key={type}
-                    className="dropdown-item"
-                    onClick={() => {
-                      setAddMenuOpen(false);
-                      commandBus.execute(new AddComponentCommand(entity.id, type));
-                    }}
-                  >
-                    {getComponentClass(type).label}
-                  </button>
-                ))}
+                {availableTypes.map((type) => {
+                  const requiredType = componentRequires[type];
+                  const missingRequirement = requiredType && !(requiredType in entity.components);
+                  const Cls = getComponentClass(type);
+                  const label = Cls?.label ?? type;
+                  return (
+                    <button
+                      key={type}
+                      className="dropdown-item"
+                      disabled={missingRequirement}
+                      title={
+                        missingRequirement
+                          ? `${label} requires a ${getComponentClass(requiredType)?.label ?? requiredType} component on this entity`
+                          : undefined
+                      }
+                      onClick={() => {
+                        if (missingRequirement) return;
+                        setAddMenuOpen(false);
+                        commandBus.execute(new AddComponentCommand(entity.id, type));
+                      }}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
               </div>
             </>
           )}
