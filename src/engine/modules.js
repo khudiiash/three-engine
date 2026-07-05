@@ -1,0 +1,69 @@
+import { registerComponent, unregisterComponent } from "./components/registry.js";
+
+/**
+ * Unity-style engine modules: optional feature packs (physics, audio, …)
+ * that a project enables per project.json. A module definition is:
+ *   {
+ *     id          — unique string ("physics-rapier")
+ *     name        — display name for the editor
+ *     description — one-liner for the Modules panel
+ *     version     — display version string
+ *     components  — component classes registered while the module is enabled
+ *     setup(engine) — async; per-engine runtime setup (create systems,
+ *                     subscribe to engine events). Returns a handle whose
+ *                     optional dispose() undoes everything.
+ *   }
+ *
+ * Definitions are registered at import time (see src/modules/index.js);
+ * enabling is per-engine and driven by the host (editor project settings or
+ * the exported scene.json's `modules` list). Heavy dependencies (wasm…)
+ * belong inside setup() as dynamic imports so disabled modules cost nothing.
+ */
+const definitions = new Map();
+
+export function registerModuleDefinition(def) {
+  if (!def?.id) throw new Error("Module definition needs an `id`");
+  definitions.set(def.id, def);
+}
+
+export function getModuleDefinition(id) {
+  return definitions.get(id);
+}
+
+export function getModuleDefinitions() {
+  return [...definitions.values()];
+}
+
+/** Registers the module's components and runs its setup on this engine. */
+export async function enableEngineModule(engine, id) {
+  if (engine.modules.has(id)) return engine.modules.get(id);
+  const def = definitions.get(id);
+  if (!def) throw new Error(`Unknown module "${id}"`);
+  for (const cls of def.components ?? []) registerComponent(cls);
+  const handle = (await def.setup?.(engine)) ?? {};
+  engine.modules.set(id, handle);
+  engine.emit("modules-changed");
+  return handle;
+}
+
+/** Tears down the module's runtime and unregisters its components. */
+export async function disableEngineModule(engine, id) {
+  const handle = engine.modules.get(id);
+  if (!handle) return;
+  engine.modules.delete(id);
+  await handle.dispose?.();
+  const def = definitions.get(id);
+  for (const cls of def?.components ?? []) unregisterComponent(cls.type);
+  engine.emit("modules-changed");
+}
+
+/** Makes the engine's enabled set exactly `ids` (order-preserving enable). */
+export async function applyEngineModules(engine, ids = []) {
+  const want = new Set(ids.filter((id) => definitions.has(id)));
+  for (const id of [...engine.modules.keys()]) {
+    if (!want.has(id)) await disableEngineModule(engine, id);
+  }
+  for (const id of ids) {
+    if (want.has(id)) await enableEngineModule(engine, id);
+  }
+}

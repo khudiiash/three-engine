@@ -1,0 +1,194 @@
+import { useEffect, useState } from "react";
+import { ensureEngine } from "../engineInstance.js";
+import { commandBus } from "../commands/CommandBus.js";
+import { SetSceneSettingsCommand } from "../commands/settingsCommands.js";
+import { useSceneStore } from "../store/sceneStore.js";
+
+const TONE_MAPPING_OPTIONS = [
+  ["neutral", "Neutral (Khronos)"],
+  ["aces", "ACES Filmic"],
+  ["agx", "AgX"],
+  ["reinhard", "Reinhard"],
+  ["cineon", "Cineon"],
+  ["linear", "Linear"],
+  ["none", "None"],
+];
+
+function Row({ label, children }) {
+  return (
+    <div className="field-row">
+      <span className="field-label">{label}</span>
+      {children}
+    </div>
+  );
+}
+
+function NumberInput({ value, onCommit, min, max, step = 0.1 }) {
+  const [text, setText] = useState(String(value));
+  useEffect(() => setText(String(Math.round(value * 1000) / 1000)), [value]);
+  const commit = () => {
+    let v = parseFloat(text);
+    if (Number.isNaN(v)) return setText(String(value));
+    if (min !== undefined) v = Math.max(min, v);
+    if (max !== undefined) v = Math.min(max, v);
+    if (v !== value) onCommit(v);
+  };
+  return (
+    <input
+      className="number-field"
+      type="number"
+      step={step}
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => e.key === "Enter" && e.target.blur()}
+    />
+  );
+}
+
+/**
+ * Per-scene environment settings (saved inside the .scene file, undoable).
+ * Every change is one command on the bus, applied live to the engine.
+ */
+export function SceneSettingsPanel() {
+  const sceneName = useSceneStore((s) => s.sceneName);
+  const [settings, setSettings] = useState(null);
+
+  useEffect(() => {
+    let unsub = null;
+    let live = true;
+    ensureEngine().then((engine) => {
+      if (!live) return;
+      setSettings(structuredClone(engine.settings));
+      unsub = engine.on("settings-changed", (s) => setSettings(structuredClone(s)));
+    });
+    return () => {
+      live = false;
+      unsub?.();
+    };
+  }, []);
+
+  if (!settings) return <div className="inspector-panel empty">Loading…</div>;
+
+  const commit = (patch, label) => commandBus.execute(new SetSceneSettingsCommand(patch, label));
+  const commitFog = (fogPatch, label) =>
+    commit({ fog: { ...settings.fog, ...fogPatch } }, label ?? "Change fog");
+
+  return (
+    <div className="inspector-panel scene-settings-panel">
+      <div className="inspector-section">
+        <div className="section-header">Scene · {sceneName}</div>
+      </div>
+
+      <div className="inspector-section">
+        <div className="section-header">Environment</div>
+        <Row label="Background">
+          <input
+            className="color-field"
+            type="color"
+            value={settings.background}
+            onChange={(e) => commit({ background: e.target.value }, "Change background")}
+          />
+        </Row>
+        <Row label="Ambient">
+          <input
+            className="color-field"
+            type="color"
+            value={settings.ambientColor}
+            onChange={(e) => commit({ ambientColor: e.target.value }, "Change ambient color")}
+          />
+        </Row>
+        <Row label="Intensity">
+          <NumberInput
+            value={settings.ambientIntensity}
+            min={0}
+            step={0.05}
+            onCommit={(v) => commit({ ambientIntensity: v }, "Change ambient intensity")}
+          />
+        </Row>
+      </div>
+
+      <div className="inspector-section">
+        <div className="section-header">Fog</div>
+        <Row label="Type">
+          <select
+            className="select-field"
+            value={settings.fog.type}
+            onChange={(e) => commitFog({ type: e.target.value })}
+          >
+            <option value="none">None</option>
+            <option value="linear">Linear</option>
+            <option value="exp2">Exponential²</option>
+          </select>
+        </Row>
+        {settings.fog.type !== "none" && (
+          <Row label="Color">
+            <input
+              className="color-field"
+              type="color"
+              value={settings.fog.color}
+              onChange={(e) => commitFog({ color: e.target.value })}
+            />
+          </Row>
+        )}
+        {settings.fog.type === "linear" && (
+          <>
+            <Row label="Near">
+              <NumberInput value={settings.fog.near} min={0} step={1} onCommit={(v) => commitFog({ near: v })} />
+            </Row>
+            <Row label="Far">
+              <NumberInput value={settings.fog.far} min={0} step={1} onCommit={(v) => commitFog({ far: v })} />
+            </Row>
+          </>
+        )}
+        {settings.fog.type === "exp2" && (
+          <Row label="Density">
+            <NumberInput
+              value={settings.fog.density}
+              min={0}
+              max={1}
+              step={0.005}
+              onCommit={(v) => commitFog({ density: v })}
+            />
+          </Row>
+        )}
+      </div>
+
+      <div className="inspector-section">
+        <div className="section-header">Rendering</div>
+        <Row label="Tone mapping">
+          <select
+            className="select-field"
+            value={settings.toneMapping}
+            onChange={(e) => commit({ toneMapping: e.target.value }, "Change tone mapping")}
+          >
+            {TONE_MAPPING_OPTIONS.map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </Row>
+        <Row label="Exposure">
+          <NumberInput
+            value={settings.exposure}
+            min={0}
+            step={0.05}
+            onCommit={(v) => commit({ exposure: v }, "Change exposure")}
+          />
+        </Row>
+        <Row label="Shadows">
+          <input
+            type="checkbox"
+            checked={settings.shadows !== false}
+            onChange={(e) => commit({ shadows: e.target.checked }, "Toggle shadows")}
+          />
+        </Row>
+      </div>
+
+      <div className="asset-hint" style={{ padding: "4px 10px" }}>
+        Saved with the scene. Lights and meshes have their own Cast/Receive Shadow toggles.
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,668 @@
+import { useEffect, useState } from "react";
+import { X, Plus, Crosshair, Eye, EyeOff } from "lucide-react";
+import { useSceneStore } from "../store/sceneStore.js";
+import { useSelectionStore } from "../store/selectionStore.js";
+import { getComponentClass, getComponentTypes } from "../../engine/index.js";
+import { commandBus } from "../commands/CommandBus.js";
+import { RenameEntityCommand, BatchCommand } from "../commands/entityCommands.js";
+import { ANCHOR_PRESETS, applyAnchorPreset } from "../../engine/ui/layout.js";
+import { SetTransformCommand } from "../commands/transformCommands.js";
+import {
+  AddComponentCommand,
+  RemoveComponentCommand,
+  SetComponentPropCommand,
+} from "../commands/componentCommands.js";
+import { openPanel } from "../EditorShell.jsx";
+import { engine } from "../engineInstance.js";
+import { AssetField } from "../fields/AssetField.jsx";
+import { AssetInspector } from "./AssetInspector.jsx";
+import { useAssetDrop } from "../assetDrag.js";
+import { getEditorCameraView } from "./ViewportPanel.jsx";
+import { useModulesStore } from "../modules.js";
+
+/**
+ * Returns the live engine entity referenced by `targetId` (the value stored
+ * on the camera's `followTarget` prop), or null when nothing is set / the
+ * referenced entity no longer exists.
+ */
+function resolveFollowEntity(targetId) {
+  if (!targetId) return null;
+  return engine.getEntity(targetId) ?? null;
+}
+
+/**
+ * Drives the "Pick" interaction for the camera's follow target. We can't
+ * reuse the standard pointer-pick path because that lives on the viewport
+ * canvas — and the user is interacting with the inspector. Instead, when
+ * picking is active, the next click on the hierarchy panel selects the
+ * clicked entity and we then set that as the follow target. We arm
+ * picking via a single module-level flag so the hierarchy panel can poll
+ * it from its existing click handler.
+ */
+let followPickArmed = false;
+export function isFollowPickArmed() {
+  return followPickArmed;
+}
+export function armFollowPick() {
+  followPickArmed = true;
+}
+export function disarmFollowPick() {
+  followPickArmed = false;
+}
+
+const RAD2DEG = 180 / Math.PI;
+const DEG2RAD = Math.PI / 180;
+
+/** Number input that keeps local text while typing; commits on Enter/blur. */
+function NumberField({ value, onCommit, min, max, step = 0.1 }) {
+  const [text, setText] = useState(formatNumber(value));
+  const [focused, setFocused] = useState(false);
+
+  useEffect(() => {
+    if (!focused) setText(formatNumber(value));
+  }, [value, focused]);
+
+  const commit = () => {
+    const parsed = parseFloat(text);
+    if (!Number.isNaN(parsed) && parsed !== value) {
+      let v = parsed;
+      if (min !== undefined) v = Math.max(min, v);
+      if (max !== undefined) v = Math.min(max, v);
+      onCommit(v);
+    } else {
+      setText(formatNumber(value));
+    }
+  };
+
+  return (
+    <input
+      className="number-field"
+      type="number"
+      step={step}
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onFocus={() => setFocused(true)}
+      onBlur={() => {
+        setFocused(false);
+        commit();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.target.blur();
+        if (e.key === "Escape") {
+          setText(formatNumber(value));
+          e.target.blur();
+        }
+      }}
+    />
+  );
+}
+
+function formatNumber(v) {
+  if (typeof v !== "number" || Number.isNaN(v)) return "0";
+  return String(Math.round(v * 1000) / 1000);
+}
+
+function Vector3Row({ label, values, onCommit }) {
+  return (
+    <div className="field-row">
+      <span className="field-label">{label}</span>
+      <div className="vector-fields">
+        {["x", "y", "z"].map((axis, i) => (
+          <NumberField
+            key={axis}
+            value={values[i]}
+            onCommit={(v) => {
+              const next = [...values];
+              next[i] = v;
+              onCommit(next);
+            }}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TransformSection({ entity }) {
+  const { position, rotation, scale } = entity.transform;
+  const rotationDeg = rotation.map((r) => r * RAD2DEG);
+
+  const commit = (patch) => {
+    commandBus.execute(new SetTransformCommand(entity.id, { ...entity.transform, ...patch }));
+  };
+
+  return (
+    <div className="inspector-section">
+      <div className="section-header">Transform</div>
+      <Vector3Row label="Position" values={position} onCommit={(v) => commit({ position: v })} />
+      <Vector3Row
+        label="Rotation"
+        values={rotationDeg}
+        onCommit={(v) => commit({ rotation: v.map((d) => d * DEG2RAD) })}
+      />
+      <Vector3Row label="Scale" values={scale} onCommit={(v) => commit({ scale: v })} />
+    </div>
+  );
+}
+
+const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
+
+/** Text field that doubles as a drop target for Assets-panel paths. */
+function TextPropField({ value, onCommit }) {
+  const dropRef = useAssetDrop({ accepts: (path, isDir) => !isDir, onDrop: onCommit });
+  return (
+    <input
+      className="text-field"
+      type="text"
+      key={value}
+      defaultValue={value}
+      ref={dropRef}
+      onBlur={(e) => onCommit(e.target.value)}
+    />
+  );
+}
+
+function Vec3PropField({ value, onCommit }) {
+  const values = Array.isArray(value) ? value : [0, 0, 0];
+  return (
+    <div className="vector-fields">
+      {[0, 1, 2].map((i) => (
+        <NumberField
+          key={i}
+          value={values[i] ?? 0}
+          onCommit={(v) => {
+            const next = [...values];
+            next[i] = v;
+            onCommit(next);
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+function PropField({ descriptor, value, onCommit }) {
+  switch (descriptor.type) {
+    case "asset":
+      return <AssetField descriptor={descriptor} value={value} onCommit={onCommit} />;
+    case "vec3":
+      return <Vec3PropField value={value} onCommit={onCommit} />;
+    case "number":
+      return (
+        <NumberField
+          value={value}
+          min={descriptor.min}
+          max={descriptor.max}
+          step={descriptor.step}
+          onCommit={onCommit}
+        />
+      );
+    case "color":
+      return (
+        <input
+          className="color-field"
+          type="color"
+          value={value}
+          onChange={(e) => onCommit(e.target.value)}
+        />
+      );
+    case "select":
+      return (
+        <select className="select-field" value={value} onChange={(e) => onCommit(e.target.value)}>
+          {descriptor.options.map((opt) => (
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
+          ))}
+        </select>
+      );
+    case "boolean":
+      return (
+        <input type="checkbox" checked={!!value} onChange={(e) => onCommit(e.target.checked)} />
+      );
+    default:
+      return <TextPropField value={value} onCommit={onCommit} />;
+  }
+}
+
+/** Fields for @attribute-decorated script properties (schema lives on the loaded module). */
+function ScriptAttributeFields({ entityId, props }) {
+  const [, bump] = useState(0);
+  useEffect(() => engine.on("script-loaded", () => bump((v) => v + 1)), []);
+
+  const component = engine.getEntity(entityId)?.getComponent("script");
+  const defs = component?.getAttributeDefs() ?? {};
+
+  return Object.entries(defs).map(([key, def]) => (
+    <div className="field-row" key={key}>
+      <span className="field-label">{key}</span>
+      <PropField
+        descriptor={{ key, label: key, type: def.type ?? "number", ...def }}
+        value={props.attributes?.[key] ?? def.default}
+        onCommit={(v) =>
+          commandBus.execute(
+            new SetComponentPropCommand(entityId, "script", "attributes", {
+              ...props.attributes,
+              [key]: v,
+            }),
+          )
+        }
+      />
+    </div>
+  ));
+}
+
+/**
+ * Camera-only follow section. Renders three controls on the camera's
+ * component panel:
+ *   - Follow target: a text field showing the live entity name (or id when
+ *     the entity has been deleted), with Pick / Clear buttons. Picking arms
+ *     the hierarchy panel to consume the next row click as the target.
+ *   - Viewport / Game checkboxes: enable follow while editing / playing.
+ *   - Show preview checkbox: editor-only PIP toggle.
+ */
+function CameraFollowSection({ entityId, props }) {
+  const [, force] = useState(0);
+  // Mirror the live engine prop values into local state so toggles reflect
+  // the current camera (the scene mirror doesn't refresh on prop changes).
+  useEffect(() => {
+    const onChange = (info) => {
+      if (info.entityId === entityId && info.componentType === "camera") force((v) => v + 1);
+    };
+    return engine.on("component-changed", onChange);
+  }, [entityId]);
+
+  const target = resolveFollowEntity(props.followTarget);
+  const targetLabel = target ? target.name : props.followTarget || "";
+  const targetMissing = !!props.followTarget && !target;
+
+  const commitProp = (key, value) =>
+    commandBus.execute(new SetComponentPropCommand(entityId, "camera", key, value));
+
+  return (
+    <>
+      <div className="inspector-subheader">Follow target</div>
+      <div className="camera-follow-row">
+        <input
+          className={`text-field ${targetMissing ? "missing-ref" : ""}`}
+          type="text"
+          value={targetLabel}
+          placeholder="(none)"
+          readOnly
+          title={targetMissing ? "Referenced entity no longer exists" : "Entity to look at"}
+        />
+        <button
+          className="toolbar-btn"
+          title="Pick an entity from the hierarchy as the follow target"
+          onClick={() => {
+            if (isFollowPickArmed()) disarmFollowPick();
+            else armFollowPick();
+            force((v) => v + 1);
+          }}
+        >
+          {isFollowPickArmed() ? "Cancel" : "Pick"}
+        </button>
+        <button
+          className="toolbar-btn"
+          title="Clear the follow target"
+          disabled={!props.followTarget}
+          onClick={() => commitProp("followTarget", null)}
+        >
+          Clear
+        </button>
+      </div>
+      <div className="camera-follow-toggles">
+        <label className="field-row inline">
+          <input
+            type="checkbox"
+            checked={!!props.followInViewport}
+            onChange={(e) => commitProp("followInViewport", e.target.checked)}
+          />
+          <span>Viewport</span>
+        </label>
+        <label className="field-row inline">
+          <input
+            type="checkbox"
+            checked={!!props.followInGame}
+            onChange={(e) => commitProp("followInGame", e.target.checked)}
+          />
+          <span>Game</span>
+        </label>
+      </div>
+      <label className="field-row inline preview-toggle">
+        <input
+          type="checkbox"
+          checked={props.showPreview !== false}
+          onChange={(e) => commitProp("showPreview", e.target.checked)}
+        />
+        {props.showPreview !== false ? <Eye size={12} /> : <EyeOff size={12} />}
+        <span>Show preview</span>
+      </label>
+    </>
+  );
+}
+
+/** Two-number field (anchors, pivot, pos, size). */
+function Vec2PropField({ value, onCommit, labels = ["X", "Y"], step = 1 }) {
+  const values = Array.isArray(value) ? value : [0, 0];
+  return (
+    <div className="vector-fields">
+      {[0, 1].map((i) => (
+        <NumberField
+          key={`${i}-${labels[i]}`}
+          value={values[i] ?? 0}
+          step={step}
+          onCommit={(v) => {
+            const next = [...values];
+            next[i] = v;
+            onCommit(next);
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+const EPSILON = 1e-6;
+const POINT_PRESETS = [
+  ["top-left", "top", "top-right"],
+  ["left", "center", "right"],
+  ["bottom-left", "bottom", "bottom-right"],
+];
+
+/** Name of the matching preset for the current anchors/pivot, or null. */
+function matchAnchorPreset(props) {
+  for (const [name, preset] of Object.entries(ANCHOR_PRESETS)) {
+    const same = (a, b) => Math.abs(a[0] - b[0]) < EPSILON && Math.abs(a[1] - b[1]) < EPSILON;
+    if (
+      same(preset.anchorMin, props.anchorMin ?? [0.5, 0.5]) &&
+      same(preset.anchorMax, props.anchorMax ?? [0.5, 0.5])
+    ) {
+      return name;
+    }
+  }
+  return null;
+}
+
+/**
+ * Custom inspector for the UI Element rect: a 3×3 anchor-preset grid plus
+ * stretch buttons, then pos/size fields whose labels adapt to the anchoring
+ * (Unity-style: point-anchored = X/Y + W/H, stretched = insets from edges).
+ */
+function UiElementSection({ entityId, props }) {
+  const commit = (key, value) =>
+    commandBus.execute(new SetComponentPropCommand(entityId, "uielement", key, value));
+
+  const applyPreset = (name) => {
+    const next = applyAnchorPreset(name, props.size);
+    if (!next) return;
+    const cmds = Object.entries(next).map(
+      ([key, value]) => new SetComponentPropCommand(entityId, "uielement", key, value),
+    );
+    commandBus.execute(new BatchCommand(cmds, `Anchor: ${name}`));
+  };
+
+  const active = matchAnchorPreset(props);
+  const stretchX = (props.anchorMax?.[0] ?? 0.5) - (props.anchorMin?.[0] ?? 0.5) > EPSILON;
+  const stretchY = (props.anchorMax?.[1] ?? 0.5) - (props.anchorMin?.[1] ?? 0.5) > EPSILON;
+
+  const posLabels = [stretchX ? "Left" : "X", stretchY ? "Top" : "Y"];
+  const sizeLabels = [stretchX ? "Right" : "W", stretchY ? "Bottom" : "H"];
+
+  const el = engine.getEntity(entityId)?.getComponent("uielement");
+  const layoutControlled = !!el?.layoutControlled;
+
+  return (
+    <>
+      <div className="field-row">
+        <span className="field-label">Anchor</span>
+        <div className="anchor-preset-wrap">
+          <div className="anchor-preset-grid">
+            {POINT_PRESETS.flat().map((name) => (
+              <button
+                key={name}
+                className={`anchor-preset-cell ${active === name ? "active" : ""}`}
+                title={name}
+                onClick={() => applyPreset(name)}
+              >
+                <span className="anchor-dot" />
+              </button>
+            ))}
+          </div>
+          <div className="anchor-preset-stretch">
+            {["stretch-x", "stretch-y", "stretch"].map((name) => (
+              <button
+                key={name}
+                className={`toolbar-btn tiny ${active === name ? "active" : ""}`}
+                title={name}
+                onClick={() => applyPreset(name)}
+              >
+                {name === "stretch-x" ? "↔" : name === "stretch-y" ? "↕" : "⛶"}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      {layoutControlled && (
+        <div className="field-row">
+          <span className="field-label" style={{ opacity: 0.6 }}>
+            Positioned by parent UI Layout
+          </span>
+        </div>
+      )}
+      <div className="field-row">
+        <span className="field-label">{posLabels.join(" / ")}</span>
+        <Vec2PropField value={props.pos} labels={posLabels} onCommit={(v) => commit("pos", v)} />
+      </div>
+      <div className="field-row">
+        <span className="field-label">{sizeLabels.join(" / ")}</span>
+        <Vec2PropField value={props.size} labels={sizeLabels} onCommit={(v) => commit("size", v)} />
+      </div>
+      <div className="field-row">
+        <span className="field-label">Pivot</span>
+        <Vec2PropField value={props.pivot} step={0.1} onCommit={(v) => commit("pivot", v)} />
+      </div>
+      <div className="field-row">
+        <span className="field-label">Opacity</span>
+        <NumberField value={props.opacity ?? 1} min={0} max={1} step={0.05} onCommit={(v) => commit("opacity", v)} />
+      </div>
+      <div className="field-row">
+        <span className="field-label">Visible</span>
+        <input type="checkbox" checked={props.visible !== false} onChange={(e) => commit("visible", e.target.checked)} />
+      </div>
+      <div className="field-row">
+        <span className="field-label">Raycast Target</span>
+        <input
+          type="checkbox"
+          checked={props.raycastTarget !== false}
+          onChange={(e) => commit("raycastTarget", e.target.checked)}
+        />
+      </div>
+    </>
+  );
+}
+
+function ComponentSection({ entityId, type, props }) {
+  const cls = getComponentClass(type);
+  // Unknown type: its module is disabled. The data survives — say so.
+  if (!cls) {
+    return (
+      <div className="inspector-section">
+        <div className="section-header">
+          {type}
+          <button
+            className="icon-btn"
+            title="Remove component"
+            onClick={() => commandBus.execute(new RemoveComponentCommand(entityId, type))}
+          >
+            <X size={12} />
+          </button>
+        </div>
+        <div className="field-row">
+          <span className="field-label" style={{ opacity: 0.6 }}>
+            Missing — enable its module in Window → Modules
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="inspector-section">
+      <div className="section-header">
+        {cls.label}
+        <button
+          className="icon-btn"
+          title="Remove component"
+          onClick={() => commandBus.execute(new RemoveComponentCommand(entityId, type))}
+        >
+          <X size={12} />
+        </button>
+      </div>
+      {cls.schema.map((descriptor) => {
+        if (descriptor.showIf && !descriptor.showIf(props)) return null;
+        return (
+          <div className="field-row" key={descriptor.key}>
+            <span className="field-label">{descriptor.label}</span>
+            <PropField
+              descriptor={descriptor}
+              value={props[descriptor.key]}
+              onCommit={(v) =>
+                commandBus.execute(new SetComponentPropCommand(entityId, type, descriptor.key, v))
+              }
+            />
+          </div>
+        );
+      })}
+      {type === "uielement" && <UiElementSection entityId={entityId} props={props} />}
+      {type === "script" && <ScriptAttributeFields entityId={entityId} props={props} />}
+      {type === "mesh" && (
+        <>
+          {props.material && (
+            <button className="toolbar-btn wide" onClick={() => openPanel("material")}>
+              Edit Material
+            </button>
+          )}
+          <button className="toolbar-btn wide" onClick={() => openPanel("shaderGraph")}>
+            Edit Shader Graph
+          </button>
+        </>
+      )}
+      {type === "camera" && (
+        <CameraFollowSection entityId={entityId} props={props} />
+      )}
+      {type === "camera" && (
+        <button
+          className="toolbar-btn wide"
+          title="Copy the editor viewport's pose onto this camera"
+          onClick={() => {
+            const view = getEditorCameraView();
+            if (!view) return;
+            const entity = engine.getEntity(entityId);
+            const before = entity?.getTransform();
+            if (!before) return;
+            commandBus.execute(
+              new SetTransformCommand(entityId, {
+                position: view.position,
+                rotation: view.rotation,
+                scale: before.scale,
+              }, before),
+            );
+          }}
+        >
+          <Crosshair size={12} />
+          Adjust to View
+        </button>
+      )}
+      {type === "particles" && (
+        <button className="toolbar-btn wide" onClick={() => openPanel("particles")}>
+          Open Particle Editor
+        </button>
+      )}
+      {type === "animation" && props.controller && (
+        <button className="toolbar-btn wide" onClick={() => openPanel("animator")}>
+          Edit Animator
+        </button>
+      )}
+    </div>
+  );
+}
+
+export function InspectorPanel() {
+  const selectedId = useSelectionStore((s) => s.ids[0] ?? null);
+  const assetPath = useSelectionStore((s) => s.assetPath);
+  const entity = useSceneStore((s) => (selectedId ? s.entities[selectedId] : null));
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  // Toggling a module (un)registers component types — re-render for the list.
+  useModulesStore((s) => s.enabled);
+
+  if (!entity && assetPath) return <AssetInspector path={assetPath} />;
+  if (!entity) {
+    return <div className="inspector-panel empty">No entity selected</div>;
+  }
+
+  const availableTypes = getComponentTypes().filter((t) => !(t in entity.components));
+
+  const commitName = (value) => {
+    const name = value.trim();
+    if (name && name !== entity.name) {
+      commandBus.execute(new RenameEntityCommand(entity.id, name));
+    }
+  };
+
+  return (
+    <div className="inspector-panel">
+      <div className="inspector-section">
+        <div className="field-row">
+          <span className="field-label">Name</span>
+          <input
+            className="text-field"
+            type="text"
+            key={entity.id + entity.name}
+            defaultValue={entity.name}
+            onBlur={(e) => commitName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && e.target.blur()}
+          />
+        </div>
+      </div>
+
+      <TransformSection entity={entity} />
+
+      {Object.entries(entity.components).map(([type, props]) => (
+        <ComponentSection key={type} entityId={entity.id} type={type} props={props} />
+      ))}
+
+      <div className="add-component-wrap">
+        <div className="dropdown-wrap">
+          <button
+            className="toolbar-btn wide"
+            disabled={!availableTypes.length}
+            onClick={() => setAddMenuOpen((v) => !v)}
+          >
+            <Plus size={14} />
+            Add Component
+          </button>
+          {addMenuOpen && (
+            <>
+              <div className="dropdown-overlay" onClick={() => setAddMenuOpen(false)} />
+              <div className="dropdown-menu up">
+                {availableTypes.map((type) => (
+                  <button
+                    key={type}
+                    className="dropdown-item"
+                    onClick={() => {
+                      setAddMenuOpen(false);
+                      commandBus.execute(new AddComponentCommand(entity.id, type));
+                    }}
+                  >
+                    {getComponentClass(type).label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

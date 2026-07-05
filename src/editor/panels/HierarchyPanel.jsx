@@ -1,0 +1,673 @@
+import { useEffect, useState } from "react";
+import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square } from "lucide-react";
+import { useSceneStore } from "../store/sceneStore.js";
+import { useSelectionStore } from "../store/selectionStore.js";
+import { commandBus } from "../commands/CommandBus.js";
+import {
+  BatchCommand,
+  CreateEntityCommand,
+  RenameEntityCommand,
+  ReparentEntityCommand,
+  isDescendantOf,
+  topMostIds,
+} from "../commands/entityCommands.js";
+import { SetComponentPropCommand } from "../commands/componentCommands.js";
+import {
+  copyEntities,
+  cutEntities,
+  pasteEntities,
+  clipboardHasEntities,
+  duplicateSelection,
+  deleteSelection,
+} from "../clipboard.js";
+import { useAssetDrop } from "../assetDrag.js";
+import { instantiatePrefab } from "../prefab.js";
+import { extOf, PREFAB_EXTENSIONS, MODEL_EXTENSIONS } from "../assetLoader.js";
+import { basename } from "../store/projectStore.js";
+import { isFollowPickArmed, disarmFollowPick } from "./InspectorPanel.jsx";
+import { engine } from "../engineInstance.js";
+
+const DROPPABLE_ASSET_EXTENSIONS = [...PREFAB_EXTENSIONS, ...MODEL_EXTENSIONS];
+
+/** Assets-panel drop onto the tree: spawn under `parentId` (null = root). */
+function dropAssetOnEntity(path, parentId) {
+  const ext = extOf(path);
+  if (PREFAB_EXTENSIONS.includes(ext)) {
+    instantiatePrefab(path, null, parentId).catch((err) => console.error(String(err)));
+  } else if (MODEL_EXTENSIONS.includes(ext)) {
+    const cmd = new CreateEntityCommand({
+      name: basename(path).replace(/\.[^.]+$/, ""),
+      parentId,
+      components: [{ type: "model", props: { path } }],
+    });
+    commandBus.execute(cmd);
+    useSelectionStore.getState().select(cmd.entityId);
+  }
+}
+
+const CREATE_PRESETS = [
+  { label: "Empty", spec: { name: "Entity", components: [] } },
+  { label: "Box", spec: { name: "Box", components: [{ type: "mesh", props: { geometry: "box" } }] } },
+  { label: "Sphere", spec: { name: "Sphere", components: [{ type: "mesh", props: { geometry: "sphere" } }] } },
+  { label: "Plane", spec: { name: "Plane", components: [{ type: "mesh", props: { geometry: "plane" } }] } },
+  { label: "Cylinder", spec: { name: "Cylinder", components: [{ type: "mesh", props: { geometry: "cylinder" } }] } },
+  { label: "Cone", spec: { name: "Cone", components: [{ type: "mesh", props: { geometry: "cone" } }] } },
+  { label: "Torus", spec: { name: "Torus", components: [{ type: "mesh", props: { geometry: "torus" } }] } },
+  { label: "Directional Light", spec: { name: "Directional Light", components: [{ type: "light", props: { kind: "directional" } }] } },
+  { label: "Point Light", spec: { name: "Point Light", components: [{ type: "light", props: { kind: "point" } }] } },
+  { label: "Spot Light", spec: { name: "Spot Light", components: [{ type: "light", props: { kind: "spot" } }] } },
+  { label: "Camera", spec: { name: "Camera", components: [{ type: "camera" }] } },
+  { divider: true, label: "UI" },
+  { label: "UI Screen", spec: { name: "UI Screen", components: [{ type: "uiscreen" }] } },
+  {
+    label: "UI Panel",
+    spec: {
+      name: "Panel",
+      components: [
+        { type: "uielement", props: { size: [360, 240] } },
+        { type: "uiimage", props: { color: "#1c1d22", opacity: 0.92, cornerRadius: 14 } },
+      ],
+    },
+  },
+  {
+    label: "UI Image",
+    spec: {
+      name: "Image",
+      components: [{ type: "uielement", props: { size: [128, 128] } }, { type: "uiimage" }],
+    },
+  },
+  {
+    label: "UI Text",
+    spec: {
+      name: "Text",
+      components: [
+        { type: "uielement", props: { size: [220, 40] } },
+        { type: "uitext", props: { text: "New Text" } },
+      ],
+    },
+  },
+  {
+    label: "UI Button",
+    spec: {
+      name: "Button",
+      components: [
+        { type: "uielement", props: { size: [180, 44] } },
+        { type: "uiimage", props: { color: "#0a84ff", cornerRadius: 10 } },
+        { type: "uibutton" },
+      ],
+      children: [
+        {
+          name: "Label",
+          components: [
+            {
+              type: "uielement",
+              props: { anchorMin: [0, 0], anchorMax: [1, 1], size: [0, 0], raycastTarget: false },
+            },
+            { type: "uitext", props: { text: "Button", fontWeight: "600" } },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    label: "UI Layout (Column)",
+    spec: {
+      name: "Layout",
+      components: [
+        { type: "uielement", props: { size: [300, 400] } },
+        { type: "uilayout" },
+      ],
+    },
+  },
+  {
+    label: "UI Scroll View",
+    spec: {
+      name: "Scroll View",
+      components: [
+        { type: "uielement", props: { size: [320, 420] } },
+        { type: "uiimage", props: { color: "#151619", opacity: 0.9, cornerRadius: 12 } },
+        { type: "uiscroll" },
+      ],
+      children: [
+        {
+          name: "Content",
+          components: [
+            {
+              type: "uielement",
+              props: { anchorMin: [0, 0], anchorMax: [1, 0], pivot: [0.5, 0], size: [0, 420] },
+            },
+            { type: "uilayout", props: { fitContent: true } },
+          ],
+        },
+      ],
+    },
+  },
+];
+
+// Tauri's `dragDropEnabled` (default true, needed by the Assets panel for OS
+// file imports) intercepts the webview's native drag-and-drop wholesale —
+// dragstart/dragover/drop never fire for HTML5 `draggable` elements either.
+// So reordering here is implemented as a manual pointer-driven drag instead
+// of relying on the HTML5 DnD API.
+const DRAG_THRESHOLD_PX = 4;
+let dragSession = null; // { ids, sourceId, startX, startY, moved }
+let suppressNextClick = false;
+
+// Hovering a drag over a collapsed row with children auto-expands it after
+// a short delay, mirroring the OS file-explorer "hover to open" convention.
+const HOVER_EXPAND_MS = 600;
+let hoverExpandId = null;
+let hoverExpandTimer = null;
+
+function clearHoverExpand() {
+  hoverExpandId = null;
+  clearTimeout(hoverExpandTimer);
+  hoverExpandTimer = null;
+}
+
+/** Finds the row (or the tree's empty area) under a point, DOM-based. */
+function hitTestRow(clientX, clientY) {
+  const el = document.elementFromPoint(clientX, clientY);
+  if (!el) return null;
+  const row = el.closest("[data-entity-id]");
+  if (row) {
+    const rect = row.getBoundingClientRect();
+    const y = (clientY - rect.top) / rect.height;
+    const pos = y < 0.25 ? "before" : y > 0.75 ? "after" : "on";
+    return { id: row.dataset.entityId, pos };
+  }
+  return el.closest(".hierarchy-tree") ? { id: null, pos: "root" } : null;
+}
+
+/** Icon (and accent color) for what the entity primarily is, by component priority. */
+function EntityIcon({ components }) {
+  const { Icon, color } = components.uiscreen
+    ? { Icon: Monitor, color: "icon-camera" }
+    : components.uibutton
+    ? { Icon: MousePointerClick, color: "icon-particles" }
+    : components.uitext
+    ? { Icon: Type, color: "icon-script" }
+    : components.uiscroll
+    ? { Icon: ScrollText, color: "icon-model" }
+    : components.uilayout
+    ? { Icon: Rows3, color: "icon-model" }
+    : components.uiimage
+    ? { Icon: ImageIcon, color: "icon-mesh" }
+    : components.uielement
+    ? { Icon: Square, color: "icon-default" }
+    : components.camera
+    ? { Icon: Video, color: "icon-camera" }
+    : components.light
+      ? { Icon: Lightbulb, color: "icon-light" }
+      : components.particles
+        ? { Icon: Sparkles, color: "icon-particles" }
+        : components.mesh
+          ? { Icon: Box, color: "icon-mesh" }
+          : components.model
+            ? { Icon: Package, color: "icon-model" }
+            : components.script
+              ? { Icon: FileCode2, color: "icon-script" }
+              : { Icon: Circle, color: "icon-default" };
+  return <Icon className={`entity-icon ${color}`} size={13} strokeWidth={1.75} />;
+}
+
+/** Depth-first visible order of entity ids (for shift-range selection). */
+function flattenTree(rootIds, entities) {
+  const out = [];
+  const walk = (id) => {
+    const e = entities[id];
+    if (!e) return;
+    out.push(id);
+    e.childIds.forEach(walk);
+  };
+  rootIds.forEach(walk);
+  return out;
+}
+
+function handleRowClick(e, id, rootIds, entities) {
+  if (suppressNextClick) {
+    suppressNextClick = false;
+    return;
+  }
+  // If the inspector armed a "pick follow target" gesture, this click
+  // resolves it: assign `id` as the follow target of whichever camera
+  // entity is currently selected (single, mandatory) and disarm.
+  if (isFollowPickArmed()) {
+    disarmFollowPick();
+    const cameraId = useSelectionStore.getState().ids[0];
+    if (!cameraId) return;
+    const camera = engine.getEntity(cameraId);
+    if (!camera || !camera.getComponent("camera")) return;
+    // Use a direct SetComponentPropCommand so the change is undoable and
+    // matches every other prop change in the inspector.
+    commandBus.execute(new SetComponentPropCommand(cameraId, "camera", "followTarget", id));
+    return;
+  }
+  const sel = useSelectionStore.getState();
+  if (e.ctrlKey || e.metaKey) {
+    sel.toggle(id);
+  } else if (e.shiftKey && sel.anchorId) {
+    const order = flattenTree(rootIds, entities);
+    const a = order.indexOf(sel.anchorId);
+    const b = order.indexOf(id);
+    if (a === -1 || b === -1) return sel.select(id);
+    sel.select(order.slice(Math.min(a, b), Math.max(a, b) + 1), sel.anchorId);
+  } else {
+    sel.select(id);
+  }
+}
+
+/**
+ * Applies a drop. `pos` is "on" (make child of target), or "before"/"after"
+ * (insert as sibling of target). Reparents all dragged top-most entities in
+ * one undo step.
+ */
+function performDrop(draggedIds, targetId, pos) {
+  const { entities, rootIds } = useSceneStore.getState();
+  const ids = topMostIds(draggedIds).filter((id) => entities[id]);
+  const parentId = pos === "on" ? targetId : (entities[targetId]?.parentId ?? null);
+
+  const valid = ids.filter(
+    (id) => id !== targetId && !(parentId && isDescendantOf(parentId, id)) && id !== parentId,
+  );
+  if (!valid.length) return;
+
+  const cmds = [];
+  if (pos === "on") {
+    for (const id of valid) {
+      if (entities[id]?.parentId !== parentId) cmds.push(new ReparentEntityCommand(id, parentId));
+      else cmds.push(new ReparentEntityCommand(id, parentId, null)); // move to end
+    }
+  } else {
+    // Sibling list without the dragged entities → stable insertion index.
+    const siblings = (parentId ? entities[parentId].childIds : rootIds).filter((id) => !valid.includes(id));
+    let index = siblings.indexOf(targetId);
+    if (index === -1) index = siblings.length;
+    if (pos === "after") index += 1;
+    valid.forEach((id, i) => cmds.push(new ReparentEntityCommand(id, parentId, index + i)));
+  }
+  commandBus.execute(new BatchCommand(cmds, cmds.length === 1 ? cmds[0].label : `Move ${cmds.length} entities`));
+}
+
+/** Drop onto the empty tree area: move dragged top-most entities to scene root. */
+function performDropToRoot(draggedIds) {
+  const { entities } = useSceneStore.getState();
+  const ids = topMostIds(draggedIds).filter((id) => entities[id]?.parentId);
+  if (!ids.length) return;
+  const cmds = ids.map((id) => new ReparentEntityCommand(id, null));
+  commandBus.execute(new BatchCommand(cmds, cmds.length === 1 ? cmds[0].label : `Move ${cmds.length} entities`));
+}
+
+function EntityRow({
+  id,
+  depth,
+  renamingId,
+  setRenamingId,
+  dropHint,
+  setDropHint,
+  onContextMenu,
+  rootIds,
+  collapsedIds,
+  setCollapsedIds,
+  draggingIds,
+  onRowPointerDown,
+}) {
+  const entity = useSceneStore((s) => s.entities[id]);
+  const selected = useSelectionStore((s) => s.ids.includes(id));
+  // Assets-panel drags (.entity/.glb) land on rows as "add as child".
+  const assetDropRef = useAssetDrop({
+    accepts: DROPPABLE_ASSET_EXTENSIONS,
+    onDrop: (path) => dropAssetOnEntity(path, id),
+  });
+  if (!entity) return null;
+
+  const isDragging = draggingIds.includes(id);
+
+  const hasChildren = entity.childIds.length > 0;
+  const collapsed = hasChildren && collapsedIds.has(id);
+
+  const commitRename = (value) => {
+    setRenamingId(null);
+    const name = value.trim();
+    if (name && name !== entity.name) {
+      commandBus.execute(new RenameEntityCommand(id, name));
+    }
+  };
+
+  const toggleCollapsed = (e) => {
+    e.stopPropagation();
+    setCollapsedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const hintPos = dropHint?.id === id ? dropHint.pos : null;
+
+  return (
+    <>
+      <div
+        className={`hierarchy-row ${selected ? "selected" : ""} ${isDragging ? "row-dragging" : ""} ${
+          hintPos === "on" ? "drop-target" : ""
+        } ${hintPos === "before" ? "drop-before" : ""} ${hintPos === "after" ? "drop-after" : ""}`}
+        style={{ paddingLeft: 8 + depth * 14 }}
+        data-entity-id={id}
+        ref={assetDropRef}
+        onClick={(e) => handleRowClick(e, id, rootIds, useSceneStore.getState().entities)}
+        onDoubleClick={() => setRenamingId(id)}
+        onContextMenu={(e) => onContextMenu(e, id)}
+        onPointerDown={(e) => onRowPointerDown(e, id)}
+      >
+        {hasChildren ? (
+          <button className={`row-disclosure ${collapsed ? "collapsed" : ""}`} onClick={toggleCollapsed}>
+            <ChevronRight size={12} strokeWidth={2} />
+          </button>
+        ) : (
+          <span className="row-disclosure-spacer" />
+        )}
+        {renamingId === id ? (
+          <input
+            className="rename-input"
+            autoFocus
+            defaultValue={entity.name}
+            onFocus={(e) => e.target.select()}
+            onBlur={(e) => commitRename(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitRename(e.target.value);
+              if (e.key === "Escape") setRenamingId(null);
+            }}
+            onClick={(e) => e.stopPropagation()}
+          />
+        ) : (
+          <>
+            <EntityIcon components={entity.components} />
+            <span className="entity-name">{entity.name}</span>
+          </>
+        )}
+      </div>
+      {!collapsed &&
+        entity.childIds.map((childId) => (
+          <EntityRow
+            key={childId}
+            id={childId}
+            depth={depth + 1}
+            renamingId={renamingId}
+            setRenamingId={setRenamingId}
+            dropHint={dropHint}
+            setDropHint={setDropHint}
+            onContextMenu={onContextMenu}
+            rootIds={rootIds}
+            collapsedIds={collapsedIds}
+            setCollapsedIds={setCollapsedIds}
+            draggingIds={draggingIds}
+            onRowPointerDown={onRowPointerDown}
+          />
+        ))}
+    </>
+  );
+}
+
+function ContextMenu({ menu, close, setRenamingId }) {
+  const selection = useSelectionStore.getState().ids;
+  const single = selection.length === 1 ? selection[0] : null;
+  const canPaste = clipboardHasEntities();
+
+  const items = [
+    { label: "Copy", shortcut: "Ctrl+C", action: () => copyEntities(selection) },
+    { label: "Cut", shortcut: "Ctrl+X", action: () => cutEntities(selection) },
+    {
+      label: "Paste",
+      shortcut: "Ctrl+V",
+      disabled: !canPaste,
+      action: () => pasteEntities(single ? useSceneStore.getState().entities[single]?.parentId : null),
+    },
+    { label: "Paste as Child", disabled: !canPaste || !single, action: () => pasteEntities(single) },
+    { separator: true },
+    { label: "Duplicate", shortcut: "Ctrl+D", action: duplicateSelection },
+    { label: "Rename", disabled: !single, action: () => setRenamingId(single) },
+    { separator: true },
+    { label: "Delete", shortcut: "Del", action: deleteSelection },
+  ];
+
+  return (
+    <>
+      <div className="dropdown-overlay" onClick={close} onContextMenu={(e) => { e.preventDefault(); close(); }} />
+      <div className="dropdown-menu context-menu" style={{ left: menu.x, top: menu.y }}>
+        {items.map((item, i) =>
+          item.separator ? (
+            <div key={i} className="menu-separator" />
+          ) : (
+            <button
+              key={item.label}
+              className="dropdown-item"
+              disabled={item.disabled}
+              onClick={() => {
+                close();
+                item.action();
+              }}
+            >
+              <span>{item.label}</span>
+              {item.shortcut && <span className="menu-shortcut">{item.shortcut}</span>}
+            </button>
+          ),
+        )}
+      </div>
+    </>
+  );
+}
+
+export function HierarchyPanel() {
+  const rootIds = useSceneStore((s) => s.rootIds);
+  const sceneName = useSceneStore((s) => s.sceneName);
+  const dirty = useSceneStore((s) => s.dirty);
+  const selection = useSelectionStore((s) => s.ids);
+  const [renamingId, setRenamingId] = useState(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [dropHint, setDropHint] = useState(null);
+  const [contextMenu, setContextMenu] = useState(null); // {x, y}
+  const [collapsedIds, setCollapsedIds] = useState(() => new Set());
+  const [draggingIds, setDraggingIds] = useState([]);
+  const [ghostPos, setGhostPos] = useState(null); // {x, y}
+
+  // Assets dropped on empty tree space spawn at the scene root.
+  const treeAssetDropRef = useAssetDrop({
+    accepts: DROPPABLE_ASSET_EXTENSIONS,
+    onDrop: (path) => dropAssetOnEntity(path, null),
+  });
+
+  // Manual pointer-driven drag (see the DRAG_THRESHOLD_PX comment above):
+  // pointerdown on a row arms a session; once the pointer moves past the
+  // threshold it becomes an active drag, hit-tested purely via the DOM
+  // (elementFromPoint) since HTML5 DnD events don't reach us in Tauri.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape" && isFollowPickArmed()) disarmFollowPick();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  useEffect(() => {
+    const onMove = (e) => {
+      if (!dragSession) return;
+      if (!dragSession.moved) {
+        const dx = e.clientX - dragSession.startX;
+        const dy = e.clientY - dragSession.startY;
+        if (Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+        dragSession.moved = true;
+        const sel = useSelectionStore.getState().ids;
+        dragSession.ids = sel.includes(dragSession.sourceId) ? [...sel] : [dragSession.sourceId];
+        setDraggingIds(dragSession.ids);
+      }
+      setGhostPos({ x: e.clientX, y: e.clientY });
+
+      const hit = hitTestRow(e.clientX, e.clientY);
+      if (!hit || hit.id === null || dragSession.ids.includes(hit.id)) {
+        setDropHint(null);
+        clearHoverExpand();
+        return;
+      }
+      setDropHint((cur) => (cur?.id === hit.id && cur.pos === hit.pos ? cur : { id: hit.id, pos: hit.pos }));
+
+      const entities = useSceneStore.getState().entities;
+      const hasChildren = (entities[hit.id]?.childIds.length ?? 0) > 0;
+      if (hit.pos === "on" && hasChildren) {
+        if (hoverExpandId !== hit.id) {
+          clearHoverExpand();
+          hoverExpandId = hit.id;
+          hoverExpandTimer = setTimeout(() => {
+            setCollapsedIds((prev) => {
+              if (!prev.has(hit.id)) return prev;
+              const next = new Set(prev);
+              next.delete(hit.id);
+              return next;
+            });
+            clearHoverExpand();
+          }, HOVER_EXPAND_MS);
+        }
+      } else if (hoverExpandId) {
+        clearHoverExpand();
+      }
+    };
+
+    const onUp = (e) => {
+      if (!dragSession) return;
+      if (dragSession.moved) {
+        suppressNextClick = true;
+        setTimeout(() => (suppressNextClick = false), 300);
+        const hit = hitTestRow(e.clientX, e.clientY);
+        if (hit && !dragSession.ids.includes(hit.id)) {
+          if (hit.id === null) performDropToRoot(dragSession.ids);
+          else performDrop(dragSession.ids, hit.id, hit.pos);
+        }
+      }
+      dragSession = null;
+      clearHoverExpand();
+      setDraggingIds([]);
+      setDropHint(null);
+      setGhostPos(null);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      dragSession = null;
+      clearHoverExpand();
+    };
+  }, []);
+
+  const onRowPointerDown = (e, id) => {
+    if (e.button !== 0 || renamingId === id) return;
+    if (e.target.closest("button, input")) return;
+    dragSession = { ids: null, sourceId: id, startX: e.clientX, startY: e.clientY, moved: false };
+  };
+
+  const createEntity = (spec) => {
+    setMenuOpen(false);
+    const selected = useSelectionStore.getState().ids;
+    const parentId = selected.length === 1 ? selected[0] : null;
+    const cmd = new CreateEntityCommand(parentId ? { ...spec, parentId } : spec);
+    commandBus.execute(cmd);
+    useSelectionStore.getState().select(cmd.entityId);
+    if (parentId) {
+      setCollapsedIds((prev) => {
+        if (!prev.has(parentId)) return prev;
+        const next = new Set(prev);
+        next.delete(parentId);
+        return next;
+      });
+    }
+  };
+
+  const onRowContextMenu = (e, id) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!useSelectionStore.getState().ids.includes(id)) {
+      useSelectionStore.getState().select(id);
+    }
+    setContextMenu({ x: e.clientX, y: e.clientY });
+  };
+
+  return (
+    <div className="hierarchy-panel">
+      <div className="panel-toolbar">
+        <div className="dropdown-wrap">
+          <button className="toolbar-btn" onClick={() => setMenuOpen((v) => !v)}> <Plus size={14} /> </button>
+          {menuOpen && (
+            <>
+              <div className="dropdown-overlay" onClick={() => setMenuOpen(false)} />
+              <div className="dropdown-menu">
+                {CREATE_PRESETS.map((p) =>
+                  p.divider ? (
+                    <div key={p.label} className="dropdown-section-label">{p.label}</div>
+                  ) : (
+                    <button key={p.label} className="dropdown-item" onClick={() => createEntity(p.spec)}>
+                      {p.label}
+                    </button>
+                  ),
+                )}
+              </div>
+            </>
+          )}
+        </div>
+        <button
+          className="toolbar-btn icon-only"
+          title="Delete selection (Del)"
+          disabled={!selection.length}
+          onClick={deleteSelection}
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
+      <div className="scene-label">
+        {sceneName}
+        {dirty ? " •" : ""}
+      </div>
+      <div
+        className={`hierarchy-tree ${isFollowPickArmed() ? "follow-pick-armed" : ""}`}
+        ref={treeAssetDropRef}
+        onClick={(e) => {
+          if (isFollowPickArmed()) {
+            // A click on a row already handled the pick via handleRowClick;
+            // only react here for clicks on the empty tree area to disarm.
+            if (e.target === e.currentTarget) disarmFollowPick();
+            return;
+          }
+          if (e.target === e.currentTarget) useSelectionStore.getState().clear();
+        }}
+      >
+        {rootIds.map((id) => (
+          <EntityRow
+            key={id}
+            id={id}
+            depth={0}
+            renamingId={renamingId}
+            setRenamingId={setRenamingId}
+            dropHint={dropHint}
+            setDropHint={setDropHint}
+            onContextMenu={onRowContextMenu}
+            rootIds={rootIds}
+            collapsedIds={collapsedIds}
+            setCollapsedIds={setCollapsedIds}
+            draggingIds={draggingIds}
+            onRowPointerDown={onRowPointerDown}
+          />
+        ))}
+      </div>
+      {contextMenu && (
+        <ContextMenu menu={contextMenu} close={() => setContextMenu(null)} setRenamingId={setRenamingId} />
+      )}
+      {ghostPos && draggingIds.length > 0 && (
+        <div className="hierarchy-drag-ghost" style={{ left: ghostPos.x, top: ghostPos.y }}>
+          {draggingIds.length === 1
+            ? (useSceneStore.getState().entities[draggingIds[0]]?.name ?? "Entity")
+            : `${draggingIds.length} entities`}
+        </div>
+      )}
+    </div>
+  );
+}
