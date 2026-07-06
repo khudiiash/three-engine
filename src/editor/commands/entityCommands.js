@@ -91,6 +91,28 @@ export class RenameEntityCommand {
   }
 }
 
+/**
+ * Toggles the entity-wide `viewOnly` flag. When true, every component on
+ * the entity opts into frustum-gated ticking (the per-component `viewOnly`
+ * is an OR with this — see `Entity.setViewOnly`).
+ */
+export class SetEntityViewOnlyCommand {
+  constructor(entityId, value) {
+    this.entityId = entityId;
+    this.value = !!value;
+    this.oldValue = !!engine.getEntity(entityId)?.viewOnly;
+    this.label = this.value ? "View Only" : "Always On";
+  }
+
+  do() {
+    engine.getEntity(this.entityId)?.setViewOnly(this.value);
+  }
+
+  undo() {
+    engine.getEntity(this.entityId)?.setViewOnly(this.oldValue);
+  }
+}
+
 /** True if `candidateId` is `entityId` itself or one of its descendants. */
 export function isDescendantOf(candidateId, entityId) {
   const entity = engine.getEntity(entityId);

@@ -4,6 +4,7 @@ import { Entity } from "./Entity.js";
 import { SCENE_SETTINGS_DEFAULTS, mergeSettings, applySettingsToScene } from "./sceneSettings.js";
 import { InputManager } from "./input/index.js";
 import { createDefaultMaps } from "./input/defaultMaps.js";
+import { ViewFrustum } from "./viewFrustum.js";
 
 /**
  * Runtime core: owns the renderer, the three.js scene (source of truth)
@@ -28,6 +29,10 @@ export class Engine extends EventEmitter {
     this.playing = false;
     this.rendererReady = false;
     this.modules = new Map(); // module id -> setup handle (see modules.js)
+    // Per-frame frustum state. Shared by every view-only component so the
+    // view*projection matrix is multiplied exactly once per frame (and even
+    // then only when the active camera actually moved). See viewFrustum.js.
+    this.viewFrustum = new ViewFrustum();
 
     // Host-tunable runtime behavior (the editor writes project settings here).
     this.config = { scriptHotReload: true, scriptReloadIntervalMs: 750 };
@@ -148,6 +153,24 @@ export class Engine extends EventEmitter {
   #tick() {
     this.timer.update();
     const dt = this.timer.getDelta();
+    // Refresh the shared frustum before update callbacks run so per-entity
+    // culling decisions see the current frame. The frustum internally
+    // no-ops when the camera hasn't moved, so this is one cheap
+    // matrix-multiply hash check on a static-camera frame.
+    this.viewFrustum.refresh(this.camera);
+    // Update `_inView` on every view-only component. Components that opted
+    // in (their `viewOnly` getter returns true) get one sphere/plane test
+    // each; the rest are skipped entirely. We don't track this in a Set
+    // because the walk is linear in the entity tree (cheap, and avoids
+    // bookkeeping on every component add/remove/prop change).
+    if (this.viewFrustum.isReady()) {
+      for (const entity of this.entities.values()) {
+        for (const c of entity.components.values()) {
+          if (!c.viewOnly) continue;
+          c.updateViewVisibility(this.viewFrustum);
+        }
+      }
+    }
     for (const fn of this.updateCallbacks) fn(dt);
     // rendererReady guards the re-init window (init() swaps the renderer
     // asynchronously; rendering before its backend resolves throws).

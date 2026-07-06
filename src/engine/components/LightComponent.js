@@ -58,6 +58,8 @@ export class LightComponent extends Component {
       this.light.target.position.set(0, 0, -1);
       this.entity.object3D.add(this.light.target);
     }
+    // Honour the enabled flag at attach time.
+    this.light.visible = this._enabled;
   }
 
   onDetach() {
@@ -66,6 +68,14 @@ export class LightComponent extends Component {
     this.entity.object3D.remove(this.light);
     this.light.dispose?.();
     this.light = null;
+  }
+
+  onDisable() {
+    if (this.light) this.light.visible = false;
+  }
+
+  onEnable() {
+    if (this.light) this.light.visible = true;
   }
 
   onPropChanged(key) {

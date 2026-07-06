@@ -41,6 +41,8 @@ export class MeshComponent extends Component {
     this.mesh.receiveShadow = !!this.props.receiveShadow;
     this.entity.object3D.add(this.mesh);
     if (this.props.material) this.#loadSharedMaterial(this.props.material);
+    // Honour the enabled flag at attach time.
+    this.mesh.visible = this.enabled;
   }
 
   onDetach() {
@@ -49,6 +51,14 @@ export class MeshComponent extends Component {
     this.entity.object3D.remove(this.mesh);
     this.mesh.geometry.dispose();
     this.mesh = null;
+  }
+
+  onDisable() {
+    if (this.mesh) this.mesh.visible = false;
+  }
+
+  onEnable() {
+    if (this.mesh) this.mesh.visible = true;
   }
 
   async #loadSharedMaterial(path) {

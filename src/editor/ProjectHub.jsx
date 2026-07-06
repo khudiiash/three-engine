@@ -9,6 +9,7 @@ import {
   ArrowRight,
   Clock,
   FileBox,
+  X,
 } from "lucide-react";
 import { useProjectStore, basename } from "./store/projectStore.js";
 
@@ -64,26 +65,48 @@ function HubButton({ icon: Icon, title, sub, onClick, accent }) {
   );
 }
 
-function RecentRow({ path, onOpen }) {
+function RecentRow({ path, onOpen, onRemove }) {
   const parent = path.replace(/[\\/][^\\/]+$/, "");
+  // The whole row is a button, but the remove control must be a separate
+  // <button> so it gets its own focus + click target. We split the row into
+  // two adjacent buttons inside a grid-friendly wrapper so the layout is
+  // identical to before.
   return (
-    <button className="hub-recent" onClick={() => onOpen(path)} title={path}>
-      <span className="hub-recent-thumb">
-        <FileBox size={20} strokeWidth={1.7} />
-      </span>
-      <span className="hub-recent-meta">
-        <span className="hub-recent-name">{basename(path)}</span>
-        <span className="hub-recent-path">{parent}</span>
-      </span>
-      <span className="hub-recent-open">
-        Open <ArrowRight size={13} strokeWidth={2.2} />
-      </span>
-    </button>
+    <div className="hub-recent" title={path}>
+      <button
+        type="button"
+        className="hub-recent-open-btn"
+        onClick={() => onOpen(path)}
+      >
+        <span className="hub-recent-thumb">
+          <FileBox size={20} strokeWidth={1.7} />
+        </span>
+        <span className="hub-recent-meta">
+          <span className="hub-recent-name">{basename(path)}</span>
+          <span className="hub-recent-path">{parent}</span>
+        </span>
+        <span className="hub-recent-open">
+          Open <ArrowRight size={13} strokeWidth={2.2} />
+        </span>
+      </button>
+      <button
+        type="button"
+        className="hub-recent-remove"
+        onClick={(e) => {
+          e.stopPropagation();
+          onRemove(path);
+        }}
+        title={`Remove ${basename(path)} from recent list`}
+        aria-label={`Remove ${basename(path)} from recent list`}
+      >
+        <X size={14} strokeWidth={2.2} />
+      </button>
+    </div>
   );
 }
 
 export function ProjectHub() {
-  const { recent, createProject, openFolder, openProject, skipHub } = useProjectStore();
+  const { recent, createProject, openFolder, openProject, skipHub, removeRecent } = useProjectStore();
 
   return (
     <div className="hub-shell">
@@ -159,7 +182,7 @@ export function ProjectHub() {
             </header>
             <div className="hub-recent-list">
               {recent.map((path) => (
-                <RecentRow key={path} path={path} onOpen={openProject} />
+                <RecentRow key={path} path={path} onOpen={openProject} onRemove={removeRecent} />
               ))}
             </div>
           </section>

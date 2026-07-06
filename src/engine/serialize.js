@@ -5,6 +5,7 @@ export function serializeEntity(entity) {
     id: entity.id,
     name: entity.name,
     ...entity.getTransform(),
+    viewOnly: !!entity.viewOnly,
     components: [...entity.components.values()].map((c) => c.toJSON()),
     children: entity.children.map(serializeEntity),
   };
@@ -22,6 +23,9 @@ export function serializeScene(engine) {
 export function instantiateEntity(engine, data, parent) {
   const entity = engine.createEntity({ id: data.id, name: data.name, parent });
   entity.setTransform(data);
+  // Restore the entity-wide viewOnly flag before attaching components so
+  // their initial `_viewOnlyActive` cache picks up the inherited state.
+  if (data.viewOnly) entity.setViewOnly(true);
   for (const { type, props } of data.components ?? []) {
     entity.addComponent(type, props);
   }

@@ -116,6 +116,12 @@ export class ScriptComponent extends Component {
       this.reloadTimer = 0;
       if (this.props.path && config.scriptHotReload !== false) this.#reloadModule();
     }
-    if (this.running) this.instance?.onUpdate?.(dt);
+    // View-only gate: when the entity is outside the camera frustum we
+    // pause `onUpdate` so the script idles. `onStart` / `onDestroy` still
+    // fire on play-changed so the script gets a clean lifecycle when it
+    // first becomes visible (or stays running if it was already visible).
+    // We never tear the instance down on frustum exit — the cost of
+    // re-creating it on re-entry would dwarf the saved cycles.
+    if (this.running && this.isInView()) this.instance?.onUpdate?.(dt);
   }
 }

@@ -46,6 +46,9 @@ export class ModelComponent extends Component {
       });
       this.entity.object3D.add(this.root);
       await this.#applyMaterialOverrides(generation);
+      // Honour the enabled flag at load time — visible by default, hidden if
+      // the user saved the scene with the component disabled.
+      this.root.visible = this._enabled;
       this.entity.engine.emit("model-loaded", this.entity);
     } catch (err) {
       console.error(`Failed to load model "${path}": ${err.message}`);
@@ -89,6 +92,14 @@ export class ModelComponent extends Component {
     this.root = null;
     this.clips = [];
     this.sharedMaterials.clear();
+  }
+
+  onDisable() {
+    if (this.root) this.root.visible = false;
+  }
+
+  onEnable() {
+    if (this.root) this.root.visible = true;
   }
 
   onPropChanged(key) {

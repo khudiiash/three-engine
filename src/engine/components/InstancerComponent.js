@@ -135,6 +135,7 @@ export class InstancerComponent extends Component {
     else this.instancedMesh.material = sourceMesh.material;
 
     this._parent.add(this.instancedMesh);
+    this.instancedMesh.visible = this._enabled;
   }
 
   onDetach() {
@@ -144,6 +145,14 @@ export class InstancerComponent extends Component {
     this._parent = null;
     if (this._ownsGeometry) this.instancedMesh.geometry.dispose();
     this.instancedMesh = null;
+  }
+
+  onDisable() {
+    if (this.instancedMesh) this.instancedMesh.visible = false;
+  }
+
+  onEnable() {
+    if (this.instancedMesh) this.instancedMesh.visible = true;
   }
 
   /**

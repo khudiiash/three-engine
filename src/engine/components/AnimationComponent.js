@@ -116,6 +116,8 @@ export class AnimationComponent extends Component {
   }
 
   #tick(dt) {
+    if (!this.enabled) return;
+    if (!this.isInView()) return;
     if (!this.runtime) return;
     if (this.entity.engine.playing || this.props.playInEditor) this.runtime.update(dt);
   }

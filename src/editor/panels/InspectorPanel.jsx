@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
-import { X, Plus, Crosshair, Eye, EyeOff } from "lucide-react";
+import { X, Plus, Crosshair, Eye, EyeOff, ScanEye } from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { getComponentClass, getComponentTypes } from "../../engine/index.js";
 import { commandBus } from "../commands/CommandBus.js";
-import { RenameEntityCommand, BatchCommand } from "../commands/entityCommands.js";
+import { RenameEntityCommand, BatchCommand, SetEntityViewOnlyCommand } from "../commands/entityCommands.js";
 import { ANCHOR_PRESETS, applyAnchorPreset } from "../../engine/ui/layout.js";
 import { SetTransformCommand } from "../commands/transformCommands.js";
 import {
@@ -603,6 +603,35 @@ function UiElementSection({ entityId, props }) {
 
 function ComponentSection({ entityId, type, props }) {
   const cls = getComponentClass(type);
+  // Mirror the live `enabled` flag into local state so the eye icon
+  // reflects the engine's current decision (the scene mirror doesn't
+  // refresh on every component prop change without a re-render trigger).
+  // We deliberately read from the engine here — same pattern as the
+  // camera-follow section above — so external mutations (undo/redo,
+  // scene load) all show up in the UI.
+  const [, force] = useState(0);
+  useEffect(() => {
+    const onChange = (info) => {
+      if (info.entityId === entityId && info.componentType === type) force((v) => v + 1);
+    };
+    return engine.on("component-changed", onChange);
+  }, [entityId, type]);
+  const component = engine.getEntity(entityId)?.getComponent(type);
+  const enabled = component ? component.enabled !== false : props.enabled !== false;
+  // viewOnly: per-component OR entity-wide. Reading both keeps the toggle
+  // showing the user's effective intent — if the entity toggle is on, this
+  // component is gated even when its own prop is off (and vice versa).
+  const entityViewOnly = !!engine.getEntity(entityId)?.viewOnly;
+  const viewOnly = component ? component.viewOnly : (!!props.viewOnly || entityViewOnly);
+  const toggleEnabled = () => {
+    if (!component) return;
+    commandBus.execute(new SetComponentPropCommand(entityId, type, "enabled", !enabled));
+  };
+  const toggleViewOnly = () => {
+    if (!component) return;
+    commandBus.execute(new SetComponentPropCommand(entityId, type, "viewOnly", !viewOnly));
+  };
+
   // Unknown type: its module is disabled. The data survives — say so.
   if (!cls) {
     return (
@@ -627,9 +656,29 @@ function ComponentSection({ entityId, type, props }) {
   }
 
   return (
-    <div className="inspector-section">
+    <div className={`inspector-section ${enabled ? "" : "disabled"}`}>
       <div className="section-header">
         {cls.label}
+        <button
+          className={`icon-btn ${viewOnly ? "active-toggle" : ""}`}
+          title={
+            viewOnly
+              ? entityViewOnly && !props.viewOnly
+                ? "View-Only (inherited from entity)"
+                : "Disable view-only gating"
+              : "Pause while off-camera"
+          }
+          onClick={toggleViewOnly}
+        >
+          <ScanEye size={12} />
+        </button>
+        <button
+          className="icon-btn"
+          title={enabled ? "Disable component" : "Enable component"}
+          onClick={toggleEnabled}
+        >
+          {enabled ? <Eye size={12} /> : <EyeOff size={12} />}
+        </button>
         <button
           className="icon-btn"
           title="Remove component"
@@ -764,6 +813,18 @@ export function InspectorPanel() {
             onBlur={(e) => commitName(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && e.target.blur()}
           />
+        </div>
+        <div className="field-row">
+          <span className="field-label">View Only</span>
+          <label className="field-row inline" title="Pause this entity's components while it is outside the camera frustum">
+            <input
+              type="checkbox"
+              checked={!!engine.getEntity(entity.id)?.viewOnly}
+              onChange={(e) =>
+                commandBus.execute(new SetEntityViewOnlyCommand(entity.id, e.target.checked))
+              }
+            />
+          </label>
         </div>
       </div>
 

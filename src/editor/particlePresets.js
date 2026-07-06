@@ -6,21 +6,48 @@
  */
 
 export const PARTICLE_PRESETS = {
+  // Two independent emitter branches sharing one component: a wide flame
+  // body (rise-then-fade opacity and a fat-near-base/thin-near-tip size
+  // curve, the same layered-forces technique Smoke uses) plus a second,
+  // faster-rising ember layer — the flagship demo of multi-emitter graphs.
   Fire: {
     nodes: [
-      { id: "emit", type: "emitCone", props: { radius: 0.18, angle: 14 }, position: { x: -60, y: 40 } },
-      { id: "speed", type: "float", props: { value: 1.6 }, position: { x: -60, y: 230 } },
+      // --- Flame body -------------------------------------------------------
+      { id: "emit", type: "emitCone", props: { radius: 0.28, angle: 22 }, position: { x: -60, y: 40 } },
+      { id: "speed", type: "float", props: { value: 1.8 }, position: { x: -60, y: 230 } },
       { id: "vel", type: "multiply", props: {}, position: { x: 170, y: 120 } },
-      { id: "heat", type: "buoyancy", props: { strength: 4, flicker: 1 }, position: { x: -60, y: 360 } },
-      { id: "turb", type: "turbulence", props: { frequency: 1.4, strength: 1.6, speed: 0.6 }, position: { x: -60, y: 520 } },
-      { id: "drag", type: "drag", props: { amount: 0.6 }, position: { x: -60, y: 690 } },
+      { id: "heat", type: "buoyancy", props: { strength: 4.2, flicker: 1 }, position: { x: -60, y: 360 } },
+      { id: "turb", type: "turbulence", props: { frequency: 1.4, strength: 1.9, speed: 0.7 }, position: { x: -60, y: 520 } },
+      { id: "windN", type: "wind", props: { direction: [1, 0, 0.15], strength: 0.25, gustiness: 0.6, gustFrequency: 0.6 }, position: { x: -60, y: 690 } },
+      { id: "drag", type: "drag", props: { amount: 0.6 }, position: { x: -60, y: 860 } },
       { id: "f1", type: "add", props: {}, position: { x: 170, y: 430 } },
       { id: "f2", type: "add", props: {}, position: { x: 170, y: 590 } },
+      { id: "f3", type: "add", props: {}, position: { x: 170, y: 750 } },
       { id: "ramp", type: "gradient", props: { from: "#ffe08a", to: "#ff2200" }, position: { x: 170, y: 260 } },
-      { id: "shrink", type: "remap", props: { inMin: 0, inMax: 1, outMin: 0.3, outMax: 0.05 }, position: { x: 170, y: 740 } },
-      { id: "sys", type: "system", props: { capacity: 3000, lifetime: 1.3, lifetimeJitter: 0.4, additive: true }, position: { x: 470, y: 180 } },
+      { id: "sizeRise", type: "remap", props: { inMin: 0, inMax: 0.2, outMin: 0.05, outMax: 0.42 }, position: { x: 450, y: 620 } },
+      { id: "sizeFall", type: "remap", props: { inMin: 0, inMax: 1, outMin: 1, outMax: 0.15 }, position: { x: 450, y: 780 } },
+      { id: "sizeMul", type: "multiply", props: {}, position: { x: 700, y: 700 } },
+      { id: "opRise", type: "remap", props: { inMin: 0, inMax: 0.15, outMin: 0, outMax: 1 }, position: { x: 450, y: 940 } },
+      { id: "opFall", type: "remap", props: { inMin: 0, inMax: 1, outMin: 1, outMax: 0 }, position: { x: 450, y: 1080 } },
+      { id: "opMul", type: "multiply", props: {}, position: { x: 700, y: 1010 } },
+      { id: "sys", type: "system", props: { capacity: 3000, lifetime: 1.3, lifetimeJitter: 0.4, additive: true }, position: { x: 950, y: 180 } },
+
+      // --- Embers (second, independent emitter branch) ----------------------
+      { id: "e_emit", type: "emitCone", props: { radius: 0.14, angle: 10 }, position: { x: -60, y: 1300 } },
+      { id: "e_speed", type: "float", props: { value: 3.5 }, position: { x: -60, y: 1480 } },
+      { id: "e_vel", type: "multiply", props: {}, position: { x: 170, y: 1360 } },
+      { id: "e_heat", type: "buoyancy", props: { strength: 5, flicker: 1.2 }, position: { x: -60, y: 1640 } },
+      { id: "e_turb", type: "turbulence", props: { frequency: 1.8, strength: 1.2, speed: 0.9 }, position: { x: -60, y: 1800 } },
+      { id: "e_f1", type: "add", props: {}, position: { x: 170, y: 1720 } },
+      { id: "e_ramp", type: "gradient", props: { from: "#fff6d0", to: "#ff8a1e" }, position: { x: 170, y: 1500 } },
+      { id: "e_size", type: "remap", props: { inMin: 0, inMax: 1, outMin: 0.035, outMax: 0.01 }, position: { x: 450, y: 1860 } },
+      { id: "e_opRise", type: "remap", props: { inMin: 0, inMax: 0.1, outMin: 0, outMax: 1 }, position: { x: 450, y: 2000 } },
+      { id: "e_opFall", type: "remap", props: { inMin: 0, inMax: 1, outMin: 1, outMax: 0 }, position: { x: 450, y: 2140 } },
+      { id: "e_opMul", type: "multiply", props: {}, position: { x: 700, y: 2070 } },
+      { id: "e_sys", type: "system", props: { capacity: 500, lifetime: 0.7, lifetimeJitter: 0.5, sizeJitter: 0.4, additive: true }, position: { x: 950, y: 1500 } },
     ],
     edges: [
+      // Flame body
       { source: "emit", sourceHandle: "pos", target: "sys", targetHandle: "position" },
       { source: "emit", sourceHandle: "dir", target: "vel", targetHandle: "a" },
       { source: "speed", sourceHandle: "out", target: "vel", targetHandle: "b" },
@@ -28,10 +55,31 @@ export const PARTICLE_PRESETS = {
       { source: "heat", sourceHandle: "out", target: "f1", targetHandle: "a" },
       { source: "turb", sourceHandle: "out", target: "f1", targetHandle: "b" },
       { source: "f1", sourceHandle: "out", target: "f2", targetHandle: "a" },
-      { source: "drag", sourceHandle: "out", target: "f2", targetHandle: "b" },
-      { source: "f2", sourceHandle: "out", target: "sys", targetHandle: "force" },
+      { source: "windN", sourceHandle: "out", target: "f2", targetHandle: "b" },
+      { source: "f2", sourceHandle: "out", target: "f3", targetHandle: "a" },
+      { source: "drag", sourceHandle: "out", target: "f3", targetHandle: "b" },
+      { source: "f3", sourceHandle: "out", target: "sys", targetHandle: "force" },
       { source: "ramp", sourceHandle: "out", target: "sys", targetHandle: "color" },
-      { source: "shrink", sourceHandle: "out", target: "sys", targetHandle: "size" },
+      { source: "sizeRise", sourceHandle: "out", target: "sizeMul", targetHandle: "a" },
+      { source: "sizeFall", sourceHandle: "out", target: "sizeMul", targetHandle: "b" },
+      { source: "sizeMul", sourceHandle: "out", target: "sys", targetHandle: "size" },
+      { source: "opRise", sourceHandle: "out", target: "opMul", targetHandle: "a" },
+      { source: "opFall", sourceHandle: "out", target: "opMul", targetHandle: "b" },
+      { source: "opMul", sourceHandle: "out", target: "sys", targetHandle: "opacity" },
+
+      // Embers
+      { source: "e_emit", sourceHandle: "pos", target: "e_sys", targetHandle: "position" },
+      { source: "e_emit", sourceHandle: "dir", target: "e_vel", targetHandle: "a" },
+      { source: "e_speed", sourceHandle: "out", target: "e_vel", targetHandle: "b" },
+      { source: "e_vel", sourceHandle: "out", target: "e_sys", targetHandle: "velocity" },
+      { source: "e_heat", sourceHandle: "out", target: "e_f1", targetHandle: "a" },
+      { source: "e_turb", sourceHandle: "out", target: "e_f1", targetHandle: "b" },
+      { source: "e_f1", sourceHandle: "out", target: "e_sys", targetHandle: "force" },
+      { source: "e_ramp", sourceHandle: "out", target: "e_sys", targetHandle: "color" },
+      { source: "e_size", sourceHandle: "out", target: "e_sys", targetHandle: "size" },
+      { source: "e_opRise", sourceHandle: "out", target: "e_opMul", targetHandle: "a" },
+      { source: "e_opFall", sourceHandle: "out", target: "e_opMul", targetHandle: "b" },
+      { source: "e_opMul", sourceHandle: "out", target: "e_sys", targetHandle: "opacity" },
     ],
   },
 

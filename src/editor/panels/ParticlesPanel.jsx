@@ -16,6 +16,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
+import { setGraphHovered } from "../nodegraph/graphContext.js";
 import { engine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
@@ -23,6 +24,7 @@ import {
   P_NODE_TYPES,
   nodeDefaults,
   compileParticleGraph,
+  particleGraphSignature,
   DEFAULT_PARTICLE_GRAPH,
 } from "../../engine/particleGraph.js";
 import { PARTICLE_PRESETS } from "../particlePresets.js";
@@ -35,6 +37,7 @@ const CATEGORY_LABELS = {
   math: "Math",
   noise: "Noise",
   force: "Forces",
+  system: "Emitters (System)",
 };
 
 const PALETTE = Object.entries(CATEGORY_LABELS).map(([category, group]) => ({
@@ -273,9 +276,17 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
 
   const guardedNodesChange = useCallback(
     (changes) => {
-      const guarded = changes.filter(
-        (c) => !(c.type === "remove" && nodes.find((n) => n.id === c.id)?.data.nodeType === "system"),
-      );
+      // A graph needs at least one System node to compile — block deleting
+      // the last one, but multiple System nodes (multi-emitter graphs) can
+      // be freely added/removed otherwise.
+      let systemCount = nodes.reduce((n, node) => n + (node.data.nodeType === "system" ? 1 : 0), 0);
+      const guarded = changes.filter((c) => {
+        if (c.type !== "remove") return true;
+        const isSystem = nodes.find((n) => n.id === c.id)?.data.nodeType === "system";
+        if (isSystem && systemCount <= 1) return false;
+        if (isSystem) systemCount--;
+        return true;
+      });
       if (guarded.some((c) => c.type !== "select" && c.type !== "dimensions")) setDirty(true);
       onNodesChange(guarded);
     },
@@ -298,11 +309,17 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
 
   const apply = async () => {
     const graph = flowToGraph(nodes, edges);
-    try {
-      await compileParticleGraph(graph); // validate before committing
-    } catch (err) {
-      console.error(`Particle graph error: ${err.message ?? err}`);
-      return;
+    // Value-only edits (same structural signature as the committed graph)
+    // are applied live via uniforms in the component — skip the redundant
+    // validation compile so slider drags stay cheap.
+    const committed = engine.getEntity(entityId)?.getComponent?.("particles")?.props?.graph;
+    if (!committed || particleGraphSignature(committed) !== particleGraphSignature(graph)) {
+      try {
+        await compileParticleGraph(graph); // validate before committing
+      } catch (err) {
+        console.error(`Particle graph error: ${err.message ?? err}`);
+        return;
+      }
     }
     commandBus.execute(new SetComponentPropCommand(entityId, "particles", "graph", graph));
     setDirty(false);
@@ -323,6 +340,16 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
   const restart = () => {
     engine.getEntity(entityId)?.getComponent("particles")?.restart();
   };
+
+  const onEdgeDoubleClick = useCallback((_event, edge) => {
+    setDirty(true);
+    setEdges((eds) => eds.filter((e) => e.id !== edge.id));
+  }, [setEdges]);
+
+  // The global keyboard shortcut handler defers to a graph editor whenever
+  // the pointer is over its canvas, so Delete/Backspace remove the selected
+  // node instead of the selected entity in the hierarchy.
+  useEffect(() => () => setGraphHovered(false), []);
 
   return (
     <div className="shader-graph-panel">
@@ -375,7 +402,11 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
           Apply{dirty ? " •" : ""}
         </button>
       </div>
-      <div className="shader-graph-canvas">
+      <div
+        className="shader-graph-canvas"
+        onMouseEnter={() => setGraphHovered(true)}
+        onMouseLeave={() => setGraphHovered(false)}
+      >
         <ReactFlow
           nodes={nodesWithHandlers}
           edges={edges}
@@ -386,6 +417,7 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
             onEdgesChange(changes);
           }}
           onConnect={onConnect}
+          onEdgeDoubleClick={onEdgeDoubleClick}
           onPaneContextMenu={(e) => {
             e.preventDefault();
             setCanvasMenu({ x: e.clientX, y: e.clientY });

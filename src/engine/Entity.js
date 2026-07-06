@@ -28,6 +28,11 @@ export class Entity {
     this.components = new Map();
     this.parent = null;
     this.children = [];
+    // Entity-wide view-only toggle. When true, every component on this
+    // entity opts into frustum gating unless it has `props.viewOnly`
+    // explicitly set false. Defaults to false to match the prior behaviour
+    // (no implicit gating). Serialised with the entity.
+    this.viewOnly = false;
   }
 
   // ---- Transform aliases (delegate to object3D) --------------------------
@@ -170,6 +175,23 @@ export class Entity {
     this.components.set(type, component);
     component.onAttach();
     return component;
+  }
+
+  /**
+   * Sets the entity-wide viewOnly flag and refreshes every component's
+   * cached `_viewOnlyActive` so their per-frame checks pick up the new
+   * state immediately. Components that have `props.viewOnly === false`
+   * explicitly stay disabled from gating (the entity toggle is an OR,
+   * not an override — see `Component._viewOnlyActive`).
+   */
+  setViewOnly(value) {
+    const next = !!value;
+    if (next === this.viewOnly) return;
+    this.viewOnly = next;
+    for (const c of this.components.values()) {
+      c._viewOnlyActive = !!c.props.viewOnly || next;
+      c._inView = null; // force a fresh decision next frame
+    }
   }
 
   removeComponent(type) {

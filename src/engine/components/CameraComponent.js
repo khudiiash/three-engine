@@ -34,6 +34,7 @@ export class CameraComponent extends Component {
     this.entity.object3D.add(this.camera);
     this.model = buildCameraModel();
     this.model.traverse((child) => child.layers.set(EDITOR_LAYER));
+    this.model.visible = this._enabled;
     this.entity.object3D.add(this.model);
     this.unsubUpdate = this.entity.engine.onUpdate(() => {
       if (!this.entity.engine.playing) return;
@@ -57,6 +58,17 @@ export class CameraComponent extends Component {
       this.unsubUpdate();
       this.unsubUpdate = null;
     }
+  }
+
+  onDisable() {
+    // Hide the editor gizmo (lens + frustum helper) and stop following the
+    // target while disabled. The PerspectiveCamera itself stays attached so
+    // toggling back on restores its FOV/transform without a rebuild.
+    if (this.model) this.model.visible = false;
+  }
+
+  onEnable() {
+    if (this.model) this.model.visible = true;
   }
 
   onPropChanged(key) {

@@ -148,6 +148,23 @@ export const useProjectStore = create((set, get) => ({
     const parent = currentPath.replace(/[\\/][^\\/]+$/, "");
     get().navigate(parent || rootPath);
   },
+
+  /**
+   * Drops a path from the recent list. This is purely a UI-bookkeeping
+   * operation: the project folder on disk is left untouched, so the user
+   * can still find it via "Open Project". Used by the Project Hub's
+   * remove button on each recent row.
+   */
+  removeRecent(path) {
+    const recent = get().recent.filter((p) => p !== path);
+    localStorage.setItem(RECENT_KEY, JSON.stringify(recent));
+    // If the dropped entry is the currently-open project, also clear the
+    // "last opened" hint so a future launch doesn't auto-restore it.
+    if (localStorage.getItem(ROOT_KEY) === path) {
+      localStorage.removeItem(ROOT_KEY);
+    }
+    set({ recent });
+  },
 }));
 
 export { basename };
