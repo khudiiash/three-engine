@@ -15,6 +15,10 @@ export const PROJECT_SETTINGS_DEFAULTS = {
     gridSize: 40,
     gridDivisions: 40,
     showGrid: true,
+    // Viewport Layers dropdown toggles. Persisted per-project so a return
+    // visit picks up the user's preferred view (e.g. "hide colliders +
+    // grid for a clean scene review").
+    layers: { gizmos: true, colliders: true, grid: true },
   },
   scripts: {
     hotReload: true,

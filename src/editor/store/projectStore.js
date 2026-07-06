@@ -35,10 +35,26 @@ export const useProjectStore = create((set, get) => ({
     set({ hubSkipped: true });
   },
 
+  /**
+   * Closes the active project and returns the user to the project hub.
+   * The engine + scene-side state are reset, the last-opened path is
+   * forgotten so the next launch starts at the hub, and `hubSkipped` is
+   * cleared so even a projectless "Skip" session can return to the hub.
+   */
+  async closeProject() {
+    localStorage.removeItem(ROOT_KEY);
+    const { resetEditorScene } = await import("../sceneIO.js");
+    await resetEditorScene().catch((err) =>
+      console.warn(`Couldn't reset editor scene on close project: ${err}`),
+    );
+    set({ rootPath: null, currentPath: null, projectMeta: {}, hubSkipped: false });
+  },
+
   projectMeta: {}, // contents of <root>/project.json (lastScene, name, …)
 
   /** Opens a known project folder and records it in the recent list. */
   async openProject(path) {
+    const previousRoot = get().rootPath;
     localStorage.setItem(ROOT_KEY, path);
     const recent = [path, ...get().recent.filter((p) => p !== path)].slice(0, 8);
     localStorage.setItem(RECENT_KEY, JSON.stringify(recent));
@@ -50,6 +66,19 @@ export const useProjectStore = create((set, get) => ({
       // Not a project created by the hub (or unreadable) — treat as empty meta.
     }
     set({ rootPath: path, recent, projectMeta });
+
+    // Project switch: the engine is a session-level singleton, so without
+    // this it would keep entities/components loaded from the previous
+    // project. Wipe the scene + reset the boot flag so EditorChrome
+    // re-bootstraps from the new project's project.json. The first call
+    // (no previous project) is also fine — clearing an empty engine is a
+    // no-op beyond resetting `currentPath`/`sceneBooted`.
+    if (previousRoot !== path) {
+      const { resetEditorScene } = await import("../sceneIO.js");
+      await resetEditorScene().catch((err) =>
+        console.warn(`Couldn't reset editor scene for new project: ${err}`),
+      );
+    }
     // Make sure the engine's TS typings are present so the user's IDE
     // provides `this.entity` / `this.engine` autocomplete when they open
     // a script. Idempotent — safe to call on every open.

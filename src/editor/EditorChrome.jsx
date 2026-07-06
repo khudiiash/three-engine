@@ -7,7 +7,14 @@ import {
   duplicateSelection,
   deleteSelection,
 } from "./clipboard.js";
-import { openScene, saveScene, restoreLastScene, hasScenePath } from "./sceneIO.js";
+import {
+  openScene,
+  saveScene,
+  restoreLastScene,
+  hasScenePath,
+  sceneBooted,
+  markSceneBooted,
+} from "./sceneIO.js";
 import { useSceneStore } from "./store/sceneStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { useProjectStore } from "./store/projectStore.js";
@@ -15,6 +22,7 @@ import { engine, ensureEngine } from "./engineInstance.js";
 import { toggle as togglePlay } from "./playMode.js";
 import { commandBus } from "./commands/CommandBus.js";
 import { getProjectSettings, applyProjectSettings } from "./projectSettings.js";
+import { isGraphHovered } from "./nodegraph/graphContext.js";
 
 /**
  * Editor "chrome": the menu bar, scene restore on first mount, keyboard
@@ -24,26 +32,42 @@ import { getProjectSettings, applyProjectSettings } from "./projectSettings.js";
  * hub has been dismissed.
  */
 export function EditorChrome() {
+  // The boot effect needs to re-run whenever the active project changes,
+  // not just on mount — otherwise switching projects (or going back to the
+  // hub via File → Close Project) would skip the scene bootstrap entirely.
+  const projectKey = useProjectStore(
+    (s) => `${s.hubSkipped ? "hub" : ""}|${s.rootPath ?? ""}`,
+  );
+
   useEffect(() => {
     let autosave = null;
+    let cancelled = false;
     ensureEngine().then(async () => {
-      // Only restore / build a default scene once per editor lifetime.
-      if (!sceneBooted) {
-        sceneBooted = true;
+      if (cancelled) return;
+      // Boot the scene for whichever project is currently active. The flag
+      // flips back to `false` in `openProject` when a project is switched,
+      // so the engine always re-bootstraps for the new project. We also
+      // run when projectKey changes — even if the module-level flag were
+      // mistakenly left set — to cover long sessions where state could
+      // drift.
+      if (!sceneBooted || projectKey !== lastBootedKey) {
+        markSceneBooted();
+        lastBootedKey = projectKey;
         // Enabled modules must register their components BEFORE the scene
         // deserializes, or module components load as inert "missing" data.
         const { syncProjectModules } = await import("./modules.js");
         await syncProjectModules().catch((err) => console.error(`Modules: ${err.message ?? err}`));
         // Apply saved input config (if any) before scene load so scripts
         // can read bindings during their first onUpdate.
-        const { useProjectStore } = await import("./store/projectStore.js");
-        const input = useProjectStore.getState().projectMeta?.input;
+        const { useProjectStore: store } = await import("./store/projectStore.js");
+        const input = store.getState().projectMeta?.input;
         if (input) engine.applyInput(input);
         const restored = await restoreLastScene();
-        // If nothing can be restored, leave the engine empty — the user picks
-        // the opening scene via File → New Scene or Open Scene…. Auto-creating
-        // a scene here silently spawned stray "Main 1.scene"/"Main 2.scene"
-        // files whenever the saved main/last scene was missing or moved.
+        // If nothing can be restored, the engine stays empty — `openProject`
+        // wiped it for us. The user picks the opening scene via File →
+        // New Scene or Open Scene…. Auto-creating a scene here silently
+        // spawned stray "Main 1.scene"/"Main 2.scene" files whenever the
+        // saved main/last scene was missing or moved.
         void restored;
         console.log("Editor ready");
       }
@@ -65,6 +89,13 @@ export function EditorChrome() {
       }, 1000);
     });
 
+    return () => {
+      cancelled = true;
+      if (autosave) clearInterval(autosave);
+    };
+  }, [projectKey]);
+
+  useEffect(() => {
     const onKeyDown = (e) => {
       const inField = e.target.closest?.("input, textarea, select, [contenteditable]");
       const ctrl = e.ctrlKey || e.metaKey;
@@ -84,9 +115,17 @@ export function EditorChrome() {
         togglePlay();
         return;
       }
+      if (ctrl && e.shiftKey && e.key.toLowerCase() === "w") {
+        e.preventDefault();
+        useProjectStore.getState().closeProject();
+        return;
+      }
       if (inField) return;
-      // The shader graph has its own delete/selection handling.
-      if (e.target.closest?.(".react-flow")) return;
+      // Node-graph editors (shader graph, particle graph) have their own
+      // delete/selection handling — the DOM-ancestry check is a fallback,
+      // but SVG edges/nodes don't always move `document.activeElement`, so
+      // hover state is the reliable signal that a graph "owns" the keypress.
+      if (e.target.closest?.(".react-flow") || isGraphHovered()) return;
 
       const selection = useSelectionStore.getState().ids;
       if (ctrl && e.key.toLowerCase() === "z") {
@@ -113,14 +152,15 @@ export function EditorChrome() {
     };
 
     window.addEventListener("keydown", onKeyDown);
-
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      if (autosave) clearInterval(autosave);
-    };
+    return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
   return <MenuBar />;
 }
 
-let sceneBooted = false;
+// Tracks the project key (see useProjectStore selector above) the boot
+// effect last ran for. Combined with the exported sceneBooted flag — which
+// `openProject` resets — this guarantees the engine always re-bootstraps
+// for the new project, even within a single mounted editor session where
+// the effect's deps array keys on the same value.
+let lastBootedKey = null;

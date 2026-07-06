@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Plus, Check, Zap } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Plus, Eye, Code, Box } from "lucide-react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -14,85 +14,60 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import * as THREE from "three/webgpu";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
-import { NODE_TYPES, inputSpec } from "../../engine/shaderGraph.js";
-import { MATERIAL_DEFAULTS, getMaterialDef, updateMaterialAsset } from "../../engine/materialAsset.js";
+import {
+  NODE_TYPES,
+  OUTPUT_SLOTS,
+  CATEGORY_LABELS,
+  nodeDefaults,
+  compileShaderGraph,
+  migrateGraph,
+  generateTslCode,
+  setUniformValue,
+} from "../../engine/tslGraph.js";
+import { migrateLegacyGraph } from "../../engine/shaderGraph.js";
+import { MATERIAL_DEFAULTS, getMaterialDef, loadMaterialAsset } from "../../engine/materialAsset.js";
+import { renderNodeThumb } from "../nodegraph/nodePreview.js";
+import { setGraphHovered } from "../nodegraph/graphContext.js";
 import { AssetField } from "../fields/AssetField.jsx";
 import { TEXTURE_EXTENSIONS } from "../assetLoader.js";
 
-/** Fresh materials open with a Principled BSDF pre-wired to the Output. */
+/** Fresh materials: a Color value wired into the Output's color slot. */
 const DEFAULT_GRAPH = {
   nodes: [
-    { id: "principled", type: "principledBsdf", props: { ...NODE_TYPES.principledBsdf.defaults }, position: { x: 200, y: 120 } },
-    { id: "output", type: "output", props: {}, position: { x: 600, y: 200 } },
+    { id: "color", type: "color", props: { value: "#ffffff" }, position: { x: 220, y: 190 } },
+    { id: "output", type: "output", props: {}, position: { x: 520, y: 120 } },
   ],
-  edges: [{ source: "principled", sourceHandle: "surface", target: "output", targetHandle: "surface" }],
+  edges: [{ source: "color", sourceHandle: "out", target: "output", targetHandle: "color" }],
 };
 
-/** Per-type category for the editor's color coding. Mirrors NODE_TYPES entries. */
-const NODE_CATEGORY = {
-  color: "value",
-  float: "value",
-  uv: "coords",
-  time: "coords",
-  texture: "texture",
-  add: "math",
-  subtract: "math",
-  multiply: "math",
-  divide: "math",
-  lerp: "math",
-  principledBsdf: "bsdf",
-  glassBsdf: "bsdf",
-  diffuseBsdf: "bsdf",
-  emission: "bsdf",
-  output: "output",
-};
-
-/** Connections that v1 rejects. Anything else is allowed (with a console hint). */
-function isIllegalConnection(srcType, srcHandle, tgtType, tgtHandle) {
-  // Two shader (BSDF) nodes cannot chain into each other's input handles —
-  // the lighting model expects a color/float there. Mixing shaders in v1 is
-  // out of scope; Mix Shader / Add Shader will come later.
-  if (NODE_TYPES[srcType]?.isShader && NODE_TYPES[tgtType]?.isShader) return true;
-  // A shader node's `surface` output can only feed the Output's `surface` input.
-  if (NODE_TYPES[srcType]?.isShader && srcHandle === "surface") return !(tgtType === "output" && tgtHandle === "surface");
-  return false;
-}
-
-const PALETTE = [
-  { group: "Shaders", types: ["principledBsdf", "glassBsdf", "diffuseBsdf", "emission"] },
-  { group: "Values", types: ["color", "float"] },
-  { group: "Coordinates", types: ["uv", "time"] },
-  { group: "Texture", types: ["texture"] },
-  { group: "Math", types: ["add", "subtract", "multiply", "divide", "lerp"] },
-];
+const catOf = (type) => NODE_TYPES[type]?.cat ?? "math";
 
 function graphToFlow(graph) {
-  const nodes = graph.nodes.map((n) => ({
-    id: n.id,
-    type: "shaderNode",
-    position: n.position ?? { x: 0, y: 0 },
-    data: { nodeType: n.type, props: n.props ?? {} },
-  }));
-  const edges = (graph.edges ?? []).map((e, i) => ({
-    id: e.id ?? `e${i}-${e.source}-${e.target}-${e.targetHandle}`,
-    source: e.source,
-    sourceHandle: e.sourceHandle ?? "out",
-    target: e.target,
-    targetHandle: e.targetHandle,
-  }));
-  return { nodes, edges };
+  return {
+    nodes: graph.nodes
+      .filter((n) => NODE_TYPES[n.type])
+      .map((n) => ({
+        id: n.id,
+        type: "tslNode",
+        position: n.position ?? { x: 0, y: 0 },
+        data: { nodeType: n.type, props: n.props ?? {} },
+      })),
+    edges: (graph.edges ?? []).map((e, i) => ({
+      id: e.id ?? `e${i}-${e.source}-${e.target}-${e.targetHandle}`,
+      source: e.source,
+      sourceHandle: e.sourceHandle ?? "out",
+      target: e.target,
+      targetHandle: e.targetHandle,
+    })),
+  };
 }
 
 function flowToGraph(nodes, edges) {
   return {
-    nodes: nodes.map((n) => ({
-      id: n.id,
-      type: n.data.nodeType,
-      props: n.data.props,
-      position: n.position,
-    })),
+    nodes: nodes.map((n) => ({ id: n.id, type: n.data.nodeType, props: n.data.props, position: n.position })),
     edges: edges.map((e) => ({
       id: e.id,
       source: e.source,
@@ -103,258 +78,335 @@ function flowToGraph(nodes, edges) {
   };
 }
 
-/** Per-prop editor for non-port props. Shader node props are scalar/color
- *  defaults used when the corresponding input port isn't wired.
- */
-function ColorField({ value, onChange }) {
-  return (
-    <div className="shader-node-row field nodrag">
-      <input
-        className="color-field"
-        type="color"
-        value={value ?? "#ffffff"}
-        onChange={(e) => onChange(e.target.value)}
-      />
-      <span className="shader-field-value">{value ?? "#ffffff"}</span>
-    </div>
-  );
-}
-
-function FloatField({ value, min, max, step, onChange }) {
-  return (
-    <div className="shader-node-row field nodrag">
-      <input
-        className="slider-field"
-        type="range"
-        min={min ?? 0}
-        max={max ?? 1}
-        step={step ?? 0.01}
-        value={value ?? 0}
-        onChange={(e) => onChange(parseFloat(e.target.value))}
-      />
-      <input
-        className="number-field slider-readout"
-        type="number"
-        min={min}
-        max={max}
-        step={step ?? 0.01}
-        value={value ?? 0}
-        onChange={(e) => {
-          const v = parseFloat(e.target.value);
-          if (!Number.isNaN(v)) onChange(v);
-        }}
-      />
-    </div>
-  );
-}
-
-/** Inline editors on value/texture nodes. `nodrag` keeps typing from moving the node. */
-function NodeField({ nodeType, props, onChange }) {
-  if (nodeType === "color") return <ColorField value={props.value} onChange={(v) => onChange({ value: v })} />;
-  if (nodeType === "float") {
-    return (
-      <div className="shader-node-row field nodrag">
-        <input
-          className="number-field"
-          type="number"
-          step={0.1}
-          value={props.value ?? 0}
-          onChange={(e) => onChange({ value: parseFloat(e.target.value) || 0 })}
-        />
-      </div>
-    );
-  }
-  if (nodeType === "texture") {
-    return (
-      <div className="shader-node-row field nodrag nopan">
-        <AssetField
-          descriptor={{ exts: TEXTURE_EXTENSIONS }}
-          value={props.path ?? ""}
-          onCommit={(path) => onChange({ path })}
-        />
-      </div>
-    );
-  }
-  return null;
-}
-
-/** Inline editor for a single shader-node input row. `wired` means an edge
- *  is feeding this handle — in that case the editor is disabled and the value
- *  comes from the upstream node.
- */
-function InputEditor({ spec, value, wired, onChange }) {
-  if (!spec.kind) return null;
-  if (spec.kind === "color") {
+/** Inline editor for an unwired input default / a node param. */
+function ValueEditor({ value, kind, onChange }) {
+  if (kind === "color") {
     return (
       <input
         className="color-field shader-input-editor nodrag nopan"
         type="color"
-        disabled={wired}
-        value={value ?? spec.default}
+        value={value ?? "#ffffff"}
         onChange={(e) => onChange(e.target.value)}
-        title={wired ? "Driven by connected node" : spec.name}
       />
     );
   }
-  // float
   return (
-    <div className="shader-input-editor slider-wrap nodrag nopan">
-      <input
-        className="slider-field"
-        type="range"
-        disabled={wired}
-        min={spec.min}
-        max={spec.max}
-        step={spec.step}
-        value={value ?? spec.default}
-        onChange={(e) => onChange(parseFloat(e.target.value))}
-        title={wired ? "Driven by connected node" : `${spec.name} (${spec.min}..${spec.max})`}
-      />
-      <input
-        className="number-field slider-readout"
-        type="number"
-        disabled={wired}
-        min={spec.min}
-        max={spec.max}
-        step={spec.step}
-        value={value ?? spec.default}
-        onChange={(e) => {
-          const v = parseFloat(e.target.value);
-          if (!Number.isNaN(v)) onChange(v);
-        }}
-      />
-    </div>
+    <input
+      className="number-field shader-input-editor nodrag nopan"
+      type="number"
+      step={0.05}
+      value={value ?? 0}
+      onChange={(e) => {
+        const v = parseFloat(e.target.value);
+        if (!Number.isNaN(v)) onChange(v);
+      }}
+    />
   );
 }
 
-function ShaderNode({ id, data, selected }) {
-  const meta = NODE_TYPES[data.nodeType] ?? { label: data.nodeType, inputs: [] };
-  const category = NODE_CATEGORY[data.nodeType] ?? "math";
-  const isShader = !!meta.isShader;
+function TslNode({ id, data, selected }) {
+  const def = NODE_TYPES[data.nodeType] ?? { label: data.nodeType, inputs: [] };
   const isOutput = data.nodeType === "output";
-  // Shader nodes expose a single `surface` source handle; output has no output handle.
-  const sourceHandle = isShader ? "surface" : "out";
+  const outputs = def.outputs ?? (isOutput ? [] : ["out"]);
   const wiredSet = data.connectedHandles;
-  const showStandaloneEditor = !isShader && !isOutput && ["color", "float", "texture"].includes(data.nodeType);
-  const hasBody = meta.inputs.length > 0 || showStandaloneEditor;
+  const thumb = !!data.props.__thumb;
 
   return (
-    <div className={`shader-node cat-${category} ${selected ? "selected" : ""}`}>
+    <div className={`shader-node cat-${def.cat} ${selected ? "selected" : ""}`}>
       <div className="shader-node-header">
         <span className="shader-node-dot" />
-        <span className="shader-node-label">{meta.label}</span>
+        <span className="shader-node-label">{def.label}</span>
         {!isOutput && (
-          <Handle type="source" position={Position.Right} id={sourceHandle} className="shader-handle" />
+          <button
+            className={`node-thumb-toggle nodrag${thumb ? " active" : ""}`}
+            title="Toggle preview"
+            onClick={() => data.onPropsChange(id, { __thumb: !thumb }, true)}
+          >
+            <Eye size={11} />
+          </button>
         )}
+        {outputs.length === 1 && <Handle type="source" position={Position.Right} id={outputs[0]} className={`shader-handle pt-${def.out ?? "any"}`} />}
       </div>
-      {hasBody && (
-        <div className="shader-node-body">
-          {meta.inputs.map((input) => {
-            const spec = inputSpec(data.nodeType, input);
-            const wired = wiredSet?.has(spec.name) ?? false;
-            return (
-              <div className="shader-node-row" key={spec.name} data-wired={wired || undefined}>
-                <Handle type="target" position={Position.Left} id={spec.name} className="shader-handle" />
-                <span className="shader-port-label">{spec.name}</span>
-                <InputEditor
-                  spec={spec}
-                  value={data.props[spec.name]}
-                  wired={wired}
-                  onChange={(v) => data.onPropsChange(id, { [spec.name]: v })}
-                />
-              </div>
-            );
-          })}
-          {showStandaloneEditor && (
-            <NodeField
-              nodeType={data.nodeType}
-              props={data.props}
-              onChange={(patch) => data.onPropsChange(id, patch)}
-            />
-          )}
+      {thumb && (
+        <div className="node-thumb nodrag">
+          <canvas width={96} height={96} ref={(el) => data.registerThumb(id, el)} />
         </div>
       )}
+      <div className="shader-node-body">
+        {outputs.length > 1 &&
+          outputs.map((o) => (
+            <div className="shader-node-row out-row" key={`out-${o}`}>
+              <span className="shader-port-label out">{o}</span>
+              <Handle type="source" position={Position.Right} id={o} className={`shader-handle pt-${def.out ?? "any"}`} />
+            </div>
+          ))}
+        {(def.inputs ?? []).map((spec) => {
+          const wired = wiredSet?.has(spec.key) ?? false;
+          const editable = spec.default != null && !Array.isArray(spec.default);
+          return (
+            <div className="shader-node-row" key={spec.key} data-wired={wired || undefined}>
+              <Handle type="target" position={Position.Left} id={spec.key} className={`shader-handle pt-${spec.type}`} />
+              <span className="shader-port-label">{spec.key}</span>
+              {editable && !wired && (
+                <ValueEditor
+                  kind={typeof spec.default === "string" ? "color" : "number"}
+                  value={data.props[spec.key] ?? spec.default}
+                  onChange={(v) => data.onPropsChange(id, { [spec.key]: v })}
+                />
+              )}
+            </div>
+          );
+        })}
+        {(def.params ?? []).map((p) => (
+          <div className={`shader-node-row field nodrag${p.type === "code" ? " code-field" : ""}`} key={p.key}>
+            {p.type === "asset" ? (
+              <div className="nodrag nopan" style={{ flex: 1 }}>
+                <AssetField
+                  descriptor={{ exts: TEXTURE_EXTENSIONS }}
+                  value={data.props[p.key] ?? ""}
+                  onCommit={(path) => data.onPropsChange(id, { [p.key]: path }, true)}
+                />
+              </div>
+            ) : p.type === "code" ? (
+              <textarea
+                className="code-field-input nodrag nopan"
+                spellCheck={false}
+                rows={4}
+                placeholder="a.mul(b)"
+                value={data.props[p.key] ?? p.default ?? ""}
+                onChange={(e) => data.onPropsChange(id, { [p.key]: e.target.value })}
+                onBlur={(e) => data.onPropsChange(id, { [p.key]: e.target.value }, true)}
+              />
+            ) : (
+              <ValueEditor
+                kind={p.type === "color" ? "color" : "number"}
+                value={data.props[p.key] ?? p.default}
+                onChange={(v) => data.onPropsChange(id, { [p.key]: v })}
+              />
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
 
-const nodeTypes = { shaderNode: ShaderNode };
+const nodeTypes = { tslNode: TslNode };
 
-/** Grouped node palette, shared by the toolbar button and canvas right-click. */
-function NodePalette({ style, onPick, onClose }) {
+/** Fuzzy-searchable node palette (toolbar button + canvas right-click). */
+function NodeSearchPalette({ style, onPick, onClose }) {
+  const [query, setQuery] = useState("");
+  const [active, setActive] = useState(0);
+  const entries = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const all = Object.entries(NODE_TYPES).filter(([t]) => t !== "output");
+    const hits = q
+      ? all.filter(([t, d]) => d.label.toLowerCase().includes(q) || t.toLowerCase().includes(q) || d.cat.includes(q))
+      : all;
+    // group by category, preserving registry order
+    const groups = [];
+    for (const [type, d] of hits) {
+      let g = groups.find((x) => x.cat === d.cat);
+      if (!g) groups.push((g = { cat: d.cat, items: [] }));
+      g.items.push(type);
+    }
+    return groups;
+  }, [query]);
+  const flat = entries.flatMap((g) => g.items);
+
   return (
     <>
       <div className="dropdown-overlay" onClick={onClose} onContextMenu={(e) => { e.preventDefault(); onClose(); }} />
       <div className={`dropdown-menu node-palette ${style ? "context-menu" : ""}`} style={style}>
-        {PALETTE.map(({ group, types }) => (
-          <div key={group}>
-            <div className="node-palette-group">{group}</div>
-            {types.map((type) => (
-              <button key={type} className="dropdown-item node-palette-item" onClick={() => onPick(type)}>
-                <span className={`shader-node-dot cat-${NODE_CATEGORY[type]}`} />
-                {NODE_TYPES[type].label}
-              </button>
-            ))}
-          </div>
-        ))}
+        <input
+          className="node-palette-search"
+          autoFocus
+          placeholder="Search nodes…"
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setActive(0);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && flat[active]) onPick(flat[active]);
+            else if (e.key === "ArrowDown") setActive((a) => Math.min(a + 1, flat.length - 1));
+            else if (e.key === "ArrowUp") setActive((a) => Math.max(a - 1, 0));
+            else if (e.key === "Escape") onClose();
+          }}
+        />
+        <div className="node-palette-list">
+          {entries.map(({ cat, items }) => (
+            <div key={cat}>
+              <div className="node-palette-group">{CATEGORY_LABELS[cat] ?? cat}</div>
+              {items.map((type) => (
+                <button
+                  key={type}
+                  className={`dropdown-item node-palette-item${flat[active] === type ? " active" : ""}`}
+                  onMouseEnter={() => setActive(flat.indexOf(type))}
+                  onClick={() => onPick(type)}
+                >
+                  <span className={`shader-node-dot cat-${cat}`} />
+                  {NODE_TYPES[type].label}
+                </button>
+              ))}
+            </div>
+          ))}
+          {!flat.length && <div className="node-palette-group">No matches</div>}
+        </div>
       </div>
     </>
+  );
+}
+
+const PREVIEW_GEOMS = {
+  sphere: () => new THREE.SphereGeometry(0.85, 48, 24),
+  box: () => new THREE.BoxGeometry(1.15, 1.15, 1.15),
+  torus: () => new THREE.TorusKnotGeometry(0.6, 0.22, 128, 24),
+  // Rotated flat so the turntable spin (around Y) never presents the
+  // geometry's backface to the camera — a plane spinning in its own plane
+  // would go edge-on/invisible for half of every rotation otherwise.
+  plane: () => new THREE.PlaneGeometry(1.6, 1.6).rotateX(-Math.PI / 2),
+};
+
+/** Corner live preview: its own WebGPURenderer + turntable, rendering the
+ *  SHARED .mat material (so it always matches the scene). Pattern copied
+ *  from AssetInspector's ModelPreview. */
+function MaterialPreview({ material }) {
+  const canvasRef = useRef(null);
+  const [prim, setPrim] = useState("sphere");
+  const meshRef = useRef(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !material) return;
+    let disposed = false;
+    let renderer;
+    (async () => {
+      renderer = new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+      await renderer.init();
+      if (disposed) return void renderer.dispose();
+      const scene = new THREE.Scene();
+      scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+      const key = new THREE.DirectionalLight(0xffffff, 2.2);
+      key.position.set(2, 3, 2);
+      scene.add(key);
+      const rim = new THREE.DirectionalLight(0x88aaff, 0.8);
+      rim.position.set(-2, -1, -2);
+      scene.add(rim);
+      const camera = new THREE.PerspectiveCamera(40, canvas.clientWidth / canvas.clientHeight, 0.1, 20);
+      camera.position.set(0, 0.4, 3);
+      camera.lookAt(0, 0, 0);
+      const mesh = new THREE.Mesh(PREVIEW_GEOMS.sphere(), material);
+      meshRef.current = mesh;
+      scene.add(mesh);
+      const timer = new THREE.Timer();
+      renderer.setAnimationLoop(() => {
+        if (disposed) return;
+        timer.update();
+        mesh.rotation.y += timer.getDelta() * 0.5;
+        renderer.render(scene, camera);
+      });
+    })();
+    return () => {
+      disposed = true;
+      if (renderer) {
+        renderer.setAnimationLoop(null);
+        renderer.dispose();
+      }
+    };
+  }, [material]);
+
+  useEffect(() => {
+    const mesh = meshRef.current;
+    if (!mesh) return;
+    mesh.geometry.dispose();
+    mesh.geometry = PREVIEW_GEOMS[prim]();
+  }, [prim]);
+
+  return (
+    <div className="shader-preview">
+      <canvas ref={canvasRef} width={220} height={170} />
+      <div className="shader-preview-prims">
+        {Object.keys(PREVIEW_GEOMS).map((p) => (
+          <button key={p} className={`shader-preview-prim${prim === p ? " active" : ""}`} title={p} onClick={() => setPrim(p)}>
+            <Box size={11} />
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
 
 function ShaderGraphEditor({ matPath }) {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
-  const [dirty, setDirty] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [canvasMenu, setCanvasMenu] = useState(null); // {x, y} — right-click position
-  const [autosave, setAutosave] = useState(() => {
-    try {
-      return localStorage.getItem("engine.autosave.shader") === "1";
-    } catch {
-      return false;
-    }
-  });
-  const toggleAutosave = () => {
-    setAutosave((cur) => {
-      const next = !cur;
-      try {
-        localStorage.setItem("engine.autosave.shader", next ? "1" : "0");
-      } catch {}
-      return next;
-    });
-  };
+  const [canvasMenu, setCanvasMenu] = useState(null);
+  const [saved, setSaved] = useState(true);
+  const [material, setMaterial] = useState(null);
   const { screenToFlowPosition } = useReactFlow();
 
+  // Guard against a stale hover flag if the panel closes/unmounts while the
+  // pointer is still over it (dockview close, tab switch, …).
+  useEffect(() => () => setGraphHovered(false), []);
+
+  const compileRef = useRef({ uniforms: {}, generation: 0 });
+  const thumbCanvases = useRef(new Map());
+  const [structural, setStructural] = useState(0);
+  const loadedRef = useRef(false);
+
+  // Load graph + shared material.
   useEffect(() => {
     let live = true;
+    loadedRef.current = false;
     (async () => {
-      let graph = DEFAULT_GRAPH;
-      if (matPath) {
-        let def = getMaterialDef(matPath);
-        if (!def) {
-          try {
-            const { invoke } = await import("@tauri-apps/api/core");
-            def = JSON.parse(await invoke("read_text_file", { path: matPath }));
-          } catch {}
-        }
-        graph = def?.shaderGraph ?? DEFAULT_GRAPH;
+      const mat = await loadMaterialAsset(matPath);
+      let def = getMaterialDef(matPath);
+      if (!def) {
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          def = JSON.parse(await invoke("read_text_file", { path: matPath }));
+        } catch {}
       }
       if (!live) return;
+      const graph = def?.shaderGraph
+        ? migrateGraph(migrateLegacyGraph(def.shaderGraph, def))
+        : DEFAULT_GRAPH;
       const flow = graphToFlow(graph);
+      setMaterial(mat);
       setNodes(flow.nodes);
       setEdges(flow.edges);
-      setDirty(false);
+      setSaved(true);
+      loadedRef.current = true;
+      setStructural((s) => s + 1);
     })();
     return () => (live = false);
   }, [matPath]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const registerThumb = useCallback((id, el) => {
+    if (el) thumbCanvases.current.set(id, el);
+    else thumbCanvases.current.delete(id);
+  }, []);
+
+  /** Value edits patch the live uniform when possible (no shader rebuild);
+   *  structural edits (wires, params like texture path, thumb toggles that
+   *  need a tap) schedule a recompile. */
   const handlePropsChange = useCallback(
-    (nodeId, patch) => {
-      setDirty(true);
+    (nodeId, patch, forceStructural = false) => {
+      setSaved(false);
       setNodes((nds) =>
         nds.map((n) => (n.id === nodeId ? { ...n, data: { ...n.data, props: { ...n.data.props, ...patch } } } : n)),
       );
+      let structuralHit = forceStructural;
+      for (const [key, value] of Object.entries(patch)) {
+        if (key === "__thumb") continue;
+        const u = compileRef.current.uniforms[`${nodeId}.${key}`];
+        if (u) setUniformValue(u, value);
+        else structuralHit = true;
+      }
+      if (structuralHit || patch.__thumb) setStructural((s) => s + 1);
     },
     [setNodes],
   );
@@ -362,47 +414,116 @@ function ShaderGraphEditor({ matPath }) {
   const nodesWithHandlers = useMemo(
     () =>
       nodes.map((n) => {
-        // Set of target handles on this node that already have an incoming edge.
-        // Drives the disabled state of the per-row inline editor.
         const connectedHandles = new Set(edges.filter((e) => e.target === n.id).map((e) => e.targetHandle));
-        return { ...n, data: { ...n.data, onPropsChange: handlePropsChange, connectedHandles } };
+        return { ...n, data: { ...n.data, onPropsChange: handlePropsChange, connectedHandles, registerThumb } };
       }),
-    [nodes, edges, handlePropsChange],
+    [nodes, edges, handlePropsChange, registerThumb],
   );
+
+  // Recompile (debounced): apply to the shared material, refresh uniforms,
+  // render thumbnails for tapped nodes.
+  useEffect(() => {
+    if (!loadedRef.current || !material) return;
+    const timer = setTimeout(async () => {
+      const graph = flowToGraph(nodes, edges);
+      const taps = nodes.filter((n) => n.data.props.__thumb).map((n) => n.id);
+      const generation = ++compileRef.current.generation;
+      try {
+        const result = await compileShaderGraph(graph, { taps });
+        if (generation !== compileRef.current.generation) return;
+        for (const slot of OUTPUT_SLOTS) material[slot.slot] = null;
+        for (const [slot, node] of Object.entries(result?.mutations ?? {})) material[slot] = node;
+        material.needsUpdate = true;
+        compileRef.current.uniforms = result?.uniforms ?? {};
+        for (const id of taps) {
+          const canvas = thumbCanvases.current.get(id);
+          if (canvas && result?.taps?.[id]) renderNodeThumb(result.taps[id], canvas);
+        }
+      } catch (err) {
+        console.error(`Shader graph compile: ${err.message}`);
+      }
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [structural, material]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Autosave the .mat (debounced) — keeps the materialAsset cache def in sync
+  // without a second compile.
+  useEffect(() => {
+    if (saved || !loadedRef.current) return;
+    const timer = setTimeout(async () => {
+      const graph = flowToGraph(nodes, edges);
+      const def = { ...MATERIAL_DEFAULTS, ...(getMaterialDef(matPath) ?? {}), shaderGraph: graph };
+      const cached = getMaterialDef(matPath);
+      if (cached) cached.shaderGraph = graph;
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("save_scene", { path: matPath, contents: JSON.stringify(def, null, 2) });
+        setSaved(true);
+      } catch (err) {
+        console.error(`Shader graph save: ${err.message}`);
+      }
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [saved, nodes, edges, matPath]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const onConnect = useCallback(
     (connection) => {
-      // Look up the source/target node types and reject clearly-bad wires.
-      const src = nodes.find((n) => n.id === connection.source);
-      const tgt = nodes.find((n) => n.id === connection.target);
-      const srcHandle = connection.sourceHandle ?? "out";
-      const tgtHandle = connection.targetHandle;
-      if (!src || !tgt) return;
-      if (isIllegalConnection(src.data.nodeType, srcHandle, tgt.data.nodeType, tgtHandle)) {
-        console.warn(
-          `Shader graph: illegal connection (${src.data.nodeType}.${srcHandle} → ${tgt.data.nodeType}.${tgtHandle})`,
-        );
-        return;
-      }
-      setDirty(true);
-      // Only one wire per input handle.
+      setSaved(false);
       setEdges((eds) =>
         addEdge(
           connection,
           eds.filter((e) => !(e.target === connection.target && e.targetHandle === connection.targetHandle)),
         ),
       );
+      setStructural((s) => s + 1);
     },
-    [setEdges, nodes],
+    [setEdges],
   );
 
-  /** The output node is the graph's anchor — never let Delete remove it. */
+  // Drag an existing edge's end away from a socket to reconnect it, or drop
+  // it on empty canvas to disconnect. `reconnectSuccessful` distinguishes a
+  // completed reconnect (handled in onReconnect) from a drop-to-delete.
+  const reconnectSuccessful = useRef(true);
+  const onReconnectStart = useCallback(() => {
+    reconnectSuccessful.current = false;
+  }, []);
+  const onReconnect = useCallback(
+    (oldEdge, connection) => {
+      reconnectSuccessful.current = true;
+      setSaved(false);
+      setEdges((eds) =>
+        addEdge(
+          connection,
+          eds
+            .filter((e) => e.id !== oldEdge.id)
+            .filter((e) => !(e.target === connection.target && e.targetHandle === connection.targetHandle)),
+        ),
+      );
+      setStructural((s) => s + 1);
+    },
+    [setEdges],
+  );
+  const onReconnectEnd = useCallback((_event, edge) => {
+    if (!reconnectSuccessful.current) {
+      setEdges((eds) => eds.filter((e) => e.id !== edge.id));
+      setSaved(false);
+      setStructural((s) => s + 1);
+    }
+    reconnectSuccessful.current = true;
+  }, []);
+  const onEdgeDoubleClick = useCallback((_event, edge) => {
+    setEdges((eds) => eds.filter((e) => e.id !== edge.id));
+    setSaved(false);
+    setStructural((s) => s + 1);
+  }, []);
+
   const guardedNodesChange = useCallback(
     (changes) => {
       const guarded = changes.filter(
         (c) => !(c.type === "remove" && nodes.find((n) => n.id === c.id)?.data.nodeType === "output"),
       );
-      if (guarded.some((c) => c.type !== "select" && c.type !== "dimensions")) setDirty(true);
+      if (guarded.some((c) => c.type === "remove")) setStructural((s) => s + 1);
+      if (guarded.some((c) => c.type !== "select" && c.type !== "dimensions")) setSaved(false);
       onNodesChange(guarded);
     },
     [nodes, onNodesChange],
@@ -411,39 +532,24 @@ function ShaderGraphEditor({ matPath }) {
   const addNode = (type, screenPos) => {
     setMenuOpen(false);
     setCanvasMenu(null);
-    setDirty(true);
+    setSaved(false);
     const position = screenPos
       ? screenToFlowPosition(screenPos)
-      : { x: 80 + Math.random() * 200, y: 80 + Math.random() * 200 };
+      : { x: 120 + Math.random() * 200, y: 100 + Math.random() * 200 };
     const id = `${type}-${Math.random().toString(36).slice(2, 8)}`;
-    setNodes((nds) => [
-      ...nds,
-      { id, type: "shaderNode", position, data: { nodeType: type, props: { ...NODE_TYPES[type].defaults } } },
-    ]);
+    setNodes((nds) => [...nds, { id, type: "tslNode", position, data: { nodeType: type, props: nodeDefaults(type) } }]);
+    setStructural((s) => s + 1);
   };
 
-  const apply = async () => {
-    if (!matPath) return;
-    const graph = flowToGraph(nodes, edges);
-    const def = { ...MATERIAL_DEFAULTS, ...(getMaterialDef(matPath) ?? {}), shaderGraph: graph };
-    updateMaterialAsset(matPath, def); // live on the shared material
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("save_scene", { path: matPath, contents: JSON.stringify(def, null, 2) });
-    setDirty(false);
-    console.log(`Shader graph applied: ${matPath}`);
+  const copyCode = async () => {
+    const code = generateTslCode(flowToGraph(nodes, edges));
+    try {
+      await navigator.clipboard.writeText(code);
+      console.log("TSL code copied to clipboard");
+    } catch {
+      console.log(code);
+    }
   };
-
-  // Autosave: when enabled, commit every change. Debounced so transient
-  // mutations (e.g. dragging a node, which fires onNodesChange on every
-  // intermediate position) collapse into a single write at the end of the
-  // gesture. Selection-only updates and the initial load keep `dirty` false
-  // and never reach the timer.
-  useEffect(() => {
-    if (!autosave) return;
-    if (!dirty) return;
-    const id = setTimeout(apply, 150);
-    return () => clearTimeout(id);
-  }, [autosave, nodes, edges, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="shader-graph-panel">
@@ -453,34 +559,39 @@ function ShaderGraphEditor({ matPath }) {
             <Plus size={14} />
             Node
           </button>
-          {menuOpen && <NodePalette onPick={(type) => addNode(type)} onClose={() => setMenuOpen(false)} />}
+          {menuOpen && <NodeSearchPalette onPick={(type) => addNode(type)} onClose={() => setMenuOpen(false)} />}
         </div>
         <span className="asset-path" title={matPath}>
           {matPath.split(/[\\/]/).pop()}
         </span>
-        <button
-          className={`toolbar-btn icon-only${autosave ? " active" : ""}`}
-          title={autosave ? "Autosave on — changes apply instantly" : "Autosave off — click Apply to commit"}
-          onClick={toggleAutosave}
-        >
-          <Zap size={14} />
-        </button>
-        <button className="toolbar-btn" disabled={!dirty || autosave} onClick={apply}>
-          <Check size={13} />
-          Apply{dirty ? " •" : ""}
+        <span className={`shader-save-state${saved ? " saved" : ""}`}>{saved ? "Saved" : "Saving…"}</span>
+        <button className="toolbar-btn" title="Copy graph as three/tsl JavaScript" onClick={copyCode}>
+          <Code size={13} />
+          Code
         </button>
       </div>
-      <div className="shader-graph-canvas">
+      <div
+        className="shader-graph-canvas"
+        onMouseEnter={() => setGraphHovered(true)}
+        onMouseLeave={() => setGraphHovered(false)}
+      >
         <ReactFlow
           nodes={nodesWithHandlers}
           edges={edges}
           nodeTypes={nodeTypes}
           onNodesChange={guardedNodesChange}
           onEdgesChange={(changes) => {
-            if (changes.some((c) => c.type === "remove")) setDirty(true);
+            if (changes.some((c) => c.type === "remove")) {
+              setSaved(false);
+              setStructural((s) => s + 1);
+            }
             onEdgesChange(changes);
           }}
           onConnect={onConnect}
+          onReconnect={onReconnect}
+          onReconnectStart={onReconnectStart}
+          onReconnectEnd={onReconnectEnd}
+          onEdgeDoubleClick={onEdgeDoubleClick}
           onPaneContextMenu={(e) => {
             e.preventDefault();
             setCanvasMenu({ x: e.clientX, y: e.clientY });
@@ -493,8 +604,9 @@ function ShaderGraphEditor({ matPath }) {
           <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} />
           <Controls showInteractive={false} />
         </ReactFlow>
+        {material && <MaterialPreview material={material} />}
         {canvasMenu && (
-          <NodePalette
+          <NodeSearchPalette
             style={{ left: canvasMenu.x, top: canvasMenu.y }}
             onPick={(type) => addNode(type, canvasMenu)}
             onClose={() => setCanvasMenu(null)}
@@ -502,8 +614,7 @@ function ShaderGraphEditor({ matPath }) {
         )}
       </div>
       <div className="shader-graph-hint">
-        Right-click canvas to add a node · drag between ports to wire · Delete removes selection · Apply saves to the
-        material
+        Right-click to add a node · drag ports to wire · eye icon previews a node · changes autosave
       </div>
     </div>
   );
@@ -513,7 +624,6 @@ export function ShaderGraphPanel() {
   const selectedId = useSelectionStore((s) => s.ids[0] ?? null);
   const assetPath = useSelectionStore((s) => s.assetPath);
   const entity = useSceneStore((s) => (selectedId ? s.entities[selectedId] : null));
-  // Graphs live on the material asset: selected .mat directly, or the selected mesh's.
   const matPath =
     assetPath?.toLowerCase().endsWith(".mat") ? assetPath : entity?.components?.mesh?.material || null;
 
@@ -527,7 +637,7 @@ export function ShaderGraphPanel() {
 
   return (
     <ReactFlowProvider>
-      <ShaderGraphEditor matPath={matPath} />
+      <ShaderGraphEditor key={matPath} matPath={matPath} />
     </ReactFlowProvider>
   );
 }

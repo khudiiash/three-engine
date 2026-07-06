@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Play, Square, Move, Rotate3d, Scale3d } from "lucide-react";
+import { Play, Square, Move, Rotate3d, Scale3d, Layers as LayersIcon } from "lucide-react";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
@@ -29,6 +29,16 @@ function putOnEditorLayer(obj) {
   });
 }
 
+// Layers-dropdown toggles. Kept in declaration order so the dropdown
+// reads top-to-bottom in the order users expect (gizmos = selection aids,
+// colliders = physics aids, grid = spatial reference). Add new toggles
+// here and to `viewport.layers` defaults above together.
+const LAYER_TOGGLES = [
+  { key: "gizmos", label: "Gizmos" },
+  { key: "colliders", label: "Colliders" },
+  { key: "grid", label: "Grid" },
+];
+
 // The renderer canvas and editor controls outlive the React panel so the
 // viewport can be closed/reopened without re-initializing WebGPU.
 const viewport = {
@@ -46,7 +56,18 @@ const viewport = {
   initPromise: null,
   hovered: false,
   gameCameraId: null,
+  // Toggles from the Layers dropdown. Mirrored in React state; mutations
+  // here apply live so a hot-reload of the panel keeps the current layer
+  // set. Default to "all on" so the viewport starts in its full visual state.
+  layers: { gizmos: true, colliders: true, grid: true },
+  layersListeners: new Set(),
 };
+
+// Notify any viewport subscriber (the toolbar dropdown) about layer changes.
+// Hot-reload safe — added on demand, cleared on dispose.
+function notifyLayersChanged() {
+  for (const fn of viewport.layersListeners) fn({ ...viewport.layers });
+}
 
 async function ensureViewport() {
   if (viewport.initPromise) return viewport.initPromise;
@@ -95,6 +116,18 @@ async function ensureViewport() {
       setupKeyboard(canvas);
       setupPlayCamera();
       setupCameraPreview();
+
+      // Layer-toggle sub-systems. Gizmo + grid live in `viewport.*` and
+      // are picked up by `applyLayerVisibility`; colliders come from
+      // individual components attached at any time, so we sync them
+      // whenever the scene tree changes.
+      applyLayerVisibility();
+      const unsubHierarchy = engine.on("hierarchy-changed", () => {
+        // Cheap-ish — walks every entity looking for a collider.
+        // Sets visibility to the user's current preference; new colliders
+        // added since the last tick get their `visible` corrected here.
+        setCollidersVisible(viewport.layers.colliders);
+      });
 
       engine.onUpdate(() => {
         viewport.orbit.update();
@@ -234,10 +267,11 @@ function findSceneCamera() {
 function setupPlayCamera() {
   engine.on("play-changed", (playing) => {
     if (viewport.helpers) viewport.helpers.visible = !playing;
-    viewport.gizmo?.getHelper() && (viewport.gizmo.getHelper().visible = !playing);
-    if (viewport.cameraHelper) viewport.cameraHelper.visible = !playing;
-    if (viewport.lightHelper) viewport.lightHelper.visible = !playing;
     if (viewport.cameraPreview) viewport.cameraPreview.setVisible(!playing);
+    // Gizmo + selectionBox visibility is owned by `applyLayerVisibility`
+    // — it AND-combines the user's Gizmo toggle with the editor-vs-play
+    // rule so flipping the dropdown takes effect both in and out of play.
+    applyLayerVisibility();
 
     if (playing) {
       const camEntity = findSceneCamera();
@@ -502,6 +536,102 @@ function rebuildGrid(editorSettings) {
     0x2c3038,
   );
   helpers.add(viewport.grid);
+  // New meshes inherit the layer-toggle visibility — the dropdown can hide
+  // a freshly-rebuilt grid without another rebuild pass.
+  viewport.grid.visible = viewport.layers.grid;
+}
+
+/**
+ * Walks every entity in the scene and applies `visible` to its
+ * `ColliderComponent.gizmo` (the green wireframe outline on
+ * EDITOR_LAYER). The component owns the gizmo Object3D — we don't
+ * tear it down, only flip `visible` so toggling is instant and
+ * reversible.
+ */
+function setCollidersVisible(visible) {
+  for (const entity of engine.entities.values()) {
+    const collider = entity.getComponent?.("collider");
+    if (!collider?.gizmo) continue;
+    collider.gizmo.visible = visible;
+  }
+}
+
+/**
+ * Apply all three Layers-toggle states at once. Used both at init
+ * (to honor any default toggles) and after the dropdown flips one.
+ * Gizmo + selectionBox live as singletons on `viewport.*`, so they're
+ * controlled directly; colliders are per-component so we walk.
+ */
+function applyLayerVisibility() {
+  const { gizmos, colliders, grid } = viewport.layers;
+  const gizmoHelper = viewport.gizmo?.getHelper();
+  if (gizmoHelper) gizmoHelper.visible = gizmos && !engine.playing;
+  if (viewport.selectionBox) viewport.selectionBox.visible = gizmos && !engine.playing;
+  if (viewport.grid) viewport.grid.visible = grid;
+  setCollidersVisible(colliders);
+}
+
+// Hydrate `viewport.layers` from project settings (settings.editor.layers)
+// on every apply. Used at boot and when the user changes settings in the
+// project settings panel. We only call `applyLayerVisibility` +
+// `notifyLayersChanged` if the value actually differs, so a no-op apply
+// (which happens after every `setLayerVisible` write) doesn't trigger
+// React re-renders.
+onProjectSettingsApplied((settings) => {
+  const incoming = settings?.editor?.layers;
+  if (!incoming) return;
+  let next = viewport.layers;
+  for (const { key } of LAYER_TOGGLES) {
+    if (key in incoming && incoming[key] !== next[key]) {
+      next = { ...next, [key]: !!incoming[key] };
+    }
+  }
+  if (next === viewport.layers) return;
+  viewport.layers = next;
+  if (viewport.initPromise) {
+    applyLayerVisibility();
+    notifyLayersChanged();
+  }
+});
+
+// Persist `viewport.layers` into project.json so the user's preferred
+// view survives reloads / sessions. The project settings panel already
+// uses `updateMeta` for similar "fire and forget" saves; we do the same
+// here, fanning the write into the existing `settings.editor.layers`
+// slot without going through `applyProjectSettings` (which would re-run
+// every settings listener for what's really just a viewport state change).
+function persistLayersNow() {
+  // Lazy import — projectStore touches the Tauri bridge which only exists
+  // in the built editor, and avoiding it during module init keeps tests
+  // and pure-JS tooling happy.
+  import("../store/projectStore.js")
+    .then(({ useProjectStore }) => {
+      const current = getProjectSettings();
+      return useProjectStore.getState().updateMeta({
+        settings: { ...current, editor: { ...current.editor, layers: { ...viewport.layers } } },
+      });
+    })
+    .catch((err) => console.warn(`Couldn't persist layers to project.json: ${err}`));
+}
+
+/**
+ * Single entry point the React toolbar uses to flip a layer toggle.
+ * Mutates `viewport.layers`, makes the visible change take effect,
+ * notifies subscribers, and persists the new state to project.json.
+ */
+export function setLayerVisible(key, visible) {
+  if (!(key in viewport.layers)) return;
+  if (viewport.layers[key] === visible) return;
+  viewport.layers = { ...viewport.layers, [key]: visible };
+  applyLayerVisibility();
+  notifyLayersChanged();
+  persistLayersNow();
+}
+
+/** Subscribe to layer-toggle changes. Returns an unsubscribe. */
+export function subscribeLayers(fn) {
+  viewport.layersListeners.add(fn);
+  return () => viewport.layersListeners.delete(fn);
 }
 
 function setSnap(enabled) {
@@ -520,13 +650,13 @@ function isUiEntity(entity) {
 
 function attachSelection(entityId) {
   const entity = entityId ? engine.getEntity(entityId) : null;
-  if (viewport.selectionBox) {
-    engine.scene.remove(viewport.selectionBox);
-    viewport.selectionBox.dispose();
-    viewport.selectionBox = null;
-  }
-  detachCameraHelper();
-  detachLightHelper();
+    if (viewport.selectionBox) {
+      engine.scene.remove(viewport.selectionBox);
+      viewport.selectionBox.dispose();
+      viewport.selectionBox = null;
+    }
+    detachCameraHelper();
+    detachLightHelper();
   // UI entities get a 2D rect outline (drawn by the UiSystem overlay pass)
   // instead of the 3D gizmo + bounding box.
   const uiSystem = getUiSystem(engine, { create: false });
@@ -583,6 +713,10 @@ function attachSelection(entityId) {
   if (lightComponent?.light) {
     attachLightHelper(lightComponent);
   }
+  // Newly-attached gizmo + selectionBox must honor the Gizmos toggle
+  // (and stop hiding in Play). Re-applying the layer state overrides
+  // any default `visible: true` from above with the user's choice.
+  applyLayerVisibility();
 }
 
 /** Adds a CameraHelper (frustum lines) for the given three.js camera. */
@@ -1402,6 +1536,12 @@ export function ViewportPanel() {
   const [macroState, setMacroState] = useState(null);
   const [previewEntityName, setPreviewEntityName] = useState(null);
   const playing = usePlayStore((s) => s.playing);
+  // Mirrors viewport.layers — kept here because React owns the toggle UI.
+  // The Panel re-reads this any time something else (e.g. another viewport
+  // instance in a future split-pane setup) mutates layer state via the
+  // subscribeLayers pub-sub.
+  const [layers, setLayers] = useState(viewport.layers);
+  const [layersOpen, setLayersOpen] = useState(false);
 
   const dropRef = useAssetDrop({
     accepts: [...MODEL_EXTENSIONS, ...TEXTURE_EXTENSIONS, ...SCRIPT_EXTENSIONS, ...MATERIAL_EXTENSIONS, ...PREFAB_EXTENSIONS],
@@ -1419,6 +1559,11 @@ export function ViewportPanel() {
       document.body.classList.remove("macro-active");
     };
   }, [macroState]);
+
+  // Sync local state when something else flips a layer toggle (today:
+  // nothing else does, but the pub-sub path lets future tooling drive
+  // it without coupling to React).
+  useEffect(() => subscribeLayers(setLayers), []);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -1530,6 +1675,37 @@ export function ViewportPanel() {
             <Icon size={14} />
           </button>
         ))}
+        <div className="layers-dropdown dropdown-wrap">
+          <button
+            className={`toolbar-btn icon-only ${layersOpen ? "active" : ""}`}
+            title="Layers"
+            onClick={() => setLayersOpen((v) => !v)}
+          >
+            <LayersIcon size={14} />
+          </button>
+          {layersOpen && (
+            <>
+              <div
+                className="dropdown-overlay"
+                onClick={() => setLayersOpen(false)}
+              />
+              <div className="dropdown-menu layers-menu">
+                {LAYER_TOGGLES.map(({ key, label }) => (
+                  <button
+                    key={key}
+                    className="dropdown-item layers-item"
+                    onClick={() => setLayerVisible(key, !layers[key])}
+                  >
+                    <span className="layers-item-label">
+                      <span className={`layers-dot ${layers[key] ? "on" : "off"}`} />
+                      {label}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
         {playing && <span className="backend-badge playing">Playing</span>}
         {backend && <span className={`backend-badge ${backend === "WebGPU" ? "webgpu" : "webgl"}`}>{backend}</span>}
       </div>

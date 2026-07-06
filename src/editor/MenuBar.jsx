@@ -21,6 +21,7 @@ export function MenuBar() {
   const sceneName = useSceneStore((s) => s.sceneName);
   const dirty = useSceneStore((s) => s.dirty);
 
+  const sceneRoot = useProjectStore((s) => s.rootPath);
   const menus = {
     File: [
       { label: "New Scene", action: () => newScene() },
@@ -29,7 +30,20 @@ export function MenuBar() {
       { label: "Save Scene", shortcut: "Ctrl+S", action: () => saveScene() },
       { label: "Save Scene As…", action: () => saveScene({ saveAs: true }) },
       { separator: true },
-      { label: "Open Project Folder…", action: () => useProjectStore.getState().openFolder() },
+      {
+        label: "New Project…",
+        action: () => useProjectStore.getState().createProject(),
+      },
+      {
+        label: "Open Project Folder…",
+        action: () => useProjectStore.getState().openFolder(),
+      },
+      {
+        label: "Close Project",
+        shortcut: "Ctrl+Shift+W",
+        disabled: !sceneRoot,
+        action: () => useProjectStore.getState().closeProject(),
+      },
       { separator: true },
       { label: "Export Game…", action: () => import("./exportGame.js").then((m) => m.exportGame()) },
     ],

@@ -7,10 +7,43 @@ import { useProjectStore } from "./store/projectStore.js";
 let currentPath = null;
 
 const SCENE_FILTERS = [{ name: "Scene", extensions: ["scene", "json"] }];
-const LAST_SCENE_KEY = "engine.lastScene.v1"; // legacy fallback when no project is open
+// Only consulted in the projectless ("Skip the project") path. With a real
+// project open, the scene to restore is always resolved from that project's
+// own project.json — never from a localStorage entry left over from a
+// previous project. See restoreLastScene().
+const LAST_SCENE_KEY = "engine.lastScene.v1";
 
 export const hasScenePath = () => !!currentPath;
 export const currentScenePath = () => currentPath;
+
+/**
+ * Flag consulted by EditorChrome on its mount effect. A single engine
+ * instance lives across the editor's whole session (so it survives project
+ * switches), so we have to remember whether the *current* project has been
+ * booted yet. Project switching flips this back to `false` to force a fresh
+ * boot of the new project.
+ */
+export let sceneBooted = false;
+export function markSceneBooted() {
+  sceneBooted = true;
+}
+export function resetSceneBooted() {
+  sceneBooted = false;
+}
+
+/**
+ * Wipes engine + scene-side bookkeeping. Called when switching projects so
+ * a new project always starts clean — never inherits entities/components
+ * left over from the previous one. The actual restore of project.json's
+ * scene is left to EditorChrome's normal boot flow.
+ */
+export async function resetEditorScene() {
+  const engine = await ensureEngine();
+  engine.clear();
+  currentPath = null;
+  resetSceneBooted();
+  afterSceneSwap();
+}
 
 const projectRoot = () => useProjectStore.getState().rootPath;
 const isAbsolute = (p) => /^([a-zA-Z]:[\\/]|\/)/.test(p);
@@ -25,12 +58,13 @@ function toProjectRelative(root, path) {
 
 /**
  * Records where the current scene lives. With a project open this is written
- * to project.json (the durable record); localStorage is only a fallback for
- * project-less sessions.
+ * to *that project's* project.json (the durable, per-project record); the
+ * legacy localStorage entry is only set in the project-less ("Skip the
+ * project") path. Mixing them would let a previous project's localStorage
+ * entry bleed into the next project opened.
  */
 function rememberScene(path) {
   currentPath = path;
-  localStorage.setItem(LAST_SCENE_KEY, path);
   const root = projectRoot();
   if (root) {
     const rel = toProjectRelative(root, path);
@@ -38,6 +72,8 @@ function rememberScene(path) {
       .getState()
       .updateMeta({ lastScene: rel ?? path })
       .catch((err) => console.warn(`Couldn't record lastScene in project.json: ${err}`));
+  } else {
+    localStorage.setItem(LAST_SCENE_KEY, path);
   }
 }
 
@@ -58,18 +94,31 @@ function resolveBootPath() {
  *  triggered an unwanted `newScene()` that polluted the project with auto-saved
  *  "Main 1"/"Main 2" files. Returns true on success, false (with a logged
  *  warning) when nothing could be restored. The caller decides what to do
- *  with that — see EditorChrome. */
+ *  with that — see EditorChrome.
+ *
+ *  Scene resolution rules:
+ *  - With a project open, the only valid source is *that project's* own
+ *    project.json (mainScene / lastScene). A localStorage entry left over
+ *    from a previous project is ignored — otherwise a freshly-created
+ *    project would silently reopen the previous game's saved scene.
+ *  - Without a project (the "Skip the project" path), legacy localStorage
+ *    is the only available record.
+ *  Callers are expected to clear the engine first (see resetEditorScene)
+ *  when switching projects, so a project with no saved scene ends up
+ *  truly empty rather than carrying the previous project's state. */
 export async function restoreLastScene() {
   const engine = await ensureEngine();
+  const root = projectRoot();
   let path = resolveBootPath();
-  if (!path) path = localStorage.getItem(LAST_SCENE_KEY);
+  if (!path && !root) path = localStorage.getItem(LAST_SCENE_KEY);
   if (!path) return false;
 
   const { invoke } = await import("@tauri-apps/api/core");
   try {
     await invoke("stat_file", { path });
   } catch {
-    console.warn(`Saved scene not found on disk: ${path} — leaving editor empty. Use File → New Scene or Open Scene…`);
+    const scope = root ? `project ${root}` : "saved scene";
+    console.warn(`Saved scene not found on disk: ${path} — leaving editor empty (${scope}). Use File → New Scene or Open Scene…`);
     return false;
   }
 

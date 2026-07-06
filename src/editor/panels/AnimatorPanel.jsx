@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Plus, Save, Play, Trash2, Zap } from "lucide-react";
 import {
   ReactFlow,
@@ -12,12 +12,17 @@ import {
   useNodesState,
   useEdgesState,
   useReactFlow,
+  BaseEdge,
+  getStraightPath,
+  EdgeLabelRenderer,
+  useStore,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
 import { engine } from "../engineInstance.js";
 import { ANY_STATE } from "../../engine/animGraph.js";
+import { setGraphHovered } from "../nodegraph/graphContext.js";
 
 /**
  * Node-graph editor for .anim animation-controller assets (Unity-style):
@@ -69,6 +74,8 @@ function graphToFlow(graph) {
       conditions: t.conditions ?? [],
       duration: t.duration ?? 0.25,
       exitTime: t.exitTime ?? null,
+      sourcePoint: t.sourcePoint,
+      targetPoint: t.targetPoint,
     },
   }));
   return { nodes, edges };
@@ -91,6 +98,8 @@ function flowToGraph(nodes, edges, parameters, entry) {
       conditions: e.data?.conditions ?? [],
       duration: e.data?.duration ?? 0.25,
       exitTime: e.data?.exitTime ?? null,
+      sourcePoint: e.data?.sourcePoint,
+      targetPoint: e.data?.targetPoint,
     })),
     anyPosition: anyNode?.position,
   };
@@ -100,15 +109,76 @@ function flowToGraph(nodes, edges, parameters, entry) {
 // nodes
 // ---------------------------------------------------------------------------
 
+/**
+ * Animator graph nodes use PlayCanvas-style edge handles: instead of small
+ * dots on the left/right, a single invisible handle covers each of the four
+ * edges of the node. Each handle acts as both source AND target, so dragging
+ * from anywhere on a node's border to anywhere on another node's border
+ * creates a transition. Connections always originate at the closest point on
+ * the source edge to the cursor (React Flow snaps the start point to the
+ * handle's edge), which is exactly the PlayCanvas behaviour.
+ *
+ * `isConnectableStart` and `isConnectableEnd` are both true so the same
+ * element can initiate and accept connections.
+ */
+const EDGE_HANDLE_BASE_STYLE = {
+  background: "transparent",
+  border: "none",
+  borderRadius: 0,
+  minWidth: 0,
+  minHeight: 0,
+  transform: "none",
+  pointerEvents: "all", // override RF's default `none` so the perimeter is grabbable
+};
+const EDGE_HANDLE_CLASS = "shader-handle shader-handle-edge connectionindicator";
+
+function EdgeHandles() {
+  return (
+    <>
+      {/* Target handles are rendered first so the source handles are on top
+       * in document order — that way pointerdown on the perimeter always
+       * hits the source handle and starts a connection. The target handle
+       * is still in the DOM and is found by `elementFromPoint` when the user
+       * drops the line on this side of another node. */}
+      <Handle type="target" position={Position.Left} id="l" className={EDGE_HANDLE_CLASS}
+        style={{ ...EDGE_HANDLE_BASE_STYLE, width: 12, height: "100%", top: 0, left: -6 }}
+        isConnectableStart={false} isConnectableEnd />
+      <Handle type="source" position={Position.Left} id="l" className={EDGE_HANDLE_CLASS}
+        style={{ ...EDGE_HANDLE_BASE_STYLE, width: 12, height: "100%", top: 0, left: -6 }}
+        isConnectableStart isConnectableEnd />
+
+      <Handle type="target" position={Position.Right} id="r" className={EDGE_HANDLE_CLASS}
+        style={{ ...EDGE_HANDLE_BASE_STYLE, width: 12, height: "100%", top: 0, right: -6 }}
+        isConnectableStart={false} isConnectableEnd />
+      <Handle type="source" position={Position.Right} id="r" className={EDGE_HANDLE_CLASS}
+        style={{ ...EDGE_HANDLE_BASE_STYLE, width: 12, height: "100%", top: 0, right: -6 }}
+        isConnectableStart isConnectableEnd />
+
+      <Handle type="target" position={Position.Top} id="t" className={EDGE_HANDLE_CLASS}
+        style={{ ...EDGE_HANDLE_BASE_STYLE, width: "100%", height: 12, top: -6 }}
+        isConnectableStart={false} isConnectableEnd />
+      <Handle type="source" position={Position.Top} id="t" className={EDGE_HANDLE_CLASS}
+        style={{ ...EDGE_HANDLE_BASE_STYLE, width: "100%", height: 12, top: -6 }}
+        isConnectableStart isConnectableEnd />
+
+      <Handle type="target" position={Position.Bottom} id="b" className={EDGE_HANDLE_CLASS}
+        style={{ ...EDGE_HANDLE_BASE_STYLE, width: "100%", height: 12, bottom: -6 }}
+        isConnectableStart={false} isConnectableEnd />
+      <Handle type="source" position={Position.Bottom} id="b" className={EDGE_HANDLE_CLASS}
+        style={{ ...EDGE_HANDLE_BASE_STYLE, width: "100%", height: 12, bottom: -6 }}
+        isConnectableStart isConnectableEnd />
+    </>
+  );
+}
+
 function StateNode({ data, selected }) {
   return (
     <div className={`shader-node cat-anim ${selected ? "selected" : ""}`}>
+      <EdgeHandles />
       <div className="shader-node-header">
-        <Handle type="target" position={Position.Left} id="in" className="shader-handle" />
         <span className="shader-node-dot" />
         <span className="shader-node-label">{data.state.name}</span>
         {data.entry && <span className="animator-entry-badge">entry</span>}
-        <Handle type="source" position={Position.Right} id="out" className="shader-handle" />
       </div>
       <div className="shader-node-body">
         <div className="shader-node-row">
@@ -122,10 +192,10 @@ function StateNode({ data, selected }) {
 function AnyStateNode({ selected }) {
   return (
     <div className={`shader-node cat-any ${selected ? "selected" : ""}`}>
+      <EdgeHandles />
       <div className="shader-node-header">
         <span className="shader-node-dot" />
         <span className="shader-node-label">Any State</span>
-        <Handle type="source" position={Position.Right} id="out" className="shader-handle" />
       </div>
     </div>
   );
@@ -133,11 +203,128 @@ function AnyStateNode({ selected }) {
 
 const nodeTypes = { animState: StateNode, anyState: AnyStateNode };
 
+/** Clamp a flow-space point so it sits on the perimeter of a node's bounding
+ *  box (with a small `pad` so the arrowhead lands a few pixels outside the
+ *  node border, never buried underneath it). Returns the input point
+ *  unchanged when no box is supplied. */
+function clampToBoxPerimeter(point, box, pad = 4) {
+  if (!box) return point;
+  const { x, y } = point;
+  const minX = box.x - pad;
+  const maxX = box.x + box.width + pad;
+  const minY = box.y - pad;
+  const maxY = box.y + box.height + pad;
+  const cx = Math.min(Math.max(x, minX), maxX);
+  const cy = Math.min(Math.max(y, minY), maxY);
+  return { x: cx, y: cy };
+}
+
+// ---------------------------------------------------------------------------
+// custom straight edge (PlayCanvas-style: a plain line + arrowhead, no curves)
+// ---------------------------------------------------------------------------
+
+function StraightEdge({
+  id, source, target, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition,
+  selected, markerEnd, label, data,
+}) {
+  // RF doesn't pass the source/target node directly — we look them up in
+  // the store by id so we can clamp the target endpoint to the target
+  // node's bounding box and keep the arrowhead visible above the node.
+  const nodes = useStore((s) => s.nodeLookup);
+  const sourceNode = nodes?.get?.(source);
+  const targetNode = nodes?.get?.(target);
+
+  // New connections carry the exact flow-space points the user grabbed and
+  // released on. Falling back to the standard handle-derived coords keeps
+  // existing edges (saved before this change) rendering correctly.
+  const sp = data?.sourcePoint;
+  const tp = data?.targetPoint;
+  const sx = sp?.x ?? sourceX;
+  const sy = sp?.y ?? sourceY;
+  let tx = tp?.x ?? targetX;
+  let ty = tp?.y ?? targetY;
+  // Clamp the target endpoint to the target node's bounding box so the
+  // arrowhead sits just outside the node's perimeter, not buried underneath
+  // it. The source point is left as-is so the line "leaves" the source from
+  // the exact spot the user grabbed.
+  if (targetNode && tp) {
+    const pos = targetNode.internals?.positionAbsolute ?? targetNode.position;
+    const m = targetNode.measured;
+    if (pos && m?.width != null && m?.height != null) {
+      const c = clampToBoxPerimeter(tp, { x: pos.x, y: pos.y, width: m.width, height: m.height }, 6);
+      tx = c.x;
+      ty = c.y;
+    }
+  }
+  const [edgePath] = getStraightPath({ sourceX: sx, sourceY: sy, targetX: tx, targetY: ty });
+  return (
+    <>
+      <BaseEdge id={id} path={edgePath} markerEnd={markerEnd} style={{ strokeWidth: selected ? 2 : 1.5 }} />
+      {label && (
+        <EdgeLabelRenderer>
+          <div
+            className={`nodrag nopan animator-edge-label${selected ? " selected" : ""}`}
+            style={{
+              position: "absolute",
+              transform: `translate(-50%, -50%) translate(${(sx + tx) / 2}px, ${(sy + ty) / 2}px)`,
+              pointerEvents: "all",
+            }}
+          >
+            {label}
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
+  );
+}
+
+const edgeTypes = { default: StraightEdge };
+
+/** Module-scoped ref shared between <ReactFlow>'s onConnect handlers and
+ *  the custom <StraightConnectionLine>. Holds the exact flow-space points
+ *  the user grabbed and is currently hovering. The connection line reads
+ *  these so the live wire starts at the cursor's initial press position
+ *  (not the edge midpoint). */
+const dragPointRef = { startPoint: null, endPoint: null };
+
+/** Live wire while dragging. We prefer the exact start/end points captured
+ *  during the drag (dragPointRef) over the edge-midpoint `from/to` that
+ *  RF passes in props. This makes the wire match what gets saved to the
+ *  edge, and it spreads multiple transitions between the same nodes. */
+function StraightConnectionLine({ fromX, fromY, toX, toY }) {
+  const sx = dragPointRef.startPoint?.x ?? fromX;
+  const sy = dragPointRef.startPoint?.y ?? fromY;
+  const tx = dragPointRef.endPoint?.x ?? toX;
+  const ty = dragPointRef.endPoint?.y ?? toY;
+  return (
+    <path
+      d={`M ${sx},${sy} L ${tx},${ty}`}
+      fill="none"
+      stroke="#4d9dff"
+      strokeWidth={2}
+    />
+  );
+}
+
 // ---------------------------------------------------------------------------
 // sidebar editors
 // ---------------------------------------------------------------------------
 
-function ParametersSection({ parameters, onChange }) {
+/**
+ * Animator parameters list. In edit mode the right-hand column edits each
+ * parameter's *default* value (the value the runtime initialises it to). In
+ * play mode the right-hand column drives the *current runtime* value on a
+ * bound Animation component, so you can poke parameters and watch the state
+ * machine react. Both modes let you rename / remove / add parameters.
+ */
+function ParametersSection({
+  parameters,
+  onChange,
+  playMode,
+  drivenComponent,
+  drivenOptions,
+  onPickDriven,
+}) {
   const add = (type) => {
     let i = 1;
     while (parameters.some((p) => p.name === `param${i}`)) i++;
@@ -147,17 +334,46 @@ function ParametersSection({ parameters, onChange }) {
   const patch = (index, p) => onChange(parameters.map((x, i) => (i === index ? { ...x, ...p } : x)));
   const remove = (index) => onChange(parameters.filter((_, i) => i !== index));
 
+  const currentState = playMode && drivenComponent ? drivenComponent.currentState : null;
+
   return (
     <div className="inspector-section">
       <div className="section-header">
-        Parameters
+        {playMode ? "Parameters (Live)" : "Parameters"}
         <div className="dropdown-wrap">
           <ParamAddButton onPick={add} />
         </div>
       </div>
-      {parameters.length === 0 && <div className="asset-hint">No parameters</div>}
+      {playMode && drivenOptions.length > 1 && (
+        <div className="field-row">
+          <span className="field-label">Drives</span>
+          <select
+            className="select-field animator-target-select"
+            value={drivenComponent?.entity.id ?? ""}
+            onChange={(e) => onPickDriven(e.target.value)}
+            title="Pick which bound entity these live values drive"
+          >
+            {drivenOptions.map(({ id, name }) => (
+              <option key={id} value={id}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+      {playMode && (
+        <div className="animator-current-state">
+          State: <span className="animator-current-state-name">{currentState ?? "—"}</span>
+        </div>
+      )}
+      {!playMode && parameters.length === 0 && <div className="asset-hint">No parameters</div>}
+      {playMode && !drivenComponent?.runtime && (
+        <div className="asset-hint">
+          No bound entity with a live runtime — add an Animation component using this controller to drive values.
+        </div>
+      )}
       {parameters.map((p, i) => (
-        <div className="field-row animator-param-row" key={i}>
+        <div className="field-row animator-param-row" key={p.name + ":" + i}>
           <input
             className="text-field"
             defaultValue={p.name}
@@ -168,7 +384,13 @@ function ParametersSection({ parameters, onChange }) {
             }}
           />
           <span className="animator-param-type">{p.type}</span>
-          {p.type === "number" ? (
+          {playMode ? (
+            drivenComponent?.runtime ? (
+              <LiveParamControl param={p} component={drivenComponent} />
+            ) : (
+              <span className="animator-param-default" />
+            )
+          ) : p.type === "number" ? (
             <input
               className="number-field animator-param-default"
               type="number"
@@ -187,6 +409,42 @@ function ParametersSection({ parameters, onChange }) {
         </div>
       ))}
     </div>
+  );
+}
+
+/** Per-parameter runtime control. Re-renders on the parent's rAF tick so
+ *  trigger consumption and external script writes show up immediately. */
+function LiveParamControl({ param, component }) {
+  const value = component.getParam(param.name);
+  if (param.type === "number") {
+    return (
+      <input
+        className="number-field animator-param-default"
+        type="number"
+        step={0.1}
+        value={typeof value === "number" ? value : 0}
+        onChange={(e) => component.setNumber(param.name, parseFloat(e.target.value) || 0)}
+      />
+    );
+  }
+  if (param.type === "boolean") {
+    return (
+      <input
+        type="checkbox"
+        checked={!!value}
+        onChange={(e) => component.setBool(param.name, e.target.checked)}
+      />
+    );
+  }
+  // trigger
+  return (
+    <button
+      className={`toolbar-btn tiny${value ? " active" : ""}`}
+      onClick={() => component.setTrigger(param.name)}
+      title="Fire trigger (auto-cleared after a transition consumes it)"
+    >
+      {value ? "set" : "fire"}
+    </button>
   );
 }
 
@@ -217,121 +475,6 @@ function ParamAddButton({ onPick }) {
         </>
       )}
     </>
-  );
-}
-
-/**
- * Live parameter playground: edits flow straight into the bound entity's
- * animator runtime, so the user can verify their transition conditions by
- * typing values and watching the active state change. The section re-reads
- * param values on every animation frame so consumed triggers and script
- * writes are reflected immediately.
- */
-function ParamValuesSection({ parameters, component, options, onPickComponent }) {
-  // rAF tick to refresh displayed values. Triggers get consumed by the
-  // runtime after a transition fires; we need to see that "true → false"
-  // transition without manual refresh.
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    if (!component?.runtime) return;
-    let alive = true;
-    const loop = () => {
-      if (!alive) return;
-      setTick((t) => (t + 1) & 0xffff);
-      requestAnimationFrame(loop);
-    };
-    const id = requestAnimationFrame(loop);
-    return () => {
-      alive = false;
-      cancelAnimationFrame(id);
-    };
-  }, [component]);
-
-  if (!component) {
-    return (
-      <div className="inspector-section">
-        <div className="section-header">Live Values</div>
-        <div className="asset-hint">No entity in the scene uses this controller — add an Animation component first.</div>
-      </div>
-    );
-  }
-  if (!component.runtime) {
-    return (
-      <div className="inspector-section">
-        <div className="section-header">Live Values</div>
-        <div className="asset-hint">Waiting for the bound model to finish loading…</div>
-      </div>
-    );
-  }
-
-  const currentState = component.currentState ?? "—";
-
-  return (
-    <div className="inspector-section">
-      <div className="section-header">
-        Live Values
-        {options.length > 1 && (
-          <select
-            className="select-field animator-target-select"
-            value={component.entity.id}
-            onChange={(e) => onPickComponent(e.target.value)}
-            title="Pick which bound entity these values drive"
-          >
-            {options.map(({ id, name }) => (
-              <option key={id} value={id}>
-                {name}
-              </option>
-            ))}
-          </select>
-        )}
-      </div>
-      <div className="animator-current-state">
-        State: <span className="animator-current-state-name">{currentState}</span>
-      </div>
-      {parameters.length === 0 && <div className="asset-hint">No parameters to drive</div>}
-      {parameters.map((p) => {
-        const value = component.getParam(p.name);
-        if (p.type === "number") {
-          return (
-            <div className="field-row animator-param-row" key={p.name}>
-              <span className="animator-param-label">{p.name}</span>
-              <input
-                className="number-field"
-                type="number"
-                step={0.1}
-                value={typeof value === "number" ? value : 0}
-                onChange={(e) => component.setNumber(p.name, parseFloat(e.target.value) || 0)}
-              />
-            </div>
-          );
-        }
-        if (p.type === "boolean") {
-          return (
-            <div className="field-row animator-param-row" key={p.name}>
-              <span className="animator-param-label">{p.name}</span>
-              <input
-                type="checkbox"
-                checked={!!value}
-                onChange={(e) => component.setBool(p.name, e.target.checked)}
-              />
-            </div>
-          );
-        }
-        // trigger
-        return (
-          <div className="field-row animator-param-row" key={p.name}>
-            <span className="animator-param-label">{p.name}</span>
-            <button
-              className={`toolbar-btn tiny${value ? " active" : ""}`}
-              onClick={() => component.setTrigger(p.name)}
-              title="Fire trigger (auto-cleared after a transition consumes it)"
-            >
-              {value ? "set" : "fire"}
-            </button>
-          </div>
-        );
-      })}
-    </div>
   );
 }
 
@@ -641,11 +784,43 @@ function AnimatorEditor({ animPath }) {
     };
   }, [animPath]);
 
+  // Track play mode (engine.setPlaying flips this). The play-mode UI shows
+  // each parameter's *runtime* value on a bound Animation component, so we
+  // need to react to play-changed events and re-render on every frame while
+  // playing (consumed triggers / script writes should be visible immediately).
+  const [playMode, setPlayMode] = useState(() => engine.playing);
+  useEffect(() => {
+    const onChange = (v) => setPlayMode(v);
+    engine.on("play-changed", onChange);
+    setPlayMode(engine.playing);
+    return () => engine.off("play-changed", onChange);
+  }, []);
+  const [, setLiveTick] = useState(0);
+  useEffect(() => {
+    if (!playMode) return;
+    let alive = true;
+    const loop = () => {
+      if (!alive) return;
+      setLiveTick((t) => (t + 1) & 0xffff);
+      requestAnimationFrame(loop);
+    };
+    const id = requestAnimationFrame(loop);
+    return () => {
+      alive = false;
+      cancelAnimationFrame(id);
+    };
+  }, [playMode]);
+
   const drivenComponent = useMemo(() => {
     if (!boundComponents.length) return null;
     const picked = boundComponents.find((c) => c.entity.id === pickedEntityId);
     return picked ?? boundComponents[0];
   }, [boundComponents, pickedEntityId]);
+
+  // Guard against a stale graph-hovered flag if the panel unmounts while
+  // the pointer is still over it (dockview close, tab switch, …).
+  useEffect(() => () => setGraphHovered(false), []);
+
   // Reset the picker if the previously-chosen entity disappears.
   useEffect(() => {
     if (pickedEntityId && boundComponents.length && !boundComponents.some((c) => c.entity.id === pickedEntityId)) {
@@ -705,16 +880,53 @@ function AnimatorEditor({ animPath }) {
     setEdges((eds) => eds.map((e) => (e.id === edgeId ? { ...e, data: { ...e.data, ...patch } } : e)));
   };
 
+  /** Live cursor position in flow coordinates during a connection drag.
+   *  Captured at the start (initial press) and updated on every pointer move
+   *  so `onConnect` knows the exact points on the source/target edges the
+   *  user grabbed and released on — the saved edge is then drawn between
+   *  those two points, not between the edge midpoints. Multiple transitions
+   *  between the same pair of nodes no longer overlap. Mirrors the
+   *  module-scoped `dragPointRef` that the <StraightConnectionLine> reads
+   *  for the live wire. */
+  const dragRef = useRef({ startPoint: null, endPoint: null });
+
+  // Window-level pointer tracking while a connection is in progress. React
+  // Flow's `onConnect` doesn't include the cursor position, so we listen
+  // for pointer events on the canvas to keep the drag ref current.
+  useEffect(() => {
+    const onMove = (e) => {
+      if (!dragPointRef.startPoint) return;
+      const pt = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+      dragPointRef.endPoint = pt;
+      dragRef.current.endPoint = pt;
+    };
+    window.addEventListener("pointermove", onMove);
+    return () => window.removeEventListener("pointermove", onMove);
+  }, [screenToFlowPosition]);
+
   const onConnect = useCallback(
     (connection) => {
-      if (connection.source === connection.target) return;
+      if (connection.source === connection.target) {
+        dragRef.current = { startPoint: null, endPoint: null };
+        dragPointRef.startPoint = null;
+        dragPointRef.endPoint = null;
+        return;
+      }
       setDirty(true);
+      const data = { conditions: [], duration: 0.25, exitTime: null };
+      // Store the actual flow-space start/end points so the saved edge
+      // doesn't snap to edge midpoints.
+      if (dragRef.current.startPoint) data.sourcePoint = dragRef.current.startPoint;
+      if (dragRef.current.endPoint) data.targetPoint = dragRef.current.endPoint;
       setEdges((eds) =>
         addEdge(
-          { ...connection, id: uid("t"), data: { conditions: [], duration: 0.25, exitTime: null } },
+          { ...connection, id: uid("t"), data },
           eds.filter((e) => !(e.source === connection.source && e.target === connection.target)),
         ),
       );
+      dragRef.current = { startPoint: null, endPoint: null };
+      dragPointRef.startPoint = null;
+      dragPointRef.endPoint = null;
     },
     [setEdges],
   );
@@ -795,12 +1007,10 @@ function AnimatorEditor({ animPath }) {
               setParameters(next);
               setDirty(true);
             }}
-          />
-          <ParamValuesSection
-            parameters={parameters}
-            component={drivenComponent}
-            options={drivenOptions}
-            onPickComponent={setPickedEntityId}
+            playMode={playMode}
+            drivenComponent={drivenComponent}
+            drivenOptions={drivenOptions}
+            onPickDriven={setPickedEntityId}
           />
           {selectedNode && (
             <StateSection
@@ -824,22 +1034,60 @@ function AnimatorEditor({ animPath }) {
             />
           )}
         </div>
-        <div className="shader-graph-canvas">
+        <div
+          className="shader-graph-canvas"
+          onMouseEnter={() => setGraphHovered(true)}
+          onMouseLeave={() => setGraphHovered(false)}
+        >
           <ReactFlow
             nodes={decoratedNodes}
             edges={decoratedEdges}
             nodeTypes={nodeTypes}
+            edgeTypes={edgeTypes}
+            connectionLineComponent={StraightConnectionLine}
+            connectionRadius={36}
             onNodesChange={guardedNodesChange}
             onEdgesChange={(changes) => {
               if (changes.some((c) => c.type === "remove")) setDirty(true);
               onEdgesChange(changes);
             }}
             onConnect={onConnect}
+            onConnectStart={(_event, _params) => {
+              const ev = _event;
+              if (ev && ev.clientX != null) {
+                const pt = screenToFlowPosition({ x: ev.clientX, y: ev.clientY });
+                dragRef.current.startPoint = pt;
+                dragRef.current.endPoint = pt;
+                dragPointRef.startPoint = pt;
+                dragPointRef.endPoint = pt;
+              } else {
+                dragRef.current = { startPoint: null, endPoint: null };
+                dragPointRef.startPoint = null;
+                dragPointRef.endPoint = null;
+              }
+            }}
+            onConnectEnd={() => {
+              // Clean up the drag ref on the next tick so `onConnect` (which
+              // fires synchronously here) still sees the final `endPoint`.
+              setTimeout(() => {
+                if (!dragRef.current.startPoint) {
+                  dragRef.current = { startPoint: null, endPoint: null };
+                  dragPointRef.startPoint = null;
+                  dragPointRef.endPoint = null;
+                }
+              }, 0);
+            }}
+            onEdgeDoubleClick={(_event, edge) => {
+              // Double-click a transition to remove it.
+              setEdges((eds) => eds.filter((e) => e.id !== edge.id));
+              setDirty(true);
+            }}
             onPaneContextMenu={(e) => {
               e.preventDefault();
               setCanvasMenu({ x: e.clientX, y: e.clientY });
             }}
             deleteKeyCode={["Delete", "Backspace"]}
+            connectionMode="loose"
             colorMode="dark"
             fitView
             fitViewOptions={{ padding: 0.3, maxZoom: 1 }}

@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import { resolveAssetUrl, loadAssetMeta } from "./assetResolver.js";
-import { compileShaderGraph, migrateLegacyGraph } from "./shaderGraph.js";
+import { migrateLegacyGraph } from "./shaderGraph.js";
+import { compileShaderGraph, migrateGraph } from "./tslGraph.js";
 import { applyTextureMeta } from "./textureMeta.js";
 
 /**
@@ -56,6 +57,9 @@ const NODE_SLOTS = [
   "clearcoatRoughnessNode",
   "transmissionNode",
   "thicknessNode",
+  "normalNode",
+  "aoNode",
+  "positionNode",
 ];
 
 function clearNodeSlots(material) {
@@ -91,7 +95,8 @@ export function applyMaterialDef(entry, def) {
   clearNodeSlots(material);
 
   if (def.shaderGraph) {
-    const graph = entry.migrated ? def.shaderGraph : migrateLegacyGraph(def.shaderGraph, def);
+    // Two-step migration: v0 color-output → BSDF (legacy), then BSDF → slot Output.
+    const graph = entry.migrated ? def.shaderGraph : migrateGraph(migrateLegacyGraph(def.shaderGraph, def));
     entry.migrated = true;
     compileShaderGraph(graph)
       .then((result) => {
