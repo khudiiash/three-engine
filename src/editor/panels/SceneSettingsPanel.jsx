@@ -3,6 +3,7 @@ import { ensureEngine } from "../engineInstance.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetSceneSettingsCommand } from "../commands/settingsCommands.js";
 import { useSceneStore } from "../store/sceneStore.js";
+import { MSAA_SAMPLES, SHADOW_TYPES } from "../../engine/sceneSettings.js";
 
 const TONE_MAPPING_OPTIONS = [
   ["neutral", "Neutral (Khronos)"],
@@ -13,6 +14,8 @@ const TONE_MAPPING_OPTIONS = [
   ["linear", "Linear"],
   ["none", "None"],
 ];
+
+const SHADOW_TYPE_OPTIONS = Object.keys(SHADOW_TYPES).map((k) => [k, k.replace("ShadowMap", "")]);
 
 function Row({ label, children }) {
   return (
@@ -70,9 +73,24 @@ export function SceneSettingsPanel() {
 
   if (!settings) return <div className="inspector-panel empty">Loading…</div>;
 
+  // Top-level settings commit. Merging via the engine keeps "old" snapshots
+  // correct on undo, even when the patch only names one key.
   const commit = (patch, label) => commandBus.execute(new SetSceneSettingsCommand(patch, label));
   const commitFog = (fogPatch, label) =>
     commit({ fog: { ...settings.fog, ...fogPatch } }, label ?? "Change fog");
+  const commitRenderer = (rendererPatch, label) =>
+    commit(
+      { renderer: { ...settings.renderer, ...rendererPatch } },
+      label ?? "Change renderer settings",
+    );
+  const commitShadow = (shadowPatch, label) =>
+    commit(
+      { shadow: { ...settings.shadow, ...shadowPatch } },
+      label ?? "Change shadow settings",
+    );
+
+  const renderer = settings.renderer ?? { antialias: true, samples: 4, transparent: false };
+  const shadow = settings.shadow ?? { type: "PCFSoftShadowMap", autoUpdate: true, needsUpdate: false };
 
   return (
     <div className="inspector-panel scene-settings-panel">
@@ -182,6 +200,82 @@ export function SceneSettingsPanel() {
             type="checkbox"
             checked={settings.shadows !== false}
             onChange={(e) => commit({ shadows: e.target.checked }, "Toggle shadows")}
+          />
+        </Row>
+      </div>
+
+      <div className="inspector-section">
+        <div className="section-header">Renderer</div>
+        <div className="asset-hint" style={{ padding: "0 4px 6px" }}>
+          MSAA / canvas options — changing them rebuilds the renderer.
+        </div>
+        <Row label="Antialias">
+          <input
+            type="checkbox"
+            checked={renderer.antialias !== false}
+            onChange={(e) =>
+              commitRenderer({ antialias: e.target.checked }, "Toggle antialiasing")
+            }
+          />
+        </Row>
+        <Row label="MSAA samples">
+          <select
+            className="select-field"
+            value={renderer.antialias === false ? 1 : (renderer.samples ?? 4)}
+            disabled={renderer.antialias === false}
+            onChange={(e) =>
+              commitRenderer({ samples: parseInt(e.target.value, 10) }, "Change MSAA samples")
+            }
+          >
+            {MSAA_SAMPLES.map((n) => (
+              <option key={n} value={n}>
+                {n}×
+              </option>
+            ))}
+          </select>
+        </Row>
+        <Row label="Transparent">
+          <input
+            type="checkbox"
+            checked={renderer.transparent !== false}
+            onChange={(e) =>
+              commitRenderer({ transparent: e.target.checked }, "Toggle transparent canvas")
+            }
+          />
+        </Row>
+      </div>
+
+      <div className="inspector-section">
+        <div className="section-header">Shadows</div>
+        <Row label="Map type">
+          <select
+            className="select-field"
+            value={shadow.type}
+            onChange={(e) => commitShadow({ type: e.target.value }, "Change shadow type")}
+          >
+            {SHADOW_TYPE_OPTIONS.map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </Row>
+        <Row label="Auto update">
+          <input
+            type="checkbox"
+            checked={shadow.autoUpdate !== false}
+            onChange={(e) =>
+              commitShadow({ autoUpdate: e.target.checked }, "Toggle shadow auto-update")
+            }
+          />
+        </Row>
+        <Row label="Force update">
+          <input
+            type="checkbox"
+            checked={shadow.needsUpdate === true}
+            onChange={(e) =>
+              commitShadow({ needsUpdate: e.target.checked }, "Toggle shadow needs-update")
+            }
           />
         </Row>
       </div>

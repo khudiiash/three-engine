@@ -1,7 +1,13 @@
 import * as THREE from "three/webgpu";
 import { EventEmitter } from "./EventEmitter.js";
 import { Entity } from "./Entity.js";
-import { SCENE_SETTINGS_DEFAULTS, mergeSettings, applySettingsToScene } from "./sceneSettings.js";
+import {
+  SCENE_SETTINGS_DEFAULTS,
+  mergeSettings,
+  applySettingsToScene,
+  rendererConstructorOptions,
+  rendererNeedsRebuild,
+} from "./sceneSettings.js";
 import { InputManager } from "./input/index.js";
 import { createDefaultMaps } from "./input/defaultMaps.js";
 import { ViewFrustum } from "./viewFrustum.js";
@@ -28,6 +34,9 @@ export class Engine extends EventEmitter {
     this.sceneName = "Untitled";
     this.playing = false;
     this.rendererReady = false;
+    // True between start() and stop(); used by the renderer-rebuild path so
+    // the animation loop re-attaches to a freshly-recreated renderer.
+    this.loopActive = false;
     this.modules = new Map(); // module id -> setup handle (see modules.js)
     // Per-frame frustum state. Shared by every view-only component so the
     // view*projection matrix is multiplied exactly once per frame (and even
@@ -68,9 +77,47 @@ export class Engine extends EventEmitter {
 
   /** Merges + applies a scene-settings patch; emits "settings-changed". */
   applySettings(patch) {
-    this.settings = mergeSettings(this.settings, patch ?? {});
+    const before = this.settings;
+    this.settings = mergeSettings(before, patch ?? {});
+    // Renderer-construction options (antialias / samples / transparent) are
+    // frozen at WebGPURenderer creation time. If any of them just changed,
+    // tear the renderer down and rebuild it on the same canvas. The new
+    // renderer then gets the rest of the settings via applySettingsToScene.
+    let recreatedRenderer = false;
+    if (
+      this.renderer &&
+      rendererNeedsRebuild(before.renderer, this.settings.renderer)
+    ) {
+      const canvas = this.renderer.domElement;
+      this.renderer.setAnimationLoop(null);
+      this.renderer.dispose();
+      this.renderer = null;
+      this.rendererReady = false;
+      // Fire-and-forget the async rebuild. applySettingsToScene runs again
+      // after the new renderer resolves, so anything that already called
+      // applySettings synchronously gets the new renderer on next tick.
+      this.#rebuildRenderer(canvas);
+      recreatedRenderer = true;
+    }
     applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
     this.emit("settings-changed", this.settings);
+    return recreatedRenderer;
+  }
+
+  async #rebuildRenderer(canvas) {
+    try {
+      const opts = rendererConstructorOptions(this.settings);
+      this.renderer = new THREE.WebGPURenderer({ canvas, ...opts });
+      this.renderer.setPixelRatio(window.devicePixelRatio ?? 1);
+      await this.renderer.init();
+      applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
+      this.rendererReady = true;
+      // If a render loop was running, restart it on the new renderer.
+      if (this.loopActive) this.renderer.setAnimationLoop(() => this.#tick());
+      this.emit("renderer-rebuilt");
+    } catch (err) {
+      console.error("Renderer rebuild failed:", err);
+    }
   }
 
   /** Toggles game-logic execution (ScriptComponent onStart/onUpdate/onDestroy). */
@@ -122,7 +169,7 @@ export class Engine extends EventEmitter {
       this.renderer.dispose();
     }
     this.rendererReady = false;
-    this.renderer = new THREE.WebGPURenderer({ canvas, antialias: true });
+    this.renderer = new THREE.WebGPURenderer({ canvas, ...rendererConstructorOptions(this.settings) });
     this.renderer.setPixelRatio(window.devicePixelRatio ?? 1);
     await this.renderer.init();
     // Renderer-side settings (tone mapping, shadows) couldn't apply earlier.
@@ -143,10 +190,12 @@ export class Engine extends EventEmitter {
   }
 
   start() {
+    this.loopActive = true;
     this.renderer.setAnimationLoop(() => this.#tick());
   }
 
   stop() {
+    this.loopActive = false;
     this.renderer.setAnimationLoop(null);
   }
 

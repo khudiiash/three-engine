@@ -379,12 +379,16 @@ export async function compileShaderGraph(graph) {
 export function migrateLegacyGraph(graph, def) {
   if (!graph?.nodes?.length) return graph;
   // Legacy graphs wired value nodes into the Output's `color` handle (which
-  // became material.colorNode). New graphs have no `color` handle on the
-  // Output at all — they wire shader nodes into `surface`. The presence of an
-  // edge into `output.color` is the unambiguous legacy signal.
-  const hasLegacy = graph.nodes.some(
-    (n) => n.type === "output" && graph.edges?.some((e) => e.target === n.id && e.targetHandle === "color"),
-  );
+  // became material.colorNode) and used NO other Output handle. The modern
+  // slot-based Output (tslGraph.js) also has a `color` handle, but it exposes
+  // many others too (roughness/metalness/normal/…/volume). So `output.color`
+  // alone is ambiguous: treat the graph as legacy only when `color` is the
+  // *only* Output handle wired. Any other handle (e.g. a `volume` edge) proves
+  // it's already a modern graph — migrating it would drop those edges.
+  const outputIds = new Set(graph.nodes.filter((n) => n.type === "output").map((n) => n.id));
+  const outputEdges = (graph.edges ?? []).filter((e) => outputIds.has(e.target));
+  const hasLegacy =
+    outputEdges.length > 0 && outputEdges.every((e) => e.targetHandle === "color");
   if (!hasLegacy) return graph;
 
   const seedProps = { ...PRINCIPLED_DEFAULTS };

@@ -158,8 +158,10 @@ export class ParticleComponent extends Component {
       const ctx = makeComputeCtx("spawn", float(0));
       positions.element(instanceIndex).assign(sys.spawnPosition(ctx));
       velocities.element(instanceIndex).assign(sys.spawnVelocity(ctx));
-      // Stagger ages across a lifetime so emission ramps in instead of popping.
-      ages.element(instanceIndex).assign(hash(instanceIndex).mul(u.lifetime));
+      // Negative age = not born yet. Staggering births across one lifetime
+      // makes emission ramp in particle-by-particle instead of the whole
+      // capacity erupting from the emitter at once on build/restart.
+      ages.element(instanceIndex).assign(hash(instanceIndex).mul(u.lifetime).negate());
     })().compute(capacity);
 
     // Scene collision: reuse the engine-wide collider field, lazily created.
@@ -184,7 +186,10 @@ export class ParticleComponent extends Component {
       const life = lifetimeOf(index);
 
       age.addAssign(deltaTime);
-      If(age.greaterThanEqual(life), () => {
+      // Respawn on death — or on birth (age just crossed 0), so a not-yet-born
+      // particle that drifted while hidden snaps back to its spawn point.
+      const justBorn = age.greaterThanEqual(0).and(age.sub(deltaTime).lessThan(0));
+      If(age.greaterThanEqual(life).or(justBorn), () => {
         // time-derived salt → fresh randoms every respawn cycle
         const ctx = makeComputeCtx("spawn", time.mul(1e3));
         age.assign(0);
@@ -452,6 +457,14 @@ export class ParticleComponent extends Component {
     }
 
     material.positionNode = center.add(localOffset);
+    // TSL's shadow pass uses raw geometry positions by default — it does
+    // NOT pick up `positionNode` overrides, so billboarding / per-particle
+    // offsets would collapse to a pile at the entity origin and a
+    // directional light's tight orthographic frustum would simply miss the
+    // result. `castShadowPositionNode` is the supported hook for projecting
+    // a transformed vertex into the shadow map; mirror `positionNode` here
+    // so the same per-instance quad is rasterized into the shadow buffer.
+    if (s.castShadow) material.castShadowPositionNode = center.add(localOffset);
     this.#applyColorAndOpacity(material, sys, renderCtx);
 
     const mesh = new THREE.InstancedMesh(geometry, material, capacity);
@@ -473,7 +486,9 @@ export class ParticleComponent extends Component {
       mask = smoothstep(0.5, 0.15, uv().sub(0.5).length());
     }
     const alpha = sys.opacity ? sys.opacity(renderCtx) : renderCtx.life01.oneMinus();
-    const alphaMask = alpha.clamp(0, 1).mul(mask);
+    // Unborn particles (negative age, see initCompute) are fully hidden.
+    const born = renderCtx.age.greaterThanEqual(0).toFloat();
+    const alphaMask = alpha.clamp(0, 1).mul(mask).mul(born);
     if (material.isMeshStandardNodeMaterial) {
       // Lit path: color goes through the light model (no full-strength
       // emissive — that would wash out any received shadow).

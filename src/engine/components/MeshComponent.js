@@ -1,6 +1,13 @@
 import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
-import { loadMaterialAsset, getDefaultMaterial } from "../materialAsset.js";
+import {
+  loadMaterialAsset,
+  getDefaultMaterial,
+  isVolumeMaterial,
+  getMaterialInstance,
+  isMaterialRenderable,
+  subscribeMaterial,
+} from "../materialAsset.js";
 
 const geometryFactories = {
   box: () => new THREE.BoxGeometry(1, 1, 1),
@@ -48,6 +55,8 @@ export class MeshComponent extends Component {
   onDetach() {
     if (!this.mesh) return;
     this.sharedGeneration = (this.sharedGeneration ?? 0) + 1;
+    this.materialUnsub?.();
+    this.materialUnsub = null;
     this.entity.object3D.remove(this.mesh);
     this.mesh.geometry.dispose();
     this.mesh = null;
@@ -58,14 +67,37 @@ export class MeshComponent extends Component {
   }
 
   onEnable() {
-    if (this.mesh) this.mesh.visible = true;
+    // A material with nothing wired to Surface/Volume must stay hidden even
+    // when the component is enabled.
+    if (this.mesh) this.mesh.visible = this.materialRenderable !== false;
   }
 
   async #loadSharedMaterial(path) {
     const generation = (this.sharedGeneration = (this.sharedGeneration ?? 0) + 1);
-    const shared = await loadMaterialAsset(path);
+    await loadMaterialAsset(path);
     if (generation !== this.sharedGeneration || !this.mesh) return;
-    this.mesh.material = shared;
+    // Re-adopt on every change: the shared instance is swapped when the .mat
+    // flips surface ↔ volume, and its renderable state flips when the graph's
+    // Surface/Volume wiring changes.
+    this.materialUnsub?.();
+    this.materialUnsub = subscribeMaterial(path, () => this.#applySharedMaterial(path));
+    this.#applySharedMaterial(path);
+  }
+
+  #applySharedMaterial(path) {
+    if (!this.mesh) return;
+    this.mesh.material = getMaterialInstance(path) ?? getDefaultMaterial();
+    this.materialRenderable = isMaterialRenderable(path);
+    // A volume material renders nothing on the box's faces — the geometry is
+    // just the raymarch container, so it must be the unit box that
+    // `unitBoxMask` clips against. Snap non-box geometry to one.
+    if (isVolumeMaterial(path) && this.props.geometry !== "box") {
+      console.warn(`Mesh "${this.entity?.name ?? this.entity?.id}" uses a volume .mat — snapping geometry to box for correct raymarch bounds.`);
+      this.mesh.geometry.dispose();
+      this.mesh.geometry = new THREE.BoxGeometry(1, 1, 1);
+      this.props.geometry = "box";
+    }
+    this.mesh.visible = this.enabled && this.materialRenderable !== false;
   }
 
   onPropChanged(key) {
@@ -75,8 +107,15 @@ export class MeshComponent extends Component {
     }
     if (key === "material") {
       this.sharedGeneration = (this.sharedGeneration ?? 0) + 1;
-      if (this.props.material) this.#loadSharedMaterial(this.props.material);
-      else this.mesh.material = getDefaultMaterial();
+      this.materialUnsub?.();
+      this.materialUnsub = null;
+      if (this.props.material) {
+        this.#loadSharedMaterial(this.props.material);
+      } else {
+        this.mesh.material = getDefaultMaterial();
+        this.materialRenderable = true;
+        this.mesh.visible = this.enabled;
+      }
     } else if (key === "castShadow" || key === "receiveShadow") {
       this.mesh[key] = !!this.props[key];
     }

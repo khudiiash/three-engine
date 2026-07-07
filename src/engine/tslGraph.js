@@ -37,28 +37,133 @@ function loadTexture(path) {
  *  (e.g. "uv", "time") used when unwired and no value set. */
 const i = (key, type, def = null, src = null, extra = null) => ({ key, type, default: def, src, ...extra });
 
-/** Material slots exposed by the Output node. `key` is the port/edge handle,
- *  `slot` the material property the compiled node is assigned to. */
+/** Input sockets exposed by the Material Output node — Blender-style. Three
+ *  pins, mirroring Blender's `Material Output`:
+ *
+ *   - `surface` (type `surface`) — fed by a shader node (Principled BSDF,
+ *     Emission, …). Those nodes don't compile to a single TSL value; they
+ *     return a *surface bundle* `{ __surface: { <materialSlot>: tslNode } }`
+ *     that the compiler unpacks into the material's `*Node` slots. This is
+ *     why the per-channel pins (Color, Roughness, Metalness, …) live on the
+ *     BSDF node now, not on the Output — exactly like Blender.
+ *   - `volume` (type `volume`) — the Volume pin: a node wired into it is a
+ *     `Fn({positionRay}) -> vec4` suitable for `VolumeNodeMaterial.scatteringNode`.
+ *     The material-asset layer instantiates a `VolumeNodeMaterial` (volume
+ *     wired) or a `MeshPhysicalNodeMaterial` (surface only) accordingly.
+ *   - `displacement` (type `vec3`) — offsets/replaces vertex position via
+ *     `positionNode`.
+ *
+ *  `slot` is the single material property a socket maps to, or `null` for
+ *  `surface` (which expands to many slots via the bundle).
+ */
 export const OUTPUT_SLOTS = [
-  { key: "color", slot: "colorNode", type: "color" },
-  { key: "roughness", slot: "roughnessNode", type: "float" },
-  { key: "metalness", slot: "metalnessNode", type: "float" },
-  { key: "normal", slot: "normalNode", type: "vec3" },
-  { key: "emissive", slot: "emissiveNode", type: "color" },
-  { key: "opacity", slot: "opacityNode", type: "float" },
-  { key: "ao", slot: "aoNode", type: "float" },
-  { key: "ior", slot: "iorNode", type: "float" },
-  { key: "specularIntensity", slot: "specularIntensityNode", type: "float" },
-  { key: "specularColor", slot: "specularColorNode", type: "color" },
-  { key: "anisotropy", slot: "anisotropyNode", type: "float" },
-  { key: "sheen", slot: "sheenNode", type: "color" },
-  { key: "sheenRoughness", slot: "sheenRoughnessNode", type: "float" },
-  { key: "clearcoat", slot: "clearcoatNode", type: "float" },
-  { key: "clearcoatRoughness", slot: "clearcoatRoughnessNode", type: "float" },
-  { key: "transmission", slot: "transmissionNode", type: "float" },
-  { key: "thickness", slot: "thicknessNode", type: "float" },
-  { key: "position", slot: "positionNode", type: "vec3" },
+  { key: "surface", slot: null, type: "surface" },
+  { key: "volume", slot: null, type: "volume" },
+  { key: "displacement", slot: "positionNode", type: "vec3" },
 ];
+
+/** Every material `*Node` a compiled graph can populate — the union of all
+ *  surface-bundle slots plus volume/displacement. Callers reset these to null
+ *  before applying a fresh compile so a stale slot never leaks across edits. */
+export const MATERIAL_NODE_SLOTS = [
+  "colorNode", "roughnessNode", "metalnessNode", "emissiveNode", "opacityNode",
+  "iorNode", "specularIntensityNode", "specularColorNode", "anisotropyNode",
+  "sheenNode", "sheenRoughnessNode", "clearcoatNode", "clearcoatRoughnessNode",
+  "transmissionNode", "thicknessNode", "normalNode", "aoNode", "positionNode",
+];
+
+/** Build a surface bundle from a shader node's resolved inputs. `def.surfaceSlots`
+ *  maps input keys → material `*Node` names; only non-null inputs are emitted
+ *  (so wire-only channels like clearcoat/transmission stay unset unless the
+ *  user wires them — three's `useClearcoat`/`useTransmission`/… getters turn
+ *  the expensive lighting path ON the instant their node is non-null, even at
+ *  0, so leaving them null is what keeps a plain material cheap). `def.emitterBase`
+ *  forces a black, rough, non-metal base (Emission). `def.emissive` combines a
+ *  color × strength input pair into `emissiveNode`. */
+function buildSurface(def, ins) {
+  const m = {};
+  if (def.emitterBase) {
+    m.colorNode = TSL.vec3(0);
+    m.roughnessNode = TSL.float(1);
+    m.metalnessNode = TSL.float(0);
+  }
+  for (const [inKey, slot] of Object.entries(def.surfaceSlots ?? {})) {
+    if (ins[inKey] != null) m[slot] = ins[inKey];
+  }
+  if (def.emissive) {
+    const c = ins[def.emissive.color];
+    const s = ins[def.emissive.strength];
+    if (c != null) m.emissiveNode = s != null ? TSL.mul(c, s) : c;
+  }
+  return { __surface: m };
+}
+
+const VOLUME_STEPS_DEFAULT = 32;
+
+/** The current raymarch sample position in the mesh's local box space, shared
+ *  so that nodes wired into a volume (Noise, math on Position, …) vary THROUGH
+ *  the volume rather than across its surface. `volumeBundle` assigns it every
+ *  march step (inside the lighting model's Loop, before density/emission are
+ *  read); `Position (Local)` / `Position (World)` resolve to it when compiling
+ *  a volume graph. Module-level + assigned-in-loop mirrors how three's own
+ *  VolumetricLightingModel drives `scatteringDensity`. */
+const volumeRayLocal = TSL.property("vec3");
+
+/** World-space form of the current volume sample (local ray pos → world). */
+const volumeRayWorld = () => TSL.modelWorldMatrix.mul(TSL.vec4(volumeRayLocal, 1)).xyz;
+
+/** Volume nodes compile to a `__volume` bundle consumed by the material-asset
+ *  layer, which drives a `THREE.VolumeNodeMaterial` + its built-in
+ *  `VolumetricLightingModel`. That model raymarches the bounds, iterates every
+ *  scene light (with shadow maps → light shafts), applies Beer's-law
+ *  transmittance, and — given `material.depthNode` (a scene depth prepass) —
+ *  clips scattering behind opaque geometry for correct depth occlusion.
+ *
+ *  The model hands the callbacks a *world-space* sample `positionRay`, so we
+ *  transform back into the mesh's local unit box for the density field and mask
+ *  everything outside `[-0.5, 0.5]³` to 0 — that's what keeps the effect bounded
+ *  to the box instead of filling all of world space.
+ *
+ *   - `scattering(worldPos) -> vec3`  density × albedo tint (modulates the light
+ *     the model accumulates at this sample; also drives the transmittance).
+ *   - `emissive(worldPos)  -> vec3`   self-emitted light (fire/blackbody), added
+ *     independently of scene lights, or `null`.
+ *   - `steps`                          raymarch step count for this material. */
+function volumeBundle({ density, albedo, emission, steps }) {
+  const local = (worldPos) => TSL.modelWorldMatrixInverse.mul(TSL.vec4(worldPos, 1)).xyz;
+  // 1 inside the unit box, 0 outside (per-axis half-extent test, multiplied).
+  const boxMask = (l) => {
+    const a = l.abs();
+    return TSL.step(a.x, 0.5).mul(TSL.step(a.y, 0.5)).mul(TSL.step(a.z, 0.5));
+  };
+  return {
+    __volume: {
+      steps: Math.max(1, Math.round(steps ?? VOLUME_STEPS_DEFAULT)),
+      scattering: (worldPos) => {
+        // Publish this sample so wired Position/Noise nodes evaluate here. The
+        // model calls us inside its march Loop, so the assign is emitted in
+        // order, before the density expression below reads it.
+        const l = local(worldPos);
+        volumeRayLocal.assign(l);
+        const d = density(l).mul(boxMask(l));
+        return albedo ? albedo.mul(d) : d;
+      },
+      emissive: emission
+        ? (worldPos) => {
+            const l = local(worldPos);
+            volumeRayLocal.assign(l);
+            return emission.mul(density(l)).mul(boxMask(l));
+          }
+        : null,
+    },
+  };
+}
+
+/** A soft 0..1 cloud field in the mesh's local box, so a plain volume reads as
+ *  fuzzy rather than a solid cube. `positionLocal` is local ([-0.5,0.5]). */
+function cloudDensity(positionLocal) {
+  return TSL.mx_fractal_noise_float(positionLocal.mul(3), 3, 2, 0.5).mul(0.5).add(0.5);
+}
 
 // --- Registry builder helpers -------------------------------------------
 const src = (label, fn, out = "any") => ({ label, cat: "attribute", fn, inputs: [], out });
@@ -230,6 +335,143 @@ export const NODE_TYPES = {
     },
   },
 
+  // --- volume ---
+  // Volume nodes wire into Material Output's Volume socket, compiling to
+  // `scatteringNode` + `scatteringEmissiveNode` callbacks for
+  // `VolumeNodeMaterial`. The material's built-in `VolumetricLightingModel`
+  // marches the bounds, iterates every scene light (including shadow maps), and
+  // composites the result with proper transmittance. `MeshComponent` snaps the
+  // geometry to `BoxGeometry(1,1,1)` for correct march bounds.
+  volumeScatter: {
+    label: "Volume Scatter",
+    cat: "volume",
+    inputs: [
+      i("color", "color", "#ffffff"),
+      i("density", "float", 1),
+      i("anisotropy", "float", 0),
+    ],
+    params: [{ key: "steps", type: "number", default: 32, min: 1, step: 1 }],
+    out: "volume",
+    build: ({ ins, props }) => {
+      const colorNode = ins.color ?? TSL.uniform(new THREE.Color("#ffffff"));
+      const densityNode = ins.density ?? TSL.float(1);
+      return volumeBundle({
+        density: (p) => densityNode.mul(cloudDensity(p)),
+        albedo: colorNode,
+        emission: null,
+        steps: props.steps,
+      });
+    },
+  },
+  volumeAbsorption: {
+    label: "Volume Absorption",
+    cat: "volume",
+    inputs: [
+      i("color", "color", "#000000"),
+      i("density", "float", 1),
+    ],
+    params: [{ key: "steps", type: "number", default: 32, min: 1, step: 1 }],
+    out: "volume",
+    build: ({ ins, props }) => {
+      const densityNode = ins.density ?? TSL.float(1);
+      return volumeBundle({
+        density: (p) => densityNode.mul(cloudDensity(p)),
+        albedo: null,
+        emission: null,
+        steps: props.steps,
+      });
+    },
+  },
+  principledVolume: {
+    label: "Principled Volume",
+    cat: "volume",
+    inputs: [
+      i("color", "color", "#ffffff"),
+      i("colorAttribute", "any"),
+      i("density", "float", 1),
+      i("anisotropy", "float", 0),
+      i("emissionColor", "color", "#000000"),
+      i("emissionStrength", "float", 0),
+      i("blackbodyIntensity", "float", 0),
+      i("blackbodyTint", "color", "#ffffff"),
+      i("temperature", "any"),
+    ],
+    params: [{ key: "steps", type: "number", default: 48, min: 1, step: 1 }],
+    out: "volume",
+    build: ({ ins, props }) => {
+      const scatterColor = ins.color ?? TSL.uniform(new THREE.Color("#ffffff"));
+      const colorAttr = ins.colorAttribute;
+      const densityNode = ins.density ?? TSL.float(1);
+      const emissionC = ins.emissionColor ?? TSL.uniform(new THREE.Color("#000000"));
+      const emissionS = ins.emissionStrength ?? TSL.float(0);
+      const bbIntensity = ins.blackbodyIntensity ?? TSL.float(0);
+      const bbTint = ins.blackbodyTint ?? TSL.uniform(new THREE.Color("#ffffff"));
+      const emit = emissionC.mul(emissionS).add(bbTint.mul(bbIntensity));
+
+      return volumeBundle({
+        density: (p) => densityNode.mul(colorAttr ? TSL.float(colorAttr) : cloudDensity(p)),
+        albedo: scatterColor,
+        emission: emit,
+        steps: props.steps,
+      });
+    },
+  },
+
+  // --- shaders (surface) ---
+  // Blender-style: these are the nodes you wire into Material Output's
+  // `Surface` socket. They carry the per-channel inputs (Color, Roughness, …)
+  // and compile to a surface bundle (see `buildSurface`). The "cheap" channels
+  // have inline-editable defaults; the expensive ones (normal, anisotropy,
+  // clearcoat*, sheen*, transmission, thickness) are wire-only so they don't
+  // switch on their lighting path unless the user explicitly connects them.
+  principledBsdf: {
+    label: "Principled BSDF",
+    cat: "shader",
+    out: "surface",
+    inputs: [
+      i("color", "color", "#ffffff"),
+      i("roughness", "float", 0.5),
+      i("metalness", "float", 0),
+      i("ior", "float", 1.5),
+      i("specularIntensity", "float", 0.5),
+      i("specularColor", "color", "#ffffff"),
+      i("emissive", "color", "#000000"),
+      i("emissiveStrength", "float", 1),
+      i("opacity", "float", 1),
+      i("ao", "float", 1),
+      i("normal", "vec3"),
+      i("anisotropy", "float"),
+      i("clearcoat", "float"),
+      i("clearcoatRoughness", "float"),
+      i("sheen", "color"),
+      i("sheenRoughness", "float"),
+      i("transmission", "float"),
+      i("thickness", "float"),
+    ],
+    surfaceSlots: {
+      color: "colorNode", roughness: "roughnessNode", metalness: "metalnessNode",
+      ior: "iorNode", specularIntensity: "specularIntensityNode", specularColor: "specularColorNode",
+      opacity: "opacityNode", ao: "aoNode", normal: "normalNode", anisotropy: "anisotropyNode",
+      clearcoat: "clearcoatNode", clearcoatRoughness: "clearcoatRoughnessNode",
+      sheen: "sheenNode", sheenRoughness: "sheenRoughnessNode",
+      transmission: "transmissionNode", thickness: "thicknessNode",
+    },
+    emissive: { color: "emissive", strength: "emissiveStrength" },
+    build: ({ def, ins }) => buildSurface(def, ins),
+  },
+  emission: {
+    label: "Emission",
+    cat: "shader",
+    out: "surface",
+    inputs: [
+      i("color", "color", "#ffffff"),
+      i("strength", "float", 1),
+    ],
+    emitterBase: true,
+    emissive: { color: "color", strength: "strength" },
+    build: ({ def, ins }) => buildSurface(def, ins),
+  },
+
   // --- output ---
   output: {
     label: "Material Output", cat: "output",
@@ -241,7 +483,7 @@ export const NODE_TYPES = {
 export const CATEGORY_LABELS = {
   value: "Values", attribute: "Attributes", osc: "Time & Oscillators", math: "Math",
   vector: "Vector", noise: "Noise", texture: "Texture", color: "Color", utility: "Utility",
-  advanced: "Advanced", output: "Output",
+  shader: "Shaders", volume: "Volume", advanced: "Advanced", output: "Output",
 };
 
 export function nodeDefaults(type) {
@@ -256,8 +498,14 @@ function num(v) {
 }
 
 /** Builtin TSL source by export name — callable exports are invoked, node
- *  objects (time, positionWorld, …) returned as-is. */
-function builtin(name) {
+ *  objects (time, positionWorld, …) returned as-is. In a volume graph the
+ *  position sources resolve to the raymarch sample (see `volumeRayLocal`) so
+ *  Position-driven nodes (Noise, …) vary through the volume, not its surface. */
+function builtin(name, volumeMode = false) {
+  if (volumeMode) {
+    if (name === "positionLocal") return volumeRayLocal;
+    if (name === "positionWorld") return volumeRayWorld();
+  }
   const v = TSL[name];
   return typeof v === "function" ? v() : v;
 }
@@ -315,6 +563,11 @@ export async function compileShaderGraph(graph, { taps } = {}) {
   const uni = (key, node) => ((uniforms[key] = node), node);
   const cache = new Map();
 
+  // Known up-front so position sources can resolve to the raymarch sample while
+  // building the volume subtree (see `builtin`).
+  const outputId = graph.nodes.find((n) => n.type === "output")?.id;
+  const isVolume = outputId != null && edges.some((e) => e.target === outputId && e.targetHandle === "volume");
+
   function inputNode(node, spec) {
     const edge = edges.find((e) => e.target === node.id && e.targetHandle === spec.key);
     if (edge) return build(edge.source, edge.sourceHandle);
@@ -323,7 +576,7 @@ export async function compileShaderGraph(graph, { taps } = {}) {
       const u = makeUniform(value);
       if (u) return uni(`${node.id}.${spec.key}`, u);
     }
-    return spec.src ? builtin(spec.src) : null;
+    return spec.src ? builtin(spec.src, isVolume) : null;
   }
 
   function build(id, outKey) {
@@ -338,11 +591,11 @@ export async function compileShaderGraph(graph, { taps } = {}) {
       const ins = {};
       for (const spec of def.inputs ?? []) ins[spec.key] = inputNode(node, spec);
       if (def.build) {
-        result = def.build({ ins, out, props: node.props ?? {}, id, uni, textures });
+        result = def.build({ def, ins, out, props: node.props ?? {}, id, uni, textures });
       } else if (def.fn && !def.inputs?.length) {
         // Attribute-source node (uv, time, positionWorld, …) — may be a
         // callable TSL builder or a plain pre-built Node object.
-        result = builtin(def.fn);
+        result = builtin(def.fn, isVolume);
       } else if (def.fn) {
         const args = def.inputs.map((s) => ins[s.key]);
         while (args.length && args[args.length - 1] == null) args.pop();
@@ -362,116 +615,35 @@ export async function compileShaderGraph(graph, { taps } = {}) {
       const edge = edges.find((e) => e.target === outputNode.id && e.targetHandle === slot.key);
       if (!edge) continue;
       const node = build(edge.source, edge.sourceHandle);
-      if (node != null) mutations[slot.slot] = node;
+      if (node == null) continue;
+      if (slot.key === "surface") {
+        if (node.__surface) Object.assign(mutations, node.__surface);
+        else mutations.colorNode = node;
+      } else if (slot.key === "volume") {
+        // Volume bundle → consumed by the material-asset layer to drive a
+        // VolumeNodeMaterial (scatteringNode / scatteringEmissiveNode / steps).
+        if (node.__volume) mutations.__volume = node.__volume;
+      } else {
+        mutations[slot.slot] = node;
+      }
     }
   }
 
   const tapNodes = {};
   if (taps) for (const id of taps) tapNodes[id] = build(id, null);
 
-  return { mutations, uniforms, taps: tapNodes };
+  // `isVolume` (computed up-front) — the Output's Volume socket being wired
+  // selects the volume material class.
+  return { mutations, uniforms, taps: tapNodes, isVolume };
 }
 
 // --- Migration ------------------------------------------------------------
-// v0 graphs (single Output with a `color` handle) work natively: the new
-// Output has a `color` port and the old value/math node type names are kept.
-// v1 graphs (Blender-style BSDF nodes wired into output.surface) migrate here.
-
-const BSDF_TYPES = new Set(["principledBsdf", "glassBsdf", "diffuseBsdf", "emission"]);
-// principled input handle -> output slot key
-const PRINCIPLED_MAP = {
-  baseColor: "color", roughness: "roughness", metalness: "metalness", ior: "ior",
-  specular: "specularIntensity", anisotropic: "anisotropy", sheen: "sheen",
-  sheenRoughness: "sheenRoughness", clearcoat: "clearcoat", clearcoatRoughness: "clearcoatRoughness",
-  transmission: "transmission", transmissionRoughness: "thickness", alpha: "opacity",
-};
-
+// The Output is Blender-style (Surface / Volume / Displacement) with first-class
+// shader nodes (Principled BSDF, Emission) feeding Surface, so modern graphs
+// compile directly with no rewrite. `migrateGraph` is kept as an identity pass
+// so existing call sites (materialAsset, ShaderGraphPanel) stay stable.
 export function migrateGraph(graph) {
-  if (!graph?.nodes?.some((n) => BSDF_TYPES.has(n.type))) return graph;
-
-  const output = graph.nodes.find((n) => n.type === "output") ?? { id: "output", type: "output", props: {}, position: { x: 600, y: 200 } };
-  const edges = graph.edges ?? [];
-  const bsdfs = graph.nodes.filter((n) => BSDF_TYPES.has(n.type));
-  // The BSDF actually wired to the output wins; else the first one.
-  const active =
-    bsdfs.find((b) => edges.some((e) => e.source === b.id && e.target === output.id)) ?? bsdfs[0];
-
-  const nodes = graph.nodes.filter((n) => !BSDF_TYPES.has(n.type) && n.type !== "output");
-  const newEdges = edges.filter(
-    (e) => !BSDF_TYPES.has(nodeType(graph, e.source)) && !BSDF_TYPES.has(nodeType(graph, e.target)) && e.target !== output.id,
-  );
-  nodes.push({ ...output });
-
-  const base = active.position ?? { x: 300, y: 200 };
-  let seedY = base.y;
-  const wire = (sourceId, sourceHandle, slotKey) =>
-    newEdges.push({ source: sourceId, sourceHandle, target: output.id, targetHandle: slotKey });
-  const seed = (type, value, slotKey) => {
-    const id = `mig-${slotKey}`;
-    nodes.push({ id, type, props: { value }, position: { x: base.x, y: (seedY += 70) } });
-    wire(id, "out", slotKey);
-  };
-
-  const p = active.props ?? {};
-  if (active.type === "emission") {
-    // emissive = color × strength
-    const colId = "mig-emissive-c";
-    nodes.push({ id: colId, type: "color", props: { value: p.color ?? "#ffffff" }, position: { x: base.x - 200, y: base.y } });
-    if ((p.emissionStrength ?? 1) !== 1) {
-      const fId = "mig-emissive-s";
-      const mId = "mig-emissive-m";
-      nodes.push({ id: fId, type: "float", props: { value: p.emissionStrength }, position: { x: base.x - 200, y: base.y + 70 } });
-      nodes.push({ id: mId, type: "multiply", props: {}, position: { x: base.x, y: base.y } });
-      newEdges.push({ source: colId, sourceHandle: "out", target: mId, targetHandle: "a" });
-      newEdges.push({ source: fId, sourceHandle: "out", target: mId, targetHandle: "b" });
-      wire(mId, "out", "emissive");
-    } else wire(colId, "out", "emissive");
-    // keep any wire that fed emission.color
-    for (const e of edges) {
-      if (e.target === active.id && e.targetHandle === "color") wire(e.source, e.sourceHandle, "emissive");
-    }
-  } else {
-    const map =
-      active.type === "principledBsdf"
-        ? PRINCIPLED_MAP
-        : { color: "color", roughness: "roughness", ior: "ior" }; // glass/diffuse share these
-    // Wired BSDF inputs → output slots.
-    const wired = new Set();
-    for (const e of edges) {
-      if (e.target !== active.id) continue;
-      const slotKey = map[e.targetHandle];
-      if (!slotKey) continue;
-      wire(e.source, e.sourceHandle, slotKey);
-      wired.add(slotKey);
-    }
-    // Scalar/color props → seeded value nodes (only where meaningful).
-    const seedProp = (propKey, slotKey, neutral) => {
-      const v = p[propKey];
-      if (wired.has(slotKey) || v == null || v === neutral) return;
-      seed(typeof v === "string" ? "color" : "float", v, slotKey);
-    };
-    seedProp("baseColor", "color", null);
-    seedProp("color", "color", null);
-    seedProp("roughness", "roughness", null);
-    seedProp("metalness", "metalness", 0);
-    seedProp("ior", "ior", 1.5);
-    seedProp("specular", "specularIntensity", 0.5);
-    seedProp("clearcoat", "clearcoat", 0);
-    seedProp("clearcoatRoughness", "clearcoatRoughness", 0.03);
-    seedProp("transmission", "transmission", 0);
-    seedProp("sheen", "sheen", 0);
-    seedProp("alpha", "opacity", 1);
-    if (active.type === "glassBsdf") seed("float", 1, "transmission");
-    if (active.type === "diffuseBsdf") p.metalness = 0;
-    // Principled emission prop
-    if (p.emission && p.emission !== "#000000" && !wired.has("emissive")) seed("color", p.emission, "emissive");
-  }
-
-  return { nodes, edges: newEdges };
-}
-
-function nodeType(graph, id) {
-  return graph.nodes.find((n) => n.id === id)?.type ?? "";
+  return graph;
 }
 
 // --- Code generation --------------------------------------------------------
@@ -537,12 +709,57 @@ export function generateTslCode(graph) {
     return name;
   }
 
+  // Expression for one input of `node` — a wired upstream, else its inline
+  // value, else null (wire-only input left unconnected).
+  const inputExpr = (node, key) => {
+    const def = NODE_TYPES[node.type];
+    const spec = def.inputs?.find((s) => s.key === key);
+    if (!spec) return null;
+    const edge = edges.find((e) => e.target === node.id && e.targetHandle === key);
+    if (edge) return emit(edge.source, edge.sourceHandle);
+    const value = node.props?.[key] ?? spec.default;
+    if (value == null) return null;
+    return typeof value === "string"
+      ? `${use("color")}('${value}')`
+      : Array.isArray(value)
+        ? `${use(`vec${value.length}`)}(${value.map(num).join(", ")})`
+        : num(value);
+  };
+
+  // Emit `material.<slot> = <expr>;` for every channel a Surface shader node
+  // drives (mirrors `buildSurface`).
+  const emitSurface = (src) => {
+    const sdef = NODE_TYPES[src.type];
+    if (sdef.emitterBase) {
+      assignments.push(`material.colorNode = ${use("vec3")}(0);`);
+      assignments.push(`material.roughnessNode = ${use("float")}(1);`);
+      assignments.push(`material.metalnessNode = ${use("float")}(0);`);
+    }
+    for (const [inKey, matSlot] of Object.entries(sdef.surfaceSlots ?? {})) {
+      const expr = inputExpr(src, inKey);
+      if (expr != null) assignments.push(`material.${matSlot} = ${expr};`);
+    }
+    if (sdef.emissive) {
+      const c = inputExpr(src, sdef.emissive.color);
+      const s = inputExpr(src, sdef.emissive.strength);
+      if (c != null) assignments.push(`material.emissiveNode = ${s != null ? `${use("mul")}(${c}, ${s})` : c};`);
+    }
+  };
+
   const assignments = [];
   const output = graph.nodes.find((n) => n.type === "output");
   if (output) {
     for (const slot of OUTPUT_SLOTS) {
       const edge = edges.find((e) => e.target === output.id && e.targetHandle === slot.key);
-      if (edge) assignments.push(`material.${slot.slot} = ${emit(edge.source, edge.sourceHandle)};`);
+      if (!edge) continue;
+      const src = nodeById.get(edge.source);
+      const sdef = src && NODE_TYPES[src.type];
+      if (slot.key === "surface" && (sdef?.surfaceSlots || sdef?.emitterBase || sdef?.emissive)) {
+        emitSurface(src);
+      } else {
+        const matSlot = slot.key === "surface" ? "colorNode" : slot.slot;
+        assignments.push(`material.${matSlot} = ${emit(edge.source, edge.sourceHandle)};`);
+      }
     }
   }
   if (!assignments.length) return "// nothing wired to the Material Output";

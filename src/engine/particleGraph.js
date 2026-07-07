@@ -133,6 +133,15 @@ export const P_NODE_TYPES = {
     outputs: [{ key: "out", label: "rgb" }],
     params: [col("from", "From", "#ffd27f"), col("to", "To", "#ff3300")],
   },
+  blackbody: {
+    label: "Blackbody",
+    category: "value",
+    // Fire-spectrum ramp: t (heat, 0..1) → dark → ember red → orange →
+    // yellow → white-hot. Reads more like flame than a two-colour gradient.
+    inputs: [{ key: "t", label: "t (heat)" }],
+    outputs: [{ key: "out", label: "rgb" }],
+    params: [num("intensity", "Intensity", 1, { min: 0, step: 0.1 })],
+  },
 
   // --- Math -------------------------------------------------------------------
   add: { label: "Add", category: "math", inputs: [{ key: "a", label: "a" }, { key: "b", label: "b" }], outputs: [{ key: "out", label: "=" }], params: [] },
@@ -603,6 +612,14 @@ export async function compileParticleGraph(graph, opts = {}) {
       case "gradient": {
         const t = input(node.id, "t", ctx, ctx.life01);
         return mix(cu("from"), cu("to"), clamp(t, 0, 1));
+      }
+      case "blackbody": {
+        const t = clamp(input(node.id, "t", ctx, ctx.life01), 0, 1);
+        let c = mix(vec3(0), vec3(0.85, 0.13, 0.02), smoothstep(0.0, 0.28, t));
+        c = mix(c, vec3(1.0, 0.45, 0.05), smoothstep(0.28, 0.55, t));
+        c = mix(c, vec3(1.0, 0.85, 0.35), smoothstep(0.55, 0.8, t));
+        c = mix(c, vec3(1.0, 0.98, 0.85), smoothstep(0.8, 1.0, t));
+        return c.mul(fu("intensity"));
       }
 
       // Math --------------------------------------------------------------------

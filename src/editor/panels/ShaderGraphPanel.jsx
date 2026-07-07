@@ -19,7 +19,6 @@ import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
 import {
   NODE_TYPES,
-  OUTPUT_SLOTS,
   CATEGORY_LABELS,
   nodeDefaults,
   compileShaderGraph,
@@ -28,19 +27,20 @@ import {
   setUniformValue,
 } from "../../engine/tslGraph.js";
 import { migrateLegacyGraph } from "../../engine/shaderGraph.js";
-import { MATERIAL_DEFAULTS, getMaterialDef, loadMaterialAsset } from "../../engine/materialAsset.js";
+import { MATERIAL_DEFAULTS, getMaterialDef, loadMaterialAsset, updateMaterialAsset, syncMaterialRenderState, applyGraphMutations } from "../../engine/materialAsset.js";
 import { renderNodeThumb } from "../nodegraph/nodePreview.js";
 import { setGraphHovered } from "../nodegraph/graphContext.js";
 import { AssetField } from "../fields/AssetField.jsx";
 import { TEXTURE_EXTENSIONS } from "../assetLoader.js";
 
-/** Fresh materials: a Color value wired into the Output's color slot. */
+/** Fresh materials: a Principled BSDF wired into the Output's Surface socket
+ *  (Blender-style — the BSDF carries Color/Roughness/… and drives the surface). */
 const DEFAULT_GRAPH = {
   nodes: [
-    { id: "color", type: "color", props: { value: "#ffffff" }, position: { x: 220, y: 190 } },
-    { id: "output", type: "output", props: {}, position: { x: 520, y: 120 } },
+    { id: "bsdf", type: "principledBsdf", props: {}, position: { x: 200, y: 120 } },
+    { id: "output", type: "output", props: {}, position: { x: 560, y: 150 } },
   ],
-  edges: [{ source: "color", sourceHandle: "out", target: "output", targetHandle: "color" }],
+  edges: [{ source: "bsdf", sourceHandle: "out", target: "output", targetHandle: "surface" }],
 };
 
 const catOf = (type) => NODE_TYPES[type]?.cat ?? "math";
@@ -325,6 +325,12 @@ function MaterialPreview({ material }) {
     mesh.geometry = PREVIEW_GEOMS[prim]();
   }, [prim]);
 
+  // A volume raymarches inside a unit box — preview it on the box so the
+  // bounds match what the scene mesh uses.
+  useEffect(() => {
+    if (material?.userData?.isVolumeMaterial) setPrim("box");
+  }, [material]);
+
   return (
     <div className="shader-preview">
       <canvas ref={canvasRef} width={220} height={170} />
@@ -431,13 +437,34 @@ function ShaderGraphEditor({ matPath }) {
       try {
         const result = await compileShaderGraph(graph, { taps });
         if (generation !== compileRef.current.generation) return;
-        for (const slot of OUTPUT_SLOTS) material[slot.slot] = null;
-        for (const [slot, node] of Object.entries(result?.mutations ?? {})) material[slot] = node;
-        material.needsUpdate = true;
+        // Wiring (or unwiring) the Output's Volume socket changes the material
+        // class (MeshPhysicalNodeMaterial ↔ the unlit volume MeshBasicNodeMaterial).
+        // A class swap can't be done in place — route it through the asset layer
+        // so the cached shared instance is replaced and recompiled, then adopt
+        // the new instance for the preview.
+        const wantVolume = !!result?.isVolume;
+        if (wantVolume !== (material.userData?.isVolumeMaterial === true)) {
+          const def = { ...MATERIAL_DEFAULTS, ...(getMaterialDef(matPath) ?? {}), shaderGraph: graph };
+          updateMaterialAsset(matPath, def);
+          const swapped = await loadMaterialAsset(matPath);
+          if (generation !== compileRef.current.generation) return;
+          compileRef.current.uniforms = {};
+          setMaterial(swapped); // re-runs this effect against the new class
+          return;
+        }
+        // Volume materials wire scatteringNode/emissive/steps, surface ones map
+        // onto *Node slots — the asset layer owns that logic so both paths agree.
+        applyGraphMutations(material, result, wantVolume);
+        // In-place edit (no class change): refresh renderable state so scene
+        // meshes hide when nothing is wired to Surface/Volume, show otherwise.
+        syncMaterialRenderState(matPath, graph);
         compileRef.current.uniforms = result?.uniforms ?? {};
         for (const id of taps) {
           const canvas = thumbCanvases.current.get(id);
-          if (canvas && result?.taps?.[id]) renderNodeThumb(result.taps[id], canvas);
+          // Shader nodes (BSDF/Emission) yield a surface bundle, not a TSL
+          // value — skip their thumbnail (nothing single to preview).
+          const tap = result?.taps?.[id];
+          if (canvas && tap && !tap.__surface) renderNodeThumb(tap, canvas);
         }
       } catch (err) {
         console.error(`Shader graph compile: ${err.message}`);

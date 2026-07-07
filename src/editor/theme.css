@@ -1476,6 +1476,8 @@ input[type="checkbox"]:checked::after {
 .cat-math { --cat: #4d9dff; }
 .cat-output { --cat: #52d276; }
 .cat-bsdf { --cat: #ef6c4d; }
+.cat-shader { --cat: #ef6c4d; }
+.cat-volume { --cat: #5fd35f; }
 .cat-emitter { --cat: #34c8ae; }
 .cat-attribute { --cat: #a78bfa; }
 .cat-noise { --cat: #ee74bd; }
@@ -2964,6 +2966,8 @@ input[type="checkbox"]:checked::after {
 .react-flow__handle.shader-handle.pt-vec3 { border-color: #38bdf8; }
 .react-flow__handle.shader-handle.pt-vec4 { border-color: #818cf8; }
 .react-flow__handle.shader-handle.pt-color { border-color: #f4bf4f; }
+.react-flow__handle.shader-handle.pt-surface { border-color: #9acd53; }
+.react-flow__handle.shader-handle.pt-volume { border-color: #5fd35f; }
 
 .shader-node-row.out-row { justify-content: flex-end; }
 .shader-port-label.out { text-align: right; }
