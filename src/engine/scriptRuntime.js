@@ -56,6 +56,10 @@ const RUNTIME_URL =
   typeof import.meta.url === "string" && import.meta.url
     ? new URL("./scriptRuntime/runtime.js", import.meta.url).href
     : null;
+const THREE_RUNTIME_URL =
+  typeof import.meta.url === "string" && import.meta.url
+    ? new URL("./scriptRuntime/threeRuntime.js", import.meta.url).href
+    : null;
 
 // Synchronous helper: when `import.meta.url` is known (the production /
 // dev browser case), the URL is computable up-front. Synchronous callers
@@ -68,8 +72,18 @@ export function getRuntimeUrlSync() {
   );
 }
 
+/** Absolute URL of the `three/webgpu` proxy for user-script imports. */
+export function getThreeRuntimeUrlSync() {
+  if (THREE_RUNTIME_URL) return THREE_RUNTIME_URL;
+  throw new Error(
+    "getThreeRuntimeUrlSync() called outside an ES module context; " +
+      "import.meta.url is not available.",
+  );
+}
+
 let cachedRuntimeUrl = null;
 let runtimeUrlPromise = null;
+let cachedThreeRuntimeUrl = null;
 
 /** Asynchronously resolves the runtime module URL. In Vite-bundled code
  *  (editor + player) this is just the cached absolute URL — the promise
@@ -111,14 +125,49 @@ export function attribute(options = {}) {
   return runtimeUrlPromise;
 }
 
-/** Rewrites `from "engine"` / `import "engine"` to the runtime module URL.
+/** Absolute URL of the `three/webgpu` proxy for user scripts. Resolves
+ *  against `import.meta.url` in the browser; no Node fallback exists
+ *  (Node tests import three directly). */
+export function getThreeRuntimeUrl() {
+  if (cachedThreeRuntimeUrl) return cachedThreeRuntimeUrl;
+  if (THREE_RUNTIME_URL) {
+    cachedThreeRuntimeUrl = THREE_RUNTIME_URL;
+    return cachedThreeRuntimeUrl;
+  }
+  throw new Error(
+    "getThreeRuntimeUrl() called outside an ES module context; " +
+      "import.meta.url is not available.",
+  );
+}
+
+/** Rewrites bare specifiers a user script imports to absolute URLs the
+ *  blob/data URL import can resolve:
+ *    - `"engine"`        → the engine runtime module (Script / attribute /
+ *                          re-exported three classes)
+ *    - `"three/webgpu"`  → the three-proxy module (re-exports the whole
+ *                          `three/webgpu` surface, including a default
+ *                          namespace, so both `import * as THREE` and
+ *                          `import { Vector3 }` work from user scripts)
  *  Async because the URL resolution is potentially async (data URL fallback
  *  in tests). Browser callers (assetLoader, player main) already work with
- *  promises. If you need a sync entry point, see `getRuntimeUrlSync`. */
+ *  promises. If you need a sync entry point, see `getRuntimeUrlSync`.
+ *
+ *  When called outside a browser (e.g. plain Node tests, no `import.meta.url`)
+ *  the `"three/webgpu"` rewrite is skipped — tests don't run user scripts
+ *  through this path and rewriting would throw. The `"engine"` rewrite
+ *  still falls back to its own data URL. */
 export async function linkEngineImports(code) {
   const url = await getRuntimeUrl();
-  return code.replace(
+  let out = code.replace(
     /((?:from|import)\s*)(["'])engine\2/g,
     (_, lead, q) => `${lead}${q}${url}${q}`,
   );
+  if (THREE_RUNTIME_URL) {
+    const threeUrl = THREE_RUNTIME_URL;
+    out = out.replace(
+      /((?:from|import)\s*)(["'])three\/webgpu\2/g,
+      (_, lead, q) => `${lead}${q}${threeUrl}${q}`,
+    );
+  }
+  return out;
 }

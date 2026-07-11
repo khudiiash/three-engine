@@ -4,7 +4,7 @@ import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { getComponentClass, getComponentTypes } from "../../engine/index.js";
 import { commandBus } from "../commands/CommandBus.js";
-import { RenameEntityCommand, BatchCommand, SetEntityViewOnlyCommand } from "../commands/entityCommands.js";
+import { RenameEntityCommand, BatchCommand, SetEntityViewOnlyCommand, SetEntityEnabledInEditorCommand, SetEntityEnabledInGameCommand } from "../commands/entityCommands.js";
 import { ANCHOR_PRESETS, applyAnchorPreset } from "../../engine/ui/layout.js";
 import { SetTransformCommand } from "../commands/transformCommands.js";
 import {
@@ -19,6 +19,9 @@ import { AssetInspector } from "./AssetInspector.jsx";
 import { useAssetDrop } from "../assetDrag.js";
 import { getEditorCameraView } from "./ViewportPanel.jsx";
 import { useModulesStore } from "../modules.js";
+import { SoundSection } from "../components/SoundSection.jsx";
+import { ListenerSection } from "../components/ListenerSection.jsx";
+import { TerrainSection } from "../components/TerrainSection.jsx";
 
 /**
  * Returns the live engine entity referenced by `targetId` (the value stored
@@ -387,7 +390,7 @@ function CameraFollowSection({ entityId, props }) {
 /**
  * Instancer-only section: appears when scatterShape === "onMesh". Renders a
  * Pick / Clear pair for the surface entity, plus helper text describing the
- * current radius-mode center. Mirrors the camera-follow picker UX so users
+ * current projected-mode center. Mirrors the camera-follow picker UX so users
  * have one mental model for "pick from hierarchy".
  */
 function InstancerSurfaceSection({ entityId, props }) {
@@ -406,7 +409,7 @@ function InstancerSurfaceSection({ entityId, props }) {
   const target = targetId ? engine.getEntity(targetId) : null;
   const targetLabel = target ? target.name : targetId || "";
   const targetMissing = !!targetId && !target;
-  const surfaceShape = props.scatterSurfaceShape ?? "whole";
+  const surfaceMode = props.scatterSurfaceMode ?? "whole";
 
   const commitProp = (key, value) =>
     commandBus.execute(new SetComponentPropCommand(entityId, "instancer", key, value));
@@ -425,8 +428,8 @@ function InstancerSurfaceSection({ entityId, props }) {
             targetMissing
               ? "Referenced entity no longer exists — falling back to this entity's mesh"
               : target
-                ? "Mesh whose surface is scattered on"
-                : "Empty = use this entity's own MeshComponent"
+                ? "Mesh/Model whose surface is scattered on"
+                : "Empty = use this entity's own Mesh/Model component"
           }
         />
         <button
@@ -449,11 +452,11 @@ function InstancerSurfaceSection({ entityId, props }) {
           Clear
         </button>
       </div>
-      {surfaceShape === "radius" && (
+      {surfaceMode === "projected" && (
         <div className="field-row" style={{ opacity: 0.75 }}>
           <span className="field-label" />
           <span className="inspector-hint">
-            Triangles within radius of the center point are kept.
+            Points inside the projected shape are cast onto the surface along the chosen axis.
           </span>
         </div>
       )}
@@ -755,6 +758,16 @@ function ComponentSection({ entityId, type, props }) {
           Edit Animator
         </button>
       )}
+      {type === "sound" && <SoundSection entityId={entityId} props={props} />}
+      {type === "listener" && <ListenerSection entityId={entityId} />}
+      {type === "terrain" && <TerrainSection entityId={entityId} props={props} />}
+      {type === "collider" && props.shape === "heightfield" && !engine.getEntity(entityId)?.getComponent("terrain") && (
+        <div className="field-row">
+          <span className="field-label" style={{ opacity: 0.6 }}>
+            Requires a Terrain component on this entity
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -787,11 +800,12 @@ export function InspectorPanel() {
   /**
    * Components that depend on other components being present. The entry is
    * kept visible in the dropdown but disabled, with a tooltip explaining the
-   * missing prerequisite so the user knows what to add.
-   *   { "instancer": "mesh" }  — Instancer requires a MeshComponent on the
-   *   same entity to read the source geometry from.
+   * missing prerequisite so the user knows what to add. Each value is a list
+   * of component types — any one of them satisfies the requirement.
+   *   { "instancer": ["mesh", "model"] }  — Instancer requires a Mesh or
+   *   Model component on the same entity to read the source geometry from.
    */
-  const componentRequires = { instancer: "mesh" };
+  const componentRequires = { instancer: ["mesh", "model"] };
 
   const commitName = (value) => {
     const name = value.trim();
@@ -799,6 +813,15 @@ export function InspectorPanel() {
       commandBus.execute(new RenameEntityCommand(entity.id, name));
     }
   };
+
+  // Per-mode visibility state lives on the live engine entity; the React
+  // mirror doesn't include it (mirroring everything every tick would be
+  // wasteful — and these flags only change when the user toggles them).
+  // Reading through the engine instance guarantees we always show the
+  // current value, even after undo/redo or scene reload.
+  const liveEntity = engine.getEntity(entity.id);
+  const editorEnabled = liveEntity?.enabledInEditor !== false;
+  const gameEnabled = liveEntity?.enabledInGame !== false;
 
   return (
     <div className="inspector-panel">
@@ -826,6 +849,41 @@ export function InspectorPanel() {
             />
           </label>
         </div>
+        <div className="field-row visibility-row">
+          <span className="field-label">Enabled</span>
+          <div className="visibility-toggles" role="group" aria-label="Visibility per mode">
+            <label
+              className="visibility-toggle"
+              title={editorEnabled ? "Visible in editor — click to hide in editor" : "Hidden in editor — click to show in editor"}
+            >
+              <input
+                type="checkbox"
+                checked={editorEnabled}
+                onChange={(e) =>
+                  commandBus.execute(
+                    new SetEntityEnabledInEditorCommand(entity.id, e.target.checked),
+                  )
+                }
+              />
+              <span className="visibility-toggle-label">Editor</span>
+            </label>
+            <label
+              className="visibility-toggle"
+              title={gameEnabled ? "Enabled in game (play) — click to disable in game" : "Disabled in game — click to enable in game"}
+            >
+              <input
+                type="checkbox"
+                checked={gameEnabled}
+                onChange={(e) =>
+                  commandBus.execute(
+                    new SetEntityEnabledInGameCommand(entity.id, e.target.checked),
+                  )
+                }
+              />
+              <span className="visibility-toggle-label">Game</span>
+            </label>
+          </div>
+        </div>
       </div>
 
       <TransformSection entity={entity} />
@@ -849,10 +907,13 @@ export function InspectorPanel() {
               <div className="dropdown-overlay" onClick={() => setAddMenuOpen(false)} />
               <div className="dropdown-menu up">
                 {availableTypes.map((type) => {
-                  const requiredType = componentRequires[type];
-                  const missingRequirement = requiredType && !(requiredType in entity.components);
+                  const requiredTypes = componentRequires[type];
+                  const missingRequirement = requiredTypes && !requiredTypes.some((t) => t in entity.components);
                   const Cls = getComponentClass(type);
                   const label = Cls?.label ?? type;
+                  const requiredLabel = requiredTypes
+                    ?.map((t) => getComponentClass(t)?.label ?? t)
+                    .join(" or ");
                   return (
                     <button
                       key={type}
@@ -860,7 +921,7 @@ export function InspectorPanel() {
                       disabled={missingRequirement}
                       title={
                         missingRequirement
-                          ? `${label} requires a ${getComponentClass(requiredType)?.label ?? requiredType} component on this entity`
+                          ? `${label} requires a ${requiredLabel} component on this entity`
                           : undefined
                       }
                       onClick={() => {

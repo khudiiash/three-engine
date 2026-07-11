@@ -33,6 +33,17 @@ export class Entity {
     // explicitly set false. Defaults to false to match the prior behaviour
     // (no implicit gating). Serialised with the entity.
     this.viewOnly = false;
+    // Per-mode enabled flags. An entity is "enabled in editor" when it
+    // contributes to the scene while not in play mode; "enabled in game"
+    // is the equivalent during play. Toggling false hides the entity's
+    // Object3D subtree (so its MeshComponent / LightComponent / etc. all
+    // drop out of the render) — the entity itself remains in the tree, so
+    // scripts can still read/write it and inspectors still show it.
+    // Inherits to descendants via the per-frame resolver in Engine.#tick;
+    // a parent disabled in editor disables its whole subtree unless the
+    // child has its own override set. Serialised with the entity.
+    this.enabledInEditor = true;
+    this.enabledInGame = true;
   }
 
   // ---- Transform aliases (delegate to object3D) --------------------------
@@ -192,6 +203,28 @@ export class Entity {
       c._viewOnlyActive = !!c.props.viewOnly || next;
       c._inView = null; // force a fresh decision next frame
     }
+  }
+
+  /**
+   * Sets the "enabled in editor" flag. The actual `object3D.visible` is
+   * recomputed by the engine each frame (parent wins unless this entity
+   * has an explicit override), so we don't need to walk descendants
+   * here — they pick up the new state automatically. Emits
+   * "hierarchy-changed" so the React mirror (and the inspector) refresh.
+   */
+  setEnabledInEditor(value) {
+    const next = !!value;
+    if (next === this.enabledInEditor) return;
+    this.enabledInEditor = next;
+    this.engine.emit("hierarchy-changed");
+  }
+
+  /** Sets the "enabled in game" flag (mirrors setEnabledInEditor). */
+  setEnabledInGame(value) {
+    const next = !!value;
+    if (next === this.enabledInGame) return;
+    this.enabledInGame = next;
+    this.engine.emit("hierarchy-changed");
   }
 
   removeComponent(type) {

@@ -14,6 +14,10 @@ export const SCRIPT_EXTENSIONS = ["js", "ts"];
 export const MATERIAL_EXTENSIONS = ["mat"];
 export const PREFAB_EXTENSIONS = ["entity"];
 export const ANIMATOR_EXTENSIONS = ["anim"];
+// `.audio` is the JSON sidecar; the others are raw audio files the engine
+// can decode straight away. AssetField filters both sidecars and raw files
+// in one picker.
+export const AUDIO_EXTENSIONS = ["audio", "ogg", "wav", "mp3"];
 
 /** TypeScript declaration files (`.d.ts` / `.d.mts` / `.d.cts`) are never
  *  runtime scripts — they're ambient type-only declarations the editor
@@ -125,9 +129,12 @@ export async function toBlobUrl(path) {
   const cached = blobUrlCache.get(path);
   if (cached) return cached;
   const { invoke } = await import("@tauri-apps/api/core");
+  // `read_binary_file` returns raw bytes over the IPC channel, so `invoke`
+  // resolves to an ArrayBuffer here (not a number array) — feed it to the
+  // Blob directly. See the Rust command for why this matters for big models.
   const bytes = await invoke("read_binary_file", { path });
   const mime = MIME_BY_EXT[extOf(path)] ?? "application/octet-stream";
-  const blob = new Blob([new Uint8Array(bytes)], { type: mime });
+  const blob = new Blob([bytes], { type: mime });
   const url = URL.createObjectURL(blob);
   blobUrlCache.set(path, url);
   return url;

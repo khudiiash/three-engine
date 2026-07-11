@@ -1,42 +1,45 @@
 /**
  * Runtime module exposed to user scripts as `import ... from "engine"`.
  *
- * Lives as a real ES module (not a generated blob) so it can `import`
- * three.js classes and re-export them. The runtime blob path in
- * `scriptRuntime.js` is replaced with this file's URL via Vite's `?url`
- * import.
+ * Lives as a real ES module that Vite bundles into a `data:` URL referenced
+ * from `scriptRuntime.js`. Because the data URL has no module-resolution
+ * base, we can't `import from "three/webgpu"` here — we instead pull three
+ * classes from `globalThis.__ENGINE_THREE__`, which the engine populates at
+ * startup. Same constructors, same singletons as the engine itself.
  *
  * Two kinds of exports live here:
- *
  *   1. Engine-specific surface — `Script` (empty base class) and the
- *      `attribute` decorator. The runtime doesn't require users to extend
- *      `Script`; `ScriptComponent` injects `entity` / `engine` / `THREE`
- *      / `input` on every script instance regardless of base class. The
- *      base class exists purely so `extends Script` is a typed no-op and
- *      so `this.entity` etc. autocomplete.
- *
+ *      `attribute` decorator. `ScriptComponent` injects `entity` /
+ *      `engine` / `THREE` / `input` on every script instance regardless
+ *      of base class, so `extends Script` is a typed no-op.
  *   2. three.js classes — `Vector2` / `Vector3` / `Quaternion` /
  *      `Euler` / `Matrix4` / `Color` / `Object3D` / `Camera` /
  *      `MathUtils`. Re-exported so user scripts can do
  *      `import { Vector3 } from "engine"` and get the same constructor
- *      the engine itself uses (real `THREE.Vector3` instances with full
- *      methods, not just a type alias).
+ *      the engine uses.
  *
  * Scripts that prefer the three.js idiom can still do
- * `import * as THREE from "three/webgpu"` — both paths return identical
- * runtime values.
+ * `import * as THREE from "three/webgpu"` — `linkEngineImports` rewrites
+ * that to a separate `threeRuntime` data URL that exposes the same
+ * surface as a namespace.
  */
-import {
-  Vector2,
-  Vector3,
-  Euler,
-  Quaternion,
-  Matrix4,
-  Color,
-  Object3D,
-  Camera,
-  MathUtils,
-} from "three/webgpu";
+const T = globalThis.__ENGINE_THREE__;
+if (!T) {
+  throw new Error(
+    "runtime: globalThis.__ENGINE_THREE__ is not set. " +
+      "The engine must finish booting before user scripts run.",
+  );
+}
+
+export const Vector2 = T.Vector2;
+export const Vector3 = T.Vector3;
+export const Euler = T.Euler;
+export const Quaternion = T.Quaternion;
+export const Matrix4 = T.Matrix4;
+export const Color = T.Color;
+export const Object3D = T.Object3D;
+export const Camera = T.Camera;
+export const MathUtils = T.MathUtils;
 
 /**
  * Base class scripts extend for full IntelliSense on `this.entity`,
@@ -62,8 +65,3 @@ export function attribute(options = {}) {
     ctor.attributes[key] = options;
   };
 }
-
-// Re-export three.js classes. Same instances the engine uses internally,
-// so `new Vector3()` here gives you a Vector3 the engine can hand back to
-// you (entity.position, etc.) without type-mismatch surprises.
-export { Vector2, Vector3, Euler, Quaternion, Matrix4, Color, Object3D, Camera, MathUtils };

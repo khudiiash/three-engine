@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { Save, X } from "lucide-react";
+import { Save, X, RotateCcw } from "lucide-react";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { getProjectSettings, saveProjectSettings } from "../projectSettings.js";
 import { currentScenePath } from "../sceneIO.js";
+import { KEY_BINDING_ACTIONS, describeBinding } from "../keybindings.js";
 
 const MAIN_SCENE_KEY = "mainScene";
 
@@ -63,6 +64,99 @@ function Num({ value, onChange, min, max, step = 0.1 }) {
         if (!Number.isNaN(v)) onChange(v);
       }}
     />
+  );
+}
+
+/**
+ * Capture-on-focus binding input. Click into the field, press the desired
+ * chord (modifiers included), and we store it through `onChange`. The
+ * visible text only updates on a valid chord so users immediately see
+ * whether the editor accepted their input. Empty input is allowed and
+ * means "unbound" — clicking the reset icon restores the default.
+ */
+function KeybindingInput({ actionId, value, defaultChord, onChange }) {
+  const [draft, setDraft] = useState(value ?? defaultChord);
+  const [capturing, setCapturing] = useState(false);
+
+  useEffect(() => {
+    setDraft(value ?? "");
+  }, [value]);
+
+  useEffect(() => {
+    if (!capturing) return;
+    const onKey = (e) => {
+      // Esc cancels capture without changing anything.
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setCapturing(false);
+        setDraft(value ?? "");
+        return;
+      }
+      // Backspace/Delete clears the binding outright (no key required).
+      if ((e.key === "Backspace" || e.key === "Delete") && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+        e.preventDefault();
+        onChange("");
+        setCapturing(false);
+        return;
+      }
+      // Ignore lone modifier presses — wait for the actual key.
+      if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return;
+      e.preventDefault();
+      const tokens = [];
+      if (e.ctrlKey) tokens.push("Ctrl");
+      if (e.shiftKey) tokens.push("Shift");
+      if (e.altKey) tokens.push("Alt");
+      if (e.metaKey) tokens.push("Meta");
+      tokens.push(e.key.length === 1 ? e.key.toUpperCase() : e.key);
+      const chord = tokens.join("+");
+      setDraft(chord);
+      onChange(chord);
+      setCapturing(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [capturing, value, onChange]);
+
+  return (
+    <div className="keybinding-cell">
+      <input
+        className={`text-field keybinding-input ${capturing ? "capturing" : ""}`}
+        value={capturing ? "Press a key…" : draft || "Unbound"}
+        placeholder={defaultChord}
+        readOnly
+        onFocus={() => setCapturing(true)}
+        onBlur={() => setCapturing(false)}
+      />
+      <button
+        type="button"
+        className="toolbar-btn icon-only"
+        title={`Reset to default (${describeBinding(defaultChord)})`}
+        onClick={() => {
+          onChange(defaultChord);
+          setDraft(defaultChord);
+        }}
+      >
+        <RotateCcw size={12} />
+      </button>
+    </div>
+  );
+}
+
+function KeybindingsTable({ keybindings, onChange }) {
+  return (
+    <div className="keybindings-table">
+      {Object.entries(KEY_BINDING_ACTIONS).map(([actionId, def]) => (
+        <div key={actionId} className="field-row keybinding-row">
+          <span className="field-label" title={actionId}>{def.label}</span>
+          <KeybindingInput
+            actionId={actionId}
+            value={keybindings[actionId] ?? ""}
+            defaultChord={def.default}
+            onChange={(chord) => onChange({ ...keybindings, [actionId]: chord })}
+          />
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -212,6 +306,14 @@ export function ProjectSettingsPanel() {
         <Row label="Divisions">
           <Num value={editor.gridDivisions} min={1} step={1} onChange={(v) => patch("editor", { gridDivisions: v })} />
         </Row>
+      </div>
+
+      <div className="inspector-section">
+        <div className="section-header">Keybindings</div>
+        <KeybindingsTable
+          keybindings={editor.keybindings ?? {}}
+          onChange={(keybindings) => patch("editor", { keybindings })}
+        />
       </div>
 
       <div className="inspector-section">

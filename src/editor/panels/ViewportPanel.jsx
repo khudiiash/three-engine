@@ -19,6 +19,8 @@ import { toggle as togglePlay } from "../playMode.js";
 import { useAssetDrop } from "../assetDrag.js";
 import { instantiatePrefab } from "../prefab.js";
 import { getProjectSettings, onProjectSettingsApplied, applyProjectSettings } from "../projectSettings.js";
+import { getTerrainBrushMode, getTerrainBrushSettings, subscribeTerrainBrush } from "../terrainBrush.js";
+import { SetTerrainHeightsCommand, SetTerrainSplatmapCommand } from "../commands/terrainCommands.js";
 
 /** Sets `layers.set(EDITOR_LAYER)` on every Object3D in the subtree —
  *  layers in three.js are not inherited, so this has to walk explicitly. */
@@ -56,6 +58,8 @@ const viewport = {
   initPromise: null,
   hovered: false,
   gameCameraId: null,
+  terrainBrushing: false,
+  terrainBrushIndicator: null,
   // Toggles from the Layers dropdown. Mirrored in React state; mutations
   // here apply live so a hot-reload of the panel keeps the current layer
   // set. Default to "all on" so the viewport starts in its full visual state.
@@ -113,7 +117,15 @@ async function ensureViewport() {
 
       setupGizmo(canvas);
       setupPicking(canvas);
+      setupTerrainBrush(canvas);
       setupKeyboard(canvas);
+      // While a sculpt/paint brush is armed, hide the transform gizmo so its
+      // arrow handles can't intercept brush strokes on the terrain mesh.
+      subscribeTerrainBrush(() => {
+        const armed = !!getTerrainBrushMode();
+        viewport.gizmo.enabled = !armed;
+        viewport.gizmo.getHelper().visible = !armed;
+      });
       setupPlayCamera();
       setupCameraPreview();
 
@@ -797,10 +809,10 @@ function setupPicking(canvas) {
   let downPos = null;
 
   canvas.addEventListener("pointerdown", (e) => {
-    if (e.button === 0) downPos = { x: e.clientX, y: e.clientY };
+    if (e.button === 0 && !getTerrainBrushMode()) downPos = { x: e.clientX, y: e.clientY };
   });
   canvas.addEventListener("pointerup", (e) => {
-    if (e.button !== 0 || !downPos) return;
+    if (e.button !== 0 || !downPos || viewport.terrainBrushing) return;
     const moved = Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y);
     downPos = null;
     if (moved > 4 || viewport.gizmo.dragging || engine.playing) return;
@@ -820,6 +832,250 @@ function setupPicking(canvas) {
       }
     }
     useSelectionStore.getState().clear();
+  });
+}
+
+const BRUSH_INDICATOR_SEGMENTS = 64;
+const SCULPT_TOOL_COLORS = {
+  raise: 0x4caf50,
+  lower: 0xff5252,
+  smooth: 0x29b6f6,
+  flatten: 0xab47bc,
+  sharpen: 0xffa726,
+  erode: 0x8d6e63,
+  noise: 0x26c6da,
+};
+const PAINT_COLOR = 0xffca28;
+
+/**
+ * Lazily builds the terrain brush cursor: a translucent filled disc plus a
+ * bright rim ring, both projected onto the live terrain surface so they read
+ * on slopes. Editor-only layer, never raycast-picked, drawn on top
+ * (depthTest off + high renderOrder) so it's always visible.
+ */
+function ensureBrushIndicator() {
+  if (viewport.terrainBrushIndicator) return viewport.terrainBrushIndicator;
+  const N = BRUSH_INDICATOR_SEGMENTS;
+
+  // Fill: a triangle fan — center vertex + N rim vertices.
+  const fillGeo = new THREE.BufferGeometry();
+  fillGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array((N + 1) * 3), 3));
+  const fillIndex = [];
+  for (let i = 0; i < N; i++) fillIndex.push(0, 1 + i, 1 + ((i + 1) % N));
+  fillGeo.setIndex(fillIndex);
+  const fill = new THREE.Mesh(
+    fillGeo,
+    new THREE.MeshBasicMaterial({
+      color: PAINT_COLOR, transparent: true, opacity: 0.15,
+      depthTest: false, depthWrite: false, side: THREE.DoubleSide,
+    }),
+  );
+
+  // Rim: a line loop over the N rim vertices.
+  const rimGeo = new THREE.BufferGeometry();
+  rimGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+  const rim = new THREE.LineLoop(
+    rimGeo,
+    new THREE.LineBasicMaterial({ color: PAINT_COLOR, transparent: true, opacity: 0.95, depthTest: false }),
+  );
+
+  const group = new THREE.Group();
+  group.add(fill, rim);
+  group.visible = false;
+  group.renderOrder = 999;
+  group.userData.editorOnly = true;
+  for (const o of [group, fill, rim]) {
+    o.layers.set(EDITOR_LAYER);
+    o.raycast = () => {};
+  }
+  engine.scene.add(group);
+  viewport.terrainBrushIndicator = { group, fill, rim, fillGeo, rimGeo };
+  return viewport.terrainBrushIndicator;
+}
+
+/** Re-projects the disc + rim onto the current terrain surface at `local`
+ *  (entity-local XZ), sampling live heights so it hugs mid-stroke deformation. */
+function updateBrushIndicator(component, local, radius, color) {
+  const ind = ensureBrushIndicator();
+  const N = BRUSH_INDICATOR_SEGMENTS;
+  ind.fill.material.color.setHex(color);
+  ind.rim.material.color.setHex(color);
+  const fillPos = ind.fillGeo.attributes.position;
+  const rimPos = ind.rimGeo.attributes.position;
+  const v = new THREE.Vector3();
+
+  // Fill center.
+  v.set(local.x, component.heightAtLocal(local.x, local.z) + 0.04, local.z);
+  component.mesh.localToWorld(v);
+  fillPos.setXYZ(0, v.x, v.y, v.z);
+
+  for (let i = 0; i < N; i++) {
+    const angle = (i / N) * Math.PI * 2;
+    const lx = local.x + Math.cos(angle) * radius;
+    const lz = local.z + Math.sin(angle) * radius;
+    const ly = component.heightAtLocal(lx, lz) + 0.04;
+    v.set(lx, ly, lz);
+    component.mesh.localToWorld(v);
+    fillPos.setXYZ(i + 1, v.x, v.y, v.z);
+    rimPos.setXYZ(i, v.x, v.y, v.z);
+  }
+  fillPos.needsUpdate = true;
+  rimPos.needsUpdate = true;
+  ind.fillGeo.computeBoundingSphere();
+  ind.rimGeo.computeBoundingSphere();
+  ind.group.visible = true;
+}
+
+function hideBrushIndicator() {
+  if (viewport.terrainBrushIndicator) viewport.terrainBrushIndicator.group.visible = false;
+}
+
+/** The terrain component on the currently-selected entity, or null. */
+function selectedTerrain() {
+  const entityId = useSelectionStore.getState().ids[0];
+  const component = entityId && engine.getEntity(entityId)?.getComponent?.("terrain");
+  return component?.mesh ? { entityId, component } : null;
+}
+
+/**
+ * Sculpt/paint brush strokes for the Terrain component. Armed via the
+ * Inspector's Terrain section (terrainBrush.js); while armed and a terrain
+ * entity is selected, drags raycast against just that entity's mesh and
+ * mutate its live geometry/splatmap buffers directly (immediate feedback, no
+ * command-bus traffic per pointermove). One undo command is dispatched per
+ * stroke, on pointerup — see SetTerrainHeightsCommand/SetTerrainSplatmapCommand.
+ *
+ * The cursor disc+ring is refreshed every frame from the update loop (not just
+ * on pointermove) so it keeps hugging the surface while the camera moves, and
+ * tracks the pointer whenever a brush is armed — before any stroke begins.
+ */
+function setupTerrainBrush(canvas) {
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  let hovering = false;
+  let haveNdc = false;
+  let stroke = null; // { component, entityId, before, mode, flattenHeight, seed }
+  let strokeSeed = 0;
+
+  const setNdc = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    ndc.set(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    haveNdc = true;
+    hovering = true; // a move/press over the canvas means we're on it
+  };
+
+  /** Raycast the current NDC against `component.mesh`; returns local-space hit or null. */
+  const localHit = (component) => {
+    raycaster.setFromCamera(ndc, viewport.camera);
+    const hits = raycaster.intersectObject(component.mesh, false);
+    if (!hits.length) return null;
+    return component.mesh.worldToLocal(hits[0].point.clone());
+  };
+
+  const applyBrush = (component, local) => {
+    const settings = getTerrainBrushSettings();
+    if (stroke.mode === "sculpt") {
+      component.applyHeightBrush(local, {
+        tool: settings.tool,
+        radius: settings.radius,
+        strength: settings.strength * 0.15,
+        hardness: settings.hardness,
+        flattenHeight: stroke.flattenHeight,
+        seed: stroke.seed,
+      });
+    } else {
+      component.applySplatBrush(local, {
+        layerIndex: Math.min(settings.activeLayer, (component.props.layers?.length ?? 1) - 1),
+        radius: settings.radius,
+        strength: settings.strength,
+        hardness: settings.hardness,
+      });
+    }
+  };
+
+  canvas.addEventListener("pointerenter", () => (hovering = true));
+  canvas.addEventListener("pointerleave", () => {
+    hovering = false;
+    if (!stroke) hideBrushIndicator();
+  });
+
+  canvas.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || !getTerrainBrushMode() || engine.playing) return;
+    const sel = selectedTerrain();
+    if (!sel) return;
+    setNdc(e);
+    const local = localHit(sel.component);
+    if (!local) return;
+    const mode = getTerrainBrushMode();
+    viewport.terrainBrushing = true;
+    viewport.orbit.enabled = false;
+    stroke = {
+      mode,
+      component: sel.component,
+      entityId: sel.entityId,
+      before: mode === "sculpt" ? sel.component.props.heights : sel.component.props.splatmap,
+      // Flatten levels toward the surface height where the stroke began.
+      flattenHeight: sel.component.heightAtLocal(local.x, local.z),
+      seed: strokeSeed++,
+    };
+    applyBrush(sel.component, local);
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (!getTerrainBrushMode()) return;
+    setNdc(e);
+    if (!stroke) return;
+    const local = localHit(stroke.component);
+    if (local) applyBrush(stroke.component, local);
+  });
+
+  window.addEventListener("pointerup", () => {
+    if (!stroke) return;
+    const { component, entityId, mode, before } = stroke;
+    stroke = null;
+    viewport.terrainBrushing = false;
+    viewport.orbit.enabled = true;
+    if (mode === "sculpt") {
+      component.commitHeights();
+      commandBus.execute(new SetTerrainHeightsCommand(entityId, before, component.props.heights));
+    } else {
+      component.commitSplatmap();
+      commandBus.execute(new SetTerrainSplatmapCommand(entityId, before, component.props.splatmap));
+    }
+  });
+
+  // Disarming clears the cursor immediately.
+  subscribeTerrainBrush(() => {
+    if (!getTerrainBrushMode()) hideBrushIndicator();
+  });
+
+  // Per-frame cursor: keep the disc+ring glued to the surface under the
+  // pointer whenever a brush is armed, independent of pointermove cadence.
+  engine.onUpdate(() => {
+    const mode = getTerrainBrushMode();
+    if (!mode || engine.playing || (!hovering && !stroke) || !haveNdc) {
+      hideBrushIndicator();
+      return;
+    }
+    const target = stroke
+      ? { component: stroke.component }
+      : selectedTerrain();
+    if (!target) {
+      hideBrushIndicator();
+      return;
+    }
+    viewport.camera.updateMatrixWorld();
+    const local = localHit(target.component);
+    if (!local) {
+      if (!stroke) hideBrushIndicator();
+      return;
+    }
+    const settings = getTerrainBrushSettings();
+    const color = mode === "sculpt" ? (SCULPT_TOOL_COLORS[settings.tool] ?? PAINT_COLOR) : PAINT_COLOR;
+    updateBrushIndicator(target.component, local, settings.radius, color);
   });
 }
 

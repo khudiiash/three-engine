@@ -1,7 +1,25 @@
 import * as THREE from "three/webgpu";
-import { Engine, deserializeScene, setAssetResolver, setScriptLoader, setAssetMetaLoader, applyEngineModules } from "../engine/index.js";
+import {
+  Engine,
+  deserializeScene,
+  setAssetResolver,
+  setScriptLoader,
+  setAssetMetaLoader,
+  applyEngineModules,
+  registerBuiltInComponents,
+} from "../engine/index.js";
 import { linkEngineImports } from "../engine/scriptRuntime.js";
 import "../modules/index.js"; // registers the built-in module catalog
+
+// Bundler tree-shaking would otherwise drop these side-effect registrations
+// — call explicitly so every built-in component is present before any scene
+// tries to deserialize (the editor does the same in `engineInstance.js`).
+registerBuiltInComponents();
+
+// Expose the three namespace under a stable global so the script-runtime
+// data URLs (which can't `import` anything themselves) can pull three
+// classes from it. Must be set before any user script runs.
+globalThis.__ENGINE_THREE__ = THREE;
 
 // Exported scenes reference assets by relative URL ("assets/foo.glb").
 setAssetResolver(async (path) => path);
@@ -44,8 +62,15 @@ function findSceneCamera(entities) {
 async function boot() {
   const engine = new Engine();
   await engine.init(document.getElementById("game"));
+  // Start the render loop early so the canvas paints the background colour
+  // immediately, instead of staying black until the scene is deserialized.
+  // The loop is harmless on an empty scene — it just renders nothing.
+  engine.start();
+
   const scene = await (await fetch("scene.json")).json();
   // Modules first: their components must exist before entities instantiate.
+  // Rapier's setup now returns a placeholder and finishes its WASM init in
+  // the background, so this await no longer blocks on the heavy work.
   await applyEngineModules(engine, scene.modules ?? []);
   // Input config next — the manager is attached during init(), so swapping
   // the snapshot detaches/re-attaches to keep listeners consistent.
@@ -67,7 +92,6 @@ async function boot() {
   resize();
 
   engine.setPlaying(true);
-  engine.start();
 }
 
 boot().catch((err) => {

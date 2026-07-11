@@ -1,5 +1,7 @@
 import { registerModuleDefinition } from "../engine/modules.js";
 import { physicsRapierModule } from "./physics-rapier/index.js";
+import { dracoModule } from "./draco/index.js";
+import { terrainModule } from "./terrain/index.js";
 
 /**
  * Built-in module catalog. Importing this file registers every definition;
@@ -10,5 +12,7 @@ import { physicsRapierModule } from "./physics-rapier/index.js";
  * Tauri — they ship with exported games.
  */
 registerModuleDefinition(physicsRapierModule);
+registerModuleDefinition(dracoModule);
+registerModuleDefinition(terrainModule);
 
-export { physicsRapierModule };
+export { physicsRapierModule, dracoModule, terrainModule };

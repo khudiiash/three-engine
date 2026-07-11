@@ -11,6 +11,7 @@ import {
 import { InputManager } from "./input/index.js";
 import { createDefaultMaps } from "./input/defaultMaps.js";
 import { ViewFrustum } from "./viewFrustum.js";
+import { AudioSystem } from "./audio/AudioSystem.js";
 
 /**
  * Runtime core: owns the renderer, the three.js scene (source of truth)
@@ -45,6 +46,11 @@ export class Engine extends EventEmitter {
 
     // Host-tunable runtime behavior (the editor writes project settings here).
     this.config = { scriptHotReload: true, scriptReloadIntervalMs: 750 };
+
+    // Audio runtime: shared AudioContext + listener + sound registry. Lazily
+    // materialises the context once the first SoundComponent attaches or
+    // engine.start() fires — browsers require a user gesture otherwise.
+    this.audio = new AudioSystem(this);
 
     // Input: built by default with the Player/UI maps enabled; an editor-
     // provided snapshot (applyInput) replaces it. Attached once the canvas
@@ -192,6 +198,11 @@ export class Engine extends EventEmitter {
   start() {
     this.loopActive = true;
     this.renderer.setAnimationLoop(() => this.#tick());
+    // Best-effort: kick the AudioContext on play start so audio is ready
+    // by the first tick. If a user gesture is required and absent, the
+    // context's `state === "suspended"` status will hold; the system
+    // installs a one-shot pointer listener to resume it.
+    this.audio.ensureContext?.().then(() => this.audio.resumeIfNeeded?.());
   }
 
   stop() {
@@ -220,7 +231,21 @@ export class Engine extends EventEmitter {
         }
       }
     }
+    // Resolve per-mode visibility onto every entity's Object3D. We write
+    // only when the desired value differs from the current one so a stable
+    // scene doesn't churn the matrix tree each frame. (Setting `.visible`
+    // back to the same value is technically a no-op in three.js — but
+    // avoiding the property assignment entirely keeps the code path
+    // side-effect free and easier to reason about.)
+    const modeFlag = this.playing ? "enabledInGame" : "enabledInEditor";
+    for (const entity of this.entities.values()) {
+      const next = entity[modeFlag] !== false;
+      if (entity.object3D.visible !== next) entity.object3D.visible = next;
+    }
     for (const fn of this.updateCallbacks) fn(dt);
+    // Audio updates go after the script tick so per-frame transforms are
+    // up to date (sound positions + listener pose).
+    this.audio.update?.(dt);
     // rendererReady guards the re-init window (init() swaps the renderer
     // asynchronously; rendering before its backend resolves throws).
     if (this.camera && this.rendererReady) this.renderer.render(this.scene, this.camera);
@@ -301,6 +326,7 @@ export class Engine extends EventEmitter {
     this._inputTickUnsub?.();
     this._inputTickUnsub = null;
     this.input.detach();
+    this.audio.dispose?.();
     this.rendererReady = false;
     this.renderer?.dispose();
     this.renderer = null;

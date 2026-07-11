@@ -13,6 +13,7 @@ import {
 import { newScene, openScene, saveScene } from "./sceneIO.js";
 import { useProjectStore } from "./store/projectStore.js";
 import { openPanel, resetLayout } from "./EditorShell.jsx";
+import { describeBinding, getBinding, visibilityActions } from "./keybindings.js";
 
 export function MenuBar() {
   const [openMenu, setOpenMenu] = useState(null);
@@ -115,6 +116,31 @@ export function MenuBar() {
       { label: "Input", action: () => openPanel("input") },
       { separator: true },
       { label: "Reset Layout", action: () => resetLayout() },
+    ],
+    Visibility: [
+      {
+        label: "Toggle selected (editor)",
+        shortcut: describeBinding(getBinding("editor.toggleSelected")),
+        disabled: !selection.length,
+        action: () => visibilityActions.toggleSelectedEditor(),
+      },
+      {
+        label: "Toggle all unselected (editor)",
+        shortcut: describeBinding(getBinding("editor.toggleUnselected")),
+        action: () => visibilityActions.toggleUnselectedEditor(),
+      },
+      { separator: true },
+      {
+        label: "Toggle selected (game)",
+        shortcut: describeBinding(getBinding("game.toggleSelected")),
+        disabled: !selection.length,
+        action: () => visibilityActions.toggleSelectedGame(),
+      },
+      {
+        label: "Toggle all unselected (game)",
+        shortcut: describeBinding(getBinding("game.toggleUnselected")),
+        action: () => visibilityActions.toggleUnselectedGame(),
+      },
     ],
   };
 

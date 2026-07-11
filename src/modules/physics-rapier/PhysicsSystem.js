@@ -3,6 +3,7 @@ import { EDITOR_LAYER } from "../../engine/editorLayers.js";
 
 const FIXED_DT = 1 / 60;
 const MAX_SUBSTEPS = 4;
+const DEG2RAD = Math.PI / 180;
 
 const _pos = new THREE.Vector3();
 const _quat = new THREE.Quaternion();
@@ -34,6 +35,7 @@ export class PhysicsSystem {
     this.colliderEntity = new Map(); // collider handle -> entity
     this.dynamicBodies = []; // { entity, body }
     this.kinematicBodies = []; // { entity, body }
+    this.characters = []; // { entity, cc } — kinematic character controllers
 
     this.unsubs = [
       engine.on("play-changed", (playing) => (playing ? this.#build() : this.#teardown())),
@@ -88,6 +90,12 @@ export class PhysicsSystem {
     // child colliders attach to the ancestor's body in pass 2).
     const bodyByEntity = new Map();
     for (const entity of this.engine.entities.values()) {
+      // Character controllers own their body + capsule collider exclusively.
+      const cc = entity.getComponent("charactercontroller");
+      if (cc) {
+        this.#buildCharacter(entity, cc);
+        continue;
+      }
       const rb = entity.getComponent("rigidbody");
       const col = entity.getComponent("collider");
       if (!rb && !col) continue;
@@ -122,6 +130,7 @@ export class PhysicsSystem {
 
     // Pass 2: colliders, attached to their own body or the nearest ancestor's.
     for (const entity of this.engine.entities.values()) {
+      if (entity.getComponent("charactercontroller")) continue; // owns its own capsule
       const col = entity.getComponent("collider");
       if (!col) continue;
       const bodyEntity = bodyByEntity.has(entity) ? entity : this.#ancestorBodyEntity(entity);
@@ -163,6 +172,18 @@ export class PhysicsSystem {
         return null;
       }
       desc = RAPIER.ColliderDesc.trimesh(tri.vertices, tri.indices);
+    } else if (shape === "heightfield") {
+      const terrain = entity.getComponent("terrain");
+      if (!terrain?.heightsArray) {
+        console.warn(`Collider on "${entity.name}": heightfield shape requires a Terrain component`);
+        return null;
+      }
+      desc = RAPIER.ColliderDesc.heightfield(
+        terrain.resolution,
+        terrain.resolution,
+        toColumnMajor(terrain.heightsArray, terrain.resolution),
+        { x: (terrain.props.size ?? 50) * sx, y: sy, z: (terrain.props.size ?? 50) * sz },
+      );
     }
     if (!desc) return null;
 
@@ -179,7 +200,10 @@ export class PhysicsSystem {
     }
 
     // Collider pose relative to its body (child colliders + local offset).
-    _pos.fromArray(shape === "mesh" ? [0, 0, 0] : offset).multiply(_scale);
+    // mesh/heightfield shapes are built already positioned (mesh bakes world
+    // scale into its vertices; heightfield is centered on the entity origin
+    // by construction), so they ignore the `offset` prop.
+    _pos.fromArray(shape === "mesh" || shape === "heightfield" ? [0, 0, 0] : offset).multiply(_scale);
     _quat.identity();
     if (entity !== bodyEntity) {
       _mat.copy(bodyEntity.object3D.matrixWorld).invert().multiply(entity.object3D.matrixWorld);
@@ -192,11 +216,66 @@ export class PhysicsSystem {
     return desc;
   }
 
+  /** Builds a kinematic body + capsule + KinematicCharacterController for a
+   *  character-controller entity, at its current world transform. */
+  #buildCharacter(entity, cc) {
+    const { RAPIER } = this;
+    const p = cc.props;
+    entity.object3D.getWorldPosition(_pos);
+    entity.object3D.getWorldQuaternion(_quat);
+    entity.object3D.getWorldScale(_scale);
+    const sy = Math.abs(_scale.y);
+    const sxz = Math.max(Math.abs(_scale.x), Math.abs(_scale.z));
+
+    const body = this.world.createRigidBody(
+      RAPIER.RigidBodyDesc.kinematicPositionBased()
+        .setTranslation(_pos.x, _pos.y, _pos.z)
+        .setRotation({ x: _quat.x, y: _quat.y, z: _quat.z, w: _quat.w }),
+    );
+
+    const colDesc = RAPIER.ColliderDesc.capsule((p.height / 2) * sy, p.radius * sxz).setTranslation(
+      p.offset[0] * _scale.x,
+      p.offset[1] * _scale.y,
+      p.offset[2] * _scale.z,
+    );
+    const collider = this.world.createCollider(colDesc, body);
+    this.colliderEntity.set(collider.handle, entity);
+
+    // Small skin gap keeps the capsule from snagging on the surfaces it slides
+    // against; scaled with the body so it stays proportional.
+    const controller = this.world.createCharacterController(Math.max(p.skinWidth, 0.001) * (sxz || 1));
+    controller.setUp({ x: 0, y: 1, z: 0 });
+    controller.setMaxSlopeClimbAngle(p.slopeClimbAngle * DEG2RAD);
+    controller.setMinSlopeSlideAngle(p.slopeSlideAngle * DEG2RAD);
+    controller.setSlideEnabled(true);
+    if (p.autostep) {
+      controller.enableAutostep(p.autostepHeight * sy, p.autostepMinWidth * sxz, true);
+    } else {
+      controller.disableAutostep();
+    }
+    if (p.snapToGround) controller.enableSnapToGround(p.snapDistance * sy);
+    else controller.disableSnapToGround();
+    controller.setApplyImpulsesToDynamicBodies(!!p.pushDynamicBodies);
+
+    cc.body = body;
+    cc.collider = collider;
+    cc.controller = controller;
+    cc.grounded = false;
+    this.characters.push({ entity, cc });
+  }
+
   #teardown() {
     for (const { entity } of [...this.dynamicBodies, ...this.kinematicBodies]) {
       const rb = entity.getComponent("rigidbody");
       if (rb) rb.body = null;
     }
+    for (const { cc } of this.characters) {
+      cc.body = null;
+      cc.collider = null;
+      cc.controller = null;
+      cc.grounded = false;
+    }
+    this.characters = [];
     for (const entity of this.colliderEntity.values()) {
       const col = entity.getComponent("collider");
       if (col) col.collider = null;
@@ -230,6 +309,9 @@ export class PhysicsSystem {
     while (this.accumulator >= FIXED_DT) {
       this.accumulator -= FIXED_DT;
       this.world.timestep = FIXED_DT;
+      // Resolve character motion before the step so the world advances the
+      // kinematic bodies to their collision-free targets this substep.
+      for (const { cc } of this.characters) this.#stepCharacter(cc, FIXED_DT);
       this.world.step(this.eventQueue);
       stepped = true;
       this.#dispatchEvents();
@@ -254,6 +336,42 @@ export class PhysicsSystem {
         obj.quaternion.copy(_quat);
       }
     }
+
+    // Character controllers own position only — the entity keeps its own
+    // rotation (scripts steer yaw directly on the transform).
+    for (const { entity, cc } of this.characters) {
+      const t = cc.body.translation();
+      _pos.set(t.x, t.y, t.z);
+      const obj = entity.object3D;
+      if (entity.parent) {
+        entity.parent.object3D.updateWorldMatrix(true, false);
+        obj.position.copy(_pos).applyMatrix4(_mat.copy(entity.parent.object3D.matrixWorld).invert());
+      } else {
+        obj.position.copy(_pos);
+      }
+    }
+  }
+
+  /** Integrates one character's velocity (with gravity) for a fixed step,
+   *  resolves the move against the world, and queues the next kinematic pose. */
+  #stepCharacter(cc, dt) {
+    const p = cc.props;
+    const v = cc.velocity;
+    if (p.applyGravity) v[1] += this.gravity[1] * (p.gravityScale ?? 1) * dt;
+
+    const t = cc.body.translation();
+    cc.controller.computeColliderMovement(cc.collider, {
+      x: v[0] * dt,
+      y: v[1] * dt,
+      z: v[2] * dt,
+    });
+    cc.grounded = cc.controller.computedGrounded();
+    // Zero out downward speed once grounded so gravity doesn't accumulate into
+    // a huge value while standing still.
+    if (cc.grounded && v[1] < 0) v[1] = 0;
+
+    const m = cc.controller.computedMovement();
+    cc.body.setNextKinematicTranslation({ x: t.x + m.x, y: t.y + m.y, z: t.z + m.z });
   }
 
   #dispatchEvents() {
@@ -270,6 +388,24 @@ export class PhysicsSystem {
       this.engine.emit(sensor ? "trigger" : "collision", { a: e1, b: e2, started });
     });
   }
+}
+
+/**
+ * TerrainComponent.heightsArray is row-major over (z-row, x-col) — it comes
+ * straight from PlaneGeometry's vertex order (see TerrainComponent's
+ * #applyHeightsToGeometry). Rapier's ColliderDesc.heightfield wants the same
+ * (row, col) samples in column-major order (nalgebra convention: index =
+ * row + col * (nrows+1)) — this just transposes the storage, not the terrain.
+ */
+function toColumnMajor(heights, resolution) {
+  const cols = resolution + 1;
+  const out = new Float32Array(heights.length);
+  for (let r = 0; r <= resolution; r++) {
+    for (let c = 0; c <= resolution; c++) {
+      out[r + c * cols] = heights[r * cols + c];
+    }
+  }
+  return out;
 }
 
 /**

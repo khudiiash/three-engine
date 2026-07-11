@@ -1,10 +1,12 @@
 import * as THREE from "three/webgpu";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { Component } from "./Component.js";
 import { resolveAssetUrl } from "../assetResolver.js";
 import { loadMaterialAsset } from "../materialAsset.js";
+import { getGltfLoader, rebaseClipToZero } from "../gltfLoader.js";
 
-const loader = new GLTFLoader();
+// Draco-enabled shared loader: Draco-compressed .glb (from the draco module)
+// decode transparently; plain .glb are unaffected.
+const loader = getGltfLoader();
 
 export class ModelComponent extends Component {
   static type = "model";
@@ -35,7 +37,9 @@ export class ModelComponent extends Component {
       const gltf = await loader.loadAsync(url);
       if (generation !== this.generation) return; // detached/reloaded meanwhile
       this.root = gltf.scene;
-      this.clips = gltf.animations ?? [];
+      // Rebase clips exported from a shared master timeline (keyframes not
+      // starting at t=0) so they actually play instead of holding one pose.
+      this.clips = (gltf.animations ?? []).map(rebaseClipToZero);
       this.root.userData.entityId = this.entity.id;
       this.root.traverse((obj) => {
         obj.userData.entityId = this.entity.id;

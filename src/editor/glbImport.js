@@ -1,7 +1,7 @@
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { toBlobUrl } from "./assetLoader.js";
 import { useProjectStore, basename } from "./store/projectStore.js";
 import { MATERIAL_DEFAULTS } from "../engine/materialAsset.js";
+import { createGltfLoader } from "../engine/gltfLoader.js";
 
 /**
  * GLB unpack pipeline: turns an imported .glb into a self-contained asset
@@ -19,7 +19,8 @@ import { MATERIAL_DEFAULTS } from "../engine/materialAsset.js";
  * the model like any other asset.
  */
 
-const loader = new GLTFLoader();
+// Draco-enabled so re-unpacking an already-compressed .glb still decodes.
+const loader = createGltfLoader();
 
 async function invoke(cmd, args) {
   const { invoke } = await import("@tauri-apps/api/core");
@@ -169,10 +170,26 @@ export async function unpackGlb(glbPath) {
   };
   await invoke("save_scene", { path: `${folder}/${stem}.entity`, contents: JSON.stringify(prefab, null, 2) });
 
+  // Auto-compress the moved .glb in place when the Draco module is enabled; it
+  // still loads through the prefab's `model` path (compression is transparent).
+  let dracoNote = "";
+  try {
+    const { isDracoEnabled, compressGlbInPlace, formatBytes } = await import("./dracoCompress.js");
+    if (isDracoEnabled()) {
+      const info = await compressGlbInPlace(movedGlb);
+      if (info && info.compressed < info.original) {
+        const pct = Math.round((1 - info.compressed / info.original) * 100);
+        dracoNote = `, Draco −${pct}% (${formatBytes(info.original)} → ${formatBytes(info.compressed)})`;
+      }
+    }
+  } catch (err) {
+    console.warn(`Draco compression skipped for ${fileName}: ${err.message ?? err}`);
+  }
+
   await useProjectStore.getState().refresh();
   console.log(
     `Unpacked ${fileName}: ${materials.size} material${materials.size === 1 ? "" : "s"}, ` +
-      `${textureFiles.size} texture${textureFiles.size === 1 ? "" : "s"}, ${clips.length} clip${clips.length === 1 ? "" : "s"}`,
+      `${textureFiles.size} texture${textureFiles.size === 1 ? "" : "s"}, ${clips.length} clip${clips.length === 1 ? "" : "s"}${dracoNote}`,
   );
   return folder;
 }

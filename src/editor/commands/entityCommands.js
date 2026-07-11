@@ -113,6 +113,47 @@ export class SetEntityViewOnlyCommand {
   }
 }
 
+/**
+ * Toggles the "enabled in editor" flag on a single entity. Visible in the
+ * editor (i.e. when `!engine.playing`) when true. The engine applies this
+ * to `entity.object3D.visible` on every frame so changing it doesn't
+ * require an explicit redraw.
+ */
+export class SetEntityEnabledInEditorCommand {
+  constructor(entityId, value) {
+    this.entityId = entityId;
+    this.value = !!value;
+    this.oldValue = engine.getEntity(entityId)?.enabledInEditor !== false;
+    this.label = this.value ? "Show in Editor" : "Hide in Editor";
+  }
+
+  do() {
+    engine.getEntity(this.entityId)?.setEnabledInEditor(this.value);
+  }
+
+  undo() {
+    engine.getEntity(this.entityId)?.setEnabledInEditor(this.oldValue);
+  }
+}
+
+/** Mirrors SetEntityEnabledInEditorCommand for the in-game (play) mode. */
+export class SetEntityEnabledInGameCommand {
+  constructor(entityId, value) {
+    this.entityId = entityId;
+    this.value = !!value;
+    this.oldValue = engine.getEntity(entityId)?.enabledInGame !== false;
+    this.label = this.value ? "Show in Game" : "Hide in Game";
+  }
+
+  do() {
+    engine.getEntity(this.entityId)?.setEnabledInGame(this.value);
+  }
+
+  undo() {
+    engine.getEntity(this.entityId)?.setEnabledInGame(this.oldValue);
+  }
+}
+
 /** True if `candidateId` is `entityId` itself or one of its descendants. */
 export function isDescendantOf(candidateId, entityId) {
   const entity = engine.getEntity(entityId);

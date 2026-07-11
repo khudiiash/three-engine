@@ -11,7 +11,10 @@ const GIZMO_COLOR = 0x2df098;
  *
  * `shape: "mesh"` builds a trimesh from the entity's rendered geometry at
  * play start (static/kinematic use only — Rapier trimeshes are hollow).
- * Shows a wireframe gizmo on the editor-only layer.
+ * `shape: "heightfield"` reads the entity's sibling Terrain component
+ * (resolution/heights/size) and builds a Rapier heightfield — requires a
+ * Terrain component on the same entity (static/kinematic use only).
+ * Both skip the wireframe gizmo — the rendered mesh is its own outline.
  */
 export class ColliderComponent extends Component {
   static type = "collider";
@@ -27,11 +30,11 @@ export class ColliderComponent extends Component {
     isSensor: false,
   };
   static schema = [
-    { key: "shape", label: "Shape", type: "select", options: ["box", "sphere", "capsule", "mesh"] },
+    { key: "shape", label: "Shape", type: "select", options: ["box", "sphere", "capsule", "mesh", "heightfield"] },
     { key: "size", label: "Size", type: "vec3", showIf: (p) => p.shape === "box" },
     { key: "radius", label: "Radius", type: "number", min: 0.01, step: 0.05, showIf: (p) => p.shape === "sphere" || p.shape === "capsule" },
     { key: "height", label: "Height", type: "number", min: 0.01, step: 0.05, showIf: (p) => p.shape === "capsule" },
-    { key: "offset", label: "Offset", type: "vec3", showIf: (p) => p.shape !== "mesh" },
+    { key: "offset", label: "Offset", type: "vec3", showIf: (p) => p.shape !== "mesh" && p.shape !== "heightfield" },
     { key: "friction", label: "Friction", type: "number", min: 0, max: 2, step: 0.05 },
     { key: "restitution", label: "Bounciness", type: "number", min: 0, max: 1, step: 0.05 },
     { key: "isSensor", label: "Is Trigger", type: "boolean" },
@@ -40,11 +43,26 @@ export class ColliderComponent extends Component {
   onAttach() {
     this.collider = null; // assigned by PhysicsSystem while playing
     this.#buildGizmo();
+    // Heightfield gizmo mirrors the sibling terrain's surface — rebuild it
+    // whenever that terrain's heights (or size/resolution) change so the
+    // collision preview keeps matching what the user just sculpted.
+    if (this.props.shape === "heightfield") {
+      this._terrainUnsub = this.entity.engine?.on?.("component-changed", (info) => {
+        if (info?.entityId === this.entity.id && info?.componentType === "terrain") this.#rebuildGizmo();
+      });
+    }
   }
 
   onDetach() {
     this.collider = null;
+    this._terrainUnsub?.();
+    this._terrainUnsub = null;
     this.#disposeGizmo();
+  }
+
+  #rebuildGizmo() {
+    this.#disposeGizmo();
+    this.#buildGizmo();
   }
 
   #buildGizmo() {
@@ -56,8 +74,10 @@ export class ColliderComponent extends Component {
       geometry = new THREE.WireframeGeometry(new THREE.SphereGeometry(radius, 12, 8));
     } else if (shape === "capsule") {
       geometry = new THREE.WireframeGeometry(new THREE.CapsuleGeometry(radius, height, 4, 8));
+    } else if (shape === "heightfield") {
+      geometry = buildHeightfieldWireframe(this.entity);
     }
-    if (!geometry) return; // mesh shape: the rendered mesh is its own outline
+    if (!geometry) return; // mesh shape (or terrain not ready): rendered mesh is its own outline
 
     this.gizmo = new THREE.LineSegments(
       geometry,
@@ -77,4 +97,28 @@ export class ColliderComponent extends Component {
     this.gizmo.material.dispose();
     this.gizmo = null;
   }
+}
+
+/**
+ * Wireframe that traces the sibling Terrain's collision surface, for the
+ * `heightfield` collider shape. Sampled on a coarse grid (the full heightmap
+ * would be far too dense as line segments) at the terrain's live heights, and
+ * lifted a hair above the surface to avoid z-fighting. Returns null if the
+ * entity has no Terrain component yet (e.g. the collider was added first).
+ */
+function buildHeightfieldWireframe(entity) {
+  const terrain = entity?.getComponent?.("terrain");
+  if (!terrain?.heightsArray || typeof terrain.heightAtLocal !== "function") return null;
+  const size = terrain.props?.size ?? 50;
+  const segments = Math.min(32, Math.max(2, terrain.resolution ?? 32));
+  const plane = new THREE.PlaneGeometry(size, size, segments, segments);
+  plane.rotateX(-Math.PI / 2);
+  const pos = plane.getAttribute("position");
+  for (let i = 0; i < pos.count; i++) {
+    pos.setY(i, terrain.heightAtLocal(pos.getX(i), pos.getZ(i)) + 0.02);
+  }
+  pos.needsUpdate = true;
+  const wire = new THREE.WireframeGeometry(plane);
+  plane.dispose();
+  return wire;
 }

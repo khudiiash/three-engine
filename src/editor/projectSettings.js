@@ -19,6 +19,11 @@ export const PROJECT_SETTINGS_DEFAULTS = {
     // visit picks up the user's preferred view (e.g. "hide colliders +
     // grid for a clean scene review").
     layers: { gizmos: true, colliders: true, grid: true },
+    // User-rebindable visibility hotkeys (H, Shift+H, E, Shift+E by
+    // default). Each entry maps an action id → chord string; the
+    // dispatcher in keybindings.js reads this on every keydown so
+    // changes apply immediately after Save.
+    keybindings: {},
   },
   scripts: {
     hotReload: true,

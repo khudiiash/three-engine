@@ -19,6 +19,7 @@ import { useSelectionStore } from "../store/selectionStore.js";
 import {
   extOf,
   toBlobUrl,
+  readAssetMeta,
   MODEL_EXTENSIONS,
   TEXTURE_EXTENSIONS,
   SCRIPT_EXTENSIONS,
@@ -255,6 +256,30 @@ function Thumb({ entry }) {
   );
 }
 
+/** Corner badge on a model tile showing how much Draco compression saved. */
+function DracoBadge({ path }) {
+  const [pct, setPct] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const meta = await readAssetMeta(`${path}.meta`);
+      const d = meta?.draco;
+      if (!alive || !d?.original || !d?.compressed) return;
+      const saved = 1 - d.compressed / d.original;
+      setPct(saved > 0.005 ? Math.round(saved * 100) : 0);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [path]);
+  if (pct == null) return null;
+  return (
+    <div className="asset-badge draco-badge" title={`Draco compressed · ${pct}% smaller`}>
+      −{pct}%
+    </div>
+  );
+}
+
 const DRAGGABLE_EXTENSIONS = [
   ...MODEL_EXTENSIONS,
   ...TEXTURE_EXTENSIONS,
@@ -306,6 +331,7 @@ function AssetTile({ entry, renaming, setRenamingPath, onContextMenu }) {
       title={entry.name}
     >
       <Thumb entry={entry} />
+      {MODEL_EXTENSIONS.includes(entry.ext) && <DracoBadge path={entry.path} />}
       {renaming ? (
         <input
           className="rename-input asset-rename"
@@ -334,7 +360,10 @@ function AssetContextMenu({ menu, close, setRenamingPath }) {
         { label: "Rename", action: () => setRenamingPath(entry.path) },
         { label: "Delete", action: () => deleteEntry(entry) },
         ...(MODEL_EXTENSIONS.includes(entry.ext)
-          ? [{ label: "Unpack Model", action: () => unpackModel(entry.path) }]
+          ? [
+              { label: "Unpack Model", action: () => unpackModel(entry.path) },
+              { label: "Compress (Draco)", action: () => compressModel(entry.path) },
+            ]
           : []),
         ...(!entry.is_dir ? [{ label: "Open in Default App", action: () => openInIDE(entry.path) }] : []),
       ]
@@ -390,6 +419,25 @@ async function unpackModel(path) {
     await unpackGlb(path);
   } catch (err) {
     console.error(`Unpack failed for ${basename(path)}: ${err.message ?? err}`);
+  }
+}
+
+/** Manually Draco-compresses a .glb in place (context menu). */
+async function compressModel(path) {
+  try {
+    const { compressGlbInPlace, formatBytes } = await import("../dracoCompress.js");
+    const info = await compressGlbInPlace(path);
+    if (info == null) {
+      console.log(`${basename(path)} is already Draco-compressed`);
+    } else if (info.compressed < info.original) {
+      const pct = Math.round((1 - info.compressed / info.original) * 100);
+      console.log(`Draco: ${basename(path)} −${pct}% (${formatBytes(info.original)} → ${formatBytes(info.compressed)})`);
+    } else {
+      console.log(`Draco: ${basename(path)} already minimal — left uncompressed`);
+    }
+    await useProjectStore.getState().refresh();
+  } catch (err) {
+    console.error(`Compression failed for ${basename(path)}: ${err.message ?? err}`);
   }
 }
 

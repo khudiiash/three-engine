@@ -35,7 +35,7 @@ export default class Player extends Script {
   private _offFire: (() => void) | null = null;
 
   onStart() {
-    // this.entity — typed as ScriptEntity with transform aliases.
+    // this.entity — typed as Entity with transform aliases.
     const ent = this.engine.createEntity({ name: "Bullet" });
     const meshComp = ent.getComponent<{ mesh: unknown }>("mesh");
     void meshComp;
@@ -83,14 +83,14 @@ export default class Player extends Script {
     const camerasByType: CameraComponentLike[] = cams;
     void camerasByType;
 
-    // this.input — typed as ScriptInputManager | null
+    // this.input — typed as InputManager | null
     this.input?.wasPressedThisFrame("Jump");
 
     // MathUtils exposed via THREE
     const clamped = this.THREE.MathUtils.clamp(this.speed, 0, 100);
     void clamped;
 
-    // 6a. Discriminated ScriptAction narrowing via getAction():
+    // 6a. Discriminated Action narrowing via getAction():
     //     type === "button" → value: boolean
     //     type === "value"  → value: number
     //     type === "vec2"   → value: THREE.Vector2 (real instance — not {x,y})

@@ -22,7 +22,10 @@ const graph = {
     { id: "run", name: "Run", clip: "Run", loop: true },
     { id: "jump", name: "Jump", clip: "Jump", loop: false },
   ],
-  entry: "idle",
+  startTransitions: [
+    { id: "st1", to: "idle", conditions: [] }, // default entry
+    { id: "st2", to: "run", conditions: [{ param: "speed", op: ">", value: 0.5 }] }, // boot-time conditional
+  ],
   transitions: [
     { id: "t1", from: "idle", to: "run", duration: 0.2, conditions: [{ param: "speed", op: ">", value: 0.5 }] },
     { id: "t2", from: "run", to: "idle", duration: 0.2, conditions: [{ param: "speed", op: "<=", value: 0.5 }] },
@@ -40,7 +43,7 @@ const assert = (cond, msg) => {
   console.log(`ok: ${msg}`);
 };
 
-assert(runtime.currentState?.name === "Idle", "enters entry state");
+assert(runtime.currentState?.name === "Idle", "enters via first Start transition with no conditions");
 
 runtime.update(0.016);
 assert(runtime.currentState?.name === "Idle", "stays in Idle without conditions met");
@@ -60,5 +63,70 @@ assert(runtime.currentState?.name === "Idle", "exit-time transition returns Jump
 
 runtime.play("Run", 0);
 assert(runtime.currentState?.name === "Run", "play() forces a state");
+
+// Conditional Start transition: a fresh runtime whose Start list is
+// [conditional → Run, unconditional → Idle] and whose `speed` default is
+// already > 0.5 should boot straight into Run.
+const conditionalGraph = {
+  ...graph,
+  startTransitions: [
+    { id: "st1", to: "run", conditions: [{ param: "speed", op: ">", value: 0.5 }] },
+    { id: "st2", to: "idle", conditions: [] },
+  ],
+};
+{
+  const g = JSON.parse(JSON.stringify(conditionalGraph));
+  for (const p of g.parameters) if (p.name === "speed") p.default = 1;
+  const rt = new AnimatorRuntime(g, new THREE.AnimationMixer(new THREE.Object3D()), clips);
+  assert(rt.currentState?.name === "Run", "conditional Start transition picks Run when speed default > 0.5");
+}
+{
+  const g = JSON.parse(JSON.stringify(conditionalGraph));
+  // speed default stays at 0 — no Start condition passes, so we fall through
+  // to the unconditional default entry (Idle).
+  const rt = new AnimatorRuntime(g, new THREE.AnimationMixer(new THREE.Object3D()), clips);
+  assert(rt.currentState?.name === "Idle", "Start falls through to default when conditions fail");
+}
+
+// Regression: overlapping transition thresholds must not freeze the model on
+// frame 0. Walk->Run fires at speed>2, Run->Walk at speed<3; at speed 2.5 both
+// conditions hold. Before the transition-lock fix the runtime flipped states
+// every frame, and each re-entry's reset() pinned the clip at time 0. Now the
+// current clip must actually advance.
+{
+  const g = {
+    version: 1,
+    parameters: [{ name: "speed", type: "number", default: 2.5 }],
+    states: [{ id: "walk", name: "Walk", clip: "Idle", loop: true }, { id: "run", name: "Run", clip: "Run", loop: true }],
+    startTransitions: [{ to: "walk", conditions: [] }],
+    transitions: [
+      { id: "t1", from: "walk", to: "run", duration: 0.2, conditions: [{ param: "speed", op: ">", value: 2 }] },
+      { id: "t2", from: "run", to: "walk", duration: 0.2, conditions: [{ param: "speed", op: "<", value: 3 }] },
+    ],
+  };
+  const rt = new AnimatorRuntime(g, new THREE.AnimationMixer(new THREE.Object3D()), clips);
+  let maxTime = 0;
+  for (let i = 0; i < 40; i++) {
+    rt.update(0.05);
+    const a = rt.actions.get(rt.currentId);
+    if (a) maxTime = Math.max(maxTime, a.time);
+  }
+  assert(maxTime > 0.15, "overlapping thresholds keep the clip advancing (not frozen at frame 0)");
+}
+
+// A self-targeting transition must never be auto-taken (it would reset the clip
+// to frame 0 every frame it holds).
+{
+  const g = {
+    version: 1,
+    parameters: [{ name: "on", type: "boolean", default: true }],
+    states: [{ id: "a", name: "A", clip: "Idle", loop: true }],
+    startTransitions: [{ to: "a", conditions: [] }],
+    transitions: [{ id: "self", from: "a", to: "a", conditions: [{ param: "on", op: "==", value: true }] }],
+  };
+  const rt = new AnimatorRuntime(g, new THREE.AnimationMixer(new THREE.Object3D()), clips);
+  for (let i = 0; i < 10; i++) rt.update(0.05);
+  assert(rt.actions.get("a").time > 0.15, "self-transition is ignored, clip keeps advancing");
+}
 
 console.log("All animator runtime checks passed.");

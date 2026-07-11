@@ -65,27 +65,74 @@ export const PANEL_SPECS = {
 
 let dockApi = null;
 
+/**
+ * Finds the id of a currently visible panel to use as a positioning
+ * anchor when the spec's preferred anchor is closed. Dockview exposes
+ * `api.panels` (all panels, including hidden ones) and `panel.api.isVisible`
+ * per-panel — we want the first VISIBLE one so the `addPanel` call below
+ * doesn't silently fail (issue: when the anchor panel has been closed by
+ * the user, addPanel against it as a reference can no-op without
+ * logging). Active panel first, then iterate visible panels.
+ */
+function pickVisibleAnchorId() {
+  const active = dockApi.activePanel;
+  if (active?.api?.isVisible) return active.id;
+  for (const panel of dockApi.panels) {
+    if (panel.api?.isVisible) return panel.id;
+  }
+  return null;
+}
+
 /** Opens any panel (focuses it if already present), even after it was closed. */
 export function openPanel(id) {
-  if (!dockApi) return;
+  if (!dockApi) {
+    console.warn(`openPanel(${id}) called before Dockview was ready`);
+    return;
+  }
   const existing = dockApi.getPanel(id);
   if (existing) {
     existing.api.setActive();
     return;
   }
   const spec = PANEL_SPECS[id];
-  if (!spec) return;
+  if (!spec) {
+    console.warn(`openPanel(${id}) called with no matching PANEL_SPECS entry`);
+    return;
+  }
   const { position, ...rest } = spec;
   const options = { id, component: id, ...rest };
-  // Only use the preferred position if its anchor panel is actually open;
-  // otherwise dockview throws. Fall back to docking next to whatever exists.
-  if (position?.referencePanel && dockApi.getPanel(position.referencePanel)) {
-    options.position = position;
-  } else if (position && !position.referencePanel) {
-    options.position = position;
-  } else if (dockApi.panels.length > 0) {
-    options.position = { referencePanel: dockApi.panels[0].id, direction: "within" };
+  // Position selection. We pick the first matching rule so the "right
+  // thing" is always predictable:
+  //   (a) No position in the spec → leave options.position unset;
+  //       Dockview docks to the container edge (safest default).
+  //   (b) Spec position has no reference panel (e.g. { direction: "right" })
+  //       → use it as-is.
+  //   (c) Spec position's anchor is visible → use it.
+  //   (d) Spec position's anchor is hidden/missing → fall back to any
+  //       currently visible panel as a "within" anchor so the panel still
+  //       appears instead of silently failing. (This is the bugfix: the
+  //       old logic picked `dockApi.panels[0]`, which is the first panel
+  //       in serialization order and is often the very same hidden
+  //       anchor the spec wanted — addPanel then no-ops without logging.)
+  //   (e) No visible panels at all → leave options.position unset so
+  //       Dockview docks to the container edge instead of failing.
+  if (!position) {
+    // (a)
+  } else if (!position.referencePanel) {
+    options.position = position; // (b)
+  } else if (dockApi.getPanel(position.referencePanel)?.api?.isVisible) {
+    options.position = position; // (c)
+  } else if (dockApi.panels.some((p) => p.api?.isVisible)) {
+    // (d) — log so future layout-fallback surprises are debuggable.
+    console.warn(
+      `openPanel(${id}): preferred anchor "${position.referencePanel}" is not visible; docking to a visible panel.`,
+    );
+    options.position = {
+      referencePanel: pickVisibleAnchorId(),
+      direction: "within",
+    };
   }
+  // (e) — no `options.position` set: addPanel docks to container edge.
   const panel = dockApi.addPanel(options);
   panel.api.setActive();
 }

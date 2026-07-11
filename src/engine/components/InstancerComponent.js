@@ -5,9 +5,11 @@ import { loadMaterialAsset, getDefaultMaterial } from "../materialAsset.js";
 /**
  * Hardware-instanced duplicates of a source mesh (Blender Array modifier +
  * Hair-particle-style scatter). Reads the geometry from the entity's own
- * MeshComponent — if absent, the component stays inert and emits a console
- * warning. One component per entity, because there is only one source mesh
- * per entity to instance; for multiple instance groups use child entities.
+ * MeshComponent or ModelComponent (first mesh found) — if neither is present
+ * (or a ModelComponent's .glb hasn't finished loading yet), the component
+ * stays inert and retries once the model loads. One component per entity,
+ * because there is only one source mesh per entity to instance; for multiple
+ * instance groups use child entities.
  *
  * Two distribution paradigms share a single THREE.InstancedMesh back-end:
  *
@@ -17,8 +19,21 @@ import { loadMaterialAsset, getDefaultMaterial } from "../materialAsset.js";
  *                      circles, spirals, helices, etc. Seeded RNG mixes jitter.
  *
  *   mode = "scatter" — Hair-particle-style random scattering inside a shape:
- *                      sphere, box, circle, disc, or on the surface of the
- *                      source mesh. Seeded RNG so reloads reproduce layout.
+ *                      sphere, box, circle, disc, or on the surface of a mesh
+ *                      (own or another entity's — Mesh or Model component).
+ *                      Seeded RNG so reloads reproduce layout.
+ *
+ * onMesh surface scattering (scatterShape = "onMesh") has two modes:
+ *   scatterSurfaceMode = "whole"     — area-weighted across every face of the
+ *                                      target (trees over a whole terrain,
+ *                                      spikes over a whole mine hull).
+ *   scatterSurfaceMode = "projected" — random points inside a circle or rect
+ *                                      are raycast onto the target along a
+ *                                      chosen axis (x/y/z), like dropping
+ *                                      seeds from above onto terrain within a
+ *                                      radius. Samples that miss the surface
+ *                                      are skipped (fewer instances than
+ *                                      `count`, never a crash).
  *
  * Per-instance variation (both modes):
  *   - random rotation around Y (or full) — rotationJitter
@@ -50,14 +65,17 @@ export class InstancerComponent extends Component {
     scatterSize: [1, 1, 1], // [radius] for sphere/circle/disc; [hx, hy, hz] for box; ignored for onMesh
     scatterAlignToNormal: false, // only meaningful for "onMesh"
 
-    // "onMesh" only: scatter across a target mesh owned by another entity,
-    // optionally restricted to triangles within `scatterRadius` (geodesic
-    // world-space distance) of `scatterSurfaceCenter`. Empty entity id =
-    // use the local MeshComponent (existing behaviour).
+    // "onMesh" only: scatter across a target mesh (Mesh or Model component),
+    // owned either by this entity or another entity in the scene. Empty
+    // entity id = use this entity's own Mesh/Model.
     scatterSurfaceEntity: "",
-    scatterSurfaceShape: "whole", // "whole" | "radius" — only meaningful when scatterShape === "onMesh"
-    scatterRadius: 1, // world-space distance cap when scatterSurfaceShape === "radius"
-    scatterSurfaceCenter: [0, 0, 0], // world-space point to measure from
+    scatterSurfaceMode: "whole", // "whole" | "projected" — only meaningful when scatterShape === "onMesh"
+    // "projected": random points in a circle/rect are raycast onto the
+    // surface along `scatterProjectedAxis`, like dropping seeds from above.
+    scatterProjectedShape: "circle", // "circle" | "rect"
+    scatterProjectedAxis: "y", // "x" | "y" | "z" — axis the rays are cast along
+    scatterProjectedSize: [1, 1, 0], // [radius] for circle; [halfX, halfZ] for rect (world units)
+    scatterSurfaceCenter: [0, 0, 0], // world-space center of the projected shape
 
     // Per-instance jitter (both modes).
     rotationJitter: 0, // 0 = none, 1 = full random orientation, 0..1 blends with Y-only random
@@ -86,9 +104,11 @@ export class InstancerComponent extends Component {
     { key: "scatterAlignToNormal", label: "Align to Normal", type: "boolean", showIf: (p) => p.mode === "scatter" && p.scatterShape === "onMesh" },
     // Surface-target controls (only when scatterShape === "onMesh").
     { key: "scatterSurfaceEntity", label: "Surface Entity", type: "text", showIf: (p) => p.mode === "scatter" && p.scatterShape === "onMesh" },
-    { key: "scatterSurfaceShape", label: "Surface Mode", type: "select", options: ["whole", "radius"], showIf: (p) => p.mode === "scatter" && p.scatterShape === "onMesh" },
-    { key: "scatterRadius", label: "Radius", type: "number", min: 0, step: 0.1, showIf: (p) => p.mode === "scatter" && p.scatterShape === "onMesh" && p.scatterSurfaceShape === "radius" },
-    { key: "scatterSurfaceCenter", label: "Center", type: "vec3", showIf: (p) => p.mode === "scatter" && p.scatterShape === "onMesh" && p.scatterSurfaceShape === "radius" },
+    { key: "scatterSurfaceMode", label: "Surface Mode", type: "select", options: ["whole", "projected"], showIf: (p) => p.mode === "scatter" && p.scatterShape === "onMesh" },
+    { key: "scatterProjectedShape", label: "Projected Shape", type: "select", options: ["circle", "rect"], showIf: (p) => p.mode === "scatter" && p.scatterShape === "onMesh" && p.scatterSurfaceMode === "projected" },
+    { key: "scatterProjectedAxis", label: "Projection Axis", type: "select", options: ["x", "y", "z"], showIf: (p) => p.mode === "scatter" && p.scatterShape === "onMesh" && p.scatterSurfaceMode === "projected" },
+    { key: "scatterProjectedSize", label: "Projected Size", type: "vec3", showIf: (p) => p.mode === "scatter" && p.scatterShape === "onMesh" && p.scatterSurfaceMode === "projected" },
+    { key: "scatterSurfaceCenter", label: "Center", type: "vec3", showIf: (p) => p.mode === "scatter" && p.scatterShape === "onMesh" && p.scatterSurfaceMode === "projected" },
 
     // Both modes.
     { key: "rotationJitter", label: "Rotation Jitter", type: "number", min: 0, max: 1, step: 0.05 },
@@ -99,16 +119,33 @@ export class InstancerComponent extends Component {
   ];
 
   onAttach() {
-    const meshComponent = this.entity.getComponent?.("mesh");
-    if (!meshComponent || !meshComponent.mesh) {
-      console.warn(
-        `InstancerComponent on entity "${this.entity.name ?? this.entity.id}" requires a MeshComponent with an attached mesh. Add a Mesh component first.`,
-      );
+    // Re-entrant: the model-loaded retry below can fire while we're already
+    // attached (e.g. the surface target's model loads after ours). Tear down
+    // the stale InstancedMesh first so we never leak a duplicate.
+    if (this.instancedMesh) this.#teardownMesh();
+
+    // Both the source mesh (this entity) and the scatter target (possibly
+    // another entity) may be backed by a ModelComponent whose .glb is still
+    // loading. Re-run onAttach once either finishes loading.
+    this._unsubModelLoaded?.();
+    this._unsubModelLoaded = this.entity.engine?.on?.("model-loaded", (loadedEntity) => {
+      const targetId = this.props.scatterSurfaceEntity;
+      if (loadedEntity === this.entity || (targetId && loadedEntity?.id === targetId)) {
+        this.onAttach();
+      }
+    });
+
+    const sourceMesh = getPrimarySourceMesh(this.entity);
+    if (!sourceMesh) {
+      if (!isModelPending(this.entity)) {
+        console.warn(
+          `InstancerComponent on entity "${this.entity.name ?? this.entity.id}" requires a Mesh or Model component with a loaded mesh. Add one first.`,
+        );
+      }
       this.instancedMesh = null;
       return;
     }
 
-    const sourceMesh = meshComponent.mesh;
     const maxCount = Math.max(1, Math.floor(this.props.count));
 
     this.instancedMesh = new THREE.InstancedMesh(sourceMesh.geometry, sourceMesh.material, maxCount);
@@ -139,6 +176,12 @@ export class InstancerComponent extends Component {
   }
 
   onDetach() {
+    this._unsubModelLoaded?.();
+    this._unsubModelLoaded = null;
+    this.#teardownMesh();
+  }
+
+  #teardownMesh() {
     if (!this.instancedMesh) return;
     this.sharedGeneration = (this.sharedGeneration ?? 0) + 1;
     this._parent?.remove(this.instancedMesh);
@@ -180,10 +223,13 @@ export class InstancerComponent extends Component {
 
   onPropChanged(key) {
     if (!this.instancedMesh) {
-      // No source mesh yet — re-attaching will rebuild once a MeshComponent appears.
+      // No source mesh yet — re-attaching will rebuild once a Mesh/Model component appears.
       if (key === "mode" || key === "count" || key === "seed" ||
           key === "arrayOffsetPosition" || key === "arrayOffsetRotation" || key === "arrayOffsetScale" ||
           key === "scatterShape" || key === "scatterSize" || key === "scatterAlignToNormal" ||
+          key === "scatterSurfaceEntity" || key === "scatterSurfaceMode" ||
+          key === "scatterProjectedShape" || key === "scatterProjectedAxis" ||
+          key === "scatterProjectedSize" || key === "scatterSurfaceCenter" ||
           key === "rotationJitter" || key === "scaleJitter") {
         this.onAttach();
         return;
@@ -195,7 +241,7 @@ export class InstancerComponent extends Component {
       this.sharedGeneration = (this.sharedGeneration ?? 0) + 1;
       if (this.props.material) this.#loadSharedMaterial(this.props.material);
       else {
-        const src = this.entity.getComponent?.("mesh")?.mesh;
+        const src = getPrimarySourceMesh(this.entity);
         this.instancedMesh.material = src?.material ?? getDefaultMaterial();
       }
       return;
@@ -260,51 +306,73 @@ export class InstancerComponent extends Component {
           scale.z += offScale.z;
         }
       }
-    } else {
-      // scatter
-      const shape = this.props.scatterShape ?? "sphere";
-      const size = vec3From(this.props.scatterSize, 1, 1, 1);
-      const alignToNormal = !!this.props.scatterAlignToNormal && shape === "onMesh";
+    } else if (this.props.scatterShape === "onMesh") {
+      // Surface scatter: sample points on a target mesh (Mesh or Model
+      // component, own or foreign entity). Sampling always happens in world
+      // space so self vs. foreign and Mesh vs. Model all share one code path;
+      // results are then converted into this._parent's local space, which is
+      // exactly what `setMatrixAt` needs.
+      const meshes = resolveSurfaceMeshes(this.entity, this.props);
+      const alignToNormal = !!this.props.scatterAlignToNormal;
+      const surfaceMode = this.props.scatterSurfaceMode ?? "whole";
+      const worldSampler = meshes.length
+        ? (surfaceMode === "projected"
+          ? makeProjectedSurfaceSampler(meshes, this.props)
+          : makeWholeSurfaceSampler(meshes))
+        : null;
 
-      // Pick the source mesh for surface modes. Defaults to the local
-      // MeshComponent; can be overridden by `scatterSurfaceEntity` (any
-      // entity with a MeshComponent in the scene).
-      const surfaceMesh = resolveSurfaceMesh(this.entity, this.props);
-      const onSurface = shape === "onMesh" && surfaceMesh;
-      const surfaceIsForeign = !!this.props.scatterSurfaceEntity && surfaceMesh
-        && this.entity.engine.getEntity(this.props.scatterSurfaceEntity) !== this.entity;
-
-      // Surface sampler: world-space if sampling a foreign mesh, object-space
-      // if sampling our own mesh (since the InstancedMesh shares the same
-      // parent transform). The sampler returns points in the InstancedMesh's
-      // parent space — exactly what `setMatrixAt` wants.
-      let surfaceSampler = null;
-      if (onSurface) {
-        const surfaceShape = this.props.scatterSurfaceShape ?? "whole";
-        if (surfaceShape === "radius") {
-          const radius = Math.max(0, this.props.scatterRadius ?? 0);
-          const center = vec3From(this.props.scatterSurfaceCenter, 0, 0, 0);
-          // Geodesic sampler is always world-space (the InstancedMesh is
-          // parented to engine.scene when the surface is foreign; for self
-          // surface with radius mode, we also force world-space sampling for
-          // consistency, since `center` is interpreted as a world point).
-          if (!surfaceIsForeign) surfaceMesh.updateWorldMatrix(true, false);
-          surfaceSampler = makeGeodesicSurfaceSampler(surfaceMesh, radius, center);
-        } else {
-          surfaceSampler = makeLocalSurfaceSampler(surfaceMesh, surfaceIsForeign);
-        }
+      if (!worldSampler) {
+        mesh.count = 0;
+        mesh.instanceMatrix.needsUpdate = true;
+        return;
       }
 
-      for (let i = 0; i < count; i++) {
-        const [px, py, pz, nx, ny, nz] = samplePoint(shape, size, rng, surfaceSampler);
-        tmpPos.set(px, py, pz);
+      this._parent.updateWorldMatrix(true, false);
+      const parentInverse = new THREE.Matrix4().copy(this._parent.matrixWorld).invert();
+      const normalMatrix = new THREE.Matrix3().getNormalMatrix(parentInverse);
+      const tmpNormal = new THREE.Vector3();
 
-        if (alignToNormal && surfaceSampler) {
-          tmpQuat.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(nx, ny, nz).normalize());
+      // Projected sampling can miss the surface (a point in the shape may not
+      // land on any triangle) — retry with fresh samples up to a budget, then
+      // settle for however many instances actually landed.
+      const maxAttempts = surfaceMode === "projected" ? count * 8 : count;
+      let placed = 0;
+      let attempts = 0;
+      while (placed < count && attempts < maxAttempts) {
+        attempts++;
+        const sample = worldSampler(rng);
+        if (!sample) continue;
+        const [wx, wy, wz, wnx, wny, wnz] = sample;
+        tmpPos.set(wx, wy, wz).applyMatrix4(parentInverse);
+
+        if (alignToNormal) {
+          tmpNormal.set(wnx, wny, wnz).applyMatrix3(normalMatrix).normalize();
+          tmpQuat.setFromUnitVectors(new THREE.Vector3(0, 1, 0), tmpNormal);
         } else {
           tmpQuat.identity();
         }
 
+        tmpScale.set(1, 1, 1);
+        composeInto(tmp, tmpPos, tmpQuat, tmpScale);
+        applyJitter(tmp, this.props, rng);
+        mesh.setMatrixAt(placed, tmp);
+        placed++;
+      }
+
+      mesh.count = placed;
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere();
+      mesh.frustumCulled = true;
+      return;
+    } else {
+      // Free-space scatter: sphere / box / circle / disc around the origin.
+      const shape = this.props.scatterShape ?? "sphere";
+      const size = vec3From(this.props.scatterSize, 1, 1, 1);
+
+      for (let i = 0; i < count; i++) {
+        const [px, py, pz] = samplePoint(shape, size, rng);
+        tmpPos.set(px, py, pz);
+        tmpQuat.identity();
         tmpScale.set(1, 1, 1);
         composeInto(tmp, tmpPos, tmpQuat, tmpScale);
         applyJitter(tmp, this.props, rng);
@@ -409,12 +477,11 @@ function applyJitter(matrix, props, rng) {
 }
 
 /**
- * Sample a random point for a scatter shape.
- * Returns [x, y, z, nx, ny, nz]. Normal is zero unless shape is "onMesh"
- * (the surface sampler sets it).
+ * Sample a random point for a free-space scatter shape (sphere/box/circle/disc).
+ * Returns [x, y, z, nx, ny, nz]; normal is always straight up (these shapes
+ * have no surface to align to).
  */
-function samplePoint(shape, size, rng, surfaceSampler) {
-  if (shape === "onMesh" && surfaceSampler) return surfaceSampler(rng);
+function samplePoint(shape, size, rng) {
   if (shape === "sphere") {
     // Uniform inside a sphere of radius size[0] (rejection sampling).
     const r = size[0];
@@ -451,212 +518,63 @@ function samplePoint(shape, size, rng, surfaceSampler) {
 }
 
 /**
- * Resolve the mesh to sample on for `scatterShape === "onMesh"`. Defaults to
- * the local MeshComponent; honours `scatterSurfaceEntity` if it points to an
- * existing entity with a mesh.
- *
- * Returns null if no usable mesh is found — the scatter branch should then
- * skip sampling entirely so we don't crash on a half-configured component.
+ * Every renderable THREE.Mesh owned by an entity's Mesh or Model component.
+ * A MeshComponent contributes its single mesh; a ModelComponent contributes
+ * every mesh in its loaded .glb hierarchy (traversed). Empty array if neither
+ * component exists yet, or a ModelComponent's .glb hasn't loaded.
  */
-function resolveSurfaceMesh(entity, props) {
+function getEntityMeshes(entity) {
+  const meshComp = entity?.getComponent?.("mesh");
+  if (meshComp?.mesh) return [meshComp.mesh];
+  const modelComp = entity?.getComponent?.("model");
+  if (modelComp?.root) {
+    const meshes = [];
+    modelComp.root.traverse((o) => { if (o.isMesh) meshes.push(o); });
+    return meshes;
+  }
+  return [];
+}
+
+/** The mesh whose geometry/material the InstancedMesh instances (first mesh found). */
+function getPrimarySourceMesh(entity) {
+  return getEntityMeshes(entity)[0] ?? null;
+}
+
+/** True if the entity has a ModelComponent whose .glb is still loading (not a real failure). */
+function isModelPending(entity) {
+  const modelComp = entity?.getComponent?.("model");
+  return !!modelComp && !!modelComp.props?.path && !modelComp.root;
+}
+
+/**
+ * Resolve every mesh to sample on for `scatterShape === "onMesh"`. Defaults
+ * to this entity's own Mesh/Model; honours `scatterSurfaceEntity` if it
+ * points to another entity with a Mesh or Model component.
+ *
+ * Returns [] if no usable mesh is found — the scatter branch then skips
+ * sampling entirely rather than crashing on a half-configured component.
+ */
+function resolveSurfaceMeshes(entity, props) {
   const targetId = props?.scatterSurfaceEntity;
   if (targetId) {
     const engine = entity?.engine;
     const targetEntity = engine?.getEntity?.(targetId);
     if (targetEntity) {
-      if (targetEntity === entity) {
-        // Picked ourselves — same as empty.
-        return entity.getComponent?.("mesh")?.mesh ?? null;
+      if (targetEntity === entity) return getEntityMeshes(entity);
+      const meshes = getEntityMeshes(targetEntity);
+      if (meshes.length) return meshes;
+      if (!isModelPending(targetEntity)) {
+        console.warn(
+          `InstancerComponent on "${entity.name ?? entity.id}": surface target "${targetEntity.name ?? targetId}" has no Mesh or Model component — falling back to local mesh.`,
+        );
       }
-      const targetMeshComp = targetEntity.getComponent?.("mesh");
-      if (targetMeshComp?.mesh) return targetMeshComp.mesh;
-      console.warn(
-        `InstancerComponent on "${entity.name ?? entity.id}": surface target "${targetEntity.name ?? targetId}" has no MeshComponent — falling back to local mesh.`,
-      );
     } else {
       console.warn(
         `InstancerComponent on "${entity.name ?? entity.id}": surface target "${targetId}" not found — falling back to local mesh.`,
       );
     }
   }
-  return entity.getComponent?.("mesh")?.mesh ?? null;
-}
-
-/**
- * Face-weighted surface sampler. Returns points in `mesh.parent`'s space
- * (the InstancedMesh's parent) for self-scatter, or world-space for foreign
- * scatter (when the InstancedMesh is parented to engine.scene).
- */
-function makeLocalSurfaceSampler(mesh, foreign) {
-  const raw = makeRawSurfaceSampler(mesh);
-  if (!raw || !foreign) return raw;
-  const tmp = new THREE.Vector3();
-  const nrm = new THREE.Vector3();
-  return (rng) => {
-    const [x, y, z, nx, ny, nz] = raw(rng);
-    mesh.updateWorldMatrix(true, false);
-    tmp.set(x, y, z).applyMatrix4(mesh.matrixWorld);
-    nrm.set(nx, ny, nz).transformDirection(mesh.matrixWorld).normalize();
-    return [tmp.x, tmp.y, tmp.z, nrm.x, nrm.y, nrm.z];
-  };
-}
-
-/**
- * Geodesic surface sampler: Dijkstra from the triangle closest to
- * `centerWorld` over world-space centroid distances, restricted to triangles
- * whose shortest-path distance is ≤ `radiusWorld`. Returns points already in
- * `parent` space (the InstancedMesh's parent — must be engine.scene /
- * world root for this sampler to be correct).
- */
-function makeGeodesicSurfaceSampler(mesh, radiusWorld, centerWorld) {
-  if (!mesh?.geometry || radiusWorld <= 0) return null;
-  const geom = mesh.geometry;
-  const index = geom.getIndex();
-  const posAttr = geom.getAttribute?.("position");
-  if (!posAttr) return null;
-  const position = posAttr.array;
-  const triCount = index ? index.count / 3 : position.length / 9;
-  if (triCount === 0) return null;
-
-  // World positions for each triangle vertex + world-space centroid.
-  mesh.updateWorldMatrix(true, false);
-  const tmp = new THREE.Vector3();
-  const worldVerts = new Float32Array(triCount * 9);
-  const worldCentroids = new Float32Array(triCount * 3);
-  for (let t = 0; t < triCount; t++) {
-    let i0, i1, i2;
-    if (index) { i0 = index.getX(t * 3); i1 = index.getX(t * 3 + 1); i2 = index.getX(t * 3 + 2); }
-    else        { i0 = t * 3; i1 = t * 3 + 1; i2 = t * 3 + 2; }
-    for (let k = 0; k < 3; k++) {
-      const idx = k === 0 ? i0 : k === 1 ? i1 : i2;
-      const o = idx * 3;
-      tmp.set(position[o] ?? 0, position[o + 1] ?? 0, position[o + 2] ?? 0).applyMatrix4(mesh.matrixWorld);
-      const w = t * 9 + k * 3;
-      worldVerts[w] = tmp.x; worldVerts[w + 1] = tmp.y; worldVerts[w + 2] = tmp.z;
-    }
-    const cx = (worldVerts[t * 9]     + worldVerts[t * 9 + 3] + worldVerts[t * 9 + 6]) / 3;
-    const cy = (worldVerts[t * 9 + 1] + worldVerts[t * 9 + 4] + worldVerts[t * 9 + 7]) / 3;
-    const cz = (worldVerts[t * 9 + 2] + worldVerts[t * 9 + 5] + worldVerts[t * 9 + 8]) / 3;
-    worldCentroids[t * 3] = cx;
-    worldCentroids[t * 3 + 1] = cy;
-    worldCentroids[t * 3 + 2] = cz;
-  }
-
-  // Seed triangle = closest centroid to centerWorld.
-  let seed = 0;
-  let bestD = Infinity;
-  for (let t = 0; t < triCount; t++) {
-    const dx = worldCentroids[t * 3]     - centerWorld[0];
-    const dy = worldCentroids[t * 3 + 1] - centerWorld[1];
-    const dz = worldCentroids[t * 3 + 2] - centerWorld[2];
-    const d2 = dx * dx + dy * dy + dz * dz;
-    if (d2 < bestD) { bestD = d2; seed = t; }
-  }
-
-  // Triangle adjacency via vertex→tri lookup.
-  const vertexTris = new Map();
-  const pushVT = (key, tri) => {
-    let s = vertexTris.get(key);
-    if (!s) vertexTris.set(key, (s = []));
-    s.push(tri);
-  };
-  for (let t = 0; t < triCount; t++) {
-    let i0, i1, i2;
-    if (index) { i0 = index.getX(t * 3); i1 = index.getX(t * 3 + 1); i2 = index.getX(t * 3 + 2); }
-    else        { i0 = t * 3; i1 = t * 3 + 1; i2 = t * 3 + 2; }
-    pushVT(i0, t); pushVT(i1, t); pushVT(i2, t);
-  }
-  const adj = new Array(triCount);
-  for (let t = 0; t < triCount; t++) adj[t] = new Set();
-  for (const tris of vertexTris.values()) {
-    for (let i = 0; i < tris.length; i++) {
-      for (let j = i + 1; j < tris.length; j++) {
-        adj[tris[i]].add(tris[j]);
-        adj[tris[j]].add(tris[i]);
-      }
-    }
-  }
-  vertexTris.clear();
-
-  // Dijkstra with a tiny array-based heap.
-  const dist = new Float32Array(triCount);
-  dist.fill(Infinity);
-  dist[seed] = 0;
-  const visited = new Uint8Array(triCount);
-  const heap = [[seed, 0]];
-  const edgeLen = (a, b) => Math.hypot(
-    worldCentroids[a * 3]     - worldCentroids[b * 3],
-    worldCentroids[a * 3 + 1] - worldCentroids[b * 3 + 1],
-    worldCentroids[a * 3 + 2] - worldCentroids[b * 3 + 2],
-  );
-  while (heap.length) {
-    let mi = 0;
-    for (let i = 1; i < heap.length; i++) if (heap[i][1] < heap[mi][1]) mi = i;
-    const [t, d] = heap.splice(mi, 1)[0];
-    if (visited[t]) continue;
-    visited[t] = 1;
-    if (d > dist[t]) continue;
-    for (const n of adj[t]) {
-      const nd = d + edgeLen(t, n);
-      if (nd < dist[n]) { dist[n] = nd; heap.push([n, nd]); }
-    }
-  }
-
-  // CDF over triangles within radius (weighted by world-space area).
-  const reachable = [];
-  let total = 0;
-  const areas = new Float32Array(triCount);
-  for (let t = 0; t < triCount; t++) {
-    if (dist[t] <= radiusWorld) {
-      const a = triangleArea(worldVerts, t * 9);
-      areas[t] = a;
-      total += a;
-      reachable.push(t);
-    }
-  }
-  if (total <= 0 || reachable.length === 0) return null;
-  const cdf = new Float32Array(reachable.length);
-  let acc = 0;
-  for (let i = 0; i < reachable.length; i++) {
-    acc += areas[reachable[i]];
-    cdf[i] = acc;
-  }
-
-  // Sampler: pick a triangle from `reachable` by area-weighted CDF, then
-  // barycentric in world-space (we already have worldVerts) — which is also
-  // the InstancedMesh's parent space since it's parented to engine.scene.
-  return (rng) => {
-    const r = rng() * total;
-    let lo = 0, hi = reachable.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (cdf[mid] < r) lo = mid + 1; else hi = mid;
-    }
-    const t = reachable[lo];
-    const wv = t * 9;
-
-    let u = rng(), v_ = rng();
-    if (u + v_ > 1) { u = 1 - u; v_ = 1 - v_; }
-    const ww = 1 - u - v_;
-    tmp.set(
-      worldVerts[wv]     * ww + worldVerts[wv + 3] * u + worldVerts[wv + 6] * v_,
-      worldVerts[wv + 1] * ww + worldVerts[wv + 4] * u + worldVerts[wv + 7] * v_,
-      worldVerts[wv + 2] * ww + worldVerts[wv + 5] * u + worldVerts[wv + 8] * v_,
-    );
-
-    // World-space normal from the same triangle.
-    const ax = worldVerts[wv + 3] - worldVerts[wv];
-    const ay = worldVerts[wv + 4] - worldVerts[wv + 1];
-    const az = worldVerts[wv + 5] - worldVerts[wv + 2];
-    const bx = worldVerts[wv + 6] - worldVerts[wv];
-    const by = worldVerts[wv + 7] - worldVerts[wv + 1];
-    const bz = worldVerts[wv + 8] - worldVerts[wv + 2];
-    let nx = ay * bz - az * by;
-    let ny = az * bx - ax * bz;
-    let nz = ax * by - ay * bx;
-    const nl = Math.hypot(nx, ny, nz) || 1;
-    return [tmp.x, tmp.y, tmp.z, nx / nl, ny / nl, nz / nl];
-  };
+  return getEntityMeshes(entity);
 }
 
 /** Triangle area from a flat 9-float worldVerts entry. */
@@ -674,83 +592,133 @@ function triangleArea(worldVerts, baseIdx) {
 }
 
 /**
- * Raw face-weighted surface sampler. Returns object-space points and
- * object-space normals. (rng, triangleIndex) -> [x, y, z, nx, ny, nz]. If
- * `triangleIndex` is omitted, picks one weighted by area.
- *
- * Returns null if the geometry has no usable position data.
+ * Area-weighted surface sampler across every triangle of every mesh in
+ * `meshes` (world space). Used for scatterSurfaceMode === "whole" — spreads
+ * instances over the entire target regardless of shape (a whole terrain, a
+ * whole mine hull). Returns [x, y, z, nx, ny, nz] in world space, or null if
+ * none of the meshes have usable geometry.
  */
-function makeRawSurfaceSampler(mesh) {
-  if (!mesh?.geometry) return null;
-  const geom = mesh.geometry;
-  const posAttr = geom.getAttribute?.("position");
-  if (!posAttr) return null;
+function makeWholeSurfaceSampler(meshes) {
+  let triCount = 0;
+  for (const m of meshes) {
+    const geom = m.geometry;
+    const index = geom?.getIndex();
+    const pos = geom?.getAttribute?.("position");
+    if (!pos) continue;
+    triCount += index ? index.count / 3 : pos.count / 3;
+  }
+  if (triCount === 0) return null;
 
-  const index = geom.getIndex();
-  const position = posAttr.array;
-  const triCount = index ? index.count / 3 : position.length / 9;
-
-  // Build cumulative area table (object-space).
+  const worldVerts = new Float32Array(triCount * 9);
   const cdf = new Float32Array(triCount);
+  const tmp = new THREE.Vector3();
   let total = 0;
-  const v = (i) => {
-    const o = i * 3;
-    return [position[o] ?? 0, position[o + 1] ?? 0, position[o + 2] ?? 0];
-  };
-
-  for (let t = 0; t < triCount; t++) {
-    let i0, i1, i2;
-    if (index) {
-      i0 = index.getX(t * 3);
-      i1 = index.getX(t * 3 + 1);
-      i2 = index.getX(t * 3 + 2);
-    } else {
-      i0 = t * 3; i1 = t * 3 + 1; i2 = t * 3 + 2;
+  let t = 0;
+  for (const m of meshes) {
+    const geom = m.geometry;
+    const pos = geom?.getAttribute?.("position");
+    if (!pos) continue;
+    m.updateWorldMatrix(true, false);
+    const index = geom.getIndex();
+    const meshTriCount = index ? index.count / 3 : pos.count / 3;
+    for (let k = 0; k < meshTriCount; k++) {
+      let i0, i1, i2;
+      if (index) { i0 = index.getX(k * 3); i1 = index.getX(k * 3 + 1); i2 = index.getX(k * 3 + 2); }
+      else        { i0 = k * 3; i1 = k * 3 + 1; i2 = k * 3 + 2; }
+      const ids = [i0, i1, i2];
+      for (let vi = 0; vi < 3; vi++) {
+        tmp.fromBufferAttribute(pos, ids[vi]).applyMatrix4(m.matrixWorld);
+        const w = t * 9 + vi * 3;
+        worldVerts[w] = tmp.x; worldVerts[w + 1] = tmp.y; worldVerts[w + 2] = tmp.z;
+      }
+      total += triangleArea(worldVerts, t * 9);
+      cdf[t] = total;
+      t++;
     }
-    const A = v(i0), B = v(i1), C = v(i2);
-    const ax = B[0] - A[0], ay = B[1] - A[1], az = B[2] - A[2];
-    const cx = C[0] - A[0], cy = C[1] - A[1], cz = C[2] - A[2];
-    // |cross(B-A, C-A)| / 2
-    const cxx = ay * cz - az * cy;
-    const cyy = az * cx - ax * cz;
-    const czz = ax * cy - ay * cx;
-    const area = 0.5 * Math.sqrt(cxx * cxx + cyy * cyy + czz * czz);
-    total += area;
-    cdf[t] = total;
   }
   if (total <= 0) return null;
 
-  const triAt = (rng, t) => {
-    let i0, i1, i2;
-    if (index) { i0 = index.getX(t * 3); i1 = index.getX(t * 3 + 1); i2 = index.getX(t * 3 + 2); }
-    else        { i0 = t * 3; i1 = t * 3 + 1; i2 = t * 3 + 2; }
-    const A = v(i0), B = v(i1), C = v(i2);
+  return (rng) => {
+    const r = rng() * total;
+    let lo = 0, hi = triCount - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (cdf[mid] < r) lo = mid + 1; else hi = mid;
+    }
+    const wv = lo * 9;
     let u = rng(), v_ = rng();
     if (u + v_ > 1) { u = 1 - u; v_ = 1 - v_; }
     const w = 1 - u - v_;
-    const x = A[0] * w + B[0] * u + C[0] * v_;
-    const y = A[1] * w + B[1] * u + C[1] * v_;
-    const z = A[2] * w + B[2] * u + C[2] * v_;
-    const ex = B[0] - A[0], ey = B[1] - A[1], ez = B[2] - A[2];
-    const fx = C[0] - A[0], fy = C[1] - A[1], fz = C[2] - A[2];
-    let nx = ey * fz - ez * fy;
-    let ny = ez * fx - ex * fz;
-    let nz = ex * fy - ey * fx;
+    const x = worldVerts[wv] * w + worldVerts[wv + 3] * u + worldVerts[wv + 6] * v_;
+    const y = worldVerts[wv + 1] * w + worldVerts[wv + 4] * u + worldVerts[wv + 7] * v_;
+    const z = worldVerts[wv + 2] * w + worldVerts[wv + 5] * u + worldVerts[wv + 8] * v_;
+    const ax = worldVerts[wv + 3] - worldVerts[wv];
+    const ay = worldVerts[wv + 4] - worldVerts[wv + 1];
+    const az = worldVerts[wv + 5] - worldVerts[wv + 2];
+    const bx = worldVerts[wv + 6] - worldVerts[wv];
+    const by = worldVerts[wv + 7] - worldVerts[wv + 1];
+    const bz = worldVerts[wv + 8] - worldVerts[wv + 2];
+    let nx = ay * bz - az * by;
+    let ny = az * bx - ax * bz;
+    let nz = ax * by - ay * bx;
     const nl = Math.hypot(nx, ny, nz) || 1;
     return [x, y, z, nx / nl, ny / nl, nz / nl];
   };
+}
 
-  return (rng, triangleIndex) => {
-    let t = triangleIndex;
-    if (t === undefined) {
-      const r = rng() * total;
-      let lo = 0, hi = triCount - 1;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (cdf[mid] < r) lo = mid + 1; else hi = mid;
-      }
-      t = lo;
+// Maps a projection axis to [rayAxis, planeAxisA, planeAxisB] component indices.
+const PROJECTION_AXES = { x: [0, 1, 2], y: [1, 0, 2], z: [2, 0, 1] };
+
+/**
+ * Projected surface sampler: picks a random point inside a circle or rect
+ * (in the plane perpendicular to `scatterProjectedAxis`, centered on
+ * `scatterSurfaceCenter`), then raycasts onto `meshes` along that axis —
+ * like dropping a seed from above onto terrain. Returns [x, y, z, nx, ny, nz]
+ * in world space from the closest hit, or null if the ray missed (the caller
+ * retries with a fresh sample). Returns null outright if there's nothing to
+ * raycast against.
+ */
+function makeProjectedSurfaceSampler(meshes, props) {
+  if (!meshes.length) return null;
+  const shape = props.scatterProjectedShape ?? "circle";
+  const [ai, bi, ci] = PROJECTION_AXES[props.scatterProjectedAxis] ?? PROJECTION_AXES.y;
+  const size = vec3From(props.scatterProjectedSize, 1, 1, 0);
+  const center = new THREE.Vector3().fromArray(vec3From(props.scatterSurfaceCenter, 0, 0, 0));
+
+  const box = new THREE.Box3();
+  for (const m of meshes) box.expandByObject(m);
+  if (box.isEmpty()) return null;
+  const rayAxisSize = box.max.getComponent(ai) - box.min.getComponent(ai);
+  const margin = Math.max(0.5, rayAxisSize * 0.1);
+
+  const dir = new THREE.Vector3();
+  dir.setComponent(ai, -1);
+  const raycaster = new THREE.Raycaster();
+  raycaster.far = rayAxisSize + margin * 2 || margin * 2;
+
+  const origin = new THREE.Vector3();
+  return (rng) => {
+    let u, v;
+    if (shape === "rect") {
+      u = (rng() * 2 - 1) * size[0];
+      v = (rng() * 2 - 1) * (size[1] || size[0]);
+    } else {
+      const r = Math.sqrt(rng()) * size[0];
+      const theta = rng() * Math.PI * 2;
+      u = Math.cos(theta) * r;
+      v = Math.sin(theta) * r;
     }
-    return triAt(rng, t);
+    origin.copy(center);
+    origin.setComponent(bi, center.getComponent(bi) + u);
+    origin.setComponent(ci, center.getComponent(ci) + v);
+    origin.setComponent(ai, box.max.getComponent(ai) + margin);
+    raycaster.set(origin, dir);
+    const hits = raycaster.intersectObjects(meshes, false);
+    if (!hits.length) return null;
+    const hit = hits[0];
+    const n = hit.face
+      ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld).normalize()
+      : new THREE.Vector3(0, 1, 0);
+    return [hit.point.x, hit.point.y, hit.point.z, n.x, n.y, n.z];
   };
 }

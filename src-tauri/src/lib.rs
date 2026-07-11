@@ -51,9 +51,17 @@ fn list_dir(path: String) -> Result<Vec<DirEntryInfo>, String> {
 }
 
 /// Reads a file's raw bytes, for feeding into blob URLs (models, textures).
+///
+/// Returns a `tauri::ipc::Response` rather than `Vec<u8>` on purpose: a plain
+/// `Vec<u8>` return value is serialized to the frontend as a JSON array of
+/// numbers, which for a multi-MB model means shipping (and parsing) tens of
+/// millions of JSON tokens — 15-20s of stall on a large `.glb`. `Response`
+/// travels over the raw IPC channel as bytes, and `invoke` resolves it to an
+/// `ArrayBuffer` on the JS side, which we wrap in a Blob directly.
 #[tauri::command]
-fn read_binary_file(path: String) -> Result<Vec<u8>, String> {
-    fs::read(&path).map_err(|e| e.to_string())
+fn read_binary_file(path: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// Reads a file as UTF-8 text (script source).

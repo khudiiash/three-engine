@@ -57,16 +57,36 @@ export class AnimationComponent extends Component {
   }
 
   // --- script-facing parameter API -----------------------------------------
+  /** Warns once (per component) if a script drives the animator before its
+   *  runtime exists — otherwise these calls no-op silently and it looks like
+   *  `setBool`/`setTrigger` "don't work". A runtime needs a sibling Model
+   *  component on the SAME entity, with a loaded model and a controller. */
+  #ensureRuntime(method) {
+    if (this.runtime) return true;
+    if (!this._warnedNoRuntime) {
+      this._warnedNoRuntime = true;
+      const hasModel = !!this.entity?.getComponent?.("model");
+      console.warn(
+        `AnimationComponent.${method}() had no active animator runtime on entity ` +
+          `"${this.entity?.name ?? "?"}". ` +
+          (hasModel
+            ? "The model/controller may still be loading, or the controller has no states."
+            : "This entity has no sibling Model component — the Animation component must sit on the SAME entity as the Model it animates."),
+      );
+    }
+    return false;
+  }
+
   setNumber(name, value) {
-    this.runtime?.setParam(name, value);
+    if (this.#ensureRuntime("setNumber")) this.runtime.setParam(name, value);
   }
 
   setBool(name, value) {
-    this.runtime?.setParam(name, !!value);
+    if (this.#ensureRuntime("setBool")) this.runtime.setParam(name, !!value);
   }
 
   setTrigger(name) {
-    this.runtime?.setTrigger(name);
+    if (this.#ensureRuntime("setTrigger")) this.runtime.setTrigger(name);
   }
 
   getParam(name) {
@@ -100,6 +120,7 @@ export class AnimationComponent extends Component {
     if (!this.graph || !model?.root || !model.clips?.length) return;
     this.mixer = new THREE.AnimationMixer(model.root);
     this.runtime = new AnimatorRuntime(this.graph, this.mixer, model.clips);
+    this._warnedNoRuntime = false; // runtime is live again; allow a fresh warning later
   }
 
   #teardownRuntime() {
@@ -107,9 +128,16 @@ export class AnimationComponent extends Component {
     if (this.mixer) {
       const root = this.mixer.getRoot();
       this.mixer.stopAllAction();
+      // `uncacheRoot` unbinds every action, and unbinding restores each
+      // animated property to the value it held before the mixer touched it
+      // (PropertyMixer.restoreOriginalState) — i.e. the bind pose. We must NOT
+      // additionally call `Skeleton.pose()`: it assumes each root bone's parent
+      // sits at the world origin, but glTF/Sketchfab rigs place the armature
+      // under an up-axis correction (e.g. ∓90° X). pose() would bake those
+      // bones' bind *world* matrices into their *local* transforms; since the
+      // clip only re-drives the deeper bones, the untouched root bones stay
+      // corrupted and the whole model tips 90° on X (and looks frozen).
       this.mixer.uncacheRoot(root);
-      // Return skinned meshes to their bind pose instead of freezing mid-clip.
-      root?.traverse?.((obj) => obj.isSkinnedMesh && obj.skeleton?.pose());
     }
     this.mixer = null;
     this.runtime = null;

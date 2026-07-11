@@ -276,10 +276,14 @@ serializeEntity JSON; dropping one on the viewport instantiates via PasteCommand
 
 ### Animation controller (.anim) — Unity-style state machine
 - `src/engine/animGraph.js`: format {parameters(number/boolean/trigger), states
-  (id/name/clip/speed/loop/x/y), entry, transitions(from|`__any__`, to, conditions
-  [{param,op,value}], duration=crossfade, exitTime 0..1|null)}. `AnimatorRuntime`
-  drives a THREE.AnimationMixer: crossFadeTo on transition, triggers consumed on
-  fire, condition-less transitions default to exitTime=1 (clip end). Headless test:
+  (id/name/clip/speed/loop/x/y), startTransitions([{to, conditions}]),
+  transitions(from|`__any__`, to, conditions [{param,op,value}], duration=crossfade,
+  exitTime 0..1|null)}. The graph entrance is the `__start__` pseudo-state — the
+  first Start→X transition whose conditions pass (evaluated once at boot against
+  parameter defaults) determines the entry state; with no Start transitions the
+  runtime falls back to the first state. `AnimatorRuntime` drives a
+  THREE.AnimationMixer: crossFadeTo on transition, triggers consumed on fire,
+  condition-less transitions default to exitTime=1 (clip end). Headless test:
   `node scripts/test-animator.mjs`.
 - `AnimationComponent` ("animation"): props {controller: .anim path, playInEditor}.
   Pulls clips from sibling ModelComponent (rebuilds on `model-loaded`), loads
@@ -288,11 +292,14 @@ serializeEntity JSON; dropping one on the viewport instantiates via PasteCommand
   Teardown re-poses skeletons (skeleton.pose()).
 - `AnimatorPanel` (`src/editor/panels/AnimatorPanel.jsx`, panel id "animator",
   Window menu + double-click .anim + Inspector "Edit Animator"): xyflow canvas
-  (state nodes + fixed Any State node, edges=transitions labeled by conditions),
-  left sidebar = Parameters list + selected State editor (name/clip dropdown from
-  bound model's clips/speed/loop/Set as Entry/Preview) + selected Transition editor
-  (conditions/blend/exit time). Save writes .anim + applyGraph on every Animation
-  component using it. "+ Animator"/"New Animator" in Assets panel.
+  (state nodes + fixed Start + Any State pseudo-nodes; edges=transitions labeled
+  by conditions; Start transitions labeled "entry"), left sidebar = Parameters
+  list + selected State editor (name/clip dropdown from bound model's clips/
+  speed/loop/Preview) + selected Transition editor (conditions, plus blend/exit
+  time for state-to-state edges). Drag a wire from Start to a state to make it
+  the entry; the Start node is anchored (not draggable, not deletable) so it
+  stays on the canvas as a permanent handle. Save writes .anim + applyGraph on
+  every Animation component using it. "+ Animator"/"New Animator" in Assets panel.
 
 ### Asset inspector rework (`src/editor/panels/AssetInspector.jsx`)
 Extracted from InspectorPanel. Header: rename field (rename_path, carries `.meta`

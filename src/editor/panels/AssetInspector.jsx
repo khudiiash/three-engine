@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { ExternalLink, Workflow, Package } from "lucide-react";
 import * as THREE from "three/webgpu";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { createGltfLoader } from "../../engine/gltfLoader.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useProjectStore } from "../store/projectStore.js";
-import { toBlobUrl, extOf, TEXTURE_EXTENSIONS } from "../assetLoader.js";
+import { toBlobUrl, extOf, readAssetMeta, TEXTURE_EXTENSIONS } from "../assetLoader.js";
 import { TEXTURE_META_DEFAULTS } from "../../engine/textureMeta.js";
 import { refreshMaterialsUsingTexture } from "../../engine/materialAsset.js";
 import { MaterialEditor } from "./MaterialPanel.jsx";
@@ -13,6 +13,19 @@ import { syncScriptClassNameAfterRename } from "../scriptClassSync.js";
 
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
 const stemOf = (name) => name.replace(/\.[^.]+$/, "");
+
+/** Human-readable byte size, e.g. "2.4 MB". */
+function formatBytes(n) {
+  if (!Number.isFinite(n)) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}
 
 async function invoke(cmd, args) {
   const { invoke } = await import("@tauri-apps/api/core");
@@ -189,7 +202,7 @@ function ModelPreview({ path }) {
 
     (async () => {
       try {
-        const gltf = await new GLTFLoader().loadAsync(await toBlobUrl(path));
+        const gltf = await createGltfLoader().loadAsync(await toBlobUrl(path));
         let meshes = 0;
         let tris = 0;
         gltf.scene.traverse((o) => {
@@ -198,8 +211,9 @@ function ModelPreview({ path }) {
             tris += (o.geometry.index?.count ?? o.geometry.attributes.position?.count ?? 0) / 3;
           }
         });
+        const draco = (await readAssetMeta(`${path}.meta`))?.draco ?? null;
         if (disposed) return;
-        setInfo({ meshes, tris: Math.round(tris), clips: (gltf.animations ?? []).map((c) => c.name) });
+        setInfo({ meshes, tris: Math.round(tris), clips: (gltf.animations ?? []).map((c) => c.name), draco });
 
         const canvas = canvasRef.current;
         if (!canvas) return;
@@ -267,6 +281,18 @@ function ModelPreview({ path }) {
           <div className="asset-info-row">
             {info.meshes} mesh{info.meshes === 1 ? "" : "es"} · {info.tris.toLocaleString()} tris
           </div>
+          {info.draco?.original > 0 && (
+            <div className="asset-info-row draco-info">
+              {info.draco.compressed < info.draco.original ? (
+                <>
+                  Draco −{Math.round((1 - info.draco.compressed / info.draco.original) * 100)}% ·{" "}
+                  {formatBytes(info.draco.original)} → {formatBytes(info.draco.compressed)}
+                </>
+              ) : (
+                <>Draco: already minimal ({formatBytes(info.draco.original)})</>
+              )}
+            </div>
+          )}
           {info.clips.length > 0 && (
             <>
               <div className="asset-info-label">Animation clips</div>

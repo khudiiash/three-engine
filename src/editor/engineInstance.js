@@ -13,8 +13,19 @@ async function loadEngine() {
   if (engineInstance) return engineInstance;
   if (!loaderPromise) {
     loaderPromise = (async () => {
-      const [{ Engine, setAssetResolver, setScriptLoader, setAssetMetaLoader }, { toBlobUrl, loadScriptModule, readAssetMeta }] =
-        await Promise.all([import("../engine/index.js"), import("./assetLoader.js")]);
+      const [
+        { Engine, THREE, setAssetResolver, setScriptLoader, setAssetMetaLoader, registerBuiltInComponents },
+        { toBlobUrl, loadScriptModule, readAssetMeta },
+      ] = await Promise.all([import("../engine/index.js"), import("./assetLoader.js")]);
+      // Expose the three namespace under a stable global so the script-
+      // runtime data URLs (which can't `import` anything themselves) can
+      // pull three classes from it. Must be set before any user script runs.
+      globalThis.__ENGINE_THREE__ = THREE;
+      // Built-in components must be on the registry before any scene is
+      // deserialized; calling explicitly also survives bundler tree-shaking
+      // in production builds where the side-effect imports would otherwise
+      // be dropped.
+      registerBuiltInComponents();
       const inst = new Engine();
       // The runtime stays fs-agnostic; the editor supplies the actual
       // path -> URL resolution (Tauri fs read -> blob: URL) and script

@@ -93,11 +93,12 @@ const TSCONFIG_BANNER =
 //    We don't run tsc here — but we verify the ambient module is well-formed.
 {
   const required = [
-    "ScriptVector3", "ScriptEuler", "ScriptQuaternion",
-    "ScriptMatrix4", "ScriptColor", "ScriptObject3D", "ScriptCamera",
-    "ScriptEntity", "ScriptEngine", "ScriptInputManager", "ScriptActionMap",
-    "ScriptUnsub", "ScriptEngineConfig", "ScriptSceneSettings",
-    "ScriptPhysicsHandle", "ScriptMathUtils", "ScriptTHREE",
+    "Vector3", "Euler", "Quaternion",
+    "Matrix4", "Color", "Object3D", "Camera",
+    "Entity", "Engine", "InputManager", "ActionMap",
+    "Unsub", "EngineConfig", "SceneSettings",
+    "PhysicsHandle", "MathUtils", "THREE",
+    "ComponentMap", "CharacterControllerComponent",
     "AttributeOptions", "attribute", "Script",
   ];
   const missing = required.filter((n) => !ENGINE_DTS.includes(n));

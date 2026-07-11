@@ -87,6 +87,14 @@ export function mergeSettings(current, patch) {
  * Settings whose effect requires recreating the WebGPU renderer (their values
  * are frozen at constructor time). Returned as a flat `{ antialias, samples,
  * transparent }` object ready for `new WebGPURenderer(opts)`.
+ *
+ * `asyncCompilation: true` is on by default — three r185+ ships an
+ * AsyncCompilation driver that builds WGSL pipelines off the render thread.
+ * Without it, the first frame blocks on every new material's shader compile,
+ * which is the difference between "loads in ~200ms" and "tab unresponsive
+ * for 10+ seconds" when a scene with many materials enters the view. The
+ * trade-off is a brief pop-in for materials that haven't compiled yet
+ * (they draw as black until ready) — acceptable for the boot speedup.
  */
 export function rendererConstructorOptions(settings) {
   const r = settings.renderer ?? SCENE_SETTINGS_DEFAULTS.renderer;
@@ -94,6 +102,7 @@ export function rendererConstructorOptions(settings) {
     antialias: r.antialias !== false,
     samples: r.antialias === false ? 0 : (r.samples ?? 4),
     alpha: r.transparent !== false,
+    asyncCompilation: r.asyncCompilation !== false,
   };
 }
 

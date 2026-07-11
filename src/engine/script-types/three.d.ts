@@ -13,16 +13,16 @@ declare module "three" {
   // shapes via `import * as THREE from "three"` as they do via
   // `this.THREE.Vector3` from a `Script` subclass.
   export {
-    ScriptVector2 as Vector2,
-    ScriptVector3 as Vector3,
-    ScriptEuler as Euler,
-    ScriptQuaternion as Quaternion,
-    ScriptMatrix4 as Matrix4,
-    ScriptColor as Color,
-    ScriptObject3D as Object3D,
-    ScriptCamera as Camera,
-    ScriptMathUtils as MathUtils,
-    ScriptTHREE as THREE,
+    Vector2,
+    Vector3,
+    Euler,
+    Quaternion,
+    Matrix4,
+    Color,
+    Object3D,
+    Camera,
+    MathUtils,
+    THREE,
   } from "engine";
 }
 

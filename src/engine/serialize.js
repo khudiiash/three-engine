@@ -6,6 +6,10 @@ export function serializeEntity(entity) {
     name: entity.name,
     ...entity.getTransform(),
     viewOnly: !!entity.viewOnly,
+    // Newer scenes may include entities without these flags — defaults are
+    // booleans, but we still defensively normalise on read.
+    enabledInEditor: entity.enabledInEditor !== false,
+    enabledInGame: entity.enabledInGame !== false,
     components: [...entity.components.values()].map((c) => c.toJSON()),
     children: entity.children.map(serializeEntity),
   };
@@ -26,6 +30,10 @@ export function instantiateEntity(engine, data, parent) {
   // Restore the entity-wide viewOnly flag before attaching components so
   // their initial `_viewOnlyActive` cache picks up the inherited state.
   if (data.viewOnly) entity.setViewOnly(true);
+  // Per-mode enabled flags. Older scenes omit them — default to true so
+  // existing scenes keep their current behaviour.
+  if (data.enabledInEditor === false) entity.setEnabledInEditor(false);
+  if (data.enabledInGame === false) entity.setEnabledInGame(false);
   for (const { type, props } of data.components ?? []) {
     entity.addComponent(type, props);
   }

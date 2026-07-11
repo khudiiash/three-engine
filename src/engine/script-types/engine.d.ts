@@ -9,22 +9,22 @@ declare module "engine" {
   /**
    * Subset of `three`'s Object3D that scripts typically use.
    */
-  export interface ScriptObject3D {
+  export interface Object3D {
     name: string;
-    position: ScriptVector3;
-    rotation: ScriptEuler;
-    quaternion: ScriptQuaternion;
-    scale: ScriptVector3;
+    position: Vector3;
+    rotation: Euler;
+    quaternion: Quaternion;
+    scale: Vector3;
     visible: boolean;
     userData: Record<string, unknown>;
-    parent: ScriptObject3D | null;
-    children: ScriptObject3D[];
+    parent: Object3D | null;
+    children: Object3D[];
     layers: { mask: number; enable(index: number): void };
-    lookAt(target: ScriptVector3 | ScriptObject3D): void;
-    getWorldPosition(target: ScriptVector3): ScriptVector3;
-    getWorldQuaternion(target: ScriptQuaternion): ScriptQuaternion;
-    getWorldScale(target: ScriptVector3): ScriptVector3;
-    traverse(fn: (obj: ScriptObject3D) => void): void;
+    lookAt(target: Vector3 | Object3D): void;
+    getWorldPosition(target: Vector3): Vector3;
+    getWorldQuaternion(target: Quaternion): Quaternion;
+    getWorldScale(target: Vector3): Vector3;
+    traverse(fn: (obj: Object3D) => void): void;
   }
 
   /**
@@ -35,38 +35,43 @@ declare module "engine" {
    * `object3D` is still typed and reachable for matrix ops and the
    * scene-graph tree.
    */
-  export interface ScriptEntity {
+  export interface Entity {
     id: string;
     name: string;
-    object3D: ScriptObject3D;
-    parent: ScriptEntity | null;
-    children: ScriptEntity[];
+    object3D: Object3D;
+    parent: Entity | null;
+    children: Entity[];
 
     // Transform aliases — get/set both delegate to object3D. Mutation via
     // `this.entity.position.x = 5` works because the getter returns the
     // same Vector3 instance the object3D owns. Setters also accept
     // `[x, y, z]` tuples, which is common for serialized transforms.
-    position: ScriptVector3;
-    rotation: ScriptEuler;
-    quaternion: ScriptQuaternion;
-    scale: ScriptVector3;
+    position: Vector3;
+    rotation: Euler;
+    quaternion: Quaternion;
+    scale: Vector3;
     visible: boolean;
-    up: ScriptVector3;
+    up: Vector3;
 
     // Forwarded Object3D methods — taking the same args as Object3D.
-    lookAt(target: ScriptVector3 | ScriptObject3D): void;
-    getWorldPosition(target: ScriptVector3): ScriptVector3;
-    getWorldQuaternion(target: ScriptQuaternion): ScriptQuaternion;
-    getWorldScale(target: ScriptVector3): ScriptVector3;
-    getWorldDirection(target: ScriptVector3): ScriptVector3;
+    lookAt(target: Vector3 | Object3D): void;
+    getWorldPosition(target: Vector3): Vector3;
+    getWorldQuaternion(target: Quaternion): Quaternion;
+    getWorldScale(target: Vector3): Vector3;
+    getWorldDirection(target: Vector3): Vector3;
     updateMatrix(): void;
     updateMatrixWorld(force?: boolean): void;
 
     addComponent(type: string, props?: Record<string, unknown>): unknown;
+    /** Known component types (e.g. `"charactercontroller"`, `"model"`) resolve to
+     *  their typed interface automatically — no cast or generic needed. Unknown
+     *  strings fall back to `T` (defaulting to `unknown`) for custom/module
+     *  component types not in {@link ComponentMap}. */
+    getComponent<K extends keyof ComponentMap>(type: K): ComponentMap[K] | undefined;
     getComponent<T = unknown>(type: string): T | undefined;
     removeComponent(type: string): void;
-    setParent(parent: ScriptEntity | null): void;
-    traverse(fn: (entity: ScriptEntity) => void): void;
+    setParent(parent: Entity | null): void;
+    traverse(fn: (entity: Entity) => void): void;
     getTransform(): {
       position: [number, number, number];
       rotation: [number, number, number];
@@ -79,13 +84,13 @@ declare module "engine" {
     }): void;
     /** THREE-style lookup of a child Object3D by exact name. Walks the entire
      *  three.js subtree (including meshes / helpers that are NOT entities). */
-    getObjectByName(name: string): ScriptObject3D | null;
+    getObjectByName(name: string): Object3D | null;
     /** Entity-aware lookup. Walks this entity's `children` (other entities
      *  only) depth-first and returns the first match, or null. Use this when
      *  you want to navigate to a child *entity* — `getObjectByName` returns a
      *  raw three.js Object3D which is missing the engine's component API,
      *  position/rotation aliases, and entity-tree navigation. */
-    getEntityByName(name: string): ScriptEntity | null;
+    getEntityByName(name: string): Entity | null;
 
     /**
      * Recursively collect every component matching `type` from this entity
@@ -96,13 +101,165 @@ declare module "engine" {
      * Compare against `getComponent(type)` if you only want this entity
      * itself.
      *
-     * Generic over `T` so callers can ask for a more specific component
-     * shape (e.g. `findComponents<CameraComponent>("camera")`); the runtime
-     * returns plain `Component` instances regardless. Cast where the static
-     * typing matters, since component classes aren't part of the engine
-     * ambient surface.
+     * Known component types (see {@link ComponentMap}) resolve to their
+     * typed interface automatically, same as `getComponent`. Pass an explicit
+     * `T` to override for custom/module component types not in the map.
      */
+    findComponents<K extends keyof ComponentMap>(type: K): ComponentMap[K][];
     findComponents<T = unknown>(type: string): T[];
+  }
+
+  /**
+   * Base shape every component exposes, regardless of type. Mirrors the
+   * runtime `Component` base class (`src/engine/components/Component.js`).
+   */
+  export interface ComponentBase {
+    entity: Entity;
+    /** The registered type string (e.g. `"mesh"`, `"charactercontroller"`). */
+    type: string;
+    /** Effective enabled state — composes `props.enabled` with any transient override. */
+    enabled: boolean;
+    props: Record<string, unknown>;
+    setEnabled(value: boolean): void;
+    setProp(key: string, value: unknown): void;
+  }
+
+  /** `entity.getComponent("model")` / `findComponents("model")`. */
+  export interface ModelComponent extends ComponentBase {
+    /** Root of the loaded GLTF scene graph, or `null` before it finishes loading. */
+    root: Object3D | null;
+    /** Animation clips available on this model (drives the sibling `AnimationComponent`). */
+    clips: unknown[];
+  }
+
+  /** `entity.getComponent("animation")`. Drives a `.anim` state machine against the sibling Model component. */
+  export interface AnimationComponent extends ComponentBase {
+    /** Name of the currently playing state, or `null` if nothing is playing. */
+    readonly currentState: string | null;
+    /** Names of the clips available on the sibling `ModelComponent`. */
+    getClipNames(): string[];
+    setNumber(name: string, value: number): void;
+    setBool(name: string, value: boolean): void;
+    setTrigger(name: string): void;
+    getParam(name: string): unknown;
+    /** Transitions to `stateName`, cross-fading over `fade` seconds (default 0.2). */
+    play(stateName: string, fade?: number): void;
+  }
+
+  /** `entity.getComponent("mesh")`. Geometry/material are data-driven via `props` — see `static schema`. */
+  export interface MeshComponent extends ComponentBase {}
+
+  /** `entity.getComponent("camera")`. */
+  export interface CameraComponent extends ComponentBase {
+    camera: Camera | null;
+    /** Resolves `props.followTarget` (an entity id) against the live engine. */
+    resolveFollowTarget(engine: Engine): Entity | null;
+    /** Rotates the entity so -Z faces the follow target, when `enabled` and a target is configured. */
+    applyLookAt(enabled: boolean, engine: Engine): void;
+  }
+
+  /** `entity.getComponent("light")`. Light kind/color/shadow params live in `props` — see `static schema`. */
+  export interface LightComponent extends ComponentBase {
+    /** The underlying three.js light instance (`DirectionalLight` / `PointLight` / `SpotLight` / `AmbientLight`). */
+    light: unknown;
+  }
+
+  /** `entity.getComponent("listener")`. One listener is active scene-wide; see the component's doc comment for claim rules. */
+  export interface ListenerComponent extends ComponentBase {}
+
+  /** `entity.getComponent("sound")`. Playback is driven by `engine.audio`; entries live in `props.entries`. */
+  export interface SoundComponent extends ComponentBase {
+    /** Plays one entry immediately (used by the inspector's Preview button). Returns a handle with `stop()`, or `null` if not ready. */
+    previewEntry(entryId: string): { stop(): void } | null;
+    /** Read-only slot list (one per active entry). */
+    getSlots(): unknown[];
+  }
+
+  /** `entity.getComponent("instancer")`. Hardware-instances the sibling `MeshComponent`/`ModelComponent`'s geometry; see `static schema`. */
+  export interface InstancerComponent extends ComponentBase {
+    /** Re-rolls the seeded RNG and rebuilds the instance transforms. */
+    regenerate(): void;
+  }
+
+  /** `entity.getComponent("particles")`. Emission/shape/color-over-life are graph-driven via `props`. */
+  export interface ParticleComponent extends ComponentBase {
+    /** Resets the simulation (clears all live particles and restarts emission). */
+    restart(): void;
+  }
+
+  /**
+   * `entity.getComponent("rigidbody")`. Physics body driven by the Rapier world
+   * while playing (requires the `physics-rapier` module) — all methods no-op
+   * outside play mode. `bodyType`/`mass`/damping/locks live in `props`.
+   */
+  export interface RigidbodyComponent extends ComponentBase {
+    applyImpulse(v: [number, number, number]): void;
+    applyForce(v: [number, number, number]): void;
+    applyTorqueImpulse(v: [number, number, number]): void;
+    setLinearVelocity(v: [number, number, number]): void;
+    getLinearVelocity(): [number, number, number];
+    setAngularVelocity(v: [number, number, number]): void;
+    getAngularVelocity(): [number, number, number];
+    /** Teleports the body (world position, optional quaternion `[x,y,z,w]`); zeroes velocity. */
+    teleport(position: [number, number, number], quaternion?: [number, number, number, number]): void;
+  }
+
+  /**
+   * `entity.getComponent("collider")`. Collision shape (requires the
+   * `physics-rapier` module); pairs with a Rigidbody on this entity or the
+   * nearest ancestor. Shape/size/friction/etc. live in `props`.
+   */
+  export interface ColliderComponent extends ComponentBase {}
+
+  /**
+   * `entity.getComponent("charactercontroller")`. Kinematic character
+   * controller (requires the `physics-rapier` module) — walks, climbs
+   * slopes/steps, and slides along walls without a separate Rigidbody or
+   * Collider. Movement is velocity-based (units/second); gravity is applied
+   * internally when `props.applyGravity` is on.
+   */
+  export interface CharacterControllerComponent extends ComponentBase {
+    /** Sets desired horizontal velocity (units/s). `y` is ignored — gravity/jump own vertical motion. */
+    move(v: [number, number, number]): void;
+    /** Launches upward at `speed` (units/s) — only takes effect when grounded. */
+    jump(speed: number): void;
+    /** Overrides the full velocity vector directly (advanced — bypasses `move`/`jump`). */
+    setVelocity(v: [number, number, number]): void;
+    getVelocity(): [number, number, number];
+    /** Touching the floor after the last physics step? */
+    isGrounded(): boolean;
+    /** Instantly repositions the character (world space) and clears fall speed. */
+    teleport(v: [number, number, number]): void;
+  }
+
+  /**
+   * Maps every built-in registered component type string to its typed
+   * interface. `getComponent`/`findComponents` key off this so
+   * `entity.getComponent("charactercontroller")` resolves to
+   * {@link CharacterControllerComponent} automatically, with full
+   * autocomplete on its methods — no cast needed.
+   *
+   * Physics types (`rigidbody`, `collider`, `charactercontroller`) are only
+   * actually attachable when the project has the `physics-rapier` module
+   * enabled; typing them here is safe either way since `getComponent`
+   * already returns `| undefined`.
+   *
+   * Custom components registered by other modules aren't in this map — use
+   * the explicit generic form (`getComponent<MyType>("mytype")`) for those.
+   */
+  export interface ComponentMap {
+    model: ModelComponent;
+    animation: AnimationComponent;
+    mesh: MeshComponent;
+    camera: CameraComponent;
+    light: LightComponent;
+    listener: ListenerComponent;
+    sound: SoundComponent;
+    instancer: InstancerComponent;
+    particles: ParticleComponent;
+    rigidbody: RigidbodyComponent;
+    collider: ColliderComponent;
+    character: CharacterControllerComponent;
   }
 
   /** Union of every value shape an action can carry, for callers that don't
@@ -114,17 +271,17 @@ declare module "engine" {
    *  methods (`.length()`, `.normalize()`, `.dot()`, …), not a plain object —
    *  the engine's input manager allocates a Vector2 per vec2 action and mutates
    *  it in place each tick. */
-  export type ScriptActionValue = boolean | number | ScriptVector2;
+  export type ActionValue = boolean | number | Vector2;
 
   /** A live action. The `type` field is the discriminant — TypeScript narrows
    *  `value` automatically:
    *    type === "button" → value: boolean
    *    type === "value"  → value: number
-   *    type === "vec2"   → value: ScriptVector2 (THREE.Vector2) */
-  export type ScriptAction =
-    | ScriptButtonAction
-    | ScriptValueAction
-    | ScriptVec2Action;
+   *    type === "vec2"   → value: Vector2 (THREE.Vector2) */
+  export type Action =
+    | ButtonAction
+    | ValueAction
+    | Vec2Action;
 
   /** Coordinate space the resolved value lives in. Only meaningful for vec2
    *  actions — buttons and value axes are scalar-shaped either way.
@@ -135,9 +292,9 @@ declare module "engine" {
    *               `y` slot holds depth so the consumer can write straight into
    *               `entity.position.z`). The manager falls back to input-space
    *               when no camera provider is wired (e.g. unit tests). */
-  export type ScriptActionSpace = "world" | "camera";
+  export type ActionSpace = "world" | "camera";
 
-  export interface ScriptButtonAction {
+  export interface ButtonAction {
     name: string;
     type: "button";
     /** Per-frame resolved value: `true` when held, `false` when released.
@@ -145,30 +302,30 @@ declare module "engine" {
     value: boolean;
     /** "any" | "all" | "min" — how multiple bindings combine. See
      *  InputAction.composite in src/engine/input/Action.js. */
-    composite: ScriptActionComposite;
+    composite: ActionComposite;
     /** Always "world" for buttons; surfaces here so the union shape stays
      *  consistent and code can read it without a type guard. */
-    space: ScriptActionSpace;
-    bindings: ScriptBindingDef[];
+    space: ActionSpace;
+    bindings: BindingDef[];
     wasDown: boolean;
     pressedThisFrame: boolean;
     releasedThisFrame: boolean;
   }
 
-  export interface ScriptValueAction {
+  export interface ValueAction {
     name: string;
     type: "value";
     value: number;
-    composite: ScriptActionComposite;
+    composite: ActionComposite;
     /** Always "world" for value axes. */
-    space: ScriptActionSpace;
-    bindings: ScriptBindingDef[];
+    space: ActionSpace;
+    bindings: BindingDef[];
     wasDown: boolean;
     pressedThisFrame: boolean;
     releasedThisFrame: boolean;
   }
 
-  export interface ScriptVec2Action {
+  export interface Vec2Action {
     name: string;
     type: "vec2";
     /** Real `THREE.Vector2` instance with `.length()`, `.normalize()`, etc.
@@ -180,46 +337,46 @@ declare module "engine" {
      *  plane). When `space === "world"`, it stays in input space (x = strafe,
      *  y = forward) and the script rotates by the camera or facing if it
      *  cares about world. */
-    value: ScriptVector2;
-    composite: ScriptActionComposite;
-    space: ScriptActionSpace;
-    bindings: ScriptBindingDef[];
+    value: Vector2;
+    composite: ActionComposite;
+    space: ActionSpace;
+    bindings: BindingDef[];
     wasDown: boolean;
     pressedThisFrame: boolean;
     releasedThisFrame: boolean;
   }
 
-  export type ScriptActionComposite = "any" | "all" | "min";
+  export type ActionComposite = "any" | "all" | "min";
 
   /** Plain-object description of one binding (the shape `addActionMap` accepts
    *  and the shape `ActionMap.toJSON()` produces). The runtime auto-detects
    *  composites from shape, but you can mark them with `kind: "composite"` or
    *  `kind: "binding"` to be explicit. */
-  export type ScriptBindingDef =
-    | ScriptBindingPlain
-    | ScriptBindingExplicit
-    | ScriptCompositeDef
-    | ScriptCompositeShorthand;
+  export type BindingDef =
+    | BindingPlain
+    | BindingExplicit
+    | CompositeDef
+    | CompositeShorthand;
 
   /** Shorthand composite — `{ type: "1d" | "2d", parts }` with no `kind`.
    *  The runtime detects this from the shape (a regular binding has a
    *  `path`, not a `parts` map) and upgrades it to a Composite. The
    *  serialized form (`ActionMap.toJSON()`) always uses the explicit
    *  `kind: "composite"` form so round-trips are stable. */
-  export interface ScriptCompositeShorthand {
+  export interface CompositeShorthand {
     type: "1d" | "2d";
-    parts: ScriptCompositeParts;
+    parts: CompositeParts;
   }
 
   /** Shorthand: just a `path` — the manager creates a regular binding. */
-  export interface ScriptBindingPlain {
+  export interface BindingPlain {
     path: string;
     negate?: boolean;
     scale?: number;
   }
 
   /** Explicit form of a regular binding. */
-  export interface ScriptBindingExplicit {
+  export interface BindingExplicit {
     kind: "binding";
     id?: string;
     path: string;
@@ -230,53 +387,53 @@ declare module "engine" {
   /** Joins multiple sub-bindings into one logical value:
    *    type "2d" → { up, down, left, right } → { x, y } in [-1..1]^2
    *    type "1d" → { negative, positive }   → number in [-1..1]
-   *  Each `parts.<slot>` is itself a `ScriptBindingDef`. */
-  export interface ScriptCompositeDef {
+   *  Each `parts.<slot>` is itself a `BindingDef`. */
+  export interface CompositeDef {
     kind: "composite";
     id?: string;
     type: "1d" | "2d";
-    parts: ScriptCompositeParts;
+    parts: CompositeParts;
   }
 
-  export interface ScriptCompositeParts {
-    up?: ScriptBindingDef;
-    down?: ScriptBindingDef;
-    left?: ScriptBindingDef;
-    right?: ScriptBindingDef;
-    negative?: ScriptBindingDef;
-    positive?: ScriptBindingDef;
+  export interface CompositeParts {
+    up?: BindingDef;
+    down?: BindingDef;
+    left?: BindingDef;
+    right?: BindingDef;
+    negative?: BindingDef;
+    positive?: BindingDef;
   }
 
   /** Shape `addActionMap` accepts (and `toJSON()` produces). */
-  export interface ScriptActionMapDef {
+  export interface ActionMapDef {
     name: string;
     /** Which device groups this map listens to. `null` = listen to all
      *  schemes the manager was constructed with (defaults to
      *  ["KeyboardMouse", "Gamepad", "Touch"]). */
     schemes?: string[] | null;
-    actions: ScriptActionDef[];
+    actions: ActionDef[];
   }
 
-  export interface ScriptActionDef {
+  export interface ActionDef {
     name: string;
     type: "button" | "value" | "vec2";
-    composite?: ScriptActionComposite;
+    composite?: ActionComposite;
     /** Coordinate space the resolved vec2 lives in. Only affects vec2
      *  actions; ignored for buttons and value axes. Default: "world". */
-    space?: ScriptActionSpace;
-    bindings?: ScriptBindingDef[];
+    space?: ActionSpace;
+    bindings?: BindingDef[];
   }
 
   /** Live action map. Read-only view exposed via `input.getMap(name)`. */
-  export interface ScriptActionMap {
+  export interface ActionMap {
     name: string;
     schemes: string[] | null;
-    actions: Map<string, ScriptAction>;
+    actions: Map<string, Action>;
   }
 
-  export type ScriptUnsub = () => void;
+  export type Unsub = () => void;
 
-  export interface ScriptInputManager {
+  export interface InputManager {
     /** Currently active device group ("KeyboardMouse" | "Gamepad" | "Touch"). */
     activeScheme: string;
     /** Device groups the manager is configured to track. */
@@ -293,27 +450,27 @@ declare module "engine" {
      *  each tick), so you can call `.length()`, `.normalize()`, `.dot()`,
      *  etc. directly.
      *  Returns `0` when the action isn't found. */
-    readValue(actionName: string): ScriptActionValue;
+    readValue(actionName: string): ActionValue;
     /** Subscribe to press events for one action. Callback receives the
      *  action's current `value` — boolean for buttons, number for value
      *  actions, `{ x, y }` for vec2 actions. */
     onAction(
       name: string,
-      cb: (value: ScriptActionValue) => void,
-    ): ScriptUnsub;
+      cb: (value: ActionValue) => void,
+    ): Unsub;
     /** Subscribe to release events for one action. Callback receives no
      *  arguments (the action name is already known from the `name` param). */
-    onRelease(name: string, cb: () => void): ScriptUnsub;
+    onRelease(name: string, cb: () => void): Unsub;
     /** Looks up a live action by name. Returns `null` if no active map
      *  defines it. The returned action is the same instance the manager
      *  updates each tick, so reading `.value` after `getAction` gives you
      *  the current frame's value with a properly-typed shape. */
-    getAction(name: string): ScriptAction | null;
+    getAction(name: string): Action | null;
     /** Looks up a live action map by name. */
-    getMap(name: string): ScriptActionMap | null;
+    getMap(name: string): ActionMap | null;
     /** Adds (or replaces) an action map. Accepts the runtime `ActionMap`
      *  instance directly, or the plain-object shape used by `toJSON()`. */
-    addActionMap(def: ScriptActionMapDef): ScriptActionMap;
+    addActionMap(def: ActionMapDef): ActionMap;
     /** Removes an action map. Idempotent. */
     removeActionMap(name: string): void;
     /** Pushes the map onto the top of the active stack. */
@@ -340,12 +497,12 @@ declare module "engine" {
     reset(): void;
   }
 
-  export interface ScriptEngineConfig {
+  export interface EngineConfig {
     scriptHotReload: boolean;
     scriptReloadIntervalMs: number;
   }
 
-  export interface ScriptSceneSettings {
+  export interface SceneSettings {
     toneMapping: string;
     exposure: number;
     ambientColor: string;
@@ -355,137 +512,137 @@ declare module "engine" {
     shadowType: "basic" | "pcf" | "pcfSoft" | "vsm";
   }
 
-  export interface ScriptPhysicsHandle {
+  export interface PhysicsHandle {
     raycast(
-      origin: ScriptVector3,
-      direction: ScriptVector3,
+      origin: Vector3,
+      direction: Vector3,
       maxDist: number,
     ): {
-      entity: ScriptEntity | null;
-      point: ScriptVector3;
-      normal: ScriptVector3;
+      entity: Entity | null;
+      point: Vector3;
+      normal: Vector3;
       distance: number;
     } | null;
     setGravity(v: [number, number, number]): void;
   }
 
-  export interface ScriptEngine {
+  export interface Engine {
     scene: { children: unknown[]; background: unknown; environment: unknown; fog: unknown };
-    camera: ScriptCamera | null;
+    camera: Camera | null;
     renderer: unknown;
-    entities: Map<string, ScriptEntity>;
-    rootEntities: ScriptEntity[];
+    entities: Map<string, Entity>;
+    rootEntities: Entity[];
     playing: boolean;
-    config: ScriptEngineConfig;
-    settings: ScriptSceneSettings;
-    input: ScriptInputManager;
-    physics?: ScriptPhysicsHandle;
-    onUpdate(fn: (dt: number) => void): ScriptUnsub;
-    onPostRender(fn: () => void): ScriptUnsub;
-    on(event: string, fn: (...args: any[]) => void): ScriptUnsub;
+    config: EngineConfig;
+    settings: SceneSettings;
+    input: InputManager;
+    physics?: PhysicsHandle;
+    onUpdate(fn: (dt: number) => void): Unsub;
+    onPostRender(fn: () => void): Unsub;
+    on(event: string, fn: (...args: any[]) => void): Unsub;
     off(event: string, fn: (...args: any[]) => void): void;
     emit(event: string, ...args: any[]): void;
-    getEntity(id: string): ScriptEntity | null;
-    createEntity(opts?: { id?: string; name?: string; parent?: ScriptEntity | null }): ScriptEntity;
-    destroyEntity(entity: ScriptEntity): void;
+    getEntity(id: string): Entity | null;
+    createEntity(opts?: { id?: string; name?: string; parent?: Entity | null }): Entity;
+    destroyEntity(entity: Entity): void;
   }
 
   // Minimal three.js surface scripts reach into. Mirrors the subset of the
   // three/webgpu build actually used by `engine/Engine.js` and scripts.
-  export class ScriptVector2 {
+  export class Vector2 {
     constructor(x?: number, y?: number);
     x: number; y: number;
     set(x: number, y: number): this;
-    copy(v: ScriptVector2): this;
-    clone(): ScriptVector2;
-    add(v: ScriptVector2): this;
-    sub(v: ScriptVector2): this;
+    copy(v: Vector2): this;
+    clone(): Vector2;
+    add(v: Vector2): this;
+    sub(v: Vector2): this;
     multiplyScalar(s: number): this;
     divideScalar(s: number): this;
     length(): number;
     lengthSq(): number;
     normalize(): this;
-    dot(v: ScriptVector2): number;
-    distanceTo(v: ScriptVector2): number;
-    lerp(v: ScriptVector2, alpha: number): this;
+    dot(v: Vector2): number;
+    distanceTo(v: Vector2): number;
+    lerp(v: Vector2, alpha: number): this;
     toArray(): [number, number];
     fromArray(arr: ArrayLike<number>): this;
-    equals(v: ScriptVector2): boolean;
-    static distance(a: ScriptVector2, b: ScriptVector2): number;
+    equals(v: Vector2): boolean;
+    static distance(a: Vector2, b: Vector2): number;
   }
-  export class ScriptVector3 {
+  export class Vector3 {
     constructor(x?: number, y?: number, z?: number);
     x: number; y: number; z: number;
     set(x: number, y: number, z: number): this;
-    copy(v: ScriptVector3): this;
-    clone(): ScriptVector3;
-    add(v: ScriptVector3): this;
-    sub(v: ScriptVector3): this;
+    copy(v: Vector3): this;
+    clone(): Vector3;
+    add(v: Vector3): this;
+    sub(v: Vector3): this;
     multiplyScalar(s: number): this;
     divideScalar(s: number): this;
     length(): number;
     lengthSq(): number;
     normalize(): this;
-    dot(v: ScriptVector3): number;
-    cross(v: ScriptVector3): this;
-    distanceTo(v: ScriptVector3): number;
-    lerp(v: ScriptVector3, alpha: number): this;
-    applyEuler(e: ScriptEuler): this;
-    applyQuaternion(q: ScriptQuaternion): this;
+    dot(v: Vector3): number;
+    cross(v: Vector3): this;
+    distanceTo(v: Vector3): number;
+    lerp(v: Vector3, alpha: number): this;
+    applyEuler(e: Euler): this;
+    applyQuaternion(q: Quaternion): this;
     toArray(): [number, number, number];
     fromArray(arr: ArrayLike<number>): this;
-    equals(v: ScriptVector3): boolean;
-    static distance(a: ScriptVector3, b: ScriptVector3): number;
+    equals(v: Vector3): boolean;
+    static distance(a: Vector3, b: Vector3): number;
   }
-  export class ScriptEuler {
+  export class Euler {
     constructor(x?: number, y?: number, z?: number, order?: string);
     x: number; y: number; z: number; order: string;
     set(x: number, y: number, z: number, order?: string): this;
     toArray(): [number, number, number];
   }
-  export class ScriptQuaternion {
+  export class Quaternion {
     constructor(x?: number, y?: number, z?: number, w?: number);
     x: number; y: number; z: number; w: number;
     set(x: number, y: number, z: number, w: number): this;
     identity(): this;
-    copy(q: ScriptQuaternion): this;
-    clone(): ScriptQuaternion;
-    setFromAxisAngle(axis: ScriptVector3, angle: number): this;
-    setFromEuler(euler: ScriptEuler): this;
+    copy(q: Quaternion): this;
+    clone(): Quaternion;
+    setFromAxisAngle(axis: Vector3, angle: number): this;
+    setFromEuler(euler: Euler): this;
     inverse(): this;
-    multiply(q: ScriptQuaternion): this;
-    slerp(qb: ScriptQuaternion, t: number): this;
+    multiply(q: Quaternion): this;
+    slerp(qb: Quaternion, t: number): this;
     toArray(): [number, number, number, number];
   }
-  export class ScriptMatrix4 {
+  export class Matrix4 {
     constructor();
     identity(): this;
-    copy(m: ScriptMatrix4): this;
-    clone(): ScriptMatrix4;
-    compose(position: ScriptVector3, quaternion: ScriptQuaternion, scale: ScriptVector3): this;
-    decompose(position: ScriptVector3, quaternion: ScriptQuaternion, scale: ScriptVector3): this;
+    copy(m: Matrix4): this;
+    clone(): Matrix4;
+    compose(position: Vector3, quaternion: Quaternion, scale: Vector3): this;
+    decompose(position: Vector3, quaternion: Quaternion, scale: Vector3): this;
     invert(): this;
-    multiply(m: ScriptMatrix4): this;
+    multiply(m: Matrix4): this;
     elements: number[];
   }
-  export class ScriptColor {
-    constructor(color?: string | number | ScriptColor);
+  export class Color {
+    constructor(color?: string | number | Color);
     r: number; g: number; b: number;
-    set(value: string | number | ScriptColor): this;
-    copy(c: ScriptColor): this;
+    set(value: string | number | Color): this;
+    copy(c: Color): this;
     setRGB(r: number, g: number, b: number): this;
     multiplyScalar(s: number): this;
-    lerp(c: ScriptColor, alpha: number): this;
+    lerp(c: Color, alpha: number): this;
     getHex(): number;
     getHexString(): string;
   }
-  export class ScriptCamera {
+  export class Camera {
     isPerspectiveCamera: boolean;
     aspect: number;
     near: number; far: number;
     updateProjectionMatrix(): void;
   }
-  export const ScriptMathUtils: {
+  export const MathUtils: {
     clamp(v: number, min: number, max: number): number;
     lerp(x: number, y: number, t: number): number;
     degToRad(d: number): number;
@@ -495,19 +652,19 @@ declare module "engine" {
   };
 
   /** Three namespace surface scripts reach into (aliases the engine's three import). */
-  export const ScriptTHREE: {
-    Vector2: typeof ScriptVector2;
-    Vector3: typeof ScriptVector3;
-    Euler: typeof ScriptEuler;
-    Quaternion: typeof ScriptQuaternion;
-    Matrix4: typeof ScriptMatrix4;
-    Color: typeof ScriptColor;
+  export const THREE: {
+    Vector2: typeof Vector2;
+    Vector3: typeof Vector3;
+    Euler: typeof Euler;
+    Quaternion: typeof Quaternion;
+    Matrix4: typeof Matrix4;
+    Color: typeof Color;
     /** Object3D is interface-only in this declaration file — we don't ship a
      *  concrete class for it. Scripts typically use the typed accessors on
-     *  `ScriptEntity` (`.position`, `.rotation`, …) instead. */
+     *  `Entity` (`.position`, `.rotation`, …) instead. */
     Object3D: unknown;
-    Camera: typeof ScriptCamera;
-    MathUtils: typeof ScriptMathUtils;
+    Camera: typeof Camera;
+    MathUtils: typeof MathUtils;
     REVISION: string;
   };
 
@@ -536,35 +693,6 @@ declare module "engine" {
    */
   export function attribute(options?: AttributeOptions): PropertyDecorator;
 
-  // Re-export math classes under their three.js names. Both type-only
-  // (`import type { Vector2 } from "engine"`) and value forms work — at
-  // runtime the re-exports resolve to the actual three.js constructors
-  // (see src/engine/scriptRuntime/runtime.js), so `import { Vector3 } from
-  // "engine"; new Vector3()` gives you a real THREE.Vector3 instance.
-  //
-  // The type-only declarations stay because some user code prefers
-  // `import type { … }` for compile-time-only handles (smaller emitted
-  // code, no runtime dependency on the engine module). The value forms
-  // match the runtime exports.
-  export type Vector2 = ScriptVector2;
-  export const Vector2: typeof ScriptVector2;
-  export type Vector3 = ScriptVector3;
-  export const Vector3: typeof ScriptVector3;
-  export type Euler = ScriptEuler;
-  export const Euler: typeof ScriptEuler;
-  export type Quaternion = ScriptQuaternion;
-  export const Quaternion: typeof ScriptQuaternion;
-  export type Matrix4 = ScriptMatrix4;
-  export const Matrix4: typeof ScriptMatrix4;
-  export type Color = ScriptColor;
-  export const Color: typeof ScriptColor;
-  export type Object3D = ScriptObject3D;
-  export const Object3D: typeof ScriptObject3D;
-  export type Camera = ScriptCamera;
-  export const Camera: typeof ScriptCamera;
-  export const MathUtils: typeof ScriptMathUtils;
-  export type Entity = ScriptEntity;
-
   /**
    * Base class scripts extend for full IntelliSense on `this.entity`,
    * `this.engine`, `this.THREE`, `this.input`, plus the lifecycle methods.
@@ -574,10 +702,10 @@ declare module "engine" {
    * of its base class. This class exists purely as a type-system helper.
    */
   export class Script {
-    entity: ScriptEntity;
-    engine: ScriptEngine;
-    THREE: typeof ScriptTHREE;
-    input: ScriptInputManager | null;
+    entity: Entity;
+    engine: Engine;
+    THREE: typeof THREE;
+    input: InputManager | null;
 
     onStart?(): void;
     onUpdate?(dt: number): void;

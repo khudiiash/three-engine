@@ -1,17 +1,20 @@
 import { useEffect, useState } from "react";
-import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square } from "lucide-react";
+import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain } from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
+import { useModulesStore } from "../modules.js";
 import { commandBus } from "../commands/CommandBus.js";
 import {
   BatchCommand,
   CreateEntityCommand,
   RenameEntityCommand,
   ReparentEntityCommand,
+  SetEntityEnabledInEditorCommand,
+  SetEntityEnabledInGameCommand,
   isDescendantOf,
   topMostIds,
 } from "../commands/entityCommands.js";
-import { SetComponentPropCommand } from "../commands/componentCommands.js";
+import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
 import {
   copyEntities,
   cutEntities,
@@ -25,6 +28,7 @@ import { instantiatePrefab } from "../prefab.js";
 import { extOf, PREFAB_EXTENSIONS, MODEL_EXTENSIONS } from "../assetLoader.js";
 import { basename } from "../store/projectStore.js";
 import { isFollowPickArmed, disarmFollowPick, isSurfacePickArmed, disarmSurfacePick } from "./InspectorPanel.jsx";
+import { isListenerPickArmed, disarmListenerPick } from "../components/ListenerSection.jsx";
 import { engine } from "../engineInstance.js";
 import { newScene } from "../sceneIO.js";
 
@@ -57,6 +61,13 @@ const COMMON_PRESETS = [
   { label: "Light", spec: { name: "Light", components: [{ type: "light", props: { kind: "directional" } }] } },
   { label: "Camera", spec: { name: "Camera", components: [{ type: "camera" }] } },
 ];
+
+// Terrain lives in the optional `terrain` module — only offered in the Add
+// menu when that module is enabled (mirrors how UI presets are gated).
+const TERRAIN_PRESET = {
+  label: "Terrain",
+  spec: { name: "Terrain", components: [{ type: "terrain", props: {} }] },
+};
 
 // UI Screen — top-level UI container. Always shown so the user can add one
 // from anywhere in the scene.
@@ -222,7 +233,9 @@ function EntityIcon({ components }) {
       ? { Icon: Lightbulb, color: "icon-light" }
       : components.particles
         ? { Icon: Sparkles, color: "icon-particles" }
-        : components.mesh
+        : components.terrain
+          ? { Icon: Mountain, color: "icon-model" }
+          : components.mesh
           ? { Icon: Box, color: "icon-mesh" }
           : components.model
             ? { Icon: Package, color: "icon-model" }
@@ -278,6 +291,26 @@ function handleRowClick(e, id, rootIds, entities) {
     );
     return;
   }
+  // Listener target pick: move the listener to the picked entity. Yield the
+  // current holder (if any) and add a ListenerComponent to the picked entity,
+  // making it the new audio listener.
+  if (isListenerPickArmed()) {
+    disarmListenerPick();
+    const sourceId = useSelectionStore.getState().ids[0];
+    if (!sourceId || sourceId === id) return;
+    const current = engine.audio?.listenerEntity;
+    if (current && current.id !== id) {
+      current.getComponent?.("listener")?.setEnabled?.(false);
+    }
+    const target = engine.getEntity(id);
+    if (!target) return;
+    if (!target.getComponent("listener")) {
+      commandBus.execute(new AddComponentCommand(id, "listener"));
+    } else {
+      target.getComponent("listener").setEnabled(true);
+    }
+    return;
+  }
   const sel = useSelectionStore.getState();
   if (e.ctrlKey || e.metaKey) {
     sel.toggle(id);
@@ -331,6 +364,52 @@ function performDropToRoot(draggedIds) {
   if (!ids.length) return;
   const cmds = ids.map((id) => new ReparentEntityCommand(id, null));
   commandBus.execute(new BatchCommand(cmds, cmds.length === 1 ? cmds[0].label : `Move ${cmds.length} entities`));
+}
+
+/**
+ * Per-row visibility icons. Two compact buttons toggle the entity's
+ * editor-mode and game-mode enabled flags respectively — the first uses
+ * an Eye/EyeOff pair (editor visibility is the most-edited), the second
+ * uses Play/Pause so the two states are visually distinct in a narrow
+ * row. Each click is a single, undoable command. The icons read live
+ * values via `engine.getEntity(...)?.[flag]` rather than the React
+ * mirror so toggles made from the inspector reflect immediately. They
+ * live inside the row but stop propagation so they don't change
+ * selection.
+ */
+function VisibilityIcons({ id }) {
+  const live = engine.getEntity(id);
+  if (!live) return null;
+  const editorOn = live.enabledInEditor !== false;
+  const gameOn = live.enabledInGame !== false;
+  return (
+    <span
+      className="hierarchy-vis-icons"
+      onClick={(e) => e.stopPropagation()}
+      onPointerDown={(e) => e.stopPropagation()}
+    >
+      <button
+        type="button"
+        className={`hierarchy-vis-icon ${editorOn ? "on" : "off"}`}
+        title={editorOn ? "Visible in editor — click to hide" : "Hidden in editor — click to show"}
+        onClick={() =>
+          commandBus.execute(new SetEntityEnabledInEditorCommand(id, !editorOn))
+        }
+      >
+        {editorOn ? <Eye size={12} /> : <EyeOff size={12} />}
+      </button>
+      <button
+        type="button"
+        className={`hierarchy-vis-icon ${gameOn ? "on" : "off"}`}
+        title={gameOn ? "Enabled in game — click to disable" : "Disabled in game — click to enable"}
+        onClick={() =>
+          commandBus.execute(new SetEntityEnabledInGameCommand(id, !gameOn))
+        }
+      >
+        {gameOn ? <Play size={10} /> : <Pause size={10} />}
+      </button>
+    </span>
+  );
 }
 
 function EntityRow({
@@ -421,6 +500,7 @@ function EntityRow({
             <span className="entity-name">{entity.name}</span>
           </>
         )}
+        <VisibilityIcons id={id} />
       </div>
       {!collapsed &&
         entity.childIds.map((childId) => (
@@ -498,6 +578,7 @@ export function HierarchyPanel() {
   const sceneName = useSceneStore((s) => s.sceneName);
   const dirty = useSceneStore((s) => s.dirty);
   const selection = useSelectionStore((s) => s.ids);
+  const terrainEnabled = useModulesStore((s) => s.enabled.includes("terrain"));
   const [renamingId, setRenamingId] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [dropHint, setDropHint] = useState(null);
@@ -519,8 +600,9 @@ export function HierarchyPanel() {
   useEffect(() => {
     const onKey = (e) => {
       if (e.key !== "Escape") return;
-      if (isFollowPickArmed()) disarmFollowPick();
-      else if (isSurfacePickArmed()) disarmSurfacePick();
+    if (isFollowPickArmed()) disarmFollowPick();
+    else if (isSurfacePickArmed()) disarmSurfacePick();
+    else if (isListenerPickArmed()) disarmListenerPick();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -656,6 +738,15 @@ export function HierarchyPanel() {
                     {p.label}
                   </button>
                 ))}
+                {terrainEnabled && (
+                  <button
+                    key={TERRAIN_PRESET.label}
+                    className="dropdown-item"
+                    onClick={() => createEntity(TERRAIN_PRESET.spec)}
+                  >
+                    {TERRAIN_PRESET.label}
+                  </button>
+                )}
                 <div className="dropdown-section-label">UI</div>
                 <button
                   key={UI_SCREEN_PRESET.label}

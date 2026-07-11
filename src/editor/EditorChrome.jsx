@@ -23,6 +23,7 @@ import { toggle as togglePlay } from "./playMode.js";
 import { commandBus } from "./commands/CommandBus.js";
 import { getProjectSettings, applyProjectSettings } from "./projectSettings.js";
 import { isGraphHovered } from "./nodegraph/graphContext.js";
+import { dispatchVisibilityKeyAction } from "./keybindings.js";
 
 /**
  * Editor "chrome": the menu bar, scene restore on first mount, keyboard
@@ -128,6 +129,13 @@ export function EditorChrome() {
       if (e.target.closest?.(".react-flow") || isGraphHovered()) return;
 
       const selection = useSelectionStore.getState().ids;
+      // User-rebindable visibility hotkeys (H / Shift+H / E / Shift+E
+      // by default). Routed through a dispatcher so the keys can be
+      // changed in Project Settings. Returns true on consume.
+      if (dispatchVisibilityKeyAction(e)) {
+        e.preventDefault();
+        return;
+      }
       if (ctrl && e.key.toLowerCase() === "z") {
         e.preventDefault();
         e.shiftKey ? commandBus.redo() : commandBus.undo();

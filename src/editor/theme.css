@@ -370,6 +370,15 @@ body,
   bottom: calc(100% + 4px);
 }
 
+/* Anchor to the trigger's right edge so a menu opened by a button sitting at
+ * the right of a narrow panel (e.g. the animator's Parameters "+") opens
+ * inward instead of spilling past the panel edge. */
+.dropdown-menu.align-right {
+  left: auto;
+  right: 0;
+  min-width: 120px;
+}
+
 .dropdown-item {
   display: flex;
   justify-content: space-between;
@@ -847,6 +856,102 @@ body.macro-active .viewport-canvas {
   outline: none;
 }
 
+/* ---------- Hierarchy visibility icons ----------
+ * Two compact eye / play / pause icons per row, pushed to the right edge.
+ * They stay full-strength on hover for the active state and dim to
+ * `--text-dim` when the entity is hidden in the corresponding mode, so
+ * the row at a glance communicates which modes it's visible in.
+ */
+
+.hierarchy-vis-icons {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+  align-items: center;
+  flex: none;
+}
+
+.hierarchy-vis-icon {
+  background: none;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+  padding: 0;
+  transition: background-color 0.12s var(--ease), color 0.12s var(--ease), opacity 0.12s var(--ease);
+}
+
+.hierarchy-vis-icon:hover {
+  background: var(--fill-1);
+}
+
+.hierarchy-vis-icon.off {
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+.hierarchy-vis-icon.off:hover {
+  color: var(--text);
+  opacity: 1;
+}
+
+.hierarchy-vis-icon.on {
+  color: var(--accent);
+}
+
+/* ---------- Inspector visibility row ---------- */
+
+.visibility-row .visibility-toggles {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.visibility-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* ---------- Project Settings keybindings table ---------- */
+
+.keybindings-table {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.keybinding-row .field-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.keybinding-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.keybinding-input {
+  width: 130px;
+  cursor: pointer;
+}
+
+.keybinding-input.capturing {
+  border-color: var(--accent);
+  background: var(--accent-soft, rgba(10, 132, 255, 0.18));
+}
+
 /* ---------- Inspector ---------- */
 
 .inspector-panel {
@@ -1184,6 +1289,7 @@ input[type="checkbox"]:checked::after {
 }
 
 .asset-tile {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1193,6 +1299,30 @@ input[type="checkbox"]:checked::after {
   cursor: default;
   border: 1px solid transparent;
   transition: background-color 0.12s var(--ease);
+}
+
+/* Draco compression saving on a model tile. */
+.asset-badge {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  padding: 1px 5px;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.5;
+  letter-spacing: 0.2px;
+  border-radius: 5px;
+  pointer-events: none;
+}
+
+.draco-badge {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid rgba(10, 132, 255, 0.35);
+}
+
+.asset-info-row.draco-info {
+  color: var(--accent);
 }
 
 .asset-tile.dir {
@@ -1485,6 +1615,7 @@ input[type="checkbox"]:checked::after {
 .cat-system { --cat: #52d276; }
 .cat-anim { --cat: #4d9dff; }
 .cat-any { --cat: #ee74bd; }
+.cat-start { --cat: #52d276; }
 
 /* Animator panel (state-machine editor): lift the edges layer above the
  * nodes so arrowheads and wire ends are not painted under a target node.
@@ -1522,6 +1653,24 @@ input[type="checkbox"]:checked::after {
   letter-spacing: 0.04em;
 }
 
+/* Start pseudo-node (the graph's entrance): a compact green anchor on the
+ * left edge of the animator canvas. The "drag → entry" hint disappears once
+ * the user wires at least one Start→State transition. */
+.cat-start .shader-node-header {
+  border-bottom: none;
+}
+.cat-start .start-hint {
+  padding: 2px 10px 8px;
+  font-size: 9.5px;
+  color: var(--text-3, #7c828e);
+  letter-spacing: 0.02em;
+  text-align: center;
+}
+.cat-start .shader-node-dot {
+  background: #52d276;
+  box-shadow: 0 0 6px color-mix(in srgb, #52d276 60%, transparent);
+}
+
 .animator-param-row,
 .animator-cond-row {
   gap: 5px;
@@ -1536,6 +1685,14 @@ input[type="checkbox"]:checked::after {
   font-size: 10px;
   color: var(--text-3, #7c828e);
   flex: none;
+}
+
+.animator-trigger-hint {
+  font-size: 10px;
+  font-style: italic;
+  color: var(--text-3, #7c828e);
+  flex: 1;
+  text-align: right;
 }
 
 .animator-param-default {
@@ -1800,6 +1957,28 @@ input[type="checkbox"]:checked::after {
   opacity: 0.45;
   background: var(--cat, var(--accent));
 }
+
+/* Animator transition handles: invisible perimeter strips covering the node's
+ * borders so a transition can be dragged out of — or dropped onto — any point
+ * on the border. They stay invisible (no rectangular bars over the rounded
+ * node); the connectable cue is a soft ring on the node itself (below). They
+ * sit above neighbouring node bodies so a strip poking a few px outside its
+ * node stays clickable. */
+.animator-panel .react-flow__handle.anim-edge-handle {
+  z-index: 6;
+  opacity: 0;
+  background: transparent !important;
+}
+/* Rounded "you can connect from here" cue that follows the node's border
+ * radius, instead of colouring the rectangular edge strips. */
+.animator-panel .react-flow__node:hover .shader-node {
+  box-shadow: 0 0 0 1px var(--cat, var(--accent)), 0 0 12px -4px var(--cat, var(--accent));
+}
+/* Keep transition wires visually beneath the state nodes; only lift a wire
+ * (and its arrowhead/label) when it's selected. Prevents the "edges tangled
+ * over the boxes" z-index mess. */
+.animator-panel .react-flow__edge { z-index: 0; }
+.animator-panel .react-flow__edge.selected { z-index: 1; }
 
 /* Animator edge label: rendered inside EdgeLabelRenderer so it sits on top
  * of the wire, similar to Unity's transition labels. */
@@ -3079,3 +3258,45 @@ input[type="checkbox"]:checked::after {
   color: var(--text);
 }
 .code-field-input:focus { outline: none; box-shadow: 0 0 0 2px var(--accent-ring); }
+
+/* Terrain texture-layer cards (Inspector › Terrain). One layer is the active
+   paint target at a time — its card is accent-outlined and its badge filled. */
+.terrain-layer {
+  border: 1px solid var(--border);
+  border-radius: var(--r-input, 6px);
+  background: var(--bg-2);
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+.terrain-layer.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.terrain-layer-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.terrain-layer-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  font-size: 10px;
+  color: var(--text-dim);
+  flex: none;
+}
+.terrain-layer-badge.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.terrain-layer-title {
+  flex: 1;
+  font-size: 11px;
+}

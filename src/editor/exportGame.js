@@ -36,6 +36,7 @@ export async function exportGame() {
   const assets = new Map(); // absolute source -> relative dest
   const scriptPaths = new Set(); // scripts ship transpiled, not copied
   const materialPaths = new Set(); // .mat files ship with rewritten texture paths
+  const audioSidecarPaths = new Set(); // .audio JSON files copied verbatim with path rewrites
   const claim = (p) => {
     if (!p || typeof p !== "string") return p;
     const rel = `assets/${basename(p)}`;
@@ -61,6 +62,16 @@ export async function exportGame() {
       } else if (c.type === "script" && c.props.path) {
         scriptPaths.add(c.props.path);
         c.props.path = `assets/${basename(c.props.path).replace(/\.ts$/i, ".js")}`;
+      } else if (c.type === "sound") {
+        // Each entry's audioAsset is the sidecar path. Ship the sidecar JSON
+        // (with its inner `path` rewritten to the assets folder) and the raw
+        // audio file it points to. Both end up in `assets/` and the
+        // runtime's asset resolver loads them by relative URL.
+        for (const entry of c.props.entries ?? []) {
+          if (!entry.audioAsset) continue;
+          audioSidecarPaths.add(entry.audioAsset);
+          entry.audioAsset = `assets/${basename(entry.audioAsset)}`;
+        }
       }
     }
     (entity.children ?? []).forEach(visit);
@@ -83,6 +94,32 @@ export async function exportGame() {
         if (n.type === "texture" && n.props?.path) n.props.path = claim(n.props.path);
       }
       files.push([`assets/${basename(src)}`, JSON.stringify(def)]);
+    }
+    for (const src of audioSidecarPaths) {
+      // Sidecar may reference a sibling raw audio file (def.path) — copy
+      // that and rewrite the path. When the sidecar JSON is missing or has
+      // no `path`, the runtime falls back to using the sidecar's own path
+      // minus its `.audio` extension as the raw file (handled by
+      // loadAudioAsset), so we also copy the raw-equivalent just in case.
+      let def = null;
+      try {
+        def = JSON.parse(await invoke("read_text_file", { path: src }));
+      } catch {
+        def = null;
+      }
+      const rawPath = def?.path ?? src.replace(/\.audio$/i, "");
+      if (def && def.path) def.path = claim(def.path);
+      const sidecarBody = def ? JSON.stringify(def) : `{"path":"${basename(rawPath)}"}`;
+      files.push([`assets/${basename(src)}`, sidecarBody]);
+      // Best-effort: raw audio lives next to the sidecar typically. Copy
+      // it when present; missing files are silently skipped (the runtime
+      // will log on first play attempt).
+      try {
+        await invoke("stat_file", { path: rawPath });
+        assets.set(rawPath, `assets/${basename(rawPath)}`);
+      } catch {
+        // Raw file missing — likely the sidecar pointed elsewhere.
+      }
     }
     // Texture import settings ship as sidecar .meta files when present.
     for (const [src, rel] of [...assets.entries()]) {

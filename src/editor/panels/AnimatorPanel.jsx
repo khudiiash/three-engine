@@ -12,6 +12,7 @@ import {
   useNodesState,
   useEdgesState,
   useReactFlow,
+  useUpdateNodeInternals,
   BaseEdge,
   getStraightPath,
   EdgeLabelRenderer,
@@ -21,7 +22,7 @@ import "@xyflow/react/dist/style.css";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
 import { engine } from "../engineInstance.js";
-import { ANY_STATE } from "../../engine/animGraph.js";
+import { ANY_STATE, START_STATE } from "../../engine/animGraph.js";
 import { setGraphHovered } from "../nodegraph/graphContext.js";
 
 /**
@@ -51,7 +52,16 @@ function conditionSummary(data, paramTypes) {
 }
 
 function graphToFlow(graph) {
+  const startNode = {
+    id: START_STATE,
+    type: "startState",
+    position: graph.startPosition ?? { x: 40, y: 200 },
+    data: {},
+    deletable: false,
+    draggable: false,
+  };
   const nodes = [
+    startNode,
     {
       id: ANY_STATE,
       type: "anyState",
@@ -63,44 +73,73 @@ function graphToFlow(graph) {
       id: s.id,
       type: "animState",
       position: { x: s.x ?? 0, y: s.y ?? 0 },
-      data: { state: { ...s }, entry: graph.entry === s.id },
+      data: { state: { ...s } },
     })),
   ];
-  const edges = (graph.transitions ?? []).map((t) => ({
-    id: t.id ?? uid("t"),
-    source: t.from,
+  const startEdges = (graph.startTransitions ?? []).map((t) => ({
+    id: t.id ?? uid("st"),
+    source: START_STATE,
     target: t.to,
     data: {
       conditions: t.conditions ?? [],
-      duration: t.duration ?? 0.25,
-      exitTime: t.exitTime ?? null,
-      sourcePoint: t.sourcePoint,
-      targetPoint: t.targetPoint,
+      kind: "start",
+      sourceAnchor: t.sourceAnchor,
+      targetAnchor: t.targetAnchor,
     },
   }));
+  const edges = [
+    ...startEdges,
+    ...(graph.transitions ?? []).map((t) => ({
+      id: t.id ?? uid("t"),
+      source: t.from,
+      target: t.to,
+      data: {
+        conditions: t.conditions ?? [],
+        duration: t.duration ?? 0.25,
+        exitTime: t.exitTime ?? null,
+        kind: "state",
+        sourceAnchor: t.sourceAnchor,
+        targetAnchor: t.targetAnchor,
+      },
+    })),
+  ];
   return { nodes, edges };
 }
 
-function flowToGraph(nodes, edges, parameters, entry) {
+function flowToGraph(nodes, edges, parameters) {
+  const startNode = nodes.find((n) => n.id === START_STATE);
   const anyNode = nodes.find((n) => n.id === ANY_STATE);
   const states = nodes
     .filter((n) => n.type === "animState")
     .map((n) => ({ ...n.data.state, x: n.position.x, y: n.position.y }));
-  return {
-    version: 1,
-    parameters,
-    states,
-    entry: states.some((s) => s.id === entry) ? entry : (states[0]?.id ?? null),
-    transitions: edges.map((e) => ({
+  const startTransitions = edges
+    .filter((e) => e.source === START_STATE)
+    .map((e) => ({
+      id: e.id,
+      to: e.target,
+      conditions: e.data?.conditions ?? [],
+      sourceAnchor: e.data?.sourceAnchor,
+      targetAnchor: e.data?.targetAnchor,
+    }));
+  const transitions = edges
+    .filter((e) => e.source !== START_STATE)
+    .map((e) => ({
       id: e.id,
       from: e.source,
       to: e.target,
       conditions: e.data?.conditions ?? [],
       duration: e.data?.duration ?? 0.25,
       exitTime: e.data?.exitTime ?? null,
-      sourcePoint: e.data?.sourcePoint,
-      targetPoint: e.data?.targetPoint,
-    })),
+      sourceAnchor: e.data?.sourceAnchor,
+      targetAnchor: e.data?.targetAnchor,
+    }));
+  return {
+    version: 1,
+    parameters,
+    states,
+    startTransitions,
+    transitions,
+    startPosition: startNode?.position,
     anyPosition: anyNode?.position,
   };
 }
@@ -110,18 +149,20 @@ function flowToGraph(nodes, edges, parameters, entry) {
 // ---------------------------------------------------------------------------
 
 /**
- * Animator graph nodes use PlayCanvas-style edge handles: instead of small
- * dots on the left/right, a single invisible handle covers each of the four
- * edges of the node. Each handle acts as both source AND target, so dragging
- * from anywhere on a node's border to anywhere on another node's border
- * creates a transition. Connections always originate at the closest point on
- * the source edge to the cursor (React Flow snaps the start point to the
- * handle's edge), which is exactly the PlayCanvas behaviour.
+ * PlayCanvas-style connection handles: a thin invisible strip along each of the
+ * node's four borders. In loose connection mode every strip is both a source
+ * and a target (`isConnectableStart` + `isConnectableEnd`), so a transition can
+ * be dragged out of any border and dropped onto any border of another node. The
+ * node interior stays free so clicks there select / drag the node. The canvas's
+ * `connectionRadius` snaps a drop to the nearest strip, so you don't have to
+ * land exactly on the border.
  *
- * `isConnectableStart` and `isConnectableEnd` are both true so the same
- * element can initiate and accept connections.
+ * One handle per side (not a source/target pair) keeps the DOM — and the
+ * z-stacking of the strips that poke a few px outside the node — simple, which
+ * is what makes connections start reliably from EVERY node, including ones
+ * added after the graph first laid out.
  */
-const EDGE_HANDLE_BASE_STYLE = {
+const EDGE_HANDLE_STYLE = {
   background: "transparent",
   border: "none",
   borderRadius: 0,
@@ -130,43 +171,28 @@ const EDGE_HANDLE_BASE_STYLE = {
   transform: "none",
   pointerEvents: "all", // override RF's default `none` so the perimeter is grabbable
 };
-const EDGE_HANDLE_CLASS = "shader-handle shader-handle-edge connectionindicator";
+const EDGE_HANDLE_SIDES = [
+  ["l", Position.Left, { width: 12, height: "100%", top: 0, left: -6 }],
+  ["r", Position.Right, { width: 12, height: "100%", top: 0, right: -6 }],
+  ["t", Position.Top, { width: "100%", height: 12, top: -6, left: 0 }],
+  ["b", Position.Bottom, { width: "100%", height: 12, bottom: -6, left: 0 }],
+];
 
 function EdgeHandles() {
   return (
     <>
-      {/* Target handles are rendered first so the source handles are on top
-       * in document order — that way pointerdown on the perimeter always
-       * hits the source handle and starts a connection. The target handle
-       * is still in the DOM and is found by `elementFromPoint` when the user
-       * drops the line on this side of another node. */}
-      <Handle type="target" position={Position.Left} id="l" className={EDGE_HANDLE_CLASS}
-        style={{ ...EDGE_HANDLE_BASE_STYLE, width: 12, height: "100%", top: 0, left: -6 }}
-        isConnectableStart={false} isConnectableEnd />
-      <Handle type="source" position={Position.Left} id="l" className={EDGE_HANDLE_CLASS}
-        style={{ ...EDGE_HANDLE_BASE_STYLE, width: 12, height: "100%", top: 0, left: -6 }}
-        isConnectableStart isConnectableEnd />
-
-      <Handle type="target" position={Position.Right} id="r" className={EDGE_HANDLE_CLASS}
-        style={{ ...EDGE_HANDLE_BASE_STYLE, width: 12, height: "100%", top: 0, right: -6 }}
-        isConnectableStart={false} isConnectableEnd />
-      <Handle type="source" position={Position.Right} id="r" className={EDGE_HANDLE_CLASS}
-        style={{ ...EDGE_HANDLE_BASE_STYLE, width: 12, height: "100%", top: 0, right: -6 }}
-        isConnectableStart isConnectableEnd />
-
-      <Handle type="target" position={Position.Top} id="t" className={EDGE_HANDLE_CLASS}
-        style={{ ...EDGE_HANDLE_BASE_STYLE, width: "100%", height: 12, top: -6 }}
-        isConnectableStart={false} isConnectableEnd />
-      <Handle type="source" position={Position.Top} id="t" className={EDGE_HANDLE_CLASS}
-        style={{ ...EDGE_HANDLE_BASE_STYLE, width: "100%", height: 12, top: -6 }}
-        isConnectableStart isConnectableEnd />
-
-      <Handle type="target" position={Position.Bottom} id="b" className={EDGE_HANDLE_CLASS}
-        style={{ ...EDGE_HANDLE_BASE_STYLE, width: "100%", height: 12, bottom: -6 }}
-        isConnectableStart={false} isConnectableEnd />
-      <Handle type="source" position={Position.Bottom} id="b" className={EDGE_HANDLE_CLASS}
-        style={{ ...EDGE_HANDLE_BASE_STYLE, width: "100%", height: 12, bottom: -6 }}
-        isConnectableStart isConnectableEnd />
+      {EDGE_HANDLE_SIDES.map(([id, position, style]) => (
+        <Handle
+          key={id}
+          id={id}
+          type="source"
+          position={position}
+          className="anim-edge-handle"
+          isConnectableStart
+          isConnectableEnd
+          style={{ ...EDGE_HANDLE_STYLE, ...style }}
+        />
+      ))}
     </>
   );
 }
@@ -178,7 +204,6 @@ function StateNode({ data, selected }) {
       <div className="shader-node-header">
         <span className="shader-node-dot" />
         <span className="shader-node-label">{data.state.name}</span>
-        {data.entry && <span className="animator-entry-badge">entry</span>}
       </div>
       <div className="shader-node-body">
         <div className="shader-node-row">
@@ -201,72 +226,118 @@ function AnyStateNode({ selected }) {
   );
 }
 
-const nodeTypes = { animState: StateNode, anyState: AnyStateNode };
-
-/** Clamp a flow-space point so it sits on the perimeter of a node's bounding
- *  box (with a small `pad` so the arrowhead lands a few pixels outside the
- *  node border, never buried underneath it). Returns the input point
- *  unchanged when no box is supplied. */
-function clampToBoxPerimeter(point, box, pad = 4) {
-  if (!box) return point;
-  const { x, y } = point;
-  const minX = box.x - pad;
-  const maxX = box.x + box.width + pad;
-  const minY = box.y - pad;
-  const maxY = box.y + box.height + pad;
-  const cx = Math.min(Math.max(x, minX), maxX);
-  const cy = Math.min(Math.max(y, minY), maxY);
-  return { x: cx, y: cy };
+/** Start pseudo-state. Unity-style entrance to the graph — the first wire
+ *  dragged out of this node points at the state the animation begins in. */
+function StartStateNode({ data, selected }) {
+  const wired = !!data?.hasWires;
+  return (
+    <div className={`shader-node cat-start ${selected ? "selected" : ""}`}>
+      <EdgeHandles />
+      <div className="shader-node-header">
+        <span className="shader-node-dot" />
+        <span className="shader-node-label">Start</span>
+      </div>
+      {!wired && <div className="shader-node-body start-hint">drag → entry</div>}
+    </div>
+  );
 }
 
+const nodeTypes = { animState: StateNode, anyState: AnyStateNode, startState: StartStateNode };
+
 // ---------------------------------------------------------------------------
-// custom straight edge (PlayCanvas-style: a plain line + arrowhead, no curves)
+// floating straight edge (PlayCanvas/Unity-style). Each endpoint is anchored to
+// a specific point on its node's border — the exact spot the user grabbed /
+// dropped — stored as a NORMALISED position (nx, ny ∈ [0,1] of the node box) so
+// it stays glued to that border spot while the node is dragged or resized. Two
+// transitions between the same pair (A→B and B→A) therefore leave from and
+// arrive at different points and never overlap. Edges without a stored anchor
+// (e.g. added programmatically) fall back to a centre-line border intersection.
 // ---------------------------------------------------------------------------
 
-function StraightEdge({
-  id, source, target, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition,
-  selected, markerEnd, label, data,
-}) {
-  // RF doesn't pass the source/target node directly — we look them up in
-  // the store by id so we can clamp the target endpoint to the target
-  // node's bounding box and keep the arrowhead visible above the node.
-  const nodes = useStore((s) => s.nodeLookup);
-  const sourceNode = nodes?.get?.(source);
-  const targetNode = nodes?.get?.(target);
+function nodeGeom(node) {
+  const p = node.internals?.positionAbsolute ?? node.position;
+  const w = node.measured?.width;
+  const h = node.measured?.height;
+  if (!p || !w || !h) return null;
+  return { x: p.x, y: p.y, w, h };
+}
 
-  // New connections carry the exact flow-space points the user grabbed and
-  // released on. Falling back to the standard handle-derived coords keeps
-  // existing edges (saved before this change) rendering correctly.
-  const sp = data?.sourcePoint;
-  const tp = data?.targetPoint;
-  const sx = sp?.x ?? sourceX;
-  const sy = sp?.y ?? sourceY;
-  let tx = tp?.x ?? targetX;
-  let ty = tp?.y ?? targetY;
-  // Clamp the target endpoint to the target node's bounding box so the
-  // arrowhead sits just outside the node's perimeter, not buried underneath
-  // it. The source point is left as-is so the line "leaves" the source from
-  // the exact spot the user grabbed.
-  if (targetNode && tp) {
-    const pos = targetNode.internals?.positionAbsolute ?? targetNode.position;
-    const m = targetNode.measured;
-    if (pos && m?.width != null && m?.height != null) {
-      const c = clampToBoxPerimeter(tp, { x: pos.x, y: pos.y, width: m.width, height: m.height }, 6);
-      tx = c.x;
-      ty = c.y;
-    }
-  }
-  const [edgePath] = getStraightPath({ sourceX: sx, sourceY: sy, targetX: tx, targetY: ty });
+/** Absolute flow point for a normalised border anchor on `node`. */
+function anchorPoint(node, anchor) {
+  const g = nodeGeom(node);
+  if (!g) return null;
+  return { x: g.x + anchor.nx * g.w, y: g.y + anchor.ny * g.h };
+}
+
+/** Convert a flow-space point to a normalised anchor snapped onto the nearest
+ *  border edge of `node`. Used when a transition is first drawn. */
+function toBorderAnchor(point, node) {
+  const g = nodeGeom(node);
+  if (!g) return null;
+  let nx = Math.min(Math.max((point.x - g.x) / g.w, 0), 1);
+  let ny = Math.min(Math.max((point.y - g.y) / g.h, 0), 1);
+  // Snap to whichever of the four edges is closest so the anchor sits ON the
+  // border, not floating inside the box.
+  const d = { l: nx, r: 1 - nx, t: ny, b: 1 - ny };
+  const nearest = Object.keys(d).reduce((a, k) => (d[k] < d[a] ? k : a), "l");
+  if (nearest === "l") nx = 0;
+  else if (nearest === "r") nx = 1;
+  else if (nearest === "t") ny = 0;
+  else ny = 1;
+  return { nx, ny };
+}
+
+/** The point on `node`'s border that lies on the straight line toward
+ *  `other`'s centre. Standard React Flow floating-edge intersection math —
+ *  the fallback for edges that carry no explicit anchor. */
+function borderPoint(node, other) {
+  const g = nodeGeom(node);
+  const og = nodeGeom(other);
+  if (!g || !og) return null;
+  const hw = g.w / 2;
+  const hh = g.h / 2;
+  const cx = g.x + hw;
+  const cy = g.y + hh;
+  const ox = og.x + og.w / 2;
+  const oy = og.y + og.h / 2;
+  const dx = (ox - cx) / (2 * hw) - (oy - cy) / (2 * hh);
+  const dy = (ox - cx) / (2 * hw) + (oy - cy) / (2 * hh);
+  const scale = 1 / (Math.abs(dx) + Math.abs(dy) || 1);
+  const ux = scale * dx;
+  const uy = scale * dy;
+  return { x: hw * (ux + uy) + cx, y: hh * (-ux + uy) + cy };
+}
+
+function FloatingEdge({ id, source, target, markerEnd, selected, label, data }) {
+  const nodeLookup = useStore((s) => s.nodeLookup);
+  const s = nodeLookup?.get?.(source);
+  const t = nodeLookup?.get?.(target);
+  if (!s || !t) return null;
+  const sp = (data?.sourceAnchor && anchorPoint(s, data.sourceAnchor)) || borderPoint(s, t);
+  const tp = (data?.targetAnchor && anchorPoint(t, data.targetAnchor)) || borderPoint(t, s);
+  if (!sp || !tp) return null;
+  const [edgePath, labelX, labelY] = getStraightPath({
+    sourceX: sp.x,
+    sourceY: sp.y,
+    targetX: tp.x,
+    targetY: tp.y,
+  });
   return (
     <>
-      <BaseEdge id={id} path={edgePath} markerEnd={markerEnd} style={{ strokeWidth: selected ? 2 : 1.5 }} />
+      <BaseEdge
+        id={id}
+        path={edgePath}
+        markerEnd={markerEnd}
+        interactionWidth={22}
+        style={{ strokeWidth: selected ? 2.5 : 1.5 }}
+      />
       {label && (
         <EdgeLabelRenderer>
           <div
             className={`nodrag nopan animator-edge-label${selected ? " selected" : ""}`}
             style={{
               position: "absolute",
-              transform: `translate(-50%, -50%) translate(${(sx + tx) / 2}px, ${(sy + ty) / 2}px)`,
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
               pointerEvents: "all",
             }}
           >
@@ -278,29 +349,15 @@ function StraightEdge({
   );
 }
 
-const edgeTypes = { default: StraightEdge };
+const edgeTypes = { default: FloatingEdge };
 
-/** Module-scoped ref shared between <ReactFlow>'s onConnect handlers and
- *  the custom <StraightConnectionLine>. Holds the exact flow-space points
- *  the user grabbed and is currently hovering. The connection line reads
- *  these so the live wire starts at the cursor's initial press position
- *  (not the edge midpoint). */
-const dragPointRef = { startPoint: null, endPoint: null };
-
-/** Live wire while dragging. We prefer the exact start/end points captured
- *  during the drag (dragPointRef) over the edge-midpoint `from/to` that
- *  RF passes in props. This makes the wire match what gets saved to the
- *  edge, and it spreads multiple transitions between the same nodes. */
+/** Live straight wire drawn while dragging a new transition out of a node. */
 function StraightConnectionLine({ fromX, fromY, toX, toY }) {
-  const sx = dragPointRef.startPoint?.x ?? fromX;
-  const sy = dragPointRef.startPoint?.y ?? fromY;
-  const tx = dragPointRef.endPoint?.x ?? toX;
-  const ty = dragPointRef.endPoint?.y ?? toY;
   return (
     <path
-      d={`M ${sx},${sy} L ${tx},${ty}`}
+      d={`M ${fromX},${fromY} L ${toX},${toY}`}
       fill="none"
-      stroke="#4d9dff"
+      stroke="var(--accent, #4d9dff)"
       strokeWidth={2}
     />
   );
@@ -458,7 +515,7 @@ function ParamAddButton({ onPick }) {
       {open && (
         <>
           <div className="dropdown-overlay" onClick={() => setOpen(false)} />
-          <div className="dropdown-menu">
+          <div className="dropdown-menu align-right">
             {PARAM_TYPES.map((t) => (
               <button
                 key={t}
@@ -478,7 +535,7 @@ function ParamAddButton({ onPick }) {
   );
 }
 
-function StateSection({ node, clipNames, isEntry, onPatch, onSetEntry, onPreview }) {
+function StateSection({ node, clipNames, onPatch, onPreview }) {
   const state = node.data.state;
   return (
     <div className="inspector-section">
@@ -530,11 +587,6 @@ function StateSection({ node, clipNames, isEntry, onPatch, onSetEntry, onPreview
         <span className="field-label">Loop</span>
         <input type="checkbox" checked={state.loop !== false} onChange={(e) => onPatch({ loop: e.target.checked })} />
       </div>
-      {!isEntry && (
-        <button className="toolbar-btn wide" onClick={onSetEntry}>
-          Set as Entry
-        </button>
-      )}
       <button className="toolbar-btn wide" onClick={onPreview}>
         <Play size={12} />
         Preview
@@ -546,6 +598,7 @@ function StateSection({ node, clipNames, isEntry, onPatch, onSetEntry, onPreview
 function TransitionSection({ edge, parameters, stateNames, onPatch }) {
   const data = edge.data ?? {};
   const conditions = data.conditions ?? [];
+  const isStart = data.kind === "start";
 
   const patchCondition = (index, patch) =>
     onPatch({ conditions: conditions.map((c, i) => (i === index ? { ...c, ...patch } : c)) });
@@ -605,6 +658,11 @@ function TransitionSection({ edge, parameters, stateNames, onPatch }) {
             <option value="false">false</option>
           </select>
         )}
+        {type === "trigger" && (
+          <span className="animator-trigger-hint" title="Fires this transition when the trigger is set from a script (setTrigger). Auto-consumed.">
+            when fired
+          </span>
+        )}
         <button
           className="icon-btn"
           title="Remove condition"
@@ -638,37 +696,45 @@ function TransitionSection({ edge, parameters, stateNames, onPatch }) {
         </button>
       </div>
       <div className="animator-transition-label">
-        {stateNames[edge.source] ?? "Any State"} → {stateNames[edge.target] ?? "?"}
+        {stateNames[edge.source] ?? (isStart ? "Start" : "Any State")} → {stateNames[edge.target] ?? "?"}
       </div>
-      {conditions.length === 0 && <div className="asset-hint">No conditions — fires at exit time</div>}
+      {conditions.length === 0 && (
+        <div className="asset-hint">
+          {isStart ? "No conditions — this is the default entry" : "No conditions — fires at exit time"}
+        </div>
+      )}
       {conditions.map(conditionRow)}
-      <div className="field-row">
-        <span className="field-label">Blend (s)</span>
-        <input
-          className="number-field"
-          type="number"
-          step={0.05}
-          min={0}
-          value={data.duration ?? 0.25}
-          onChange={(e) => onPatch({ duration: Math.max(0, parseFloat(e.target.value) || 0) })}
-        />
-      </div>
-      <div className="field-row">
-        <span className="field-label">Exit time</span>
-        <input
-          className="number-field"
-          type="number"
-          step={0.05}
-          min={0}
-          max={1}
-          placeholder="—"
-          value={data.exitTime ?? ""}
-          onChange={(e) => {
-            const v = e.target.value === "" ? null : Math.min(1, Math.max(0, parseFloat(e.target.value) || 0));
-            onPatch({ exitTime: v });
-          }}
-        />
-      </div>
+      {!isStart && (
+        <>
+          <div className="field-row">
+            <span className="field-label">Blend (s)</span>
+            <input
+              className="number-field"
+              type="number"
+              step={0.05}
+              min={0}
+              value={data.duration ?? 0.25}
+              onChange={(e) => onPatch({ duration: Math.max(0, parseFloat(e.target.value) || 0) })}
+            />
+          </div>
+          <div className="field-row">
+            <span className="field-label">Exit time</span>
+            <input
+              className="number-field"
+              type="number"
+              step={0.05}
+              min={0}
+              max={1}
+              placeholder="—"
+              value={data.exitTime ?? ""}
+              onChange={(e) => {
+                const v = e.target.value === "" ? null : Math.min(1, Math.max(0, parseFloat(e.target.value) || 0));
+                onPatch({ exitTime: v });
+              }}
+            />
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -713,9 +779,9 @@ function AnimatorEditor({ animPath }) {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [parameters, setParameters] = useState([]);
-  const [entry, setEntry] = useState(null);
   const [dirty, setDirty] = useState(false);
-  const { screenToFlowPosition } = useReactFlow();
+  const { screenToFlowPosition, getInternalNode } = useReactFlow();
+  const updateNodeInternals = useUpdateNodeInternals();
   const [canvasMenu, setCanvasMenu] = useState(null);
   const [pickedEntityId, setPickedEntityId] = useState(null);
   const [autosave, setAutosave] = useState(() => {
@@ -751,7 +817,6 @@ function AnimatorEditor({ animPath }) {
       setNodes(flow.nodes);
       setEdges(flow.edges);
       setParameters(graph.parameters ?? []);
-      setEntry(graph.entry ?? null);
       setDirty(false);
     })();
     return () => (live = false);
@@ -766,6 +831,26 @@ function AnimatorEditor({ animPath }) {
 
   const selectedNode = nodes.find((n) => n.selected && n.type === "animState");
   const selectedEdge = !selectedNode && edges.find((e) => e.selected);
+
+  // React Flow measures a node's handle bounds when it first mounts. Our state
+  // nodes use full-edge handles sized at height/width 100%, and a node added
+  // dynamically after the graph is already laid out doesn't get those
+  // percentage-sized strips re-measured — so you can't start a transition from
+  // it (only the states present at load work). Re-register each newly-seen
+  // node's internals once it has mounted AND been measured (defer a frame so
+  // `measured` width/height exist before RF recomputes handle bounds).
+  const seenNodeIds = useRef(new Set());
+  useEffect(() => {
+    const fresh = [];
+    for (const n of nodes) {
+      if (seenNodeIds.current.has(n.id)) continue;
+      seenNodeIds.current.add(n.id);
+      fresh.push(n.id);
+    }
+    if (!fresh.length) return;
+    const raf = requestAnimationFrame(() => fresh.forEach((id) => updateNodeInternals(id)));
+    return () => cancelAnimationFrame(raf);
+  }, [nodes, updateNodeInternals]);
 
   // Re-scan the scene every frame so the param-values playground tracks adds
   // and removes of Animation components referencing this controller.
@@ -832,18 +917,26 @@ function AnimatorEditor({ animPath }) {
     [boundComponents],
   );
 
-  // Entry badge + condition labels are derived — refresh node/edge data.
-  const decoratedNodes = useMemo(
-    () => nodes.map((n) => (n.type === "animState" ? { ...n, data: { ...n.data, entry: n.id === entry } } : n)),
-    [nodes, entry],
-  );
+  // Refresh derived node/edge data on every change.
+  const decoratedNodes = useMemo(() => {
+    const startHasWires = edges.some((e) => e.source === START_STATE);
+    return nodes.map((n) =>
+      n.id === START_STATE ? { ...n, data: { ...n.data, hasWires: startHasWires } } : n,
+    );
+  }, [nodes, edges]);
   const decoratedEdges = useMemo(
     () =>
       edges.map((e) => ({
         ...e,
         type: "default",
         animated: e.source === ANY_STATE,
-        label: conditionSummary(e.data ?? {}, paramTypes),
+        // Only surface the condition summary while the transition is selected —
+        // keeps the graph uncluttered when nothing is being edited.
+        label: e.selected
+          ? e.data?.kind === "start"
+            ? "entry"
+            : conditionSummary(e.data ?? {}, paramTypes)
+          : undefined,
         markerEnd: { type: "arrowclosed" },
       })),
     [edges, paramTypes],
@@ -855,7 +948,12 @@ function AnimatorEditor({ animPath }) {
     let i = 1;
     while (nodes.some((n) => n.data?.state?.name === `State ${i}`)) i++;
     const id = uid("state");
-    const position = screenPos ? screenToFlowPosition(screenPos) : { x: 220, y: 120 + Math.random() * 120 };
+    // Toolbar-added states cascade instead of stacking on the same spot, so
+    // their borders stay individually grabbable for drawing transitions.
+    const stateCount = nodes.filter((n) => n.type === "animState").length;
+    const position = screenPos
+      ? screenToFlowPosition(screenPos)
+      : { x: 220 + (stateCount % 3) * 60, y: 120 + (stateCount % 4) * 70 };
     setNodes((nds) => [
       ...nds,
       {
@@ -865,7 +963,6 @@ function AnimatorEditor({ animPath }) {
         data: { state: { id, name: `State ${i}`, clip: clipNames[0] ?? "", speed: 1, loop: true } },
       },
     ]);
-    setEntry((cur) => cur ?? id);
   };
 
   const patchState = (nodeId, patch) => {
@@ -880,25 +977,17 @@ function AnimatorEditor({ animPath }) {
     setEdges((eds) => eds.map((e) => (e.id === edgeId ? { ...e, data: { ...e.data, ...patch } } : e)));
   };
 
-  /** Live cursor position in flow coordinates during a connection drag.
-   *  Captured at the start (initial press) and updated on every pointer move
-   *  so `onConnect` knows the exact points on the source/target edges the
-   *  user grabbed and released on — the saved edge is then drawn between
-   *  those two points, not between the edge midpoints. Multiple transitions
-   *  between the same pair of nodes no longer overlap. Mirrors the
-   *  module-scoped `dragPointRef` that the <StraightConnectionLine> reads
-   *  for the live wire. */
-  const dragRef = useRef({ startPoint: null, endPoint: null });
+  // Grab/drop points (flow space) captured during a connection drag, used to
+  // anchor the new edge to the exact border spots. Component-scoped (not
+  // module-scoped) so React Fast Refresh can't leave a stale reference behind.
+  const dragPointRef = useRef({ start: null, end: null });
 
-  // Window-level pointer tracking while a connection is in progress. React
-  // Flow's `onConnect` doesn't include the cursor position, so we listen
-  // for pointer events on the canvas to keep the drag ref current.
+  // Keep the live drop point current while a connection is being dragged
+  // (React Flow's onConnect doesn't include the cursor position).
   useEffect(() => {
     const onMove = (e) => {
-      if (!dragPointRef.startPoint) return;
-      const pt = screenToFlowPosition({ x: e.clientX, y: e.clientY });
-      dragPointRef.endPoint = pt;
-      dragRef.current.endPoint = pt;
+      if (!dragPointRef.current.start) return;
+      dragPointRef.current.end = screenToFlowPosition({ x: e.clientX, y: e.clientY });
     };
     window.addEventListener("pointermove", onMove);
     return () => window.removeEventListener("pointermove", onMove);
@@ -906,41 +995,49 @@ function AnimatorEditor({ animPath }) {
 
   const onConnect = useCallback(
     (connection) => {
-      if (connection.source === connection.target) {
-        dragRef.current = { startPoint: null, endPoint: null };
-        dragPointRef.startPoint = null;
-        dragPointRef.endPoint = null;
-        return;
-      }
+      if (connection.source === connection.target) return; // self-loops make no sense here
       setDirty(true);
-      const data = { conditions: [], duration: 0.25, exitTime: null };
-      // Store the actual flow-space start/end points so the saved edge
-      // doesn't snap to edge midpoints.
-      if (dragRef.current.startPoint) data.sourcePoint = dragRef.current.startPoint;
-      if (dragRef.current.endPoint) data.targetPoint = dragRef.current.endPoint;
+      const isStart = connection.source === START_STATE;
+      const data = isStart
+        ? { conditions: [], kind: "start" }
+        : { conditions: [], duration: 0.25, exitTime: null, kind: "state" };
+      // Anchor the endpoints to the exact border points the user grabbed and
+      // dropped, stored normalised so they follow the nodes. Falls back to a
+      // floating centre-line endpoint if a point couldn't be captured.
+      const { start, end } = dragPointRef.current;
+      const srcNode = getInternalNode(connection.source);
+      const tgtNode = getInternalNode(connection.target);
+      const sa = start && srcNode && toBorderAnchor(start, srcNode);
+      const ta = end && tgtNode && toBorderAnchor(end, tgtNode);
+      if (sa) data.sourceAnchor = sa;
+      if (ta) data.targetAnchor = ta;
       setEdges((eds) =>
         addEdge(
-          { ...connection, id: uid("t"), data },
+          { ...connection, id: isStart ? uid("st") : uid("t"), data },
           eds.filter((e) => !(e.source === connection.source && e.target === connection.target)),
         ),
       );
-      dragRef.current = { startPoint: null, endPoint: null };
-      dragPointRef.startPoint = null;
-      dragPointRef.endPoint = null;
     },
-    [setEdges],
+    [setEdges, getInternalNode],
   );
 
   const guardedNodesChange = useCallback(
     (changes) => {
-      const guarded = changes.filter((c) => !(c.type === "remove" && c.id === ANY_STATE));
-      if (guarded.some((c) => c.type !== "select" && c.type !== "dimensions")) setDirty(true);
-      onNodesChange(guarded);
+      const guarded = changes.filter(
+        (c) => !(c.type === "remove" && (c.id === ANY_STATE || c.id === START_STATE)),
+      );
+      // The Start node is a fixed-position anchor: never let the user drag it.
+      const startLocked = guarded.map((c) => {
+        if (c.type === "position" && c.id === START_STATE) return { ...c, position: undefined };
+        return c;
+      });
+      if (startLocked.some((c) => c.type !== "select" && c.type !== "dimensions")) setDirty(true);
+      onNodesChange(startLocked);
     },
     [onNodesChange],
   );
 
-  const buildGraph = () => flowToGraph(nodes, edges, parameters, entry);
+  const buildGraph = () => flowToGraph(nodes, edges, parameters);
 
   const save = async () => {
     const graph = buildGraph();
@@ -961,7 +1058,7 @@ function AnimatorEditor({ animPath }) {
     if (!dirty) return;
     const id = setTimeout(save, 150);
     return () => clearTimeout(id);
-  }, [autosave, nodes, edges, parameters, entry, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [autosave, nodes, edges, parameters, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const preview = (stateName) => {
     const bound = componentsUsing(animPath);
@@ -1016,12 +1113,7 @@ function AnimatorEditor({ animPath }) {
             <StateSection
               node={selectedNode}
               clipNames={clipNames}
-              isEntry={selectedNode.id === entry}
               onPatch={(patch) => patchState(selectedNode.id, patch)}
-              onSetEntry={() => {
-                setEntry(selectedNode.id);
-                setDirty(true);
-              }}
               onPreview={() => preview(selectedNode.data.state.name)}
             />
           )}
@@ -1045,37 +1137,25 @@ function AnimatorEditor({ animPath }) {
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
             connectionLineComponent={StraightConnectionLine}
-            connectionRadius={36}
+            connectionRadius={40}
             onNodesChange={guardedNodesChange}
             onEdgesChange={(changes) => {
               if (changes.some((c) => c.type === "remove")) setDirty(true);
               onEdgesChange(changes);
             }}
             onConnect={onConnect}
-            onConnectStart={(_event, _params) => {
-              const ev = _event;
-              if (ev && ev.clientX != null) {
-                const pt = screenToFlowPosition({ x: ev.clientX, y: ev.clientY });
-                dragRef.current.startPoint = pt;
-                dragRef.current.endPoint = pt;
-                dragPointRef.startPoint = pt;
-                dragPointRef.endPoint = pt;
-              } else {
-                dragRef.current = { startPoint: null, endPoint: null };
-                dragPointRef.startPoint = null;
-                dragPointRef.endPoint = null;
-              }
+            onConnectStart={(event) => {
+              const pt =
+                event && event.clientX != null
+                  ? screenToFlowPosition({ x: event.clientX, y: event.clientY })
+                  : null;
+              dragPointRef.current.start = pt;
+              dragPointRef.current.end = pt;
             }}
             onConnectEnd={() => {
-              // Clean up the drag ref on the next tick so `onConnect` (which
-              // fires synchronously here) still sees the final `endPoint`.
-              setTimeout(() => {
-                if (!dragRef.current.startPoint) {
-                  dragRef.current = { startPoint: null, endPoint: null };
-                  dragPointRef.startPoint = null;
-                  dragPointRef.endPoint = null;
-                }
-              }, 0);
+              // onConnect (if the drop was valid) has already read the points.
+              dragPointRef.current.start = null;
+              dragPointRef.current.end = null;
             }}
             onEdgeDoubleClick={(_event, edge) => {
               // Double-click a transition to remove it.
