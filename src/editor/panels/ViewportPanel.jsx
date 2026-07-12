@@ -19,8 +19,18 @@ import { toggle as togglePlay } from "../playMode.js";
 import { useAssetDrop } from "../assetDrag.js";
 import { instantiatePrefab } from "../prefab.js";
 import { getProjectSettings, onProjectSettingsApplied, applyProjectSettings } from "../projectSettings.js";
-import { getTerrainBrushMode, getTerrainBrushSettings, subscribeTerrainBrush } from "../terrainBrush.js";
-import { SetTerrainHeightsCommand, SetTerrainSplatmapCommand } from "../commands/terrainCommands.js";
+import {
+  finishTerrainBrushAdjustment,
+  dispatchTerrainKeyAction,
+  getTerrainBrushAdjustment,
+  getTerrainBrushMode,
+  getTerrainBrushSettings,
+  setTerrainBrushSetting,
+  subscribeTerrainBrush,
+} from "../terrainBrush.js";
+import { SetTerrainHeightsCommand, SetTerrainScatterCommand, SetTerrainSplatmapCommand } from "../commands/terrainCommands.js";
+import { GeometryEditorPanel } from "./GeometryEditorPanel.jsx";
+import { useGeometryEditStore } from "../store/geometryEditStore.js";
 
 /** Sets `layers.set(EDITOR_LAYER)` on every Object3D in the subtree —
  *  layers in three.js are not inherited, so this has to walk explicitly. */
@@ -139,6 +149,19 @@ async function ensureViewport() {
         // Sets visibility to the user's current preference; new colliders
         // added since the last tick get their `visible` corrected here.
         setCollidersVisible(viewport.layers.colliders);
+
+        // Some operations rebuild an entity's Object3D while keeping its id —
+        // prefab respawns (apply / revert / a prefab asset changing) destroy
+        // the subtree and re-expand it. `attachSelection` only re-runs on a
+        // *selection* change, so the gizmo would still be holding the destroyed
+        // object ("TransformControls: The attached 3D object must be a part of
+        // the scene graph"). Re-attach when the object under the selection has
+        // been swapped out.
+        const selectedId = useSelectionStore.getState().ids[0] ?? null;
+        const selected = selectedId ? engine.getEntity(selectedId) : null;
+        if (selected && viewport.gizmo.object && viewport.gizmo.object !== selected.object3D) {
+          attachSelection(selectedId);
+        }
       });
 
       engine.onUpdate(() => {
@@ -836,6 +859,7 @@ function setupPicking(canvas) {
 }
 
 const BRUSH_INDICATOR_SEGMENTS = 64;
+const BRUSH_PREVIEW_RINGS = 6;
 const SCULPT_TOOL_COLORS = {
   raise: 0x4caf50,
   lower: 0xff5252,
@@ -846,6 +870,8 @@ const SCULPT_TOOL_COLORS = {
   noise: 0x26c6da,
 };
 const PAINT_COLOR = 0xffca28;
+const ERASE_COLOR = 0xff5252;
+const SCATTER_COLOR = 0x80ff72;
 
 /**
  * Lazily builds the terrain brush cursor: a translucent filled disc plus a
@@ -857,11 +883,19 @@ function ensureBrushIndicator() {
   if (viewport.terrainBrushIndicator) return viewport.terrainBrushIndicator;
   const N = BRUSH_INDICATOR_SEGMENTS;
 
-  // Fill: a triangle fan — center vertex + N rim vertices.
+  // Concentric rings let the fill show the predicted post-stroke surface.
   const fillGeo = new THREE.BufferGeometry();
-  fillGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array((N + 1) * 3), 3));
+  fillGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array((1 + BRUSH_PREVIEW_RINGS * N) * 3), 3));
   const fillIndex = [];
   for (let i = 0; i < N; i++) fillIndex.push(0, 1 + i, 1 + ((i + 1) % N));
+  for (let ring = 1; ring < BRUSH_PREVIEW_RINGS; ring++) {
+    const inner = 1 + (ring - 1) * N;
+    const outer = 1 + ring * N;
+    for (let i = 0; i < N; i++) {
+      const next = (i + 1) % N;
+      fillIndex.push(inner + i, outer + i, outer + next, inner + i, outer + next, inner + next);
+    }
+  }
   fillGeo.setIndex(fillIndex);
   const fill = new THREE.Mesh(
     fillGeo,
@@ -871,63 +905,296 @@ function ensureBrushIndicator() {
     }),
   );
 
-  // Rim: a line loop over the N rim vertices.
+  // Rim: an explicitly closed line. WebGPURenderer does not support
+  // THREE.LineLoop, so vertex N duplicates vertex 0.
   const rimGeo = new THREE.BufferGeometry();
-  rimGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(N * 3), 3));
-  const rim = new THREE.LineLoop(
+  rimGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array((N + 1) * 3), 3));
+  const rim = new THREE.Line(
     rimGeo,
     new THREE.LineBasicMaterial({ color: PAINT_COLOR, transparent: true, opacity: 0.95, depthTest: false }),
   );
 
+  // Core: a second line loop at the falloff's half-strength radius, so the
+  // gap between the two rings reads the brush hardness (soft = wide gap,
+  // hard = tight inner ring hugging the rim) — the Unity/Unreal brush cursor.
+  const coreGeo = new THREE.BufferGeometry();
+  coreGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array((N + 1) * 3), 3));
+  const core = new THREE.Line(
+    coreGeo,
+    new THREE.LineBasicMaterial({ color: PAINT_COLOR, transparent: true, opacity: 0.6, depthTest: false }),
+  );
+
+  // Predicted contour rings and current→predicted displacement ticks make
+  // small sculpt deltas legible even when the translucent surface nearly
+  // overlaps the terrain.
+  const outcomeGeo = new THREE.BufferGeometry();
+  outcomeGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(BRUSH_PREVIEW_RINGS * N * 2 * 3), 3));
+  const outcome = new THREE.LineSegments(
+    outcomeGeo,
+    new THREE.LineBasicMaterial({ color: PAINT_COLOR, transparent: true, opacity: 0.65, depthTest: false }),
+  );
+  const deltaSampleCount = 1 + BRUSH_PREVIEW_RINGS * 8;
+  const deltaGeo = new THREE.BufferGeometry();
+  deltaGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(deltaSampleCount * 2 * 3), 3));
+  const delta = new THREE.LineSegments(
+    deltaGeo,
+    new THREE.LineBasicMaterial({ color: PAINT_COLOR, transparent: true, opacity: 0.95, depthTest: false }),
+  );
+
   const group = new THREE.Group();
-  group.add(fill, rim);
+  const scatter = new THREE.Group();
+  group.add(fill, outcome, delta, rim, core, scatter);
   group.visible = false;
   group.renderOrder = 999;
   group.userData.editorOnly = true;
-  for (const o of [group, fill, rim]) {
+  for (const o of [group, fill, outcome, delta, rim, core, scatter]) {
     o.layers.set(EDITOR_LAYER);
     o.raycast = () => {};
   }
   engine.scene.add(group);
-  viewport.terrainBrushIndicator = { group, fill, rim, fillGeo, rimGeo };
+  viewport.terrainBrushIndicator = {
+    group, fill, outcome, delta, rim, core, scatter,
+    fillGeo, outcomeGeo, deltaGeo, rimGeo, coreGeo, scatterKey: "",
+  };
   return viewport.terrainBrushIndicator;
 }
 
-/** Re-projects the disc + rim onto the current terrain surface at `local`
- *  (entity-local XZ), sampling live heights so it hugs mid-stroke deformation. */
-function updateBrushIndicator(component, local, radius, color) {
+/**
+ * Re-projects the cursor onto the current terrain surface at `local`
+ * (entity-local XZ), sampling live heights so it hugs mid-stroke deformation.
+ *
+ * Two cues read the brush parameters the way Unity/Unreal's do:
+ *   - fill opacity scales with `strength` (0.06 → 0.4) so a stronger brush
+ *     visibly "fills in" more solidly;
+ *   - the inner core ring sits at the falloff's half-strength radius, derived
+ *     from `hardness` (exp = lerp(0.4, 4, hardness), matching applyHeightBrush):
+ *     r½ = radius · (1 − 0.5^(1/exp)). A soft brush pushes the ring inward
+ *     (wide gradient band); a hard brush pulls it out toward the rim.
+ */
+function updateBrushIndicator(component, local, radius, color, strength = 0.5, hardness = 0.5, preview = null) {
   const ind = ensureBrushIndicator();
   const N = BRUSH_INDICATOR_SEGMENTS;
   ind.fill.material.color.setHex(color);
+  ind.outcome.material.color.setHex(color);
+  ind.delta.material.color.setHex(color);
   ind.rim.material.color.setHex(color);
+  ind.core.material.color.setHex(color);
+  ind.fill.material.opacity = THREE.MathUtils.lerp(0.06, 0.4, THREE.MathUtils.clamp(strength, 0, 1));
+  ind.fill.visible = false;
+
+  const exp = THREE.MathUtils.lerp(0.4, 4, THREE.MathUtils.clamp(hardness, 0, 1));
+  const coreRadius = radius * (1 - Math.pow(0.5, 1 / exp));
+
   const fillPos = ind.fillGeo.attributes.position;
   const rimPos = ind.rimGeo.attributes.position;
+  const corePos = ind.coreGeo.attributes.position;
+  const outcomePos = ind.outcomeGeo.attributes.position;
+  const deltaPos = ind.deltaGeo.attributes.position;
   const v = new THREE.Vector3();
+  const previewHeight = (x, z) => preview?.mode === "sculpt"
+    ? component.previewHeightAtLocal(x, z, local, preview)
+    : component.heightAtLocal(x, z);
 
   // Fill center.
-  v.set(local.x, component.heightAtLocal(local.x, local.z) + 0.04, local.z);
+  v.set(local.x, previewHeight(local.x, local.z) + 0.04, local.z);
   component.mesh.localToWorld(v);
   fillPos.setXYZ(0, v.x, v.y, v.z);
 
+  for (let ring = 0; ring < BRUSH_PREVIEW_RINGS; ring++) {
+    const ringRadius = radius * ((ring + 1) / BRUSH_PREVIEW_RINGS);
+    for (let i = 0; i < N; i++) {
+      const angle = (i / N) * Math.PI * 2;
+      const lx = local.x + Math.cos(angle) * ringRadius;
+      const lz = local.z + Math.sin(angle) * ringRadius;
+      v.set(lx, previewHeight(lx, lz) + 0.04, lz);
+      component.mesh.localToWorld(v);
+      fillPos.setXYZ(1 + ring * N + i, v.x, v.y, v.z);
+      if (ring === BRUSH_PREVIEW_RINGS - 1) rimPos.setXYZ(i, v.x, v.y, v.z);
+    }
+  }
+
   for (let i = 0; i < N; i++) {
     const angle = (i / N) * Math.PI * 2;
-    const lx = local.x + Math.cos(angle) * radius;
-    const lz = local.z + Math.sin(angle) * radius;
-    const ly = component.heightAtLocal(lx, lz) + 0.04;
-    v.set(lx, ly, lz);
+    const ca = Math.cos(angle), sa = Math.sin(angle);
+
+    // Core ring — same angle, half-strength radius, hugging the surface.
+    const cx = local.x + ca * coreRadius;
+    const cz = local.z + sa * coreRadius;
+    v.set(cx, previewHeight(cx, cz) + 0.045, cz);
     component.mesh.localToWorld(v);
-    fillPos.setXYZ(i + 1, v.x, v.y, v.z);
-    rimPos.setXYZ(i, v.x, v.y, v.z);
+    corePos.setXYZ(i, v.x, v.y, v.z);
+  }
+  // Close both polylines explicitly for WebGPU.
+  rimPos.setXYZ(N, rimPos.getX(0), rimPos.getY(0), rimPos.getZ(0));
+  corePos.setXYZ(N, corePos.getX(0), corePos.getY(0), corePos.getZ(0));
+
+  const sculpting = preview?.mode === "sculpt";
+  ind.outcome.visible = sculpting;
+  ind.delta.visible = sculpting;
+  if (sculpting) {
+    let outcomeVertex = 0;
+    for (let ring = 0; ring < BRUSH_PREVIEW_RINGS; ring++) {
+      for (let i = 0; i < N; i++) {
+        const a = 1 + ring * N + i;
+        const b = 1 + ring * N + ((i + 1) % N);
+        outcomePos.setXYZ(outcomeVertex++, fillPos.getX(a), fillPos.getY(a) + 0.012, fillPos.getZ(a));
+        outcomePos.setXYZ(outcomeVertex++, fillPos.getX(b), fillPos.getY(b) + 0.012, fillPos.getZ(b));
+      }
+    }
+    let deltaVertex = 0;
+    const writeDelta = (lx, lz, predictedIndex) => {
+      v.set(lx, component.heightAtLocal(lx, lz) + 0.025, lz);
+      component.mesh.localToWorld(v);
+      deltaPos.setXYZ(deltaVertex++, v.x, v.y, v.z);
+      deltaPos.setXYZ(
+        deltaVertex++,
+        fillPos.getX(predictedIndex),
+        fillPos.getY(predictedIndex) + 0.025,
+        fillPos.getZ(predictedIndex),
+      );
+    };
+    writeDelta(local.x, local.z, 0);
+    for (let ring = 0; ring < BRUSH_PREVIEW_RINGS; ring++) {
+      const ringRadius = radius * ((ring + 1) / BRUSH_PREVIEW_RINGS);
+      for (let sample = 0; sample < 8; sample++) {
+        const i = sample * (N / 8);
+        const angle = (i / N) * Math.PI * 2;
+        writeDelta(
+          local.x + Math.cos(angle) * ringRadius,
+          local.z + Math.sin(angle) * ringRadius,
+          1 + ring * N + i,
+        );
+      }
+    }
+    outcomePos.needsUpdate = true;
+    deltaPos.needsUpdate = true;
+    ind.outcomeGeo.computeBoundingSphere();
+    ind.deltaGeo.computeBoundingSphere();
   }
   fillPos.needsUpdate = true;
   rimPos.needsUpdate = true;
+  corePos.needsUpdate = true;
   ind.fillGeo.computeBoundingSphere();
   ind.rimGeo.computeBoundingSphere();
+  ind.coreGeo.computeBoundingSphere();
   ind.group.visible = true;
+}
+
+function updateScatterSilhouette(component, local, settings, erase, seed) {
+  const ind = ensureBrushIndicator();
+  const layerIndex = Math.min(settings.activeScatterLayer, Math.max(0, (component.props.scatterLayers?.length ?? 1) - 1));
+  const sources = component.getScatterPreviewSources(layerIndex);
+  const sourceKey = `${layerIndex}:${sources.map((source) => source.geometry.uuid).join(",")}`;
+  if (ind.scatterKey !== sourceKey) {
+    for (const child of ind.scatter.children) {
+      child.material?.dispose?.();
+      if (child.userData.ownedPreviewGeometry) child.geometry?.dispose?.();
+    }
+    ind.scatter.clear();
+    const previewSources = sources.length ? sources : [{
+      geometry: new THREE.ConeGeometry(0.32, 1, 7).translate(0, 0.5, 0),
+      sourceMatrix: new THREE.Matrix4(),
+      fallback: true,
+    }];
+    for (const source of previewSources) {
+      const material = new THREE.MeshBasicMaterial({
+        color: erase ? ERASE_COLOR : 0x80ff72,
+        transparent: true,
+        opacity: 0.42,
+        side: THREE.DoubleSide,
+        depthTest: false,
+        depthWrite: false,
+      });
+      const mesh = new THREE.InstancedMesh(source.geometry, material, 64);
+      mesh.count = 0;
+      mesh.raycast = () => {};
+      mesh.layers.set(EDITOR_LAYER);
+      mesh.renderOrder = 1000;
+      mesh.userData.previewSource = source;
+      mesh.userData.ownedPreviewGeometry = !!source.fallback;
+      ind.scatter.add(mesh);
+    }
+    ind.scatterKey = sourceKey;
+  }
+  const all = erase
+    ? component.getScatterInstances(layerIndex).filter((item) => {
+        const p = item.position;
+        const effectiveRadius = settings.radius * THREE.MathUtils.lerp(0.25, 1, settings.strength);
+        return p && Math.hypot(p[0] - local.x, p[2] - local.z) <= effectiveRadius;
+      }).slice(0, 64)
+    : component.getScatterPreviewPlacements(local, {
+        layerIndex,
+        radius: settings.radius,
+        strength: settings.strength,
+        spacing: settings.scatterSpacing,
+        jitter: settings.scatterJitter,
+        seed,
+      });
+  // Placement (rotation/scale/offset) is resolved by the component from the
+  // layer's settings — the preview must not compose its own, or it would stop
+  // matching what the brush actually paints the moment those settings change.
+  const placement = new THREE.Matrix4();
+  const localMatrix = new THREE.Matrix4();
+  const worldMatrix = new THREE.Matrix4();
+  component.entity.object3D.updateMatrixWorld(true);
+  for (const mesh of ind.scatter.children) {
+    mesh.material.color.setHex(erase ? ERASE_COLOR : 0x80ff72);
+    mesh.count = Math.min(64, all.length);
+    const source = mesh.userData.previewSource;
+    for (let i = 0; i < mesh.count; i++) {
+      component.scatterPlacementMatrix(layerIndex, all[i], placement, 0.03);
+      localMatrix.multiplyMatrices(placement, source.sourceMatrix);
+      worldMatrix.multiplyMatrices(component.entity.object3D.matrixWorld, localMatrix);
+      mesh.setMatrixAt(i, worldMatrix);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.computeBoundingSphere();
+  }
+  ind.scatter.visible = true;
+}
+
+function hideScatterSilhouette() {
+  if (viewport.terrainBrushIndicator?.scatter) viewport.terrainBrushIndicator.scatter.visible = false;
 }
 
 function hideBrushIndicator() {
   if (viewport.terrainBrushIndicator) viewport.terrainBrushIndicator.group.visible = false;
+}
+
+function ensureBrushAdjustOverlay(canvas) {
+  let overlay = viewport.terrainBrushAdjustOverlay;
+  const host = canvas.parentElement;
+  if (!host) return null;
+  if (overlay?.isConnected && overlay.parentElement === host) return overlay;
+  overlay = document.createElement("div");
+  overlay.className = "terrain-brush-adjust-overlay";
+  overlay.innerHTML = '<div class="terrain-brush-adjust-ring"></div><div class="terrain-brush-adjust-dot"></div><div class="terrain-brush-adjust-label"></div>';
+  host.appendChild(overlay);
+  viewport.terrainBrushAdjustOverlay = overlay;
+  return overlay;
+}
+
+function showBrushAdjustOverlay(canvas, gesture, radiusPx, value) {
+  const overlay = ensureBrushAdjustOverlay(canvas);
+  if (!overlay) return;
+  const hostRect = overlay.parentElement.getBoundingClientRect();
+  const x = gesture.centerX - hostRect.left;
+  const y = gesture.centerY - hostRect.top;
+  const ring = overlay.querySelector(".terrain-brush-adjust-ring");
+  const dot = overlay.querySelector(".terrain-brush-adjust-dot");
+  const label = overlay.querySelector(".terrain-brush-adjust-label");
+  const diameter = Math.max(2, radiusPx * 2);
+  ring.style.cssText = `left:${x - radiusPx}px;top:${y - radiusPx}px;width:${diameter}px;height:${diameter}px`;
+  dot.style.cssText = `left:${x + gesture.virtualX - gesture.centerX}px;top:${y + gesture.virtualY - gesture.centerY}px`;
+  label.style.cssText = `left:${x}px;top:${y - radiusPx - 30}px`;
+  label.textContent = `${gesture.key === "scatterSpacing" ? "Spacing" : "Size"}: ${value.toFixed(2)}`;
+  overlay.classList.add("visible");
+  document.body.classList.add("terrain-brush-radial");
+}
+
+function hideBrushAdjustOverlay() {
+  viewport.terrainBrushAdjustOverlay?.classList.remove("visible");
+  document.body.classList.remove("terrain-brush-radial");
 }
 
 /** The terrain component on the currently-selected entity, or null. */
@@ -956,6 +1223,9 @@ function setupTerrainBrush(canvas) {
   let haveNdc = false;
   let stroke = null; // { component, entityId, before, mode, flattenHeight, seed }
   let strokeSeed = 0;
+  let lastClient = null;
+  let lastBrushTarget = null;
+  let adjustGesture = null;
 
   const setNdc = (e) => {
     const rect = canvas.getBoundingClientRect();
@@ -975,6 +1245,51 @@ function setupTerrainBrush(canvas) {
     return component.mesh.worldToLocal(hits[0].point.clone());
   };
 
+  const makeAdjustGesture = (adjustment) => {
+    const target = lastBrushTarget;
+    const rect = canvas.getBoundingClientRect();
+    let centerX = lastClient?.x ?? rect.left + rect.width / 2;
+    let centerY = lastClient?.y ?? rect.top + rect.height / 2;
+    let radiusPx = 60;
+    if (target) {
+      viewport.camera.updateMatrixWorld();
+      const worldValue = adjustment.key === "scatterSpacing"
+        ? getTerrainBrushSettings().scatterSpacing
+        : getTerrainBrushSettings().radius;
+      const center = new THREE.Vector3(
+        target.local.x,
+        target.component.heightAtLocal(target.local.x, target.local.z),
+        target.local.z,
+      );
+      const edge = new THREE.Vector3(
+        target.local.x + worldValue,
+        target.component.heightAtLocal(target.local.x + worldValue, target.local.z),
+        target.local.z,
+      );
+      target.component.mesh.localToWorld(center);
+      target.component.mesh.localToWorld(edge);
+      center.project(viewport.camera);
+      edge.project(viewport.camera);
+      centerX = rect.left + (center.x * 0.5 + 0.5) * rect.width;
+      centerY = rect.top + (-center.y * 0.5 + 0.5) * rect.height;
+      const edgeX = rect.left + (edge.x * 0.5 + 0.5) * rect.width;
+      const edgeY = rect.top + (-edge.y * 0.5 + 0.5) * rect.height;
+      radiusPx = Math.max(8, Math.hypot(edgeX - centerX, edgeY - centerY));
+    }
+    return {
+      key: adjustment.key,
+      value: adjustment.startValue,
+      startValue: adjustment.startValue,
+      centerX,
+      centerY,
+      startRadiusPx: radiusPx,
+      virtualX: centerX + radiusPx,
+      virtualY: centerY,
+      lastActualX: lastClient?.x ?? centerX,
+      lastActualY: lastClient?.y ?? centerY,
+    };
+  };
+
   const applyBrush = (component, local) => {
     const settings = getTerrainBrushSettings();
     if (stroke.mode === "sculpt") {
@@ -986,12 +1301,23 @@ function setupTerrainBrush(canvas) {
         flattenHeight: stroke.flattenHeight,
         seed: stroke.seed,
       });
-    } else {
+    } else if (stroke.mode === "paint" || stroke.mode === "erase") {
       component.applySplatBrush(local, {
         layerIndex: Math.min(settings.activeLayer, (component.props.layers?.length ?? 1) - 1),
         radius: settings.radius,
         strength: settings.strength,
         hardness: settings.hardness,
+        erase: stroke.mode === "erase",
+      });
+    } else if (stroke.mode === "scatter") {
+      component.applyScatterBrush(local, {
+        layerIndex: Math.min(settings.activeScatterLayer, Math.max(0, (component.props.scatterLayers?.length ?? 1) - 1)),
+        radius: settings.radius,
+        strength: settings.strength,
+        spacing: settings.scatterSpacing,
+        jitter: settings.scatterJitter,
+        erase: stroke.erase,
+        seed: stroke.seed + stroke.dab++,
       });
     }
   };
@@ -1003,12 +1329,23 @@ function setupTerrainBrush(canvas) {
   });
 
   canvas.addEventListener("pointerdown", (e) => {
+    if (getTerrainBrushAdjustment()) {
+      if (e.button === 0 || e.button === 2) {
+        finishTerrainBrushAdjustment(e.button === 2);
+        adjustGesture = null;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+      return;
+    }
     if (e.button !== 0 || !getTerrainBrushMode() || engine.playing) return;
     const sel = selectedTerrain();
     if (!sel) return;
     setNdc(e);
     const local = localHit(sel.component);
     if (!local) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
     const mode = getTerrainBrushMode();
     viewport.terrainBrushing = true;
     viewport.orbit.enabled = false;
@@ -1016,15 +1353,51 @@ function setupTerrainBrush(canvas) {
       mode,
       component: sel.component,
       entityId: sel.entityId,
-      before: mode === "sculpt" ? sel.component.props.heights : sel.component.props.splatmap,
+      before: mode === "sculpt"
+        ? sel.component.props.heights
+        : mode === "scatter"
+          ? JSON.stringify(sel.component.scatterLayersData ?? sel.component.props.scatterLayers ?? [])
+          : sel.component.props.splatmap,
       // Flatten levels toward the surface height where the stroke began.
       flattenHeight: sel.component.heightAtLocal(local.x, local.z),
       seed: strokeSeed++,
+      dab: 0,
+      erase: mode === "scatter" && e.ctrlKey,
     };
     applyBrush(sel.component, local);
-  });
+  }, true);
 
   canvas.addEventListener("pointermove", (e) => {
+    lastClient = { x: e.clientX, y: e.clientY };
+    const adjustment = getTerrainBrushAdjustment();
+    if (adjustment) {
+      if (!adjustGesture || adjustGesture.key !== adjustment.key) {
+        adjustGesture = makeAdjustGesture(adjustment);
+      }
+      const radial = adjustment.key === "radius" || adjustment.key === "scatterSpacing";
+      const dx = e.clientX - adjustGesture.lastActualX;
+      const dy = e.clientY - adjustGesture.lastActualY;
+      adjustGesture.lastActualX = e.clientX;
+      adjustGesture.lastActualY = e.clientY;
+      let value;
+      if (radial) {
+        adjustGesture.virtualX += dx;
+        adjustGesture.virtualY += dy;
+        const screenRadius = Math.max(2, Math.hypot(
+          adjustGesture.virtualX - adjustGesture.centerX,
+          adjustGesture.virtualY - adjustGesture.centerY,
+        ));
+        value = Math.max(0.1, adjustGesture.startValue * (screenRadius / adjustGesture.startRadiusPx));
+        showBrushAdjustOverlay(canvas, adjustGesture, screenRadius, value);
+      } else {
+        value = THREE.MathUtils.clamp(adjustGesture.value + dx / 300, adjustment.key === "strength" ? 0.01 : 0, 1);
+        adjustGesture.value = value;
+      }
+      setTerrainBrushSetting(adjustment.key, +value.toFixed(3));
+      setNdc(e);
+      return;
+    }
+    adjustGesture = null;
     if (!getTerrainBrushMode()) return;
     setNdc(e);
     if (!stroke) return;
@@ -1041,15 +1414,37 @@ function setupTerrainBrush(canvas) {
     if (mode === "sculpt") {
       component.commitHeights();
       commandBus.execute(new SetTerrainHeightsCommand(entityId, before, component.props.heights));
-    } else {
+    } else if (mode === "paint" || mode === "erase") {
       component.commitSplatmap();
       commandBus.execute(new SetTerrainSplatmapCommand(entityId, before, component.props.splatmap));
+    } else if (mode === "scatter") {
+      const after = component.commitScatterLayers();
+      commandBus.execute(new SetTerrainScatterCommand(entityId, before, after));
     }
+  });
+
+  canvas.addEventListener("contextmenu", (e) => {
+    if (getTerrainBrushAdjustment()) e.preventDefault();
+  });
+  window.addEventListener("blur", () => {
+    if (getTerrainBrushAdjustment()) finishTerrainBrushAdjustment(true);
   });
 
   // Disarming clears the cursor immediately.
   subscribeTerrainBrush(() => {
     if (!getTerrainBrushMode()) hideBrushIndicator();
+    const adjustment = getTerrainBrushAdjustment();
+    if (adjustment) {
+      if (!adjustGesture || adjustGesture.key !== adjustment.key) {
+        adjustGesture = makeAdjustGesture(adjustment);
+        if (adjustment.key === "radius" || adjustment.key === "scatterSpacing") {
+          showBrushAdjustOverlay(canvas, adjustGesture, adjustGesture.startRadiusPx, adjustment.startValue);
+        }
+      }
+    } else {
+      adjustGesture = null;
+      hideBrushAdjustOverlay();
+    }
   });
 
   // Per-frame cursor: keep the disc+ring glued to the surface under the
@@ -1073,9 +1468,33 @@ function setupTerrainBrush(canvas) {
       if (!stroke) hideBrushIndicator();
       return;
     }
+    lastBrushTarget = { component: target.component, local: local.clone() };
+    const adjustment = getTerrainBrushAdjustment();
+    if (adjustment?.key === "radius" || adjustment?.key === "scatterSpacing") {
+      hideBrushIndicator();
+      return;
+    }
     const settings = getTerrainBrushSettings();
-    const color = mode === "sculpt" ? (SCULPT_TOOL_COLORS[settings.tool] ?? PAINT_COLOR) : PAINT_COLOR;
-    updateBrushIndicator(target.component, local, settings.radius, color);
+    const paintLayer = target.component.props.layers?.[Math.min(settings.activeLayer, Math.max(0, (target.component.props.layers?.length ?? 1) - 1))];
+    const paintPreviewColor = paintLayer?.tint ? new THREE.Color(paintLayer.tint).getHex() : PAINT_COLOR;
+    const color = mode === "sculpt"
+      ? (SCULPT_TOOL_COLORS[settings.tool] ?? PAINT_COLOR)
+      : mode === "erase" ? ERASE_COLOR : mode === "scatter" ? SCATTER_COLOR : paintPreviewColor;
+    const sculptPreview = mode === "sculpt" ? {
+      mode,
+      tool: settings.tool,
+      radius: settings.radius,
+      strength: settings.strength * 0.15,
+      hardness: settings.hardness,
+      flattenHeight: stroke?.flattenHeight ?? target.component.heightAtLocal(local.x, local.z),
+      seed: stroke?.seed ?? strokeSeed,
+    } : null;
+    updateBrushIndicator(target.component, local, settings.radius, color, settings.strength, settings.hardness, sculptPreview);
+    if (mode === "scatter") {
+      updateScatterSilhouette(target.component, local, settings, stroke?.erase ?? false, stroke?.seed ?? strokeSeed);
+    } else {
+      hideScatterSilhouette();
+    }
   });
 }
 
@@ -1184,7 +1603,17 @@ function setupKeyboard(canvas) {
 
   window.addEventListener("keydown", (e) => {
     if (!viewport.hovered || engine.playing) return;
+    if (e.target.closest?.(".geometry-editor")) return;
     if (e.target.closest?.("input, textarea, select, [contenteditable]")) return;
+    if (!e.repeat && dispatchTerrainKeyAction(e)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      return;
+    }
+    if (getTerrainBrushAdjustment() && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      return;
+    }
     if (handleMacroKey(e)) return;
     if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
     switch (e.key.toLowerCase()) {
@@ -1790,8 +2219,25 @@ export function ViewportPanel() {
   const [backend, setBackend] = useState(viewport.backend);
   const [mode, setMode] = useState("translate");
   const [macroState, setMacroState] = useState(null);
+  const [terrainBrushState, setTerrainBrushState] = useState(() => ({
+    mode: getTerrainBrushMode(),
+    settings: { ...getTerrainBrushSettings() },
+    adjustment: getTerrainBrushAdjustment(),
+  }));
   const [previewEntityName, setPreviewEntityName] = useState(null);
   const playing = usePlayStore((s) => s.playing);
+  const geometryEntityId = useGeometryEditStore((s) => s.entityId);
+  const geometryInitialView = (() => {
+    if (!geometryEntityId || !viewport.camera || !viewport.orbit) return null;
+    const entity = engine.getEntity(geometryEntityId);
+    if (!entity) return null;
+    entity.object3D.updateWorldMatrix(true, false);
+    const inverse = entity.object3D.matrixWorld.clone().invert();
+    return {
+      position: viewport.camera.position.clone().applyMatrix4(inverse).toArray(),
+      target: viewport.orbit.target.clone().applyMatrix4(inverse).toArray(),
+    };
+  })();
   // Mirrors viewport.layers — kept here because React owns the toggle UI.
   // The Panel re-reads this any time something else (e.g. another viewport
   // instance in a future split-pane setup) mutates layer state via the
@@ -1820,6 +2266,11 @@ export function ViewportPanel() {
   // nothing else does, but the pub-sub path lets future tooling drive
   // it without coupling to React).
   useEffect(() => subscribeLayers(setLayers), []);
+  useEffect(() => subscribeTerrainBrush(() => setTerrainBrushState({
+    mode: getTerrainBrushMode(),
+    settings: { ...getTerrainBrushSettings() },
+    adjustment: getTerrainBrushAdjustment(),
+  })), []);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -1981,10 +2432,37 @@ export function ViewportPanel() {
           </span>
         </div>
       )}
+      {terrainBrushState.mode && !playing && (
+        <div className={`terrain-brush-hud ${terrainBrushState.adjustment ? "adjusting" : ""}`}>
+          <span className="terrain-brush-hud-mode">{terrainBrushState.mode}</span>
+          {terrainBrushState.mode === "sculpt" && <span>{terrainBrushState.settings.tool}</span>}
+          <span>R {terrainBrushState.settings.radius.toFixed(2)}</span>
+          <span>S {terrainBrushState.settings.strength.toFixed(2)}</span>
+          {terrainBrushState.mode === "scatter" && <span>Spacing {terrainBrushState.settings.scatterSpacing.toFixed(2)}</span>}
+          <span>H {terrainBrushState.settings.hardness.toFixed(2)}</span>
+          <span className="terrain-brush-hud-hint">
+            {terrainBrushState.adjustment
+              ? `${terrainBrushState.adjustment.key}: move cursor · click/↵ confirm · RMB/Esc cancel`
+              : terrainBrushState.mode === "scatter"
+                ? "F size · Shift+F spacing · Ctrl+drag erase · B exit"
+                : "F size · Shift+F strength · Ctrl+F hardness · B exit"}
+          </span>
+        </div>
+      )}
       {previewEntityName && !playing && (
         <div className="camera-preview-label" title="Live render from the selected camera">
           <span className="dot" />
           {previewEntityName}
+        </div>
+      )}
+      {geometryEntityId && !playing && (
+        <div className="scene-geometry-editor-overlay">
+          <GeometryEditorPanel
+            embedded
+            entityIdOverride={geometryEntityId}
+            initialView={geometryInitialView}
+            onClose={() => useGeometryEditStore.getState().exit()}
+          />
         </div>
       )}
     </div>

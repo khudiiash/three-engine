@@ -15,8 +15,11 @@ export async function exportGame() {
   if (!outDir) return;
 
   const engine = await ensureEngine();
-  const { serializeScene } = await import("../engine/index.js");
-  const scene = serializeScene(engine);
+  const { serializeScene, prefabRegistry } = await import("../engine/index.js");
+  // Prefab defs ride along in the scene JSON: a build has no project to scan,
+  // and instances (plus `engine.instantiate` from scripts) must resolve with
+  // no I/O before the first frame.
+  const scene = serializeScene(engine, { embedPrefabs: true });
 
   // Runtime-relevant project settings ride along in the scene JSON.
   const { getProjectSettings } = await import("./projectSettings.js");
@@ -44,39 +47,89 @@ export async function exportGame() {
     return rel;
   };
 
-  const visit = (entity) => {
-    for (const c of entity.components ?? []) {
-      if (c.type === "mesh") {
-        if (c.props.material) {
-          materialPaths.add(c.props.material);
-          c.props.material = `assets/${basename(c.props.material)}`;
-        }
-      } else if (c.type === "model") {
-        c.props.path = claim(c.props.path) || c.props.path;
-        for (const [name, matPath] of Object.entries(c.props.materials ?? {})) {
-          materialPaths.add(matPath);
-          c.props.materials[name] = `assets/${basename(matPath)}`;
-        }
-      } else if (c.type === "animation" && c.props.controller) {
-        c.props.controller = claim(c.props.controller);
-      } else if (c.type === "script" && c.props.path) {
-        scriptPaths.add(c.props.path);
-        c.props.path = `assets/${basename(c.props.path).replace(/\.ts$/i, ".js")}`;
-      } else if (c.type === "sound") {
-        // Each entry's audioAsset is the sidecar path. Ship the sidecar JSON
-        // (with its inner `path` rewritten to the assets folder) and the raw
-        // audio file it points to. Both end up in `assets/` and the
-        // runtime's asset resolver loads them by relative URL.
-        for (const entry of c.props.entries ?? []) {
-          if (!entry.audioAsset) continue;
-          audioSidecarPaths.add(entry.audioAsset);
-          entry.audioAsset = `assets/${basename(entry.audioAsset)}`;
-        }
+  /**
+   * A script can hold a prefab reference as a plain path string (that's what
+   * the inspector's prefab field stores). Paths don't survive the trip into a
+   * build, so swap them for the prefab's guid — which is stable and is what the
+   * player's registry is keyed by. `engine.instantiate` accepts either.
+   */
+  const toPrefabGuid = (value) => {
+    if (typeof value !== "string") return value;
+    const guid = prefabRegistry.guidForPath(value);
+    return guid ?? value;
+  };
+  const rewritePrefabRefs = (props) => {
+    for (const [key, value] of Object.entries(props ?? {})) {
+      if (typeof value === "string") props[key] = toPrefabGuid(value);
+    }
+  };
+
+  const visitComponent = (c) => {
+    rewritePrefabRefs(c.props);
+    if (c.type === "mesh") {
+      if (c.props.geometryAsset) c.props.geometryAsset = claim(c.props.geometryAsset);
+      if (c.props.material) {
+        materialPaths.add(c.props.material);
+        c.props.material = `assets/${basename(c.props.material)}`;
+      }
+    } else if (c.type === "model") {
+      c.props.path = claim(c.props.path) || c.props.path;
+      for (const [name, matPath] of Object.entries(c.props.materials ?? {})) {
+        materialPaths.add(matPath);
+        c.props.materials[name] = `assets/${basename(matPath)}`;
+      }
+    } else if (c.type === "animation" && c.props.controller) {
+      c.props.controller = claim(c.props.controller);
+    } else if (c.type === "script" && c.props.path) {
+      scriptPaths.add(c.props.path);
+      c.props.path = `assets/${basename(c.props.path).replace(/\.ts$/i, ".js")}`;
+    } else if (c.type === "sound") {
+      // Each entry's audioAsset is the sidecar path. Ship the sidecar JSON
+      // (with its inner `path` rewritten to the assets folder) and the raw
+      // audio file it points to. Both end up in `assets/` and the
+      // runtime's asset resolver loads them by relative URL.
+      for (const entry of c.props.entries ?? []) {
+        if (!entry.audioAsset) continue;
+        audioSidecarPaths.add(entry.audioAsset);
+        entry.audioAsset = `assets/${basename(entry.audioAsset)}`;
       }
     }
-    (entity.children ?? []).forEach(visit);
   };
+
+  /**
+   * One walker for both shapes, because they *are* one shape: a scene entity, a
+   * prefab node and an added-entity override all carry components + children,
+   * and a prefab instance (in a scene or nested in a prefab) carries overrides
+   * whose payloads are components and subtrees in turn.
+   */
+  const visitOverride = (ov) => {
+    if (ov.k === "prop") {
+      const shim = { type: ov.c, props: { [ov.key]: ov.v } };
+      visitComponent(shim);
+      ov.v = shim.props[ov.key];
+    } else if (ov.k === "addComponent") {
+      visitComponent({ type: ov.c, props: ov.v });
+    } else if (ov.k === "addEntity") {
+      visit(ov.v);
+    }
+  };
+  const visit = (node) => {
+    // Instances resolve by guid in a build; the authoring path is a local
+    // absolute path and has no business shipping.
+    if (node.prefab) delete node.prefab.path;
+    for (const c of node.components ?? []) visitComponent(c);
+    for (const ov of node.overrides ?? []) visitOverride(ov);
+    (node.children ?? []).forEach(visit);
+  };
+
   scene.entities.forEach(visit);
+  for (const def of scene.prefabs ?? []) {
+    if (def.root) visit(def.root);
+    for (const ov of def.overrides ?? []) visitOverride(ov); // variants
+    // The registry in the build is keyed by guid; drop the authoring path so a
+    // machine-specific absolute path doesn't ship inside the bundle.
+    delete def.path;
+  }
 
   const { invoke } = await import("@tauri-apps/api/core");
   try {

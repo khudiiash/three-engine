@@ -38,6 +38,7 @@ export function resetSceneBooted() {
  * scene is left to EditorChrome's normal boot flow.
  */
 export async function resetEditorScene() {
+  await leavePrefabMode();
   const engine = await ensureEngine();
   engine.clear();
   currentPath = null;
@@ -144,7 +145,16 @@ function afterSceneSwap() {
   useSceneStore.getState().markDirty(false);
 }
 
+/** Prefab Mode holds the scene suspended in memory. Any operation that swaps
+ *  the scene out has to leave the stage first (saving the prefab), or the
+ *  suspended scene would be silently dropped on the floor. */
+async function leavePrefabMode() {
+  const { isPrefabModeActive, exitPrefabMode } = await import("./prefab.js");
+  if (isPrefabModeActive()) await exitPrefabMode({ save: true });
+}
+
 export async function newScene() {
+  await leavePrefabMode();
   const engine = await ensureEngine();
   engine.clear();
   currentPath = null;
@@ -188,6 +198,14 @@ async function uniqueScenePath(root, name) {
 
 export async function saveScene({ saveAs = false } = {}) {
   const engine = await ensureEngine();
+
+  // In Prefab Mode the viewport holds a prefab, not the scene — the scene is
+  // suspended in memory. Saving must write the *prefab*; writing the scene file
+  // here would overwrite the user's scene with the staged prefab's contents.
+  // Routing it centrally covers Ctrl+S, the File menu and autosave at once.
+  const { isPrefabModeActive, savePrefabStage } = await import("./prefab.js");
+  if (isPrefabModeActive()) return savePrefabStage();
+
   let path = !saveAs && currentPath;
   if (!path) {
     const root = projectRoot();
@@ -227,6 +245,7 @@ export async function openScene() {
 
 /** Loads a scene from a known path (double-click in Assets, project restore). */
 export async function openScenePath(path) {
+  await leavePrefabMode();
   const engine = await ensureEngine();
   const { invoke } = await import("@tauri-apps/api/core");
   const { deserializeScene } = await import("../engine/index.js");

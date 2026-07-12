@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { engine } from "../engineInstance.js";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
+import { usePrefabStore } from "../store/prefabStore.js";
 
 const MAX_HISTORY = 100;
 
@@ -48,6 +49,9 @@ class CommandBus {
   #afterMutation() {
     useSceneStore.getState().refresh();
     useSceneStore.getState().markDirty();
+    // In Prefab Mode the edit belongs to the staged prefab, not the scene.
+    // (No-op when no prefab is staged.)
+    usePrefabStore.getState().markStageDirty();
     useSelectionStore.getState().prune(new Set(engine.entities.keys()));
     this.#syncHistoryState();
   }

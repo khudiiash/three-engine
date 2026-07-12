@@ -24,6 +24,7 @@ import { commandBus } from "./commands/CommandBus.js";
 import { getProjectSettings, applyProjectSettings } from "./projectSettings.js";
 import { isGraphHovered } from "./nodegraph/graphContext.js";
 import { dispatchVisibilityKeyAction } from "./keybindings.js";
+import { dispatchTerrainKeyAction } from "./terrainBrush.js";
 
 /**
  * Editor "chrome": the menu bar, scene restore on first mount, keyboard
@@ -63,6 +64,10 @@ export function EditorChrome() {
         const { useProjectStore: store } = await import("./store/projectStore.js");
         const input = store.getState().projectMeta?.input;
         if (input) engine.applyInput(input);
+        // Prefabs must be in the registry before the scene loads: a scene
+        // stores instances as links, and a link with no def can't expand.
+        const { loadProjectPrefabs } = await import("./prefab.js");
+        await loadProjectPrefabs().catch((err) => console.error(`Prefabs: ${err.message ?? err}`));
         const restored = await restoreLastScene();
         // If nothing can be restored, the engine stays empty — `openProject`
         // wiped it for us. The user picks the opening scene via File →
@@ -121,6 +126,9 @@ export function EditorChrome() {
         useProjectStore.getState().closeProject();
         return;
       }
+      // Geometry edit mode owns Delete, Ctrl+Z, G/R/S/E and selection keys.
+      // Its canvas is created imperatively, but remains inside this wrapper.
+      if (e.target.closest?.(".geometry-editor")) return;
       if (inField) return;
       // Node-graph editors (shader graph, particle graph) have their own
       // delete/selection handling — the DOM-ancestry check is a fallback,
@@ -129,6 +137,13 @@ export function EditorChrome() {
       if (e.target.closest?.(".react-flow") || isGraphHovered()) return;
 
       const selection = useSelectionStore.getState().ids;
+      // Terrain-editor context keys (S/P/E, [ ], B/Esc) — only fire while a
+      // terrain entity is selected, so they get first crack at E before the
+      // global game-visibility toggle below claims it.
+      if (dispatchTerrainKeyAction(e)) {
+        e.preventDefault();
+        return;
+      }
       // User-rebindable visibility hotkeys (H / Shift+H / E / Shift+E
       // by default). Routed through a dispatcher so the keys can be
       // changed in Project Settings. Returns true on consume.

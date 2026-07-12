@@ -157,18 +157,28 @@ export async function unpackGlb(glbPath) {
   }
 
   // --- prefab ----------------------------------------------------------------
-  const prefab = {
-    name: stem,
-    position: [0, 0, 0],
-    rotation: [0, 0, 0],
-    scale: [1, 1, 1],
-    components: [
-      { type: "model", props: { path: movedGlb, materials: materialOverrides } },
-      ...(animPath ? [{ type: "animation", props: { controller: animPath, playInEditor: true } }] : []),
-    ],
-    children: [],
-  };
-  await invoke("save_scene", { path: `${folder}/${stem}.entity`, contents: JSON.stringify(prefab, null, 2) });
+  // A real prefab asset: instances of it stay linked, so re-importing the model
+  // (or editing the prefab) updates every place it was dropped into a scene.
+  const { makeDef, newFid } = await import("../engine/index.js");
+  const prefabDef = makeDef(
+    {
+      fid: newFid(),
+      name: stem,
+      position: [0, 0, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+      components: [
+        { type: "model", props: { path: movedGlb, materials: materialOverrides } },
+        ...(animPath ? [{ type: "animation", props: { controller: animPath, playInEditor: true } }] : []),
+      ],
+      children: [],
+    },
+    { name: stem },
+  );
+  const prefabPath = `${folder}/${stem}.prefab`;
+  await invoke("save_scene", { path: prefabPath, contents: JSON.stringify(prefabDef, null, 2) });
+  const { loadPrefabFile } = await import("./prefab.js");
+  await loadPrefabFile(prefabPath); // register it so it can be dropped immediately
 
   // Auto-compress the moved .glb in place when the Draco module is enabled; it
   // still loads through the prefab's `model` path (compression is transparent).

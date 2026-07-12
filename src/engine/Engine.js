@@ -12,6 +12,8 @@ import { InputManager } from "./input/index.js";
 import { createDefaultMaps } from "./input/defaultMaps.js";
 import { ViewFrustum } from "./viewFrustum.js";
 import { AudioSystem } from "./audio/AudioSystem.js";
+import { prefabRegistry } from "./prefab/registry.js";
+import { instantiatePrefabNode } from "./prefab/expand.js";
 
 /**
  * Runtime core: owns the renderer, the three.js scene (source of truth)
@@ -289,6 +291,35 @@ export class Engine extends EventEmitter {
     this.entities.set(entity.id, entity);
     entity.setParent(parent);
     this.emit("hierarchy-changed");
+    return entity;
+  }
+
+  /**
+   * Spawns a prefab. The workhorse of runtime content: bullets, enemies,
+   * pickups. Synchronous — every prefab is in the registry before the scene
+   * loads (the editor scans the project; a build embeds them in scene.json) —
+   * so scripts can call it straight from `update()` without awaiting.
+   *
+   *   const bullet = this.entity.engine.instantiate(this.bulletPrefab, {
+   *     position: muzzle.getWorldPosition(new THREE.Vector3()),
+   *   });
+   *
+   * `ref` is whatever the inspector's prefab field gave you (an asset path),
+   * a prefab guid, or a `{ guid, path }` link. Returns the instance root
+   * entity, or null when the prefab can't be found.
+   */
+  instantiate(ref, { parent = null, position, rotation, scale, name } = {}) {
+    const link = typeof ref === "string" ? (prefabRegistry.has(ref) ? { guid: ref } : { path: ref }) : ref;
+    const guid = prefabRegistry.resolveLink(link);
+    if (!guid) {
+      console.warn(`instantiate: prefab not found (${typeof ref === "string" ? ref : JSON.stringify(ref)})`);
+      return null;
+    }
+    const entity = instantiatePrefabNode(this, { prefab: { guid, path: prefabRegistry.pathOf(guid) } }, parent);
+    if (position) entity.position = position;
+    if (rotation) entity.rotation = rotation;
+    if (scale) entity.scale = scale;
+    if (name) entity.name = name;
     return entity;
   }
 

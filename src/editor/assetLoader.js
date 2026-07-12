@@ -12,8 +12,12 @@ export const MODEL_EXTENSIONS = ["glb"];
 export const TEXTURE_EXTENSIONS = ["png", "jpg", "jpeg", "webp"];
 export const SCRIPT_EXTENSIONS = ["js", "ts"];
 export const MATERIAL_EXTENSIONS = ["mat"];
-export const PREFAB_EXTENSIONS = ["entity"];
+// `.prefab` is the real thing (a linked, override-aware prefab asset).
+// `.entity` is the legacy bare snapshot — still readable (it's upgraded to a
+// prefab def on load), so old assets keep working.
+export const PREFAB_EXTENSIONS = ["prefab", "entity"];
 export const ANIMATOR_EXTENSIONS = ["anim"];
+export const GEOMETRY_EXTENSIONS = ["geom"];
 // `.audio` is the JSON sidecar; the others are raw audio files the engine
 // can decode straight away. AssetField filters both sidecars and raw files
 // in one picker.
@@ -114,6 +118,13 @@ export async function transpileScript(code) {
 }
 
 const blobUrlCache = new Map(); // path -> object URL
+
+/** Drops a cached file URL after an editor overwrites an asset in place. */
+export function invalidateBlobUrl(path) {
+  const url = blobUrlCache.get(path);
+  if (url) URL.revokeObjectURL(url);
+  blobUrlCache.delete(path);
+}
 
 export function extOf(path) {
   return path.split(".").pop()?.toLowerCase() ?? "";

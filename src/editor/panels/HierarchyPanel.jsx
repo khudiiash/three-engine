@@ -24,11 +24,23 @@ import {
   deleteSelection,
 } from "../clipboard.js";
 import { useAssetDrop } from "../assetDrag.js";
-import { instantiatePrefab } from "../prefab.js";
+import {
+  instantiatePrefab,
+  openPrefabMode,
+  exitPrefabMode,
+  createPrefabFromEntity,
+  createVariantFromInstance,
+  applyPrefab,
+  revertPrefab,
+  unpackPrefab,
+} from "../prefab.js";
+import { usePrefabStore } from "../store/prefabStore.js";
+import { prefabRegistry, diffInstance, getPrefabRoot } from "../../engine/index.js";
 import { extOf, PREFAB_EXTENSIONS, MODEL_EXTENSIONS } from "../assetLoader.js";
 import { basename } from "../store/projectStore.js";
 import { isFollowPickArmed, disarmFollowPick, isSurfacePickArmed, disarmSurfacePick } from "./InspectorPanel.jsx";
 import { isListenerPickArmed, disarmListenerPick } from "../components/ListenerSection.jsx";
+import { disarmTerrainScatterSourcePick, getTerrainScatterSourcePick } from "../terrainBrush.js";
 import { engine } from "../engineInstance.js";
 import { newScene } from "../sceneIO.js";
 
@@ -291,6 +303,24 @@ function handleRowClick(e, id, rootIds, entities) {
     );
     return;
   }
+  const terrainScatterPick = getTerrainScatterSourcePick();
+  if (terrainScatterPick) {
+    disarmTerrainScatterSourcePick();
+    const source = engine.getEntity(id);
+    const terrain = engine.getEntity(terrainScatterPick.terrainEntityId)?.getComponent("terrain");
+    if (!source || !terrain || (!source.getComponent("mesh") && !source.getComponent("model"))) return;
+    const layers = terrain.props.scatterLayers ?? [];
+    if (!layers[terrainScatterPick.layerIndex]) return;
+    commandBus.execute(new SetComponentPropCommand(
+      terrainScatterPick.terrainEntityId,
+      "terrain",
+      "scatterLayers",
+      layers.map((layer, index) => index === terrainScatterPick.layerIndex
+        ? { ...layer, sourceType: "entity", sourceEntity: id }
+        : layer),
+    ));
+    return;
+  }
   // Listener target pick: move the listener to the picked entity. Yield the
   // current holder (if any) and add a ListenerComponent to the picked entity,
   // making it the new audio listener.
@@ -412,6 +442,30 @@ function VisibilityIcons({ id }) {
   );
 }
 
+/**
+ * Prefab state for one row: is it an instance root (blue name + badge), a node
+ * *inside* an instance (blue name only), or an ordinary entity? Subscribing to
+ * the registry version is what makes the badge light up the moment a prefab is
+ * created, applied or reverted.
+ */
+function usePrefabRowInfo(id) {
+  usePrefabStore((s) => s.version);
+  const live = engine.getEntity(id);
+  const root = live ? getPrefabRoot(live) : null;
+  if (!root) return {};
+  const isRoot = root === live;
+  const guid = prefabRegistry.resolveLink(root.prefab);
+  const def = guid ? prefabRegistry.getDef(guid) : null;
+  return {
+    kind: isRoot ? "root" : "child",
+    name: def?.name ?? "Prefab",
+    path: guid ? prefabRegistry.pathOf(guid) : null,
+    missing: !guid,
+    // Only the root carries overrides, so only the root can look "modified".
+    dirty: isRoot && !!guid && diffInstance(root).length > 0,
+  };
+}
+
 function EntityRow({
   id,
   depth,
@@ -428,7 +482,8 @@ function EntityRow({
 }) {
   const entity = useSceneStore((s) => s.entities[id]);
   const selected = useSelectionStore((s) => s.ids.includes(id));
-  // Assets-panel drags (.entity/.glb) land on rows as "add as child".
+  const prefab = usePrefabRowInfo(id);
+  // Assets-panel drags (.prefab/.entity/.glb) land on rows as "add as child".
   const assetDropRef = useAssetDrop({
     accepts: DROPPABLE_ASSET_EXTENSIONS,
     onDrop: (path) => dropAssetOnEntity(path, id),
@@ -497,7 +552,25 @@ function EntityRow({
         ) : (
           <>
             <EntityIcon components={entity.components} />
-            <span className="entity-name">{entity.name}</span>
+            <span className={`entity-name ${prefab.kind ? `prefab-${prefab.kind}` : ""}`}>{entity.name}</span>
+            {prefab.kind === "root" && (
+              <span
+                className={`prefab-badge ${prefab.dirty ? "dirty" : ""} ${prefab.missing ? "missing" : ""}`}
+                title={
+                  prefab.missing
+                    ? "Prefab asset is missing"
+                    : `Prefab instance: ${prefab.name}${prefab.dirty ? " (modified)" : ""} — double-click to open`
+                }
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (prefab.path) openPrefabMode(prefab.path);
+                }}
+              >
+                <Package size={11} />
+                {prefab.dirty && <span className="prefab-dot" />}
+              </span>
+            )}
           </>
         )}
         <VisibilityIcons id={id} />
@@ -524,6 +597,39 @@ function EntityRow({
   );
 }
 
+/**
+ * The prefab half of the row context menu. What's on offer depends on whether
+ * the row is a prefab instance (apply / revert / unpack / open) or a plain
+ * entity (create a prefab out of it).
+ */
+function prefabMenuItems(single) {
+  if (!single) return [];
+  const live = engine.getEntity(single);
+  if (!live) return [];
+  const root = getPrefabRoot(live);
+
+  if (!root) {
+    return [{ separator: true }, { label: "Create Prefab…", action: () => createPrefabFromEntity(single) }];
+  }
+
+  // Apply/Revert always act on the instance root, even when the click was on a
+  // child inside it — that's the object that owns the overrides.
+  const rootId = root.id;
+  const dirty = diffInstance(root).length > 0;
+  const assetPath = root.prefab ? prefabRegistry.pathOf(prefabRegistry.resolveLink(root.prefab)) : null;
+
+  return [
+    { separator: true },
+    { label: "Open Prefab", disabled: !assetPath, action: () => openPrefabMode(assetPath) },
+    { label: "Select Prefab Asset", disabled: !assetPath, action: () => useSelectionStore.getState().selectAsset(assetPath) },
+    { label: "Apply All", disabled: !dirty, action: () => applyPrefab(rootId) },
+    { label: "Revert All", disabled: !dirty, action: () => revertPrefab(rootId) },
+    { label: "Create Prefab Variant…", action: () => createVariantFromInstance(rootId) },
+    { label: "Unpack Prefab", action: () => unpackPrefab(rootId, { deep: false }) },
+    { label: "Unpack Completely", action: () => unpackPrefab(rootId, { deep: true }) },
+  ];
+}
+
 function ContextMenu({ menu, close, setRenamingId }) {
   const selection = useSelectionStore.getState().ids;
   const single = selection.length === 1 ? selection[0] : null;
@@ -542,6 +648,7 @@ function ContextMenu({ menu, close, setRenamingId }) {
     { separator: true },
     { label: "Duplicate", shortcut: "Ctrl+D", action: duplicateSelection },
     { label: "Rename", disabled: !single, action: () => setRenamingId(single) },
+    ...prefabMenuItems(single),
     { separator: true },
     { label: "Delete", shortcut: "Del", action: deleteSelection },
   ];
@@ -579,6 +686,8 @@ export function HierarchyPanel() {
   const dirty = useSceneStore((s) => s.dirty);
   const selection = useSelectionStore((s) => s.ids);
   const terrainEnabled = useModulesStore((s) => s.enabled.includes("terrain"));
+  const stage = usePrefabStore((s) => s.stage);
+  const stageDirty = usePrefabStore((s) => s.stageDirty);
   const [renamingId, setRenamingId] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [dropHint, setDropHint] = useState(null);
@@ -603,6 +712,7 @@ export function HierarchyPanel() {
     if (isFollowPickArmed()) disarmFollowPick();
     else if (isSurfacePickArmed()) disarmSurfacePick();
     else if (isListenerPickArmed()) disarmListenerPick();
+    else if (getTerrainScatterSourcePick()) disarmTerrainScatterSourcePick();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -721,6 +831,22 @@ export function HierarchyPanel() {
 
   return (
     <div className="hierarchy-panel">
+      {stage && (
+        <div className="prefab-stage-bar" title="You are editing a prefab in isolation — the scene is set aside">
+          <button
+            className="prefab-stage-back"
+            onClick={() => exitPrefabMode({ save: true }).catch((err) => console.error(String(err)))}
+          >
+            <ChevronRight size={12} className="prefab-stage-chevron" />
+            Scenes
+          </button>
+          <span className="prefab-stage-name">
+            <Package size={12} />
+            {stage.name}
+            {stageDirty && <span className="prefab-dot" />}
+          </span>
+        </div>
+      )}
       <div className="panel-toolbar">
         <div className="dropdown-wrap">
           <button className="toolbar-btn" onClick={() => setMenuOpen((v) => !v)}> <Plus size={14} /> </button>
@@ -779,13 +905,17 @@ export function HierarchyPanel() {
         {dirty ? " •" : ""}
       </div>
       <div
-        className={`hierarchy-tree ${isFollowPickArmed() ? "follow-pick-armed" : ""}`}
+        className={`hierarchy-tree ${isFollowPickArmed() || getTerrainScatterSourcePick() ? "follow-pick-armed" : ""}`}
         ref={treeAssetDropRef}
         onClick={(e) => {
           if (isFollowPickArmed()) {
             // A click on a row already handled the pick via handleRowClick;
             // only react here for clicks on the empty tree area to disarm.
             if (e.target === e.currentTarget) disarmFollowPick();
+            return;
+          }
+          if (getTerrainScatterSourcePick()) {
+            if (e.target === e.currentTarget) disarmTerrainScatterSourcePick();
             return;
           }
           if (e.target === e.currentTarget) useSelectionStore.getState().clear();

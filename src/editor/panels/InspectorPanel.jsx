@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { X, Plus, Crosshair, Eye, EyeOff, ScanEye } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { X, Plus, Crosshair, Eye, EyeOff, ScanEye, Package, ChevronRight } from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { getComponentClass, getComponentTypes } from "../../engine/index.js";
@@ -15,13 +15,18 @@ import {
 import { openPanel } from "../EditorShell.jsx";
 import { engine } from "../engineInstance.js";
 import { AssetField } from "../fields/AssetField.jsx";
+import { PREFAB_EXTENSIONS } from "../assetLoader.js";
 import { AssetInspector } from "./AssetInspector.jsx";
 import { useAssetDrop } from "../assetDrag.js";
 import { getEditorCameraView } from "./ViewportPanel.jsx";
 import { useModulesStore } from "../modules.js";
+import { usePrefabStore } from "../store/prefabStore.js";
+import { prefabRegistry, diffInstance, getPrefabRoot } from "../../engine/index.js";
+import { applyPrefab, revertPrefab, unpackPrefab, openPrefabMode, createVariantFromInstance } from "../prefab.js";
 import { SoundSection } from "../components/SoundSection.jsx";
 import { ListenerSection } from "../components/ListenerSection.jsx";
 import { TerrainSection } from "../components/TerrainSection.jsx";
+import { useGeometryEditStore } from "../store/geometryEditStore.js";
 
 /**
  * Returns the live engine entity referenced by `targetId` (the value stored
@@ -230,6 +235,16 @@ function PropField({ descriptor, value, onCommit }) {
   switch (descriptor.type) {
     case "asset":
       return <AssetField descriptor={descriptor} value={value} onCommit={onCommit} />;
+    // A prefab reference: an asset picker pinned to prefab files. The value is
+    // the asset path, which is exactly what `engine.instantiate()` takes.
+    case "prefab":
+      return (
+        <AssetField
+          descriptor={{ ...descriptor, exts: PREFAB_EXTENSIONS }}
+          value={value}
+          onCommit={onCommit}
+        />
+      );
     case "vec3":
       return <Vec3PropField value={value} onCommit={onCommit} />;
     case "number":
@@ -698,9 +713,16 @@ function ComponentSection({ entityId, type, props }) {
             <PropField
               descriptor={descriptor}
               value={props[descriptor.key]}
-              onCommit={(v) =>
-                commandBus.execute(new SetComponentPropCommand(entityId, type, descriptor.key, v))
-              }
+              onCommit={(v) => {
+                if (type === "mesh" && descriptor.key === "geometry" && props.geometryAsset) {
+                  commandBus.execute(new BatchCommand([
+                    new SetComponentPropCommand(entityId, type, "geometryAsset", ""),
+                    new SetComponentPropCommand(entityId, type, descriptor.key, v),
+                  ], "Use primitive geometry"));
+                  return;
+                }
+                commandBus.execute(new SetComponentPropCommand(entityId, type, descriptor.key, v));
+              }}
             />
           </div>
         );
@@ -709,6 +731,18 @@ function ComponentSection({ entityId, type, props }) {
       {type === "script" && <ScriptAttributeFields entityId={entityId} props={props} />}
       {type === "mesh" && (
         <>
+          <button
+            className="toolbar-btn wide"
+            onClick={() => {
+              useGeometryEditStore.getState().enter(entityId);
+              openPanel("viewport");
+            }}
+          >
+            Edit Geometry in Scene
+          </button>
+          <button className="toolbar-btn wide" onClick={() => openPanel("geometryEditor")}>
+            Open Separate Geometry Editor
+          </button>
           {props.material && (
             <button className="toolbar-btn wide" onClick={() => openPanel("material")}>
               Edit Material
@@ -772,13 +806,204 @@ function ComponentSection({ entityId, type, props }) {
   );
 }
 
+/** One line in the Overrides dropdown, with its own Apply / Revert. */
+function OverrideRow({ rootId, override, label }) {
+  return (
+    <div className="prefab-override-row">
+      <span className="prefab-override-label" title={label}>
+        {label}
+      </span>
+      <button className="prefab-mini-btn" title="Apply just this to the prefab" onClick={() => applyPrefab(rootId, [override])}>
+        Apply
+      </button>
+      <button className="prefab-mini-btn" title="Discard just this change" onClick={() => revertPrefab(rootId, [override])}>
+        Revert
+      </button>
+    </div>
+  );
+}
+
+/** Human-readable description of an override, for the dropdown. */
+function describeOverride(root, override) {
+  const target = override.t?.length
+    ? (findEntityByFidPath(root, override.t)?.name ?? override.t.join(" › "))
+    : root.name;
+  switch (override.k) {
+    case "prop":
+      return `${target} › ${getComponentClass(override.c)?.label ?? override.c} › ${override.key}`;
+    case "transform":
+      return `${target} › ${override.key}`;
+    case "name":
+      return `${target} › name`;
+    case "flag":
+      return `${target} › ${override.key}`;
+    case "addComponent":
+      return `${target} › added ${getComponentClass(override.c)?.label ?? override.c}`;
+    case "removeComponent":
+      return `${target} › removed ${getComponentClass(override.c)?.label ?? override.c}`;
+    case "addEntity":
+      return `${target} › added "${override.v?.name ?? "entity"}"`;
+    case "removeEntity":
+      return `removed "${target}"`;
+    default:
+      return target;
+  }
+}
+
+/** Live entity at an fid path inside an instance. */
+function findEntityByFidPath(root, path) {
+  let entity = root;
+  for (const fid of path) {
+    entity = entity?.children.find((c) => c.fid === fid);
+    if (!entity) return null;
+  }
+  return entity;
+}
+
+/**
+ * The prefab bar at the top of the inspector for anything inside an instance:
+ * where the prefab lives, what's been changed on this instance, and the
+ * Apply / Revert / Open / Unpack actions.
+ */
+function PrefabSection({ entityId }) {
+  const [overridesOpen, setOverridesOpen] = useState(false);
+  usePrefabStore((s) => s.version);
+  useSceneStore((s) => s.entities); // re-derive after any scene mutation
+
+  const live = engine.getEntity(entityId);
+  const root = live ? getPrefabRoot(live) : null;
+  if (!root) return null;
+
+  const guid = prefabRegistry.resolveLink(root.prefab);
+  const def = guid ? prefabRegistry.getDef(guid) : null;
+  const path = guid ? prefabRegistry.pathOf(guid) : null;
+  const overrides = guid ? diffInstance(root) : [];
+  const baseName = def?.variantOf ? prefabRegistry.getDef(prefabRegistry.resolveLink(def.variantOf))?.name : null;
+
+  if (!guid) {
+    return (
+      <div className="prefab-section missing">
+        <div className="prefab-section-head">
+          <Package size={13} />
+          <span className="prefab-section-name">Missing Prefab</span>
+        </div>
+        <div className="prefab-section-note">
+          The asset this instance came from can't be found. Its overrides are preserved — restore the file, or unpack to
+          keep these entities as plain objects.
+        </div>
+        <div className="prefab-actions">
+          <button className="toolbar-btn" onClick={() => unpackPrefab(root.id, { deep: true })}>
+            Unpack Completely
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="prefab-section">
+      <div className="prefab-section-head">
+        <Package size={13} />
+        <span className="prefab-section-name" title={path ?? ""}>
+          {def?.name ?? "Prefab"}
+        </span>
+        {baseName && <span className="prefab-variant-tag" title={`Variant of ${baseName}`}>variant of {baseName}</span>}
+        {root !== live && <span className="prefab-section-note inline">(part of this prefab)</span>}
+      </div>
+
+      <div className="prefab-actions">
+        <button className="toolbar-btn" disabled={!path} onClick={() => openPrefabMode(path)} title="Edit the prefab asset in isolation">
+          Open
+        </button>
+        <button className="toolbar-btn" disabled={!path} onClick={() => useSelectionStore.getState().selectAsset(path)} title="Reveal the asset in the Assets panel">
+          Select
+        </button>
+        <button
+          className="toolbar-btn"
+          disabled={!overrides.length}
+          onClick={() => applyPrefab(root.id)}
+          title="Push every change on this instance into the prefab (all other instances update)"
+        >
+          Apply All
+        </button>
+        <button
+          className="toolbar-btn"
+          disabled={!overrides.length}
+          onClick={() => revertPrefab(root.id)}
+          title="Discard every change on this instance"
+        >
+          Revert All
+        </button>
+      </div>
+
+      <div className="prefab-actions">
+        <button className="toolbar-btn" onClick={() => createVariantFromInstance(root.id)} title="Make a new prefab that inherits from this one, with these changes baked in">
+          Create Variant
+        </button>
+        <button className="toolbar-btn" onClick={() => unpackPrefab(root.id)} title="Break the link, keep the entities (nested prefabs stay linked)">
+          Unpack
+        </button>
+      </div>
+
+      {overrides.length > 0 && (
+        <>
+          <button className="prefab-overrides-toggle" onClick={() => setOverridesOpen((v) => !v)}>
+            <ChevronRight size={11} className={overridesOpen ? "open" : ""} />
+            {overrides.length} override{overrides.length === 1 ? "" : "s"}
+          </button>
+          {overridesOpen && (
+            <div className="prefab-overrides">
+              {overrides.map((override, i) => (
+                <OverrideRow key={i} rootId={root.id} override={override} label={describeOverride(root, override)} />
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 export function InspectorPanel() {
   const selectedId = useSelectionStore((s) => s.ids[0] ?? null);
   const assetPath = useSelectionStore((s) => s.assetPath);
   const entity = useSceneStore((s) => (selectedId ? s.entities[selectedId] : null));
   const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [addMenuUp, setAddMenuUp] = useState(false);
+  const addButtonRef = useRef(null);
+  const addMenuRef = useRef(null);
   // Toggling a module (un)registers component types — re-render for the list.
   useModulesStore((s) => s.enabled);
+
+  // Esc closes the open Add Component menu without dismissing focus from
+  // the trigger button. Keeps the menu from "sticking open" if the user
+  // opens it and then backs out.
+  useEffect(() => {
+    if (!addMenuOpen) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") setAddMenuOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [addMenuOpen]);
+
+  /**
+   * When opening the Add Component menu, pick the direction at runtime: open
+   * upward only if there's not enough room below the trigger AND there's more
+   * room above than below. The menu caps itself at 60vh via CSS, so the
+   * correct check is which side has more room at the moment of opening —
+   * that way it never spills off-screen in either direction.
+   */
+  const openAddMenu = () => {
+    const btn = addButtonRef.current;
+    if (btn) {
+      const rect = btn.getBoundingClientRect();
+      const spaceAbove = rect.top;
+      const spaceBelow = window.innerHeight - rect.bottom;
+      setAddMenuUp(spaceBelow < spaceAbove);
+    }
+    setAddMenuOpen(true);
+  };
 
   if (!entity && assetPath) return <AssetInspector path={assetPath} />;
   if (!entity) {
@@ -825,6 +1050,7 @@ export function InspectorPanel() {
 
   return (
     <div className="inspector-panel">
+      <PrefabSection entityId={entity.id} />
       <div className="inspector-section">
         <div className="field-row">
           <span className="field-label">Name</span>
@@ -895,9 +1121,10 @@ export function InspectorPanel() {
       <div className="add-component-wrap">
         <div className="dropdown-wrap">
           <button
+            ref={addButtonRef}
             className="toolbar-btn wide"
             disabled={!availableTypes.length}
-            onClick={() => setAddMenuOpen((v) => !v)}
+            onClick={() => (addMenuOpen ? setAddMenuOpen(false) : openAddMenu())}
           >
             <Plus size={14} />
             Add Component
@@ -905,7 +1132,7 @@ export function InspectorPanel() {
           {addMenuOpen && (
             <>
               <div className="dropdown-overlay" onClick={() => setAddMenuOpen(false)} />
-              <div className="dropdown-menu up">
+              <div ref={addMenuRef} className={`dropdown-menu${addMenuUp ? " up" : ""}`}>
                 {availableTypes.map((type) => {
                   const requiredTypes = componentRequires[type];
                   const missingRequirement = requiredTypes && !requiredTypes.some((t) => t in entity.components);

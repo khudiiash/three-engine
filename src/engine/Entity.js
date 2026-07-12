@@ -44,6 +44,13 @@ export class Entity {
     // child has its own override set. Serialised with the entity.
     this.enabledInEditor = true;
     this.enabledInGame = true;
+    // Prefab bookkeeping. `prefab` ({ guid, path }) is set only on the root of
+    // a prefab instance and is what makes it one; `fid` / `fidPath` address
+    // this entity inside the prefab it came from. All three are absent on
+    // ordinary entities and are stripped by Unpack. See engine/prefab/expand.js.
+    this.prefab = null;
+    this.fid = null;
+    this.fidPath = null;
   }
 
   // ---- Transform aliases (delegate to object3D) --------------------------

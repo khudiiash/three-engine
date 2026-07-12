@@ -40,3 +40,21 @@ export class SetTerrainSplatmapCommand {
     engine.getEntity(this.entityId)?.getComponent("terrain")?.setProp("splatmap", this.before);
   }
 }
+
+/** One add/remove scatter stroke, stored as compact JSON snapshots. */
+export class SetTerrainScatterCommand {
+  constructor(entityId, before, after) {
+    this.entityId = entityId;
+    this.before = before;
+    this.after = after;
+    this.label = "Scatter on Terrain";
+  }
+
+  #apply(snapshot) {
+    const component = engine.getEntity(this.entityId)?.getComponent("terrain");
+    component?.setProp("scatterLayers", JSON.parse(snapshot));
+  }
+
+  do() { this.#apply(this.after); }
+  undo() { this.#apply(this.before); }
+}

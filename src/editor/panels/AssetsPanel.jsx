@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
   Box,
@@ -8,10 +8,17 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  Grid2x2,
+  Grid3x3,
   Image,
   Layers,
+  LayoutGrid,
+  List,
   Package,
   Palette,
+  PanelLeft,
+  Shapes,
+  Trash2,
   Workflow,
 } from "lucide-react";
 import { useProjectStore, basename } from "../store/projectStore.js";
@@ -26,12 +33,27 @@ import {
   MATERIAL_EXTENSIONS,
   PREFAB_EXTENSIONS,
   ANIMATOR_EXTENSIONS,
+  GEOMETRY_EXTENSIONS,
 } from "../assetLoader.js";
 import { MATERIAL_DEFAULTS } from "../../engine/materialAsset.js";
 import { openScenePath } from "../sceneIO.js";
+import { openPrefabMode } from "../prefab.js";
 import { armAssetDrag, useAssetDrop, consumeAssetDragClick } from "../assetDrag.js";
-import { stemToClassName, syncScriptClassNameAfterRename } from "../scriptClassSync.js";
+import { stemToClassName } from "../scriptClassSync.js";
 import { scaffoldProjectTypes } from "../projectTypes.js";
+import { FolderTree } from "../components/FolderTree.jsx";
+import { clickSelect, pathsInBox } from "../assetSelection.js";
+import {
+  invoke,
+  uniqueName,
+  createAssetFile,
+  createFolder,
+  deleteEntries,
+  renameEntry,
+  moveDraggedIntoFolder,
+  formatBytes,
+  formatDate,
+} from "../assetOps.js";
 
 const ICON_BY_EXT = {
   glb: Box,
@@ -45,102 +67,43 @@ const ICON_BY_EXT = {
   jpg: Image,
   jpeg: Image,
   webp: Image,
-  entity: Package,
+  prefab: Package,
+  entity: Package, // legacy prefab snapshots
   anim: Workflow,
+  geom: Shapes,
 };
 
-async function invoke(cmd, args) {
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke(cmd, args);
-}
+const TYPE_LABEL = {
+  glb: "Model",
+  gltf: "Model",
+  scene: "Scene",
+  json: "JSON",
+  js: "Script",
+  ts: "Script",
+  mat: "Material",
+  png: "Texture",
+  jpg: "Texture",
+  jpeg: "Texture",
+  webp: "Texture",
+  entity: "Prefab",
+  anim: "Animator",
+  geom: "Geometry",
+};
 
-/** First "name", "name 1", "name 2"… not already taken in the folder. */
-function uniqueName(baseName, entries) {
-  const names = new Set(entries.map((e) => e.name));
-  if (!names.has(baseName)) return baseName;
-  const dot = baseName.lastIndexOf(".");
-  const stem = dot === -1 ? baseName : baseName.slice(0, dot);
-  const ext = dot === -1 ? "" : baseName.slice(dot);
-  for (let i = 1; ; i++) {
-    const name = `${stem} ${i}${ext}`;
-    if (!names.has(name)) return name;
-  }
-}
+/**
+ * Grid density / detail presets, mirroring Explorer's view menu. `thumb` is the
+ * preview size in px; the details view lays entries out as rows with metadata
+ * columns instead of tiles.
+ */
+const VIEW_MODES = [
+  { id: "details", title: "Details", Icon: List, thumb: 18 },
+  { id: "small", title: "Small icons", Icon: Grid3x3, thumb: 24 },
+  { id: "medium", title: "Medium icons", Icon: Grid2x2, thumb: 40 },
+  { id: "large", title: "Large icons", Icon: LayoutGrid, thumb: 72 },
+];
 
-async function createAssetFile(baseName, contents) {
-  const { currentPath, entries, refresh } = useProjectStore.getState();
-  if (!currentPath) return;
-  const name = uniqueName(baseName, entries);
-  await invoke("save_scene", { path: `${currentPath}/${name}`, contents });
-  await refresh();
-  console.log(`Created ${name}`);
-}
-
-async function createFolder() {
-  const { currentPath, entries, refresh } = useProjectStore.getState();
-  if (!currentPath) return;
-  const name = uniqueName("New Folder", entries);
-  await invoke("create_dir", { path: `${currentPath}/${name}` });
-  await refresh();
-}
-
-async function deleteEntry(entry) {
-  const { confirm } = await import("@tauri-apps/plugin-dialog");
-  const ok = await confirm(
-    `Delete "${entry.name}"${entry.is_dir ? " and everything inside it" : ""}? This can't be undone.`,
-    { title: "Delete asset", kind: "warning" },
-  );
-  if (!ok) return;
-  try {
-    await invoke("delete_path", { path: entry.path });
-    await invoke("delete_path", { path: `${entry.path}.meta` }).catch(() => {});
-    if (useSelectionStore.getState().assetPath === entry.path) useSelectionStore.getState().clear();
-    await useProjectStore.getState().refresh();
-    console.log(`Deleted ${entry.name}`);
-  } catch (err) {
-    console.error(`Delete failed: ${err}`);
-  }
-}
-
-async function renameEntry(entry, newName) {
-  const name = newName.trim();
-  if (!name || name === entry.name) return;
-  const dir = entry.path.slice(0, entry.path.length - entry.name.length);
-  const newPath = `${dir}${name}`;
-  try {
-    await invoke("rename_path", { from: entry.path, to: newPath });
-    // Keep texture import settings attached across the rename.
-    await invoke("rename_path", { from: `${entry.path}.meta`, to: `${newPath}.meta` }).catch(() => {});
-
-    // Scripts: rewrite the default-exported class name to match the new
-    // filename stem, and inject `extends Script` if the script predates the
-    // engine base class.
-    const newStem = name.replace(/\.(ts|js)$/i, "");
-    await syncScriptClassNameAfterRename(newPath, newStem);
-
-    await useProjectStore.getState().refresh();
-  } catch (err) {
-    console.error(`Rename failed: ${err}`);
-  }
-}
-
-/** Moves a file/folder into a target directory (drag-drop between tiles). */
-async function moveIntoFolder(sourcePath, destDir) {
-  if (!sourcePath || sourcePath === destDir) return;
-  const name = sourcePath.split(/[\\/]/).pop();
-  const dest = `${destDir}/${name}`;
-  if (dest === sourcePath) return;
-  // Refuse moving a folder into itself/descendant.
-  const norm = (p) => p.replaceAll("\\", "/").toLowerCase();
-  if (norm(destDir).startsWith(`${norm(sourcePath)}/`)) return;
-  try {
-    await invoke("rename_path", { from: sourcePath, to: dest });
-    await useProjectStore.getState().refresh();
-    console.log(`Moved ${name}`);
-  } catch (err) {
-    console.error(`Move failed: ${err}`);
-  }
-}
+const VIEW_KEY = "engine.assets.viewMode.v1";
+const TREE_KEY = "engine.assets.showTree.v1";
 
 /** Template with a placeholder for the class name; filled in by createScript(). */
 const SCRIPT_TEMPLATE = (className) => `import { Script, attribute } from "engine";
@@ -198,7 +161,7 @@ async function openInIDE(path) {
 }
 
 /** Texture image thumbnail (blob URL over Tauri fs). */
-function TextureThumb({ path }) {
+function TextureThumb({ path, size }) {
   const [url, setUrl] = useState(null);
   useEffect(() => {
     let live = true;
@@ -207,15 +170,23 @@ function TextureThumb({ path }) {
   }, [path]);
   if (!url)
     return (
-      <div className="asset-icon">
-        <Image size={26} strokeWidth={1.5} />
+      <div className="asset-icon" style={{ width: size, height: size }}>
+        <Image size={size * 0.65} strokeWidth={1.5} />
       </div>
     );
-  return <img className="asset-thumb" src={url} alt="" draggable={false} />;
+  return (
+    <img
+      className="asset-thumb"
+      style={{ width: size, height: size }}
+      src={url}
+      alt=""
+      draggable={false}
+    />
+  );
 }
 
 /** Material preview: color swatch, with its texture blended in when set. */
-function MaterialThumb({ path }) {
+function MaterialThumb({ path, size }) {
   const [def, setDef] = useState(null);
   const [mapUrl, setMapUrl] = useState(null);
   useEffect(() => {
@@ -233,25 +204,28 @@ function MaterialThumb({ path }) {
     return () => (live = false);
   }, [path]);
   return (
-    <div className="asset-thumb mat-thumb" style={{ background: def?.color ?? "#888" }}>
+    <div
+      className="asset-thumb mat-thumb"
+      style={{ width: size, height: size, background: def?.color ?? "#888" }}
+    >
       {mapUrl && <img className="mat-thumb-map" src={mapUrl} alt="" draggable={false} />}
     </div>
   );
 }
 
-function Thumb({ entry }) {
+function Thumb({ entry, size }) {
   if (entry.is_dir)
     return (
-      <div className="asset-icon dir-icon">
-        <Folder size={28} strokeWidth={1.5} />
+      <div className="asset-icon dir-icon" style={{ width: size, height: size }}>
+        <Folder size={size * 0.72} strokeWidth={1.5} />
       </div>
     );
-  if (TEXTURE_EXTENSIONS.includes(entry.ext)) return <TextureThumb path={entry.path} />;
-  if (entry.ext === "mat") return <MaterialThumb path={entry.path} />;
+  if (TEXTURE_EXTENSIONS.includes(entry.ext)) return <TextureThumb path={entry.path} size={size} />;
+  if (entry.ext === "mat") return <MaterialThumb path={entry.path} size={size} />;
   const Icon = ICON_BY_EXT[entry.ext] ?? File;
   return (
-    <div className="asset-icon">
-      <Icon size={26} strokeWidth={1.5} />
+    <div className="asset-icon" style={{ width: size, height: size }}>
+      <Icon size={size * 0.65} strokeWidth={1.5} />
     </div>
   );
 }
@@ -287,65 +261,116 @@ const DRAGGABLE_EXTENSIONS = [
   ...MATERIAL_EXTENSIONS,
   ...PREFAB_EXTENSIONS,
   ...ANIMATOR_EXTENSIONS,
+  ...GEOMETRY_EXTENSIONS,
 ];
 
-function AssetTile({ entry, renaming, setRenamingPath, onContextMenu }) {
+function openEntry(entry) {
+  if (entry.is_dir) {
+    useProjectStore.getState().navigate(entry.path);
+  } else if (SCRIPT_EXTENSIONS.includes(entry.ext)) {
+    openInIDE(entry.path);
+  } else if (entry.ext === "scene") {
+    openScenePath(entry.path).catch((err) => console.error(String(err)));
+  } else if (PREFAB_EXTENSIONS.includes(entry.ext)) {
+    // Double-click opens the prefab in isolation, like Unity's Prefab Mode.
+    openPrefabMode(entry.path).catch((err) => console.error(String(err)));
+  } else if (ANIMATOR_EXTENSIONS.includes(entry.ext)) {
+    useSelectionStore.getState().selectAsset(entry.path);
+    import("../EditorShell.jsx").then((m) => m.openPanel("animator"));
+  }
+}
+
+function RenameInput({ entry, setRenamingPath }) {
+  const commit = (value) => {
+    setRenamingPath(null);
+    renameEntry(entry, value);
+  };
+  return (
+    <input
+      className="rename-input asset-rename"
+      autoFocus
+      defaultValue={entry.name}
+      onFocus={(e) => e.target.select()}
+      onBlur={(e) => commit(e.target.value)}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") commit(e.target.value);
+        if (e.key === "Escape") setRenamingPath(null);
+      }}
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      onPointerDown={(e) => e.stopPropagation()}
+    />
+  );
+}
+
+function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextMenu }) {
   const draggable = entry.is_dir || DRAGGABLE_EXTENSIONS.includes(entry.ext);
-  const selected = useSelectionStore((s) => s.assetPath === entry.path);
+  const selected = useSelectionStore((s) => s.assetPaths.includes(entry.path));
+  const details = view.id === "details";
 
   // Folders accept asset drops (move into folder).
   const dropRef = useAssetDrop({
     accepts: (path) => path !== entry.path,
     hoverClass: "drop-target",
-    onDrop: (path) => moveIntoFolder(path, entry.path),
+    onDrop: (path) => moveDraggedIntoFolder(path, entry.path),
   });
 
-  const commitRename = (value) => {
-    setRenamingPath(null);
-    renameEntry(entry, value);
+  const handlers = {
+    "data-asset-path": entry.path,
+    ref: entry.is_dir ? dropRef : undefined,
+    onPointerDown: (e) => {
+      // Selecting on pointerdown (not click) so a drag that starts on an
+      // unselected tile carries that tile, and a drag on a multi-selection
+      // keeps it intact.
+      if (renaming || e.target.closest("input") || e.button !== 0) return;
+      const sel = useSelectionStore.getState();
+      const inSelection = sel.assetPaths.includes(entry.path);
+      if (!inSelection || e.shiftKey || e.ctrlKey || e.metaKey) clickSelect(e, entry, visible);
+      if (draggable) armAssetDrag(e, entry.path, { isDir: entry.is_dir });
+    },
+    onClick: (e) => {
+      if (consumeAssetDragClick()) return;
+      // A plain click on an already-multi-selected tile collapses the
+      // selection to it (Explorer behaviour) — pointerdown left it alone so
+      // the drag could carry the whole set.
+      const sel = useSelectionStore.getState();
+      if (!e.shiftKey && !e.ctrlKey && !e.metaKey && sel.assetPaths.length > 1) {
+        sel.selectAsset(entry.path);
+      }
+    },
+    onDoubleClick: () => openEntry(entry),
+    onContextMenu: (e) => onContextMenu(e, entry),
+    title: entry.name,
   };
+
+  if (details) {
+    return (
+      <div className={`asset-row ${selected ? "selected" : ""}`} {...handlers}>
+        <div className="asset-row-name">
+          <Thumb entry={entry} size={view.thumb} />
+          {renaming ? (
+            <RenameInput entry={entry} setRenamingPath={setRenamingPath} />
+          ) : (
+            <span className="asset-row-label">{entry.name}</span>
+          )}
+        </div>
+        <div className="asset-col">{entry.is_dir ? "Folder" : (TYPE_LABEL[entry.ext] ?? entry.ext.toUpperCase())}</div>
+        <div className="asset-col">{entry.is_dir ? "—" : formatBytes(entry.size)}</div>
+        <div className="asset-col">{formatDate(entry.modified)}</div>
+      </div>
+    );
+  }
 
   return (
     <div
       className={`asset-tile ${entry.is_dir ? "dir" : ""} ${selected ? "selected" : ""}`}
-      ref={entry.is_dir ? dropRef : undefined}
-      onPointerDown={(e) => {
-        if (draggable && !renaming && !e.target.closest("input")) {
-          armAssetDrag(e, entry.path, { isDir: entry.is_dir });
-        }
-      }}
-      onClick={() => {
-        if (consumeAssetDragClick()) return;
-        if (!entry.is_dir) useSelectionStore.getState().selectAsset(entry.path);
-      }}
-      onDoubleClick={() => {
-        if (entry.is_dir) useProjectStore.getState().navigate(entry.path);
-        else if (SCRIPT_EXTENSIONS.includes(entry.ext)) openInIDE(entry.path);
-        else if (entry.ext === "scene") openScenePath(entry.path).catch((err) => console.error(String(err)));
-        else if (ANIMATOR_EXTENSIONS.includes(entry.ext)) {
-          useSelectionStore.getState().selectAsset(entry.path);
-          import("../EditorShell.jsx").then((m) => m.openPanel("animator"));
-        }
-      }}
-      onContextMenu={(e) => onContextMenu(e, entry)}
-      title={entry.name}
+      {...handlers}
     >
-      <Thumb entry={entry} />
+      <Thumb entry={entry} size={view.thumb} />
       {MODEL_EXTENSIONS.includes(entry.ext) && <DracoBadge path={entry.path} />}
       {renaming ? (
-        <input
-          className="rename-input asset-rename"
-          autoFocus
-          defaultValue={entry.name}
-          onFocus={(e) => e.target.select()}
-          onBlur={(e) => commitRename(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") commitRename(e.target.value);
-            if (e.key === "Escape") setRenamingPath(null);
-          }}
-          onClick={(e) => e.stopPropagation()}
-          onDoubleClick={(e) => e.stopPropagation()}
-        />
+        <RenameInput entry={entry} setRenamingPath={setRenamingPath} />
       ) : (
         <div className="asset-name">{entry.name}</div>
       )}
@@ -353,19 +378,27 @@ function AssetTile({ entry, renaming, setRenamingPath, onContextMenu }) {
   );
 }
 
-function AssetContextMenu({ menu, close, setRenamingPath }) {
+function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
   const entry = menu.entry;
+  // Right-clicking inside a multi-selection acts on the whole set.
+  const multi = entry && selectedEntries.length > 1 && selectedEntries.some((s) => s.path === entry.path);
+  const targets = multi ? selectedEntries : entry ? [entry] : [];
+
   const items = entry
     ? [
-        { label: "Rename", action: () => setRenamingPath(entry.path) },
-        { label: "Delete", action: () => deleteEntry(entry) },
-        ...(MODEL_EXTENSIONS.includes(entry.ext)
+        ...(multi
+          ? []
+          : [{ label: "Rename", action: () => setRenamingPath(entry.path) }]),
+        { label: multi ? `Delete ${targets.length} items` : "Delete", action: () => deleteEntries(targets) },
+        ...(!multi && MODEL_EXTENSIONS.includes(entry.ext)
           ? [
               { label: "Unpack Model", action: () => unpackModel(entry.path) },
               { label: "Compress (Draco)", action: () => compressModel(entry.path) },
             ]
           : []),
-        ...(!entry.is_dir ? [{ label: "Open in Default App", action: () => openInIDE(entry.path) }] : []),
+        ...(!multi && !entry.is_dir
+          ? [{ label: "Open in Default App", action: () => openInIDE(entry.path) }]
+          : []),
       ]
     : [
         { label: "New Folder", action: createFolder },
@@ -425,13 +458,13 @@ async function unpackModel(path) {
 /** Manually Draco-compresses a .glb in place (context menu). */
 async function compressModel(path) {
   try {
-    const { compressGlbInPlace, formatBytes } = await import("../dracoCompress.js");
+    const { compressGlbInPlace, formatBytes: fmt } = await import("../dracoCompress.js");
     const info = await compressGlbInPlace(path);
     if (info == null) {
       console.log(`${basename(path)} is already Draco-compressed`);
     } else if (info.compressed < info.original) {
       const pct = Math.round((1 - info.compressed / info.original) * 100);
-      console.log(`Draco: ${basename(path)} −${pct}% (${formatBytes(info.original)} → ${formatBytes(info.compressed)})`);
+      console.log(`Draco: ${basename(path)} −${pct}% (${fmt(info.original)} → ${fmt(info.compressed)})`);
     } else {
       console.log(`Draco: ${basename(path)} already minimal — left uncompressed`);
     }
@@ -441,29 +474,124 @@ async function compressModel(path) {
   }
 }
 
+/**
+ * Rubber-band selection over the asset grid. Returns the marquee rectangle to
+ * draw (in grid-content coordinates) plus the pointerdown handler that starts
+ * a drag. Tiles are hit-tested through their `data-asset-path` attribute, so
+ * this works identically for the tile grid and the details rows.
+ */
+function useBoxSelect(gridRef) {
+  const [box, setBox] = useState(null); // {left, top, width, height} in content coords
+
+  const onPointerDown = (e) => {
+    const grid = gridRef.current;
+    if (!grid || e.button !== 0) return;
+    // Only empty space starts a marquee — tiles handle their own pointerdown.
+    if (e.target.closest("[data-asset-path]")) return;
+
+    const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+    const base = additive ? useSelectionStore.getState().assetPaths : [];
+    if (!additive) useSelectionStore.getState().clear();
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let dragging = false;
+
+    const onMove = (ev) => {
+      const rect = grid.getBoundingClientRect();
+      if (!dragging) {
+        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 4) return;
+        dragging = true;
+      }
+      const view = {
+        left: Math.min(startX, ev.clientX),
+        right: Math.max(startX, ev.clientX),
+        top: Math.min(startY, ev.clientY),
+        bottom: Math.max(startY, ev.clientY),
+      };
+      const hits = pathsInBox(
+        view,
+        [...grid.querySelectorAll("[data-asset-path]")].map((el) => [
+          el.dataset.assetPath,
+          el.getBoundingClientRect(),
+        ]),
+      );
+      useSelectionStore.getState().selectAssets([...base, ...hits], { anchor: hits[0] ?? base[0] });
+
+      setBox({
+        left: view.left - rect.left + grid.scrollLeft,
+        top: view.top - rect.top + grid.scrollTop,
+        width: view.right - view.left,
+        height: view.bottom - view.top,
+      });
+    };
+
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      setBox(null);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+
+  return { box, onPointerDown };
+}
+
 export function AssetsPanel() {
   const rootPath = useProjectStore((s) => s.rootPath);
   const currentPath = useProjectStore((s) => s.currentPath);
   const entries = useProjectStore((s) => s.entries);
   const loading = useProjectStore((s) => s.loading);
   const error = useProjectStore((s) => s.error);
+  const assetPaths = useSelectionStore((s) => s.assetPaths);
   const [renamingPath, setRenamingPath] = useState(null);
   const [contextMenu, setContextMenu] = useState(null); // {x, y, entry|null}
   const [fileDropActive, setFileDropActive] = useState(false);
+  const [viewId, setViewId] = useState(() => localStorage.getItem(VIEW_KEY) ?? "medium");
+  const [showTree, setShowTree] = useState(() => localStorage.getItem(TREE_KEY) !== "0");
   const panelRef = useRef(null);
+  const gridRef = useRef(null);
+
+  const view = VIEW_MODES.find((v) => v.id === viewId) ?? VIEW_MODES[2];
+  // .meta sidecars are edited via their asset's inspector, not shown as tiles.
+  const visible = useMemo(() => entries.filter((e) => !e.name.endsWith(".meta")), [entries]);
+  const selectedEntries = useMemo(
+    () => visible.filter((e) => assetPaths.includes(e.path)),
+    [visible, assetPaths],
+  );
+
+  const { box, onPointerDown: onGridPointerDown } = useBoxSelect(gridRef);
+
+  const setView = (id) => {
+    setViewId(id);
+    localStorage.setItem(VIEW_KEY, id);
+  };
+  const toggleTree = () => {
+    setShowTree((prev) => {
+      localStorage.setItem(TREE_KEY, prev ? "0" : "1");
+      return !prev;
+    });
+  };
 
   // Drop an asset on the "Up" button: move it into the parent folder.
   const upDropRef = useAssetDrop({
     accepts: () => currentPath !== rootPath,
     onDrop: (path) => {
       const parent = currentPath.replace(/[\\/][^\\/]+$/, "");
-      moveIntoFolder(path, parent || rootPath);
+      moveDraggedIntoFolder(path, parent || rootPath);
     },
   });
 
   useEffect(() => {
     if (!rootPath) useProjectStore.getState().restoreLastFolder();
   }, [rootPath]);
+
+  // Leaving a folder drops its selection — the paths aren't on screen any more.
+  useEffect(() => {
+    useSelectionStore.getState().clear();
+    setRenamingPath(null);
+  }, [currentPath]);
 
   // Ensure the engine's .d.ts files are present in the project root so the
   // user's IDE provides `this.entity` / `this.engine` autocomplete when they
@@ -538,12 +666,44 @@ export function AssetsPanel() {
   const onTileContextMenu = (e, entry) => {
     e.preventDefault();
     e.stopPropagation();
+    // Right-clicking outside the selection reselects the clicked entry, so the
+    // menu always acts on what's highlighted.
+    if (entry && !useSelectionStore.getState().assetPaths.includes(entry.path)) {
+      useSelectionStore.getState().selectAsset(entry.path);
+    }
     setContextMenu({ x: e.clientX, y: e.clientY, entry });
+  };
+
+  // Grid keyboard shortcuts. The grid is focusable, so these only fire while
+  // the Assets panel has focus and never steal Delete from the viewport.
+  const onGridKeyDown = (e) => {
+    if (e.target.closest("input")) return;
+    const sel = useSelectionStore.getState();
+    if (e.key === "Delete" && sel.assetPaths.length) {
+      e.preventDefault();
+      e.stopPropagation();
+      deleteEntries(visible.filter((v) => sel.assetPaths.includes(v.path)));
+    } else if (e.key === "F2" && sel.assetPath) {
+      e.preventDefault();
+      setRenamingPath(sel.assetPath);
+    } else if (e.key === "Escape") {
+      sel.clear();
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      sel.selectAssets(visible.map((v) => v.path));
+    }
   };
 
   return (
     <div className={`assets-panel ${fileDropActive ? "file-drop" : ""}`} ref={panelRef}>
       <div className="panel-toolbar">
+        <button
+          className={`toolbar-btn icon-only ${showTree ? "active" : ""}`}
+          title="Toggle folder tree"
+          onClick={toggleTree}
+        >
+          <PanelLeft size={14} />
+        </button>
         <button
           className="toolbar-btn icon-only"
           title="Up one folder"
@@ -556,15 +716,40 @@ export function AssetsPanel() {
         <span className="asset-path" title={currentPath}>
           {currentPath === rootPath ? basename(rootPath) : currentPath?.slice(rootPath.length + 1)}
         </span>
-        <button className="toolbar-btn" title="New folder" onClick={createFolder}>
+        {selectedEntries.length > 0 && (
+          <button
+            className="toolbar-btn icon-only danger"
+            title={
+              selectedEntries.length === 1
+                ? `Delete ${selectedEntries[0].name}`
+                : `Delete ${selectedEntries.length} items`
+            }
+            onClick={() => deleteEntries(selectedEntries)}
+          >
+            <Trash2 size={14} />
+          </button>
+        )}
+        <button className="toolbar-btn icon-only" title="New folder" onClick={createFolder}>
           <FolderPlus size={14} />
         </button>
-        <button className="toolbar-btn" title="New script" onClick={createScript}>
+        <button className="toolbar-btn icon-only" title="New script" onClick={createScript}>
           <FileCode2 size={14} />
         </button>
-        <button className="toolbar-btn" title="New material" onClick={createMaterial}>
+        <button className="toolbar-btn icon-only" title="New material" onClick={createMaterial}>
           <Palette size={14} />
         </button>
+        <div className="view-mode-group">
+          {VIEW_MODES.map(({ id, title, Icon }) => (
+            <button
+              key={id}
+              className={`toolbar-btn icon-only ${viewId === id ? "active" : ""}`}
+              title={title}
+              onClick={() => setView(id)}
+            >
+              <Icon size={14} />
+            </button>
+          ))}
+        </div>
         <button
           className="toolbar-btn icon-only"
           title="Open project folder…"
@@ -574,28 +759,60 @@ export function AssetsPanel() {
         </button>
       </div>
       {error && <div className="asset-error">{error}</div>}
-      <div
-        className="asset-grid"
-        onContextMenu={(e) => {
-          e.preventDefault();
-          setContextMenu({ x: e.clientX, y: e.clientY, entry: null });
-        }}
-      >
-        {loading && <div className="asset-hint">Loading…</div>}
-        {!loading && entries.length === 0 && <div className="asset-hint">Empty folder</div>}
-        {/* .meta sidecars are edited via their asset's inspector, not shown as tiles */}
-        {entries.filter((e) => !e.name.endsWith(".meta")).map((entry) => (
-          <AssetTile
-            key={entry.path}
-            entry={entry}
-            renaming={renamingPath === entry.path}
-            setRenamingPath={setRenamingPath}
-            onContextMenu={onTileContextMenu}
-          />
-        ))}
+      <div className="assets-body">
+        {showTree && (
+          <div className="assets-sidebar">
+            <FolderTree />
+          </div>
+        )}
+        <div
+          className={`asset-grid view-${view.id}`}
+          ref={gridRef}
+          tabIndex={0}
+          onKeyDown={onGridKeyDown}
+          onPointerDown={onGridPointerDown}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            useSelectionStore.getState().clear();
+            setContextMenu({ x: e.clientX, y: e.clientY, entry: null });
+          }}
+        >
+          {loading && <div className="asset-hint">Loading…</div>}
+          {!loading && visible.length === 0 && <div className="asset-hint">Empty folder</div>}
+          {view.id === "details" && visible.length > 0 && (
+            <div className="asset-row header">
+              <div className="asset-row-name">Name</div>
+              <div className="asset-col">Type</div>
+              <div className="asset-col">Size</div>
+              <div className="asset-col">Modified</div>
+            </div>
+          )}
+          {visible.map((entry) => (
+            <AssetItem
+              key={entry.path}
+              entry={entry}
+              view={view}
+              visible={visible}
+              renaming={renamingPath === entry.path}
+              setRenamingPath={setRenamingPath}
+              onContextMenu={onTileContextMenu}
+            />
+          ))}
+          {box && (
+            <div
+              className="asset-marquee"
+              style={{ left: box.left, top: box.top, width: box.width, height: box.height }}
+            />
+          )}
+        </div>
       </div>
       {contextMenu && (
-        <AssetContextMenu menu={contextMenu} close={() => setContextMenu(null)} setRenamingPath={setRenamingPath} />
+        <AssetContextMenu
+          menu={contextMenu}
+          close={() => setContextMenu(null)}
+          setRenamingPath={setRenamingPath}
+          selectedEntries={selectedEntries}
+        />
       )}
     </div>
   );

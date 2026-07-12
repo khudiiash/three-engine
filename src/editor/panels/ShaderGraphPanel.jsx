@@ -281,12 +281,23 @@ function MaterialPreview({ material }) {
     if (!canvas || !material) return;
     let disposed = false;
     let renderer;
+    let resizeObserver;
     (async () => {
       renderer = new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true });
       renderer.setPixelRatio(window.devicePixelRatio);
-      renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+      const resize = () => {
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        if (width < 1 || height < 1) return false;
+        renderer.setSize(width, height, false);
+        return true;
+      };
+      // Never initialize a WebGPU swapchain from a hidden dock tab's 0x0 box.
+      if (!resize()) renderer.setSize(canvas.width || 220, canvas.height || 170, false);
       await renderer.init();
       if (disposed) return void renderer.dispose();
+      resizeObserver = new ResizeObserver(() => resize());
+      resizeObserver.observe(canvas);
       const scene = new THREE.Scene();
       scene.add(new THREE.AmbientLight(0xffffff, 0.5));
       const key = new THREE.DirectionalLight(0xffffff, 2.2);
@@ -303,7 +314,7 @@ function MaterialPreview({ material }) {
       scene.add(mesh);
       const timer = new THREE.Timer();
       renderer.setAnimationLoop(() => {
-        if (disposed) return;
+        if (disposed || !canvas.isConnected || canvas.clientWidth < 1 || canvas.clientHeight < 1) return;
         timer.update();
         mesh.rotation.y += timer.getDelta() * 0.5;
         renderer.render(scene, camera);
@@ -311,6 +322,7 @@ function MaterialPreview({ material }) {
     })();
     return () => {
       disposed = true;
+      resizeObserver?.disconnect();
       if (renderer) {
         renderer.setAnimationLoop(null);
         renderer.dispose();

@@ -82,6 +82,38 @@ export {
   AUDIO_ASSET_DEFAULTS,
 } from "./audio/AudioAsset.js";
 export { serializeScene, deserializeScene, serializeEntity, instantiateEntity } from "./serialize.js";
+export {
+  PREFAB_EXT,
+  LEGACY_PREFAB_EXT,
+  prefabRegistry,
+  registerPrefabDefs,
+  parsePrefabFile,
+  makeDef,
+  makeVariantDef,
+  newGuid,
+  newFid,
+  isVariant,
+  isPrefabDef,
+  resolvePrefab,
+  resolveInstance,
+  instantiatePrefabNode,
+  unpackInstance,
+  getPrefabRoot,
+  isPrefabRoot,
+  isInsidePrefab,
+  diffInstance,
+  hasOverrides,
+  groupOverrides,
+  instanceNodeOf,
+  respawnInstance,
+  reloadPrefab,
+  instancesAffectedBy,
+  createDefFromEntity,
+  bindEntityToPrefab,
+  createVariantDefFromInstance,
+  defWithInstanceApplied,
+  defFromStageRoot,
+} from "./prefab/index.js";
 export { setAssetResolver, resolveAssetUrl, setScriptLoader, loadScriptModule, setAssetMetaLoader, loadAssetMeta } from "./assetResolver.js";
 export { SCENE_SETTINGS_DEFAULTS, TONE_MAPPINGS } from "./sceneSettings.js";
 export { EDITOR_LAYER } from "./editorLayers.js";

@@ -10,6 +10,8 @@ import { refreshMaterialsUsingTexture } from "../../engine/materialAsset.js";
 import { MaterialEditor } from "./MaterialPanel.jsx";
 import { openPanel } from "../EditorShell.jsx";
 import { syncScriptClassNameAfterRename } from "../scriptClassSync.js";
+import { openPrefabMode } from "../prefab.js";
+import { prefabRegistry, resolvePrefab, isPrefabDef } from "../../engine/index.js";
 
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
 const stemOf = (name) => name.replace(/\.[^.]+$/, "");
@@ -40,7 +42,8 @@ const TYPE_LABELS = {
   glb: "Model",
   mat: "Material",
   anim: "Animator",
-  entity: "Prefab",
+  prefab: "Prefab",
+  entity: "Prefab (legacy)",
   js: "Script",
   ts: "Script",
   scene: "Scene",
@@ -197,6 +200,7 @@ function ModelPreview({ path }) {
   useEffect(() => {
     let disposed = false;
     let renderer = null;
+    let resizeObserver = null;
     setInfo(null);
     setError(null);
 
@@ -224,6 +228,12 @@ function ModelPreview({ path }) {
         const width = canvas.clientWidth || 280;
         const height = canvas.clientHeight || 190;
         renderer.setSize(width, height, false);
+        resizeObserver = new ResizeObserver(() => {
+          const nextWidth = canvas.clientWidth;
+          const nextHeight = canvas.clientHeight;
+          if (nextWidth > 0 && nextHeight > 0) renderer?.setSize(nextWidth, nextHeight, false);
+        });
+        resizeObserver.observe(canvas);
 
         const scene = new THREE.Scene();
         scene.add(new THREE.HemisphereLight(0xffffff, 0x30343c, 1.4));
@@ -246,6 +256,7 @@ function ModelPreview({ path }) {
         const timer = new THREE.Timer();
         let angle = 0.7;
         renderer.setAnimationLoop(() => {
+          if (!canvas.isConnected || canvas.clientWidth < 1 || canvas.clientHeight < 1) return;
           timer.update();
           const dt = timer.getDelta();
           angle += dt * 0.5;
@@ -265,6 +276,7 @@ function ModelPreview({ path }) {
 
     return () => {
       disposed = true;
+      resizeObserver?.disconnect();
       renderer?.setAnimationLoop(null);
       renderer?.dispose();
     };
@@ -353,19 +365,49 @@ function AnimatorSummary({ path }) {
   );
 }
 
+/** Entities in a resolved prefab tree, counted for the summary line. */
+function countNodes(node) {
+  if (!node) return 0;
+  return 1 + (node.children ?? []).reduce((sum, child) => sum + countNodes(child), 0);
+}
+
 function PrefabSummary({ path }) {
   return (
     <JsonSummary
       path={path}
-      render={(prefab) => (
-        <div className="inspector-section">
-          <div className="section-header">Prefab</div>
-          <div className="asset-info-row">
-            <Package size={13} /> {prefab.name} · {(prefab.components ?? []).map((c) => c.type).join(", ") || "empty"}
+      render={(file) => {
+        // `.prefab` files are defs; legacy `.entity` files are bare snapshots.
+        const def = isPrefabDef(file) ? file : null;
+        const guid = def?.guid ?? prefabRegistry.guidForPath(path);
+        const resolved = guid ? resolvePrefab(guid) : null;
+        const base = def?.variantOf ? prefabRegistry.getDef(prefabRegistry.resolveLink(def.variantOf)) : null;
+        const name = def?.name ?? file.name ?? "Prefab";
+        const entities = resolved ? countNodes(resolved) : countNodes(file);
+        const components = resolved
+          ? (resolved.components ?? []).map((c) => c.type)
+          : (file.components ?? []).map((c) => c.type);
+
+        return (
+          <div className="inspector-section">
+            <div className="section-header">Prefab</div>
+            <div className="asset-info-row">
+              <Package size={13} /> {name} · {entities} {entities === 1 ? "entity" : "entities"}
+              {components.length ? ` · ${components.join(", ")}` : ""}
+            </div>
+            {base && <div className="asset-info-row">Variant of {base.name}</div>}
+            {!def && (
+              <div className="asset-hint">
+                Legacy snapshot — it still works, but it isn't linked. Instances of it won't track edits to this file.
+              </div>
+            )}
+            <button className="toolbar-btn wide" onClick={() => openPrefabMode(path)}>
+              <Package size={13} />
+              Open Prefab
+            </button>
+            <div className="asset-hint">Drag into the viewport or hierarchy to add a linked instance.</div>
           </div>
-          <div className="asset-hint">Drag into the viewport to add it to the scene.</div>
-        </div>
-      )}
+        );
+      }}
     />
   );
 }
@@ -420,7 +462,7 @@ export function AssetInspector({ path }) {
       {ext === "glb" && <ModelPreview path={path} />}
       {ext === "mat" && <MaterialEditor matPath={path} />}
       {ext === "anim" && <AnimatorSummary path={path} />}
-      {ext === "entity" && <PrefabSummary path={path} />}
+      {(ext === "prefab" || ext === "entity") && <PrefabSummary path={path} />}
     </div>
   );
 }

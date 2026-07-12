@@ -3,9 +3,11 @@ import { texture as tslTexture, uv, float, vec3, normalMap } from "three/tsl";
 import { Component } from "../../engine/components/Component.js";
 import { resolveAssetUrl, loadAssetMeta } from "../../engine/assetResolver.js";
 import { applyTextureMeta } from "../../engine/textureMeta.js";
+import { getGltfLoader } from "../../engine/gltfLoader.js";
 
 export const MAX_TERRAIN_LAYERS = 4;
 export const SCULPT_TOOLS = ["raise", "lower", "smooth", "flatten", "sharpen", "erode", "noise"];
+const scatterLoader = getGltfLoader();
 
 /** A fresh terrain layer — a full PBR surface (rock, grass, …), not just a
  *  texture. `albedo`/`normalMap`/`roughnessMap` are optional asset paths;
@@ -20,6 +22,135 @@ export function makeTerrainLayer(overrides = {}) {
     tint: "#8a8f7a",
     roughness: 0.95,
     metalness: 0,
+    visible: true,
+    ...overrides,
+  };
+}
+
+export const SCATTER_ALIGN_MODES = ["surface", "axis", "source"];
+export const SCATTER_AXES = ["+x", "-x", "+y", "-y", "+z", "-z"];
+
+const AXIS_VECTORS = {
+  "+x": new THREE.Vector3(1, 0, 0),
+  "-x": new THREE.Vector3(-1, 0, 0),
+  "+y": new THREE.Vector3(0, 1, 0),
+  "-y": new THREE.Vector3(0, -1, 0),
+  "+z": new THREE.Vector3(0, 0, 1),
+  "-z": new THREE.Vector3(0, 0, -1),
+};
+const UP_Y = new THREE.Vector3(0, 1, 0);
+
+// Scratch objects — `scatterPlacementMatrix` runs once per instance per refresh
+// (thousands of times on a sculpt stroke), so it must not allocate.
+const _pos = new THREE.Vector3();
+const _up = new THREE.Vector3();
+const _quat = new THREE.Quaternion();
+const _q2 = new THREE.Quaternion();
+const _q3 = new THREE.Quaternion();
+const _scale = new THREE.Vector3();
+const _euler = new THREE.Euler();
+
+/**
+ * The six random numbers an instance keeps: [yaw, tiltX, tiltZ, scale, stretch,
+ * heightOffset], each in 0..1. Storing the *draws* rather than the resolved
+ * values is what makes the layer's ranges editable after the fact — the same
+ * rock keeps its identity in the distribution while the range moves under it.
+ */
+function randomDraws(random) {
+  return [random(), random(), random(), random(), random(), random()];
+}
+
+/** A PRNG seeded from a position — same spot, same numbers, every time. */
+function positionSeeded(x, z) {
+  let state = (Math.imul(Math.round(x * 1000) | 0, 374761393) ^ Math.imul(Math.round(z * 1000) | 0, 668265263)) >>> 0;
+  return () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+}
+
+/**
+ * Upgrades instances painted before placement settings existed. Those baked
+ * their transform into the instance, which means every knob on the layer would
+ * do nothing to them — the thing you'd actually notice as "changing the
+ * settings has no effect on my scatter".
+ *
+ * The migration must be *deterministic*: it runs again on every `setProp`
+ * (props still hold the old shape until the next commit), so drawing fresh
+ * randoms would reshuffle the whole layer on each keystroke. Seeding from the
+ * instance's position fixes that, and the existing scale is inverted back into
+ * its draw so instances keep the exact size they already had.
+ */
+function migrateScatterInstances(layer) {
+  for (const item of layer.instances ?? []) {
+    if (item.r) continue;
+    const x = item.position?.[0] ?? 0;
+    const z = item.position?.[2] ?? 0;
+    const random = positionSeeded(x, z);
+    const scaleMin = layer.scaleMin ?? 0.8;
+    const scaleMax = layer.scaleMax ?? 1.2;
+    const scaleDraw = scaleMax > scaleMin
+      ? THREE.MathUtils.clamp(((item.scale ?? 1) - scaleMin) / (scaleMax - scaleMin), 0, 1)
+      : 0.5;
+    // Yaw/tilt are re-drawn (recovering them from the baked quaternion isn't
+    // worth it — a different shuffle of the same distribution is invisible),
+    // but scale and seating are preserved exactly.
+    item.r = [random(), random(), random(), scaleDraw, 0.5, 0.5];
+    delete item.quaternion;
+    delete item.scale;
+    delete item.heightOffset; // the layer's Sink + the r[5] draw own this now
+  }
+  return layer;
+}
+
+/**
+ * A scatter layer: a model painted onto the terrain as InstancedMeshes.
+ *
+ * Placement settings live on the *layer*, and an instance stores only its
+ * position plus its raw random draws (`r`, six values in 0..1). Nothing about
+ * the final transform is baked, so every knob below re-resolves live across the
+ * instances already painted — drag Scale Max and the existing rocks grow. It
+ * also means surface-aligned instances re-orient themselves when you sculpt the
+ * ground underneath them, instead of hovering at their old angle.
+ */
+export function makeTerrainScatterLayer(overrides = {}) {
+  return {
+    name: "Scatter",
+    sourceType: "asset", // "asset" | "entity"
+    model: "",
+    sourceEntity: "",
+    instances: [],
+    castShadow: true,
+    receiveShadow: true,
+    visible: true,
+
+    // --- orientation ---
+    // "surface" — stand up along the terrain normal (blend controls how much)
+    // "axis"    — a fixed axis, ignoring the terrain
+    // "source"  — copy the source object's own rotation
+    align: "surface",
+    alignAxis: "+y", // the "up" the model is authored around
+    alignBlend: 1, // 0 = ignore the normal, 1 = fully follow it
+    yawMin: 0, // random spin about the model's own up, in degrees
+    yawMax: 360,
+    tiltJitter: 0, // random lean off the align axis, in degrees
+
+    // --- size ---
+    scaleMin: 0.8,
+    scaleMax: 1.2,
+    stretchMin: 1, // extra multiplier on the up axis only (squat/lanky variation)
+    stretchMax: 1,
+
+    // --- seating ---
+    heightOffset: 0, // sink (negative) or lift every instance
+    heightJitter: 0, // ± random sink/lift
+
+    // --- where it's allowed to land (checked when painting) ---
+    slopeMin: 0, // degrees from flat
+    slopeMax: 90,
+    altitudeMin: -1000,
+    altitudeMax: 1000,
+
     ...overrides,
   };
 }
@@ -138,6 +269,7 @@ export class TerrainComponent extends Component {
     heights: "", // base64 Float32Array((resolution+1)^2), row-major
     splatmap: "", // base64 Uint8Array(splatResolution^2 * 4)
     layers: [makeTerrainLayer()], // PBR surfaces blended by the splatmap
+    scatterLayers: [], // model-backed instance layers painted onto the surface
     castShadow: false,
     receiveShadow: true,
   };
@@ -159,6 +291,26 @@ export class TerrainComponent extends Component {
     this.mesh.receiveShadow = !!this.props.receiveShadow;
     this.mesh.visible = this.enabled;
     this.entity.object3D.add(this.mesh);
+    this.scatterRoot = new THREE.Group();
+    this.scatterRoot.name = "Terrain Scatter";
+    this.entity.object3D.add(this.scatterRoot);
+    this.scatterLayersData = this.#adoptScatterLayers(this.props.scatterLayers);
+    this.scatterSources = [];
+    this.unsubScatterModel = this.entity.engine.on("model-loaded", (entity) => {
+      if ((this.scatterLayersData ?? []).some((layer) => layer.sourceType === "entity" && layer.sourceEntity === entity.id)) {
+        this.#loadScatterLayers();
+      }
+    });
+    this.unsubScatterSourceChange = this.entity.engine.on("component-changed", (info) => {
+      if ((info.componentType === "mesh" || info.componentType === "model")
+        && (this.scatterLayersData ?? []).some((layer) => layer.sourceType === "entity" && layer.sourceEntity === info.entityId)) {
+        this.#loadScatterLayers();
+      }
+    });
+    this.unsubScatterHierarchy = this.entity.engine.on("hierarchy-changed", () => {
+      if (this.#scatterSourceReadinessChanged()) this.#loadScatterLayers();
+    });
+    this.#loadScatterLayers();
     this.#loadLayerMaps();
   }
 
@@ -166,19 +318,30 @@ export class TerrainComponent extends Component {
     if (!this.mesh) return;
     this.generation = (this.generation ?? 0) + 1;
     this.entity.object3D.remove(this.mesh);
+    if (this.scatterRoot) this.entity.object3D.remove(this.scatterRoot);
+    this.#disposeScatterLayers();
+    this.unsubScatterModel?.();
+    this.unsubScatterModel = null;
+    this.unsubScatterSourceChange?.();
+    this.unsubScatterSourceChange = null;
+    this.unsubScatterHierarchy?.();
+    this.unsubScatterHierarchy = null;
     this.geometry.dispose();
     this.material.dispose();
     this.splatTexture.dispose();
     this.#disposeLayerMaps();
     this.mesh = null;
+    this.scatterRoot = null;
   }
 
   onDisable() {
     if (this.mesh) this.mesh.visible = false;
+    if (this.scatterRoot) this.scatterRoot.visible = false;
   }
 
   onEnable() {
     if (this.mesh) this.mesh.visible = true;
+    if (this.scatterRoot) this.scatterRoot.visible = true;
   }
 
   onPropChanged(key) {
@@ -196,6 +359,21 @@ export class TerrainComponent extends Component {
     }
     if (key === "layers") {
       this.#loadLayerMaps();
+      return;
+    }
+    if (key === "scatterLayers") {
+      const next = this.#adoptScatterLayers(this.props.scatterLayers);
+      const sourceKeys = next.map((layer) => layer.sourceType === "entity"
+        ? `entity:${layer.sourceEntity ?? ""}`
+        : `asset:${layer.model ?? ""}`);
+      const canReuse = sourceKeys.length === (this.scatterSourceKeys?.length ?? -1)
+        && sourceKeys.every((path, i) => path === this.scatterSourceKeys[i]);
+      this.scatterLayersData = next;
+      if (canReuse) {
+        for (let i = 0; i < next.length; i++) this.#refreshScatterLayer(i);
+      } else {
+        this.#loadScatterLayers();
+      }
       return;
     }
     if (key === "castShadow" || key === "receiveShadow") {
@@ -227,6 +405,7 @@ export class TerrainComponent extends Component {
     pos.needsUpdate = true;
     this.geometry.computeVertexNormals();
     this.geometry.computeBoundingSphere();
+    for (let i = 0; i < (this.scatterLayersData?.length ?? 0); i++) this.#refreshScatterLayer(i);
   }
 
   /** Encode the live heights buffer back into `props` (call once per stroke). */
@@ -257,6 +436,48 @@ export class TerrainComponent extends Component {
       THREE.MathUtils.lerp(h01, h11, tc),
       tr,
     );
+  }
+
+  /** Surface normal sampled from the live heightfield in entity-local space. */
+  normalAtLocal(x, z) {
+    const step = (this.props.size ?? 50) / this.resolution;
+    const dx = this.heightAtLocal(x + step, z) - this.heightAtLocal(x - step, z);
+    const dz = this.heightAtLocal(x, z + step) - this.heightAtLocal(x, z - step);
+    return new THREE.Vector3(-dx, step * 2, -dz).normalize();
+  }
+
+  /** Predicted post-stroke height, used by the editor's outcome silhouette. */
+  previewHeightAtLocal(x, z, center, opts) {
+    const current = this.heightAtLocal(x, z);
+    const { tool, radius, strength, hardness = 0.5, flattenHeight = center.y, seed = 0 } = opts;
+    const dist = Math.hypot(x - center.x, z - center.z);
+    if (dist > radius) return current;
+    const exp = THREE.MathUtils.lerp(0.4, 4, hardness);
+    const amount = strength * Math.pow(1 - dist / radius, exp);
+    const step = (this.props.size ?? 50) / this.resolution;
+    const neighbor = () => {
+      let sum = 0;
+      for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+        sum += this.heightAtLocal(x + dx * step, z + dz * step);
+      }
+      return sum / 9;
+    };
+    switch (tool) {
+      case "raise": return current + amount;
+      case "lower": return current - amount;
+      case "flatten": return current + (flattenHeight - current) * Math.min(1, amount);
+      case "smooth": return current + (neighbor() - current) * Math.min(1, amount);
+      case "sharpen": return current + (current - neighbor()) * amount;
+      case "erode": {
+        let mn = current;
+        for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+          mn = Math.min(mn, this.heightAtLocal(x + dx * step, z + dz * step));
+        }
+        return current + (mn - current) * Math.min(1, amount);
+      }
+      case "noise": return current + (valueNoise(x * 0.5, z * 0.5, seed) * 2 - 1) * amount;
+      default: return current;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -325,6 +546,7 @@ export class TerrainComponent extends Component {
 
     for (let i = 0; i < layers.length; i++) {
       const layer = layers[i] ?? {};
+      if (layer.visible === false) continue;
       const maps = this.layerMaps[i] ?? {};
       const w = weights[i];
       const tiling = layer.tiling ?? 20;
@@ -414,6 +636,355 @@ export class TerrainComponent extends Component {
   }
 
   // ---------------------------------------------------------------------------
+  // Model scatter layers
+  // ---------------------------------------------------------------------------
+
+  /** Takes ownership of the layer data coming out of props: a deep copy (we
+   *  mutate it as the user paints) with legacy instances upgraded in place. */
+  #adoptScatterLayers(layers) {
+    const next = JSON.parse(JSON.stringify(layers ?? []));
+    for (const layer of next) migrateScatterInstances(layer);
+    return next;
+  }
+
+  /** Removes every instance of a layer, keeping the layer and its settings. */
+  clearScatterLayer(layerIndex) {
+    const layer = this.scatterLayersData?.[layerIndex];
+    if (!layer) return 0;
+    const removed = layer.instances?.length ?? 0;
+    layer.instances = [];
+    this.#refreshScatterLayer(layerIndex);
+    return removed;
+  }
+
+  #scatterSourceReadinessChanged() {
+    return (this.scatterLayersData ?? []).some((layer, index) => {
+      if (layer.sourceType !== "entity") return false;
+      const source = this.entity.engine.getEntity(layer.sourceEntity);
+      const hasRenderableSource = !!(source?.getComponent("mesh")?.mesh || source?.getComponent("model")?.root);
+      const hasLoadedScatterSource = !!this.scatterSources?.[index]?.length;
+      return hasRenderableSource !== hasLoadedScatterSource;
+    });
+  }
+
+  async #loadScatterLayers() {
+    if (!this.scatterRoot) return;
+    this.#disposeScatterLayers();
+    const generation = (this.scatterGeneration = (this.scatterGeneration ?? 0) + 1);
+    this.scatterSources = (this.scatterLayersData ?? []).map(() => []);
+    this.scatterSourceKeys = (this.scatterLayersData ?? []).map((layer) => layer.sourceType === "entity"
+      ? `entity:${layer.sourceEntity ?? ""}`
+      : `asset:${layer.model ?? ""}`);
+    await Promise.all((this.scatterLayersData ?? []).map(async (layer, layerIndex) => {
+      try {
+        let root = null;
+        let sourceOwner = null;
+        let owned = false;
+        if (layer?.sourceType === "entity") {
+          sourceOwner = this.entity.engine.getEntity(layer.sourceEntity);
+          if (!sourceOwner) return;
+          sourceOwner.object3D.updateWorldMatrix(true, true);
+        } else {
+          if (!layer?.model) return;
+          const url = await resolveAssetUrl(layer.model);
+          const gltf = await scatterLoader.loadAsync(url);
+          root = gltf.scene;
+          owned = true;
+        }
+        if (generation !== this.scatterGeneration || !this.scatterRoot) return;
+        const objects = [];
+        if (sourceOwner) {
+          const mesh = sourceOwner.getComponent("mesh")?.mesh;
+          const modelRoot = sourceOwner.getComponent("model")?.root;
+          if (mesh) objects.push(mesh);
+          modelRoot?.traverse((object) => object.isMesh && objects.push(object));
+        } else {
+          root.updateMatrixWorld(true);
+          root.traverse((object) => object.isMesh && objects.push(object));
+        }
+        const ownerInverse = sourceOwner?.object3D.matrixWorld.clone().invert();
+        const sources = [];
+        for (const object of objects) {
+          if (!object.isMesh || !object.geometry || !object.material) continue;
+          sources.push({
+            geometry: object.geometry,
+            material: object.material,
+            // The live source mesh for entity-backed layers. Its geometry and
+            // material can still be swapped after this point (async .mat /
+            // geometry-asset resolution), so `#refreshScatterLayer` re-reads
+            // them from here rather than trusting the snapshot above. Asset
+            // (GLB) layers own their objects outright and have nothing to track.
+            object: owned ? null : object,
+            sourceMatrix: ownerInverse
+              ? ownerInverse.clone().multiply(object.matrixWorld)
+              : object.matrixWorld.clone(),
+            mesh: null,
+            owned,
+            animated: !!(object.isSkinnedMesh || sourceOwner?.getComponent("animation")),
+          });
+        }
+        this.scatterSources[layerIndex] = sources;
+        this.#refreshScatterLayer(layerIndex);
+      } catch (err) {
+        console.error(`Terrain scatter source "${layer.model || layer.sourceEntity}": ${err.message}`);
+      }
+    }));
+  }
+
+  #disposeScatterLayers() {
+    this.scatterGeneration = (this.scatterGeneration ?? 0) + 1;
+    for (const sources of this.scatterSources ?? []) {
+      const geometries = new Set();
+      const materials = new Set();
+      for (const source of sources ?? []) {
+        if (source.mesh?.parent) source.mesh.parent.remove(source.mesh);
+        if (source.owned && source.geometry) geometries.add(source.geometry);
+        const mats = Array.isArray(source.material) ? source.material : [source.material];
+        for (const mat of mats) if (source.owned && mat) materials.add(mat);
+      }
+      for (const geometry of geometries) geometry.dispose?.();
+      for (const material of materials) material.dispose?.();
+    }
+    this.scatterSources = [];
+    this.scatterRoot?.clear();
+  }
+
+  /**
+   * The rotation a "source"-aligned layer copies: the source entity's own
+   * orientation, expressed in the terrain's local space (so a rotated terrain
+   * doesn't double-rotate its scatter). Asset-backed layers have no source
+   * entity — their orientation is already baked into `source.sourceMatrix`, so
+   * identity is the right answer there.
+   */
+  #alignSourceQuat(layer, out) {
+    out.identity();
+    if (layer.sourceType !== "entity") return out;
+    const owner = this.entity.engine.getEntity(layer.sourceEntity);
+    if (!owner) return out;
+    owner.object3D.updateWorldMatrix(true, false);
+    this.entity.object3D.updateWorldMatrix(true, false);
+    const terrainQuat = _q2.setFromRotationMatrix(this.entity.object3D.matrixWorld).invert();
+    const sourceQuat = _q3.setFromRotationMatrix(owner.object3D.matrixWorld);
+    return out.copy(terrainQuat).multiply(sourceQuat);
+  }
+
+  /**
+   * Resolves one instance's placement matrix from the layer's settings and the
+   * instance's stored random draws. This is the single definition of what a
+   * scatter instance looks like — the runtime InstancedMesh and the editor's
+   * brush silhouette both go through here, so a preview can't drift from what
+   * actually gets painted.
+   *
+   * `lift` nudges the instance up along the terrain normal (the preview uses it
+   * to avoid z-fighting with the ground).
+   */
+  scatterPlacementMatrix(layerIndex, item, out = new THREE.Matrix4(), lift = 0) {
+    const layer = this.scatterLayersData?.[layerIndex] ?? {};
+    const x = item.position?.[0] ?? 0;
+    const z = item.position?.[2] ?? 0;
+    const ground = this.heightAtLocal(x, z);
+
+    // Instances painted before placement settings existed baked their transform
+    // into the instance. Keep rendering them exactly as they were.
+    const r = item.r;
+    if (!r) {
+      _pos.set(x, ground + (item.heightOffset ?? 0) + lift, z);
+      _quat.fromArray(item.quaternion ?? [0, 0, 0, 1]);
+      _scale.setScalar(item.scale ?? 1);
+      return out.compose(_pos, _quat, _scale);
+    }
+
+    const align = layer.align ?? "surface";
+    const axis = AXIS_VECTORS[layer.alignAxis ?? "+y"] ?? UP_Y;
+    if (align === "source") {
+      this.#alignSourceQuat(layer, _quat);
+    } else {
+      _up.copy(axis);
+      if (align === "surface") {
+        const blend = THREE.MathUtils.clamp(layer.alignBlend ?? 1, 0, 1);
+        _up.lerp(this.normalAtLocal(x, z), blend).normalize();
+      }
+      _quat.setFromUnitVectors(UP_Y, _up);
+    }
+    // Yaw spins the model about its *own* up, so it works the same whether the
+    // instance is standing on flat ground or lying on a cliff face.
+    const yaw = THREE.MathUtils.degToRad(THREE.MathUtils.lerp(layer.yawMin ?? 0, layer.yawMax ?? 360, r[0]));
+    if (yaw) _quat.multiply(_q2.setFromAxisAngle(UP_Y, yaw));
+    const tilt = THREE.MathUtils.degToRad(layer.tiltJitter ?? 0);
+    if (tilt) {
+      _euler.set((r[1] * 2 - 1) * tilt, 0, (r[2] * 2 - 1) * tilt);
+      _quat.multiply(_q2.setFromEuler(_euler));
+    }
+
+    const s = THREE.MathUtils.lerp(layer.scaleMin ?? 0.8, layer.scaleMax ?? 1.2, r[3]);
+    const stretch = THREE.MathUtils.lerp(layer.stretchMin ?? 1, layer.stretchMax ?? 1, r[4]);
+    _scale.set(s, s * stretch, s);
+
+    const offset = (layer.heightOffset ?? 0) + (r[5] * 2 - 1) * (layer.heightJitter ?? 0);
+    _pos.set(x, ground + offset + lift, z);
+    return out.compose(_pos, _quat, _scale);
+  }
+
+  #refreshScatterLayer(layerIndex) {
+    const layer = this.scatterLayersData?.[layerIndex];
+    const sources = this.scatterSources?.[layerIndex];
+    if (!layer || !sources || !this.scatterRoot) return;
+    const instances = layer.instances ?? [];
+    const placementMatrix = new THREE.Matrix4();
+    const finalMatrix = new THREE.Matrix4();
+    for (const source of sources) {
+      // An entity-backed source can swap its geometry/material out from under
+      // us: MeshComponent resolves its `.mat` (and geometry asset) *after*
+      // attach, replacing `mesh.material` with the shared instance. We captured
+      // the placeholder. Re-read the live object rather than trusting the
+      // snapshot — otherwise the scatter renders with the default white
+      // material after every scene load or Play (the material we captured was
+      // never the real one).
+      if (source.object) {
+        if (source.object.geometry && source.object.geometry !== source.geometry) {
+          source.geometry = source.object.geometry;
+          if (source.mesh?.parent) source.mesh.parent.remove(source.mesh);
+          source.mesh = null; // capacity/geometry changed — rebuild below
+        }
+        if (source.object.material && source.object.material !== source.material) {
+          source.material = source.object.material;
+          if (source.mesh) source.mesh.material = source.material;
+        }
+      }
+
+      const needed = Math.max(1, instances.length);
+      let mesh = source.mesh;
+      if (!mesh || mesh.instanceMatrix.count < needed) {
+        if (mesh?.parent) mesh.parent.remove(mesh);
+        const capacity = 2 ** Math.ceil(Math.log2(needed));
+        mesh = new THREE.InstancedMesh(source.geometry, source.material, capacity);
+        this.scatterRoot.add(mesh);
+        source.mesh = mesh;
+      }
+      mesh.count = instances.length;
+      mesh.castShadow = layer.castShadow !== false;
+      mesh.receiveShadow = layer.receiveShadow !== false;
+      mesh.visible = layer.visible !== false;
+      mesh.userData.entityId = this.entity.id;
+      for (let i = 0; i < instances.length; i++) {
+        this.scatterPlacementMatrix(layerIndex, instances[i], placementMatrix);
+        finalMatrix.multiplyMatrices(placementMatrix, source.sourceMatrix);
+        mesh.setMatrixAt(i, finalMatrix);
+      }
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere();
+    }
+  }
+
+  /** Re-rolls every instance's random draws (the "Reseed" button). Positions
+   *  stay put; rotation/scale/offset variation is drawn afresh. */
+  reseedScatterLayer(layerIndex) {
+    const layer = this.scatterLayersData?.[layerIndex];
+    if (!layer) return;
+    for (const item of layer.instances ?? []) {
+      item.r = randomDraws(Math.random);
+      delete item.quaternion; // legacy bake, if any — the draws replace it
+      delete item.scale;
+      delete item.heightOffset;
+    }
+    this.#refreshScatterLayer(layerIndex);
+  }
+
+  /** Source geometry for the editor's true-model scatter silhouette. */
+  getScatterPreviewSources(layerIndex) {
+    return this.scatterSources?.[layerIndex] ?? [];
+  }
+
+  getScatterInstances(layerIndex) {
+    return this.scatterLayersData?.[layerIndex]?.instances ?? [];
+  }
+
+  /**
+   * Picks positions for a brush dab. Only the *position* and the random draws
+   * are decided here — the actual transform is resolved later from the layer's
+   * settings (see `scatterPlacementMatrix`), which is what lets those settings
+   * stay editable after painting.
+   *
+   * A candidate is rejected when it lands outside the terrain, too close to a
+   * neighbour (spacing), or outside the layer's slope / altitude window.
+   */
+  #scatterCandidates(local, opts) {
+    const layer = this.scatterLayersData?.[opts.layerIndex] ?? {};
+    const spacing = Math.max(0.1, opts.spacing ?? 2);
+    const radius = Math.max(0.1, opts.radius ?? 4);
+    const density = THREE.MathUtils.clamp(opts.strength ?? 1, 0.01, 1);
+    const count = Math.min(64, Math.max(1, Math.ceil(Math.PI * radius * radius / (spacing * spacing) * 0.35 * density)));
+    let state = ((opts.seed ?? 0) + 1) >>> 0;
+    const random = () => {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      return state / 4294967296;
+    };
+    const existing = opts.existing ?? [];
+    const accepted = [];
+    const half = (this.props.size ?? 50) / 2;
+    const slopeMin = layer.slopeMin ?? 0;
+    const slopeMax = layer.slopeMax ?? 90;
+    const altitudeMin = layer.altitudeMin ?? -Infinity;
+    const altitudeMax = layer.altitudeMax ?? Infinity;
+
+    for (let attempt = 0; attempt < count * 12 && accepted.length < count; attempt++) {
+      const angle = random() * Math.PI * 2;
+      const radial = Math.sqrt(random()) * radius;
+      const jitter = THREE.MathUtils.clamp(opts.jitter ?? 0.75, 0, 1);
+      const ring = Math.round(radial / spacing) * spacing;
+      const r = THREE.MathUtils.lerp(ring, radial, jitter);
+      const x = local.x + Math.cos(angle) * r;
+      const z = local.z + Math.sin(angle) * r;
+      if (x < -half || x > half || z < -half || z > half) continue;
+      const tooClose = [...existing, ...accepted].some((item) => {
+        const p = item.position;
+        return p && Math.hypot(p[0] - x, p[2] - z) < spacing;
+      });
+      if (tooClose) continue;
+
+      // Slope filter: grass on the flats, nothing on the cliff — the angle
+      // between the surface normal and straight up, in degrees.
+      const normal = this.normalAtLocal(x, z);
+      const slope = THREE.MathUtils.radToDeg(Math.acos(THREE.MathUtils.clamp(normal.y, -1, 1)));
+      if (slope < slopeMin || slope > slopeMax) continue;
+
+      const height = this.heightAtLocal(x, z);
+      if (height < altitudeMin || height > altitudeMax) continue;
+
+      accepted.push({ position: [x, 0, z], r: randomDraws(random) });
+    }
+    return accepted;
+  }
+
+  getScatterPreviewPlacements(local, opts) {
+    const layer = this.scatterLayersData?.[opts.layerIndex];
+    if (!layer || opts.erase) return [];
+    return this.#scatterCandidates(local, { ...opts, existing: layer.instances ?? [] });
+  }
+
+  applyScatterBrush(local, opts) {
+    const layer = this.scatterLayersData?.[opts.layerIndex];
+    if (!layer) return 0;
+    const instances = (layer.instances ??= []);
+    const before = instances.length;
+    if (opts.erase) {
+      const effectiveRadius = Math.max(0.1, opts.radius ?? 4) * THREE.MathUtils.lerp(0.25, 1, opts.strength ?? 1);
+      layer.instances = instances.filter((item) => {
+        const p = item.position;
+        return !p || Math.hypot(p[0] - local.x, p[2] - local.z) > effectiveRadius;
+      });
+    } else {
+      instances.push(...this.#scatterCandidates(local, { ...opts, existing: instances }));
+    }
+    this.#refreshScatterLayer(opts.layerIndex);
+    return Math.abs((layer.instances?.length ?? 0) - before);
+  }
+
+  commitScatterLayers() {
+    return JSON.stringify(this.scatterLayersData ?? []);
+  }
+
+  // ---------------------------------------------------------------------------
   // Sculpt brush (called from the editor's viewport pointer handlers)
   // ---------------------------------------------------------------------------
 
@@ -493,13 +1064,17 @@ export class TerrainComponent extends Component {
 
   /**
    * local: THREE.Vector3 brush center in local space.
-   * opts: { layerIndex, radius, strength, hardness? }
-   * Adds weight to the active layer's channel and renormalizes the four
-   * channels so they sum to 255 per texel (a proper splat weight set).
+   * opts: { layerIndex, radius, strength, hardness?, erase? }
+   * Adds weight to the active layer's channel (or subtracts it when
+   * `erase` is set — the eraser removes what was painted, revealing the
+   * layers underneath) and renormalizes the four channels so they sum to
+   * 255 per texel (a proper splat weight set). If erasing empties a texel
+   * completely it falls back to the base layer (channel 0) so the surface
+   * never renders as an unweighted void.
    */
   applySplatBrush(local, opts) {
     if (!this.splatData) return;
-    const { layerIndex, radius, strength, hardness = 0.5 } = opts;
+    const { layerIndex, radius, strength, hardness = 0.5, erase = false } = opts;
     const layer = THREE.MathUtils.clamp(layerIndex | 0, 0, 3);
     const half = (this.props.size ?? 50) / 2;
     const res = this.splatResolution;
@@ -524,11 +1099,16 @@ export class TerrainComponent extends Component {
         const dist = Math.hypot(wx - local.x, wz - local.z);
         if (dist > radius) continue;
         const falloff = Math.pow(1 - dist / radius, exp);
-        const add = Math.min(1, strength * falloff) * 255;
+        const delta = Math.min(1, strength * falloff) * 255;
         const base = (y * res + x) * 4;
         const cur = [this.splatData[base], this.splatData[base + 1], this.splatData[base + 2], this.splatData[base + 3]];
-        cur[layer] = Math.min(255, cur[layer] + add);
-        const sum = cur[0] + cur[1] + cur[2] + cur[3] || 1;
+        cur[layer] = erase
+          ? Math.max(0, cur[layer] - delta)
+          : Math.min(255, cur[layer] + delta);
+        let sum = cur[0] + cur[1] + cur[2] + cur[3];
+        // Erasing the last remaining weight would leave the texel unweighted
+        // (renders black) — fall back to the base layer instead.
+        if (sum <= 0) { cur[0] = 255; sum = 255; }
         for (let ch = 0; ch < 4; ch++) this.splatData[base + ch] = Math.round((cur[ch] / sum) * 255);
       }
     }

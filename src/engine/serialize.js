@@ -1,6 +1,17 @@
+import { prefabRegistry } from "./prefab/registry.js";
+import { instantiatePrefabNode } from "./prefab/expand.js";
+import { instanceNodeOf } from "./prefab/sync.js";
+
 const SCENE_VERSION = 1;
 
+/**
+ * A prefab instance serializes as a *link*, not as a tree: the entities under
+ * it are the prefab's business, and only the differences (its overrides) belong
+ * to the scene. That's what makes editing a prefab update every instance in
+ * every scene. See engine/prefab/ for the format.
+ */
 export function serializeEntity(entity) {
+  if (entity.prefab) return instanceNodeOf(entity);
   return {
     id: entity.id,
     name: entity.name,
@@ -15,16 +26,26 @@ export function serializeEntity(entity) {
   };
 }
 
-export function serializeScene(engine) {
-  return {
+/**
+ * `embedPrefabs` bundles every registered prefab def into the scene JSON. The
+ * editor doesn't need it (it scans the project for `.prefab` files), but an
+ * exported build has no project to scan — and the player must be able to
+ * resolve instances (and `engine.instantiate` from scripts) with no I/O.
+ */
+export function serializeScene(engine, { embedPrefabs = false } = {}) {
+  const scene = {
     version: SCENE_VERSION,
     name: engine.sceneName,
     settings: structuredClone(engine.settings),
     entities: engine.rootEntities.map(serializeEntity),
   };
+  if (embedPrefabs) scene.prefabs = structuredClone(prefabRegistry.all());
+  return scene;
 }
 
 export function instantiateEntity(engine, data, parent) {
+  if (data.prefab) return instantiatePrefabNode(engine, data, parent);
+
   const entity = engine.createEntity({ id: data.id, name: data.name, parent });
   entity.setTransform(data);
   // Restore the entity-wide viewOnly flag before attaching components so
@@ -51,6 +72,10 @@ export function deserializeScene(engine, json) {
   engine.clear(); // resets settings to defaults
   engine.sceneName = json.name ?? "Untitled";
   if (json.settings) engine.applySettings(json.settings);
+  // Prefabs must be in the registry before any instance node is expanded.
+  for (const def of json.prefabs ?? []) {
+    if (def?.guid) prefabRegistry.register(def, def.path ?? null);
+  }
   for (const entityData of json.entities ?? []) {
     instantiateEntity(engine, entityData, null);
   }

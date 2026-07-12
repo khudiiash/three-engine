@@ -545,6 +545,33 @@ declare module "engine" {
     getEntity(id: string): Entity | null;
     createEntity(opts?: { id?: string; name?: string; parent?: Entity | null }): Entity;
     destroyEntity(entity: Entity): void;
+
+    /**
+     * Spawns a prefab and returns its root entity (null when the prefab can't
+     * be found). Synchronous — prefabs are resolved before the scene loads, so
+     * this is safe to call from `update()`.
+     *
+     * `ref` is a prefab asset path (what an `@attribute({ type: "prefab" })`
+     * field gives you) or a prefab guid.
+     *
+     *   @attribute({ type: "prefab" }) bullet!: string;
+     *
+     *   fire(muzzle: Entity) {
+     *     const b = this.entity.engine.instantiate(this.bullet, {
+     *       position: muzzle.getWorldPosition(new Vector3()),
+     *     });
+     *   }
+     */
+    instantiate(
+      ref: string | { guid?: string; path?: string },
+      opts?: {
+        parent?: Entity | null;
+        position?: Vector3 | [number, number, number];
+        rotation?: Vector3 | [number, number, number];
+        scale?: Vector3 | [number, number, number];
+        name?: string;
+      },
+    ): Entity | null;
   }
 
   // Minimal three.js surface scripts reach into. Mirrors the subset of the
@@ -671,13 +698,16 @@ declare module "engine" {
   /**
    * Schema for an `@attribute`-decorated field. The editor reads this off the
    * loaded class (`static attributes`) and renders an Inspector field of the
-   * matching kind (`number` / `text` / `boolean` / `select` / `vec3`).
+   * matching kind (`number` / `text` / `boolean` / `select` / `vec3` /
+   * `prefab`).
    *
    * Constraints on `min`/`max`/`step` only apply to numeric fields. The
-   * `options` array supplies values for `select` fields.
+   * `options` array supplies values for `select` fields. A `prefab` field
+   * renders a prefab picker and holds the asset path — pass it straight to
+   * `engine.instantiate()`.
    */
   export interface AttributeOptions {
-    type?: "number" | "text" | "boolean" | "select" | "vec3";
+    type?: "number" | "text" | "boolean" | "select" | "vec3" | "prefab";
     default?: unknown;
     min?: number;
     max?: number;

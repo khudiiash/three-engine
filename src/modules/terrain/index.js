@@ -18,6 +18,6 @@ export const terrainModule = {
   version: "1.0.0",
   description:
     "Heightmap terrain with a sculpt brush " +
-    "and up to four splatmap-blended PBR material layers you paint by hand.",
+    "up to four splatmap-blended PBR material layers, and model-instance scatter painting.",
   components: [TerrainComponent],
 };

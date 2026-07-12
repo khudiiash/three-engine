@@ -21,6 +21,10 @@ struct DirEntryInfo {
     path: String,
     is_dir: bool,
     ext: String,
+    /// File size in bytes (0 for directories), shown in the Assets details view.
+    size: u64,
+    /// Last-modified time in seconds since the Unix epoch (0 if unavailable).
+    modified: f64,
 }
 
 /// Lists the immediate children of `path` (directories first, then files, both A-Z).
@@ -35,11 +39,24 @@ fn list_dir(path: String) -> Result<Vec<DirEntryInfo>, String> {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
+        let meta = entry.metadata().ok();
+        let is_dir = file_type.is_dir();
+        let size = match (&meta, is_dir) {
+            (Some(m), false) => m.len(),
+            _ => 0,
+        };
+        let modified = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         entries.push(DirEntryInfo {
             name,
             path: entry.path().to_string_lossy().into_owned(),
-            is_dir: file_type.is_dir(),
+            is_dir,
             ext,
+            size,
+            modified,
         });
     }
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {

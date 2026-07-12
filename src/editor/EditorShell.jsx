@@ -19,6 +19,7 @@ const SceneSettingsPanel = lazy(() => import("./panels/SceneSettingsPanel.jsx").
 const ProjectSettingsPanel = lazy(() => import("./panels/ProjectSettingsPanel.jsx").then((m) => ({ default: m.ProjectSettingsPanel })));
 const ModulesPanel = lazy(() => import("./panels/ModulesPanel.jsx").then((m) => ({ default: m.ModulesPanel })));
 const InputPanel = lazy(() => import("./panels/InputPanel.jsx").then((m) => ({ default: m.InputPanel })));
+const GeometryEditorPanel = lazy(() => import("./panels/GeometryEditorPanel.jsx").then((m) => ({ default: m.GeometryEditorPanel })));
 
 const panelComponents = {
   viewport: ViewportPanel,
@@ -34,6 +35,7 @@ const panelComponents = {
   projectSettings: ProjectSettingsPanel,
   modules: ModulesPanel,
   input: InputPanel,
+  geometryEditor: GeometryEditorPanel,
 };
 
 // The chrome (menu bar + scene/keyboard bootstrap) is lazy-loaded behind a
@@ -61,9 +63,19 @@ export const PANEL_SPECS = {
   projectSettings: { title: "Project Settings", position: { referencePanel: "inspector", direction: "within" } },
   modules: { title: "Modules", position: { referencePanel: "inspector", direction: "within" } },
   input: { title: "Input", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 280 },
+  geometryEditor: { title: "Geometry Editor", position: { referencePanel: "viewport", direction: "within" } },
 };
 
 let dockApi = null;
+// Calls to `openPanel` made before Dockview fires `onReady` would otherwise
+// be silently dropped (and the user would see "panel didn't open" with no
+// obvious cause). We queue them here and flush in onDockReady, so clicking
+// an "Open Particle Editor" / "Edit Material" / "Edit Shader Graph" button
+// during the first paint still opens the panel once Dockview is ready.
+// Using a Set dedupes a flurry of clicks aimed at the same panel — the panel
+// only needs to be opened once, after which Dockview's "focus existing"
+// branch in openPanel handles subsequent toggles.
+const pendingOpenPanels = new Set();
 
 /**
  * Finds the id of a currently visible panel to use as a positioning
@@ -86,7 +98,10 @@ function pickVisibleAnchorId() {
 /** Opens any panel (focuses it if already present), even after it was closed. */
 export function openPanel(id) {
   if (!dockApi) {
-    console.warn(`openPanel(${id}) called before Dockview was ready`);
+    // Dockview not yet mounted (typical during the first paint: heavy panels
+    // like Viewport lazy-load three.js/WebGPU behind Suspense). Park the
+    // request and flush it from onDockReady so the click isn't lost.
+    pendingOpenPanels.add(id);
     return;
   }
   const existing = dockApi.getPanel(id);
@@ -202,6 +217,18 @@ function onDockReady(event) {
       localStorage.setItem(LAYOUT_KEY, JSON.stringify(api.toJSON()));
     }, 500);
   });
+
+  // Flush any openPanel requests that came in while the dock was mounting.
+  // We copy first because openPanel itself is read-only on `dockApi` (it's
+  // set by the time we get here), but adding to a Set we're iterating over
+  // would still be surprising — capturing the planned ids up-front and
+  // clearing the queue keeps things deterministic if more clicks land during
+  // the flush.
+  if (pendingOpenPanels.size > 0) {
+    const queued = [...pendingOpenPanels];
+    pendingOpenPanels.clear();
+    for (const id of queued) openPanel(id);
+  }
 }
 
 export function EditorShell() {
