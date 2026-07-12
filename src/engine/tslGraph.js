@@ -1,6 +1,6 @@
 import * as THREE from "three/webgpu";
 import * as TSL from "three/tsl";
-import { resolveAssetUrl } from "./assetResolver.js";
+import { loadTextureAsset } from "./textureAsset.js";
 
 /**
  * TSL-first shader graph. Every node maps ~1:1 to a `three/tsl` export; the
@@ -18,15 +18,10 @@ import { resolveAssetUrl } from "./assetResolver.js";
  */
 
 const textureCache = new Map(); // path -> Promise<THREE.Texture>
-const textureLoader = new THREE.TextureLoader();
 function loadTexture(path) {
   let cached = textureCache.get(path);
   if (!cached) {
-    cached = resolveAssetUrl(path).then((url) => textureLoader.loadAsync(url)).then((tex) => {
-      tex.colorSpace = THREE.SRGBColorSpace;
-      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-      return tex;
-    });
+    cached = loadTextureAsset(path, { colorSpace: THREE.SRGBColorSpace });
     textureCache.set(path, cached);
   }
   return cached;

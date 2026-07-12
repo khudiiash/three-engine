@@ -26,7 +26,14 @@ export function geometryFromAsset(definition) {
   if (definition.uvs?.length === (positions.length / 3) * 2) {
     geometry.setAttribute("uv", new THREE.Float32BufferAttribute(finiteArray(definition.uvs, 2, "uvs"), 2));
   }
-  geometry.computeVertexNormals();
+  // Authored normals (GLB imports) beat recomputed ones — recomputing loses
+  // smoothing groups / hard edges. Older assets without them still recompute.
+  if (definition.normals?.length === positions.length) {
+    geometry.setAttribute(
+      "normal",
+      new THREE.Float32BufferAttribute(finiteArray(definition.normals, 3, "normals"), 3),
+    );
+  } else geometry.computeVertexNormals();
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
   return geometry;

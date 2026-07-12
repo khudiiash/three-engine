@@ -21,6 +21,7 @@ import {
   vec3,
 } from "three/tsl";
 import { resolveAssetUrl } from "./assetResolver.js";
+import { loadTextureAsset } from "./textureAsset.js";
 import { sampleSurfacePoints, sampleVolumePoints } from "./meshSampling.js";
 
 /**
@@ -385,18 +386,12 @@ function sampleMeshSurface(path) {
   return cached;
 }
 
-const textureLoader = new THREE.TextureLoader();
 const spriteTextureCache = new Map(); // path -> Promise<THREE.Texture>
 
 function loadSpriteTexture(path) {
   let cached = spriteTextureCache.get(path);
   if (!cached) {
-    cached = resolveAssetUrl(path)
-      .then((url) => textureLoader.loadAsync(url))
-      .then((tex) => {
-        tex.colorSpace = THREE.SRGBColorSpace;
-        return tex;
-      });
+    cached = loadTextureAsset(path, { colorSpace: THREE.SRGBColorSpace });
     spriteTextureCache.set(path, cached);
   }
   return cached;

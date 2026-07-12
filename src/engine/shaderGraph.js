@@ -1,14 +1,13 @@
 import * as THREE from "three/webgpu";
 import { color, float, uv, time, texture as tslTexture, add, sub, mul, div, mix, vec3 } from "three/tsl";
-import { resolveAssetUrl } from "./assetResolver.js";
+import { loadTextureAsset } from "./textureAsset.js";
 
-const textureLoader = new THREE.TextureLoader();
 const textureCache = new Map(); // path -> Promise<THREE.Texture>
 
 function loadTexture(path) {
   let cached = textureCache.get(path);
   if (!cached) {
-    cached = resolveAssetUrl(path).then((url) => textureLoader.loadAsync(url));
+    cached = loadTextureAsset(path, { colorSpace: THREE.SRGBColorSpace });
     textureCache.set(path, cached);
   }
   return cached;

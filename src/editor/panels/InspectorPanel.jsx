@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { X, Plus, Crosshair, Eye, EyeOff, ScanEye, Package, ChevronRight } from "lucide-react";
+import { X, Plus, Crosshair, Eye, EyeOff, ScanEye, Package, ChevronRight, Sparkles } from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { getComponentClass, getComponentTypes } from "../../engine/index.js";
@@ -782,6 +782,16 @@ function ComponentSection({ entityId, type, props }) {
           Adjust to View
         </button>
       )}
+      {type === "camera" && engine.getEntity(entityId)?.getComponent?.("postprocess") && (
+        <button
+          className="toolbar-btn wide"
+          title="Open the post-process graph editor for this camera"
+          onClick={() => openPanel("postprocess")}
+        >
+          <Sparkles size={12} />
+          Open Post Process Editor
+        </button>
+      )}
       {type === "particles" && (
         <button className="toolbar-btn wide" onClick={() => openPanel("particles")}>
           Open Particle Editor
@@ -1012,6 +1022,13 @@ export function InspectorPanel() {
 
   const availableTypes = getComponentTypes()
     .filter((t) => !(t in entity.components))
+    // `internal` components are invisible everywhere; `importOnly` ones show
+    // their inspector section but can't be added by hand (e.g. Skinned Mesh —
+    // meaningless without an imported rig above it).
+    .filter((t) => {
+      const cls = getComponentClass(t);
+      return !cls?.internal && !cls?.importOnly;
+    })
     // UI components only exist inside a UI Screen subtree. Without an
     // ancestor `uiscreen`, the dropdown hides everything except `uiscreen`
     // itself (which is what *creates* the UI subtree). UI Screen itself is
@@ -1030,7 +1047,7 @@ export function InspectorPanel() {
    *   { "instancer": ["mesh", "model"] }  — Instancer requires a Mesh or
    *   Model component on the same entity to read the source geometry from.
    */
-  const componentRequires = { instancer: ["mesh", "model"] };
+  const componentRequires = { instancer: ["mesh", "model"], postprocess: ["camera"] };
 
   const commitName = (value) => {
     const name = value.trim();
@@ -1114,9 +1131,11 @@ export function InspectorPanel() {
 
       <TransformSection entity={entity} />
 
-      {Object.entries(entity.components).map(([type, props]) => (
-        <ComponentSection key={type} entityId={entity.id} type={type} props={props} />
-      ))}
+      {Object.entries(entity.components)
+        .filter(([type]) => !getComponentClass(type)?.internal)
+        .map(([type, props]) => (
+          <ComponentSection key={type} entityId={entity.id} type={type} props={props} />
+        ))}
 
       <div className="add-component-wrap">
         <div className="dropdown-wrap">

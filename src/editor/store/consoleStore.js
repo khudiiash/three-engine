@@ -5,17 +5,30 @@ const MAX_ENTRIES = 500;
 
 export const useConsoleStore = create((set) => ({
   entries: [],
+  // Number of error-level entries the user hasn't seen yet. Incremented when a
+  // new error lands, reset to zero when the Console panel becomes active (i.e.
+  // the user opens it) or when they hit Clear. The tab renderer reads this to
+  // draw the red-dot indicator.
+  unreadErrors: 0,
 
   push(level, message) {
     set((state) => {
       const entries = [...state.entries, { id: nextId++, level, message, time: new Date() }];
       if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES);
-      return { entries };
+      return {
+        entries,
+        unreadErrors: level === "error" ? state.unreadErrors + 1 : state.unreadErrors,
+      };
     });
   },
 
   clear() {
-    set({ entries: [] });
+    set({ entries: [], unreadErrors: 0 });
+  },
+
+  /** Called by the editor shell when the Console tab becomes the active tab. */
+  markConsoleRead() {
+    set({ unreadErrors: 0 });
   },
 }));
 

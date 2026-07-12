@@ -114,6 +114,7 @@ export function MenuBar() {
       { label: "Project Settings", action: () => openPanel("projectSettings") },
       { label: "Modules", action: () => openPanel("modules") },
       { label: "Input", action: () => openPanel("input") },
+      { label: "Poly Haven", action: () => openPanel("polyhaven") },
       { separator: true },
       { label: "Reset Layout", action: () => resetLayout() },
     ],

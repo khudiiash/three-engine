@@ -1,0 +1,91 @@
+{
+  "prefab": 1,
+  "guid": "p_N-LYvWiw7q",
+  "name": "Lantern 01",
+  "root": {
+    "fid": "f_QLa_4hZTPa",
+    "name": "Lantern 01",
+    "position": [
+      0,
+      0,
+      0
+    ],
+    "rotation": [
+      0,
+      0,
+      0
+    ],
+    "scale": [
+      1,
+      1,
+      1
+    ],
+    "components": [],
+    "children": [
+      {
+        "fid": "f_DQOJIOhlKF",
+        "name": "Lantern_01",
+        "position": [
+          0,
+          0,
+          0
+        ],
+        "rotation": [
+          0,
+          0,
+          0
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ],
+        "components": [
+          {
+            "type": "mesh",
+            "props": {
+              "geometry": "box",
+              "geometryAsset": "C:\\Users\\Khudiiash\\Documents\\GAME/PolyHaven/Lantern 01/Geometry/Lantern_01.geom",
+              "material": "C:\\Users\\Khudiiash\\Documents\\GAME/PolyHaven/Lantern 01/Materials/Lantern_01_brass.mat",
+              "castShadow": true,
+              "receiveShadow": true
+            }
+          }
+        ],
+        "children": []
+      },
+      {
+        "fid": "f_olw5tTZArD",
+        "name": "Lantern_01_glass",
+        "position": [
+          0,
+          0,
+          0
+        ],
+        "rotation": [
+          0,
+          0,
+          0
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ],
+        "components": [
+          {
+            "type": "mesh",
+            "props": {
+              "geometry": "box",
+              "geometryAsset": "C:\\Users\\Khudiiash\\Documents\\GAME/PolyHaven/Lantern 01/Geometry/Lantern_01_glass.geom",
+              "material": "C:\\Users\\Khudiiash\\Documents\\GAME/PolyHaven/Lantern 01/Materials/Lantern_01_glass.mat",
+              "castShadow": true,
+              "receiveShadow": true
+            }
+          }
+        ],
+        "children": []
+      }
+    ]
+  }
+}

@@ -11,6 +11,7 @@ const HierarchyPanel = lazy(() => import("./panels/HierarchyPanel.jsx").then((m)
 const InspectorPanel = lazy(() => import("./panels/InspectorPanel.jsx").then((m) => ({ default: m.InspectorPanel })));
 const AssetsPanel = lazy(() => import("./panels/AssetsPanel.jsx").then((m) => ({ default: m.AssetsPanel })));
 const ConsolePanel = lazy(() => import("./panels/ConsolePanel.jsx").then((m) => ({ default: m.ConsolePanel })));
+const ConsoleTab = lazy(() => import("./panels/ConsoleTab.jsx").then((m) => ({ default: m.ConsoleTab })));
 const ShaderGraphPanel = lazy(() => import("./panels/ShaderGraphPanel.jsx").then((m) => ({ default: m.ShaderGraphPanel })));
 const ParticlesPanel = lazy(() => import("./panels/ParticlesPanel.jsx").then((m) => ({ default: m.ParticlesPanel })));
 const MaterialPanel = lazy(() => import("./panels/MaterialPanel.jsx").then((m) => ({ default: m.MaterialPanel })));
@@ -20,6 +21,8 @@ const ProjectSettingsPanel = lazy(() => import("./panels/ProjectSettingsPanel.js
 const ModulesPanel = lazy(() => import("./panels/ModulesPanel.jsx").then((m) => ({ default: m.ModulesPanel })));
 const InputPanel = lazy(() => import("./panels/InputPanel.jsx").then((m) => ({ default: m.InputPanel })));
 const GeometryEditorPanel = lazy(() => import("./panels/GeometryEditorPanel.jsx").then((m) => ({ default: m.GeometryEditorPanel })));
+const PostprocessPanel = lazy(() => import("./panels/PostprocessPanel.jsx").then((m) => ({ default: m.PostprocessPanel })));
+const PolyHavenPanel = lazy(() => import("./panels/PolyHavenPanel.jsx").then((m) => ({ default: m.PolyHavenPanel })));
 
 const panelComponents = {
   viewport: ViewportPanel,
@@ -36,6 +39,8 @@ const panelComponents = {
   modules: ModulesPanel,
   input: InputPanel,
   geometryEditor: GeometryEditorPanel,
+  postprocess: PostprocessPanel,
+  polyhaven: PolyHavenPanel,
 };
 
 // The chrome (menu bar + scene/keyboard bootstrap) is lazy-loaded behind a
@@ -64,6 +69,8 @@ export const PANEL_SPECS = {
   modules: { title: "Modules", position: { referencePanel: "inspector", direction: "within" } },
   input: { title: "Input", position: { referencePanel: "viewport", direction: "below" }, initialHeight: 280 },
   geometryEditor: { title: "Geometry Editor", position: { referencePanel: "viewport", direction: "within" } },
+  postprocess: { title: "Post Process", position: { referencePanel: "inspector", direction: "within" } },
+  polyhaven: { title: "Poly Haven", position: { referencePanel: "assets", direction: "within" } },
 };
 
 let dockApi = null;
@@ -116,6 +123,10 @@ export function openPanel(id) {
   }
   const { position, ...rest } = spec;
   const options = { id, component: id, ...rest };
+  // The Console panel uses a custom tab renderer so it can show an unread-error
+  // dot — pin the renderer here so programmatic opens (via the menu, etc.)
+  // pick it up too, not just the default layout builder above.
+  if (id === "console") options.tabComponent = "console";
   // Position selection. We pick the first matching rule so the "right
   // thing" is always predictable:
   //   (a) No position in the spec → leave options.position unset;
@@ -186,6 +197,7 @@ function buildDefaultLayout(api) {
   api.addPanel({
     id: "console",
     component: "console",
+    tabComponent: "console",
     title: "Console",
     position: { referencePanel: "assets", direction: "within" },
   });
@@ -239,7 +251,16 @@ export function EditorShell() {
       </Suspense>
       <div className="dock-container">
         <Suspense fallback={<PanelFallback />}>
-          <DockviewReact components={panelComponents} onReady={onDockReady} theme={themeAbyss} />
+          <DockviewReact
+            components={panelComponents}
+            tabComponents={{ console: ConsoleTab }}
+            onReady={onDockReady}
+            theme={themeAbyss}
+            // Tauri's embedded webview can swallow HTML5 drag/drop events.
+            // Pointer DnD keeps tabs movable between dock groups as well as
+            // reorderable within their current group.
+            dndStrategy="pointer"
+          />
         </Suspense>
       </div>
     </div>

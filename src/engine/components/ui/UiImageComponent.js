@@ -2,8 +2,7 @@ import * as THREE from "three/webgpu";
 import { Component } from "../Component.js";
 import { createUiImageMaterial, applyElementUniforms } from "../../ui/uiMaterial.js";
 import { UI_LAYER } from "../../ui/UiSystem.js";
-import { resolveAssetUrl, loadAssetMeta } from "../../assetResolver.js";
-import { applyTextureMeta } from "../../textureMeta.js";
+import { loadTextureAsset } from "../../textureAsset.js";
 
 // One shared unit plane for every UI quad — meshes scale it per-rect.
 let sharedPlane = null;
@@ -94,15 +93,11 @@ export class UiImageComponent extends Component {
   async #loadTexture(path) {
     const generation = ++this.generation;
     try {
-      const [url, meta] = await Promise.all([resolveAssetUrl(path), loadAssetMeta(path)]);
-      if (!url) return;
-      const tex = await new THREE.TextureLoader().loadAsync(url);
+      const tex = await loadTextureAsset(path, { colorSpace: THREE.SRGBColorSpace });
       if (generation !== this.generation || !this.mesh) {
         tex.dispose();
         return;
       }
-      tex.colorSpace = THREE.SRGBColorSpace;
-      if (meta) applyTextureMeta(tex, meta);
       this.texture = tex;
       this.#rebuildMaterial();
     } catch (err) {

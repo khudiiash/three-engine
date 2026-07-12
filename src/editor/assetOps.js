@@ -13,6 +13,9 @@ export async function invoke(cmd, args) {
   return invoke(cmd, args);
 }
 
+/** Normalised path for case-insensitive prefix/suffix comparisons. */
+const norm = (p) => p.replaceAll("\\", "/").toLowerCase();
+
 /** First "name", "name 1", "name 2"… not already taken in the folder. */
 export function uniqueName(baseName, entries) {
   const names = new Set(entries.map((e) => e.name));
@@ -65,7 +68,15 @@ export async function deleteEntries(entries) {
   for (const entry of list) {
     try {
       await invoke("delete_path", { path: entry.path });
-      await invoke("delete_path", { path: `${entry.path}.meta` }).catch(() => {});
+      // `.meta` and `.basis` sidecars only exist alongside texture files —
+      // skipping them for directories avoids a noisy "system cannot find the
+      // path specified" warning from the Rust side on every folder delete,
+      // since Tauri logs IPC errors to its own channel even when the JS side
+      // .catch()es them.
+      if (!entry.is_dir) {
+        await invoke("delete_path", { path: `${entry.path}.meta` }).catch(() => {});
+        await invoke("delete_path", { path: `${entry.path}.basis` }).catch(() => {});
+      }
       deleted.push(entry.path);
     } catch (err) {
       console.error(`Delete failed for ${entry.name}: ${err}`);
@@ -80,7 +91,42 @@ export async function deleteEntries(entries) {
   if (kept.length) selectAssets(kept);
   else if (assetPath == null || gone.has(assetPath)) clear();
 
-  await useProjectStore.getState().refresh();
+  const project = useProjectStore.getState();
+  // If the folder we're currently browsing is gone (or sits inside a deleted
+  // folder) the grid would otherwise list a path that no longer exists and
+  // surface a "system cannot find the path specified" error. Step up to the
+  // nearest surviving ancestor so the user lands on a folder they can still
+  // see the contents of.
+  const deletedNorm = new Set(deleted.map(norm));
+  const isDeletedOrInside = (path) => {
+    if (!path) return false;
+    const np = norm(path);
+    if (deletedNorm.has(np)) return true;
+    for (const d of deletedNorm) if (np.startsWith(`${d}/`)) return true;
+    return false;
+  };
+  let nextPath = null;
+  if (isDeletedOrInside(project.currentPath)) {
+    let cursor = project.currentPath;
+    const root = project.rootPath;
+    while (cursor && isDeletedOrInside(cursor)) {
+      const parent = cursor.replace(/[\\/][^\\/]+$/, "");
+      // Reached the project root without escaping the deleted subtree —
+      // there's nothing above to step up to.
+      if (!parent || parent === cursor || norm(parent) === norm(root ?? "")) {
+        cursor = root;
+        break;
+      }
+      cursor = parent;
+    }
+    nextPath = cursor || root;
+  }
+
+  if (nextPath) {
+    await project.navigate(nextPath);
+  } else {
+    await project.refresh();
+  }
   console.log(deleted.length === 1 ? `Deleted ${list[0].name}` : `Deleted ${deleted.length} assets`);
 }
 
@@ -93,6 +139,7 @@ export async function renameEntry(entry, newName) {
     await invoke("rename_path", { from: entry.path, to: newPath });
     // Keep texture import settings attached across the rename.
     await invoke("rename_path", { from: `${entry.path}.meta`, to: `${newPath}.meta` }).catch(() => {});
+    await invoke("rename_path", { from: `${entry.path}.basis`, to: `${newPath}.basis` }).catch(() => {});
 
     // Scripts: rewrite the default-exported class name to match the new
     // filename stem, and inject `extends Script` if the script predates the
@@ -105,8 +152,6 @@ export async function renameEntry(entry, newName) {
     console.error(`Rename failed: ${err}`);
   }
 }
-
-const norm = (p) => p.replaceAll("\\", "/").toLowerCase();
 
 /** True when moving `sourcePath` into `destDir` would be a no-op or a cycle. */
 function badMove(sourcePath, destDir) {
@@ -128,6 +173,7 @@ export async function movePathsIntoFolder(sourcePaths, destDir) {
     try {
       await invoke("rename_path", { from: sourcePath, to: dest });
       await invoke("rename_path", { from: `${sourcePath}.meta`, to: `${dest}.meta` }).catch(() => {});
+      await invoke("rename_path", { from: `${sourcePath}.basis`, to: `${dest}.basis` }).catch(() => {});
       moved++;
     } catch (err) {
       console.error(`Move failed for ${name}: ${err}`);

@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Folder, FolderOpen } from "lucide-react";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { useAssetDrop } from "../assetDrag.js";
-import { invoke, moveDraggedIntoFolder } from "../assetOps.js";
+import { deleteEntries, invoke, moveDraggedIntoFolder, renameEntry } from "../assetOps.js";
 
 /**
  * Folder hierarchy sidebar for the Assets panel. Children are listed lazily
@@ -11,6 +11,11 @@ import { invoke, moveDraggedIntoFolder } from "../assetOps.js";
  *
  * Rows are asset drop targets: dropping onto a folder moves the dragged
  * selection into it, same as dropping onto a folder tile in the grid.
+ *
+ * Selection works Explorer-style: plain click selects + navigates (the
+ * default "open folder" UX), Ctrl/Cmd-click toggles a single row without
+ * navigating, Shift-click extends a range over the visible rows. Delete
+ * removes every selected folder and double-clicking the label renames it.
  */
 
 const EXPANDED_KEY = "engine.assets.expandedFolders.v1";
@@ -36,11 +41,45 @@ function ancestorsOf(path, root) {
   return out;
 }
 
-function FolderRow({ path, name, depth, childrenOf, expanded, onToggle, hasLoaded }) {
+/**
+ * Walks the cached `childrenOf` map depth-first to produce the visible folder
+ * paths in display order. Used as the universe for Shift-click range selects.
+ */
+function visibleFolderPaths(childrenOf, expanded, rootPath) {
+  const out = [];
+  if (!rootPath) return out;
+  const visit = (path) => {
+    out.push(path);
+    if (!expanded.has(path)) return;
+    const children = childrenOf.get(path);
+    if (!children) return;
+    for (const child of children) visit(child.path);
+  };
+  visit(rootPath);
+  return out;
+}
+
+function FolderRow({
+  path,
+  name,
+  depth,
+  childrenOf,
+  expanded,
+  selectedSet,
+  anchor,
+  onSelect,
+  onToggle,
+  hasLoaded,
+  renaming,
+  setRenamingPath,
+  onActivate,
+}) {
+  const navigate = useProjectStore((s) => s.navigate);
   const currentPath = useProjectStore((s) => s.currentPath);
   const isOpen = expanded.has(path);
   const children = childrenOf.get(path);
   const active = currentPath === path;
+  const selected = selectedSet.has(path);
   // Until a folder has been listed we don't know whether it has subfolders, so
   // show the chevron optimistically and let the first expand settle it.
   const expandable = !hasLoaded(path) || (children?.length ?? 0) > 0;
@@ -51,13 +90,52 @@ function FolderRow({ path, name, depth, childrenOf, expanded, onToggle, hasLoade
     onDrop: (dragged) => moveDraggedIntoFolder(dragged, path),
   });
 
+  // Plain click selects + navigates; Ctrl/Cmd toggles without navigating;
+  // Shift extends the range from the anchor. Navigation is deferred by a short
+  // debounce so a quick double-click on the label cancels it — otherwise the
+  // first click would navigate into the folder before rename mode kicks in.
+  const NAV_DELAY = 180;
+  const navTimer = useRef(null);
+  const handleClick = (e) => {
+    onActivate?.();
+    if (e.detail > 1) {
+      clearTimeout(navTimer.current);
+      navTimer.current = null;
+      return;
+    }
+    if (e.shiftKey) {
+      onSelect({ path, mode: "range", anchor });
+      return;
+    }
+    if (e.ctrlKey || e.metaKey) {
+      onSelect({ path, mode: "toggle" });
+      return;
+    }
+    onSelect({ path, mode: "replace" });
+    clearTimeout(navTimer.current);
+    navTimer.current = setTimeout(() => navigate(path), NAV_DELAY);
+  };
+
+  // Flush any pending navigation when the row unmounts (avoids navigating into
+  // a folder that's been deleted).
+  useEffect(() => () => clearTimeout(navTimer.current), []);
+
+  const startRename = () => {
+    // Make sure the row we're renaming is part of the selection so Delete can
+    // still act on the rest of the selection afterwards.
+    onActivate?.();
+    onSelect({ path, mode: "replace" });
+    setRenamingPath(path);
+  };
+
   return (
     <>
       <div
         ref={dropRef}
-        className={`folder-row ${active ? "active" : ""}`}
+        className={`folder-row ${active ? "active" : ""} ${selected ? "selected" : ""}`}
         style={{ paddingLeft: 4 + depth * 12 }}
-        onClick={() => useProjectStore.getState().navigate(path)}
+        onClick={handleClick}
+        onDoubleClick={() => startRename()}
         title={path}
       >
         <button
@@ -66,6 +144,7 @@ function FolderRow({ path, name, depth, childrenOf, expanded, onToggle, hasLoade
             e.stopPropagation();
             onToggle(path);
           }}
+          onDoubleClick={(e) => e.stopPropagation()}
           tabIndex={-1}
         >
           {expandable ? (
@@ -77,7 +156,31 @@ function FolderRow({ path, name, depth, childrenOf, expanded, onToggle, hasLoade
           ) : null}
         </button>
         {isOpen ? <FolderOpen size={13} /> : <Folder size={13} />}
-        <span className="folder-label">{name}</span>
+        {renaming ? (
+          <input
+            className="rename-input folder-rename"
+            autoFocus
+            defaultValue={name}
+            onFocus={(e) => e.target.select()}
+            onBlur={(e) => {
+              setRenamingPath(null);
+              renameEntry({ name, path }, e.target.value);
+            }}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") {
+                setRenamingPath(null);
+                renameEntry({ name, path }, e.target.value);
+              }
+              if (e.key === "Escape") setRenamingPath(null);
+            }}
+            onClick={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+          />
+        ) : (
+          <span className="folder-label">{name}</span>
+        )}
       </div>
       {isOpen &&
         children?.map((child) => (
@@ -88,8 +191,14 @@ function FolderRow({ path, name, depth, childrenOf, expanded, onToggle, hasLoade
             depth={depth + 1}
             childrenOf={childrenOf}
             expanded={expanded}
+            selectedSet={selectedSet}
+            anchor={anchor}
+            onSelect={onSelect}
             onToggle={onToggle}
             hasLoaded={hasLoaded}
+            renaming={renaming === child.path}
+            setRenamingPath={setRenamingPath}
+            onActivate={onActivate}
           />
         ))}
     </>
@@ -100,18 +209,25 @@ export function FolderTree() {
   const rootPath = useProjectStore((s) => s.rootPath);
   const currentPath = useProjectStore((s) => s.currentPath);
   const entries = useProjectStore((s) => s.entries);
+  const changeCounter = useProjectStore((s) => s.changeCounter);
   const [expanded, setExpanded] = useState(loadExpanded);
   const [childrenOf, setChildrenOf] = useState(() => new Map()); // path -> [{name, path}]
+  const [selected, setSelected] = useState(() => new Set());
+  const [anchor, setAnchor] = useState(null);
+  const [renamingPath, setRenamingPath] = useState(null);
   const loadedRef = useRef(new Set());
+  const treeRef = useRef(null);
 
   const hasLoaded = useCallback((path) => loadedRef.current.has(path), []);
 
   const listFolder = useCallback(async (path) => {
     try {
       const dirEntries = await invoke("list_dir", { path });
+      // The tree only renders folders, but keep `is_dir` on the record so the
+      // Delete shortcut can build an entry object without a re-fetch.
       const dirs = dirEntries
         .filter((e) => e.is_dir)
-        .map((e) => ({ name: e.name, path: e.path }));
+        .map((e) => ({ name: e.name, path: e.path, is_dir: true }));
       loadedRef.current.add(path);
       setChildrenOf((prev) => new Map(prev).set(path, dirs));
     } catch {
@@ -120,17 +236,20 @@ export function FolderTree() {
     }
   }, []);
 
-  // A refresh (create / delete / move / rename) replaces `entries`, which is
-  // our cue that the tree's cached listings may be stale. Re-list everything
-  // currently visible rather than trying to guess what changed.
+  // A refresh (create / delete / move / rename) is signalled by either
+  // `entries` changing (the current folder was affected) or `changeCounter`
+  // bumping (a sibling/ancestor path was modified). Either way, our cached
+  // listings may be stale — re-list everything currently visible rather than
+  // trying to guess what changed.
   useEffect(() => {
     if (!rootPath) return;
     loadedRef.current = new Set();
     const visible = [rootPath, ...[...expanded].filter((p) => p.startsWith(rootPath))];
     for (const path of new Set(visible)) listFolder(path);
-    // `entries` is the change signal; `expanded` changes are handled below.
+    // `entries` and `changeCounter` are the change signals; `expanded`
+    // changes are handled below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rootPath, entries, listFolder]);
+  }, [rootPath, entries, changeCounter, listFolder]);
 
   // List a folder the first time it's expanded.
   useEffect(() => {
@@ -165,18 +284,142 @@ export function FolderTree() {
     });
   }, []);
 
+  const onSelect = useCallback(({ path, mode }) => {
+    // Compute the next selection outside the setState updater so we can also
+    // update the anchor atomically (and stay pure in Strict Mode).
+    const prev = selectedRef.current;
+    const next = new Set(prev);
+    let nextAnchor = anchorRef.current;
+    if (mode === "toggle") {
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      nextAnchor = path;
+    } else if (mode === "range") {
+      const order = visibleFolderPaths(childrenOfRef.current, expandedRef.current, rootPathRef.current);
+      const from = order.indexOf(anchorRef.current ?? path);
+      const to = order.indexOf(path);
+      if (from === -1 || to === -1) {
+        next.clear();
+        next.add(path);
+        nextAnchor = path;
+      } else {
+        const [lo, hi] = from < to ? [from, to] : [to, from];
+        next.clear();
+        for (let i = lo; i <= hi; i++) next.add(order[i]);
+        // Shift-click never moves the range origin (Explorer behaviour).
+      }
+    } else {
+      next.clear();
+      next.add(path);
+      nextAnchor = path;
+    }
+    setSelected(next);
+    setAnchor(nextAnchor);
+  }, []);
+
+  const selectedRef = useRef(selected);
+  useEffect(() => { selectedRef.current = selected; }, [selected]);
+
+  // Keep refs of state that `onSelect` reads but shouldn't trigger a re-bind,
+  // so the row click handlers stay referentially stable across re-renders.
+  const childrenOfRef = useRef(childrenOf);
+  const expandedRef = useRef(expanded);
+  const rootPathRef = useRef(rootPath);
+  const anchorRef = useRef(anchor);
+  useEffect(() => { childrenOfRef.current = childrenOf; }, [childrenOf]);
+  useEffect(() => { expandedRef.current = expanded; }, [expanded]);
+  useEffect(() => { rootPathRef.current = rootPath; }, [rootPath]);
+  useEffect(() => { anchorRef.current = anchor; }, [anchor]);
+
+  // Drop selection rows that are no longer in the tree (after deletes, etc.).
+  useEffect(() => {
+    if (!selected.size || !rootPath) return;
+    const known = new Set(visibleFolderPaths(childrenOf, expanded, rootPath));
+    let changed = false;
+    for (const p of selected) {
+      if (!known.has(p)) { changed = true; break; }
+    }
+    if (changed) {
+      const next = new Set();
+      for (const p of selected) if (known.has(p)) next.add(p);
+      setSelected(next);
+    }
+  }, [childrenOf, expanded, rootPath, selected]);
+
+  // Drop expanded-folders entries that no longer exist on disk. Without this
+  // the tree keeps trying to list deleted paths forever (silently failing),
+  // and the stale ids live on in localStorage across sessions.
+  useEffect(() => {
+    if (!rootPath || !expanded.size) return;
+    const known = new Set(visibleFolderPaths(childrenOf, expanded, rootPath));
+    const live = new Set([rootPath, ...[...known]]);
+    let changed = false;
+    for (const p of expanded) {
+      if (!live.has(p)) { changed = true; break; }
+    }
+    if (changed) {
+      const next = new Set();
+      for (const p of expanded) if (live.has(p)) next.add(p);
+      setExpanded(next);
+    }
+  }, [childrenOf, rootPath, expanded]);
+
+  // Delete key on the tree deletes every selected folder. Skip while renaming so
+  // Backspace inside the input still edits text.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.target.closest("input")) return;
+      if (e.key !== "Delete" || !selected.size) return;
+      const tree = treeRef.current;
+      if (!tree) return;
+      // Only act when focus is inside the tree — otherwise let Delete work in
+      // the asset grid (or other panels) as before.
+      if (!tree.contains(document.activeElement) && document.activeElement !== tree) return;
+      e.preventDefault();
+      const list = [...selected].map((p) => ({ path: p, name: basename(p), is_dir: true }));
+      deleteEntries(list);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selected]);
+
+  // The root row is non-deletable — make sure it never lands in the selection.
+  const visibleSet = useMemo(
+    () => new Set(visibleFolderPaths(childrenOf, expanded, rootPath)),
+    [childrenOf, expanded, rootPath],
+  );
+  const safeSelected = useMemo(() => {
+    if (!rootPath) return new Set();
+    const next = new Set();
+    for (const p of selected) {
+      if (p !== rootPath && visibleSet.has(p)) next.add(p);
+    }
+    return next;
+  }, [selected, visibleSet, rootPath]);
+
   if (!rootPath) return null;
 
   return (
-    <div className="folder-tree">
+    <div
+      className="folder-tree"
+      ref={treeRef}
+      tabIndex={0}
+      onClick={(e) => e.stopPropagation()}
+    >
       <FolderRow
         path={rootPath}
         name={basename(rootPath)}
         depth={0}
         childrenOf={childrenOf}
         expanded={expanded}
+        selectedSet={safeSelected}
+        anchor={anchor}
+        onSelect={onSelect}
         onToggle={onToggle}
         hasLoaded={hasLoaded}
+        renaming={renamingPath === rootPath}
+        setRenamingPath={setRenamingPath}
+        onActivate={() => treeRef.current?.focus({ preventScroll: true })}
       />
     </div>
   );

@@ -440,6 +440,12 @@ async function importDroppedPaths(paths) {
     // Imported models unpack into an asset folder (textures/materials/prefab).
     for (const path of imported) {
       if (MODEL_EXTENSIONS.includes(extOf(path))) await unpackModel(path);
+      if (TEXTURE_EXTENSIONS.includes(extOf(path))) {
+        const { autoCompressTexture } = await import("../basisCompress.js");
+        await autoCompressTexture(path).catch((err) =>
+          console.warn(`Basis compression skipped for ${basename(path)}: ${err.message ?? err}`),
+        );
+      }
     }
   } catch (err) {
     console.error(`Import failed: ${err}`);
@@ -554,8 +560,11 @@ export function AssetsPanel() {
   const gridRef = useRef(null);
 
   const view = VIEW_MODES.find((v) => v.id === viewId) ?? VIEW_MODES[2];
-  // .meta sidecars are edited via their asset's inspector, not shown as tiles.
-  const visible = useMemo(() => entries.filter((e) => !e.name.endsWith(".meta")), [entries]);
+  // Generated sidecars are managed through their source asset, not shown as tiles.
+  const visible = useMemo(
+    () => entries.filter((e) => !e.name.endsWith(".meta") && !e.name.endsWith(".basis")),
+    [entries],
+  );
   const selectedEntries = useMemo(
     () => visible.filter((e) => assetPaths.includes(e.path)),
     [visible, assetPaths],

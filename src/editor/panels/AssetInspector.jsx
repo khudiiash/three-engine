@@ -11,6 +11,7 @@ import { MaterialEditor } from "./MaterialPanel.jsx";
 import { openPanel } from "../EditorShell.jsx";
 import { syncScriptClassNameAfterRename } from "../scriptClassSync.js";
 import { openPrefabMode } from "../prefab.js";
+import { useModulesStore } from "../modules.js";
 import { prefabRegistry, resolvePrefab, isPrefabDef } from "../../engine/index.js";
 
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
@@ -62,6 +63,7 @@ async function renameAsset(path, newStem) {
     await invoke("rename_path", { from: path, to: newPath });
     // Keep texture import settings attached across the rename.
     await invoke("rename_path", { from: `${path}.meta`, to: `${newPath}.meta` }).catch(() => {});
+    await invoke("rename_path", { from: `${path}.basis`, to: `${newPath}.basis` }).catch(() => {});
     // Scripts: keep the default-exported class name in sync with the new
     // filename stem, and inject `extends Script` if missing.
     await syncScriptClassNameAfterRename(newPath, name);
@@ -108,6 +110,8 @@ function TexturePreview({ path }) {
 
 function TextureSettings({ path }) {
   const [meta, setMeta] = useState(null);
+  const [basisBusy, setBasisBusy] = useState(false);
+  const basisModuleEnabled = useModulesStore((s) => s.enabled.includes("basis"));
 
   useEffect(() => {
     let live = true;
@@ -142,6 +146,24 @@ function TextureSettings({ path }) {
       <option value="mirror">Mirror</option>
     </select>
   );
+
+  const toggleBasis = async (enabled) => {
+    setBasisBusy(true);
+    try {
+      const { setTextureBasisEnabled } = await import("../basisCompress.js");
+      const info = await setTextureBasisEnabled(path, enabled);
+      setMeta((current) => ({
+        ...current,
+        basis: enabled ? { enabled: true, ...info } : { enabled: false },
+      }));
+      refreshMaterialsUsingTexture(path);
+      await useProjectStore.getState().refresh();
+    } catch (err) {
+      console.error(`Basis compression failed: ${err.message ?? err}`);
+    } finally {
+      setBasisBusy(false);
+    }
+  };
 
   return (
     <div className="inspector-section">
@@ -184,6 +206,27 @@ function TextureSettings({ path }) {
         <span className="field-label">Flip Y</span>
         <input type="checkbox" checked={meta.flipY !== false} onChange={(e) => patch({ flipY: e.target.checked })} />
       </div>
+      <div className="field-row">
+        <span className="field-label">Basis</span>
+        <input
+          type="checkbox"
+          checked={meta.basis?.enabled === true}
+          disabled={basisBusy || !basisModuleEnabled}
+          title={
+            basisModuleEnabled
+              ? "Override Basis compression for this texture"
+              : "Enable the Basis Compression module first"
+          }
+          onChange={(e) => toggleBasis(e.target.checked)}
+        />
+      </div>
+      {meta.basis?.enabled && meta.basis.original > 0 && (
+        <div className="asset-info-row">
+          {meta.basis.compressed < meta.basis.original
+            ? `Basis −${Math.round((1 - meta.basis.compressed / meta.basis.original) * 100)}% · ${formatBytes(meta.basis.original)} → ${formatBytes(meta.basis.compressed)}`
+            : `Basis ${formatBytes(meta.basis.compressed)}`}
+        </div>
+      )}
     </div>
   );
 }
@@ -318,6 +361,92 @@ function ModelPreview({ path }) {
         </div>
       )}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Virtual geometry import settings (.meta sidecar) — Unreal-style: the asset
+// opts in, and every Model component using it renders through the cluster-LOD
+// pipeline. Only shown while the virtual-geometry module is enabled.
+// ---------------------------------------------------------------------------
+
+function VirtualGeometrySettings({ path }) {
+  const modulesEnabled = useModulesStore((s) => s.enabled);
+  const [vg, setVg] = useState(null);
+
+  useEffect(() => {
+    let live = true;
+    setVg(null);
+    (async () => {
+      const meta = await readAssetMeta(`${path}.meta`);
+      const { VIRTUAL_GEOMETRY_META_DEFAULTS } = await import("../../modules/virtual-geometry/index.js");
+      const stored = meta?.virtualGeometry ?? {};
+      const merged = { ...VIRTUAL_GEOMETRY_META_DEFAULTS, ...stored };
+      // Legacy boolean from the first iteration of the settings.
+      if (stored.debugView == null && stored.debugClusters) merged.debugView = "clusters";
+      if (live) setVg(merged);
+    })();
+    return () => (live = false);
+  }, [path]);
+
+  if (!modulesEnabled.includes("virtual-geometry") || !vg) return null;
+
+  const patch = async (p) => {
+    const next = { ...vg, ...p };
+    setVg(next);
+    try {
+      // Merge into the full meta — other sections (draco, …) must survive.
+      const meta = (await readAssetMeta(`${path}.meta`)) ?? {};
+      meta.virtualGeometry = next;
+      await invoke("save_scene", { path: `${path}.meta`, contents: JSON.stringify(meta, null, 2) });
+      const { refreshVirtualGeometryAsset } = await import("../../modules/virtual-geometry/index.js");
+      refreshVirtualGeometryAsset(path); // live-update every open engine
+    } catch (err) {
+      console.error(`Failed to save virtual geometry settings: ${err}`);
+    }
+  };
+
+  return (
+    <div className="inspector-section">
+      <div className="section-header">Virtual Geometry</div>
+      <div className="field-row">
+        <span className="field-label">Enabled</span>
+        <input type="checkbox" checked={vg.enabled === true} onChange={(e) => patch({ enabled: e.target.checked })} />
+      </div>
+      {vg.enabled && (
+        <>
+          <div className="field-row">
+            <span className="field-label">Pixel Error</span>
+            <input
+              className="number-field"
+              type="number"
+              min={0.25}
+              max={32}
+              step={0.25}
+              value={vg.pixelError}
+              onChange={(e) => patch({ pixelError: Math.max(0.05, parseFloat(e.target.value) || 1) })}
+            />
+          </div>
+          <div className="field-row">
+            <span className="field-label">Debug View</span>
+            <select
+              className="select-field"
+              value={vg.debugView ?? "off"}
+              onChange={(e) => patch({ debugView: e.target.value })}
+            >
+              <option value="off">Off</option>
+              <option value="triangles">Triangles</option>
+              <option value="clusters">Clusters</option>
+            </select>
+          </div>
+          <div className="asset-hint">
+            Renders the model through Nanite-style cluster LOD wherever it's used. Pixel Error is the
+            screen-space error budget — higher is faster, lower is sharper. Debug views color the live
+            cut: Triangles per-triangle (density shows LOD), Clusters one color per ~128-triangle patch.
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -459,7 +588,12 @@ export function AssetInspector({ path }) {
           <TextureSettings path={path} />
         </>
       )}
-      {ext === "glb" && <ModelPreview path={path} />}
+      {ext === "glb" && (
+        <>
+          <ModelPreview path={path} />
+          <VirtualGeometrySettings path={path} />
+        </>
+      )}
       {ext === "mat" && <MaterialEditor matPath={path} />}
       {ext === "anim" && <AnimatorSummary path={path} />}
       {(ext === "prefab" || ext === "entity") && <PrefabSummary path={path} />}

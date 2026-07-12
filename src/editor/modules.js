@@ -23,6 +23,18 @@ export async function listModuleDefinitions() {
   return (await engineModulesApi()).getModuleDefinitions();
 }
 
+/**
+ * Loads the module catalog (registers every built-in module definition with
+ * the engine) without applying any to the engine. Idempotent — returns the
+ * already-loaded catalog if it was loaded once. Panels that need to know
+ * whether the postprocessing module is registered call this from their
+ * mount effect so they can resolve the component class on demand.
+ */
+export async function ensureModules() {
+  const api = await engineModulesApi();
+  return api;
+}
+
 /** Applies project.json's enabled modules to the engine (call at boot, before scene load). */
 export async function syncProjectModules() {
   const enabled = useProjectStore.getState().projectMeta?.modules ?? [];
@@ -44,4 +56,17 @@ export async function setModuleEnabled(id, on) {
     .getState()
     .updateMeta({ modules: enabled })
     .catch((err) => console.warn(`Couldn't persist modules to project.json: ${err}`));
+  if (id === "basis" && on) {
+    const { compressAllProjectTextures } = await import("./basisCompress.js");
+    const result = await compressAllProjectTextures();
+    console.log(
+      `Basis: compressed ${result.compressed} texture${result.compressed === 1 ? "" : "s"}` +
+        (result.failed ? `, ${result.failed} failed` : ""),
+    );
+    await useProjectStore.getState().refresh();
+  }
+  if (id === "basis") {
+    const { refreshAllMaterials } = await import("../engine/materialAsset.js");
+    refreshAllMaterials();
+  }
 }

@@ -30,6 +30,14 @@ export const useProjectStore = create((set, get) => ({
   error: null,
   recent: loadRecent(),
   hubSkipped: false,
+  // Monotonic counter bumped every time the project tree's contents change
+  // anywhere on disk (delete/rename/move/create inside the project, even on
+  // paths the user isn't currently browsing in the grid). The folder tree
+  // listens to this so it re-lists cached sub-folders when, e.g., a sibling
+  // folder is deleted — otherwise a row for a now-deleted folder can stay
+  // visible in the tree until the user navigates and triggers a fresh
+  // `list_dir`.
+  changeCounter: 0,
 
   skipHub() {
     set({ hubSkipped: true });
@@ -139,6 +147,10 @@ export const useProjectStore = create((set, get) => ({
 
   async refresh() {
     const { currentPath } = get();
+    // Always bump so the tree can re-list its cached children, even when the
+    // current grid view is unaffected by the change (deleting a sibling
+    // folder while browsing a different folder, etc.).
+    set({ changeCounter: get().changeCounter + 1 });
     if (currentPath) await get().navigate(currentPath);
   },
 

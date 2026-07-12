@@ -1,0 +1,108 @@
+{
+  "color": "#ffffff",
+  "roughness": 1,
+  "metalness": 1,
+  "map": "C:\\Users\\Khudiiash\\Documents\\GAME/PolyHaven/Lantern 01/Textures/Lantern_01_brass_diff-Lantern_01_brass_opacity.png",
+  "shaderGraph": {
+    "nodes": [
+      {
+        "id": "out",
+        "type": "output",
+        "props": {},
+        "position": {
+          "x": 980,
+          "y": 200
+        }
+      },
+      {
+        "id": "bsdf",
+        "type": "principledBsdf",
+        "props": {},
+        "position": {
+          "x": 620,
+          "y": 80
+        }
+      },
+      {
+        "id": "tex_diffuse",
+        "type": "texture",
+        "props": {
+          "path": "C:\\Users\\Khudiiash\\Documents\\GAME/PolyHaven/Lantern 01/Textures/Lantern_01_brass_diff-Lantern_01_brass_opacity.png"
+        },
+        "position": {
+          "x": 120,
+          "y": 0
+        }
+      },
+      {
+        "id": "tex_arm",
+        "type": "texture",
+        "props": {
+          "path": "C:\\Users\\Khudiiash\\Documents\\GAME/PolyHaven/Lantern 01/Textures/Lantern_01_brass_metallic-Lantern_01_brass_roughness.png"
+        },
+        "position": {
+          "x": 120,
+          "y": 240
+        }
+      },
+      {
+        "id": "tex_normal",
+        "type": "texture",
+        "props": {
+          "path": "C:\\Users\\Khudiiash\\Documents\\GAME/PolyHaven/Lantern 01/Textures/Lantern_01_brass_nor_gl.png"
+        },
+        "position": {
+          "x": 120,
+          "y": 480
+        }
+      },
+      {
+        "id": "nmap",
+        "type": "normalMap",
+        "props": {},
+        "position": {
+          "x": 400,
+          "y": 420
+        }
+      }
+    ],
+    "edges": [
+      {
+        "source": "bsdf",
+        "sourceHandle": "out",
+        "target": "out",
+        "targetHandle": "surface"
+      },
+      {
+        "source": "tex_diffuse",
+        "sourceHandle": "out",
+        "target": "bsdf",
+        "targetHandle": "color"
+      },
+      {
+        "source": "tex_arm",
+        "sourceHandle": "g",
+        "target": "bsdf",
+        "targetHandle": "roughness"
+      },
+      {
+        "source": "tex_arm",
+        "sourceHandle": "b",
+        "target": "bsdf",
+        "targetHandle": "metalness"
+      },
+      {
+        "source": "tex_normal",
+        "sourceHandle": "out",
+        "target": "nmap",
+        "targetHandle": "color"
+      },
+      {
+        "source": "nmap",
+        "sourceHandle": "out",
+        "target": "bsdf",
+        "targetHandle": "normal"
+      }
+    ]
+  }
+}

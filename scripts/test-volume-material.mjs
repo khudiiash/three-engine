@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import * as THREE from "three/webgpu";
 import { setAssetResolver } from "../src/engine/assetResolver.js";
 import { compileShaderGraph, NODE_TYPES, OUTPUT_SLOTS } from "../src/engine/tslGraph.js";
-import { applyMaterialDef, MATERIAL_DEFAULTS } from "../src/engine/materialAsset.js";
+import { applyMaterialDef, loadMaterialAsset, MATERIAL_DEFAULTS } from "../src/engine/materialAsset.js";
 
 setAssetResolver(async (path) => path);
 
@@ -230,6 +230,19 @@ const isVolumeMat = (m) => m?.userData?.isVolumeMaterial === true;
   assert.ok(entry.material instanceof THREE.MeshPhysicalNodeMaterial,
     "switching back to surface must swap the instance");
   assert.equal(entry.isVolume, false);
+}
+
+// --- materialAsset: Windows slash variants share one cache entry ----------
+{
+  const json = encodeURIComponent(JSON.stringify({ ...MATERIAL_DEFAULTS, color: "#123456" }));
+  setAssetResolver(async () => `data:application/json,${json}`);
+  const fromPrefab = await loadMaterialAsset("C:\\Game/Models/Table/Materials/Wood.mat");
+  const fromAssetsPanel = await loadMaterialAsset("C:\\Game\\Models\\Table\\Materials\\Wood.mat");
+  assert.strictEqual(
+    fromAssetsPanel,
+    fromPrefab,
+    "mixed and backslash Windows paths must resolve to the same live material",
+  );
 }
 
 console.log("All volume material checks passed.");

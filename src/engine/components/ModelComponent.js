@@ -11,6 +11,12 @@ const loader = getGltfLoader();
 export class ModelComponent extends Component {
   static type = "model";
   static label = "Model";
+  // Internal plumbing, not a user-facing component: skinned/animated GLB
+  // imports are the only thing that creates one (skeletons + clips can't be
+  // flattened into static .geom assets). Everything else is mesh entities
+  // with geometry/material assets — see glbImport.js. `internal` hides it
+  // from the Add Component menu and the inspector's section list.
+  static internal = true;
   static defaults = {
     path: "",
     materials: {}, // GLTF material name -> .mat asset path override
@@ -26,6 +32,8 @@ export class ModelComponent extends Component {
   onAttach() {
     this.root = null;
     this.clips = [];
+    this.skeletonBindings = [];
+    this.unsubSkeletonSync = null;
     this.sharedMaterials = new Set(); // .mat-backed materials we must not dispose
     this.generation = (this.generation ?? 0) + 1;
     if (this.props.path) this.#load(this.props.path, this.generation);
@@ -53,9 +61,57 @@ export class ModelComponent extends Component {
       // Honour the enabled flag at load time — visible by default, hidden if
       // the user saved the scene with the component disabled.
       this.root.visible = this._enabled;
+      this.bindSkeletonEntities();
       this.entity.engine.emit("model-loaded", this.entity);
     } catch (err) {
       console.error(`Failed to load model "${path}": ${err.message}`);
+    }
+  }
+
+  /**
+   * Connects imported `bone` entities below this model to their matching GLB
+   * Bones.  The entity hierarchy remains normal engine data; each frame we
+   * copy the final animated bone pose into those entities, which means an
+   * ordinary child entity automatically becomes an attachment (weapon, VFX,
+   * hitbox, ...).
+   */
+  bindSkeletonEntities() {
+    if (!this.root || !this.entity) return;
+    const bindings = [];
+    this.entity.traverse((entity) => {
+      const bone = entity.getComponent("bone");
+      if (!bone || nearestModel(entity) !== this) return;
+      const source = objectAtPath(this.root, bone.props.path);
+      if (source?.isBone) bindings.push({ entity, source });
+    });
+    this.skeletonBindings = bindings;
+
+    // This subscription is deliberately created after the GLB finishes
+    // loading. AnimationComponent has already subscribed during prefab
+    // expansion, so its mixer advances first and attachment entities receive
+    // the pose from the same frame rather than one frame behind.
+    if (bindings.length && !this.unsubSkeletonSync) {
+      this.unsubSkeletonSync = this.entity.engine.onUpdate(() => this.#syncSkeletonEntities());
+    }
+    if (!bindings.length) {
+      this.unsubSkeletonSync?.();
+      this.unsubSkeletonSync = null;
+    }
+    this.#syncSkeletonEntities();
+  }
+
+  #syncSkeletonEntities() {
+    if (!this.root || !this.skeletonBindings.length) return;
+    // AnimationMixer changes local transforms. Refresh the GLB's world
+    // matrices once before deriving every attachment's local pose.
+    this.entity.object3D.updateMatrixWorld(true);
+    this.root.updateMatrixWorld(true);
+    for (const { entity, source } of this.skeletonBindings) {
+      const parent = entity.parent?.object3D;
+      if (!parent) continue;
+      parent.updateMatrixWorld(true);
+      _relative.multiplyMatrices(_inverse.copy(parent.matrixWorld).invert(), source.matrixWorld);
+      _relative.decompose(entity.position, entity.quaternion, entity.scale);
     }
   }
 
@@ -84,6 +140,9 @@ export class ModelComponent extends Component {
 
   onDetach() {
     this.generation = (this.generation ?? 0) + 1;
+    this.unsubSkeletonSync?.();
+    this.unsubSkeletonSync = null;
+    this.skeletonBindings = [];
     if (!this.root) return;
     this.entity.object3D.remove(this.root);
     this.root.traverse((obj) => {
@@ -116,4 +175,29 @@ export class ModelComponent extends Component {
     this.onDetach();
     this.onAttach();
   }
+}
+
+const _inverse = new THREE.Matrix4();
+const _relative = new THREE.Matrix4();
+
+/** Returns the nested Object3D addressed by a slash-separated child index path. */
+function objectAtPath(root, path) {
+  if (typeof path !== "string" || !path) return null;
+  let object = root;
+  for (const part of path.split("/")) {
+    const index = Number(part);
+    if (!Number.isInteger(index) || index < 0) return null;
+    object = object.children[index];
+    if (!object) return null;
+  }
+  return object;
+}
+
+/** The closest model ancestor owns a bone marker (nested models stay isolated). */
+function nearestModel(entity) {
+  for (let current = entity.parent; current; current = current.parent) {
+    const model = current.getComponent("model");
+    if (model) return model;
+  }
+  return null;
 }

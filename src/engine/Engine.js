@@ -14,6 +14,8 @@ import { ViewFrustum } from "./viewFrustum.js";
 import { AudioSystem } from "./audio/AudioSystem.js";
 import { prefabRegistry } from "./prefab/registry.js";
 import { instantiatePrefabNode } from "./prefab/expand.js";
+import { StatsSystem } from "./StatsSystem.js";
+import { configureTextureAssetLoader } from "./textureAsset.js";
 
 /**
  * Runtime core: owns the renderer, the three.js scene (source of truth)
@@ -41,10 +43,22 @@ export class Engine extends EventEmitter {
     // the animation loop re-attaches to a freshly-recreated renderer.
     this.loopActive = false;
     this.modules = new Map(); // module id -> setup handle (see modules.js)
+    // Optional per-camera render overrides (e.g. PostprocessComponent).
+    // When the active camera's override is set, the engine defers its main
+    // `renderer.render(scene, camera)` call to it — the override is
+    // responsible for the scene render AND any post-pass to the canvas.
+    // At most one override is consulted per frame (the one whose camera
+    // matches engine.camera).
+    this.renderOverrides = new Set();
     // Per-frame frustum state. Shared by every view-only component so the
     // view*projection matrix is multiplied exactly once per frame (and even
     // then only when the active camera actually moved). See viewFrustum.js.
     this.viewFrustum = new ViewFrustum();
+    // Built-in per-frame telemetry sampler. Lives on the engine — every
+    // engine has one, no module registry involved. The editor's viewport
+    // overlay reads `engine.stats.readout`; built games can ignore it.
+    this.stats = new StatsSystem(this);
+    this.stats.start();
 
     // Host-tunable runtime behavior (the editor writes project settings here).
     this.config = { scriptHotReload: true, scriptReloadIntervalMs: 750 };
@@ -118,11 +132,22 @@ export class Engine extends EventEmitter {
       this.renderer = new THREE.WebGPURenderer({ canvas, ...opts });
       this.renderer.setPixelRatio(window.devicePixelRatio ?? 1);
       await this.renderer.init();
+      configureTextureAssetLoader(this.renderer);
       applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
       this.rendererReady = true;
       // If a render loop was running, restart it on the new renderer.
       if (this.loopActive) this.renderer.setAnimationLoop(() => this.#tick());
       this.emit("renderer-rebuilt");
+      // Lazy-loaded SSGI/SSR addon handles from the previous renderer are
+      // renderer-agnostic factories in r185, but invalidating them on a
+      // full renderer rebuild is a no-cost safety net against any addon
+      // that may cache backend-specific state internally.
+      try {
+        const { resetLazyPostAddons } = await import("../modules/postprocessing/postGraph.js");
+        resetLazyPostAddons();
+      } catch {
+        // Postprocessing module not registered — fine, nothing to reset.
+      }
     } catch (err) {
       console.error("Renderer rebuild failed:", err);
     }
@@ -180,6 +205,7 @@ export class Engine extends EventEmitter {
     this.renderer = new THREE.WebGPURenderer({ canvas, ...rendererConstructorOptions(this.settings) });
     this.renderer.setPixelRatio(window.devicePixelRatio ?? 1);
     await this.renderer.init();
+    configureTextureAssetLoader(this.renderer);
     // Renderer-side settings (tone mapping, shadows) couldn't apply earlier.
     applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
     this.rendererReady = true;
@@ -250,7 +276,34 @@ export class Engine extends EventEmitter {
     this.audio.update?.(dt);
     // rendererReady guards the re-init window (init() swaps the renderer
     // asynchronously; rendering before its backend resolves throws).
-    if (this.camera && this.rendererReady) this.renderer.render(this.scene, this.camera);
+    if (this.camera && this.rendererReady) {
+      // Wall-clock the GPU-submit portion of the frame so the stats
+      // overlay's "GPU" reading reflects only the render call, not the
+      // script tick. WebGPU dispatches the actual GPU work asynchronously,
+      // so this is command-encoding time, not hardware GPU time — but it's
+      // the closest portable signal without WebGPU timestamp-query support.
+      const t0 = performance.now();
+      const override = this.#activeRenderOverride();
+      if (override) {
+        // The override (typically a PostprocessComponent) runs the scene
+        // render to its own offscreen target and the post-graph blit to
+        // the canvas — via three's RenderPipeline + PassNode, which
+        // handles all render-target bookkeeping internally. Skipping
+        // the default renderer.render() avoids a redundant scene draw
+        // (and the WebGPU validation errors that follow from manual
+        // setRenderTarget calls).
+        override.render(this);
+      } else {
+        this.renderer.render(this.scene, this.camera);
+      }
+      this.stats.recordRenderMs(performance.now() - t0);
+      // Snapshot three's per-frame renderer metrics (draw calls, triangles,
+      // texture memory). Has to happen AFTER render() returns because
+      // three's animation loop resets these counters at the start of each
+      // frame, before user code runs. See StatsSystem header for the
+      // timing rationale.
+      this.stats.recordRenderInfo();
+    }
     // Post-render passes draw on top of the main render's pixels. The
     // WebGPU backend's render pass starts with `loadOp: Clear`, so any
     // post-render `renderer.render(...)` would wipe the canvas — callers
@@ -277,6 +330,37 @@ export class Engine extends EventEmitter {
     return () => this.postRenderCallbacks.delete(fn);
   }
 
+  /**
+   * Registers a per-camera render override. The override is a Component
+   * with an `ownsCamera(engine) → boolean` predicate (true when its camera
+   * is the active one AND it's enabled) and a `render(engine)` method
+   * that performs both the scene render and any post-pass to the canvas.
+   *
+   * While an override is active, the engine skips its default
+   * `renderer.render(scene, camera)` and lets the override drive the frame.
+   * Overrides are typically `PostprocessComponent` instances — see
+   * `src/modules/postprocessing/PostprocessComponent.js`.
+   */
+  registerRenderOverride(component) {
+    if (!component || typeof component.render !== "function") {
+      console.warn("registerRenderOverride: component must implement render(engine)");
+      return;
+    }
+    this.renderOverrides.add(component);
+  }
+
+  unregisterRenderOverride(component) {
+    this.renderOverrides.delete(component);
+  }
+
+  /** First override whose `ownsCamera()` returns true, or null. */
+  #activeRenderOverride() {
+    for (const o of this.renderOverrides) {
+      if (o.ownsCamera?.(this)) return o;
+    }
+    return null;
+  }
+
   setSize(width, height) {
     if (!this.renderer || width === 0 || height === 0) return;
     this.renderer.setSize(width, height, false);
@@ -284,6 +368,10 @@ export class Engine extends EventEmitter {
       this.camera.aspect = width / height;
       this.camera.updateProjectionMatrix();
     }
+    // Resize hooks for components that own render targets (e.g. the
+    // PostprocessComponent's beauty RT). The render loop walks the set
+    // every time; cheap, no bookkeeping needed.
+    for (const o of this.renderOverrides) o.handleResize?.(width, height);
   }
 
   createEntity({ id, name = "Entity", parent = null } = {}) {
@@ -358,6 +446,8 @@ export class Engine extends EventEmitter {
     this._inputTickUnsub = null;
     this.input.detach();
     this.audio.dispose?.();
+    this.stats.dispose();
+    this.renderOverrides.clear();
     this.rendererReady = false;
     this.renderer?.dispose();
     this.renderer = null;

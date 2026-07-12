@@ -144,6 +144,39 @@ body,
   background: var(--fill-2);
 }
 
+/* Unread-error indicator on the Console tab. Shown when error-level entries
+   have arrived since the user last opened the panel. Mirrors the dockview
+   default tab's layout so the dot slots in next to the title. */
+.console-tab .console-tab-title {
+  display: inline-block;
+}
+
+.console-error-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--danger);
+  /* Subtle pulse so the indicator catches the eye even at a glance — the
+     tab is otherwise static, so motion is what makes "something happened"
+     read instantly. */
+  box-shadow: 0 0 0 0 rgba(255, 93, 85, 0.55);
+  animation: console-error-dot-pulse 1.6s var(--ease) infinite;
+}
+
+@keyframes console-error-dot-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 93, 85, 0.55);
+  }
+  60% {
+    box-shadow: 0 0 0 6px rgba(255, 93, 85, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 93, 85, 0);
+  }
+}
+
 .dock-container .dv-resize-container,
 .dock-container .dv-split-view-container > .dv-view-container > .dv-view {
   outline: none;
@@ -518,7 +551,7 @@ select:focus-visible {
   height: 100%;
   min-height: 260px;
   overflow: hidden;
-  background: #111417;
+  background: #282828;
 }
 
 .scene-geometry-editor-overlay {
@@ -547,11 +580,11 @@ select:focus-visible {
   right: 10px;
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 6px;
+  gap: 3px;
+  padding: 4px;
   border: 1px solid var(--border);
   border-radius: 7px;
-  background: rgba(20, 22, 25, 0.88);
+  background: rgba(35, 35, 35, 0.92);
   box-shadow: 0 6px 22px rgba(0, 0, 0, 0.3);
   backdrop-filter: blur(14px);
   overflow-x: auto;
@@ -563,13 +596,20 @@ select:focus-visible {
 .geometry-mode-group {
   display: flex;
   gap: 3px;
-  padding-right: 6px;
+  padding-right: 4px;
   border-right: 1px solid var(--border);
 }
 
 .geometry-transform-buttons {
   display: flex;
   gap: 3px;
+}
+
+.geometry-selection-tools {
+  display: flex;
+  gap: 3px;
+  padding-right: 4px;
+  border-right: 1px solid var(--border);
 }
 
 .geometry-transform-buttons .toolbar-btn {
@@ -586,12 +626,25 @@ select:focus-visible {
   white-space: nowrap;
 }
 
+.geometry-editor-toolbar .toolbar-btn.icon-only {
+  width: 25px;
+  min-width: 25px;
+  height: 25px;
+}
+
+.geometry-editor-toolbar .geometry-selection-count,
+.geometry-editor-toolbar .geometry-topology-count {
+  min-width: 28px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 .geometry-editor-toolbar kbd,
 .geometry-editor-shortcuts kbd {
   padding: 1px 4px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 3px;
-  color: #e9ad72;
+  color: #ffad58;
   background: rgba(255, 255, 255, 0.05);
   font: 10px/1.2 monospace;
 }
@@ -650,6 +703,19 @@ select:focus-visible {
   pointer-events: none;
 }
 
+.geometry-editor-toolbar kbd {
+  display: none;
+}
+
+.geometry-editor-canvas {
+  cursor: crosshair;
+  outline: none;
+}
+
+.geometry-editor-canvas:active {
+  cursor: crosshair;
+}
+
 .geometry-transform-hud {
   position: absolute;
   z-index: 3;
@@ -677,6 +743,21 @@ select:focus-visible {
 
 .geometry-transform-hud small {
   color: var(--text-dim);
+}
+
+.geometry-selection-rect,
+.geometry-selection-circle {
+  position: absolute;
+  z-index: 4;
+  pointer-events: none;
+  box-sizing: border-box;
+  border: 1px solid #5da9ff;
+  background: rgba(75, 145, 220, 0.16);
+}
+
+.geometry-selection-circle {
+  border-radius: 50%;
+  background: rgba(75, 145, 220, 0.08);
 }
 
 .geometry-editor-empty {
@@ -760,6 +841,129 @@ body.macro-active .viewport-canvas {
   animation: pulse-playing 1.4s ease-in-out infinite;
   flex: 0;
   margin: auto 0;
+}
+
+/* Editor telemetry overlay. Floating glass panel pinned to the top-right
+   so it doesn't fight with the toolbar (top-left), the macro HUD (top-
+   center), or the terrain brush HUD (bottom-left). On by default; the
+   Layers dropdown has a "Stats" entry to show/hide it entirely, and
+   clicking the header collapses the panel to FPS-only (persisted to
+   localStorage). Layout is a two-column grid (label | value) inside a
+   fixed-width panel so large values like "13 392" or "1 234 567" never
+   push the panel wider. The header is a real <button> (pointer-events:
+   auto) so the orbit controls don't capture the click; body rows are
+   pointer-events: none so they pass through to the canvas underneath. */
+.stats-overlay {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 11;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 9px;
+  /* Wide enough to hold "Draw calls" (10 chars) in the label column and
+     "1 234 567" (10 chars) in the value column without truncation. The
+     header collapses to a single FPS row, but the same width is kept so
+     the panel doesn't snap narrower when collapsed. */
+  width: 168px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(20, 21, 25, 0.82);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+.stats-overlay-header {
+  /* Strip the <button> chrome so it looks identical to the body rows. */
+  all: unset;
+  display: grid;
+  grid-template-columns: 12px 1fr auto;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  cursor: pointer;
+  border-radius: 4px;
+  color: var(--text);
+  /* The header is the only interactive surface in the overlay — keep
+     clicks local. */
+  pointer-events: auto;
+}
+.stats-overlay-header:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.stats-overlay-header:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.stats-overlay-chevron {
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.stats-overlay-row {
+  display: grid;
+  /* label | value — the label column is wide enough for "Draw calls"
+     (10 chars), the value column gets the rest for "1 234 567" (10 chars
+     plus thousands separators). Right-align the value so the digits line
+     up across rows. */
+  grid-template-columns: 86px 1fr;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--text);
+  pointer-events: none;
+}
+
+.stats-overlay-label {
+  color: var(--text-dim);
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
+
+.stats-overlay-value {
+  font-weight: 600;
+  color: var(--text);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: clip;
+}
+
+.stats-overlay-section {
+  /* Subtle group divider — same colour as the label, slightly smaller,
+     with a thin top border so the eye can find the boundary even when
+     rows above and below are similar. The first section ("Performance")
+     gets a little extra top margin so it doesn't crowd the FPS header. */
+  color: var(--text-dim);
+  font-size: 9.5px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  pointer-events: none;
+}
+.stats-overlay.collapsed .stats-overlay-section {
+  display: none;
+}
+
+/* Traffic-light colours for load — the user wants to *see* a problem at a
+   glance during iteration, not have to read a number. */
+.stats-overlay-row.tone-warm .stats-overlay-value,
+.stats-overlay-header .stats-overlay-value.tone-warm {
+  color: var(--warn);
+}
+.stats-overlay-row.tone-heavy .stats-overlay-value,
+.stats-overlay-header .stats-overlay-value.tone-heavy {
+  color: #ff453a;
 }
 
 /* Blender-style transform macro HUD (G/R/S). Floating glass pill, centered
@@ -1492,6 +1696,47 @@ input[type="checkbox"]:checked::after {
 .folder-row.active {
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+.folder-row.selected {
+  background: var(--fill-2);
+}
+
+/* Selected-but-not-active needs its own row so it wins over the hover
+   background that otherwise paints the same shade. */
+.folder-row.selected:not(.active) {
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.folder-row.selected.active {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* Rename input that takes over the label slot. Stays inline with the row so
+   the surrounding layout doesn't jump when the user starts renaming. */
+.folder-rename {
+  flex: 1;
+  min-width: 0;
+  height: 18px;
+  padding: 0 4px;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  background: var(--bg-1);
+  border-radius: 4px;
+}
+
+.folder-rename:focus {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.folder-tree:focus {
+  outline: none;
+}
+
+.folder-tree:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--border-strong);
 }
 
 .folder-row.drop-target {
@@ -3109,24 +3354,266 @@ input[type="checkbox"]:checked::after {
 }
 
 /* ---- Modules panel ---- */
+/* Unity / Blender-style package manager: a narrow rail of module names on
+ * the left with their enabled state, a wide detail pane on the right.
+ * Mirrors the AssetsPanel sidebar + main split, but uses 100% panel width
+ * (no folder tree on top) because the module catalog is a flat list.
+ */
 .modules-panel {
   height: 100%;
-  overflow-y: auto;
-  padding: 10px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  background: var(--bg-1);
 }
 .modules-intro {
   font-size: 11px;
   color: var(--text-dim);
   line-height: 1.5;
-  padding: 2px 4px 6px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
 }
 .modules-intro em {
   color: #e6a23c;
   font-style: normal;
 }
+
+/* Side-by-side list + detail. Both children scroll independently so a
+ * long module name doesn't push the detail off the screen, and a long
+ * description doesn't push the list off the screen. */
+.modules-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+/* ---- Left rail (module list) ---- */
+.modules-list {
+  width: 220px;
+  flex: none;
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+  padding: 6px 4px;
+}
+.modules-list-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--text);
+  user-select: none;
+  transition: background-color 0.1s var(--ease), color 0.1s var(--ease);
+}
+.modules-list-row:hover {
+  background: var(--fill-1);
+}
+.modules-list-row.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.modules-list-row.active .modules-list-name-text {
+  color: var(--accent);
+}
+.modules-list-name {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+}
+.modules-list-row.active .modules-list-name {
+  color: var(--accent);
+}
+.modules-list-name-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+/* The switch is bigger than the row's click area thinks; let the row's
+ * hover handle feedback, and let the switch keep its own cursor so the
+ * affordance is obvious. */
+.modules-list-row input[type="checkbox"] {
+  cursor: pointer;
+}
+
+/* ---- Right pane (detail) ---- */
+.modules-detail {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 14px 16px 18px;
+}
+.modules-detail-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.modules-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 520px;
+}
+.modules-detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.modules-detail-title {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.modules-detail-title h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  line-height: 1.2;
+}
+.modules-detail-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.modules-detail-version {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  padding: 1px 7px;
+  background: var(--fill-1);
+  border-radius: 999px;
+}
+.module-badge {
+  font-size: 9.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: #2df098;
+  background: rgba(45, 240, 152, 0.12);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.modules-detail-desc {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
+}
+
+/* Section labels — same treatment as inspector section headers so the
+ * module detail feels like an inspector for a module. */
+.modules-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+}
+.modules-detail-section-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-dim);
+}
+
+/* Component chips — small pills that wrap, more legible than the previous
+ * comma-separated inline list. */
+.modules-component-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.modules-component-chip {
+  font-size: 11px;
+  color: var(--text);
+  background: var(--bg-3);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+
+/* Two-column property list (Module ID / Version / State). */
+.modules-detail-grid {
+  display: grid;
+  grid-template-columns: 88px 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 12px;
+}
+.modules-detail-grid dt {
+  color: var(--text-dim);
+  font-weight: 500;
+}
+.modules-detail-grid dd {
+  margin: 0;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.modules-detail-grid code {
+  font-family: "Cascadia Mono", Consolas, "SF Mono", monospace;
+  font-size: 11px;
+  background: var(--bg-0);
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--text);
+}
+
+/* State dot mirrors the colors used in the inspector Visibility row so
+ * enabled/disabled reads at a glance. */
+.modules-state-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+.modules-state-dot.on {
+  background: var(--ok);
+  box-shadow: 0 0 6px rgba(79, 212, 117, 0.5);
+}
+.modules-state-dot.off {
+  background: var(--text-dim);
+  opacity: 0.6;
+}
+
+.modules-detail-note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.modules-detail-note code {
+  font-family: "Cascadia Mono", Consolas, "SF Mono", monospace;
+  font-size: 10.5px;
+  background: var(--bg-0);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--text);
+}
+
+/* Module icon — still used by the old `.module-icon` class on
+ * `.module-card` if it ever returns; kept here so nothing leaks when the
+ * rail chips get re-themed later. */
 .module-card {
   display: flex;
   align-items: center;
@@ -3162,16 +3649,6 @@ input[type="checkbox"]:checked::after {
   font-size: 10px;
   font-weight: 400;
   color: var(--text-dim);
-}
-.module-badge {
-  font-size: 9px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.4px;
-  color: #2df098;
-  background: rgba(45, 240, 152, 0.12);
-  border-radius: 999px;
-  padding: 2px 7px;
 }
 .module-desc {
   font-size: 11px;
@@ -4032,5 +4509,436 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 
 .terrain-range-sep {
   color: var(--text-dim);
+  font-size: 11px;
+}
+
+/* ===================================================================
+ * Post-processing panel + nodes
+ * ===================================================================
+ * The node visuals reuse the existing .shader-node primitives; the
+ * category colors below give every effect a distinct accent.
+ */
+.cat-source {
+  --cat: #34c8ae;
+}
+.cat-gi {
+  --cat: #ee74bd;
+}
+.cat-color {
+  --cat: #f4bf4f;
+}
+.cat-effect {
+  --cat: #f07a52;
+}
+.cat-blend {
+  --cat: #4d9dff;
+}
+.cat-mask {
+  --cat: #94a3b8;
+}
+.cat-output {
+  --cat: #52d276;
+}
+
+.postprocess-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.postprocess-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+}
+
+.postprocess-hint {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.postprocess-panel .shader-graph-canvas {
+  flex: 1;
+  min-height: 0;
+}
+
+.postprocess-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: 0;
+}
+
+.postprocess-empty .empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-width: 320px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.postprocess-empty h3 {
+  margin: 4px 0 2px;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.postprocess-empty code {
+  background: var(--bg-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+  color: var(--text);
+}
+
+.toolbar-btn.disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Post-node tweaks: pull field rows a bit tighter than the shader-node
+ * default so a 6-node GI/reflection/color chain still fits comfortably. */
+.post-node .shader-node-row.field {
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.post-node .shader-node-row .number-field,
+.post-node .shader-node-row .select-field {
+  width: 90px;
+}
+
+.post-node .shader-node-row .color-field {
+  width: 30px;
+  flex: none;
+}
+
+.post-node .shader-node-row .shader-port-label.param-label {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* --- Poly Haven browser -------------------------------------------------- */
+.ph-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg-1);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.ph-gate {
+  margin: auto;
+  max-width: 380px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-dim);
+  padding: 24px;
+}
+
+.ph-gate h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.ph-gate p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.ph-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--bg-3);
+  flex: none;
+}
+
+.ph-tabs {
+  display: flex;
+  gap: 2px;
+  background: var(--bg-2);
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.ph-tab {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.ph-tab:hover {
+  color: var(--text);
+}
+
+.ph-tab.active {
+  background: var(--bg-3);
+  color: var(--text);
+}
+
+.ph-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  max-width: 320px;
+  background: var(--bg-2);
+  border: 1px solid var(--bg-3);
+  border-radius: 6px;
+  padding: 4px 8px;
+  color: var(--text-dim);
+}
+
+.ph-search input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 12px;
+  min-width: 0;
+}
+
+.ph-category {
+  background: var(--bg-2);
+  border: 1px solid var(--bg-3);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 6px;
+  max-width: 160px;
+}
+
+.ph-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.ph-grid-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+.ph-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 8px;
+}
+
+.ph-tile {
+  position: relative;
+  aspect-ratio: 1;
+  border-radius: 6px;
+  overflow: hidden;
+  cursor: pointer;
+  background: var(--bg-2);
+  outline: 1px solid transparent;
+}
+
+.ph-tile img {
+  width: 100%;
+  height: 100%;
+  /* Thumbs keep their native aspect (model renders are often portrait);
+     contain shows the whole asset instead of a cropped close-up. */
+  object-fit: contain;
+  display: block;
+  transition: transform 0.15s ease;
+}
+
+.ph-tile:hover img {
+  transform: scale(1.05);
+}
+
+.ph-tile.active {
+  outline: 2px solid var(--accent);
+}
+
+.ph-tile-name {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 14px 8px 6px;
+  font-size: 11px;
+  color: #fff;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.75));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.ph-more {
+  margin: 12px auto;
+  display: block;
+}
+
+.ph-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--text-dim);
+  padding: 18px;
+  text-align: center;
+}
+
+.ph-spin {
+  animation: ph-spin 0.9s linear infinite;
+}
+
+@keyframes ph-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.ph-detail {
+  position: relative;
+  width: 260px;
+  flex: none;
+  border-left: 1px solid var(--bg-3);
+  padding: 12px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg-1);
+}
+
+.ph-detail-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 1;
+  border: none;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.ph-detail-preview {
+  width: 100%;
+  border-radius: 6px;
+  background: var(--bg-2);
+  min-height: 120px;
+  object-fit: contain;
+}
+
+.ph-detail-name {
+  margin: 0;
+  font-size: 13px;
+}
+
+.ph-detail-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.ph-detail-cats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.ph-chip {
+  background: var(--bg-2);
+  border-radius: 10px;
+  padding: 2px 8px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.ph-detail-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ph-detail-row label {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.ph-detail-row select {
+  background: var(--bg-2);
+  border: 1px solid var(--bg-3);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
+.ph-size {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.ph-detail-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ph-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.ph-progress-bar {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+
+.ph-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.15s ease;
+}
+
+.ph-done {
+  color: #58c26e;
+  font-size: 11px;
+}
+
+.ph-error {
+  color: #e46a6a;
   font-size: 11px;
 }

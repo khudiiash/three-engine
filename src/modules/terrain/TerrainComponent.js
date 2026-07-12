@@ -1,8 +1,8 @@
 import * as THREE from "three/webgpu";
 import { texture as tslTexture, uv, float, vec3, normalMap } from "three/tsl";
 import { Component } from "../../engine/components/Component.js";
-import { resolveAssetUrl, loadAssetMeta } from "../../engine/assetResolver.js";
-import { applyTextureMeta } from "../../engine/textureMeta.js";
+import { resolveAssetUrl } from "../../engine/assetResolver.js";
+import { loadTextureAsset } from "../../engine/textureAsset.js";
 import { getGltfLoader } from "../../engine/gltfLoader.js";
 
 export const MAX_TERRAIN_LAYERS = 4;
@@ -593,16 +593,9 @@ export class TerrainComponent extends Component {
   async #loadMap(path, { srgb }) {
     if (!path) return null;
     try {
-      const [url, meta] = await Promise.all([
-        resolveAssetUrl(path),
-        loadAssetMeta(`${path}.meta`).catch(() => null),
-      ]);
-      const tex = await new THREE.TextureLoader().loadAsync(url);
-      tex.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-      tex.wrapS = THREE.RepeatWrapping;
-      tex.wrapT = THREE.RepeatWrapping;
-      applyTextureMeta(tex, meta);
-      return tex;
+      return await loadTextureAsset(path, {
+        colorSpace: srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace,
+      });
     } catch (err) {
       console.error(`Terrain layer map "${path}": ${err.message}`);
       return null;

@@ -1,7 +1,11 @@
 import { registerModuleDefinition } from "../engine/modules.js";
 import { physicsRapierModule } from "./physics-rapier/index.js";
 import { dracoModule } from "./draco/index.js";
+import { basisModule } from "./basis/index.js";
 import { terrainModule } from "./terrain/index.js";
+import { virtualGeometryModule } from "./virtual-geometry/index.js";
+import { postprocessingModule } from "./postprocessing/index.js";
+import { polyhavenModule } from "./polyhaven/index.js";
 
 /**
  * Built-in module catalog. Importing this file registers every definition;
@@ -13,6 +17,10 @@ import { terrainModule } from "./terrain/index.js";
  */
 registerModuleDefinition(physicsRapierModule);
 registerModuleDefinition(dracoModule);
+registerModuleDefinition(basisModule);
 registerModuleDefinition(terrainModule);
+registerModuleDefinition(virtualGeometryModule);
+registerModuleDefinition(postprocessingModule);
+registerModuleDefinition(polyhavenModule);
 
-export { physicsRapierModule, dracoModule, terrainModule };
+export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule };

@@ -7,6 +7,22 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
+  // The `three` npm package's `package.json` only declares explicit
+  // export-map entries for `./webgpu` and `./tsl` — bare `three/addons/*`
+  // subpaths are NOT in the export map, so Vite's runtime module
+  // resolver fails with "Failed to resolve module specifier" when our
+  // postGraph.js dynamic `import("three/addons/tsl/display/...js")`
+  // calls hit the browser. Map the prefix onto the actual file layout
+  // (`three/examples/jsm/...` = the same files, served from
+  // node_modules). We use the multi-line array syntax because the
+  // regex form has subtle anchoring issues across Vite versions —
+  // this explicit-prefix form is reliable.
+  resolve: {
+    alias: {
+      "three/addons": "three/examples/jsm",
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors
@@ -39,7 +55,24 @@ export default defineConfig(async () => ({
   // many different lazy chunks. Without this Vite re-esbuilds them per
   // import path on first load, which stretches `tauri dev`'s first WebView
   // paint to multi-seconds.
+  //
+  // We list post-process addons under their **resolved** alias target
+  // (`three/examples/jsm/...`) rather than the bare `three/addons/...`
+  // form because `optimizeDeps.include` resolves at config-load time,
+  // before the `resolve.alias` plugin fully bootstraps. Pre-bundling
+  // them is what makes the first `import("three/addons/...")` resolve
+  // instantly instead of triggering an on-demand transform chain.
+  //
+  // `entries` tells the dep-scanner to walk our source tree when
+  // looking for dynamic imports — without this, Vite only scans
+  // statically-imported deps and would miss the lazy `import()` calls
+  // inside `postGraph.js`, leaving the bare `three/addons/...`
+  // specifiers un-resolved at module-graph build time (which surfaces
+  // as the "Failed to resolve module specifier" runtime warning).
+  // `entries` is just a glob covering our app source so the scanner
+  // walks it during cold-start optimization.
   optimizeDeps: {
+    entries: ["src/**/*.js", "src/**/*.jsx"],
     include: [
       "react",
       "react-dom",
@@ -48,8 +81,37 @@ export default defineConfig(async () => ({
       "@xyflow/react",
       "three",
       "three/webgpu",
-      "three/addons/controls/OrbitControls.js",
-      "three/addons/controls/TransformControls.js",
+      // External controls / studios' interactive controls
+      "three/examples/jsm/controls/OrbitControls.js",
+      "three/examples/jsm/controls/TransformControls.js",
+      // Post-process addons (TSL display nodes). Each is dynamically
+      // `import()`-ed from `postGraph.js`; pre-bundling them shaves
+      // hundreds of ms off first-compile + drops a bunch of "Failed
+      // to resolve module specifier" errors in the browser console
+      // (the `resolve.alias` block above handles the runtime path).
+      "three/examples/jsm/tsl/display/SSGINode.js",
+      "three/examples/jsm/tsl/display/SSRNode.js",
+      "three/examples/jsm/tsl/display/DenoiseNode.js",
+      "three/examples/jsm/tsl/display/BloomNode.js",
+      "three/examples/jsm/tsl/display/GodraysNode.js",
+      "three/examples/jsm/tsl/display/depthAwareBlend.js",
+      "three/examples/jsm/tsl/display/DepthOfFieldNode.js",
+      "three/examples/jsm/tsl/display/ChromaticAberrationNode.js",
+      "three/examples/jsm/tsl/display/FilmNode.js",
+      "three/examples/jsm/tsl/display/FXAANode.js",
+      "three/examples/jsm/tsl/display/SMAANode.js",
+      "three/examples/jsm/tsl/display/SobelOperatorNode.js",
+      "three/examples/jsm/tsl/display/RGBShiftNode.js",
+      "three/examples/jsm/tsl/display/SharpenNode.js",
+      "three/examples/jsm/tsl/display/AfterImageNode.js",
+      "three/examples/jsm/tsl/display/Sepia.js",
+      "three/examples/jsm/tsl/display/BleachBypass.js",
+      "three/examples/jsm/tsl/display/DotScreenNode.js",
+      "three/examples/jsm/tsl/display/Lut3DNode.js",
+      "three/examples/jsm/tsl/display/GaussianBlurNode.js",
+      "three/examples/jsm/tsl/display/BilateralBlurNode.js",
+      "three/examples/jsm/tsl/display/MotionBlur.js",
+      "three/examples/jsm/tsl/display/FSR1Node.js",
       "lucide-react",
       "zustand",
       "immer",

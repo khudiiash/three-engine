@@ -78,6 +78,11 @@ export async function exportGame() {
         materialPaths.add(matPath);
         c.props.materials[name] = `assets/${basename(matPath)}`;
       }
+    } else if (c.type === "skinnedmesh" && c.props.material) {
+      materialPaths.add(c.props.material);
+      c.props.material = `assets/${basename(c.props.material)}`;
+    } else if (c.type === "environment" && c.props.hdri) {
+      c.props.hdri = claim(c.props.hdri);
     } else if (c.type === "animation" && c.props.controller) {
       c.props.controller = claim(c.props.controller);
     } else if (c.type === "script" && c.props.path) {
@@ -174,12 +179,22 @@ export async function exportGame() {
         // Raw file missing — likely the sidecar pointed elsewhere.
       }
     }
-    // Texture import settings ship as sidecar .meta files when present.
+    // Import settings ship as sidecar .meta files when present: textures
+    // (filtering/wrap) and models (virtual geometry).
     for (const [src, rel] of [...assets.entries()]) {
-      if (!/\.(png|jpe?g|webp)$/i.test(src)) continue;
+      if (!/\.(png|jpe?g|webp|glb)$/i.test(src)) continue;
       try {
         await invoke("stat_file", { path: `${src}.meta` });
         assets.set(`${src}.meta`, `${rel}.meta`);
+        if (/\.(png|jpe?g|webp)$/i.test(src)) {
+          const textureMeta = JSON.parse(
+            await invoke("read_text_file", { path: `${src}.meta` }),
+          );
+          if (textureMeta?.basis?.enabled) {
+            await invoke("stat_file", { path: `${src}.basis` });
+            assets.set(`${src}.basis`, `${rel}.basis`);
+          }
+        }
       } catch {
         // No sidecar — defaults apply.
       }

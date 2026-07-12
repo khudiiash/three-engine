@@ -1,6 +1,79 @@
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
+use tauri::Manager;
+
+#[derive(Serialize)]
+struct BasisCompressionInfo {
+    original: u64,
+    compressed: u64,
+}
+
+/// Encodes a source image to an ETC1S Basis Universal KTX2 derivative.
+/// The source remains untouched; runtime loading selects `<source>.basis`
+/// through the image's metadata and can always fall back to the original.
+#[tauri::command]
+async fn compress_texture_basis(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<BasisCompressionInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let exe_name = if cfg!(windows) { "basisu.exe" } else { "basisu" };
+        let platform_dir = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("windows", "x86_64") => "win32-x64",
+            ("linux", "x86_64") => "linux-x64",
+            ("linux", "aarch64") => "linux-arm64",
+            ("macos", "x86_64") => "darwin-x64",
+            ("macos", "aarch64") => "darwin-arm64",
+            (os, arch) => return Err(format!("Basis encoder unsupported on {os}/{arch}")),
+        };
+        let mut candidates = vec![
+            Path::new("../node_modules/@gpu-tex-enc/basis/bin")
+                .join(platform_dir)
+                .join(exe_name),
+            Path::new("node_modules/@gpu-tex-enc/basis/bin")
+                .join(platform_dir)
+                .join(exe_name),
+        ];
+        if let Ok(resources) = app.path().resource_dir() {
+            candidates.insert(
+                0,
+                resources.join("basisu/bin").join(platform_dir).join(exe_name),
+            );
+        }
+        let encoder = candidates
+            .into_iter()
+            .find(|candidate| candidate.exists())
+            .ok_or("Basis encoder resource not found")?;
+
+        let output_path = format!("{path}.basis");
+        let result = std::process::Command::new(&encoder)
+            .args([
+                path.as_str(),
+                "-ktx2",
+                "-mipmap",
+                "-linear",
+                "-q",
+                "180",
+                "-output_file",
+                output_path.as_str(),
+            ])
+            .output()
+            .map_err(|e| format!("start {}: {e}", encoder.display()))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            return Err(format!("basisu failed: {}{}", stdout, stderr));
+        }
+
+        Ok(BasisCompressionInfo {
+            original: fs::metadata(&path).map_err(|e| e.to_string())?.len(),
+            compressed: fs::metadata(&output_path).map_err(|e| e.to_string())?.len(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
 #[tauri::command]
 fn save_scene(path: String, contents: String) -> Result<(), String> {
@@ -248,6 +321,7 @@ pub fn run() {
             import_files,
             export_game,
             write_binary_file,
+            compress_texture_basis,
             frontend_log
         ])
         .run(tauri::generate_context!())

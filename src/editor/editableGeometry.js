@@ -86,7 +86,7 @@ export function expandLogicalVertices(editable, indices) {
 }
 
 /** Returns the connected, coplanar triangle region containing faceIndex. */
-export function coplanarFaceGroup(editable, faceIndex, threshold = 0.9999) {
+export function coplanarFaceGroup(editable, faceIndex, threshold = 0.9999, blockedEdges = new Set()) {
   if (!editable.faces[faceIndex]) return [];
   const edgeFaces = new Map();
   editable.faces.forEach((face, index) => {
@@ -104,6 +104,7 @@ export function coplanarFaceGroup(editable, faceIndex, threshold = 0.9999) {
     const face = editable.faces[current];
     for (let edge = 0; edge < 3; edge++) {
       const key = spatialEdgeKey(editable.positions[face[edge]], editable.positions[face[(edge + 1) % 3]]);
+      if (blockedEdges.has(key)) continue;
       for (const neighbor of edgeFaces.get(key) ?? []) {
         if (!found.has(neighbor) && faceNormal(editable, editable.faces[neighbor]).dot(originNormal) >= threshold) {
           found.add(neighbor);

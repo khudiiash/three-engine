@@ -18,7 +18,7 @@ export const PROJECT_SETTINGS_DEFAULTS = {
     // Viewport Layers dropdown toggles. Persisted per-project so a return
     // visit picks up the user's preferred view (e.g. "hide colliders +
     // grid for a clean scene review").
-    layers: { gizmos: true, colliders: true, grid: true },
+    layers: { gizmos: true, colliders: true, grid: true, stats: true },
     // User-rebindable visibility hotkeys (H, Shift+H, E, Shift+E by
     // default). Each entry maps an action id → chord string; the
     // dispatcher in keybindings.js reads this on every keydown so

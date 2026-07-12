@@ -3,6 +3,8 @@ import { MeshComponent } from "./components/MeshComponent.js";
 import { LightComponent } from "./components/LightComponent.js";
 import { CameraComponent } from "./components/CameraComponent.js";
 import { ModelComponent } from "./components/ModelComponent.js";
+import { BoneComponent } from "./components/BoneComponent.js";
+import { SkinnedMeshComponent } from "./components/SkinnedMeshComponent.js";
 import { ScriptComponent } from "./components/ScriptComponent.js";
 import { ParticleComponent } from "./components/ParticleComponent.js";
 import { AnimationComponent } from "./components/AnimationComponent.js";
@@ -30,6 +32,8 @@ const BUILT_IN_COMPONENTS = [
   LightComponent,
   CameraComponent,
   ModelComponent,
+  BoneComponent,
+  SkinnedMeshComponent,
   ScriptComponent,
   ParticleComponent,
   AnimationComponent,

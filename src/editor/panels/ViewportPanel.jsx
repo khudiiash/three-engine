@@ -5,11 +5,12 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { ensureEngine, engine } from "../engineInstance.js";
 import { EDITOR_LAYER } from "../../engine/editorLayers.js";
+import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetTransformCommand } from "../commands/transformCommands.js";
-import { CreateEntityCommand, BatchCommand } from "../commands/entityCommands.js";
+import { BatchCommand } from "../commands/entityCommands.js";
 import { getUiSystem } from "../../engine/ui/UiSystem.js";
 import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
 import { extOf, MODEL_EXTENSIONS, TEXTURE_EXTENSIONS, SCRIPT_EXTENSIONS, MATERIAL_EXTENSIONS, PREFAB_EXTENSIONS } from "../assetLoader.js";
@@ -49,6 +50,7 @@ const LAYER_TOGGLES = [
   { key: "gizmos", label: "Gizmos" },
   { key: "colliders", label: "Colliders" },
   { key: "grid", label: "Grid" },
+  { key: "stats", label: "Stats" },
 ];
 
 // The renderer canvas and editor controls outlive the React panel so the
@@ -73,7 +75,7 @@ const viewport = {
   // Toggles from the Layers dropdown. Mirrored in React state; mutations
   // here apply live so a hot-reload of the panel keeps the current layer
   // set. Default to "all on" so the viewport starts in its full visual state.
-  layers: { gizmos: true, colliders: true, grid: true },
+  layers: { gizmos: true, colliders: true, grid: true, stats: true },
   layersListeners: new Set(),
 };
 
@@ -1570,13 +1572,14 @@ function handleAssetDrop(path, point) {
       instantiatePrefab(path, at.toArray()).catch((err) => console.error(String(err)));
       return;
     }
-    const cmd = new CreateEntityCommand({
-      name: basename(path).replace(/\.[^.]+$/, ""),
-      transform: { position: at.toArray() },
-      components: [{ type: "model", props: { path } }],
-    });
-    commandBus.execute(cmd);
-    useSelectionStore.getState().select(cmd.entityId);
+    // Raw .glb: run the import pipeline (mesh entities + geometry/material
+    // assets), then place the resulting prefab at the drop point.
+    (async () => {
+      const { unpackGlb } = await import("../glbImport.js");
+      const folder = await unpackGlb(path);
+      const stem = basename(path).replace(/\.[^.]+$/, "");
+      await instantiatePrefab(`${folder}/${stem}.prefab`, at.toArray());
+    })().catch((err) => console.error(String(err)));
   }
 }
 
@@ -2465,6 +2468,7 @@ export function ViewportPanel() {
           />
         </div>
       )}
+      <StatsOverlay />
     </div>
   );
 }

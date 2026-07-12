@@ -1,0 +1,450 @@
+import * as THREE from "three/webgpu";
+import { loadAssetMeta } from "../../engine/assetResolver.js";
+import { buildClusterDAG, selectClusters } from "./clusterBuilder.js";
+
+/**
+ * Per-engine virtual-geometry runtime (installed by the module's setup()).
+ *
+ * Unreal-style: virtual geometry is a property of the ASSET, not a component.
+ * A model opts in via its sidecar meta (`<model>.glb.meta` →
+ * `virtualGeometry: { enabled, pixelError, debugView }`, edited in the asset
+ * inspector). Whenever a Model component finishes loading such a model — any
+ * entity, any scene — this system swaps each eligible mesh's geometry in
+ * place: same mesh object, same material, same transforms, but the index
+ * buffer becomes the per-frame LOD cut through the cluster DAG (see
+ * clusterBuilder.js). Nothing else in the engine knows this happened, so
+ * shadows, picking and serialization keep working on the original mesh.
+ *
+ * The cut is selected from the CAMERA POSITION only — deliberately not
+ * frustum-culled per cluster. The same index buffer feeds every render of the
+ * mesh (main view, shadow maps, editor PIP), so view-dependent culling would
+ * punch holes in shadows and in any pass with a different frustum; the
+ * distance-only cut is identical for all of them. Whole-mesh frustum culling
+ * still happens in three.js via the geometry's bounding sphere. A bonus:
+ * rotating the camera in place never re-selects or re-uploads anything.
+ *
+ * The DAG is built once per (asset, mesh) and cached process-wide — it only
+ * stores triangle INDICES plus error metadata, so it's valid for every
+ * reload/instance of the same asset even though each load parses fresh
+ * vertex buffers.
+ *
+ * MVP cuts: static meshes only (skinned skipped); multi-material meshes draw
+ * with their first material (a dynamic index buffer has no group ranges);
+ * shadows reuse the camera's cut; scatter/instancer meshes are untouched.
+ */
+
+// `${path}#${meshIndex}` -> Promise<dag>. Failed builds are evicted so a
+// broken asset can retry after being re-imported.
+const dagCache = new Map();
+
+function getDag(path, meshIndex, geometry) {
+  const key = `${path}#${meshIndex}`;
+  let p = dagCache.get(key);
+  if (!p) {
+    p = buildDagFromGeometry(path, geometry);
+    p.catch(() => dagCache.delete(key));
+    dagCache.set(key, p);
+  }
+  return p;
+}
+
+// mesh -> record. A WeakMap (NOT mesh.userData) on purpose: userData can end
+// up in serialization/clone paths, and a record holds multi-megabyte buffers.
+const virtualized = new WeakMap();
+
+/** Non-interleaved Float32 view of an attribute (copies when it must). */
+function attrToFloat32(attr) {
+  if (!attr) return null;
+  if (!attr.isInterleavedBufferAttribute && attr.array instanceof Float32Array) return attr.array;
+  const n = attr.count, s = attr.itemSize;
+  const out = new Float32Array(n * s);
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < s; c++) out[i * s + c] = attr.getComponent(i, c);
+  }
+  return out;
+}
+
+async function buildDagFromGeometry(path, geometry) {
+  if (!geometry.getAttribute("normal")) geometry.computeVertexNormals();
+  const positions = attrToFloat32(geometry.getAttribute("position"));
+  const normals = attrToFloat32(geometry.getAttribute("normal"));
+  const uvAttr = geometry.getAttribute("uv");
+  let indices;
+  if (geometry.index) {
+    indices = geometry.index.array instanceof Uint32Array
+      ? geometry.index.array
+      : new Uint32Array(geometry.index.array);
+  } else {
+    indices = new Uint32Array(positions.length / 3);
+    for (let i = 0; i < indices.length; i++) indices[i] = i;
+  }
+  const t0 = performance.now();
+  const dag = await buildClusterDAG({ positions, normals, uvs: uvAttr ? attrToFloat32(uvAttr) : null, indices });
+  console.info(
+    `[virtual-geometry] ${path}: ${(indices.length / 3).toLocaleString()} tris → ` +
+      `${dag.clusterCount.toLocaleString()} clusters, ${dag.levelCount} levels, ${(performance.now() - t0).toFixed(0)} ms`,
+  );
+  return dag;
+}
+
+// Every live system, so the editor can poke all open engines when a model's
+// meta changes (see refreshVirtualGeometryAsset).
+const activeSystems = new Set();
+
+/** Editor hook: re-evaluates one asset everywhere after its meta changed. */
+export function refreshVirtualGeometryAsset(path) {
+  for (const sys of activeSystems) sys.refreshAsset(path);
+}
+
+export const VIRTUAL_GEOMETRY_META_DEFAULTS = {
+  enabled: false,
+  pixelError: 1,
+  debugView: "off", // "off" | "triangles" | "clusters"
+};
+
+/** Normalizes stored meta (incl. the legacy `debugClusters` boolean). */
+function resolveVgMeta(raw) {
+  if (!raw) return null;
+  const vg = { ...VIRTUAL_GEOMETRY_META_DEFAULTS, ...raw };
+  if (raw.debugView == null && raw.debugClusters) vg.debugView = "clusters";
+  return vg;
+}
+
+/** Stable bright pseudo-random color from an id (UE-debug-view style). */
+function debugColor(id, out) {
+  const h = (Math.imul(id + 1, 2654435761) >>> 0) / 4294967296;
+  const hue = h * 6;
+  const x = 1 - Math.abs((hue % 2) - 1);
+  const seg = hue | 0;
+  let r = 0, g = 0, b = 0;
+  if (seg === 0) { r = 1; g = x; } else if (seg === 1) { r = x; g = 1; }
+  else if (seg === 2) { g = 1; b = x; } else if (seg === 3) { g = x; b = 1; }
+  else if (seg === 4) { r = x; b = 1; } else { r = 1; b = x; }
+  // Two brightness bands so same-hue neighbours still separate.
+  const l = 0.55 + (((Math.imul(id + 7, 40503) >>> 0) % 100) / 100) * 0.45;
+  out[0] = r * l;
+  out[1] = g * l;
+  out[2] = b * l;
+}
+
+/** Paths may arrive with either slash direction on Windows — compare loosely. */
+const normPath = (p) => (p ?? "").replace(/\\/g, "/");
+
+// Scratch objects for the per-frame selection — never allocate in the loop.
+const _inv = new THREE.Matrix4();
+const _camWorld = new THREE.Vector3();
+const _camLocal = new THREE.Vector3();
+const _rgb = [0, 0, 0];
+
+export class VirtualGeometrySystem {
+  constructor(engine) {
+    this.engine = engine;
+    // One record per virtualized mesh:
+    // { mesh, path, dag, geometry, index, original, selClusters, drawn,
+    //   hash, debug }
+    this.records = [];
+    this.settings = new Map(); // path -> resolved virtualGeometry meta | null
+    this.stats = { drawnTriangles: 0, totalTriangles: 0, drawnClusters: 0 };
+    this._pruneNeeded = false;
+    this._offModel = engine.on("model-loaded", (entity) => this.applyEntity(entity));
+    this._offHier = engine.on("hierarchy-changed", () => (this._pruneNeeded = true));
+    this._offTick = engine.onUpdate(() => this.#tick());
+    activeSystems.add(this);
+    // The module can be enabled after a scene (and its models) already loaded.
+    for (const entity of engine.entities.values()) this.applyEntity(entity);
+  }
+
+  dispose() {
+    activeSystems.delete(this);
+    this._offModel?.();
+    this._offHier?.();
+    this._offTick?.();
+    for (const r of this.records) this.#restore(r);
+    this.records = [];
+    this.settings.clear();
+  }
+
+  async #metaFor(path, force = false) {
+    if (!force && this.settings.has(path)) return this.settings.get(path);
+    const meta = await loadAssetMeta(`${path}.meta`);
+    const vg = resolveVgMeta(meta?.virtualGeometry);
+    this.settings.set(path, vg);
+    return vg;
+  }
+
+  /** Virtualizes the meshes of an entity's Model component (if opted in). */
+  async applyEntity(entity) {
+    const mc = entity.getComponent?.("model");
+    const path = mc?.props?.path;
+    if (!mc?.root || !path) return;
+    const vg = await this.#metaFor(path);
+    if (!vg?.enabled) return;
+    const root = mc.root;
+    const meshes = [];
+    root.traverse((o) => {
+      if (o.isMesh && !o.isSkinnedMesh && !o.userData.vgeoDebug) meshes.push(o);
+    });
+    for (let i = 0; i < meshes.length; i++) {
+      const mesh = meshes[i];
+      if (virtualized.has(mesh)) continue;
+      if (!mesh.geometry?.getAttribute("position")) continue;
+      try {
+        const dag = await getDag(path, i, mesh.geometry);
+        // The await is a suspension point: the model may have been reloaded
+        // or the entity destroyed meanwhile. Only swap a mesh that is still
+        // the live one.
+        if (mc.root !== root || virtualized.has(mesh)) continue;
+        this.#virtualize(mesh, path, dag);
+      } catch (err) {
+        console.error(`[virtual-geometry] ${path} failed: ${err.message}`);
+      }
+    }
+  }
+
+  #virtualize(mesh, path, dag) {
+    const src = mesh.geometry;
+    const geometry = new THREE.BufferGeometry();
+    // Vertex data is shared with the source geometry; only the index buffer
+    // (the current LOD cut) belongs to this record.
+    for (const name of Object.keys(src.attributes)) geometry.setAttribute(name, src.attributes[name]);
+    const index = new THREE.BufferAttribute(new Uint32Array(dag.lod0IndexCount), 1);
+    index.setUsage(THREE.DynamicDrawUsage);
+    geometry.setIndex(index);
+    geometry.setDrawRange(0, 0);
+    const [bx, by, bz, br] = dag.bounds;
+    geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(bx, by, bz), br);
+
+    mesh.geometry = geometry;
+    if (Array.isArray(mesh.material)) mesh.material = mesh.material[0]; // no group ranges
+
+    const record = {
+      mesh,
+      path,
+      dag,
+      geometry,
+      index,
+      original: src,
+      selClusters: new Uint32Array(dag.clusterCount),
+      drawn: 0,
+      hash: null,
+      debug: null,
+    };
+    virtualized.set(mesh, record);
+    this.records.push(record);
+  }
+
+  /** Puts the original geometry back and drops per-record GPU state. */
+  #restore(r) {
+    if (virtualized.get(r.mesh) === r) {
+      r.mesh.geometry = r.original;
+      virtualized.delete(r.mesh);
+    }
+    this.#dropDebug(r);
+    r.geometry.dispose();
+  }
+
+  #dropDebug(r) {
+    if (!r.debug) return;
+    r.mesh.remove(r.debug.mesh);
+    r.debug.geometry.dispose();
+    r.debug.mesh.material.dispose();
+    r.debug = null;
+  }
+
+  /** Editor hook: an asset's virtualGeometry meta changed. */
+  async refreshAsset(path) {
+    const vg = await this.#metaFor(path, true);
+    const np = normPath(path);
+    if (!vg?.enabled) {
+      // Turned off: restore every mesh using this asset.
+      const dead = this.records.filter((r) => normPath(r.path) === np);
+      this.records = this.records.filter((r) => normPath(r.path) !== np);
+      for (const r of dead) this.#restore(r);
+      console.info(`[virtual-geometry] refresh ${path}: disabled, restored ${dead.length} mesh(es)`);
+      return;
+    }
+    // Turned on / retuned: (re)apply to every entity using the asset. Hash
+    // reset picks up pixelError/debugView changes on already-virtual meshes.
+    let matched = 0;
+    for (const r of this.records) {
+      if (normPath(r.path) === np) {
+        // The tick looks settings up by the record's own path string, which
+        // may differ from the editor's in slash direction — refresh it too.
+        this.settings.set(r.path, vg);
+        r.hash = null;
+        matched++;
+      }
+    }
+    for (const entity of this.engine.entities.values()) {
+      if (normPath(entity.getComponent?.("model")?.props?.path) === np) this.applyEntity(entity);
+    }
+    console.info(
+      `[virtual-geometry] refresh ${path}: enabled, pixelError=${vg.pixelError}, ` +
+        `debugView=${vg.debugView}, ${matched}/${this.records.length} record(s) matched`,
+    );
+  }
+
+  /** Drops records whose mesh is no longer connected to the scene (model
+   *  reloaded / entity destroyed — ModelComponent already disposed the
+   *  swapped geometry, we just stop tracking it). */
+  #prune() {
+    this._pruneNeeded = false;
+    const scene = this.engine.scene;
+    this.records = this.records.filter((r) => {
+      let n = r.mesh;
+      while (n.parent) n = n.parent;
+      if (n === scene) return true;
+      if (virtualized.get(r.mesh) === r) virtualized.delete(r.mesh);
+      this.#dropDebug(r);
+      return false;
+    });
+  }
+
+  #tick() {
+    if (this._pruneNeeded) this.#prune();
+    if (!this.records.length) return;
+    const engine = this.engine;
+    const camera = engine.camera;
+    const renderer = engine.renderer;
+    if (!camera || !renderer) return;
+
+    const heightPx = renderer.domElement?.height || 1080;
+    // Camera part of the dirty hash. The cut depends only on the camera
+    // POSITION (plus projection/viewport for the pixel budget) — rotation is
+    // irrelevant by design, so orbiting/panning in place re-uploads nothing.
+    let camHash = 2166136261;
+    const mixCam = (v) => (camHash = ((camHash ^ Math.fround(v)) * 16777619) >>> 0);
+    const p = camera.projectionMatrix.elements;
+    mixCam(p[0]); mixCam(p[5]);
+    const cm = camera.matrixWorld.elements;
+    mixCam(cm[12]); mixCam(cm[13]); mixCam(cm[14]);
+    mixCam(heightPx);
+
+    const isOrtho = !!camera.isOrthographicCamera;
+    // Perspective: pxError = worldError * k / distance. Ortho: * k directly.
+    const k = isOrtho
+      ? (heightPx * (camera.zoom ?? 1)) / Math.max(1e-6, camera.top - camera.bottom)
+      : heightPx / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov ?? 50) / 2));
+    _camWorld.setFromMatrixPosition(camera.matrixWorld);
+
+    this.stats.drawnTriangles = 0;
+    this.stats.totalTriangles = 0;
+    this.stats.drawnClusters = 0;
+    for (const r of this.records) {
+      const vg = this.settings.get(r.path) ?? VIRTUAL_GEOMETRY_META_DEFAULTS;
+      this.stats.totalTriangles += r.dag.lod0IndexCount / 3;
+
+      let h = camHash;
+      const mix = (v) => (h = ((h ^ Math.fround(v)) * 16777619) >>> 0);
+      const em = r.mesh.matrixWorld.elements;
+      mix(em[0]); mix(em[5]); mix(em[10]); mix(em[12]); mix(em[13]); mix(em[14]);
+      mix(vg.pixelError);
+      mix(vg.debugView === "off" ? 0 : vg.debugView === "clusters" ? 1 : 2);
+      if (h !== r.hash) {
+        r.hash = h;
+        this.#select(r, vg, k, isOrtho);
+      }
+      this.stats.drawnTriangles += r.drawn / 3;
+      this.stats.drawnClusters += r._selStats?.drawnClusters ?? 0;
+    }
+  }
+
+  #select(r, vg, k, isOrtho) {
+    const mesh = r.mesh;
+    mesh.updateWorldMatrix(true, false);
+    _inv.copy(mesh.matrixWorld).invert();
+    _camLocal.copy(_camWorld).applyMatrix4(_inv);
+
+    const tau = Math.max(0.05, vg.pixelError ?? 1);
+    const stats = (r._selStats ??= {});
+    const count = selectClusters(
+      r.dag, _camLocal.x, _camLocal.y, _camLocal.z,
+      k, isOrtho, tau, null, r.index.array, r.selClusters, stats,
+    );
+    r.drawn = count;
+
+    const debugOn = vg.debugView && vg.debugView !== "off";
+    if (debugOn) {
+      // Debug replaces the real surface: the main geometry draws nothing
+      // (no z-fighting), the colored triangles render as a child mesh.
+      r.geometry.setDrawRange(0, 0);
+      this.#updateDebug(r, vg.debugView, count, stats.drawnClusters);
+      r.debug.mesh.visible = true;
+    } else {
+      r.index.clearUpdateRanges();
+      if (count > 0) r.index.addUpdateRange(0, count);
+      r.index.needsUpdate = true;
+      r.geometry.setDrawRange(0, count);
+      if (r.debug) r.debug.mesh.visible = false;
+    }
+  }
+
+  /**
+   * Debug views, UE-style: unlit flat pseudo-random colors, stable frame to
+   * frame — "triangles" colors every triangle of the cut individually (so
+   * on-screen triangle density is directly visible; it grows near, shrinks
+   * far), "clusters" gives each ~128-triangle cluster one color (so cluster
+   * boundaries and LOD switches are visible).
+   *
+   * Buffers are position + uint8 color only (no normals — unlit), sized to
+   * the CURRENT cut and grown geometrically on demand: a typical cut is far
+   * smaller than full detail, so this stays tens of MB instead of the
+   * hundreds that full-detail preallocation would cost per mesh.
+   */
+  #updateDebug(r, view, indexCount, drawnClusters) {
+    if (!r.debug || r.debug.capacity < indexCount) {
+      const capacity = Math.ceil((indexCount * 1.5) / 3) * 3;
+      this.#dropDebug(r);
+      const geometry = new THREE.BufferGeometry();
+      const position = new THREE.BufferAttribute(new Float32Array(capacity * 3), 3);
+      position.setUsage(THREE.DynamicDrawUsage);
+      // Float RGB on purpose: it's the one vertex-color layout every three.js
+      // path is exercised with. Byte-packed colors looked tempting but WebGPU
+      // has no 3-component byte vertex format (`unorm8x3` doesn't exist), and
+      // a format the pipeline rejects makes the mesh silently draw nothing.
+      const color = new THREE.BufferAttribute(new Float32Array(capacity * 3), 3);
+      color.setUsage(THREE.DynamicDrawUsage);
+      geometry.setAttribute("position", position);
+      geometry.setAttribute("color", color);
+      geometry.setDrawRange(0, 0);
+      geometry.boundingSphere = r.geometry.boundingSphere.clone();
+      const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ vertexColors: true }));
+      mesh.userData.vgeoDebug = true;
+      mesh.userData.entityId = r.mesh.userData.entityId;
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      r.mesh.add(mesh); // child ⇒ inherits transform, dies with the mesh
+      r.debug = { geometry, mesh, position, color, capacity };
+      r._dbgPositions = attrToFloat32(r.geometry.getAttribute("position"));
+      console.info(`[virtual-geometry] debug mesh created for ${r.path} (capacity ${capacity} verts)`);
+    }
+    const dag = r.dag;
+    const positions = r._dbgPositions;
+    const dp = r.debug.position.array;
+    const dc = r.debug.color.array;
+    const perTriangle = view === "triangles";
+    let vi = 0;
+    for (let s = 0; s < drawnClusters; s++) {
+      const ci = r.selClusters[s];
+      const off = dag.clusterRanges[ci * 2], cnt = dag.clusterRanges[ci * 2 + 1];
+      if (!perTriangle) debugColor(ci, _rgb);
+      for (let j = 0; j < cnt; j += 3) {
+        // Global triangle id ⇒ a triangle keeps its color between frames.
+        if (perTriangle) debugColor((off + j) / 3, _rgb);
+        for (let e = 0; e < 3; e++) {
+          const v = dag.indexData[off + j + e] * 3;
+          const p3 = vi * 3;
+          dp[p3] = positions[v]; dp[p3 + 1] = positions[v + 1]; dp[p3 + 2] = positions[v + 2];
+          dc[p3] = _rgb[0]; dc[p3 + 1] = _rgb[1]; dc[p3 + 2] = _rgb[2];
+          vi++;
+        }
+      }
+    }
+    for (const attr of [r.debug.position, r.debug.color]) {
+      attr.clearUpdateRanges();
+      if (vi > 0) attr.addUpdateRange(0, vi * 3);
+      attr.needsUpdate = true;
+    }
+    r.debug.geometry.setDrawRange(0, vi);
+  }
+}

@@ -52,13 +52,15 @@ function dropAssetOnEntity(path, parentId) {
   if (PREFAB_EXTENSIONS.includes(ext)) {
     instantiatePrefab(path, null, parentId).catch((err) => console.error(String(err)));
   } else if (MODEL_EXTENSIONS.includes(ext)) {
-    const cmd = new CreateEntityCommand({
-      name: basename(path).replace(/\.[^.]+$/, ""),
-      parentId,
-      components: [{ type: "model", props: { path } }],
-    });
-    commandBus.execute(cmd);
-    useSelectionStore.getState().select(cmd.entityId);
+    // Raw .glb (legacy leftover or hand-copied file): run it through the
+    // import pipeline — mesh entities + geometry/material assets — then drop
+    // the resulting prefab where the user aimed.
+    (async () => {
+      const { unpackGlb } = await import("../glbImport.js");
+      const folder = await unpackGlb(path);
+      const stem = basename(path).replace(/\.[^.]+$/, "");
+      await instantiatePrefab(`${folder}/${stem}.prefab`, null, parentId);
+    })().catch((err) => console.error(String(err)));
   }
 }
 
