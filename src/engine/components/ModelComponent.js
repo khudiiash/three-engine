@@ -11,11 +11,9 @@ const loader = getGltfLoader();
 export class ModelComponent extends Component {
   static type = "model";
   static label = "Model";
-  // Internal plumbing, not a user-facing component: skinned/animated GLB
-  // imports are the only thing that creates one (skeletons + clips can't be
-  // flattened into static .geom assets). Everything else is mesh entities
-  // with geometry/material assets — see glbImport.js. `internal` hides it
-  // from the Add Component menu and the inspector's section list.
+  // Internal owner for skinned/animated GLBs. User-facing render controls are
+  // exposed through Mesh handles; this component only owns the loaded GLB,
+  // skeleton and animation clips.
   static internal = true;
   static defaults = {
     path: "",

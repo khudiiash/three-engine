@@ -33,10 +33,27 @@ setAssetMetaLoader(async (path) => {
 // Scripts ship as plain files; import once via blob URL (version never
 // changes, so ScriptComponent's hot-reload poll is a cheap cache hit).
 const scriptCache = new Map();
+/** Reject HTML/markup payloads early so the user sees a clear error
+ *  ("this isn't a script") rather than the cryptic "Unexpected identifier
+ *  'html'" thrown when the browser tries to parse `<html>` as JS. */
+function looksLikeHtml(source) {
+  if (typeof source !== "string") return false;
+  const head = source.trimStart().slice(0, 256).toLowerCase();
+  return head.startsWith("<!doctype") || head.startsWith("<html") || head.startsWith("<?xml");
+}
 setScriptLoader(async (path) => {
   let entry = scriptCache.get(path);
   if (!entry) {
-    const code = await linkEngineImports(await (await fetch(path)).text());
+    const raw = await (await fetch(path)).text();
+    if (looksLikeHtml(raw)) {
+      throw new Error(`Script "${path}" looks like HTML/markup, not JavaScript or TypeScript`);
+    }
+    let code;
+    try {
+      code = await linkEngineImports(raw);
+    } catch (err) {
+      throw new Error(`Failed to import script "${path}": ${err.message ?? err}`);
+    }
     const url = URL.createObjectURL(new Blob([code], { type: "text/javascript" }));
     try {
       const mod = await import(/* @vite-ignore */ url);

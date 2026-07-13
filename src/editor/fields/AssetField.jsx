@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { useProjectStore } from "../store/projectStore.js";
-import { listProjectAssets, toBlobUrl, extOf, TEXTURE_EXTENSIONS } from "../assetLoader.js";
+import { listProjectAssets, toBlobUrl, extOf, TEXTURE_EXTENSIONS, MATERIAL_EXTENSIONS } from "../assetLoader.js";
+import { MATERIAL_DEFAULTS } from "../../engine/materialAsset.js";
 import { useAssetDrop } from "../assetDrag.js";
 
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
@@ -15,8 +16,33 @@ function relativeToRoot(path) {
   return p.toLowerCase().startsWith(`${r.toLowerCase()}/`) ? p.slice(r.length + 1) : path;
 }
 
+/** Inline swatch/texture preview for .mat values and options. */
+function MaterialOptionThumb({ path }) {
+  const [def, setDef] = useState(null);
+  const [mapUrl, setMapUrl] = useState(null);
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const value = { ...MATERIAL_DEFAULTS, ...JSON.parse(await invoke("read_text_file", { path })) };
+        if (!live) return;
+        setDef(value);
+        setMapUrl(value.map ? await toBlobUrl(value.map).catch(() => null) : null);
+      } catch {
+        if (live) setDef({ ...MATERIAL_DEFAULTS });
+      }
+    })();
+    return () => { live = false; };
+  }, [path]);
+  return (
+    <div className="asset-option-thumb mat-thumb" style={{ background: def?.color ?? "#888" }}>
+      {mapUrl && <img className="mat-thumb-map" src={mapUrl} alt="" draggable={false} />}
+    </div>
+  );
+}
 /** Small inline preview for texture options/values in asset pickers. */
-function OptionThumb({ path }) {
+function TextureOptionThumb({ path }) {
   const [url, setUrl] = useState(null);
   useEffect(() => {
     let live = true;
@@ -31,6 +57,11 @@ function OptionThumb({ path }) {
   return <img className="asset-option-thumb" src={url} alt="" draggable={false} />;
 }
 
+function OptionThumb({ path }) {
+  return MATERIAL_EXTENSIONS.includes(extOf(path))
+    ? <MaterialOptionThumb path={path} />
+    : <TextureOptionThumb path={path} />;
+}
 /**
  * Asset reference input: drop target + picker listing project files of the
  * right type (descriptor.exts). Value is the asset's absolute path; commit ""
@@ -41,7 +72,7 @@ export function AssetField({ descriptor, value, onCommit }) {
   const [options, setOptions] = useState(null);
 
   const exts = descriptor.exts ?? [];
-  const showThumb = value && TEXTURE_EXTENSIONS.includes(extOf(value));
+  const showThumb = value && [...TEXTURE_EXTENSIONS, ...MATERIAL_EXTENSIONS].includes(extOf(value));
 
   const dropRef = useAssetDrop({ accepts: exts, onDrop: onCommit });
 

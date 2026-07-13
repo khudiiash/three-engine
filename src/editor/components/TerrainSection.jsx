@@ -2,9 +2,11 @@ import { useEffect, useState } from "react";
 import { Plus, Trash2, Check, Eye, EyeOff, Eraser } from "lucide-react";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetComponentPropCommand } from "../commands/componentCommands.js";
+import { SetTerrainSplatmapCommand } from "../commands/terrainCommands.js";
 import { AssetField } from "../fields/AssetField.jsx";
-import { TEXTURE_EXTENSIONS, MODEL_EXTENSIONS } from "../assetLoader.js";
+import { MATERIAL_EXTENSIONS, MODEL_EXTENSIONS, TEXTURE_EXTENSIONS } from "../assetLoader.js";
 import { engine } from "../engineInstance.js";
+import { ensureTerrainAssets } from "../terrainAssetSetup.js";
 import { SCULPT_TOOLS, MAX_TERRAIN_LAYERS, makeTerrainLayer, makeTerrainScatterLayer } from "../../modules/terrain/TerrainComponent.js";
 import {
   armTerrainBrush,
@@ -107,6 +109,28 @@ function runOnScatterLayer(entityId, mutate) {
   );
 }
 
+function runOnSplatLayer(entityId, layerIndex, operation) {
+  const component = engine.getEntity(entityId)?.getComponent("terrain");
+  if (!component?.splatData) return;
+  const before = component.props.splatmap;
+  if (operation === "fill") {
+    if (typeof component.fillSplatLayer === "function") component.fillSplatLayer(layerIndex);
+    else {
+      for (let offset = 0; offset < component.splatData.length; offset += 4) {
+        for (let channel = 0; channel < 4; channel++) component.splatData[offset + channel] = channel === layerIndex ? 255 : 0;
+      }
+      component.splatTexture.needsUpdate = true;
+    }
+  } else {
+    if (typeof component.clearSplatLayer === "function") component.clearSplatLayer(layerIndex);
+    else {
+      for (let offset = layerIndex; offset < component.splatData.length; offset += 4) component.splatData[offset] = 0;
+      component.splatTexture.needsUpdate = true;
+    }
+  }
+  component.commitSplatmap();
+  commandBus.execute(new SetTerrainSplatmapCommand(entityId, before, component.props.splatmap));
+}
 /** A min/max pair on one row — the shape most scatter variation takes. */
 function RangeRow({ label, title, min, max, step = 0.05, lo, hi, onCommit }) {
   return (
@@ -269,6 +293,10 @@ function ScatterPlacement({ layer, entityId, layerIndex, onChange }) {
 export function TerrainSection({ entityId, props }) {
   const [, force] = useState(0);
   useEffect(() => subscribeTerrainBrush(() => force((v) => v + 1)), []);
+  useEffect(() => {
+    const entity = engine.getEntity(entityId);
+    ensureTerrainAssets(entity, props).catch((err) => console.error(`Could not create terrain assets: ${err}`));
+  }, [entityId]);
 
   const mode = getTerrainBrushMode();
   const settings = getTerrainBrushSettings();
@@ -276,6 +304,7 @@ export function TerrainSection({ entityId, props }) {
   const scatterLayers = props.scatterLayers ?? [];
   const activeLayer = Math.min(settings.activeLayer, Math.max(0, layers.length - 1));
   const activeScatterLayer = Math.min(settings.activeScatterLayer, Math.max(0, scatterLayers.length - 1));
+  const activeLayerHasMaterial = !!layers[activeLayer]?.material;
 
   const commit = (key, value) =>
     commandBus.execute(new SetComponentPropCommand(entityId, "terrain", key, value));
@@ -324,14 +353,16 @@ export function TerrainSection({ entityId, props }) {
         <button
           className={`toolbar-btn ${mode === "paint" ? "active" : ""}`}
           onClick={() => toggleMode("paint")}
-          title="Paint the active texture layer with the mouse in the viewport (P)"
+          disabled={!activeLayerHasMaterial}
+          title={activeLayerHasMaterial ? "Paint the active material layer with the mouse in the viewport (P)" : "Assign a material to the active layer first"}
         >
           {mode === "paint" ? "Painting…" : "Paint"}
         </button>
         <button
           className={`toolbar-btn ${mode === "erase" ? "active" : ""}`}
           onClick={() => toggleMode("erase")}
-          title="Erase the active texture layer, revealing the layers underneath (E)"
+          disabled={!activeLayerHasMaterial}
+          title={activeLayerHasMaterial ? "Erase the active material layer, revealing the base (E)" : "Assign a material to the active layer first"}
         >
           {mode === "erase" ? "Erasing…" : "Erase"}
         </button>
@@ -496,12 +527,12 @@ export function TerrainSection({ entityId, props }) {
       </button>
 
       <div className="inspector-subheader">
-        Texture Layers
+        Material Layers
         {(mode === "paint" || mode === "erase") && <span style={{ opacity: 0.6, fontWeight: 400 }}> — click to select active</span>}
       </div>
       {layers.length === 0 && (
         <div className="inspector-hint" style={{ margin: "4px 2px 8px" }}>
-          No layers yet. Add one and assign a texture, then paint it in.
+          No layers yet. Add one and assign a material, then paint it in.
         </div>
       )}
       {layers.map((layer, i) => (
@@ -535,44 +566,34 @@ export function TerrainSection({ entityId, props }) {
             </button>
           </div>
           <div onClick={(e) => e.stopPropagation()}>
-            <PropRow label="Albedo">
+            <PropRow label="Material">
               <AssetField
-                descriptor={{ exts: TEXTURE_EXTENSIONS }}
-                value={layer.albedo ?? layer.texture ?? ""}
-                onCommit={(v) => updateLayer(i, { albedo: v })}
+                descriptor={{ exts: MATERIAL_EXTENSIONS }}
+                value={layer.material ?? ""}
+                onCommit={(v) => updateLayer(i, { material: v })}
               />
             </PropRow>
-            <PropRow label="Normal">
-              <AssetField
-                descriptor={{ exts: TEXTURE_EXTENSIONS }}
-                value={layer.normalMap ?? ""}
-                onCommit={(v) => updateLayer(i, { normalMap: v })}
-              />
-            </PropRow>
-            <PropRow label="Roughness Map">
-              <AssetField
-                descriptor={{ exts: TEXTURE_EXTENSIONS }}
-                value={layer.roughnessMap ?? ""}
-                onCommit={(v) => updateLayer(i, { roughnessMap: v })}
-              />
-            </PropRow>
-            <PropRow label="Tint">
-              <input
-                className="color-field"
-                type="color"
-                value={layer.tint ?? "#8a8f7a"}
-                onChange={(e) => updateLayer(i, { tint: e.target.value })}
-              />
+            <PropRow label="Opacity">
+              <NumberInput value={layer.opacity ?? 1} min={0} max={1} step={0.05} onCommit={(v) => updateLayer(i, { opacity: v })} />
             </PropRow>
             <PropRow label="Tiling">
-              <NumberInput value={layer.tiling ?? 20} min={0.1} step={1} onCommit={(v) => updateLayer(i, { tiling: v })} />
+              <NumberInput value={layer.tiling ?? 20} min={0.01} step={0.25} onCommit={(v) => updateLayer(i, { tiling: v })} />
             </PropRow>
-            <PropRow label="Roughness">
-              <NumberInput value={layer.roughness ?? 0.95} min={0} max={1} step={0.05} onCommit={(v) => updateLayer(i, { roughness: v })} />
-            </PropRow>
-            <PropRow label="Metalness">
-              <NumberInput value={layer.metalness ?? 0} min={0} max={1} step={0.05} onCommit={(v) => updateLayer(i, { metalness: v })} />
-            </PropRow>
+            <div className="camera-follow-row" style={{ margin: "4px 0 0" }}>
+              <button
+                className="toolbar-btn"
+                disabled={!layer.material}
+                onClick={() => runOnSplatLayer(entityId, i, "fill")}
+              >
+                Fill
+              </button>
+              <button
+                className="toolbar-btn"
+                onClick={() => runOnSplatLayer(entityId, i, "clear")}
+              >
+                Clear
+              </button>
+            </div>
           </div>
         </div>
       ))}

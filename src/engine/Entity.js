@@ -1,6 +1,6 @@
 import * as THREE from "three/webgpu";
 import { createId } from "../shared/ids.js";
-import { createComponent } from "./components/registry.js";
+import { createComponent, getComponentClass } from "./components/registry.js";
 
 /**
  * PlayCanvas-style entity: a scene-graph node wrapping an Object3D,
@@ -189,6 +189,12 @@ export class Entity {
 
   addComponent(type, props) {
     if (this.components.has(type)) throw new Error(`Entity already has a "${type}" component`);
+    const ComponentClass = getComponentClass(type);
+    for (const requirement of ComponentClass?.requiredComponents ?? []) {
+      const requiredType = typeof requirement === "string" ? requirement : requirement.type;
+      if (!requiredType || this.components.has(requiredType)) continue;
+      this.addComponent(requiredType, typeof requirement === "string" ? {} : requirement.props ?? {});
+    }
     const component = createComponent(type, this, props);
     this.components.set(type, component);
     component.onAttach();

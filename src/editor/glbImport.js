@@ -21,10 +21,9 @@ import { buildMeshEntities, buildBoneEntities } from "./rigPrefab.js";
  * The source .glb is deleted after a successful static unpack — everything
  * it carried now lives in editable assets.
  *
- * Skinned or animated models can't be flattened into static .geom assets
- * (skeletons + clips live in the GLB), so they keep the legacy layout: a
- * prefab with a model component pointing at the moved .glb, plus an .anim
- * controller and per-material .mat overrides.
+ * Skinned or animated models also extract editable .geom assets, including
+ * skin weights and morph targets. They retain the GLB only because skeletons
+ * and animation clips still live in that container.
  */
 
 // Draco-enabled so re-unpacking an already-compressed .glb still decodes.
@@ -86,6 +85,22 @@ function geometryAssetFromMesh(geometry) {
     }
     return out;
   };
+  const attributeAsset = (attribute) => ({
+    itemSize: attribute.itemSize,
+    normalized: !!attribute.normalized,
+    arrayType: attribute.array.constructor.name,
+    array: Array.from(attribute.array, round6),
+  });
+  const attributes = {};
+  for (const [name, attribute] of Object.entries(geometry.attributes)) {
+    if (name !== "position" && name !== "normal" && name !== "uv") {
+      attributes[name] = attributeAsset(attribute);
+    }
+  }
+  const morphAttributes = {};
+  for (const [name, targets] of Object.entries(geometry.morphAttributes)) {
+    morphAttributes[name] = targets.map(attributeAsset);
+  }
   return {
     version: GEOMETRY_ASSET_VERSION,
     positions: read(position, 3),
@@ -94,6 +109,10 @@ function geometryAssetFromMesh(geometry) {
       : Array.from({ length: position.count }, (_, i) => i),
     uvs: uv ? read(uv, 2) : [],
     normals: normal ? read(normal, 3) : [],
+    attributes,
+    morphAttributes,
+    morphTargetsRelative: !!geometry.morphTargetsRelative,
+    groups: geometry.groups.map(({ start, count, materialIndex }) => ({ start, count, materialIndex })),
   };
 }
 
@@ -160,22 +179,59 @@ export async function unpackGlb(glbPath) {
     const maps = {};
     if (mat.map) maps.diffuse = await writeTexture(mat.map, `${name} diffuse`, { srgb: true });
     if (mat.normalMap) maps.normal = await writeTexture(mat.normalMap, `${name} normal`);
-    const orm = mat.roughnessMap ?? mat.metalnessMap;
-    if (orm) maps.arm = await writeTexture(orm, `${name} orm`);
-    if (mat.aoMap && mat.aoMap !== orm) maps.ao = await writeTexture(mat.aoMap, `${name} ao`);
-    if (mat.emissiveMap) await writeTexture(mat.emissiveMap, `${name} emissive`, { srgb: true });
+    const sharedOrm = mat.roughnessMap && mat.roughnessMap === mat.metalnessMap
+      ? mat.roughnessMap
+      : null;
+    if (sharedOrm) maps.arm = await writeTexture(sharedOrm, `${name} orm`);
+    else {
+      if (mat.roughnessMap) maps.roughness = await writeTexture(mat.roughnessMap, `${name} roughness`);
+      if (mat.metalnessMap) maps.metalness = await writeTexture(mat.metalnessMap, `${name} metalness`);
+    }
+    if (mat.aoMap && mat.aoMap !== sharedOrm) maps.ao = await writeTexture(mat.aoMap, `${name} ao`);
+    if (mat.emissiveMap) maps.emissive = await writeTexture(mat.emissiveMap, `${name} emissive`, { srgb: true });
+    if (mat.alphaMap) maps.opacity = await writeTexture(mat.alphaMap, `${name} opacity`);
+    if (mat.clearcoatMap) maps.clearcoat = await writeTexture(mat.clearcoatMap, `${name} clearcoat`);
+    if (mat.clearcoatRoughnessMap) maps.clearcoatRoughness = await writeTexture(mat.clearcoatRoughnessMap, `${name} clearcoat roughness`);
+    if (mat.transmissionMap) maps.transmission = await writeTexture(mat.transmissionMap, `${name} transmission`);
+    if (mat.thicknessMap) maps.thickness = await writeTexture(mat.thicknessMap, `${name} thickness`);
+    if (mat.sheenColorMap) maps.sheen = await writeTexture(mat.sheenColorMap, `${name} sheen`, { srgb: true });
+    if (mat.sheenRoughnessMap) maps.sheenRoughness = await writeTexture(mat.sheenRoughnessMap, `${name} sheen roughness`);
+    if (mat.specularIntensityMap) maps.specularIntensity = await writeTexture(mat.specularIntensityMap, `${name} specular intensity`);
+    if (mat.specularColorMap) maps.specularColor = await writeTexture(mat.specularColorMap, `${name} specular color`, { srgb: true });
+    if (mat.anisotropyMap) maps.anisotropy = await writeTexture(mat.anisotropyMap, `${name} anisotropy`);
 
-    const hasGraphMaps = maps.normal || maps.arm || maps.ao;
-    const def = {
-      ...MATERIAL_DEFAULTS,
+    const hasGraphMaps = Object.values(maps).some(Boolean);
+    const factors = {
       color: colorHex(mat.color),
       roughness: typeof mat.roughness === "number" ? mat.roughness : MATERIAL_DEFAULTS.roughness,
       metalness: typeof mat.metalness === "number" ? mat.metalness : MATERIAL_DEFAULTS.metalness,
+      ior: typeof mat.ior === "number" ? mat.ior : 1.5,
+      specularIntensity: typeof mat.specularIntensity === "number" ? mat.specularIntensity : 0.5,
+      specularColor: colorHex(mat.specularColor),
+      emissive: colorHex(mat.emissive),
+      emissiveStrength: typeof mat.emissiveIntensity === "number" ? mat.emissiveIntensity : 1,
+      opacity: typeof mat.opacity === "number" ? mat.opacity : 1,
+      ao: typeof mat.aoMapIntensity === "number" ? mat.aoMapIntensity : 1,
+      normalScale: typeof mat.normalScale?.x === "number" ? mat.normalScale.x : 1,
+      anisotropy: typeof mat.anisotropy === "number" ? mat.anisotropy : null,
+      clearcoat: typeof mat.clearcoat === "number" ? mat.clearcoat : null,
+      clearcoatRoughness: typeof mat.clearcoatRoughness === "number" ? mat.clearcoatRoughness : null,
+      sheen: mat.sheenColor ? colorHex(mat.sheenColor) : null,
+      sheenRoughness: typeof mat.sheenRoughness === "number" ? mat.sheenRoughness : null,
+      transmission: typeof mat.transmission === "number" ? mat.transmission : null,
+      thickness: typeof mat.thickness === "number" ? mat.thickness : null,
+      useDiffuseAlpha: !!mat.map && (mat.transparent || mat.alphaTest > 0 || mat.opacity < 1),
+    };
+    const def = {
+      ...MATERIAL_DEFAULTS,
+      color: factors.color,
+      roughness: factors.roughness,
+      metalness: factors.metalness,
       map: maps.diffuse ?? "",
       // Diffuse-only materials stay plain scalar .mat files; the graph only
       // appears when there's something for it to wire.
       shaderGraph: hasGraphMaps
-        ? buildPbrGraph(maps, { armHasAo: !!orm && mat.aoMap === orm })
+        ? buildPbrGraph(maps, { armHasAo: !!sharedOrm && mat.aoMap === sharedOrm, factors })
         : null,
     };
     const matPath = `${folder}/Materials/${name}.mat`;
@@ -188,23 +244,25 @@ export async function unpackGlb(glbPath) {
   let dracoNote = "";
   let geometryCount = 0;
 
+  // Geometry is extracted for both static and skeletal meshes. Skeletal
+  // models retain the GLB only as the owner of their skeleton and clips.
+  const geomNames = new Set();
+  const geometryFor = async (mesh) => {
+    const base = safeName(mesh.name || "Mesh");
+    let name = base;
+    for (let i = 1; geomNames.has(name); i++) name = `${base} ${i}`;
+    geomNames.add(name);
+    const path = `${folder}/Geometry/${name}.geom`;
+    await invoke("save_scene", {
+      path,
+      contents: JSON.stringify(geometryAssetFromMesh(mesh.geometry)),
+    });
+    geometryCount++;
+    return path;
+  };
+
   if (!skinned && !animated) {
     // --- static path: geometry assets + a mesh-entity tree ------------------
-    const geomNames = new Set();
-    const geometryFor = async (mesh) => {
-      const base = safeName(mesh.name || "Mesh");
-      let name = base;
-      for (let i = 1; geomNames.has(name); i++) name = `${base} ${i}`;
-      geomNames.add(name);
-      const path = `${folder}/Geometry/${name}.geom`;
-      await invoke("save_scene", {
-        path,
-        contents: JSON.stringify(geometryAssetFromMesh(mesh.geometry)),
-      });
-      geometryCount++;
-      return path;
-    };
-
     // Async pass first (file writes), then a sync tree build from the results.
     const meshAssets = new Map(); // mesh -> { geometryAsset, material }
     const meshes = [];
@@ -277,6 +335,22 @@ export async function unpackGlb(glbPath) {
       });
     }
 
+    const geometryPaths = new Map();
+    const rigMeshes = [];
+    gltf.scene.traverse((object) => object.isMesh && rigMeshes.push(object));
+    for (const mesh of rigMeshes) geometryPaths.set(mesh, await geometryFor(mesh));
+
+    const meshNodes = buildMeshEntities(
+      gltf.scene,
+      newFid,
+      (mesh) => {
+        const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+        return materialPaths.get(mat) ?? "";
+      },
+      (mesh) => geometryPaths.get(mesh) ?? "",
+    );
+    const rootMesh = meshNodes.shift() ?? null;
+
     prefabRoot = {
       fid: newFid(),
       name: stem,
@@ -285,16 +359,15 @@ export async function unpackGlb(glbPath) {
       scale: [1, 1, 1],
       components: [
         { type: "model", props: { path: movedGlb } },
+        // The first render surface lives on the prefab root as the user-facing
+        // Mesh component. Multi-mesh rigs keep their remaining surfaces as
+        // child Mesh handles because an entity can own one component per type.
+        ...(rootMesh?.components ?? []),
         ...(animPath ? [{ type: "animation", props: { controller: animPath, playInEditor: true } }] : []),
       ],
       children: [
-        // One entity per mesh (Unity-style): the skinnedmesh component
-        // references the rig's mesh so it gets an inspector section
-        // (material/shadows), an eye toggle, and click-to-select.
-        ...buildMeshEntities(gltf.scene, newFid, (mesh) => {
-          const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
-          return materialPaths.get(mat) ?? "";
-        }),
+        // Additional render surfaces remain independently selectable/editable.
+        ...meshNodes,
         // Each joint is a normal prefab entity, so children can be dropped on
         // the rig (for example, put a sword beneath Hand.R). ModelComponent
         // syncs these attachment points from the animated GLB bones at runtime.

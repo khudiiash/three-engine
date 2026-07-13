@@ -27,6 +27,7 @@ import { SoundSection } from "../components/SoundSection.jsx";
 import { ListenerSection } from "../components/ListenerSection.jsx";
 import { TerrainSection } from "../components/TerrainSection.jsx";
 import { useGeometryEditStore } from "../store/geometryEditStore.js";
+import { assignTerrainAssets, createTerrainAssets } from "../terrainAssetSetup.js";
 
 /**
  * Returns the live engine entity referenced by `targetId` (the value stored
@@ -198,8 +199,11 @@ function TransformSection({ entity }) {
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
 
 /** Text field that doubles as a drop target for Assets-panel paths. */
-function TextPropField({ value, onCommit }) {
-  const dropRef = useAssetDrop({ accepts: (path, isDir) => !isDir, onDrop: onCommit });
+function TextPropField({ value, onCommit, readOnly = false }) {
+  const dropRef = useAssetDrop({
+    accepts: (path, isDir) => !readOnly && !isDir,
+    onDrop: onCommit,
+  });
   return (
     <input
       className="text-field"
@@ -207,7 +211,8 @@ function TextPropField({ value, onCommit }) {
       key={value}
       defaultValue={value}
       ref={dropRef}
-      onBlur={(e) => onCommit(e.target.value)}
+      readOnly={readOnly}
+      onBlur={(e) => !readOnly && onCommit(e.target.value)}
     />
   );
 }
@@ -281,7 +286,7 @@ function PropField({ descriptor, value, onCommit }) {
         <input type="checkbox" checked={!!value} onChange={(e) => onCommit(e.target.checked)} />
       );
     default:
-      return <TextPropField value={value} onCommit={onCommit} />;
+      return <TextPropField value={value} onCommit={onCommit} readOnly={descriptor.readOnly} />;
   }
 }
 
@@ -1170,10 +1175,25 @@ export function InspectorPanel() {
                           ? `${label} requires a ${requiredLabel} component on this entity`
                           : undefined
                       }
-                      onClick={() => {
+                      onClick={async () => {
                         if (missingRequirement) return;
                         setAddMenuOpen(false);
-                        commandBus.execute(new AddComponentCommand(entity.id, type));
+                        if (type === "terrain") {
+                          const mesh = entity.getComponent("mesh");
+                          const needsAssets = !mesh?.props.geometryAsset || !mesh?.props.material;
+                          let assets = null;
+                          if (needsAssets) {
+                            try {
+                              assets = await createTerrainAssets();
+                            } catch (err) {
+                              console.error(`Could not create terrain assets: ${err}`);
+                            }
+                          }
+                          commandBus.execute(new AddComponentCommand(entity.id, type));
+                          assignTerrainAssets(entity, assets);
+                        } else {
+                          commandBus.execute(new AddComponentCommand(entity.id, type));
+                        }
                       }}
                     >
                       {label}

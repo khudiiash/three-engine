@@ -12,7 +12,7 @@ const round6 = (v) => Math.round(v * 1e6) / 1e6;
  * The entities sit at identity transform — the mesh itself stays inside (and
  * is posed by) the model's GLB scene; the entity is its editing handle.
  */
-export function buildMeshEntities(scene, newFid, materialFor) {
+export function buildMeshEntities(scene, newFid, materialFor, geometryFor = () => "") {
   const nodes = [];
   const visit = (object, path) => {
     if (object.isMesh) {
@@ -25,7 +25,13 @@ export function buildMeshEntities(scene, newFid, materialFor) {
         components: [
           {
             type: "skinnedmesh",
-            props: { path, material: materialFor(object), castShadow: true, receiveShadow: true },
+            props: {
+              geometry: geometryFor(object),
+              path,
+              material: materialFor(object),
+              castShadow: true,
+              receiveShadow: true,
+            },
           },
         ],
         children: [],

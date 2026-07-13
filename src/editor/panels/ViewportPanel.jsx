@@ -1304,8 +1304,10 @@ function setupTerrainBrush(canvas) {
         seed: stroke.seed,
       });
     } else if (stroke.mode === "paint" || stroke.mode === "erase") {
+      const layerIndex = Math.min(settings.activeLayer, (component.props.layers?.length ?? 1) - 1);
+      if (!component.props.layers?.[layerIndex]?.material) return;
       component.applySplatBrush(local, {
-        layerIndex: Math.min(settings.activeLayer, (component.props.layers?.length ?? 1) - 1),
+        layerIndex,
         radius: settings.radius,
         strength: settings.strength,
         hardness: settings.hardness,

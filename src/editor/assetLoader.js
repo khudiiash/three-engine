@@ -163,6 +163,17 @@ export async function readAssetMeta(metaPath) {
 
 const scriptModuleCache = new Map(); // path -> { version, default }
 
+/** Cheap sniff: HTML / XML payloads can land in script slots when a project
+ *  file with the wrong extension is dropped onto a script entity. esbuild
+ *  will happily transpile them and the browser only fails once the JS parser
+ *  hits `<html>` or `<!doctype`. Reject up-front with a clear error so the
+ *  user sees "this isn't a script" instead of "Unexpected identifier 'html'". */
+function looksLikeHtml(source) {
+  if (typeof source !== "string") return false;
+  const head = source.trimStart().slice(0, 256).toLowerCase();
+  return head.startsWith("<!doctype") || head.startsWith("<html") || head.startsWith("<?xml");
+}
+
 /**
  * Loads a script file as an ES module, keyed by mtime so unchanged files are
  * never re-imported (re-importing would reset any module-level state). This
@@ -176,8 +187,16 @@ export async function loadScriptModule(path) {
   if (cached && cached.version === version) return cached;
 
   const raw = await invoke("read_text_file", { path });
-  const { linkEngineImports } = await import("../engine/scriptRuntime.js");
-  const code = await linkEngineImports(await transpileScript(raw));
+  if (looksLikeHtml(raw)) {
+    throw new Error(`Script "${path}" looks like HTML/markup, not JavaScript or TypeScript`);
+  }
+  let code;
+  try {
+    const { linkEngineImports } = await import("../engine/scriptRuntime.js");
+    code = await linkEngineImports(await transpileScript(raw));
+  } catch (err) {
+    throw new Error(`Failed to transpile script "${path}": ${err.message ?? err}`);
+  }
   const blob = new Blob([code], { type: "text/javascript" });
   const url = URL.createObjectURL(blob);
   try {
@@ -185,6 +204,8 @@ export async function loadScriptModule(path) {
     const entry = { version, default: mod.default ?? null };
     scriptModuleCache.set(path, entry);
     return entry;
+  } catch (err) {
+    throw new Error(`Failed to import script "${path}": ${err.message ?? err}`);
   } finally {
     URL.revokeObjectURL(url);
   }

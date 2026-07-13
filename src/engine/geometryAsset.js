@@ -10,6 +10,26 @@ function finiteArray(value, stride, label) {
   return value;
 }
 
+const ARRAY_TYPES = {
+  Float32Array,
+  Uint8Array,
+  Uint16Array,
+  Uint32Array,
+  Int8Array,
+  Int16Array,
+  Int32Array,
+};
+
+function attributeFromAsset(definition, label) {
+  const itemSize = definition?.itemSize;
+  if (!Number.isInteger(itemSize) || itemSize < 1 || itemSize > 4) {
+    throw new Error(`Invalid geometry ${label} item size`);
+  }
+  const values = finiteArray(definition.array, itemSize, label);
+  const ArrayType = ARRAY_TYPES[definition.arrayType] ?? Float32Array;
+  return new THREE.BufferAttribute(new ArrayType(values), itemSize, !!definition.normalized);
+}
+
 export function geometryFromAsset(definition) {
   if (!definition || definition.version !== GEOMETRY_ASSET_VERSION) {
     throw new Error(`Unsupported geometry asset version ${definition?.version}`);
@@ -34,12 +54,38 @@ export function geometryFromAsset(definition) {
       new THREE.Float32BufferAttribute(finiteArray(definition.normals, 3, "normals"), 3),
     );
   } else geometry.computeVertexNormals();
+  for (const [name, attribute] of Object.entries(definition.attributes ?? {})) {
+    geometry.setAttribute(name, attributeFromAsset(attribute, `attribute ${name}`));
+  }
+  for (const [name, targets] of Object.entries(definition.morphAttributes ?? {})) {
+    if (!Array.isArray(targets)) throw new Error(`Invalid geometry morph attribute ${name}`);
+    geometry.morphAttributes[name] = targets.map((target, index) =>
+      attributeFromAsset(target, `morph attribute ${name}[${index}]`),
+    );
+  }
+  geometry.morphTargetsRelative = !!definition.morphTargetsRelative;
+  if (Array.isArray(definition.groups)) {
+    for (const group of definition.groups) {
+      if ([group?.start, group?.count, group?.materialIndex].every(Number.isInteger)) {
+        geometry.addGroup(group.start, group.count, group.materialIndex);
+      }
+    }
+  }
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
   return geometry;
 }
 
 export async function loadGeometryAsset(path) {
+  // Reject non-`.geom` paths up-front so a stale scene reference (e.g. a
+  // component that still points at a `.glb` from before that asset was
+  // unpacked into editable `.geom` files) doesn't hit the network and
+  // surface as a confusing "Unexpected token 'g', ...is not valid JSON"
+  // parse error. Callers translate this into a clean warning.
+  const ext = String(path ?? "").split(/[\\/]/).pop()?.split(".").pop()?.toLowerCase();
+  if (ext !== "geom") {
+    throw new Error(`Geometry asset must be a .geom file (got .${ext || "<none>"}): "${path}"`);
+  }
   const url = await resolveAssetUrl(path);
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Geometry request failed (${response.status})`);

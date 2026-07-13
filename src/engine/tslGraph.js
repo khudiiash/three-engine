@@ -18,13 +18,29 @@ import { loadTextureAsset } from "./textureAsset.js";
  */
 
 const textureCache = new Map(); // path -> Promise<THREE.Texture>
+const textureKey = (path) => String(path ?? "").replaceAll("\\", "/");
+
 function loadTexture(path) {
-  let cached = textureCache.get(path);
+  const key = textureKey(path);
+  let cached = textureCache.get(key);
   if (!cached) {
     cached = loadTextureAsset(path, { colorSpace: THREE.SRGBColorSpace });
-    textureCache.set(path, cached);
+    textureCache.set(key, cached);
+    // A rejected load must be retryable after the asset is repaired or its
+    // compression setting changes. Pending loads are bounded by
+    // textureAsset's Basis timeout.
+    cached.catch(() => {
+      if (textureCache.get(key) === cached) textureCache.delete(key);
+    });
   }
   return cached;
+}
+
+/** Drops cached shader textures so material refreshes cannot reuse a stale or
+ * previously stalled Promise. With no path, clears every graph texture. */
+export function invalidateShaderTextureCache(path = null) {
+  if (path == null) textureCache.clear();
+  else textureCache.delete(textureKey(path));
 }
 
 /** Input port spec. `def` null = wire-only; number/hex/array = inline-editable

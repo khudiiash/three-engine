@@ -3,6 +3,7 @@ import { texture as tslTexture, uv, float, vec3, normalMap } from "three/tsl";
 import { Component } from "../../engine/components/Component.js";
 import { resolveAssetUrl } from "../../engine/assetResolver.js";
 import { loadTextureAsset } from "../../engine/textureAsset.js";
+import { getMaterialInstance, loadMaterialAsset, subscribeMaterial } from "../../engine/materialAsset.js";
 import { getGltfLoader } from "../../engine/gltfLoader.js";
 
 export const MAX_TERRAIN_LAYERS = 4;
@@ -15,6 +16,8 @@ const scatterLoader = getGltfLoader();
  *  untextured layer is still a valid flat-colored surface. */
 export function makeTerrainLayer(overrides = {}) {
   return {
+    material: "",
+    opacity: 1,
     albedo: "",
     normalMap: "",
     roughnessMap: "",
@@ -194,11 +197,9 @@ function decodeUint8(str, length) {
   return arr;
 }
 
-/** Default splatmap: layer 0 (R channel) fully covers the terrain. */
+/** Empty splatmap: every paint layer starts transparent over the base material. */
 function makeDefaultSplat(resolution) {
-  const arr = new Uint8Array(resolution * resolution * 4);
-  for (let i = 0; i < resolution * resolution; i++) arr[i * 4] = 255;
-  return arr;
+  return new Uint8Array(resolution * resolution * 4);
 }
 
 // -----------------------------------------------------------------------------
@@ -262,13 +263,14 @@ function valueNoise(x, y, seed) {
 export class TerrainComponent extends Component {
   static type = "terrain";
   static label = "Terrain";
+  static requiredComponents = ["mesh"];
   static defaults = {
     size: 50,
     resolution: 128,
     splatResolution: 256,
     heights: "", // base64 Float32Array((resolution+1)^2), row-major
     splatmap: "", // base64 Uint8Array(splatResolution^2 * 4)
-    layers: [makeTerrainLayer()], // PBR surfaces blended by the splatmap
+    layers: [], // optional material overlays blended over the Mesh base material
     scatterLayers: [], // model-backed instance layers painted onto the surface
     castShadow: false,
     receiveShadow: true,
@@ -285,12 +287,18 @@ export class TerrainComponent extends Component {
     this.#buildGeometry();
     this.#buildSplatmap();
     this.#buildMaterial();
-    this.mesh = new THREE.Mesh(this.geometry, this.material);
+    const meshComponent = this.entity.getComponent("mesh");
+    if (!meshComponent?.mesh) throw new Error("Terrain requires an attached Mesh component");
+    this.meshComponent = meshComponent;
+    this.previousMeshGeometry = meshComponent.mesh.geometry;
+    this.previousMeshMaterial = meshComponent.mesh.material;
+    this.mesh = meshComponent.mesh;
+    this.mesh.geometry = this.geometry;
+    this.mesh.material = this.material;
     this.mesh.userData.entityId = this.entity.id;
     this.mesh.castShadow = !!this.props.castShadow;
     this.mesh.receiveShadow = !!this.props.receiveShadow;
     this.mesh.visible = this.enabled;
-    this.entity.object3D.add(this.mesh);
     this.scatterRoot = new THREE.Group();
     this.scatterRoot.name = "Terrain Scatter";
     this.entity.object3D.add(this.scatterRoot);
@@ -310,14 +318,23 @@ export class TerrainComponent extends Component {
     this.unsubScatterHierarchy = this.entity.engine.on("hierarchy-changed", () => {
       if (this.#scatterSourceReadinessChanged()) this.#loadScatterLayers();
     });
+    this.unsubTerrainMeshChange = this.entity.engine.on("component-changed", (info) => {
+      if (info.entityId !== this.entity.id || info.componentType !== "mesh") return;
+      if (info.key === "material") this.#loadBaseMaterial();
+      this.#applyTerrainMesh();
+    });
     this.#loadScatterLayers();
     this.#loadLayerMaps();
+    this.#loadBaseMaterial();
   }
 
   onDetach() {
     if (!this.mesh) return;
     this.generation = (this.generation ?? 0) + 1;
-    this.entity.object3D.remove(this.mesh);
+    if (this.meshComponent?.mesh === this.mesh) {
+      this.mesh.geometry = this.previousMeshGeometry;
+      this.mesh.material = this.previousMeshMaterial;
+    }
     if (this.scatterRoot) this.entity.object3D.remove(this.scatterRoot);
     this.#disposeScatterLayers();
     this.unsubScatterModel?.();
@@ -326,11 +343,18 @@ export class TerrainComponent extends Component {
     this.unsubScatterSourceChange = null;
     this.unsubScatterHierarchy?.();
     this.unsubScatterHierarchy = null;
+    this.unsubTerrainMeshChange?.();
+    this.unsubTerrainMeshChange = null;
     this.geometry.dispose();
     this.material.dispose();
     this.splatTexture.dispose();
     this.#disposeLayerMaps();
+    this.#disposeLayerMaterials();
+    this.#disposeBaseMaterial();
     this.mesh = null;
+    this.meshComponent = null;
+    this.previousMeshGeometry = null;
+    this.previousMeshMaterial = null;
     this.scatterRoot = null;
   }
 
@@ -500,6 +524,19 @@ export class TerrainComponent extends Component {
     this.props.splatmap = encodeUint8(this.splatData);
   }
 
+  fillSplatLayer(layerIndex) {
+    const layer = THREE.MathUtils.clamp(layerIndex | 0, 0, 3);
+    for (let i = 0; i < this.splatData.length; i += 4) {
+      for (let ch = 0; ch < 4; ch++) this.splatData[i + ch] = ch === layer ? 255 : 0;
+    }
+    this.splatTexture.needsUpdate = true;
+  }
+
+  clearSplatLayer(layerIndex) {
+    const layer = THREE.MathUtils.clamp(layerIndex | 0, 0, 3);
+    for (let i = layer; i < this.splatData.length; i += 4) this.splatData[i] = 0;
+    this.splatTexture.needsUpdate = true;
+  }
   // ---------------------------------------------------------------------------
   // Material — per-layer PBR surfaces blended by the splatmap
   // ---------------------------------------------------------------------------
@@ -512,6 +549,10 @@ export class TerrainComponent extends Component {
     });
     // Per-layer loaded maps: this.layerMaps[i] = { albedo, normal, roughness }.
     this.layerMaps = [];
+    this.layerMaterials = [];
+    this.layerMaterialUnsubs = [];
+    this.baseMaterial = null;
+    this.baseMaterialUnsub = null;
     this.#wireMaterialNodes();
   }
 
@@ -537,58 +578,101 @@ export class TerrainComponent extends Component {
   #wireMaterialNodes() {
     const layers = (this.props.layers ?? []).slice(0, MAX_TERRAIN_LAYERS);
     const splat = tslTexture(this.splatTexture, uv());
-    const weights = [splat.r, splat.g, splat.b, splat.a];
-    const FLAT_NORMAL = vec3(0.5, 0.5, 1.0); // tangent-space "no bump" in 0..1
+    const rawWeights = [splat.r, splat.g, splat.b, splat.a];
+    const weights = rawWeights.map((weight, index) => weight.mul(layers[index]?.opacity ?? 1));
+    const FLAT_NORMAL = vec3(0.5, 0.5, 1.0);
 
-    let colorNum = null, roughNum = null, metalNum = null, normalNum = null;
-    let denom = null;
-    let hasNormal = false;
+    let paintedWeight = null;
+    for (let i = 0; i < layers.length; i++) {
+      if (layers[i]?.visible === false) continue;
+      paintedWeight = paintedWeight ? paintedWeight.add(weights[i]) : weights[i];
+    }
+    const baseWeight = paintedWeight ? float(1).sub(paintedWeight).max(float(0)) : float(1);
+    const baseAsset = this.baseMaterial;
+    const baseColorValue = baseAsset?.color ?? new THREE.Color(0x8a8f7a);
+    const baseColor = baseAsset?.colorNode
+      ?? (baseAsset?.map ? tslTexture(baseAsset.map, uv()).rgb : null)
+      ?? vec3(baseColorValue.r, baseColorValue.g, baseColorValue.b);
+    const baseRough = baseAsset?.roughnessNode ?? float(baseAsset?.roughness ?? 0.95);
+    const baseMetal = baseAsset?.metalnessNode ?? float(baseAsset?.metalness ?? 0);
+    const baseNormal = baseAsset?.normalNode ?? FLAT_NORMAL;
+
+    let colorNum = baseColor.mul(baseWeight);
+    let roughNum = baseRough.mul(baseWeight);
+    let metalNum = baseMetal.mul(baseWeight);
+    let normalNum = baseNormal.mul(baseWeight);
+    let denom = baseWeight;
+    let hasNormal = !!baseAsset?.normalNode;
 
     for (let i = 0; i < layers.length; i++) {
       const layer = layers[i] ?? {};
       if (layer.visible === false) continue;
       const maps = this.layerMaps[i] ?? {};
+      const asset = this.layerMaterials[i] ?? null;
       const w = weights[i];
-      const tiling = layer.tiling ?? 20;
-      const layerUv = uv().mul(tiling);
-
-      // Color: albedo × tint (tint alone when no albedo map).
+      const layerUv = uv().mul(layer.tiling ?? 20);
       const tint = new THREE.Color(layer.tint ?? "#ffffff");
       const tintNode = vec3(tint.r, tint.g, tint.b);
-      const albedo = maps.albedo ? tslTexture(maps.albedo, layerUv).rgb.mul(tintNode) : tintNode;
-      const colorTerm = albedo.mul(w);
+      const assetColor = asset?.color ? vec3(asset.color.r, asset.color.g, asset.color.b) : null;
+      const color = asset?.colorNode
+        ?? (asset?.map ? tslTexture(asset.map, layerUv).rgb : null)
+        ?? assetColor
+        ?? (maps.albedo ? tslTexture(maps.albedo, layerUv).rgb.mul(tintNode) : tintNode);
+      const rough = asset?.roughnessNode
+        ?? (maps.roughness ? tslTexture(maps.roughness, layerUv).r.mul(layer.roughness ?? 1) : float(asset?.roughness ?? layer.roughness ?? 0.95));
+      const metal = asset?.metalnessNode ?? float(asset?.metalness ?? layer.metalness ?? 0);
+      const normal = asset?.normalNode ?? (maps.normal ? tslTexture(maps.normal, layerUv).xyz : FLAT_NORMAL);
+      if (asset?.normalNode || maps.normal) hasNormal = true;
 
-      // Roughness / metalness scalars (roughness map, red channel, when present).
-      const rough = maps.roughness ? tslTexture(maps.roughness, layerUv).r.mul(layer.roughness ?? 1) : float(layer.roughness ?? 0.95);
-      const roughTerm = rough.mul(w);
-      const metalTerm = float(layer.metalness ?? 0).mul(w);
-
-      // Normal texel (0..1), flat where a layer has no normal map.
-      if (maps.normal) hasNormal = true;
-      const normalTexel = (maps.normal ? tslTexture(maps.normal, layerUv).xyz : FLAT_NORMAL).mul(w);
-
-      colorNum = colorNum ? colorNum.add(colorTerm) : colorTerm;
-      roughNum = roughNum ? roughNum.add(roughTerm) : roughTerm;
-      metalNum = metalNum ? metalNum.add(metalTerm) : metalTerm;
-      normalNum = normalNum ? normalNum.add(normalTexel) : normalTexel;
-      denom = denom ? denom.add(w) : w;
+      colorNum = colorNum.add(color.mul(w));
+      roughNum = roughNum.add(rough.mul(w));
+      metalNum = metalNum.add(metal.mul(w));
+      normalNum = normalNum.add(normal.mul(w));
+      denom = denom.add(w);
     }
 
-    if (colorNum && denom) {
-      const inv = denom.max(float(1e-4));
-      this.material.colorNode = colorNum.div(inv);
-      this.material.roughnessNode = roughNum.div(inv);
-      this.material.metalnessNode = metalNum.div(inv);
-      this.material.normalNode = hasNormal ? normalMap(normalNum.div(inv)) : null;
-    } else {
-      this.material.colorNode = null;
-      this.material.roughnessNode = null;
-      this.material.metalnessNode = null;
-      this.material.normalNode = null;
-    }
+    const inv = denom.max(float(1e-4));
+    this.material.colorNode = colorNum.div(inv);
+    this.material.roughnessNode = roughNum.div(inv);
+    this.material.metalnessNode = metalNum.div(inv);
+    this.material.normalNode = hasNormal ? normalMap(normalNum.div(inv)) : null;
     this.material.needsUpdate = true;
   }
+  #applyTerrainMesh() {
+    if (!this.meshComponent?.mesh || !this.geometry || !this.material) return;
+    this.mesh = this.meshComponent.mesh;
+    this.mesh.geometry = this.geometry;
+    this.mesh.material = this.material;
+  }
 
+  async #loadBaseMaterial() {
+    const path = this.meshComponent?.props.material;
+    const generation = (this.baseMaterialGeneration = (this.baseMaterialGeneration ?? 0) + 1);
+    this.baseMaterialUnsub?.();
+    this.baseMaterialUnsub = null;
+    if (!path) {
+      this.baseMaterial = null;
+      this.#wireMaterialNodes();
+      return;
+    }
+    await loadMaterialAsset(path);
+    if (generation !== this.baseMaterialGeneration || !this.mesh) return;
+    this.baseMaterial = getMaterialInstance(path);
+    this.baseMaterialUnsub = subscribeMaterial(path, () => {
+      this.baseMaterial = getMaterialInstance(path);
+      this.#wireMaterialNodes();
+      this.#applyTerrainMesh();
+    });
+    this.#wireMaterialNodes();
+    this.#applyTerrainMesh();
+  }
+
+  #disposeBaseMaterial() {
+    this.baseMaterialGeneration = (this.baseMaterialGeneration ?? 0) + 1;
+    this.baseMaterialUnsub?.();
+    this.baseMaterialUnsub = null;
+    this.baseMaterial = null;
+  }
   /** Load one texture (or null) with the right color space + wrapping. */
   async #loadMap(path, { srgb }) {
     if (!path) return null;
@@ -605,20 +689,29 @@ export class TerrainComponent extends Component {
   async #loadLayerMaps() {
     const generation = (this.generation = (this.generation ?? 0) + 1);
     const layers = (this.props.layers ?? []).slice(0, MAX_TERRAIN_LAYERS);
-    const loaded = await Promise.all(
-      layers.map(async (layer) => ({
-        // Back-compat: older scenes stored the albedo path as `texture`.
-        albedo: await this.#loadMap(layer?.albedo ?? layer?.texture, { srgb: true }),
-        normal: await this.#loadMap(layer?.normalMap, { srgb: false }),
-        roughness: await this.#loadMap(layer?.roughnessMap, { srgb: false }),
-      })),
-    );
+    const loaded = await Promise.all(layers.map(async (layer) => ({
+      material: layer?.material ? await loadMaterialAsset(layer.material) : null,
+      // Back-compat for old scenes; new layers use only material.
+      albedo: await this.#loadMap(layer?.material ? "" : (layer?.albedo ?? layer?.texture), { srgb: true }),
+      normal: await this.#loadMap(layer?.material ? "" : layer?.normalMap, { srgb: false }),
+      roughness: await this.#loadMap(layer?.material ? "" : layer?.roughnessMap, { srgb: false }),
+    })));
     if (generation !== this.generation || !this.mesh) return;
     this.#disposeLayerMaps();
-    this.layerMaps = loaded;
+    this.#disposeLayerMaterials();
+    this.layerMaps = loaded.map(({ albedo, normal, roughness }) => ({ albedo, normal, roughness }));
+    this.layerMaterials = loaded.map(({ material }) => material);
+    this.layerMaterialUnsubs = layers.map((layer) => layer?.material
+      ? subscribeMaterial(layer.material, () => this.#wireMaterialNodes())
+      : null);
     this.#wireMaterialNodes();
   }
 
+  #disposeLayerMaterials() {
+    for (const unsubscribe of this.layerMaterialUnsubs ?? []) unsubscribe?.();
+    this.layerMaterialUnsubs = [];
+    this.layerMaterials = [];
+  }
   #disposeLayerMaps() {
     for (const maps of this.layerMaps ?? []) {
       maps?.albedo?.dispose?.();
@@ -1095,14 +1188,22 @@ export class TerrainComponent extends Component {
         const delta = Math.min(1, strength * falloff) * 255;
         const base = (y * res + x) * 4;
         const cur = [this.splatData[base], this.splatData[base + 1], this.splatData[base + 2], this.splatData[base + 3]];
-        cur[layer] = erase
-          ? Math.max(0, cur[layer] - delta)
-          : Math.min(255, cur[layer] + delta);
-        let sum = cur[0] + cur[1] + cur[2] + cur[3];
-        // Erasing the last remaining weight would leave the texel unweighted
-        // (renders black) — fall back to the base layer instead.
-        if (sum <= 0) { cur[0] = 255; sum = 255; }
-        for (let ch = 0; ch < 4; ch++) this.splatData[base + ch] = Math.round((cur[ch] / sum) * 255);
+        const amount = delta / 255;
+        if (erase) {
+          cur[layer] *= 1 - amount;
+        } else {
+          // Move the complete weight vector toward the selected layer. The
+          // former add-then-normalize rule converged near 50/50, preventing
+          // a painted layer from ever replacing the one underneath.
+          for (let ch = 0; ch < 4; ch++) {
+            cur[ch] = ch === layer
+              ? cur[ch] + (255 - cur[ch]) * amount
+              : cur[ch] * (1 - amount);
+          }
+        }
+        for (let ch = 0; ch < 4; ch++) {
+          this.splatData[base + ch] = Math.round(THREE.MathUtils.clamp(cur[ch], 0, 255));
+        }
       }
     }
     this.splatTexture.needsUpdate = true;

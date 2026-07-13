@@ -366,7 +366,7 @@ function ModelPreview({ path }) {
 
 // ---------------------------------------------------------------------------
 // Virtual geometry import settings (.meta sidecar) — Unreal-style: the asset
-// opts in, and every Model component using it renders through the cluster-LOD
+// opts in, and every Model or static Mesh using it renders through cluster LOD
 // pipeline. Only shown while the virtual-geometry module is enabled.
 // ---------------------------------------------------------------------------
 
@@ -440,7 +440,7 @@ function VirtualGeometrySettings({ path }) {
             </select>
           </div>
           <div className="asset-hint">
-            Renders the model through Nanite-style cluster LOD wherever it's used. Pixel Error is the
+            Renders static meshes through Nanite-style cluster LOD wherever this asset is used. Pixel Error is the
             screen-space error budget — higher is faster, lower is sharper. Debug views color the live
             cut: Triangles per-triangle (density shows LOD), Clusters one color per ~128-triangle patch.
           </div>
@@ -594,6 +594,7 @@ export function AssetInspector({ path }) {
           <VirtualGeometrySettings path={path} />
         </>
       )}
+      {ext === "geom" && <VirtualGeometrySettings path={path} />}
       {ext === "mat" && <MaterialEditor matPath={path} />}
       {ext === "anim" && <AnimatorSummary path={path} />}
       {(ext === "prefab" || ext === "entity") && <PrefabSummary path={path} />}

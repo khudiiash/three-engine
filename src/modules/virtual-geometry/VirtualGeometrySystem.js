@@ -6,7 +6,7 @@ import { buildClusterDAG, selectClusters } from "./clusterBuilder.js";
  * Per-engine virtual-geometry runtime (installed by the module's setup()).
  *
  * Unreal-style: virtual geometry is a property of the ASSET, not a component.
- * A model opts in via its sidecar meta (`<model>.glb.meta` →
+ * A model or geometry opts in via its sidecar meta (`<asset>.meta` →
  * `virtualGeometry: { enabled, pixelError, debugView }`, edited in the asset
  * inspector). Whenever a Model component finishes loading such a model — any
  * entity, any scene — this system swaps each eligible mesh's geometry in
@@ -80,10 +80,9 @@ async function buildDagFromGeometry(path, geometry) {
   }
   const t0 = performance.now();
   const dag = await buildClusterDAG({ positions, normals, uvs: uvAttr ? attrToFloat32(uvAttr) : null, indices });
-  console.info(
-    `[virtual-geometry] ${path}: ${(indices.length / 3).toLocaleString()} tris → ` +
-      `${dag.clusterCount.toLocaleString()} clusters, ${dag.levelCount} levels, ${(performance.now() - t0).toFixed(0)} ms`,
-  );
+  const dt = (performance.now() - t0).toFixed(0);
+  const tris = (indices.length / 3).toLocaleString();
+  console.info(`[virtual-geometry] ${path}: ${tris} tris → ${dag.clusterCount} clusters (${dag.levelCount} LODs, ${dt} ms)`);
   return dag;
 }
 
@@ -147,6 +146,13 @@ export class VirtualGeometrySystem {
     this.stats = { drawnTriangles: 0, totalTriangles: 0, drawnClusters: 0 };
     this._pruneNeeded = false;
     this._offModel = engine.on("model-loaded", (entity) => this.applyEntity(entity));
+    this._offComponent = engine.on("component-changed", ({ entityId, componentType, key }) => {
+      // MeshComponent emits this after its asynchronous .geom load completes.
+      if (componentType === "mesh" && key === "geometryAsset") {
+        const entity = engine.entities.get(entityId);
+        if (entity) this.applyEntity(entity);
+      }
+    });
     this._offHier = engine.on("hierarchy-changed", () => (this._pruneNeeded = true));
     this._offTick = engine.onUpdate(() => this.#tick());
     activeSystems.add(this);
@@ -157,6 +163,7 @@ export class VirtualGeometrySystem {
   dispose() {
     activeSystems.delete(this);
     this._offModel?.();
+    this._offComponent?.();
     this._offHier?.();
     this._offTick?.();
     for (const r of this.records) this.#restore(r);
@@ -172,18 +179,23 @@ export class VirtualGeometrySystem {
     return vg;
   }
 
-  /** Virtualizes the meshes of an entity's Model component (if opted in). */
+  /** Virtualizes an entity's Model or .geom-backed Mesh (if opted in). */
   async applyEntity(entity) {
     const mc = entity.getComponent?.("model");
-    const path = mc?.props?.path;
-    if (!mc?.root || !path) return;
+    const meshComponent = entity.getComponent?.("mesh");
+    const path = mc?.props?.path || meshComponent?.props?.geometryAsset;
+    if (!path) return;
     const vg = await this.#metaFor(path);
     if (!vg?.enabled) return;
-    const root = mc.root;
     const meshes = [];
-    root.traverse((o) => {
-      if (o.isMesh && !o.isSkinnedMesh && !o.userData.vgeoDebug) meshes.push(o);
-    });
+    const root = mc?.root;
+    if (root) {
+      root.traverse((o) => {
+        if (o.isMesh && !o.isSkinnedMesh && !o.userData.vgeoDebug) meshes.push(o);
+      });
+    } else if (meshComponent?.mesh && !meshComponent.mesh.isSkinnedMesh) {
+      meshes.push(meshComponent.mesh);
+    }
     for (let i = 0; i < meshes.length; i++) {
       const mesh = meshes[i];
       if (virtualized.has(mesh)) continue;
@@ -193,7 +205,7 @@ export class VirtualGeometrySystem {
         // The await is a suspension point: the model may have been reloaded
         // or the entity destroyed meanwhile. Only swap a mesh that is still
         // the live one.
-        if (mc.root !== root || virtualized.has(mesh)) continue;
+        if ((mc && mc.root !== root) || (!mc && meshComponent.mesh !== mesh) || virtualized.has(mesh)) continue;
         this.#virtualize(mesh, path, dag);
       } catch (err) {
         console.error(`[virtual-geometry] ${path} failed: ${err.message}`);
@@ -260,7 +272,7 @@ export class VirtualGeometrySystem {
       const dead = this.records.filter((r) => normPath(r.path) === np);
       this.records = this.records.filter((r) => normPath(r.path) !== np);
       for (const r of dead) this.#restore(r);
-      console.info(`[virtual-geometry] refresh ${path}: disabled, restored ${dead.length} mesh(es)`);
+      console.info(`[virtual-geometry] ${path}: disabled, restored ${dead.length} mesh(es)`);
       return;
     }
     // Turned on / retuned: (re)apply to every entity using the asset. Hash
@@ -276,11 +288,13 @@ export class VirtualGeometrySystem {
       }
     }
     for (const entity of this.engine.entities.values()) {
-      if (normPath(entity.getComponent?.("model")?.props?.path) === np) this.applyEntity(entity);
+      const modelPath = entity.getComponent?.("model")?.props?.path;
+      const geometryPath = entity.getComponent?.("mesh")?.props?.geometryAsset;
+      if (normPath(modelPath) === np || normPath(geometryPath) === np) this.applyEntity(entity);
     }
     console.info(
-      `[virtual-geometry] refresh ${path}: enabled, pixelError=${vg.pixelError}, ` +
-        `debugView=${vg.debugView}, ${matched}/${this.records.length} record(s) matched`,
+      `[virtual-geometry] ${path}: enabled, pixelError=${vg.pixelError}, ` +
+        `debugView=${vg.debugView}, ${matched}/${this.records.length} mesh(es) matched`,
     );
   }
 
@@ -416,7 +430,6 @@ export class VirtualGeometrySystem {
       r.mesh.add(mesh); // child ⇒ inherits transform, dies with the mesh
       r.debug = { geometry, mesh, position, color, capacity };
       r._dbgPositions = attrToFloat32(r.geometry.getAttribute("position"));
-      console.info(`[virtual-geometry] debug mesh created for ${r.path} (capacity ${capacity} verts)`);
     }
     const dag = r.dag;
     const positions = r._dbgPositions;

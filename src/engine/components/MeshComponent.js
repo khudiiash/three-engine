@@ -97,8 +97,15 @@ export class MeshComponent extends Component {
         geometry.dispose();
         return;
       }
-      this.mesh.geometry.dispose();
-      this.mesh.geometry = geometry;
+      const terrain = this.entity.getComponent("terrain");
+      if (terrain?.mesh === this.mesh) {
+        // Terrain owns the live deformable geometry; the .geom remains the
+        // persistent base asset shown in this component input.
+        geometry.dispose();
+      } else {
+        this.mesh.geometry.dispose();
+        this.mesh.geometry = geometry;
+      }
       this.#announceSwap("geometryAsset"); // same stale-reference problem as material
     } catch (err) {
       console.warn(`Couldn't load geometry asset "${path}": ${err}`);
@@ -107,12 +114,13 @@ export class MeshComponent extends Component {
 
   #applySharedMaterial(path) {
     if (!this.mesh) return;
-    this.mesh.material = getMaterialInstance(path) ?? getDefaultMaterial();
+    const terrainManaged = this.entity.getComponent("terrain")?.mesh === this.mesh;
+    if (!terrainManaged) this.mesh.material = getMaterialInstance(path) ?? getDefaultMaterial();
     this.materialRenderable = isMaterialRenderable(path);
     // A volume material renders nothing on the box's faces — the geometry is
     // just the raymarch container, so it must be the unit box that
     // `unitBoxMask` clips against. Snap non-box geometry to one.
-    if (isVolumeMaterial(path) && (this.props.geometry !== "box" || this.props.geometryAsset)) {
+    if (!terrainManaged && isVolumeMaterial(path) && (this.props.geometry !== "box" || this.props.geometryAsset)) {
       this.geometryGeneration = (this.geometryGeneration ?? 0) + 1;
       console.warn(`Mesh "${this.entity?.name ?? this.entity?.id}" uses a volume .mat — snapping geometry to box for correct raymarch bounds.`);
       this.mesh.geometry.dispose();

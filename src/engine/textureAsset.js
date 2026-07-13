@@ -14,7 +14,18 @@ let basisCompressionEnabled = false;
 // and subsequent graph edits appear to do nothing. The editable source image
 // is always retained specifically as a safe fallback; do not wait forever
 // before using it.
-const BASIS_LOAD_TIMEOUT_MS = 5000;
+//
+// The 30s budget is generous on purpose: KTX2 transcoding spawns a worker
+// that on first run JIT-compiles the Basis Universal WASM, which on some
+// hardware takes well over 5s. The previous 5s default produced a flood of
+// false-positive fallback warnings on cold startup. Once the worker is warm
+// (within the same editor session) subsequent transcodes are sub-second.
+const BASIS_LOAD_TIMEOUT_MS = 30000;
+
+// One-time summary so a flood of slow transcodes doesn't drown the console.
+// We surface the first timeout via a normal `console.info` (the source PNG
+// fallback already covers it — the user just gets to know it happened).
+let basisTimeoutNotified = false;
 
 async function loadBasisWithTimeout(loader, url) {
   let timer = null;
@@ -81,7 +92,17 @@ export async function loadTextureAsset(path, { colorSpace = null } = {}) {
         );
       }
     } catch (err) {
-      console.warn(`Basis texture fallback for "${path}": ${err.message ?? err}`);
+      // The timeout / transcode failure falls back to the source PNG below,
+      // which is always available — no need for the user to act. Demote the
+      // log to a one-shot `info` so a cold-start transcode storm doesn't
+      // bury real warnings from their scene.
+      if (!basisTimeoutNotified) {
+        basisTimeoutNotified = true;
+        console.info(
+          `Basis transcoding is slow on this machine; falling back to source PNGs ` +
+            `for compressed textures. First failure: "${path}" — ${err.message ?? err}`,
+        );
+      }
     }
   }
 

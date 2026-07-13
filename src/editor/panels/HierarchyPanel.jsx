@@ -43,6 +43,7 @@ import { isListenerPickArmed, disarmListenerPick } from "../components/ListenerS
 import { disarmTerrainScatterSourcePick, getTerrainScatterSourcePick } from "../terrainBrush.js";
 import { engine } from "../engineInstance.js";
 import { newScene } from "../sceneIO.js";
+import { createTerrainAssets } from "../terrainAssetSetup.js";
 
 const DROPPABLE_ASSET_EXTENSIONS = [...PREFAB_EXTENSIONS, ...MODEL_EXTENSIONS];
 
@@ -797,11 +798,32 @@ export function HierarchyPanel() {
     dragSession = { ids: null, sourceId: id, startX: e.clientX, startY: e.clientY, moved: false };
   };
 
-  const createEntity = (spec) => {
+  const createEntity = async (spec) => {
     setMenuOpen(false);
     const selected = useSelectionStore.getState().ids;
     const parentId = selected.length === 1 ? selected[0] : null;
-    const cmd = new CreateEntityCommand(parentId ? { ...spec, parentId } : spec);
+    let prepared = spec;
+    if (spec.components?.some((component) => component.type === "terrain")) {
+      try {
+        const assets = await createTerrainAssets(spec.components.find((component) => component.type === "terrain")?.props);
+        if (assets) {
+          const components = [...(spec.components ?? [])];
+          const meshIndex = components.findIndex((component) => component.type === "mesh");
+          if (meshIndex === -1) {
+            components.unshift({ type: "mesh", props: { geometryAsset: assets.geometryAsset, material: assets.material } });
+          } else {
+            components[meshIndex] = {
+              ...components[meshIndex],
+              props: { ...components[meshIndex].props, geometryAsset: assets.geometryAsset, material: assets.material },
+            };
+          }
+          prepared = { ...spec, components };
+        }
+      } catch (err) {
+        console.error(`Could not create terrain assets: ${err}`);
+      }
+    }
+    const cmd = new CreateEntityCommand(parentId ? { ...prepared, parentId } : prepared);
     commandBus.execute(cmd);
     useSelectionStore.getState().select(cmd.entityId);
     if (parentId) {

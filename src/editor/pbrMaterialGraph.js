@@ -12,10 +12,32 @@
  * occlusion (glTF metallicRoughness textures leave R undefined unless the
  * material's own aoMap points at the same image).
  */
-export function buildPbrGraph(maps, { armHasAo = true } = {}) {
+export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
   const nodes = [{ id: "out", type: "output", props: {}, position: { x: 980, y: 200 } }];
   const edges = [];
-  const bsdf = { id: "bsdf", type: "principledBsdf", props: {}, position: { x: 620, y: 80 } };
+  const bsdf = {
+    id: "bsdf",
+    type: "principledBsdf",
+    props: {
+      color: factors.color ?? "#ffffff",
+      roughness: factors.roughness ?? 1,
+      metalness: factors.metalness ?? 1,
+      ior: factors.ior ?? 1.5,
+      specularIntensity: factors.specularIntensity ?? 0.5,
+      specularColor: factors.specularColor ?? "#ffffff",
+      emissive: factors.emissive ?? "#000000",
+      emissiveStrength: factors.emissiveStrength ?? 1,
+      opacity: factors.opacity ?? 1,
+      anisotropy: factors.anisotropy,
+      clearcoat: factors.clearcoat,
+      clearcoatRoughness: factors.clearcoatRoughness,
+      sheen: factors.sheen,
+      sheenRoughness: factors.sheenRoughness,
+      transmission: factors.transmission,
+      thickness: factors.thickness,
+    },
+    position: { x: 620, y: 80 },
+  };
   nodes.push(bsdf);
   edges.push({ source: "bsdf", sourceHandle: "out", target: "out", targetHandle: "surface" });
 
@@ -28,21 +50,58 @@ export function buildPbrGraph(maps, { armHasAo = true } = {}) {
   const wire = (source, sourceHandle, targetHandle) =>
     edges.push({ source, sourceHandle, target: "bsdf", targetHandle });
 
-  if (maps.diffuse) wire(texNode("diffuse", maps.diffuse), "out", "color");
-  if (maps.roughness) wire(texNode("roughness", maps.roughness), "r", "roughness");
-  if (maps.ao) wire(texNode("ao", maps.ao), "r", "ao");
-  if (maps.metalness) wire(texNode("metalness", maps.metalness), "r", "metalness");
+  // glTF/Three scalar and color factors multiply their corresponding maps;
+  // a texture does not replace the factor. Emit that multiply explicitly so
+  // the editable graph is faithful to the source material.
+  const factoredWire = (slot, tex, channel, target, factor, identity = 1, kind = "float") => {
+    if (factor == null || factor === identity) {
+      wire(tex, channel, target);
+      return;
+    }
+    const valueId = `factor_${slot}`;
+    const mulId = `mul_${slot}`;
+    nodes.push({ id: valueId, type: kind, props: { value: factor }, position: { x: 330, y: row * 160 } });
+    nodes.push({ id: mulId, type: "multiply", props: {}, position: { x: 450, y: row * 160 } });
+    edges.push({ source: tex, sourceHandle: channel, target: mulId, targetHandle: "a" });
+    edges.push({ source: valueId, sourceHandle: "out", target: mulId, targetHandle: "b" });
+    wire(mulId, "out", target);
+  };
+
+  let diffuseId = null;
+  if (maps.diffuse) {
+    diffuseId = texNode("diffuse", maps.diffuse);
+    factoredWire("color", diffuseId, "out", "color", factors.color, "#ffffff", "color");
+    if (factors.useDiffuseAlpha) {
+      factoredWire("opacity", diffuseId, "a", "opacity", factors.opacity ?? 1);
+    }
+  }
+  if (maps.roughness) factoredWire("roughness", texNode("roughness", maps.roughness), "g", "roughness", factors.roughness ?? 1);
+  if (maps.ao) factoredWire("ao", texNode("ao", maps.ao), "r", "ao", factors.ao ?? 1);
+  if (maps.metalness) factoredWire("metalness", texNode("metalness", maps.metalness), "b", "metalness", factors.metalness ?? 1);
   if (maps.arm) {
     const id = texNode("arm", maps.arm);
     if (!maps.ao && armHasAo) wire(id, "r", "ao");
-    if (!maps.roughness) wire(id, "g", "roughness");
-    if (!maps.metalness) wire(id, "b", "metalness");
+    if (!maps.roughness) factoredWire("roughness", id, "g", "roughness", factors.roughness ?? 1);
+    if (!maps.metalness) factoredWire("metalness", id, "b", "metalness", factors.metalness ?? 1);
   }
   if (maps.normal) {
     const tex = texNode("normal", maps.normal);
-    nodes.push({ id: "nmap", type: "normalMap", props: {}, position: { x: 400, y: 420 } });
+    nodes.push({ id: "nmap", type: "normalMap", props: { scale: factors.normalScale ?? 1 }, position: { x: 400, y: 420 } });
     edges.push({ source: tex, sourceHandle: "out", target: "nmap", targetHandle: "color" });
     edges.push({ source: "nmap", sourceHandle: "out", target: "bsdf", targetHandle: "normal" });
   }
+  if (maps.emissive) {
+    factoredWire("emissive", texNode("emissive", maps.emissive), "out", "emissive", factors.emissive, "#ffffff", "color");
+  }
+  if (maps.opacity) factoredWire("opacity", texNode("opacity", maps.opacity), "g", "opacity", factors.opacity ?? 1);
+  if (maps.anisotropy) factoredWire("anisotropy", texNode("anisotropy", maps.anisotropy), "b", "anisotropy", factors.anisotropy ?? 1);
+  if (maps.clearcoat) factoredWire("clearcoat", texNode("clearcoat", maps.clearcoat), "r", "clearcoat", factors.clearcoat ?? 1);
+  if (maps.clearcoatRoughness) factoredWire("clearcoatRoughness", texNode("clearcoatRoughness", maps.clearcoatRoughness), "g", "clearcoatRoughness", factors.clearcoatRoughness ?? 1);
+  if (maps.transmission) factoredWire("transmission", texNode("transmission", maps.transmission), "r", "transmission", factors.transmission ?? 1);
+  if (maps.thickness) factoredWire("thickness", texNode("thickness", maps.thickness), "g", "thickness", factors.thickness ?? 1);
+  if (maps.sheen) factoredWire("sheen", texNode("sheen", maps.sheen), "out", "sheen", factors.sheen, "#ffffff", "color");
+  if (maps.sheenRoughness) factoredWire("sheenRoughness", texNode("sheenRoughness", maps.sheenRoughness), "a", "sheenRoughness", factors.sheenRoughness ?? 1);
+  if (maps.specularIntensity) factoredWire("specularIntensity", texNode("specularIntensity", maps.specularIntensity), "a", "specularIntensity", factors.specularIntensity ?? 1);
+  if (maps.specularColor) factoredWire("specularColor", texNode("specularColor", maps.specularColor), "out", "specularColor", factors.specularColor, "#ffffff", "color");
   return { nodes, edges };
 }
