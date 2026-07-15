@@ -34,6 +34,37 @@ export const SCENE_SETTINGS_DEFAULTS = {
     autoUpdate: true, // re-render shadow maps every frame
     needsUpdate: false, // one-shot re-render on the next frame
   },
+  // Performance tuning. None of these require a renderer rebuild — they are
+  // applied live (render scale via setPixelRatio, volume quality via the
+  // shared runtimeQuality object the volumetric lighting model reads).
+  performance: {
+    // Per-scene ceiling applied after the project-wide DPR cap. Useful for
+    // keeping especially expensive scenes at 1x on high-density displays.
+    maxDevicePixelRatio: 2, // 0.5 … 4
+    // Manual resolution multiplier on the whole frame (canvas backing store).
+    // 0.5 = quarter the pixels = roughly 2–4× GPU headroom on fill-bound
+    // scenes (SSGI/SSR/volumes are all fill-bound). CSS upscales the canvas.
+    renderScale: 1, // 0.25 … 1
+    // Auto-adjusts an internal multiplier (on top of renderScale) between
+    // 0.5 and 1 to hold targetFps, driven by the measured GPU frame time.
+    dynamicResolution: false,
+    targetFps: 60, // 30 | 60 | 90 | 120
+    // Multiplies every volumetric material's raymarch step count. 0.5 halves
+    // the per-pixel loop iterations of all volumes (biggest volume cost).
+    volumeStepScale: 1, // 0.1 … 1
+  },
+};
+
+/**
+ * Live quality knobs read by hot shader-update callbacks (e.g. the
+ * volumetric lighting model's per-frame step-count uniform). A mutable
+ * module-level object — NOT serialized — so shader `onRenderUpdate`
+ * closures can read the current value without threading the engine
+ * through the TSL build. `applySettingsToScene` copies the scene's
+ * `performance` values in here.
+ */
+export const runtimeQuality = {
+  volumeStepScale: 1,
 };
 
 export const TONE_MAPPINGS = {
@@ -79,6 +110,11 @@ export function mergeSettings(current, patch) {
     fog: { ...current.fog, ...(patch?.fog ?? {}) },
     renderer: { ...current.renderer, ...(patch?.renderer ?? {}) },
     shadow: { ...current.shadow, ...(patch?.shadow ?? {}) },
+    performance: {
+      ...SCENE_SETTINGS_DEFAULTS.performance,
+      ...(current.performance ?? {}),
+      ...(patch?.performance ?? {}),
+    },
   };
   return next;
 }
@@ -103,12 +139,24 @@ export function rendererConstructorOptions(settings) {
     samples: r.antialias === false ? 0 : (r.samples ?? 4),
     alpha: r.transparent !== false,
     asyncCompilation: r.asyncCompilation !== false,
+    // Enables WebGPU timestamp queries so the engine can read real GPU
+    // frame time (renderer.info.render.timestamp) instead of guessing from
+    // CPU-side submit time. The backend degrades gracefully when the
+    // adapter lacks the "timestamp-query" feature (WebGPUBackend.js:294),
+    // so this is safe to request unconditionally. Overhead is negligible
+    // (two GPU timestamps + one tiny resolve buffer per pass).
+    trackTimestamp: true,
   };
 }
 
 /** Pushes settings onto a scene + renderer. Renderer may be null (pre-init). */
 export function applySettingsToScene(settings, scene, ambientLight, renderer) {
   scene.background = new THREE.Color(settings.background);
+
+  // Live quality knobs — copied into the mutable runtimeQuality object that
+  // shader onRenderUpdate closures read every frame (see volumetricLightingModel).
+  const perf = settings.performance ?? SCENE_SETTINGS_DEFAULTS.performance;
+  runtimeQuality.volumeStepScale = clamp01Range(perf.volumeStepScale ?? 1, 0.1, 1);
 
   ambientLight.color.set(settings.ambientColor);
   ambientLight.intensity = settings.ambientIntensity;
@@ -135,4 +183,8 @@ export function applySettingsToScene(settings, scene, ambientLight, renderer) {
     renderer.shadowMap.autoUpdate = shadow.autoUpdate !== false;
     renderer.shadowMap.needsUpdate = shadow.needsUpdate === true;
   }
+}
+
+function clamp01Range(v, min, max) {
+  return Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : max;
 }

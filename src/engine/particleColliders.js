@@ -14,6 +14,7 @@ const _scale = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _up = new THREE.Vector3();
 const _fwd = new THREE.Vector3();
+const _offset = new THREE.Vector3();
 
 /**
  * Per-engine singleton that gathers every `ColliderComponent` in the scene
@@ -33,7 +34,6 @@ export class ParticleColliderField {
     this.buffer = instancedArray(this.data, "vec4");
     this.countUniform = uniform(0, "int");
     this.activeUsers = 0;
-    this.unsub = engine.onUpdate(() => this.#refresh());
   }
 
   /** Called by a ParticleComponent when a system with sceneCollision attaches/detaches. */
@@ -46,11 +46,11 @@ export class ParticleColliderField {
   }
 
   dispose() {
-    this.unsub?.();
     if (this.engine.particleColliders === this) delete this.engine.particleColliders;
   }
 
-  #refresh() {
+  /** Upload the current scene colliders immediately before particle compute. */
+  refresh() {
     if (this.activeUsers <= 0) return;
     let count = 0;
     for (const entity of this.engine.entities.values()) {
@@ -70,9 +70,12 @@ export class ParticleColliderField {
 
       const base = count * FLOATS_PER_COLLIDER;
       const offset = col.props.offset ?? [0, 0, 0];
-      const cx = _pos.x + offset[0] * _scale.x;
-      const cy = _pos.y + offset[1] * _scale.y;
-      const cz = _pos.z + offset[2] * _scale.z;
+      // Collider offsets are entity-local, so scale and rotate them before
+      // adding the entity's world position.
+      _offset.fromArray(offset).multiply(_scale).applyQuaternion(_quat).add(_pos);
+      const cx = _offset.x;
+      const cy = _offset.y;
+      const cz = _offset.z;
 
       if (shape === "box") {
         const size = col.props.size ?? [1, 1, 1];

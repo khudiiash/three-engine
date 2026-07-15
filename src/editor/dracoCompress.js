@@ -3,6 +3,8 @@ import { KHRDracoMeshCompression } from "@gltf-transform/extensions";
 import { draco } from "@gltf-transform/functions";
 import { getDracoWasm } from "./dracoWasm.js";
 import { useModulesStore } from "./modules.js";
+import { useAssetProcessingStore } from "./store/assetProcessingStore.js";
+import { basename } from "./store/projectStore.js";
 
 /**
  * Editor-side Draco compression of imported models (enabled by the "draco"
@@ -56,6 +58,14 @@ async function writeDracoMeta(glbPath, dracoInfo) {
  * the file it's left untouched but still labelled (compressed === original).
  */
 export async function compressGlbInPlace(glbPath) {
+  return useAssetProcessingStore.getState().track(
+    (p) => `Draco compressing ${basename(p)}…`,
+    (p) => compressGlbInPlaceImpl(p),
+    glbPath,
+  );
+}
+
+async function compressGlbInPlaceImpl(glbPath) {
   const io = await getIO();
 
   // `read_binary_file` resolves to an ArrayBuffer (raw IPC bytes).

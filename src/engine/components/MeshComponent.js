@@ -32,13 +32,27 @@ export class MeshComponent extends Component {
     geometry: "box",
     geometryAsset: "",
     material: "", // .mat asset path; empty = default white
+    material2: "",
+    material3: "",
+    material4: "",
+    material5: "",
+    material6: "",
+    material7: "",
+    material8: "",
     castShadow: true,
     receiveShadow: true,
   };
   static schema = [
-    { key: "geometry", label: "Geometry", type: "select", options: Object.keys(geometryFactories) },
-    { key: "geometryAsset", label: "Geometry Asset", type: "asset", exts: ["geom"] },
-    { key: "material", label: "Material", type: "asset", exts: ["mat"] },
+    { key: "geometry", label: "Primitive", type: "select", options: Object.keys(geometryFactories), showIf: (props) => !props.geometryAsset },
+    { key: "geometryAsset", label: "Geometry", type: "asset", exts: ["geom"] },
+    { key: "material", label: "Material 1", type: "asset", exts: ["mat"] },
+    { key: "material2", label: "Material 2", type: "asset", exts: ["mat"] },
+    { key: "material3", label: "Material 3", type: "asset", exts: ["mat"] },
+    { key: "material4", label: "Material 4", type: "asset", exts: ["mat"] },
+    { key: "material5", label: "Material 5", type: "asset", exts: ["mat"] },
+    { key: "material6", label: "Material 6", type: "asset", exts: ["mat"] },
+    { key: "material7", label: "Material 7", type: "asset", exts: ["mat"] },
+    { key: "material8", label: "Material 8", type: "asset", exts: ["mat"] },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
   ];
@@ -52,6 +66,7 @@ export class MeshComponent extends Component {
     this.entity.object3D.add(this.mesh);
     if (this.props.geometryAsset) this.#loadGeometry(this.props.geometryAsset);
     if (this.props.material) this.#loadSharedMaterial(this.props.material);
+    this.#loadExtraMaterials();
     // Honour the enabled flag at attach time.
     this.mesh.visible = this.enabled;
   }
@@ -62,6 +77,8 @@ export class MeshComponent extends Component {
     this.sharedGeneration = (this.sharedGeneration ?? 0) + 1;
     this.materialUnsub?.();
     this.materialUnsub = null;
+    this.extraMaterialUnsubs?.forEach((unsubscribe) => unsubscribe());
+    this.extraMaterialUnsubs = [];
     this.entity.object3D.remove(this.mesh);
     this.mesh.geometry.dispose();
     this.mesh = null;
@@ -89,6 +106,35 @@ export class MeshComponent extends Component {
     this.#applySharedMaterial(path);
   }
 
+  async #loadExtraMaterials() {
+    const generation = (this.extraMaterialGeneration = (this.extraMaterialGeneration ?? 0) + 1);
+    const paths = Array.from({ length: 7 }, (_, index) => this.props[`material${index + 2}`] ?? '');
+    await Promise.all(paths.filter(Boolean).map((path) => loadMaterialAsset(path)));
+    if (generation !== this.extraMaterialGeneration || !this.mesh) return;
+    this.extraMaterialUnsubs?.forEach((unsubscribe) => unsubscribe());
+    this.extraMaterialUnsubs = paths.filter(Boolean).map((path) => subscribeMaterial(path, () => this.#applyMaterialSlots()));
+    this.#applyMaterialSlots();
+  }
+
+  #applyMaterialSlots() {
+    if (!this.mesh) return;
+    const paths = [this.props.material ?? '', ...Array.from({ length: 7 }, (_, index) => this.props[`material${index + 2}`] ?? '')];
+    const hasExtraMaterial = paths.slice(1).some(Boolean);
+    // Geometry groups retain their numeric material slot even when that slot
+    // has no asset assigned. Keep the complete slot array so faces in an empty
+    // (especially trailing) slot render with the default material instead of
+    // disappearing because Three.js cannot resolve the group index.
+    const materials = paths.map((path) => getMaterialInstance(path) ?? getDefaultMaterial());
+    // Three.js only renders a material array through BufferGeometry groups.
+    // Most GLTF primitives are unpacked as one mesh per material and therefore
+    // have no groups; assigning an array to those makes every face disappear.
+    // Built-in primitives also have implementation-detail groups (a box has
+    // one per side). Until an extra slot is explicitly assigned, keep a single
+    // material so Material 1 covers the entire primitive instead of only group
+    // 0. Once a second slot is used, preserve all slots for authored geometry.
+    this.mesh.material = hasExtraMaterial && this.mesh.geometry?.groups?.length ? materials : materials[0];
+  }
+
   async #loadGeometry(path) {
     const generation = (this.geometryGeneration = (this.geometryGeneration ?? 0) + 1);
     try {
@@ -105,6 +151,10 @@ export class MeshComponent extends Component {
       } else {
         this.mesh.geometry.dispose();
         this.mesh.geometry = geometry;
+        // Material binding depends on whether the newly-loaded geometry has
+        // groups. The placeholder box does, while many imported GLTF
+        // primitives do not, so re-evaluate after the asynchronous swap.
+        this.#applyMaterialSlots();
       }
       this.#announceSwap("geometryAsset"); // same stale-reference problem as material
     } catch (err) {
@@ -115,7 +165,7 @@ export class MeshComponent extends Component {
   #applySharedMaterial(path) {
     if (!this.mesh) return;
     const terrainManaged = this.entity.getComponent("terrain")?.mesh === this.mesh;
-    if (!terrainManaged) this.mesh.material = getMaterialInstance(path) ?? getDefaultMaterial();
+    if (!terrainManaged) this.#applyMaterialSlots();
     this.materialRenderable = isMaterialRenderable(path);
     // A volume material renders nothing on the box's faces — the geometry is
     // just the raymarch container, so it must be the unit box that
@@ -166,10 +216,12 @@ export class MeshComponent extends Component {
       if (this.props.material) {
         this.#loadSharedMaterial(this.props.material);
       } else {
-        this.mesh.material = getDefaultMaterial();
+        this.#applyMaterialSlots();
         this.materialRenderable = true;
         this.mesh.visible = this.enabled;
       }
+    } else if (/^material[2-8]$/.test(key)) {
+      this.#loadExtraMaterials();
     } else if (key === "castShadow" || key === "receiveShadow") {
       this.mesh[key] = !!this.props[key];
     }

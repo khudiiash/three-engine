@@ -13,6 +13,12 @@ const _scratchSphere = new THREE.Sphere();
  *                          min?, max?, step?, options? }]
  * and may override onAttach/onDetach/onPropChanged.
  *
+ * Subclasses may also set:
+ *   static tags       — short string array of free-form editor tags, used by
+ *                       the Modules panel to filter / group components
+ *                       (e.g. ["physics", "play-mode", "3d"]). Pure metadata;
+ *                       never read by the runtime.
+ *
  * Every component has two built-in meta-toggles (default true). They are
  * not part of `schema` — the inspector renders them in the section header
  * alongside the existing eye (enabled) and remove buttons.
@@ -31,6 +37,12 @@ const _scratchSphere = new THREE.Sphere();
  * behind `this.isInView()` (or `if (!this.viewOnly || this.isInView())`).
  */
 export class Component {
+  // Default: no tags. Subclasses override with a string array (e.g.
+  // `static tags = ["physics", "play-mode"]`). Pure editor metadata; the
+  // runtime never reads this. Defined on the base class so reading
+  // `MyComponent.tags` is always safe even for subclasses that don't set it.
+  static tags = [];
+
   constructor(entity, props = {}) {
     this.entity = entity;
     // `enabled` lives outside the subclass `defaults` spread so it's always

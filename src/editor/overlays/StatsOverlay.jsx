@@ -6,10 +6,12 @@ import { engine } from "../engineInstance.js";
  * Editor-only viewport overlay showing live engine telemetry:
  *
  *   FPS              frames/second (smoothed)
- *   CPU %            engine frame time as a percentage of a 60 Hz budget,
- *                    clamped 0–100 so the bar saturates instead of overflowing
- *   GPU %            renderer.render() wall time as a percentage of a 60 Hz
- *                    budget, clamped 0–100
+ *   CPU              engine frame time in ms (update tick, excluding render)
+ *   GPU              real on-GPU frame time in ms (WebGPU timestamp queries);
+ *                    falls back to CPU-side submit time, labelled
+ *                    "GPU (submit)", on adapters without the feature
+ *   Res scale        shown when the frame renders below native resolution
+ *                    (manual render scale and/or dynamic resolution)
  *   Memory           JS heap (Chromium-only; "—" elsewhere)
  *   Textures         GPU memory used by tracked textures (sum of every
  *                    three.Texture's byte size, in MB)
@@ -41,6 +43,8 @@ const EMPTY_READOUT = {
   cpuLoadPct: 0,
   renderMs: 0,
   gpuLoadPct: 0,
+  gpuMs: 0,
+  renderScale: 1,
   jsHeapBytes: null,
   drawCalls: 0,
   triangles: 0,
@@ -150,13 +154,18 @@ export function StatsOverlay() {
           <Section title="Performance" />
           <Row
             label="CPU"
-            value={`${r.cpuLoadPct.toFixed(0)}%`}
+            value={formatMs(r.frameMs)}
             tone={loadClass(r.frameMs)}
           />
+          {/* Real GPU frame time when WebGPU timestamp queries are
+              available (gpuMs > 0); CPU-side submit time otherwise. The
+              raw milliseconds are what you tune against a frame budget
+              (16.7 ms = 60 fps, 8.3 ms = 120 fps) — a percent of one
+              fixed budget can't express both targets. */}
           <Row
-            label="GPU"
-            value={`${r.gpuLoadPct.toFixed(0)}%`}
-            tone={loadClass(r.renderMs)}
+            label={r.gpuMs > 0 ? "GPU" : "GPU (submit)"}
+            value={formatMs(r.gpuMs > 0 ? r.gpuMs : r.renderMs)}
+            tone={loadClass(r.gpuMs > 0 ? r.gpuMs : r.renderMs)}
           />
           <Row
             label="Memory"
@@ -164,6 +173,9 @@ export function StatsOverlay() {
             tone={memTone(r.jsHeapBytes)}
           />
           <Section title="Renderer" />
+          {r.renderScale < 0.995 && (
+            <Row label="Res scale" value={`${Math.round(r.renderScale * 100)}%`} tone="warm" />
+          )}
           <Row label="Textures" value={formatBytes(r.textureMem)} tone={memTone(r.textureMem)} />
           <Row label="Draw calls" value={formatCount(r.drawCalls)} />
           <Row label="Triangles" value={formatCount(r.triangles)} />
@@ -192,6 +204,11 @@ function formatBytes(b) {
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
   if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
   return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function formatMs(ms) {
+  if (!(ms > 0)) return "—";
+  return `${ms.toFixed(1)} ms`;
 }
 
 function formatCount(n) {

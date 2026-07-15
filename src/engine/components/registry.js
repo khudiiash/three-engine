@@ -29,6 +29,7 @@ export class MissingComponent extends Component {
   static label = "Missing Component";
   static defaults = {};
   static schema = [];
+  static tags = [];
 
   constructor(entity, props, missingType) {
     super(entity, props);

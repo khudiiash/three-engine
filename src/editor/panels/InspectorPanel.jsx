@@ -105,17 +105,17 @@ const RAD2DEG = 180 / Math.PI;
 const DEG2RAD = Math.PI / 180;
 
 /** Number input that keeps local text while typing; commits on Enter/blur. */
-function NumberField({ value, onCommit, min, max, step = 0.1 }) {
-  const [text, setText] = useState(formatNumber(value));
+function NumberField({ value, onCommit, min, max, step = 0.1, mixed = false }) {
+  const [text, setText] = useState(mixed ? "" : formatNumber(value));
   const [focused, setFocused] = useState(false);
 
   useEffect(() => {
-    if (!focused) setText(formatNumber(value));
-  }, [value, focused]);
+    if (!focused) setText(mixed ? "" : formatNumber(value));
+  }, [value, mixed, focused]);
 
   const commit = () => {
     const parsed = parseFloat(text);
-    if (!Number.isNaN(parsed) && parsed !== value) {
+    if (!Number.isNaN(parsed) && (mixed || parsed !== value)) {
       let v = parsed;
       if (min !== undefined) v = Math.max(min, v);
       if (max !== undefined) v = Math.min(max, v);
@@ -131,6 +131,7 @@ function NumberField({ value, onCommit, min, max, step = 0.1 }) {
       type="number"
       step={step}
       value={text}
+      placeholder={mixed ? "—" : undefined}
       onChange={(e) => setText(e.target.value)}
       onFocus={() => setFocused(true)}
       onBlur={() => {
@@ -199,7 +200,7 @@ function TransformSection({ entity }) {
 const fileName = (p) => p?.split(/[\\/]/).pop() ?? "";
 
 /** Text field that doubles as a drop target for Assets-panel paths. */
-function TextPropField({ value, onCommit, readOnly = false }) {
+function TextPropField({ value, onCommit, readOnly = false, mixed = false }) {
   const dropRef = useAssetDrop({
     accepts: (path, isDir) => !readOnly && !isDir,
     onDrop: onCommit,
@@ -208,16 +209,20 @@ function TextPropField({ value, onCommit, readOnly = false }) {
     <input
       className="text-field"
       type="text"
-      key={value}
-      defaultValue={value}
+      key={`${mixed ? "mixed" : "value"}-${value}`}
+      defaultValue={mixed ? "" : value}
+      placeholder={mixed ? "— Mixed —" : undefined}
       ref={dropRef}
       readOnly={readOnly}
-      onBlur={(e) => !readOnly && onCommit(e.target.value)}
+      onBlur={(e) => {
+        const initial = mixed ? "" : String(value ?? "");
+        if (!readOnly && e.target.value !== initial) onCommit(e.target.value);
+      }}
     />
   );
 }
 
-function Vec3PropField({ value, onCommit }) {
+function Vec3PropField({ value, onCommit, mixed = [] }) {
   const values = Array.isArray(value) ? value : [0, 0, 0];
   return (
     <div className="vector-fields">
@@ -225,10 +230,11 @@ function Vec3PropField({ value, onCommit }) {
         <NumberField
           key={i}
           value={values[i] ?? 0}
+          mixed={!!mixed[i]}
           onCommit={(v) => {
             const next = [...values];
             next[i] = v;
-            onCommit(next);
+            onCommit(next, i);
           }}
         />
       ))}
@@ -236,26 +242,91 @@ function Vec3PropField({ value, onCommit }) {
   );
 }
 
-function PropField({ descriptor, value, onCommit }) {
+function MixedCheckbox({ checked, mixed, onChange, ...props }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (ref.current) ref.current.indeterminate = !!mixed;
+  }, [mixed]);
+  return <input ref={ref} type="checkbox" checked={!mixed && !!checked} onChange={onChange} {...props} />;
+}
+
+const valuesEqual = (a, b) => {
+  if (Object.is(a, b)) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((value, index) => valuesEqual(value, b[index]));
+  }
+  if (a && b && typeof a === "object" && typeof b === "object") {
+    const aKeys = Object.keys(a);
+    const bKeys = Object.keys(b);
+    return aKeys.length === bKeys.length && aKeys.every((key) => valuesEqual(a[key], b[key]));
+  }
+  return false;
+};
+
+function MultiTransformSection({ entities }) {
+  const primary = entities[0];
+  const rows = [
+    ["Position", "position", 1],
+    ["Rotation", "rotation", RAD2DEG],
+    ["Scale", "scale", 1],
+  ];
+  const commitAxis = (key, axis, displayValue, displayScale) => {
+    const value = displayValue / displayScale;
+    const commands = entities.map((entity) => {
+      const before = engine.getEntity(entity.id)?.getTransform() ?? entity.transform;
+      const next = { ...before, [key]: [...before[key]] };
+      next[key][axis] = value;
+      return new SetTransformCommand(entity.id, next, before);
+    });
+    commandBus.execute(new BatchCommand(commands, `Transform ${entities.length} entities`));
+  };
+
+  return (
+    <div className="inspector-section">
+      <div className="section-header">Transform</div>
+      {rows.map(([label, key, displayScale]) => (
+        <div className="field-row" key={key}>
+          <span className="field-label">{label}</span>
+          <div className="vector-fields">
+            {[0, 1, 2].map((axis) => {
+              const values = entities.map((entity) => entity.transform[key][axis]);
+              return (
+                <NumberField
+                  key={axis}
+                  value={primary.transform[key][axis] * displayScale}
+                  mixed={!values.every((value) => Object.is(value, values[0]))}
+                  onCommit={(value) => commitAxis(key, axis, value, displayScale)}
+                />
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PropField({ descriptor, value, onCommit, mixed = false, mixedAxes = [] }) {
   switch (descriptor.type) {
     case "asset":
-      return <AssetField descriptor={descriptor} value={value} onCommit={onCommit} />;
+      return <AssetField descriptor={descriptor} value={mixed ? "" : value} onCommit={onCommit} />;
     // A prefab reference: an asset picker pinned to prefab files. The value is
     // the asset path, which is exactly what `engine.instantiate()` takes.
     case "prefab":
       return (
         <AssetField
           descriptor={{ ...descriptor, exts: PREFAB_EXTENSIONS }}
-          value={value}
+          value={mixed ? "" : value}
           onCommit={onCommit}
         />
       );
     case "vec3":
-      return <Vec3PropField value={value} onCommit={onCommit} />;
+      return <Vec3PropField value={value} mixed={mixedAxes} onCommit={onCommit} />;
     case "number":
       return (
         <NumberField
           value={value}
+          mixed={mixed}
           min={descriptor.min}
           max={descriptor.max}
           step={descriptor.step}
@@ -265,15 +336,16 @@ function PropField({ descriptor, value, onCommit }) {
     case "color":
       return (
         <input
-          className="color-field"
           type="color"
           value={value}
+          className={`color-field${mixed ? " mixed" : ""}`}
           onChange={(e) => onCommit(e.target.value)}
         />
       );
     case "select":
       return (
-        <select className="select-field" value={value} onChange={(e) => onCommit(e.target.value)}>
+        <select className="select-field" value={mixed ? "" : value} onChange={(e) => onCommit(e.target.value)}>
+          {mixed && <option value="">— Mixed —</option>}
           {descriptor.options.map((opt) => (
             <option key={opt} value={opt}>
               {opt}
@@ -283,10 +355,10 @@ function PropField({ descriptor, value, onCommit }) {
       );
     case "boolean":
       return (
-        <input type="checkbox" checked={!!value} onChange={(e) => onCommit(e.target.checked)} />
+        <MixedCheckbox checked={value} mixed={mixed} onChange={(e) => onCommit(e.target.checked)} />
       );
     default:
-      return <TextPropField value={value} onCommit={onCommit} readOnly={descriptor.readOnly} />;
+      return <TextPropField value={value} mixed={mixed} onCommit={onCommit} readOnly={descriptor.readOnly} />;
   }
 }
 
@@ -748,11 +820,6 @@ function ComponentSection({ entityId, type, props }) {
           <button className="toolbar-btn wide" onClick={() => openPanel("geometryEditor")}>
             Open Separate Geometry Editor
           </button>
-          {props.material && (
-            <button className="toolbar-btn wide" onClick={() => openPanel("material")}>
-              Edit Material
-            </button>
-          )}
           <button className="toolbar-btn wide" onClick={() => openPanel("shaderGraph")}>
             Edit Shader Graph
           </button>
@@ -817,6 +884,149 @@ function ComponentSection({ entityId, type, props }) {
           </span>
         </div>
       )}
+    </div>
+  );
+}
+
+function MultiScriptAttributeFields({ entities }) {
+  const components = entities.map((entity) => engine.getEntity(entity.id)?.getComponent("script"));
+  const definitions = components.map((component) => component?.getAttributeDefs?.() ?? {});
+  const sharedKeys = Object.keys(definitions[0] ?? {}).filter((key) => definitions.every((defs) => key in defs));
+  return sharedKeys.map((key) => {
+    const def = definitions[0][key];
+    const values = entities.map((entity, index) => entity.components.script.attributes?.[key] ?? definitions[index][key].default);
+    const isMixed = !values.every((value) => valuesEqual(value, values[0]));
+    const mixedAxes = def.type === "vec3"
+      ? [0, 1, 2].map((axis) => !values.every((value) => value?.[axis] === values[0]?.[axis]))
+      : [];
+    return (
+      <div className="field-row" key={key}>
+        <span className="field-label">{key}</span>
+        <PropField
+          descriptor={{ key, label: key, type: def.type ?? "number", ...def }}
+          value={values[0]}
+          mixed={isMixed}
+          mixedAxes={mixedAxes}
+          onCommit={(value, changedAxis) => {
+            const commands = entities.map((entity) => {
+              const attributes = { ...(entity.components.script.attributes ?? {}) };
+              if (def.type === "vec3" && Number.isInteger(changedAxis)) {
+                const next = [...(attributes[key] ?? def.default ?? [0, 0, 0])];
+                next[changedAxis] = value[changedAxis];
+                attributes[key] = next;
+              } else attributes[key] = value;
+              return new SetComponentPropCommand(entity.id, "script", "attributes", attributes);
+            });
+            commandBus.execute(new BatchCommand(commands, `Set ${key} on ${entities.length} scripts`));
+          }}
+        />
+      </div>
+    );
+  });
+}
+
+function MultiComponentSection({ entities, type }) {
+  const cls = getComponentClass(type);
+  const [, force] = useState(0);
+  const entityIds = entities.map((entity) => entity.id);
+  const propsList = entities.map((entity) => entity.components[type]);
+
+  useEffect(() => {
+    const selected = new Set(entityIds);
+    return engine.on("component-changed", (info) => {
+      if (selected.has(info.entityId) && info.componentType === type) force((value) => value + 1);
+    });
+  }, [type, entityIds.join("|")]);
+
+  const liveComponents = entityIds.map((id) => engine.getEntity(id)?.getComponent(type)).filter(Boolean);
+  const enabledValues = liveComponents.map((component) => component.enabled !== false);
+  const viewOnlyValues = liveComponents.map((component) => !!component.props.viewOnly);
+  const batchProps = (key, value, label = `Set ${key} on ${entities.length} entities`) => {
+    const commands = entityIds.map((id) => new SetComponentPropCommand(id, type, key, value));
+    commandBus.execute(new BatchCommand(commands, label));
+  };
+  const removeAll = () => commandBus.execute(
+    new BatchCommand(
+      entityIds.map((id) => new RemoveComponentCommand(id, type)),
+      `Remove ${cls?.label ?? type} from ${entities.length} entities`,
+    ),
+  );
+
+  if (!cls) {
+    return (
+      <div className="inspector-section">
+        <div className="section-header">
+          {type}
+          <button className="icon-btn" title="Remove component from selection" onClick={removeAll}>
+            <X size={12} />
+          </button>
+        </div>
+        <div className="field-row"><span className="field-label" style={{ opacity: 0.6 }}>Missing module</span></div>
+      </div>
+    );
+  }
+
+  const enabledMixed = !enabledValues.every((value) => value === enabledValues[0]);
+  const viewOnlyMixed = !viewOnlyValues.every((value) => value === viewOnlyValues[0]);
+  return (
+    <div className={`inspector-section ${!enabledMixed && !enabledValues[0] ? "disabled" : ""}`}>
+      <div className="section-header">
+        {cls.label}
+        <button
+          className={`icon-btn ${!viewOnlyMixed && viewOnlyValues[0] ? "active-toggle" : ""}`}
+          title={viewOnlyMixed ? "Mixed view-only state; click to enable all" : "Toggle view-only for selection"}
+          onClick={() => batchProps("viewOnly", viewOnlyMixed ? true : !viewOnlyValues[0])}
+        >
+          <ScanEye size={12} />
+        </button>
+        <button
+          className="icon-btn"
+          title={enabledMixed ? "Mixed enabled state; click to enable all" : "Toggle component for selection"}
+          onClick={() => batchProps("enabled", enabledMixed ? true : !enabledValues[0])}
+        >
+          {enabledMixed || enabledValues[0] ? <Eye size={12} /> : <EyeOff size={12} />}
+        </button>
+        <button className="icon-btn" title="Remove component from selection" onClick={removeAll}>
+          <X size={12} />
+        </button>
+      </div>
+      {cls.schema.map((descriptor) => {
+        if (descriptor.showIf && !propsList.every((props) => descriptor.showIf(props))) return null;
+        const values = propsList.map((props) => props[descriptor.key]);
+        const mixed = !values.every((value) => valuesEqual(value, values[0]));
+        const mixedAxes = descriptor.type === "vec3"
+          ? [0, 1, 2].map((axis) => !values.every((value) => value?.[axis] === values[0]?.[axis]))
+          : [];
+        return (
+          <div className="field-row" key={descriptor.key}>
+            <span className="field-label">{descriptor.label}</span>
+            <PropField
+              descriptor={descriptor}
+              value={values[0]}
+              mixed={mixed}
+              mixedAxes={mixedAxes}
+              onCommit={(value, changedAxis) => {
+                const commands = [];
+                for (const entity of entities) {
+                  const props = entity.components[type];
+                  if (type === "mesh" && descriptor.key === "geometry" && props.geometryAsset) {
+                    commands.push(new SetComponentPropCommand(entity.id, type, "geometryAsset", ""));
+                  }
+                  let entityValue = value;
+                  if (descriptor.type === "vec3" && Number.isInteger(changedAxis)) {
+                    entityValue = [...(props[descriptor.key] ?? [0, 0, 0])];
+                    entityValue[changedAxis] = value[changedAxis];
+                  }
+                  commands.push(new SetComponentPropCommand(entity.id, type, descriptor.key, entityValue));
+                }
+                commandBus.execute(new BatchCommand(commands, `Set ${descriptor.label} on ${entities.length} entities`));
+              }}
+            />
+          </div>
+        );
+      })}
+      {type === "script" && <MultiScriptAttributeFields entities={entities} />}
+      <div className="asset-hint">Editing shared values on {entities.length} selected entities.</div>
     </div>
   );
 }
@@ -979,10 +1189,134 @@ function PrefabSection({ entityId }) {
   );
 }
 
+function MultiEntityInspector({ entities }) {
+  const [addOpen, setAddOpen] = useState(false);
+  const entityIds = entities.map((entity) => entity.id);
+  const liveEntities = entityIds.map((id) => engine.getEntity(id)).filter(Boolean);
+  const commonTypes = Object.keys(entities[0].components).filter(
+    (type) => entities.every((entity) => type in entity.components) && !getComponentClass(type)?.internal,
+  );
+  const flagValues = (key, fallback = true) => liveEntities.map((entity) => entity[key] ?? fallback);
+  const editorValues = liveEntities.map((entity) => entity.enabledInEditor !== false);
+  const gameValues = liveEntities.map((entity) => entity.enabledInGame !== false);
+  const viewOnlyValues = flagValues("viewOnly", false).map(Boolean);
+  const mixed = (values) => !values.every((value) => value === values[0]);
+  const executeForAll = (Command, value, label) => commandBus.execute(
+    new BatchCommand(entityIds.map((id) => new Command(id, value)), label),
+  );
+
+  const availableTypes = getComponentTypes()
+    .filter((type) => entities.some((entity) => !(type in entity.components)))
+    .filter((type) => {
+      const cls = getComponentClass(type);
+      return !cls?.internal && !cls?.importOnly && type !== "terrain";
+    })
+    .filter((type) => !type.startsWith("ui") || type === "uiscreen" || entities.every((entity) => isInsideUiScreen(entity.id)));
+  const componentRequires = { instancer: ["mesh", "model"], postprocess: ["camera"] };
+
+  return (
+    <div className="inspector-panel">
+      <div className="inspector-section multi-selection-summary">
+        <div className="section-header">{entities.length} Entities Selected</div>
+        <div className="field-row">
+          <span className="field-label">Name</span>
+          <input
+            className="text-field"
+            type="text"
+            placeholder="— Multiple —"
+            onBlur={(event) => {
+              const name = event.target.value.trim();
+              if (!name) return;
+              executeForAll(RenameEntityCommand, name, `Rename ${entities.length} entities`);
+              event.target.value = "";
+            }}
+            onKeyDown={(event) => event.key === "Enter" && event.currentTarget.blur()}
+          />
+        </div>
+        <div className="field-row">
+          <span className="field-label">View Only</span>
+          <MixedCheckbox
+            checked={viewOnlyValues[0]}
+            mixed={mixed(viewOnlyValues)}
+            onChange={(event) => executeForAll(SetEntityViewOnlyCommand, event.target.checked, `Set View Only on ${entities.length} entities`)}
+          />
+        </div>
+        <div className="field-row visibility-row">
+          <span className="field-label">Enabled</span>
+          <div className="visibility-toggles">
+            <label className="visibility-toggle">
+              <MixedCheckbox
+                checked={editorValues[0]}
+                mixed={mixed(editorValues)}
+                onChange={(event) => executeForAll(SetEntityEnabledInEditorCommand, event.target.checked, `Set editor visibility on ${entities.length} entities`)}
+              />
+              <span className="visibility-toggle-label">Editor</span>
+            </label>
+            <label className="visibility-toggle">
+              <MixedCheckbox
+                checked={gameValues[0]}
+                mixed={mixed(gameValues)}
+                onChange={(event) => executeForAll(SetEntityEnabledInGameCommand, event.target.checked, `Set game visibility on ${entities.length} entities`)}
+              />
+              <span className="visibility-toggle-label">Game</span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <MultiTransformSection entities={entities} />
+      {commonTypes.map((type) => <MultiComponentSection key={type} entities={entities} type={type} />)}
+      {!commonTypes.length && <div className="asset-hint">The selected entities have no components in common.</div>}
+
+      <div className="add-component-wrap">
+        <div className="dropdown-wrap">
+          <button className="toolbar-btn wide" disabled={!availableTypes.length} onClick={() => setAddOpen((value) => !value)}>
+            <Plus size={14} /> Add Component to Selection
+          </button>
+          {addOpen && (
+            <>
+              <div className="dropdown-overlay" onClick={() => setAddOpen(false)} />
+              <div className="dropdown-menu up">
+                {availableTypes.map((type) => {
+                  const requirements = componentRequires[type];
+                  const targets = entities.filter((entity) => !(type in entity.components));
+                  const missingRequirement = requirements && targets.some(
+                    (entity) => !requirements.some((required) => required in entity.components),
+                  );
+                  return (
+                    <button
+                      key={type}
+                      className="dropdown-item"
+                      disabled={missingRequirement}
+                      title={missingRequirement ? `Some selected entities are missing ${requirements.join(" or ")}` : undefined}
+                      onClick={() => {
+                        setAddOpen(false);
+                        commandBus.execute(new BatchCommand(
+                          targets.map((entity) => new AddComponentCommand(entity.id, type)),
+                          `Add ${getComponentClass(type)?.label ?? type} to ${targets.length} entities`,
+                        ));
+                      }}
+                    >
+                      {getComponentClass(type)?.label ?? type} ({targets.length})
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function InspectorPanel() {
-  const selectedId = useSelectionStore((s) => s.ids[0] ?? null);
+  const selectedIds = useSelectionStore((s) => s.ids);
+  const selectedId = selectedIds[0] ?? null;
   const assetPath = useSelectionStore((s) => s.assetPath);
-  const entity = useSceneStore((s) => (selectedId ? s.entities[selectedId] : null));
+  const entitiesById = useSceneStore((s) => s.entities);
+  const entities = selectedIds.map((id) => entitiesById[id]).filter(Boolean);
+  const entity = entities[0] ?? null;
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [addMenuUp, setAddMenuUp] = useState(false);
   const addButtonRef = useRef(null);
@@ -1024,6 +1358,7 @@ export function InspectorPanel() {
   if (!entity) {
     return <div className="inspector-panel empty">No entity selected</div>;
   }
+  if (entities.length > 1) return <MultiEntityInspector entities={entities} />;
 
   const availableTypes = getComponentTypes()
     .filter((t) => !(t in entity.components))

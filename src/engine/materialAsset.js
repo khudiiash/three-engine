@@ -425,6 +425,16 @@ export function applyMaterialDef(entry, def) {
 
         applyGraphMutations(material, result, wantVolume);
 
+        // The graph's `*Node` slots only exist once the (async) compile lands.
+        // Subscribers that *read* those slots rather than just re-adopting the
+        // instance — Terrain blends colorNode/roughnessNode/normalNode of each
+        // layer .mat into its own splat material — wired themselves up before
+        // this point and saw every slot null. Without this second notify they
+        // keep that stale wiring forever, so a full PBR .mat renders as its
+        // diffuse map alone.
+
+        notifyMaterial(entry.path);
+
       })
 
       .catch((err) => console.error(`Material shader graph: ${err.message}`));
@@ -530,6 +540,27 @@ export function syncMaterialRenderState(path, graph) {
 }
 
 
+
+/**
+ * Compiles a .mat's graph into raw `*Node` mutations for a caller that wants to
+ * blend them into its *own* material rather than use the shared instance.
+ *
+ * Terrain is the reason this exists. It can't just read the shared instance's
+ * `*Node` slots: those bake in the graph's own `uv()`, so every layer would
+ * sample at the terrain's raw UV and the layer's `tiling` would do nothing.
+ * Passing `uvNode` recompiles the same graph against the layer's tiled UV.
+ *
+ * Returns null when the .mat has no graph (a plain scalar material) — the
+ * caller should fall back to the instance's scalar color/roughness/metalness.
+ */
+export async function compileMaterialGraph(path, { uvNode = null } = {}) {
+  const entry = cache.get(assetKey(path));
+  const def = entry?.def;
+  if (!def?.shaderGraph) return null;
+  const graph = migrateGraph(migrateLegacyGraph(def.shaderGraph, def));
+  const result = await compileShaderGraph(graph, { uvNode });
+  return result?.mutations ?? null;
+}
 
 /** Editor hooks: read the cached def / push edits into the live shared material. */
 

@@ -14,6 +14,7 @@ import { resolveAssetUrl } from "../../engine/assetResolver.js";
 export class EnvironmentComponent extends Component {
   static type = "environment";
   static label = "Environment (HDRI)";
+  static tags = ["rendering", "lighting", "hdri", "skybox"];
   static defaults = {
     hdri: "",
     background: true,

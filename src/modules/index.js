@@ -6,6 +6,8 @@ import { terrainModule } from "./terrain/index.js";
 import { virtualGeometryModule } from "./virtual-geometry/index.js";
 import { postprocessingModule } from "./postprocessing/index.js";
 import { polyhavenModule } from "./polyhaven/index.js";
+import { ambientcgModule } from "./ambientcg/index.js";
+import { sketchfabModule } from "./sketchfab/index.js";
 
 /**
  * Built-in module catalog. Importing this file registers every definition;
@@ -22,5 +24,8 @@ registerModuleDefinition(terrainModule);
 registerModuleDefinition(virtualGeometryModule);
 registerModuleDefinition(postprocessingModule);
 registerModuleDefinition(polyhavenModule);
+registerModuleDefinition(ambientcgModule);
+registerModuleDefinition(sketchfabModule);
+registerModuleDefinition(giModule);
 
-export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule };
+export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, giModule };

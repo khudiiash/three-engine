@@ -1,5 +1,6 @@
 import * as THREE from "three/webgpu";
 import { loadAssetMeta } from "../../engine/assetResolver.js";
+import { EDITOR_LAYER } from "../../engine/editorLayers.js";
 import { buildClusterDAG, selectClusters } from "./clusterBuilder.js";
 
 /**
@@ -7,7 +8,7 @@ import { buildClusterDAG, selectClusters } from "./clusterBuilder.js";
  *
  * Unreal-style: virtual geometry is a property of the ASSET, not a component.
  * A model or geometry opts in via its sidecar meta (`<asset>.meta` →
- * `virtualGeometry: { enabled, pixelError, debugView }`, edited in the asset
+ * `virtualGeometry: { enabled, pixelError }`, edited in the asset
  * inspector). Whenever a Model component finishes loading such a model — any
  * entity, any scene — this system swaps each eligible mesh's geometry in
  * place: same mesh object, same material, same transforms, but the index
@@ -98,15 +99,25 @@ export function refreshVirtualGeometryAsset(path) {
 export const VIRTUAL_GEOMETRY_META_DEFAULTS = {
   enabled: false,
   pixelError: 1,
-  debugView: "off", // "off" | "triangles" | "clusters"
 };
 
-/** Normalizes stored meta (incl. the legacy `debugClusters` boolean). */
+/** Ignores retired per-asset debug settings while normalizing stored meta. */
 function resolveVgMeta(raw) {
   if (!raw) return null;
-  const vg = { ...VIRTUAL_GEOMETRY_META_DEFAULTS, ...raw };
-  if (raw.debugView == null && raw.debugClusters) vg.debugView = "clusters";
-  return vg;
+  return {
+    enabled: raw.enabled === true,
+    pixelError: raw.pixelError ?? VIRTUAL_GEOMETRY_META_DEFAULTS.pixelError,
+  };
+}
+
+// Debug visualization belongs to the editor viewport, not individual assets.
+// Retain the requested state for systems created after the viewport toggle.
+let debugTrianglesVisible = false;
+
+/** Editor hook: shows triangle-density coloring for every live VG mesh. */
+export function setVirtualGeometryDebugVisible(visible) {
+  debugTrianglesVisible = !!visible;
+  for (const system of activeSystems) system.setDebugVisible(debugTrianglesVisible);
 }
 
 /** Stable bright pseudo-random color from an id (UE-debug-view style). */
@@ -144,6 +155,7 @@ export class VirtualGeometrySystem {
     this.records = [];
     this.settings = new Map(); // path -> resolved virtualGeometry meta | null
     this.stats = { drawnTriangles: 0, totalTriangles: 0, drawnClusters: 0 };
+    this.debugVisible = debugTrianglesVisible;
     this._pruneNeeded = false;
     this._offModel = engine.on("model-loaded", (entity) => this.applyEntity(entity));
     this._offComponent = engine.on("component-changed", ({ entityId, componentType, key }) => {
@@ -158,6 +170,13 @@ export class VirtualGeometrySystem {
     activeSystems.add(this);
     // The module can be enabled after a scene (and its models) already loaded.
     for (const entity of engine.entities.values()) this.applyEntity(entity);
+  }
+
+  setDebugVisible(visible) {
+    visible = !!visible;
+    if (this.debugVisible === visible) return;
+    this.debugVisible = visible;
+    for (const r of this.records) r.hash = null;
   }
 
   dispose() {
@@ -276,7 +295,7 @@ export class VirtualGeometrySystem {
       return;
     }
     // Turned on / retuned: (re)apply to every entity using the asset. Hash
-    // reset picks up pixelError/debugView changes on already-virtual meshes.
+    // reset picks up pixelError changes on already-virtual meshes.
     let matched = 0;
     for (const r of this.records) {
       if (normPath(r.path) === np) {
@@ -294,7 +313,7 @@ export class VirtualGeometrySystem {
     }
     console.info(
       `[virtual-geometry] ${path}: enabled, pixelError=${vg.pixelError}, ` +
-        `debugView=${vg.debugView}, ${matched}/${this.records.length} mesh(es) matched`,
+        `${matched}/${this.records.length} mesh(es) matched`,
     );
   }
 
@@ -353,7 +372,7 @@ export class VirtualGeometrySystem {
       const em = r.mesh.matrixWorld.elements;
       mix(em[0]); mix(em[5]); mix(em[10]); mix(em[12]); mix(em[13]); mix(em[14]);
       mix(vg.pixelError);
-      mix(vg.debugView === "off" ? 0 : vg.debugView === "clusters" ? 1 : 2);
+      mix(this.debugVisible ? 1 : 0);
       if (h !== r.hash) {
         r.hash = h;
         this.#select(r, vg, k, isOrtho);
@@ -377,35 +396,28 @@ export class VirtualGeometrySystem {
     );
     r.drawn = count;
 
-    const debugOn = vg.debugView && vg.debugView !== "off";
-    if (debugOn) {
-      // Debug replaces the real surface: the main geometry draws nothing
-      // (no z-fighting), the colored triangles render as a child mesh.
-      r.geometry.setDrawRange(0, 0);
-      this.#updateDebug(r, vg.debugView, count, stats.drawnClusters);
+    r.index.clearUpdateRanges();
+    if (count > 0) r.index.addUpdateRange(0, count);
+    r.index.needsUpdate = true;
+    r.geometry.setDrawRange(0, count);
+
+    if (this.debugVisible) {
+      this.#updateDebug(r, count, stats.drawnClusters);
       r.debug.mesh.visible = true;
-    } else {
-      r.index.clearUpdateRanges();
-      if (count > 0) r.index.addUpdateRange(0, count);
-      r.index.needsUpdate = true;
-      r.geometry.setDrawRange(0, count);
-      if (r.debug) r.debug.mesh.visible = false;
-    }
+    } else if (r.debug) r.debug.mesh.visible = false;
   }
 
   /**
-   * Debug views, UE-style: unlit flat pseudo-random colors, stable frame to
-   * frame — "triangles" colors every triangle of the cut individually (so
-   * on-screen triangle density is directly visible; it grows near, shrinks
-   * far), "clusters" gives each ~128-triangle cluster one color (so cluster
-   * boundaries and LOD switches are visible).
+   * Editor debug view: unlit flat pseudo-random colors, stable frame to
+   * frame. Every triangle of the cut is colored individually, so on-screen
+   * triangle density is directly visible; it grows near and shrinks far.
    *
    * Buffers are position + uint8 color only (no normals — unlit), sized to
    * the CURRENT cut and grown geometrically on demand: a typical cut is far
    * smaller than full detail, so this stays tens of MB instead of the
    * hundreds that full-detail preallocation would cost per mesh.
    */
-  #updateDebug(r, view, indexCount, drawnClusters) {
+  #updateDebug(r, indexCount, drawnClusters) {
     if (!r.debug || r.debug.capacity < indexCount) {
       const capacity = Math.ceil((indexCount * 1.5) / 3) * 3;
       this.#dropDebug(r);
@@ -422,9 +434,15 @@ export class VirtualGeometrySystem {
       geometry.setAttribute("color", color);
       geometry.setDrawRange(0, 0);
       geometry.boundingSphere = r.geometry.boundingSphere.clone();
-      const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ vertexColors: true }));
+      const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+        vertexColors: true,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
+      }));
       mesh.userData.vgeoDebug = true;
       mesh.userData.entityId = r.mesh.userData.entityId;
+      mesh.layers.set(EDITOR_LAYER);
       mesh.castShadow = false;
       mesh.receiveShadow = false;
       r.mesh.add(mesh); // child ⇒ inherits transform, dies with the mesh
@@ -435,15 +453,13 @@ export class VirtualGeometrySystem {
     const positions = r._dbgPositions;
     const dp = r.debug.position.array;
     const dc = r.debug.color.array;
-    const perTriangle = view === "triangles";
     let vi = 0;
     for (let s = 0; s < drawnClusters; s++) {
       const ci = r.selClusters[s];
       const off = dag.clusterRanges[ci * 2], cnt = dag.clusterRanges[ci * 2 + 1];
-      if (!perTriangle) debugColor(ci, _rgb);
       for (let j = 0; j < cnt; j += 3) {
         // Global triangle id ⇒ a triangle keeps its color between frames.
-        if (perTriangle) debugColor((off + j) / 3, _rgb);
+        debugColor((off + j) / 3, _rgb);
         for (let e = 0; e < 3; e++) {
           const v = dag.indexData[off + j + e] * 3;
           const p3 = vi * 3;

@@ -1,6 +1,10 @@
 import { VirtualGeometrySystem } from "./VirtualGeometrySystem.js";
 
-export { refreshVirtualGeometryAsset, VIRTUAL_GEOMETRY_META_DEFAULTS } from "./VirtualGeometrySystem.js";
+export {
+  refreshVirtualGeometryAsset,
+  setVirtualGeometryDebugVisible,
+  VIRTUAL_GEOMETRY_META_DEFAULTS,
+} from "./VirtualGeometrySystem.js";
 
 /**
  * Virtual geometry module — Nanite-style cluster LOD for high-density static
@@ -19,6 +23,8 @@ export const virtualGeometryModule = {
   id: "virtual-geometry",
   name: "Virtual Geometry",
   version: "1.0.0",
+  category: "Optimization",
+  tags: ["lod", "mesh", "cluster", "nanite", "wasm", "rendering"],
   description:
     "Nanite-style cluster LOD: models opted in via their import settings render " +
     "with a triangle count that follows screen-space error instead of mesh density.",

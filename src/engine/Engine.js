@@ -27,10 +27,26 @@ export class Engine extends EventEmitter {
     this.scene = new THREE.Scene();
     this.renderer = null;
     this.camera = null; // active camera (editor camera or a CameraComponent's)
+    // Keep the CSS viewport size separate from the canvas backing-store size.
+    // A WebGPURenderer constructor reads canvas.width/height as its initial
+    // *logical* size. During a renderer rebuild the existing canvas attributes
+    // already include DPR, so failing to restore the CSS size would apply DPR
+    // twice (for example 3392 * 2 * 2 = 13568).
+    this._width = 0;
+    this._height = 0;
+    this._pixelRatio = globalThis.window?.devicePixelRatio ?? 1;
     this.entities = new Map(); // id -> Entity
     this.rootEntities = [];
     this.timer = new THREE.Timer();
     this.updateCallbacks = new Set();
+    // Callbacks fired after all update callbacks but BEFORE the main render,
+    // once per frame. Use these for passes that must see the frame's final
+    // transforms (post-physics, post-script) yet run ahead of the main draw —
+    // e.g. the GI deferred prepass, whose screen-space output the main render
+    // samples. Running such a pass inside a plain onUpdate risks executing
+    // before physics writes a body's new transform, which desyncs the pass
+    // from the main render (moving objects then shimmer).
+    this.preRenderCallbacks = new Set();
     // Callbacks fired after the main render. Use these for layered
     // effects that need to draw on top of the main scene (e.g. the
     // editor's camera-preview PIP), without the main render's
@@ -42,6 +58,29 @@ export class Engine extends EventEmitter {
     // True between start() and stop(); used by the renderer-rebuild path so
     // the animation loop re-attaches to a freshly-recreated renderer.
     this.loopActive = false;
+    // Bumped every time a renderer rebuild is requested. Each in-flight
+    // #rebuildRenderer captures the token at entry; if a newer rebuild
+    // superseded it while `init()` was awaiting, the older one aborts
+    // after init resolves instead of clobbering the new renderer with
+    // settings meant for a stale one. Without this, two back-to-back
+    // applySettings() calls (e.g. play→stop, which clears then re-applies
+    // settings in one tick) race: rebuild B disposes the renderer A is
+    // still awaiting init() on, then A wakes up and calls
+    // configureTextureAssetLoader(this.renderer) — pointing at B, which
+    // hasn't finished init() yet — and KTX2Loader's detectSupport throws
+    // "called before the backend is initialized".
+    this._rendererRebuildSeq = 0;
+    this._rendererRebuildInFlight = null;
+    // Dynamic-resolution state. `_drsScale` is the auto multiplier (0.5–1)
+    // applied ON TOP of settings.performance.renderScale when
+    // settings.performance.dynamicResolution is on. Driven each frame by
+    // #updateDynamicResolution from the measured GPU frame time.
+    this._drsScale = 1;
+    this._drsEmaMs = 0;
+    this._drsLastChange = 0;
+    // Tracks the active timestamp readback. Besides preventing stacked
+    // readbacks, renderer rebuilds await it before disposing mapped buffers.
+    this._gpuTimestampInFlight = null;
     this.modules = new Map(); // module id -> setup handle (see modules.js)
     // Optional per-camera render overrides (e.g. PostprocessComponent).
     // When the active camera's override is set, the engine defers its main
@@ -98,7 +137,7 @@ export class Engine extends EventEmitter {
   }
 
   /** Merges + applies a scene-settings patch; emits "settings-changed". */
-  applySettings(patch) {
+  async applySettings(patch) {
     const before = this.settings;
     this.settings = mergeSettings(before, patch ?? {});
     // Renderer-construction options (antialias / samples / transparent) are
@@ -111,7 +150,25 @@ export class Engine extends EventEmitter {
       rendererNeedsRebuild(before.renderer, this.settings.renderer)
     ) {
       const canvas = this.renderer.domElement;
+      // Wait for any in-flight rebuild before tearing down the renderer it
+      // created — otherwise we'd dispose() a renderer that's mid-init() and
+      // race its post-init wiring (configureTextureAssetLoader, etc.)
+      // against this rebuild's post-init wiring. Awaiting also serializes
+      // back-to-back applySettings() calls (e.g. play→stop triggers
+      // clear()→applySettings(DEFAULTS) then applySettings(snapshot) in one
+      // tick) so they don't fight over `this.renderer`.
+      if (this._rendererRebuildInFlight) {
+        try {
+          await this._rendererRebuildInFlight;
+        } catch {
+          // The in-flight rebuild already logged its own failure; swallow so
+          // this rebuild can still proceed.
+        }
+      }
       this.renderer.setAnimationLoop(null);
+      // Timestamp readback maps renderer-owned GPU buffers asynchronously.
+      // Wait so dispose() does not unmap a pending GPUBuffer.mapAsync call.
+      if (this._gpuTimestampInFlight) await this._gpuTimestampInFlight;
       this.renderer.dispose();
       this.renderer = null;
       this.rendererReady = false;
@@ -122,34 +179,73 @@ export class Engine extends EventEmitter {
       recreatedRenderer = true;
     }
     applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
+    // A manual render-scale change resizes the canvas backing store. Only
+    // re-apply when the value actually moved — renderer.setSize reallocates
+    // the swap chain, which we don't want on every unrelated settings drag.
+    const prevScale = before.performance?.renderScale ?? 1;
+    const nextScale = this.settings.performance?.renderScale ?? 1;
+    const prevDpr = before.performance?.maxDevicePixelRatio ?? 2;
+    const nextDpr = this.settings.performance?.maxDevicePixelRatio ?? 2;
+    if (!recreatedRenderer && (prevScale !== nextScale || prevDpr !== nextDpr)) {
+      this.#applyRendererSize();
+    }
     this.emit("settings-changed", this.settings);
     return recreatedRenderer;
   }
 
+  /**
+   * Effective resolution multiplier on the canvas backing store: the manual
+   * Scene Settings → Performance → Render Scale times the dynamic-resolution
+   * controller's current auto scale. 1 = native resolution.
+   */
+  get renderScale() {
+    const manual = this.settings.performance?.renderScale ?? 1;
+    const clamped = Number.isFinite(manual) ? Math.min(1, Math.max(0.25, manual)) : 1;
+    return clamped * this._drsScale;
+  }
+
   async #rebuildRenderer(canvas) {
-    try {
-      const opts = rendererConstructorOptions(this.settings);
-      this.renderer = new THREE.WebGPURenderer({ canvas, ...opts });
-      this.renderer.setPixelRatio(window.devicePixelRatio ?? 1);
-      await this.renderer.init();
-      configureTextureAssetLoader(this.renderer);
-      applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
-      this.rendererReady = true;
-      // If a render loop was running, restart it on the new renderer.
-      if (this.loopActive) this.renderer.setAnimationLoop(() => this.#tick());
-      this.emit("renderer-rebuilt");
-      // Lazy-loaded SSGI/SSR addon handles from the previous renderer are
-      // renderer-agnostic factories in r185, but invalidating them on a
-      // full renderer rebuild is a no-cost safety net against any addon
-      // that may cache backend-specific state internally.
+    // Capture the token + publish the in-flight promise so a newer
+    // applySettings() can await this one before tearing the renderer down.
+    const token = ++this._rendererRebuildSeq;
+    const work = (async () => {
       try {
-        const { resetLazyPostAddons } = await import("../modules/postprocessing/postGraph.js");
-        resetLazyPostAddons();
-      } catch {
-        // Postprocessing module not registered — fine, nothing to reset.
+        const opts = rendererConstructorOptions(this.settings);
+        this.renderer = new THREE.WebGPURenderer({ canvas, ...opts });
+        this.#applyRendererSize();
+        await this.renderer.init();
+        // Another rebuild started while we were awaiting init(). It owns
+        // `this.renderer` now and will run its own post-init wiring — skip
+        // ours so we don't run configureTextureAssetLoader / start the
+        // animation loop against a renderer that isn't ours yet.
+        if (token !== this._rendererRebuildSeq) return;
+        configureTextureAssetLoader(this.renderer);
+        applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
+        // Lazy-loaded SSGI/SSR addon handles from the previous renderer are
+        // renderer-agnostic factories in r185, but invalidating them on a
+        // full renderer rebuild is a no-cost safety net against any addon
+        // that may cache backend-specific state internally.
+        try {
+          const { resetLazyPostAddons } = await import("../modules/postprocessing/postGraph.js");
+          resetLazyPostAddons();
+        } catch {
+          // Postprocessing module not registered — fine, nothing to reset.
+        }
+        this.rendererReady = true;
+        // Notify renderer-owning consumers before the new animation loop can
+        // render. Pipelines and timestamp query sets belong to the old device.
+        this.emit("renderer-rebuilt");
+        if (this.loopActive) this.renderer.setAnimationLoop(() => this.#tick());
+      } catch (err) {
+        console.error("Renderer rebuild failed:", err);
       }
-    } catch (err) {
-      console.error("Renderer rebuild failed:", err);
+    })();
+    this._rendererRebuildInFlight = work;
+    try {
+      await work;
+    } finally {
+      // Only clear the in-flight slot if we're still the most recent one.
+      if (token === this._rendererRebuildSeq) this._rendererRebuildInFlight = null;
     }
   }
 
@@ -197,13 +293,26 @@ export class Engine extends EventEmitter {
     // Re-init (viewport rebuild / dev HMR): retire the old renderer first so
     // its still-running animation loop can't render through the new,
     // not-yet-initialized one.
+    if (this._rendererRebuildInFlight) {
+      // Wait for any pending applySettings-driven rebuild to finish before
+      // we tear the renderer down — same race as in applySettings().
+      try {
+        await this._rendererRebuildInFlight;
+      } catch {
+        // Already logged by the in-flight rebuild.
+      }
+    }
     if (this.renderer) {
       this.renderer.setAnimationLoop(null);
+      if (this._gpuTimestampInFlight) await this._gpuTimestampInFlight;
       this.renderer.dispose();
     }
     this.rendererReady = false;
+    // Mark this as a new rebuild generation so any stale #rebuildRenderer
+    // awaiting init() will notice and abort instead of clobbering us.
+    ++this._rendererRebuildSeq;
     this.renderer = new THREE.WebGPURenderer({ canvas, ...rendererConstructorOptions(this.settings) });
-    this.renderer.setPixelRatio(window.devicePixelRatio ?? 1);
+    this.#applyRendererSize();
     await this.renderer.init();
     configureTextureAssetLoader(this.renderer);
     // Renderer-side settings (tone mapping, shadows) couldn't apply earlier.
@@ -277,6 +386,10 @@ export class Engine extends EventEmitter {
     // rendererReady guards the re-init window (init() swaps the renderer
     // asynchronously; rendering before its backend resolves throws).
     if (this.camera && this.rendererReady) {
+      // Final-transform passes (e.g. GI deferred prepass) run here: after
+      // physics/scripts have written this frame's transforms, before the
+      // main draw that samples their output.
+      for (const fn of this.preRenderCallbacks) fn();
       // Wall-clock the GPU-submit portion of the frame so the stats
       // overlay's "GPU" reading reflects only the render call, not the
       // script tick. WebGPU dispatches the actual GPU work asynchronously,
@@ -303,6 +416,8 @@ export class Engine extends EventEmitter {
       // frame, before user code runs. See StatsSystem header for the
       // timing rationale.
       this.stats.recordRenderInfo();
+      this.#resolveGpuTimestamps();
+      this.#updateDynamicResolution();
     }
     // Post-render passes draw on top of the main render's pixels. The
     // WebGPU backend's render pass starts with `loadOp: Clear`, so any
@@ -312,10 +427,99 @@ export class Engine extends EventEmitter {
     for (const fn of this.postRenderCallbacks) fn();
   }
 
+  /**
+   * Reads back the WebGPU timestamp queries written during this frame's
+   * passes. `trackTimestamp: true` (set in rendererConstructorOptions) makes
+   * the backend bracket render and compute passes with GPU timestamps. Both
+   * pools are resolved because virtual geometry uses compute passes heavily.
+   * That's the number that actually moves when SSGI/SSR/volumes get cheaper
+   * — unlike the CPU-side submit time the stats previously showed.
+   *
+   * The resolve is async (a small GPU→CPU readback), so the reading shown is
+   * one-to-a-few frames stale — fine for a tuning readout. On adapters
+   * without the timestamp-query feature the backend no-ops and the value
+   * stays 0; StatsSystem falls back to submit time in that case.
+   */
+  #resolveGpuTimestamps() {
+    const renderer = this.renderer;
+    if (!renderer?.backend?.trackTimestamp || this._gpuTimestampInFlight) return;
+    const readback = Promise.all([
+      renderer.resolveTimestampsAsync("render"),
+      renderer.resolveTimestampsAsync("compute"),
+    ])
+      .then(([renderDuration, computeDuration]) => {
+        // Include virtual-geometry compute work in the GPU readout and drain
+        // its fixed-size query pool along with the render query pool.
+        const duration =
+          (typeof renderDuration === "number" ? renderDuration : 0) +
+          (typeof computeDuration === "number" ? computeDuration : 0);
+        if (duration > 0) this.stats.recordGpuMs(duration);
+      })
+      .catch(() => {
+        // Device loss can still reject a readback; keep it contained here.
+      })
+      .finally(() => {
+        if (this._gpuTimestampInFlight === readback) this._gpuTimestampInFlight = null;
+      });
+    this._gpuTimestampInFlight = readback;
+  }
+
+  /**
+   * Dynamic-resolution controller. When enabled, nudges `_drsScale` between
+   * 0.5 and 1 so the GPU frame time tracks `settings.performance.targetFps`.
+   *
+   * Control loop: EMA the GPU frame time (real timestamps when available,
+   * frame wall time otherwise), then at most twice a second either back off
+   * (over ~95% of budget → drop 0.1) or recover (under ~65% → climb 0.05).
+   * The asymmetric step + the 65–95% dead zone stops it oscillating around
+   * the budget. Each change reallocates the canvas backing store, which is
+   * why changes are rate-limited rather than continuous.
+   */
+  #updateDynamicResolution() {
+    const perf = this.settings.performance;
+    if (!perf?.dynamicResolution) {
+      if (this._drsScale !== 1) {
+        this._drsScale = 1;
+        this._drsEmaMs = 0;
+        this.#applyRendererSize();
+      }
+      return;
+    }
+    const budgetMs = 1000 / (perf.targetFps > 0 ? perf.targetFps : 60);
+    const r = this.stats.readout;
+    // Prefer real GPU time; a CPU-bound frame shouldn't drive resolution
+    // down (it wouldn't help). frameMs is the honest fallback when the
+    // adapter has no timestamp queries.
+    const signal = r.gpuMs > 0 ? r.gpuMs : r.frameMs;
+    if (!(signal > 0)) return;
+    this._drsEmaMs = this._drsEmaMs === 0 ? signal : 0.1 * signal + 0.9 * this._drsEmaMs;
+    const now = performance.now();
+    if (now - this._drsLastChange < 500) return;
+    let next = this._drsScale;
+    if (this._drsEmaMs > budgetMs * 0.95) next = Math.max(0.5, this._drsScale - 0.1);
+    else if (this._drsEmaMs < budgetMs * 0.65) next = Math.min(1, this._drsScale + 0.05);
+    if (Math.abs(next - this._drsScale) > 1e-3) {
+      this._drsScale = next;
+      this._drsLastChange = now;
+      this.#applyRendererSize();
+    }
+  }
+
   /** Register a per-frame callback; returns an unsubscribe function. */
   onUpdate(fn) {
     this.updateCallbacks.add(fn);
     return () => this.updateCallbacks.delete(fn);
+  }
+
+  /**
+   * Register a callback that fires after all update callbacks but before the
+   * main render each frame. Use for passes that must see the frame's final
+   * transforms yet produce output the main render consumes (e.g. the GI
+   * deferred prepass). Returns an unsubscribe function.
+   */
+  onPreRender(fn) {
+    this.preRenderCallbacks.add(fn);
+    return () => this.preRenderCallbacks.delete(fn);
   }
 
   /**
@@ -361,9 +565,48 @@ export class Engine extends EventEmitter {
     return null;
   }
 
+  /** Sets the desired DPR; the actual DPR may be lowered to fit GPU limits. */
+  setPixelRatio(pixelRatio) {
+    const next = Number.isFinite(pixelRatio) && pixelRatio > 0 ? pixelRatio : 1;
+    this._pixelRatio = next;
+    if (this.renderer) this.#applyRendererSize();
+  }
+
+  #applyRendererSize() {
+    if (!this.renderer) return;
+
+    const width = this._width;
+    const height = this._height;
+    // Render scale folds into the pixel ratio: the canvas keeps its CSS
+    // size while the backing store shrinks, and the browser upscales
+    // bilinearly. This scales EVERY pass (scene, SSGI/SSR offscreen
+    // targets, post quad) in one place — the same lever console games
+    // call "resolution scale".
+    const configuredDpr = this.settings.performance?.maxDevicePixelRatio ?? 2;
+    const maxDpr = Number.isFinite(configuredDpr)
+      ? Math.min(4, Math.max(0.5, configuredDpr))
+      : 2;
+    let pixelRatio = Math.min(this._pixelRatio, maxDpr) * this.renderScale;
+
+    // WebGPU exposes the effective device limit after init. Before init, use
+    // WebGPU's guaranteed default limit so a rebuild can never create an
+    // invalid canvas/MSAA attachment on the first frame.
+    const deviceLimit = this.renderer.backend?.device?.limits?.maxTextureDimension2D;
+    const maxDimension = Number.isFinite(deviceLimit) ? deviceLimit : 8192;
+    if (width > 0 && height > 0) {
+      pixelRatio = Math.min(pixelRatio, maxDimension / width, maxDimension / height);
+    }
+
+    this.renderer.setPixelRatio(Math.max(pixelRatio, Number.EPSILON));
+    if (width > 0 && height > 0) this.renderer.setSize(width, height, false);
+  }
+
   setSize(width, height) {
-    if (!this.renderer || width === 0 || height === 0) return;
-    this.renderer.setSize(width, height, false);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+    this._width = width;
+    this._height = height;
+    if (!this.renderer) return;
+    this.#applyRendererSize();
     if (this.camera?.isPerspectiveCamera) {
       this.camera.aspect = width / height;
       this.camera.updateProjectionMatrix();
@@ -432,16 +675,16 @@ export class Engine extends EventEmitter {
     return this.entities.get(id);
   }
 
-  clear() {
+  clear({ resetSettings = true } = {}) {
     for (const entity of [...this.rootEntities]) this.destroyEntity(entity);
     this.sceneName = "Untitled";
-    this.applySettings(structuredClone(SCENE_SETTINGS_DEFAULTS));
+    if (resetSettings) this.applySettings(structuredClone(SCENE_SETTINGS_DEFAULTS));
     this.emit("hierarchy-changed");
   }
 
   dispose() {
     this.stop();
-    this.clear();
+    this.clear({ resetSettings: false });
     this._inputTickUnsub?.();
     this._inputTickUnsub = null;
     this.input.detach();
@@ -449,6 +692,11 @@ export class Engine extends EventEmitter {
     this.stats.dispose();
     this.renderOverrides.clear();
     this.rendererReady = false;
+    // Bump the rebuild token so any in-flight #rebuildRenderer awaiting
+    // init() notices its renderer is gone and bails before it tries to
+    // configure the (now-null) renderer.
+    ++this._rendererRebuildSeq;
+    this._rendererRebuildInFlight = null;
     this.renderer?.dispose();
     this.renderer = null;
   }

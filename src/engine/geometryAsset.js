@@ -43,6 +43,13 @@ export function geometryFromAsset(definition) {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geometry.setIndex(indices);
+  if (definition.edges?.length) {
+    const edges = finiteArray(definition.edges, 2, "edges");
+    if (edges.some((i) => !Number.isInteger(i) || i < 0 || i >= positions.length / 3)) {
+      throw new Error("Geometry edge indices are out of range");
+    }
+    geometry.userData.editableEdges = Array.from({ length: edges.length / 2 }, (_, index) => edges.slice(index * 2, index * 2 + 2));
+  }
   if (definition.uvs?.length === (positions.length / 3) * 2) {
     geometry.setAttribute("uv", new THREE.Float32BufferAttribute(finiteArray(definition.uvs, 2, "uvs"), 2));
   }

@@ -76,6 +76,15 @@ export class StatsSystem {
       cpuLoadPct: 0,
       renderMs: 0,
       gpuLoadPct: 0,
+      // Real on-GPU frame time from WebGPU timestamp queries (0 when the
+      // adapter lacks the feature). Recorded asynchronously by
+      // Engine.#resolveGpuTimestamps, so it's a frame or two stale — fine
+      // for tuning. When > 0 it drives gpuLoadPct instead of renderMs.
+      gpuMs: 0,
+      // Effective canvas resolution multiplier (manual render scale ×
+      // dynamic-resolution auto scale). Surfaced so the overlay can show
+      // when the frame is being rendered below native res.
+      renderScale: 1,
       jsHeapBytes: null,
       drawCalls: 0,
       triangles: 0,
@@ -115,6 +124,16 @@ export class StatsSystem {
   }
 
   /**
+   * Real GPU frame time from resolved WebGPU timestamp queries. Lightly
+   * smoothed (same EMA constant as FPS) because per-pass timestamps are
+   * noisy frame-to-frame even on a static scene.
+   */
+  recordGpuMs(ms) {
+    const prev = this.readout.gpuMs;
+    this.readout.gpuMs = prev === 0 ? ms : FPS_EMA_ALPHA * ms + (1 - FPS_EMA_ALPHA) * prev;
+  }
+
+  /**
    * Snapshot three's per-frame renderer metrics into the readout. Called
    * by Engine.#tick() AFTER `renderer.render()` returns, so the values
    * are populated with the just-rendered frame's data. Reading them
@@ -135,6 +154,7 @@ export class StatsSystem {
     // targets and other implicit GPU resources, but it's the only number
     // the renderer exposes without a custom bridge.
     this.readout.textureMem = mem?.texturesSize ?? 0;
+    this.readout.renderScale = this.engine.renderScale ?? 1;
   }
 
   _tick() {
@@ -169,7 +189,11 @@ export class StatsSystem {
     // beyond is still "100%+" — the overlay shows the underlying ms
     // value next to the percent for diagnostics.
     this.readout.cpuLoadPct = clampPct((this.readout.frameMs / FRAME_BUDGET_MS) * 100);
-    this.readout.gpuLoadPct = clampPct((this.readout.renderMs / FRAME_BUDGET_MS) * 100);
+    // Prefer the real GPU timestamp reading when available; the CPU-side
+    // submit time (renderMs) badly understates async GPU work like SSGI's
+    // offscreen passes or volume raymarching.
+    const gpuSignalMs = this.readout.gpuMs > 0 ? this.readout.gpuMs : this.readout.renderMs;
+    this.readout.gpuLoadPct = clampPct((gpuSignalMs / FRAME_BUDGET_MS) * 100);
 
     // Chromium-only. Other hosts (Firefox, Safari, Tauri-on-Windows-older-
     // WebView2, etc.) leave the field at null and the UI shows "—".

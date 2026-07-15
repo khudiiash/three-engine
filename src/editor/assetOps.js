@@ -1,6 +1,7 @@
 import { useProjectStore } from "./store/projectStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import { syncScriptClassNameAfterRename } from "./scriptClassSync.js";
+import { confirm } from "@tauri-apps/plugin-dialog";
 
 /**
  * Filesystem operations behind the Assets panel (create / rename / move /
@@ -53,15 +54,23 @@ export async function createFolder() {
 export async function deleteEntries(entries) {
   const list = entries.filter(Boolean);
   if (!list.length) return;
-  const { confirm } = await import("@tauri-apps/plugin-dialog");
   const message =
     list.length === 1
       ? `Delete "${list[0].name}"${list[0].is_dir ? " and everything inside it" : ""}? This can't be undone.`
       : `Delete ${list.length} items? Folders are deleted with everything inside them. This can't be undone.`;
-  const ok = await confirm(message, {
-    title: list.length === 1 ? "Delete asset" : "Delete assets",
-    kind: "warning",
-  });
+  let ok = false;
+  try {
+    ok = await confirm(message, {
+      title: list.length === 1 ? "Delete asset" : "Delete assets",
+      kind: "warning",
+    });
+  } catch (err) {
+    // Browser-based development has no native dialog host. Keep asset
+    // deletion usable there and avoid turning a dialog bootstrap failure
+    // into an unhandled rejection.
+    console.warn(`Native delete confirmation unavailable: ${err}`);
+    ok = window.confirm(message);
+  }
   if (!ok) return;
 
   const deleted = [];

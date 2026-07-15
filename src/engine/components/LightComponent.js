@@ -2,6 +2,17 @@ import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
 
 const SHADOW_TYPE_OPTIONS = ["BasicShadowMap", "PCFShadowMap", "PCFSoftShadowMap", "VSMShadowMap"];
+const _ownerWorld = new THREE.Matrix4();
+const _inverseOwnerWorld = new THREE.Matrix4();
+const _worldRotation = new THREE.Quaternion();
+const _direction = new THREE.Vector3();
+const _lightWorld = new THREE.Vector3();
+const _targetWorld = new THREE.Vector3();
+const _cameraWorld = new THREE.Vector3();
+const _shadowCentre = new THREE.Vector3();
+const _shadowRight = new THREE.Vector3();
+const _shadowUp = new THREE.Vector3();
+const _worldUp = new THREE.Vector3(0, 1, 0);
 
 export class LightComponent extends Component {
   static type = "light";
@@ -27,6 +38,9 @@ export class LightComponent extends Component {
     shadowCamFar: 100,
     shadowCamSize: 20, // orthographic half-extent (left/right/top/bottom = ±size)
     shadowCamFov: 90, // point-light cube: face FOV in degrees
+    // Centre directional shadow coverage on the active camera without
+    // inheriting that camera's rotation.
+    shadowFollowCamera: false,
   };
   // Schema entries with `showIf` are auto-filtered by the Inspector; see
   // ComponentSection. `section` is just a label prefix in the inspector.
@@ -50,6 +64,7 @@ export class LightComponent extends Component {
     { key: "shadowCamNear", label: "Cam Near", type: "number", min: 0, step: 0.1, showIf: (p) => (p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow, section: "Shadow" },
     { key: "shadowCamFar", label: "Cam Far", type: "number", min: 0, step: 1, showIf: (p) => (p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow, section: "Shadow" },
     { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => (p.kind === "directional" || p.kind === "spot") && p.castShadow, section: "Shadow" },
+    { key: "shadowFollowCamera", label: "Follow Camera", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow, section: "Shadow" },
     { key: "shadowCamFov", label: "Face FOV°", type: "number", min: 1, max: 179, step: 1, showIf: (p) => p.kind === "point" && p.castShadow, section: "Shadow" },
   ];
 
@@ -58,6 +73,8 @@ export class LightComponent extends Component {
   }
 
   onDetach() {
+    this.unsubPreRender?.();
+    this.unsubPreRender = null;
     if (!this.light) return;
     if (this.light.target) this.entity.object3D.remove(this.light.target);
     this.entity.object3D.remove(this.light);
@@ -159,8 +176,58 @@ export class LightComponent extends Component {
       this.light.target.position.set(0, 0, -1);
       this.entity.object3D.add(this.light.target);
     }
+    // Resolve after scripts and physics have finalized this frame's camera
+    // and entity transforms. This also makes translation and non-uniform
+    // parent scale incapable of changing a directional light's angle.
+    if (this.light.isDirectionalLight) {
+      this.unsubPreRender = this.entity.engine.onPreRender(() => this.#syncDirectionalTransform());
+      this.#syncDirectionalTransform();
+    }
     // Honour the enabled flag at attach time.
     this.light.visible = this._enabled;
+  }
+
+  #syncDirectionalTransform() {
+    if (!this.light?.isDirectionalLight || !this.light.target) return;
+
+    const owner = this.entity.object3D;
+    owner.updateWorldMatrix(true, false);
+    _ownerWorld.copy(owner.matrixWorld);
+    _inverseOwnerWorld.copy(_ownerWorld).invert();
+    owner.getWorldQuaternion(_worldRotation);
+    _direction.set(0, 0, -1).applyQuaternion(_worldRotation).normalize();
+
+    if (this.props.shadowFollowCamera && this.entity.engine.camera) {
+      this.entity.engine.camera.getWorldPosition(_cameraWorld);
+      _shadowCentre.copy(_cameraWorld);
+      // Stabilize the orthographic projection: snap its lateral origin to
+      // whole shadow-map texels so tiny camera movements do not make every
+      // shadow edge crawl across the texture.
+      _shadowRight.crossVectors(_direction, _worldUp);
+      if (_shadowRight.lengthSq() < 1e-8) _shadowRight.set(1, 0, 0);
+      else _shadowRight.normalize();
+      _shadowUp.crossVectors(_shadowRight, _direction).normalize();
+      const worldUnits = this.props.shadowCamSize * 2;
+      const texelX = worldUnits / Math.max(1, this.props.shadowMapWidth);
+      const texelY = worldUnits / Math.max(1, this.props.shadowMapHeight);
+      const projectedX = _shadowCentre.dot(_shadowRight);
+      const projectedY = _shadowCentre.dot(_shadowUp);
+      _shadowCentre.addScaledVector(_shadowRight, Math.round(projectedX / texelX) * texelX - projectedX);
+      _shadowCentre.addScaledVector(_shadowUp, Math.round(projectedY / texelY) * texelY - projectedY);
+      // The orthographic shadow camera sees only forward along the light
+      // direction. Put the view camera midway through its depth interval so
+      // nearby casters are retained on both sides of the viewer.
+      const depthCentre = (this.props.shadowCamNear + this.props.shadowCamFar) * 0.5;
+      _lightWorld.copy(_shadowCentre).addScaledVector(_direction, -depthCentre);
+    } else {
+      _lightWorld.setFromMatrixPosition(_ownerWorld);
+    }
+
+    _targetWorld.copy(_lightWorld).add(_direction);
+    this.light.position.copy(_lightWorld).applyMatrix4(_inverseOwnerWorld);
+    this.light.target.position.copy(_targetWorld).applyMatrix4(_inverseOwnerWorld);
+    this.light.updateMatrix();
+    this.light.target.updateMatrix();
   }
 
   // Map shadow-type name → three.js constant. Built lazily and reused.

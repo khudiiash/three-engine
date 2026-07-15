@@ -33,6 +33,13 @@ export function renderNodeThumb(tslNode, target) {
     try {
       const s = await ensure();
       s.material.colorNode = vec4(vec3(tslNode), 1);
+      // Every thumb reuses this one material with a different colorNode, and
+      // `needsUpdate` does NOT evict three's cached node program — the next
+      // render would happily reuse the previous node's compiled shader, so a
+      // thumbnail shows a stale (or another node's) image. Disposing forces the
+      // program to be rebuilt against the colorNode we just assigned. Thumbs
+      // are rare and 64×64, so the recompile is not worth optimizing around.
+      s.material.dispose();
       s.material.needsUpdate = true;
       await s.renderer.renderAsync(s.scene, s.camera);
       const ctx = target.getContext("2d");

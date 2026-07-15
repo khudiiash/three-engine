@@ -1,6 +1,7 @@
 import { prefabRegistry } from "./prefab/registry.js";
 import { instantiatePrefabNode } from "./prefab/expand.js";
 import { instanceNodeOf } from "./prefab/sync.js";
+import { SCENE_SETTINGS_DEFAULTS } from "./sceneSettings.js";
 
 const SCENE_VERSION = 1;
 
@@ -65,13 +66,19 @@ export function instantiateEntity(engine, data, parent) {
 }
 
 /** Replaces the current scene contents with the serialized scene. */
-export function deserializeScene(engine, json) {
+export async function deserializeScene(engine, json) {
   if (json.version !== SCENE_VERSION) {
     throw new Error(`Unsupported scene version ${json.version}`);
   }
-  engine.clear(); // resets settings to defaults
+  // Do not reset renderer settings to defaults only to restore the scene's
+  // settings immediately afterwards. Besides doing two expensive rebuilds,
+  // that allowed components to attach to the temporary renderer between the
+  // two async initializations. Renderer-owned objects (notably post-process
+  // pipelines) then retained a disposed backend and rendered black on the
+  // next Play. Apply and await the final settings before attaching anything.
+  engine.clear({ resetSettings: false });
   engine.sceneName = json.name ?? "Untitled";
-  if (json.settings) engine.applySettings(json.settings);
+  await engine.applySettings(json.settings ?? structuredClone(SCENE_SETTINGS_DEFAULTS));
   // Prefabs must be in the registry before any instance node is expanded.
   for (const def of json.prefabs ?? []) {
     if (def?.guid) prefabRegistry.register(def, def.path ?? null);

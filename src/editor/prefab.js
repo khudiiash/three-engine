@@ -297,7 +297,7 @@ export async function exitPrefabMode({ save = true } = {}) {
 
   engine.clear();
   if (backup) {
-    deserializeScene(engine, backup.json);
+    await deserializeScene(engine, backup.json);
     engine.sceneName = backup.name;
   }
   commandBus.clearHistory();

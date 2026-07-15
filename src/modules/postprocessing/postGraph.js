@@ -43,6 +43,14 @@ const num = (key, label, def, extra = {}) => ({ kind: "hot", key, label, type: "
 const sel = (key, label, def, options) => ({ kind: "struct", key, label, type: "select", default: def, options });
 const bool = (key, label, def) => ({ kind: "struct", key, label, type: "boolean", default: def });
 
+// Per-effect resolution scale. Structural (not hot) because it resizes the
+// addon's offscreen render target — a real pipeline change, not a uniform.
+// String options because the select control round-trips strings; builders
+// parse with parseFloat. Screen-space GI/reflections/glow are low-frequency
+// signals, so half or quarter res is usually indistinguishable after the
+// upsample+denoise — and costs 1/4 or 1/16 of the fill.
+const resScale = (def = "1") => sel("resolutionScale", "Resolution", def, ["0.25", "0.5", "0.75", "1"]);
+
 // ---------------------------------------------------------------------------
 // Node registry
 // ---------------------------------------------------------------------------
@@ -93,6 +101,7 @@ export const PP_NODE_TYPES = {
     // assigns it directly. Defaults match the addon's own.
     params: [
       // --- Quality / sampling ---
+      resScale("1"),
       num("sliceCount", "Slice Count", 2, { min: 1, max: 4, step: 1 }),
       num("stepCount", "Step Count", 8, { min: 1, max: 32, step: 1 }),
       num("radius", "Radius", 12, { min: 1, max: 25, step: 0.5 }),
@@ -119,6 +128,7 @@ export const PP_NODE_TYPES = {
     ],
     outputs: [{ key: "out", kind: "vec4" }],
     params: [
+      resScale("1"),
       bool("stochastic", "Stochastic", false),
       num("intensity", "Intensity", 1.0, { min: 0, max: 4, step: 0.05 }),
       bool("reflectNonMetals", "Reflect Non-metals", false),
@@ -364,6 +374,9 @@ export const PP_NODE_TYPES = {
     inputs: [{ key: "color", kind: "vec4" }],
     outputs: [{ key: "out", kind: "vec4" }],
     params: [
+      // BloomNode's own internal default is 0.5 — the blur chain rarely
+      // needs full res since the result is a soft glow by definition.
+      resScale("0.5"),
       num("strength", "Strength", 1.0, { min: 0, max: 3, step: 0.01 }),
       num("radius", "Radius", 0.0, { min: 0, max: 1, step: 0.01 }),
       // Three's BloomNode default is 0 (every pixel contributes). A higher
@@ -386,7 +399,12 @@ export const PP_NODE_TYPES = {
       { key: "depth", kind: "float" },
     ],
     outputs: [{ key: "out", kind: "vec4" }],
-    params: [num("density", "Density", 0.7, { min: 0, max: 1, step: 0.005 })],
+    params: [
+      // GodraysNode's internal default is 0.5; radial blur is even more
+      // forgiving of low res than bloom.
+      resScale("0.5"),
+      num("density", "Density", 0.7, { min: 0, max: 1, step: 0.005 }),
+    ],
   },
   depthOfField: {
     label: "Depth of Field",
@@ -808,6 +826,9 @@ function buildNode(type, props, ins, ctx) {
   if (type === "input" || type === "output") return null;
 
   const P = { ...nodeDefaults(type), ...props };
+  // Shared reader for the structural `resolutionScale` select ("0.25"…"1"
+  // strings from the panel dropdown). Nodes without the param get 1.
+  const resolutionScale = Math.min(1, Math.max(0.1, parseFloat(P.resolutionScale) || 1));
   switch (type) {
 
     // --- GI / Reflections ---
@@ -849,6 +870,22 @@ function buildNode(type, props, ins, ctx) {
       ssgiNode.useLinearThickness.value = P.useLinearThickness;
       ssgiNode.useScreenSpaceSampling.value = P.useScreenSpaceSampling;
       ssgiNode.useTemporalFiltering = P.useTemporalFiltering;
+      // SSGINode has no resolutionScale property (unlike SSRNode), but its
+      // updateBefore path sizes the GI render target by calling
+      // `this.setSize(drawingBufferWidth, drawingBufferHeight)` every
+      // frame. Wrapping the instance's setSize scales the offscreen GI/AO
+      // targets while the beauty pass stays full res — GI is low-frequency,
+      // so half res reads nearly identically after the temporal filter but
+      // costs a quarter of the (sliceCount × stepCount) fill. The wrapper
+      // is per-instance and rebuilt on every compile, so no global state.
+      if (resolutionScale < 1 && typeof ssgiNode.setSize === "function") {
+        const baseSetSize = ssgiNode.setSize.bind(ssgiNode);
+        ssgiNode.setSize = (w, h) =>
+          baseSetSize(
+            Math.max(1, Math.round(w * resolutionScale)),
+            Math.max(1, Math.round(h * resolutionScale)),
+          );
+      }
       // SSGINode is a TempNode whose `setup()` runs the GI/AO shaders
       // against an offscreen render target (`_ssgiRenderTarget`) and
       // exposes its results as `getAONode()` (vec4 sampled from the AO
@@ -934,6 +971,10 @@ function buildNode(type, props, ins, ctx) {
         stochastic: P.stochastic,
         reflectNonMetals: P.reflectNonMetals,
       });
+      // SSRNode exposes resolutionScale as a plain JS property read in its
+      // setSize (SSRNode.js:652) — the ray-march target shrinks while the
+      // composite stays full res.
+      ssrNode.resolutionScale = resolutionScale;
       return TSL.mix(beauty, ssrNode, TSL.float(P.intensity));
     }
     case "denoise": {
@@ -1176,6 +1217,7 @@ function buildNode(type, props, ins, ctx) {
       if (node.strength?.value !== undefined) node.strength.value = P.strength;
       if (node.radius?.value !== undefined) node.radius.value = P.radius;
       if (node.threshold?.value !== undefined) node.threshold.value = P.threshold;
+      node.setResolutionScale?.(resolutionScale);
       // BloomNode returns only the blurred contribution. Composite it over
       // the original color so the scene remains sharp outside the glow.
       if (ctx.temps?.add) ctx.temps.add(node);
@@ -1191,6 +1233,8 @@ function buildNode(type, props, ins, ctx) {
       // source is resolved from the scene's enabled shadow-casting lights.
       const node = fn(depth, ctx.camera, light);
       if (node.density?.value !== undefined) node.density.value = P.density;
+      // Plain JS property, read by GodraysNode.setSize (GodraysNode.js:258).
+      node.resolutionScale = resolutionScale;
       if (ctx.temps?.add) ctx.temps.add(node);
       if (typeof ctx.depthAwareBlend === "function" && typeof color.sample === "function") {
         return ctx.depthAwareBlend(color, node, depth, ctx.camera);

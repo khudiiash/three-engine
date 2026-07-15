@@ -9,23 +9,21 @@ let basisLoaderPromise = null;
 let basisCompressionEnabled = false;
 
 // A broken/unsupported worker or GPU transcode can leave KTX2Loader's promise
-// pending forever without rejecting. Shader-graph compilation waits for every
-// referenced texture, so one such task leaves the material permanently white
-// and subsequent graph edits appear to do nothing. The editable source image
-// is always retained specifically as a safe fallback; do not wait forever
-// before using it.
+// pending forever without rejecting (three's WorkerPool never listens for the
+// worker's `error` event, so a worker that dies at startup simply never
+// replies). Shader-graph compilation waits for every referenced texture, so one
+// such task leaves the material permanently white. The editable source image is
+// always retained specifically as a safe fallback; do not wait forever.
 //
-// The 30s budget is generous on purpose: KTX2 transcoding spawns a worker
-// that on first run JIT-compiles the Basis Universal WASM, which on some
-// hardware takes well over 5s. The previous 5s default produced a flood of
-// false-positive fallback warnings on cold startup. Once the worker is warm
-// (within the same editor session) subsequent transcodes are sub-second.
-const BASIS_LOAD_TIMEOUT_MS = 30000;
+// A warm worker transcodes in well under a second, so anything past a few
+// seconds is a broken worker, not a slow one — don't budget for the hang.
+const BASIS_LOAD_TIMEOUT_MS = 5000;
 
-// One-time summary so a flood of slow transcodes doesn't drown the console.
-// We surface the first timeout via a normal `console.info` (the source PNG
-// fallback already covers it — the user just gets to know it happened).
-let basisTimeoutNotified = false;
+// A hung/broken transcoder fails the same way for every texture. Without this
+// latch each one independently burns the full timeout, turning a single fault
+// into minutes of white geometry on startup. First failure disables Basis for
+// the session; the source images load in ~400ms.
+let basisDisabledForSession = false;
 
 async function loadBasisWithTimeout(loader, url) {
   let timer = null;
@@ -65,9 +63,38 @@ export function configureTextureAssetLoader(nextRenderer) {
 async function getBasisLoader() {
   if (!textureRenderer) return null;
   if (!basisLoaderPromise) {
-    basisLoaderPromise = import("three/addons/loaders/KTX2Loader.js").then(({ KTX2Loader }) => {
-      basisLoader = new KTX2Loader().detectSupport(textureRenderer);
-      return basisLoader;
+    basisLoaderPromise = import("three/addons/loaders/KTX2Loader.js").then(async ({ KTX2Loader }) => {
+      // The transcoder binaries live in `public/basis/` (copied from three's
+      // libs), exactly like the Draco decoder — and the path is RELATIVE for
+      // the same reason: it resolves against the document URL, so an exported
+      // game served from a subpath still finds them.
+      //
+      // Setting this explicitly is NOT optional. Left empty, KTX2Loader
+      // resolves the transcoder via `new URL('../libs/basis/...',
+      // import.meta.url)`. Vite pre-bundles KTX2Loader into
+      // `/node_modules/.vite/deps/`, so that relative URL points at a path that
+      // does not exist — and the dev server's SPA fallback answers it with
+      // `index.html` and a 200. FileLoader sees success, the worker gets built
+      // with HTML as its source, dies on `<!doctype html>`, and (because
+      // WorkerPool ignores worker errors) never replies at all. Every texture
+      // then hangs until the timeout below. See git history for the 20s
+      // white-geometry startup this caused.
+      const loader = new KTX2Loader().setTranscoderPath("basis/").detectSupport(textureRenderer);
+      await loader.init();
+
+      // WorkerPool has no 'error' handling, so without this a broken worker is
+      // completely silent. Keep the failure loud.
+      const createWorker = loader.workerPool.workerCreator;
+      loader.workerPool.setWorkerCreator(() => {
+        const worker = createWorker();
+        worker.addEventListener("error", (e) =>
+          console.error(`Basis transcode worker failed: ${e.message} (${e.filename}:${e.lineno})`),
+        );
+        return worker;
+      });
+
+      basisLoader = loader;
+      return loader;
     });
   }
   return basisLoaderPromise;
@@ -82,27 +109,21 @@ export async function loadTextureAsset(path, { colorSpace = null } = {}) {
   const meta = await loadAssetMeta(`${path}.meta`);
   let texture = null;
 
-  if (basisCompressionEnabled && meta?.basis?.enabled) {
+  if (basisCompressionEnabled && meta?.basis?.enabled && !basisDisabledForSession) {
     try {
       const loader = await getBasisLoader();
       if (loader) {
-        texture = await loadBasisWithTimeout(
-          loader,
-          await resolveAssetUrl(`${path}.basis`),
-        );
+        texture = await loadBasisWithTimeout(loader, await resolveAssetUrl(`${path}.basis`));
       }
     } catch (err) {
-      // The timeout / transcode failure falls back to the source PNG below,
-      // which is always available — no need for the user to act. Demote the
-      // log to a one-shot `info` so a cold-start transcode storm doesn't
-      // bury real warnings from their scene.
-      if (!basisTimeoutNotified) {
-        basisTimeoutNotified = true;
-        console.info(
-          `Basis transcoding is slow on this machine; falling back to source PNGs ` +
-            `for compressed textures. First failure: "${path}" — ${err.message ?? err}`,
-        );
-      }
+      // The source image is always retained, so this is recoverable — but a
+      // transcoder that fails once fails for everything, so stop paying the
+      // timeout per texture and take the fallback for the rest of the session.
+      basisDisabledForSession = true;
+      console.warn(
+        `Basis transcoding failed; using source images for the rest of this session. ` +
+          `First failure: "${path}" — ${err.message ?? err}`,
+      );
     }
   }
 

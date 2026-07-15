@@ -14,6 +14,7 @@ import { newScene, openScene, saveScene } from "./sceneIO.js";
 import { useProjectStore } from "./store/projectStore.js";
 import { openPanel, resetLayout } from "./EditorShell.jsx";
 import { describeBinding, getBinding, visibilityActions } from "./keybindings.js";
+import { ProcessingIndicator } from "./components/ProcessingIndicator.jsx";
 
 export function MenuBar() {
   const [openMenu, setOpenMenu] = useState(null);
@@ -107,7 +108,6 @@ export function MenuBar() {
       { separator: true },
       { label: "Shader Graph", action: () => openPanel("shaderGraph") },
       { label: "Particles", action: () => openPanel("particles") },
-      { label: "Material", action: () => openPanel("material") },
       { label: "Animator", action: () => openPanel("animator") },
       { separator: true },
       { label: "Scene Settings", action: () => openPanel("sceneSettings") },
@@ -115,6 +115,8 @@ export function MenuBar() {
       { label: "Modules", action: () => openPanel("modules") },
       { label: "Input", action: () => openPanel("input") },
       { label: "Poly Haven", action: () => openPanel("polyhaven") },
+      { label: "AmbientCG", action: () => openPanel("ambientcg") },
+      { label: "Sketchfab", action: () => openPanel("sketchfab") },
       { separator: true },
       { label: "Reset Layout", action: () => resetLayout() },
     ],
@@ -183,6 +185,8 @@ export function MenuBar() {
         </div>
       ))}
       {openMenu && <div className="dropdown-overlay" onClick={() => setOpenMenu(null)} />}
+      <div className="menu-spacer" />
+      <ProcessingIndicator />
       <div className="menu-title">
         {sceneName}
         {dirty ? " •" : ""} — Three Engine

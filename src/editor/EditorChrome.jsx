@@ -25,6 +25,7 @@ import { getProjectSettings, applyProjectSettings } from "./projectSettings.js";
 import { isGraphHovered } from "./nodegraph/graphContext.js";
 import { dispatchVisibilityKeyAction } from "./keybindings.js";
 import { dispatchTerrainKeyAction } from "./terrainBrush.js";
+import { useGeometryEditStore } from "./store/geometryEditStore.js";
 
 /**
  * Editor "chrome": the menu bar, scene restore on first mount, keyboard
@@ -137,6 +138,13 @@ export function EditorChrome() {
       if (e.target.closest?.(".react-flow") || isGraphHovered()) return;
 
       const selection = useSelectionStore.getState().ids;
+      if (e.shiftKey && !ctrl && !e.altKey && e.key.toLowerCase() === "d") {
+        e.preventDefault();
+        duplicateSelection().then(() => {
+          window.dispatchEvent(new CustomEvent("editor-start-transform", { detail: "translate" }));
+        });
+        return;
+      }
       // Terrain-editor context keys (S/P/E, [ ], B/Esc) — only fire while a
       // terrain entity is selected, so they get first crack at E before the
       // global game-visibility toggle below claims it.
@@ -176,6 +184,16 @@ export function EditorChrome() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  useEffect(() => {
+    const blockGeometryReload = (event) => {
+      if (!useGeometryEditStore.getState().entityId) return;
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "r") return;
+      event.preventDefault();
+    };
+    window.addEventListener("keydown", blockGeometryReload, true);
+    return () => window.removeEventListener("keydown", blockGeometryReload, true);
   }, []);
 
   return <MenuBar />;

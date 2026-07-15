@@ -117,6 +117,7 @@ export default defineConfig(async () => ({
       "immer",
       "esbuild-wasm",
       "nanoid",
+      "@tauri-apps/plugin-dialog",
     ],
   },
 }));

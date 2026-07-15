@@ -19,6 +19,7 @@ const GIZMO_COLOR = 0x2df098;
 export class ColliderComponent extends Component {
   static type = "collider";
   static label = "Collider";
+  static tags = ["physics", "play-mode", "3d"];
   static defaults = {
     shape: "box",
     size: [1, 1, 1],
@@ -81,9 +82,13 @@ export class ColliderComponent extends Component {
 
     this.gizmo = new THREE.LineSegments(
       geometry,
-      new THREE.LineBasicMaterial({ color: GIZMO_COLOR, transparent: true, opacity: 0.7, depthTest: false }),
+      new THREE.LineBasicMaterial({ color: GIZMO_COLOR, transparent: true, opacity: 0.7, depthWrite: false }),
     );
     this.gizmo.position.fromArray(offset);
+    // Defer to scene depth so the wireframe hides behind walls instead of
+    // painting over them; the previous `depthTest: false` made colliders
+    // look like they sit in front of every solid object in the scene.
+    this.gizmo.renderOrder = 1;
     this.gizmo.layers.set(EDITOR_LAYER);
     this.gizmo.userData.engineOwned = true;
     this.gizmo.raycast = () => {}; // never intercept viewport picking

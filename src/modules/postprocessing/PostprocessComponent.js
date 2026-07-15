@@ -88,6 +88,7 @@ function findGodraysLight(engine) {
 export class PostprocessComponent extends Component {
   static type = "postprocess";
   static label = "Post Process";
+  static tags = ["rendering", "camera", "screen-space", "graph"];
   static defaults = {
     graph: null,
     // Whether to apply the post-graph at all. When false, the camera
@@ -95,16 +96,23 @@ export class PostprocessComponent extends Component {
     // authoring a graph on a duplicate camera without paying for it on the
     // main one.
     enabled: true,
+    // Preview this camera's graph through the editor viewport camera while
+    // not playing. Play mode always uses the component's owning camera.
+    showInEditor: false,
   };
   // The node editor (Window → Post Process) is the real UI; nothing
   // schema-relevant to inspect here.
   static schema = [
     { key: "enabled", label: "Enabled", type: "boolean" },
+    { key: "showInEditor", label: "Show in Editor", type: "boolean" },
   ];
 
   constructor(entity, props = {}) {
     super(entity, props);
     this.camera = null;
+    // Camera for which scenePass/outputNode are currently compiled. This is
+    // normally `camera`, but may be the editor orbit camera for preview.
+    this.renderCamera = null;
     // TSL `vec4` produced by the compiled graph (the input to RenderPipeline).
     this.outputNode = null;
     this.pipeline = null;
@@ -133,9 +141,21 @@ export class PostprocessComponent extends Component {
     // Unsubscribe handle for the late-camera-arrival watcher. Cleared
     // once the camera is resolved.
     this.watchHandle = null;
+    // RenderPipeline captures its renderer in the constructor, so renderer
+    // recreation (MSAA/alpha changes) must rebuild the pipeline.
+    this.rendererRebuildHandle = null;
+    this.playChangedHandle = null;
   }
 
   onAttach() {
+    this.rendererRebuildHandle?.();
+    this.rendererRebuildHandle = this.entity.engine.on?.("renderer-rebuilt", () => {
+      this.generation++;
+      this.#disposePipeline();
+      void this.#ensurePipeline();
+    });
+    this.playChangedHandle?.();
+    this.playChangedHandle = this.entity.engine.on?.("play-changed", () => this.#syncRenderCamera());
     this.#tryAttach();
     // If the camera component is added AFTER us (typical: postprocess is
     // a follow-up add to an existing camera), the engine emits
@@ -146,6 +166,10 @@ export class PostprocessComponent extends Component {
   }
 
   onDetach() {
+    this.rendererRebuildHandle?.();
+    this.rendererRebuildHandle = null;
+    this.playChangedHandle?.();
+    this.playChangedHandle = null;
     this.watchHandle?.();
     this.watchHandle = null;
     const engine = this.entity.engine;
@@ -154,6 +178,7 @@ export class PostprocessComponent extends Component {
     }
     this.#disposePipeline();
     this.camera = null;
+    this.renderCamera = null;
     this.outputNode = null;
   }
 
@@ -173,6 +198,10 @@ export class PostprocessComponent extends Component {
       else this.onDisable();
       return;
     }
+    if (key === "showInEditor") {
+      this.#syncRenderCamera();
+      return;
+    }
     // `graph` is the only other mutable prop; force a recompile.
     this.generation++;
     void this.#ensurePipeline();
@@ -184,7 +213,7 @@ export class PostprocessComponent extends Component {
     const cam = this.entity.getComponent("camera")?.camera;
     if (!cam) return;
     this.camera = cam;
-    void this.#ensurePipeline();
+    this.#syncRenderCamera();
     const engine = this.entity.engine;
     if (engine?.registerRenderOverride) {
       engine.registerRenderOverride(this);
@@ -194,13 +223,43 @@ export class PostprocessComponent extends Component {
     this.watchHandle = null;
   }
 
+  #desiredRenderCamera(engine = this.entity.engine) {
+    if (!engine?.playing && this.props.showInEditor && engine.camera) return engine.camera;
+    return this.camera;
+  }
+
+  /** Recompile camera-dependent pass/depth nodes when entering/leaving Play
+   * or when the editor swaps its perspective/orthographic camera. */
+  #syncRenderCamera() {
+    if (!this.camera) return;
+    const next = this.#desiredRenderCamera();
+    if (!next) return;
+    if (next === this.renderCamera) {
+      if (!this.pipeline) void this.#ensurePipeline();
+      return;
+    }
+    this.renderCamera = next;
+    this.generation++;
+    this.#disposePipeline();
+    void this.#ensurePipeline();
+  }
+
   /**
    * Returns true when this component's camera is the engine's currently
    * active camera AND the post-process is enabled — only then does it
    * intercept the engine's render.
    */
   ownsCamera(engine) {
-    return this.props.enabled !== false && engine.camera === this.camera && !!this.pipeline;
+    if (this.props.enabled === false) return false;
+    const desired = this.#desiredRenderCamera(engine);
+    if (desired !== this.renderCamera) {
+      this.#syncRenderCamera();
+      return false;
+    }
+    const allowed = engine.playing
+      ? engine.camera === this.camera
+      : !!this.props.showInEditor && engine.camera === this.renderCamera;
+    return allowed && !!this.pipeline;
   }
 
   /**
@@ -234,7 +293,7 @@ export class PostprocessComponent extends Component {
   // -------------------------------------------------------------------------
 
   async #ensurePipeline() {
-    if (!this.camera) return;
+    if (!this.renderCamera) return;
     const engine = this.entity.engine;
     const renderer = engine?.renderer;
     if (!renderer) return;
@@ -315,9 +374,9 @@ export class PostprocessComponent extends Component {
     // targets and renders the scene through them when the RenderPipeline
     // walks the output graph. Rebuild on camera/scene swap — otherwise
     // graph edits reuse the same pass.
-    if (!this.scenePass || this.scene !== engine.scene || this._passCamera !== this.camera) {
+    if (!this.scenePass || this.scene !== engine.scene || this._passCamera !== this.renderCamera) {
       this.scene = engine.scene;
-      this._passCamera = this.camera;
+      this._passCamera = this.renderCamera;
       // 'color' scope renders the full color pass with a depth attachment;
       // that's what SSGI/SSR need to read.
       //
@@ -333,7 +392,7 @@ export class PostprocessComponent extends Component {
       // pass keeps the editor's MSAA intact (the editor / non-postprocess
       // cameras still go through the renderer's default path) and produces
       // a standard `texture_depth_2d` that SSGINode's shader expects.
-      this.scenePass = TSL.pass(engine.scene, this.camera, { samples: 1 });
+      this.scenePass = TSL.pass(engine.scene, this.renderCamera, { samples: 1 });
       // Attach a per-fragment view-space normal MRT to the scene pass.
       // SSGI consumes the normal via `getTextureNode('normal')` (an RGB
       // texture where each pixel's RGB encodes a view-space normal). The
@@ -402,7 +461,7 @@ export class PostprocessComponent extends Component {
       // compile re-register whatever it needs.
       this.keepaliveTemps.clear();
       const compiled = compilePostGraph(graph, {
-        camera: this.camera,
+        camera: this.renderCamera,
         beautyNode,
         depthNode,
         normalNode,

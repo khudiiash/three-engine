@@ -16,6 +16,8 @@
 export const dracoModule = {
   id: "draco",
   name: "Draco Compression",
+  category: "Optimization",
+  tags: ["compression", "mesh", "gltf", "wasm", "import-time"],
   description:
     "Automatically compresses imported models with Draco mesh compression; decoded transparently at load time.",
   version: "1.0.0",

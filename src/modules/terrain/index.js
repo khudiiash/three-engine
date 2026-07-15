@@ -16,6 +16,8 @@ export const terrainModule = {
   id: "terrain",
   name: "Terrain",
   version: "1.0.0",
+  category: "World",
+  tags: ["terrain", "heightmap", "sculpt", "splatmap", "3d", "world"],
   description:
     "Heightmap terrain with a sculpt brush " +
     "up to four splatmap-blended PBR material layers, and model-instance scatter painting.",

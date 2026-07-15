@@ -25,6 +25,7 @@
     "draco3dgltf": "^1.5.7",
     "esbuild-wasm": "^0.28.1",
     "immer": "^11.1.9",
+    "jszip": "^3.10.1",
     "lucide-react": "^1.23.0",
     "meshoptimizer": "^1.2.0",
     "nanoid": "^5.1.16",

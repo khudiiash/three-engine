@@ -56,6 +56,16 @@ export class PhysicsSystem {
     if (this.world) this.world.gravity = new this.RAPIER.Vector3(x, y, z);
   }
 
+  /** Remove a live character immediately when its component/entity is
+   * detached during Play. Keeping this explicit prevents a resumed frame
+   * from stepping a component whose public Rapier handles were cleared. */
+  unregisterCharacter(cc) {
+    const index = this.characters.findIndex((entry) => entry.cc === cc);
+    if (index === -1) return;
+    const [entry] = this.characters.splice(index, 1);
+    this.#removeCharacterEntry(entry);
+  }
+
   /** World-space ray query against the live physics world (play mode only). */
   raycast(origin, direction, maxDistance = 1000) {
     if (!this.world) return null;
@@ -261,7 +271,23 @@ export class PhysicsSystem {
     cc.collider = collider;
     cc.controller = controller;
     cc.grounded = false;
-    this.characters.push({ entity, cc });
+    // Retain the Rapier handles on the system entry too. Component teardown
+    // deliberately clears its public handles, but the system still needs the
+    // originals in order to remove them safely from the live world.
+    this.characters.push({ entity, cc, body, collider, controller });
+  }
+
+  #removeCharacterEntry({ cc, body, collider, controller }) {
+    if (collider) this.colliderEntity.delete(collider.handle);
+    if (this.world) {
+      if (controller) this.world.removeCharacterController(controller);
+      // Removing the rigid body also removes its attached capsule collider.
+      if (body) this.world.removeRigidBody(body);
+    }
+    if (cc.body === body) cc.body = null;
+    if (cc.collider === collider) cc.collider = null;
+    if (cc.controller === controller) cc.controller = null;
+    cc.grounded = false;
   }
 
   #teardown() {
@@ -295,6 +321,20 @@ export class PhysicsSystem {
   #tick(dt) {
     if (!this.world || !this.engine.playing) return;
 
+    // Defensive reconciliation for component replacement/HMR and any caller
+    // that cleared a component handle directly. Normally onDetach reaches
+    // unregisterCharacter first; this closes the remaining stale-entry path.
+    for (let i = this.characters.length - 1; i >= 0; i -= 1) {
+      const entry = this.characters[i];
+      const attached = entry.entity.getComponent("charactercontroller") === entry.cc;
+      const handlesMatch = entry.cc.body === entry.body
+        && entry.cc.collider === entry.collider
+        && entry.cc.controller === entry.controller;
+      if (attached && handlesMatch) continue;
+      this.characters.splice(i, 1);
+      this.#removeCharacterEntry(entry);
+    }
+
     // Kinematic bodies follow their entity (scripts/animations drive them).
     if (this.kinematicBodies.length) this.engine.scene.updateMatrixWorld(true);
     for (const { entity, body } of this.kinematicBodies) {
@@ -311,7 +351,7 @@ export class PhysicsSystem {
       this.world.timestep = FIXED_DT;
       // Resolve character motion before the step so the world advances the
       // kinematic bodies to their collision-free targets this substep.
-      for (const { cc } of this.characters) this.#stepCharacter(cc, FIXED_DT);
+      for (const entry of this.characters) this.#stepCharacter(entry, FIXED_DT);
       this.world.step(this.eventQueue);
       stepped = true;
       this.#dispatchEvents();
@@ -339,8 +379,8 @@ export class PhysicsSystem {
 
     // Character controllers own position only — the entity keeps its own
     // rotation (scripts steer yaw directly on the transform).
-    for (const { entity, cc } of this.characters) {
-      const t = cc.body.translation();
+    for (const { entity, cc, body } of this.characters) {
+      const t = body.translation();
       _pos.set(t.x, t.y, t.z);
       const obj = entity.object3D;
       if (entity.parent) {
@@ -354,24 +394,24 @@ export class PhysicsSystem {
 
   /** Integrates one character's velocity (with gravity) for a fixed step,
    *  resolves the move against the world, and queues the next kinematic pose. */
-  #stepCharacter(cc, dt) {
+  #stepCharacter({ cc, body, collider, controller }, dt) {
     const p = cc.props;
     const v = cc.velocity;
     if (p.applyGravity) v[1] += this.gravity[1] * (p.gravityScale ?? 1) * dt;
 
-    const t = cc.body.translation();
-    cc.controller.computeColliderMovement(cc.collider, {
+    const t = body.translation();
+    controller.computeColliderMovement(collider, {
       x: v[0] * dt,
       y: v[1] * dt,
       z: v[2] * dt,
     });
-    cc.grounded = cc.controller.computedGrounded();
+    cc.grounded = controller.computedGrounded();
     // Zero out downward speed once grounded so gravity doesn't accumulate into
     // a huge value while standing still.
     if (cc.grounded && v[1] < 0) v[1] = 0;
 
-    const m = cc.controller.computedMovement();
-    cc.body.setNextKinematicTranslation({ x: t.x + m.x, y: t.y + m.y, z: t.z + m.z });
+    const m = controller.computedMovement();
+    body.setNextKinematicTranslation({ x: t.x + m.x, y: t.y + m.y, z: t.z + m.z });
   }
 
   #dispatchEvents() {

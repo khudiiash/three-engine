@@ -9,6 +9,9 @@ const MIME_BY_EXT = {
 };
 
 export const MODEL_EXTENSIONS = ["glb"];
+// Source formats accepted by OS import/unpack. Only GLB is a runtime model
+// asset; FBX is converted during import and must never reach ModelComponent.
+export const MODEL_IMPORT_EXTENSIONS = ["glb", "fbx"];
 export const TEXTURE_EXTENSIONS = ["png", "jpg", "jpeg", "webp"];
 export const SCRIPT_EXTENSIONS = ["js", "ts"];
 export const MATERIAL_EXTENSIONS = ["mat"];

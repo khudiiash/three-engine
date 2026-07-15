@@ -29,6 +29,7 @@ const GIZMO_COLOR = 0x2d8bf0;
 export class CharacterControllerComponent extends Component {
   static type = "charactercontroller";
   static label = "Character Controller";
+  static tags = ["physics", "play-mode", "3d", "controller"];
   static defaults = {
     radius: 0.3,
     height: 1.0,
@@ -73,6 +74,7 @@ export class CharacterControllerComponent extends Component {
   }
 
   onDetach() {
+    this.entity.engine.physics?.unregisterCharacter?.(this);
     this.body = null;
     this.collider = null;
     this.controller = null;
@@ -129,9 +131,13 @@ export class CharacterControllerComponent extends Component {
     const { radius, height, offset } = this.props;
     this.gizmo = new THREE.LineSegments(
       new THREE.WireframeGeometry(new THREE.CapsuleGeometry(radius, height, 4, 8)),
-      new THREE.LineBasicMaterial({ color: GIZMO_COLOR, transparent: true, opacity: 0.7, depthTest: false }),
+      new THREE.LineBasicMaterial({ color: GIZMO_COLOR, transparent: true, opacity: 0.7, depthWrite: false }),
     );
     this.gizmo.position.fromArray(offset);
+    // Respect scene depth so the capsule outline hides behind walls instead
+    // of drawing on top of every solid object in the scene — `depthTest: true`
+    // (default) makes the wireframe a normal depth-tested overlay.
+    this.gizmo.renderOrder = 1;
     this.gizmo.layers.set(EDITOR_LAYER);
     this.gizmo.userData.engineOwned = true;
     this.gizmo.raycast = () => {}; // never intercept viewport picking

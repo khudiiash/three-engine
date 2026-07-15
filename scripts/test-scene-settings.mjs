@@ -3,6 +3,8 @@
 import * as THREE from "three/webgpu";
 import { Engine, serializeScene, deserializeScene, SCENE_SETTINGS_DEFAULTS } from "../src/engine/index.js";
 
+globalThis.document ??= { body: {} };
+
 const assert = (cond, msg) => {
   if (!cond) {
     console.error(`FAIL: ${msg}`);
@@ -33,6 +35,10 @@ assert(engine.ambientLight.intensity === 0.8, "ambient intensity applied");
 engine.applySettings({ fog: { type: "exp2", density: 0.05 } });
 assert(engine.scene.fog instanceof THREE.FogExp2 && engine.scene.fog.density === 0.05, "exp2 fog applied");
 
+engine.applySettings({ performance: { maxDevicePixelRatio: 1.25 } });
+assert(engine.settings.performance.maxDevicePixelRatio === 1.25, "max device pixel ratio applied");
+assert(engine.settings.performance.renderScale === SCENE_SETTINGS_DEFAULTS.performance.renderScale, "DPR patch preserves other performance settings");
+
 const json = serializeScene(engine);
 assert(json.settings.toneMapping === "aces" && json.settings.exposure === 1.4, "settings serialized");
 
@@ -40,6 +46,7 @@ const engine2 = new Engine();
 deserializeScene(engine2, JSON.parse(JSON.stringify(json)));
 assert(engine2.settings.background === "#101020", "settings roundtrip through deserialize");
 assert(engine2.scene.fog instanceof THREE.FogExp2, "fog restored on load");
+assert(engine2.settings.performance.maxDevicePixelRatio === 1.25, "max device pixel ratio roundtrips");
 
 engine2.clear();
 assert(engine2.settings.background === SCENE_SETTINGS_DEFAULTS.background, "clear() resets to defaults");

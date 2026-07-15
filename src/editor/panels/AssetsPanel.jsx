@@ -22,12 +22,15 @@ import {
   Workflow,
 } from "lucide-react";
 import { useProjectStore, basename } from "../store/projectStore.js";
+import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
+import { useAssetProcessingStore } from "../store/assetProcessingStore.js";
 import {
   extOf,
   toBlobUrl,
   readAssetMeta,
   MODEL_EXTENSIONS,
+  MODEL_IMPORT_EXTENSIONS,
   TEXTURE_EXTENSIONS,
   SCRIPT_EXTENSIONS,
   MATERIAL_EXTENSIONS,
@@ -58,6 +61,7 @@ import {
 const ICON_BY_EXT = {
   glb: Box,
   gltf: Box,
+  fbx: Box,
   scene: Layers,
   json: Braces,
   js: FileCode2,
@@ -76,6 +80,7 @@ const ICON_BY_EXT = {
 const TYPE_LABEL = {
   glb: "Model",
   gltf: "Model",
+  fbx: "FBX source",
   scene: "Scene",
   json: "JSON",
   js: "Script",
@@ -277,7 +282,35 @@ function openEntry(entry) {
   } else if (ANIMATOR_EXTENSIONS.includes(entry.ext)) {
     useSelectionStore.getState().selectAsset(entry.path);
     import("../EditorShell.jsx").then((m) => m.openPanel("animator"));
+  } else if (MATERIAL_EXTENSIONS.includes(entry.ext)) {
+    // A material *is* its shader graph — that's the only editor for it.
+    useSelectionStore.getState().selectAsset(entry.path);
+    import("../EditorShell.jsx").then((m) => m.openPanel("shaderGraph"));
+  } else if (GEOMETRY_EXTENSIONS.includes(entry.ext)) {
+    openGeometryAsset(entry.path);
   }
+}
+
+/**
+ * The Geometry Editor edits a live mesh on an entity, not a file — so opening a
+ * .geom means finding an entity that uses it and editing that. Selecting the
+ * asset itself would leave the editor with nothing to act on.
+ */
+function openGeometryAsset(path) {
+  const key = (p) => String(p ?? "").replaceAll("\\", "/");
+  const entities = useSceneStore.getState().entities;
+  const match = Object.values(entities).find(
+    (entity) => key(entity?.components?.mesh?.geometryAsset) === key(path),
+  );
+  if (!match) {
+    console.warn(
+      `No entity in the scene uses "${basename(path)}" — ` +
+        `drag it onto an entity's Mesh (or into the scene) to edit it.`,
+    );
+    return;
+  }
+  useSelectionStore.getState().select(match.id);
+  import("../EditorShell.jsx").then((m) => m.openPanel("geometryEditor"));
 }
 
 function RenameInput({ entry, setRenamingPath }) {
@@ -368,7 +401,7 @@ function AssetItem({ entry, view, visible, renaming, setRenamingPath, onContextM
       {...handlers}
     >
       <Thumb entry={entry} size={view.thumb} />
-      {MODEL_EXTENSIONS.includes(entry.ext) && <DracoBadge path={entry.path} />}
+      {entry.ext === "glb" && <DracoBadge path={entry.path} />}
       {renaming ? (
         <RenameInput entry={entry} setRenamingPath={setRenamingPath} />
       ) : (
@@ -390,10 +423,12 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
           ? []
           : [{ label: "Rename", action: () => setRenamingPath(entry.path) }]),
         { label: multi ? `Delete ${targets.length} items` : "Delete", action: () => deleteEntries(targets) },
-        ...(!multi && MODEL_EXTENSIONS.includes(entry.ext)
+        ...(!multi && MODEL_IMPORT_EXTENSIONS.includes(entry.ext)
           ? [
               { label: "Unpack Model", action: () => unpackModel(entry.path) },
-              { label: "Compress (Draco)", action: () => compressModel(entry.path) },
+              ...(entry.ext === "glb"
+                ? [{ label: "Compress (Draco)", action: () => compressModel(entry.path) }]
+                : []),
             ]
           : []),
         ...(!multi && !entry.is_dir
@@ -433,29 +468,41 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries }) {
 async function importDroppedPaths(paths) {
   const { currentPath, refresh } = useProjectStore.getState();
   if (!currentPath || !paths?.length) return;
-  try {
-    const imported = await invoke("import_files", { paths, destDir: currentPath });
-    await refresh();
-    console.log(`Imported ${imported.length} ${imported.length === 1 ? "asset" : "assets"}`);
-    // Imported models unpack into an asset folder (textures/materials/prefab).
-    for (const path of imported) {
-      if (MODEL_EXTENSIONS.includes(extOf(path))) await unpackModel(path);
-      if (TEXTURE_EXTENSIONS.includes(extOf(path))) {
-        const { autoCompressTexture } = await import("../basisCompress.js");
-        await autoCompressTexture(path).catch((err) =>
-          console.warn(`Basis compression skipped for ${basename(path)}: ${err.message ?? err}`),
-        );
+  const track = useAssetProcessingStore.getState().track;
+  await track(
+    (n) => `Importing ${n} ${n === 1 ? "asset" : "assets"}…`,
+    async () => {
+      try {
+        const imported = await invoke("import_files", { paths, destDir: currentPath });
+        await refresh();
+        console.log(`Imported ${imported.length} ${imported.length === 1 ? "asset" : "assets"}`);
+        // Imported models unpack into an asset folder (textures/materials/prefab).
+        for (const path of imported) {
+          if (MODEL_IMPORT_EXTENSIONS.includes(extOf(path))) await unpackModel(path);
+          if (TEXTURE_EXTENSIONS.includes(extOf(path))) {
+            const { autoCompressTexture } = await import("../basisCompress.js");
+            await autoCompressTexture(path).catch((err) =>
+              console.warn(`Basis compression skipped for ${basename(path)}: ${err.message ?? err}`),
+            );
+          }
+        }
+      } catch (err) {
+        console.error(`Import failed: ${err}`);
       }
-    }
-  } catch (err) {
-    console.error(`Import failed: ${err}`);
-  }
+    },
+    paths.length,
+  );
 }
 
 async function unpackModel(path) {
   try {
-    const { unpackGlb } = await import("../glbImport.js");
-    await unpackGlb(path);
+    if (extOf(path) === "fbx") {
+      const { unpackFbx } = await import("../fbxImport.js");
+      await unpackFbx(path);
+    } else {
+      const { unpackGlb } = await import("../glbImport.js");
+      await unpackGlb(path);
+    }
   } catch (err) {
     console.error(`Unpack failed for ${basename(path)}: ${err.message ?? err}`);
   }

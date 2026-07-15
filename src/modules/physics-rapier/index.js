@@ -35,6 +35,8 @@ export const physicsRapierModule = {
   id: "physics-rapier",
   name: "Rapier Physics",
   version: "1.0.0",
+  category: "Physics",
+  tags: ["physics", "rapier", "wasm", "3d", "rigidbody", "collider"],
   description:
     "Rigid-body physics powered by Rapier: Rigidbody, Collider + Character " +
     "Controller components, fixed-step simulation in play mode, collision/" +

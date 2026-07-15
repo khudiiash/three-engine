@@ -553,7 +553,13 @@ export function setUniformValue(uniformNode, value) {
   else if (cur?.set && Array.isArray(value)) cur.set(...value);
 }
 
-export async function compileShaderGraph(graph, { taps } = {}) {
+/**
+ * `uvNode` replaces the graph's default `uv()` source wherever a node falls
+ * back to it (texture nodes, most notably). Terrain needs this: it blends
+ * several layer .mats into one material and each layer samples at its own
+ * tiling, which is impossible if every graph hard-codes the mesh's raw UV.
+ */
+export async function compileShaderGraph(graph, { taps, uvNode = null } = {}) {
   if (!graph?.nodes?.length) return null;
   const nodeById = new Map(graph.nodes.map((n) => [n.id, n]));
   const edges = graph.edges ?? [];
@@ -579,6 +585,8 @@ export async function compileShaderGraph(graph, { taps } = {}) {
   const outputId = graph.nodes.find((n) => n.type === "output")?.id;
   const isVolume = outputId != null && edges.some((e) => e.target === outputId && e.targetHandle === "volume");
 
+  const source = (name) => (name === "uv" && uvNode ? uvNode : builtin(name, isVolume));
+
   function inputNode(node, spec) {
     const edge = edges.find((e) => e.target === node.id && e.targetHandle === spec.key);
     if (edge) return build(edge.source, edge.sourceHandle);
@@ -587,7 +595,7 @@ export async function compileShaderGraph(graph, { taps } = {}) {
       const u = makeUniform(value);
       if (u) return uni(`${node.id}.${spec.key}`, u);
     }
-    return spec.src ? builtin(spec.src, isVolume) : null;
+    return spec.src ? source(spec.src) : null;
   }
 
   function build(id, outKey) {
@@ -606,7 +614,7 @@ export async function compileShaderGraph(graph, { taps } = {}) {
       } else if (def.fn && !def.inputs?.length) {
         // Attribute-source node (uv, time, positionWorld, …) — may be a
         // callable TSL builder or a plain pre-built Node object.
-        result = builtin(def.fn, isVolume);
+        result = source(def.fn);
       } else if (def.fn) {
         const args = def.inputs.map((s) => ins[s.key]);
         while (args.length && args[args.length - 1] == null) args.pop();
@@ -651,10 +659,45 @@ export async function compileShaderGraph(graph, { taps } = {}) {
 // --- Migration ------------------------------------------------------------
 // The Output is Blender-style (Surface / Volume / Displacement) with first-class
 // shader nodes (Principled BSDF, Emission) feeding Surface, so modern graphs
-// compile directly with no rewrite. `migrateGraph` is kept as an identity pass
-// so existing call sites (materialAsset, ShaderGraphPanel) stay stable.
+// compile directly with no rewrite.
+//
+// The one thing that does need rewriting: a Texture wired STRAIGHT into a
+// `normal` input. A normal map stores a tangent-space vector packed into 0..1
+// texels — feeding those raw RGB values in as a normal vector produces normals
+// that all point roughly +Z-ish in the wrong space, so lighting collapses and
+// the surface goes dark. It has to pass through a Normal Map node, which
+// unpacks (texel·2−1) and applies the TBN transform.
+//
+// Older importers emitted the direct wire; the generator now inserts the node
+// itself (see pbrMaterialGraph.js), but .mat files already on disk still carry
+// the broken edge and would never be regenerated. Repair them on load.
 export function migrateGraph(graph) {
-  return graph;
+  if (!graph?.nodes?.length) return graph;
+  const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+  const edges = graph.edges ?? [];
+  const direct = edges.filter(
+    (e) => e.targetHandle === "normal" && byId.get(e.source)?.type === "texture",
+  );
+  if (!direct.length) return graph;
+
+  const nodes = [...graph.nodes];
+  const next = edges.filter((e) => !direct.includes(e));
+  for (const edge of direct) {
+    const tex = byId.get(edge.source);
+    let id = `normalMap_${edge.source}`;
+    while (byId.has(id)) id = `${id}_`;
+    nodes.push({
+      id,
+      type: "normalMap",
+      props: { scale: 1 },
+      position: { x: (tex.position?.x ?? 0) + 260, y: tex.position?.y ?? 0 },
+    });
+    // Always take the texture's full color, never a single channel — a normal
+    // map needs all three components.
+    next.push({ source: edge.source, sourceHandle: "out", target: id, targetHandle: "color" });
+    next.push({ source: id, sourceHandle: "out", target: edge.target, targetHandle: "normal" });
+  }
+  return { ...graph, nodes, edges: next };
 }
 
 // --- Code generation --------------------------------------------------------

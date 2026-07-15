@@ -88,7 +88,19 @@ export function SceneSettingsPanel() {
       { shadow: { ...settings.shadow, ...shadowPatch } },
       label ?? "Change shadow settings",
     );
+  const commitPerf = (perfPatch, label) =>
+    commit(
+      { performance: { ...settings.performance, ...perfPatch } },
+      label ?? "Change performance settings",
+    );
 
+  const perf = settings.performance ?? {
+    maxDevicePixelRatio: 2,
+    renderScale: 1,
+    dynamicResolution: false,
+    targetFps: 60,
+    volumeStepScale: 1,
+  };
   const renderer = settings.renderer ?? { antialias: true, samples: 4, transparent: false };
   const shadow = settings.shadow ?? { type: "PCFSoftShadowMap", autoUpdate: true, needsUpdate: false };
 
@@ -200,6 +212,75 @@ export function SceneSettingsPanel() {
             type="checkbox"
             checked={settings.shadows !== false}
             onChange={(e) => commit({ shadows: e.target.checked }, "Toggle shadows")}
+          />
+        </Row>
+      </div>
+
+      <div className="inspector-section">
+        <div className="section-header">Performance</div>
+        <div className="asset-hint" style={{ padding: "0 4px 6px" }}>
+          Applied live — no renderer rebuild. Watch the GPU ms readout in the
+          viewport stats while tuning (8.3 ms = 120 fps, 16.7 ms = 60 fps).
+        </div>
+        <Row label="Max device pixel ratio">
+          <NumberInput
+            value={perf.maxDevicePixelRatio ?? 2}
+            min={0.5}
+            max={4}
+            step={0.25}
+            onCommit={(v) =>
+              commitPerf({ maxDevicePixelRatio: v }, "Change max device pixel ratio")
+            }
+          />
+        </Row>
+        <Row label="Render scale">
+          <select
+            className="select-field"
+            value={String(perf.renderScale ?? 1)}
+            onChange={(e) =>
+              commitPerf({ renderScale: parseFloat(e.target.value) }, "Change render scale")
+            }
+          >
+            <option value="1">100%</option>
+            <option value="0.85">85%</option>
+            <option value="0.75">75%</option>
+            <option value="0.66">66%</option>
+            <option value="0.5">50%</option>
+            <option value="0.33">33%</option>
+            <option value="0.25">25%</option>
+          </select>
+        </Row>
+        <Row label="Dynamic res">
+          <input
+            type="checkbox"
+            checked={perf.dynamicResolution === true}
+            onChange={(e) =>
+              commitPerf({ dynamicResolution: e.target.checked }, "Toggle dynamic resolution")
+            }
+          />
+        </Row>
+        <Row label="Target FPS">
+          <select
+            className="select-field"
+            value={String(perf.targetFps ?? 60)}
+            disabled={perf.dynamicResolution !== true}
+            onChange={(e) =>
+              commitPerf({ targetFps: parseInt(e.target.value, 10) }, "Change target FPS")
+            }
+          >
+            <option value="30">30</option>
+            <option value="60">60</option>
+            <option value="90">90</option>
+            <option value="120">120</option>
+          </select>
+        </Row>
+        <Row label="Volume quality">
+          <NumberInput
+            value={perf.volumeStepScale ?? 1}
+            min={0.1}
+            max={1}
+            step={0.05}
+            onCommit={(v) => commitPerf({ volumeStepScale: v }, "Change volume quality")}
           />
         </Row>
       </div>

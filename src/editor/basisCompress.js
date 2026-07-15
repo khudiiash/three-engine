@@ -1,5 +1,7 @@
 import { useModulesStore } from "./modules.js";
 import { useProjectStore } from "./store/projectStore.js";
+import { useAssetProcessingStore } from "./store/assetProcessingStore.js";
+import { basename } from "./store/projectStore.js";
 import {
   invalidateBlobUrl,
   listProjectAssets,
@@ -28,6 +30,14 @@ async function writeMeta(path, basis) {
 
 /** Compresses a texture source without replacing it. */
 export async function compressTextureBasis(path) {
+  return useAssetProcessingStore.getState().track(
+    (p) => `Compressing ${basename(p)}…`,
+    (p) => compressTextureBasisImpl(p),
+    path,
+  );
+}
+
+async function compressTextureBasisImpl(path) {
   const info = await invoke("compress_texture_basis", { path });
   invalidateBlobUrl(`${path}.basis`);
   await writeMeta(path, { enabled: true, ...info });
@@ -48,6 +58,13 @@ export async function setTextureBasisEnabled(path, enabled) {
 
 /** Compresses every texture that has not explicitly opted out. */
 export async function compressAllProjectTextures() {
+  return useAssetProcessingStore.getState().track(
+    "Compressing project textures…",
+    () => compressAllProjectTexturesImpl(),
+  );
+}
+
+async function compressAllProjectTexturesImpl() {
   const root = useProjectStore.getState().rootPath;
   if (!root) return { compressed: 0, failed: 0 };
   const paths = await listProjectAssets(root, TEXTURE_EXTENSIONS, 20);
@@ -57,7 +74,7 @@ export async function compressAllProjectTextures() {
     const meta = await readAssetMeta(`${path}.meta`);
     if (meta?.basis?.enabled === false) continue;
     try {
-      await compressTextureBasis(path);
+      await compressTextureBasisImpl(path);
       compressed++;
     } catch (err) {
       failed++;

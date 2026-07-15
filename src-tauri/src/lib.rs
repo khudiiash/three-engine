@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use tauri::Manager;
 
@@ -154,6 +155,25 @@ fn read_binary_file(path: String) -> Result<tauri::ipc::Response, String> {
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// Reads only the beginning of a binary file. Importers use this to validate
+/// very large source assets before allocating/copying the complete payload.
+#[tauri::command]
+fn read_binary_file_head(path: String, max_bytes: u64) -> Result<tauri::ipc::Response, String> {
+    let file = fs::File::open(&path).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024) as usize);
+    file.take(max_bytes)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+fn file_size(path: String) -> Result<u64, String> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|e| e.to_string())
+}
+
 /// Reads a file as UTF-8 text (script source).
 #[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
@@ -303,6 +323,134 @@ fn frontend_log(message: String) {
     println!("[frontend] {message}");
 }
 
+/// Proxies a GET request to `url` and returns the response body as UTF-8 text.
+/// Used by the AmbientCG asset browser: `ambientcg.com`'s API and download
+/// endpoints don't send CORS headers, so a direct `fetch` from the webview
+/// fails with "Failed to fetch". Routing through Rust bypasses the browser
+/// sandbox and lets the engine read the catalog. `User-Agent` is required:
+/// ambientCG returns a 403 to the default libcurl UA, and the redirect
+/// target (`acg-download.struffelproductions.com`) refuses empty UAs too.
+#[tauri::command]
+async fn fetch_text(url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let original = url.clone();
+        let mut current = url;
+        // Follow up to 5 hops manually — `ureq`'s default of 5 covers the
+        // ambientCG case (`/get?file=…` 302s to the CDN). We re-parse after
+        // each hop because ureq doesn't expose the redirect target as a URL.
+        for _ in 0..5 {
+            let resp = ureq::get(&current)
+                .set(
+                    "User-Agent",
+                    "three-engine/0.1 (+https://github.com/three-engine)",
+                )
+                .set("Accept", "application/json,text/html;q=0.9,*/*;q=0.5")
+                .call()
+                .map_err(|e| format!("fetch {current}: {e}"))?;
+            if resp.status() >= 300 && resp.status() < 400 {
+                let loc = resp
+                    .header("Location")
+                    .ok_or_else(|| format!("redirect from {current} with no Location"))?;
+                current = if loc.starts_with("http://") || loc.starts_with("https://") {
+                    loc.to_string()
+                } else {
+                    // relative redirect — resolve against current
+                    let base =
+                        url::Url::parse(&current).map_err(|e| format!("bad url {current}: {e}"))?;
+                    base.join(&loc)
+                        .map_err(|e| format!("resolve {loc}: {e}"))?
+                        .to_string()
+                };
+                continue;
+            }
+            return resp.into_string().map_err(|e| format!("read body: {e}"));
+        }
+        Err(format!("too many redirects for {original}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Proxies a GET request and returns the raw response body bytes.
+/// Same CORS rationale as `fetch_text`: ambientCG's ZIP endpoint 302s to
+/// `acg-download.struffelproductions.com` which also refuses direct browser
+/// fetches. Returning bytes via `tauri::ipc::Response` ships them over the
+/// raw IPC channel (no JSON serialisation), so the frontend gets an
+/// `ArrayBuffer` it can hand straight to JSZip. ZIPs are typically a few MB,
+/// well within memory.
+#[tauri::command]
+async fn fetch_bytes(url: String) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let original = url.clone();
+        let mut current = url;
+        for _ in 0..5 {
+            let resp = ureq::get(&current)
+                .set("User-Agent", "three-engine/0.1 (+https://github.com/three-engine)")
+                .call()
+                .map_err(|e| format!("fetch {current}: {e}"))?;
+            if resp.status() >= 300 && resp.status() < 400 {
+                let loc = resp
+                    .header("Location")
+                    .ok_or_else(|| format!("redirect from {current} with no Location"))?;
+                current = if loc.starts_with("http://") || loc.starts_with("https://") {
+                    loc.to_string()
+                } else {
+                    let base = url::Url::parse(&current)
+                        .map_err(|e| format!("bad url {current}: {e}"))?;
+                    base.join(&loc)
+                        .map_err(|e| format!("resolve {loc}: {e}"))?
+                        .to_string()
+                };
+                continue;
+            }
+            let mut buf = Vec::new();
+            resp.into_reader()
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("read body: {e}"))?;
+            return Ok(tauri::ipc::Response::new(buf));
+        }
+        Err(format!("too many redirects for {original}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Sketchfab's public catalog is readable without a token, while its download
+/// endpoint requires the current user's OAuth/API token. Keep the credential
+/// out of browser fetches and refuse non-Sketchfab hosts so it cannot be sent
+/// to an arbitrary URL. OAuth tokens use `Bearer`; legacy personal API tokens
+/// use `Token`, so a 401 retries once with the latter scheme.
+#[tauri::command]
+async fn fetch_sketchfab_text(url: String, token: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let parsed = url::Url::parse(&url).map_err(|e| format!("bad Sketchfab URL: {e}"))?;
+        if parsed.scheme() != "https" || parsed.host_str() != Some("api.sketchfab.com") {
+            return Err("Sketchfab API requests must use https://api.sketchfab.com".to_string());
+        }
+
+        let request = |scheme: &str| {
+            let mut req = ureq::get(&url)
+                .set("User-Agent", "three-engine/0.1")
+                .set("Accept", "application/json");
+            if let Some(value) = token.as_deref().filter(|value| !value.is_empty()) {
+                req = req.set("Authorization", &format!("{scheme} {value}"));
+            }
+            req.call()
+        };
+
+        let response = match request("Bearer") {
+            Err(ureq::Error::Status(401, _)) if token.is_some() => request("Token"),
+            result => result,
+        }
+        .map_err(|e| format!("Sketchfab API: {e}"))?;
+        response
+            .into_string()
+            .map_err(|e| format!("read Sketchfab response: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -313,6 +461,8 @@ pub fn run() {
             load_scene,
             list_dir,
             read_binary_file,
+            read_binary_file_head,
+            file_size,
             read_text_file,
             stat_file,
             create_dir,
@@ -322,7 +472,10 @@ pub fn run() {
             export_game,
             write_binary_file,
             compress_texture_basis,
-            frontend_log
+            frontend_log,
+            fetch_text,
+            fetch_bytes,
+            fetch_sketchfab_text
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

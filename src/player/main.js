@@ -92,12 +92,12 @@ async function boot() {
   // Input config next — the manager is attached during init(), so swapping
   // the snapshot detaches/re-attaches to keep listeners consistent.
   if (scene.input) engine.applyInput(scene.input);
-  deserializeScene(engine, scene);
+  await deserializeScene(engine, scene);
 
   // Project settings embedded at export time.
   if (scene.player?.title) document.title = scene.player.title;
   if (scene.player?.pixelRatioCap) {
-    engine.renderer.setPixelRatio(Math.min(window.devicePixelRatio ?? 1, scene.player.pixelRatioCap));
+    engine.setPixelRatio(Math.min(window.devicePixelRatio ?? 1, scene.player.pixelRatioCap));
   }
 
   engine.camera =

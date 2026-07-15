@@ -704,6 +704,17 @@ export class ParticleComponent extends Component {
     if (!this.isInView()) return;
     const renderer = this.entity.engine.renderer;
     if (!renderer) return;
+    // Refresh collider storage in the same callback that dispatches compute.
+    // A separate engine update hook made correctness depend on callback order
+    // and could leave rebuilt systems reading a stale/empty GPU buffer.
+    let colliderField = null;
+    for (const sub of this.subsystems ?? []) {
+      if (!sub.colliderField) continue;
+      colliderField = sub.colliderField;
+      break; // ParticleColliderField is an engine-wide singleton.
+    }
+    colliderField?.refresh();
+
     // All passes are batched into one renderer.compute() call — a single
     // command encoder / compute pass instead of one submit per dispatch.
     const queue = (this._computeQueue ??= []);
@@ -711,6 +722,7 @@ export class ParticleComponent extends Component {
     for (const sub of this.subsystems ?? []) {
       if (!sub.updateCompute) continue;
       if (sub.collisionMatrices) {
+        this.entity.object3D.updateWorldMatrix(true, false);
         const m = this.entity.object3D.matrixWorld;
         sub.collisionMatrices.world.value.copy(m);
         sub.collisionMatrices.inverse.value.copy(m).invert();

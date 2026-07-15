@@ -32,6 +32,9 @@ import {
 import { SetTerrainHeightsCommand, SetTerrainScatterCommand, SetTerrainSplatmapCommand } from "../commands/terrainCommands.js";
 import { GeometryEditorPanel } from "./GeometryEditorPanel.jsx";
 import { useGeometryEditStore } from "../store/geometryEditStore.js";
+import { ensureGeometryAsset } from "../geometryEditing.js";
+import { setVirtualGeometryDebugVisible } from "../../modules/virtual-geometry/index.js";
+import { DirectionalLightGizmo } from "../helpers/DirectionalLightGizmo.js";
 
 /** Sets `layers.set(EDITOR_LAYER)` on every Object3D in the subtree —
  *  layers in three.js are not inherited, so this has to walk explicitly. */
@@ -51,6 +54,7 @@ const LAYER_TOGGLES = [
   { key: "colliders", label: "Colliders" },
   { key: "grid", label: "Grid" },
   { key: "stats", label: "Stats" },
+  { key: "virtualGeometry", label: "Virtual Geometry" },
 ];
 
 // The renderer canvas and editor controls outlive the React panel so the
@@ -58,6 +62,12 @@ const LAYER_TOGGLES = [
 const viewport = {
   canvas: null,
   camera: null,
+  perspectiveCamera: null,
+  orthographicCamera: null,
+  orthographicHeight: 10,
+  axisView: null,
+  axisAnimation: null,
+  orbitStartQuaternion: null,
   orbit: null,
   gizmo: null,
   selectionBox: null,
@@ -75,7 +85,7 @@ const viewport = {
   // Toggles from the Layers dropdown. Mirrored in React state; mutations
   // here apply live so a hot-reload of the panel keeps the current layer
   // set. Default to "all on" so the viewport starts in its full visual state.
-  layers: { gizmos: true, colliders: true, grid: true, stats: true },
+  layers: { gizmos: true, colliders: true, grid: true, stats: true, virtualGeometry: false },
   layersListeners: new Set(),
 };
 
@@ -98,7 +108,8 @@ async function ensureViewport() {
     viewport.canvas = canvas;
 
     try {
-      viewport.camera = new THREE.PerspectiveCamera(60, 1, 0.1, 2000);
+      viewport.perspectiveCamera = new THREE.PerspectiveCamera(60, 1, 0.1, 2000);
+      viewport.camera = viewport.perspectiveCamera;
       viewport.camera.position.set(7, 5, 9);
       // Editor camera must see the editor-only layer (camera model, gizmo,
       // grid, selection box, frustum helper). Without this, those objects
@@ -126,6 +137,18 @@ async function ensureViewport() {
       viewport.orbit = new OrbitControls(viewport.camera, canvas);
       viewport.orbit.enableDamping = true;
       viewport.orbit.dampingFactor = 0.12;
+      viewport.orbit.addEventListener("start", () => {
+        viewport.orbitStartQuaternion = viewport.camera?.quaternion.clone() ?? null;
+      });
+      viewport.orbit.addEventListener("change", () => {
+        if (!viewport.camera?.isOrthographicCamera || viewport.axisAnimation || !viewport.orbitStartQuaternion) return;
+        // Pan and zoom keep an orthographic axis view. The first real rotation
+        // delta returns to perspective, matching Blender's viewport behavior.
+        if (Math.abs(viewport.camera.quaternion.dot(viewport.orbitStartQuaternion)) < 0.999999) {
+          viewport.orbitStartQuaternion = null;
+          usePerspectiveView();
+        }
+      });
 
       setupGizmo(canvas);
       setupPicking(canvas);
@@ -168,6 +191,7 @@ async function ensureViewport() {
 
       engine.onUpdate(() => {
         viewport.orbit.update();
+        updateAxisViewAnimation();
         viewport.selectionBox?.update();
         viewport.cameraHelper?.update();
         // The light helper samples the live THREE.Light on every update(), so
@@ -340,11 +364,175 @@ function setupPlayCamera() {
 }
 
 function resizeActiveCamera() {
-  if (!viewport.canvas || !engine.camera?.isPerspectiveCamera) return;
+  if (!viewport.canvas || !engine.camera) return;
   const { width, height } = viewport.canvas;
   if (!width || !height) return;
-  engine.camera.aspect = width / height;
+  const aspect = width / height;
+  if (engine.camera.isPerspectiveCamera) {
+    engine.camera.aspect = aspect;
+  } else if (engine.camera.isOrthographicCamera) {
+    const halfHeight = viewport.orthographicHeight * 0.5;
+    engine.camera.left = -halfHeight * aspect;
+    engine.camera.right = halfHeight * aspect;
+    engine.camera.top = halfHeight;
+    engine.camera.bottom = -halfHeight;
+  }
   engine.camera.updateProjectionMatrix();
+}
+
+const axisViewListeners = new Set();
+
+function notifyAxisViewChanged() {
+  for (const fn of axisViewListeners) fn(viewport.axisView);
+}
+
+function subscribeAxisView(fn) {
+  axisViewListeners.add(fn);
+  return () => axisViewListeners.delete(fn);
+}
+
+/** Swap the editor camera while keeping OrbitControls and TransformControls
+ * attached to the currently rendered camera. */
+function syncOrbitCamera(camera) {
+  if (viewport.orbit) {
+    const orbit = viewport.orbit;
+    orbit.object = camera;
+    // The editor is permanently Y-up. A +/-Y orthographic view temporarily
+    // uses Z only as its screen-up direction, but OrbitControls must keep its
+    // world-Y orbit basis when cameras are swapped.
+    orbit._quat.identity();
+    orbit._quatInverse.copy(orbit._quat).invert();
+    // A snap is an absolute camera change. Do not let damping accumulated on
+    // the previous camera continue moving the replacement camera.
+    orbit._sphericalDelta.set(0, 0, 0);
+    orbit._panOffset.set(0, 0, 0);
+    orbit._scale = 1;
+    orbit.position0.copy(camera.position);
+    orbit.zoom0 = camera.zoom;
+    orbit.target0.copy(orbit.target);
+  }
+}
+
+function useEditorCamera(camera) {
+  viewport.camera = camera;
+  camera.layers.enable(EDITOR_LAYER);
+  syncOrbitCamera(camera);
+  if (viewport.gizmo) viewport.gizmo.camera = camera;
+  if (!engine.playing) engine.camera = camera;
+  resizeActiveCamera();
+  camera.updateMatrixWorld(true);
+  viewport.gizmo?.getHelper()?.updateMatrixWorld(true);
+}
+
+const AXIS_VIEW_DURATION = 180;
+
+function updateAxisViewAnimation() {
+  const animation = viewport.axisAnimation;
+  if (!animation) return;
+  const elapsed = performance.now() - animation.startedAt;
+  const t = THREE.MathUtils.clamp(elapsed / AXIS_VIEW_DURATION, 0, 1);
+  const eased = 1 - Math.pow(1 - t, 3);
+
+  const turn = new THREE.Quaternion().identity().slerp(animation.directionTurn, eased);
+  const direction = animation.startDirection.clone().applyQuaternion(turn);
+  animation.camera.position.copy(animation.target).addScaledVector(direction, animation.distance);
+  animation.camera.quaternion.slerpQuaternions(animation.startQuaternion, animation.endQuaternion, eased);
+  // The camera pose is animated outside OrbitControls, so publish its normal
+  // change event explicitly to make the corner axes animate with the view.
+  viewport.orbit.dispatchEvent({ type: "change" });
+
+  if (t < 1) return;
+  animation.camera.position.copy(animation.endPosition);
+  animation.camera.quaternion.copy(animation.endQuaternion);
+  animation.camera.up.copy(animation.endUp);
+  viewport.axisAnimation = null;
+  syncOrbitCamera(animation.camera);
+  viewport.orbit.enabled = !engine.playing && !getTerrainBrushMode();
+  viewport.orbit.update();
+}
+
+function setAxisView(axis, sign = 1) {
+  if (!viewport.camera || !viewport.orbit || engine.playing) return;
+
+  const requestedView = `${sign > 0 ? "+" : "-"}${axis.toUpperCase()}`;
+  // Re-clicking the face-on endpoint flips to the opposite side, which keeps
+  // both directions reachable when their projected buttons overlap.
+  if (viewport.axisView === requestedView) sign *= -1;
+
+  const source = viewport.camera;
+  const target = viewport.orbit.target.clone();
+  const distance = Math.max(source.position.distanceTo(target), 0.1);
+  const aspect = Math.max(viewport.canvas?.clientWidth || 1, 1) / Math.max(viewport.canvas?.clientHeight || 1, 1);
+
+  // Match the perspective camera's visible height at the orbit target so the
+  // snap changes projection without an unexpected jump in framing.
+  if (source.isPerspectiveCamera) {
+    viewport.orthographicHeight = 2 * distance * Math.tan(THREE.MathUtils.degToRad(source.fov * 0.5)) / source.zoom;
+  } else {
+    viewport.orthographicHeight = (source.top - source.bottom) / source.zoom;
+  }
+  const halfHeight = viewport.orthographicHeight * 0.5;
+  let camera = viewport.orthographicCamera;
+  if (!camera) {
+    camera = new THREE.OrthographicCamera(-halfHeight * aspect, halfHeight * aspect, halfHeight, -halfHeight, 0.1, 2000);
+    viewport.orthographicCamera = camera;
+  }
+  camera.left = -halfHeight * aspect;
+  camera.right = halfHeight * aspect;
+  camera.top = halfHeight;
+  camera.bottom = -halfHeight;
+  camera.zoom = 1;
+
+  const direction = new THREE.Vector3(
+    axis === "x" ? sign : 0,
+    axis === "y" ? sign : 0,
+    axis === "z" ? sign : 0,
+  );
+  const endPosition = target.clone().addScaledVector(direction, distance);
+  const endUp = new THREE.Vector3(0, 1, 0);
+  if (axis === "y") endUp.set(0, 0, sign > 0 ? -1 : 1);
+  const endQuaternion = new THREE.Quaternion().setFromRotationMatrix(
+    new THREE.Matrix4().lookAt(endPosition, target, endUp),
+  );
+  camera.position.copy(source.position);
+  camera.quaternion.copy(source.quaternion);
+  camera.up.copy(source.up);
+  camera.updateProjectionMatrix();
+
+  useEditorCamera(camera);
+  viewport.orbit.target.copy(target);
+  viewport.orbit.enabled = false;
+  const startDirection = source.position.clone().sub(target).normalize();
+  viewport.axisAnimation = {
+    camera,
+    target,
+    distance,
+    startDirection,
+    directionTurn: new THREE.Quaternion().setFromUnitVectors(startDirection, direction),
+    startQuaternion: source.quaternion.clone(),
+    endQuaternion,
+    endPosition,
+    endUp,
+    startedAt: performance.now(),
+  };
+  viewport.axisView = `${sign > 0 ? "+" : "-"}${axis.toUpperCase()}`;
+  viewport.orbitStartQuaternion = null;
+  notifyAxisViewChanged();
+}
+
+function usePerspectiveView() {
+  if (!viewport.camera || !viewport.orbit || engine.playing || viewport.camera.isPerspectiveCamera) return;
+  viewport.axisAnimation = null;
+  const source = viewport.camera;
+  const camera = viewport.perspectiveCamera;
+  camera.position.copy(source.position);
+  camera.quaternion.copy(source.quaternion);
+  camera.up.set(0, 1, 0);
+  useEditorCamera(camera);
+  viewport.orbit.enabled = !getTerrainBrushMode();
+  viewport.orbit.update();
+  viewport.axisView = null;
+  notifyAxisViewChanged();
 }
 
 /**
@@ -579,17 +767,20 @@ function rebuildGrid(editorSettings) {
 }
 
 /**
- * Walks every entity in the scene and applies `visible` to its
- * `ColliderComponent.gizmo` (the green wireframe outline on
- * EDITOR_LAYER). The component owns the gizmo Object3D — we don't
- * tear it down, only flip `visible` so toggling is instant and
- * reversible.
+ * Walks every entity in the scene and applies `visible` to the gizmo of its
+ * physics-shape components (Collider + CharacterController). Both gizmos live
+ * on EDITOR_LAYER and follow the same "Colliders" layer toggle so a
+ * CharacterController entity — which owns its own capsule rather than a
+ * separate Collider — respects the user's "show physics aids" preference
+ * without needing its own menu entry. Components own the gizmo Object3D;
+ * we only flip `visible` so toggling is instant and reversible.
  */
 function setCollidersVisible(visible) {
   for (const entity of engine.entities.values()) {
     const collider = entity.getComponent?.("collider");
-    if (!collider?.gizmo) continue;
-    collider.gizmo.visible = visible;
+    if (collider?.gizmo) collider.gizmo.visible = visible;
+    const character = entity.getComponent?.("charactercontroller");
+    if (character?.gizmo) character.gizmo.visible = visible;
   }
 }
 
@@ -600,12 +791,13 @@ function setCollidersVisible(visible) {
  * controlled directly; colliders are per-component so we walk.
  */
 function applyLayerVisibility() {
-  const { gizmos, colliders, grid } = viewport.layers;
+  const { gizmos, colliders, grid, virtualGeometry } = viewport.layers;
   const gizmoHelper = viewport.gizmo?.getHelper();
   if (gizmoHelper) gizmoHelper.visible = gizmos && !engine.playing;
   if (viewport.selectionBox) viewport.selectionBox.visible = gizmos && !engine.playing;
   if (viewport.grid) viewport.grid.visible = grid;
   setCollidersVisible(colliders);
+  setVirtualGeometryDebugVisible(virtualGeometry && !engine.playing);
 }
 
 // Hydrate `viewport.layers` from project settings (settings.editor.layers)
@@ -782,7 +974,7 @@ function detachCameraHelper() {
  * entity. The shape depends on the light's kind, matching what three.js's
  * built-in helpers were designed for:
  *
- *   - directional -> DirectionalLightHelper (arrow + planes)
+ *   - directional -> compact hemisphere + direction arrow
  *   - spot        -> SpotLightHelper        (cone)
  *   - point       -> PointLightHelper       (small wireframe sphere)
  *   - ambient     -> no helper (no spatial meaning)
@@ -801,7 +993,7 @@ function attachLightHelper(lightComponent) {
   const kind = lightComponent.props.kind;
   let helper = null;
   if (kind === "directional" && light.isDirectionalLight) {
-    helper = new THREE.DirectionalLightHelper(light, 5);
+    helper = new DirectionalLightGizmo(lightComponent.entity, 1);
   } else if (kind === "spot" && light.isSpotLight) {
     helper = new THREE.SpotLightHelper(light, 5);
   } else if (kind === "point" && light.isPointLight) {
@@ -852,11 +1044,13 @@ function setupPicking(canvas) {
     for (const hit of hits) {
       const entityId = findEntityId(hit.object);
       if (entityId) {
-        useSelectionStore.getState().select(entityId);
+        const selection = useSelectionStore.getState();
+        if (e.ctrlKey || e.metaKey) selection.toggle(entityId);
+        else selection.select(entityId);
         return;
       }
     }
-    useSelectionStore.getState().clear();
+    if (!e.ctrlKey && !e.metaKey) useSelectionStore.getState().clear();
   });
 }
 
@@ -1622,10 +1816,35 @@ function setupKeyboard(canvas) {
     if (handleMacroKey(e)) return;
     if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
     switch (e.key.toLowerCase()) {
+      case "tab": {
+        const entityId = useSelectionStore.getState().ids[0] ?? null;
+        if (!entityId || !engine.getEntity(entityId)?.getComponent("mesh")) break;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        ensureGeometryAsset(entityId)
+          .then(() => useGeometryEditStore.getState().enter(entityId))
+          .catch((error) => console.error(`Couldn't enter geometry edit mode: ${error}`));
+        break;
+      }
       case "f":
         focusSelection();
         break;
+      case "l": {
+        // Directional-light convenience: jump straight to rotation while the
+        // compact sun-direction helper remains visible.
+        const entityId = useSelectionStore.getState().ids[0] ?? null;
+        const light = entityId ? engine.getEntity(entityId)?.getComponent("light") : null;
+        if (light?.props.kind !== "directional") break;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        setGizmoMode("rotate");
+        break;
+      }
     }
+  });
+
+  window.addEventListener("editor-start-transform", (event) => {
+    if (!engine.playing && event.detail === "translate") startMacro("translate");
   });
 
   // Cancel an in-progress macro if the window loses focus (e.g. user
@@ -2219,6 +2438,98 @@ export function getEditorCameraView() {
   };
 }
 
+const AXIS_COLORS = { x: "#f06a73", y: "#67c77a", z: "#5d9df5" };
+
+function AxisViewGizmo({ playing }) {
+  const [activeView, setActiveView] = useState(viewport.axisView);
+  const [directions, setDirections] = useState({
+    x: { x: 1, y: 0, depth: 0 },
+    y: { x: 0, y: -1, depth: 0 },
+    z: { x: -0.7, y: 0.7, depth: 0 },
+  });
+
+  useEffect(() => subscribeAxisView(setActiveView), []);
+  useEffect(() => {
+    let disposed = false;
+    let orbit = null;
+    const update = () => {
+      const camera = viewport.camera;
+      if (!camera || disposed) return;
+      const inverse = camera.quaternion.clone().invert();
+      const next = {};
+      for (const axis of ["x", "y", "z"]) {
+        const world = new THREE.Vector3(axis === "x" ? 1 : 0, axis === "y" ? 1 : 0, axis === "z" ? 1 : 0);
+        world.applyQuaternion(inverse);
+        const length = Math.hypot(world.x, world.y);
+        next[axis] = length < 0.001
+          ? { x: 0, y: 0, depth: world.z }
+          : { x: world.x / length, y: -world.y / length, depth: world.z };
+      }
+      setDirections(next);
+    };
+    ensureViewport().then(() => {
+      if (disposed) return;
+      orbit = viewport.orbit;
+      orbit?.addEventListener("change", update);
+      update();
+    });
+    return () => {
+      disposed = true;
+      orbit?.removeEventListener("change", update);
+    };
+  }, []);
+
+  const radius = 27;
+  const endpoints = [];
+  for (const axis of ["x", "y", "z"]) {
+    for (const sign of [-1, 1]) {
+      const direction = directions[axis];
+      endpoints.push({
+        axis,
+        sign,
+        left: 38 + direction.x * radius * sign,
+        top: 38 + direction.y * radius * sign,
+        depth: direction.depth * sign,
+      });
+    }
+  }
+
+  return (
+    <div className={`axis-view-gizmo ${playing ? "disabled" : ""}`} aria-label="Viewport orientation">
+      <svg className="axis-view-lines" viewBox="0 0 76 76" aria-hidden="true">
+        {Object.entries(directions).map(([axis, direction]) => (
+          <line
+            key={axis}
+            x1={38 - direction.x * radius}
+            y1={38 - direction.y * radius}
+            x2={38 + direction.x * radius}
+            y2={38 + direction.y * radius}
+            stroke={AXIS_COLORS[axis]}
+          />
+        ))}
+      </svg>
+      {endpoints
+        .sort((a, b) => a.depth - b.depth)
+        .map(({ axis, sign, left, top, depth }) => {
+          const view = `${sign > 0 ? "+" : "-"}${axis.toUpperCase()}`;
+          return (
+            <button
+              key={view}
+              className={`axis-view-end ${sign > 0 ? "positive" : "negative"} ${activeView === view ? "active" : ""}`}
+              style={{ left, top, zIndex: 3 + Math.round((depth + 1) * 2), "--axis-color": AXIS_COLORS[axis] }}
+              title={`${view} orthographic view`}
+              aria-label={`${view} orthographic view`}
+              disabled={playing}
+              onClick={() => setAxisView(axis, sign)}
+            >
+              {sign > 0 ? axis.toUpperCase() : ""}
+            </button>
+          );
+        })}
+    </div>
+  );
+}
+
 export function ViewportPanel() {
   const containerRef = useRef(null);
   const [backend, setBackend] = useState(viewport.backend);
@@ -2286,10 +2597,12 @@ export function ViewportPanel() {
       setBackend(name);
       const { width, height } = container.getBoundingClientRect();
       engine.setSize(width, height);
+      resizeActiveCamera();
     });
 
     const observer = new ResizeObserver(([entry]) => {
       engine.setSize(entry.contentRect.width, entry.contentRect.height);
+      resizeActiveCamera();
     });
     observer.observe(container);
 
@@ -2421,6 +2734,7 @@ export function ViewportPanel() {
         {playing && <span className="backend-badge playing">Playing</span>}
         {backend && <span className={`backend-badge ${backend === "WebGPU" ? "webgpu" : "webgl"}`}>{backend}</span>}
       </div>
+      {!playing && <AxisViewGizmo playing={playing} />}
       {macroState && (
         <div className="macro-hud">
           <span className="macro-hud-kind">{macroState.label}</span>

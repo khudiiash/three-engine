@@ -1,9 +1,14 @@
 import * as THREE from "three/webgpu";
-import { texture as tslTexture, uv, float, vec3, normalMap } from "three/tsl";
+import { texture as tslTexture, uv, float, vec3, normalMap, normalView } from "three/tsl";
 import { Component } from "../../engine/components/Component.js";
 import { resolveAssetUrl } from "../../engine/assetResolver.js";
 import { loadTextureAsset } from "../../engine/textureAsset.js";
-import { getMaterialInstance, loadMaterialAsset, subscribeMaterial } from "../../engine/materialAsset.js";
+import {
+  compileMaterialGraph,
+  getMaterialInstance,
+  loadMaterialAsset,
+  subscribeMaterial,
+} from "../../engine/materialAsset.js";
 import { getGltfLoader } from "../../engine/gltfLoader.js";
 
 export const MAX_TERRAIN_LAYERS = 4;
@@ -263,6 +268,7 @@ function valueNoise(x, y, seed) {
 export class TerrainComponent extends Component {
   static type = "terrain";
   static label = "Terrain";
+  static tags = ["world", "terrain", "heightmap", "3d"];
   static requiredComponents = ["mesh"];
   static defaults = {
     size: 50,
@@ -550,6 +556,9 @@ export class TerrainComponent extends Component {
     // Per-layer loaded maps: this.layerMaps[i] = { albedo, normal, roughness }.
     this.layerMaps = [];
     this.layerMaterials = [];
+    // Compiled shader-graph mutations per layer / for the base .mat.
+    this.layerGraphs = [];
+    this.baseGraph = null;
     this.layerMaterialUnsubs = [];
     this.baseMaterial = null;
     this.baseMaterialUnsub = null;
@@ -563,24 +572,30 @@ export class TerrainComponent extends Component {
    *   color     = Σ(albedoᵢ·tintᵢ · wᵢ) / Σwᵢ
    *   roughness = Σ(roughnessᵢ         · wᵢ) / Σwᵢ
    *   metalness = Σ(metalnessᵢ         · wᵢ) / Σwᵢ
-   *   normal    = normalMap( Σ(normalTexelᵢ · wᵢ) / Σwᵢ )   [if any normal maps]
+   *   ao        = Σ(aoᵢ                · wᵢ) / Σwᵢ     [if any AO maps]
+   *   normal    = normalize( Σ(normalᵢ · wᵢ) / Σwᵢ )   [if any normal maps]
    *
    * Every existing layer contributes (its scalar tint/roughness apply even
    * without maps), so an untextured layer is a valid flat-colored surface and
    * layer 0 is paintable. With no layers, all channel nodes are cleared and
    * the material falls back to its scalar base color.
    *
-   * Normal blend note: unpacking a normal map is affine (texel·2−1), so
-   * blending the raw 0..1 texels weighted (denominator = Σw) and then calling
-   * normalMap() is identical to blending the unpacked tangent normals — it
-   * lets us reuse three's tangent-space transform without hand-rolling the TBN.
+   * A layer backed by a .mat contributes its whole compiled graph, not just a
+   * diffuse map — `this.layerGraphs[i]` holds the mutations, recompiled against
+   * the layer's tiled UV (see `compileMaterialGraph`).
+   *
+   * Normal blend note: contributions are blended as *decoded* normals (the
+   * space `material.normalNode` expects). A .mat's `normalNode` is already
+   * decoded — it comes out of a Normal Map node — so only the legacy raw
+   * `maps.normal` texel path needs `normalMap()` applied to it here. Blending
+   * the two in encoded 0..1 texel space and decoding once at the end (what this
+   * used to do) double-decodes the .mat contribution and yields wrong lighting.
    */
   #wireMaterialNodes() {
     const layers = (this.props.layers ?? []).slice(0, MAX_TERRAIN_LAYERS);
     const splat = tslTexture(this.splatTexture, uv());
     const rawWeights = [splat.r, splat.g, splat.b, splat.a];
     const weights = rawWeights.map((weight, index) => weight.mul(layers[index]?.opacity ?? 1));
-    const FLAT_NORMAL = vec3(0.5, 0.5, 1.0);
 
     let paintedWeight = null;
     for (let i = 0; i < layers.length; i++) {
@@ -589,45 +604,62 @@ export class TerrainComponent extends Component {
     }
     const baseWeight = paintedWeight ? float(1).sub(paintedWeight).max(float(0)) : float(1);
     const baseAsset = this.baseMaterial;
+    const baseGraph = this.baseGraph ?? {};
     const baseColorValue = baseAsset?.color ?? new THREE.Color(0x8a8f7a);
-    const baseColor = baseAsset?.colorNode
-      ?? (baseAsset?.map ? tslTexture(baseAsset.map, uv()).rgb : null)
-      ?? vec3(baseColorValue.r, baseColorValue.g, baseColorValue.b);
-    const baseRough = baseAsset?.roughnessNode ?? float(baseAsset?.roughness ?? 0.95);
-    const baseMetal = baseAsset?.metalnessNode ?? float(baseAsset?.metalness ?? 0);
-    const baseNormal = baseAsset?.normalNode ?? FLAT_NORMAL;
+    // A graph's `color` slot is fed from a Principled BSDF `color` input, which
+    // is wired straight from a texture's `out` socket — a vec4. Everything else
+    // blended here is vec3, and summing the two mixes an alpha channel into the
+    // color and yields a near-black surface. Truncate to rgb up front.
+    const baseColor = baseGraph.colorNode
+      ? vec3(baseGraph.colorNode)
+      : (baseAsset?.map ? tslTexture(baseAsset.map, uv()).rgb : vec3(baseColorValue.r, baseColorValue.g, baseColorValue.b));
+    const baseRough = baseGraph.roughnessNode ?? float(baseAsset?.roughness ?? 0.95);
+    const baseMetal = baseGraph.metalnessNode ?? float(baseAsset?.metalness ?? 0);
 
     let colorNum = baseColor.mul(baseWeight);
     let roughNum = baseRough.mul(baseWeight);
     let metalNum = baseMetal.mul(baseWeight);
-    let normalNum = baseNormal.mul(baseWeight);
+    let aoNum = (baseGraph.aoNode ?? float(1)).mul(baseWeight);
+    // Layers with no normal map still contribute — as the geometric normal, so
+    // painting a flat layer over a bumpy one correctly flattens it.
+    let normalNum = (baseGraph.normalNode ?? normalView).mul(baseWeight);
     let denom = baseWeight;
-    let hasNormal = !!baseAsset?.normalNode;
+    let hasNormal = !!baseGraph.normalNode;
+    let hasAo = !!baseGraph.aoNode;
 
     for (let i = 0; i < layers.length; i++) {
       const layer = layers[i] ?? {};
       if (layer.visible === false) continue;
       const maps = this.layerMaps[i] ?? {};
       const asset = this.layerMaterials[i] ?? null;
+      const graph = this.layerGraphs?.[i] ?? {};
       const w = weights[i];
       const layerUv = uv().mul(layer.tiling ?? 20);
       const tint = new THREE.Color(layer.tint ?? "#ffffff");
       const tintNode = vec3(tint.r, tint.g, tint.b);
       const assetColor = asset?.color ? vec3(asset.color.r, asset.color.g, asset.color.b) : null;
-      const color = asset?.colorNode
-        ?? (asset?.map ? tslTexture(asset.map, layerUv).rgb : null)
-        ?? assetColor
-        ?? (maps.albedo ? tslTexture(maps.albedo, layerUv).rgb.mul(tintNode) : tintNode);
-      const rough = asset?.roughnessNode
+      const color = (graph.colorNode
+        ? vec3(graph.colorNode)
+        : (asset?.map ? tslTexture(asset.map, layerUv).rgb : null)
+          ?? assetColor
+          ?? (maps.albedo ? tslTexture(maps.albedo, layerUv).rgb : null)
+          ?? vec3(1, 1, 1)
+      ).mul(tintNode);
+      const rough = graph.roughnessNode
         ?? (maps.roughness ? tslTexture(maps.roughness, layerUv).r.mul(layer.roughness ?? 1) : float(asset?.roughness ?? layer.roughness ?? 0.95));
-      const metal = asset?.metalnessNode ?? float(asset?.metalness ?? layer.metalness ?? 0);
-      const normal = asset?.normalNode ?? (maps.normal ? tslTexture(maps.normal, layerUv).xyz : FLAT_NORMAL);
-      if (asset?.normalNode || maps.normal) hasNormal = true;
+      const metal = graph.metalnessNode ?? float(asset?.metalness ?? layer.metalness ?? 0);
+      const ao = graph.aoNode ?? float(1);
+      // A .mat's normalNode is already decoded; a legacy raw texel map is not.
+      const normal = graph.normalNode
+        ?? (maps.normal ? normalMap(tslTexture(maps.normal, layerUv)) : null);
+      if (normal) hasNormal = true;
+      if (graph.aoNode) hasAo = true;
 
       colorNum = colorNum.add(color.mul(w));
       roughNum = roughNum.add(rough.mul(w));
       metalNum = metalNum.add(metal.mul(w));
-      normalNum = normalNum.add(normal.mul(w));
+      aoNum = aoNum.add(ao.mul(w));
+      normalNum = normalNum.add((normal ?? normalView).mul(w));
       denom = denom.add(w);
     }
 
@@ -635,7 +667,9 @@ export class TerrainComponent extends Component {
     this.material.colorNode = colorNum.div(inv);
     this.material.roughnessNode = roughNum.div(inv);
     this.material.metalnessNode = metalNum.div(inv);
-    this.material.normalNode = hasNormal ? normalMap(normalNum.div(inv)) : null;
+    this.material.aoNode = hasAo ? aoNum.div(inv) : null;
+    // Already-decoded normals: blend and renormalize, do NOT decode again.
+    this.material.normalNode = hasNormal ? normalNum.div(inv).normalize() : null;
     this.material.needsUpdate = true;
   }
   #applyTerrainMesh() {
@@ -656,13 +690,17 @@ export class TerrainComponent extends Component {
       return;
     }
     await loadMaterialAsset(path);
+    // The .mat's `*Node` slots are populated by an async graph compile, so the
+    // instance alone is not enough — compile the graph ourselves and blend the
+    // resulting mutations (the base layer samples at the raw UV).
+    const graph = await compileMaterialGraph(path).catch((err) => {
+      console.error(`Terrain base material "${path}": ${err.message}`);
+      return null;
+    });
     if (generation !== this.baseMaterialGeneration || !this.mesh) return;
     this.baseMaterial = getMaterialInstance(path);
-    this.baseMaterialUnsub = subscribeMaterial(path, () => {
-      this.baseMaterial = getMaterialInstance(path);
-      this.#wireMaterialNodes();
-      this.#applyTerrainMesh();
-    });
+    this.baseGraph = graph;
+    this.baseMaterialUnsub = subscribeMaterial(path, () => this.#loadBaseMaterial());
     this.#wireMaterialNodes();
     this.#applyTerrainMesh();
   }
@@ -672,6 +710,7 @@ export class TerrainComponent extends Component {
     this.baseMaterialUnsub?.();
     this.baseMaterialUnsub = null;
     this.baseMaterial = null;
+    this.baseGraph = null;
   }
   /** Load one texture (or null) with the right color space + wrapping. */
   async #loadMap(path, { srgb }) {
@@ -691,6 +730,15 @@ export class TerrainComponent extends Component {
     const layers = (this.props.layers ?? []).slice(0, MAX_TERRAIN_LAYERS);
     const loaded = await Promise.all(layers.map(async (layer) => ({
       material: layer?.material ? await loadMaterialAsset(layer.material) : null,
+      // The .mat's graph is recompiled here against this layer's tiled UV.
+      // Reading the shared instance's `*Node` slots instead would bake in the
+      // graph's own uv() and silently ignore `tiling`.
+      graph: layer?.material
+        ? await compileMaterialGraph(layer.material, { uvNode: uv().mul(layer.tiling ?? 20) }).catch((err) => {
+            console.error(`Terrain layer material "${layer.material}": ${err.message}`);
+            return null;
+          })
+        : null,
       // Back-compat for old scenes; new layers use only material.
       albedo: await this.#loadMap(layer?.material ? "" : (layer?.albedo ?? layer?.texture), { srgb: true }),
       normal: await this.#loadMap(layer?.material ? "" : layer?.normalMap, { srgb: false }),
@@ -701,8 +749,9 @@ export class TerrainComponent extends Component {
     this.#disposeLayerMaterials();
     this.layerMaps = loaded.map(({ albedo, normal, roughness }) => ({ albedo, normal, roughness }));
     this.layerMaterials = loaded.map(({ material }) => material);
+    this.layerGraphs = loaded.map(({ graph }) => graph);
     this.layerMaterialUnsubs = layers.map((layer) => layer?.material
-      ? subscribeMaterial(layer.material, () => this.#wireMaterialNodes())
+      ? subscribeMaterial(layer.material, () => this.#loadLayerMaps())
       : null);
     this.#wireMaterialNodes();
   }
@@ -711,6 +760,7 @@ export class TerrainComponent extends Component {
     for (const unsubscribe of this.layerMaterialUnsubs ?? []) unsubscribe?.();
     this.layerMaterialUnsubs = [];
     this.layerMaterials = [];
+    this.layerGraphs = [];
   }
   #disposeLayerMaps() {
     for (const maps of this.layerMaps ?? []) {

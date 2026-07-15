@@ -11,6 +11,8 @@ import { EnvironmentComponent } from "./EnvironmentComponent.js";
 export const polyhavenModule = {
   id: "polyhaven",
   name: "Poly Haven",
+  category: "Editor",
+  tags: ["editor-import", "assets", "hdri", "pbr", "cc0"],
   description:
     "Browse and download free CC0 PBR materials, models and HDRIs from polyhaven.com straight into the project. Adds an Environment (HDRI) component for image-based lighting and skyboxes.",
   version: "1.0.0",

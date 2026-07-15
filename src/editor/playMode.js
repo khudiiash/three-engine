@@ -5,8 +5,19 @@ import { useSelectionStore } from "./store/selectionStore.js";
 import { usePlayStore } from "./store/playStore.js";
 
 let snapshot = null;
+let transition = null;
 
 export async function play() {
+  if (transition) return transition;
+  transition = doPlay();
+  try {
+    return await transition;
+  } finally {
+    transition = null;
+  }
+}
+
+async function doPlay() {
   const engine = await ensureEngine();
   const { serializeScene } = await import("../engine/index.js");
   if (engine.playing) return;
@@ -16,12 +27,22 @@ export async function play() {
 }
 
 export async function stop() {
+  if (transition) return transition;
+  transition = doStop();
+  try {
+    return await transition;
+  } finally {
+    transition = null;
+  }
+}
+
+async function doStop() {
   const engine = await ensureEngine();
   const { deserializeScene } = await import("../engine/index.js");
   if (!engine.playing) return;
   engine.setPlaying(false);
   if (snapshot) {
-    deserializeScene(engine, snapshot);
+    await deserializeScene(engine, snapshot);
     snapshot = null;
   }
   commandBus.clearHistory();
@@ -31,6 +52,10 @@ export async function stop() {
 }
 
 export async function toggle() {
+  // Ignore repeated toolbar/shortcut input while the snapshot is being
+  // restored. Starting Play midway through that transaction can select a
+  // camera or start scripts from a half-populated scene.
+  if (transition) return transition;
   const engine = await ensureEngine();
   if (engine.playing) await stop();
   else await play();

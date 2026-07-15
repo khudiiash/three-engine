@@ -7,7 +7,6 @@ import { useProjectStore } from "../store/projectStore.js";
 import { toBlobUrl, extOf, readAssetMeta, TEXTURE_EXTENSIONS } from "../assetLoader.js";
 import { TEXTURE_META_DEFAULTS } from "../../engine/textureMeta.js";
 import { refreshMaterialsUsingTexture } from "../../engine/materialAsset.js";
-import { MaterialEditor } from "./MaterialPanel.jsx";
 import { openPanel } from "../EditorShell.jsx";
 import { syncScriptClassNameAfterRename } from "../scriptClassSync.js";
 import { openPrefabMode } from "../prefab.js";
@@ -41,6 +40,7 @@ const TYPE_LABELS = {
   jpeg: "Texture",
   webp: "Texture",
   glb: "Model",
+  geom: "Geometry",
   mat: "Material",
   anim: "Animator",
   prefab: "Prefab",
@@ -231,6 +231,123 @@ function TextureSettings({ path }) {
   );
 }
 
+function MultiTextureSettings({ paths }) {
+  const [metas, setMetas] = useState(null);
+  useEffect(() => {
+    let live = true;
+    Promise.all(paths.map(async (path) => ({
+      path,
+      meta: { ...TEXTURE_META_DEFAULTS, ...((await readAssetMeta(`${path}.meta`)) ?? {}) },
+    }))).then((value) => live && setMetas(value));
+    return () => { live = false; };
+  }, [paths.join("|")]);
+  if (!metas?.length) return null;
+
+  const allSame = (read) => metas.every((entry) => Object.is(read(entry.meta), read(metas[0].meta)));
+  const patch = async (createPatch) => {
+    const next = metas.map(({ path, meta }) => ({ path, meta: { ...meta, ...createPatch(meta) } }));
+    setMetas(next);
+    await Promise.all(next.map(async ({ path, meta }) => {
+      await invoke("save_scene", { path: `${path}.meta`, contents: JSON.stringify(meta, null, 2) });
+      refreshMaterialsUsingTexture(path);
+    })).catch((error) => console.error(`Failed to save texture settings: ${error}`));
+  };
+  const select = (key, options) => {
+    const same = allSame((meta) => meta[key]);
+    return (
+      <select className="select-field" value={same ? metas[0].meta[key] : ""} onChange={(event) => patch(() => ({ [key]: event.target.value }))}>
+        {!same && <option value="">— Mixed —</option>}
+        {options.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+      </select>
+    );
+  };
+  const mixedCheckbox = (key, read = (meta) => meta[key]) => {
+    const same = allSame(read);
+    const ref = (element) => { if (element) element.indeterminate = !same; };
+    return (
+      <input
+        ref={ref}
+        type="checkbox"
+        checked={same && !!read(metas[0].meta)}
+        onChange={(event) => patch(() => ({ [key]: event.target.checked }))}
+      />
+    );
+  };
+
+  return (
+    <div className="inspector-section">
+      <div className="section-header">Shared Import Settings</div>
+      <div className="field-row">
+        <span className="field-label">Filtering</span>
+        {select("filter", [["linear", "Linear"], ["nearest", "Nearest (pixel art)"]])}
+      </div>
+      <div className="field-row">
+        <span className="field-label">Wrap U</span>
+        {select("wrapS", [["repeat", "Repeat"], ["clamp", "Clamp"], ["mirror", "Mirror"]])}
+      </div>
+      <div className="field-row">
+        <span className="field-label">Wrap V</span>
+        {select("wrapT", [["repeat", "Repeat"], ["clamp", "Clamp"], ["mirror", "Mirror"]])}
+      </div>
+      <div className="field-row">
+        <span className="field-label">Tiling</span>
+        <div className="vector-fields">
+          {[0, 1].map((axis) => {
+            const same = allSame((meta) => meta.repeat?.[axis] ?? 1);
+            return (
+              <input
+                key={axis}
+                className="number-field"
+                type="number"
+                step={0.5}
+                value={same ? (metas[0].meta.repeat?.[axis] ?? 1) : ""}
+                placeholder={same ? undefined : "—"}
+                onChange={(event) => {
+                  const value = Number.parseFloat(event.target.value);
+                  if (!Number.isFinite(value)) return;
+                  patch((meta) => {
+                    const repeat = [...(meta.repeat ?? [1, 1])];
+                    repeat[axis] = value;
+                    return { repeat };
+                  });
+                }}
+              />
+            );
+          })}
+        </div>
+      </div>
+      <div className="field-row">
+        <span className="field-label">Flip Y</span>
+        {mixedCheckbox("flipY", (meta) => meta.flipY !== false)}
+      </div>
+      <div className="asset-hint">Changes apply to all {paths.length} selected textures.</div>
+    </div>
+  );
+}
+
+function MultiAssetInspector({ paths }) {
+  const extensions = paths.map(extOf);
+  const allTextures = extensions.every((ext) => TEXTURE_EXTENSIONS.includes(ext));
+  const allVirtualGeometry = extensions.every((ext) => ext === "geom" || ext === "glb");
+  const sameType = extensions.every((ext) => ext === extensions[0]);
+  return (
+    <div className="inspector-panel">
+      <div className="inspector-section multi-selection-summary">
+        <div className="section-header">{paths.length} Assets Selected</div>
+        <div className="field-row">
+          <span className="field-label">Type</span>
+          <span className="asset-type-badge">{allTextures ? "Textures" : sameType ? (TYPE_LABELS[extensions[0]] ?? extensions[0].toUpperCase()) : "Mixed"}</span>
+        </div>
+      </div>
+      {allTextures ? <MultiTextureSettings paths={paths} /> : allVirtualGeometry ? (
+        <MultiVirtualGeometrySettings paths={paths} />
+      ) : (
+        <div className="asset-hint">Batch editing is available when the selected assets share editable import settings.</div>
+      )}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Model (.glb) 3D preview: its own small WebGPU renderer + slow turntable.
 // ---------------------------------------------------------------------------
@@ -381,9 +498,11 @@ function VirtualGeometrySettings({ path }) {
       const meta = await readAssetMeta(`${path}.meta`);
       const { VIRTUAL_GEOMETRY_META_DEFAULTS } = await import("../../modules/virtual-geometry/index.js");
       const stored = meta?.virtualGeometry ?? {};
-      const merged = { ...VIRTUAL_GEOMETRY_META_DEFAULTS, ...stored };
-      // Legacy boolean from the first iteration of the settings.
-      if (stored.debugView == null && stored.debugClusters) merged.debugView = "clusters";
+      const merged = {
+        ...VIRTUAL_GEOMETRY_META_DEFAULTS,
+        enabled: stored.enabled === true,
+        pixelError: stored.pixelError ?? VIRTUAL_GEOMETRY_META_DEFAULTS.pixelError,
+      };
       if (live) setVg(merged);
     })();
     return () => (live = false);
@@ -427,25 +546,98 @@ function VirtualGeometrySettings({ path }) {
               onChange={(e) => patch({ pixelError: Math.max(0.05, parseFloat(e.target.value) || 1) })}
             />
           </div>
-          <div className="field-row">
-            <span className="field-label">Debug View</span>
-            <select
-              className="select-field"
-              value={vg.debugView ?? "off"}
-              onChange={(e) => patch({ debugView: e.target.value })}
-            >
-              <option value="off">Off</option>
-              <option value="triangles">Triangles</option>
-              <option value="clusters">Clusters</option>
-            </select>
-          </div>
           <div className="asset-hint">
             Renders static meshes through Nanite-style cluster LOD wherever this asset is used. Pixel Error is the
-            screen-space error budget — higher is faster, lower is sharper. Debug views color the live
-            cut: Triangles per-triangle (density shows LOD), Clusters one color per ~128-triangle patch.
+            screen-space error budget — higher is faster, lower is sharper. Use the viewport's Virtual Geometry
+            layer to color every triangle in the live LOD cut.
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function MultiVirtualGeometrySettings({ paths }) {
+  const modulesEnabled = useModulesStore((state) => state.enabled);
+  const [entries, setEntries] = useState(null);
+
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      const { VIRTUAL_GEOMETRY_META_DEFAULTS } = await import("../../modules/virtual-geometry/index.js");
+      const loaded = await Promise.all(paths.map(async (path) => {
+        const meta = (await readAssetMeta(`${path}.meta`)) ?? {};
+        const stored = meta.virtualGeometry ?? {};
+        const vg = {
+          ...VIRTUAL_GEOMETRY_META_DEFAULTS,
+          enabled: stored.enabled === true,
+          pixelError: stored.pixelError ?? VIRTUAL_GEOMETRY_META_DEFAULTS.pixelError,
+        };
+        return { path, meta, vg };
+      }));
+      if (live) setEntries(loaded);
+    })().catch((error) => console.error(`Failed to load virtual geometry settings: ${error}`));
+    return () => { live = false; };
+  }, [paths.join("|")]);
+
+  if (!modulesEnabled.includes("virtual-geometry") || !entries?.length) return null;
+
+  const same = (key) => entries.every((entry) => Object.is(entry.vg[key], entries[0].vg[key]));
+  const patch = async (partial) => {
+    const next = entries.map((entry) => ({ ...entry, vg: { ...entry.vg, ...partial } }));
+    setEntries(next);
+    try {
+      const { refreshVirtualGeometryAsset } = await import("../../modules/virtual-geometry/index.js");
+      await Promise.all(next.map(async ({ path, meta, vg }) => {
+        const nextMeta = { ...meta, virtualGeometry: vg };
+        await invoke("save_scene", { path: `${path}.meta`, contents: JSON.stringify(nextMeta, null, 2) });
+        refreshVirtualGeometryAsset(path);
+      }));
+    } catch (error) {
+      console.error(`Failed to save virtual geometry settings: ${error}`);
+    }
+  };
+
+  const enabledSame = same("enabled");
+  const anyEnabled = entries.some((entry) => entry.vg.enabled === true);
+  const pixelSame = same("pixelError");
+  return (
+    <div className="inspector-section">
+      <div className="section-header">Virtual Geometry</div>
+      <div className="field-row">
+        <span className="field-label">Enabled</span>
+        <input
+          ref={(element) => { if (element) element.indeterminate = !enabledSame; }}
+          type="checkbox"
+          checked={enabledSame && entries[0].vg.enabled === true}
+          onChange={(event) => patch({ enabled: event.target.checked })}
+        />
+      </div>
+      {(anyEnabled || !enabledSame) && (
+        <>
+          <div className="field-row">
+            <span className="field-label">Pixel Error</span>
+            <input
+              className="number-field"
+              type="number"
+              min={0.25}
+              max={32}
+              step={0.25}
+              key={pixelSame ? entries[0].vg.pixelError : "mixed"}
+              defaultValue={pixelSame ? entries[0].vg.pixelError : ""}
+              placeholder={pixelSame ? undefined : "—"}
+              onBlur={(event) => {
+                const value = Number.parseFloat(event.target.value);
+                if (Number.isFinite(value) && (!pixelSame || value !== entries[0].vg.pixelError)) {
+                  patch({ pixelError: Math.max(0.05, value) });
+                }
+              }}
+              onKeyDown={(event) => event.key === "Enter" && event.currentTarget.blur()}
+            />
+          </div>
+        </>
+      )}
+      <div className="asset-hint">Changes apply to all {paths.length} selected geometry assets.</div>
     </div>
   );
 }
@@ -465,6 +657,40 @@ function JsonSummary({ path, render }) {
     return () => (live = false);
   }, [path]);
   return data ? render(data) : null;
+}
+
+/**
+ * A material has no inspector-editable settings: its surface is entirely
+ * defined by its shader graph, so the Shader Graph panel is the only editor.
+ * (The .mat's legacy scalar color/roughness/metalness/map fields still exist in
+ * the file format for back-compat, but nothing in the UI writes them.)
+ */
+function MaterialSummary({ path }) {
+  return (
+    <JsonSummary
+      path={path}
+      render={(def) => (
+        <div className="inspector-section">
+          <div className="section-header">Material</div>
+          <div className="asset-info-row">
+            {def.shaderGraph?.nodes?.length
+              ? `${def.shaderGraph.nodes.length} nodes · ${(def.shaderGraph.edges ?? []).length} connections`
+              : "No shader graph — open the editor to build one"}
+          </div>
+          <button
+            className="toolbar-btn wide"
+            onClick={() => {
+              useSelectionStore.getState().selectAsset(path);
+              openPanel("shaderGraph");
+            }}
+          >
+            <Workflow size={13} />
+            Open Shader Graph
+          </button>
+        </div>
+      )}
+    />
+  );
 }
 
 function AnimatorSummary({ path }) {
@@ -545,6 +771,8 @@ function PrefabSummary({ path }) {
 
 /** Shown when an Assets-panel file is selected instead of an entity. */
 export function AssetInspector({ path }) {
+  const assetPaths = useSelectionStore((state) => state.assetPaths);
+  if (assetPaths.length > 1) return <MultiAssetInspector paths={assetPaths} />;
   const ext = extOf(path);
   const isTexture = TEXTURE_EXTENSIONS.includes(ext);
 
@@ -595,7 +823,7 @@ export function AssetInspector({ path }) {
         </>
       )}
       {ext === "geom" && <VirtualGeometrySettings path={path} />}
-      {ext === "mat" && <MaterialEditor matPath={path} />}
+      {ext === "mat" && <MaterialSummary path={path} />}
       {ext === "anim" && <AnimatorSummary path={path} />}
       {(ext === "prefab" || ext === "entity") && <PrefabSummary path={path} />}
     </div>

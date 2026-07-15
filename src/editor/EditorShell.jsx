@@ -1,7 +1,11 @@
 import { Suspense, lazy } from "react";
 import { DockviewReact, themeAbyss } from "dockview-react";
 
-const LAYOUT_KEY = "engine.layout.v1";
+// Bumped to v2 when the "material" panel was removed (materials are edited only
+// through the Shader Graph now). A v1 layout can still contain a Material tab,
+// and `fromJSON` throws on a component that is no longer registered — leaving
+// the dock half-restored. Bumping the key drops those layouts instead.
+const LAYOUT_KEY = "engine.layout.v2";
 
 // Heavy panels: lazy so their deps (three/webgpu, @xyflow/react,
 // particleGraph) don't enter the boot path. The viewport alone pulls in
@@ -14,7 +18,6 @@ const ConsolePanel = lazy(() => import("./panels/ConsolePanel.jsx").then((m) => 
 const ConsoleTab = lazy(() => import("./panels/ConsoleTab.jsx").then((m) => ({ default: m.ConsoleTab })));
 const ShaderGraphPanel = lazy(() => import("./panels/ShaderGraphPanel.jsx").then((m) => ({ default: m.ShaderGraphPanel })));
 const ParticlesPanel = lazy(() => import("./panels/ParticlesPanel.jsx").then((m) => ({ default: m.ParticlesPanel })));
-const MaterialPanel = lazy(() => import("./panels/MaterialPanel.jsx").then((m) => ({ default: m.MaterialPanel })));
 const AnimatorPanel = lazy(() => import("./panels/AnimatorPanel.jsx").then((m) => ({ default: m.AnimatorPanel })));
 const SceneSettingsPanel = lazy(() => import("./panels/SceneSettingsPanel.jsx").then((m) => ({ default: m.SceneSettingsPanel })));
 const ProjectSettingsPanel = lazy(() => import("./panels/ProjectSettingsPanel.jsx").then((m) => ({ default: m.ProjectSettingsPanel })));
@@ -23,24 +26,42 @@ const InputPanel = lazy(() => import("./panels/InputPanel.jsx").then((m) => ({ d
 const GeometryEditorPanel = lazy(() => import("./panels/GeometryEditorPanel.jsx").then((m) => ({ default: m.GeometryEditorPanel })));
 const PostprocessPanel = lazy(() => import("./panels/PostprocessPanel.jsx").then((m) => ({ default: m.PostprocessPanel })));
 const PolyHavenPanel = lazy(() => import("./panels/PolyHavenPanel.jsx").then((m) => ({ default: m.PolyHavenPanel })));
+const AmbientCGPanel = lazy(() => import("./panels/AmbientCGPanel.jsx").then((m) => ({ default: m.AmbientCGPanel })));
+const SketchfabPanel = lazy(() => import("./panels/SketchfabPanel.jsx").then((m) => ({ default: m.SketchfabPanel })));
+
+/** Keep lazy loading local to one Dockview portal. A shared boundary around
+ * Dockview would hide the entire editor whenever any heavy panel suspends. */
+function withPanelSuspense(LazyPanel, fallback = <PanelFallback />) {
+  return function SuspendedDockPanel(props) {
+    return (
+      <Suspense fallback={fallback}>
+        <LazyPanel {...props} />
+      </Suspense>
+    );
+  };
+}
 
 const panelComponents = {
-  viewport: ViewportPanel,
-  hierarchy: HierarchyPanel,
-  inspector: InspectorPanel,
-  assets: AssetsPanel,
-  console: ConsolePanel,
-  shaderGraph: ShaderGraphPanel,
-  particles: ParticlesPanel,
-  material: MaterialPanel,
-  animator: AnimatorPanel,
-  sceneSettings: SceneSettingsPanel,
-  projectSettings: ProjectSettingsPanel,
-  modules: ModulesPanel,
-  input: InputPanel,
-  geometryEditor: GeometryEditorPanel,
-  postprocess: PostprocessPanel,
-  polyhaven: PolyHavenPanel,
+  viewport: withPanelSuspense(ViewportPanel),
+  hierarchy: withPanelSuspense(HierarchyPanel),
+  inspector: withPanelSuspense(InspectorPanel),
+  assets: withPanelSuspense(AssetsPanel),
+  console: withPanelSuspense(ConsolePanel),
+  shaderGraph: withPanelSuspense(ShaderGraphPanel),
+  particles: withPanelSuspense(ParticlesPanel),
+  animator: withPanelSuspense(AnimatorPanel),
+  sceneSettings: withPanelSuspense(SceneSettingsPanel),
+  projectSettings: withPanelSuspense(ProjectSettingsPanel),
+  modules: withPanelSuspense(ModulesPanel),
+  input: withPanelSuspense(InputPanel),
+  geometryEditor: withPanelSuspense(GeometryEditorPanel),
+  postprocess: withPanelSuspense(PostprocessPanel),
+  polyhaven: withPanelSuspense(PolyHavenPanel),
+  ambientcg: withPanelSuspense(AmbientCGPanel),
+  sketchfab: withPanelSuspense(SketchfabPanel),
+};
+const tabComponents = {
+  console: withPanelSuspense(ConsoleTab, <span className="tab-loading">Console</span>),
 };
 
 // The chrome (menu bar + scene/keyboard bootstrap) is lazy-loaded behind a
@@ -50,7 +71,7 @@ const panelComponents = {
 const EditorChrome = lazy(() => import("./EditorChrome.jsx").then((m) => ({ default: m.EditorChrome })));
 
 function PanelFallback() {
-  return <div style={{ padding: 12, color: "#9aa3b2", fontSize: 12 }}>Loading…</div>;
+  return <div className="panel-loading">Loading panel…</div>;
 }
 
 /** Where each panel prefers to (re)open. referencePanel falls back if closed too. */
@@ -62,7 +83,6 @@ export const PANEL_SPECS = {
   console: { title: "Console", position: { referencePanel: "assets", direction: "within" } },
   shaderGraph: { title: "Shader Graph", position: { referencePanel: "assets", direction: "within" } },
   particles: { title: "Particles", position: { referencePanel: "inspector", direction: "within" } },
-  material: { title: "Material", position: { referencePanel: "inspector", direction: "within" } },
   animator: { title: "Animator", position: { referencePanel: "assets", direction: "within" } },
   sceneSettings: { title: "Scene Settings", position: { referencePanel: "inspector", direction: "within" } },
   projectSettings: { title: "Project Settings", position: { referencePanel: "inspector", direction: "within" } },
@@ -71,6 +91,8 @@ export const PANEL_SPECS = {
   geometryEditor: { title: "Geometry Editor", position: { referencePanel: "viewport", direction: "within" } },
   postprocess: { title: "Post Process", position: { referencePanel: "inspector", direction: "within" } },
   polyhaven: { title: "Poly Haven", position: { referencePanel: "assets", direction: "within" } },
+  ambientcg: { title: "AmbientCG", position: { referencePanel: "assets", direction: "within" } },
+  sketchfab: { title: "Sketchfab", position: { referencePanel: "assets", direction: "within" } },
 };
 
 let dockApi = null;
@@ -93,11 +115,27 @@ const pendingOpenPanels = new Set();
  * the user, addPanel against it as a reference can no-op without
  * logging). Active panel first, then iterate visible panels.
  */
-function pickVisibleAnchorId() {
+function isUsableAnchor(panel) {
+  const groupApi = panel?.group?.api;
+  if (!groupApi?.isVisible) return false;
+  try {
+    return groupApi.location?.type === "grid";
+  } catch {
+    return false;
+  }
+}
+
+function revealPanel(panel) {
+  const groupApi = panel?.group?.api;
+  if (groupApi && !groupApi.isVisible) groupApi.setVisible(true);
+  panel.api.setActive();
+}
+
+function pickVisibleAnchor() {
   const active = dockApi.activePanel;
-  if (active?.api?.isVisible) return active.id;
+  if (isUsableAnchor(active)) return active;
   for (const panel of dockApi.panels) {
-    if (panel.api?.isVisible) return panel.id;
+    if (isUsableAnchor(panel)) return panel;
   }
   return null;
 }
@@ -113,7 +151,7 @@ export function openPanel(id) {
   }
   const existing = dockApi.getPanel(id);
   if (existing) {
-    existing.api.setActive();
+    revealPanel(existing);
     return;
   }
   const spec = PANEL_SPECS[id];
@@ -146,21 +184,26 @@ export function openPanel(id) {
     // (a)
   } else if (!position.referencePanel) {
     options.position = position; // (b)
-  } else if (dockApi.getPanel(position.referencePanel)?.api?.isVisible) {
-    options.position = position; // (c)
-  } else if (dockApi.panels.some((p) => p.api?.isVisible)) {
+  } else if (isUsableAnchor(dockApi.getPanel(position.referencePanel))) {
+    // Pass the live object. String ids restored from an older layout can point
+    // at a hidden/stale group even though getPanel briefly resolves them.
+    options.position = {
+      ...position,
+      referencePanel: dockApi.getPanel(position.referencePanel),
+    }; // (c)
+  } else if (pickVisibleAnchor()) {
     // (d) — log so future layout-fallback surprises are debuggable.
     console.warn(
       `openPanel(${id}): preferred anchor "${position.referencePanel}" is not visible; docking to a visible panel.`,
     );
     options.position = {
-      referencePanel: pickVisibleAnchorId(),
+      referencePanel: pickVisibleAnchor(),
       direction: "within",
     };
   }
   // (e) — no `options.position` set: addPanel docks to container edge.
   const panel = dockApi.addPanel(options);
-  panel.api.setActive();
+  revealPanel(panel);
 }
 
 /** Wipes the saved layout and rebuilds the default one. */
@@ -250,18 +293,16 @@ export function EditorShell() {
         <EditorChrome />
       </Suspense>
       <div className="dock-container">
-        <Suspense fallback={<PanelFallback />}>
-          <DockviewReact
-            components={panelComponents}
-            tabComponents={{ console: ConsoleTab }}
-            onReady={onDockReady}
-            theme={themeAbyss}
-            // Tauri's embedded webview can swallow HTML5 drag/drop events.
-            // Pointer DnD keeps tabs movable between dock groups as well as
-            // reorderable within their current group.
-            dndStrategy="pointer"
-          />
-        </Suspense>
+        <DockviewReact
+          components={panelComponents}
+          tabComponents={tabComponents}
+          onReady={onDockReady}
+          theme={themeAbyss}
+          // Tauri's embedded webview can swallow HTML5 drag/drop events.
+          // Pointer DnD keeps tabs movable between dock groups as well as
+          // reorderable within their current group.
+          dndStrategy="pointer"
+        />
       </div>
     </div>
   );

@@ -1,5 +1,6 @@
 import { toBlobUrl } from "./assetLoader.js";
 import { useProjectStore, basename } from "./store/projectStore.js";
+import { useAssetProcessingStore } from "./store/assetProcessingStore.js";
 import { MATERIAL_DEFAULTS } from "../engine/materialAsset.js";
 import { GEOMETRY_ASSET_VERSION } from "../engine/geometryAsset.js";
 import { createGltfLoader } from "../engine/gltfLoader.js";
@@ -85,12 +86,28 @@ function geometryAssetFromMesh(geometry) {
     }
     return out;
   };
-  const attributeAsset = (attribute) => ({
-    itemSize: attribute.itemSize,
-    normalized: !!attribute.normalized,
-    arrayType: attribute.array.constructor.name,
-    array: Array.from(attribute.array, round6),
-  });
+  const attributeAsset = (attribute) => {
+    // glTF optimizers commonly interleave tangent/color/skin attributes.
+    // InterleavedBufferAttribute exposes its storage through `.data.array`,
+    // not `.array`; serializing the latter aborted the entire import after
+    // materials/textures had already been written.
+    const source = attribute.array ?? attribute.data?.array;
+    if (!source) throw new Error("Unsupported vertex attribute storage");
+    const stride = attribute.isInterleavedBufferAttribute ? attribute.data.stride : attribute.itemSize;
+    const offset = attribute.isInterleavedBufferAttribute ? attribute.offset : 0;
+    const array = new Array(attribute.count * attribute.itemSize);
+    for (let i = 0; i < attribute.count; i++) {
+      for (let component = 0; component < attribute.itemSize; component++) {
+        array[i * attribute.itemSize + component] = round6(source[i * stride + offset + component]);
+      }
+    }
+    return {
+      itemSize: attribute.itemSize,
+      normalized: !!attribute.normalized,
+      arrayType: source.constructor.name,
+      array,
+    };
+  };
   const attributes = {};
   for (const [name, attribute] of Object.entries(geometry.attributes)) {
     if (name !== "position" && name !== "normal" && name !== "uv") {
@@ -117,12 +134,20 @@ function geometryAssetFromMesh(geometry) {
 }
 
 /** Unpacks a .glb in place; returns the created folder path (or null). */
-export async function unpackGlb(glbPath) {
+export async function unpackGlb(glbPath, { assetStem = null, cleanupPaths = [] } = {}) {
+  return useAssetProcessingStore.getState().track(
+    (p) => `Unpacking ${basename(p)}…`,
+    (p) => unpackGlbImpl(p, { assetStem, cleanupPaths }),
+    glbPath,
+  );
+}
+
+async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = {}) {
   const gltf = await loader.loadAsync(await toBlobUrl(glbPath));
 
   const dir = glbPath.replace(/[\\/][^\\/]+$/, "");
   const fileName = basename(glbPath);
-  const stem = stemOf(fileName);
+  const stem = assetStem ?? stemOf(fileName);
   const folder = `${dir}/${await uniqueChildName(dir, stem)}`;
   await invoke("create_dir", { path: folder });
 
@@ -253,10 +278,13 @@ export async function unpackGlb(glbPath) {
     for (let i = 1; geomNames.has(name); i++) name = `${base} ${i}`;
     geomNames.add(name);
     const path = `${folder}/Geometry/${name}.geom`;
-    await invoke("save_scene", {
-      path,
-      contents: JSON.stringify(geometryAssetFromMesh(mesh.geometry)),
-    });
+    let contents;
+    try {
+      contents = JSON.stringify(geometryAssetFromMesh(mesh.geometry));
+    } catch (error) {
+      throw new Error(`Could not extract geometry "${mesh.name || "Mesh"}": ${error.message ?? error}`);
+    }
+    await invoke("save_scene", { path, contents });
     geometryCount++;
     return path;
   };
@@ -309,7 +337,7 @@ export async function unpackGlb(glbPath) {
     await invoke("delete_path", { path: `${glbPath}.meta` }).catch(() => {});
   } else {
     // --- legacy path: skinned/animated models stay GLB-backed ---------------
-    const movedGlb = `${folder}/${fileName}`;
+    const movedGlb = `${folder}/${stem}.glb`;
     await invoke("rename_path", { from: glbPath, to: movedGlb });
 
     const clips = gltf.animations ?? [];
@@ -399,6 +427,14 @@ export async function unpackGlb(glbPath) {
   await invoke("save_scene", { path: prefabPath, contents: JSON.stringify(prefabDef, null, 2) });
   const { loadPrefabFile } = await import("./prefab.js");
   await loadPrefabFile(prefabPath); // register it so it can be dropped immediately
+
+  // Converted source formats (FBX today) are retained until conversion,
+  // unpack, prefab write, and registration all succeed. A failure leaves the
+  // source untouched so the user can inspect or retry it.
+  for (const path of cleanupPaths) {
+    await invoke("delete_path", { path }).catch(() => {});
+    await invoke("delete_path", { path: `${path}.meta` }).catch(() => {});
+  }
 
   await useProjectStore.getState().refresh();
   const clips = gltf.animations ?? [];

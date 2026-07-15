@@ -84,6 +84,19 @@ step();
 assert.ok(player.object3D.position.x > 9 && player.object3D.position.x < 11, "teleported in x");
 assert.ok(player.object3D.position.z < -3 && player.object3D.position.z > -5, "teleported in z");
 
+// A browser/Tauri animation loop can report a very large delta after the
+// editor was minimized. The fixed-step cap must absorb it without invalidating
+// the live character handles.
+assert.doesNotThrow(() => step(5), "large resume delta keeps the character live");
+assert.ok(cc.body && cc.collider && cc.controller, "handles survive a resumed frame");
+
+// -- live removal must unregister the Rapier handles before the next tick --
+// This is also the stale-entry path seen when a suspended editor resumes after
+// an entity/component lifecycle change.
+player.removeComponent("charactercontroller");
+assert.equal(engine.physics.characters.length, 0, "character entry removed immediately on detach");
+assert.doesNotThrow(() => step(), "next/resumed physics tick ignores the detached character");
+
 engine.setPlaying(false);
 assert.equal(cc.body, null, "body cleared on stop");
 assert.equal(cc.controller, null, "controller cleared on stop");

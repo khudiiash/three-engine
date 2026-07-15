@@ -18,7 +18,7 @@ export const PROJECT_SETTINGS_DEFAULTS = {
     // Viewport Layers dropdown toggles. Persisted per-project so a return
     // visit picks up the user's preferred view (e.g. "hide colliders +
     // grid for a clean scene review").
-    layers: { gizmos: true, colliders: true, grid: true, stats: true },
+    layers: { gizmos: true, colliders: true, grid: true, stats: true, virtualGeometry: false },
     // User-rebindable visibility hotkeys (H, Shift+H, E, Shift+E by
     // default). Each entry maps an action id → chord string; the
     // dispatcher in keybindings.js reads this on every keydown so
@@ -75,7 +75,7 @@ export async function applyProjectSettings(settings = getProjectSettings()) {
   // its backend resolves, and touching it in that window breaks the loop.
   if (engine.rendererReady) {
     const dpr = window.devicePixelRatio ?? 1;
-    engine.renderer.setPixelRatio(Math.min(dpr, settings.rendering.pixelRatioCap ?? dpr));
+    engine.setPixelRatio(Math.min(dpr, settings.rendering.pixelRatioCap ?? dpr));
     // Re-apply the current size so the new pixel ratio takes effect.
     const canvas = engine.renderer.domElement;
     if (canvas?.clientWidth) engine.setSize(canvas.clientWidth, canvas.clientHeight);

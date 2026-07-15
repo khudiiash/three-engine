@@ -8,6 +8,12 @@ import { registerComponent, unregisterComponent } from "./components/registry.js
  *     name        — display name for the editor
  *     description — one-liner for the Modules panel
  *     version     — display version string
+ *     category    — group label for the Modules panel list ("Physics",
+ *                   "Rendering", "Optimization", "Editor", "World").
+ *                   Editor-only metadata; the runtime doesn't read it.
+ *                   Defaults to "Other" when omitted.
+ *     tags        — short string array used by the Modules panel search
+ *                   (e.g. ["wasm", "3d"]). Free-form; editor-only.
  *     components  — component classes registered while the module is enabled
  *     setup(engine) — async; per-engine runtime setup (create systems,
  *                     subscribe to engine events). Returns a handle whose
@@ -31,7 +37,14 @@ export function getModuleDefinition(id) {
 }
 
 export function getModuleDefinitions() {
-  return [...definitions.values()];
+  // Surface `category` / `tags` with safe defaults so the Modules panel
+  // doesn't have to defensive-check every definition (third-party modules
+  // registered before these fields were introduced still work).
+  return [...definitions.values()].map((d) => ({
+    ...d,
+    category: d.category ?? "Other",
+    tags: d.tags ?? [],
+  }));
 }
 
 /** Registers the module's components and runs its setup on this engine. */

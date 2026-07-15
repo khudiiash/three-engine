@@ -20,6 +20,8 @@ export const postprocessingModule = {
   id: "postprocessing",
   name: "Post Processing",
   version: "1.0.0",
+  category: "Rendering",
+  tags: ["rendering", "camera", "screen-space", "graph", "ssgi", "ssr"],
   description:
     "Node-graph screen-space effects for cameras. Add a Postprocess component to any camera, " +
     "then open Window → Post Process to wire SSGI, SSR, color grading, and effects.",

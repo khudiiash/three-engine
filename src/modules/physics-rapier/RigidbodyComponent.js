@@ -12,6 +12,7 @@ import { Component } from "../../engine/components/Component.js";
 export class RigidbodyComponent extends Component {
   static type = "rigidbody";
   static label = "Rigidbody";
+  static tags = ["physics", "play-mode", "3d"];
   static defaults = {
     bodyType: "dynamic",
     mass: 1,

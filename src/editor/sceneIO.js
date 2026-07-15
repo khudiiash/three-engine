@@ -126,7 +126,7 @@ export async function restoreLastScene() {
   try {
     const { deserializeScene } = await import("../engine/index.js");
     const contents = await invoke("load_scene", { path });
-    deserializeScene(engine, JSON.parse(contents));
+    await deserializeScene(engine, JSON.parse(contents));
     engine.sceneName = sceneNameFromPath(path);
     currentPath = path;
     afterSceneSwap();
@@ -250,7 +250,7 @@ export async function openScenePath(path) {
   const { invoke } = await import("@tauri-apps/api/core");
   const { deserializeScene } = await import("../engine/index.js");
   const contents = await invoke("load_scene", { path });
-  deserializeScene(engine, JSON.parse(contents));
+  await deserializeScene(engine, JSON.parse(contents));
   engine.sceneName = sceneNameFromPath(path);
   rememberScene(path);
   afterSceneSwap();

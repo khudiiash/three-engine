@@ -127,19 +127,32 @@ function TslNode({ id, data, selected }) {
         )}
         {outputs.length === 1 && <Handle type="source" position={Position.Right} id={outputs[0]} className={`shader-handle pt-${def.out ?? "any"}`} />}
       </div>
-      {thumb && (
+      {/* A multi-output node (Texture: out/r/g/b/a) sits its preview *beside*
+          the socket column rather than stacked above it — otherwise the node
+          grows to preview height + five rows and towers over the graph. */}
+      {thumb && outputs.length <= 1 && (
         <div className="node-thumb nodrag">
           <canvas width={96} height={96} ref={(el) => data.registerThumb(id, el)} />
         </div>
       )}
       <div className="shader-node-body">
-        {outputs.length > 1 &&
-          outputs.map((o) => (
-            <div className="shader-node-row out-row" key={`out-${o}`}>
-              <span className="shader-port-label out">{o}</span>
-              <Handle type="source" position={Position.Right} id={o} className={`shader-handle pt-${def.out ?? "any"}`} />
+        {outputs.length > 1 && (
+          <div className="node-output-group">
+            {thumb && (
+              <div className="node-thumb inline nodrag">
+                <canvas width={96} height={96} ref={(el) => data.registerThumb(id, el)} />
+              </div>
+            )}
+            <div className="node-output-ports">
+              {outputs.map((o) => (
+                <div className="shader-node-row out-row" key={`out-${o}`}>
+                  <span className="shader-port-label out">{o}</span>
+                  <Handle type="source" position={Position.Right} id={o} className={`shader-handle pt-${def.out ?? "any"}`} />
+                </div>
+              ))}
             </div>
-          ))}
+          </div>
+        )}
         {(def.inputs ?? []).map((spec) => {
           const wired = wiredSet?.has(spec.key) ?? false;
           const editable = spec.default != null && !Array.isArray(spec.default);
@@ -282,14 +295,26 @@ function MaterialPreview({ material }) {
     let disposed = false;
     let renderer;
     let resizeObserver;
+    let camera;
     (async () => {
       renderer = new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true });
       renderer.setPixelRatio(window.devicePixelRatio);
+      // The camera's aspect MUST be refreshed here, not just the renderer's
+      // size. This panel commonly mounts inside a hidden dock tab, where the
+      // canvas is 0x0 — deriving the aspect once from clientWidth/clientHeight
+      // then yields 0/0 = NaN, which poisons the projection matrix and the
+      // preview renders nothing forever (it never recovers, because the tab
+      // becoming visible only ever resized the renderer). Hence: no camera
+      // aspect is set until we have a real box.
       const resize = () => {
         const width = canvas.clientWidth;
         const height = canvas.clientHeight;
         if (width < 1 || height < 1) return false;
         renderer.setSize(width, height, false);
+        if (camera) {
+          camera.aspect = width / height;
+          camera.updateProjectionMatrix();
+        }
         return true;
       };
       // Never initialize a WebGPU swapchain from a hidden dock tab's 0x0 box.
@@ -306,9 +331,10 @@ function MaterialPreview({ material }) {
       const rim = new THREE.DirectionalLight(0x88aaff, 0.8);
       rim.position.set(-2, -1, -2);
       scene.add(rim);
-      const camera = new THREE.PerspectiveCamera(40, canvas.clientWidth / canvas.clientHeight, 0.1, 20);
+      camera = new THREE.PerspectiveCamera(40, 1, 0.1, 20);
       camera.position.set(0, 0.4, 3);
       camera.lookAt(0, 0, 0);
+      resize(); // adopt the real aspect if the tab is (or becomes) visible
       const mesh = new THREE.Mesh(PREVIEW_GEOMS.sphere(), material);
       meshRef.current = mesh;
       scene.add(mesh);
@@ -370,7 +396,7 @@ function ShaderGraphEditor({ matPath }) {
   // pointer is still over it (dockview close, tab switch, …).
   useEffect(() => () => setGraphHovered(false), []);
 
-  const compileRef = useRef({ uniforms: {}, generation: 0 });
+  const compileRef = useRef({ uniforms: {}, taps: {}, generation: 0 });
   const thumbCanvases = useRef(new Map());
   const [structural, setStructural] = useState(0);
   const loadedRef = useRef(false);
@@ -404,8 +430,18 @@ function ShaderGraphEditor({ matPath }) {
   }, [matPath]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const registerThumb = useCallback((id, el) => {
-    if (el) thumbCanvases.current.set(id, el);
-    else thumbCanvases.current.delete(id);
+    if (!el) {
+      thumbCanvases.current.delete(id);
+      return;
+    }
+    thumbCanvases.current.set(id, el);
+    // A canvas can mount *after* the compile that produced its tap (toggling the
+    // eye re-renders the node, and the node itself may remount as the graph
+    // re-lays out). Without this, that thumbnail stays blank until the next
+    // structural edit — the "preview sometimes doesn't work" case. Draw straight
+    // away if we already have a tap for this node.
+    const tap = compileRef.current.taps?.[id];
+    if (tap && !tap.__surface) renderNodeThumb(tap, el);
   }, []);
 
   /** Value edits patch the live uniform when possible (no shader rebuild);
@@ -461,6 +497,7 @@ function ShaderGraphEditor({ matPath }) {
           const swapped = await loadMaterialAsset(matPath);
           if (generation !== compileRef.current.generation) return;
           compileRef.current.uniforms = {};
+          compileRef.current.taps = {};
           setMaterial(swapped); // re-runs this effect against the new class
           return;
         }
@@ -471,6 +508,9 @@ function ShaderGraphEditor({ matPath }) {
         // meshes hide when nothing is wired to Surface/Volume, show otherwise.
         syncMaterialRenderState(matPath, graph);
         compileRef.current.uniforms = result?.uniforms ?? {};
+        // Kept so a thumb canvas mounting after this compile can still draw
+        // itself (see registerThumb).
+        compileRef.current.taps = result?.taps ?? {};
         for (const id of taps) {
           const canvas = thumbCanvases.current.get(id);
           // Shader nodes (BSDF/Emission) yield a surface bundle, not a TSL

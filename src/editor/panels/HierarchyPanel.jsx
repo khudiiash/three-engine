@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Search, X } from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useModulesStore } from "../modules.js";
@@ -24,6 +24,7 @@ import {
   deleteSelection,
 } from "../clipboard.js";
 import { useAssetDrop } from "../assetDrag.js";
+import { loadCollapsed, saveCollapsed } from "../hierarchyPrefs.js";
 import {
   instantiatePrefab,
   openPrefabMode,
@@ -273,6 +274,117 @@ function flattenTree(rootIds, entities) {
   return out;
 }
 
+/** Walks the subtree under `id` and returns every descendant id (depth-first,
+ *  no parent included). Used to fold/unfold entire branches in one pass. */
+function collectDescendants(id, entities) {
+  const out = [];
+  const stack = [...(entities[id]?.childIds ?? [])];
+  while (stack.length) {
+    const cur = stack.pop();
+    const e = entities[cur];
+    if (!e) continue;
+    out.push(cur);
+    if (e.childIds.length) stack.push(...e.childIds);
+  }
+  return out;
+}
+
+/**
+ * Rank an entity against the search query in the priority order the user
+ * asked for. Returns a numeric tier where lower = better; `Infinity` means
+ * "no match". Tiers:
+ *   0 — name starts with query (case-insensitive)
+ *   1 — name contains query
+ *   2 — entity has a component whose type starts with query
+ *   3 — entity has a component whose type contains query
+ *
+ * Both the name and every component type are checked in this priority, so
+ * "can" jumps to the top for entities literally named "can" AND for any
+ * entity carrying a `camera` component.
+ */
+function matchTier(entity, q) {
+  const name = (entity.name ?? "").toLowerCase();
+  if (name.startsWith(q)) return 0;
+  if (name.includes(q)) return 1;
+  const components = entity.components ?? {};
+  for (const type of Object.keys(components)) {
+    const t = type.toLowerCase();
+    if (t.startsWith(q)) return 2;
+  }
+  for (const type of Object.keys(components)) {
+    const t = type.toLowerCase();
+    if (t.includes(q)) return 3;
+  }
+  return Infinity;
+}
+
+/**
+ * Renders `name` with the (case-insensitive) `query` substring wrapped in
+ * `<mark>` so the matched fragment pops visually. The original casing of
+ * `name` is preserved in the output. Empty query renders the plain name.
+ *
+ * Only used inside a match row — it's the "this is why this row matched"
+ * signal. Tiers 2/3 (component-name matches) don't substring-highlight
+ * the entity name (the match was on a component type, not on the name),
+ * so the highlight is suppressed for those tiers to avoid confusing the
+ * user into thinking the name contained the query.
+ */
+function HighlightedName({ name, query, tier }) {
+  if (!query || tier == null || tier >= 2) {
+    return <span className="entity-name-text">{name}</span>;
+  }
+  const lower = name.toLowerCase();
+  const q = query.toLowerCase();
+  const idx = lower.indexOf(q);
+  if (idx === -1) return <span className="entity-name-text">{name}</span>;
+  const end = idx + query.length;
+  return (
+    <span className="entity-name-text">
+      {name.slice(0, idx)}
+      <mark className="hierarchy-search-mark">{name.slice(idx, end)}</mark>
+      {name.slice(end)}
+    </span>
+  );
+}
+
+/** Builds the search index for the current scene: { id -> tier }. Walks the
+ *  full scene (not just visible rows) so collapsed branches still surface
+ *  when they match the query. Returns `null` when the query is empty so the
+ *  caller can fast-path to "show everything". */
+function buildSearchIndex(rootIds, entities, query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return null;
+  const out = {};
+  const stack = [...rootIds];
+  while (stack.length) {
+    const id = stack.pop();
+    const e = entities[id];
+    if (!e) continue;
+    const tier = matchTier(e, q);
+    if (tier !== Infinity) out[id] = { tier };
+    if (e.childIds.length) stack.push(...e.childIds);
+  }
+  return out;
+}
+
+/** Walks from `id` up to the scene root, collecting every ancestor id.
+ *  Used to uncollapse the path to a search result so the user lands on
+ *  the right row when search exits. */
+function collectAncestors(id, entities) {
+  const out = [];
+  const parentsOf = new Map();
+  for (const eid in entities) {
+    const e = entities[eid];
+    for (const childId of e.childIds) parentsOf.set(childId, eid);
+  }
+  let cur = parentsOf.get(id);
+  while (cur) {
+    out.push(cur);
+    cur = parentsOf.get(cur);
+  }
+  return out;
+}
+
 function handleRowClick(e, id, rootIds, entities) {
   if (suppressNextClick) {
     suppressNextClick = false;
@@ -479,9 +591,12 @@ function EntityRow({
   onContextMenu,
   rootIds,
   collapsedIds,
-  setCollapsedIds,
+  onToggleCollapsed,
   draggingIds,
   onRowPointerDown,
+  searchMatches,
+  searchQuery,
+  onPickSearchResult,
 }) {
   const entity = useSceneStore((s) => s.entities[id]);
   const selected = useSelectionStore((s) => s.ids.includes(id));
@@ -495,8 +610,33 @@ function EntityRow({
 
   const isDragging = draggingIds.includes(id);
 
-  const hasChildren = entity.childIds.length > 0;
+  // Search visibility: when the panel has built a match index, only rows
+  // that actually matched render. The hierarchy is reduced to a flat list
+  // of hits — the user picks one, the panel clears the query and uncollapses
+  // the path to that entity so they land in the regular tree view.
+  const searchMatch = searchMatches ? searchMatches[id] ?? null : null;
+  const isSearching = !!searchMatches;
+  const hidden = isSearching && !searchMatch;
+  if (hidden) return null;
+
+  // While searching, render every match at depth 0 for a clean vertical
+  // list — original nesting is irrelevant when the tree is filtered.
+  const effectiveDepth = isSearching ? 0 : depth;
+  const hasChildren = !isSearching && entity.childIds.length > 0;
   const collapsed = hasChildren && collapsedIds.has(id);
+
+  // While searching, clicking a hit exits the search and lands the user on
+  // the full hierarchy with that entity's path uncollapsed and selected.
+  // Outside of search, the regular select / drag / pick handlers in
+  // handleRowClick apply.
+  const onRowClick = (e) => {
+    if (isSearching) {
+      e.stopPropagation();
+      onPickSearchResult?.(id);
+      return;
+    }
+    handleRowClick(e, id, rootIds, useSceneStore.getState().entities);
+  };
 
   const commitRename = (value) => {
     setRenamingId(null);
@@ -506,34 +646,41 @@ function EntityRow({
     }
   };
 
-  const toggleCollapsed = (e) => {
+  // Toggle the persisted collapse state. The actual state mutation (with
+  // descendant-collapse rule) lives in the panel — the row only forwards
+  // intent so the rule has one implementation.
+  const onChevronClick = (e) => {
     e.stopPropagation();
-    setCollapsedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+    onToggleCollapsed(id);
   };
 
   const hintPos = dropHint?.id === id ? dropHint.pos : null;
+  const rowClasses = [
+    "hierarchy-row",
+    selected ? "selected" : "",
+    isDragging ? "row-dragging" : "",
+    hintPos === "on" ? "drop-target" : "",
+    hintPos === "before" ? "drop-before" : "",
+    hintPos === "after" ? "drop-after" : "",
+    searchMatch ? `hierarchy-search-match tier-${searchMatch.tier}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <>
       <div
-        className={`hierarchy-row ${selected ? "selected" : ""} ${isDragging ? "row-dragging" : ""} ${
-          hintPos === "on" ? "drop-target" : ""
-        } ${hintPos === "before" ? "drop-before" : ""} ${hintPos === "after" ? "drop-after" : ""}`}
-        style={{ paddingLeft: 8 + depth * 14 }}
+        className={rowClasses}
+        style={{ paddingLeft: 8 + effectiveDepth * 14 }}
         data-entity-id={id}
         ref={assetDropRef}
-        onClick={(e) => handleRowClick(e, id, rootIds, useSceneStore.getState().entities)}
+        onClick={onRowClick}
         onDoubleClick={() => setRenamingId(id)}
         onContextMenu={(e) => onContextMenu(e, id)}
         onPointerDown={(e) => onRowPointerDown(e, id)}
       >
         {hasChildren ? (
-          <button className={`row-disclosure ${collapsed ? "collapsed" : ""}`} onClick={toggleCollapsed}>
+          <button className={`row-disclosure ${collapsed ? "collapsed" : ""}`} onClick={onChevronClick}>
             <ChevronRight size={12} strokeWidth={2} />
           </button>
         ) : (
@@ -555,7 +702,9 @@ function EntityRow({
         ) : (
           <>
             <EntityIcon components={entity.components} />
-            <span className={`entity-name ${prefab.kind ? `prefab-${prefab.kind}` : ""}`}>{entity.name}</span>
+            <span className={`entity-name ${prefab.kind ? `prefab-${prefab.kind}` : ""}`}>
+              <HighlightedName name={entity.name} query={searchQuery} tier={searchMatch?.tier ?? null} />
+            </span>
             {prefab.kind === "root" && (
               <span
                 className={`prefab-badge ${prefab.dirty ? "dirty" : ""} ${prefab.missing ? "missing" : ""}`}
@@ -578,7 +727,7 @@ function EntityRow({
         )}
         <VisibilityIcons id={id} />
       </div>
-      {!collapsed &&
+      {!isSearching && !collapsed &&
         entity.childIds.map((childId) => (
           <EntityRow
             key={childId}
@@ -591,9 +740,13 @@ function EntityRow({
             onContextMenu={onContextMenu}
             rootIds={rootIds}
             collapsedIds={collapsedIds}
-            setCollapsedIds={setCollapsedIds}
+            forcedCollapsed={null}
+            onToggleCollapsed={onToggleCollapsed}
             draggingIds={draggingIds}
             onRowPointerDown={onRowPointerDown}
+            searchMatches={searchMatches}
+            searchQuery={searchQuery}
+            onPickSearchResult={onPickSearchResult}
           />
         ))}
     </>
@@ -698,12 +851,57 @@ export function HierarchyPanel() {
   const [collapsedIds, setCollapsedIds] = useState(() => new Set());
   const [draggingIds, setDraggingIds] = useState([]);
   const [ghostPos, setGhostPos] = useState(null); // {x, y}
+  const [searchQuery, setSearchQuery] = useState("");
+  // Track which scene this collapse state belongs to so a project switch or
+  // a new/open-scene swap loads that scene's remembered collapse set (or, if
+  // it's a brand-new scene, defaults to fully collapsed). Persisted per
+  // scene in localStorage via `hierarchyPrefs.js`.
+  const lastSceneKey = useRef(null);
 
   // Assets dropped on empty tree space spawn at the scene root.
   const treeAssetDropRef = useAssetDrop({
     accepts: DROPPABLE_ASSET_EXTENSIONS,
     onDrop: (path) => dropAssetOnEntity(path, null),
   });
+
+  // Whenever the scene swaps (boot, File → Open, File → New Scene, project
+  // switch), load that scene's remembered collapse state. If the scene has
+  // never been opened in this editor, fall back to the user's stated
+  // default: every entity that has children is collapsed, so only top-level
+  // rows show. The saved set is pruned against the current entities so a
+  // stale id from a previously-deleted entity doesn't pollute localStorage.
+  useEffect(() => {
+    const sceneKey = sceneName;
+    if (lastSceneKey.current === sceneKey) return;
+    lastSceneKey.current = sceneKey;
+    const entities = useSceneStore.getState().entities;
+    const validIds = new Set(Object.keys(entities));
+    const saved = loadCollapsed(sceneKey);
+    if (saved) {
+      const next = new Set();
+      for (const id of saved) if (validIds.has(id)) next.add(id);
+      setCollapsedIds(next);
+      return;
+    }
+    const next = new Set();
+    for (const id of rootIds) {
+      if (entities[id]?.childIds?.length) next.add(id);
+    }
+    setCollapsedIds(next);
+  }, [sceneName, rootIds]);
+
+  // Persist the collapse set whenever it changes. We prune against the
+  // current entity table so deleted ids disappear from the saved state
+  // without waiting for the next scene swap. localStorage may be unavailable
+  // (private mode / quota) — `saveCollapsed` swallows that silently.
+  useEffect(() => {
+    if (lastSceneKey.current === null) return;
+    const entities = useSceneStore.getState().entities;
+    const validIds = new Set(Object.keys(entities));
+    const pruned = new Set();
+    for (const id of collapsedIds) if (validIds.has(id)) pruned.add(id);
+    saveCollapsed(lastSceneKey.current, pruned);
+  }, [collapsedIds]);
 
   // Manual pointer-driven drag (see the DRAG_THRESHOLD_PX comment above):
   // pointerdown on a row arms a session; once the pointer moves past the
@@ -797,6 +995,69 @@ export function HierarchyPanel() {
     if (e.target.closest("button, input")) return;
     dragSession = { ids: null, sourceId: id, startX: e.clientX, startY: e.clientY, moved: false };
   };
+
+  /** Toggle a node's collapsed state, applying the user's stated rule:
+   *  uncollapsing an entity also collapses every descendant. The
+   *  chevron is a real toggle — clicking a currently-expanded row folds
+   *  it back up, and clicking a currently-collapsed row opens it one
+   *  level deep (with all of its descendants collapsed in turn, until
+   *  the user uncollapses them). */
+  const onToggleCollapsed = (id) => {
+    const entities = useSceneStore.getState().entities;
+    setCollapsedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        // Currently collapsed → user wants to unfold. Remove this id AND
+        // collapse every descendant so the branch opens one level deep.
+        next.delete(id);
+        for (const d of collectDescendants(id, entities)) {
+          if (entities[d]?.childIds?.length) next.add(d);
+        }
+        return next;
+      }
+      // Currently expanded → user wants to fold. Just add this id; any
+      // descendants already in the set stay collapsed (they were folded
+      // when the user previously unfolded this branch one level deep).
+      next.add(id);
+      return next;
+    });
+  };
+
+  /** Search-mode "exit to entity": when the user clicks a hit, clear the
+   *  query, drop every ancestor of the chosen entity from `collapsedIds`
+   *  so the path is fully expanded, and select the entity. The hierarchy
+   *  then snaps back to its normal tree view, focused on the picked row. */
+  const onPickSearchResult = (id) => {
+    const entities = useSceneStore.getState().entities;
+    const ancestors = collectAncestors(id, entities);
+    setCollapsedIds((prev) => {
+      const next = new Set(prev);
+      for (const a of ancestors) next.delete(a);
+      return next;
+    });
+    useSelectionStore.getState().select(id);
+    setSearchQuery("");
+  };
+
+  // Search → match index. Recomputed only when the query or scene changes;
+  // empty query short-circuits to `null` so the tree falls back to normal
+  // (unfiltered) rendering.
+  const entities = useSceneStore((s) => s.entities);
+  const searchMatches = useMemo(() => buildSearchIndex(rootIds, entities, searchQuery), [rootIds, entities, searchQuery]);
+  // No more ancestor-aware collapse overlay: in search mode the row hides
+  // anything that isn't a match, so the user's saved `collapsedIds` is
+  // simply ignored. Clearing the search restores the exact prior state.
+
+  // Sorted match ids for the "X results" pill. Tier-0/1 (name) first, then
+  // tier-2/3 (component), with name as the stable tiebreaker.
+  const sortedMatchIds = useMemo(() => {
+    if (!searchMatches) return [];
+    return Object.keys(searchMatches).sort((a, b) => {
+      const t = searchMatches[a].tier - searchMatches[b].tier;
+      if (t !== 0) return t;
+      return (entities[a]?.name ?? "").localeCompare(entities[b]?.name ?? "");
+    });
+  }, [searchMatches, entities]);
 
   const createEntity = async (spec) => {
     setMenuOpen(false);
@@ -923,6 +1184,51 @@ export function HierarchyPanel() {
         >
           <Trash2 size={14} />
         </button>
+        <div className="hierarchy-search">
+          <Search size={12} className="hierarchy-search-icon" />
+          <input
+            className="hierarchy-search-input"
+            type="text"
+            placeholder="Search hierarchy…"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && searchQuery) {
+                e.stopPropagation();
+                setSearchQuery("");
+                return;
+              }
+              // Enter on a non-empty query jumps straight to the top match:
+              // clear the search, uncollapse the path to that entity, and
+              // select it. Mirrors what happens on click but keeps the
+              // keyboard flow for "type → Enter → land" without a mouse.
+              if (e.key === "Enter" && sortedMatchIds.length > 0) {
+                e.preventDefault();
+                e.stopPropagation();
+                onPickSearchResult(sortedMatchIds[0]);
+              }
+            }}
+            spellCheck={false}
+          />
+          {searchQuery && (
+            <button
+              type="button"
+              className="hierarchy-search-clear"
+              title="Clear search (Esc)"
+              onClick={() => setSearchQuery("")}
+            >
+              <X size={11} />
+            </button>
+          )}
+          {searchQuery && (
+            <span
+              className={`hierarchy-search-count ${sortedMatchIds.length === 0 ? "is-zero" : ""}`}
+              title={`${sortedMatchIds.length} match${sortedMatchIds.length === 1 ? "" : "es"}`}
+            >
+              {sortedMatchIds.length}
+            </span>
+          )}
+        </div>
       </div>
       <div className="scene-label">
         {sceneName}
@@ -945,7 +1251,7 @@ export function HierarchyPanel() {
           if (e.target === e.currentTarget) useSelectionStore.getState().clear();
         }}
       >
-        {rootIds.map((id) => (
+        {(searchMatches ? sortedMatchIds : rootIds).map((id) => (
           <EntityRow
             key={id}
             id={id}
@@ -957,11 +1263,18 @@ export function HierarchyPanel() {
             onContextMenu={onRowContextMenu}
             rootIds={rootIds}
             collapsedIds={collapsedIds}
-            setCollapsedIds={setCollapsedIds}
+            forcedCollapsed={null}
+            onToggleCollapsed={onToggleCollapsed}
             draggingIds={draggingIds}
             onRowPointerDown={onRowPointerDown}
+            searchMatches={searchMatches}
+            searchQuery={searchQuery}
+            onPickSearchResult={onPickSearchResult}
           />
         ))}
+        {searchMatches && sortedMatchIds.length === 0 && (
+          <div className="hierarchy-search-empty">No entities match “{searchQuery}”.</div>
+        )}
       </div>
       {contextMenu && (
         <ContextMenu menu={contextMenu} close={() => setContextMenu(null)} setRenamingId={setRenamingId} />

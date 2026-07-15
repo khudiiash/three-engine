@@ -240,8 +240,9 @@ function useCamerasWithPost() {
     const e = engine;
     if (!e?.entities) return;
     for (const ent of e.entities.values()) {
-      if (!ent.getComponent?.("camera") || !ent.getComponent?.("postprocess")) continue;
-      out.push({ entityId: ent.id, name: ent.name });
+      const post = ent.getComponent?.("postprocess");
+      if (!ent.getComponent?.("camera") || !post) continue;
+      out.push({ entityId: ent.id, name: ent.name, showInEditor: !!post.props.showInEditor });
     }
     setItems(out);
   }, []);
@@ -448,7 +449,11 @@ function PostprocessEditor({ entityId }) {
           {dirty ? "Apply" : "Saved"}
         </button>
       </div>
-      <div className="shader-graph-canvas">
+      <div
+        className="shader-graph-canvas"
+        onMouseEnter={() => setGraphHovered(true)}
+        onMouseLeave={() => setGraphHovered(false)}
+      >
         <ReactFlow
           nodes={nodesWithHandlers}
           edges={edges}
@@ -508,6 +513,12 @@ export function PostprocessPanel() {
     ensureModules().catch(() => {});
   }, []);
 
+  const activeCamera = cameras.find((item) => item.entityId === activeId) ?? null;
+  const setShowInEditor = (value) => {
+    if (!activeId) return;
+    commandBus.execute(new SetComponentPropCommand(activeId, "postprocess", "showInEditor", value));
+  };
+
   return (
     <ReactFlowProvider>
       <div className="postprocess-panel">
@@ -515,6 +526,7 @@ export function PostprocessPanel() {
           <div className="dropdown-wrap">
             <button className="toolbar-btn" onClick={() => setPending((v) => !v)}>
               <Camera size={14} label="Pick a camera" />
+              {activeCamera?.name ?? "Camera"}
             </button>
             {pending && (
               <>
@@ -534,12 +546,22 @@ export function PostprocessPanel() {
                         setActiveId(entityId);
                       }}
                     >
+                      {name}
                     </button>
                   ))}
                 </div>
               </>
             )}
           </div>
+          <label className="postprocess-preview-toggle" title="Apply this graph to the editor viewport outside Play mode">
+            <input
+              type="checkbox"
+              checked={!!activeCamera?.showInEditor}
+              disabled={!activeCamera}
+              onChange={(event) => setShowInEditor(event.target.checked)}
+            />
+            <span>Show in Editor</span>
+          </label>
         </div>
         <PostprocessEditor entityId={activeId} />
       </div>

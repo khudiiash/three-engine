@@ -8,6 +8,7 @@ import { linearDepth, viewZToPerspectiveDepth } from "three/src/nodes/display/Vi
 import { modelRadius } from "three/src/nodes/accessors/ModelNode.js";
 import LightingModel from "three/src/nodes/core/LightingModel.js";
 import { LTC_Evaluate_Volume } from "three/src/nodes/functions/BSDF/LTC.js";
+import { runtimeQuality } from "./sceneSettings.js";
 
 const scatteringDensity = property("vec3");
 const linearDepthRay = property("vec3");
@@ -40,7 +41,13 @@ export class EngineVolumetricLightingModel extends LightingModel {
     });
 
     const viewVector = endPos.sub(startPos);
-    const steps = uniform("int").onRenderUpdate(({ material }) => material.steps);
+    // The per-material step count, scaled by the scene-wide volume quality
+    // knob (Scene Settings → Performance). The raymarch loop is the entire
+    // per-pixel cost of a volume, so this single multiplier is the global
+    // "volume quality" dial. Floor of 1 keeps degenerate scales rendering.
+    const steps = uniform("int").onRenderUpdate(
+      ({ material }) => Math.max(1, Math.round(material.steps * runtimeQuality.volumeStepScale)),
+    );
     const stepSize = viewVector.length().div(steps).toVar();
     const rayDir = viewVector.normalize().toVar();
 
