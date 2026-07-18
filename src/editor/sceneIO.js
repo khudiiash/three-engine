@@ -1,3 +1,4 @@
+import * as THREE from "three/webgpu";
 import { ensureEngine } from "./engineInstance.js";
 import { commandBus } from "./commands/CommandBus.js";
 import { useSceneStore } from "./store/sceneStore.js";
@@ -66,6 +67,7 @@ function toProjectRelative(root, path) {
  */
 function rememberScene(path) {
   currentPath = path;
+  useSceneStore.getState().setScenePath(path);
   const root = projectRoot();
   if (root) {
     const rel = toProjectRelative(root, path);
@@ -141,7 +143,7 @@ export async function restoreLastScene() {
 function afterSceneSwap() {
   commandBus.clearHistory();
   useSelectionStore.getState().clear();
-  useSceneStore.getState().refresh();
+  useSceneStore.getState().refresh(currentPath);
   useSceneStore.getState().markDirty(false);
 }
 
@@ -158,13 +160,20 @@ export async function newScene() {
   const engine = await ensureEngine();
   engine.clear();
   currentPath = null;
+  useSceneStore.getState().setScenePath(null);
   engine.sceneName = projectRoot() ? "Main" : "Untitled";
 
   // Unity-style default content (not undoable — it's the baseline).
   const light = engine.createEntity({ name: "Directional Light" });
   light.addComponent("light", { kind: "directional", intensity: 2 });
-  light.object3D.position.set(4, 6, 3);
-  light.object3D.lookAt(0, 0, 0);
+  // Directional lights are pinned to the world origin; only their rotation
+  // defines the emitted direction. Tilt the default sun downward at ~55°
+  // pitch so the new scene has a clear key light from above-and-to-the-side.
+  light.object3D.rotation.set(
+    THREE.MathUtils.degToRad(-55),
+    THREE.MathUtils.degToRad(35),
+    0,
+  );
 
   const camera = engine.createEntity({ name: "Main Camera" });
   camera.addComponent("camera");

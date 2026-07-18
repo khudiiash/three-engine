@@ -19,6 +19,7 @@ import {
   subdivideFaces,
   unwrapBox,
   unwrapPlanar,
+  updateExtrudeUVs,
 } from "../src/editor/editableGeometry.js";
 import { geometryFromAsset } from "../src/engine/geometryAsset.js";
 
@@ -37,15 +38,52 @@ const regionCopy = editableFromBufferGeometry(new THREE.BoxGeometry(1, 1, 1));
 const regionVertices = regionCopy.positions.length;
 const regionFaces = regionCopy.faces.length;
 extrudeFaces(regionCopy, coplanarFaceGroup(regionCopy, 0), 0.25);
-assert.equal(regionCopy.positions.length, regionVertices + 4);
+assert.equal(regionCopy.positions.length, regionVertices + 4 + 4 * 4,
+  "a quad extrusion needs four cap vertices and four UV-seam vertices per wall");
 assert.equal(regionCopy.faces.length, regionFaces + 8);
+assert.equal(regionCopy.uvs.length, regionCopy.positions.length,
+  "extrusion must retain one UV per render vertex");
 const interactiveCopy = editableFromBufferGeometry(new THREE.BoxGeometry(1, 1, 1));
 const interactiveBefore = interactiveCopy.positions.map((position) => [...position]);
 const interactive = beginExtrudeFaces(interactiveCopy, coplanarFaceGroup(interactiveCopy, 0));
-assert.equal(interactive.vertexIndices.length, 4);
+assert.equal(interactive.vertexIndices.length, 12,
+  "interactive quad extrusion moves four cap vertices plus two UV-seam vertices per wall");
 assert.ok(interactive.vertexIndices.every((index) => interactiveBefore.some((position) =>
   position.every((value, axis) => value === interactiveCopy.positions[index][axis]),
 )), "interactive extrusion must begin at zero offset");
+const interactiveOffset = new THREE.Vector3(...interactive.normal).multiplyScalar(0.25);
+interactive.vertexIndices.forEach((index) => {
+  interactiveCopy.positions[index] = new THREE.Vector3(...interactiveCopy.positions[index]).add(interactiveOffset).toArray();
+});
+updateExtrudeUVs(interactiveCopy, interactive);
+assert.ok(interactive.walls.every(([baseA, baseB, topA, topB]) => {
+  const quadUVs = [baseA, baseB, topA, topB].map((index) => interactiveCopy.uvs[index]);
+  return quadUVs[1][0] > quadUVs[0][0] && quadUVs[2][1] > quadUVs[0][1];
+}), "extrusion walls must receive a non-degenerate UV strip");
+const edgeIdentityCopy = editableFromBufferGeometry(new THREE.BoxGeometry(1, 1, 1));
+const edgeIdentityRegion = coplanarFaceGroup(edgeIdentityCopy, 0);
+const edgeIdentityHiddenSpatial = coplanarHiddenEdges(edgeIdentityCopy);
+const edgeIdentityHidden = new Set();
+const extrusionPointKey = (point) => point.map((value) => Math.round(value * 1e5)).join(",");
+edgeIdentityCopy.faces.forEach((face) => face.forEach((a, edge) => {
+  const b = face[(edge + 1) % 3];
+  const spatial = [extrusionPointKey(edgeIdentityCopy.positions[a]), extrusionPointKey(edgeIdentityCopy.positions[b])];
+  if (edgeIdentityHiddenSpatial.has(spatial.sort().join("|"))) {
+    edgeIdentityHidden.add(a < b ? `${a}|${b}` : `${b}|${a}`);
+  }
+}));
+const edgeIdentity = beginExtrudeFaces(edgeIdentityCopy, edgeIdentityRegion, edgeIdentityHidden);
+const visibleCapEdges = new Set();
+edgeIdentity.faceIndices.forEach((faceIndex) => {
+  const face = edgeIdentityCopy.faces[faceIndex];
+  face.forEach((a, edge) => {
+    const b = face[(edge + 1) % 3];
+    const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+    if (edgeIdentity.visiblePairs.has(key)) visibleCapEdges.add(key);
+  });
+});
+assert.equal(visibleCapEdges.size, 4,
+  "extruded cap must preserve four authored quad borders while hiding its triangulation diagonal");
 const cutCopy = editableFromBufferGeometry(new THREE.BoxGeometry(1, 1, 1));
 const cut = cutMeshByPlane(cutCopy, [0, 1, 0], [0, 0, 0], 0);
 assert.ok(cutCopy.faces.length > 12, "loop cut should split intersected triangles");

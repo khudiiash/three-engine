@@ -214,6 +214,22 @@ export class MeshComponent extends Component {
       this.materialUnsub?.();
       this.materialUnsub = null;
       if (this.props.material) {
+        // Adopt the cached instance immediately when already loaded — without
+        // this the mesh sits on `getDefaultMaterial()` (white) for one frame
+        // between the commit and `loadMaterialAsset` resolving. `#loadSharedMaterial`
+        // will still run for the visibility / generation / subscribe plumbing.
+        const cached = getMaterialInstance(this.props.material);
+        if (cached) {
+          const paths = [this.props.material, ...Array.from({ length: 7 }, (_, index) => this.props[`material${index + 2}`] ?? '')];
+          const hasExtraMaterial = paths.slice(1).some(Boolean);
+          this.mesh.material = hasExtraMaterial && this.mesh.geometry?.groups?.length ? paths.map((p) => getMaterialInstance(p) ?? getDefaultMaterial()) : cached;
+          this.materialRenderable = isMaterialRenderable(this.props.material);
+          this.mesh.visible = this.enabled && this.materialRenderable !== false;
+        } else {
+          // Cold cache: leave the mesh on its current material rather than
+          // reverting to the default placeholder — the `#loadSharedMaterial`
+          // call below will adopt the real instance once it arrives.
+        }
         this.#loadSharedMaterial(this.props.material);
       } else {
         this.#applyMaterialSlots();

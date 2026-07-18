@@ -7,6 +7,7 @@ import {
   duplicateSelection,
   deleteSelection,
 } from "./clipboard.js";
+import { groupSelection } from "./group.js";
 import {
   openScene,
   saveScene,
@@ -168,6 +169,9 @@ export function EditorChrome() {
       } else if (ctrl && e.key.toLowerCase() === "d") {
         e.preventDefault();
         duplicateSelection();
+      } else if (ctrl && e.key.toLowerCase() === "g") {
+        e.preventDefault();
+        if (selection.length >= 2) groupSelection();
       } else if (ctrl && e.key.toLowerCase() === "c") {
         if (selection.length) copyEntities(selection);
       } else if (ctrl && e.key.toLowerCase() === "x") {

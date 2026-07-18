@@ -1420,6 +1420,142 @@ body.macro-active .viewport-canvas {
   border-left: 1px solid rgba(255, 255, 255, 0.12);
 }
 
+/* 3D Cursor snap menu (Shift+S fly-out). Reuses the same glass-pill
+   palette the macro HUD uses so the two dialogs feel like siblings. */
+.cursor-snap-menu {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 260px;
+  padding: 4px;
+  border-radius: 10px;
+  background: rgba(20, 21, 25, 0.92);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.55);
+  font-size: 12.5px;
+  color: #fff;
+  user-select: none;
+}
+
+.cursor-snap-menu .cursor-snap-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 8px 12px;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.cursor-snap-menu .cursor-snap-item:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.cursor-snap-menu .cursor-snap-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.cursor-snap-menu .cursor-snap-label {
+  font-weight: 500;
+}
+
+.cursor-snap-menu .cursor-snap-hint {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
+.cursor-snap-menu .cursor-snap-separator {
+  height: 1px;
+  margin: 4px 8px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* "Cursor" toolbar dropdown in the Edit Mode toolbar picks up the same
+   visual language as the geometry-toolbar-menu popovers, with an extra
+   icon slot for the Crosshair glyph used on the rows above. */
+.geometry-toolbar-popover > button svg {
+  margin-right: 4px;
+  flex-shrink: 0;
+}
+
+/* 3D Cursor HUD readout — sits in the bottom-left next to the
+   terrain-brush HUD. Glass pill, monospace numbers, RGB axis tint. */
+.cursor-hud {
+  position: absolute;
+  bottom: 14px;
+  left: 14px;
+  z-index: 11;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  background: rgba(20, 21, 25, 0.78);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.32);
+  color: #fff;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+  pointer-events: none;
+}
+
+.cursor-hud[hidden] {
+  display: none;
+}
+
+.cursor-hud-icon {
+  font-size: 13px;
+  color: #f9ec4d;
+}
+
+.cursor-hud-pos {
+  display: inline-flex;
+  gap: 10px;
+}
+
+.cursor-hud-axis {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.cursor-hud-axis .cursor-hud-key {
+  font-weight: 600;
+  opacity: 0.7;
+}
+
+.cursor-hud-x { color: #f06a73; }
+.cursor-hud-y { color: #67c77a; }
+.cursor-hud-z { color: #5d9df5; }
+
+.cursor-hud-hint {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  padding-left: 8px;
+  margin-left: 4px;
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+}
+
 /* DOM frame that sits exactly over the WebGL canvas sub-region used for
    the camera preview (rendered by the viewport into a viewport+scissor
    rectangle of the editor canvas). The frame gives the preview a rounded
@@ -2387,6 +2523,35 @@ input[type="checkbox"]:checked::after {
   object-fit: cover;
   opacity: 0.75;
   mix-blend-mode: multiply;
+}
+
+/* "Unset color" indicator: a subtle diagonal stripe pattern that signals the
+ * material's `.color` field is still at the placeholder white. Without this,
+ * the swatch is indistinguishable from a properly-authored white material —
+ * the user can't tell whether they just haven't colored it yet. The stripes
+ * draw attention at a glance and prompt them to open the Shader Graph panel. */
+.mat-thumb--unset {
+  background-image:
+    repeating-linear-gradient(
+      135deg,
+      transparent 0,
+      transparent 4px,
+      rgba(255, 165, 0, 0.55) 4px,
+      rgba(255, 165, 0, 0.55) 5px
+    );
+  background-blend-mode: normal;
+}
+.asset-option-thumb.mat-thumb--unset {
+  /* Smaller swatch — use slightly heavier stripes so the pattern reads at
+   * 20×20 px in the asset picker rows. */
+  background-image:
+    repeating-linear-gradient(
+      135deg,
+      transparent 0,
+      transparent 2px,
+      rgba(255, 165, 0, 0.7) 2px,
+      rgba(255, 165, 0, 0.7) 3px
+    );
 }
 
 .asset-tile.drop-target {

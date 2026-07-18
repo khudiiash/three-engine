@@ -1,7 +1,14 @@
 import * as THREE from "three/webgpu";
 import { Component } from "./Component.js";
+import { PCSSShadowFilter } from "../pcssShadowFilter.js";
 
-const SHADOW_TYPE_OPTIONS = ["BasicShadowMap", "PCFShadowMap", "PCFSoftShadowMap", "VSMShadowMap"];
+const SHADOW_TYPE_OPTIONS = [
+  "BasicShadowMap",
+  "PCFShadowMap",
+  "PCFSoftShadowMap",
+  "PCSSShadowMap",
+  "VSMShadowMap",
+];
 const _ownerWorld = new THREE.Matrix4();
 const _inverseOwnerWorld = new THREE.Matrix4();
 const _worldRotation = new THREE.Quaternion();
@@ -32,15 +39,16 @@ export class LightComponent extends Component {
     shadowMapHeight: 2048,
     shadowBias: -0.0005,
     shadowNormalBias: 0.02,
-    shadowRadius: 1, // PCFSoft / VSM blur radius
+    shadowRadius: 1, // PCF/VSM blur radius; PCSS directional source radius in world units
     // Directional / spot shadow camera (orthographic frustum).
     shadowCamNear: 0.1,
     shadowCamFar: 100,
     shadowCamSize: 20, // orthographic half-extent (left/right/top/bottom = ±size)
     shadowCamFov: 90, // point-light cube: face FOV in degrees
-    // Centre directional shadow coverage on the active camera without
-    // inheriting that camera's rotation.
-    shadowFollowCamera: false,
+    // Directional shadow maps always recentre on the active camera (editor
+    // orbit camera in edit mode, the play-mode camera during play). The
+    // camera pose drives the orthographic frustum every pre-render so the
+    // user can never orbit outside the shadow coverage.
   };
   // Schema entries with `showIf` are auto-filtered by the Inspector; see
   // ComponentSection. `section` is just a label prefix in the inspector.
@@ -60,11 +68,10 @@ export class LightComponent extends Component {
     { key: "shadowMapHeight", label: "Map Height", type: "number", min: 16, step: 256, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
     { key: "shadowBias", label: "Bias", type: "number", step: 0.0005, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
     { key: "shadowNormalBias", label: "Normal Bias", type: "number", step: 0.005, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
-    { key: "shadowRadius", label: "Radius", type: "number", min: 0, step: 0.5, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
+    { key: "shadowRadius", label: "Radius / Light Size", type: "number", min: 0, step: 0.25, showIf: (p) => p.kind !== "ambient" && p.castShadow, section: "Shadow" },
     { key: "shadowCamNear", label: "Cam Near", type: "number", min: 0, step: 0.1, showIf: (p) => (p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow, section: "Shadow" },
     { key: "shadowCamFar", label: "Cam Far", type: "number", min: 0, step: 1, showIf: (p) => (p.kind === "directional" || p.kind === "spot" || p.kind === "point") && p.castShadow, section: "Shadow" },
     { key: "shadowCamSize", label: "Frustum Size", type: "number", min: 0.1, step: 1, showIf: (p) => (p.kind === "directional" || p.kind === "spot") && p.castShadow, section: "Shadow" },
-    { key: "shadowFollowCamera", label: "Follow Camera", type: "boolean", showIf: (p) => p.kind === "directional" && p.castShadow, section: "Shadow" },
     { key: "shadowCamFov", label: "Face FOV°", type: "number", min: 1, max: 179, step: 1, showIf: (p) => p.kind === "point" && p.castShadow, section: "Shadow" },
   ];
 
@@ -94,7 +101,7 @@ export class LightComponent extends Component {
     // Switching `kind` swaps the entire three.js light instance (point vs
     // spot vs directional have different constructors and shadow camera
     // shapes). Tear the old one down and rebuild from current props.
-    if (key === "kind" || !this.light) {
+    if (key === "kind" || key === "shadowMapType" || !this.light) {
       this.onDetach();
       this.#buildLight();
       return;
@@ -177,8 +184,10 @@ export class LightComponent extends Component {
       this.entity.object3D.add(this.light.target);
     }
     // Resolve after scripts and physics have finalized this frame's camera
-    // and entity transforms. This also makes translation and non-uniform
-    // parent scale incapable of changing a directional light's angle.
+    // and entity transforms. The sync also pins the entity's world position
+    // to the origin and resets parent scale so directional lights can only
+    // be re-aimed via rotation. The shadow camera recentres on whichever
+    // camera is currently active so the user never leaves the frustum.
     if (this.light.isDirectionalLight) {
       this.unsubPreRender = this.entity.engine.onPreRender(() => this.#syncDirectionalTransform());
       this.#syncDirectionalTransform();
@@ -191,14 +200,27 @@ export class LightComponent extends Component {
     if (!this.light?.isDirectionalLight || !this.light.target) return;
 
     const owner = this.entity.object3D;
-    owner.updateWorldMatrix(true, false);
+    // Directional lights are infinite sources — their position is meaningless
+    // (only the rotation defines the emitted direction). Pin the owner to the
+    // world origin every frame so any external mutation (gizmo drag, script,
+    // legacy scene data, parent transform) cannot move the light. Reset the
+    // parent's scale too: a non-uniform parent scale would otherwise skew the
+    // shadow-map frustum and tilt the apparent light direction.
+    owner.position.set(0, 0, 0);
+    owner.scale.set(1, 1, 1);
+    owner.updateMatrixWorld(true);
     _ownerWorld.copy(owner.matrixWorld);
     _inverseOwnerWorld.copy(_ownerWorld).invert();
     owner.getWorldQuaternion(_worldRotation);
     _direction.set(0, 0, -1).applyQuaternion(_worldRotation).normalize();
 
-    if (this.props.shadowFollowCamera && this.entity.engine.camera) {
-      this.entity.engine.camera.getWorldPosition(_cameraWorld);
+    // Directional shadow coverage is always recentred on the currently active
+    // camera (editor orbit camera in edit mode, the play-mode camera while
+    // playing). Without this the user can orbit outside the shadow frustum
+    // and every shadow on the screen appears clipped.
+    const camera = this.entity.engine.camera;
+    if (camera) {
+      camera.getWorldPosition(_cameraWorld);
       _shadowCentre.copy(_cameraWorld);
       // Stabilize the orthographic projection: snap its lateral origin to
       // whole shadow-map texels so tiny camera movements do not make every
@@ -220,7 +242,7 @@ export class LightComponent extends Component {
       const depthCentre = (this.props.shadowCamNear + this.props.shadowCamFar) * 0.5;
       _lightWorld.copy(_shadowCentre).addScaledVector(_direction, -depthCentre);
     } else {
-      _lightWorld.setFromMatrixPosition(_ownerWorld);
+      _lightWorld.set(0, 0, 0);
     }
 
     _targetWorld.copy(_lightWorld).add(_direction);
@@ -238,6 +260,7 @@ export class LightComponent extends Component {
         BasicShadowMap: THREE.BasicShadowMap,
         PCFShadowMap: THREE.PCFShadowMap,
         PCFSoftShadowMap: THREE.PCFSoftShadowMap,
+        PCSSShadowMap: THREE.PCFShadowMap,
         VSMShadowMap: THREE.VSMShadowMap,
       };
     }
@@ -256,6 +279,11 @@ export class LightComponent extends Component {
     if (this.props.shadowMapType in typeMap) {
       s.type = typeMap[this.props.shadowMapType];
     }
+    s.filterNode =
+      this.props.shadowMapType === "PCSSShadowMap" &&
+      this.light.isDirectionalLight
+        ? PCSSShadowFilter
+        : undefined;
     const cam = s.camera;
     if (this.light.isDirectionalLight || this.light.isSpotLight) {
       // Orthographic frustum: ±shadowCamSize on each side.
@@ -296,6 +324,11 @@ export class LightComponent extends Component {
       case "shadowMapType": {
         const map = LightComponent.#getShadowTypeMap();
         s.type = map[this.props.shadowMapType] ?? THREE.PCFSoftShadowMap;
+        s.filterNode =
+          this.props.shadowMapType === "PCSSShadowMap" &&
+          this.light.isDirectionalLight
+            ? PCSSShadowFilter
+            : undefined;
         // PCFSoft / VSM cache depth/blur textures; dispose to force reallocate
         // on the new type so the next frame doesn't render with stale data.
         s.dispose?.();

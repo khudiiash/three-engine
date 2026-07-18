@@ -430,6 +430,31 @@ export async function buildClusterDAG({ positions, normals, uvs, indices }) {
 }
 
 /**
+ * Returns the coarsest complete cut through a cluster DAG. Roots are the
+ * clusters with no parent error (Infinity); together they still cover the
+ * whole mesh, including regions whose simplification stalled.
+ */
+export function getCoarsestClusterIndices(dag) {
+  const roots = [];
+  let total = 0;
+  for (let cluster = 0; cluster < dag.clusterCount; cluster++) {
+    const metaOffset = cluster * CLUSTER_STRIDE;
+    if (dag.clusterMeta[metaOffset + 13] !== Infinity) continue;
+    roots.push(cluster);
+    total += dag.clusterRanges[cluster * 2 + 1];
+  }
+  const indices = new Uint32Array(total);
+  let cursor = 0;
+  for (const cluster of roots) {
+    const offset = dag.clusterRanges[cluster * 2];
+    const count = dag.clusterRanges[cluster * 2 + 1];
+    indices.set(dag.indexData.subarray(offset, offset + count), cursor);
+    cursor += count;
+  }
+  return indices;
+}
+
+/**
  * Picks the LOD cut and writes the selected clusters' indices into
  * `outIndices` (must hold dag.lod0IndexCount — a cut can never exceed the
  * full-detail triangle count). Returns the number of indices written.

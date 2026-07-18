@@ -190,10 +190,22 @@ function TextureThumb({ path, size }) {
   );
 }
 
-/** Material preview: color swatch, with its texture blended in when set. */
+// Plain white on a swatch is the classic "I haven't set a color yet" signal —
+// a freshly-created .mat file is white by default and looks identical to a mesh
+// that has no material assigned at all. Flag it so the user can tell the
+// difference at a glance.
+const isUnsetColor = (color) => !color || color.toLowerCase() === "#ffffff" || color.toLowerCase() === "white";
+
+/** Material preview: color swatch, with its texture blended in when set.
+ *  Reads the live shared material first (via getMaterialColorPreview) so the
+ *  swatch reflects what the mesh actually renders — including edits made in
+ *  the Shader Graph panel that haven't been autosaved yet, and pre-existing
+ *  .mat files whose top-level `color` field is stale. Falls back to the
+ *  top-level `def.color` only when no live material is loaded. */
 function MaterialThumb({ path, size }) {
   const [def, setDef] = useState(null);
   const [mapUrl, setMapUrl] = useState(null);
+  const [liveColor, setLiveColor] = useState(null);
   useEffect(() => {
     let live = true;
     (async () => {
@@ -203,15 +215,39 @@ function MaterialThumb({ path, size }) {
         setDef(d);
         if (d.map) setMapUrl(await toBlobUrl(d.map).catch(() => null));
       } catch {
-        if (live) setDef({ ...MATERIAL_DEFAULTS });
+        if (live) setDef((prev) => prev ?? { ...MATERIAL_DEFAULTS, color: "#888" });
       }
     })();
-    return () => (live = false);
+    // Subscribe to live material updates so the swatch refreshes as soon as
+    // the shared material instance finishes its async compile / ShaderGraph
+    // edit. Resolves to `null` until the compile lands.
+    let unsub = () => {};
+    import("../../engine/materialAsset.js").then(({ getMaterialColorPreview, loadMaterialAsset, subscribeMaterial }) => {
+      if (!live) return;
+      // Make sure the cache has an entry — the swatch may mount before any
+      // mesh has loaded this .mat, and the live-color walk needs an entry.
+      loadMaterialAsset(path).then(() => {
+        if (!live) return;
+        const refresh = () => {
+          if (live) setLiveColor(getMaterialColorPreview(path));
+        };
+        refresh();
+        unsub = subscribeMaterial(path, refresh);
+      });
+    });
+    return () => {
+      live = false;
+      unsub();
+    };
   }, [path]);
+  // Live color wins over the stale top-level field — that's the whole point.
+  const color = liveColor ?? def?.color;
+  const unset = isUnsetColor(color);
   return (
     <div
-      className="asset-thumb mat-thumb"
-      style={{ width: size, height: size, background: def?.color ?? "#888" }}
+      className={`asset-thumb mat-thumb${unset ? " mat-thumb--unset" : ""}`}
+      style={{ width: size, height: size, background: color ?? "#888" }}
+      title={unset ? "Default color — open in the Shader Graph panel to set a real color" : undefined}
     >
       {mapUrl && <img className="mat-thumb-map" src={mapUrl} alt="" draggable={false} />}
     </div>

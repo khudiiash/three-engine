@@ -175,9 +175,21 @@ function Vector3Row({ label, values, onCommit }) {
   );
 }
 
+/**
+ * True when the entity carries a directional light. Directional lights are
+ * infinite sources — only their rotation matters — so position/scale controls
+ * are hidden from the inspector and locked at the world origin.
+ */
+function isDirectionalLightEntity(entity) {
+  const live = engine.getEntity(entity.id);
+  const component = live?.getComponent?.("light");
+  return !!component && component.props?.kind === "directional";
+}
+
 function TransformSection({ entity }) {
   const { position, rotation, scale } = entity.transform;
   const rotationDeg = rotation.map((r) => r * RAD2DEG);
+  const lockNonRotation = isDirectionalLightEntity(entity);
 
   const commit = (patch) => {
     commandBus.execute(new SetTransformCommand(entity.id, { ...entity.transform, ...patch }));
@@ -186,13 +198,17 @@ function TransformSection({ entity }) {
   return (
     <div className="inspector-section">
       <div className="section-header">Transform</div>
-      <Vector3Row label="Position" values={position} onCommit={(v) => commit({ position: v })} />
+      {!lockNonRotation && (
+        <Vector3Row label="Position" values={position} onCommit={(v) => commit({ position: v })} />
+      )}
       <Vector3Row
         label="Rotation"
         values={rotationDeg}
         onCommit={(v) => commit({ rotation: v.map((d) => d * DEG2RAD) })}
       />
-      <Vector3Row label="Scale" values={scale} onCommit={(v) => commit({ scale: v })} />
+      {!lockNonRotation && (
+        <Vector3Row label="Scale" values={scale} onCommit={(v) => commit({ scale: v })} />
+      )}
     </div>
   );
 }
@@ -265,11 +281,17 @@ const valuesEqual = (a, b) => {
 
 function MultiTransformSection({ entities }) {
   const primary = entities[0];
-  const rows = [
-    ["Position", "position", 1],
-    ["Rotation", "rotation", RAD2DEG],
-    ["Scale", "scale", 1],
-  ];
+  // Directional lights have no positional/scale state — only rotation
+  // changes their behaviour. If every selected entity is a directional light
+  // we collapse the transform panel to a single Rotation row.
+  const allDirectional = entities.every(isDirectionalLightEntity);
+  const rows = allDirectional
+    ? [["Rotation", "rotation", RAD2DEG]]
+    : [
+        ["Position", "position", 1],
+        ["Rotation", "rotation", RAD2DEG],
+        ["Scale", "scale", 1],
+      ];
   const commitAxis = (key, axis, displayValue, displayScale) => {
     const value = displayValue / displayScale;
     const commands = entities.map((entity) => {

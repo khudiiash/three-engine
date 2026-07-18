@@ -23,6 +23,7 @@ import {
   duplicateSelection,
   deleteSelection,
 } from "../clipboard.js";
+import { groupSelection } from "../group.js";
 import { useAssetDrop } from "../assetDrag.js";
 import { loadCollapsed, saveCollapsed } from "../hierarchyPrefs.js";
 import {
@@ -45,6 +46,7 @@ import { disarmTerrainScatterSourcePick, getTerrainScatterSourcePick } from "../
 import { engine } from "../engineInstance.js";
 import { newScene } from "../sceneIO.js";
 import { createTerrainAssets } from "../terrainAssetSetup.js";
+import { getCursor3DPosition } from "../threeDCursor.js";
 
 const DROPPABLE_ASSET_EXTENSIONS = [...PREFAB_EXTENSIONS, ...MODEL_EXTENSIONS];
 
@@ -803,6 +805,7 @@ function ContextMenu({ menu, close, setRenamingId }) {
     { label: "Paste as Child", disabled: !canPaste || !single, action: () => pasteEntities(single) },
     { separator: true },
     { label: "Duplicate", shortcut: "Ctrl+D", action: duplicateSelection },
+    { label: "Group Selection", shortcut: "Ctrl+G", disabled: selection.length < 2, action: groupSelection },
     { label: "Rename", disabled: !single, action: () => setRenamingId(single) },
     ...prefabMenuItems(single),
     { separator: true },
@@ -1083,6 +1086,20 @@ export function HierarchyPanel() {
       } catch (err) {
         console.error(`Could not create terrain assets: ${err}`);
       }
+    }
+    // New entities snap to the 3D cursor by default — like Blender's
+    // "Add Mesh at Cursor" behavior. Parent override still wins: when the
+    // user explicitly adds inside a selected entity that entity owns the
+    // transform, so we keep the default origin in that branch.
+    if (!parentId && !spec.transform) {
+      prepared = {
+        ...prepared,
+        transform: {
+          position: getCursor3DPosition().toArray(),
+          rotation: [0, 0, 0],
+          scale: [1, 1, 1],
+        },
+      };
     }
     const cmd = new CreateEntityCommand(parentId ? { ...prepared, parentId } : prepared);
     commandBus.execute(cmd);

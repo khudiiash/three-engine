@@ -33,6 +33,23 @@ import { setGraphHovered } from "../nodegraph/graphContext.js";
 import { AssetField } from "../fields/AssetField.jsx";
 import { TEXTURE_EXTENSIONS } from "../assetLoader.js";
 
+/** Resolve the existing material def for `matPath`. Prefers the in-memory
+ *  cache (which has whatever the user has been editing this session), but
+ *  falls back to reading the file from disk if the cache is cold. Without
+ *  this fallback, every Shader Graph save would clobber the file's
+ *  `color`/`roughness`/`metalness`/`map` fields with the placeholder
+ *  MATERIAL_DEFAULTS just because the cache hadn't been populated yet. */
+async function resolveMaterialDefForSave(matPath) {
+  const cached = getMaterialDef(matPath);
+  if (cached) return cached;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return JSON.parse(await invoke("read_text_file", { path: matPath })) ?? {};
+  } catch {
+    return {};
+  }
+}
+
 /** Fresh materials: a Principled BSDF wired into the Output's Surface socket
  *  (Blender-style — the BSDF carries Color/Roughness/… and drives the surface). */
 const DEFAULT_GRAPH = {
@@ -492,7 +509,8 @@ function ShaderGraphEditor({ matPath }) {
         // the new instance for the preview.
         const wantVolume = !!result?.isVolume;
         if (wantVolume !== (material.userData?.isVolumeMaterial === true)) {
-          const def = { ...MATERIAL_DEFAULTS, ...(getMaterialDef(matPath) ?? {}), shaderGraph: graph };
+          const existing = await resolveMaterialDefForSave(matPath);
+          const def = { ...MATERIAL_DEFAULTS, ...existing, shaderGraph: graph };
           updateMaterialAsset(matPath, def);
           const swapped = await loadMaterialAsset(matPath);
           if (generation !== compileRef.current.generation) return;
@@ -531,7 +549,11 @@ function ShaderGraphEditor({ matPath }) {
     if (saved || !loadedRef.current) return;
     const timer = setTimeout(async () => {
       const graph = flowToGraph(nodes, edges);
-      const def = { ...MATERIAL_DEFAULTS, ...(getMaterialDef(matPath) ?? {}), shaderGraph: graph };
+      // Pull the existing def (cache, falling back to disk) so we don't
+      // clobber color/roughness/metalness/map with MATERIAL_DEFAULTS on
+      // first save.
+      const existing = await resolveMaterialDefForSave(matPath);
+      const def = { ...MATERIAL_DEFAULTS, ...existing, shaderGraph: graph };
       const cached = getMaterialDef(matPath);
       if (cached) cached.shaderGraph = graph;
       try {

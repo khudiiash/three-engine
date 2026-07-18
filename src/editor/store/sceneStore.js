@@ -21,6 +21,7 @@ function mirrorEntity(entity) {
  */
 export const useSceneStore = create((set) => ({
   sceneName: "Untitled",
+  scenePath: null,
   rootIds: [],
   entities: {}, // id -> mirror
   dirty: false,
@@ -29,18 +30,19 @@ export const useSceneStore = create((set) => ({
   // after EditorShell has mounted and resolved `ensureEngine()`. Belt and
   // braces: guard against the load-not-yet-finished race so a stray call
   // during boot doesn't throw on the Proxy.
-  refresh() {
+  refresh(scenePath = undefined) {
     const inst = engineInstanceCache;
     if (!inst) return;
     const entities = {};
     for (const entity of inst.entities.values()) {
       entities[entity.id] = mirrorEntity(entity);
     }
-    set({
+    set((state) => ({
       entities,
       rootIds: inst.rootEntities.map((e) => e.id),
       sceneName: inst.sceneName,
-    });
+      ...(scenePath !== undefined ? { scenePath } : { scenePath: state.scenePath }),
+    }));
   },
 
   updateTransform(id) {
@@ -54,6 +56,10 @@ export const useSceneStore = create((set) => ({
         [id]: { ...state.entities[id], transform: entity.getTransform() },
       },
     }));
+  },
+
+  setScenePath(scenePath) {
+    set({ scenePath });
   },
 
   markDirty(dirty = true) {

@@ -7,7 +7,7 @@ import { editableFromBufferGeometry, geometryAssetFromEditable } from "./editabl
 
 const safeStem = (value) => (value || "Geometry").replace(/[^a-z0-9 _-]/gi, "").trim() || "Geometry";
 
-async function uniqueGeometryPath(root, stem) {
+export async function uniqueGeometryPath(root, stem) {
   const { invoke } = await import("@tauri-apps/api/core");
   for (let suffix = 0; ; suffix++) {
     const path = `${root}/geometries/${stem}${suffix ? ` ${suffix}` : ""}.geom`;
@@ -27,11 +27,27 @@ export async function ensureGeometryAsset(entityId) {
   const root = useProjectStore.getState().rootPath;
   if (!root) throw new Error("Open a project before editing geometry");
   const path = await uniqueGeometryPath(root, safeStem(entity.name));
-  const asset = geometryAssetFromEditable(editableFromBufferGeometry(component.mesh.geometry));
+  const sourceGeometry = entity.getComponent("geometryModifiers")?.getSourceGeometry?.() ?? component.mesh.geometry;
+  const asset = geometryAssetFromEditable(editableFromBufferGeometry(sourceGeometry));
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("save_scene", { path, contents: JSON.stringify(asset, null, 2) });
   invalidateBlobUrl(path);
   commandBus.execute(new SetComponentPropCommand(entityId, "mesh", "geometryAsset", path));
+  await useProjectStore.getState().refresh();
+  return path;
+}
+
+/** Saves a new editable geometry asset without attaching it to an entity. */
+export async function saveNewGeometryAsset(stem, editable) {
+  const root = useProjectStore.getState().rootPath;
+  if (!root) throw new Error("Open a project before creating geometry");
+  const path = await uniqueGeometryPath(root, safeStem(stem));
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("save_scene", {
+    path,
+    contents: JSON.stringify(geometryAssetFromEditable(editable), null, 2),
+  });
+  invalidateBlobUrl(path);
   await useProjectStore.getState().refresh();
   return path;
 }

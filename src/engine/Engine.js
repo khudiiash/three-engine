@@ -78,6 +78,10 @@ export class Engine extends EventEmitter {
     this._drsScale = 1;
     this._drsEmaMs = 0;
     this._drsLastChange = 0;
+    // Canvas/WebGPU attachment resize synchronization. Custom render targets
+    // (GI/SSGI/etc.) may still be referenced by submitted command buffers;
+    // resizing only after the queue drains avoids destroying them in flight.
+    this._resizeInFlight = null;
     // Tracks the active timestamp readback. Besides preventing stacked
     // readbacks, renderer rebuilds await it before disposing mapped buffers.
     this._gpuTimestampInFlight = null;
@@ -187,7 +191,7 @@ export class Engine extends EventEmitter {
     const prevDpr = before.performance?.maxDevicePixelRatio ?? 2;
     const nextDpr = this.settings.performance?.maxDevicePixelRatio ?? 2;
     if (!recreatedRenderer && (prevScale !== nextScale || prevDpr !== nextDpr)) {
-      this.#applyRendererSize();
+      this.#scheduleRendererResize();
     }
     this.emit("settings-changed", this.settings);
     return recreatedRenderer;
@@ -311,7 +315,10 @@ export class Engine extends EventEmitter {
     // Mark this as a new rebuild generation so any stale #rebuildRenderer
     // awaiting init() will notice and abort instead of clobbering us.
     ++this._rendererRebuildSeq;
-    this.renderer = new THREE.WebGPURenderer({ canvas, ...rendererConstructorOptions(this.settings) });
+    this.renderer = new THREE.WebGPURenderer({
+      canvas,
+      ...rendererConstructorOptions(this.settings),
+    });
     this.#applyRendererSize();
     await this.renderer.init();
     configureTextureAssetLoader(this.renderer);
@@ -386,6 +393,10 @@ export class Engine extends EventEmitter {
     // rendererReady guards the re-init window (init() swaps the renderer
     // asynchronously; rendering before its backend resolves throws).
     if (this.camera && this.rendererReady) {
+      // A renderer resize temporarily stops the animation loop and drains
+      // submitted GPU work. If it was requested from inside an update
+      // callback, do not encode another frame after the drain was scheduled.
+      if (this._resizeInFlight) return;
       // Final-transform passes (e.g. GI deferred prepass) run here: after
       // physics/scripts have written this frame's transforms, before the
       // main draw that samples their output.
@@ -481,7 +492,7 @@ export class Engine extends EventEmitter {
       if (this._drsScale !== 1) {
         this._drsScale = 1;
         this._drsEmaMs = 0;
-        this.#applyRendererSize();
+        this.#scheduleRendererResize();
       }
       return;
     }
@@ -501,7 +512,7 @@ export class Engine extends EventEmitter {
     if (Math.abs(next - this._drsScale) > 1e-3) {
       this._drsScale = next;
       this._drsLastChange = now;
-      this.#applyRendererSize();
+      this.#scheduleRendererResize();
     }
   }
 
@@ -569,7 +580,36 @@ export class Engine extends EventEmitter {
   setPixelRatio(pixelRatio) {
     const next = Number.isFinite(pixelRatio) && pixelRatio > 0 ? pixelRatio : 1;
     this._pixelRatio = next;
-    if (this.renderer) this.#applyRendererSize();
+    if (this.renderer) this.#scheduleRendererResize();
+  }
+
+  #scheduleRendererResize() {
+    const renderer = this.renderer;
+    if (!renderer) return;
+    const queue = renderer.backend?.device?.queue;
+    if (!this.rendererReady || !queue?.onSubmittedWorkDone) {
+      this.#applyRendererSize();
+      return;
+    }
+    // Coalesce ResizeObserver, DPR, render-scale, and DRS changes. The final
+    // dimensions are read only after the queue is safe, so intermediate
+    // requests cost nothing.
+    if (this._resizeInFlight) return;
+    renderer.setAnimationLoop(null);
+    const work = queue
+      .onSubmittedWorkDone()
+      .catch(() => {})
+      .then(() => {
+        if (renderer === this.renderer) this.#applyRendererSize();
+      })
+      .finally(() => {
+        if (this._resizeInFlight !== work) return;
+        this._resizeInFlight = null;
+        if (this.loopActive && renderer === this.renderer) {
+          renderer.setAnimationLoop(() => this.#tick());
+        }
+      });
+    this._resizeInFlight = work;
   }
 
   #applyRendererSize() {
@@ -597,8 +637,18 @@ export class Engine extends EventEmitter {
       pixelRatio = Math.min(pixelRatio, maxDimension / width, maxDimension / height);
     }
 
-    this.renderer.setPixelRatio(Math.max(pixelRatio, Number.EPSILON));
-    if (width > 0 && height > 0) this.renderer.setSize(width, height, false);
+    // CanvasTarget.setPixelRatio() performs an implicit resize of the old
+    // logical size. Calling setSize() immediately afterwards therefore
+    // creates two attachment generations and can leave cached WebGPU render
+    // contexts referencing the first, already-destroyed depth texture.
+    // Apply logical size + DPR atomically so there is only one generation.
+    if (width > 0 && height > 0) {
+      this.renderer.setDrawingBufferSize(
+        width,
+        height,
+        Math.max(pixelRatio, Number.EPSILON),
+      );
+    }
   }
 
   setSize(width, height) {
@@ -606,7 +656,7 @@ export class Engine extends EventEmitter {
     this._width = width;
     this._height = height;
     if (!this.renderer) return;
-    this.#applyRendererSize();
+    this.#scheduleRendererResize();
     if (this.camera?.isPerspectiveCamera) {
       this.camera.aspect = width / height;
       this.camera.updateProjectionMatrix();

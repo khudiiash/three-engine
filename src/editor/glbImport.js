@@ -278,13 +278,33 @@ async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = 
     for (let i = 1; geomNames.has(name); i++) name = `${base} ${i}`;
     geomNames.add(name);
     const path = `${folder}/Geometry/${name}.geom`;
-    let contents;
+    let definition;
     try {
-      contents = JSON.stringify(geometryAssetFromMesh(mesh.geometry));
+      definition = geometryAssetFromMesh(mesh.geometry);
     } catch (error) {
       throw new Error(`Could not extract geometry "${mesh.name || "Mesh"}": ${error.message ?? error}`);
     }
-    await invoke("save_scene", { path, contents });
+    await invoke("save_scene", { path, contents: JSON.stringify(definition) });
+    // Stage-1 GI proxy cache: explicit import work is the right place for
+    // meshopt simplification. Runtime scene loading can then build only the
+    // small BLAS instead of simplifying a production mesh on the main thread.
+    if (!mesh.isSkinnedMesh) {
+      try {
+        const { buildRayProxyAsset } = await import("../modules/gi/rayProxy.js");
+        const giRayProxy = await buildRayProxyAsset({
+          positions: new Float32Array(definition.positions),
+          indices: new Uint32Array(definition.indices),
+        });
+        await invoke("save_scene", {
+          path: `${path}.meta`,
+          contents: JSON.stringify({ giRayProxy }, null, 2),
+        });
+      } catch (error) {
+        console.warn(
+          `GI ray proxy cache skipped for "${mesh.name || "Mesh"}": ${error.message ?? error}`,
+        );
+      }
+    }
     geometryCount++;
     return path;
   };

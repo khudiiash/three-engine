@@ -21,6 +21,7 @@ import {
   octaTexelDirections,
   RAYS_PER_PROBE,
   OCTA_RES,
+  computeAutoClipmapLayout,
 } from "../src/modules/gi/index.js";
 import {
   createGINodes,
@@ -28,8 +29,9 @@ import {
   GIProbeVolumeLight,
   GIProbeVolumeLightNode,
   MIP_GAP,
+  MAX_LOCAL_LIGHTS,
 } from "../src/modules/gi/giCompute.js";
-import { uniform } from "three/tsl";
+import { uniform, texture, vec2, vec3 } from "three/tsl";
 import "../src/modules/index.js";
 
 registerBuiltInComponents();
@@ -129,6 +131,17 @@ registerBuiltInComponents();
   assert.ok(graphVoxel, "graph-authored emissive expression produced emissive voxels");
   assert.equal(graphVoxel & 0xff, Math.round((4 / 8) * 255), "graph emissive red includes strength once");
   assert.equal((graphVoxel >>> 8) & 0xff, Math.round((1 / 8) * 255), "graph emissive green includes strength once");
+
+  // Virtual Geometry keeps a worst-case index-buffer capacity and publishes
+  // only the current cluster cut through drawRange. GI must consume that cut,
+  // not the zero-filled tail or full-resolution capacity.
+  const cutScene = new THREE.Scene();
+  const cutGeometry = new THREE.BoxGeometry(2, 2, 2);
+  cutGeometry.setDrawRange(0, 6); // two of the box's twelve triangles
+  cutScene.add(new THREE.Mesh(cutGeometry, new THREE.MeshStandardMaterial()));
+  cutScene.updateMatrixWorld(true);
+  const cutResult = voxelizeScene(cutScene, grid);
+  assert.equal(cutResult.tris, 2, "voxelizer respects active drawRange / virtual-geometry cut");
   console.log("[2] OK: voxelizeScene (occupancy, packing, normals, emissive)");
 }
 
@@ -150,6 +163,9 @@ registerBuiltInComponents();
   const editorOnly = mk();
   editorOnly.layers.set(31);
   assert.ok(!isVoxelizableMesh(editorOnly), "editor-layer-31 mesh skipped (unsigned mask compare)");
+  const mixedEditorLayer = mk();
+  mixedEditorLayer.layers.enable(31);
+  assert.ok(!isVoxelizableMesh(mixedEditorLayer), "editor layer excluded even when layer 0 is also enabled");
 
   // Meshes under an INVISIBLE parent must not voxelize — the engine hides
   // disabled entities via the root object's `visible`, children stay true.
@@ -162,6 +178,17 @@ registerBuiltInComponents();
   const gridV = computeGrid(new THREE.Vector3(0, 0, 0), new THREE.Vector3(8, 8, 8), 16);
   const resV = voxelizeScene(sceneV, gridV);
   assert.equal(resV.meshes, 1, "hidden subtree pruned from voxelization");
+  const editorScene = new THREE.Scene();
+  const editorRoot = new THREE.Group();
+  editorRoot.userData.editorOnly = true;
+  editorRoot.add(mk());
+  editorScene.add(editorRoot);
+  editorScene.updateMatrixWorld(true);
+  assert.equal(
+    voxelizeScene(editorScene, gridV).meshes,
+    0,
+    "editor-only root prunes untagged gizmo descendants",
+  );
   console.log("[3] OK: isVoxelizableMesh filtering + hidden-subtree pruning");
 }
 
@@ -189,6 +216,25 @@ registerBuiltInComponents();
   }
   assert.ok(up >= 24 && up <= 40, `octa texels cover both hemispheres (+z: ${up}/64)`);
   console.log("[4] OK: fibonacci + octahedral direction sets");
+}
+
+// -- automatic camera clipmaps: projection coverage without size props --
+{
+  const camera = new THREE.PerspectiveCamera(60, 16 / 9, 0.1, 2000);
+  const layouts = computeAutoClipmapLayout(camera);
+  assert.equal(layouts.length, 3, "editor far range is capped to three useful GI cascades");
+  assert.ok(layouts[0].reach <= 12, "inner cascade keeps fine near-camera detail");
+  assert.ok(layouts.at(-1).reach >= 128, "outer cascade reaches the useful GI range");
+  assert.ok(
+    layouts.every((layout) => layout.forwardOffset === 0),
+    "clipmaps stay camera-position centered so view rotation cannot recenter them",
+  );
+  for (let i = 1; i < layouts.length; i++) {
+    assert.equal(layouts[i].scale, layouts[i - 1].scale * 4, "clipmap scale grows 4x");
+    assert.equal(layouts[i].reach, layouts[i - 1].reach * 4, "coverage grows 4x");
+  }
+  assert.ok(layouts.every((l) => l.size.x === l.size.y && l.size.y === l.size.z), "rotation-independent cube coverage");
+  console.log("[4b] OK: automatic camera clipmap layout");
 }
 
 // -- clipmap scrolling: grid shift + region-limited re-voxelization --
@@ -265,6 +311,50 @@ registerBuiltInComponents();
   assert.deepEqual(asyncTarget.emissive, reference.emissive, "time-sliced emissive matches sync voxelization");
   assert.equal(asyncStats.occupied, reference.occupied);
 
+  // One huge triangle used to monopolize a frame because the async worker
+  // yielded only between triangles. Confirm the inner lattice loop lets the
+  // event loop run before the job completes.
+  const hugeScene = new THREE.Scene();
+  const hugeGeometry = new THREE.BufferGeometry();
+  hugeGeometry.setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute(
+      [-256, 0, -256, 256, 0, -256, -256, 0, 256],
+      3,
+    ),
+  );
+  hugeScene.add(new THREE.Mesh(hugeGeometry, new THREE.MeshStandardMaterial()));
+  hugeScene.updateMatrixWorld(true);
+  const hugeGrid = computeGrid(
+    new THREE.Vector3(),
+    new THREE.Vector3(512, 1, 512),
+    512,
+  );
+  const hugeTarget = {
+    albedo: new Uint32Array(hugeGrid.count),
+    normal: new Uint32Array(hugeGrid.count),
+    emissive: new Uint32Array(hugeGrid.count),
+  };
+  let eventLoopProgressed = false;
+  setTimeout(() => {
+    eventLoopProgressed = true;
+  }, 0);
+  await voxelizeRegionAsync(
+    hugeScene,
+    hugeGrid,
+    hugeTarget,
+    {
+      x0: 0,
+      y0: 0,
+      z0: 0,
+      x1: hugeGrid.dims.x,
+      y1: hugeGrid.dims.y,
+      z1: hugeGrid.dims.z,
+    },
+    { timeSliceMs: 1 },
+  );
+  assert.ok(eventLoopProgressed, "large-triangle raster yields inside its lattice loop");
+
   const cancelled = await voxelizeRegionAsync(scene, grid2, asyncTarget, region, {
     signal: { cancelled: true },
   });
@@ -279,7 +369,14 @@ registerBuiltInComponents();
   assert.deepEqual(mip.levels[1].dims, { x: 32, y: 16, z: 32 });
   assert.equal(mip.levels[0].bufOffset, -1, "level 0 lives in the radiance buffer");
   assert.equal(mip.levels[1].bufOffset, 0, "level 1 starts the mip buffer");
-  assert.equal(mip.levels[2].bufOffset, 32 * 16 * 32, "levels packed consecutively");
+  assert.equal(
+    mip.levels[2].bufOffset,
+    32 * 16 * 32 * 6,
+    "levels ≥ 1 store six anisotropic direction bins back to back",
+  );
+  assert.equal(mip.levels[1].count, 32 * 16 * 32, "per-level texel count");
+  assert.equal(mip.levels[0].bins, 1, "level 0 is isotropic");
+  assert.equal(mip.levels[1].bins, 6, "levels ≥ 1 are anisotropic");
   const last = mip.levels[mip.levels.length - 1];
   assert.ok(Math.max(last.dims.x, last.dims.y, last.dims.z) <= 4, "coarsest level ≤ 4 voxels");
   assert.equal(mip.levels[1].atlasX, 64 + MIP_GAP, "atlas levels laid out along X with a gap");
@@ -300,6 +397,44 @@ registerBuiltInComponents();
   const radianceAtlas = new THREE.Storage3DTexture(mip.atlasDims.x, mip.atlasDims.y, mip.atlasDims.z);
   radianceAtlas.type = THREE.HalfFloatType;
   const sba = (arr, s) => new THREE.StorageBufferAttribute(arr, s);
+  // Mirror GISystem's packed probeData layout (one storage buffer holds rays,
+  // irradiance, visibility moments, shift scratch, and direction tables).
+  const probeLayout = (() => {
+    const texelCount = probeCount * OCTA_RES * OCTA_RES;
+    const rays = 0;
+    const irradiance = rays + probesPerFrame * RAYS_PER_PROBE;
+    const visibility = irradiance + texelCount;
+    const irradianceScratch = visibility + texelCount;
+    const visibilityScratch = irradianceScratch + texelCount;
+    const rayDirs = visibilityScratch + texelCount;
+    const texelDirs = rayDirs + RAYS_PER_PROBE;
+    return {
+      rays,
+      irradiance,
+      visibility,
+      irradianceScratch,
+      visibilityScratch,
+      rayDirs,
+      texelDirs,
+      total: texelDirs + OCTA_RES * OCTA_RES,
+    };
+  })();
+  const probeArray = new Float32Array(probeLayout.total * 4);
+  probeArray.set(fibonacciDirections(RAYS_PER_PROBE), probeLayout.rayDirs * 4);
+  probeArray.set(octaTexelDirections(), probeLayout.texelDirs * 4);
+  const buffers = {
+    voxAlbedo: sba(new Uint32Array(512), 1),
+    voxNormal: sba(new Uint32Array(512), 1),
+    voxEmissive: sba(new Uint32Array(512), 1),
+    voxDirect: sba(new Uint32Array(512), 1),
+    voxDirectStaging: sba(new Uint32Array(512), 1),
+    voxEmissiveDirect: sba(new Uint32Array(512), 1),
+    voxEmissiveDirectStaging: sba(new Uint32Array(512), 1),
+    radiance: sba(new Float32Array(512 * 4), 4),
+    mips: sba(new Float32Array(Math.max(1, mip.mipTexelCount) * 4), 4),
+    probeData: sba(probeArray, 4),
+    lightData: sba(new Float32Array(MAX_LOCAL_LIGHTS * 5 * 4), 4),
+  };
   const nodes = createGINodes({
     dims,
     counts,
@@ -310,24 +445,18 @@ registerBuiltInComponents();
     mip,
     coneSteps: 10,
     reflections: true,
-    buffers: {
-      voxAlbedo: sba(new Uint32Array(512), 1),
-      voxNormal: sba(new Uint32Array(512), 1),
-      voxEmissive: sba(new Uint32Array(512), 1),
-      voxDirect: sba(new Uint32Array(512), 1),
-      radiance: sba(new Float32Array(512 * 4), 4),
-      mips: sba(new Float32Array(Math.max(1, mip.mipTexelCount) * 4), 4),
-      rays: sba(new Float32Array(probesPerFrame * RAYS_PER_PROBE * 4), 4),
-      irradiance: sba(new Float32Array(probeCount * 64 * 4), 4),
-      probeScratch: sba(new Float32Array(probeCount * 64 * 4), 4),
-      rayDirs: sba(fibonacciDirections(RAYS_PER_PROBE), 4),
-      texelDirs: sba(octaTexelDirections(), 4),
-    },
+    buffers,
+    probeLayout,
     atlas,
     radianceAtlas,
   });
   assert.ok(nodes.injectNode?.isNode, "inject (combine) compute node built");
   assert.ok(nodes.injectDirectNode?.isNode, "cached direct-sun compute node built");
+  assert.ok(nodes.publishDirectNode?.isNode, "atomic direct-cache publish node built");
+  assert.ok(
+    nodes.blendEmissiveDirectNode?.isNode,
+    "temporal emissive receiver-cache blend node built",
+  );
   assert.ok(nodes.traceNode?.isNode, "trace compute node built");
   assert.ok(nodes.integrateNode?.isNode, "integrate compute node built");
   assert.ok(nodes.probeShiftSaveNode?.isNode && nodes.probeShiftApplyNode?.isNode, "probe shift passes built");
@@ -344,15 +473,96 @@ registerBuiltInComponents();
   assert.ok(nodes.uniforms.sunDir.value.isVector3, "uniforms exposed");
   assert.ok(nodes.uniforms.reflectionIntensity, "reflection intensity uniform exposed");
 
+  const rayNodes = createGINodes({
+    dims,
+    counts,
+    probesPerFrame,
+    tilesPerRow,
+    atlasW: atlas.image.width,
+    atlasH: atlas.image.height,
+    mip,
+    coneSteps: 10,
+    reflections: false,
+    buffers: {
+      ...buffers,
+      rayData: sba(new Float32Array(64 * 4), 4),
+    },
+    probeLayout,
+    rayTracing: true,
+    rayDataCapacity: 64,
+    atlas,
+    radianceAtlas,
+  });
+  assert.ok(rayNodes.traceNode?.isNode, "triangle/voxel A/B probe trace graph built");
+  assert.ok(rayNodes.uniforms.rayTracingEnabled, "triangle trace A/B uniform exposed");
+  assert.ok(rayNodes.uniforms.rayTlasNodeCount, "triangle trace TLAS uniforms exposed");
+
   // Deferred screen-space pass builds against the volume list headlessly.
-  const { createDeferredGI } = await import("../src/modules/gi/giDeferred.js");
+  const { createDeferredGI, createDeferredGISampler } = await import("../src/modules/gi/giDeferred.js");
   const deferred = createDeferredGI({ width: 320, height: 200, volumes: [{ nodes }] });
   assert.equal(deferred.width, 160, "half-res width");
   assert.equal(deferred.height, 100, "half-res height");
   assert.ok(deferred.passNode?.isNode, "deferred GI compute pass built");
+  assert.ok(deferred.resolveNode?.isNode, "deterministic spatial resolve pass built");
   assert.ok(deferred.giTexture?.isTexture, "GI output texture created");
+  assert.ok(deferred.rawTexture?.isTexture, "raw GI texture created");
   assert.ok(deferred.normalMaterial?.isMaterial, "prepass normal material created");
-  assert.ok(nodes.coneDiffuseFn && nodes.edgeFadeFn, "raw cone/fade Fns exposed for deferred pass");
+  assert.ok(
+    nodes.probeDiffuseFn && nodes.coneDiffuseFn && nodes.edgeFadeFn,
+    "world-probe final gather plus cone/fade detail Fns exposed",
+  );
+  const deferredSampler = createDeferredGISampler({
+    giTextureNode: texture(deferred.giTexture),
+    depthTextureNode: texture(deferred.gbuffer.depthTexture),
+    normalTextureNode: texture(deferred.gbuffer.texture),
+    uniforms: deferred.uniforms,
+  });
+  assert.ok(
+    deferredSampler(vec3(0), vec3(0, 1, 0), vec2(0.5)).isNode,
+    "edge-aware deferred reconstruction node built",
+  );
+
+  // Live JFA SDF + material-space distance-field sun-shadow graph. This
+  // catches JS-level construction errors; WGSL validity is runtime-only.
+  const { createSDFNodes } = await import("../src/modules/gi/sdfField.js");
+  const { createSunShadowNode } = await import("../src/modules/gi/dfShadows.js");
+  const shadowDims = { x: 8, y: 8, z: 8 };
+  const shadowCount = 8 * 8 * 8;
+  const shadowBuffers = {
+    voxAlbedo: sba(new Uint32Array(shadowCount), 1),
+    sdfSeedA: sba(new Float32Array(shadowCount * 4), 4),
+    sdfSeedB: sba(new Float32Array(shadowCount * 4), 4),
+  };
+  const sdfTexture = new THREE.Storage3DTexture(8, 8, 8);
+  sdfTexture.type = THREE.HalfFloatType;
+  const sdfNodes = createSDFNodes({
+    dims: shadowDims,
+    buffers: shadowBuffers,
+    sdfTexture,
+  });
+  assert.ok(sdfNodes.seedNode?.isNode, "JFA seed pass built");
+  assert.ok(sdfNodes.jumpNodes.length >= 2, "JFA jump sequence built");
+  for (const pass of sdfNodes.jumpNodes) assert.ok(pass?.isNode);
+  assert.ok(sdfNodes.publishNode?.isNode, "SDF publish pass built");
+  const shadowVolume = {
+    grid: { dims: shadowDims, count: shadowCount },
+    nodes: {
+      uniforms: {
+        gridMin: uniform(new THREE.Vector3(-2, -2, -2)),
+        voxelSize: uniform(0.5),
+      },
+    },
+    buffers: shadowBuffers,
+    sdfTexture,
+  };
+  const sunShadow = createSunShadowNode({
+    volumes: [shadowVolume, shadowVolume],
+    readyUniform: uniform(0),
+  });
+  assert.ok(sunShadow.node?.isNode, "material-space DF sun-shadow node built");
+  assert.ok(sunShadow.uniforms.sunDirToLight.value.isVector3, "sun direction uniform exposed");
+  assert.ok(sunShadow.uniforms.softness && sunShadow.uniforms.maxDistance, "softness/range uniforms exposed");
+  sdfTexture.dispose();
   deferred.dispose();
 
   const light = new GIProbeVolumeLight();
@@ -360,6 +570,100 @@ registerBuiltInComponents();
   const lightNode = new GIProbeVolumeLightNode(light);
   assert.ok(lightNode.isAnalyticLightNode, "light node extends AnalyticLightNode");
   console.log("[7] OK: TSL node graph + light node construction");
+}
+
+// -- GPU dynamic layer: triangle pool extraction + splat/copy node construction --
+{
+  const { DynamicVoxelPool, createDynamicVoxelNodes, VEC4S_PER_TRI, DYNAMIC_TRI_CAPACITY, MAX_DYNAMIC_MESHES } =
+    await import("../src/modules/gi/gpuVoxelizer.js");
+  const { uniform: makeUniform } = await import("three/tsl");
+
+  const pool = new DynamicVoxelPool();
+  assert.equal(pool.count, 0, "pool starts empty");
+  assert.equal(pool.sync([]), false, "empty→empty sync is a no-op");
+
+  const red = new THREE.Mesh(
+    new THREE.BoxGeometry(2, 2, 2),
+    new THREE.MeshStandardMaterial({ color: 0xff0000, emissive: 0x00ff00, emissiveIntensity: 4 }),
+  );
+  red.position.set(3, 0, 0);
+  const blue = new THREE.Mesh(
+    new THREE.BoxGeometry(1, 1, 1).toNonIndexed(),
+    new THREE.MeshStandardMaterial({ color: 0x0000ff }),
+  );
+  assert.equal(pool.sync([red, blue]), true, "set change rebuilds");
+  assert.equal(pool.count, 24, "12 indexed + 12 non-indexed triangles");
+  assert.equal(pool.triCountU.value, 24, "GPU tri-count uniform tracks the pool");
+  assert.equal(pool.meshes.length, 2);
+
+  // Record layout: v0 in OBJECT space (matrix applied on GPU), mesh index in
+  // v0.w, albedo in record 3, pre-scaled emissive in record 4.
+  const arr = pool.triangles.array;
+  assert.equal(arr[3], 0, "first mesh index 0");
+  const stride = VEC4S_PER_TRI * 4;
+  assert.equal(arr[12 * stride + 3], 1, "second mesh's triangles carry index 1");
+  assert.equal(arr[12], 1, "albedo.r red");
+  assert.equal(arr[14], 0, "albedo.b zero for red mesh");
+  assert.equal(arr[17], Math.min(1, 4 / 8), "emissive green = intensity/EMISSIVE_SCALE");
+  assert.equal(arr[12 * stride + 14], 1, "second mesh albedo.b blue");
+  // Object-space corners of a 2×2×2 box are at ±1 regardless of the world position.
+  assert.ok(Math.abs(Math.abs(arr[0]) - 1) < 1e-6, "v0 stored in object space");
+
+  assert.equal(pool.sync([red, blue]), false, "same set + same geometry versions → no rebuild");
+  red.geometry.getAttribute("position").version++;
+  assert.equal(pool.sync([red, blue]), true, "geometry edit (version bump) rebuilds");
+
+  const cutPool = new DynamicVoxelPool();
+  const cutMesh = new THREE.Mesh(
+    new THREE.BoxGeometry(2, 2, 2),
+    new THREE.MeshStandardMaterial(),
+  );
+  cutMesh.geometry.setDrawRange(0, 6);
+  cutPool.sync([cutMesh]);
+  assert.equal(cutPool.count, 2, "dynamic pool respects virtual-geometry drawRange");
+  cutMesh.geometry.setDrawRange(0, 12);
+  cutPool.sync([cutMesh]);
+  assert.equal(cutPool.count, 4, "drawRange change invalidates dynamic-pool extraction");
+
+  // Matrices upload world transforms and refresh world AABBs.
+  red.updateMatrixWorld(true);
+  pool.updateMatrices();
+  assert.equal(pool.matrices.array[12], 3, "world translation lands in the matrix table");
+  assert.ok(Math.abs(pool.boxes[0].min.x - 2) < 1e-6, "world AABB follows the transform");
+  assert.ok(Math.abs(pool.maxDims[0] - 2) < 1e-6, "largest world axis recorded (sub-voxel gating)");
+
+  // Capacity: an oversized mesh is skipped, not partially written.
+  const huge = new THREE.Mesh(
+    new THREE.SphereGeometry(1, 256, 256),
+    new THREE.MeshStandardMaterial(),
+  );
+  const hugeTris = huge.geometry.index.count / 3;
+  assert.ok(hugeTris > DYNAMIC_TRI_CAPACITY, "test sphere exceeds pool capacity");
+  pool.sync([red, huge, blue]);
+  assert.equal(pool.count, 24, "oversized mesh skipped, small ones kept");
+  assert.equal(pool.meshes.length, 2);
+  assert.ok(pool.meshes.length <= MAX_DYNAMIC_MESHES);
+
+  // Per-volume compose passes build headlessly against shared pool nodes.
+  const dims = { x: 8, y: 8, z: 8 };
+  const sba1 = () => new THREE.StorageBufferAttribute(new Uint32Array(512), 1);
+  const dynNodes = createDynamicVoxelNodes({
+    dims,
+    gridMin: makeUniform(new THREE.Vector3(0, 0, 0)),
+    voxelSize: makeUniform(0.5),
+    buffers: {
+      voxAlbedo: sba1(),
+      voxNormal: sba1(),
+      voxEmissive: sba1(),
+      voxStaticAlbedo: sba1(),
+      voxStaticNormal: sba1(),
+      voxStaticEmissive: sba1(),
+    },
+    pool,
+  });
+  assert.ok(dynNodes.copyNode?.isNode, "static→live copy pass built");
+  assert.ok(dynNodes.splatNode?.isNode, "dynamic triangle splat pass built");
+  console.log("[7b] OK: GPU dynamic layer (pool extraction + compose passes)");
 }
 
 // -- module + component lifecycle on a real engine --
@@ -373,6 +677,10 @@ registerBuiltInComponents();
   const entity = engine.createEntity({ name: "GI Volume" });
   entity.addComponent("global-illumination", { sizeX: 20, sizeY: 10, sizeZ: 20 });
   const comp = entity.getComponent("global-illumination");
+  assert.ok(
+    !comp.constructor.schema.some((field) => ["sizeX", "sizeY", "sizeZ", "followCamera"].includes(field.key)),
+    "manual volume/follow fields removed from the inspector schema",
+  );
   assert.equal(handle.system.component, comp, "component activated the system");
   assert.ok(handle.system._rebuildQueued, "rebuild queued (runs on first rendered tick)");
 

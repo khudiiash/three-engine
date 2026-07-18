@@ -369,6 +369,60 @@ export async function compileShaderGraph(graph) {
 }
 
 /**
+ * Translate prop names that the legacy shaderGraph.js runtime used on
+ * `principledBsdf` nodes (`baseColor`, `specular`, `specularTint`, `emission`,
+ * `alpha`, `transmissionRoughness`) to the names the current tslGraph runtime
+ * reads (`color`, `specularIntensity`, `specularColor`, `emissive`, `opacity`,
+ * `thickness`). Same for `emission` → `emissive` and `sheenTint` → `sheen`.
+ *
+ * Without this translation a .mat file authored under the legacy runtime
+ * silently renders with the runtime's input defaults (white diffuse, etc.) —
+ * every input would resolve to its spec default because none of the new keys
+ * are populated.
+ *
+ * Idempotent and cheap — only rewrites a node when it actually has legacy
+ * keys present, so already-modern graphs are returned unchanged.
+ */
+function normalizeLegacyPropKeys(graph) {
+  if (!graph?.nodes?.length) return graph;
+  // Map: legacy prop name → current (tslGraph) prop name. The values come
+  // from the legacy `shaderGraph.js` PRINCIPLED_INPUTS / current tslGraph
+  // NODE_TYPES.principledBsdf.inputs.
+  const RENAMES = {
+    baseColor: "color",
+    specular: "specularIntensity",
+    specularTint: "specularColor",
+    anisotropicRotation: null, // dropped — tslGraph no longer exposes this input
+    sheenTint: "sheen",
+    emission: "emissive",
+    alpha: "opacity",
+    transmissionRoughness: "thickness",
+  };
+  let changed = false;
+  const nodes = graph.nodes.map((n) => {
+    if (!n?.props) return n;
+    let nodeChanged = false;
+    const props = { ...n.props };
+    for (const [from, to] of Object.entries(RENAMES)) {
+      if (from in props) {
+        if (to && props[to] == null) props[to] = props[from];
+        delete props[from];
+        nodeChanged = true;
+      }
+    }
+    // Legacy spec used `sheen` as the scalar amount AND tslGraph uses
+    // `sheen` for the same scalar amount — they're already aligned, no rename.
+    if (nodeChanged) {
+      changed = true;
+      return { ...n, props };
+    }
+    return n;
+  });
+  if (!changed) return graph;
+  return { ...graph, nodes };
+}
+
+/**
  * Convert an older single-Output (color-sink) graph into the new shader-tree
  * shape: a Principled BSDF pre-seeded from the .mat defaults wired to the Output.
  *
@@ -377,6 +431,15 @@ export async function compileShaderGraph(graph) {
  */
 export function migrateLegacyGraph(graph, def) {
   if (!graph?.nodes?.length) return graph;
+  // Normalize prop keys first: BSDF graphs authored by the legacy
+  // shaderGraph.js runtime used `baseColor`, `specular`, `specularTint`,
+  // `emission`, `alpha`, `transmissionRoughness` as prop names. The current
+  // tslGraph runtime reads `color`, `specularIntensity`, `specularColor`,
+  // `emissive`, `opacity`, `thickness`. Without this translation a .mat
+  // file authored under the old runtime silently renders with default
+  // values (white diffuse, etc.) — every input resolves to its spec
+  // default because none of the new keys are populated.
+  const normalized = normalizeLegacyPropKeys(graph);
   // Legacy graphs wired value nodes into the Output's `color` handle (which
   // became material.colorNode) and used NO other Output handle. The modern
   // slot-based Output (tslGraph.js) also has a `color` handle, but it exposes
@@ -384,34 +447,51 @@ export function migrateLegacyGraph(graph, def) {
   // alone is ambiguous: treat the graph as legacy only when `color` is the
   // *only* Output handle wired. Any other handle (e.g. a `volume` edge) proves
   // it's already a modern graph — migrating it would drop those edges.
-  const outputIds = new Set(graph.nodes.filter((n) => n.type === "output").map((n) => n.id));
-  const outputEdges = (graph.edges ?? []).filter((e) => outputIds.has(e.target));
+  const outputIds = new Set(normalized.nodes.filter((n) => n.type === "output").map((n) => n.id));
+  const outputEdges = (normalized.edges ?? []).filter((e) => outputIds.has(e.target));
   const hasLegacy =
     outputEdges.length > 0 && outputEdges.every((e) => e.targetHandle === "color");
-  if (!hasLegacy) return graph;
+  if (!hasLegacy) return normalized;
 
-  const seedProps = { ...PRINCIPLED_DEFAULTS };
-  if (def?.color) seedProps.baseColor = def.color;
+  // `migrateLegacyGraph` is only invoked at runtime (via `compileShaderGraph`
+  // in tslGraph.js) to massage old-format graphs into modern ones. The modern
+  // compile reads each input from `node.props[<input.key>]` — and in
+  // tslGraph's NODE_TYPES.principledBsdf, the input keys are `color`,
+  // `specularIntensity`, `specularColor`, `emissive`, `opacity`, etc., NOT
+  // `baseColor`/`specular`/`specularTint`/`emission`/`alpha`. So we have to
+  // emit seed props under those keys. Otherwise the migrated graph would
+  // compile to the default white because every input would resolve to its
+  // spec default and the user's stored `def.color` would be silently dropped.
+  const seedProps = {};
+  if (def?.color) seedProps.color = def.color;
+  else seedProps.color = "#ffffff";
   if (def?.roughness != null) seedProps.roughness = def.roughness;
   if (def?.metalness != null) seedProps.metalness = def.metalness;
+  seedProps.ior = 1.5;
+  seedProps.specularIntensity = 0.5;
+  seedProps.specularColor = "#ffffff";
+  seedProps.emissive = "#000000";
+  seedProps.emissiveStrength = 1;
+  seedProps.opacity = 1;
 
-  const oldOutput = graph.nodes.find((n) => n.type === "output");
-  const oldEdges = graph.edges ?? [];
-  const oldNodes = graph.nodes;
+  const oldOutput = normalized.nodes.find((n) => n.type === "output");
+  const oldEdges = normalized.edges ?? [];
+  const oldNodes = normalized.nodes;
 
   // The legacy Output only had a `color` input — every edge into it carries
-  // a color expression, so we funnel them all into Principled.baseColor.
+  // a color expression, so we funnel them all into Principled.color (the
+  // tslGraph input key, NOT `baseColor`).
   // (Anything else odd, e.g. an edge with a strange handle, just gets dropped
   // from the migrated graph; better than mis-wiring.)
   const newEdges = [];
   for (const e of oldEdges) {
     if (e.target === oldOutput.id && e.targetHandle === "color") {
-      newEdges.push({ ...e, target: "principled", targetHandle: "baseColor" });
+      newEdges.push({ ...e, target: "principled", targetHandle: "color" });
     } else if (e.target !== oldOutput.id) {
       newEdges.push(e);
     }
   }
-  newEdges.push({ source: "principled", sourceHandle: "surface", target: "output", targetHandle: "surface" });
+  newEdges.push({ source: "principled", sourceHandle: "out", target: "output", targetHandle: "surface" });
 
   const newNodes = [
     ...oldNodes.filter((n) => n.id !== oldOutput.id),

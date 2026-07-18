@@ -1,10 +1,12 @@
 import { VirtualGeometrySystem } from "./VirtualGeometrySystem.js";
 
 export {
+  getVirtualGeometryRecord,
   refreshVirtualGeometryAsset,
   setVirtualGeometryDebugVisible,
   VIRTUAL_GEOMETRY_META_DEFAULTS,
 } from "./VirtualGeometrySystem.js";
+export { getCoarsestClusterIndices } from "./clusterBuilder.js";
 
 /**
  * Virtual geometry module — Nanite-style cluster LOD for high-density static

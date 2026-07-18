@@ -1,5 +1,7 @@
 import * as THREE from "three/webgpu";
 import { EDITOR_LAYER } from "../../engine/editorLayers.js";
+import { getVirtualGeometryRecord } from "../virtual-geometry/VirtualGeometrySystem.js";
+import { getCoarsestClusterIndices } from "../virtual-geometry/clusterBuilder.js";
 
 /**
  * CPU scene voxelizer for the GI module. Produces the static world
@@ -75,7 +77,7 @@ function readConstantNode(node, seen = new Set(), depth = 0) {
   return null;
 }
 
-function readConstantNodeColor(node, out) {
+export function readConstantNodeColor(node, out) {
   const value = readConstantNode(node);
   if (!Array.isArray(value) || value.length < 3 || !value.slice(0, 3).every(Number.isFinite)) return false;
   out.setRGB(value[0], value[1], value[2]);
@@ -90,9 +92,16 @@ const EDITOR_ONLY_MASK = (1 << EDITOR_LAYER) >>> 0;
 export function isVoxelizableMesh(obj) {
   if (!obj.isMesh || obj.isSkinnedMesh) return false;
   if (!obj.geometry?.getAttribute?.("position")) return false;
-  if (obj.userData.engineOwned || obj.userData.vgeoDebug || obj.userData.giDebug) return false;
+  if (
+    obj.userData.engineOwned ||
+    obj.userData.editorOnly ||
+    obj.userData.vgeoDebug ||
+    obj.userData.giDebug
+  ) {
+    return false;
+  }
   // Editor-only helpers (gizmos, grid, camera models) live on layer 31.
-  if ((obj.layers.mask >>> 0) === EDITOR_ONLY_MASK) return false;
+  if (((obj.layers.mask >>> 0) & EDITOR_ONLY_MASK) !== 0) return false;
   return obj.visible;
 }
 
@@ -104,6 +113,16 @@ export function isVoxelizableMesh(obj) {
  */
 export function forEachVoxelizableMesh(root, fn) {
   if (root.visible === false) return;
+  // Layers are not inherited in Three, but editor helpers commonly mark only
+  // their root. Prune the whole subtree when either convention is present.
+  if (
+    !root.isScene &&
+    (root.userData?.editorOnly ||
+      root.userData?.giDebug ||
+      (((root.layers?.mask ?? 0) >>> 0) & EDITOR_ONLY_MASK) !== 0)
+  ) {
+    return;
+  }
   // Skip skeletons and everything rigged to them: an animated character is a
   // moving object, not static world geometry. Voxelizing its body/wings/armor
   // bakes an occluder into the grid that then lags behind as it moves — the
@@ -140,6 +159,170 @@ export function computeGrid(center, size, res) {
   return { min, voxelSize, dims, count: dims.x * dims.y * dims.z };
 }
 
+// Empty voxels reached by a six-connected flood from the clipmap boundary
+// carry this bit in the otherwise-unused top bit of the packed normal word.
+// Occupied voxels keep their existing RGB normal + bit-24 two-sided flag.
+export const EXTERIOR_EMPTY_BIT = 0x80000000;
+
+// Corner/junction/mesh-overlap cells hold triangles from multiple faces;
+// their averaged or dominant normal is unreliable, so direct injection
+// skips them and sample-time normal gates accept them (a normal test there
+// paints black seams along every wall junction).
+export const AMBIGUOUS_NORMAL_BIT = 0x08000000; // bit 27
+
+/**
+ * Marks empty space connected to the clipmap boundary.
+ *
+ * A plain voxel/probe miss cannot distinguish open sky from a sealed room:
+ * both contain empty voxels. Encoding connectivity lets GPU transport return
+ * sky only for the former. Opening a wall joins the room to the exterior on
+ * the next staged voxel publish; closing it removes that connection.
+ */
+export function markExteriorEmptyVoxels(albedo, normal, dims) {
+  const work = markExteriorEmptyVoxelsWork(albedo, normal, dims);
+  let step;
+  do step = work.next(); while (!step.done);
+  return step.value;
+}
+
+/**
+ * Time-sliced flood classification for the async voxel publish path. The
+ * synchronous flood on a large grid (up to 160³ = 4M cells) blocked one
+ * editor frame for tens of milliseconds every time a bake or recenter
+ * published — one of the "freeze on camera/object movement" sources.
+ */
+export async function markExteriorEmptyVoxelsAsync(
+  albedo,
+  normal,
+  dims,
+  { signal, timeSliceMs = 4 } = {},
+) {
+  const work = markExteriorEmptyVoxelsWork(albedo, normal, dims);
+  const slice = Math.max(1, timeSliceMs);
+  while (true) {
+    const deadline = performance.now() + slice;
+    let step;
+    do {
+      if (signal?.cancelled) {
+        work.return?.();
+        return { cancelled: true, exterior: 0, sealed: 0, occupied: 0, twoSided: 0 };
+      }
+      step = work.next();
+      if (step.done) return step.value;
+    } while (performance.now() < deadline);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
+function* markExteriorEmptyVoxelsWork(albedo, normal, dims) {
+  const { x: dx, y: dy, z: dz } = dims;
+  const count = dx * dy * dz;
+  if (!count) return { exterior: 0, sealed: 0, occupied: 0, twoSided: 0 };
+
+  // The target arrays are normally fresh, but clearing first also makes this
+  // safe for reused staging arrays. Occupancy/sidedness tallies ride along to
+  // diagnose enclosure classification without a second full sweep.
+  let occupied = 0;
+  let twoSided = 0;
+  for (let i = 0; i < count; i++) {
+    // Strip the exterior bit and the ambiguity bit before reclassifying.
+    normal[i] = (normal[i] & 0x71ffffff) >>> 0;
+    if ((albedo[i] >>> 24) !== 0) {
+      occupied++;
+      if ((normal[i] & 0x01000000) !== 0) twoSided++;
+    }
+    if ((i & 65535) === 65535) yield;
+  }
+
+  const queue = new Uint32Array(count);
+  let head = 0;
+  let tail = 0;
+  const enqueue = (index) => {
+    if ((albedo[index] >>> 24) !== 0) return;
+    if ((normal[index] & EXTERIOR_EMPTY_BIT) !== 0) return;
+    normal[index] = EXTERIOR_EMPTY_BIT;
+    queue[tail++] = index;
+  };
+
+  // Seed every boundary face. Duplicate edges/corners are rejected by the
+  // bit check, keeping the queue bounded to exactly `count`.
+  for (let z = 0; z < dz; z++) {
+    for (let y = 0; y < dy; y++) {
+      enqueue(y * dx + z * dx * dy);
+      enqueue(dx - 1 + y * dx + z * dx * dy);
+    }
+  }
+  for (let z = 0; z < dz; z++) {
+    for (let x = 0; x < dx; x++) {
+      enqueue(x + z * dx * dy);
+      enqueue(x + (dy - 1) * dx + z * dx * dy);
+    }
+  }
+  for (let y = 0; y < dy; y++) {
+    for (let x = 0; x < dx; x++) {
+      enqueue(x + y * dx);
+      enqueue(x + y * dx + (dz - 1) * dx * dy);
+    }
+  }
+
+  while (head < tail) {
+    const index = queue[head++];
+    const z = Math.floor(index / (dx * dy));
+    const rem = index - z * dx * dy;
+    const y = Math.floor(rem / dx);
+    const x = rem - y * dx;
+    if (x > 0) enqueue(index - 1);
+    if (x + 1 < dx) enqueue(index + 1);
+    if (y > 0) enqueue(index - dx);
+    if (y + 1 < dy) enqueue(index + dx);
+    if (z > 0) enqueue(index - dx * dy);
+    if (z + 1 < dz) enqueue(index + dx * dy);
+    if ((head & 32767) === 0) yield;
+  }
+
+  // Ambiguous-normal tagging. A cell whose normal-side neighbour is also
+  // occupied holds triangles from multiple faces (wall junction or mesh
+  // overlap): its averaged/dominant normal is unreliable, so injection
+  // skips it (corners are AO territory) and sample-time normal gates fall
+  // back to accepting it. The former sealed/exterior face-component bits
+  // were removed together with the binary enclosure gating.
+  const occupiedAt = (x, y, z) => {
+    if (x < 0 || y < 0 || z < 0 || x >= dx || y >= dy || z >= dz) return false;
+    return (albedo[x + y * dx + z * dx * dy] >>> 24) !== 0;
+  };
+  for (let z = 0; z < dz; z++) {
+    for (let y = 0; y < dy; y++) {
+      for (let x = 0; x < dx; x++) {
+        const i = x + y * dx + z * dx * dy;
+        if ((albedo[i] >>> 24) === 0) continue;
+        const word = normal[i];
+        const nx = (word & 255) / 127.5 - 1;
+        const ny = ((word >>> 8) & 255) / 127.5 - 1;
+        const nz = ((word >>> 16) & 255) / 127.5 - 1;
+        const sx = nx > 0.35 ? 1 : nx < -0.35 ? -1 : 0;
+        const sy = ny > 0.35 ? 1 : ny < -0.35 ? -1 : 0;
+        const sz = nz > 0.35 ? 1 : nz < -0.35 ? -1 : 0;
+        const twoSidedCell = (word & 0x01000000) !== 0;
+        let ambiguous = occupiedAt(x + sx, y + sy, z + sz);
+        if (!ambiguous && twoSidedCell) {
+          ambiguous = occupiedAt(x - sx, y - sy, z - sz);
+        }
+        if (ambiguous) {
+          normal[i] = (word | AMBIGUOUS_NORMAL_BIT) >>> 0;
+        }
+      }
+      yield;
+    }
+  }
+
+  return {
+    exterior: tail,
+    sealed: count - occupied - tail,
+    occupied,
+    twoSided,
+  };
+}
+
 /**
  * Voxelizes every eligible mesh in `scene` into the given grid.
  * Returns { albedo: Uint32Array, normal: Uint32Array, occupied, meshes, tris }.
@@ -168,6 +351,47 @@ export function voxelizeScene(scene, grid, opts = {}) {
 // Emissive is HDR-ish (emissiveIntensity can exceed 1); it packs into RGB8
 // at 1/EMISSIVE_SCALE and unpacks ×EMISSIVE_SCALE on the GPU.
 export const EMISSIVE_SCALE = 8;
+
+/**
+ * Resolves a mesh's flat GI colors into `colorOut`/`emissiveOut`. Emissive is
+ * returned pre-scaled by 1/EMISSIVE_SCALE (the packed-RGB8 storage scale).
+ * Shared by the CPU voxelizer and the GPU dynamic-mesh splatter so an object
+ * keeps the same voxel color while moving and after it settles.
+ *
+ * Base color: first material's color, linear. Node materials may carry their
+ * albedo on a uniform colorNode instead of .color — prefer it when present so
+ * graph-driven materials don't voxelize as white. In NodeMaterial,
+ * emissiveNode replaces (rather than modifies) emissive × emissiveIntensity.
+ */
+export function readMeshGIColors(mesh, colorOut, emissiveOut) {
+  const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+  colorOut.set(1, 1, 1);
+  if (material?.color?.isColor) colorOut.copy(material.color);
+  readConstantNodeColor(material?.colorNode, colorOut);
+
+  emissiveOut.set(0, 0, 0);
+  if (material?.emissiveNode?.isNode === true) {
+    readConstantNodeColor(material.emissiveNode, emissiveOut);
+  } else {
+    if (material?.emissive?.isColor) emissiveOut.copy(material.emissive);
+    const emissiveIntensity = Number.isFinite(material?.emissiveIntensity)
+      ? material.emissiveIntensity
+      : 1;
+    emissiveOut.multiplyScalar(emissiveIntensity);
+  }
+  emissiveOut.multiplyScalar(1 / EMISSIVE_SCALE);
+}
+
+/**
+ * Matches the normal orientation used by Three's visible material lighting:
+ * 0 = front side, 1 = double sided, -1 = back side.
+ */
+export function readMeshGISidedness(mesh) {
+  const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+  if (material?.side === THREE.DoubleSide) return 1;
+  if (material?.side === THREE.BackSide) return -1;
+  return 0;
+}
 
 const _meshBox = new THREE.Box3();
 const _regionBox = new THREE.Box3();
@@ -239,6 +463,10 @@ function* voxelizeRegionWork(scene, grid, target, region, { skip } = {}) {
   }
 
   const normalAccum = new Float32Array(regionCount * 3);
+  const normalSamples = new Uint32Array(regionCount);
+  const dominantWeight = new Float32Array(regionCount);
+  const dominantNormal = new Float32Array(regionCount * 3);
+  const normalFlags = new Uint8Array(regionCount);
   const touched = new Uint8Array(regionCount);
 
   _regionBox.min.set(min.x + x0 * voxelSize, min.y + y0 * voxelSize, min.z + z0 * voxelSize);
@@ -257,7 +485,21 @@ function* voxelizeRegionWork(scene, grid, target, region, { skip } = {}) {
   let tris = 0;
   const meshLog = [];
   for (const mesh of meshes) {
-    const result = yield* voxelizeMesh(mesh, target.albedo, target.emissive, normalAccum, touched, min, voxelSize, dims, region);
+    const result = yield* voxelizeMesh(
+      mesh,
+      target.albedo,
+      target.emissive,
+      normalAccum,
+      normalSamples,
+      dominantWeight,
+      dominantNormal,
+      normalFlags,
+      touched,
+      min,
+      voxelSize,
+      dims,
+      region,
+    );
     tris += result.tris;
     if (meshLog.length < 12) meshLog.push(`${mesh.name || mesh.uuid.slice(0, 8)}#${result.albedoHex}`);
   }
@@ -274,7 +516,18 @@ function* voxelizeRegionWork(scene, grid, target, region, { skip } = {}) {
         let ny = normalAccum[ri * 3 + 1];
         let nz = normalAccum[ri * 3 + 2];
         const len = Math.hypot(nx, ny, nz);
-        if (len > 1e-6) {
+        const samples = normalSamples[ri] || 1;
+        // Orthogonal surfaces sharing one voxel used to average into a
+        // diagonal normal, so colored corners received light from a
+        // direction no real face had. Preserve smooth/curved surfaces when
+        // their samples agree, but fall back to the largest contributing
+        // triangle when coherence drops below ~37°.
+        const coherence = len / samples;
+        if (coherence < 0.8 && dominantWeight[ri] > 0) {
+          nx = dominantNormal[ri * 3];
+          ny = dominantNormal[ri * 3 + 1];
+          nz = dominantNormal[ri * 3 + 2];
+        } else if (len > 1e-6) {
           nx /= len;
           ny /= len;
           nz /= len;
@@ -286,7 +539,8 @@ function* voxelizeRegionWork(scene, grid, target, region, { skip } = {}) {
         target.normal[voxelIndex(x + x0, y + y0, z + z0, dims)] =
           (Math.round((nx * 0.5 + 0.5) * 255) |
             (Math.round((ny * 0.5 + 0.5) * 255) << 8) |
-            (Math.round((nz * 0.5 + 0.5) * 255) << 16)) >>>
+            (Math.round((nz * 0.5 + 0.5) * 255) << 16) |
+            ((normalFlags[ri] & 1) << 24)) >>>
           0;
       }
     }
@@ -330,11 +584,42 @@ export function shiftGrid(arr, dims, shift, scratch) {
 // half-voxel sample spacing used below.
 const MAX_EDGE_STEPS = 1024;
 
-function* voxelizeMesh(mesh, albedo, emissive, normalAccum, touched, min, voxelSize, dims, region) {
-  const geometry = mesh.geometry;
+function* voxelizeMesh(
+  mesh,
+  albedo,
+  emissive,
+  normalAccum,
+  normalSamples,
+  dominantWeight,
+  dominantNormal,
+  normalFlags,
+  touched,
+  min,
+  voxelSize,
+  dims,
+  region,
+) {
+  // A virtualized mesh's live geometry contains the camera-distance-selected
+  // render cut. It starts at drawRange=0 and changes as the camera moves, so
+  // consuming it here made static objects disappear from GI until the camera
+  // happened to select their clusters. Use the camera-independent, complete
+  // root cut against the original vertex stream instead.
+  const vgRecord = getVirtualGeometryRecord(mesh);
+  const geometry = vgRecord?.original ?? mesh.geometry;
   const pos = geometry.getAttribute("position");
   const index = geometry.index;
-  const triCount = (index ? index.count : pos.count) / 3;
+  const indexOverride = vgRecord?.dag
+    ? getCoarsestClusterIndices(vgRecord.dag)
+    : null;
+  const sourceCount = indexOverride?.length ?? (index ? index.count : pos.count);
+  const drawStart = indexOverride
+    ? 0
+    : Math.max(0, Math.min(sourceCount, geometry.drawRange?.start || 0));
+  const requestedCount = indexOverride ? sourceCount : geometry.drawRange?.count;
+  const drawCount = Number.isFinite(requestedCount)
+    ? Math.max(0, Math.min(sourceCount - drawStart, requestedCount))
+    : sourceCount - drawStart;
+  const triCount = Math.floor(drawCount / 3);
   mesh.updateWorldMatrix(true, false);
   // Snapshot transforms for async rebuild consistency. Indexed meshes reuse
   // vertices heavily, so transform every unique position once instead of
@@ -355,37 +640,16 @@ function* voxelizeMesh(mesh, albedo, emissive, normalAccum, touched, min, voxelS
   const rx = x1 - x0;
   const rxy = rx * (y1 - y0);
 
-  // Base color: first material's color, linear. Node materials may carry
-  // their albedo on a uniform colorNode instead of .color — prefer it when
-  // present so graph-driven materials don't voxelize as white.
-  const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
-  _color.set(1, 1, 1);
-  if (material?.color?.isColor) _color.copy(material.color);
-  readConstantNodeColor(material?.colorNode, _color);
+  readMeshGIColors(mesh, _color, _emissive);
+  const sidedness = readMeshGISidedness(mesh);
+  const doubleSided = sidedness > 0;
+  const flipNormal = sidedness < 0;
   const packedAlbedo =
     (Math.round(Math.min(1, _color.r) * 255) |
       (Math.round(Math.min(1, _color.g) * 255) << 8) |
       (Math.round(Math.min(1, _color.b) * 255) << 16) |
       (255 << 24)) >>>
     0;
-
-  // Emissive: `emissive × emissiveIntensity` (or a uniform emissiveNode),
-  // packed at 1/EMISSIVE_SCALE so intensities up to EMISSIVE_SCALE survive.
-  _emissive.set(0, 0, 0);
-  // In NodeMaterial, emissiveNode replaces (rather than modifies)
-  // material.emissive * emissiveIntensity. Graph-authored emission is usually
-  // a constant expression such as color * strength, which the helper above
-  // resolves. Plain Three materials take the scalar-property path.
-  const hasEmissiveNode = material?.emissiveNode?.isNode === true;
-  if (hasEmissiveNode) readConstantNodeColor(material.emissiveNode, _emissive);
-  else {
-    if (material?.emissive?.isColor) _emissive.copy(material.emissive);
-    const emissiveIntensity = Number.isFinite(material?.emissiveIntensity)
-      ? material.emissiveIntensity
-      : 1;
-    _emissive.multiplyScalar(emissiveIntensity);
-  }
-  _emissive.multiplyScalar(1 / EMISSIVE_SCALE);
   const packedEmissive =
     (Math.round(Math.max(0, Math.min(1, _emissive.r)) * 255) |
       (Math.round(Math.max(0, Math.min(1, _emissive.g)) * 255) << 8) |
@@ -393,7 +657,12 @@ function* voxelizeMesh(mesh, albedo, emissive, normalAccum, touched, min, voxelS
     0;
 
   const readVertex = (tri, corner, out) => {
-    const i = index ? index.getX(tri * 3 + corner) : tri * 3 + corner;
+    const drawIndex = drawStart + tri * 3 + corner;
+    const i = indexOverride
+      ? indexOverride[drawIndex]
+      : index
+        ? index.getX(drawIndex)
+        : drawIndex;
     if (worldPositions) out.fromArray(worldPositions, i * 3);
     else out.fromBufferAttribute(pos, i).applyMatrix4(matrix);
   };
@@ -409,14 +678,22 @@ function* voxelizeMesh(mesh, albedo, emissive, normalAccum, touched, min, voxelS
   const wz1 = min.z + z1 * voxelSize + pad;
 
   // Lattice-samples one (sub)triangle with the ORIGINAL face normal in _n.
-  const sampleTri = (a, b, c) => {
+  // This is a generator because a single world-sized floor/wall triangle can
+  // contain hundreds of thousands of lattice samples. Yielding only between
+  // triangles made the nominally async voxelizer block one editor frame for
+  // 100–200 ms while an object was being dragged.
+  const sampleTri = function* (a, b, c, faceWeight) {
     _e01.subVectors(b, a);
     _e02.subVectors(c, a);
     const maxEdge = Math.max(_e01.length(), _e02.length(), c.distanceTo(b));
     const steps = Math.min(MAX_EDGE_STEPS, Math.max(1, Math.ceil((maxEdge / voxelSize) * 2)));
     const inv = 1 / steps;
+    let samples = 0;
     for (let i = 0; i <= steps; i++) {
       for (let j = 0; j <= steps - i; j++) {
+        // Keep each synchronous generator slice small even for one huge
+        // triangle. The outer scheduler still enforces its wall-clock budget.
+        if (++samples % 1024 === 0) yield;
         _p.copy(a)
           .addScaledVector(_e01, i * inv)
           .addScaledVector(_e02, j * inv);
@@ -432,6 +709,14 @@ function* voxelizeMesh(mesh, albedo, emissive, normalAccum, touched, min, voxelS
         normalAccum[ri * 3] += _n.x;
         normalAccum[ri * 3 + 1] += _n.y;
         normalAccum[ri * 3 + 2] += _n.z;
+        normalSamples[ri]++;
+        if (doubleSided) normalFlags[ri] = 1;
+        if (faceWeight > dominantWeight[ri]) {
+          dominantWeight[ri] = faceWeight;
+          dominantNormal[ri * 3] = _n.x;
+          dominantNormal[ri * 3 + 1] = _n.y;
+          dominantNormal[ri * 3 + 2] = _n.z;
+        }
       }
     }
   };
@@ -451,6 +736,7 @@ function* voxelizeMesh(mesh, albedo, emissive, normalAccum, touched, min, voxelS
     const area2 = _n.length();
     if (area2 < 1e-12) continue;
     _n.divideScalar(area2);
+    if (flipNormal) _n.negate();
 
     // Triangle AABB vs region: reject outsiders outright; clip triangles
     // that straddle the region so sampling cost tracks the REGION size, not
@@ -466,11 +752,13 @@ function* voxelizeMesh(mesh, albedo, emissive, normalAccum, touched, min, voxelS
       continue;
     }
     if (tminx >= wx0 && tmaxx <= wx1 && tminy >= wy0 && tmaxy <= wy1 && tminz >= wz0 && tmaxz <= wz1) {
-      sampleTri(_v0, _v1, _v2);
+      yield* sampleTri(_v0, _v1, _v2, area2);
       continue;
     }
     const poly = clipPolyToBox([_v0, _v1, _v2], wx0, wy0, wz0, wx1, wy1, wz1);
-    for (let k = 2; k < poly.length; k++) sampleTri(poly[0], poly[k - 1], poly[k]);
+    for (let k = 2; k < poly.length; k++) {
+      yield* sampleTri(poly[0], poly[k - 1], poly[k], area2);
+    }
   }
   return { tris: triCount, albedoHex: _color.getHexString() };
 }

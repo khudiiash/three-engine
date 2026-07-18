@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { Play, Square, Move, Rotate3d, Scale3d, Layers as LayersIcon } from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Play, Square, Move, Rotate3d, Scale3d, Layers as LayersIcon, Crosshair } from "lucide-react";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
@@ -8,13 +8,28 @@ import { EDITOR_LAYER } from "../../engine/editorLayers.js";
 import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
+import {
+  attachCursor,
+  refreshCursor3D,
+  setCursor3DPosition,
+  setCursor3DVisible,
+} from "../threeDCursor.js";
+import {
+  snapCursorToSelection,
+  snapCursorToWorldOrigin,
+  snapCursorToGridFloor,
+  snapSelectionToCursor,
+  snapSelectionToOrigin,
+} from "../threeDCursorOps.js";
+import { CursorHUD } from "../helpers/CursorHUD.jsx";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetTransformCommand } from "../commands/transformCommands.js";
-import { BatchCommand } from "../commands/entityCommands.js";
+import { BatchCommand, topMostIds } from "../commands/entityCommands.js";
 import { getUiSystem } from "../../engine/ui/UiSystem.js";
 import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
 import { extOf, MODEL_EXTENSIONS, TEXTURE_EXTENSIONS, SCRIPT_EXTENSIONS, MATERIAL_EXTENSIONS, PREFAB_EXTENSIONS } from "../assetLoader.js";
-import { basename } from "../store/projectStore.js";
+import { basename, useProjectStore } from "../store/projectStore.js";
+import { getEditorCameraStorageKey, loadEditorCamera, saveEditorCamera } from "../cameraPrefs.js";
 import { usePlayStore } from "../store/playStore.js";
 import { toggle as togglePlay } from "../playMode.js";
 import { useAssetDrop } from "../assetDrag.js";
@@ -51,6 +66,7 @@ function putOnEditorLayer(obj) {
 // here and to `viewport.layers` defaults above together.
 const LAYER_TOGGLES = [
   { key: "gizmos", label: "Gizmos" },
+  { key: "cursor3D", label: "3D Cursor" },
   { key: "colliders", label: "Colliders" },
   { key: "grid", label: "Grid" },
   { key: "stats", label: "Stats" },
@@ -74,6 +90,8 @@ const viewport = {
   cameraHelper: null,
   lightHelper: null,
   cameraPreview: null,
+  cameraPrefsKey: null,
+  cameraPrefsSaveTimer: null,
   helpers: null,
   grid: null,
   backend: null,
@@ -82,12 +100,31 @@ const viewport = {
   gameCameraId: null,
   terrainBrushing: false,
   terrainBrushIndicator: null,
+  // Multi-select pivot. A world-aligned Group the transform gizmo attaches
+  // to when more than one entity is selected. While dragging we fan out
+  // the pivot's world delta to every selected entity; once the drag ends
+  // the per-entity transform commands are emitted as a batched undoable.
+  pivot: null,
+  pivotDrag: null, // { origins: [{id, worldPos, worldQuat, worldScale, object3D}], start: {pos,quat,scale} } | null
   // Toggles from the Layers dropdown. Mirrored in React state; mutations
   // here apply live so a hot-reload of the panel keeps the current layer
   // set. Default to "all on" so the viewport starts in its full visual state.
-  layers: { gizmos: true, colliders: true, grid: true, stats: true, virtualGeometry: false },
+  layers: { gizmos: true, cursor3D: true, colliders: true, grid: true, stats: true, virtualGeometry: false },
   layersListeners: new Set(),
 };
+
+// Depth-first walk over engine.rootEntities returning a flat list of
+// entity ids. Mirrors HierarchyPanel's `flattenTree` but iterates the
+// live engine tree instead of the React mirror — that's the source of
+// truth for what's actually present in the 3D scene and matches what
+// the picker raycaster can hit.
+function flattenEngineTree() {
+  const out = [];
+  for (const root of engine.rootEntities) {
+    root.traverse((entity) => out.push(entity.id));
+  }
+  return out;
+}
 
 // Notify any viewport subscriber (the toolbar dropdown) about layer changes.
 // Hot-reload safe — added on demand, cleared on dispose.
@@ -134,6 +171,23 @@ async function ensureViewport() {
       // Grid size/visibility follow project settings live.
       onProjectSettingsApplied((settings) => rebuildGrid(settings.editor));
 
+      // 3D cursor — the Blender-style spawn/transform anchor. Lives on the
+      // helpers group so it shares the EDITOR_LAYER placement and follows
+      // every editor-only visibility rule for free.
+      attachCursor(helpers);
+
+      // World-aligned pivot used by the transform gizmo for multi-selection.
+      // Lives in engine.scene so its world matrix is the identity parent;
+      // attachSelection positions it at the selection centroid. The Group
+      // itself is editor-only (camera helpers, grid, etc. all use the same
+      // flag) so click-through picking and play-mode visibility stay correct.
+      const pivot = new THREE.Group();
+      pivot.name = "MultiSelectPivot";
+      pivot.userData.editorOnly = true;
+      pivot.visible = false; // hidden — only the gizmo arrows are visible
+      engine.scene.add(pivot);
+      viewport.pivot = pivot;
+
       viewport.orbit = new OrbitControls(viewport.camera, canvas);
       viewport.orbit.enableDamping = true;
       viewport.orbit.dampingFactor = 0.12;
@@ -141,14 +195,24 @@ async function ensureViewport() {
         viewport.orbitStartQuaternion = viewport.camera?.quaternion.clone() ?? null;
       });
       viewport.orbit.addEventListener("change", () => {
-        if (!viewport.camera?.isOrthographicCamera || viewport.axisAnimation || !viewport.orbitStartQuaternion) return;
+        if (!viewport.camera?.isOrthographicCamera || viewport.axisAnimation || !viewport.orbitStartQuaternion) {
+          if (!engine.playing) scheduleEditorCameraPrefsSave();
+          return;
+        }
         // Pan and zoom keep an orthographic axis view. The first real rotation
         // delta returns to perspective, matching Blender's viewport behavior.
         if (Math.abs(viewport.camera.quaternion.dot(viewport.orbitStartQuaternion)) < 0.999999) {
           viewport.orbitStartQuaternion = null;
           usePerspectiveView();
         }
+        if (!engine.playing) scheduleEditorCameraPrefsSave();
       });
+      const sceneState = useSceneStore.getState();
+      updateEditorCameraPrefsKey(
+        useProjectStore.getState().rootPath,
+        sceneState.scenePath,
+        sceneState.sceneName,
+      );
 
       setupGizmo(canvas);
       setupPicking(canvas);
@@ -180,19 +244,57 @@ async function ensureViewport() {
         // the subtree and re-expand it. `attachSelection` only re-runs on a
         // *selection* change, so the gizmo would still be holding the destroyed
         // object ("TransformControls: The attached 3D object must be a part of
-        // the scene graph"). Re-attach when the object under the selection has
-        // been swapped out.
-        const selectedId = useSelectionStore.getState().ids[0] ?? null;
-        const selected = selectedId ? engine.getEntity(selectedId) : null;
-        if (selected && viewport.gizmo.object && viewport.gizmo.object !== selected.object3D) {
-          attachSelection(selectedId);
+        // the scene graph"). Re-attach when the object under the selection
+        // has been swapped out — for multi-select this also covers any
+        // selected entity's object3D being rebuilt under the pivot.
+        const ids = useSelectionStore.getState().ids;
+        if (!ids.length || !viewport.gizmo?.object) return;
+        if (viewport.gizmo.object === viewport.pivot) {
+          // Multi-select: any selected entity whose object3D no longer
+          // matches the captured origin forces a full re-attach so the
+          // pivot repositions at the new centroid and the box3 helper
+          // recomputes over the live tree.
+          const drag = viewport.pivotDrag;
+          if (drag) {
+            for (const origin of drag.origins) {
+              const entity = engine.getEntity(origin.id);
+              if (!entity || entity.object3D !== origin.object3D) {
+                attachSelection(ids);
+                return;
+              }
+            }
+          } else {
+            // No active drag — re-run attachSelection so the pivot
+            // centroid and Box3 helper stay in sync with the live tree.
+            attachSelection(ids);
+          }
+        } else {
+          // Single-select: same check as before, against ids[0].
+          const selectedId = ids[0];
+          const selected = selectedId ? engine.getEntity(selectedId) : null;
+          if (selected && viewport.gizmo.object !== selected.object3D) {
+            attachSelection(ids);
+          }
         }
       });
 
       engine.onUpdate(() => {
         viewport.orbit.update();
         updateAxisViewAnimation();
-        viewport.selectionBox?.update();
+        // 3D cursor: keep the proxy parented (in case helpers were
+        // rebuilt) and at its current world position. Cheap — just
+        // touches the cursor Group's matrix.
+        refreshCursor3D();
+        // `viewport.selectionBox` is a BoxHelper in single-select mode
+        // (which has an `update()` that recomputes its geometry from the
+        // attached object3D) or a Box3Helper in multi-select mode (which
+        // has no `update()` and instead reads from its `box` property on
+        // every `updateMatrixWorld`). The type-discriminated call keeps
+        // the per-frame refresh working for both.
+        if (viewport.selectionBox) {
+          if (viewport.selectionBox.type === "BoxHelper") viewport.selectionBox.update();
+          else if (viewport.selectionBox.type === "Box3Helper") viewport.selectionBox.updateMatrixWorld(true);
+        }
         viewport.cameraHelper?.update();
         // The light helper samples the live THREE.Light on every update(), so
         // calling it each frame keeps the cone / arrow aligned with the
@@ -268,6 +370,13 @@ function setupGizmo(canvas) {
   let beforeTransform = null;
   gizmo.addEventListener("dragging-changed", (e) => {
     viewport.orbit.enabled = !e.value;
+    if (gizmo.object === viewport.pivot) {
+      // Multi-select drag: capture or commit per the world pivot state.
+      if (e.value) beginPivotDrag();
+      else commitPivotDrag();
+      return;
+    }
+    // Single-entity drag: the existing one-shot SetTransformCommand.
     const entityId = gizmo.object?.userData.entityId;
     if (!entityId) return;
     if (e.value) {
@@ -279,8 +388,18 @@ function setupGizmo(canvas) {
     }
   });
   gizmo.addEventListener("objectChange", () => {
+    if (gizmo.object === viewport.pivot) {
+      // Multi-select: fan out the pivot's world delta to every selected
+      // entity and refresh the inspector numbers.
+      if (viewport.pivotDrag) applyPivotDrag();
+      engine.emit("transform-changed");
+      return;
+    }
     const entityId = gizmo.object?.userData.entityId;
-    if (entityId) useSceneStore.getState().updateTransform(entityId);
+    if (entityId) {
+      useSceneStore.getState().updateTransform(entityId);
+      engine.emit("transform-changed", { entityId });
+    }
   });
 
   // Hold Ctrl to snap: 0.5 units / 15° / 0.1 scale.
@@ -291,8 +410,8 @@ function setupGizmo(canvas) {
     if (e.key === "Control") setSnap(false);
   });
 
-  useSelectionStore.subscribe((state) => attachSelection(state.ids[0] ?? null));
-  engine.on("play-changed", () => attachSelection(useSelectionStore.getState().ids[0] ?? null));
+  useSelectionStore.subscribe((state) => attachSelection(state.ids));
+  engine.on("play-changed", () => attachSelection(useSelectionStore.getState().ids));
   // Rebuild the light helper when the selected light's `kind` changes —
   // the component replaces its underlying THREE.Light instance on kind
   // change (onPropChanged detaches+reattaches), so any helper bound to
@@ -333,6 +452,12 @@ function setupPlayCamera() {
     // — it AND-combines the user's Gizmo toggle with the editor-vs-play
     // rule so flipping the dropdown takes effect both in and out of play.
     applyLayerVisibility();
+    // The 3D cursor's primary proxy lives under viewport.helpers so it's
+    // already hidden when helpers go invisible — but its local proxy in
+    // the geometry editor's detached scene does *not*. Force a refresh
+    // so that one hides (or unhides) on the same frame as the play flip
+    // instead of waiting for the next engine.onUpdate tick.
+    refreshCursor3D();
 
     if (playing) {
       const camEntity = findSceneCamera();
@@ -379,6 +504,58 @@ function resizeActiveCamera() {
   }
   engine.camera.updateProjectionMatrix();
 }
+
+function getEditorCameraPose() {
+  if (!viewport.camera || !viewport.orbit) return null;
+  return {
+    position: viewport.camera.position.toArray(),
+    direction: new THREE.Vector3(0, 0, -1).applyQuaternion(viewport.camera.quaternion).toArray(),
+    quaternion: viewport.camera.quaternion.toArray(),
+    target: viewport.orbit.target.toArray(),
+    up: viewport.camera.up.toArray(),
+    zoom: viewport.camera.zoom,
+  };
+}
+
+function saveEditorCameraPrefs(key = viewport.cameraPrefsKey) {
+  const pose = getEditorCameraPose();
+  if (!key || !pose) return;
+  saveEditorCamera(key, pose);
+}
+
+function scheduleEditorCameraPrefsSave() {
+  if (!viewport.cameraPrefsKey) return;
+  clearTimeout(viewport.cameraPrefsSaveTimer);
+  viewport.cameraPrefsSaveTimer = setTimeout(() => {
+    viewport.cameraPrefsSaveTimer = null;
+    saveEditorCameraPrefs();
+  }, 250);
+}
+
+function restoreEditorCameraPrefs(key) {
+  const saved = loadEditorCamera(key);
+  if (!saved || !viewport.camera || !viewport.orbit) return;
+  viewport.camera.position.fromArray(saved.position);
+  viewport.camera.quaternion.fromArray(saved.quaternion);
+  viewport.camera.up.fromArray(saved.up);
+  viewport.camera.zoom = saved.zoom;
+  viewport.camera.updateProjectionMatrix();
+  viewport.orbit.target.fromArray(saved.target);
+  syncOrbitCamera(viewport.camera);
+  viewport.orbit.update();
+  viewport.camera.updateMatrixWorld(true);
+}
+
+function updateEditorCameraPrefsKey(rootPath, scenePath, sceneName) {
+  const nextKey = getEditorCameraStorageKey(rootPath, scenePath || sceneName);
+  if (nextKey === viewport.cameraPrefsKey) return;
+  clearTimeout(viewport.cameraPrefsSaveTimer);
+  viewport.cameraPrefsSaveTimer = null;
+  if (viewport.cameraPrefsKey) saveEditorCameraPrefs(viewport.cameraPrefsKey);
+  viewport.cameraPrefsKey = nextKey;
+  restoreEditorCameraPrefs(nextKey);
+}
+
 
 const axisViewListeners = new Set();
 
@@ -668,7 +845,7 @@ class CameraPreview {
     const prevAutoClearDepth = this.renderer.autoClearDepth;
 
     const hidden = hideEditorOnly(engine.scene);
-    const prevEnabled = cam.layers.test(EDITOR_LAYER);
+    const prevEnabled = cam.layers.isEnabled(EDITOR_LAYER);
     cam.layers.disable(EDITOR_LAYER);
     try {
       this.renderer.setViewport(x, y, w, h);
@@ -760,6 +937,10 @@ function rebuildGrid(editorSettings) {
     0x4a5060,
     0x2c3038,
   );
+  // Layers are not inherited. A grid rebuilt after initial viewport setup
+  // must be moved explicitly or it remains on layer 0 and leaks into GI/depth
+  // prepasses even though its parent helper group is editor-only.
+  putOnEditorLayer(viewport.grid);
   helpers.add(viewport.grid);
   // New meshes inherit the layer-toggle visibility — the dropdown can hide
   // a freshly-rebuilt grid without another rebuild pass.
@@ -791,13 +972,23 @@ function setCollidersVisible(visible) {
  * controlled directly; colliders are per-component so we walk.
  */
 function applyLayerVisibility() {
-  const { gizmos, colliders, grid, virtualGeometry } = viewport.layers;
+  const { gizmos, cursor3D, colliders, grid, virtualGeometry } = viewport.layers;
   const gizmoHelper = viewport.gizmo?.getHelper();
-  if (gizmoHelper) gizmoHelper.visible = gizmos && !engine.playing;
+  // `viewport.gizmo.object` is null when nothing is attached (no selection,
+  // UI-only entity, or a directional light which uses the dedicated sun-dial
+  // helper instead). Hide the standard transform helper in those cases so a
+  // detached gizmo doesn't keep showing stale arrows on screen.
+  const gizmoAttached = !!viewport.gizmo?.object;
+  if (gizmoHelper) gizmoHelper.visible = gizmos && !engine.playing && gizmoAttached;
   if (viewport.selectionBox) viewport.selectionBox.visible = gizmos && !engine.playing;
   if (viewport.grid) viewport.grid.visible = grid;
   setCollidersVisible(colliders);
   setVirtualGeometryDebugVisible(virtualGeometry && !engine.playing);
+  // 3D cursor visibility also depends on the user's layer toggle. The
+  // module's own `visible` flag stays the source of truth for the snap
+  // menu helpers (which want to read "is the cursor visible right
+  // now?"); this just toggles the proxy.
+  setCursor3DVisible(cursor3D);
 }
 
 // Hydrate `viewport.layers` from project settings (settings.editor.layers)
@@ -877,38 +1068,115 @@ function isUiEntity(entity) {
   return !!(entity?.getComponent?.("uielement") || entity?.getComponent?.("uiscreen"));
 }
 
-function attachSelection(entityId) {
-  const entity = entityId ? engine.getEntity(entityId) : null;
-    if (viewport.selectionBox) {
-      engine.scene.remove(viewport.selectionBox);
-      viewport.selectionBox.dispose();
-      viewport.selectionBox = null;
-    }
-    detachCameraHelper();
-    detachLightHelper();
+// Shared helpers reused by both the single- and multi-entity attach paths.
+// resolveEntities filters the selection down to live, non-UI entities so the
+// gizmo, selection box and helpers all see the same "what counts" predicate.
+function resolveEntities(ids) {
+  return ids.map((id) => engine.getEntity(id)).filter(Boolean);
+}
+
+// Average world position of the given entities. Used to position the multi-
+// select pivot at the visual centroid of the selection so the gizmo arrows
+// land at a sensible point.
+function computeSelectionCentroid(entities) {
+  if (!entities.length) return new THREE.Vector3();
+  const centroid = new THREE.Vector3();
+  for (const entity of entities) entity.object3D.getWorldPosition(centroid.add(new THREE.Vector3()));
+  return centroid.divideScalar(entities.length);
+}
+
+// World-aligned union Box3 over the given entities. Returns an empty box
+// when no entity has any geometry (the caller's fallback handles that).
+function computeSelectionBounds(entities) {
+  const bounds = new THREE.Box3();
+  for (const entity of entities) bounds.expandByObject(entity.object3D);
+  return bounds;
+}
+
+// Camera/light entities are skipped when building the multi-selection box
+// — same reason the single-entity path skips them: their subtrees are the
+// editor model mesh and a frustum helper, which bracket a useless silhouette.
+function isBoxableEntity(entity) {
+  const lightComponent = entity.getComponent?.("light");
+  const cameraComponent = entity.getComponent?.("camera");
+  return !cameraComponent?.camera && !lightComponent?.light;
+}
+
+function attachSelection(ids) {
+  // Normalize: drop anything that's no longer in the engine and de-duplicate
+  // so a stale double-click in the picker doesn't create twin entries.
+  const unique = [...new Set(ids ?? [])];
+  const entities = resolveEntities(unique);
+  const entity = entities[0] ?? null;
+
+  if (viewport.selectionBox) {
+    engine.scene.remove(viewport.selectionBox);
+    viewport.selectionBox.dispose();
+    viewport.selectionBox = null;
+  }
+  detachCameraHelper();
+  detachLightHelper();
+
   // UI entities get a 2D rect outline (drawn by the UiSystem overlay pass)
-  // instead of the 3D gizmo + bounding box.
+  // instead of the 3D gizmo + bounding box. setHighlight accepts a single
+  // entity id, so for multi-UI selections we only highlight the first —
+  // users can cycle through by Shift-clicking the hierarchy.
   const uiSystem = getUiSystem(engine, { create: false });
-  uiSystem?.setHighlight(entity && !engine.playing && isUiEntity(entity) ? entity.id : null);
-  if (!entity || engine.playing || isUiEntity(entity)) {
+  if (uiSystem && !engine.playing && entities.length && entities.some(isUiEntity)) {
+    uiSystem.setHighlight(entities.find(isUiEntity).id);
+  } else {
+    uiSystem?.setHighlight(null);
+  }
+
+  // Reset any leftover pivot drag state so a stale capture doesn't try to
+  // write to entities that are no longer selected.
+  viewport.pivotDrag = null;
+
+  // The 3D transform gizmo doesn't make sense for entities whose layout is
+  // UI-driven (uielement / uiscreen). Detach whenever ANY selected entity
+  // is a UI entity — matching the single-entity rule (where a UI entity
+  // alone hides the gizmo) and extending it to mixed selections.
+  const skipGizmo = engine.playing || !entities.length || entities.some(isUiEntity);
+  if (skipGizmo) {
     viewport.gizmo.detach();
     viewport.cameraPreview?.setCamera(null);
+    applyLayerVisibility();
     return;
   }
-  // Make sure the entity's matrixWorld is current before we attach. Without
-  // this, the very first frame after selection would show the gizmo arrows
-  // at the entity's OLD world position (wherever it was on the previous
-  // render), and any pointermove fired before the next render would raycast
-  // against that stale position — making the gizmo look broken for one
-  // frame after every selection change.
-  entity.object3D.updateMatrixWorld(true);
-  viewport.gizmo.attach(entity.object3D);
-  // Pull the gizmo helper's matrix world up to date immediately so its
-  // picker meshes are at the entity's position right away, instead of
-  // one frame later.
-  viewport.gizmo.getHelper().updateMatrixWorld(true);
-  const cameraComponent = entity.getComponent?.("camera");
+
+  if (entities.length === 1) {
+    attachSingleSelection(entity);
+  } else {
+    attachMultiSelection(entities);
+  }
+  applyLayerVisibility();
+}
+
+// Single-entity gizmo + helpers path. Unchanged from the original behavior
+// — extracted verbatim so attachSelection stays readable.
+function attachSingleSelection(entity) {
   const lightComponent = entity.getComponent?.("light");
+  const cameraComponent = entity.getComponent?.("camera");
+  // Directional lights are infinite sources — they have no meaningful
+  // position/scale, only a rotation. The dedicated DirectionalLightGizmo
+  // (compact sun-dial helper) already visualises the emitted direction, so
+  // the standard transform gizmo would just duplicate that visual without
+  // adding any useful handle. Skip attaching it entirely and detach any
+  // previous gizmo so the helper isn't left dangling on a stale object.
+  const isDirectionalLight = lightComponent?.props?.kind === "directional";
+  if (isDirectionalLight) {
+    viewport.gizmo.detach();
+  } else {
+    // Make sure the entity's matrixWorld is current before we attach.
+    // Without this, the very first frame after selection would show the
+    // gizmo arrows at the entity's OLD world position (wherever it was on
+    // the previous render), and any pointermove fired before the next
+    // render would raycast against that stale position — making the gizmo
+    // look broken for one frame after every selection change.
+    entity.object3D.updateMatrixWorld(true);
+    viewport.gizmo.attach(entity.object3D);
+    viewport.gizmo.getHelper().updateMatrixWorld(true);
+  }
   // Cameras skip the bounding-box outline: the entity itself is a single
   // Object3D whose only children are the PerspectiveCamera and the
   // editor-only model mesh, so a Box3 over the subtree just brackets the
@@ -942,10 +1210,251 @@ function attachSelection(entityId) {
   if (lightComponent?.light) {
     attachLightHelper(lightComponent);
   }
-  // Newly-attached gizmo + selectionBox must honor the Gizmos toggle
-  // (and stop hiding in Play). Re-applying the layer state overrides
-  // any default `visible: true` from above with the user's choice.
-  applyLayerVisibility();
+}
+
+// Multi-entity attach: drive TransformControls from a temporary pivot Group
+// positioned at the selection centroid. The actual transform application
+// happens lazily during the drag (see applyPivotDelta / commitPivotDrag).
+function attachMultiSelection(entities) {
+  // Filter out non-boxable entities (cameras/lights) for the union bounds
+  // visualization — they would only bracket the editor preview mesh. They
+  // still receive the gizmo transform; only the outline is suppressed.
+  const boxable = entities.filter(isBoxableEntity);
+
+  // Camera helpers / PIP are single-entity affordances — hide them when
+  // the selection spans more than one entity so the screen doesn't pile up
+  // overlapping frustums.
+  viewport.cameraPreview?.setCamera(null);
+
+  // Position the pivot at the visual centroid and reset its transform to
+  // identity rotation / unit scale. The drag-time world delta is computed
+  // against this start pose, so a fresh attach mid-drag would otherwise
+  // inherit stale pivot state.
+  const pivot = viewport.pivot;
+  pivot.position.copy(computeSelectionCentroid(entities));
+  pivot.quaternion.identity();
+  pivot.scale.set(1, 1, 1);
+  pivot.updateMatrixWorld(true);
+
+  viewport.gizmo.attach(pivot);
+  viewport.gizmo.getHelper().updateMatrixWorld(true);
+
+  if (boxable.length) {
+    const bounds = computeSelectionBounds(boxable);
+    if (!bounds.isEmpty()) {
+      viewport.selectionBox = new THREE.Box3Helper(bounds, 0x4da3ff);
+      viewport.selectionBox.userData.editorOnly = true;
+      // Tag with the first entity id so a click on the outline (which is
+      // editor-only and short-circuits findEntityId by default) still
+      // resolves to a real selection.
+      viewport.selectionBox.userData.entityId = boxable[0].id;
+      putOnEditorLayer(viewport.selectionBox);
+      engine.scene.add(viewport.selectionBox);
+    }
+  }
+}
+
+// ---- Multi-select pivot drag ----------------------------------------------
+//
+// Capture the per-entity world transform at drag start. We snapshot world
+// space (not local) because the gizmo itself operates in world space and
+// three.js doesn't preserve object-local deltas for non-identity parent
+// transforms. The `parentWorldInverse` matrix is cached so we can convert
+// each new world pose back into local space when writing to object3D.
+function snapshotPivotOrigins(ids) {
+  const origins = [];
+  for (const id of ids) {
+    const entity = engine.getEntity(id);
+    if (!entity) continue;
+    entity.object3D.updateMatrixWorld(true);
+    // The three.js parent of entity.object3D is what we use for the
+    // world→local conversion in applyPivotDrag. Root entities live under
+    // engine.scene directly (set by Entity.setParent), so this is always
+    // a valid Object3D — never null. Storing entity.parent (the Entity
+    // parent, which IS null for roots) would break the world→local math.
+    const parentObj = entity.object3D.parent;
+    origins.push({
+      id,
+      object3D: entity.object3D,
+      // World-space baseline for the per-frame fan-out math.
+      worldPos: entity.object3D.getWorldPosition(new THREE.Vector3()),
+      worldQuat: entity.object3D.getWorldQuaternion(new THREE.Quaternion()),
+      worldScale: entity.object3D.getWorldScale(new THREE.Vector3()),
+      parent: parentObj,
+      // Local-space baseline for the undo command — the fan-out math
+      // mutates object3D in place, so we have to remember what the local
+      // transform was at drag start to emit a correct SetTransformCommand.
+      local: {
+        position: [entity.object3D.position.x, entity.object3D.position.y, entity.object3D.position.z],
+        rotation: [entity.object3D.rotation.x, entity.object3D.rotation.y, entity.object3D.rotation.z],
+        scale: [entity.object3D.scale.x, entity.object3D.scale.y, entity.object3D.scale.z],
+      },
+    });
+  }
+  return origins;
+}
+
+function beginPivotDrag() {
+  const ids = useSelectionStore.getState().ids;
+  const pivot = viewport.pivot;
+  // Reset pivot pose to identity (rotation 0, scale 1) at the centroid so
+  // the deltas captured during the drag are clean. attachMultiSelection
+  // already positioned pivot.position at the centroid on attach.
+  pivot.updateMatrixWorld(true);
+  viewport.pivotDrag = {
+    origins: snapshotPivotOrigins(ids),
+    // Pivot pose at drag start — kept constant for the whole drag so the
+    // cumulative delta (current - start) can be applied to each origin's
+    // snapshot pose every frame. Mutating this mid-drag would yield
+    // incremental deltas, which would not be cumulative across frames.
+    start: {
+      position: pivot.position.clone(),
+      quaternion: pivot.quaternion.clone(),
+      scale: pivot.scale.clone(),
+    },
+  };
+}
+
+// Reused per-frame scratch values for the fan-out math. Allocating them
+// here keeps the drag loop allocation-free.
+const _pivotPosDelta = new THREE.Vector3();
+const _pivotQuatDelta = new THREE.Quaternion();
+const _pivotScaleDelta = new THREE.Vector3();
+const _pivotInvStartQuat = new THREE.Quaternion();
+const _pivotStartOffset = new THREE.Vector3();
+const _pivotLocalOffset = new THREE.Vector3();
+const _pivotNewWorldPos = new THREE.Vector3();
+const _pivotNewWorldQuat = new THREE.Quaternion();
+const _pivotNewWorldScale = new THREE.Vector3();
+const _pivotParentWorldInverse = new THREE.Matrix4();
+const _pivotLocalMatrix = new THREE.Matrix4();
+const _pivotDecomposed = { position: new THREE.Vector3(), quaternion: new THREE.Quaternion(), scale: new THREE.Vector3() };
+
+function applyPivotDrag() {
+  const drag = viewport.pivotDrag;
+  if (!drag) return;
+  const pivot = viewport.pivot;
+
+  // Cumulative world-space delta of the pivot since the drag started. The
+  // gizmo gives us absolute pivot state on every objectChange; we derive
+  // the cumulative delta against `drag.start` (which is held constant
+  // throughout the drag) and apply it to each origin's snapshot pose.
+  // Mutating drag.start mid-drag would shrink the per-frame delta to
+  // just-the-last-frame's motion, snapping entities back to where they
+  // were after the first frame.
+  _pivotPosDelta.subVectors(pivot.position, drag.start.position);
+  _pivotInvStartQuat.copy(drag.start.quaternion).invert();
+  _pivotQuatDelta.copy(pivot.quaternion).multiply(_pivotInvStartQuat);
+  _pivotScaleDelta.set(
+    drag.start.scale.x !== 0 ? pivot.scale.x / drag.start.scale.x : 1,
+    drag.start.scale.y !== 0 ? pivot.scale.y / drag.start.scale.y : 1,
+    drag.start.scale.z !== 0 ? pivot.scale.z / drag.start.scale.z : 1,
+  );
+
+  for (const origin of drag.origins) {
+    // Decide the world→local branch on origin.parent (the three.js parent
+    // captured at drag start), not origin.object3D.parent. For root
+    // entities origin.parent is engine.scene (identity world matrix), so
+    // world pose == local pose and we can skip the matrix decompose.
+    const parent = origin.parent;
+    const isRoot = parent === engine.scene || !parent;
+    if (isRoot) {
+      // Root entity (or stale parent ref) — world space == local space,
+      // write straight to the Object3D.
+      origin.object3D.position.copy(origin.worldPos).add(_pivotPosDelta);
+      _pivotNewWorldQuat.copy(_pivotQuatDelta).multiply(origin.worldQuat);
+      origin.object3D.quaternion.copy(_pivotNewWorldQuat);
+      origin.object3D.scale.set(
+        origin.worldScale.x * _pivotScaleDelta.x,
+        origin.worldScale.y * _pivotScaleDelta.y,
+        origin.worldScale.z * _pivotScaleDelta.z,
+      );
+    } else {
+      // Child of a transformed parent: convert the new world pose back
+      // into local space using the parent's inverse world matrix.
+      _pivotParentWorldInverse.copy(parent.matrixWorld).invert();
+      // Rotate the snapshot's offset around the new pivot rotation, then
+      // translate by the pivot's translation. The pivot is parented to
+      // engine.scene (identity world matrix), so its world and local
+      // transforms coincide — we can read its position/quaternion directly
+      // for the math here.
+      _pivotStartOffset.copy(origin.worldPos).sub(drag.start.position);
+      _pivotLocalOffset.copy(_pivotStartOffset).applyQuaternion(_pivotQuatDelta);
+      _pivotNewWorldPos.copy(drag.start.position).add(_pivotLocalOffset).add(_pivotPosDelta);
+      _pivotNewWorldQuat.copy(_pivotQuatDelta).multiply(origin.worldQuat);
+      _pivotNewWorldScale.set(
+        origin.worldScale.x * _pivotScaleDelta.x,
+        origin.worldScale.y * _pivotScaleDelta.y,
+        origin.worldScale.z * _pivotScaleDelta.z,
+      );
+      _pivotLocalMatrix.compose(_pivotNewWorldPos, _pivotNewWorldQuat, _pivotNewWorldScale);
+      _pivotLocalMatrix.premultiply(_pivotParentWorldInverse);
+      _pivotLocalMatrix.decompose(_pivotDecomposed.position, _pivotDecomposed.quaternion, _pivotDecomposed.scale);
+      origin.object3D.position.copy(_pivotDecomposed.position);
+      origin.object3D.quaternion.copy(_pivotDecomposed.quaternion);
+      origin.object3D.scale.copy(_pivotDecomposed.scale);
+    }
+    useSceneStore.getState().updateTransform(origin.id);
+  }
+  // Refresh the Box3 helper so it tracks the moving selection.
+  if (viewport.selectionBox && viewport.selectionBox.type === "Box3Helper") {
+    const entities = drag.origins
+      .map((o) => engine.getEntity(o.id))
+      .filter((e) => e && isBoxableEntity(e));
+    if (entities.length) {
+      const bounds = computeSelectionBounds(entities);
+      if (!bounds.isEmpty()) {
+        viewport.selectionBox.box.copy(bounds);
+        viewport.selectionBox.updateMatrixWorld(true);
+      }
+    }
+  }
+  // NOTE: drag.start is *not* advanced each frame. It holds the pivot's
+  // pose at drag start so the delta we apply is cumulative across frames.
+  // Mutating it would shrink each frame's delta to the per-frame motion,
+  // snapping entities back to where they were after the first frame.
+}
+
+// Build one SetTransformCommand per non-ancestor entity and emit as a
+// single BatchCommand so the whole multi-drag is one undoable.
+function commitPivotDrag() {
+  const drag = viewport.pivotDrag;
+  if (!drag) return;
+  const ids = drag.origins.map((o) => o.id);
+  // Collapse parent/child selections so a descendant isn't transformed
+  // twice (once as a child of a moved parent, once on its own).
+  const targets = topMostIds(ids);
+  const cmds = [];
+  let primaryLabel = "Move entities";
+  for (const id of targets) {
+    const entity = engine.getEntity(id);
+    if (!entity) continue;
+    const origin = drag.origins.find((o) => o.id === id);
+    if (!origin) continue;
+    const before = origin.local;
+    const after = entity.getTransform();
+    if (
+      before.position[0] === after.position[0] && before.position[1] === after.position[1] && before.position[2] === after.position[2] &&
+      before.rotation[0] === after.rotation[0] && before.rotation[1] === after.rotation[1] && before.rotation[2] === after.rotation[2] &&
+      before.scale[0] === after.scale[0] && before.scale[1] === after.scale[1] && before.scale[2] === after.scale[2]
+    ) {
+      continue; // No-op: the user dragged but didn't actually move anything.
+    }
+    cmds.push(new SetTransformCommand(id, after, before));
+    if (cmds.length === 1) primaryLabel = `Move ${entity.name}`;
+  }
+  viewport.pivotDrag = null;
+  // Reset the pivot to identity so a fresh attach starts from a clean pose.
+  const pivot = viewport.pivot;
+  pivot.position.set(0, 0, 0);
+  pivot.quaternion.identity();
+  pivot.scale.set(1, 1, 1);
+  if (cmds.length === 1) commandBus.execute(cmds[0]);
+  else if (cmds.length > 1) commandBus.execute(new BatchCommand(cmds, primaryLabel));
+  // Re-attach so the gizmo helper's matrixWorld and any pending helpers
+  // pick up the new entity transforms (the world delta has been applied
+  // to every object3D, but the gizmo's own matrix is stale otherwise).
+  attachSelection(useSelectionStore.getState().ids);
 }
 
 /** Adds a CameraHelper (frustum lines) for the given three.js camera. */
@@ -1045,12 +1554,32 @@ function setupPicking(canvas) {
       const entityId = findEntityId(hit.object);
       if (entityId) {
         const selection = useSelectionStore.getState();
-        if (e.ctrlKey || e.metaKey) selection.toggle(entityId);
-        else selection.select(entityId);
+        if (e.ctrlKey || e.metaKey) {
+          // Ctrl/Cmd: toggle this entity in/out of the current selection.
+          selection.toggle(entityId);
+        } else if (e.shiftKey && selection.anchorId) {
+          // Shift: extend the selection from the anchor to this entity
+          // along the depth-first engine tree (same ordering the
+          // HierarchyPanel uses). Falls back to a plain select if either
+          // end isn't in the live tree (entity got deleted mid-drag).
+          const order = flattenEngineTree();
+          const a = order.indexOf(selection.anchorId);
+          const b = order.indexOf(entityId);
+          if (a !== -1 && b !== -1) {
+            selection.select(
+              order.slice(Math.min(a, b), Math.max(a, b) + 1),
+              selection.anchorId,
+            );
+          } else {
+            selection.select(entityId);
+          }
+        } else {
+          selection.select(entityId);
+        }
         return;
       }
     }
-    if (!e.ctrlKey && !e.metaKey) useSelectionStore.getState().clear();
+    if (!e.ctrlKey && !e.metaKey && !e.shiftKey) useSelectionStore.getState().clear();
   });
 }
 
@@ -1712,7 +2241,19 @@ const GROUND_PLANE = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 
 async function applyTextureToMaterial(matPath, texPath) {
   const { getMaterialDef, updateMaterialAsset, MATERIAL_DEFAULTS } = await import("../../engine/materialAsset.js");
-  const def = { ...MATERIAL_DEFAULTS, ...(getMaterialDef(matPath) ?? {}), map: texPath };
+  // Pull the existing def (cache, falling back to disk) so dropping a texture
+  // doesn't wipe color/roughness/metalness/shaderGraph with MATERIAL_DEFAULTS
+  // when the cache is cold.
+  let existing = getMaterialDef(matPath);
+  if (!existing) {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      existing = JSON.parse(await invoke("read_text_file", { path: matPath })) ?? {};
+    } catch {
+      existing = {};
+    }
+  }
+  const def = { ...MATERIAL_DEFAULTS, ...existing, map: texPath };
   updateMaterialAsset(matPath, def);
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("save_scene", { path: matPath, contents: JSON.stringify(def, null, 2) });
@@ -1762,10 +2303,26 @@ function handleAssetDrop(path, point) {
   }
 
   if (MODEL_EXTENSIONS.includes(ext) || PREFAB_EXTENSIONS.includes(ext)) {
-    const at = new THREE.Vector3();
-    if (!raycaster.ray.intersectPlane(GROUND_PLANE, at)) at.set(0, 0, 0);
+    // Drop precedence: a hit on a mesh drops onto that surface (existing
+    // behavior); a free-air drop lands on the 3D cursor (so users can
+    // pre-place a target and drop straight onto it without aiming in 3D).
+    // The ground plane remains the fallback when neither applies — e.g. an
+    // empty scene with the cursor still at the origin.
+    const hits = raycaster.intersectObjects(engine.scene.children, true);
+    let at = null;
+    const surfaceHit = hits.find((hit) => !hit.object.userData?.editorOnly);
+    if (surfaceHit) {
+      at = [surfaceHit.point.x, surfaceHit.point.y, surfaceHit.point.z];
+    } else {
+      const ground = new THREE.Vector3();
+      if (raycaster.ray.intersectPlane(GROUND_PLANE, ground)) {
+        at = ground.toArray();
+      } else {
+        at = getCursor3D().position.slice();
+      }
+    }
     if (PREFAB_EXTENSIONS.includes(ext)) {
-      instantiatePrefab(path, at.toArray()).catch((err) => console.error(String(err)));
+      instantiatePrefab(path, at).catch((err) => console.error(String(err)));
       return;
     }
     // Raw .glb: run the import pipeline (mesh entities + geometry/material
@@ -1774,7 +2331,7 @@ function handleAssetDrop(path, point) {
       const { unpackGlb } = await import("../glbImport.js");
       const folder = await unpackGlb(path);
       const stem = basename(path).replace(/\.[^.]+$/, "");
-      await instantiatePrefab(`${folder}/${stem}.prefab`, at.toArray());
+      await instantiatePrefab(`${folder}/${stem}.prefab`, at);
     })().catch((err) => console.error(String(err)));
   }
 }
@@ -1796,9 +2353,153 @@ function findEntityId(object) {
   return null;
 }
 
+/**
+ * Resolves the world-space point under the pointer at `(clientX, clientY)`,
+ * preferring a mesh hit so the cursor lands on the visible surface and
+ * falling back to the camera-facing plane a fixed distance from the
+ * cursor's existing z when there's nothing to hit. Used by Shift+RMB and
+ * the "Snap Cursor to Hit" menu entry. Returns `[x, y, z]` or null.
+ */
+function placeCursorFromPointer(clientX, clientY, canvas, snapToExistingDepth) {
+  if (!viewport.camera) return null;
+  const rect = canvas.getBoundingClientRect();
+  const pointer = new THREE.Vector2(
+    ((clientX - rect.left) / rect.width) * 2 - 1,
+    -((clientY - rect.top) / rect.height) * 2 + 1,
+  );
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(pointer, viewport.camera);
+  const hits = raycaster.intersectObjects(engine.scene.children, true);
+  for (const hit of hits) {
+    if (hit.object.userData?.editorOnly) continue;
+    return [hit.point.x, hit.point.y, hit.point.z];
+  }
+  // Miss: project the cursor onto a plane through the existing 3D
+  // cursor position so it stays at the user's depth, or onto the ground
+  // plane when there's nothing to anchor it to. Either way the cursor is
+  // never lost on an empty scene.
+  const ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  const out = new THREE.Vector3();
+  const plane = snapToExistingDepth && getCursor3D().position
+    ? new THREE.Plane().setFromNormalAndCoplanarPoint(
+        viewport.camera.getWorldDirection(new THREE.Vector3()).negate(),
+        new THREE.Vector3().fromArray(getCursor3D().position),
+      )
+    : ground;
+  if (!raycaster.ray.intersectPlane(plane, out)) {
+    out.set(0, 0, 0);
+  }
+  return [out.x, out.y, out.z];
+}
+
+/**
+ * Open the Shift+S snap menu. The menu mirrors Blender's fly-out
+ * ("Selection to Cursor", "Cursor to Selected", "Cursor to World Origin"
+ * etc.) but lives inside the editor chrome to keep the dependency chain
+ * outside the heavy `threeDCursor` module.
+ */
+function openCursorSnapMenu() {
+  if (cursorSnapMenu) {
+    cursorSnapMenu.remove();
+    cursorSnapMenu = null;
+  }
+  const rows = [
+    {
+      label: "Selection → 3D Cursor",
+      hint: "Selection → Cursor",
+      enabled: useSelectionStore.getState().ids.length > 0,
+      run: () => snapSelectionToCursor(),
+    },
+    {
+      label: "Selection → World Origin",
+      hint: "Selection → Origin",
+      enabled: useSelectionStore.getState().ids.length > 0,
+      run: () => snapSelectionToOrigin(),
+    },
+    { separator: true },
+    {
+      label: "3D Cursor → Selection",
+      hint: "Cursor → Selection",
+      enabled: useSelectionStore.getState().ids.length > 0,
+      run: () => snapCursorToSelection(),
+    },
+    {
+      label: "3D Cursor → World Origin",
+      hint: "Cursor → Origin",
+      run: () => snapCursorToWorldOrigin(),
+    },
+    {
+      label: "3D Cursor → Grid Floor",
+      hint: "Cursor → Grid",
+      run: () => snapCursorToGridFloor(),
+    },
+  ];
+  const host = document.querySelector(".viewport-panel") ?? document.body;
+  const menu = document.createElement("div");
+  menu.className = "cursor-snap-menu";
+  for (const row of rows) {
+    if (row.separator) {
+      const sep = document.createElement("div");
+      sep.className = "cursor-snap-separator";
+      menu.appendChild(sep);
+      continue;
+    }
+    const btn = document.createElement("button");
+    btn.className = "cursor-snap-item";
+    btn.disabled = !row.enabled;
+    btn.innerHTML = `<span class="cursor-snap-label">${row.label}</span><kbd class="cursor-snap-hint">${row.hint}</kbd>`;
+    btn.addEventListener("click", () => {
+      row.run();
+      menu.remove();
+      cursorSnapMenu = null;
+    });
+    menu.appendChild(btn);
+  }
+  const close = () => {
+    menu.remove();
+    cursorSnapMenu = null;
+    window.removeEventListener("keydown", onKey, true);
+    window.removeEventListener("pointerdown", onPointer, true);
+  };
+  const onKey = (e) => {
+    if (e.key === "Escape") close();
+  };
+  const onPointer = (e) => {
+    if (!menu.contains(e.target)) close();
+  };
+  window.addEventListener("keydown", onKey, true);
+  window.addEventListener("pointerdown", onPointer, true);
+  host.appendChild(menu);
+  cursorSnapMenu = menu;
+}
+
+let cursorSnapMenu = null;
+
+/**
+ * Convert a world-space raycast hit + plane (xz, or camera-facing) into a
+ * point for the cursor. Exposed so callers in other modules (e.g. the
+ * asset drop handler) can reuse the same fallback strategy.
+ */
+
 function setupKeyboard(canvas) {
   canvas.addEventListener("pointerenter", () => (viewport.hovered = true));
   canvas.addEventListener("pointerleave", () => (viewport.hovered = false));
+
+  // Shift + Right-click anywhere on the canvas drops a 3D cursor there.
+  // Blender uses Shift+RMB for "Place 3D Cursor" — the right button keeps
+  // orbit's RMB-orbit shortcut intact while making the modifier explicit.
+  // `capture: true` so we run before OrbitControls' pan handler (also on
+  // the canvas), letting us suppress the orbit RMB-pan gesture when the
+  // user is using the cursor modifier.
+  canvas.addEventListener("pointerdown", (e) => {
+    if (e.button !== 2 || !e.shiftKey || engine.playing) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const point = placeCursorFromPointer(e.clientX, e.clientY, canvas, true);
+    if (point) {
+      setCursor3DPosition(point);
+    }
+  }, { capture: true });
 
   window.addEventListener("keydown", (e) => {
     if (!viewport.hovered || engine.playing) return;
@@ -1829,17 +2530,23 @@ function setupKeyboard(canvas) {
       case "f":
         focusSelection();
         break;
-      case "l": {
-        // Directional-light convenience: jump straight to rotation while the
-        // compact sun-direction helper remains visible.
-        const entityId = useSelectionStore.getState().ids[0] ?? null;
-        const light = entityId ? engine.getEntity(entityId)?.getComponent("light") : null;
-        if (light?.props.kind !== "directional") break;
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        setGizmoMode("rotate");
-        break;
-      }
+    }
+  });
+
+  // Shift+S → 3D cursor snap menu. We listen on window so the menu opens
+  // even when the canvas hasn't been hovered yet (the user might be
+  // reaching for the keyboard after a hierarchy click). Match Blender's
+  // "Cursor to Selected" / "Cursor to World Origin" / "Selection to
+  // Cursor" / "Selection to World Origin" rows.
+  window.addEventListener("keydown", (e) => {
+    if (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === "s") {
+      // Don't fight the geometry editor's "S" macro OR the global
+      // "Save (Ctrl+S)" — those pre-conditions already filter the input
+      // (we checked e.repeat/no modifiers), so this only fires for plain
+      // Shift+S, which is otherwise unbound.
+      if (engine.playing) return;
+      openCursorSnapMenu();
+      e.preventDefault();
     }
   });
 
@@ -2289,8 +2996,10 @@ function onMacroPointerDown(e) {
 function handleMacroKey(e) {
   if (macro) return handleMacroInput(e);
 
-  // Don't start a macro if the user is holding a modifier.
-  if (e.ctrlKey || e.metaKey || e.altKey) return false;
+  // Don't start a macro if the user is holding a modifier. Shift is also
+  // reserved — the Shift+S chord opens the 3D cursor snap menu (Blender's
+  // behaviour) so plain keypresses never carry Shift.
+  if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return false;
   if (e.repeat) return false;
   const k = e.key.toLowerCase();
   let kind = null;
@@ -2300,10 +3009,32 @@ function handleMacroKey(e) {
   if (!kind) return false;
   // startMacro is a no-op if nothing is selected / game is playing — in that
   // case fall through so the keystroke doesn't get preventDefault'd.
-  if (useSelectionStore.getState().ids.length === 0) return false;
+  const selectedIds = useSelectionStore.getState().ids;
+  if (selectedIds.length === 0) return false;
+  // Directional lights have no positional/scale state — skip translate and
+  // scale macros so the user gets no false "move worked" feedback.
+  if (
+    (kind === "translate" || kind === "scale") &&
+    selectionHasDirectionalLight(selectedIds)
+  ) {
+    return false;
+  }
   e.preventDefault();
   startMacro(kind);
   return true;
+}
+
+/**
+ * True when at least one selected entity carries a directional light. Used
+ * to suppress the G/S transform macros (those properties don't exist for a
+ * sun) and to skip attaching the standard transform gizmo on selection.
+ */
+function selectionHasDirectionalLight(ids = useSelectionStore.getState().ids) {
+  for (const id of ids) {
+    const light = engine.getEntity(id)?.getComponent?.("light");
+    if (light?.props?.kind === "directional") return true;
+  }
+  return false;
 }
 
 function handleMacroInput(e) {
@@ -2409,20 +3140,29 @@ function uninstallMacroPointer() {
 }
 
 function focusSelection() {
-  const id = useSelectionStore.getState().ids[0];
-  const entity = id ? engine.getEntity(id) : null;
-  if (!entity) return;
-  const bounds = new THREE.Box3().setFromObject(entity.object3D);
+  const ids = useSelectionStore.getState().ids;
+  if (!ids.length) return;
+  const entities = resolveEntities(ids);
+  if (!entities.length) return;
+  // Frame the union bounds of the entire selection. Boxable-only filter so
+  // a single camera entity with its preview mesh doesn't blow up the
+  // framing distance.
+  const boxable = entities.filter(isBoxableEntity);
+  const bounds = boxable.length ? computeSelectionBounds(boxable) : new THREE.Box3();
   const center = new THREE.Vector3();
-  if (bounds.isEmpty()) {
-    entity.object3D.getWorldPosition(center);
-  } else {
+  let size = 2;
+  if (!bounds.isEmpty()) {
     bounds.getCenter(center);
+    size = bounds.getSize(new THREE.Vector3()).length() || 2;
+  } else {
+    // No boxable geometry (e.g. only lights/UI). Center on the average
+    // world position and pick a default framing distance.
+    center.copy(computeSelectionCentroid(entities));
   }
-  const size = bounds.isEmpty() ? 2 : bounds.getSize(new THREE.Vector3()).length() || 2;
   const offset = viewport.camera.position.clone().sub(viewport.orbit.target).normalize().multiplyScalar(size * 2);
   viewport.orbit.target.copy(center);
   viewport.camera.position.copy(center).add(offset);
+  viewport.orbit.dispatchEvent({ type: "change" });
 }
 
 /**
@@ -2542,18 +3282,16 @@ export function ViewportPanel() {
   }));
   const [previewEntityName, setPreviewEntityName] = useState(null);
   const playing = usePlayStore((s) => s.playing);
+  const rootPath = useProjectStore((s) => s.rootPath);
+  const sceneName = useSceneStore((s) => s.sceneName);
+  const scenePath = useSceneStore((s) => s.scenePath);
   const geometryEntityId = useGeometryEditStore((s) => s.entityId);
-  const geometryInitialView = (() => {
-    if (!geometryEntityId || !viewport.camera || !viewport.orbit) return null;
-    const entity = engine.getEntity(geometryEntityId);
-    if (!entity) return null;
-    entity.object3D.updateWorldMatrix(true, false);
-    const inverse = entity.object3D.matrixWorld.clone().invert();
-    return {
-      position: viewport.camera.position.clone().applyMatrix4(inverse).toArray(),
-      target: viewport.orbit.target.clone().applyMatrix4(inverse).toArray(),
-    };
-  })();
+  // Captured pose for the embedded geometry editor. Recomputed whenever the
+  // entity being edited changes — first we focus the editor camera on the
+  // geometry's world-space bounding box, then sample the orbit pose and
+  // transform it into the geometry's local space so the standalone panel
+  // inherits the same view direction.
+  const [geometryInitialView, setGeometryInitialView] = useState(null);
   // Mirrors viewport.layers — kept here because React owns the toggle UI.
   // The Panel re-reads this any time something else (e.g. another viewport
   // instance in a future split-pane setup) mutates layer state via the
@@ -2569,6 +3307,17 @@ export function ViewportPanel() {
   });
 
   useEffect(() => {
+    let cancelled = false;
+    ensureViewport().then(() => {
+      if (cancelled) return;
+      updateEditorCameraPrefsKey(rootPath, scenePath, sceneName);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [rootPath, scenePath, sceneName]);
+
+  useEffect(() => {
     // Toggle a body class while the macro is interactive so theme.css can
     // give the viewport a grab cursor without leaking the cursor onto other
     // panels (the macro is modal anyway).
@@ -2577,6 +3326,57 @@ export function ViewportPanel() {
       document.body.classList.remove("macro-active");
     };
   }, [macroState]);
+
+  // When the user enters geometry edit mode, pull the editor camera back to
+  // a comfortable framing of the geometry's world-space bounding box. The
+  // geometry editor itself does its own local-space focus from the snapshot
+  // it captures next render; without this pass the local pose it inherits
+  // would carry whatever the user happened to be looking at elsewhere in
+  // the scene, not the mesh being edited.
+  useLayoutEffect(() => {
+    setGeometryInitialView(null);
+    if (!geometryEntityId) return;
+    // The viewport camera may not be initialized yet on the first paint after
+    // project load. Wait for `ensureViewport()` so we focus the real camera
+    // instead of bailing out and leaving the editor pointing at stale state.
+    let cancelled = false;
+    const focusAndCapture = () => {
+      if (cancelled) return;
+      if (!viewport.camera || !viewport.orbit) return;
+      const entity = engine.getEntity(geometryEntityId);
+      if (!entity?.object3D) return;
+      entity.object3D.updateWorldMatrix(true, false);
+      const bounds = new THREE.Box3().setFromObject(entity.object3D);
+      // Even an empty bounding box (e.g. a single-point mesh) shouldn't leave
+      // the camera at its previous target — pull it onto the entity origin so
+      // the embedded editor starts off looking at the geometry.
+      const center = bounds.isEmpty()
+        ? entity.object3D.getWorldPosition(new THREE.Vector3())
+        : bounds.getCenter(new THREE.Vector3());
+      const size = bounds.isEmpty() ? 1 : bounds.getSize(new THREE.Vector3()).length() || 1;
+      // FOV-derived distance so the geometry fills roughly 60% of the viewport.
+      const fov = THREE.MathUtils.degToRad((viewport.camera.fov || 60) * 0.5);
+      const distance = (size * 0.5) / Math.max(Math.sin(fov), 0.05) * 1.6;
+      const offset = viewport.camera.position.clone().sub(viewport.orbit.target);
+      if (offset.lengthSq() < 1e-6) offset.set(0.6, 0.5, 0.7);
+      offset.normalize();
+      viewport.orbit.target.copy(center);
+      viewport.camera.position.copy(center).addScaledVector(offset, distance);
+      viewport.camera.updateProjectionMatrix();
+      viewport.orbit.update();
+      viewport.orbit.dispatchEvent({ type: "change" });
+      // Sample the focused pose and transform it into the entity's local space
+      // so the embedded editor's detached mesh inherits the same view direction.
+      const inverse = entity.object3D.matrixWorld.clone().invert();
+      setGeometryInitialView({
+        position: viewport.camera.position.clone().applyMatrix4(inverse).toArray(),
+        target: viewport.orbit.target.clone().applyMatrix4(inverse).toArray(),
+      });
+    };
+    if (viewport.camera && viewport.orbit) focusAndCapture();
+    else ensureViewport().then(focusAndCapture);
+    return () => { cancelled = true; };
+  }, [geometryEntityId]);
 
   // Sync local state when something else flips a layer toggle (today:
   // nothing else does, but the pub-sub path lets future tooling drive
@@ -2621,7 +3421,15 @@ export function ViewportPanel() {
         setPreviewEntityName(null);
         return;
       }
-      const id = useSelectionStore.getState().ids[0];
+      // The PIP is a single-entity affordance — when more than one entity
+      // is selected there's no canonical camera to preview, so clear the
+      // label and let attachMultiSelection clear the WebGL side.
+      const ids = useSelectionStore.getState().ids;
+      if (ids.length !== 1) {
+        setPreviewEntityName(null);
+        return;
+      }
+      const id = ids[0];
       const ent = id ? engine.getEntity(id) : null;
       const cam = ent?.getComponent?.("camera");
       if (!cam) {
@@ -2657,6 +3465,13 @@ export function ViewportPanel() {
     if (viewport.canvas) appendCanvas();
     else ensureViewport().then(appendCanvas);
 
+    const flushCameraPrefs = () => {
+      clearTimeout(viewport.cameraPrefsSaveTimer);
+      viewport.cameraPrefsSaveTimer = null;
+      saveEditorCameraPrefs();
+    };
+    window.addEventListener("beforeunload", flushCameraPrefs);
+
     return () => {
       disposed = true;
       observer.disconnect();
@@ -2665,6 +3480,8 @@ export function ViewportPanel() {
       unsubSel();
       unsubPlay();
       unsubProp();
+      window.removeEventListener("beforeunload", flushCameraPrefs);
+      flushCameraPrefs();
       viewport.canvas?.remove();
     };
   }, []);
@@ -2768,6 +3585,7 @@ export function ViewportPanel() {
           </span>
         </div>
       )}
+      {!playing && <CursorHUD />}
       {previewEntityName && !playing && (
         <div className="camera-preview-label" title="Live render from the selected camera">
           <span className="dot" />

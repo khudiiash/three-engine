@@ -180,9 +180,10 @@ export async function exportGame() {
       }
     }
     // Import settings ship as sidecar .meta files when present: textures
-    // (filtering/wrap) and models (virtual geometry).
+    // (filtering/wrap), models (virtual geometry), and geometry (GI ray proxy
+    // import cache).
     for (const [src, rel] of [...assets.entries()]) {
-      if (!/\.(png|jpe?g|webp|glb)$/i.test(src)) continue;
+      if (!/\.(png|jpe?g|webp|glb|geom)$/i.test(src)) continue;
       try {
         await invoke("stat_file", { path: `${src}.meta` });
         assets.set(`${src}.meta`, `${rel}.meta`);

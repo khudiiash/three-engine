@@ -11,6 +11,9 @@ import { loadTextureAsset } from "./textureAsset.js";
 
 export const MATERIAL_DEFAULTS = {
 
+  // New materials and meshes without an assigned material use the same
+  // neutral white base. Lighting, not a placeholder tint, determines their
+  // visible shade.
   color: "#ffffff",
 
   roughness: 0.7,
@@ -89,13 +92,9 @@ export function subscribeMaterial(path, cb) {
 function notifyMaterial(path) {
   const set = path && subscribers.get(assetKey(path));
   if (!set) return;
-
   for (const cb of set) {
-
     try { cb(); } catch (err) { console.error(`Material subscriber for "${path}": ${err.message}`); }
-
   }
-
 }
 
 
@@ -383,6 +382,11 @@ export function applyMaterialDef(entry, def) {
           if (generation !== entry.generation) return;
           material.map = texture;
           material.needsUpdate = true;
+          // Visibility depends on the graph's Surface/Volume wiring, not on the
+          // diffuse map, but re-derive from `entry.def` so the value is always
+          // consistent with the most recently applied def — the sync notify
+          // below can otherwise leave a stale `false` from a half-applied graph.
+          entry.renderable = computeRenderable(entry.def?.shaderGraph);
           notifyMaterial(entry.path);
 
         })
@@ -432,7 +436,13 @@ export function applyMaterialDef(entry, def) {
         // this point and saw every slot null. Without this second notify they
         // keep that stale wiring forever, so a full PBR .mat renders as its
         // diffuse map alone.
-
+        //
+        // Re-evaluate visibility from the *final* graph (post-migration, in
+        // `entry.def`) — the sync notify below ran with the pre-migration
+        // graph and may have flipped `renderable` to `false` on a graph whose
+        // Output got wired during compile. Without this refresh the mesh
+        // stays hidden until a manual edit forces another apply.
+        entry.renderable = computeRenderable(entry.def?.shaderGraph);
         notifyMaterial(entry.path);
 
       })
@@ -572,6 +582,52 @@ export function updateMaterialAsset(path, def) {
   const entry = cache.get(assetKey(path));
   if (entry) applyMaterialDef(entry, def);
 
+}
+
+/** Best-effort swatch color for a .mat: walks the live material's
+ *  colorNode to find a constant color. Used by the editor's swatch UI so
+ *  it shows what the material *actually* renders, not what the top-level
+ *  `def.color` field happens to be — those can drift (a Shader Graph edit
+ *  changes colorNode without writing back to the top-level field, an old
+ *  .mat file might have a stale `color: "#ffffff"` from a buggy autosave
+ *  before the swatch was fixed, etc.).
+ *
+ * Returns a `#rrggbb` string or `null` when the color can't be resolved
+ * (complex expression, no material loaded yet, etc.). The caller decides
+ *  what to fall back to. */
+export function getMaterialColorPreview(path) {
+  const entry = cache.get(assetKey(path));
+  if (!entry?.material) return null;
+  const node = entry.material.colorNode;
+  if (!node) {
+    // No shader graph (or graph compile hasn't landed yet) — fall back to
+    // the scalar `material.color` which is set synchronously from def.color.
+    const c = entry.material.color;
+    if (c && typeof c.r === "number") {
+      const r = Math.round(c.r * 255);
+      const g = Math.round(c.g * 255);
+      const b = Math.round(c.b * 255);
+      return `#${[r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+    }
+    return null;
+  }
+  return readConstantColor(node);
+}
+
+/** Walk a TSL color expression looking for a constant ColorNode / uniform
+ *  carrying a THREE.Color or [r,g,b] array. Returns null for anything more
+ *  complex (e.g. multiply, add, texture sample). */
+function readConstantColor(node) {
+  if (!node) return null;
+  // TSL ColorNode / uniform-color: `value` is a THREE.Color (has r/g/b in 0..1).
+  const v = node.value;
+  if (v && typeof v === "object" && typeof v.r === "number" && typeof v.g === "number" && typeof v.b === "number") {
+    const r = Math.round(v.r * 255);
+    const g = Math.round(v.g * 255);
+    const b = Math.round(v.b * 255);
+    return `#${[r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("")}`;
+  }
+  return null;
 }
 
 

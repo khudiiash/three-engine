@@ -1,5 +1,5 @@
 import * as THREE from "three/webgpu";
-import { resolveAssetUrl } from "./assetResolver.js";
+import { loadAssetMeta, resolveAssetUrl } from "./assetResolver.js";
 
 export const GEOMETRY_ASSET_VERSION = 1;
 
@@ -50,6 +50,16 @@ export function geometryFromAsset(definition) {
     }
     geometry.userData.editableEdges = Array.from({ length: edges.length / 2 }, (_, index) => edges.slice(index * 2, index * 2 + 2));
   }
+  if (Array.isArray(definition.hiddenEdges)) {
+    const hiddenEdges = finiteArray(definition.hiddenEdges, 2, "hidden edges");
+    if (hiddenEdges.some((i) => !Number.isInteger(i) || i < 0 || i >= positions.length / 3)) {
+      throw new Error("Geometry hidden-edge indices are out of range");
+    }
+    geometry.userData.editableHiddenEdges = Array.from(
+      { length: hiddenEdges.length / 2 },
+      (_, index) => hiddenEdges.slice(index * 2, index * 2 + 2),
+    );
+  }
   if (definition.uvs?.length === (positions.length / 3) * 2) {
     geometry.setAttribute("uv", new THREE.Float32BufferAttribute(finiteArray(definition.uvs, 2, "uvs"), 2));
   }
@@ -93,8 +103,17 @@ export async function loadGeometryAsset(path) {
   if (ext !== "geom") {
     throw new Error(`Geometry asset must be a .geom file (got .${ext || "<none>"}): "${path}"`);
   }
-  const url = await resolveAssetUrl(path);
+  const [url, meta] = await Promise.all([
+    resolveAssetUrl(path),
+    loadAssetMeta(`${path}.meta`),
+  ]);
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Geometry request failed (${response.status})`);
-  return geometryFromAsset(await response.json());
+  const geometry = geometryFromAsset(await response.json());
+  geometry.userData.assetPath = path;
+  // GI validates the content hash before using this. Keeping the runtime
+  // loader subsystem-agnostic lets exported games consume the same sidecar
+  // without making the engine core depend on the optional GI module.
+  if (meta?.giRayProxy) geometry.userData.giRayProxy = meta.giRayProxy;
+  return geometry;
 }

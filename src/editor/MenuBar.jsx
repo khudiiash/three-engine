@@ -10,11 +10,23 @@ import {
   duplicateSelection,
   deleteSelection,
 } from "./clipboard.js";
+import { groupSelection } from "./group.js";
 import { newScene, openScene, saveScene } from "./sceneIO.js";
 import { useProjectStore } from "./store/projectStore.js";
 import { openPanel, resetLayout } from "./EditorShell.jsx";
 import { describeBinding, getBinding, visibilityActions } from "./keybindings.js";
 import { ProcessingIndicator } from "./components/ProcessingIndicator.jsx";
+import {
+  setCursor3DPosition,
+  toggleCursor3DVisible,
+} from "./threeDCursor.js";
+import {
+  snapCursorToSelection,
+  snapCursorToWorldOrigin,
+  snapCursorToGridFloor,
+  snapSelectionToCursor,
+  snapSelectionToOrigin,
+} from "./threeDCursorOps.js";
 
 export function MenuBar() {
   const [openMenu, setOpenMenu] = useState(null);
@@ -93,6 +105,12 @@ export function MenuBar() {
         action: () => duplicateSelection(),
       },
       {
+        label: "Group Selection",
+        shortcut: "Ctrl+G",
+        disabled: selection.length < 2,
+        action: () => groupSelection(),
+      },
+      {
         label: "Delete",
         shortcut: "Del",
         disabled: !selection.length,
@@ -143,6 +161,37 @@ export function MenuBar() {
         label: "Toggle all unselected (game)",
         shortcut: describeBinding(getBinding("game.toggleUnselected")),
         action: () => visibilityActions.toggleUnselectedGame(),
+      },
+    ],
+    Cursor: [
+      {
+        label: "Snap Selection to 3D Cursor",
+        shortcut: "Shift+S",
+        disabled: !selection.length,
+        action: () => snapSelectionToCursor(),
+      },
+      {
+        label: "Snap Selection to World Origin",
+        disabled: !selection.length,
+        action: () => snapSelectionToOrigin(),
+      },
+      { separator: true },
+      {
+        label: "3D Cursor to Selection",
+        shortcut: "Shift+S",
+        disabled: !selection.length,
+        action: () => snapCursorToSelection(),
+      },
+      { label: "3D Cursor to World Origin", action: () => snapCursorToWorldOrigin() },
+      { label: "3D Cursor to Grid Floor", action: () => snapCursorToGridFloor() },
+      {
+        label: "Reset 3D Cursor",
+        action: () => setCursor3DPosition(0, 0, 0),
+      },
+      { separator: true },
+      {
+        label: "Toggle 3D Cursor",
+        action: () => toggleCursor3DVisible(),
       },
     ],
   };

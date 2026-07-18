@@ -19,6 +19,12 @@ export function editableFromBufferGeometry(geometry) {
     uvs: uv ? Array.from({ length: position.count }, (_, i) => [uv.getX(i), uv.getY(i)]) : [],
     faceMaterials,
     looseEdges: (geometry.userData?.editableEdges ?? []).map((edge) => [...edge]),
+    // `null` means legacy / unauthored topology and lets Edit Mode infer flat
+    // triangulation diagonals once. An array (including an empty one) is an
+    // authored answer and must be preserved exactly.
+    hiddenEdges: Array.isArray(geometry.userData?.editableHiddenEdges)
+      ? geometry.userData.editableHiddenEdges.map((edge) => [...edge])
+      : null,
   };
 }
 
@@ -29,6 +35,7 @@ export function cloneEditable(editable) {
     uvs: editable.uvs.map((uv) => [...uv]),
     faceMaterials: [...(editable.faceMaterials ?? [])],
     looseEdges: (editable.looseEdges ?? []).map((edge) => [...edge]),
+    hiddenEdges: Array.isArray(editable.hiddenEdges) ? editable.hiddenEdges.map((edge) => [...edge]) : null,
   };
 }
 
@@ -41,6 +48,9 @@ export function bufferGeometryFromEditable(editable) {
   }
   applyMaterialGroups(geometry, editable.faceMaterials, editable.faces.length);
   geometry.userData.editableEdges = (editable.looseEdges ?? []).map((edge) => [...edge]);
+  if (Array.isArray(editable.hiddenEdges)) {
+    geometry.userData.editableHiddenEdges = editable.hiddenEdges.map((edge) => [...edge]);
+  }
   geometry.computeVertexNormals();
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
@@ -48,6 +58,9 @@ export function bufferGeometryFromEditable(editable) {
 }
 
 export function geometryAssetFromEditable(editable) {
+  const hiddenEdges = Array.isArray(editable.hiddenEdges)
+    ? editable.hiddenEdges
+    : inferredHiddenEdgePairs(editable);
   return {
     version: GEOMETRY_ASSET_VERSION,
     positions: editable.positions.flat(),
@@ -55,7 +68,21 @@ export function geometryAssetFromEditable(editable) {
     uvs: editable.uvs.length === editable.positions.length ? editable.uvs.flat() : [],
     groups: materialGroups(editable.faceMaterials, editable.faces.length),
     edges: (editable.looseEdges ?? []).flat(),
+    hiddenEdges: hiddenEdges.flat(),
   };
+}
+
+function inferredHiddenEdgePairs(editable) {
+  const hidden = coplanarHiddenEdges(editable);
+  const pairs = new Map();
+  editable.faces.forEach((face) => face.forEach((a, edge) => {
+    const b = face[(edge + 1) % 3];
+    if (hidden.has(spatialEdgeKey(editable.positions[a], editable.positions[b]))) {
+      const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+      pairs.set(key, a < b ? [a, b] : [b, a]);
+    }
+  }));
+  return [...pairs.values()];
 }
 
 function materialGroups(faceMaterials = [], faceCount = 0) {
@@ -150,43 +177,97 @@ export function coplanarFaceGroup(editable, faceIndex, threshold = 0.9999, block
 }
 
 /** Creates zero-offset extrusion topology for an interactive extrusion. */
-export function beginExtrudeFaces(editable, faceIndices) {
+export function beginExtrudeFaces(editable, faceIndices, hiddenIndexEdges = new Set()) {
   const selected = [...new Set(faceIndices)].filter((index) => editable.faces[index]);
   if (!selected.length) return { faceIndices: [], vertexIndices: [], normal: [0, 0, 1] };
+  const hasUVs = editable.uvs.length === editable.positions.length;
   const normals = selected.map((index) => faceNormal(editable, editable.faces[index]));
   const normal = normals.reduce((sum, value) => sum.add(value), new THREE.Vector3());
   if (normal.lengthSq() < 1e-10) normal.copy(normals[0]);
   normal.normalize();
   const vertexMap = new Map();
   const duplicate = (oldIndex) => {
-    const key = pointKey(editable.positions[oldIndex]);
-    if (vertexMap.has(key)) return vertexMap.get(key);
+    // Render vertices at the same position can carry different UVs/normals.
+    // Welding them by position here destroyed cap UV seams after extrusion.
+    if (vertexMap.has(oldIndex)) return vertexMap.get(oldIndex);
     const index = editable.positions.length;
     editable.positions.push([...editable.positions[oldIndex]]);
-    editable.uvs.push(editable.uvs[oldIndex] ? [...editable.uvs[oldIndex]] : [0, 0]);
-    vertexMap.set(key, index);
+    if (hasUVs) editable.uvs.push([...(editable.uvs[oldIndex] ?? [0, 0])]);
+    vertexMap.set(oldIndex, index);
     return index;
   };
   const boundary = new Map();
+  const visiblePairs = new Set();
+  const indexKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
   for (const faceIndex of selected) {
     const face = editable.faces[faceIndex];
     for (let edge = 0; edge < 3; edge++) {
       const a = face[edge];
       const b = face[(edge + 1) % 3];
       const key = spatialEdgeKey(editable.positions[a], editable.positions[b]);
-      if (boundary.has(key)) boundary.delete(key);
-      else boundary.set(key, [a, b]);
+      const entry = boundary.get(key) ?? { count: 0, edge: [a, b] };
+      entry.count++;
+      boundary.set(key, entry);
     }
-    editable.faces[faceIndex] = face.map(duplicate);
+    const cap = face.map(duplicate);
+    editable.faces[faceIndex] = cap;
+    for (let edge = 0; edge < 3; edge++) {
+      const sourceKey = indexKey(face[edge], face[(edge + 1) % 3]);
+      if (!hiddenIndexEdges.has(sourceKey)) {
+        visiblePairs.add(indexKey(cap[edge], cap[(edge + 1) % 3]));
+      }
+    }
   }
-  for (const [a, b] of boundary.values()) {
-    const nextA = duplicate(a);
-    const nextB = duplicate(b);
-    editable.faces.push([a, b, nextB], [a, nextB, nextA]);
+  const moving = [...vertexMap.values()];
+  const walls = [];
+  for (const { count, edge: [a, b] } of boundary.values()) {
+    if (count !== 1) continue;
+    // Walls need their own four render vertices. Sharing cap vertices forces
+    // one UV value to serve two perpendicular surfaces and visibly tears the
+    // texture. Logical edit topology remains welded by position.
+    const wall = [a, b, a, b].map((sourceIndex) => {
+      const index = editable.positions.length;
+      editable.positions.push([...editable.positions[sourceIndex]]);
+      if (hasUVs) editable.uvs.push([0, 0]);
+      return index;
+    });
+    const [baseA, baseB, topA, topB] = wall;
+    editable.faces.push([baseA, baseB, topB], [baseA, topB, topA]);
+    moving.push(topA, topB);
+    walls.push(wall);
+    visiblePairs.add(indexKey(baseA, baseB));
+    visiblePairs.add(indexKey(topA, topB));
+    visiblePairs.add(indexKey(baseA, topA));
+    visiblePairs.add(indexKey(baseB, topB));
     const material = editable.faceMaterials?.[selected[0]] ?? 0;
     editable.faceMaterials?.push(material, material);
   }
-  return { faceIndices: selected, vertexIndices: [...vertexMap.values()], normal: normal.toArray() };
+  const result = {
+    faceIndices: selected,
+    vertexIndices: moving,
+    normal: normal.toArray(),
+    walls,
+    visiblePairs,
+  };
+  updateExtrudeUVs(editable, result);
+  return result;
+}
+
+/** Rebuilds the dedicated wall UV strips after an interactive extrusion moves. */
+export function updateExtrudeUVs(editable, extrusion) {
+  if (editable.uvs.length !== editable.positions.length) return;
+  for (const [baseA, baseB, topA, topB] of extrusion.walls ?? []) {
+    const a = new THREE.Vector3(...editable.positions[baseA]);
+    const b = new THREE.Vector3(...editable.positions[baseB]);
+    const c = new THREE.Vector3(...editable.positions[topA]);
+    const d = new THREE.Vector3(...editable.positions[topB]);
+    const width = Math.max(a.distanceTo(b), 1e-6);
+    const height = Math.max((a.distanceTo(c) + b.distanceTo(d)) * 0.5, 1e-6);
+    editable.uvs[baseA] = [0, 0];
+    editable.uvs[baseB] = [width, 0];
+    editable.uvs[topA] = [0, height];
+    editable.uvs[topB] = [width, height];
+  }
 }
 
 /** Extrudes a connected triangle region by a fixed distance. */
@@ -197,6 +278,7 @@ export function extrudeFaces(editable, faceIndices, distance) {
   result.vertexIndices.forEach((index) => {
     editable.positions[index] = new THREE.Vector3(...editable.positions[index]).add(offset).toArray();
   });
+  updateExtrudeUVs(editable, result);
   return result.faceIndices;
 }
 
@@ -217,6 +299,11 @@ export function deleteFaces(editable, faceIndices) {
   editable.uvs = uvs.length === positions.length ? uvs : [];
   editable.faces = editable.faces.map((face) => face.map((index) => remap.get(index)));
   editable.looseEdges = (editable.looseEdges ?? []).map(([a, b]) => [remap.get(a), remap.get(b)]).filter(([a, b]) => a !== undefined && b !== undefined);
+  if (Array.isArray(editable.hiddenEdges)) {
+    editable.hiddenEdges = editable.hiddenEdges
+      .map(([a, b]) => [remap.get(a), remap.get(b)])
+      .filter(([a, b]) => a !== undefined && b !== undefined);
+  }
 }
 
 /** Removes intermediate/orphan vertices while preserving UV and loose-edge indices. */
@@ -237,7 +324,44 @@ export function removeUnusedVertices(editable) {
   editable.looseEdges = (editable.looseEdges ?? [])
     .map(([a, b]) => [remap.get(a), remap.get(b)])
     .filter(([a, b]) => a !== undefined && b !== undefined);
+  if (Array.isArray(editable.hiddenEdges)) {
+    editable.hiddenEdges = editable.hiddenEdges
+      .map(([a, b]) => [remap.get(a), remap.get(b)])
+      .filter(([a, b]) => a !== undefined && b !== undefined);
+  }
   return removed;
+}
+
+/**
+ * Builds a compact editable mesh from a face selection. This is the persistent
+ * half of Blender's Separate by Selection operation; the caller decides where
+ * the returned mesh is saved and which entity owns it.
+ */
+export function editableFromFaces(editable, faceIndices) {
+  const selected = [...new Set(faceIndices)]
+    .filter((index) => Number.isInteger(index) && editable.faces[index]);
+  const used = new Set(selected.flatMap((index) => editable.faces[index]));
+  const remap = new Map();
+  const positions = [];
+  const uvs = [];
+  [...used].sort((a, b) => a - b).forEach((oldIndex) => {
+    remap.set(oldIndex, positions.length);
+    positions.push([...editable.positions[oldIndex]]);
+    if (editable.uvs[oldIndex]) uvs.push([...editable.uvs[oldIndex]]);
+  });
+  const hiddenEdges = Array.isArray(editable.hiddenEdges)
+    ? editable.hiddenEdges
+      .map(([a, b]) => [remap.get(a), remap.get(b)])
+      .filter(([a, b]) => a !== undefined && b !== undefined)
+    : null;
+  return {
+    positions,
+    faces: selected.map((index) => editable.faces[index].map((vertex) => remap.get(vertex))),
+    uvs: uvs.length === positions.length ? uvs : [],
+    faceMaterials: selected.map((index) => editable.faceMaterials?.[index] ?? 0),
+    looseEdges: [],
+    hiddenEdges,
+  };
 }
 
 function connectedFaces(editable, seedFace) {

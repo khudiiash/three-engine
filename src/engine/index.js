@@ -9,6 +9,7 @@ import { ScriptComponent } from "./components/ScriptComponent.js";
 import { ParticleComponent } from "./components/ParticleComponent.js";
 import { AnimationComponent } from "./components/AnimationComponent.js";
 import { InstancerComponent } from "./components/InstancerComponent.js";
+import { GeometryModifiersComponent } from "./components/GeometryModifiersComponent.js";
 import { SoundComponent } from "./components/SoundComponent.js";
 import { ListenerComponent } from "./components/ListenerComponent.js";
 import { UiScreenComponent } from "./components/ui/UiScreenComponent.js";
@@ -38,6 +39,7 @@ const BUILT_IN_COMPONENTS = [
   ParticleComponent,
   AnimationComponent,
   InstancerComponent,
+  GeometryModifiersComponent,
   SoundComponent,
   ListenerComponent,
   UiScreenComponent,

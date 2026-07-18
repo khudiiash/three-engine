@@ -18,6 +18,13 @@ export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
   const bsdf = {
     id: "bsdf",
     type: "principledBsdf",
+    // Prop keys must match what compileShaderGraph reads in tslGraph.js
+    // (NODE_TYPES.principledBsdf.inputs). The PBR builder used to write
+    // `color` here and `color` as the edge targetHandle, which was correct
+    // for the legacy shaderGraph.js runtime; the live runtime reads from
+    // tslGraph.js, which uses the same `color` / `specularColor` / `opacity`
+    // / `emissive` / `thickness` keys the panel shows in its BSDF node UI,
+    // so we keep that mapping here.
     props: {
       color: factors.color ?? "#ffffff",
       roughness: factors.roughness ?? 1,
@@ -70,6 +77,7 @@ export function buildPbrGraph(maps, { armHasAo = true, factors = {} } = {}) {
   let diffuseId = null;
   if (maps.diffuse) {
     diffuseId = texNode("diffuse", maps.diffuse);
+    // Edge handle must match the principledBsdf input name in tslGraph.js.
     factoredWire("color", diffuseId, "out", "color", factors.color, "#ffffff", "color");
     if (factors.useDiffuseAlpha) {
       factoredWire("opacity", diffuseId, "a", "opacity", factors.opacity ?? 1);

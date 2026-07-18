@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { Box, Circle, Eye, Layers, Magnet, Move, Rotate3d, Scale3d, Scissors, Square, Triangle, Undo2, X } from "lucide-react";
+import { Box, Circle, Crosshair, Eye, Layers, Magnet, Move, Rotate3d, Scale3d, Scissors, Square, Triangle, Undo2, X } from "lucide-react";
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { engine } from "../engineInstance.js";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { invalidateBlobUrl } from "../assetLoader.js";
-import { ensureGeometryAsset } from "../geometryEditing.js";
+import { ensureGeometryAsset, saveNewGeometryAsset } from "../geometryEditing.js";
+import { CreateEntityCommand } from "../commands/entityCommands.js";
+import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
+import { AxisViewGizmo } from "../helpers/AxisViewGizmo.jsx";
 import {
   bufferGeometryFromEditable,
   beginExtrudeFaces,
@@ -16,16 +19,25 @@ import {
   cutMeshByEdgeRing,
   deleteFaces,
   editableFromBufferGeometry,
+  editableFromFaces,
   expandLogicalVertices,
   geometryAssetFromEditable,
   insetFaces,
   mergeVerticesAtCenter,
   mirrorVertices,
   subdivideFaces,
+  updateExtrudeUVs,
   MAX_SUBDIVISION_CUTS,
   unwrapBox,
   unwrapPlanar,
 } from "../editableGeometry.js";
+import {
+  attachCursor,
+  detachCursor,
+  refreshCursor3D,
+  setCursor3DPosition,
+  getCursor3D,
+} from "../threeDCursor.js";
 
 const MODES = ["vertex", "edge", "face"];
 const MODE_LABELS = { vertex: "Vertex", edge: "Edge", face: "Face" };
@@ -136,11 +148,16 @@ function applyTopology(session, before, result = {}) {
       const key = edgeKey(editable, a, b);
       const isHidden = result.hidden ? result.hidden.has(key)
         : before.edges.has(key) ? before.hidden.has(key)
-          : !result.visible?.has(key) && coplanar.has(key);
+          : !result.visible?.has(key) && !result.visiblePairs?.has(indexEdgeKey(a, b)) && coplanar.has(key);
       if (isHidden) hidden.add(indexEdgeKey(a, b));
     }
   });
   session.hiddenEdges = hidden;
+  syncEditableTopology(session);
+}
+
+function syncEditableTopology(session) {
+  session.editable.hiddenEdges = [...session.hiddenEdges].map((key) => key.split("|").map(Number));
 }
 
 function logicalEdgeLoop(session, seedKey) {
@@ -183,13 +200,21 @@ function setVertexMarkers(markers, points, session, pixelRadius) {
   const scale = new THREE.Vector3();
   const rotation = new THREE.Quaternion();
   const viewportHeight = Math.max(session.canvas.clientHeight, 1);
-  const perspectiveScale = 2 * Math.tan(THREE.MathUtils.degToRad(session.camera.fov * 0.5)) / viewportHeight;
+  const pixelScale = session.camera.isOrthographicCamera
+    ? (session.camera.top - session.camera.bottom) / Math.max(session.camera.zoom, 1e-6) / viewportHeight
+    : null;
+  const perspectiveScale = session.camera.isPerspectiveCamera
+    ? 2 * Math.tan(THREE.MathUtils.degToRad(session.camera.fov * 0.5)) / viewportHeight
+    : 0;
   markers.userData.markerPoints = points;
   markers.userData.pixelRadius = pixelRadius;
   markers.count = Math.min(points.length, markers.instanceMatrix.count);
   for (let index = 0; index < markers.count; index++) {
     const point = new THREE.Vector3(...points[index]);
-    const size = Math.max(session.camera.position.distanceTo(point) * perspectiveScale * pixelRadius, 0.00001);
+    const size = Math.max(
+      (pixelScale ?? session.camera.position.distanceTo(point) * perspectiveScale) * pixelRadius,
+      0.00001,
+    );
     scale.setScalar(size);
     matrix.compose(point, rotation, scale);
     markers.setMatrixAt(index, matrix);
@@ -202,6 +227,151 @@ function refreshVertexMarkerScales(session) {
   [session.basePoints, session.vertexOverlay].forEach((markers) => {
     setVertexMarkers(markers, markers.userData.markerPoints ?? [], session, markers.userData.pixelRadius ?? VERTEX_PIXEL_RADIUS);
   });
+}
+
+/**
+ * Camera distance required so a sphere of `radius` fits comfortably inside the
+ * viewport along its narrowest axis. A 1.6× margin keeps the gizmo, axis view,
+ * and selection overlays from hugging the geometry against the canvas edge.
+ */
+function framingDistance(camera, radius) {
+  const fov = THREE.MathUtils.degToRad((camera.fov || 50) * 0.5);
+  return Math.max(radius / Math.max(Math.sin(fov), 0.05), 0.5) * 1.6;
+}
+
+function resizeGeometryCamera(camera, width, height, orthographicHeight = 10) {
+  const aspect = Math.max(width, 1) / Math.max(height, 1);
+  if (camera.isOrthographicCamera) {
+    const halfHeight = orthographicHeight * 0.5;
+    camera.left = -halfHeight * aspect;
+    camera.right = halfHeight * aspect;
+    camera.top = halfHeight;
+    camera.bottom = -halfHeight;
+  } else {
+    camera.aspect = aspect;
+  }
+  camera.updateProjectionMatrix();
+}
+
+/** Bounding sphere around the *current* editable mesh, in the editor's local
+ *  space. Recomputing each call lets focus track geometry that was extruded
+ *  or subdivided since the panel opened. */
+function editableBoundingSphere(session) {
+  const points = session.editable.positions.map((position) => new THREE.Vector3(...position));
+  if (!points.length) return new THREE.Sphere();
+  const box = new THREE.Box3().setFromPoints(points);
+  return box.getBoundingSphere(new THREE.Sphere());
+}
+
+/**
+ * Re-frames the orbit camera around the geometry's current bounding sphere.
+ * Used both for the initial "focus on the geometry first" pose and as the
+ * snapshot callback for axis snapping.
+ */
+function frameGeometry(session, { direction = null } = {}) {
+  const { camera, controls } = session;
+  const sphere = editableBoundingSphere(session);
+  // A zero-radius mesh (a single vertex, an empty cut) would otherwise leave
+  // the camera pinned on top of the geometry; fall back to a minimum radius.
+  const radius = Math.max(sphere.radius, 0.25);
+  if (!sphere.center) sphere.center = new THREE.Vector3();
+  controls.target.copy(sphere.center);
+  // Preserve current orbit direction when no explicit axis was requested;
+  // otherwise look from the requested cardinal direction.
+  const currentDirection = direction ?? camera.position.clone().sub(controls.target).normalize();
+  if (currentDirection.lengthSq() < 1e-6) currentDirection.set(0.6, 0.5, 0.7).normalize();
+  const distance = framingDistance(camera, radius);
+  camera.position.copy(sphere.center).addScaledVector(currentDirection, distance);
+  camera.near = Math.max(distance / 1000, 0.001);
+  camera.far = Math.max(distance * 200, 100);
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+/** Smoothly tweens the orbit camera to a cardinal-axis view of the geometry. */
+function animateToAxis(session, axis, sign) {
+  if (session.snapAnimation) cancelAnimationFrame(session.snapAnimation);
+  const { controls } = session;
+  const source = session.camera;
+  const sphere = editableBoundingSphere(session);
+  const radius = Math.max(sphere.radius, 0.25);
+  const target = sphere.center.clone();
+  const endDirection = new THREE.Vector3(
+    axis === "x" ? sign : 0,
+    axis === "y" ? sign : 0,
+    axis === "z" ? sign : 0,
+  );
+  if (endDirection.lengthSq() < 1e-6) endDirection.set(0, 1, 0);
+  endDirection.normalize();
+  const endDistance = framingDistance(session.perspectiveCamera, radius);
+  const startTarget = controls.target.clone();
+  const startDirection = source.position.clone().sub(startTarget);
+  const startDistance = startDirection.length() || endDistance;
+  startDirection.normalize();
+  const visibleHeight = source.isPerspectiveCamera
+    ? 2 * startDistance * Math.tan(THREE.MathUtils.degToRad(source.fov * 0.5)) / source.zoom
+    : session.orthographicHeight;
+  session.orthographicHeight = Math.max(visibleHeight, radius * 2.2, 0.01);
+  const camera = session.orthographicCamera ?? new THREE.OrthographicCamera(-1, 1, 1, -1, 0.001, 1000);
+  session.orthographicCamera = camera;
+  camera.position.copy(source.position);
+  camera.quaternion.copy(source.quaternion);
+  camera.up.copy(source.up);
+  camera.near = source.near;
+  camera.far = source.far;
+  resizeGeometryCamera(camera, session.canvas.clientWidth, session.canvas.clientHeight, session.orthographicHeight);
+  session.useCamera(camera);
+  const startQuaternion = camera.quaternion.clone();
+  const endUp = axis === "y"
+    ? new THREE.Vector3(0, 0, sign > 0 ? -1 : 1)
+    : new THREE.Vector3(0, 1, 0);
+  const endPosition = target.clone().addScaledVector(endDirection, endDistance);
+  const endQuaternion = new THREE.Quaternion().setFromRotationMatrix(
+    new THREE.Matrix4().lookAt(endPosition, target, endUp),
+  );
+  // Pick the shorter of the two great-circle arcs to the new direction so
+  // flipping from -X to +X doesn't whip through the back of the model.
+  if (startDirection.dot(endDirection) < -0.999) {
+    startDirection.set(endDirection.z, endDirection.x, -endDirection.y);
+  }
+  const duration = 220;
+  const startTime = performance.now();
+  const tick = (now) => {
+    const t = THREE.MathUtils.clamp((now - startTime) / duration, 0, 1);
+    // Ease-out cubic — fast then settle, matches the main viewport's axis snap.
+    const eased = 1 - Math.pow(1 - t, 3);
+    const direction = startDirection.clone().lerp(endDirection, eased).normalize();
+    const distance = THREE.MathUtils.lerp(startDistance, endDistance, eased);
+    controls.target.copy(startTarget).lerp(target, eased);
+    camera.position.copy(controls.target).addScaledVector(direction, distance);
+    camera.quaternion.slerpQuaternions(startQuaternion, endQuaternion, eased);
+    controls.dispatchEvent({ type: "change" });
+    if (t < 1) {
+      session.snapAnimation = requestAnimationFrame(tick);
+    } else {
+      camera.position.copy(endPosition);
+      camera.quaternion.copy(endQuaternion);
+      camera.up.copy(endUp);
+      session.snapAnimation = 0;
+      session.orbitStartQuaternion = camera.quaternion.clone();
+      session.useCamera(camera);
+    }
+  };
+  session.snapAnimation = requestAnimationFrame(tick);
+}
+
+function usePerspectiveGeometryView(session) {
+  const source = session.camera;
+  const camera = session.perspectiveCamera;
+  if (!source?.isOrthographicCamera || !camera) return;
+  camera.position.copy(source.position);
+  camera.quaternion.copy(source.quaternion);
+  camera.up.set(0, 1, 0);
+  camera.near = source.near;
+  camera.far = source.far;
+  resizeGeometryCamera(camera, session.canvas.clientWidth, session.canvas.clientHeight);
+  session.useCamera(camera);
+  session.controls.update();
 }
 
 /** Rebuilds the wireframe line list and caches its edge order for recolouring. */
@@ -626,6 +796,138 @@ function selectedVertexIndices(session, mode = session.mode) {
   return expandLogicalVertices(editable, [...indices]);
 }
 
+function transformPivot(session, indices, mode = session.pivotMode) {
+  if (mode === "origin") return new THREE.Vector3();
+  const unique = new Map(indices.map((index) => [
+    positionKey(session.editable.positions[index]),
+    new THREE.Vector3(...session.editable.positions[index]),
+  ]));
+  const points = [...unique.values()];
+  if (!points.length) return new THREE.Vector3();
+  if (mode === "bounds") return new THREE.Box3().setFromPoints(points).getCenter(new THREE.Vector3());
+  return points.reduce((sum, point) => sum.add(point), new THREE.Vector3()).multiplyScalar(1 / points.length);
+}
+
+function individualTransformPivots(session, indices, fallback) {
+  if (session.pivotMode !== "individual") return null;
+  const accumulators = new Map();
+  const add = (vertex, center) => {
+    const key = positionKey(session.editable.positions[vertex]);
+    const entry = accumulators.get(key) ?? { sum: new THREE.Vector3(), count: 0 };
+    entry.sum.add(center);
+    entry.count++;
+    accumulators.set(key, entry);
+  };
+  if (session.mode === "face") {
+    const visited = new Set();
+    session.selections.face.forEach((faceIndex) => {
+      const group = logicalFaceGroup(session, faceIndex);
+      const groupKey = group.slice().sort((a, b) => a - b).join("|");
+      if (visited.has(groupKey)) return;
+      visited.add(groupKey);
+      const vertices = [...new Set(group.flatMap((index) => session.editable.faces[index] ?? []))];
+      const points = new Map(vertices.map((index) => [positionKey(session.editable.positions[index]), index]));
+      const center = [...points.values()].reduce(
+        (sum, index) => sum.add(new THREE.Vector3(...session.editable.positions[index])),
+        new THREE.Vector3(),
+      ).multiplyScalar(1 / Math.max(points.size, 1));
+      vertices.forEach((index) => add(index, center));
+    });
+  } else if (session.mode === "edge") {
+    session.selections.edge.forEach((key) => {
+      const edge = sessionEdges(session).get(key);
+      if (!edge) return;
+      const center = new THREE.Vector3(...session.editable.positions[edge.a])
+        .add(new THREE.Vector3(...session.editable.positions[edge.b])).multiplyScalar(0.5);
+      add(edge.a, center);
+      add(edge.b, center);
+    });
+  }
+  const pivots = new Map();
+  indices.forEach((index) => {
+    const key = positionKey(session.editable.positions[index]);
+    const entry = accumulators.get(key);
+    pivots.set(index, session.mode === "vertex"
+      ? new THREE.Vector3(...session.editable.positions[index])
+      : entry ? entry.sum.clone().multiplyScalar(1 / entry.count) : fallback.clone());
+  });
+  return pivots;
+}
+
+function proportionalTopologyDistances(session, selectedIndices) {
+  const adjacency = new Map();
+  const connect = (a, b, distance) => {
+    if (!adjacency.has(a)) adjacency.set(a, []);
+    if (!adjacency.has(b)) adjacency.set(b, []);
+    adjacency.get(a).push([b, distance]);
+    adjacency.get(b).push([a, distance]);
+  };
+  visibleLogicalEdges(session).forEach((edge) => {
+    const a = positionKey(session.editable.positions[edge.a]);
+    const b = positionKey(session.editable.positions[edge.b]);
+    const distance = new THREE.Vector3(...session.editable.positions[edge.a])
+      .distanceTo(new THREE.Vector3(...session.editable.positions[edge.b]));
+    connect(a, b, distance);
+  });
+  const distances = new Map();
+  const queue = [];
+  new Set(selectedIndices.map((index) => positionKey(session.editable.positions[index]))).forEach((key) => {
+    distances.set(key, 0);
+    queue.push([0, key]);
+  });
+  // Binary min-heap keeps connected proportional editing usable on imported
+  // meshes where a quadratic shortest-path walk would stall interaction.
+  const push = (entry) => {
+    queue.push(entry);
+    for (let index = queue.length - 1; index > 0;) {
+      const parent = Math.floor((index - 1) / 2);
+      if (queue[parent][0] <= queue[index][0]) break;
+      [queue[parent], queue[index]] = [queue[index], queue[parent]];
+      index = parent;
+    }
+  };
+  const pop = () => {
+    const first = queue[0];
+    const last = queue.pop();
+    if (queue.length && last) {
+      queue[0] = last;
+      for (let index = 0;;) {
+        const left = index * 2 + 1;
+        const right = left + 1;
+        let smallest = index;
+        if (left < queue.length && queue[left][0] < queue[smallest][0]) smallest = left;
+        if (right < queue.length && queue[right][0] < queue[smallest][0]) smallest = right;
+        if (smallest === index) break;
+        [queue[index], queue[smallest]] = [queue[smallest], queue[index]];
+        index = smallest;
+      }
+    }
+    return first;
+  };
+  while (queue.length) {
+    const [distance, key] = pop();
+    if (distance !== distances.get(key)) continue;
+    for (const [next, cost] of adjacency.get(key) ?? []) {
+      const nextDistance = distance + cost;
+      if (nextDistance >= (distances.get(next) ?? Infinity)) continue;
+      distances.set(next, nextDistance);
+      push([nextDistance, next]);
+    }
+  }
+  return distances;
+}
+
+function proportionalFalloff(normalized, falloff) {
+  const t = THREE.MathUtils.clamp(normalized, 0, 1);
+  if (t >= 1) return 0;
+  if (falloff === "constant") return 1;
+  if (falloff === "linear") return 1 - t;
+  if (falloff === "sharp") return (1 - t) ** 2;
+  if (falloff === "root") return Math.sqrt(1 - t);
+  if (falloff === "sphere") return Math.sqrt(Math.max(0, 1 - t * t));
+  return 0.5 + 0.5 * Math.cos(Math.PI * t);
+}
+
 function syncTransformedSelection(session, macro) {
   if (session.mode === "vertex") {
     session.selections.vertex = new Set(macro.indices.map((index) => positionKey(session.editable.positions[index])));
@@ -711,30 +1013,35 @@ function applyTransformMacro(session) {
     const point = (macro.proportional ? new THREE.Vector3(...macro.allPositions[index]) : positions[i]).clone();
     let weight = 1;
     if (macro.proportional && !selectedKeys.has(positionKey(macro.allPositions[index]))) {
-      const distance = Math.min(...indices.map((selectedIndex) => point.distanceTo(new THREE.Vector3(...macro.allPositions[selectedIndex]))));
+      const distance = macro.connected
+        ? (macro.topologyDistances.get(positionKey(macro.allPositions[index])) ?? Infinity)
+        : Math.min(...indices.map((selectedIndex) => point.distanceTo(new THREE.Vector3(...macro.allPositions[selectedIndex]))));
       const normalized = THREE.MathUtils.clamp(distance / Math.max(macro.radius, 0.0001), 0, 1);
-      weight = normalized >= 1 ? 0 : 0.5 + 0.5 * Math.cos(Math.PI * normalized);
+      weight = proportionalFalloff(normalized, macro.falloff);
     }
+    const elementPivot = macro.individualPivots?.get(index) ?? pivot;
     if (kind === "translate") point.add(translation);
     if (kind === "extrude") point.add(translation);
-    if (kind === "rotate") point.sub(pivot).applyQuaternion(quaternion).add(pivot);
+    if (kind === "rotate") point.sub(elementPivot).applyQuaternion(quaternion).add(elementPivot);
     if (kind === "scale") {
-      point.sub(pivot);
+      point.sub(elementPivot);
       const weightedFactor = THREE.MathUtils.lerp(1, factor, weight);
       if (axis) {
         if (axis === "x") point.x *= weightedFactor;
         if (axis === "y") point.y *= weightedFactor;
         if (axis === "z") point.z *= weightedFactor;
       } else point.multiplyScalar(weightedFactor);
-      point.add(pivot);
+      point.add(elementPivot);
     }
     if (weight !== 1 && (kind === "translate" || kind === "extrude")) point.sub(translation).addScaledVector(translation, weight);
     if (weight !== 1 && kind === "rotate") {
       const weightedQuaternion = new THREE.Quaternion().setFromAxisAngle(rotationAxis, angle * weight);
-      point.copy((macro.proportional ? new THREE.Vector3(...macro.allPositions[index]) : positions[i])).sub(pivot).applyQuaternion(weightedQuaternion).add(pivot);
+      point.copy((macro.proportional ? new THREE.Vector3(...macro.allPositions[index]) : positions[i]))
+        .sub(elementPivot).applyQuaternion(weightedQuaternion).add(elementPivot);
     }
     session.editable.positions[index] = point.toArray();
   });
+  if (kind === "extrude") updateExtrudeUVs(session.editable, macro);
   syncTransformedSelection(session, macro);
   session.preview();
 }
@@ -761,11 +1068,15 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   const [macroState, setMacroState] = useState(null);
   const [showSceneContext, setShowSceneContext] = useState(embedded);
   const [proportional, setProportional] = useState(false);
+  const [proportionalConnected, setProportionalConnected] = useState(true);
+  const [proportionalFalloffMode, setProportionalFalloffMode] = useState("smooth");
+  const [pivotMode, setPivotMode] = useState("median");
   const [xray, setXray] = useState(false);
   const [selectionTool, setSelectionTool] = useState(null);
   const [selectionGesture, setSelectionGesture] = useState(null);
   const [faceMaterial, setFaceMaterial] = useState(0);
   const [cuts, setCuts] = useState(1);
+  const [snapView, setSnapView] = useState(null);
   const entity = entityId ? engine.getEntity(entityId) : null;
   const component = entity?.getComponent("mesh");
 
@@ -817,6 +1128,29 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     session.xray = !session.xray;
     applyXray(session);
     setXray(session.xray);
+  };
+
+  const handleAxisSnap = (axis, sign) => {
+    const session = sessionRef.current;
+    if (!session) return;
+    // Toggle the snap: clicking the currently active axis returns to the
+    // free orbit so the user can always escape the snap without hunting for
+    // a separate "reset" control.
+    const view = `${sign > 0 ? "+" : "-"}${axis.toUpperCase()}`;
+    if (snapView === view) {
+      usePerspectiveGeometryView(session);
+      setSnapView(null);
+      return;
+    }
+    animateToAxis(session, axis, sign);
+    setSnapView(view);
+  };
+
+  const focusGeometry = () => {
+    const session = sessionRef.current;
+    if (!session) return;
+    frameGeometry(session);
+    setSnapView(null);
   };
 
   const armSelectionTool = (kind) => {
@@ -875,6 +1209,118 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     autosaveGeometry(session);
   };
 
+  /**
+   * Blender-style "Selection to 3D Cursor" inside Edit Mode. Translates
+   * every selected vertex so that the selection's local-space centroid
+   * (or all-vertex union centroid) lands on the entity-local cursor
+   * position. The entity-local cursor is computed by inverting the
+   * entity's world matrix onto the global cursor — this matches the
+   * proxy the cursor module renders in this scene, so the visual and
+   * the math agree.
+   */
+  const snapVerticesToCursor = (geometryEditorSession) => {
+    const indices = selectedVertexIndices(geometryEditorSession);
+    if (!indices.length) return false;
+    const entity = engine.getEntity(entityId);
+    if (!entity?.object3D) return false;
+    entity.object3D.updateWorldMatrix(true, false);
+    const inverse = entity.object3D.matrixWorld.clone().invert();
+    const localTarget = new THREE.Vector3().fromArray(getCursor3D().position).applyMatrix4(inverse);
+    mutate((session) => {
+      const delta = new THREE.Vector3().copy(localTarget);
+      // Compute centroid of the indices so the entire selection lands
+      // on the cursor (matches Blender's "Selection to Cursor" — the
+      // centre of the selection lands on the cursor, not each vertex).
+      const points = indices.map((i) => new THREE.Vector3(...session.editable.positions[i]));
+      const centroid = points.reduce((sum, p) => sum.add(p), new THREE.Vector3()).multiplyScalar(1 / points.length);
+      delta.sub(centroid);
+      indices.forEach((index) => {
+        const p = session.editable.positions[index];
+        p[0] += delta.x;
+        p[1] += delta.y;
+        p[2] += delta.z;
+      });
+      session.editable.hiddenEdges = [...session.hiddenEdges].map((key) => key.split("|").map(Number));
+    });
+    return true;
+  };
+
+  /**
+   * "3D Cursor → Selected" inside Edit Mode. The cursor (local) jumps to
+   * the centroid of the current selection, both for the visual proxy and
+   * for any future "snap to cursor" operation the user queues.
+   */
+  const snapCursorToSelectedVertices = () => {
+    const session = sessionRef.current;
+    if (!session) return false;
+    const indices = selectedVertexIndices(session);
+    if (!indices.length) return false;
+    const points = indices.map((i) => new THREE.Vector3(...session.editable.positions[i]));
+    const centroid = points.reduce((sum, p) => sum.add(p), new THREE.Vector3()).multiplyScalar(1 / points.length);
+    const entity = engine.getEntity(entityId);
+    if (!entity?.object3D) return false;
+    entity.object3D.updateWorldMatrix(true, false);
+    const worldCentroid = centroid.clone().applyMatrix4(entity.object3D.matrixWorld);
+    setCursor3DPosition(worldCentroid);
+    return true;
+  };
+
+  /**
+   * "Origin to 3D Cursor" inside Edit Mode — Blender's "Geometry to Origin"
+   * in reverse. Re-positions the entity in world space so the entity's
+   * origin lands at the 3D cursor; the editable geometry stays untouched
+   * (it's defined in local space, so the entity's transform absorbs the
+   * shift). This produces the same world-space result as moving every
+   * vertex, with a cheaper command (one transform change vs. N vertex
+   * edits).
+   */
+  const moveEntityOriginToCursor = async () => {
+    const entity = engine.getEntity(entityId);
+    if (!entity) return false;
+    const cursor = getCursor3D().position;
+    const next = {
+      ...entity.getTransform(),
+      position: [cursor[0], cursor[1], cursor[2]],
+    };
+    const [{ SetTransformCommand }, { commandBus }] = await Promise.all([
+      import("../commands/transformCommands.js"),
+      import("../commands/CommandBus.js"),
+    ]);
+    commandBus.execute(new SetTransformCommand(entity.id, next));
+    return true;
+  };
+
+  /**
+   * Add a single vertex at the (local-space) 3D cursor and select it. The
+   * user wires it up later as part of a face by switching into Edge or
+   * Face mode — the geometry editor doesn't auto-create faces from a
+   * stray vertex, matching Blender's own behaviour for "Add Vertex".
+   */
+  const addVertexAtCursor = () => {
+    const session = sessionRef.current;
+    if (!session) return false;
+    const entity = engine.getEntity(entityId);
+    if (!entity?.object3D) return false;
+    entity.object3D.updateWorldMatrix(true, false);
+    const inverse = entity.object3D.matrixWorld.clone().invert();
+    const localTarget = new THREE.Vector3().fromArray(getCursor3D().position).applyMatrix4(inverse);
+    mutate(() => {
+      const { editable } = session;
+      const newIndex = editable.positions.length;
+      editable.positions.push([localTarget.x, localTarget.y, localTarget.z]);
+      // Keep `uvs` length-aligned with `positions` so subsequent edits
+      // don't trip the (uvs.length === positions.length) invariants used
+      // by bufferGeometryFromEditable and friends. A zero-length UV is a
+      // safe default — UV unwrap repopulates it later.
+      while (editable.uvs.length < newIndex + 1) editable.uvs.push([0, 0]);
+      const key = positionKey(editable.positions[newIndex]);
+      session.selections.vertex.add(key);
+      session.selections.edge.clear();
+      session.selections.face.clear();
+    });
+    return true;
+  };
+
   const undo = () => {
     const session = sessionRef.current;
     const previous = session?.history.pop();
@@ -893,7 +1339,11 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     const beforeSelections = cloneSelections(session.selections);
     const beforeHidden = new Set(session.hiddenEdges);
     const beforeTopology = topologySnapshot(session);
-    const result = beginExtrudeFaces(session.editable, [...session.selections.face]);
+    const result = beginExtrudeFaces(
+      session.editable,
+      [...session.selections.face],
+      session.hiddenEdges,
+    );
     if (!result.vertexIndices.length) return;
     session.selections.face = new Set(result.faceIndices);
     const pointer = session.lastPointer ?? { x: 0, y: 0 };
@@ -904,13 +1354,14 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       allPositions: session.editable.positions.map((value) => [...value]), proportional: false, radius: 1,
       pivot,
       normal: result.normal, edges: [], before, beforeSelections,
+      walls: result.walls, visiblePairs: result.visiblePairs,
       beforeHidden, beforeTopology, beforeMode: session.mode,
       start: { ...pointer }, current: { ...pointer },
     };
     session.controls.enabled = false;
     // The extruded walls are degenerate until the drag moves them, so their
     // hidden flags are re-derived on every preview frame, not just here.
-    applyTopology(session, beforeTopology);
+    applyTopology(session, beforeTopology, { visiblePairs: result.visiblePairs });
     session.rebuild();
     setMacroState({ kind: "extrude", axis: null, buffer: "" });
   };
@@ -955,9 +1406,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     if (!session || !indices.length || session.macro) return;
     const pointer = session.lastPointer ?? { x: 0, y: 0 };
     const positions = indices.map((index) => new THREE.Vector3(...session.editable.positions[index]));
-    const uniquePivotPoints = new Map(positions.map((point) => [positionKey(point.toArray()), point]));
-    const pivot = [...uniquePivotPoints.values()].reduce((sum, point) => sum.add(point), new THREE.Vector3())
-      .multiplyScalar(1 / uniquePivotPoints.size);
+    const pivot = transformPivot(session, indices);
     const edges = options.edges ?? (session.mode === "edge"
       ? [...session.selections.edge].map((key) => {
           const edge = sessionEdges(session).get(key);
@@ -970,6 +1419,10 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     session.macro = {
       kind, axis: null, buffer: "", indices, positions, allPositions, pivot, edges,
       proportional: session.proportional, radius,
+      connected: session.proportionalConnected,
+      falloff: session.proportionalFalloff,
+      topologyDistances: proportionalTopologyDistances(session, indices),
+      individualPivots: individualTransformPivots(session, indices, pivot),
       before: options.before ?? cloneEditable(session.editable),
       beforeSelections: options.beforeSelections ?? cloneSelections(session.selections),
       beforeHidden: options.beforeHidden ?? new Set(session.hiddenEdges),
@@ -977,7 +1430,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       start: { ...pointer }, current: { ...pointer },
     };
     session.controls.enabled = false;
-    setMacroState({ kind, axis: null, buffer: "", proportional: session.proportional, radius });
+    setMacroState({ kind, axis: null, buffer: "", proportional: session.proportional, radius, connected: session.proportionalConnected, falloff: session.proportionalFalloff });
   };
 
   const duplicateGeometrySelection = () => {
@@ -1318,6 +1771,17 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       mergeSelection();
       return;
     }
+    // Shift+S in Edit Mode → 3D-cursor snap menu (selection → cursor
+    // and cursor → selection, but applied to the editable mesh rather
+    // than world-space entities). Falls through to the global snap menu
+    // when the editor isn't focused so plain Shift+S still reaches the
+    // viewport handlers, but inside the editor we use the local-space
+    // variants instead.
+    if (!sessionRef.current?.macro && event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      setStatus("Shift+S: use the Cursor menu in the toolbar.");
+      return;
+    }
     const activeMacro = sessionRef.current?.macro;
     if (activeMacro) {
       const key = event.key.toLowerCase();
@@ -1367,6 +1831,21 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     if (event.key.toLowerCase() === "a") { event.preventDefault(); event.altKey ? clearSelection() : selectAll(); return; }
     if (event.key.toLowerCase() === "o") { event.preventDefault(); toggleProportional(); return; }
     if (event.altKey && event.key.toLowerCase() === "z") { event.preventDefault(); toggleXray(); return; }
+    if (event.key.toLowerCase() === "f" && !event.ctrlKey && !event.metaKey && !event.altKey) { event.preventDefault(); focusGeometry(); return; }
+    // Numpad axis views. The number keys (1/2/3) already select modes, so
+    // Numpad1/3/7 give a non-conflicting bind. Clicking the same axis again
+    // exits the snap back to free orbit.
+    if (!event.ctrlKey && !event.metaKey && !event.altKey && (event.code === "Numpad1" || event.code === "Numpad3" || event.code === "Numpad7" || event.code === "Numpad4" || event.code === "Numpad6" || event.code === "Numpad9")) {
+      event.preventDefault();
+      const map = {
+        Numpad1: ["z", 1], Numpad9: ["z", -1],
+        Numpad3: ["x", 1], Numpad7: ["x", -1],
+        Numpad6: ["y", 1], Numpad4: ["y", -1],
+      };
+      const [axis, sign] = map[event.code];
+      handleAxisSnap(axis, sign);
+      return;
+    }
     if (event.key === "Tab" && embedded && onClose) { event.preventDefault(); onClose(); return; }
     if (event.key.toLowerCase() === "e" && mode === "face") { event.preventDefault(); startExtrude(); return; }
     if (event.key.toLowerCase() === "u") { event.preventDefault(); mutate((session) => unwrapBox(session.editable)); }
@@ -1403,7 +1882,8 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     host.replaceChildren(canvas);
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x282828);
-    const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 1000);
+    let camera = new THREE.PerspectiveCamera(50, 1, 0.01, 1000);
+    const perspectiveCamera = camera;
     const controls = new OrbitControls(camera, canvas);
     controls.enableDamping = true;
     // Match the main editor viewport. Geometry editing changes the mesh
@@ -1441,6 +1921,21 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       context.add(clone);
     });
 
+    // 3D cursor (world → entity-local). The cursor's *world* position is
+    // managed by the editor's primary proxy; here we mirror it into the
+    // detached scene so the user sees the cursor inside Edit Mode too.
+    // The mapping uses the entity's inverse world matrix so that working
+    // on a parented mesh still places the cursor relative to the mesh's
+    // own origin, matching Blender's behaviour in object-mode previews.
+    const localCursorTarget = new THREE.Vector3();
+    attachCursor(scene, {
+      localTransform: () => {
+        entity.object3D.updateWorldMatrix(true, false);
+        localCursorTarget.fromArray(getCursor3D().position).applyMatrix4(entity.object3D.matrixWorld.clone().invert());
+        return localCursorTarget;
+      },
+    });
+
     const original = editableFromBufferGeometry(component.mesh.geometry);
     const editable = cloneEditable(original);
     // Blender's Edit Mode uses a neutral solid viewport independent of the
@@ -1470,11 +1965,27 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
 
     const session = {
       editable, original, mesh, wire, basePoints, faceOverlay, edgeOverlay, vertexOverlay, context,
-      camera, controls, canvas, hiddenEdges: new Set(), mode: "face",
+      camera, perspectiveCamera, orthographicCamera: null, orthographicHeight: 10,
+      controls, canvas, hiddenEdges: new Set(), mode: "face",
       selections: { vertex: new Set(), edge: new Set(), face: new Set() },
       wireEdges: [], history: [], macro: null,
       proportional: false, xray: false,
       selectionTool: null, selectionGesture: null, circleRadius: 32,
+    };
+    session.useCamera = (nextCamera) => {
+      camera = nextCamera;
+      session.camera = nextCamera;
+      controls.object = nextCamera;
+      controls._quat.identity();
+      controls._quatInverse.copy(controls._quat).invert();
+      controls._sphericalDelta.set(0, 0, 0);
+      controls._panOffset.set(0, 0, 0);
+      controls._scale = 1;
+      controls.position0.copy(nextCamera.position);
+      controls.zoom0 = nextCamera.zoom;
+      controls.target0.copy(controls.target);
+      refreshVertexMarkerScales(session);
+      setRevision((value) => value + 1);
     };
     applyTopology(session, { edges: new Set(), hidden: new Set() });
     session.preview = () => {
@@ -1487,7 +1998,11 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       // Extrusion walls start degenerate and only take shape as the drag runs, so
       // their hidden flags follow the geometry. Plain moves must not re-derive:
       // that is what used to make a bent quad show its diagonal.
-      if (session.macro?.kind === "extrude") applyTopology(session, session.macro.beforeTopology);
+      if (session.macro?.kind === "extrude") {
+        applyTopology(session, session.macro.beforeTopology, {
+          visiblePairs: session.macro.visiblePairs,
+        });
+      }
       updateTopologyCache(session);
       refreshWire(session);
       refreshOverlays(session);
@@ -1506,19 +2021,43 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     applyXray(session);
     session.rebuild();
 
-    const sphere = new THREE.Box3().setFromObject(mesh).getBoundingSphere(new THREE.Sphere());
+    const sphere = editableBoundingSphere(session);
     if (initialView) {
-      controls.target.fromArray(initialView.target);
-      camera.position.fromArray(initialView.position);
-    } else {
+      // Embedded Edit-in-Scene: preserve the editor's orbit *direction* but
+      // snap the target onto the geometry's center and pull the camera back
+      // to a comfortable framing distance. Otherwise the local-space camera
+      // pose (a) might sit inside the geometry or (b) hug the corner the
+      // editor was looking at before — both feel disorienting.
+      const preservedDirection = new THREE.Vector3(...initialView.position).sub(new THREE.Vector3(...initialView.target));
       controls.target.copy(sphere.center);
-      camera.position.copy(sphere.center).add(new THREE.Vector3(1.4, 1.1, 1.7).multiplyScalar(Math.max(sphere.radius, 0.75)));
+      const radius = Math.max(sphere.radius, 0.25);
+      if (preservedDirection.lengthSq() < 1e-6) preservedDirection.set(0.6, 0.5, 0.7);
+      const distance = framingDistance(camera, radius);
+      camera.position.copy(sphere.center).addScaledVector(preservedDirection.normalize(), distance);
+    } else {
+      frameGeometry(session);
     }
     camera.near = Math.max(sphere.radius / 100, 0.001);
     camera.far = Math.max(sphere.radius * 100, 100);
     camera.updateProjectionMatrix();
     refreshVertexMarkerScales(session);
-    const onControlsChange = () => refreshVertexMarkerScales(session);
+    const onControlsStart = () => {
+      session.orbitStartQuaternion = session.camera.quaternion.clone();
+    };
+    const onControlsChange = () => {
+      if (
+        session.camera.isOrthographicCamera &&
+        !session.snapAnimation &&
+        session.orbitStartQuaternion &&
+        Math.abs(session.camera.quaternion.dot(session.orbitStartQuaternion)) < 0.999999
+      ) {
+        session.orbitStartQuaternion = null;
+        usePerspectiveGeometryView(session);
+        setSnapView(null);
+      }
+      refreshVertexMarkerScales(session);
+    };
+    controls.addEventListener("start", onControlsStart);
     controls.addEventListener("change", onControlsChange);
 
     const raycaster = new THREE.Raycaster();
@@ -1677,9 +2216,11 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         applyTransformMacro(session);
         setMacroState({ kind: "bevel", axis: null, buffer: session.macro.buffer, amount: session.macro.amount, segments: session.macro.segments });
       } else if (session.macro.proportional) {
-        session.macro.radius = THREE.MathUtils.clamp(session.macro.radius * Math.pow(1.08, -event.deltaY / 100), 0.001, 100000);
+        // Blender's wheel direction: scroll up tightens the influence circle,
+        // scroll down expands it.
+        session.macro.radius = THREE.MathUtils.clamp(session.macro.radius * Math.pow(1.08, event.deltaY / 100), 0.001, 100000);
         applyTransformMacro(session);
-        setMacroState({ kind: session.macro.kind, axis: session.macro.axis, buffer: session.macro.buffer, proportional: true, radius: session.macro.radius });
+        setMacroState({ kind: session.macro.kind, axis: session.macro.axis, buffer: session.macro.buffer, proportional: true, radius: session.macro.radius, connected: session.macro.connected, falloff: session.macro.falloff });
       } else return;
       event.preventDefault();
       event.stopPropagation();
@@ -1707,8 +2248,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         const { width, height } = host.getBoundingClientRect();
         if (!width || !height) return;
         renderer.setSize(width, height, false);
-        camera.aspect = width / height;
-        camera.updateProjectionMatrix();
+        resizeGeometryCamera(camera, width, height, session.orthographicHeight);
       };
       resizeObserver = new ResizeObserver(resize);
       resizeObserver.observe(host);
@@ -1718,6 +2258,12 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         const rect = host.getBoundingClientRect();
         if (canvas.isConnected && rect.width >= 1 && rect.height >= 1) {
           controls.update();
+          // Mirror the world 3D cursor into the local scene so the user
+          // sees it in Edit Mode too. Without this the cursor only
+          // refreshes when the user manipulates it from the main
+          // viewport, which is jarring when the cursor lives in world
+          // space but the editor view is local.
+          refreshCursor3D();
           renderer.render(scene, camera);
         }
         frame = requestAnimationFrame(render);
@@ -1729,6 +2275,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       disposed = true;
       cancelAnimationFrame(frame);
       cancelAnimationFrame(session.macroFrame);
+      if (session.snapAnimation) cancelAnimationFrame(session.snapAnimation);
       resizeObserver?.disconnect();
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointerup", onPointerUp);
@@ -1738,6 +2285,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       window.removeEventListener("wheel", onWindowWheel, true);
       window.removeEventListener("contextmenu", onContextMenu, true);
       window.removeEventListener("blur", onBlur);
+      controls.removeEventListener("start", onControlsStart);
       controls.removeEventListener("change", onControlsChange);
       controls.dispose();
       scene.traverse((object) => {
@@ -1748,6 +2296,11 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         }
       });
       renderer?.dispose();
+      // Drop the local cursor proxy we added in attachCursor — without
+      // this the additionalProxies list accumulates a stale entry every
+      // time the user switches the entity being edited, and the detached
+      // proxy gets left behind in the disposed scene.
+      detachCursor();
       sessionRef.current = null;
     };
   }, [entityId, component]);
@@ -1787,6 +2340,20 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
             <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, () => startTransform("rotate"))}><Rotate3d size={13} /> Rotate <kbd>R</kbd></button>
             <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, () => startTransform("scale"))}><Scale3d size={13} /> Scale <kbd>S</kbd></button>
             <button className={proportional ? "active" : ""} onClick={(event) => runMenuAction(event, toggleProportional)}><Magnet size={13} /> Proportional <kbd>O</kbd></button>
+          </div>
+        </details>
+        <details className="geometry-toolbar-menu">
+          <summary>Cursor</summary>
+          <div className="geometry-toolbar-popover">
+            <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, () => snapVerticesToCursor(sessionRef.current))}><Crosshair size={13} /> Selection → 3D Cursor</button>
+            <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, snapCursorToSelectedVertices)}>3D Cursor → Selection</button>
+            <button onClick={(event) => runMenuAction(event, () => setCursor3DPosition(0, 0, 0))}>3D Cursor → Origin</button>
+            <button onClick={(event) => runMenuAction(event, moveEntityOriginToCursor)}>Origin → 3D Cursor</button>
+            {mode === "vertex" && (
+              <button onClick={(event) => runMenuAction(event, addVertexAtCursor)}>
+                <Crosshair size={13} /> Add Vertex at 3D Cursor
+              </button>
+            )}
           </div>
         </details>
         <details className="geometry-toolbar-menu">
@@ -1832,6 +2399,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
           <div className="geometry-toolbar-popover">
             <button className={xray ? "active" : ""} onClick={(event) => runMenuAction(event, toggleXray)}><Eye size={13} /> X-Ray <kbd>Alt+Z</kbd></button>
             <button className={showSceneContext ? "active" : ""} onClick={(event) => runMenuAction(event, () => setShowSceneContext((value) => !value))}><Layers size={13} /> Scene Context</button>
+            <button onClick={(event) => runMenuAction(event, focusGeometry)}>Focus Geometry</button>
           </div>
         </details>
         <button className="toolbar-btn icon-only" title="Undo (Ctrl+Z)" disabled={!session?.history.length} onClick={undo}><Undo2 size={14} /></button>
@@ -1839,7 +2407,16 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         <span className="geometry-editor-stat geometry-topology-count" key={revision} title={`${session?.editable.positions.length ?? 0} vertices / ${session?.editable.faces.length ?? 0} triangles`}>{session?.editable.positions.length ?? 0}v · {session?.editable.faces.length ?? 0}t</span>
         {embedded && <button className="toolbar-btn icon-only" title="Cancel scene edit" onClick={onClose}><X size={14} /></button>}
       </div>
-      <div className="geometry-editor-viewport" ref={hostRef} />
+      <div className="geometry-editor-viewport" ref={hostRef}>
+        {session && (
+          <AxisViewGizmo
+            camera={session.camera}
+            controls={session.controls}
+            activeView={snapView}
+            onSnap={handleAxisSnap}
+          />
+        )}
+      </div>
       {selectionGesture?.kind === "box" && (() => {
         const rect = rootRef.current?.getBoundingClientRect();
         if (!rect) return null;
@@ -1864,7 +2441,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
           <small>{macroState.kind === "loopcut" && macroState.locked ? "Slide · LMB confirm · Esc cancel" : macroState.kind === "loopcut" ? "Scroll cuts · LMB set · Esc cancel" : macroState.kind === "bevel" ? "Move width · Scroll segments · LMB confirm · Esc cancel" : "LMB / Enter confirm · Esc / RMB cancel"}</small>
         </div>
       )}
-      <div className="geometry-editor-shortcuts"><kbd>1/2/3</kbd> modes <kbd>Alt+Click</kbd> loop <kbd>Ctrl+Click</kbd> path <kbd>Shift+D</kbd> duplicate <kbd>Esc</kbd> cancel</div>
+      <div className="geometry-editor-shortcuts"><kbd>1/2/3</kbd> modes <kbd>F</kbd> focus <kbd>Numpad</kbd> axis view <kbd>Alt+Click</kbd> loop <kbd>Ctrl+Click</kbd> path <kbd>Shift+D</kbd> duplicate <kbd>Esc</kbd> cancel</div>
       {status && <div className="geometry-editor-status">{status}</div>}
     </div>
   );

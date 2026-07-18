@@ -53,6 +53,11 @@ function getDag(path, meshIndex, geometry) {
 // up in serialization/clone paths, and a record holds multi-megabyte buffers.
 const virtualized = new WeakMap();
 
+/** Read-only bridge for low-frequency consumers such as GI ray proxies. */
+export function getVirtualGeometryRecord(mesh) {
+  return virtualized.get(mesh) ?? null;
+}
+
 /** Non-interleaved Float32 view of an attribute (copies when it must). */
 function attrToFloat32(attr) {
   if (!attr) return null;
@@ -262,6 +267,7 @@ export class VirtualGeometrySystem {
     };
     virtualized.set(mesh, record);
     this.records.push(record);
+    this.engine.emit("virtual-geometry-ready", { mesh, path, dag });
   }
 
   /** Puts the original geometry back and drops per-record GPU state. */
@@ -291,6 +297,7 @@ export class VirtualGeometrySystem {
       const dead = this.records.filter((r) => normPath(r.path) === np);
       this.records = this.records.filter((r) => normPath(r.path) !== np);
       for (const r of dead) this.#restore(r);
+      this.engine.emit("virtual-geometry-changed", { path });
       console.info(`[virtual-geometry] ${path}: disabled, restored ${dead.length} mesh(es)`);
       return;
     }
@@ -311,6 +318,7 @@ export class VirtualGeometrySystem {
       const geometryPath = entity.getComponent?.("mesh")?.props?.geometryAsset;
       if (normPath(modelPath) === np || normPath(geometryPath) === np) this.applyEntity(entity);
     }
+    this.engine.emit("virtual-geometry-changed", { path });
     console.info(
       `[virtual-geometry] ${path}: enabled, pixelError=${vg.pixelError}, ` +
         `${matched}/${this.records.length} mesh(es) matched`,
