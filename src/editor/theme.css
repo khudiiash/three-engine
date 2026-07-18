@@ -1556,6 +1556,19 @@ body.macro-active .viewport-canvas {
   border-left: 1px solid rgba(255, 255, 255, 0.12);
 }
 
+/* When the cursor is the active selection the HUD adopts a blue tint
+   and a hairline accent ring to match the on-screen proxy's blue
+   disc — gives the user a single-glance "the gizmo is attached to the
+   cursor right now" cue. */
+.cursor-hud-selected {
+  border-color: rgba(108, 182, 255, 0.55);
+  box-shadow: 0 0 0 1px rgba(108, 182, 255, 0.35), 0 2px 10px rgba(0, 0, 0, 0.45);
+  background: linear-gradient(180deg, rgba(108, 182, 255, 0.14), rgba(108, 182, 255, 0.04));
+}
+.cursor-hud-selected .cursor-hud-hint {
+  color: #9ec5ff;
+}
+
 /* DOM frame that sits exactly over the WebGL canvas sub-region used for
    the camera preview (rendered by the viewport into a viewport+scissor
    rectangle of the editor canvas). The frame gives the preview a rounded

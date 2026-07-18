@@ -3,8 +3,10 @@ import { engine } from "./engineInstance.js";
 import { commandBus } from "./commands/CommandBus.js";
 import { BatchCommand, topMostIds } from "./commands/entityCommands.js";
 import { SetTransformCommand } from "./commands/transformCommands.js";
+import { SetCursor3DCommand } from "./commands/cursorCommands.js";
 import { useSelectionStore } from "./store/selectionStore.js";
 import {
+  getCursor3D,
   getCursor3DPosition,
   setCursor3DPosition,
 } from "./threeDCursor.js";
@@ -21,14 +23,18 @@ import {
  *     Same as above but with the cursor temporarily set to (0,0,0).
  *
  *   snapCursorToSelection()    "Shift+S → Cursor to Selected"
- *     Repositions the 3D cursor to the centroid of the current selection.
- *     Not undoable — it's editor state.
+ *     Repositions the 3D cursor to the selection's anchor. With one
+ *     entity selected this is the entity's world-space origin; with
+ *     multiple entities it's their world-space centroid (the same
+ *     notion Blender uses for "Cursor to Selected"). Routed through
+ *     SetCursor3DCommand so Ctrl+Z brings the cursor back.
  *
  *   snapCursorToWorldOrigin()  "Shift+S → Cursor to World Origin"
- *     Cursor → (0,0,0).
+ *     Cursor → (0,0,0). Routed through SetCursor3DCommand so it's
+ *     undoable like the other cursor moves.
  *
  *   snapCursorToGridFloor()    "Shift+S → Cursor to Grid"
- *     Drops the cursor onto the world XZ plane (y = 0).
+ *     Drops the cursor onto the world XZ plane (y = 0). Undoable.
  */
 
 export function snapSelectionToCursor() {
@@ -79,35 +85,52 @@ export function snapSelectionToOrigin() {
 }
 
 export function snapCursorToSelection() {
-  // Selection centroid; null falls back silently.
+  // Drop the cursor on the selection's anchor. With exactly one entity
+  // selected the anchor is that entity's world-space origin (matches
+  // Blender's "Cursor to Active"); with multiple selected entities we
+  // average their world-space origins (matches Blender's "Cursor to
+  // Selected"). Both paths are routed through SetCursor3DCommand so
+  // Ctrl+Z reverses the move.
   const ids = useSelectionStore.getState().ids;
-  if (!ids.length) return false;
+  const filtered = ids.filter((id) => engine.getEntity(id)?.object3D);
+  if (!filtered.length) return false;
   let count = 0;
-  const centroid = new THREE.Vector3();
-  for (const id of ids) {
+  const target = new THREE.Vector3();
+  for (const id of filtered) {
     const entity = engine.getEntity(id);
-    if (!entity?.object3D) continue;
     entity.object3D.updateWorldMatrix(true, false);
-    centroid.x += entity.object3D.matrixWorld.elements[12];
-    centroid.y += entity.object3D.matrixWorld.elements[13];
-    centroid.z += entity.object3D.matrixWorld.elements[14];
+    target.x += entity.object3D.matrixWorld.elements[12];
+    target.y += entity.object3D.matrixWorld.elements[13];
+    target.z += entity.object3D.matrixWorld.elements[14];
     count++;
   }
-  if (!count) return false;
-  centroid.multiplyScalar(1 / count);
-  setCursor3DPosition(centroid);
+  target.multiplyScalar(1 / count);
+  const before = getCursor3D().position;
+  // Skip the command (and the position write) entirely when the cursor
+  // is already at the target — saves the undo stack from a no-op entry
+  // when the user spams the menu shortcut.
+  if (Math.abs(before[0] - target.x) < 1e-6 && Math.abs(before[1] - target.y) < 1e-6 && Math.abs(before[2] - target.z) < 1e-6) {
+    return false;
+  }
+  commandBus.execute(new SetCursor3DCommand(target, before));
   return true;
 }
 
 export function snapCursorToWorldOrigin() {
-  setCursor3DPosition(0, 0, 0);
+  // "Cursor to World Origin" — undoable via SetCursor3DCommand so Ctrl+Z
+  // pops the cursor back. Done lazily (and only when the cursor isn't
+  // already at the origin) to avoid spamming the undo stack.
+  const before = getCursor3D().position;
+  if (before[0] === 0 && before[1] === 0 && before[2] === 0) return false;
+  commandBus.execute(new SetCursor3DCommand([0, 0, 0], before));
   return true;
 }
 
 export function snapCursorToGridFloor() {
   // "Cursor to Grid" — drop the cursor onto the XZ plane (y = 0). Blender's
-  // bind is Shift+S → Cursor to Grid.
-  const current = getCursor3D().position;
-  setCursor3DPosition(current[0], 0, current[2]);
+  // bind is Shift+S → Cursor to Grid. Undoable.
+  const before = getCursor3D().position;
+  if (before[1] === 0) return false;
+  commandBus.execute(new SetCursor3DCommand([before[0], 0, before[2]], before));
   return true;
 }

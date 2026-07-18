@@ -176,11 +176,12 @@ export function createDeferredGI({
       const result = current.toVar();
       const depth = depthTex.sample(uv).level(0).x.toVar();
 
-      // Deterministic current-frame cleanup for cone-step moiré. Four
+      // Deterministic current-frame cleanup for cone-step moiré. Eight
       // half-resolution neighbours are accepted only when their world normal
       // and view-space depth agree with the receiver, so large coplanar
       // surfaces smooth out while silhouettes and separate geometry remain
-      // sharp. AO blends only partway to retain contact definition.
+      // sharp. The full 3x3 footprint also removes diagonal cache boundaries
+      // that a four-neighbour cross leaves untouched.
       If(depth.lessThan(0.99999), () => {
         const centerViewPos = getViewPosition(uv, depth, uProjInv);
         const centerNormal = normalize(
@@ -195,10 +196,9 @@ export function createDeferredGI({
         const halfTexel = vec2(0.5 / w, 0.5 / h);
 
         for (const offset of [
-          [-1, 0],
-          [1, 0],
-          [0, -1],
-          [0, 1],
+          [-1, -1], [0, -1], [1, -1],
+          [-1,  0],           [1,  0],
+          [-1,  1], [0,  1], [1,  1],
         ]) {
           const sampleUv = clamp(
             uv.add(vec2(offset[0] / w, offset[1] / h)),
@@ -226,7 +226,7 @@ export function createDeferredGI({
             );
             const normalWeight = pow(
               max(dot(centerNormal, sampleNormal), 0),
-              32,
+              24,
             );
             const depthWeight = float(1).div(
               float(1).add(
@@ -248,7 +248,10 @@ export function createDeferredGI({
           max(spatialWeightSum, 1e-4),
         );
         result.xyz.assign(spatial.xyz);
-        result.w.assign(mix(current.w, spatial.w, 0.35));
+        // The voxel field has no reliable sub-voxel AO detail. The bilateral
+        // normal/depth gates preserve actual corners while this stronger
+        // spatial blend suppresses the visible voxel/cache lattice.
+        result.w.assign(mix(current.w, spatial.w, 0.75));
       });
 
       textureStore(giTexture, coord, result).toWriteOnly();

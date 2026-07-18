@@ -13,6 +13,11 @@ import {
   refreshCursor3D,
   setCursor3DPosition,
   setCursor3DVisible,
+  setCursor3DSelected,
+  getCursor3DObject,
+  getCursor3D,
+  isCursorSelectionId,
+  CURSOR_SELECTION_ID,
 } from "../threeDCursor.js";
 import {
   snapCursorToSelection,
@@ -24,6 +29,7 @@ import {
 import { CursorHUD } from "../helpers/CursorHUD.jsx";
 import { commandBus } from "../commands/CommandBus.js";
 import { SetTransformCommand } from "../commands/transformCommands.js";
+import { SetCursor3DCommand } from "../commands/cursorCommands.js";
 import { BatchCommand, topMostIds } from "../commands/entityCommands.js";
 import { getUiSystem } from "../../engine/ui/UiSystem.js";
 import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
@@ -368,12 +374,35 @@ function setupGizmo(canvas) {
   viewport.camera.updateMatrixWorld(true);
 
   let beforeTransform = null;
+  let beforeCursorPos = null;
+  let cursorDragCommand = null;
   gizmo.addEventListener("dragging-changed", (e) => {
     viewport.orbit.enabled = !e.value;
     if (gizmo.object === viewport.pivot) {
       // Multi-select drag: capture or commit per the world pivot state.
       if (e.value) beginPivotDrag();
       else commitPivotDrag();
+      return;
+    }
+    // Cursor drag: the gizmo is attached to the cursor's proxy (a
+    // sentinel selection), so the user can grab and move the cursor
+    // like any other object. Drag commits a single SetCursor3DCommand
+    // so Ctrl+Z pops it back to where it was.
+    if (isCursorSelectionTarget(gizmo.object)) {
+      if (e.value) {
+        beforeCursorPos = [...getCursor3D()];
+      } else if (beforeCursorPos) {
+        const after = getCursor3D();
+        // Skip no-op drags (e.g. clicks on the gizmo's centre handle
+        // without movement) so the undo stack stays clean.
+        const moved = beforeCursorPos.some((v, i) => Math.abs(v - after[i]) > 1e-6);
+        if (moved) {
+          cursorDragCommand = new SetCursor3DCommand(after, beforeCursorPos);
+          commandBus.execute(cursorDragCommand);
+        }
+        beforeCursorPos = null;
+        cursorDragCommand = null;
+      }
       return;
     }
     // Single-entity drag: the existing one-shot SetTransformCommand.
@@ -395,6 +424,14 @@ function setupGizmo(canvas) {
       engine.emit("transform-changed");
       return;
     }
+    // Cursor drag: read the proxy's world position back into cursor
+    // state on every frame so the visible crosshairs and the readout
+    // HUD both follow the user's pointer.
+    if (isCursorSelectionTarget(gizmo.object)) {
+      const pos = gizmo.object.position;
+      setCursor3DPosition(pos.x, pos.y, pos.z);
+      return;
+    }
     const entityId = gizmo.object?.userData.entityId;
     if (entityId) {
       useSceneStore.getState().updateTransform(entityId);
@@ -410,7 +447,15 @@ function setupGizmo(canvas) {
     if (e.key === "Control") setSnap(false);
   });
 
-  useSelectionStore.subscribe((state) => attachSelection(state.ids));
+  useSelectionStore.subscribe((state) => {
+    // Mirror the cursor's selection bit onto its module state so the
+    // HUD can highlight when the cursor is the active target. Done
+    // before attachSelection so the proxy's tint is up-to-date when
+    // the gizmo arrows get attached to it on the same tick.
+    const cursorSelected = state.ids?.some(isCursorSelectionId);
+    setCursor3DSelected(cursorSelected);
+    attachSelection(state.ids);
+  });
   engine.on("play-changed", () => attachSelection(useSelectionStore.getState().ids));
   // Rebuild the light helper when the selected light's `kind` changes —
   // the component replaces its underlying THREE.Light instance on kind
@@ -1106,7 +1151,15 @@ function attachSelection(ids) {
   // Normalize: drop anything that's no longer in the engine and de-duplicate
   // so a stale double-click in the picker doesn't create twin entries.
   const unique = [...new Set(ids ?? [])];
-  const entities = resolveEntities(unique);
+
+  // Cursor-only selection: the cursor's hit-sphere produces the sentinel
+  // CURSOR_SELECTION_ID on click. Route through the single-selection path
+  // so the gizmo attaches to the cursor proxy and the user can grab+drag
+  // it like any other scene-graph object. Entities are skipped — a
+  // selection like ["__3dCursor__"] means "the cursor only".
+  const hasCursor = unique.some(isCursorSelectionId);
+  const entityIds = unique.filter((id) => !isCursorSelectionId(id));
+  const entities = resolveEntities(entityIds);
   const entity = entities[0] ?? null;
 
   if (viewport.selectionBox) {
@@ -1136,7 +1189,7 @@ function attachSelection(ids) {
   // UI-driven (uielement / uiscreen). Detach whenever ANY selected entity
   // is a UI entity — matching the single-entity rule (where a UI entity
   // alone hides the gizmo) and extending it to mixed selections.
-  const skipGizmo = engine.playing || !entities.length || entities.some(isUiEntity);
+  const skipGizmo = engine.playing || (!hasCursor && (!entities.length || entities.some(isUiEntity)));
   if (skipGizmo) {
     viewport.gizmo.detach();
     viewport.cameraPreview?.setCamera(null);
@@ -1144,10 +1197,18 @@ function attachSelection(ids) {
     return;
   }
 
-  if (entities.length === 1) {
+  if (hasCursor && entities.length === 0) {
+    attachCursorSelection();
+  } else if (entities.length === 1) {
     attachSingleSelection(entity);
-  } else {
+  } else if (entities.length > 1) {
     attachMultiSelection(entities);
+  } else {
+    // Cursor was selected together with at least one entity — show the
+    // entity gizmo (the multi-select path handles pivot positioning); the
+    // cursor is otherwise just a hover target. This keeps the gizmo's
+    // "attach a single Object3D" contract simple.
+    attachSingleSelection(entity);
   }
   applyLayerVisibility();
 }
@@ -1210,6 +1271,22 @@ function attachSingleSelection(entity) {
   if (lightComponent?.light) {
     attachLightHelper(lightComponent);
   }
+}
+
+/** Single-target selection where the target is the 3D cursor proxy. The
+ *  gizmo is attached to the proxy group so dragging the handles translates
+ *  the cursor in world space; the dragging-changed/objectChange handlers
+ *  in setupGizmo route the new position into cursor state and emit a
+ *  SetCursor3DCommand for undo. There is no bounding box, light/camera
+ *  helper, or camera preview to manage — the cursor is its own visible
+ *  representation and lives entirely on the editor layer. */
+function attachCursorSelection() {
+  const cursor = getCursor3DObject();
+  if (!cursor) return;
+  cursor.updateMatrixWorld(true);
+  viewport.gizmo.attach(cursor);
+  viewport.gizmo.getHelper().updateMatrixWorld(true);
+  viewport.cameraPreview?.setCamera(null);
 }
 
 // Multi-entity attach: drive TransformControls from a temporary pivot Group
@@ -2353,6 +2430,17 @@ function findEntityId(object) {
   return null;
 }
 
+/** True when `object` is the cursor proxy (or its hit-sphere). Used by
+ *  the gizmo event handlers to distinguish cursor drags from entity
+ *  drags without having to thread a separate selection-id through the
+ *  gizmo machinery. */
+function isCursorSelectionTarget(object) {
+  if (!object) return false;
+  // The gizmo is attached to either the cursor group or its hit-sphere;
+  // both carry userData.is3DCursor (group) or userData.is3DCursorHit (mesh).
+  return !!(object.userData?.is3DCursor || object.userData?.is3DCursorHit);
+}
+
 /**
  * Resolves the world-space point under the pointer at `(clientX, clientY)`,
  * preferring a mesh hit so the cursor lands on the visible surface and
@@ -2490,14 +2578,18 @@ function setupKeyboard(canvas) {
   // orbit's RMB-orbit shortcut intact while making the modifier explicit.
   // `capture: true` so we run before OrbitControls' pan handler (also on
   // the canvas), letting us suppress the orbit RMB-pan gesture when the
-  // user is using the cursor modifier.
+  // user is using the cursor modifier. The placement is wrapped in a
+  // SetCursor3DCommand so Ctrl+Z brings the cursor back to where it was
+  // if the click was accidental.
   canvas.addEventListener("pointerdown", (e) => {
     if (e.button !== 2 || !e.shiftKey || engine.playing) return;
     e.preventDefault();
     e.stopPropagation();
     const point = placeCursorFromPointer(e.clientX, e.clientY, canvas, true);
     if (point) {
-      setCursor3DPosition(point);
+      const before = getCursor3D().position;
+      const moved = before[0] !== point[0] || before[1] !== point[1] || before[2] !== point[2];
+      if (moved) commandBus.execute(new SetCursor3DCommand(point, before));
     }
   }, { capture: true });
 
@@ -2546,6 +2638,20 @@ function setupKeyboard(canvas) {
       // Shift+S, which is otherwise unbound.
       if (engine.playing) return;
       openCursorSnapMenu();
+      e.preventDefault();
+    }
+  });
+
+  // Shift+C → snap the 3D cursor back to (0,0,0). Mirrors Blender's
+  // "Cursor to World Origin" being available both through the Shift+S
+  // menu and as a one-keystroke shortcut. Routed through the command
+  // bus so Ctrl+Z reverses it.
+  window.addEventListener("keydown", (e) => {
+    if (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === "c") {
+      if (engine.playing) return;
+      const before = getCursor3D().position;
+      if (before[0] === 0 && before[1] === 0 && before[2] === 0) return;
+      commandBus.execute(new SetCursor3DCommand([0, 0, 0], before));
       e.preventDefault();
     }
   });

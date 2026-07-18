@@ -2306,6 +2306,7 @@ export function createGINodes(cfg) {
   const sampleEmissiveReceiver = Fn(([P, N]) => {
     const result = vec3(0).toVar();
     const bestSupport = float(0).toVar();
+    const selectedOffset = float(0).toVar();
 
     // Surface positions can land numerically on either side of their voxel.
     // Search a narrow normal segment and keep the sample with the strongest
@@ -2321,8 +2322,42 @@ export function createGINodes(cfg) {
       If(support.greaterThan(bestSupport), () => {
         bestSupport.assign(support);
         result.assign(sample.xyz);
+        selectedOffset.assign(offset);
       });
     }
+
+    // The receiver cache is a sparse voxel shell. Trilinear reconstruction
+    // alone is continuous, but its slope still changes at every cell and
+    // shows up as large rectangular irradiance patches on flat walls. Apply
+    // a compact world-space cross in the receiver tangent plane. All taps
+    // retain the normal-aware validity test above, so this smooths lighting
+    // across one cell without borrowing through an edge or opposite wall.
+    const ref = mix(vec3(0, 0, 1), vec3(1, 0, 0), step(0.9, abs(N.z)));
+    const tangent = normalize(cross(ref, N));
+    const bitangent = cross(N, tangent);
+    const selectedPosition = P.add(
+      N.mul(u.voxelSize.mul(selectedOffset)),
+    );
+    const filtered = result.mul(bestSupport.mul(4)).toVar();
+    const filterWeight = bestSupport.mul(4).toVar();
+    for (const offset of [
+      [-0.85, 0],
+      [0.85, 0],
+      [0, -0.85],
+      [0, 0.85],
+    ]) {
+      const tap = sampleEmissiveCacheTrilinear(
+        selectedPosition
+          .add(tangent.mul(u.voxelSize.mul(offset[0])))
+          .add(bitangent.mul(u.voxelSize.mul(offset[1]))),
+        N,
+      ).toVar();
+      filtered.addAssign(tap.xyz.mul(tap.w));
+      filterWeight.addAssign(tap.w);
+    }
+    If(filterWeight.greaterThan(1e-4), () => {
+      result.assign(filtered.div(filterWeight));
+    });
 
     // Cache storage is Lambertian E/PI; the material context consumes E.
     // Preserve support so non-voxelized receivers (notably animated skinned
@@ -2357,15 +2392,20 @@ export function createGINodes(cfg) {
         origin,
         dir,
         float(coneAperture),
-        float(cfg.lite ? 1 : 0),
+        // Level zero exposes individual radiance voxels on broad receivers.
+        // A half-level minimum preserves near-field shape while blending in
+        // the first filtered mip, greatly reducing cell-sized RGB dirt.
+        float(cfg.lite ? 1 : 0.5),
       );
       total.addAssign(r.xyz.mul(cone.w));
       visibility.addAssign(r.w.mul(cone.w));
     }
-    // Contact strength was already applied inside traceCone. Do not weaken
-    // enclosure visibility here: the former mix left 60% of environment IBL
-    // in a fully sealed room at the default aoStrength=0.4.
-    const ao = visibility;
+    // Cone visibility is conservative and voxel-scale. Feeding it into the
+    // material at full strength exposed that coarse lattice as broad gray AO
+    // blocks, and also meant the user-facing AO Strength was never applied.
+    // Blend from unoccluded visibility so strength=1 retains the sealed-room
+    // mask while the default does not masquerade as contact-detail AO.
+    const ao = mix(float(1), visibility, u.aoStrength);
     // The deferred compute shader contains all cascades in one bind group.
     // Per-surface emissive caches cost two storage buffers per volume, and
     // dynamic proxy evaluation costs three more. Bind those detailed paths

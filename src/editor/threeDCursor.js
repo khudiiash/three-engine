@@ -15,17 +15,37 @@ import { useSelectionStore } from "./store/selectionStore.js";
  *     entity so its origin lands on the cursor — like Blender's snap menu.
  *   - "Set Cursor to Selected" recenters the cursor on the selection
  *     centroid (orverts an entity's origin in geometry editor parlance).
- *   - The cursor also acts as a transform-origin for the gizmo when no
- *     entity is selected, so users can pre-place a target before dropping
- *     a primitive into the scene.
+ *   - The cursor is selectable: clicking near it populates the selection
+ *     store with CURSOR_SELECTION_ID so the transform gizmo attaches,
+ *     and Shift+Click on a mesh raycast hit snaps the cursor to that
+ *     world point. In the geometry editor the same shortcut snaps the
+ *     cursor to a vertex, edge midpoint, or face centroid on click.
  *
  * The cursor is rendered as three red/green/blue short axes meeting at a
  * small disc — matching Blender's own widget without leaning on an
- * external asset. It lives on EDITOR_LAYER so play cameras ignore it, and
- * is excluded from picking raycasts (its `raycast` is a no-op).
+ * external asset. It lives on EDITOR_LAYER so play cameras ignore it.
+ * For picking it carries an invisible hit-sphere mesh so the user can
+ * click anywhere near the cursor's centre to select it.
+ *
+ * Selection routing: the hit-sphere tags itself with a sentinel
+ * `entityId` value (`CURSOR_SELECTION_ID`) which the picker picks up via
+ * the same `findEntityId` walk it uses for entities. The viewport's
+ * selection attachment code special-cases that sentinel and binds the
+ * gizmo to the proxy's group instead of to any entity.
  */
 
 const DEFAULT_POSITION = Object.freeze([0, 0, 0]);
+
+/** Special selection id used when the user has the cursor selected. The
+ *  picker produces this from a sentinel on the cursor's hit-sphere; the
+ *  selection-store plumbing otherwise treats ids uniformly. */
+export const CURSOR_SELECTION_ID = "__3dCursor__";
+
+/** Size of the invisible hit-sphere wrapping the cursor. Slightly larger
+ *  than the visible 0.18-disc / 0.55-axes so a click a few pixels off
+ *  the cross still registers — this matches Blender's own fudge factor
+ *  for grabbing the cursor. */
+const CURSOR_HIT_RADIUS = 0.35;
 
 // 3D cursor state. Subscribers get notified on every position or active
 // change so React components can render a readout and the viewport panel
@@ -37,6 +57,10 @@ const state = {
   // transient transform operation, even when there's no selection. This is
   // the in-engine analogue of Blender's "Transform Pivot Point: 3D Cursor".
   anchored: false,
+  // True when the cursor's selection id is currently in the selection
+  // store. Reflected in the HUD readout and the proxy's tint to give a
+  // visual cue that the cursor is the active target.
+  selected: false,
 };
 
 const listeners = new Set();
@@ -49,6 +73,7 @@ function snapshot() {
     position: [...state.position],
     visible: !!state.visible,
     anchored: !!state.anchored,
+    selected: !!state.selected,
   };
 }
 
@@ -102,9 +127,39 @@ export function toggleCursor3DVisible() {
   setCursor3DVisible(!state.visible);
 }
 
+/** Returns the primary cursor proxy (the engine-scene one), creating it
+ *  lazily if needed. The gizmo and other scene-graph-aware code use this
+ *  to attach to the cursor — selecting it should produce the same effect
+ *  as selecting any other scene-graph node, just with a different
+ *  delegate for "what to do with the new world position". */
+export function getCursor3DObject() {
+  ensureCursorProxy();
+  return cursorObject;
+}
+
+/** Returns true when `id` matches the sentinel that the cursor's
+ *  hit-sphere produces on click. Selectors use this to differentiate
+ *  "the cursor is selected" from a real entity id without leaking the
+ *  sentinel constant into every call site. */
+export function isCursorSelectionId(id) {
+  return id === CURSOR_SELECTION_ID;
+}
+
 export function setCursor3DAnchored(anchored) {
   if (state.anchored === !!anchored) return;
   state.anchored = !!anchored;
+  notify();
+}
+
+/** Mirrors the selection store's "is the cursor selected" bit onto the
+ *  cursor state so the HUD and the proxy can react. Wired up by
+ *  ViewportPanel's selection subscription — every selection change
+ *  walks the active ids and notifies the cursor module. The state is
+ *  idempotent: callers can spam-subscribe and only actual changes
+ *  trigger notify(). */
+export function setCursor3DSelected(selected) {
+  if (state.selected === !!selected) return;
+  state.selected = !!selected;
   notify();
 }
 
@@ -165,6 +220,7 @@ function buildCursorProxy() {
   const group = new THREE.Group();
   group.name = "ThreeDCursor";
   group.userData.editorOnly = true;
+  group.userData.is3DCursor = true;
   group.layers.set(EDITOR_LAYER);
   group.renderOrder = 998;
 
@@ -214,8 +270,31 @@ function buildCursorProxy() {
     obj.raycast = () => {};
     group.add(obj);
   }
+
+  // Invisible hit-sphere: this is what the picker actually raycasts
+  // against. Without it the user has to click a 1-pixel sliver of
+  // yellow ring; with the sphere the entire 0.35-radius area around the
+  // cursor's centre accepts the click. The mesh itself isn't rendered
+  // (visible=false) so it never shows up in the viewport but still
+  // participates in raycasting, which is exactly what Three.js does for
+  // ghost helpers / pick proxies. The cursor sentinel id is set on
+  // userData so `findEntityId` returns it and the picker routes the
+  // click to the selection store just like an entity id.
+  const hit = new THREE.Mesh(
+    new THREE.SphereGeometry(CURSOR_HIT_RADIUS, 12, 8),
+    new THREE.MeshBasicMaterial({ visible: false, depthWrite: false, depthTest: false }),
+  );
+  hit.name = "ThreeDCursorHit";
+  hit.visible = true; // raycaster respects visible=false and skips the mesh; we want hits
+  hit.userData.editorOnly = true;
+  hit.userData.entityId = CURSOR_SELECTION_ID;
+  hit.userData.is3DCursorHit = true;
+  // renderOrder doesn't matter (the material is invisible) but stays in
+  // step with the rest of the cursor.
+  hit.renderOrder = 999;
+  group.add(hit);
+
   group.userData.noPick = true;
-  group.raycast = () => {};
   return group;
 }
 
@@ -306,6 +385,18 @@ export function refreshCursor3D() {
     primaryBoundParent = scene;
   }
   cursorObject.position.fromArray(state.position);
+  // Tint the disc + rim based on selection state. Cheaper than swapping
+  // materials and matches the visual language users already know from
+  // other selected objects (gold when selected, gold with a slight blue
+  // bias when idle).
+  const tint = state.selected ? 0x6cb6ff : 0xf9ec4d;
+  if (cursorObject.userData.tint !== tint) {
+    cursorObject.userData.tint = tint;
+    const disc = cursorObject.children[0];
+    const rim = cursorObject.children[1];
+    if (disc?.material) disc.material.color.setHex(tint);
+    if (rim?.material) rim.material.color.setHex(tint);
+  }
   // The cursor is editor-only — it shares the EDITOR_LAYER with the rest
   // of viewport.helpers, but the geometry editor's local proxy lives in
   // its own scene which has no play-mode gate. Force the visibility off
@@ -321,6 +412,16 @@ export function refreshCursor3D() {
     entry.object3D.position.copy(local);
     entry.object3D.visible = state.visible && !engine.playing;
     entry.object3D.updateMatrixWorld(true);
+    // Mirror the tint onto additional proxies (geometry editor) so the
+    // local cursor reflects the selection state too.
+    const localTint = state.selected ? 0x6cb6ff : 0xf9ec4d;
+    if (entry.object3D.userData.tint !== localTint) {
+      entry.object3D.userData.tint = localTint;
+      const localDisc = entry.object3D.children[0];
+      const localRim = entry.object3D.children[1];
+      if (localDisc?.material) localDisc.material.color.setHex(localTint);
+      if (localRim?.material) localRim.material.color.setHex(localTint);
+    }
   }
 }
 

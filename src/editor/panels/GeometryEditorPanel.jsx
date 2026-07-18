@@ -38,6 +38,7 @@ import {
   setCursor3DPosition,
   getCursor3D,
 } from "../threeDCursor.js";
+import { SetCursor3DCommand } from "../commands/cursorCommands.js";
 
 const MODES = ["vertex", "edge", "face"];
 const MODE_LABELS = { vertex: "Vertex", edge: "Edge", face: "Face" };
@@ -1266,6 +1267,94 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
   };
 
   /**
+   * "3D Cursor → Edge Midpoint" — in Edit Mode with one or more edges
+   * selected, move the cursor to the midpoint of the first selected
+   * edge. The operation is undoable so users can quickly reposition
+   * the cursor while iterating on extrude / loop-cut work.
+   */
+  const snapCursorToSelectedEdge = async () => {
+    const session = sessionRef.current;
+    if (!session) return false;
+    const edgeKeys = [...session.selections.edge];
+    if (!edgeKeys.length) return false;
+    const edges = sessionEdges(session);
+    const before = getCursor3D().position;
+    // Prefer the most-recently-added selection (Set iteration order is
+    // insertion order) so a Ctrl-click sequence picks up the last edge
+    // the user actually selected, matching how Blender treats a fresh
+    // selection after a Ctrl+click toggle.
+    const lastKey = edgeKeys[edgeKeys.length - 1];
+    const edge = edges.get(lastKey);
+    if (!edge) return false;
+    const a = session.editable.positions[edge.a];
+    const b = session.editable.positions[edge.b];
+    if (!a || !b) return false;
+    const localMid = new THREE.Vector3(
+      (a[0] + b[0]) * 0.5,
+      (a[1] + b[1]) * 0.5,
+      (a[2] + b[2]) * 0.5,
+    );
+    const entity = engine.getEntity(entityId);
+    if (!entity?.object3D) return false;
+    entity.object3D.updateWorldMatrix(true, false);
+    const world = localMid.clone().applyMatrix4(entity.object3D.matrixWorld);
+    const { commandBus } = await import("../commands/CommandBus.js");
+    commandBus.execute(new SetCursor3DCommand(world, before));
+    return true;
+  };
+
+  /**
+   * "3D Cursor → Face Center" — in Edit Mode with one or more faces
+   * selected, move the cursor to the centroid (vertex-mean) of all
+   * selected faces. Faces are summed via their vertex positions so the
+   * result follows Blender's "3D Cursor → Selected" semantics even on
+   * irregular polygons.
+   */
+  const snapCursorToSelectedFace = async () => {
+    const session = sessionRef.current;
+    if (!session) return false;
+    const faceIdxs = [...session.selections.face];
+    if (!faceIdxs.length) return false;
+    const before = getCursor3D().position;
+    let sum = new THREE.Vector3();
+    let count = 0;
+    for (const faceIndex of faceIdxs) {
+      const face = session.editable.faces[faceIndex];
+      if (!face) continue;
+      for (const vertexIndex of face) {
+        const p = session.editable.positions[vertexIndex];
+        if (!p) continue;
+        sum.x += p[0];
+        sum.y += p[1];
+        sum.z += p[2];
+        count++;
+      }
+    }
+    if (!count) return false;
+    const localCenter = sum.multiplyScalar(1 / count);
+    const entity = engine.getEntity(entityId);
+    if (!entity?.object3D) return false;
+    entity.object3D.updateWorldMatrix(true, false);
+    const world = localCenter.clone().applyMatrix4(entity.object3D.matrixWorld);
+    const { commandBus } = await import("../commands/CommandBus.js");
+    commandBus.execute(new SetCursor3DCommand(world, before));
+    return true;
+  };
+
+  /**
+   * "3D Cursor → World Origin" — shortcut for the menu entry that
+   * resets the cursor to (0,0,0). Implemented as an undoable command
+   * so Ctrl+Z brings the cursor back exactly where it was.
+   */
+  const resetCursorToWorldOrigin = async () => {
+    const before = getCursor3D().position;
+    if (before[0] === 0 && before[1] === 0 && before[2] === 0) return false;
+    const { commandBus } = await import("../commands/CommandBus.js");
+    commandBus.execute(new SetCursor3DCommand([0, 0, 0], before));
+    return true;
+  };
+
+  /**
    * "Origin to 3D Cursor" inside Edit Mode — Blender's "Geometry to Origin"
    * in reverse. Re-positions the entity in world space so the entity's
    * origin lands at the 3D cursor; the editable geometry stays untouched
@@ -2347,7 +2436,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
           <div className="geometry-toolbar-popover">
             <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, () => snapVerticesToCursor(sessionRef.current))}><Crosshair size={13} /> Selection → 3D Cursor</button>
             <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, snapCursorToSelectedVertices)}>3D Cursor → Selection</button>
-            <button onClick={(event) => runMenuAction(event, () => setCursor3DPosition(0, 0, 0))}>3D Cursor → Origin</button>
+            <button disabled={mode !== "edge" || !selectionCount} onClick={(event) => runMenuAction(event, snapCursorToSelectedEdge)}>3D Cursor → Edge Midpoint</button>
+            <button disabled={mode !== "face" || !selectionCount} onClick={(event) => runMenuAction(event, snapCursorToSelectedFace)}>3D Cursor → Face Center</button>
+            <button onClick={(event) => runMenuAction(event, resetCursorToWorldOrigin)}>3D Cursor → World Origin</button>
             <button onClick={(event) => runMenuAction(event, moveEntityOriginToCursor)}>Origin → 3D Cursor</button>
             {mode === "vertex" && (
               <button onClick={(event) => runMenuAction(event, addVertexAtCursor)}>

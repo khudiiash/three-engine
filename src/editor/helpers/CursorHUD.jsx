@@ -4,7 +4,9 @@ import { subscribeCursor3D } from "../threeDCursor.js";
 /**
  * Tiny pinned readout of the 3D cursor's world-space coordinates. Lives
  * in the bottom-left of the viewport next to the terrain-brush HUD so
- * the user always sees the cursor's value while working.
+ * the user always sees the cursor's value while working. The panel
+ * gets an "active" class when the cursor is the current selection so
+ * users can tell at a glance that the gizmo is attached to the cursor.
  */
 const AXES = ["x", "y", "z"];
 
@@ -15,11 +17,14 @@ function format(value) {
 }
 
 export function CursorHUD() {
-  const [cursor, setCursor] = useState({ position: [0, 0, 0], visible: true });
+  const [cursor, setCursor] = useState({ position: [0, 0, 0], visible: true, selected: false });
   useEffect(() => subscribeCursor3D(setCursor), []);
 
   return (
-    <div className="cursor-hud" hidden={!cursor.visible}>
+    <div
+      className={`cursor-hud${cursor.selected ? " cursor-hud-selected" : ""}`}
+      hidden={!cursor.visible}
+    >
       <span className="cursor-hud-icon">⌖</span>
       <span className="cursor-hud-pos">
         {AXES.map((axis, index) => (
@@ -29,7 +34,9 @@ export function CursorHUD() {
           </span>
         ))}
       </span>
-      <span className="cursor-hud-hint">3D Cursor</span>
+      <span className="cursor-hud-hint">
+        {cursor.selected ? "3D Cursor (selected)" : "3D Cursor"}
+      </span>
     </div>
   );
 }
