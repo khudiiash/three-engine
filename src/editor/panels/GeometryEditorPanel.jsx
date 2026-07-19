@@ -11,9 +11,12 @@ import { AddComponentCommand, SetComponentPropCommand } from "../commands/compon
 import { AxisViewGizmo } from "../helpers/AxisViewGizmo.jsx";
 import {
   bufferGeometryFromEditable,
+  beginExtrudeEdges,
   beginExtrudeFaces,
+  beginExtrudeVertices,
   assignFaceMaterial,
   bevelEdges,
+  bridgeEdgeLoops,
   cloneEditable,
   coplanarHiddenEdges,
   cutMeshByEdgeRing,
@@ -21,7 +24,9 @@ import {
   editableFromBufferGeometry,
   editableFromFaces,
   expandLogicalVertices,
+  flipFaces,
   geometryAssetFromEditable,
+  gridFillEdges,
   insetFaces,
   mergeVerticesAtCenter,
   mirrorVertices,
@@ -993,9 +998,11 @@ function applyTransformMacro(session) {
   } else if (kind === "rotate") {
     angle = numeric !== null && Number.isFinite(numeric) ? THREE.MathUtils.degToRad(numeric) : (dx - dy) * 0.01;
   } else if (kind === "extrude") {
-    const extrusionAxis = axisVector ?? new THREE.Vector3(...macro.normal);
+    const extrusionAxis = axisVector ?? (macro.free ? null : new THREE.Vector3(...macro.normal));
     if (numeric !== null && Number.isFinite(numeric)) {
-      translation.copy(extrusionAxis).multiplyScalar(numeric);
+      translation.copy(extrusionAxis ?? right).multiplyScalar(numeric);
+    } else if (!extrusionAxis) {
+      translation.copy(right).multiplyScalar(dx * worldPerPixel).addScaledVector(up, -dy * worldPerPixel);
     } else {
       const projected = dx * extrusionAxis.dot(right) - dy * extrusionAxis.dot(up);
       const screenDistance = Math.abs(extrusionAxis.dot(right)) + Math.abs(extrusionAxis.dot(up)) > 0.08
@@ -1423,18 +1430,27 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
 
   const startExtrude = () => {
     const session = sessionRef.current;
-    if (!session || session.mode !== "face" || !session.selections.face.size || session.macro) return;
+    if (!session || !session.selections[session.mode].size || session.macro) return;
     const before = cloneEditable(session.editable);
     const beforeSelections = cloneSelections(session.selections);
     const beforeHidden = new Set(session.hiddenEdges);
     const beforeTopology = topologySnapshot(session);
-    const result = beginExtrudeFaces(
-      session.editable,
-      [...session.selections.face],
-      session.hiddenEdges,
-    );
+    let result;
+    if (session.mode === "face") {
+      result = beginExtrudeFaces(session.editable, [...session.selections.face], session.hiddenEdges);
+      session.selections.face = new Set(result.faceIndices);
+    } else if (session.mode === "edge") {
+      const pairs = [...session.selections.edge].flatMap((key) => {
+        const edge = sessionEdges(session).get(key);
+        return edge ? [[edge.a, edge.b]] : [];
+      });
+      result = beginExtrudeEdges(session.editable, pairs);
+      session.selections.edge = new Set(result.edges.map(([a, b]) => edgeKey(session.editable, a, b)));
+    } else {
+      result = beginExtrudeVertices(session.editable, selectedVertexIndices(session));
+      session.selections.vertex = new Set(result.vertexIndices.map((index) => positionKey(session.editable.positions[index])));
+    }
     if (!result.vertexIndices.length) return;
-    session.selections.face = new Set(result.faceIndices);
     const pointer = session.lastPointer ?? { x: 0, y: 0 };
     const positions = result.vertexIndices.map((index) => new THREE.Vector3(...session.editable.positions[index]));
     const pivot = positions.reduce((sum, point) => sum.add(point), new THREE.Vector3()).multiplyScalar(1 / positions.length);
@@ -1442,7 +1458,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       kind: "extrude", axis: null, buffer: "", indices: result.vertexIndices, positions,
       allPositions: session.editable.positions.map((value) => [...value]), proportional: false, radius: 1,
       pivot,
-      normal: result.normal, edges: [], before, beforeSelections,
+      normal: result.normal, edges: result.edges ?? [], free: session.mode !== "face", before, beforeSelections,
       walls: result.walls, visiblePairs: result.visiblePairs,
       beforeHidden, beforeTopology, beforeMode: session.mode,
       start: { ...pointer }, current: { ...pointer },
@@ -1452,7 +1468,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     // hidden flags are re-derived on every preview frame, not just here.
     applyTopology(session, beforeTopology, { visiblePairs: result.visiblePairs });
     session.rebuild();
-    setMacroState({ kind: "extrude", axis: null, buffer: "" });
+    setMacroState({ kind: "extrude", axis: null, buffer: "", free: session.mode !== "face" });
   };
 
   const startLoopCut = () => {
@@ -1796,6 +1812,45 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     assignFaceMaterial(session.editable, [...session.selections.face], faceMaterial);
   });
 
+  const flipSelectedFaceNormals = () => {
+    const session = sessionRef.current;
+    if (!session || session.mode !== "face" || !session.selections.face.size || session.macro) return;
+    const count = session.selections.face.size;
+    mutate((value) => flipFaces(value.editable, value.selections.face));
+    setStatus(`Flipped ${count} face${count === 1 ? "" : "s"}`);
+  };
+
+  const selectedEdgePairs = (session) => [...session.selections.edge].flatMap((key) => {
+    const edge = sessionEdges(session).get(key);
+    return edge ? [[edge.a, edge.b]] : [];
+  });
+
+  const bridgeSelectedEdges = () => {
+    const session = sessionRef.current;
+    if (!session || session.mode !== "edge" || !session.selections.edge.size || session.macro) return;
+    const candidate = cloneEditable(session.editable);
+    const result = bridgeEdgeLoops(candidate, selectedEdgePairs(session));
+    if (result.error) { setStatus(result.error); return; }
+    mutate((value, before) => {
+      Object.assign(value.editable, candidate);
+      return { hidden: new Set([...before.hidden, ...result.hiddenKeys]) };
+    });
+    setStatus(`Bridged edge loops with ${result.faceIndices.length / 2} quads`);
+  };
+
+  const gridFillSelectedEdges = () => {
+    const session = sessionRef.current;
+    if (!session || session.mode !== "edge" || !session.selections.edge.size || session.macro) return;
+    const candidate = cloneEditable(session.editable);
+    const result = gridFillEdges(candidate, selectedEdgePairs(session));
+    if (result.error) { setStatus(result.error); return; }
+    mutate((value, before) => {
+      Object.assign(value.editable, candidate);
+      return { hidden: new Set([...before.hidden, ...result.hiddenKeys]) };
+    });
+    setStatus(`Grid filled boundary with ${result.faceIndices.length / 2} quads`);
+  };
+
   const mirrorSelection = (axis) => mutate((session) => {
     const indices = selectedVertexIndices(session);
     if (!indices.length) return;
@@ -1855,6 +1910,11 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       startInset();
       return;
     }
+    if (!sessionRef.current?.macro && event.altKey && !event.ctrlKey && !event.metaKey && event.key.toLowerCase() === "n" && mode === "face") {
+      event.preventDefault();
+      flipSelectedFaceNormals();
+      return;
+    }
     if (!sessionRef.current?.macro && event.key.toLowerCase() === 'm') {
       event.preventDefault();
       mergeSelection();
@@ -1884,21 +1944,21 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         sessionRef.current.proportional = activeMacro.proportional;
         setProportional(activeMacro.proportional);
         applyTransformMacro(sessionRef.current);
-        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, proportional: activeMacro.proportional, radius: activeMacro.radius });
+        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, free: activeMacro.free, proportional: activeMacro.proportional, radius: activeMacro.radius });
         return;
       }
       if (["x", "y", "z"].includes(key)) {
         event.preventDefault();
         activeMacro.axis = activeMacro.axis === key ? null : key;
         applyTransformMacro(sessionRef.current);
-        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, amount: activeMacro.amount, segments: activeMacro.segments });
+        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, free: activeMacro.free, amount: activeMacro.amount, segments: activeMacro.segments });
         return;
       }
       if (key === "backspace") {
         event.preventDefault();
         activeMacro.buffer = activeMacro.buffer.slice(0, -1);
         applyTransformMacro(sessionRef.current);
-        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, amount: activeMacro.amount, segments: activeMacro.segments });
+        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, free: activeMacro.free, amount: activeMacro.amount, segments: activeMacro.segments });
         return;
       }
       if (/^[0-9.-]$/.test(key)) {
@@ -1907,7 +1967,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         event.preventDefault();
         activeMacro.buffer += key;
         applyTransformMacro(sessionRef.current);
-        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, amount: activeMacro.amount, segments: activeMacro.segments });
+        setMacroState({ kind: activeMacro.kind, axis: activeMacro.axis, buffer: activeMacro.buffer, free: activeMacro.free, amount: activeMacro.amount, segments: activeMacro.segments });
       }
       return;
     }
@@ -1936,7 +1996,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       return;
     }
     if (event.key === "Tab" && embedded && onClose) { event.preventDefault(); onClose(); return; }
-    if (event.key.toLowerCase() === "e" && mode === "face") { event.preventDefault(); startExtrude(); return; }
+    if (event.key.toLowerCase() === "e") { event.preventDefault(); startExtrude(); return; }
     if (event.key.toLowerCase() === "u") { event.preventDefault(); mutate((session) => unwrapBox(session.editable)); }
     if (event.key.toLowerCase() === "g") { event.preventDefault(); startTransform("translate"); }
     if (event.key.toLowerCase() === "r") { event.preventDefault(); startTransform("rotate"); }
@@ -2055,7 +2115,9 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
     const session = {
       editable, original, mesh, wire, basePoints, faceOverlay, edgeOverlay, vertexOverlay, context,
       camera, perspectiveCamera, orthographicCamera: null, orthographicHeight: 10,
-      controls, canvas, hiddenEdges: new Set(), mode: "face",
+      controls, canvas,
+      hiddenEdges: new Set((editable.hiddenEdges ?? []).map(([a, b]) => indexEdgeKey(a, b))),
+      mode: "face",
       selections: { vertex: new Set(), edge: new Set(), face: new Set() },
       wireEdges: [], history: [], macro: null,
       proportional: false, xray: false,
@@ -2076,7 +2138,13 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
       refreshVertexMarkerScales(session);
       setRevision((value) => value + 1);
     };
-    applyTopology(session, { edges: new Set(), hidden: new Set() });
+    // Persisted .geom topology is authoritative. Re-inferring all coplanar
+    // diagonals here hid subdivision/grid edges every time Edit Mode reopened.
+    if (!Array.isArray(editable.hiddenEdges)) {
+      applyTopology(session, { edges: new Set(), hidden: new Set() });
+    } else {
+      syncEditableTopology(session);
+    }
     session.preview = () => {
       const attribute = mesh.geometry.getAttribute("position");
       editable.positions.forEach((position, index) => attribute.setXYZ(index, ...position));
@@ -2450,9 +2518,12 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         <details className="geometry-toolbar-menu">
           <summary>Mesh</summary>
           <div className="geometry-toolbar-popover">
-            <button disabled={mode !== "face" || !selectionCount} onClick={(event) => runMenuAction(event, startExtrude)}>Extrude <kbd>E</kbd></button>
+            <button disabled={!selectionCount} onClick={(event) => runMenuAction(event, startExtrude)}>Extrude {MODE_LABELS[mode]} <kbd>E</kbd></button>
             <button disabled={mode !== "face" || !selectionCount} onClick={(event) => runMenuAction(event, startInset)}>Inset Faces <kbd>I</kbd></button>
+            <button disabled={mode !== "face" || !selectionCount} onClick={(event) => runMenuAction(event, flipSelectedFaceNormals)}>Flip Normals <kbd>Alt+N</kbd></button>
             <button disabled={mode !== "edge" || !selectionCount} onClick={(event) => runMenuAction(event, startBevel)}>Bevel Edges <kbd>Ctrl+B</kbd></button>
+            <button disabled={mode !== "edge" || !selectionCount} onClick={(event) => runMenuAction(event, bridgeSelectedEdges)}>Bridge Edge Loops</button>
+            <button disabled={mode !== "edge" || !selectionCount} onClick={(event) => runMenuAction(event, gridFillSelectedEdges)}>Grid Fill</button>
             <label className="geometry-menu-field">Cuts
               <input
                 type="number"
@@ -2527,7 +2598,7 @@ export function GeometryEditorPanel({ embedded = false, entityIdOverride = null,
         <div className="geometry-transform-hud">
           <strong>{macroState.kind === "translate" ? "Move" : macroState.kind === "rotate" ? "Rotate" : macroState.kind === "extrude" ? "Extrude" : macroState.kind === "loopcut" ? "Loop Cut" : macroState.kind === "bevel" ? "Bevel" : macroState.kind === "inset" ? "Inset" : "Scale"}</strong>
           {(macroState.kind === "loopcut" || macroState.kind === "bevel") && <span className="geometry-transform-value">{macroState.segments ?? 1}×</span>}
-          <span>{macroState.kind === "loopcut" ? (macroState.locked ? "Edge Slide" : "Even Spacing") : macroState.kind === "bevel" ? `${Math.round((macroState.amount ?? 0) * 1000) / 1000} width` : macroState.kind === "inset" ? `${Math.round((macroState.amount ?? 0) * 1000) / 1000} factor` : macroState.axis ? macroState.axis.toUpperCase() : macroState.kind === "rotate" ? "View" : macroState.kind === "extrude" ? "Normal" : "Free"}</span>
+          <span>{macroState.kind === "loopcut" ? (macroState.locked ? "Edge Slide" : "Even Spacing") : macroState.kind === "bevel" ? `${Math.round((macroState.amount ?? 0) * 1000) / 1000} width` : macroState.kind === "inset" ? `${Math.round((macroState.amount ?? 0) * 1000) / 1000} factor` : macroState.axis ? macroState.axis.toUpperCase() : macroState.kind === "rotate" ? "View" : macroState.kind === "extrude" && !macroState.free ? "Normal" : "Free"}</span>
           {macroState.buffer && <span className="geometry-transform-value">{macroState.buffer}{macroState.kind === "rotate" ? "°" : ""}</span>}
           <small>{macroState.kind === "loopcut" && macroState.locked ? "Slide · LMB confirm · Esc cancel" : macroState.kind === "loopcut" ? "Scroll cuts · LMB set · Esc cancel" : macroState.kind === "bevel" ? "Move width · Scroll segments · LMB confirm · Esc cancel" : "LMB / Enter confirm · Esc / RMB cancel"}</small>
         </div>

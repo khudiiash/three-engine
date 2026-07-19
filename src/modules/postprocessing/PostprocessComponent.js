@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import * as TSL from "three/tsl";
 import { Component } from "../../engine/components/Component.js";
+import { EDITOR_LAYER } from "../../engine/editorLayers.js";
 import {
   compilePostGraph,
   DEFAULT_POST_GRAPH,
@@ -8,6 +9,7 @@ import {
   loadSSGI,
   loadSSR,
   loadDenoise,
+  loadTRAA,
   loadBloom,
   loadGodrays,
   loadDepthAwareBlend,
@@ -55,12 +57,12 @@ function findGodraysLight(engine) {
  * call.
  *
  * The graph is anchored by an Input pseudo-source that resolves to the
- * three auto-fed sockets of a TSL `pass(scene, camera)` node:
+ * four auto-fed sockets of a TSL `pass(scene, camera)` node:
  *
  *   - `color`  → `pass.getTextureNode()` (the beauty render)
  *   - `depth`  → `pass.getTextureNode('depth')` (the depth attachment)
- *   - `normal` → reconstructed by SSGI in-shader from depth (three r185
- *                does not expose a viewportNormalTexture MRT helper).
+ *   - `normal` → packed view-space normal MRT
+ *   - `velocity` → motion-vector MRT for temporal effects such as TRAA
  *
  * The `RenderPipeline` handles ALL the render-target bookkeeping
  * internally: it discovers the `PassNode` inside the compiled TSL graph,
@@ -121,6 +123,7 @@ export class PostprocessComponent extends Component {
     // RenderPipeline discovers it via the output graph and renders the
     // scene through it before sampling it in the post-graph quad.
     this.scenePass = null;
+    this.postprocessLayers = null;
     // The engine scene reference is needed for pass(scene, camera).
     this.scene = null;
     // TSL temp nodes that must stay alive across rebuilds — primarily
@@ -284,6 +287,14 @@ export class PostprocessComponent extends Component {
     // across frames — we keep a single PassNode and rebind its refs when
     // the entity's transform changes the camera — so we only need to
     // refresh when the camera entity swaps (rare).
+    // PassNode temporarily applies this mask only while it renders its MRT,
+    // then restores the camera mask. Mirror the camera's current layer
+    // selection every frame but always remove editor gizmos from the beauty,
+    // depth, normal, velocity and material buffers consumed by effects.
+    if (this.postprocessLayers && this.renderCamera) {
+      this.postprocessLayers.mask = this.renderCamera.layers.mask;
+      this.postprocessLayers.disable(EDITOR_LAYER);
+    }
     this.pipeline.outputNode = this.outputNode;
     this.pipeline.render();
   }
@@ -323,6 +334,7 @@ export class PostprocessComponent extends Component {
       ssgi,
       ssr,
       denoise,
+      traa,
       bloom,
       godrays,
       depthAwareBlend,
@@ -347,6 +359,7 @@ export class PostprocessComponent extends Component {
       loadSSGI(),
       loadSSR(),
       loadDenoise(),
+      loadTRAA(),
       loadBloom(),
       loadGodrays(),
       loadDepthAwareBlend(),
@@ -393,6 +406,10 @@ export class PostprocessComponent extends Component {
       // cameras still go through the renderer's default path) and produces
       // a standard `texture_depth_2d` that SSGINode's shader expects.
       this.scenePass = TSL.pass(engine.scene, this.renderCamera, { samples: 1 });
+      this.postprocessLayers = new THREE.Layers();
+      this.postprocessLayers.mask = this.renderCamera.layers.mask;
+      this.postprocessLayers.disable(EDITOR_LAYER);
+      this.scenePass.setLayers(this.postprocessLayers);
       // Attach a per-fragment view-space normal MRT to the scene pass.
       // SSGI consumes the normal via `getTextureNode('normal')` (an RGB
       // texture where each pixel's RGB encodes a view-space normal). The
@@ -403,18 +420,25 @@ export class PostprocessComponent extends Component {
       // normal from depth in-shader, which is noisy at low tessellation
       // and slow at high tessellation.
       //
-      // We only enable the normal MRT (not diffuseColor / velocity)
-      // because: (1) materials may not support the extra output slot
-      // and (2) the composite path approximates diffuse with beauty.rgb
-      // which produces visually similar results without an extra RTT.
-      // Velocity requires the renderer's `outputTransform` to be a no-op
-      // (no tone mapping) for proper reprojection, which conflicts with
-      // our editor pipeline, so we leave it off — TRAA can be added
-      // later if its bandwidth cost is acceptable.
+      // Keep diffuseColor out for now because the graph still approximates
+      // diffuse albedo with beauty.rgb. Velocity is required by TRAA and is
+      // generated alongside color/depth/normal so reprojection stays aligned.
       this.scenePass.setMRT(
         TSL.mrt({
           output: TSL.output,
           normal: TSL.packNormalToRGB(TSL.normalView),
+          // Motion vectors consumed by TRAA. This must be produced by the
+          // same scene pass as color/depth so temporal reprojection aligns.
+          velocity: TSL.velocity,
+          // Material params for screen-space reflections: metalness in R,
+          // roughness in G. `metalness`/`roughness` are MaterialNode accessors
+          // that resolve to each material's own value during its fragment
+          // shader (defaulting to 0 / 1 for materials without the property),
+          // so the pass writes a per-pixel material buffer alongside colour.
+          // The hybrid SSR path reads it to tell metal from dielectric and to
+          // pick the reflection blur mip; without it SSR reflects everything
+          // or nothing.
+          matParams: TSL.vec4(TSL.metalness, TSL.roughness, 0, 1),
         }),
       );
       // Narrow the normal texture to UnsignedByteType (8-bit/channel RGBA)
@@ -424,6 +448,9 @@ export class PostprocessComponent extends Component {
       // step counts.
       const normalTexture = this.scenePass.getTexture("normal");
       if (normalTexture) normalTexture.type = THREE.UnsignedByteType;
+      // metalness/roughness are 0..1 scalars — 8-bit is plenty.
+      const matTexture = this.scenePass.getTexture("matParams");
+      if (matTexture) matTexture.type = THREE.UnsignedByteType;
     }
 
     // Pull the auto-fed input sockets from the pass.
@@ -453,6 +480,35 @@ export class PostprocessComponent extends Component {
       normalNode = null;
     }
 
+    // TRAA consumes the raw velocity texture because it performs texel loads
+    // and reads the XY motion vector itself.
+    let velocityNode = null;
+    try {
+      velocityNode = this.scenePass.getTextureNode("velocity");
+    } catch (err) {
+      console.warn(
+        `PostprocessComponent: could not wire velocity MRT (${err?.message ?? err}) — TRAA will be a passthrough.`,
+      );
+      velocityNode = null;
+    }
+
+    // Per-pixel metalness (R) / roughness (G) for the hybrid SSR path. Null
+    // when the MRT slot isn't available (older three builds) — the SSR node
+    // then treats surfaces with its own null-node defaults.
+    let metalnessNode = null;
+    let roughnessNode = null;
+    try {
+      const matTex = this.scenePass.getTextureNode("matParams");
+      metalnessNode = TSL.sample((uv) => matTex.sample(uv).r);
+      roughnessNode = TSL.sample((uv) => matTex.sample(uv).g);
+    } catch (err) {
+      console.warn(
+        `PostprocessComponent: could not wire material-params MRT (${err?.message ?? err}) — SSR will treat surfaces as non-metallic.`,
+      );
+      metalnessNode = null;
+      roughnessNode = null;
+    }
+
     try {
       // Reset the keepalive set per compile. SSGI nodes from a previous
       // compile are stale — the SSGI's render target is bound to a
@@ -465,10 +521,17 @@ export class PostprocessComponent extends Component {
         beautyNode,
         depthNode,
         normalNode,
+        velocityNode,
+        msaaEnabled:
+          engine.settings?.renderer?.antialias !== false &&
+          (engine.settings?.renderer?.samples ?? 4) > 1,
+        metalnessNode,
+        roughnessNode,
         // GI / Reflections
         ssgi,
         ssr,
         denoise,
+        traa,
         // Effects / Filters
         bloom,
         godrays,
@@ -534,6 +597,7 @@ export class PostprocessComponent extends Component {
       }
     }
     this.scenePass = null;
+    this.postprocessLayers = null;
     this.scene = null;
     this.signature = null;
     this.outputNode = null;

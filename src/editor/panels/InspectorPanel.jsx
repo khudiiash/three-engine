@@ -106,12 +106,13 @@ const DEG2RAD = Math.PI / 180;
 
 /** Number input that keeps local text while typing; commits on Enter/blur. */
 function NumberField({ value, onCommit, min, max, step = 0.1, mixed = false }) {
-  const [text, setText] = useState(mixed ? "" : formatNumber(value));
-  const [focused, setFocused] = useState(false);
-
-  useEffect(() => {
-    if (!focused) setText(mixed ? "" : formatNumber(value));
-  }, [value, mixed, focused]);
+  // `draft` is non-null only while the field is actively edited; otherwise the
+  // displayed text derives DIRECTLY from `value`. The previous version synced
+  // via a useEffect+setState on every `value` change, which React flags as a
+  // "Cascading Update" — a ~25ms Inspector re-render on every frame of a gizmo
+  // drag (the "spike when I move an object"). Deriving avoids the extra render.
+  const [draft, setDraft] = useState(null);
+  const text = draft !== null ? draft : mixed ? "" : formatNumber(value);
 
   const commit = () => {
     const parsed = parseFloat(text);
@@ -120,9 +121,8 @@ function NumberField({ value, onCommit, min, max, step = 0.1, mixed = false }) {
       if (min !== undefined) v = Math.max(min, v);
       if (max !== undefined) v = Math.min(max, v);
       onCommit(v);
-    } else {
-      setText(formatNumber(value));
     }
+    // Invalid/unchanged: text reverts to `value` automatically when draft clears.
   };
 
   return (
@@ -132,16 +132,16 @@ function NumberField({ value, onCommit, min, max, step = 0.1, mixed = false }) {
       step={step}
       value={text}
       placeholder={mixed ? "—" : undefined}
-      onChange={(e) => setText(e.target.value)}
-      onFocus={() => setFocused(true)}
+      onChange={(e) => setDraft(e.target.value)}
+      onFocus={() => setDraft(mixed ? "" : formatNumber(value))}
       onBlur={() => {
-        setFocused(false);
         commit();
+        setDraft(null);
       }}
       onKeyDown={(e) => {
         if (e.key === "Enter") e.target.blur();
         if (e.key === "Escape") {
-          setText(formatNumber(value));
+          setDraft(null);
           e.target.blur();
         }
       }}

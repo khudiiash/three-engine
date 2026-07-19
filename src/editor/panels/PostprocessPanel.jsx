@@ -143,7 +143,7 @@ function PostNode({ id, data, selected }) {
         <span className="shader-node-label">{meta.label}</span>
       </div>
       <div className="shader-node-body">
-        {/* Input nodes expose the three auto-fed sockets; everything else
+        {/* Input nodes expose the auto-fed sockets; everything else
             has its declared inputs (rendered as wire targets). */}
         {isInput && (
           <>
@@ -158,6 +158,10 @@ function PostNode({ id, data, selected }) {
             <div className="shader-node-row">
               <Handle type="source" position={Position.Right} id="normal" className="shader-handle pt-vec3" />
               <span className="shader-port-label">{INPUT_PORT_LABELS.normal}</span>
+            </div>
+            <div className="shader-node-row">
+              <Handle type="source" position={Position.Right} id="velocity" className="shader-handle pt-vec4" />
+              <span className="shader-port-label">{INPUT_PORT_LABELS.velocity}</span>
             </div>
           </>
         )}

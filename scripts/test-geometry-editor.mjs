@@ -3,7 +3,10 @@ import * as THREE from "three/webgpu";
 import {
   bufferGeometryFromEditable,
   bevelEdges,
+  beginExtrudeEdges,
   beginExtrudeFaces,
+  beginExtrudeVertices,
+  bridgeEdgeLoops,
   editableFromBufferGeometry,
   coplanarFaceGroup,
   coplanarHiddenEdges,
@@ -14,7 +17,9 @@ import {
   extrudeFaces,
   expandLogicalVertices,
   deleteFaces,
+  flipFaces,
   geometryAssetFromEditable,
+  gridFillEdges,
   insetFaces,
   subdivideFaces,
   unwrapBox,
@@ -155,6 +160,58 @@ const deleteCopy = editableFromBufferGeometry(new THREE.BoxGeometry(1, 1, 1));
 deleteFaces(deleteCopy, coplanarFaceGroup(deleteCopy, 0));
 assert.equal(deleteCopy.faces.length, 10);
 assert.ok(deleteCopy.faces.flat().every((index) => index < deleteCopy.positions.length));
+const flipCopy = editableFromBufferGeometry(new THREE.BoxGeometry(1, 1, 1));
+const flippedRegion = coplanarFaceGroup(flipCopy, 0);
+const facesBeforeFlip = flipCopy.faces.map((face) => [...face]);
+const faceNormal = (mesh, face) => {
+  const [a, b, c] = face.map((index) => new THREE.Vector3(...mesh.positions[index]));
+  return b.sub(a).cross(c.sub(a)).normalize();
+};
+const normalsBeforeFlip = flippedRegion.map((faceIndex) => faceNormal(flipCopy, flipCopy.faces[faceIndex]));
+assert.equal(flipFaces(flipCopy, [...flippedRegion, flippedRegion[0], -1]), flippedRegion.length,
+  "flipping should ignore duplicate and invalid face indices");
+flippedRegion.forEach((faceIndex, index) => {
+  assert.deepEqual(flipCopy.faces[faceIndex], [facesBeforeFlip[faceIndex][0], facesBeforeFlip[faceIndex][2], facesBeforeFlip[faceIndex][1]],
+    "flipping a face should reverse its winding");
+  assert.ok(faceNormal(flipCopy, flipCopy.faces[faceIndex]).dot(normalsBeforeFlip[index]) < -0.9999,
+    "reversed winding should reverse the geometric normal");
+});
+const untouchedFace = flipCopy.faces.findIndex((_, faceIndex) => !flippedRegion.includes(faceIndex));
+assert.deepEqual(flipCopy.faces[untouchedFace], facesBeforeFlip[untouchedFace],
+  "unselected faces should keep their winding");
+const vertexExtrudeCopy = {
+  positions: [[0, 0, 0]], faces: [], uvs: [[0, 0]], faceMaterials: [], looseEdges: [], hiddenEdges: [],
+};
+const vertexExtrusion = beginExtrudeVertices(vertexExtrudeCopy, [0]);
+assert.equal(vertexExtrudeCopy.positions.length, 2, "vertex extrusion should duplicate the selected vertex");
+assert.deepEqual(vertexExtrudeCopy.looseEdges, [[0, 1]], "vertex extrusion should connect the source and new vertex");
+assert.deepEqual(vertexExtrusion.vertexIndices, [1]);
+const edgeExtrudeCopy = {
+  positions: [[0, 0, 0], [1, 0, 0]], faces: [], uvs: [[0, 0], [1, 0]], faceMaterials: [], looseEdges: [[0, 1]], hiddenEdges: [],
+};
+const edgeExtrusion = beginExtrudeEdges(edgeExtrudeCopy, [[0, 1]]);
+assert.equal(edgeExtrudeCopy.faces.length, 2, "edge extrusion should bridge the source and duplicated edge with a quad");
+assert.equal(edgeExtrusion.edges.length, 1, "edge extrusion should expose the new top edge for selection");
+assert.equal(edgeExtrusion.vertexIndices.length, 2, "only the new edge endpoints should move interactively");
+const bridgeCopy = {
+  positions: [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
+  faces: [], uvs: [], faceMaterials: [], looseEdges: [], hiddenEdges: [],
+};
+const squareEdges = (offset) => Array.from({ length: 4 }, (_, index) => [offset + index, offset + ((index + 1) % 4)]);
+const bridgeResult = bridgeEdgeLoops(bridgeCopy, [...squareEdges(0), ...squareEdges(4)]);
+assert.equal(bridgeResult.error, undefined);
+assert.equal(bridgeCopy.faces.length, 8, "bridging two four-edge loops should create four quads");
+assert.equal(bridgeResult.hiddenKeys.length, 4, "each bridged quad should hide its triangulation diagonal");
+const gridFillCopy = {
+  positions: [[0, 0, 0], [1, 0, 0], [2, 0, 0], [2, 1, 0], [2, 2, 0], [1, 2, 0], [0, 2, 0], [0, 1, 0]],
+  faces: [], uvs: [], faceMaterials: [], looseEdges: [], hiddenEdges: [],
+};
+const gridBoundary = Array.from({ length: 8 }, (_, index) => [index, (index + 1) % 8]);
+const gridFillResult = gridFillEdges(gridFillCopy, gridBoundary);
+assert.equal(gridFillResult.error, undefined);
+assert.equal(gridFillCopy.positions.length, 9, "a 2x2 Grid Fill should create one interior vertex");
+assert.equal(gridFillCopy.faces.length, 8, "a 2x2 Grid Fill should create four triangulated quads");
+assert.equal(gridFillResult.hiddenKeys.length, 4, "Grid Fill should hide one diagonal per generated quad");
 const bevelCopy = editableFromBufferGeometry(new THREE.BoxGeometry(1, 1, 1));
 const bevelFace = bevelCopy.faces[0];
 const bevelKey = [bevelCopy.positions[bevelFace[0]], bevelCopy.positions[bevelFace[1]]]
@@ -246,6 +303,11 @@ const looseCopy = editableFromBufferGeometry(new THREE.BoxGeometry(1, 1, 1));
 looseCopy.looseEdges.push([0, 1]);
 const looseRestored = geometryFromAsset(geometryAssetFromEditable(looseCopy));
 assert.deepEqual(looseRestored.userData.editableEdges, [[0, 1]], "duplicated loose edges should survive geometry autosave/reload");
+const hiddenSource = editableFromBufferGeometry(new THREE.BoxGeometry(1, 1, 1));
+hiddenSource.hiddenEdges = [[hiddenSource.faces[0][0], hiddenSource.faces[0][2]]];
+const hiddenRoundTrip = editableFromBufferGeometry(geometryFromAsset(geometryAssetFromEditable(hiddenSource)));
+assert.deepEqual(hiddenRoundTrip.hiddenEdges, hiddenSource.hiddenEdges,
+  "authored subdivision visibility should survive geometry autosave/reload");
 
 assert.throws(() => geometryFromAsset({ version: 1, positions: [0, 0, 0], indices: [0, 1, 2] }), /out of range/);
 console.log("geometry editor topology tests passed");

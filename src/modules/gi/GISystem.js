@@ -15,6 +15,7 @@ import {
   normalWorld,
 } from "three/tsl";
 import { createDeferredGI, createDeferredGISampler } from "./giDeferred.js";
+import { QUALITY_PRESETS } from "./GlobalIlluminationComponent.js";
 import { createSunShadowNode } from "./dfShadows.js"; // voxel-cone fallback (unused by default)
 import { MeshSDFShadows, createMeshSDFSunShadowNode } from "./meshSDF.js";
 import { CapsuleShadows, collectSkinnedMeshes } from "./capsuleShadows.js";
@@ -31,6 +32,8 @@ import {
   readMeshGIColors,
   EMISSIVE_SCALE,
   markExteriorEmptyVoxelsAsync,
+  reclassifyAmbiguousRegion,
+  shiftGrid,
   EXTERIOR_EMPTY_BIT,
   AMBIGUOUS_NORMAL_BIT,
 } from "./voxelizer.js";
@@ -73,6 +76,26 @@ const AUTO_COVERAGE_MARGIN = 1.2;
 const CONVERGENCE_SWEEPS = 4;
 const RECENTER_SWEEPS = 2;
 const LIGHT_CONVERGENCE_SWEEPS = 6;
+
+// Snappy convergence for cascades that currently contain a moving object.
+// The visible EMA time constant is `lightingResponse` (default 0.5 s), giving
+// ~1.8 s to settle — measured as the dominant term behind the "light lags
+// several seconds after I move something" complaint. While a mover is present
+// (and briefly after it settles) the inner cascade drops to this much shorter
+// constant so bounce/AO track the object in ~0.3 s. The eye is following the
+// mover then and tolerates the extra temporal noise; static scenes are
+// untouched and keep the smooth default. GRACE keeps the fast response alive
+// across the settle transition so convergence doesn't visibly stall the moment
+// the dynamic gate releases and the volume falls back to round-robin.
+const DYNAMIC_RESPONSE_SECONDS = 0.12;
+const DYNAMIC_GRACE_FRAMES = 45;
+// Extra probe windows per frame while a mover is present, to converge the
+// multi-bounce field faster. Kept low (1) by default: higher values refresh
+// the noisy 64-ray probes more often and flicker on moving objects. The
+// Quality tier opts into a mild 2×; a proper fast+smooth path needs probe
+// denoising, not just more sweeps. Custom mode uses this default.
+const PROBE_MOTION_SWEEPS = 1;
+
 
 /** Matches Object3D's rendered visibility, including hidden ancestors. */
 function isEffectivelyVisible(object) {
@@ -198,6 +221,20 @@ export class GISystem {
     this._shadowDebugMaterial = null;
     this.stats = { occupied: 0, meshes: 0, tris: 0, voxelMs: 0 };
     this._voxelsDirtyAt = 0; // 0 = clean, else timestamp of the dirtying event
+    // A structural change (mesh added/removed, geometry/terrain swap) needs a
+    // full-scene re-bake; a settled object move only needs its footprint
+    // re-baked. _dirtyBoxes accumulates the world-space AABBs (old + new pose)
+    // of settled movers so the debounced handler can rebake just those regions
+    // instead of rescanning every triangle in the scene.
+    this._structuralDirty = false;
+    this._dirtyBoxes = [];
+    // Signature of the voxelizable mesh SET (identity/geometry/material — NOT
+    // transform). `hierarchy-changed` fires on every Component.setProp (for the
+    // React mirror) and editor noise (autosave, async material reloads), so
+    // treating each one as structural forced a ~200 ms full re-voxelize on
+    // every move/edit. We only mark structural when this signature actually
+    // changes (mesh added/removed, geometry or material swapped).
+    this._meshSetSignature = null;
     this._rebuildQueued = false;
     this._frame = 0;
     this._deltaTime = 1 / 60;
@@ -273,12 +310,14 @@ export class GISystem {
     // desyncing the GI from the main render (moving objects shimmer).
     this._offPreRender = engine.onPreRender(() => this.#runDeferred());
     this._offHier = engine.on("hierarchy-changed", () => {
-      this._voxelsDirtyAt = performance.now();
+      // Only re-voxelize if the mesh set actually changed — hierarchy-changed
+      // also fires for every prop edit / autosave, and treating those as
+      // structural was the ~200 ms full-rebuild-on-every-move spike.
+      if (this.#markStructuralIfMeshSetChanged()) this.markRayProxiesDirty();
       this._sun.stale = true;
       this._emissiveSourcesDirty = true;
       this._localLightsDirty = true;
       this._dynamicSetDirty = true;
-      this.markRayProxiesDirty();
       // A mesh added after GI init has a material that never got the GI
       // light node — the "black until I move it" surfaces. Mark only new
       // materials (WeakSet-deduped) so this is cheap and spike-free.
@@ -291,8 +330,10 @@ export class GISystem {
       this._localLightsDirty = true;
       this._dynamicSetDirty = true;
       if (componentType === "mesh" || componentType === "model" || componentType === "terrain") {
-        this._voxelsDirtyAt = performance.now();
-        this.markRayProxiesDirty();
+        // Same gate: a mesh/model component-changed that didn't actually swap
+        // geometry/material (e.g. a transform or unrelated prop) must not force
+        // a full re-voxelize.
+        if (this.#markStructuralIfMeshSetChanged()) this.markRayProxiesDirty();
         // Async geometry/material swaps bring new materials; give them the
         // GI node without waiting for the user to move the object.
         if (this.light) this.#invalidateLitMaterials();
@@ -319,19 +360,18 @@ export class GISystem {
     // still use the per-frame matrix poll, but editor lighting no longer waits
     // for an indirect hierarchy/component event or a background static bake.
     this._offTransform = engine.on("transform-changed", () => {
-      this.engine.scene.updateMatrixWorld(true);
-      // Emissive meshes are represented both in the dynamic voxel layer and
-      // as finite-area direct-light proxies. Rebuild proxy transforms on the
-      // very next GI tick instead of waiting for the six-frame light poll.
+      // NOT force=true: forcing recompute of the WHOLE scene every frame of a
+      // drag overwrote the baked matrices of matrixAutoUpdate=false objects
+      // (imported models), so the poll saw ALL meshes "move" and promoted every
+      // one to dynamic — an empty voxelize (all skipped) + a full-rebuild spike
+      // on every move. A plain update still refreshes the moved (auto-update)
+      // object, which is all the poll needs.
+      this.engine.scene.updateMatrixWorld();
       this._localLightsDirty = true;
       if (this.#pollMotion()) {
         this._sceneHashReady = true;
         this._voxelsDirtyAt = performance.now();
       }
-      // A first-motion promotion intentionally does not request a CPU bake:
-      // clearStaticFootprint + the dynamic splat are the visible live path.
-      // Still refresh the pool on this same gizmo event so the first changed
-      // pose reaches the inner cascade without waiting for the next tick.
       this.#syncDynamicPool();
     });
   }
@@ -353,9 +393,66 @@ export class GISystem {
     this._rebuildQueued = true;
   }
 
+  /**
+   * Effective quality knobs. A `quality` preset ("performance"/"balanced"/
+   * "quality") wins; "custom" (or unset) falls back to the individual advanced
+   * props so power users keep full control.
+   */
+  #qualityParams() {
+    const p = this.component?.props ?? {};
+    const preset = QUALITY_PRESETS[p.quality];
+    if (preset) return preset;
+    return {
+      voxelRes: Math.max(16, Math.min(160, Math.round(p.voxelRes) || 64)),
+      giResScale: Math.min(1, Math.max(0.25, p.giResScale ?? 0.5)),
+      probesPerFrame: Math.max(16, Math.round(p.probesPerFrame || 256)),
+      coneSteps: p.coneSteps ?? 8,
+      probeMotionSweeps: PROBE_MOTION_SWEEPS,
+      realtimeInject: p.realtimeLighting === true,
+      reflections: p.reflections !== false,
+    };
+  }
+
   /** Scene content changed — re-voxelize (debounced) without reallocating. */
   markVoxelsDirty() {
+    this._structuralDirty = true;
     this._voxelsDirtyAt = performance.now();
+  }
+
+  /**
+   * Signature of everything about the voxelizable mesh set that affects the
+   * static bake — identity, geometry, draw range, material — but deliberately
+   * NOT transform (moves go through the incremental/dynamic path). Cheap string
+   * build, orders of magnitude cheaper than the full re-voxelize it prevents.
+   */
+  #voxelizableMeshSignature() {
+    const parts = [];
+    forEachVoxelizableMesh(this.engine.scene, (mesh) => {
+      const geo = mesh.geometry;
+      const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+      parts.push(
+        `${mesh.uuid}:${geo?.id ?? 0}:${geo?.getAttribute?.("position")?.version ?? 0}:` +
+          `${geo?.drawRange?.start ?? 0}:${geo?.drawRange?.count ?? -1}:${mat?.uuid ?? 0}`,
+      );
+    });
+    parts.sort();
+    return parts.join("|");
+  }
+
+  /**
+   * Marks a structural re-voxelize ONLY when the mesh set genuinely changed.
+   * `hierarchy-changed`/`component-changed` fire constantly for prop edits,
+   * autosaves and async material reloads — none of which change what needs to
+   * be voxelized — so gating on the signature is what stops the per-edit and
+   * per-move full-rebuild spikes.
+   */
+  #markStructuralIfMeshSetChanged() {
+    const sig = this.#voxelizableMeshSignature();
+    if (sig === this._meshSetSignature) return false;
+    this._meshSetSignature = sig;
+    this._structuralDirty = true;
+    this._voxelsDirtyAt = performance.now();
+    return true;
   }
 
   /** Live environment/GI parameters changed without requiring reallocation. */
@@ -418,7 +515,7 @@ export class GISystem {
     // pass. Materials perform only four edge-aware reconstruction samples;
     // the expensive 3D cone trace is no longer duplicated for every lit
     // fragment and every overdraw layer.
-    const reflections = p.reflections !== false;
+    const reflections = this.#qualityParams().reflections;
     const specNodes = this.volumes[0].nodes;
     const volumes = this.volumes;
     const outerU = volumes[volumes.length - 1].nodes.uniforms;
@@ -466,6 +563,7 @@ export class GISystem {
     this._deferredResyncCount = 0;
     this._deferredResyncFrame = undefined;
 
+    this._structuralDirty = true;
     this._voxelsDirtyAt = 1; // voxelize on the next tick (already "overdue")
     this._debugView = p.debugView ?? (p.debugProbes ? "probes" : "off");
     if (this._debugView !== "off") this.#buildDebugMesh();
@@ -473,9 +571,10 @@ export class GISystem {
 
   /** Builds one cascade volume. `idx` 0 is the innermost/densest. */
   #buildVolume(p, idx, target, layout) {
+    const q = this.#qualityParams();
     const scale = layout.scale;
     const size = layout.size.clone();
-    const baseRes = Math.max(16, Math.min(160, Math.round(p.voxelRes) || 64));
+    const baseRes = q.voxelRes;
     // Outer cascades drop resolution — their voxels are 4× larger anyway,
     // and this keeps the added GPU cost of a cascade well under 1×.
     const res =
@@ -522,7 +621,7 @@ export class GISystem {
     const probeCount = counts.x * counts.y * counts.z;
     const probesPerFrame = Math.min(
       probeCount,
-      Math.max(16, Math.round((p.probesPerFrame || 256) / 2 ** idx)),
+      Math.max(16, Math.round(q.probesPerFrame / 2 ** idx)),
     );
     const tilesPerRow = Math.ceil(Math.sqrt(probeCount));
     const atlasW = tilesPerRow * OCTA_RES;
@@ -587,8 +686,8 @@ export class GISystem {
       atlasW,
       atlasH,
       mip,
-      coneSteps: p.coneSteps,
-      reflections: p.reflections !== false,
+      coneSteps: q.coneSteps,
+      reflections: q.reflections,
       // Outer cascades carry low-frequency light only: fewer, wider cones
       // and no specular — less WGSL in every material, cheaper blend zones.
       lite: idx > 0,
@@ -682,14 +781,21 @@ export class GISystem {
     // destroying those objects can leave an already-recorded bundle pointing
     // at a dead GPUTexture. A fixed half-res buffer naturally stretches with
     // screenUV when the viewport changes.
-    const width = old ? old.width * 2 : Math.max(4, _size.x || 4);
-    const height = old ? old.height * 2 : Math.max(4, _size.y || 4);
+    const resScale = this.#qualityParams().giResScale;
+    // Keep the full drawing-buffer size stable across rebuilds (the GI buffers
+    // are fixed and stretch via screenUV on viewport resize). Only reuse the
+    // textures when the target resolution is unchanged — a resScale change must
+    // allocate at the new size.
+    const width = old ? old.fullWidth : Math.max(4, _size.x || 4);
+    const height = old ? old.fullHeight : Math.max(4, _size.y || 4);
+    const reuse = old && old.resScale === resScale;
     this._deferred = createDeferredGI({
       width,
       height,
+      resScale,
       volumes: this.volumes,
       uniforms: this._deferredUniforms,
-      resources: old?.resources,
+      resources: reuse ? old.resources : undefined,
     });
     // Initialize attachment/storage usage before the GI light can sample
     // these textures. If a texture is first seen as a sampled binding and
@@ -932,7 +1038,22 @@ export class GISystem {
 
     if (this._voxelsDirtyAt && performance.now() - this._voxelsDirtyAt > REVOXELIZE_DELAY_MS) {
       this._voxelsDirtyAt = 0;
-      this.#voxelizeAll();
+      const boxes = this._dirtyBoxes;
+      this._dirtyBoxes = [];
+      const anyReady = this.volumes.some((v) => v.voxelReady);
+      if (this._structuralDirty || !anyReady) {
+        // Mesh added/removed or geometry swapped (or nothing baked yet): the
+        // whole scene must be rescanned.
+        this._structuralDirty = false;
+        this.#voxelizeAll();
+      } else if (boxes.length) {
+        // Only settled object footprints changed — rebake just those regions.
+        this.#voxelizeIncremental(boxes);
+      }
+      // else: a first-motion promotion set the dirty flag but there is nothing
+      // to bake yet (the mover lives in the GPU dynamic layer until it
+      // settles). Skipping avoids the wasteful mid-drag full rescan that used
+      // to fire ~120 ms into every drag.
     }
 
     // Dynamic meshes (perpetual movers the CPU voxelizer excludes) splat into
@@ -1053,10 +1174,29 @@ export class GISystem {
       }
     }
 
-    const lightingResponse = Math.min(
+    const responseBase = Math.min(
       2,
       Math.max(0.05, this.component.props.lightingResponse ?? 0.5),
     );
+    // Accelerate the EMA where a mover is (or just was) present. dynActive is
+    // the per-frame overlap test; the grace window carries the fast response
+    // through the ~1 s settle so the tail doesn't drop back to the slow
+    // constant the instant motion stops.
+    const recentlyDynamic =
+      dynActive ||
+      this._frame - (vol.lastDynamicFrame ?? -1e9) < DYNAMIC_GRACE_FRAMES;
+    const lightingResponse = recentlyDynamic
+      ? Math.min(responseBase, DYNAMIC_RESPONSE_SECONDS)
+      : responseBase;
+    // Emissive receiver cache (room surfaces lit BY emissive meshes) blend
+    // cap. A motion-time 0.85 was tried to snap a moving emissive light, but it
+    // made the cache JUMP whenever ANYTHING moved — moving a non-emissive
+    // occluder near the light flickered its shadow. A moving emissive already
+    // tracks via the voxEmissive splat, so keep the smooth 0.18 always;
+    // real-time occluder shadows come from realtimeInject (un-chunking), which
+    // updates the whole cache coherently in one frame rather than snapping a
+    // partial blend.
+    const emissiveCap = 0.18;
     let completedDirectSweep = false;
     if (vol.directStepsRemaining > 0) {
       const sweeps = Math.max(
@@ -1066,7 +1206,15 @@ export class GISystem {
       vol.nodes.uniforms.directBlend.value = vol.directInitialized
         ? 1 - Math.exp(-4 / sweeps)
         : 1;
-      const chunkBudget = 1;
+      // One direct chunk per frame normally. In the Quality tier's real-time
+      // mode, process the WHOLE direct+emissive light cache in one frame while
+      // a mover is present, so a moving light/occluder's shadow and first
+      // bounce update immediately instead of over ~16 frames. This is real GPU
+      // cost, paid only during motion and only when the user opts in.
+      const chunkBudget =
+        recentlyDynamic && this.#qualityParams().realtimeInject
+          ? vol.nodes.directChunks
+          : 1;
       for (let chunk = 0; chunk < chunkBudget; chunk++) {
         vol.nodes.uniforms.directChunk.value = vol.directChunk;
         r.compute(vol.nodes.injectDirectNode);
@@ -1095,7 +1243,7 @@ export class GISystem {
         vol.nodes.uniforms.emissiveBlend.value = initialEmissive
           ? 1
           : Math.min(
-              0.18,
+              emissiveCap,
               Math.max(
                 0.025,
                 1 - Math.exp(-elapsed / lightingResponse),
@@ -1147,7 +1295,7 @@ export class GISystem {
             );
       const elapsed = elapsedFrames * this._deltaTime;
       vol.nodes.uniforms.emissiveBlend.value = Math.min(
-        0.18,
+        emissiveCap,
         Math.max(
           0.025,
           1 - Math.exp(-elapsed / lightingResponse),
@@ -1226,10 +1374,18 @@ export class GISystem {
       vol.nodes.uniforms.feedbackWeight.value = 1;
     }
 
-    r.compute(vol.nodes.traceNode);
-    r.compute(vol.nodes.integrateNode);
-    vol.baseProbe =
-      (vol.baseProbe + vol.probesPerFrame) % vol.nodes.probeCount;
+    // Multi-bounce feedback: one probe window normally, several per frame
+    // while a mover is present so the bounce field catches up near real time.
+    const probeSweeps = recentlyDynamic
+      ? this.#qualityParams().probeMotionSweeps
+      : 1;
+    for (let s = 0; s < probeSweeps; s++) {
+      vol.nodes.uniforms.baseProbe.value = vol.baseProbe;
+      r.compute(vol.nodes.traceNode);
+      r.compute(vol.nodes.integrateNode);
+      vol.baseProbe =
+        (vol.baseProbe + vol.probesPerFrame) % vol.nodes.probeCount;
+    }
     if (vol.updatesRemaining > 0) vol.updatesRemaining--;
 
   }
@@ -1673,10 +1829,16 @@ export class GISystem {
         rec.still = 0;
         rec.settling = false;
         if (rec.dynamic) {
-          // A pose being baked moved again. Keep it in the dynamic layer and
-          // schedule a replacement static bake so a stale settled footprint
-          // cannot survive.
-          if (interruptedBake) dirty = true;
+          // A pose being baked moved again. A settling mesh may already have
+          // its footprint stamped into static at oldBox; clear it now (and
+          // remember the region) so the eventual incremental rebake restores
+          // it and no ghost survives. A still-dynamic mesh (not settling) has
+          // no static footprint yet, so nothing to clear.
+          if (interruptedBake) {
+            this.#clearStaticFootprint(oldBox);
+            (rec.staleBoxes ??= []).push(oldBox);
+            dirty = true;
+          }
           return;
         }
         rec.dynamic = true;
@@ -1684,8 +1846,11 @@ export class GISystem {
         // Remove the baked old pose immediately. Otherwise an opening wall
         // remains an occluder until the multi-second background rebake
         // publishes, then lighting jumps suddenly. The live dynamic splat
-        // supplies the new pose on this same update cycle.
+        // supplies the new pose on this same update cycle. Remember the
+        // cleared region so the settle-time incremental rebake restores any
+        // neighbouring geometry the AABB clear also wiped.
         this.#clearStaticFootprint(oldBox);
+        (rec.staleBoxes ??= []).push(oldBox);
         dirty = true;
       } else {
         rec.moving = 0;
@@ -1696,6 +1861,21 @@ export class GISystem {
           rec.still >= SETTLE_POLL_COUNT
         ) {
           rec.settling = true;
+          // The mover has come to rest: its footprint must return to the
+          // static grid. Record the regions to re-bake — every region the
+          // AABB clears wiped plus the mesh's final resting pose — so the
+          // debounced handler can rebake just these boxes instead of the
+          // whole scene. A null box (missing geometry bounds) forces the full
+          // path as a safe fallback.
+          if (rec.staleBoxes?.length) {
+            for (const b of rec.staleBoxes) this._dirtyBoxes.push(b);
+            rec.staleBoxes.length = 0;
+          }
+          // A null box means the mesh has no geometry bounds — nothing to bake
+          // incrementally, and NOT a reason to force a full-scene re-voxelize
+          // (that was a per-move spike when a degenerate mesh settled). Just
+          // skip it; a genuine structural change will rebuild if needed.
+          if (rec.box) this._dirtyBoxes.push(rec.box.clone());
           dirty = true;
         }
       }
@@ -1708,6 +1888,31 @@ export class GISystem {
     if (!geometry?.boundingBox) geometry?.computeBoundingBox?.();
     if (!geometry?.boundingBox) return null;
     return geometry.boundingBox.clone().applyMatrix4(mesh.matrixWorld);
+  }
+
+  /**
+   * Uploads ONLY the changed voxel span of the static buffers instead of the
+   * whole buffer. three's WebGPU backend honours `updateRanges` (partial
+   * `writeBuffer`); a plain `needsUpdate` re-uploads the entire buffer — tens
+   * of MB at high voxelRes, ~46 ms of `writeBuffer` on every re-voxelize (the
+   * measured "hitch when I move"). We mark the contiguous linear span from the
+   * region's min to max cell (over-covers only the rows between, still a small
+   * fraction of the grid for a normal object).
+   */
+  #uploadVoxelRegion(vol, x0, y0, z0, x1, y1, z1) {
+    const { dims } = vol.grid;
+    const stride = dims.x * dims.y;
+    const minIdx = x0 + y0 * dims.x + z0 * stride;
+    const maxIdx = (x1 - 1) + (y1 - 1) * dims.x + (z1 - 1) * stride;
+    const count = Math.max(1, maxIdx - minIdx + 1);
+    for (const buf of [
+      vol.buffers.voxStaticAlbedo,
+      vol.buffers.voxStaticNormal,
+      vol.buffers.voxStaticEmissive,
+    ]) {
+      buf.addUpdateRange(minIdx, count);
+      buf.needsUpdate = true;
+    }
   }
 
   #clearStaticFootprint(box) {
@@ -1735,9 +1940,7 @@ export class GISystem {
           }
         }
       }
-      vol.buffers.voxStaticAlbedo.needsUpdate = true;
-      vol.buffers.voxStaticNormal.needsUpdate = true;
-      vol.buffers.voxStaticEmissive.needsUpdate = true;
+      this.#uploadVoxelRegion(vol, x0, y0, z0, x1, y1, z1);
       vol.staticDirty = true;
       vol.pendingUpdate = true;
       // Do not interpret a long idle period as elapsed transition time. That
@@ -1806,6 +2009,7 @@ export class GISystem {
       const active = this.#volumeSeesDynamics(vol, pool);
       this._dynActive[i] = active;
       if (active && vol.voxelReady) {
+        vol.lastDynamicFrame = this._frame;
         this.#requestConvergence(vol, 1);
       }
     }
@@ -1896,7 +2100,21 @@ export class GISystem {
     // 8→40ms spike) and lets the in-flight job finish. The volume holds its
     // correct old center until the job swaps the new content in; the deadband
     // tolerates that lag.
-    if (this.volumes.some((v) => v.voxelJob || v.pendingRecenter)) return;
+    // Do not start a new recenter until the previous one's light cache has
+    // REALIGNED to the new center. injectDirect rebuilds both the sun and the
+    // emissive receiver caches over ~16 chunked frames (hidden by the cascade
+    // fade); a fresh recenter that interrupts that leaves the direct/emissive
+    // cache misaligned to the new center — the "lighting settles wrong" report
+    // once recentering became frequent enough to overlap. (Only the realign
+    // sweep is gated, not the slower emissive refinement blend, which can be
+    // interrupted harmlessly.)
+    if (
+      this.volumes.some(
+        (v) => v.voxelJob || v.pendingRecenter || v.directStepsRemaining > 0,
+      )
+    ) {
+      return;
+    }
     const newCenter = new THREE.Vector3(
       vol.center.x + steps.x * sw,
       vol.center.y + steps.y * sw,
@@ -1916,6 +2134,138 @@ export class GISystem {
     job.token.cancelled = true;
     vol.voxelJob = null;
     return true;
+  }
+
+  /**
+   * Rebakes only the regions touched by settled movers, in place, into the
+   * existing static buffers — the cheap path that replaces a full-scene
+   * rescan on every object move. Cost is proportional to the changed
+   * footprint, not the scene triangle count.
+   *
+   * Per volume: union the changed world boxes into a voxel region (already
+   * dilated a voxel when accumulated), clamp to the grid, and — unless the
+   * region covers a large fraction of the grid, where a full rebake is
+   * simpler — voxelize just that region from every intersecting mesh, then
+   * reclassify ambiguous cells locally. The global exterior BFS is skipped:
+   * the lighting shaders read the ambiguous (junction) bit but not the
+   * exterior bit, so a bounded local pass is sufficient.
+   *
+   * Writing in place is safe against the GPU: the live grid only re-reads the
+   * static buffers when `staticDirty` fires (the copy pass), which is set only
+   * after the bake completes and `needsUpdate` re-uploads the finished buffer.
+   */
+  #voxelizeIncremental(boxes) {
+    if (!boxes.length) return;
+    const promises = [];
+    for (const vol of this.volumes) {
+      if (!vol.voxelReady) continue;
+      const { min, dims, voxelSize } = vol.grid;
+      // Convert each dirty box to a clamped, 1-voxel-dilated region. Baking
+      // them SEPARATELY (not as one bounding union) is what keeps a long drag
+      // cheap: the start and end footprints are each small even when far
+      // apart, whereas their union could span — and rebuild — most of the
+      // volume (the "200 ms spike when I move an object" report).
+      const regions = [];
+      for (const b of boxes) {
+        if (!b || b.isEmpty()) continue;
+        const r = {
+          x0: Math.max(0, Math.floor((b.min.x - min.x) / voxelSize) - 1),
+          y0: Math.max(0, Math.floor((b.min.y - min.y) / voxelSize) - 1),
+          z0: Math.max(0, Math.floor((b.min.z - min.z) / voxelSize) - 1),
+          x1: Math.min(dims.x, Math.floor((b.max.x - min.x) / voxelSize) + 2),
+          y1: Math.min(dims.y, Math.floor((b.max.y - min.y) / voxelSize) + 2),
+          z1: Math.min(dims.z, Math.floor((b.max.z - min.z) / voxelSize) + 2),
+        };
+        if (r.x0 >= r.x1 || r.y0 >= r.y1 || r.z0 >= r.z1) continue;
+        regions.push(r);
+      }
+      if (!regions.length) continue;
+      // Merge only regions that actually overlap, so an in-place nudge does
+      // not bake the same cells twice while a far drag stays two small boxes.
+      const merged = [];
+      const overlaps = (a, c) =>
+        a.x0 < c.x1 && c.x0 < a.x1 && a.y0 < c.y1 && c.y0 < a.y1 && a.z0 < c.z1 && c.z0 < a.z1;
+      for (const r of regions) {
+        const m = merged.find((c) => overlaps(r, c));
+        if (m) {
+          m.x0 = Math.min(m.x0, r.x0); m.y0 = Math.min(m.y0, r.y0); m.z0 = Math.min(m.z0, r.z0);
+          m.x1 = Math.max(m.x1, r.x1); m.y1 = Math.max(m.y1, r.y1); m.z1 = Math.max(m.z1, r.z1);
+        } else {
+          merged.push({ ...r });
+        }
+      }
+      const totalCells = merged.reduce(
+        (s, r) => s + (r.x1 - r.x0) * (r.y1 - r.y0) * (r.z1 - r.z0),
+        0,
+      );
+      if (totalCells > vol.grid.count * 0.4) {
+        // Genuinely large change: a full rebake is not much dearer.
+        promises.push(this.#voxelize(vol));
+        continue;
+      }
+      this.#cancelVoxelize(vol);
+      const token = { cancelled: false };
+      const grid = {
+        ...vol.grid,
+        min: vol.grid.min.clone(),
+        dims: { ...vol.grid.dims },
+      };
+      const target = {
+        albedo: vol.buffers.voxStaticAlbedo.array,
+        normal: vol.buffers.voxStaticNormal.array,
+        emissive: vol.buffers.voxStaticEmissive.array,
+      };
+      const run = async () => {
+        for (const r of merged) {
+          if (token.cancelled) return;
+          const result = await voxelizeRegionAsync(
+            this.engine.scene, grid, target, r,
+            { skip: this.#skipMesh, signal: token, timeSliceMs: 5 },
+          );
+          if (token.cancelled || result?.cancelled || vol.voxelJob?.token !== token) return;
+          // Reclassify ambiguous cells one voxel beyond the baked region: a
+          // cell's junction status depends on its neighbours' occupancy.
+          reclassifyAmbiguousRegion(target.albedo, target.normal, grid.dims, {
+            x0: Math.max(0, r.x0 - 1), y0: Math.max(0, r.y0 - 1), z0: Math.max(0, r.z0 - 1),
+            x1: Math.min(dims.x, r.x1 + 1), y1: Math.min(dims.y, r.y1 + 1), z1: Math.min(dims.z, r.z1 + 1),
+          });
+        }
+      };
+      const promise = run()
+        .then(() => {
+          if (token.cancelled || vol.voxelJob?.token !== token) return;
+          vol.voxelJob = null;
+          // Upload only the baked regions (+ the 1-voxel ambiguous halo), not
+          // the whole multi-MB buffer.
+          for (const r of merged) {
+            this.#uploadVoxelRegion(
+              vol,
+              Math.max(0, r.x0 - 1), Math.max(0, r.y0 - 1), Math.max(0, r.z0 - 1),
+              Math.min(dims.x, r.x1 + 1), Math.min(dims.y, r.y1 + 1), Math.min(dims.z, r.z1 + 1),
+            );
+          }
+          vol.staticDirty = true;
+          vol.pendingUpdate = true;
+          vol.lastRadianceFrame = this._frame;
+          this.#requestConvergence(vol, CONVERGENCE_SWEEPS);
+          if (vol === this.volumes[0] && this._debugView === "voxels") {
+            this.#buildDebugMesh();
+          }
+        })
+        .catch((err) => {
+          if (!token.cancelled) {
+            console.error(`[gi] incremental voxelization failed: ${err.message}`);
+          }
+        })
+        .finally(() => {
+          if (vol.voxelJob?.token === token) vol.voxelJob = null;
+        });
+      vol.voxelJob = { token, promise };
+      promises.push(promise);
+    }
+    // Retire settled dynamic copies once their static footprint has landed, so
+    // the mover stops costing a per-frame splat without a one-frame vanish.
+    Promise.all(promises).then(() => this.#finalizeSettledDynamics());
   }
 
   /** Full scene rebuilds run one cascade at a time to avoid stacked slices. */
@@ -1985,6 +2335,11 @@ export class GISystem {
         vol.buffers.voxStaticAlbedo.array.set(target.albedo);
         vol.buffers.voxStaticNormal.array.set(target.normal);
         vol.buffers.voxStaticEmissive.array.set(target.emissive);
+        // Whole-buffer change: clear any pending partial range so three
+        // uploads the entire buffer, not just a stale region.
+        vol.buffers.voxStaticAlbedo.clearUpdateRanges();
+        vol.buffers.voxStaticNormal.clearUpdateRanges();
+        vol.buffers.voxStaticEmissive.clearUpdateRanges();
         vol.buffers.voxStaticAlbedo.needsUpdate = true;
         vol.buffers.voxStaticNormal.needsUpdate = true;
         vol.buffers.voxStaticEmissive.needsUpdate = true;
@@ -2034,34 +2389,88 @@ export class GISystem {
     };
     const grid = { ...vol.grid, min: newMin.clone(), dims: { ...dims } };
     const token = { cancelled: false };
-    const fullRegion = {
-      x0: 0, y0: 0, z0: 0,
-      x1: dims.x, y1: dims.y, z1: dims.z,
+    // Voxel shift in whole voxels (probe steps × voxels-per-probe-spacing).
+    const sVox = {
+      x: steps.x * vol.spacingVox,
+      y: steps.y * vol.spacingVox,
+      z: steps.z * vol.spacingVox,
     };
-    const promise = voxelizeRegionAsync(
-      this.engine.scene,
-      grid,
-      target,
-      fullRegion,
-      { skip: this.#skipMesh, signal: token, timeSliceMs: 6 },
-    )
-      .then(async (result) => {
-        if (token.cancelled || result.cancelled || vol.voxelJob?.token !== token) return;
-        const enclosure = await markExteriorEmptyVoxelsAsync(
-          target.albedo,
-          target.normal,
-          grid.dims,
-          { signal: token },
+    // A full-volume rebuild takes seconds and, being single-flight, BLOCKS
+    // every further recenter until it finishes — so the clipmap could not keep
+    // up with the camera, lagged far behind, and caught up in one lurching
+    // recenter with a deep fade-to-coarse (the "old lighting flashes" report).
+    // Instead scroll the survivors (toroidal shift) and re-voxelize only the
+    // newly exposed boundary slabs; the boundary is a small fraction of the
+    // volume, so this completes in a frame or two and tracks the camera.
+    const canShift =
+      !teleport &&
+      Math.abs(sVox.x) < dims.x &&
+      Math.abs(sVox.y) < dims.y &&
+      Math.abs(sVox.z) < dims.z;
+
+    // The exposed slabs after shifting by sVox: for each axis the boundary on
+    // the side the volume moved toward (its cells scrolled in as zeros).
+    const exposedSlabs = () => {
+      const full = { x0: 0, y0: 0, z0: 0, x1: dims.x, y1: dims.y, z1: dims.z };
+      const slabs = [];
+      if (sVox.x > 0) slabs.push({ ...full, x0: dims.x - sVox.x });
+      else if (sVox.x < 0) slabs.push({ ...full, x1: -sVox.x });
+      if (sVox.y > 0) slabs.push({ ...full, y0: dims.y - sVox.y });
+      else if (sVox.y < 0) slabs.push({ ...full, y1: -sVox.y });
+      if (sVox.z > 0) slabs.push({ ...full, z0: dims.z - sVox.z });
+      else if (sVox.z < 0) slabs.push({ ...full, z1: -sVox.z });
+      return slabs;
+    };
+
+    const build = async () => {
+      if (!canShift) {
+        // Teleport / grid-sized jump: no survivors, rebuild everything.
+        const r = await voxelizeRegionAsync(
+          this.engine.scene, grid, target,
+          { x0: 0, y0: 0, z0: 0, x1: dims.x, y1: dims.y, z1: dims.z },
+          { skip: this.#skipMesh, signal: token, timeSliceMs: 6 },
         );
-        if (token.cancelled || vol.voxelJob?.token !== token) return;
+        if (token.cancelled || r.cancelled) return { cancelled: true };
+        await markExteriorEmptyVoxelsAsync(target.albedo, target.normal, grid.dims, { signal: token });
+        return { cancelled: token.cancelled };
+      }
+      // Scroll survivors into target, then fill only the exposed slabs.
+      const scratch = new Uint32Array(vol.grid.count);
+      target.albedo.set(vol.buffers.voxStaticAlbedo.array); shiftGrid(target.albedo, dims, sVox, scratch);
+      target.normal.set(vol.buffers.voxStaticNormal.array); shiftGrid(target.normal, dims, sVox, scratch);
+      target.emissive.set(vol.buffers.voxStaticEmissive.array); shiftGrid(target.emissive, dims, sVox, scratch);
+      for (const region of exposedSlabs()) {
+        if (token.cancelled) return { cancelled: true };
+        const r = await voxelizeRegionAsync(
+          this.engine.scene, grid, target, region,
+          { skip: this.#skipMesh, signal: token, timeSliceMs: 6 },
+        );
+        if (token.cancelled || r.cancelled) return { cancelled: true };
+        // Local ambiguous re-tag at the seam (survivors kept their bits under
+        // the shift; only the new slab + its one-voxel border need it).
+        reclassifyAmbiguousRegion(target.albedo, target.normal, dims, {
+          x0: Math.max(0, region.x0 - 1), y0: Math.max(0, region.y0 - 1), z0: Math.max(0, region.z0 - 1),
+          x1: Math.min(dims.x, region.x1 + 1), y1: Math.min(dims.y, region.y1 + 1), z1: Math.min(dims.z, region.z1 + 1),
+        });
+      }
+      return { cancelled: token.cancelled };
+    };
+
+    const promise = build()
+      .then(async (result) => {
+        if (token.cancelled || result?.cancelled || vol.voxelJob?.token !== token) return;
         vol.voxelJob = null;
-        this.#logEnclosure(vol, enclosure);
         // Publish only the static staging data here. Direct lighting and the
         // radiance pyramid are built over subsequent bounded update frames;
         // the visible origin remains unchanged until all of them are ready.
         vol.buffers.voxStaticAlbedo.array.set(target.albedo);
         vol.buffers.voxStaticNormal.array.set(target.normal);
         vol.buffers.voxStaticEmissive.array.set(target.emissive);
+        // Whole-buffer change: clear any pending partial range so three
+        // uploads the entire buffer, not just a stale region.
+        vol.buffers.voxStaticAlbedo.clearUpdateRanges();
+        vol.buffers.voxStaticNormal.clearUpdateRanges();
+        vol.buffers.voxStaticEmissive.clearUpdateRanges();
         vol.buffers.voxStaticAlbedo.needsUpdate = true;
         vol.buffers.voxStaticNormal.needsUpdate = true;
         vol.buffers.voxStaticEmissive.needsUpdate = true;
@@ -2450,16 +2859,26 @@ export class GISystem {
     // lighting survived; moving an object merely kept scheduling sweeps until
     // it eventually looked correct. While work is pending, converge with a
     // bounded half-life, then restore the user's high steady-state stability.
-    u.hysteresis.value =
+    const idx = this.volumes.indexOf(vol);
+    const recentlyDynamic =
+      this._dynActive[idx] === true ||
+      this._frame - (vol.lastDynamicFrame ?? -1e9) < DYNAMIC_GRACE_FRAMES;
+    const pendingWork =
       vol.updatesRemaining > 0 ||
       vol.directStepsRemaining > 0 ||
       vol.emissiveBlendStepsRemaining > 0 ||
       vol.staticDirty ||
-      vol.pendingRecenter
+      vol.pendingRecenter;
+    // 0.35 during any convergence work (moving or not). An earlier 0.15
+    // motion cap converged faster but made probes adopt their noisy 64-ray
+    // estimate too aggressively — visible flicker on moving objects. 0.35
+    // keeps enough history to stay stable; speed comes from more sweeps +
+    // realtimeInject, not from starving the temporal filter.
+    u.hysteresis.value =
+      recentlyDynamic || pendingWork
         ? Math.min(configuredHysteresis, 0.35)
         : configuredHysteresis;
-    u.connectivityGate.value =
-      this._dynActive[this.volumes.indexOf(vol)] === true ? 0 : 1;
+    u.connectivityGate.value = this._dynActive[idx] === true ? 0 : 1;
     u.aoStrength.value = Math.min(1, Math.max(0, p.aoStrength ?? 0.4));
     u.aoRadius.value = Math.min(12, Math.max(1, p.aoRadius ?? 2.5));
     u.normalBias.value = Math.max(0, p.normalBias ?? 0.3);
@@ -2613,6 +3032,7 @@ export class GISystem {
         record = {
           castShadow: light.castShadow,
           shadowNode: light.shadow?.shadowNode,
+          appliedShadowNode: light.shadow?.shadowNode,
         };
         patch.lights.set(light, record);
       }
@@ -2633,6 +3053,17 @@ export class GISystem {
         }
         light.shadow.needsUpdate = true;
       }
+      const currentShadowNode = light.shadow?.shadowNode;
+      const applied = record.appliedShadowNode;
+      // The CSM node is replaced wholesale on renderer rebuilds and on
+      // csm/csmCascades/csmMode/csmMaxFar changes; the patch must treat that
+      // as a normal external swap and keep tracking the new node instead of
+      // restoring the disposed one.
+      const wasExternallyReplaced =
+        currentShadowNode && applied && currentShadowNode !== applied;
+      if (wasExternallyReplaced) {
+        record.shadowNode = currentShadowNode;
+      }
       const desiredShadowNode =
         dfEnabled && light === sun
           ? this._dfSunShadowNode
@@ -2641,13 +3072,19 @@ export class GISystem {
         light.shadow.shadowNode = desiredShadowNode;
         light.shadow.needsUpdate = true;
       }
+      record.appliedShadowNode = desiredShadowNode;
     }
 
     for (const [light, record] of patch.lights) {
       if (active.has(light)) continue;
+      const currentShadowNode = light.shadow?.shadowNode;
+      const wasExternallyReplaced =
+        currentShadowNode &&
+        record.appliedShadowNode &&
+        currentShadowNode !== record.appliedShadowNode;
       light.castShadow = record.castShadow;
       if (light.shadow) {
-        light.shadow.shadowNode = record.shadowNode;
+        if (!wasExternallyReplaced) light.shadow.shadowNode = record.shadowNode;
         if (record.bias !== undefined) {
           light.shadow.bias = record.bias;
           light.shadow.normalBias = record.normalBias;
@@ -2666,7 +3103,12 @@ export class GISystem {
       for (const [light, record] of patch.lights) {
         light.castShadow = record.castShadow;
         if (light.shadow) {
-          light.shadow.shadowNode = record.shadowNode;
+          const currentShadowNode = light.shadow?.shadowNode;
+          const wasExternallyReplaced =
+            currentShadowNode &&
+            record.appliedShadowNode &&
+            currentShadowNode !== record.appliedShadowNode;
+          if (!wasExternallyReplaced) light.shadow.shadowNode = record.shadowNode;
           if (record.bias !== undefined) {
             light.shadow.bias = record.bias;
             light.shadow.normalBias = record.normalBias;

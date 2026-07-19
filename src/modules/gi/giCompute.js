@@ -312,6 +312,9 @@ export function createGINodes(cfg) {
     probeData.element(uint(cfg.probeLayout[section]).add(uint(index)));
   const lightAt = (lightIndex, field) =>
     lightData.element(uint(lightIndex * 5 + field));
+  // Dynamic (node) index variant for the local-light GPU Loop.
+  const lightAtDyn = (iNode, field) =>
+    lightData.element(iNode.mul(uint(5)).add(uint(field)));
   const atlasTex = texture(cfg.atlas);
   const radianceTex = texture3D(cfg.radianceAtlas);
   const radianceAtlasDims = vec3(
@@ -1131,13 +1134,17 @@ export function createGINodes(cfg) {
         // Camera-independent source injection. Directional/point/spot lights
         // and off-volume emissive proxies share this bounded buffer, so
         // walking past a source does not erase its bounce from the room.
-        for (let lightIndex = 0; lightIndex < MAX_LOCAL_LIGHTS; lightIndex++) {
-          If(uint(lightIndex).lessThan(u.localLightCount), () => {
-            const posRange = lightAt(lightIndex, 0);
-            const colorType = lightAt(lightIndex, 1);
-            const dirOuter = lightAt(lightIndex, 2);
-            const params = lightAt(lightIndex, 3);
-            const extra = lightAt(lightIndex, 4);
+        // Real GPU loop over local lights, NOT a JS-unrolled one. The unrolled
+        // 8× version made injectDirect an enormous shader that took ~13 s to
+        // compile (the editor froze on every GI rebuild). Same output, ~8×
+        // smaller shader, far faster compile.
+        Loop(MAX_LOCAL_LIGHTS, ({ i }) => {
+          If(i.lessThan(u.localLightCount), () => {
+            const posRange = lightAtDyn(i, 0);
+            const colorType = lightAtDyn(i, 1);
+            const dirOuter = lightAtDyn(i, 2);
+            const params = lightAtDyn(i, 3);
+            const extra = lightAtDyn(i, 4);
             const isDirectional = colorType.w
               .greaterThan(1.5)
               .and(colorType.w.lessThan(2.5));
@@ -1418,7 +1425,7 @@ export function createGINodes(cfg) {
               },
             );
           });
-        }
+        });
         // Junction cells (AMBIGUOUS_NORMAL) have meaningless normals: the
         // 1.75-voxel shadow-ray lift exits through a one-voxel wall and
         // caches bright exterior light inside sealed corners, seen as
@@ -1427,7 +1434,15 @@ export function createGINodes(cfg) {
           normalWord.shiftRight(uint(27)).bitAnd(uint(1)).toFloat(),
         );
         direct.mulAssign(reliableNormal);
-        emissiveDirect.mulAssign(reliableNormal);
+        // Emissive, unlike the sun, is isotropic incident light and its area
+        // proxies carry their own visibility march — the wall-leak that forces
+        // the sun off at junction cells does not apply. Fully zeroing it here
+        // (the old `reliableNormal` gate) left any surface an emissive object
+        // rests ON or is embedded IN unlit, because the contact voxels are
+        // junction (AMBIGUOUS) cells: e.g. a glowing box sunk into the floor
+        // stopped lighting the floor. Keep most of the emissive at those cells.
+        const emissiveReliable = max(reliableNormal, float(0.75));
+        emissiveDirect.mulAssign(emissiveReliable);
         const previous = unpackRGBE8(voxDirectStaging.element(vi));
         const previousEmissive = unpackRGBE8(
           voxEmissiveDirectStaging.element(vi),
@@ -2338,13 +2353,15 @@ export function createGINodes(cfg) {
     const selectedPosition = P.add(
       N.mul(u.voxelSize.mul(selectedOffset)),
     );
+    // Wider tangent-plane blur (8 taps, ~1.5-voxel ring): a 1-cell cross left
+    // the trilinear "diamond" irradiance patches visible on flat walls/floors.
+    // All taps keep the normal-aware validity (tap.w) so this never borrows
+    // through an edge or an opposite wall.
     const filtered = result.mul(bestSupport.mul(4)).toVar();
     const filterWeight = bestSupport.mul(4).toVar();
     for (const offset of [
-      [-0.85, 0],
-      [0.85, 0],
-      [0, -0.85],
-      [0, 0.85],
+      [-1.5, 0], [1.5, 0], [0, -1.5], [0, 1.5],
+      [-1.1, -1.1], [1.1, -1.1], [-1.1, 1.1], [1.1, 1.1],
     ]) {
       const tap = sampleEmissiveCacheTrilinear(
         selectedPosition

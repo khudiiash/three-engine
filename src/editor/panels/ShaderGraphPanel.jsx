@@ -27,11 +27,16 @@ import {
   setUniformValue,
 } from "../../engine/tslGraph.js";
 import { migrateLegacyGraph } from "../../engine/shaderGraph.js";
-import { MATERIAL_DEFAULTS, getMaterialDef, loadMaterialAsset, updateMaterialAsset, syncMaterialRenderState, applyGraphMutations } from "../../engine/materialAsset.js";
+import { MATERIAL_DEFAULTS, getDefaultMaterial, getMaterialDef, loadMaterialAsset, updateMaterialAsset, syncMaterialRenderState, applyGraphMutations } from "../../engine/materialAsset.js";
 import { renderNodeThumb } from "../nodegraph/nodePreview.js";
 import { setGraphHovered } from "../nodegraph/graphContext.js";
 import { AssetField } from "../fields/AssetField.jsx";
 import { TEXTURE_EXTENSIONS } from "../assetLoader.js";
+import { useProjectStore } from "../store/projectStore.js";
+import { commandBus } from "../commands/CommandBus.js";
+import { SetComponentPropCommand } from "../commands/componentCommands.js";
+import { engine } from "../engineInstance.js";
+import { createDefaultMaterialFork } from "../defaultMaterialFork.js";
 
 /** Resolve the existing material def for `matPath`. Prefers the in-memory
  *  cache (which has whatever the user has been editing this session), but
@@ -400,7 +405,7 @@ function MaterialPreview({ material }) {
   );
 }
 
-function ShaderGraphEditor({ matPath }) {
+function ShaderGraphEditor({ matPath, defaultEntity }) {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -423,9 +428,9 @@ function ShaderGraphEditor({ matPath }) {
     let live = true;
     loadedRef.current = false;
     (async () => {
-      const mat = await loadMaterialAsset(matPath);
-      let def = getMaterialDef(matPath);
-      if (!def) {
+      const mat = matPath ? await loadMaterialAsset(matPath) : getDefaultMaterial();
+      let def = matPath ? getMaterialDef(matPath) : MATERIAL_DEFAULTS;
+      if (matPath && !def) {
         try {
           const { invoke } = await import("@tauri-apps/api/core");
           def = JSON.parse(await invoke("read_text_file", { path: matPath }));
@@ -494,7 +499,10 @@ function ShaderGraphEditor({ matPath }) {
   // Recompile (debounced): apply to the shared material, refresh uniforms,
   // render thumbnails for tapped nodes.
   useEffect(() => {
-    if (!loadedRef.current || !material) return;
+    // Never compile edits into the shared Default material. Its first change
+    // is persisted as a new asset below; the assigned asset then remounts this
+    // editor and follows the normal live-compile path.
+    if (!loadedRef.current || !material || !matPath) return;
     const timer = setTimeout(async () => {
       const graph = flowToGraph(nodes, edges);
       const taps = nodes.filter((n) => n.data.props.__thumb).map((n) => n.id);
@@ -552,13 +560,31 @@ function ShaderGraphEditor({ matPath }) {
       // Pull the existing def (cache, falling back to disk) so we don't
       // clobber color/roughness/metalness/map with MATERIAL_DEFAULTS on
       // first save.
-      const existing = await resolveMaterialDefForSave(matPath);
-      const def = { ...MATERIAL_DEFAULTS, ...existing, shaderGraph: graph };
-      const cached = getMaterialDef(matPath);
-      if (cached) cached.shaderGraph = graph;
       try {
         const { invoke } = await import("@tauri-apps/api/core");
-        await invoke("save_scene", { path: matPath, contents: JSON.stringify(def, null, 2) });
+        if (!matPath) {
+          const liveMesh = engine.getEntity(defaultEntity?.id)?.getComponent("mesh");
+          // The debounce can overlap an assignment from another editor action.
+          // Fork only if Material 1 is still the Default material.
+          if (!liveMesh || liveMesh.props.material) return;
+          const project = useProjectStore.getState();
+          const forkPath = await createDefaultMaterialFork({
+            rootPath: project.rootPath,
+            entityName: engine.getEntity(defaultEntity.id)?.name ?? defaultEntity.name,
+            graph,
+            listDirectory: (path) => invoke("list_dir", { path }),
+            saveFile: (path, contents) => invoke("save_scene", { path, contents }),
+          });
+          if (liveMesh.props.material) return;
+          commandBus.execute(new SetComponentPropCommand(defaultEntity.id, "mesh", "material", forkPath));
+          await useProjectStore.getState().refresh();
+        } else {
+          const existing = await resolveMaterialDefForSave(matPath);
+          const def = { ...MATERIAL_DEFAULTS, ...existing, shaderGraph: graph };
+          const cached = getMaterialDef(matPath);
+          if (cached) cached.shaderGraph = graph;
+          await invoke("save_scene", { path: matPath, contents: JSON.stringify(def, null, 2) });
+        }
         setSaved(true);
       } catch (err) {
         console.error(`Shader graph save: ${err.message}`);
@@ -662,8 +688,8 @@ function ShaderGraphEditor({ matPath }) {
           </button>
           {menuOpen && <NodeSearchPalette onPick={(type) => addNode(type)} onClose={() => setMenuOpen(false)} />}
         </div>
-        <span className="asset-path" title={matPath}>
-          {matPath.split(/[\\/]/).pop()}
+        <span className="asset-path" title={matPath ?? "Default material"}>
+          {matPath ? matPath.split(/[\\/]/).pop() : "Default"}
         </span>
         <span className={`shader-save-state${saved ? " saved" : ""}`}>{saved ? "Saved" : "Saving…"}</span>
         <button className="toolbar-btn" title="Copy graph as three/tsl JavaScript" onClick={copyCode}>
@@ -727,18 +753,25 @@ export function ShaderGraphPanel() {
   const entity = useSceneStore((s) => (selectedId ? s.entities[selectedId] : null));
   const matPath =
     assetPath?.toLowerCase().endsWith(".mat") ? assetPath : entity?.components?.mesh?.material || null;
+  const defaultEntity = !assetPath && entity?.components?.mesh && !entity.components.mesh.material
+    ? { id: entity.id, name: entity.name }
+    : null;
 
-  if (!matPath) {
+  if (!matPath && !defaultEntity) {
     return (
       <div className="shader-graph-panel empty">
-        Select a .mat asset (or an entity whose Mesh has one assigned) to edit its shader graph.
+        Select a .mat asset or an entity with a Mesh component to edit its shader graph.
       </div>
     );
   }
 
   return (
     <ReactFlowProvider>
-      <ShaderGraphEditor key={matPath} matPath={matPath} />
+      <ShaderGraphEditor
+        key={matPath ?? `default:${defaultEntity.id}`}
+        matPath={matPath}
+        defaultEntity={defaultEntity}
+      />
     </ReactFlowProvider>
   );
 }

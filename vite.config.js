@@ -92,6 +92,7 @@ export default defineConfig(async () => ({
       "three/examples/jsm/tsl/display/SSGINode.js",
       "three/examples/jsm/tsl/display/SSRNode.js",
       "three/examples/jsm/tsl/display/DenoiseNode.js",
+      "three/examples/jsm/tsl/display/TRAANode.js",
       "three/examples/jsm/tsl/display/BloomNode.js",
       "three/examples/jsm/tsl/display/GodraysNode.js",
       "three/examples/jsm/tsl/display/depthAwareBlend.js",

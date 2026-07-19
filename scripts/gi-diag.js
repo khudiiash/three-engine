@@ -74,6 +74,29 @@ giEntity.addComponent("global-illumination", {
 engine.start();
 const system = handle.system;
 
+// Tag every compute pass with a readable name so the compute wrapper below can
+// report WHICH pass compiles/stalls and WHEN (startup warmup vs object drag).
+const tagPasses = () => {
+  for (let i = 0; i < system.volumes.length; i++) {
+    const v = system.volumes[i];
+    const n = v.nodes;
+    const tag = (node, label) => { if (node && !node.name) node.name = `c${i}:${label}`; };
+    tag(n.injectNode, "inject");
+    tag(n.injectDirectNode, "injectDirect");
+    tag(n.publishDirectNode, "publishDirect");
+    tag(n.blendEmissiveDirectNode, "blendEmissive");
+    tag(n.copyNode, "copy");
+    tag(n.traceNode, "trace");
+    tag(n.integrateNode, "integrate");
+    tag(n.probeShiftSaveNode, "probeShiftSave");
+    tag(n.probeShiftApplyNode, "probeShiftApply");
+    (n.mipPasses || []).forEach((p, k) => tag(p, `mip${k}`));
+    tag(v.dynNodes?.copyNode, "dynCopy");
+    tag(v.dynNodes?.splatNode, "dynSplat");
+  }
+};
+tagPasses();
+
 // Instrument pipeline creation and per-frame stalls to find what blocks the
 // main thread during startup.
 {
@@ -111,7 +134,7 @@ const system = handle.system;
     const c0 = performance.now();
     const value = originalCompute(...args);
     const ms = performance.now() - c0;
-    if (ms > 100) log(`compute ${ms.toFixed(0)}ms ${args[0]?.name || ""}`);
+    if (ms > 40) log(`compute ${ms.toFixed(0)}ms ${args[0]?.name || "?"}`);
     return value;
   };
   let lastFrameAt = performance.now();
@@ -267,6 +290,21 @@ async function readStats(label) {
       ` probeIn=${inN ? (inSum / inN).toFixed(4) : "n/a"} (n=${inN}, max=${inMax.toFixed(4)})` +
       ` probeOut=${outN ? (outSum / outN).toFixed(4) : "n/a"} (n=${outN})`,
   );
+  // Cheap scheduler-state snapshot (no GPU readback) — reveals which throttle
+  // owns the convergence tail: probe-sweep budget (updatesRemaining), the
+  // radiance EMA (radianceBlend), the direct-refresh sweep (directStepsRemaining),
+  // or the dynamic-layer gate (dynActive).
+  const u = vol.nodes.uniforms;
+  log(
+    `${label} SCHED updatesRemaining=${vol.updatesRemaining}` +
+      ` directStepsRemaining=${vol.directStepsRemaining}` +
+      ` emissiveBlendStepsRemaining=${vol.emissiveBlendStepsRemaining}` +
+      ` radianceBlend=${u.radianceBlend.value.toFixed(3)}` +
+      ` directBlend=${u.directBlend.value.toFixed(3)}` +
+      ` baseProbe=${vol.baseProbe}/${vol.nodes.probeCount}` +
+      ` dynActive0=${system._dynActive?.[0] === true}` +
+      ` workCursor=${system._workCursor} cascades=${system.volumes.length}`,
+  );
   return { inMean: inN ? inSum / inN : 0, outMean: outN ? outSum / outN : 0 };
 }
 
@@ -325,7 +363,9 @@ frontWall.position.y = endY;
 frontWall.updateMatrixWorld(true);
 log("RELEASED wall");
 let elapsed = 0;
-for (const target of [700, 1500, 3000, 5000, 9000, 13000]) {
+// Fine sampling through the first 2 s (where the user sees "nothing happens")
+// then coarser out to steady state.
+for (const target of [250, 500, 800, 1200, 1800, 2500, 3500, 5000, 8000, 13000]) {
   await wait(target - elapsed);
   elapsed = target;
   await readStats(`AFTER@${target}ms`);

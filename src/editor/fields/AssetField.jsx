@@ -104,6 +104,7 @@ export function AssetField({ descriptor, value, onCommit }) {
   const [options, setOptions] = useState(null);
 
   const exts = descriptor.exts ?? [];
+  const emptyLabel = descriptor.emptyLabel ?? "None";
   const showThumb = value && [...TEXTURE_EXTENSIONS, ...MATERIAL_EXTENSIONS].includes(extOf(value));
 
   const dropRef = useAssetDrop({ accepts: exts, onDrop: onCommit });
@@ -119,12 +120,12 @@ export function AssetField({ descriptor, value, onCommit }) {
     <div className="dropdown-wrap asset-field-wrap">
       <div
         className={`asset-field ${value ? "" : "empty"}`}
-        title={value || "Drop an asset here or browse"}
+        title={value || `${emptyLabel} — drop an asset here or browse`}
         ref={dropRef}
         onClick={browse}
       >
         {showThumb && <OptionThumb path={value} />}
-        <span className="asset-field-name">{value ? fileName(value) : "None"}</span>
+        <span className="asset-field-name">{value ? fileName(value) : emptyLabel}</span>
         <span className="asset-field-caret">
           <ChevronDown size={12} />
         </span>
@@ -140,7 +141,7 @@ export function AssetField({ descriptor, value, onCommit }) {
                 onCommit("");
               }}
             >
-              None
+              {emptyLabel}
             </button>
             {options === null && <div className="dropdown-item">Loading…</div>}
             {options?.map((path) => (

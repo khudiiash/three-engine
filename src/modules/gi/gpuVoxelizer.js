@@ -44,6 +44,14 @@ import {
 
 export const MAX_DYNAMIC_MESHES = 64;
 export const DYNAMIC_TRI_CAPACITY = 32768;
+// A single high-poly mover must not consume the whole pool (that starved every
+// other mover) nor be dropped entirely (that made a detailed object vanish
+// from GI the moment it started moving and only reappear ~1 s later when the
+// static bake caught up — the "lighting redraws much later" lag). Instead each
+// mesh is stride-decimated to fit this budget; GI is low frequency, so a coarse
+// triangle subset still occludes and bounces correctly during motion, and the
+// exact geometry lands on settle.
+export const DYNAMIC_TRI_PER_MESH = 12288;
 // vec4 records per triangle: [v0|meshIdx], [v1|-], [v2|-], [albedo|-], [emissive|-]
 export const VEC4S_PER_TRI = 5;
 // Caps the barycentric lattice per thread. Edges longer than ~24 voxels get
@@ -128,13 +136,20 @@ export class DynamicVoxelPool {
         ? Math.max(0, Math.min(sourceCount - drawStart, requestedCount))
         : sourceCount - drawStart;
       const triCount = Math.floor(drawCount / 3);
-      if (tri + triCount > DYNAMIC_TRI_CAPACITY) {
+      if (triCount <= 0) continue;
+      // Fit the mesh into the remaining pool by stride-decimation rather than
+      // dropping it: emit every `stride`-th triangle up to `budget`.
+      const remaining = DYNAMIC_TRI_CAPACITY - tri;
+      if (remaining <= 0) {
         if (!this._warnedCapacity) {
           this._warnedCapacity = true;
           console.warn(`[gi] dynamic triangle pool full (${DYNAMIC_TRI_CAPACITY}); skipping ${mesh.name || mesh.uuid.slice(0, 8)}`);
         }
         continue;
       }
+      const budget = Math.min(triCount, remaining, DYNAMIC_TRI_PER_MESH);
+      const stride = Math.max(1, Math.ceil(triCount / budget));
+      const emitCount = Math.min(budget, Math.floor((triCount - 1) / stride) + 1);
       const meshIdx = this.meshes.length;
       readMeshGIColors(mesh, _poolColor, _poolEmissive);
       const sidedness = readMeshGISidedness(mesh);
@@ -144,10 +159,11 @@ export class DynamicVoxelPool {
       const er = Math.min(1, Math.max(0, _poolEmissive.r));
       const eg = Math.min(1, Math.max(0, _poolEmissive.g));
       const eb = Math.min(1, Math.max(0, _poolEmissive.b));
-      for (let t = 0; t < triCount; t++) {
+      for (let t = 0; t < emitCount; t++) {
+        const srcTri = t * stride; // stride-decimated source triangle
         const base = (tri + t) * VEC4S_PER_TRI * 4;
         for (let corner = 0; corner < 3; corner++) {
-          const drawIndex = drawStart + t * 3 + corner;
+          const drawIndex = drawStart + srcTri * 3 + corner;
           const i = indexOverride
             ? indexOverride[drawIndex]
             : index
@@ -169,7 +185,7 @@ export class DynamicVoxelPool {
         arr[base + 18] = eb;
         arr[base + 19] = 0;
       }
-      tri += triCount;
+      tri += emitCount;
       this.meshes.push(mesh);
     }
     this.count = tri;

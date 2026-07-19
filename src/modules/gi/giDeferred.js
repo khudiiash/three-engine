@@ -42,9 +42,14 @@ export function createDeferredGI({
   volumes,
   uniforms = null,
   resources = null,
+  resScale = 0.5,
 }) {
-  const w = Math.max(2, Math.floor(width / 2));
-  const h = Math.max(2, Math.floor(height / 2));
+  // resScale controls the GI compute resolution vs. the screen: 0.5 = half-res
+  // (fast, blockier under the bilinear upsample), 1.0 = full-res (smooth, the
+  // Quality lever for "lighting is blocky"). `width`/`height` are the full
+  // drawing-buffer size; the GI buffers are scaled down from there.
+  const w = Math.max(2, Math.floor(width * resScale));
+  const h = Math.max(2, Math.floor(height * resScale));
 
   let depthTexture = resources?.depthTexture ?? null;
   let gbuffer = resources?.gbuffer ?? null;
@@ -195,53 +200,39 @@ export function createDeferredGI({
         const spatialWeightSum = float(2).toVar();
         const halfTexel = vec2(0.5 / w, 0.5 / h);
 
-        for (const offset of [
-          [-1, -1], [0, -1], [1, -1],
-          [-1,  0],           [1,  0],
-          [-1,  1], [0,  1], [1,  1],
-        ]) {
-          const sampleUv = clamp(
-            uv.add(vec2(offset[0] / w, offset[1] / h)),
-            halfTexel,
-            vec2(1).sub(halfTexel),
-          );
-          const sampleDepth = depthTex
-            .sample(sampleUv)
-            .level(0)
-            .x
-            .toVar();
-          If(sampleDepth.lessThan(0.99999), () => {
-            const sampleNormal = normalize(
-              normalTex
-                .sample(sampleUv)
-                .level(0)
-                .xyz
-                .mul(2)
-                .sub(1),
+        // 5x5 bilateral footprint (radius 2): the trilinear voxel blocks are
+        // wider than a 3x3 half-res kernel can smooth, so this reaches farther
+        // while the normal/depth gates keep silhouettes and corners crisp. Each
+        // tap also gets a Gaussian spatial falloff so nearer neighbours dominate
+        // (avoids a boxy over-blur).
+        const RADIUS = 2;
+        const SIGMA2 = 2 * 1.4 * 1.4;
+        for (let oy = -RADIUS; oy <= RADIUS; oy++) {
+          for (let ox = -RADIUS; ox <= RADIUS; ox++) {
+            if (ox === 0 && oy === 0) continue;
+            const spatialW = Math.exp(-(ox * ox + oy * oy) / SIGMA2);
+            const sampleUv = clamp(
+              uv.add(vec2(ox / w, oy / h)),
+              halfTexel,
+              vec2(1).sub(halfTexel),
             );
-            const sampleViewPos = getViewPosition(
-              sampleUv,
-              sampleDepth,
-              uProjInv,
-            );
-            const normalWeight = pow(
-              max(dot(centerNormal, sampleNormal), 0),
-              24,
-            );
-            const depthWeight = float(1).div(
-              float(1).add(
-                sampleViewPos.z
-                  .sub(centerViewPos.z)
-                  .abs()
-                  .div(depthTolerance),
-              ),
-            );
-            const weight = normalWeight.mul(depthWeight);
-            spatialSum.addAssign(
-              rawTex.sample(sampleUv).level(0).mul(weight),
-            );
-            spatialWeightSum.addAssign(weight);
-          });
+            const sampleDepth = depthTex.sample(sampleUv).level(0).x.toVar();
+            If(sampleDepth.lessThan(0.99999), () => {
+              const sampleNormal = normalize(
+                normalTex.sample(sampleUv).level(0).xyz.mul(2).sub(1),
+              );
+              const sampleViewPos = getViewPosition(sampleUv, sampleDepth, uProjInv);
+              const normalWeight = pow(max(dot(centerNormal, sampleNormal), 0), 24);
+              const depthWeight = float(1).div(
+                float(1).add(
+                  sampleViewPos.z.sub(centerViewPos.z).abs().div(depthTolerance),
+                ),
+              );
+              const weight = normalWeight.mul(depthWeight).mul(spatialW);
+              spatialSum.addAssign(rawTex.sample(sampleUv).level(0).mul(weight));
+              spatialWeightSum.addAssign(weight);
+            });
+          }
         }
 
         const spatial = spatialSum.div(
@@ -275,6 +266,9 @@ export function createDeferredGI({
   return {
     width: w,
     height: h,
+    fullWidth: width,
+    fullHeight: height,
+    resScale,
     giTexture,
     rawTexture,
     gbuffer,

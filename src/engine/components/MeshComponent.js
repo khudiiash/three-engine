@@ -45,7 +45,7 @@ export class MeshComponent extends Component {
   static schema = [
     { key: "geometry", label: "Primitive", type: "select", options: Object.keys(geometryFactories), showIf: (props) => !props.geometryAsset },
     { key: "geometryAsset", label: "Geometry", type: "asset", exts: ["geom"] },
-    { key: "material", label: "Material 1", type: "asset", exts: ["mat"] },
+    { key: "material", label: "Material 1", type: "asset", exts: ["mat"], emptyLabel: "Default" },
     { key: "material2", label: "Material 2", type: "asset", exts: ["mat"] },
     { key: "material3", label: "Material 3", type: "asset", exts: ["mat"] },
     { key: "material4", label: "Material 4", type: "asset", exts: ["mat"] },

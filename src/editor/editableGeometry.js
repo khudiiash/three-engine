@@ -253,6 +253,72 @@ export function beginExtrudeFaces(editable, faceIndices, hiddenIndexEdges = new 
   return result;
 }
 
+/** Creates connected duplicate vertices for an interactive vertex extrusion. */
+export function beginExtrudeVertices(editable, vertexIndices) {
+  const hasUVs = editable.uvs.length === editable.positions.length;
+  const sources = new Map();
+  vertexIndices.forEach((index) => {
+    if (editable.positions[index]) sources.set(pointKey(editable.positions[index]), index);
+  });
+  const moving = [];
+  editable.looseEdges ??= [];
+  sources.forEach((source) => {
+    const next = editable.positions.length;
+    editable.positions.push([...editable.positions[source]]);
+    if (hasUVs) editable.uvs.push([...(editable.uvs[source] ?? [0, 0])]);
+    editable.looseEdges.push([source, next]);
+    moving.push(next);
+  });
+  return { vertexIndices: moving, normal: [0, 0, 1], walls: [], visiblePairs: new Set() };
+}
+
+/** Creates zero-offset quad walls for an interactive edge extrusion. */
+export function beginExtrudeEdges(editable, edgePairs) {
+  const hasUVs = editable.uvs.length === editable.positions.length;
+  const selected = new Map();
+  edgePairs.forEach(([a, b]) => {
+    if (editable.positions[a] && editable.positions[b]) selected.set(spatialEdgeKey(editable.positions[a], editable.positions[b]), [a, b]);
+  });
+  const moving = [];
+  const topEdges = [];
+  const walls = [];
+  const visiblePairs = new Set();
+  const normal = new THREE.Vector3();
+  const indexKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+  selected.forEach((pair, spatialKey) => {
+    let [a, b] = pair;
+    let material = 0;
+    for (let faceIndex = 0; faceIndex < editable.faces.length; faceIndex++) {
+      const face = editable.faces[faceIndex];
+      const directed = face.map((start, edge) => [start, face[(edge + 1) % face.length]])
+        .find(([start, end]) => spatialEdgeKey(editable.positions[start], editable.positions[end]) === spatialKey);
+      if (!directed) continue;
+      [a, b] = directed;
+      normal.add(faceNormal(editable, face));
+      material = editable.faceMaterials?.[faceIndex] ?? 0;
+      break;
+    }
+    const wall = [a, b, a, b].map((source) => {
+      const next = editable.positions.length;
+      editable.positions.push([...editable.positions[source]]);
+      if (hasUVs) editable.uvs.push([0, 0]);
+      return next;
+    });
+    const [baseA, baseB, topA, topB] = wall;
+    editable.faces.push([baseA, baseB, topB], [baseA, topB, topA]);
+    editable.faceMaterials?.push(material, material);
+    moving.push(topA, topB);
+    topEdges.push([topA, topB]);
+    walls.push(wall);
+    [[baseA, baseB], [topA, topB], [baseA, topA], [baseB, topB]].forEach(([start, end]) => visiblePairs.add(indexKey(start, end)));
+  });
+  if (normal.lengthSq() < 1e-10) normal.set(0, 0, 1);
+  normal.normalize();
+  const result = { vertexIndices: moving, edges: topEdges, normal: normal.toArray(), walls, visiblePairs };
+  updateExtrudeUVs(editable, result);
+  return result;
+}
+
 /** Rebuilds the dedicated wall UV strips after an interactive extrusion moves. */
 export function updateExtrudeUVs(editable, extrusion) {
   if (editable.uvs.length !== editable.positions.length) return;
@@ -304,6 +370,205 @@ export function deleteFaces(editable, faceIndices) {
       .map(([a, b]) => [remap.get(a), remap.get(b)])
       .filter(([a, b]) => a !== undefined && b !== undefined);
   }
+}
+
+/** Reverses the winding (and therefore the normal) of the requested faces. */
+export function flipFaces(editable, faceIndices) {
+  const selected = new Set(faceIndices);
+  let flipped = 0;
+  selected.forEach((faceIndex) => {
+    const face = editable.faces[faceIndex];
+    if (!face || face.length < 3) return;
+    editable.faces[faceIndex] = [face[0], ...face.slice(1).reverse()];
+    flipped++;
+  });
+  return flipped;
+}
+
+function orderedEdgeComponents(editable, edgePairs) {
+  const nodes = new Map();
+  const edges = new Map();
+  const node = (index) => {
+    const key = pointKey(editable.positions[index]);
+    if (!nodes.has(key)) nodes.set(key, { key, index, neighbours: new Set() });
+    return nodes.get(key);
+  };
+  edgePairs.forEach(([a, b]) => {
+    if (!editable.positions[a] || !editable.positions[b]) return;
+    const start = node(a);
+    const end = node(b);
+    if (start.key === end.key) return;
+    const key = [start.key, end.key].sort().join("|");
+    edges.set(key, [start.key, end.key]);
+    start.neighbours.add(end.key);
+    end.neighbours.add(start.key);
+  });
+  if ([...nodes.values()].some((entry) => entry.neighbours.size > 2)) {
+    return { error: "Selected edges must form non-branching loops or chains" };
+  }
+  const remaining = new Set(edges.keys());
+  const components = [];
+  while (remaining.size) {
+    const seedEdge = edges.get(remaining.values().next().value);
+    const connected = new Set(seedEdge);
+    const queue = [...seedEdge];
+    while (queue.length) {
+      const key = queue.pop();
+      nodes.get(key).neighbours.forEach((next) => {
+        if (!connected.has(next)) { connected.add(next); queue.push(next); }
+      });
+    }
+    const endpoints = [...connected].filter((key) => nodes.get(key).neighbours.size === 1);
+    if (endpoints.length !== 0 && endpoints.length !== 2) return { error: "Selected edges do not form a valid loop or chain" };
+    const closed = endpoints.length === 0;
+    const start = endpoints[0] ?? connected.values().next().value;
+    const ordered = [];
+    let previous = null;
+    let current = start;
+    do {
+      ordered.push(nodes.get(current).index);
+      const next = [...nodes.get(current).neighbours].find((key) => key !== previous && (closed ? key !== start || ordered.length === connected.size : true));
+      if (!next) break;
+      remaining.delete([current, next].sort().join("|"));
+      previous = current;
+      current = next;
+    } while (current !== start && ordered.length <= connected.size);
+    if (closed) remaining.delete([current, previous].sort().join("|"));
+    connected.forEach((key) => nodes.get(key).neighbours.forEach((next) => remaining.delete([key, next].sort().join("|"))));
+    if (ordered.length !== connected.size) return { error: "Could not order the selected edge boundary" };
+    components.push({ indices: ordered, closed });
+  }
+  return { components };
+}
+
+/** Bridges two equally sized selected edge loops or open chains with quads. */
+export function bridgeEdgeLoops(editable, edgePairs) {
+  const ordered = orderedEdgeComponents(editable, edgePairs);
+  if (ordered.error) return ordered;
+  if (ordered.components.length !== 2) return { error: "Bridge requires exactly two edge loops or chains" };
+  const [first, second] = ordered.components;
+  if (first.closed !== second.closed) return { error: "Both bridge boundaries must both be open or both be closed" };
+  if (first.indices.length !== second.indices.length) return { error: "Bridge boundaries must have the same vertex count" };
+  const count = first.indices.length;
+  if (count < 2) return { error: "Bridge boundaries are too small" };
+  const distance = (a, b) => new THREE.Vector3(...editable.positions[a]).distanceToSquared(new THREE.Vector3(...editable.positions[b]));
+  let best = null;
+  const orientations = [second.indices, [...second.indices].reverse()];
+  orientations.forEach((candidate) => {
+    const shifts = first.closed ? count : 1;
+    for (let shift = 0; shift < shifts; shift++) {
+      const aligned = candidate.map((_, index) => candidate[(index + shift) % count]);
+      const score = aligned.reduce((sum, index, i) => sum + distance(first.indices[i], index), 0);
+      if (!best || score < best.score) best = { score, indices: aligned };
+    }
+  });
+  const faceIndices = [];
+  const hiddenKeys = [];
+  const segments = first.closed ? count : count - 1;
+  for (let index = 0; index < segments; index++) {
+    const next = (index + 1) % count;
+    const a = first.indices[index];
+    const b = first.indices[next];
+    const c = best.indices[next];
+    const d = best.indices[index];
+    faceIndices.push(editable.faces.length, editable.faces.length + 1);
+    editable.faces.push([a, b, c], [a, c, d]);
+    editable.faceMaterials?.push(0, 0);
+    hiddenKeys.push(spatialEdgeKey(editable.positions[a], editable.positions[c]));
+  }
+  return { faceIndices, hiddenKeys };
+}
+
+/** Fills a four-sided selected boundary with a Coons-interpolated quad grid. */
+export function gridFillEdges(editable, edgePairs) {
+  const ordered = orderedEdgeComponents(editable, edgePairs);
+  if (ordered.error) return ordered;
+  if (ordered.components.length !== 1 || !ordered.components[0].closed) return { error: "Grid Fill requires one closed edge boundary" };
+  const boundary = ordered.components[0].indices;
+  if (boundary.length < 4) return { error: "Grid Fill boundary is too small" };
+  const score = boundary.map((index, position) => {
+    const previous = new THREE.Vector3(...editable.positions[boundary[(position - 1 + boundary.length) % boundary.length]]);
+    const point = new THREE.Vector3(...editable.positions[index]);
+    const next = new THREE.Vector3(...editable.positions[boundary[(position + 1) % boundary.length]]);
+    return { position, score: 1 - previous.sub(point).normalize().dot(next.sub(point).normalize()) };
+  });
+  if (boundary.length % 2) return { error: "Grid Fill requires an even number of boundary vertices" };
+  const scores = new Map(score.map((entry) => [entry.position, entry.score]));
+  const half = boundary.length / 2;
+  let bestCorners = null;
+  for (let start = 0; start < boundary.length; start++) for (let firstSpan = 1; firstSpan < half; firstSpan++) {
+    const candidate = [start, (start + firstSpan) % boundary.length, (start + half) % boundary.length, (start + half + firstSpan) % boundary.length];
+    const cornerScore = candidate.reduce((sum, position) => sum + scores.get(position), 0);
+    const candidateScore = cornerScore - Math.abs(firstSpan - (half - firstSpan)) * 1e-3;
+    if (!bestCorners || candidateScore > bestCorners.score) bestCorners = { score: candidateScore, positions: candidate };
+  }
+  const corners = bestCorners.positions.sort((a, b) => a - b);
+  const side = (start, end) => {
+    const values = [];
+    for (let at = start; ; at = (at + 1) % boundary.length) {
+      values.push(boundary[at]);
+      if (at === end) return values;
+    }
+  };
+  const sides = corners.map((corner, index) => side(corner, corners[(index + 1) % 4]));
+  if (sides[0].length !== sides[2].length || sides[1].length !== sides[3].length) {
+    return { error: "Opposite Grid Fill sides must have matching vertex counts" };
+  }
+  const columns = sides[0].length - 1;
+  const rows = sides[1].length - 1;
+  const top = sides[0];
+  const right = sides[1];
+  const bottom = [...sides[2]].reverse();
+  const left = [...sides[3]].reverse();
+  const grid = Array.from({ length: rows + 1 }, () => Array(columns + 1));
+  top.forEach((index, column) => { grid[0][column] = index; });
+  bottom.forEach((index, column) => { grid[rows][column] = index; });
+  left.forEach((index, row) => { grid[row][0] = index; });
+  right.forEach((index, row) => { grid[row][columns] = index; });
+  const vector = (index) => new THREE.Vector3(...editable.positions[index]);
+  const c00 = vector(grid[0][0]);
+  const c10 = vector(grid[0][columns]);
+  const c01 = vector(grid[rows][0]);
+  const c11 = vector(grid[rows][columns]);
+  const hasUVs = editable.uvs.length === editable.positions.length;
+  for (let row = 1; row < rows; row++) {
+    const v = row / rows;
+    for (let column = 1; column < columns; column++) {
+      const u = column / columns;
+      const point = vector(top[column]).multiplyScalar(1 - v).addScaledVector(vector(bottom[column]), v)
+        .addScaledVector(vector(left[row]), 1 - u).addScaledVector(vector(right[row]), u)
+        .sub(c00.clone().multiplyScalar((1 - u) * (1 - v)))
+        .sub(c10.clone().multiplyScalar(u * (1 - v)))
+        .sub(c01.clone().multiplyScalar((1 - u) * v))
+        .sub(c11.clone().multiplyScalar(u * v));
+      grid[row][column] = editable.positions.length;
+      editable.positions.push(point.toArray());
+      if (hasUVs) editable.uvs.push([u, v]);
+    }
+  }
+  const polygonNormal = new THREE.Vector3();
+  boundary.forEach((index, at) => {
+    const current = vector(index);
+    const next = vector(boundary[(at + 1) % boundary.length]);
+    polygonNormal.x += (current.y - next.y) * (current.z + next.z);
+    polygonNormal.y += (current.z - next.z) * (current.x + next.x);
+    polygonNormal.z += (current.x - next.x) * (current.y + next.y);
+  });
+  const faceIndices = [];
+  const hiddenKeys = [];
+  for (let row = 0; row < rows; row++) for (let column = 0; column < columns; column++) {
+    const a = grid[row][column];
+    const b = grid[row][column + 1];
+    const c = grid[row + 1][column + 1];
+    const d = grid[row + 1][column];
+    let faces = [[a, b, c], [a, c, d]];
+    if (faceNormal(editable, faces[0]).dot(polygonNormal) < 0) faces = faces.map(([x, y, z]) => [x, z, y]);
+    faceIndices.push(editable.faces.length, editable.faces.length + 1);
+    editable.faces.push(...faces);
+    editable.faceMaterials?.push(0, 0);
+    hiddenKeys.push(spatialEdgeKey(editable.positions[a], editable.positions[c]));
+  }
+  return { faceIndices, hiddenKeys };
 }
 
 /** Removes intermediate/orphan vertices while preserving UV and loose-edge indices. */

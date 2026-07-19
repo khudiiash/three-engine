@@ -9,6 +9,34 @@ import { compileShaderGraph, invalidateShaderTextureCache, migrateGraph } from "
 import { loadTextureAsset } from "./textureAsset.js";
 
 
+export const MATERIAL_PIPELINE_DEFAULTS = {
+  cullMode: "back",
+  depthTest: true,
+  depthWrite: true,
+  depthFunc: "less-equal",
+  colorWrite: true,
+  transparent: false,
+  blendMode: "normal",
+  alphaTest: 0,
+  alphaHash: false,
+  premultipliedAlpha: false,
+  polygonOffset: false,
+  polygonOffsetFactor: 0,
+  polygonOffsetUnits: 0,
+  wireframe: false,
+  toneMapped: true,
+  fog: true,
+};
+
+export const MATERIAL_VOLUME_PIPELINE_DEFAULTS = {
+  ...MATERIAL_PIPELINE_DEFAULTS,
+  cullMode: "front",
+  depthTest: false,
+  depthWrite: false,
+  transparent: true,
+  blendMode: "additive",
+};
+
 export const MATERIAL_DEFAULTS = {
 
   // New materials and meshes without an assigned material use the same
@@ -24,7 +52,62 @@ export const MATERIAL_DEFAULTS = {
 
   shaderGraph: null,
 
+  // Null keeps legacy/volume materials on their material-class defaults until
+  // fixed-function state is explicitly authored in the Inspector.
+  pipeline: null,
+
 };
+
+const SIDE_BY_CULL_MODE = {
+  back: THREE.FrontSide,
+  front: THREE.BackSide,
+  none: THREE.DoubleSide,
+};
+
+const DEPTH_FUNC_BY_NAME = {
+  never: THREE.NeverDepth,
+  always: THREE.AlwaysDepth,
+  less: THREE.LessDepth,
+  "less-equal": THREE.LessEqualDepth,
+  equal: THREE.EqualDepth,
+  "greater-equal": THREE.GreaterEqualDepth,
+  greater: THREE.GreaterDepth,
+  "not-equal": THREE.NotEqualDepth,
+};
+
+const BLENDING_BY_MODE = {
+  none: THREE.NoBlending,
+  normal: THREE.NormalBlending,
+  additive: THREE.AdditiveBlending,
+  subtractive: THREE.SubtractiveBlending,
+  multiply: THREE.MultiplyBlending,
+};
+
+/** Applies serialized fixed-function render state to a live Three material. */
+export function applyMaterialPipeline(material, definition = MATERIAL_PIPELINE_DEFAULTS) {
+  if (!material || !definition) return;
+  const defaults = material.userData?.isVolumeMaterial
+    ? MATERIAL_VOLUME_PIPELINE_DEFAULTS
+    : MATERIAL_PIPELINE_DEFAULTS;
+  const pipeline = { ...defaults, ...definition };
+  material.side = SIDE_BY_CULL_MODE[pipeline.cullMode] ?? THREE.FrontSide;
+  material.depthTest = pipeline.depthTest !== false;
+  material.depthWrite = pipeline.depthWrite !== false;
+  material.depthFunc = DEPTH_FUNC_BY_NAME[pipeline.depthFunc] ?? THREE.LessEqualDepth;
+  material.colorWrite = pipeline.colorWrite !== false;
+  material.transparent = pipeline.transparent === true;
+  material.blending = BLENDING_BY_MODE[pipeline.blendMode] ?? THREE.NormalBlending;
+  material.alphaTest = THREE.MathUtils.clamp(Number(pipeline.alphaTest) || 0, 0, 1);
+  material.alphaHash = pipeline.alphaHash === true;
+  material.premultipliedAlpha = pipeline.premultipliedAlpha === true;
+  material.polygonOffset = pipeline.polygonOffset === true;
+  material.polygonOffsetFactor = Number(pipeline.polygonOffsetFactor) || 0;
+  material.polygonOffsetUnits = Number(pipeline.polygonOffsetUnits) || 0;
+  if ("wireframe" in material) material.wireframe = pipeline.wireframe === true;
+  material.toneMapped = pipeline.toneMapped !== false;
+  material.fog = pipeline.fog !== false;
+  material.needsUpdate = true;
+}
 
 
 
@@ -407,6 +490,8 @@ export function applyMaterialDef(entry, def) {
 
   // graph leaving a slot populated would leak into the new graph's compile.
 
+  if (def.pipeline) applyMaterialPipeline(material, def.pipeline);
+
   clearNodeSlots(material);
 
 
@@ -582,6 +667,15 @@ export function updateMaterialAsset(path, def) {
   const entry = cache.get(assetKey(path));
   if (entry) applyMaterialDef(entry, def);
 
+}
+
+/** Fast editor path for fixed-function state changes; avoids recompiling TSL. */
+export function updateMaterialPipeline(path, pipeline) {
+  const entry = cache.get(assetKey(path));
+  if (!entry) return;
+  entry.def = { ...entry.def, pipeline: { ...pipeline } };
+  applyMaterialPipeline(entry.material, pipeline);
+  notifyMaterial(path);
 }
 
 /** Best-effort swatch color for a .mat: walks the live material's

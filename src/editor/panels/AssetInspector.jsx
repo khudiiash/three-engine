@@ -6,7 +6,13 @@ import { useSelectionStore } from "../store/selectionStore.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { toBlobUrl, extOf, readAssetMeta, TEXTURE_EXTENSIONS } from "../assetLoader.js";
 import { TEXTURE_META_DEFAULTS } from "../../engine/textureMeta.js";
-import { refreshMaterialsUsingTexture } from "../../engine/materialAsset.js";
+import {
+  MATERIAL_PIPELINE_DEFAULTS,
+  MATERIAL_VOLUME_PIPELINE_DEFAULTS,
+  loadMaterialAsset,
+  refreshMaterialsUsingTexture,
+  updateMaterialPipeline,
+} from "../../engine/materialAsset.js";
 import { openPanel } from "../EditorShell.jsx";
 import { syncScriptClassNameAfterRename } from "../scriptClassSync.js";
 import { openPrefabMode } from "../prefab.js";
@@ -659,18 +665,80 @@ function JsonSummary({ path, render }) {
   return data ? render(data) : null;
 }
 
-/**
- * A material has no inspector-editable settings: its surface is entirely
- * defined by its shader graph, so the Shader Graph panel is the only editor.
- * (The .mat's legacy scalar color/roughness/metalness/map fields still exist in
- * the file format for back-compat, but nothing in the UI writes them.)
- */
 function MaterialSummary({ path }) {
+  const [def, setDef] = useState(null);
+  const defRef = useRef(null);
+  const saveQueue = useRef(Promise.resolve());
+
+  useEffect(() => {
+    let live = true;
+    defRef.current = null;
+    setDef(null);
+    Promise.all([
+      invoke("read_text_file", { path }).then((text) => JSON.parse(text)),
+      loadMaterialAsset(path),
+    ]).then(([loaded]) => {
+      if (!live) return;
+      defRef.current = loaded;
+      setDef(loaded);
+    }).catch((error) => console.error(`Failed to inspect material: ${error}`));
+    return () => { live = false; };
+  }, [path]);
+
+  if (!def) return null;
+  const output = def.shaderGraph?.nodes?.find((node) => node.type === "output");
+  const isVolume = !!output && (def.shaderGraph?.edges ?? []).some(
+    (edge) => edge.target === output.id && edge.targetHandle === "volume",
+  );
+  const defaults = isVolume ? MATERIAL_VOLUME_PIPELINE_DEFAULTS : MATERIAL_PIPELINE_DEFAULTS;
+  const pipeline = { ...defaults, ...(def.pipeline ?? {}) };
+
+  const patchPipeline = (patch) => {
+    const current = defRef.current;
+    if (!current) return;
+    const nextPipeline = { ...defaults, ...(current.pipeline ?? {}), ...patch };
+    const next = { ...current, pipeline: nextPipeline };
+    defRef.current = next;
+    setDef(next);
+    updateMaterialPipeline(path, nextPipeline);
+    saveQueue.current = saveQueue.current.catch(() => {}).then(() =>
+      invoke("save_scene", { path, contents: JSON.stringify(next, null, 2) }),
+    ).catch((error) => console.error(`Failed to save material pipeline: ${error}`));
+  };
+
+  const toggle = (key, label, title) => (
+    <div className="field-row" title={title}>
+      <span className="field-label">{label}</span>
+      <input type="checkbox" checked={!!pipeline[key]} onChange={(event) => patchPipeline({ [key]: event.target.checked })} />
+    </div>
+  );
+
+  const number = (key, label, { min, max, step = 0.1 } = {}) => (
+    <div className="field-row">
+      <span className="field-label">{label}</span>
+      <input
+        key={`${key}-${pipeline[key]}`}
+        className="number-field"
+        type="number"
+        defaultValue={pipeline[key]}
+        min={min}
+        max={max}
+        step={step}
+        onBlur={(event) => {
+          let value = Number(event.target.value);
+          if (!Number.isFinite(value)) return;
+          if (min != null) value = Math.max(min, value);
+          if (max != null) value = Math.min(max, value);
+          patchPipeline({ [key]: value });
+        }}
+        onKeyDown={(event) => event.key === "Enter" && event.currentTarget.blur()}
+      />
+    </div>
+  );
+
   return (
-    <JsonSummary
-      path={path}
-      render={(def) => (
-        <div className="inspector-section">
+    <>
+      <div className="inspector-section">
           <div className="section-header">Material</div>
           <div className="asset-info-row">
             {def.shaderGraph?.nodes?.length
@@ -687,9 +755,56 @@ function MaterialSummary({ path }) {
             <Workflow size={13} />
             Open Shader Graph
           </button>
+      </div>
+      <div className="inspector-section">
+        <div className="section-header">Pipeline</div>
+        <div className="field-row">
+          <span className="field-label">Cull Mode</span>
+          <select className="select-field" value={pipeline.cullMode} onChange={(event) => patchPipeline({ cullMode: event.target.value })}>
+            <option value="back">Back Faces</option>
+            <option value="front">Front Faces</option>
+            <option value="none">None (Double-Sided)</option>
+          </select>
         </div>
-      )}
-    />
+        {toggle("depthTest", "Depth Test")}
+        {toggle("depthWrite", "Depth Write")}
+        <div className="field-row">
+          <span className="field-label">Depth Function</span>
+          <select className="select-field" value={pipeline.depthFunc} disabled={!pipeline.depthTest} onChange={(event) => patchPipeline({ depthFunc: event.target.value })}>
+            <option value="less-equal">Less or Equal</option>
+            <option value="less">Less</option>
+            <option value="equal">Equal</option>
+            <option value="greater-equal">Greater or Equal</option>
+            <option value="greater">Greater</option>
+            <option value="not-equal">Not Equal</option>
+            <option value="always">Always</option>
+            <option value="never">Never</option>
+          </select>
+        </div>
+        {toggle("colorWrite", "Color Write")}
+        {toggle("transparent", "Transparent")}
+        <div className="field-row">
+          <span className="field-label">Blend Mode</span>
+          <select className="select-field" value={pipeline.blendMode} onChange={(event) => patchPipeline({ blendMode: event.target.value })}>
+            <option value="normal">Normal</option>
+            <option value="additive">Additive</option>
+            <option value="subtractive">Subtractive</option>
+            <option value="multiply">Multiply</option>
+            <option value="none">Disabled</option>
+          </select>
+        </div>
+        {number("alphaTest", "Alpha Clip", { min: 0, max: 1, step: 0.01 })}
+        {toggle("alphaHash", "Alpha Hash", "Stochastic alpha testing for dithered cutouts")}
+        {toggle("premultipliedAlpha", "Premultiplied Alpha")}
+        {toggle("polygonOffset", "Polygon Offset")}
+        {pipeline.polygonOffset && number("polygonOffsetFactor", "Offset Factor", { step: 1 })}
+        {pipeline.polygonOffset && number("polygonOffsetUnits", "Offset Units", { step: 1 })}
+        {toggle("wireframe", "Wireframe")}
+        {toggle("toneMapped", "Tone Mapped")}
+        {toggle("fog", "Affected by Fog")}
+        <div className="asset-hint">Pipeline changes update every mesh using this material.</div>
+      </div>
+    </>
   );
 }
 

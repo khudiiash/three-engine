@@ -324,6 +324,53 @@ function* markExteriorEmptyVoxelsWork(albedo, normal, dims) {
 }
 
 /**
+ * Re-runs ONLY the local ambiguous-normal tagging (the second half of
+ * `markExteriorEmptyVoxelsWork`) over a bounded region, in place. Used by the
+ * incremental region re-bake, which cannot afford the global exterior BFS —
+ * and does not need it, because the lighting shaders read the ambiguous bit
+ * (junction cells) but not the exterior bit. The tagging is purely local: each
+ * occupied cell inspects its normal-side neighbour's occupancy, so a region
+ * dilated by one voxel around the changed area reclassifies correctly without
+ * touching the rest of the grid. Stale ambiguous bits inside the region are
+ * stripped first so a cell that stopped being a junction clears its flag.
+ *
+ * `region` is {x0,y0,z0,x1,y1,z1} in voxel coordinates (half-open, already
+ * clamped to the grid by the caller).
+ */
+export function reclassifyAmbiguousRegion(albedo, normal, dims, region) {
+  const { x: dx, y: dy, z: dz } = dims;
+  const { x0, y0, z0, x1, y1, z1 } = region;
+  const occupiedAt = (x, y, z) => {
+    if (x < 0 || y < 0 || z < 0 || x >= dx || y >= dy || z >= dz) return false;
+    return (albedo[x + y * dx + z * dx * dy] >>> 24) !== 0;
+  };
+  for (let z = z0; z < z1; z++) {
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const i = x + y * dx + z * dx * dy;
+        const word = (normal[i] & ~AMBIGUOUS_NORMAL_BIT) >>> 0;
+        if ((albedo[i] >>> 24) === 0) {
+          normal[i] = word;
+          continue;
+        }
+        const nx = (word & 255) / 127.5 - 1;
+        const ny = ((word >>> 8) & 255) / 127.5 - 1;
+        const nz = ((word >>> 16) & 255) / 127.5 - 1;
+        const sx = nx > 0.35 ? 1 : nx < -0.35 ? -1 : 0;
+        const sy = ny > 0.35 ? 1 : ny < -0.35 ? -1 : 0;
+        const sz = nz > 0.35 ? 1 : nz < -0.35 ? -1 : 0;
+        const twoSidedCell = (word & 0x01000000) !== 0;
+        let ambiguous = occupiedAt(x + sx, y + sy, z + sz);
+        if (!ambiguous && twoSidedCell) {
+          ambiguous = occupiedAt(x - sx, y - sy, z - sz);
+        }
+        normal[i] = ambiguous ? (word | AMBIGUOUS_NORMAL_BIT) >>> 0 : word;
+      }
+    }
+  }
+}
+
+/**
  * Voxelizes every eligible mesh in `scene` into the given grid.
  * Returns { albedo: Uint32Array, normal: Uint32Array, occupied, meshes, tris }.
  *

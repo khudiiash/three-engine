@@ -27,7 +27,8 @@ import * as TSL from "three/tsl";
  *   - signature: structure-only fingerprint (string).
  *   - ctx: { camera, beautyNode, depthNode, normalNode } — Input-node bodies
  *     read these by the port's "kind" so the graph compiler doesn't need to
- *     know which camera owns it.
+ *     know which camera owns it. The Input node also exposes velocity for
+ *     temporal effects such as TRAA.
  *
  * Every param with `kind: "hot"` compiles to a TSL uniform so the editor's
  * slider drags refresh the GPU without rebuilding pipelines; structural
@@ -65,6 +66,7 @@ export const PP_NODE_TYPES = {
       { key: "color", kind: "vec4" },
       { key: "depth", kind: "float" },
       { key: "normal", kind: "vec3" },
+      { key: "velocity", kind: "vec4" },
     ],
     params: [],
   },
@@ -160,6 +162,20 @@ export const PP_NODE_TYPES = {
       num("depthPhi", "Depth φ", 5, { min: 0.1, max: 32, step: 0.1 }),
       num("normalPhi", "Normal φ", 5, { min: 0.1, max: 32, step: 0.1 }),
     ],
+  },
+  traa: {
+    label: "TRAA",
+    category: "gi",
+    // Temporal reprojection must run after the noisy SSGI composite. Depth
+    // and velocity come from the same scene pass so the history reprojection
+    // remains aligned with the current color buffer.
+    inputs: [
+      { key: "color", kind: "vec4" },
+      { key: "depth", kind: "float" },
+      { key: "velocity", kind: "vec4" },
+    ],
+    outputs: [{ key: "out", kind: "vec4" }],
+    params: [],
   },
 
   // --- Color grading ------------------------------------------------------
@@ -577,11 +593,7 @@ export const PP_NODE_TYPES = {
   motionBlur: {
     label: "Motion Blur",
     category: "effect",
-    // `motionBlur(input, velocity, numSamples)` — needs a velocity MRT,
-    // which our current scene pass doesn't provide. The builder resolves
-    // the node when we don't have velocity and reports a warning. The
-    // result is best-effort: a uniform static blur until proper velocity
-    // is plumbed.
+    // `motionBlur(input, velocity, numSamples)` uses the auto-fed velocity MRT.
     inputs: [{ key: "color", kind: "vec4" }],
     outputs: [{ key: "out", kind: "vec4" }],
     params: [num("samples", "Samples", 8, { min: 1, max: 64, step: 1 })],
@@ -612,11 +624,12 @@ export const PP_CATEGORY_LABELS = {
   output: "Output",
 };
 
-/** Used by the editor to label the three auto-fed Input sockets. */
+/** Used by the editor to label the auto-fed Input sockets. */
 export const INPUT_PORT_LABELS = {
   color: "Color",
   depth: "Depth",
   normal: "Normal",
+  velocity: "Velocity",
 };
 
 /** Returns default props for a node type. */
@@ -675,6 +688,7 @@ const _addonLoaders = {
   ssgi: () => import("three/addons/tsl/display/SSGINode.js"),
   ssr: () => import("three/addons/tsl/display/SSRNode.js"),
   denoise: () => import("three/addons/tsl/display/DenoiseNode.js"),
+  traa: () => import("three/addons/tsl/display/TRAANode.js"),
   bloom: () => import("three/addons/tsl/display/BloomNode.js"),
   godrays: () => import("three/addons/tsl/display/GodraysNode.js"),
   depthAwareBlend: () => import("three/addons/tsl/display/depthAwareBlend.js"),
@@ -744,6 +758,9 @@ export function loadSSR() {
 // utility (also bundled).
 export function loadDenoise() {
   return lazyLoad("denoise", "denoise");
+}
+export function loadTRAA() {
+  return lazyLoad("traa", "traa");
 }
 export function loadBloom() {
   return lazyLoad("bloom", "bloom");
@@ -970,12 +987,39 @@ function buildNode(type, props, ins, ctx) {
       const ssrNode = fn(beauty, depth, normal, {
         stochastic: P.stochastic,
         reflectNonMetals: P.reflectNonMetals,
+        // Per-pixel material params from the scene-pass MRT (null on builds
+        // without the slot — the addon then treats surfaces as smooth
+        // non-metal). With these wired, SSR reflects metals correctly and
+        // picks its blur mip from roughness.
+        metalnessNode: ctx.metalnessNode ?? null,
+        roughnessNode: ctx.roughnessNode ?? null,
       });
       // SSRNode exposes resolutionScale as a plain JS property read in its
       // setSize (SSRNode.js:652) — the ray-march target shrinks while the
       // composite stays full res.
       ssrNode.resolutionScale = resolutionScale;
-      return TSL.mix(beauty, ssrNode, TSL.float(P.intensity));
+      // Hybrid composite (SSR on-screen + GI voxel-cone fallback):
+      //  - The GI specular cone is already folded into `beauty` (in-material),
+      //    so a metallic surface's beauty ≈ its reflection. That is the
+      //    off-screen fallback.
+      //  - SSR (blur mode) writes vec4(0) on a screen-space miss, so its alpha
+      //    (hit distance) is a clean miss mask: `.a > 0` = on-screen hit.
+      //  - On a hit we mix the beauty toward the sharp SSR by the surface's
+      //    reflectivity (metalness). Metal (weight→1) swaps its blurry voxel
+      //    reflection for the sharp SSR; on a miss the weight is 0 so the voxel
+      //    cone in beauty shows through. Non-metals keep beauty (SSR blur mode
+      //    already weights its output by metalness, so this only ever *reveals*
+      //    a reflection where one belongs — it never darkens a dielectric the
+      //    way the old flat `mix(beauty, ssr, intensity)` did).
+      const hitMask = ssrNode.a.greaterThan(0);
+      const reflectivity = ctx.metalnessNode != null
+        ? TSL.float(ctx.metalnessNode)
+        : TSL.float(1);
+      const weight = hitMask.select(
+        reflectivity.mul(TSL.float(P.intensity)).clamp(0, 1),
+        TSL.float(0),
+      );
+      return TSL.mix(beauty, TSL.vec4(ssrNode.rgb, beauty.a), weight);
     }
     case "denoise": {
       const beauty = ins.get("color") ?? TSL.vec4(0);
@@ -1006,6 +1050,21 @@ function buildNode(type, props, ins, ctx) {
       denoiseNode.depthPhi.value = P.depthPhi;
       denoiseNode.normalPhi.value = P.normalPhi;
       return denoiseNode;
+    }
+    case "traa": {
+      const color = ins.get("color") ?? ctx.beautyNode ?? TSL.vec4(0);
+      const depth = ins.get("depth") ?? ctx.depthNode ?? null;
+      const velocityNode = ins.get("velocity") ?? ctx.velocityNode ?? null;
+      const fn = ctx.traa;
+      if (ctx.msaaEnabled) {
+        console.warn("TRAA node: disable Scene Settings > Renderer > Antialiasing (MSAA) to enable temporal reprojection");
+        return color;
+      }
+      if (typeof fn !== "function" || !depth || !velocityNode) {
+        console.warn("TRAA node: addon, depth, or velocity unavailable — emitting color passthrough");
+        return color;
+      }
+      return fn(color, depth, velocityNode, ctx.camera);
     }
 
     // --- Color grading ---
@@ -1384,12 +1443,7 @@ function buildNode(type, props, ins, ctx) {
     case "motionBlur": {
       const color = ins.get("color") ?? TSL.vec4(0);
       const fn = ctx.motionBlur;
-      // motionBlur(input, velocity, numSamples). Without a velocity MRT
-      // from the scene pass we degrade to a passthrough — the effect's
-      // whole point is screen-space sample taps along the velocity
-      // vector, so faking it with `vec2(0)` would just blur radially
-      // and produce a smear, not motion. PostprocessComponent can
-      // populate `ctx.velocityNode` later by adding a velocity MRT.
+      // Return passthrough if the renderer could not expose the velocity MRT.
       if (typeof fn !== "function" || !ctx.velocityNode) return color;
       return fn(color, ctx.velocityNode, TSL.int(P.samples));
     }
@@ -1479,6 +1533,7 @@ export function compilePostGraph(graph, ctx) {
       if (ctx.beautyNode) out.set("color", ctx.beautyNode);
       if (ctx.depthNode) out.set("depth", ctx.depthNode);
       if (ctx.normalNode) out.set("normal", ctx.normalNode);
+      if (ctx.velocityNode) out.set("velocity", ctx.velocityNode);
       outMap = out;
     } else if (node.type === "output") {
       // The Output node is a pass-through: whatever's wired into its

@@ -574,7 +574,7 @@ registerBuiltInComponents();
 
 // -- GPU dynamic layer: triangle pool extraction + splat/copy node construction --
 {
-  const { DynamicVoxelPool, createDynamicVoxelNodes, VEC4S_PER_TRI, DYNAMIC_TRI_CAPACITY, MAX_DYNAMIC_MESHES } =
+  const { DynamicVoxelPool, createDynamicVoxelNodes, VEC4S_PER_TRI, DYNAMIC_TRI_CAPACITY, DYNAMIC_TRI_PER_MESH, MAX_DYNAMIC_MESHES } =
     await import("../src/modules/gi/gpuVoxelizer.js");
   const { uniform: makeUniform } = await import("three/tsl");
 
@@ -632,7 +632,9 @@ registerBuiltInComponents();
   assert.ok(Math.abs(pool.boxes[0].min.x - 2) < 1e-6, "world AABB follows the transform");
   assert.ok(Math.abs(pool.maxDims[0] - 2) < 1e-6, "largest world axis recorded (sub-voxel gating)");
 
-  // Capacity: an oversized mesh is skipped, not partially written.
+  // Capacity: an oversized mesh is stride-decimated to fit its per-mesh
+  // budget (never dropped — dropping made detailed movers vanish from GI
+  // during motion), while small meshes stay fully represented.
   const huge = new THREE.Mesh(
     new THREE.SphereGeometry(1, 256, 256),
     new THREE.MeshStandardMaterial(),
@@ -640,8 +642,14 @@ registerBuiltInComponents();
   const hugeTris = huge.geometry.index.count / 3;
   assert.ok(hugeTris > DYNAMIC_TRI_CAPACITY, "test sphere exceeds pool capacity");
   pool.sync([red, huge, blue]);
-  assert.equal(pool.count, 24, "oversized mesh skipped, small ones kept");
-  assert.equal(pool.meshes.length, 2);
+  assert.equal(pool.meshes.length, 3, "oversized mesh kept (subsampled), not dropped");
+  assert.ok(pool.meshes.includes(huge), "the oversized mesh is in the pool");
+  assert.ok(pool.count <= DYNAMIC_TRI_CAPACITY, "pool never exceeds capacity");
+  const hugeContribution = pool.count - 24; // red + blue contribute 24
+  assert.ok(
+    hugeContribution > 0 && hugeContribution <= DYNAMIC_TRI_PER_MESH,
+    "oversized mesh decimated into its per-mesh budget",
+  );
   assert.ok(pool.meshes.length <= MAX_DYNAMIC_MESHES);
 
   // Per-volume compose passes build headlessly against shared pool nodes.

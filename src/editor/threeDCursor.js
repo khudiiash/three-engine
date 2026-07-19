@@ -294,6 +294,12 @@ function buildCursorProxy() {
   hit.renderOrder = 999;
   group.add(hit);
 
+  // Object3D layers are evaluated per object; a child's layer does not
+  // inherit from its parent. Keep every drawable and picking proxy on the
+  // editor-only layer so none of the cursor can enter a gameplay or
+  // post-process color/depth/normal pass.
+  group.traverse((obj) => obj.layers.set(EDITOR_LAYER));
+
   group.userData.noPick = true;
   return group;
 }
