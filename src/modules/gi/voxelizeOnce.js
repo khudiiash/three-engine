@@ -14,7 +14,7 @@
 // (`createSceneTrace`) + an SDF sphere-trace (`createSoftShadowTrace`) over
 // a trilinear-filtered Data3DTexture distance field.
 import * as THREE from "three/webgpu";
-import { Break, If, Loop, float, floor, instancedArray, smoothstep, step, texture3D, vec3 } from "three/tsl";
+import { Break, If, Loop, float, floor, instancedArray, step, texture3D, vec3 } from "three/tsl";
 import { allocateBakeArrays, runBake } from "./bakeCore.js";
 
 /**
@@ -99,6 +99,10 @@ export function serializeMeshForBake(mesh) {
     geometryCopyCache.set(mesh.geometry, cached);
   }
   return {
+    // Identity for the worker's incremental diffing + geometry cache: the
+    // key changes when geometry content does, so edits re-ship exactly once.
+    id: mesh.id,
+    geometryKey: `${mesh.geometry.id}:${version}`,
     positions: cached.positions,
     index: cached.index,
     matrix: [...mesh.matrixWorld.elements],
@@ -150,7 +154,15 @@ export function voxelizeOnce(meshes, bounds, res, light) {
   );
 
   const { radiance, surface, normals, distance } = arrays;
-  const radianceBuffer = instancedArray(radiance, "vec4");
+  // Buffer roles for temporal streaming (flicker-free moving objects):
+  //   stagingBuffer  — the LATEST CPU bake, partial-uploaded at worker cadence
+  //   baseBuffer     — blended direct+emissive state; the per-frame bounce-
+  //                    feedback pass lerps it toward staging (~100ms settle)
+  //   radianceBuffer — live field the cascade rays trace (base + bounce)
+  // Only staging is written from the CPU during streaming, so a 10-15Hz bake
+  // cadence no longer hard-snaps the field the lighting reads.
+  const stagingBuffer = instancedArray(radiance, "vec4");
+  const radianceBuffer = instancedArray(radiance.slice(), "vec4");
   const baseBuffer = instancedArray(radiance.slice(), "vec4");
   const surfaceBuffer = instancedArray(surface, "vec4");
   const normalBuffer = instancedArray(normals, "vec4");
@@ -166,8 +178,11 @@ export function voxelizeOnce(meshes, bounds, res, light) {
   distanceTexture.needsUpdate = true;
 
   const upload = () => {
+    // Sync path (initial build / harness rebake): full snap of every buffer —
+    // deterministic harnesses want the new state immediately, no blend-in.
     baseBuffer.value?.array?.set(radiance);
-    for (const buffer of [radianceBuffer, baseBuffer, surfaceBuffer, normalBuffer]) {
+    radianceBuffer.value?.array?.set(radiance);
+    for (const buffer of [stagingBuffer, radianceBuffer, baseBuffer, surfaceBuffer, normalBuffer]) {
       const attribute = buffer.value;
       if (attribute) {
         // Full upload: clear any stale PARTIAL ranges first or the whole-
@@ -185,10 +200,14 @@ export function voxelizeOnce(meshes, bounds, res, light) {
   let jobId = 0;
   let inFlight = null; // { id, resolve }
   let pending = null; // latest superseding request { records, lights, resolve }
+  // Geometry payloads the worker already caches — ship each (geometry,
+  // version) exactly once; drags then send only ids + matrices + colors.
+  const shippedGeometry = new Set();
 
   const ensureWorker = () => {
     if (worker || workerBroken) return worker;
     try {
+      shippedGeometry.clear();
       worker = new Worker(new URL("./bakeWorker.js", import.meta.url), { type: "module" });
       console.log("[gi] bake worker active — re-bakes run off the main thread");
       worker.onmessage = (event) => {
@@ -196,40 +215,33 @@ export function voxelizeOnce(meshes, bounds, res, light) {
         const current = inFlight;
         inFlight = null;
         if (current && message.jobId === current.id) {
-          // PARTIAL apply: copy + upload only the ranges the worker found
-          // changed. Full re-uploads of every buffer were a 30-60ms
-          // main-thread writeBuffer stall per rebake at fine voxel sizes;
-          // moving one object touches a tiny fraction of the grid.
-          const applyRange = (target, source, buffer, range) => {
-            if (!range) return;
-            target.set(source.subarray(range[0], range[1]), range[0]);
+          // PARTIAL apply: the worker sends changed-range SLICES (its full
+          // arrays never leave the worker). Full re-uploads of every buffer
+          // were a 30-60ms main-thread writeBuffer stall per rebake at fine
+          // voxel sizes; moving one object touches a tiny fraction of the grid.
+          const applyRange = (target, slice, buffer, range) => {
+            if (!range || !slice) return;
+            target.set(slice, range[0]);
             const attribute = buffer.value;
             if (attribute) {
-              attribute.addUpdateRange(range[0], range[1] - range[0]);
+              attribute.addUpdateRange(range[0], slice.length);
               attribute.needsUpdate = true;
             }
           };
-          applyRange(radiance, message.radiance, radianceBuffer, message.ranges.radiance);
-          // base mirrors radiance — same changed range by construction.
-          if (message.ranges.radiance) {
-            const [r0, r1] = message.ranges.radiance;
-            baseBuffer.value?.array?.set(message.radiance.subarray(r0, r1), r0);
-            baseBuffer.value?.addUpdateRange(r0, r1 - r0);
-            if (baseBuffer.value) baseBuffer.value.needsUpdate = true;
-          }
+          // Streaming path: only STAGING gets the new radiance — the per-
+          // frame feedback pass blends base/radiance toward it (temporal
+          // smoothing of incoming bakes; hard swaps were the flicker).
+          applyRange(radiance, message.radiance, stagingBuffer, message.ranges.radiance);
           applyRange(surface, message.surface, surfaceBuffer, message.ranges.surface);
           applyRange(normals, message.normals, normalBuffer, message.ranges.normals);
-          if (message.ranges.distance) {
-            distance.set(
-              message.distance.subarray(message.ranges.distance[0], message.ranges.distance[1]),
-              message.ranges.distance[0],
-            );
+          if (message.ranges.distance && message.distance) {
+            distance.set(message.distance, message.ranges.distance[0]);
             // Data3DTexture has no partial-upload path in three — full
             // texture re-upload, but only when the field actually changed.
             distanceTexture.needsUpdate = true;
           }
-          Object.assign(stats, message.stats);
-          current.resolve({ stats, elapsed: message.elapsed });
+          if (message.stats) Object.assign(stats, message.stats);
+          current.resolve({ stats, elapsed: message.elapsed, mode: message.mode ?? "noop" });
         } else {
           current?.resolve(null);
         }
@@ -263,7 +275,24 @@ export function voxelizeOnce(meshes, bounds, res, light) {
   const post = (records, lights, resolve) => {
     jobId++;
     inFlight = { id: jobId, resolve };
-    worker.postMessage({ jobId, records, bounds: plainBounds, res, cell: plainCell, lights });
+    const wire = records.map((r, i) => {
+      const hasKey = !!r.geometryKey;
+      const key = r.geometryKey ?? `anon:${i}`;
+      // Keyless records (non-standard callers) re-ship every job — the
+      // cache entry is overwritten in place, so no growth and no staleness.
+      const known = hasKey && shippedGeometry.has(key);
+      if (hasKey && !known) shippedGeometry.add(key);
+      return {
+        id: r.id ?? `idx:${i}`,
+        geometryKey: key,
+        matrix: r.matrix,
+        color: r.color,
+        emissive: r.emissive,
+        emissiveIntensity: r.emissiveIntensity,
+        geometry: known ? null : { positions: r.positions, index: r.index },
+      };
+    });
+    worker.postMessage({ jobId, records: wire, bounds: plainBounds, res, cell: plainCell, lights });
   };
 
   return {
@@ -273,6 +302,7 @@ export function voxelizeOnce(meshes, bounds, res, light) {
     stats,
     radianceBuffer,
     baseBuffer,
+    stagingBuffer,
     surfaceBuffer,
     normalBuffer,
     distanceTexture,
@@ -325,7 +355,7 @@ export function voxelizeOnce(meshes, bounds, res, light) {
     },
 
     createSceneTrace: () => createVoxelSceneTrace(radianceBuffer, bounds, res, cell),
-    createSoftShadowTrace: () => createSDFShadowTrace(distanceTexture, bounds, res, cell),
+    createSoftShadowTrace: (lift) => createSDFShadowTrace(distanceTexture, bounds, res, cell, lift),
   };
 }
 
@@ -415,9 +445,24 @@ function createVoxelSceneTrace(radianceBuffer, bounds, res, cell) {
  * plane-aware self-exclusion (samples whose distance ≈ the ray's height
  * above the RECEIVER'S OWN plane are the receiver surface, not a blocker —
  * without this, grazing rays paint terraced false-shadow rings).
+ *
+ * The field carries EXACT sub-voxel distances near surfaces (bakeCore's
+ * narrow band), so around thin geometry the d < contact region can be as
+ * thin as the geometry itself — the minimum step (0.35·voxel) is what
+ * guarantees a crossing ray still samples inside it (worst case a steep
+ * crossing samples d ≤ step/2 ≈ 0.18·voxel < the 0.25·voxel contact cut).
+ *
+ * `lift` = the caller's ray-origin normal offset in world units. The
+ * self-exclusion needs it exactly: with an exact field the receiver's own
+ * plane reports dRaw == lift + t·cos, so "occluder" is dRaw meaningfully
+ * BELOW that height. (The old version guessed the lift as 2·minCell and
+ * compared the 0.85-scaled d — with exact distances that made every
+ * receiver's own plane an "occluder" past t·cos ≈ 1.5 voxels → false
+ * radial shadow rings across open floors/ceilings.)
  */
-function createSDFShadowTrace(distanceTexture, bounds, res, cell) {
+function createSDFShadowTrace(distanceTexture, bounds, res, cell, lift) {
   const minCell = Math.min(cell.x, cell.y, cell.z);
+  const liftWorld = typeof lift === "number" ? lift : minCell * 2;
   const sizeX = bounds.max.x - bounds.min.x;
   const sizeY = bounds.max.y - bounds.min.y;
   const sizeZ = bounds.max.z - bounds.min.z;
@@ -426,7 +471,7 @@ function createSDFShadowTrace(distanceTexture, bounds, res, cell) {
     const penumbra = float(1).toVar();
     const t = float(minCell * 2).toVar();
 
-    Loop({ start: 0, end: 40, name: "sdfShadow" }, () => {
+    Loop({ start: 0, end: 56, name: "sdfShadow" }, () => {
       If(t.greaterThanEqual(maxT), () => {
         Break();
       });
@@ -448,20 +493,28 @@ function createSDFShadowTrace(distanceTexture, bounds, res, cell) {
         },
       );
       // Hardware trilinear; explicit level — implicit-derivative sampling
-      // inside loops is illegal WGSL.
-      const d = texture3D(distanceTexture, uvw).level(0).r.mul(minCell).mul(0.85).toVar();
-      const selfPlane = float(minCell * 2).add(t.mul(cosRayNormal));
-      const isRealOccluder = d.lessThan(selfPlane.sub(minCell * 1.2));
-      If(isRealOccluder.and(d.lessThan(minCell * 0.6)), () => {
+      // inside loops is illegal WGSL. RAW distance for classification and
+      // the penumbra estimate (the field is exact near surfaces now); the
+      // 0.85 safety factor applies to STEPPING only.
+      const dRaw = texture3D(distanceTexture, uvw).level(0).r.mul(minCell).toVar();
+      const planeHeight = float(liftWorld).add(t.mul(cosRayNormal));
+      const isRealOccluder = dRaw.lessThan(planeHeight.sub(minCell * 0.75));
+      // Contact cut kept small (0.25·voxel) and only as an early-exit — the
+      // graded part of the transition comes entirely from min(k·d/t) over the
+      // exact near field. The old 0.6·voxel binary cut painted a hard inner
+      // edge straight through every penumbra.
+      If(isRealOccluder.and(dRaw.lessThan(minCell * 0.25)), () => {
         penumbra.assign(0);
         Break();
       });
       If(isRealOccluder, () => {
-        penumbra.assign(penumbra.min(d.mul(k).div(t)));
+        penumbra.assign(penumbra.min(dRaw.mul(k).div(t)));
       });
-      t.addAssign(d.clamp(minCell * 0.75, minCell * 8));
+      t.addAssign(dRaw.mul(0.85).clamp(minCell * 0.35, minCell * 8));
     });
 
-    return smoothstep(0, 1, penumbra.clamp(0, 1));
+    // Plain clamp — the estimator's own ramp is the penumbra. The previous
+    // extra smoothstep(0,1,·) steepened every transition a second time.
+    return penumbra.clamp(0, 1);
   };
 }

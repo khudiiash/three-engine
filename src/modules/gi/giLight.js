@@ -56,6 +56,9 @@ export class GICascadeLight extends THREE.Light {
     this.emitterSlots = null;
     this.shadowTraceFn = null;
     this.shadowMargin = 0.3;
+    // World-units reach of the per-pixel mirror ray (set by GISystem from
+    // the volume size; the DDA's step cap bounds shader cost).
+    this.mirrorRange = 24;
     // Live-tunable without recompiles.
     this.intensityUniform = uniform(1);
     this.normalOffset = 0.35;
@@ -105,7 +108,7 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // real mirror needs a real ray, same as the reference demo's analytic
       // trace). Miss → keep the cascade lookup.
       if (light.mirrorTraceFn) {
-        const mirror = light.mirrorTraceFn(samplePoint, reflected, 24);
+        const mirror = light.mirrorTraceFn(samplePoint, reflected, light.mirrorRange ?? 24);
         const useMirror = smoothstep(0.3, 0.08, roughness).mul(step(0, mirror.t));
         directional = mix(directional, mirror.rad, useMirror);
       }
@@ -155,8 +158,10 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
             // SDF sphere-traced penumbra: ONE ray, smooth by construction
             // (multi-tap binary-occupancy rays could only trade staircase
             // for banding for grain). k = distance / emitter radius encodes
-            // the light's angular size: bigger/closer emitter → softer.
-            const k = dist.div(slot.radius.max(0.05)).clamp(3, 24);
+            // the light's angular size: bigger/closer emitter → softer. The
+            // old floor of 3 forbade genuinely soft shadows from big/near
+            // emitters; 1.25 keeps degenerate-radius stability only.
+            const k = dist.div(slot.radius.max(0.05)).clamp(1.25, 32);
             const origin = positionWorld.add(N.mul(light.normalOffset));
             const maxT = dist.sub(slot.radius).sub(light.shadowMargin).max(0);
             If(maxT.greaterThan(light.shadowMargin), () => {

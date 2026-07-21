@@ -19,6 +19,7 @@ export class GlobalIlluminationComponent extends Component {
   static label = "Global Illumination (RC)";
   static tags = ["rendering", "lighting", "gi", "radiance-cascades"];
   static defaults = {
+    autoFit: false,
     sizeX: 40,
     sizeY: 12,
     sizeZ: 40,
@@ -28,12 +29,18 @@ export class GlobalIlluminationComponent extends Component {
     c0DirRes: 4,
     intensity: 1,
     bounce: 1,
+    temporalBlend: 0.25,
     reflections: true,
     emissiveShadows: true,
     autoRebake: true,
     debugProbes: "off",
   };
   static schema = [
+    // Auto-fit wraps the volume around the scene's GI meshes with headroom
+    // and derives voxel/probe density from fixed budgets (size props become
+    // irrelevant; voxelSize/probeSpacing act as quality floors). Refits
+    // automatically when content outgrows the volume.
+    { key: "autoFit", label: "Auto Fit Scene", type: "boolean" },
     { key: "sizeX", label: "Size X", type: "number", min: 4, max: 200, step: 1 },
     { key: "sizeY", label: "Size Y", type: "number", min: 2, max: 100, step: 1 },
     { key: "sizeZ", label: "Size Z", type: "number", min: 4, max: 200, step: 1 },
@@ -45,6 +52,8 @@ export class GlobalIlluminationComponent extends Component {
     // Fraction of secondary energy retained per pass — the pass itself is
     // an infinite-bounce feedback loop; values > 1 would diverge.
     { key: "bounce", label: "Bounce Energy", type: "number", min: 0, max: 1, step: 0.05 },
+    // How fast streamed re-bakes blend into the live field (1 = instant).
+    { key: "temporalBlend", label: "Temporal Blend", type: "number", min: 0.02, max: 1, step: 0.01 },
     { key: "reflections", label: "GI Reflections", type: "boolean" },
     { key: "emissiveShadows", label: "Emissive Shadows", type: "boolean" },
     { key: "autoRebake", label: "Auto Re-bake", type: "boolean" },

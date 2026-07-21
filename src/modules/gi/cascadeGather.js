@@ -19,7 +19,7 @@
 // second transport implementation. Direct material shading here deliberately
 // bypasses any G-buffer/deferred-resolve layer (where the prior attempt's
 // never-root-caused stripe bug lived).
-import { Fn, If, Loop, Return, float, floor, instanceIndex, max, mod, smoothstep, step, vec3, vec4 } from "three/tsl";
+import { Fn, If, Loop, Return, float, floor, instanceIndex, max, mix, mod, smoothstep, step, vec3, vec4 } from "three/tsl";
 import { octahedralTexelIndex, octahedralUV } from "./cascadeTrace.js";
 
 /**
@@ -197,15 +197,31 @@ export function createRadianceLookup(cascades, level = 2) {
  *
  * Dispatch this FIRST in the per-frame queue (before traces/merges).
  */
-export function createBounceFeedback(cascades, volume, gainUniform) {
+export function createBounceFeedback(cascades, volume, gainUniform, blendUniform) {
   const gather = createIrradianceGather(cascades);
   const { res, bounds, cell } = volume;
   const cellCount = res.x * res.y * res.z;
   const normalLift = Math.min(cell.x, cell.y, cell.z) * 1.2;
 
   return Fn(() => {
-    const base = volume.baseBuffer.element(instanceIndex).toVar();
+    // Temporal ingest of streamed bakes: staging holds the latest CPU bake
+    // (worker cadence, 10-15Hz); base lerps toward it every frame so bake
+    // swaps spread over ~100ms instead of popping — this is the moving-
+    // object flicker fix. Occupancy SNAPS (geometry presence is binary) and
+    // radiance snaps with it on occupancy change, otherwise a mover's
+    // leading edge would blend up from black and dim.
+    const staging = volume.stagingBuffer.element(instanceIndex).toVar();
+    const prev = volume.baseBuffer.element(instanceIndex).toVar();
+    const alpha = float(1).toVar();
+    If(staging.w.sub(prev.w).abs().lessThan(0.5), () => {
+      alpha.assign(blendUniform);
+    });
+    const base = vec4(mix(prev.xyz, staging.xyz, alpha), staging.w).toVar();
+    volume.baseBuffer.element(instanceIndex).assign(base);
     If(base.w.lessThan(0.5), () => {
+      // Cells that just became empty must clear the live field too — the
+      // CPU no longer writes radianceBuffer directly.
+      volume.radianceBuffer.element(instanceIndex).assign(vec4(0, 0, 0, 0));
       Return();
     });
     const surface = volume.surfaceBuffer.element(instanceIndex).toVar();

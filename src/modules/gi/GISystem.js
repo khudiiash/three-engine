@@ -58,7 +58,7 @@ export class GISystem {
 
   onComponentProp(component, key) {
     if (this.component !== component) return;
-    if (key === "intensity" || key === "bounce" || key === "enabled") {
+    if (key === "intensity" || key === "bounce" || key === "temporalBlend" || key === "enabled") {
       this.#applyLiveProps();
     } else if (key === "debugProbes") {
       this.#applyDebugVisibility();
@@ -90,7 +90,21 @@ export class GISystem {
       p.c0DirRes,
       p.reflections,
       p.emissiveShadows,
+      p.autoFit,
     ]);
+  }
+
+  /** World AABB of the GI-relevant meshes, or null when the scene is empty. */
+  #sceneAabb(meshes) {
+    if (!meshes.length) return null;
+    const aabb = new THREE.Box3();
+    const meshBox = new THREE.Box3();
+    for (const mesh of meshes) {
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+      meshBox.copy(mesh.geometry.boundingBox).applyMatrix4(mesh.matrixWorld);
+      aabb.union(meshBox);
+    }
+    return aabb.isEmpty() ? null : aabb;
   }
 
   requestRebuild() {
@@ -138,36 +152,65 @@ export class GISystem {
     if (!component || !engine.scene) return;
 
     const props = component.props;
+    const meshes = this.#collectMeshes();
+    const lights = this.#collectLights();
+
+    // Volume placement: manual (entity-centered, size props) or AUTO-FIT —
+    // bounds wrap the GI-relevant scene content with headroom, and voxel/
+    // probe densities are derived from fixed budgets so any world size stays
+    // performant (bigger world → coarser field, same cost).
     const center = new THREE.Vector3();
-    component.entity.object3D.getWorldPosition(center);
-    const half = new THREE.Vector3(props.sizeX / 2, props.sizeY / 2, props.sizeZ / 2);
+    let sizeX = props.sizeX;
+    let sizeY = props.sizeY;
+    let sizeZ = props.sizeZ;
+    const autoFit = props.autoFit === true;
+    const sceneAabb = autoFit ? this.#sceneAabb(meshes) : null;
+    if (sceneAabb) {
+      sceneAabb.getCenter(center);
+      const span = new THREE.Vector3();
+      sceneAabb.getSize(span);
+      // 10% + 0.75m headroom per side: content can move a bit before a
+      // refit is needed (see #checkFingerprint's containment test).
+      sizeX = Math.max(4, span.x * 1.2 + 1.5);
+      sizeY = Math.max(2, span.y * 1.2 + 1.5);
+      sizeZ = Math.max(4, span.z * 1.2 + 1.5);
+    } else {
+      component.entity.object3D.getWorldPosition(center);
+    }
+    const half = new THREE.Vector3(sizeX / 2, sizeY / 2, sizeZ / 2);
     const bounds = {
       min: center.clone().sub(half),
       max: center.clone().add(half),
     };
 
-    const voxelSize = Math.max(0.05, props.voxelSize || 0.3);
+    let voxelSize = Math.max(0.05, props.voxelSize || 0.3);
+    let probeSpacing = Math.max(0.25, props.probeSpacing || 1.25);
+    if (autoFit) {
+      // Budget-derived densities: the user's values act as a FLOOR (their
+      // quality intent), coarsened as needed so ~1.5M cells / MAX_PROBE_AXIS
+      // probes are never exceeded regardless of world size.
+      const maxAxis = Math.max(sizeX, sizeY, sizeZ);
+      const volume = sizeX * sizeY * sizeZ;
+      voxelSize = Math.max(voxelSize, maxAxis / MAX_AXIS_RES, Math.cbrt(volume / 1_500_000));
+      probeSpacing = Math.max(probeSpacing, maxAxis / MAX_PROBE_AXIS);
+    }
     const res = {
-      x: Math.min(MAX_AXIS_RES, Math.max(4, Math.round(props.sizeX / voxelSize))),
-      y: Math.min(MAX_AXIS_RES, Math.max(4, Math.round(props.sizeY / voxelSize))),
-      z: Math.min(MAX_AXIS_RES, Math.max(4, Math.round(props.sizeZ / voxelSize))),
+      x: Math.min(MAX_AXIS_RES, Math.max(4, Math.round(sizeX / voxelSize))),
+      y: Math.min(MAX_AXIS_RES, Math.max(4, Math.round(sizeY / voxelSize))),
+      z: Math.min(MAX_AXIS_RES, Math.max(4, Math.round(sizeZ / voxelSize))),
     };
-    const probeSpacing = Math.max(0.25, props.probeSpacing || 1.25);
     const c0Grid = {
-      x: Math.min(MAX_PROBE_AXIS, Math.max(2, Math.round(props.sizeX / probeSpacing))),
-      y: Math.min(MAX_PROBE_AXIS, Math.max(2, Math.round(props.sizeY / probeSpacing))),
-      z: Math.min(MAX_PROBE_AXIS, Math.max(2, Math.round(props.sizeZ / probeSpacing))),
+      x: Math.min(MAX_PROBE_AXIS, Math.max(2, Math.round(sizeX / probeSpacing))),
+      y: Math.min(MAX_PROBE_AXIS, Math.max(2, Math.round(sizeY / probeSpacing))),
+      z: Math.min(MAX_PROBE_AXIS, Math.max(2, Math.round(sizeZ / probeSpacing))),
     };
 
     if (res.x * res.y * res.z > 1_500_000) {
       console.warn(
         `[gi] ${res.x}x${res.y}x${res.z} voxels is heavy (ray-march steps scale with 1/voxelSize). ` +
-          `For a ${props.sizeX}m volume, voxelSize ~${(props.sizeX / 100).toFixed(2)} is usually plenty.`,
+          `For a ${sizeX.toFixed(0)}m volume, voxelSize ~${(sizeX / 100).toFixed(2)} is usually plenty.`,
       );
     }
-
-    const meshes = this.#collectMeshes();
-    const lights = this.#collectLights();
     const t0 = performance.now();
     const volume = voxelizeOnce(meshes, bounds, res, lights);
 
@@ -177,7 +220,7 @@ export class GISystem {
       c0Grid,
       c0DirRes: props.c0DirRes === 2 ? 2 : 4,
       t0: probeSpacing,
-      farT: Math.max(props.sizeX, props.sizeY, props.sizeZ) * 2,
+      farT: Math.max(sizeX, sizeY, sizeZ) * 2,
       sceneTrace: volume.createSceneTrace(),
     });
     const { mergeComputes } = createCascadeMerge(cascades);
@@ -186,7 +229,11 @@ export class GISystem {
     // FIRST (reads last frame's merged field) so this frame's trace sees
     // bounced energy — this is what makes emissive-only scenes bleed.
     const bounceGain = uniform(Math.min(1, Math.max(0, props.bounce ?? 1)));
-    const feedbackCompute = createBounceFeedback(cascades, volume, bounceGain);
+    // Per-frame lerp factor pulling the GPU base field toward the latest
+    // streamed bake (see createBounceFeedback). 1 = instant snap (old
+    // behavior), ~0.25 spreads a bake swap over ~10 frames.
+    const temporalBlend = uniform(Math.min(1, Math.max(0.02, props.temporalBlend ?? 0.25)));
+    const feedbackCompute = createBounceFeedback(cascades, volume, bounceGain, temporalBlend);
 
     const queue = [feedbackCompute];
     for (const cascade of cascades) queue.push(cascade.traceCompute);
@@ -205,10 +252,15 @@ export class GISystem {
       light.radianceSharpFn = sharpLevel > 2 ? createRadianceLookup(cascades, sharpLevel) : null;
       // Low-roughness materials get a real per-pixel voxel ray (mirror look).
       light.mirrorTraceFn = volume.createSceneTrace();
+      // Ray reach scales with the volume (was a fixed 24m — cut mirrors off
+      // in bigger worlds). Clamped: the DDA's step cap bounds shader cost.
+      light.mirrorRange = Math.min(48, Math.max(8, Math.hypot(sizeX, sizeY, sizeZ)));
     }
     light.normalOffset = Math.max(0.1, voxelSize * 1.2);
     if (props.emissiveShadows !== false) {
-      light.shadowTraceFn = volume.createSoftShadowTrace();
+      // Pass the exact ray-origin lift — the trace's self-plane exclusion
+      // compares field distances against lift + t·cos and needs the real value.
+      light.shadowTraceFn = volume.createSoftShadowTrace(light.normalOffset);
       light.shadowMargin = Math.max(0.2, voxelSize * 2.5);
       light.emitterSlots = Array.from({ length: MAX_EMITTERS }, () => ({
         center: uniform(new THREE.Vector3()),
@@ -222,7 +274,20 @@ export class GISystem {
     const gizmos = this.#buildGizmos(cascades, bounds);
     for (const mesh of gizmos.all) engine.scene.add(mesh);
 
-    this.state = { volume, cascades, queue, light, gizmos, meshes, lights, bounds, center, bounceGain };
+    this.state = {
+      volume,
+      cascades,
+      queue,
+      light,
+      gizmos,
+      meshes,
+      lights,
+      bounds,
+      center,
+      bounceGain,
+      temporalBlend,
+      autoFit,
+    };
     this._structuralSig = this.#structuralSignature(component);
     this._fingerprint = this.#computeFingerprint(meshes, this.#collectLightObjects());
     this.#applyLiveProps();
@@ -260,6 +325,7 @@ export class GISystem {
     // carry values up to 4 from the earlier schema. Artistic exaggeration
     // belongs to `intensity`, which sits OUTSIDE the loop.
     state.bounceGain.value = Math.min(1, Math.max(0, this.component?.props.bounce ?? 1));
+    state.temporalBlend.value = Math.min(1, Math.max(0.02, this.component?.props.temporalBlend ?? 0.25));
   }
 
   #applyDebugVisibility() {
@@ -383,11 +449,41 @@ export class GISystem {
     const component = this.component;
     if (!state || !component) return;
 
-    const center = new THREE.Vector3();
-    component.entity.object3D.getWorldPosition(center);
-    if (center.distanceTo(state.center) > Math.max(0.5, (component.props.probeSpacing || 1.25) * 0.5)) {
-      this.requestRebuild();
-      return;
+    if (state.autoFit) {
+      // Refit when content leaves the volume (or the volume is mostly empty
+      // air). The rebuild's 10%+0.75m headroom is the hysteresis: after a
+      // refit, content must travel that far again to trigger the next one.
+      const now = performance.now();
+      if (now - (this._lastRefitAt ?? 0) > 2000) {
+        const aabb = this.#sceneAabb(this.#collectMeshes());
+        if (aabb) {
+          const inside =
+            aabb.min.x >= state.bounds.min.x &&
+            aabb.min.y >= state.bounds.min.y &&
+            aabb.min.z >= state.bounds.min.z &&
+            aabb.max.x <= state.bounds.max.x &&
+            aabb.max.y <= state.bounds.max.y &&
+            aabb.max.z <= state.bounds.max.z;
+          const span = new THREE.Vector3();
+          aabb.getSize(span);
+          const boundsSpan = new THREE.Vector3().subVectors(state.bounds.max, state.bounds.min);
+          const shrunk =
+            span.x * span.y * span.z < boundsSpan.x * boundsSpan.y * boundsSpan.z * 0.35;
+          if (!inside || shrunk) {
+            this._lastRefitAt = now;
+            console.log(`[gi] auto-fit: scene ${!inside ? "outgrew" : "shrank well below"} the volume — refitting`);
+            this.requestRebuild();
+            return;
+          }
+        }
+      }
+    } else {
+      const center = new THREE.Vector3();
+      component.entity.object3D.getWorldPosition(center);
+      if (center.distanceTo(state.center) > Math.max(0.5, (component.props.probeSpacing || 1.25) * 0.5)) {
+        this.requestRebuild();
+        return;
+      }
     }
 
     const meshes = this.#collectMeshes();
@@ -399,7 +495,9 @@ export class GISystem {
     // this, mesh serialization runs per-frame during a drag. Leaving
     // _fingerprint un-updated makes the next check retry, so no edit is lost.
     const now = performance.now();
-    if (now - (this._lastRebakeAt ?? 0) < 70) return;
+    // Incremental region bakes run ~9ms in the worker — 40ms request cadence
+    // (~24Hz) keeps drags near-continuous; the temporal blend hides the rest.
+    if (now - (this._lastRebakeAt ?? 0) < 40) return;
     this._lastRebakeAt = now;
     this._fingerprint = fingerprint;
 
@@ -414,7 +512,8 @@ export class GISystem {
       this.#updateEmitters(current.light, this.#collectMeshes());
       const { occupiedCells, litCells, emissiveCells } = current.volume.stats;
       console.log(
-        `[gi] worker rebake ${result.elapsed.toFixed(0)}ms (occ ${occupiedCells}, lit ${litCells}, emissive ${emissiveCells})`,
+        `[gi] worker rebake ${result.elapsed.toFixed(0)}ms [${result.mode}] ` +
+          `(occ ${occupiedCells}, lit ${litCells}, emissive ${emissiveCells})`,
       );
     });
   }
