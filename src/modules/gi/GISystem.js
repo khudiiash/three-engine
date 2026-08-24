@@ -2373,6 +2373,41 @@ export class GISystem {
         const base = 0.9 * (1 - mLight);
         this._giIrrHistWeightU.value = windowOpen ? 0 : Math.max(base, 0.7 * fastField);
       }
+      // ── §17 R7c: REFLECTIONS ARE VIEW-DEPENDENT ─────────────────────────
+      // The header's "held high under CAMERA motion — reprojection handles
+      // that" is true for IRRADIANCE and wrong for the hit radiance: a
+      // reflection is a function of the view ray, so position-validated
+      // history carries a stale IMAGE while the camera moves. The hit
+      // filter's own weight goes near-raw under camera motion (the moving
+      // image masks the noise this filter exists to smooth) and recovers
+      // over ~1/3 s at rest. `__giBvhHitHistWeight` pins it for A/Bs.
+      if (this._giBvhHitHistWeightU) {
+        const hitPin = Number(globalThis.__giBvhHitHistWeight);
+        if (Number.isFinite(hitPin)) {
+          this._giBvhHitHistWeightU.value = Math.min(0.98, Math.max(0, hitPin));
+        } else {
+          const cam = this.engine.camera;
+          const scr = (this._giCamMotionScratch ??= {
+            pos: new THREE.Vector3(), dir: new THREE.Vector3(), seeded: false, ema: 0,
+          });
+          let moving = 0;
+          if (cam) {
+            const e = cam.matrixWorld.elements;
+            if (scr.seeded) {
+              const posDelta = Math.hypot(e[12] - scr.pos.x, e[13] - scr.pos.y, e[14] - scr.pos.z);
+              const dirDelta = Math.abs(e[8] - scr.dir.x) + Math.abs(e[9] - scr.dir.y) + Math.abs(e[10] - scr.dir.z);
+              moving = posDelta > 0.002 || dirDelta > 0.0005 ? 1 : 0;
+            }
+            scr.pos.set(e[12], e[13], e[14]);
+            scr.dir.set(e[8], e[9], e[10]);
+            scr.seeded = true;
+          }
+          // Fast attack, ~0.85^n release (~0.3 s at 60 fps; longer at low
+          // fps, which only errs toward responsiveness).
+          scr.ema = Math.max(moving, scr.ema * 0.85);
+          this._giBvhHitHistWeightU.value = this._giIrrHistWeightU.value * (1 - 0.95 * scr.ema);
+        }
+      }
       this.#syncDynamicSurfaceBounds();
     }
     // (Analytic-width arm: `_giShadowFrameU` is never created, the whole
@@ -6143,7 +6178,12 @@ export class GISystem {
       resolveHeight: height,
       history: {
         prevViewProj: this._giIrrPrevVPU,
-        weight: this._giIrrHistWeightU,
+        // §17 R7c — the glossy radiance is a lookup along the REFLECTED
+        // ray: view-dependent, same as the exact hit radiance, so it shares
+        // the camera-motion-aware weight rather than the diffuse filter's
+        // camera-blind one (which made rough reflections drag behind the
+        // camera exactly like the exact ones).
+        weight: (this._giBvhHitHistWeightU ??= uniform(0.9)),
         validEps,
         dynMin: (this._giDynRejectMinU ??= uniform(new THREE.Vector3())),
         dynMax: (this._giDynRejectMaxU ??= uniform(new THREE.Vector3())),
@@ -6201,7 +6241,15 @@ export class GISystem {
       resolveHeight,
       history: {
         prevViewProj: this._giIrrPrevVPU,
-        weight: this._giIrrHistWeightU,
+        // §17 R7c — the hit radiance gets its OWN weight, not the diffuse
+        // filter's. Reflections are VIEW-DEPENDENT: surface-anchored
+        // reprojection validates history whose CONTENT is stale the moment
+        // the camera moves, so the shared weight made the reflected image
+        // hang and settle 1-2 s after motion stopped (the user's report,
+        // first visible once §17 R7a made the content worth looking at).
+        // The tick drives this near zero while the camera moves and
+        // recovers it over ~a third of a second at rest.
+        weight: (this._giBvhHitHistWeightU ??= uniform(0.9)),
         validEps,
         dynMin: (this._giDynRejectMinU ??= uniform(new THREE.Vector3())),
         dynMax: (this._giDynRejectMaxU ??= uniform(new THREE.Vector3())),

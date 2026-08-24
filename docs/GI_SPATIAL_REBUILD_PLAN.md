@@ -352,6 +352,20 @@ heap-kill signature).
   Caveats carried: 44-deep stack silent subtree drop = conservative miss;
   degrade ladder can drop the static region on portable → fall back to
   the incumbent automatically (it checks region presence).
+- **✅ R7c — VIEW-DEPENDENT TEMPORAL WEIGHT (2026-08-24, user: "reflections
+  look like hanging, update 1-2 s after I move").** The hit-radiance AND
+  glossy temporal filters bound the DIFFUSE filter's weight, whose policy
+  ("camera motion stales nothing — reprojection handles it") is correct
+  for irradiance and WRONG for reflections: surface-anchored reprojection
+  validates history whose IMAGE is stale the moment the view ray changes.
+  Both chains now ride `_giBvhHitHistWeightU`: near-raw while the camera
+  moves (motion masks the noise the filter exists to smooth; fast attack),
+  recovering to the diffuse base over ~1/3 s at rest (0.85^n release).
+  Camera motion = matrixWorld position/basis delta per tick (2 mm /
+  ~0.03°). `__giBvhHitHistWeight` pins it. Invisible before R7a because
+  the reflected content was too wrong to see lag in. Probe captures stay
+  untouched — they are world-anchored (box projection + depth parallax
+  handle the view), not lagging.
 - **B1 — WORKER BVH (user-approved).** buildStaticSceneBvhWords + the
   MeshBVH BLAS builds off the main thread (flat inputs, transferable
   words; staged-attach + 60-frame resync windows already tolerate late
