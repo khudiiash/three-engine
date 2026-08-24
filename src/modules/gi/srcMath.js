@@ -135,6 +135,45 @@ export function binMorton(i, j) {
   return m >>> 0;
 }
 
+/** Inverse of `binMorton` — deinterleave a storage index back to (i, j). */
+export function binUnmorton(m) {
+  let i = 0;
+  let j = 0;
+  for (let b = 0; b < 16; b++) {
+    i |= ((m >>> (2 * b)) & 1) << b;
+    j |= ((m >>> (2 * b + 1)) & 1) << b;
+  }
+  return { i, j };
+}
+
+/**
+ * §16 S1 — bin-centre DIRECTIONS in STORAGE (Morton) order, as one uploaded
+ * table: `[m*4 .. m*4+2]` = the unit direction of bin index m on the 2w×w
+ * grid, `.w` unused (vec4 stride keeps the GPU read a single element()).
+ *
+ * The same tileCosineWeights idea: the mapping is a pure function of `w`, so
+ * it is computed ONCE here — the kernels that composite sky per direction
+ * (srcMerge's top-cascade close, srcTiles' orphan term) do a table read and
+ * an equirect sample, no in-kernel Morton or trig, and there is no twin to
+ * drift because there is no second implementation.
+ *
+ * Morton over the 2w×w grid is DENSE for power-of-two w (i carries one more
+ * bit than j and the interleave covers [0, 2w²) exactly), which is also why
+ * it can be the payload's storage order in the first place.
+ */
+export function binDirTable(w) {
+  const nBins = 2 * w * w;
+  const table = new Float32Array(nBins * 4);
+  for (let m = 0; m < nBins; m++) {
+    const { i, j } = binUnmorton(m);
+    const [dx, dy, dz] = binDir(i, j, w);
+    table[m * 4] = dx;
+    table[m * 4 + 1] = dy;
+    table[m * 4 + 2] = dz;
+  }
+  return table;
+}
+
 /** Inverse of binMorton. */
 export function mortonToBin(m) {
   let i = 0;
@@ -336,12 +375,308 @@ export const KEY_EMPTY = 0;
 // `wrapCellNear` below, and the margin proved above is exactly what makes the
 // representative unique.
 //
-// Hatched (`__giSrcWorldKeys`) and OFF by default: the plan requires the old
-// keying kept for A/B through the whole phase.
+// ⛔⛔ OPT-IN AGAIN — 2026-08-22 late evening, THE USER'S SECOND LIVE VETO.
+// The default has now flipped ON twice on rig receipts and been thrown out
+// twice by the user's eyes on the real Level ("it was a lot better before we
+// moved to world keys. Now it is just trash"). Every rig number below REMAINS
+// TRUE AT RIG SCALE — pixel parity, freezeless teleport, 0 re-anchors,
+// spin-retention recovery 720→90 ms, the anchor-relative return-to-black —
+// and none of it predicted the live look. DO NOT RE-FLIP ON RIG RECEIPTS A
+// THIRD TIME: the re-flip precondition is a discriminating LIVE instrument on
+// the user's own Level that the user has looked at and accepted, plus the
+// steady-state merge-orphan question answered (30-45% mid-play orphaning had
+// world-keys/retention on its §12.56 suspect list; an orphaned bin's partial
+// answer is exactly a "patch updating" the user can see and no crop-mean rig
+// measures).
+//
+// History for that future instrument:
+//  · The flip gate (`test:gi-worldkeys-flip`): pixel parity within the
+//    cross-boot envelope, freezeless 100 m teleport (max 17 ms), fixed store
+//    over 600 m, 0 re-anchors vs shipped's 15.
+//  · First revert's "heavy freezes" were the §12.56 auto-retry false-firing
+//    (fixed, two-strike); the Level-scale probe then walked
+//    world-keys+retention FASTEST of five arms — that exoneration justified
+//    re-flip #2, and the user's eyes still said worse.
+//  · Anchor-relative's own documented cost stands: walking a room and
+//    returning leaves it BLACK (ceiling −100%, +3 s — §15 front 5). Both
+//    defaults have a user-visible failure; the user prefers this one.
+// `__giSrcWorldKeys = true` arms world keys + locality retention for A/B.
 
-/** Is world-absolute probe keying armed? `__giSrcWorldKeys = true` opts in. */
+/** Is world-absolute probe keying armed? OPT-IN; `true` arms it. */
 export function worldKeysEnabled() {
   return globalThis.__giSrcWorldKeys === true;
+}
+
+/**
+ * §13.9 — SMOOTHED TRILINEAR WEIGHTS. Plain trilinear interpolation is only
+ * C0: the gradient STEPS at every cell face, and the eye reads a gradient step
+ * as a line (Mach banding). On a probe field that is exactly where a crease
+ * appears — and it appears strongest where adjacent probes disagree most,
+ * which with differently-coloured emitters is the hue boundary between two
+ * lights. Replacing `t` with `3t²−2t³` zeroes the derivative at both ends of
+ * every cell, so the interpolant is C1 across faces and the creases go.
+ *
+ * Read through ONE function because `srcRef.js`'s CPU mirror and the GPU
+ * gather must agree, or `test:gi-src-gather` diffs a smoothed GPU against an
+ * unsmoothed CPU and calls the fix a regression ([[gi-src-rebuild]] §13.7e).
+ *
+ * ══ §12.86 — DEFAULT-ON, AND THE USER DESCRIBED THIS FUNCTION'S DOCSTRING ══
+ *
+ * 2026-08-23, the user's report, unprompted and in their own words:
+ *
+ *   "blockiness ... mostly in darker regions, and mostly in further regions.
+ *    As far as I could figure out, this happens when we transite from ONE
+ *    VOXEL GRID TO ANOTHER. That must not happen, we must always see smooth
+ *    lighting" — and, correcting a wrong lead: "it happens mostly when our
+ *    camera moves from one room into the other, or we start looking in the
+ *    opposite direction swiftly."
+ *
+ * "Transiting from one voxel grid to another" IS a cell-face crossing, and the
+ * paragraph above says what a C0 interpolant does at one: the gradient steps,
+ * and the eye reads the step as a line. Over a 3D lattice those lines close
+ * into a cell-shaped grid. It checks out against every constraint they gave:
+ *
+ *   · SCALE — the crease period is exactly `spacing0` = 0.45 m on their Level,
+ *     which is the ~90-110 px block measured in their screenshots at 3-4 m.
+ *   · CAMERA-TRIGGERED — the pattern is WORLD-LOCKED, so it is invisible until
+ *     you translate across it. Walking into the next room sweeps you through
+ *     ~18 cell faces; a swift turn re-projects the whole grid at once. Standing
+ *     still, nothing moves and nothing draws the eye to it.
+ *   · PERMANENT — it is a deterministic property of the interpolant, not
+ *     variance. It cannot converge away, which is why the walk probe reads
+ *     `settles 0 ms` and why `checker` RISES over the measuring window instead
+ *     of decaying.
+ *   · DARK — Mach banding is contrast-relative, and `checker` normalises by the
+ *     local mean for the same reason. This scene has `Sky Light 0`, so dark
+ *     regions have no fill to swamp the step.
+ *   · FAR — the same 0.45 m cell subtends ~110 px at 3.5 m and ~19 px at 20 m,
+ *     so the creases pack together and read as a grid rather than as a soft
+ *     gradient.
+ *
+ * The cost is three multiplies and a subtract per axis per corner, on weights
+ * that were already being computed — no extra taps, no extra bindings, no
+ * temporal state. It reshapes WEIGHTS ONLY: `cell0`, the corner keys, the hash
+ * lookups, the coverage renormalisation and the energy are all untouched, and
+ * the weights still sum to 1 (`3t²−2t³` maps [0,1]→[0,1] with f(0)=0, f(1)=1),
+ * so it cannot move a furnace test.
+ *
+ * ⚠ It is NOT a variance filter. If a probe's own estimate is noisy, this makes
+ * the noise smooth instead of blocky — better, but the amplitude is unchanged.
+ * Judge it on creases, not on brightness.
+ *
+ * ══ ⛔ AND IT IS REFUTED. IT STAYS OPT-IN. (2026-08-23, same night) ═════════
+ *
+ * Flipped default-on on the reasoning above, then measured properly and put
+ * back. `probe:gi-gather-smooth-paired` — ONE boot, ONE pose, ONE converged
+ * field, the arm flipped as a live uniform so A and B differ by NOTHING except
+ * the interpolant — on the user's Level at three room-threshold poses:
+ *
+ *   pose                       picture delta      crease p99 C1/C0
+ *   west room, long axis        1.55%              1.001
+ *   centre → west doorway       0.74%              1.046
+ *   centre corridor             1.14%              0.995
+ *
+ * The dial is LIVE (it moves ~1% of the picture) and it does not reduce
+ * cell-face gradient steps at all. Two of three ratios are above 1.
+ *
+ * ⚠ THE MEASUREMENT HAS A KNOWN WEAKNESS, RECORDED SO THE NEXT ATTEMPT DOES
+ * NOT REPEAT IT: `creaseFlat` masks to LOW-first-difference pixels to exclude
+ * albedo and geometry edges, and a crease is by definition a place where the
+ * gradient on one side is elevated — so the mask may be excluding the very
+ * pixels it is meant to score. A better instrument would mask by ALBEDO
+ * (gbuffer), not by gradient. Until someone builds that, this is a refutation
+ * of "C1 weights visibly help on this scene", not of the Mach-band mechanism.
+ *
+ * Three prior statistics failed on this same question BEFORE this one worked,
+ * and all three failed silently by returning a clean null:
+ *   · `checker` (probe:gi-walk) is a mean FIRST difference, and total variation
+ *     across a cell is fixed by its endpoints — a linear and a smoothstep ramp
+ *     from L0 to L1 have identical Σ|ΔL|. Blind by algebra.
+ *   · a whole-frame SECOND difference is dominated by albedo/geometry edges.
+ *   · the first paired run captured a BLACK canvas (drawImage outside the rAF
+ *     callback; a WebGPU canvas invalidates on present) and reported "INERT".
+ *
+ * `__giGatherSmoothWeights = true` arms it; `probe:gi-walk`'s `nosmooth` arm
+ * and `__giGatherSmoothLive` (the per-frame uniform) are the A/B instruments.
+ */
+/**
+ * §12.88 — NORMAL BIAS ON THE GATHER, IN METRES. Default 0 = today's behaviour.
+ *
+ * The screen gather evaluates its 8-corner trilinear stencil at the RAW gbuffer
+ * position (`srcScreenGather`: `const P = vec3(position)`), so the four corners
+ * behind the shaded face sit up to `s0` BEHIND it. On the user's Level that is
+ * 0.45 m against 0.25 m partition walls — the stencil spans 0.90 m, 3.6× the
+ * wall — and those corners land in the NEXT ROOM, voting at full trilinear
+ * weight. There is nothing to stop them: `gatherNormalWeightExp()` is 0 by
+ * default, `gatherLosWeight()` is opt-in, `mergeLosWeight()` is opt-in. The
+ * corner weight on this scene is bare, unshaped, position-only trilinear.
+ *
+ * Offsetting the sample point along the surface normal is the standard DDGI
+ * answer and it is GEOMETRIC rather than heuristic: the far corner reaches
+ * `s0 − β` past the surface, so the leak through a wall of thickness `w` is
+ * exactly zero once `β > s0 − w`. At s0 = 0.45 and w = 0.25 that is β > 0.20 m;
+ * 0.6·s0 = 0.27 m holds it at every lattice phase.
+ *
+ * ⚠ THE TRADE, and it is the user's call, not this function's: β metres of
+ * contact and concave shading detail move with the sample point. Too large and
+ * corners lose their darkening. That is why it ships at 0 and is swept by
+ * `probe:gi-gather-smooth-paired` as a LIVE UNIFORM — one boot, one pose, both
+ * arms, which is the only kind of A/B this scene supports (its boot-to-boot
+ * spread is ~2×).
+ *
+ * ONE reader, like the two below it, because `srcRef.js`'s CPU mirror and the
+ * GPU gather must agree or `test:gi-src-gather` calls an armed default a
+ * regression.
+ */
+export function gatherNormalBias() {
+  const v = Number(globalThis.__giGatherNormalBias);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+export function gatherSmoothWeights() {
+  return globalThis.__giGatherSmoothWeights === true;
+}
+
+/**
+ * §13.7d / §14 Q9 — the gather's normal-plane weight exponent; 0 = off.
+ *
+ * ⚠ OPT-IN AGAIN since 2026-08-20 late (`__giGatherNormalWeight`: `true` = 2,
+ * a number = exponent). It shipped default-on for a few hours and produced
+ * THREE artifacts in a row on the user's Level, each a lesson:
+ *   1. the DDGI direction wrap → grid DOTS (modulates front probes);
+ *   2. one-sided direction cosine → soft SQUARES (cos varies with lateral
+ *      offset — still lattice-periodic);
+ *   3. one-sided signed PLANE DISTANCE (the current, correct form —
+ *      lattice-silent by construction) → BRIGHT BANDS at wall edges and
+ *      corners, because suppressing the dark behind-the-wall probes and
+ *      RENORMALIZING redistributes their share onto the bright front
+ *      probes: corners brighten, where reality darkens them.
+ * The formula stays (it is finally geometry-sound); what is missing is the
+ * energy story: a suppressed probe should DARKEN like occlusion, not
+ * redistribute — i.e. scale the gather by the kept-weight fraction instead
+ * of renormalizing (an AO-like term needing its own pricing rig). Until that
+ * ships, the thin-wall bleed lever stays a hatch.
+ *
+ * ONE reader for the same reason as `gatherSmoothWeights` above — the CPU
+ * mirror and the GPU gather must agree or `test:gi-src-gather` calls an
+ * armed default a regression.
+ */
+export function gatherNormalWeightExp() {
+  const h = globalThis.__giGatherNormalWeight;
+  if (h === false) return 0;
+  if (h === true) return 2;
+  if (Number.isFinite(h)) return h > 0 ? h : 0;
+  return 0;
+}
+
+/**
+ * THE OCCUPANCY SHOULDER both LOS marches read through (2026-08-23).
+ *
+ * `occupancyAtWorld` returns TRILINEARLY FILTERED coverage, which is what
+ * makes the suppression continuous and therefore shippable — the binary read
+ * drew stair-stepped light boundaries at voxel granularity and cost U3 its
+ * default. But a filtered field is non-zero for a whole voxel AROUND geometry,
+ * so feeding it in raw makes "near a wall" mean "partially blocked": measured
+ * on the leak rig, legitimate in-room light fell to 0.624 of the unsuppressed
+ * arm, against the one-bit arm's 0.89–0.92.
+ *
+ * So the march thresholds it with a SOFT SHOULDER instead of using it raw. A
+ * sample must be substantially INSIDE geometry to occlude (a planar wall reads
+ * ~0.5 exactly at its surface, 1.0 a voxel in, 0.0 a voxel out), while the
+ * ramp between the two bounds keeps the position-continuity the whole change
+ * exists for. Free space stays free; the staircase stays gone.
+ *
+ * One definition, both call sites (screen gather + cascade merge) — they must
+ * agree or the field's own tiles and the screen's read of them disagree about
+ * which side of a wall a probe is on.
+ */
+// ⚠ LO IS 0.5 FOR A GEOMETRIC REASON, NOT A TUNED ONE. Trilinear filtering of
+// a binary field puts the value 0.5 exactly ON the surface, above it INSIDE
+// the solid and below it in the one-voxel skirt OUTSIDE. A lower bound below
+// 0.5 therefore makes the skirt occlude, i.e. makes "near a wall" mean
+// "partially blocked" — measured on the leak rig at LO 0.35, that cost ~28%
+// of LEGITIMATE in-room light on top of the leak it removed (control ratio
+// 0.647 where the leak alone accounts for ~0.90). At 0.5 the skirt is free by
+// construction and only the ramp from surface to solid interior is soft.
+export const LOS_OCC_LO = 0.5;
+export const LOS_OCC_HI = 0.85;
+
+/**
+ * How much of the marched path has to be inside geometry before the corner is
+ * called blocked — the second half of the same argument.
+ *
+ * A PRODUCT over per-sample occlusion convicts a path on ONE sample, which is
+ * right for a wall and wrong for a graze: indoors, most legitimate probe→point
+ * paths run close to a floor or a wall, and a single sample dipping into that
+ * surface was enough to suppress the corner. Measured, that cost ~35% of the
+ * in-room light the leak fix was not supposed to touch, and moving the
+ * per-sample shoulder did not shift it (0.647 → 0.616 → 0.616).
+ *
+ * A WALL is a RUN of blocked samples; a graze is one. So the march averages
+ * the per-sample shoulder and ramps on that mean: at four samples one blocked
+ * sample reads 0.25 and barely dims, two read 0.5 and fully block. Same
+ * continuity, same leak, far less collateral.
+ */
+export const LOS_PATH_LO = 0.18;
+export const LOS_PATH_HI = 0.5;
+
+/**
+ * §15 U3 — LOS GATHER VALIDITY. `__giGatherLosWeight = true` arms a short
+ * probe→pixel visibility march through the occupancy field inside the screen
+ * gather's corner weights: a probe the point cannot SEE (the next room's, a
+ * thin wall's far side) is suppressed by measured occupancy instead of by the
+ * §13.7d tangent-plane heuristic it supersedes. This is the honest density
+ * multiplier — behind-wall probes stop diluting gathers — and the §14 4b
+ * through-wall-bounce killer on the gather side.
+ *
+ * ⛔ REVERTED TO OPT-IN 2026-08-22 (later that night) after the user's live
+ * look: the BINARY one-bit suppression paints stair-stepped light boundaries
+ * on walls at occupancy-voxel granularity (the Q9c lattice-artifact family,
+ * live screenshots), and the hit-shade gather goes BLACK in mirrors where
+ * every corner is floored (starved wsum). The rig's gate measured crops, not
+ * boundaries — a mean over a crop cannot see a stair-step. Before any
+ * re-flip: (a) SMOOTH suppression (fractional occupancy or a 2-tap filtered
+ * read — the hard 0/1 per corner is the artifact), (b) the all-suppressed →
+ * starved-black interaction must clamp to the blocked mean, (c) a gate that
+ * asserts BOUNDARY smoothness, not crop means. `test:gi-gather-los` receipts
+ * (complete leak removal pre-heal, U3b ladder finding) remain valid.
+ * ⚠ The CPU mirror (`srcRef.js`) has no occupancy field — mirror-diff pages
+ * are safe by CONSTRUCTION: an instance built without the `losOccupied`
+ * closure cannot arm and keeps the pre-U3 graph.
+ */
+export function gatherLosWeight() {
+  return globalThis.__giGatherLosWeight === true;
+}
+
+/**
+ * §15 U3b — LADDER CROSS-WALL VALIDITY. The through-wall leak's endgame on a
+ * HEALTHY field: c1/c2 parent cells (0.7–1.4 m) span interior walls, so the
+ * cascade merge mixes the far room's radiance into parents the near room's c0
+ * bins inherit — the leak sits in the probes' OWN TILES, where no gather-side
+ * weight (U3's march included) can reach it. Proven by the los-gate's
+ * bimodality: pre-heal (broken ladder) the gather march removed 100% of the
+ * leak; post-heal it removed ~nothing (§15 U3 block, ⭐⭐ entry).
+ *
+ * The fix rides the MERGE's corner weights ([G.1] in srcMerge.js): the same
+ * one-bit occupancy march U3 built, child probe → parent corner, at MERGE
+ * rate — thousands of probes, not megapixels, so the ×18 pricing cliff the
+ * gather's first march hit cannot recur. Suppression is RELATIVE (floor,
+ * never zero): with any same-room corner alive it dominates 1000:1; with all
+ * corners blocked the renormalization returns the blocked mean — the pre-U3b
+ * answer, never a dark vote (R1) and never a new orphan cliff. Because the
+ * weight lives at PROBE granularity and reaches the screen only through the
+ * merge average + the gather's own trilinear smoothing, the per-pixel
+ * stair-step family that reverted U3's screen march does not apply here.
+ *
+ * ⚠ The CPU mirror (`srcRef.js` mergeCascades) has no occupancy field —
+ * merge-diff pages are safe by CONSTRUCTION: an instance built without the
+ * `losOccupied` closure cannot arm and keeps the pre-U3b graph.
+ */
+export function mergeLosWeight() {
+  // ⛔ OPT-IN since the 2026-08-22 full-revert: part of the arc the user's
+  // "undo all the GI work" covered. The build and its gates stand; it
+  // returns only with the user's explicit go-ahead, alone.
+  return globalThis.__giMergeLosWeight === true;
 }
 
 /**
@@ -783,16 +1118,17 @@ export function preAverage(children) {
 // information, and absence must not be spent as a dark vote.
 
 /** The 8 corner cells and trilinear weights for `p` on a lattice of `spacing`. */
-export function trilinearCorners(px, py, pz, originX, originY, originZ, spacing) {
+export function trilinearCorners(px, py, pz, originX, originY, originZ, spacing, smooth = false) {
   const fx = (px - originX) / spacing;
   const fy = (py - originY) / spacing;
   const fz = (pz - originZ) / spacing;
   const x0 = Math.floor(fx);
   const y0 = Math.floor(fy);
   const z0 = Math.floor(fz);
-  const tx = fx - x0;
-  const ty = fy - y0;
-  const tz = fz - z0;
+  const fade = smooth ? (t) => t * t * (3 - 2 * t) : (t) => t;
+  const tx = fade(fx - x0);
+  const ty = fade(fy - y0);
+  const tz = fade(fz - z0);
   const out = [];
   for (let dz = 0; dz < 2; dz++) {
     for (let dy = 0; dy < 2; dy++) {
@@ -932,6 +1268,42 @@ export function octahedralDirection(u, v, res) {
 export function octahedralTexelWeight(dx, dy, dz) {
   const s = Math.abs(dx) + Math.abs(dy) + Math.abs(dz);
   return s * s * s;
+}
+
+// ══════════════════════════════════ §12.82 — A HIT NORMAL IN ONE WORD
+//
+// Mirror of `srcMathTsl.js`'s pair; that side's header carries the argument
+// (why one word, and why the present bit cannot be inferred from the decoded
+// direction — (0,0) decodes to −Z, so a zeroed word would claim to be a real
+// surface facing away).
+
+/** Octahedral grid resolution per axis — 15 bits, leaving room for the flag. */
+export const NORMAL_OCT_RES = 32768;
+/** Bit 30: "this bin has a normal". */
+export const NORMAL_OCT_PRESENT = 1 << 30;
+
+/** Unit normal → one packed word. Twin of `srcMathTsl.js`'s `packNormal`. */
+export function packNormal(dx, dy, dz) {
+  const { u, v } = octahedralUV(dx, dy, dz, NORMAL_OCT_RES);
+  // `Math.floor`, and CLAMPED — `octahedralUV` returns [0, res] closed at the
+  // far edge (an axial direction lands exactly on it), and res would set a
+  // sixteenth bit and walk into the flag.
+  const iu = Math.min(NORMAL_OCT_RES - 1, Math.max(0, Math.floor(u)));
+  const iv = Math.min(NORMAL_OCT_RES - 1, Math.max(0, Math.floor(v)));
+  return (iu + iv * NORMAL_OCT_RES + NORMAL_OCT_PRESENT) >>> 0;
+}
+
+/** Packed word → unit normal. Test `normalPresent` FIRST. */
+export function unpackNormal(word) {
+  const w = word >>> 0;
+  const u = w & (NORMAL_OCT_RES - 1);
+  const v = (w >>> 15) & (NORMAL_OCT_RES - 1);
+  return octahedralDirection(u, v, NORMAL_OCT_RES);
+}
+
+/** Whether a bin has ever been given a normal. */
+export function normalPresent(word) {
+  return ((word >>> 0) & NORMAL_OCT_PRESENT) !== 0;
 }
 
 /**

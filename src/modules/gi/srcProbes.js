@@ -178,8 +178,8 @@ export const FLAG_FRESH = 2;
  */
 export { INFLUX_ONE };
 
-/** Per-cascade counter block. 8 words, four spare — a counter is one atomic. */
-export const COUNTER_WORDS = 8;
+/** Per-cascade counter block. A counter is one atomic. */
+export const COUNTER_WORDS = 10;
 export const COUNTER_LIVE = 0;      // probes currently in the indirection table
 export const COUNTER_FAILED = 1;    // inserts that exhausted MAX_PROBE_STEPS
 export const COUNTER_STEPS = 2;     // total linear-probe steps this frame
@@ -229,6 +229,34 @@ export const COUNTER_BOOSTED = 6;
  * a no-op and no gate would notice.
  */
 export const COUNTER_HELD = 7;
+/**
+ * ⭐⭐ Probes the age pass RETIRED this frame, and the sum of live probes' ages.
+ *
+ * ⛔ THE POPULATION COLLAPSE HAD NO MECHANISM BECAUSE NOTHING COUNTED THE
+ * DEATHS (2026-08-23). Measured on the user's Level with the camera PINNED and
+ * the scene fully frozen — so the visible set does not change at all — the c0
+ * population falls from 1660 live at arrival to 487 a few seconds later, and on
+ * the other leg 1251 → 194. That is a 70-85% collapse of the lattice the gather
+ * interpolates over, while the user stands still looking at it, and the gather's
+ * corner count falls with it (5.47 → 4.37). It is the leading candidate for
+ * "convergence never finishes".
+ *
+ * `COUNTER_FRESH` counts BIRTHS and there was no counter for DEATHS, so the two
+ * hypotheses — "the population pass stopped inserting" and "the age pass is
+ * retiring faster than inserts replace" — render IDENTICALLY as a falling
+ * `COUNTER_LIVE`. They have opposite fixes: the first is the §12.61 rest
+ * cadence starving the pixel walk, the second is `PROBE_MAX_AGE` being counted
+ * in FRAMES while the walk that refreshes a probe is STRIDED (at rest, stride 8,
+ * a pixel is revisited every ~9 frames, so 60 frames is only ~7 refreshes of
+ * headroom — and any probe whose pixels are re-strided unluckily dies).
+ *
+ * `COUNTER_AGESUM` divided by `COUNTER_LIVE` is the mean age: a population
+ * sitting at ~5 frames is healthy, one drifting toward `PROBE_MAX_AGE` = 60 is
+ * about to fall off the cliff, and it says which of the two stories is running
+ * BEFORE the collapse rather than after.
+ */
+export const COUNTER_RETIRED = 8;
+export const COUNTER_AGESUM = 9;
 
 // ═════════════════════════════════════════════════════════ THE WGSL ISLAND
 
@@ -636,6 +664,9 @@ export function createHashClearPass(store) {
       // Same rule as BOOSTED: cleared here, frames before the age pass that
       // counts into it, so no thread clears a word its siblings are adding to.
       atomicStore(counters.element(base.add(COUNTER_HELD)), uint(0));
+      // Same rule again — both are written by the age pass. See COUNTER_RETIRED.
+      atomicStore(counters.element(base.add(COUNTER_RETIRED)), uint(0));
+      atomicStore(counters.element(base.add(COUNTER_AGESUM)), uint(0));
     });
   })().compute(hashTotal);
 }
@@ -658,6 +689,7 @@ export function createHashClearPass(store) {
 export function createAgePass(store, cascade, {
   maxAge = PROBE_MAX_AGE,
   retain = null,
+  frameStamp = null,
 } = {}) {
   const c = store.cascades[cascade];
   const { hashKeys, hashSlot, probeTable, counters, freeStack, freeTop, cascadeCount } = store;
@@ -666,6 +698,9 @@ export function createAgePass(store, cascade, {
   const blockStack = store.blockStackBase + c.blockBase;
   const blockTopWord = cascadeCount + cascade;
   const heldStamp = store.blockHeldBase + c.blockBase;
+  // The same stamp region `createCompactPass` writes on CLAIM — see the release
+  // branch below for why a RELEASE has to write it too.
+  const blockStamp = store.blockStampBase + c.blockBase;
   return Fn(() => {
     const p = instanceIndex.add(uint(c.probeBase)).toVar();
     const w = p.mul(PROBE_WORDS).toVar();
@@ -680,6 +715,10 @@ export function createAgePass(store, cascade, {
     });
 
     const age = probeTable.element(w.add(PROBE_AGE)).add(1).toVar();
+    // The age DISTRIBUTION, not just the survivors — see COUNTER_RETIRED. Taken
+    // before any retirement branch, so it describes the population this pass was
+    // handed rather than the one it leaves behind.
+    atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_AGESUM)), age);
     const key = probeTable.element(w.add(PROBE_KEY)).toVar();
 
     // ── S1: LOCALITY RETIREMENT ──────────────────────────────────────────────
@@ -716,35 +755,105 @@ export function createAgePass(store, cascade, {
     if (retain) {
       const lodI = keyLod(key).toVar();
       const s = probeSpacing(cascade, float(lodI), retain.spacing0).toVar();
-      const pos = vec3(keyWorldCell(key, retain.camera, s)).mul(s).toVar();
+      // Arm-aware position recovery: world keys resolve against the camera
+      // (the ±256-cell representative); anchor-relative keys decode against
+      // the SAME anchor that packed them.
+      const pos = (retain.worldKeys
+        ? vec3(keyWorldCell(key, retain.camera, s)).mul(s)
+        : cellPosition(keyCell(key), latticeOrigin(retain.anchor, s), s)).toVar();
       const cheb = chebyshev(pos, retain.camera).toVar();
       const outOfReach = cheb.greaterThan(lodOuterRadius(float(lodI), retain.spacing0));
       // Last frame's live count. One frame stale by construction (compaction
       // writes it after this pass) and that is fine — it is a pressure signal,
       // not a correctness input.
       const live = atomicLoad(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_LIVE))).toVar();
-      const crowded = live.greaterThan(uint(Math.floor(c.probeCapacity * retain.highWater)));
-      If(outOfReach.not().and(crowded.not()), () => {
-        effMaxAge.assign(uint(retain.maxAge));
+      // ── §16 (2026-08-24): THE CROWDING GUARD IS A VALVE, NOT A STEP ──────
+      //
+      // The old form was binary: the frame `live` crossed highWater, EVERY
+      // held probe reverted to the visibility age at once — a mass-
+      // retirement wave, a refill back to the boundary, another wave. A
+      // population sawtooth whose visible face is whole regions dimming and
+      // relighting in unison (the merge parents die in the wave), and the
+      // user's Bistro parks EXACTLY at the boundary (19.4-19.6k live of
+      // 32768 at highWater 0.6). The hold age now fades LINEARLY from
+      // retain.maxAge at highWater to the visibility age at highWater+0.25,
+      // so retirement rate meets insert rate at an equilibrium. R1's "no
+      // binary anything", applied to a population control.
+      // ⚠ THE WATER MARKS FOLLOW THE BASIS (2026-08-24, spin-gate recovery
+      // 120→510 ms taught it): `highWater` 0.6 was calibrated for HASH-LOAD
+      // headroom against the slot pool. Against the block-backed bound it
+      // over-sheds — Bistro's healthy, fully-backed operating point is
+      // 19-20k of 21875 blocks, and a 0.6 mark would cap retention at 13k.
+      // Blocks need CHURN headroom only: fade from 85% (the retain bundle's
+      // default now) and shed fully 12 points later.
+      const highFrac = retain.highWater;
+      const hardFrac = Math.min(0.97, highFrac + 0.12);
+      // ⭐⭐ THE CAPACITY THAT BINDS IS THE BLOCK-BACKED ONE (2026-08-24,
+      // the user's persistent-at-rest black patches). Bistro c0: 32768
+      // probe SLOTS but only 21875 BIN BLOCKS at the budget ceiling — a
+      // probe past the block bound EXISTS but holds no bins, bakes a black
+      // tile, and renders as a solid black cell that stays black at rest
+      // (nothing retries a claim until blocks free). A valve keyed on slot
+      // capacity happily parks the population between the two bounds —
+      // thousands of lit-less probes, exactly the report "sometimes they
+      // don't even disappear without further camera adjustment". Keying on
+      // min(slots, blocks) makes retention yield while every live probe
+      // can still be BACKED.
+      const backedCapacity = Math.max(1, Math.min(c.probeCapacity, c.blockCapacity ?? c.probeCapacity));
+      const crowdT = float(live).div(backedCapacity)
+        .sub(highFrac).div(hardFrac - highFrac).clamp(0, 1).toVar();
+      // ⭐ THE SHED CURVE (2026-08-24, the user's Bistro black-quilt receipt:
+      // c0 hit 32768/32768 with 689 DROPPED inserts during a street
+      // traversal, and every dropped insert is a probe that DOES NOT EXIST —
+      // a solid black cell exactly where the camera just turned). Fading the
+      // hold linearly down to the visibility age cannot shed: with ~seconds
+      // of held population, retirement only outruns insertion once the hold
+      // is SHORT, and a linear 1800→60 ramp is still >60 for 97% of its
+      // range. Quadratic instead — 1800·(1−t)²: half pressure ≈ 450 frames,
+      // 80% ≈ 72, and at the hard waterline the hold floors at 8 frames,
+      // BELOW the 60-frame visibility age on purpose: a pool refusing
+      // inserts is refusing NEW VISIBLE probes, and a black pixel now is
+      // strictly worse than a cold cache of somewhere behind you. Visible
+      // probes (age ≤ 1) sit under the 8-frame floor and are untouched.
+      const crowdInv = float(1).sub(crowdT).toVar();
+      const heldAge = float(retain.maxAge).mul(crowdInv.mul(crowdInv)).max(8).toVar();
+      If(outOfReach, () => {
+        // Out of reach retires NOW, not in `maxAge` frames — see the bound note.
+        effMaxAge.assign(uint(0));
+      }).Else(() => {
+        effMaxAge.assign(heldAge.toUint());
         // HOLD THIS BLOCK'S PAYLOAD. Only when the probe is INVISIBLE
         // (`age > 1` — age was incremented above, so 1 means "resolved last
         // frame"), because a visible probe must keep decaying at the calibrated
-        // rate whether or not the ray stride gave it rays this frame. See
+        // rate whether or not the ray stride gave it rays this frame — and
+        // only while the valve is actually extending the hold. See
         // `blockHeldBase` for the full argument.
-        If(age.greaterThan(uint(1)), () => {
+        If(age.greaterThan(uint(1)).and(heldAge.greaterThan(float(maxAge))), () => {
           const block = probeTable.element(w.add(PROBE_BLOCK)).toVar();
           If(block.notEqual(uint(SLOT_EMPTY)), () => {
             freeStack.element(uint(heldStamp).add(block)).assign(retain.frameStamp);
             atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_HELD)), uint(1));
           });
         });
-      }).Else(() => {
-        // Out of reach retires NOW, not in `maxAge` frames — see the bound note.
-        If(outOfReach, () => { effMaxAge.assign(uint(0)); });
       });
+      // ── THE RE-ANCHOR KILL (anchor-relative arm) ─────────────────────────
+      // A re-anchor renumbers every key, so every held probe — and every
+      // still-visible one — must die THIS frame: a stale key left in the
+      // hash is adoptable by a renumbered pixel, which reads its payload at
+      // the wrong world position. Visible probes re-insert with fresh keys
+      // in the same frame ([B] runs after this pass), which is exactly the
+      // wholesale wipe this arm's re-anchor always meant. Overrides every
+      // branch above by construction — it is the last write.
+      if (retain.kill) {
+        If(uint(retain.kill).notEqual(uint(0)), () => { effMaxAge.assign(uint(0)); });
+      }
     }
 
     If(age.greaterThan(effMaxAge), () => {
+      // ⭐ THE DEATH COUNT. Without it, "the population pass stopped inserting"
+      // and "the age pass is out-retiring the inserts" are the same falling
+      // `COUNTER_LIVE` with opposite fixes. See COUNTER_RETIRED's header.
+      atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_RETIRED)), uint(1));
       probeTable.element(w.add(PROBE_FLAGS)).assign(uint(0));
       probeTable.element(w.add(PROBE_AGE)).assign(uint(0));
       // ── RELEASE THE BIN BLOCK ──────────────────────────────────────────
@@ -759,6 +868,36 @@ export function createAgePass(store, cascade, {
       If(block.notEqual(uint(SLOT_EMPTY)), () => {
         const btop = atomicAdd(freeTop.element(uint(blockTopWord)), uint(1)).toVar();
         freeStack.element(uint(blockStack).add(btop)).assign(block);
+        // ⭐⭐ STAMP THE RELEASE, NOT ONLY THE CLAIM (2026-08-23).
+        //
+        // `srcMerge.js`'s header states the invariant this restores, in as many
+        // words: "an unclaimed block took no deposits this frame, the deposit's
+        // CLEAR zeroed its accumulators, and [F] therefore wrote UNKNOWN into
+        // every one of its bins — so the merge takes its `selfT < 0` early-out
+        // before it ever looks at the record." §12.20.1 replaced that CLEAR
+        // with a DECAY, and the invariant quietly became false: a freed block's
+        // accumulators now FADE at `keep` instead of vanishing, so its bins stay
+        // KNOWN for ~1/(1−keep) frames — hundreds, at the still-scene α.
+        //
+        // Two things read those phantoms, and both are wrong:
+        //  · [G.3] dispatches over `blockCapacity × nBins` — EVERY block, owned
+        //    or not — so phantom bins pass the `selfT < 0` gate, get counted
+        //    into MERGE_BINS (the orphan rate's own denominator) and burn 8
+        //    corner fetches and 4 payload reads each.
+        //  · worse, they read a corner record [G.1] never refreshed for them
+        //    (it writes records only for blocks a LIVE probe holds). If the
+        //    parent block named in that stale record has since been reclaimed
+        //    by a probe in ANOTHER ROOM, the phantom merges that room's
+        //    radiance. A silent cross-wall leak that no energy check can see.
+        //
+        // The claim path already stamps (`createCompactPass`), and the decay's
+        // `If(stamp.equal(frameStamp)) k = 0` already exists — this reuses both.
+        // One u32 store per retiring probe, and it REMOVES work downstream by
+        // restoring the early-out. Nothing is lost: the compaction zeroes on
+        // claim anyway, so a released block's payload was never readable.
+        if (frameStamp) {
+          freeStack.element(uint(blockStamp).add(block)).assign(frameStamp);
+        }
         probeTable.element(w.add(PROBE_BLOCK)).assign(uint(SLOT_EMPTY));
       });
       // Push. `atomicAdd` returns the OLD top, which is the index to write.
@@ -859,6 +998,38 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
     });
     If(hashSlot.element(h).notEqual(uint(SLOT_EMPTY)), () => {
       // A survivor re-inserted by the age pass — it already owns its index.
+      //
+      // ── §16: THE BLOCKLESS-SURVIVOR RETRY (2026-08-24) ──────────────────
+      //
+      // A probe whose birth-claim failed used to stay blockless FOR ITS
+      // WHOLE LIFE: nothing ever retried, a blockless probe bakes a black
+      // tile, and a VISIBLE blockless probe never ages toward retirement —
+      // so the black cell persisted exactly as long as the user kept
+      // looking at it, and healed only when they looked away long enough
+      // for the probe to retire and re-mint (the live Bistro report:
+      // "sometimes they don't even disappear without further camera
+      // adjustment"). The retry lives HERE and not in the age pass because
+      // the age pass is the one PUSHING releases onto the same stack — a
+      // pop concurrent with a push can read the top ahead of the stack
+      // write and claim garbage; the pass barrier is what makes any claim
+      // legal, for fresh probes and veterans alike. Same pop, same undo,
+      // same claim stamp (so the decay zeroes the recycled block and D3's
+      // maturity fades the cell in instead of popping it).
+      const sp = hashSlot.element(h).toVar();
+      const sw = sp.mul(PROBE_WORDS).toVar();
+      If(probeTable.element(sw.add(PROBE_BLOCK)).equal(uint(SLOT_EMPTY)), () => {
+        const rtop = atomicSub(freeTop.element(uint(blockTopWord)), uint(1)).toVar();
+        If(rtop.equal(uint(0)).or(rtop.greaterThan(uint(c.blockCapacity))), () => {
+          atomicAdd(freeTop.element(uint(blockTopWord)), uint(1));
+          atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_NOBLOCK)), uint(1));
+        }).Else(() => {
+          const rblock = freeStack.element(uint(blockStack).add(rtop).sub(1)).toVar();
+          if (frameStamp) {
+            freeStack.element(uint(blockStamp).add(rblock)).assign(frameStamp);
+          }
+          probeTable.element(sw.add(PROBE_BLOCK)).assign(rblock);
+        });
+      });
       Return();
     });
 
@@ -1120,6 +1291,10 @@ export function createSrcProbeFrame(store, {
   maxLods = MAX_LODS,
   maxAge = PROBE_MAX_AGE,
   frameStamp = null,
+  // uint uniform, driven by srcSystem's re-anchor: nonzero retires EVERY
+  // probe this frame (anchor-relative retention's jump guard — see the
+  // retention bundle below).
+  retainKill = null,
 } = {}) {
   const { probeTable } = store;
   const N = store.cascadeCount;
@@ -1172,26 +1347,61 @@ export function createSrcProbeFrame(store, {
   passes.push(createHashClearPass(store));
   // ── S1: THE RETENTION BUNDLE, OR NULL ────────────────────────────────────
   //
-  // Built only under world-absolute keys, because locality retention is not
-  // expressible without them: holding a probe across a camera move is only
-  // meaningful if it is still the SAME probe afterwards, and under anchor-relative
-  // keys a re-anchor renames it. Arming one without the other would retain probes
-  // right up to the anchor jump that renumbers every one of them.
-  const retain = worldKeysEnabled() && globalThis.__giSrcProbeRetain !== false && frameStamp
+  // Originally built only under world-absolute keys ("a re-anchor renames
+  // every probe, so retention would hold them right up to the jump that
+  // renumbers them"). 2026-08-22 late: ALSO armed on the anchor-relative arm
+  // — the user's second world-keys veto put them on this arm, whose 60-frame
+  // visibility retirement deletes everything behind the camera within a
+  // second of looking away; mid-play that measured tiles 65% empty texels /
+  // 10 of 32 bins known, which renders as the black-ceiling class (ceilings
+  // live on the LONG-range answer, the first thing starvation eats). Between
+  // re-anchors the arm's keys are stable, so retention is sound there — the
+  // jump hazard is closed by `kill` below: on a re-anchor EVERYTHING retires
+  // on one frame (visible probes re-insert with new keys the same frame,
+  // which is the wipe this arm always had). That kill also closes a
+  // pre-existing hole: stale-keyed probes used to linger in the hash for up
+  // to 60 frames post-jump, where a new pixel whose renumbered cell collides
+  // with an old key ADOPTS the old payload at the wrong world position.
+  //
+  // ⭐ §16 D1 (2026-08-24): the gate below used to ALSO require
+  // `worldKeysEnabled()`, which made everything this comment describes — and
+  // the whole anchor-arm branch of the bundle (the 1800-frame maxAge, the
+  // `kill` uniform, `createAgePass`'s anchor-relative position recovery) —
+  // dead code on the shipped default. Retention now arms on BOTH key arms;
+  // `__giSrcProbeRetain = false` is the off hatch.
+  const retain = globalThis.__giSrcProbeRetain !== false && frameStamp
     ? {
         camera,
+        // Base-arm position math for the out-of-reach bound (`keyWorldCell`
+        // is only meaningful under world keys).
+        anchor,
+        worldKeys: worldKeysEnabled(),
+        // The re-anchor kill uniform (anchor-relative arm only; the world
+        // arm never re-keys and never sets it).
+        kill: retainKill,
         spacing0,
         frameStamp,
         // Long enough to be "held", finite so a probe whose surface was deleted
         // is still reclaimed. Geometry edits rebuild the field anyway; this is
         // the backstop for the case that does not.
-        maxAge: Number(globalThis.__giSrcProbeRetainAge) || 3600,
-        // Retention yields to capacity at this fraction of the slot pool — see
-        // the `crowded` note in `createAgePass`.
-        highWater: Number(globalThis.__giSrcProbeRetainHighWater) || 0.6,
+        // World arm: 14400 (~4 min) — raised from 3600 on 2026-08-22 night.
+        // Anchor-relative arm: 1800 (~30 s) — the goal there is bridging
+        // look-arounds between re-anchors, and the shorter hold bounds the
+        // stale-key exposure if the kill ever misses. SAFE BY CONSTRUCTION
+        // either way: retention yields to the visibility age above 60% of
+        // slot capacity (a failed insert is a probe that does not exist), so
+        // a longer hold can crowd nothing; the flip gate's "0 dropped
+        // inserts" assertion is the receipt.
+        maxAge: Number(globalThis.__giSrcProbeRetainAge) || (worldKeysEnabled() ? 14400 : 1800),
+        // Retention yields to capacity at this fraction of the BLOCK-BACKED
+        // pool (min(slots, blocks) — see the valve in `createAgePass`).
+        // 0.85, not the old 0.6: the block bound needs churn headroom, not
+        // hash-load headroom, and 0.6 of Bistro's 21875 backed blocks would
+        // cap retention below its healthy 19-20k operating point.
+        highWater: Number(globalThis.__giSrcProbeRetainHighWater) || 0.85,
       }
     : null;
-  for (let c = 0; c < N; c++) passes.push(createAgePass(store, c, { maxAge, retain }));
+  for (let c = 0; c < N; c++) passes.push(createAgePass(store, c, { maxAge, retain, frameStamp }));
 
   // ── [B] cascade 0, from the gbuffer ───────────────────────────────────────
   passes.push(createInsertPass(
@@ -1338,6 +1548,15 @@ export async function readSrcProbeStats(renderer, store) {
       boosted: raw[base + COUNTER_BOOSTED] >>> 0,
       /** S1: probes held off-screen this frame instead of retired. */
       held: raw[base + COUNTER_HELD] >>> 0,
+      /**
+       * ⭐ The population's BALANCE SHEET. `fresh − retired` is the per-frame
+       * change in `live`, so the pair says whether a falling population is
+       * births stopping or deaths accelerating — see COUNTER_RETIRED. `meanAge`
+       * against PROBE_MAX_AGE (60) says how much headroom is left before the
+       * cliff, which is visible BEFORE the collapse rather than after it.
+       */
+      retired: raw[base + COUNTER_RETIRED] >>> 0,
+      meanAge: live > 0 ? (raw[base + COUNTER_AGESUM] >>> 0) / live : 0,
       probeCapacity: c.probeCapacity,
       hashCapacity: c.hashCapacity,
       blockCapacity: c.blockCapacity,

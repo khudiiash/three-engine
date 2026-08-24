@@ -93,17 +93,20 @@ import {
   Return,
   atomicAdd,
   atomicStore,
+  cos,
+  equirectUV,
   float,
   floor,
   instanceIndex,
   instancedArray,
   int,
   ivec3,
+  sin,
   uint,
   vec3,
 } from "three/tsl";
 import { CASCADE_COUNT, W0 } from "./srcConfig.js";
-import { worldKeysEnabled } from "./srcMath.js";
+import { LOS_OCC_HI, LOS_OCC_LO, LOS_PATH_HI, LOS_PATH_LO, binDirTable, mergeLosWeight, worldKeysEnabled } from "./srcMath.js";
 import {
   cellPosition,
   keyCell,
@@ -142,7 +145,25 @@ const CORNER_OFFSETS = Array.from({ length: MERGE_CORNERS }, (_, k) => [
   k & 1, (k >> 1) & 1, (k >> 2) & 1,
 ]);
 
-/** Merge telemetry. One atomic buffer, eight words. */
+/**
+ * Merge telemetry — eight words PER CASCADE.
+ *
+ * ⛔⛔ IT USED TO BE EIGHT WORDS TOTAL, SHARED BY EVERY [G.1] AND [G.3]
+ * DISPATCH, AND THAT MADE THE HEADLINE NUMBER UNATTRIBUTABLE (2026-08-23).
+ *
+ * The user's Level prints `cascade merge orphaning 26% of 31713 bins` on every
+ * boot against a healthy ~1%, and that 26% is a BLEND over the c0, c1 and c2
+ * ladder passes — three different lattices, three different populations, three
+ * different fixes. `meanCorners` had the same problem across the [G.1] passes.
+ * Nobody could tell whether c0 was fine and c2 was starving, or the reverse,
+ * so the defect survived every look at it.
+ *
+ * A cascade's slice is `MERGE_STRIDE * c`; the constants below are offsets
+ * WITHIN a slice. `readStats` reports both the per-cascade rates and the
+ * aggregate, and the aggregate is byte-for-byte the number the old code
+ * printed — so the §12.56 watchdog signature and every recorded reading stay
+ * comparable.
+ */
 export const MERGE_PROBES = 0;   // probes that resolved a corner set (i.e. held a block)
 export const MERGE_FOUND = 1;    // parent corners found, out of 8 per probe
 export const MERGE_BINS = 2;     // KNOWN self bins the merge visited
@@ -150,7 +171,28 @@ export const MERGE_MERGED = 3;   // ...of those, bins that found at least one pa
 export const MERGE_ORPHAN = 4;   // ...of those, bins that found none — kept as-is
 export const MERGE_OPAQUE = 5;   // merged bins whose T came out exactly 0
 export const MERGE_SKY = 6;      // top-cascade bins the sky composited into
-export const MERGE_WORDS = 8;
+export const MERGE_LOS = 7;      // §15 U3b: parent corners the cross-wall march suppressed
+/**
+ * ⭐ The orphan count, split by whether it COST ANYTHING.
+ *
+ * `MERGE_ORPHAN_OPAQUE` — the bin's own transmittance was exactly 0, so the
+ * merged branch would have written `L_self + L_parent·0` and `T = 0`: the same
+ * bytes orphaning leaves. Free. `MERGE_ORPHAN_LIVE` — selfT > 0, so a parent
+ * WOULD have shone through and its absence is real lost long-range light.
+ * `OPAQUE + LIVE == ORPHAN` by construction, which is also the arithmetic check
+ * that the split is wired correctly.
+ */
+export const MERGE_ORPHAN_OPAQUE = 8;
+export const MERGE_ORPHAN_LIVE = 9;
+/** Words per cascade slice. */
+export const MERGE_STRIDE = 10;
+/**
+ * ⚠ KEPT AS THE STRIDE, NOT THE BUFFER SIZE. Several call sites still read
+ * `MERGE_WORDS` as "the offsets go 0..MERGE_WORDS-1"; the BUFFER is
+ * `MERGE_STRIDE * cascadeCount` and is sized from `store.cascadeCount` at
+ * build, never from this constant.
+ */
+export const MERGE_WORDS = MERGE_STRIDE;
 
 /**
  * Build the merge as a dispatch list.
@@ -174,13 +216,24 @@ export const MERGE_WORDS = 8;
  *   world-absolute keying (S1) and unused without it: a key holds
  *   `worldCell mod 512` and the representative is resolved within ±256 cells of
  *   the viewer, so the merge cannot turn a key back into a position without it.
+ * @param {Function} [options.losOccupied]  the occupancy field's one-bit
+ *   `occupiedAtWorld` sharedFn — §15 U3b arms the cross-wall corner march on
+ *   it (see `mergeLosWeight` in srcMath.js). Null keeps the pre-U3b graph,
+ *   which is what makes the CPU-mirror diff safe by construction.
  */
 export function createSrcMergeFrame(store, bins, {
   spacing0,
   anchor,
   camera = null,
   sky,
+  // §16 S1 (2026-08-24): the DIRECTIONAL sky — `{ node, intensity, rotY }`,
+  // the persistent env-miss bundle shape. When present, the top-cascade
+  // close samples the scene's environment PER BIN DIRECTION instead of
+  // compositing the flat mean; absent (every gate fixture), the flat `sky`
+  // path compiles bit-identically to the pre-S1 build.
+  skyEnv = null,
   w0 = W0,
+  losOccupied = null,
 } = {}) {
   if (worldKeysEnabled() && !camera) {
     // Loud, at build, rather than a merge that silently interpolates over the
@@ -192,6 +245,11 @@ export function createSrcMergeFrame(store, bins, {
   const { payload } = bins;
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const top = N - 1;
+  // §15 U3b — build-time arm, same idiom as the gather's losArmed: the flag is
+  // structural (it changes the WGSL), and an instance built without the
+  // closure (every mirror-diff page) cannot arm regardless of the global.
+  const losArmed = mergeLosWeight() && !!losOccupied;
+  if (losArmed) console.info("[gi] merge: cross-wall LOS validity ARMED (U3b)");
 
   // ── the corner records, indexed by BIN BLOCK ──────────────────────────────
   // Only cascades 0..N−2 have a parent to interpolate over, so the top cascade
@@ -208,7 +266,12 @@ export function createSrcMergeFrame(store, bins, {
   // never-written probe look like it interpolates over block 0 eight times.
   const cornerBlock = instancedArray(new Uint32Array(cornerSize).fill(SLOT_EMPTY), "uint");
   const cornerWeight = instancedArray(new Float32Array(cornerSize), "float");
-  const stats = instancedArray(new Uint32Array(MERGE_WORDS), "uint").toAtomic();
+  // One slice per cascade — see MERGE_STRIDE's header for why the shared
+  // buffer made the headline unattributable.
+  const statWords = MERGE_STRIDE * N;
+  const stats = instancedArray(new Uint32Array(statWords), "uint").toAtomic();
+  /** Offset of cascade `c`'s word `w`. JS-side constant — folded at build. */
+  const sw = (c, w) => uint(c * MERGE_STRIDE + w);
 
   const passes = [];
 
@@ -222,10 +285,10 @@ export function createSrcMergeFrame(store, bins, {
   // `srcDeposit.js` records from the other side (`atomicLoad` on a read).
   passes.push(Fn(() => {
     const i = instanceIndex.toVar();
-    If(i.lessThan(uint(MERGE_WORDS)), () => {
+    If(i.lessThan(uint(statWords)), () => {
       atomicStore(stats.element(i), uint(0));
     });
-  })().compute(MERGE_WORDS));
+  })().compute(statWords));
 
   // ── [G.1] resolve each probe's 8 parent corners ───────────────────────────
   //
@@ -249,7 +312,7 @@ export function createSrcMergeFrame(store, bins, {
       // No block means no bins, which means nothing to merge INTO. The record
       // is indexed by block, so there is not even an address to write to.
       If(block.equal(uint(SLOT_EMPTY)), () => { Return(); });
-      atomicAdd(stats.element(uint(MERGE_PROBES)), uint(1));
+      atomicAdd(stats.element(sw(c, MERGE_PROBES)), uint(1));
 
       // WORLD POSITION FROM THE KEY, never from a stored position — same rule
       // the population ladder runs under (`childPosition` in srcProbes). A
@@ -284,12 +347,59 @@ export function createSrcMergeFrame(store, bins, {
       if (parentShift) baseCell.assign(baseCell.add(parentShift));
       const record = uint(recordBase).add(block.mul(uint(MERGE_CORNERS))).toVar();
 
+      // ── §15 U3b: THE PARENT MUST SEE THE CHILD ──────────────────────────
+      //
+      // A parent corner across an interior wall carries the FAR room's
+      // radiance; interpolating it into this probe's bins is how the
+      // through-wall leak gets into the field's own tiles (the los-gate's
+      // bimodality finding — the leak the gather-side march cannot reach).
+      // March child probe → corner through the one-bit occupancy field and
+      // suppress blocked corners' trilinear weight. Sample fractions stay off
+      // both ends so neither probe is convicted by its own voxel, and the
+      // count grows with the cascade because the segment does (parent spacing
+      // doubles per level; a 0.2 m wall + the conservative voxel bulge must
+      // stay denser than the sample stride).
+      //
+      // The floor keeps R1: [G.3] divides by the weight FOUND, so a probe
+      // whose every corner is blocked renormalizes to the blocked mean — the
+      // pre-U3b answer — instead of orphaning (which would composite T·sky
+      // through walls) or darkening. One visible corner outvotes blocked
+      // ones 1000:1, which is the whole fix.
+      const losFractions = losArmed
+        ? (() => {
+            const n = c === 0 ? 4 : c === 1 ? 6 : 8;
+            return Array.from({ length: n }, (_, i) => 0.1 + (0.8 * (i + 0.5)) / n);
+          })()
+        : null;
+
       for (let k = 0; k < MERGE_CORNERS; k++) {
         const [dx, dy, dz] = CORNER_OFFSETS[k];
         const weight = (dx ? t.x : float(1).sub(t.x))
           .mul(dy ? t.y : float(1).sub(t.y))
           .mul(dz ? t.z : float(1).sub(t.z))
           .toVar();
+        if (losArmed) {
+          const cornerPos = originP.add(cell0.add(vec3(dx, dy, dz)).mul(sp)).toVar();
+          const seg = cornerPos.sub(position).toVar();
+          // Same two shoulders as the screen gather (srcMath's LOS_OCC_* and
+          // LOS_PATH_*) — if the two disagreed, the field's own tiles and the
+          // screen's read of them would disagree about which side of a wall a
+          // probe sits on, which is the exact confusion this unit removes.
+          const blocked = float(0).toVar();
+          for (const tf of losFractions) {
+            const x = position.add(seg.mul(tf));
+            const t = float(losOccupied(x)).sub(LOS_OCC_LO)
+              .div(LOS_OCC_HI - LOS_OCC_LO).clamp(0, 1).toVar();
+            blocked.addAssign(t.mul(t).mul(float(3).sub(t.mul(2))));
+          }
+          const bp = blocked.div(losFractions.length).sub(LOS_PATH_LO)
+            .div(LOS_PATH_HI - LOS_PATH_LO).clamp(0, 1).toVar();
+          const vis = float(1).sub(bp.mul(bp).mul(float(3).sub(bp.mul(2)))).toVar();
+          If(vis.lessThan(0.5), () => {
+            atomicAdd(stats.element(sw(c, MERGE_LOS)), uint(1));
+          });
+          weight.mulAssign(vis.max(1e-3));
+        }
         // `packProbeKey` returns KEY_EMPTY for a cell outside the ±256 key
         // window, and the WGSL find returns "absent" for key 0 by its first
         // line — so an out-of-window corner is a missing corner, with no extra
@@ -310,7 +420,7 @@ export function createSrcMergeFrame(store, bins, {
           );
         });
         If(parentBlock.notEqual(uint(SLOT_EMPTY)), () => {
-          atomicAdd(stats.element(uint(MERGE_FOUND)), uint(1));
+          atomicAdd(stats.element(sw(c, MERGE_FOUND)), uint(1));
         });
         cornerBlock.element(record.add(uint(k))).assign(parentBlock);
         cornerWeight.element(record.add(uint(k))).assign(weight);
@@ -331,17 +441,42 @@ export function createSrcMergeFrame(store, bins, {
   // this reason and says so.
   {
     const info = bins.cascades[top];
+    // §16 S1 — the top cascade's bin-direction LUT (Morton order, the
+    // storage order — binDirTable's header). Built only when the
+    // directional sky is armed, so an unarmed build binds nothing new.
+    const wTop = Math.round(Math.sqrt(info.bins / 2));
+    const skyDirTable = skyEnv ? instancedArray(binDirTable(wTop), "vec4") : null;
     passes.push(Fn(() => {
       const i = instanceIndex.toVar();
       const o = uint(info.binBase).add(i).mul(uint(PAYLOAD_WORDS)).toVar();
       const T = payload.element(o.add(uint(3))).toVar();
       If(T.lessThan(0), () => { Return(); });
       const S = vec3(sky).toVar();
+      // §16 S1 — DIRECTIONAL SKY (2026-08-24, the user's "sky hdri acts
+      // like ambient" report). The flat `sky` is sceneSkyRadiance's NEUTRAL
+      // GREY of the env intensity — the HDRI's chroma, luminance
+      // distribution and directionality never reached the transport, so an
+      // escaping ray brought back the same colour in every direction =
+      // ambient. Now each bin composites the environment sampled at ITS OWN
+      // direction (same rotation math as the env-on-miss/capture read).
+      // Occlusion is untouched — T is still the ladder's transmittance.
+      if (skyEnv) {
+        const m = i.mod(uint(info.bins)).toVar();
+        const d = vec3(skyDirTable.element(m).xyz).toVar();
+        const cr = cos(skyEnv.rotY).toVar();
+        const sr = sin(skyEnv.rotY).toVar();
+        const rd = vec3(
+          d.x.mul(cr).add(d.z.mul(sr)),
+          d.y,
+          d.z.mul(cr).sub(d.x.mul(sr)),
+        ).toVar();
+        S.assign(vec3(skyEnv.node.sample(equirectUV(rd)).level(0).xyz).mul(skyEnv.intensity));
+      }
       payload.element(o).assign(payload.element(o).add(T.mul(S.x)));
       payload.element(o.add(uint(1))).assign(payload.element(o.add(uint(1))).add(T.mul(S.y)));
       payload.element(o.add(uint(2))).assign(payload.element(o.add(uint(2))).add(T.mul(S.z)));
       payload.element(o.add(uint(3))).assign(float(0));
-      atomicAdd(stats.element(uint(MERGE_SKY)), uint(1));
+      atomicAdd(stats.element(sw(top, MERGE_SKY)), uint(1));
     })().compute(info.bins * info.blockCapacity));
   }
 
@@ -368,7 +503,7 @@ export function createSrcMergeFrame(store, bins, {
       // invention would be most of the buffer.
       const selfT = payload.element(o.add(uint(3))).toVar();
       If(selfT.lessThan(0), () => { Return(); });
-      atomicAdd(stats.element(uint(MERGE_BINS)), uint(1));
+      atomicAdd(stats.element(sw(c, MERGE_BINS)), uint(1));
 
       const record = uint(recordBase).add(block.mul(uint(MERGE_CORNERS))).toVar();
       const acc = vec3(0).toVar();
@@ -445,15 +580,40 @@ export function createSrcMergeFrame(store, bins, {
         payload.element(o.add(uint(1))).assign(outL.y);
         payload.element(o.add(uint(2))).assign(outL.z);
         payload.element(o.add(uint(3))).assign(outT);
-        atomicAdd(stats.element(uint(MERGE_MERGED)), uint(1));
-        If(outT.equal(0), () => { atomicAdd(stats.element(uint(MERGE_OPAQUE)), uint(1)); });
+        atomicAdd(stats.element(sw(c, MERGE_MERGED)), uint(1));
+        If(outT.equal(0), () => { atomicAdd(stats.element(sw(c, MERGE_OPAQUE)), uint(1)); });
       }).Else(() => {
-        // NO PARENT PROBE EXISTED. The bin keeps its own interval and stays
+        // NO PARENT CONTRIBUTED. The bin keeps its own interval and stays
         // transparent above it — NOT a black vote — so temporal accumulation
         // can fill it in on a later frame and `srcGather`'s `L + T·sky` still
         // gives it the c0-only answer meanwhile. A fixed-radius fallback here
         // is precisely the cliff R1 forbids.
-        atomicAdd(stats.element(uint(MERGE_ORPHAN)), uint(1));
+        atomicAdd(stats.element(sw(c, MERGE_ORPHAN)), uint(1));
+        // ⭐⭐ AND SPLIT IT BY WHETHER IT COST A PHOTON (2026-08-23).
+        //
+        // The headline "26% orphaning" says nothing about lost light on its own,
+        // because the merged branch above computes `L_self + L_parent·selfT`
+        // and `T_self·parentT`. At **selfT == 0** those are `L_self` and `0` —
+        // byte-identical to what orphaning leaves behind. An opaque bin's own
+        // interval already blocked everything, so there is nothing for a parent
+        // to shine through and NO parent could have changed the answer.
+        //
+        // That is not a corner case here: an orphan means no corner had a KNOWN
+        // parent bin in this direction, and the most common reason for a parent
+        // bin to be unknown is that no ray in that direction ever reached the
+        // parent's interval — i.e. it was stopped inside this bin's own, which
+        // is precisely the selfT == 0 case. So the two counters are expected to
+        // be strongly correlated, and the LIVE one is the only one that can
+        // cost the user visible long-range light.
+        //
+        // Redirects an atomic that was already being issued — no new atomics,
+        // no new reads, zero frame cost. Nothing should be BUILT on the orphan
+        // rate until this readout says how much of it is live.
+        If(selfT.equal(0), () => {
+          atomicAdd(stats.element(sw(c, MERGE_ORPHAN_OPAQUE)), uint(1));
+        }).Else(() => {
+          atomicAdd(stats.element(sw(c, MERGE_ORPHAN_LIVE)), uint(1));
+        });
       });
     })().compute(info.blockCapacity * nBins));
   }
@@ -464,43 +624,94 @@ export function createSrcMergeFrame(store, bins, {
     cornerWeight,
     cornerCascades,
     stats,
-    bytes: (cornerSize * 2 + MERGE_WORDS) * 4,
+    bytes: (cornerSize * 2 + statWords) * 4,
     w0,
+    cascadeCount: N,
 
     /**
-     * One frame's merge telemetry.
+     * One frame's merge telemetry, PER CASCADE and aggregated.
      *
-     * `orphanRate` is the one to watch: it is the fraction of known bins whose
-     * parent lattice had no probe at all, i.e. how much of the frame is still
-     * getting the c0-only answer. A rate that climbs when the camera moves is
-     * the population thinning at the top of the ladder, which is a probe-budget
-     * story and not a merge one.
+     * `orphanRate` is the one to watch: the fraction of known bins whose parent
+     * lattice had no probe at all, i.e. how much of the frame is getting the
+     * short-interval answer with the long-range cascades missing.
+     *
+     * ⭐ READ `perCascade` FIRST. The aggregate is a bin-count-weighted blend of
+     * three lattices, and c0 has ~64× the bins of c2, so a catastrophic c2 can
+     * hide inside a healthy-looking total and vice versa. `cascade[c].orphanRate`
+     * is the number that names the level; `orphanRate` is kept only so the
+     * §12.56 watchdog signature and every historical reading stay comparable.
      */
     async readStats(renderer) {
       const allocated = !!renderer?.backend?.get?.(stats.value)?.buffer;
-      if (!allocated) return { dispatched: false, bins: 0, merged: 0 };
+      if (!allocated) return { dispatched: false, bins: 0, merged: 0, perCascade: [] };
       const v = new Uint32Array(await renderer.getArrayBufferAsync(stats.value));
-      const probes = v[MERGE_PROBES] >>> 0;
-      const visited = v[MERGE_BINS] >>> 0;
-      const merged = v[MERGE_MERGED] >>> 0;
+      const at = (c, w) => v[c * MERGE_STRIDE + w] >>> 0;
+      const perCascade = [];
+      let probes = 0, visited = 0, merged = 0, orphans = 0, opaque = 0, sky = 0, los = 0, found = 0;
+      let orphanLive = 0, orphanOpaque = 0;
+      for (let c = 0; c < N; c++) {
+        const p = at(c, MERGE_PROBES);
+        const b = at(c, MERGE_BINS);
+        const mg = at(c, MERGE_MERGED);
+        const or = at(c, MERGE_ORPHAN);
+        const fd = at(c, MERGE_FOUND);
+        probes += p; visited += b; merged += mg; orphans += or; found += fd;
+        opaque += at(c, MERGE_OPAQUE); sky += at(c, MERGE_SKY); los += at(c, MERGE_LOS);
+        orphanLive += at(c, MERGE_ORPHAN_LIVE); orphanOpaque += at(c, MERGE_ORPHAN_OPAQUE);
+        perCascade.push({
+          cascade: c,
+          probes: p,
+          bins: b,
+          merged: mg,
+          orphans: or,
+          // The two numbers that separate "no parent existed" from "the parent
+          // existed and had nothing to say": orphanRate counts bins that found
+          // NO corner at all, meanCorners counts corners found per probe. A
+          // high orphanRate with a high meanCorners means the population is
+          // fine and the parents' BINS are unknown — a completely different fix.
+          orphanRate: b > 0 ? or / b : 0,
+          // ⭐ Of those orphans, how many COST a photon. See MERGE_ORPHAN_LIVE:
+          // an opaque orphan (selfT == 0) is byte-identical to a merge, so only
+          // `orphanLiveRate` can explain missing long-range light.
+          orphanOpaque: at(c, MERGE_ORPHAN_OPAQUE),
+          orphanLive: at(c, MERGE_ORPHAN_LIVE),
+          orphanLiveRate: b > 0 ? at(c, MERGE_ORPHAN_LIVE) / b : 0,
+          meanCorners: p > 0 ? fd / p : 0,
+          sky: at(c, MERGE_SKY),
+          losSuppressed: at(c, MERGE_LOS),
+        });
+      }
       return {
         dispatched: true,
+        perCascade,
         probes,
         // Mean parent corners found per probe, out of 8. Below ~4 means the
         // parent cascade is sparser than the trilinear stencil wants, and the
         // renormalization is carrying the result.
-        meanCorners: probes > 0 ? (v[MERGE_FOUND] >>> 0) / probes : 0,
+        meanCorners: probes > 0 ? found / probes : 0,
         bins: visited,
         merged,
-        orphans: v[MERGE_ORPHAN] >>> 0,
-        opaque: v[MERGE_OPAQUE] >>> 0,
-        sky: v[MERGE_SKY] >>> 0,
-        orphanRate: visited > 0 ? (v[MERGE_ORPHAN] >>> 0) / visited : 0,
+        orphans,
+        opaque,
+        sky,
+        // §15 U3b: corners the cross-wall march suppressed. Nonzero says the
+        // march is armed AND finding walls; the RATE (per resolved corner
+        // set) is scene-shaped — a one-room rig reads ~0, the user's Level
+        // reads whatever fraction of parent cells straddle its walls.
+        losSuppressed: los,
+        losRate: probes > 0 ? los / (probes * MERGE_CORNERS) : 0,
+        orphanRate: visited > 0 ? orphans / visited : 0,
+        // ⭐ THE NUMBER THAT MATTERS. `orphanRate` counts bins that found no
+        // parent; this counts the ones where that absence actually changed the
+        // answer. See MERGE_ORPHAN_LIVE.
+        orphanLive,
+        orphanOpaque,
+        orphanLiveRate: visited > 0 ? orphanLive / visited : 0,
         // Merged bins that reached T = 0, i.e. whose parent chain resolved all
         // the way to the sky. With hit shading absent this is also the fraction
         // of the frame that gets the FULL-RANGE answer rather than a partial
         // one, so it is the number that says the ladder is connected.
-        resolvedRate: merged > 0 ? (v[MERGE_OPAQUE] >>> 0) / merged : 0,
+        resolvedRate: merged > 0 ? opaque / merged : 0,
       };
     },
 
@@ -513,6 +724,17 @@ export function createSrcMergeFrame(store, bins, {
 /** The per-frame merge line, for the telemetry log. */
 export function formatSrcMerge(m) {
   if (!m?.dispatched) return "";
+  // Per-cascade breakdown appended: the aggregate is bin-count-weighted and c0
+  // has ~64× the bins of c2, so the total cannot name the level that is
+  // starving. Only cascades that actually ran a ladder pass (0..N−2) are
+  // printed — the top cascade merges against the sky and can never orphan.
+  const by = (m.perCascade ?? [])
+    .filter((c) => c.bins > 0)
+    .map((c) => `c${c.cascade} ${(c.orphanRate * 100).toFixed(0)}%(${(c.orphanLiveRate * 100).toFixed(0)}live)/${c.meanCorners.toFixed(1)}`)
+    .join(" ");
   return `merge ${m.merged}/${m.bins} bins (${(m.resolvedRate * 100).toFixed(0)}% to sky, ` +
-    `${(m.orphanRate * 100).toFixed(1)}% orphan, ${m.meanCorners.toFixed(1)}/8 corners)`;
+    `${(m.orphanRate * 100).toFixed(1)}% orphan (${((m.orphanLiveRate ?? 0) * 100).toFixed(1)}% LIVE — the rest cost nothing, selfT was 0), ` +
+    `${m.meanCorners.toFixed(1)}/8 corners` +
+    (m.losSuppressed > 0 ? `, ${(m.losRate * 100).toFixed(1)}% los-cut` : "") + `)` +
+    (by ? ` — orphan/corners by cascade: ${by}` : "");
 }

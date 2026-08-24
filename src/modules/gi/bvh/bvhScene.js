@@ -49,8 +49,19 @@ import * as THREE from "three/webgpu";
 import { If, Loop, attributeArray, cross, float, fract, mat3, max, min, select, texture, uniform, uniformArray, vec2, vec3, vec4, wgslFn } from "three/tsl";
 import { MeshBVH } from "three-mesh-bvh";
 
-/** Hard cap on meshes seated into one BVH scene — bounds per-frame loop cost. */
-export const MAX_BVH_MESHES = 64;
+/**
+ * Hard cap on meshes seated into one BVH scene — bounds per-frame loop cost.
+ * 64 → 128 (2026-08-22): at 64 the user's Level (87 eligible) left 23 meshes
+ * UNSEATED, and every reflection ray flew straight through them — "the
+ * mirror grabs emission from behind the walls" plus white env speckle where
+ * rays escaped the scene entirely. Seat-by-size had already fixed WHICH
+ * meshes overflowed; past ~85 eligible nothing but a bigger table fixes THAT
+ * they overflow. The per-ray cost is a TLAS AABB loop bounded by the LIVE
+ * meshCountUniform, so a 64-mesh scene pays exactly what it paid — only
+ * scenes that actually seat more pay more, and the prepass they feed has
+ * been stride-2 + half-res-shaded since the same day.
+ */
+export const MAX_BVH_MESHES = 128;
 /** Per-mesh triangle cap — a single 150k-tri BLAS is already a deep tree. */
 export const MAX_TRIS_PER_BVH_MESH = 150_000;
 
@@ -59,6 +70,8 @@ const UINT32_PER_NODE = BYTES_PER_NODE / 4; // 8
 
 // geometry -> { nodeCount, triCount, vertexCount, bounds, contents, index, position, boundsMin, boundsMax }
 const blasCache = new WeakMap();
+// Scratch for the seat-by-size ranking below (never held across calls).
+const _capScale = new THREE.Vector3();
 
 /**
  * Packs one geometry's MeshBVH into flat CPU typed arrays, byte-identical
@@ -330,15 +343,15 @@ const bvhMeshFirstHitFn = wgslFn(/* wgsl */ `
 
 ` );
 
-// Tile grid for the per-mesh albedo atlas (buildAlbedoAtlas): 8x8 tiles of
-// 256x256 == MAX_BVH_MESHES exactly, so the tile index IS the mesh table
+// Tile grid for the per-mesh albedo atlas (buildAlbedoAtlas): GRID² tiles of
+// 256x256 >= MAX_BVH_MESHES, and the tile index IS the mesh table
 // index (offsets/aabbMin/worldToLocal's own `i`) — no separate mesh->tile
 // map to keep in sync. Bump one, check the other. Exported so giScreen.js's
 // blitBvhAtlasTiles can compute the same per-tile pixel rects when it
 // GPU-renders tiles the canvas 2D path here could not draw.
 export const ALBEDO_ATLAS_TILE = 256;
-export const ALBEDO_ATLAS_GRID = 8; // 8 * 8 === MAX_BVH_MESHES
-export const ALBEDO_ATLAS_SIZE = ALBEDO_ATLAS_TILE * ALBEDO_ATLAS_GRID; // 2048
+export const ALBEDO_ATLAS_GRID = 12; // 12 * 12 = 144 >= MAX_BVH_MESHES (128)
+export const ALBEDO_ATLAS_SIZE = ALBEDO_ATLAS_TILE * ALBEDO_ATLAS_GRID; // 3072
 
 /**
  * Bakes one atlas of per-mesh albedo (GI Phase 3 v2 — texture-at-hit, see
@@ -486,9 +499,31 @@ export function buildBvhScene(meshes) {
   }
   let capped = eligible;
   if (eligible.length > MAX_BVH_MESHES) {
-    console.warn(`[gi] bvh: ${eligible.length} eligible meshes exceed the ${MAX_BVH_MESHES}-mesh cap — seating the first ${MAX_BVH_MESHES}`);
-    capped = eligible.slice(0, MAX_BVH_MESHES);
-    dynamicMeshes.push(...eligible.slice(MAX_BVH_MESHES));
+    // SEAT BY SIZE, NOT WALK ORDER (2026-08-21): with more eligible meshes
+    // than seats, "the first 64" left whole WALLS unseated on scene-walk
+    // luck — mirror rays flew straight through them, "proved" the
+    // environment visible, and the env-on-miss term drew SKY inside a
+    // closed room (user's mirror slab). Ranking by world-AABB surface area
+    // before the cut makes the overflow the smallest props, whose absence
+    // from reflections is barely visible. Same cadence as the atlas bake
+    // (mesh-set changes only), so the sort costs nothing per frame.
+    const worldArea = (mesh) => {
+      const g = mesh.geometry;
+      if (!g.boundingBox) g.computeBoundingBox();
+      const b = g.boundingBox;
+      _capScale.setFromMatrixScale(mesh.matrixWorld);
+      const x = (b.max.x - b.min.x) * Math.abs(_capScale.x);
+      const y = (b.max.y - b.min.y) * Math.abs(_capScale.y);
+      const z = (b.max.z - b.min.z) * Math.abs(_capScale.z);
+      return 2 * (x * y + y * z + z * x);
+    };
+    const ranked = eligible
+      .map((mesh) => [mesh, worldArea(mesh)])
+      .sort((a, b) => b[1] - a[1])
+      .map((pair) => pair[0]);
+    console.warn(`[gi] bvh: ${eligible.length} eligible meshes exceed the ${MAX_BVH_MESHES}-mesh cap — seating the ${MAX_BVH_MESHES} LARGEST (overflow: smallest props)`);
+    capped = ranked.slice(0, MAX_BVH_MESHES);
+    dynamicMeshes.push(...ranked.slice(MAX_BVH_MESHES));
   }
 
   const entries = [];

@@ -85,10 +85,13 @@ import {
   atomicMax,
   atomicMin,
   atomicStore,
+  cos,
+  equirectUV,
   float,
   instanceIndex,
   instancedArray,
   ivec2,
+  sin,
   texture,
   textureStore,
   uint,
@@ -102,7 +105,7 @@ import {
   W0,
   binGridWidth,
 } from "./srcConfig.js";
-import { tileCosineWeights } from "./srcMath.js";
+import { binDirTable, tileCosineWeights } from "./srcMath.js";
 import { octahedralUV } from "./srcOctahedral.js";
 import { PAYLOAD_WORDS } from "./srcDeposit.js";
 
@@ -166,6 +169,12 @@ export function createSrcTileAtlas(store, bins, {
   sub = COSINE_SUB,
   maxDimension = 8192,
   sky = null,
+  frameStamp = null,
+  // §16 S1 — the DIRECTIONAL sky bundle ({ node, intensity, rotY }); when
+  // present the orphan/residual `T·sky` term samples the environment at the
+  // bin's own direction instead of the flat mean. Absent (every gate
+  // fixture) the flat path compiles bit-identically.
+  skyEnv = null,
 } = {}) {
   const info = bins.cascades[0];
   const nBins = info.bins;
@@ -197,9 +206,77 @@ export function createSrcTileAtlas(store, bins, {
   const w = binGridWidth(0, w0);
   const table = tileCosineWeights(w, interior, sub, border);
   const cosTable = instancedArray(table, "float");
+  /**
+   * ⭐⭐ THE HONEST DENOMINATOR FOR `meanKnownBins` (§12.87c, 2026-08-24).
+   *
+   * `known` is incremented INSIDE `If(cw.greaterThan(0))`, so its domain is not
+   * `nBins` — it is the bins whose patch actually crosses this texel's horizon.
+   * Reporting it as `x/32` made a healthy field look two-thirds starved and
+   * sent a whole session hunting a phantom: on the user's Level the reading was
+   * `11.1/32` (35%), and the true figure is `11.1/20.1` = **55%**.
+   *
+   * Computed on the CPU from the very table the kernel reads — no GPU counter,
+   * no atomic, no frame cost. At the shipping w0=4/interior=6/border=1 it is
+   * 20.125 (histogram {16:4, 20:36, 21:24} over the 64 bordered texels), and it
+   * is a pure function of (w, interior, sub, border), so it cannot drift from
+   * what the kernel does.
+   *
+   * ⚠ The CEILING is 20.125 and it is reached only by a probe fed from every
+   * direction. A probe fed by ONE flat surface is bounded far lower — the ray
+   * fold (`srcMathTsl` rayDirection: every ray is folded into the firing
+   * pixel's own hemisphere) means a probe against a wall can never receive
+   * evidence in the half-sphere behind it. So a mid-teens reading on a blockout
+   * interior is not starvation; it is geometry.
+   */
+  const lobeBins = (() => {
+    const texelsAll = (interior + 2 * border) ** 2;
+    let sum = 0;
+    for (let t = 0; t < texelsAll; t++) {
+      for (let m = 0; m < nBins; m++) if (table[t * nBins + m] > 0) sum++;
+    }
+    return sum / texelsAll;
+  })();
   const stats = instancedArray(new Uint32Array(TS_WORDS), "uint").toAtomic();
   const { payload } = bins;
   const skyNode = sky ? vec3(sky) : vec3(0);
+  // §16 S1 — c0's bin-direction LUT for the directional orphan composite
+  // (Morton order — binDirTable's header). Bound only when armed.
+  const skyDirTable = skyEnv ? instancedArray(binDirTable(w), "vec4") : null;
+
+  // ── §16 D3 — PROBE MATURITY (2026-08-24) ──────────────────────────────────
+  //
+  // A block claimed R frames ago carries ~R frames of accumulated evidence; a
+  // block claimed THIS frame carries one noisy sample (or a §12.59.2 seed),
+  // and until now it voted in the gather at the same weight as a converged
+  // neighbour — which is exactly the cell-sized rectangle popping bright/dim
+  // in view that camera motion produces at every walk frontier. Scaling
+  // `cover` by m = clamp(claimAge/RAMP, FLOOR, 1) makes a young corner defer
+  // to converged neighbours and FADE IN as it earns evidence:
+  //   · per-corner mean invariant — rgb is stored E·cover, so both channels
+  //     carry m and tap.rgb/tap.a is untouched;
+  //   · R1-safe — a lone young corner still renormalizes to its own mean
+  //     (never dark), and uniformly-young regions cancel m entirely;
+  //   · steady state BIT-IDENTICAL to the pre-D3 build (m = 1 everywhere) —
+  //     unlike every vetoed weight-shaping attempt, this term exists only
+  //     during transients.
+  // The claim stamp is the one `createCompactPass` already writes (and the
+  // age pass re-stamps on release — a released block bakes a black tile via
+  // wsum == 0, so the release value is never read). No new storage.
+  // `__giSrcMaturity = false` removes it at build; `__giSrcMaturityRamp` /
+  // `__giSrcMaturityFloor` override the constants.
+  const maturityOn = globalThis.__giSrcMaturity !== false
+    && frameStamp != null
+    && store?.freeStack != null
+    && store?.blockStampBase != null
+    && store?.cascades?.[0]?.blockBase != null;
+  const maturityRamp = Number(globalThis.__giSrcMaturityRamp) > 0
+    ? Number(globalThis.__giSrcMaturityRamp)
+    : 30;
+  const maturityFloor = Number.isFinite(Number(globalThis.__giSrcMaturityFloor))
+    ? Number(globalThis.__giSrcMaturityFloor)
+    : 0.2;
+  const stampBase = maturityOn ? store.blockStampBase + store.cascades[0].blockBase : 0;
+  const stampStack = maturityOn ? store.freeStack : null;
 
   const passes = [];
 
@@ -231,6 +308,8 @@ export function createSrcTileAtlas(store, bins, {
     const row = t.mul(uint(nBins)).toVar();
     const acc = vec3(0).toVar();
     const wsum = float(0).toVar();
+    /** Σ cosine weight over the WHOLE lobe — see `cover` below. */
+    const wsumAll = float(0).toVar();
     const known = uint(0).toVar();
 
     // A dynamic loop rather than a JS unroll: `nBins` is 32 at the shipping w₀
@@ -239,6 +318,12 @@ export function createSrcTileAtlas(store, bins, {
     // divergence worth flattening.
     Loop({ start: 0, end: nBins, type: "uint", name: "m" }, ({ m }) => {
       const cw = cosTable.element(row.add(m)).toVar();
+      // ⭐ THE DENOMINATOR OF HONEST COVERAGE — the whole cosine lobe, known or
+      // not. See `cover` below for why the flag it replaces was the block
+      // generator. Accumulated outside the `T >= 0` gate on purpose: this is
+      // "how much of this texel's lobe EXISTS", against which `wsum` is "how
+      // much of it we have actually sampled".
+      wsumAll.addAssign(cw);
       If(cw.greaterThan(0), () => {
         const o = base.add(m).mul(uint(PAYLOAD_WORDS)).toVar();
         // ZERO-COUNT BINS ARE UNKNOWN, NOT ZERO. Excluded from the average, and
@@ -259,11 +344,28 @@ export function createSrcTileAtlas(store, bins, {
           // contribute `T·sky`, and §12.21.9 measured 17.9% orphans on the
           // smoke scene. Same expression, same reasoning, same place in both
           // twins (`bakeProbeIrradiance`).
+          //
+          // §16 S1 — when the directional sky is armed, the residual term
+          // samples the environment at THIS bin's direction (srcMerge [G.2]
+          // carries the full argument); the flat mean stays the unarmed
+          // path, bit-identical for every fixture.
+          const SB = vec3(skyNode).toVar();
+          if (skyEnv) {
+            const d = vec3(skyDirTable.element(m).xyz).toVar();
+            const crS = cos(skyEnv.rotY).toVar();
+            const srS = sin(skyEnv.rotY).toVar();
+            const rdS = vec3(
+              d.x.mul(crS).add(d.z.mul(srS)),
+              d.y,
+              d.z.mul(crS).sub(d.x.mul(srS)),
+            ).toVar();
+            SB.assign(vec3(skyEnv.node.sample(equirectUV(rdS)).level(0).xyz).mul(skyEnv.intensity));
+          }
           acc.addAssign(vec3(
             payload.element(o),
             payload.element(o.add(uint(1))),
             payload.element(o.add(uint(2))),
-          ).add(skyNode.mul(T)).mul(cw));
+          ).add(SB.mul(T)).mul(cw));
           wsum.addAssign(cw);
           known.addAssign(uint(1));
         });
@@ -276,7 +378,65 @@ export function createSrcTileAtlas(store, bins, {
       // π · Σ(L·W) / Σ(W) — exact for uniform L at any bin count, whichever
       // bins happened to be sampled. See the header on why the π is analytic.
       E.assign(acc.mul(float(Math.PI).div(wsum)));
-      cover.assign(1);
+      // ── ⭐⭐ COVERAGE IS A FRACTION, NOT A FLAG (§12.87, 2026-08-24) ──────
+      //
+      // This was `cover.assign(1)`: ANY known bin in the lobe ⇒ full
+      // confidence. Combined with the renormalised `E` above — a mean over the
+      // KNOWN bins, which is an EXTRAPOLATION of them across the whole lobe —
+      // a texel backed by ONE bin of sixteen claimed to know its hemisphere as
+      // well as a fully-sampled one.
+      //
+      // ⚠ IT IS NOT A CONTRACT VIOLATION, AND THE FIRST WRITE-UP OF THIS SAID
+      // IT WAS. `srcScreenGather.js`'s header reads "the atlas's alpha is 1
+      // where a texel found a known bin and 0 where it did not … FILTERED, it
+      // is `Σ w_tap` over the covered taps": the fraction is meant to come from
+      // the hardware bilinear tap STRADDLING covered and uncovered TEXELS, not
+      // from partial bin coverage inside one texel. The flag is the designed
+      // behaviour and `test:gi-src-tiles`' COVERAGE arm defends it explicitly
+      // ("alpha is 1 where a known bin was found, 0 where none"). So this is a
+      // DESIGN CHANGE, and it ships OPT-IN until a measurement earns it.
+      //
+      // What it cost, measured on the user's Level (2026-08-23/24): probes read
+      // `knownBins 11.1/32`, so one-bin extrapolation is the COMMON case, not
+      // the tail. Whichever corner won a 0.45 m cell handed that whole cell its
+      // single-bin constant, and which corner wins churns as probes are
+      // re-minted — cell-scale blocks that rearrange when the camera moves,
+      // worst where the base is near zero (this scene has Sky Light 0) and at
+      // distance (influx per probe scales with screen footprint, so coverage
+      // degrades as 1/d²). That is the user's report in one line of code.
+      //
+      // The fix is the honest fraction. A 1-of-16 texel now votes at 1/16 and
+      // the gather's EXISTING coverage renormalisation lets better-sampled
+      // neighbours carry the cell. It cannot darken anything: `acc` and `wsum`
+      // in the gather carry the same factor, so a uniformly-downweighted point
+      // renormalises back to the same mean — only the RATIO between corners
+      // moves, which is exactly what "in proportion to what it knows" means.
+      //
+      // The argument FOR it, unmeasured: `E` is renormalised over the known
+      // bins, which is unbiased only if those bins are a random subset of the
+      // lobe. They are not — they are the bins rays happened to reach — so a
+      // 4-of-16 texel is a BIASED extrapolation carrying a full vote. Weighting
+      // by the sampled fraction lets better-sampled neighbours carry the cell.
+      // It cannot darken: the gather's `acc` and `wsum` take the same factor,
+      // so a uniformly-downweighted point renormalises to the same mean and
+      // only the RATIO between corners moves.
+      //
+      // `__giTileCoverFraction = true` arms it. Both twins read the one hatch,
+      // so `test:gi-src-gather` compares like with like either way.
+      cover.assign(globalThis.__giTileCoverFraction === true
+        ? wsum.div(wsumAll.max(1e-6)).clamp(0, 1)
+        : float(1));
+      // §16 D3 — the maturity factor (header above). u32 subtraction is safe:
+      // any live block's stamp is a past frame of this session's monotonic
+      // counter, so `frame − stamp` never underflows.
+      if (maturityOn) {
+        const stamp = stampStack.element(uint(stampBase).add(block)).toVar();
+        const m = float(uint(frameStamp).sub(stamp))
+          .div(maturityRamp)
+          .clamp(maturityFloor, 1)
+          .toVar();
+        cover.mulAssign(m);
+      }
       atomicAdd(stats.element(uint(TS_TEXELS)), uint(1));
     }).Else(() => {
       // NOT A FAULT BY ITSELF, AND ON A REAL SCENE IT IS COMMON. A texel whose
@@ -325,7 +485,27 @@ export function createSrcTileAtlas(store, bins, {
     // exactly. Whether [I] renormalizes — and whether the mirror's
     // `sampleTile` grows a coverage channel to match — is unit 5's decision,
     // made with the measured empty-texel rate in hand rather than in advance.
-    textureStore(atlas, coord, vec4(E, cover));
+    // ⛔⛔ E IS PREMULTIPLIED BY COVER, AND IT MUST BE (§12.87b, 2026-08-24).
+    //
+    // `srcScreenGather.js:422-424` accumulates `acc += tap.xyz·weight` and
+    // `wsum += tap.w·weight`, then divides ONCE at `:439`. That computes
+    // `Σ w·c·E / Σ w·c` — a coverage-weighted mean — ONLY if the stored rgb
+    // already carries `c`. Storing bare `E` computes `Σ w·E / Σ w·c` instead,
+    // which is the mean divided by mean coverage: a gain of 1/c̄.
+    //
+    // With the shipped flag (`cover ≡ 1`) the two are identical, which is why
+    // this survived — and it is why this line is a PROVABLE NO-OP on the
+    // default path. Under `__giTileCoverFraction = true` it was not: c̄ runs
+    // 0.378 (+Z face) to 0.689 (floor+wall junction), i.e. a **1.45×-2.65×
+    // brightening that varies with each probe's feeding orientation** — per
+    // 0.45 m cell. The opt-in arm as first written would have MANUFACTURED
+    // exactly the cell-scale blocks it was built to test a cure for.
+    //
+    // ⚠ The CPU mirror was right all along (`srcRef.js` gatherPixel:
+    // `const w = weight * cov; acc.r += c[0]*w; acc.w += w`), so the two twins
+    // implemented different estimators under the hatch and only the GPU was
+    // wrong. `test:gi-src-gather` cannot see it while the flag is off.
+    textureStore(atlas, coord, vec4(E.mul(cover), cover));
   })().compute(blocks * texels));
 
   /**
@@ -423,7 +603,15 @@ export function createSrcTileAtlas(store, bins, {
         // BAKE is working — see `formatSrcTiles`.
         coverage: total > 0 ? lit / total : 0,
         meanKnownBins: lit > 0 ? (v[TS_KNOWN] >>> 0) / lit : 0,
+        /**
+         * ⚠ `totalBins` is NOT the denominator of `meanKnownBins` — see
+         * `lobeBins`. It is kept because callers report the bin count, and
+         * `lobeBins` is what the ratio is actually out of.
+         */
         totalBins: nBins,
+        lobeBins,
+        knownFrac: lit > 0 && lobeBins > 0
+          ? (v[TS_KNOWN] >>> 0) / lit / lobeBins : 0,
         meanLum: lit > 0 ? (v[TS_SUM] >>> 0) / lit / LUM_FIXED : 0,
         minLum: rawMin === 0xffffffff ? 0 : rawMin / LUM_FIXED,
         maxLum: (v[TS_MAX] >>> 0) / LUM_FIXED,
@@ -452,6 +640,7 @@ export function formatSrcTiles(t, liveProbes = 0) {
   const owned = liveProbes * t.texelsPerTile;
   return `tiles ${t.lit}/${owned || t.texels} texels lit` +
     (owned ? ` (${(100 * t.lit / owned).toFixed(0)}% of claimed)` : "") +
-    `, ${t.meanKnownBins.toFixed(1)}/${t.totalBins} bins, ` +
+    `, ${t.meanKnownBins.toFixed(1)}/${(t.lobeBins ?? t.totalBins).toFixed(1)} lobe bins ` +
+    `(${((t.knownFrac ?? 0) * 100).toFixed(0)}%), ` +
     `E ${t.minLum.toFixed(3)}..${t.maxLum.toFixed(3)}`;
 }

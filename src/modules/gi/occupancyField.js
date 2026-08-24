@@ -791,9 +791,33 @@ export function createOccupancyField(bounds, res0, options = {}) {
   let vertexBuffer = instancedArray(new Float32Array(4), "vec4");
   let indexBuffer = instancedArray(new Uint32Array(3), "uint");
   // One entry per (slot, triangle, chunk) work item — see `setGeometry`.
-  let pairSlot = instancedArray(new Uint32Array(1), "uint");
-  let pairTri = instancedArray(new Uint32Array(1), "uint");
-  let pairChunk = instancedArray(new Uint32Array(1), "uint");
+  //
+  // ⚠ ONE BUFFER, THREE WORDS PER ITEM — and the interleave is a PORTABILITY
+  // fix, not a cache-locality opinion (2026-08-23). As three separate
+  // `instancedArray`s these were three of the NINE storage buffers the surface
+  // -accumulate kernel bound, and the portable WebGPU limit is EIGHT. On a
+  // phone (and on any adapter that advertises only the baseline)
+  // `occupancy#7`'s pipeline layout is then invalid, every bind group built
+  // from it fails, the occupancy chain never runs, and GI ships a scene with
+  // NO transport at all — the user's "on mobile only emissive lighting works,
+  // the sun's indirect light is missing entirely". Emissives survive because
+  // their delivery is the screen-space analytic term; everything that has to
+  // travel through the field dies with the field.
+  //
+  // The regression was invisible for a reason worth keeping: `sceneSettings.js`
+  // opportunistically raises the ask to 16 storage buffers on adapters that
+  // offer them, so every desktop hid it, and `gi-gpu-smoke`'s portable pin
+  // audits `state.queue` + `srcProbes.passes` — the occupancy chain is
+  // dispatched separately and was never in the audited set. Both are fixed
+  // alongside this (the smoke censuses `prewarmComputes()` now).
+  //
+  // AoS with a CONSTANT stride, deliberately, rather than SoA at
+  // `+pairCap`/`+2·pairCap` offsets: a scene-dependent offset baked into the
+  // WGSL is a text change per boot, and R11's whole point is that a shader
+  // whose text moves between boots can never hit the content-keyed disk cache.
+  // `3` is the same integer on every scene.
+  const PAIR_WORDS = 3;
+  let pairWork = instancedArray(new Uint32Array(PAIR_WORDS), "uint");
   let pairCount = 0;
   let geometryRevision = 0;
   // ── Incremental bookkeeping (see setGeometry). The buffers above are
@@ -808,8 +832,21 @@ export function createOccupancyField(bounds, res0, options = {}) {
   let slotPairInfo = new Map(); // slot -> {start, count, key, chunkDensity}
   let enabledSlots = new Set(); // slots present in the last placements list
   let vertexUsed = 0, triUsed = 0, vertexCap = 0, triCap = 0, pairCap = 0;
-  let vdataArr = null, idataArr = null, pairSlotArr = null, pairTriArr = null, pairChunkArr = null;
+  let vdataArr = null, idataArr = null, pairWorkArr = null;
   let pairComputes = []; // every compute dispatched over the pair list
+
+  /**
+   * The work item this thread owns, read LAZILY.
+   *
+   * Both filtered kernels read the slot, test it against the static/dynamic
+   * split, and return — so `tri`/`chunk` stay behind their own accessors and
+   * an exiting thread still pays exactly the two reads the split's header
+   * prices it at, interleave or not.
+   */
+  const pairBaseAt = (index) => uint(index).mul(uint(PAIR_WORDS)).toVar();
+  const pairSlotAt = (base) => pairWork.element(base);
+  const pairTriAt = (base) => pairWork.element(base.add(uint(1)));
+  const pairChunkAt = (base) => pairWork.element(base.add(uint(2)));
 
   // Local→world per instance slot. The atlas carries the INVERSE (it samples
   // slot SDFs by pushing world points into local space); voxelization pushes
@@ -1038,15 +1075,16 @@ export function createOccupancyField(bounds, res0, options = {}) {
    * and the set membership is a uniform write.
    */
   const buildVoxelizeCompute = (filter = null) => Fn(() => {
-    const slot = pairSlot.element(instanceIndex).toVar();
+    const pair = pairBaseAt(instanceIndex);
+    const slot = pairSlotAt(pair).toVar();
     if (filter) {
       const want = filter === "dynamic" ? 1 : 0;
       If(slotDynamic.element(slot.toInt()).notEqual(float(want)), () => {
         Return();
       });
     }
-    const tri = pairTri.element(instanceIndex).toVar();
-    const chunk = pairChunk.element(instanceIndex).toVar();
+    const tri = pairTriAt(pair).toVar();
+    const chunk = pairChunkAt(pair).toVar();
 
     const base = tri.mul(uint(3)).toVar();
     const i0 = indexBuffer.element(base).toVar();
@@ -1469,13 +1507,14 @@ export function createOccupancyField(bounds, res0, options = {}) {
    */
   const buildSurfAccumCompute = surfaceEnabled
     ? (filter = "static") => Fn(() => {
-        const slot = pairSlot.element(instanceIndex).toVar();
+        const pair = pairBaseAt(instanceIndex);
+        const slot = pairSlotAt(pair).toVar();
         const want = filter === "dynamic" ? 1 : 0;
         If(slotDynamic.element(slot.toInt()).notEqual(float(want)), () => {
           Return();
         });
-        const tri = pairTri.element(instanceIndex).toVar();
-        const chunk = pairChunk.element(instanceIndex).toVar();
+        const tri = pairTriAt(pair).toVar();
+        const chunk = pairChunkAt(pair).toVar();
 
         const base = tri.mul(uint(3)).toVar();
         const i0 = indexBuffer.element(base).toVar();
@@ -1813,13 +1852,14 @@ export function createOccupancyField(bounds, res0, options = {}) {
    */
   const buildComplexWriteCompute = complexEnabled
     ? (filter = "static") => Fn(() => {
-        const slot = pairSlot.element(instanceIndex).toVar();
+        const pair = pairBaseAt(instanceIndex);
+        const slot = pairSlotAt(pair).toVar();
         const want = filter === "dynamic" ? 1 : 0;
         If(slotDynamic.element(slot.toInt()).notEqual(float(want)), () => {
           Return();
         });
-        const tri = pairTri.element(instanceIndex).toVar();
-        const chunk = pairChunk.element(instanceIndex).toVar();
+        const tri = pairTriAt(pair).toVar();
+        const chunk = pairChunkAt(pair).toVar();
 
         const base = tri.mul(uint(3)).toVar();
         const i0 = indexBuffer.element(base).toVar();
@@ -3657,6 +3697,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // times per kernel. `level` is always a JS constant, so it is a variant key
   // rather than a parameter.
   const occupiedAtWorldVariants = new Map();
+  let occupancyAtWorldFn = null;
   const occupiedAtWorld = (p, level = 0) => {
     let fn = occupiedAtWorldVariants.get(level);
     if (fn === undefined) {
@@ -3671,6 +3712,65 @@ export function createOccupancyField(bounds, res0, options = {}) {
       });
       occupiedAtWorldVariants.set(level, fn);
     }
+    return fn(p);
+  };
+
+  /**
+   * FILTERED OCCUPANCY — `occupiedAtWorld`'s one-bit answer, trilinearly
+   * interpolated over the eight level-0 voxels around `p`. Returns a
+   * CONTINUOUS coverage in [0, 1] instead of a step.
+   *
+   * ══ WHY THE CONTINUITY IS THE WHOLE FEATURE ════════════════════════════
+   *
+   * §15 U3/U3b weight a probe's contribution by whether the probe can SEE the
+   * point, marching this field between them. Built on the binary reader that
+   * weight is a step function of position: as a shaded pixel slides along a
+   * flat wall, each march sample crosses voxel boundaries and the corner's
+   * weight FLIPS. The lit/unlit boundary that comes out is stair-stepped at
+   * voxel granularity — which is exactly why U3 was shipped, seen by the user
+   * ("stair-stepped light boundaries on walls"), and reverted to opt-in the
+   * same night. The leak it removed was real; the staircase it drew was worse.
+   *
+   * Trilinear filtering makes the same test vary smoothly over one voxel, so
+   * the boundary becomes a soft gradient rather than a lattice of squares, and
+   * the suppression can ship. It is the "fractional occupancy / filtered read"
+   * the revert named as the re-flip precondition.
+   *
+   * ⚠ THE HALF-VOXEL SHIFT IS NOT COSMETIC. `occupiedAtWorld` floors a
+   * voxel-space position to get a CELL INDEX; interpolating between cells
+   * means interpolating between their CENTRES, so the lattice has to be
+   * shifted by half a voxel first. Without the shift the filter is centred on
+   * cell corners, which biases every reading half a voxel toward −xyz — on a
+   * 0.22 m grid that is 11 cm of systematic error in a test whose entire job
+   * is to decide which side of a 0.25 m wall a probe is on.
+   *
+   * Cost: eight bit fetches per call against the binary reader's one, all
+   * against `occupiedAtLevel0` (constant-folded dimensions, no `levelSelect`
+   * chain). Priced in the U3 gate rather than assumed.
+   */
+  const occupancyAtWorld = (p) => {
+    const fn = occupancyAtWorldFn ?? (occupancyAtWorldFn = sharedFn({
+      name: "giOccupancyL0F",
+      type: "float",
+      inputs: [{ name: "p", type: "vec3" }],
+      body: (pp) => {
+        const q = vec3(pp).sub(vec3(gridOrigin)).mul(vec3(voxelInv)).sub(0.5).toVar();
+        const b = q.floor().toVar();
+        const f = q.sub(b).clamp(0, 1).toVar();
+        const acc = float(0).toVar();
+        for (let dz = 0; dz < 2; dz++) {
+          for (let dy = 0; dy < 2; dy++) {
+            for (let dx = 0; dx < 2; dx++) {
+              const w = (dx ? f.x : f.x.oneMinus())
+                .mul(dy ? f.y : f.y.oneMinus())
+                .mul(dz ? f.z : f.z.oneMinus());
+              acc.addAssign(occupiedAtLevel0(b.add(vec3(dx, dy, dz))).mul(w));
+            }
+          }
+        }
+        return acc;
+      },
+    }));
     return fn(p);
   };
 
@@ -4368,9 +4468,10 @@ export function createOccupancyField(bounds, res0, options = {}) {
       const span = Math.ceil(ext[ti] * density) + 2;
       const n = Math.max(1, Math.ceil((span * span * span) / CHUNK_VOXELS));
       for (let c = 0; c < n; c++) {
-        pairSlotArr[cursor] = slot;
-        pairTriArr[cursor] = range.triStart + ti;
-        pairChunkArr[cursor] = c;
+        const w = cursor * PAIR_WORDS;
+        pairWorkArr[w] = slot;
+        pairWorkArr[w + 1] = range.triStart + ti;
+        pairWorkArr[w + 2] = c;
         cursor++;
       }
     }
@@ -4434,9 +4535,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
       pairTotal += countPairsFor(ext, density);
     }
     pairCap = Math.ceil(pairTotal * 1.4) + 4096;
-    pairSlotArr = new Uint32Array(pairCap);
-    pairTriArr = new Uint32Array(pairCap);
-    pairChunkArr = new Uint32Array(pairCap);
+    pairWorkArr = new Uint32Array(pairCap * PAIR_WORDS);
     // Unwritten tail entries read slot 0 — harmless, the dispatch count never
     // reaches them; the sentinel is only needed for TOMBSTONED live ranges.
     slotPairInfo = new Map();
@@ -4451,9 +4550,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
 
     vertexBuffer = instancedArray(vdataArr, "vec4");
     indexBuffer = instancedArray(idataArr, "uint");
-    pairSlot = instancedArray(pairSlotArr, "uint");
-    pairTri = instancedArray(pairTriArr, "uint");
-    pairChunk = instancedArray(pairChunkArr, "uint");
+    pairWork = instancedArray(pairWorkArr, "uint");
     pairComputes = [];
     geometryRevision++;
 
@@ -4535,16 +4632,19 @@ export function createOccupancyField(bounds, res0, options = {}) {
         // Replaced range: point its entries at the sentinel slot so every
         // variant skips them. A STATIC slot whose geometry/scale changed has
         // stale bits in the snapshot — that one genuinely needs a full pass.
-        pairSlotArr.fill(slotCapacity, old.start, old.start + old.count);
-        pairSlot.value.addUpdateRange(old.start, old.count);
+        // Strided, because only the SLOT word of each item is tombstoned —
+        // `fill` over the interleaved buffer would also overwrite the
+        // triangle and chunk words of every item in the range.
+        for (let i = old.start; i < old.start + old.count; i++) {
+          pairWorkArr[i * PAIR_WORDS] = slotCapacity;
+        }
+        pairWork.value.addUpdateRange(old.start * PAIR_WORDS, old.count * PAIR_WORDS);
         pairsDirty = true;
         if (slotDynamic.array[p.slot] === 0) staticDirty = true;
       }
       const range = geoRanges.get(p.geometryKey);
       const count = writePairsFor(p.slot, range, ext, density, pairCount);
-      pairSlot.value.addUpdateRange(pairCount, count);
-      pairTri.value.addUpdateRange(pairCount, count);
-      pairChunk.value.addUpdateRange(pairCount, count);
+      pairWork.value.addUpdateRange(pairCount * PAIR_WORDS, count * PAIR_WORDS);
       slotPairInfo.set(p.slot, { start: pairCount, count, key: p.geometryKey, chunkDensity: density });
       pairCount += count;
       pairsDirty = true;
@@ -4557,9 +4657,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
       }
     }
     if (pairsDirty) {
-      pairSlot.value.needsUpdate = true;
-      pairTri.value.needsUpdate = true;
-      pairChunk.value.needsUpdate = true;
+      pairWork.value.needsUpdate = true;
       for (const c of pairComputes) c.count = Math.max(1, pairCount);
     }
 
@@ -4911,7 +5009,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
         slotPairInfo: [...slotPairInfo.entries()].map(([slot, i]) => ({ slot, ...i })),
       };
     },
-    debugPairBuffers: () => ({ pairSlot, pairTri, pairChunk, vertexBuffer, indexBuffer }),
+    debugPairBuffers: () => ({ pairWork, pairWords: PAIR_WORDS, vertexBuffer, indexBuffer }),
     setSlotDynamic,
     slotCapacity,
     /**
@@ -5066,6 +5164,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
       };
     },
     occupiedAtWorld,
+    occupancyAtWorld,
     freeRadiusAtWorld,
     recordNormalAt,
     occupiedAt,

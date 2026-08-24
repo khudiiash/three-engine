@@ -89,9 +89,13 @@ import {
   int,
   ivec2,
   ivec3,
+  mix,
+  reflect,
+  select,
   texture,
   textureStore,
   uint,
+  uniform,
   vec3,
   vec4,
 } from "three/tsl";
@@ -105,7 +109,7 @@ import {
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
-import { worldKeysEnabled } from "./srcMath.js";
+import { LOS_OCC_HI, LOS_OCC_LO, LOS_PATH_HI, LOS_PATH_LO, gatherLosWeight, gatherNormalBias, gatherNormalWeightExp, gatherSmoothWeights, worldKeysEnabled } from "./srcMath.js";
 import { SLOT_EMPTY } from "./srcProbes.js";
 
 /** Gather telemetry — the same five failures `srcGather.js` learned to separate. */
@@ -115,7 +119,22 @@ export const GG_EMPTY = 2;    // ...that found no probe with coverage at all
 export const GG_SUM = 3;
 export const GG_MIN = 4;
 export const GG_MAX = 5;
-export const GG_CORNERS = 6;  // Σ corners that contributed, over lit pixels
+export const GG_CORNERS = 6;  // Σ corners that had a BLOCK
+/**
+ * Σ corners that had COVERAGE — i.e. whose tile actually knew something in the
+ * pixel's direction (`tap.w > 0`), which is the only kind of corner that moves
+ * the answer.
+ *
+ * ⚠ `GG_CORNERS` COULD NOT SEE THE FAILURE IT WAS BUILT FOR. Its increment sits
+ * inside `If(block != SLOT_EMPTY)`, so it counts corners that exist, never
+ * corners that VOTE — and the shell's renormalisation divides by `wsum`, which
+ * is coverage. A shell whose eight probes all exist and all know nothing about
+ * this direction reads `meanCorners 8.0` and returns the answer of however few
+ * corners had coverage; at one, that is a CONSTANT over the whole cell, which
+ * is a literal block. `meanCovered` is the number that separates "the lattice is
+ * thin" from "the lattice is there and silent". Read them as a PAIR.
+ */
+export const GG_COVERED = 7;
 export const GG_WORDS = 8;
 const LUM_FIXED = 4096;
 
@@ -161,6 +180,15 @@ export function createSrcScreenGather(store, tiles, {
   lodBias = null,
   maxLods = MAX_LODS,
   w0 = W0,
+  // §15 U3 — the occupancy field's one-bit world-space test
+  // (`occField.occupiedAtWorld`) + the world bundle the lift is sized from.
+  // OPTIONAL: an instance built without them (a gate page with no engine)
+  // simply cannot arm LOS and keeps the exact pre-U3 graph. A BIT test, not
+  // the distance oracle: the oracle's 27-voxel near field at the march's
+  // call count priced the gather ×18 (los-gate run 9); the march only ever
+  // asks "is this sample inside geometry", which is one word fetch.
+  losOccupied = null,
+  losWorld = null,
 } = {}) {
   void store;
   void w0;
@@ -172,9 +200,52 @@ export function createSrcScreenGather(store, tiles, {
   // strength dial — 2 removes the most leak and costs the most brightness
   // (measured on Bistro: awning cavity −42%, but the whole frame −35%), 1 is
   // the soft half of that. See plan §13.7d for the ledger.
-  const nwHatch = globalThis.__giGatherNormalWeight;
-  const normalWeight = nwHatch === true || (Number.isFinite(nwHatch) && nwHatch > 0);
-  const nwExp = Number.isFinite(nwHatch) && nwHatch > 0 ? nwHatch : 2;
+  // §14 Q9: default-armed at exponent 1 through the shared reader — see
+  // `gatherNormalWeightExp` in srcMath.js for the ledger and the hatch.
+  // §15 U3 — LOS validity supersedes the tangent-plane heuristic when armed:
+  // both answer "should this probe vote here", and the plane test is the
+  // approximation (it suppresses by GEOMETRY SIDE, LOS by measured occupancy —
+  // the plane test's Q9c corner-brightening came from suppressing probes the
+  // point could actually see). Armed only when the caller supplied the
+  // distance closure; a closure-less instance keeps the pre-U3 graph.
+  const losArmed = gatherLosWeight() && !!losOccupied && !!losWorld;
+  // The boot receipt the gate asserts (the §12.70 rule: identical-across-arms
+  // readings mean "same code path" until an armed line proves otherwise).
+  // SCREEN instances only (readPixel present): the closure-only secondary
+  // instance is EXPECTED to lack the distance closure and must not cry wolf.
+  if (readPixel && gatherLosWeight() && !losArmed) {
+    console.warn("[gi] gather: LOS validity requested but NOT armed — no distance closure at this screen instance");
+  } else if (readPixel && losArmed) {
+    console.info(`[gi] gather: LOS validity ARMED (voxel ${losWorld.minCellValue ?? losWorld.minCell?.value ?? "?"})`);
+  }
+  const nwExp = losArmed ? 0 : gatherNormalWeightExp();
+  const normalWeight = nwExp > 0;
+  // §13.9, shared with the CPU mirror through one reader.
+  //
+  // ⭐ AND IT IS A LIVE UNIFORM, NOT A BUILD CONSTANT (2026-08-23). Every
+  // cross-BOOT A/B on the user's Level is swamped: the plan's own method rule
+  // says this scene needs "N≥4 boots per arm with medians+spread, or a
+  // within-boot dial" because the healthy boot-to-boot spread is ~2×. A build
+  // constant forces the expensive option. As a uniform, one boot can render
+  // BOTH arms at the same pose, the same convergence state and the same GPU
+  // clock — a PAIRED comparison, which is the only kind this scene supports
+  // cheaply.
+  //
+  // The mix is over the WEIGHT PARAMETER only, so at 0 the graph evaluates the
+  // identical arithmetic the pre-uniform build did (`mix(t, s, 0) == t`), and
+  // the uniform defaults to the shared reader — so `test:gi-src-gather` still
+  // diffs the same configuration the CPU mirror is in. `__giGatherSmoothLive`
+  // pins it per frame for the paired probe.
+  const smoothWeights = gatherSmoothWeights();
+  const smoothU = uniform(smoothWeights ? 1 : 0);
+  /** §12.88's normal bias in metres — see `gatherAt`. Live, defaults to 0. */
+  const biasU = uniform(gatherNormalBias());
+  /**
+   * §12.89 — how much of the §15 U3 LOS suppression to apply, 0..1. Only
+   * meaningful when `losArmed` compiled the march in; 1 is the shipped armed
+   * behaviour and 0 is the identity. See the `mix` at the suppression site.
+   */
+  const losStrengthU = uniform(1);
 
   /**
    * THE GATHER. One world point, one normal, one irradiance.
@@ -182,10 +253,37 @@ export function createSrcScreenGather(store, tiles, {
    * Inlined at both call sites — the screen pass below and
    * `createGiResolve`'s exact-reflection hit — so there is one integral, not
    * two that happen to agree today.
+   *
+   * `sampleDir` (optional, §12.71b v2): the direction the tile taps are
+   * taken in, when it is not the surface normal — the glossy pass feeds the
+   * REFLECTION vector here. The normal keeps every other job it has: the
+   * lattice-side weighting (§13.7d's one-sided plane test asks "is this
+   * probe on my surface's side", a question about the SURFACE, not about
+   * the lobe being read) and the LOD stencil. When absent the tap direction
+   * IS the normal and the graph is byte-identical to what every gather gate
+   * measured.
    */
-  const gatherAt = (position, normal) => {
-    const P = vec3(position).toVar();
+  const gatherAt = (position, normal, sampleDir = null) => {
     const N = vec3(normal).normalize().toVar();
+    // ── §12.88: SAMPLE THE LATTICE FROM IN FRONT OF THE SURFACE ────────────
+    //
+    // `P` was the raw gbuffer position, so the four corners BEHIND the shaded
+    // face sat up to `s0` behind it — 0.45 m on the user's Level, against
+    // 0.25 m partition walls, i.e. squarely in the next room, voting at full
+    // trilinear weight with nothing to stop them (every geometric guard in this
+    // file is opt-in and off: the plane test, the LOS march, the C1 weights).
+    // Offsetting along the normal is geometric, not heuristic — the far corner
+    // reaches `s0 − β` past the surface, so the leak through a wall of
+    // thickness `w` is exactly zero once `β > s0 − w`.
+    //
+    // ⚠ A LIVE UNIFORM AND ZERO BY DEFAULT. Zero reproduces the pre-§12.88
+    // graph exactly (`P = position`), so every gather gate measures what it
+    // always did; the uniform is what lets one boot sweep β at one pose, which
+    // is the only A/B this scene supports. `gatherNormalBias()` is the shared
+    // reader — the CPU mirror reads it too, or the twin diff would call an
+    // armed default a regression.
+    const P = vec3(position).add(N.mul(biasU)).toVar();
+    const S = sampleDir ? vec3(sampleDir).normalize().toVar() : N;
     const lodF = lodAtDistance(chebyshev(P, camera), spacing0, maxLods).toVar();
     // The bias is RE-CLAMPED to the same window `lodAtDistance` returns. A
     // negative bias would otherwise select a lattice finer than any the
@@ -203,6 +301,17 @@ export function createSrcScreenGather(store, tiles, {
     const out = vec3(0).toVar();
     const shellTotal = float(0).toVar();
     const cornersHit = uint(0).toVar();
+    const cornersCovered = uint(0).toVar();
+
+    // §15 U3 — LOS shared pieces, hoisted: the march start is the shaded point
+    // lifted ONE OCCUPANCY VOXEL off its surface, so samples hugging the own
+    // wall read a free radius ≈ the lift and pass the tight threshold below —
+    // the hugging-ray false positive is excluded by GEOMETRY, not by a plane
+    // heuristic. `losMinCell` is the occupancy voxel scale (world.cell mirrors
+    // occField.voxel), which is what makes every threshold voxel-relative and
+    // resolution-independent.
+    const losMinCell = losArmed ? float(losWorld.minCell).toVar() : null;
+    const losStart = losArmed ? P.add(N.mul(losMinCell)).toVar() : null;
 
     /** One LOD shell's sparse-trilinear, coverage-weighted gather. */
     const shell = (lod, shellWeight) => {
@@ -211,6 +320,16 @@ export function createSrcScreenGather(store, tiles, {
       const f = P.sub(origin).div(s).toVar();
       const cell0 = floor(f).toVar();
       const t = f.sub(cell0).toVar();
+      // §13.9 — C1 ACROSS CELL FACES. Plain trilinear steps its GRADIENT at
+      // every face, and a gradient step is a visible line. `3t²−2t³` has zero
+      // derivative at t=0 and t=1, so the two cells sharing a face agree on
+      // the slope as well as the value. `cell0` and the corner KEYS are
+      // untouched — this reshapes the weights only, so the population, the
+      // hash and the coverage renormalization are all exactly as before.
+      // `mix(t, 3t²−2t³, smoothU)`: at 0 this is bit-identical to the C0
+      // weights, at 1 it is §13.9's C1 weights, and in between it is a live
+      // dial — see `smoothU`'s note above for why a dial and not a constant.
+      t.assign(mix(t, t.mul(t).mul(float(3).sub(t.mul(2))), smoothU));
       // ── S1: THE CORNER KEYS MUST BE IN THE SAME COORDINATE SYSTEM THE
       // POPULATION WROTE ────────────────────────────────────────────────────
       //
@@ -257,10 +376,69 @@ export function createSrcScreenGather(store, tiles, {
         // renormalization below then divides by what actually contributed, so
         // a surface with every probe behind it goes DARK rather than BLACK.
         if (normalWeight) {
-          const toProbe = origin.add(cell0.add(vec3(dx, dy, dz)).mul(s)).sub(P).toVar();
-          const facing = toProbe.normalize().dot(N).mul(0.5).add(0.5).max(0).toVar();
-          const shaped = nwExp === 2 ? facing.mul(facing) : facing.pow(float(nwExp));
+          // §14 Q9c: ONE-SIDED over SIGNED PLANE DISTANCE — third form, and
+          // the geometry says this one is lattice-silent. The DDGI direction
+          // wrap modulated FRONT probes (grid DOTS); the one-sided DIRECTION
+          // cosine fixed that but still varied with the pixel's LATERAL
+          // offset to each behind-probe (cos = −b/√(b²+lat²)), which beats
+          // at the lattice period as soft SQUARES — both were the same
+          // mistake: weighting by a quantity that changes as the pixel
+          // slides along its own flat wall. The signed plane distance
+          // `(probe − P)·N` does not: in-plane motion leaves it untouched,
+          // so on a flat wall every corner's weight is a constant and the
+          // gather is pure (weighted) trilinear — no pattern, by
+          // construction. Probes deeper than 0.35·spacing behind the
+          // tangent plane fade to the 1e-3 floor (wsum stays alive; a
+          // surface with every probe behind it goes DARK, not black).
+          const pd = origin.add(cell0.add(vec3(dx, dy, dz)).mul(s)).sub(P).dot(N).toVar();
+          const t = pd.div(s.mul(0.35)).add(1).clamp(0, 1).toVar();
+          const oneSided = t.mul(t).mul(float(3).sub(t.mul(2))).toVar();
+          const shaped = nwExp === 1 ? oneSided : oneSided.pow(float(nwExp));
           weight.mulAssign(shaped.max(1e-3));
+        }
+        // ── §15 U3: THE PROBE MUST SEE THE POINT ───────────────────────────
+        //
+        // Four samples along lifted-P → probe, each ONE occupancy-bit fetch:
+        // a sample inside geometry (a wall's interior — conservative
+        // voxelization bulges ~a voxel, so even a 10 cm partition holds a
+        // sample) collapses the corner's weight. The hugging-ray false
+        // positive is excluded by GEOMETRY, not by a threshold: the start is
+        // lifted one voxel off the surface, so a sample skimming the own
+        // wall sits in a FREE voxel. t stops at 0.85 so a probe hugging its
+        // own surface is not convicted by its own voxel.
+        //
+        // The suppression is RELATIVE by construction: acc and wsum carry the
+        // same factor, so a uniformly-suppressed point renormalizes back to
+        // the blocked probes' mean (R1 — an absence is never a dark vote);
+        // only the RATIO between visible and blocked corners moves, which is
+        // exactly "the field answers from probes on this side of the wall".
+        if (losArmed) {
+          const probePos = origin.add(cell0.add(vec3(dx, dy, dz)).mul(s)).toVar();
+          const seg = probePos.sub(losStart).toVar();
+          const LOS_TS = [0.25, 0.45, 0.65, 0.85];
+          const blocked = float(0).toVar();
+          for (const tf of LOS_TS) {
+            const x = losStart.add(seg.mul(tf));
+            // Per-sample shoulder (LOS_OCC_LO), then the PATH shoulder over
+            // their mean (LOS_PATH_LO) — see both in srcMath. Hand-rolled
+            // smootherstep rather than importing `smoothstep`, matching the
+            // plane weight twenty lines up.
+            const t = float(losOccupied(x)).sub(LOS_OCC_LO)
+              .div(LOS_OCC_HI - LOS_OCC_LO).clamp(0, 1).toVar();
+            blocked.addAssign(t.mul(t).mul(float(3).sub(t.mul(2))));
+          }
+          const b = blocked.div(LOS_TS.length).sub(LOS_PATH_LO)
+            .div(LOS_PATH_HI - LOS_PATH_LO).clamp(0, 1).toVar();
+          const vis = float(1).sub(b.mul(b).mul(float(3).sub(b.mul(2)))).toVar();
+          // ⭐ STRENGTH IS A LIVE UNIFORM (§12.89, 2026-08-24), so ONE boot can
+          // sweep the guard at ONE pose on a converged field. `losArmed` is a
+          // BUILD flag — it compiles the march in or out — so it could only
+          // ever be A/B'd across boots, and this scene's boot-to-boot spread is
+          // ~2×, which is wider than any effect worth measuring. At strength 0
+          // the suppression is the identity and the arm is the unguarded
+          // baseline WITH the march's cost still paid, which is the honest
+          // control: it prices the guard and its effect separately.
+          weight.mulAssign(mix(float(1), vis.max(1e-3), losStrengthU));
         }
         If(weight.greaterThan(0), () => {
           // `secondary` is 0: the multibounce cache is Phase 5's caller, not a
@@ -274,10 +452,14 @@ export function createSrcScreenGather(store, tiles, {
             // ONE hardware-bilinear tap. rgb is `Σ w_tap·E` over the covered
             // taps and a is `Σ w_tap` over the same ones — see the header on
             // why both ride the accumulation instead of dividing here.
-            const tap = tiles.sampleTileRGBA(block, N).toVar();
+            const tap = tiles.sampleTileRGBA(block, S).toVar();
             acc.addAssign(tap.xyz.mul(weight));
             wsum.addAssign(tap.w.mul(weight));
             cornersHit.addAssign(uint(1));
+            // The corner EXISTS (above) vs the corner VOTES (here) — see
+            // GG_COVERED's header for why the difference is the whole
+            // block-vs-thin-lattice question.
+            If(tap.w.greaterThan(0), () => { cornersCovered.addAssign(uint(1)); });
           });
         });
       }
@@ -305,7 +487,12 @@ export function createSrcScreenGather(store, tiles, {
     // find some carries full weight. Same renormalize-don't-zero rule, one
     // level up from the corners.
     If(shellTotal.greaterThan(0), () => { out.assign(out.div(shellTotal)); });
-    return { irradiance: out, corners: cornersHit };
+    // `known` (2026-08-22, the black-rectangle fix): whether ANY coverage was
+    // found. A point with none returns irradiance 0 — which is an ABSENCE,
+    // not a measurement of darkness — and every consumer that renders it as
+    // black is violating R1 at the display. The screen pass carries this in
+    // the target's alpha so the temporal filter can hold history instead.
+    return { irradiance: out, corners: cornersHit, covered: cornersCovered, known: shellTotal.greaterThan(0) };
   };
 
   // CLOSURE-ONLY, and the header's first section is the whole argument for it:
@@ -337,6 +524,11 @@ export function createSrcScreenGather(store, tiles, {
     const i = instanceIndex.toVar();
     const coord = ivec2(i.mod(uint(widthU)).toInt(), i.div(uint(widthU)).toInt());
     const E = vec3(0).toVar();
+    // Validity rides the ALPHA: 1 where the gather found coverage, 0 where it
+    // found nothing (no probes, no known bins — the resolve and the temporal
+    // filter must treat that as "unknown", never as "black"). Background
+    // pixels stay 0 too, which nothing samples.
+    const known = float(0).toVar();
     const px = readPixel(i);
     If(px.valid, () => {
       atomicAdd(stats.element(uint(GG_PIXELS)), uint(1));
@@ -345,7 +537,9 @@ export function createSrcScreenGather(store, tiles, {
       // along, so the hemisphere this reads is the hemisphere that was filled.
       const g = gatherAt(px.position, px.normal);
       E.assign(g.irradiance);
+      known.assign(select(g.known, float(1), float(0)));
       atomicAdd(stats.element(uint(GG_CORNERS)), g.corners);
+      atomicAdd(stats.element(uint(GG_COVERED)), g.covered);
       If(g.corners.equal(uint(0)), () => {
         atomicAdd(stats.element(uint(GG_EMPTY)), uint(1));
       });
@@ -358,7 +552,7 @@ export function createSrcScreenGather(store, tiles, {
         atomicMax(stats.element(uint(GG_MAX)), fx);
       });
     });
-    textureStore(target, coord, vec4(E, 1));
+    textureStore(target, coord, vec4(E, known));
   })().compute(width * height);
 
   return {
@@ -368,6 +562,19 @@ export function createSrcScreenGather(store, tiles, {
     compute,
     target,
     stats,
+    /**
+     * §13.9's C0↔C1 weight dial, live. GISystem pushes `__giGatherSmoothLive`
+     * into it each frame when that global is set, so a probe can render both
+     * arms in ONE boot at ONE pose — the within-boot dial the plan's method
+     * rule asks for on this scene. Unset, it holds the shared reader's value.
+     */
+    smoothWeights: smoothU,
+    /** §12.88's normal bias, live — `__giGatherNormalBiasLive` pins it. */
+    normalBias: biasU,
+    /** §12.89's LOS suppression strength, live — `__giGatherLosLive` pins it. */
+    losStrength: losStrengthU,
+    /** Whether the LOS march was compiled in at all (a BUILD decision). */
+    losArmed,
     /** The resolve's primary-diffuse input: one texture load, no storage bindings. */
     node: texture(target),
     width,
@@ -395,6 +602,12 @@ export function createSrcScreenGather(store, tiles, {
         // trilinear stencil wants and the renormalization is carrying the
         // result — which is legal, and worth seeing.
         meanCorners: pixels > 0 ? (v[GG_CORNERS] >>> 0) / pixels : 0,
+        // The corners that actually VOTED. `meanCorners` counts corners with a
+        // block; this counts corners whose tile knew this direction. A large
+        // gap between the two means the lattice is present but SILENT, and the
+        // renormalisation is handing whole cells the answer of one probe —
+        // which is a flat plateau the width of a cell. See GG_COVERED.
+        meanCovered: pixels > 0 ? (v[GG_COVERED] >>> 0) / pixels : 0,
         meanLum: lit > 0 ? (v[GG_SUM] >>> 0) / lit / LUM_FIXED : 0,
         minLum: min,
         maxLum: max,
@@ -416,7 +629,99 @@ export function createSrcScreenGather(store, tiles, {
 /** The per-frame gather line, for the telemetry log. */
 export function formatSrcGather(g) {
   if (!g?.dispatched) return "";
-  return `gather ${g.lit}/${g.pixels} lit (${g.meanCorners.toFixed(1)} corners` +
+  return `gather ${g.lit}/${g.pixels} lit (${g.meanCorners.toFixed(1)} corners, ` +
+    `${(g.meanCovered ?? 0).toFixed(1)} COVERED` +
     (g.empty ? `, ${g.empty} EMPTY` : "") +
     `), E ${g.minLum.toFixed(3)}..${g.maxLum.toFixed(3)} mean ${g.meanLum.toFixed(3)}`;
+}
+
+/**
+ * THE GLOSSY GATHER (§12.71b v2) — the diffuse pass's integral, fed the
+ * REFLECTION vector, at half the gather's resolution.
+ *
+ * §12.71b established that `sampleTileRGBA(block, dir)` along the reflected
+ * ray IS the cosine-lobe-blurred environment term giLight's specular slot
+ * wants — and then shipped opt-in, because its first form inlined the lookup
+ * into the resolve at RESOLVE res with no temporal pass behind it: raw
+ * single-bin probe noise on every glossy pixel ("flickering white blobs on
+ * the metallic embroidery"). This pass is the affordable form of the same
+ * integral:
+ *
+ *   · its OWN half-res grid — a glossy lobe is already an angular blur, so a
+ *     2× spatial carrier is far below what the signal can represent (the same
+ *     argument the diffuse gather's SRC_GATHER_SCALE note makes, without the
+ *     silhouette objection: giLight blends the exact-BVH hit over this on
+ *     mirror pixels, which is where silhouettes matter);
+ *   · a LUMINANCE CAP at the write (`__giGlossyCap` pins the uniform) — the
+ *     firefly clamp that keeps one hot bin from becoming a white blob the
+ *     temporal filter would then smear;
+ *   · TWO outputs, `target` + `raw`, the §12.65 fail-safe topology verbatim:
+ *     GISystem runs the radiance temporal filter raw → target, and a filter
+ *     whose pipeline never lands degrades to this pass's un-filtered write
+ *     instead of a black specular term.
+ *
+ * The de-duplication worry from §12.71b's ledger is answered by R5, not by
+ * code here: tree/NEE emitters' FIELD emission is zeroed at bake time, so the
+ * bins this reads carry lit surfaces, not the emitter disks the resolve's
+ * emitter-direct term already delivers.
+ *
+ * The hist pair lives here (not in giScreen's targets) because it must match
+ * THIS pass's grid and lifetime — a srcProbes rebuild replaces the whole
+ * chain, and specular history is cheap to re-earn.
+ */
+export function createSrcGlossyGather(gatherAt, { readPixel, width, height, camera, cap = 6 }) {
+  const mkTex = (name, type) => {
+    const t = new THREE.StorageTexture(width, height);
+    t.type = type;
+    t.name = name;
+    t.version = (globalThis.__giSrcTargetVersion = (globalThis.__giSrcTargetVersion ?? 0) + 1);
+    return t;
+  };
+  const target = mkTex("giSrcGlossy", THREE.HalfFloatType);
+  const raw = mkTex("giSrcGlossyRaw", THREE.HalfFloatType);
+  const hist = mkTex("giSrcGlossyHist", THREE.HalfFloatType);
+  const histPos = mkTex("giSrcGlossyHistPos", THREE.FloatType);
+  const capU = uniform(cap);
+  const widthU = width;
+
+  const compute = Fn(() => {
+    const i = instanceIndex.toVar();
+    const coord = ivec2(i.mod(uint(widthU)).toInt(), i.div(uint(widthU)).toInt());
+    const E = vec3(0).toVar();
+    const px = readPixel(i);
+    If(px.valid, () => {
+      const P = vec3(px.position).toVar();
+      // Already camera-faced by readPixel — the same hemisphere the bins
+      // were filled along.
+      const N = vec3(px.normal).toVar();
+      const R = reflect(P.sub(vec3(camera)).normalize(), N).toVar();
+      // ÷π: cosine-hemisphere irradiance → the outgoing-radiance scale the
+      // specular slot multiplies by F (§12.71b's convention, unchanged).
+      E.assign(vec3(gatherAt(P, N, R).irradiance).mul(1 / Math.PI));
+      // The firefly clamp — soft luminance cap, hue-preserving.
+      const lum = E.x.mul(0.2126).add(E.y.mul(0.7152)).add(E.z.mul(0.0722)).toVar();
+      E.mulAssign(float(capU).div(lum.max(capU)));
+    });
+    textureStore(target, coord, vec4(E, 1));
+    textureStore(raw, coord, vec4(E, 1));
+  })().compute(width * height);
+
+  return {
+    compute,
+    target,
+    raw,
+    hist,
+    histPos,
+    /** The resolve's glossy input: one texture sample, no storage bindings. */
+    node: texture(target),
+    cap: capU,
+    width,
+    height,
+    dispose() {
+      target.dispose?.();
+      raw.dispose?.();
+      hist.dispose?.();
+      histPos.dispose?.();
+    },
+  };
 }

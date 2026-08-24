@@ -161,6 +161,79 @@ export function refSphereAt(P, N, c, r) {
   return refSphereFactor(cosTheta, sinR);
 }
 
+/**
+ * ONE PLANAR EMITTING QUAD'S EXACT LAMBERT FORM FACTOR, CLIPPED TO THE
+ * RECEIVER'S HORIZON — the scalar twin of giLight.js's `polyHorizonFactor`.
+ *
+ * `verts` are the four corners as vectors FROM the receiver, unnormalized and
+ * in winding order. The contour formula (Baum et al.) integrates the whole
+ * polygon whether or not the receiver can see all of it, and the part below
+ * the tangent plane integrates NEGATIVELY. The previous version answered that
+ * with `max(faceSum, 0)` on the face TOTAL, which is only right when the face
+ * is entirely below the horizon.
+ *
+ * ⚠ WHEN IT IS NOT RIGHT IT RETURNS ZERO FOR A FACE THAT IS HALF VISIBLE, and
+ * that is the user's 2026-08-20 report: "the emitters do not light surfaces if
+ * their meshes overlap with them; move the emitter to the side and they start
+ * emitting". Overlap is exactly the configuration that puts a receiver BETWEEN
+ * a box's two opposing face planes, so the visible faces straddle its horizon
+ * and every one of them clamped away. Measured against the brute-force MC
+ * arbiter, a pillar face 0.05 m from a straddling emissive box read **0.000 of
+ * a true 3.06** — and 0.14x to 0.58x through the whole transition band — then
+ * snapped to 1.00x the moment the box cleared the receiver's plane. A hard
+ * discontinuity in what is physically a smooth field, which is why it read as
+ * "no light at all" rather than "a bit dim".
+ *
+ * So: CLIP FIRST, INTEGRATE SECOND. Sutherland-Hodgman against
+ * `dot(v, N) = 0` in LINEAR space (the intersection of an edge with a plane is
+ * linear; the same point on the unit sphere is not, so normalizing before the
+ * clip would bend every cut edge), then the same contour sum over what
+ * survives. Restores 0.99-1.01x of MC across the entire sweep, overlap
+ * included. `max(0)` stays as a floating-point floor only — after clipping,
+ * every surviving vertex is on or above the tangent plane, so the sum cannot
+ * be meaningfully negative.
+ */
+function clippedPolyFactor(N, verts) {
+  // At most 5 vertices survive a plane cut of a quad. `__giPolyHorizonClip =
+  // false` is the A/B arm — the pre-fix behaviour, kept so the TSL twin's
+  // hatch has a scalar mirror and the gate can measure both.
+  const clip = globalThis.__giPolyHorizonClip !== false;
+  const poly = [];
+  for (let i = 0; i < verts.length; i++) {
+    const a = verts[i];
+    const b = verts[(i + 1) % verts.length];
+    if (!clip) { poly.push(a); continue; }
+    const da = a[0] * N[0] + a[1] * N[1] + a[2] * N[2];
+    const db = b[0] * N[0] + b[1] * N[1] + b[2] * N[2];
+    if (da >= 0) poly.push(a);
+    if ((da >= 0) !== (db >= 0)) {
+      const t = da / (da - db);
+      poly.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), a[2] + t * (b[2] - a[2])]);
+    }
+  }
+  if (poly.length < 3) return 0;
+  // COPY, never normalize in place: `poly` holds references to the caller's
+  // corner scratch for every vertex that survived uncut, and scaling those
+  // would hand the next face a unit-length quad.
+  for (let i = 0; i < poly.length; i++) {
+    const p = poly[i];
+    const l = Math.hypot(p[0], p[1], p[2]) || 1;
+    poly[i] = [p[0] / l, p[1] / l, p[2] / l];
+  }
+  let sum = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const cx = a[1] * b[2] - a[2] * b[1];
+    const cy = a[2] * b[0] - a[0] * b[2];
+    const cz = a[0] * b[1] - a[1] * b[0];
+    const cl = Math.max(Math.hypot(cx, cy, cz), 1e-9);
+    const d = clamp(a[0] * b[0] + a[1] * b[1] + a[2] * b[2], -1, 1);
+    sum += Math.acos(d) * ((cx * N[0] + cy * N[1] + cz * N[2]) / cl);
+  }
+  return Math.max(0.5 * sum, 0);
+}
+
 /** Mirror of giLight.js boxLightFactor (exact Lambert contour per face). */
 export function refBoxFactor(P, N, center, half, bx, by, bz) {
   const faces = [
@@ -172,31 +245,22 @@ export function refBoxFactor(P, N, center, half, bx, by, bz) {
     [[-bz[0], -bz[1], -bz[2]], half[2], by, half[1], bx, half[0]],
   ];
   let F = 0;
-  const u = [0, 0, 0], v0 = [0, 0, 0], v1 = [0, 0, 0], v2 = [0, 0, 0], v3 = [0, 0, 0];
+  const v0 = [0, 0, 0], v1 = [0, 0, 0], v2 = [0, 0, 0], v3 = [0, 0, 0];
   for (const [w, hw, euAxis, hu, evAxis, hv] of faces) {
     const fc = [center[0] + w[0] * hw, center[1] + w[1] * hw, center[2] + w[2] * hw];
     const facing = (P[0] - fc[0]) * w[0] + (P[1] - fc[1]) * w[1] + (P[2] - fc[2]) * w[2];
     if (facing <= 1e-4) continue;
     const eu = [euAxis[0] * hu, euAxis[1] * hu, euAxis[2] * hu];
     const ev = [evAxis[0] * hv, evAxis[1] * hv, evAxis[2] * hv];
+    // UNNORMALIZED, deliberately — `clippedPolyFactor` cuts in linear space and
+    // normalizes after (see its header).
     const corner = (out, su, sv) => {
       out[0] = fc[0] + su * eu[0] + sv * ev[0] - P[0];
       out[1] = fc[1] + su * eu[1] + sv * ev[1] - P[1];
       out[2] = fc[2] + su * eu[2] + sv * ev[2] - P[2];
-      const len = Math.hypot(out[0], out[1], out[2]) || 1;
-      out[0] /= len; out[1] /= len; out[2] /= len;
     };
     corner(v0, 1, 1); corner(v1, 1, -1); corner(v2, -1, -1); corner(v3, -1, 1);
-    const edge = (a, b) => {
-      u[0] = a[1] * b[2] - a[2] * b[1];
-      u[1] = a[2] * b[0] - a[0] * b[2];
-      u[2] = a[0] * b[1] - a[1] * b[0];
-      const cl = Math.max(Math.hypot(u[0], u[1], u[2]), 1e-6);
-      const dot = clamp(a[0] * b[0] + a[1] * b[1] + a[2] * b[2], -1, 1);
-      return Math.acos(dot) * ((u[0] * N[0] + u[1] * N[1] + u[2] * N[2]) / cl);
-    };
-    const faceSum = 0.5 * (edge(v0, v1) + edge(v1, v2) + edge(v2, v3) + edge(v3, v0));
-    F += Math.max(faceSum, 0);
+    F += clippedPolyFactor(N, [v0, v1, v2, v3]);
   }
   return F;
 }

@@ -37,7 +37,8 @@ import * as THREE from "three/webgpu";
 import { cameraPosition, float, instanceIndex, positionLocal, select, uint, vec3, vec4 } from "three/tsl";
 import { MAX_LODS } from "./srcConfig.js";
 import { FLAG_ALIVE, FLAG_FRESH, PROBE_FLAGS, PROBE_KEY, PROBE_WORDS } from "./srcProbes.js";
-import { cellPosition, keyCell, keyLod, latticeOrigin, probeSpacing } from "./srcMathTsl.js";
+import { cellPosition, keyCell, keyLod, keyWorldCell, latticeOrigin, probeSpacing } from "./srcMathTsl.js";
+import { worldKeysEnabled } from "./srcMath.js";
 
 /**
  * Sphere radius as a fraction of the probe's own spacing.
@@ -119,7 +120,13 @@ export function createSrcProbeGizmos(store, { spacing0, anchor, detail = 0 } = {
         spacing: s,
         alive: flags.bitAnd(uint(FLAG_ALIVE)).notEqual(uint(0)),
         fresh: flags.bitAnd(uint(FLAG_FRESH)).notEqual(uint(0)),
-        centre: cellPosition(keyCell(key), latticeOrigin(anchor, s), s).toVar(),
+        // World-absolute keys hold residues — resolve against the camera
+        // (keyWorldCell's contract) and a world cell's position is cell × s,
+        // origin zero. Anchor-relative keeps the origin-based decode. A JS
+        // branch: the flag is fixed for the life of the compiled material.
+        centre: (worldKeysEnabled()
+          ? vec3(keyWorldCell(key, cameraPosition, s)).mul(s)
+          : cellPosition(keyCell(key), latticeOrigin(anchor, s), s)).toVar(),
       };
     };
 

@@ -125,6 +125,7 @@ import {
   atomicAdd,
   atomicLoad,
   atomicMax,
+  atomicStore,
   float,
   instanceIndex,
   select,
@@ -138,6 +139,10 @@ import {
   BIN_B,
   BIN_G,
   BIN_R,
+  BIN_SB,
+  BIN_SG,
+  BIN_SN,
+  BIN_SR,
   DEPOSIT_SCALE,
   SEC_EMITTER,
   SEC_HIT_WORDS,
@@ -153,7 +158,10 @@ import {
   STAT_SECONDARY,
   STAT_SEC_CLAMPED,
   STAT_SEC_OVERFLOW,
+  STAT_SUN_FACING,
+  STAT_SUN_SHADED,
 } from "./srcDeposit.js";
+import { packNormal } from "./srcMathTsl.js";
 import { SLOT_EMPTY } from "./srcProbes.js";
 import { createSrcScreenGather } from "./srcScreenGather.js";
 
@@ -210,6 +218,12 @@ export function createSrcSecondaryFrame(store, bins, {
   lodBias = null,
   maxLods = MAX_LODS,
   w0 = W0,
+  // §15 U3 — the LOS validity closure, threaded to the hit gather below. A
+  // validity-blind gather HERE is the through-wall leak's main artery: it
+  // shades ray hits, and what it mis-gathers is DEPOSITED into the room's
+  // own bins where no screen-side weight can reach it.
+  losOccupied = null,
+  losWorld = null,
   surprise = null,
   capacity = 0,
 } = {}) {
@@ -265,6 +279,7 @@ export function createSrcSecondaryFrame(store, bins, {
   const gather = bounce
     ? createSrcScreenGather(store, tiles, {
         lookup, spacing0, camera, anchor, maxLods, w0, lodBias: lodBiasU,
+        losOccupied, losWorld,
       })
     : null;
 
@@ -296,7 +311,13 @@ export function createSrcSecondaryFrame(store, bins, {
     // Le' + ρ/π · Σ_lights, with the visibility marcher, the rolled light slots
     // and the NEE emitter set — the whole of what used to be inlined into [E]'s
     // ray loop, compiled ONCE here.
-    const Ld = vec3(shade(P, n, rho, Le, emitter, rayIndex)).toVar();
+    // §12.82 split the return in two: `L` is everything EXCEPT the sun, and
+    // `sunTransfer` is the sun's `ρ/π · V` with the cosine and the irradiance
+    // deliberately left out for `[F]` to supply from the CURRENT angle.
+    const shaded = shade(P, n, rho, Le, emitter, rayIndex);
+    const Ld = vec3(shaded.L).toVar();
+    const sunTransfer = shaded.sunTransfer;
+    const sunFacing = shaded.sunFacing;
 
     // ── THE BOUNCE ─────────────────────────────────────────────────────────
     //
@@ -326,6 +347,65 @@ export function createSrcSecondaryFrame(store, bins, {
     atomicAdd(scratch.element(slot.add(uint(BIN_R))), fx[0]);
     atomicAdd(scratch.element(slot.add(uint(BIN_G))), fx[1]);
     atomicAdd(scratch.element(slot.add(uint(BIN_B))), fx[2]);
+
+    // ── §12.82: THE SUN'S CACHE, BESIDE THE RADIANCE IT WAS TAKEN OUT OF ────
+    //
+    // Same slot, same frame, same `BIN_COUNT` — the transfer is normalized by
+    // the identical weight, so `ΣS/Σcount` is an exponentially-weighted mean
+    // over RAYS exactly as `ΣR/Σcount` is, and a bin whose transfer and
+    // radiance came from different numbers of samples cannot arise.
+    //
+    // ⚠ THE SCALE IS NOT `lmax`. `ρ/π · V` is a REFLECTANCE, bounded by 1/π,
+    // and dividing it by a radiance ceiling would throw away five bits of it
+    // for nothing. `DEPOSIT_SCALE` per unit, `count` in the same units, scales
+    // cancel — the same argument the resolve's `toL` note makes, one term over.
+    //
+    // ⚠ AND THE NORMAL IS **STORED**, NOT ADDED. Three threads scattering into
+    // one bin race here and the last writer wins, which is the intended
+    // semantics: a normal is a representative direction, not a measurement to
+    // be averaged, and `atomicAdd` on a packed pair of bit-fields would carry
+    // between the fields and produce a direction no surface in the scene has.
+    if (sunTransfer) {
+      const st = vec3(sunTransfer).toVar();
+      // The HIT-side rate — see `STAT_SUN_FACING`. Counted for every shaded
+      // hit, facing or not, so the ratio has a denominator that means something.
+      atomicAdd(stats.element(uint(STAT_SUN_SHADED)), uint(1));
+      atomicAdd(stats.element(uint(STAT_SUN_FACING)), select(float(sunFacing).greaterThan(0), uint(1), uint(0)));
+      atomicAdd(
+        scratch.element(slot.add(uint(BIN_SR))),
+        st.x.clamp(0, 1).mul(DEPOSIT_SCALE).add(0.5).floor().toUint(),
+      );
+      atomicAdd(
+        scratch.element(slot.add(uint(BIN_SG))),
+        st.y.clamp(0, 1).mul(DEPOSIT_SCALE).add(0.5).floor().toUint(),
+      );
+      atomicAdd(
+        scratch.element(slot.add(uint(BIN_SB))),
+        st.z.clamp(0, 1).mul(DEPOSIT_SCALE).add(0.5).floor().toUint(),
+      );
+      // ⚠⚠ **ONLY A SUN-FACING HIT MAY WRITE THE NORMAL, AND THIS COST 44% OF
+      // THE PICTURE TO LEARN.** One word holds one normal for a whole bin, last
+      // write wins — so an AVERTED hit's normal landing here makes `[F]`'s
+      // `max(0, n̂·l)` zero and silences the transfer that the bin's sun-facing
+      // hits accumulated over many frames. Measured on the user's Level: leg0
+      // tail luma 0.039 → 0.022, leg1 0.245 → 0.193, and `checker` got WORSE
+      // (leg1 0.0305 → 0.0557, rising rather than settling) because which
+      // normal won flipped frame to frame.
+      //
+      // Gated, the split is unbiased across the two populations: an averted hit
+      // deposits a ZERO transfer and still counts in `BIN_COUNT`, so a bin that
+      // is half averted delivers half the sun — the right answer — while the
+      // normal describes the half that actually transfers.
+      //
+      // The FACE-FORWARDED normal — `[E]`'s `createSrcHitAttribution` already
+      // flipped it against the ray (§12.26.4) and wrote that one to `SEC_N`, so
+      // this is the same normal the shading used and the cosine `[F]` computes
+      // is the cosine the deposit would have computed. Reading the unflipped
+      // record normal here would light the far face of every wall.
+      If(float(sunFacing).greaterThan(0), () => {
+        atomicStore(scratch.element(slot.add(uint(BIN_SN))), packNormal(n));
+      });
+    }
 
     // ── §12.52's per-block evidence, the LUMA half ──────────────────────────
     //

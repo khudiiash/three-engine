@@ -4,7 +4,9 @@ import { GI_QUALITY_LEVELS } from "./giConfig.js";
 /**
  * Global Illumination via Split Radiance Cascades.
  *
- * ONE PROPERTY. `quality`, and nothing else.
+ * THREE PROPERTIES: `quality`, and the `ao`/`reflections` feature toggles
+ * (2026-08-21). The toggles are quality's kin, not the 27's return — see the
+ * note on `defaults`.
  *
  * ══ WHY, BECAUSE THIS COMPONENT USED TO HAVE 27 ════════════════════════════
  *
@@ -53,6 +55,14 @@ export class GlobalIlluminationComponent extends Component {
     // everywhere, and the tier ladder is only meaningful if the middle of it is
     // where people start.
     quality: "medium",
+    // The two feature toggles (2026-08-21). They survive the one-knob
+    // doctrine because they are the same KIND of property quality is: each
+    // removes a whole term at a whole cost — Ambient Occlusion is the
+    // contact-darkening pass on the indirect term, Reflections is the glossy
+    // radiance chain plus ultra's exact mirrors — and neither can mis-TUNE
+    // anything, which is the failure the 27-property collapse was aimed at.
+    ao: true,
+    reflections: true,
   };
 
   static schema = [
@@ -63,6 +73,8 @@ export class GlobalIlluminationComponent extends Component {
     // old scene storing "custom" resolves to the default tier (giConfig's
     // `giQualityTier`).
     { key: "quality", label: "Quality", type: "select", options: [...GI_QUALITY_LEVELS] },
+    { key: "ao", label: "Ambient Occlusion", type: "boolean" },
+    { key: "reflections", label: "Reflections", type: "boolean" },
   ];
 
   get #system() {
@@ -96,10 +108,10 @@ export class GlobalIlluminationComponent extends Component {
     seen.add(signature);
     console.warn(
       `[gi] ignoring ${retired.length} retired propert${retired.length === 1 ? "y" : "ies"}: ` +
-      `${retired.join(", ")}. Global Illumination has ONE property now — quality — and ` +
-      "everything else is derived from it (src/modules/gi/giConfig.js). Sky light comes from " +
-      "the scene's environment; the debug view is globalThis.__giDebugView; a probe that must " +
-      "force a value uses globalThis.__giConfigOverride. Stored values drop on the next save.",
+      `${retired.join(", ")}. Global Illumination has THREE properties — quality, ao, ` +
+      "reflections — and everything else is derived (src/modules/gi/giConfig.js). Sky light " +
+      "comes from the scene's environment; the debug view is globalThis.__giDebugView; a probe " +
+      "that must force a value uses globalThis.__giConfigOverride. Stored values drop on the next save.",
     );
   }
 

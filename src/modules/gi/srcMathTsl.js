@@ -80,7 +80,7 @@ import {
   R2_HALF_FX,
   worldKeysEnabled,
 } from "./srcMath.js";
-import { KEY_MAX_LODS, LOD0_REACH, LOD_OVERLAP, MAX_LODS, R0_OVER_S0, GAMMA } from "./srcConfig.js";
+import { KEY_MAX_LODS, LOD_OVERLAP, MAX_LODS, R0_OVER_S0, GAMMA, lod0Reach } from "./srcConfig.js";
 
 const TAU = Math.PI * 2;
 
@@ -443,7 +443,7 @@ export function probeSpacing(cascade, lod, spacing0) {
  * from the probe's own key.
  */
 export function lodOuterRadius(lod, spacing0) {
-  return float(spacing0).mul(LOD0_REACH).mul(float(lod).add(1).exp2());
+  return float(spacing0).mul(lod0Reach()).mul(float(lod).add(1).exp2());
 }
 
 /**
@@ -581,7 +581,7 @@ export function lodAtDistance(cheb, spacing0, maxLods = MAX_LODS) {
   // multiply this line introduces cannot make the twins drift — see the
   // constant's own note in srcConfig. The order matters and is the mirror's:
   // scale FIRST, then floor at 1e-6, then divide.
-  const ratio = float(cheb).div(float(spacing0).mul(LOD0_REACH).max(1e-6)).toVar();
+  const ratio = float(cheb).div(float(spacing0).mul(lod0Reach()).max(1e-6)).toVar();
   return select(
     ratio.greaterThan(1),
     log2(ratio).clamp(0, maxLods - 1),
@@ -670,6 +670,53 @@ export function octahedralTexelWeight(d) {
   const s = vec3(d).abs().toVar();
   const t = s.x.add(s.y).add(s.z).toVar();
   return t.mul(t).mul(t);
+}
+
+// ══════════════════════════════════ §12.82 — A HIT NORMAL IN ONE WORD
+//
+// The sun split caches each bin's hit normal so `[F]` can close `max(0, n̂·l)`
+// against the CURRENT sun instead of against whatever the sun was doing when
+// the ray landed. One word, because three would not fit — `srcDeposit.js`'s
+// `BIN_SN` note carries the binding-limit arithmetic.
+//
+// ⚠ **THE PRESENT BIT IS NOT DECORATION.** `(0, 0)` is a perfectly legitimate
+// octahedral coordinate — it decodes to −Z — so a zeroed word cannot be
+// distinguished from a real normal by looking at the direction it produces. A
+// reclaimed block's bins ARE zeroed (the decay pass), and without an explicit
+// flag every one of them would claim to face −Z and take whatever sun a −Z
+// surface gets. The flag lives in bit 30, which is why the grid is 15 bits per
+// axis rather than 16.
+//
+// 1/32768 of the octahedral square is ~1e-4 rad of direction error, three
+// orders below the quantity it feeds (a cosine), and the ROUNDTRIP is what the
+// twin gate measures rather than either half on its own.
+
+/** Octahedral grid resolution per axis — 15 bits, leaving room for the flag. */
+export const NORMAL_OCT_RES = 32768;
+/** Bit 30: "this bin has a normal". Bit 31 is left clear so the word stays a
+ *  small positive i32 as well as a u32, which is what the CPU mirror reads. */
+export const NORMAL_OCT_PRESENT = 1 << 30;
+
+/** Unit normal → one packed word. Twin of `srcMath.js`'s `packNormal`. */
+export function packNormal(d) {
+  const uv = octahedralUV(d, NORMAL_OCT_RES).toVar();
+  const u = uint(int(floor(uv.x)).clamp(0, NORMAL_OCT_RES - 1)).toVar();
+  const v = uint(int(floor(uv.y)).clamp(0, NORMAL_OCT_RES - 1)).toVar();
+  return u.add(shiftLeft(v, uint(15))).add(uint(NORMAL_OCT_PRESENT));
+}
+
+/** Packed word → unit normal. Garbage in, unit vector out — test `normalPresent`
+ *  FIRST; this cannot tell an empty word from a −Z surface (see the note). */
+export function unpackNormal(word) {
+  const w = uint(word).toVar();
+  const u = bitAnd(w, uint(NORMAL_OCT_RES - 1)).toVar();
+  const v = bitAnd(shiftRight(w, uint(15)), uint(NORMAL_OCT_RES - 1)).toVar();
+  return octahedralDirection(float(u), float(v), NORMAL_OCT_RES);
+}
+
+/** Whether a bin has ever been given a normal. */
+export function normalPresent(word) {
+  return bitAnd(uint(word), uint(NORMAL_OCT_PRESENT)).notEqual(uint(0));
 }
 
 /**

@@ -1,4 +1,5 @@
 import { GlobalIlluminationComponent } from "./GlobalIlluminationComponent.js";
+import { ReflectionProbeComponent } from "./ReflectionProbeComponent.js";
 
 /**
  * Global Illumination module — 3D Radiance Cascades.
@@ -16,7 +17,7 @@ export const giModule = {
   version: "1.0.0",
   category: "Rendering",
   tags: ["gi", "lighting", "radiance-cascades", "webgpu"],
-  components: [GlobalIlluminationComponent],
+  components: [GlobalIlluminationComponent, ReflectionProbeComponent],
   async setup(engine) {
     const { GISystem } = await import("./GISystem.js");
     const system = new GISystem(engine);
@@ -28,6 +29,7 @@ export const giModule = {
 };
 
 export { GlobalIlluminationComponent };
+export { ReflectionProbeComponent };
 export { RayHitMode, RAY_HIT_MODE_OPTIONS, normalizeRayHitMode, rayHitModeName } from "./rayHit/RayHitConfig.js";
 export { intersectRayTriangle, buildWorldTriangles, traceTrianglesExact, validateRayHits } from "./rayHit/RayHitValidator.js";
 export {

@@ -386,6 +386,95 @@ export const ALPHA_TRACK_THRESHOLD = 0.5;
  */
 export const ALPHA_TRACK_REARM_MS = 800;
 
+/**
+ * ⛔ §12.83 — A NOVELTY GATE WAS BUILT HERE AND BACKED OUT THE SAME HOUR. THE
+ * PREMISE WAS A MISREAD LOG LINE, AND THE MISREADING IS THE THING WORTH
+ * KEEPING (2026-08-23).
+ *
+ * The live receipt from the user's editor reads
+ *
+ *     [gi] light-track window: 1 arms in 2.0s (0.5/s), open 60% of 121 frames
+ *          — armed by shadow 1, peak 0.53 (threshold 0.5)
+ *
+ * and "open 60% of frames" was read — here, in `gi-walk-transient`, and in the
+ * plan's §12.82 banner ("open 43-58% of frames") — as a STEADY STATE: the
+ * window open most of the time, flushing the screen irradiance filter and
+ * lifting the ray cap for most of every second of play. That reading is wrong.
+ * **The line is a ~2 s TALLY and it is printed ONLY when the window armed or
+ * was open during that tally**, so "open 60%" is one 1200 ms hold inside one
+ * 2 s span, and the spans in between print NOTHING. On the user's Level those
+ * two lines are THREE MINUTES apart with silence between: two arms in ~210 s
+ * = a **~1% duty cycle**, not 60%.
+ *
+ * §12.46's rising-edge arm is therefore doing its job. A simulation of the
+ * exact arming block against their own day cycle (0.1 rad/s → a shadow term
+ * of 0.52 at 72 fps, straddling the 0.5 threshold) with ±12% frame-rate
+ * jitter: 1 arm and 2% open in 60 s. The straddle cannot re-arm because the
+ * dips are ONE FRAME long and the dwell wants 800 ms of them.
+ *
+ * So: do not spend a unit on this window. Its cost is ~1% of frames, and the
+ * §12.82 banner's "⭐ (3) is the next unit" rests on the same misreading and
+ * is withdrawn. ⚠ The general trap: a periodic tally that suppresses its own
+ * empty prints reads as a duty cycle and is a RATE — check the timestamps
+ * between lines before believing a percentage.
+ *
+ * ── the original design, kept because the hole is real if narrow ───────────
+ *
+ * §12.46 (above) established the intent in as many words: *sustained motion
+ * needs no window*. Its instrument was a RISING EDGE against a fixed absolute
+ * threshold, and that instrument only works when the sustained signal sits
+ * clearly above the threshold — then the edge never re-fires.
+ *
+ * IT DOES NOT WORK WHEN THE SIGNAL STRADDLES THE THRESHOLD, and the user's own
+ * Level does exactly that. A day cycle at 0.1 rad/s puts `shadowMotion /
+ * ALPHA_MOTION_SAT` at ~0.62 at 60 fps and ~0.37 at 100 fps — so ordinary frame-
+ * rate jitter walks the peak back and forth across 0.5, each dip clears the
+ * 800 ms dwell, and the next rise arms a fresh 1200 ms window. The live receipt
+ * from the user's editor, twice, minutes apart:
+ *
+ *     [gi] light-track window: 1 arms in 2.0s (0.5/s), open 60% of 121 frames
+ *          — armed by shadow 1, peak 0.53 (threshold 0.5)
+ *
+ * i.e. the window is open **~60% of every second of play** for a sun that is
+ * doing nothing eventful. What that costs, all three at once:
+ *
+ *   · `_giIrrHistWeightU = 0` (GISystem ~2262) — the §12.65 screen irradiance
+ *     temporal filter is FLUSHED, so the raw gather goes to the screen and the
+ *     c0 probe lattice's own per-probe variance is the picture. At s₀ = 0.45 m
+ *     that is a ~0.45 m tent on every surface — the user's "blockiness in the
+ *     darker, further regions", where the relative variance is largest because
+ *     the mean is smallest (this scene has NO environment: every photon is a
+ *     lamp and a bounce);
+ *   · the §12.43 root relaxes — evidence is no longer preserved across the
+ *     sparse refresh, so at stride 5 the effective sample count per probe falls
+ *     from ~250 frames to ~20. √12 ≈ 3.5× more noise, on the same lattice;
+ *   · the per-probe ray cap lifts to OFF — the 3.8× deposit swing §12.45
+ *     priced, paid for 60% of frames.
+ *
+ * THE FIX IS TO ASK A DIFFERENT QUESTION. A light EVENT is not "fast" — it is
+ * FASTER THAN THIS LIGHT HAS BEEN. So each term keeps a slow EMA of itself and
+ * arms only when it clears `max(threshold, NOVELTY × its own baseline)`.
+ *
+ *   · a steadily rotating sun: term ≈ its own EMA ⇒ never novel ⇒ window shut,
+ *     and responsiveness falls back to the m-driven α ramp, which is what
+ *     §12.46 said should own this case all along;
+ *   · a sun that STARTS moving, a teleport, a scrub: EMA is low ⇒ arms;
+ *   · a lamp toggling mid-day-cycle: the EMA is PER TERM, so the sun's raised
+ *     shadow baseline cannot mask a luminance event. This is why it is three
+ *     baselines and not one — a single EMA over the max would have made the
+ *     day cycle deaf to every other light in the scene.
+ *
+ * The EMA is fed the UNCLAMPED term (the clamp to 1 that `mLight` applies would
+ * saturate a rotating sun and a teleport to the same number, and then a
+ * teleport during a day cycle would not be novel either).
+ *
+ * NOT SHIPPED. It would close the straddle if a slower ease ever put the dips
+ * past the 800 ms dwell (the ping-pong endpoints in §12.46's ledger are ~0.6 s
+ * — closer than is comfortable), but on the measured configuration it is a
+ * NO-OP, and inert complexity in the arming path is how this window got two
+ * conflicting stories in the first place.
+ */
+
 /** Frames a probe survives unseen before the per-frame rebuild stops re-inserting it. */
 export const PROBE_MAX_AGE = 60;
 
@@ -403,12 +492,26 @@ export const MAX_LOOP_ALBEDO = 0.9;
  *
  * `spacing0` is metres at LOD 0. `raysPerPixel` counts full-length rays per
  * half-res gbuffer pixel. `w0` raises c0 angular resolution on the top tiers.
+ *
+ * ⚠ ULTRA'S RAY BUDGET MUST SCALE WITH ITS BIN COUNT (2026-08-22, the
+ * user's "black patches appear on Ultra preset"). w0 8 gives every ultra
+ * probe 4× the bins of high (2·w0²: 128 vs 32) — but transportRays was only
+ * 2× high's and probeRayCap was the SAME 16, so an ultra probe filled ~4×
+ * slower than a high probe and, under play movement (60-frame visibility
+ * retirement churning the population), never reached knownness equilibrium:
+ * unfilled bins render as the ceiling-hugging black exactly where the
+ * long-range answer matters, at ultra only. transportRays 262_144 → 393_216
+ * (frame cost is bounded by this ceiling; the deposit trace measured
+ * ~0.4-0.55 ms at 245k — expect ~+0.3 ms) and probeRayCap 16 → 32 at ultra
+ * (redistribution within the ceiling toward probes that still have unknown
+ * bins; the cap's fat-probe protection loosens by exactly the factor the
+ * bin count grew).
  */
 export const SRC_QUALITY = {
   low: { spacing0: 0.8, raysPerPixel: 1, w0: 4, secondary: false, transportRays: 32_768, probeRayCap: 16 },
   medium: { spacing0: 0.6, raysPerPixel: 1, w0: 4, secondary: true, transportRays: 65_536, probeRayCap: 16 },
   high: { spacing0: 0.45, raysPerPixel: 2, w0: 4, secondary: true, transportRays: 131_072, probeRayCap: 16 },
-  ultra: { spacing0: 0.35, raysPerPixel: 2, w0: 8, secondary: true, transportRays: 262_144, probeRayCap: 16 },
+  ultra: { spacing0: 0.35, raysPerPixel: 2, w0: 8, secondary: true, transportRays: 393_216, probeRayCap: 32 },
 };
 
 /**
@@ -855,6 +958,33 @@ export function cascadeReach(lod, spacing0, cascadeCount = CASCADE_COUNT) {
 export const LOD0_REACH = 64;
 
 /**
+ * §12.90b — LOD 0's REACH IS IN METRES, and `LOD0_REACH` is in CELLS.
+ *
+ * The constant above is an ANGULAR criterion (s₀/α at α ≈ 1/64 rad), which is
+ * why it is expressed in cells — and that is correct while s₀ is a per-tier
+ * constant. It stops being correct the moment §12.90 derives s₀ from the scene:
+ * refining s₀ 0.45 → 0.35 pulls LOD 0's reach 28.8 m → **22.4 m**, so on the
+ * user's 28 m house the far end drops to LOD 1 at 0.70 m spacing — COARSER than
+ * the 0.45 m it had before the "improvement". A fix aimed at through-wall leaks
+ * would have made "further regions look worse", which is the user's original
+ * complaint, arriving by a new route.
+ *
+ * The same trap as `REANCHOR_CHEBYSHEV` (srcSystem), and the same fix: pin the
+ * REACH, let the cell count follow. Holding 28.8 m at s₀ = 0.35 means LOD 0's
+ * angular spacing is 1/82 rad — FINER than the 1/64 target, i.e. strictly more
+ * quality for the probes the finer lattice was already spending. It is not a
+ * violation of the criterion; it is the criterion being over-satisfied.
+ *
+ * ONE reader, read by BOTH twins (`lodAtDistance` here and in srcMathTsl), or
+ * `test:gi-src-math` diffs a scaled GPU against an unscaled CPU. Unset = 1 =
+ * the shipped constant exactly.
+ */
+export function lod0Reach() {
+  const k = Number(globalThis.__giLod0ReachScale);
+  return LOD0_REACH * (Number.isFinite(k) && k > 0 ? k : 1);
+}
+
+/**
  * LOD for a world point, from the CHEBYSHEV distance to the camera (paper
  * §4.1 — Chebyshev, not Euclidean: with grid-aligned probes the L∞ ball's
  * flat faces put LOD boundaries parallel to the probe planes, which produces
@@ -865,7 +995,7 @@ export const LOD0_REACH = 64;
  * sees a hard flip (R1).
  */
 export function lodAtDistance(cheb, spacing0, maxLods = MAX_LODS) {
-  const ratio = cheb / Math.max(spacing0 * LOD0_REACH, 1e-6);
+  const ratio = cheb / Math.max(spacing0 * lod0Reach(), 1e-6);
   if (!(ratio > 1)) return 0;
   const lod = Math.log2(ratio);
   return Math.min(Math.max(lod, 0), maxLods - 1);
@@ -883,7 +1013,7 @@ export function lodAtDistance(cheb, spacing0, maxLods = MAX_LODS) {
  * silently testing a single LOD. One definition, inverted once.
  */
 export function lodRadius(lod, spacing0) {
-  return spacing0 * LOD0_REACH * Math.pow(2, lod);
+  return spacing0 * lod0Reach() * Math.pow(2, lod);
 }
 
 /** Chebyshev (L∞) distance — the LOD metric. */

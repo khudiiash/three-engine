@@ -1,8 +1,9 @@
 // GLOBAL ILLUMINATION — THE WHOLE CONFIGURATION, IN ONE TABLE.
 //
-// The GI component declares exactly ONE authored property: `quality`. Every
-// other number the module runs on is here, and this file is the only place any
-// of them is written down.
+// The GI component declares THREE authored properties: `quality`, plus the
+// `ao`/`reflections` feature toggles (2026-08-21 — see resolveGiConfig).
+// Every other number the module runs on is here, and this file is the only
+// place any of them is written down.
 //
 // ══ WHY THERE IS ONLY ONE KNOB ═════════════════════════════════════════════
 //
@@ -96,8 +97,12 @@ const CONSTANT = {
   temporalBlend: 0.25,
   probeSmoothing: 0.02,
 
-  // Deferred screen-space reflections are always on; they cost one shared
-  // trace that the resolve already runs.
+  // GI reflections — the glossy radiance chain, the materials' specular
+  // sample of it, and (at ultra) the exact-BVH mirror path. AUTHORABLE since
+  // 2026-08-21: the component declares a `reflections` toggle (see
+  // resolveGiConfig below), because "no reflections" is a look/cost CHOICE
+  // in the same class as `quality` — it removes a term wholesale, it cannot
+  // mis-tune one.
   reflections: true,
 
   // "auto" follows the preset through RayHitConfig's AUTO_MODE_BY_QUALITY —
@@ -131,15 +136,24 @@ const CONSTANT = {
   // `__giConfigOverride = { emissiveShadows: false }` remains the hatch.
   emissiveShadows: true,
 
-  // Indirect-only ambient occlusion from the occupancy pyramid. OFF, unchanged
-  // — it only ever removes light, and it shipped default-on once in the same
-  // change that darkened the whole module, which made the two indistinguishable.
-  // Note that SRC's own c0 resolve is already occlusion-shaped (transmittance
-  // with no hit radiance IS ambient occlusion), so this is a second, older
-  // mechanism rather than the only source of contact darkening.
-  ao: false,
-  aoStrength: 0.6,
-  aoRadius: 0.6,
+  // Indirect-only ambient occlusion. ON since 2026-08-21, when the mechanism
+  // changed: the old occupancy-oracle ladder inlined ~200 fetches into the
+  // resolve kernel (§13.7f priced a build that never finished compiling with
+  // it on) and could not darken inside its own 2-voxel self-surface
+  // allowance (§13.7d). `createGiAoPass` is a screen-space pass over the GI
+  // gbuffer instead — a tiny kernel, one texture sample in the resolve, and
+  // contact-scale darkening from exact world positions. It still only ever
+  // modulates the INDIRECT term (direct light keeps its traced shadows), so
+  // the §14 "priced-but-parked contrast lever" finally engages.
+  // `__giConfigOverride = { ao: false }` is the measurement hatch, and the
+  // component declares an `ao` toggle (same argument as `reflections`).
+  ao: true,
+  // 0.8/0.8 since the first live look (2026-08-21, "AO is quite weak"):
+  // 0.6/0.6 was tuned against the rig; on real scenes the emitter-direct
+  // share leaves the indirect term — the only thing AO modulates — carrying
+  // less of the image, so the ceiling has to work harder to read at all.
+  aoStrength: 0.8,
+  aoRadius: 0.8,
 
   // Cost CEILINGS in total pixels, not quality levels — what the machine can
   // afford. The resolve is sized from the drawing buffer, so a maximized 4K
@@ -171,13 +185,20 @@ const BY_TIER = {
   // corners" under a bright sun. Ultra pays ~4× the resolve to remove it.
   low: { resolveScale: 0.5, exactReflections: false },
   medium: { resolveScale: 0.5, exactReflections: false },
-  high: { resolveScale: 0.5, exactReflections: false },
-  // Per-triangle BVH reflections. Previously an opt-in checkbox gated to
-  // high/ultra and defaulting OFF, which meant it was reachable only by hand
-  // and therefore almost never used. As a tier property it is reachable by
-  // choosing the tier that is defined as "spend whatever it costs" — and it
-  // stays off everywhere else, which is the protection the old gate existed
-  // for (a stale flag turning a Medium scene into a 100-200ms/frame workload).
+  // HIGH TAKES EXACT REFLECTIONS TOO (2026-08-22, with §14 R-A). The old
+  // "ultra only" line was priced when hit shading lived inside the resolve
+  // (the 66 ms register-pressure receipt); in its own pass, high's half-res
+  // resolve runs the prepass + hit shade at a quarter of ultra's pixels,
+  // and the consumer gate (#bvhReflectionsEnabled) still keeps every
+  // mirror-less scene from paying anything. The driver was user-visible: a
+  // FLAT authored mirror can never resolve through a reflection probe (the
+  // oct-tile magnification limit) — at high it either gets the exact arm or
+  // it gets mush. Low/medium stay probes-only: that is still the
+  // 100-200ms-workload protection for the tiers defined as cheap.
+  high: { resolveScale: 0.5, exactReflections: true },
+  // Per-triangle BVH reflections at FULL resolve resolution. As a tier
+  // property it is reachable by choosing the tier, not by a stale checkbox
+  // (the failure mode the old opt-in had).
   ultra: { resolveScale: 1, exactReflections: true },
 };
 
@@ -196,6 +217,21 @@ const BY_TIER = {
 export function resolveGiConfig(props, runtime = globalThis) {
   const quality = giQualityTier(props?.quality);
   const settled = { quality, ...CONSTANT, ...BY_TIER[quality] };
+  // ── THE TWO AUTHORED FEATURE TOGGLES (2026-08-21, user request) ──────────
+  //
+  // `ao` and `reflections` join `quality` as component properties, and the
+  // one-knob doctrine survives the addition because they are the same KIND
+  // of thing quality is: each removes a whole term at a whole cost, and
+  // neither can mis-tune anything — the failure the 27-property collapse
+  // exists to prevent. Only an explicit `false` acts; any other stored value
+  // (old scenes, typos) keeps the default ON.
+  if (props?.ao === false) settled.ao = false;
+  if (props?.reflections === false) {
+    settled.reflections = false;
+    // No reflections means ALL of them — the ultra tier's exact-BVH mirrors
+    // are a reflection before they are a tier feature.
+    settled.exactReflections = false;
+  }
   // ── THE MEASUREMENT HATCH, AND WHY IT IS NOT A KNOB SURFACE ──────────────
   //
   // `globalThis.__giConfigOverride = { emissiveShadows: true }` forces any of

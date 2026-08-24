@@ -1156,6 +1156,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
 
   const scratchM = new THREE.Matrix4();
   const scratchInv = new THREE.Matrix4();
+  const scratchProxyM = new THREE.Matrix4();
   const scratchV = new THREE.Vector3();
 
   /**
@@ -1192,9 +1193,12 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     entry.surfaceStamp = stamp;
     const s = resolveMaterialSurface(mesh?.material, mesh?.name);
     const i = entry.index;
-    wm(i, 34, s.color?.r ?? 1);
-    wm(i, 35, s.color?.g ?? 1);
-    wm(i, 36, s.color?.b ?? 1);
+    // Per-proxy override first (see `albedoOverride` in adopt): a bone
+    // proxy's colour comes from the skin texture, not the (white) material.
+    const o = entry.albedoOverride;
+    wm(i, 34, o ? o[0] : (s.color?.r ?? 1));
+    wm(i, 35, o ? o[1] : (s.color?.g ?? 1));
+    wm(i, 36, o ? o[2] : (s.color?.b ?? 1));
     // Premultiplied: the shading site wants one number, and the voxel bake
     // already folds intensity in the same place.
     const k = promoted ? 0 : (s.emissiveIntensity ?? 1);
@@ -1205,7 +1209,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     // mover's colour actually reach the GPU" is the first question every
     // bounce measurement asks.
     entry.surface = {
-      albedo: [s.color?.r ?? 1, s.color?.g ?? 1, s.color?.b ?? 1],
+      albedo: o ? [...o] : [s.color?.r ?? 1, s.color?.g ?? 1, s.color?.b ?? 1],
       emissive: [(s.emissive?.r ?? 0) * k, (s.emissive?.g ?? 0) * k, (s.emissive?.b ?? 0) * k],
     };
     return true;
@@ -1228,6 +1232,16 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
 
   const worldMatrixOf = (entry) => {
     const { mesh, instanceId } = entry;
+    // PROXY ENTRIES (skinned bone capsules) are not placed by the mesh's own
+    // world matrix — a SkinnedMesh's `matrixWorld` cancels out of the vertex
+    // position entirely and the BONES carry the pose. `matrixOf` rebuilds the
+    // matrix from live bone transforms; a false return means the segment
+    // collapsed this frame, and keeping the previous matrix is strictly better
+    // than publishing a zero-scale occluder that blinks out of existence.
+    if (entry.matrixOf) {
+      entry.matrixOf(scratchProxyM) && entry.proxyMatrix.copy(scratchProxyM);
+      return entry.proxyMatrix;
+    }
     if (instanceId == null || !mesh.isInstancedMesh) return mesh.matrixWorld;
     mesh.getMatrixAt(instanceId, scratchM);
     scratchM.premultiply(mesh.matrixWorld);
@@ -1294,15 +1308,44 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         const tExit = tf.x.min(tf.y).min(tf.z).toVar();
 
         const scale = rf(ob.add(uint(22))).max(1e-6).toVar();
-        // Self-exclusion (OBB only — convex, so the exact receiver surface
-        // can never legitimately shadow itself): skip when the exclude point
-        // lies ON this box's surface.
+        // Self-exclusion: skip when the exclude point lies ON this shape's
+        // surface. OBB: |d| < 3 cm (an exact adoptee IS the surface, convex,
+        // so it can never legitimately shadow itself). §14 Q2 — sphere and
+        // capsule join with a SIGNED test, on-or-INSIDE: a bone-capsule proxy
+        // is fat, the receiver's true skin sits centimetres inside the shell,
+        // and `|d|` would exclude only a hairline band while the whole limb
+        // kept grazing its own proxy into dark self-shadow bands. Slack
+        // scales with the shape's own radius (floored at the OBB's 3 cm).
+        // A DIFFERENT capsule (another limb, another rig) still occludes —
+        // the test is per-object, and overlapping joint capsules both contain
+        // the joint skin, which is exactly the right admission there.
         const excluded = exclP != null
           ? (() => {
               const exL = c0.mul(exclP.x).add(c1.mul(exclP.y)).add(c2.mul(exclP.z)).add(c3);
               const qe = exL.abs().sub(he);
               const de = qe.max(vec3(0)).length().add(qe.x.max(qe.y.max(qe.z)).min(0));
-              return type.lessThan(1.5).and(de.mul(scale).abs().lessThan(0.03));
+              const deSphere = exL.length().sub(prm.x);
+              const deCapsule = vec3(
+                exL.x,
+                exL.y.sub(exL.y.clamp(prm.y.negate(), prm.y)),
+                exL.z,
+              ).length().sub(prm.x);
+              const slackW = prm.x.mul(scale).mul(0.15).max(0.03);
+              // §14 round 6: the OBB test went SIGNED (on-or-INSIDE), same
+              // reasoning as sphere/capsule below — a skinned flesh box is
+              // joint-grown past the vertex span now, so the receiver's skin
+              // can sit centimetres INSIDE it, where the old |d| surface
+              // band re-admitted the box as its own occluder. `de` is an
+              // SDF (negative inside); a classified exact OBB adoptee is
+              // unchanged by this — its receivers sit ON the surface, where
+              // signed and |d| agree.
+              const boxTest = type.lessThan(1.5)
+                .and(de.mul(scale).lessThan(0.03));
+              const sphereTest = type.greaterThan(2.5).and(type.lessThan(3.5))
+                .and(deSphere.mul(scale).lessThan(slackW));
+              const capsuleTest = type.greaterThan(3.5).and(type.lessThan(4.5))
+                .and(deCapsule.mul(scale).lessThan(slackW));
+              return boxTest.or(sphereTest).or(capsuleTest);
             })()
           : null;
 
@@ -1606,6 +1649,12 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       let index = -1;
       for (let i = 0; i < MAX; i++) if (!slots[i]) { index = i; break; }
       if (index < 0) return false;
+      // A proxy must arrive with a VALID first matrix. `worldMatrixOf` keeps the
+      // previous one when `matrixOf` fails, and at adoption there is no previous
+      // one — an identity matrix would seat a unit capsule at the world origin,
+      // shadowing whatever happens to be standing there. Refusing lets the
+      // caller retry on the next frame, by which time the pose has settled.
+      if (shape.matrixOf && !shape.matrixOf(scratchProxyM)) return false;
 
       let geoBlock = null;
       if (shape.type === "mesh") {
@@ -1654,6 +1703,18 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         center: shape.center.clone(),
         halfExtents: shape.halfExtents.clone(),
         geoBlock,
+        // Optional per-proxy albedo (linear RGB), overriding the material
+        // resolver in `writeSurface`. Skinned bone proxies use it: their
+        // material's BASE colour is usually white (the character's colour
+        // lives in the skin TEXTURE), which made every reflected character
+        // a grey mannequin. skinnedProxy's fit samples the texture per bone.
+        albedoOverride: Array.isArray(shape.albedo) ? shape.albedo : null,
+        // Skinned bone-capsule proxies: `matrixOf(out)` fills `out` from live
+        // bone transforms (see skinnedProxy.js). `proxyMatrix` is the entry's
+        // OWN storage, because `sync` holds the returned matrix across the
+        // frame in `entry.prev` and a shared scratch would alias.
+        matrixOf: shape.matrixOf ?? null,
+        proxyMatrix: shape.matrixOf ? new THREE.Matrix4().copy(scratchProxyM) : null,
         prev: new THREE.Matrix4().makeScale(0, 0, 0), // sentinel → first sync always writes
         movedFrames: 0,
         prevBounds: new THREE.Box3(),
@@ -1943,6 +2004,18 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       const p = float(packed).toVar();
       const index = p.div(OBJ_SLOT_STRIDE).floor().toVar();
       return { index, slot: p.sub(index.mul(OBJ_SLOT_STRIDE)).toVar() };
+    },
+
+    /**
+     * Forces the next sync to re-publish this entry's surface words. Needed
+     * when an `albedoOverride` ARRAY was mutated in place after adoption —
+     * skinned per-bone colours resolving late on the GPU (KTX2 textures the
+     * fit's CPU sampler could not read) — because `writeSurface`'s stamp
+     * only watches the material, not the override's contents.
+     */
+    touchSurface(key) {
+      const entry = entries.get(key);
+      if (entry) entry.surfaceStamp = null;
     },
 
     /**

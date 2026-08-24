@@ -44,9 +44,14 @@ import {
   dirToBin,
   hashKey,
   influxWordFor,
+  keyWorldCell,
+  latticeOriginCellFor,
   latticeOriginFor,
   nearestCell,
   octahedralBorderMap,
+  gatherNormalWeightExp,
+  gatherNormalBias,
+  gatherSmoothWeights,
   packProbeKey,
   preAverage,
   rayDirection,
@@ -55,6 +60,7 @@ import {
   sparseGather,
   trilinearCorners,
   unpackProbeKey,
+  worldKeysEnabled,
 } from "./srcMath.js";
 
 /**
@@ -88,6 +94,26 @@ export function makeSrcConfig(options = {}) {
 export function latticeOrigin(cfg, cascade, lod) {
   const s = probeSpacing(cascade, lod, cfg.spacing0);
   return latticeOriginFor(cfg.anchor[0], cfg.anchor[1], cfg.anchor[2], s);
+}
+
+/**
+ * The cell a probe KEY carries for an origin-relative lattice cell — the
+ * world-keys mirror (S1 flip prerequisite, plan §15 U1 / NEXT item 2).
+ *
+ * All of this file's corner/cell math stays ORIGIN-RELATIVE (trilinearCorners
+ * and nearestCell answer against the anchor-snapped origin, which is also what
+ * keeps the arithmetic in small integers — srcMath's trap-4 note). Only the
+ * KEY changes representation: under world-absolute keying it holds the WORLD
+ * cell, which is the origin's own cell index plus the local offset — integer
+ * addition, exactly `worldCellAt`'s composition, never `round(p/s)`.
+ * Identity under the anchor-relative keying, so every call site reads the
+ * same either way.
+ */
+function keyCellFor(cfg, cascade, lod, cx, cy, cz) {
+  if (!worldKeysEnabled()) return [cx, cy, cz];
+  const s = probeSpacing(cascade, lod, cfg.spacing0);
+  const o = latticeOriginCellFor(cfg.anchor[0], cfg.anchor[1], cfg.anchor[2], s);
+  return [o[0] + cx, o[1] + cy, o[2] + cz];
 }
 
 // ══════════════════════════════════════════════════════════ THE PROBE MAP
@@ -209,14 +235,25 @@ export function buildProbes(cfg, pixels) {
     const u = unpackProbeKey(key);
     const origin = latticeOrigin(cfg, cascade, lod);
     const s = probeSpacing(cascade, lod, cfg.spacing0);
+    // Under world-absolute keying the key's cell fields are [0,512) RESIDUES
+    // — recover the world cell against the CAMERA's own cell on this lattice
+    // (reconstruction needs the camera; srcMath's alias-margin proof is what
+    // makes the representative unique), and a world cell's position is simply
+    // cell × spacing (origin zero). Numerically identical to the relative
+    // arm: (originCell + local)·s = origin + local·s.
+    const wc = u.residue
+      ? keyWorldCell(key, ...latticeOriginCellFor(cfg.camera[0], cfg.camera[1], cfg.camera[2], s))
+      : u;
     return {
       key,
       index,
       cascade,
       lod: u.lod,
       secondary: u.secondary,
-      cell: [u.cx, u.cy, u.cz],
-      position: cellPosition(u.cx, u.cy, u.cz, origin[0], origin[1], origin[2], s),
+      cell: [wc.cx, wc.cy, wc.cz],
+      position: u.residue
+        ? [wc.cx * s, wc.cy * s, wc.cz * s]
+        : cellPosition(u.cx, u.cy, u.cz, origin[0], origin[1], origin[2], s),
       spacing: s,
       parent: -1,
       children: [],
@@ -251,7 +288,7 @@ export function buildProbes(cfg, pixels) {
       px.position[0], px.position[1], px.position[2],
       origin[0], origin[1], origin[2], s,
     );
-    const key = packProbeKey(lod, false, cell.cx, cell.cy, cell.cz);
+    const key = packProbeKey(lod, false, ...keyCellFor(cfg, 0, lod, cell.cx, cell.cy, cell.cz));
     const slot = cascades[0].insert(key, makeProbe(0, lod));
     pixelProbe[p] = slot;
   }
@@ -267,7 +304,7 @@ export function buildProbes(cfg, pixels) {
         probe.position[0], probe.position[1], probe.position[2],
         origin[0], origin[1], origin[2], s,
       );
-      const key = packProbeKey(probe.lod, probe.secondary, cell.cx, cell.cy, cell.cz);
+      const key = packProbeKey(probe.lod, probe.secondary, ...keyCellFor(cfg, c, probe.lod, cell.cx, cell.cy, cell.cz));
       const slot = parentMap.insert(key, makeProbe(c, probe.lod));
       probe.parent = slot;
       if (slot >= 0) parentMap.probes[slot].children.push(probe.index);
@@ -606,7 +643,8 @@ export function mergeCascades(cfg, built, resolved) {
         const gathered = sparseGather(
           corners,
           (cx, cy, cz) => {
-            const key = packProbeKey(probe.lod, probe.secondary, cx, cy, cz);
+            const key = packProbeKey(probe.lod, probe.secondary,
+              ...keyCellFor(cfg, parentCascade, probe.lod, cx, cy, cz));
             const slot = built.cascades[parentCascade].find(key);
             if (slot < 0) return null;
             return preAverageChildBins(merged[parentCascade][slot], m);
@@ -813,8 +851,9 @@ export function bakeProbeIrradiance(cfg, built, merged, cascade = 0, interior = 
 }
 
 /**
- * The COVERAGE twin of `bakeProbeIrradiance`: 1 where a texel found at least
- * one known bin, 0 where it found none.
+ * The COVERAGE twin of `bakeProbeIrradiance`: the FRACTION of the texel's
+ * cosine lobe backed by a known bin (§12.87 — it was 1-if-any until
+ * 2026-08-24; see srcTiles.js for what the flag cost).
  *
  * ══ WHY AN ABSENCE NEEDS ITS OWN CHANNEL ═══════════════════════════════════
  *
@@ -849,11 +888,26 @@ export function bakeProbeCoverage(cfg, built, merged, cascade = 0, interior = IR
     for (let v = 0; v < interior; v++) {
       for (let u = 0; u < interior; u++) {
         const t = v * interior + u;
-        let found = 0;
-        for (let m = 0; m < nBins && !found; m++) {
-          if (values[m] && cosTable[m * texels + t] > 0) found = 1;
+        // §12.87 — THE FRACTION OF THE LOBE ACTUALLY SAMPLED, not a flag.
+        // The GPU twin (srcTiles.js) carries the full ledger; the short form is
+        // that `bakeProbeIrradiance` renormalises over the KNOWN bins, which
+        // EXTRAPOLATES them across the whole lobe, and `gatherPixel` then
+        // weights this probe by the coverage its tap found. A flag told the
+        // gather that a one-bin extrapolation was as trustworthy as a fully
+        // sampled texel, so whichever probe won a cell handed the whole cell
+        // its single-bin constant. Both twins read the same hatch so
+        // `test:gi-src-gather` compares like with like.
+        let known = 0;
+        let all = 0;
+        for (let m = 0; m < nBins; m++) {
+          const cw = cosTable[m * texels + t];
+          if (!(cw > 0)) continue;
+          all += cw;
+          if (values[m]) known += cw;
         }
-        tile[(v + 1) * size + (u + 1)] = found;
+        tile[(v + 1) * size + (u + 1)] = globalThis.__giTileCoverFraction === true
+          ? (all > 0 ? Math.min(1, known / all) : 0)
+          : (known > 0 ? 1 : 0);
       }
     }
     fillOctahedralBorder(tile, interior, size, 1);
@@ -942,6 +996,22 @@ export function sampleTile(tile, interior, nx, ny, nz, channels = 3) {
  * the one thing R1 forbids — see `bakeProbeCoverage` for the measured size.
  */
 export function gatherPixel(cfg, built, tiles, position, normal, interior = IRRADIANCE_TILE_INTERIOR, coverage = null) {
+  // §12.88 — NORMAL BIAS, mirrored off the SAME reader the GPU gather uses.
+  // Zero by default, so this is `position` verbatim and every gate measures the
+  // graph it always did. See `gatherNormalBias` in srcMath.js for why the fix is
+  // geometric (`β > s0 − wallThickness` makes the back-corner leak exactly zero)
+  // and why it ships off. Applied BEFORE the LOD metric and the lattice, which
+  // is where the GPU applies it too — biasing only the corner lookup and not
+  // `chebyshev` would put the two twins on different shells near a boundary.
+  const bias = gatherNormalBias();
+  if (bias > 0) {
+    const nl = Math.hypot(normal[0], normal[1], normal[2]) || 1;
+    position = [
+      position[0] + (normal[0] / nl) * bias,
+      position[1] + (normal[1] / nl) * bias,
+      position[2] + (normal[2] / nl) * bias,
+    ];
+  }
   const cheb = Math.max(
     Math.abs(position[0] - cfg.camera[0]),
     Math.abs(position[1] - cfg.camera[1]),
@@ -959,28 +1029,34 @@ export function gatherPixel(cfg, built, tiles, position, normal, interior = IRRA
     const corners = trilinearCorners(
       position[0], position[1], position[2],
       origin[0], origin[1], origin[2], s,
+      // §13.9, mirrored off the SAME global the GPU gather reads.
+      gatherSmoothWeights(),
     );
     // §13.7d — the GPU gather's normal-plane wrap weight, mirrored. Reads the
     // SAME global, so `test:gi-src-gather` never diffs a weighted GPU against
     // an unweighted CPU. Applied to the corner weights before the sparse
     // gather rather than inside `combine`, which is not handed a position.
-    const nwHatch = globalThis.__giGatherNormalWeight;
-    if (nwHatch === true || (Number.isFinite(nwHatch) && nwHatch > 0)) {
-      const nwExp = Number.isFinite(nwHatch) && nwHatch > 0 ? nwHatch : 2;
+    const nwExp = gatherNormalWeightExp();
+    if (nwExp > 0) {
       for (const c of corners) {
         const dx = origin[0] + c.cx * s - position[0];
         const dy = origin[1] + c.cy * s - position[1];
         const dz = origin[2] + c.cz * s - position[2];
-        const len = Math.hypot(dx, dy, dz) || 1e-5;
-        const dot = (dx * normal[0] + dy * normal[1] + dz * normal[2]) / len;
-        const facing = Math.max(0, dot * 0.5 + 0.5);
-        c.weight *= Math.max(1e-3, nwExp === 2 ? facing * facing : facing ** nwExp);
+        // §14 Q9c: SIGNED PLANE DISTANCE, not a direction cosine — mirrors
+        // the GPU gather exactly (see srcScreenGather for why the two
+        // direction forms both painted lattice-period patterns on flat
+        // walls). In-plane motion leaves this invariant, so a flat wall's
+        // corner weights are constants.
+        const pd = dx * normal[0] + dy * normal[1] + dz * normal[2];
+        const t = Math.min(1, Math.max(0, pd / (0.35 * s) + 1));
+        const oneSided = t * t * (3 - 2 * t);
+        c.weight *= Math.max(1e-3, nwExp === 1 ? oneSided : oneSided ** nwExp);
       }
     }
     const gathered = sparseGather(
       corners,
       (cx, cy, cz) => {
-        const key = packProbeKey(shell.lod, false, cx, cy, cz);
+        const key = packProbeKey(shell.lod, false, ...keyCellFor(cfg, 0, shell.lod, cx, cy, cz));
         const slot = built.cascades[0].find(key);
         return slot < 0 ? null : slot;
       },

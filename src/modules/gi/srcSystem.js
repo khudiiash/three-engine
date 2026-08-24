@@ -55,7 +55,7 @@ import {
   PROBE_RAY_CAP_OFF, REST_BOOT_HOLD_MS, REST_CAM_FADE_MS, REST_CAM_HOLD_MS,
   REST_TRANSPORT_FRACTION,
   SEED_RAYS, SRC_QUALITY, SUM_SHIFT, SURPRISE_ONE, TEMPORAL_ALPHA,
-  TEMPORAL_ALPHA_STILL, W0, srcProbeRayCap, srcQualityTier, srcTransportRays,
+  TEMPORAL_ALPHA_STILL, W0, lod0Reach, srcProbeRayCap, srcQualityTier, srcTransportRays,
 } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX, worldKeysEnabled } from "./srcMath.js";
@@ -69,18 +69,63 @@ import {
 import {
   DEPOSIT_SCALE, createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters,
 } from "./srcDeposit.js";
-import { createSrcHitAttribution, createSrcHitLighting, createSrcHitShader } from "./srcShade.js";
+import { createSrcHitAttribution, createSrcHitLighting, createSrcHitShader, sunTerm } from "./srcShade.js";
 import { createLightTreeEmitterEval, createLightTreeSampler } from "./lightTreeGpu.js";
 import { createSrcMergeFrame, formatSrcMerge } from "./srcMerge.js";
 import { createSrcSeedFrame, formatSrcSeed } from "./srcSeed.js";
 import { createSrcSecondaryFrame, formatSrcSecondary } from "./srcSecondary.js";
-import { createSrcScreenGather, formatSrcGather } from "./srcScreenGather.js";
+import { createSrcGlossyGather, createSrcScreenGather, formatSrcGather } from "./srcScreenGather.js";
 import { createSrcTileAtlas, formatSrcTiles } from "./srcTiles.js";
 import { createSrcRayFrame, createSrcRayStore } from "./srcRays.js";
 import { createSrcSceneTrace, createSrcVisibility, ifMoverHit, moverSurfaceAt } from "./srcTrace.js";
 
-/** Camera drift, in units of s₀, that triggers a re-anchor. */
-const REANCHOR_CHEBYSHEV = 64;
+/**
+ * Camera drift, in units of s₀, that triggers a re-anchor — DERIVED from the
+ * key window, not chosen.
+ *
+ * ⭐⭐ THE OLD VALUE WAS 64 AND IT FIRED INSIDE THE USER'S HOUSE. The header
+ * above called 64 "comfortably inside the 254·s₀ the window actually allows",
+ * which is true and was never the question: 64·s₀ at ultra (s₀ = 0.35) is
+ * **22.4 m**, and their Level is **27.6 m** long. Their console, mid-play,
+ * 2026-08-24:
+ *
+ *     00:40:20  [gi] src probes: re-anchored (#2) — every probe re-keys, which retires it
+ *     00:40:39  [gi] src probes: re-anchored (#3) — every probe re-keys, which retires it
+ *
+ * Nineteen seconds apart. A re-anchor RETIRES EVERY PROBE IN THE SCENE, so the
+ * whole field goes cold and re-converges from nothing — twice, while walking
+ * the length of one house. That is the user's report word for word ("still mud
+ * everywhere as I move"), and it is a WHOLE-FIELD reset, not a local artifact.
+ *
+ * ⚠ AND IT HID BEHIND A TIER. At `high` (s₀ = 0.45) the radius is 28.8 m, just
+ * past the 27.6 m scene, so it never fires — which is why every headless probe
+ * run at QUALITY=high measured a scene that never re-anchors, and why the note
+ * in this project's memory read "cannot fire indoors". The user runs ULTRA. A
+ * threshold that lands on one side of the scene at one tier and the other side
+ * at the next tier is not a threshold, it is a coin flip.
+ *
+ * THE DERIVATION. Probe cells are packed as 9-bit signed offsets from the
+ * anchor (`KEY_AXIS_RANGE` 512, `KEY_AXIS_OFFSET` 256 in srcMath), so an offset
+ * must stay inside ±254 cells to be representable at all — past it
+ * `packProbeKey` returns EMPTY and the probe silently does not exist. Probes
+ * are placed around the CAMERA and LOD 0 reaches `lod0Reach()` cells past it,
+ * so the furthest live cell sits at `drift + reach` from the anchor:
+ *
+ *     drift + reach ≤ 254        →  drift ≤ 254 − reach
+ *
+ * minus one `ANCHOR_QUANTUM` for the frame in which the threshold is crossed.
+ * At the shipped reach of 64 that is **174 cells** — 60.9 m at ultra, 78.3 m at
+ * high, 139 m at low. Every one of those is past any interior, so the re-anchor
+ * goes back to being what the header says it is: the thing that saves a player
+ * who walks 130 m away, and nothing that happens indoors at any tier.
+ *
+ * ⚠ It is computed from `lod0Reach()` rather than the constant because §12.90
+ * can scale the reach; a bigger reach must SHRINK this, and hard-coding 174
+ * would let the two drift apart silently.
+ */
+const KEY_SAFE_CELLS = 254;
+const reanchorChebyshev = () =>
+  Math.max(ANCHOR_QUANTUM * 2, KEY_SAFE_CELLS - lod0Reach() - ANCHOR_QUANTUM);
 /** The anchor snaps to multiples of this many s₀, so it moves in whole steps. */
 const ANCHOR_QUANTUM = 16;
 /** Per-frame camera deltas that count as "panning" for the §12.45.2 cap lift:
@@ -197,11 +242,25 @@ export function srcPoolCeilings(pixelCount) {
  */
 export function createSrcProbeSystem({
   gbuffer, width, height, props = null, volume = null, sky = null,
+  // §16 S1 — the DIRECTIONAL sky bundle ({ node, intensity, rotY }), threaded
+  // to the merge's top-cascade close and the tiles' residual composite. Null
+  // (every fixture) keeps the flat `sky` path bit-identical.
+  skyEnv = null,
   lighting = null, surfaces = null, sceneMotion = null, trackMotion = null,
   pools = null,
+  // §12.90 — the SCENE-DERIVED gather lattice, or undefined to keep the tier's.
+  // GISystem's separator census picks it; see its ledger for why a tier
+  // constant was the wrong shape (it made the gather's stencil reach 1.8× the
+  // user's 0.25 m walls, and no corner weighting can undo that).
+  spacing0: spacing0Override = undefined,
 } = {}) {
   const tier = SRC_QUALITY[srcQualityTier(props)];
-  const spacing0 = Number(globalThis.__giSrcSpacing0) || tier.spacing0;
+  // Precedence: the instrument hatch outranks the scene rule outranks the tier.
+  // `__giSrcSpacing0` stays first so every probe that pins it still means what
+  // the arm that set it meant.
+  const spacing0 = Number(globalThis.__giSrcSpacing0)
+    || (Number.isFinite(spacing0Override) && spacing0Override > 0 ? spacing0Override : 0)
+    || tier.spacing0;
   const pixelCount = width * height;
 
   // Resolved pool sizes, floors-first (§12.77 Unit A). Precedence: the FIXED
@@ -296,6 +355,19 @@ export function createSrcProbeSystem({
   const gatherReadPixel = (i) => readPixel(
     i.div(uint(gatherWidth)).mul(uint(SRC_GATHER_SCALE * width))
       .add(i.mod(uint(gatherWidth)).mul(uint(SRC_GATHER_SCALE))),
+  );
+  // The GLOSSY gather's grid (§12.71b v2) — half the resolve, its own map
+  // into the full-res gbuffer for exactly the shear reason above. 2 is safe
+  // where the diffuse gather's backed-out 2 was not: giLight blends the
+  // exact-BVH hit over this term on mirror pixels, and a glossy lobe is an
+  // angular blur before it is a spatial one (the pass header has the full
+  // argument).
+  const GLOSSY_SCALE = 2;
+  const glossyWidth = Math.max(1, Math.ceil(width / GLOSSY_SCALE));
+  const glossyHeight = Math.max(1, Math.ceil(height / GLOSSY_SCALE));
+  const glossyReadPixel = (i) => readPixel(
+    i.div(uint(glossyWidth)).mul(uint(GLOSSY_SCALE * width))
+      .add(i.mod(uint(glossyWidth)).mul(uint(GLOSSY_SCALE))),
   );
   const readPixel = (i) => {
     const t = texelOf(i);
@@ -438,6 +510,12 @@ export function createSrcProbeSystem({
   // zero. Harmless in fact (an unclaimed block holds zeros, which zero to
   // zeros) and not worth relying on.
   const frameStampU = uniform(1, "uint");
+  // Anchor-relative retention's re-anchor kill (see srcProbes' retention
+  // bundle): nonzero for the re-anchor frame (+1 for ordering safety), driven
+  // by `syncCamera` below through a JS countdown so pass order can't leak a
+  // stale-keyed probe past the renumbering.
+  const retainKillU = uniform(0, "uint");
+  let retainKillFrames = 0;
 
   const frame = createSrcProbeFrame(store, {
     spacing0,
@@ -447,6 +525,7 @@ export function createSrcProbeSystem({
     maxLods: MAX_LODS,
     readPixel,
     frameStamp: frameStampU,
+    retainKill: retainKillU,
   });
 
   // The gizmos share the SAME anchor uniform, not a copy. A gizmo lattice
@@ -720,6 +799,11 @@ export function createSrcProbeSystem({
         // the orphans. Zero when a project never set it, which means this build
         // still renders exactly as it did.
         sky: sky ? vec3(sky) : vec3(0),
+        // §16 D3 — the probe-maturity fade rides the claim stamps against
+        // this frame counter (srcTiles' header carries the design).
+        frameStamp: frameStampU,
+        // §16 S1 — directional residual sky.
+        skyEnv,
       })
     : null;
 
@@ -736,6 +820,31 @@ export function createSrcProbeSystem({
   // and since §12.39 its words ride `hashKeys`' TAIL, so the lookup is ONE
   // storage buffer: the price at which the deposit kernel (7 of 8 bindings)
   // can afford it too.
+  // §15 U3 — ONE LOS occupancy test for BOTH gather instances. The screen
+  // gather [I] cleans the direct corner read; the secondary [J] instance is
+  // the one that matters MORE: it shades ray hits, and a validity-blind
+  // gather there DEPOSITS the wrong room's light into this room's bins — the
+  // leak then lives in the field itself where no screen-side weight can
+  // reach it (the los-leak gate measured exactly that: control-crop redness
+  // 0.36 across all of room B). The ONE-BIT test, not the distance oracle:
+  // the oracle's near-field scan at the march's call count priced the
+  // gather ×18 (los-gate run 9).
+  //
+  // ⚠ FILTERED, NOT ONE-BIT (2026-08-23). The one-bit reader made the corner
+  // weight a STEP function of position, so the lit/unlit boundary it drew on
+  // a wall was stair-stepped at voxel granularity — the artifact that sent
+  // U3 back to opt-in the night it shipped, with the leak fix along with it.
+  // `occupancyAtWorld` is the same eight-times-cheaper-than-the-oracle test
+  // trilinearly interpolated, i.e. continuous in the sample position, so the
+  // boundary is a gradient instead of a lattice of squares. See its header.
+  // `__giLosFiltered = false` restores the one-bit reader — the arm the
+  // filtered/binary comparison needs, and the escape hatch if a scene ever
+  // prefers the step. The shoulder above it is a no-op on 0/1 input, so the
+  // two arms differ ONLY in the smoothness of the read.
+  const losOccupied = (globalThis.__giLosFiltered === false
+    ? volume?.occupancyField?.occupiedAtWorld
+    : volume?.occupancyField?.occupancyAtWorld ?? volume?.occupancyField?.occupiedAtWorld) ?? null;
+  const losWorld = volume?.world ?? null;
   const hashBlockFrame = tiles ? createSrcHashBlockFrame(store, 0) : null;
   const gather = tiles
     ? createSrcScreenGather(store, tiles, {
@@ -767,6 +876,28 @@ export function createSrcProbeSystem({
         height: gatherHeight,
         maxLods: MAX_LODS,
         w0: W0,
+        // §15 U3 — inert until `__giGatherLosWeight` arms it (the reader in
+        // srcMath); see the closure's construction above.
+        losOccupied,
+        losWorld,
+      })
+    : null;
+
+  // ── [I']: THE GLOSSY GATHER (§12.71b v2) ─────────────────────────────────
+  //
+  // The same integral as [I], fed the reflection vector, at half res — the
+  // resolve samples it into the radiance target that giLight's specular slot
+  // reads. Default ON; `__giGlossyRadiance = false` is the kill switch (the
+  // OFF arm must reproduce the dark-but-stable metals the opt-in era shipped).
+  // GISystem appends the radiance temporal filter behind it — see
+  // #armGlossyTemporal for why the filter is built there and not here (it
+  // needs the gbuffer-side history uniforms).
+  const glossy = gather && props?.reflections !== false && globalThis.__giGlossyRadiance !== false
+    ? createSrcGlossyGather(gather.gatherAt, {
+        readPixel: glossyReadPixel,
+        width: glossyWidth,
+        height: glossyHeight,
+        camera: vec3(cameraU),
       })
     : null;
 
@@ -932,9 +1063,68 @@ export function createSrcProbeSystem({
             evalAt: (P, n, idx) => evalAt(P, n, base, idx),
           };
         })(),
+        // ── §12.82: TAKE THE SUN OUT OF THE TEMPORAL STORE ────────────────
+        //
+        // The user's Level runs a day cycle and the sun never stops turning, so
+        // every stored radiance is stale by however long ago its bin was last
+        // refreshed — and neighbouring bins are stale by DIFFERENT amounts,
+        // which is the bright/dark patchwork they report. `srcDeposit.js`'s
+        // `BIN_SR` note carries the measurement and why no blend rate fixes it.
+        //
+        // The slot INDEX is the interface, not the light: `kind` is a uniform
+        // (R11), so which slot is directional is a runtime fact and a build-time
+        // pick would be wrong the moment a light is added. `< 0` means the scene
+        // has no directional light and the split arms nothing — the shader is
+        // still emitted, the comparison simply never matches, so adding a sun to
+        // a scene that had none does not recompile.
+        //
+        // ⛔⛔ **DEFAULT OFF, AND IT MUST STAY OFF UNTIL THE DELIVERY IS
+        // WHOLE.** The mechanism is built, gated at the hit (`test:gi-src-shade`
+        // proves the split-then-close identity to 0.0000%) and correct per hit —
+        // but the BIN-level delivery is short, measured on the user's Level with
+        // the sun PINNED and the pose pinned:
+        //
+        //   removed from the picture   leg0 46%   leg1 57%   (the sun is ~half
+        //                                                     this scene's GI)
+        //   delivered back by [F]      leg0  5%   leg1 24%
+        //   i.e. the transfer returns  leg0 11%   leg1 41%   of what it took
+        //
+        // A quarter to a half of the picture, gone. Arming this by default would
+        // ship exactly the regression the 60 fps rule's sibling forbids — never
+        // ship what looks bad — and it would do it while every counter read
+        // healthy (merge orphan rate, corners and noBlock are all UNCHANGED
+        // between the arms). `__giSrcSunSplit = true` arms it for measurement.
+        sunSplit: globalThis.__giSrcSunSplit !== true || lighting.sunSlot == null
+          ? null
+          // `__giSrcSunSplitKeep` DOUBLE-DELIVERS the sun on purpose — see
+          // `createSrcHitLighting`'s `splitKeep`. It is the only way to weigh
+          // the removed half against the delivered half; never a shipping arm.
+          : { slot: lighting.sunSlot, keep: globalThis.__giSrcSunSplitKeep === true },
         count: shadeCounters,
       }
     : null;
+
+  // What `[F]` closes the cached transfer against — the SAME pair the shading
+  // was built from, resolved through `srcShade.js` so the deposit side and the
+  // resolve side cannot drift apart. A thunk: the nodes belong to whichever
+  // kernel body calls it.
+  const sunClose = lightingOptions && splitShade ? sunTerm(lightingOptions) : null;
+  // §12.42's rule — a number nothing prints does not exist, and this one has
+  // three ways to be silently absent (no surface attribution, the one-kernel
+  // arm, no directional slot to name). The walk probe reads this line to know
+  // which arm it measured.
+  if (lightingOptions) {
+    console.log(
+      sunClose
+        ? "[gi] src §12.82 sun split: ARMED (opt-in) — the sun is re-evaluated per frame at [F]. " +
+          "⚠ ITS BIN-LEVEL DELIVERY IS SHORT (11-41% of what it removes); do not read this arm as correct"
+        : `[gi] src §12.82 sun split: OFF (${
+          globalThis.__giSrcSunSplit !== true ? "default — arm with __giSrcSunSplit = true"
+            : !splitShade ? "one-kernel shading (__giSrcSplitShade = false) — [J] is where the split deposits"
+              : "no directional light slot to name"
+        }) — the sun accumulates into the bins and stales with the day cycle`,
+    );
+  }
 
   // THE SPLIT FORM: [E] gets attribution only.
   const attribute = srcSurfaceAt && splitShade
@@ -977,6 +1167,10 @@ export function createSrcProbeSystem({
         lmax: lmaxU,
         maxLods: MAX_LODS,
         w0: W0,
+        // §15 U3 — the hit gather is where a validity-blind corner poisons
+        // the DEPOSIT; same closure as the screen instance above.
+        losOccupied,
+        losWorld,
         // §12.52's LUMA half, at the address [E] put in the record. Null with
         // the bundle off, and then not one node of it is built.
         surprise: surpriseBundle ? { statBase: binStore.blockStatBase } : null,
@@ -1008,6 +1202,8 @@ export function createSrcProbeSystem({
         // have [J] shade the same hit again.
         attribute,
         shadeHit,
+        // §12.82: what `[F]` re-evaluates the cached sun transfer against.
+        sunClose,
         // [J]'s hit list. Passed ONLY when [J] exists, and that is what keeps
         // the un-split kernel byte-identical to the pre-[J] one: with this
         // null, not a node of the record or the append is built.
@@ -1078,9 +1274,35 @@ export function createSrcProbeSystem({
   // backs a bit-exactness claim. The live dial is `__giSrcSeedRays` (0 = the
   // in-page A/B arm), polled in `syncCamera` under the same §12.23 rule as α.
   const seedOn = globalThis.__giSrcSeed !== false;
+  // ⚠ §12.82 AND THE SEED, WORKED THROUGH — IT COMPOSES, AND THE REASON IS THE
+  // COUNT. The seed copies a parent's RESOLVED payload into `BIN_R/G/B`, which
+  // under the split is the SUN-FREE channel, and that payload has already had
+  // the sun closed into it at `[F]`. That reads like a double delivery. It is
+  // not, because the seed also adds its weight `W` to `BIN_COUNT`, and the
+  // resolve divides BOTH sums by it:
+  //
+  //     ΣR/Σcount            = w_seed·L_parent(full) + w_ray·L(sun-free)
+  //     (ΣS/Σcount)·E·cos    = w_ray·sun(now)          — ΣS has no seeded term
+  //     total                = w_seed·L_parent(full) + w_ray·L(full, now)
+  //
+  // a convex blend of the parent's answer and this frame's, which is exactly
+  // what the seed is for. What the seeded fraction carries is a STALE sun (the
+  // parent's, at seed time), decaying out at the ordinary rate — i.e. the
+  // pre-split behaviour, confined to a shrinking fraction of one bin's weight,
+  // instead of the whole store. Nothing to guard; worth writing down, because
+  // the shape invites the wrong conclusion and a "fix" would break the blend.
   const seedRaysU = uniform(SEED_RAYS);
   const seed = seedOn && deposit
-    ? createSrcSeedFrame(store, binStore, { lmax: lmaxU, seedRays: seedRaysU })
+    ? createSrcSeedFrame(store, binStore, {
+        lmax: lmaxU,
+        seedRays: seedRaysU,
+        // §12.59.2's spatial fallback (cold-column rescue) — §16 D2b: armed
+        // on both key arms; the anchor is what the default arm re-keys by.
+        camera: vec3(cameraU),
+        spacing0,
+        maxLods: MAX_LODS,
+        anchor: vec3(anchorU),
+      })
     : null;
 
   // ── [G]: THE MERGE (plan §12.18.7 unit 3) ────────────────────────────────
@@ -1103,7 +1325,15 @@ export function createSrcProbeSystem({
         // world-absolute keying. Same uniform the population's LOD metric uses.
         camera: vec3(cameraU),
         sky: sky ? vec3(sky) : vec3(0),
+        // §16 S1 — the top-cascade close samples the environment per bin
+        // direction when this is armed.
+        skyEnv,
         w0: W0,
+        // §15 U3b — the same one-bit closure the gather instances take; the
+        // merge marches child probe → parent corner with it so cross-wall
+        // parents stop poisoning this room's own tiles (the leak the
+        // gather-side march measurably cannot reach on a healthy ladder).
+        losOccupied,
       })
     : null;
 
@@ -1150,6 +1380,8 @@ export function createSrcProbeSystem({
     tiles,
     hashBlockFrame,
     gather,
+    /** [I'] — the half-res reflection-direction gather, or null when off. */
+    glossy,
     spacing0,
     raysPerPixel: tier.raysPerPixel,
     // ONE dispatch list, in dependency order: population → budget → trace and
@@ -1210,6 +1442,10 @@ export function createSrcProbeSystem({
               : deposit.passes),
           ...merge.passes, ...tiles.passes,
           gather.reset, gather.compute,
+          // The glossy gather reads the SAME atlas bake the diffuse gather
+          // does, so anywhere after `tiles.passes` is correct; after the
+          // diffuse keeps the two half-frames adjacent for the profiler.
+          ...(glossy ? [glossy.compute] : []),
         ]
       : [...frame.passes, ...rayFrame.passes],
     // ── WHO OWNS THE FRAME ──────────────────────────────────────────────────
@@ -1260,6 +1496,7 @@ export function createSrcProbeSystem({
           { label: "merge", count: merge.passes.length },
           { label: "tiles", count: tiles.passes.length },
           { label: "gather", count: 2 },
+          { label: "glossy gather", count: glossy ? 1 : 0 },
         ].filter((g) => g.count > 0)
       : [
           { label: "populate", count: frame.passes.length },
@@ -1491,6 +1728,36 @@ export function createSrcProbeSystem({
       // in, so no page could read back what α the motion signal actually
       // produced, and the intensity-delta fix would have shipped on faith.
       globalThis.__giSrcAlphaLive = alpha;
+      // §13.9's C0↔C1 gather-weight dial, pushed live so a probe can render
+      // both arms in one boot at one pose (see `smoothU` in srcScreenGather).
+      // Unset leaves the uniform at the shared reader's build-time value, so
+      // an ordinary boot and every gate are untouched.
+      if (gather?.smoothWeights) {
+        const pin = Number(globalThis.__giGatherSmoothLive);
+        if (Number.isFinite(pin)) {
+          const v = Math.min(1, Math.max(0, pin));
+          if (gather.smoothWeights.value !== v) gather.smoothWeights.value = v;
+        }
+      }
+      // §12.88's normal bias, same idiom and the same reason: the only A/B this
+      // scene supports is one boot sweeping a uniform at one fixed pose.
+      if (gather?.normalBias) {
+        const pin = Number(globalThis.__giGatherNormalBiasLive);
+        if (Number.isFinite(pin)) {
+          const v = Math.min(2, Math.max(0, pin));
+          if (gather.normalBias.value !== v) gather.normalBias.value = v;
+        }
+      }
+      // §12.89's LOS suppression strength. Only has an effect when the march
+      // was compiled in (`__giGatherLosWeight === true` at BUILD time) — the
+      // probe arms the build and then sweeps this live.
+      if (gather?.losStrength) {
+        const pin = Number(globalThis.__giGatherLosLive);
+        if (Number.isFinite(pin)) {
+          const v = Math.min(1, Math.max(0, pin));
+          if (gather.losStrength.value !== v) gather.losStrength.value = v;
+        }
+      }
       // ── THE ROOT RELAXES WITH MOTION (§12.43) ────────────────────────────
       // At m = 0 this is §12.32's root exactly — preserve evidence across
       // sparse refreshes, the still scene's variance shield. At m = 1 it is
@@ -1648,6 +1915,12 @@ export function createSrcProbeSystem({
       // wrap is that a block untouched since the last lap gets zeroed instead
       // of decayed, which is what a block untouched for 2.2 years deserves.
       frameStampU.value = (frameStampU.value + 1) >>> 0;
+      // The re-anchor kill's countdown (see syncCamera): armed for two
+      // frames so pass ordering inside the re-anchor frame cannot leak a
+      // stale-keyed probe, then off.
+      const killOn = retainKillFrames > 0 ? 1 : 0;
+      if (retainKillU.value !== killOn) retainKillU.value = killOn;
+      if (retainKillFrames > 0) retainKillFrames--;
       // The ray ceiling's residue class, rotated by the same counter. Over
       // `stride` frames every pixel is sampled exactly once, which is what
       // makes this a temporal subsample rather than a permanent crop — and the
@@ -1757,7 +2030,15 @@ export function createSrcProbeSystem({
         }
         return false;
       }
-      if (anchored && drift <= REANCHOR_CHEBYSHEV * spacing0) return false;
+      // The radius is DERIVED from the key window — see `reanchorChebyshev`'s
+      // header for why the old constant fired inside the user's house at ultra
+      // and not at high. Cells of the ACTUAL lattice, because the key window is
+      // in those cells; an earlier version pinned this to the TIER's nominal
+      // spacing to stop the radius shrinking with a refined s0, which the
+      // derived value makes unnecessary — 174 cells is past any interior at
+      // every tier, so there is nothing left to protect against.
+      const reanchorMetres = reanchorChebyshev() * spacing0;
+      if (anchored && drift <= reanchorMetres) return false;
       // Snap to a whole number of quanta rather than to the camera itself, so a
       // player pacing back and forth across the threshold does not re-anchor on
       // alternate frames. The quantum is the hysteresis.
@@ -1770,6 +2051,11 @@ export function createSrcProbeSystem({
       // one frame and every one of them COLD. Re-arm the guard — see the switch
       // above for what the unguarded version costs.
       coldGuard = COLD_GUARD_FRAMES;
+      // Retire EVERYTHING this frame (and the next, for ordering safety) —
+      // the anchor-relative retention's jump guard, and the fix for the
+      // pre-existing 60-frame stale-key adoption window (srcProbes' age
+      // pass carries the argument).
+      retainKillFrames = 2;
       return true;
     },
 
@@ -1841,6 +2127,11 @@ export function createSrcProbeSystem({
       // tracing the dynamic-resolution rebuild churn.
       const next = createSrcProbeSystem({
         gbuffer, width: nextWidth, height: nextHeight, props, volume, sky,
+        // §16 S1 + §12.90: two more args the warning above exists for — the
+        // directional sky bundle and the census's spacing override both
+        // silently reverted on the first viewport resize before this line.
+        skyEnv,
+        spacing0: spacing0Override,
         lighting, surfaces, sceneMotion, trackMotion,
         pools: nextPools ?? pools,
       });
@@ -1858,6 +2149,7 @@ export function createSrcProbeSystem({
       gizmos.dispose();
       seed?.dispose();
       secondary?.dispose();
+      glossy?.dispose();
       gather?.dispose();
       hashBlockFrame?.dispose();
       tiles?.dispose();
@@ -1881,9 +2173,12 @@ export function describeSrcProbeSystem(system) {
   // exactly like the shipped one — the §12.30 failure this file keeps re-finding
   // in a new costume. `retain` is the BUILT bundle, not the flag that asked for
   // it, so a build where the two disagree says so.
+  const retainNote = system.frame?.retain
+    ? `, retention (hold >${system.frame.retain.maxAge}f, yields at ${Math.round(system.frame.retain.highWater * 100)}% capacity)`
+    : ", retention OFF";
   const keying = worldKeysEnabled()
-    ? `WORLD-ABSOLUTE keys (no re-anchor)${system.frame?.retain ? `, locality retention (hold >${system.frame.retain.maxAge}f, yields at ${Math.round(system.frame.retain.highWater * 100)}% capacity)` : ", retention OFF"}`
-    : "anchor-relative keys (re-anchors on drift)";
+    ? `WORLD-ABSOLUTE keys (no re-anchor)${retainNote}`
+    : `anchor-relative keys (re-anchors on drift, kill-on-jump)${retainNote}`;
   const bytes = system.store.bytes + system.rayStore.bytes + (system.binStore?.bytes ?? 0);
   // `passes/groups` is not decoration: `profile.giPasses` attributes the chain
   // by walking `passGroups`, and when that came back absent there was no way to

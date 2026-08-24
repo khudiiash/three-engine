@@ -11,6 +11,22 @@ import { ensureEngine, engine, isEngineReady } from "../engineInstance.js";
 import { installEditorFramePacing } from "../editorFramePacing.js";
 import { installWheelZoom } from "../viewportZoom.js";
 import { isPickVisible } from "../pickVisibility.js";
+import { findEntityId, outermostPrefabRoot, resolveSelectionTarget } from "../pickTarget.js";
+import { selectInScreenRect } from "../selectionRect.js";
+// The viewport's window-level shortcuts are single letters, so "is the user
+// typing?" has to be answered the same way the rest of the editor answers it.
+// The ad-hoc `closest("input, textarea, select, [contenteditable]")` this file
+// used to carry has a hole: Monaco 0.55 renders its input as
+// `div.native-edit-context`, which matches none of those, so G/R/S/F/Tab fired
+// mid-word whenever the pointer happened to rest over the 3D view.
+import { isTypingTarget } from "../keyScope.js";
+import {
+  collectSelectionCandidates,
+  frustumFromNdcRect,
+  idsInFrustum,
+  ndcRectFromPixels,
+} from "../boxSelect.js";
+import { setupBoxSelect } from "../viewportBoxSelect.js";
 import {
   openBrowserPreviewUrl,
   getBrowserPreviewState,
@@ -187,6 +203,10 @@ const viewport = {
   gameCameraId: null,
   terrainBrushing: false,
   terrainBrushIndicator: null,
+  // Rubber-band selection (viewportBoxSelect.js): the overlay rectangle and
+  // the teardown for its window-level capture listener.
+  marqueeOverlay: null,
+  disposeBoxSelect: null,
   // Multi-select pivot. A world-aligned Group the transform gizmo attaches
   // to when more than one entity is selected. While dragging we fan out
   // the pivot's world delta to every selected entity; once the drag ends
@@ -286,6 +306,13 @@ async function ensureViewport() {
       viewport.pivot = pivot;
 
       viewport.orbit = new OrbitControls(viewport.camera, canvas);
+      // §16 (2026-08-24): publish the orbit pivot as the engine's camera
+      // FOCUS. The GI detail-box follow anchors on it in edit mode — an
+      // orbiting camera's POSITION crosses the follow band every fraction of
+      // a second (slide metronome, "patches flickering"), while the pivot is
+      // exactly the content being looked at. Live reference: OrbitControls
+      // mutates `target` in place.
+      engine.cameraFocus = viewport.orbit.target;
       // DEV-ONLY handle for automated harnesses. `engine.camera` IS this
       // camera, but OrbitControls re-aims it at `orbit.target` on every
       // update — so a script that sets position+lookAt gets its orientation
@@ -336,6 +363,7 @@ async function ensureViewport() {
       setupGizmo(canvas);
       setupSplineEditing(canvas);
       setupPicking(canvas);
+      setupBoxSelect(canvas);
       setupTerrainBrush(canvas);
       setupBlockoutTool(canvas, viewport);
       setupKeyboard(canvas);
@@ -597,6 +625,10 @@ function setupGizmo(canvas) {
     const cursorSelected = state.ids?.some(isCursorSelectionId);
     setCursor3DSelected(cursorSelected);
     attachSelection(state.ids);
+    // Trimesh collider outlines are built for the selection only, so they
+    // have to be re-evaluated whenever it moves — not just when the layer
+    // toggle flips.
+    setCollidersVisible(viewport.layers.colliders);
   });
   engine.on("play-changed", () => attachSelection(useSelectionStore.getState().ids));
   // Rebuild the light helper when the selected light's `kind` changes —
@@ -1241,9 +1273,16 @@ function rebuildGrid(editorSettings) {
  * we only flip `visible` so toggling is instant and reversible.
  */
 function setCollidersVisible(visible) {
+  // `mesh` colliders own no gizmo — the rendered mesh is their outline — so
+  // the toggle alone has nothing to show for them. They trace one on demand
+  // for the SELECTED entity instead, which is where "is there a collider on
+  // this, and does it cover the children?" is actually being asked. Hidden
+  // wholesale when the layer is off.
+  const selected = visible ? new Set(useSelectionStore.getState().ids) : null;
   for (const entity of engine.entities.values()) {
     const collider = entity.getComponent?.("collider");
     if (collider?.gizmo) collider.gizmo.visible = visible;
+    collider?.setOutlineVisible?.(!!selected?.has(entity.id));
     const character = entity.getComponent?.("charactercontroller");
     if (character?.gizmo) character.gizmo.visible = visible;
   }
@@ -1853,6 +1892,7 @@ function setupPicking(canvas) {
   raycaster.layers.enableAll();
   const pointer = new THREE.Vector2();
   let downPos = null;
+  let lastClick = { t: 0, x: 0, y: 0 };
 
   // Keep the last cursor position on hand for the G/R/S macros, which anchor
   // their drag where the cursor was when the key was pressed. Re-adding the
@@ -1919,6 +1959,19 @@ function setupPicking(canvas) {
       return;
     }
 
+    // A click means the whole model, not the leaf mesh it landed on: an
+    // imported .glb is a prefab, so the trunk of a tree is one entity and the
+    // leaves another, and selecting the leaves alone is never what was meant.
+    // Alt+click and double-click drill past that to the exact entity — and a
+    // second click inside a model you already drilled into stays drilled, so
+    // editing one model part-by-part doesn't mean holding Alt all afternoon.
+    const now = performance.now();
+    const doubleClick =
+      now - lastClick.t < DOUBLE_CLICK_MS &&
+      Math.hypot(e.clientX - lastClick.x, e.clientY - lastClick.y) < 5;
+    lastClick = { t: now, x: e.clientX, y: e.clientY };
+    entityId = resolveClickTarget(entityId, { drill: e.altKey || doubleClick });
+
     const selection = useSelectionStore.getState();
     if (e.ctrlKey || e.metaKey) {
       // Ctrl/Cmd: toggle this entity in/out of the current selection.
@@ -1940,6 +1993,24 @@ function setupPicking(canvas) {
       selection.select(entityId);
     }
   });
+}
+
+/** Two clicks closer together than this (and in the same spot) drill into a
+ *  prefab instead of re-selecting its root. */
+const DOUBLE_CLICK_MS = 400;
+
+/**
+ * Id of the entity a click on `entityId` should actually select.
+ *
+ * The rule and its exceptions live in pickTarget.js; this is the id/entity
+ * plumbing around it, including the sentinel ids (the 3D cursor) that are
+ * selectable but are not entities at all.
+ */
+function resolveClickTarget(entityId, { drill = false } = {}) {
+  const entity = engine.getEntity(entityId);
+  if (!entity) return entityId;
+  const selected = resolveEntities(useSelectionStore.getState().ids);
+  return resolveSelectionTarget(entity, { drill, selected })?.id ?? entityId;
 }
 
 const BRUSH_INDICATOR_SEGMENTS = 64;
@@ -2697,8 +2768,7 @@ function setupSplineEditing(canvas) {
   window.addEventListener("keydown", (e) => {
     if (e.altKey) setBreakTangent(true);
     if (!getSplineEdit().armed || engine.playing) return;
-    const target = e.target;
-    if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable) return;
+    if (isTypingTarget(e)) return;
     if (e.key === "Delete" || e.key === "x" || e.key === "X") {
       if (deleteSelectedKnot()) e.preventDefault();
     }
@@ -2830,23 +2900,6 @@ function handleAssetDrop(path, point) {
       await instantiatePrefab(`${folder}/${stem}.prefab`, at);
     })().catch((err) => console.error(String(err)));
   }
-}
-
-/**
- * Walks up the parent chain to find the entity a picked object belongs to.
- * Entity-aware helpers (e.g. the selection BoxHelper) carry an `entityId`
- * directly and resolve even though they're flagged editor-only. Pure
- * editor-only helpers (grid, gizmo, generic decoration) don't carry one
- * and short-circuit to null so they don't block selection.
- */
-function findEntityId(object) {
-  let node = object;
-  while (node) {
-    if (node.userData.entityId) return node.userData.entityId;
-    if (node.userData.editorOnly) return null;
-    node = node.parent;
-  }
-  return null;
 }
 
 /** True when `object` is the cursor proxy (or its hit-sphere). Used by
@@ -3015,7 +3068,7 @@ function setupKeyboard(canvas) {
 
   window.addEventListener("keydown", (e) => {
     if (engine.playing) return;
-    if (e.target.closest?.("input, textarea, select, [contenteditable]")) return;
+    if (isTypingTarget(e)) return;
     // Framing the selection belongs to the Hierarchy too: you pick an entity in
     // the tree and press F, with the pointer still on the row you just clicked.
     // Handled up here rather than by loosening the hover gate below — every
@@ -3073,7 +3126,7 @@ function setupKeyboard(canvas) {
   window.addEventListener("keydown", (e) => {
     // Let editable controls receive capital S instead of opening the cursor
     // snap menu while the user is typing.
-    if (e.target.closest?.("input, textarea, select, [contenteditable]")) return;
+    if (isTypingTarget(e)) return;
     if (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === "s") {
       // Don't fight the geometry editor's "S" macro OR the global
       // "Save (Ctrl+S)" — those pre-conditions already filter the input
@@ -3090,6 +3143,9 @@ function setupKeyboard(canvas) {
   // menu and as a one-keystroke shortcut. Routed through the command
   // bus so Ctrl+Z reverses it.
   window.addEventListener("keydown", (e) => {
+    // Same typing guard as Shift+S above — this one never had one at all, so a
+    // capital C anywhere in the editor moved the 3D cursor.
+    if (isTypingTarget(e)) return;
     if (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === "c") {
       if (engine.playing) return;
       const before = getCursor3D().position;
@@ -3783,6 +3839,38 @@ function AxisViewGizmo({ playing }) {
  * for with an object under the cursor, plus the 3D-cursor snaps that otherwise
  * only exist behind the Shift+S chord.
  */
+/** True when the entity sits inside a prefab instance but isn't its root —
+ *  i.e. the user drilled in and "Select Prefab Root" has somewhere to go. */
+function insidePrefabInstance(id) {
+  const entity = engine.getEntity(id);
+  const root = entity && outermostPrefabRoot(entity);
+  return !!root && root !== entity;
+}
+
+/** Walk each selected entity out to the model it belongs to. */
+function selectPrefabRoots() {
+  const roots = new Set();
+  for (const id of useSelectionStore.getState().ids) {
+    const entity = engine.getEntity(id);
+    if (!entity) continue;
+    roots.add((outermostPrefabRoot(entity) ?? entity).id);
+  }
+  if (roots.size) useSelectionStore.getState().select([...roots]);
+}
+
+/** The marquee gesture with the rectangle set to the whole viewport — the
+ *  menu-driven way to reach it, and where the gesture gets discovered. */
+function selectAllInView() {
+  const canvas = viewport.canvas;
+  if (!canvas) return;
+  selectInScreenRect({
+    left: 0,
+    top: 0,
+    right: canvas.clientWidth || canvas.width,
+    bottom: canvas.clientHeight || canvas.height,
+  });
+}
+
 function viewportMenuItems() {
   const ids = useSelectionStore.getState().ids;
   const has = ids.length > 0;
@@ -3796,6 +3884,18 @@ function viewportMenuItems() {
       : undefined;
   return [
     { label: "Focus Selected", shortcut: "F", disabled: !has, action: () => focusSelection() },
+    { separator: true },
+    {
+      label: "Select Prefab Root",
+      disabled: !ids.some((id) => insidePrefabInstance(id)),
+      hint: "A click already selects the whole model — this walks back out after Alt+click or a double-click drilled into one.",
+      action: () => selectPrefabRoots(),
+    },
+    {
+      label: "Select All in View",
+      hint: "Or hold Alt and drag a box over part of the view (add Shift to grow the selection, Ctrl to shrink it).",
+      action: () => selectAllInView(),
+    },
     { separator: true },
     { label: "Duplicate", shortcut: "Ctrl+D", disabled: !has, action: () => duplicateSelection() },
     { label: "Copy", shortcut: "Ctrl+C", disabled: !has, action: () => copyEntities(ids) },

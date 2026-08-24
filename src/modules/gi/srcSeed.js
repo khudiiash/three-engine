@@ -96,17 +96,38 @@ import {
   FLAG_FRESH,
   PROBE_BLOCK,
   PROBE_FLAGS,
+  PROBE_KEY,
   PROBE_PARENT,
   PROBE_WORDS,
   SLOT_EMPTY,
+  createProbeLookup,
 } from "./srcProbes.js";
+import { worldKeysEnabled } from "./srcMath.js";
+import {
+  cellPosition,
+  keyCell,
+  keyLod,
+  keySecondary,
+  keyWorldCell,
+  latticeOrigin,
+  nearestCell,
+  packProbeKey,
+  probeSpacing,
+} from "./srcMathTsl.js";
+import { floor, int, ivec3 } from "three/tsl";
 
-/** Seed telemetry. One atomic buffer, four words. */
+/** Seed telemetry. One atomic buffer, six words. */
 export const SEED_PROBES = 0;  // fresh probes seeded (parent had history)
 export const SEED_ORPHAN = 1;  // fresh probes with no parent probe at all
 export const SEED_COLD = 2;    // fresh probes whose parent was fresh/blockless — a cold column
 export const SEED_BINS = 3;    // bins that received a prior
-export const SEED_WORDS = 4;
+export const SEED_SPATIAL = 4; // cold-column probes rescued by the LOD+1 spatial fallback
+// §16 D2a: fresh probes that held NO bin block when the seed ran. This exit
+// used to `Return()` silently, which made "seed 0 probes" unreadable — it
+// could mean "nothing fresh at sample time" OR "fresh probes exist but the
+// seed cannot reach them" and the two have opposite fixes.
+export const SEED_NOBLOCK = 5;
+export const SEED_WORDS = 6;
 
 /**
  * Bins per thread. Bin counts quadruple up the ladder (32 at c0, 512 at c2
@@ -143,13 +164,39 @@ const SEED_MAX_UNIT = 8;
  * @param {Node} options.seedRays  uniform: the prior's effective sample count,
  *   in rays. 0 zeroes every write (the in-page off arm).
  */
-export function createSrcSeedFrame(store, bins, { lmax, seedRays } = {}) {
+export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null, spacing0 = null, maxLods = null, anchor = null } = {}) {
   const { probeTable } = store;
   const { payload, scratch } = bins;
   const N = store.cascadeCount ?? CASCADE_COUNT;
+  // §12.59.2's DEFERRED SPATIAL FALLBACK, built 2026-08-22 night — the user's
+  // "lighting blocks update on the way" named it: at a walk frontier the whole
+  // COLUMN is fresh, the cascade parent is unusable, and the probe converged
+  // from zero IN VIEW (under locality retention the pop is worse-looking, not
+  // worse — converged neighbours make each cold block visible by contrast).
+  // The fallback seeds a cold-column probe from the SAME-cascade probe at
+  // LOD+1 (whose 2× cell reaches back into visited, converged space) — same
+  // bin count, 1:1 direction mapping, no 4→1.
+  //
+  // §16 D2b (2026-08-24): armed on BOTH key arms now. The world arm recovers
+  // the LOD+1 cell anchor-free via `keyWorldCell` + floor-halving; the
+  // anchor-relative arm cannot halve cell indices (each spacing has its own
+  // `latticeOrigin`), so it re-keys BY POSITION exactly the way the populate
+  // pass [B] would: position from this key's cell, then `nearestCell` on the
+  // LOD+1 lattice. With §16 D1's retention, the LOD+1 probes that covered a
+  // region while it was distant SURVIVE the approach — which is precisely the
+  // converged prior a walk frontier wants.
+  // Cost: fresh probes only (a handful per frame) — structurally inside the
+  // 60 fps rule.
+  const worldKeys = worldKeysEnabled();
+  const spatial = camera && spacing0 != null && maxLods != null && (worldKeys || anchor);
 
   const stats = instancedArray(new Uint32Array(SEED_WORDS), "uint").toAtomic();
   const passes = [];
+  // One flag-checked probe lookup per seeded cascade (the fallback finds the
+  // LOD+1 probe by key in the SAME cascade's hash).
+  const lookups = spatial
+    ? Array.from({ length: N - 1 }, (_, c) => createProbeLookup(store, c))
+    : null;
 
   // `atomicStore`, not `.assign` — srcMerge's telemetry clear carries the trap.
   passes.push(Fn(() => {
@@ -181,39 +228,103 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays } = {}) {
       // seen last frame cannot take this branch and be re-seeded over its own
       // history.
       If(flags.bitAnd(uint(FLAG_FRESH)).equal(uint(0)), () => { Return(); });
-      const block = probeTable.element(w.add(uint(PROBE_BLOCK))).toVar();
-      // No block, nowhere to seed — the same NOBLOCK absence the deposit
-      // drops-and-counts. The probe-store counter already owns that number.
-      If(block.equal(uint(SLOT_EMPTY)), () => { Return(); });
-
       // Per-probe counters tally once, on the probe's first group — the other
       // groups of the same probe take the same branches and stay silent.
       const first = group.equal(uint(0));
 
+      const block = probeTable.element(w.add(uint(PROBE_BLOCK))).toVar();
+      // No block, nowhere to seed. §16 D2a: counted now — this was the one
+      // silent exit, and it made "seed 0 probes" indistinguishable from
+      // "nothing fresh at sample time".
+      If(block.equal(uint(SLOT_EMPTY)), () => {
+        If(first, () => {
+          atomicAdd(stats.element(uint(SEED_NOBLOCK)), uint(1));
+        });
+        Return();
+      });
+
       // PROBE_PARENT holds the parent's probe INDEX here — the populate
       // ladder's resolve settled it earlier this frame (its hash-slot interim
       // is dead by compaction, srcProbes' PROBE_PARENT doc). SLOT_EMPTY is a
-      // probe whose parent cell never got a probe: today's from-zero, counted.
+      // probe whose parent cell never got a probe.
       const parent = probeTable.element(w.add(uint(PROBE_PARENT))).toVar();
-      If(parent.equal(uint(SLOT_EMPTY)), () => {
-        If(first, () => { atomicAdd(stats.element(uint(SEED_ORPHAN)), uint(1)); });
+      // The header's trap 3 folded in: a usable parent is alive, NOT fresh
+      // (a fresh parent's payload is a previous owner's stale answer) and
+      // holds a block. `pblock` is only meaningful when `parentUsable` is 1.
+      const parentUsable = uint(0).toVar();
+      const pblock = uint(SLOT_EMPTY).toVar();
+      If(parent.notEqual(uint(SLOT_EMPTY)), () => {
+        const pw = parent.mul(uint(PROBE_WORDS)).toVar();
+        const pflags = probeTable.element(pw.add(uint(PROBE_FLAGS))).toVar();
+        const pb = probeTable.element(pw.add(uint(PROBE_BLOCK))).toVar();
+        If(pflags.bitAnd(uint(FLAG_ALIVE)).notEqual(uint(0))
+          .and(pflags.bitAnd(uint(FLAG_FRESH)).equal(uint(0)))
+          .and(pb.notEqual(uint(SLOT_EMPTY))), () => {
+          pblock.assign(pb);
+          parentUsable.assign(uint(1));
+        });
+      });
+
+      // ── THE SPATIAL FALLBACK (header note above) ─────────────────────────
+      // Only consulted when the cascade parent is unusable. The LOD+1 probe
+      // is found by KEY (same cascade, the containing cell one LOD up), via
+      // the flag-checked probe lookup — the block-only lookup would read a
+      // same-frame-fresh probe's previous owner (trap 3 again).
+      const spBlock = uint(SLOT_EMPTY).toVar();
+      if (spatial) {
+        const lookupProbe = lookups[c];
+        If(parentUsable.equal(uint(0)), () => {
+          const key = probeTable.element(w.add(uint(PROBE_KEY))).toVar();
+          const lod = keyLod(key).toVar();
+          If(lod.add(int(1)).lessThan(int(maxLods)), () => {
+            const sL = probeSpacing(c, lod, spacing0).toVar();
+            // §16 D2b, arm-aware. World keys: floor-division by 2 (negatives
+            // included) is the containing cell one LOD up on a world-anchored
+            // lattice whose spacing doubles. Anchor arm: cell indices CANNOT
+            // be halved (each spacing snaps its own `latticeOrigin`), so
+            // re-key by POSITION exactly as the populate pass [B] would —
+            // this key's world position, `nearestCell` on the LOD+1 lattice.
+            const cellL1 = (worldKeys
+              ? ivec3(floor(vec3(keyWorldCell(key, camera, sL)).mul(0.5)))
+              : nearestCell(
+                  cellPosition(keyCell(key), latticeOrigin(anchor, sL), sL),
+                  latticeOrigin(anchor, sL.mul(2)),
+                  sL.mul(2),
+                )).toVar();
+            const sp = uint(lookupProbe(packProbeKey(lod.add(int(1)), keySecondary(key), cellL1))).toVar();
+            If(sp.notEqual(uint(SLOT_EMPTY)), () => {
+              const spw = sp.mul(uint(PROBE_WORDS)).toVar();
+              const spFlags = probeTable.element(spw.add(uint(PROBE_FLAGS))).toVar();
+              const spb = probeTable.element(spw.add(uint(PROBE_BLOCK))).toVar();
+              If(spFlags.bitAnd(uint(FLAG_ALIVE)).notEqual(uint(0))
+                .and(spFlags.bitAnd(uint(FLAG_FRESH)).equal(uint(0)))
+                .and(spb.notEqual(uint(SLOT_EMPTY))), () => {
+                spBlock.assign(spb);
+              });
+            });
+          });
+        });
+      }
+
+      // Nothing to seed from: tally as before (orphan = no parent cell at
+      // all; cold = a fresh/blockless column) and keep today's from-zero.
+      If(parentUsable.equal(uint(0)).and(spBlock.equal(uint(SLOT_EMPTY))), () => {
+        If(first, () => {
+          If(parent.equal(uint(SLOT_EMPTY)), () => {
+            atomicAdd(stats.element(uint(SEED_ORPHAN)), uint(1));
+          }).Else(() => {
+            atomicAdd(stats.element(uint(SEED_COLD)), uint(1));
+          });
+        });
         Return();
       });
 
-      const pw = parent.mul(uint(PROBE_WORDS)).toVar();
-      const pflags = probeTable.element(pw.add(uint(PROBE_FLAGS))).toVar();
-      const pblock = probeTable.element(pw.add(uint(PROBE_BLOCK))).toVar();
-      // The header's trap 3: a fresh parent's payload is a previous owner's
-      // stale answer. Skip it, count it — a pan that outruns the ladder shows
-      // up HERE, as SEED_COLD, rather than as unexplained residual flicker.
-      If(pflags.bitAnd(uint(FLAG_ALIVE)).equal(uint(0))
-        .or(pflags.bitAnd(uint(FLAG_FRESH)).notEqual(uint(0)))
-        .or(pblock.equal(uint(SLOT_EMPTY))), () => {
-        If(first, () => { atomicAdd(stats.element(uint(SEED_COLD)), uint(1)); });
-        Return();
+      If(first, () => {
+        atomicAdd(stats.element(uint(SEED_PROBES)), uint(1));
+        If(spBlock.notEqual(uint(SLOT_EMPTY)), () => {
+          atomicAdd(stats.element(uint(SEED_SPATIAL)), uint(1));
+        });
       });
-
-      If(first, () => { atomicAdd(stats.element(uint(SEED_PROBES)), uint(1)); });
 
       // The prior's weight in fixed-point count units. Everything below is
       // proportional to it, which is what makes 0 the in-page off arm.
@@ -224,30 +335,50 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays } = {}) {
       const mBase = group.mul(uint(groupBins)).toVar();
       Loop({ start: uint(0), end: uint(groupBins), type: "uint", condition: "<" }, ({ i: j }) => {
         const m = mBase.add(j).toVar();
-        // srcMerge [G.3]'s 4→1 pre-average, same direction convention: the
-        // parent's four finer bins for child bin m are `4m…4m+3`, one aligned
-        // Morton run. Getting it backwards reads another DIRECTION's radiance
-        // — a hue rotation no energy check can see (the merge's own warning).
-        const pBase = uint(parentInfo.binBase)
-          .add(pblock.mul(uint(parentInfo.bins)))
-          .add(m.mul(uint(4)))
-          .toVar();
         const pL = vec3(0).toVar();
         const pT = float(0).toVar();
         const known = float(0).toVar();
-        for (let k = 0; k < 4; k++) {
-          const op = pBase.add(uint(k)).mul(uint(PAYLOAD_WORDS)).toVar();
+        If(spBlock.notEqual(uint(SLOT_EMPTY)), () => {
+          // SPATIAL source: same cascade, LOD+1 — SAME bin count and the SAME
+          // direction convention, so bin m reads bin m, no 4→1.
+          const op = uint(info.binBase)
+            .add(spBlock.mul(uint(nBins)))
+            .add(m)
+            .mul(uint(PAYLOAD_WORDS))
+            .toVar();
           const t = payload.element(op.add(uint(3))).toVar();
           If(t.greaterThanEqual(0), () => {
-            pL.addAssign(vec3(
+            pL.assign(vec3(
               payload.element(op),
               payload.element(op.add(uint(1))),
               payload.element(op.add(uint(2))),
             ));
-            pT.addAssign(t);
-            known.addAssign(1);
+            pT.assign(t);
+            known.assign(1);
           });
-        }
+        }).Else(() => {
+          // srcMerge [G.3]'s 4→1 pre-average, same direction convention: the
+          // parent's four finer bins for child bin m are `4m…4m+3`, one aligned
+          // Morton run. Getting it backwards reads another DIRECTION's radiance
+          // — a hue rotation no energy check can see (the merge's own warning).
+          const pBase = uint(parentInfo.binBase)
+            .add(pblock.mul(uint(parentInfo.bins)))
+            .add(m.mul(uint(4)))
+            .toVar();
+          for (let k = 0; k < 4; k++) {
+            const op = pBase.add(uint(k)).mul(uint(PAYLOAD_WORDS)).toVar();
+            const t = payload.element(op.add(uint(3))).toVar();
+            If(t.greaterThanEqual(0), () => {
+              pL.addAssign(vec3(
+                payload.element(op),
+                payload.element(op.add(uint(1))),
+                payload.element(op.add(uint(2))),
+              ));
+              pT.addAssign(t);
+              known.addAssign(1);
+            });
+          }
+        });
         If(known.greaterThan(0), () => {
           const inv = float(1).div(known).toVar();
           // Into the deposit's fixed point: BIN_R carries `L/Lmax · 2^16` per
@@ -296,6 +427,8 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays } = {}) {
         orphans: v[SEED_ORPHAN] >>> 0,
         cold: v[SEED_COLD] >>> 0,
         bins: v[SEED_BINS] >>> 0,
+        spatial: v[SEED_SPATIAL] >>> 0,
+        noBlock: v[SEED_NOBLOCK] >>> 0,
       };
     },
 
@@ -309,6 +442,8 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays } = {}) {
 export function formatSrcSeed(s) {
   if (!s?.dispatched) return "";
   return `seed ${s.probes} probes / ${s.bins} bins` +
+    (s.spatial ? ` (${s.spatial} via LOD+1 spatial)` : "") +
     (s.cold ? ` (${s.cold} cold)` : "") +
-    (s.orphans ? ` (${s.orphans} orphan)` : "");
+    (s.orphans ? ` (${s.orphans} orphan)` : "") +
+    (s.noBlock ? ` (${s.noBlock} noblock)` : "");
 }

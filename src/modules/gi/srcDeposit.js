@@ -140,8 +140,10 @@ import {
   dirToBin,
   intervalBoundary,
   lodAtDistance,
+  normalPresent,
   rayDirection,
   transportPixel,
+  unpackNormal,
 } from "./srcMathTsl.js";
 import {
   INFLUX_ONE,
@@ -151,13 +153,80 @@ import {
   SLOT_EMPTY,
 } from "./srcProbes.js";
 
-/** Per-bin accumulator layout. Five words, one atomic buffer. */
+/** Per-bin accumulator layout. Nine words, one atomic buffer. */
 export const BIN_R = 0;
 export const BIN_G = 1;
 export const BIN_B = 2;
 export const BIN_T = 3;     // fixed-point WEIGHT of clear deposits
 export const BIN_COUNT = 4;  // fixed-point WEIGHT of all deposits
-export const BIN_WORDS = 5;
+/**
+ * ══ §12.82 THE SUN SPLIT — WHY FOUR MORE WORDS ═════════════════════════════
+ *
+ * `BIN_R/G/B` store ACCUMULATED RADIANCE, and radiance is a function of the sun
+ * angle. The user's Level runs a day cycle (`Rotator.ts`, an
+ * `@executeInEditMode` script that assigns `rotation = f(engine.time.elapsed)`
+ * — ~0.1 rad/s, a 62.8 s cycle), so every stored value is stale by an amount
+ * proportional to how long ago its bin was last refreshed. Walk into a room and
+ * neighbouring bins are stale by DIFFERENT amounts; **that disagreement is the
+ * bright/dark patchwork the user reports**, measured at `checker` 0.0415 on
+ * arrival against 0.0046 with the sun pinned — 9×, with no decay at all in the
+ * pinned arm.
+ *
+ * ⛔ IT IS NOT A BLEND RATE. α ×5 leaves the picture **77% blockier at rest and
+ * slower to settle** (0.0044 → 0.0078, 2084 → 2660 ms); the probe ray cap ×4
+ * does nothing measurable. No rate fixes a stored quantity whose TARGET moves
+ * every frame — and the §12.43 tracking window makes it worse by design, because
+ * a continuously-moving sun keeps it armed and it keeps throwing history away.
+ *
+ * So the sun stops being STORED and starts being EVALUATED. What is cached is
+ * the part of a hit that a rotating sun does not change:
+ *
+ *   `BIN_SR/SG/SB`  Σ w · (ρ/π) · V_sun   the sun's TRANSFER — albedo and
+ *                   shadow, no cosine, no irradiance. Accumulated and decayed
+ *                   exactly like radiance, so it inherits the evidence
+ *                   weighting and the noise averaging that make `ΣR/Σcount` an
+ *                   exponentially-weighted mean over RAYS.
+ *   `BIN_SN`        the hit NORMAL, octahedral-packed into 15:15 + a flag, LAST WRITE
+ *                   WINS. A normal is geometry, not a measurement: it needs a
+ *                   representative value, not an average, and one word instead
+ *                   of three is what keeps this affordable (see the budget
+ *                   note below).
+ *
+ * and `[F]` closes it every frame against the CURRENT sun:
+ *
+ *     L = ΣR·Lmax/Σcount  +  (ΣS/Σcount) · E_sun(now) · max(0, n̂ · l(now))
+ *
+ * A rotating sun then invalidates NOTHING. Only genuine multi-bounce residue
+ * accumulates slowly, which is the thing temporal accumulation is actually for.
+ *
+ * ⚠ **WHAT STAYS STALE, NAMED SO IT IS NOT MISREAD AS FIXED: V.** Visibility
+ * toward the sun is not sun-independent and cannot be made analytic without
+ * re-tracing a shadow ray per bin per frame, which is the cost this whole
+ * module is built to avoid. So the fully-lit and fully-shadowed regions stop
+ * drifting and the SHADOW BOUNDARIES still lag at the old refresh rate. That is
+ * the honest maximum here, and it is the right trade: a late shadow edge reads
+ * as a soft penumbra, a stale cosine reads as the blocky patchwork.
+ *
+ * ⚠ **AND WHY NOT SIX WORDS.** The obvious form accumulates `Σ w·V·n` as three
+ * signed words instead of packing one. It does not fit: at the grown pool
+ * (`BIN_BUDGET` 2.8 M, the Bistro sizing) eleven words is 123 MB of `scratch`
+ * BEFORE [J]'s hit list and the per-block statistics, which ride the same
+ * buffer, and the 128 MiB binding limit is what killed capacity-addressed bins
+ * in the first place (§12.16). Nine words leaves ~17 MB of headroom there. The
+ * constructor throws with the arithmetic if a future pool eats it.
+ */
+export const BIN_SR = 5;
+export const BIN_SG = 6;
+export const BIN_SB = 7;
+/**
+ * The hit normal, octahedral 16:16. NOT a sum and NOT decayed — see the decay
+ * pass, which stores it through unchanged and zeroes it only when the block is
+ * reclaimed. Zero is the "no normal yet" sentinel: it decodes to a degenerate
+ * direction, and `[F]` tests the raw word rather than the decoded vector so the
+ * sentinel cannot be confused with a legitimately-encoded axis.
+ */
+export const BIN_SN = 8;
+export const BIN_WORDS = 9;
 
 /** Fractional bits in the radiance accumulator. §12.13.4 measured this. */
 export const DEPOSIT_F = 16;
@@ -327,7 +396,36 @@ export const STAT_IMPORTANCE_FLOORED = 14;
 export const STAT_SECONDARY = 15;
 export const STAT_SEC_CLAMPED = 16;
 export const STAT_SEC_OVERFLOW = 17;
-export const STAT_WORDS = 18;
+/**
+ * ── §12.82's OWN INSTRUMENT, WRITTEN BY `[F]` ──────────────────────────────
+ *
+ * The split has exactly one failure mode that no image statistic can name: a
+ * bin resolves with radiance but WITHOUT a cached normal, so its whole sun
+ * contribution is silently dropped. That reads as "the picture is darker" — the
+ * same symptom as a transfer that is too small, as a wrong cosine, and as a sun
+ * that never got split at all. These two words separate them: if
+ * `SUN_NORMAL / SUN_LIVE` is far below 1, the sun is being dropped for want of
+ * a normal; if it is near 1 and the picture is still dark, the arithmetic is
+ * wrong rather than the bookkeeping.
+ *
+ * `[F]` is the only pass that binds `stats` for writing besides `[E]` and `[J]`,
+ * and it binds one more buffer to do it — three of the portable eight, which is
+ * nowhere near the limit that makes [E] and [J] interesting (R7).
+ */
+export const STAT_SUN_LIVE = 18;    // resolved bins carrying RADIANCE
+export const STAT_SUN_NORMAL = 19;  // ...of which had a cached normal to close
+/**
+ * [J]-side: hits that FACE the split source, and hits shaded at all. The bin
+ * ratio above cannot distinguish "few bins ever saw a sun-facing hit" (correct
+ * — most bins are lit by bounce) from "the facing test is broken" (the bug),
+ * because it has the wrong denominator for that question. This has the right
+ * one: `SUN_FACING / SUN_SHADED` is a property of HITS, and for a sun ~21°
+ * above the horizon it should be roughly the fraction of surfaces whose normal
+ * is in its hemisphere — near half, not near a tenth.
+ */
+export const STAT_SUN_FACING = 20;
+export const STAT_SUN_SHADED = 21;
+export const STAT_WORDS = 22;
 const T_FIXED = 1024;
 
 /**
@@ -574,6 +672,13 @@ export function createSrcDepositFrame(store, bins, {
   stride = null,
   phase = null,
   threads = 0,
+  /**
+   * §12.82. `srcShade.js`'s `sunTerm(lighting)` — a THUNK returning the split
+   * source's `{direction, irradiance}` as of THIS frame. Null leaves `[F]`
+   * emitting exactly the four assignments it always did, so a build without the
+   * split is byte-identical and the bins' four extra words simply stay zero.
+   */
+  sunClose = null,
 } = {}) {
   const { probeTable, freeStack } = store;
   const { scratch, payload, stats, binTotal, w0 } = bins;
@@ -797,7 +902,53 @@ export function createSrcDepositFrame(store, bins, {
     }
     for (let w = 0; w < BIN_WORDS; w++) {
       const e = scratch.element(b.add(uint(w)));
-      atomicStore(e, uint(floor(float(atomicLoad(e)).mul(k).add(0.5))));
+      if (w === BIN_SN && globalThis.__giSunSplitHoldNormal === true) {
+        // ⚠ DIAGNOSTIC. Emits NO store for the normal at all, so the decay
+        // cannot touch it — a reclaimed block then inherits a dead probe's
+        // direction, which is wrong on purpose. It is what separated the two
+        // ways the cached normal can go missing, and it is kept because it is
+        // the control for the trap below.
+      } else if (w === BIN_SN) {
+        // §12.82: THE NORMAL IS NOT A SUM, SO IT MUST NOT BE DECAYED. It is a
+        // packed pair of 15-bit fields plus a flag; `floor(x·keep)` on that is
+        // not a dimmer normal, it is a DIFFERENT direction, and at keep 0.98 it
+        // would walk across the octahedral map a few thousand texels per second
+        // while every counter read healthy. Held exactly, and zeroed on the one
+        // event that invalidates it — the block being handed to another probe,
+        // which is the `keep == 0` the stamp check above produces.
+        //
+        // ══ ⛔⛔ AND IT IS AN `If`, NOT A `select`. THIS COST A SESSION. ══════
+        //
+        // The obvious form is `atomicStore(e, select(k > 0, atomicLoad(e), 0))`
+        // — read it back and write it unchanged when the block survives. **That
+        // zeroes the word EVERY FRAME.** `ConditionalNode` does not emit a
+        // ternary here: it `isolate()`s each branch and emits a real `if`
+        // statement assigning into a hoisted property, and an `atomicLoad` of
+        // the very word being `atomicStore`d does not survive that round trip.
+        //
+        // Nothing said so. Every counter stayed healthy — merge orphan rate,
+        // corners, `noBlock`, the shade tallies, all unchanged — and the SHADE
+        // gate passed at 0.0000% because the defect is not in the expression,
+        // it is in the store. What it cost on the user's Level, with the sun
+        // PINNED (where a re-aiming split must be a no-op): only **9% of bins
+        // carrying radiance still had a normal** against the 48-53% of hits that
+        // face the sun, so **the picture lost a quarter to a half of its light**.
+        // The tell was arithmetic, not visual: the normal count tracked THIS
+        // FRAME's facing hits at a flat 0.73 while radiance plainly survived
+        // across frames (47,540 lit bins against 13,045 hits).
+        //
+        // ⭐ THE RULE, which generalizes past this file: **never round-trip an
+        // atomic through a conditional to "keep" it. Write only when you mean to
+        // change it.** The `If` below touches the word on the one frame it is
+        // reclaimed and leaves it alone otherwise — which is also one fewer
+        // read-modify-write per bin per frame on the hottest buffer in the
+        // module. `__giSunSplitHoldNormal` is the control that proved it: with
+        // the store removed entirely the ratio went 9% → 52-63% and the luma
+        // came back (leg0 0.00154 → 0.00283 against a 0.00259-0.00294 baseline).
+        If(k.lessThanEqual(0), () => { atomicStore(e, uint(0)); });
+      } else {
+        atomicStore(e, uint(floor(float(atomicLoad(e)).mul(k).add(0.5))));
+      }
     }
     If(i.lessThan(uint(STAT_WORDS)), () => { atomicStore(stats.element(i), uint(0)); });
     // ── the per-block SUM words, cleared beside the stats ───────────────────
@@ -1237,9 +1388,87 @@ export function createSrcDepositFrame(store, bins, {
     // count now carries `2^F` per ray as well, so the two scales cancel exactly
     // and this stays a single multiply however the fixed point is retuned.
     const toL = float(lmax).mul(inv).toVar();
-    payload.element(o).assign(float(atomicLoad(scratch.element(b.add(uint(BIN_R))))).mul(toL));
-    payload.element(o.add(uint(1))).assign(float(atomicLoad(scratch.element(b.add(uint(BIN_G))))).mul(toL));
-    payload.element(o.add(uint(2))).assign(float(atomicLoad(scratch.element(b.add(uint(BIN_B))))).mul(toL));
+    const L = vec3(
+      float(atomicLoad(scratch.element(b.add(uint(BIN_R))))).mul(toL),
+      float(atomicLoad(scratch.element(b.add(uint(BIN_G))))).mul(toL),
+      float(atomicLoad(scratch.element(b.add(uint(BIN_B))))).mul(toL),
+    ).toVar();
+
+    // ── §12.82: CLOSE THE SUN, HERE, AGAINST THE SUN THAT EXISTS NOW ────────
+    //
+    //     L += (ΣS/Σcount) · E_sun(now) · max(0, n̂ · l(now))
+    //
+    // `ΣS/Σcount` is the evidence-weighted mean transfer `ρ/π · V` — the same
+    // exponentially-weighted-over-RAYS mean the radiance gets, for the same
+    // reason (a frame's single ray must not outvote another frame's twenty).
+    // `n̂` is the bin's cached hit normal. NEITHER depends on where the sun is,
+    // so a day cycle no longer invalidates a single stored word, and the ray
+    // budget goes back to buying convergence instead of chasing a moving target.
+    //
+    // ⚠ **THE PAYLOAD DOES NOT GROW, AND THAT IS THE WHOLE REASON THIS IS
+    // AFFORDABLE.** Everything downstream — the merge, the tiles, the gather,
+    // the screen resolve — reads the same four words it always did, because the
+    // sun is closed BEFORE the payload is written rather than carried through
+    // four more passes. The cost of the split is confined to `scratch` and to
+    // this multiply.
+    //
+    // ⚠ `n̂` IS TESTED ON THE RAW WORD, not on the decoded vector: octahedral
+    // (0,0) decodes to a perfectly good −Z, so an empty bin would otherwise
+    // claim to be a surface facing away and take whatever sun that gets.
+    if (sunClose) {
+      const nw = atomicLoad(scratch.element(b.add(uint(BIN_SN)))).toVar();
+      // ⚠ THE DENOMINATOR IS BINS THAT CARRY **RADIANCE**, NOT BINS THAT
+      // RESOLVE. Most resolved bins are pure TRANSMITTANCE — a ray crossed them
+      // and was blocked higher up — and those correctly have no surface and no
+      // normal, so counting them buried the ratio that matters in a ~93%
+      // constant. A bin with radiance and NO normal is the actual failure: its
+      // sun is dropped and nothing else says so.
+      const lit = float(atomicLoad(scratch.element(b.add(uint(BIN_R)))))
+        .add(float(atomicLoad(scratch.element(b.add(uint(BIN_G))))))
+        .add(float(atomicLoad(scratch.element(b.add(uint(BIN_B))))))
+        .greaterThan(0).toVar();
+      If(lit, () => {
+        atomicAdd(stats.element(uint(STAT_SUN_LIVE)), uint(1));
+        atomicAdd(stats.element(uint(STAT_SUN_NORMAL)), select(normalPresent(nw), uint(1), uint(0)));
+      });
+      If(normalPresent(nw), () => {
+        const { direction, irradiance } = sunClose();
+        const nrm = unpackNormal(nw).toVar();
+        // ── THE BISECT HATCH. `__giSunSplitCos = false` closes the sun with a
+        //    cosine of ONE, which is wrong on purpose: it separates "the cached
+        //    TRANSFER is missing or too small" from "the cached NORMAL is
+        //    wrong". Both produce the same symptom — a picture that is darker
+        //    than the un-split arm WITH THE SUN PINNED — and no image statistic
+        //    tells them apart. Never a shipping arm; it over-lights every
+        //    surface the sun grazes.
+        const cos = globalThis.__giSunSplitCos === false
+          ? float(1).toVar()
+          : nrm.dot(direction).max(0).toVar();
+        // The transfer's own scale: `ρ/π · V` lives in [0, 1], deposited as
+        // `x · DEPOSIT_SCALE` per ray exactly as `count` is, so the two scales
+        // cancel in `ΣS/Σcount` and `inv` alone converts it — no `Lmax` here,
+        // because a transfer is a reflectance and not a radiance.
+        const tr = vec3(
+          float(atomicLoad(scratch.element(b.add(uint(BIN_SR))))),
+          float(atomicLoad(scratch.element(b.add(uint(BIN_SG))))),
+          float(atomicLoad(scratch.element(b.add(uint(BIN_SB))))),
+        ).mul(inv).toVar();
+        L.addAssign(tr.mul(irradiance).mul(cos));
+      });
+      // ⚠ AND BACK UNDER THE CEILING. Every deposit was clamped to `Lmax` on
+      // its way into the fixed point, so `ΣR/Σcount` has ALWAYS been bounded by
+      // it and every consumer downstream — the merge, the tiles, the gather —
+      // has only ever seen values in [0, Lmax]. The sun now arrives AFTER that
+      // clamp, as a float, so without this a bright enough sun would hand them
+      // a range they have never been tested against. `STAT_CLAMPED` is still
+      // the instrument for "the ceiling is binding at all"; it counts the same
+      // event one stage earlier, and a sun that saturates here saturated there.
+      L.assign(L.min(vec3(float(lmax))));
+    }
+
+    payload.element(o).assign(L.x);
+    payload.element(o.add(uint(1))).assign(L.y);
+    payload.element(o.add(uint(2))).assign(L.z);
     payload.element(o.add(uint(3)))
       .assign(float(atomicLoad(scratch.element(b.add(uint(BIN_T))))).mul(inv));
   })().compute(binTotal));
@@ -1270,7 +1499,7 @@ export function createSrcDepositFrame(store, bins, {
       if (!allocated) {
         return {
           dispatched: false, rays: 0, hits: 0, deposits: 0, clamped: 0, noBlock: 0, shaded: 0,
-          secondaryHits: 0, secondaryClamped: 0, secondaryOverflow: 0,
+          secondaryHits: 0, secondaryClamped: 0, secondaryOverflow: 0, sunLive: 0, sunNormal: 0, sunFacing: 0, sunShaded: 0,
         };
       }
       const v = new Uint32Array(await renderer.getArrayBufferAsync(stats.value));
@@ -1313,6 +1542,15 @@ export function createSrcDepositFrame(store, bins, {
         secondaryHits: v[STAT_SECONDARY] >>> 0,
         secondaryClamped: v[STAT_SEC_CLAMPED] >>> 0,
         secondaryOverflow: v[STAT_SEC_OVERFLOW] >>> 0,
+        // §12.82: how many resolved bins could actually close the sun. A ratio
+        // far below 1 means the sun is being dropped for want of a cached
+        // normal, which looks exactly like every other way the split can be
+        // dark. Both zero on a build without the split.
+        sunLive: v[STAT_SUN_LIVE] >>> 0,
+        sunNormal: v[STAT_SUN_NORMAL] >>> 0,
+        // The HIT-side rate, which has the denominator the bin ratio lacks.
+        sunFacing: v[STAT_SUN_FACING] >>> 0,
+        sunShaded: v[STAT_SUN_SHADED] >>> 0,
         unattributedRate: shaded > 0 ? (v[STAT_UNATTRIBUTED] >>> 0) / shaded : 0,
         deposits: v[STAT_DEPOSITS] >>> 0,
         clamped: v[STAT_CLAMPED] >>> 0,
