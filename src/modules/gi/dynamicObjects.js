@@ -872,6 +872,159 @@ const bvh8MaskedTraceWgsl = wgslFn(/* wgsl */ `
 
 `);
 
+// §17 R7 — the CLOSEST-HIT REFLECTION variant of the static traversal.
+//
+// Same tree, same 512-bit mask, same acceptance test — plus it KEEPS what
+// the shadow fn discards: the winning triangle's OCCUPANCY SLOT (word 9 is
+// already loaded for the mask test) rides the return, and the normal goes
+// octahedral so t + normal + slot fit one vec4f:
+//
+//     x = t (< 0 miss) · y,z = octahedral normal (rayHitTSL convention —
+//     decode with octDecodeTSL) · w = bitcast<f32>(slot), 0xffffffff on miss
+//
+// A SEPARATE wgslFn rather than a widened shared one, deliberately: the
+// shadow fn's return shape is compiled into every shadow consumer, and
+// widening it would recompile all of them for a field none reads. This
+// variant is emitted ONLY into kernels that call `traceStaticBvhSlot`
+// (today: the reflection prepass). Helper names carry the C8 suffix so the
+// two wgslFns can never collide if a future kernel includes both.
+const bvh8ClosestSlotTraceWgsl = wgslFn(/* wgsl */ `
+
+	fn giStaticBvh8Slot(
+		roL: vec3f, rdL: vec3f, tMin: f32, tMax: f32,
+		nodeBase: u32, triBase: u32, maskBase: u32,
+		bits: ptr<storage, array<u32>, read_write>
+	) -> vec4f {
+
+		var stack: array<u32, 44>;
+		var sp: i32 = 0;
+		stack[0] = 1u;
+
+		var bestT: f32 = tMax;
+		var found: f32 = -1.0;
+		var bestN: vec3f = vec3f(0.0, 0.0, 1.0);
+		var bestSlot: u32 = 0u;
+		let inv = vec3f(1.0 / statNzC8(rdL.x), 1.0 / statNzC8(rdL.y), 1.0 / statNzC8(rdL.z));
+		var guard: u32 = 0u;
+
+		loop {
+			if (sp < 0 || guard > 1024u) { break; }
+			guard = guard + 1u;
+			let nref = stack[sp];
+			sp = sp - 1;
+			if (nref == 0u) { continue; }
+
+			if ((nref & 0x80000000u) != 0u) {
+				let triStart = nref & 0x00ffffffu;
+				let triCount = (nref >> 24u) & 0x7fu;
+				for (var j: u32 = 0u; j < triCount; j = j + 1u) {
+					let tw = triBase + (triStart + j) * 10u;
+					let slotId = bits[tw + 9u];
+					if ((bits[maskBase + (slotId >> 5u)] & (1u << (slotId & 31u))) != 0u) { continue; }
+					let a = vec3f(bitcast<f32>(bits[tw]), bitcast<f32>(bits[tw + 1u]), bitcast<f32>(bits[tw + 2u]));
+					let b = vec3f(bitcast<f32>(bits[tw + 3u]), bitcast<f32>(bits[tw + 4u]), bitcast<f32>(bits[tw + 5u]));
+					let c = vec3f(bitcast<f32>(bits[tw + 6u]), bitcast<f32>(bits[tw + 7u]), bitcast<f32>(bits[tw + 8u]));
+					let e1 = b - a;
+					let e2 = c - a;
+					let h = cross(rdL, e2);
+					let det = dot(e1, h);
+					if (abs(det) < 1e-10) { continue; }
+					let invDet = 1.0 / det;
+					let s = roL - a;
+					let u = dot(s, h) * invDet;
+					let q = cross(s, e1);
+					let v = dot(rdL, q) * invDet;
+					let t = dot(e2, q) * invDet;
+					if (u >= -1e-4 && v >= -1e-4 && (u + v) <= 1.0001 && t > tMin && t < bestT) {
+						bestT = t;
+						found = 1.0;
+						bestN = cross(e1, e2);
+						bestSlot = slotId;
+					}
+				}
+				continue;
+			}
+
+			let nb = nodeBase + (nref - 1u) * 28u;
+			let org = vec3f(bitcast<f32>(bits[nb]), bitcast<f32>(bits[nb + 1u]), bitcast<f32>(bits[nb + 2u]));
+			let ep = bits[nb + 3u];
+			let step = vec3f(
+				exp2(f32(i32(ep & 0xffu) - 128)),
+				exp2(f32(i32((ep >> 8u) & 0xffu) - 128)),
+				exp2(f32(i32((ep >> 16u) & 0xffu) - 128))
+			);
+			var ct: array<f32, 8>;
+			var cr: array<u32, 8>;
+			var cn: i32 = 0;
+			for (var ci: u32 = 0u; ci < 8u; ci = ci + 1u) {
+				let cref = bits[nb + 4u + ci];
+				if (cref == 0u) { continue; }
+				let qa = bits[nb + 12u + ci * 2u];
+				let qb = bits[nb + 13u + ci * 2u];
+				let bmin = org + vec3f(f32(qa & 0xffu), f32((qa >> 8u) & 0xffu), f32((qa >> 16u) & 0xffu)) * step;
+				let bmax = org + vec3f(f32((qa >> 24u) & 0xffu), f32(qb & 0xffu), f32((qb >> 8u) & 0xffu)) * step;
+				let t0 = (bmin - roL) * inv;
+				let t1 = (bmax - roL) * inv;
+				let tn = min(t0, t1);
+				let tf = max(t0, t1);
+				let te = max(max(tn.x, tn.y), max(tn.z, tMin));
+				let tx = min(min(tf.x, tf.y), min(tf.z, bestT));
+				if (tx < te) { continue; }
+				ct[cn] = te;
+				cr[cn] = cref;
+				cn = cn + 1;
+			}
+			for (var ai: i32 = 1; ai < cn; ai = ai + 1) {
+				let kt = ct[ai];
+				let kr = cr[ai];
+				var bi: i32 = ai - 1;
+				loop {
+					if (bi < 0 || ct[bi] <= kt) { break; }
+					ct[bi + 1] = ct[bi];
+					cr[bi + 1] = cr[bi];
+					bi = bi - 1;
+				}
+				ct[bi + 1] = kt;
+				cr[bi + 1] = kr;
+			}
+			for (var pi: i32 = cn - 1; pi >= 0; pi = pi - 1) {
+				if (sp >= 43) { break; }
+				sp = sp + 1;
+				stack[sp] = cr[pi];
+			}
+		}
+
+		// ⚠ The slot rides as a PLAIN integer-valued f32 (exact to 16.7M),
+		// never a bitcast: a const bitcast<f32>(0xffffffffu) is a NaN the WGSL
+		// parser REJECTS outright ("value -nan cannot be represented"), and a
+		// runtime bitcast of a small slot id is a DENORMAL any float op may
+		// flush to zero. -1 marks a miss (consumers only read .w when t >= 0).
+		if (found < 0.0) { return vec4f(-1.0, 0.0, 0.0, -1.0); }
+		let oe = giOctEncC8(normalize(bestN));
+		return vec4f(bestT, oe.x, oe.y, f32(bestSlot));
+	}
+
+	// Twin of rayHitTSL's octEncodeTSL (signNotZero: 0 encodes as +1).
+	fn giOctEncC8(n: vec3f) -> vec2f {
+		let l1 = 1.0 / max(abs(n.x) + abs(n.y) + abs(n.z), 1e-12);
+		let x = n.x * l1;
+		let y = n.y * l1;
+		if (n.z < 0.0) {
+			return vec2f(
+				(1.0 - abs(y)) * select(-1.0, 1.0, x >= 0.0),
+				(1.0 - abs(x)) * select(-1.0, 1.0, y >= 0.0)
+			);
+		}
+		return vec2f(x, y);
+	}
+
+	fn statNzC8(x: f32) -> f32 {
+		if (abs(x) < 1e-9) { return select(-1e-9, 1e-9, x >= 0.0); }
+		return x;
+	}
+
+`);
+
 // ═══════════════════════════ TSL: analytic default-primitive intersections
 /**
  * Sphere / capsule / conical-frustum ray intersection in OBJECT-LOCAL space
@@ -1637,6 +1790,25 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         vec3(origin), vec3(dir), float(tMin), float(tMax),
         staticNodeBaseUniform, staticTriBaseUniform,
         uint(baseWord + STATIC_MASK_WORD_BASE), uint(anyHit ? 1 : 0), bits,
+      ).toVar();
+    },
+
+    /**
+     * §17 R7 — closest static hit WITH the winning triangle's occupancy
+     * slot, for reflection-style rays. Packed vec4: x = t (< 0 miss),
+     * y,z = octahedral normal (decode with rayHitTSL's octDecodeTSL),
+     * w = bitcast slot id (0xffffffff on miss). Compiles its own wgslFn —
+     * see bvh8ClosestSlotTraceWgsl's header for why the shadow fn's return
+     * is not widened instead. Same live base/mask uniforms, so rebuilds
+     * repoint it without a recompile exactly like the shadow arm.
+     */
+    traceStaticBvhSlot(origin, dir, tMin, tMax) {
+      const info = set.staticBvh;
+      if (!info) return null;
+      return bvh8ClosestSlotTraceWgsl(
+        vec3(origin), vec3(dir), float(tMin), float(tMax),
+        staticNodeBaseUniform, staticTriBaseUniform,
+        uint(baseWord + STATIC_MASK_WORD_BASE), bits,
       ).toVar();
     },
 

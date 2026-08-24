@@ -55,12 +55,14 @@ import {
   texture,
   textureStore,
   uint,
+  uintBitsToFloat,
   uniform,
   vec2,
   vec3,
   vec4,
 } from "three/tsl";
 import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt, emitterSlotShadow } from "./giLight.js";
+import { octDecodeTSL } from "./rayHit/rayHitTSL.js";
 import { DEBUG_LAYER, EDITOR_LAYER, GI_MIRROR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { readRenderTargetImage } from "../../engine/renderTargetImage.js";
 import { ALBEDO_ATLAS_GRID, ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_TILE } from "./bvh/bvhScene.js";
@@ -2773,6 +2775,15 @@ export function createGiBvhReflect({
   gbuffer, target, colorTarget, width, height, bvhScene,
   cameraPosition, normalOffset, maxDistance, mask = true, dyn = null,
   strideDefault = 2,
+  // §17 R7a — the ONE-BVH bundle: { trace(origin,dir,tMin,tMax) →
+  // vec4(t, octN.xy, bitcast slot), palette: { bits, wordOffset, words,
+  // slots } | null }. When present (and its trace compiles — the static
+  // BVH region can be dropped by the degrade ladder), the prepass traces
+  // the WHOLE static scene through the shadow BVH8 in one traversal
+  // instead of the ≤128-mesh linear loop, and shades hits from the
+  // per-slot surface palette. Null keeps the incumbent path compiled
+  // (`__giOneBvhReflect = false` forces it from GISystem).
+  oneBvh = null,
 }) {
   // ── ONE RAY PER stride×stride BLOCK (2026-08-16) ────────────────────────────
   //
@@ -2891,13 +2902,74 @@ export function createGiBvhReflect({
       // that. -1 stays "never traced" (masked skip / no geometry), whose
       // honest fallback is still the field lookup.
       t.assign(-2);
-      const hit = bvhScene.firstHit(origin, R, float(maxDistance));
-      If(hit.t.greaterThanEqual(0), () => {
-        t.assign(hit.t);
-        albedo.assign(hit.albedo);
-        hasAlbedo.assign(hit.hasAlbedo);
-        octXY.assign(octEncodeNormal(hit.normal));
-      });
+      // ── §17 R7a — ONE-BVH REFLECTIONS (2026-08-24) ───────────────────────
+      //
+      // The incumbent core is a LINEAR LOOP over ≤128 seated mesh AABBs per
+      // ray, and the 452 unseated Bistro meshes VANISH from reflections
+      // (rays pass through to whatever is behind, or exit to the -2 env
+      // marker — sky painted through a chair). The static SHADOW BVH already
+      // covers EVERY static placement in one world-space BVH8 whose
+      // traversal is closest-hit and whose triangles carry their occupancy
+      // slot — so one traversal replaces up to 128 slab tests + k BLAS
+      // walks AND every prop appears. Hits shade from the per-slot surface
+      // palette (mean albedo — textured refinement is §17 R7b); the dyn
+      // union below still wins by min(t) exactly as before. When the trace
+      // is unavailable (degrade ladder dropped the region, portable) the
+      // JS-null falls back to the incumbent path at build time.
+      const oneBvhHit = oneBvh ? oneBvh.trace(origin, R, float(1e-4), float(maxDistance)) : null;
+      if (oneBvhHit) {
+        If(oneBvhHit.x.greaterThanEqual(0), () => {
+          t.assign(oneBvhHit.x);
+          // The WGSL returns the octahedral GEOMETRIC normal (winding-
+          // dependent) — face it against the ray like the incumbent's
+          // resolve does, then re-encode with the STORAGE convention.
+          const nRaw = octDecodeTSL(vec2(oneBvhHit.y, oneBvhHit.z)).toVar();
+          const nFace = select(nRaw.dot(R).lessThan(0), nRaw, nRaw.negate()).toVar();
+          octXY.assign(octEncodeNormal(nFace));
+          if (oneBvh.palette) {
+            const pal = oneBvh.palette;
+            // .w is the slot as an integer-valued float (see the WGSL note —
+            // a bitcast would be a denormal), so a plain convert is exact.
+            const slot = uint(oneBvhHit.w.max(0)).min(uint(Math.max(0, (pal.slots ?? 768) - 1))).toVar();
+            const pbase = uint(pal.wordOffset).add(slot.mul(uint(pal.words))).toVar();
+            const pa = vec3(
+              uintBitsToFloat(pal.bits.element(pbase)),
+              uintBitsToFloat(pal.bits.element(pbase.add(uint(1)))),
+              uintBitsToFloat(pal.bits.element(pbase.add(uint(2)))),
+            ).toVar();
+            // live = 0 ⇒ slot never resolved a surface colour — mid-grey,
+            // never black (R1's silent dark vote, arriving as data).
+            const live = uint(pal.bits.element(pbase.add(uint(7)))).toVar();
+            albedo.assign(select(live.greaterThan(uint(0)), pa, vec3(0.5)));
+          } else {
+            albedo.assign(vec3(0.5));
+          }
+          // §17 debug probe (build-time): paint every one-BVH HIT solid
+          // yellow — one boot separates "rays miss (black stays)" from
+          // "hits shade black (yellow appears)". EXTRA={"__giOneBvhDebug":true}.
+          if (globalThis.__giOneBvhDebug) albedo.assign(vec3(1, 1, 0));
+          hasAlbedo.assign(1);
+        });
+        // §17 debug probe, second half: MISSES become fake 1 m hits painted
+        // RED so they are visible through the whole consumer chain (a real
+        // miss renders env/black and is indistinguishable from dark shading).
+        if (globalThis.__giOneBvhDebug) {
+          If(t.lessThan(-1.5), () => {
+            t.assign(1);
+            albedo.assign(vec3(1, 0, 0));
+            hasAlbedo.assign(1);
+            octXY.assign(octEncodeNormal(N));
+          });
+        }
+      } else {
+        const hit = bvhScene.firstHit(origin, R, float(maxDistance));
+        If(hit.t.greaterThanEqual(0), () => {
+          t.assign(hit.t);
+          albedo.assign(hit.albedo);
+          hasAlbedo.assign(hit.hasAlbedo);
+          octXY.assign(octEncodeNormal(hit.normal));
+        });
+      }
       // §14 R-D (2026-08-22, "no character in another material with
       // roughness 0 metalness 1"): skinned characters are BVH-excluded
       // (bvhScene.js) and the SDF arm that used to draw them in mirrors is

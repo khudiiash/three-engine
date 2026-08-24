@@ -280,6 +280,111 @@ dispatch, not its compile).
 
 ---
 
+# ══ §17 — ONE-BVH REFLECTIONS + THE SPATIAL LEDGER (2026-08-24 evening) ══
+
+**USER MANDATE (after §16 landed):** reflections must be FAST and show the
+REAL scene; probe placement/updates must be memory- and perf-optimal;
+"calculate only what we actually need". Worker-thread BVH explicitly
+approved. Bistro at medium measured 15 fps and it was CPU (89 ms CPU vs
+24 ms GPU, 3179 draws, 13.3 GB heap → GPU DEVICE DIED — the documented
+heap-kill signature).
+
+## THE THREE MAP FACTS THAT DECIDE THE DESIGN (verified, reader fan-out)
+
+1. **The exact-reflection path's top level is a LINEAR LOOP over ≤128 mesh
+   AABBs per ray** (bvhScene.js:780-822, no TLAS), and the 452 unseated
+   Bistro meshes VANISH from reflections (rays pass through; full miss
+   writes t=-2 = "environment proven visible" → sky painted through props).
+   Both user complaints (wrong content + cost) are this one structure.
+2. **The static shadow BVH already IS the answer**: world-space BVH8 over
+   EVERY static placement (no mesh/tri caps, 768 placements, Bistro ~2.9M
+   tris), traversal ALREADY CLOSEST-HIT (`anyHit` param is dead code —
+   dynamicObjects.js:806-810 tracks bestT, near-child-first, bestT-pruned),
+   every triangle carries its OCCUPANCY SLOT inline (word 9), and the
+   8-word surface palette (albedo/emissive/emitterId/live) sits in the SAME
+   `bits` buffer — a hit can shade with ZERO new bindings. The dyn set's
+   traceDynBody is also closest-hit with objId+albedo, and min(t)
+   composition already ships in both shadow arms.
+3. **The uniform grid is NOT the memory problem**: at Bistro the occupancy
+   BITS are ~9.6 MB of the 366 MB (2.6%); ~70% is surface-record machinery
+   (records 33 MB + fit SCRATCH 82.5 MB + exact-triangle pool 112-140 MB).
+   And the dense 1 m probe volume ALLOCATES NOTHING and is CONSUMED BY
+   NOTHING ("probe lattice, NOT traced" in its own boot line) — it survives
+   only as the fit's spacing quantum. Diffuse is already fully sparse.
+
+## UNITS
+
+- **R7 — ONE-BVH REFLECTIONS (the centrepiece). ▶ R7a IMPLEMENTED
+  2026-08-24 late (gates in flight):** `giStaticBvh8Slot` wgslFn
+  (dynamicObjects.js — separate fn, C8-suffixed helpers, oct-normal +
+  bitcast slot in one vec4; the shared shadow fn untouched),
+  `traceStaticBvhSlot` wrapper on the dyn set (same live base/mask
+  uniforms), `#oneBvhBundle()` in GISystem (trace + palette
+  bits/wordOffset/words/slots from surfaceAttribution), and
+  createGiBvhReflect's core branches on the bundle at build time —
+  palette-shaded hits (live=0 → mid-grey, R1), ray-faced normal decoded
+  via octDecodeTSL and re-encoded with the storage convention, dyn min(t)
+  union unchanged, incumbent path kept and auto-selected whenever the
+  bundle or the static region is absent. `__giOneBvhReflect = false`
+  forces the incumbent.
+  (a) A closest-hit WGSL variant `giStaticBvh8Closest` compiled ONLY into
+  the reflection prepass (do NOT widen the shared shadow fn's return — that
+  recompiles every shadow consumer): returns t + normal + SLOT (+ u,v — 
+  already computed at dynamicObjects.js:802-805 and discarded).
+  (b) createGiBvhReflect swaps its firstHit core to: static closest-hit ∪
+  dyn.trace, min(t) — full scene coverage, one traversal per ray.
+  (c) Shading at hits: slot → palette mean albedo + premultiplied emissive
+  (gated: palette requires srcShadeEnabled — ensure allocated for the
+  reflection consumer).
+  (d) R7b TEXTURED REFINEMENT: slot→bvhScene-mesh table (≤768 u32
+  uniforms); when the winning slot belongs to one of the ≤128
+  atlas-seated meshes, run THAT ONE mesh's BLAS in a t±ε window to recover
+  barycentric UV → the textured atlas albedo. Cost: 1 BVH8 + ≤1 BLAS per
+  ray (vs 128 slab tests + k BLAS walks). Sharp mirrors keep texture
+  detail on the big meshes; everything else gets correct geometry with
+  mean albedo.
+  (e) Hatch `__giOneBvhReflect = false` keeps the incumbent path for A/B.
+  Gates: test:gi-hit-shade + test:gi-reflection-probes (unchanged
+  semantics), a NEW prepass-content assertion (a small unseated prop must
+  appear in the reflection under R7 and be absent under the hatch), and a
+  Bistro-scale ms receipt (bvhReflect 146 ms dense → target <20 dense /
+  <5 masked).
+  Caveats carried: 44-deep stack silent subtree drop = conservative miss;
+  degrade ladder can drop the static region on portable → fall back to
+  the incumbent automatically (it checks region presence).
+- **B1 — WORKER BVH (user-approved).** buildStaticSceneBvhWords + the
+  MeshBVH BLAS builds off the main thread (flat inputs, transferable
+  words; staged-attach + 60-frame resync windows already tolerate late
+  arrival). Kills the ~1.2 s boot stall and the 200-600 ms rebuild stalls.
+- **S2-mem — THE REAL MEMORY LEVERS (not a brick map):**
+  (a) release the 82.5 MB fit SCRATCH after the build (it is scratch);
+  (b) the exact-triangle pool (112-140 MB) gets a budget + spill-to-voxel
+  policy ordered by cell density (the 40k densest cells already keep
+  voxel-box hits — extend that ladder downward under a byte budget);
+  (c) the REBUILD HEAP LEAK is now a session-killer (13.3 GB → device
+  loss) — next session opens with a real retainer-graph snapshot, not a
+  fourth guess.
+- **S3-sched — DEMAND-GATED POOL SWEEPS ("only what we need"):** tiles
+  bake ALL 21,875 blocks × 64 texels EVERY frame; decay/merge sweep the
+  whole bin pool. Gate per-block work on a dirty bit (deposits landed /
+  seed wrote / claim changed) — at rest with the ray stride, most blocks
+  are untouched most frames. This is §12.77-A3's indirect-dispatch class;
+  start with the TILE bake (biggest texel count, cleanest dirty signal).
+- **P2 — STREAMING REFLECTION PROBES (large scenes):** the 8-slot atlas
+  gains slot EVICTION + placement along the detail box (grid of candidate
+  anchors at ~12 m, nearest-N to the camera own slots, capture points
+  clearance-checked against occupancy; one capture/frame amortized as
+  today). Kills the manual-volume friction at street scale without the
+  scene-AABB smear (declined by the §16 size gate).
+- **M-check — the 3179-draw merge disengagement** on the user's live
+  Bistro: after their restart, verify merging re-engages (healthy ~384
+  draws); if the R4 floor-resolution storm (102 materials' cache keys
+  flipping over ~13 s) re-invalidates merge groups, BATCH the flips (one
+  pass once all floors resolve, or exempt GI-internal needsUpdate from
+  merging's material-edit watcher).
+
+---
+
 # ══ CHRONOLOGY: §12.82 — THE SUN SPLIT WORKS AND CHANGES NOTHING. THE STALE TERM IS `V`. ══
 
 **▶ NEXT UNIT, and it is cheap: suppress the §12.43 tracking window's arming for

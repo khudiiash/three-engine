@@ -7016,6 +7016,8 @@ export class GISystem {
         mask: this.#bvhMaskEnabled(),
         dyn: this._dynSet ?? null,
         strideDefault: this.#bvhReflectStride(),
+        // §17 R7a — whole-scene reflections through the static shadow BVH.
+        oneBvh: this.#oneBvhBundle(),
       });
       screen.bvhReflect = { compute, bvhScene: screen.bvhReflect.bvhScene, dynSet: this._dynSet ?? null };
     }
@@ -7402,6 +7404,8 @@ export class GISystem {
         // interleaved exact and probe images per texel (the mirror-wall
         // stipple); see createGiBvhReflect's strideDefault note.
         strideDefault: this.#bvhReflectStride(),
+        // §17 R7a — whole-scene reflections through the static shadow BVH.
+        oneBvh: this.#oneBvhBundle(),
       });
       state.screen.bvhReflect = { compute, bvhScene, dynSet: this._dynSet ?? null };
       // Hits are shaded when the screen chain was built with a `bvhShade`
@@ -7485,6 +7489,32 @@ export class GISystem {
    */
   #bvhReflectStride() {
     return giBvhReflectStride(qualityTierOf(this.config) === "ultra" ? 1 : 2);
+  }
+
+  /**
+   * §17 R7a — the ONE-BVH reflection bundle for createGiBvhReflect, or null
+   * to keep the incumbent ≤128-mesh loop. Null when: the hatch forces the
+   * incumbent, the dyn set is absent, the static shadow BVH region was
+   * never attached (or the degrade ladder dropped it — traceStaticBvhSlot
+   * itself returns null then, and the prepass falls back at build time), or
+   * there is no surface palette to shade hits from.
+   */
+  #oneBvhBundle() {
+    if (globalThis.__giOneBvhReflect === false) return null;
+    const dyn = this._dynSet;
+    if (!dyn?.traceStaticBvhSlot) return null;
+    const sa = this.state?.volume?.occupancyField?.surfaceAttribution ?? null;
+    return {
+      trace: (origin, dir, tMin, tMax) => dyn.traceStaticBvhSlot(origin, dir, tMin, tMax),
+      palette: sa
+        ? {
+            bits: sa.bits,
+            wordOffset: sa.paletteWordOffset,
+            words: sa.paletteWords,
+            slots: sa.paletteSlots,
+          }
+        : null,
+    };
   }
 
   #bvhMaskEnabled() {
