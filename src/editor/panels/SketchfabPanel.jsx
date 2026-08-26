@@ -4,6 +4,7 @@ import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { useProjectStore } from "../store/projectStore.js";
 import { downloadModel, getSavedToken, openModelPage, searchModels } from "../sketchfab.js";
 import { CREDENTIAL_CHANGED_EVENT } from "../credentialEvents.js";
+import { AssetPreview } from "../components/AssetPreview.jsx";
 
 const openModulesPanel = () => import("../EditorShell.jsx").then((m) => m.openPanel("modules"));
 
@@ -201,7 +202,16 @@ function ModelDetail({ model, hasProject, hasToken, onClose }) {
   return (
     <div className="ph-detail">
       <button className="ph-detail-close" onClick={onClose} title="Close">×</button>
-      {model.thumbnailUrl && <img className="ph-detail-preview" src={model.thumbnailUrl} alt={model.name} />}
+      {/* Sketchfab's own viewer, not the thumbnail. Downloading the geometry
+          to preview it would need the token AND a multi-megabyte GLTF zip per
+          click, which is the import, not a preview — and the embed is free,
+          anonymous and instant. Falls back to the still if a record somehow
+          has no embed. */}
+      <AssetPreview
+        embedUrl={model.embedUrl}
+        thumbnailUrl={model.thumbnailUrl}
+        alt={model.name}
+      />
       <h3 className="ph-detail-name">{model.name}</h3>
       <div className="ph-detail-meta">
         <span>by {model.author}</span>

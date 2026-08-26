@@ -876,5 +876,138 @@ check("merging is off unless the scene asks for it", () => {
   assert.equal(fresh.settings.performance.staticMerging, false);
 });
 
+// ---- render bundles ---------------------------------------------------------
+
+/** A scene of `count` identical merge-eligible props, with merging enabled. */
+function bundleScene(count = 30, renderBundles = false) {
+  const material = new THREE.MeshPhysicalNodeMaterial();
+  material.map = makeTexture();
+  const fresh = new Engine();
+  fresh.settings.performance.renderBundles = renderBundles;
+  for (let i = 0; i < count; i++) {
+    const entity = fresh.createEntity(`prop_${i}`);
+    const mesh = entity.addComponent("mesh");
+    mesh.mesh.geometry = new THREE.BoxGeometry(1, 1, 1);
+    mesh.mesh.material = material;
+    mesh.materialRenderable = true;
+    entity.object3D.position.set(i * 3, 0, 0);
+  }
+  fresh.scene.updateMatrixWorld(true);
+  fresh.merging.setEnabled(true);
+  fresh.merging.sync();
+  return fresh;
+}
+
+const bundlesOf = (engine) => engine.scene.children.filter((c) => c.isBundleGroup === true);
+
+check("proxies parent to the SCENE when render bundles are off", () => {
+  const fresh = bundleScene(30, false);
+  assert.ok(fresh.merging.groups.length > 0, "the fixture must actually merge something");
+  assert.equal(bundlesOf(fresh).length, 0, "no bundle group unless the scene asks");
+  for (const group of fresh.merging.groups) {
+    assert.equal(group.mesh.parent, fresh.scene, "the proxy hangs off the scene root");
+  }
+});
+
+check("⭐ proxies parent INTO a bundle group when the scene asks for one", () => {
+  const fresh = bundleScene(30, true);
+  assert.ok(fresh.merging.groups.length > 0, "the fixture must actually merge something");
+  const bundles = bundlesOf(fresh);
+  assert.equal(bundles.length, 1, "exactly one bundle group, at the scene root");
+  const bundle = bundles[0];
+  for (const group of fresh.merging.groups) {
+    assert.equal(group.mesh.parent, bundle, "every proxy is recorded into the bundle");
+  }
+  // Vertices are baked in world space, so any transform on the group moves them.
+  assert.equal(bundle.matrixAutoUpdate, false);
+  assert.deepEqual(bundle.position.toArray(), [0, 0, 0]);
+});
+
+check("⭐ the bundle's version MOVES when its contents change", () => {
+  // A bundle is a recording: attach a proxy to a clean bundle and it is simply
+  // never drawn; drop one and it keeps drawing after its geometry is disposed.
+  // Neither raises an error, so this is the only thing standing between the
+  // optimisation and silently wrong pixels.
+  const fresh = bundleScene(30, true);
+  const bundle = bundlesOf(fresh)[0];
+  const before = bundle.version;
+  assert.ok(before > 0, "building the proxies must already have dirtied it");
+  fresh.merging.invalidate("test");
+  fresh.merging._dirtiedAt = -Infinity;
+  fresh.merging._dirtySince = -Infinity;
+  fresh.merging._lastRebuildAt = -Infinity;
+  fresh.merging.sync();
+  assert.ok(
+    bundle.version > before,
+    `a rebuild must re-record the bundle (version stuck at ${before})`,
+  );
+});
+
+check("turning render bundles off hands every proxy back to the scene", () => {
+  const fresh = bundleScene(30, true);
+  assert.equal(bundlesOf(fresh).length, 1);
+  fresh.settings.performance.renderBundles = false;
+  fresh.merging.invalidate("test");
+  fresh.merging._dirtiedAt = -Infinity;
+  fresh.merging._dirtySince = -Infinity;
+  fresh.merging._lastRebuildAt = -Infinity;
+  fresh.merging.sync();
+  assert.equal(bundlesOf(fresh).length, 0, "the group is disbanded, not orphaned in the scene");
+  for (const group of fresh.merging.groups) {
+    assert.equal(group.mesh.parent, fresh.scene, "and its proxies still render");
+  }
+});
+
+check("⛔⛔ BOOT ORDER: a colour proxy built AFTER shadowMerge absorbed its members still CASTS", () => {
+  // THE "shadows are broken after each reload, changing bias fixes them" BUG
+  // (user, 2026-08-25). At boot, shadowMerge settles in ~2 s while this system
+  // defers up to 60 s for a streaming scene — so shadowMerge absorbs the raw
+  // meshes FIRST and zeroes their live `castShadow` (recording the intent in
+  // `userData.shadowCastAuthored`). A colour proxy then built from
+  // `template.castShadow` is born NON-CASTING while its originals are hidden:
+  // on Bistro that silently dropped ~2M triangles from the shadow map (757 731
+  // in-pass at boot-final vs 2 828 266 settled, bake full both times, the same
+  // proxies drawing completely in the g-buffer pass). Any later edit healed it
+  // — shadowMerge's teardown restores the bits — which is exactly why every
+  // live A/B passed and only a cold reload reproduced it.
+  const material = new THREE.MeshPhysicalNodeMaterial();
+  material.map = makeTexture();
+  const fresh = new Engine();
+  const meshes = [];
+  for (let i = 0; i < 6; i++) {
+    const entity = fresh.createEntity(`prop_${i}`);
+    const mc = entity.addComponent("mesh");
+    mc.mesh.geometry = new THREE.BoxGeometry(1, 1, 1);
+    mc.mesh.material = material;
+    mc.mesh.castShadow = true; // the AUTHORED state
+    mc.materialRenderable = true;
+    entity.object3D.position.set(i * 3, 0, 0);
+    meshes.push(mc.mesh);
+  }
+  fresh.scene.updateMatrixWorld(true);
+
+  // 1) Boot order: the shadow merge builds first and takes the live bits.
+  fresh.shadowMerge.setEnabled(true);
+  fresh.shadowMerge._dirtiedAt = -Infinity;
+  fresh.shadowMerge._dirtySince = -Infinity;
+  fresh.shadowMerge.sync();
+  assert.ok(
+    meshes.some((m) => m.castShadow === false && m.userData.shadowMergedInto),
+    "precondition: shadowMerge must have absorbed the meshes and zeroed the live bit",
+  );
+
+  // 2) The colour merge builds second, from members whose live bit is stolen.
+  fresh.merging.setEnabled(true);
+  fresh.merging.sync();
+  assert.ok(fresh.merging.groups.length > 0, "the colour merge must form a group");
+  for (const group of fresh.merging.groups) {
+    assert.equal(
+      group.mesh.castShadow, true,
+      "a colour proxy must inherit the AUTHORED castShadow — cloning the live bit births it "
+        + "non-casting, hides its originals, and their geometry vanishes from the shadow map",
+    );
+  }
+});
+
 console.log(failures ? `\n${failures} failing` : "\nall ok");
 process.exit(failures ? 1 : 0);

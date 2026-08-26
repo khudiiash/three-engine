@@ -148,6 +148,7 @@ export { PostprocessComponent } from "../../modules/postprocessing/PostprocessCo
 export { EnvironmentComponent } from "../../modules/polyhaven/EnvironmentComponent.js";
 export { ObjModelComponent } from "../../modules/ambientcg/ObjModelComponent.js";
 export { GlobalIlluminationComponent } from "../../modules/gi/GlobalIlluminationComponent.js";
+export { ReflectionProbeComponent } from "../../modules/gi/ReflectionProbeComponent.js";
 
 /**
  * Base class scripts extend for full IntelliSense on `this.entity`,

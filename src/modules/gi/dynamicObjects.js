@@ -277,6 +277,42 @@ export function classifyDynamicShape(mesh) {
 }
 
 // ═══════════════════════════════════════════════════════ CPU: BVH4 packing
+/**
+ * f32 -> IEEE half, the standard bit-twiddle (no `Float16Array` dependency —
+ * it is too new to assume in every runtime this build has to load in, and a
+ * silent `undefined` here would write zeroed UVs, i.e. every reflected surface
+ * showing one corner texel of its texture).
+ *
+ * Half is chosen over f32 for the static BVH's UV region because that region
+ * is sized against a scene whose triangle soup already costs >100 MB on the
+ * user's Bistro: 3 words per triangle instead of 6. The precision that buys is
+ * ~2^-11 RELATIVE, so a UV inside [0,1] resolves to well under a texel of a
+ * 256-px atlas tile, and a heavily TILED UV (0..20) lands within ~2 px — the
+ * error is in a reflection, of a texture, at half resolution.
+ */
+const HALF_F32 = new Float32Array(1);
+const HALF_U32 = new Uint32Array(HALF_F32.buffer);
+function toHalfBits(value) {
+  HALF_F32[0] = value;
+  const x = HALF_U32[0];
+  const sign = (x >>> 16) & 0x8000;
+  const exp = (x >>> 23) & 0xff;
+  let mant = (x >>> 12) & 0x07ff;
+  if (exp === 0xff) return sign | 0x7c00 | (x & 0x007fffff ? 0x0200 : 0);
+  if (exp > 142) return sign | 0x7bff;          // overflow -> largest finite
+  if (exp < 103) return sign;                   // underflow -> signed zero
+  if (exp < 113) {                              // subnormal half
+    mant |= 0x0800;
+    return sign | ((mant >>> (114 - exp)) + ((mant >>> (113 - exp)) & 1));
+  }
+  return (sign | ((exp - 112) << 10) | (mant >>> 1)) + (mant & 1);
+}
+
+/** Two floats into one u32 the way WGSL's `unpack2x16float` reads it back. */
+function packHalf2(u, v) {
+  return ((toHalfBits(v) << 16) | toHalfBits(u)) >>> 0;
+}
+
 /** Uncompressed 4-wide build (the `__giDynBvhArity=4` A/B arm). */
 export function buildBvh4Words(geometry) {
   return buildBvhWords(geometry, 4);
@@ -295,7 +331,7 @@ export function buildBvh8Words(geometry) {
  * levels, which preserves its SAH quality while dividing the traversal's pop
  * count; arity 8 additionally quantizes child bounds (see the header note).
  */
-export function buildBvhWords(geometry, arity = 8, triSlotOf = null, strategy = null) {
+export function buildBvhWords(geometry, arity = 8, triSlotOf = null, strategy = null, triUvOf = null) {
   const srcPos = geometry.attributes.position;
   const positions = srcPos.array.slice(0, srcPos.count * 3);
   let index;
@@ -342,6 +378,9 @@ export function buildBvhWords(geometry, arity = 8, triSlotOf = null, strategy = 
   const nodes = [];
   const tris = [];
   const triSlots = [];
+  // §18.17 — three packed UV pairs per triangle, in the SAME leaf order as
+  // `tris`, so the WGSL's `triStart + j` indexes both without a second map.
+  const triUvs = [];
   const makeLeafRef = (n) => {
     const start = tris.length / 9;
     const c = Math.min(cnt(n), 127);
@@ -353,6 +392,20 @@ export function buildBvhWords(geometry, arity = 8, triSlotOf = null, strategy = 
         tris.push(pos[vi], pos[vi + 1], pos[vi + 2]);
       }
       if (triSlotOf) triSlots.push(triSlotOf(idx[ti] / 3) >>> 0);
+      if (triUvOf) {
+        // MeshBVH reorders the index in place; `idx[ti]/3` recovers the
+        // ORIGINAL triangle id exactly as the slot lookup above does (the
+        // sequential-index precondition in buildStaticSceneBvhWords).
+        const uv = triUvOf(idx[ti] / 3);
+        if (uv) {
+          triUvs.push(packHalf2(uv[0], uv[1]), packHalf2(uv[2], uv[3]), packHalf2(uv[4], uv[5]));
+        } else {
+          // No UV for this placement — mid-tile, which reads as the tile's
+          // own centre texel rather than as black.
+          const half = packHalf2(0.5, 0.5);
+          triUvs.push(half, half, half);
+        }
+      }
     }
     return (0x80000000 | (start & 0xffffff) | (c << 24)) >>> 0;
   };
@@ -395,7 +448,14 @@ export function buildBvhWords(geometry, arity = 8, triSlotOf = null, strategy = 
   const NODE_WORDS = 28;
   const nodeWords = nodes.length * NODE_WORDS;
   const triCount = tris.length / 9;
-  const words = new Uint32Array(nodeWords + triCount * TRI_WORDS);
+  // The UV region is PARALLEL, not interleaved: the traversal's inner loop
+  // touches word 9 (the slot) of every candidate triangle and the vertices of
+  // most, and widening that stride would cost every shadow ray cache lines it
+  // never reads. Only the WINNING triangle's UV is fetched, once, after the
+  // loop.
+  const uvRel = triUvOf ? nodeWords + triCount * TRI_WORDS : 0;
+  const uvWordCount = triUvOf ? triCount * 3 : 0;
+  const words = new Uint32Array(nodeWords + triCount * TRI_WORDS + uvWordCount);
   const wf = new Float32Array(words.buffer);
   if (arity === 8) {
     // COMPRESSED 8-wide: per-node origin + per-axis power-of-two step,
@@ -469,8 +529,9 @@ export function buildBvhWords(geometry, arity = 8, triSlotOf = null, strategy = 
   } else {
     wf.set(tris, nodeWords);
   }
+  if (triUvOf) words.set(triUvs, uvRel);
   geom.dispose();
-  return { words, nodeWords, triWords: triCount * TRI_WORDS, triCount, arity };
+  return { words, nodeWords, triWords: triCount * TRI_WORDS, triCount, arity, uvRel, uvWordCount };
 }
 
 /**
@@ -484,7 +545,7 @@ export function buildBvhWords(geometry, arity = 8, triSlotOf = null, strategy = 
  * @param items [{ positions: Float32Array, index: TypedArray|null,
  *                 matrix: THREE.Matrix4, slot: number }]
  */
-export function buildStaticSceneBvhWords(items, strategy = null) {
+export function buildStaticSceneBvhWords(items, strategy = null, { uvs = false } = {}) {
   let triTotal = 0;
   for (const it of items) {
     triTotal += Math.floor((it.index ? it.index.length : it.positions.length / 3) / 3);
@@ -492,6 +553,11 @@ export function buildStaticSceneBvhWords(items, strategy = null) {
   if (triTotal < 1) return null;
   const soup = new Float32Array(triTotal * 9);
   const triSlot = new Uint32Array(triTotal);
+  // §18.17 — per-triangle UVs for textured reflection hits, built ONLY when
+  // the caller asked (i.e. when a reflection consumer exists). 6 floats per
+  // triangle here, 3 packed words on the GPU. A scene with reflections off
+  // never allocates it.
+  const triUv = uvs ? new Float32Array(triTotal * 6) : null;
   const v = new THREE.Vector3();
   let t = 0;
   for (const it of items) {
@@ -502,6 +568,14 @@ export function buildStaticSceneBvhWords(items, strategy = null) {
         v.set(it.positions[vi * 3], it.positions[vi * 3 + 1], it.positions[vi * 3 + 2]).applyMatrix4(it.matrix);
         const o = t * 9 + k * 3;
         soup[o] = v.x; soup[o + 1] = v.y; soup[o + 2] = v.z;
+        if (triUv) {
+          const u = t * 6 + k * 2;
+          // A placement whose geometry carries no UV attribute writes 0.5 —
+          // the tile centre, so it reads as a flat sample of its own texture
+          // rather than as a corner artefact.
+          triUv[u] = it.uvs ? it.uvs[vi * 2] : 0.5;
+          triUv[u + 1] = it.uvs ? it.uvs[vi * 2 + 1] : 0.5;
+        }
       }
       triSlot[t] = it.slot >>> 0;
       t++;
@@ -514,7 +588,11 @@ export function buildStaticSceneBvhWords(items, strategy = null) {
   const index = new Uint32Array(triTotal * 3);
   for (let i = 0; i < index.length; i++) index[i] = i;
   geom.setIndex(new THREE.BufferAttribute(index, 1));
-  const packed = buildBvhWords(geom, 8, (origTri) => triSlot[origTri], strategy);
+  const uvScratch = triUv ? new Float32Array(6) : null;
+  const packed = buildBvhWords(
+    geom, 8, (origTri) => triSlot[origTri], strategy,
+    triUv ? (origTri) => { uvScratch.set(triUv.subarray(origTri * 6, origTri * 6 + 6)); return uvScratch; } : null,
+  );
   geom.dispose();
   return packed;
 }
@@ -876,11 +954,17 @@ const bvh8MaskedTraceWgsl = wgslFn(/* wgsl */ `
 //
 // Same tree, same 512-bit mask, same acceptance test — plus it KEEPS what
 // the shadow fn discards: the winning triangle's OCCUPANCY SLOT (word 9 is
-// already loaded for the mask test) rides the return, and the normal goes
-// octahedral so t + normal + slot fit one vec4f:
+// already loaded for the mask test), its interpolated UV (§18.17, from the
+// parallel UV region), and its normal — four values in one vec4f:
 //
-//     x = t (< 0 miss) · y,z = octahedral normal (rayHitTSL convention —
-//     decode with octDecodeTSL) · w = bitcast<f32>(slot), 0xffffffff on miss
+//     x = t (< 0 miss)
+//     y = octahedral normal, two 12-bit fields (hi*4096 + lo), each 0..4095
+//         mapping [-1,1]; an INTEGER-VALUED f32, exact below 2^24
+//     z = fract(uv), same 12-bit pair encoding; 0.5,0.5 with no UV region
+//     w = slot as a plain integer-valued f32, -1 on miss
+//
+// giScreen's `unpack12` is the decoder; both halves are packed rather than
+// bitcast for the reason the miss-value note below spells out.
 //
 // A SEPARATE wgslFn rather than a widened shared one, deliberately: the
 // shadow fn's return shape is compiled into every shadow consumer, and
@@ -892,7 +976,7 @@ const bvh8ClosestSlotTraceWgsl = wgslFn(/* wgsl */ `
 
 	fn giStaticBvh8Slot(
 		roL: vec3f, rdL: vec3f, tMin: f32, tMax: f32,
-		nodeBase: u32, triBase: u32, maskBase: u32,
+		nodeBase: u32, triBase: u32, uvBase: u32, maskBase: u32,
 		bits: ptr<storage, array<u32>, read_write>
 	) -> vec4f {
 
@@ -904,6 +988,12 @@ const bvh8ClosestSlotTraceWgsl = wgslFn(/* wgsl */ `
 		var found: f32 = -1.0;
 		var bestN: vec3f = vec3f(0.0, 0.0, 1.0);
 		var bestSlot: u32 = 0u;
+		// §18.17: the winning triangle's global index + its barycentrics, so
+		// the UV can be resolved ONCE after the loop instead of interpolated
+		// for every candidate the traversal rejects.
+		var bestTri: u32 = 0u;
+		var bestU: f32 = 0.0;
+		var bestV: f32 = 0.0;
 		let inv = vec3f(1.0 / statNzC8(rdL.x), 1.0 / statNzC8(rdL.y), 1.0 / statNzC8(rdL.z));
 		var guard: u32 = 0u;
 
@@ -940,6 +1030,9 @@ const bvh8ClosestSlotTraceWgsl = wgslFn(/* wgsl */ `
 						found = 1.0;
 						bestN = cross(e1, e2);
 						bestSlot = slotId;
+						bestTri = triStart + j;
+						bestU = u;
+						bestV = v;
 					}
 				}
 				continue;
@@ -1000,8 +1093,40 @@ const bvh8ClosestSlotTraceWgsl = wgslFn(/* wgsl */ `
 		// runtime bitcast of a small slot id is a DENORMAL any float op may
 		// flush to zero. -1 marks a miss (consumers only read .w when t >= 0).
 		if (found < 0.0) { return vec4f(-1.0, 0.0, 0.0, -1.0); }
-		let oe = giOctEncC8(normalize(bestN));
-		return vec4f(bestT, oe.x, oe.y, f32(bestSlot));
+		// ── §18.17: FOUR VALUES INTO THREE LANES, WITHOUT A BITCAST ─────────
+		//
+		// t, a normal, a UV and a slot do not fit a vec4f one-per-lane, and
+		// the obvious fix — bitcast a packed half pair into an f32 lane — is
+		// the trap this file's slot comment already documents from the other
+		// side: such a pattern can be a NaN or a denormal, and any float op on
+		// the way out may flush or reject it.
+		//
+		// So both pairs ride as PLAIN INTEGER-VALUED FLOATS. 12 bits per
+		// component packs to at most 4095*4096+4095 = 2^24-1, which f32
+		// represents EXACTLY — no rounding on the way out, no decode drift.
+		// 12 bits of octahedral normal is ~0.05 degrees; 12 bits of a
+		// fractional UV is 1/4096, finer than a texel of a 256-px atlas tile.
+		let oe = giOctEncC8(normalize(bestN)) * 0.5 + vec2f(0.5);
+		let nq = vec2u(clamp(oe, vec2f(0.0), vec2f(0.99999)) * 4095.0);
+		var uv = vec2f(0.5, 0.5);
+		if (uvBase != 0u) {
+			let uw = uvBase + bestTri * 3u;
+			let uv0 = unpack2x16float(bits[uw]);
+			let uv1 = unpack2x16float(bits[uw + 1u]);
+			let uv2 = unpack2x16float(bits[uw + 2u]);
+			// Interpolate FIRST, wrap second: a triangle whose UVs straddle a
+			// wrap (0.9 -> 1.1) is continuous in raw UV and discontinuous in
+			// fract(), so wrapping the corners would smear the whole triangle.
+			uv = uv0 * (1.0 - bestU - bestV) + uv1 * bestU + uv2 * bestV;
+		}
+		let fuv = fract(uv);
+		let uq = vec2u(clamp(fuv, vec2f(0.0), vec2f(0.99999)) * 4095.0);
+		return vec4f(
+			bestT,
+			f32(nq.x * 4096u + nq.y),
+			f32(uq.x * 4096u + uq.y),
+			f32(bestSlot),
+		);
 	}
 
 	// Twin of rayHitTSL's octEncodeTSL (signNotZero: 0 encodes as +1).
@@ -1254,6 +1379,11 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
   // Two uniform reads per traversal — against a 44-deep stack walk, free.
   const staticNodeBaseUniform = uniform(0, "uint");
   const staticTriBaseUniform = uniform(0, "uint");
+  // §18.17 — base of the PARALLEL per-triangle UV region (3 packed words per
+  // triangle). 0 means "this build has no UV region", and the traversal
+  // returns the tile-centre UV there, so a scene that never asked for one is
+  // bit-identical to the pre-§18.17 picture.
+  const staticUvBaseUniform = uniform(0, "uint");
 
   // Persistent header-sync compute: uniform vec4s → bitcast f32 words in the
   // bits region (mask words pass through raw). Its own pipeline, 3 bindings —
@@ -1641,10 +1771,11 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
      * region that still holds the previous build is the same garbage-read as
      * the stale-literal bug this replaced.
      */
-    attachStaticBvh({ nodeBase, triBase }) {
-      set.staticBvh = { nodeBase, triBase };
+    attachStaticBvh({ nodeBase, triBase, uvBase = 0 }) {
+      set.staticBvh = { nodeBase, triBase, uvBase };
       staticNodeBaseUniform.value = nodeBase >>> 0;
       staticTriBaseUniform.value = triBase >>> 0;
+      staticUvBaseUniform.value = uvBase >>> 0;
     },
 
     /**
@@ -1795,9 +1926,10 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
 
     /**
      * §17 R7 — closest static hit WITH the winning triangle's occupancy
-     * slot, for reflection-style rays. Packed vec4: x = t (< 0 miss),
-     * y,z = octahedral normal (decode with rayHitTSL's octDecodeTSL),
-     * w = bitcast slot id (0xffffffff on miss). Compiles its own wgslFn —
+     * slot AND its interpolated UV (§18.17), for reflection-style rays.
+     * Packed vec4: x = t (< 0 miss), y = 12+12-bit octahedral normal,
+     * z = 12+12-bit fract(uv), w = slot as an integer-valued float (-1 on
+     * miss) — see the wgslFn's own banner. Compiles its own wgslFn —
      * see bvh8ClosestSlotTraceWgsl's header for why the shadow fn's return
      * is not widened instead. Same live base/mask uniforms, so rebuilds
      * repoint it without a recompile exactly like the shadow arm.
@@ -1807,7 +1939,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       if (!info) return null;
       return bvh8ClosestSlotTraceWgsl(
         vec3(origin), vec3(dir), float(tMin), float(tMax),
-        staticNodeBaseUniform, staticTriBaseUniform,
+        staticNodeBaseUniform, staticTriBaseUniform, staticUvBaseUniform,
         uint(baseWord + STATIC_MASK_WORD_BASE), bits,
       ).toVar();
     },

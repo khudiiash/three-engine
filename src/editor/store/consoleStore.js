@@ -57,6 +57,32 @@ function format(args) {
     .join(" ");
 }
 
+/**
+ * Where an uncaught error actually came from, as a few source frames.
+ *
+ * An `ErrorEvent` carries the throwing FRAME, and dropping it is what makes a
+ * message like "Cannot read properties of undefined (reading 'M_ID')"
+ * unactionable: the property name is data (an asset or material name reaching a
+ * computed lookup), so it appears nowhere in the source and the message alone
+ * cannot be traced to a call site. `filename:line` is kept as a fallback for
+ * cross-origin errors, whose stack is stripped to "Script error".
+ */
+function errorDetail(error, event) {
+  const stack = typeof error?.stack === "string" ? error.stack : "";
+  // Chrome repeats the message as the stack's first line; V8-style frames
+  // start at the second. Firefox omits it, so only drop a real duplicate.
+  const frames = stack
+    .split("\n")
+    .filter((line) => /\s+at\s|@/.test(line))
+    .slice(0, 6)
+    .join("\n");
+  if (frames) return `\n${frames}`;
+  const where = event?.filename
+    ? `\n    at ${event.filename}:${event.lineno ?? "?"}:${event.colno ?? "?"}`
+    : "";
+  return where;
+}
+
 /** Tee console.log/warn/error and window errors into the Console panel. */
 export function installConsoleCapture() {
   for (const level of ["log", "info", "warn", "error"]) {
@@ -64,17 +90,24 @@ export function installConsoleCapture() {
     console[level] = (...args) => {
       const message = format(args);
       try {
-        original(message);
+        // The ORIGINAL arguments, not the flattened string: devtools then
+        // reports each line's real call site and keeps objects inspectable.
+        // Logging the formatted copy instead made every line in the browser
+        // console read as `consoleStore.js:<line>`, which hid the origin of
+        // exactly the messages someone opens devtools to trace.
+        original(...args);
       } catch {
-        console.error("Error formatting console message:", args);
+        original(message);
       }
       useConsoleStore.getState().push(level === "info" ? "log" : level, message);
     };
   }
   window.addEventListener("error", (e) => {
-    useConsoleStore.getState().push("error", e.message);
+    useConsoleStore.getState().push("error", `${e.message}${errorDetail(e.error, e)}`);
   });
   window.addEventListener("unhandledrejection", (e) => {
-    useConsoleStore.getState().push("error", `Unhandled rejection: ${e.reason?.message ?? e.reason}`);
+    const reason = e.reason;
+    const head = reason?.message ?? reason;
+    useConsoleStore.getState().push("error", `Unhandled rejection: ${head}${errorDetail(reason, null)}`);
   });
 }

@@ -944,6 +944,23 @@ select:focus-visible {
   outline: none;
 }
 
+/* Rubber-band selection dragged over the 3D viewport (Shift / Ctrl + drag).
+   Positioned by viewportBoxSelect.js against the canvas's own parent, so it
+   stays put while the canvas is letterboxed or handed to the Game panel. */
+.viewport-marquee {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  display: none;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+}
+
+.viewport-marquee.visible {
+  display: block;
+}
+
 /* ---- Game panel -----------------------------------------------------------
    The stage is letterboxed inside `.game-stage-area`, which is why the area is
    a flex centering box and the stage's size is written inline by the panel
@@ -7592,6 +7609,13 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
   font-size: 9px;
 }
 
+/* Fab is the one browser whose grid is mostly PAID, so its badge carries the
+   price and this marks the free exceptions. Green rather than neutral because
+   "free" is the thing being scanned for. */
+.fab-badge-free {
+  background: rgba(38, 128, 74, 0.9);
+}
+
 /* Interactive GLB preview (components/ModelPreview.jsx). Used in the asset
    browsers' detail pane, where the question is "what am I about to import". */
 .model-preview-3d {
@@ -7623,6 +7647,20 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 }
 
 .model-preview-stage canvas:active { cursor: grabbing; }
+
+/* A provider's own viewer (Sketchfab, Fab), in place of our renderer — see
+   components/AssetPreview.jsx for why those two cannot use the native path.
+   Sized identically to the canvas so the pane does not reflow depending on
+   which browser you are in. */
+.model-preview-embed {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  /* The viewers paint their own (usually dark) background; this only shows
+     through in the moment before the frame commits its first paint. */
+  background: var(--bg-2);
+}
 
 .model-preview-loading {
   position: absolute;

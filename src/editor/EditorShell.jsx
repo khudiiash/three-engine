@@ -37,6 +37,7 @@ const PolyHavenPanel = lazy(() => import("./panels/PolyHavenPanel.jsx").then((m)
 const AmbientCGPanel = lazy(() => import("./panels/AmbientCGPanel.jsx").then((m) => ({ default: m.AmbientCGPanel })));
 const SketchfabPanel = lazy(() => import("./panels/SketchfabPanel.jsx").then((m) => ({ default: m.SketchfabPanel })));
 const PolyPizzaPanel = lazy(() => import("./panels/PolyPizzaPanel.jsx").then((m) => ({ default: m.PolyPizzaPanel })));
+const FabPanel = lazy(() => import("./panels/FabPanel.jsx").then((m) => ({ default: m.FabPanel })));
 const ItchioPanel = lazy(() => import("./panels/ItchioPanel.jsx").then((m) => ({ default: m.ItchioPanel })));
 const AudioLibraryPanel = lazy(() => import("./panels/AudioLibraryPanel.jsx").then((m) => ({ default: m.AudioLibraryPanel })));
 const AudioEditorPanel = lazy(() => import("./panels/AudioEditorPanel.jsx").then((m) => ({ default: m.AudioEditorPanel })));
@@ -88,6 +89,7 @@ const panelComponents = {
   ambientcg: withPanelSuspense(AmbientCGPanel),
   sketchfab: withPanelSuspense(SketchfabPanel),
   polypizza: withPanelSuspense(PolyPizzaPanel),
+  fab: withPanelSuspense(FabPanel),
   itchio: withPanelSuspense(ItchioPanel),
   audioLibrary: withPanelSuspense(AudioLibraryPanel),
   audioEditor: withPanelSuspense(AudioEditorPanel),
@@ -149,6 +151,7 @@ export const PANEL_SPECS = {
   ambientcg: { title: "AmbientCG", position: { referencePanel: "assets", direction: "within" } },
   sketchfab: { title: "Sketchfab", position: { referencePanel: "assets", direction: "within" } },
   polypizza: { title: "Poly Pizza", position: { referencePanel: "assets", direction: "within" } },
+  fab: { title: "Fab", position: { referencePanel: "assets", direction: "within" } },
   itchio: { title: "itch.io", position: { referencePanel: "assets", direction: "within" } },
   audioLibrary: { title: "Audio Library", position: { referencePanel: "assets", direction: "within" } },
   // Docks with the Assets strip for the same reason the Texture Editor does:

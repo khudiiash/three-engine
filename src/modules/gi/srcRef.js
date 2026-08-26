@@ -888,14 +888,27 @@ export function bakeProbeCoverage(cfg, built, merged, cascade = 0, interior = IR
     for (let v = 0; v < interior; v++) {
       for (let u = 0; u < interior; u++) {
         const t = v * interior + u;
-        // §12.87 — THE FRACTION OF THE LOBE ACTUALLY SAMPLED, not a flag.
-        // The GPU twin (srcTiles.js) carries the full ledger; the short form is
-        // that `bakeProbeIrradiance` renormalises over the KNOWN bins, which
+        // §12.87 — THE FRACTION OF THE LOBE ACTUALLY SAMPLED, not a flag, and
+        // the DEFAULT since 2026-08-26 (the user's own A/B: the fraction all
+        // but cleared the "checkerboard on newly visible surfaces" report at
+        // no frame cost, where lifting the per-probe ray cap cost 25% of the
+        // frame and cleared less — see the ledger in `srcTiles.js`).
+        //
+        // The GPU twin carries the full argument; the short form is that
+        // `bakeProbeIrradiance` renormalises over the KNOWN bins, which
         // EXTRAPOLATES them across the whole lobe, and `gatherPixel` then
         // weights this probe by the coverage its tap found. A flag told the
         // gather that a one-bin extrapolation was as trustworthy as a fully
         // sampled texel, so whichever probe won a cell handed the whole cell
-        // its single-bin constant. Both twins read the same hatch so
+        // its single-bin constant.
+        //
+        // ⚠ THE TWINS STORE DIFFERENT THINGS AND STILL AGREE. Coverage lives
+        // in this separate array (the tile stride is 3 everywhere in this
+        // module) and `gatherPixel` multiplies it in at gather time, while the
+        // GPU premultiplies it into the atlas RGB because its gather divides
+        // by `Σ w·c` once. Both compute `Σ w·c·E / Σ w·c`; only the stored
+        // bytes differ, which is why `test:gi-src-tiles` compares the atlas
+        // against `mirror·cover`. Both twins read the one hatch so
         // `test:gi-src-gather` compares like with like.
         let known = 0;
         let all = 0;
@@ -905,9 +918,9 @@ export function bakeProbeCoverage(cfg, built, merged, cascade = 0, interior = IR
           all += cw;
           if (values[m]) known += cw;
         }
-        tile[(v + 1) * size + (u + 1)] = globalThis.__giTileCoverFraction === true
-          ? (all > 0 ? Math.min(1, known / all) : 0)
-          : (known > 0 ? 1 : 0);
+        tile[(v + 1) * size + (u + 1)] = globalThis.__giTileCoverFraction === false
+          ? (known > 0 ? 1 : 0)
+          : (all > 0 ? Math.min(1, known / all) : 0);
       }
     }
     fillOctahedralBorder(tile, interior, size, 1);

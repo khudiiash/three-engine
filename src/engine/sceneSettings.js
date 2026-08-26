@@ -1,5 +1,6 @@
 import * as THREE from "three/webgpu";
 import { getLoadedEnvironment, loadEnvironmentAsset } from "./environmentAsset.js";
+import { collectFreezableCasters } from "./shadowFreeze.js";
 
 /**
  * Per-scene environment/rendering settings, serialized inside the scene JSON
@@ -66,6 +67,37 @@ export const SCENE_SETTINGS_DEFAULTS = {
     // 0.5 and 1 to hold targetFps, driven by the measured GPU frame time.
     dynamicResolution: false,
     targetFps: 60, // 30 | 60 | 90 | 120
+    // ⭐ THE FRAME-RATE FLOOR (§18 W3). Scales the GI module's traced-pixel
+    // budget — the one term that owns most of the GPU frame — so the measured
+    // GPU time tracks `targetFps`. See frameGovernor.js for the loop.
+    //
+    // WHY THIS AND NOT `dynamicResolution`: DRS scales the CANVAS, and GI
+    // deliberately divides DRS back out of its own sizing (see GISystem's
+    // `#screenResolveSize` — letting DRS resize GI made the loop hunt itself,
+    // because GI *is* the cost DRS was reacting to). On Bistro/ultra the raster
+    // DRS can reach is ~5 ms of a 46 ms GPU frame, so DRS alone can never hold
+    // 60 here. MEASURED, same camera, same frame: renderScale 1 → 45.7 ms GPU;
+    // renderScale 0.5 (a quarter of the pixels) → 12.1 ms.
+    //
+    // ⛔⛔ OFF BY DEFAULT (2026-08-25, reversed the same day it shipped ON).
+    // It shipped default-true on the argument "a floor nobody enables is not a
+    // floor", and one day in the field refuted that argument twice at once. On
+    // the user's GPU-bound Level scene (CPU 12.5 ms, GPU 16.6 ms) it walked to
+    // the BOTTOM rung and sat there: the resolve at 0.19× read as mud across
+    // every wall with a ghost trail on the character — while the frame STILL
+    // ran 40 fps, because GI's fixed GPU floor (probe pools, prepass, raster)
+    // does not scale with the traced-pixel budget this controls. All quality
+    // spent, floor still missed: the project's own rule calls that two
+    // regressions, not a trade. And every rung change re-mints the GI field —
+    // a visible reset reported as "gi keeps reloading".
+    //
+    // It stays available for scenes where the ladder genuinely spans the gap.
+    // ⚠ DO NOT DEFAULT IT ON AGAIN until (1) a rung change no longer re-mints
+    // the field (resize the screen targets without touching the volume state),
+    // and (2) the controller refuses to spend rungs that measurably cannot
+    // reach the target (project the reachable floor from the fixed terms
+    // before stepping).
+    adaptiveQuality: false,
     // Multiplies every volumetric material's raymarch step count. 0.5 halves
     // the per-pixel loop iterations of all volumes (biggest volume cost).
     volumeStepScale: 1, // 0.1 … 1
@@ -89,6 +121,33 @@ export const SCENE_SETTINGS_DEFAULTS = {
     // tint to GI's BVH reflection albedo rather than its own texture. Direct
     // lighting, shadows and the voxel field are unaffected.
     staticMerging: false,
+    // Collapses the SHADOW passes' casters into depth-only proxies
+    // (shadowMerge.js). Independent of `staticMerging` because it answers a
+    // different question: three swaps in one depth override for every material,
+    // so a shadow merge keys on almost nothing and reaches a far lower draw
+    // floor than the colour merge can. On Bistro the two CSM cascades were 842
+    // of 1144 draws with a measured `floorIfMerged` of 8 and 6.
+    //
+    // OFF by default while it is being proven: it rewrites `castShadow` across
+    // the scene, so a defect shows up as MISSING SHADOWS rather than a slow
+    // frame, and that is the more expensive failure to diagnose.
+    shadowMerging: false,
+    // Records the static merge proxies into a WebGPU RENDER BUNDLE, so their
+    // draws are replayed by the GPU instead of re-encoded from JavaScript every
+    // frame (three's `BundleGroup`).
+    //
+    // This is the only lever here that attacks the COST PER DRAW rather than
+    // the draw count. three submits every draw from JS, and on Bistro that is
+    // ~35-45 µs each whatever the triangle count — the frame is CPU-bound on
+    // submission, not on geometry. When a bundle is clean the renderer skips
+    // the scene walk, the per-object frustum test and the render-list build for
+    // everything inside it, then replays the whole recorded pass with one call.
+    //
+    // OFF by default while it is being proven, and the failure mode is why: a
+    // bundle is a RECORDING, so anything that changes without bumping
+    // `needsUpdate` keeps drawing the old thing. Proxies are a good first
+    // subject precisely because they are already rebuilt-not-mutated.
+    renderBundles: false,
     // Hides objects the depth buffer says are behind something else (see
     // culling/OcclusionSystem.js). OFF by default and deliberately so: it costs
     // a low-resolution depth pass over the scene's big geometry every frame,
@@ -383,6 +442,23 @@ export async function resolveRendererLimits() {
     // placements, not an invalid pipeline.
     const storageBufs = adapter?.limits?.maxStorageBuffersPerShaderStage ?? 0;
     if (storageBufs > 8) requiredLimits.maxStorageBuffersPerShaderStage = Math.min(16, storageBufs);
+    // ── THE HARNESS CAP (`globalThis.__engineLimitsCap`) ────────────────────
+    // A per-key CEILING on the ask, for harnesses that must prove the engine
+    // still works inside the PORTABLE envelope on hardware that advertises
+    // more. gi-gpu-smoke pins `{ maxStorageBuffersPerShaderStage: 8 }` with
+    // it: without the pin, the 2026-08-16 raise to 16 (above) made the
+    // smoke's "portable limit 8" assertion fail at device creation on every
+    // desktop adapter — the smoke was red while the engine was fine. Asking
+    // for exactly the baseline value is a legal ask, so capping is a
+    // `Math.min`, never a delete.
+    const cap = globalThis.__engineLimitsCap;
+    if (cap && typeof cap === "object") {
+      for (const [key, value] of Object.entries(cap)) {
+        if (Number.isFinite(value) && requiredLimits[key] != null) {
+          requiredLimits[key] = Math.min(requiredLimits[key], value);
+        }
+      }
+    }
     // One line, always: when GI later refuses the occupancy backend ("device
     // gate"), THIS is the first thing to check. Storage buffers' BINDING COUNT
     // is raised only when the adapter advertises more (above); everything else
@@ -505,8 +581,15 @@ export function applySettingsToScene(settings, scene, ambientLight, renderer) {
     // lights stay out: their 16x16 map is deliberately frozen forever
     // (LightComponent#configureShadow) and flipping autoUpdate back on would
     // re-render a placeholder nothing samples.
-    scene.traverse((obj) => {
-      if (!obj.isLight || !obj.shadow || obj.userData.giShadowMode === "gi") return;
+    // ⚠ ONE PREDICATE, SHARED WITH ShadowFreezeSystem, and that is deliberate:
+    // this walk used to filter on `obj.isLight`, which silently excluded every
+    // CSM cascade (`class LwLight extends Object3D` — it owns a real map and
+    // carries no `isLight`) while including the CSM parent, whose flag three
+    // never reads. So the author's own escape hatch was inert on exactly the
+    // scenes that needed it most. Two copies of this filter drifting apart is
+    // how that survived; `collectFreezableCasters` is now the single answer to
+    // "whose `autoUpdate` does a plain ShadowNode actually read".
+    for (const obj of collectFreezableCasters(scene)) {
       obj.shadow.autoUpdate = shadow.autoUpdate !== false;
       // ⚠ `!obj.shadow.map` WAS TESTING THE WRONG FIELD. `LightShadow.map` is the
       // WebGL render target and is ALWAYS null on the WebGPU path — the map lives
@@ -536,7 +619,7 @@ export function applySettingsToScene(settings, scene, ambientLight, renderer) {
       if (shadow.needsUpdate === true) {
         obj.shadow.needsUpdate = true;
       }
-    });
+    }
   }
 }
 

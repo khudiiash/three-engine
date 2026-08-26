@@ -11,6 +11,7 @@ import { engine } from "../../engineInstance.js";
 import { commandBus, useHistoryStore } from "../../commands/CommandBus.js";
 import { useSelectionStore } from "../../store/selectionStore.js";
 import { matchTier, candidateFromLive } from "../../hierarchySearch.js";
+import { selectInScreenRect, viewportPixelSize } from "../../selectionRect.js";
 import { useSceneStore } from "../../store/sceneStore.js";
 import { useProjectStore } from "../../store/projectStore.js";
 import { describeEntity } from "./entities.js";
@@ -101,6 +102,40 @@ defineOp({
       truncated: total > ids.length,
       entityIds: [...useSelectionStore.getState().ids],
     };
+  },
+});
+
+defineOp({
+  name: "selection.selectInRect",
+  description:
+    "Box-select: select every entity whose geometry falls inside a rectangle of the viewport image — the agent's version of dragging a marquee, and the way to grab 'everything in this corner of the level' after a screenshot, which no name or tag query can express. Coordinates are FRACTIONS of the viewport (0,0 top-left to 1,1 bottom-right), NOT pixels: viewport.screenshot renders at whatever size you asked for, so divide the pixel coordinates you read off the image by that image's width and height. The click-through rule applies here too — a hit inside a prefab instance resolves to the instance ROOT, so marqueeing an imported model returns one id and not its forty meshes.",
+  params: {
+    left: { type: "number", required: true, description: "Left edge, 0-1 across the viewport." },
+    top: { type: "number", required: true, description: "Top edge, 0-1 down the viewport." },
+    right: { type: "number", required: true, description: "Right edge, 0-1." },
+    bottom: { type: "number", required: true, description: "Bottom edge, 0-1." },
+    mode: {
+      type: "string",
+      default: "replace",
+      enum: ["replace", "add", "remove"],
+      description: "replace the selection (default), add what the box touches, or remove it.",
+    },
+  },
+  run({ left, top, right, bottom, mode = "replace" }) {
+    const size = viewportPixelSize();
+    const rect = {
+      left: Math.min(left, right) * size.width,
+      right: Math.max(left, right) * size.width,
+      top: Math.min(top, bottom) * size.height,
+      bottom: Math.max(top, bottom) * size.height,
+    };
+    if (rect.right - rect.left < 1 || rect.bottom - rect.top < 1) {
+      throw new Error("selection.selectInRect: the rectangle has no area on a viewport this size.");
+    }
+    const { touched, entityIds } = selectInScreenRect(rect, mode);
+    // The viewport size travels back so a caller can sanity-check that the
+    // fractions it sent landed where it meant them to.
+    return { touched: touched.length, entityIds, viewport: size };
   },
 });
 

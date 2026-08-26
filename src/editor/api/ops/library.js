@@ -1,7 +1,8 @@
 /**
- * The asset libraries: Poly Haven, ambientCG, Sketchfab, Poly Pizza and itch.io.
+ * The asset libraries: Poly Haven, ambientCG, Sketchfab, Poly Pizza, Fab and
+ * itch.io.
  *
- * Five browser panels with five different APIs, presented here as one
+ * Six browser panels with six different APIs, presented here as one
  * search-then-import pair. The panels each speak their provider's own dialect —
  * ambientCG calls a PBR set a "Material" and Poly Haven calls it a "texture",
  * resolutions are `2k` in one and `2K-JPG` in the other — and an agent should
@@ -32,6 +33,9 @@ const PROVIDERS = {
   ambientcg: { module: "ambientcg", label: "ambientCG", types: ["texture", "model", "hdri"], needsKey: false },
   sketchfab: { module: "sketchfab", label: "Sketchfab", types: ["model"], needsKey: true },
   polypizza: { module: "polypizza", label: "Poly Pizza", types: ["model"], needsKey: true },
+  // The only provider here with no credential at all: Fab's read API and its
+  // download URLs for free CC-BY assets are both served anonymously.
+  fab: { module: "fab", label: "Fab", types: ["model"], needsKey: false },
   itchio: { module: "itchio", label: "itch.io", types: ["pack"], needsKey: true },
 };
 
@@ -171,7 +175,7 @@ defineOp({
   name: "library.search",
   readOnly: true,
   description:
-    "Search one asset library. Returns `{ id, name, provider, type, tags, resolutions }` — pass an `id` straight to library.import. Poly Haven and ambientCG filter a full catalogue locally (so any word in the name, tags or categories matches); Sketchfab, Poly Pizza and itch.io query their own search. Poly Pizza additionally accepts `category`, `license` and `animated`, applied server-side. ⚠ With no `query` it needs at least one of them — there is no unfiltered browse — and `license` alone cannot mean 'any', since 'any' is expressed by omitting it. `people-characters` (their own label: 'Animated + Rigged Women, Men') plus `animated: true` is the way to find a rigged character.",
+    "Search one asset library. Returns `{ id, name, provider, type, tags, resolutions }` — pass an `id` straight to library.import. Poly Haven and ambientCG filter a full catalogue locally (so any word in the name, tags or categories matches); Sketchfab, Poly Pizza, Fab and itch.io query their own search. Poly Pizza additionally accepts `category`, `license` and `animated`, applied server-side. ⚠ With no `query` it needs at least one of them — there is no unfiltered browse — and `license` alone cannot mean 'any', since 'any' is expressed by omitting it. `people-characters` (their own label: 'Animated + Rigged Women, Men') plus `animated: true` is the way to find a rigged character. Fab is mostly a PAID marketplace: it defaults to the free Creative Commons slice, and `freeOnly: false` widens the search but returns listings that CANNOT be imported — only opened on fab.com.",
   params: {
     provider: { type: "string", required: true, enum: providerIds, description: "Which library to search." },
     query: { type: "string", default: "", description: "Free text. Omit to browse the most popular." },
@@ -179,7 +183,7 @@ defineOp({
       type: "string",
       default: "texture",
       enum: ["texture", "model", "hdri", "pack"],
-      description: "What kind of asset. Poly Haven and ambientCG have all three; Sketchfab and Poly Pizza are models only; itch.io is asset packs.",
+      description: "What kind of asset. Poly Haven and ambientCG have all three; Sketchfab, Poly Pizza and Fab are models only; itch.io is asset packs.",
     },
     category: {
       type: "string",
@@ -197,9 +201,15 @@ defineOp({
       type: "boolean",
       description: "Poly Pizza only: return only models that ship with animation clips.",
     },
+    freeOnly: {
+      type: "boolean",
+      default: true,
+      description:
+        "Fab only: restrict to Creative Commons Attribution listings — the ones that are free for any use and that library.import can actually fetch. Set false to search the paid catalogue too; those results are informational, since importing one would be piracy and is refused.",
+    },
     limit: { type: "number", default: 20, description: "Maximum results (1-100)." },
   },
-  async run({ provider, query = "", type = "texture", category = "", license = "", animated, limit = 20 }) {
+  async run({ provider, query = "", type = "texture", category = "", license = "", animated, freeOnly = true, limit = 20 }) {
     requireProvider(provider);
     const max = Math.max(1, Math.min(100, limit));
 
@@ -241,14 +251,48 @@ defineOp({
     if (provider === "sketchfab") {
       const { searchModels } = await import("../../sketchfab.js");
       const { models = [] } = await searchModels(query);
+      // `searchModels` returns records its own `normalise` already flattened —
+      // `id`/`author`/`license`, not the raw `uid`/`user`/`license.label` the
+      // Sketchfab API answers. Reading the raw shape here handed back an `id`
+      // of undefined for every result, which library.import then could not
+      // resolve.
       return models.slice(0, max).map((model) => ({
-        id: model.uid,
+        id: model.id,
         name: model.name,
         provider,
         type: "model",
-        tags: (model.tags ?? []).map((t) => t.name ?? t),
-        authors: [model.user?.displayName ?? model.user?.username].filter(Boolean),
-        license: model.license?.label ?? null,
+        tags: model.tags ?? [],
+        authors: [model.author].filter(Boolean),
+        license: model.license,
+        animated: model.animated,
+        thumbnail: model.thumbnailUrl,
+      }));
+    }
+
+    if (provider === "fab") {
+      const { searchListings } = await import("../../fab.js");
+      const { listings = [] } = await searchListings({
+        query,
+        // Fab's taxonomy is listing types, not asset kinds; models are the only
+        // one this engine imports, so the op's `type` does not map onto it.
+        listingType: "3d-model",
+        freeOnly: freeOnly !== false,
+      });
+      return listings.slice(0, max).map((listing) => ({
+        id: listing.id,
+        name: listing.name,
+        provider,
+        type: "model",
+        tags: listing.tags,
+        authors: [listing.author].filter(Boolean),
+        license: listing.license,
+        // The field that decides whether library.import will touch it. A paid
+        // listing is legitimate to FIND (to link a human at it) and is never
+        // fetched.
+        importable: listing.ccBy,
+        price: listing.price,
+        formats: listing.formats,
+        thumbnail: listing.thumbnailUrl,
       }));
     }
 
@@ -299,7 +343,7 @@ defineOp({
 defineOp({
   name: "library.import",
   description:
-    "Import an asset from a library into the open project, exactly as the library's panel would: files land in the provider's folder, textures get their .meta colour-space flags, and attribution is written where the licence requires it. Returns `{ paths, primary, next }` — `primary` is the ONE file worth acting on (the .prefab for a model, the .mat for a PBR set, the .hdr for an environment) and `next` names the op that consumes it. Pass `instantiate: true` to place a model in the scene in the same call. The file import itself is NOT undoable; the entity it creates is.",
+    "Import an asset from a library into the open project, exactly as the library's panel would: files land in the provider's folder, textures get their .meta colour-space flags, and attribution is written where the licence requires it. Fab imports only its free CC-BY listings and refuses anything paid; a Fab listing is often a whole PACK, so `imported` reports how many meshes it produced. Returns `{ paths, primary, next }` — `primary` is the ONE file worth acting on (the .prefab for a model, the .mat for a PBR set, the .hdr for an environment) and `next` names the op that consumes it. Pass `instantiate: true` to place a model in the scene in the same call. The file import itself is NOT undoable; the entity it creates is.",
   params: {
     provider: { type: "string", required: true, enum: providerIds, description: "The library the id came from." },
     id: { type: "any", required: true, description: "The `id` from a library.search result." },
@@ -396,9 +440,25 @@ defineOp({
       // Sketchfab's API has no "get one model" endpoint we use elsewhere; the
       // search result IS the download descriptor, so re-find it by uid.
       const { models = [] } = await searchModels(String(id));
-      const model = models.find((m) => m.uid === id) ?? models[0];
+      // `normalise` renames `uid` to `id`; matching on `uid` here never hit,
+      // so every import silently took models[0] — the first result of a search
+      // for the id string, which is not the same model.
+      const model = models.find((m) => m.id === id) ?? models[0];
       if (!model) throw new Error(`No Sketchfab model with uid "${id}" — search for it first.`);
       return finish(await downloadModel(model));
+    }
+
+    if (provider === "fab") {
+      const { fetchListing, downloadListing } = await import("../../fab.js");
+      // Fab HAS a get-one-listing endpoint, and it is the only place the
+      // licence and the media list come from — a search result alone cannot
+      // answer "is this free", which is the question that gates the download.
+      const listing = await fetchListing(String(id));
+      const outcome = await downloadListing(listing);
+      // A Fab archive is usually a PACK — forty props in one listing — so the
+      // per-mesh folders are all reported and `finish` picks a prefab out of
+      // them for `primary`.
+      return finish(outcome.folders, { imported: outcome.imported, format: outcome.format });
     }
 
     if (provider === "polypizza") {

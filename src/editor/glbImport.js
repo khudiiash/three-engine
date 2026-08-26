@@ -1,4 +1,4 @@
-import { toBlobUrl, writeBinaryFile } from "./assetLoader.js";
+import { lfsPointerMessage, lfsPointerSize, toBlobUrl, writeBinaryFile } from "./assetLoader.js";
 import * as THREE from "three/webgpu";
 import { useProjectStore, basename } from "./store/projectStore.js";
 import { useAssetProcessingStore } from "./store/assetProcessingStore.js";
@@ -138,7 +138,28 @@ export async function unpackGlb(glbPath, { assetStem = null, cleanupPaths = [] }
   );
 }
 
+/**
+ * `.glb` is Git-LFS-tracked by the repository template the editor writes, so a
+ * pointer stub reaches this path exactly as often as it reaches the FBX one.
+ * GLTFLoader would report it as malformed JSON, which describes the stub's
+ * contents rather than the reason they are the wrong contents.
+ */
+async function assertNotLfsPointer(path) {
+  try {
+    const head = await invoke("read_binary_file_head", { path, maxBytes: 256 });
+    const size = lfsPointerSize(
+      head instanceof ArrayBuffer || ArrayBuffer.isView(head) ? head : Uint8Array.from(head),
+    );
+    if (size != null) throw new Error(lfsPointerMessage(basename(path), size));
+  } catch (err) {
+    // Only the pointer verdict is worth stopping for; a failed *peek* (older
+    // app binary without the command) must not block an otherwise fine import.
+    if (String(err?.message ?? err).includes("Git LFS")) throw err;
+  }
+}
+
 async function unpackGlbImpl(glbPath, { assetStem = null, cleanupPaths = [] } = {}) {
+  await assertNotLfsPointer(glbPath);
   const gltf = await loader.loadAsync(await toBlobUrl(glbPath));
 
   const dir = glbPath.replace(/[\\/][^\\/]+$/, "");

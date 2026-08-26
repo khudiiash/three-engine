@@ -531,7 +531,17 @@ export function CodeEditor({
           </button>
         </div>
       )}
-      <div className="code-editor-host" ref={hostRef} />
+      {/* `nokey` is React Flow's opt-out, and it is not optional here. Every
+          mounted graph editor (shader, events, particles, animator, post)
+          registers `panActivationKeyCode` ("Space") and `deleteKeyCode`
+          ("Backspace"/"Delete") on WINDOW, and skips them only for a target its
+          `isInputDOMNode` recognises — INPUT / SELECT / TEXTAREA /
+          [contenteditable] / anything inside `.nokey`. Monaco 0.55 renders its
+          input as `div.native-edit-context` (EditContext, no textarea), which is
+          none of those, so with a graph panel open ANYWHERE in the layout Space
+          was preventDefault-ed before the EditContext saw it and Backspace also
+          deleted the graph's selected nodes. */}
+      <div className="code-editor-host nokey" ref={hostRef} />
       {/* The vim status line (mode, pending command, `:` prompt). Always in the
           tree so `initVimMode` has a node to write into the instant it loads,
           and collapsed to nothing while vim is off. */}

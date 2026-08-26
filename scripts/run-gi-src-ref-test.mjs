@@ -86,11 +86,13 @@ import {
   dirToBin,
   encodeDir,
   mortonToBin,
+  keyWorldCell,
   octahedralDirection,
   octahedralTexelWeight,
   octahedralUV,
   packProbeKey,
   preAverage,
+  worldKeysEnabled,
   R2_ALPHA1,
   R2_ALPHA2,
   r2Point,
@@ -460,6 +462,19 @@ console.log("── 32-BIT PROBE KEY ──────────────�
       return;
     }
     neverZero = neverZero && key !== 0;
+    if (worldKeysEnabled()) {
+      // WORLD-ABSOLUTE CONTRACT: the key holds residues, and the round-trip
+      // is pack → keyWorldCell against a reference within ±256 cells — using
+      // the cell ITSELF as the reference makes the unique representative the
+      // cell, so equality is the bijection-over-the-window claim.
+      const w = keyWorldCell(key, cx, cy, cz);
+      if (!w || w.lod !== lod || w.secondary !== secondary ||
+          w.cx !== cx || w.cy !== cy || w.cz !== cz) {
+        bijectionOk = false;
+        detail = `lod=${lod} sec=${secondary} cell=(${cx},${cy},${cz}) -> ${JSON.stringify(w)} (world)`;
+      }
+      return;
+    }
     const u = unpackProbeKey(key);
     if (!u || u.lod !== lod || u.secondary !== secondary ||
         u.cx !== cx || u.cy !== cy || u.cz !== cz) {
@@ -487,16 +502,32 @@ console.log("── 32-BIT PROBE KEY ──────────────�
   check("the unbiased-layout zero collision is gone", nastiest !== 0,
     `lod0/primary/(-256,-256,-256) -> 0x${nastiest.toString(16)}`);
 
-  // Out-of-window must REFUSE (return EMPTY), never silently wrap into a
-  // different probe's identity.
-  const outside = [
-    packProbeKey(0, false, -KEY_AXIS_OFFSET - 1, 0, 0),
-    packProbeKey(0, false, 0, KEY_AXIS_RANGE - KEY_AXIS_OFFSET, 0),
-    packProbeKey(15, false, 0, 0, 0),
-    packProbeKey(-1, false, 0, 0, 0),
-  ];
-  check("out-of-window cells refuse rather than wrap",
-    outside.every((k) => k === KEY_EMPTY), `got ${outside.map((k) => k.toString()).join(",")}`);
+  if (worldKeysEnabled()) {
+    // WORLD-ABSOLUTE: there is no out-of-window — the window is toroidal, so
+    // a far cell packs to a VALID key that reconstructs to itself near its
+    // own reference (this is the "every cell representable" property that
+    // deletes the silent-absence class). LOD refusal is unchanged.
+    const cx = -KEY_AXIS_OFFSET - 1;
+    const a = packProbeKey(0, false, cx, 0, 0);
+    const wa = keyWorldCell(a, cx, 0, 0);
+    const lodRefuse =
+      packProbeKey(15, false, 0, 0, 0) === KEY_EMPTY &&
+      packProbeKey(-1, false, 0, 0, 0) === KEY_EMPTY;
+    check("world keys: every cell representable, LODs still refuse",
+      a !== KEY_EMPTY && !!wa && wa.cx === cx && wa.cy === 0 && wa.cz === 0 && lodRefuse,
+      `cell ${cx} -> key 0x${a.toString(16)} -> ${JSON.stringify(wa)}`);
+  } else {
+    // Out-of-window must REFUSE (return EMPTY), never silently wrap into a
+    // different probe's identity.
+    const outside = [
+      packProbeKey(0, false, -KEY_AXIS_OFFSET - 1, 0, 0),
+      packProbeKey(0, false, 0, KEY_AXIS_RANGE - KEY_AXIS_OFFSET, 0),
+      packProbeKey(15, false, 0, 0, 0),
+      packProbeKey(-1, false, 0, 0, 0),
+    ];
+    check("out-of-window cells refuse rather than wrap",
+      outside.every((k) => k === KEY_EMPTY), `got ${outside.map((k) => k.toString()).join(",")}`);
+  }
 
   // The window must actually be big enough for the LOD it serves: an LOD shell
   // reaches ~2^lod * s0 * some constant, and a 512-cell axis must cover it.
@@ -1847,9 +1878,21 @@ console.log("── HIT SHADING: R4, THE IN-LOOP ALBEDO CEILING ─────�
   // direction, and let the GPU side choose the coarsening against a real scene
   // rather than against this 2m box.
   const drift = coarse2[coarse2.length - 1] / clamped[clamped.length - 1] - 1;
-  check("coarsening moves the fixed point by a bounded amount, and the direction is BRIGHT (leak)",
-    drift > 0 && drift < 0.1,
-    `+${(drift * 100).toFixed(2)}% at 4x coarser, in a box exactly one coarse cell wide`);
+  // §14 Q9: the BRIGHT direction is a property of the POSITION-ONLY gather
+  // (its trilinear corners straddle walls one-sidedly). The gather's normal
+  // wrap weight ships default-armed now and suppresses exactly that leak, so
+  // the direction claim only holds on the unweighted arm — re-run the coarse
+  // arm with the hatch pinned off to keep testing the mechanism this check
+  // names, then restore the default for everything after.
+  const nwPrev = globalThis.__giGatherNormalWeight;
+  globalThis.__giGatherNormalWeight = false;
+  const coarse2Raw = runLoop([1, 1, 1], MAX_LOOP_ALBEDO, 11, 2.0);
+  const clampedRaw = runLoop([1, 1, 1], MAX_LOOP_ALBEDO, 11);
+  globalThis.__giGatherNormalWeight = nwPrev;
+  const driftRaw = coarse2Raw[coarse2Raw.length - 1] / clampedRaw[clampedRaw.length - 1] - 1;
+  check("coarsening moves the fixed point by a bounded amount, and on the unweighted gather the direction is BRIGHT (leak)",
+    driftRaw > 0 && driftRaw < 0.1 && Math.abs(drift) < 0.1,
+    `unweighted +${(driftRaw * 100).toFixed(2)}%, armed default ${(drift * 100).toFixed(2)}%, at 4x coarser in a box exactly one coarse cell wide`);
 }
 
 console.log("── HIT SHADING: THE RECORD NORMAL + THE SHADOW LIFT ─────────────");

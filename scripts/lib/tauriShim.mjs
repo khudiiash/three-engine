@@ -104,11 +104,36 @@ function handle(cmd, args = {}, writableRoot = null) {
       // fires it speculatively for each sidecar (`.meta`, `.basis`, `.tex`,
       // `.aud`) and catches the failures, so a missing source must throw the
       // way the Rust side does rather than succeed quietly.
-      case "rename_path":
-        if (fs.existsSync(args.to)) throw new Error(`"${args.to}" already exists`);
+      // A case-only rename on a case-insensitive filesystem is a real rename
+      // even though the target "exists" — it is the same entry. Mirrors
+      // `rename_path` in src-tauri/src/lib.rs, which goes through a temporary
+      // name for exactly this case.
+      case "rename_path": {
+        const sameEntry =
+          fs.existsSync(args.to) &&
+          (() => {
+            try {
+              return fs.realpathSync.native(args.from) === fs.realpathSync.native(args.to);
+            } catch {
+              return false;
+            }
+          })();
+        if (fs.existsSync(args.to) && !sameEntry) throw new Error(`"${args.to}" already exists`);
         fs.mkdirSync(path.dirname(args.to), { recursive: true });
+        if (sameEntry && args.from !== args.to) {
+          const temp = path.join(path.dirname(args.from), `.${path.basename(args.from)}.case-rename-tmp`);
+          fs.renameSync(args.from, temp);
+          try {
+            fs.renameSync(temp, args.to);
+          } catch (err) {
+            fs.renameSync(temp, args.from);
+            throw err;
+          }
+          return null;
+        }
         fs.renameSync(args.from, args.to);
         return null;
+      }
       // scaffold_three_types is a no-op the editor calls on every Assets mount;
       // succeeding silently keeps it out of the harness's error log.
       case "scaffold_three_types":

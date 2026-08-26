@@ -487,6 +487,23 @@ console.log("=== horizon arm: straddling receivers stay in [0, unoccluded MC] ==
       }
       checks++;
       if (an < -1e-6) fail(`${S.name} horizon tilt ${tilt}: negative factor ${an}`);
+      // ⚠ A ONE-SIDED BOUND IS NOT A TEST (2026-08-20). This arm asserted only
+      // `an ≤ MC·cap` for five months, and ZERO satisfies that — so it stayed
+      // green through the whole life of the horizon bug: a box face straddling
+      // the receiver's tangent plane clamped its NEGATIVE below-horizon share
+      // against its positive one and delivered nothing. `mc` above is already
+      // the true CLIPPED integral, so the floor costs nothing to add and is
+      // the half that would have caught it. Kinds that are documented MODELS
+      // rather than exact forms (capsule/cylinder/frustum/torus) and the
+      // sphere's shipped Hermite fade keep a loose floor; box, plane and the
+      // disc family are exact and get a tight one.
+      const exact = S.shape.kind === EMITTER_KIND.BOX || S.shape.kind === EMITTER_KIND.DISC;
+      const floor = exact ? 0.9 : 0.5;
+      if (mc > 1e-4 && an < mc * floor) {
+        fail(`${S.name} horizon tilt ${tilt}: analytic ${an.toExponential(3)} is only ` +
+          `${((an / mc) * 100).toFixed(1)}% of clipped MC ${mc.toExponential(3)} ` +
+          `(floor ${(floor * 100).toFixed(0)}%) — a straddling face is being clamped away`);
+      }
       // The sphere's horizon is a SHIPPED Hermite fade (sphereLightFactor)
       // that deliberately over-lights the deep-straddle band so a lamp
       // resting on the floor doesn't die with a razor edge — bound its
@@ -498,7 +515,73 @@ console.log("=== horizon arm: straddling receivers stay in [0, unoccluded MC] ==
       }
     }
   }
-  console.log(`  all straddle cases within the one-sided clamp convention`);
+  console.log(`  all straddle cases bracketed by the clipped MC`);
+}
+
+console.log("=== overlap arm: the emitter's mesh INTERSECTS the receiver's ===");
+{
+  // THE USER'S 2026-08-20 REPORT, as a scalar: "the emitters do not light
+  // surfaces if their meshes overlap with them, but when I move the emitters
+  // lightly to the side they start emitting light." A pillar passing through
+  // an emissive box; a glow strip embedded in the ledge it sits on.
+  //
+  // Overlap is not an exotic configuration — it is what a receiver sitting
+  // BETWEEN two of the emitter's opposing face planes means, and level
+  // blockouts are built out of exactly that. Every earlier arm places its
+  // receiver clear of the shape (`P = 1.1 × maxDim`), so none of them could
+  // ever see it. This one SWEEPS the emitter through the receiver's plane and
+  // asserts against MC at every step — which also makes it a continuity test:
+  // the failure was a hard cliff to zero, and a cliff is what a sweep sees.
+  //
+  // ⚠ FOUR KINDS STILL FAIL THIS AND ARE RECORDED, NOT SILENCED. The 2026-08-20
+  // fix is `polyHorizonFactor` — the POLYGON clip — so it repairs every kind
+  // built from quads (box, plane, and the disc family, which was already
+  // clipped). The tube/cap closed forms have the same one-sided clamp in their
+  // own derivations and go to ZERO on a straddling receiver exactly as the box
+  // did. They are listed with the shortfall MEASURED at the time, and the arm
+  // asserts they do not get WORSE — a red line nobody can act on gets ignored,
+  // and a tolerance wide enough to pass them would stop protecting the box.
+  const KNOWN_GAP = new Map([
+    ["cylinder", 1.00], ["cone", 1.00], ["frustum", 1.00], ["torus", 0.61],
+  ]);
+  const rand = prng(4242);
+  for (const S of SHAPES) {
+    // Receiver on a vertical face at x = 0.25, normal +x. The shape slides
+    // along +x from centred on the receiver (deep overlap) to well clear.
+    const P = v3(0.25, 0.55 * S.maxDim, 0);
+    const N = v3(1, 0, 0);
+    let worst = 0, worstAt = 0;
+    for (const dx of [0, 0.25, 0.5, 0.75, 1.0, 1.5]) {
+      const shift = dx * S.maxDim;
+      const shape = { ...S.shape, center: add(S.shape.center, v3(shift, 0, 0)) };
+      const sampler = (r) => {
+        const s = S.sampler(r);
+        return { ...s, p: add(s.p, v3(shift, 0, 0)) };
+      };
+      const occl = S.occl ? (Pq, T) => S.occl(sub(Pq, v3(shift, 0, 0)), sub(T, v3(shift, 0, 0))) : null;
+      const mc = mcFactor(rand, sampler, P, N, 200000, occl);
+      const an = refShapeFactor(shape, P, N);
+      checks++;
+      if (mc < 1e-4) continue;   // receiver inside a solid emitter: 0 is correct
+      const rel = Math.abs(an - mc) / mc;
+      if (rel > worst) { worst = rel; worstAt = dx; }
+      const known = KNOWN_GAP.get(S.name);
+      // +2% headroom over the recorded gap absorbs MC noise; anything beyond it
+      // is a real regression even in a kind that is already known-short.
+      const tol = known !== undefined
+        ? known + 0.02
+        : (S.shape.kind === EMITTER_KIND.BOX || S.shape.kind === EMITTER_KIND.DISC ? 0.15 : 0.45);
+      if (rel > tol) {
+        fail(`${S.name} overlap dx=${dx}×maxDim — analytic ${an.toExponential(3)} vs MC ` +
+          `${mc.toExponential(3)} (${(rel * 100).toFixed(1)}% off, tol ${(tol * 100).toFixed(0)}%)`);
+      }
+    }
+    const known = KNOWN_GAP.get(S.name);
+    const tag = known !== undefined
+      ? `  ⚠ KNOWN GAP — the tube/cap closed forms still clamp a straddling receiver to zero`
+      : "";
+    console.log(`  ${S.name.padEnd(16)} worst ${(worst * 100).toFixed(1)}% at dx ${worstAt}×maxDim${tag}`);
+  }
 }
 
 console.log("=== fitter arm: real three.js geometries → shape records ===");

@@ -154,6 +154,27 @@ const armGlobals = (armName) => ({
   ...(arm === "sixteenoff" ? { __giSrcProbeRetain: false, __giSrcMaturity: false } : {}),
   ...(arm === "worldkeys" ? { __giSrcWorldKeys: true } : {}),
   ...(arm === "hold" ? { __giIrrValidityHold: true } : {}),
+  // ⭐⭐ §12.87's CONTROL ARM — TILE COVERAGE BACK TO A FLAG (2026-08-26).
+  //
+  // Fractional coverage became the DEFAULT on the strength of a live A/B in the
+  // user's editor (ultra, the Level this probe walks): against "when camera
+  // moves and sees a new surface … patches look like a checkerboard, some
+  // darker, some brighter", the fraction took the patches to ALMOST GONE at no
+  // frame cost, where `capoff` — 25% of the frame — cleared less.
+  //
+  // This arm is what that claim has to keep beating, and it is the reason the
+  // claim is falsifiable at all: `base` is now the fraction, so without a
+  // control every future run would report the fixed number with nothing to
+  // compare it to. The metric to read is `checker` (and `crease`, which sees
+  // the interpolant-order change `checker` structurally cannot — see its
+  // header): a flag hands whichever probe won a cell that probe's single-bin
+  // constant, so the artifact is cell-scale blockiness that rearranges as
+  // probes re-mint, which is exactly what `checker` measures.
+  //
+  // ⚠ RUN IT IN THE SAME SESSION AS `base`. This probe has had SEVEN
+  // uncontrolled inputs (see the header and #7 below); a number from a
+  // different session is not a control.
+  ...(arm === "nocoverfrac" ? { __giTileCoverFraction: false } : {}),
   // §12.61's rest cadence halves the ray ceiling 1 s after the camera stops
   // (REST_CAM_HOLD_MS 600 + REST_CAM_FADE_MS 400) — while the field, measured
   // here, still has SECONDS of convergence left. This arm removes the cadence
@@ -341,7 +362,7 @@ const KNOWN_ARMS = new Set([
   "capbig", "capoff", "caplow", "alphamid", "alphabig", "nochecker",
   "sunsplit", "sunsplitflatcos", "sunsplitkeep", "sunsplitholdn",
   "nolightfill", "nosmooth", "motionsmooth", "noroot", "irrhist",
-  "adapt", "noadapt", "adaptnoreach", "sixteenoff",
+  "adapt", "noadapt", "adaptnoreach", "sixteenoff", "nocoverfrac",
 ]);
 for (const armName of ARMS) {
   const normalized = armName.replace(/\d+$/, "");

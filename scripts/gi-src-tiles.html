@@ -34,7 +34,9 @@
       //             mirrored interior rows, and the quadrature is materially
       //             different from a centre-cosine (the §12.2 bias — so the
       //             arm shows what it is worth rather than asserting into air).
-      //   interior  every interior texel vs `bakeProbeIrradiance`.
+      //   interior  every interior texel vs `bakeProbeIrradiance` TIMES
+      //             `bakeProbeCoverage` — the GPU premultiplies coverage into
+      //             the atlas RGB, the mirror keeps the two apart (§12.87).
       //   border    every border texel EXACTLY equals the interior texel it
       //             mirrors. Exact, because the GPU computes both from the same
       //             table row in the same order — so this arm is about
@@ -372,6 +374,16 @@
           return values;
         })];
         const mirrorTiles = ref.bakeProbeIrradiance(cfg, built, merged, 0, INTERIOR);
+        // §12.87 (default-on 2026-08-26): the mirror keeps irradiance and
+        // coverage in SEPARATE arrays — the tile stride is 3 throughout
+        // `srcRef.js` — and `gatherPixel` multiplies them at gather time. The
+        // GPU premultiplies instead, because its gather divides by `Σ w·c`
+        // once. So the atlas is `mirror·cover` and its alpha IS cover, and
+        // both arms below need this to compare like with like. With
+        // `__giTileCoverFraction = false` every entry is 1 and the two arms
+        // reduce to the assertions they made before the flip.
+        const mirrorCover = ref.bakeProbeCoverage(cfg, built, merged, 0, INTERIOR);
+        const coverAt = (i, tx, ty) => mirrorCover[i][ty * TILE + tx];
 
         const mirrorFailures = built.cascades.reduce((a, m) => a + m.insertFailures, 0);
         check("the mirror's probe maps had room for every key", mirrorFailures === 0,
@@ -403,10 +415,11 @@
             for (let u = 0; u < INTERIOR; u++) {
               const src = ((v + BORDER) * TILE + (u + BORDER)) * 3;
               const dst = texelAt(block, u + BORDER, v + BORDER);
+              const cov = coverAt(i, u + BORDER, v + BORDER);
               interiorChecked++;
               let bad = false;
               for (let ch = 0; ch < 3; ch++) {
-                const want = tile[src + ch];
+                const want = tile[src + ch] * cov;
                 const got = atlas[dst + ch];
                 const allowance = TOL + TOL * Math.abs(want);
                 // REPORTED AS A FRACTION OF ITS OWN ALLOWANCE, not as a bare
@@ -423,7 +436,8 @@
               if (bad) {
                 interiorWrong++;
                 worstDetail ??= `block ${block} texel ${u},${v}: ` +
-                  `gpu ${atlas[dst].toFixed(5)} vs mirror ${tile[src].toFixed(5)}`;
+                  `gpu ${atlas[dst].toFixed(5)} vs mirror ${(tile[src] * cov).toFixed(5)} ` +
+                  `(${tile[src].toFixed(5)} x cover ${cov.toFixed(3)})`;
               }
             }
           }
@@ -468,36 +482,69 @@
 
         // ══ ARM 3b: alpha carries coverage ══════════════════════════════
         say("");
-        say("── COVERAGE: alpha is 1 where a known bin was found, 0 where none ──");
-        // The channel [I] will renormalize with, if it chooses to. Checked
-        // against the MIRROR's own notion of coverage rather than against the
-        // GPU's alpha alone: `bakeProbeIrradiance` leaves a texel at exactly
-        // zero when it found no known bin, so "the mirror wrote nothing here"
-        // and "the GPU said uncovered" must be the same set.
+        say("── COVERAGE: alpha IS the fraction of the lobe that was sampled ──");
+        // The channel [I] renormalizes with, checked against the MIRROR's own
+        // notion of coverage rather than against the GPU's alpha alone.
         //
-        // Nothing divides by alpha yet — the RGB above is bit-for-bit the
-        // mirror's, which is what keeps [H] a make-the-GPU-agree unit.
+        // ⚠ THIS ARM USED TO ASSERT A FLAG (`a === 1` wherever the mirror had
+        // written any radiance) and that is exactly what §12.87 turned out to
+        // be wrong about: a texel backed by one bin of sixteen claimed to know
+        // its hemisphere as well as a fully sampled one, and the gather
+        // believed it. So the assertion is now the VALUE — alpha equals the
+        // cosine-weighted fraction of the texel's lobe that had a known bin —
+        // and it is a strictly stronger statement than the flag it replaces:
+        // it pins every intermediate coverage, not just the zero/non-zero
+        // split. Under `__giTileCoverFraction = false` the mirror emits 1 for
+        // every covered texel and this reduces to the original assertion.
         let alphaWrong = 0;
         let uncovered = 0;
         let alphaChecked = 0;
+        let worstAlpha = 0;
+        let alphaDetail = null;
         for (let i = 0; i < built.cascades[0].probes.length; i++) {
           const probe = built.cascades[0].probes[i];
           const block = keyToBlock.get(probe.key >>> 0);
           if (block === undefined) continue;
-          const tile = mirrorTiles[i];
           for (let ty = 0; ty < TILE; ty++) {
             for (let tx = 0; tx < TILE; tx++) {
-              const src = (ty * TILE + tx) * 3;
               const a = atlas[texelAt(block, tx, ty) + 3];
-              const mirrorHas = tile[src] !== 0 || tile[src + 1] !== 0 || tile[src + 2] !== 0;
+              const cov = coverAt(i, tx, ty);
               alphaChecked++;
-              if (!mirrorHas) uncovered++;
-              if ((a === 1) !== mirrorHas) alphaWrong++;
+              if (!(cov > 0)) uncovered++;
+              const allowance = TOL + TOL * Math.abs(cov);
+              worstAlpha = Math.max(worstAlpha, Math.abs(a - cov) / allowance);
+              if (Math.abs(a - cov) > allowance) {
+                alphaWrong++;
+                alphaDetail ??= `block ${block} texel ${tx},${ty}: ` +
+                  `gpu ${a.toFixed(5)} vs mirror ${cov.toFixed(5)}`;
+              }
             }
           }
         }
-        check("alpha agrees with the mirror about which texels have information",
-          alphaWrong === 0, `${alphaWrong}/${alphaChecked} texels disagree`);
+        check("alpha equals the mirror's sampled fraction, texel for texel",
+          alphaWrong === 0,
+          `${alphaWrong}/${alphaChecked} texels disagree${alphaDetail ? ` — ${alphaDetail}` : ""}`);
+        say(`   worst alpha deviation used ${(worstAlpha * 100).toFixed(1)}% of its ` +
+          `${TOL.toExponential(0)} allowance`);
+        // A run where every covered texel reads exactly 1 is a run where the
+        // hatch is off (or where the synthetic field is too dense to have
+        // partial lobes) — either way the arm above is back to testing a flag,
+        // and saying so is cheaper than discovering it later.
+        let partial = 0;
+        for (let i = 0; i < built.cascades[0].probes.length; i++) {
+          const block = keyToBlock.get((built.cascades[0].probes[i].key >>> 0));
+          if (block === undefined) continue;
+          for (let ty = 0; ty < TILE; ty++) {
+            for (let tx = 0; tx < TILE; tx++) {
+              const cov = coverAt(i, tx, ty);
+              if (cov > 0 && cov < 0.999) partial++;
+            }
+          }
+        }
+        check("the fraction is really fractional somewhere",
+          globalThis.__giTileCoverFraction === false || partial > 0,
+          `${partial}/${alphaChecked} texels sampled only part of their lobe — zero would ` +
+          "mean this arm is testing the flag §12.87 replaced");
         check("some texel really was uncovered", uncovered > 0,
           `${uncovered}/${alphaChecked} texels of claimed tiles found NO known bin ` +
           `(${(100 * uncovered / alphaChecked).toFixed(1)}%) — zero would make the arm above ` +
@@ -801,6 +848,7 @@
           cornerSpread: +(worstSpread * 100).toFixed(1),
           worstSample: +(worstSample * 100).toFixed(2),
           uncovered: +(100 * uncovered / alphaChecked).toFixed(1),
+          partialLobe: +(100 * partial / alphaChecked).toFixed(1),
           queries: QUERIES,
           coverage: +(bakeStats.coverage * 100).toFixed(1),
           megabytes: +(tiles.bytes / 1048576).toFixed(2),

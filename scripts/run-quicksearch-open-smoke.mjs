@@ -12,6 +12,15 @@
 // the selection has to be applied AFTER the navigate or the revealed tile ends
 // up ringed but unselected.
 //
+// And pinned at the end: GHOST ROWS. The result list was keyed on
+// `type:title:subtitle`, which is the same string for two entities that share
+// a name — React's warning for that says children may be "duplicated and/or
+// omitted", and they were: rows from the previous query stayed in the DOM above
+// the real match while the footer, counting the array rather than the DOM,
+// correctly said "1 result". The scene below deliberately contains duplicate
+// names, and the console-error gate at the bottom of this file fails on React's
+// key warning, so the fixture and the assertion catch it from both ends.
+//
 //   npx vite --port 5219
 //   node scripts/run-quicksearch-open-smoke.mjs [url]
 //
@@ -38,6 +47,40 @@ fs.writeFileSync(
   "export default class Whirligig {\n  onUpdate(dt) {\n    this.entity.rotation.y += dt;\n  }\n}\n",
 );
 const scriptPath = path.join(root, "scripts", "Whirligig.js").replaceAll("\\", "/");
+
+// A scene whose entity names REPEAT — the key collision needs two rows that
+// look identical to the old key function to reproduce at all.
+const sceneEntity = (id, name) => ({
+  id,
+  name,
+  position: [0, 0, 0],
+  rotation: [0, 0, 0],
+  scale: [1, 1, 1],
+  viewOnly: false,
+  enabledInEditor: true,
+  enabledInGame: true,
+  components: [],
+  children: [],
+});
+fs.mkdirSync(path.join(root, "scenes"), { recursive: true });
+fs.writeFileSync(
+  path.join(root, "scenes", "Ghost.scene"),
+  JSON.stringify(
+    {
+      version: 1,
+      name: "Ghost",
+      entities: [
+        sceneEntity("aaaaaaaaa1", "Light Stand"),
+        sceneEntity("aaaaaaaaa2", "Light Stand"),
+        sceneEntity("aaaaaaaaa3", "Light Ceiling"),
+        sceneEntity("aaaaaaaaa4", "Coffee Table"),
+        sceneEntity("aaaaaaaaa5", "bookcaseClosedDoors"),
+      ],
+    },
+    null,
+    2,
+  ),
+);
 
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
@@ -193,6 +236,96 @@ check(
   norm(opened.activePath) === norm(scriptPath) && opened.files.length === 1,
   JSON.stringify(opened),
 );
+
+// --- ghost rows --------------------------------------------------------------
+
+await page.evaluate(async (projectRoot) => {
+  const { openScenePath } = await globalThis.__importLive("/src/editor/sceneIO.js");
+  await openScenePath(`${projectRoot}/scenes/Ghost.scene`);
+}, root.replaceAll("\\", "/"));
+await wait(2000);
+
+/** What the list is ACTUALLY showing, read from the DOM, next to what it says
+ *  it is showing. The bug lived precisely in the gap between the two. */
+const listState = () =>
+  page.evaluate(() => ({
+    rows: [...document.querySelectorAll(".quick-search-result")].map((row) => ({
+      title: row.querySelector(".quick-search-title")?.textContent ?? "",
+      // "entity" / "asset" / "panel" / "setting" — a panel legitimately named
+      // "Hierarchy" is a different thing from every entity answering to its
+      // own subtitle, and only the kind tells them apart.
+      kind: (row.querySelector(".quick-search-kind")?.className ?? "").replace("quick-search-kind", "").trim(),
+    })),
+    footer: document.querySelector(".quick-search-result-count")?.textContent ?? "",
+  }));
+
+await page.keyboard.down("Control");
+await page.keyboard.press("f");
+await page.keyboard.up("Control");
+await wait(400);
+await page.keyboard.type("Light");
+await wait(500);
+
+const lights = await listState();
+const lightTitles = lights.rows.map((r) => r.title);
+// "Use for Lighting" (a Scene Settings property) is a REAL match for "light" —
+// the rule is that everything listed contains the query somewhere the user can
+// see, not that everything listed is an entity.
+check(
+  "everything a query returns visibly contains it",
+  lights.rows.length > 0 && lightTitles.every((t) => t.toLowerCase().includes("light")),
+  lightTitles.join(", ") || "nothing",
+);
+check(
+  "...including both same-named entities, and only the three Light entities",
+  lights.rows.filter((r) => r.kind === "entity").length === 3 &&
+    lightTitles.filter((t) => t === "Light Stand").length === 2,
+  lightTitles.join(", "),
+);
+
+// Retype, don't reopen: the stale rows only survived a list that CHANGED.
+await page.keyboard.down("Control");
+await page.keyboard.press("a");
+await page.keyboard.up("Control");
+await page.keyboard.type("Shader Graph");
+await wait(600);
+
+const narrowed = await listState();
+check(
+  "narrowing to a panel leaves ONLY the panel on screen",
+  narrowed.rows.length === 1 && narrowed.rows[0].title === "Shader Graph",
+  narrowed.rows.map((r) => r.title).join(", ") || "nothing",
+);
+check(
+  "...and the DOM agrees with the footer's count",
+  narrowed.footer.startsWith(String(narrowed.rows.length)),
+  `${narrowed.rows.length} rows vs "${narrowed.footer}"`,
+);
+
+// The other half of the report: nothing unrelated is admitted in the first
+// place. "hierarchy" is every entity's subtitle and used to return the scene.
+await page.keyboard.down("Control");
+await page.keyboard.press("a");
+await page.keyboard.up("Control");
+await page.keyboard.type("hierarchy");
+await wait(600);
+const subtitleQuery = await listState();
+// The Hierarchy PANEL is a real hit and must stay. What must not come back is
+// the scene: every entity's subtitle reads "Entity · Hierarchy", and matching
+// that turned one keystroke into "here are all 291 of your entities".
+check(
+  "an entity's category label is not searchable",
+  subtitleQuery.rows.every((r) => r.kind !== "entity"),
+  subtitleQuery.rows.map((r) => `${r.title}[${r.kind}]`).join(", ") || "nothing",
+);
+check(
+  "...while a panel actually named Hierarchy still answers to it",
+  subtitleQuery.rows.some((r) => r.kind === "panel" && r.title === "Hierarchy"),
+  subtitleQuery.rows.map((r) => r.title).join(", ") || "nothing",
+);
+
+await page.keyboard.press("Escape");
+await wait(300);
 
 // ---------------------------------------------------------------------------
 

@@ -1,6 +1,7 @@
 // @ts-nocheck
 import {
   extOf,
+  MODEL_IMPORT_EXTENSIONS,
   TEXTURE_EXTENSIONS,
   SCRIPT_EXTENSIONS,
   AUDIO_EXTENSIONS,
@@ -93,15 +94,32 @@ function textureActions(path) {
   ];
 }
 
+/**
+ * Actions for a source model — `.glb` or `.fbx`.
+ *
+ * FBX unpacking used to exist only on the drag-and-drop path in the Assets
+ * panel, so an `.fbx` already sitting in the project had no way to be
+ * unpacked: not from the Inspector, the context menu, or MCP. That is easy to
+ * land in — a file copied in by hand, restored by `git lfs pull`, or left
+ * behind when its first import failed.
+ */
 function modelActions(path) {
+  const isFbx = extOf(path) === "fbx";
   return [
     {
       id: "model.unpack",
       label: "Unpack Model",
-      hint: "Extract meshes, materials and textures into project assets plus a prefab.",
+      hint: isFbx
+        ? "Convert to GLB, then extract meshes, materials, rig and clips into project assets plus a prefab."
+        : "Extract meshes, materials and textures into project assets plus a prefab.",
       icon: "PackageOpen",
       primary: true,
       run: async () => {
+        if (isFbx) {
+          const { unpackFbx } = await import("./fbxImport.js");
+          await unpackFbx(path);
+          return;
+        }
         const { unpackGlb } = await import("./glbImport.js");
         await unpackGlb(path);
       },
@@ -111,7 +129,10 @@ function modelActions(path) {
       label: "Compress (Draco)",
       hint: "Shrink the mesh data in place; decoded transparently at runtime.",
       icon: "Archive",
-      available: async () => (await import("./dracoCompress.js")).isDracoEnabled(),
+      // Draco rewrites glTF buffer views in place; an FBX has none to rewrite
+      // until it has been unpacked, and its unpack already produces a GLB the
+      // import pipeline can compress.
+      available: async () => !isFbx && (await import("./dracoCompress.js")).isDracoEnabled(),
       run: async () => {
         const { compressGlbInPlace } = await import("./dracoCompress.js");
         await compressGlbInPlace(path);
@@ -305,7 +326,7 @@ function typeActions(path) {
   if (TEXTURE_EXTENSIONS.includes(ext)) return textureActions(path);
   if (FONT_EXTENSIONS.includes(ext)) return fontActions(path);
   if (SCRIPT_EXTENSIONS.includes(ext)) return scriptActions(path);
-  if (ext === "glb") return modelActions(path);
+  if (MODEL_IMPORT_EXTENSIONS.includes(ext)) return modelActions(path);
   if (ext === "geom") return geometryActions(path);
   if (ext === "mat") return materialActions(path);
   if (ext === "prefab" || ext === "entity") return prefabActions(path);
@@ -343,16 +364,22 @@ function typeActions(path) {
  * The common tail — reveal, copy path, duplicate, delete — is appended for
  * every type, because those are exactly the operations someone hunts through
  * menus for and they have no reason to differ by extension.
+ *
+ * `isDir` marks a FOLDER. A folder has no extension, so it already falls
+ * through every type-specific branch; what it needs on top is for the two
+ * file-shaped members of that common tail to stand down — "View Source" has no
+ * text to show, and "Duplicate" reads the path as bytes and fails — and for
+ * Delete to know it is about to take everything inside with it.
  */
-export function assetActions(path) {
+export function assetActions(path, { isDir = false } = {}) {
   if (!path) return [];
-  const ext = extOf(path);
-  const actions = [...typeActions(path)];
+  const ext = isDir ? "" : extOf(path);
+  const actions = isDir ? [] : [...typeActions(path)];
 
   // Code editing is offered for anything the editor can show as text, not just
   // scripts: opening a `.mat` or a `.meta` to see what is actually in it is a
   // legitimate thing to want, and refusing is just an obstacle.
-  if (!SCRIPT_EXTENSIONS.includes(ext)) {
+  if (!isDir && !SCRIPT_EXTENSIONS.includes(ext)) {
     actions.push({
       id: "asset.source",
       label: "View Source",
@@ -394,17 +421,21 @@ export function assetActions(path) {
         await navigator.clipboard.writeText(relative);
       },
     },
-    {
-      id: "asset.duplicate",
-      label: "Duplicate",
-      hint: "A copy beside it, named to avoid a collision.",
-      icon: "CopyPlus",
-      run: async () => {
-        const { duplicateAsset } = await import("./assetOps.js");
-        const created = await duplicateAsset(path);
-        if (created) select(created);
-      },
-    },
+    ...(isDir
+      ? []
+      : [
+          {
+            id: "asset.duplicate",
+            label: "Duplicate",
+            hint: "A copy beside it, named to avoid a collision.",
+            icon: "CopyPlus",
+            run: async () => {
+              const { duplicateAsset } = await import("./assetOps.js");
+              const created = await duplicateAsset(path);
+              if (created) select(created);
+            },
+          },
+        ]),
     {
       id: "asset.externalIde",
       label: "Open in IDE",
@@ -415,12 +446,14 @@ export function assetActions(path) {
     {
       id: "asset.delete",
       label: `Delete ${basename(path)}`,
-      hint: "Moves the file (and its sidecars) to the recycle bin.",
+      hint: isDir
+        ? "Moves the folder and everything inside it to the recycle bin."
+        : "Moves the file (and its sidecars) to the recycle bin.",
       icon: "Trash2",
       danger: true,
       run: async () => {
         const { deleteEntries } = await import("./assetOps.js");
-        await deleteEntries([{ path, name: basename(path), is_dir: false }]);
+        await deleteEntries([{ path, name: basename(path), is_dir: isDir }]);
       },
     },
   );
@@ -428,11 +461,29 @@ export function assetActions(path) {
 }
 
 /**
+ * Whether `path` is a folder. `list_dir` succeeds on a directory and fails on
+ * anything else, which is the cheapest answer available — there is no `stat`
+ * command that reports the file type.
+ *
+ * The two async entry points below resolve it themselves so a caller that only
+ * has a path (the editor API, and therefore an agent driving it) gets the same
+ * list the Inspector shows, without having to know what it is pointing at.
+ */
+async function isDirectory(path) {
+  return invoke("list_dir", { path }).then(
+    () => true,
+    () => false,
+  );
+}
+
+/**
  * Runs an action by id. The one entry point the editor API uses, so an agent
  * and a user go through exactly the same code.
  */
-export async function runAssetAction(path, id) {
-  const action = assetActions(path).find((entry) => entry.id === id);
+export async function runAssetAction(path, id, options) {
+  const action = assetActions(path, options ?? { isDir: await isDirectory(path) }).find(
+    (entry) => entry.id === id,
+  );
   if (!action) throw new Error(`No action "${id}" for ${basename(path)}`);
   if (action.enabled && !action.enabled()) throw new Error(`"${action.label}" is not available right now`);
   await action.run();
@@ -440,9 +491,9 @@ export async function runAssetAction(path, id) {
 }
 
 /** Action ids available for `path`, for menus and for the API's discovery op. */
-export async function assetActionList(path) {
+export async function assetActionList(path, options) {
   const out = [];
-  for (const action of assetActions(path)) {
+  for (const action of assetActions(path, options ?? { isDir: await isDirectory(path) })) {
     if (action.available && !(await action.available())) continue;
     out.push({
       id: action.id,

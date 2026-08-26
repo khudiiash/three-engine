@@ -806,15 +806,57 @@ fn create_dir(path: String) -> Result<(), String> {
     fs::create_dir_all(&path).map_err(|e| e.to_string())
 }
 
-/// Renames or moves a file/directory. Refuses to clobber an existing target.
+/// Renames or moves a file/directory. Refuses to clobber a DIFFERENT existing
+/// target.
+///
+/// "Different" is doing real work on Windows, where the filesystem is
+/// case-insensitive: `Textures` "exists" the moment `textures` does, so a plain
+/// `exists()` guard rejected every case-only rename — `textures` → `Textures`
+/// came back as `"…\Textures" already exists` and the panel, which renders
+/// whatever the last listing said, simply showed the old name again. A rename
+/// that only changes case is a legitimate rename and goes through a temporary
+/// name, because `fs::rename` onto the same inode is a no-op on that platform.
 #[tauri::command]
 fn rename_path(from: String, to: String) -> Result<(), String> {
-    if Path::new(&to).exists() {
+    let src = Path::new(&from);
+    let dst = Path::new(&to);
+    // Same entry under a different spelling? `canonicalize` resolves case (and
+    // short 8.3 names, and symlinks) so this is the platform's own answer to
+    // "are these the same file", not a string comparison.
+    let same_entry = dst.exists()
+        && match (src.canonicalize(), dst.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+    if dst.exists() && !same_entry {
         return Err(format!("\"{to}\" already exists"));
     }
     watcher::note_self_write(&from);
     watcher::note_self_write(&to);
-    fs::rename(&from, &to).map_err(|e| e.to_string())
+    if same_entry {
+        if from == to {
+            return Ok(());
+        }
+        // Two steps: rename out to a name nothing holds, then into the target
+        // spelling. The intermediate is a sibling so both halves stay on one
+        // volume, and it carries a marker no real asset would.
+        let parent = src.parent().ok_or_else(|| "no parent directory".to_string())?;
+        let stem = src
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let temp = parent.join(format!(".{stem}.case-rename-tmp"));
+        watcher::note_self_write(&temp);
+        fs::rename(src, &temp).map_err(|e| e.to_string())?;
+        // Put it back under the old name if the second half fails, so a
+        // half-finished rename never leaves the asset under a hidden name.
+        if let Err(e) = fs::rename(&temp, dst) {
+            let _ = fs::rename(&temp, src);
+            return Err(e.to_string());
+        }
+        return Ok(());
+    }
+    fs::rename(src, dst).map_err(|e| e.to_string())
 }
 
 /// Deletes a file or directory (recursively).
@@ -1239,6 +1281,105 @@ async fn fetch_polypizza_text(url: String, token: Option<String>) -> Result<Stri
     .map_err(|e| e.to_string())?
 }
 
+/// Fab's read API (`www.fab.com/i/…`) — Epic's marketplace, and the only one
+/// of these browsers that needs no credential AT ALL. Search, listing detail,
+/// asset-format listing and even the signed download URL for a free asset are
+/// all served to an anonymous caller; there is nothing to attach, so unlike
+/// every proxy above this command takes no token.
+///
+/// It exists for CORS: verified against the live host, a request carrying
+/// `Origin:` comes back with no `Access-Control-Allow-Origin` header at all, so
+/// a plain webview `fetch` is blocked even though the data is public.
+///
+/// ## Cloudflare, and why this one keeps an Agent
+///
+/// Fab sits behind Cloudflare's *managed challenge*, and getting past it is not
+/// about the User-Agent — it is about looking like ONE CLIENT rather than a new
+/// stranger on every request. Three things were measured against the live host
+/// from the same IP, and all three are counter-intuitive enough to write down:
+///
+/// 1. **A browser User-Agent makes it WORSE, not better.** `three-engine/0.1`
+///    is served 200; the same request claiming to be Chrome 124 is served a 403
+///    challenge page. Cloudflare fingerprints the TLS handshake, and an honest
+///    UA that matches a non-browser fingerprint is fine while a browser UA that
+///    contradicts one is exactly what its bot detection looks for. So this
+///    keeps `fetch_text`'s honest UA rather than copying `fetch_itchio_html`'s
+///    browser impersonation, which is right for itch.io and wrong here.
+///
+/// 2. **A fresh `ureq::get` per call is challenged intermittently.** Measured
+///    over a burst of 8: two 403s with one-shot requests, zero with a shared
+///    `Agent`. The Agent carries Cloudflare's `__cf_bm` cookie back and reuses
+///    the connection, which is what makes a sequence of requests read as a
+///    session. That is why AGENT exists rather than a bare call.
+///
+/// 3. **Even the Agent is challenged occasionally** — 2 in 25 over a hard
+///    burst — so a challenged response is retried rather than surfaced. It
+///    passes on the retry, because by then the cookie from the challenge
+///    response is in the jar.
+///
+/// A challenge that survives every retry is reported as one short sentence. The
+/// page itself is ~30KB of HTML and CSS, and returning it verbatim put the
+/// entire Cloudflare interstitial into the panel's error box.
+static FAB_AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+
+fn fab_agent() -> &'static ureq::Agent {
+    FAB_AGENT.get_or_init(|| ureq::AgentBuilder::new().build())
+}
+
+/// Is this response body Cloudflare's interstitial rather than Fab's own error?
+fn is_cf_challenge(body: &str) -> bool {
+    body.contains("cf_challenge") || body.contains("challenge-platform")
+}
+
+#[tauri::command]
+async fn fetch_fab_text(url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let parsed = url::Url::parse(&url).map_err(|e| format!("bad Fab URL: {e}"))?;
+        if parsed.scheme() != "https" || parsed.host_str() != Some("www.fab.com") {
+            return Err("Fab API requests must use https://www.fab.com".to_string());
+        }
+
+        // Three attempts, backing off. The challenge is transient and the
+        // cookie the failed attempt sets is what makes the next one pass, so
+        // retrying on the SAME agent is the whole mechanism — a fresh request
+        // here would throw that away.
+        let mut last = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(300 * attempt as u64));
+            }
+            match fab_agent()
+                .get(&url)
+                .set("User-Agent", "three-engine/0.1")
+                .set("Accept", "application/json")
+                .call()
+            {
+                Ok(response) => {
+                    return response
+                        .into_string()
+                        .map_err(|e| format!("read Fab response: {e}"));
+                }
+                Err(ureq::Error::Status(code, response)) => {
+                    let body = response.into_string().unwrap_or_default();
+                    if is_cf_challenge(&body) {
+                        last = "Fab's bot protection is throttling this client. Wait a few seconds and search again.".to_string();
+                        continue;
+                    }
+                    // A real API error. Fab's own bodies are short and say what
+                    // is wrong, but truncate anyway so no future HTML page can
+                    // land in a panel again.
+                    let detail: String = body.chars().take(300).collect();
+                    return Err(format!("Fab API {code}: {detail}"));
+                }
+                Err(e) => return Err(format!("Fab API: {e}")),
+            }
+        }
+        Err(last)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// itch.io has no public catalog/search API — only the per-account endpoints
 /// above. Browsing the *whole* store means fetching itch.io's own public
 /// browse/search HTML pages and parsing them client-side with the browser's
@@ -1524,6 +1665,7 @@ pub fn run() {
             fetch_sketchfab_text,
             fetch_itchio_text,
             fetch_itchio_html,
+            fetch_fab_text,
             fetch_freesound_text,
             fetch_polypizza_text,
             ai_chat,

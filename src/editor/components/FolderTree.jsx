@@ -10,6 +10,7 @@ import {
   renameEntry,
 } from "../assetOps.js";
 import { ContextMenu, isTextEditTarget } from "../ContextMenu.jsx";
+import { samePath } from "../assetReveal.js";
 
 /**
  * Folder hierarchy sidebar for the Assets panel. Children are listed lazily
@@ -87,7 +88,10 @@ function FolderRow({
   // Compared here rather than by the parent: passing a BOOLEAN down and then
   // re-comparing it against the child's path (`renaming === child.path`) is
   // always false, which is how renaming used to work on the root row only.
-  const renaming = renamingPath === path;
+  // `samePath`, not `===`: a path the editor BUILT (`dir/name`) and one
+  // `list_dir` returned (`dir\name` on Windows) name the same folder, and an
+  // exact compare left a freshly created folder never entering rename mode.
+  const renaming = samePath(renamingPath, path);
   const isOpen = expanded.has(path);
   const children = childrenOf.get(path);
   const active = currentPath === path;

@@ -391,10 +391,10 @@ export function createSrcTileAtlas(store, bins, {
       // where a texel found a known bin and 0 where it did not … FILTERED, it
       // is `Σ w_tap` over the covered taps": the fraction is meant to come from
       // the hardware bilinear tap STRADDLING covered and uncovered TEXELS, not
-      // from partial bin coverage inside one texel. The flag is the designed
-      // behaviour and `test:gi-src-tiles`' COVERAGE arm defends it explicitly
-      // ("alpha is 1 where a known bin was found, 0 where none"). So this is a
-      // DESIGN CHANGE, and it ships OPT-IN until a measurement earns it.
+      // from partial bin coverage inside one texel. The flag was the designed
+      // behaviour and `test:gi-src-tiles`' COVERAGE arm defended it explicitly.
+      // So this is a DESIGN CHANGE, and it shipped OPT-IN pending a
+      // measurement.
       //
       // What it cost, measured on the user's Level (2026-08-23/24): probes read
       // `knownBins 11.1/32`, so one-bin extrapolation is the COMMON case, not
@@ -407,28 +407,76 @@ export function createSrcTileAtlas(store, bins, {
       //
       // The fix is the honest fraction. A 1-of-16 texel now votes at 1/16 and
       // the gather's EXISTING coverage renormalisation lets better-sampled
-      // neighbours carry the cell. It cannot darken anything: `acc` and `wsum`
-      // in the gather carry the same factor, so a uniformly-downweighted point
-      // renormalises back to the same mean — only the RATIO between corners
-      // moves, which is exactly what "in proportion to what it knows" means.
+      // neighbours carry the cell. `E` is renormalised over the KNOWN bins,
+      // which is unbiased only if those bins are a random subset of the lobe;
+      // they are not — they are the bins rays happened to reach — so a 4-of-16
+      // texel is a BIASED extrapolation, and a flag gave it a full vote. It
+      // cannot darken anything: `acc` and `wsum` in the gather carry the same
+      // factor, so a uniformly-downweighted point renormalises back to the
+      // same mean and only the RATIO between corners moves, which is exactly
+      // what "in proportion to what it knows" means.
       //
-      // The argument FOR it, unmeasured: `E` is renormalised over the known
-      // bins, which is unbiased only if those bins are a random subset of the
-      // lobe. They are not — they are the bins rays happened to reach — so a
-      // 4-of-16 texel is a BIASED extrapolation carrying a full vote. Weighting
-      // by the sampled fraction lets better-sampled neighbours carry the cell.
-      // It cannot darken: the gather's `acc` and `wsum` take the same factor,
-      // so a uniformly-downweighted point renormalises to the same mean and
-      // only the RATIO between corners moves.
+      // ══ DEFAULT ON (2026-08-26). THE MEASUREMENT THAT EARNED IT ═══════════
       //
-      // `__giTileCoverFraction = true` arms it. Both twins read the one hatch,
-      // so `test:gi-src-gather` compares like with like either way.
-      cover.assign(globalThis.__giTileCoverFraction === true
-        ? wsum.div(wsumAll.max(1e-6)).clamp(0, 1)
-        : float(1));
+      // The A/B the block above asked for, run in the user's own editor at
+      // ultra on the Level this text already describes, against the report
+      // "when camera moves and sees a new surface, there are usually patches
+      // that gradually turn to smooth lighting … patches look like a
+      // checkerboard, some darker, some brighter":
+      //
+      //     arm                          patches            fps
+      //     __giSrcProbeRayCap = 0       still present      60 → 45
+      //     __giTileCoverFraction        ALMOST GONE        60 → 60
+      //
+      // ⚠ THAT TABLE IS A LIVE OBSERVATION AND IT IS THE ONLY EVIDENCE THERE
+      // IS. `probe:gi-walk` was run twice at ultra with the `nocoverfrac`
+      // control and came back NULL — its same-arm run-to-run spread (29% on
+      // `checker`, 33% on `crease`) is several times the between-arm gap and
+      // the sign flips between runs, so it cannot resolve an effect this size.
+      // Do not cite the probe for or against this line; see §D1c in
+      // docs/GI_SPATIAL_REBUILD_PLAN.md for the full ledger and the two
+      // instrument defects that have to be fixed before it can.
+      //
+      // So the honest fraction is the fix and the ray budget was not: lifting
+      // the per-probe cap spends 25% of the frame to treat the same artifact
+      // less well, because a starved probe's problem is not that it has too
+      // few rays — it is that it VOTES AS IF IT HAD ENOUGH. The cap arm is
+      // kept as a diagnostic and its headroom is spent selectively instead
+      // (see `srcRays.js` [D1']); this line is what actually closes the
+      // report.
+      //
+      // ⚠ THE FLAG IS NOT COSMETIC TO THE GATES, and that is the cost of the
+      // flip. The GPU stores `E·c` (premultiplied — see the ⛔⛔ note at the
+      // `textureStore` below, which is why it MUST) while the mirror keeps `E`
+      // and a separate coverage tile that `gatherPixel` multiplies in. Both
+      // twins therefore compute `Σ w·c·E / Σ w·c` and agree at the GATHER,
+      // but their ATLAS CONTENTS differ by `c` — so `test:gi-src-tiles`
+      // compares its interior arm against `mirror·cover` and its coverage arm
+      // against `cover` rather than against 1. With `c ≡ 1` both reduce to the
+      // old assertions exactly, which is what keeps `false` a real opt-out.
+      //
+      // `__giTileCoverFraction = false` restores the flag. Both twins read the
+      // one hatch, so `test:gi-src-gather` compares like with like either way.
+      cover.assign(globalThis.__giTileCoverFraction === false
+        ? float(1)
+        : wsum.div(wsumAll.max(1e-6)).clamp(0, 1));
       // §16 D3 — the maturity factor (header above). u32 subtraction is safe:
       // any live block's stamp is a past frame of this session's monotonic
       // counter, so `frame − stamp` never underflows.
+      //
+      // ⚠ THIS COMPOUNDS WITH THE FRACTION ABOVE, AND THAT IS INTENDED. Since
+      // §12.87 went default-on the two multiply — `cover = sampledFraction ×
+      // maturity` — so a newborn block on a walk frontier is discounted TWICE:
+      // once for the part of its lobe it has not sampled, once for the frames
+      // of evidence it has not yet had. They are different ignorances (WHICH
+      // directions are unknown vs HOW MUCH any of them is worth), so a product
+      // is the right composition and not a double penalty.
+      //
+      // It cannot over-darken, for the reason the fraction cannot: the gather's
+      // `acc` and `wsum` both carry `cover`, so a uniformly discounted probe
+      // renormalises to the same mean and only its RATIO against better-known
+      // neighbours moves. The floor is what keeps a cell from having no vote at
+      // all when every corner is new.
       if (maturityOn) {
         const stamp = stampStack.element(uint(stampBase).add(block)).toVar();
         const m = float(uint(frameStamp).sub(stamp))

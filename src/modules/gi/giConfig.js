@@ -52,6 +52,53 @@ export const GI_QUALITY_LEVELS = ["low", "medium", "high", "ultra"];
 const TIERS = new Set(GI_QUALITY_LEVELS);
 
 /**
+ * The debug view modes exposed on the GI component, in inspector order.
+ *
+ * - "off" (default): no overlay.
+ * - "indirect": the diffuse-irradiance term only — what the SRC gather
+ *   computed, before AO darkens it. What "indirect light" actually IS in this
+ *   build, with no contact shading mixed in.
+ * - "ao": the obscurance factor (1 = no occlusion, 0 = fully occluded) as a
+ *   greyscale. Wide+contact+VXAO combined into one screen-space factor by the
+ *   AO pass. Lets you see what is darkening your corners.
+ * - "reflections": the glossy radiance term only — what mirrors see, before
+ *   it gets multiplied by a material's specular response.
+ *
+ * The legacy `sdf` / `occupancy` / `src-probes` modes stay on the global
+ * (`globalThis.__giDebugView`) — those touch DIFFERENT data (the SDF distance
+ * field, the voxel occupancy pyramid, the SRC probe gizmos) and have never
+ * had a component prop.
+ */
+export const GI_DEBUG_VIEWS = [
+  "off",
+  "indirect",
+  // "ao" is the factor the RESOLVE APPLIES. Since 2026-08-26 there is exactly
+  // ONE estimator behind it (per-pixel ray-traced, #armRtaoPass) — the
+  // screen-spiral and voxel-cone pair it replaced needed a mode each, because
+  // the resolve composed them with `min` and that made an isolated read of
+  // either impossible. One estimator, one view. The single-source modes come
+  // back automatically if `__giAoLegacy = true` ever re-arms the pair: this
+  // view then shows their `min`, which is still what the frame applies.
+  "ao",
+  // "reflections" is the glossy field WEIGHTED BY FRESNEL, which is what
+  // turns it from "a blurry copy of the scene" (the raw buffer holds a
+  // radiance at every pixel, including the ~96% of a dielectric surface that
+  // never shows it) into the layer the frame actually adds.
+  // "reflections-exact" is the traced BVH layer — the sharp arm ultra runs,
+  // which no view could show before.
+  "reflections",
+  "reflections-exact",
+];
+const DEBUG_VIEWS = new Set(GI_DEBUG_VIEWS);
+/**
+ * The subset drawn by the fullscreen TERM overlay (`#buildDebugView`), as
+ * opposed to the volume/gizmo views ("sdf", "occupancy", "src-probes")
+ * that are console-only. Kept beside the list so adding a mode to one and
+ * not the other is impossible.
+ */
+export const GI_TERM_DEBUG_VIEWS = new Set(GI_DEBUG_VIEWS.filter((v) => v !== "off"));
+
+/**
  * The tier a stored value selects for.
  *
  * Unrecognised — an old scene's "custom", a typo, an unset field — resolves to
@@ -62,6 +109,70 @@ const TIERS = new Set(GI_QUALITY_LEVELS);
  */
 export function giQualityTier(quality) {
   return TIERS.has(quality) ? quality : "medium";
+}
+
+/**
+ * The most expensive tier THIS DEVICE is allowed to run, or null for "no
+ * ceiling" (every desktop GPU).
+ *
+ * WHY A CEILING RATHER THAN A SECOND LADDER: every cost a preset controls is
+ * keyed on the tier NAME (see BY_TIER's note — `QUALITY_BUDGETS` for
+ * cells/probes, the trace step ladder, `AUTO_MODE_BY_QUALITY`, `SRC_QUALITY`
+ * for s₀/rays/w₀). Clamping the name therefore moves all of them at once, and
+ * cannot drift from them the way a parallel set of mobile constants would.
+ *
+ * WHAT IT IS FOR. There was no platform tier at all, so a phone and a laptop
+ * on battery ran the tier the scene authored on a desktop — at `ultra` that is
+ * 393,216 transport rays per frame against an occupancy field sized from a
+ * 2.8M-cell budget. Two user-visible consequences:
+ *
+ *  · MOBILE: GI allocation is measured in hundreds of MB per build (a real
+ *    scene reached 449MB of occupancy bits alone) and the JS/GPU retention per
+ *    rebuild is ~2GB; a device that runs out does not fail politely, it is
+ *    LOST, and every pipeline with it — reported as "everything disappears,
+ *    only the HDRI sky remains", because the sky is drawn by the background
+ *    and needs none of the pipelines that just died.
+ *  · SAFARI/APPLE: WebGPU there generally lands on an integrated GPU, and the
+ *    same workload runs at a small fraction of the speed. `medium` keeps the
+ *    transport and the half-res resolve while dropping the exact-BVH
+ *    reflections and the biggest ray budgets.
+ *
+ * `__giDeviceTier` overrides the detection — `null`/`"none"` removes the
+ * ceiling, a tier name forces one. Harnesses need it (headless Chrome on a
+ * desktop detects no ceiling, so every existing gate is unaffected either way)
+ * and so does anyone reproducing a phone's tier on a workstation.
+ */
+export function giDeviceTierCeiling(runtime = globalThis) {
+  const forced = runtime?.__giDeviceTier;
+  if (forced === null || forced === "none") return null;
+  if (TIERS.has(forced)) return forced;
+  const nav = runtime?.navigator;
+  if (!nav) return null;
+  const ua = String(nav.userAgent ?? "");
+  // `userAgentData.mobile` is the only non-heuristic answer; the UA regex is
+  // the fallback for the engines that do not ship it (every WebKit today).
+  // iPadOS reports a desktop UA, hence the touch-points clause: a Mac has
+  // maxTouchPoints 0, an iPad reports 5.
+  const isMobile = nav.userAgentData?.mobile === true
+    || /Android|iPhone|iPod|Mobile|Windows Phone/i.test(ua)
+    || (/Macintosh/.test(ua) && (nav.maxTouchPoints ?? 0) > 1);
+  if (isMobile) return "low";
+  // Safari and every other WebKit shell: "Safari" with no Chrome/Chromium
+  // token. Chromium's UA carries Safari too, which is why both are excluded.
+  const isAppleWebKit = /Apple/.test(String(nav.vendor ?? ""))
+    && /Safari/.test(ua) && !/Chrome|Chromium|Edg\//.test(ua);
+  if (isAppleWebKit) return "medium";
+  return null;
+}
+
+let warnedClamp = false;
+
+/** `tier` clamped to `ceiling` using GI_QUALITY_LEVELS' cost order. */
+function clampTier(tier, ceiling) {
+  if (!ceiling) return tier;
+  const want = GI_QUALITY_LEVELS.indexOf(tier);
+  const cap = GI_QUALITY_LEVELS.indexOf(ceiling);
+  return want > cap ? ceiling : tier;
 }
 
 /**
@@ -152,8 +263,19 @@ const CONSTANT = {
   // 0.6/0.6 was tuned against the rig; on real scenes the emitter-direct
   // share leaves the indirect term — the only thing AO modulates — carrying
   // less of the image, so the ceiling has to work harder to read at all.
-  aoStrength: 0.8,
-  aoRadius: 0.8,
+  //
+  // Radius 0.8 → 0.5 (2026-08-24, "can't see any NOTABLE effect"): 0.8 m is
+  // ABOVE typical probe spacing, so the wide ring reproduced the lattice-
+  // scale shading the field already carries — a broad wash, no contact
+  // definition. 0.5 pulls the wide ring under lattice scale (contact ring
+  // 0.125 m) and pairs with the ring-union + ×3 renormalization fix in
+  // createGiAoPass, which is what actually lets a crevice read DARK.
+  // Both are live uniforms — `__giAoOverride = {strength, radius}` to tune.
+  // 0.85 → 0.75 same night: with the union actually engaging both rings,
+  // 0.85 over-darkened the shadowed side ("started to look bad") — the
+  // ceiling now works against a term that finally reaches it.
+  aoStrength: 0.75,
+  aoRadius: 0.5,
 
   // Cost CEILINGS in total pixels, not quality levels — what the machine can
   // afford. The resolve is sized from the drawing buffer, so a maximized 4K
@@ -215,8 +337,26 @@ const BY_TIER = {
  * where everyone can see it.
  */
 export function resolveGiConfig(props, runtime = globalThis) {
-  const quality = giQualityTier(props?.quality);
+  const authored = giQualityTier(props?.quality);
+  // Clamped BEFORE anything reads the tier, so every tier-keyed ladder
+  // downstream sees the tier this device can actually run — see
+  // giDeviceTierCeiling. A desktop resolves to `authored` unchanged.
+  const ceiling = giDeviceTierCeiling(runtime);
+  const quality = clampTier(authored, ceiling);
   const settled = { quality, ...CONSTANT, ...BY_TIER[quality] };
+  if (quality !== authored) {
+    settled.qualityClampedFrom = authored;
+    // Once per session, not per rebuild: a scene looking different on a phone
+    // than on the desktop it was authored on has to be explainable from the
+    // console, or it reads as GI being broken on that device.
+    if (!warnedClamp) {
+      warnedClamp = true;
+      console.info(
+        `[gi] quality clamped ${authored} → ${quality} for this device ` +
+        `(mobile/Apple WebKit tier ceiling — __giDeviceTier = null removes it)`,
+      );
+    }
+  }
   // ── THE TWO AUTHORED FEATURE TOGGLES (2026-08-21, user request) ──────────
   //
   // `ao` and `reflections` join `quality` as component properties, and the
@@ -295,12 +435,30 @@ export function sceneSkyRadiance(scene, out) {
 /**
  * The debug overlay, as a developer switch rather than an authored property.
  *
- * "off" | "sdf" | "occupancy" | "src-probes". Set `globalThis.__giDebugView`
- * from the console or a harness. Polled rather than pushed — every reader is
- * already in a per-frame path, and a string compare per frame is cheaper than
- * the change notification would be.
+ * "off" | "sdf" | "occupancy" | "src-probes" | "indirect" | "ao" |
+ * "reflections". Set `globalThis.__giDebugView` from the console or a
+ * harness. Polled rather than pushed — every reader is already in a per-frame
+ * path, and a string compare per frame is cheaper than the change notification
+ * would be.
+ *
+ * The "indirect" / "ao" / "reflections" modes are also reachable from the GI
+ * component's `debugView` prop, which is what an inspector user actually wants
+ * (a checkbox beats typing a global). The component prop is a SECOND-PRIORITY
+ * source — `globalThis.__giDebugView` still wins, because a harness that
+ * forces a mode has no component to read from and a console override has to
+ * beat the inspector or nothing can ever step in front of it.
  */
-export function giDebugView() {
-  const view = globalThis.__giDebugView;
-  return typeof view === "string" ? view : "off";
+export function giDebugView(component = null) {
+  // The global is a CONSOLE SWITCH, not a persistent setting. Treating
+  // `"off"` as an override (rather than as "no override") makes a stale
+  // `__giDebugView = "off"` from a previous test arm beat the inspector's
+  // prop, which is the worst outcome — the visible inspector control does
+  // nothing. The convention: the global only wins when it asks for SOMETHING
+  // non-default. A harness that needs to suppress the inspector path should
+  // `delete globalThis.__giDebugView`, not set it to "off".
+  const override = globalThis.__giDebugView;
+  if (typeof override === "string" && override !== "off") return override;
+  const propValue = component?.props?.debugView;
+  if (typeof propValue === "string") return propValue;
+  return "off";
 }

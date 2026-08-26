@@ -131,6 +131,18 @@ the four separate Mixamo downloads were combined into one file.
  * — a jump landed on and immediately re-triggered (bunny-hopping) should cut
  * to JumpUp again right away rather than waiting for JumpDown's crossfade to
  * finish first.
+ *
+ * JumpDown is skipped entirely when Speed is already above the walk deadzone
+ * at the moment Grounded goes true (or crosses it while JumpDown is still
+ * playing) — `t-land-moving`, checked before both `t-land` and `t-recover`.
+ * JumpDown is a landing-IMPACT pose, not a run cycle; playing it while the
+ * controller is already moving the entity used to look like the character
+ * gliding forward with its feet planted for the ~0.37s the clip needs plus
+ * the 0.2s crossfade back to Locomotion — the impact clip has nothing that
+ * resembles a stride, so however fast the capsule was actually travelling,
+ * the mesh read as standing still. Landing while stationary is unaffected:
+ * Speed stays under the deadzone, so `t-land-moving`'s condition never
+ * passes and the impact clip plays exactly as before.
  */
 export const CHARACTER_LOCOMOTION_ANIM = {
   version: 2,
@@ -195,6 +207,17 @@ export const CHARACTER_LOCOMOTION_ANIM = {
           duration: 0.08,
           exitTime: null,
           conditions: [{ param: "Grounded", op: "==", value: false }],
+        },
+        {
+          id: "t-land-moving",
+          from: "__any__",
+          to: "state-locomotion",
+          duration: 0.15,
+          exitTime: null,
+          conditions: [
+            { param: "Grounded", op: "==", value: true },
+            { param: "Speed", op: ">", value: 0.5 },
+          ],
         },
         {
           id: "t-land",

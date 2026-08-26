@@ -239,8 +239,64 @@ export function invalidateBlobUrl(path) {
   for (const fn of invalidationListeners) fn(path);
 }
 
+/**
+ * The file extension of `path`, lowercased and without the dot — `""` when
+ * there isn't one.
+ *
+ * The dot has to be in the BASENAME, and there has to be a dot at all.
+ * `split(".").pop()` returns the WHOLE STRING when the string contains no dot,
+ * so every extension-less path — every FOLDER, most of all — used to report
+ * its own full path as its extension. That is what made renaming a folder from
+ * the Asset Inspector impossible: the rename appended the "extension" back on
+ * and asked the filesystem for `NewName.c:/users/.../new folder`, which it
+ * refused, and the refusal only ever reached the console. A dot anywhere in a
+ * DIRECTORY name ("C:/My.Game/scripts/Rotator") produced the same nonsense for
+ * files.
+ *
+ * A leading dot is a name, not an extension: `.gitignore` has no extension.
+ */
 export function extOf(path) {
-  return path.split(".").pop()?.toLowerCase() ?? "";
+  const base = String(path ?? "").split(/[\\/]/).pop() ?? "";
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot + 1).toLowerCase() : "";
+}
+
+/**
+ * Git LFS keeps a large binary out of the repo, leaving a ~130-byte text stub
+ * in the working tree and fetching the real bytes on checkout. A clone made
+ * without LFS installed — and, far more often, a "Download ZIP" from a web UI,
+ * which never expands them at all — leaves those stubs behind under the
+ * original file names. They then reach an importer looking like nothing but a
+ * corrupt model or texture.
+ *
+ * Returns the byte count the pointer promises (so a caller can say how much is
+ * actually missing), or null when these bytes are not a pointer.
+ *
+ * Worth naming explicitly rather than letting a parser fail: "no FBX header
+ * found" sends someone back to their DCC tool to re-export a file that was
+ * never downloaded, while `git lfs pull` fixes it in one command.
+ */
+export function lfsPointerSize(head) {
+  const bytes =
+    typeof head === "string"
+      ? null
+      : ArrayBuffer.isView(head)
+        ? new Uint8Array(head.buffer, head.byteOffset, head.byteLength)
+        : new Uint8Array(head);
+  // The spec fixes the version line first, so 200 bytes is always enough.
+  const text = typeof head === "string" ? head : new TextDecoder().decode(bytes.subarray(0, 200));
+  if (!text.startsWith("version https://git-lfs.github.com/spec/v1")) return null;
+  return Number(text.match(/\bsize (\d+)/)?.[1] ?? 0);
+}
+
+/** The message an importer should surface for an unexpanded LFS pointer. */
+export function lfsPointerMessage(fileName, size) {
+  const mb = size >= 1048576 ? `${(size / 1048576).toFixed(1)} MB` : `${(size / 1024).toFixed(0)} KB`;
+  return (
+    `${fileName} is a Git LFS pointer, not the file itself — the real ${mb} was never downloaded. ` +
+    `Run "git lfs pull" in the repository you got it from (or download it from that project's ` +
+    `releases page); a "Download ZIP" from a web UI always leaves these stubs behind.`
+  );
 }
 
 /**

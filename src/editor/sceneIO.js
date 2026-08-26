@@ -4,7 +4,7 @@ import { ensureEngine } from "./engineInstance.js";
 import { commandBus } from "./commands/CommandBus.js";
 import { useSceneStore } from "./store/sceneStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
-import { useProjectStore } from "./store/projectStore.js";
+import { useProjectStore, lastProjectPath } from "./store/projectStore.js";
 
 /**
  * The scene file on screen. VM-wide rather than a module-level `let`: "which
@@ -111,6 +111,59 @@ function bootCandidates() {
   // Deduped because the two very often name the same scene, and trying it
   // twice would log the same "not found" warning twice.
   return [...new Set([meta.lastScene, meta.mainScene].filter(Boolean).map(absolute))];
+}
+
+/**
+ * The `renderer` block of the scene the editor is ABOUT to boot into, read
+ * before the renderer exists so it can be built with those options the first
+ * time. Returns null when there is nothing to pre-apply.
+ *
+ * WHY THIS IS READ TWICE (here, and again by the real scene load a moment
+ * later): antialias / samples / transparent are frozen at `WebGPURenderer`
+ * construction time, so a scene whose block differs from
+ * `SCENE_SETTINGS_DEFAULTS` used to be honoured by DESTROYING the boot
+ * renderer and building a second one — `renderer.dispose()` → `[gpu] DEVICE
+ * LOST (destroyed)` in the console on EVERY launch of any such project, plus a
+ * second adapter+device request and every pipeline minted against the dead
+ * device thrown away. `Engine.init` runs from ViewportPanel's mount, well
+ * before `restoreLastScene`, so the only way to build it right once is to look
+ * the value up early. One extra file read at boot buys that.
+ *
+ * Deliberately store-independent: the project root comes from localStorage via
+ * `lastProjectPath()` when the store has not been populated yet, because the
+ * viewport can mount before `openProject` has resolved and a store miss would
+ * silently put the destroy back.
+ */
+export async function peekBootRendererSettings() {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const readJson = async (path) => JSON.parse(await invoke("load_scene", { path }));
+    const root = projectRoot() ?? lastProjectPath();
+    /** @type {string[]} */
+    const candidates = [];
+    if (root) {
+      // The store's meta when it is already loaded, else project.json itself.
+      let meta = useProjectStore.getState().projectMeta ?? {};
+      if (!meta.lastScene && !meta.mainScene) {
+        meta = await readJson(`${root}/project.json`).catch(() => ({}));
+      }
+      for (const rel of [meta.lastScene, meta.mainScene]) {
+        if (rel) candidates.push(isAbsolute(rel) ? rel : `${root}/${rel}`);
+      }
+    } else {
+      const legacy = localStorage.getItem(LAST_SCENE_KEY);
+      if (legacy) candidates.push(legacy);
+    }
+    for (const path of [...new Set(candidates)]) {
+      const scene = await readJson(path).catch(() => null);
+      const renderer = scene?.settings?.renderer;
+      if (renderer && typeof renderer === "object") return renderer;
+    }
+  } catch {
+    // No Tauri, no project, or an unreadable scene. The renderer is then built
+    // from the defaults exactly as before — one rebuild, not a broken boot.
+  }
+  return null;
 }
 
 /** Reloads the scene the editor should boot into. Validates the path exists

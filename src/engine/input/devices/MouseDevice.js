@@ -54,6 +54,27 @@ export class MouseDevice {
     this.scroll.x = this.scroll.y = 0;
   }
 
+  /**
+   * A touchscreen speaks Pointer Events too: one finger dragging across the
+   * glass fires `pointerdown`/`pointermove`/`pointerup` with
+   * `pointerType === "touch"`, indistinguishable from a mouse to any
+   * listener that doesn't ask.
+   *
+   * It has to be asked. Touch has its own device (`TouchDevice`) and its own
+   * higher-level layer (`VirtualJoysticks`); letting it ALSO drive this one
+   * meant `mouse/delta` — which the default Player map binds to Look — was
+   * fed by every finger on the screen, so dragging the on-screen MOVE stick
+   * turned the camera. It also latched `mouse/leftButton`, which made
+   * `InputManager.#anyMouseDown()` report keyboard-and-mouse activity on a
+   * phone and hide the joystick overlay the player was holding.
+   *
+   * Pen/stylus is deliberately still a mouse: it has a hover state and a
+   * button, and games treat it as one.
+   */
+  #isTouch(e) {
+    return e.pointerType === "touch";
+  }
+
   #onPointerMove(e) {
     const t = this._target;
     // Normalize against the target's bounding rect so cursor-locked reads
@@ -61,18 +82,25 @@ export class MouseDevice {
     const rect = t.getBoundingClientRect ? t.getBoundingClientRect() : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
     const nx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     const ny = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
-    this.delta.x += e.movementX ?? nx - this.position.x;
-    this.delta.y += e.movementY ?? ny - this.position.y;
+    // Position still tracks a finger — `mouse/position` and `mouse.ray()` are
+    // how a game picks what was tapped, and a touch that never updated it
+    // would raycast through wherever the mouse last was. Only the per-frame
+    // DELTA (the look axis) is refused.
+    if (!this.#isTouch(e)) {
+      this.delta.x += e.movementX ?? nx - this.position.x;
+      this.delta.y += e.movementY ?? ny - this.position.y;
+    }
     this.position.x = nx;
     this.position.y = ny;
   }
 
   #onPointerDown(e) {
-    if (e.button === undefined) return;
+    if (e.button === undefined || this.#isTouch(e)) return;
     this.buttons.set(this.#buttonName(e.button), true);
   }
 
   #onPointerUp(e) {
+    if (this.#isTouch(e)) return;
     // pointerup's button is whatever was released; `buttons` (plural) covers
     // the case where the OS only fires once for all up events.
     const name = e.button !== undefined ? this.#buttonName(e.button) : null;

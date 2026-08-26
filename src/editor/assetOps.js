@@ -1,6 +1,6 @@
 import { useProjectStore } from "./store/projectStore.js";
 import { useSelectionStore } from "./store/selectionStore.js";
-import { syncScriptClassNameAfterRename, retargetScriptPath } from "./scriptClassSync.js";
+import { syncScriptClassNameAfterRename, retargetScriptPath, retargetScriptFolder } from "./scriptClassSync.js";
 import { confirmDestructive } from "./components/ConfirmDialog.jsx";
 
 /**
@@ -16,6 +16,25 @@ export async function invoke(cmd, args) {
 
 /** Normalised path for case-insensitive prefix/suffix comparisons. */
 const norm = (p) => p.replaceAll("\\", "/").toLowerCase();
+
+/**
+ * Joins a child onto a directory using the separator that directory already
+ * uses.
+ *
+ * `list_dir` builds every entry path with the OS separator (backslashes on
+ * Windows), and half the editor compares paths with `===`: the rename gate
+ * (`renamingPath === entry.path`), the selection highlight, the Inspector's
+ * lookup. A created folder that came back as `C:\…\GAME/New Folder` therefore
+ * matched none of them — the tile wasn't selected and never dropped into
+ * rename mode, so "New Folder" stayed called New Folder.
+ */
+export function joinPath(dir, name) {
+  const base = String(dir ?? "").replace(/[\\/]+$/, "");
+  // The separator the parent itself last used, so a Windows path stays a
+  // Windows path and a POSIX one stays POSIX. Falls back to "/" for a bare name.
+  const sep = base.lastIndexOf("\\") > base.lastIndexOf("/") ? "\\" : "/";
+  return `${base}${sep}${name}`;
+}
 
 /** First "name", "name 1", "name 2"… not already taken in the folder. */
 export function uniqueName(baseName, entries) {
@@ -35,7 +54,7 @@ export async function createAssetFile(baseName, contents) {
   const { currentPath, entries, refresh } = useProjectStore.getState();
   if (!currentPath) return null;
   const name = uniqueName(baseName, entries);
-  const path = `${currentPath}/${name}`;
+  const path = joinPath(currentPath, name);
   await invoke("save_scene", { path, contents });
   await refresh();
   console.log(`Created ${name}`);
@@ -115,7 +134,7 @@ export async function createFolderIn(parentPath, { name = "New Folder" } = {}) {
   if (!dir) return null;
   const siblings = await invoke("list_dir", { path: dir }).catch(() => []);
   const folderName = uniqueName(name, siblings);
-  const path = `${dir}/${folderName}`;
+  const path = joinPath(dir, folderName);
   try {
     await invoke("create_dir", { path });
   } catch (err) {
@@ -152,7 +171,7 @@ export async function groupIntoFolder(entries, { name = "New Folder" } = {}) {
   // A folder can't be moved into itself; drop any selected folder that would
   // become its own ancestor (only possible when the name collides).
   const folderName = uniqueName(name, siblings);
-  const dest = `${parent}/${folderName}`;
+  const dest = joinPath(parent, folderName);
   try {
     await invoke("create_dir", { path: dest });
   } catch (err) {
@@ -283,10 +302,41 @@ export async function renameEntry(entry, newName) {
     // …and move what pointed at the old name: open tabs, the shared Monaco
     // model, and every entity whose Scripts component named this file.
     await retargetScriptPath(entry.path, newPath);
+    // A folder rename moves every script UNDER it too. Without this, renaming
+    // `scripts/` left every entity referencing a path that no longer exists —
+    // no error, just behaviours that quietly stop running.
+    await retargetScriptFolder(entry.path, newPath);
 
+    // Renaming the folder you are standing in (or an ancestor of it) leaves the
+    // store browsing a path that is gone: `refresh()` re-lists `currentPath`,
+    // `list_dir` throws, and the panel keeps showing the OLD listing — which
+    // reads exactly like a rename that didn't happen. Move with the folder.
+    const project = useProjectStore.getState();
+    const inside = `${norm(entry.path)}/`;
+    const browsed = norm(project.currentPath ?? "");
+    if (browsed === norm(entry.path) || browsed.startsWith(inside)) {
+      await project.navigate(`${newPath}${project.currentPath.slice(entry.path.length)}`);
+    }
     await useProjectStore.getState().refresh();
+    // Keep the renamed asset selected, so the Inspector isn't left pointing at
+    // a dead path and a follow-up F2 still acts on it.
+    if (useSelectionStore.getState().assetPaths.includes(entry.path)) {
+      useSelectionStore.getState().selectAsset(newPath);
+    }
   } catch (err) {
+    // A toast, not just the console. The grid and the tree render whatever the
+    // last listing said and nothing here is applied optimistically, so a
+    // refused rename looks *exactly* like a successful one that snapped back to
+    // the old name — the user has no way to tell "the folder is locked" from "I
+    // typed it wrong" from "the editor is broken". Say which.
     console.error(`Rename failed: ${err}`);
+    const { pushToast } = await import("./toasts.js");
+    pushToast({
+      level: "error",
+      title: `Couldn't rename "${entry.name}"`,
+      detail: String(err?.message ?? err),
+      key: `rename:${entry.path}`,
+    });
   }
 }
 
@@ -294,7 +344,7 @@ export async function renameEntry(entry, newName) {
 function badMove(sourcePath, destDir) {
   if (!sourcePath || !destDir || sourcePath === destDir) return true;
   const name = sourcePath.split(/[\\/]/).pop();
-  if (`${destDir}/${name}` === sourcePath) return true;
+  if (norm(joinPath(destDir, name)) === norm(sourcePath)) return true;
   // Refuse moving a folder into itself/a descendant.
   return norm(destDir).startsWith(`${norm(sourcePath)}/`);
 }
@@ -306,7 +356,7 @@ export async function movePathsIntoFolder(sourcePaths, destDir) {
   let moved = 0;
   for (const sourcePath of paths) {
     const name = sourcePath.split(/[\\/]/).pop();
-    const dest = `${destDir}/${name}`;
+    const dest = joinPath(destDir, name);
     try {
       await invoke("rename_path", { from: sourcePath, to: dest });
       await invoke("rename_path", { from: `${sourcePath}.meta`, to: `${dest}.meta` }).catch(() => {});

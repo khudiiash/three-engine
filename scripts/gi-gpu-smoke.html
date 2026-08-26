@@ -139,6 +139,14 @@
         // that needs the loop RUNNING at assert time (earlier arms only read
         // state accumulated during the pinned boot window).
         globalThis.__editorKeepRendering = true;
+        // THE PORTABLE PIN. The engine opportunistically asks the adapter for
+        // 16 storage buffers since 2026-08-16 (sceneSettings.js's voxelizer
+        // note), which is correct for the editor and WRONG for this smoke:
+        // its whole claim is that every GI kernel fits the PORTABLE limit of
+        // 8, and that claim is only tested on a device that actually has 8.
+        // The cap turns the ask back down; the `!== 8` assertion below then
+        // means what it says on any adapter.
+        globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
         const { Engine, THREE, registerBuiltInComponents } = await import("/src/engine/index.js");
         await import("/src/modules/index.js");
         const { enableEngineModule } = await import("/src/engine/modules.js");
@@ -481,7 +489,27 @@
         // The SRC population's kernels are NOT in `state.queue` (they are
         // dispatched off the gbuffer, ahead of it), so the audit has to be told
         // about them explicitly or the arm would audit nothing and pass.
+        //
+        // ⚠⚠ AND NEITHER IS THE OCCUPANCY CHAIN — which is how a NINE-storage-
+        // buffer kernel shipped past this smoke's whole reason to exist
+        // (2026-08-23). `occupancyField.passes()` is dispatched on its own, so
+        // for as long as this list held only the queue and SRC, the arm proved
+        // the portable envelope for two thirds of GI and stayed green while the
+        // field's own voxelizer/surface-fit kernels went over the limit. On a
+        // baseline device that invalidates `occupancy#7`'s pipeline layout,
+        // every bind group built from it, and finally the device — GI ships
+        // with no transport at all and only screen-space emissive survives.
+        // `prewarmComputes()` returns exactly the set `passes()` can dispatch,
+        // with none of its side effects, which is why it is safe here.
+        let occAuditNodes = [];
+        try {
+          occAuditNodes = (state?.volume?.occupancyField?.prewarmComputes?.() ?? [])
+            .map((node, index) => [node?.__giPassName ?? `occupancy[${index}]`, node]);
+        } catch (e) {
+          console.log(`GI-SMOKE NOTE occupancy chain not auditable: ${e?.message ?? e}`);
+        }
         const auditNodes = [
+          ...occAuditNodes,
           ...(state?.queue ?? []).map((node, index) => [`queue[${index}]`, node]),
           ...(state?.screen?.srcProbes?.passes ?? []).map((node, index) => [`srcProbes[${index}]`, node]),
         ];
@@ -513,6 +541,25 @@
           }
         }
         console.log("GI-SMOKE BINDINGS", JSON.stringify(bindingAudit));
+        // ⚠ THE AUDIT NOW FAILS, IT DOES NOT MERELY REPORT (2026-08-23).
+        //
+        // It collected over-limit kernels and logged them for as long as it has
+        // existed, on the theory that the pinned device would refuse the
+        // pipeline and some later assertion would notice. It does refuse — but
+        // the refusal surfaces as an UNCAPTURED validation error on a pipeline
+        // whose dispatch is skipped, so frames keep flowing, the arm's own
+        // asserts stay green on whatever the still-working passes produced, and
+        // the smoke reports PASS on a build that cannot run on a phone. Say it
+        // here, where the count is already in hand.
+        const overLimit = bindingAudit.filter((b) => b.storageBindings > 8);
+        if (overLimit.length) {
+          throw new Error(
+            `${overLimit.length} GI kernel(s) exceed the portable limit of 8 storage buffers: ` +
+            overLimit.map((b) => `${b.index}=${b.storageBindings}`).join(", ") +
+            " — a baseline WebGPU device (every phone) invalidates their pipeline layout, and " +
+            "the chain they belong to never runs. Fold two buffers into one before shipping this.",
+          );
+        }
         if (secondaryPass) {
           if (!secondaryAudit) {
             throw new Error("[J] exists on the system but is not in `passes` — it would never dispatch");

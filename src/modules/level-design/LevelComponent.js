@@ -1,5 +1,6 @@
 // @ts-check
 import { Component } from "../../engine/components/Component.js";
+import { levelRooms } from "./rooms.js";
 
 /**
  * The root of a blockout: the settings every piece under it is drawn with, and
@@ -77,6 +78,16 @@ export class LevelComponent extends Component {
     return (this.entity.children ?? [])
       .filter((child) => child.getComponent?.("levelfloor"))
       .sort((a, b) => a.object3D.position.y - b.object3D.position.y);
+  }
+
+  /**
+   * The rooms this blockout encloses, derived per storey by flood-filling the
+   * wall footprints (§15 U4b). Duck-typed — the GI system's auto reflection
+   * probes call this without importing the level-design module; see rooms.js
+   * for the algorithm and its deliberate treatment of door openings.
+   */
+  rooms(opts) {
+    return levelRooms(this, opts);
   }
 
   /** The storey nearest `elevation`, or null when the level has none yet. */

@@ -524,14 +524,21 @@ function mountCamera({ position = [0, 0, 0], bodyYaw = 0, damping, boom = false 
   if (damping !== undefined) camera.damping = damping;
   camera.avoidWalls = false;
   camera.engine = { physics: null };
+  // The rig's visible model: a "Body" child, which is what the first-person
+  // view has to hide (the eyes are inside the head) and the third-person view
+  // has to leave alone.
+  const bodyEntity = { name: "Body", visible: true, findComponents: () => [{}] };
   camera.entity = {
     object3D: body,
+    children: [bodyEntity],
     getWorldPosition: (target) => body.getWorldPosition(target),
+    getEntityByName: (name) => (name === "Body" ? bodyEntity : null),
     getScript: () => null,
   };
   camera.cameraEntity = { object3D: cameraObject };
   camera.currentDistance = camera.distance; // onStart's job
-  return { camera, body, cameraObject };
+  camera.body = camera.findBody(); // onStart's job
+  return { camera, body, cameraObject, bodyEntity };
 }
 
 /** Where the camera must be, from first principles: the shoulder offset in the
@@ -624,6 +631,120 @@ check("a teleport does not fly the camera across the level", () => {
   camera.snap();
   camera.applyThirdPerson(1 / 60);
   near(worldOf(cameraObject), orbitPoint(camera, [60, 0, -40]), "the camera is still travelling there");
+});
+
+/* -------------------------------------------------------------------------- */
+console.log("first person");
+
+/*
+ * "In first person I can see the head of our character."
+ *
+ * Of course you can: an eye height puts the camera INSIDE the skull, so the
+ * model's own head fills the bottom of the frame and its face fills the rest
+ * the moment you look down. The camera has to hide the body it is standing in.
+ */
+
+check("first person hides the character's body, third person shows it", () => {
+  const { camera, bodyEntity } = mountCamera();
+  assert.equal(bodyEntity.visible, true, "third person starts with the body visible");
+  camera.setView("first");
+  assert.equal(bodyEntity.visible, false, "the head is still in the way in first person");
+  camera.setView("third");
+  assert.equal(bodyEntity.visible, true, "the body never came back for third person");
+});
+
+check("the body follows the View field flipped in the Inspector mid-Play", () => {
+  // setView() is the API; `view` is an @attribute, and changing it in the
+  // Inspector writes the field directly. Both have to work.
+  const { camera, bodyEntity } = mountCamera();
+  camera.view = "first";
+  camera.applyBodyVisibility();
+  assert.equal(bodyEntity.visible, false);
+  camera.view = "third";
+  camera.applyBodyVisibility();
+  assert.equal(bodyEntity.visible, true);
+});
+
+check("turning the hiding off leaves the body alone", () => {
+  const { camera, bodyEntity } = mountCamera();
+  camera.hideBody = false;
+  camera.setView("first");
+  assert.equal(bodyEntity.visible, true, "an arms-only model must survive first person");
+});
+
+check("a body somebody else hid is not force-shown on the way back out", () => {
+  const { camera, bodyEntity } = mountCamera();
+  bodyEntity.visible = false; // a cutscene, an invisibility pickup, whatever
+  camera.setView("first");
+  camera.setView("third");
+  assert.equal(bodyEntity.visible, false, "the camera resurrected a deliberately hidden body");
+});
+
+check("onDestroy puts the body back", () => {
+  const { camera, bodyEntity } = mountCamera();
+  camera.setView("first");
+  camera.onDestroy();
+  assert.equal(bodyEntity.visible, true, "stopping Play left the character invisible");
+});
+
+check("the body is found without a name, from whatever child renders", () => {
+  const { camera } = mountCamera();
+  camera.bodyName = "";
+  assert.ok(camera.findBody(), "a hand-built rig with a differently named model finds nothing");
+});
+
+/* -------------------------------------------------------------------------- */
+console.log("look input");
+
+/*
+ * A mouse reports how far it MOVED; a stick reports how far it is HELD. Feeding
+ * both through the same per-frame multiplier makes the stick framerate
+ * dependent — the same thumb pressure turns twice as far on a 120 Hz phone as
+ * on a 60 Hz one — which is most of why on-screen look felt uncontrollable.
+ */
+
+function mountLook(scheme, look) {
+  const { camera } = mountCamera();
+  camera.input = {
+    activeScheme: scheme,
+    readValue: () => look,
+    wasPressedThisFrame: () => false,
+  };
+  return camera;
+}
+
+check("mouse look is a delta: the same movement turns the same amount at any fps", () => {
+  const slow = mountLook("KeyboardMouse", { x: 10, y: 0 });
+  const fast = mountLook("KeyboardMouse", { x: 10, y: 0 });
+  slow.readLook(1 / 30);
+  fast.readLook(1 / 240);
+  assert.ok(Math.abs(slow.yaw - fast.yaw) < 1e-12, "frame time leaked into mouse look");
+  assert.ok(Math.abs(slow.yaw) > 1e-6, "the mouse turned nothing at all");
+});
+
+check("stick look is a rate: full deflection turns Stick Speed per second", () => {
+  for (const scheme of ["Gamepad", "Touch"]) {
+    const camera = mountLook(scheme, { x: 1, y: 0 });
+    const steps = 120;
+    for (let i = 0; i < steps; i++) camera.readLook(1 / steps); // one second, any fps
+    const degrees = (-camera.yaw * 180) / Math.PI;
+    assert.ok(
+      Math.abs(degrees - camera.stickSpeed) < 1e-6,
+      `${scheme}: a second of full deflection turned ${degrees}deg, not ${camera.stickSpeed}`,
+    );
+  }
+});
+
+check("a stick turns the same amount per second whatever the framerate", () => {
+  const at = (fps) => {
+    const camera = mountLook("Touch", { x: 0.6, y: 0.4 });
+    for (let i = 0; i < fps; i++) camera.readLook(1 / fps);
+    return camera;
+  };
+  const slow = at(30);
+  const fast = at(144);
+  assert.ok(Math.abs(slow.yaw - fast.yaw) < 1e-9, "stick yaw is framerate dependent");
+  assert.ok(Math.abs(slow.pitch - fast.pitch) < 1e-9, "stick pitch is framerate dependent");
 });
 
 /**

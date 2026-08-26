@@ -270,6 +270,16 @@ async function ensureViewport() {
       // world planes while authoring, so the editor camera needs them too.
       viewport.camera.layers.enable(UI_LAYER);
 
+      // The boot scene's constructor-frozen renderer options, applied BEFORE
+      // the renderer is built. Without this the renderer is built from the
+      // defaults and then thrown away — see peekBootRendererSettings.
+      // `applySettings` cannot schedule a rebuild here because there is no
+      // renderer yet, so this is a plain seed of the settings object.
+      // Imported lazily to keep this panel off sceneIO's static import graph.
+      const { peekBootRendererSettings } = await import("../sceneIO.js");
+      const bootRenderer = await peekBootRendererSettings();
+      if (bootRenderer) await engine.applySettings({ renderer: bootRenderer });
+
       viewport.backend = await engine.init(canvas);
       engine.camera = viewport.camera;
       console.log(`Renderer backend: ${viewport.backend}`);

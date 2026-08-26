@@ -253,6 +253,18 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
   const thumbCanvases = useRef(new Map());
   const graphRef = useRef(null);
   const loadedRef = useRef(false);
+  // Does this material's look ACTUALLY come from a graph? A .mat authored in
+  // the Inspector (a colour, a texture) has no `shaderGraph` at all, and the
+  // editor shows it DEFAULT_GRAPH — a white Principled BSDF — as a starting
+  // point. Compiling that starting point into the shared material is not a
+  // no-op: `applyGraphMutations` nulls every node slot and sets `colorNode`,
+  // which overrides the material's own `color` and `map`. So merely SELECTING
+  // a mesh turned it (and every other mesh sharing the material) white.
+  //
+  // Same contract the shared Default material already has: show the graph, and
+  // take the material over only once the user actually edits it.
+  const authoredRef = useRef(false);
+  const touchedRef = useRef(false);
 
   // Follow the panel when it points at a genuinely different material. A fork
   // we made ourselves arrives here as the value `path` already holds, so React
@@ -269,6 +281,9 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
     // leaving node positions, undo history and the user's edit untouched.
     if (adoptedRef.current && adoptedRef.current === path) {
       adoptedRef.current = null;
+      // A fork only exists because the user edited; its graph is theirs.
+      authoredRef.current = true;
+      touchedRef.current = true;
       (async () => {
         const mat = await loadMaterialAsset(path);
         if (!live) return;
@@ -290,6 +305,8 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
         } catch {}
       }
       if (!live) return;
+      authoredRef.current = !!def?.shaderGraph;
+      touchedRef.current = false;
       const graph = def?.shaderGraph ? migrateGraph(migrateLegacyGraph(def.shaderGraph, def)) : DEFAULT_GRAPH;
       graphRef.current = graph;
       setMaterial(mat);
@@ -330,6 +347,9 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
     if (meta?.kind === "props") {
       // Pure layout state: persist it, but it can't change a single pixel.
       if (meta.patch?.__collapsed !== undefined) return;
+      // A change that reaches the shader is what makes this material the
+      // graph's — dragging a node around is not (see `authoredRef`).
+      touchedRef.current = true;
       let structuralHit = false;
       for (const [key, value] of Object.entries(meta.patch ?? {})) {
         if (key === "__thumb") {
@@ -345,6 +365,7 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
     }
     // Node moves don't affect the compiled shader — only the saved layout.
     if (meta?.kind === "position") return;
+    touchedRef.current = true;
     setStructural((s) => s + 1);
   }, []);
 
@@ -355,6 +376,9 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
     // is persisted as a new asset below; this editor then adopts that asset in
     // place and follows the normal live-compile path from the next tick on.
     if (!loadedRef.current || !material || !path) return;
+    // ...and never compile a starting-point graph into a material that never
+    // had one. Reading a .mat must not change how it looks.
+    if (!authoredRef.current && !touchedRef.current) return;
     const timer = setTimeout(async () => {
       const full = graphRef.current;
       // Comments and reroute pins are authoring aids; the compiler resolves
@@ -410,6 +434,10 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
   // without a second compile.
   useEffect(() => {
     if (saved || !loadedRef.current) return;
+    // Writing a `shaderGraph` the user never authored would hand the material
+    // to the graph on the NEXT load — the same white-out, one reload later.
+    // A node someone dragged is not a reason to do that.
+    if (path && !authoredRef.current && !touchedRef.current) return;
     const timer = setTimeout(async () => {
       // The FULL graph is saved (comments and reroutes included) so the user's
       // layout survives a reload; only the compiler gets the stripped copy.

@@ -94,13 +94,47 @@ export function giRoughnessBucketOf(material) {
   // KTX2) — until one lands the material stays conservatively in bucket 3
   // and the existing #refreshMirrorBucket healing recompiles it when the
   // stat arrives. `__giRoughnessFloorClassify = false` reverts.
-  if (globalThis.__giRoughnessFloorClassify !== false) {
+  // ⚠ OPT-IN (=== true) SINCE 2026-08-24 LATE — REFUTED AS A DEFAULT, twice
+  // in one night, by the user's eyes + two A/B boots on Sponza:
+  //   floor → bucket 2: shadowed walls went near-black (diffuse-only
+  //     compiles out the whole directional chain);
+  //   floor → bucket 1: STILL murky — the missing energy is the
+  //     canMirror block's HIT-SHADED EXACT RADIANCE itself. At grazing
+  //     angles Fresnel drives rough-surface specular high, so the "term
+  //     smoothstep zeroes" premise is wrong for the hit-shade path: on
+  //     Sponza those traces paint a real share of every shadowed wall.
+  // The 22.7 ms is real lighting, not waste. The perf lever is making the
+  // prepass CHEAPER for rough pixels (they are low-frequency — coarse
+  // stride + the existing block replication), not removing them. The
+  // channel-floor machinery below stays correct and gated for that design.
+  if (globalThis.__giRoughnessFloorClassify === true) {
     const src = giRoughnessSourceOf(material);
-    const texFloor = src?.tex ? giRoughnessFloorStats.get(src.tex) : undefined;
-    if (typeof texFloor === "number") {
-      const floor = Math.min(1, texFloor * src.factor);
-      if (floor > GI_SPECULAR_ROUGHNESS_MAX) return 2;
-      if (floor > GI_MIRROR_ROUGHNESS_MAX) return 1;
+    const stats = src?.tex ? giRoughnessFloorStats.get(src.tex) : undefined;
+    if (stats) {
+      // Pick the floor for the channel the material actually samples.
+      // min-RGB is the fallback for an unknown channel only — on a glTF
+      // packed metallicRoughness map (B = metalness ≈ 0 on dielectrics)
+      // min-RGB is ~0 on EVERY texel, which silently kept every packed-map
+      // material in the consumer set (the Sponza 24/39 regression). Legacy
+      // number-shaped stats (pre per-channel) still read as the min floor.
+      const texFloor =
+        typeof stats === "number" ? stats : (stats[src.channel] ?? stats.min);
+      if (typeof texFloor === "number") {
+        const floor = Math.min(1, texFloor * src.factor);
+        // ⚠ BUCKET 1, NEVER BUCKET 2 (2026-08-24, the user's "shadowed
+        // areas too dark/murky" — A/B-confirmed the same night). Bucket 2
+        // compiles ONLY irradiance/π: the whole directional radiance chain
+        // (cascade lookups, reflection probes, the rough-lobe collapse) is
+        // compiled OUT, and on real scenes that chain carries a visible
+        // share of every shadowed wall's light even at roughness 0.7+.
+        // What R4 exists to kill is the EXACT-reflection cost, and that is
+        // bucket 0/3 membership (the mirror mask + bvhShade readers) —
+        // bucket 1 already avoids all of it while keeping the energy. The
+        // map-floor path therefore never demotes past 1; only an AUTHORED
+        // constant roughness (the artist's explicit intent, below) may
+        // still choose the diffuse-only limit.
+        if (floor > GI_MIRROR_ROUGHNESS_MAX) return 1;
+      }
     }
   }
   if (material.roughnessMap) return 3;
@@ -116,6 +150,129 @@ export function giRoughnessBucketOf(material) {
  * releases its stat.
  */
 export const giRoughnessFloorStats = new WeakMap();
+
+/**
+ * §18 — THE REFLECTION QUALITY LADDER. How FINELY a surface's reflection must
+ * be sampled, from its roughness LOWER BOUND. 0 = sharp, 1 = medium, 2 = coarse.
+ *
+ * ⚠⚠ THIS IS A RESOLUTION DECISION AND NEVER A PATH DECISION, and that
+ * distinction is the entire reason it is safe where §16 R4 was not. R4 used
+ * these same floors to move materials OUT of the exact-reflection path, and the
+ * user's eyes refuted it in one night: the hit-shaded exact radiance is REAL
+ * LIGHT (at grazing angles Fresnel drives rough-surface specular high), so
+ * dropping it turned shadowed walls near-black. Nothing here changes which
+ * terms a material compiles or which code path it takes — every surface keeps
+ * the reflection it has today. The tier only says how many rays pay for it.
+ * A wrong tier therefore costs SHARPNESS or SPEED, never energy.
+ *
+ * ## Why the ladder exists at all
+ *
+ * The engine had exactly TWO tiers: bucket 0 (mirror) and bucket 3 (everything
+ * with a roughness map). On the user's Bistro that is **2 materials against
+ * 102** — so window glass and wall plaster are in the same tier and get
+ * identical treatment. Both halves of that are wrong at once: the glass is
+ * denied the sharp trace it needs (its reflection arrives as a blurry, blobby
+ * probe-field gather — the user's "blurry, noisy, dirty" windows), while the
+ * plaster pays FULL-RESOLUTION PER-PIXEL BVH TRACING at ultra (25.77 ms of a
+ * ~52 ms GPU frame) to produce something that is then blurred anyway.
+ * User, 2026-08-24: *"for some surfaces we need much cleaner reflection while
+ * others, like a wet carpet, would do with a very low res."*
+ *
+ * ## Why the FLOOR, not the mean
+ *
+ * The floor is the roughness LOWER BOUND over the map (§16 R4's per-channel p5).
+ * Keying on it is deliberately conservative in the QUALITY direction: a surface
+ * with any smooth region is traced finely across the whole surface, so the
+ * ladder can never under-sample a mirror-like patch. It costs some perf on
+ * mixed maps and cannot produce a sharpness regression, which is the right way
+ * round for a change the user has to look at.
+ *
+ * An UNRESOLVED floor (the async GPU stat has not landed, or the roughness
+ * expression is not one the bounded walk recognises) returns MEDIUM rather than
+ * SHARP or COARSE — the middle is the only answer that is not a guess in either
+ * direction, and §16 R4's existing `#refreshMirrorBucket` drain re-derives it
+ * when the stat arrives.
+ */
+export const GI_REFLECT_TIER = { SHARP: 0, MEDIUM: 1, COARSE: 2 };
+
+/**
+ * ⚠ THESE ARE NOT TUNING NUMBERS — they are read off the ramp that already
+ * decides how much of the exact traced reflection survives, `exactWeight =
+ * smoothstep(0.45, 0.15, roughness)` (giLight.js, the exact-blend site):
+ *
+ *   roughness <= 0.15  ->  exactWeight 1.00   the traced image is shown in full
+ *   roughness  = 0.30  ->  exactWeight 0.50
+ *   roughness >= 0.45  ->  exactWeight 0.00   the traced image is DISCARDED
+ *
+ * So the tiers are the ramp's own breakpoints. Picking independent constants
+ * (the first cut used 0.12 / 0.35) means the ladder and the shader disagree
+ * about what "sharp" is, and the scene's own MIRROR materials then fail to
+ * qualify as sharp — which is exactly what the first census showed: 0 sharp.
+ */
+export const GI_TIER_SHARP_MAX = 0.15;
+export const GI_TIER_MEDIUM_MAX = 0.45;
+
+function tierFromRoughness(r) {
+  if (!(r >= 0)) return GI_REFLECT_TIER.MEDIUM;
+  if (r <= GI_TIER_SHARP_MAX) return GI_REFLECT_TIER.SHARP;
+  if (r <= GI_TIER_MEDIUM_MAX) return GI_REFLECT_TIER.MEDIUM;
+  return GI_REFLECT_TIER.COARSE;
+}
+
+/**
+ * The ladder, WITH ITS REASON — because `MEDIUM` is returned for two completely
+ * different situations and reading them as one is a measuring instrument that
+ * cannot see its own subject:
+ *
+ *   - the floor really is mid-range (0.15 < r <= 0.45), a settled answer;
+ *   - the floor has NOT RESOLVED YET (the per-channel stat is computed
+ *     asynchronously on the GPU), a placeholder.
+ *
+ * The first census shipped without the distinction and reported "0 sharp, 102
+ * medium" on a scene whose windows are mirrors — which reads as "this scene has
+ * no sharp surfaces" when it actually meant "ask again later". Any decision
+ * made off a tier — a layer tag, a trace stride — must be re-taken when
+ * `resolved` flips, so the caller has to be able to see it.
+ *
+ * @param {any} material
+ * @returns {{ tier: number, roughness: number|null, resolved: boolean }}
+ */
+export function giReflectTierInfoOf(material) {
+  const pending = { tier: GI_REFLECT_TIER.MEDIUM, roughness: null, resolved: false };
+  if (!material) return { tier: GI_REFLECT_TIER.COARSE, roughness: null, resolved: true };
+  // ⚠ THE MAP IS CHECKED FIRST, and that ordering is load-bearing:
+  // `staticRoughnessOf` returns `material.roughness` — a NUMBER — even when a
+  // roughness MAP is present, because there the scalar is only a MULTIPLIER on
+  // the map. Reading it as the surface's roughness would tier every mapped
+  // material by its multiplier (typically 1.0 → COARSE, or 0.0 → SHARP for the
+  // whole scene). `giRoughnessBucketOf` checks `material.roughnessMap` before
+  // `staticRoughnessOf` for exactly this reason.
+  const src = giRoughnessSourceOf(material);
+  if (!src?.tex) {
+    // No per-pixel source: the AUTHORED constant is the artist's explicit
+    // statement about the whole surface — no floor needed, no async wait.
+    const constant = staticRoughnessOf(material);
+    if (constant === null) return pending;
+    return { tier: tierFromRoughness(constant), roughness: constant, resolved: true };
+  }
+  // Otherwise the map's floor, read through the SAME channel-aware path R4
+  // built (min-RGB on a glTF packed metallicRoughness map is ~0 on every
+  // dielectric texel, which would promote the entire scene to SHARP).
+  const stats = giRoughnessFloorStats.get(src.tex);
+  if (!stats) return pending;
+  const texFloor = typeof stats === "number" ? stats : (stats[src.channel] ?? stats.min);
+  if (typeof texFloor !== "number") return pending;
+  const floor = Math.min(1, texFloor * src.factor);
+  return { tier: tierFromRoughness(floor), roughness: floor, resolved: true };
+}
+
+/**
+ * @param {any} material
+ * @returns {number} one of `GI_REFLECT_TIER`
+ */
+export function giReflectTierOf(material) {
+  return giReflectTierInfoOf(material).tier;
+}
 
 /**
  * §16 R4 — the TEXTURE a material's per-pixel roughness comes from, plus the
@@ -135,11 +292,16 @@ export function giRoughnessSourceOf(material) {
   const node = material.roughnessNode;
   if (node == null) {
     return material.roughnessMap
-      ? { tex: material.roughnessMap, factor: material.roughness ?? 1 }
+      // three's PBR convention samples roughnessMap's GREEN channel
+      // (glTF packed metallicRoughness: G = roughness, B = metalness) —
+      // naming the channel is what lets the floor reader skip past the
+      // packed map's near-zero B/min.
+      ? { tex: material.roughnessMap, factor: material.roughness ?? 1, channel: "g" }
       : null;
   }
   let tex = null;
   let factor = 1;
+  let channel = null;
   const walk = (n, depth) => {
     if (!n || depth > 10) return false;
     if (n.isTextureNode && n.value?.isTexture) {
@@ -156,16 +318,32 @@ export function giRoughnessSourceOf(material) {
     if (n.isOperatorNode && n.op === "*") {
       return walk(n.aNode, depth + 1) && walk(n.bNode, depth + 1);
     }
-    // Wrappers that don't change the value bound: auto-var, converts, and
-    // channel swizzles (the floor is per-texel min over RGB, so ANY single
-    // channel read is bounded below by it).
-    if (n.isVarNode || n.isConvertNode || n.isSplitNode) {
+    // Wrappers that don't change the value bound: auto-var and converts.
+    if (n.isVarNode || n.isConvertNode) {
+      return walk(n.node, depth + 1);
+    }
+    // A channel swizzle NAMES the channel the material reads — record a
+    // single-component swizzle so the floor reader can use that channel's
+    // own p5 instead of the min-RGB fallback (degenerate on packed maps,
+    // see giRoughnessBucketOf). ⚠ TSL NORMALIZES swizzles to xyzw at the
+    // proxy (`setProtoSwizzle`: `.g`/`.t` construct SplitNode(node, 'y')),
+    // so a live graph NEVER carries 'g' — matching rgb alone read every
+    // real split as unknown and the drain reported 4 full cycles with
+    // "no flips" against fully resolved floors (2026-08-24 heartbeats).
+    // Multi-component or w/a swizzles keep the conservative fallback.
+    if (n.isSplitNode) {
+      const c = typeof n.components === "string" ? n.components : null;
+      const mapped =
+        c && c.length === 1
+          ? ({ r: "r", g: "g", b: "b", x: "r", y: "g", z: "b" })[c] ?? null
+          : null;
+      if (mapped) channel = channel ?? mapped;
       return walk(n.node, depth + 1);
     }
     return false;
   };
   if (!walk(node, 0) || !tex) return null;
-  return { tex, factor: Math.max(0, factor) };
+  return { tex, factor: Math.max(0, factor), channel };
 }
 
 /**
@@ -1357,7 +1535,31 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint, penumbraOut =
  * @param {*} N unit normal at the hit
  * @returns irradiance (a TSL vec3 var)
  */
-export function analyticDirectAt(lightSlots, P, N, shadowFn = null) {
+/**
+ * @param {boolean} [oneSided] — CLAMP the cosine instead of taking its absolute
+ *   value. Default false, which keeps every existing caller byte-identical.
+ *
+ * ⚠ THE DEFAULT IS RIGHT FOR A FIELD CELL AND WRONG FOR A HIT, and the
+ * distinction is already written down in this repo — `srcShade.js`'s
+ * `lightTermsAt` header (§12.26.4):
+ *
+ *   "THE COSINE IS CLAMPED HERE, NOT ABSOLUTE. `analyticDirectAt` takes
+ *    dot(dirTo, N).abs() because it shades a FIELD CELL, which has no definite
+ *    side — a cell straddling a wall must light from either. A hit has a side:
+ *    the normal was face-forwarded against the ray one line earlier, so abs()
+ *    here would light the back of every wall from a lamp in front of it."
+ *
+ * `createGiBvhHitShade` shades a HIT — it face-forwards `nFace` against the
+ * reflected ray and then called this function with the field-cell convention.
+ * The consequence is the user's report: every reflected surface whose visible
+ * face points AWAY from the sun received the sun's FULL irradiance, where the
+ * same surface rendered directly receives exactly zero (three's `max(0, N·L)`
+ * times its shadow map). That is roughly half of every reflected scene lit from
+ * the wrong side — "materials that are very reflective ignore lighting,
+ * appearing too bright", and at roughness 0.2 `exactWeight ~ 0.93`, so that
+ * image replaces the surface response almost wholesale.
+ */
+export function analyticDirectAt(lightSlots, P, N, shadowFn = null, oneSided = false) {
   const total = vec3(0).toVar();
   for (const slot of lightSlots) {
     If(slot.active.greaterThan(0.5), () => {
@@ -1377,7 +1579,11 @@ export function analyticDirectAt(lightSlots, P, N, shadowFn = null) {
         const win = r2.mul(r2).oneMinus().clamp(0, 1);
         atten = atten.mul(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
       }
-      const cosH = dirTo.dot(N).abs().toVar();
+      // See the `oneSided` note on the signature: `.abs()` is the FIELD-CELL
+      // convention (a cell straddling a wall must light from either side);
+      // `.max(0)` is the SURFACE convention, and a face-forwarded hit normal is
+      // a surface. Same expression `srcShade.js` uses for its own hits.
+      const cosH = (oneSided ? dirTo.dot(N).max(0) : dirTo.dot(N).abs()).toVar();
       // `shadowFn` (optional, 2026-08-21 — reflection-hit realism): a caller
       // that can afford a visibility march supplies it; the resolve's hit
       // path passes an occupancy-cone closure so a reflected sunlit wall

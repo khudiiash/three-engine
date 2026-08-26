@@ -346,10 +346,21 @@ export function serializeMeshForBake(mesh) {
   let cached = geometryCopyCache.get(mesh.geometry);
   const version = position.version ?? 0;
   if (!cached || cached.version !== version) {
+    // §18.17 — UVs ride along for the static BVH's textured-reflection
+    // region. Sliced HERE rather than at the BVH build because this cache is
+    // keyed per geometry: 200 crates pay for one copy, and a drag (matrix
+    // only) pays for none. A geometry with no `uv` attribute yields null and
+    // every consumer falls back to the per-slot mean albedo, which is exactly
+    // the pre-R7b picture for that mesh alone.
+    const uvAttr = mesh.geometry.attributes.uv;
     cached = {
       version,
       positions: position.array.slice(0, position.count * 3),
       index: mesh.geometry.index ? mesh.geometry.index.array.slice() : null,
+      uvs: uvAttr && uvAttr.itemSize >= 2 && uvAttr.count >= position.count
+        ? Float32Array.from({ length: position.count * 2 }, (_, i) =>
+            (i & 1) ? uvAttr.getY(i >> 1) : uvAttr.getX(i >> 1))
+        : null,
     };
     geometryCopyCache.set(mesh.geometry, cached);
   }
@@ -360,6 +371,7 @@ export function serializeMeshForBake(mesh) {
     geometryKey: `${mesh.geometry.id}:${version}`,
     positions: cached.positions,
     index: cached.index,
+    uvs: cached.uvs,
     matrix: [...mesh.matrixWorld.elements],
     color: { r: surface.color.r, g: surface.color.g, b: surface.color.b },
     emissive: { r: surface.emissive.r, g: surface.emissive.g, b: surface.emissive.b },

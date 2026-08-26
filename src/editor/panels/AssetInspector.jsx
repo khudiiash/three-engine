@@ -199,31 +199,94 @@ function formatDate(seconds) {
   });
 }
 
-/** Renames the asset (and its .meta sidecar), keeping it selected. */
-async function renameAsset(path, newStem) {
+/**
+ * Renames the asset (and its .meta sidecar), keeping it selected.
+ *
+ * `isDir` is not a nicety. A folder has no extension to put back on, and no
+ * class name or script reference to keep in step — and the Name field is its
+ * WHOLE name, not a stem, so a folder called "Sky.HDRIs" must not come back as
+ * "Sky" the moment you focus the field.
+ */
+async function renameAsset(path, newStem, { isDir = false } = {}) {
   const name = newStem.trim();
-  const ext = extOf(path);
+  const ext = isDir ? "" : extOf(path);
   const oldName = fileName(path);
-  if (!name || name === stemOf(oldName)) return;
+  if (!name || name === (isDir ? oldName : stemOf(oldName))) return;
   const dir = path.slice(0, path.length - oldName.length);
   const newPath = `${dir}${name}${ext ? `.${ext}` : ""}`;
   try {
     await invoke("rename_path", { from: path, to: newPath });
-    // Keep texture import settings attached across the rename.
-    await invoke("rename_path", { from: `${path}.meta`, to: `${newPath}.meta` }).catch(() => {});
-    await invoke("rename_path", { from: `${path}.basis`, to: `${newPath}.basis` }).catch(() => {});
-    // Scripts: keep the default-exported class name in sync with the new
-    // filename stem, and inject `extends Script` if missing.
-    await syncScriptClassNameAfterRename(newPath, name);
-    // …and move what pointed at the old name: open tabs, the shared Monaco
-    // model, and every entity whose Scripts component named this file.
-    await retargetScriptPath(path, newPath);
+    if (!isDir) {
+      // Keep texture import settings attached across the rename.
+      await invoke("rename_path", { from: `${path}.meta`, to: `${newPath}.meta` }).catch(() => {});
+      await invoke("rename_path", { from: `${path}.basis`, to: `${newPath}.basis` }).catch(() => {});
+      // Scripts: keep the default-exported class name in sync with the new
+      // filename stem, and inject `extends Script` if missing.
+      await syncScriptClassNameAfterRename(newPath, name);
+      // …and move what pointed at the old name: open tabs, the shared Monaco
+      // model, and every entity whose Scripts component named this file.
+      await retargetScriptPath(path, newPath);
+    }
     await useProjectStore.getState().refresh();
     useSelectionStore.getState().selectAsset(newPath);
     console.log(`Renamed to ${fileName(newPath)}`);
   } catch (err) {
     console.error(`Rename failed: ${err}`);
   }
+}
+
+/**
+ * Whether `path` is a folder.
+ *
+ * The Inspector is handed a path and nothing else, and a path does not say. The
+ * browsed listing usually already knows (it came from `list_dir`, which reports
+ * `is_dir`), so that answers synchronously and without a round trip for the
+ * common case — clicking a folder in the grid. Anything else (a folder revealed
+ * from a search, or one selected while the panel browses elsewhere) falls back
+ * to asking the filesystem: `list_dir` succeeds on a directory and fails on a
+ * file.
+ */
+function useIsDirectory(path) {
+  const listed = useProjectStore((state) => state.entries.find((entry) => entry.path === path));
+  const [probed, setProbed] = useState(null);
+  useEffect(() => {
+    setProbed(null);
+    if (!path || listed) return undefined;
+    let live = true;
+    invoke("list_dir", { path }).then(
+      () => live && setProbed(true),
+      () => live && setProbed(false),
+    );
+    return () => {
+      live = false;
+    };
+  }, [path, !!listed]);
+  return listed ? !!listed.is_dir : probed === true;
+}
+
+/** What a folder holds, for the one line of fact the Inspector can offer. */
+function FolderSummary({ path }) {
+  const [count, setCount] = useState(null);
+  const bump = useProjectStore((state) => state.changeCounter);
+  useEffect(() => {
+    let live = true;
+    setCount(null);
+    invoke("list_dir", { path }).then(
+      (entries) => live && setCount(entries.length),
+      () => live && setCount(null),
+    );
+    return () => {
+      live = false;
+    };
+  }, [path, bump]);
+  return (
+    <div className="inspector-section">
+      <div className="section-header">Folder</div>
+      <div className="asset-info-row">
+        {count == null ? "…" : count === 0 ? "Empty" : `${count} ${count === 1 ? "item" : "items"}`}
+      </div>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1564,7 +1627,7 @@ function FileFacts({ path }) {
  * are shown disabled with the reason, rather than hidden: a control that
  * appears and disappears teaches nothing about why.
  */
-function AssetActionsSection({ path }) {
+function AssetActionsSection({ path, isDir = false }) {
   const [visible, setVisible] = useState([]);
   const [running, setRunning] = useState(null);
   // Subscribing to the entity selection is what keeps "Assign to Selected"
@@ -1574,7 +1637,7 @@ function AssetActionsSection({ path }) {
   useEffect(() => {
     let live = true;
     (async () => {
-      const actions = assetActions(path);
+      const actions = assetActions(path, { isDir });
       const allowed = [];
       for (const action of actions) {
         // `available` is async because some checks (is this text-editable, is
@@ -1588,7 +1651,7 @@ function AssetActionsSection({ path }) {
     return () => {
       live = false;
     };
-  }, [path]);
+  }, [path, isDir]);
 
   if (!visible.length) return null;
 
@@ -2136,9 +2199,56 @@ function GenericPreview({ path, ext }) {
   );
 }
 
+/**
+ * A folder's Inspector.
+ *
+ * Split out rather than branched inline because almost nothing the file
+ * Inspector shows applies: a folder has no extension, no preview, no import
+ * settings, and no build flags (those live in a `.meta` sidecar, and a
+ * `MyFolder.meta` sitting next to the folder is litter). Run through the file
+ * path it rendered a Type badge reading the folder's own absolute path and a
+ * hint offering "No dedicated editor for .c:/users/…/new folder files" — both
+ * symptoms of the same `extOf` bug that stopped the rename below from working
+ * at all.
+ *
+ * What it does keep is the part that was actually asked for: the Name field
+ * renames the folder on disk.
+ */
+function FolderInspector({ path }) {
+  return (
+    <div className="inspector-panel">
+      <div className="inspector-section">
+        <div className="field-row">
+          <span className="field-label">Name</span>
+          <input
+            className="text-field"
+            type="text"
+            key={path}
+            defaultValue={fileName(path)}
+            onBlur={(e) => renameAsset(path, e.target.value, { isDir: true })}
+            onKeyDown={(e) => e.key === "Enter" && e.target.blur()}
+          />
+        </div>
+        <div className="field-row">
+          <span className="field-label">Type</span>
+          <span className="asset-type-badge">Folder</span>
+        </div>
+        <div className="asset-inspector-path" title={path}>
+          {path}
+        </div>
+      </div>
+      <FolderSummary path={path} />
+      <AssetActionsSection path={path} isDir />
+    </div>
+  );
+}
+
 export function AssetInspector({ path }) {
   const assetPaths = useSelectionStore((state) => state.assetPaths);
+  // Unconditional: hooks cannot sit behind the early returns below.
+  const isDir = useIsDirectory(path);
   if (assetPaths.length > 1) return <MultiAssetInspector paths={assetPaths} />;
+  if (isDir) return <FolderInspector path={path} />;
   const ext = extOf(path);
   const isTexture = TEXTURE_EXTENSIONS.includes(ext);
   const isFont = FONT_EXTENSIONS.includes(ext);

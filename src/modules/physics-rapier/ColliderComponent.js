@@ -72,6 +72,7 @@ export class ColliderComponent extends Component {
     this._terrainUnsub?.();
     this._terrainUnsub = null;
     this.#disposeGizmo();
+    this.#disposeOutline();
   }
 
   #rebuildGizmo() {
@@ -114,6 +115,76 @@ export class ColliderComponent extends Component {
     this.gizmo.geometry.dispose();
     this.gizmo.material.dispose();
     this.gizmo = null;
+  }
+
+  // ---- selection-only outline (mesh / trimesh shapes) ----
+
+  /**
+   * `mesh` colliders build no wireframe of their own — the rendered mesh is
+   * their outline — which leaves the Colliders layer with nothing to show for
+   * them and no way to confirm a trimesh collider is even there. This traces
+   * one on demand, and ONLY for the selected entity: a level of sixty trimesh
+   * colliders would pay for sixty wireframes to say what the shaded geometry
+   * already shows, so it is built on select and disposed on deselect.
+   *
+   * Traces the same meshes `collectTrimesh` feeds to Rapier (editor-only
+   * helpers skipped), so what you see is what actually collides — including
+   * child meshes, which is exactly the case where "is this one collider or
+   * five?" cannot be answered by eye.
+   */
+  setOutlineVisible(visible) {
+    if (!visible) return this.#disposeOutline();
+    // Primitive shapes already draw a real gizmo; a second outline on top of
+    // one would only z-fight with it.
+    if (this.outline || this.gizmo) return;
+    this.#buildOutline();
+  }
+
+  #buildOutline() {
+    const root = this.entity.object3D;
+    root.updateWorldMatrix(true, false);
+    // Into the entity's LOCAL frame: the outline is parented to object3D, so
+    // the entity's own scale is applied at render. Baking it in here — the way
+    // collectTrimesh must, because Rapier shapes cannot scale — would square it.
+    const invRoot = new THREE.Matrix4().copy(root.matrixWorld).invert();
+    const local = new THREE.Matrix4();
+    const v = new THREE.Vector3();
+    const positions = [];
+
+    root.traverse((child) => {
+      if (!child.isMesh || !child.geometry?.attributes?.position) return;
+      if (child.layers.mask === 1 << EDITOR_LAYER) return; // editor-only helper
+      child.updateWorldMatrix(true, false);
+      local.copy(invRoot).multiply(child.matrixWorld);
+      const edges = new THREE.EdgesGeometry(child.geometry);
+      const pos = edges.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(local);
+        positions.push(v.x, v.y, v.z);
+      }
+      edges.dispose();
+    });
+    if (!positions.length) return;
+
+    this.outline = new THREE.LineSegments(
+      new THREE.BufferGeometry().setAttribute("position", new THREE.Float32BufferAttribute(positions, 3)),
+      new THREE.LineBasicMaterial({ color: GIZMO_COLOR, transparent: true, opacity: 0.7, depthWrite: false }),
+    );
+    // No offset: `mesh` and `heightfield` ignore props.offset — see that prop's
+    // `showIf` and the zeroed translation in PhysicsSystem's collider desc.
+    this.outline.renderOrder = 1;
+    this.outline.layers.set(EDITOR_LAYER);
+    this.outline.userData.engineOwned = true;
+    this.outline.raycast = () => {}; // never intercept viewport picking
+    root.add(this.outline);
+  }
+
+  #disposeOutline() {
+    if (!this.outline) return;
+    this.entity.object3D.remove(this.outline);
+    this.outline.geometry.dispose();
+    this.outline.material.dispose();
+    this.outline = null;
   }
 }
 

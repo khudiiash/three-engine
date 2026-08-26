@@ -1886,6 +1886,17 @@ declare module "engine" {
   export interface GlobalIlluminationComponent extends ComponentBase<Record<string, unknown>> {}
 
   /**
+   * A box-projected reflection probe (requires the `gi` module). The GI
+   * system traces a small radiance map at this entity's position; reflective
+   * materials inside the box reflect it, parallax-corrected against the box.
+   * `size` is the box in metres (× the entity's world scale), centred on the
+   * entity.
+   */
+  export interface ReflectionProbeComponent extends ComponentBase<{
+    size: [number, number, number];
+  }> {}
+
+  /**
    * `entity.getComponent("level")`. Root of a blockout (requires the
    * `level-design` module): the grid, storey height and default piece
    * dimensions the tools draw with, plus the greybox/materials switch.
@@ -2029,6 +2040,7 @@ declare module "engine" {
     environment: EnvironmentComponent;
     objModel: ObjModelComponent;
     "global-illumination": GlobalIlluminationComponent;
+    "reflection-probe": ReflectionProbeComponent;
     script: ScriptComponent;
     level: LevelComponent;
     levelfloor: LevelFloorComponent;
@@ -2110,6 +2122,7 @@ declare module "engine" {
   export const EnvironmentComponent: ComponentClass<"environment">;
   export const ObjModelComponent: ComponentClass<"objModel">;
   export const GlobalIlluminationComponent: ComponentClass<"global-illumination">;
+  export const ReflectionProbeComponent: ComponentClass<"reflection-probe">;
 
   export const LevelComponent: ComponentClass<"level">;
   export const LevelFloorComponent: ComponentClass<"levelfloor">;

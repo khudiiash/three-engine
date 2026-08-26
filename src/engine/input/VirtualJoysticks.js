@@ -28,6 +28,17 @@ export class VirtualJoysticks {
    * @param {string}      opts.theme   "dark" | "light".
    */
   constructor({ parent = document.body, enabled = null, theme = "dark" } = {}) {
+    // The manager matches a binding's device FAMILY against `device.id`
+    // (`InputManager.#readBinding`), so a device without one is a device no
+    // binding can ever reach. Missing here, every `virtualjoystick/...` path
+    // fell through the whole device loop and resolved to 0 — the on-screen
+    // sticks were drawn, tracked the finger, and drove nothing. What the
+    // player then saw was the LOOK action's other binding, `mouse/delta`,
+    // being fed by the touch pointer events (see MouseDevice), i.e. both
+    // sticks turning the camera and neither one walking.
+    this.id = "virtualjoysticks";
+    this.name = "Virtual Joysticks";
+    this.connected = true;
     this.parent = parent;
     this.enabled = enabled; // null = auto-detect
     this.theme = theme;
@@ -49,7 +60,7 @@ export class VirtualJoysticks {
     this._onTouchMove = (e) => this.#touchMove(e);
     this._onTouchEnd = (e) => this.#touchEnd(e);
     this._onCancel = (e) => this.#touchEnd(e);
-    this._onHardwareInput = () => this.#hardwareInput();
+    this._onHardwareInput = (e) => this.#hardwareInput(e);
   }
 
   /** Auto-detect: coarse pointer / first touch / `navigator.maxTouchPoints`. */
@@ -123,6 +134,11 @@ export class VirtualJoysticks {
   readValue(path) {
     const [, side, control] = path.split("/");
     if (control === "stick") return side === "left" ? this.leftValue : this.rightValue;
+    // Buttons resolve through readValue too: the manager's `#bindingIsPressedNow`
+    // asks for the VALUE and thresholds it at 0.5, and never calls `isPressed`
+    // on the device. Returning a flat 0 here made the tap-to-fire path dead
+    // even once the device id above let bindings find us at all.
+    if (control === "fire") return this.isPressed(path) ? 1 : 0;
     return 0;
   }
 
@@ -166,7 +182,14 @@ export class VirtualJoysticks {
     this._rightKnob = R.knob;
   }
 
-  #hardwareInput() {
+  #hardwareInput(e) {
+    // A finger fires `pointerdown` exactly like a mouse click does, and it
+    // fires BEFORE `touchstart` — so without this guard every tap on a stick
+    // counted as "the player picked up a mouse", hid the overlay and started
+    // the 3s grace countdown that hides it for good. `keydown` has no
+    // pointerType, and the manager calls this with no event at all when it
+    // sees real key/button state, so both still count as hardware.
+    if (e && e.pointerType === "touch") return;
     // Hide the overlay as soon as the player touches keyboard/mouse — give
     // them 3s of grace in case they're still using gamepad.
     this._wasAnyHardwareInput = true;
@@ -178,7 +201,8 @@ export class VirtualJoysticks {
   }
 
   #touchStart(e) {
-    if (!this._el || !this.visible) {
+    if (!this._el) return; // not attached yet — nothing to show or track
+    if (!this.visible) {
       // First touch: become visible unless explicitly disabled.
       if (this.enabled === false) return;
       this._el.style.display = "block";

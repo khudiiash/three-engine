@@ -12,11 +12,14 @@ import {
   modelDownloadSize,
   hdriDownloadSize,
   pickResolution,
+  modelPreviewPlan,
   downloadTexture,
   downloadModel,
   downloadHdri,
   setSceneEnvironment,
 } from "../polyhaven.js";
+import { AssetPreview } from "../components/AssetPreview.jsx";
+import { loadRemappedGltf } from "../previewSources.js";
 
 const TABS = [
   { id: "textures", label: "Materials" },
@@ -244,6 +247,15 @@ function AssetDetail({ asset, type, hasProject, onClose }) {
     }
   }, [resolutions, res]);
 
+  // The preview always loads the SMALLEST glTF on offer, not the resolution
+  // selected for download: this is a thumbnail replacement, and pulling 4k
+  // textures to spin a 260px pane would cost more than the import it is meant
+  // to help you decide on.
+  const preview = useMemo(
+    () => (type === "models" && files ? modelPreviewPlan(files, resolutions[0] ?? "1k") : null),
+    [type, files, resolutions],
+  );
+
   const size = useMemo(() => {
     if (!files) return 0;
     if (type === "hdris") return hdriDownloadSize(files, res);
@@ -275,7 +287,17 @@ function AssetDetail({ asset, type, hasProject, onClose }) {
       <button className="ph-detail-close" onClick={onClose} title="Close">
         ×
       </button>
-      <img className="ph-detail-preview" src={previewUrl(asset.id)} alt={asset.name} draggable={false} />
+      {/* Models get the live mesh; materials and HDRIs keep the still,
+          which for those two IS the asset — a rendered sphere and a
+          panorama both say more than a viewport would. The plan carries the
+          include table because Poly Haven's resources are not where the
+          .gltf claims they are; see modelPreviewPlan. */}
+      <AssetPreview
+        src={type === "models" ? (preview?.url ?? null) : null}
+        load={preview ? () => loadRemappedGltf(preview.url, preview.resources) : null}
+        thumbnailUrl={previewUrl(asset.id)}
+        alt={asset.name}
+      />
       <h3 className="ph-detail-name">{asset.name}</h3>
       <div className="ph-detail-meta">
         {asset.authors && <span>by {Object.keys(asset.authors).join(", ")}</span>}

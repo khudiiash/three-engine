@@ -1,5 +1,5 @@
 import { Component } from "../../engine/components/Component.js";
-import { GI_QUALITY_LEVELS } from "./giConfig.js";
+import { GI_DEBUG_VIEWS, GI_QUALITY_LEVELS } from "./giConfig.js";
 
 /**
  * Global Illumination via Split Radiance Cascades.
@@ -33,7 +33,12 @@ import { GI_QUALITY_LEVELS } from "./giConfig.js";
  *   keep image-based lighting. No environment means no sky, exactly as
  *   `skyIntensity: 0` did.
  * · THE DEBUG VIEW never touched the lit image — it draws an overlay. It is a
- *   developer instrument and lives at `globalThis.__giDebugView`.
+ *   developer instrument; the SDF / occupancy / SRC-probes overlays live at
+ *   `globalThis.__giDebugView`, and the GI-term overlays (indirect / AO /
+ *   reflections) are also reachable through `props.debugView` so an inspector
+ *   user can flip them without typing a global. `debugView` is `advanced` and
+ *   NOT part of the structural signature — flipping it is a live swap of the
+ *   overlay's source texture, never a module rebuild.
  *
  * Saved scenes with the old properties load unchanged; undeclared keys are
  * ignored and drop on the next save. A scene that stored `intensity: 2` renders
@@ -63,18 +68,29 @@ export class GlobalIlluminationComponent extends Component {
     // anything, which is the failure the 27-property collapse was aimed at.
     ao: true,
     reflections: true,
+    // Debug view: an overlay-source switch, NOT a lighting parameter. Default
+    // "off" so an authoring scene never ships with a debug view on; the field
+    // is also `advanced` (collapsed by default) because it is a developer
+    // instrument. See giConfig's `GI_DEBUG_VIEWS` for what each mode draws.
+    debugView: "off",
   };
 
   static schema = [
-    // NOTHING IS `advanced` HERE ANY MORE, and there is nothing for
-    // `flipsToCustom` to flip to — "custom" was the Inspector's way of saying
-    // "an advanced field was hand-edited so the preset name no longer implies
-    // its values", and with no advanced fields it has nothing left to mean. An
-    // old scene storing "custom" resolves to the default tier (giConfig's
-    // `giQualityTier`).
+    // NOTHING IS `advanced` HERE ANY MORE EXCEPT `debugView`, and there is
+    // nothing for `flipsToCustom` to flip to — "custom" was the Inspector's
+    // way of saying "an advanced field was hand-edited so the preset name no
+    // longer implies its values", and the only advanced field (debugView) is
+    // not a value the quality tier controls, so it cannot make a preset lie.
     { key: "quality", label: "Quality", type: "select", options: [...GI_QUALITY_LEVELS] },
     { key: "ao", label: "Ambient Occlusion", type: "boolean" },
     { key: "reflections", label: "Reflections", type: "boolean" },
+    {
+      key: "debugView",
+      label: "Debug View",
+      type: "select",
+      options: [...GI_DEBUG_VIEWS],
+      advanced: true,
+    },
   ];
 
   get #system() {
@@ -108,10 +124,11 @@ export class GlobalIlluminationComponent extends Component {
     seen.add(signature);
     console.warn(
       `[gi] ignoring ${retired.length} retired propert${retired.length === 1 ? "y" : "ies"}: ` +
-      `${retired.join(", ")}. Global Illumination has THREE properties — quality, ao, ` +
-      "reflections — and everything else is derived (src/modules/gi/giConfig.js). Sky light " +
-      "comes from the scene's environment; the debug view is globalThis.__giDebugView; a probe " +
-      "that must force a value uses globalThis.__giConfigOverride. Stored values drop on the next save.",
+      `${retired.join(", ")}. Global Illumination has FOUR properties — quality, ao, ` +
+      "reflections, debugView — and everything else is derived (src/modules/gi/giConfig.js). Sky " +
+      "light comes from the scene's environment; the SDF/occupancy/SRC-probes debug view is " +
+      "globalThis.__giDebugView; a probe that must force a value uses " +
+      "globalThis.__giConfigOverride. Stored values drop on the next save.",
     );
   }
 

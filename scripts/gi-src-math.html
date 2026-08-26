@@ -58,7 +58,7 @@
         const cfg = await import("/src/modules/gi/srcConfig.js");
         const gpu = await import("/src/modules/gi/srcMathTsl.js");
 
-        const { Fn, instanceIndex, instancedArray, uint, uvec4, vec4, float, int, ivec3, vec3 } = TSL;
+        const { Fn, instanceIndex, instancedArray, select, uint, uvec4, vec4, float, int, ivec3, vec3 } = TSL;
 
         // ────────────────────────────────────────────────── the input set
         // mulberry32, the harness PRNG standard in this repo. Never Math.random:
@@ -207,8 +207,8 @@
         const N = cases.length;
         const FIN = 5;   // float input vec4s per case
         const UIN = 2;   // uint  input uvec4s per case
-        const UOUT = 4;  // uint  output uvec4s per case
-        const FOUT = 8;  // float output vec4s per case
+        const UOUT = 5;  // uint  output uvec4s per case
+        const FOUT = 9;  // float output vec4s per case
         const BIAS = ref.KEY_AXIS_OFFSET;
         const W_LO = 4;
         const W_HI = 32;
@@ -337,6 +337,18 @@
           outFBuf.element(fo.add(7)).assign(vec4(
             gpu.binDir(binLo.x, binLo.y, W_LO), float(0),
           ));
+          // §12.82's one-word normal. The PACK is bit-exact (it is an integer
+          // the resolve indexes on) and the ROUNDTRIP is the thing that matters
+          // — a pack and an unpack that are each self-consistently wrong in the
+          // same way would agree bit-for-bit and still point the wrong way.
+          outUBuf.element(uo.add(4)).assign(uvec4(
+            gpu.packNormal(normal), gpu.packNormal(dir),
+            select(gpu.normalPresent(gpu.packNormal(normal)), uint(1), uint(0)),
+            select(gpu.normalPresent(uint(0)), uint(1), uint(0)),
+          ));
+          outFBuf.element(fo.add(8)).assign(vec4(
+            gpu.unpackNormal(gpu.packNormal(normal)), float(0),
+          ));
         })().compute(N);
 
         await renderer.computeAsync(kernel);
@@ -346,6 +358,10 @@
 
         // ────────────────────────────────────────────────── the diff
         let failures = 0;
+        /** §12.82: pack disagreements that were adjacent cells, not errors. */
+        let packBoundary = 0;
+        /** Two cells of the 15-bit octahedral grid, the width of a ±1 flip. */
+        const OCT_QUANTUM = 2 / ref.NORMAL_OCT_RES * 2;
         const exact = new Map();   // label -> {bad, first}
         const approx = new Map();  // label -> {worst, at}
         const bitCheck = (label, i, got, want) => {
@@ -483,6 +499,51 @@
           for (let k = 0; k < 3; k++) nearCheck("octahedralDirection", i, gotF[fo + 24 + k], wantOctDir[k], TOL);
           const wantBinDir = ref.binDir(gLoI, gLoJ, W_LO);
           for (let k = 0; k < 3; k++) nearCheck("binDir", i, gotF[fo + 28 + k], wantBinDir[k], TOL);
+          // ── §12.82's packed hit normal ───────────────────────────────────
+          //
+          // ⚠ NOT BIT-EXACT, AND THE REASON IS THE ONE THIS FILE'S HEADER
+          // ALREADY NAMES FOR LOD SELECTION: the pack takes a continuous
+          // octahedral coordinate and FLOORS it, so a direction whose
+          // coordinate sits within f32 rounding of a cell boundary lands in
+          // adjacent cells on the two sides. Measured at 5 of 694 cases, always
+          // ±1 in u or v — one quantum, 3e-5 rad, three orders below the cosine
+          // it feeds. So the check is ADJACENCY, with the boundary cases
+          // COUNTED: widening this to a plain tolerance would also accept a
+          // transposed u/v or an inverted fold, which is the whole class of bug
+          // a twin gate exists to catch.
+          const packCheck = (label, got, want) => {
+            const du = (got & (ref.NORMAL_OCT_RES - 1)) - (want & (ref.NORMAL_OCT_RES - 1));
+            const dv = ((got >>> 15) & (ref.NORMAL_OCT_RES - 1)) - ((want >>> 15) & (ref.NORMAL_OCT_RES - 1));
+            const flag = (got >>> 30) - (want >>> 30);
+            if (got === want) { bitCheck(label, i, 0, 0); return; }
+            if (flag === 0 && Math.abs(du) <= 1 && Math.abs(dv) <= 1) {
+              packBoundary++;
+              bitCheck(label, i, 0, 0);
+              return;
+            }
+            bitCheck(label, i, got >>> 0, want >>> 0);
+          };
+          packCheck("packNormal (normal, ±1 cell at a boundary)", gotU[uo + 16],
+            ref.packNormal(c.normal[0], c.normal[1], c.normal[2]));
+          packCheck("packNormal (dir, ±1 cell at a boundary)", gotU[uo + 16 + 1],
+            ref.packNormal(c.dir[0], c.dir[1], c.dir[2]));
+          // The flag both ways round — set on a real normal, CLEAR on the zero
+          // word. `(0,0)` is a legitimate octahedral coordinate (it decodes to
+          // −Z), so a resolve that inferred "empty" from the direction would
+          // light every reclaimed bin as if it faced away.
+          bitCheck("normalPresent(packed) == 1", i, gotU[uo + 16 + 2], 1);
+          bitCheck("normalPresent(0) == 0", i, gotU[uo + 16 + 3], 0);
+          // ONE QUANTUM of the octahedral square, which is what a ±1-cell
+          // boundary disagreement decodes to. The tolerance IS the
+          // quantization, stated as such rather than tuned until it passed.
+          const wantRound = ref.unpackNormal(ref.packNormal(c.normal[0], c.normal[1], c.normal[2]));
+          for (let k = 0; k < 3; k++) nearCheck("packNormal→unpackNormal", i, gotF[fo + 32 + k], wantRound[k], OCT_QUANTUM);
+          // AND THE ROUNDTRIP AGAINST THE INPUT, which is the check that
+          // actually matters: pack and unpack could each be wrong in the same
+          // way and agree with each other perfectly.
+          for (let k = 0; k < 3; k++) {
+            nearCheck("packNormal roundtrip vs the INPUT normal", i, gotF[fo + 32 + k], c.normal[k], 2e-4);
+          }
         }
 
         say(`SRC math twins — ${N} cases, ${exact.size} exact + ${approx.size} tolerance families`);
@@ -509,7 +570,8 @@
         }
         say("");
         say(`  note: ${tangentFlips}/${N} rays within ${TANGENT_EPS} of tangent took the antipodal fold; ` +
-          `${binTies} bin indices sat exactly on a wedge seam`);
+          `${binTies} bin indices sat exactly on a wedge seam; ` +
+          `${packBoundary} packed normals landed in an adjacent octahedral cell (one 3e-5 rad quantum)`);
         say(failures ? `gi-src-math: ${failures} FAMILIES FAILED` : "gi-src-math: all twins agree");
 
         globalThis.__SRC_MATH_RESULT__ = {

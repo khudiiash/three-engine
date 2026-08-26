@@ -41,6 +41,10 @@ scripts/*.png
 # Generated repro projects (scripts/lib/make*Project.mjs) — rewritten on every
 # harness run, never hand-edited. The rig lives in the generator, not here.
 scripts/.gi-*/
+# Scratch Chrome profiles the puppeteer probes point `userDataDir` at, so two
+# arms stay independent and neither takes the shared default-profile lock
+# (AGENTS.md). Tens of thousands of files, none of them ours.
+scripts/.chrome-*/
 # GI harness screenshots + probe dumps. Same rule as scripts/*.png: always
 # regenerable by re-running the probe, so it never enters history.
 .gi-shots/

@@ -70,13 +70,48 @@ function makeScene({ count = 3 } = {}) {
     meshes.push(mesh);
   }
   engine.scene.updateMatrixWorld(true);
+  primeRenderer(engine);
   return { engine, light, meshes };
 }
 
-/** One frame of the freeze system, with matrices resolved first as #tick does. */
-function step(engine) {
+/**
+ * Give a fixture engine a renderer with a render counter.
+ *
+ * ⚠ MUST BE CALLED AT CONSTRUCTION, not lazily on the first render. The freeze
+ * watches `engine.renderer` BY IDENTITY and treats a change as a device loss, so
+ * materialising the stub on the first draw reads as "the renderer was rebuilt"
+ * and releases every light — which is a real behaviour of the system, correctly
+ * defended by its own check, and it silently broke fifteen unrelated fixtures
+ * when this helper created the object on demand.
+ */
+function primeRenderer(engine) {
+  engine.renderer ??= {};
+  engine.renderer.info ??= { render: { calls: 0 } };
+  return engine;
+}
+
+function noteRender(engine) {
+  primeRenderer(engine).renderer.info.render.calls++;
+}
+
+/**
+ * One frame of the freeze system, with matrices resolved first as #tick does.
+ *
+ * ⚠ `drew` IS PART OF WHAT A FRAME IS. The freeze may only take a light over
+ * once three has actually rendered its map, and it proves that by watching
+ * `renderer.info.render.calls` advance. A fixture that never advances it is
+ * modelling an engine whose renderer never runs — which is exactly the state
+ * (a suspended GI compile wave) that broke this in the field, so it has to be
+ * expressible here rather than assumed away.
+ */
+function step(engine, { drew = true } = {}) {
   engine.scene.updateMatrixWorld(true);
   engine.shadowFreeze.update();
+  // ⚠ AFTER the freeze, because that is the tick's order: `Engine#tick` decides
+  // the freeze and THEN calls `renderer.render`. So the count the freeze reads
+  // is always "renders completed before this frame", which is exactly the
+  // question it needs answered.
+  if (drew) noteRender(engine);
 }
 
 // ---- the freeze itself ------------------------------------------------------
@@ -90,6 +125,71 @@ check("a still scene renders its shadow map once, then freezes", () => {
   );
   step(engine);
   assert.equal(light.shadow.autoUpdate, false, "an unchanged scene must stop re-rendering");
+});
+
+check("⭐⭐ a tick that never RENDERED must not count toward the freeze", () => {
+  // THE LIVE BUG (user, 2026-08-25): "shadows are broken after each reload,
+  // have to change bias to fix them, though I think it is just a shadow map
+  // update that fixes it" — and the user's own diagnosis was right.
+  //
+  // `Engine#tick` called `shadowFreeze.update()` ABOVE its `renderSuspended`
+  // early return, so while a GI compile wave held rendering off, the freeze
+  // still got a tick per frame. Two of those in a row on a settled scene is the
+  // "same key twice" rule satisfied without three ever having rendered the map,
+  // and `autoUpdate` goes false on an EMPTY texture. Three's gate is
+  // `needsUpdate || autoUpdate`, so nothing ever renders it again — until an
+  // edit like the shadow bias sets `needsUpdate` by hand, which is exactly the
+  // workaround that was being used.
+  //
+  // ⚠ THE ASSERTION IS NOT "it does not freeze". It is that the freeze still
+  // WORKS afterwards: a system that merely refused would trade a broken shadow
+  // for a permanently unfrozen one, which is the 842-draw regression again.
+  const { engine, light } = makeScene();
+  for (let i = 0; i < 5; i++) step(engine, { drew: false });
+  assert.equal(
+    light.shadow.autoUpdate, true,
+    "five suspended ticks are not five frames — the map has never been rendered",
+  );
+  step(engine); // the wave ends; this tick draws for the first time
+  assert.equal(light.shadow.autoUpdate, true, "the freeze needs a render BEHIND it, not ahead");
+  step(engine);
+  assert.equal(light.shadow.autoUpdate, false, "and once one has happened, it must still freeze");
+});
+
+check("⭐ a deforming caster is answered from a CACHE, not a walk per frame", () => {
+  // `shadowFreeze` cost 1.147 ms of a 35.6 ms Bistro frame while reporting
+  // `frozen: 0` — a full traversal of 1600 meshes, every frame, to re-derive
+  // that one skinned character had disabled the whole system. Being skinned is
+  // structural, so `hierarchy-changed` is a complete invalidation signal.
+  const { engine, light } = makeScene();
+  step(engine);
+  step(engine);
+  assert.equal(light.shadow.autoUpdate, false, "precondition: frozen on a static scene");
+
+  const skinned = new THREE.SkinnedMesh(
+    new THREE.BoxGeometry(1, 1, 1),
+    new THREE.MeshStandardMaterial(),
+  );
+  skinned.castShadow = true;
+  engine.scene.add(skinned);
+  engine.emit("hierarchy-changed");
+  engine.flushHierarchyChanged();
+  step(engine);
+  assert.equal(light.shadow.autoUpdate, true, "a deforming caster must hand every light back");
+  assert.match(
+    engine.shadowFreeze.reason,
+    /skinned|morph/i,
+    `the receipt must name the cause, got: ${engine.shadowFreeze.reason}`,
+  );
+
+  // And it must RECOVER — a cache that never clears would leave the freeze off
+  // for the rest of the session once any character had ever existed.
+  engine.scene.remove(skinned);
+  engine.emit("hierarchy-changed");
+  engine.flushHierarchyChanged();
+  step(engine);
+  step(engine);
+  assert.equal(light.shadow.autoUpdate, false, "removing it must let the freeze engage again");
 });
 
 check("a caster that MOVES redraws the map", () => {
@@ -437,7 +537,9 @@ function makeComponentScene({ snap = 8 } = {}) {
     for (const fn of engine.preRenderCallbacks) fn();
     engine.scene.updateMatrixWorld(true);
     engine.shadowFreeze.update();
+    noteRender(engine);
   };
+  primeRenderer(engine);
   return { engine, camera, light: light.light, stepFrame };
 }
 
@@ -484,6 +586,200 @@ check("the depth axis is snapped, not merely ignored", () => {
   assert.ok(
     light.position.distanceTo(near) > 8,
     "a 200 m move must still re-pose the light; it tracks in steps, it does not stop tracking",
+  );
+});
+
+// ---- resource lifetime: the maps can vanish without the scene changing -------
+
+check("⭐ a NEW DEVICE un-freezes every light — its maps are gone", () => {
+  const { engine, light } = makeScene();
+  engine.renderer = { backend: { device: { id: "A" } } };
+  step(engine);
+  step(engine);
+  assert.equal(light.shadow.autoUpdate, false, "precondition: frozen");
+  // A device loss + restore. The SCENE is byte-for-byte identical, so the
+  // content fingerprint cannot possibly notice — but every shadow map is now
+  // an empty texture on a fresh device.
+  engine.renderer = { backend: { device: { id: "B" } } };
+  step(engine);
+  assert.equal(
+    light.shadow.autoUpdate, true,
+    "THE PERMANENTLY-BLANK-SHADOW BUG: the map is empty and frozen, and nothing " +
+    "in the scene can ever invalidate it — the whole scene loses its shadows for good",
+  );
+});
+
+check("a new RENDERER un-freezes every light", () => {
+  const { engine, light } = makeScene();
+  engine.renderer = { backend: { device: { id: "A" } } };
+  step(engine);
+  step(engine);
+  assert.equal(light.shadow.autoUpdate, false, "precondition: frozen");
+  engine.renderer = { backend: { device: { id: "A" } } }; // rebuilt wrapper
+  step(engine);
+  assert.equal(light.shadow.autoUpdate, true, "a renderer rebuild re-mints the maps too");
+});
+
+check("after a device change the light needs TWO sightings to re-freeze", () => {
+  // Not merely unfrozen — a FIRST sighting again. Otherwise the very next
+  // update matches the pre-loss key and re-freezes the empty map one frame on.
+  const { engine, light } = makeScene();
+  engine.renderer = { backend: { device: { id: "A" } } };
+  step(engine);
+  step(engine);
+  engine.renderer = { backend: { device: { id: "B" } } };
+  step(engine);
+  assert.equal(light.shadow.autoUpdate, true, "sighting 1 after the loss: rendering");
+  step(engine);
+  assert.equal(light.shadow.autoUpdate, true, "sighting 2 re-records the key, still rendering");
+  step(engine);
+  assert.equal(light.shadow.autoUpdate, false, "and only then may it freeze again");
+});
+
+// ---- CSM: the case that made the whole system inert -------------------------
+//
+// These use the REAL `CSMShadowNode`, not a stand-in, because the bug was
+// entirely about three's actual object shapes: a hand-rolled mock would have
+// been built from the same wrong assumption the code was.
+//
+// What shipped broken: `update()` filtered casters with `object.isLight`, and a
+// CSM cascade is `class LwLight extends Object3D` — no `isLight` — while the
+// only real Light in the scene is the CSM parent, whose `autoUpdate` three
+// never reads because `shadow.shadowNode` is set. So every map in the frame was
+// either invisible to the freeze or immune to it, and the system reported
+// itself as working. Measured on Bistro: 842 of 1144 draws re-rendered every
+// frame on a parked camera.
+
+const { CSMShadowNode } = await import("three/addons/csm/CSMShadowNode.js");
+
+/** A scene whose sun uses CSM, wired the way LightComponent#syncCSM wires it. */
+function makeCSMScene({ cascades = 2, count = 3 } = {}) {
+  const { engine, light, meshes } = makeScene({ count });
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 500);
+  engine.scene.add(camera);
+  const csm = new CSMShadowNode(light, { cascades, maxFar: 150 });
+  csm._init({
+    camera,
+    renderer: {
+      coordinateSystem: THREE.WebGPUCoordinateSystem,
+      reversedDepthBuffer: false,
+    },
+  });
+  // The one line that makes three skip its own ShadowNode for this light.
+  light.shadow.shadowNode = csm;
+  // One engine frame: the freeze decides BEFORE the render, and the render is
+  // what re-poses the cascades (`CSMShadowNode.updateBefore`). Keeping that
+  // order is the point — reversing it would test a system that cannot exist.
+  const frame = () => {
+    engine.scene.updateMatrixWorld(true);
+    engine.shadowFreeze.update();
+    noteRender(engine);
+    csm.updateBefore();
+    engine.scene.updateMatrixWorld(true);
+  };
+  return { engine, light, meshes, csm, camera, frame };
+}
+
+check("a CSM cascade is an Object3D, not a Light — three's shape, pinned", () => {
+  const { csm } = makeCSMScene();
+  const cascade = csm.lights[0];
+  assert.equal(
+    cascade.isLight, undefined,
+    "if three ever makes LwLight a real Light this test should be revisited, " +
+    "not deleted — the freeze must keep finding cascades either way",
+  );
+  assert.equal(cascade.castShadow, true, "a cascade owns a real map");
+  assert.ok(cascade.shadow?.camera, "and therefore a shadow camera");
+  assert.equal(
+    !!cascade.shadow.shadowNode, false,
+    "a cascade's map IS rendered by a plain ShadowNode, so autoUpdate is real there",
+  );
+});
+
+check("CSM cascades freeze on a still scene — the 842-draw regression", () => {
+  const { csm, frame } = makeCSMScene();
+  frame();
+  frame();
+  frame();
+  const frozen = csm.lights.filter((c) => c.shadow.autoUpdate === false).length;
+  assert.equal(
+    frozen, csm.lights.length,
+    `THE REGRESSION: ${csm.lights.length - frozen} of ${csm.lights.length} cascades ` +
+    "still re-render every frame on a scene that has not moved",
+  );
+});
+
+check("a caster that moves redraws EVERY cascade", () => {
+  const { csm, meshes, frame } = makeCSMScene();
+  frame();
+  frame();
+  frame();
+  assert.ok(
+    csm.lights.every((c) => c.shadow.autoUpdate === false),
+    "precondition: all cascades frozen",
+  );
+  meshes[1].position.x += 5;
+  frame();
+  assert.ok(
+    csm.lights.every((c) => c.shadow.autoUpdate === true),
+    "THE STALE-SHADOW BUG, per cascade: a caster moved and a map stayed frozen",
+  );
+});
+
+check("the CSM parent light is never managed — its autoUpdate is inert", () => {
+  const { engine, light, frame } = makeCSMScene();
+  frame();
+  frame();
+  frame();
+  assert.equal(
+    light.shadow.autoUpdate, true,
+    "three skips ShadowNode for a light with a custom shadowNode, so freezing " +
+    "this light saves NOTHING and only produces a false receipt",
+  );
+  assert.equal(
+    engine.shadowFreeze.managedLights, 2,
+    "the two cascades are the freezable casters; the parent is not one of them",
+  );
+});
+
+check("moving the view camera redraws the cascades it re-poses", () => {
+  const { csm, camera, frame } = makeCSMScene();
+  frame();
+  frame();
+  frame();
+  assert.ok(
+    csm.lights.every((c) => c.shadow.autoUpdate === false),
+    "precondition: all cascades frozen",
+  );
+  // Cascades track the view camera, so this genuinely changes what each map
+  // must contain — and the cascade centre is texel-snapped upstream, so the
+  // move has to be big enough to cross a texel. That snapping is what lets the
+  // freeze survive ordinary sub-texel drift.
+  camera.position.set(120, 60, 120);
+  frame();
+  frame();
+  assert.ok(
+    csm.lights.some((c) => c.shadow.autoUpdate === true),
+    "the cascades moved with the camera and their maps must follow",
+  );
+});
+
+check("a skinned mesh still disables CSM freezing entirely", () => {
+  const { engine, csm, frame } = makeCSMScene();
+  frame();
+  frame();
+  frame();
+  const skinned = new THREE.SkinnedMesh(
+    new THREE.BoxGeometry(1, 1, 1),
+    new THREE.MeshStandardMaterial(),
+  );
+  skinned.castShadow = true;
+  engine.scene.add(skinned);
+  frame();
+  assert.ok(
+    csm.lights.every((c) => c.shadow.autoUpdate === true),
+    "deforming geometry is invisible to a transform fingerprint — the " +
+    "conservative bail must cover cascades too",
   );
 });
 

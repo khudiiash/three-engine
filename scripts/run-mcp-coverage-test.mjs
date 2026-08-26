@@ -171,6 +171,7 @@ const MODULE_OPS = {
   polyhaven: "library",
   sketchfab: "library",
   polypizza: "library",
+  fab: "library",
   itchio: "library",
   "audio-library": "audio.library",
   "audio-editor": "audio",

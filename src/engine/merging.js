@@ -67,6 +67,23 @@ import { textureLoadsInFlight } from "./textureAsset.js";
 const MIN_GROUP_SIZE = 3;
 
 /**
+ * ⭐ THE SAME-MATERIAL FLOOR IS LOWER, BECAUSE ITS BOOKKEEPING IS NOTHING.
+ *
+ * `MIN_GROUP_SIZE = 3` is priced for the UBER path, and correctly: an uber group
+ * copies a texture array and mints a shader variant that GI must then compile,
+ * so two members cannot repay it. A same-material group pays neither — it is one
+ * vertex copy and one draw call less, with no atlas, no new material and no
+ * compile. Charging it the uber price refuses a free trade.
+ *
+ * MEASURED on Bistro from `profile.frameStats.merging`: 1390 candidates, 1072
+ * merged, and **318 left unmerged purely by falling below three after the
+ * locality split** — with the texture budget at 42 MB of 768, i.e. nowhere near
+ * binding. Those 318 are overwhelmingly pairs, and each pair is one draw call at
+ * ~40 us that the frame is currently paying for a rule that was never about it.
+ */
+const MIN_SAME_MATERIAL_GROUP_SIZE = 2;
+
+/**
  * A group is abandoned when merging it would inflate the culling bound by more
  * than this factor over the members' own mean radius. 6x lets a building's
  * worth of surfaces merge (their bounds already overlap) and stops a group of
@@ -402,6 +419,31 @@ const MERGED_ATTRIBUTES = ["position", "normal", "uv", "uv1"];
  *
  * Everything else the uber path refuses is fine here, and that is the point.
  */
+/**
+ * The shadow-casting bit the AUTHOR gave a mesh, not the one it happens to
+ * hold this frame.
+ *
+ * ⛔⛔ NEVER KEY OR CLONE `mesh.castShadow` DIRECTLY IN THIS FILE. shadowMerge
+ * absorbs a caster by SETTING its `castShadow` to false (recording the intent
+ * in `userData.shadowCastAuthored`), and at boot it reliably builds FIRST: its
+ * settle is ~2 s while this system defers up to 60 s for a streaming scene.
+ * Reading the live bit therefore built every colour proxy of an absorbed mesh
+ * NON-CASTING, hid the originals, and silently dropped their geometry from the
+ * shadow map — MEASURED on Bistro (2026-08-25): shadow pass 757 731 triangles
+ * at boot-final vs 2 828 266 settled, with the bake FULL (`mergedTriangles`
+ * 2 712 499) and the very same proxies drawing completely in the GI g-buffer
+ * pass. `castShadow` was the only gate that differed between those passes.
+ *
+ * User-visible as "shadows are broken after each reload, changing bias fixes
+ * them": any edit makes shadowMerge tear down and restore the authored bits, so
+ * the NEXT colour rebuild is born casting — which also made the bug invisible
+ * to every live A/B, because toggling either system heals it. Only a cold boot
+ * reproduces the theft, deterministically.
+ */
+export function authoredCastShadow(mesh) {
+  return mesh.userData?.shadowCastAuthored ?? mesh.castShadow;
+}
+
 function sameMaterialRefusal(material) {
   if (!material || Array.isArray(material)) return "no single material";
   // Not the uber material's own table shader: it reads `materialIndex`, which a
@@ -583,6 +625,12 @@ export class MergeSystem {
   constructor(engine) {
     this.engine = engine;
     this.enabled = false;
+    /**
+     * The WebGPU render bundle every proxy is parented into, or `null` when
+     * `performance.renderBundles` is off. See `#proxyParent`.
+     * @type {any}
+     */
+    this._bundle = null;
     /** @type {any[]} */
     this.groups = [];
     this._dirty = true;
@@ -1100,7 +1148,7 @@ export class MergeSystem {
       // The uber path keeps everything below `MIN_GROUP_SIZE` copies of one
       // material, which is the case it was actually designed for: many DISTINCT
       // materials on a room-sized scene.
-      if ((perMaterial.get(material) ?? 0) >= MIN_GROUP_SIZE) {
+      if ((perMaterial.get(material) ?? 0) >= MIN_SAME_MATERIAL_GROUP_SIZE) {
         push(
           [
             "sm",
@@ -1110,7 +1158,9 @@ export class MergeSystem {
             // Per-MESH state the proxy carries as one value for the whole group.
             // Every material-level scalar matches by construction here (it is
             // literally the same object), so this is the entire remainder.
-            mesh.castShadow ? 1 : 0,
+            // ⚠ AUTHORED, not live — see authoredCastShadow. Keying on the live
+            // bit also made the grouping depend on which merge built first.
+            authoredCastShadow(mesh) ? 1 : 0,
             mesh.receiveShadow ? 1 : 0,
             (mesh.layers.mask >>> 0) & ~(1 << OCCLUDER_LAYER),
             mesh.renderOrder,
@@ -1149,7 +1199,8 @@ export class MergeSystem {
         material.ior,
         material.specularIntensity,
         material.specularColor?.getHex() ?? -1,
-        mesh.castShadow ? 1 : 0,
+        // ⚠ AUTHORED, not live — see authoredCastShadow.
+        authoredCastShadow(mesh) ? 1 : 0,
         mesh.receiveShadow ? 1 : 0,
         (mesh.layers.mask >>> 0) & ~(1 << OCCLUDER_LAYER),
         mesh.renderOrder,
@@ -1262,7 +1313,9 @@ export class MergeSystem {
           // then need re-splitting spatially anyway.
           for (const members of splitByTriangleBudget(local)) {
             candidates += members.length;
-            if (members.length < MIN_GROUP_SIZE) {
+            // The floor is priced per merge KIND — see MIN_SAME_MATERIAL_GROUP_SIZE.
+            const floor = members[0]?.sameMaterial ? MIN_SAME_MATERIAL_GROUP_SIZE : MIN_GROUP_SIZE;
+            if (members.length < floor) {
               undersized += members.length;
               continue;
             }
@@ -1361,6 +1414,26 @@ export class MergeSystem {
   #report(candidates, undersized) {
     const merged = this.groups.reduce((n, g) => n + g.members.length, 0);
     const summary = `${this.groups.length}|${merged}|${candidates}`;
+    // ⭐ THE SAME NUMBERS AS A READABLE RECEIPT, not only as a console line.
+    // The line below is change-gated on purpose, so on a settled scene the
+    // answer to "why is the main pass still 355 draws" exists only in scrollback
+    // from minutes ago. Published as `profile.frameStats.merging`. Stored BEFORE
+    // the early return so it is always this rebuild's truth.
+    this.lastReport = {
+      groups: this.groups.length,
+      merged,
+      candidates,
+      undersizedAfterSplit: undersized,
+      sameMaterialGroups: this.groups.filter((g) => g.sameMaterial).length,
+      savedDrawCalls: this.savedDrawCalls,
+      textureMB: Math.round(this.groups.reduce((n, g) => n + (g.textureBytes ?? 0), 0) / 1048576),
+      budgetMB: Math.round(this.textureBudgetBytes / 1048576),
+      spentMB: Math.round((this._textureBudgetSpent ?? 0) / 1048576),
+      localityCellM: Math.round((this._sceneDiagonal ?? 0) / MAX_LOCALITY_CELLS_PER_AXIS),
+      rejects: { ...(this._rejects ?? {}) },
+      rebuild: this._rebuildCount,
+      askedForBy: this._invalidateReason,
+    };
     // ── A SILENT REBUILD LOOP IS THE EXPENSIVE ONE ───────────────────────────
     //
     // Reporting only on CHANGE was chosen so a `hierarchy-changed` storm does
@@ -1554,7 +1627,10 @@ export class MergeSystem {
     const template = members[0].mesh;
     const proxy = new THREE.Mesh(geometry, material);
     proxy.name = `Merged(${members.length})`;
-    proxy.castShadow = template.castShadow;
+    // ⛔ AUTHORED, not live: at boot shadowMerge has already zeroed the members'
+    // bit, and cloning it here births a proxy that never casts. Full receipt at
+    // authoredCastShadow.
+    proxy.castShadow = authoredCastShadow(template);
     proxy.receiveShadow = template.receiveShadow;
     proxy.renderOrder = template.renderOrder;
     proxy.layers.mask = (template.layers.mask >>> 0) & ~(1 << OCCLUDER_LAYER);
@@ -1563,7 +1639,8 @@ export class MergeSystem {
     proxy.userData.batchProxy = true;
     proxy.userData.mergeProxy = true;
     proxy.userData.engineOwned = true;
-    this.engine.scene.add(proxy);
+    this.#proxyParent().add(proxy);
+    this.#invalidateBundle();
 
     const matrices = [];
     for (const member of members) {
@@ -1691,7 +1768,9 @@ export class MergeSystem {
     const template = members[0].mesh;
     const proxy = new THREE.Mesh(geometry, built.material);
     proxy.name = `Merged(${members.length})`;
-    proxy.castShadow = template.castShadow;
+    // ⛔ AUTHORED, not live — same theft as the same-material site above; see
+    // authoredCastShadow.
+    proxy.castShadow = authoredCastShadow(template);
     proxy.receiveShadow = template.receiveShadow;
     proxy.renderOrder = template.renderOrder;
     proxy.layers.mask = (template.layers.mask >>> 0) & ~(1 << OCCLUDER_LAYER);
@@ -1701,7 +1780,8 @@ export class MergeSystem {
     proxy.userData.batchProxy = true;
     proxy.userData.mergeProxy = true;
     proxy.userData.engineOwned = true;
-    this.engine.scene.add(proxy);
+    this.#proxyParent().add(proxy);
+    this.#invalidateBundle();
 
     const matrices = [];
     for (const member of members) {
@@ -1744,13 +1824,64 @@ export class MergeSystem {
           ? component.enabled && component.materialRenderable !== false
           : true;
       }
-      this.engine.scene.remove(group.mesh);
+      group.mesh.parent?.remove(group.mesh);
+      this.#invalidateBundle();
       // The merged geometry IS this group's own — dispose it. The material is
       // the cache's, and disposing it here is what made every rebuild re-decode
       // every texture; see MIN_REBUILD_INTERVAL_MS.
       group.mesh.geometry.dispose();
     }
     this.groups.length = 0;
+  }
+
+  /**
+   * Where a freshly built proxy is attached: a render bundle when the scene
+   * asks for one, the scene itself otherwise.
+   *
+   * ⚠ THE BUNDLE IS A RECORDING, SO ITS VERSION MUST MOVE WHENEVER ITS CONTENTS
+   * DO. Every caller therefore goes through `#invalidateBundle()` on both
+   * attach and detach; a proxy added to a clean bundle is simply never drawn,
+   * and a proxy removed from one keeps being drawn after its geometry is
+   * disposed. Both are silent — there is no error, just wrong pixels — which is
+   * why this is centralised in one accessor rather than left to the two build
+   * sites.
+   *
+   * The group sits at the scene root with an identity transform: proxy vertices
+   * are already in world space, so any transform here would move them.
+   */
+  #proxyParent() {
+    const wanted = this.engine.settings?.performance?.renderBundles === true;
+    if (!wanted) {
+      if (this._bundle) this.#disbandBundle();
+      return this.engine.scene;
+    }
+    if (!this._bundle) {
+      const bundle = new THREE.BundleGroup();
+      bundle.name = "MergeBundle";
+      bundle.matrixAutoUpdate = false;
+      // Not world geometry: every GI scene walk and the occlusion tagger skip
+      // engine-owned objects, and the proxies inside already carry their own
+      // flags. The group must never be mistaken for a mesh container to merge.
+      bundle.userData.engineOwned = true;
+      bundle.userData.__giDebug = true;
+      this.engine.scene.add(bundle);
+      this._bundle = bundle;
+    }
+    return this._bundle;
+  }
+
+  /** Re-record the bundle on the next frame that draws it. */
+  #invalidateBundle() {
+    if (this._bundle) this._bundle.needsUpdate = true;
+  }
+
+  /** Hand the proxies back to the scene and drop the group. */
+  #disbandBundle() {
+    const bundle = this._bundle;
+    if (!bundle) return;
+    this._bundle = null;
+    for (const child of [...bundle.children]) this.engine.scene.add(child);
+    bundle.parent?.remove(bundle);
   }
 
   /**
@@ -1788,8 +1919,14 @@ export class MergeSystem {
  * `rowOf` is `null` for a SAME-MATERIAL merge, which writes no `materialIndex`
  * at all — the proxy's material shades from its own uniforms and never samples a
  * row, so the attribute would be four bytes per vertex that nothing reads.
+ *
+ * `wanted` narrows the attribute set. It exists for the SHADOW merge
+ * (`shadowMerge.js`), where three replaces every material with one depth-only
+ * override, so `normal`, `uv1` and usually `uv` are bytes nothing samples —
+ * position alone is typically 1/3 the buffer of a colour-pass merge over the
+ * same meshes. Passing `undefined` keeps the full colour-pass set.
  */
-function mergeGeometries(members, rowOf) {
+export function mergeGeometries(members, rowOf, wanted = MERGED_ATTRIBUTES) {
   let vertexCount = 0;
   let indexCount = 0;
   for (const member of members) {
@@ -1800,8 +1937,8 @@ function mergeGeometries(members, rowOf) {
   }
   if (!vertexCount || vertexCount > 0x7fffffff) return null;
 
-  const present = new Set(MERGED_ATTRIBUTES);
-  for (const name of MERGED_ATTRIBUTES) {
+  const present = new Set(wanted);
+  for (const name of wanted) {
     // An attribute only survives if EVERY member has it — a half-filled uv
     // channel shades half the merge with garbage.
     for (const member of members) {

@@ -71,6 +71,20 @@ const report = await page.evaluate(async () => {
       const posDelta = Math.hypot(e[12] - p[12], e[13] - p[13], e[14] - p[14]);
       rows[i].maxDir = Math.max(rows[i].maxDir, dirDelta);
       rows[i].maxPos = Math.max(rows[i].maxPos, posDelta);
+      // ── IS IT THE LIGHT, OR THE ENTITY THAT OWNS IT? ──────────────────
+      // The shadow fit writes the LIGHT's local position/target every frame,
+      // so the light's own z-column is expected to wobble. The OWNER's aim is
+      // supposed to be the authored, untouched one — if that moves too, the
+      // jitter is upstream of GI entirely and reading the parent cannot fix it.
+      const pe = lights[i].parent?.matrixWorld?.elements;
+      if (pe) {
+        const pp = prev[i].pe ?? pe;
+        rows[i].maxParentDir = Math.max(rows[i].maxParentDir ?? 0,
+          Math.hypot(pe[8] - pp[8], pe[9] - pp[9], pe[10] - pp[10]));
+        rows[i].maxParentPos = Math.max(rows[i].maxParentPos ?? 0,
+          Math.hypot(pe[12] - pp[12], pe[13] - pp[13], pe[14] - pp[14]));
+        prev[i].pe = [...pe];
+      }
       if (dirDelta + posDelta * 0.05 > 1e-4) rows[i].framesMoving++;
       prev[i].e = [...e];
     }
@@ -94,7 +108,7 @@ if (report.err) { console.log(`FAIL: ${report.err}`); await browser.close(); pro
 console.log(`\n=== LIGHT JITTER PROBE (parked camera, ${report.FRAMES} frames, ${report.lightCount} lights) ===`);
 for (const r of report.rows) {
   console.log(`  ${String(r.name).padEnd(24)} ${String(r.type).padEnd(18)} intensity ${String(r.intensity).padEnd(6)} ` +
-    `parent ${String(r.parent).padEnd(16)} maxDir ${r.maxDir.toFixed(5)} maxPos ${r.maxPos.toFixed(5)} moving ${r.framesMoving}/${report.FRAMES}`);
+    `parent ${String(r.parent).padEnd(16)} maxDir ${r.maxDir.toFixed(5)} parentDir ${(r.maxParentDir ?? 0).toFixed(5)} parentPos ${(r.maxParentPos ?? 0).toFixed(5)} maxPos ${r.maxPos.toFixed(5)} moving ${r.framesMoving}/${report.FRAMES}`);
 }
 console.log(`  window: tr>0 on ${report.trOpen}/${report.FRAMES} frames (trMax ${report.trMax.toFixed(2)}), ` +
   `shMax ${report.shMax.toFixed(4)} emMax ${report.emMax.toFixed(2)} lumMax ${report.lumMax.toFixed(4)}, live cap ${report.cap}`);

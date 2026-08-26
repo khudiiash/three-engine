@@ -109,6 +109,95 @@ function fingerprintCasters(scene) {
 }
 
 /**
+ * Does the scene contain anything whose SILHOUETTE moves without its matrix?
+ *
+ * ⭐ THIS IS THE SAME TEST `fingerprintCasters` MAKES, HOISTED OUT OF THE PER-
+ * FRAME WALK. A single skinned mesh anywhere — one character in a 1600-mesh
+ * street — makes the fingerprint return `null` forever, so the freeze can never
+ * engage and the full traversal is pure loss. MEASURED on Bistro:
+ * `shadowFreeze` 1.147 ms of a 35.6 ms CPU frame (3.2 %) with `frozen: 0`, every
+ * frame, to re-derive an answer that cannot change without a hierarchy edit.
+ *
+ * Being skinned or carrying morph targets is STRUCTURAL — a mesh cannot acquire
+ * either without being rebuilt and re-added — so `hierarchy-changed` is a
+ * complete invalidation signal, which is what makes caching this safe when
+ * caching the fingerprint itself would not be.
+ */
+function sceneHasDeformingCaster(scene) {
+  let found = false;
+  scene.traverse((object) => {
+    if (found || !object.isMesh) return;
+    // ⚠ Deliberately NOT gated on `castShadow`, to match `fingerprintCasters`
+    // exactly. Diverging here would make the fast path answer a different
+    // question from the slow one, which is how a cache becomes a bug.
+    if (object.isSkinnedMesh || object.morphTargetInfluences?.length) found = true;
+  });
+  return found;
+}
+
+/**
+ * Every shadow caster in the scene whose map this system can actually stop.
+ *
+ * ⚠⚠ THIS IS NOT `object.isLight`, AND THAT COST THE WHOLE OPTIMISATION.
+ *
+ * The gate this system writes is `shadow.autoUpdate`, and the only code that
+ * reads it is `ShadowNode.updateBefore` (three r185, ShadowNode.js:855):
+ *
+ *     let needsUpdate = shadow.needsUpdate || shadow.autoUpdate;
+ *     if ( needsUpdate ) this.updateShadow( frame );   // <- renders the map
+ *
+ * So the question is never "is this a light" — it is **"does a plain
+ * `ShadowNode` own this map"**. Two cases break the naive answer, and CSM
+ * manages to be both at once:
+ *
+ * 1. **A custom `shadow.shadowNode` means three SKIPS `ShadowNode` entirely.**
+ *    `AnalyticLightNode.setupShadow` takes the custom node and never calls
+ *    `setupShadowNode()`, so nothing reads `autoUpdate` and freezing such a
+ *    light is a silent no-op. Both of this project's custom nodes land here:
+ *    GI-traced shadows and `CSMShadowNode`.
+ * 2. **A CSM cascade is NOT a Light.** `CSMShadowNode._init` builds one
+ *    `class LwLight extends Object3D` per cascade — `castShadow = true`, a
+ *    real cloned `DirectionalLightShadow`, wrapped in a real TSL
+ *    `shadow(lwLight, lShadow)` node, and added to the scene graph by
+ *    `updateBefore`. It carries **no `isLight`**, because it is an Object3D.
+ *
+ * Together those two produced a total, silent failure: an `object.isLight`
+ * filter found ONLY the CSM parent — whose flag nothing reads (case 1) — and
+ * never the cascades, which are the objects that actually own the maps and DO
+ * honour the flag (case 2). Measured on Bistro (2026-08-24, 2 cascades at
+ * 4096²): **842 of the frame's 1144 draws and 4.5M triangles re-rendered every
+ * frame on a parked camera over static geometry**, ~46 ms of a 63 ms
+ * `renderEncode` on an 83 ms CPU frame. `frozenLights` reported 1 the whole
+ * time — a freeze that owned a light it could not stop.
+ *
+ * The predicate below therefore asks the structural question directly: it takes
+ * anything that carries its own `shadow.camera` (that is what a map is rendered
+ * from) and rejects anything whose map a custom node owns.
+ */
+export function collectFreezableCasters(scene) {
+  const casters = [];
+  scene.traverse((object) => {
+    // A Mesh has `castShadow` too and no `shadow`, so this pair is what
+    // separates "casts into someone's map" from "owns a map".
+    if (object.castShadow !== true) return;
+    const shadow = object.shadow;
+    if (!shadow?.camera) return;
+    // Case 1: a custom node owns the render and never reads `autoUpdate`.
+    // Freezing here would be a false receipt, not an optimisation. The CSM
+    // parent light is excluded by exactly this — its cascades are found
+    // separately, on their own placeholders, where the flag is real.
+    if (shadow.shadowNode) return;
+    // GI-traced lights already freeze themselves — their map is a 16x16 stub
+    // that never renders. (Redundant with the check above while GI assigns a
+    // `shadowNode`, and kept because it is a statement about GI's contract
+    // rather than about three's internals.)
+    if (object.userData?.giShadowMode === "gi") return;
+    casters.push(object);
+  });
+  return casters;
+}
+
+/**
  * Per-frame shadow-map freezing across every shadow-casting light in the scene.
  *
  * Owns `shadow.autoUpdate` ONLY for lights it has taken over, and only while the
@@ -123,6 +212,33 @@ export class ShadowFreezeSystem {
     /** @type {Set<any>} lights whose autoUpdate this system switched off. */
     this._owned = new Set();
     this.frozenLights = 0;
+    /**
+     * Casters this system could freeze, whether or not it did this frame.
+     *
+     * A RECEIPT, and it exists because the absence of one hid a total failure
+     * for as long as CSM has been on: nothing anywhere reported how many maps
+     * were actually being stopped, so a filter that found zero freezable
+     * casters looked exactly like a scene that was legitimately moving. Any
+     * frame where `managedLights` is 0 on a shadowed scene, or where
+     * `frozenLights` stays 0 on a parked one, is this system not working.
+     */
+    this.managedLights = 0;
+    /**
+     * Why the freeze is doing what it is doing, for `profile.frameStats`.
+     *
+     * `frozenLights: 0` reads identically whether the scene is legitimately
+     * moving, the author switched shadows off, or one skinned mesh has disabled
+     * the whole system — three very different problems. Nothing said which.
+     */
+    this.reason = "not run yet";
+    /** Cached answer to `sceneHasDeformingCaster`, keyed on hierarchy edits. */
+    this._hasDeformingCaster = false;
+    this._deformDirty = true;
+    this._deformOff = null;
+    /** Renderer/device identity, so a rebuild or device loss un-freezes. */
+    this._rendererSeen = false;
+    this._renderer = null;
+    this._device = null;
     this.enabled = true;
   }
 
@@ -134,15 +250,74 @@ export class ShadowFreezeSystem {
     // project that switched it off would be this system overriding a setting
     // rather than implementing one.
     if (this.enabled === false || engine.settings?.shadow?.autoUpdate === false) {
+      this.reason = this.enabled === false ? "disabled" : "the project authored shadow.autoUpdate = false";
       this.#releaseAll();
       return;
     }
 
-    const lights = [];
-    scene.traverse((object) => {
-      if (object.isLight && object.castShadow && object.shadow) lights.push(object);
-    });
+    // ⭐ THE CHEAP QUESTION FIRST. See sceneHasDeformingCaster: one skinned mesh
+    // makes every later step futile, and asking it per frame cost more than the
+    // freeze was ever going to save on a scene that has one.
+    if (!this._deformOff && typeof engine.on === "function") {
+      this._deformOff = engine.on("hierarchy-changed", () => {
+        this._deformDirty = true;
+      });
+    }
+    if (this._deformDirty) {
+      this._deformDirty = false;
+      this._hasDeformingCaster = sceneHasDeformingCaster(scene);
+    }
+    if (this._hasDeformingCaster) {
+      this.reason = "a skinned or morphing mesh is present — no matrix this walk can read moves when its shadow should";
+      this.managedLights = 0;
+      this.#releaseAll();
+      return;
+    }
+
+    // ⚠⚠ A NEW RENDERER OR A NEW DEVICE MEANS EVERY SHADOW MAP IS GONE, AND A
+    // FROZEN LIGHT WILL NEVER NOTICE.
+    //
+    // The fingerprint answers "has the SCENE changed", and after a device loss
+    // or a renderer rebuild the scene is byte-for-byte identical — the casters
+    // did not move, the light did not rotate, the map resolution is the same.
+    // So the key matches, `autoUpdate` stays false, and three never re-renders
+    // a map that is now an EMPTY texture on a fresh device. The whole scene
+    // loses its shadows, permanently, and nothing in the scene can ever bring
+    // them back: exactly the "stale shadow reads as a lighting bug" failure
+    // this file's header calls more expensive than a slow frame.
+    //
+    // This was invisible before CSM cascades became freezable, because they
+    // were never frozen — a lost device healed itself on the very next frame.
+    // Making the freeze work is what made this reachable.
+    //
+    // Checked by IDENTITY every frame rather than wired to an event, on
+    // purpose: `renderer-rebuilt` exists, but a freeze that depends on someone
+    // remembering to notify it is a freeze that will silently stop being
+    // correct. Two reference compares per frame cost nothing.
+    const renderer = engine.renderer;
+    const device = renderer?.backend?.device;
+    // The FIRST observation is not a change — nothing is frozen yet, and
+    // treating it as one would spend a frame resetting state that is already
+    // empty (and, in a fixture, silently shift every later expectation).
+    const changed = this._rendererSeen && (renderer !== this._renderer || device !== this._device);
+    this._rendererSeen = true;
+    this._renderer = renderer;
+    this._device = device;
+    if (changed) {
+      this.#releaseAll();
+      // A FIRST SIGHTING AGAIN, not merely unfrozen: the keys must go too, or
+      // the very next update matches the pre-loss key and re-freezes the empty
+      // map on the frame after. Dropping the map restores the "same key twice"
+      // rule, which guarantees three completes one real render first.
+      this._keys = new WeakMap();
+      this.managedLights = 0;
+      return;
+    }
+
+    const lights = collectFreezableCasters(scene);
+    this.managedLights = lights.length;
     if (!lights.length) {
+      this.reason = "no caster owns a plain ShadowNode — every map here has a custom node (CSM/GI)";
       this.#releaseAll();
       return;
     }
@@ -152,16 +327,43 @@ export class ShadowFreezeSystem {
     const content = fingerprintCasters(scene);
     if (content === null) {
       // Something in the scene deforms without moving. Hand every light back.
+      // ⭐ THE BACKSTOP TEACHES THE CACHE. Reaching here means a deforming mesh
+      // arrived by a route that is not `hierarchy-changed` — MEASURED on Bistro,
+      // where a ModelComponent swapping in a skinned GLB announces itself as
+      // `component-changed:mesh`, so this branch fired every single frame and
+      // the cheap path never did. Recording what the slow path just proved makes
+      // the next frame take the early exit; `hierarchy-changed` still clears it,
+      // so removing the character still restores the freeze.
+      this._hasDeformingCaster = true;
+      this.reason = "a deforming caster appeared without a hierarchy edit";
       this.#releaseAll();
       return;
     }
 
+    // ⭐⭐ PROOF THAT A RENDER HAPPENED BETWEEN THE TWO SIGHTINGS.
+    //
+    // The freeze rule is "same key twice", and its entire safety rests on three
+    // having rendered the map at least once in between — see the `autoUpdate`
+    // note below. That was enforced only by WHERE `Engine#tick` called this,
+    // and the call sat ABOVE the tick's `renderSuspended` early return, so a
+    // suspended GI compile wave produced update() calls on frames that never
+    // drew. Store the key on one of those, match it on the next, and the light
+    // is frozen with `autoUpdate = false` on a map three has never rendered.
+    // Both flags false, three's gate is `needsUpdate || autoUpdate`, and the
+    // map stays EMPTY until something else sets `needsUpdate` — reported as
+    // "shadows are broken after each reload, have to change bias to fix them"
+    // (user, 2026-08-25). The tick order is fixed too, but a caller-side
+    // invariant that only a comment defends is one refactor from returning, so
+    // it is now checked here.
+    //
+    // `info.render.calls` is cumulative and nothing in this engine resets it,
+    // which is exactly the property needed: it advances if and only if the
+    // renderer actually ran.
+    const renderCalls = this.engine?.renderer?.info?.render?.calls ?? 0;
+
     let frozen = 0;
     for (const light of lights) {
       const shadow = light.shadow;
-      // GI-traced lights already freeze themselves — their map is a 16×16 stub
-      // that never renders, and touching `needsUpdate` here would make it render.
-      if (light.userData?.giShadowMode === "gi") continue;
       let key = content;
       const mixKey = (v) => {
         key = Math.imul(key ^ (v | 0), 0x01000193) >>> 0;
@@ -245,17 +447,23 @@ export class ShadowFreezeSystem {
       // three is guaranteed to have completed at least one real shadow render
       // before this system ever switches it off.
       const previous = this._keys.get(light);
-      if (previous === key) {
+      if (previous?.key === key && renderCalls > previous.calls) {
         shadow.autoUpdate = false;
         this._owned.add(light);
         frozen++;
       } else {
-        this._keys.set(light, key);
+        // A repeat key with no render in between leaves the record ALONE, so
+        // the freeze still lands on the first sighting after the renderer
+        // actually runs rather than restarting the count.
+        if (previous?.key !== key) this._keys.set(light, { key, calls: renderCalls });
         shadow.autoUpdate = true;
         this._owned.add(light);
       }
     }
     this.frozenLights = frozen;
+    this.reason = frozen === lights.length
+      ? `frozen (${frozen}/${lights.length})`
+      : `redrawing — the scene key changed (${frozen}/${lights.length} frozen)`;
   }
 
   /**
@@ -269,7 +477,9 @@ export class ShadowFreezeSystem {
   #releaseAll() {
     if (!this._owned.size) return;
     for (const light of this._owned) {
-      light.shadow.autoUpdate = true;
+      // CSM disposes and rebuilds its cascade placeholders on any cascade-count
+      // or renderer change, so `_owned` can outlive the object it names.
+      if (light.shadow) light.shadow.autoUpdate = true;
       this._keys.delete(light);
     }
     this._owned.clear();
@@ -277,6 +487,8 @@ export class ShadowFreezeSystem {
   }
 
   dispose() {
+    this._deformOff?.();
+    this._deformOff = null;
     this.#releaseAll();
   }
 }

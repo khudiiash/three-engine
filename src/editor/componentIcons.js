@@ -88,6 +88,7 @@ const ICONS = {
   light: [Lightbulb, LIGHT],
   environment: [Cloud, LIGHT],
   "global-illumination": [Sun, LIGHT],
+  "reflection-probe": [CircleDot, LIGHT],
 
   navmesh: [Waypoints, AI],
   navagent: [Footprints, AI],
@@ -142,7 +143,7 @@ export const COMPONENT_GROUPS = [
   { label: "Rendering", types: ["mesh", "model", "skinnedmesh", "objModel", "instancer", "geometryModifiers", "lod", "impostor"] },
   { label: "Effects", types: ["particles", "line", "trail", "decal"] },
   { label: "Camera", types: ["camera", "postprocess"] },
-  { label: "Lighting", types: ["light", "environment", "global-illumination"] },
+  { label: "Lighting", types: ["light", "environment", "global-illumination", "reflection-probe"] },
   { label: "Physics", types: ["rigidbody", "collider", "charactercontroller"] },
   { label: "Logic", types: ["script", "animation", "bone", "pool"] },
   { label: "Audio", types: ["sound", "listener"] },

@@ -53,6 +53,10 @@ const AB = process.env.AB === "1" || SEAM;
 // the off-vs-on excess stays the statistic.
 const EXTRA = process.env.EXTRA ? JSON.parse(process.env.EXTRA) : null;
 const OUT = ".gi-shots/emitter-scale";
+// Floats per tile in the cut's `posBuf`: [P.xyz, valid][N.xyz, comp][w0..w3].
+// The third vec4 is §13.8's per-channel soft-cut weight — read the layout off
+// `createGiEmitterTileCutPass`, never off a remembered stride.
+const TILE_F = 12;
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 mkdirSync(OUT, { recursive: true });
 
@@ -246,7 +250,7 @@ async function runArm(lamps, cutOn = TILECUT) {
     if (cutOn && cut && !cut.fail) {
       const EMPTY = 0xffffffff;
       const setOf = (t) => cut.tileIds.slice(t * 4, t * 4 + 4).filter((i) => i !== EMPTY);
-      const valid = (t) => cut.pos[t * 8 + 3] > 0.5;
+      const valid = (t) => cut.pos[t * TILE_F + 3] > 0.5;
       const symDiff = (a, b) => a.filter((x) => !b.includes(x)).length + b.filter((x) => !a.includes(x)).length;
       let hPairs = 0, hDiffer = 0, hDiffSum = 0, vPairs = 0, vDiffer = 0, vDiffSum = 0, best = null;
       for (let ty = 0; ty < cut.tilesY; ty++) {
@@ -338,11 +342,11 @@ async function runArm(lamps, cutOn = TILECUT) {
       const inRange = nonEmpty.every((i) => i < view.emitterCount);
       const emptiesLast = ids4.slice(nonEmpty.length).every((i) => i === EMPTY);
       if (!ascending || !inRange || !emptiesLast) { structuralBad++; continue; }
-      const valid = cut.pos[t * 8 + 3] > 0.5;
+      const valid = cut.pos[t * TILE_F + 3] > 0.5;
       if (!valid) { if (nonEmpty.length) structuralBad++; continue; }
       validTiles++;
-      const P = [cut.pos[t * 8], cut.pos[t * 8 + 1], cut.pos[t * 8 + 2]];
-      const N = [cut.pos[t * 8 + 4], cut.pos[t * 8 + 5], cut.pos[t * 8 + 6]];
+      const P = [cut.pos[t * TILE_F], cut.pos[t * TILE_F + 1], cut.pos[t * TILE_F + 2]];
+      const N = [cut.pos[t * TILE_F + 4], cut.pos[t * TILE_F + 5], cut.pos[t * TILE_F + 6]];
       const imps = [];
       for (let id = 0; id < view.emitterCount; id++) imps.push(emitterImportance(view, id, P, N));
       const rank = imps.map((imp, id) => ({ imp, id })).filter((e) => e.imp > 0)
@@ -381,9 +385,9 @@ async function runArm(lamps, cutOn = TILECUT) {
     // reconstruction is broken and every ranking above is circularly "ok".
     const pmin = [Infinity, Infinity, Infinity], pmax = [-Infinity, -Infinity, -Infinity];
     for (let t = 0; t < tiles; t++) {
-      if (cut.pos[t * 8 + 3] <= 0.5) continue;
+      if (cut.pos[t * TILE_F + 3] <= 0.5) continue;
       for (let k = 0; k < 3; k++) {
-        const v = cut.pos[t * 8 + k];
+        const v = cut.pos[t * TILE_F + k];
         if (v < pmin[k]) pmin[k] = v;
         if (v > pmax[k]) pmax[k] = v;
       }
@@ -394,7 +398,7 @@ async function runArm(lamps, cutOn = TILECUT) {
     // seam), and a saturated one reads the cap everywhere (the ratio stopped
     // discriminating and the fix is degenerate).
     const comps = [];
-    for (let t = 0; t < tiles; t++) if (cut.pos[t * 8 + 3] > 0.5) comps.push(cut.pos[t * 8 + 7]);
+    for (let t = 0; t < tiles; t++) if (cut.pos[t * TILE_F + 3] > 0.5) comps.push(cut.pos[t * TILE_F + 7]);
     comps.sort((a, b) => a - b);
     const q = (f) => (comps.length ? comps[Math.min(comps.length - 1, Math.floor(f * comps.length))] : 0);
     cutVerdict = {

@@ -33,6 +33,13 @@ import { throttlePreviewFrame } from "../previewLoop.js";
  * the bytes load straight into the webview with no Rust proxy in the way. A
  * host that does not would need `fetch_bytes` and a blob URL instead.
  *
+ * A source that is not glTF at all passes `load` instead: an async function
+ * returning `{ scene, animations }`, the two fields of a GLTF this component
+ * actually reads. ambientCG's models are OBJ+MTL inside a ZIP and have no URL
+ * a loader could be pointed at, so they build their scene themselves and hand
+ * it over. `src` is still required alongside it — it is the cache key the load
+ * effect keys off, so two different models never share a render.
+ *
  * ## Interaction
  *
  * It turntables on its own until you touch it, then hands over: showing the
@@ -74,7 +81,7 @@ function disposeScene(root) {
   for (const texture of textures) texture.dispose();
 }
 
-export function ModelPreview({ src, className = "" }) {
+export function ModelPreview({ src, load = null, onError = null, className = "" }) {
   const canvasRef = useRef(null);
   const [clips, setClips] = useState([]);
   const [clipIndex, setClipIndex] = useState(0);
@@ -87,6 +94,14 @@ export function ModelPreview({ src, className = "" }) {
   // Lets the clip <select> reach the mixer without re-running the whole
   // load-and-build effect, which would re-download the model on every change.
   const playRef = useRef(null);
+  // Read inside the effect but deliberately NOT in its dep list: `load` is an
+  // inline arrow in every caller, so a new identity arrives on each render and
+  // depending on it would re-download the model whenever the panel re-renders.
+  // `src` is the identity that actually decides which model this is.
+  const loadRef = useRef(load);
+  loadRef.current = load;
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
 
   useEffect(() => {
     let disposed = false;
@@ -106,7 +121,11 @@ export function ModelPreview({ src, className = "" }) {
 
     (async () => {
       try {
-        const gltf = await createGltfLoader().loadAsync(src);
+        // `load` returns the same two fields a GLTF exposes, so everything
+        // downstream — bounds, mixer, disposal — is identical either way.
+        const gltf = loadRef.current
+          ? await loadRef.current()
+          : await createGltfLoader().loadAsync(src);
         if (disposed) {
           disposeScene(gltf.scene);
           return;
@@ -197,6 +216,12 @@ export function ModelPreview({ src, className = "" }) {
         if (!disposed) {
           setError(String(err?.message ?? err));
           setLoading(false);
+          // Let the caller decide what a failed load should look like. Some
+          // sources cannot be read at all — three's FBXLoader rejects FBX
+          // variants that ship no normals array, and Fab's catalogue has them —
+          // and for a browser the honest answer is the still image, not an
+          // error string where the asset should be.
+          onErrorRef.current?.(err);
         }
       }
     })();

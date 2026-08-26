@@ -9,6 +9,7 @@ import {
   subscribeMaterial,
 } from "../materialAsset.js";
 import { acquireGeometryAsset, disposeOrReleaseGeometry } from "../geometryAsset.js";
+import { applyCastShadow } from "../shadowMerge.js";
 
 const geometryFactories = {
   box: () => new THREE.BoxGeometry(1, 1, 1),
@@ -166,7 +167,7 @@ export class MeshComponent extends Component {
     const makeGeometry = geometryFactories[this.props.geometry] ?? geometryFactories.box;
     this.mesh = new THREE.Mesh(makeGeometry(), getDefaultMaterial());
     this.mesh.userData.entityId = this.entity.id;
-    this.mesh.castShadow = !!this.props.castShadow;
+    applyCastShadow(this.mesh, !!this.props.castShadow, this.entity.engine);
     this.mesh.receiveShadow = !!this.props.receiveShadow;
     this.#applyGiDynamic();
     this.entity.object3D.add(this.mesh);
@@ -439,7 +440,11 @@ export class MeshComponent extends Component {
     } else if (/^material[2-8]$/.test(key)) {
       this.#loadExtraMaterials();
     } else if (key === "castShadow" || key === "receiveShadow") {
-      this.mesh[key] = !!this.props[key];
+      // `castShadow` goes through the ownership rule — a shadow proxy may hold
+      // this mesh, and writing it back on would draw its triangles twice in
+      // every cascade. See applyCastShadow.
+      if (key === "castShadow") applyCastShadow(this.mesh, !!this.props[key], this.entity.engine);
+      else this.mesh[key] = !!this.props[key];
     } else if (key === "giProxy") {
       // Read fresh every frame by GISystem#syncMoverOccluders straight off
       // userData — no rebuild, no slot churn, so switching a character from

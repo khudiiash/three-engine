@@ -1825,8 +1825,30 @@ function buildNode(type, props, ins, ctx) {
       // Plain JS property, read by GodraysNode.setSize (GodraysNode.js:258).
       node.resolutionScale = resolutionScale;
       if (ctx.temps?.add) ctx.temps.add(node);
-      if (typeof ctx.depthAwareBlend === "function" && typeof color.sample === "function") {
-        return ctx.depthAwareBlend(color, node, depth, ctx.camera);
+      // ⚠ `depthAwareBlend` TAKES THE EFFECT'S TEXTURE NODE, NOT THE EFFECT.
+      //
+      // It samples all three of its inputs at shifted UVs (`blendNode.sample(
+      // sampleUv).r`, depthAwareBlend.js:75), so every one of them has to be a
+      // texture-like node. `GodraysNode` is a TempNode and has no `.sample` —
+      // passing it threw `TypeError: blendNode.sample is not a function` from
+      // inside TSL, on a stack that names no node type and no graph node, the
+      // moment anyone wired input → god rays → output (user, 2026-08-23).
+      // `getTextureNode()` returns the `passTexture` wrapper the addon builds
+      // for exactly this, and three's own usage example composites that.
+      //
+      // Referencing only the texture node still renders the pass: PassTextureNode
+      // .setup records `properties.passNode`, which is how the canonical
+      // `pass(scene, camera).getTextureNode()` pattern drives a pass at all.
+      const blend = typeof node.getTextureNode === "function" ? node.getTextureNode() : node;
+      // Every input checked, not just the base: the addon reads `.sample` on
+      // the base, the blend AND the depth, and a missing one is a build-time
+      // throw rather than a wrong picture. The additive fallback below is
+      // correct, just harder-edged, so degrading to it beats failing to
+      // compile the user's whole post chain.
+      const samplable = (n) => typeof n?.sample === "function";
+      if (typeof ctx.depthAwareBlend === "function"
+        && samplable(color) && samplable(blend) && samplable(depth)) {
+        return ctx.depthAwareBlend(color, blend, depth, ctx.camera);
       }
       return TSL.vec4(TSL.add(color.rgb, node.rgb), color.a);
     }

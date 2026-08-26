@@ -25,7 +25,9 @@ import { installOutputDither } from "./outputDither.js";
 import { installShadowNodeGuard } from "./shadowNodeGuard.js";
 import { BatchSystem } from "./batching.js";
 import { MergeSystem } from "./merging.js";
+import { ShadowMergeSystem } from "./shadowMerge.js";
 import { ShadowFreezeSystem } from "./shadowFreeze.js";
+import { FrameGovernorSystem } from "./frameGovernor.js";
 import { LodSystem } from "./lod/LodSystem.js";
 import { ImpostorSystem } from "./lod/ImpostorSystem.js";
 import { OcclusionSystem } from "./culling/OcclusionSystem.js";
@@ -175,6 +177,13 @@ export class Engine extends EventEmitter {
     this._drsScale = 1;
     this._drsEmaMs = 0;
     this._drsLastChange = 0;
+    // §18 W3 — the frame-rate floor. Separate from `_drsScale` on purpose:
+    // that one scales the CANVAS and is deliberately divided back out of GI's
+    // own sizing, so on a GI-dominated frame it controls a few ms of raster and
+    // nothing that matters. `giCostScale` is the multiplier the GI module
+    // applies to its traced-pixel budget; see frameGovernor.js for the loop and
+    // for the measurements that made the pixel budget the control variable.
+    this.frameGovernor = new FrameGovernorSystem(this);
     // Canvas/WebGPU attachment resize synchronization. Custom render targets
     // (GI/SSGI/etc.) may still be referenced by submitted command buffers;
     // resizing only after the queue drains avoids destroying them in flight.
@@ -205,6 +214,10 @@ export class Engine extends EventEmitter {
     // table-driven material — the imported-environment case instancing cannot
     // reach. Off unless the scene asks for it; see merging.js on why.
     this.merging = new MergeSystem(this);
+    // The same idea aimed at the SHADOW passes, where three replaces every
+    // material with one depth override and merging's colour-pass key is
+    // therefore meaningless. Opt-in while it is being proven. See shadowMerge.js.
+    this.shadowMerge = new ShadowMergeSystem(this);
     // Picks a detail level per LOD group each frame. Ordered after batching so
     // it can invalidate it (a hidden member still draws through its proxy).
     this.lod = new LodSystem(this);
@@ -308,6 +321,7 @@ export class Engine extends EventEmitter {
     // applySettings() re-applies this whenever the scene changes it.
     this.batching.setEnabled(this.settings.performance?.autoBatching !== false);
     this.merging.setEnabled(this.settings.performance?.staticMerging === true);
+    this.shadowMerge.setEnabled(this.settings.performance?.shadowMerging === true);
     // Resolved through the camera, not read from settings directly — the scene
     // setting is only what a camera set to "inherit" falls back to. Re-applied
     // every tick anyway; this is just so the state is right before the first one.
@@ -408,40 +422,33 @@ export class Engine extends EventEmitter {
     // frozen at WebGPURenderer creation time. If any of them just changed,
     // tear the renderer down and rebuild it on the same canvas. The new
     // renderer then gets the rest of the settings via applySettingsToScene.
-    let recreatedRenderer = false;
-    if (
-      this.renderer &&
-      rendererNeedsRebuild(before.renderer, this.settings.renderer)
-    ) {
-      const canvas = this.renderer.domElement;
-      // Wait for any in-flight rebuild before tearing down the renderer it
-      // created — otherwise we'd dispose() a renderer that's mid-init() and
-      // race its post-init wiring (configureTextureAssetLoader, etc.)
-      // against this rebuild's post-init wiring. Awaiting also serializes
-      // back-to-back applySettings() calls (e.g. play→stop triggers
-      // clear()→applySettings(DEFAULTS) then applySettings(snapshot) in one
-      // tick) so they don't fight over `this.renderer`.
-      if (this._rendererRebuildInFlight) {
-        try {
-          await this._rendererRebuildInFlight;
-        } catch {
-          // The in-flight rebuild already logged its own failure; swallow so
-          // this rebuild can still proceed.
-        }
-      }
-      this.renderer.setAnimationLoop(null);
-      // Timestamp readback maps renderer-owned GPU buffers asynchronously.
-      // Wait so dispose() does not unmap a pending GPUBuffer.mapAsync call.
-      if (this._gpuTimestampInFlight) await this._gpuTimestampInFlight;
-      this.renderer.dispose();
-      this.renderer = null;
-      this.rendererReady = false;
-      // Fire-and-forget the async rebuild. applySettingsToScene runs again
-      // after the new renderer resolves, so anything that already called
-      // applySettings synchronously gets the new renderer on next tick.
-      this.#rebuildRenderer(canvas);
-      recreatedRenderer = true;
-    }
+    //
+    // ⛔⛔ DECIDED AGAINST THE RENDERER'S BUILT OPTIONS, COALESCED TO END OF
+    // TICK — NOT against the previous settings object, immediately.
+    //
+    // The immediate before/after comparison destroyed the GPU DEVICE TWICE on
+    // every play-stop of any scene whose renderer block differs from the
+    // defaults. Stop-play restores state as `applySettings(DEFAULTS)` then
+    // `applySettings(snapshot)` in one tick (see the serialization note
+    // below); with the Level scene at `antialias: false` against the default
+    // `true`, each call saw a "changed" antialias and each ran a full
+    // teardown — `renderer.dispose()` → `[gpu] DEVICE LOST (destroyed)` in the
+    // user's console at 19:16:43, followed by async-pipeline-creation failures
+    // and null-`layers` unhandled rejections as GI and the selection outline
+    // recovered against a dying device. Reported as "gi keeps crushing, even
+    // on other scene" — the Level is where Play is used, and every stop killed
+    // the device twice for a round trip that ended exactly where it began.
+    //
+    // The scheduled check compares the EFFECTIVE constructor options
+    // (`rendererConstructorOptions`, which is what the renderer actually
+    // froze — e.g. samples collapse to 0 whenever antialias is off) against
+    // what the live renderer was BUILT with. A DEFAULTS→snapshot round trip
+    // coalesces to "unchanged" and no rebuild happens at all; a real
+    // antialias/samples/transparent change still rebuilds, once, with the
+    // final values.
+    const optionCheckScheduled = this.renderer
+      && rendererNeedsRebuild(before.renderer, this.settings.renderer);
+    if (optionCheckScheduled) this.#scheduleRendererOptionCheck();
     applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
     // A manual render-scale change resizes the canvas backing store. Only
     // re-apply when the value actually moved — renderer.setSize reallocates
@@ -450,17 +457,80 @@ export class Engine extends EventEmitter {
     const nextScale = this.settings.performance?.renderScale ?? 1;
     const prevDpr = before.performance?.maxDevicePixelRatio ?? 2;
     const nextDpr = this.settings.performance?.maxDevicePixelRatio ?? 2;
-    if (!recreatedRenderer && (prevScale !== nextScale || prevDpr !== nextDpr)) {
+    if (prevScale !== nextScale || prevDpr !== nextDpr) {
       this.#scheduleRendererResize();
     }
     this.batching.setEnabled(this.settings.performance?.autoBatching !== false);
     this.merging.setEnabled(this.settings.performance?.staticMerging === true);
+    this.shadowMerge.setEnabled(this.settings.performance?.shadowMerging === true);
     // Resolved through the camera, not read from settings directly — the scene
     // setting is only what a camera set to "inherit" falls back to. Re-applied
     // every tick anyway; this is just so the state is right before the first one.
     this.applyCullingSettings();
     this.emit("settings-changed", this.settings);
-    return recreatedRenderer;
+    // "Might the renderer be rebuilt as a result of this call": the decision
+    // itself now lands at end of tick, so this is an upper bound, kept for
+    // callers that used the old boolean to expect a renderer swap.
+    return optionCheckScheduled;
+  }
+
+  /**
+   * The coalesced renderer-rebuild decision — see the banner in applySettings.
+   *
+   * Runs once per macrotask however many applySettings calls queued it, and
+   * compares the EFFECTIVE constructor options of the FINAL settings against
+   * what the live renderer was actually built with (`_rendererBuiltWith`,
+   * recorded at both construction sites). A play-stop's DEFAULTS→snapshot
+   * round trip lands here as "unchanged" and no device is destroyed.
+   */
+  #scheduleRendererOptionCheck() {
+    if (this._rendererOptionCheckQueued) return;
+    this._rendererOptionCheckQueued = true;
+    // setTimeout, not queueMicrotask: the DEFAULTS and snapshot applies are
+    // separate awaited async calls, so microtasks between them would still see
+    // the intermediate state. A macrotask runs after the whole play-stop
+    // sequence has settled.
+    setTimeout(() => {
+      this._rendererOptionCheckQueued = false;
+      void this.#applyRendererOptionsIfChanged();
+    }, 0);
+  }
+
+  async #applyRendererOptionsIfChanged() {
+    if (!this.renderer) return;
+    const built = this._rendererBuiltWith;
+    const wanted = rendererConstructorOptions(this.settings);
+    const changed = !built
+      || Object.keys(wanted).some((key) => wanted[key] !== built[key]);
+    if (!changed) return;
+    const canvas = this.renderer.domElement;
+    // Wait for any in-flight rebuild before tearing down the renderer it
+    // created — otherwise we'd dispose() a renderer that's mid-init() and
+    // race its post-init wiring (configureTextureAssetLoader, etc.) against
+    // this rebuild's post-init wiring.
+    if (this._rendererRebuildInFlight) {
+      try {
+        await this._rendererRebuildInFlight;
+      } catch {
+        // The in-flight rebuild already logged its own failure; swallow so
+        // this rebuild can still proceed.
+      }
+      // The settings may have moved again while we waited — re-check against
+      // whatever that rebuild recorded, rather than tearing down a renderer
+      // that already matches.
+      return this.#applyRendererOptionsIfChanged();
+    }
+    this.renderer.setAnimationLoop(null);
+    // Timestamp readback maps renderer-owned GPU buffers asynchronously.
+    // Wait so dispose() does not unmap a pending GPUBuffer.mapAsync call.
+    if (this._gpuTimestampInFlight) await this._gpuTimestampInFlight;
+    this.renderer.dispose();
+    this.renderer = null;
+    this.rendererReady = false;
+    // Fire-and-forget the async rebuild. applySettingsToScene runs again
+    // after the new renderer resolves, so anything that already called
+    // applySettings synchronously gets the new renderer on next tick.
+    this.#rebuildRenderer(canvas);
   }
 
   /**
@@ -472,6 +542,68 @@ export class Engine extends EventEmitter {
     const manual = this.settings.performance?.renderScale ?? 1;
     const clamped = Number.isFinite(manual) ? Math.min(1, Math.max(0.25, manual)) : 1;
     return clamped * this._drsScale;
+  }
+
+  /**
+   * The frame governor's current multiplier on GI's traced-pixel budget.
+   * 1 = the quality tier's authored cost, untouched. See frameGovernor.js.
+   *
+   * A GETTER rather than a field so there is exactly one owner of the value:
+   * a module reading a stale copy of a number the loop moves is the whole
+   * class of bug this replaces.
+   */
+  get giCostScale() {
+    return this.frameGovernor?.scale ?? 1;
+  }
+
+  /**
+   * Subscribes to the live device's error stream.
+   *
+   * SURFACE SILENT GPU FAILURES (2026-08-22 night). An async compute pipeline
+   * that fails validation dispatches nothing and — with no listener — logs
+   * NOTHING: the §12.56 dead-field family stayed a coin-flip mystery for weeks
+   * because nothing in the engine ever subscribed to the device's error stream.
+   * Every uncaptured validation/OOM/internal error now prints with its real
+   * message, which names the failing pipeline instead of leaving a black field
+   * as the only symptom.
+   *
+   * ⚠ CALLED FROM BOTH RENDERER CONSTRUCTION SITES, and that is the whole
+   * reason it is a method. It used to be an inline block in `init()` only, so
+   * every renderer built by `#rebuildRenderer` — the play-stop path, any
+   * antialias/samples change — ran with NO error listener at all: a device that
+   * died after a rebuild produced total silence, which is the worst possible
+   * state for the failure it exists to explain.
+   *
+   * RECOVERY: a loss whose reason is not `"destroyed"` was not our doing (a
+   * driver reset, a GPU-process crash, an OOM on a phone). Everything the
+   * renderer owns is gone, and without a rebuild the canvas keeps presenting
+   * the last good frame — or nothing — forever, with only a console line to
+   * say why. An intentional teardown (`reason === "destroyed"`) is skipped:
+   * that device was replaced on purpose and something else already owns the
+   * canvas.
+   */
+  #watchDevice() {
+    const device = this.renderer?.backend?.device;
+    if (!device || device.__engineErrorListener) return;
+    device.__engineErrorListener = true;
+    device.addEventListener("uncapturederror", (e) => {
+      const msg = e?.error?.message ?? String(e?.error ?? e);
+      console.error(`[gpu] UNCAPTURED DEVICE ERROR: ${msg.slice(0, 1200)}`);
+    });
+    device.lost?.then?.((info) => {
+      const reason = info?.reason ?? "unknown";
+      console.error(`[gpu] DEVICE LOST (${reason}): ${info?.message ?? ""}`);
+      if (reason === "destroyed") return;
+      // Only if this dead device is still the one the live renderer holds —
+      // otherwise a rebuild has already moved on and this is a stale echo.
+      if (this.renderer?.backend?.device !== device) return;
+      const canvas = this.renderer.domElement;
+      console.warn("[gpu] rebuilding the renderer after an unexpected device loss");
+      this.renderer.setAnimationLoop(null);
+      this.renderer = null;
+      this.rendererReady = false;
+      void this.#rebuildRenderer(canvas);
+    }).catch(() => {});
   }
 
   async #rebuildRenderer(canvas) {
@@ -486,6 +618,9 @@ export class Engine extends EventEmitter {
         // parameter three forwards straight to requestDevice.
         const limits = await resolveRendererLimits();
         this.renderer = new THREE.WebGPURenderer({ canvas, ...opts, ...limits });
+        // What this renderer actually froze — the baseline the coalesced
+        // option check compares against (see #applyRendererOptionsIfChanged).
+        this._rendererBuiltWith = opts;
         this.#applyRendererSize();
         await this.renderer.init();
         // Another rebuild started while we were awaiting init(). It owns
@@ -493,6 +628,8 @@ export class Engine extends EventEmitter {
         // ours so we don't run configureTextureAssetLoader / start the
         // animation loop against a renderer that isn't ours yet.
         if (token !== this._rendererRebuildSeq) return;
+        // The replacement device needs its own error listener — see #watchDevice.
+        this.#watchDevice();
         configureTextureAssetLoader(this.renderer);
     // Sub-LSB dither on the output transform — without it every smooth GI
     // gradient bands into hard-edged contour rings on the 8-bit canvas.
@@ -690,13 +827,16 @@ export class Engine extends EventEmitter {
     // Mark this as a new rebuild generation so any stale #rebuildRenderer
     // awaiting init() will notice and abort instead of clobbering us.
     ++this._rendererRebuildSeq;
+    // See #applyRendererOptionsIfChanged for why the built options are kept.
+    this._rendererBuiltWith = rendererConstructorOptions(this.settings);
     this.renderer = new THREE.WebGPURenderer({
       canvas,
-      ...rendererConstructorOptions(this.settings),
+      ...this._rendererBuiltWith,
       ...(await resolveRendererLimits()),
     });
     this.#applyRendererSize();
     await this.renderer.init();
+    this.#watchDevice();
     configureTextureAssetLoader(this.renderer);
     // Sub-LSB dither on the output transform — without it every smooth GI
     // gradient bands into hard-edged contour rings on the 8-bit canvas.
@@ -941,6 +1081,8 @@ export class Engine extends EventEmitter {
       // callback, do not encode another frame after the drain was scheduled.
       if (this._resizeInFlight) {
         this.stats.recordSkippedFrame();
+        // §18 W3: a tick without a draw is not a measurement. See governor.hold().
+        this.frameGovernor.hold();
         this.stats.endPhaseFrame();
         return;
       }
@@ -950,6 +1092,8 @@ export class Engine extends EventEmitter {
       // call blocking the main thread for the whole wave.
       if (this.renderSuspended) {
         this.stats.recordSkippedFrame();
+        // §18 W3: a tick without a draw is not a measurement. See governor.hold().
+        this.frameGovernor.hold();
         this.stats.endPhaseFrame();
         return;
       }
@@ -968,6 +1112,12 @@ export class Engine extends EventEmitter {
       // could take.
       this.stats.markPhase(PHASE.merging);
       this.merging.sync();
+      // ⚠ AFTER `merging.sync()`, and that is structural rather than ordering
+      // taste: the set the shadow merge replaces is whatever the depth pass
+      // draws TODAY, which includes merging's own batch proxies. Running it
+      // first would merge the originals merging is about to hide, and merging
+      // would then hide meshes this system had already taken `castShadow` from.
+      this.shadowMerge.sync();
       // Impostor bakes are nested renders, so they belong here — after the
       // scene's transforms are final and before the main draw. At most one
       // atlas is baked per frame; the rest of this call just refreshes the
@@ -987,6 +1137,16 @@ export class Engine extends EventEmitter {
       // this frame's upload rather than the next one's.
       this.stats.markPhase(PHASE.debugFlush);
       this.debug.flush();
+      // Re-check: a preRender callback (GI rebuild) may have suspended
+      // rendering THIS frame — rendering now would sync-compile the whole
+      // material wave in this frame, the exact freeze suspension prevents.
+      if (this.renderSuspended) {
+        this.stats.recordSkippedFrame();
+        // §18 W3: a tick without a draw is not a measurement. See governor.hold().
+        this.frameGovernor.hold();
+        this.stats.endPhaseFrame();
+        return;
+      }
       // ⚠ AFTER the preRender callbacks, and that is not a preference.
       // LightComponent recentres a directional light's shadow camera from an
       // `onPreRender` callback, so before this point the shadow camera is still
@@ -996,16 +1156,22 @@ export class Engine extends EventEmitter {
       // hard stair-stepped shadow edges in the wrong place. It also has to stay
       // after batching/merging/impostors for the ordinary reason: the caster
       // transforms must be this frame's final ones.
+      //
+      // ⚠⚠ AND AFTER THE `renderSuspended` RE-CHECK ABOVE, WHICH IT WAS NOT.
+      // `ShadowFreezeSystem` freezes a light the second time it sees the same
+      // content key, and the whole safety of that rule rests on three having
+      // rendered the map at least once in between — its own header says so.
+      // That holds only if every `update()` is followed by a draw. Sitting
+      // ABOVE this early return, it also counted ticks that never rendered: a
+      // GI rebuild suspends here, the key is stored on a frame with no draw,
+      // and the next tick to get this far matches it and switches `autoUpdate`
+      // off on a map three never rendered. Both flags are then false, three's
+      // gate is `needsUpdate || autoUpdate`, and the map stays EMPTY for the
+      // rest of the session — "shadows are broken after each reload, I have to
+      // change the bias to fix them" (user, 2026-08-25), bias being one of the
+      // few edits that sets `needsUpdate` and forces the render three skipped.
       this.stats.markPhase(PHASE.shadowFreeze);
       this.shadowFreeze.update();
-      // Re-check: a preRender callback (GI rebuild) may have suspended
-      // rendering THIS frame — rendering now would sync-compile the whole
-      // material wave in this frame, the exact freeze suspension prevents.
-      if (this.renderSuspended) {
-        this.stats.recordSkippedFrame();
-        this.stats.endPhaseFrame();
-        return;
-      }
       // Wall-clock the GPU-submit portion of the frame so the stats
       // overlay's "GPU" reading reflects only the render call, not the
       // script tick. WebGPU dispatches the actual GPU work asynchronously,
@@ -1040,10 +1206,18 @@ export class Engine extends EventEmitter {
       this.stats.recordRenderInfo();
       this.#resolveGpuTimestamps();
       this.#updateDynamicResolution();
+      // §18 W3, and deliberately in the same slot as the DRS loop: both read
+      // `stats.readout.gpuMs`, which only carries this frame's number once
+      // `#resolveGpuTimestamps` has landed it. Running the governor earlier in
+      // the tick would feed it a frame-old measurement of a rung it may have
+      // already left. GI reads `giCostScale` from its own preRender callback,
+      // so a level set here takes effect on the very next tick.
+      this.frameGovernor.update();
     } else {
       // No camera, or the renderer is mid-swap. The loop is running and the
       // canvas is not changing — the same thing a suspended wave looks like.
       this.stats.recordSkippedFrame();
+      this.frameGovernor.hold();
     }
     // Post-render passes draw on top of the main render's pixels. The
     // WebGPU backend's render pass starts with `loadOp: Clear`, so any
@@ -1515,6 +1689,7 @@ export class Engine extends EventEmitter {
     this.time.clear();
     this.batching.dispose();
     this.merging.dispose();
+    this.shadowMerge.dispose();
     this.lod.dispose();
     this.impostors.dispose();
     this.occlusion.dispose();

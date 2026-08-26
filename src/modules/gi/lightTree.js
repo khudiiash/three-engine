@@ -219,9 +219,15 @@ export function coneUnion(axisA, cosA, axisB, cosB) {
  * knob for callers who want a dim-emitter cull as a *perf* choice, and it
  * defaults to admitting everything.
  *
+ * ⚠ PREFER `minPower` OVER `minPeak` FOR ANY CULL. `minPeak` gates on radiance,
+ * which is SIZE-BLIND — it cannot distinguish a 2 cm decorative bulb from a 2 m²
+ * illuminated sign at the same authored brightness, though they differ by three
+ * orders of magnitude in delivered light. `minPower` gates on `pi * A * L`, the
+ * quantity that actually reaches a surface. See its note at the check itself.
+ *
  * @param {THREE.Mesh} mesh
  * @param {{ instanceId?: number, matrixWorld?: THREE.Matrix4, minPeak?: number,
- *           thetaE?: number, maxConeTris?: number }} [options]
+ *           minPower?: number, thetaE?: number, maxConeTris?: number }} [options]
  *   `matrixWorld` overrides the mesh's own — this is how an InstancedMesh
  *   contributes one emitter PER INSTANCE. (Promotion cannot: one emitter slot
  *   is described by one `mesh.matrixWorld`, so every instance promoted to the
@@ -497,6 +503,28 @@ export function emitterFromMesh(mesh, options = {}) {
   // is RELATIVE — it stayed last. The block comment above already stated the
   // intent ("`power` already uses [the true area]"); only the ordering was wrong.
   const meanAuthored = (rgb[0] + rgb[1] + rgb[2]) / 3;
+  // ── `minPower` — THE SIZE-AWARE CULL (2026-08-25) ──────────────────────────
+  //
+  // `minPeak` above gates on RADIANCE, which is size-blind, and that is the
+  // wrong physical quantity: what a surface receives scales with radiant POWER,
+  // `Phi = pi * A * L`. Two meshes at identical radiance 0.4 — a 2 cm bulb
+  // (A ~ 1.3e-3 m², Phi ~ 8e-4) and a 2 m² sign (Phi ~ 2.5) — differ by more
+  // than three orders of magnitude in what they actually deliver, and a
+  // radiance gate cannot tell them apart. The user's Bistro shows both ends
+  // live: a real lamp logs P=1.8e+1, a decorative bulb ~1e-3.
+  //
+  // Gating on power expresses the user's rule exactly — "the smaller the
+  // emitter, the more power it needs to emit any light into the scene" —
+  // because `Phi >= P_min` rearranges to `L >= P_min / (pi * A)`: the required
+  // radiance rises as the area falls, automatically and continuously, with no
+  // size buckets to tune.
+  //
+  // ⚠ MEASURED ON `meanAuthored`, BEFORE THE FILL DAMPING, for the same reason
+  // the `power` field below is — see the block comment above. Culling on the
+  // damped radiance would delete exactly the sparse emitters §13.7g exists to
+  // rescue.
+  const minPower = options.minPower ?? 0;
+  if (minPower > 0 && Math.PI * area * meanAuthored < minPower) return null;
   if (fill < 1) {
     rgb[0] *= fill; rgb[1] *= fill; rgb[2] *= fill;
   }
@@ -854,6 +882,66 @@ export function collectEmitters(source, options = {}) {
   // Second pass rather than inline, because the budget has to be spent on the
   // emitters that matter. Splitting is ranked by `power` — the TRUE emitted
   // power, `pi * area * L_authored`, which §13.7g deliberately keeps free of
+  // ── §18.11 — THE CULL IS RELATIVE TO THE SCENE, NOT AN ABSOLUTE WATTAGE ────
+  //
+  // ⚠ THIS REPLACES AN ABSOLUTE `minPower` DEFAULT THAT WAS MEASURED WRONG.
+  // The first cut gated at `pi*A*L < 0.05` on the reasoning that a real lamp
+  // logs P=1.8e+1 and a 2 cm bulb ~8e-4, so anything between separates two
+  // "clearly bimodal" populations. That inference came from TWO data points and
+  // it did not survive contact with a second scene: on the user's Bistro the
+  // same gate culled **26 emitters**, taking the light tree from 114 to 88 and
+  // leaving a green neon as the dominant chromatic source — reported as "all
+  // reflections are greenish". Emitter powers are NOT bimodal in general; they
+  // are a broad continuum whose SCALE is a property of how the scene was
+  // authored, and no constant in watts can be right for every scene.
+  //
+  // A FRACTION of the scene's own total emitted power has no such problem. It
+  // says the thing actually meant — "this emitter is a negligible share of the
+  // light in this room" — and it is invariant to the units the artist happened
+  // to author in. The user's rule survives intact, because `power` is still
+  // `pi * A * L`: at equal brightness a smaller emitter has less power and is
+  // culled first, so "the smaller the emitter, the more power it needs" holds,
+  // now measured against the room instead of against a constant.
+  //
+  // Applied AFTER fitting (the total is not knowable until every emitter is
+  // described) and BEFORE the split pass, so a culled emitter cannot consume
+  // split budget. `minPower` is still honoured for callers that genuinely want
+  // an absolute floor.
+  const cullStats = { culled: 0, culledFloor: 0, total: fitted.length };
+  // ⚠ CAPTURED BEFORE THE CULL, DELIBERATELY. `meshFits` (returned at the end)
+  // exists for consumers that describe a whole MESH — the analytic emitter
+  // seats. Seat selection does NOT apply this power cull, so a sparse mesh can
+  // hold a seat while the tree has dropped it, and taking the fits from the
+  // post-cull list would leave exactly that emitter — the most over-delivering
+  // one there is — with no fill to be damped by.
+  const meshFits = fitted.map((f) => ({
+    mesh: f.mesh,
+    instanceId: f.instanceId,
+    fill: f.e?.fill ?? 1,
+    power: f.e?.power ?? 0,
+  }));
+  const fracOverride = Number(globalThis.__giEmitterMinPowerFraction);
+  const fraction = Number.isFinite(fracOverride)
+    ? fracOverride
+    : (options.minPowerFraction ?? 0);
+  if (fraction > 0 && fitted.length > 1) {
+    let total = 0;
+    for (const f of fitted) total += f.e.power ?? 0;
+    const floor = total * fraction;
+    if (floor > 0) {
+      const kept = fitted.filter((f) => (f.e.power ?? 0) >= floor);
+      // ⚠ NEVER CULL EVERYTHING. If every emitter is below the fraction the
+      // scene is uniformly lit by many equal sources — exactly the case where
+      // culling is most wrong — so keep them all. A gate that can empty the
+      // light tree is a gate that can black out a room.
+      if (kept.length > 0) {
+        cullStats.culled = fitted.length - kept.length;
+        cullStats.culledFloor = floor;
+        fitted.length = 0;
+        fitted.push(...kept);
+      }
+    }
+  }
   // the fill damping — so a dark decorative strip cannot consume the budget a
   // room's actual lighting needs.
   const stats = { sparse: 0, split: 0, added: 0, worstBefore: 1, bestAfter: 0 };
@@ -892,6 +980,19 @@ export function collectEmitters(source, options = {}) {
     else out.push(f.e);
   }
   out.splitStats = stats;
+  out.cullStats = cullStats;
+  // ── §18.15: THE PRE-SPLIT FIT, FOR CONSUMERS THAT CANNOT SPLIT ────────────
+  //
+  // `out` is the POST-split list, where every piece reads fill ~= 1 by
+  // construction — so it cannot answer "how badly does a shape fitted to this
+  // whole MESH over-deliver?", which is exactly the question the analytic
+  // emitter SEATS need. A seat is described by one mesh's world transform and
+  // one bounding shape (GISystem #refreshEmitterSlots); it has no way to be
+  // several pieces, so its only correct option is the fill damping this pass
+  // already applies to un-splittable emitters. Handing back the per-mesh fit
+  // lets that consumer use the same number instead of the raw material
+  // emissive, which on this project's Bistro is ~285x too bright.
+  out.meshFits = meshFits;
   return out;
 }
 

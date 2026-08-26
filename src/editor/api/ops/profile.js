@@ -282,6 +282,15 @@ defineOp({
           unattributedRate: stats.rays?.unattributedRate != null
             ? +(stats.rays.unattributedRate * 100).toFixed(2) + "%"
             : null,
+          // §15 front 5 ("smooth light no matter where we go"): the ladder's
+          // health decides whether bins carry the full-range answer or a
+          // patchy partial one. orphanRate is the number to watch — healthy
+          // ~0.01; the user-visible "patches updating" state reads 0.3+.
+          // Relayed verbatim from the merge/seed/tiles readbacks so an
+          // agent can watch it over MCP without a custom page.
+          merge: stats.merge ?? null,
+          seed: stats.seed ?? null,
+          tiles: stats.tiles ?? null,
           note: stats.rays?.shaded
             ? `Hit shading is LIVE — ${stats.rays.shaded} hits shaded last frame. Radiance carries ` +
               "albedo, sun, lights and emission."
@@ -567,6 +576,193 @@ defineOp({
       culling: {
         occlusion: engine.occlusion?.stats ?? null,
         lodHidden: [...engine.entities.values()].filter((e) => e._lodHidden === true).length,
+      },
+      // §18 W3 — the frame-rate floor's own state. Without this, a scene that
+      // is holding 60 fps and a scene that is holding 60 fps BY SPENDING GI
+      // RESOLUTION look identical from the outside, which is the one thing this
+      // controller must never be allowed to hide. `scale` 1 means it has not
+      // spent anything; `lastReason` says what it reacted to.
+      governor: engine.frameGovernor?.stats ?? null,
+      // Shadow freezing is routinely the single biggest draw-call lever in the
+      // frame (a shadow map is a full extra submission of every caster, and it
+      // is NOT reduced by view frustum culling), and it had no receipt at all
+      // until a CSM scene was found re-rendering 842 of its 1144 draws every
+      // frame on a parked camera. `managed` 0 on a shadowed scene means the
+      // system cannot see the maps; `frozen` 0 while `managed` > 0 on a still
+      // scene means it sees them and something keeps invalidating them.
+      // The two GPU passes that dominate a GI frame (bvhReflect ~26 ms +
+      // bvhHitShade ~26 ms of ~52 ms on Bistro at ultra). Both are HELD while
+      // the g-buffer key is unchanged — the trace exactly, the shade on a
+      // cadence. A non-zero count here is the only way to tell "the view is
+      // held and the GPU is idle" from "the gate never engaged".
+      giHold: {
+        reflectHeldFrames: engine.modules?.get?.("gi")?.system?._bvhReflectHeldFrames ?? null,
+        hitShadeHeldFrames: engine.modules?.get?.("gi")?.system?._bvhHitShadeHeldFrames ?? null,
+        // §17 R7c's reflection history weight. ~0.9 means the reflection is a
+        // ~10-frame exponential smear = "a stale image lagging behind"; near 0
+        // means it is passing raw and R7c is doing its job. `atMotion` is
+        // peak-held from a frame the camera was ACTUALLY moving, because the
+        // motion EMA decays long before any reader can sample it.
+        hitHistWeight: engine.modules?.get?.("gi")?.system?._giBvhHitHistWeightU?.value ?? null,
+        hitHistWeightAtMotion: engine.modules?.get?.("gi")?.system?._giHitWeightAtMotion ?? null,
+        camMotionEma: engine.modules?.get?.("gi")?.system?._giCamMotionEma ?? null,
+        // ⚠ THE TWO ABOVE DESCRIBE DECISIONS; THESE DESCRIBE DISPATCHES.
+        // `hitShadeHeldFrames` counts only the frames the HELD-VIEW cadence
+        // chose to skip — it reported 0 ("healthy") on every frame the idle
+        // sleep had already dropped the pass from the queue entirely, which is
+        // how a reflection re-shading once every 30 frames went unnoticed for
+        // sessions. `hitShadeGapFrames` asks the submitted queue instead, and
+        // `hitShadeGapMax` is the WORST gap seen — deliberately a maximum, not
+        // the peak-held best case that misled the same investigation twice.
+        hitShadeGapFrames: engine.modules?.get?.("gi")?.system?._bvhHitShadeGapFrames ?? null,
+        hitShadeGapMax: engine.modules?.get?.("gi")?.system?._bvhHitShadeGapMax ?? null,
+        // The idle gate's inputs. `#fieldInputHash` has NO camera term, so
+        // `fieldQuietFrames` climbs straight through a camera orbit; past
+        // GI_IDLE_AFTER_FRAMES (180) the queue is replaced by a reduced list.
+        // A high count here WITH the camera moving is the signature to watch.
+        fieldQuietFrames: engine.modules?.get?.("gi")?.system?._fieldQuietFramesSeen ?? null,
+      },
+      // §18 THE LADDER's live census (GISystem.reflectTierCensus). Counted at
+      // READ time, not build time, because the per-channel roughness floors it
+      // reads land asynchronously off the GPU — the build-time tally reported
+      // "0 sharp" for a scene full of mirrors purely because it asked too
+      // early. `pendingMaterials` is how much of the medium column is still
+      // "ask again later"; `coarseTriangleShare` is the budget a per-tier trace
+      // stride can reclaim at zero visual cost (those materials' roughness
+      // floor is above 0.45, where the exact reflection's weight is 0).
+      giTiers: engine.modules?.get?.("gi")?.system?.reflectTierCensus?.() ?? null,
+      // §18's masked-mode gate (armed by `__giMaskCoverageProbe`). `pct` is the
+      // share of gbuffer texels carrying geometry; it must be IDENTICAL with
+      // the mask on and off. Reported here as well as logged because a console
+      // line can scroll past and a null result must be distinguishable from a
+      // result of zero — this is the rig that decides whether a four-times-
+      // reverted feature ships.
+      giMaskCoverage: engine.modules?.get?.("gi")?.system?._maskCoverage ?? null,
+      // §18.13 colour probe. `wait` climbing proves the tick reaches the probe
+      // at all — distinguishing "the readback failed" from "the code never
+      // ran", which a silent console cannot.
+      // §18.15 — WHICH FOUR EMITTERS THE ANALYTIC PATH IS USING. The exact-
+      // reflection hit shading lights the WHOLE scene from the four global
+      // emitter seats (a hit is a different world point than the pixel, so it
+      // cannot use the per-pixel tile cut), and on a 116-emitter scene nothing
+      // said which four those are. The term probe measured the reflected
+      // radiance as x2.99 green with an emitted-power aggregate of only x1.42,
+      // so the seats' own chroma is the question — and `radius` answers the
+      // other half: a seat fitted to a whole mesh of scattered bulbs is a
+      // metres-wide sphere whose solid angle is orders of magnitude too large.
+      giEmitterSeats: (() => {
+        const slots = engine.modules?.get?.("gi")?.system?.state?.emitterSlots;
+        if (!Array.isArray(slots)) return null;
+        return slots.map((s, i) => {
+          const c = s.color?.value;
+          const r = c?.r ?? 0, g = c?.g ?? 0, b = c?.b ?? 0;
+          return {
+            slot: i,
+            rgb: [Number(r.toFixed(3)), Number(g.toFixed(3)), Number(b.toFixed(3))],
+            green: Number((g / Math.max(1e-6, (r + b) / 2)).toFixed(2)),
+            radius: Number((s.radius?.value ?? 0).toFixed(3)),
+            reff: Number((s.reff?.value ?? 0).toFixed(3)),
+          };
+        });
+      })(),
+      // Who asked for each GI rebuild and when — the answer to "gi reloads
+      // for no reason". `asks` counts requests (several can coalesce into one
+      // run), `runs` counts executions, and the log names the last twelve with
+      // their age. A `resolve-resize` entry carries giCostScale, so a governor
+      // rung change is distinguishable from a window resize at a glance.
+      giRebuilds: (() => {
+        const system = engine.modules?.get?.("gi")?.system;
+        if (!system) return null;
+        const now = performance.now();
+        return {
+          runs: system.rebuilds ?? 0,
+          asks: system.rebuildAsks ?? 0,
+          log: (system.rebuildLog ?? []).map((e) => ({
+            reason: e.reason,
+            secondsAgo: Math.round((now - e.at) / 1000),
+          })),
+        };
+      })(),
+      giColourProbe: {
+        wait: engine.modules?.get?.("gi")?.system?._colourProbeWait ?? null,
+        done: engine.modules?.get?.("gi")?.system?._colourProbeDone ?? null,
+        result: engine.modules?.get?.("gi")?.system?._colourProbeResult ?? null,
+      },
+      // Why the main pass still submits what it does. `undersizedAfterSplit` is
+      // the locality split dicing groups below MIN_GROUP_SIZE; `rejects` names
+      // the gate that ate the rest. Without this the answer lives only in a
+      // change-gated console line from whenever the last rebuild happened.
+      merging: engine.merging?.lastReport ?? null,
+      shadows: {
+        managed: engine.shadowFreeze?.managedLights ?? 0,
+        frozen: engine.shadowFreeze?.frozenLights ?? 0,
+        // `frozen: 0` has at least four different causes and used to look the
+        // same for all of them. This names the one in force.
+        freezeReason: engine.shadowFreeze?.reason ?? null,
+        // Depth-only merging of the casters themselves (shadowMerge.js).
+        // `replaced` is the number of individual meshes the cascades no longer
+        // submit; `proxies` is what they submit instead. A `frozen` cascade
+        // costs nothing either way — these are the numbers that matter once the
+        // camera MOVES and the maps correctly redraw.
+        mergedProxies: engine.shadowMerge?.stats?.proxies ?? 0,
+        mergedReplaced: engine.shadowMerge?.stats?.replaced ?? 0,
+        // How many times the merge has been thrown away and rebuilt this
+        // session, and what asked for the last one. On a settled scene this
+        // should stop moving; if it keeps climbing, every shadow map is being
+        // un-frozen with it (the proxies' object ids are in the freeze's
+        // fingerprint) and every rebuild re-copies the merged vertices.
+        mergedRebuilds: engine.shadowMerge?.rebuilds ?? 0,
+        mergedRebuiltBy: engine.shadowMerge?.lastRebuildReason ?? null,
+        // ⭐ TRIANGLES AS BAKED, BEFORE ANY FRUSTUM CULL. The per-pass triangle
+        // count in `profile.drawCalls` is post-culling, so it moves with proxy
+        // GRANULARITY as well as with content — which makes it useless for
+        // answering "did the merge capture the whole scene". This one does not
+        // move with the camera, so a cold-boot value below the settled value is
+        // the merge having baked less than the scene contains.
+        mergedTriangles: engine.shadowMerge?.stats?.triangles ?? 0,
+        // The same sum taken from the members' CURRENT geometry, not the bake.
+        // `mergedTriangles` is what the proxies froze at build time; this is
+        // what they would contain if rebuilt right now. Divergence = a missed
+        // invalidation (the watcher has a gap); equal-but-low = the members
+        // themselves were coarse at build time and the deficit is upstream.
+        mergedMemberTrianglesNow: (() => {
+          let t = 0;
+          for (const g of engine.shadowMerge?.groups ?? []) {
+            for (const m of g.members ?? []) {
+              const geo = m.geometry;
+              t += (geo?.index ? geo.index.count : geo?.attributes?.position?.count ?? 0) / 3;
+            }
+          }
+          return Math.round(t);
+        })(),
+        // Member composition: shadowMerge's caster set includes merging.js's
+        // COLOUR proxies, and those carry most of the scene's triangles. If the
+        // boot-final member set holds fewer of them than a later rebuild does,
+        // the deficit is an ordering problem between the two merges, not a
+        // geometry-staleness problem.
+        mergedBatchProxyMembers: (() => {
+          let count = 0;
+          let tris = 0;
+          for (const g of engine.shadowMerge?.groups ?? []) {
+            for (const m of g.members ?? []) {
+              if (!/^Merged\(/.test(m?.name ?? "")) continue;
+              count++;
+              const geo = m.geometry;
+              tris += (geo?.index ? geo.index.count : geo?.attributes?.position?.count ?? 0) / 3;
+            }
+          }
+          return { count, tris: Math.round(tris) };
+        })(),
+        // §18 G1 — the same proxies standing in for GI's g-buffer prepass. A
+        // healthy `mergedProxies` beside a zero here means the merge is working
+        // and the prepass is getting none of it (geometry without normals),
+        // which is otherwise invisible.
+        gbufferProxies: engine.shadowMerge?.stats?.gbufferProxies ?? 0,
+        gbufferReplaced: engine.shadowMerge?.stats?.gbufferReplaced ?? 0,
+        // What the prepass DID with them last frame. `used: 0` beside a healthy
+        // `gbufferProxies` means every group was refused, and the two `parked*`
+        // counters say by which rule.
+        gbufferSwap: engine.modules?.get?.("gi")?.system?._gbufProxyStats ?? null,
       },
       note: drawing
         ? r.skippedFps > 0

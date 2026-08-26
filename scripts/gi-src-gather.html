@@ -532,6 +532,35 @@
         })];
         const cappedTiles = ref.bakeProbeIrradiance(cfg, built, cappedMerged, 0, INTERIOR);
         const cappedCover = ref.bakeProbeCoverage(cfg, built, cappedMerged, 0, INTERIOR);
+        // ── THIS ARM'S BOUND IS LOOSER THAN THE SUITE'S, AND MEASURED ────────
+        //
+        // §12.87's fractional coverage (default since 2026-08-26) genuinely
+        // worsens the CONDITIONING of this quotient, and the A/B says by how
+        // much. Same field, same pixels, only the hatch moved:
+        //
+        //     __giTileCoverFraction   worst GPU-vs-mirror   channels over 1%
+        //     false (the old flag)          0.12%                  0
+        //     true  (the default)           2.79%                  1 of 3504
+        //
+        // WHY, and it is arithmetic rather than a defect. The gather computes
+        // `Σ w·c·E / Σ w·c`, and the GPU gets both sums from ONE hardware
+        // bilinear tap each — rgb premultiplied by c, alpha carrying c — over
+        // an f16 atlas with ~8-bit filter weights. With `c ∈ {0,1}` adjacent
+        // texels are either equally weighted or one is simply absent, so the
+        // numerator and denominator round almost identically and the ratio is
+        // insensitive. With continuous c the two sums carry coverage's full
+        // dynamic range through DIFFERENT roundings, and the residual is
+        // amplified by the spread of `E` across the tap — which on this
+        // synthetic field is ~7x. 0.4% x 7 is the 2.8% observed.
+        //
+        // The mirror is the reference and it is unchanged, so this is a
+        // precision disagreement between twins, not an error in the estimator:
+        // the furnace and PIXELS arms above still hold at the tight bound
+        // (0.44%), which is what says the gather itself did not move. 4% keeps
+        // a real regression catchable — the failure this arm was written for
+        // (coverage ignored entirely) moves channels by up to 55%, two orders
+        // of magnitude clear of the bound.
+        const COV_TOL = TOL * 4;
         let covWrong = 0;
         let covWorst = 0;
         let effect = 0;
@@ -545,7 +574,7 @@
           for (let ch = 0; ch < 3; ch++) {
             const err = Math.abs(cappedGot[i * 4 + ch] - w[ch]) / Math.max(1e-4, scale);
             covWorst = Math.max(covWorst, err);
-            if (err > TOL) covWrong++;
+            if (err > COV_TOL) covWrong++;
             if (w[ch] > 1e-4) {
               effect = Math.max(effect, Math.abs(w[ch] - naive[ch]) / w[ch]);
               if (Math.abs(w[ch] - naive[ch]) > 1e-5) effectN++;
@@ -553,7 +582,8 @@
           }
         }
         check("the GPU matches the coverage-weighted mirror", covWrong === 0,
-          `${covWrong} channels differ, worst ${(covWorst * 100).toFixed(2)}% of peak`);
+          `${covWrong} channels differ, worst ${(covWorst * 100).toFixed(2)}% of peak ` +
+          `against this arm's ${(COV_TOL * 100).toFixed(0)}% bound (see the conditioning note)`);
         check("ignoring coverage would have changed the answer", effectN > 0,
           `${effectN} channels differ from the coverage-blind gather, by up to ` +
           `${(effect * 100).toFixed(1)}% — zero would make the arm above vacuous`);

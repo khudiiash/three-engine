@@ -489,6 +489,23 @@ const DRAGGABLE_EXTENSIONS = [
 
 const openEntry = (entry) => openAssetPath(entry.path, { isDir: entry.is_dir });
 
+/**
+ * "New Folder", from the toolbar or the context menu: create it, select it,
+ * and put the tile straight into rename.
+ *
+ * Creating a folder and leaving it called "New Folder" is half a gesture. The
+ * folder tree's own New Folder and Ctrl+G ("group into folder") have both
+ * dropped into rename since they shipped; this one didn't, so the panel's most
+ * obvious way to make a folder was the only one that made you hunt the tile
+ * down and rename it by a second, separate gesture.
+ */
+async function newFolder(setRenamingPath) {
+  const created = await createFolder();
+  if (!created) return;
+  useSelectionStore.getState().selectAsset(created);
+  setRenamingPath(created);
+}
+
 function RenameInput({ entry, setRenamingPath }) {
   const commit = (value) => {
     setRenamingPath(null);
@@ -758,7 +775,7 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries, onRes
       ]
     : [
         { header: "Create" },
-        { label: "New Folder", action: createFolder },
+        { label: "New Folder", action: () => newFolder(setRenamingPath) },
         { label: "New Script", action: createScript },
         { label: "New Material", action: createMaterial },
         { label: "New Texture", action: createTexture },
@@ -993,10 +1010,22 @@ export function AssetsPanel() {
 
   // Load the subtree pool the first time a filter is switched on, and refresh
   // it whenever the folder changes or the project tree moves underneath us.
+  //
+  // ⚠ The trigger is `searching`'s FALSE→TRUE edge, not its current value.
+  // `searching` flips with every keystroke (`query.trim().length > 0`), and
+  // the scan walks the whole subtree + reads every `.meta` sidecar — a
+  // project with thousands of files takes seconds per scan, and re-running it
+  // on every character makes the panel freeze while the user types. The pool
+  // itself doesn't depend on `query` or `typeId`; once it's in `projectEntries`
+  // the filter is pure over it, so a cached scan answers every keystroke.
   const changeCounter = useProjectStore((s) => s.changeCounter);
+  const wasSearching = useRef(false);
   useEffect(() => {
     const from = currentPath ?? rootPath;
+    const becameSearching = searching && !wasSearching.current;
+    wasSearching.current = searching;
     if (!searching || !from) return;
+    if (!becameSearching && projectEntries !== null) return;
     let live = true;
     setScanning(true);
     listProjectEntries(from)
@@ -1255,7 +1284,7 @@ export function AssetsPanel() {
             <Trash2 size={14} />
           </button>
         )}
-        <button className="toolbar-btn icon-only" title="New folder" onClick={createFolder}>
+        <button className="toolbar-btn icon-only" title="New folder" onClick={() => newFolder(setRenamingPath)}>
           <FolderPlus size={14} />
         </button>
         <button className="toolbar-btn icon-only" title="New script" onClick={createScript}>
@@ -1409,7 +1438,7 @@ export function AssetsPanel() {
               entry={entry}
               view={view}
               visible={visible}
-              renaming={renamingPath === entry.path}
+              renaming={samePath(renamingPath, entry.path)}
               setRenamingPath={setRenamingPath}
               onContextMenu={onTileContextMenu}
               subtitle={relativeFolder(entry)}

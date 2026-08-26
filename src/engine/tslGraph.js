@@ -288,7 +288,11 @@ export const NODE_TYPES = {
 
   // --- texture ---
   texture: {
-    label: "Texture", cat: "texture", params: [{ key: "path", type: "asset" }],
+    // `exts` is not optional on an asset param: AssetField coerces a missing
+    // list to `[]`, which matches nothing — the browse popover comes back
+    // empty and drag-and-drop rejects every file.
+    label: "Texture", cat: "texture",
+    params: [{ key: "path", label: "Texture", type: "asset", exts: ["png", "jpg", "jpeg", "webp"], default: "" }],
     inputs: [i("uv", "vec2", null, "uv")], outputs: ["out", "r", "g", "b", "a"], out: "color",
     build: ({ ins, out, textures, id }) => {
       const tex = textures.get(id);

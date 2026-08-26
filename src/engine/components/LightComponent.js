@@ -6,6 +6,7 @@ import { PCFShadowFilter, float } from "three/tsl";
 import { CSMShadowNode } from "three/addons/csm/CSMShadowNode.js";
 import { Component } from "./Component.js";
 import { PCSSShadowFilter } from "../pcssShadowFilter.js";
+import { SHADOW_PROXY_LAYER } from "../editorLayers.js";
 
 const SHADOW_TYPE_OPTIONS = [
   "BasicShadowMap",
@@ -652,6 +653,27 @@ export class LightComponent extends Component {
       const t = i / last;
       let changed = false;
 
+      // ⚠ THE DEPTH PASS MUST SEE THE SHADOW-MERGE PROXIES, AND BY DEFAULT IT
+      // CANNOT. three's `ShadowNode.updateShadow` reads:
+      //
+      //     if ( ( shadow.camera.layers.mask & 0xFFFFFFFE ) === 0 )
+      //         shadow.camera.layers.mask = camera.layers.mask;
+      //
+      // — a shadow camera left on layer 0 alone INHERITS THE VIEW CAMERA'S
+      // mask, and no view camera in this engine ever enables
+      // SHADOW_PROXY_LAYER (none calls `enableAll`; they enable layer 0 plus
+      // EDITOR/DEBUG/UI explicitly). So inheriting hides the proxies from the
+      // one pass they exist for. Enabling the bit here also lifts the camera
+      // out of the inheritance branch, which is what we want: every other
+      // engine layer is ADDITIVE — its meshes keep layer 0 — so rendering
+      // {0, SHADOW_PROXY_LAYER} loses no real caster.
+      //
+      // Done here rather than at construction because CSM DISPOSES AND REBUILDS
+      // these placeholders whenever the cascade count or the renderer changes,
+      // and a cascade that came back without the bit would silently stop
+      // casting the merged half of the scene.
+      shadow.camera?.layers.enable(SHADOW_PROXY_LAYER);
+
       // The upstream CSM clone multiplies bias by (cascade + 1), producing
       // detached far shadows and triangular light wedges at closed corners.
       // Use less bias in the high-resolution near maps and never exceed the
@@ -707,6 +729,11 @@ export class LightComponent extends Component {
 
   #configureShadow({ shadowMapWidth, shadowMapHeight, shadowCamNear, shadowCamFar, shadowCamSize, shadowCamFov }) {
     const s = this.light.shadow;
+    // The non-CSM half of the shadow-merge routing — same reasoning as the
+    // cascade loop in #syncCSMCascadeShadows: without this bit the camera falls
+    // into three's mask-inheritance branch and picks up a view mask that has
+    // SHADOW_PROXY_LAYER switched off.
+    s.camera?.layers.enable(SHADOW_PROXY_LAYER);
     // mapSize is a Vector2 — set both axes separately; for point lights both
     // must match (cube faces are square).
     s.mapSize.set(shadowMapWidth, shadowMapHeight);

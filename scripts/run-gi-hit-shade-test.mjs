@@ -65,6 +65,10 @@ async function runArm(arm) {
     const t = m.text();
     if (/\[gi\] built/.test(t)) built = true;
     if (/bvh: exact reflections ON/.test(t)) bvhLine = t;
+    // §18.16/§18.17 receipts: WHICH albedo path and WHICH sun-visibility path
+    // armed. Both fall back silently, so a run that never printed these is a
+    // run that proved nothing about them.
+    if (/reflections: one-BVH hits|reflection albedo atlas|static shadow bvh:/.test(t)) console.log(`  ${t}`);
     // §17: a WGSL validation failure surfaces only as this warn, and a
     // skipped pipeline renders as a stale target, not an error — echo it.
     if (/failed to compile|compilation info|Invalid ShaderModule|error while parsing WGSL/i.test(t)) {

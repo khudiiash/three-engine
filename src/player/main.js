@@ -142,18 +142,27 @@ async function boot() {
   // through: `__engine.loadScene("scenes/Level2.scene")` from a console is
   // the fastest way to check a level transition in a real build.
   globalThis.__engine = engine;
+  // Build-level config rides along in the start scene: modules, the input
+  // snapshot and the exported page settings. The scene manager only cares
+  // about entities, so read these here (the fetch is served from cache when
+  // it loads the same file a moment later).
+  //
+  // READ BEFORE `init`, and that ordering is load-bearing: antialias / samples
+  // / transparent are frozen when the WebGPURenderer is constructed, so a
+  // renderer built from the defaults and only then told the scene's own block
+  // has to be DESTROYED and rebuilt — `[gpu] DEVICE LOST (destroyed)` on every
+  // launch, a second adapter + device request, and any pipeline already minted
+  // against the dead device thrown away. The cost of moving the fetch up is
+  // that the canvas paints its background one round trip later; the file is
+  // local and needed within milliseconds anyway.
+  const config = await (await fetch(START_SCENE)).json();
+  if (config.settings?.renderer) await engine.applySettings({ renderer: config.settings.renderer });
   await engine.init(document.getElementById("game"));
   // Start the render loop early so the canvas paints the background colour
   // immediately, instead of staying black until the scene is deserialized.
   // The loop is harmless on an empty scene — it just renders nothing.
   engine.start();
   createLoadingScreen(engine);
-
-  // Build-level config rides along in the start scene: modules, the input
-  // snapshot and the exported page settings. The scene manager only cares
-  // about entities, so read these here (the fetch is served from cache when
-  // it loads the same file a moment later).
-  const config = await (await fetch(START_SCENE)).json();
   // (Live-preview reload polling used to live here, keyed off
   // `config.player.previewRevision`. It moved into the exporter —
   // `injectLivePreviewClient` in src/editor/build/playerHtml.js — because a

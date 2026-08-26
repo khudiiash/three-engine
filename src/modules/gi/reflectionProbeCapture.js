@@ -51,7 +51,7 @@ import { MAX_REFLECTION_PROBES, REFL_PROBE_LEVEL_CONES, REFL_PROBE_LEVELS, REFL_
  */
 export function createReflectionProbeCapture({
   scratch, history, bvhScene, gatherAt, emitter, lightSlots, env, normalOffset, intensity, cap = 6,
-  uniforms,
+  uniforms, staticOcclude = null, dynOcclude = null, shadowReach = null,
 }) {
   const { centerU, maxDistU, rowU, jitterU, alphaU } = uniforms;
   const capU = uniform(cap);
@@ -116,23 +116,64 @@ export function createReflectionProbeCapture({
                 ? null
                 : (emitter.recordShadowTrace ?? null),
               traceCutoffScale: 24,
-              maxTraceDistance: 4,
+              // ⚠ §18.15: THIS WAS LEFT AT 4 WHEN ITS TWIN WENT TO 16. Both
+              // this file's header and createGiBvhHitShade's state that the
+              // formula is identical on purpose, "one formula, two consumers"
+              // — and §18.14 raised the hit shade's march cap to 16 m without
+              // this one, so a captured probe and a traced reflection of the
+              // same surface disagreed about which occluders exist. Reads the
+              // same hatch as the hit shade for the same reason.
+              // ▶ DEBT, carried from §18.14: still a constant in METRES. It
+              // wants to be a fraction of the GI volume extent, which GISystem
+              // knows and neither kernel does.
+              maxTraceDistance: Number.isFinite(Number(globalThis.__giHitEmitterMarchCap))
+                ? Number(globalThis.__giHitEmitterMarchCap)
+                : 16,
             }
           : { ...emitter, shadowSample: () => float(1) };
         E.addAssign(emitterDirectAt(hitParams, hitP, nFace, shadePoint).irradiance);
       }
       if (lightSlots?.length) {
-        // Sun/analytic at the hit, cone-shadowed like the resolve's
-        // lightShadowFn (6 m cap — occluders past it stop occluding, the
-        // bounded-leak trade documented there).
-        const lightShadowFn = shadows && emitter?.shadowTraceFn
-          ? (dirTo, isDir, pointDist, cosH) => {
-              const capT = float(6);
-              const maxT = mix(pointDist.sub(0.3), capT, isDir).min(capT).max(0).toVar();
-              return emitter.shadowTraceFn(shadePoint, dirTo, maxT, float(32), cosH, vec3(0), float(0), null);
+        // §18.16 — EXACT BVH VISIBILITY, the atlas twin of the hit shade's
+        // own move (see createGiBvhHitShade's banner). The cone this replaces
+        // is the same voxel-lattice etcher R3a already removed from the
+        // EMITTER arm three units ago; leaving it on the sun arm baked the
+        // black crosses into the atlas, where the jitter+EMA rounds only blur
+        // them into permanent mottle that every probe lookup then reflects.
+        // The 6 m cap goes with it: a BVH ray costs traversal depth, not
+        // distance, so `shadowReach` (the medium's diagonal, as a node) is
+        // affordable where a 6 m march cap never was.
+        const bvhLightShadows = staticOcclude && globalThis.__giHitBvhShadows !== false;
+        const sunReach = float(shadowReach ?? 64).toVar();
+        const lightShadowFn = shadows && bvhLightShadows
+          ? (dirTo, isDir, pointDist) => {
+              const tMin = float(1e-3);
+              const near = pointDist.sub(float(normalOffset).mul(2)).max(tMin.mul(2)).toVar();
+              const maxT = mix(near, sunReach, isDir).toVar();
+              const st = staticOcclude(shadePoint, dirTo, tMin, maxT);
+              const vis = float(1).toVar();
+              if (st) vis.assign(select(st.x.greaterThanEqual(0), float(0), float(1)));
+              if (dynOcclude) {
+                const dh = dynOcclude(shadePoint, dirTo, tMin, maxT, hitP);
+                if (dh) vis.mulAssign(float(dh).clamp(0, 1).oneMinus());
+              }
+              return vis;
             }
-          : null;
-        E.addAssign(analyticDirectAt(lightSlots, hitP, nFace, lightShadowFn));
+          : shadows && emitter?.shadowTraceFn
+            ? (dirTo, isDir, pointDist, cosH) => {
+                const capT = float(6);
+                const maxT = mix(pointDist.sub(0.3), capT, isDir).min(capT).max(0).toVar();
+                return emitter.shadowTraceFn(shadePoint, dirTo, maxT, float(32), cosH, vec3(0), float(0), null);
+              }
+            : null;
+        // ONE-SIDED, for the same reason and by the same rule as
+        // createGiBvhHitShade (§18.10): `nFace` is a face-forwarded HIT normal,
+        // not a field cell. Keeping the two in step is deliberate — this file's
+        // header and the hit shade's both state that the formula is identical
+        // on purpose, "one formula, two consumers", and a cosine convention
+        // that differed between them would put a probe capture and a traced
+        // reflection of the SAME surface at different brightnesses.
+        E.addAssign(analyticDirectAt(lightSlots, hitP, nFace, lightShadowFn, true));
       }
       out.assign(vec3(hit.albedo).mul(E).mul(1 / Math.PI).mul(intensity));
       // The glossy chain's hue-preserving luminance cap, same default: a hot

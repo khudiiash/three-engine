@@ -2381,6 +2381,240 @@ export function createOccupancyField(bounds, res0, options = {}) {
     },
   });
 
+  /**
+   * `densityTrilinear` for a DENSE sampler, levels 1..4 only — identical math
+   * with the per-level resolution and buffer offset resolved ONCE instead of
+   * once per corner.
+   *
+   * WHY A SECOND ONE: the shadow cone reads density only inside cells its
+   * hierarchy already proved occupied — a handful of samples per ray, so the
+   * shared sampler's eight `densityCellAt` calls (each re-running the five-way
+   * level select for res.x/res.y/res.z/offset) are noise. The VXAO march below
+   * has no occupancy gate at all, by design, and samples every step of every
+   * cone. There those 32 redundant select chains per sample ARE the pass.
+   *
+   * Level 0 is deliberately out of range: it is the raw occupancy BIT in a
+   * differently-packed region, and a cone thinner than a level-1 cell is below
+   * the scale this estimator owns (screen-space contact AO owns it), so folding
+   * the second packing into this inner loop would cost more than it buys.
+   */
+  const densityTrilinearDense = sharedFn({
+    name: "giOccDensityTriDense",
+    type: "float",
+    inputs: [
+      { name: "q", type: "vec3" },
+      { name: "levelF", type: "float" },
+    ],
+    body: (q, levelF) => {
+      const level = levelF.round().toInt().max(int(1)).min(int(OCC_LEVELS - 1)).toVar();
+      const rx = densityLevelSelect(level, (l) => l.res.x).toVar();
+      const ry = densityLevelSelect(level, (l) => l.res.y).toVar();
+      const rz = densityLevelSelect(level, (l) => l.res.z).toVar();
+      const off = densityLevelSelect(level, (l) => l.offset).toVar();
+      const rxu = rx.toUint().toVar();
+      const ryu = ry.toUint().toVar();
+      const base = uint(densityWordOffset).add(off.toUint()).toVar();
+      const scale = exp2(level.toFloat()).toVar();
+      const c = q.div(scale).sub(0.5).toVar();
+      const b = c.floor().toVar();
+      const f = c.sub(b).toVar();
+      const corner = (dx, dy, dz) => {
+        const v = b.add(vec3(dx, dy, dz)).toVar();
+        const inside = v.x.greaterThanEqual(0).and(v.y.greaterThanEqual(0)).and(v.z.greaterThanEqual(0))
+          .and(v.x.lessThan(rx)).and(v.y.lessThan(ry)).and(v.z.lessThan(rz));
+        const xi = v.x.max(0).min(rx.sub(1)).toUint().toVar();
+        const yi = v.y.max(0).min(ry.sub(1)).toUint().toVar();
+        const zi = v.z.max(0).min(rz.sub(1)).toUint().toVar();
+        const cIdx = zi.mul(ryu).add(yi).mul(rxu).add(xi).toVar();
+        const word = base.add(shiftRight(cIdx, uint(2)));
+        const byte = bitAnd(shiftRight(bits.element(word), shiftLeft(bitAnd(cIdx, uint(3)), uint(3))), uint(255));
+        return select(inside, byte.toFloat().div(255), float(0)).toVar();
+      };
+      const d00 = mix(corner(0, 0, 0), corner(1, 0, 0), f.x).toVar();
+      const d10 = mix(corner(0, 1, 0), corner(1, 1, 0), f.x).toVar();
+      const d01 = mix(corner(0, 0, 1), corner(1, 0, 1), f.x).toVar();
+      const d11 = mix(corner(0, 1, 1), corner(1, 1, 1), f.x).toVar();
+      return mix(mix(d00, d10, f.y), mix(d01, d11, f.y), f.z);
+    },
+  });
+
+  // ═══════════════════════════════════════════════════ SHADER: VXAO cone march
+  /**
+   * VOXEL CONE TRACED AMBIENT OCCLUSION — NVIDIA's VXAO march, on this module's
+   * density pyramid. Returns VISIBILITY 0..1 (1 = fully open).
+   *
+   * DELIBERATELY NOT `traceOccupancyCone` (below). That is a hierarchical DDA
+   * whose accumulator only runs inside cells a BINARY occupancy bit already
+   * proved occupied — the right shape for a shadow ray, where the hierarchy is
+   * how a 96-step march crosses tens of metres. Used as an AO estimator it is
+   * also exactly why the first VXAO arm read BLOCKY: that gate is a step
+   * function on a cell lattice whose cells, at the leaf a 60° cone selects, are
+   * 4-16 voxels — metres — wide. Two neighbouring pixels whose cones straddle a
+   * cell boundary answer very differently, so the lattice prints itself on the
+   * screen, and no filter downstream removes a discontinuity that is IN the
+   * estimator.
+   *
+   * This march has no gate. It is the textbook cone trace:
+   *   · GEOMETRIC STEPS — the step length is the cone's radius at t, so the
+   *     march samples once per footprint and the step count is logarithmic in
+   *     reach (≈5 steps for a 2.4 m radius), not proportional to it.
+   *   · QUADRILINEAR MEDIUM — each sample is a trilinear read of the density
+   *     pyramid at the two levels straddling log2(radius/voxel), mixed by the
+   *     fraction. Continuous in space AND in level: nothing in the result can
+   *     encode either a cell boundary or a level boundary.
+   *   · FRONT-TO-BACK ALPHA — `alpha += (1-alpha)·a`. That is what "cone traced"
+   *     means, and it is the step that turns a fractional medium into soft
+   *     occlusion instead of a verdict.
+   *
+   * THE ONE NON-OBVIOUS CHOICE — the sampled cell is the cone's RADIUS, not its
+   * diameter. A trilinear sample's support is ±1 cell, i.e. TWICE the cell it
+   * names, so the usual lod = log2(diameter/voxel) filters twice as wide as the
+   * cone it is standing in for. On a floor that footprint reaches back down
+   * through the receiver's own surface slab and self-occludes every open
+   * surface — the artifact the previous arm fought with a footprint-scaled hard
+   * receiver-plane exclusion, which is the same device that produced the
+   * light-aligned streaks documented on the shadow cone. At cell = radius the
+   * support matches the cone, and the receiver plane lands exactly outside it:
+   * a cone at 60° elevation with a 60° aperture sits sin60°/tan30° = 1.5 cells
+   * above the plane at EVERY t, which is the first zero of the trilinear
+   * kernel. The self-occlusion is not attenuated, it is absent — so this trace
+   * needs no exclusion that can also eat a real occluder at range.
+   *
+   * `recvP`/`recvN` survive only as a guard for what that geometry does not
+   * cover: a concave receiver whose own neighbouring surface curves up in front
+   * of the cone. It is a fixed sub-voxel band, never a footprint-scaled one.
+   */
+  const aoConeVariants = new Map();
+  /** Sample spacing as a multiple of the cone radius. One sample per footprint. */
+  const AO_STEP_MUL = 1;
+  /**
+   * τ in the volume-fraction → coverage conversion below: how many level-0
+   * voxels of density one opaque occluder is worth to this march. Both factors
+   * are measured, neither is a taste knob.
+   *
+   *   · 2 voxels of SHELL. Conservative voxelization sets every voxel a
+   *     triangle touches, so a thin surface lands two voxels thick.
+   *     scripts/vxao-thickness.mjs histograms the run lengths of set voxels in
+   *     this module's own output: the mode and the median are 2 on all three
+   *     axes (3128 of 4170 x-runs, 15375 of 17202 y, 6120 of 6833 z). The long
+   *     tail is runs ALONG a surface, not through one.
+   *   · ~1.5x for OVERLAP. The march advances one cell per step but a trilinear
+   *     sample's support is ±1 cell, so an extended occluder is composited by
+   *     about one and a half consecutive samples rather than one.
+   *
+   * Their product is what scripts/vxao-bench.mjs independently finds by scoring
+   * this march against brute-force ray-cast AO over the same voxels: across 482
+   * floor points, 3 lands at bias −0.009 / rms 0.049 and stays unbiased over
+   * the whole tonal range, where 1 is −0.31 at the dark end — twice as dark as
+   * the truth wherever there is geometry, which is what let this term swamp the
+   * screen-space contact estimator it is supposed to be composed with.
+   */
+  const AO_OCCLUDER_VOXELS = 3;
+  const traceOccupancyConeAO = (origin, dir, tMin, tMax, opts = {}) => {
+    const steps = Math.max(4, Math.min(24, Math.round(opts.steps ?? 8)));
+    let fn = aoConeVariants.get(steps);
+    if (fn === undefined) {
+      fn = sharedFn({
+        name: `giOccConeAO${steps}`,
+        type: "float",
+        inputs: [
+          { name: "origin", type: "vec3" },
+          { name: "dir", type: "vec3" },
+          { name: "tMin", type: "float" },
+          { name: "tMax", type: "float" },
+          { name: "tanHalf", type: "float" },
+          { name: "recvP", type: "vec3" },
+          { name: "recvN", type: "vec3" },
+        ],
+        body: (o, d, t0, t1, tanH, recvP, recvN) => {
+          const inv = vec3(voxelInv).toVar();
+          const q0 = vec3(o).sub(vec3(gridOrigin)).mul(inv).toVar();
+          const dq = vec3(d).mul(inv).toVar();
+          const voxMinW = vec3(voxel).x.min(vec3(voxel).y).min(vec3(voxel).z).toVar();
+          // The medium's finest cell: level 1. `densityTrilinearDense` does not
+          // read level 0, and the cone has no business below this scale anyway.
+          const finest = voxMinW.mul(2).toVar();
+          const reach = float(t1).max(finest).toVar();
+          const t = float(t0).max(finest.mul(0.5)).toVar();
+          const alpha = float(0).toVar();
+
+          Loop({ start: 0, end: steps, name: "aoCone" }, () => {
+            If(t.greaterThanEqual(reach).or(alpha.greaterThanEqual(0.995)), () => {
+              Break();
+            });
+            // Cell = cone RADIUS (see the header), floored at the medium.
+            const cell = tanH.mul(t).max(finest).toVar();
+            const stepLen = cell.mul(AO_STEP_MUL).toVar();
+            const tm = t.add(stepLen.mul(0.5)).toVar();
+            const qm = q0.add(dq.mul(tm)).toVar();
+            If(
+              qm.x.lessThan(0).or(qm.y.lessThan(0)).or(qm.z.lessThan(0))
+                .or(qm.x.greaterThanEqual(level0.res.x))
+                .or(qm.y.greaterThanEqual(level0.res.y))
+                .or(qm.z.greaterThanEqual(level0.res.z)),
+              () => {
+                // Left the volume. Nothing beyond it can occlude.
+                Break();
+              },
+            );
+            const lod = log2(cell.div(voxMinW)).clamp(1, OCC_LEVELS - 1).toVar();
+            const lf = lod.floor().toVar();
+            const dens = mix(
+              densityTrilinearDense(qm, lf),
+              densityTrilinearDense(qm, lf.add(1)),
+              lod.sub(lf),
+            ).toVar();
+            // CONCAVE-RECEIVER GUARD — a fixed sub-voxel band, not a scaled one.
+            const pw = qm.mul(vec3(voxel)).add(vec3(gridOrigin)).toVar();
+            const above = smoothstep(
+              voxMinW.mul(-0.25), voxMinW.mul(0.75), recvN.dot(pw.sub(recvP)),
+            ).toVar();
+            // VOLUME FRACTION → PROJECTED COVERAGE. The pyramid stores what
+            // fraction of a cell's VOLUME is filled; a cone wants what fraction
+            // of its CROSS-SECTION is blocked. A surface τ voxels thick
+            // spanning a cell of c voxels fills τ/c of that volume and blocks
+            // all of it, so coverage = dens·c/τ. Because a parent's density is
+            // the MEAN of its eight children while c doubles, the product is
+            // invariant across levels — a cone crossing a level boundary sees
+            // no step in brightness. It is also the term the shadow cone
+            // approximates with its `boost` constant, and the difference
+            // between a ceiling that blocks the cone beneath it (the truth) and
+            // one that blocks 40% of it, which is what the raw fraction claims
+            // and what makes textbook voxel cone AO look washed out.
+            //
+            // The width is the SAMPLED cell's, not the cone's: once `lod`
+            // saturates at the top level the sample stops growing with the
+            // cone, and charging it the cone's width over-blocks at long reach.
+            const coverage = dens.mul(above).mul(exp2(lod).mul(1 / AO_OCCLUDER_VOXELS)).clamp(0, 1).toVar();
+            const a = coverage.mul(AO_STEP_MUL).clamp(0, 1).toVar();
+            // RANGE WINDOW — obscurance, not shadowing: this term answers "how
+            // enclosed is this point", so it has a horizon, and fading to zero
+            // AT the reach rather than truncating there is what stops an
+            // occluder popping a shadow on as it enters the radius.
+            //
+            // Where the fade STARTS is the one number here the bench does not
+            // pin down: over 0.2R..0.95R the error against ray-cast truth only
+            // moves between rms 0.043 and 0.059. 0.4R is picked from inside
+            // that flat region because it keeps full weight across the near
+            // half of the radius, which is where the off-screen-occluder
+            // capability lives — an earlier fade scores no better and quietly
+            // shortens the reach the pass exists to have.
+            const w = float(1).sub(smoothstep(reach.mul(0.4), reach, tm)).toVar();
+            alpha.assign(alpha.add(alpha.oneMinus().mul(a).mul(w)));
+            t.addAssign(stepLen);
+          });
+
+          return alpha.oneMinus().clamp(0, 1);
+        },
+      });
+      aoConeVariants.set(steps, fn);
+    }
+    return fn(
+      vec3(origin), vec3(dir), float(tMin), float(tMax), float(opts.tanHalf ?? 0.5774),
+      vec3(opts.receiverP ?? origin), vec3(opts.receiverN ?? vec3(0, 0, 0)),
+    );
+  };
+
   // ══════════════════════════════════════════════════ SHADER: cone-DDA trace
   /**
    * SOFT SHADOW CONE MARCH — area-light visibility computed IN the trace, not
@@ -5112,6 +5346,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
 
     traceOccupancy,
     traceOccupancyCone,
+    traceOccupancyConeAO,
     traceHybridBrick,
     traceHybridPlane,
     coverageInBox,

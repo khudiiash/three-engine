@@ -47,6 +47,12 @@ const normalise = (item) => ({
   license: item.license?.label ?? "License not specified",
   licenseUrl: item.license?.url ?? null,
   thumbnailUrl: thumbnail(item),
+  // Sketchfab's own viewer, embeddable and anonymous — the answer to "what am
+  // I about to import" for a catalogue whose geometry needs a token AND a
+  // multi-megabyte zip before anything can be rendered locally. The API hands
+  // it to us on the search result, so a preview costs no extra request.
+  // Verified: the embed page sets no X-Frame-Options and no frame-ancestors.
+  embedUrl: item.embedUrl ?? `https://sketchfab.com/models/${item.uid}/embed`,
   categories: (item.categories ?? []).map((category) => category.name).filter(Boolean),
   tags: (item.tags ?? []).map((tag) => tag.name).filter(Boolean),
   views: item.viewCount ?? 0,

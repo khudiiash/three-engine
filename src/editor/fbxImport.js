@@ -5,6 +5,8 @@ import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 import {
   extOf,
   invalidateBlobUrl,
+  lfsPointerMessage,
+  lfsPointerSize,
   TEXTURE_EXTENSIONS,
   toBlobUrl,
 } from "./assetLoader.js";
@@ -45,6 +47,13 @@ async function inspectFbx(path) {
   ]);
   const head = asArrayBuffer(headValue);
   const text = new TextDecoder().decode(head);
+
+  // Check this before the FBX header: a pointer file fails every header test,
+  // and "no FBX header found" describes the bytes on disk without explaining
+  // why they are the wrong bytes.
+  const pointerSize = lfsPointerSize(head);
+  if (pointerSize != null) throw new Error(lfsPointerMessage(basename(path), pointerSize));
+
   const binary = text.startsWith("Kaydara FBX Binary  \0");
   const version = binary
     ? new DataView(head).getUint32(23, true)

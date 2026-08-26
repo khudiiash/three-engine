@@ -730,6 +730,34 @@ export function availableResolutions(downloads) {
   return Object.keys(downloads).sort((a, b) => order.indexOf(a) - order.indexOf(b));
 }
 
+/**
+ * The cheapest 3D-model archive on offer, for the interactive preview.
+ *
+ * ambientCG's 3D assets have no preview mesh and no per-file URLs — the ZIP is
+ * the only way to see the geometry, so a preview costs a real download. That
+ * makes picking the smallest variant the whole point: `LQ-1K-JPG` is a low-poly
+ * decimation with 1k maps, typically a couple of megabytes against tens for the
+ * HQ-4K the download button defaults near.
+ *
+ * Returns null when the asset ships no low variant, which the caller should
+ * read as "show the still instead" rather than as an error.
+ */
+export const PREVIEW_MODEL_RES = ["LQ-1K-JPG", "LQ-1K-PNG", "SQ-1K-JPG", "LQ-2K-JPG", "SQ-2K-JPG"];
+
+export function modelPreviewUrl(files) {
+  const downloads = files?.downloads;
+  if (!downloads) return null;
+  for (const res of PREVIEW_MODEL_RES) {
+    if (downloads[res]?.url) return downloads[res].url;
+  }
+  return availableResolutions(downloads).map((res) => downloads[res]?.url).find(Boolean) ?? null;
+}
+
+/** Raw archive bytes for a preview. No writes, no project involvement. */
+export async function fetchArchiveBytes(url) {
+  return new Uint8Array(await proxyBytes(url));
+}
+
 /** Picks `res` from an availability map, else the nearest available. */
 export function pickResolution(downloads, res) {
   if (!downloads) return null;

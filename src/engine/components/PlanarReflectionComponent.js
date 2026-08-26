@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import { clamp, float, normalView, positionViewDirection, pow, reflector, vec3 } from "three/tsl";
 import { Component } from "./Component.js";
+import { subscribeMaterial } from "../materialAsset.js";
 
 /**
  * True mirror reflections for a FLAT surface — a polished floor, a still pool,
@@ -75,6 +76,77 @@ export class PlanarReflectionComponent extends Component {
 
     const root = this.entity?.object3D;
     if (!root) return;
+    // ── WAIT FOR A LIVE RENDERER (2026-08-22, "boots black" round 2) ──────
+    // On scene load the attach chain (including the material self-heal below)
+    // can run BEFORE the WebGPU renderer exists — measured on the user's
+    // Level: heal re-attach at t=13.8s, "Renderer backend: WebGPU" at
+    // t=14.7s. A reflector node created against no renderer never renders
+    // its mirrored pass, and nothing later re-creates it — the mirror is
+    // stably black until a manual remove+add (which works precisely because
+    // a live add has a renderer). Defer the whole attach until the engine
+    // has one; the material self-heal then subscribes against the current
+    // (post-load) instances anyway.
+    if (!this.entity?.engine?.renderer) {
+      if (this._rendererWait == null) {
+        const tick = () => {
+          this._rendererWait = null;
+          if (!this.entity) return; // detached while waiting
+          if (this.entity.engine?.renderer) { this.onAttach(); return; }
+          this._rendererWait = requestAnimationFrame(tick);
+        };
+        this._rendererWait = requestAnimationFrame(tick);
+      }
+      return;
+    }
+    // ── RE-ARM AFTER EVERY GI COMPILE WAVE (2026-08-22, "boots black") ────
+    // The reflector's mirrored pass creates its render pipelines the first
+    // time it runs — and on scene load that happens while GISystem's compile
+    // wave has the postprocess MRT pinned across a multi-second await, which
+    // makes them the invalid-pipeline class: cached, no console error, and
+    // the mirror is black forever. (Measured on the user's Level: mirror
+    // black on every load; a manual remove+add — which recreates the
+    // reflector AFTER the wave — always fixed it.) GISystem emits
+    // `gi-compile-wave-done` at the wave's commit point; recreating the
+    // reflector then costs one target realloc and compiles clean. Capped in
+    // case some future wave is triggered by the re-attach itself.
+    const engine = this.entity.engine;
+    if (engine?.on && !this._waveUnsub) {
+      const onWaveDone = () => {
+        if (this._healQueued || !this.entity) return;
+        if ((this._waveReattaches = (this._waveReattaches ?? 0) + 1) > 8) return;
+        this._healQueued = true;
+        queueMicrotask(() => {
+          this._healQueued = false;
+          if (!this.entity) return;
+          this.onDetach();
+          this.onAttach();
+        });
+      };
+      engine.on("gi-compile-wave-done", onWaveDone);
+      this._waveUnsub = () => engine.off?.("gi-compile-wave-done", onWaveDone);
+    }
+    // ── SELF-HEAL (2026-08-22) ────────────────────────────────────────────
+    // The composite below lives on MATERIAL INSTANCES, and the mesh component
+    // swaps those out from under us: the async .mat load on scene open runs
+    // AFTER this attach (the symptom was a mirror that worked when added live
+    // and booted BLACK on every scene load — the composite sat on the
+    // placeholder material), and every material edit (material_set, inspector,
+    // graph change) rebuilds the instance the same way. `subscribeMaterial`
+    // fires on exactly those events; the microtask defer lets the mesh
+    // component's own subscriber swap `mesh.material` first, so the re-attach
+    // captures the CURRENT instance instead of racing it in Set order.
+    this._materialUnsubs = [...this.#materialPaths()].map((path) =>
+      subscribeMaterial(path, () => {
+        if (this._healQueued) return;
+        this._healQueued = true;
+        queueMicrotask(() => {
+          this._healQueued = false;
+          if (!this.entity) return; // detached while queued
+          this.onDetach();
+          this.onAttach();
+        });
+      }),
+    );
     const meshes = [];
     root.traverse((object) => {
       if (object.isMesh && !object.userData.editorOnly) meshes.push(object);
@@ -107,6 +179,26 @@ export class PlanarReflectionComponent extends Component {
       bounces: props.bounces === true,
     });
     this._node = node;
+    // ── TELL GI THIS IS A NESTED RENDER (2026-08-22) ──────────────────────
+    // GI's deferred screen textures are keyed to the MAIN camera; giLight
+    // samples them by a resolve-camera projection so the mirrored pass reads
+    // each point's own GI — but points the main view cannot see have no
+    // correct GI anywhere, and giLight zeroes them ONLY when it knows it is
+    // inside a nested render. The reflector's whole mirrored pass runs
+    // inside `updateBefore`, so bracketing it flips the flag GISystem's
+    // renderGroup uniform re-reads per render.
+    const base = node._reflectorBaseNode ?? node;
+    if (typeof base?.updateBefore === "function") {
+      const original = base.updateBefore.bind(base);
+      base.updateBefore = (frame) => {
+        globalThis.__giNestedRender = true;
+        try {
+          return original(frame);
+        } finally {
+          globalThis.__giNestedRender = false;
+        }
+      };
+    }
 
     const tint = new THREE.Color(props.tint ?? "#ffffff");
     const intensity = Math.max(0, props.intensity ?? 1);
@@ -159,7 +251,37 @@ export class PlanarReflectionComponent extends Component {
     material.needsUpdate = true;
   }
 
+  /**
+   * Material asset paths of every mesh component on this entity and its
+   * children — the set the self-heal subscribes to. Reads component PROPS
+   * (the paths), not mesh.material (the instances), because the instances
+   * are exactly what the heal exists to chase.
+   */
+  #materialPaths() {
+    const paths = new Set();
+    const walk = (entity) => {
+      if (!entity) return;
+      const meshComp = entity.getComponent?.("mesh");
+      if (meshComp?.props) {
+        for (const key of ["material", "material2", "material3", "material4", "material5", "material6", "material7", "material8"]) {
+          if (meshComp.props[key]) paths.add(meshComp.props[key]);
+        }
+      }
+      for (const child of entity.children ?? []) walk(child);
+    };
+    walk(this.entity);
+    return paths;
+  }
+
   onDetach() {
+    if (this._rendererWait != null) {
+      cancelAnimationFrame(this._rendererWait);
+      this._rendererWait = null;
+    }
+    this._waveUnsub?.();
+    this._waveUnsub = null;
+    for (const unsubscribe of this._materialUnsubs ?? []) unsubscribe();
+    this._materialUnsubs = [];
     for (const entry of this._restore ?? []) {
       entry.material.emissiveNode = entry.emissiveNode;
       if (entry.planarFlag === undefined) delete entry.material.userData.planarReflection;

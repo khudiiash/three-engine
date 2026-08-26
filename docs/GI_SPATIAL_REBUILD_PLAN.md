@@ -1,8 +1,1157 @@
+# ⚠ SUPERSEDED FOR "WHAT NEXT" — READ `docs/GI_SCALE_PLAN.md` (§19, 2026-08-26)
+
+The §19 scale plan replaces every "next unit" list below with a staged
+restructure (window clipmap + bit-DDA + screen probes + fixed budgets). This
+file stays as the history and the receipts for §1-18.
+
 # GI: emitter delivery fix + world-anchored spatial rebuild
 
 ---
 
 ## ▶ NEXT SESSION STARTS HERE
+
+# ══ §18.16 — THE CPU IS DRAW SUBMISSION, NOT GEOMETRY (2026-08-25) ══
+
+## ⭐⭐ THE CONTROLLED EXPERIMENT THAT SETTLES "IT MUST BE THE TRIANGLES"
+
+Merging deletes NO triangles — it submits the same ones in fewer draws. That
+makes it a clean control, and it was already in hand:
+
+| step | draws | triangles | CPU |
+|---|---|---|---|
+| baseline | 1153 | 7.27 M | 44.5 ms |
+| + `shadowMerging` | 672 | **7.30 M (+0.5%)** | **33.9 ms** |
+| + non-caster merge | 527 | 5.86 M | 29.3 ms |
+| later boot | 466 | 6.01 M | 28.7 ms |
+
+**Triangles rose 0.5% while CPU fell 24%.** Per-draw cost measured
+**~35-45 µs regardless of triangle density** (shadow pass 1.13 M tris in 49
+draws; main pass 2.02 M tris in 299). Of 17.4 ms GPU, **~15.6 ms is GI compute**
+— leaving ~2 ms for all 6 M triangles. ⛔ **VIRTUAL GEOMETRY IS THE WRONG AXIS**
+and structurally conflicts with both merge systems (they bake world-space
+vertices; VG swaps geometry in place). ⛔ **OCCLUSION CULLING IS A NET LOSS
+HERE**: 570 occluder draws to cull 74 of 1040 (7%), CPU 33.9 → 38.3 ms. Full
+ledger: memory `bistro-cpu-is-draws-not-triangles`.
+
+## ✅ G1 SHIPPED — THE GI G-BUFFER DRAWS THE DEPTH PROXIES
+
+`renderGiGBuffer` was the frame's second full scene submission: **317 draws /
+10.96 ms**, `floorIfMerged` 9. `shadowMerge.js` had already merged that same
+geometry on the same "what does a depth pass read" key, so the prepass now draws
+ITS proxies instead of their members. Proxies gained a world-space `normal`
+(`mergeGeometries` applies the normal matrix) and advertise eligibility with a
+new additive **`GI_DEPTH_LAYER` (bit 20)**, set only when the built geometry
+really kept normals. `#collectCasters` now also takes NON-casters (`casts` is in
+the depth key, so each proxy is homogeneous and inherits the right
+`castShadow`) — on Bistro they were most of the draws that survived the first
+cut. **Result: prepass 10.96 → 5.5 ms, draws 1153 → 466-527, CPU 44.5 → 28.7 ms.**
+
+⚠ **THE SUBSTITUTION IS ALL-OR-NOTHING PER GROUP.** Draw a proxy while any
+member is independently hidden and that member's triangles reappear as geometry
+nothing on screen has; hide members without drawing the proxy and the street
+vanishes from GI. Both silent. Sharp/medium-tier groups are skipped WHOLESALE
+and checked **per frame** — `GI_SHARP_LAYER` is written when an async roughness
+floor lands, so a build-time answer is the blind-census bug again. Receipt:
+`profile.frameStats.shadows.gbufferSwap` = `{groups, used, unsafe, parkedSharp,
+parkedHidden, hidden}`. Gates: `test:shadow-merge` 26 checks, `test:merging`,
+`test:shadow-freeze`; every new guard fail-verified.
+
+⚠ **A FIXTURE BUG FOUND ON THE WAY**: `run-shadow-merge-test.mjs`' `step()` set
+`_dirtiedAt = 0` to "skip the settle debounce", but Node's `performance.now()`
+counts from PROCESS START — early in a run `now - 0` is UNDER `SETTLE_MS`, so
+"0" ARMED the debounce instead of skipping it. Every REBUILD was silently
+skipped (the first build passes because `groups.length === 0` bypasses the
+guard), and the suite passed or failed on how long earlier tests took. Now
+`-Infinity`. Same trap the merging tests already carry a banner for.
+
+## ⛔ RENDER BUNDLES: SHIPPED OPT-IN, MEASURED NET ZERO — AND WHY
+
+`performance.renderBundles` parents merge proxies into a three `BundleGroup`.
+Within ONE boot, identical 556 draws: renderEncode 16.32 → 15.33, but
+gbufferPrepass 8.37 → 9.25; **total CPU 33.03 both ways.**
+
+**ROOT CAUSE, AND IT IS OURS:** `NodeMaterialObserver.needsRefresh()` returns
+`true` on `hasNode` BEFORE it ever reaches the `isBundle` / `isStatic` fast
+path, and `containsNode()` is true if ANY material property is a node. GI's
+`#markObservedMaterial` sets `material.giMonitorNode = float(0)` **precisely to
+force that** — and GISystem's resize path depends on it ("every observed
+material has hasNode = true, so its bindings refresh per frame") to re-point
+persistent nodes at new targets without a shader rebuild. So the bundle skips
+only the GPU encode; three still runs `updateBefore` → `geometries/nodes/
+bindings.updateForRender` → `updateAfter` per object per frame. **This also
+means `object.static` can never help any GI scene.**
+
+▶ **NEXT UNIT: make that refresh EVENT-DRIVEN** (on GI resize/rebuild) instead
+of per-frame. It unblocks render bundles AND `static`, and it is the same wall
+as the ~21% of JS time in material cache-key hashing ([[camera-motion-perf]]).
+
+⚠⚠ **A BUNDLE IGNORES THE LAYER MASK.** `_projectObject` handles
+`isBundleGroup` OUTSIDE its `layers.test(camera.layers)` branch, and bundles key
+on `(group, camera, renderContext)` — the g-buffer's pass 1 and its mirror-mask
+pass 2 share all three, so a pass-1 bundle would replay into pass 2 and stamp
+every proxy into `giNormal.w = 1`: the four-times-reverted masked-mode failure
+by a new road. `visible` is the ONLY gate checked before the bundle branch, and
+is what `renderGiGBuffer` uses to hold bundles out of pass 2.
+
+## ▶ THE NEXT UNIT, SPECCED — AND THE TWO FACTS THAT SHAPE IT
+
+**FACT 1: `hasNode` SHORT-CIRCUITS BEFORE `object.static`.** `needsRefresh()`
+tests `hasNode` first and only reaches `renderObject.object.static` if it is
+false. The observer is built from **whichever material actually renders the
+object**, so the same mesh can be blocked in one pass and free in another:
+
+| pass | material the observer sees | `hasNode` | is `static` reachable? |
+|---|---|---|---|
+| main colour | the mesh's own (GI-marked; uber adds colorNode/normalNode/…) | **true** | no |
+| ShadowMap | three's depth override | **false** | **YES** |
+| GI g-buffer | `gbuffer.material` (MeshBasicNodeMaterial, `lights = false`) | **false** | **YES** |
+
+⇒ **SAFE GROUND, NO GI CHANGES NEEDED:** marking a genuinely unmoving mesh
+`static = true` costs nothing in the main pass (short-circuited) and skips
+`updateBefore` → `geometries/nodes/bindings.updateForRender` → `updateAfter` in
+the two override passes — which is ~400 of the frame's draws. Neither override
+binds anything GI re-points, so there is no stale-binding exposure at all.
+✅ Already done for the depth proxies (`proxy.static = true`, gated by
+`test:shadow-merge`; too small a population — 69 of ~693 draws — to measure).
+▶ **TO EXTEND IT to the ~165 unmerged entity meshes in the g-buffer, they need a
+MOTION WATCHER first**: `static` skips the binding update, so a mesh that moves
+afterwards draws at a STALE TRANSFORM (wrong GI lighting, wrong shadow) — a
+silent bug. `shadowMerge#watchForMotion` covers only absorbed members; this
+needs its own, on the same round-robin amortisation. That is the unit.
+
+**FACT 2: THE PER-FRAME REFRESH IS NOT WHAT MAKES A GI TARGET SWAP LAND — THE
+TEXTURE VERSION IS.** `createGiTargets`' own banner says it: three invalidates a
+cached bind group only when `binding.generation !== textureData.generation`, and
+`textureData.generation` IS `texture.version`; a fresh texture is version 0, so
+GI forces `++targetGeneration` per generation or the swap is invisible and the
+next submit dies with "Destroyed texture used in a submit".
+
+⇒ The generation check lives INSIDE `bindings.updateForRender`, which is what
+`needsRefresh: false` skips. So dropping `giMonitorNode` does not need targets to
+become stable — it needs **ONE guaranteed refresh per render object after a
+re-point**. `equals()` cannot supply it (it monitors the world matrix and the
+material's own uniforms, never node texture values), and `static = false` alone
+cannot either. The candidate hammer is `material.needsUpdate = true` on the
+observed set at re-point time, which rebuilds the node-builder state and trips
+`firstInitialization` — and may be CHEAP rather than a compile wave, because
+`NodeManager.nodeBuilderCache` is keyed on the material cache key and the key
+does not change. **PRICE THAT BEFORE BUILDING ON IT.**
+
+⛔ Do NOT start with an in-place `setSize` refactor of the ~20 targets. It was
+the first plan and Fact 2 retires it: the rebind path is already solved, and
+that refactor would touch the exact code with the documented dead-binding and
+black-field scars for no additional benefit.
+
+## ⚠ TWO THINGS LEFT OPEN, NEITHER CAUSED BY THE ABOVE
+
+1. **"Cast shadows disappeared."** Reproduces with `shadowMerging` OFF, and
+   survives reverting the WHOLE GI module in stages (`GISystem`, `giScreen`,
+   `giLight`, `lightTree`, `reflectionProbeCapture`). The shadow map renders
+   correctly in every arm — **49 draws / 1,126,001 triangles**. But the
+   HEAD-`GISystem` arm renders DARK and high-contrast, like the last known-good
+   frame. ⇒ Best hypothesis: **not a shadow-map failure but indirect light
+   grown bright enough to fill the shadows in** — which is exactly what the
+   uncommitted `giLight.js` work targets ("shadowed walls went near-black").
+   NOT PROVEN; settle it with `__giColourProbe`'s `irradiance` in both arms.
+   ⚠ `shadows: false` is NOT a valid A/B: it only stops the map UPDATING, it
+   does not remove the compiled shadow branch. Exposure IS a valid instrument
+   check (0.3 visibly darkens), and `environment.intensity = 0` barely changes
+   the image — GI owns the indirect here.
+2. **`shadowMerging` costs the shadow pass 1.67 M triangles** (2.80 M → 1.13 M).
+   The draw collapse is the point; the triangle loss is not, and it predates
+   this session's work.
+
+# ══ §18.15 — THE GREEN REFLECTIONS, LOCALISED TO ONE TERM (2026-08-25) ══
+
+## ⭐⭐ THE FINDING, AS A MEASUREMENT
+
+`npm run probe:gi-green` (scripts/run-gi-green-terms.mjs) drives a new **term
+mask** — a vec4 uniform inside `createGiBvhHitShade`, one scalar per term of the
+reflected radiance — and reads the §18.13 colour probe back once per arm. The
+reflected radiance is a SUM of four independently-sourced terms and
+`bvhRadiance` only ever shows the sum, which is why FIVE code-reading theories
+about this cast have now been wrong. Bistro, ultra, settled:
+
+| arm (mask) | rgb | green | lum |
+|---|---|---|---|
+| all — shipped (1,1,1,1) | 6.1 / 9.4 / 6.3 | **×1.52** | 8.5 |
+| gather only — the field (1,0,0,0) | 3.1 / 3.2 / 3.3 | ×0.99 | 3.2 |
+| probe atlas only (0,1,0,0) | 0.0 / 0.0 / 0.0 | — | 0.0 |
+| **emitter direct only (0,0,1,0)** | 1.7 / **4.9** / 1.6 | **×2.99** | 4.0 |
+| analytic/sun only (0,0,0,1) | 1.4 / 1.4 / 1.3 | ×1.02 | 1.4 |
+| all **minus emitter** (1,1,0,1) | 4.5 / 4.5 / 4.6 | **×1.00** | 4.5 |
+
+**Removing one term takes the cast from ×1.52 to exactly ×1.00.** Two things to
+read off it: the emitter term is a near-pure green wash, and it carries MORE
+LUMINANCE THAN THE SUN (4.0 vs 1.4) in a daylit street — so it is not only the
+wrong colour, it is the wrong magnitude. Note also that the probe atlas
+contributes ZERO here: §18.12's chroma-import fix was real, but on this scene
+that term is inert, which retires it as a suspect.
+
+⚠ The aggregate the harness prints alongside kills the "it is just the scene's
+green neon" answer for good: **116 emitters, power-weighted chroma ×1.42, with
+17 strongly-green emitters carrying 21% of emitted power** — and the FIELD,
+which delivers all 116 through the light tree, reads ×0.99. The same scene's
+emitters are neutral when delivered properly.
+
+## ⭐⭐ THE CAUSE — TWO DESCRIPTIONS OF THE SAME LAMPS
+
+- the resolve (`giScreen.js:647`) and the emitter shadow pass
+  (`giScreen.js:1701`) load emitters from **LIGHT TREE RECORDS** — split into
+  connected pieces by `splitSparseEmitter` and fill-damped by
+  `emitterFromMesh`;
+- the exact-reflection hit shading uses the **GLOBAL ANALYTIC SEATS** instead,
+  deliberately and by comment ("a hit is a different world point — its tile is
+  not this pixel's"), and a seat was the RAW material emissive on a shape
+  fitted to the WHOLE MESH (`#buildEntries` → `#refreshEmitterSlots`, whose OBB
+  fallback is `geometry.boundingBox`).
+
+**THE SEAT DUMP IS THE PICTURE** (`profile.frameStats.giEmitterSeats`, Bistro):
+
+```
+slot 0: rgb 0.00/0.00/0.00   r 20.94m at -6.7,6.0,-16.9
+slot 1: rgb 0.00/0.00/0.00   r 20.88m at -6.6,6.0,-16.9
+slot 2: rgb 0.00/0.02/0.00   r  3.87m at -6.4,4.3, -7.8     ← pure green
+slot 3: rgb 0.00/0.02/0.00   r  3.87m at -4.7,4.0, 3.9      ← pure green
+```
+
+Every reflection in the scene was lit by **two 21-metre emitters and two
+3.9-metre ones, half of them pure green** — the whole-mesh bounding spheres of
+string-light meshes, not lamps. (The rgb column above is already damped by the
+fix; undamped, slots 2 and 3 are radiance 10 green.) Nothing logged this before,
+which is why five theories could each sound right.
+
+§13.7g already measured what that costs and the log says it out loud: a glTF
+puts a whole string of party bulbs in ONE mesh, both irradiance models scale
+with the fitted shape's projected area, and **Bistro's string lights measured
+fill 0.0035 — ~285× too much light**. The tree was fixed in §13.7g/h. The
+analytic seats never were, and the reflection hit shading is their biggest
+consumer. The chroma follows the energy because the sparsest emitters in this
+scene are the saturated ones.
+
+## THE FIX
+
+`#refreshEmitterSlots` damps each seat's colour by its mesh's **pre-split**
+fill, which `collectEmitters` now hands back as `out.meshFits` (the post-split
+list cannot answer the question — every piece reads fill ≈ 1 by construction).
+Total power is preserved exactly: `π·crossSection·(L·area/crossSection) =
+π·area·L`, the same identity the tree's own damping rests on. A seat cannot BE
+several pieces, so damping is its whole correction — and it is the same
+correction from the same fit, not a new model.
+
+Receipts: `[gi] emitter seats: N of 4 damped …` names slot and fill;
+`__giEmitterSeatFill = false` reverts; `profile.frameStats.giEmitterSeats`
+reports each seat's rgb, green ratio and radius live. Bistro's line reads
+**`slot:fill 0:1.8e-4, 1:6.0e-5, 2:1.9e-3, 3:1.7e-3` — 526× to 16,700× too
+bright**, all four of them.
+
+### ⭐ THE FIX, MEASURED ON THE SAME RIG
+
+| arm | rgb | green | lum | before |
+|---|---|---|---|---|
+| all (shipped) | 5.1/5.1/5.2 | **×1.00** | 5.1 | ×1.52, lum 8.5 |
+| gather only | 3.4/3.5/3.7 | ×0.99 | 3.5 | 3.2 |
+| **emitter only** | **0.0/0.0/0.0** | — | **0.0** | ×2.99, lum 4.0 |
+| sun only | 1.4/1.4/1.3 | ×1.02 | 1.4 | 1.4 — UNCHANGED |
+
+The controls are what make this a result rather than a coincidence: the sun term
+is identical before and after, the field is within run spread, and the ONE term
+that moved is the one the mask identified. Gates: `test:gi-hit-shade`,
+`test:gi-emitter-power` (16), `test:gi-emitter-split`, `test:gi-emitter-shapes`
+(855) all green.
+
+⚠ **THE EMITTER TERM AT HITS IS NOW EXACTLY ZERO, NOT MERELY SMALLER.** Damped
+by 5000–16,000×, these seats fall under `emitterCutoff`'s fade and are zeroed
+outright. Two reasons that is acceptable and one reason it is temporary: the
+fill damping is exact in the FAR field by construction (`emitterFromMesh` says
+so) and these shapes are 21 m across, so the near field it under-serves is
+inside the fitted volume; emissive light still reaches reflections through the
+gather, since the light tree's NEE carries all 116 emitters. But a NIGHT scene
+would want that direct term back, and it should come from a per-hit tree
+sample, not from a bigger constant.
+
+ALSO FIXED, same class: `reflectionProbeCapture.js` was still on
+`maxTraceDistance: 4` after §18.14 raised its documented twin to 16 — "one
+formula, two consumers" with two different occlusion horizons.
+
+▶ **DEBT**: both march caps are still constants in METRES; they want a fraction
+of the GI volume extent, which GISystem knows and neither kernel does.
+
+▶ **THE REAL FIX IS STILL AHEAD.** Damping makes the four seats deliver their
+TRUE share, which is small — so reflections now get much less emitter direct
+than they did, and the diffuse field loses the analytic copy it was
+double-counting alongside the tree's NEE. Correct, but the reflection hit path
+still lights a 116-emitter scene from four seats chosen by scene-wide power.
+The right answer is a per-hit light-tree sample (the tile cut cannot serve an
+off-screen point, which is why the seats were used at all).
+
+## ⛔⛔ FOUR MORE BLIND-INSTRUMENT TRAPS, SAME DAY
+
+1. **The rig measured the wrong scene.** Bistro is saved with
+   `global-illumination.reflections: false`; a plain boot has no exact chain, so
+   the rig read the diffuse frame while reporting on reflections. Now forced ON
+   at scene READ by a shim `load_scene` override — nothing is written back.
+2. **Flipping the prop LIVE is a different experiment.** It rebuilds the GI
+   mid-session, and the run that did it read `bvhRadiance` as uniformly BLACK on
+   every arm — a second compile wave was still landing while the arms sampled.
+   The verdict block cheerfully named "gather only" the greenest term. **The rig
+   now refuses to report when the shipped image is black**, with its own retry.
+3. **Editing anything under `src/` while a puppeteer harness runs invalidates
+   the run** — vite HMR reloads the page mid-measurement.
+4. **`Engine.init` → "reading 'backend'" on a null renderer** hit 4 of 8 boots,
+   on the SCENE LOAD as often as the first boot: no WebGPU device, most likely
+   GPU pressure from the user's own editor (9 GB heap) on the same card. The
+   retry has to wrap the load, not just the hub click.
+
+# ══ §18.13/14 — THE COLOUR PROBE, AND FOUR BLIND INSTRUMENTS (2026-08-25) ══
+
+## ⛔⛔ THE LESSON OF THE DAY, BEFORE THE FINDINGS
+
+**Three theories about "all reflections are greenish" were wrong in a row**, each
+plausible from reading the code, none surviving the user's screen:
+1. the scene's own green neon (a subagent panel's high-confidence answer);
+2. the §18.7 emitter cull removing warm balance;
+3. the probe-atlas chroma import at giScreen.js:849.
+
+(2) and (3) were real defects worth fixing on their own merits — they were not
+THIS bug. **The pattern is reasoning where measuring was possible.**
+
+**FOUR instruments reported confidently about subjects they could not see, in
+one day:**
+
+| instrument | how it lied |
+|---|---|
+| `_tierTally` census | counted at BUILD time, before the async GPU roughness floors landed — "0 sharp" on a scene of mirrors |
+| `hitHistWeightAtMotion` | PEAK-HELD its best case, so it could only ever report good news |
+| `_bvhHitShadeHeldFrames` | counted a DECISION, not a DISPATCH — wrote "0, healthy" on frames the idle list had already dropped the pass |
+| `__giColourProbe` (mine) | sampled at tick 31, before the reflection chain had dispatched — reported `rgb 0.0/0.0/0.0` for empty textures and called them black |
+
+The fourth is the sharpest: **I had already fixed exactly this `settled`-and-reset
+discipline on the mask-coverage probe hours earlier and did not carry it over.**
+
+⭐ **RULE: when a receipt says "fine" and the user says "broken", suspect the
+receipt first. And gate every probe on its subject EXISTING, resetting the
+counter whenever it does not.**
+
+## ⭐⭐ THE COLOUR PROBE (`__giColourProbe`) — THE ONE THAT WORKED
+
+Reads back each stage of the reflection chain and reports mean RGB plus a green
+ratio `g/((r+b)/2)`. Exposed as `profile.frameStats.giColourProbe`. Bistro, ultra,
+settled (90 frames after the chain was live):
+
+| stage | rgb | green |
+|---|---|---|
+| `bvhColor` — raw hit albedo | 170.5 / 170.5 / 170.5 | **×1.00** |
+| `bvhRadiance` — shaded hit | 67.1 / 101.1 / 73.5 | **×1.44** |
+| `irradiance` — diffuse field | 182.2 / 191.5 / 208.3 | **×0.98** |
+
+**Albedo in is neutral. The diffuse field is neutral. The green is MANUFACTURED
+BY THE HIT SHADING.** One reading localised what three sessions of theory could
+not. This is the template for any future "wrong colour" report.
+
+## §18.14 — THE 4 m EMITTER MARCH CAP AT REFLECTION HITS
+
+`createGiBvhHitShade` passes `maxTraceDistance: 4` to the emitter shadow march,
+and its own header calls that "a soft, bounded leak, reflections only": an
+occluder further than 4 m from the hit point STOPS OCCLUDING. Bistro is a ~47 m
+street, so every reflected surface across the road took the green shopfront neon
+**unshadowed** — the whole cast, from one term.
+
+⭐ **RAISING IT IS NEARLY FREE**, which is why it beats damping the emitter:
+`shadowTraceFn(..., maxT, float(32), ...)` is a FIXED 32 steps, so `maxT` sets
+step SIZE, not step COUNT. Reach costs precision, never time. Set to **16 m**
+(0.5 m/step, ~2 GI cells at this scene's 1 m spacing). `__giHitEmitterMarchCap`
+is the A/B. ⚠ Still a constant in METRES — derive it from the GI volume extent
+(GISystem knows it, the kernel does not). Same class as the two constants this
+session already had to retract.
+
+## §18.10 — THE TWO-SIDED COSINE (fixed, user-confirmed)
+
+`analyticDirectAt` takes `dot(dirTo, N).abs()` because it shades a FIELD CELL,
+which has no side. `createGiBvhHitShade` shades a HIT and face-forwards its
+normal one line earlier — so every reflected surface pointing AWAY from the sun
+took the sun's FULL irradiance where the same surface rendered directly takes
+zero. `srcShade.js:239` already clamps for exactly this reason and its header
+spells out the trap. Added `oneSided` (default false — every field-cell caller
+byte-identical), passed `true` from BOTH hit shaders (the exact reflection and
+the probe capture, whose formulas are deliberately identical).
+**User-confirmed: this was the "brown patches all over the scene".**
+
+## §18.11 — THE EMITTER GATE HAD TO BECOME RELATIVE
+
+The §18.7 absolute gate (`pi*A*L < 0.05`) was justified from TWO data points and
+**culled 26 of Bistro's emitters**, taking the light tree 114 → 88. Emitter
+powers are a continuum whose SCALE is an authoring property; no wattage is right
+for two scenes. Now a FRACTION of the scene's own total emitted power (0.2%),
+applied in `collectEmitters`. Unit-invariant, and it can never empty the tree.
+`npm run test:gi-emitter-power` — 16 checks, including the Bistro failure
+("a uniformly-lit scene loses nothing").
+
+⚠ ALSO FIXED: `#belowEmitterPowerGate` read `entry.analytic.power`, but
+`entry.analytic` is an `analyticShapeOf` result — `{type, center, half}`, no area
+and no power. It failed open and the FIELD half of the cull never fired once.
+It now consults what `collectEmitters` actually admitted.
+
+▶ **OPEN**: `bvhColor` read 170.5/170.5/170.5 — all three channels identical.
+That may mean reflected surfaces carry NO albedo variation (the palette-vs-atlas
+R7b gap, and a candidate for the brown patches). The probe reports only the MEAN,
+which cannot separate "every texel is grey" from "a varied image averaging grey".
+**Add a variance statistic before asserting either.**
+
+# ══ §18.6 — THE IDLE LIST HAD A HOLE (2026-08-25) ══
+
+**USER-CONFIRMED FIXED**: *"reflections are responsive now, that's great."*
+
+## ⭐⭐ THE FINDING
+
+The GI tick's IDLE SLEEP replaces the whole pass queue with a hand-written
+"camera-dependent passes only" list (GISystem.js ~3305-3344). Every entry in
+that list carries its own comment saying it must ride idle *or it would lag
+every camera move*. **The exact-reflection hit chain was not in it** —
+`bvhHitShade`, `bvhHitTemporal.filter`, `bvhHitTemporal.snapshot` live only in
+`state.queue`, which idle discards wholesale.
+
+Two things turned that omission into a two-second freeze:
+
+```js
+const idle = !freeze && globalThis.__giNoIdleSleep !== true &&
+  (this._fieldQuietFrames ?? 0) > GI_IDLE_AFTER_FRAMES &&   // 180
+  this._frame % GI_IDLE_HEARTBEAT_FRAMES !== 0;             // 30
+```
+
+1. **`#fieldInputHash()` HAS NO CAMERA TERM.** It digests light slots, emitter
+   slots, sky radiance, `bounceGain`, `_dynSet.version` and three blend knobs —
+   and nothing about the view. So orbiting never resets `_fieldQuietFrames`;
+   the counter climbs *straight through* the motion.
+2. Past 180 quiet frames, idle engages and **stays** engaged while the camera
+   moves. The hit chain then dispatches on the heartbeat alone: **1 frame in
+   30** — about two seconds at the 15-18 fps this scene moves at.
+
+**Why it looked like a reflection bug.** The TRACE is dispatched outside the
+queue, so it kept running every frame: hit `t`, hit normal and albedo stayed
+current while the RADIANCE materials sample was frozen — fresh geometry, stale
+light. And materials read `bvhRadiance` at `giUV`, the surface's own
+reprojection, so the frozen image **translates with the surface** while its
+content never changes. The user's words, mechanically: *"reflection just moves
+to the side when camera moves to the side, not changing the angle as it
+should."* And *"works properly sometimes, then gets overwhelmed"* is not a load
+threshold at all — it is the 180-frame timer arming.
+
+## ✅ THE FIX — GATE ON THE VIEW, NOT ON THE WORLD
+
+The chain now rides the idle list whenever `this._gbufHeld !== true`. A parked
+camera keeps today's saving (and the held-view cadence at ~3455 still governs
+it); a moving camera gets a live reflection. `_gbufHeld` is already computed
+each tick and is exactly the "the view has not changed" signal.
+
+⚠ **The general defect is that the idle list is a hand-maintained DUPLICATE of
+"which passes are camera-dependent", and it has now silently diverged once.**
+Any pass added to `state.queue` must be audited against it. Better still,
+derive one from the other.
+
+## ⭐⭐ THE THIRD BLIND RECEIPT IN ONE DAY
+
+`_bvhHitShadeHeldFrames` counts only the frames the HELD-VIEW CADENCE chose to
+skip. On every frame the idle list had already removed the pass, the `else`
+branch ran and wrote **0 — "not held, healthy"** — while zero dispatches
+occurred. It described a *decision*, not a *dispatch*.
+
+Now measured from the queue that is actually submitted:
+
+```js
+const dispatching = frameQueue.includes(hitShadeNode);
+this._bvhHitShadeGapFrames = dispatching ? 0 : (this._bvhHitShadeGapFrames ?? 0) + 1;
+```
+
+**Live confirmation, Bistro at ultra:** `fieldQuietFrames 454` (idle engaged,
+not inert), **`hitShadeGapMax 29`** (the predicted 1-in-30, measured), and
+`hitShadeHeldFrames 1` against a true gap of 16 — the old receipt understating
+by 16x. `hitShadeGapMax` is deliberately a MAXIMUM, not the peak-held best case
+that misled this same investigation twice.
+
+⛔ **THE PATTERN, THREE TIMES IN ONE DAY** — the tier census counted before its
+inputs resolved; `hitHistWeightAtMotion` peak-held its best case; this counted a
+decision instead of a dispatch. **Every one of them reported health while the
+subject was broken.** When a receipt says "fine" and the user says "broken",
+suspect the receipt first.
+
+▶ **STILL OPEN: emissive/indirect light lags under camera motion**, and the
+reflection fix did not touch it (user, same message). Different path — the idle
+list DOES contain `resolve`, `irrTemporalPass`, `irrHistoryPass` and the whole
+emitter shadow chain, so the cause is elsewhere. Leading suspects: the
+irradiance history weight (0.9, and its only motion term is LIGHT motion, never
+camera), and probe population churn (measured: cascade-0 live probes 4215 parked
+-> 20668 moving, cascade-2 orphanRate 0.035 -> 0.18, knownFrac 0.794 -> 0.752).
+
+# ══ §18.5 — THE LADDER COULD NOT SEE (2026-08-25) ══
+
+Three findings from one morning, all of them instrument problems rather than
+algorithm problems. Read this before touching §18's R8.
+
+## ⭐⭐ 1. THE CENSUS WAS COUNTING "NOT KNOWN YET" AS "MEDIUM"
+
+`_tierTally` is filled inside `#collectMeshes`, which runs at **build** time —
+before the per-channel roughness floors have come back off the GPU. Every mapped
+material is `MEDIUM`-by-default at that moment, so the boot line reported
+**"0 sharp, 102 medium"** for a scene whose windows are mirrors, and that
+non-finding was nearly used as evidence that the ladder had no population to
+work with.
+
+**Fixed by `GISystem.reflectTierCensus()`** — walks at READ time, and keeps
+PENDING as its own column. Exposed as `giTiers` in `profile.frameStats`, so it
+can be read without a screenshot. First real reading, Bistro at ultra, mid-boot:
+
+| | sharp | medium | coarse | pending |
+|---|---|---|---|---|
+| materials | 0 | 131 | 3 | **128** |
+| meshes | 0 | 1610 | 17 | 1568 |
+| triangles | 0 | 4.28 M | 0.28 M | — |
+
+**128 of the 131 "medium" materials were "ask again later".** The census was
+blind, exactly as [[probe-blind-statistics]] predicts, and the fix was to teach
+the instrument to say so.
+
+## ⭐⭐ 2. THE FLOOR DRAIN WAS COUPLED TO THE FRAME RATE IT EXISTS TO REPAIR
+
+`giRoughnessFloorStats` is what the whole ladder tiers on, and it filled at
+**2 materials per 16 FRAMES**, with at most 2 readbacks in flight.
+
+On a mid-boot Bistro sitting at 4 fps that is 16 frames = **four seconds**, so
+128 pending floors needed roughly **eight minutes** — and every one of those
+minutes is spent tracing full-resolution reflections for materials whose exact
+weight is provably zero. The slower the frame, the slower the repair. Backwards.
+
+**Fixed:** the drain now runs on **wall clock** (120 ms) with a batch that scales
+to the backlog (8 while >32 pending, 2 when settled), and the in-flight readback
+cap went 2 → 6. Each readback is 32x32 ≈ 4 kB; the cap, not the cadence, is the
+real bound on GPU stalls.
+
+## ⭐⭐ 3. COARSE SURFACES CAN SKIP THE TRACE — PROVED, NOT ASSUMED
+
+All **three** consumers of the BVH reflection textures gate on the identical
+ramp, verified by reading each site:
+
+| site | gate |
+|---|---|
+| `giLight.js` exact blend | `exactHit.a * smoothstep(0.45, 0.15, roughness)` |
+| `giLight.js` mirror trace | `smoothstep(0.45, 0.15, roughness)` |
+| `giLight.js` env-on-miss | `smoothstep(0.45, 0.15, roughness)` |
+
+Above roughness **0.45 every one of them is exactly 0**. The ladder tiers on the
+map's **floor** (p5 over the texture), and floor > 0.45 ⇒ *every texel* of that
+material is above 0.45 ⇒ the traced reflection it pays for is multiplied out of
+the image at every pixel.
+
+⚠ This does NOT contradict §16 R4's refutation. R4 removed materials from the
+reflection PATH by bucket, which took real light from MEDIUM surfaces
+(0.15–0.45), where the ramp is non-zero. This is the COARSE rung only, and the
+proof is per-texel rather than per-material.
+
+**`coarseTriangleShare` in `giTiers` is the number that decides R8a's worth.**
+Blind (mid-boot, 128 floors unresolved) it read **6%**. Settled it reads **89%**
+— the instrument had been reporting very nearly the opposite of the truth.
+
+| | sharp | medium | coarse |
+|---|---|---|---|
+| materials | 1 | 40 | **93** |
+| meshes | 14 | 90 | **1523** |
+| triangles | 136 | 509,937 | **4,053,119** |
+
+## ⭐⭐ 3b. R8a IS THEREFORE A MASK-POPULATION CHANGE, NOT A STRIDE CHANGE
+
+The original R8a spec was "tier the block stride". The census says something
+simpler and much stronger is available: the prepass already has a mechanism for
+skipping pixels — the mirror mask — and it was **pointed at the wrong set**.
+
+`GI_MIRROR_LAYER` is "reads a reflection" = buckets 0 and 3 = **104 of 111
+materials** on Bistro, because "has a roughness MAP" is all bucket 3 means. As a
+cost lever it excluded nothing, which is why masked mode was all risk and no
+reward for three sessions.
+
+**The mask pass now draws `GI_SHARP_LAYER`** — redefined as the ladder's SHARP +
+MEDIUM rungs, i.e. floor <= 0.45, i.e. "the traced reflection survives the
+blend". That is **104 meshes of 1631**, and the 89% it excludes is multiplied by
+zero at every texel.
+
+### MEASURED, live, Bistro at ultra, 1803x887 resolve
+
+| pass | mask off | mask on (tier population) |
+|---|---|---|
+| **bvhReflect** | **23.22 ms** | **10.09 ms** |
+| resolve | 8.94 | 4.72 |
+| screen total | 36.67 | 19.29 |
+| ao (with the new micro ring) | 1.01 | 1.02 |
+
+⚠ **The two arms are not a perfectly matched pair** — the volume auto-fit slid
+between boots (`probes 8980 → 19883`), so the resolve delta in particular is not
+attributable to the mask. `bvhReflect` is per-traced-pixel work and the 23.22 →
+10.09 halving is structural, but re-measure both arms in one boot before quoting
+the frame-level number.
+
+Re-measured on a clean boot with the shipped defaults, floors drained
+(`pendingMaterials` 37, `coarseTriangleShare` 0.888):
+
+| pass | settled, shipped |
+|---|---|
+| **bvhReflect** | **11.82 ms** (from 23.22) |
+| **bvhHitShade** | **14.56 ms** — now the frame's largest |
+| resolve | 4.79 |
+| screen total | 20.40 (from 36.67) |
+
+⚠ **11.82 ms is far higher than the 89% triangle share predicts (~2.5 ms), and
+the reason is the next unit's whole premise: TRIANGLES ARE NOT PIXELS.** The
+fine set is 104 meshes, but they are the windows, glass and polished floors —
+the big ones. Screen coverage fell far less than triangle count did.
+
+### ▶ R8b: bvhHitShade, and why another gate is NOT the answer
+
+The hit-shade already benefits from the mask *logically* — its inner guard is
+`hitTexel.x >= 0 && albedoTexel.w > 0.5`, and the prepass writes `t = -1` on
+every masked-skip, so masked pixels do no shading work. 14.56 ms is therefore
+**not** wasted threads; it is occupancy. This kernel's own header records it:
+"register pressure from the cone marcher collapsed the whole kernel's
+occupancy". Every workgroup containing even one traced pixel pays the full
+register cost, and with the fine set being large contiguous surfaces, most
+workgroups contain one. **Adding a `g1.w` gate would change nothing** — do not
+spend a session on it.
+
+### ▶ THE NEXT UNIT IS PER-TIER STRIDE *WITHIN* THE FINE SET
+
+This is the roughness ladder the user actually asked for: *"for some surfaces we
+need much cleaner reflection while others, like a wet carpet, would do with a
+very low res on time trace."*
+
+The census makes the split obvious — **SHARP is 1 material, 14 meshes, 136
+triangles.** Essentially the entire fine set is MEDIUM (40 materials, 90 meshes,
+510 K triangles), spanning floor 0.15–0.45 where `exactWeight` runs 1.0 → 0.0.
+A MEDIUM surface at floor 0.40 has weight ~0.03; at 0.16, ~0.99.
+
+So: **SHARP keeps stride 1; MEDIUM goes to stride 2–3.** giLight already
+prefilters the exact reflection by roughness (the 12-tap two-ring hexagonal blur
+at giLight.js ~2100, radius `smoothstep(0.02, 0.45, roughness) * 12 texels`), so
+a MEDIUM surface's traced image is being blurred anyway — tracing it at full
+resolution first is paying for detail that is deliberately destroyed downstream.
+
+⚠ The known hazard is the one that forced ultra to stride 1 in the first place:
+at a silhouette, block replication validates neighbours out to −1 and giLight
+falls to the PROBE reflection on exactly those texels, interleaving two images
+per texel — the "salt-and-pepper stipple" on the user's mirror walls. That
+argument applies with full force to SHARP and much less to MEDIUM, whose
+prefilter blurs across the stipple. **Implement as two dispatches (SHARP at
+stride 1, MEDIUM strided), not as one dispatch with a varying stride** — the
+replication/validation logic in `createGiBvhReflect` assumes a uniform block.
+
+## ✅ THE GATE PASSED — MASKED MODE IS ON BY DEFAULT
+
+The standing condition for re-enabling masked mode was a rig asserting that
+non-mirror gbuffer pixels survive the mask pass. It exists and it passed:
+
+| arm | `giMaskCoverage` |
+|---|---|
+| mask OFF | 4096/4096 = **100.0%** |
+| mask ON | 4096/4096 = **100.0%** |
+
+`#bvhMaskEnabled()` now returns `globalThis.__giBvhMask !== false`.
+
+⚠ The rig's own first cut was blind in the classic way — it sampled during the
+compile wave, where `wantsMirrorMask` is forced false, so a build configured
+mask-ON reported "mask OFF". It now requires `wantsMirrorMask ===
+#bvhMaskEnabled()` and resets its counter whenever that fails. Its `.catch` logs
+rather than swallowing, and the result is mirrored into
+`profile.frameStats.giMaskCoverage` so a scrolled-away console line cannot be
+mistaken for a clean run.
+
+**GATE ADDED: `npm run test:gi-gbuffer-clear`, 12 checks**, asserting the
+`autoClear*` flags and the background at *draw time* (snapshotted inside a fake
+`render()`, because reading them after the call returns proves nothing — the
+`finally` restores them), plus full restoration including through a throw.
+**Negative control run: reverting the fix fails 2 of 12.**
+
+## ⭐ 4. AO's MINIMUM FEATURE SIZE WAS ITS RING RADIUS
+
+**User (2026-08-25):** *"a very weak AO, almost invisible between meshes,
+possibly it works only on larger meshes."* That names a RESOLUTION limit, and no
+amount of `aoStrength` can reach it.
+
+Both existing rings are anchored in WORLD space (`aoRadius` 0.5 m projected to
+pixels), and N taps spread √-uniform over radius r put the innermost at
+`r·√(0.5/N)`. At a 900-row resolve, 50° fov, 10 m out:
+
+| | radius | innermost tap |
+|---|---|---|
+| wide ring | 48 px | 11 px |
+| contact ring | 12 px | 3.5 px |
+| **a 2 cm gap between two props** | **1.9 px** | — |
+
+Every tap in both rings steps straight over the contact. A large mesh fills a
+big share of the 12–48 px disc and shades normally — which is precisely *"it
+works only on larger meshes"*.
+
+**Fixed: a third MICRO ring pinned at a fixed 3 px**, 6 taps, phase 2.4.
+Two surfaces that touch are adjacent IN PIXELS at every distance — the one
+invariant a world-anchored radius throws away. Its falloff still normalizes in
+world units, which is what keeps it an occlusion term and not an edge detector:
+a tap 2 px away that is 20 m behind is a silhouette against the background and
+its falloff sends it to 0. Joins the same multiplicative union,
+`1-(1-w)(1-c)(1-m)`.
+
+---
+
+# ══ §18 — THE FRAME, NOT THE FIELD (2026-08-24 night, USER MANDATE) ══
+
+**THE MANDATE (user, verbatim intent):** *"quality is quite great at this point,
+we need just to work on performance and speed. It must never get below 60 fps."*
+and *"this is not about tuning, this is about making structural changes in order
+to achieve better results."* So: §16/§17's quality units are DONE being the
+priority. Everything below is frame cost, and a constant is not an answer.
+
+## ⭐ THE FINDING: SHADOW FREEZING HAS BEEN 100% INERT UNDER CSM
+
+Measured live on the user's Bistro at ultra, editor viewport **parked**, static
+geometry, not playing — i.e. the best case the engine will ever see:
+
+| | before | after | |
+|---|---|---|---|
+| CPU frame | 86.65 ms | **22.69 ms** | 3.8x |
+| `renderEncode` | 63.22 ms | **15.60 ms** | 4.1x |
+| draw calls | 1147 | **376** | -771 |
+| triangles | 6.61 M | **2.44 M** | -63% |
+
+The draw ledger said it outright once it was read per pass:
+
+| pass | draws | `floorIfMerged` |
+|---|---|---|
+| ShadowMap 4096² (cascade 0) | 554 | 8 |
+| main rt 1878x1066 | 301 | 9 |
+| ShadowMap 4096² (cascade 1) | 288 | 6 |
+
+**842 of 1144 draws were the two shadow cascades, re-rendered every frame on a
+scene that had not moved.** `ShadowFreezeSystem` existed, ran (2.0 ms/frame),
+and reported itself healthy the whole time.
+
+### The mechanism, exactly
+
+The flag the system writes is `shadow.autoUpdate`, and its ONLY reader is
+`ShadowNode.updateBefore` (three r185, ShadowNode.js:855 — `let needsUpdate =
+shadow.needsUpdate || shadow.autoUpdate;` gating `this.updateShadow(frame)`).
+Two facts about CSM each independently defeat it, and the light has both:
+
+1. **The CSM parent's flag is unread.** `LightComponent#syncCSM` sets
+   `light.shadow.shadowNode = this.#csm` (LightComponent.js:597).
+   `AnalyticLightNode.setupShadow` takes a custom `shadowNode` and SKIPS
+   `setupShadowNode()`, so no `ShadowNode` is ever built for that light and
+   nothing reads its `autoUpdate`. Freezing it removes zero draws.
+2. **A CSM cascade is not a Light.** `CSMShadowNode._init` builds one
+   `class LwLight extends Object3D` per cascade (CSMShadowNode.js:26) with
+   `castShadow = true`, a real cloned `DirectionalLightShadow`, wrapped in a
+   real TSL `shadow(lwLight, lShadow)` node, added to the scene graph by
+   `updateBefore`. It carries **no `isLight`** — verified live against
+   r185.1: `isLight: undefined | castShadow: true | ctor: LwLight`.
+
+`ShadowFreezeSystem.update()` filtered candidates with
+`object.isLight && object.castShadow && object.shadow`. So it found ONLY the
+one object it could not stop, and never the two that owned the maps and DO
+honour the flag. `frozenLights` read 1 — a freeze that owned a light it could
+not freeze. **Textbook [[probe-blind-statistics]]: the instrument could not see
+its subject and returned a clean result.**
+
+### ✅ SHIPPED
+
+- **`collectFreezableCasters(scene)`** (shadowFreeze.js) replaces the
+  `isLight` filter and asks the structural question instead — *does a plain
+  `ShadowNode` own this map?* Takes anything with `castShadow === true` and its
+  own `shadow.camera`; rejects anything whose `shadow.shadowNode` is set (a
+  custom node means nothing reads the flag) and GI-mode lights.
+- **No feedback loop, and it is verified, not assumed.** This file's standing
+  rule is never to fingerprint a value the freeze's own output gates.
+  `CSMShadowNode.updateBefore` writes `lwLight.position` / `target.position`
+  **ungated by `autoUpdate`** (CSMShadowNode.js:561-563), so the cascade pose is
+  an input three refreshes unconditionally — exactly what the rule demands. It
+  is also **texel-snapped** upstream (`Math.floor(_center.x / texelWidth)`), so
+  the freeze survives sub-texel drift for free.
+- **The twin bug, fixed with the same predicate** (sceneSettings.js:526): the
+  author's own Scene Settings "shadow auto update" checkbox used the identical
+  `isLight` filter, so the manual escape hatch was ALSO inert on CSM scenes.
+  Both call sites now share `collectFreezableCasters` — two copies of that
+  filter drifting apart is how this survived.
+- **A RECEIPT, because the absence of one hid this for as long as CSM has been
+  on.** `profile.frameStats` now reports `shadows: { managed, frozen }`.
+  `managed: 0` on a shadowed scene = the system cannot see the maps;
+  `frozen: 0` while `managed > 0` on a still scene = something keeps
+  invalidating them. Live now: `{ managed: 2, frozen: 2 }`.
+- **Gate: `npm run test:shadow-freeze`, 20 -> 26 checks.** The six new ones drive
+  the REAL `CSMShadowNode` (it instantiates headless — `_init({camera,
+  renderer:{coordinateSystem, reversedDepthBuffer}})`), not a mock, because the
+  bug was entirely about three's actual object shapes and a hand-rolled stand-in
+  would have been built from the same wrong assumption. **Negative control run:
+  reverting the predicate to `isLight` fails 4 of the 6 with
+  "THE REGRESSION: 2 of 2 cascades still re-render every frame".**
+
+⚠ HONEST CONFOUND: the A/B spans an editor reload, which also reset the heap
+(6404 -> 2144 MB), so part of the per-draw improvement (55.1 -> 41.5 us/draw) is
+reduced GC pressure rather than the fix. **The -771 draws and -4.2M triangles
+are unambiguously the fix**; the ms split between the two causes is not
+separated.
+
+## ⛔ WHAT THIS DOES *NOT* FIX — AND IT IS THE MANDATE
+
+A frozen cascade is a **parked-camera** win. Under camera motion the cascade
+centre crosses a texel (4096² over a ~60 m cascade ≈ 1.5 cm) and both cascades
+correctly redraw — **so a moving camera returns to the 1144-draw / ~63 ms
+frame that was measured before the fix.** That measurement IS the under-motion
+cost; it is not a projection. For "60 fps under ANY conditions" the redraw has
+to become CHEAP, not rare.
+
+## UNITS (next, in leverage order — measured targets, not guesses)
+
+- **▶ F1 — SHADOW-ONLY MERGE — BUILT + STRUCTURALLY VERIFIED LIVE 2026-08-24
+  night; ms receipt still owed.** ⭐ On the user's Bistro with
+  `performance.shadowMerging = true`: **`mergedProxies: 44, mergedReplaced:
+  551`** — 551 individual casters now submit as 44 proxies, against the
+  cascade's own 554 draw count. Shadows verified intact by screenshot (awnings,
+  lamp posts, chairs, scooter all casting correctly). ⚠ THE ms NUMBER IS NOT
+  YET CLEAN: the measurement was taken while the scene was still settling after
+  a reload (heap climbing 2.3 → 5.1 GB, texture 566 → 892 MB, GI mid-rebuild,
+  `drawCalls` reading 1454 from a rebuild frame). Re-measure on a settled
+  Bistro, parked AND while orbiting, before quoting a saving. `src/engine/shadowMerge.js` + `SHADOW_PROXY_LAYER = 22` +
+  `performance.shadowMerging` (default FALSE — it rewrites `castShadow` across
+  the scene, so a defect reads as MISSING SHADOWS, the more expensive failure).
+  Gate: `npm run test:shadow-merge`, 17 checks, all green.
+  WHAT IT DOES: collects what the depth pass draws TODAY (merging's batch
+  proxies + the meshes merging refused), groups them on the depth key ONLY,
+  splits by locality so cascades can still cull, and swaps in position-only
+  proxies; originals keep layer 0 and get `castShadow = false`.
+  ROUTING (both ends mandatory — see the `SHADOW_PROXY_LAYER` header):
+  proxies sit on bit 22 ALONE (`layers.set`, not `enable`), and every shadow
+  camera enables bit 22 explicitly in `#syncCSMCascadeShadows` /
+  `#configureShadow`. ⭐ CORRECTION TO AN EARLIER ASSUMPTION: no camera in this
+  engine calls `layers.enableAll()` (only raycasters do), so a VIEW camera's
+  mask is layer 0 plus EDITOR/DEBUG/UI and never bit 22 — the colour pass is
+  safe for free. That is exactly why the shadow side is mandatory: the cascade
+  would otherwise INHERIT that same mask and the merged half of the scene would
+  stop casting entirely.
+  GI EXCLUSION (both, deliberately redundant): the proxy's exclusive layer is
+  added to `#collectMeshes`' `editorOnly` test and `#gbufferFingerprint`'s
+  `skipLayers`, AND the proxy carries `userData.__giDebug = true`, GI's own
+  opt-out, so a GI walk added later stays correct by construction.
+  ⭐ TWO DEFECTS THE 49-AGENT MAP CAUGHT IN THE FIRST CUT, both fixed + gated:
+  (1) **THE RESURRECT/DOUBLE-DRAW CLASS.** `merging.js` claims a member via
+  `visible = false` and every component write to `visible` defers to that claim
+  (`MeshComponent#applyVisibility`'s banner — six sites used to resurrect
+  members and draw them twice; on Bistro that was the load/hang loop). This
+  system claims through a DIFFERENT channel, `castShadow = false`, and that
+  channel had NO guard: `MeshComponent`:169/:441 and `ModelComponent`:62/:192
+  all write `castShadow` unconditionally, so any prop change or model reload put
+  the original back in the depth pass with its triangles ALSO inside the proxy —
+  once per cascade, invisible in the colour pass, so it reads as "shadows got
+  slower" rather than as a bug. Fixed by `applyCastShadow(mesh, value, engine)`,
+  routed through all four sites: asymmetric like the visibility rule (OFF
+  applies immediately — it cannot resurrect; ON is deferred to the owner), the
+  authored value is recorded so `#teardown` REPLAYS it instead of writing a
+  blanket `true`, and any change invalidates the merge.
+  (2) **MOVERS.** A merge bakes world-space vertices, so a caster that moves
+  afterwards leaves its shadow standing where it used to be. `merging.js`
+  carries `#watchForMotion` for exactly this; this system needs its OWN because
+  it absorbs a strictly larger set (every caster, including the ~429 meshes
+  merging refuses), so merging's watcher does not cover them. Added, amortised
+  over 4 frames on a round-robin cursor, and a caught mover joins a permanent
+  `_movers` set so it is left unmerged rather than re-absorbed every frame.
+  ⚠ OPEN: the culling trade. A proxy cannot be culled member-by-member, so a
+  cascade rasterises triangles it used to reject. That is a good trade only
+  while the frame is CPU-bound on submission — re-check it if shadow
+  rasterisation ever dominates.
+  ORIGINAL ANALYSIS: The depth pass
+  replaces every material with one shared override
+  (`scene.overrideMaterial = getShadowMaterial(light)`, ShadowNode.js:746;
+  Renderer.js:3562-3577 honours it), so in a cascade a mesh's material identity,
+  its maps and its `colorNode` are all IRRELEVANT — only alphaTest / side /
+  layers / castShadow survive. Yet `merging.js` keys its groups on the COLOUR
+  pass: `material.uuid` on the free path (merging.js:1106) plus texture-array
+  and shading signatures on the uber path, refusing outright on
+  `uberIncompatibility` — *that* is the log's "142 custom colorNode". The
+  arithmetic closes exactly: 125 merge proxies + 287 below-threshold + 142
+  colorNode = **554**, the first cascade's draw count to the unit.
+  Build a SECOND grouping pass keyed only on what a depth pass consumes
+  (position, uv only where alpha is live, side, alphaTest, alphaMap, layers) —
+  no textures copied, no uber variant, no GI compile wave, so none of the trades
+  that force the current 3-mesh / 42 MB caution apply. Route it with layers:
+  proxies on a dedicated shadow layer the cascade cameras enable and the main
+  camera does not; originals keep `castShadow = false` so they drop out of the
+  depth pass and stay in the colour pass.
+  TARGET: 554 -> ~8 and 288 -> ~8 by the profiler's own `floorIfMerged`, i.e.
+  ~826 of 842 shadow draws removed **even while the camera moves**.
+  ⚠ RISKS TO SETTLE FIRST: the new layer bit vs the documented UI/DEBUG layer
+  collision ([[ui-depth]]); GI's own mesh walks / static BVH must not adopt the
+  proxies; `fingerprintCasters` will now see them.
+- **F2 — PER-DRAW ENCODE: 41.5 us against this project's own 24 us ceiling.**
+  `#markObservedMaterial` (GISystem.js:12243) gives every GI-lit material a
+  `giMonitorNode`, which makes three's `NodeMaterialObserver.hasNode` true,
+  which makes `needsRefresh` true for EVERY render object EVERY frame. It is
+  load-bearing and must not simply be deleted — it is what stops a moved lamp
+  lighting its old position (harness-proven). The structural move is to put
+  GI's changing uniforms in a shared `renderGroup` UBO updated once per frame,
+  so the per-object refresh is not what carries them. ~6.6 ms at 376 draws,
+  and it scales every future draw.
+- **F3 — THREE FULL-SCENE FINGERPRINT WALKS PER FRAME.**
+  `fingerprintCasters` (shadowFreeze.js:75, 1.165 ms) and `#gbufferFingerprint`
+  (GISystem.js:9782, most of gi.gbufferPrepass) are the SAME traverse with the
+  same 16x `Math.round`/`Math.imul` per mesh; `#checkFingerprint`
+  (GISystem.js:3253) does a third full collect every 5th frame. Replace with ONE
+  engine-owned content key bumped by the events that already exist
+  (`hierarchy-changed`, transform commits, visibility, merging commits,
+  instanceMatrix uploads). ~2 ms, and it makes the freeze's walk cheap enough to
+  stop being a tax on the optimisation it serves.
+- **F4 — ~60 SEPARATE `queue.submit()`s PER FRAME.** `giCompute`
+  (GISystem.js:346) loops `renderer.compute(node)` one node at a time ON PURPOSE
+  (so a pipeline created mid-dispatch is attributable to its node), and three's
+  `Renderer.compute` creates a command encoder + compute pass + submit per call
+  (WebGPUBackend beginCompute/finishCompute). Make the per-node path
+  CONDITIONAL: pass the whole array once every node already has a pipeline, fall
+  back to the loop only while any is pending. Est. 2.3-5.7 ms of gi.screenChain's
+  3.5 ms band. ⚠ magnitude UNVERIFIED — mechanism is certain from source, the
+  per-submit cost is not measured here.
+- **F5 — MERGE COVERAGE: dicing manufactures the singletons it then discards.**
+  `#rebuild` dices by locality FIRST and applies `MIN_GROUP_SIZE = 3` SECOND
+  (merging.js:1257-1272), which is what prints "287 below the 3-mesh threshold
+  **after splitting**". Invert the order: re-merge adjacent under-sized cells of
+  the same key in Morton order until each survivor clears the threshold. 287
+  meshes recovered; a cell of one is strictly worse than not dicing.
+- **F6 — the SRC probe chain (~44 dispatches) is exempt BY DESIGN from the
+  converged-idle gate** (GISystem.js:2760/2784), because probe retirement is
+  frame-counted so skipping a frame ages probes. Make aging wall-clock or
+  evidence-driven, then let SRC ride the same `idle` list the resolve rides.
+- **F7 — unconditional telemetry on the shipping path**: `#maybeLogSrcProbeStats`
+  (GISystem.js:8100) is gated on a 60-frame cadence only, NOT on
+  `__giLogSrcProbes` (which gates just the console line), and pulls 8+ chained
+  GPU readbacks plus a whole-pool CPU reduction. Gate the READBACK on demand.
+
+## ⭐ STATE AT SESSION END — THE FRAME FLIPPED TO GPU-BOUND, AND THE GPU IS ONE THING
+
+Settled Bistro, parked, shadow-merge on: **CPU 26.14 ms / GPU 51.63 ms,
+`bound: "gpu"`**, 422 draws. The CPU side went 86.65 → 26.14 ms this session and
+is no longer the ceiling. `profile.giPasses` attributes the GPU frame outright:
+
+| pass | ms |
+|---|---|
+| **bvhHitShade** | **26.03** |
+| **bvhReflect** | **25.77** |
+| resolve | 5.17 |
+| emitterShadowPass | 4.25 |
+| whole SRC probe chain (63 dispatches) | 12.32 |
+
+**bvhReflect + bvhHitShade = 51.8 ms, i.e. the ENTIRE GPU frame.** Everything
+else is rounding. The bucket line is still "2 mirror, 102 dynamic-roughness",
+so the dense full-screen prepass traces every pixel for a term that only 2
+materials consume sharply — which is exactly the case §17's **R8
+roughness-tiered prepass RESOLUTION** was spec'd for after R4 classification was
+refuted as a default (the energy is real, so the fix is RESOLUTION, not path
+membership: rough pixels at stride 4 = 1/16 the rays via the existing block
+replication, mirror pixels at stride 1).
+
+### ✅ SHIPPED — THE REFLECTION HOLDS (2026-08-24, fps 18 → 37 on Bistro)
+
+| | before | after |
+|---|---|---|
+| **fps** | 18 | **37** |
+| GPU | 53.3 ms | **23.6 ms** |
+| CPU | 22-33 ms | 17.3 ms |
+
+Receipt: `profile.frameStats` gained `giHold: { reflectHeldFrames,
+hitShadeHeldFrames }` — live `286 / 1`.
+
+- **`bvhReflect` is HELD EXACTLY when `gbufHeld`.** The pass TRACES ONLY (hit t,
+  face normal, hit albedo — never light, per its own header), so its inputs are
+  exactly the g-buffer, the camera and the BVH — and `gbufHeld` already proves
+  all three unchanged (it folds in both camera matrices, every drawn mesh's
+  world transform, geometry IDENTITY so a BVH rebuild breaks it, the target's
+  identity, and it BAILS on any skinned/morphing mesh). On a held frame the
+  kernel would recompute a BIT-IDENTICAL result, which is why there is no
+  heartbeat. `__giReflectHold = false` reverts.
+- **`bvhHitShade` rides a 1-in-3 CADENCE**, not a hold — it also consumes the
+  SRC probe field, which keeps converging on a parked camera (the probe chain is
+  exempt from the idle gate, unit F6). ⚠ And only after
+  `GI_HELD_HIT_SHADE_SETTLE = 45` held frames at FULL rate: dropping to a
+  cadence the instant the camera stops would make the reflection converge 3x
+  slower exactly when the user is looking at it, and "reflections update a
+  second or two after I stop" is a LIVE complaint about this chain.
+  `__giHitShadeHold = false` reverts.
+- ⚠ **`this._gbufHeld` is published on the instance ON PURPOSE**: the two
+  consumers sit in a DIFFERENT SCOPE of the same tick from where `gbufHeld` is
+  defined, and a bare reference there is a ReferenceError that throws the whole
+  GI tick every frame (shipped that way for one boot — fps 5, GI dead).
+- ⛔ **THIS IS A HELD-VIEW WIN ONLY.** While the camera moves `gbufHeld` is
+  false and both passes run at full rate, i.e. back to ~18 fps. The
+  moving-camera fix is R8a below.
+
+⚠ METHOD NOTE, recorded because it cost most of a session: the frame was read as
+CPU-bound from an early `gpuMs 19.29` sample taken MID-BOOT, before the
+reflection kernels had compiled. Settled, the GPU was ~52 ms all along. **Re-read
+the bound after the scene settles before choosing a direction.**
+
+### ⛔⛔ THE STILLNESS TRAP — the user's standing correction, 2026-08-24
+
+*"we gain performance from camera stillness, but it drops 3x when it starts
+moving, defying our dynamic orientation again."* Every win this session was a
+HELD-VIEW win — shadow freeze, shadow merge, the reflection hold, the hit-shade
+cadence. **This engine is for games. A parked-camera optimisation optimises the
+case that does not matter.** Judge every future unit by its MOVING number.
+
+⚠⚠ AND READ THE TIER BEFORE QUOTING ANY NUMBER ([[probe-blind-statistics]]
+rule 9, violated again here): mid-session the user switched the **GI component's**
+`quality` to `high` while `project.settings.build.quality` stayed `"ultra"` —
+two different knobs. A 48 fps reading at high was briefly compared against an
+18 fps ultra baseline. The corrected, tier-consistent picture, from the user:
+
+| GI quality | still | moving |
+|---|---|---|
+| ultra, session start | 18 | ~18 |
+| ultra, after the holds | **30** | **15** |
+| high, after the holds | 48 | — |
+
+So the holds are real (18 → 30 still at ultra) and, exactly as designed, do
+NOTHING for motion. 15 fps moving is the number that matters.
+
+### ⭐ THE REFLECTION FREEZE — TWO SUSPECTS ELIMINATED BY MEASUREMENT
+
+User: *"when a reflective object is moving or rotating, reflections look
+correct, but when the camera orbits around it, it shows the same perspective
+for the whole motion, until the camera stops."* Receipts added to
+`profile.frameStats.giHold` (`hitHistWeight`, `hitHistWeightAtMotion`,
+`camMotionEma`, `reflectHeldFrames`) and measured live:
+
+- **R7c WORKS.** `hitHistWeightAtMotion: 0.045` — exactly `0.9 x 0.05`. The
+  history weight does collapse to near-raw under camera motion, and the GLOSSY
+  chain shares the same uniform (`#armGlossyTemporal` binds
+  `_giBvhHitHistWeightU`, verified). NOT a stale temporal buffer.
+- **THE REFLECT HOLD IS NOT IT.** `reflectHeldFrames` 1710 → 9 on a camera
+  move; the hold releases and the trace re-runs while orbiting. (A hold count
+  climbing between MCP calls is an artifact of the gaps between them — a real
+  continuous orbit never lets it engage.)
+
+⇒ The frozen image is a THIRD source, shown INSTEAD of the traced reflection
+while moving. Leading candidate: the **reflection probe atlas** — world-anchored
+cubemaps captured ~one face per frame, which genuinely do show "the same
+perspective" from any orbit position, and which the material falls back to when
+the traced/glossy signal is rejected. ⚠ AWAITING THE USER'S EYES on the one
+question that separates it: during the orbit is the frozen reflection SHARP
+(a correct image from the wrong viewpoint ⇒ something freezes the trace) or
+BLURRY/washed (⇒ the probe fallback)?
+
+### ▶ R8a GROUNDWORK LAID (inert), AND WHY IT STOPPED THERE
+
+`GI_SHARP_LAYER = 21` + bucket-0-only tagging in `#collectMeshes` are IN and
+INERT (nothing reads the bit yet; a stale tag would cost RESOLUTION, never a
+missing reflection — which is why this is safe where the mirror MASK was not).
+Deliberately NOT `GI_MIRROR_LAYER`, which tags buckets 0 AND 3 = 104 of 111
+materials and is therefore useless as a cost lever.
+
+WHAT REMAINS, and it is surgery, not wiring: `createGiBvhReflect` traces INLINE
+inside its `If(live)` block, so a per-block stride needs either (a) the trace
+restructured into a TSL `Loop` over sub-pixels — in a kernel with a documented
+history of ruled lines, stipple and dark holes — or (b) a SECOND compiled
+instance (~92 kB more WGSL onto a 1469 kB / ~3 min boot). Pick (a), and gate it
+with the prepass-content rig before trusting it.
+
+### ⭐⭐ R8 RE-SPEC'D BY MEASUREMENT — THE TRACE WAS ONLY HALF THE BILL
+
+A forced global `stride 4` arm was compiled and measured live on Bistro
+(temporary, since removed). The result splits R8 in two and refutes the
+one-unit framing:
+
+| pass | stride 1 (ultra today) | stride 4 | scales? |
+|---|---|---|---|
+| **bvhReflect** (the TRACE) | 25.77 ms | **2.70 ms** | ⭐ 9.5x |
+| **bvhHitShade** (the SHADE) | 26.03 ms | **25.06 ms** | ⛔ NOT AT ALL |
+
+**Why:** `createGiBvhHitShade` ends `})().compute(width * height)` — ONE THREAD
+PER RADIANCE-GRID TEXEL, unconditionally. Its `sourceStride` parameter only
+QUANTISES WHERE IT READS (the anchor-snapping that killed the "ruled lines"
+bug); it has never reduced the thread count. So the shade pass pays full price
+at every stride, and a stride change alone can never fix more than half the GPU
+frame.
+
+**Why the trace is so expensive today:** `#bvhReflectStride()` is
+`qualityTierOf(config) === "ultra" ? 1 : 2` (GISystem.js:7639-7641) and this
+project BUILDS ULTRA — so the prepass traces ONE BVH RAY PER PIXEL over
+1803x887 against a 2.8M-triangle BVH8. Ultra chose stride 1 purely to protect
+MIRRORS from replication stipple ("salt-and-pepper on the user's mirror walls",
+"mosaic patchwork on CURVED mirror columns") — and Bistro's bucket line is
+**2 mirror against 102 dynamic-roughness**. A screenshot at forced stride 4
+shows NO visible degradation on this scene. Paying 23 ms per frame to protect
+two materials is the waste, and that is exactly what tiering removes.
+
+⇒ **R8 IS NOW TWO UNITS:**
+- **R8a — TIERED TRACE.** Mirror blocks keep stride 1; rough blocks go to
+  stride 4. Worth **~23 ms**, and the machinery (validated block replication)
+  already exists — only the stride becomes per-block.
+- **R8b — THE SHADE. ⛔ MY FIRST DIAGNOSIS WAS WRONG; CORRECTED BY THE MAP.**
+  I claimed bvhHitShade was shading ~16x redundantly and was worth ~19-22 ms via
+  anchor-rate dispatch. **The arithmetic refutes that.** `radianceDiv: 3` is
+  hardcoded (GISystem.js:7266), so the shade grid is a FIXED
+  round(1803/3) x round(887/3) = **601 x 296 = 177,896 threads, at every
+  stride** — which is exactly why the measurement showed 26.03 -> 25.06 ms
+  (constant, not merely "not scaling"). Distinct source anchors by stride:
+  s=1 -> 1.6M (capped by the grid, so **1:1 — ZERO redundancy to harvest**),
+  s=3 -> exactly 1:1 with the grid, s=4 -> 100,122 (**43.7%** duplicates).
+  So anchor-rating buys NOTHING at today's ultra stride 1 and at most ~44% of
+  25 ms even at stride 4.
+  ⇒ **The real R8b question is not redundancy, it is that each shade thread
+  costs ~140 ns** (25 ms / 177,896). That is the probe gather + emitter slots +
+  palette + reflection-probe work per thread. Investigate what is IN the thread
+  before proposing a dispatch change. R8b is now UNSCOPED pending that.
+
+## ⭐⭐ THE MIRROR-MASK CLEAR BUG — ROOT CAUSE FOUND AFTER FOUR REVERTS
+
+Not `renderer.autoClear` failing to survive a context switch (the standing
+guess). The real chain, verified in three's source:
+
+- A WebGPU render pass's loadOp is decided ONLY by
+  `renderContext.clearColor/clearDepth/clearStencil` (WebGPUBackend.js:852-916).
+- Those three are written in exactly one place: `Background.update`, called
+  unconditionally from `Renderer._renderScene` on EVERY `renderer.render()`.
+- Its gate is `if ( renderer.autoClear === true || forceClear === true )`
+  (Background.js:185) — **an OR. So `renderer.autoClear = false` is IGNORED
+  whenever `forceClear` is set.**
+- `forceClear` is set whenever `scene.background` is an opaque Color
+  (Background.js:71-78) — and this engine ALWAYS installs one unless an
+  HDRI/texture skybox is present (`sceneSettings.js:446` and `:468`).
+
+⇒ On any scene with a plain colour background — **a Cornell box** — the mask
+pass began from a fully cleared MRT pair AND cleared depth, so only
+GI_MIRROR_LAYER meshes survived as gbuffer geometry and every diffuse wall went
+black. **Sponza survived only because its mask covered most materials.** That is
+the entire four-revert history, and it was never about `setMRT` or the override
+swap.
+
+**FIX (small, and it is the same one `godraysShadow.js` already uses at line
+211):** null `scene.background` for the duration of the mask pass — that alone
+takes Background.js's null branch, leaves `forceClear` false, lets
+`autoClear = false` reach the "clear nothing" path, AND removes the full-screen
+background MESH a texture background would otherwise unshift (which bypasses
+`camera.layers` entirely). Restore it in the existing `finally`. Exact anchors
+in the map result. ⚠ Still gate it with a readback rig asserting a NON-mirror
+pixel's `output.w` survives the mask pass before re-flipping `__giBvhMask`.
+
+⭐ **THE TIER SIGNAL — a design that sidesteps the four mask reverts.** Do NOT
+revive the second gbuffer pass. Render a SEPARATE, SMALL, single-channel mirror
+mask into its OWN render target (cleared to 0, drawing only GI_MIRROR_LAYER
+meshes — 2 materials on Bistro), ideally at BLOCK resolution since only
+per-block granularity is needed. This cannot reproduce the Cornell wipe, because
+it never shares an attachment with the gbuffer: the failure mode of a wrong or
+missing bit is a COARSER TRACE, never a black wall. That asymmetry is the whole
+argument — the mask was catastrophic when it gated whether a pixel is traced AT
+ALL, and is benign when it only picks a resolution.
+
+⇒ **R8 IS STILL THE HIGHEST-VALUE UNIT IN THE PLAN**, ahead of F2-F5: it is
+~50 ms of a ~52 ms GPU frame, and the CPU work that remains (F2 per-draw encode
+~6 ms, F3 fingerprints ~2 ms, F4 submits ~2-5 ms) cannot be seen until the GPU
+stops being the ceiling. It also touches the user's open visual complaint — the
+window reflections are both slow AND laggy.
+⚠ R8's design constraint stands: the per-pixel tier signal must NOT come from
+the mirror-mask second gbuffer pass (the Cornell black-walls bug, fourth mask
+revert) — carry the tier in the MAIN gbuffer pass instead.
+
+---
 
 # ══ §16 — THE DYNAMIC GI OVERHAUL (2026-08-24, USER MANDATE) ══
 
@@ -58,6 +1207,111 @@ ULTRA; measure there, probe-blind-statistics rule 9).
   is still a permutation — no leak/double-free under held blocks). Still
   owed: mid-play tiles empty-texel% and walk-probe checker AT ULTRA on the
   user's Level.
+- **✅ D1c — §12.87 TILE COVERAGE IS A FRACTION BY DEFAULT (SHIPPED
+  2026-08-26).** Flipped `__giTileCoverFraction` to default-on in BOTH twins
+  (`srcTiles.js` GPU, `srcRef.js` mirror); `false` is now the opt-out. The
+  change had been sitting opt-in with its own comment saying it would ship
+  "OPT-IN until a measurement earns it" — this is that measurement.
+
+  WHY IT IS A CONVERGENCE UNIT, not a cosmetic one. `bakeProbeIrradiance`
+  renormalises over the KNOWN bins, i.e. it EXTRAPOLATES them across the whole
+  cosine lobe, and a flag told the gather that a one-bin extrapolation was as
+  trustworthy as a fully sampled texel. So whichever corner won a cell handed
+  that whole cell its single-bin constant, and which corner wins churns as
+  probes re-mint — precisely this front's "blocky-rectangle patches". The
+  honest fraction lets better-sampled neighbours carry the cell. It cannot
+  darken: the gather's `acc` and `wsum` both carry the factor, so a uniformly
+  discounted probe renormalises to the same mean and only RATIOS move.
+
+  RECEIPTS, AND THEY ARE ASYMMETRIC — READ BOTH HALVES. The evidence for this
+  unit is a LIVE OBSERVATION, not a harness number, and `probe:gi-walk` was
+  run and could NOT confirm it. Do not cite this entry as if the probe had.
+
+  (a) THE LIVE A/B — the user's own editor, ultra, their Level, against "when
+  camera moves and sees a new surface … patches look like a checkerboard, some
+  darker, some brighter": the fraction took the patches to **almost gone at no
+  fps cost**, where `__giSrcProbeRayCap = 0` cost **60 → 45 fps** and cleared
+  LESS. That comparison is the unit's central finding and it redirects D2/D4:
+  a starved probe's problem is not that it has too few rays, it is that it
+  VOTES AS IF IT HAD ENOUGH. Cheap honesty about confidence beats expensive
+  extra evidence.
+
+  (b) THE HARNESS — `ARMS=base,nocoverfrac QUALITY=ultra probe:gi-walk`, run
+  TWICE. **Null, and the instrument is why.** Between-arm gap: leg1 `checker`
+  0.0638 (base) vs 0.0648, ~1.5%, and leg0 REVERSED at 0.0753 vs 0.0596.
+  Between-RUN gap for the SAME arm: base leg1 `checker` 0.0898 → 0.0638 (29%)
+  and `crease` p99 0.97064 → 0.65323 (33%). The replicate moves several times
+  further than the arms differ, the sign of the arm difference flips between
+  runs on both metrics, and the aggregate `err0` verdict flips with it (run 1
+  base 0.02120 vs 0.01322; run 2 base 0.00764 vs 0.05395). So the probe cannot
+  resolve an effect this size at n=1 per arm, and no reading from it — in
+  either direction — is admissible here. Clean in both runs otherwise: no
+  `storage` line, no WebGPU validation error, no `pageerror`.
+
+  The unit ships on (a) plus the estimator argument above, which stands on its
+  own: a biased extrapolation must not carry a full vote. It is NOT resting on
+  (b). The offline gates that DO bear on it are the twin-agreement ones, and
+  those pass: `test:gi-src-tiles`, `test:gi-src-gather`, `test:gi-src-ref`,
+  `smoke:gi-gpu` (storage still 8/stage).
+
+  ⚠ TWO INSTRUMENT DEFECTS THIS EXPOSED, both worth fixing before anyone
+  trusts `probe:gi-walk` on a convergence unit again. They join the SEVEN
+  uncontrolled inputs already in its header.
+    · **leg0 measures a near-black frame.** Tail mean luma 0.00579 (and
+      0.00026 on a cold run), so `checker` — a first difference normalised by
+      the mean — is computed on noise. leg0 needs a lit camera position or its
+      readings should not be reported at all.
+    · **A cold run puts the compile wave inside the measuring window**
+      (`SLOWEST PIPELINE #105 [bvhHitShade] 36.6s`, first frame after the wave
+      17086 ms), and one arm's probe pool COLLAPSED at rest (leg1 nocoverfrac
+      c0 live 4779 → 323), which makes its orphan rate a ratio over an empty
+      store. Both runs also fired the §12.56 `reflProbeCapture` watchdog.
+    · Wanted: repeated runs per arm with a paired-difference verdict, so the
+      probe reports an effect against its OWN replicate spread instead of a
+      single number per arm.
+
+  ⚠ A FALSE ALARM, KILLED HERE SO IT IS NOT RE-RAISED. leg0's `tiles cover %`
+  and `knownBins` are BIT-IDENTICAL between the two arms, which reads as "the
+  hatch is not reaching the bake". It is not — both statistics are computed
+  from `TS_TEXELS` (incremented on `wsum > 0`) and `TS_KNOWN` (a count of
+  known bins), and NEITHER reads `cover`. Identical is the expected result and
+  says nothing about whether the fraction is live.
+
+  SCALE OF THE DEFECT, newly measured: **89.5% of tile texels sampled only
+  part of their lobe** (20,622 of 23,040 on the tiles gate's synthetic field).
+  One-bin extrapolation was never a tail case.
+
+  GATE CHANGES THIS FORCED, and they are not rubber stamps. The GPU
+  premultiplies `cover` into the atlas RGB (it must — its gather divides by
+  `Σ w·c` once) while the mirror keeps coverage in a separate array and
+  multiplies at gather time. Both compute `Σ w·c·E / Σ w·c` and agree at the
+  GATHER; only their stored bytes differ. So `test:gi-src-tiles` now compares
+  its interior arm against `mirror × cover`, and its coverage arm asserts alpha
+  **IS** the sampled fraction rather than a 0/1 flag — strictly stronger than
+  the assertion it replaces, since it pins every intermediate value. A new arm
+  fails if nothing is fractional, so the suite cannot silently revert to
+  testing the flag.
+
+  ⚠ MEASURED PRECISION COST, recorded so it is not rediscovered as a bug.
+  `test:gi-src-gather`'s coverage arm goes **0.12% → 2.79%** worst GPU-vs-mirror
+  error (confirmed causal by forcing the hatch off and re-running). It is
+  CONDITIONING, not a defect: with `c ∈ {0,1}` numerator and denominator round
+  almost identically, and with continuous `c` they carry coverage's full
+  dynamic range through different f16/filter-weight roundings, amplified by the
+  spread of `E` across the tap (~7× on that field). That arm's bound is now 4%
+  with the arithmetic written down; every other arm stays at 1% and still
+  passes at 0.44%, which is what says the estimator did not move.
+
+  ⚠ IT COMPOUNDS WITH D3's MATURITY, intentionally — `cover = sampledFraction ×
+  maturity`, two different ignorances (WHICH directions are unknown vs HOW MUCH
+  any of them is worth), so a product is the right composition.
+
+  CONTROL ARM: `ARMS=nocoverfrac` in `run-gi-walk-patches.mjs` restores the
+  flag, so `base` has something to be compared against. Read `checker` and
+  `crease` — but see (b): the arm is only worth running once the probe can
+  resolve a ~10% effect, i.e. after the two instrument defects above are
+  fixed. Still owed, and NOT discharged by (b): a walk-probe `checker` delta
+  at ultra on the user's Level, which is also what D1 above still owes.
 - **D2 — seed pass made real.** (a) `SEED_NOBLOCK` counter at the silent
   srcSeed.js:216 exit; (b) un-gate the §12.59.2 LOD+1 spatial rescue from
   world keys (srcSeed.js:173) with arm-aware cell recovery mirroring [B]'s
@@ -343,6 +1597,33 @@ heap-kill signature).
   ray (vs 128 slab tests + k BLAS walks). Sharp mirrors keep texture
   detail on the big meshes; everything else gets correct geometry with
   mean albedo.
+  R7b DESIGN (settled 2026-08-24 night, pre-implementation):
+  · Mapping source: `field.placements` carries `{slot, mesh, instanceId}`
+    (GISystem#occupancyContentOf; slots stable-for-life via _occSlotMap).
+    At #syncBvhScene cadence build Int32Array(paletteSlots).fill(-1);
+    for each placement with instanceId == null whose mesh is seated in
+    bvhScene.meshes, table[slot] = bvhScene table index. Instanced
+    placements stay -1 (bvhScene's worldToLocal is the MESH matrix, not
+    the per-instance one — the window walk would miss anyway; palette
+    fallback is correct). Upload as attributeArray("int").toReadOnly().
+    Slots spawned after the sync stay -1 → palette fallback, graceful.
+  · Window walk (giScreen prepass, inside the accepted oneBvhHit branch):
+    mi = table[slot]; if mi ≥ 0: ε = max(0.01, t·0.002);
+    ro2 = (origin + R·t) − R·ε, local-transform via worldToLocal[mi],
+    bvhMeshFirstHitFn(..., maxT = 2ε) — t is world-parameter-identical
+    in local space (bvhScene's CRITICAL unnormalized-rd note), so ε in
+    world units is valid directly. Accept ONLY hits inside the window;
+    resolve UV → atlas via the SAME post-loop math as firstHit (extract
+    that block into a shared resolveHitAlbedo(meshIdx, tri, uv) helper
+    on the scene object rather than duplicating the offset math).
+  · Any window miss keeps the palette albedo — no black, no env leak.
+  · createGiBvhReflect already receives BOTH bvhScene and oneBvh; the
+    refinement re-binds the incumbent's 5 buffers + atlas into the
+    prepass (what the incumbent bound anyway).
+  · Hatch: `__giBvhTexRefine = false` (build-time, like the others).
+  · Static-merge meshes: both systems see the same merged mesh objects
+    and merged geometry keeps UVs valid against the shared material's
+    map — no special case.
   (e) Hatch `__giOneBvhReflect = false` keeps the incumbent path for A/B.
   Gates: test:gi-hit-shade + test:gi-reflection-probes (unchanged
   semantics), a NEW prepass-content assertion (a small unseated prop must
@@ -378,6 +1659,33 @@ heap-kill signature).
   (c) the REBUILD HEAP LEAK is now a session-killer (13.3 GB → device
   loss) — next session opens with a real retainer-graph snapshot, not a
   fourth guess.
+  ✅ (c) ANSWERED by the 18-agent retention audit (2026-08-24 night, 12
+  CONFIRMED / 0 refuted; full detail in the audit result + memory). The
+  3.8 GB post-GC IDLE baseline (measured headless on Bistro ultra) is
+  single-generation CPU mirrors nothing reads back: bits 449 MB
+  (occupancyField:613), SRC bin-store shadows 171 MB (srcSystem:745),
+  surfScratch 86 MB, plus asset caches (blobUrlCache 160 MB/scene,
+  merging _uberCache ≤960 MB ceiling, KTX2 transcode copies). The CLIMB
+  is orphan storms, each priced: ⭐ giOwner PINNING (GISystem:530 —
+  `data.giOwner` never cleared; three's session-lifetime Pipelines.caches
+  → pipeline → backend dict → giOwner → whole TSL graph + buffers; turns
+  every orphan below into a HARD leak, ~800 MB-1.4 GB/churny session);
+  buildStaticSceneBvhWords ~780 MB TRANSIENT per static-BVH rebuild
+  (soup + slice copies + plain-JS tris array of 26M doubles — and live
+  editing fires one per mover batch); occupancyField dispose() is EMPTY
+  (~573 MB retained per scene switch); makeField degrade ladder can
+  allocate the full field ×3 per build (~500 MB spikes); resize storm
+  #syncScreenResolveSize replaces ~20 screen kernels on a 2-px tolerance
+  with NO releaseComputeNodes sweep (~500 MB per resize);
+  ensureComputes geometry-revision chain swap (~280 MB) and
+  #rebuildSrcProbesForPools pool-grow swap (~150 MB) — same missing
+  sweep. FIX ORDER: (1) null giOwner/giTiming once the pipeline settles;
+  (2) releaseComputeNodes at the FOUR incremental swap sites (resolve
+  resize, ensureComputes, pool grow, #syncBvhScene incremental) — the
+  exact call #dispose already makes; (3) implement field dispose();
+  (4) detach post-upload CPU mirrors (⚠ verify re-upload/device-restore
+  paths first — incremental setGeometry may write CPU-side); (5) worker
+  BVH (B1) also caps the 780 MB transient by moving it off-heap.
 - **S3-sched — DEMAND-GATED POOL SWEEPS ("only what we need"):** tiles
   bake ALL 21,875 blocks × 64 texels EVERY frame; decay/merge sweep the
   whole bin pool. Gate per-block work on a dirty bit (deposits landed /
@@ -396,6 +1704,53 @@ heap-kill signature).
   flipping over ~13 s) re-invalidates merge groups, BATCH the flips (one
   pass once all floors resolve, or exempt GI-internal needsUpdate from
   merging's material-edit watcher).
+- **⛔ R4 CLASSIFICATION REFUTED AS A DEFAULT (2026-08-24, ~15:40 — the
+  user's eyes + three A/B boots, STRONGER than the fix below).** With the
+  channel floors finally working, the FIRST live reclassification produced
+  "started to look bad" — shadowed arcades near-black. Attribution chain:
+  AO exonerated (on/off identical); classification-off boot = bright;
+  floor→bucket-2 = black (directional chain compiled out); floor→bucket-1
+  = STILL murky ⇒ the missing energy is the canMirror block's HIT-SHADED
+  EXACT RADIANCE itself. At grazing angles Fresnel drives rough-surface
+  specular high — R4's founding premise ("the dense prepass computes a
+  term smoothstep zeroes") is TRUE of the mirror gate and FALSE of the
+  hit-shade path, which on Sponza paints a real share of every shadowed
+  wall. The 22.7 ms is lighting, not waste. Classification is back to
+  OPT-IN (`__giRoughnessFloorClassify === true`); the channel-floor
+  machinery, idle drain, flip/floor/census receipts, and the node gate
+  (run-gi-roughness-floor-test.mjs, armed) all remain — they are the
+  substrate for the REAL unit:
+  **→ NEXT: R8 ROUGHNESS-TIERED PREPASS RESOLUTION.** Rough pixels are
+  low-frequency by definition: trace them at stride 4 (1/16 rays) with
+  the EXISTING block-replication machinery and keep stride 1 only for
+  true mirror pixels (floor < mirror gate). Same energy, ~10-20 ms →
+  ~2-4 ms expected on Sponza/Bistro-class scenes. The floors classify
+  RESOLUTION TIERS instead of path membership.
+  ⚠ R8 DESIGN CONSTRAINT added same night: the per-pixel roughness/tier
+  signal must NOT come from the mirror-mask second gbuffer pass — that
+  pass WIPES pass 1's geometry (the Cornell black-walls bug, fourth mask
+  revert; see GISystem#bvhMaskEnabled's banner and memory). Either fix
+  the mask's clear semantics first (rig: assert a non-mirror pixel's
+  position.w survives the mask pass) or carry the tier in the MAIN
+  gbuffer pass (e.g. quantized floor in position.w's spare bits / a
+  third MRT written by the one pass), which also deletes the second
+  full-scene submission entirely — the better end state.
+- **✅ R4-FIX — THE PACKED-MAP CHANNEL BLINDNESS (2026-08-24 night, user:
+  "10 fps on ultra, dropped notably recently").** Live Sponza profile: 31 ms
+  GPU frame, of which bvhReflect 12.3 + bvhHitShade 10.4 = 22.7 ms — and
+  the bucket line read "0 mirror, 0 specular, 15 diffuse-only, 24
+  dynamic-roughness". R4's floor stat was p5 of per-texel min(RGB); on a
+  glTF PACKED metallicRoughness texture B is METALNESS ≈ 0 on every
+  dielectric texel, so the floor read 0 on every packed map and NO such
+  material ever left the consumer set — R4's Level-rig receipt was real
+  but the Level's ambientCG-style GRAYSCALE roughness maps are the one
+  layout min-RGB survives. Fix: per-channel p5 floors
+  ({r,g,b,min} in giRoughnessFloorStats; legacy number = min) + the source
+  walk names the sampled channel (roughnessMap → "g", three's PBR
+  convention; a graph SplitNode names its own; unknown → min fallback,
+  conservative). Gate: scripts/run-gi-roughness-floor-test.mjs (9 checks,
+  node-side, no editor). This likely also shrinks Bistro's "102
+  dynamic-roughness" the same way.
 
 ---
 

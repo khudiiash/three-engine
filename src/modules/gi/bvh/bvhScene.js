@@ -383,61 +383,61 @@ export const ALBEDO_ATLAS_SIZE = ALBEDO_ATLAS_TILE * ALBEDO_ATLAS_GRID; // 3072
  * relays it through a QuadMesh, the same orientation-preserving idiom every
  * postprocessing pass in this three.js build already relies on.
  */
-function buildAlbedoAtlas(entries) {
-  const canvas =
-    typeof document !== "undefined"
-      ? Object.assign(document.createElement("canvas"), { width: ALBEDO_ATLAS_SIZE, height: ALBEDO_ATLAS_SIZE })
-      : new OffscreenCanvas(ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_SIZE);
-  const ctx = canvas.getContext("2d");
-  let texturedCount = 0;
-  // Tiles the canvas 2D path above could not draw — consumed exactly once by
-  // blitBvhAtlasTiles (giScreen.js), which clears this back to [] once the
-  // GPU pass has overwritten them for real (see that function's comment).
-  const pendingGpuTiles = [];
-  entries.forEach((entry, i) => {
-    const tileX = (i % ALBEDO_ATLAS_GRID) * ALBEDO_ATLAS_TILE;
-    const tileY = Math.floor(i / ALBEDO_ATLAS_GRID) * ALBEDO_ATLAS_TILE;
-    const material = Array.isArray(entry.mesh.material) ? entry.mesh.material[0] : entry.mesh.material;
-    const map = material?.map;
-    let drew = false;
-    if (map) {
-      const image = map.image ?? map.source?.data;
-      if (image && image.width > 0 && image.height > 0) {
-        ctx.save();
-        try {
-          // Local tile space (0,0)-(TILE,TILE), Y-flipped so the source
-          // image's row 0 lands at the BOTTOM of the tile — see the FLIP
-          // note above.
-          ctx.translate(tileX, tileY + ALBEDO_ATLAS_TILE);
-          ctx.scale(1, -1);
-          ctx.drawImage(image, 0, 0, ALBEDO_ATLAS_TILE, ALBEDO_ATLAS_TILE);
-          drew = true;
-        } catch {
-          drew = false;
-        } finally {
-          ctx.restore();
-        }
+function makeAtlasCanvas(size = ALBEDO_ATLAS_SIZE) {
+  return typeof document !== "undefined"
+    ? Object.assign(document.createElement("canvas"), { width: size, height: size })
+    : new OffscreenCanvas(size, size);
+}
+
+/**
+ * Draws ONE material into tile `i`. Returns whether real texture pixels
+ * landed (as opposed to the flat-colour placeholder). Shared by the seated
+ * per-mesh atlas and the §18.17 per-slot one so the FLIP convention and the
+ * compressed-texture fallback can never drift between them.
+ */
+function drawAlbedoTile(ctx, material, i, pendingGpuTiles, tilePx = ALBEDO_ATLAS_TILE, grid = ALBEDO_ATLAS_GRID) {
+  const tileX = (i % grid) * tilePx;
+  const tileY = Math.floor(i / grid) * tilePx;
+  const map = material?.map;
+  let drew = false;
+  if (map) {
+    const image = map.image ?? map.source?.data;
+    if (image && image.width > 0 && image.height > 0) {
+      ctx.save();
+      try {
+        // Local tile space (0,0)-(TILE,TILE), Y-flipped so the source
+        // image's row 0 lands at the BOTTOM of the tile — see the FLIP
+        // note above.
+        ctx.translate(tileX, tileY + tilePx);
+        ctx.scale(1, -1);
+        ctx.drawImage(image, 0, 0, tilePx, tilePx);
+        drew = true;
+      } catch {
+        drew = false;
+      } finally {
+        ctx.restore();
       }
     }
-    if (drew) {
-      texturedCount++;
-    } else {
-      ctx.fillStyle = material?.color ? `#${material.color.getHexString()}` : "#808080";
-      ctx.fillRect(tileX, tileY, ALBEDO_ATLAS_TILE, ALBEDO_ATLAS_TILE);
-    }
-    // GPU-blit candidate: the canvas draw failed for any reason (no
-    // CPU-readable image, zero-size, a decode error — `!drew`), or the map
-    // is flatly a compressed texture. For a CompressedTexture `drew` is
-    // already false in every observed case (caught by the try/catch above),
-    // but the explicit `isCompressedTexture` check keeps this correct even
-    // if some future/other path lets a compressed map through the canvas
-    // silently — the GPU sample is the authoritative one either way, so it
-    // still gets queued to overwrite whatever the canvas produced.
-    if (map && (!drew || map.isCompressedTexture)) {
-      pendingGpuTiles.push({ map, tileIndex: i });
-    }
-  });
+  }
+  if (!drew) {
+    ctx.fillStyle = material?.color ? `#${material.color.getHexString()}` : "#808080";
+    ctx.fillRect(tileX, tileY, tilePx, tilePx);
+  }
+  // GPU-blit candidate: the canvas draw failed for any reason (no
+  // CPU-readable image, zero-size, a decode error — `!drew`), or the map
+  // is flatly a compressed texture. For a CompressedTexture `drew` is
+  // already false in every observed case (caught by the try/catch above),
+  // but the explicit `isCompressedTexture` check keeps this correct even
+  // if some future/other path lets a compressed map through the canvas
+  // silently — the GPU sample is the authoritative one either way, so it
+  // still gets queued to overwrite whatever the canvas produced.
+  if (map && (!drew || map.isCompressedTexture)) {
+    pendingGpuTiles.push({ map, tileIndex: i });
+  }
+  return drew;
+}
 
+function finishAtlas(canvas) {
   const atlasTexture = new THREE.CanvasTexture(canvas);
   atlasTexture.colorSpace = THREE.SRGBColorSpace;
   atlasTexture.flipY = false;
@@ -447,7 +447,106 @@ function buildAlbedoAtlas(entries) {
   atlasTexture.wrapS = THREE.ClampToEdgeWrapping;
   atlasTexture.wrapT = THREE.ClampToEdgeWrapping;
   atlasTexture.needsUpdate = true;
-  return { atlasTexture, texturedCount, pendingGpuTiles };
+  return atlasTexture;
+}
+
+function buildAlbedoAtlas(entries) {
+  const canvas = makeAtlasCanvas();
+  const ctx = canvas.getContext("2d");
+  let texturedCount = 0;
+  // Tiles the canvas 2D path above could not draw — consumed exactly once by
+  // blitBvhAtlasTiles (giScreen.js), which clears this back to [] once the
+  // GPU pass has overwritten them for real (see that function's comment).
+  const pendingGpuTiles = [];
+  entries.forEach((entry, i) => {
+    const material = Array.isArray(entry.mesh.material) ? entry.mesh.material[0] : entry.mesh.material;
+    if (drawAlbedoTile(ctx, material, i, pendingGpuTiles)) texturedCount++;
+  });
+  return { atlasTexture: finishAtlas(canvas), texturedCount, pendingGpuTiles };
+}
+
+/**
+ * Per-slot atlas geometry — the SAME 12x12 grid as the seated atlas, at HALF
+ * the tile size.
+ *
+ * ⚠ VRAM, not taste. A second 3072-square atlas is 37 MB of canvas texture
+ * plus a 75 MB half-float blit target beside the pair the seated atlas already
+ * holds, on a module whose worst production failure to date is a GPU device
+ * lost to memory pressure. 128 px per material costs 9 + 19 MB and is spent on
+ * a REFLECTION, traced at half resolution, of a texture — the magnification
+ * limit on a flat mirror bites long before the tile does.
+ * `__giReflectAtlasTile` overrides for an A/B.
+ */
+export const SLOT_ATLAS_GRID = ALBEDO_ATLAS_GRID;
+export const SLOT_ATLAS_TILES = SLOT_ATLAS_GRID * SLOT_ATLAS_GRID;
+
+/**
+ * §18.17 — THE PER-SLOT ALBEDO ATLAS: what makes one-BVH reflections
+ * TEXTURED (2026-08-26, user: "for reflections we average color of the mesh,
+ * we need texture sampling, as average color won't work for many cases").
+ *
+ * §17 R7a replaced the seated <=128-mesh BVH with the one world-space BVH8 so
+ * that every prop appears in a mirror — and paid for it by dropping the
+ * texture lookup the old path had, because that path resolved UVs from
+ * per-mesh vertex buffers the world BVH does not carry. Hits have shaded from
+ * the occupancy slot MEAN albedo ever since, which is why the user Sponza
+ * reflects flat red and green curtains instead of patterned ones.
+ *
+ * The missing half is a tile the world BVH can address. Tiles are keyed by
+ * MATERIAL, not by slot: a scene is placements-many (hundreds) but
+ * materials-few (Sponza: 25), so 144 tiles cover real scenes, where a
+ * per-slot atlas at the same tile size would be a 200 MB canvas. Slots beyond
+ * the cap, and slots whose material has no map, keep the palette mean — the
+ * pre-§18.17 picture, per slot, never a hole.
+ *
+ * Returns the atlas plus `tileOfSlot` (Map slot -> tile index); the caller
+ * turns that into the per-slot uniform the reflect prepass indexes.
+ */
+export function buildSlotAlbedoAtlas(placements) {
+  const raw = Number(globalThis.__giReflectAtlasTile);
+  const tilePx = Number.isFinite(raw) ? Math.max(16, Math.min(512, Math.round(raw))) : 128;
+  const size = tilePx * SLOT_ATLAS_GRID;
+  const canvas = makeAtlasCanvas(size);
+  const ctx = canvas.getContext("2d");
+  const pendingGpuTiles = [];
+  const tileOfMaterial = new Map();
+  const tileOfSlot = new Map();
+  let texturedCount = 0;
+  let overflow = 0;
+  for (const p of placements ?? []) {
+    const material = Array.isArray(p.mesh?.material) ? p.mesh.material[0] : p.mesh?.material;
+    // NO MAP, NO TILE — and this is not just an economy. A tile for a map-less
+    // material is a flat fill of `material.color`, while the per-slot palette
+    // already holds `resolveMaterialSurface`'s answer for that mesh, which
+    // accounts for things a raw `.color` does not (a compressed map's GPU
+    // average, an emissive promotion). Taking the tile there would REPLACE a
+    // better number with a worse one, and it would spend a scarce tile doing
+    // it. Only a real texture beats the mean.
+    if (!material?.map) continue;
+    let tile = tileOfMaterial.get(material);
+    if (tile == null) {
+      if (tileOfMaterial.size >= SLOT_ATLAS_TILES) { overflow++; continue; }
+      tile = tileOfMaterial.size;
+      tileOfMaterial.set(material, tile);
+      if (drawAlbedoTile(ctx, material, tile, pendingGpuTiles, tilePx, SLOT_ATLAS_GRID)) texturedCount++;
+    }
+    tileOfSlot.set(p.slot, tile);
+  }
+  if (tileOfMaterial.size === 0) return null;
+  return {
+    atlasTexture: finishAtlas(canvas),
+    tileOfSlot,
+    materialCount: tileOfMaterial.size,
+    texturedCount,
+    overflow,
+    pendingGpuTiles,
+    // Geometry travels WITH the atlas: blitBvhAtlasTiles reads these off the
+    // object it is handed, so the two atlases can differ in tile size without
+    // either one carrying the other's constants.
+    atlasSize: size,
+    atlasTile: tilePx,
+    atlasGrid: SLOT_ATLAS_GRID,
+  };
 }
 
 /**

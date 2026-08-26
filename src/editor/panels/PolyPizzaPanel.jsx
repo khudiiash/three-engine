@@ -13,7 +13,7 @@ import {
   searchModels,
 } from "../polypizza.js";
 import { CREDENTIAL_CHANGED_EVENT } from "../credentialEvents.js";
-import { ModelPreview } from "../components/ModelPreview.jsx";
+import { AssetPreview } from "../components/AssetPreview.jsx";
 
 const openModulesPanel = () => import("../EditorShell.jsx").then((m) => m.openPanel("modules"));
 
@@ -284,14 +284,7 @@ function ModelDetail({ model, hasProject, onClose }) {
           says nothing about whether its walk cycle is usable, and that is the
           whole question being asked before an import. Falls back to the
           thumbnail only when there is no downloadable GLB to show. */}
-      {/* Deliberately NOT `ph-detail-preview`: that class paints a background
-          and rounds the corners for the <img> it was written for, and layering
-          it under the stage's own box double-draws both. */}
-      {model.downloadUrl ? (
-        <ModelPreview src={model.downloadUrl} />
-      ) : (
-        model.thumbnailUrl && <img className="ph-detail-preview" src={model.thumbnailUrl} alt={model.name} />
-      )}
+      <AssetPreview src={model.downloadUrl} thumbnailUrl={model.thumbnailUrl} alt={model.name} />
       <h3 className="ph-detail-name">{model.name}</h3>
       <div className="ph-detail-meta">
         <span>by {model.author}</span>

@@ -17,6 +17,7 @@ import { listProjectEntries, withoutSidecars } from "./assetLoader.js";
 import { openPanel } from "./EditorShell.jsx";
 import { useAssetRevealStore } from "./assetReveal.js";
 import { keyScopeOwns } from "./keyScope.js";
+import { makeItem, score, TYPE_WEIGHT } from "./quickSearchRank.js";
 
 const PANELS = [
   ["viewport", "Viewport"], ["game", "Game"], ["hierarchy", "Hierarchy"],
@@ -26,7 +27,7 @@ const PANELS = [
   ["projectSettings", "Project Settings"], ["build", "Build"], ["modules", "Modules"],
   ["input", "Input"], ["events", "Events"], ["eventGraph", "Event Graph"], ["geometryEditor", "Geometry Editor"], ["postprocess", "Post Process"],
   ["polyhaven", "Poly Haven"], ["ambientcg", "AmbientCG"], ["sketchfab", "Sketchfab"],
-  ["polypizza", "Poly Pizza"],
+  ["polypizza", "Poly Pizza"], ["fab", "Fab"],
   ["itchio", "itch.io"], ["audioLibrary", "Audio Library"], ["audioEditor", "Audio Editor"],
   ["terminal", "Terminal"], ["mcp", "Assistant (MCP)"],
   // The panel id doubles as a search keyword (see `panelItems`), so "git"
@@ -38,48 +39,6 @@ const SETTINGS = [
   ["sceneSettings", "Scene Settings", ["Environment", "Background", "Ambient", "Intensity", "Cube Map", "Show as Sky", "Use for Lighting", "Fog", "Type", "Color", "Near", "Far", "Density", "Tone mapping", "Exposure", "Shadows", "Performance", "Max device pixel ratio", "Render scale", "Dynamic res", "Target FPS", "Volume quality", "Occlusion culling", "Renderer", "Antialias", "MSAA samples", "Transparent", "Shadow", "Map type"]],
   ["projectSettings", "Project Settings", ["Editor", "Autosave", "Snap move", "Snap rotate", "Snap scale", "Show grid", "Grid size", "Divisions", "Keybindings", "Scripts", "Hot reload", "Poll", "Performance", "Pixel ratio cap", "Game", "Title", "Main scene", "Saves", "Save id", "Save version", "Physics Layers"]],
 ];
-
-const TYPE_WEIGHT = { entity: 0, asset: 1, panel: 2, setting: 3 };
-
-function makeItem(type, title, subtitle, activate, keywords = "") {
-  return { type, title, subtitle, activate, haystack: normalizeSearch(`${title} ${subtitle ?? ""} ${keywords}`) };
-}
-
-function normalizeSearch(value) {
-  return String(value ?? "")
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
-}
-
-function score(item, query) {
-  const q = normalizeSearch(query).trim();
-  if (!q) return 0;
-  const tokens = q.split(/\s+/).filter(Boolean);
-  const phraseAt = item.haystack.indexOf(q);
-  const tokenPositions = tokens.map((token) => item.haystack.indexOf(token));
-  // Match the complete phrase when possible, but accept all query words in
-  // any order too. This keeps "mcp" useful for "Assistant (MCP)" and makes
-  // multi-word searches forgiving without scanning anything asynchronously.
-  if (phraseAt < 0 && tokenPositions.some((position) => position < 0)) {
-    const compactQuery = q.replace(/[^a-z0-9]/g, "");
-    const compactHaystack = item.haystack.replace(/[^a-z0-9]/g, "");
-    if (!compactQuery || !compactHaystack.includes(compactQuery)) return -1;
-  }
-  const title = normalizeSearch(item.title);
-  const firstMatch = phraseAt >= 0
-    ? phraseAt
-    : Math.min(...tokenPositions.filter((position) => position >= 0), item.haystack.length);
-  // Keep every valid match above zero. The position only affects ordering;
-  // it must never make a later match disappear from the result list.
-  return 1000
-    + (title === q ? 1400 : 0)
-    + (title.startsWith(q) ? 1000 : 0)
-    + (phraseAt === 0 ? 500 : 0)
-    + (tokens.length > 1 && tokenPositions.every((position) => position >= 0) ? 120 : 0)
-    - firstMatch
-    - TYPE_WEIGHT[item.type];
-}
 
 function ResultIcon({ type }) {
   const Icon = type === "entity" ? Box : type === "asset" ? FileBox : type === "panel" ? PanelsTopLeft : Settings2;
@@ -132,15 +91,31 @@ export function QuickSearch() {
     return () => { live = false; };
   }, [open, rootPath, changeCounter]);
 
+  // Every `key` below has to be UNIQUE, and that is not a detail. The list used
+  // to be keyed on `type:title:subtitle`, so a scene with two entities both
+  // named "Light Stand" gave them the same key — and React's own warning says
+  // the result is children "duplicated and/or omitted". That is exactly what it
+  // did: rows from the PREVIOUS query survived reconciliation and sat above the
+  // real match, while the footer count (read from the array, not the DOM)
+  // correctly said "1 result".
   const allItems = useMemo(() => {
-    const entityItems = Object.values(entities).map((entity) => makeItem(
-      "entity", entity.name || entity.id, "Entity · Hierarchy",
-      () => { useSelectionStore.getState().select(entity.id); openPanel("inspector"); },
-      `${entity.id} ${entity.tags?.join(" ") ?? ""}`,
-    ));
-    const assetItems = projectAssets.map((entry) => makeItem(
-      "asset", entry.name, `Asset · ${entry.path}`,
-      async () => {
+    const entityItems = Object.values(entities).map((entity) => makeItem({
+      key: `entity:${entity.id}`,
+      type: "entity",
+      title: entity.name || entity.id,
+      subtitle: "Entity · Hierarchy",
+      // Tags are searchable; the id only as a WHOLE — see quickSearchRank.js.
+      terms: entity.tags ?? [],
+      exact: entity.id,
+      activate: () => { useSelectionStore.getState().select(entity.id); openPanel("inspector"); },
+    }));
+    const assetItems = projectAssets.map((entry) => makeItem({
+      key: `asset:${entry.path}`,
+      type: "asset",
+      title: entry.name,
+      subtitle: `Asset · ${entry.path}`,
+      terms: [entry.path],
+      activate: async () => {
         const project = useProjectStore.getState();
         openPanel("assets");
         const dir = entry.path.replace(/[\\/][^\\/]+$/, "");
@@ -152,16 +127,30 @@ export function QuickSearch() {
         useSelectionStore.getState().selectAsset(entry.path);
         useAssetRevealStore.getState().reveal(entry.path, { focus: true });
       },
-      entry.path,
-    ));
-    const panelItems = PANELS.map(([id, title]) => makeItem("panel", title, "Panel", () => openPanel(id), id));
-    const settingItems = SETTINGS.flatMap(([id, title, properties]) => properties.map((property) => makeItem("setting", property, `Settings · ${title}`, () => {
+    }));
+    const panelItems = PANELS.map(([id, title]) => makeItem({
+      key: `panel:${id}`,
+      type: "panel",
+      title,
+      subtitle: "Panel",
+      // The panel id doubles as a keyword, so "git" finds "Source Control".
+      terms: [id],
+      activate: () => openPanel(id),
+    }));
+    const settingItems = SETTINGS.flatMap(([id, title, properties]) => properties.map((property) => makeItem({
+      key: `setting:${id}:${property}`,
+      type: "setting",
+      title: property,
+      subtitle: `Settings · ${title}`,
+      terms: [title],
+      activate: () => {
         openPanel(id);
         window.setTimeout(() => {
           const labels = [...document.querySelectorAll(".field-label, .section-header")];
           labels.find((label) => label.textContent.trim().toLocaleLowerCase().includes(property.toLocaleLowerCase()))?.scrollIntoView({ block: "center", behavior: "smooth" });
         }, 80);
-      }, `${property} ${title}`)));
+      },
+    })));
     return [...entityItems, ...assetItems, ...panelItems, ...settingItems];
   }, [entities, projectAssets]);
 
@@ -197,7 +186,7 @@ export function QuickSearch() {
         </div>
         <div className="quick-search-results">
           {results.length ? results.map((item, index) => (
-            <button type="button" key={`${item.type}:${item.title}:${item.subtitle}`} className={`quick-search-result ${index === active ? "active" : ""}`}
+            <button type="button" key={item.key} className={`quick-search-result ${index === active ? "active" : ""}`}
               onMouseEnter={() => setActive(index)} onClick={() => choose(item)}>
               <span className={`quick-search-kind ${item.type}`}><ResultIcon type={item.type} /></span>
               <span className="quick-search-copy"><span className="quick-search-title">{item.title}</span><span className="quick-search-subtitle">{item.subtitle}</span></span>

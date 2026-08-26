@@ -5,6 +5,7 @@ import { resolveAssetUrl } from "../assetResolver.js";
 import { loadMaterialAsset } from "../materialAsset.js";
 import { getGltfLoader, rebaseClipToZero } from "../gltfLoader.js";
 import { invalidateEntityBounds } from "../viewFrustum.js";
+import { applyCastShadow } from "../shadowMerge.js";
 
 // Draco-enabled shared loader: Draco-compressed .glb (from the draco module)
 // decode transparently; plain .glb are unaffected.
@@ -59,7 +60,7 @@ export class ModelComponent extends Component {
       this.root.traverse((obj) => {
         obj.userData.entityId = this.entity.id;
         if (obj.isMesh) {
-          obj.castShadow = this.props.castShadow !== false;
+          applyCastShadow(obj, this.props.castShadow !== false, this.entity.engine);
           obj.receiveShadow = this.props.receiveShadow !== false;
           // Provenance for derived-data sidecars (e.g. baked mesh SDFs):
           // GLB-internal geometries have no asset path of their own, so
@@ -191,7 +192,9 @@ export class ModelComponent extends Component {
   onPropChanged(key) {
     if ((key === "castShadow" || key === "receiveShadow") && this.root) {
       this.root.traverse((obj) => {
-        if (obj.isMesh) obj[key] = this.props[key] !== false;
+        if (!obj.isMesh) return;
+        if (key === "castShadow") applyCastShadow(obj, this.props[key] !== false, this.entity.engine);
+        else obj[key] = this.props[key] !== false;
       });
       return;
     }

@@ -98,8 +98,15 @@ function getDracoLoader() {
 }
 
 /** A fresh GLTFLoader with Draco decoding attached. */
-export function createGltfLoader() {
-  return new GLTFLoader()
+/**
+ * `manager` is optional and exists for one job: sources whose sibling
+ * resources do not live where the .gltf's URIs say they do. Poly Haven's CDN
+ * is the case — its `textures/x.jpg` resolves to a completely different path —
+ * and a LoadingManager URL modifier is how that gets fixed without teaching
+ * the loader about any particular provider. Omit it for ordinary loads.
+ */
+export function createGltfLoader(manager = undefined) {
+  return new GLTFLoader(manager)
     .register((parser) => new LegacySpecGlossExtension(parser))
     .setDRACOLoader(getDracoLoader());
 }

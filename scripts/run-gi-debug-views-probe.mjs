@@ -12,10 +12,16 @@
 // ── THREE INSTRUMENT TRAPS THIS PROBE PAID FOR, all three of which reported
 // "the overlay shader is broken" when the shader was fine:
 //
-// 1. `gi.props.debugProbes = mode` DOES NOTHING. A raw props write skips the
+// 1. `gi.props.debugView = mode` DOES NOTHING. A raw props write skips the
 //    component's prop accessor, so `onPropChanged` → GISystem.onComponentProp →
 //    #applyDebugVisibility never fires and every view stays hidden. Use
-//    `setProp`.
+//    `setProp`. The legacy `debugProbes` prop is RETIRED — it is now a
+//    "debugView" sub-mode reachable through `globalThis.__giDebugView` for the
+//    SDF / occupancy / SRC-probes overlays, and through `props.debugView` for
+//    the GI-term overlays (indirect / ao / reflections). The retire warning
+//    is itself a trap: this probe used to set `debugProbes: "off"` and the
+//    warning fires once, which is fine — but if you set it via raw props
+//    write, nothing happens (same as #1).
 // 2. A full-page screenshot measures THE EDITOR'S CHROME. The viewport panel is
 //    a few hundred pixels inside a 1000×700 page, so every arm scored 98.9%
 //    coverage at identical mean luminance whether the overlay drew or not — the
@@ -113,11 +119,17 @@ await page.evaluate(async () => {
 
   const giEntity = engine.createEntity({ name: "GI" });
   const gi = giEntity.addComponent("global-illumination", {
-    autoFit: true, quality: "high", intensity: 1, debugProbes: "off",
+    autoFit: true, quality: "high", intensity: 1,
   });
   globalThis.__gi = gi;
-  // `setProp`, NOT a raw props write — see trap 1 in the header.
-  globalThis.__setView = (mode) => { gi.setProp("debugProbes", mode); };
+  // `setProp`, NOT a raw props write — see trap 1 in the header. The probe
+  // now exercises BOTH axes of the debug-view switch:
+  //   - `globalThis.__giDebugView = mode` for the SDF / occupancy / src-probes
+  //     overlays (the historical path; still polled per tick).
+  //   - `gi.setProp("debugView", mode)` for the GI-term overlays
+  //     (indirect / ao / reflections), reachable from the inspector.
+  globalThis.__setGlobalView = (mode) => { globalThis.__giDebugView = mode; };
+  globalThis.__setPropView = (mode) => { gi.setProp("debugView", mode); };
   console.log("GI-DV scene ready");
 });
 
@@ -147,7 +159,19 @@ console.log(`live canvas: ${canvasRect.width}x${canvasRect.height} at ${canvasRe
 let failures = 0;
 
 async function shoot(mode) {
-  await page.evaluate((m) => globalThis.__setView(m), mode);
+  // Map mode → setter. Legacy volume views live on the global; the new
+  // GI-term views live on the inspector prop. Either way the OTHER source is
+  // cleared so the test name actually determines what drew.
+  await page.evaluate((m) => {
+    const legacy = m === "occupancy" || m === "sdf" || m === "src-probes";
+    if (legacy) {
+      globalThis.__setPropView("off");
+      globalThis.__setGlobalView(m);
+    } else {
+      globalThis.__setGlobalView("off");
+      globalThis.__setPropView(m);
+    }
+  }, mode);
   await new Promise((resolve) => setTimeout(resolve, 2500));
   // MECHANISM READOUT before the pixels: every failure this probe has actually
   // produced was the harness not reaching the views, and a coverage number
@@ -156,9 +180,11 @@ async function shoot(mode) {
     const system = globalThis.__engine.modules.get("gi")?.system;
     const g = system?.state?.gizmos;
     return {
-      prop: globalThis.__gi.props.debugProbes,
+      propView: globalThis.__gi.props.debugView,
+      globalView: globalThis.__giDebugView ?? null,
       sdf: g?.sdfView ? { visible: g.sdfView.visible, inScene: !!g.sdfView.parent } : null,
       occ: g?.occView ? { visible: g.occView.visible, inScene: !!g.occView.parent } : null,
+      debugView: g?.debugView ? { visible: g.debugView.visible, parent: g.debugView.parent?.type ?? null } : null,
     };
   });
   const before = errors.length;
@@ -219,14 +245,26 @@ function diff(a, b, key = "px") {
 // "off" is the CONTROL: the scene itself. Controls first — a view that matched
 // the control exactly would mean the overlay never drew at all. Twice, because
 // the second one measures the frame-to-frame noise the comparison sits on.
+//
+// The arm list mixes BOTH debug-view code paths:
+//   - `off` (control): props.debugView="off" AND __giDebugView cleared.
+//   - `occupancy`, `sdf`: the legacy volume overlays, driven by the global
+//     `__giDebugView = mode` switch (the inspector's `debugView` prop does
+//     not carry them — see GI_DEBUG_VIEWS in giConfig.js).
+//   - `indirect`, `ao`, `reflections`: the new GI-term overlays, driven by
+//     `gi.setProp("debugView", mode)`. The global switch is OFF during these
+//     arms so the prop is the one source of truth being exercised.
 const off = await shoot("off");
 const off2 = await shoot("off");
 const occ = await shoot("occupancy");
 const sdf = await shoot("sdf");
+const indirect = await shoot("indirect");
+const ao = await shoot("ao");
+const reflections = await shoot("reflections");
 const noise = { offscreen: diff(off2, off), live: diff(off2, off, "livePx") };
 console.log(`noise floor (off vs off): Δ offscreen=${noise.offscreen.toFixed(2)} live=${noise.live.toFixed(2)}`);
 
-for (const view of [occ, sdf]) {
+for (const view of [occ, sdf, indirect, ao, reflections]) {
   const offscreen = diff(view, off);
   const liveDelta = diff(view, off, "livePx");
   const clean = view.errors.length === 0;

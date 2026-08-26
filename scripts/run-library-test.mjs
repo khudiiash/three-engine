@@ -47,6 +47,10 @@ const modulesIndex = read("src/modules/index.js");
 const modulesPanel = read("src/editor/panels/ModulesPanel.jsx");
 const libraryOps = read("src/editor/api/ops/library.js");
 const polypizza = read("src/editor/polypizza.js");
+const ambientcg = read("src/editor/ambientcg.js");
+const polyhaven = read("src/editor/polyhaven.js");
+const fab = read("src/editor/fab.js");
+const previewSources = read("src/editor/previewSources.js");
 const rust = read("src-tauri/src/lib.rs");
 
 /** Every browser panel, and the module that gates it. */
@@ -55,6 +59,7 @@ const BROWSERS = [
   { panel: "ambientcg", component: "AmbientCGPanel", module: "ambientcg", menu: "AmbientCG" },
   { panel: "sketchfab", component: "SketchfabPanel", module: "sketchfab", menu: "Sketchfab" },
   { panel: "polypizza", component: "PolyPizzaPanel", module: "polypizza", menu: "Poly Pizza" },
+  { panel: "fab", component: "FabPanel", module: "fab", menu: "Fab" },
   { panel: "itchio", component: "ItchioPanel", module: "itchio", menu: "itch.io" },
   { panel: "audioLibrary", component: "AudioLibraryPanel", module: "audio-library", menu: "Audio Library" },
 ];
@@ -143,7 +148,7 @@ console.log("\nlibrary — MCP coverage tracks the panels");
 check("every keyed browser is a library.* provider", () => {
   // itch.io and the audio library are the two exceptions with their own op
   // families; everything else must be reachable through library.search.
-  for (const id of ["polyhaven", "ambientcg", "sketchfab", "polypizza", "itchio"]) {
+  for (const id of ["polyhaven", "ambientcg", "sketchfab", "polypizza", "fab", "itchio"]) {
     assert.ok(
       new RegExp(`^\\s*${id}: \\{ module:`, "m").test(libraryOps),
       `${id} is not in library.js PROVIDERS — the panel would have no MCP equivalent`,
@@ -438,6 +443,287 @@ check("attribution is written for every import", () => {
 });
 
 // ---------------------------------------------------------------------------
+console.log("\nlibrary — Fab specifics");
+// ---------------------------------------------------------------------------
+
+check("free means the LICENCE, never the starting price", () => {
+  // `is_free=1` is the obvious-looking filter and it is a trap: it matches on
+  // the STARTING price, so every $2.99 Quixel Megascan comes back "free"
+  // because its UEFN-reference-only tier is $0. Filtering on `licenses=cc-by`
+  // selects assets whose only licence is Creative Commons Attribution.
+  assert.ok(/const FREE_LICENSE = "cc-by"/.test(fab), "no licence constant");
+  assert.ok(/params\.set\("licenses", FREE_LICENSE\)/.test(fab), "the free filter is not the licence one");
+  assert.ok(
+    !/params\.set\("is_free"/.test(fab),
+    "is_free matches a $0 starting tier, not a free asset — see the Megascans case",
+  );
+});
+
+check("the import refuses anything that is not CC-BY", () => {
+  // Fab's download-info endpoint answers anonymously for FREE assets. The
+  // honest reading of that is "free assets are free", not "the paywall is
+  // optional", and this guard is what writes that down.
+  const fn = fab.match(/export async function downloadListing[\s\S]*?\n\}/)[0];
+  assert.ok(/if \(!listing\?\.ccBy\)/.test(fn), "no licence guard before download");
+  assert.ok(
+    fn.indexOf("ccBy") < fn.indexOf("fetchDownloadUrl"),
+    "the guard must run BEFORE any download URL is requested",
+  );
+  // And the UI must not offer it either, or the guard is discovered as an error.
+  const panel = read("src/editor/panels/FabPanel.jsx");
+  assert.ok(/disabled=\{!hasProject \|\| !model\.ccBy \|\|/.test(panel), "the button is enabled on paid listings");
+});
+
+check("there is no sort control, because sort_by does nothing", () => {
+  // Measured 2026-08-22: `-createdAt`, `-popularity`, `-listingRating` and the
+  // literal string `bogus` all return byte-identical orderings, which differ
+  // from omitting the parameter. The value is ignored; only its presence
+  // counts. A dropdown built on it would silently lie.
+  // Comments stripped first: the panel explains WHY there is no sort, and the
+  // explanation naturally names the parameter it is refusing to use.
+  const code = read("src/editor/panels/FabPanel.jsx").replace(/\{?\/\*[\s\S]*?\*\/\}?|\/\/.*/g, "");
+  assert.ok(!/sort/i.test(code), "the panel offers a sort it cannot honour");
+  assert.ok(/sort_by/.test(fab), "the finding should be written down where the params are");
+});
+
+check("paging is the cursor URL, passed back verbatim", () => {
+  // The cursor encodes the sort position of the last row and cannot be rebuilt
+  // from the filters, so a "load more" that re-derives the query pages a
+  // different search than the one on screen.
+  assert.ok(/nextUrl/.test(fab), "no cursor parameter");
+  assert.ok(/data\.next \?\? null/.test(fab), "the next URL is not carried out");
+  const panel = read("src/editor/panels/FabPanel.jsx");
+  assert.ok(/searchListings\(\{ nextUrl: next \}\)/.test(panel), "load-more must pass the cursor alone");
+});
+
+const extractor = fab.slice(
+  fab.indexOf("export async function extractArchive"),
+  fab.indexOf("export async function downloadListing"),
+);
+const fabDownload = fab.slice(fab.indexOf("export async function downloadListing"));
+
+check("an archive is treated as a pack, not as one model", () => {
+  // Fab's ZIPs routinely hold dozens of separate meshes — a tile set, a prop
+  // kit. Importing only the first would silently drop most of what the listing
+  // is, and previewing only the first shows you a floor tile.
+  assert.ok(/export async function extractArchive/.test(fab), "no archive extractor");
+  assert.ok(/glbEntries\.map/.test(extractor), "GLB entries are not all extracted");
+  assert.ok(/for \(const entry of gltfEntries\)/.test(extractor), "glTF entries are not all packed");
+  assert.ok(/fbxEntries\.map/.test(extractor), "FBX entries are not all extracted");
+});
+
+check("FBX is a first-class format, not a listed-but-unhandled one", () => {
+  // A large share of Fab's free catalogue ships FBX and NOTHING else — the
+  // first five CC-BY 3D listings all did. An extractor that only knew glTF made
+  // every one of those unimportable while IMPORT_FORMATS still advertised FBX,
+  // so the listing looked supported and failed at download time.
+  assert.ok(/\{ id: "fbx"/.test(fab), "fbx is not offered");
+  assert.ok(/format: "fbx"/.test(extractor), "the extractor cannot report an FBX archive");
+  // FBX resolves textures by bare filename against its own directory, so the
+  // loose images have to travel with the meshes or every model imports grey.
+  assert.ok(/TEXTURE_RE/.test(extractor), "loose textures are not collected");
+  assert.ok(/unpackFbx/.test(fabDownload), "the import never converts an FBX");
+  assert.ok(
+    fabDownload.indexOf("for (const [name, bytes] of textures)") <
+      fabDownload.indexOf("const folder = archiveFormat ==="),
+    "textures must be written BEFORE the meshes are unpacked",
+  );
+});
+
+check("a download that is NOT a zip is still read", () => {
+  // Fab zips an upload only when it holds more than one file: a listing whose
+  // FBX upload was a single `ghoul_ue5.fbx` serves those bytes verbatim from
+  // the same download-info URL that hands another listing a `.zip`. Without a
+  // sniff that arrives as JSZip's "Can't find end of central directory : is
+  // this a zip file ?", which names neither the listing nor the real problem.
+  assert.ok(/function sniffBareModel/.test(fab), "no bare-file sniff");
+  assert.ok(/sniffBareModel\(payload, name\)/.test(extractor), "the extractor never sniffs");
+  const sniff = fab.match(/function sniffBareModel[\s\S]*?\n\}/)[0];
+  assert.ok(/PK\\x03\\x04/.test(sniff), "a real zip is not recognised and would be misread as a mesh");
+  assert.ok(/glTF/.test(sniff), "a bare GLB is not recognised");
+  // Binary FBX has a magic string; ASCII FBX has none at all, so it is
+  // recognised by the version line every writer emits.
+  assert.ok(/Kaydara FBX Binary/.test(sniff), "a bare binary FBX is not recognised");
+  assert.ok(/FBXVersion/.test(sniff), "a bare ASCII FBX is not recognised");
+});
+
+check("'any format' means any format WE can import", () => {
+  // Omitting the parameter is the literal reading of the dropdown and a bad
+  // default: measured, only 9 of 24 free 3D listings ship anything but an
+  // Unreal `.uasset` build, so an unfiltered grid is mostly dead ends that look
+  // identical to the usable ones until you click them.
+  assert.ok(
+    /for \(const code of format \? \[format\] : IMPORT_FORMAT_IDS\)/.test(fab),
+    "an empty format filter does not fall back to the importable set",
+  );
+  // Repeated values OR together — a single `set` would send only the last one.
+  assert.ok(/params\.append\("asset_formats", code\)/.test(fab), "formats must be appended, not set");
+  const panel = read("src/editor/panels/FabPanel.jsx");
+  assert.ok(/Any importable format/.test(panel), "the dropdown promises more than it delivers");
+});
+
+check("a listing with nothing importable says so instead of failing later", () => {
+  const panel = read("src/editor/panels/FabPanel.jsx");
+  assert.ok(/plan === false/.test(panel), "the panel cannot tell an unimportable listing apart");
+  assert.ok(/only Unreal Engine files/.test(panel), "no explanation next to the button");
+});
+
+check("packed glTF resources are keyed the way packGlb looks them up", () => {
+  // packGlb resolves by the DECODED uri. Storing the raw one misses on every
+  // path containing a space, which asset packs are full of.
+  assert.ok(/resources\.set\(decoded, bytes\)/.test(extractor), "resources keyed by the raw uri");
+});
+
+check("Fab falls back to reading the real archive when it has no viewer", () => {
+  // Measured 2026-08-22: only about ONE FREE LISTING IN TEN publishes Fab's own
+  // 3D viewer, so an embed-only preview would leave 90% of the catalogue as a
+  // still image — which is the thing this whole change set out to fix.
+  assert.ok(/export async function previewPlan/.test(fab), "no native preview plan");
+  assert.ok(/export const PREVIEW_AUTO_LIMIT/.test(fab), "no size ceiling on the auto-download");
+  const panel = read("src/editor/panels/FabPanel.jsx");
+  assert.ok(/const native = !embed && plan/.test(panel), "the embed does not take precedence");
+  // Archives run to hundreds of megabytes and the size is known before
+  // committing to the bytes, so a large one must ASK rather than just download.
+  assert.ok(/Load 3D preview/.test(panel), "a large archive offers no opt-in");
+  assert.ok(/native\.size <= PREVIEW_AUTO_LIMIT/.test(panel), "the ceiling is not applied");
+});
+
+check("a pack preview shows the pack, and cleans up after the FBX parser", () => {
+  // Every mesh laid out as a contact sheet, each scaled to its cell: at true
+  // relative scale a pack containing a building and a doorknob shows a building
+  // and no doorknob.
+  assert.ok(/export async function loadArchivePreview/.test(previewSources), "no pack preview");
+  const fn = previewSources.slice(previewSources.indexOf("export async function loadArchivePreview"));
+  assert.ok(/PACK_LIMIT/.test(fn), "an unbounded pack would parse hundreds of meshes");
+  // The FBX parser holds blob URLs for the whole pack (its textures are shared
+  // and resolved asynchronously), so they outlive each parse and have to be
+  // released by the caller rather than per-mesh.
+  assert.ok(/parse\.dispose\?\.\(\)/.test(fn), "the parser's blob URLs are never released");
+});
+
+check("an FBX preview waits for its textures before the blob URLs are revoked", () => {
+  // `FBXLoader.parse` returns SYNCHRONOUSLY while its textures keep loading
+  // through the manager. Returning without waiting revokes the blob URLs out
+  // from under them — which does not throw, it renders the model as a black
+  // silhouette, because the materials hold textures that never arrived.
+  const fn = previewSources.slice(previewSources.indexOf("async function fbxParser"));
+  assert.ok(/manager\.onLoad = resolve/.test(fn), "nothing waits for the texture queue");
+  // Guarded on onStart: a mesh with embedded or no textures never starts the
+  // manager, and `onLoad` would then never fire — an unguarded await hangs.
+  assert.ok(/if \(started\) await settled/.test(fn), "the wait is not guarded on the queue starting");
+});
+
+check("Fab needs no credential, anywhere", () => {
+  // Every other browser here has one. Fab's read path and its free-asset
+  // download URLs are anonymous, so a credential row would be a lie.
+  for (const fn of ["getSavedToken", "validateAndSaveToken"]) {
+    assert.ok(!new RegExp(`export (async )?function ${fn}|export const ${fn}`).test(fab), `fab.js exports ${fn}`);
+  }
+  const providers = modulesPanel.match(/const CREDENTIAL_PROVIDERS = \{[\s\S]*?\n\};/)[0];
+  assert.ok(!/\bfab: \[/.test(providers), "fab must not have a credential row");
+  assert.ok(
+    /fab: \{ module: "fab", label: "Fab", types: \["model"\], needsKey: false \}/.test(libraryOps),
+    "library.status must report fab as keyless",
+  );
+});
+
+check("the Fab proxy keeps one client across requests, and retries a challenge", () => {
+  // Fab is behind Cloudflare's managed challenge, and the measured way past it
+  // is to look like ONE CLIENT rather than a new stranger per request: a shared
+  // Agent (which carries the `__cf_bm` cookie and reuses the connection) went
+  // 8/8 where one-shot requests went 6/8, and adding a retry took a 40-request
+  // burst to 40/40. See src-tauri/tests/fab_cloudflare.rs.
+  const command = rust.match(/async fn fetch_fab_text[\s\S]*?\n\}/)[0];
+  assert.ok(/static FAB_AGENT/.test(rust), "no shared Agent — every call would be a new client");
+  assert.ok(/fab_agent\(\)/.test(command), "the command does not use the shared Agent");
+  assert.ok(/is_cf_challenge\(&body\)/.test(command), "a challenge is not detected");
+  assert.ok(/continue;/.test(command), "a challenge is not retried");
+});
+
+check("a Cloudflare challenge never reaches the panel as HTML", () => {
+  // The first version returned the body verbatim, which put ~30KB of Cloudflare
+  // interstitial — CSS, base64 logo and all — into the panel's error box.
+  const command = rust.match(/async fn fetch_fab_text[\s\S]*?\n\}/)[0];
+  assert.ok(/bot protection is throttling/.test(command), "no human-readable message for a challenge");
+  assert.ok(/chars\(\)\.take\(/.test(command), "a non-challenge error body is not truncated");
+});
+
+check("the Fab proxy sends an honest User-Agent, not a browser one", () => {
+  // Counter-intuitive: Cloudflare fingerprints the TLS handshake, so claiming
+  // to be Chrome from a rustls client is what its bot detection looks for.
+  // Measured live from one IP: `three-engine/0.1` 200, Chrome 124 UA 403.
+  // `fetch_itchio_html` DOES impersonate a browser — that is right for itch.io
+  // and wrong here, so the difference has to stay deliberate.
+  const command = rust.match(/async fn fetch_fab_text[\s\S]*?\n\}/)[0];
+  assert.ok(/"User-Agent", "three-engine\/0\.1"/.test(command), "UA is not the honest one");
+  assert.ok(!/Mozilla/.test(command), "a browser UA gets this client challenged, not served");
+});
+
+check("the proxy refuses hosts other than www.fab.com", () => {
+  const command = rust.match(/async fn fetch_fab_text[\s\S]*?\n\}/);
+  assert.ok(command, "fetch_fab_text not found in lib.rs");
+  assert.ok(
+    command[0].includes('host_str() != Some("www.fab.com")'),
+    "no host allowlist — the proxy could fetch an arbitrary URL",
+  );
+  assert.ok(command[0].includes('scheme() != "https"'), "no https requirement");
+  // There is no token to attach, and adding one later would need the allowlist
+  // rethought — assert the absence so that stays a deliberate change.
+  assert.ok(!/token/i.test(command[0]), "fetch_fab_text should carry no credential");
+});
+
+check("fetch_fab_text is registered on the invoke handler", () => {
+  assert.ok(/\n\s+fetch_fab_text,/.test(rust), "not in the invoke_handler list");
+});
+
+check("a Cloudflare challenge is reported as one, not as a parse error", () => {
+  // Fab sits behind Cloudflare, which answers a bot-challenge HTML page with a
+  // 200 to some clients. A bare JSON.parse failure there reads as "Fab changed
+  // its response shape", which sends you looking in entirely the wrong place.
+  const fn = fab.match(/async function apiJson[\s\S]*?\n\}/)[0];
+  assert.ok(/bot protection/.test(fn), "a non-JSON body is not explained");
+});
+
+check("attribution is written, and says the credit is mandatory", () => {
+  // Unlike Poly Haven (CC0), EVERY importable asset here is CC-BY: the credit
+  // line is the condition of use, not a courtesy.
+  assert.ok(/ATTRIBUTION\.md/.test(fab), "no ATTRIBUTION.md written");
+  assert.ok(/MUST credit/.test(fab), "the obligation is not stated");
+});
+
+check("fab has both a search and an import branch", () => {
+  const branches = libraryOps.match(/if \(provider === "fab"\) \{/g) ?? [];
+  assert.equal(branches.length, 2, `expected search + import branches, found ${branches.length}`);
+});
+
+check("the ops surface whether a found listing can actually be imported", () => {
+  // Searching the paid catalogue is legitimate — you may want to link a human
+  // at it — but an agent must be able to tell before it tries.
+  assert.ok(/importable: listing\.ccBy/.test(libraryOps), "no importable flag on fab results");
+  assert.ok(/freeOnly: \{/.test(libraryOps), "no freeOnly parameter");
+});
+
+// ---------------------------------------------------------------------------
+console.log("\nlibrary — Sketchfab's normalised shape");
+// ---------------------------------------------------------------------------
+
+check("the ops read the NORMALISED record, not Sketchfab's raw JSON", () => {
+  // `searchModels` returns records its own `normalise` already flattened —
+  // `id`/`author`/`license`, not `uid`/`user`/`license.label`. Reading the raw
+  // shape handed back `id: undefined` for every result, and the import's
+  // `m.uid === id` never matched, so it silently took models[0] — the first
+  // result of a search for the id string, which is a different model.
+  const search = libraryOps.slice(
+    libraryOps.indexOf('if (provider === "sketchfab")'),
+    libraryOps.indexOf('if (provider === "fab")'),
+  );
+  assert.ok(/id: model\.id/.test(search), "search maps `uid`, which normalise renamed");
+  assert.ok(!/model\.user\?\./.test(search), "search reads `user`, which normalise flattened to `author`");
+  const importBranch = libraryOps.slice(libraryOps.lastIndexOf('if (provider === "sketchfab")'));
+  assert.ok(/m\.id === id/.test(importBranch), "import matches on `uid`, which never hits");
+});
+
+// ---------------------------------------------------------------------------
 console.log("\nlibrary — an agent can import AND use what it finds");
 // ---------------------------------------------------------------------------
 
@@ -508,7 +794,7 @@ check("every asset browser module is reachable through an op family", () => {
   // The standing rule: a feature is not done until an agent can drive it.
   // library.* covers five providers; audio-library has its own family.
   const covered = { polyhaven: "library", ambientcg: "library", sketchfab: "library",
-    polypizza: "library", itchio: "library", "audio-library": "audio.library" };
+    polypizza: "library", fab: "library", itchio: "library", "audio-library": "audio.library" };
   for (const browser of BROWSERS) {
     assert.ok(covered[browser.module], `${browser.module} has no op family`);
   }
@@ -536,9 +822,11 @@ const preview = read("src/editor/components/ModelPreview.jsx");
 
 check("the preview renders the model, not the thumbnail", () => {
   const panel = read("src/editor/panels/PolyPizzaPanel.jsx");
-  assert.ok(/<ModelPreview src=\{model\.downloadUrl\}/.test(panel), "detail pane shows no live model");
-  // The thumbnail stays as the fallback for a record with no downloadable GLB.
-  assert.ok(/model\.thumbnailUrl && <img/.test(panel), "no still fallback");
+  assert.ok(/<AssetPreview src=\{model\.downloadUrl\}/.test(panel), "detail pane shows no live model");
+  // The thumbnail stays as the fallback for a record with no downloadable GLB,
+  // now expressed by handing both to the dispatcher rather than by branching
+  // in the panel.
+  assert.ok(/thumbnailUrl=\{model\.thumbnailUrl\}/.test(panel), "no still fallback");
 });
 
 check("it is capped and skipped when invisible, like every other preview", () => {
@@ -604,6 +892,126 @@ check("camera state lives in a ref, not in React state", () => {
 check("the clip selector only appears when there is a choice", () => {
   assert.ok(/clips\.length > 1 && \(/.test(preview), "a one-clip model should not get a dropdown");
   assert.ok(/clips\.length === 1 &&/.test(preview), "a single clip should still be named");
+});
+
+
+// ---------------------------------------------------------------------------
+console.log("\nlibrary — every browser previews what it is about to import");
+// ---------------------------------------------------------------------------
+
+const assetPreview = read("src/editor/components/AssetPreview.jsx");
+
+check("the preview dispatcher prefers our renderer, then an embed, then a still", () => {
+  // Order is load-bearing and runs DOWNWARD only: a provider that hands us a
+  // loadable model gets the native path even if it also publishes an embed,
+  // because ours honours the editor theme and does not put a third-party page
+  // inside the editor.
+  // Sliced to end-of-file rather than matched: the destructured parameter
+  // list closes with its own `\n})`, so a lazy match stops at the signature.
+  const fn = assetPreview.slice(assetPreview.indexOf("export function AssetPreview("));
+  const native = fn.indexOf("if (src && failed !== src)");
+  const embed = fn.indexOf("if (embedUrl)");
+  const still = fn.indexOf("if (thumbnailUrl)");
+  assert.ok(native >= 0 && embed > native && still > embed, "the fallback chain is out of order");
+});
+
+check("every model browser shows something interactive, not a still", () => {
+  // The rule: a thumbnail cannot answer "what am I about to import". Each
+  // browser reaches it differently — see AssetPreview for which and why — but
+  // none of them may stop at the <img>.
+  for (const [panel, prop] of [
+    ["PolyPizzaPanel", "src="],
+    ["PolyHavenPanel", "src="],
+    ["AmbientCGPanel", "src="],
+    ["SketchfabPanel", "embedUrl="],
+    ["FabPanel", "embedUrl="],
+  ]) {
+    const source = read(`src/editor/panels/${panel}.jsx`);
+    assert.ok(/<AssetPreview/.test(source), `${panel} does not use the shared preview`);
+    assert.ok(source.includes(prop), `${panel} passes no ${prop.replace("=", "")}`);
+  }
+});
+
+check("the two embed browsers are the two that cannot load geometry cheaply", () => {
+  // Not a style choice: Sketchfab needs a token AND a multi-megabyte zip
+  // before anything renders, and Fab's preview geometry is an Epic-proprietary
+  // `.binz` its own WASM decoder reads. The rationale has to survive, or the
+  // next person "fixes" it into a native loader that cannot work.
+  assert.ok(/binz/.test(assetPreview) || /binz/.test(fab), "Fab's format constraint is not recorded");
+  assert.ok(/embedUrl/.test(read("src/editor/sketchfab.js")), "sketchfab.js carries no embed URL");
+});
+
+check("the embed frame is sandboxed to what a WebGL viewer needs", () => {
+  // `allow-same-origin` keeps the frame on ITS origin, which is what stops it
+  // reaching into the editor — it does not grant it ours. Forms, popups,
+  // downloads and top-level navigation stay withheld.
+  const sandbox = assetPreview.match(/sandbox="([^"]*)"/)?.[1];
+  assert.ok(sandbox, "the iframe is not sandboxed at all");
+  assert.deepEqual(sandbox.split(" ").sort(), ["allow-same-origin", "allow-scripts"], `sandbox is "${sandbox}"`);
+});
+
+check("a cross-origin embed cannot hang on its spinner forever", () => {
+  // `onError` does not fire for an HTTP error inside a cross-origin frame and
+  // its content is unreadable, so `onLoad` alone can never clear.
+  assert.ok(/setTimeout\(\(\) => setLoaded\(true\)/.test(assetPreview), "no timeout escape for the load state");
+});
+
+check("Poly Haven's preview remaps its resources, because the CDN moves them", () => {
+  // Its .gltf refers to `textures/Foo_diff_1k.jpg` and `Foo.bin`, which the CDN
+  // serves from `Models/jpg/1k/…` and — even for a 1k mesh — `Models/gltf/4k/…`.
+  // A loader pointed at the .gltf URL 404s on every single resource.
+  assert.ok(/export function modelPreviewPlan/.test(polyhaven), "no preview plan export");
+  assert.ok(/entry\.include/.test(polyhaven.match(/export function modelPreviewPlan[\s\S]*?\n\}/)[0]),
+    "the plan drops the include table, which is the whole point");
+  assert.ok(/setURLModifier/.test(previewSources), "nothing remaps the resource URLs");
+  assert.ok(/createGltfLoader\(manager\)/.test(previewSources), "the manager never reaches the loader");
+  assert.ok(/createGltfLoader\(manager = undefined\)/.test(read("src/engine/gltfLoader.js")),
+    "createGltfLoader does not accept a manager");
+});
+
+check("Poly Haven previews the SMALLEST glTF, not the download resolution", () => {
+  // This replaces a thumbnail. Pulling 4k textures to fill a 260px pane costs
+  // more than the import it is meant to help you decide on.
+  const panel = read("src/editor/panels/PolyHavenPanel.jsx");
+  assert.ok(/modelPreviewPlan\(files, resolutions\[0\]/.test(panel), "preview follows the download resolution");
+});
+
+check("ambientCG builds its OBJ preview in memory and leaks no blob URLs", () => {
+  // The one catalogue here that is not glTF at all: OBJ + MTL + loose maps in
+  // a ZIP, with no preview mesh and no per-file URLs, so a preview costs a real
+  // download and must take the smallest variant.
+  assert.ok(/export const PREVIEW_MODEL_RES = \["LQ-1K-JPG"/.test(ambientcg), "no smallest-variant preference");
+  assert.ok(/export function modelPreviewUrl/.test(ambientcg), "no preview archive resolver");
+  assert.ok(/export async function loadObjArchivePreview/.test(previewSources), "no OBJ preview loader");
+  const fn = previewSources.match(/export async function loadObjArchivePreview[\s\S]*?\n\}\n/)[0];
+  assert.ok(/revokeObjectURL/.test(fn), "blob URLs are never revoked");
+  assert.ok(/finally \{/.test(fn), "a failed texture load would leak every URL created before it");
+  // MTLLoader resolves textures through the manager asynchronously, which would
+  // race those revocations; the filenames already say what each map is.
+  assert.ok(!/MTLLoader/.test(fn), "MTLLoader races the revocations — load maps by name instead");
+});
+
+check("an unreadable model falls back to the still, not to an error string", () => {
+  // Some sources genuinely cannot be loaded: three's FBXLoader rejects FBX
+  // variants whose LayerElementNormal ships no Normals array, and Fab's free
+  // catalogue contains them. A thumbnail still answers "what is this", which an
+  // exception parked where the asset should be does not.
+  assert.ok(/onError/.test(preview), "ModelPreview reports a failed load to nobody");
+  assert.ok(/onErrorRef/.test(preview), "the callback must be held in a ref, like `load`");
+  assert.ok(/const \[failed, setFailed\] = useState\(null\)/.test(assetPreview), "no failure state");
+  assert.ok(/failed !== src/.test(assetPreview), "a failed source is retried forever");
+  // Reset on a new source, or one bad model poisons the pane for every
+  // selection after it.
+  assert.ok(/useEffect\(\(\) => setFailed\(null\), \[src, embedUrl\]\)/.test(assetPreview),
+    "the failure state is never cleared");
+});
+
+check("a custom loader does not re-download on every render", () => {
+  // `load` is an inline arrow in every caller, so a new identity arrives each
+  // render. Depending on it would re-fetch the model whenever the panel
+  // re-rendered — and for ambientCG that is a multi-megabyte ZIP.
+  assert.ok(/const loadRef = useRef\(load\)/.test(preview), "load is not held in a ref");
+  assert.ok(/\}, \[src\]\);/.test(preview), "the load effect must still depend on src alone");
 });
 
 // ---------------------------------------------------------------------------

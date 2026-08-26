@@ -259,6 +259,32 @@ function gltfEntry(files, res) {
 }
 
 /**
+ * What the interactive preview needs to load a model WITHOUT downloading it
+ * into the project: the .gltf URL plus the relative-path → CDN-URL table its
+ * resources actually live at.
+ *
+ * That table is not optional decoration. Poly Haven's `.gltf` refers to
+ * `textures/Foo_diff_1k.jpg` and `Foo.bin`, but the CDN serves those from
+ * `Models/jpg/1k/Foo/…` and `Models/gltf/4k/Foo/…` respectively — the buffer
+ * comes from the 4k folder even for a 1k mesh. So a loader pointed straight at
+ * the .gltf URL 404s on every single resource, and `include` is the only thing
+ * that knows better. `previewSources.loadRemappedGltf` consumes this.
+ *
+ * Returns null when the asset has no glTF at that resolution, which the caller
+ * should read as "show the still instead".
+ */
+export function modelPreviewPlan(files, res = "1k") {
+  const entry = gltfEntry(files, res);
+  if (!entry?.url) return null;
+  return {
+    url: entry.url,
+    resources: Object.fromEntries(
+      Object.entries(entry.include ?? {}).map(([relative, file]) => [relative, file.url]),
+    ),
+  };
+}
+
+/**
  * Fetches the .gltf + every included file (buffers, textures), packs them
  * into one self-contained .glb and hands it to the regular GLB import
  * (prefab + materials + texture extraction). Returns the unpacked folder.

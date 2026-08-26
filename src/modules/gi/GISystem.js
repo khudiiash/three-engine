@@ -27,16 +27,17 @@
 // smoothing, sky) are still live uniforms with no consumer; see the PARKED
 // block in #build for why they were kept rather than deleted and re-added.
 import * as THREE from "three/webgpu";
-import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionWorld, renderGroup, screenCoordinate, screenUV, select, sin, smoothstep, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
+import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionGeometry, positionWorld, renderGroup, sRGBTransferEOTF, screenCoordinate, screenUV, select, sin, smoothstep, step, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
-import { giDebugView, resolveGiConfig, sceneSkyRadiance } from "./giConfig.js";
-import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
+import { GI_TERM_DEBUG_VIEWS, giDebugView, resolveGiConfig, sceneSkyRadiance } from "./giConfig.js";
+import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
+import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiAoPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiRtaoPass, createGiShadowClearPass, createGiTargets, createGiVxaoPass, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
 import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
 import { noteTextureAverage, pendingTextureAverages, resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
 import { SRC_POOL_FLOORS, createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcPoolCeilings, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
-import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD, CASCADE_COUNT, SRC_QUALITY, binCount } from "./srcConfig.js";
+import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD, CASCADE_COUNT, R0_OVER_S0 as SRC_R0_OVER_S0, SRC_QUALITY, binCount } from "./srcConfig.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { SURFACE_POOL_CEILINGS, createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
@@ -45,10 +46,10 @@ import { fitPrimitive } from "./primitiveFit.js";
 import { fitEmitterShape } from "./emitterShapes.js";
 import { fitSkinnedCapsules, rigRootOf, skinnedBoneMatrix, skinnedBoxShape, skinnedCapsuleMatrix, skinnedCapsuleShape } from "./skinnedProxy.js";
 import { MeshBVH } from "three-mesh-bvh";
-import { DEBUG_LAYER, EDITOR_LAYER, GI_DYNAMIC_LAYER, GI_MIRROR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
+import { DEBUG_LAYER, EDITOR_LAYER, GI_DYNAMIC_LAYER, GI_MIRROR_LAYER, GI_SHARP_LAYER, SHADOW_PROXY_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { collectStateComputeNodes, purgeNodeBuilderCache, releaseComputeNodes } from "./releaseCompute.js";
 import { textureLoadsInFlight } from "../../engine/textureAsset.js";
-import { GICascadeLight, MAX_EMITTERS, giRoughnessBucketOf, giRoughnessFloorStats, giRoughnessSourceOf, registerGILight } from "./giLight.js";
+import { GICascadeLight, GI_REFLECT_TIER, MAX_EMITTERS, giReflectTierInfoOf, giReflectTierOf, giRoughnessBucketOf, giRoughnessFloorStats, giRoughnessSourceOf, registerGILight } from "./giLight.js";
 import { MAX_REFLECTION_PROBES, createReflectionProbeAtlas } from "./reflectionProbes.js";
 import { createReflectionProbeBlur, createReflectionProbeCapture, createReflectionProbeHistory, createReflectionProbeScratch, createReflectionProbeUniforms } from "./reflectionProbeCapture.js";
 import { buildBvhScene } from "./bvh/bvhScene.js";
@@ -111,8 +112,76 @@ const OCC_DYNAMIC_QUIET_FRAMES = 90;
  * probe-EMA convergence at the default smoothing, so nothing visible moves
  * at the moment sleep begins. `__giNoIdleSleep = true` disables (A/B).
  */
+/**
+ * §18.7 — THE SIZE-AWARE EMITTER CULL, in RADIANT POWER (`Phi = pi * A * L`).
+ *
+ * An emissive placement below this delivers no GI at all: no analytic slot, no
+ * light-tree entry, no NEE sampling, AND no deposit into the probe field. Its
+ * own visible glow is the raster material and is untouched — the mesh still
+ * looks lit, it just stops paying for light nobody can see.
+ *
+ * ⚠ WHY POWER AND NOT BRIGHTNESS. The gate this replaces was `peak >= 0.5`, a
+ * RADIANCE test, and radiance is size-blind. A 2 cm decorative bulb and a 2 m²
+ * illuminated sign at the same authored brightness differ by more than three
+ * orders of magnitude in delivered light, and that gate treated them
+ * identically. Requiring `pi * A * L >= P_min` rearranges to
+ * `L >= P_min / (pi * A)` — the smaller the emitter, the more brightness it
+ * needs, continuously and with nothing to tune per size. That is the user's own
+ * statement of the rule (2026-08-25).
+ *
+ * ⛔⛔ THE ABSOLUTE VERSION OF THIS GATE WAS MEASURED WRONG AND SHIPPED — read
+ * this before touching the number. The first cut was `0.05` in absolute power,
+ * justified as: a real Bistro lamp logs `P=1.8e+1`, a 2 cm bulb computes
+ * `pi * 1.3e-3 * 0.2 ~ 8e-4`, four orders of magnitude apart, so anything
+ * between "separates two clearly bimodal populations with wide margin".
+ *
+ * That was an inference from TWO data points, and the very next scene refuted
+ * it. On the user's Bistro the gate culled **26 emitters**, taking the light
+ * tree from 114 to 88 and leaving a green neon as the dominant chromatic
+ * source — the user's "all reflections are greenish", correctly attributed by
+ * them to our edits. Emitter powers are not bimodal; they are a broad continuum
+ * whose SCALE is a property of how a scene was authored.
+ *
+ * ✅ SO THE GATE IS A FRACTION OF THE SCENE'S OWN TOTAL EMITTED POWER, applied
+ * in `collectEmitters` where the total is knowable. It expresses what was
+ * actually meant — "a negligible share of the light in this room" — and it is
+ * invariant to the units the artist authored in. The user's rule is untouched,
+ * because power is still `pi * A * L`: at equal brightness the smaller emitter
+ * has less power and goes first.
+ *
+ * 0.002 = an emitter delivering under 0.2% of the scene's light. With ~100
+ * roughly-equal emitters each holds ~1%, so a uniformly-lit scene loses
+ * nothing; the tiny decorative bulbs that prompted this sit 3-4 orders below
+ * their scene's lamps and go. `__giEmitterMinPowerFraction` overrides, and 0
+ * disables the cull entirely.
+ *
+ * ⚠ AND IT CAN NEVER EMPTY THE TREE — see the guard in `collectEmitters`. A
+ * scene lit by many equal weak sources is exactly where culling is most wrong.
+ */
+const GI_EMITTER_MIN_POWER_FRACTION = 0.002;
+
 const GI_IDLE_AFTER_FRAMES = 180;
 const GI_IDLE_HEARTBEAT_FRAMES = 30;
+
+/**
+ * Dispatch `bvhHitShade` one frame in this many while the view is HELD.
+ *
+ * 3, not 30 like the idle heartbeat above, because this pass is what makes a
+ * reflection CONVERGE — it is chasing the probe field, not merely refreshing a
+ * static image. A third of the rate is still far faster than the reflection
+ * chain's own temporal release (~1/3 s at rest, §17 R7c), so the filtered
+ * output the user actually sees is unchanged while the cost drops ~3x.
+ */
+const GI_HELD_HIT_SHADE_FRAMES = 3;
+
+/**
+ * Held frames to run at FULL hit-shade rate before the cadence above engages.
+ *
+ * The reflection has to finish converging first. R7c's view-dependent history
+ * runs near-raw while the camera moves and recovers over ~1/3 s at rest, so
+ * this covers that recovery and then some at any frame rate the editor sees.
+ */
+const GI_HELD_HIT_SHADE_SETTLE = 45;
 /**
  * GI PROXY FIT — a mover's `giProxy` choice turned into occluder spheres.
  *
@@ -341,30 +410,92 @@ function staticBvhStrategy() {
  *  descend the same BVH with the same width probe). Names end that permanently. */
 let giCurrentComputeNode = null;
 
-/** Dispatch wrapper for GISystem's own renderer.compute calls — marks skips
- *  as GI-owned so they take the ordered-retry path, not the replay path. */
-function giCompute(renderer, nodes) {
+// ── THE BOOT FREEZE, AND THE FIRST-BUILD BUDGET ────────────────────────────
+//
+// `renderer.compute(node)` BUILDS the node's TSL graph and generates its WGSL
+// synchronously, on that node's first dispatch. There are ~77 GI kernels, and
+// the first tick after a rebuild dispatches every chain it needs — so all of
+// that construction landed in ONE frame. Profile-attributed, project boot:
+// **2359ms of a 3020ms main-thread task**, inside this function, with three's
+// `analyze` / `getDataFromNode` / `getHash` as the leaves. That is the editor
+// freezing on startup, and it is also why #compileWave's prewarm loop reports
+// a nonsense `4ms over 77 kernels` — the ticks already did the work it exists
+// to spread out, several seconds before it runs.
+//
+// `deferrable: true` lets a call site trade a frame of its own output for a
+// shorter frame. A deferred node is registered in `giSkippedComputes` — THE
+// SAME CONTRACT a dispatch whose pipeline has not compiled yet already uses
+// (see the wrapper in installAsyncComputePipelines) — so every re-arm the
+// system already performs for that case fires here unchanged.
+//
+// ⛔ THE FIRST ATTEMPT SKIPPED WITHOUT REGISTERING, AND THAT IS THE WHOLE
+// LESSON. A budget that just returned early cut the freeze exactly as hoped
+// (worst task 3020ms → 942ms) and reported `[gi] field ready: 0 occupied
+// voxels` against 40498 on the same fixture: the occupancy chain's caller
+// checks `giSkippedComputes.size` to decide whether to re-arm, saw no skip,
+// concluded the chain had run, and let a field composited from passes that
+// never ran be consumed. A dispatch that silently does not happen is
+// indistinguishable from one that did — so a deferral MUST say so.
+//
+// WHICH SITES OPT IN is a per-chain judgement, written at each call:
+//   · deferrable — the per-frame accumulators (SRC transport, the screen
+//     resolve queue, the BVH reflect prepass, dynamic-object uploads). Missing
+//     a frame costs one frame of freshness and is ALREADY routine for them
+//     when a pipeline is still compiling.
+//   · NOT deferrable — the occupancy pyramid chain, whose half-execution is
+//     itself the damage (its caller pre-checks `giNodesPending` for exactly
+//     this reason and blocks the whole chain rather than run part of it);
+//     the reflection-probe capture, whose caller advances `rounds`/`dirty`
+//     bookkeeping that a skip would desynchronise; the build-time shadow
+//     clears, which are fail-closed one-shots; and the prewarm loop itself,
+//     which is the yield-budgeted path this budget exists to defer work TO.
+const giBuiltNodes = new WeakSet();
+let giFrameBuildMs = 0;
+
+/** Called once per GI tick — see the budget note above. */
+function giResetFrameBuildBudget() {
+  giFrameBuildMs = 0;
+}
+
+/** True once this frame has spent its allowance on first-dispatch graph builds. */
+function giBuildBudgetSpent() {
+  return giFrameBuildMs >= (Number(globalThis.__giFrameBuildBudgetMs) || 12);
+}
+
+function giCompileVariantKey(object) {
+  const mat = object.material;
+  const mats = Array.isArray(mat) ? mat : [mat];
+  const geo = object.geometry;
+  const attrs = geo?.attributes ? Object.keys(geo.attributes).sort().join(",") : "";
+  const skin = object.isSkinnedMesh ? "s" : "";
+  const morph = geo?.morphAttributes && Object.keys(geo.morphAttributes).length ? "m" : "";
+  const ids = mats.map((m) => m?.uuid ?? m?.type ?? "?").join("+");
+  return `${ids}|${attrs}|${skin}|${morph}`;
+}
+
+function giCompute(renderer, nodes, { deferrable = false } = {}) {
   giDispatchDepth++;
   try {
-    if (Array.isArray(nodes)) {
-      // One at a time, so the current-node tracker stays truthful for the
-      // pipeline each dispatch creates. three accepts arrays, but an array
-      // dispatch would leave every pipeline in it attributed to the ARRAY.
-      for (const node of nodes) {
-        giCurrentComputeNode = node;
-        try {
-          renderer.compute(node);
-        } finally {
-          giCurrentComputeNode = null;
-        }
+    const list = Array.isArray(nodes) ? nodes : [nodes];
+    // One at a time, so the current-node tracker stays truthful for the
+    // pipeline each dispatch creates. three accepts arrays, but an array
+    // dispatch would leave every pipeline in it attributed to the ARRAY.
+    for (const node of list) {
+      if (!node) continue;
+      const unbuilt = !giBuiltNodes.has(node);
+      if (unbuilt && deferrable && giBuildBudgetSpent()) {
+        giSkippedComputes.add(node);
+        continue;
       }
-      return;
-    }
-    giCurrentComputeNode = nodes;
-    try {
-      renderer.compute(nodes);
-    } finally {
-      giCurrentComputeNode = null;
+      const t0 = unbuilt ? performance.now() : 0;
+      giCurrentComputeNode = node;
+      try {
+        renderer.compute(node);
+        giBuiltNodes.add(node);
+      } finally {
+        giCurrentComputeNode = null;
+        if (unbuilt) giFrameBuildMs += performance.now() - t0;
+      }
     }
   } finally {
     giDispatchDepth--;
@@ -540,6 +671,19 @@ export function installAsyncComputePipelines(renderer) {
             data.giReplayNodes = null;
             for (const node of replay) renderer.compute(node);
           }
+          // ⚠ DROP THE OWNER ONCE THE PIPELINE SETTLES (retention audit,
+          // 2026-08-24). three keeps every ComputePipeline in the
+          // session-lifetime `Pipelines.caches` strong Map, so a
+          // `giOwner` left on the backend data pins the ENTIRE compute
+          // node graph — builder state, bind groups, every storage
+          // buffer and closed-over CPU typed array — even after the
+          // node itself is orphaned by an incremental swap
+          // (#syncBvhScene, resolve resize, pool grow). Measured as
+          // the ~150-450 MB-per-orphan-event hard-leak class. The owner
+          // exists ONLY for the §12.56 watchdog's re-roll credit, and a
+          // wedged pipeline by definition never reaches this handler.
+          data.giOwner = null;
+          data.giTiming = null;
         },
         (error) => {
           record();
@@ -547,6 +691,14 @@ export function installAsyncComputePipelines(renderer) {
             `[gi] compute pipeline "${descriptor?.label ?? ""}" failed to compile:`,
             error?.message ?? error,
           );
+          // Same release as the success path — a REJECTED creation has
+          // settled just as finally; only a still-pending pipeline may
+          // keep its owner (the watchdog needs it).
+          const data = backend.get(computePipeline);
+          if (data) {
+            data.giOwner = null;
+            data.giTiming = null;
+          }
         },
       );
       // Charge this compile to the node that triggered it, so a consumer can
@@ -662,6 +814,11 @@ export function installAsyncComputePipelines(renderer) {
           data.giOwnerCredited = true;
           giPendingByNode.set(data.giOwner, Math.max(0, (giPendingByNode.get(data.giOwner) ?? 1) - 1));
         }
+        // Credited — the owner ref's last consumer. Same pinning release as
+        // the ordinary settle handlers (see the audit note there); without
+        // it a healed-by-re-roll pipeline pins its node graph forever when
+        // the wedged original never settles.
+        data.giOwner = null;
         console.warn(`[gi] §12.56 WATCHDOG: re-roll landed — "${name}" live after ${data.giRetries} attempt(s)`);
         const replay = data.giReplayNodes;
         if (replay?.size) {
@@ -1174,6 +1331,11 @@ export class GISystem {
     // bake worker (a rebuild must never kill an in-flight bake).
     // material → compile-time roughness bucket (see #refreshMirrorBucket).
     this._mirrorBuckets = new WeakMap();
+    // The DRAINABLE side of _mirrorBuckets (§16 R4b): the WeakMap cannot be
+    // iterated, and the idle floor drain needs to revisit every known
+    // material. Strong refs, so it is cleared in #dispose — the next build's
+    // scan repopulates it from the live scene.
+    this._mirrorBucketMaterials = new Set();
     // Resolve targets replaced by a resize, awaiting a safe disposal frame.
     this._retiredTargets = [];
     this._unsubs = [
@@ -1181,6 +1343,18 @@ export class GISystem {
       engine.on?.("hierarchy-changed", () => this.#queueRebakeCheck()) ?? (() => {}),
       engine.on?.("component-changed", () => this.#queueRebakeCheck()) ?? (() => {}),
       engine.on?.("model-loaded", () => this.#queueRebakeCheck()) ?? (() => {}),
+      // A RENDERER REBUILD REPLACES THE DEVICE, and every compute pipeline,
+      // bind group, storage buffer and render target this system owns belonged
+      // to the old one. Nothing here is transferable, and stale GPU handles do
+      // not throw — they simply stop delivering, so GI goes dark (or freezes on
+      // its last irradiance) with no error to say why. Every other
+      // renderer-owning consumer already subscribes to this (PostprocessComponent,
+      // LightComponent, the editor's selection outline); GI, the largest owner
+      // of device-lifetime state in the engine, did not.
+      engine.on?.("renderer-rebuilt", () => {
+        this.#dispose();
+        this.requestRebuild("renderer-rebuilt");
+      }) ?? (() => {}),
     ];
   }
 
@@ -1211,7 +1385,7 @@ export class GISystem {
     if (this.component === component) return;
     this.component = component;
     this._cfg = undefined;
-    this.requestRebuild();
+    this.requestRebuild("component-attached");
   }
 
   detach(component) {
@@ -1246,10 +1420,19 @@ export class GISystem {
       this.#applyLiveProps();
       return;
     }
+    // `debugView` is a live prop, not a structural one — flipping it must
+    // NOT trigger a rebuild (the WGSL is identical; only the source texture
+    // changes, and that is a uniform write inside `#applyDebugVisibility`).
+    // Adding it to the structural signature would also gate the live
+    // update on a build cycle the user did not ask for.
+    if (key === "debugView") {
+      this.#applyDebugVisibility();
+      return;
+    }
     const signature = this.#structuralSignature(component);
     if (signature !== this._structuralSig) {
       this._structuralSig = signature;
-      this.requestRebuild();
+      this.requestRebuild("structural-props-changed");
     }
   }
 
@@ -1452,7 +1635,7 @@ export class GISystem {
     const signature = this.#structuralSignature(this.component);
     if (signature !== this._structuralSig) {
       this._structuralSig = signature;
-      this.requestRebuild();
+      this.requestRebuild("reflection-probe-set-changed");
     }
   }
 
@@ -1595,8 +1778,26 @@ export class GISystem {
     return union.isEmpty() ? null : union;
   }
 
-  requestRebuild() {
+  /**
+   * ⭐ EVERY REBUILD CARRIES ITS REASON, because "gi reloads occasionally for
+   * no reason" (user, 2026-08-25) was undiagnosable without one. A GI rebuild
+   * costs a compile wave and every temporal accumulation; eleven different
+   * sites can ask for it, the console line (`[gi] src ... slot NEE replaced`)
+   * names none of them, and the resolve-resize path bypasses this method
+   * entirely — so the receipt below (`profile.frameStats.giRebuilds`) records
+   * both routes in one rolling log. The same blindness hid the governor hunt
+   * AND the shadowMerge invalidation loop earlier this same day.
+   */
+  requestRebuild(reason = "unspecified") {
     this._rebuildQueued = true;
+    this.noteRebuildAsk(reason);
+  }
+
+  /** Rolling log of who asked for a rebuild and when. Shared with the resize path. */
+  noteRebuildAsk(reason) {
+    this.rebuildAsks = (this.rebuildAsks ?? 0) + 1;
+    (this.rebuildLog ??= []).push({ reason, at: performance.now() });
+    if (this.rebuildLog.length > 12) this.rebuildLog.shift();
   }
 
   /**
@@ -1904,6 +2105,10 @@ export class GISystem {
     if (!component || !component.enabled) return;
     const renderer = this.engine.renderer;
     if (!renderer) return;
+    // One frame's allowance for first-dispatch graph construction — see the
+    // note above giCompute. Reset per GI tick, which is the unit the chains
+    // are ordered by.
+    giResetFrameBuildBudget();
     registerGILight(renderer);
     // Must be live before the FIRST build's dispatches — the build happens
     // inside this tick, and its kernels are the big ones.
@@ -1960,6 +2165,15 @@ export class GISystem {
     if (this.state?.skyRadiance) {
       sceneSkyRadiance(this.engine?.scene, this.state.skyRadiance.value);
     }
+    // ── DEBUG VIEW POLL ───────────────────────────────────────────────────
+    // `#applyDebugVisibility` polls `__giDebugView` AND the component's
+    // `debugView` prop every frame. The component-side change is already
+    // routed through `onComponentProp` (a single call on the click that does
+    // not require polling), but `__giDebugView` is a console switch with no
+    // notification — only a poll catches it. The cost is one string read and
+    // a uniform write when the value actually changed; everything else
+    // short-circuits inside `#applyDebugVisibility`.
+    this.#applyDebugVisibility();
     // ── THE ENVIRONMENT MUST NOT ALSO LIGHT MATERIALS DIRECTLY (§12.64) ──
     // three applies `scene.environment` as per-material image-based light —
     // diffuse `iblIrradiance` AND specular radiance, both UNOCCLUDED. With GI
@@ -1984,7 +2198,17 @@ export class GISystem {
       const scene = this.engine?.scene;
       if (scene) {
         const keep = globalThis.__giKeepIBL === true;
-        const install = !keep && !!scene.environment;
+        // ⚠ NOT THE MOMENT GI ATTACHES, THE MOMENT GI CAN LIGHT. The compile
+        // wave keeps the GI light OFF the live scene until every material
+        // variant is warm (30s+ on a real project). Suppressing IBL on the
+        // first tick of that wait is the user's "everything disappears, only
+        // the HDRI sky remains": `scene.background` still draws the
+        // environment, but every mesh loses its IBL and the replacement GI
+        // light is not in the scene yet. Hold IBL until the light is
+        // committed AND the occupancy field has actually dispatched — then
+        // the occluded-sky path is real and this suppression is honest.
+        const giLive = this.state?.light?.parent === scene && this._fieldReadyOnce === true;
+        const install = !keep && !!scene.environment && giLive;
         if (install && !scene.environmentNode) {
           this._envIblBlack ??= THREE.TSL.vec3(0, 0, 0);
           scene.environmentNode = this._envIblBlack;
@@ -2075,12 +2299,110 @@ export class GISystem {
         state.screen.ao.radius.value = Math.min(4, Math.max(0.1, aoOv.radius));
       }
     }
+    const vxaoOv = globalThis.__giVxaoOverride;
+    if (vxaoOv && state.screen?.vxao) {
+      if (Number.isFinite(vxaoOv.strength)) {
+        state.screen.vxao.strength.value = Math.min(1, Math.max(0, vxaoOv.strength));
+      }
+      if (Number.isFinite(vxaoOv.radius)) {
+        state.screen.vxao.radius.value = Math.min(4, Math.max(0.1, vxaoOv.radius));
+      }
+    }
     // §12.71b v2 — the glossy firefly cap is a live uniform on the glossy
     // gather; `__giGlossyCap` pins it (same polling convention as the AO
     // dials above).
     const glossyCap = Number(globalThis.__giGlossyCap);
     const glossyU = state.screen?.srcProbes?.glossy?.cap;
     if (glossyU && Number.isFinite(glossyCap) && glossyCap > 0) glossyU.value = glossyCap;
+
+    // ── §16 R4b — IDLE FLOOR DRAIN (2026-08-24 night) ────────────────────────
+    //
+    // Roughness-floor resolution AND the bucket heal both rode the
+    // edit-driven mesh scan (#collectMeshes → #refreshMirrorBucket), so an
+    // editor sitting idle after boot never resolved a single floor — and even
+    // when boot-time scans won the race and resolved them, no LATER scan ran
+    // to act on the stats, so misclassified consumers kept paying the dense
+    // prepass forever (the user's Sponza: 22.7 ms/frame of bvhReflect +
+    // bvhHitShade against "24 dynamic-roughness, 0 mirrors", measured live
+    // with ZERO scans firing after the compile wave). Round-robin the known
+    // materials through the SAME heal the scan uses: 2 materials every 16
+    // frames ≈ 7 materials/s — a full 100-material scene settles in ~15 s of
+    // idle, and a stable material costs two map reads. Perpetual by design:
+    // it also heals uniform-factor edits and late-loading textures without
+    // waiting for an unrelated scene edit.
+    if (globalThis.__giRoughnessFloorClassify !== false && !this._compileWaveActive) {
+      // ⚠ WALL CLOCK, NOT FRAME COUNT (2026-08-25). This drain used to fire on
+      // `(frame & 15) === 0` — 2 materials per 16 FRAMES. That couples the rate
+      // at which the ladder learns what a surface is to the frame rate it
+      // exists to repair: at the 4 fps a mid-boot Bistro sits at, 16 frames is
+      // FOUR SECONDS, so 128 pending floors would take about eight minutes,
+      // and every one of those minutes is spent tracing full-resolution
+      // reflections for materials whose exact-reflection weight is zero. The
+      // slower the frame, the slower the fix — exactly backwards.
+      //
+      // Time-based instead, and the batch scales with the backlog: a settled
+      // scene still costs two map reads per tick, while a fresh import drains
+      // in seconds. The in-flight cap below is what actually bounds the GPU
+      // work; this only decides how often we ask.
+      const now = (globalThis.performance ?? Date).now();
+      const due = now - (this._floorDrainAt ?? 0) >= 120;
+      if (due && this._mirrorBucketMaterials?.size > 0) {
+        this._floorDrainAt = now;
+        const queue = (this._floorDrainQueue ??= []);
+        if (queue.length === 0) queue.push(...this._mirrorBucketMaterials);
+        // Bigger bites while a backlog exists. A 32x32 readback is ~4 kB, so
+        // the cost of asking is not the readback — it is the pipeline stall,
+        // which `_roughnessStatInFlight` bounds regardless of what we queue.
+        const batch = queue.length > 32 ? 8 : 2;
+        for (let n = 0; n < batch && queue.length > 0; n++) {
+          const material = queue.pop();
+          // Dropped from the drain set by a dispose between passes.
+          if (this._mirrorBucketMaterials.has(material) && this.#refreshMirrorBucket(material)) {
+            this._floorDrainFlipped = true;
+          }
+        }
+        // ── THE TAG HALF (measured 2026-08-24: heals alone moved NOTHING) ──
+        //
+        // The mirror-mask pass draws GI_MIRROR_LAYER, and only the mesh walk
+        // (#collectMeshes) rewrites those layer tags from the buckets — so a
+        // heal without a re-tag leaves the mask covering the OLD consumer
+        // set and the prepass cost exactly where it was (Sponza: bvhReflect
+        // 13.9 ms after every floor had resolved). One walk per completed
+        // drain cycle that flipped anything: ~600 objects, tens of µs,
+        // against a 22 ms/frame stake.
+        if (queue.length === 0) {
+          // Cycle heartbeat (capped): "the drain ran and computed THESE
+          // buckets" — without it, "no flips" cannot be told apart from
+          // "never executed" (the exact ambiguity of the first live test).
+          // The bucket-3 census names WHY each remaining consumer stays:
+          // walk-blind (src null — a graph shape giRoughnessSourceOf does
+          // not recognise = a further reclassification lever), stat still
+          // pending, or a genuinely low floor (correct conservatism).
+          if ((this._floorDrainCycles = (this._floorDrainCycles ?? 0) + 1) <= 4) {
+            let srcNull = 0, statPending = 0, floorLow = 0;
+            for (const m of this._mirrorBucketMaterials) {
+              if (this._mirrorBuckets.get(m) !== 3) continue;
+              const src = giRoughnessSourceOf(m);
+              if (!src?.tex) { srcNull++; continue; }
+              const stats = giRoughnessFloorStats.get(src.tex);
+              if (stats === undefined) { statPending++; continue; }
+              floorLow++;
+            }
+            const bt = this._bucketTally;
+            console.log(
+              `[gi] §16 R4b: drain cycle ${this._floorDrainCycles} — ` +
+                `${this._mirrorBucketMaterials.size} materials, tally ` +
+                `${bt ? bt.join("/") : "?"}${this._floorDrainFlipped ? ", flips → re-tag" : ", no flips"}` +
+                ` (bucket-3: ${srcNull} walk-blind, ${statPending} stat-pending, ${floorLow} floor-low)`,
+            );
+          }
+          if (this._floorDrainFlipped) {
+            this._floorDrainFlipped = false;
+            this.#collectMeshes();
+          }
+        }
+      }
+    }
 
     // Belt-and-braces for the lights-hash memo bug (#purgeLightsHashMemo):
     // purge once more a few frames after every build, when async pipeline
@@ -2316,6 +2638,18 @@ export class GISystem {
     // way position validation cannot see. An open §12.43 window zeroes it
     // too (a light EVENT just fired). `__giIrrHistWeight` pins it;
     // `__giIrrTemporal = false` at build removes the chain entirely.
+    // §18.15 — the hit-shade TERM MASK rides its live global array, so an A/B
+    // between the four terms of the reflected radiance costs one frame instead
+    // of a 50 s Bistro rebuild. Deliberately OUTSIDE every pass gate below: an
+    // instrument that silently stops applying because an unrelated filter was
+    // off is the exact failure mode this session has already hit four times.
+    // Inert unless `#hitTermMask` armed the uniform at build time.
+    if (this._giHitTermMaskU && Array.isArray(globalThis.__giHitTermMask)) {
+      const m = globalThis.__giHitTermMask;
+      this._giHitTermMaskU.value.set(
+        Number(m[0] ?? 1), Number(m[1] ?? 1), Number(m[2] ?? 1), Number(m[3] ?? 1),
+      );
+    }
     if (state.screen?.irrTemporalPass && this._giIrrHistWeightU) {
       const camera = this.engine.camera;
       if (camera) {
@@ -2341,6 +2675,10 @@ export class GISystem {
           );
         }
       }
+      // ⚠ ADVANCED HERE, ONCE, so BOTH history weights below read the same
+      // number this frame. It used to be computed inside the R7c block, which
+      // meant only the reflection filter could see camera motion at all.
+      const camEma = this.#cameraMotionEma();
       const pin = Number(globalThis.__giIrrHistWeight);
       if (Number.isFinite(pin)) {
         this._giIrrHistWeightU.value = Math.min(0.98, Math.max(0, pin));
@@ -2371,7 +2709,54 @@ export class GISystem {
         // case where history is wrong rather than noisy.
         const fastField = Math.min(1, Math.max(0, Number(globalThis.__giSrcMotionRootLive) || 0));
         const base = 0.9 * (1 - mLight);
-        this._giIrrHistWeightU.value = windowOpen ? 0 : Math.max(base, 0.7 * fastField);
+        // ── §18.8: THE CAMERA TERM THIS FILTER NEVER HAD (2026-08-25) ────────
+        //
+        // Every term above is about the WORLD — light motion, a light-step
+        // window, how fast the field is forgetting. There was no camera term at
+        // all, so this weight sat at 0.9 through an orbit: a ~10-frame
+        // exponential smear (time constant 1/(1-w)). That is what the user sees
+        // as GHOSTING on movement, and it survived culling the emitters
+        // ("reduced all lights except 10, and still ghosting on movement"),
+        // which is what rules the emitter path out and points here.
+        //
+        // The defence for holding it high was "it is reprojected and
+        // world-validated", and that IS sound for CORRECTNESS: diffuse
+        // irradiance is view-independent, so a reprojected static-world sample
+        // is the right value. It is not sound for ACCUMULATED RESAMPLING. At
+        // w = 0.9 a texel's content survives ~10 frames, and every one of those
+        // frames re-fetches it through a bilinear tap at a new sub-texel offset
+        // while the world-position guard's tolerance is voxel-scale (0.15-0.25 m,
+        // far coarser than a texel). Correct values, smeared along the screen
+        // path the camera swept — a ghost.
+        //
+        // §17 R7c already made exactly this argument for the reflection filter,
+        // and its reasoning transfers word for word: the MOVING IMAGE MASKS THE
+        // NOISE this filter exists to smooth, and the weight recovers over
+        // ~1/3 s at rest (the EMA's 0.85 release), which is when a still image
+        // needs the smoothing again.
+        //
+        // ⚠ GENTLER THAN R7c's 0.95, deliberately. A reflection under motion is
+        // genuinely stale and should go near-raw; diffuse history is genuinely
+        // VALID, just resampled, so this only shortens the tail rather than
+        // cutting it. 0.9 -> 0.45 at full motion takes the time constant from
+        // ~10 frames to ~1.8. `__giIrrHistCamMotion` tunes the coefficient and
+        // 0 restores the old camera-blind behaviour; `__giIrrHistWeight` still
+        // pins the whole thing for a clean A/B.
+        const camK = Number(globalThis.__giIrrHistCamMotion);
+        const k = Number.isFinite(camK) ? Math.min(1, Math.max(0, camK)) : 0.5;
+        const settled = windowOpen ? 0 : Math.max(base, 0.7 * fastField);
+        this._giIrrHistWeightU.value = settled * (1 - k * camEma);
+        // Published for the REFLECTION filter below, which must scale the
+        // motion-free value rather than this one — see its own banner.
+        this._giIrrHistSettled = settled;
+        // RECEIPT, and a MAXIMUM rather than a peak-held best case — three
+        // receipts lied in this module today by reporting only good news.
+        if (camEma > 0.5) {
+          this._giIrrWeightAtMotion = Math.max(
+            this._giIrrWeightAtMotion ?? 0,
+            this._giIrrHistWeightU.value,
+          );
+        }
       }
       // ── §17 R7c: REFLECTIONS ARE VIEW-DEPENDENT ─────────────────────────
       // The header's "held high under CAMERA motion — reprojection handles
@@ -2386,26 +2771,51 @@ export class GISystem {
         if (Number.isFinite(hitPin)) {
           this._giBvhHitHistWeightU.value = Math.min(0.98, Math.max(0, hitPin));
         } else {
-          const cam = this.engine.camera;
-          const scr = (this._giCamMotionScratch ??= {
-            pos: new THREE.Vector3(), dir: new THREE.Vector3(), seeded: false, ema: 0,
-          });
-          let moving = 0;
-          if (cam) {
-            const e = cam.matrixWorld.elements;
-            if (scr.seeded) {
-              const posDelta = Math.hypot(e[12] - scr.pos.x, e[13] - scr.pos.y, e[14] - scr.pos.z);
-              const dirDelta = Math.abs(e[8] - scr.dir.x) + Math.abs(e[9] - scr.dir.y) + Math.abs(e[10] - scr.dir.z);
-              moving = posDelta > 0.002 || dirDelta > 0.0005 ? 1 : 0;
-            }
-            scr.pos.set(e[12], e[13], e[14]);
-            scr.dir.set(e[8], e[9], e[10]);
-            scr.seeded = true;
-          }
-          // Fast attack, ~0.85^n release (~0.3 s at 60 fps; longer at low
-          // fps, which only errs toward responsiveness).
-          scr.ema = Math.max(moving, scr.ema * 0.85);
-          this._giBvhHitHistWeightU.value = this._giIrrHistWeightU.value * (1 - 0.95 * scr.ema);
+          // ⚠ READS the shared EMA advanced above — it must NOT recompute it.
+          // While this block owned the only copy, a second consumer would have
+          // advanced the same scratch twice in one tick and halved its release
+          // time. `#cameraMotionEma` is frame-guarded for exactly that reason.
+          const camMotion = this._giCamMotionEma ?? 0;
+          // ⭐⭐ §18 W5 — TWO FIXES, BOTH FROM ONE USER REPORT: "reflections are
+          // both bad and very flickery/noisy when camera is moving. They must be
+          // smooth and not flicker on camera movement."
+          //
+          // 1. THE MOTION PENALTY WAS APPLIED TWICE. This line scaled
+          //    `_giIrrHistWeightU.value`, but §18.8 had since given THAT weight
+          //    its own camera term — so the reflection weight was
+          //    `settled·(1−0.5m)·(1−0.95m)`, compounding two independent
+          //    reductions that were each written as if they were the only one.
+          //    Measured live at a mild `camMotionEma` of 0.377: 0.469 where the
+          //    single penalty intends 0.72. Scaling `settled` restores the one
+          //    penalty R7c actually specified.
+          //
+          // 2. 0.95 ANNIHILATED THE FILTER. At full motion the pair above
+          //    reached 0.0225 — a receipt this module already printed as
+          //    `hitHistWeightAtMotion` and nobody read as the disaster it is:
+          //    weight 0.02 is NOT a filter, it is the raw single-sample trace,
+          //    and the hit radiance is the noisiest term in the module (per-texel
+          //    cone-shadow and gather variance is why it was given a temporal
+          //    filter in the first place). The justification in R7c's own comment
+          //    is "the MOVING IMAGE MASKS THE NOISE", and the user's report
+          //    refutes exactly that sentence — the noise is the most visible
+          //    thing on screen while moving.
+          //
+          // 0.45 keeps ~0.5 at full motion: a ~2-frame time constant, which is
+          // ~35 ms at 60 fps — far too short to read as the "reflections drag
+          // behind the camera" lag R7c was built to kill (that was w = 0.9, a
+          // ~10-frame smear), and enough to halve the variance.
+          // `__giBvhHitHistWeight` still pins it for a clean A/B, and
+          // `__giBvhHitCamMotion` tunes just this coefficient.
+          const hitK = Number(globalThis.__giBvhHitCamMotion);
+          const hk = Number.isFinite(hitK) ? Math.min(1, Math.max(0, hitK)) : 0.45;
+          const settledBase = this._giIrrHistSettled ?? this._giIrrHistWeightU.value;
+          this._giBvhHitHistWeightU.value = settledBase * (1 - hk * camMotion);
+          // RECEIPT (§18): "reflections look like a stale image lagging
+          // behind" is a report about THIS number and nothing else — a
+          // history weight near 0.9 is a ~10-frame exponential smear. Peak-hold
+          // the value SEEN WHILE THE CAMERA WAS ACTUALLY MOVING, because by the
+          // time anything can read it the EMA has already decayed.
+          if (this._giCamMoving) this._giHitWeightAtMotion = this._giBvhHitHistWeightU.value;
         }
       }
       this.#syncDynamicSurfaceBounds();
@@ -2567,6 +2977,20 @@ export class GISystem {
         const proj = this.engine.camera?.projectionMatrix?.elements;
         if (proj) this._giAoProjU.value = 0.5 * state.screen.height * proj[5];
       }
+      // GTAO marches SCREEN directions, so it needs the camera's two screen
+      // axes in world space to turn one into a world-space slice plane. Read
+      // from the live matrixWorld beside the projection scale above and for
+      // the same reason: a baked basis here is the §14 penumbra
+      // camera-dependence bug in a new costume. Columns 0 and 1 of a camera
+      // matrixWorld are right and up; both are unit for an unscaled camera,
+      // and the pass renormalizes anyway.
+      if (this._giAoCamRightU) {
+        const m = this.engine.camera?.matrixWorld?.elements;
+        if (m) {
+          this._giAoCamRightU.value.set(m[0], m[1], m[2]);
+          this._giAoCamUpU.value.set(m[4], m[5], m[6]);
+        }
+      }
       // §12.71b v3 — env-on-miss inputs track the LIVE scene environment.
       // Equirect only for now: a cube-mapped environment keeps intensity 0
       // (the term stays inert) rather than sampling with the wrong mapping.
@@ -2636,15 +3060,216 @@ export class GISystem {
       const gbufHeld = gbufKey !== null &&
         gbufKey === this._gbufferKey &&
         wantsMirrorMask === this._gbufferMask;
+      // Published on the instance because the reflection holds below read it
+      // from a DIFFERENT SCOPE in this tick (the frame-queue filter), and a
+      // bare `gbufHeld` there is a ReferenceError that throws the whole tick.
+      this._gbufHeld = gbufHeld;
       if (gbufHeld) {
         this._gbufferHeldFrames = (this._gbufferHeldFrames ?? 0) + 1;
       } else {
         this._gbufferKey = gbufKey;
         this._gbufferMask = wantsMirrorMask;
         this._gbufferHeldFrames = 0;
-        renderGiGBuffer(renderer, this.engine.scene, this.engine.camera, state.screen.gbuffer, {
+        this._gbufProxyStats = renderGiGBuffer(renderer, this.engine.scene, this.engine.camera, state.screen.gbuffer, {
           mirrorMask: wantsMirrorMask,
+          // §18 G1. Read fresh every frame rather than cached: the merge
+          // rebuilds on its own clock (streaming geometry, a caster that moved),
+          // and holding a stale group list here would hide members whose proxy
+          // no longer exists — the whole street missing from GI's g-buffer.
+          depthProxies: this.engine.shadowMerge?.gbufferGroups?.() ?? null,
         });
+      }
+      // ── THE MASK-COVERAGE ASSERTION (§18, 2026-08-25) ────────────────────
+      //
+      // Masked mode has been reverted FOUR times, and this plan doc's standing
+      // condition for ever re-flipping it is: "a rig asserts non-mirror
+      // gbuffer pixels SURVIVE the mask pass". This is that rig.
+      //
+      // The failure it exists to catch: pass 2 opening with a clear loadOp
+      // (three's Background.update ORs `forceClear` against `autoClear` — see
+      // renderGiGBuffer's note), which wipes pass 1's attachments so ONLY the
+      // masked meshes remain as gbuffer geometry. The screen gather then finds
+      // `position.w == 0` on every wall and the diffuse resolve reads zero —
+      // "every diffuse wall PITCH BLACK".
+      //
+      // So the number to watch is simply how much of the gbuffer carries
+      // geometry at all. It must be the SAME with the mask on as with it off.
+      // A collapse toward the masked set's screen coverage IS the bug, and it
+      // is visible in one number instead of a screenshot of a black room.
+      // Arm with `__giMaskCoverageProbe = true`; it fires once, a few frames
+      // in, so the first frames' partial state cannot answer for a settled one.
+      // ── §18.13 — THE COLOUR PROBE: WHERE DOES THE GREEN ENTER? ───────────
+      //
+      // Three theories about a green cast have now been wrong (the scene's own
+      // neon, the emitter cull, the probe-atlas chroma import). Each was
+      // plausible from the code and none survived contact with the screen. That
+      // is the signature of reasoning without an instrument, so this is the
+      // instrument: read back the reflection chain's own textures and report
+      // what colour is ACTUALLY in each, as a green ratio g/((r+b)/2).
+      //
+      // The chain, in order — the first stage that is already green is the
+      // source, and every stage after it is just carrying it:
+      //   bvhColor     the RAW hit albedo the prepass wrote (palette/atlas)
+      //   bvhRadiance  the SHADED hit radiance materials actually sample
+      //   irradiance   the diffuse field, for reference — if this is green too
+      //                the cast is scene-wide and not a reflection bug at all
+      //
+      // §18.15 additions:
+      //   • RE-ARMABLE. `__giColourProbeRun` is a token; bump it and the probe
+      //     fires again. A one-shot instrument cannot A/B, and an A/B that
+      //     needs a 50 s rebuild per arm does not get run — this plus the
+      //     hit-shade term mask is what makes four arms cost four seconds.
+      //   • the reflection-probe ATLAS is a stage. It is an input to the hit
+      //     shading (the R-C luminance floor), it is a blurred capture of the
+      //     whole room, and its own capture kernel shades with the same emitter
+      //     formula — so "is the atlas itself green?" is a question about a
+      //     texture, answerable by reading it.
+      //   • CHROMA SPREAD per stage, closing §18.14's open item: a MEAN alone
+      //     cannot tell "every texel is grey" from "a varied image averaging
+      //     grey", and that ambiguity is what left `bvhColor`'s 170.5/170.5/
+      //     170.5 unreadable.
+      // One shot per token, ~90 settled frames in. `__giColourProbe = true`.
+      if (globalThis.__giColourProbe &&
+          this._colourProbeRunSeen !== (globalThis.__giColourProbeRun ?? 0)) {
+        this._colourProbeRunSeen = globalThis.__giColourProbeRun ?? 0;
+        this._colourProbeDone = false;
+        this._colourProbeWait = 0;
+        this._colourProbeResult = null;
+      }
+      if (globalThis.__giColourProbe && !this._colourProbeDone) {
+        // ⚠ WAIT FOR THE CHAIN TO HAVE ACTUALLY DISPATCHED, and RESET when it
+        // has not. The first cut counted 30 raw ticks and fired mid-boot, when
+        // `bvhColor` and `bvhRadiance` were still untouched — and dutifully
+        // reported "rgb 0.0/0.0/0.0" for both, i.e. it measured empty textures
+        // and called them black. That is the FOURTH instrument today to report
+        // confidently about a subject it could not see, and the third to do it
+        // by sampling before its input existed. The mask probe already needed
+        // this exact `settled`-and-reset discipline; not carrying it over here
+        // was the whole bug.
+        const armed =
+          !this._compileWaveActive &&
+          !!state.screen?.bvhReflect &&
+          this._bvhHitShadeGapFrames !== undefined;
+        this._colourProbeWait = armed ? (this._colourProbeWait ?? 0) + 1 : 0;
+        const bt = this._giBvhTarget;
+        const settleFrames = Number.isFinite(Number(globalThis.__giColourProbeSettle))
+          ? Number(globalThis.__giColourProbeSettle)
+          : 90;
+        if (this._colourProbeWait > settleFrames && bt?.bvhColor && bt?.bvhRadiance) {
+          this._colourProbeDone = true;
+          const mean = async (tex, label) => {
+            try {
+              const px = await readTexturePixelsGPU(renderer, tex, 64);
+              if (!px?.length) return `${label}: empty`;
+              let r = 0, g = 0, b = 0, n = 0;
+              // §18.15: chroma SPREAD alongside the mean. `sat` is the mean
+              // per-texel (max−min)/max — 0.00 proves a genuinely grey image,
+              // and a high `sat` on a neutral MEAN proves a varied one whose
+              // colours cancel. `gSd` is the standard deviation of the
+              // per-texel green ratio: a cast is a SHIFTED POPULATION, so a
+              // mean of 1.44 with a small spread is a tint on everything,
+              // while the same mean with a huge spread is a few green texels
+              // dragging the average and nothing to do with the report.
+              let sat = 0, gSum = 0, gSq = 0;
+              for (let i = 0; i < px.length; i += 4) {
+                // Skip texels with no coverage — averaging the untouched
+                // background in would report the CLEAR colour, not the image.
+                if (px[i + 3] === 0) continue;
+                const tr = px[i], tg = px[i + 1], tb = px[i + 2];
+                r += tr; g += tg; b += tb; n++;
+                const mx = Math.max(tr, tg, tb);
+                if (mx > 4) sat += (mx - Math.min(tr, tg, tb)) / mx;
+                const gr = tg / Math.max(1e-3, (tr + tb) / 2);
+                gSum += gr; gSq += gr * gr;
+              }
+              if (!n) return `${label}: no covered texels`;
+              r /= n; g /= n; b /= n; sat /= n;
+              const gMean = gSum / n;
+              const gSd = Math.sqrt(Math.max(0, gSq / n - gMean * gMean));
+              const greenRatio = g / Math.max(1e-3, (r + b) / 2);
+              return `${label}: rgb ${r.toFixed(1)}/${g.toFixed(1)}/${b.toFixed(1)} ` +
+                `green x${greenRatio.toFixed(2)} (per-texel mean x${gMean.toFixed(2)} sd ${gSd.toFixed(2)}) ` +
+                `sat ${sat.toFixed(3)} over ${n}/${px.length >> 2} texels`;
+            } catch (error) {
+              return `${label}: FAILED ${error?.message ?? error}`;
+            }
+          };
+          const mask = Array.isArray(globalThis.__giHitTermMask)
+            ? ` [termMask ${globalThis.__giHitTermMask.join(",")}]`
+            : "";
+          Promise.all([
+            Promise.resolve(`arm: run ${this._colourProbeRunSeen}${mask}`),
+            mean(bt.bvhColor, "bvhColor (raw hit albedo)"),
+            mean(bt.bvhRadiance, "bvhRadiance (shaded hit)"),
+            this._giTargets?.irradiance
+              ? mean(this._giTargets.irradiance, "irradiance (diffuse field)")
+              : Promise.resolve("irradiance: absent"),
+            // The atlas the hit shade's R-C floor imports from. Its capture
+            // kernel is the emitter formula's OTHER consumer, so a green atlas
+            // and a green hit radiance can share one cause upstream of both.
+            this._reflProbeGpu?.atlas
+              ? mean(this._reflProbeGpu.atlas, "reflProbeAtlas (probe capture)")
+              : Promise.resolve("reflProbeAtlas: absent"),
+          ])
+            .then((lines) => {
+              this._colourProbeResult = lines;
+              console.log(
+                "[gi] §18.13 colour probe — green x1.00 is neutral; the FIRST stage " +
+                  `above ~1.15 is where the cast enters:\n    ${lines.join("\n    ")}`,
+              );
+            })
+            .catch((error) => {
+              console.warn(`[gi] §18.13 colour probe FAILED: ${error?.message ?? error}`);
+            });
+        }
+      }
+      if (globalThis.__giMaskCoverageProbe && !this._maskProbeDone) {
+        // ⚠ ONLY SAMPLE THE SETTLED STATE, and RESET the counter when it is not
+        // settled. `wantsMirrorMask` is forced false for the whole compile wave
+        // (§16 R2 hardening), so a naive frame counter fires DURING the wave
+        // and reports "mask OFF" on a build configured mask ON — which is
+        // exactly what the first run of this rig did: it measured the arm it
+        // was not testing and logged nothing distinguishable. The probe must
+        // agree with the configuration before it is allowed to answer.
+        const settled = !this._compileWaveActive &&
+          wantsMirrorMask === this.#bvhMaskEnabled();
+        this._maskProbeWait = settled ? (this._maskProbeWait ?? 0) + 1 : 0;
+        const position = state.screen.gbuffer?.position;
+        if (this._maskProbeWait > 30 && position) {
+          this._maskProbeDone = true;
+          const masked = wantsMirrorMask;
+          this._maskCoverage = { state: "reading", masked };
+          readTexturePixelsGPU(renderer, position, 64)
+            .then((px) => {
+              if (!px?.length) {
+                this._maskCoverage = { state: "empty readback", masked };
+                console.log("[gi] §18 mask-coverage probe: readback empty — inconclusive.");
+                return;
+              }
+              const texels = px.length >> 2;
+              let geometry = 0;
+              // .w is the "geometry here" flag (1 or 0); an 8-bit blit keeps
+              // that faithfully, so a mid-range threshold is safe.
+              for (let i = 3; i < px.length; i += 4) if (px[i] > 127) geometry++;
+              const pct = ((100 * geometry) / texels).toFixed(1);
+              this._maskCoverage = { state: "ok", masked, texels, geometry, pct: Number(pct) };
+              console.log(
+                `[gi] §18 mask-coverage probe: ${geometry}/${texels} gbuffer texels carry ` +
+                  `geometry (${pct}%) with the mask ${masked ? "ON" : "OFF"}. ` +
+                  "⚠ ASSERTION: run both arms — this percentage must NOT drop when the mask " +
+                  "is ON. A drop toward the masked set's own screen coverage means pass 2 is " +
+                  "clearing pass 1's attachments, which is the four-revert bug.",
+              );
+            })
+            // ⚠ NOT a silent catch. This probe is the gate on re-enabling a
+            // feature that has been reverted four times; a rig that fails
+            // quietly reports "no problem found" for "never ran", which is the
+            // same blindness it exists to rule out.
+            .catch((error) => {
+              this._maskCoverage = { state: `failed: ${error?.message ?? error}`, masked };
+              console.warn(`[gi] §18 mask-coverage probe FAILED: ${error?.message ?? error}`);
+            });
+        }
       }
       mark("gi.screenChain");
       // [A] → [B]: probe population reads the gbuffer that was just rendered,
@@ -2680,7 +3305,11 @@ export class GISystem {
         // The lesson is about the LATCH, not the ordering: a boot optimisation
         // may not be gated on a one-shot that a rebuild can re-arm, because a
         // busy editor rebuilds faster than a 16 s pipeline compile completes.
-        giCompute(renderer, state.screen.srcProbes.passes);
+        // Deferrable: SRC is a temporal accumulator re-dispatched every frame,
+        // and a partially-dispatched chain is already what a boot with
+        // uncompiled pipelines produces. Its 44 kernels are the largest single
+        // block of first-build work in the tick.
+        giCompute(renderer, state.screen.srcProbes.passes, { deferrable: true });
         this.#maybeLogSrcProbeStats(renderer, state);
       }
       // BVH exact-reflection prepass: dispatched right after the gbuffer,
@@ -2700,8 +3329,44 @@ export class GISystem {
         // practice #build re-runs #syncBvhScene right after the field
         // build, so this only skips dispatch inside that same tick.
         if ((state.screen.bvhReflect.dynSet ?? null) === (this._dynSet ?? null)) {
-          this.engine.camera.getWorldPosition(this._bvhCameraPosition.value);
-          giCompute(renderer, state.screen.bvhReflect.compute);
+          // ── HELD WHEN ITS INPUTS ARE PROVABLY UNCHANGED ────────────────────
+          //
+          // MEASURED (Bistro, ultra, settled, parked): this pass is **25.77 ms
+          // of a ~52 ms GPU frame** — at ultra `#bvhReflectStride()` is 1, so
+          // it fires ONE BVH RAY PER RESOLVE PIXEL (1,599,261 of them) against
+          // a 2.8M-triangle BVH8, every frame, for an image that had not
+          // changed in any of them. The whole frame was GPU-bound on it.
+          //
+          // This pass TRACES ONLY — it writes hit t, face normal and hit
+          // albedo, never light (see createGiBvhReflect's header). So its
+          // inputs are exactly: the g-buffer, the camera, and the BVH. And
+          // `gbufHeld` already proves all three are unchanged — the g-buffer
+          // fingerprint folds in both camera matrices, every drawn mesh's
+          // world transform, geometry IDENTITY (so a BVH rebuild breaks it)
+          // and the target's identity, and it BAILS OUTRIGHT on any skinned or
+          // morphing mesh. Its target is persistent and nothing ping-pongs it,
+          // so the previous frame's trace is still there to be read.
+          //
+          // ⚠ EXACT, NOT AN APPROXIMATION, and that is why there is no
+          // heartbeat here: on a held frame this kernel would recompute a
+          // bit-identical result. The hit-SHADE pass is a different matter —
+          // it consumes the converging probe field, so it keeps its own
+          // cadence (see the frame queue).
+          // `__giReflectHold = false` restores the unconditional trace.
+          const reflectHeld = this._gbufHeld === true && globalThis.__giReflectHold !== false;
+          if (reflectHeld) {
+            this._bvhReflectHeldFrames = (this._bvhReflectHeldFrames ?? 0) + 1;
+          } else {
+            this._bvhReflectHeldFrames = 0;
+            this.engine.camera.getWorldPosition(this._bvhCameraPosition.value);
+            // Deferrable: a per-frame camera-dependent prepass — a frame late
+            // is a frame of reflection lag, which is what a pending pipeline
+            // already costs it. Not during the compile wave — this is the
+            // 51–132 s kernel; compiling it alongside materials is the 30 s init.
+            if (!this._compileWaveActive) {
+              giCompute(renderer, state.screen.bvhReflect.compute, { deferrable: true });
+            }
+          }
         } else {
           this._bvhSceneStale ??= this._frame;
         }
@@ -2724,7 +3389,11 @@ export class GISystem {
         const stale = !rp ||
           rp.bvhScene !== state.bvhScene ||
           rp.srcProbes !== (state.screen.srcProbes ?? null) ||
-          rp.traceKey !== (state.screen.emitter?.shadowTraceFn ?? null);
+          rp.traceKey !== (state.screen.emitter?.shadowTraceFn ?? null) ||
+          // §18.16: the capture now closes over the dynamic set's static-BVH
+          // any-hit trace (and its occupancy `bits` buffer). A NEW set is a
+          // stale closure — the same rule every other trace key here encodes.
+          rp.dynSet !== (this._dynSet ?? null);
         if (stale) this.#armReflectionProbeCapture(state);
         const armed = state.screen.reflProbes;
         if (armed) {
@@ -2744,10 +3413,21 @@ export class GISystem {
               (0.5 + 0.5698402909980532 * round) % 1,
             );
             gpu.uniforms.alphaU.value = round === 0 ? 1 : REFL_PROBE_EMA_ALPHA;
-            due.rec.rounds = round + 1;
-            giCompute(renderer, [armed.capture.compute, armed.blur.compute]);
-            due.rec.dirty = false;
-            due.rec.capturedAt = this._frame;
+            // Not during the compile wave: this kernel was measured pending
+            // 14.5 s on a toy room (watchdog re-roll), and kicking it off
+            // while the driver is already compiling 50+ material pipelines
+            // is how a real scene's "GI init" becomes half a minute. Capture
+            // is amortized one-per-few-frames anyway; waiting out the wave
+            // costs one refresh cycle, not the image.
+            if (this._compileWaveActive) {
+              // Leave dirty/rounds alone so the first post-wave tick captures
+              // for real instead of thinking this skip was a finished round.
+            } else {
+              due.rec.rounds = round + 1;
+              giCompute(renderer, [armed.capture.compute, armed.blur.compute]);
+              due.rec.dirty = false;
+              due.rec.capturedAt = this._frame;
+            }
           }
         }
       } else if (state.screen.reflProbes) {
@@ -2773,6 +3453,17 @@ export class GISystem {
         const blitted = blitBvhAtlasTiles(renderer, state.bvhScene);
         if (blitted > 0) {
           console.log(`[gi] bvh: atlas gpu-blit: ${blitted} compressed tiles`);
+        }
+      }
+      // §18.17: the reflection atlas is a second consumer of the same blit —
+      // Sponza's maps arrive KTX2-compressed, and the canvas path CANNOT draw
+      // them (no CPU-readable pixels), so without this every textured
+      // reflection would show the flat placeholder colour and look exactly
+      // like the mean-albedo picture this unit exists to replace.
+      if (this._slotAtlas?.pendingGpuTiles?.length && !this._compileWaveActive) {
+        const blitted = blitBvhAtlasTiles(renderer, this._slotAtlas);
+        if (blitted > 0) {
+          console.log(`[gi] bvh: reflection atlas gpu-blit: ${blitted} compressed tiles`);
         }
       }
       // GPU average colors for compressed textures (bounce-albedo palette —
@@ -2872,6 +3563,17 @@ export class GISystem {
         "lightShadowPass", "lightShadowFilterPass", "lightShadowWidePass",
         "lightShadowWidePass2", "lightShadowHistoryPass", "lightShadowPostPass",
       ]) frameSkip.add(state.screen[name]?.compute);
+    }
+    // 3. Exact-reflection shade/trace during the compile wave. These are the
+    // 16–50 s kernels; the occ-wait path used to dispatch `state.queue` with
+    // them still in it, which created their pipelines mid-wave anyway (the
+    // same trap the light-shadow skip was invented to close). They compile
+    // on first post-wave use.
+    if (this._compileWaveActive) {
+      frameSkip.add(state.screen?.bvhHitShade?.compute);
+      frameSkip.add(state.screen?.bvhHitTemporal?.filter?.compute);
+      frameSkip.add(state.screen?.bvhHitTemporal?.snapshot?.compute);
+      frameSkip.add(state.screen?.bvhReflect?.compute);
     }
     frameSkip.delete(undefined);
     const rateQueue = freeze === "all"
@@ -2991,6 +3693,11 @@ export class GISystem {
         : giNodesPending(occPasses));
       let occSkipped = false;
       if (occPasses && !occWait) {
+        // NOT deferrable, and rule one above is why: a half-executed pyramid
+        // chain IS the damage, so this caller blocks the whole chain rather
+        // than run part of it. The first-build budget must never make that
+        // decision for it — the field is also the critical path to first light,
+        // so it gets the frame's allowance ahead of every deferrable stage.
         giCompute(renderer, occPasses);
         occSkipped = giSkippedComputes.size > skippedBefore;
       }
@@ -3060,6 +3767,24 @@ export class GISystem {
               // texture) and the resolve consumes them — before it.
               ...(state.screen.emitterShadowPass
                 ? [
+                    // ⭐ §18.9 — THE TILE CUT, the SECOND thing missing from
+                    // this list (2026-08-25). It is `unshift`ed to the FRONT of
+                    // the emitter chain in the full queue, and it was absent
+                    // here entirely.
+                    //
+                    // The push site still calls it "consumerless today"; that
+                    // comment is STALE. `createGiResolve` reads its buffer —
+                    // `tileComp = emitterTileCut.posBuf.element(...).w` — and
+                    // multiplies EVERY emitter's direct irradiance by it. So
+                    // while idle, the resolve kept running each frame but
+                    // scaled emitter light by a per-SCREEN-TILE compensation up
+                    // to 29 frames old. The camera moves, the tiles sweep over
+                    // new content, and their compensation does not follow:
+                    // "the whole screen space image of lights starts lagging
+                    // behind" (user, verbatim). Same class as the hit chain,
+                    // same list, found by auditing it properly instead of one
+                    // pass at a time.
+                    ...(state.screen.emitterTileCut ? [state.screen.emitterTileCut.compute] : []),
                     state.screen.emitterShadowPass.compute,
                     state.screen.emitterShadowFilterPass.compute,
                     // The temporal pair rides the idle path too: skipping it
@@ -3076,6 +3801,58 @@ export class GISystem {
                   ]
                 : []),
               state.screen.resolve.compute,
+              // ⭐⭐ §18.6 — THE EXACT-REFLECTION HIT CHAIN, WHICH WAS MISSING
+              // FROM THIS LIST (2026-08-25). Every other entry here carries a
+              // comment saying it is camera-dependent and that freezing it
+              // would lag a camera move — and the single MOST camera-dependent
+              // chain in the frame was simply absent, because this list is a
+              // hand-maintained duplicate of "which passes are camera
+              // dependent" and it silently diverged when §14 R-A moved hit
+              // shading into `state.queue` (see the ordering contract at the
+              // full-queue push: resolve, then hit chain, then the irradiance
+              // pair — matched exactly here).
+              //
+              // WHAT IT COST: `idle` keys on `_fieldQuietFrames`, and
+              // `#fieldInputHash()` digests lights, emitters, sky, bounceGain,
+              // dynSet version and the blend knobs — THE CAMERA IS NOT IN IT.
+              // So orbiting never resets the counter; after 180 quiet frames
+              // idle engages and STAYS engaged through the whole orbit, and the
+              // hit chain then dispatches on the heartbeat alone: ONE FRAME IN
+              // THIRTY. At the ~15-18 fps this scene moves at, that is a
+              // reflection that re-shades about every two seconds.
+              //
+              // The trace keeps running every frame (it is dispatched outside
+              // this queue), so `t`/normal/albedo stay current while the
+              // RADIANCE the material actually samples is frozen — fresh
+              // geometry, stale light. Materials read `bvhRadiance` at `giUV`,
+              // the surface's own reprojection, so the frozen image TRANSLATES
+              // WITH THE SURFACE while its content does not change. That is the
+              // user's report verbatim: "reflection just moves to the side when
+              // camera moves to the side, not changing the angle as it should",
+              // and "works properly sometimes, but soon it gets overwhelmed" is
+              // the 180-frame timer arming, not a load threshold.
+              //
+              // ⚠ GATED ON THE VIEW, NOT ON THE WORLD. Adding it
+              // unconditionally would restore ~14.6 ms to every idle frame
+              // including parked ones, for a re-shade of a view that has not
+              // moved. `_gbufHeld` is already the exact "the view is unchanged"
+              // signal, computed earlier this tick — so a PARKED camera keeps
+              // today's saving (and the held-view cadence below still governs
+              // it), while a MOVING camera gets a live reflection, which is the
+              // one state that was broken. The idle gate asks "did the WORLD
+              // change?"; a view-dependent pass has to ask "did the VIEW
+              // change?".
+              ...(state.screen.bvhHitShade && this._gbufHeld !== true
+                ? [
+                    state.screen.bvhHitShade.compute,
+                    ...(state.screen.bvhHitTemporal
+                      ? [
+                          state.screen.bvhHitTemporal.filter.compute,
+                          state.screen.bvhHitTemporal.snapshot.compute,
+                        ]
+                      : []),
+                  ]
+                : []),
               // §12.65: the filter pair rides wherever the resolve rides —
               // with the filter built, the resolve writes RAW and only the
               // filter writes the texture materials sample; dropping it here
@@ -3094,6 +3871,35 @@ export class GISystem {
               ...(state.screen.lightShadowPostPass ? [state.screen.lightShadowPostPass.compute] : []),
             ]
           : [];
+        // ⭐⭐ §18.9 — THE DIVERGENCE AUDIT. This list is a HAND-MAINTAINED
+        // DUPLICATE of "which passes are camera-dependent", and it has now
+        // silently diverged TWICE: §14 R-A added the exact-reflection hit chain
+        // to the queue and never added it here (a two-second reflection
+        // freeze), and §12.70 W4b unshifted the emitter tile cut and never
+        // added it here (stale per-tile emitter compensation). Both were
+        // invisible: the frame rate looked *better* for dropping them, and the
+        // only symptom was the user saying something lagged.
+        //
+        // So the list now checks itself against the real queue the first time
+        // it is used after a build. It cannot auto-fix — a pass may be omitted
+        // deliberately, and guessing would be worse — but a named warning turns
+        // a silent visual bug into a line in the console. Anything reported
+        // here is either a bug or a decision that deserves a comment.
+        if (this._idleAuditedFor !== state.queue && Array.isArray(state.queue)) {
+          this._idleAuditedFor = state.queue;
+          const present = new Set(frameQueue);
+          const dropped = state.queue.filter((node) => !present.has(node));
+          if (dropped.length) {
+            const names = dropped.map((n) => n?.__giPassName ?? "unnamed").join(", ");
+            console.warn(
+              `[gi] §18.9 IDLE-LIST DIVERGENCE: ${dropped.length} queued pass(es) are DROPPED ` +
+                `while the field is idle — ${names}. The idle list runs 1 frame in ` +
+                `${GI_IDLE_HEARTBEAT_FRAMES}, so anything camera-dependent in that set will ` +
+                `visibly lag the camera. Add it to the idle list, or document why it is safe ` +
+                `to freeze. (\`__giNoIdleSleep = true\` disables idle entirely for an A/B.)`,
+            );
+          }
+        }
       }
       // NO EMITTERS, NO EMITTER PASSES. The emitter shadow trace and its
       // bilateral filter are built whenever `emissiveShadows` is on — that is
@@ -3120,6 +3926,71 @@ export class GISystem {
       // source above (idle lists), and re-applying a Set is cheaper than
       // proving it never is.
       if (frameSkip.size) frameQueue = frameQueue.filter((node) => !frameSkip.has(node));
+      // ── HIT-SHADE RIDES A CADENCE WHILE THE VIEW IS HELD ─────────────────
+      //
+      // MEASURED alongside the trace: `bvhHitShade` is **26.03 ms** of the same
+      // ~52 ms GPU frame, and unlike the trace it does NOT get cheaper with the
+      // block stride — `radianceDiv` fixes its grid at 601x296 = 177,896
+      // threads at every stride. The cost is what each thread DOES: a probe
+      // field gather, a reflection-probe atlas sample, `emitterDirectAt` with a
+      // record shadow MARCH, and a light shadow march. That is secondary ray
+      // tracing per reflected hit, ~140 ns of it, 177,896 times a frame.
+      //
+      // It cannot simply be HELD the way the trace is: the trace is a pure
+      // function of inputs `gbufHeld` proves constant, but this pass also
+      // consumes the SRC probe field, which keeps converging on a parked
+      // camera (the field is never "quiet" — the probe chain is exempt from
+      // the idle gate by design). Freezing it would stop reflections
+      // converging for as long as the camera sits still.
+      //
+      // So it runs on a CADENCE instead, and only while the view is held. The
+      // reflection chain is already temporally filtered end to end (§17 R7c's
+      // view-dependent history weight), and at rest that filter's own release
+      // is ~1/3 s — far slower than this cadence, so the smoothed output is
+      // unchanged. The moment anything moves, `gbufHeld` goes false and this
+      // reverts to every frame, which is the case R7c tuned for.
+      // `__giHitShadeHold = false` restores the unconditional dispatch.
+      const hitShadeNode = state.screen?.bvhHitShade?.compute;
+      // ⚠ AND ONLY ONCE THE VIEW HAS BEEN HELD A WHILE. Dropping to a cadence
+      // the INSTANT the camera stops would make the reflection converge 3x
+      // slower at exactly the moment the user is looking at it — and "the
+      // reflections update a second or two after I stop" is a live complaint
+      // about this very chain (§18). So the first `GI_HELD_HIT_SHADE_SETTLE`
+      // held frames run at FULL rate to converge, and the cadence only takes
+      // over on a view that has been still well past that.
+      if (
+        hitShadeNode &&
+        this._gbufHeld === true &&
+        (this._gbufferHeldFrames ?? 0) > GI_HELD_HIT_SHADE_SETTLE &&
+        globalThis.__giHitShadeHold !== false &&
+        this._frame % GI_HELD_HIT_SHADE_FRAMES !== 0
+      ) {
+        frameQueue = frameQueue.filter((node) => node !== hitShadeNode);
+        this._bvhHitShadeHeldFrames = (this._bvhHitShadeHeldFrames ?? 0) + 1;
+      } else if (hitShadeNode) {
+        this._bvhHitShadeHeldFrames = 0;
+      }
+      // ⚠⚠ THE RECEIPT ABOVE DESCRIBES A DECISION, NOT A DISPATCH — and that is
+      // exactly how §18.6 stayed hidden. The `else` branch runs whenever THIS
+      // gate did not fire, so on every idle-dropped frame it wrote
+      // `_bvhHitShadeHeldFrames = 0` ("not held") while the idle list had
+      // already removed the pass and ZERO dispatches occurred. A live probe
+      // read 0 during an orbit and concluded the chain was healthy.
+      //
+      // Same species as `hitHistWeightAtMotion` peak-holding its best case.
+      // The fix in both places is to measure the OUTCOME: ask the queue that is
+      // about to be submitted whether the node is actually in it.
+      if (hitShadeNode) {
+        const dispatching = frameQueue.includes(hitShadeNode);
+        this._bvhHitShadeGapFrames = dispatching ? 0 : (this._bvhHitShadeGapFrames ?? 0) + 1;
+        if (!dispatching) {
+          this._bvhHitShadeGapMax = Math.max(this._bvhHitShadeGapMax ?? 0, this._bvhHitShadeGapFrames);
+        }
+      }
+      // The idle gate's own inputs, published for the same reason: `idleActive`
+      // with a HIGH `fieldQuietFrames` and a MOVING camera is the signature of
+      // a view-dependent pass being starved by a world-keyed timer.
+      this._fieldQuietFramesSeen = this._fieldQuietFrames ?? 0;
       // (§12.65 pipeline priming lived here and is GONE: four shapes —
       // in-tick batched, gated single-shot, task-context single-node,
       // computeAsync — all fired and all failed to create the wedged
@@ -3128,7 +3999,23 @@ export class GISystem {
       // wedge cosmetic instead; the general §12.56 auto-retry stays filed.)
       // Guard the empty case: `__giFreeze = "all"` produces no computes, and
       // three's renderer.compute([]) throws "expects a ComputeNode".
-      if (frameQueue.length) giCompute(renderer, frameQueue);
+      //
+      // Deferrable: the screen chain re-runs every frame and a skipped frame
+      // leaves the last resolved irradiance on screen — the same outcome as a
+      // pipeline that has not compiled yet.
+      if (this._compileWaveActive) {
+        // Exact-reflection shade/trace are the 16–50 s compiles; kicking them
+        // off from a live tick during the wave puts them in the same driver
+        // queue as the materials and SRC. They compile on first post-wave use.
+        const cold = new Set([
+          state.screen?.bvhHitShade?.compute,
+          state.screen?.bvhHitTemporal?.filter?.compute,
+          state.screen?.bvhHitTemporal?.snapshot?.compute,
+          state.screen?.bvhReflect?.compute,
+        ]);
+        frameQueue = frameQueue.filter((node) => !cold.has(node));
+      }
+      if (frameQueue.length) giCompute(renderer, frameQueue, { deferrable: true });
     }
     giSkippedComputes.clear();
 
@@ -3394,6 +4281,7 @@ export class GISystem {
       compileTarget.environmentRotation.copy(engine.scene.environmentRotation);
       compileTarget.fog = engine.scene.fog;
       engine.scene.updateMatrixWorld(true);
+      const compileSeen = new Set();
       engine.scene.traverseVisible((object) => {
         if (object.isLight) {
           // A clone keeps the live light's bind groups owned by the live
@@ -3407,8 +4295,24 @@ export class GISystem {
         // the imported object in its real hierarchy (some custom subclasses
         // cannot be shallow-cloned), while compileTarget gives its RenderObject
         // a separate scene/cache identity and therefore separate bind groups.
+        //
+        // ONE OBJECT PER PIPELINE VARIANT, not per mesh. three's render
+        // pipeline cache keys on material + vertex layout + skin/morph, so
+        // warming the 80th copy of the same wall material does not create a
+        // new pipeline — it just re-walks 180–250 kB of GI-injected WGSL on
+        // the main thread. A real interior is hundreds of meshes over a
+        // handful of materials; that walk WAS the 30 s init.
+        const key = giCompileVariantKey(object);
+        if (compileSeen.has(key)) return;
+        compileSeen.add(key);
         compileObjects.push(object);
       });
+      if (compileObjects.length) {
+        console.log(
+          `[gi] compile wave: ${compileObjects.length} unique material variants ` +
+            `(duplicate meshes that share a pipeline are not re-walked)`,
+        );
+      }
     }
     if (pendingLight) {
       if (backgroundCompile) compileTarget.add(pendingLight);
@@ -3500,23 +4404,29 @@ export class GISystem {
     let compileSucceeded = false;
     try {
       console.log("[gi] compile wave started");
-      // ── REFUTED: WARMING THE FIELD'S KERNELS HERE, BEFORE THE MATERIALS ──
-      //
-      // A `#warmFieldKernels` used to sit on this line: create the occupancy
-      // chain's 25 pipelines at wave start and drain them with the event loop
-      // free, so the field would not queue behind the material compiles. The
-      // reasoning was sound and the mechanism worked — the pass-family table
-      // showed the field's kernels created first — and it bought NOTHING.
-      //
-      // Measured, 3 runs per arm (`ARMS=warm`, medians): the field's own span
-      // (occupancy backend → field ready) fell 6,062 → 5,638 ms, and the user's
-      // wait went 11,040 → 11,291 ms. The warm's own node-graph build is
-      // ~700 ms of synchronous JS, and running it here simply moved that cost
-      // from after the `occupancy backend` log to before it. A wash, plus a
-      // 700 ms hitch and a method to maintain.
-      //
-      // Kept as a comment because "create the pipelines earlier" is the obvious
-      // next idea for anyone reading the boot timeline, and it has been tried.
+      // Kick occupancy AND SRC graph-builds NOW, in yielded slices, so their
+      // pipelines compile on the driver DURING the material walk instead of
+      // AFTER it. Sequential "warm field, then materials" was a wash (the
+      // hitch just moved); overlapping is a different claim: a 30 s material
+      // queue no longer stalls the field, and the first tick no longer owns
+      // a 1–3 s freeze of TSL analyze() for ~70 kernels.
+      {
+        const early = [];
+        const occNodes = state?.volume?.occupancyField?.prewarmComputes?.() ?? [];
+        occNodes.forEach((n, i) => { if (n && typeof n === "object") n.__giPassName ??= `occupancy#${i}`; });
+        early.push(...occNodes);
+        const srcEarly = state?.screen?.srcProbes?.passes ?? [];
+        early.push(...srcEarly);
+        let sinceEarly = performance.now();
+        for (const node of early) {
+          if (performance.now() - sinceEarly >= 8) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            sinceEarly = performance.now();
+          }
+          if (this.state !== state) break;
+          giCompute(renderer, node);
+        }
+      }
       // Compile against the render path that will actually draw at resume.
       // With a postprocess override active, the scene renders through the
       // override's PassNode target + MRT — a DIFFERENT pipeline-cache
@@ -3528,7 +4438,38 @@ export class GISystem {
       const objTimings = [];
       if (!(await this.#warmOverridePass(renderer))) {
         if (backgroundCompile) {
+          // ══ THIS LOOP YIELDS ON ITS OWN CLOCK, AND HAS TO ═════════════════
+          //
+          // The `scheduler.yield` override above is the only thing that ever
+          // handed a frame back during the material wave, and it can only fire
+          // where THREE chooses to call it. Two things conspire to make that
+          // almost never here: the `getForRender` interception means
+          // `compileAsync` no longer awaits `createRenderPipelineAsync` (that
+          // is the point — it is what overlaps the driver compiles), so its one
+          // real async boundary per object is gone; and the JS per object is
+          // genuinely cheap (measured: worst 16ms, most under 1ms), so the
+          // budget check skips nearly every call it does get.
+          //
+          // What is NOT cheap is the native work each `compileAsync` triggers
+          // synchronously — `createShaderModule` parses and validates the
+          // material's 180-250kB of GI-injected WGSL on the calling thread.
+          // That is invisible to a JS-frame profile (it lands in "(program)")
+          // and it does not offer a yield point.
+          //
+          // Measured before this loop got its own yields: ONE 3282ms main-thread
+          // task inside a wave whose own log line claimed the "viewport
+          // remained live". It was not live; it was frozen for over three
+          // seconds, which is most of what a startup freeze report is about.
+          // An unconditional macrotask every `yieldBudgetMs` of wall clock caps
+          // the block at roughly one budget's worth regardless of where the
+          // time went, native or not.
+          let sinceYield = performance.now();
           for (const object of compileObjects) {
+            if (performance.now() - sinceYield >= yieldBudgetMs) {
+              await new Promise((resolve) => setTimeout(resolve, 0));
+              sinceYield = performance.now();
+              yieldStats.loopYields = (yieldStats.loopYields ?? 0) + 1;
+            }
             const tObj = performance.now();
             await renderer.compileAsync(object, engine.camera, compileTarget);
             objTimings.push({
@@ -3656,6 +4597,20 @@ export class GISystem {
             if (node) coldShadow.add(node);
           }
         }
+        // Exact-reflection SHADE chain — same disease as the 51–132 s trace.
+        // High/ultra put these in `state.queue`, so the prewarm compiled them
+        // even after the trace itself was taken out. Measured on the toy room:
+        // `bvhHitShade` 16.6 s of a 12.7 s compute wait. Diffuse GI does not
+        // need them; they compile on first use like the trace.
+        if (globalThis.__giWarmBvhReflect !== true) {
+          for (const node of [
+            state.screen?.bvhHitShade?.compute,
+            state.screen?.bvhHitTemporal?.filter?.compute,
+            state.screen?.bvhHitTemporal?.snapshot?.compute,
+          ]) {
+            if (node) coldShadow.add(node);
+          }
+        }
         // Filtered out of BOTH loops. The re-dispatch below would otherwise
         // trigger the very creation this skipped, which is the kind of fix that
         // measures as no change and reads as a mystery.
@@ -3677,7 +4632,17 @@ export class GISystem {
         // counts it, instead of stalling the first frames after the wave says
         // it is finished.
         const reflectNode = this.#bvhReflectionsEnabled() ? state.screen?.bvhReflect?.compute : null;
-        if (reflectNode) queueWarm.push(reflectNode);
+        // Warmed as a RAMP, not as a boot tax. Exact reflections are the
+        // 51–132 s compile on Sponza when included here; GI's diffuse term
+        // does not need them, and the first post-wave dispatch creates the
+        // pipeline asynchronously (skip-until-ready, same as cold shadows).
+        if (reflectNode && globalThis.__giWarmBvhReflect === true) queueWarm.push(reflectNode);
+        else if (reflectNode) {
+          console.log(
+            "[gi] skipping exact-reflection prepass at warm-up — compiles on first use " +
+              "(`__giWarmBvhReflect = true` puts it back in the wave)",
+          );
+        }
         const warmNodes = [...queueWarm, ...srcPasses];
         if (coldShadow.size) {
           // Named per chain, because "which optional chains did this boot
@@ -3899,7 +4864,10 @@ export class GISystem {
       {
         console.log(
           `[gi] wave breakdown: ${yieldStats.count} real yields waited ${yieldStats.waited.toFixed(0)}ms ` +
-            `(${yieldStats.skipped} skipped by the 40ms budget); ` +
+            `(${yieldStats.skipped} skipped by the ${yieldBudgetMs}ms budget), ` +
+            `${yieldStats.loopYields ?? 0} taken by the material loop itself ` +
+            "(three stops offering yield points once the pipeline await is intercepted — " +
+            "these are what keep the wave off one long task); " +
             `slowest objects: ${objTimings
               .sort((a, b) => b.ms - a.ms)
               .slice(0, 6)
@@ -4092,7 +5060,7 @@ export class GISystem {
                   `[gi] §12.56 AUTO-RETRY (opt-in): ${second} — re-minting the field ` +
                   `(attempt ${this._giDeadFieldRetries}/2).`,
                 );
-                this.requestRebuild();
+                this.requestRebuild("dead-field-auto-retry");
               } else {
                 console.error(
                   `[gi] DEAD FIELD after 2 re-mints — ${second}. GI is degraded; reload the editor. ` +
@@ -4914,7 +5882,26 @@ export class GISystem {
             emitterCutoff,
           }
         : null;
-      const inputs = { gather, normalOffset: light.normalOffset, intensity: light.intensityUniform, emitter, ao };
+      // ⚠ THE NAME IS A FOSSIL. This is THE AO INPUT SLOT — the half-res one
+      // the resolve reconstructs with a position/normal-weighted 2x2 upsample —
+      // and every estimator since the voxel cones has ridden it (RTAO, now
+      // GTAO). It carries its own strength/radius uniforms so the term can be
+      // dialled without touching the (now unused) full-res `ao` slot.
+      //
+      // ⚠ AND IT NO LONGER REQUIRES THE OCCUPANCY CONE FN. Gating the slot on
+      // `traceOccupancyConeAO` was correct while a voxel cone was the only
+      // consumer; it silently deleted the AO term for every build without one.
+      // GTAO needs no acceleration structure at all, so the gate would now cost
+      // AO on exactly the portable/degraded builds that can least afford to
+      // lose a cheap term. The legacy cone arm still checks for its own fn.
+      const vxao = ao && globalThis.__giVxao !== false
+        ? {
+            strength: uniform(ao.strength.value),
+            radius: uniform(ao.radius.value),
+            node: null,
+          }
+        : null;
+      const inputs = { gather, normalOffset: light.normalOffset, intensity: light.intensityUniform, emitter, ao, vxao };
       // The bundle arrives target-less (the targets are created just above, and
       // only the system knows when) — bind it here and keep the completed
       // bundle on `screen` so the resize path can re-point it.
@@ -5419,7 +6406,15 @@ export class GISystem {
         srcProbes, gbuffer, width, height,
         validEps: inputs.lightShadow?.voxMax ?? 0.15,
       });
-      const aoPass = this.#armAoPass({ srcProbes, gbuffer, width, height, ao: inputs.ao });
+      const { aoPass, vxaoPass } = this.#armAoTerm({
+        srcProbes,
+        gbuffer,
+        width,
+        height,
+        ao: inputs.ao,
+        vxao: inputs.vxao,
+        occupancy: volume?.occupancyField,
+      });
       // §12.70 W4b: the per-tile emitter cut — built BEFORE the resolve and
       // the shadow pass because both CONSUME it since slice (ii): the shadow
       // pass marches each pixel's tile-list emitters (record pseudo-slots),
@@ -5596,6 +6591,12 @@ export class GISystem {
             probes: this.#reflectionProbesEnabled()
               ? (({ node, slots }) => ({ node, slots }))(this.#ensureReflProbeState())
               : null,
+            termMask: this.#hitTermMask(),
+            // §18.16 — exact BVH visibility for the sun/analytic term at hits
+            // (the occupancy cone it replaces etched the black lattice the
+            // user photographed on the Sponza mirror).
+            ...this.#hitShadowBundle(),
+            shadowReach: this.#hitShadowReach(volume),
           })
         : null;
       const bvhHitTemporal = bvhHitShade
@@ -6139,7 +7140,7 @@ export class GISystem {
         this.engine.scene.add(srcProbes.gizmos.group);
         srcProbes.gizmos.setVisible(giDebugView() === "src-probes");
       }
-      return { gbuffer, srcProbes, resolve, bvhHitShade, bvhHitTemporal, irrTemporalPass, irrHistoryPass, aoPass, glossyTemporal, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterTileCut, emitterTileCutBundle: tileCutBundle, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
+      return { gbuffer, srcProbes, resolve, bvhHitShade, bvhHitTemporal, irrTemporalPass, irrHistoryPass, aoPass, vxaoPass, glossyTemporal, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterTileCut, emitterTileCutBundle: tileCutBundle, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -6298,9 +7299,553 @@ export class GISystem {
       strength: ao.strength,
       radius: ao.radius,
     });
-    ao.node = pass.node;
+    // ── THE DENOISER IS NOT OPTIONAL (2026-08-26) ─────────────────────────
+    //
+    // The estimator rotates its spirals per pixel, which is a per-pixel
+    // ESTIMATOR and therefore spatial noise — the user's "especially screen
+    // space component". createGiAoFilterPass' header has the full argument.
+    // Two separable radius-2 cross-bilateral passes; the resolve then samples
+    // the FILTERED texture, and `pass.target` (the raw estimate) stays
+    // reachable for an A/B through `__giAoFilter = false`.
+    const filtered = globalThis.__giAoFilter === false
+      ? null
+      : (() => {
+        const tmp = new THREE.StorageTexture(width, height);
+        tmp.name = "giAoBlurX";
+        tmp.generateMipmaps = false;
+        const out = new THREE.StorageTexture(width, height);
+        out.name = "giAoFiltered";
+        out.generateMipmaps = false;
+        const filterX = createGiAoFilterPass({
+          gbuffer, source: pass.target, target: tmp, width, height,
+          cameraPosition: this._giResolveCamU, projScale: this._giAoProjU, axisX: 1,
+        });
+        const filterY = createGiAoFilterPass({
+          gbuffer, source: tmp, target: out, width, height,
+          cameraPosition: this._giResolveCamU, projScale: this._giAoProjU, axisY: 1,
+        });
+        return { tmp, out, computes: [filterX.compute, filterY.compute] };
+      })();
+    const finalTarget = filtered ? filtered.out : pass.target;
+    ao.node = texture(finalTarget);
     srcProbes.passes.push(pass.compute);
-    srcProbes.passGroups?.push({ label: "ao", count: 1 });
+    if (filtered) srcProbes.passes.push(...filtered.computes);
+    srcProbes.passGroups?.push({ label: "ao", count: filtered ? 3 : 1 });
+    // `target` IS what the resolve and the debug view read — the filtered
+    // estimate. `rawTarget` is the unfiltered one; keeping the names honest is
+    // what stops the "ao" debug view showing a different buffer from the one
+    // the frame multiplies in, which is the bug this whole pass came out of.
+    return {
+      ...pass,
+      target: finalTarget,
+      node: ao.node,
+      rawTarget: pass.target,
+      dispose: () => {
+        pass.target?.dispose?.();
+        filtered?.tmp?.dispose?.();
+        filtered?.out?.dispose?.();
+      },
+    };
+  }
+
+  /**
+   * ⛔ RETIRED — the AO PAIR (screen spirals + voxel cones) IS NO LONGER ARMED.
+   *
+   * `#armRtaoPass` replaces both (user directive 2026-08-26, "abandon vxao and
+   * gtao, for gi ao, reuse our Radiance Cascade traces"). This method and
+   * `#armAoPass` are kept, unreferenced by the default path, ONLY as the A/B
+   * arm behind `__giAoLegacy = true` — the change is a look change on every
+   * scene and the honest way to judge it is to be able to flip back in one
+   * build. Delete both once the ray-traced arm has been accepted.
+   *
+   * What they were: screen-space spirals over the gbuffer (4.31 ms, blind to
+   * anything off screen, estimating occlusion from a heightfield) and six
+   * 60-degree cones through the occupancy density pyramid (10.94 ms — the most
+   * expensive pass in the whole SRC chain — blind below a level-1 cell).
+   */
+  #armLegacyAoPair({ srcProbes, gbuffer, width, height, ao, vxao, occupancy }) {
+    const aoPass = this.#armAoPass({ srcProbes, gbuffer, width, height, ao });
+    const vxaoPass = this.#armVxaoPass({ srcProbes, gbuffer, width, height, vxao, occupancy });
+    return { aoPass, vxaoPass };
+  }
+
+  /**
+   * THE AO TERM'S ONE ENTRY POINT — which estimator runs, and why there is a
+   * choice at all rather than one shipped answer.
+   *
+   * There have been four. Two are retired (`#armLegacyAoPair`: screen spirals
+   * blind to anything off-screen, and voxel cones blind below a level-1 cell,
+   * 15.25 ms for the pair). Of the two that remain, neither dominates the
+   * other on correctness — they are blind in DIFFERENT directions, and that
+   * is exactly why the hatch exists instead of a deletion:
+   *
+   *   GTAO (default) solves the visibility integral in closed form from
+   *   screen-space horizons. Smooth, sharp at contacts, ~3x cheaper, and
+   *   available even where the static BVH is absent (a portable build, a
+   *   degrade-ladder drop) — but it cannot see an occluder that is off-screen
+   *   or hidden behind the receiver.
+   *
+   *   RTAO (`__giAoRaytraced = true`) traces the real world through the
+   *   cascade's BVH8, so it sees everything — but the budget it fits into is
+   *   ONE ray per pixel, i.e. a binary sample of a continuous integral, and
+   *   the 7x7 filter that makes that presentable is what costs the detail.
+   *
+   * The tie is broken by what the term is FOR here: the resolve multiplies it
+   * into the gather only, and the cascade's own BIN_T visibility already
+   * carries every world-space blocker at lattice resolution. The band left
+   * over is sub-lattice, and sub-lattice occluders are on screen next to the
+   * pixel they darken. See createGiGtaoPass' header for the full argument.
+   */
+  #armAoTerm(args) {
+    if (globalThis.__giAoLegacy === true) {
+      if (!this._rtaoLegacyLogged) {
+        this._rtaoLegacyLogged = true;
+        console.log("[gi] AO: LEGACY PAIR armed (__giAoLegacy = true) — screen spirals + voxel cones.");
+      }
+      return this.#armLegacyAoPair(args);
+    }
+    if (globalThis.__giAoRaytraced === true) return this.#armRtaoPass(args);
+    return this.#armGtaoPass(args);
+  }
+
+  /**
+   * GTAO — the shipped AO term. `createGiGtaoPass` owns the integral; this
+   * method owns the four things that are the SYSTEM's business.
+   *
+   * 1. THE RADIUS IS READ FROM THE CASCADE, exactly as the ray-traced arm's
+   *    was: `spacing0 * R0_OVER_S0 * 2` — one cascade-0 reach plus the
+   *    lattice cell, i.e. "the band the probe grid cannot resolve". 1.12 m on
+   *    the user's Sponza. Never a metre constant (that class has been
+   *    retracted three times in this module), and never the authored
+   *    `aoRadius`, which is why `derivedRadius` is published for
+   *    `#applyLiveProps` to write back every frame.
+   *
+   * 2. THE SAMPLE COUNT IS THE PRESET'S DIAL. Presets trade rays and probes,
+   *    never energy — a slice is exactly that kind of dial, because the arc
+   *    integral is normalized by slice count, so 2 slices and 4 slices differ
+   *    in variance and not in brightness. (Contrast the old spirals, whose
+   *    tap count multiplied a falloff sum: fewer taps there meant a DIMMER
+   *    image, and that is how a preset silently becomes a look.)
+   *
+   * 3. IT NEEDS NO TRACER, so unlike the ray-traced arm it has no fallback
+   *    path and cannot silently become 1. Two camera-axis uniforms are the
+   *    entire extra state, and they are written beside `_giAoProjU` in the
+   *    tick from the LIVE camera — a baked camera basis here would be the
+   *    §14 penumbra camera-dependence bug all over again.
+   *
+   * 4. THE FILTER IS NARROWER THAN THE RAY-TRACED ARM'S, and that is the
+   *    point of the swap. Radius 2 (5x5) still spans the 4x4 rotation tile,
+   *    so every rotation is averaged exactly once; radius 3 was sized to hide
+   *    ONE ray's variance, and spending it on an estimator that has none just
+   *    removes contact detail.
+   */
+  #armGtaoPass({ srcProbes, gbuffer, width, height, ao, vxao }) {
+    if (!vxao || !srcProbes) {
+      if (ao) ao.node = null;
+      if (vxao) vxao.node = null;
+      return { aoPass: null, vxaoPass: null };
+    }
+    // ONE ESTIMATOR. The `ao` slot stays null so the resolve's `min` cannot
+    // compose two terms and make an isolated read of either impossible — the
+    // instrument failure that cost two sessions in August.
+    if (ao) ao.node = null;
+    // ⚠ BORN HERE AND IN `#armRtaoPass`, never inside a pass: the denoiser
+    // reads `_giAoProjU`, and `float(undefined)` is a TSL BUILD error that
+    // takes down the entire GI screen chain rather than defaulting to zero.
+    this._giAoProjU ??= uniform(1).setGroup(renderGroup);
+    this._giAoCamRightU ??= uniform(new THREE.Vector3(1, 0, 0)).setGroup(renderGroup);
+    this._giAoCamUpU ??= uniform(new THREE.Vector3(0, 1, 0)).setGroup(renderGroup);
+
+    const s0 = Number(srcProbes.spacing0) > 0 ? Number(srcProbes.spacing0) : 0.35;
+    const radiusIntervals = Math.max(0.5, Math.min(8, Number(globalThis.__giGtaoIntervals) || 2));
+    const radius = s0 * SRC_R0_OVER_S0 * radiusIntervals;
+
+    const requestedScale = Number(globalThis.__giGtaoScale);
+    // HALF RESOLUTION, over a FULL-resolution gbuffer. The pass marches the
+    // full-res position buffer either way, so halving the pixel count halves
+    // the cost without blunting the horizons themselves; the resolve's
+    // position/normal-weighted 2x2 upsample (the `vxao` slot, see below) is
+    // what keeps the result from reading as blocky.
+    const scale = Number.isFinite(requestedScale)
+      ? Math.min(1, Math.max(0.25, requestedScale))
+      : 0.5;
+    const rtWidth = Math.max(16, Math.round(width * scale));
+    const rtHeight = Math.max(16, Math.round(height * scale));
+
+    // Taps per pixel = slices x steps x 2. The ladder is a variance ladder,
+    // not a brightness one (see 2. above).
+    const tier = qualityTierOf(this.config);
+    const preset = tier === "ultra"
+      ? { slices: 3, steps: 4 }
+      : tier === "high"
+        ? { slices: 3, steps: 3 }
+        : tier === "medium"
+          ? { slices: 2, steps: 3 }
+          : { slices: 2, steps: 2 };
+    const slices = Math.max(1, Math.min(8, Math.round(Number(globalThis.__giGtaoSlices) || preset.slices)));
+    const steps = Math.max(1, Math.min(8, Math.round(Number(globalThis.__giGtaoSteps) || preset.steps)));
+
+    const mkTex = (name) => {
+      const t = new THREE.StorageTexture(rtWidth, rtHeight);
+      t.name = name;
+      t.type = THREE.HalfFloatType;
+      t.generateMipmaps = false;
+      t.minFilter = THREE.LinearFilter;
+      t.magFilter = THREE.LinearFilter;
+      return t;
+    };
+    const rawTarget = mkTex("giGtaoRaw");
+    const pass = createGiGtaoPass({
+      gbuffer,
+      width: rtWidth,
+      height: rtHeight,
+      resolveWidth: width,
+      resolveHeight: height,
+      cameraPosition: this._giResolveCamU,
+      cameraRight: this._giAoCamRightU,
+      cameraUp: this._giAoCamUpU,
+      projScale: this._giAoProjU,
+      strength: vxao.strength,
+      radius: vxao.radius,
+      slices,
+      steps,
+      target: rawTarget,
+    });
+    vxao.derivedRadius = radius;
+    vxao.radius.value = radius;
+
+    const filtered = globalThis.__giAoFilter === false
+      ? null
+      : (() => {
+        const tmp = mkTex("giGtaoBlurX");
+        const out = mkTex("giGtao");
+        const shared = {
+          gbuffer,
+          width: rtWidth,
+          height: rtHeight,
+          resolveWidth: width,
+          resolveHeight: height,
+          cameraPosition: this._giResolveCamU,
+          projScale: this._giAoProjU,
+        };
+        const blur = Math.max(1, Math.min(6, Math.round(Number(globalThis.__giAoFilterRadius) || 2)));
+        const filterX = createGiAoFilterPass({ ...shared, source: rawTarget, target: tmp, axisX: 1, radius: blur });
+        const filterY = createGiAoFilterPass({ ...shared, source: tmp, target: out, axisY: 1, radius: blur });
+        return { tmp, out, blur, computes: [filterX.compute, filterY.compute] };
+      })();
+    const finalTarget = filtered ? filtered.out : rawTarget;
+
+    // IT RIDES THE `vxao` SLOT for the same reason the ray-traced arm did:
+    // that slot is the one the resolve reconstructs with a position/normal-
+    // weighted 2x2 upsample, which is what makes half resolution affordable
+    // instead of blocky. The slot's NAME is a fossil of the voxel-cone arm
+    // that first used it; it means "the half-res AO input" now.
+    vxao.node = texture(finalTarget);
+    vxao.width = rtWidth;
+    vxao.height = rtHeight;
+    srcProbes.passes.push(pass.compute);
+    if (filtered) srcProbes.passes.push(...filtered.computes);
+    srcProbes.passGroups?.push({ label: "gtao", count: filtered ? 3 : 1 });
+    console.log(
+      `[gi] AO: GTAO — ${slices} slices x ${steps} steps (${slices * steps * 2} taps/px) at ` +
+        `${rtWidth}x${rtHeight} (scale ${scale.toFixed(2)}, Jimenez 4x4 spatial rotation), ` +
+        `radius ${radius.toFixed(2)}m = ${radiusIntervals} x cascade-0 interval (s0 ${s0.toFixed(2)}), ` +
+        `closed-form arc integral over a full-res gbuffer` +
+        `${filtered ? `, bilateral r${filtered.blur}` : ", UNFILTERED"}, no temporal. ` +
+        "__giAoRaytraced = true restores the ray-traced arm.",
+    );
+    return {
+      aoPass: null,
+      vxaoPass: {
+        compute: pass.compute,
+        target: finalTarget,
+        rawTarget,
+        node: vxao.node,
+        width: rtWidth,
+        height: rtHeight,
+        dispose: () => {
+          rawTarget?.dispose?.();
+          filtered?.tmp?.dispose?.();
+          filtered?.out?.dispose?.();
+        },
+      },
+    };
+  }
+
+  /**
+   * RAY-TRACED AO, per pixel, through the cascade's own static-BVH8 tracer.
+   * createGiRtaoPass' header carries the estimator argument; this method owns
+   * the three things that are the SYSTEM's business rather than the kernel's.
+   *
+   * 1. THE RADIUS IS READ FROM THE CASCADE. `spacing0 · R0_OVER_S0` is the
+   *    distance cascade 0 resolves per probe, so four of those is a reach
+   *    expressed in what the scene measures instead of in metres. It lands at
+   *    2.24 m on the user's Sponza (s0 0.35), within 12% of the 2.0 m the
+   *    retired VXAO shipped as a constant — which is the check that this is a
+   *    re-derivation and not a re-tuning.
+   *
+   * 2. THE BIAS IS THE EXACT ARM'S, NOT THE VOXEL ONE. `voxMax · 0.02` — the
+   *    same ~2 mm the static-BVH shadow arm uses, and for the same measured
+   *    reason: inheriting the DDA's 1.5-voxel lift there cost 0.25 m of blind
+   *    band and 2.6% of surface points their shadow outright.
+   *
+   * 3. IT FALLS BACK, LOUDLY. No static BVH means no tracer, and an AO term
+   *    that silently becomes 1 is the failure this module keeps re-learning —
+   *    so the legacy pair is armed instead and says so once.
+   */
+  #armRtaoPass({ srcProbes, gbuffer, width, height, ao, vxao, occupancy }) {
+    if (globalThis.__giAoLegacy === true) {
+      if (!this._rtaoLegacyLogged) {
+        this._rtaoLegacyLogged = true;
+        console.log("[gi] AO: LEGACY PAIR armed (__giAoLegacy = true) — screen spirals + voxel cones.");
+      }
+      return this.#armLegacyAoPair({ srcProbes, gbuffer, width, height, ao, vxao, occupancy });
+    }
+    const traceStaticBvh = this._dynSet?.staticBvh ? this._dynSet.traceStaticBvh.bind(this._dynSet) : null;
+    if (!vxao || !srcProbes || !traceStaticBvh) {
+      if (vxao && srcProbes && !traceStaticBvh && !this._rtaoNoBvhLogged) {
+        this._rtaoNoBvhLogged = true;
+        console.warn(
+          "[gi] AO: no static BVH is built, so the ray-traced arm cannot trace — " +
+          "falling back to the retired screen+voxel pair for this build.",
+        );
+        return this.#armLegacyAoPair({ srcProbes, gbuffer, width, height, ao, vxao, occupancy });
+      }
+      if (ao) ao.node = null;
+      if (vxao) vxao.node = null;
+      return { aoPass: null, vxaoPass: null };
+    }
+    // The screen-space arm is GONE from the default path: one estimator, one
+    // composition, nothing for a `min()` to hide behind.
+    if (ao) ao.node = null;
+    // ⚠ THIS UNIFORM USED TO BE BORN INSIDE `#armAoPass`, which no longer
+    // runs. The denoiser needs it (world radius -> screen taps, written per
+    // frame beside the resolve camera) and `float(undefined)` is a TSL build
+    // error, not a zero — the whole GI screen chain failed to compile.
+    this._giAoProjU ??= uniform(1).setGroup(renderGroup);
+
+    const s0 = Number(srcProbes.spacing0) > 0 ? Number(srcProbes.spacing0) : 0.35;
+    // ── TWO CASCADE-0 INTERVALS, NOT FOUR (2026-08-26) ────────────────────
+    //
+    // Four was picked to land on the 2.0 m the retired VXAO shipped, and that
+    // number was an artifact of a voxel cone that could not resolve anything
+    // finer. Cost here is roughly linear in reach — a 2.24 m ray descends far
+    // more of a 262k-triangle BVH than a 1.12 m one — and the long tail buys
+    // little: past r0 the cascade already answers, at lattice resolution.
+    // Two intervals is "the band the probe grid cannot resolve, plus the
+    // lattice cell itself" (r0 + s0*2 = 1.12 m here), which is the band this
+    // term exists for. It also reads CRISPER, because a metre-scale AO is a
+    // broad wash and a contact-scale one is an edge.
+    const radiusIntervals = Math.max(0.5, Math.min(8, Number(globalThis.__giRtaoIntervals) || 2));
+    const radius = s0 * SRC_R0_OVER_S0 * radiusIntervals;
+    // `occupancy.voxel` is a UNIFORM NODE, not a vector — its `.x` is a swizzle
+    // node, so reading it directly and handing it to Math.max yields NaN and a
+    // bias of NaN silently makes every ray miss. The CPU-side value is on
+    // `.value`; `occupancyBackend` also publishes it as a plain clone.
+    const voxVec = occupancy?.voxel?.value ?? occupancy?.voxel ?? null;
+    const voxMax = voxVec && Number.isFinite(voxVec.x)
+      ? Math.max(voxVec.x, voxVec.y, voxVec.z)
+      : 0.1;
+    const bias = Math.max(1e-4, voxMax * 0.02);
+
+    const requestedScale = Number(globalThis.__giRtaoScale);
+    // HALF RESOLUTION BY DEFAULT, and the resolve's position/normal-weighted
+    // 2x2 upsample is what makes that affordable rather than blocky — it is
+    // the same reconstruction the voxel arm shipped with, and it is already
+    // written and proven. AO is a smooth low-frequency factor; its silhouettes
+    // are reconstructed from the gbuffer, not carried in the buffer.
+    const scale = Number.isFinite(requestedScale)
+      ? Math.min(1, Math.max(0.25, requestedScale))
+      : 0.5;
+    const rtWidth = Math.max(16, Math.round(width * scale));
+    const rtHeight = Math.max(16, Math.round(height * scale));
+    // ── THE MEASURED LADDER, AND WHY IT ENDS HERE ─────────────────────────
+    //
+    // All at 939x380 on the user's Sponza:
+    //   4 rays, 2.24 m, 9x9 spatial            13.73 ms  "expensive"
+    //   2 rays, 2.24 m, 9x9 spatial             5.65 ms  "blurry and grainy"
+    //   1 ray,  2.24 m, animated + TEMPORAL     ~7.6 ms  REVERTED — see below
+    //   2 rays, 1.12 m, 7x7 spatial             this
+    //
+    // ⛔ THE TEMPORAL ARM IS NOT COMING BACK. It is the textbook RTAO answer
+    // and the user killed it in one look: "we are a game engine, things move a
+    // lot, temporal does not work". Reprojection is only valid where the world
+    // stood still; every accumulated frame is a bet that it did. It did not
+    // even pay for itself here — the trace measured HIGHER at 1 ray with the
+    // filter than at 2 rays without it.
+    //
+    // ⛔ AND THE COST IS THE RAYS, MEASURED, NOT ANYTHING AROUND THEM. Same
+    // camera, AO on vs off: 18.68 vs 11.33 ms for 714k rays — ~10 ns each,
+    // unmoved by halving the reach or by dropping the dynamic-set trace. So
+    // `pixels x rays` is the only budget dial there is, and ONE ray per pixel
+    // is what fits. What makes one ray enough is not the filter alone: the
+    // kernel strata it across the 2x2 pixel quad, so any filter wider than a
+    // pixel reconstructs a 4x-stratified estimate (see its note).
+    const rays = Math.max(1, Math.min(16, Math.round(Number(globalThis.__giRtaoRays) || 1)));
+
+    const dynSet = this._dynSet;
+    // ⛔ REFUTED, and it looked so likely: "the dynamic-set trace is half this
+    // pass". It is a second sharedFn traversal per ray, so it should be — but
+    // with it disabled the same view measured 18.68 ms AO-on vs 11.33 ms
+    // AO-off, i.e. the 7.35 ms is the STATIC BVH rays and nothing else.
+    // Dynamic occluders cast contact AO for free; do not trade them away.
+    // `__giRtaoDynamic = false` is the A/B arm that proved it.
+    const traceDynamic = globalThis.__giRtaoDynamic === false ? null : dynSet?.trace
+      ? (origin, dir, tMin, tMax, receiverP) => {
+          // `excludePoint` is §14 Q2's self-plane exclusion: a fat proxy (a
+          // bone capsule) that CONTAINS this very surface must not occlude it,
+          // and a millimetre bias cannot escape a shell that overshoots the
+          // skin by centimetres.
+          const d = dynSet.trace(origin, dir, tMin, tMax, { excludePoint: receiverP });
+          return d?.hit ?? null;
+        }
+      : null;
+
+    const mkTex = (name, type = THREE.HalfFloatType) => {
+      const t = new THREE.StorageTexture(rtWidth, rtHeight);
+      t.name = name;
+      t.type = type;
+      t.generateMipmaps = false;
+      t.minFilter = THREE.LinearFilter;
+      t.magFilter = THREE.LinearFilter;
+      return t;
+    };
+    const rawTarget = mkTex("giRtaoRaw");
+    const pass = createGiRtaoPass({
+      gbuffer,
+      width: rtWidth,
+      height: rtHeight,
+      resolveWidth: width,
+      resolveHeight: height,
+      cameraPosition: this._giResolveCamU,
+      strength: vxao.strength,
+      radius: vxao.radius,
+      bias,
+      rays,
+      traceStatic: traceStaticBvh,
+      traceDynamic,
+      target: rawTarget,
+    });
+    // The radius is DERIVED, so it is published here and `#applyLiveProps`
+    // writes it into the live uniform every frame. Leaving `aoRadius` to win
+    // would put a metre constant back on the one number this pass has.
+    vxao.derivedRadius = radius;
+    vxao.radius.value = radius;
+
+    // THE SPATIAL FILTER IS THE WHOLE DENOISER, so its width is the one place
+    // "grainy" and "blurry" are traded against each other directly. Radius 3
+    // is a 7x7 support (~98 decorrelated 2-ray estimates) and, at half
+    // resolution, about 3.5 full-res pixels of reach — narrower than the
+    // radius 4 that read as blurry, wider than the radius 2 that reads as
+    // grainy where the plane test rejects most taps (which is exactly the
+    // detailed geometry: reliefs, curtain folds, foliage).
+    // `__giAoFilterRadius` retunes it, `__giAoFilter = false` shows raw rays.
+    const filtered = globalThis.__giAoFilter === false
+      ? null
+      : (() => {
+        const tmp = mkTex("giRtaoBlurX");
+        const out = mkTex("giRtao");
+        const shared = {
+          gbuffer,
+          width: rtWidth,
+          height: rtHeight,
+          resolveWidth: width,
+          resolveHeight: height,
+          cameraPosition: this._giResolveCamU,
+          projScale: this._giAoProjU,
+        };
+        const blur = Math.max(1, Math.min(6, Math.round(Number(globalThis.__giAoFilterRadius) || 3)));
+        const filterX = createGiAoFilterPass({ ...shared, source: rawTarget, target: tmp, axisX: 1, radius: blur });
+        const filterY = createGiAoFilterPass({ ...shared, source: tmp, target: out, axisY: 1, radius: blur });
+        return { tmp, out, blur, computes: [filterX.compute, filterY.compute] };
+      })();
+    const finalTarget = filtered ? filtered.out : rawTarget;
+
+    // IT RIDES THE `vxao` SLOT, and that is not laziness. That slot is the one
+    // the resolve reconstructs with a position/normal-weighted 2x2 upsample
+    // (the `ao` slot is a plain full-res UV sample), which is exactly what a
+    // half-resolution AO needs. One estimator now feeds it, so the resolve's
+    // `min` degenerates to an identity.
+    vxao.node = texture(finalTarget);
+    vxao.width = rtWidth;
+    vxao.height = rtHeight;
+    srcProbes.passes.push(pass.compute);
+    if (filtered) srcProbes.passes.push(...filtered.computes);
+    srcProbes.passGroups?.push({ label: "rtao", count: filtered ? 3 : 1 });
+    console.log(
+      `[gi] AO: RAY-TRACED — ${rays} cosine rays/pixel at ${rtWidth}x${rtHeight} ` +
+        `(scale ${scale.toFixed(2)}, 2x2-quad stratified), radius ${radius.toFixed(2)}m = ` +
+        `${radiusIntervals} x cascade-0 interval ` +
+        `(s0 ${s0.toFixed(2)}), bias ${(bias * 1000).toFixed(1)}mm, exact static BVH` +
+        `${traceDynamic ? " + dynamic set" : ""}` +
+        `${filtered ? `, bilateral r${filtered.blur}` : ", UNFILTERED"}, no temporal. ` +
+        "__giAoLegacy = true restores the screen+voxel pair.",
+    );
+    return {
+      aoPass: null,
+      vxaoPass: {
+        compute: pass.compute,
+        target: finalTarget,
+        rawTarget,
+        node: vxao.node,
+        width: rtWidth,
+        height: rtHeight,
+        dispose: () => {
+          rawTarget?.dispose?.();
+          filtered?.tmp?.dispose?.();
+          filtered?.out?.dispose?.();
+        },
+      },
+    };
+  }
+
+  /**
+   * World-space cone-traced AO over the occupancy density hierarchy. Separate
+   * from both the screen AO and the resolve so its one `bits` storage binding
+   * never joins either larger composed graph. `__giVxaoScale` is a build-time
+   * profiling hatch (0.25..1) and `__giVxao = false` removes the pass entirely.
+   */
+  #armVxaoPass({ srcProbes, gbuffer, width, height, vxao, occupancy }) {
+    if (!vxao || !srcProbes || !occupancy?.traceOccupancyConeAO || !occupancy?.voxel) {
+      if (vxao) vxao.node = null;
+      return null;
+    }
+    const requestedScale = Number(globalThis.__giVxaoScale);
+    const scale = Number.isFinite(requestedScale)
+      ? Math.min(1, Math.max(0.25, requestedScale))
+      // FULL resolve resolution — which is already a fraction of the display,
+      // because the gbuffer this reads is. Half was tried and reverted: the
+      // cone march measures 0.046 ms at 1200x800 (run-gi-vxao-probe), 2% of the
+      // pass budget, so a 4x saving buys nothing worth a reconstruction filter.
+      // At scale 1 the resolve `load`s this texel-for-texel and there is no
+      // filter at all — no bilateral fallback to "unoccluded" at silhouettes,
+      // which is the one place a magnified AO term still shows its grid.
+      : 1;
+    const vxWidth = Math.max(16, Math.round(width * scale));
+    const vxHeight = Math.max(16, Math.round(height * scale));
+    const pass = createGiVxaoPass({
+      gbuffer,
+      width: vxWidth,
+      height: vxHeight,
+      resolveWidth: width,
+      resolveHeight: height,
+      cameraPosition: this._giResolveCamU,
+      strength: vxao.strength,
+      radius: vxao.radius,
+      voxel: occupancy.voxel,
+      traceConeAO: occupancy.traceOccupancyConeAO,
+    });
+    vxao.node = pass.node;
+    // The resolve performs the edge-aware reconstruction. Keep dimensions as
+    // JS metadata — unlike a uniform they do not add a GPU binding.
+    vxao.width = pass.width;
+    vxao.height = pass.height;
+    srcProbes.passes.push(pass.compute);
+    srcProbes.passGroups?.push({ label: "vxao", count: 1 });
+    console.log(
+      `[gi] VXAO: 6 cone-traced cones at ${vxWidth}x${vxHeight} ` +
+        `(scale ${scale.toFixed(2)}, quadrilinear occupancy density; __giVxao=false disables)`,
+    );
     return pass;
   }
 
@@ -6350,6 +7895,14 @@ export class GISystem {
       this._resolveResizes = (this._resolveResizes ?? 0) + 1;
       console.log(`[gi] resolve target resized to ${width}x${height} (was ${screen.width}x${screen.height})`);
     }
+    // ⭐ ALWAYS on the receipt, not only under the diagnostic flag: this path
+    // bypasses requestRebuild() entirely, and it is the route the frame
+    // governor's rung changes arrive by — `giCostScale` in the reason string is
+    // what separates "the governor stepped" from "the window resized".
+    this.noteRebuildAsk(
+      `resolve-resize ${screen.width}x${screen.height}→${width}x${height}`
+        + ` (giCostScale ${this.engine?.giCostScale ?? 1})`,
+    );
     screen.width = width;
     screen.height = height;
     screen.shadowWidth = shadowW;
@@ -6523,10 +8076,18 @@ export class GISystem {
       srcProbes: screen.srcProbes, gbuffer: screen.gbuffer, width, height,
       validEps: screen.lightShadow?.voxMax ?? 0.15,
     });
-    screen.aoPass?.target?.dispose?.();
-    screen.aoPass = this.#armAoPass({
-      srcProbes: screen.srcProbes, gbuffer: screen.gbuffer, width, height, ao: screen.ao,
-    });
+    screen.aoPass?.dispose?.();
+    screen.vxaoPass?.dispose?.();
+    screen.vxaoPass?.target?.dispose?.();
+    ({ aoPass: screen.aoPass, vxaoPass: screen.vxaoPass } = this.#armAoTerm({
+      srcProbes: screen.srcProbes,
+      gbuffer: screen.gbuffer,
+      width,
+      height,
+      ao: screen.ao,
+      vxao: screen.vxao,
+      occupancy: state.volume?.occupancyField,
+    }));
     // §12.70 W4b: the tile cut is sized to the emitter grid AND bakes the
     // gbuffer scale, so it rebuilds BEFORE the resolve and the shadow pass
     // that consume its buffers — a stale sx/sy would rank tiles at the wrong
@@ -6594,6 +8155,7 @@ export class GISystem {
       emitter: screen.emitter,
       screenRadiance: screen.screenRadiance,
       ao: screen.ao,
+      vxao: screen.vxao,
       emitterTileCut: screen.emitterTileCutBundle
         ? { ...screen.emitterTileCutBundle, scaleX: emitterW / width, scaleY: emitterH / height }
         : null,
@@ -6623,6 +8185,9 @@ export class GISystem {
         probes: this.#reflectionProbesEnabled()
           ? (({ node, slots }) => ({ node, slots }))(this.#ensureReflProbeState())
           : null,
+        termMask: this.#hitTermMask(),
+        ...this.#hitShadowBundle(),
+        shadowReach: this.#hitShadowReach(state.volume),
       });
       screen.bvhHitShade.compute.__giPassName = "bvhHitShade";
       if (hitShadeIndexes) {
@@ -7182,6 +8747,18 @@ export class GISystem {
    * atlas NODE and the slot uniform OBJECTS, so probe moves/edits are value
    * writes, never rebinds or rebuilds.
    */
+  /**
+   * §18.15 — the hit-shade TERM MASK uniform (see createGiBvhHitShade's note
+   * for what it does). BUILD-TIME OPT-IN: set `globalThis.__giHitTermMask` to
+   * an array of four scalars BEFORE the GI build and every later write to that
+   * array re-weights the terms live; leave it unset and this returns null, the
+   * kernel emits no mask nodes at all, and the shipping graph is unchanged.
+   */
+  #hitTermMask() {
+    if (!Array.isArray(globalThis.__giHitTermMask)) return null;
+    return (this._giHitTermMaskU ??= uniform(new THREE.Vector4(1, 1, 1, 1)));
+  }
+
   #ensureReflProbeState() {
     if (!this._reflProbeGpu) {
       const atlas = createReflectionProbeAtlas();
@@ -7252,6 +8829,10 @@ export class GISystem {
         normalOffset: light.normalOffset,
         intensity: light.intensityUniform,
         uniforms: gpu.uniforms,
+        // §18.16 — the same exact-visibility pair the hit shade uses; the
+        // cone it replaces etched its lattice straight INTO this atlas.
+        ...this.#hitShadowBundle(),
+        shadowReach: this.#hitShadowReach(state.volume),
       });
       const blur = createReflectionProbeBlur({ scratch: gpu.scratch, atlas: gpu.atlas, history: gpu.history, uniforms: gpu.uniforms });
       // Pipeline attribution (§13.14.8): the capture inlines BVH + gather +
@@ -7267,6 +8848,7 @@ export class GISystem {
         bvhScene: state.bvhScene,
         srcProbes,
         traceKey: emitter?.shadowTraceFn ?? null,
+        dynSet: this._dynSet ?? null,
       };
       // Re-arms happen on every #syncBvhScene, and on a scene with an
       // animated character the fingerprint churn rebuilds the BVH every few
@@ -7552,8 +9134,29 @@ export class GISystem {
     const dyn = this._dynSet;
     if (!dyn?.traceStaticBvhSlot) return null;
     const sa = this.state?.volume?.occupancyField?.surfaceAttribution ?? null;
+    // §18.17 — present only when the UV region made it into the BVH AND the
+    // atlas baked; the prepass falls back to the per-slot mean albedo at build
+    // time otherwise, which is the pre-§18.17 picture.
+    const atlas = this._slotAtlas;
+    // Published, because the fallbacks here are SILENT and each one changes
+    // what a mirror shows: no static BVH = the ≤128-mesh loop (props vanish),
+    // no UV region = per-slot mean albedo (flat colours). Reading "one-BVH,
+    // mean albedo" in the console is how the next session knows which of the
+    // two it is looking at without bisecting.
+    const armed = atlas && dyn.staticBvh?.uvBase
+      ? `textured (${atlas.materialCount ?? "?"} mapped materials)`
+      : dyn.staticBvh?.uvBase
+        ? "mean albedo (no mapped material in the scene)"
+        : "mean albedo (no UV region)";
+    if (this._oneBvhArmedLog !== armed) {
+      this._oneBvhArmedLog = armed;
+      console.log(`[gi] reflections: one-BVH hits, ${armed}`);
+    }
     return {
       trace: (origin, dir, tMin, tMax) => dyn.traceStaticBvhSlot(origin, dir, tMin, tMax),
+      albedoAtlas: atlas && dyn.staticBvh?.uvBase
+        ? { node: atlas.atlasTextureNode, tiles: atlas.tileNode, slots: atlas.slots, grid: atlas.atlasGrid, tilePx: atlas.atlasTile }
+        : null,
       palette: sa
         ? {
             bits: sa.bits,
@@ -7563,6 +9166,142 @@ export class GISystem {
           }
         : null,
     };
+  }
+
+  /**
+   * §18.16 — the EXACT visibility pair the reflection hit shade uses for the
+   * sun/analytic term: any-hit through the static BVH8 (the same acceleration
+   * structure the reflection ray itself was traced through), plus the dynamic
+   * proxy set so a character standing in the sun casts a shadow inside a
+   * mirror. Null when no static BVH is built — the caller then keeps the
+   * occupancy cone, which is the artifact this replaces but is still better
+   * than no shadow at all.
+   *
+   * `anyHit: true` is the point: visibility is boolean, and the shadow arm of
+   * the traversal stops at the first blocker under near-first child ordering.
+   */
+  #hitShadowBundle() {
+    const dyn = this._dynSet;
+    if (!dyn?.staticBvh) return { staticOcclude: null, dynOcclude: null };
+    return {
+      staticOcclude: (origin, dir, tMin, tMax) =>
+        dyn.traceStaticBvh(origin, dir, tMin, tMax, { anyHit: true }),
+      dynOcclude: globalThis.__giHitDynShadows === false || !dyn.trace
+        ? null
+        // `excludePoint` is §14 Q2's self-plane exclusion, the same one RTAO
+        // passes: a bone capsule that CONTAINS the surface being shaded must
+        // not shadow it, and no bias escapes a shell that overshoots the skin
+        // by centimetres.
+        : (origin, dir, tMin, tMax, receiverP) =>
+            dyn.trace(origin, dir, tMin, tMax, { excludePoint: receiverP })?.hit ?? null,
+    };
+  }
+
+  /**
+   * The GI medium's diagonal as a NODE — see `maxRay`'s note for why it must
+   * not be a JS number (a stretch refit updates the uniform and can never
+   * reach a literal already baked into WGSL).
+   *
+   * `volume` is passed explicitly from `#buildScreenResolve`, which runs
+   * BEFORE `this.state` is published; the other two call sites hold a live
+   * `state` and let it default.
+   */
+  #hitShadowReach(volume = null) {
+    const size = (volume ?? this.state?.volume)?.world?.size;
+    return size ? vec3(size).length() : null;
+  }
+
+  /**
+   * §18.17 — does this build want the static BVH's per-triangle UV region?
+   *
+   * Keyed on the CONFIG, not on `#bvhReflectionsEnabled()`: that gate also
+   * asks whether a mirror-bucket material exists right now, and that answer
+   * flips live (a roughness edit, an async roughness-map floor landing) while
+   * the BVH region is fixed at field-build time. Deciding on the live gate
+   * would mean a scene whose first mirror appears after the build never gets
+   * textured reflections until the next full rebuild.
+   */
+  #staticBvhWantsUv() {
+    if (globalThis.__giReflectTextures === false) return false;
+    const props = this.config;
+    if (!props || props.reflections === false) return false;
+    const quality = qualityTierOf(props);
+    return quality === "high" || quality === "ultra";
+  }
+
+  /**
+   * §18.17 — the per-slot albedo tile table, as a DATA TEXTURE.
+   *
+   * ⚠ NOT a `uniformArray`, and that is a measured constraint rather than a
+   * preference: three packs every uniformArray a compute object binds into ONE
+   * `bindGroup_object` UBO against a 64KB limit, and occupancyField's own
+   * matrix note records 768 slots x 64 bytes breaking exactly that budget —
+   * with the failure mode being a DROPPED SUBMIT, i.e. a black GI field and no
+   * error dialog. A 768x1 texture is bound on its own.
+   *
+   * ⚠ AND IT IS RGBA8 HOLDING TILE INDICES, not floats holding UV origins.
+   * The origin is `index / grid` and the scale is `1 / grid` — the grid is a
+   * build-time constant on both sides, so nothing is gained by storing the
+   * division's result, and an 8-bit texture is unambiguously loadable where a
+   * FloatType one depends on the device's `float32-filterable` feature for its
+   * bind-group sample type. Texel = (tileX, tileY, 0, 255 when mapped).
+   */
+  #ensureSlotAlbedoAtlas(field, placements) {
+    const wantUv = this.#staticBvhWantsUv() && this._staticBvhItemsWantedUv === true;
+    if (!wantUv) { this._slotAtlas = null; return null; }
+    const built = buildSlotAlbedoAtlas(placements);
+    if (!built) { this._slotAtlas = null; return null; }
+    const slots = Math.max(1, Math.min(MAX_INSTANCE_SLOTS, field?.slotCapacity ?? MAX_INSTANCE_SLOTS));
+    let state = this._slotAtlas;
+    if (!state || state.slots !== slots) {
+      const data = new Uint8Array(slots * 4);
+      const tex = new THREE.DataTexture(data, slots, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
+      tex.name = "giSlotAlbedoTiles";
+      tex.minFilter = THREE.NearestFilter;
+      tex.magFilter = THREE.NearestFilter;
+      tex.generateMipmaps = false;
+      tex.needsUpdate = true;
+      state = this._slotAtlas = {
+        slots,
+        data,
+        tileTexture: tex,
+        tileNode: texture(tex),
+        // Persistent, repointed by the GPU blit — the same contract
+        // bvhScene's `atlasTextureNode` carries, and the reason a compiled
+        // prepass survives a compressed-texture blit without a rebuild.
+        atlasTextureNode: null,
+      };
+    }
+    state.data.fill(0);
+    for (const [slot, tile] of built.tileOfSlot) {
+      if (!(slot >= 0 && slot < slots)) continue;
+      const o = slot * 4;
+      state.data[o] = tile % built.atlasGrid;
+      state.data[o + 1] = Math.floor(tile / built.atlasGrid);
+      state.data[o + 3] = 255;
+    }
+    state.tileTexture.needsUpdate = true;
+    // A re-bake replaces a multi-megabyte canvas texture and orphans whatever
+    // the last GPU blit rendered into. Neither is small, and this path runs on
+    // every mesh-set change — dropping them on the floor is how a long editing
+    // session walks into the device loss this module has already survived once.
+    if (state.atlasTexture && state.atlasTexture !== built.atlasTexture) state.atlasTexture.dispose();
+    if (state.blitTarget) { state.blitTarget.dispose(); state.blitTarget = null; }
+    state.atlasSize = built.atlasSize;
+    state.atlasTile = built.atlasTile;
+    state.atlasGrid = built.atlasGrid;
+    state.materialCount = built.materialCount;
+    state.atlasTexture = built.atlasTexture;
+    state.atlasTextureNode ??= texture(built.atlasTexture);
+    state.atlasTextureNode.value = built.atlasTexture;
+    // blitBvhAtlasTiles is duck-typed on exactly these three fields.
+    state.pendingGpuTiles = built.pendingGpuTiles;
+    console.log(
+      `[gi] reflection albedo atlas: ${built.materialCount} materials ` +
+        `(${built.texturedCount} textured), ${built.tileOfSlot.size} slots mapped` +
+        (built.overflow > 0 ? `, ${built.overflow} over the ${SLOT_ATLAS_TILES}-tile cap (mean albedo)` : ""),
+    );
+    return state;
   }
 
   #bvhMaskEnabled() {
@@ -7579,18 +9318,50 @@ export class GISystem {
     // density in its own pass) — what masking still buys is skipping the
     // prepass trace + hit shade on non-mirror pixels.
     //
-    // ⭐ §16 R2 — DEFAULT ON (2026-08-24, third attempt, with the missing
-    // piece found first): the mask pass was the ONE nested pipeline creator
-    // with no `_compileWaveActive` gate, so the maskMaterial's first
-    // pipeline could compile inside the wave's pinned-MRT window — the
-    // §12.56 empty-struct poison, matching the exact historical signature
-    // ("masked boots break; stopping the mask pass live does NOT recover" =
-    // a cached invalid pipeline). With the gate in, `run-gi-mask-bisect`
-    // renders masked ≡ dense (no split, no washout; the rig's storm helper
-    // has rotted, so the user's live look is the standing gate). Under R4's
-    // roughness-floor reclassification the mask set shrinks to TRUE mirror
-    // consumers — on Bistro that turns the 146-286 ms dense prepass into a
-    // mirror-pixels-only cost. `__giBvhMask = false` reverts.
+    // ⛔⛔ RE-REVERTED TO OPT-IN, FOURTH TIME (2026-08-24 evening) — and this
+    // time the failure was REPRODUCED AND ISOLATED on the user's Cornell box:
+    // reflections ON + masked = every diffuse wall PITCH BLACK while the
+    // emissive box and the mirror stay lit; reflections OFF = a perfect
+    // Cornell. AO exonerated by its own A/B. The standing condition for ever
+    // re-flipping was: a rig must assert that non-mirror gbuffer pixels
+    // SURVIVE the mask pass, and the clear semantics must be pinned.
+    //
+    // ⭐⭐ BOTH CONDITIONS ARE NOW MET (2026-08-25), so this is ON by default.
+    //
+    // The mechanism was not a race and not the compile wave — it is an OR in
+    // three's own `Background.update` (r185, Background.js:185):
+    //
+    //     if ( renderer.autoClear === true || forceClear === true ) {
+    //         renderContext.clearColor = renderer.autoClearColor === true;
+    //         renderContext.clearDepth = renderer.autoClearDepth === true;
+    //
+    // and `forceClear` is set by ANY opaque Color `scene.background`
+    // (Background.js:78). So pass 2's `renderer.autoClear = false` was simply
+    // ignored, the pass opened with a clear loadOp on every MRT attachment AND
+    // on depth, and only the masked meshes survived as gbuffer geometry — the
+    // screen gather then read `position.w == 0` on every wall. Sponza hid it
+    // because its mask covered 104 of 111 materials, so nearly every pixel was
+    // redrawn by pass 2 anyway. Fixed in `renderGiGBuffer` (see its note), and
+    // pinned by `npm run test:gi-gbuffer-clear` — 12 checks that snapshot the
+    // autoClear* flags at DRAW time, with a negative control that fails 2.
+    //
+    // THE RIG: `__giMaskCoverageProbe = true` reads back `gbuffer.position` and
+    // reports the share of texels carrying geometry, into the console and into
+    // `profile.frameStats.giMaskCoverage`. Bistro at ultra, both arms:
+    // mask OFF **4096/4096 = 100.0%**, mask ON **4096/4096 = 100.0%**. The
+    // wipe is gone.
+    //
+    // ⚠ AND THE MASK ONLY BECAME WORTH ITS RISK TODAY. It used to draw
+    // GI_MIRROR_LAYER — "reads a reflection", 104 of 111 materials — which
+    // excluded nothing. It now draws GI_SHARP_LAYER, §18's ladder rungs
+    // SHARP+MEDIUM (roughness floor <= 0.45), because all three consumers of
+    // the traced reflection multiply by `smoothstep(0.45, 0.15, roughness)` and
+    // a COARSE surface's contribution is provably zero at every texel. On
+    // Bistro that is 104 meshes of 1631, and 89% of reflective triangle area
+    // stops being traced for a result that was multiplied out.
+    // MEASURED: bvhReflect **23.22 → 10.09 ms**, the frame's largest pass.
+    //
+    // `__giBvhMask = false` is the escape hatch back to DENSE.
     return globalThis.__giBvhMask !== false;
   }
 
@@ -7650,8 +9421,22 @@ export class GISystem {
       this.config.resolveMaxPixels ||
       1_600_000;
     const px = width * height;
-    if (px > budget) {
-      const s = Math.sqrt(budget / px);
+    // ⭐ §18 W3 — THE FRAME-RATE FLOOR MULTIPLIES THE *TARGET*, NOT THE CEILING.
+    //
+    // The obvious version scales `budget` alone, and it is wrong on half the
+    // presets: at ultra `resolveScale` is 1 so a 1.88 MP viewport is already
+    // clamped by the 1.6 MP ceiling and scaling it works — but at high/medium
+    // `resolveScale` is 0.5, the nominal 0.47 MP never reaches the ceiling, and
+    // a governor that only moved the ceiling would have NO EFFECT on exactly
+    // the tiers most likely to need it. Taking the min FIRST and scaling the
+    // result makes the control authoritative at every tier.
+    //
+    // Isotropic, and via a total-pixel target rather than a per-axis one, for
+    // the same reason the ceiling is: cost rides the pixel COUNT, and an aspect
+    // ratio is not a cost.
+    const governed = Math.min(px, budget) * (this.engine?.giCostScale ?? 1);
+    if (px > governed) {
+      const s = Math.sqrt(governed / px);
       width = Math.max(16, Math.round(width * s));
       height = Math.max(16, Math.round(height * s));
     }
@@ -7834,7 +9619,12 @@ export class GISystem {
     // A texture with no content yet resolves to black — wait for real data.
     if (!tex.image && !tex.source?.data) return;
     const inFlight = (this._roughnessStatInFlight ??= new Set());
-    if (inFlight.size >= 2 || inFlight.has(tex)) return;
+    // 2 → 6 (2026-08-25). Each of these is a 32x32 readback — ~4 kB — and the
+    // ladder cannot tier a single material until its map's floor lands, so a
+    // cap of 2 made the whole §18 census a multi-minute wait on a large import
+    // (Bistro: 128 pending). Still bounded: this is the real limiter on GPU
+    // stalls, the drain cadence above only decides how often we ask.
+    if (inFlight.size >= 6 || inFlight.has(tex)) return;
     const tries = (this._roughnessStatTries ??= new WeakMap());
     const tried = (tries.get(tex) ?? 0) + 1;
     tries.set(tex, tried);
@@ -7844,19 +9634,52 @@ export class GISystem {
         if (!px?.length) {
           // Transient (mid-upload) — retried on later scans; after enough
           // failures pin the conservative answer so the scan stops asking.
-          if (tried >= 8) giRoughnessFloorStats.set(tex, 0);
+          if (tried >= 8) giRoughnessFloorStats.set(tex, { r: 0, g: 0, b: 0, min: 0 });
           return;
         }
-        // Per-texel min over RGB — a LOWER bound for any channel the graph
-        // reads (glTF roughness is G; grayscale maps are all three). p5, not
-        // min: one dark texel must not turn a wall into a mirror consumer.
-        const mins = new Float32Array(px.length >> 2);
+        // PER-CHANNEL p5 floors, not one min-RGB floor (§16 R4 fix,
+        // 2026-08-24 night). min(RGB) was pitched as "a lower bound for any
+        // channel the graph reads" — true, and DEGENERATE on the most common
+        // real-world layout: a glTF packed metallicRoughness texture carries
+        // METALNESS in B, which is ~0 on every dielectric texel, so min-RGB
+        // read 0 on every such map and NO packed-texture material ever left
+        // the consumer set (the user's Sponza: 24/39 dynamic-roughness, the
+        // full-screen prepass tracing a mirror term smoothstep zeroes —
+        // 22.7 ms/frame). The reader picks the channel the material actually
+        // samples (three's roughnessMap convention is G; a graph's SplitNode
+        // names its own) and falls back to `min` only when the channel is
+        // unknown. p5, not min: one dark texel must not turn a wall into a
+        // mirror consumer.
+        const n = px.length >> 2;
+        const ch = [new Float32Array(n), new Float32Array(n), new Float32Array(n)];
+        const mins = new Float32Array(n);
         for (let i = 0, o = 0; i < px.length; i += 4, o++) {
-          mins[o] = Math.min(px[i], px[i + 1], px[i + 2]) / 255;
+          ch[0][o] = px[i] / 255;
+          ch[1][o] = px[i + 1] / 255;
+          ch[2][o] = px[i + 2] / 255;
+          mins[o] = Math.min(ch[0][o], ch[1][o], ch[2][o]);
         }
-        mins.sort();
-        const p5 = mins[Math.floor(mins.length * 0.05)] ?? 0;
-        giRoughnessFloorStats.set(tex, p5);
+        const p5Of = (arr) => {
+          arr.sort();
+          return arr[Math.floor(arr.length * 0.05)] ?? 0;
+        };
+        const stats = {
+          r: p5Of(ch[0]), g: p5Of(ch[1]), b: p5Of(ch[2]), min: p5Of(mins),
+        };
+        giRoughnessFloorStats.set(tex, stats);
+        // Capped value receipt: without the numbers, "floors resolved but
+        // nothing reclassified" is indistinguishable from "the readback
+        // returned zeros and cached them forever" (the has(tex) guard makes
+        // a bad first read permanent) — the exact ambiguity that stalled
+        // the Sponza diagnosis.
+        if ((this._floorValueLogs = (this._floorValueLogs ?? 0) + 1) <= 8) {
+          const f = (v) => v.toFixed(2);
+          console.log(
+            `[gi] §16 R4: floor "${tex.name || tex.uuid?.slice(0, 8) || "tex"}" ` +
+              `r ${f(stats.r)} g ${f(stats.g)} b ${f(stats.b)} min ${f(stats.min)}` +
+              (this._floorValueLogs === 8 ? " (further floors logged silently)" : ""),
+          );
+        }
         if ((this._roughnessStatCount = (this._roughnessStatCount ?? 0) + 1) === 1) {
           console.log(
             "[gi] §16 R4: roughness-map floors resolving — materials whose roughness never " +
@@ -7870,12 +9693,23 @@ export class GISystem {
   }
 
   #refreshMirrorBucket(material) {
-    if (!material) return;
+    if (!material) return false;
     this.#maybeResolveRoughnessFloor(material);
     const bucket = giRoughnessBucketOf(material);
     const previous = this._mirrorBuckets.get(material);
-    if (previous !== undefined && previous !== bucket) {
+    const flipped = previous !== undefined && previous !== bucket;
+    if (flipped) {
       material.needsUpdate = true;
+      // §16 R4b RECEIPT (capped): without a per-flip line there is no way to
+      // tell "floors resolved and reclassified" from "floors resolved LOW
+      // and nothing moved" — exactly the blind spot that hid the packed-map
+      // bug (min-RGB read 0, silence, and the cost stood).
+      if ((this._bucketFlipLogs = (this._bucketFlipLogs ?? 0) + 1) <= 12) {
+        console.log(
+          `[gi] §16 R4: "${material.name || "material"}" bucket ${previous} → ${bucket}` +
+            (this._bucketFlipLogs === 12 ? " (further flips logged silently)" : ""),
+        );
+      }
       // §16 R4: keep the CONSUMER TALLY live. The mesh walk fills it per
       // unique material at build time; a stats-driven reclassification
       // (roughness floors resolving) must be able to STOP the dense prepass
@@ -7905,6 +9739,11 @@ export class GISystem {
       }
     }
     this._mirrorBuckets.set(material, bucket);
+    // Mirror into the iterable drain set (§16 R4b) — the WeakMap above
+    // cannot be walked, and the idle drain in #tick must be able to revisit
+    // every material the scan has ever classified.
+    this._mirrorBucketMaterials?.add(material);
+    return flipped;
   }
 
   /**
@@ -8123,7 +9962,7 @@ export class GISystem {
                 `oversubscription stays until something else triggers a build, and shadowed regions ` +
                 `keep losing their indirect fill.`,
             );
-            this.requestRebuild();
+            this.requestRebuild("surface-pool-resize");
           }
         } else if (this._surfacePoolHint && alloc.triangles < alloc.triangleCapacity * 0.6) {
           // ⚠ A GROW-ONLY HINT IS A LEAK. Delete half the scene, or drop the
@@ -8391,6 +10230,9 @@ export class GISystem {
     // wave, no GI light. One boot answers "is ANY GI boot path what breaks
     // the sun's shadow evaluation".
     if (globalThis.__giOff === true) return;
+    // The EXECUTION count, distinct from `rebuildAsks`: several asks coalesce
+    // into one run, and the receipt reads honestly only with both numbers.
+    this.rebuilds = (this.rebuilds ?? 0) + 1;
     this.#dispose();
     const component = this.component;
     const engine = this.engine;
@@ -8595,7 +10437,14 @@ export class GISystem {
         // Same STABLE order the refresh uses — see #lightTreeMeshes. If the
         // build collected in candidate order and the refresh in id order, the
         // very first repack would renumber every record.
-        const treeEmitters = collectEmitters(this.#lightTreeMeshes());
+        // §18.7 minPower: the same radiant-power gate `#slotSurface` applies to
+        // the field, applied here so a culled emitter costs nothing in the tree
+        // either — no node, no NEE sampling, no descent weight.
+        const treeCandidates = this.#lightTreeMeshes();
+        const treeEmitters = collectEmitters(treeCandidates, {
+          minPowerFraction: this.#emitterMinPowerFraction(),
+        });
+        this.#recordEmitterAdmission(treeCandidates, treeEmitters);
         // §13.7g — SAY WHEN AN EMITTER DOES NOT FILL ITS OWN SHAPE. A mesh
         // holding scattered emissive geometry (a GLB puts a whole string of
         // party bulbs in ONE mesh, per material) is fitted to its BOUNDING
@@ -8637,6 +10486,21 @@ export class GISystem {
         // it "the bulbs light the whole street" is unattributable — the fill
         // correction above prints nothing when nothing is sparse, and that
         // silence is indistinguishable from "no emitters here at all".
+        // §18.15 — RETAIN the ledger, not just print six lines of it. "The
+        // scene's own green neon" was one of the wrong answers about the green
+        // cast, and it stayed unfalsifiable because nothing could state what
+        // share of the scene's emitted power is actually green: the console
+        // shows the top SIX of 116, ranked by power, which is precisely the
+        // sample that cannot answer a question about the aggregate. This is
+        // 116 small objects; the cost is nil and the alternative is another
+        // round of arguing from a screenshot.
+        this._emitterLedger = treeEmitters.map((e) => ({
+          name: (e.mesh?.name || "mesh").slice(-28),
+          power: e.power,
+          rgb: [...e.rgb],
+          area: e.area,
+          fill: e.fill ?? 1,
+        }));
         if (globalThis.__giLogEmitterLedger !== false && treeEmitters.length) {
           const top = [...treeEmitters].sort((a, b) => b.power - a.power).slice(0, 6);
           console.log(
@@ -9050,7 +10914,11 @@ export class GISystem {
       // estimator family shares a WGSL fingerprint; a name at the dispatch
       // site is immune to that.
       for (const [key, bundle] of Object.entries(screen)) {
-        if (bundle?.compute?.isNode ?? bundle?.compute) bundle.compute.__giPassName = key;
+        // A pass may carry a more useful public profiler label than its bundle
+        // key (the VXAO bundle is `vxaoPass`, the label is simply `vxao`).
+        if ((bundle?.compute?.isNode ?? bundle?.compute) && !bundle.compute.__giPassName) {
+          bundle.compute.__giPassName = key;
+        }
       }
       screen.srcProbes?.passes?.forEach((p, i) => {
         if (p && typeof p === "object") p.__giPassName ??= `src#${i}`;
@@ -9161,15 +11029,21 @@ export class GISystem {
     }
     const queueLabels = queue.map((node, i) => queueLabel.get(node) ?? `queue[${i}]`);
 
-    // The two SURVIVING debug views. `raw`/`merged` — instanced spheres at every
-    // c0 probe, coloured by that probe's average radiance — went with the probes
-    // they read (#buildGizmos is gone, and so are the `debugProbes` options that
-    // selected them; see the component schema).
+    // The three SURVIVING debug overlays:
+    //   - `sdfView` / `occView`: back-faced volume boxes anchored in world
+    //     space at the GI volume's bounds.
+    //   - `debugView`: an NDC-anchored fullscreen quad that samples one of
+    //     the GI term textures (`_giTargets.irradiance`, the AO target, or
+    //     `_giTargets.radiance`) and writes it as the lit image. Its vertex
+    //     shader emits clip-space position directly, so the mesh lives in
+    //     the scene at the origin and follows the camera for free.
     const gizmos = { all: [] };
     gizmos.sdfView = this.#buildSdfView(volume, bounds, center);
     if (gizmos.sdfView) gizmos.all.push(gizmos.sdfView);
     gizmos.occView = this.#buildOccupancyView(volume, bounds, center);
     if (gizmos.occView) gizmos.all.push(gizmos.occView);
+    gizmos.debugView = this.#buildDebugView();
+    if (gizmos.debugView) gizmos.all.push(gizmos.debugView);
     for (const mesh of gizmos.all) engine.scene.add(mesh);
 
     this.state = {
@@ -9555,6 +11429,33 @@ export class GISystem {
       `[gi] material GI buckets: ${bt[0]} mirror, ${bt[1]} specular, ${bt[2]} diffuse-only, ${bt[3]} dynamic-roughness` +
         ` (mirror + dynamic = the expensive shaders; ${bt[0] + bt[3]}/${bt[0] + bt[1] + bt[2] + bt[3]})`,
     );
+    // §18 THE LADDER's census, reported next to the buckets because the two
+    // answer DIFFERENT questions and confusing them is the bug this fixes:
+    // a bucket says which shader a material compiles, a tier says how finely
+    // its reflection is sampled. "2 mirror / 102 dynamic-roughness" is why
+    // window glass was being traced like plaster.
+    // ⚠ READ THE LIVE CENSUS, NOT `_tierTally`. The tally is filled during
+    // #collectMeshes — at BUILD time, before the per-channel roughness floors
+    // come back off the GPU — so every mapped material is still MEDIUM by
+    // default when it is counted, and this line reported "0 sharp" for a scene
+    // whose windows are mirrors. `reflectTierCensus()` re-reads the floors that
+    // have landed by now and, more importantly, reports PENDING separately so
+    // "mid-roughness" and "not known yet" stop sharing a column.
+    const census = this.reflectTierCensus();
+    if (census) {
+      const { materials: cm, triangles: ct, pendingMaterials } = census;
+      const total = cm.sharp + cm.medium + cm.coarse;
+      const share = census.coarseTriangleShare;
+      console.log(
+        `[gi] §18 reflection tiers: ${cm.sharp} sharp, ${cm.medium} medium, ${cm.coarse} coarse of ${total}` +
+          ` materials (${ct.sharp}/${ct.medium}/${ct.coarse} tris)` +
+          (share !== null ? ` — COARSE is ${(share * 100).toFixed(0)}% of reflective triangles` : "") +
+          (pendingMaterials > 0
+            ? `. ⚠ ${pendingMaterials} floors have NOT resolved yet and are counted as medium;` +
+              ` they re-tier when the async GPU stat lands on the #refreshMirrorBucket drain.`
+            : "."),
+      );
+    }
   }
 
   /**
@@ -9674,7 +11575,7 @@ export class GISystem {
     // long as the camera sits still. Texture ids are per-object and monotonic,
     // so a new target can never collide with the old one.
     mix(rt?.textures?.[0]?.id ?? -1);
-    const skipLayers = (1 << EDITOR_LAYER) | (1 << UI_LAYER) | (1 << DEBUG_LAYER);
+    const skipLayers = (1 << EDITOR_LAYER) | (1 << UI_LAYER) | (1 << DEBUG_LAYER) | (1 << SHADOW_PROXY_LAYER);
     scene.traverse((object) => {
       if (dynamic || !object.isMesh) return;
       if (object.isSkinnedMesh || object.morphTargetInfluences?.length) {
@@ -9979,10 +11880,18 @@ export class GISystem {
       srcProbes: screen.srcProbes, gbuffer: screen.gbuffer, width, height,
       validEps: screen.lightShadow?.voxMax ?? 0.15,
     });
-    screen.aoPass?.target?.dispose?.();
-    screen.aoPass = this.#armAoPass({
-      srcProbes: screen.srcProbes, gbuffer: screen.gbuffer, width, height, ao: screen.ao,
-    });
+    screen.aoPass?.dispose?.();
+    screen.vxaoPass?.dispose?.();
+    screen.vxaoPass?.target?.dispose?.();
+    ({ aoPass: screen.aoPass, vxaoPass: screen.vxaoPass } = this.#armAoTerm({
+      srcProbes: screen.srcProbes,
+      gbuffer: screen.gbuffer,
+      width,
+      height,
+      ao: screen.ao,
+      vxao: screen.vxao,
+      occupancy: state.volume?.occupancyField,
+    }));
     const emitterW = screen.emitterShadowWidth;
     const emitterH = screen.emitterShadowHeight;
     screen.resolve = createGiResolve({
@@ -10000,6 +11909,7 @@ export class GISystem {
       emitter: screen.emitter,
       screenRadiance: screen.screenRadiance,
       ao: screen.ao,
+      vxao: screen.vxao,
       emitterTileCut: screen.emitterTileCutBundle && emitterW && emitterH
         ? { ...screen.emitterTileCutBundle, scaleX: emitterW / width, scaleY: emitterH / height }
         : null,
@@ -10030,6 +11940,9 @@ export class GISystem {
         probes: this.#reflectionProbesEnabled()
           ? (({ node, slots }) => ({ node, slots }))(this.#ensureReflProbeState())
           : null,
+        termMask: this.#hitTermMask(),
+        ...this.#hitShadowBundle(),
+        shadowReach: this.#hitShadowReach(state.volume),
       });
       screen.bvhHitShade.compute.__giPassName = "bvhHitShade";
       if (hitShadeIndexes) {
@@ -10750,6 +12663,10 @@ export class GISystem {
     const state = this.state;
     if (!state) return;
     this.state = null;
+    // §16 R4b: strong refs — release the old build's materials (a scene
+    // switch must not retain them); the next build's scan repopulates.
+    this._mirrorBucketMaterials?.clear();
+    this._floorDrainQueue = [];
     // GI-traced shadows die WITH the system, and this cannot wait for the next
     // light sync: that sync runs off `this.state`, which is now null, so a
     // light left holding our shadowNode would sample a texture nothing writes
@@ -10767,7 +12684,9 @@ export class GISystem {
     state.screen?.gbuffer?.dispose?.();
     // Per-build like the gbuffer it reads (the AO texture is only ever bound
     // by the resolve, which dies with the build).
-    state.screen?.aoPass?.target?.dispose?.();
+    state.screen?.aoPass?.dispose?.();
+    state.screen?.vxaoPass?.dispose?.();
+    state.screen?.vxaoPass?.target?.dispose?.();
     // Per-build like the gbuffer it reads, and unlike the resolve targets: no
     // material is bound to a probe buffer, so nothing is stranded by this.
     state.screen?.srcProbes?.dispose?.();
@@ -10840,12 +12759,134 @@ export class GISystem {
       state.screen.ao.strength.value = Math.min(1, Math.max(0, cfg.aoStrength ?? 0.6));
       state.screen.ao.radius.value = Math.min(3, Math.max(0.1, cfg.aoRadius ?? 0.6));
     }
+    if (state.screen?.vxao) {
+      state.screen.vxao.strength.value = Math.min(1, Math.max(0, cfg.aoStrength ?? 0.6));
+      // THE RAY-TRACED ARM DERIVES ITS RADIUS FROM THE CASCADE (4 x the
+      // cascade-0 interval, see #armRtaoPass) — letting the authored metre
+      // constant win here would put back exactly the world-unit constant that
+      // re-derivation removed. `rtaoRadius` is absent only on the legacy arm.
+      state.screen.vxao.radius.value = state.screen.vxao.derivedRadius
+        ?? Math.min(3, Math.max(0.1, cfg.aoRadius ?? 0.6));
+    }
+  }
+
+  /**
+   * ONE-SHOT DISTRIBUTION READBACK BEHIND THE TERM DEBUG VIEWS.
+   *
+   * A debug view answers "what does this term look like" but not "what is in
+   * it" — and this module's own history is four instruments reporting
+   * confidently about a subject they could not see. Selecting `ao` or
+   * `reflections` therefore also prints the buffers' actual distribution
+   * once, so "the AO view is nearly white" can be settled as a number
+   * (mean/p05/p50) instead of an impression, and so the two AO estimators can
+   * be compared even though the frame composes them with `min` (which, on its
+   * own, makes an isolated read of either impossible — see the vxao memo).
+   *
+   * Fires once per selection, ~20 frames after the view arms so the textures
+   * behind it have actually been written.
+   */
+  #debugViewStats(termMode, { aoPass, vxaoPass, targets }) {
+    if (this._giDebugStatsMode !== termMode) {
+      this._giDebugStatsMode = termMode;
+      this._giDebugStatsWait = 0;
+      this._giDebugStatsDone = false;
+    }
+    if (this._giDebugStatsDone) return;
+    // NOT WHILE THE COMPILE WAVE IS RUNNING, and not for the first ~2s after
+    // it: the BVH hit-shade chain is the last thing to produce a frame, and a
+    // readback taken at 20 frames measured it as ENTIRELY BLACK (0% non-black)
+    // when 8 seconds later the same buffer covered 48% of the screen. Reading
+    // a buffer before its producer has run is the failure this module has now
+    // logged five times; the wait is the fix, and re-selecting the view
+    // re-arms the measurement if it still lands early.
+    if (this._compileWaveActive) return;
+    this._giDebugStatsWait = (this._giDebugStatsWait ?? 0) + 1;
+    if (this._giDebugStatsWait < 120) return;
+    this._giDebugStatsDone = true;
+    const renderer = this.engine?.renderer;
+    if (!renderer) return;
+    // 64 was the colour probe's size and it is the wrong one here: a 64x64
+    // resample of a 1878x760 buffer averages ~29x12 pixels into each sample,
+    // which flattens exactly the crevice minima an AO distribution is being
+    // asked about. 256 costs one more small render and keeps the tail.
+    const SIZE = 256;
+    const grab = async (tex, label) => {
+      if (!tex) return { label, px: null };
+      try {
+        return { label, px: await readTexturePixelsGPU(renderer, tex, SIZE) };
+      } catch (error) {
+        return { label, px: null, error: error?.message ?? String(error) };
+      }
+    };
+    const pct = (sorted, q) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(q * (sorted.length - 1))))] : NaN);
+    const describe = (label, values) => {
+      if (!values.length) return `${label}: no samples`;
+      const sorted = [...values].sort((a, b) => a - b);
+      const mean = values.reduce((a, b) => a + b, 0) / values.length;
+      return `${label}: mean ${mean.toFixed(3)} min ${sorted[0].toFixed(3)} ` +
+        `p05 ${pct(sorted, 0.05).toFixed(3)} p50 ${pct(sorted, 0.5).toFixed(3)} p95 ${pct(sorted, 0.95).toFixed(3)}`;
+    };
+    if (termMode === "ao" || termMode === "ao-screen" || termMode === "ao-vxao") {
+      Promise.all([grab(aoPass?.target, "legacy screen AO"), grab(vxaoPass?.target, "AO")])
+        .then(([a, v]) => {
+          const lines = [];
+          const chan = (px) => {
+            const out = [];
+            if (!px) return out;
+            for (let i = 0; i < px.length; i += 4) out.push(px[i] / 255);
+            return out;
+          };
+          const av = chan(a.px);
+          const vv = chan(v.px);
+          if (a.px) lines.push(describe("legacy screen AO", av));
+          lines.push(v.px ? describe("AO", vv) : `AO: ${v.error ?? "not armed"}`);
+          if (av.length && vv.length && av.length === vv.length) {
+            lines.push(describe("min()", av.map((x, i) => Math.min(x, vv[i]))));
+          }
+          console.log(`[gi] debug view "${termMode}" — 1 is unoccluded, 0 is fully occluded:\n    ${lines.join("\n    ")}`);
+        })
+        .catch((error) => console.warn(`[gi] debug view "ao" stats FAILED: ${error?.message ?? error}`));
+      return;
+    }
+    if (termMode === "reflections" || termMode === "reflections-exact") {
+      const bt = this._giBvhTarget;
+      Promise.all([
+        grab(targets?.radiance, "glossy field"),
+        grab(bt?.bvhRadiance, "exact BVH"),
+      ]).then(([g, b]) => {
+        const lines = [];
+        const summarise = (label, px) => {
+          if (!px) return `${label}: not armed`;
+          let n = 0, lit = 0, lum = 0;
+          for (let i = 0; i < px.length; i += 4) {
+            n++;
+            const l = (0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]) / 255;
+            if (l > 0.004) lit++;
+            lum += l;
+          }
+          // ⚠ NO VALIDITY COLUMN, and that is deliberate. The obvious one —
+          // count texels whose ALPHA survives — measures the readback quad's
+          // own opaque output, not the buffer: it reported "1.00 on 100%" for
+          // a texture that was provably black everywhere. Coverage is read
+          // from the COLOUR instead, which is the channel the readback
+          // actually carries.
+          return `${label}: mean luma ${(lum / Math.max(1, n)).toFixed(3)}, ` +
+            `non-black on ${((100 * lit) / Math.max(1, n)).toFixed(1)}% of texels`;
+        };
+        lines.push(summarise("glossy field", g.px));
+        lines.push(summarise("exact BVH   ", b.px));
+        console.log(`[gi] debug view "${termMode}" — what each reflection source holds:\n    ${lines.join("\n    ")}`);
+      }).catch((error) => console.warn(`[gi] debug view "reflections" stats FAILED: ${error?.message ?? error}`));
+    }
   }
 
   #applyDebugVisibility() {
     const state = this.state;
     if (!state) return;
-    const mode = giDebugView();
+    // The component path passes `this.component` so `giDebugView` can fall
+    // through to the inspector-driven `props.debugView`; the global still
+    // wins (a console switch has to beat a stale inspector value).
+    const mode = giDebugView(this.component);
     if (state.gizmos.sdfView) state.gizmos.sdfView.visible = mode === "sdf";
     if (state.gizmos.occView) state.gizmos.occView.visible = mode === "occupancy";
     // "src-probes" is selectable whether or not `__giSrcProbes` is on; with the
@@ -10862,6 +12903,106 @@ export class GISystem {
       );
     }
     state.screen?.srcProbes?.gizmos?.setVisible(mode === "src-probes");
+
+    // The GI-term overlay (`indirect` / `ao` / `reflections`). Three of these
+    // need a live texture sample; the resolve's `irradiance` and `radiance`
+    // targets are system-lifetime (`_giTargets`), and the AO targets live on
+    // the screen passes — which may not exist (e.g. `ao: false` strips the AO
+    // pass), and the debug view gracefully degrades to invisible rather than
+    // sampling a null target. The mode uniform and texture uniform are both
+    // on the debug mesh's material — set them here, once per change, not
+    // every frame. Polling happens in `tick` so the global console switch
+    // still works without a rebuild.
+    const debugMesh = state.gizmos?.debugView;
+    if (debugMesh) {
+      const termMode = GI_TERM_DEBUG_VIEWS.has(mode) ? mode : "off";
+      const isVisible = termMode !== "off";
+      if (debugMesh.visible !== isVisible) debugMesh.visible = isVisible;
+      if (isVisible) {
+        const texU = debugMesh.userData.__giDebugTex;
+        const tex2U = debugMesh.userData.__giDebugTex2;
+        const gPosU = debugMesh.userData.__giDebugGPos;
+        const gNormalU = debugMesh.userData.__giDebugGNormal;
+        const modeU = debugMesh.userData.__giDebugMode;
+        const targets = this._giTargets;
+        const aoPass = state.screen?.aoPass;
+        const vxaoPass = state.screen?.vxaoPass;
+        let sampled = null;
+        let second = null;
+        let gPos = null;
+        let gNormal = null;
+        let modeCode = 0;
+        if (termMode === "indirect" && targets?.irradiance) {
+          sampled = targets.irradiance;
+          modeCode = 1;
+        } else if (termMode === "ao-screen") {
+          sampled = aoPass?.target ?? null;
+          if (sampled) modeCode = 2;
+        } else if (termMode === "ao-vxao") {
+          sampled = vxaoPass?.target ?? null;
+          if (sampled) modeCode = 2;
+        } else if (termMode === "ao") {
+          // THE FACTOR THE RESOLVE APPLIES, not whichever estimator answered
+          // first. The old order (`aoPass.target` else `vxaoPass.target`) made
+          // this view report the SCREEN term alone on every build where both
+          // are armed — which is every shipped one — so a weak screen AO read
+          // as "AO is weak" no matter what the world-space cone was doing.
+          // With both present the shader takes the same `min` giScreen does;
+          // with one present it degrades to that one.
+          if (aoPass?.target && vxaoPass?.target) {
+            sampled = aoPass.target;
+            second = vxaoPass.target;
+            modeCode = 3;
+          } else {
+            sampled = aoPass?.target ?? vxaoPass?.target ?? null;
+            if (sampled) modeCode = 2;
+          }
+        } else if (termMode === "reflections" && targets?.radiance) {
+          // The glossy field, Fresnel-weighted by the shader against the
+          // gbuffer — see mode 4's note for why the raw buffer reads as a
+          // second copy of the scene.
+          sampled = targets.radiance;
+          gPos = state.screen?.gbuffer?.position ?? null;
+          gNormal = state.screen?.gbuffer?.normal ?? null;
+          modeCode = gPos && gNormal ? 4 : 1;
+        } else if (termMode === "reflections-exact") {
+          // The traced arm has no view of its own before this: `bvhRadiance`
+          // is what ultra's sharp reflections actually sample, and a wrong
+          // one was only ever visible reflected in a surface.
+          second = this._giBvhTarget?.bvhRadiance ?? null;
+          sampled = second;
+          modeCode = second ? 5 : 0;
+        }
+        if (sampled && modeCode) {
+          if (texU.value !== sampled) texU.value = sampled;
+          // Leave a placeholder bound when a mode has no source for a slot:
+          // the shader's branch for it is not taken, and rebinding a live
+          // target into an unread slot only risks holding a disposed texture.
+          if (second && tex2U && tex2U.value !== second) tex2U.value = second;
+          if (gPos && gPosU && gPosU.value !== gPos) gPosU.value = gPos;
+          if (gNormal && gNormalU && gNormalU.value !== gNormal) gNormalU.value = gNormal;
+          if (modeU.value !== modeCode) modeU.value = modeCode;
+          this.#debugViewStats(termMode, { aoPass, vxaoPass, targets });
+        } else {
+          // Mode is selected but no source texture exists — hide rather than
+          // bind a null texture and crash the pipeline. The first time this
+          // happens, say so once: "I picked reflections and nothing changed"
+          // is otherwise indistinguishable from "reflections is broken". A
+          // disabled AO with the AO view selected is the obvious case.
+          if (debugMesh.visible) debugMesh.visible = false;
+          if (!this._giDebugNoSourceHintShown?.has(termMode)) {
+            (this._giDebugNoSourceHintShown ??= new Set()).add(termMode);
+            console.log(
+              `[gi] Debug View "${termMode}": no source texture is armed ` +
+              "(an AO view with the Ambient Occlusion toggle off — \"ao-vxao\" also needs the " +
+              "occupancy field, which lower quality tiers may not build; a reflections view with " +
+              "Reflections off; the indirect view before the first resolve). " +
+              "The view is hidden until a source returns.",
+            );
+          }
+        }
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -11019,16 +13160,34 @@ export class GISystem {
         seenEmitterMesh.add(entry.mesh);
         bright.push(entry);
       }
-      if (excludedInstanced.size || excludedDim) {
+      // §18.7 — SPLIT THE REPORT BY WHAT ACTUALLY HAPPENS TO THE LIGHT, because
+      // "field only" and "culled" are now different fates and lumping them
+      // together is how the user's tiny bulbs read as a delivery choice rather
+      // than a cost. Also THROTTLED: this used to print on every rebuild, and a
+      // scene being autosaved fired it several times a second.
+      let culled = 0;
+      for (const entry of entries) {
+        if (this.#belowEmitterPowerGate(entry)) culled++;
+      }
+      if (excludedInstanced.size || excludedDim || culled) {
         let instances = 0;
         for (const mesh of excludedInstanced) instances += mesh.count ?? 1;
-        console.log(
-          `[gi] emitters delivered by the FIELD ONLY: ${excludedInstanced.size} instanced mesh(es) ` +
-            `= ${instances} instances, plus ${excludedDim} placement(s) under the 0.5 peak gate. ` +
-            `They are not in the light tree, get no NEE sampling and are not R5-zeroed — ` +
-            `sub-cell ones deposit their hue into the probe lattice (§13.7c damps that; ` +
-            `\`__giSubCellEmissiveDamp = false\` restores it).`,
-        );
+        const key = `${excludedInstanced.size}/${instances}/${excludedDim}/${culled}`;
+        if (this._emitterFateKey !== key) {
+          this._emitterFateKey = key;
+          const min = this.#emitterMinPowerFraction();
+          console.log(
+            `[gi] emitter delivery: ${culled} placement(s) CULLED below the ` +
+              `${(min * 100).toFixed(2)}%-of-scene-power gate (Phi = pi*A*L) — no analytic slot, no light tree, ` +
+              `no NEE, and no field deposit either. Their own glow is the raster ` +
+              `material and is untouched. ` +
+              `${excludedInstanced.size} instanced mesh(es) = ${instances} instances ` +
+              `plus ${excludedDim} dim placement(s) are FIELD ONLY: not in the light ` +
+              `tree, no NEE sampling, not R5-zeroed — they reach the scene through ` +
+              `the probe lattice alone, which is the SLOW path (§18.6). ` +
+              `\`__giEmitterMinPowerFraction = 0\` restores the old admit-everything behaviour.`,
+          );
+        }
       }
       for (const cand of analyticEmitterCands) {
         if (seenEmitterMesh.has(cand.mesh)) continue;
@@ -11338,7 +13497,17 @@ export class GISystem {
 
   /** Slot surface for an entry: NEE-sampled emitters composite ZERO emissive. */
   #slotSurface(entry) {
-    const zeroed = entry.promoted || this.#isNeeEmitterMesh(entry.mesh);
+    // §18.7: below the power gate is a THIRD reason to publish zero emissive,
+    // and it is the one that makes the cull real. The other two are
+    // anti-double-count (an emitter delivered by NEE must not ALSO deposit into
+    // the field); this one is the cull itself. Without it a culled bulb keeps
+    // its only remaining delivery path — the probe lattice — which is precisely
+    // the slow path whose latency the user is complaining about, so a cull that
+    // stopped at the light tree would have removed the cheap half of the cost
+    // and left the expensive, laggy half running.
+    const zeroed = entry.promoted ||
+      this.#isNeeEmitterMesh(entry.mesh) ||
+      this.#belowEmitterPowerGate(entry);
     if (zeroed) return { color: entry.surface.color, emissive: { r: 0, g: 0, b: 0 } };
     let r = entry.surface.emissive.r * entry.surface.emissiveIntensity;
     let g = entry.surface.emissive.g * entry.surface.emissiveIntensity;
@@ -11353,6 +13522,127 @@ export class GISystem {
       b = (lum + (b - lum) * damp.chroma) * damp.energy;
     }
     return { color: entry.surface.color, emissive: { r, g, b } };
+  }
+
+  /**
+   * §18.7 — is this placement below the radiant-power gate, i.e. too small AND
+   * too dim to deliver light worth computing? See `GI_EMITTER_MIN_POWER_FRACTION`.
+   *
+   * ⚠ FAILS OPEN. An entry with no fitted analytic shape has no area, so its
+   * power is unknown — and "unknown" must mean "keep emitting", never "cull".
+   * The failure modes are not symmetric: a wrongly-kept emitter costs a little
+   * time, a wrongly-culled one silently deletes a light the user authored and
+   * leaves no error anywhere. That asymmetry is exactly how §13.7g's nineteen
+   * dead Bistro emitters went unnoticed for a session.
+   */
+  /**
+   * §18.8 — "is the camera moving", as a 0..1 EMA, advanced EXACTLY ONCE per
+   * tick and shared by every temporal filter that needs it.
+   *
+   * Fast attack, ~0.85^n release (~0.3 s at 60 fps; longer at low fps, which
+   * only errs toward responsiveness).
+   *
+   * ⚠ THE FRAME GUARD IS LOAD-BEARING. This scratch used to live inside the
+   * R7c block, so it had exactly one consumer and advancing it was safe there.
+   * With two consumers, calling it twice in a tick would apply the 0.85 release
+   * twice and halve the recovery time — a filter that quietly stops smoothing
+   * a still image. Returning the cached value for the same frame keeps "once
+   * per tick" true no matter how many callers appear later.
+   */
+  #cameraMotionEma() {
+    const scr = (this._giCamMotionScratch ??= {
+      pos: new THREE.Vector3(), dir: new THREE.Vector3(), seeded: false, ema: 0, frame: -1,
+    });
+    if (scr.frame === this._frame) return scr.ema;
+    scr.frame = this._frame;
+    const cam = this.engine?.camera;
+    let moving = 0;
+    if (cam) {
+      const e = cam.matrixWorld.elements;
+      if (scr.seeded) {
+        const posDelta = Math.hypot(e[12] - scr.pos.x, e[13] - scr.pos.y, e[14] - scr.pos.z);
+        const dirDelta = Math.abs(e[8] - scr.dir.x) + Math.abs(e[9] - scr.dir.y) + Math.abs(e[10] - scr.dir.z);
+        moving = posDelta > 0.002 || dirDelta > 0.0005 ? 1 : 0;
+      }
+      scr.pos.set(e[12], e[13], e[14]);
+      scr.dir.set(e[8], e[9], e[10]);
+      scr.seeded = true;
+    }
+    scr.ema = Math.max(moving, scr.ema * 0.85);
+    this._giCamMotionEma = scr.ema;
+    this._giCamMoving = moving === 1;
+    return scr.ema;
+  }
+
+  /** The live power gate — ONE definition, so the tree and the field agree. */
+  #emitterMinPowerFraction() {
+    const raw = Number(globalThis.__giEmitterMinPowerFraction);
+    return Number.isFinite(raw) ? raw : GI_EMITTER_MIN_POWER_FRACTION;
+  }
+
+  /**
+   * Remembers, per rebuild, which emissive meshes the light tree actually
+   * ADMITTED under the power gate — and which were even offered to it.
+   *
+   * ⚠⚠ THIS EXISTS BECAUSE THE FIRST CUT OF THE GATE WAS INERT (2026-08-25).
+   * It read `entry.analytic.power`, and `entry.analytic` is an
+   * `analyticShapeOf` result — `{ type, center, half }`, a geometric SHAPE with
+   * no area and no power. `Number.isFinite(undefined)` is false, the guard
+   * failed OPEN, and the field half of the cull never fired once. Nothing broke
+   * (failing open was the deliberate choice), but the user's "just skip it" was
+   * only half delivered: the light tree culled, the probe lattice did not.
+   *
+   * The lesson is not "check the field name". `power` lives in the
+   * `emitterFromMesh` description, which is the only place `area` is ever
+   * computed — so the gate has to ask the component that owns the number
+   * instead of re-deriving it from whatever object happens to be in hand.
+   */
+  #recordEmitterAdmission(candidates, admitted) {
+    this._emitterCandidateMeshes = new Set(candidates ?? []);
+    this._emitterAdmittedMeshes = new Set();
+    for (const e of admitted ?? []) if (e?.mesh) this._emitterAdmittedMeshes.add(e.mesh);
+    // §18.15 — the PER-MESH fill, for #refreshEmitterSlots (see its own note).
+    // Keyed by mesh and taken from the PRE-split fit, because a seat is one
+    // mesh-shaped emitter and cannot be the pieces the tree splits into.
+    const fits = admitted?.meshFits;
+    if (Array.isArray(fits)) {
+      const byMesh = new Map();
+      for (const f of fits) {
+        if (!f?.mesh) continue;
+        // A mesh with several placements keeps the WORST (smallest) fill: the
+        // seat shape is the mesh's own bounds either way, so the most sparse
+        // fit is the one whose over-delivery has to be corrected.
+        const prev = byMesh.get(f.mesh);
+        const fill = Math.min(1, Math.max(0, f.fill ?? 1));
+        if (prev === undefined || fill < prev) byMesh.set(f.mesh, fill);
+      }
+      this._emitterFillByMesh = byMesh;
+    }
+  }
+
+  /**
+   * §18.7 — is this placement below the radiant-power gate, i.e. too small AND
+   * too dim to deliver light worth computing? See `GI_EMITTER_MIN_POWER_FRACTION`.
+   *
+   * Answered by what `collectEmitters` ADMITTED rather than by re-deriving
+   * power here, because `emitterFromMesh` is where `area` is computed and
+   * `Phi = pi * A * L` is the whole point of the gate.
+   *
+   * ⚠ FAILS OPEN, TWICE. Unknown must mean "keep emitting", never "cull": a
+   * wrongly-kept emitter costs a little time, a wrongly-culled one silently
+   * deletes a light the user authored and leaves no error anywhere. That
+   * asymmetry is exactly how §13.7g's nineteen dead Bistro emitters went
+   * unnoticed for a session. So: no admission record yet -> keep; the mesh was
+   * never even offered to the tree -> keep.
+   */
+  #belowEmitterPowerGate(entry) {
+    if (!(this.#emitterMinPowerFraction() > 0)) return false;
+    const candidates = this._emitterCandidateMeshes;
+    const admitted = this._emitterAdmittedMeshes;
+    if (!candidates || !admitted) return false;
+    const mesh = entry?.mesh;
+    if (!mesh || !candidates.has(mesh)) return false;
+    return !admitted.has(mesh);
   }
 
   /**
@@ -11475,7 +13765,7 @@ export class GISystem {
       const canGrow = atlas.capacity < MAX_INSTANCE_SLOTS;
       if (canGrow && this._overflowRebuildSig !== overflowSig) {
         this._overflowRebuildSig = overflowSig;
-        this.requestRebuild();
+        this.requestRebuild("atlas-overflow-grow");
       } else if (!this._warnedSlotBudget) {
         this._warnedSlotBudget = true;
         console.warn(
@@ -11617,7 +13907,10 @@ export class GISystem {
     if (!changed) return;
     try {
       const started = performance.now();
-      const treeEmitters = collectEmitters(meshes);
+      const treeEmitters = collectEmitters(meshes, {
+        minPowerFraction: this.#emitterMinPowerFraction(),
+      });
+      this.#recordEmitterAdmission(meshes, treeEmitters);
       const tree = treeEmitters.length ? buildLightTree(treeEmitters) : null;
       this._lightTreeRefreshCost = performance.now() - started;
       this._lightTreeRefreshAt = performance.now();
@@ -11893,7 +14186,39 @@ export class GISystem {
         continue;
       }
       const geometry = info.mesh.geometry;
-      slot.color.value.setRGB(info.r, info.g, info.b);
+      // ── §18.15: THE SEATS TAKE THE LIGHT TREE'S FILL DAMPING ───────────────
+      //
+      // MEASURED (`npm run probe:gi-green`, Bistro, ultra): the exact-
+      // reflection hit shading's emitter term is the ENTIRE green cast the user
+      // reported — masking that one term takes the reflected image from green
+      // x1.52 to x1.00 — and it carries more luminance than the SUN in a
+      // daylit street (4.0 vs 1.4). The cause is an asymmetry between two
+      // descriptions of the same lamps:
+      //
+      //   the resolve and the emitter shadow pass load their emitters from
+      //   LIGHT TREE RECORDS (giScreen 647/1701) — split into connected pieces
+      //   and fill-damped by `emitterFromMesh`;
+      //   the reflection hit path uses these GLOBAL SEATS instead, on purpose
+      //   ("a hit is a different world point — its tile is not this pixel's"),
+      //   and a seat was the raw material emissive on a shape fitted to the
+      //   WHOLE MESH.
+      //
+      // §13.7g already established what that costs: a glTF puts a whole string
+      // of party bulbs in ONE mesh, the shape is fitted to its bounds, and both
+      // irradiance models scale with that shape's projected area — Bistro's
+      // string lights measured fill 0.0035, i.e. ~285x too much light. The tree
+      // fixed it by splitting and, where it cannot split, by damping radiance
+      // to the fill fraction so the emitter delivers its REAL area's worth. A
+      // seat cannot be several pieces, so damping is its whole correction —
+      // and it is the same correction, from the same fit, not a new model.
+      //
+      // The chroma follows the energy: the sparsest emitters here are the
+      // saturated ones, so the undamped seats over-weighted green specifically.
+      // `__giEmitterSeatFill = false` restores the raw emissive for an A/B.
+      const seatFill = globalThis.__giEmitterSeatFill === false
+        ? 1
+        : (this._emitterFillByMesh?.get(info.mesh) ?? 1);
+      slot.color.value.setRGB(info.r * seatFill, info.g * seatFill, info.b * seatFill);
       // SHAPE. fitEmitterShape (emitterShapes.js) maps every default three
       // geometry to its analytic kind — sphere, capsule, cylinder, frustum/
       // cone, disc/ring, torus, equal-area spheres for the polyhedra — from
@@ -11962,6 +14287,30 @@ export class GISystem {
       emitterMotion = Math.max(emitterMotion, slot.moved.value ?? 0);
     }
     this._giEmitterLastMotion = emitterMotion;
+    // §18.15 RECEIPT — which seats got damped, and by how much. Throttled on
+    // the value key, so it prints when the seating or the fits CHANGE and not
+    // once per frame. Named because a corrected number is invisible otherwise
+    // (the same reason §13.7g's own line exists) and because this is the
+    // number that decides whether reflections are the right colour.
+    if (globalThis.__giLogEmitterSeatFill !== false && this._emitterFillByMesh?.size) {
+      const damped = [];
+      for (let i = 0; i < state.emitterSlots.length; i++) {
+        const mesh = infos[i]?.mesh;
+        const fill = mesh ? this._emitterFillByMesh.get(mesh) : undefined;
+        if (fill !== undefined && fill < 0.999) damped.push(`${i}:${fill.toExponential(1)}`);
+      }
+      const key = damped.join(",");
+      if (key && this._emitterSeatFillKey !== key) {
+        this._emitterSeatFillKey = key;
+        console.log(
+          `[gi] emitter seats: ${damped.length} of ${state.emitterSlots.length} damped to their ` +
+            `mesh FILL (slot:fill ${key}) — a seat is fitted to the whole mesh, so a scattered ` +
+            "emissive (a string of bulbs in one glTF mesh) over-delivers by 1/fill. The light tree " +
+            "already damps its own copy of these lamps; this is the same correction on the analytic " +
+            "seats the exact-reflection hit shading uses. `__giEmitterSeatFill = false` reverts.",
+        );
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -11974,8 +14323,16 @@ export class GISystem {
     // mirror + hit-lighting path, buckets 1/2 are a fraction of that cost.
     const seenMaterials = new Set();
     const tally = [0, 0, 0, 0];
+    // §18 THE LADDER's census: [sharp, medium, coarse]. Reported at build so
+    // the classification is VISIBLE — a ladder whose tiers nobody can see is
+    // how §16 R4 shipped blind on every packed map for a whole session.
+    const seenTierMaterials = new Set();
+    const tierTally = [0, 0, 0];
     // The deforming meshes, for the temporal filters' reject bounds.
     const dynamicSurfaces = [];
+    // §18 W2: did this scan flip any layer bit that `shadowMerge`'s depth key
+    // reads? See the write site below for what a missed flip costs.
+    let depthKeyTagsChanged = false;
     const visit = (object) => {
       // Batched members are hidden yet still drawn (engine/batching.js).
       // `cameraHidden` = hidden by LOD/occlusion only (see Engine's visibility
@@ -11999,12 +14356,25 @@ export class GISystem {
         // field's bounds out to hundreds of metres of empty air.
         const editorOnly =
           (((object.layers.mask >>> 0) & 0x80000000) !== 0 && (object.layers.mask >>> 0) === 0x80000000) ||
-          object.layers.isEnabled(UI_LAYER);
+          object.layers.isEnabled(UI_LAYER) ||
+          // A SHADOW-MERGE PROXY IS NOT WORLD GEOMETRY. It is a depth-only
+          // duplicate of casters GI has already collected in their own right,
+          // so adopting it would voxelize every one of them TWICE, claim a
+          // second set of surface records for the same triangles, and put its
+          // throwaway depth material through GI's node injection and compile
+          // wave. Keyed on the exclusive layer for the same reason as the
+          // editor test above: the proxy sits on that bit ALONE.
+          (object.layers.mask >>> 0) === (1 << SHADOW_PROXY_LAYER) >>> 0;
         // EVERY lit material must be visible to three's NodeMaterialObserver
         // as "node-driven" — see #markObservedMaterial. GI light receivers
         // include meshes the FIELD skips (transparent etc.), so mark all.
         const mats = Array.isArray(object.material) ? object.material : [object.material];
         let readsReflection = false;
+        // §18 R8a — the SHARP subset, bucket 0 only. `readsReflection` (0 or 3)
+        // is nearly every material on an imported scene and is therefore
+        // useless as a cost lever; this one is the 2-of-111 that actually need
+        // a full-resolution reflection.
+        let sharpReflection = false;
         for (const m of mats) {
           // Volume materials shade through a scattering model with no
           // irradiance slot (see GICascadeLightNode.setup) — marking them
@@ -12015,6 +14385,24 @@ export class GISystem {
           this.#refreshMirrorBucket(m);
           const bucket = m ? giRoughnessBucketOf(m) : 2;
           if (bucket === 0 || bucket === 3) readsReflection = true;
+          // §18 THE LADDER — a RESOLUTION tier from the roughness floor, not a
+          // path decision. Bucket 0 alone was the wrong population: on this
+          // scene it is 2 materials, while window GLASS sits in bucket 3 with
+          // the plaster (a roughness MAP is all bucket 3 means) and was being
+          // sampled like a wet carpet.
+          const tier = giReflectTierOf(m);
+          // ⚠ SHARP *OR* MEDIUM, not SHARP alone — this tag now means "the
+          // traced reflection survives the blend on this surface". The three
+          // consumers all multiply by `smoothstep(0.45, 0.15, roughness)`, so
+          // COARSE (floor > 0.45) contributes exactly 0 at every texel, while
+          // MEDIUM reaches weight 1.0 at its sharp end and must keep its full
+          // trace. Tagging SHARP alone would be §16 R4's refuted mistake with
+          // a new name: on this scene SHARP is ONE material.
+          if (tier <= GI_REFLECT_TIER.MEDIUM) sharpReflection = true;
+          if (m && !seenTierMaterials.has(m)) {
+            seenTierMaterials.add(m);
+            tierTally[tier]++;
+          }
           if (m && !seenMaterials.has(m)) {
             seenMaterials.add(m);
             tally[bucket]++;
@@ -12031,8 +14419,52 @@ export class GISystem {
         // wrong image. ⚠ Masked mode itself is still NOT default — see
         // #bvhMaskEnabled for the open visual bug and the rig that shows it.
         if (!editorOnly) {
+          // ⭐ §18 W2 — `mesh.layers.mask` IS PART OF `shadowMerge`'s DEPTH KEY,
+          // so the tags written just below silently invalidate its buckets.
+          // The roughness FLOOR that decides `sharpReflection` resolves from an
+          // async GPU readback that lands long after the merge was built, so
+          // the flip always arrives late: a group built while a member was
+          // still "coarse" gains a SHARP member afterwards, and
+          // `renderGiGBuffer` then parks that whole group for the rest of the
+          // session (all-or-nothing per group — see its own banner). MEASURED
+          // on Bistro: 8 of 63 groups parked, covering 197 of the 550 merged
+          // meshes, i.e. ~197 draws the prepass paid one at a time for a tag
+          // change nobody told the merge about. Recording the flip and
+          // invalidating lets the next rebuild put the sharp meshes in their
+          // OWN bucket, where parking them costs only themselves.
+          // ⛔⛔ A FIRST TAGGING IS NOT A FLIP, AND TREATING IT AS ONE IS AN
+          // INFINITE REBUILD LOOP.
+          //
+          // The invalidation below exists to tell `shadowMerge` that a member's
+          // depth key changed. But shadowMerge's rebuild DESTROYS ITS PROXIES
+          // AND BUILDS NEW MESHES, and GI tags those fresh objects on its very
+          // next scan — where `maskBefore` is necessarily the untagged default,
+          // so every one of them reads as a change, which invalidates
+          // shadowMerge again, which builds new proxies again. Each turn of that
+          // cycle also re-mints the GI field (`[gi] src ... slot NEE replaced`)
+          // and tears down/rebuilds the 576 shadow proxies mid-frame.
+          //
+          // Reported by the user as "gi keeps reloading forever" AND "shadows
+          // are broken after each reload" — one bug wearing two faces, because
+          // the shadow map keeps being rendered against a half-swapped scene.
+          //
+          // Tracking which meshes have been tagged before makes the signal mean
+          // what it always claimed to: a tag that CHANGED, not a tag that was
+          // written for the first time. A brand-new proxy is never in the set,
+          // so it can never ask for the rebuild that created it.
+          this._giTaggedMeshes ??= new WeakSet();
+          const taggedBefore = this._giTaggedMeshes.has(object);
+          if (!taggedBefore) this._giTaggedMeshes.add(object);
+          const maskBefore = object.layers.mask;
           if (readsReflection) object.layers.enable(GI_MIRROR_LAYER);
           else object.layers.disable(GI_MIRROR_LAYER);
+          // §18 R8a: the prepass traces these at full resolution and everything
+          // else at a coarse block stride. A stale tag costs RESOLUTION on a
+          // few pixels, never a missing reflection — the failure mode that made
+          // the mirror MASK dangerous does not exist here.
+          if (sharpReflection) object.layers.enable(GI_SHARP_LAYER);
+          else object.layers.disable(GI_SHARP_LAYER);
+          if (taggedBefore && object.layers.mask !== maskBefore) depthKeyTagsChanged = true;
           // A DEFORMING surface moves independently of the camera, so the
           // screen-space temporal filters' reprojection (which assumes a
           // static world) lands on the wrong point of it — the ghost trail
@@ -12063,8 +14495,100 @@ export class GISystem {
     };
     if (this.engine.scene) visit(this.engine.scene);
     this._bucketTally = tally;
+    this._tierTally = tierTally;
     this._dynamicSurfaces = dynamicSurfaces;
+    // §18 W2. Debounced on the other side (SETTLE_MS/MAX_DEFER_MS), so a scan
+    // that flips a handful of tags per pass while the roughness readbacks drain
+    // coalesces into one rebuild rather than one per tag.
+    if (depthKeyTagsChanged) this.engine?.shadowMerge?.invalidate?.("gi-layer-tags");
     return meshes;
+  }
+
+  /**
+   * §18 THE LADDER, COUNTED LIVE — the instrument the build-time tally could
+   * not be.
+   *
+   * `_tierTally` is filled during #collectMeshes, which runs at BUILD time,
+   * before the per-channel roughness floors have come back off the GPU. Every
+   * mapped material is therefore still `MEDIUM`-by-default when it is counted,
+   * and the census printed "0 sharp, 102 medium" for a scene whose windows are
+   * mirrors. That is [[probe-blind-statistics]] exactly: an instrument that
+   * cannot see its subject reports a null.
+   *
+   * This walks the scene at READ time instead, so it sees whatever floors have
+   * landed, and it keeps PENDING separate from MEDIUM so the two can never be
+   * confused again.
+   *
+   * Three populations, because they answer different questions:
+   * - `materials` — how many shader variants sit on each rung;
+   * - `meshes` — tagged by their SHARPEST material, which is how the layer tag
+   *   is decided (a mesh is traced finely if any of its submaterials needs it);
+   * - `triangles` — the closest cheap proxy for SCREEN COVERAGE, which is what
+   *   a per-tier trace stride actually spends its budget on. Material counts
+   *   alone over-weight a one-quad decal and under-weight a facade.
+   *
+   * ⚠ Reflective set only (`giRoughnessBucketOf` 0 or 3 — the materials that
+   * READ `bvhShade`). Counting the diffuse majority would bury the answer.
+   */
+  reflectTierCensus() {
+    const scene = this.engine?.scene;
+    if (!scene) return null;
+    const zero = () => [0, 0, 0];
+    const materials = zero();
+    const meshes = zero();
+    const triangles = zero();
+    let pendingMaterials = 0;
+    let pendingMeshes = 0;
+    const seen = new Set();
+    scene.traverse((object) => {
+      if (!object.isMesh && !object.isInstancedMesh) return;
+      if (object.layers?.isEnabled?.(EDITOR_LAYER)) return;
+      if (object.layers?.isEnabled?.(UI_LAYER)) return;
+      const list = Array.isArray(object.material) ? object.material : [object.material];
+      // A mesh is traced at the rate its SHARPEST material needs — one layer
+      // tag covers every submaterial, so the finest one wins (min tier index).
+      let best = null;
+      let pending = false;
+      for (const m of list) {
+        if (!m) continue;
+        const bucket = giRoughnessBucketOf(m);
+        if (bucket !== 0 && bucket !== 3) continue;
+        const info = giReflectTierInfoOf(m);
+        if (!info.resolved) pending = true;
+        if (!seen.has(m)) {
+          seen.add(m);
+          materials[info.tier]++;
+          if (!info.resolved) pendingMaterials++;
+        }
+        best = best === null ? info.tier : Math.min(best, info.tier);
+      }
+      if (best === null) return;
+      meshes[best]++;
+      if (pending) pendingMeshes++;
+      const geometry = object.geometry;
+      const indexed = geometry?.index?.count;
+      const verts = indexed ?? geometry?.attributes?.position?.count ?? 0;
+      const instances = object.isInstancedMesh ? Math.max(1, object.count || 1) : 1;
+      triangles[best] += Math.round(verts / 3) * instances;
+    });
+    const label = (a) => ({ sharp: a[0], medium: a[1], coarse: a[2] });
+    return {
+      materials: label(materials),
+      meshes: label(meshes),
+      triangles: label(triangles),
+      // How much of the "medium" column is really "ask again later".
+      pendingMaterials,
+      pendingMeshes,
+      // The decision number: COARSE means the roughness FLOOR is above 0.45,
+      // and `exactWeight = smoothstep(0.45, 0.15, roughness)` is then 0 for
+      // EVERY texel of that material — the traced reflection it is paying for
+      // is multiplied out of the image. That share is what a per-tier stride
+      // can reclaim at provably zero visual cost.
+      coarseTriangleShare: (() => {
+        const total = triangles[0] + triangles[1] + triangles[2];
+        return total > 0 ? triangles[2] / total : null;
+      })(),
+    };
   }
 
   /**
@@ -12149,6 +14673,7 @@ export class GISystem {
     if (this._reflectionConsumerAppeared) {
       this._reflectionConsumerAppeared = false;
       console.log("[gi] a material became reflective — rebuilding to bring exact reflections online");
+      this.noteRebuildAsk("reflective-material-appeared");
       this.#rebuild();
       return;
     }
@@ -12208,7 +14733,7 @@ export class GISystem {
               // non-cubic or under-resolved.
               if (!this.#refitInPlace(fit)) {
                 console.log("[gi] auto-fit: bounds drifted beyond the in-place window — full rebuild");
-                this.requestRebuild();
+                this.requestRebuild("auto-fit-bounds-drifted");
               }
               return;
             }
@@ -12227,7 +14752,7 @@ export class GISystem {
       // it compares against is the fitted lattice's, read off the built state
       // rather than off a property that no longer exists.
       if (center.distanceTo(state.center) > Math.max(0.5, (state.probeSpacing || 1.25) * 0.5)) {
-        this.requestRebuild();
+        this.requestRebuild("manual-volume-recenter");
         return;
       }
     }
@@ -12734,16 +15259,22 @@ export class GISystem {
     // channels trace exact triangles while injection/bounce stay voxel.
     // `__giShadowStaticBvh = false` restores the records/DDA marcher.
     let staticBvhPacked = null;
+    // Hoisted out of the block below so the §18.17 degrade rung can re-pack
+    // the SAME item list without a UV region.
+    let items = [];
     if (dynObjectsOn && globalThis.__giShadowStaticBvh !== false) {
       const t0 = performance.now();
       const geomByKey = new Map(geometries.map((g) => [g.key, g]));
-      const items = placements
+      items = placements
         .map((p) => {
           const g = geomByKey.get(p.geometryKey);
-          return g ? { positions: g.positions, index: g.index, matrix: p.matrix, slot: p.slot } : null;
+          return g ? { positions: g.positions, index: g.index, uvs: g.uvs, matrix: p.matrix, slot: p.slot } : null;
         })
         .filter(Boolean);
-      staticBvhPacked = items.length ? buildStaticSceneBvhWords(items, staticBvhStrategy()) : null;
+      staticBvhPacked = items.length
+        ? buildStaticSceneBvhWords(items, staticBvhStrategy(), { uvs: this.#staticBvhWantsUv() })
+        : null;
+      this._staticBvhItemsWantedUv = this.#staticBvhWantsUv();
       // Diagnostics handle: the CPU traversal mirror in the static-BVH probe
       // reads the SAME words the GPU traverses (the bits upload is a compute
       // copy from staging — the CPU bits array never holds them).
@@ -12767,7 +15298,7 @@ export class GISystem {
     }
     // 1.5× headroom so content refreshes (late GLBs) and demote rebuilds fit
     // without a full field rebuild.
-    const staticBvhWords = staticBvhPacked ? Math.ceil(staticBvhPacked.words.length * 1.5) : 0;
+    let staticBvhWords = staticBvhPacked ? Math.ceil(staticBvhPacked.words.length * 1.5) : 0;
 
     const makeField = (dynW, statW) => createOccupancyField(bounds, res, {
       slotCapacity: Math.min(MAX_INSTANCE_SLOTS, Math.max(64, placements.length * 2)),
@@ -12828,6 +15359,24 @@ export class GISystem {
       deviceLimits?.maxBufferSize ?? 268435456,
     );
     let field = makeField(dynWords, staticBvhWords);
+    // ── §18.17 RUNG ZERO: THE UV REGION GOES BEFORE THE BVH DOES ───────────
+    //
+    // Textured reflections cost 3 words per static triangle, and on a scene
+    // big enough to reach this ladder that is tens of megabytes. Losing them
+    // costs one feature (hits fall back to the per-slot mean albedo — exactly
+    // the pre-§18.17 picture); losing the whole static BVH costs every exact
+    // shadow AND every reflection in the scene. Cheapest thing first.
+    if (field.bitsBuffer.value.array.byteLength > deviceLimit && (staticBvhPacked?.uvWordCount ?? 0) > 0) {
+      console.warn(
+        `[gi] bits buffer ${(field.bitsBuffer.value.array.byteLength / 1048576).toFixed(0)}MB over the ` +
+          `${(deviceLimit / 1048576).toFixed(0)}MB device limit — dropping the reflection UV region ` +
+          "(reflections fall back to per-slot mean albedo)",
+      );
+      staticBvhPacked = items.length ? buildStaticSceneBvhWords(items, staticBvhStrategy(), { uvs: false }) : null;
+      this._staticBvhItemsWantedUv = false;
+      staticBvhWords = staticBvhPacked ? Math.ceil(staticBvhPacked.words.length * 1.5) : 0;
+      field = makeField(dynWords, staticBvhWords);
+    }
     if (field.bitsBuffer.value.array.byteLength > deviceLimit && staticBvhWords > 0) {
       console.warn(
         `[gi] bits buffer ${(field.bitsBuffer.value.array.byteLength / 1048576).toFixed(0)}MB exceeds the device's ` +
@@ -12843,6 +15392,9 @@ export class GISystem {
     for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.setGeometry(geometries, placements);
     field.placements = placements;
+    // §18.17: baked before the dynamic set below, because #oneBvhBundle reads
+    // `_slotAtlas` while the reflect prepass is being built.
+    this.#ensureSlotAlbedoAtlas(field, placements);
 
     // Fresh per-build dynamic-object set (GPU state is per-field: region
     // offsets move with the allocation). Adoption KEYS persist across builds
@@ -12877,6 +15429,9 @@ export class GISystem {
         this._dynSet.attachStaticBvh({
           nodeBase: field.staticBvhWordOffset,
           triBase: field.staticBvhWordOffset + staticBvhPacked.nodeWords,
+          uvBase: staticBvhPacked.uvWordCount
+            ? field.staticBvhWordOffset + staticBvhPacked.uvRel
+            : 0,
         });
         this._staticBvhCapacity = field.staticBvhWords;
         this._staticBvhStale = null;
@@ -13008,7 +15563,7 @@ export class GISystem {
       if (!record) continue;
       if (!seen.has(record.geometryKey)) {
         seen.add(record.geometryKey);
-        geometries.push({ key: record.geometryKey, positions: record.positions, index: record.index });
+        geometries.push({ key: record.geometryKey, positions: record.positions, index: record.index, uvs: record.uvs });
       }
       for (const instanceId of this.#placementsOf(mesh)) {
         if (placements.length >= MAX_INSTANCE_SLOTS) break;
@@ -13064,7 +15619,7 @@ export class GISystem {
     const maxSlot = placements.reduce((m, p) => Math.max(m, p.slot), -1);
     if (maxSlot >= field.slotCapacity) {
       console.log(`[gi] occupancy: slot ${maxSlot} exceeds capacity ${field.slotCapacity} — rebuilding`);
-      this.requestRebuild();
+      this.requestRebuild("occupancy-slot-capacity");
       return;
     }
     // Placement objects are rebuilt every scan — carry the mover bookkeeping
@@ -13681,7 +16236,10 @@ export class GISystem {
     const cell = typeof cellRaw === "number" ? cellRaw : (typeof cellRaw?.value === "number" ? cellRaw.value : 0.35);
     dyn.sync(cell * 1.5);
     const pending = dyn.pendingDispatch();
-    if (pending.length > 0) giCompute(renderer, pending);
+    // Deferrable: `confirmDispatch` reads the skip set below and withholds
+    // `live` for anything that did not go out, so a deferred upload simply
+    // stays pending — the mover keeps its frozen bits for another frame.
+    if (pending.length > 0) giCompute(renderer, pending, { deferrable: true });
     const live = dyn.confirmDispatch(giSkippedComputes);
     // Before this frame's screen passes: words and bases flip together.
     this.#commitStaticBvhAttach();
@@ -13768,9 +16326,15 @@ export class GISystem {
       if (this._dynAdoptedKeys?.has(slotKeyOf(p.mesh, p.instanceId))) continue;
       const record = serializeMeshForBake(p.mesh);
       if (!record) continue;
-      items.push({ positions: record.positions, index: record.index, matrix: p.matrix, slot: p.slot });
+      items.push({ positions: record.positions, index: record.index, uvs: record.uvs, matrix: p.matrix, slot: p.slot });
     }
-    const packed = items.length ? buildStaticSceneBvhWords(items, staticBvhStrategy()) : null;
+    // The UV region has to match what the FIELD was sized for, not what the
+    // config wants right now: this path reuses the allocation made at build
+    // time (`_staticBvhCapacity`), so re-adding a region the ladder dropped
+    // would simply overflow and keep the stale BVH.
+    const packed = items.length
+      ? buildStaticSceneBvhWords(items, staticBvhStrategy(), { uvs: this._staticBvhItemsWantedUv === true })
+      : null;
     if (!packed) {
       // No static geometry left to pack. Nothing to retry, but the motion mask
       // must not survive the decision — see the capacity path below.
@@ -13780,6 +16344,11 @@ export class GISystem {
     // Opt-in for the same reason as the build-time site above: this reference
     // is what keeps the packed words on the heap after the upload.
     if (globalThis.__giKeepStaticBvhPacked === true) this._staticBvhPacked = packed;
+    // §18.17: the mesh SET changed, so the material set can have too — re-bake
+    // the reflection atlas against the same placements this BVH was packed
+    // from. Both the atlas texture node and the tile table are persistent, so
+    // no compiled kernel is rebuilt by this.
+    this.#ensureSlotAlbedoAtlas(field, field.placements);
     if (packed.words.length > (this._staticBvhCapacity ?? 0)) {
       console.warn(
         `[gi] static shadow bvh: rebuild needs ${packed.words.length} words > ${this._staticBvhCapacity} capacity — ` +
@@ -13803,6 +16372,7 @@ export class GISystem {
       block: dyn.queueRegionUpload(field.staticBvhWordOffset, packed.words),
       nodeBase: field.staticBvhWordOffset,
       triBase: field.staticBvhWordOffset + packed.nodeWords,
+      uvBase: packed.uvWordCount ? field.staticBvhWordOffset + packed.uvRel : 0,
       triCount: packed.triCount,
       buildMs: performance.now() - t0,
     };
@@ -13822,7 +16392,7 @@ export class GISystem {
     this._staticBvhPendingAttach = null;
     const dyn = this._dynSet;
     if (!dyn) return;
-    dyn.attachStaticBvh({ nodeBase: pending.nodeBase, triBase: pending.triBase });
+    dyn.attachStaticBvh({ nodeBase: pending.nodeBase, triBase: pending.triBase, uvBase: pending.uvBase ?? 0 });
     dyn.resetStaticMask([]);
     // ALWAYS LOGGED, not behind the debug flag: this is a SYNCHRONOUS
     // main-thread stall of hundreds of milliseconds (262k tris ≈ 200ms center
@@ -14218,7 +16788,7 @@ export class GISystem {
       if (field && this._skinnedCapRebuildFor !== field && dyn.count() >= dyn.maxObjects) {
         this._skinnedCapRebuildFor = field;
         console.warn(`[gi] skinned proxies: mover set is full (${dyn.maxObjects}) — requesting one field rebuild to widen the cap for late-loaded rigs.`);
-        this.requestRebuild();
+        this.requestRebuild("skinned-mover-cap");
       }
     }
     this.#resolveSkinnedProxyColors(groups, dyn);
@@ -14363,6 +16933,193 @@ export class GISystem {
     if (dyn.staticBvh) this._staticBvhStale = this._frame;
     this._dynLastEvictFrame = this._frame;
     return true;
+  }
+
+  /**
+   * Debug view overlay: a fullscreen quad that samples one of the GI term
+   * textures (irradiance, AO, radiance) and writes it as the lit image.
+   *
+   * The radiance/irradiance pair are already system-lifetime `_giTargets`,
+   * and the AO/VXAO targets live on `state.screen.aoPass`/`vxaoPass` for as
+   * long as those passes are armed — so the mesh has no textures of its own
+   * to dispose. `#applyDebugVisibility` rewires `material.fragmentNode` (a
+   * uniform-driven texture sample) per mode; for `off` the mesh is hidden.
+   *
+   * Positioned as a CHILD of the active camera so it follows without a
+   * per-frame uniform write. `engine.camera` may swap on scene change — the
+   * rebuild path re-runs `#buildDebugView` and re-parents, so a swap that
+   * happens between rebuilds will leave the overlay on the old camera until
+   * the next rebuild. That is the same contract the SRC probe gizmos have,
+   * and the failure it produces is the wrong camera being overlaid, which is
+   * visible at first frame and never silent.
+   */
+  #buildDebugView() {
+    // THE MESH GOES IN THE SCENE GRAPH, NOT AS A CAMERA CHILD.
+    //
+    // An earlier version parented this mesh to `engine.camera` so it
+    // automatically followed, but `renderer.render(scene, camera)` traverses
+    // `scene` — not the camera's children — so a mesh parented to the camera
+    // never appears in the frame even with `visible = true`. That was the
+    // reason `debugView` "didn't change the viewport at all": the wiring was
+    // correct, but the mesh was outside the render graph.
+    //
+    // The fix is a vertex shader that ignores model-view-projection and emits
+    // clip-space position directly. `PlaneGeometry(2, 2)` already has
+    // vertices at `xy ∈ [-1, 1]` with `z = 0`, so passing `position.xy`
+    // straight to `gl_Position` is enough to cover the full frame, regardless
+    // of where the mesh sits in the world. No per-frame uniform update, no
+    // per-frame camera-re-parent dance.
+    const geometry = new THREE.PlaneGeometry(2, 2);
+    const material = new THREE.MeshBasicNodeMaterial();
+    material.depthTest = false;
+    material.depthWrite = false;
+    material.toneMapped = false;
+    material.colorWrite = true;
+    // `MeshBasicNodeMaterial` exposes a `vertexNode` slot — `MeshBasicNodeMaterial`'s
+    // default vertex pipeline does the projection, so overriding it to skip
+    // straight to clip space is what anchors the quad in NDC.
+    //
+    // The CRITICAL TSL detail: a `uniform(null)` is for scalars/vectors/
+    // matrices, NOT for textures. A texture-binding uniform must be created
+    // by wrapping a real `THREE.Texture` with `texture(...)` — that returns a
+    // node whose `.value` can be reassigned to a different texture at any
+    // time, and the existing `.sample()` calls in this material keep pointing
+    // at the new binding without a recompile. Seeding with a 1×1 white
+    // texture is the smallest safe default — a unit of `texture.create()`
+    // would also work but allocates a GPU object we never sample from.
+    const placeholder = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+    placeholder.needsUpdate = true;
+    const texU = texture(placeholder);
+    // THE SECOND SOURCE. Two of these views show a COMPOSITION, not a buffer:
+    // the AO the resolve applies is `min(screen, vxao)` and the reflection the
+    // material shades with is the exact BVH hit where one resolved, over the
+    // glossy field everywhere else. Showing either half alone is the "can the
+    // instrument see its subject" failure — the view looked correct and
+    // reported the wrong term. A second texture binding is the whole cost.
+    const placeholder2 = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+    placeholder2.needsUpdate = true;
+    const tex2U = texture(placeholder2);
+    // THE GBUFFER, for the reflection modes only. A reflection buffer holds a
+    // radiance at every pixel; how much of it a DIELECTRIC actually shows is
+    // Fresnel, and Fresnel needs the surface point and its normal. Both are
+    // already resolved in this module's own gbuffer, so the view can weight
+    // what it shows instead of presenting a full-brightness field that reads
+    // as a second copy of the scene.
+    const placeholder3 = new THREE.DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
+    placeholder3.needsUpdate = true;
+    const gPosU = texture(placeholder3);
+    const placeholder4 = new THREE.DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
+    placeholder4.needsUpdate = true;
+    const gNormalU = texture(placeholder4);
+    // 0 = off, 1 = indirect (rgb), 2 = one AO buffer (grey), 3 = composed AO
+    // min() (grey), 4 = glossy reflection field x Fresnel, 5 = traced BVH
+    // reflection layer (raw — the sharp arm is judged undimmed).
+    const modeU = uniform(0);
+    // Clip-space passthrough: PlaneGeometry(2,2) vertices have xy in [-1, 1]
+    // and z = 0. `vertexNode` expects a vec4 (clip-space), so we build it
+    // component-by-component — the `vec4(vec3, num, num)` overload trips TSL
+    // type-length detection with the implicit `1`. `MeshBasicNodeMaterial`
+    // will treat this as the final `gl_Position`, bypassing the model-view-
+    // projection entirely and anchoring the quad at NDC [-1, 1] regardless
+    // of where the mesh sits in the world.
+    material.vertexNode = vec4(positionGeometry.x, positionGeometry.y, 0, 1);
+    material.fragmentNode = Fn(() => {
+      // `screenUV` is a TSL node, not a function — three.js's `nodeImmutable`
+      // returns a Node whose `.value` is the current per-pixel UV. Inside an
+      // `Fn`, you reference it directly; calling it (`screenUV()`) throws
+      // "is not a function" at node-graph build time.
+      const uv = screenUV;
+      // `texU` always points at SOMETHING — the placeholder 1×1 white texture
+      // above, or the live target `#applyDebugVisibility` swapped in. The mesh
+      // is hidden while `modeU === 0`, so the shader still compiles but
+      // nothing draws it.
+      const sampled = texU.sample(uv).toVar();
+      const second = tex2U.sample(uv).toVar();
+      // AO textures carry a single factor in `.r`; irradiance and radiance
+      // are full RGB. Every branch ends with alpha 1: an undefined `.a` (which
+      // these kernels write as a validity bit, not as coverage) must not leak
+      // a 0 alpha into the surface blend.
+      // ── AO IS A FACTOR, SO IT IS SHOWN AS ONE ──────────────────────────
+      //
+      // `renderer.outputColorSpace` is sRGB, so anything this quad writes is
+      // encoded on the way to the canvas: an AO of 0.50 leaves here linear and
+      // arrives on screen at 0.74, 0.87 arrives at 0.94. That transform is
+      // correct for a RADIANCE (the indirect/reflection modes) and a lie for a
+      // 0..1 multiplier — it is the whole reason a measured field of p50 0.84 /
+      // p05 0.51 read as "nearly white, so AO must be broken". Decoding first
+      // makes the displayed grey EQUAL the factor, so the view can be read as
+      // a number rather than as a mood.
+      const grey = (v) => vec4(sRGBTransferEOTF(vec3(v, v, v)), 1);
+      If(modeU.equal(2), () => {
+        sampled.assign(grey(sampled.r));
+      }).ElseIf(modeU.equal(3), () => {
+        // Exactly the resolve's composition (giScreen's `factor.min(...)`).
+        // Both AO buffers are written at resolve resolution, so at the shipped
+        // scale this is texel-for-texel the number the frame multiplies in.
+        sampled.assign(grey(sampled.r.min(second.r)));
+      }).ElseIf(modeU.equal(4), () => {
+        // ── WHY THIS VIEW IS WEIGHTED AND THE OTHERS ARE NOT ──────────────
+        //
+        // THE REPORT: "the reflections debug view shows not only reflections".
+        // It was showing `giRadiance` raw, and that buffer legitimately holds
+        // a radiance at EVERY covered pixel — the glossy gather runs per
+        // screen pixel, not per reflective pixel. What decides how much of it
+        // reaches the frame is the material's specular BRDF, and the single
+        // dominant factor there for every non-metal is Fresnel: ~4% head-on,
+        // rising to 1 at grazing. Unweighted, the buffer therefore reads as a
+        // second, blurry copy of the scene; weighted, it reads as the rim-lit
+        // layer the frame actually adds.
+        //
+        // ⚠ THE ASSUMPTION IS DIELECTRIC F0 = 0.04 AND NO ROUGHNESS TERM. A
+        // metal's reflection is tinted by its own F0 and is far brighter than
+        // this shows, and a rough surface's lobe is wider than the mirror
+        // direction this ignores — neither is knowable from a gbuffer that by
+        // construction cannot read the material it overrode (createGiGBuffer's
+        // mask note). This view is therefore a floor on the contribution, not
+        // a match for the frame; "reflections-exact" shows the traced layer
+        // undimmed for judging its quality.
+        const g = gPosU.sample(uv).toVar();
+        const n = gNormalU.sample(uv).xyz.toVar();
+        const view = vec3(cameraPosition).sub(g.xyz).normalize().toVar();
+        const nrm = n.normalize().toVar();
+        // Camera-faced, exactly as every other consumer of this gbuffer does:
+        // a double-sided wall seen from inside must be Fresnel-weighted
+        // against the side that is visible.
+        const facing = step(0, nrm.dot(view)).mul(2).sub(1);
+        const dotNV = nrm.mul(facing).dot(view).clamp(0, 1).toVar();
+        const fresnel = float(0.04).add(float(0.96).mul(dotNV.oneMinus().pow(5))).toVar();
+        // No geometry, no surface, no reflection — the sky is not reflecting
+        // anything at this pixel, it IS the pixel.
+        const covered = g.w.greaterThan(0.5).select(float(1), float(0));
+        sampled.assign(vec4(sampled.rgb.mul(fresnel).mul(covered), 1));
+      }).ElseIf(modeU.equal(5), () => {
+        // The traced layer, raw. `bvhRadiance.a`: 1 = an exact hit was traced
+        // and shaded, -1 = a traced MISS (giLight falls back to the
+        // environment there), 0 = the sharp mask skipped this pixel. Anything
+        // that is not a positive hit shows as black, so the view reads as
+        // coverage AND colour in one look.
+        sampled.assign(vec4(second.a.greaterThan(0.5).select(second.rgb, vec3(0)), 1));
+      }).Else(() => {
+        sampled.assign(vec4(sampled.rgb, 1));
+      });
+      return sampled;
+    })();
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.frustumCulled = false;
+    mesh.visible = false;
+    mesh.renderOrder = 10000; // one above sdf/occ, which sit at 9999
+    mesh.userData.__giDebug = true;
+    mesh.userData.__giDebugTerm = true;
+    mesh.userData.__giDebugTex = texU;
+    mesh.userData.__giDebugTex2 = tex2U;
+    mesh.userData.__giDebugGPos = gPosU;
+    mesh.userData.__giDebugGNormal = gNormalU;
+    mesh.userData.__giDebugMode = modeU;
+    mesh.userData.__giDebugTexPlaceholder = placeholder;
+    mesh.userData.__giDebugTexPlaceholder2 = placeholder2;
+    mesh.userData.__giDebugTexPlaceholder3 = placeholder3;
+    mesh.userData.__giDebugTexPlaceholder4 = placeholder4;
+    return mesh;
   }
 
   /** Debug "Occupancy" view: a volume box hierarchical-DDA-ing the pyramid. */

@@ -372,8 +372,25 @@ export default class CharacterCamera extends Script {
   @attribute({ type: "select", default: "third", options: ["first", "third"], label: "View" })
   view = "third";
 
+  /** Mouse look, in radians of turn per 100 px of mouse movement. Sticks do
+   *  NOT use this — see "Stick Speed". */
   @attribute({ type: "number", default: 2.4, min: 0.01, step: 0.1, label: "Sensitivity" })
   sensitivity = 2.4;
+
+  /**
+   * Stick look, in DEGREES PER SECOND at full deflection — for a gamepad's
+   * right stick and the on-screen joystick on a phone.
+   *
+   * Separate from "Sensitivity", and in different units, because the two
+   * devices report different things. A mouse reports how far it MOVED since
+   * the last frame: that is already a delta, and multiplying it by frame time
+   * would make a fast machine turn less for the same hand movement. A stick
+   * reports a HELD position, which is a rate — so it must be multiplied by
+   * frame time, or the same thumb pressure turns the camera twice as fast on
+   * a 120 Hz phone as on a 60 Hz one.
+   */
+  @attribute({ type: "number", default: 140, min: 1, step: 5, label: "Stick Speed" })
+  stickSpeed = 140;
 
   @attribute({ type: "boolean", default: false, label: "Invert Y" })
   invertY = false;
@@ -387,6 +404,32 @@ export default class CharacterCamera extends Script {
   /** First person: where the eyes are, measured from the entity origin. */
   @attribute({ type: "number", default: 1.6, min: 0, step: 0.05, label: "Eye Height" })
   eyeHeight = 1.6;
+
+  /**
+   * Hide the character's own model while in first person.
+   *
+   * The eyes are INSIDE the head — that is what an eye height is — so a body
+   * left visible puts the character's skull across the bottom of the screen
+   * and the inside of its face across the rest of it the moment you look
+   * down. Every first-person game hides the body for exactly this reason;
+   * the ones that appear not to are showing a second, arms-only model.
+   *
+   * Turn it off if you have moved the camera clear of the head yourself, or
+   * if the body IS the arms-only model.
+   *
+   * The one thing it costs is the character's own shadow: three skips an
+   * invisible object when it renders a shadow map, so a hidden body casts
+   * none. If that shadow matters more than the head does, leave this off and
+   * raise "Eye Height" instead.
+   */
+  @attribute({ type: "boolean", default: true, label: "Hide Body In First Person" })
+  hideBody = true;
+
+  /** Child entity holding the visible character model. "Body" is what the
+   *  Character Controller rig names it; any child that renders something is
+   *  used as a fallback, so a hand-built rig usually needs no change here. */
+  @attribute({ type: "text", default: "Body", label: "Body Entity" })
+  bodyName = "Body";
 
   /** Third person: the point the camera orbits, relative to the character. */
   @attribute({ type: "vec3", default: [0.4, 1.5, 0], label: "Shoulder Offset" })
@@ -439,6 +482,13 @@ export default class CharacterCamera extends Script {
    *  shoulder unless "damping" is turned up. */
   private pivot: any = null;
   private unlisten: (() => void) | null = null;
+  /** The model we hide in first person, whether WE are the ones hiding it,
+   *  and what its visibility was before we did — so switching back to third
+   *  person restores what was there rather than force-showing a body another
+   *  script (a cutscene, an invisibility pickup) had turned off. */
+  private body: any = null;
+  private bodyHidden = false;
+  private bodyWasVisible = true;
 
   onStart() {
     this.cameraEntity = this.findCamera();
@@ -451,7 +501,15 @@ export default class CharacterCamera extends Script {
     const camera = this.cameraEntity.getComponent("camera");
     this.baseFov = camera ? (camera.props.fov as number) : 60;
 
-    if (this.lockCursor && this.input) {
+    this.body = this.findBody();
+    this.applyBodyVisibility();
+
+    // Pointer lock is a MOUSE feature. Asking for it on a touchscreen does
+    // nothing useful and, on some mobile browsers, spends the tap on a
+    // permission prompt instead of on the game.
+    const touchOnly =
+      typeof window !== "undefined" && !!window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+    if (this.lockCursor && this.input && !touchOnly) {
       // Pointer lock is only granted from a user gesture, so it is requested
       // on the first click rather than here.
       const canvas = this.engine.renderer as any;
@@ -465,15 +523,23 @@ export default class CharacterCamera extends Script {
   onDestroy() {
     this.unlisten?.();
     this.unlisten = null;
+    // Leave the world as we found it: a body this script hid is a body no
+    // other script knows to bring back.
+    if (this.bodyHidden && this.bodyWasVisible && this.body) this.body.visible = true;
+    this.bodyHidden = false;
     this.input?.exitPointerLock();
   }
 
   onUpdate(dt: number) {
     if (!this.cameraEntity) return;
-    this.readLook();
+    this.readLook(dt);
     if (this.toggleAction && this.input?.wasPressedThisFrame(this.toggleAction)) {
       this.setView(this.view === "first" ? "third" : "first");
     }
+    // Re-checked every frame rather than only on the toggle, because "view"
+    // is an Inspector field: changing it there during Play has to take
+    // effect, and so does a "hideBody" flipped while first person is live.
+    this.applyBodyVisibility();
     if (this.view === "first") this.applyFirstPerson();
     else this.applyThirdPerson(dt);
     this.applyFov(dt);
@@ -482,17 +548,54 @@ export default class CharacterCamera extends Script {
   /** Switches view. Safe to call from a menu, a cutscene, or a pickup. */
   setView(view: string) {
     this.view = view === "first" ? "first" : "third";
+    this.applyBodyVisibility();
   }
 
-  private readLook() {
+  /** Shows or hides the character's model to match the current view. */
+  private applyBodyVisibility() {
+    if (!this.body) return;
+    const hide = this.hideBody && this.view === "first";
+    if (hide === this.bodyHidden) return;
+    if (hide) {
+      this.bodyWasVisible = this.body.visible;
+      this.body.visible = false;
+    } else if (this.bodyWasVisible) {
+      this.body.visible = true;
+    }
+    this.bodyHidden = hide;
+  }
+
+  /** The child entity carrying the visible character model. Named lookup
+   *  first (the rig calls it "Body"); otherwise the first child that renders
+   *  anything, which covers a rig somebody built by hand. */
+  private findBody(): any {
+    const named = this.bodyName ? this.entity.getEntityByName(this.bodyName) : null;
+    if (named) return named;
+    for (const child of this.entity.children) {
+      if (child === this.cameraEntity) continue;
+      const renders =
+        child.findComponents("model").length ||
+        child.findComponents("skinnedmesh").length ||
+        child.findComponents("mesh").length;
+      if (renders) return child;
+    }
+    return null;
+  }
+
+  private readLook(dt: number) {
     if (!this.input) return;
     const look = this.input.readValue(this.lookAction) as { x: number; y: number };
     if (!look || typeof look !== "object") return;
-    // Look is a per-frame DELTA (mouse movement / stick deflection), so it is
-    // deliberately NOT scaled by dt — a mouse that moved 100 px turns the same
-    // amount however long the frame took.
-    this.yaw -= look.x * this.sensitivity * 0.01;
-    this.pitch += (this.invertY ? look.y : -look.y) * this.sensitivity * 0.01;
+    // A mouse delta is already per-frame and is deliberately NOT scaled by dt
+    // — a mouse that moved 100 px turns the same amount however long the
+    // frame took. A stick's deflection is a rate and MUST be, or the camera
+    // spins at whatever speed the display happens to run at. The active
+    // scheme is what tells the two apart; see "Stick Speed" above.
+    const scheme = this.input.activeScheme;
+    const stick = scheme === "Gamepad" || scheme === "Touch";
+    const rate = stick ? ((this.stickSpeed * Math.PI) / 180) * dt : this.sensitivity * 0.01;
+    this.yaw -= look.x * rate;
+    this.pitch += (this.invertY ? look.y : -look.y) * rate;
     const min = (this.minPitch * Math.PI) / 180;
     const max = (this.maxPitch * Math.PI) / 180;
     this.pitch = Math.max(min, Math.min(max, this.pitch));

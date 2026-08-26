@@ -247,6 +247,46 @@ export async function retargetScriptPath(oldPath, newPath) {
 }
 
 /**
+ * The folder version of `retargetScriptPath`: everything that pointed INSIDE
+ * `oldDir` now points inside `newDir`.
+ *
+ * Renaming a folder moves every script under it, and `retargetScriptPath` only
+ * ever matched the renamed path itself — so renaming `scripts/` silently
+ * unhooked every entity that referenced a file in it, and left every open tab
+ * showing a path that no longer exists. The failure is invisible until the game
+ * is run and a behaviour is simply missing.
+ *
+ * Safe to call for a file rename: nothing sits under a file path, so the prefix
+ * matches nothing and this does no work.
+ */
+export async function retargetScriptFolder(oldDir, newDir) {
+  if (!oldDir || !newDir || oldDir === newDir) return;
+  const prefix = `${String(oldDir).replaceAll("\\", "/").replace(/\/$/, "").toLowerCase()}/`;
+  const under = (p) => String(p ?? "").replaceAll("\\", "/").toLowerCase().startsWith(prefix);
+  // Rebuild against the OLD spelling's length so the tail keeps its own
+  // separators exactly as the caller stored them.
+  const moved = (p) => `${newDir}${String(p).slice(String(oldDir).length)}`;
+
+  const [{ useCodeStore }, { engine }] = await Promise.all([
+    import("./codeStore.js"),
+    import("./engineInstance.js"),
+  ]);
+
+  const affected = new Set();
+  for (const file of useCodeStore.getState().files) if (under(file)) affected.add(file);
+  for (const rootEntity of engine.rootEntities ?? []) {
+    rootEntity.traverse((entity) => {
+      for (const slot of entity.getComponent?.("script")?.props?.scripts ?? []) {
+        if (under(slot?.path)) affected.add(slot.path);
+      }
+    });
+  }
+  // One at a time through the tested single-path routine, so tabs, the shared
+  // Monaco model and the entities' script slots all move by the same rules.
+  for (const path of affected) await retargetScriptPath(path, moved(path));
+}
+
+/**
  * Renames a script file so its name matches the class it exports, if they have
  * drifted apart. Returns the new path, or null when nothing needed to move.
  *

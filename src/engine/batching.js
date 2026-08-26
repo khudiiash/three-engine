@@ -1,5 +1,6 @@
 // @ts-check
 import * as THREE from "three/webgpu";
+import { authoredCastShadow } from "./merging.js";
 
 /**
  * Automatic static batching.
@@ -144,7 +145,11 @@ export class BatchSystem {
       if (geometry.morphAttributes && Object.keys(geometry.morphAttributes).length) continue;
       if (EXCLUSIVE_COMPONENTS.some((type) => entity.components.has(type))) continue;
 
-      const key = `${geometry.uuid}|${material.uuid}|${mesh.castShadow ? 1 : 0}${
+      // ⚠ AUTHORED, not live: shadowMerge zeroes members' castShadow at boot,
+      // and a batch keyed/cloned from that bit is born non-casting — the same
+      // theft that dropped 73% of Bistro's shadow map via merging.js's colour
+      // proxies. See authoredCastShadow's banner in merging.js.
+      const key = `${geometry.uuid}|${material.uuid}|${authoredCastShadow(mesh) ? 1 : 0}${
         mesh.receiveShadow ? 1 : 0
       }|${mesh.layers.mask}|${mesh.renderOrder}`;
       const list = groups.get(key);
@@ -166,7 +171,7 @@ export class BatchSystem {
         members.length,
       );
       instanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      instanced.castShadow = template.castShadow;
+      instanced.castShadow = authoredCastShadow(template);
       instanced.receiveShadow = template.receiveShadow;
       instanced.layers.mask = template.layers.mask;
       instanced.renderOrder = template.renderOrder;

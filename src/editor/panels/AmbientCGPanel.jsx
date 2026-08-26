@@ -14,7 +14,11 @@ import {
   downloadHdri,
   downloadModel,
   RES_DEFAULTS,
+  modelPreviewUrl,
+  fetchArchiveBytes,
 } from "../ambientcg.js";
+import { AssetPreview } from "../components/AssetPreview.jsx";
+import { loadObjArchivePreview } from "../previewSources.js";
 
 const TABS = [
   { id: "Material", label: "Materials" },
@@ -245,6 +249,14 @@ function AssetDetail({ asset, dataType, hasProject, onClose }) {
     }
   }, [resolutions, res, files]);
 
+  // The preview downloads a real archive — ambientCG ships no preview mesh —
+  // so it always takes the SMALLEST variant rather than the one selected for
+  // import. See modelPreviewUrl.
+  const previewArchive = useMemo(
+    () => (dataType === "3DModel" && files ? modelPreviewUrl(files) : null),
+    [dataType, files],
+  );
+
   const size = useMemo(() => {
     if (!files) return 0;
     if (dataType === "HDRI" || dataType === "3DModel") {
@@ -286,7 +298,15 @@ function AssetDetail({ asset, dataType, hasProject, onClose }) {
       <button className="acg-detail-close" onClick={onClose} title="Close">
         ×
       </button>
-      <img className="acg-detail-preview" src={previewUrl(asset.id)} alt={asset.name} draggable={false} />
+      {/* Models get the live mesh; materials and HDRIs keep the still,
+          which for those two IS the asset — ambientCG's own rendered sphere
+          says more about a material than a viewport would. */}
+      <AssetPreview
+        src={dataType === "3DModel" ? previewArchive : null}
+        load={previewArchive ? () => fetchArchiveBytes(previewArchive).then(loadObjArchivePreview) : null}
+        thumbnailUrl={previewUrl(asset.id)}
+        alt={asset.name}
+      />
       <h3 className="acg-detail-name">{asset.name}</h3>
       <div className="acg-detail-meta">
         {asset.category && <span>{asset.category}</span>}
