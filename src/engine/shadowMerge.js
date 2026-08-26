@@ -69,6 +69,9 @@ import { mergeGeometries } from "./merging.js";
 import {
   SHADOW_PROXY_LAYER,
   GI_DEPTH_LAYER,
+  GI_DYNAMIC_LAYER,
+  GI_MIRROR_LAYER,
+  GI_SHARP_LAYER,
   EDITOR_LAYER,
   UI_LAYER,
   DEBUG_LAYER,
@@ -131,6 +134,14 @@ const WATCH_WINDOW_FRAMES = 4;
  */
 const SETTLE_MS = 400;
 const MAX_DEFER_MS = 3000;
+
+/**
+ * GI's PRIVATE tag bits — written by `GISystem#collectMeshes` to route GI's own
+ * passes, and invisible to any depth render. See `depthKeyOf`'s banner for why
+ * they are masked out of the caster identity.
+ */
+const GI_TAG_BITS =
+  ((1 << GI_MIRROR_LAYER) | (1 << GI_SHARP_LAYER) | (1 << GI_DYNAMIC_LAYER)) >>> 0;
 
 /** Layers whose meshes are never real casters for this purpose. */
 const SKIP_LAYERS =
@@ -212,7 +223,43 @@ function depthKeyOf(mesh, material, casts) {
     needsUv ? (hasUv ? "uv" : "NOUV") : "-",
     // The proxy inherits this, and a caster on a filtered layer must not be
     // folded in with one on layer 0.
-    (mesh.layers.mask >>> 0) & ~(1 << SHADOW_PROXY_LAYER),
+    //
+    // ⛔⛔ §19 STAGE 0.3 — GI'S OWN TAG BITS ARE MASKED OUT, AND THAT IS A
+    // TERMINATION ARGUMENT, NOT A TIDY-UP. GI re-tags the scene from
+    // `GISystem#collectMeshes` every time it learns something about a material
+    // (a roughness floor landing off an async GPU readback, a bucket flip, a
+    // skinned mesh appearing). Those bits sat inside this mask, so each of
+    // those discoveries changed a caster's depth key, which invalidated this
+    // system, which DESTROYED AND REBUILT every proxy — new meshes, which GI
+    // then re-tags, which is where the user's `mergedRebuilds 29,
+    // mergedRebuiltBy "gi-layer-tags"` came from (one rebuild per drain cycle,
+    // forever, each one also re-minting the GI field and un-freezing every
+    // shadow map).
+    //
+    // The bits are provably irrelevant HERE: a depth pass reads position,
+    // alpha and displacement (see the header), and this key's job is to decide
+    // which casters may share ONE baked buffer. `GI_MIRROR_LAYER` says a
+    // material reads a reflection and `GI_DYNAMIC_LAYER` says a surface
+    // deforms — neither changes one vertex of a depth proxy, and a deforming
+    // mesh is refused by `#collectCasters` before it ever reaches this key.
+    // Anything GI wants to say about a proxy's CONTENTS has to come through a
+    // channel of its own, not through a mask this system reads for a different
+    // question.
+    (mesh.layers.mask >>> 0) & ~GI_TAG_BITS & ~(1 << SHADOW_PROXY_LAYER),
+    // ⚠ THE ONE GI BIT THAT STILL BUCKETS — AND STILL NEVER INVALIDATES.
+    //
+    // GI's g-buffer prepass draws this proxy set and parks a whole group when
+    // ANY member is `GI_SHARP_LAYER` (it needs those meshes to write their own
+    // depth exactly — see giScreen.js `renderGiGBuffer`). Keeping the bit as a
+    // grouping input means a rebuild that happens for some OTHER reason puts
+    // the sharp meshes in their own proxy, so parking costs only them
+    // (measured 2026-08-25: 8 of 63 groups parked, dragging 197 of 550 merged
+    // meshes back into per-mesh draws).
+    //
+    // It is a HINT, never a trigger: nothing in this file compares keys after a
+    // build, so a bit that flips later simply waits for the next natural
+    // rebuild. Re-introducing an invalidation on it re-opens the loop above.
+    (mesh.layers.mask >>> 0) & (1 << GI_SHARP_LAYER) ? "sharp" : "-",
   ].join("|");
 }
 

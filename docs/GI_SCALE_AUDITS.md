@@ -238,3 +238,54 @@ the mask pass reports a non-zero mirror-pixel count (the emitter chain's shape a
 :4231). Not created below `high` (`#bvhReflectionsEnabled` :7549-7580).
 Target: 182 -> ~75 kB, 331 -> ~120 ifs, 12 -> 3 descent sites. Only
 `probe:wgsl-compile` RATIOS count (the same kernel measured 47-238 s across runs).
+
+---
+
+## H. STAGE 0.4 EXECUTION SPEC — mobile/Safari safety (written 08-27 01:10)
+
+1. **IBL blackout only after the transport is proven alive.** `GISystem.js`
+   ~:2013 `const giLive = … && this._fieldReadyOnce === true` → add
+   `&& this._transportAlive === true`. Set `_transportAlive` from the EXISTING
+   post-wave readback at ~:4637 (`src.readStats(renderer)`, srcSystem.js:1970 —
+   counters for rays/deposits) or srcTiles `readStats` (:629, `lit` texels):
+   alive = rays > 0 && (deposits > 0 || tiles.lit > 0). Reset on every rebuild.
+   If not alive 10 s after the wave → `console.error("[gi] transport never
+   produced light — IBL left on; GI is effectively off on this device")` and
+   publish `profile.frameStats.giTransport = "dead"`. This alone turns
+   "everything disappears" into "no GI" on any failing device.
+2. **`device.lost` → drop a tier, never rebuild the same size.** Engine.js:593
+   emits `renderer-rebuilt` → GISystem:1188 `requestRebuild`. Count losses per
+   session; on a loss while GI was built, set `globalThis.__giDeviceTier` to
+   the next lower tier than the RESOLVED one (giConfig `giDeviceTierCeiling`
+   reads it), log `[gi] device lost with GI at <tier> — rebuilding at <tier-1>`;
+   at `low` already → do not rebuild GI (leave IBL) and console.error.
+3. **Tier byte budget before allocation.** Interim budgets for the CURRENT
+   architecture (GI2 replaces them): low 192 MB, medium 384, high 768, ultra
+   1536 (GPU bytes of bits + SRC store + screen targets). Compute with 0.2's
+   `bitsBytesFor` + the srcDeposit size arithmetic (:520-543) + target sizes
+   BEFORE `makeField`/`createSrcBinStore`; if over → walk the SAME ladder the
+   device-limit code walks (drop UV region → static BVH → exact tris → dyn
+   pool → halve BIN_BUDGET → halve resolve) until it fits, logging each rung.
+   The prefs hint (GISystem ~:11751 "re-seats a scene at its previously
+   measured demand") is clamped by the same budget. srcDeposit's `throw` at
+   :530 becomes unreachable (the budget ran first) but stays as the assert.
+4. **Envelope census = uniform buffers + storage textures too.**
+   `#auditPortableBindings` (:3854) counts only `var<storage`; add
+   `var<uniform` (baseline 12) and `texture_storage_` (baseline 4). Compare
+   against BOTH the baseline (warn) and `device.limits` (error + name the
+   kernel + mark `_transportAlive=false` candidates). Keep it logging-only on
+   desktop; the IBL gate (1) is what protects the image.
+5. **`unrestricted_pointer_parameters`.** At GI init:
+   `navigator.gpu?.wgslLanguageFeatures?.has("unrestricted_pointer_parameters")`;
+   if false → console.error naming the six raw-WGSL kernels (dynamicObjects.js
+   `ptr<storage…>` params ×4, bvhScene.js:215, and any left in bvh/) and
+   force `dynamicObjects` + the static BVH8 OFF for the session (they would
+   fail to compile and dead-end the chain). Verify by grepping `ptr<storage`
+   across src/modules/gi after 0.1.
+6. **`probe:gi-portable` under WebKit** is Stage 4.2; for now add the uniform
+   + storage-texture census to its report (scripts/run-gi-portable-envelope.mjs).
+
+Gate: `npm run probe:gi-portable` portable arm → 0 kernels over any counted
+limit; a forced `__giDeviceTier="low"` boot on Bistro must either fit the
+192 MB budget via the ladder or refuse GI with IBL intact (never a black
+scene); `test:gi-occupancy`, `smoke:gi-gpu` green.

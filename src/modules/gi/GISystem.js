@@ -61,6 +61,17 @@ import {
   slotKeyOf,
 } from "./slotRegistry.js";
 const FINGERPRINT_INTERVAL_FRAMES = 5;
+/**
+ * §19 STAGE 0.3 — how long a WANTED resolve size must hold still before the
+ * screen chain is re-minted at it. See `#syncScreenResolveSize`.
+ *
+ * 250 ms is the same order as `shadowMerge`'s 400 ms settle and for the same
+ * reason: a rebuild whose cost is measured in driver compiles must never be
+ * driven at the rate of the signal that asks for it. Long enough to swallow a
+ * governor overshoot-and-recover and a window drag; short enough that a real
+ * resize lands within one blink.
+ */
+const RESOLVE_RESIZE_SETTLE_MS = 250;
 // Reflection-probe recapture cadence (§14 R-B): a clean probe re-traces every
 // N frames round-robin — this both tracks lighting changes AND walks the
 // jitter/EMA supersampling rounds (a probe needs ~8 rounds to converge past
@@ -2064,8 +2075,27 @@ export class GISystem {
     // queued rebuild would swap state under the running wave and stack a
     // second wave on top (the repeated viewport-freeze episodes report).
     // _rebuildQueued persists — the rebuild runs when the wave ends.
+    //
+    // ⭐⭐ §19 STAGE 0.3 — `renderSuspended` WAS NOT THE WAVE GATE, AND THE
+    // COMMENT ABOVE HAS BEEN WRONG SINCE §16 B2.
+    //
+    // The rule it describes was implemented as `if (renderSuspended) return`,
+    // and B2 (2026-08-24) deliberately STOPPED suspending the render for the
+    // common case: `backgroundCompile` is true whenever the new light has not
+    // been parented yet — i.e. every first build — and it sets
+    // `renderSuspended = false` so the editor keeps drawing through the wave.
+    // From that day the gate was open for the exact case it was written for: a
+    // rebuild asked mid-wave RAN mid-wave, swapped `this.state` under the
+    // compiling pass set, and called #compileWave again. That is the user's
+    // console with "323 pipelines" and "256 pipelines" compiling CONCURRENTLY
+    // (155 s and 168 s, overlapping), on a scene whose whole complaint is a
+    // two-minute init.
+    //
+    // Gate on the wave itself. `_rebuildQueued` is a latch, so the ask is not
+    // lost — it is taken the first tick after the wave's `finally` clears the
+    // flag, which is what "coalesce to after the wave" means.
     if (this.engine.renderSuspended) return;
-    if (this._rebuildQueued && this.#readyToRebuild()) {
+    if (this._rebuildQueued && !this._compileWaveActive && this.#readyToRebuild()) {
       this._rebuildQueued = false;
       this.#rebuild();
     }
@@ -2141,7 +2171,28 @@ export class GISystem {
       // work; this only decides how often we ask.
       const now = (globalThis.performance ?? Date).now();
       const due = now - (this._floorDrainAt ?? 0) >= 120;
-      if (due && this._mirrorBucketMaterials?.size > 0) {
+      // ── §19 STAGE 0.3 — A DRAIN THAT CAN STOP ────────────────────────────
+      //
+      // "Perpetual by design" was written when the drain was the only thing
+      // that could ever heal a late texture, and it cost two map reads per
+      // tick. It does not: a cycle is a full walk of every classified material
+      // (106 on Bistro), each walk calls #refreshMirrorBucket → the bucket
+      // derivation → #maybeResolveRoughnessFloor, and the cycle END re-walks
+      // the WHOLE SCENE whenever anything flipped. The user's console showed
+      // `drain cycle N — 106 materials, no flips` every ~3 s for the life of
+      // the session, with `pendingMaterials` frozen: a scan that had nothing
+      // left to learn, re-run forever.
+      //
+      // It now parks when a cycle completes with NO flips and NO material
+      // whose floor can still arrive (see #floorState — a material with no
+      // readable roughness source is `unknown`, which is a settled answer, not
+      // a pending one). It re-arms on the only three events that can change
+      // the answer: a new material entering the classified set, a readback
+      // landing, and a rebuild.
+      if (this._floorDrainSettled && this._mirrorBucketMaterials?.size !== this._floorDrainSettledSize) {
+        this._floorDrainSettled = false;
+      }
+      if (due && !this._floorDrainSettled && this._mirrorBucketMaterials?.size > 0) {
         this._floorDrainAt = now;
         const queue = (this._floorDrainQueue ??= []);
         if (queue.length === 0) queue.push(...this._mirrorBucketMaterials);
@@ -2173,6 +2224,15 @@ export class GISystem {
           // walk-blind (src null — a graph shape giRoughnessSourceOf does
           // not recognise = a further reclassification lever), stat still
           // pending, or a genuinely low floor (correct conservatism).
+          // How many materials can STILL change their mind — the drain's own
+          // termination condition, counted over the same set it walks.
+          let stillPending = 0;
+          let unknown = 0;
+          for (const m of this._mirrorBucketMaterials) {
+            const s = this.#floorState(m);
+            if (s === "pending") stillPending++;
+            else if (s === "unknown") unknown++;
+          }
           if ((this._floorDrainCycles = (this._floorDrainCycles ?? 0) + 1) <= 4) {
             let srcNull = 0, statPending = 0, floorLow = 0;
             for (const m of this._mirrorBucketMaterials) {
@@ -2191,9 +2251,27 @@ export class GISystem {
                 ` (bucket-3: ${srcNull} walk-blind, ${statPending} stat-pending, ${floorLow} floor-low)`,
             );
           }
-          if (this._floorDrainFlipped) {
+          const flipped = this._floorDrainFlipped;
+          if (flipped) {
             this._floorDrainFlipped = false;
             this.#collectMeshes();
+          }
+          // ⭐ §19 STAGE 0.3: PARK. A cycle that flipped nothing and has no
+          // outstanding readback has answered every question this walk can
+          // ask; walking again cannot produce a different result until one of
+          // the re-arm events above fires.
+          if (!flipped && stillPending === 0) {
+            this._floorDrainSettled = true;
+            this._floorDrainSettledSize = this._mirrorBucketMaterials.size;
+            if (!this._floorDrainSettleLogged) {
+              this._floorDrainSettleLogged = true;
+              console.log(
+                `[gi] §19 0.3: roughness-floor drain SETTLED after ${this._floorDrainCycles} cycles — ` +
+                  `${this._mirrorBucketMaterials.size} materials, 0 pending, ${unknown} unresolvable ` +
+                  "(no readable roughness source; tiered MEDIUM and never asked again). " +
+                  "Re-arms on a new material, a landing readback or a rebuild.",
+              );
+            }
           }
         }
       }
@@ -2705,7 +2783,13 @@ export class GISystem {
     // before any compute is dispatched. It is a nested render (one override
     // material, editor layers excluded) that restores renderer state.
     if (state.screen) {
-      this.#syncScreenResolveSize(state);
+      // ⛔ §19 STAGE 0.3: NEVER MID-WAVE. A resize re-mints ~25 compute passes
+      // and sync-compiles the resolve — inside a running compile wave that is
+      // a second wave, stacked on the first, against bindings the first is
+      // still walking. It is not lost: the size test below is a pure compare
+      // of the wanted size against the built one, so the next tick after the
+      // wave asks the same question and gets the same answer.
+      if (!this._compileWaveActive) this.#syncScreenResolveSize(state);
       // UNCONDITIONAL where it used to be gated on the cascade radiance bundle
       // existing: the resolve's back-face flip, its view bias and the emitter
       // shadow pass all read this, and none of them is about reflections
@@ -3894,6 +3978,22 @@ export class GISystem {
     // Exists to answer "is the wave's compile-target/light-clone machinery
     // what poisons the sun's shadow evaluation on fresh boots" with one boot.
     if (globalThis.__giNoCompileWave === true) return;
+    // ⛔⛔ §19 STAGE 0.3 — ONE WAVE AT A TIME, AND THE SECOND ONE WAITS.
+    //
+    // Two waves overlapping is not "twice the work": they compile against
+    // DIFFERENT `this.state` snapshots (the second one's rebuild replaced it),
+    // each pins renderer internals across its awaits (`pipelines.getForRender`,
+    // `scheduler.yield`, the postprocess MRT), and the first one's `finally`
+    // restores those from under the second. The user's Bistro console showed
+    // 323 pipelines / 155 s and 256 / 168 s running at the same time.
+    //
+    // Coalesce to ONE pending flag rather than queueing: a wave prewarms
+    // whatever `this.state` holds when it starts, so N asks during a wave all
+    // want the same thing — the state as of the wave's end.
+    if (this._compileWaveActive) {
+      this._compileWavePending = true;
+      return;
+    }
     const engine = this.engine;
     const renderer = engine.renderer;
     if (!renderer?.compileAsync || !engine.camera || !engine.scene) return;
@@ -4531,6 +4631,18 @@ export class GISystem {
       this._compileWaveActive = false;
       if (originalYield) scheduler.yield = originalYield;
       if (originalGetForRender) pipelines.getForRender = originalGetForRender;
+      // §19 STAGE 0.3: the coalesced ask. Anything that wanted a wave while
+      // this one ran gets exactly ONE, now, against the settled state — and it
+      // runs from a fresh task so the re-entry cannot unwind through this
+      // `finally` (which still has restores to do below).
+      if (this._compileWavePending && this._compileToken === token) {
+        this._compileWavePending = false;
+        queueMicrotask(() => {
+          if (this._compileToken !== token || this._compileWaveActive) return;
+          console.log("[gi] §19 0.3: compile wave coalesced — running the ask that arrived mid-wave");
+          this.#compileWave();
+        });
+      }
       if (this._compileToken === token) {
         // Moving the already-compiled light from the temporary scene to the
         // live scene is the commit point. The next render observes the new
@@ -6824,11 +6936,27 @@ export class GISystem {
   }
 
   /**
-   * Keeps the resolve buffers matched to the viewport. A resize swaps the
-   * texture objects behind the PERSISTENT texture nodes (a uniform rebind),
-   * and rebuilds only the resolve compute — whose WGSL is size-independent
-   * (the dimensions are uniforms), so three's node cache and the driver's
-   * pipeline cache both hit and no material is touched.
+   * Keeps the resolve buffers matched to the viewport.
+   *
+   * ⛔ THE DOC THAT USED TO SIT HERE WAS FALSE, AND IT IS WHY THIS PATH WAS
+   * TREATED AS CHEAP FOR A YEAR. It claimed "the resolve's WGSL is
+   * size-independent (the dimensions are uniforms), so three's node cache and
+   * the driver's pipeline cache both hit". Half true: `width` IS a uniform in
+   * most kernels (`widthU`), `height` is NOT — it is multiplied and divided as
+   * a JS number, so it lands in the generated WGSL as a literal. Audited
+   * 2026-08-27 across giScreen.js: createGiResolve, createGiBvhHitShade,
+   * createGiGtaoPass, createGiAoFilterPass, createGiLightShadowPass /
+   * Filter / Wide / History, createGiIrradianceTemporalPass,
+   * createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiBvhReflect
+   * and createGiFarFieldAvgPass ALL bake at least the height. A new size is
+   * therefore new source for every pass below, i.e. a full driver compile each
+   * — `bvhHitShade` alone measured 110 s on the user's Bistro.
+   *
+   * Until those are uniformized (§19 stage 0.5), the only honest defence is to
+   * take fewer of these: the 2 px tolerance rejects a size that never changed,
+   * and `RESOLVE_RESIZE_SETTLE_MS` rejects one that will not stay changed.
+   * Material pipelines are still untouched — the texture NODES are persistent
+   * and only re-pointed, which is what keeps a resize off the material wave.
    */
   #syncScreenResolveSize(state) {
     const screen = state.screen;
@@ -6856,8 +6984,45 @@ export class GISystem {
       close(shadowW, screen.shadowWidth) &&
       close(shadowH, screen.shadowHeight)
     ) {
+      // §19 STAGE 0.3: the wanted size came BACK to the built one while the
+      // settle below was still counting — drop the pending want so the round
+      // trip costs nothing. This is the whole of a governor overshoot-and-
+      // recover, and of a window drag that ends where it started.
+      this._resolveWant = null;
       return;
     }
+    // ⭐⭐ §19 STAGE 0.3 — SETTLE BEFORE RE-MINTING, BECAUSE A RESIZE IS A
+    // COMPILE WAVE WEARING A DIFFERENT NAME.
+    //
+    // Everything below re-creates ~25 compute passes, and the screen kernels
+    // bake `height` and its derived ratios into their WGSL TEXT
+    // (giScreen.js: `.div(height)`, `height - 1`, `aoHeight / height` in
+    // createGiResolve, createGiBvhHitShade, createGiGtaoPass and nine more) —
+    // so a new size is genuinely new source for every one of them, i.e. a
+    // driver compile each. On the user's Bistro that is what eight
+    // `resolve-resize (giCostScale …)` entries in three minutes cost, next to
+    // 82 orphaned compute nodes per resize.
+    //
+    // The 2 px tolerance above rejects a size that never really changed. This
+    // rejects a size that will not STAY changed: a governor hunting for a rung,
+    // a window drag mid-drag, a DRS step and its correction. The size has to be
+    // the same wanted size for `RESOLVE_RESIZE_SETTLE_MS` before a single
+    // pipeline is minted. Cost of waiting: GI keeps tracing at the previous
+    // pixel count for a quarter second, which is exactly the thing the governor
+    // was already 20 frames late to notice.
+    //
+    // ⚠ NOT A `MAX_DEFER` — unlike shadowMerge's settle there is no starvation
+    // case here: the wanted size is recomputed from scratch every tick, so a
+    // size that persists is taken on the very next tick past the window.
+    const nowMs = performance.now();
+    const want = `${width}x${height}|${shadowW}x${shadowH}`;
+    if (this._resolveWant !== want) {
+      this._resolveWant = want;
+      this._resolveWantAt = nowMs;
+      return;
+    }
+    if (nowMs - (this._resolveWantAt ?? nowMs) < RESOLVE_RESIZE_SETTLE_MS) return;
+    this._resolveWant = null;
     // A RESIZE IS SUPPOSED TO BE RARE. It recreates every GI target, retires
     // the old ones 3 frames later, and REBUILDS + sync-compiles the resolve
     // pipeline. If this fires repeatedly on a static viewport (a size that
@@ -8475,8 +8640,23 @@ export class GISystem {
     const src = giRoughnessSourceOf(material);
     const tex = src?.tex;
     if (!tex || giRoughnessFloorStats.has(tex)) return;
+    const tries = (this._roughnessStatTries ??= new WeakMap());
     // A texture with no content yet resolves to black — wait for real data.
-    if (!tex.image && !tex.source?.data) return;
+    //
+    // ⭐ §19 STAGE 0.3 — BUT NOT FOREVER, AND THIS EARLY RETURN WAS THE LEAK.
+    // It sat BEFORE the try counter, so a texture that never grows an `image`
+    // (a source that failed to decode, a proxy the loader abandoned) was
+    // re-polled on every drain cycle for the life of the session and its
+    // material stayed `pending` in every census — the user's `pendingMaterials`
+    // frozen at 39 with the drain still cycling. Give the wait its own bounded
+    // budget and then PIN the conservative answer, exactly as the failed-
+    // readback branch below does.
+    if (!tex.image && !tex.source?.data) {
+      const waited = (tries.get(tex) ?? 0) + 1;
+      tries.set(tex, waited);
+      if (waited >= 16) this.#pinUnknownFloor(tex, "no texture data");
+      return;
+    }
     const inFlight = (this._roughnessStatInFlight ??= new Set());
     // 2 → 6 (2026-08-25). Each of these is a 32x32 readback — ~4 kB — and the
     // ladder cannot tier a single material until its map's floor lands, so a
@@ -8484,7 +8664,6 @@ export class GISystem {
     // (Bistro: 128 pending). Still bounded: this is the real limiter on GPU
     // stalls, the drain cadence above only decides how often we ask.
     if (inFlight.size >= 6 || inFlight.has(tex)) return;
-    const tries = (this._roughnessStatTries ??= new WeakMap());
     const tried = (tries.get(tex) ?? 0) + 1;
     tries.set(tex, tried);
     inFlight.add(tex);
@@ -8493,7 +8672,7 @@ export class GISystem {
         if (!px?.length) {
           // Transient (mid-upload) — retried on later scans; after enough
           // failures pin the conservative answer so the scan stops asking.
-          if (tried >= 8) giRoughnessFloorStats.set(tex, { r: 0, g: 0, b: 0, min: 0 });
+          if (tried >= 8) this.#pinUnknownFloor(tex, "readback returned nothing");
           return;
         }
         // PER-CHANNEL p5 floors, not one min-RGB floor (§16 R4 fix,
@@ -8526,6 +8705,9 @@ export class GISystem {
           r: p5Of(ch[0]), g: p5Of(ch[1]), b: p5Of(ch[2]), min: p5Of(mins),
         };
         giRoughnessFloorStats.set(tex, stats);
+        // §19 STAGE 0.3: a landing stat is one of the three events that can
+        // change a parked drain's answer — re-arm it (see #tick's drain).
+        this._floorDrainSettled = false;
         // Capped value receipt: without the numbers, "floors resolved but
         // nothing reclassified" is indistinguishable from "the readback
         // returned zeros and cached them forever" (the has(tex) guard makes
@@ -8549,6 +8731,74 @@ export class GISystem {
       })
       .catch(() => {})
       .finally(() => inFlight.delete(tex));
+  }
+
+  /**
+   * ⭐⭐ §19 STAGE 0.3 — "I CANNOT KNOW" IS A RESOLVED ANSWER, AND IT HAS TO BE
+   * WRITTEN DOWN.
+   *
+   * A texture whose floor can never be read (no decoded data, a readback that
+   * keeps coming back empty) used to leave its material `resolved: false`
+   * forever: the census counted it as PENDING, the drain kept re-asking, and
+   * every "wait for the floors to land" gate waited on something that was
+   * never going to land. Pin the stat instead — the WeakMap entry IS the
+   * record — so the material tiers, the drain can park, and `pendingMaterials`
+   * means what it says.
+   *
+   * ⚠ THE PINNED VALUE IS THE *PENDING DEFAULT*, NOT ZERO. The old
+   * failed-readback pin wrote `min: 0`, which tiers SHARP — the FINEST trace
+   * stride and a `GI_SHARP_LAYER` tag — so a texture that failed to read was
+   * promoted to the most expensive rung in the ladder. 0.3 lands in the middle
+   * of MEDIUM, which is exactly what `giReflectTierInfoOf` returns while a
+   * floor is in flight: an unreadable map now costs what an unread one already
+   * cost, and nothing else changes. Bucket classification is unaffected either
+   * way (the floor path only demotes above 0.45, and it is opt-in).
+   */
+  #pinUnknownFloor(tex, why) {
+    if (!tex || giRoughnessFloorStats.has(tex)) return;
+    const UNKNOWN_FLOOR = 0.3;
+    giRoughnessFloorStats.set(tex, {
+      r: UNKNOWN_FLOOR, g: UNKNOWN_FLOOR, b: UNKNOWN_FLOOR, min: UNKNOWN_FLOOR,
+      unknown: true,
+    });
+    this._floorDrainSettled = false;
+    if ((this._floorPinLogs = (this._floorPinLogs ?? 0) + 1) <= 4) {
+      console.log(
+        `[gi] §19 0.3: roughness floor UNRESOLVABLE for "${tex.name || tex.uuid?.slice(0, 8) || "tex"}" ` +
+          `(${why}) — pinned at the MEDIUM default so the ladder stops asking` +
+          (this._floorPinLogs === 4 ? " (further pins logged silently)" : ""),
+      );
+    }
+  }
+
+  /**
+   * Where a material sits between "the ladder knows" and "the ladder is still
+   * waiting" — the drain's termination condition and the census' honesty.
+   *
+   *   `resolved` — a tier has been derived from a real number.
+   *   `pending`  — a readback is outstanding; asking again can still help.
+   *   `unknown`  — nothing async can change this answer (no readable roughness
+   *                source at all, or a stat that landed unreadable). It tiers
+   *                MEDIUM and must never be counted as pending again.
+   *
+   * `unknown` exists because `giReflectTierInfoOf` reports exactly one bit
+   * (`resolved`) and returns FALSE for both of the last two — which is how
+   * `pendingMaterials` froze at 39 on a scene where every readback that could
+   * ever land already had.
+   *
+   * @param {any} material
+   * @returns {"resolved"|"pending"|"unknown"}
+   */
+  #floorState(material) {
+    if (!material) return "unknown";
+    if (giReflectTierInfoOf(material).resolved) return "resolved";
+    const src = giRoughnessSourceOf(material);
+    // No texture to read and no readable constant: only a material EDIT can
+    // move this, and an edit re-arms the drain through its own scan.
+    if (!src?.tex) return "unknown";
+    // A stat that landed but still leaves the tier unresolved is unreadable
+    // (a non-numeric channel) — settled, not pending.
+    return giRoughnessFloorStats.has(src.tex) ? "unknown" : "pending";
   }
 
   #refreshMirrorBucket(material) {
@@ -10090,7 +10340,7 @@ export class GISystem {
     // "mid-roughness" and "not known yet" stop sharing a column.
     const census = this.reflectTierCensus();
     if (census) {
-      const { materials: cm, triangles: ct, pendingMaterials } = census;
+      const { materials: cm, triangles: ct, pendingMaterials, unknownMaterials } = census;
       const total = cm.sharp + cm.medium + cm.coarse;
       const share = census.coarseTriangleShare;
       console.log(
@@ -10100,7 +10350,12 @@ export class GISystem {
           (pendingMaterials > 0
             ? `. ⚠ ${pendingMaterials} floors have NOT resolved yet and are counted as medium;` +
               ` they re-tier when the async GPU stat lands on the #refreshMirrorBucket drain.`
-            : "."),
+            : ".") +
+          // §19 0.3: named separately, because this share never moves and a
+          // reader who cannot see it reads a stalled drain into the number.
+          (unknownMaterials > 0
+            ? ` ${unknownMaterials} have no readable roughness source at all — MEDIUM is their final answer.`
+            : ""),
       );
     }
   }
@@ -11316,6 +11571,12 @@ export class GISystem {
     // §16 R4b: strong refs — release the old build's materials (a scene
     // switch must not retain them); the next build's scan repopulates.
     this._mirrorBucketMaterials?.clear();
+    // §19 STAGE 0.3: the third re-arm event. Explicit rather than relying on
+    // the size compare — a new scene that happens to classify the SAME number
+    // of materials would otherwise inherit the old build's "settled".
+    this._floorDrainSettled = false;
+    this._floorDrainSettledSize = -1;
+    this._floorDrainQueue = [];
     this._floorDrainQueue = [];
     // GI-traced shadows die WITH the system, and this cannot wait for the next
     // light sync: that sync runs off `this.state`, which is now null, so a
@@ -13097,39 +13358,36 @@ export class GISystem {
         // wrong image. ⚠ Masked mode itself is still NOT default — see
         // #bvhMaskEnabled for the open visual bug and the rig that shows it.
         if (!editorOnly) {
-          // ⭐ §18 W2 — `mesh.layers.mask` IS PART OF `shadowMerge`'s DEPTH KEY,
-          // so the tags written just below silently invalidate its buckets.
-          // The roughness FLOOR that decides `sharpReflection` resolves from an
-          // async GPU readback that lands long after the merge was built, so
-          // the flip always arrives late: a group built while a member was
-          // still "coarse" gains a SHARP member afterwards, and
-          // `renderGiGBuffer` then parks that whole group for the rest of the
-          // session (all-or-nothing per group — see its own banner). MEASURED
-          // on Bistro: 8 of 63 groups parked, covering 197 of the 550 merged
-          // meshes, i.e. ~197 draws the prepass paid one at a time for a tag
-          // change nobody told the merge about. Recording the flip and
-          // invalidating lets the next rebuild put the sharp meshes in their
-          // OWN bucket, where parking them costs only themselves.
-          // ⛔⛔ A FIRST TAGGING IS NOT A FLIP, AND TREATING IT AS ONE IS AN
-          // INFINITE REBUILD LOOP.
+          // ⛔⛔ §19 STAGE 0.3 — THESE TAGS NO LONGER INVALIDATE `shadowMerge`,
+          // AND THAT IS THE FIX FOR THE LOOP §18 W2 CREATED.
           //
-          // The invalidation below exists to tell `shadowMerge` that a member's
-          // depth key changed. But shadowMerge's rebuild DESTROYS ITS PROXIES
-          // AND BUILDS NEW MESHES, and GI tags those fresh objects on its very
-          // next scan — where `maskBefore` is necessarily the untagged default,
-          // so every one of them reads as a change, which invalidates
-          // shadowMerge again, which builds new proxies again. Each turn of that
-          // cycle also re-mints the GI field (`[gi] src ... slot NEE replaced`)
-          // and tears down/rebuilds the 576 shadow proxies mid-frame.
+          // W2's reasoning was sound and its mechanism was not: `layers.mask`
+          // was part of shadowMerge's depth key, a late-resolving roughness
+          // floor flips `sharpReflection`, and a mixed group is parked whole by
+          // `renderGiGBuffer` — so W2 told the merge to rebuild. But a merge
+          // rebuild is not free and not local: it destroys 576 proxies, re-bakes
+          // every merged vertex, un-freezes every shadow map, and (through the
+          // structural signature) re-mints the GI field. One per drain cycle
+          // ≈ every 6 s, forever — the user's `shadows.mergedRebuilds 29,
+          // mergedRebuiltBy: "gi-layer-tags"` in a 3-minute window, next to two
+          // concurrent compile waves.
           //
-          // Reported by the user as "gi keeps reloading forever" AND "shadows
-          // are broken after each reload" — one bug wearing two faces, because
-          // the shadow map keeps being rendered against a half-swapped scene.
+          // The tags are GI-PRIVATE, so the right place to break the cycle is
+          // the KEY, not the notification: `shadowMerge.depthKeyOf` now masks
+          // GI_MIRROR/GI_DYNAMIC out entirely and treats GI_SHARP as a passive
+          // BUCKETING hint that never triggers anything. A tag written here can
+          // therefore no longer reach the merge at all, and the W2 win survives
+          // on any rebuild that happens for a real reason.
           //
-          // Tracking which meshes have been tagged before makes the signal mean
-          // what it always claimed to: a tag that CHANGED, not a tag that was
-          // written for the first time. A brand-new proxy is never in the set,
-          // so it can never ask for the rebuild that created it.
+          // The counter below is kept as the receipt (`profile.frameStats`
+          // reads `giTagFlips`): "tags are still churning" and "the merge is
+          // being rebuilt" are now separate facts, and the first one is the
+          // honest measure of how settled the ladder is.
+          //
+          // ⛔ A FIRST TAGGING IS NOT A FLIP. The `_giTaggedMeshes` set stays:
+          // it is what stops a freshly-created object from reading as a change
+          // on its first scan, and the same trap is one `invalidate()` call away
+          // for anything that ever consumes this signal again.
           this._giTaggedMeshes ??= new WeakSet();
           const taggedBefore = this._giTaggedMeshes.has(object);
           if (!taggedBefore) this._giTaggedMeshes.add(object);
@@ -13175,10 +13433,11 @@ export class GISystem {
     this._bucketTally = tally;
     this._tierTally = tierTally;
     this._dynamicSurfaces = dynamicSurfaces;
-    // §18 W2. Debounced on the other side (SETTLE_MS/MAX_DEFER_MS), so a scan
-    // that flips a handful of tags per pass while the roughness readbacks drain
-    // coalesces into one rebuild rather than one per tag.
-    if (depthKeyTagsChanged) this.engine?.shadowMerge?.invalidate?.("gi-layer-tags");
+    // §19 STAGE 0.3: a RECEIPT, not a trigger. See the tag write site above —
+    // nothing outside GI reacts to these bits any more, so this number is free
+    // to keep climbing while the merge stays put, which is exactly the pair of
+    // facts the loop made impossible to separate.
+    if (depthKeyTagsChanged) this.giTagFlips = (this.giTagFlips ?? 0) + 1;
     return meshes;
   }
 
@@ -13217,6 +13476,10 @@ export class GISystem {
     const triangles = zero();
     let pendingMaterials = 0;
     let pendingMeshes = 0;
+    // §19 STAGE 0.3: materials whose floor can NEVER resolve, split out of
+    // `pendingMaterials` so "ask again later" stops covering "there is nothing
+    // left to ask". See #floorState.
+    let unknownMaterials = 0;
     const seen = new Set();
     scene.traverse((object) => {
       if (!object.isMesh && !object.isInstancedMesh) return;
@@ -13232,11 +13495,17 @@ export class GISystem {
         const bucket = giRoughnessBucketOf(m);
         if (bucket !== 0 && bucket !== 3) continue;
         const info = giReflectTierInfoOf(m);
-        if (!info.resolved) pending = true;
+        // §19 STAGE 0.3: `resolved === false` covers two different states —
+        // "a readback is in flight" and "no readback will ever come". Only the
+        // first is pending; conflating them is what made this number a
+        // permanent 39 on a fully-drained scene.
+        const state = this.#floorState(m);
+        if (state === "pending") pending = true;
         if (!seen.has(m)) {
           seen.add(m);
           materials[info.tier]++;
-          if (!info.resolved) pendingMaterials++;
+          if (state === "pending") pendingMaterials++;
+          else if (state === "unknown") unknownMaterials++;
         }
         best = best === null ? info.tier : Math.min(best, info.tier);
       }
@@ -13257,6 +13526,11 @@ export class GISystem {
       // How much of the "medium" column is really "ask again later".
       pendingMaterials,
       pendingMeshes,
+      // …and how much of it is "nobody can tell": no readable roughness source
+      // and no readable constant, so MEDIUM is the final answer, not a
+      // placeholder. On a settled scene `pendingMaterials` is 0 and this is
+      // whatever the scene's unrecognised shader graphs add up to.
+      unknownMaterials,
       // The decision number: COARSE means the roughness FLOOR is above 0.45,
       // and `exactWeight = smoothstep(0.45, 0.15, roughness)` is then 0 for
       // EVERY texel of that material — the traced reflection it is paying for
@@ -13351,8 +13625,12 @@ export class GISystem {
     if (this._reflectionConsumerAppeared) {
       this._reflectionConsumerAppeared = false;
       console.log("[gi] a material became reflective — rebuilding to bring exact reflections online");
-      this.noteRebuildAsk("reflective-material-appeared");
-      this.#rebuild();
+      // §19 STAGE 0.3: QUEUED, not immediate. This runs from the tick's
+      // fingerprint cadence, which is NOT behind the compile-wave gate — a
+      // direct #rebuild() here swapped `this.state` under a running wave and
+      // started a second one (see #compileWave's banner). `requestRebuild`
+      // latches, and the tick takes it the first frame after the wave ends.
+      this.requestRebuild("reflective-material-appeared");
       return;
     }
 

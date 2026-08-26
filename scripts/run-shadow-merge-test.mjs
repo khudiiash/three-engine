@@ -824,5 +824,27 @@ check("⛔ GI's tag invalidation still ignores a FIRST tagging", () => {
   );
 });
 
+check("⛔⛔ §19 0.3 — A GI LAYER TAG CANNOT REACH THIS SYSTEM AT ALL", () => {
+  // The stronger form of the check above, and the one that actually ends the
+  // loop: the first-tagging guard only narrowed the signal, so every LATER
+  // flip (a roughness floor landing off an async readback, ~one per drain
+  // cycle) still destroyed and re-baked every proxy — `mergedRebuilds 29,
+  // mergedRebuiltBy "gi-layer-tags"` in three minutes on the user's Bistro,
+  // each turn also re-minting the GI field.
+  //
+  // Two halves, and BOTH are load-bearing: GI must not notify, and the key
+  // must not care. Either one alone leaves a live path back to the loop.
+  const gi = readFileSync(new URL("../src/modules/gi/GISystem.js", import.meta.url), "utf8");
+  assert.ok(
+    !/shadowMerge\??\.?\??invalidate\??\.?\(\s*"gi-layer-tags"/.test(gi),
+    "GISystem must not invalidate shadowMerge for its own layer tags",
+  );
+  const merge = readFileSync(new URL("../src/engine/shadowMerge.js", import.meta.url), "utf8");
+  assert.ok(
+    /GI_TAG_BITS/.test(merge) && /& ~GI_TAG_BITS/.test(merge),
+    "depthKeyOf must mask GI's private tag bits out of the caster identity",
+  );
+});
+
 console.log(failures ? `\n${failures} failing` : "\nall ok");
 process.exit(failures ? 1 : 0);
