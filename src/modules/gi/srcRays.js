@@ -147,6 +147,14 @@ export function createSrcRayStore(store, { pixelCount }) {
     rayTotal,
     pixelRayBase,
     rayWork,
+    /**
+     * §19 Stage 0.2 — GPU-only after the first bind; `detachCpuMirror` drops
+     * the JS twin three already copied into the GPU buffer. Nothing here is
+     * ever written CPU-side again (readbacks go through `getArrayBufferAsync`,
+     * which sizes itself from `bufferGPU.size`).
+     */
+    cpuMirrors: [rayCount, rayCursor, rayTotal, pixelRayBase, rayWork]
+      .map((n) => n?.value).filter(Boolean),
     pixelCount,
     bytes: (probeTotal * 2 + 2 + pixelCount * 2) * 4,
     dispose() {

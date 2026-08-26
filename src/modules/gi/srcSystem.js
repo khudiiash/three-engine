@@ -1263,6 +1263,21 @@ export function createSrcProbeSystem({
     store,
     frame,
     gizmos,
+    /**
+     * §19 Stage 0.2 — every SRC storage buffer that is GPU-ONLY once uploaded,
+     * gathered from the stores that own them so no list here can go stale when
+     * a store gains a buffer. GISystem queues these for `detachCpuMirror` and
+     * drains the queue once an SRC frame has dispatched unskipped.
+     */
+    get cpuMirrors() {
+      return [
+        ...(store.cpuMirrors ?? []),
+        ...(frame.cpuMirrors ?? []),
+        ...(rayStore.cpuMirrors ?? []),
+        ...(binStore?.cpuMirrors ?? []),
+        ...(merge?.cpuMirrors ?? []),
+      ];
+    },
     rayStore,
     rayFrame,
     binStore,

@@ -71,6 +71,7 @@ import {
   packSnorm2x16, select, shiftLeft, shiftRight, uint, uintBitsToFloat, uniform, uniformArray,
   unpackSnorm2x16, vec2, vec3, vec4,
 } from "three/tsl";
+import { cpuMirrorBytes, releaseComputeNodes } from "./releaseCompute.js";
 import { sharedFn } from "./giFn.js";
 import { createRayHitDebugBuffer } from "./rayHit/RayHitDebug.js";
 import { octDecodeTSL, octEncodeTSL } from "./rayHit/rayHitTSL.js";
@@ -379,11 +380,33 @@ export function planSurfacePools({
   };
 }
 
-export function createOccupancyField(bounds, res0, options = {}) {
+
+/**
+ * THE `bits` ALLOCATION'S WHOLE LAYOUT, AS ARITHMETIC — no device, no buffers.
+ *
+ * Split out of `createOccupancyField` for §19 Stage 0.2's allocate-once ladder.
+ * GISystem's binding-size degrade ladder used to answer "does this fit the
+ * device limit?" by BUILDING the field and reading
+ * `field.bitsBuffer.value.array.byteLength` — so a scene that had to drop the UV
+ * region, then the static BVH, then the exact-dynamic pool minted **four**
+ * fresh 450 MB `Uint32Array`s (plus four fields' worth of compute nodes) to
+ * publish one. The ladder now walks this NUMBER and calls `createOccupancyField`
+ * exactly once.
+ *
+ * ⚠ ONE DEFINITION, DELIBERATELY. The region bases are a chain of
+ * `alignRegion` sums where every base after `dynamicObjectWordOffset` moves with
+ * the two sizes the ladder is trying — a second copy of that chain in GISystem
+ * would drift the moment a region is added, and it would drift SILENTLY
+ * (an under-estimate allocates a buffer the ladder thought it had rejected).
+ * `createOccupancyField` destructures this; it does not recompute any of it.
+ *
+ * @param {{x:number,y:number,z:number}} res0 level-0 resolution (already quantized)
+ * @param {object} [options] the same options object `createOccupancyField` takes
+ */
+export function planBitsLayout(res0, options = {}) {
   const { levels, totalWords } = planLevels(res0);
   const level0 = levels[0];
   const slotCapacity = Math.max(1, options.slotCapacity ?? 512);
-  const traceSteps = Math.max(16, options.traceSteps ?? DEFAULT_TRACE_STEPS);
   const hybridLayout = planHybridBrickLayout(res0);
   // Phase 2/3 imply the Phase-1 hierarchy: surface records are addressed by a
   // voxel's rank inside its brick mask, so the plane path cannot exist without
@@ -498,40 +521,6 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // a small enclosed grid presented as "the lighting went weird".
   const attributionEnabled = surfaceEnabled && options.enableSurfaceAttribution === true;
   const paletteSlots = attributionEnabled ? slotCapacity : 0;
-  // Phase 5: the conservative pyramid ride (levels 3-4) has been ALWAYS-ON
-  // since Phase 1, so its cost/benefit was never isolable. This is the A/B
-  // kill switch, default on: disabled the traces start at level 2 and the
-  // coarse branch is not emitted at all, so the two arms differ in WGSL, not
-  // just in a runtime predicate.
-  const coarseSkipEnabled = options.rayHitCoarseSkip !== false;
-  // Opt-in so ordinary rendering keeps the exact pre-Phase-0 graph and cost.
-  // When enabled this is the ONE extra storage binding used by all ray-hit
-  // counters; do not split counters into per-cascade/per-kind buffers.
-  const rayHitDebug = options.enableProfiling
-    ? createRayHitDebugBuffer({ countLegacyFallbacks: options.countLegacyFallbacks === true })
-    : null;
-
-  // Origin and level-0 voxel size as uniforms, OWNED HERE rather than borrowed
-  // from the SDF volume's `world` bundle. They describe the same box, but they
-  // must be independently re-derivable from `bounds`: the volume's bundle is
-  // built by createGiField AFTER this field exists, so borrowing it would have
-  // left the pyramid pointing at a uniform nobody updates on a refit — the
-  // whole field silently offset from the geometry it was rasterized from.
-  //
-  // Voxel size is also the unit the DDA works in: rays are reparameterized into
-  // level-0 voxel space, so a level-L voxel is a cube of side 2^L there and NO
-  // per-level world constants are needed.
-  const gridOrigin = uniform(bounds.min.clone());
-  const voxel = uniform(new THREE.Vector3(1, 1, 1));
-  const voxelInv = uniform(new THREE.Vector3(1, 1, 1));
-  const syncVoxel = () => {
-    const size = new THREE.Vector3().subVectors(bounds.max, bounds.min);
-    gridOrigin.value.copy(bounds.min);
-    voxel.value.set(size.x / res0.x, size.y / res0.y, size.z / res0.z);
-    voxelInv.value.set(res0.x / size.x, res0.y / size.y, res0.z / size.z);
-  };
-  syncVoxel();
-
   // ────────────────────────────────────────────────────────────── the bitsets
   const hybridWordOffset = totalWords;
   const surfaceWordOffset = totalWords + (hybridEnabled ? hybridLayout.totalWords : 0);
@@ -610,9 +599,86 @@ export function createOccupancyField(bounds, res0, options = {}) {
   const attrWords = attributionEnabled ? totalSurfaceCapacity : 0;
   const paletteWordOffset = alignRegion(attrWordOffset + attrWords);
   const paletteWords = paletteSlots * SURFACE_PALETTE_WORDS;
-  const bits = instancedArray(new Uint32Array(
-    paletteWordOffset + paletteWords,
-  ), "uint");
+
+  return {
+    levels, totalWords, level0, slotCapacity, hybridLayout,
+    hybridEnabled, surfaceEnabled, complexEnabled, attributionEnabled,
+    level0VoxelCount,
+    surfaceCapacity, complexTriangleCapacity,
+    dynamicSurfaceCapacity, dynamicComplexTriangleCapacity,
+    totalSurfaceCapacity, totalComplexTriangleCapacity,
+    paletteSlots,
+    hybridWordOffset, surfaceWordOffset, trianglePoolWordOffset,
+    densityPlan, densityWordOffset,
+    dynamicObjectWords, dynamicObjectWordOffset,
+    staticBvhWords, staticBvhWordOffset,
+    attrWordOffset, attrWords,
+    paletteWordOffset, paletteWords,
+    /** Length of the `bits` Uint32Array — the ladder's whole question. */
+    totalBitsWords: paletteWordOffset + paletteWords,
+  };
+}
+
+/** Bytes the `bits` buffer would take for these options. See planBitsLayout. */
+export function bitsBytesFor(res0, options) {
+  return planBitsLayout(res0, options).totalBitsWords * 4;
+}
+
+export function createOccupancyField(bounds, res0, options = {}) {
+  // EVERY size, flag and region base comes from the ONE layout planner — see
+  // planBitsLayout for why this is not recomputed here (the ladder walks the
+  // same arithmetic before this function is ever called).
+  const {
+    levels, totalWords, level0, slotCapacity, hybridLayout,
+    hybridEnabled, surfaceEnabled, complexEnabled, attributionEnabled,
+    surfaceCapacity, complexTriangleCapacity,
+    dynamicSurfaceCapacity, dynamicComplexTriangleCapacity,
+    totalSurfaceCapacity, totalComplexTriangleCapacity,
+    paletteSlots,
+    hybridWordOffset, surfaceWordOffset, trianglePoolWordOffset,
+    densityPlan, densityWordOffset,
+    dynamicObjectWords, dynamicObjectWordOffset,
+    staticBvhWords, staticBvhWordOffset,
+    attrWordOffset, attrWords,
+    paletteWordOffset, paletteWords,
+    totalBitsWords,
+  } = planBitsLayout(res0, options);
+  const traceSteps = Math.max(16, options.traceSteps ?? DEFAULT_TRACE_STEPS);
+  // Phase 5: the conservative pyramid ride (levels 3-4) has been ALWAYS-ON
+  // since Phase 1, so its cost/benefit was never isolable. This is the A/B
+  // kill switch, default on: disabled the traces start at level 2 and the
+  // coarse branch is not emitted at all, so the two arms differ in WGSL, not
+  // just in a runtime predicate.
+  const coarseSkipEnabled = options.rayHitCoarseSkip !== false;
+  // Opt-in so ordinary rendering keeps the exact pre-Phase-0 graph and cost.
+  // When enabled this is the ONE extra storage binding used by all ray-hit
+  // counters; do not split counters into per-cascade/per-kind buffers.
+  const rayHitDebug = options.enableProfiling
+    ? createRayHitDebugBuffer({ countLegacyFallbacks: options.countLegacyFallbacks === true })
+    : null;
+
+  // Origin and level-0 voxel size as uniforms, OWNED HERE rather than borrowed
+  // from the SDF volume's `world` bundle. They describe the same box, but they
+  // must be independently re-derivable from `bounds`: the volume's bundle is
+  // built by createGiField AFTER this field exists, so borrowing it would have
+  // left the pyramid pointing at a uniform nobody updates on a refit — the
+  // whole field silently offset from the geometry it was rasterized from.
+  //
+  // Voxel size is also the unit the DDA works in: rays are reparameterized into
+  // level-0 voxel space, so a level-L voxel is a cube of side 2^L there and NO
+  // per-level world constants are needed.
+  const gridOrigin = uniform(bounds.min.clone());
+  const voxel = uniform(new THREE.Vector3(1, 1, 1));
+  const voxelInv = uniform(new THREE.Vector3(1, 1, 1));
+  const syncVoxel = () => {
+    const size = new THREE.Vector3().subVectors(bounds.max, bounds.min);
+    gridOrigin.value.copy(bounds.min);
+    voxel.value.set(size.x / res0.x, size.y / res0.y, size.z / res0.z);
+    voxelInv.value.set(res0.x / size.x, res0.y / size.y, res0.z / size.z);
+  };
+  syncVoxel();
+
+  const bits = instancedArray(new Uint32Array(totalBitsWords), "uint");
   const atomicBits = instancedArray(new Uint32Array(level0.words), "uint").toAtomic();
   // Build-time scratch for the attribution stamp. Separate from `surfScratch`
   // rather than an eleventh word of it: widening the shared stride would cost
@@ -4425,6 +4491,17 @@ export function createOccupancyField(bounds, res0, options = {}) {
   let computes = null;
   let computesRevision = -1;
   let jitterFrame = 0;
+  // The renderer, for the two sweeps that need one (the geometry-revision
+  // re-mint below and `dispose`). Set by GISystem through `options.renderer`;
+  // null degrades every sweep to "leaks as before", never to a crash.
+  let hostRenderer = options.renderer ?? null;
+  // Exactly the nodes `ensureComputes` MINTS — never the ones it reuses. A
+  // re-mint orphans this generation in `renderer._bindings` (with the vertex /
+  // index / pair buffers each bind group holds), and a sweep that took the
+  // whole chain would evict `copyCompute` and the downsample ladder, which the
+  // NEW generation still dispatches: releaseCompute.js' header prices that at a
+  // 16-27 s recompile.
+  let mintedComputes = [];
 
   /**
    * Builds (and caches) the two dispatch chains, both valid until the geometry
@@ -4454,6 +4531,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
    */
   function ensureComputes() {
     if (computesRevision === geometryRevision) return;
+    const staleMinted = mintedComputes;
     const voxStatic = buildVoxelizeCompute("static");
     const voxDynamic = buildVoxelizeCompute("dynamic");
     const surfAccumStatic = surfaceEnabled ? buildSurfAccumCompute() : null;
@@ -4485,12 +4563,15 @@ export function createOccupancyField(bounds, res0, options = {}) {
           ...(complexDynamic ? [complexDynamic] : []),
         ]
       : [];
+    // Named rather than inlined so the re-mint sweep below can evict it with
+    // the rest of this generation.
+    const freshClear = buildClearCompute();
     computes = {
       full: [
         // Fresh clear per geometry change — see buildClearCompute's note:
         // a stale compiled clear executing ahead of skipped fresh
         // voxelize nodes is the spawn-blink's empty-pyramid window.
-        buildClearCompute(),
+        freshClear,
         voxStatic, snapStaticBitsCompute,
         ...surfaceChain,
         voxDynamic, copyCompute, ...downsampleComputes, ...densityComputes,
@@ -4506,6 +4587,15 @@ export function createOccupancyField(bounds, res0, options = {}) {
     };
     computesRevision = geometryRevision;
     staticDirty = true; // fresh kernels → fresh snapshot before any fast replay
+    // ⚠ AFTER the new generation exists, and only the generation being
+    // replaced: the old chain can never be dispatched again (`computes` is the
+    // sole reference and it was just overwritten), so its bind groups — which
+    // are what still hold the PREVIOUS `vertexBuffer`/`indexBuffer`/`pairWork`
+    // allocations, replaced wholesale by the setGeometry that bumped the
+    // revision — are pure retention. Every other node in the chain is shared
+    // with the new generation and is deliberately NOT in this list.
+    mintedComputes = [...pairComputes, freshClear].filter(Boolean);
+    if (staleMinted.length) releaseComputeNodes(hostRenderer, staleMinted);
   }
 
   // ══════════════════════════════════ SURFACE ATTRIBUTION: read side + palette
@@ -4833,6 +4923,24 @@ export function createOccupancyField(bounds, res0, options = {}) {
      * never bind anything new — they read through this same buffer.
      */
     bitsBuffer: bits,
+    /**
+     * §19 Stage 0.2 — every storage buffer of this field that is GPU-ONLY once
+     * uploaded, i.e. safe for `detachCpuMirror`. On Bistro this is the single
+     * biggest CPU retention in the process (`bits` alone is 449 MB, and three
+     * copies it into the GPU buffer exactly once, at first bind).
+     *
+     * ⚠ THE KEEP SET IS THE POINT OF THIS LIST BEING EXPLICIT. `vertexBuffer`,
+     * `indexBuffer` and `pairWork` are written CPU-side by the incremental
+     * spawn path (`addUpdateRange` + `needsUpdate`), and `localToWorld` by
+     * every `setSlotMatrix` — detaching any of them would make those writes
+     * upload zero bytes and vanish silently.
+     */
+    cpuMirrors: [bits, atomicBits, staticBits, attrScratch, surfScratch, surfAlloc]
+      .filter(Boolean)
+      .map((n) => n.value)
+      .filter(Boolean),
+    /** The renderer the two eviction sweeps need (re-mint + dispose). */
+    setRenderer(r) { hostRenderer = r ?? null; },
     dynamicObjectWordOffset,
     dynamicObjectWords,
     staticBvhWordOffset,
@@ -4896,7 +5004,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
       // 321 MB and the map rejects with a RangeError. A diagnostic must never
       // throw out of the tick; callers receive null and say the count was
       // skipped.
-      const bitsBytes = bits.value?.array?.byteLength ?? 0;
+      const bitsBytes = cpuMirrorBytes(bits.value);
       if (bitsBytes > 200 * 1024 * 1024) {
         console.log(
           `[gi] bits readback skipped — ${(bitsBytes / 1048576).toFixed(0)} MB exceeds the mappable staging cap`,
@@ -4960,7 +5068,40 @@ export function createOccupancyField(bounds, res0, options = {}) {
       return reader ? stats : null;
     },
 
-    dispose() {},
+    /**
+     * ⛔ THIS WAS `{}` UNTIL §19 STAGE 0.2, AND THAT EMPTY BODY WAS A LEAK.
+     *
+     * A field owns ~20 compute nodes, and every dispatched one leaves an entry
+     * in `renderer._bindings` / `_pipelines` / `_nodes` whose bind groups hold
+     * strong references to this field's `bits` (449 MB on Bistro), its scratch
+     * pools and its geometry buffers. `GISystem#dispose` swept `state` and this
+     * field is reachable from it, so the miss was partial rather than total —
+     * but a field replaced by the ladder or by a re-mint is not in `state` at
+     * all when it dies, and nothing else ever evicted it.
+     *
+     * Releases only nodes this field minted; idempotent (the arrays are nulled
+     * so a second call sweeps nothing).
+     */
+    dispose() {
+      const nodes = [
+        ...(computes?.full ?? []), ...(computes?.fast ?? []),
+        ...mintedComputes, ...pairComputes,
+        copyCompute, snapStaticBitsCompute, restoreStaticBitsCompute,
+        ...downsampleComputes, ...densityComputes,
+        hybridBuildCompute, surfClearCompute, surfAllocCompute,
+        surfFinalizeCompute, dynSurfClearCompute, dynSurfAllocCompute,
+        dynSurfFinalizeCompute, palettePass,
+      ].filter(Boolean);
+      const released = releaseComputeNodes(hostRenderer, new Set(nodes));
+      computes = null;
+      computesRevision = -1;
+      mintedComputes = [];
+      pairComputes = [];
+      if (globalThis.__giLogComputeRelease === true) {
+        console.log(`[gi] occupancy field dispose: released ${released}/${nodes.length} compute nodes`);
+      }
+      return released;
+    },
   };
 }
 

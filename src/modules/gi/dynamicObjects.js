@@ -118,6 +118,7 @@ import {
   Fn, If, Loop, float, floatBitsToUint, instanceIndex, instancedArray, int,
   select, uint, uintBitsToFloat, uniform, uniformArray, vec2, vec3, vec4, wgslFn,
 } from "three/tsl";
+import { releaseComputeNodes } from "./releaseCompute.js";
 import { sharedFn } from "./giFn.js";
 import { resolveMaterialSurface } from "./voxelizeOnce.js";
 import { octDecodeTSL, octEncodeTSL } from "./rayHit/rayHitTSL.js";
@@ -1408,6 +1409,21 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
   const geoBlocks = new Map();
   let nextWord = HEADER_WORDS;
   const pendingComputes = [];
+  // ── §19 STAGE 0.2: THE STATIC-BVH STAGING DUPLICATE ─────────────────────
+  //
+  // Every one-shot region upload builds a staging `instancedArray` and a
+  // compute that copies it into `bits`. Once the copy has run, both are dead —
+  // but nothing dropped either: the entry left `pendingComputes`, and the
+  // compute node stayed in `renderer._bindings` with its bind group holding the
+  // staging buffer. On Bistro the static BVH's staging alone is 125-160 MB of
+  // GPU *and* CPU, retained for the session (audit §B, dynamicObjects.js
+  // :1874-1880 / :2214).
+  //
+  // ⚠ ONE CONFIRM LATE, DELIBERATELY. `confirmDispatch` runs in the SAME tick
+  // as the `giCompute` that submitted the copy, so evicting the bind group
+  // there would tear down a dispatch that can still be in flight. Everything
+  // in this queue is at least one confirm — i.e. one frame — old.
+  const staleUploads = [];
   // Persistent re-uploadable regions (createRegionUploader) — one pipeline
   // each, offered to the dispatcher only on the frames their bytes changed.
   const regionUploaders = [];
@@ -1871,7 +1887,9 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         bits.element(uint(absWordStart).add(instanceIndex)).assign(staging.element(instanceIndex));
       })().compute(words.length);
       const block = { uploaded: false };
-      pendingComputes.push({ compute: copy, block });
+      // `staging` rides the entry so `confirmDispatch` can drop it explicitly
+      // rather than relying on the entry being the only reference.
+      pendingComputes.push({ compute: copy, block, staging });
       return block;
     },
 
@@ -1990,7 +2008,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
           const copy = Fn(() => {
             bits.element(uint(absStart).add(instanceIndex)).assign(staging.element(instanceIndex));
           })().compute(packed.words.length);
-          pendingComputes.push({ compute: copy, block: geoBlock });
+          pendingComputes.push({ compute: copy, block: geoBlock, staging });
           set.stats.meshUploadsQueued++;
         }
         geoBlock.refs++;
@@ -2197,7 +2215,14 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     },
 
     /** `skipped` = the giSkippedComputes set after this frame's dispatch. */
-    confirmDispatch(skipped) {
+    confirmDispatch(skipped, renderer = null) {
+      // Last confirm's finished uploads: a frame old, so safe to evict. Without
+      // a renderer this degrades to "leaks as before" (the queue is capped by
+      // the same drain, so it cannot grow without bound either).
+      if (staleUploads.length) {
+        if (renderer) releaseComputeNodes(renderer, staleUploads);
+        staleUploads.length = 0;
+      }
       if (headerCompute && headerDirty && !skipped.has(headerCompute)) headerDirty = false;
       for (const r of regionUploaders) {
         if (r.handle.dirty && !skipped.has(r.compute)) r.handle.dirty = false;
@@ -2206,6 +2231,11 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         const p = pendingComputes[i];
         if (!skipped.has(p.compute)) {
           p.block.uploaded = true;
+          // The copy has run; the staging buffer and the kernel that read it
+          // are dead weight from here. Evicted on the NEXT confirm — see
+          // `staleUploads`.
+          staleUploads.push(p.compute);
+          p.staging = null;
           pendingComputes.splice(i, 1);
         }
       }

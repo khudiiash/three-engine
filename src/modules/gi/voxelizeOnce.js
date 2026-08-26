@@ -353,10 +353,40 @@ export function serializeMeshForBake(mesh) {
     // every consumer falls back to the per-slot mean albedo, which is exactly
     // the pre-R7b picture for that mesh alone.
     const uvAttr = mesh.geometry.attributes.uv;
+    // ── §19 STAGE 0.2: REFERENCE WHAT IS ALREADY THE RIGHT SHAPE ───────────
+    //
+    // These slices duplicated EVERY static geometry in the scene — ~86 MB on
+    // Bistro, held for the session by this cache, on top of three's own copy
+    // and the voxelizer's packed `vdataArr`/`idataArr` ("triangle data lives
+    // 6×", plan §2.2). The slice bought nothing for the common case: a plain
+    // non-interleaved `Float32Array` position whose length is exactly
+    // `count * 3` is byte-for-byte what every consumer wants, and every
+    // consumer of these records is READ-ONLY (`buildStaticSceneBvhWords`,
+    // `occupancyField.setGeometry`/`computeExtents`, `dynamicObjects`' packer).
+    //
+    // The copy STAYS wherever the shape is wrong — interleaved data, a
+    // normalized or non-Float32 array, or a buffer longer than `count * 3`
+    // (`positions.length / 3` is how consumers count vertices, so a padded
+    // tail would invent triangles).
+    //
+    // ⚠ The record is no longer safe to TRANSFER (postMessage with a transfer
+    // list would detach the live geometry). Nothing transfers it — the bake
+    // worker went with the SDF pipeline in 2026-08 — but a future worker must
+    // copy, not transfer.
+    const refPositions = position.array instanceof Float32Array &&
+      position.isInterleavedBufferAttribute !== true &&
+      position.normalized !== true &&
+      position.itemSize === 3 &&
+      position.array.length === position.count * 3;
+    const indexAttr = mesh.geometry.index;
+    const refIndex = !!indexAttr &&
+      (indexAttr.array instanceof Uint32Array || indexAttr.array instanceof Uint16Array) &&
+      indexAttr.isInterleavedBufferAttribute !== true &&
+      indexAttr.array.length === indexAttr.count;
     cached = {
       version,
-      positions: position.array.slice(0, position.count * 3),
-      index: mesh.geometry.index ? mesh.geometry.index.array.slice() : null,
+      positions: refPositions ? position.array : position.array.slice(0, position.count * 3),
+      index: indexAttr ? (refIndex ? indexAttr.array : indexAttr.array.slice()) : null,
       uvs: uvAttr && uvAttr.itemSize >= 2 && uvAttr.count >= position.count
         ? Float32Array.from({ length: position.count * 2 }, (_, i) =>
             (i & 1) ? uvAttr.getY(i >> 1) : uvAttr.getX(i >> 1))

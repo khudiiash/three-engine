@@ -471,6 +471,13 @@ export function createSrcBinStore(store, {
     scratch,
     payload,
     stats,
+    /**
+     * §19 Stage 0.2 — GPU-only after the first bind; `detachCpuMirror` drops
+     * the JS twin three already copied into the GPU buffer. Nothing here is
+     * ever written CPU-side again (readbacks go through `getArrayBufferAsync`,
+     * which sizes itself from `bufferGPU.size`).
+     */
+    cpuMirrors: [scratch, payload, stats].map((n) => n?.value).filter(Boolean),
     /** [J]'s region. `hitCapacity` 0 means the tail was not allocated. */
     hitListBase,
     hitCapacity,

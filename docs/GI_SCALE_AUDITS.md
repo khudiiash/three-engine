@@ -204,3 +204,37 @@ writes it CPU-side again (`addUpdateRange` + `needsUpdate`). So:
 **Gate:** Bistro settled heap < 2 GB and flat over 10 min orbit
 (`profile.frameStats.jsHeapMB`); `profile.textures` orphans < 50 MB; battery
 green; `probe:gi-heap-retainer` POKE=quality shows no per-rebuild climb.
+
+---
+
+## G. STAGE 0.5 EXECUTION SPEC — bvhHitShade diet (analysis 08-27 00:30)
+
+`createGiBvhHitShade` (`giScreen.js:831-1170`) carries TWO JS loops that unroll
+x4 each, every iteration inlining a BVH descent + PCSS: `emitterDirectAt`
+(`giLight.js:1269`, `for … of params.emitterSlots.entries()`, MAX_EMITTERS = 4,
+inlines `emitterSlotShadow` :1337-1560 -> `recordShadowTrace` GISystem :5200-5335)
+and `analyticDirectAt` (`giLight.js:1564`, `for … of lightSlots`, MAX_GI_LIGHTS = 4,
+inlines `lightShadowFn` giScreen :1076-1105 -> staticOcclude + dynOcclude);
+plus `sampleReflectionProbes` x8 (`reflectionProbes.js:133`) when probes exist.
+= 12 shadow-ray call sites where 3 would do. Share estimate of 182 kB: emitter
+loop 65-70, light loop 30-40, probes 20-25, shared fn bodies 35, rest 10.
+Dump: `DUMP_ALL=<dir> npm run probe:gi-boot` then
+`REPS=3 node scripts/run-wgsl-compile-probe.mjs <dir>/k*.wgsl`.
+
+**D1** roll the emitter loop (`giLight.js:1269`) into `Loop({start:int(0),
+end:int(4)})` with a select-built virtual slot — copy `createGiEmitterShadowPass`
+(`giScreen.js:2066-2082`: slotKeys intersection, `shadowVars[k].assign(select(...))`).
+Expect -50 kB / -120 ifs. Gates: test:gi-emitter-tsl, test:gi-hit-shade.
+**D2** roll the light loop (`giLight.js:1564`) — precedent `srcShade.js:600-640`
+(measured: ~1.2 s compile per inlined descent). Expect -25 kB / -80 ifs.
+Gates: test:gi-lighttree-nee, probe:gi-reflect-black.
+**D3** uniformize the baked numbers: `normalOffset` (giScreen :914/:933/:1085),
+`emitterCutoff x traceCutoffScale` + `maxTraceDistance` (:1014-1023),
+`uint(baseWord + STATIC_MASK_WORD_BASE)` (dynamicObjects.js:1918/:1937 — moves
+with grid resolution = cross-scene cache miss).
+**D4** defer: the kernel is already out of the prewarm (GISystem :4246-4253) but
+sits in `state.queue` (:7152) so it compiles on frame 1; skip its dispatch until
+the mask pass reports a non-zero mirror-pixel count (the emitter chain's shape at
+:4231). Not created below `high` (`#bvhReflectionsEnabled` :7549-7580).
+Target: 182 -> ~75 kB, 331 -> ~120 ifs, 12 -> 3 descent sites. Only
+`probe:wgsl-compile` RATIOS count (the same kernel measured 47-238 s across runs).

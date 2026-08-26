@@ -39,7 +39,7 @@ import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.j
 import { SRC_POOL_FLOORS, createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcPoolCeilings, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
 import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD, CASCADE_COUNT, R0_OVER_S0 as SRC_R0_OVER_S0, binCount } from "./srcConfig.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
-import { SURFACE_POOL_CEILINGS, createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
+import { SURFACE_POOL_CEILINGS, bitsBytesFor, createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
 import { buildLightTree, collectEmitters, estimateLightTreeWords } from "./lightTree.js";
 import { fitPrimitive } from "./primitiveFit.js";
@@ -47,7 +47,7 @@ import { fitEmitterShape } from "./emitterShapes.js";
 import { fitSkinnedCapsules, rigRootOf, skinnedBoneMatrix, skinnedBoxShape, skinnedCapsuleMatrix, skinnedCapsuleShape } from "./skinnedProxy.js";
 
 import { DEBUG_LAYER, EDITOR_LAYER, GI_DYNAMIC_LAYER, GI_MIRROR_LAYER, GI_SHARP_LAYER, SHADOW_PROXY_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
-import { collectStateComputeNodes, purgeNodeBuilderCache, releaseComputeNodes } from "./releaseCompute.js";
+import { collectStateComputeNodes, cpuMirrorBytes, detachCpuMirror, purgeNodeBuilderCache, releaseComputeNodes } from "./releaseCompute.js";
 import { textureLoadsInFlight } from "../../engine/textureAsset.js";
 import { GICascadeLight, GI_REFLECT_TIER, MAX_EMITTERS, giReflectTierInfoOf, giReflectTierOf, giRoughnessBucketOf, giRoughnessFloorStats, giRoughnessSourceOf, registerGILight } from "./giLight.js";
 import { MAX_REFLECTION_PROBES, createReflectionProbeAtlas } from "./reflectionProbes.js";
@@ -3021,7 +3021,12 @@ export class GISystem {
         // and a partially-dispatched chain is already what a boot with
         // uncompiled pipelines produces. Its 44 kernels are the largest single
         // block of first-build work in the tick.
+        // §19 Stage 0.2's SRC gate. `giSkippedComputes` is cleared at the end of
+        // every tick, so a size delta across THIS call means one of these
+        // passes was deferred — i.e. its buffers may not exist yet.
+        const srcSkippedBefore = giSkippedComputes.size;
         giCompute(renderer, state.screen.srcProbes.passes, { deferrable: true });
+        if (giSkippedComputes.size === srcSkippedBefore) this._srcRanOnce = true;
         this.#maybeLogSrcProbeStats(renderer, state);
       }
       // BVH exact-reflection prepass: dispatched right after the gbuffer,
@@ -3658,6 +3663,9 @@ export class GISystem {
       }
       if (frameQueue.length) giCompute(renderer, frameQueue, { deferrable: true });
     }
+    // §19 Stage 0.2: after every gate this tick could have opened, and before
+    // the skip set is cleared (the SRC latch above reads it).
+    this.#drainCpuMirrors(renderer);
     giSkippedComputes.clear();
 
     this._frame++;
@@ -5751,6 +5759,10 @@ export class GISystem {
               : null,
           });
           console.log(describeSrcProbeSystem(srcProbes));
+          // Same contract as the field's, gated on the first unskipped SRC
+          // frame instead of the occupancy chain.
+          this.#queueCpuMirrorDetach(srcProbes.cpuMirrors, "src");
+          this._srcRanOnce = false;
         } catch (error) {
           // Never take the shipping chain down for an experimental branch.
           console.warn("[gi] src probes unavailable:", error?.message ?? error);
@@ -6865,6 +6877,16 @@ export class GISystem {
       `resolve-resize ${screen.width}x${screen.height}→${width}x${height}`
         + ` (giCostScale ${this.engine?.giCostScale ?? 1})`,
     );
+    // ── §19 STAGE 0.2: THIS SWAP HAD NO EVICTION SWEEP ────────────────────
+    //
+    // A resize rebuilds ~25 passes and a whole srcProbes generation. Every one
+    // of the OLD nodes keeps its entry in `renderer._bindings`/`_pipelines`/
+    // `_nodes`, and a bind group holds strong references to every buffer and
+    // texture it binds — so each resize orphaned a generation's worth of
+    // storage (`#dispose` swept exactly one site, teardown). Snapshot the
+    // nodes reachable from `state` NOW; anything still reachable after the
+    // rebuild is shared and must be left alone (see the sweep at the end).
+    const staleBefore = new Set(collectStateComputeNodes(state));
     screen.width = width;
     screen.height = height;
     screen.shadowWidth = shadowW;
@@ -6873,7 +6895,13 @@ export class GISystem {
     // The probe population is one thread per gbuffer pixel and its dispatch
     // counts are baked into the compute nodes, so a resize rebuilds it. Returns
     // a NEW system and disposes the old one — the assignment is the point.
-    if (screen.srcProbes) screen.srcProbes = screen.srcProbes.setSize(width, height, this._srcPools ?? null);
+    if (screen.srcProbes) {
+      screen.srcProbes = screen.srcProbes.setSize(width, height, this._srcPools ?? null);
+      // Fresh buffers, so a fresh detach generation (and the latch that gates
+      // it must re-arm — the new passes have not dispatched yet).
+      this._srcRanOnce = false;
+      this.#queueCpuMirrorDetach(screen.srcProbes.cpuMirrors, "src");
+    }
     // New targets at the new size; the persistent nodes are re-pointed at
     // them, which is a binding refresh rather than a shader rebuild (every
     // observed material has hasNode = true, so its bindings refresh per frame
@@ -7536,6 +7564,11 @@ export class GISystem {
       screen.bvhReflect = { compute, bvhScene: screen.bvhReflect.bvhScene, dynSet: this._dynSet ?? null };
     }
     this.#retireTargets(previousBvhTarget);
+    // ⚠ THE DIFF IS THE SAFETY ARGUMENT, and releaseCompute.js prices getting it
+    // wrong at a 16-27 s recompile: a node still reachable from `state` is still
+    // dispatched, so only what the rebuild ORPHANED may be evicted — and only
+    // now, after every replacement has been built and spliced.
+    this.#sweepOrphanedComputes(state, staleBefore, "resolve-resize");
   }
 
   /**
@@ -10403,10 +10436,15 @@ export class GISystem {
     const screen = state.screen;
     if (!screen?.srcProbes || !screen.resolve) return false;
     const { width, height } = { width: screen.width, height: screen.height };
+    // §19 Stage 0.2 — same eviction contract as the resize path; see the sweep
+    // at the end of #syncScreenResolveSize for why this is a DIFF.
+    const staleBefore = new Set(collectStateComputeNodes(state));
     const before = screen.srcProbes;
     const next = before.setSize(width, height, this._srcPools ?? null);
     if (next === before) return false;          // setSize refused — nothing grew
     screen.srcProbes = next;
+    this._srcRanOnce = false;
+    this.#queueCpuMirrorDetach(next.cpuMirrors, "src");
 
     // The queue slots the resolve occupies, captured BEFORE it is replaced.
     const index = state.queue.indexOf(screen.resolve.compute);
@@ -10530,7 +10568,40 @@ export class GISystem {
         if (hitShadeIndexes[2] >= 0) state.queueFeedbackOnly[hitShadeIndexes[2]] = screen.bvhHitShade.compute;
       }
     }
+    this.#sweepOrphanedComputes(state, staleBefore, "src-pool-grow");
     return true;
+  }
+
+  /**
+   * §19 Stage 0.2 — evict the compute nodes a swap site ORPHANED.
+   *
+   * `#dispose` was the only `releaseComputeNodes` call site in the module, so
+   * the three generation-replacing paths (viewport resize, SRC pool grow, the
+   * occupancy field's geometry-revision re-mint) each left their previous
+   * generation pinned in `renderer._bindings` — with every storage buffer and
+   * render target those bind groups reference.
+   *
+   * The set difference is what makes this safe. `collectStateComputeNodes` is a
+   * scan, not a hand-written list (a list stops covering the newest pass and
+   * that is exactly the failure this leak came from), so "reachable from
+   * `state` before but not after" is precisely the generation that was thrown
+   * away — a node the rebuild REUSED is still reachable and is never touched.
+   *
+   * @param {any} state
+   * @param {Set<any>} before nodes reachable from `state` before the swap
+   * @param {string} why for the `__giLogComputeRelease` receipt
+   */
+  #sweepOrphanedComputes(state, before, why) {
+    if (!before?.size) return 0;
+    const after = new Set(collectStateComputeNodes(state));
+    const orphans = [];
+    for (const node of before) if (!after.has(node)) orphans.push(node);
+    if (orphans.length === 0) return 0;
+    const released = releaseComputeNodes(this.engine?.renderer, orphans);
+    if (globalThis.__giLogComputeRelease === true) {
+      console.log(`[gi] ${why}: released ${released}/${orphans.length} orphaned compute nodes`);
+    }
+    return released;
   }
 
   #syncSrcPoolPressure(state) {
@@ -11290,6 +11361,14 @@ export class GISystem {
     // a few; 13.4 GB killed the device outright). See releaseCompute.js.
     const stale = collectStateComputeNodes(state);
     const released = releaseComputeNodes(this.engine?.renderer, stale);
+    // §19 Stage 0.2: the field owns kernels the `state` walk cannot see — the
+    // minted generation the geometry-revision re-mint replaced, and the build
+    // variants only `computes` references. Its `dispose()` was `{}` until now.
+    const occField = state.volume?.occupancyField;
+    occField?.setRenderer?.(this.engine?.renderer);
+    occField?.dispose?.();
+    // Nothing left to detach for a state that is going away.
+    this._giPendingDetach = [];
     // ⚠ AND THE MATERIAL SIDE, WHICH IS THE BIGGER HALF. The compute eviction
     // alone left the heap climbing ~2.2 GB per rebuild; the bulk is 116
     // materials' re-injected GI node graphs piling up in `nodeBuilderCache`
@@ -11299,6 +11378,69 @@ export class GISystem {
       console.log(
         `[gi] dispose: released ${released}/${stale.length} compute nodes` +
         `${purged ? ", purged the node-builder cache" : ""}`,
+      );
+    }
+  }
+
+  /**
+   * §19 STAGE 0.2 — QUEUE A GENERATION'S CPU MIRRORS FOR DETACH.
+   *
+   * `instancedArray(new Uint32Array(N))` hands three a
+   * `StorageInstancedBufferAttribute`; three copies `.array` into the GPU
+   * buffer ONCE, at first bind (`mappedAtCreation`), and never reads it again
+   * unless the owner writes it CPU-side. Every GPU-only GI buffer therefore
+   * keeps a dead JS twin for the process's life — on Bistro ~1.1 GB of it,
+   * `bits` alone 449 MB. See `detachCpuMirror` for the safety argument.
+   *
+   * The detach cannot happen at build time: the buffer does not exist until the
+   * owning chain has actually DISPATCHED, so this queues and `#drainCpuMirrors`
+   * polls. ONE live generation per gate — a rebuild, resize or pool grow
+   * replaces the buffers, so anything still pending from the previous
+   * generation describes a field that is already dead.
+   *
+   * @param {any[]} mirrors storage ATTRIBUTES (`node.value`), not nodes
+   * @param {"occupancy"|"src"} gate which chain must have run unskipped first
+   */
+  #queueCpuMirrorDetach(mirrors, gate) {
+    const list = (this._giPendingDetach ??= []);
+    for (let i = list.length - 1; i >= 0; i--) if (list[i].gate === gate) list.splice(i, 1);
+    if (!Array.isArray(mirrors) || mirrors.length === 0) return;
+    if (list.length === 0) {
+      // A fresh drain reports its own total rather than accumulating across
+      // rebuilds — a climbing "detached N" line would read as a leak.
+      this._giDetachCount = 0;
+      this._giDetachBytes = 0;
+      this._giDetachLogged = false;
+    }
+    for (const attr of mirrors) if (attr) list.push({ attr, gate });
+  }
+
+  /**
+   * Detach whatever is now uploadable. Cheap: the list is a few dozen entries
+   * and empties within a handful of frames of first light.
+   *
+   * The GATE (`_fieldReadyOnce` / `_srcRanOnce`) is only a "do not churn every
+   * frame" filter — the correctness gate is inside `detachCpuMirror`, which
+   * refuses any attribute the backend has no GPU buffer for and leaves it
+   * queued for the next tick.
+   */
+  #drainCpuMirrors(renderer) {
+    const list = this._giPendingDetach;
+    if (!list?.length) return;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const entry = list[i];
+      const open = entry.gate === "src" ? this._srcRanOnce === true : this._fieldReadyOnce === true;
+      if (!open) continue;
+      if (!detachCpuMirror(renderer, entry.attr)) continue; // not uploaded yet
+      this._giDetachCount = (this._giDetachCount ?? 0) + 1;
+      this._giDetachBytes = (this._giDetachBytes ?? 0) + cpuMirrorBytes(entry.attr);
+      list.splice(i, 1);
+    }
+    if (list.length === 0 && !this._giDetachLogged && (this._giDetachCount ?? 0) > 0) {
+      this._giDetachLogged = true;
+      console.log(
+        `[gi] detached ${this._giDetachCount} CPU mirrors ` +
+          `(${(this._giDetachBytes / 1048576).toFixed(1)} MB)`,
       );
     }
   }
@@ -13788,7 +13930,7 @@ export class GISystem {
     for (const g of this.#skinnedProxyGroups()?.values() ?? []) proxySlots += g.segments.length;
     const dynMaxObjects = Number(globalThis.__giMaxDynamicObjects) ||
       Math.min(64, ({ low: 16, medium: 16, high: 24, ultra: 32 }[quality] ?? 16) + proxySlots);
-    const dynWords = dynObjectsOn ? dynHeaderWords(dynMaxObjects) + dynPoolWords : 0;
+    let dynWords = dynObjectsOn ? dynHeaderWords(dynMaxObjects) + dynPoolWords : 0;
 
     // STATIC-SCENE SHADOW BVH ("light by voxels, shadows by BVH"): one
     // world-space BVH8 over every static placement — the screen shadow
@@ -13835,7 +13977,11 @@ export class GISystem {
     // without a full field rebuild.
     let staticBvhWords = staticBvhPacked ? Math.ceil(staticBvhPacked.words.length * 1.5) : 0;
 
-    const makeField = (dynW, statW) => createOccupancyField(bounds, res, {
+    const fieldOptions = (dynW, statW) => ({
+      // The two eviction sweeps the field owns (its geometry-revision re-mint
+      // and `dispose`) need a renderer; without one they degrade to "leaks as
+      // before".
+      renderer: this.engine?.renderer ?? null,
       slotCapacity: Math.min(MAX_INSTANCE_SLOTS, Math.max(64, placements.length * 2)),
       traceSteps: { low: 48, medium: 64, high: 96, ultra: 128 }[quality] ?? 96,
       dynamicObjectWords: dynW,
@@ -13874,6 +14020,19 @@ export class GISystem {
       // skip; only an explicit opt-out compiles the no-skip A/B arm.
       rayHitCoarseSkip: rayHitConfig?.enableSkipDistance !== false,
     });
+    const makeField = (dynW, statW) => createOccupancyField(bounds, res, fieldOptions(dynW, statW));
+    // ── THE LADDER WALKS A NUMBER NOW, NOT A BUILT FIELD (§19 Stage 0.2) ────
+    //
+    // It used to answer "does this fit?" by BUILDING the field and reading
+    // `field.bitsBuffer.value.array.byteLength`, so a scene that had to drop the
+    // UV region, then the static BVH, then the exact-dynamic pool minted FOUR
+    // 450 MB `Uint32Array`s (plus four fields' worth of compute nodes and
+    // scratch pools) to publish one — on the exact scenes that are already
+    // against the memory wall, which is the only reason the ladder runs at all.
+    // `bitsBytesFor` is the SAME region arithmetic `createOccupancyField`
+    // destructures (occupancyField.js `planBitsLayout`), so the two cannot
+    // disagree about what a rung would have allocated.
+    const bitsBytes = (dynW, statW) => bitsBytesFor(res, fieldOptions(dynW, statW));
     // BINDING-SIZE DEGRADE LADDER: the bits buffer is ONE binding, and a big
     // ultra scene already sits near 128MB before the optional tails — a real
     // project hit 144MB and every bind group using the buffer failed (GI
@@ -13893,7 +14052,6 @@ export class GISystem {
       deviceLimits?.maxStorageBufferBindingSize ?? 134217728,
       deviceLimits?.maxBufferSize ?? 268435456,
     );
-    let field = makeField(dynWords, staticBvhWords);
     // ── §18.17 RUNG ZERO: THE UV REGION GOES BEFORE THE BVH DOES ───────────
     //
     // Textured reflections cost 3 words per static triangle, and on a scene
@@ -13901,32 +14059,36 @@ export class GISystem {
     // costs one feature (hits fall back to the per-slot mean albedo — exactly
     // the pre-§18.17 picture); losing the whole static BVH costs every exact
     // shadow AND every reflection in the scene. Cheapest thing first.
-    if (field.bitsBuffer.value.array.byteLength > deviceLimit && (staticBvhPacked?.uvWordCount ?? 0) > 0) {
+    if (bitsBytes(dynWords, staticBvhWords) > deviceLimit && (staticBvhPacked?.uvWordCount ?? 0) > 0) {
       console.warn(
-        `[gi] bits buffer ${(field.bitsBuffer.value.array.byteLength / 1048576).toFixed(0)}MB over the ` +
+        `[gi] bits buffer ${(bitsBytes(dynWords, staticBvhWords) / 1048576).toFixed(0)}MB over the ` +
           `${(deviceLimit / 1048576).toFixed(0)}MB device limit — dropping the reflection UV region ` +
           "(reflections fall back to per-slot mean albedo)",
       );
       staticBvhPacked = items.length ? buildStaticSceneBvhWords(items, staticBvhStrategy(), { uvs: false }) : null;
       this._staticBvhItemsWantedUv = false;
       staticBvhWords = staticBvhPacked ? Math.ceil(staticBvhPacked.words.length * 1.5) : 0;
-      field = makeField(dynWords, staticBvhWords);
     }
-    if (field.bitsBuffer.value.array.byteLength > deviceLimit && staticBvhWords > 0) {
+    if (bitsBytes(dynWords, staticBvhWords) > deviceLimit && staticBvhWords > 0) {
       console.warn(
-        `[gi] bits buffer ${(field.bitsBuffer.value.array.byteLength / 1048576).toFixed(0)}MB exceeds the device's ` +
+        `[gi] bits buffer ${(bitsBytes(dynWords, staticBvhWords) / 1048576).toFixed(0)}MB exceeds the device's ` +
           `${(deviceLimit / 1048576).toFixed(0)}MB storage binding limit — dropping the static shadow BVH (records marcher fallback)`,
       );
       staticBvhPacked = null;
-      field = makeField(dynWords, 0);
+      staticBvhWords = 0;
     }
-    if (field.bitsBuffer.value.array.byteLength > deviceLimit && dynWords > 0) {
+    if (bitsBytes(dynWords, staticBvhWords) > deviceLimit && dynWords > 0) {
       console.warn("[gi] bits buffer still over the storage binding limit — disabling exact dynamic objects");
-      field = makeField(0, 0);
+      dynWords = 0;
     }
+    // ONE allocation, after the ladder has settled every size it can change.
+    const field = makeField(dynWords, staticBvhWords);
     for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.setGeometry(geometries, placements);
     field.placements = placements;
+    // §19 Stage 0.2: `bits` + the scratch pools are GPU-only once the occupancy
+    // chain has run. Queued here, drained in #tick — see #queueCpuMirrorDetach.
+    this.#queueCpuMirrorDetach(field.cpuMirrors, "occupancy");
     // §18.17: baked before the dynamic set below, because #oneBvhBundle reads
     // `_slotAtlas` while the reflect prepass is being built.
     this.#ensureSlotAlbedoAtlas(field, placements);
@@ -14466,7 +14628,7 @@ export class GISystem {
     // `live` for anything that did not go out, so a deferred upload simply
     // stays pending — the mover keeps its frozen bits for another frame.
     if (pending.length > 0) giCompute(renderer, pending, { deferrable: true });
-    const live = dyn.confirmDispatch(giSkippedComputes);
+    const live = dyn.confirmDispatch(giSkippedComputes, renderer);
     // Before this frame's screen passes: words and bases flip together.
     this.#commitStaticBvhAttach();
     // Park the adoptees' voxel slots only once the exact side is actually
@@ -15038,7 +15200,7 @@ export class GISystem {
           // Round 6: a box-shipped segment logs its WORLD box — the ladder
           // shadow was diagnosed blind because the log printed only the
           // capsule params while the boxes actually traced.
-          if (boxMode && segment.he && !segment.bridge && skinnedBoneMatrix(mesh, segment, M)) {
+          if (segment.he && !segment.bridge && skinnedBoneMatrix(mesh, segment, M)) {
             const s = Math.hypot(M.elements[0], M.elements[1], M.elements[2]);
             dims.push(
               `${name} box=${(segment.he[0] * 2 * s).toFixed(2)}x${(segment.he[1] * 2 * s).toFixed(2)}x` +

@@ -175,3 +175,84 @@ export function collectStateComputeNodes(state) {
   visit(state, 0);
   return [...found];
 }
+
+/**
+ * Drops the JS-side twin of a GPU-only storage buffer.
+ *
+ * ## The mechanism (verified against three r1xx
+ * `WebGPUAttributeUtils.createAttribute`)
+ *
+ * `instancedArray(new Uint32Array(N))` builds a
+ * `StorageInstancedBufferAttribute`. The FIRST time it is bound, three creates
+ * the GPU buffer `mappedAtCreation` and does
+ * `new array.constructor(buffer.getMappedRange()).set(array)` — one copy, then
+ * `buffer.unmap()`. From that moment the JS array is dead weight: nothing reads
+ * it again unless the owner writes it CPU-side and bumps `version`
+ * (`Attributes.update` → `updateAttribute`, which is the ONLY other reader).
+ *
+ * On Bistro that dead weight is ~1.1 GB (`bits` alone is 449 MB), and it is
+ * pinned for the process's life by the closure that allocated it.
+ *
+ * ## Why a zero-length view of the same constructor is the safe replacement
+ *
+ * Everything downstream that touches `.array` after upload reads only its TYPE,
+ * never its contents or length:
+ *
+ *   · `BufferAttribute.count` is fixed at construction (`array.length /
+ *     itemSize`) and is what every dispatch-count and binding-size path uses.
+ *   · `NodeStorageBuffer.buffer` is a live getter over `nodeUniform.value.array`
+ *     — so it follows the swap rather than pinning the old array (a stored
+ *     reference would have made this unsafe; `StorageBuffer`'s base class DOES
+ *     store one, and the node subclass overriding it is what saves us).
+ *   · Bind-group creation reads `backend.get(binding.attribute).buffer` — the
+ *     GPU buffer, never the CPU array (`WebGPUBindingUtils.createBindings`).
+ *   · `getArrayBufferAsync` sizes its readback from `bufferGPU.size`.
+ *   · `createShaderVertexBuffers` reads `array.BYTES_PER_ELEMENT`, which lives
+ *     on the constructor — preserved by construction here.
+ *
+ * A DEVICE LOSS does not resurrect the need for the mirror: `renderer-rebuilt`
+ * makes GISystem `#dispose()` and rebuild from scratch, so every buffer is
+ * re-minted with a fresh array against the new device. Nothing ever re-uploads
+ * a detached attribute (three re-creates a GPU buffer only when its
+ * `Attributes` entry was deleted, which happens for geometry attributes through
+ * `Geometries`' dispose handler and never for a standalone storage buffer).
+ *
+ * ⚠ NEVER call this on an attribute the owner writes CPU-side later
+ * (`addUpdateRange` + `needsUpdate`). `updateAttribute` would then upload zero
+ * bytes and the write would silently vanish. In GI that is the KEEP set:
+ * `vertexBuffer`, `indexBuffer`, `pairWork`, `localToWorld`, the dynamic-object
+ * staging/uploader buffers, and every `uniformArray`.
+ *
+ * @param {any} renderer
+ * @param {any} attr a `StorageInstancedBufferAttribute` (`node.value`)
+ * @returns {boolean} true when the mirror is gone (or was already gone); false
+ *   when the buffer has not been uploaded yet — the caller retries next tick.
+ */
+export function detachCpuMirror(renderer, attr) {
+  const array = attr?.array;
+  if (!array) return false;
+  if (array.length === 0) return true; // already detached
+  const backend = renderer?.backend;
+  // `has` before `get`: three's DataMap.get CREATES the entry, so probing with
+  // `get` on an attribute that was never bound would seed a permanent empty
+  // record for a buffer that may never exist.
+  if (typeof backend?.has !== "function" || !backend.has(attr)) return false;
+  let data = null;
+  try { data = backend.get(attr); } catch { return false; }
+  if (!data || data.buffer === undefined) return false;
+  try {
+    // BEFORE the swap — `readbackBits`' mappable-staging cap and the bits
+    // ladder both size themselves off this, and reading 0 would make a 449 MB
+    // buffer look free.
+    attr.__giBytes = array.byteLength;
+    attr.array = new array.constructor(0);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/** Byte size of a storage attribute, mirror attached or not. */
+export function cpuMirrorBytes(attr) {
+  return attr?.__giBytes ?? attr?.array?.byteLength ?? 0;
+}
