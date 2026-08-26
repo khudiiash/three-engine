@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>SRC hit-shading gate — createSrcHitShader vs makeHitShader</title>
+    <title>SRC hit-shading gate — createSrcHitLighting vs makeHitShader</title>
     <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
   </head>
   <body>
@@ -11,7 +11,7 @@
     <script type="module">
       // ══ THE PHASE-5 UNIT-2 GATE: HIT SHADING, WITHOUT THE ENGINE ═════════
       //
-      // `srcShade.js`'s `createSrcHitShader` diffed against `srcRef.js`'s
+      // `srcShade.js`'s attribution+lighting pair diffed against `srcRef.js`'s
       // `makeHitShader` — the CPU mirror §12.26 built first and proved out over
       // 124 checks — at the same synthetic hit points, with the same emitters,
       // the same sun and the same surfaces.
@@ -203,7 +203,7 @@
           direction: f32v([0.36, 0.87, 0.33].map((c) => c / Math.hypot(0.36, 0.87, 0.33))),
           irradiance: f32v([3.1, 2.85, 2.4]),
         };
-        // `createSrcHitShader`'s own margin, and the mirror has to use the same
+        // the lighting kernel's own margin, and the mirror has to use the same
         // one or the two sides aim their shadow rays at different points.
         const MARGIN = f32(VOXEL * 0.5);
 
@@ -251,7 +251,7 @@
          * Run the shader over the whole fixture and read the radiance back.
          * `visibility` and the shader options are the arm's to choose.
          */
-        const runGpu = async (options = {}, { normalSign = 1, albedo = null, unflag = false, half = null } = {}) => {
+        const runGpu = async (options = {}, { normalSign = 1, albedo = null, unflag = false } = {}) => {
           const dst = instancedArray(new Float32Array(N_HITS * 4), "vec4");
           const kernel = Fn(() => {
             const i = instanceIndex.toVar();
@@ -275,29 +275,15 @@
             const dir = dirBuf.element(i).xyz;
             // The ray index IS the fixture index: a pure function of a u32,
             // bit-identical to what the mirror is handed.
-            if (half) {
-              // ── §12.82: THE TWO HALVES, SEPARATELY ────────────────────────
-              //
-              // `createSrcHitShader` puts them back together, which is the
-              // IDENTITY the arm below asserts — and an identity is exactly what
-              // a split that silently did nothing would also satisfy. So this
-              // reaches past the composer for the raw halves: `L` must LOSE the
-              // sun and `transfer` must be non-zero, or the pass is vacuous.
-              const { surfaceAt: sa, maxLoopAlbedo, count, ...lighting } = shaderOptions;
-              const attribute = S.createSrcHitAttribution({ surfaceAt: sa, count });
-              const light = S.createSrcHitLighting(lighting);
-              const a = attribute({}, dir);
-              const r = light(a.P, a.n, a.rho, a.emissive, a.emitter, i);
-              dst.element(i).assign(vec4(
-                half === "transfer" ? r.sunTransfer
-                  : half === "facing" ? vec3(r.sunFacing)
-                    : r.L,
-                1,
-              ));
-            } else {
-              const shade = S.createSrcHitShader(shaderOptions);
-              dst.element(i).assign(vec4(shade({}, dir, i), 1));
-            }
+            // THE SHIPPED COMPOSITION: [E] attribution then [J] lighting, the
+            // two-kernel split the deposit runs. There is no one-kernel form to
+            // diff against any more, so the gate drives the real pair directly.
+            const { surfaceAt: sa, maxLoopAlbedo, count, ...lighting } = shaderOptions;
+            const attribute = S.createSrcHitAttribution({ surfaceAt: sa, count });
+            const light = S.createSrcHitLighting(lighting);
+            const a = attribute({}, dir);
+            const r = light(a.P, a.n, a.rho, a.emissive, a.emitter, i);
+            dst.element(i).assign(vec4(r.L, 1));
           })().compute(N_HITS);
           await renderer.computeAsync(kernel);
           const raw = new Float32Array((await renderer.getArrayBufferAsync(dst.value)).slice(0, N_HITS * 16));
@@ -311,7 +297,7 @@
             return [e.color[0] * f, e.color[1] * f, e.color[2] * f];
           },
           // The point the shadow ray stops at: the emitter's own surface, less
-          // the same margin `createSrcHitShader` subtracts. `emitterSurfaceT`
+          // the same margin the lighting kernel subtracts. `emitterSurfaceT`
           // for a sphere is `dist − radius`, so this is its exact twin.
           sampleTarget: (P) => {
             const d = [e.center[0] - P[0], e.center[1] - P[1], e.center[2] - P[2]];
@@ -383,7 +369,7 @@
 
         // ══ ARM: lights — the slot path vs the sun path ═════════════════════
         //
-        // `createSrcHitShader` has two ways in for punctual light: `sun`
+        // `createSrcHitLighting` has two ways in for punctual light: `sun`
         // (`srcRef.js`'s shape, one directional source, what the mirror gates)
         // and `lights` (`giLight.js`'s slot array, what the ENGINE passes —
         // point AND directional, one shadow ray each). A directional slot is the
@@ -429,90 +415,6 @@
           check("a POINT slot does NOT — `kind` is read, not ignored",
             differs > N_HITS * 0.5, `${differs}/${N_HITS} hits differ`);
 
-          // ══ §12.82: THE SUN SPLIT IS AN IDENTITY AT ITS OWN SUN ANGLE ═════
-          //
-          // The split caches `ρ/π · V` and lets `[F]` close `E·max(0,n̂·l)` from
-          // the CURRENT sun every frame, so that a day cycle stops staling the
-          // store. Closed against the sun the DEPOSIT saw, that has to reproduce
-          // the un-split radiance exactly — anything else is energy invented or
-          // lost, and it would be invisible on screen because both arms look
-          // like plausible lighting.
-          say("");
-          say("── §12.82: THE SUN SPLIT ──");
-          const splitOpts = {
-            visibility: null, sun: null, lights: sunAsSlot, maxRay: DIAG,
-            neeEmitters: false, sunSplit: { slot: 0 },
-          };
-          const splitWhole = await runGpu(splitOpts);
-          compare("split then closed at the deposit's own sun == un-split, exactly",
-            splitWhole, slotOnly, 2e-4);
-          // ⚠ AND IT IS NOT VACUOUS — a split that compiled to NOTHING would
-          // satisfy the identity above perfectly, so the halves are checked
-          // against an independent construction of each.
-          //
-          // ⚠⚠ THE CONTROL IS "NO SUN AT ALL", NOT "NOTHING IS LIT". The
-          // fixture has EMISSIVE surfaces, and `Le` is added past every light
-          // term — so 9 of 96 hits stay lit with the sun gone, correctly, and an
-          // arm that demanded darkness would be measuring the emissive set. The
-          // exact statement is: removing the slot and splitting the slot must
-          // leave the same picture.
-          const splitFree = await runGpu(splitOpts, { half: "free" });
-          const splitTransfer = await runGpu(splitOpts, { half: "transfer" });
-          const noSun = await runGpu({ ...splitOpts, lights: [], maxRay: null, sunSplit: null });
-          compare("the sun-free half == the same scene with the sun REMOVED, exactly",
-            splitFree, noSun, 2e-4);
-          // And the sun was worth something here, or the comparison above is
-          // two black images agreeing.
-          let sunlit = 0;
-          for (let i = 0; i < N_HITS; i++) if (relErr(luma(slotOnly[i]), luma(noSun[i])) > 0.01) sunlit++;
-          check("and the sun was worth something on this fixture — the arm is not two black images agreeing",
-            sunlit > N_HITS * 0.3, `${sunlit}/${N_HITS} hits change when the sun is removed`);
-          // The transfer must be non-zero on EVERY hit the sun reached — that
-          // is the term `[F]` re-closes, and a hit the sun lit but the cache
-          // forgot is a surface that goes dark for a whole refresh cycle.
-          let missing = 0;
-          for (let i = 0; i < N_HITS; i++) {
-            const lit = relErr(luma(slotOnly[i]), luma(noSun[i])) > 0.01;
-            if (lit && luma(splitTransfer[i]) <= 1e-9) missing++;
-          }
-          check("the transfer carries every one of them — ρ/π·V non-zero wherever the sun contributed",
-            missing === 0, `${missing} sunlit hits cached a zero transfer`);
-          // ── `sunFacing`: WHICH HITS MAY WRITE THE BIN'S ONE NORMAL ────────
-          //
-          // A bin holds ONE normal, last write wins, so a hit that faces AWAY
-          // from the sun must not write it — its normal would zero `[F]`'s
-          // cosine and silence the transfer the bin's sun-facing hits spent many
-          // frames accumulating. That defect cost 44% of the picture's luma on
-          // the user's Level, WITH THE SUN PINNED, which is how it was found:
-          // a split that only re-aims the sun cannot change a static image.
-          //
-          // A flag stuck at 1 reproduces the bug exactly, so both directions are
-          // asserted. With `visibility: null` every facing hit is also lit, so
-          // the flag and the transfer must agree hit for hit.
-          const splitFacing = await runGpu(splitOpts, { half: "facing" });
-          let flagMismatch = 0;
-          let facingCount = 0;
-          for (let i = 0; i < N_HITS; i++) {
-            const facing = splitFacing[i][0] > 0.5;
-            if (facing) facingCount++;
-            if (facing !== (luma(splitTransfer[i]) > 1e-9)) flagMismatch++;
-          }
-          check("`sunFacing` marks exactly the hits the sun reaches — no unlit hit may write the bin normal",
-            flagMismatch === 0, `${flagMismatch} hits disagree with their transfer`);
-          check("and it is not stuck at 1 — the averted hits are flagged as such",
-            facingCount > 0 && facingCount < N_HITS,
-            `${facingCount}/${N_HITS} hits face the sun`);
-          // A transfer is a REFLECTANCE. If this ever exceeds 1/π the resolve's
-          // fixed point is clamping it and the sun comes back short.
-          const maxTransfer = Math.max(...splitTransfer.map((v) => Math.max(v[0], v[1], v[2])));
-          check("the transfer is bounded by 1/π — the resolve's fixed point stores it unclamped",
-            maxTransfer <= 1 / Math.PI + 1e-6, `max ${maxTransfer.toFixed(5)} vs 1/π = ${(1 / Math.PI).toFixed(5)}`);
-          // Naming a slot that is NOT the sun must leave the sun where it was —
-          // this is what says the comparison is against the INDEX and not
-          // against "any directional slot".
-          const splitOther = await runGpu({ ...splitOpts, sunSplit: { slot: 3 } });
-          compare("naming a different slot splits nothing — the index is read, not the kind",
-            splitOther, slotOnly, 2e-4);
         }
 
         // ══ ARM: faceward — §12.26.4 ════════════════════════════════════════

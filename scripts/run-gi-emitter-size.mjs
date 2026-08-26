@@ -53,7 +53,7 @@ import path from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
 import puppeteer from "puppeteer-core";
 import { installTauriShim } from "./lib/tauriShim.mjs";
-import { makeShadowedBulbProject, BULB_POSE, BULB } from "./lib/makeShadowedBulbProject.mjs";
+import { makeShadowedBulbProject, BULB_POSE } from "./lib/makeShadowedBulbProject.mjs";
 
 const url = process.argv[2] ?? "http://localhost:5201/";
 const SWEEP = process.env.SWEEP ?? "both";
@@ -128,7 +128,6 @@ async function runArm(arm, i) {
     globalThis.__editorKeepRendering = true;
     // Full delivery, explicitly, on every arm.
     globalThis.__giSrcLightTree = true;
-    globalThis.__giEmitterTileCut = true;
   }, root);
   await page.goto(url, { waitUntil: "load", timeout: 60000 });
   await page.waitForSelector(".hub-recent-open-btn", { timeout: 30000 });

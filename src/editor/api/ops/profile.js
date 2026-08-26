@@ -36,8 +36,6 @@ const SCREEN_PASSES = [
   "lightShadowFilterPass",
   "lightShadowWidePass",
   "lightShadowWidePass2",
-  "lightShadowHistoryPass",
-  "lightShadowPostPass",
   "emitterShadowPass",
   "emitterShadowFilterPass",
   "bvhReflect",

@@ -68,10 +68,8 @@ async function runArm(hatch) {
   // ---- Phase 1: build the scene (fast, synchronous-ish). Camera/candidate
   // search happen LATER (phase 3) — the ViewportPanel's camera mounts late
   // (see run-gi-sdf-hires.mjs's own note) and isn't reliably up yet here. ----
-  await page.evaluate(async ({ hatch, v1, v1light }) => {
+  await page.evaluate(async ({ hatch }) => {
     if (hatch) globalThis.__giNoBvhReflections = true;
-    if (v1) globalThis.__giBvhV1 = true;
-    if (v1light) globalThis.__giBvhV1Light = true;
     const { THREE } = await import("/src/engine/index.js");
     await import("/src/modules/index.js");
     const { enableEngineModule } = await import("/src/engine/modules.js");
@@ -167,7 +165,7 @@ async function runArm(hatch) {
     };
     giEntity.addComponent("global-illumination", { quality: "high" });
     console.log("GI-BR scene ready");
-  }, { hatch, v1: process.env.V1 === "1" && !hatch, v1light: process.env.V1LIGHT === "1" && !hatch });
+  }, { hatch });
 
   // ---- Phase 2: settle — same rhythm as run-gi-sdf-hires.mjs (compile
   // wave, then the knot's async SDF bake, which even the BVH arm needs —

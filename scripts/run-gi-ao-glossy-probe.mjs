@@ -1,5 +1,5 @@
 // AO + GLOSSY GATE (2026-08-21) — prices and verifies the two indirect
-// completions shipped together: screen-space AO (createGiAoPass, `ao: true`
+// completions shipped together: GTAO (createGiGtaoPass, `ao: true`
 // in giConfig) and the half-res glossy radiance chain (createSrcGlossyGather
 // + the radiance temporal filter, §12.71b v2 default-on).
 //
@@ -150,22 +150,10 @@ async function runArm(arm) {
     // Same-page AO A/B, on-arm only — BOTH ends of the live dial, so the
     // statistic is the term's full swing rather than default-vs-off (the
     // contact strip is mostly emitter-DIRECT light, which AO deliberately
-    // leaves alone; the modulated indirect is the minor share here).
-    //
-    // VXAO IS HELD AT ZERO ACROSS IT. The resolve composes the two obscurance
-    // estimators with `min`, so wherever the world-space one is the darker the
-    // screen-space dial moves nothing and this A/B measures the composition
-    // instead of the term it names. That is not hypothetical: it clipped the
-    // swing from 2.7% to 1.3% here. Zeroing VXAO's live strength makes it
-    // return 1 and hands the `min` back to the estimator under test — the same
-    // isolation run-gi-vxao-probe.mjs applies in the mirror direction.
+    // leaves alone; the modulated indirect is the minor share here). GTAO is
+    // the sole obscurance estimator now, so no isolation trick is needed.
     let aoFull = null, aoZero = null;
     if (on) {
-      // Restored explicitly, not by deleting the hatch: the override is a live
-      // uniform write, so dropping the global leaves the last value latched and
-      // the RESIZE measurement below would run with VXAO still off.
-      const vxaoStrength = engine.modules.get("gi")?.system?.state?.screen?.vxao?.strength?.value ?? null;
-      globalThis.__giVxaoOverride = { strength: 0 };
       globalThis.__giAoOverride = { strength: 1, radius: 0.8 };
       await sleep(1200);
       aoFull = await sample();
@@ -173,9 +161,6 @@ async function runArm(arm) {
       await sleep(1200);
       aoZero = await sample();
       delete globalThis.__giAoOverride;
-      if (vxaoStrength !== null) globalThis.__giVxaoOverride = { strength: vxaoStrength };
-      await sleep(300);
-      delete globalThis.__giVxaoOverride;
       await sleep(300);
     }
 

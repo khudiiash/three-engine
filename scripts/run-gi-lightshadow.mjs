@@ -388,10 +388,7 @@ if (process.env.FACEKIND) {
 // BOXTEST=1 — THE SILHOUETTE GROUND TRUTH the counters can't give: spawn a
 // tilted box mid-atrium (never moved after spawn → static → records fitted on
 // the next full chain), close-up the floor shadow under the RECORD MARCH,
-// then rebuild with `__giLightShadowLegacyDda` and shoot the LEGACY arm from
-// the same pose. If the two images match, the record march is not changing
-// verdicts and the defect is inside the trace path — no amount of pool or
-// routing work will show up until that is explained.
+// then rotate it and confirm the demote path re-fits records at the new pose.
 if (process.env.BOXTEST) {
   const spawned = await page.evaluate(async (anchorId) => {
     const api = globalThis.__editorApi;
@@ -473,20 +470,9 @@ if (process.env.BOXTEST) {
   await page.screenshot({ path: "scripts/gi-boxtest-settled.png" });
   console.log("  BOXTEST rotate arms -> justrotated (dynamic window) / settled (post-demote)");
 
-  // Legacy arm: the hatch is read at resolve build; toggling profiling back
-  // is the structural flip that forces the rebuild re-reading it.
-  await page.evaluate(() => { globalThis.__giLightShadowLegacyDda = true; });
-  await call("component.setProp", {
-    id: giEntity.id, type: "global-illumination", key: "rayHitProfiling", value: true,
-  });
-  await wait(30000);
-  await page.screenshot({ path: "scripts/gi-boxtest-legacy.png" });
-  console.log("  BOXTEST legacy arm -> scripts/gi-boxtest-legacy.png");
-
-  // Restore: hatch off, profiling back, mesh out. The scene file was never
-  // touched; the page dies at exit anyway, but leave the live state clean.
+  // Restore: profiling back, mesh out. The scene file was never touched;
+  // the page dies at exit anyway, but leave the live state clean.
   await page.evaluate((anchorId) => {
-    globalThis.__giLightShadowLegacyDda = false;
     const eng = globalThis.__editorApi?.entities?.live(anchorId)?.engine;
     const mesh = globalThis.__BOXTEST_MESH__;
     if (eng?.scene && mesh) eng.scene.remove(mesh);

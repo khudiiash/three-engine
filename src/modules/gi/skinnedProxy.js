@@ -528,8 +528,8 @@ function fitImpl(group, bones, skeleton, budget) {
       const me = m.elements;
       const dropR = d.radius * Math.hypot(me[0], me[1], me[2]);
       // §14 round 4: the BOX is the shape that ships, so the box's verdict
-      // decides absorb-vs-promote; the capsule params grow alongside for the
-      // `__giSkinnedProxyShape = "capsule"` hatch.
+      // decides absorb-vs-promote; the capsule params grow alongside because
+      // the JOINT BRIDGES below size their spheres from the grown `radius`.
       const took = growBox(k, _a, _b, dropR);
       if (took) growCapsule(k, _a, _b, dropR);
       // §14: a refused absorb used to leave the flesh UNCAST — and on the
@@ -752,12 +752,12 @@ export function skinnedCapsuleShape(capsule) {
  * skin sits outside the shell (self-shadow the exclusion cannot claim) and
  * round shells leave lit slits between body parts (the shadow "holes"). The
  * box is the flesh's own bounding shape — skin on its surface, neighbours
- * meeting the way the body does. `__giSkinnedProxyShape = "capsule"`
- * restores the old shape.
+ * meeting the way the body does. Bridge segments still ship as capsules /
+ * spheres (`skinnedCapsuleShape`); only fleshed bones take this path.
  */
 export function skinnedBoxShape(capsule) {
   // Round 6: the box's own centre — the joint-grown bounds shift it off the
-  // capsule's flesh mid (see the fit), and the capsule hatch keeps `center`.
+  // capsule's flesh mid (see the fit), so `center` stays the capsule's.
   const c = capsule.boxCenter ?? capsule.center;
   return {
     type: "obb",

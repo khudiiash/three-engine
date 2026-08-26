@@ -7,7 +7,7 @@
 // alternative is one editor boot per ablation arm and a guess in between.
 //
 // Run: node scripts/run-gi-pass-cost-probe.mjs
-//      PRESET_GLOBALS='{"__giShadowStaticBvh":false}' ... for arm A/Bs
+//      PRESET_GLOBALS='{"__giAoOverride":{"strength":0}}' ... for arm A/Bs
 import puppeteer from "puppeteer-core";
 import { installTauriShim } from "./lib/tauriShim.mjs";
 
@@ -115,8 +115,6 @@ const report = await page.evaluate(async (K) => {
     ["lightShadowFilterPass", screen.lightShadowFilterPass?.compute],
     ["lightShadowWidePass", screen.lightShadowWidePass?.compute],
     ["lightShadowWidePass2", screen.lightShadowWidePass2?.compute],
-    ["lightShadowHistoryPass", screen.lightShadowHistoryPass?.compute],
-    ["lightShadowPostPass", screen.lightShadowPostPass?.compute],
     ["emitterShadowPass", screen.emitterShadowPass?.compute],
     ["emitterShadowFilterPass", screen.emitterShadowFilterPass?.compute],
     ["resolve", screen.resolve?.compute ?? screen.resolve],

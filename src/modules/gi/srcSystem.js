@@ -69,7 +69,7 @@ import {
 import {
   DEPOSIT_SCALE, createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters,
 } from "./srcDeposit.js";
-import { createSrcHitAttribution, createSrcHitLighting, createSrcHitShader, sunTerm } from "./srcShade.js";
+import { createSrcHitAttribution, createSrcHitLighting } from "./srcShade.js";
 import { createLightTreeEmitterEval, createLightTreeSampler } from "./lightTreeGpu.js";
 import { createSrcMergeFrame, formatSrcMerge } from "./srcMerge.js";
 import { createSrcSeedFrame, formatSrcSeed } from "./srcSeed.js";
@@ -712,17 +712,7 @@ export function createSrcProbeSystem({
   // of those is built if and only if the one before it was, and this decision
   // has to be made before the first of them exists.
   //
-  // ── `__giSrcSplitShade = false` IS THE R12 HATCH FOR THE SPLIT ITSELF ─────
-  //
-  // It rebuilds the ONE-KERNEL deposit (`createSrcHitShader` inline in [E], no
-  // [J], single bounce) — the shape every measurement before §12.53 was taken
-  // on. The unit's whole claim is a COMPILE claim, and a compile claim across
-  // two processes is worthless in this module (§13.14: the same kernel has read
-  // 47 s and 238 s in different runs because the driver serializes). So the
-  // arms have to exist in one page, which means the old shape has to still be
-  // buildable, which is what this flag is for. `smoke:gi-gpu` A/Bs on it.
-  const splitShade = globalThis.__giSrcSplitShade !== false;
-  const shadingPass = !!(volume?.occupancyField && shadeEnabled && splitShade);
+  const shadingPass = !!(volume?.occupancyField && shadeEnabled);
   // ── THE MULTIBOUNCE GATE — DEFAULT ON, FROM THE TIER (§12.39) ─────────────
   //
   // It was opt-in (`__giSrcSecondary === true`) for exactly as long as [J] was
@@ -921,10 +911,9 @@ export function createSrcProbeSystem({
   // where a moving crate lights the room differently from the identical static
   // one beside it (§12.26.1).
   //
-  // ONE definition, handed to whichever arrangement is built — the split's
-  // attribution half or the one-kernel `createSrcHitShader` behind the R12
-  // hatch. Two copies would be two `surfaceAt`s to keep in step, which is the
-  // §12.9 crossed-numbering shape.
+  // ONE definition, handed to the split's attribution half — two copies would
+  // be two `surfaceAt`s to keep in step, which is the §12.9 crossed-numbering
+  // shape.
   const srcSurfaceAt = shadeEnabled && binStore
     ? (hit, dir) => {
           // ⚠ `srcSurface.js`'s signature is `(voxel, worldPos, normal)`, NOT
@@ -976,11 +965,7 @@ export function createSrcProbeSystem({
 
   // ── THE LIGHTING HALF'S ARGUMENTS, ONCE ───────────────────────────────────
   //
-  // The same object feeds `createSrcHitLighting` (split, in [J]) and
-  // `createSrcHitShader` (one-kernel, behind the R12 hatch). Built here rather
-  // than spelled twice so the two arrangements can never disagree about what
-  // "the lighting" is — the whole point of the hatch is that they differ only
-  // in WHICH KERNEL compiles it.
+  // Feeds `createSrcHitLighting` in [J].
   const lightingOptions = srcSurfaceAt
     ? {
         sun: lighting.sun ?? null,
@@ -1020,13 +1005,11 @@ export function createSrcProbeSystem({
         // visibility marcher already binds — zero new storage bindings in
         // [J], the entire reason W1 staged it there.
         //
-        // **DEFAULT ON since 2026-08-15 (§12.70), together with
-        // `__giEmitterTileCut` — the two are one feature (W5b): this gives
-        // every emitter a TRANSPORT sampler, the cut gives it a SCREEN one,
-        // and R5's zeroing keys on THIS hatch. Armed apart they double-deliver
-        // or under-deliver; the measurement is in the plan.** Gated on the W3
-        // fixture (19/19), the live ABBA parity rig (energy 1.008, noise
-        // 0.96×) and §12.70's storm + Sponza ledgers.
+        // **DEFAULT ON since 2026-08-15 (§12.70), together with the per-tile
+        // emitter cut — the two are one feature (W5b): this gives every emitter
+        // a TRANSPORT sampler, the cut gives it a SCREEN one, and R5's zeroing
+        // keys on this one.** Gated on the W3 fixture (19/19), the live ABBA
+        // parity rig (energy 1.008, noise 0.96×) and §12.70's ledgers.
         // `__giSrcLightTree = false` restores the four promoted slots.
         lightTree: (() => {
           if (globalThis.__giSrcLightTree === false) return null;
@@ -1063,79 +1046,13 @@ export function createSrcProbeSystem({
             evalAt: (P, n, idx) => evalAt(P, n, base, idx),
           };
         })(),
-        // ── §12.82: TAKE THE SUN OUT OF THE TEMPORAL STORE ────────────────
-        //
-        // The user's Level runs a day cycle and the sun never stops turning, so
-        // every stored radiance is stale by however long ago its bin was last
-        // refreshed — and neighbouring bins are stale by DIFFERENT amounts,
-        // which is the bright/dark patchwork they report. `srcDeposit.js`'s
-        // `BIN_SR` note carries the measurement and why no blend rate fixes it.
-        //
-        // The slot INDEX is the interface, not the light: `kind` is a uniform
-        // (R11), so which slot is directional is a runtime fact and a build-time
-        // pick would be wrong the moment a light is added. `< 0` means the scene
-        // has no directional light and the split arms nothing — the shader is
-        // still emitted, the comparison simply never matches, so adding a sun to
-        // a scene that had none does not recompile.
-        //
-        // ⛔⛔ **DEFAULT OFF, AND IT MUST STAY OFF UNTIL THE DELIVERY IS
-        // WHOLE.** The mechanism is built, gated at the hit (`test:gi-src-shade`
-        // proves the split-then-close identity to 0.0000%) and correct per hit —
-        // but the BIN-level delivery is short, measured on the user's Level with
-        // the sun PINNED and the pose pinned:
-        //
-        //   removed from the picture   leg0 46%   leg1 57%   (the sun is ~half
-        //                                                     this scene's GI)
-        //   delivered back by [F]      leg0  5%   leg1 24%
-        //   i.e. the transfer returns  leg0 11%   leg1 41%   of what it took
-        //
-        // A quarter to a half of the picture, gone. Arming this by default would
-        // ship exactly the regression the 60 fps rule's sibling forbids — never
-        // ship what looks bad — and it would do it while every counter read
-        // healthy (merge orphan rate, corners and noBlock are all UNCHANGED
-        // between the arms). `__giSrcSunSplit = true` arms it for measurement.
-        sunSplit: globalThis.__giSrcSunSplit !== true || lighting.sunSlot == null
-          ? null
-          // `__giSrcSunSplitKeep` DOUBLE-DELIVERS the sun on purpose — see
-          // `createSrcHitLighting`'s `splitKeep`. It is the only way to weigh
-          // the removed half against the delivered half; never a shipping arm.
-          : { slot: lighting.sunSlot, keep: globalThis.__giSrcSunSplitKeep === true },
         count: shadeCounters,
       }
     : null;
 
-  // What `[F]` closes the cached transfer against — the SAME pair the shading
-  // was built from, resolved through `srcShade.js` so the deposit side and the
-  // resolve side cannot drift apart. A thunk: the nodes belong to whichever
-  // kernel body calls it.
-  const sunClose = lightingOptions && splitShade ? sunTerm(lightingOptions) : null;
-  // §12.42's rule — a number nothing prints does not exist, and this one has
-  // three ways to be silently absent (no surface attribution, the one-kernel
-  // arm, no directional slot to name). The walk probe reads this line to know
-  // which arm it measured.
-  if (lightingOptions) {
-    console.log(
-      sunClose
-        ? "[gi] src §12.82 sun split: ARMED (opt-in) — the sun is re-evaluated per frame at [F]. " +
-          "⚠ ITS BIN-LEVEL DELIVERY IS SHORT (11-41% of what it removes); do not read this arm as correct"
-        : `[gi] src §12.82 sun split: OFF (${
-          globalThis.__giSrcSunSplit !== true ? "default — arm with __giSrcSunSplit = true"
-            : !splitShade ? "one-kernel shading (__giSrcSplitShade = false) — [J] is where the split deposits"
-              : "no directional light slot to name"
-        }) — the sun accumulates into the bins and stales with the day cycle`,
-    );
-  }
-
-  // THE SPLIT FORM: [E] gets attribution only.
-  const attribute = srcSurfaceAt && splitShade
+  // [E] gets attribution only; the lighting half shades in [J].
+  const attribute = srcSurfaceAt
     ? createSrcHitAttribution({ surfaceAt: srcSurfaceAt, count: shadeCounters })
-    : null;
-  // THE ONE-KERNEL FORM, behind `__giSrcSplitShade = false` — the pre-§12.53
-  // deposit, every measurement before the split was taken on it, and it is
-  // single-bounce because [J] (which carried the gather) does not exist on this
-  // arm at all.
-  const shadeHit = srcSurfaceAt && !splitShade
-    ? createSrcHitShader({ surfaceAt: srcSurfaceAt, ...lightingOptions })
     : null;
 
   // ── [J]: THE SHADING PASS, AND THE SECOND BOUNCE INSIDE IT ────────────────
@@ -1151,7 +1068,7 @@ export function createSrcProbeSystem({
   const secondary = shadingPass && binStore
     ? createSrcSecondaryFrame(store, binStore, {
         // THE MOVED HALF. Every one of `lightingOptions`' entries used to be an
-        // argument to `createSrcHitShader` inside the deposit's ray loop.
+        // argument to `createSrcHitLighting` inside the deposit's ray loop.
         shade: createSrcHitLighting(lightingOptions),
         // The multibounce TERM. False keeps the shading and drops the gather —
         // see `bounceOn` above for why that is not the same switch as the pass.
@@ -1197,13 +1114,8 @@ export function createSrcProbeSystem({
         // shades nothing at all and what survives the resolve is transmittance
         // — a receiver lit by transmittance alone against the sky is ambient
         // occlusion, which is §7's "AO-like short-range bounce" and not a
-        // placeholder. Exactly one of these is ever non-null — the constructor
-        // refuses both, because a kernel that shades inline AND appends would
-        // have [J] shade the same hit again.
+        // placeholder.
         attribute,
-        shadeHit,
-        // §12.82: what `[F]` re-evaluates the cached sun transfer against.
-        sunClose,
         // [J]'s hit list. Passed ONLY when [J] exists, and that is what keeps
         // the un-split kernel byte-identical to the pre-[J] one: with this
         // null, not a node of the record or the append is built.
@@ -1274,23 +1186,6 @@ export function createSrcProbeSystem({
   // backs a bit-exactness claim. The live dial is `__giSrcSeedRays` (0 = the
   // in-page A/B arm), polled in `syncCamera` under the same §12.23 rule as α.
   const seedOn = globalThis.__giSrcSeed !== false;
-  // ⚠ §12.82 AND THE SEED, WORKED THROUGH — IT COMPOSES, AND THE REASON IS THE
-  // COUNT. The seed copies a parent's RESOLVED payload into `BIN_R/G/B`, which
-  // under the split is the SUN-FREE channel, and that payload has already had
-  // the sun closed into it at `[F]`. That reads like a double delivery. It is
-  // not, because the seed also adds its weight `W` to `BIN_COUNT`, and the
-  // resolve divides BOTH sums by it:
-  //
-  //     ΣR/Σcount            = w_seed·L_parent(full) + w_ray·L(sun-free)
-  //     (ΣS/Σcount)·E·cos    = w_ray·sun(now)          — ΣS has no seeded term
-  //     total                = w_seed·L_parent(full) + w_ray·L(full, now)
-  //
-  // a convex blend of the parent's answer and this frame's, which is exactly
-  // what the seed is for. What the seeded fraction carries is a STALE sun (the
-  // parent's, at seed time), decaying out at the ordinary rate — i.e. the
-  // pre-split behaviour, confined to a shrinking fraction of one bin's weight,
-  // instead of the whole store. Nothing to guard; worth writing down, because
-  // the shape invites the wrong conclusion and a "fix" would break the blend.
   const seedRaysU = uniform(SEED_RAYS);
   const seed = seedOn && deposit
     ? createSrcSeedFrame(store, binStore, {
@@ -1504,14 +1399,11 @@ export function createSrcProbeSystem({
         ],
     pixelProbe: frame.pixelProbe,
     /** Non-null only when the hit shading was actually built — see `describeSrcProbeSystem`. */
-    shading: (attribute && secondary) || shadeHit
+    shading: (attribute && secondary)
       ? {
           lights: (lighting?.lights ?? []).length,
           emitters: (lighting?.emitters ?? []).length,
           attributed: !!surfaces,
-          // WHICH ARRANGEMENT COMPILED, so the boot line cannot claim the split
-          // on a build running the hatch.
-          split: !!attribute,
           // THE BUILT TERM, not the gate that asked for it — a boot line that
           // disagrees with the built kernel is the §12.30 failure this file
           // keeps re-finding. ⚠ `!!secondary` stopped being this answer at
@@ -2228,11 +2120,7 @@ export function describeSrcProbeSystem(system) {
         // this module prints, so the log now names it.
         (system.shading
           ? `, SHADING (${system.shading.lights} lights, ${system.shading.emitters} emitters` +
-            `${system.shading.attributed ? ", static surfaces attributed" : ""}` +
-            // WHICH KERNEL SHADES. `__giSrcSplitShade = false` rebuilds the
-            // pre-§12.53 one-kernel deposit, and a boot line that did not say
-            // so would leave a 179 kB kernel looking like an 88 kB one.
-            `${system.shading.split ? ", shaded in [J]" : ", SHADED INLINE IN [E] (pre-split hatch)"}` +
+            `${system.shading.attributed ? ", static surfaces attributed" : ""}, shaded in [J]` +
             `${system.shading.secondary ? ", MULTIBOUNCE via the tile atlas" : ", single bounce"})`
           : ", NO hit shading (radiance is sky-only)") +
         (system.tiles

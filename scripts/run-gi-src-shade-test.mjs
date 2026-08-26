@@ -1,6 +1,6 @@
 // SRC HIT-SHADING GATE — drives scripts/gi-src-shade.html.
 //
-// Plan §7 Phase 5 / §12.26's gate: `srcShade.js`'s `createSrcHitShader` diffed
+// Plan §7 Phase 5 / §12.26's gate: `srcShade.js`'s attribution+lighting pair diffed
 // against `srcRef.js`'s `makeHitShader` on a synthetic fixture, plus the two
 // shadow-ray budget arms §12.26.3 paid for.
 //

@@ -75,19 +75,6 @@ const QUALITY = process.env.QUALITY ?? "high";
  */
 const DIAL = process.env.DIAL ?? "bias";
 /**
- * `ADAPTIVE=1` arms §12.90's adaptive gather lattice before the page boots.
- *
- * ⚠ IT CHANGES WHAT `bias` MEANS. Unarmed, the gather runs at the TIER's
- * s0 = 0.45 m, where the safe window is `1.9w − s0` = **0.025 m wide** — there is
- * no β that both stops the leak and keeps the pillar lit, so a bias sweep there
- * measures a knife edge and every level is wrong in one direction or the other.
- * Armed, the census picks s0 = 0.35 m and the window opens to 0.125 m
- * (0.100–0.225), which is the only regime in which "which β" is a real question.
- * So a `bias` sweep without this flag is not a cheaper version of one with it;
- * it is a different experiment on a lattice the fix has already replaced.
- */
-const ADAPTIVE = process.env.ADAPTIVE === "1";
-/**
  * BUILD-TIME transport overrides, for the 2026-08-24 "mud" question.
  *
  * `SPACING0` pins the SRC gather lattice outright (`__giSrcSpacing0`, which
@@ -156,10 +143,6 @@ const ROUNDS = Number(process.env.ROUNDS ?? 3);
 // arm's own answer rather than a blend of both.
 const HOLD = Number(process.env.HOLD ?? 1200);
 const wantPng = process.env.PNG !== "0";
-// ⚠ OVERRIDE THIS FOR EVERY A/B THAT SPANS TWO BOOTS. The PNG name is keyed on
-// the pose and the DIAL LEVEL only, so an `ADAPTIVE=1` run and a plain one write
-// the same filenames — the second silently overwrites the first, and comparing
-// "before" against "after" then compares a picture with itself.
 const OUT = process.env.OUT ?? ".gi-shots/gather-smooth";
 mkdirSync(OUT, { recursive: true });
 
@@ -216,7 +199,7 @@ page.on("pageerror", (e) => {
 });
 
 await installTauriShim(page, {});
-await page.evaluateOnNewDocument((project, quality, dial, adaptive, spacing0, rayCap, emitScale, irrEps) => {
+await page.evaluateOnNewDocument((project, quality, dial, spacing0, rayCap, emitScale, irrEps) => {
   localStorage.setItem("engine.projectRoot.v1", project);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
   globalThis.__editorKeepRendering = true;
@@ -228,10 +211,6 @@ await page.evaluateOnNewDocument((project, quality, dial, adaptive, spacing0, ra
   // and the standing rule is that a re-flip needs their explicit go-ahead, one
   // at a time, judged on their Level.
   if (dial === "los") globalThis.__giGatherLosWeight = true;
-  // §12.90's lattice census, also a BUILD decision: it runs once per rebuild in
-  // `#chooseAdaptiveLattice` and decides `spacing0` and `__giLod0ReachScale`
-  // before the transport is allocated. Nothing about it is live.
-  if (adaptive) globalThis.__giAdaptiveLattice = true;
   if (spacing0 > 0) globalThis.__giSrcSpacing0 = spacing0;
   if (rayCap > 0) globalThis.__giSrcProbeRayCap = rayCap;
   if (emitScale > 0) globalThis.__giEmitterShadowScale = emitScale;
@@ -239,7 +218,7 @@ await page.evaluateOnNewDocument((project, quality, dial, adaptive, spacing0, ra
   // The dial starts at the SHIPPED default so the boot, the build and the
   // convergence are the ones a user gets; the probe only moves it after the
   // field is settled.
-}, PROJECT, QUALITY, DIAL, ADAPTIVE, SPACING0, RAYCAP, EMITSCALE, IRREPS);
+}, PROJECT, QUALITY, DIAL, SPACING0, RAYCAP, EMITSCALE, IRREPS);
 
 await page.goto(url, { waitUntil: "load", timeout: 90000 });
 await page.waitForSelector(".hub-recent-open-btn", { timeout: 90000 });
@@ -267,20 +246,17 @@ const readyMark = await Promise.race([
   fieldReady, new Promise((r) => setTimeout(() => r(null), READY_MS)),
 ]);
 console.log(`  field ${readyMark ? "up" : "⚠ NOT READY (timed out)"} at ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-// ⚠ REFUSE TO MEASURE AN ARM THAT DID NOT ARM. §12.90's first version printed
-// its receipt from a census that ran ~500 lines AFTER the transport was built,
-// so the decision was real and the transport never saw it — every count came
-// back bit-identical and it read as a clean null. The receipt is now the proof
-// the build consumed it; no receipt with ADAPTIVE=1 means the census declined
-// (under 8 separators) or the flag never reached the page.
-if (ADAPTIVE && !latticeReceipt) {
+// ⚠ REFUSE TO MEASURE AN ARM THAT DID NOT ARM. §12.90's adaptive gather
+// lattice census runs on every build now; no receipt means it declined
+// (under 8 separators) rather than that a flag never reached the page.
+if (!latticeReceipt) {
   await browser.close();
   throw new Error(
-    "ADAPTIVE=1 but no `§12.90 adaptive gather lattice` receipt — the census did not fire, " +
+    "no `§12.90 adaptive gather lattice` receipt — the census did not fire, " +
     "so this would be a bias sweep on the TIER lattice (s0 0.45) mislabelled as one on 0.35.",
   );
 }
-if (latticeReceipt) console.log(`  ⭐ ${latticeReceipt}`);
+console.log(`  ⭐ ${latticeReceipt}`);
 
 // FREEZE EVERYTHING THAT IS NOT THE DIAL. Game time drives the day cycle
 // (GAME/scripts/Rotator.ts reads `engine.time.elapsed`) and the mixers drive

@@ -132,7 +132,6 @@ const pinned = await page.evaluate(async () => {
   return {
     light: lightEntity?.name ?? "(none)",
     adoptedMovers: sys?._dynSet?.count?.() ?? -1,
-    occluderSlots: sys?._moverOccluders?.count?.value ?? 0,
     restored,
   };
 });

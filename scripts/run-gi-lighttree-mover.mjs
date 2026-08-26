@@ -97,7 +97,6 @@ async function runArm(refreshOn) {
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
     globalThis.__giSrcLightTree = true;
-    globalThis.__giEmitterTileCut = true;
     if (!refresh) globalThis.__giLightTreeRefresh = false;
   }, genRoot, refreshOn);
   await page.goto(url, { waitUntil: "load", timeout: 60000 });

@@ -698,9 +698,6 @@ export function fitEmitterShape(geometry, matrixWorld, out) {
   const sx = _colX.length(), sy = _colY.length(), sz = _colZ.length();
   if (!(sx > 1e-8 && sy > 1e-8 && sz > 1e-8)) return false;
 
-  // Dev/harness hatch: legacy sphere/box-only shapes, for A/B and bisects.
-  const legacy = globalThis.__giLegacyEmitterShapes === true;
-
   const centerLocal = (x, y, z) => out.center.set(x, y, z).applyMatrix4(matrixWorld);
   const axes = (axisCol, u1Col, u2Col) => {
     out.by.copy(axisCol).divideScalar(axisCol.length());
@@ -725,7 +722,7 @@ export function fitEmitterShape(geometry, matrixWorld, out) {
     type === "SphereGeometry" &&
     (params?.phiLength ?? Math.PI * 2) > Math.PI * 2 - 1e-3 &&
     (params?.thetaLength ?? Math.PI) > Math.PI - 1e-3;
-  if (fullSphere || globalThis.__giSphereEmitters) {
+  if (fullSphere) {
     if (!geometry.boundingSphere) geometry.computeBoundingSphere();
     out.kind = EMITTER_KIND.SPHERE;
     out.center.copy(geometry.boundingSphere.center).applyMatrix4(matrixWorld);
@@ -736,8 +733,6 @@ export function fitEmitterShape(geometry, matrixWorld, out) {
     out.exHalf.set(out.radius, out.radius, out.radius);
     return true;
   }
-  if (legacy) return false;
-
   // --- Polyhedra → equal-area sphere --------------------------------------
   const polyEq = POLY_AREA_EQ_RADIUS[type];
   if (polyEq !== undefined && params && nearEqual(sx, sy, 0.03) && nearEqual(sy, sz, 0.03)) {

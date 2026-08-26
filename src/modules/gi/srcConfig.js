@@ -975,13 +975,11 @@ export const LOD0_REACH = 64;
  * quality for the probes the finer lattice was already spending. It is not a
  * violation of the criterion; it is the criterion being over-satisfied.
  *
- * ONE reader, read by BOTH twins (`lodAtDistance` here and in srcMathTsl), or
- * `test:gi-src-math` diffs a scaled GPU against an unscaled CPU. Unset = 1 =
- * the shipped constant exactly.
+ * ONE reader, read by BOTH twins (`lodAtDistance` here and in srcMathTsl), so
+ * the GPU and CPU forms of the lattice cannot drift apart.
  */
 export function lod0Reach() {
-  const k = Number(globalThis.__giLod0ReachScale);
-  return LOD0_REACH * (Number.isFinite(k) && k > 0 ? k : 1);
+  return LOD0_REACH;
 }
 
 /**

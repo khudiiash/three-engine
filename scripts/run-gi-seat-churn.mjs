@@ -101,10 +101,8 @@ async function runArm(arm) {
     localStorage.setItem("engine.projectRoot.v1", project);
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
-    // FULL DELIVERY ON BOTH ARMS, EXPLICITLY — see the header for why the
-    // tile-cut-off arm would be a confounded comparison rather than a control.
+    // FULL DELIVERY ON BOTH ARMS, EXPLICITLY.
     globalThis.__giSrcLightTree = true;
-    globalThis.__giEmitterTileCut = true;
     globalThis.__giEmitterSeatsFollowCamera = followCam;
   }, GEN_ROOT, follow);
   await page.goto(url, { waitUntil: "load", timeout: 60000 });

@@ -4,13 +4,12 @@
 // reads back the emitterShadow texture (channel 0 = slot 0, what materials
 // sample) and PNGs it, plus a viewport screenshot for context.
 // Env HATCH: none | noselfcut (__giNoOccSelfCut) | norecords
-// (__giRayHitShadowRecords=false) | sphere (__giSphereEmitters).
-// Arms: none (record-march default) | spherearm (__giEmitterRecordShadows=false,
-// the legacy sphere trace) | noprobe (__giShadowAnalyticWidth=false — march+pen
-// only) | kind (verdict-kind map) | tap (width-probe argmin-tap map) |
-// nopenumbra (__giEmitterAnalyticPenumbra=false — the pre-2026-08-13 width
-// probe) | nowide (__giEmitterWidePass=false — analytic width, no blur) |
-// noselfcut | norecords | sphere. STEPS=n overrides the macro budget.
+// (__giRayHitShadowRecords=false).
+// Arms: none (record-march default) | kind (verdict-kind map) | tap
+// (width-probe argmin-tap map) | nopenumbra (__giEmitterAnalyticPenumbra=false
+// — the pre-2026-08-13 width probe) | nowide (__giEmitterWidePass=false —
+// analytic width, no blur) | noselfcut | norecords. STEPS=n overrides the
+// macro budget.
 //   HATCH=none node scripts/run-gi-emitter-shadow-probe.mjs <url>
 import puppeteer from "puppeteer-core";
 import { writeFileSync } from "node:fs";
@@ -126,9 +125,7 @@ const sourceAngle = Number(process.env.SOURCEANGLE ?? 10);
 // elsewhere. This probe is the right gate for the pair because its two headline
 // metrics ARE the failure class the (refuted) blocker predicted: `grain` is the
 // waffle-lattice number (a voxel-quantized distance etching a regular pattern
-// into the floor) and `leak` is the seal. Composes with HATCH, so
-// `SRCVOL=legacy HATCH=spherearm` is the legacy sphere arm on the composited
-// distance — the pre-§12.6 shipping shadow.
+// into the floor) and `leak` is the seal. Composes with HATCH.
 const srcVol = process.env.SRCVOL ?? "";
 // CAPCUT — fraction of capWorld for the width probe's lattice-inset
 // rejection gate (`__giShadowWidthCapCut`; shipping default 0.5 since
@@ -153,11 +150,8 @@ const result = await page.evaluate(async ({ hatch, quality, steps, slab, sunOn, 
   globalThis.__editorKeepRendering = true;
   if (hatch === "noselfcut") globalThis.__giNoOccSelfCut = true;
   if (hatch === "norecords") globalThis.__giRayHitShadowRecords = false;
-  if (hatch === "sphere") globalThis.__giSphereEmitters = true;
-  if (hatch === "spherearm") globalThis.__giEmitterRecordShadows = false;
   if (steps) globalThis.__giDirectShadowSteps = steps;
   if (hatch === "kind") globalThis.__giEmitterShadowKindDebug = true;
-  if (hatch === "noprobe") globalThis.__giShadowAnalyticWidth = false;
   // THE ANALYTIC-PENUMBRA A/B (2026-08-13, plan §12.52.1 unit 2). Default ON:
   // the static-BVH arm's softness comes from the blocker distance + the two
   // wide passes. `nopenumbra` restores the 12-tap width probe (the pre-change

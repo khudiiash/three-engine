@@ -45,8 +45,7 @@
 //                   READ-ONLY through the tauri shim. Required — a rig scene
 //                   is a hypothesis, their scene is the case.
 //   POSE=px,py,pz,tx,ty,tz   camera (default: the screenshot's pose)
-//   ARM=default     comma set: nocut (__giEmitterTileCut=false +
-//                   __giSrcLightTree=false), nocomp (__giTileCutCompensate=1),
+//   ARM=default     comma set: nocomp (__giTileCutCompensate=1),
 //                   comp=<n> (__giTileCutCompensate=<n>, e.g. 64 = uncapped),
 //                   srcoff (__giSrcProbes=false — direct term only),
 //                   noamb (scene ambient light to 0)
@@ -102,7 +101,6 @@ await page.evaluateOnNewDocument((project, armStr, extra) => {
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
   globalThis.__editorKeepRendering = true;
   const flags = new Set(String(armStr).split(",").map((s) => s.trim()).filter(Boolean));
-  if (flags.has("nocut")) { globalThis.__giEmitterTileCut = false; globalThis.__giSrcLightTree = false; }
   if (flags.has("nocomp")) globalThis.__giTileCutCompensate = 1;
   if (flags.has("srcoff")) globalThis.__giSrcProbes = false;
   // The 2026-08-20 horizon-clip A/B: `noclip` restores the pre-fix emitter
@@ -442,7 +440,6 @@ const result = await page.evaluate(async ({ arm, grid, wantPng, settle }) => {
     tileCut: {
       horizonClip: globalThis.__giPolyHorizonClip !== false,
       compensate: globalThis.__giTileCutCompensate ?? "(default 2)",
-      enabled: globalThis.__giEmitterTileCut !== false,
       lightTree: globalThis.__giSrcLightTree !== false,
       srcProbes: globalThis.__giSrcProbes !== false,
     },

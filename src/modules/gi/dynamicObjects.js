@@ -318,11 +318,6 @@ export function buildBvh4Words(geometry) {
   return buildBvhWords(geometry, 4);
 }
 
-/** Compressed 8-wide build — the default mesh acceleration. */
-export function buildBvh8Words(geometry) {
-  return buildBvhWords(geometry, 8);
-}
-
 /**
  * Builds an object-local wide BVH with exact triangle leaves for `geometry`
  * and packs it into the u32 word layout the WGSL traversal reads. Built ONCE
@@ -826,7 +821,7 @@ const bvh8TraceWgsl = wgslFn(/* wgsl */ `
 `);
 
 /** Build-time traversal arity — ONE arm compiles per GI build (see header). */
-export function dynBvhArity() {
+function dynBvhArity() {
   return Number(globalThis.__giDynBvhArity) === 4 ? 4 : 8;
 }
 
@@ -2514,9 +2509,6 @@ export function composeFieldDynamics(field, dyn) {
   wrap("traceOccupancy", false);
   wrap("traceHybridBrick", false);
   wrap("traceHybridPlane", true);
-  // traceOccupancyCone (the legacy density-cone arm) is deliberately not
-  // composed: it is an opt-in A/B arm, and its transmittance contract has no
-  // nearest-hit to merge — the analytic-width default path covers dynamics.
   field.dynamicObjects = dyn;
   return field;
 }

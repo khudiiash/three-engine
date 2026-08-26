@@ -232,32 +232,6 @@ const armGlobals = (armName) => ({
   // what it looks like when a walk has just replaced the content BOTH parities
   // are holding. `__giShadowCheckerboard = false` restores the full trace.
   ...(arm === "nochecker" ? { __giShadowCheckerboard: false } : {}),
-  // ⭐ §12.82's CONTROL ARM — the sun back INSIDE the temporal store, which is
-  // every measurement taken before the split existed. `base` is the split; this
-  // is what it has to beat, and the two must be run in the same session because
-  // the day cycle's phase, not the arm, was the largest term until `SUNPIN`
-  // alignment landed.
-  // §12.82 is OPT-IN (its delivery is short — see srcSystem), so `sunsplit` is
-  // the arm that turns it ON and `base` is now the un-split control. The old
-  // `nosunsplit` spelling stays as an alias so older invocations still mean the
-  // control rather than silently becoming the experiment.
-  ...(arm === "sunsplit" ? { __giSrcSunSplit: true } : {}),
-  ...(arm === "sunsplitflatcos" || arm === "sunsplitkeep" ? { __giSrcSunSplit: true } : {}),
-  // §12.82's BISECT. Closes the sun with cos = 1 — deliberately wrong, and the
-  // only thing that separates "the cached transfer is short" from "the cached
-  // normal is wrong" when both read as a darker picture under a PINNED sun.
-  ...(arm === "sunsplitflatcos" ? { __giSunSplitCos: false } : {}),
-  // ⭐ THE DECOMPOSITION ARM. Keeps the sun in the accumulator AND closes the
-  // cached transfer on top, so `sunsplitkeep − nosunsplit` is what the transfer
-  // DELIVERS and `nosunsplit − base` is what the split cost. One image cannot
-  // separate those; three can. Double-delivers on purpose — never a ship arm.
-  ...(arm === "sunsplitkeep" ? { __giSrcSunSplitKeep: true } : {}),
-  // ⭐ Does the DECAY eat the cached normal? Radiance survives across frames on
-  // this scene (47540 lit bins against 13045 hits) but only ~9% of lit bins
-  // carry a normal, and the normal count tracks THIS FRAME's facing hits at a
-  // flat 0.73 — the signature of a per-frame wipe. This arm stops the decay
-  // touching `BIN_SN` at all.
-  ...(arm === "sunsplitholdn" ? { __giSrcSunSplit: true, __giSunSplitHoldNormal: true } : {}),
   // ══ §12.84 — IS THE ARTIFACT JUST `mLight` TURNING BOTH SMOOTHERS DOWN? ══
   //
   // Neither of these touches the sun's PHYSICS. Both undo what a CONSTANT-RATE
@@ -327,19 +301,6 @@ const armGlobals = (armName) => ({
   ...(arm === "motionsmooth" ? { __giSrcMotionRoot: false, __giIrrHistWeight: 0.9 } : {}),
   ...(arm === "noroot" ? { __giSrcMotionRoot: false } : {}),
   ...(arm === "irrhist" ? { __giIrrHistWeight: 0.9 } : {}),
-  // §12.90 — THE ADAPTIVE GATHER LATTICE, **DEFAULT ON since 2026-08-24**. The
-  // census reads this scene's separators (46, area-weighted p10 = 0.250 m) and
-  // picks s0 0.45 → 0.35 with β = 0.162 instead of taking the tier constant on
-  // faith. `noadapt` is now the regression control; `adapt` is redundant with
-  // `base` and kept only so older command lines still mean something.
-  ...(arm === "adapt" ? { __giAdaptiveLattice: true } : {}),
-  ...(arm === "noadapt" ? { __giAdaptiveLattice: false } : {}),
-  // The lattice WITHOUT §12.90b's metre-pinned reach. This is the arm that
-  // reproduced the "2.5× darker" scare to within 1.4% (leg0 tail luma 0.00587
-  // vs 0.00579, checker 0.1234 vs 0.1256) and so proved the darkening was
-  // `LOD0_REACH`'s cells-vs-metres bug rather than the finer lattice or β.
-  // Keep it: it is the only arm that can catch that regression coming back.
-  ...(arm === "adaptnoreach" ? { __giAdaptiveLattice: true, __giLod0ReachPin: false } : {}),
   }))(armName.replace(/\d+$/, ""))),
 });
 
@@ -360,9 +321,8 @@ const armGlobals = (armName) => ({
 const KNOWN_ARMS = new Set([
   "base", "retain", "worldkeys", "hold", "norest", "nosecondary", "nosurprise",
   "capbig", "capoff", "caplow", "alphamid", "alphabig", "nochecker",
-  "sunsplit", "sunsplitflatcos", "sunsplitkeep", "sunsplitholdn",
   "nolightfill", "nosmooth", "motionsmooth", "noroot", "irrhist",
-  "adapt", "noadapt", "adaptnoreach", "sixteenoff", "nocoverfrac",
+  "sixteenoff", "nocoverfrac",
 ]);
 for (const armName of ARMS) {
   const normalized = armName.replace(/\d+$/, "");
@@ -813,16 +773,6 @@ async function runArm(arm) {
           held: c.held, cap: c.probeCapacity, blocks: c.blockCapacity,
         })),
         seed: s.seed ? { probes: s.seed.probes, cold: s.seed.cold, orphans: s.seed.orphans } : null,
-        // §12.82: of the resolved bins that carry RADIANCE, how many could
-        // close the sun. Anything below ~100% is sun being dropped for want of
-        // a cached normal — on screen that is indistinguishable from a transfer
-        // that is too small, a wrong cosine, or a split that never armed.
-        sun: s.rays && s.rays.sunLive != null
-          ? {
-            live: s.rays.sunLive, withNormal: s.rays.sunNormal,
-            facing: s.rays.sunFacing, shaded: s.rays.sunShaded,
-          }
-          : null,
         // ── SURPRISE'S OWN THREE-WAY DIAGNOSTIC (srcSystem ~1888) ───────────
         // The per-block fast-α already exists: the decay mixes `keep′` toward
         // `surpriseF = TEMPORAL_ALPHA / α_now`, so a fully surprised block
@@ -1428,13 +1378,7 @@ for (const arm of ARMS) {
           (s.gather?.empty ? ` EMPTY ${s.gather.empty}` : "") +
           // ⚠ /lobeBins, NOT /32: `known` only counts bins whose patch crosses
           // the texel's horizon (~20.1 at w0=4), so /32 understated it by 59%.
-          ` | tiles cover ${((s.tiles?.coverage ?? 0) * 100).toFixed(0)}% knownBins ${(s.tiles?.meanKnownBins ?? 0).toFixed(1)}/${(s.tiles?.lobeBins ?? 32).toFixed(1)} (${((s.tiles?.knownFrac ?? 0) * 100).toFixed(0)}%)` +
-          (s.sun
-            ? `  ⭐ sun-split ${s.sun.withNormal}/${s.sun.live} LIT bins carry a normal (${
-              s.sun.live ? ((s.sun.withNormal / s.sun.live) * 100).toFixed(1) : "0.0"}%)` +
-              `, ${s.sun.facing}/${s.sun.shaded} HITS face the sun (${
-                s.sun.shaded ? ((s.sun.facing / s.sun.shaded) * 100).toFixed(1) : "0.0"}%)`
-            : ""));
+          ` | tiles cover ${((s.tiles?.coverage ?? 0) * 100).toFixed(0)}% knownBins ${(s.tiles?.meanKnownBins ?? 0).toFixed(1)}/${(s.tiles?.lobeBins ?? 32).toFixed(1)} (${((s.tiles?.knownFrac ?? 0) * 100).toFixed(0)}%)`);
       }
     }
     for (const w of r.windows ?? []) {

@@ -72,13 +72,8 @@ const TIERS = new Set(GI_QUALITY_LEVELS);
 export const GI_DEBUG_VIEWS = [
   "off",
   "indirect",
-  // "ao" is the factor the RESOLVE APPLIES. Since 2026-08-26 there is exactly
-  // ONE estimator behind it (per-pixel ray-traced, #armRtaoPass) — the
-  // screen-spiral and voxel-cone pair it replaced needed a mode each, because
-  // the resolve composed them with `min` and that made an isolated read of
-  // either impossible. One estimator, one view. The single-source modes come
-  // back automatically if `__giAoLegacy = true` ever re-arms the pair: this
-  // view then shows their `min`, which is still what the frame applies.
+  // "ao" is the factor the RESOLVE APPLIES. Exactly ONE estimator sits behind
+  // it (GTAO — see #armGtaoPass), so this view is that estimator's buffer.
   "ao",
   // "reflections" is the glossy field WEIGHTED BY FRESNEL, which is what
   // turns it from "a blurry copy of the scene" (the raw buffer holds a
@@ -251,7 +246,7 @@ const CONSTANT = {
   // changed: the old occupancy-oracle ladder inlined ~200 fetches into the
   // resolve kernel (§13.7f priced a build that never finished compiling with
   // it on) and could not darken inside its own 2-voxel self-surface
-  // allowance (§13.7d). `createGiAoPass` is a screen-space pass over the GI
+  // allowance (§13.7d). `createGiGtaoPass` is a screen-space pass over the GI
   // gbuffer instead — a tiny kernel, one texture sample in the resolve, and
   // contact-scale darkening from exact world positions. It still only ever
   // modulates the INDIRECT term (direct light keeps its traced shadows), so
@@ -269,7 +264,7 @@ const CONSTANT = {
   // scale shading the field already carries — a broad wash, no contact
   // definition. 0.5 pulls the wide ring under lattice scale (contact ring
   // 0.125 m) and pairs with the ring-union + ×3 renormalization fix in
-  // createGiAoPass, which is what actually lets a crevice read DARK.
+  // createGiGtaoPass, which is what actually lets a crevice read DARK.
   // Both are live uniforms — `__giAoOverride = {strength, radius}` to tune.
   // 0.85 → 0.75 same night: with the union actually engaging both rings,
   // 0.85 over-darkened the shadowed side ("started to look bad") — the

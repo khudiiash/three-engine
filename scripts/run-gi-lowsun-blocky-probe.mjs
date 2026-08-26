@@ -79,10 +79,6 @@ const armGlobals = (arm) => {
     ...(arm === "shadow1" ? { __giShadowScale: 1 } : {}),
     ...(arm === "emsh1" ? { __giEmitterShadowScale: 1 } : {}),
     ...(arm === "srcoff" ? { __giSrcProbes: false } : {}),
-    // The §12.70 tile cut keeps the top-4 emitters PER 8×8 TILE — a tile
-    // grid whose screen period matches the observed block scale. `nocut`
-    // pays every emitter everywhere (slow, diagnosis only).
-    ...(arm === "nocut" ? { __giEmitterTileCut: false, __giSrcLightTree: false } : {}),
   };
 };
 

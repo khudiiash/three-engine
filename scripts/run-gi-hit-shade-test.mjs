@@ -85,7 +85,7 @@ async function runArm(arm) {
     globalThis.__editorKeepRendering = true;
     if (!tracedOn) globalThis.__giHitEmitterShadows = false;
     if (forceExact) globalThis.__giConfigOverride = { exactReflections: true };
-    // §17: EXTRA={"__giOneBvhReflect":false} etc. — arm any dev global at
+    // §17: EXTRA={"__giBvhMask":false} etc. — arm any dev global at
     // boot, the same escape hatch every sibling rig carries.
     if (extra) for (const [k, v] of Object.entries(extra)) globalThis[k] = v;
   }, root, traced, FORCE_EXACT, process.env.EXTRA ? JSON.parse(process.env.EXTRA) : null);

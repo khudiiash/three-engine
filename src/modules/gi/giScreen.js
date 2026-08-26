@@ -469,77 +469,14 @@ export function createGiFarFieldAvgPass({ source, width, height, out }) {
 }
 
 /**
- * The resolve pass: one compute over screen pixels that turns the gbuffer
- * into the two textures materials read.
- *
- * `irradiance` — diffuse indirect (cascade gather) plus every emitter's
- * shadowed direct contribution. This is the whole diffuse GI answer, so a
- * rough material's entire GI cost becomes one texture fetch.
- *
- * `emitterShadow` — the per-emitter shadow factor (one channel per slot,
- * MAX_EMITTERS = 4) that the in-material specular glow needs. Without it,
- * glossy materials would have to re-trace shadows per pixel, which is
- * exactly the per-material cost this pass exists to remove.
- *
- * EXACT-REFLECTION HIT SHADING IS NOT HERE ANY MORE (§14 unit R-A,
- * 2026-08-22) — see `createGiBvhHitShade` below. It lived in this kernel from
- * 2026-08-02 ("binding the gather + emitter + light slots in the BVH pass asks
- * for 16 uniform buffers against a baseline of 12"), and that placement is
- * what made traced shadows at hits unshippable: the cone marcher inflated
- * THIS kernel's register footprint and the whole resolve's occupancy
- * collapsed — 5.95 → 66 ms on the user's Level, and a masked arm with ~10×
- * fewer hit pixels read the SAME 66 ms, which is the signature of a
- * whole-kernel cost, not a per-pixel one. So hits shipped UNSHADOWED at dense
- * (§12.56), and a reflected room rendered as flat, uniformly-lit albedo. The
- * uniform-buffer objection died when sceneSettings started asking the adapter
- * for 24, so the block now lives in its own pass at its own occupancy.
- *
- * `lightShadow` (optional) — GI-TRACED DIRECT SHADOWS. One occupancy shadow
- * cone per flagged analytic light slot, written to a 4-channel screen texture
- * that three's own lighting then samples through a custom `shadow.shadowNode`
- * (see GISystem's `#syncLightShadowNodes`). This is where a light's shadow gets
- * to be a real world-space trace against the same medium GI transports through,
- * instead of a shadow map — no map render, no cascade splits, no peter-panning,
- * and penumbra width that follows the light's authored angular size.
- *
- * It lives in THIS pass rather than in the materials for the same reason
- * everything else here does: one march per screen pixel per light instead of
- * one per fragment per material, and material shaders that stay a texture
- * fetch. Bundle: `{ target, slots, trace, lift, span }` — GISystem owns all of
- * them because they need the volume (trace/lift/span) and the light slots.
- *
- * `cameraPosition` IS ITS OWN INPUT, not a field of `radiance`, and that
- * separation is load-bearing rather than tidiness. Four things here need the
- * camera — the back-face `facing` flip, the gather's view bias, the reflection
- * incident ray, and (at the call site) the emitter shadow pass — while only ONE
- * of them is about reflections. It used to live inside the `radiance` bundle, so
- * a build with no cascade radiance lookup silently lost the back-face flip in
- * three surviving passes: `facing` degenerates to +1, a double-sided wall seen
- * from inside a room gathers the wrong hemisphere, and the emitter pass takes
- * its own documented `cameraPosition = null` fallback. Found while making this
- * chain survive the transport's deletion (GI_SRC_REBUILD_PLAN §12.8), where
- * `radiance` becomes null for real.
- *
- * `gather` MAY BE NULL — a build with no diffuse indirect at all (the SRC
- * rebuild's intermediate state: probes not yet populated). The diffuse term and
- * the AO that modulates it are then compiled out, not multiplied by zero, and
- * an exact-reflection hit is lit by its direct terms alone. Every other term
- * here — emitter direct, analytic direct, reflections, sun shadows — is
- * independent of it and keeps working.
- *
- * `farField` (§13 F3, optional — only passed when the detail volume is armed):
- * `{ node, worldMin, worldSize, feather }`. Surfaces outside the camera-
- * following detail box have no probes, no occupancy and no surface records —
- * without this term their indirect is an ACCIDENTAL zero (F0 measured them
- * crushed black). The term replaces the diffuse indirect with a hemispherical
- * constant — the far-field average texture × a sky-down cosine — feathered in
- * across the last `feather` metres inside the boundary. Direct sun, analytic
- * lights and their traced shadows are volume-independent and untouched; the
- * mix runs BEFORE those terms are added. `worldMin`/`worldSize` are the
- * volume's LIVE world uniforms, so every F2 slide moves the feather with the
- * box for free.
+ * The resolve pass: one compute over screen pixels producing the two textures
+ * materials sample — `irradiance` (cascade gather + every emitter's shadowed
+ * direct) and `emitterShadow` (per-slot shadow factor for in-material glow).
+ * `lightShadow` adds GI-traced direct shadows per flagged analytic slot.
+ * `gather`, `radiance`, `farField`, `ao` and `cameraPosition` may each be null
+ * or absent; every dependent term compiles out rather than multiplying by zero.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, screenRadiance = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, ao = null, vxao = null, rawCopy = null, emitterTileCut = null, farField = null }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, screenRadiance = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, ao = null, rawCopy = null, emitterTileCut = null, farField = null }) {
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
@@ -639,62 +576,47 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       }
       // AMBIENT OCCLUSION ON THE INDIRECT TERM — one texture sample.
       //
-      // The probe lattice is ~1m — indirect light arrives with NO small-scale
-      // occlusion: no contact darkening under props, no corner/crevice
-      // shading. The obscurance itself is computed in `createGiAoPass` (see
-      // its header for why the inlined occupancy-oracle ladder that used to
-      // live here is gone: §13.7f's unfinishable compile, §13.7d's 0.7 m
-      // blind zone); this kernel pays a single bilinear sample.
-      //
-      // Applied to the GATHER term only: emitter/analytic direct have real
-      // traced shadows (penumbra estimator) — obscuring them twice reads as
-      // dirt. Reflections keep their own visibility. The block compiles out
-      // when the component's `ao` prop is off (structural), and is gated on
+      // The probe lattice is ~1m, so indirect light arrives with NO small-scale
+      // occlusion. The obscurance is computed in `createGiGtaoPass`; this kernel
+      // pays a single bilinear sample. Applied to the GATHER term only:
+      // emitter/analytic direct have real traced shadows (obscuring them twice
+      // reads as dirt) and reflections keep their own visibility. The block
+      // compiles out when the component's `ao` prop is off, and is gated on
       // having a diffuse term at all — with none, `out` is zero here.
-      if ((gather || screenGather) && (ao?.node || vxao?.node)) {
-        const aoUv = vec2(px.toFloat().add(0.5).div(width), py.toFloat().add(0.5).div(height));
-        let factor = ao?.node ? ao.node.sample(aoUv).level(0).x : float(1);
-        // Hybrid composition, not multiplication: screen AO owns sub-voxel
-        // contacts while VXAO owns world-space/off-screen blockers. Taking the
-        // darker factor lets either estimator fill the other's blind spot but
-        // never charges the same occluder twice.
-        if (vxao?.node) {
-          // Hardware bilinear magnification crosses object silhouettes: one
-          // low-res floor texel beside a pillar blends into the pillar's
-          // pixels, creating a halo. Reuse the already-bound gbuffer to weight
-          // the four low-res samples by whether they belong to THIS surface.
-          // This costs texture reads only — no new storage buffer, so the
-          // portable eight-buffer budget is unchanged.
-          const vxWidth = vxao.width ?? width;
-          const vxHeight = vxao.height ?? height;
-          // Full-resolution VXAO needs no reconstruction at all. In
-          // particular, don't blur its exact per-pixel value back across a
-          // broad planar surface just because the optional half-res path has
-          // an edge-aware filter.
-          if (vxWidth === width && vxHeight === height) {
-            factor = factor.min(vxao.node.load(coord).x);
-          } else {
-          const lowX = px.toFloat().add(0.5).mul(vxWidth / width).sub(0.5).toVar();
-          const lowY = py.toFloat().add(0.5).mul(vxHeight / height).sub(0.5).toVar();
+      if ((gather || screenGather) && ao?.node) {
+        const aoWidth = ao.width ?? width;
+        const aoHeight = ao.height ?? height;
+        if (aoWidth === width && aoHeight === height) {
+          out.mulAssign(ao.node.load(coord).x);
+        } else {
+          // ⚠ THE HALF-RES UPSAMPLE IS LOAD-BEARING, NOT A NICETY. GTAO runs at
+          // half resolution (see #armGtaoPass), and hardware bilinear
+          // magnification crosses object silhouettes: one low-res floor texel
+          // beside a pillar blends into the pillar's pixels and haloes. Reuse
+          // the already-bound gbuffer to weight the four low-res taps by
+          // whether they belong to THIS surface. Texture reads only — no new
+          // storage buffer, so the portable eight-buffer budget is unchanged.
+          const lowX = px.toFloat().add(0.5).mul(aoWidth / width).sub(0.5).toVar();
+          const lowY = py.toFloat().add(0.5).mul(aoHeight / height).sub(0.5).toVar();
           const baseX = lowX.floor().toVar();
           const baseY = lowY.floor().toVar();
-          // THE BILINEAR FRACTIONS ARE NOT OPTIONAL. Weighting the 2×2 by the
+          // THE BILINEAR FRACTIONS ARE NOT OPTIONAL. Weighting the 2x2 by the
           // edge terms ALONE is a box filter: every full-res pixel inside one
           // low-res quad gets the identical average, so a smooth AO gradient
-          // comes out as 2×2 plateaus — quantised bands on exactly the large
+          // comes out as 2x2 plateaus — quantised bands on exactly the large
           // featureless floors this term exists to shade. The edge terms
           // MODULATE a bilinear interpolation; they do not replace it.
           const fx = lowX.sub(baseX).toVar();
           const fy = lowY.sub(baseY).toVar();
           const value = float(0).toVar();
           const weight = float(0).toVar();
-          const addVxaoTap = (dx, dy) => {
+          const addAoTap = (dx, dy) => {
             const bilinear = (dx === 0 ? fx.oneMinus() : fx).mul(dy === 0 ? fy.oneMinus() : fy);
-            const lx = baseX.add(dx).toInt().clamp(0, vxWidth - 1).toVar();
-            const ly = baseY.add(dy).toInt().clamp(0, vxHeight - 1).toVar();
-            // Must match createGiVxaoPass's low-pixel → gbuffer mapping.
-            const gx = lx.toFloat().add(0.5).mul(width / vxWidth).toInt().clamp(0, width - 1);
-            const gy = ly.toFloat().add(0.5).mul(height / vxHeight).toInt().clamp(0, height - 1);
+            const lx = baseX.add(dx).toInt().clamp(0, aoWidth - 1).toVar();
+            const ly = baseY.add(dy).toInt().clamp(0, aoHeight - 1).toVar();
+            // Must match createGiGtaoPass's low-pixel → gbuffer mapping.
+            const gx = lx.toFloat().add(0.5).mul(width / aoWidth).toInt().clamp(0, width - 1);
+            const gy = ly.toFloat().add(0.5).mul(height / aoHeight).toInt().clamp(0, height - 1);
             const tapP = positionNode.load(ivec2(gx, gy)).toVar();
             const tapN = normalNode.load(ivec2(gx, gy)).xyz.normalize().toVar();
             const sameNormal = smoothstep(0.7, 0.95, tapN.dot(N).abs());
@@ -703,27 +625,21 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
             // along the surface while it is still the SAME plane; a Euclidean
             // test rejects all four taps there and the term falls back to
             // "unoccluded", which reads as AO switching off toward the horizon.
-            // 0.75 m of plane separation is deliberately wider than the voxel
-            // AO detail scale: it keeps broad floor gradients while rejecting
-            // the foreground/background discontinuities (pillar, wall and
-            // furniture edges) the filter is actually for.
             const sameDepth = float(1).sub(smoothstep(0.12, 0.75, N.dot(tapP.xyz.sub(P)).abs()));
             const w = tapP.w.greaterThan(0.5).select(sameNormal.mul(sameDepth), float(0)).mul(bilinear);
-            value.addAssign(vxao.node.load(ivec2(lx, ly)).x.mul(w));
+            value.addAssign(ao.node.load(ivec2(lx, ly)).x.mul(w));
             weight.addAssign(w);
           };
-          addVxaoTap(0, 0);
-          addVxaoTap(1, 0);
-          addVxaoTap(0, 1);
-          addVxaoTap(1, 1);
-          const vxFactor = value.div(weight.max(1e-4)).toVar();
+          addAoTap(0, 0);
+          addAoTap(1, 0);
+          addAoTap(0, 1);
+          addAoTap(1, 1);
           // A disocclusion has no trustworthy low-res neighbour. Falling back
           // to unoccluded is preferable to importing a pillar/wall's dark
           // factor across the silhouette for a frame.
-          factor = factor.min(weight.greaterThan(1e-4).select(vxFactor, float(1)));
-          }
+          const aoFactor = value.div(weight.max(1e-4)).toVar();
+          out.mulAssign(weight.greaterThan(1e-4).select(aoFactor, float(1)));
         }
-        out.mulAssign(factor);
       }
       // ── §13 F3: THE FAR FIELD IS DELIBERATE, NOT AN ACCIDENT ────────────
       // Runs AFTER the AO block on purpose: the AO oracle's occupancy taps
@@ -1025,46 +941,12 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
             const p = sampleReflectionProbes(probes, shadePoint, nFace, float(1));
             const pIrr = vec3(p.rgb).mul(Math.PI).mul(p.weight).div(float(intensity).max(1e-4)).toVar();
             const lumW = vec3(0.2126, 0.7152, 0.0722);
-            // SOFT blend by luminance ratio, not a whole-winner select
-            // (2026-08-22 round 2, "shadows in mirrors look very weird"):
-            // the binary select flipped per hit point between the NOISY
-            // starved field and the smooth probe — the mottle survived,
-            // recoloured. Widened same day ("reflections are very dirty"):
-            // the field's per-point bounce variance IS the dirt on every
-            // reflected floor, so the probe now dominates up to ~parity
-            // (ratio 1 → ~half probe) and the field only wins outright
-            // where it is decisively BRIGHTER than the room average (sun
-            // bounce hotspots, ratio ≥1.6). Reflected bounce trades
-            // per-point exactness for the probe's smoothness — the traced
-            // direct sun/emitter terms added below keep the contrast that
-            // reads as lighting.
-            // ── §18.12: FLOOR THE LEVEL, KEEP THE HUE (2026-08-25) ───────────
-            //
-            // ⚠ THE OLD LINE CONTRADICTED THE COMMENT ABOVE IT. That comment
-            // states this is "a LUMINANCE FLOOR on the bounce term only" and
-            // warns in the same breath that "mixing would tint the converged
-            // field with the blurry probe" — and then the implementation was a
-            // full RGB `mix(pIrr, hitE, ...)`, which imports exactly that tint.
-            //
-            // The blend is deliberately probe-dominant up to ~parity, so ANY
-            // reflected surface dimmer than ~1.6x the room average took most of
-            // its bounce COLOUR from the probe atlas. The atlas is a blurred
-            // capture of the room, so its chroma is the room's average — on the
-            // user's Bistro, a scene with a large green neon and green foliage,
-            // that average is green. Result: "all reflections are greenish",
-            // on every dim reflected surface at once.
-            //
-            // It surfaced now rather than earlier because §18.6 made
-            // `bvhHitShade` run every frame instead of 1 in 30; before that the
-            // reflected image was frozen and stale, so the tint was never
-            // applied consistently enough to read as a colour cast.
-            //
-            // THE FIX IS THE COMMENT'S OWN DESIGN: derive a TARGET LUMINANCE
-            // with the identical curve, then SCALE the field's own colour to
-            // it. Same anti-dirt behaviour (a starved gather still gets lifted
-            // out of the dark), none of the chroma import. At parity the field
-            // now passes through untouched, where before it was already half
-            // probe.
+            // §18.12 SOFT BLEND BY LUMINANCE RATIO, HUE FROM THE FIELD.
+            // The probe dominates up to ~parity and the field only wins where
+            // it is decisively brighter (ratio >= 1.6), which kills the
+            // per-point bounce variance that read as dirt. The blend derives a
+            // TARGET LUMINANCE and SCALES the field's own colour to it — a full
+            // RGB mix imported the probe atlas's room-average chroma (green).
             const fieldLum = hitE.dot(lumW).toVar();
             const probeLum = pIrr.dot(lumW).toVar();
             const ratio = fieldLum.div(probeLum.max(1e-4)).toVar();
@@ -1174,48 +1056,12 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
             hitE.addAssign(termMask ? emitterTerm.mul(termMask.z) : emitterTerm);
           }
           if (bvhShade.lightSlots?.length) {
-            // ── §18.16: THE SUN SHADOW AT A REFLECTION HIT IS A BVH RAY NOW
-            // (2026-08-26, "many dark grid artifacts ... that mud is terrible
-            // even on higher roughness") ────────────────────────────────────
-            //
-            // THE ARTIFACT. On the user's Sponza (one directional light at
-            // intensity 30, mirror box at roughness 0 / metalness 1) every
-            // reflected SUNLIT surface came back as dense black-and-white
-            // salt-and-pepper: blown-white where the sun landed, near-black
-            // one texel away, in short axis-aligned runs. Only the lit
-            // regions carry it — the shadowed half of the same reflected
-            // floor is smooth — which localises it to the visibility term of
-            // the sun, and nothing else.
-            //
-            // THE MECHANISM WAS ALREADY WRITTEN DOWN, TWICE, AND ONLY HALF
-            // APPLIED. `emitterSlotShadow`'s own note (giLight.js) records
-            // that "the sphere trace's threshold admissions over the
-            // voxel-quantized distance field ETCHED A LATTICE GRID ACROSS
-            // RECEIVERS", and the emitter block directly above this one
-            // records the same finding for reflections in so many words —
-            // "the cone stamps a LATTICE OF BLACK CROSSES across every
-            // reflected floor and wall". Both moved the EMITTER arm onto the
-            // record march. The sun arm was added in the same round and kept
-            // the retired estimator. That is what is being photographed.
-            //
-            // WHY A BVH RAY RATHER THAN THE RECORD MARCH. The reflection ray
-            // that produced this hit was ALREADY traced through the static
-            // BVH8 (§17 R7a) — the exact triangles are right there, the
-            // traversal is any-hit (half the work of the closest-hit the
-            // prepass ran), and visibility is a boolean question. It is also
-            // CHEAPER than what it replaces: the cone is 32 fixed steps, each
-            // paying the occupancy oracle's ~27 near-field fetches. And it
-            // removes the 6 m reach cap with it — a BVH ray's cost is
-            // traversal depth, not distance, so a reflected wall across the
-            // atrium finally shadows the floor it stands on.
-            //
-            // The dynamic set unions in on top (bone capsules, spawned
-            // props), so a character standing in the sun casts a shadow in
-            // the mirror the same way its reflection appears in it.
-            //
-            // `__giHitBvhShadows = false` returns the whole light arm to the
-            // occupancy cone for an A/B; `__giHitDynShadows = false` drops
-            // just the dynamic union.
+            // §18.16: THE SUN SHADOW AT A REFLECTION HIT IS A BVH RAY.
+            // The reflection ray already traversed the static BVH8, so
+            // visibility is one any-hit ray there — cheaper than the retired
+            // occupancy cone (32 steps x ~27 oracle fetches, which etched a
+            // lattice of black crosses) and with no reach cap. The dynamic set
+            // unions on top so characters shadow inside a mirror.
             const bvhLightShadows = staticOcclude && globalThis.__giHitBvhShadows !== false;
             // Reach is derived, never a constant in metres (this module has
             // been burned by hard-coded world distances twice — the emitter
@@ -1313,528 +1159,16 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
 }
 
 /**
- * SCREEN-SPACE AMBIENT OCCLUSION, as its own pass — the successor to the
- * resolve's inlined occupancy-oracle ladder (2026-08-21).
- *
- * The oracle ladder was the right idea priced out of existence twice over:
- * §13.7f measured a build that NEVER FINISHED compiling with it on (~200
- * occupancy fetches inlined per resolve pixel — §13.14's "WGSL size buys
- * compile seconds", bought four times), and §13.7d showed it structurally
- * cannot darken below its own 2-voxel self-surface allowance (0.7 m at
- * default cells) — which is exactly the contact scale AO exists for.
- *
- * This pass reads the gbuffer instead: THREE golden-spiral rings of WORLD
- * POSITION taps around each pixel (22 total — a WIDE ring at the authored
- * radius for corner and crevice shading, a CONTACT ring at a quarter of it
- * whose own falloff normalization keeps centimetre-scale darkening crisp
- * under feet and furniture, and a MICRO ring pinned at a fixed few PIXELS
- * that is the only one able to see two meshes touching at distance — see its
- * note below), Alchemy-style horizon estimate against the camera-faced
- * normal. The three rings combine by the multiplicative union
- * 1-(1-w)(1-c)(1-m) — each deepens what the others cannot resolve, bounded by
- * 1 — and a ^1.5 curve on the result deepens
- * creases without touching open surfaces. World-space vectors from exact
- * positions, so the self-surface allowance problem does not exist here —
- * contact darkening starts at centimetres. The classic screen-space blind
- * spot (off-screen occluders) is accepted: this term only ever REMOVES
- * light from the indirect estimate, and a missed occluder degrades to
- * exactly the pre-AO image.
- *
- * The kernel is ~30 lines of WGSL and two texture bindings — the compile
- * cost that killed the oracle simply is not here. The IGN rotation is a pure
- * function of the pixel coordinate, so the pattern is STABLE across frames:
- * no temporal noise, no filter debt. It modulates the INDIRECT term only
- * (the resolve applies it before the direct terms are added), same contract
- * as the ladder it replaces.
- *
- * `strength`/`radius` are the same live uniforms the old block bound
- * (`__giAoOverride` keeps working); `projScale` converts the world radius to
- * a screen tap radius (0.5 · resolveHeight · proj[1][1], written per frame
- * beside the resolve camera).
- */
-export function createGiAoPass({ gbuffer, width, height, cameraPosition, projScale, strength, radius }) {
-  const target = new THREE.StorageTexture(width, height);
-  target.name = "giAo";
-  // Only mip 0 is ever sampled. StorageTexture inherits automatic mip
-  // generation; leaving it on silently builds an unused chain every frame.
-  target.generateMipmaps = false;
-  const widthU = uniform(width, "uint");
-  const positionNode = texture(gbuffer.position);
-  const normalNode = texture(gbuffer.normal);
-  // The old 10/6/6 pattern left visible angular sectors around round props:
-  // a stable per-pixel spiral makes those sectors read as large AO blocks.
-  // These counts keep the same estimator/radii but provide enough angular
-  // coverage for a cylinder base without temporal dithering.
-  const TAPS_WIDE = 20;
-  const TAPS_CONTACT = 12;
-  // ── THE MICRO RING (2026-08-25, "very weak AO, almost invisible BETWEEN
-  // MESHES — possibly it works only on larger meshes") ──────────────────────
-  //
-  // That report names a RESOLUTION limit, not a strength one, and turning
-  // strength up cannot reach it. Both rings above are anchored in WORLD space
-  // (`aoRadius` 0.5 m, projected to pixels), and a ring of N taps spread
-  // √-uniform over radius r puts its INNERMOST tap at r·√(0.5/N) — so the
-  // contact ring's 6 taps at r = 0.25·pxRad never sample closer than ~0.29 r.
-  //
-  // Work it through at a normal viewing distance (projScale ≈ 964 for a
-  // 900-row resolve at 50°, dist 10 m): pxRad = 964·0.5/10 = 48 px, contact
-  // pxRadC = 12 px, innermost contact tap ≈ 3.5 px. A 2 cm gap between two
-  // touching props subtends 964·0.02/10 = 1.9 px. EVERY tap in both rings
-  // steps straight over it. A large mesh, by contrast, fills a big share of
-  // the 12-48 px disc and reads darkening normally — which is precisely
-  // "it works only on larger meshes".
-  //
-  // The fix is a ring pinned in SCREEN space rather than world space. Two
-  // surfaces that touch are adjacent IN PIXELS at every distance — that is the
-  // one invariant a world-anchored radius throws away — so a fixed few-pixel
-  // ring straddles the contact whether it is 2 cm at 10 m or 2 m at 1 km.
-  // Its falloff still normalizes in WORLD units (`effRM` below), which is what
-  // keeps it an occlusion term and not an edge detector: a tap 2 px away that
-  // is 20 m behind is a silhouette against the background, and its falloff
-  // sends it to exactly 0.
-  const TAPS_MICRO = 10;
-  const MICRO_PX = 3;
-  const compute = Fn(() => {
-    const px = instanceIndex.mod(widthU);
-    const py = instanceIndex.div(widthU);
-    const coord = ivec2(px.toInt(), py.toInt());
-    const ao = float(1).toVar();
-    const g0 = positionNode.load(coord).toVar();
-    // BOTH channels, not just position.w — srcSystem's readPixel records the
-    // measured lesson: w alone admits sky pixels whose normal is ZERO, and
-    // `normalize(0)` here would write NaN into a texture the resolve
-    // multiplies into every indirect pixel.
-    const nRaw = normalNode.load(coord).xyz.toVar();
-    If(g0.w.greaterThan(0.5).and(nRaw.dot(nRaw).greaterThan(0.25)), () => {
-      const P = g0.xyz.toVar();
-      // The same camera-facing flip the resolve and readPixel apply — a
-      // double-sided wall seen from inside must occlude against the inside.
-      const rawN = nRaw.normalize().toVar();
-      const facing = step(0, rawN.dot(vec3(cameraPosition).sub(P))).mul(2).sub(1);
-      const N = rawN.mul(facing).toVar();
-      const dist = vec3(cameraPosition).sub(P).length().max(1e-3).toVar();
-      const R = float(radius).max(0.05).toVar();
-      // World radius → screen taps. Clamped low so distant surfaces keep a
-      // usable footprint (AO fades there by the falloff, not by starvation)
-      // and high so near surfaces don't march across the whole frame.
-      // Max 128 since 2026-08-21 ("make AO realistic-notable"): at 64 the
-      // clamp bound at ROOM distances on every real resolve — a 473-row
-      // play viewport reached 0.31 m of the authored 0.8 at 2 m, so corner
-      // and crevice shading simply never happened. 128 restores the
-      // authored reach through typical rooms; the falloff renormalization
-      // below keeps whatever still clamps at full strength.
-      const pxRad = float(projScale).mul(R).div(dist).clamp(3, 128).toVar();
-      // THE EFFECTIVE RADIUS (2026-08-21 — "AO is quite weak"): at editor
-      // resolution the pixel clamp binds hard up close (931-px resolve,
-      // 0.6 m at 4 m wants 149 px), so the taps actually span a fraction of
-      // the authored radius — and normalizing the falloff against the FULL
-      // radius then under-reported every one of them. Renormalizing against
-      // the span the taps actually cover keeps near-field contact at full
-      // strength wherever the clamp bites; unclamped, effR == R exactly.
-      const effR = pxRad.mul(dist).div(float(projScale).max(1e-3)).toVar();
-      // Interleaved gradient noise — per-pixel spiral rotation, constant in
-      // time (deliberately: a temporally jittered AO needs a temporal filter;
-      // a stable pattern needs none).
-      const ign = fract(
-        fract(px.toFloat().mul(0.06711056).add(py.toFloat().mul(0.00583715))).mul(52.9829189),
-      ).toVar();
-      // THE CONTACT RING: a quarter of the wide radius with its OWN falloff
-      // normalization — the same renormalization argument as effR, applied
-      // at the scale where feet, chair legs and prop bases occlude. Min 2 px
-      // so it never collapses onto the centre texel.
-      const pxRadC = pxRad.mul(0.25).max(2).toVar();
-      const effRC = pxRadC.mul(dist).div(float(projScale).max(1e-3)).toVar();
-      // THE MICRO RING's radius is a CONSTANT IN PIXELS (see the note above) —
-      // deliberately not derived from `pxRad`, because deriving it from the
-      // world radius is the exact dependency that makes contacts invisible at
-      // distance. Its world falloff is the span those pixels actually cover at
-      // this depth, floored so the divide stays finite when the camera is
-      // almost on the surface.
-      const pxRadM = float(MICRO_PX).toVar();
-      const effRM = pxRadM.mul(dist).div(float(projScale).max(1e-3)).max(1e-3).toVar();
-      const occW = float(0).toVar();
-      const occC = float(0).toVar();
-      const occM = float(0).toVar();
-      // One ring: golden-angle spiral (even angular coverage at any tap
-      // count, radii spread √-uniform over the disc), Alchemy-style
-      // occlusion ∝ cosine of the tap above the tangent plane, faded over
-      // that ring's own effective radius. The 0.1 cosine bias eats
-      // self-plane noise and gentle curvature; a tap on this pixel's own
-      // flat surface reads exactly 0 by construction. `phase` decorrelates
-      // the two rings' spirals.
-      const ring = (taps, radPx, radWorld, phase, acc) => {
-        for (let k = 0; k < taps; k++) {
-          const ang = ign.mul(2 * Math.PI).add(k * 2.39996323 + phase);
-          // ── THE RADIUS IS JITTERED TOO (2026-08-26) ─────────────────────
-          //
-          // The IGN rotation randomized the ANGLE and left the RADII a fixed
-          // ladder — `sqrt((k + 0.5) / taps)` is the same 20 distances at
-          // every pixel in the frame. On a curved surface each of those
-          // distances crosses the geometry at its own point, so the estimate
-          // steps 20 times as the surface turns and the steps line up into
-          // concentric contours: structured error, identical in every pixel,
-          // which no spatial filter can average away because every pixel has
-          // the SAME error.
-          //
-          // `(k + ign) / taps` keeps the stratification (each tap still owns
-          // its own annulus, so coverage is unchanged) while making the offset
-          // inside the annulus per-pixel. That converts the contours into
-          // noise — which is a strictly better failure, because the denoiser
-          // behind this pass removes noise and cannot remove a contour.
-          const rad = radPx.mul(ign.add(k).div(taps).sqrt());
-          const sc = ivec2(
-            px.toFloat().add(cos(ang).mul(rad)).toInt().clamp(0, width - 1),
-            py.toFloat().add(sin(ang).mul(rad)).toInt().clamp(0, height - 1),
-          ).toVar();
-          const gs = positionNode.load(sc).toVar();
-          const D = gs.xyz.sub(P).toVar();
-          const dLen = D.length().max(1e-4).toVar();
-          const fall = float(1).sub(dLen.div(radWorld)).clamp(0, 1);
-          // Bias 0.1 → 0.03 (2026-08-24, "can't see any notable effect"):
-          // 0.1 also ate the GRAZING taps that define a contact — a floor
-          // pixel at a column base sees the wall at a shallow D·N, exactly
-          // the geometry this pass exists for. 0.03 still zeroes true
-          // self-plane taps (their cosine is 0 by construction).
-          const cosA = D.div(dLen).dot(N).sub(0.03).max(0);
-          acc.addAssign(select(gs.w.greaterThan(0.5), cosA.mul(fall), float(0)));
-        }
-      };
-      ring(TAPS_WIDE, pxRad, effR, 0, occW);
-      ring(TAPS_CONTACT, pxRadC, effRC, 1.2, occC);
-      // Third phase offset so all three spirals decorrelate; without it the
-      // micro ring would sample the same angular directions as the wide one
-      // and simply re-report its innermost taps.
-      ring(TAPS_MICRO, pxRadM, effRM, 2.4, occM);
-      // ×3, and the rings UNION multiplicatively (2026-08-24, the "no
-      // notable visual effect" report — both fixes measured against the
-      // ring math, not guessed):
-      // · ×2 assumed a covering hemisphere averages ~0.5 per tap, but the
-      //   product cosA·fall averages ~1/3 over the √-uniform disc even at
-      //   full coverage, so a fully enclosed crevice topped out at
-      //   obscurance ≈ 0.6·cos̄ ≈ 0.3 — AO could NEVER read dark. ×3 is the
-      //   correct renormalization for the linear-falloff disc mean.
-      // · max() discarded the contact ring wholesale: each ring normalizes
-      //   against its OWN radius, so at a real contact both report the same
-      //   fraction and max() returns the wide (lattice-scale) wash — the
-      //   6 contact taps were dead weight at exactly the pixels they were
-      //   added for. The multiplicative union 1-(1-w)(1-c) keeps the wide
-      //   ring's mid-scale term AND lets the contact ring deepen contacts,
-      //   bounded by 1 with no double-count blow-up.
-      // Wide ×2.5 vs contact ×3 (2026-08-24, second pass — the first shipped
-      // ×3 on BOTH and the user's very next look was "started to look bad":
-      // the broad ring's doubled obscurance multiplied into shadowed-side
-      // indirect read as murk, not contact). The contact ring keeps the full
-      // renormalization — crispness lives there; the wide ring stays the
-      // gentle mid-scale term it always was, just no longer discarded.
-      const obscW = occW.div(TAPS_WIDE).mul(2.5).clamp(0, 1);
-      const obscC = occC.div(TAPS_CONTACT).mul(3).clamp(0, 1);
-      // Same ×3 renormalization as the contact ring (the linear-falloff disc
-      // mean is ~1/3 even at full coverage), and it joins the SAME
-      // multiplicative union — bounded by 1, so three rings agreeing on a deep
-      // crevice saturate instead of compounding into a black hole.
-      const obscM = occM.div(TAPS_MICRO).mul(3).clamp(0, 1);
-      const union = float(1).sub(
-        float(1).sub(obscW).mul(float(1).sub(obscC)).mul(float(1).sub(obscM)),
-      );
-      const obscurance = union.mul(float(strength)).clamp(0, 1);
-      ao.assign(float(1).sub(obscurance).pow(1.5));
-    });
-    textureStore(target, coord, vec4(ao, 0, 0, 1));
-  })().compute(width * height);
-
-  return { compute, target, node: texture(target), widthU, width, height };
-}
-
-/**
- * RAY-TRACED AMBIENT OCCLUSION — AO FROM THE CASCADE'S OWN TRACER (2026-08-26).
- *
- * Replaces BOTH previous estimators, on a user directive ("abandon vxao and
- * gtao, for gi ao, reuse our Radiance Cascade traces"). What each of them was
- * and why neither survives:
- *
- *   · `createGiAoPass` — three screen-space spirals over the gbuffer. It can
- *     only see what is ON SCREEN and it estimates occlusion from a depth
- *     buffer, which is a heightfield and not the scene. 4.31 ms measured.
- *   · `createGiVxaoPass` — six 60-degree cones through the occupancy density
- *     pyramid. Correct in world space and blind below a level-1 cell, because
- *     that is the finest medium it has. **10.94 ms measured — the single most
- *     expensive pass in the whole SRC chain.**
- *
- * Both are approximations of one integral that this module can now evaluate
- * DIRECTLY: the cascade's own ray budget already runs against a masked static
- * BVH8 of exact world triangles (`dynamicObjects.traceStaticBvh`), plus the
- * exact dynamic set. So AO stops being a separate estimator with its own
- * failure modes and becomes the same visibility question the transport already
- * answers, asked per PIXEL instead of per probe.
- *
- * ══ WHY THIS IS NOT THE SAME AS GATHERING THE CASCADE'S STORED VISIBILITY ══
- *
- * Every c0 bin already stores `BIN_T`, the fraction of rays through that
- * direction that passed unblocked, and the gather's irradiance was integrated
- * from those same rays — so the occlusion is ALREADY in the gather, at PROBE
- * LATTICE resolution (0.70 m on the user's Sponza). Re-deriving AO from that
- * field and multiplying it back in would add no detail and darken twice. The
- * whole reason an AO term exists here is the sub-lattice band the probe grid
- * cannot resolve, and only a per-PIXEL query reaches it. That is this pass.
- *
- * ══ THE RADIUS IS DERIVED FROM THE CASCADE, NOT AUTHORED ═══════════════════
- *
- * `intervalBoundary(0, 0, s0) = s0 · R0_OVER_S0` is the distance cascade 0
- * resolves per probe. Four of those is the reach — which lands at 2.24 m on
- * the user's Sponza, within 12% of the 2.0 m the retired VXAO shipped, except
- * that this one is a function of what the scene measures rather than a metre
- * constant. That is the standing rule about world-unit constants, applied to
- * the one number this pass has.
- *
- * ══ WHAT MAKES FOUR RAYS ENOUGH ════════════════════════════════════════════
- *
- * · COSINE-WEIGHTED sampling, so `1 - mean(occluded)` IS the cosine-weighted
- *   visibility integral. No cosine factor, no bias term, no falloff curve
- *   standing in for one.
- * · STRATIFIED: ray k draws its radius from `[k/N, (k+1)/N)`, so the rays
- *   cannot clump. Only the offset inside each stratum is per-pixel.
- * · A STATIC pattern (no `frame` term). The same argument the retired screen
- *   pass made and then failed to honour: a per-pixel rotation is a per-pixel
- *   estimator, and its disagreement is spatial noise. The difference is that
- *   this pass is FOLLOWED by the separable cross-bilateral, which turns a
- *   5x5 neighbourhood of decorrelated 4-ray estimates into ~100 samples. A
- *   temporally-animated pattern would need a history buffer to pay off and
- *   would shimmer without one.
- * · A STOCHASTIC PER-RAY RANGE in [0.55R, R]. `anyHit` returns the first
- *   blocker rather than the nearest, so its `t` cannot drive an exact falloff
- *   curve — but jittering the ray's own tMax makes the ENSEMBLE a smooth ramp
- *   over that band, in expectation exactly. Free, and it is what stops a hard
- *   "AO ends here" ring on large surfaces.
- *
- * ══ THE BIAS IS SLOPE-SCALED, AND IT HAS TO BE ═════════════════════════════
- *
- * Cosine sampling puts most rays near the normal but the tail arbitrarily
- * close to the tangent plane, where an interpolated shading normal and the
- * true triangle diverge most — the classic RTAO dark-banding artifact. `d·N`
- * is `sqrt(1-u1)`, already computed for the direction, so scaling the offset
- * by `1/max(d·N, 0.15)` costs one divide and removes it. Against exact
- * triangles the offset is millimetres, not the 1.5 voxels a DDA needs (see
- * the static-BVH arm's note in GISystem: that inherited voxel bias was the
- * measured cause of "holes in the shadows").
- */
-export function createGiRtaoPass({
-  gbuffer,
-  width,
-  height,
-  resolveWidth,
-  resolveHeight,
-  cameraPosition,
-  strength,
-  radius,
-  bias,
-  rays = 4,
-  traceStatic,
-  traceDynamic = null,
-  target = null,
-}) {
-  // HALF FLOAT WHEN THE CALLER OWNS THE TARGET. An 8-bit AO history cannot
-  // hold an exponential blend: at weight 0.92 one frame moves the value by
-  // 8% of the gap, and below ~1/255 of a step the accumulator simply stops
-  // — the classic "temporal filter that converges to a quantized plateau".
-  if (!target) {
-    target = new THREE.StorageTexture(width, height);
-    target.name = "giRtaoRaw";
-    target.type = THREE.HalfFloatType;
-    target.generateMipmaps = false;
-    target.minFilter = THREE.LinearFilter;
-    target.magFilter = THREE.LinearFilter;
-  }
-
-  const widthU = uniform(width, "uint");
-  const positionNode = texture(gbuffer.position);
-  const normalNode = texture(gbuffer.normal);
-  const sx = resolveWidth / width;
-  const sy = resolveHeight / height;
-  const RAYS = Math.max(1, Math.min(16, Math.round(rays)));
-  /** Where the stochastic range window opens, as a fraction of the radius. */
-  const RANGE_FADE = 0.55;
-
-  const compute = Fn(() => {
-    const px = instanceIndex.mod(widthU);
-    const py = instanceIndex.div(widthU);
-    const sourceCoord = ivec2(
-      px.toFloat().add(0.5).mul(sx).toInt().clamp(0, resolveWidth - 1),
-      py.toFloat().add(0.5).mul(sy).toInt().clamp(0, resolveHeight - 1),
-    ).toVar();
-    const g0 = positionNode.load(sourceCoord).toVar();
-    const nRaw = normalNode.load(sourceCoord).xyz.toVar();
-    const ao = float(1).toVar();
-
-    // Both channels, not just `position.w`: a sky texel's normal is ZERO and
-    // `normalize(0)` would write NaN into a texture the resolve multiplies
-    // into every indirect pixel.
-    If(g0.w.greaterThan(0.5).and(nRaw.dot(nRaw).greaterThan(0.25)), () => {
-      const P = g0.xyz.toVar();
-      const rawN = nRaw.normalize().toVar();
-      // Camera-faced, as every other consumer of this gbuffer is: a
-      // double-sided wall seen from inside must be occluded against the
-      // inside.
-      const facing = step(0, rawN.dot(vec3(cameraPosition).sub(P))).mul(2).sub(1);
-      const N = rawN.mul(facing).toVar();
-      // Duff/Frisvad branchless ONB — `sgn + N.z` cannot vanish, so it is
-      // continuous everywhere a `select` on an up-vector is not (and it
-      // therefore cannot print a seam where one axis dominates).
-      const sgn = select(N.z.greaterThanEqual(0), float(1), float(-1)).toVar();
-      const oa = float(-1).div(sgn.add(N.z)).toVar();
-      const ob = N.x.mul(N.y).mul(oa).toVar();
-      const T = vec3(
-        N.x.mul(N.x).mul(oa).mul(sgn).add(1),
-        ob.mul(sgn),
-        N.x.mul(sgn).negate(),
-      ).toVar();
-      const B = vec3(ob, N.y.mul(N.y).mul(oa).add(sgn), N.y.negate()).toVar();
-      const R = float(radius).max(1e-3).toVar();
-      // Two decorrelated interleaved-gradient channels — same lattice,
-      // shifted phase, which is enough independence for a 2D sample.
-      const ignBase = fract(
-        fract(px.toFloat().mul(0.06711056).add(py.toFloat().mul(0.00583715))).mul(52.9829189),
-      ).toVar();
-      const ign2Base = fract(
-        fract(px.toFloat().add(37).mul(0.06711056).add(py.toFloat().add(17).mul(0.00583715)))
-          .mul(52.9829189),
-      ).toVar();
-      // ⛔ THE PATTERN IS FROZEN, AND IT STAYS FROZEN (user, 2026-08-26:
-      // "temporal is bad, remove it — we are a game engine, things move a
-      // lot, temporal does not work"). Animating it per frame and integrating
-      // with a reprojected history was built and reverted: it is the standard
-      // RTAO answer and it is the wrong one HERE, because reprojection is only
-      // valid where the world stood still, and in a game the world is the
-      // thing that moves. A frozen pattern's error is spatial noise, which the
-      // separable bilateral removes; an animated one's error is ghosting,
-      // which nothing downstream can.
-      const ign = ignBase;
-      const ign2 = ign2Base;
-      // ── INTERLEAVED 2x2 STRATIFICATION (2026-08-26) ─────────────────────
-      //
-      // A ray costs ~10 ns here — measured, and it is the whole budget: AO on
-      // vs off is 18.68 vs 11.33 ms for 714k rays, and neither the radius nor
-      // the dynamic-set trace moved it. So the only lever left is how much
-      // each ray is WORTH, and the classic answer costs nothing: give the four
-      // pixels of every 2x2 quad four DIFFERENT strata of the hemisphere.
-      //
-      // Any filter whose support spans the quad (radius >= 1 does) then
-      // reconstructs a 4x-stratified estimate from 1 ray per pixel. Not "4
-      // random samples" — 4 samples that provably cannot land in each other's
-      // annulus, which is strictly better than 4 independent ones.
-      //
-      // ⚠ IT MUST NOT BE THE ONLY DECORRELATION. The quad index is a fixed
-      // 2x2 pattern, so on its own it would print a 2x2 grid over the whole
-      // frame; `ign` still jitters INSIDE each stratum, per pixel, so the grid
-      // has no phase to align on.
-      const quad = px.bitAnd(uint(1)).add(py.bitAnd(uint(1)).mul(uint(2))).toFloat().toVar();
-      const STRATA = RAYS * 4;
-      const occ = float(0).toVar();
-      for (let k = 0; k < RAYS; k++) {
-        // Stratum (quad*RAYS + k) of STRATA, jittered inside itself.
-        const u1 = quad.mul(RAYS).add(k).add(ign).div(STRATA).clamp(0, 0.9999).toVar();
-        // The azimuth gets the quad too, a quarter turn apart, so two pixels
-        // in the same quad never sample the same DIRECTION either.
-        const u2 = fract(ign2.add(quad.mul(0.25)).add(k * 0.618033988749895)).toVar();
-        const r = u1.sqrt().toVar();
-        // d·N for a cosine-weighted sample, kept because the slope-scaled
-        // bias below needs exactly this number.
-        const cosD = u1.oneMinus().sqrt().toVar();
-        const phi = u2.mul(Math.PI * 2).toVar();
-        const dir = T.mul(r.mul(cos(phi))).add(B.mul(r.mul(sin(phi)))).add(N.mul(cosD)).toVar();
-        const b = float(bias).div(cosD.max(0.15)).toVar();
-        const origin = P.add(N.mul(b)).toVar();
-        // Stochastic range — see the header. `u2` is already spent on the
-        // azimuth, so this walks its own golden-ratio sequence.
-        const tMax = R.mul(mix(
-          float(RANGE_FADE), float(1),
-          fract(ign.add(quad.mul(0.17)).add(k * 0.754877666246693)),
-        )).toVar();
-        const hit = float(0).toVar();
-        const st = traceStatic(origin, dir, b, tMax);
-        if (st) hit.assign(select(st.x.greaterThanEqual(0), float(1), float(0)));
-        if (traceDynamic) {
-          const dyn = traceDynamic(origin, dir, b, tMax, P);
-          if (dyn) hit.assign(hit.max(dyn));
-        }
-        occ.addAssign(hit);
-      }
-      ao.assign(mix(float(1), occ.div(RAYS).oneMinus().clamp(0, 1), float(strength).clamp(0, 1)));
-    });
-
-    textureStore(target, ivec2(px.toInt(), py.toInt()), vec4(ao, 0, 0, 1));
-  })().compute(width * height);
-
-  compute.__giPassName = "rtao";
-  return { compute, target, node: texture(target), widthU, width, height, rays: RAYS };
-}
-
-/**
- * ⭐ GTAO — GROUND TRUTH AMBIENT OCCLUSION (2026-08-26, user: "could we get
- * back to GTAO in our GI AO solution? just make it right and good").
- *
- * WHAT "GROUND TRUTH" ACTUALLY MEANS HERE, because the name is the reason to
- * prefer it and it is routinely read as a marketing word. Every other AO this
- * module has shipped estimated occlusion with a HEURISTIC — count the rays
- * that hit (RTAO), accumulate density along a cone (VXAO), sum an
- * artist-shaped falloff per tap (the old spirals). GTAO instead SOLVES the
- * cosine-weighted visibility integral in closed form over the horizon angles
- * it measures (Jimenez et al., "Practical Realtime Strategies for Accurate
- * Indirect Occlusion", SIGGRAPH 2016). Given the same horizons, its answer is
- * the analytically correct one — no falloff curve to tune, no strength that
- * secretly means "how wrong am I willing to be". That is why this term has no
- * knobs, and it is the reason to run it in a module whose standing rule is
- * that GI has three properties.
- *
- * THE INTEGRAL, per slice, so the code below reads as maths:
- *
- *   A slice is the plane through the view vector V and one screen-space
- *   direction ω. Marching ω left and right and keeping the largest
- *   cos(angle to V) on each side gives the two HORIZON angles h₀, h₁ that
- *   bound the unoccluded arc in that plane. Projecting the surface normal
- *   into the same plane gives its in-plane angle γ and its length |n| (the
- *   share of the hemisphere this slice is entitled to). The cosine-weighted
- *   visibility of that arc is then, exactly,
- *
- *     ¼·|n|·Σ_{h ∈ {h₀,h₁}} ( cos γ + 2·h·sin γ − cos(2h − γ) )
- *
- *   and AO is the mean over slices. `cos γ` is `cosNorm` below and is never
- *   recomputed from γ — γ is derived FROM it by an arccos.
- *
- * WHY IT COMES BACK AFTER THE RAY-TRACED ARM. That arm is not wrong: it is
- * world-space correct and it sees off-screen geometry. But its cost is the
- * rays and only the rays (measured: ~10 ns each, and neither the reach nor
- * the dynamic-set traversal moved it), so the whole budget bought ONE ray per
- * pixel plus a 7×7 filter to hide the variance — and one ray is a binary
- * sample of a continuous integral. A GTAO slice is not a sample of anything:
- * it reads a horizon, the EXTREME over its entire march, and integrates it in
- * closed form. Three slices over 24 gbuffer loads therefore carry far more of
- * the answer than one ray does, for less, and they produce a smooth field
- * rather than a denoised one.
- *
- * ⚠ THE TRADE IS REAL AND IT IS SCREEN-SPACE: an occluder outside the frustum,
- * or hidden behind the surface it should darken, does not exist to this pass.
- * That is acceptable *here specifically* and nowhere else — the resolve
- * multiplies this factor into the GATHER term only, and the cascade's own
- * BIN_T visibility already carries every world-space blocker at probe-lattice
- * resolution (0.70 m on the user's Sponza). The whole job of an AO term in
- * this module is the SUB-LATTICE band, and that band is by construction
- * within a few pixels of the receiving pixel — exactly where a depth buffer
- * is a faithful description of the world. `__giAoRaytraced = true` restores
- * the ray-traced arm for an A/B.
- *
- * ⛔ NO TEMPORAL. Standing user directive, and GTAO normally ships WITH a
- * 6-frame temporal rotation — that half is deliberately not taken. The
- * pattern is Jimenez's 4×4 SPATIAL one (16 slice rotations × 4 step offsets
- * over a 4×4 pixel tile), jittered inside each cell so the tile has no phase
- * to print, and the existing separable bilateral reconstructs across it. A
- * frozen pattern's error is spatial noise, which a filter removes; an
- * animated one's error is ghosting, which nothing downstream can.
- *
- * ⚠ EVERY CONSTANT HERE IS A FRACTION OR A PIXEL COUNT — never a metre.
- * `radius` arrives derived from the cascade (see #armGtaoPass), the falloff
- * opens at a FRACTION of it, and the screen reach is clamped in pixels and as
- * a fraction of the frame height. Metre constants are the class this module
- * has now retracted three times.
+ * GTAO — the shipped AO term. Per slice (a plane through the view vector and
+ * one screen direction) it marches both horizons and SOLVES the cosine-weighted
+ * visibility of the arc in closed form (Jimenez et al. 2016):
+ *   1/4 * |n| * SUM_{h in {h0,h1}} ( cos g + 2*h*sin g - cos(2h - g) ),
+ * meaned over slices. No falloff curve, no strength — hence no knobs. Screen-
+ * space by design: it modulates the GATHER only, whose BIN_T visibility already
+ * carries world-space blockers at lattice resolution, so this term owns the
+ * SUB-LATTICE band, which is within a few pixels of the receiver. NO TEMPORAL:
+ * the 4x4 spatial pattern is jittered per cell and the separable bilateral
+ * reconstructs across it. Every constant is a fraction or a pixel count.
  */
 export function createGiGtaoPass({
   gbuffer,
@@ -2160,40 +1494,13 @@ export function createGiGtaoPass({
 
 
 /**
- * THE SCREEN-AO DENOISER (2026-08-26, "the ao is quite bad quality still,
- * especially screen space component").
- *
- * WHAT THE GRAIN IS. `createGiAoPass` rotates its three golden-angle spirals
- * by interleaved-gradient noise — a DIFFERENT angle at every pixel. Its header
- * calls that pattern "stable across frames: no temporal noise, no filter debt",
- * and the first half is true: nothing here flickers. The second half is not.
- * A per-pixel rotation is a per-pixel ESTIMATOR, so neighbouring pixels
- * integrate different subsets of the same hemisphere and disagree — that
- * disagreement is spatial noise whether or not it moves, and nothing
- * downstream was removing it. It is worst in the MICRO ring, which draws 10
- * taps from the ~28 pixels inside a 3 px disc and is then multiplied by 3.
- *
- * Every shipping SSAO pairs a rotated kernel with a spatial denoiser for
- * exactly this reason; the rotation is what trades BANDING for noise, and the
- * filter is the other half of that trade. (Dropping the rotation instead is
- * what the pass did before, and it printed angular sectors around round props
- * — see the TAPS_WIDE note. The pair is the answer, not either half.)
- *
- * SEPARABLE, AND CROSS-BILATERAL ON THE PLANE ONLY. Two radius-2 passes cover
- * a 5x5 support for 10 taps instead of 25. The edge test is the receiver's own
- * plane — |dot(N, tapP - P)| — and NOT a normal comparison, because the plane
- * test already rejects the perpendicular face of a corner (its distance from
- * the centre plane grows immediately) while costing one texture read per tap
- * instead of two. AO is a smooth 0..1 factor, so a tap that fails the test is
- * dropped and the weights renormalize; there is no fallback-to-unoccluded that
- * could print a bright halo at a silhouette.
- *
- * ⚠ THE TOLERANCE IS IN PIXEL FOOTPRINTS, NOT METRES. A fixed world epsilon
- * is the constant class this module keeps retracting: at 2 m it rejects a
- * floor's own neighbours, at 40 m it accepts a different wall. `dist /
- * projScale` is the world size of one pixel at this depth, so 4 of them is
- * "about as far as a 2-tap-radius neighbour can legitimately be", at every
- * distance and every field of view.
+ * THE SCREEN-AO DENOISER. A rotated-kernel estimator is a PER-PIXEL estimator:
+ * neighbouring pixels integrate different subsets of the same hemisphere and
+ * disagree, and that disagreement is spatial noise whether or not it moves.
+ * Two separable radius-2 cross-bilateral passes cover a 5x5 support for 10 taps.
+ * The edge test is the receiver's own plane — |dot(N, tapP - P)| — with the
+ * tolerance in PIXEL FOOTPRINTS (`dist / projScale`), never metres; failed taps
+ * are dropped and the weights renormalize, so no bright halo at a silhouette.
  */
 export function createGiAoFilterPass({ gbuffer, source, target, width, height, resolveWidth = width, resolveHeight = height, cameraPosition, projScale, axisX = 0, axisY = 0, radius = 2 }) {
   const widthU = uniform(width, "uint");
@@ -2281,165 +1588,6 @@ export function createGiAoFilterPass({ gbuffer, source, target, width, height, r
 
   compute.__giPassName = axisX ? "aoFilterX" : "aoFilterY";
   return { compute, widthU };
-}
-
-/**
- * WORLD-SPACE VOXEL AO — VXAO, in the NVIDIA sense: a cone-traced integral of
- * the hemisphere against a voxel opacity pyramid.
- *
- * The occupancy field already owns the expensive half: conservative scene
- * voxelization plus a five-level FRACTIONAL-density hierarchy. This pass only
- * traces it from visible gbuffer points. It deliberately lives outside the
- * resolve so the occupancy `bits` storage buffer is bound in this small kernel
- * alone; the fully-composed resolve stays under WebGPU's portable
- * eight-storage-buffer limit.
- *
- * THE CONE SET is Crassin's, which is also what VXGI/VXAO ship: six cones of
- * 60° aperture — one along the normal, five at 60° elevation spaced 72° in
- * azimuth — weighted by the cosine of their elevation, so the sum is a
- * cosine-weighted hemisphere integral rather than an unweighted average.
- *
- * NOTHING IS RANDOMISED. The previous arm rotated the azimuth per pixel with
- * interleaved-gradient noise and had no temporal or spatial filter behind it,
- * so the rotation was a per-pixel bias, not an ensemble that averages. Six wide
- * overlapping cones over a CONTINUOUS medium vary so little with azimuth that a
- * fixed frame costs almost nothing in bias and buys an exactly reproducible,
- * noise-free field — which is what a term reconstructed by a 2×2 bilateral
- * upsample needs. The frame is Duff et al.'s branchless orthonormal basis: it
- * has no `up`-vector flip, so it cannot print a seam where one axis dominates.
- *
- * `traceConeAO` is occupancyField.traceOccupancyConeAO — read its header for
- * why the estimator, not the filtering, is where AO smoothness is won.
- *
- * RESOLUTION. This term is metre-scale by construction (its finest medium is a
- * level-1 cell and its cones open at 60°), so it is computed at half width and
- * height and reconstructed by the resolve's position/normal-weighted bilinear
- * upsample. `createGiAoPass` remains responsible for exact screen-space
- * contacts below the voxel scale; the resolve composes them with `min`.
- */
-export function createGiVxaoPass({
-  gbuffer,
-  width,
-  height,
-  resolveWidth,
-  resolveHeight,
-  cameraPosition,
-  strength,
-  radius,
-  voxel,
-  traceConeAO,
-}) {
-  const target = new THREE.StorageTexture(width, height);
-  target.name = "giVxao";
-  target.generateMipmaps = false;
-  // This is a deliberately low-frequency channel. The resolve's edge-aware
-  // reconstruction is the magnification filter; silhouette/contact validity
-  // remains the full-res screen AO.
-  target.minFilter = THREE.LinearFilter;
-  target.magFilter = THREE.LinearFilter;
-
-  const widthU = uniform(width, "uint");
-  const positionNode = texture(gbuffer.position);
-  const normalNode = texture(gbuffer.normal);
-  const sx = resolveWidth / width;
-  const sy = resolveHeight / height;
-  /** 60° full aperture. Paired with cell = radius, this is the 1.5-cell
-   *  receiver-plane clearance the AO cone's header derives. */
-  const CONE_TAN_HALF = Math.tan(Math.PI / 6);
-  const SIDE_CONES = 5;
-  const SIDE_ELEVATION = Math.PI / 3;
-  const SIDE_Z = Math.cos(SIDE_ELEVATION);
-  const SIDE_R = Math.sin(SIDE_ELEVATION);
-  // Cosine-weighted, normalised. cos(0) = 1 for the axial cone, cos(60°) = 0.5
-  // for each side cone.
-  const WEIGHT_SUM = 1 + SIDE_CONES * SIDE_Z;
-  const W_AXIAL = 1 / WEIGHT_SUM;
-  const W_SIDE = SIDE_Z / WEIGHT_SUM;
-  // Geometric stepping needs ≈5 steps to cross a 2.4 m reach at this aperture;
-  // the march breaks out early, so this is a ceiling, not a cost.
-  const CONE_STEPS = 8;
-
-  const compute = Fn(() => {
-    const px = instanceIndex.mod(widthU);
-    const py = instanceIndex.div(widthU);
-    const sourceCoord = ivec2(
-      px.toFloat().add(0.5).mul(sx).toInt().clamp(0, resolveWidth - 1),
-      py.toFloat().add(0.5).mul(sy).toInt().clamp(0, resolveHeight - 1),
-    ).toVar();
-    const g0 = positionNode.load(sourceCoord).toVar();
-    const nRaw = normalNode.load(sourceCoord).xyz.toVar();
-    const ao = float(1).toVar();
-
-    If(g0.w.greaterThan(0.5).and(nRaw.dot(nRaw).greaterThan(0.25)), () => {
-      const P = g0.xyz.toVar();
-      const rawN = nRaw.normalize().toVar();
-      const facing = step(0, rawN.dot(vec3(cameraPosition).sub(P))).mul(2).sub(1);
-      const N = rawN.mul(facing).toVar();
-      // Duff/Frisvad branchless ONB. `sgn + N.z` cannot vanish: sgn is +1 only
-      // where N.z ≥ 0 and −1 only where N.z < 0, so the denominator is in
-      // ±[1, 2]. Continuous everywhere a `select` on an up-vector is not.
-      const sgn = select(N.z.greaterThanEqual(0), float(1), float(-1)).toVar();
-      const oa = float(-1).div(sgn.add(N.z)).toVar();
-      const ob = N.x.mul(N.y).mul(oa).toVar();
-      const T = vec3(
-        N.x.mul(N.x).mul(oa).mul(sgn).add(1),
-        ob.mul(sgn),
-        N.x.mul(sgn).negate(),
-      ).toVar();
-      const B = vec3(ob, N.y.mul(N.y).mul(oa).add(sgn), N.y.negate()).toVar();
-      const vox = vec3(voxel).toVar();
-      const voxMin = vox.x.min(vox.y).min(vox.z).toVar();
-      // The medium's finest cell is level 1 = two level-0 voxels. Lifting the
-      // origin 1.5 of those puts the very first sample at the trilinear
-      // kernel's first zero for the receiver's own surface slab, which is the
-      // same clearance the march then holds at every t (see its header).
-      const finest = voxMin.mul(2).toVar();
-      const origin = P.add(N.mul(finest.mul(1.5))).toVar();
-      const tMin = finest.mul(0.5).toVar();
-      // FOUR TIMES the AO radius — but what matters is the REACH IN METRES,
-      // and the two are only related through the shipped `aoRadius` of 0.5
-      // (giConfig), so if that moves far this multiplier has to be re-derived.
-      //
-      // 2 m is the far end of where this estimator is still honest.
-      // scripts/vxao-bench.mjs scores the march against brute-force ray-cast AO
-      // over the same voxels: rms 0.047 at 1 m, 0.043 at 1.5 m, 0.049 at 2 m,
-      // then 0.056 at 2.5 m and 0.068 at 3 m, drifting steadily dark as the
-      // top-level cell grows past a metre and its trilinear support starts
-      // finding a ceiling from two metres below it. Shorter reaches score no
-      // better and cannot see the off-screen occluder the gate is built around
-      // — a 0.85 m slab needs ~1.2 m along a 60-degree cone — so 2 m is the
-      // point where capability stops being free, not a preference.
-      const reach = float(radius).mul(4).max(finest.mul(6)).toVar();
-
-      const trace = (dir) => traceConeAO(origin, dir, tMin, reach, {
-        tanHalf: CONE_TAN_HALF,
-        steps: CONE_STEPS,
-        receiverP: P,
-        receiverN: N,
-      });
-
-      const visibility = trace(N).mul(W_AXIAL).toVar();
-      for (let k = 0; k < SIDE_CONES; k++) {
-        const a = (k * 2 * Math.PI) / SIDE_CONES;
-        // T and B are unit and orthogonal to N, and SIDE_Z² + SIDE_R² = 1, so
-        // this is already normalised — no normalize() in the inner loop.
-        const dir = N.mul(SIDE_Z).add(T.mul(Math.cos(a) * SIDE_R)).add(B.mul(Math.sin(a) * SIDE_R));
-        visibility.addAssign(trace(dir).mul(W_SIDE));
-      }
-
-      // `strength` applies undiluted. The previous arm scaled it by 0.55 to
-      // stop it double-darkening contacts the screen estimator also sees — but
-      // the resolve composes the two with `min`, which already forbids that,
-      // and most of what the factor was actually suppressing was the old
-      // march's own receiver-plane self-occlusion, which no longer exists.
-      ao.assign(mix(float(1), visibility.clamp(0, 1), float(strength).clamp(0, 1)));
-    });
-
-    textureStore(target, ivec2(px.toInt(), py.toInt()), vec4(ao, 0, 0, 1));
-  })().compute(width * height);
-
-  compute.__giPassName = "vxao";
-  return { compute, target, node: texture(target), widthU, width, height };
 }
 
 /**
@@ -2592,7 +1740,7 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
               .max(0)
               .toVar();
             const angle = rawAngle
-              .clamp(0.0005, globalThis.__giShadowAnalyticWidth !== false ? 0.78 : 0.35)
+              .clamp(0.0005, 0.78)
               .toVar();
             // The cone arm wants the TRUE half-angle, unclamped — capping
             // it at 0.35 was exactly the "90° looks the same as 20°" bug;
@@ -3230,10 +2378,8 @@ export function createGiEmitterTileCutPass({
 /**
  * EDGE-AWARE SPATIAL FILTER for the traced light-shadow channels.
  *
- * The sun-disc stochastic march resolves ONE jittered sun-disc direction per
- * shadow pixel: unbiased, but a wide penumbra renders as a static IGN dither
- * (~50% black/white speckle at half occlusion — the "very grainy and noisy"
- * report). This pass turns the pixel ensemble into the ensemble AVERAGE: a
+ * The traced shadow channel is a raw per-texel result (checkerboarded while
+ * the camera moves, and stochastic on the emitter arm). This pass turns it
  * 21-tap (5×5 minus corners) cross-bilateral at shadow resolution, weights
  * from the RECEIVER PLANE (gbuffer position/normal) so penumbras smooth along
  * a surface but never bleed across silhouettes or depth steps. `planeEps` is
@@ -3470,53 +2616,12 @@ export function createGiLightShadowFilterPass({
 }
 
 /**
- * WIDE PENUMBRA RECONSTRUCTION for the direct-shadow channel (2026-08-06).
- *
- * The analytic-width estimator softens the MISS side of a silhouette; the
- * central-ray HIT boundary is binary, and at large source angles that reads
- * as a hard edge inside the smoothed penumbra (user report at 30°, then
- * again at 90°). The material-side PCSS disc cannot fix it alone: its
- * radius is capped at 24 half-res texels (a 90° sun wants 3-4× that) and
- * spending more taps there costs every lit pixel of every material. This
- * pass does the wide blur ONCE, at the shadow channel's own budgeted
- * resolution: per-pixel penumbra width = tan(source half-angle) × blocker
- * distance (the march's own occluder distance, deterministic), radius up
- * to 40 shadow-res texels, a per-pixel IGN-rotated 12-tap golden spiral
- * whose taps contribute per-channel only within that channel's radius,
- * with receiver-plane validity so silhouettes don't cross-bleed. Sub-texel
- * radii keep the sharp result bit-exact, so a 0° sun is untouched.
- *
- * Point lights keep radius 0 for now (their angular size is per-pixel;
- * same deliberate deferral as the material disc).
- *
- * WORLD-WIDTH MODE (`slots: null`, 2026-08-13) — how the EMITTER channel uses
- * this same pass. Area emitters have no single source angle to reconstruct a
- * width from (it is per-pixel: reff/dist), so their marcher stores the
- * finished penumbra HALF-WIDTH IN METRES in the dist channel and this pass
- * only projects it to texels. That removes `span`, `tanHalf`, `slot.kind` and
- * the whole slot table from the emitter arm's bindings — the radius is one
- * multiply. `searchFrac` widens the blocker search to match the pass's own
- * radius cap: a pass that may blur by r texels has to look r texels out for
- * the blocker, or the penumbra clips at the geometric silhouette instead of
- * spanning both sides of it (the light arm's fixed 3 texels is sized for a
- * marcher that already softened the miss side; the emitter arm's raw is a
- * hard binary hit).
- *
- * ── THE WORLD→TEXEL MAP IS THE CAMERA'S, NOT A CONSTANT (2026-08-19) ────────
- * `projScale` is `P[5]/2` from the live projection matrix: a world half-width
- * `w` at depth `d` covers exactly `w·P[5]/(2d)` of the frame HEIGHT. It used to
- * be a hard-coded 1.2, which is that term at a 45° camera and nothing else — a
- * 60° view over-blurred by 1.39×, a 74° view by 1.8×. That is a bug you cannot
- * see as "wrong softness", only as "the shadow got weaker when I changed the
- * view", and it is half of the measured 2× over-blur that turned a full umbra
- * into 35% grey (scripts/run-gi-shadow-viewdist-probe.mjs).
- *
- * `radiusScale` is the other half. TWO CHAINED DISC BLURS OF RADIUS r ARE NOT
- * A BLUR OF RADIUS r — variances add, so the pair behaves like a single disc of
- * r·√2. The chain exists for SAMPLE COUNT (16 taps over 16-tap-averaged data ≈
- * 256 effective), not for width, so each instance takes 1/√2 of the analytic
- * width and the composite lands on the width the penumbra model actually asked
- * for. Callers that WANT the compounding (the 90° sun) simply leave it at 1.
+ * WIDE PENUMBRA RECONSTRUCTION for the direct-shadow channel. Per-pixel
+ * penumbra width = tan(source half-angle) x blocker distance (world half-width
+ * in metres on the emitter arm, `slots: null`), projected to texels through the
+ * LIVE `projScale` (P[5]/2) and capped at 40; a 12-tap IGN-rotated golden spiral
+ * with receiver-plane validity, sub-texel radii staying bit-exact. `radiusScale`
+ * takes 1/sqrt(2) per instance when two of these chain (variances add).
  */
 export function createGiLightShadowWidePass({
   gbuffer, source, dist, target, slots = null, span = 1, width, height, resolveWidth, resolveHeight,
@@ -4174,57 +3279,16 @@ export function createGiBvhReflect({
   // the WHOLE static scene through the shadow BVH8 in one traversal
   // instead of the ≤128-mesh linear loop, and shades hits from the
   // per-slot surface palette. Null keeps the incumbent path compiled
-  // (`__giOneBvhReflect = false` forces it from GISystem).
+  // per-slot surface palette. Null (the degrade ladder dropped the static BVH
+  // region) keeps the incumbent ≤128-mesh path compiled as the fallback.
   oneBvh = null,
 }) {
-  // ── ONE RAY PER stride×stride BLOCK (2026-08-16) ────────────────────────────
-  //
-  // MEASURED: this pass is **13.09 ms of a 31.85 ms ultra frame** on the banner
-  // Sponza (`profile.giPasses`, 1588×898) — 41 % of the frame, and by far the
-  // most expensive thing GI does. It was invisible for three sessions because
-  // it was missing from that op's pass list.
-  //
-  // A BVH traversal per pixel is what costs; the STORES are nearly free. So
-  // trace one ray per block and replicate the result across the block, which
-  // keeps every target full-resolution and therefore needs NO change in any
-  // consumer — the resolve reads these with `load(coord)` on its own full-res
-  // grid (createGiResolve's `bvhShade`) and materials sample by `screenUV`. A
-  // genuinely half-res TEXTURE would have required touching both.
-  //
-  // Replication is VALIDATED, not blind: each neighbour's gbuffer position and
-  // normal are compared against the traced texel's, and a texel that fails
-  // (the block straddles a silhouette) is written as a MISS rather than given
-  // its neighbour's hit distance. That matters because the consumer
-  // reconstructs the hit point from this `t` and its OWN normal — a wrong `t`
-  // puts the reflected sample somewhere else entirely, which is the bright
-  // smear half-res reflections are known for. A miss is not a hole: it is the
-  // same value a masked-off pixel gets, and the material falls back to the
-  // cascade lookup exactly as it does everywhere else.
-  //
-  // MEASURED on the banner Sponza at 1588×898: 13.09 ms per-pixel → 4.23 ms at
-  // stride 2 → 3.84 ms at stride 3. The curve flattens because the validation
-  // taps and the stores grow with the block while only the TRACES shrink, so
-  // stride 3 is the practical floor; past it the block starts spanning enough
-  // surface that the position/normal check rejects most neighbours and the
-  // reflection quietly degrades to the cascade lookup for no further speed.
-  //
-  // `__giBvhReflectStride` is the A/B hatch; 1 restores per-pixel tracing.
-  // Default 2 since 2026-08-21 (was 3): stride 3's larger blocks were
-  // half of the mosaic patchwork on CURVED mirrors (the user's mirror
-  // columns; the other half was the loose same-surface test below). Banner
-  // Sponza prices: 13.09 ms per-pixel / 4.23 at 2 / 3.84 at 3 — stride 2
-  // buys the quality back for +0.4 ms there, and small scenes barely notice
-  // (the user's Level: 0.45 ms at 3, ~0.9 at 2).
-  //
-  // `strideDefault` (2026-08-22): ULTRA passes 1. On complex reflected
-  // content (railings, stairs) half of every 2×2 block straddles a
-  // silhouette and its texels are validated-out to −1 — giLight then falls
-  // to the PROBE reflection on exactly those texels, and interleaving two
-  // different images per-texel is the salt-and-pepper stipple the user's
-  // mirror walls showed ("a lot of artifacts"). Per-pixel tracing removes
-  // the replication class entirely; ultra is the tier defined as "spend
-  // whatever it costs" (banner Sponza pays the full 13 ms there — lower
-  // quality if that hurts). High keeps 2 on its half-res grid.
+  // ── ONE RAY PER stride×stride BLOCK ────────────────────────────────────────
+  // A BVH traversal per pixel is what costs; the STORES are nearly free. Trace
+  // one ray per block and replicate across it, so every target stays full-res
+  // and no consumer changes. Replication is VALIDATED against each neighbour's
+  // gbuffer position/normal — a texel that straddles a silhouette is written as
+  // a MISS (-1, "never traced"), which falls back to the cascade lookup.
   const stride = giBvhReflectStride(strideDefault);
   const blocksW = Math.ceil(width / stride);
   const blocksH = Math.ceil(height / stride);
@@ -4431,13 +3495,8 @@ export function createGiBvhReflect({
           hasAlbedo.assign(1);
         });
       }
-      // The coverage flag exists so the (SDF-armed) consumer could union in
-      // meshes the BVH can't see. With the dyn union above, those pixels
-      // RESOLVE here instead of being flagged — and the flag's only
-      // consumer is compiled out on the deferred path anyway.
-      if (!globalThis.__giBvhV1 && !dynUnion) {
-        dynFlag.assign(bvhScene.dynamicBlocked(origin, R, t, float(maxDistance)));
-      }
+      // `dynFlag` stays 0: the dyn union above RESOLVES those pixels instead of
+      // flagging them, and the flag's only consumer is compiled out here.
     });
     const hitOut = vec4(t, dynFlag, octXY.x, octXY.y).toVar();
     const colorOut = vec4(albedo, hasAlbedo).toVar();
@@ -4628,43 +3687,7 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
     lightShadowRaw,
     lightShadowMid,
     lightShadowWide,
-    // TEMPORAL TRIO — LAZY (2026-08-06, the analytic-width default): the
-    // accumulate/history chain only exists on the stochastic A/B arm, and
-    // its history-position texture alone is 14.4MB of rgba32float at the
-    // 900k shadow budget (~22MB for the trio). `ensureShadowTemporal()`
-    // creates them on demand when a stochastic build actually asks — so an
-    // arm flip via `__giShadowAnalyticWidth = false` + rebuild still works
-    // against the SAME persistent targets object.
-    lightShadowAccum: null,
-    lightShadowHist: null,
-    lightShadowHistPos: null,
     lightShadowDist,
-    ensureShadowTemporal() {
-      if (this.lightShadowAccum) return;
-      const v = globalThis.__giNoTargetVersion ? 0 : ++targetGeneration;
-      // The ACCUMULATED signal (filter+temporal output). Materials do NOT
-      // sample this — a second, history-free filter pass cleans it into
-      // `lightShadow`. The split keeps the presentation blur OUTSIDE the
-      // accumulation loop: post-filtering the fed-back signal would
-      // convolve it once per frame and wash every penumbra to flat grey.
-      const accum = new THREE.StorageTexture(shadowWidth, shadowHeight);
-      accum.name = "giLightShadowAccum";
-      accum.version = v;
-      // Temporal history (createGiLightShadowFilterPass's reprojection):
-      // last frame's accumulated shadow + the world position it was
-      // resolved for (full float — half precision at world scale is ~3cm
-      // at 50m, the same order as the validity epsilon).
-      const hist = new THREE.StorageTexture(shadowWidth, shadowHeight);
-      hist.name = "giLightShadowHist";
-      hist.version = v;
-      const histPos = new THREE.StorageTexture(shadowWidth, shadowHeight);
-      histPos.type = THREE.FloatType;
-      histPos.name = "giLightShadowHistPos";
-      histPos.version = v;
-      this.lightShadowAccum = accum;
-      this.lightShadowHist = hist;
-      this.lightShadowHistPos = histPos;
-    },
     // THE EMITTER CHANNEL'S OWN TEMPORAL TRIO — same shape, same laziness, and
     // it did not exist until 2026-08-07.
     //
@@ -4765,9 +3788,6 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
       lightShadowRaw.dispose();
       lightShadowMid.dispose();
       lightShadowWide.dispose();
-      this.lightShadowAccum?.dispose();
-      this.lightShadowHist?.dispose();
-      this.lightShadowHistPos?.dispose();
       this.emitterShadowAccum?.dispose();
       this.emitterShadowHist?.dispose();
       this.emitterShadowHistPos?.dispose();
@@ -4854,66 +3874,12 @@ export function createGiBvhTarget(width, height, { radianceDiv = null } = {}) {
   bvhColor.magFilter = THREE.NearestFilter;
   bvhColor.name = "giBvhColor";
   bvhColor.version = version;
-  // `bvhRadiance` (2026-08-02) holds what the material actually wants: the
-  // reflected point's outgoing RADIANCE (rgb) + a valid flag (a), written by
-  // the HIT-SHADE pass (createGiBvhHitShade) from `bvhColor`'s albedo and
-  // `bvhReflect`'s hit geometry. It is its own texture rather than an
-  // overwrite of `bvhColor` because a pass cannot bind the same texture as
-  // both a sampled input and a writable storage output.
-  //
-  // HALF THE RESOLVE GRID + LinearFilter (2026-08-22): hit shading at full
-  // res was resolution theater — the prepass already block-replicates t at
-  // stride 2, and the marches (up to 3 emitter cones + a sun cone per
-  // texel) measured 43.26 ms at the user's 1.6M-pixel ultra resolve. The
-  // consumer samples by screenUV only (giLight — verified, no texel loads),
-  // so the hardware bilinear is the upsample, exactly the glossy chain's
-  // trade. The t/albedo textures STAY full-res (giLight reads exact t per
-  // pixel). `__giHitShadeFull = true` restores full-res for an A/B (read at
-  // target creation — boot-time, like every structural hatch).
-  //
-  // `radianceDiv` (§15 perf, 2026-08-22): the caller may widen the divisor
-  // below ultra — hit shading measured 4.42 ms of a 16.6 ms GPU frame at
-  // div 2 on the user's Level at "high", and the cost is whole-kernel
-  // register pressure (∝ threads, not work), so div 3 is a straight ~55%
-  // cut. Ultra keeps div 2: per-pixel exactness is that tier's contract.
-  // ⭐⭐ §18 W4 — THE DIVISOR IS A MAXIMUM NOW, NOT A CONSTANT, BECAUSE THE
-  // RESOLVE UNDER IT CAN MOVE 5x.
-  //
-  // `radianceDiv: 3` was measured and chosen against a FIXED 1.6 M-pixel ultra
-  // resolve, where it yields ~178 k radiance texels — about 3.2x linear
-  // magnification onto a 1.88 M-pixel screen, which the hardware bilinear
-  // carries. The frame governor (engine/frameGovernor.js) now scales the
-  // resolve itself, and a constant divisor turns into a QUALITY CLIFF the
-  // moment it does: at governor rung 3 the resolve is 592 k, the radiance grid
-  // is 65 k, and one reflection sample covers a 5.4 x 5.4 SCREEN BLOCK.
-  //
-  // That is a user-visible bug, reported as "reflections look incredibly
-  // shitty" with a screenshot of a Vespa whose chrome was blocky red/white/
-  // black speckle. Two multiplications of the same reduction stacked: the
-  // governor's, and this one.
-  //
-  // So solve for the divisor that HOLDS the shipped magnification instead of
-  // holding the shipped divisor.
-  //
-  // ⚠⚠ FRACTIONAL, AND THAT IS THE WHOLE TRICK. The first attempt rounded to an
-  // integer and its own gate rejected it: an integer step from 3 to 2
-  // multiplies radiance texels by 2.25 while one governor rung only removes
-  // 28%, so texels went UP between rung 1 and rung 2. That breaks the ladder's
-  // monotonicity in cost, which is far worse than the blockiness it fixes — the
-  // governor would descend a rung, measure a SLOWER frame, and descend again
-  // into a loop it can never win. A fractional divisor is safe because nothing
-  // downstream reads it: `createGiBvhHitShade` derives its mapping as
-  // `resolveWidth / radianceWidth` from the ACTUAL texture dimensions, and
-  // snaps that to the prepass stride (see its own banner on the 3-vs-2 beat).
-  //
-  // ⚠ CLAMPED AT 2 ON THE CHEAP SIDE, also load-bearing: without it a small
-  // resolve solves below 1 and the radiance grid ends up LARGER than it was at
-  // full quality. Div >= 2 keeps radiance texels <= resolve/4 at every rung, so
-  // cost falls with the rung even where magnification can no longer be held.
-  //
-  // At full-quality ultra this returns exactly 3.0 — the shipped value,
-  // unchanged, which is the point: it only engages where the governor has
-  // already spent resolve.
+  // `bvhRadiance` holds the reflected point's outgoing RADIANCE (rgb) + a valid
+  // flag, written by createGiBvhHitShade. Its own texture, because a pass cannot
+  // bind one texture as both sampled input and storage output. `radianceDiv` is
+  // a MAXIMUM, not a constant: the solved divisor holds ~178k radiance texels so
+  // the frame governor's resolve scaling and this reduction cannot multiply.
+  // Fractional on purpose (an integer step breaks ladder monotonicity); min 2.
   const capDiv = globalThis.__giHitShadeFull ? 1 : (radianceDiv ?? 2);
   const TARGET_RADIANCE_TEXELS = 178_000;
   const solved = Math.sqrt((width * height) / TARGET_RADIANCE_TEXELS);
@@ -4972,55 +3938,11 @@ export function createGiBvhTarget(width, height, { radianceDiv = null } = {}) {
 }
 
 /**
- * GPU-blits atlas tiles the canvas 2D path in bvhScene.js's buildAlbedoAtlas
- * could not draw — overwhelmingly KTX2/Basis-compressed material maps, which
- * have no CPU-readable `.image` for `ctx.drawImage` to sample (see that
- * function's own comment). The compute shader that actually SAMPLES the
- * atlas (bvhScene.js `firstHit`) has no such limitation: a compressed
- * texture is real, native GPU data, decoded by the sampler hardware exactly
- * like any other texture — the only reason those tiles were ever a flat
- * mean color is that the CANVAS couldn't see the pixels, not that the GPU
- * can't.
- *
- * One-shot per bvhScene build, entirely self-guarding: a no-op whenever
- * `bvhScene.pendingGpuTiles` is empty, which is true both BEFORE the first
- * call that has real work to do and forever AFTER that call finishes (it
- * clears the list). Callers (GISystem's `#tick`) can therefore call this
- * every frame unconditionally — see that call site's own comment.
- *
- * MECHANISM: two kinds of ordinary textured-quad passes (three's own
- * QuadMesh — the exact idiom every postprocessing pass in this three.js
- * build uses to relay one texture into another render target) into a fresh
- * 2048x2048 target: first the EXISTING canvas atlas whole (so every
- * already-drawn/solid-filled tile survives unchanged), then one quad per
- * pending tile with the viewport+scissor restricted to that tile's 256x256
- * rect, sampling the compressed map directly. Renderer state is saved and
- * restored via three's own RendererUtils — the same helper three's
- * postprocessing nodes use for exactly this "nested render mid-frame" shape
- * (renderGiGBuffer above hand-rolls the same idea for a narrower, scene/
- * camera-specific set of fields; this pass only ever touches the renderer).
- *
- * COLOR SPACE: the destination target is declared LINEAR colorSpace
- * (HalfFloatType has no `-srgb` GPU format variant to begin with, so this
- * is belt-and-braces, not load-bearing, for THAT type specifically — but it
- * is the semantically correct label and keeps the invariant explicit).
- * `texture(atlasTexture)`/`texture(map)` sampling auto-decodes each SOURCE
- * (both declared SRGBColorSpace, like any authored color texture) to linear
- * exactly once, at the GPU-format level — this renderer never bakes a
- * second, shader-side color-space conversion on top (see TextureNode's
- * `needsToWorkingColorSpace` callers: always format/hardware-driven here,
- * never WGSL-codegen-driven), so the linear value sampled is exactly the
- * linear value stored, and exactly the linear value read back later with no
- * further decode. A solid-fill tile therefore reads the SAME color before
- * and after this pass runs (old atlas, sRGB-decoded once → stored linear →
- * new target, read with no decode) — that equivalence is the whole
- * color-space correctness bar for this function, and is what makes swapping
- * `atlasTextureNode.value` afterward safe without rebuilding bvhScene's
- * already-compiled compute graph.
- *
- * @param {import("three/webgpu").Renderer} renderer
- * @param {ReturnType<typeof import("./bvh/bvhScene.js").buildBvhScene>} bvhScene
- * @return {number} Tiles actually blitted this call (0 = no-op).
+ * GPU-blits atlas tiles bvhScene's canvas path could not draw (KTX2/Basis maps
+ * have no CPU-readable `.image`): the existing atlas is relayed whole into a
+ * fresh LINEAR 2048² target, then one scissored quad per pending tile samples
+ * the compressed map directly. No-op while `pendingGpuTiles` is empty, so #tick
+ * may call it every frame. Returns the number of tiles blitted.
  */
 /**
  * Mean LINEAR color of a texture the CPU cannot draw (KTX2/basis), on the GPU.

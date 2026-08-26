@@ -31,13 +31,13 @@ import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionGe
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
 import { GI_TERM_DEBUG_VIEWS, giDebugView, resolveGiConfig, sceneSkyRadiance } from "./giConfig.js";
 import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
-import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiAoPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiRtaoPass, createGiShadowClearPass, createGiTargets, createGiVxaoPass, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
+import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
 import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
 import { noteTextureAverage, pendingTextureAverages, resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
 import { SRC_POOL_FLOORS, createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcPoolCeilings, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
-import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD, CASCADE_COUNT, R0_OVER_S0 as SRC_R0_OVER_S0, SRC_QUALITY, binCount } from "./srcConfig.js";
+import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD, CASCADE_COUNT, R0_OVER_S0 as SRC_R0_OVER_S0, binCount } from "./srcConfig.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { SURFACE_POOL_CEILINGS, createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
@@ -45,7 +45,7 @@ import { buildLightTree, collectEmitters, estimateLightTreeWords } from "./light
 import { fitPrimitive } from "./primitiveFit.js";
 import { fitEmitterShape } from "./emitterShapes.js";
 import { fitSkinnedCapsules, rigRootOf, skinnedBoneMatrix, skinnedBoxShape, skinnedCapsuleMatrix, skinnedCapsuleShape } from "./skinnedProxy.js";
-import { MeshBVH } from "three-mesh-bvh";
+
 import { DEBUG_LAYER, EDITOR_LAYER, GI_DYNAMIC_LAYER, GI_MIRROR_LAYER, GI_SHARP_LAYER, SHADOW_PROXY_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { collectStateComputeNodes, purgeNodeBuilderCache, releaseComputeNodes } from "./releaseCompute.js";
 import { textureLoadsInFlight } from "../../engine/textureAsset.js";
@@ -113,50 +113,12 @@ const OCC_DYNAMIC_QUIET_FRAMES = 90;
  * at the moment sleep begins. `__giNoIdleSleep = true` disables (A/B).
  */
 /**
- * §18.7 — THE SIZE-AWARE EMITTER CULL, in RADIANT POWER (`Phi = pi * A * L`).
- *
- * An emissive placement below this delivers no GI at all: no analytic slot, no
- * light-tree entry, no NEE sampling, AND no deposit into the probe field. Its
- * own visible glow is the raster material and is untouched — the mesh still
- * looks lit, it just stops paying for light nobody can see.
- *
- * ⚠ WHY POWER AND NOT BRIGHTNESS. The gate this replaces was `peak >= 0.5`, a
- * RADIANCE test, and radiance is size-blind. A 2 cm decorative bulb and a 2 m²
- * illuminated sign at the same authored brightness differ by more than three
- * orders of magnitude in delivered light, and that gate treated them
- * identically. Requiring `pi * A * L >= P_min` rearranges to
- * `L >= P_min / (pi * A)` — the smaller the emitter, the more brightness it
- * needs, continuously and with nothing to tune per size. That is the user's own
- * statement of the rule (2026-08-25).
- *
- * ⛔⛔ THE ABSOLUTE VERSION OF THIS GATE WAS MEASURED WRONG AND SHIPPED — read
- * this before touching the number. The first cut was `0.05` in absolute power,
- * justified as: a real Bistro lamp logs `P=1.8e+1`, a 2 cm bulb computes
- * `pi * 1.3e-3 * 0.2 ~ 8e-4`, four orders of magnitude apart, so anything
- * between "separates two clearly bimodal populations with wide margin".
- *
- * That was an inference from TWO data points, and the very next scene refuted
- * it. On the user's Bistro the gate culled **26 emitters**, taking the light
- * tree from 114 to 88 and leaving a green neon as the dominant chromatic
- * source — the user's "all reflections are greenish", correctly attributed by
- * them to our edits. Emitter powers are not bimodal; they are a broad continuum
- * whose SCALE is a property of how a scene was authored.
- *
- * ✅ SO THE GATE IS A FRACTION OF THE SCENE'S OWN TOTAL EMITTED POWER, applied
- * in `collectEmitters` where the total is knowable. It expresses what was
- * actually meant — "a negligible share of the light in this room" — and it is
- * invariant to the units the artist authored in. The user's rule is untouched,
- * because power is still `pi * A * L`: at equal brightness the smaller emitter
- * has less power and goes first.
- *
- * 0.002 = an emitter delivering under 0.2% of the scene's light. With ~100
- * roughly-equal emitters each holds ~1%, so a uniformly-lit scene loses
- * nothing; the tiny decorative bulbs that prompted this sit 3-4 orders below
- * their scene's lamps and go. `__giEmitterMinPowerFraction` overrides, and 0
- * disables the cull entirely.
- *
- * ⚠ AND IT CAN NEVER EMPTY THE TREE — see the guard in `collectEmitters`. A
- * scene lit by many equal weak sources is exactly where culling is most wrong.
+ * §18.7 — THE SIZE-AWARE EMITTER CULL, as a FRACTION of the scene's own total
+ * emitted power (`Phi = pi * A * L`, summed in `collectEmitters`). Below it an
+ * emissive placement gets no analytic slot, no light-tree entry, no NEE sample
+ * and no field deposit; its raster glow is untouched. 0.002 = under 0.2% of the
+ * scene's light. `__giEmitterMinPowerFraction` overrides, 0 disables, and the
+ * cull can never empty the tree (guard in `collectEmitters`).
  */
 const GI_EMITTER_MIN_POWER_FRACTION = 0.002;
 
@@ -1136,141 +1098,13 @@ const quantizeSpacing = (value) =>
   PROBE_SPACING_LADDER.find((step) => value <= step * 1.0001) ??
   PROBE_SPACING_LADDER[PROBE_SPACING_LADDER.length - 1];
 
-/**
- * The per-frame analytic direct-light slots: fixed uniforms every consumer
- * reads (field gather, screen resolve, and the transport rays' exact-dynamic
- * shading). Light moves/edits update uniforms only — never a rebuild.
- */
-// ── MOVER DIRECT-LIGHT SHADOW ORACLE (CPU) ─────────────────────────────────
-// One ray per (mover × analytic light) per frame against the STATIC meshes,
-// via three-mesh-bvh — the answer to "is this mover actually lit by that
-// light", which the analytic mover bounce needs and no GPU path can deliver
-// to a UNIFORM without a frame-path readback. Scratches shared, no per-frame
-// allocation; the smoothing lives on the ENTRY (entry._giLightVis) so slot
-// reshuffles cannot smear one mover's ramp onto another.
-const _msoOrigin = new THREE.Vector3();
-const _msoDir = new THREE.Vector3();
-const _msoLocalRay = new THREE.Ray();
-const _msoWorldRay = new THREE.Ray();
-const _msoHit = new THREE.Vector3();
-const _msoBoundsC = new THREE.Vector3();
-const _msoBoundsS = new THREE.Vector3();
-const _mocCamera = new THREE.Vector3();
-const _mocCenter = new THREE.Vector3();
-// Geometry → MeshBVH, shared across oracle re-keys. The oracle rebuilds its
-// mesh list whenever the occupancy field object is replaced (any structural
-// rebuild), and the first shipped version rebuilt every BVH with it — the
-// cannonball probe counted 121 main-thread builds in one session because a
-// mid-game rebuild re-keyed it. Geometries survive rebuilds; the BVH is a
-// pure function of the geometry; cache it for the session.
-const moverOracleBvhCache = new WeakMap();
-function moverLightVisTarget(oracle, center, boundR, slot) {
-  if (!(slot.active.value > 0.5)) return 1;
-  const isDir = slot.kind.value >= 0.5;
-  let maxT;
-  if (isDir) {
-    // `vector` holds the normalized direction TOWARD the light.
-    _msoDir.copy(slot.vector.value).normalize();
-    maxT = 64;
-  } else {
-    _msoDir.copy(slot.vector.value).sub(center);
-    const d = _msoDir.length();
-    if (d < 1e-4) return 1;
-    _msoDir.divideScalar(d);
-    maxT = d - 1e-3;
-  }
-  // Start outside the mover's own body — it must not shadow itself here
-  // (the bounce term's ndotl already carries its self-shadowing).
-  const lift = boundR * 1.05;
-  _msoOrigin.copy(center).addScaledVector(_msoDir, lift);
-  maxT -= lift;
-  if (maxT <= 0) return 1;
-  _msoWorldRay.origin.copy(_msoOrigin);
-  _msoWorldRay.direction.copy(_msoDir);
-  for (const e of oracle.ready) {
-    // World-AABB slab test before the transform + BVH descent: a Sponza
-    // sun ray misses most of the 55 meshes' boxes outright, and this loop
-    // runs per (mover × light) per frame. `skip` = currently adopted as an
-    // exact mover (stale pose here would ghost-shadow).
-    if (e.skip) continue;
-    if (e.worldBox && !_msoWorldRay.intersectsBox(e.worldBox)) continue;
-    _msoLocalRay.origin.copy(_msoOrigin).applyMatrix4(e.inv);
-    _msoLocalRay.direction.copy(_msoDir).transformDirection(e.inv);
-    const hit = e.bvh.raycastFirst(_msoLocalRay, THREE.DoubleSide);
-    if (hit) {
-      _msoHit.copy(hit.point).applyMatrix4(e.mesh.matrixWorld);
-      if (_msoHit.distanceTo(_msoOrigin) <= maxT) return 0;
-    }
-  }
-  return 1;
-}
-
-// Oriented-box occluder record for #syncMoverOccluders — fills the shared
-// scratch record below (center/half/radius) + moverObbQuat with the mover's
-// world OBB from its LOCAL bounding box through matrixWorld, the same recipe
-// (and the same shear-out-of-scope caveat) as the emitter fitter's OBB
-// fallback. Returns false when the mover should keep its sphere-chain proxy:
-// exact spheres, user-pinned sphere/capsule proxies, instanced movers, or
-// `__giMoverObbOcclusion === false` (the A/B hatch back to bounding spheres).
-const moverObbQuat = new THREE.Quaternion();
-const _obbPos = new THREE.Vector3();
+// Shared world-scale scratch (mover bounds, emitter fits) — no per-frame alloc.
 const _obbScale = new THREE.Vector3();
+
 // Scratch for #syncDynamicSurfaceBounds — runs every frame, allocates nothing.
 const _dynRejectMin = new THREE.Vector3();
 const _dynRejectMax = new THREE.Vector3();
 const _dynRejectCenter = new THREE.Vector3();
-function moverObbRecord(entry, out) {
-  if (globalThis.__giMoverObbOcclusion === false) return false;
-  const mesh = entry.mesh;
-  if (!mesh || mesh.isInstancedMesh) return false;
-  // ── SKINNED BONE CAPSULES DESCRIBE A BONE, NOT THE MESH ──────────────────
-  //
-  // ⚠ EVERYTHING BELOW READS `mesh.geometry.boundingBox × mesh.matrixWorld`,
-  // which is the right box for a rigid adoptee and catastrophically wrong for a
-  // proxy: a SkinnedMesh's geometry box is its BIND POSE, so all twelve of a
-  // character's capsules published the same full-body T-pose box into the
-  // analytic occluder bundle. Twelve overlapping body-sized blobs of indirect
-  // occlusion, sitting where the character is not — the user's "weird camera
-  // projected artifacts all over the place" (2026-08-19).
-  //
-  // A proxy already knows its own oriented box exactly: `proxyMatrix` is
-  // `bone.matrixWorld × fit` with a uniform scale, and `halfExtents` is the
-  // unit capsule's local bounds, so the two compose into the capsule's OBB.
-  if (entry.matrixOf) {
-    const m = entry.proxyMatrix;
-    if (!m) return false;
-    m.decompose(_obbPos, moverObbQuat, _obbScale);
-    const s = Math.max(Math.abs(_obbScale.x), Math.abs(_obbScale.y), Math.abs(_obbScale.z));
-    out.center.copy(_obbPos);
-    out.half.set(
-      Math.max(entry.halfExtents.x * s, 0.005),
-      Math.max(entry.halfExtents.y * s, 0.005),
-      Math.max(entry.halfExtents.z * s, 0.005),
-    );
-    out.radius = Math.hypot(out.half.x, out.half.y, out.half.z);
-    return out.radius > 1e-4;
-  }
-  const mode = mesh.userData?.giProxy ?? "auto";
-  if (mode === "sphere" || mode === "capsule" || mode === "none") return false;
-  if (entry.type === "sphere") return false;
-  const g = mesh.geometry;
-  if (!g) return false;
-  if (!g.boundingBox) g.computeBoundingBox();
-  const bb = g.boundingBox;
-  if (!bb || bb.isEmpty()) return false;
-  mesh.matrixWorld.decompose(_obbPos, moverObbQuat, _obbScale);
-  out.center
-    .set((bb.min.x + bb.max.x) / 2, (bb.min.y + bb.max.y) / 2, (bb.min.z + bb.max.z) / 2)
-    .applyMatrix4(mesh.matrixWorld);
-  out.half.set(
-    Math.max(((bb.max.x - bb.min.x) / 2) * Math.abs(_obbScale.x), 0.005),
-    Math.max(((bb.max.y - bb.min.y) / 2) * Math.abs(_obbScale.y), 0.005),
-    Math.max(((bb.max.z - bb.min.z) / 2) * Math.abs(_obbScale.z), 0.005),
-  );
-  out.radius = Math.hypot(out.half.x, out.half.y, out.half.z);
-  return out.radius > 1e-4;
-}
-
 // Reused by #refreshEmitterSlots every frame — fitEmitterShape fills it
 // in place so the per-slot refresh allocates nothing.
 const emitterFitScratch = {
@@ -2117,43 +1951,12 @@ export class GISystem {
     // while a compile wave holds the rest of this tick.
     this.#drainRetiredTargets();
 
-    // BOOT AMBIENT — the answer to "black screen for 30 seconds until GI
-    // appears". In a GI-lit scene GI IS the ambient: an interior renders
-    // pitch black until the field's first composite, however long assets +
-    // the compile wave take (probe screenshot: draw calls live, one sunlit
-    // floor strip, everything else black — physics, not a bug). A neutral
-    // hemisphere carries the frame from the first tick until the field's
-    // first composite lands (`statsLogged`), then leaves — so startup shows
-    // a flat-lit scene that GI then deepens, instead of a void that GI
-    // eventually replaces. Cold boot only: rebuilds keep the previous
-    // field's light on screen and never re-enter here.
-    // FADES to zero and STAYS in the scene: removing a light changes three's
-    // lights hash, which forces a second full material-recompile wave — the
-    // exact freeze this feature exists to paper over. A zero-intensity
-    // hemisphere is a few dead uniforms per material.
-    //
-    // DEFAULT OFF as of 2026-08-07, and it took a user report to earn that.
-    // This shipped default-on and silently ADDS A LIGHT THE SCENE DOES NOT
-    // HAVE: it is a raw three.js object, not an entity, so it has no outliner
-    // row, no Inspector control and no log line. The report was "there is some
-    // weird ambient to the GI, even before the light itself loaded in ... yet
-    // scene does not have any ambient" — which is an exactly correct reading of
-    // the scene graph, and the renderer was the thing lying. A module may not
-    // put light in a scene the author cannot see or switch off, so this is now
-    // the `bootAmbient` prop and it starts off.
-    //
-    // WHY IT NEVER LEFT (the actual bug, independent of the default): the fade
-    // was gated on `state.statsLogged`, which is not a rendering predicate at
-    // all — it is the one-shot flag for the occupancy STATS LOG, and
-    // #maybeLogStats returns early unless `state.entries.length` is non-zero
-    // AND every entry is resident in the atlas. So a scene that composites GI
-    // perfectly well but has an empty entry list, or one entry that never lands
-    // in the atlas, keeps a 0.6 blue-grey hemisphere over it forever. The real
-    // "GI is on screen now" signal is `_fieldReadyOnce`, which is what
-    // #maybeLogStats is itself gated on one level up (see its call site).
-    // Gate on that, and — because no predicate is worth trusting alone here —
-    // cap the whole thing in wall-clock ticks so "never fades" is not a
-    // reachable state no matter what the field does.
+    // BOOT AMBIENT (the `bootAmbient` prop, DEFAULT OFF — a module may not put
+    // light in a scene the author cannot see or switch off). When on, a neutral
+    // hemisphere carries a cold boot from the first tick until GI is on screen,
+    // then FADES to zero and stays in the scene (removing a light re-hashes
+    // three's lights and forces a second compile wave). The fade is gated on
+    // `_fieldReadyOnce` and hard-capped in wall-clock ticks.
     // ── THE SKY, RE-READ EVERY FRAME ─────────────────────────────────────
     // It comes from `scene.environment` + `environmentIntensity` now, and
     // NOTHING NOTIFIES GI when those change: the scene owns them, Scene
@@ -2299,15 +2102,7 @@ export class GISystem {
         state.screen.ao.radius.value = Math.min(4, Math.max(0.1, aoOv.radius));
       }
     }
-    const vxaoOv = globalThis.__giVxaoOverride;
-    if (vxaoOv && state.screen?.vxao) {
-      if (Number.isFinite(vxaoOv.strength)) {
-        state.screen.vxao.strength.value = Math.min(1, Math.max(0, vxaoOv.strength));
-      }
-      if (Number.isFinite(vxaoOv.radius)) {
-        state.screen.vxao.radius.value = Math.min(4, Math.max(0.1, vxaoOv.radius));
-      }
-    }
+
     // §12.71b v2 — the glossy firefly cap is a live uniform on the glossy
     // gather; `__giGlossyCap` pins it (same polling convention as the AO
     // dials above).
@@ -2655,25 +2450,20 @@ export class GISystem {
       if (camera) {
         if (this._giPrevVPStore) {
           this._giIrrPrevVPU.value.copy(this._giPrevVPStore);
-          // §14 Q1: the emitter temporal chain binds `_giShadowPrevVPU`, but
-          // that uniform's only writer was the STOCHASTIC shadow block below —
-          // which the default analytic arm compiles out, leaving the emitter
-          // history to reproject through an identity matrix forever (the
-          // "bistable rig" of §12.80.2 was measuring an inert chain). On the
-          // analytic arm this is its copy point.
-          if (this._giEmitterHistWeightU && this._giShadowPrevVPU
-              && !(state.screen?.lightShadowPass && this._giShadowFrameU)) {
+          // §14 Q1: the emitter temporal chain binds `_giShadowPrevVPU` and
+          // this is its ONLY copy point — the stochastic light-shadow block
+          // that used to write it is gone, and an identity matrix here
+          // reprojects the emitter history through nothing forever (the
+          // "bistable rig" of §12.80.2 was measuring an inert chain).
+          if (this._giEmitterHistWeightU && this._giShadowPrevVPU) {
             this._giShadowPrevVPU.value.copy(this._giPrevVPStore);
           }
         }
-        // If the shadow block below is absent (analytic arm), this block
-        // owns the store update instead — exactly one writer per frame.
-        if (!(state.screen?.lightShadowPass && this._giShadowFrameU)) {
-          (this._giPrevVPStore ??= new THREE.Matrix4()).multiplyMatrices(
-            camera.projectionMatrix,
-            camera.matrixWorldInverse,
-          );
-        }
+        // Exactly one writer per frame; this block owns the store update.
+        (this._giPrevVPStore ??= new THREE.Matrix4()).multiplyMatrices(
+          camera.projectionMatrix,
+          camera.matrixWorldInverse,
+        );
       }
       // ⚠ ADVANCED HERE, ONCE, so BOTH history weights below read the same
       // number this frame. It used to be computed inside the R7c block, which
@@ -2820,37 +2610,11 @@ export class GISystem {
       }
       this.#syncDynamicSurfaceBounds();
     }
-    // (Analytic-width arm: `_giShadowFrameU` is never created, the whole
-    // block compiles out of the frame — no phase, no history weights.)
-    if (state.screen?.lightShadowPass && this._giShadowFrameU) {
-      const camera = this.engine.camera;
-      if (camera) {
-        if (this._giPrevVPStore) this._giShadowPrevVPU.value.copy(this._giPrevVPStore);
-        (this._giPrevVPStore ??= new THREE.Matrix4()).multiplyMatrices(
-          camera.projectionMatrix,
-          camera.matrixWorldInverse,
-        );
-      }
-      const motion = this._giShadowLastMotion ?? 0;
-      const temporalOn = globalThis.__giShadowTemporal !== false;
-      // DEDICATED phase counter — NOT `this._frame`, which is a scan-cadence
-      // counter that #queueRebakeCheck RESETS to -1 on every change event. A
-      // scene with any per-frame transform write (the user's script-driven
-      // sun, any animated prop) pinned `_frame` near zero, the "animated"
-      // jitter oscillated between two phases, and the accumulation converged
-      // to a frozen two-sample stipple — measured by run-gi-shadow-motion as
-      // flicker 0.0000 with grain 0.2262: temporally rock-solid, spatially
-      // filthy, exactly the user's "still grainy" verdict.
-      this._giShadowPhase = ((this._giShadowPhase ?? 0) + 1) % 4096;
-      this._giShadowFrameU.value = temporalOn ? this._giShadowPhase : 0;
-      this._giShadowHistWeightU.value = temporalOn
-        ? Math.min(0.94, Math.max(0.86, 0.94 - motion * 30))
-        : 0;
-    } else if (this._giEmitterHistWeightU
+    if (this._giEmitterHistWeightU
         && !(state.screen?.irrTemporalPass && this._giIrrHistWeightU)) {
-      // §14 Q1: emitter-temporal-only build (analytic light arm AND the
-      // irradiance filter disabled) — neither block above exists, so this one
-      // owns the copy and the store update. Still exactly one writer per frame.
+      // §14 Q1: emitter-temporal-only build (the irradiance filter disabled) —
+      // the block above does not exist, so this one owns the copy and the
+      // store update. Still exactly one writer per frame.
       const camera = this.engine.camera;
       if (camera) {
         if (this._giPrevVPStore && this._giShadowPrevVPU) {
@@ -2883,16 +2647,7 @@ export class GISystem {
           ? Math.min(0.99, Math.max(0, pin))
           : Math.min(0.94, Math.max(0.86, 0.94 - motion * 30));
     }
-    // §14 Q7: the area sample's golden-ratio walk of the emitter disc — one
-    // new disc point per frame, integrated by the chain above. With
-    // `__giShadowTemporal = false` the weight above is 0 (no accumulation),
-    // so the phase pins to 0 exactly like the light arm's `_giShadowFrameU`
-    // — an animated jitter nobody integrates is raw shimmer, and a pinned
-    // one is the deterministic centre-biased sample the old arm had.
-    if (this._giEmitterFrameU) {
-      this._giEmitterPhase = ((this._giEmitterPhase ?? 0) + 1) % 4096;
-      this._giEmitterFrameU.value = globalThis.__giShadowTemporal !== false ? this._giEmitterPhase : 0;
-    }
+
     // (THE TRANSPORT'S PER-FRAME UNIFORM WRITES LIVED HERE — the gather's
     // surface/view bias, the probe-snap and depth-moment alphas, the field
     // radiance EMA, and the feedback/trace checkerboard parities. All of them
@@ -2920,11 +2675,6 @@ export class GISystem {
     // never touches them — see #buildOccupancyField.
     mark("gi.occupancyTransforms");
     this.#refreshOccupancyTransforms(state.volume.occupancyField);
-    // AFTER the transform refresh, so the bounds this reads are this frame's.
-    // Reading them before would publish the previous pose's occluder spheres and
-    // give every mover shadow a one-frame lag against its own geometry.
-    mark("gi.moverOccluders");
-    this.#syncMoverOccluders();
     // Exact dynamic objects: live transforms into the header region, queued
     // geometry uploads, deferred voxel-slot parking. Before the gbuffer/
     // compute work so this frame's rays see this frame's pose.
@@ -3079,56 +2829,18 @@ export class GISystem {
           depthProxies: this.engine.shadowMerge?.gbufferGroups?.() ?? null,
         });
       }
-      // ── THE MASK-COVERAGE ASSERTION (§18, 2026-08-25) ────────────────────
-      //
-      // Masked mode has been reverted FOUR times, and this plan doc's standing
-      // condition for ever re-flipping it is: "a rig asserts non-mirror
-      // gbuffer pixels SURVIVE the mask pass". This is that rig.
-      //
-      // The failure it exists to catch: pass 2 opening with a clear loadOp
-      // (three's Background.update ORs `forceClear` against `autoClear` — see
-      // renderGiGBuffer's note), which wipes pass 1's attachments so ONLY the
-      // masked meshes remain as gbuffer geometry. The screen gather then finds
-      // `position.w == 0` on every wall and the diffuse resolve reads zero —
-      // "every diffuse wall PITCH BLACK".
-      //
-      // So the number to watch is simply how much of the gbuffer carries
-      // geometry at all. It must be the SAME with the mask on as with it off.
-      // A collapse toward the masked set's screen coverage IS the bug, and it
-      // is visible in one number instead of a screenshot of a black room.
-      // Arm with `__giMaskCoverageProbe = true`; it fires once, a few frames
-      // in, so the first frames' partial state cannot answer for a settled one.
-      // ── §18.13 — THE COLOUR PROBE: WHERE DOES THE GREEN ENTER? ───────────
-      //
-      // Three theories about a green cast have now been wrong (the scene's own
-      // neon, the emitter cull, the probe-atlas chroma import). Each was
-      // plausible from the code and none survived contact with the screen. That
-      // is the signature of reasoning without an instrument, so this is the
-      // instrument: read back the reflection chain's own textures and report
-      // what colour is ACTUALLY in each, as a green ratio g/((r+b)/2).
-      //
-      // The chain, in order — the first stage that is already green is the
-      // source, and every stage after it is just carrying it:
-      //   bvhColor     the RAW hit albedo the prepass wrote (palette/atlas)
-      //   bvhRadiance  the SHADED hit radiance materials actually sample
-      //   irradiance   the diffuse field, for reference — if this is green too
-      //                the cast is scene-wide and not a reflection bug at all
-      //
-      // §18.15 additions:
-      //   • RE-ARMABLE. `__giColourProbeRun` is a token; bump it and the probe
-      //     fires again. A one-shot instrument cannot A/B, and an A/B that
-      //     needs a 50 s rebuild per arm does not get run — this plus the
-      //     hit-shade term mask is what makes four arms cost four seconds.
-      //   • the reflection-probe ATLAS is a stage. It is an input to the hit
-      //     shading (the R-C luminance floor), it is a blurred capture of the
-      //     whole room, and its own capture kernel shades with the same emitter
-      //     formula — so "is the atlas itself green?" is a question about a
-      //     texture, answerable by reading it.
-      //   • CHROMA SPREAD per stage, closing §18.14's open item: a MEAN alone
-      //     cannot tell "every texel is grey" from "a varied image averaging
-      //     grey", and that ambiguity is what left `bvhColor`'s 170.5/170.5/
-      //     170.5 unreadable.
-      // One shot per token, ~90 settled frames in. `__giColourProbe = true`.
+      // ── THE MASK-COVERAGE ASSERTION (§18) ───────────────────────────────
+      // Reads back how much of the gbuffer carries geometry at all. It must be
+      // the SAME with the mask on as off; a collapse toward the masked set's
+      // screen coverage is the pass-2 clear-loadOp wipe (see renderGiGBuffer).
+      // Arm with `__giMaskCoverageProbe = true`; it fires once, a few frames in,
+      // so the first frames' partial state cannot answer for a settled one.
+      // ── §18.13 — THE COLOUR PROBE ────────────────────────────────────────
+      // Reads back the reflection chain's own textures and reports the green
+      // ratio g/((r+b)/2) plus chroma spread per stage — bvhColor (raw hit
+      // albedo), bvhRadiance (shaded), the reflection-probe atlas, irradiance.
+      // The FIRST stage that is already green is the source. One shot per
+      // `__giColourProbeRun` token, ~90 settled frames in. `__giColourProbe = true`.
       if (globalThis.__giColourProbe &&
           this._colourProbeRunSeen !== (globalThis.__giColourProbeRun ?? 0)) {
         this._colourProbeRunSeen = globalThis.__giColourProbeRun ?? 0;
@@ -3561,7 +3273,7 @@ export class GISystem {
     if (!anyGiShadowLive && state.screen?.lightShadowPass) {
       for (const name of [
         "lightShadowPass", "lightShadowFilterPass", "lightShadowWidePass",
-        "lightShadowWidePass2", "lightShadowHistoryPass", "lightShadowPostPass",
+        "lightShadowWidePass2",
       ]) frameSkip.add(state.screen[name]?.compute);
     }
     // 3. Exact-reflection shade/trace during the compile wave. These are the
@@ -3648,46 +3360,12 @@ export class GISystem {
       // so the stamp has to happen at use, not at some one-time build site.
       occPasses?.forEach((n, i) => { if (n && typeof n === "object") n.__giPassName ??= `occupancy#${i}`; });
       const skippedBefore = giSkippedComputes.size;
-      // THE SPAWN-BLINK GUARD (2026-08-04, run-gi-spawn-blink measured it), and
-      // it OUTLIVES the composite it was written for. A geometry change rebuilds
-      // the voxelizer's pair tables, so passes() mints FRESH compute nodes whose
-      // pipelines compile async for a few frames. Dispatching the ordered chain
-      // then executes the old, already-compiled CLEAR and skips the new voxelize,
-      // leaving a half-built pyramid that reads "empty everywhere". That used to
-      // blink the whole field black for ~6 frames through the feedback's
-      // empty-clear; now it is every shadow ray and every AO tap passing straight
-      // through geometry for those frames — the same bug in different clothes.
-      // Two rules fix it: while ANY compute pipeline is still compiling, do not
-      // dispatch the pyramid chain at all (its half-execution IS the damage); and
-      // if a dispatch DID skip (the first tick is what triggers compilation, so it
-      // cannot know in advance), bail out before anything consumes the pyramid.
-      // Bail frames keep last-good occupancy.
-      //
-      // ── RULE ONE IS SCOPED TO THIS CHAIN'S OWN NODES ──────────────────────
-      //
-      // It used to read `giPendingComputePipelines.size > 0` — is ANY GI
-      // pipeline anywhere still compiling. During boot that set holds all ~79,
-      // so the field waited out every unrelated SRC kernel before it was
-      // allowed to dispatch even once. The per-frame tally below named it:
-      // **21 of 23 frames BLOCKED, the chain ran ONCE**. On the 24-triangle
-      // spawn scene, where the field's own work is microseconds, it read
-      // **865 blocked frames / 9835ms** — the wait is independent of scene
-      // size, which is the signature of queueing behind other people's work.
-      //
-      // `giPendingByNode` charges each compile to the node whose dispatch
-      // created it, so this asks "are MY passes ready". Measured, twice:
-      //   Sponza boot   5261ms / 22 blocked  →  2758ms / 14 blocked   (-48%)
-      //   spawn scene   9835ms / 865 blocked →  1636ms / 143 blocked  (6x)
-      //
-      // SAFE because rule one was never the only protection, only the widest.
-      // The stale-clear hazard it was written for is already gone (a geometry
-      // change mints a FRESH clear, so it skips alongside the fresh voxelize
-      // instead of running ahead of it), and rule two still catches the rest:
-      // a dispatch that skips sets `occSkipped`, which re-arms and bails before
-      // anything consumes the pyramid. `test:gi-spawn` — the regression suite
-      // for exactly this bug — passes all 16 assertions scoped.
-      //
-      // `__giOccWaitAll = true` restores the global wait for bisecting.
+      // THE SPAWN-BLINK GUARD (test:gi-spawn). Two rules: while any of THIS
+      // chain's own compute pipelines is still compiling (`giPendingByNode`, not
+      // the global set) do not dispatch the pyramid chain — a half-executed
+      // chain leaves a pyramid that reads empty everywhere; and if a dispatch
+      // DID skip, bail before anything consumes the pyramid (bail frames keep
+      // last-good occupancy). `__giOccWaitAll = true` restores the global wait.
       const occWait = occPasses !== null && (globalThis.__giOccWaitAll === true
         ? giPendingComputePipelines.size > 0
         : giNodesPending(occPasses));
@@ -3801,47 +3479,12 @@ export class GISystem {
                   ]
                 : []),
               state.screen.resolve.compute,
-              // ⭐⭐ §18.6 — THE EXACT-REFLECTION HIT CHAIN, WHICH WAS MISSING
-              // FROM THIS LIST (2026-08-25). Every other entry here carries a
-              // comment saying it is camera-dependent and that freezing it
-              // would lag a camera move — and the single MOST camera-dependent
-              // chain in the frame was simply absent, because this list is a
-              // hand-maintained duplicate of "which passes are camera
-              // dependent" and it silently diverged when §14 R-A moved hit
-              // shading into `state.queue` (see the ordering contract at the
-              // full-queue push: resolve, then hit chain, then the irradiance
-              // pair — matched exactly here).
-              //
-              // WHAT IT COST: `idle` keys on `_fieldQuietFrames`, and
-              // `#fieldInputHash()` digests lights, emitters, sky, bounceGain,
-              // dynSet version and the blend knobs — THE CAMERA IS NOT IN IT.
-              // So orbiting never resets the counter; after 180 quiet frames
-              // idle engages and STAYS engaged through the whole orbit, and the
-              // hit chain then dispatches on the heartbeat alone: ONE FRAME IN
-              // THIRTY. At the ~15-18 fps this scene moves at, that is a
-              // reflection that re-shades about every two seconds.
-              //
-              // The trace keeps running every frame (it is dispatched outside
-              // this queue), so `t`/normal/albedo stay current while the
-              // RADIANCE the material actually samples is frozen — fresh
-              // geometry, stale light. Materials read `bvhRadiance` at `giUV`,
-              // the surface's own reprojection, so the frozen image TRANSLATES
-              // WITH THE SURFACE while its content does not change. That is the
-              // user's report verbatim: "reflection just moves to the side when
-              // camera moves to the side, not changing the angle as it should",
-              // and "works properly sometimes, but soon it gets overwhelmed" is
-              // the 180-frame timer arming, not a load threshold.
-              //
-              // ⚠ GATED ON THE VIEW, NOT ON THE WORLD. Adding it
-              // unconditionally would restore ~14.6 ms to every idle frame
-              // including parked ones, for a re-shade of a view that has not
-              // moved. `_gbufHeld` is already the exact "the view is unchanged"
-              // signal, computed earlier this tick — so a PARKED camera keeps
-              // today's saving (and the held-view cadence below still governs
-              // it), while a MOVING camera gets a live reflection, which is the
-              // one state that was broken. The idle gate asks "did the WORLD
-              // change?"; a view-dependent pass has to ask "did the VIEW
-              // change?".
+              // §18.6 — THE EXACT-REFLECTION HIT CHAIN, GATED ON THE VIEW, NOT
+              // THE WORLD. `#fieldInputHash()` has no camera term, so the idle
+              // gate answers "did the WORLD change?" — wrong question for a
+              // view-dependent pass. `_gbufHeld` is the "the view is unchanged"
+              // signal: a parked camera keeps the idle saving, a moving one gets
+              // a live reflection. Order: resolve, hit chain, irradiance pair.
               ...(state.screen.bvhHitShade && this._gbufHeld !== true
                 ? [
                     state.screen.bvhHitShade.compute,
@@ -3867,8 +3510,6 @@ export class GISystem {
               ...(state.screen.lightShadowWidePass
                 ? [state.screen.lightShadowWidePass.compute, state.screen.lightShadowWidePass2.compute]
                 : []),
-              ...(state.screen.lightShadowHistoryPass ? [state.screen.lightShadowHistoryPass.compute] : []),
-              ...(state.screen.lightShadowPostPass ? [state.screen.lightShadowPostPass.compute] : []),
             ]
           : [];
         // ⭐⭐ §18.9 — THE DIVERGENCE AUDIT. This list is a HAND-MAINTAINED
@@ -4564,7 +4205,7 @@ export class GISystem {
         if (!anyGiShadow) {
           for (const name of [
             "lightShadowPass", "lightShadowFilterPass", "lightShadowWidePass",
-            "lightShadowWidePass2", "lightShadowHistoryPass", "lightShadowPostPass",
+            "lightShadowWidePass2",
           ]) {
             const node = state.screen?.[name]?.compute;
             if (node) coldShadow.add(node);
@@ -5089,29 +4730,15 @@ export class GISystem {
    * NOTHING BLOCKED ME and the interior renders blown white. 64 steps did that;
    * these budgets do not. (`__giDirectShadowSteps` overrides for an A/B.)
    *
-   * TWO GATES, both about bindings rather than taste:
-   *
-   *  · STORAGE TEXTURES. The resolve already writes irradiance + emitterShadow
-   *    + radiance, plus the BVH radiance target when exact reflections are on.
-   *    This makes one more, which is the 4th or the 5th against a WebGPU
-   *    BASELINE OF 4. The engine asks the adapter for 8 (see
-   *    resolveRendererLimits), but the ask is adapter-clamped, so a
-   *    baseline-only device really does land at 4 and must simply not get the
-   *    feature — over the limit the pipeline is INVALID and every compute
-   *    submitted with it is silently dropped, taking all of GI with it.
-   *
-   *  · STORAGE BUFFERS. The trace reads the occupancy pyramid, the composited
-   *    distance texture and the atlas — the resolve is at the portable
-   *    8-storage-buffer baseline and cannot take new ones. It is only provably
-   *    free when the pass ALREADY carries a trace of the same family, i.e. when
-   *    emitter shadows built `light.shadowTraceFn`: same resources, so the bind
-   *    group is unchanged and only a second WGSL function appears. With
-   *    `emissiveShadows` off there is no such trace and this one would add its
-   *    own bindings to a pass whose real count we cannot measure without a GPU,
-   *    so the honest answer is to decline. `__giLightShadowIgnoreBudget` forces
-   *    it for a measurement run.
+   * ONE GATE, about bindings rather than taste: STORAGE TEXTURES. The resolve
+   * already writes irradiance + emitterShadow + radiance, plus the BVH radiance
+   * target when exact reflections are on. This makes one more, which is the 4th
+   * or the 5th against a WebGPU BASELINE OF 4. The engine asks the adapter for 8
+   * (resolveRendererLimits), but the ask is adapter-clamped, so a baseline-only
+   * device must simply not get the feature — over the limit the pipeline is
+   * INVALID and every compute submitted with it is silently dropped.
    */
-  #buildLightShadow({ volume, lightSlots, quality, hasEmitterTrace, span }) {
+  #buildLightShadow({ volume, lightSlots, quality, span }) {
     if (globalThis.__giNoLightShadows === true) return null;
     const occ = volume.occupancyField;
     // No pyramid, no feature: the lift is sized in occupancy voxels and the
@@ -5119,26 +4746,12 @@ export class GISystem {
     // through anything thinner than a field cell, which for a sun shadow is
     // every floor in the scene.
     if (!occ?.voxel) return null;
-    // The emitter-trace requirement is a SPHERE-ARM rule: that marcher reads
-    // distanceTexture + atlas + staging + sparse and is only provably free
-    // when the emitter trace already bound the same family. The DDA arm
-    // reads ONLY the occupancy bits buffer — +1 storage buffer worst case,
-    // +0 whenever AO or the emitter oracle already binds it — so it stands
-    // alone. If a pathological config still over-commits the pass, the
-    // failure is loud in the harness (the irradiance CONTROL collapses when
-    // a batch drops) and `__giNoLightShadows` is the hatch.
-    const sphereArm = globalThis.__giLightShadowSphere === true;
-    if (!hasEmitterTrace && sphereArm && globalThis.__giLightShadowIgnoreBudget !== true) {
-      if (!this._warnedLightShadowBudget) {
-        this._warnedLightShadowBudget = true;
-        console.warn(
-          "[gi] gi-traced light shadows are off: the sphere arm needs the emitter trace's bindings " +
-            "(Emissive Shadows is disabled). Re-enable it, drop __giLightShadowSphere, or set " +
-            "__giLightShadowIgnoreBudget to measure anyway.",
-        );
-      }
-      return null;
-    }
+    // No binding-budget gate: the marching arms read ONLY the occupancy bits
+    // buffer (+1 storage buffer worst case, +0 whenever AO or the emitter
+    // oracle already binds it), so this pass stands alone. If a pathological
+    // config still over-commits it, the failure is loud in the harness (the
+    // irradiance CONTROL collapses when a batch drops) and
+    // `__giNoLightShadows` is the hatch.
     const limit = this.engine.renderer?.backend?.device?.limits?.maxStorageTexturesPerShaderStage ?? 0;
     const used = 3 + (this.#bvhReflectionsEnabled() ? 1 : 0);
     if (limit < used + 1) {
@@ -5176,8 +4789,7 @@ export class GISystem {
       occ.traceHybridPlane &&
       occ.hasSurfaceRecords === true &&
       shadowMode >= RayHitMode.HybridPlane &&
-      shadowMode <= RayHitMode.HybridExactComplex &&
-      globalThis.__giLightShadowLegacyDda !== true;
+      shadowMode <= RayHitMode.HybridExactComplex;
     // ANALYTIC-WIDTH ARM (docs/GI_SHADOWS_PLAN.md §5) — THE DEFAULT since
     // 2026-08-06 (user call): the deterministic soft-shadow estimator.
     // Admission stays with the march (records/DDA, unchanged); softness
@@ -5188,11 +4800,7 @@ export class GISystem {
     // sample), and #buildScreenResolve skips the whole temporal machinery:
     // each frame is already the converged answer, which is what makes the
     // shadow track a dragged sun at full sharpness with zero grain.
-    // `__giShadowAnalyticWidth = false` (build-time) restores the stochastic
-    // sun-disc + temporal arm for A/B — it remains the reference instrument
-    // (256-frame static accumulation is unbiased ground truth).
-    const analyticWidth = globalThis.__giShadowAnalyticWidth !== false;
-    const exactArm = !!(this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false);
+    const exactArm = !!this._dynSet?.staticBvh;
     // ── §12.79 THE WIDTH PROBE IS THE POLE, AND ON THE EXACT ARM IT IS
     //    REDUNDANT — the same diet §12.54 ran on the emitter arm.
     //
@@ -5219,8 +4827,8 @@ export class GISystem {
     // remove softness nothing else supplies. Scoped to the arm that measured.
     //
     // `__giLightAnalyticPenumbra = false` restores the probe on this arm.
-    const analyticPen = analyticWidth && exactArm && globalThis.__giLightAnalyticPenumbra !== false;
-    const widthProbe = analyticWidth && !analyticPen ? volume.createWidthProbe?.() : null;
+    const analyticPen = exactArm && globalThis.__giLightAnalyticPenumbra !== false;
+    const widthProbe = analyticPen ? null : volume.createWidthProbe?.();
     // 1.5 OCCUPANCY VOXELS of ray lift — a node, not a number, so an in-place
     // refit rescales it with the pyramid. See the resolve's own comment for
     // why the gather's normalOffset is the wrong scale here. The factor is a
@@ -5238,23 +4846,19 @@ export class GISystem {
       liftFactor,
       exactBiasFactor,
       exactArm,
-      analyticWidth,
       // Read by #buildScreenResolve: with the diet on, the dist channel holds
       // METRES of penumbra half-width rather than a normalised blocker
       // distance, so the wide passes must run in world-width mode.
       analyticPen,
-      marcher: globalThis.__giLightShadowSphere === true
-        ? "sphere"
-        : (this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false
-            ? "static-bvh8 + exact-dynamics"
-            : recordMarch ? `records (${rayHitModeName(shadowMode)})` : "voxel-dda") +
-          (analyticWidth
-            // The name says which softness model compiled, because "did my
-            // change take?" was otherwise only answerable by staring at a ms
-            // figure inside its own noise band — which is how the §12.79 diet
-            // first read as a REGRESSION on a page that had not reloaded.
-            ? (analyticPen ? " + analytic-penumbra" : " + analytic-width")
-            : globalThis.__giConeShadowDensity === true ? " + density-cone" : " + sun-disc"),
+      // The name says which softness model compiled, because "did my change
+      // take?" was otherwise only answerable by staring at a ms figure inside
+      // its own noise band — which is how the §12.79 diet first read as a
+      // REGRESSION on a page that had not reloaded.
+      marcher:
+        (exactArm
+          ? "static-bvh8 + exact-dynamics"
+          : recordMarch ? `records (${rayHitModeName(shadowMode)})` : "voxel-dda") +
+        (analyticPen ? " + analytic-penumbra" : " + analytic-width"),
       slots: lightSlots,
       lift,
       voxMax,
@@ -5282,8 +4886,7 @@ export class GISystem {
       // `__giShadowBurialGate = true` forces it back on for A/B.
       freeRadius:
         occ.hasSurfaceRecords === true && occ.freeRadiusAtWorld &&
-        (globalThis.__giShadowBurialGate === true ||
-          !(this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false))
+        (globalThis.__giShadowBurialGate === true || !exactArm)
           ? (p) => occ.freeRadiusAtWorld(p, 1, true, null, true)
           : null,
       // THE MARCHER IS THE TRANSPORT DDA, NOT THE SPHERE TRACE. This is the
@@ -5297,290 +4900,230 @@ export class GISystem {
       // and its analytic cone accumulator (`pen`) fades a grazing ray
       // continuously before the binary hit flips. 64 steps with coarse-skip
       // crosses the volume; per-pixel cost beats 160 sphere steps.
-      // `__giLightShadowSphere = true` restores the sphere arm (build-time).
       traceDda:
-        globalThis.__giLightShadowSphere === true
-          ? null
-          : (origin, dir, maxT, k, receiverP = null, tanHalf = null, jitter = null, jitter2 = null, cosRayNormal = null) => {
-              // tMin one voxel: the lifted origin can still clip its own
-              // surface's SAT-bulged voxel on curved geometry, and a DDA
-              // first-voxel hit is a hard black dot. One voxel along the ray
-              // (on top of the 1.5-voxel normal lift) clears it; anything
-              // thinner than that near the receiver is below the medium's
-              // resolving power anyway.
-              const vox = vec3(occ.voxel);
-              const tMin = vox.x.max(vox.y).max(vox.z);
-              // ── STOCHASTIC SUN-DISC SOFT SHADOWS (the soft arm of record).
-              // Each pixel traces the EXACT march along one jittered
-              // direction inside the sun's disc; the penumbra is the pixel
-              // ENSEMBLE (IGN dither, averaged by the material bilateral),
-              // not a per-ray estimate. This replaced the density-cone arm
-              // after the user's 15° screenshots showed both of that model's
-              // congenital diseases at once: a thin solid roof in a coarse
-              // cell reads fraction ~1/8 → dappled LIGHT LEAKS, while dense
-              // clusters + the fail-dark clamp collapse to BLACK — and
-              // tuning boost only trades one for the other. Binary exact
-              // occlusion per ray has neither disease, keeps sub-voxel
-              // record silhouettes at EVERY angle, costs the same march the
-              // user-validated 0° path always ran, and a jittered ray that
-              // dips below the receiver's horizon correctly reads its own
-              // ground as the occluder (that part of the disc IS set).
-              // 0° degenerates exactly (disc radius 0 → jd = dir).
-              // `__giConeShadowDensity = true` restores the density-cone
-              // two-phase arm for A/B (build-time, like every hatch here).
-              const soft = tanHalf != null && jitter != null;
-              const legacyCone =
-                globalThis.__giConeShadowDensity === true &&
-                !analyticWidth &&
-                soft &&
-                occ.traceOccupancyCone;
-              const voxMin = vox.x.min(vox.y).min(vox.z);
-              // The analytic-width arm traces the CENTRAL ray only — a
-              // deterministic ray cannot wander into the origin dead zone
-              // and needs no ensemble to average; softness is the width
-              // probe's job (multiplied in below).
-              let dirEff = dir;
-              if (soft && !legacyCone && !analyticWidth) {
-                const d = vec3(dir);
-                const upRef = select(d.y.abs().lessThan(0.9), vec3(0, 1, 0), vec3(1, 0, 0));
-                const s1 = d.cross(upRef).normalize().toVar();
-                const s2 = d.cross(s1).toVar();
-                const ang = float(jitter).mul(Math.PI * 2).toVar();
-                const rr = float(jitter2 ?? 0.5).sqrt().mul(float(tanHalf)).toVar();
-                dirEff = d.add(s1.mul(ang.cos()).add(s2.mul(ang.sin())).mul(rr)).normalize().toVar();
-              }
-              const exactEnd = legacyCone
-                ? voxMin.mul(0.5).div(float(tanHalf).max(1e-5)).min(maxT).toVar()
-                : maxT;
-              const coneSteps =
-                Number(globalThis.__giConeShadowSteps) ||
-                ({ low: 48, medium: 64, high: 80, ultra: 96 }[quality] ?? 80);
-              const coneT = legacyCone
-                ? occ.traceOccupancyCone(origin, dir, exactEnd.max(tMin), maxT, {
-                    tanHalf,
-                    steps: coneSteps,
-                    boost: Number(globalThis.__giConeDensityBoost) || 3,
-                    // Receiver plane for the cone's self-shadow exclusion.
-                    // The light-facing normal is recoverable from the lifted
-                    // origin — origin = P + n·lift by construction.
-                    receiverP,
-                    receiverN: receiverP ? vec3(origin).sub(receiverP).normalize() : null,
-                    jitter,
-                    jitter2,
-                  })
-                : null;
-              // THE MID-FIELD WIDTH TERM (analytic-width arm only): the
-              // penumbra reach the near-field pen terms are starved of.
-              // Evaluated on the CENTRAL ray, gated the same ~3 voxels the
-              // marchers' own penGate uses so the receiver's neighbourhood
-              // never clamps a ray at birth. cosRayNormal comes from the
-              // resolve (the receiver's geometric N·L); a missing value
-              // degrades to 1, which only ever makes the own-plane test
-              // stricter about calling a sample an occluder.
-              // LAZY — the probe only runs where the central ray MISSED:
-              // in the umbra the verdict is already 0 and multiplying a
-              // width into it changes nothing, so the umbra (often the
-              // largest shadowed region on screen) skips all 12 taps.
-              const evalMidW = widthProbe
-                ? (gateNode) => {
-                    const w = float(1).toVar();
-                    If(gateNode, () => {
-                      w.assign(widthProbe(
-                        origin, dir, tMin.mul(3), maxT, k,
-                        cosRayNormal != null ? float(cosRayNormal) : float(1),
-                        lift,
-                      ));
-                    });
-                    return w;
-                  }
-                : null;
-              // STATIC-BVH ARM ("light by voxels, shadows by BVH", user
-              // directive 2026-08-06): the shadow ray intersects EXACT world
-              // triangles — the masked static-scene BVH8 merged with the
-              // exact dynamic set — and never touches voxels. Admission is
-              // exact geometry; softness stays the analytic width probe
-              // (width, never admission). Radiance/bounce remain voxel.
-              // `__giShadowStaticBvh = false` restores the records marcher.
-              if (this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false) {
-                // EXACT GEOMETRY NEEDS AN EXACT-GEOMETRY BIAS — this arm
-                // inherited the VOXEL one and that is the measured cause of
-                // the "holes in the shadows". `origin` arrives lifted 1.5
-                // occupancy voxels off the surface and `tMin` skips a whole
-                // voxel more; both exist because the conservative voxel shell
-                // bulges the receiver's own surface up to a voxel above its
-                // true plane. Against real triangles there is no shell and
-                // nothing to escape, so the pair is pure loss: 0.25 m of
-                // blind band on the user's Sponza (voxel 0.098 m), measured
-                // as 10.8% of surface points with their NEAREST occluder
-                // inside it and 2.6% losing their shadow outright
-                // (run-gi-static-bvh-probe.mjs). It is worst on walls, whose
-                // light-facing normal shoves the origin 0.15 m out of the
-                // arcade — past the very column that should shadow them.
-                // The lift direction is recoverable: origin = P + n·lift by
-                // construction, and cosRayNormal > 0.05 at every call site
-                // keeps that difference non-degenerate.
-                let exactOrigin = origin;
-                let exactMin = tMin;
-                if (receiverP != null) {
-                  const nHat = vec3(origin).sub(vec3(receiverP)).normalize().toVar();
-                  // Slope-scaled: a grazing ray is where the interpolated
-                  // shading normal and the true face diverge most, so the
-                  // offset has to grow with 1/cos to stay off its own surface.
-                  const bias = voxMax
-                    .mul(exactBiasFactor)
-                    .div(float(cosRayNormal ?? 1).max(0.25))
-                    .toVar();
-                  exactOrigin = vec3(receiverP).add(nHat.mul(bias)).toVar();
-                  exactMin = bias;
-                }
-                const s = this._dynSet.traceStaticBvh(exactOrigin, dirEff, exactMin, exactEnd);
-                // §14 Q2: the receiver point rides along so a fat proxy
-                // (bone capsule) containing this very surface cannot shadow
-                // it — the tight exact bias (~2 mm) cannot escape a shell
-                // that overshoots the skin by centimetres.
-                const dr = this._dynSet.trace(exactOrigin, dirEff, exactMin, exactEnd, {
-                  excludePoint: globalThis.__giNoSelfPlaneExclusion === true ? null : receiverP,
+        (origin, dir, maxT, k, receiverP = null, tanHalf = null, jitter = null, jitter2 = null, cosRayNormal = null) => {
+          // tMin one voxel: the lifted origin can still clip its own
+          // surface's SAT-bulged voxel on curved geometry, and a DDA
+          // first-voxel hit is a hard black dot. One voxel along the ray
+          // (on top of the 1.5-voxel normal lift) clears it; anything
+          // thinner than that near the receiver is below the medium's
+          // resolving power anyway.
+          const vox = vec3(occ.voxel);
+          const tMin = vox.x.max(vox.y).max(vox.z);
+          // THE CENTRAL RAY ONLY. A deterministic ray cannot wander into
+          // the origin dead zone and needs no ensemble to average, so the
+          // sun-disc jitter arguments are unused; softness is the width
+          // probe's job (multiplied in below), or the analytic penumbra's.
+          //
+          // THE MID-FIELD WIDTH TERM (width-probe arm only): the
+          // penumbra reach the near-field pen terms are starved of.
+          // Evaluated on the CENTRAL ray, gated the same ~3 voxels the
+          // marchers' own penGate uses so the receiver's neighbourhood
+          // never clamps a ray at birth. cosRayNormal comes from the
+          // resolve (the receiver's geometric N·L); a missing value
+          // degrades to 1, which only ever makes the own-plane test
+          // stricter about calling a sample an occluder.
+          // LAZY — the probe only runs where the central ray MISSED:
+          // in the umbra the verdict is already 0 and multiplying a
+          // width into it changes nothing, so the umbra (often the
+          // largest shadowed region on screen) skips all 12 taps.
+          const evalMidW = widthProbe
+            ? (gateNode) => {
+                const w = float(1).toVar();
+                If(gateNode, () => {
+                  w.assign(widthProbe(
+                    origin, dir, tMin.mul(3), maxT, k,
+                    cosRayNormal != null ? float(cosRayNormal) : float(1),
+                    lift,
+                  ));
                 });
-                const sHit = s.x.greaterThanEqual(0).toVar();
-                const hit = sHit.or(dr.hit.greaterThan(0.5)).toVar();
-                const tBest = select(
-                  sHit.and(dr.hit.greaterThan(0.5)), s.x.min(dr.t),
-                  select(sHit, s.x, dr.t),
-                ).toVar();
-                let exactVis;
-                if (evalMidW) {
-                  exactVis = select(hit, float(0), evalMidW(hit.not()));
-                } else {
-                  exactVis = select(hit, float(0), float(1));
-                }
-                if (analyticPen) {
-                  // tan(half-angle) * blocker distance — the sun's penumbra
-                  // half-width at the receiver, in METRES, straight from the
-                  // t the traces already resolved. `tanHalf` is null only on
-                  // a hard-shadow call, where a zero width is the right answer.
-                  //
-                  // THE 1 mm FLOOR IS A SENTINEL, NOT A WIDTH (§12.54's rule,
-                  // and it is load-bearing for the blocker search below): a
-                  // CONTACT pixel and a LIT pixel both write ~0, and the
-                  // search has to keep the first's own zero radius while
-                  // giving the second its neighbours'. Exact 0 only on a miss
-                  // makes the channel its own occupancy mask.
-                  const w = float(tanHalf ?? 0).max(0).mul(tBest.max(0)).clamp(0, 64).toVar();
-                  return vec2(
-                    coneT ? exactVis.mul(coneT) : exactVis,
-                    select(hit, w.max(1e-3), float(0)),
-                  );
-                }
-                return vec2(
-                  coneT ? exactVis.mul(coneT) : exactVis,
-                  tBest.max(0).div(float(span)).clamp(0, 1),
-                );
+                return w;
               }
-              // THE RECORD MARCH — the non-voxel shadow arm. When the active
-              // ray-hit mode carries surface records, shadow rays resolve hits
-              // through the SAME fitted planes (+ coverage clips, + exact
-              // triangles on ultra) the gather uses: silhouettes follow the
-              // recorded geometry at sub-voxel precision instead of the voxel
-              // hull, and the cone estimate comes from perpendicular miss
-              // distances to those planes rather than voxel free-radius.
-              // `__giLightShadowLegacyDda = true` restores the binary-voxel
-              // arm for an A/B (build-time, like every hatch here).
-              // DynamicBrick cells resolve through the per-chain DYNAMIC
-              // record tail (refit at the mover's pose every dispatch), so
-              // movers keep fitted-plane silhouettes while moving. KNOWN
-              // LIMITS (why a silhouette can still read voxel-true): static
-              // cells sharing a mover's brick refit unfitted (box) until the
-              // demote's full rebuild, tail overflow degrades that brick to
-              // box, and COMPLEX-classified cells (curved stone, thin
-              // double-face walls) only resolve to real triangles in
-              // exact-complex mode.
-              if (recordMarch) {
-                // Tiered macro budget like the legacy arm — the cap only binds
-                // on long grazing rays (the frames where shadow cost spikes),
-                // and with the fail-closed clamp a capped ray goes DARK, never
-                // a leak. `__giDirectShadowSteps` overrides here too.
-                const macroSteps =
-                  Number(globalThis.__giDirectShadowSteps) ||
-                  ({ low: 96, medium: 128, high: 160, ultra: 192 }[quality] ?? 160);
-                const r = occ.traceHybridPlane(origin, dirEff, tMin, exactEnd, {
-                  coverage: shadowMode >= RayHitMode.HybridPlaneCoverage,
-                  exact: shadowMode === RayHitMode.HybridExactComplex,
-                  penumbraK: k,
-                  macroSteps,
-                  // DIAGNOSTIC (build-time): fold the SHADOW rays into the
-                  // rayHitDebug counters. The gather rays are profiled by
-                  // default and read 0 limit exits on healthy scenes, so any
-                  // macro/brick/invalid counts that appear under this hatch
-                  // are the shadow arm's — the fail-closed attribution the
-                  // texture-side kind map exists for, without the texture.
-                  profile: globalThis.__giShadowProfile === true,
-                  // ORIGIN-PLANE EXCLUSION: the receiving surface point. The
-                  // march skips accepts/cone contributions whose plane
-                  // contains it — the receiver's own SAT-bulged staircase
-                  // cells re-fit exactly that plane, and each tooth used to
-                  // stamp a teardrop self-shadow phantom on tilted receivers.
-                  // `__giNoSelfPlaneExclusion = true` restores the old arm
-                  // (build-time A/B like every hatch here).
-                  excludePoint: globalThis.__giNoSelfPlaneExclusion === true ? null : receiverP,
-                });
-                if (globalThis.__giShadowKindDebug === true) {
-                  // VERDICT-KIND MAP instead of a shadow: the channel paints
-                  // WHICH acceptance class decided each pixel. miss=white,
-                  // plane=0.75, exact-triangle=0.5, box=0.25, clamp=black.
-                  return vec2(float(1).sub(r.kind.mul(0.25)), 0);
-                }
-                if (globalThis.__giShadowKindDebug === "sub") {
-                  // SUB-KIND MAP: kind·0.125 puts every class at a distinct
-                  // byte — miss=0, plane=32, tri=64, box=96, macro-exhaust=128,
-                  // brick-limit=159, invalid-brick=191 (and 255 = no geometry,
-                  // the pass default). This is the fail-closed ATTRIBUTION
-                  // instrument: 4/5/6 render identically in production.
-                  return vec2(r.kind.mul(0.125), 0);
-                }
-                // x = exact-arm visibility × cone transmittance (the two
-                // phases partition the ray, so the product is the ray's
-                // visibility). y = blocker distance for the PCSS/wide-pass
-                // chain; misses carry t = -1, hence the max(0).
-                // EXHAUSTION (kind 4) → THE PROBE'S VERDICT, exactly like
-                // the emitter arm. The 90° kind map measured 16.8k of 51.8k
-                // pixels CLAMPED — the fail-closed black was most of the
-                // "umbra", with a bogus ~0.3m blocker distance that also
-                // collapsed the wide-pass radius. The probe's openness
-                // reading gives those rays the physically-shaped gradient
-                // (dark at the caster's base, washing out with distance —
-                // the Blender 90° look) instead of a hard black blob, and
-                // it is what makes LOWERING march budgets safe: an
-                // exhausted ray now degrades to "approximately right" not
-                // "black".
-                let exactVis;
-                if (evalMidW) {
-                  const exhausted = float(r.kind).greaterThan(3.5).toVar();
-                  const w = evalMidW(float(r.hit).lessThan(0.5).or(exhausted));
-                  exactVis = select(exhausted, r.pen.mul(w), r.hit.oneMinus().mul(r.pen).mul(w));
-                } else {
-                  exactVis = r.hit.oneMinus().mul(r.pen);
-                }
-                return vec2(
-                  coneT ? exactVis.mul(coneT) : exactVis,
-                  r.t.max(0).div(float(span)).clamp(0, 1),
-                );
-              }
-              // Tiered like every other march in this module — the DDA's
-              // hierarchical coarse-skip means these budgets cross the whole
-              // volume at every tier; the tiers trade tail-end reach in
-              // pathological threading rays for per-pixel cost.
-              // (`__giDirectShadowSteps` overrides both arms for an A/B.)
-              const ddaSteps =
-                Number(globalThis.__giDirectShadowSteps) ||
-                ({ low: 40, medium: 56, high: 64, ultra: 80 }[quality] ?? 64);
-              const r = occ.traceOccupancy(origin, dirEff, tMin, exactEnd, { steps: ddaSteps, penumbraK: k });
-              let legacyVis = r.hit.oneMinus().mul(r.pen);
-              if (evalMidW) legacyVis = legacyVis.mul(evalMidW(float(r.hit).lessThan(0.5)));
+            : null;
+          // STATIC-BVH ARM ("light by voxels, shadows by BVH", user
+          // directive 2026-08-06): the shadow ray intersects EXACT world
+          // triangles — the masked static-scene BVH8 merged with the
+          // exact dynamic set — and never touches voxels. Admission is
+          // exact geometry; softness stays the analytic width probe
+          // (width, never admission). Radiance/bounce remain voxel.
+          if (exactArm) {
+            // EXACT GEOMETRY NEEDS AN EXACT-GEOMETRY BIAS — this arm
+            // inherited the VOXEL one and that is the measured cause of
+            // the "holes in the shadows". `origin` arrives lifted 1.5
+            // occupancy voxels off the surface and `tMin` skips a whole
+            // voxel more; both exist because the conservative voxel shell
+            // bulges the receiver's own surface up to a voxel above its
+            // true plane. Against real triangles there is no shell and
+            // nothing to escape, so the pair is pure loss: 0.25 m of
+            // blind band on the user's Sponza (voxel 0.098 m), measured
+            // as 10.8% of surface points with their NEAREST occluder
+            // inside it and 2.6% losing their shadow outright
+            // (run-gi-static-bvh-probe.mjs). It is worst on walls, whose
+            // light-facing normal shoves the origin 0.15 m out of the
+            // arcade — past the very column that should shadow them.
+            // The lift direction is recoverable: origin = P + n·lift by
+            // construction, and cosRayNormal > 0.05 at every call site
+            // keeps that difference non-degenerate.
+            let exactOrigin = origin;
+            let exactMin = tMin;
+            if (receiverP != null) {
+              const nHat = vec3(origin).sub(vec3(receiverP)).normalize().toVar();
+              // Slope-scaled: a grazing ray is where the interpolated
+              // shading normal and the true face diverge most, so the
+              // offset has to grow with 1/cos to stay off its own surface.
+              const bias = voxMax
+                .mul(exactBiasFactor)
+                .div(float(cosRayNormal ?? 1).max(0.25))
+                .toVar();
+              exactOrigin = vec3(receiverP).add(nHat.mul(bias)).toVar();
+              exactMin = bias;
+            }
+            const s = this._dynSet.traceStaticBvh(exactOrigin, dir, exactMin, maxT);
+            // §14 Q2: the receiver point rides along so a fat proxy
+            // (bone capsule) containing this very surface cannot shadow
+            // it — the tight exact bias (~2 mm) cannot escape a shell
+            // that overshoots the skin by centimetres.
+            const dr = this._dynSet.trace(exactOrigin, dir, exactMin, maxT, {
+              excludePoint: globalThis.__giNoSelfPlaneExclusion === true ? null : receiverP,
+            });
+            const sHit = s.x.greaterThanEqual(0).toVar();
+            const hit = sHit.or(dr.hit.greaterThan(0.5)).toVar();
+            const tBest = select(
+              sHit.and(dr.hit.greaterThan(0.5)), s.x.min(dr.t),
+              select(sHit, s.x, dr.t),
+            ).toVar();
+            let exactVis;
+            if (evalMidW) {
+              exactVis = select(hit, float(0), evalMidW(hit.not()));
+            } else {
+              exactVis = select(hit, float(0), float(1));
+            }
+            if (analyticPen) {
+              // tan(half-angle) * blocker distance — the sun's penumbra
+              // half-width at the receiver, in METRES, straight from the
+              // t the traces already resolved. `tanHalf` is null only on
+              // a hard-shadow call, where a zero width is the right answer.
+              //
+              // THE 1 mm FLOOR IS A SENTINEL, NOT A WIDTH (§12.54's rule,
+              // and it is load-bearing for the blocker search below): a
+              // CONTACT pixel and a LIT pixel both write ~0, and the
+              // search has to keep the first's own zero radius while
+              // giving the second its neighbours'. Exact 0 only on a miss
+              // makes the channel its own occupancy mask.
+              const w = float(tanHalf ?? 0).max(0).mul(tBest.max(0)).clamp(0, 64).toVar();
               return vec2(
-                coneT ? legacyVis.mul(coneT) : legacyVis,
-                r.t.max(0).div(float(span)).clamp(0, 1),
+                exactVis,
+                select(hit, w.max(1e-3), float(0)),
               );
-            },
+            }
+            return vec2(
+              exactVis,
+              tBest.max(0).div(float(span)).clamp(0, 1),
+            );
+          }
+          // THE RECORD MARCH — the non-voxel shadow arm. When the active
+          // ray-hit mode carries surface records, shadow rays resolve hits
+          // through the SAME fitted planes (+ coverage clips, + exact
+          // triangles on ultra) the gather uses: silhouettes follow the
+          // recorded geometry at sub-voxel precision instead of the voxel
+          // hull, and the cone estimate comes from perpendicular miss
+          // distances to those planes rather than voxel free-radius.
+          // DynamicBrick cells resolve through the per-chain DYNAMIC
+          // record tail (refit at the mover's pose every dispatch), so
+          // movers keep fitted-plane silhouettes while moving. KNOWN
+          // LIMITS (why a silhouette can still read voxel-true): static
+          // cells sharing a mover's brick refit unfitted (box) until the
+          // demote's full rebuild, tail overflow degrades that brick to
+          // box, and COMPLEX-classified cells (curved stone, thin
+          // double-face walls) only resolve to real triangles in
+          // exact-complex mode.
+          if (recordMarch) {
+            // Tiered macro budget like the legacy arm — the cap only binds
+            // on long grazing rays (the frames where shadow cost spikes),
+            // and with the fail-closed clamp a capped ray goes DARK, never
+            // a leak. `__giDirectShadowSteps` overrides here too.
+            const macroSteps =
+              Number(globalThis.__giDirectShadowSteps) ||
+              ({ low: 96, medium: 128, high: 160, ultra: 192 }[quality] ?? 160);
+            const r = occ.traceHybridPlane(origin, dir, tMin, maxT, {
+              coverage: shadowMode >= RayHitMode.HybridPlaneCoverage,
+              exact: shadowMode === RayHitMode.HybridExactComplex,
+              penumbraK: k,
+              macroSteps,
+              // DIAGNOSTIC (build-time): fold the SHADOW rays into the
+              // rayHitDebug counters. The gather rays are profiled by
+              // default and read 0 limit exits on healthy scenes, so any
+              // macro/brick/invalid counts that appear under this hatch
+              // are the shadow arm's — the fail-closed attribution the
+              // texture-side kind map exists for, without the texture.
+              profile: globalThis.__giShadowProfile === true,
+              // ORIGIN-PLANE EXCLUSION: the receiving surface point. The
+              // march skips accepts/cone contributions whose plane
+              // contains it — the receiver's own SAT-bulged staircase
+              // cells re-fit exactly that plane, and each tooth used to
+              // stamp a teardrop self-shadow phantom on tilted receivers.
+              // `__giNoSelfPlaneExclusion = true` restores the old arm
+              // (build-time A/B like every hatch here).
+              excludePoint: globalThis.__giNoSelfPlaneExclusion === true ? null : receiverP,
+            });
+            if (globalThis.__giShadowKindDebug === true) {
+              // VERDICT-KIND MAP instead of a shadow: the channel paints
+              // WHICH acceptance class decided each pixel. miss=white,
+              // plane=0.75, exact-triangle=0.5, box=0.25, clamp=black.
+              return vec2(float(1).sub(r.kind.mul(0.25)), 0);
+            }
+            if (globalThis.__giShadowKindDebug === "sub") {
+              // SUB-KIND MAP: kind·0.125 puts every class at a distinct
+              // byte — miss=0, plane=32, tri=64, box=96, macro-exhaust=128,
+              // brick-limit=159, invalid-brick=191 (and 255 = no geometry,
+              // the pass default). This is the fail-closed ATTRIBUTION
+              // instrument: 4/5/6 render identically in production.
+              return vec2(r.kind.mul(0.125), 0);
+            }
+            // x = exact-arm visibility × cone transmittance (the two
+            // phases partition the ray, so the product is the ray's
+            // visibility). y = blocker distance for the PCSS/wide-pass
+            // chain; misses carry t = -1, hence the max(0).
+            // EXHAUSTION (kind 4) → THE PROBE'S VERDICT, exactly like
+            // the emitter arm. The 90° kind map measured 16.8k of 51.8k
+            // pixels CLAMPED — the fail-closed black was most of the
+            // "umbra", with a bogus ~0.3m blocker distance that also
+            // collapsed the wide-pass radius. The probe's openness
+            // reading gives those rays the physically-shaped gradient
+            // (dark at the caster's base, washing out with distance —
+            // the Blender 90° look) instead of a hard black blob, and
+            // it is what makes LOWERING march budgets safe: an
+            // exhausted ray now degrades to "approximately right" not
+            // "black".
+            let exactVis;
+            if (evalMidW) {
+              const exhausted = float(r.kind).greaterThan(3.5).toVar();
+              const w = evalMidW(float(r.hit).lessThan(0.5).or(exhausted));
+              exactVis = select(exhausted, r.pen.mul(w), r.hit.oneMinus().mul(r.pen).mul(w));
+            } else {
+              exactVis = r.hit.oneMinus().mul(r.pen);
+            }
+            return vec2(
+              exactVis,
+              r.t.max(0).div(float(span)).clamp(0, 1),
+            );
+          }
+          // Tiered like every other march in this module — the DDA's
+          // hierarchical coarse-skip means these budgets cross the whole
+          // volume at every tier; the tiers trade tail-end reach in
+          // pathological threading rays for per-pixel cost.
+          // (`__giDirectShadowSteps` overrides both arms for an A/B.)
+          const ddaSteps =
+            Number(globalThis.__giDirectShadowSteps) ||
+            ({ low: 40, medium: 56, high: 64, ultra: 80 }[quality] ?? 64);
+          const r = occ.traceOccupancy(origin, dir, tMin, maxT, { steps: ddaSteps, penumbraK: k });
+          let legacyVis = r.hit.oneMinus().mul(r.pen);
+          if (evalMidW) legacyVis = legacyVis.mul(evalMidW(float(r.hit).lessThan(0.5)));
+          return vec2(
+            legacyVis,
+            r.t.max(0).div(float(span)).clamp(0, 1),
+          );
+        },
       // STABLE estimator, deliberately (the sharp one was tried first): the
       // sharp arm's occluder admission is binary, and against a ~12cm-voxel
       // medium those verdicts flip with lattice phase — white-speckle
@@ -5609,7 +5152,6 @@ export class GISystem {
    * record march's admission is exact geometry (planes/coverage/triangles,
    * fail-closed), and softness is the same analytic width term the direct
    * arm uses — deterministic, no thresholds, unified with the light arm.
-   * `__giEmitterRecordShadows = false` restores the sphere arm (build-time).
    *
    * ANALYTIC PENUMBRA (2026-08-13, plan §12.52.1 unit 2). On the SHIPPING
    * static-BVH arm the width probe is gone: admission there is one exact BVH8
@@ -5634,7 +5176,6 @@ export class GISystem {
    * report width 0, which the wide passes read as "nothing to blur".
    */
   #buildEmitterRecordTrace(volume, quality) {
-    if (globalThis.__giEmitterRecordShadows === false) return null;
     const occ = volume.occupancyField;
     if (!occ?.voxel || !occ.traceHybridPlane || occ.hasSurfaceRecords !== true) return null;
     const shadowMode = volume.rayHitMode ?? RayHitMode.OccupancyLegacy;
@@ -5645,9 +5186,7 @@ export class GISystem {
     // descents' worth of code in a kernel that no longer uses one. The RECORD
     // arm below still needs it (its admission is a march, not a single exact
     // hit, so it has no blocker distance to hand the wide pass); the analytic
-    // static-BVH arm must never touch it. `wantWidthProbe` keeps the arm
-    // selection readable without forcing the construction.
-    const wantWidthProbe = globalThis.__giShadowAnalyticWidth !== false;
+    // static-BVH arm must never touch it.
     let widthProbeFn;
     const widthProbe = () => (widthProbeFn ??= volume.createWidthProbe?.() ?? null);
     const analyticPen = globalThis.__giEmitterAnalyticPenumbra !== false;
@@ -5693,7 +5232,7 @@ export class GISystem {
       // STATIC-BVH ARM (see the direct arm's note): exact triangles for the
       // emitter's occlusion too. The tEnd trim above already excludes the
       // lamp's own surface; the width probe supplies area-light softness.
-      if (this._dynSet?.staticBvh && globalThis.__giShadowStaticBvh !== false) {
+      if (this._dynSet?.staticBvh) {
         // Exact-geometry bias, same reasoning as the direct arm's (see there):
         // the voxel lift + one-voxel tMin is a quarter-metre blind band that
         // exact triangles have no shell to justify. P and N arrive directly
@@ -5741,7 +5280,7 @@ export class GISystem {
             select(hit, w.max(1e-3), float(0)),
           );
         }
-        if (wantWidthProbe && widthProbe()) {
+        if (widthProbe()) {
           const w = float(1).toVar();
           If(hit.not(), () => {
             // tProbe, not tEnd — admission (the BVH trace above) keeps the
@@ -5769,7 +5308,7 @@ export class GISystem {
         // plane=0.75, exact-triangle=0.5, box=0.25, clamp=black.
         return out(float(1).sub(float(r.kind).mul(0.25)));
       }
-      if (wantWidthProbe && widthProbe()) {
+      if (widthProbe()) {
         // EXHAUSTION → THE PROBE'S VERDICT, not the fail-closed black.
         // Emitter geometry makes GRAZING rays the common case, not the
         // pathological one: a floor pixel's ray to a low panel hugs its own
@@ -5882,26 +5421,7 @@ export class GISystem {
             emitterCutoff,
           }
         : null;
-      // ⚠ THE NAME IS A FOSSIL. This is THE AO INPUT SLOT — the half-res one
-      // the resolve reconstructs with a position/normal-weighted 2x2 upsample —
-      // and every estimator since the voxel cones has ridden it (RTAO, now
-      // GTAO). It carries its own strength/radius uniforms so the term can be
-      // dialled without touching the (now unused) full-res `ao` slot.
-      //
-      // ⚠ AND IT NO LONGER REQUIRES THE OCCUPANCY CONE FN. Gating the slot on
-      // `traceOccupancyConeAO` was correct while a voxel cone was the only
-      // consumer; it silently deleted the AO term for every build without one.
-      // GTAO needs no acceleration structure at all, so the gate would now cost
-      // AO on exactly the portable/degraded builds that can least afford to
-      // lose a cheap term. The legacy cone arm still checks for its own fn.
-      const vxao = ao && globalThis.__giVxao !== false
-        ? {
-            strength: uniform(ao.strength.value),
-            radius: uniform(ao.radius.value),
-            node: null,
-          }
-        : null;
-      const inputs = { gather, normalOffset: light.normalOffset, intensity: light.intensityUniform, emitter, ao, vxao };
+      const inputs = { gather, normalOffset: light.normalOffset, intensity: light.intensityUniform, emitter, ao };
       // The bundle arrives target-less (the targets are created just above, and
       // only the system knows when) — bind it here and keep the completed
       // bundle on `screen` so the resize path can re-point it.
@@ -5916,7 +5436,7 @@ export class GISystem {
           }
         : null;
       // THE RESOLVE'S CAMERA, owned by the system and persistent across
-      // rebuilds — like `_giShadowFrameU` and friends, and for the same reason:
+      // rebuilds — like `_giShadowCheckerU` and friends, and for the same reason:
       // the tick writes it every frame and a rebuild must not orphan that ref.
       //
       // It used to be a field of the `radiance` bundle, created per build. That
@@ -5994,25 +5514,6 @@ export class GISystem {
               console.warn("[gi] src surface attribution unavailable:", error?.message ?? error);
             }
           }
-          // ── §12.90: HAND THE TRANSPORT THE SCENE-DERIVED LATTICE ──────────
-          //
-          // `#reportThinMeshes`' separator census (the loop that already walks
-          // every mesh) chose these; see the ledger there. `spacing0` overrides
-          // the TIER CONSTANT `SRC_QUALITY[tier].spacing0`, which is the value
-          // that made the gather's stencil reach 1.8× a 0.25 m wall.
-          //
-          // ⚠ THE BIAS GOES THROUGH THE SHARED GLOBAL ON PURPOSE. `srcRef.js`'s
-          // CPU mirror and the GPU gather must read ONE source or
-          // `test:gi-src-gather` diffs a biased GPU against an unbiased mirror
-          // and calls the fix a regression — `gatherNormalBias()` in srcMath is
-          // that source, and this is its writer. Both are no-ops when the census
-          // declined to fire (fewer than 8 separators, or no safe β window) —
-          // `_giAdaptiveFit` is null then, and #chooseAdaptiveLattice's reset
-          // block CLEARS the global so a previous fit cannot linger. One gate,
-          // checked once, there.
-          if (this._giAdaptiveFit) {
-            globalThis.__giGatherNormalBias = this._giAdaptiveFit.beta;
-          }
           // §16 S1 — the directional-sky bundle shares the PERSISTENT
           // env-miss nodes (created here with the same ??= the reflection
           // block uses, whichever runs first) but carries its OWN intensity
@@ -6040,7 +5541,6 @@ export class GISystem {
               rotY: this._giEnvMissRotU,
             },
             surfaces,
-            spacing0: this._giAdaptiveFit ? this._giAdaptiveFit.s0 : undefined,
             // §12.77 Unit A: the grown pool sizes survive every rebuild —
             // quality changes, resizes, scene edits — because demand already
             // proved the floors short. Growth only; see #syncSrcPoolPressure.
@@ -6321,55 +5821,13 @@ export class GISystem {
             `feather ${inputs.farField.feather.toFixed(1)}m inside the detail box boundary`,
         );
       }
-      // ── THE DIRECTIONAL RADIANCE LOOKUP, REBUILT (§12.71b) ───────────────
-      // `deferredRadianceLookup` has been null since the cascades (and their
-      // createRadianceLookup reader) died — "rough/glossy surfaces lose their
-      // blurred environment term until Phase 1-3". The consequence stayed
-      // invisible until the first metal-heavy scene: with the lookup null,
-      // giLight's ENTIRE specular block (its gate is `radianceFn ||
-      // giRadianceNode`) compiles out — including the exact-BVH mirror blend
-      // inside it — and §12.64's IBL suppression removed the last remaining
-      // leg, so `indirectSpecular = radiance·F + multi·iblIrradiance/π`
-      // evaluated 0 + 0: a bright-gray metal sphere rendered PITCH BLACK in
-      // a sunlit corridor (probe-sphere protocol, 2026-08-14; flipping the
-      // same sphere to metalness 0 lit it perfectly, which is what convicts
-      // the specular slot specifically).
-      //
-      // Phase 1-3's replacement is the SRC probe atlas itself: the tiles are
-      // direction-binned, `sampleTileRGBA(block, dir)` accepts an arbitrary
-      // direction, and gatherAt() only ever passed the surface normal by
-      // CONVENTION. Fed the reflected direction instead, the same sparse-
-      // trilinear coverage-weighted integral IS the cosine-lobe-blurred
-      // environment term — spatially local, occlusion-aware (probes only
-      // know what reached them), and exactly the "blurred" end of the lobe
-      // giLight's roughness gates expect: mirrors still take the exact-BVH
-      // hit blend over it. ÷π converts the cosine-hemisphere irradiance to
-      // the outgoing-radiance scale the specular slot multiplies by F (the
-      // same convention as the fully-rough `irradiance/π` limit).
-      //
-      // Cost note: the resolve already inlines THIS closure for the exact-
-      // reflection hit, so the per-pixel call reuses the same two storage-
-      // buffer bindings (hashKeys + hashBlock) and the atlas texture — ALU
-      // and WGSL size, not new bindings.
-      //
-      // ⚠ v1 WAS OPT-IN (`__giGlossyRadiance = true`) SINCE THE SAME NIGHT
-      // IT SHIPPED: inlined in the resolve at resolve res with no temporal
-      // pass behind it, it painted FLICKERING WHITE BLOBS on the user's
-      // metallic embroidery — raw single-bin probe noise on every glossy
-      // pixel. The ledger's three preconditions for default-ON are now
-      // built, which is why v2 IS default-on:
-      //   · the lookup moved to SRC's own half-res glossy pass
-      //     (createSrcGlossyGather — [I'] in srcSystem's dispatch list), so
-      //     the resolve pays one texture sample and its WGSL never grows;
-      //   · a LUMINANCE CAP at the write is the firefly clamp
-      //     (`__giGlossyCap` pins it);
-      //   · the radiance temporal filter (#armGlossyTemporal, the §12.65
-      //     pass reused at the glossy grid) tames what the cap admits.
-      // The de-duplication worry is answered by R5: tree/NEE emitters'
-      // field emission is zeroed at bake, so the bins carry lit surfaces,
-      // not the emitter disks the resolve's emitter-direct already lights.
-      // `__giGlossyRadiance = false` is the kill switch (srcSystem skips the
-      // pass; this input stays null; giLight compiles the specular slot out).
+      // ── THE DIRECTIONAL RADIANCE LOOKUP (§12.71b v2) ─────────────────────
+      // The glossy/blurred environment term giLight's specular slot needs (with
+      // it null the whole specular block, mirror blend included, compiles out —
+      // metals render black). It is SRC's own half-res glossy pass
+      // (createSrcGlossyGather): probe tiles sampled along the REFLECTED
+      // direction, luminance-capped (`__giGlossyCap`) and temporally filtered.
+      // `__giGlossyRadiance = false` is the kill switch (input stays null).
       inputs.screenRadiance = srcProbes?.glossy?.node ?? null;
       if (inputs.screenRadiance) {
         console.log(
@@ -6406,13 +5864,12 @@ export class GISystem {
         srcProbes, gbuffer, width, height,
         validEps: inputs.lightShadow?.voxMax ?? 0.15,
       });
-      const { aoPass, vxaoPass } = this.#armAoTerm({
+      const { aoPass } = this.#armGtaoPass({
         srcProbes,
         gbuffer,
         width,
         height,
         ao: inputs.ao,
-        vxao: inputs.vxao,
         occupancy: volume?.occupancyField,
       });
       // §12.70 W4b: the per-tile emitter cut — built BEFORE the resolve and
@@ -6429,9 +5886,7 @@ export class GISystem {
       // seam PASS at tileSize 1, R5 palette flags 4→N with zero orphans, the
       // mover gate, and a Sponza-scale ledger where the pair is CHEAPER
       // (6.572 → 6.162 ms while lighting 15 emitters instead of 4).
-      // `__giEmitterTileCut = false` restores the four global seats.
       const emitterTileCut = inputs.emitter
-          && globalThis.__giEmitterTileCut !== false
           && this._lightTreeRegion
           && volume?.occupancyField?.bits
         ? createGiEmitterTileCutPass({
@@ -6534,7 +5989,7 @@ export class GISystem {
           `tail compensation cap ${emitterTileCut.compCap}${emitterTileCut.compCap > 1 ? "" : " — DISABLED"}, ` +
           `soft-cut feather ${emitterTileCut.feather}${emitterTileCut.feather > 0 ? "" : " — HARD CUT"})`,
         );
-      } else if (globalThis.__giEmitterTileCut !== false && inputs.emitter) {
+      } else if (inputs.emitter) {
         // Wanted and did not get — say WHY (the §12.42 rule; the slice-(ii)
         // gate's first run read byte-identical arms and the only silent
         // explanation is a precondition failing here). Only when the scene
@@ -6650,40 +6105,21 @@ export class GISystem {
       // createGiLightShadowPass for why it left the resolve kernel.
       // Temporal-accumulation uniforms, persistent across rebuilds/resizes
       // (the tick updates them; a rebuild must not orphan the tick's refs).
-      // THE ANALYTIC-WIDTH ARM NEEDS NO TEMPORAL ANYTHING (docs/
-      // GI_SHADOWS_PLAN.md §5): the trace is deterministic, so each frame
-      // is already the converged answer — no jitter animation, no
-      // reprojection, no history, and the single filter pass below writes
-      // straight into the sampled target as banding insurance (rgba16
-      // quantization of D and record-plane seams are the residual risks).
-      const analyticWidth = inputs.lightShadow?.analyticWidth === true;
-      if (inputs.lightShadow && !analyticWidth) {
-        // Stochastic arm: materialize the accumulate/history textures (lazy
-        // since the analytic default — see createGiTargets).
-        targets.ensureShadowTemporal?.();
-        // renderGroup + onRenderUpdate — three's canonical per-frame-uniform
-        // pattern (what time uniforms use). The default object group's
-        // buffer does NOT re-upload on a quiet scene: the phase uniform's
-        // CPU value climbed every tick while the GPU kernel kept the boot
-        // value — the animated jitter was compiled in yet never animated
-        // (probe signature: two same-state raw readbacks differing by ~1
-        // pixel while the phase climbs). The same treatment goes to the
-        // reprojection matrix and history weight — all three are per-frame
-        // temporal inputs with no other upload trigger on a still scene.
-        this._giShadowFrameU ??= uniform(0).setGroup(renderGroup).onRenderUpdate(() => this._giShadowPhase ?? 0);
-        this._giShadowPrevVPU ??= uniform(new THREE.Matrix4()).setGroup(renderGroup);
-        this._giShadowHistWeightU ??= uniform(0.9).setGroup(renderGroup);
-      }
-      // §12.80 Unit B: checkerboard trace — half the pixels per dispatch, the
+      // THE SHADOW TRACE NEEDS NO TEMPORAL ANYTHING (docs/GI_SHADOWS_PLAN.md
+      // §5): it is deterministic, so each frame is already the converged
+      // answer — no jitter animation, no reprojection, no history. The single
+      // filter pass below writes straight into the sampled target as banding
+      // insurance (rgba16 quantization of D and record-plane seams are the
+      // residual risks).
       // other half keeps last frame's texel (see the pass's own comment for
       // why the DISPATCH halves rather than the lanes). The parity uniform
       // advances in the per-frame sync, independent of the temporal-jitter
-      // phase (which the analytic arm doesn't run). `__giShadowCheckerboard =
-      // false` restores the full-dispatch trace for A/B.
+      // phase. `__giShadowCheckerboard = false` restores the full-dispatch
+      // trace for A/B.
       const checkerOn = globalThis.__giShadowCheckerboard !== false;
       // `.setGroup(renderGroup)` on both: the default object group's buffer
-      // does not re-upload on a quiet scene (same trap `_giShadowFrameU`
-      // documents), and a frozen parity = half the buffer permanently stale.
+      // does not re-upload on a quiet scene, and a frozen parity = half the
+      // buffer permanently stale.
       if (checkerOn) {
         this._giShadowCheckerU ??= uniform(0, "uint").setGroup(renderGroup);
         this._giShadowCheckerFillU ??= uniform(0, "uint").setGroup(renderGroup);
@@ -6696,7 +6132,7 @@ export class GISystem {
             height: shadowH,
             resolveWidth: width,
             resolveHeight: height,
-            frame: analyticWidth ? null : this._giShadowFrameU,
+            frame: null,
             checker: checkerOn ? this._giShadowCheckerU : null,
             checkerFill: checkerOn ? this._giShadowCheckerFillU : null,
           })
@@ -6710,7 +6146,7 @@ export class GISystem {
       // into the sampled target (see createGiLightShadowWidePass — the 90°
       // hard-inner-edge fix). Without PCSS (no dist channel) the bilateral
       // writes the target directly, exactly as before.
-      const wideOn = analyticWidth && inputs.lightShadow?.pcss && globalThis.__giShadowWidePass !== false;
+      const wideOn = !!inputs.lightShadow?.pcss && globalThis.__giShadowWidePass !== false;
       // §14 Q6: the camera/projection pair used to exist only for the wide
       // passes; the bilateral's distance-robust eps needs them on every arm,
       // so they are created whenever any shadow filter will (the tick's
@@ -6723,7 +6159,7 @@ export class GISystem {
             source: targets.lightShadowRaw,
             // Analytic arm: ONE bilateral, straight into the sampled target
             // (the accumulate→history→post chain never exists).
-            target: analyticWidth ? (wideOn ? targets.lightShadowMid : targets.lightShadow) : targets.lightShadowAccum,
+            target: wideOn ? targets.lightShadowMid : targets.lightShadow,
             width: shadowW,
             height: shadowH,
             resolveWidth: width,
@@ -6734,13 +6170,7 @@ export class GISystem {
             // Angle-adaptive σ (see the filter's note) — synced per tick
             // from the sharpest claimed light in #syncLightShadowNodes.
             softness: (this._giShadowSoftnessU ??= uniform(1)),
-            history: analyticWidth ? null : {
-              histShadow: targets.lightShadowHist,
-              histPos: targets.lightShadowHistPos,
-              prevViewProj: this._giShadowPrevVPU,
-              weight: this._giShadowHistWeightU,
-              validEps: inputs.lightShadow.voxMax ?? 0.15,
-            },
+            history: null,
           })
         : null;
       // Two chained instances — small radius first, large radius over the
@@ -6794,39 +6224,6 @@ export class GISystem {
             rotSalt: 1.2,
           })
         : null;
-      const lightShadowHistoryPass = lightShadowFilterPass && !analyticWidth
-        ? createGiLightShadowHistoryPass({
-            gbuffer,
-            source: targets.lightShadowAccum,
-            histShadow: targets.lightShadowHist,
-            histPos: targets.lightShadowHistPos,
-            width: shadowW,
-            height: shadowH,
-            resolveWidth: width,
-            resolveHeight: height,
-          })
-        : null;
-      // PRESENTATION FILTER — the same edge-aware kernel, history-free,
-      // cleaning the ACCUMULATED signal into the texture materials sample.
-      // Outside the feedback loop on purpose: history stores the un-post-
-      // filtered accumulation, so the extra blur never compounds frame over
-      // frame (that would flatten every penumbra), it only removes the
-      // residual filter-scale mottle the EMA leaves behind ("still very
-      // grainy and dirty").
-      const lightShadowPostPass = lightShadowFilterPass && !analyticWidth
-        ? createGiLightShadowFilterPass({
-            gbuffer,
-            source: targets.lightShadowAccum,
-            target: targets.lightShadow,
-            width: shadowW,
-            height: shadowH,
-            resolveWidth: width,
-            resolveHeight: height,
-            planeEps: inputs.lightShadow.voxMax ?? 0.1,
-            cameraPos: this._giShadowWideCamU,
-            projScale: this._giShadowWideProjU,
-          })
-        : null;
       // EMITTER SHADOW PASS + FILTER (see createGiEmitterShadowPass in
       // giScreen) — queued BEFORE the resolve each frame: the resolve
       // samples the filtered texture instead of tracing per resolve pixel.
@@ -6842,25 +6239,11 @@ export class GISystem {
       const emitterAnalyticPen =
         !!inputs.emitter && emitterRecordTrace?.withPenumbra === true;
       const emitterWideOn = emitterAnalyticPen && globalThis.__giEmitterWidePass !== false;
-      // §14 Q7: the area sample rides the temporal chain — a jittered ray
-      // with no EMA behind it is shimmer. Decided here because the PASS needs
-      // the frame uniform at build.
-      //
-      // ⚠ OPT-IN (`__giEmitterAreaSample = true`) since 2026-08-20 EVENING,
-      // one hour after shipping default-on: live on the user's Level the
-      // jitter read as a SPECKLE AURA around the moving character — exactly
-      // where the occluder keeps history invalid (Q7b clips it, motion drops
-      // the weight), so the raw binary jitter reaches the screen with only
-      // the despeckle bilateral behind it. The area sample needs its own
-      // instrument (pose-held convergence + moving-occluder noise floor)
-      // and probably a lower disc fraction + wide-radius trade before it can
-      // ship on. The temporal CHAIN stays default-on — it is what makes the
-      // checkerboard/motion story coherent — the jitter alone is parked.
+      // §14 Q7: the emitter shadow ray is the CENTRAL ray — the jittered area
+      // sample was parked (a speckle aura around a moving character, where
+      // history is invalid). The temporal CHAIN stays on; only the jitter is
+      // gone, so the pass takes no frame uniform.
       const emitterTemporalWanted = globalThis.__giEmitterTemporal !== false;
-      const emitterAreaSample = emitterTemporalWanted && globalThis.__giEmitterAreaSample === true;
-      if (emitterAreaSample && inputs.emitter) {
-        this._giEmitterFrameU ??= uniform(0, "uint").setGroup(renderGroup);
-      }
       const emitterShadowPass = inputs.emitter
         ? createGiEmitterShadowPass({
             gbuffer,
@@ -6875,7 +6258,7 @@ export class GISystem {
             cameraPosition: this._giResolveCamU,
             // §12.70 W4b slice (ii): march each pixel's TILE-list emitters.
             tileCut: tileCutBundle,
-            frame: emitterAreaSample ? this._giEmitterFrameU : null,
+            frame: null,
           })
         : null;
       // EMITTER TEMPORAL ACCUMULATION (2026-08-07). This channel had the
@@ -7067,7 +6450,7 @@ export class GISystem {
       // to each pixel's TILE list, not to the global seats these material
       // slots are — giLight's glow path reads this flag and goes unshadowed
       // rather than occluding one lamp's glow with another lamp's shadow.
-      light.emitterTileKeyed = globalThis.__giEmitterTileCut !== false && !!this._lightTreeRegion;
+      light.emitterTileKeyed = !!this._lightTreeRegion;
       // Armed by EITHER radiance source: the legacy closure (harness) or the
       // glossy texture chain (§12.71b v2, the default). Materials sample the
       // persistent radiance target either way.
@@ -7140,7 +6523,7 @@ export class GISystem {
         this.engine.scene.add(srcProbes.gizmos.group);
         srcProbes.gizmos.setVisible(giDebugView() === "src-probes");
       }
-      return { gbuffer, srcProbes, resolve, bvhHitShade, bvhHitTemporal, irrTemporalPass, irrHistoryPass, aoPass, vxaoPass, glossyTemporal, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterTileCut, emitterTileCutBundle: tileCutBundle, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
+      return { gbuffer, srcProbes, resolve, bvhHitShade, bvhHitTemporal, irrTemporalPass, irrHistoryPass, aoPass, glossyTemporal, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, emitterShadowPass, emitterTileCut, emitterTileCutBundle: tileCutBundle, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -7274,141 +6657,6 @@ export class GISystem {
   }
 
   /**
-   * THE AO PASS (screen-space, 2026-08-21 — createGiAoPass has the whole
-   * pricing story). It rides srcProbes' dispatch list for the same lifecycle
-   * reason the far-field average does — and because AO without a diffuse
-   * term is a multiply on zero: no srcProbes, no indirect, no pass. The
-   * resolve's sample compiles out with it (`ao.node` stays unset).
-   */
-  #armAoPass({ srcProbes, gbuffer, width, height, ao }) {
-    if (!ao || !srcProbes) {
-      // A re-arm that cannot build must not leave the resolve a node over a
-      // disposed target (the resize path re-arms against a fresh gbuffer).
-      if (ao) ao.node = null;
-      return null;
-    }
-    // World radius → screen taps: 0.5 · resolveHeight · proj[1][1], written
-    // per frame beside the resolve camera (see the tick's uniform sync).
-    this._giAoProjU ??= uniform(1).setGroup(renderGroup);
-    const pass = createGiAoPass({
-      gbuffer,
-      width,
-      height,
-      cameraPosition: this._giResolveCamU,
-      projScale: this._giAoProjU,
-      strength: ao.strength,
-      radius: ao.radius,
-    });
-    // ── THE DENOISER IS NOT OPTIONAL (2026-08-26) ─────────────────────────
-    //
-    // The estimator rotates its spirals per pixel, which is a per-pixel
-    // ESTIMATOR and therefore spatial noise — the user's "especially screen
-    // space component". createGiAoFilterPass' header has the full argument.
-    // Two separable radius-2 cross-bilateral passes; the resolve then samples
-    // the FILTERED texture, and `pass.target` (the raw estimate) stays
-    // reachable for an A/B through `__giAoFilter = false`.
-    const filtered = globalThis.__giAoFilter === false
-      ? null
-      : (() => {
-        const tmp = new THREE.StorageTexture(width, height);
-        tmp.name = "giAoBlurX";
-        tmp.generateMipmaps = false;
-        const out = new THREE.StorageTexture(width, height);
-        out.name = "giAoFiltered";
-        out.generateMipmaps = false;
-        const filterX = createGiAoFilterPass({
-          gbuffer, source: pass.target, target: tmp, width, height,
-          cameraPosition: this._giResolveCamU, projScale: this._giAoProjU, axisX: 1,
-        });
-        const filterY = createGiAoFilterPass({
-          gbuffer, source: tmp, target: out, width, height,
-          cameraPosition: this._giResolveCamU, projScale: this._giAoProjU, axisY: 1,
-        });
-        return { tmp, out, computes: [filterX.compute, filterY.compute] };
-      })();
-    const finalTarget = filtered ? filtered.out : pass.target;
-    ao.node = texture(finalTarget);
-    srcProbes.passes.push(pass.compute);
-    if (filtered) srcProbes.passes.push(...filtered.computes);
-    srcProbes.passGroups?.push({ label: "ao", count: filtered ? 3 : 1 });
-    // `target` IS what the resolve and the debug view read — the filtered
-    // estimate. `rawTarget` is the unfiltered one; keeping the names honest is
-    // what stops the "ao" debug view showing a different buffer from the one
-    // the frame multiplies in, which is the bug this whole pass came out of.
-    return {
-      ...pass,
-      target: finalTarget,
-      node: ao.node,
-      rawTarget: pass.target,
-      dispose: () => {
-        pass.target?.dispose?.();
-        filtered?.tmp?.dispose?.();
-        filtered?.out?.dispose?.();
-      },
-    };
-  }
-
-  /**
-   * ⛔ RETIRED — the AO PAIR (screen spirals + voxel cones) IS NO LONGER ARMED.
-   *
-   * `#armRtaoPass` replaces both (user directive 2026-08-26, "abandon vxao and
-   * gtao, for gi ao, reuse our Radiance Cascade traces"). This method and
-   * `#armAoPass` are kept, unreferenced by the default path, ONLY as the A/B
-   * arm behind `__giAoLegacy = true` — the change is a look change on every
-   * scene and the honest way to judge it is to be able to flip back in one
-   * build. Delete both once the ray-traced arm has been accepted.
-   *
-   * What they were: screen-space spirals over the gbuffer (4.31 ms, blind to
-   * anything off screen, estimating occlusion from a heightfield) and six
-   * 60-degree cones through the occupancy density pyramid (10.94 ms — the most
-   * expensive pass in the whole SRC chain — blind below a level-1 cell).
-   */
-  #armLegacyAoPair({ srcProbes, gbuffer, width, height, ao, vxao, occupancy }) {
-    const aoPass = this.#armAoPass({ srcProbes, gbuffer, width, height, ao });
-    const vxaoPass = this.#armVxaoPass({ srcProbes, gbuffer, width, height, vxao, occupancy });
-    return { aoPass, vxaoPass };
-  }
-
-  /**
-   * THE AO TERM'S ONE ENTRY POINT — which estimator runs, and why there is a
-   * choice at all rather than one shipped answer.
-   *
-   * There have been four. Two are retired (`#armLegacyAoPair`: screen spirals
-   * blind to anything off-screen, and voxel cones blind below a level-1 cell,
-   * 15.25 ms for the pair). Of the two that remain, neither dominates the
-   * other on correctness — they are blind in DIFFERENT directions, and that
-   * is exactly why the hatch exists instead of a deletion:
-   *
-   *   GTAO (default) solves the visibility integral in closed form from
-   *   screen-space horizons. Smooth, sharp at contacts, ~3x cheaper, and
-   *   available even where the static BVH is absent (a portable build, a
-   *   degrade-ladder drop) — but it cannot see an occluder that is off-screen
-   *   or hidden behind the receiver.
-   *
-   *   RTAO (`__giAoRaytraced = true`) traces the real world through the
-   *   cascade's BVH8, so it sees everything — but the budget it fits into is
-   *   ONE ray per pixel, i.e. a binary sample of a continuous integral, and
-   *   the 7x7 filter that makes that presentable is what costs the detail.
-   *
-   * The tie is broken by what the term is FOR here: the resolve multiplies it
-   * into the gather only, and the cascade's own BIN_T visibility already
-   * carries every world-space blocker at lattice resolution. The band left
-   * over is sub-lattice, and sub-lattice occluders are on screen next to the
-   * pixel they darken. See createGiGtaoPass' header for the full argument.
-   */
-  #armAoTerm(args) {
-    if (globalThis.__giAoLegacy === true) {
-      if (!this._rtaoLegacyLogged) {
-        this._rtaoLegacyLogged = true;
-        console.log("[gi] AO: LEGACY PAIR armed (__giAoLegacy = true) — screen spirals + voxel cones.");
-      }
-      return this.#armLegacyAoPair(args);
-    }
-    if (globalThis.__giAoRaytraced === true) return this.#armRtaoPass(args);
-    return this.#armGtaoPass(args);
-  }
-
-  /**
    * GTAO — the shipped AO term. `createGiGtaoPass` owns the integral; this
    * method owns the four things that are the SYSTEM's business.
    *
@@ -7439,17 +6687,12 @@ export class GISystem {
    *    ONE ray's variance, and spending it on an estimator that has none just
    *    removes contact detail.
    */
-  #armGtaoPass({ srcProbes, gbuffer, width, height, ao, vxao }) {
-    if (!vxao || !srcProbes) {
+  #armGtaoPass({ srcProbes, gbuffer, width, height, ao }) {
+    if (!ao || !srcProbes) {
       if (ao) ao.node = null;
-      if (vxao) vxao.node = null;
-      return { aoPass: null, vxaoPass: null };
+      return { aoPass: null };
     }
-    // ONE ESTIMATOR. The `ao` slot stays null so the resolve's `min` cannot
-    // compose two terms and make an isolated read of either impossible — the
-    // instrument failure that cost two sessions in August.
-    if (ao) ao.node = null;
-    // ⚠ BORN HERE AND IN `#armRtaoPass`, never inside a pass: the denoiser
+    // ⚠ BORN HERE, never inside a pass: the denoiser
     // reads `_giAoProjU`, and `float(undefined)` is a TSL BUILD error that
     // takes down the entire GI screen chain rather than defaulting to zero.
     this._giAoProjU ??= uniform(1).setGroup(renderGroup);
@@ -7464,7 +6707,7 @@ export class GISystem {
     // HALF RESOLUTION, over a FULL-resolution gbuffer. The pass marches the
     // full-res position buffer either way, so halving the pixel count halves
     // the cost without blunting the horizons themselves; the resolve's
-    // position/normal-weighted 2x2 upsample (the `vxao` slot, see below) is
+    // position/normal-weighted 2x2 upsample in the resolve is
     // what keeps the result from reading as blocky.
     const scale = Number.isFinite(requestedScale)
       ? Math.min(1, Math.max(0.25, requestedScale))
@@ -7505,14 +6748,14 @@ export class GISystem {
       cameraRight: this._giAoCamRightU,
       cameraUp: this._giAoCamUpU,
       projScale: this._giAoProjU,
-      strength: vxao.strength,
-      radius: vxao.radius,
+      strength: ao.strength,
+      radius: ao.radius,
       slices,
       steps,
       target: rawTarget,
     });
-    vxao.derivedRadius = radius;
-    vxao.radius.value = radius;
+    ao.derivedRadius = radius;
+    ao.radius.value = radius;
 
     const filtered = globalThis.__giAoFilter === false
       ? null
@@ -7535,14 +6778,12 @@ export class GISystem {
       })();
     const finalTarget = filtered ? filtered.out : rawTarget;
 
-    // IT RIDES THE `vxao` SLOT for the same reason the ray-traced arm did:
-    // that slot is the one the resolve reconstructs with a position/normal-
-    // weighted 2x2 upsample, which is what makes half resolution affordable
-    // instead of blocky. The slot's NAME is a fossil of the voxel-cone arm
-    // that first used it; it means "the half-res AO input" now.
-    vxao.node = texture(finalTarget);
-    vxao.width = rtWidth;
-    vxao.height = rtHeight;
+    // The resolve reconstructs this slot with a position/normal-weighted 2x2
+    // upsample, which is what makes half resolution affordable instead of
+    // blocky — see createGiResolve's AO block.
+    ao.node = texture(finalTarget);
+    ao.width = rtWidth;
+    ao.height = rtHeight;
     srcProbes.passes.push(pass.compute);
     if (filtered) srcProbes.passes.push(...filtered.computes);
     srcProbes.passGroups?.push({ label: "gtao", count: filtered ? 3 : 1 });
@@ -7551,16 +6792,14 @@ export class GISystem {
         `${rtWidth}x${rtHeight} (scale ${scale.toFixed(2)}, Jimenez 4x4 spatial rotation), ` +
         `radius ${radius.toFixed(2)}m = ${radiusIntervals} x cascade-0 interval (s0 ${s0.toFixed(2)}), ` +
         `closed-form arc integral over a full-res gbuffer` +
-        `${filtered ? `, bilateral r${filtered.blur}` : ", UNFILTERED"}, no temporal. ` +
-        "__giAoRaytraced = true restores the ray-traced arm.",
+        `${filtered ? `, bilateral r${filtered.blur}` : ", UNFILTERED"}, no temporal.`,
     );
     return {
-      aoPass: null,
-      vxaoPass: {
+      aoPass: {
         compute: pass.compute,
         target: finalTarget,
         rawTarget,
-        node: vxao.node,
+        node: ao.node,
         width: rtWidth,
         height: rtHeight,
         dispose: () => {
@@ -7570,283 +6809,6 @@ export class GISystem {
         },
       },
     };
-  }
-
-  /**
-   * RAY-TRACED AO, per pixel, through the cascade's own static-BVH8 tracer.
-   * createGiRtaoPass' header carries the estimator argument; this method owns
-   * the three things that are the SYSTEM's business rather than the kernel's.
-   *
-   * 1. THE RADIUS IS READ FROM THE CASCADE. `spacing0 · R0_OVER_S0` is the
-   *    distance cascade 0 resolves per probe, so four of those is a reach
-   *    expressed in what the scene measures instead of in metres. It lands at
-   *    2.24 m on the user's Sponza (s0 0.35), within 12% of the 2.0 m the
-   *    retired VXAO shipped as a constant — which is the check that this is a
-   *    re-derivation and not a re-tuning.
-   *
-   * 2. THE BIAS IS THE EXACT ARM'S, NOT THE VOXEL ONE. `voxMax · 0.02` — the
-   *    same ~2 mm the static-BVH shadow arm uses, and for the same measured
-   *    reason: inheriting the DDA's 1.5-voxel lift there cost 0.25 m of blind
-   *    band and 2.6% of surface points their shadow outright.
-   *
-   * 3. IT FALLS BACK, LOUDLY. No static BVH means no tracer, and an AO term
-   *    that silently becomes 1 is the failure this module keeps re-learning —
-   *    so the legacy pair is armed instead and says so once.
-   */
-  #armRtaoPass({ srcProbes, gbuffer, width, height, ao, vxao, occupancy }) {
-    if (globalThis.__giAoLegacy === true) {
-      if (!this._rtaoLegacyLogged) {
-        this._rtaoLegacyLogged = true;
-        console.log("[gi] AO: LEGACY PAIR armed (__giAoLegacy = true) — screen spirals + voxel cones.");
-      }
-      return this.#armLegacyAoPair({ srcProbes, gbuffer, width, height, ao, vxao, occupancy });
-    }
-    const traceStaticBvh = this._dynSet?.staticBvh ? this._dynSet.traceStaticBvh.bind(this._dynSet) : null;
-    if (!vxao || !srcProbes || !traceStaticBvh) {
-      if (vxao && srcProbes && !traceStaticBvh && !this._rtaoNoBvhLogged) {
-        this._rtaoNoBvhLogged = true;
-        console.warn(
-          "[gi] AO: no static BVH is built, so the ray-traced arm cannot trace — " +
-          "falling back to the retired screen+voxel pair for this build.",
-        );
-        return this.#armLegacyAoPair({ srcProbes, gbuffer, width, height, ao, vxao, occupancy });
-      }
-      if (ao) ao.node = null;
-      if (vxao) vxao.node = null;
-      return { aoPass: null, vxaoPass: null };
-    }
-    // The screen-space arm is GONE from the default path: one estimator, one
-    // composition, nothing for a `min()` to hide behind.
-    if (ao) ao.node = null;
-    // ⚠ THIS UNIFORM USED TO BE BORN INSIDE `#armAoPass`, which no longer
-    // runs. The denoiser needs it (world radius -> screen taps, written per
-    // frame beside the resolve camera) and `float(undefined)` is a TSL build
-    // error, not a zero — the whole GI screen chain failed to compile.
-    this._giAoProjU ??= uniform(1).setGroup(renderGroup);
-
-    const s0 = Number(srcProbes.spacing0) > 0 ? Number(srcProbes.spacing0) : 0.35;
-    // ── TWO CASCADE-0 INTERVALS, NOT FOUR (2026-08-26) ────────────────────
-    //
-    // Four was picked to land on the 2.0 m the retired VXAO shipped, and that
-    // number was an artifact of a voxel cone that could not resolve anything
-    // finer. Cost here is roughly linear in reach — a 2.24 m ray descends far
-    // more of a 262k-triangle BVH than a 1.12 m one — and the long tail buys
-    // little: past r0 the cascade already answers, at lattice resolution.
-    // Two intervals is "the band the probe grid cannot resolve, plus the
-    // lattice cell itself" (r0 + s0*2 = 1.12 m here), which is the band this
-    // term exists for. It also reads CRISPER, because a metre-scale AO is a
-    // broad wash and a contact-scale one is an edge.
-    const radiusIntervals = Math.max(0.5, Math.min(8, Number(globalThis.__giRtaoIntervals) || 2));
-    const radius = s0 * SRC_R0_OVER_S0 * radiusIntervals;
-    // `occupancy.voxel` is a UNIFORM NODE, not a vector — its `.x` is a swizzle
-    // node, so reading it directly and handing it to Math.max yields NaN and a
-    // bias of NaN silently makes every ray miss. The CPU-side value is on
-    // `.value`; `occupancyBackend` also publishes it as a plain clone.
-    const voxVec = occupancy?.voxel?.value ?? occupancy?.voxel ?? null;
-    const voxMax = voxVec && Number.isFinite(voxVec.x)
-      ? Math.max(voxVec.x, voxVec.y, voxVec.z)
-      : 0.1;
-    const bias = Math.max(1e-4, voxMax * 0.02);
-
-    const requestedScale = Number(globalThis.__giRtaoScale);
-    // HALF RESOLUTION BY DEFAULT, and the resolve's position/normal-weighted
-    // 2x2 upsample is what makes that affordable rather than blocky — it is
-    // the same reconstruction the voxel arm shipped with, and it is already
-    // written and proven. AO is a smooth low-frequency factor; its silhouettes
-    // are reconstructed from the gbuffer, not carried in the buffer.
-    const scale = Number.isFinite(requestedScale)
-      ? Math.min(1, Math.max(0.25, requestedScale))
-      : 0.5;
-    const rtWidth = Math.max(16, Math.round(width * scale));
-    const rtHeight = Math.max(16, Math.round(height * scale));
-    // ── THE MEASURED LADDER, AND WHY IT ENDS HERE ─────────────────────────
-    //
-    // All at 939x380 on the user's Sponza:
-    //   4 rays, 2.24 m, 9x9 spatial            13.73 ms  "expensive"
-    //   2 rays, 2.24 m, 9x9 spatial             5.65 ms  "blurry and grainy"
-    //   1 ray,  2.24 m, animated + TEMPORAL     ~7.6 ms  REVERTED — see below
-    //   2 rays, 1.12 m, 7x7 spatial             this
-    //
-    // ⛔ THE TEMPORAL ARM IS NOT COMING BACK. It is the textbook RTAO answer
-    // and the user killed it in one look: "we are a game engine, things move a
-    // lot, temporal does not work". Reprojection is only valid where the world
-    // stood still; every accumulated frame is a bet that it did. It did not
-    // even pay for itself here — the trace measured HIGHER at 1 ray with the
-    // filter than at 2 rays without it.
-    //
-    // ⛔ AND THE COST IS THE RAYS, MEASURED, NOT ANYTHING AROUND THEM. Same
-    // camera, AO on vs off: 18.68 vs 11.33 ms for 714k rays — ~10 ns each,
-    // unmoved by halving the reach or by dropping the dynamic-set trace. So
-    // `pixels x rays` is the only budget dial there is, and ONE ray per pixel
-    // is what fits. What makes one ray enough is not the filter alone: the
-    // kernel strata it across the 2x2 pixel quad, so any filter wider than a
-    // pixel reconstructs a 4x-stratified estimate (see its note).
-    const rays = Math.max(1, Math.min(16, Math.round(Number(globalThis.__giRtaoRays) || 1)));
-
-    const dynSet = this._dynSet;
-    // ⛔ REFUTED, and it looked so likely: "the dynamic-set trace is half this
-    // pass". It is a second sharedFn traversal per ray, so it should be — but
-    // with it disabled the same view measured 18.68 ms AO-on vs 11.33 ms
-    // AO-off, i.e. the 7.35 ms is the STATIC BVH rays and nothing else.
-    // Dynamic occluders cast contact AO for free; do not trade them away.
-    // `__giRtaoDynamic = false` is the A/B arm that proved it.
-    const traceDynamic = globalThis.__giRtaoDynamic === false ? null : dynSet?.trace
-      ? (origin, dir, tMin, tMax, receiverP) => {
-          // `excludePoint` is §14 Q2's self-plane exclusion: a fat proxy (a
-          // bone capsule) that CONTAINS this very surface must not occlude it,
-          // and a millimetre bias cannot escape a shell that overshoots the
-          // skin by centimetres.
-          const d = dynSet.trace(origin, dir, tMin, tMax, { excludePoint: receiverP });
-          return d?.hit ?? null;
-        }
-      : null;
-
-    const mkTex = (name, type = THREE.HalfFloatType) => {
-      const t = new THREE.StorageTexture(rtWidth, rtHeight);
-      t.name = name;
-      t.type = type;
-      t.generateMipmaps = false;
-      t.minFilter = THREE.LinearFilter;
-      t.magFilter = THREE.LinearFilter;
-      return t;
-    };
-    const rawTarget = mkTex("giRtaoRaw");
-    const pass = createGiRtaoPass({
-      gbuffer,
-      width: rtWidth,
-      height: rtHeight,
-      resolveWidth: width,
-      resolveHeight: height,
-      cameraPosition: this._giResolveCamU,
-      strength: vxao.strength,
-      radius: vxao.radius,
-      bias,
-      rays,
-      traceStatic: traceStaticBvh,
-      traceDynamic,
-      target: rawTarget,
-    });
-    // The radius is DERIVED, so it is published here and `#applyLiveProps`
-    // writes it into the live uniform every frame. Leaving `aoRadius` to win
-    // would put a metre constant back on the one number this pass has.
-    vxao.derivedRadius = radius;
-    vxao.radius.value = radius;
-
-    // THE SPATIAL FILTER IS THE WHOLE DENOISER, so its width is the one place
-    // "grainy" and "blurry" are traded against each other directly. Radius 3
-    // is a 7x7 support (~98 decorrelated 2-ray estimates) and, at half
-    // resolution, about 3.5 full-res pixels of reach — narrower than the
-    // radius 4 that read as blurry, wider than the radius 2 that reads as
-    // grainy where the plane test rejects most taps (which is exactly the
-    // detailed geometry: reliefs, curtain folds, foliage).
-    // `__giAoFilterRadius` retunes it, `__giAoFilter = false` shows raw rays.
-    const filtered = globalThis.__giAoFilter === false
-      ? null
-      : (() => {
-        const tmp = mkTex("giRtaoBlurX");
-        const out = mkTex("giRtao");
-        const shared = {
-          gbuffer,
-          width: rtWidth,
-          height: rtHeight,
-          resolveWidth: width,
-          resolveHeight: height,
-          cameraPosition: this._giResolveCamU,
-          projScale: this._giAoProjU,
-        };
-        const blur = Math.max(1, Math.min(6, Math.round(Number(globalThis.__giAoFilterRadius) || 3)));
-        const filterX = createGiAoFilterPass({ ...shared, source: rawTarget, target: tmp, axisX: 1, radius: blur });
-        const filterY = createGiAoFilterPass({ ...shared, source: tmp, target: out, axisY: 1, radius: blur });
-        return { tmp, out, blur, computes: [filterX.compute, filterY.compute] };
-      })();
-    const finalTarget = filtered ? filtered.out : rawTarget;
-
-    // IT RIDES THE `vxao` SLOT, and that is not laziness. That slot is the one
-    // the resolve reconstructs with a position/normal-weighted 2x2 upsample
-    // (the `ao` slot is a plain full-res UV sample), which is exactly what a
-    // half-resolution AO needs. One estimator now feeds it, so the resolve's
-    // `min` degenerates to an identity.
-    vxao.node = texture(finalTarget);
-    vxao.width = rtWidth;
-    vxao.height = rtHeight;
-    srcProbes.passes.push(pass.compute);
-    if (filtered) srcProbes.passes.push(...filtered.computes);
-    srcProbes.passGroups?.push({ label: "rtao", count: filtered ? 3 : 1 });
-    console.log(
-      `[gi] AO: RAY-TRACED — ${rays} cosine rays/pixel at ${rtWidth}x${rtHeight} ` +
-        `(scale ${scale.toFixed(2)}, 2x2-quad stratified), radius ${radius.toFixed(2)}m = ` +
-        `${radiusIntervals} x cascade-0 interval ` +
-        `(s0 ${s0.toFixed(2)}), bias ${(bias * 1000).toFixed(1)}mm, exact static BVH` +
-        `${traceDynamic ? " + dynamic set" : ""}` +
-        `${filtered ? `, bilateral r${filtered.blur}` : ", UNFILTERED"}, no temporal. ` +
-        "__giAoLegacy = true restores the screen+voxel pair.",
-    );
-    return {
-      aoPass: null,
-      vxaoPass: {
-        compute: pass.compute,
-        target: finalTarget,
-        rawTarget,
-        node: vxao.node,
-        width: rtWidth,
-        height: rtHeight,
-        dispose: () => {
-          rawTarget?.dispose?.();
-          filtered?.tmp?.dispose?.();
-          filtered?.out?.dispose?.();
-        },
-      },
-    };
-  }
-
-  /**
-   * World-space cone-traced AO over the occupancy density hierarchy. Separate
-   * from both the screen AO and the resolve so its one `bits` storage binding
-   * never joins either larger composed graph. `__giVxaoScale` is a build-time
-   * profiling hatch (0.25..1) and `__giVxao = false` removes the pass entirely.
-   */
-  #armVxaoPass({ srcProbes, gbuffer, width, height, vxao, occupancy }) {
-    if (!vxao || !srcProbes || !occupancy?.traceOccupancyConeAO || !occupancy?.voxel) {
-      if (vxao) vxao.node = null;
-      return null;
-    }
-    const requestedScale = Number(globalThis.__giVxaoScale);
-    const scale = Number.isFinite(requestedScale)
-      ? Math.min(1, Math.max(0.25, requestedScale))
-      // FULL resolve resolution — which is already a fraction of the display,
-      // because the gbuffer this reads is. Half was tried and reverted: the
-      // cone march measures 0.046 ms at 1200x800 (run-gi-vxao-probe), 2% of the
-      // pass budget, so a 4x saving buys nothing worth a reconstruction filter.
-      // At scale 1 the resolve `load`s this texel-for-texel and there is no
-      // filter at all — no bilateral fallback to "unoccluded" at silhouettes,
-      // which is the one place a magnified AO term still shows its grid.
-      : 1;
-    const vxWidth = Math.max(16, Math.round(width * scale));
-    const vxHeight = Math.max(16, Math.round(height * scale));
-    const pass = createGiVxaoPass({
-      gbuffer,
-      width: vxWidth,
-      height: vxHeight,
-      resolveWidth: width,
-      resolveHeight: height,
-      cameraPosition: this._giResolveCamU,
-      strength: vxao.strength,
-      radius: vxao.radius,
-      voxel: occupancy.voxel,
-      traceConeAO: occupancy.traceOccupancyConeAO,
-    });
-    vxao.node = pass.node;
-    // The resolve performs the edge-aware reconstruction. Keep dimensions as
-    // JS metadata — unlike a uniform they do not add a GPU binding.
-    vxao.width = pass.width;
-    vxao.height = pass.height;
-    srcProbes.passes.push(pass.compute);
-    srcProbes.passGroups?.push({ label: "vxao", count: 1 });
-    console.log(
-      `[gi] VXAO: 6 cone-traced cones at ${vxWidth}x${vxHeight} ` +
-        `(scale ${scale.toFixed(2)}, quadrilinear occupancy density; __giVxao=false disables)`,
-    );
-    return pass;
   }
 
   /**
@@ -7929,7 +6891,6 @@ export class GISystem {
     // The stochastic arm's accumulate/history textures are lazy now — a
     // resize on that arm must re-materialize them before the pass rebuilds
     // below bind them (the history pass's existence records the arm).
-    if (screen.lightShadowHistoryPass) screen.targets.ensureShadowTemporal?.();
     // §12.65: same re-materialization contract for the irradiance trio.
     if (screen.irrTemporalPass) screen.targets.ensureIrradianceTemporal?.();
     this._giTargets = screen.targets;
@@ -8077,15 +7038,13 @@ export class GISystem {
       validEps: screen.lightShadow?.voxMax ?? 0.15,
     });
     screen.aoPass?.dispose?.();
-    screen.vxaoPass?.dispose?.();
-    screen.vxaoPass?.target?.dispose?.();
-    ({ aoPass: screen.aoPass, vxaoPass: screen.vxaoPass } = this.#armAoTerm({
+    screen.aoPass?.target?.dispose?.();
+    ({ aoPass: screen.aoPass } = this.#armGtaoPass({
       srcProbes: screen.srcProbes,
       gbuffer: screen.gbuffer,
       width,
       height,
       ao: screen.ao,
-      vxao: screen.vxao,
       occupancy: state.volume?.occupancyField,
     }));
     // §12.70 W4b: the tile cut is sized to the emitter grid AND bakes the
@@ -8155,7 +7114,6 @@ export class GISystem {
       emitter: screen.emitter,
       screenRadiance: screen.screenRadiance,
       ao: screen.ao,
-      vxao: screen.vxao,
       emitterTileCut: screen.emitterTileCutBundle
         ? { ...screen.emitterTileCutBundle, scaleX: emitterW / width, scaleY: emitterH / height }
         : null,
@@ -8292,10 +7250,9 @@ export class GISystem {
         resolveHeight: height,
         cameraPosition: this._giResolveCamU,
         tileCut: screen.emitterTileCutBundle ?? null,
-        // §14 Q7: same MUST-match rule as `distTarget` above — the frame
-        // uniform's existence at build is what armed the area sample, and
-        // `_giEmitterFrameU` is its durable record.
-        frame: this._giEmitterFrameU ?? null,
+        // §14 Q7: the area sample is retired — the central ray is
+        // deterministic, so the build path passes no frame uniform either.
+        frame: null,
       });
       if (emitterIndexes[0] >= 0) state.queue[emitterIndexes[0]] = screen.emitterShadowPass.compute;
       if (emitterIndexes[1] >= 0) state.queueNoFeedback[emitterIndexes[1]] = screen.emitterShadowPass.compute;
@@ -8450,8 +7407,8 @@ export class GISystem {
         // dither while the (never-resizing) smoke page validated the
         // animated path. Probe signature: two same-state readbacks of the
         // raw texture differing by ~1 pixel while the phase uniform climbs.
-        // (The analytic-width arm builds with frame null — same rule.)
-        frame: screen.lightShadow?.analyticWidth ? null : this._giShadowFrameU,
+        // (The trace is deterministic, so frame is always null — same rule.)
+        frame: null,
         // Same MUST-match rule for the checkerboard parity (§12.80 Unit B):
         // omitting it here would silently swap in the full-dispatch kernel on
         // the first resize — the inverse of the frozen-dither bug above.
@@ -8474,16 +7431,10 @@ export class GISystem {
         state.queueNoFeedback.indexOf(oldFilter),
         state.queueFeedbackOnly?.indexOf(oldFilter) ?? -1,
       ];
-      // The history pass's existence is the durable record of which chain
-      // the build chose (temporal vs analytic-width single-filter) — derive
-      // target/history from it so a resize can never silently flip arms.
-      const temporalChain = !!screen.lightShadowHistoryPass;
       screen.lightShadowFilterPass = createGiLightShadowFilterPass({
         gbuffer: screen.gbuffer,
         source: screen.targets.lightShadowRaw,
-        target: temporalChain
-          ? screen.targets.lightShadowAccum
-          : screen.lightShadowWidePass ? screen.targets.lightShadowMid : screen.targets.lightShadow,
+        target: screen.lightShadowWidePass ? screen.targets.lightShadowMid : screen.targets.lightShadow,
         width: shadowW,
         height: shadowH,
         resolveWidth: width,
@@ -8491,13 +7442,7 @@ export class GISystem {
         planeEps: screen.lightShadow?.voxMax ?? 0.1,
         cameraPos: this._giShadowWideCamU,
         projScale: this._giShadowWideProjU,
-        history: temporalChain ? {
-          histShadow: screen.targets.lightShadowHist,
-          histPos: screen.targets.lightShadowHistPos,
-          prevViewProj: this._giShadowPrevVPU,
-          weight: this._giShadowHistWeightU,
-          validEps: screen.lightShadow?.voxMax ?? 0.15,
-        } : null,
+        history: null,
       });
       if (filterIndexes[0] >= 0) state.queue[filterIndexes[0]] = screen.lightShadowFilterPass.compute;
       if (filterIndexes[1] >= 0) state.queueNoFeedback[filterIndexes[1]] = screen.lightShadowFilterPass.compute;
@@ -8536,50 +7481,6 @@ export class GISystem {
         if (wideIndexes[1] >= 0) state.queueNoFeedback[wideIndexes[1]] = screen[spec.key].compute;
         if (wideIndexes[2] >= 0) state.queueFeedbackOnly[wideIndexes[2]] = screen[spec.key].compute;
       }
-    }
-    if (screen.lightShadowHistoryPass) {
-      const oldHistory = screen.lightShadowHistoryPass.compute;
-      const historyIndexes = [
-        state.queue.indexOf(oldHistory),
-        state.queueNoFeedback.indexOf(oldHistory),
-        state.queueFeedbackOnly?.indexOf(oldHistory) ?? -1,
-      ];
-      screen.lightShadowHistoryPass = createGiLightShadowHistoryPass({
-        gbuffer: screen.gbuffer,
-        source: screen.targets.lightShadowAccum,
-        histShadow: screen.targets.lightShadowHist,
-        histPos: screen.targets.lightShadowHistPos,
-        width: shadowW,
-        height: shadowH,
-        resolveWidth: width,
-        resolveHeight: height,
-      });
-      if (historyIndexes[0] >= 0) state.queue[historyIndexes[0]] = screen.lightShadowHistoryPass.compute;
-      if (historyIndexes[1] >= 0) state.queueNoFeedback[historyIndexes[1]] = screen.lightShadowHistoryPass.compute;
-      if (historyIndexes[2] >= 0) state.queueFeedbackOnly[historyIndexes[2]] = screen.lightShadowHistoryPass.compute;
-    }
-    if (screen.lightShadowPostPass) {
-      const oldPost = screen.lightShadowPostPass.compute;
-      const postIndexes = [
-        state.queue.indexOf(oldPost),
-        state.queueNoFeedback.indexOf(oldPost),
-        state.queueFeedbackOnly?.indexOf(oldPost) ?? -1,
-      ];
-      screen.lightShadowPostPass = createGiLightShadowFilterPass({
-        gbuffer: screen.gbuffer,
-        source: screen.targets.lightShadowAccum,
-        target: screen.targets.lightShadow,
-        width: shadowW,
-        height: shadowH,
-        resolveWidth: width,
-        resolveHeight: height,
-        planeEps: screen.lightShadow?.voxMax ?? 0.1,
-        cameraPos: this._giShadowWideCamU,
-        projScale: this._giShadowWideProjU,
-      });
-      if (postIndexes[0] >= 0) state.queue[postIndexes[0]] = screen.lightShadowPostPass.compute;
-      if (postIndexes[1] >= 0) state.queueNoFeedback[postIndexes[1]] = screen.lightShadowPostPass.compute;
-      if (postIndexes[2] >= 0) state.queueFeedbackOnly[postIndexes[2]] = screen.lightShadowPostPass.compute;
     }
     this.#retireTargets(previousTargets);
     // Same follow-up for the BVH reflect compute (GI Phase 3 v1) — it is NOT
@@ -9087,27 +7988,6 @@ export class GISystem {
   }
 
   /**
-   * Whether the exact-reflection prepass restricts itself to mirror pixels.
-   * ⚠ STILL OPT-IN (`__giBvhMask = true`), and deliberately so — but not for
-   * the reason the original comment claimed ("on by default"; the code has
-   * read `=== true` since 2026-08-04, the `__giSrcSecondary` polarity trap).
-   * 2026-08-13 findings, in order:
-   *   1. Masked mode was UNSHIPPABLE regardless of the gate: nothing ever
-   *      tagged meshes into GI_MIRROR_LAYER, so the mask pass drew nothing
-   *      and masked mode silently killed exact reflections. #collectMeshes
-   *      tags bucket-0/3 meshes now — that half is fixed and harmless under
-   *      dense (nothing reads normal.w there).
-   *   2. With tagging in place the flip was tried and REVERTED same-day:
-   *      masked boots render a broken frame on the enclosed mirror rig
-   *      (`MIRROR=1 run-gi-emissive-cost.mjs` — white/black split where the
-   *      dense arm lights correctly), and stopping the mask pass live does
-   *      NOT recover the frame (scripts/run-gi-mask-bisect.mjs), so the
-   *      fault is on the masked-prepass/consumption side, not the second
-   *      gbuffer render. Diagnose with that rig before re-attempting the
-   *      flip; the prize is real (mask alone halved the emitters×reflections
-   *      resolve term: Δ +9.35 → +4.37 ms on the rig).
-   */
-  /**
    * The exact-reflection prepass's block stride for the CURRENT tier.
    *
    * Ultra traces per-pixel (1); every tier below traces one ray per 2×2 block
@@ -9123,14 +8003,13 @@ export class GISystem {
 
   /**
    * §17 R7a — the ONE-BVH reflection bundle for createGiBvhReflect, or null
-   * to keep the incumbent ≤128-mesh loop. Null when: the hatch forces the
-   * incumbent, the dyn set is absent, the static shadow BVH region was
-   * never attached (or the degrade ladder dropped it — traceStaticBvhSlot
-   * itself returns null then, and the prepass falls back at build time), or
-   * there is no surface palette to shade hits from.
+   * to fall back to the incumbent ≤128-mesh loop. Null when: the dyn set is
+   * absent, the static shadow BVH region was never attached (or the degrade
+   * ladder dropped it — traceStaticBvhSlot itself returns null then, and the
+   * prepass falls back at build time), or there is no surface palette to
+   * shade hits from.
    */
   #oneBvhBundle() {
-    if (globalThis.__giOneBvhReflect === false) return null;
     const dyn = this._dynSet;
     if (!dyn?.traceStaticBvhSlot) return null;
     const sa = this.state?.volume?.occupancyField?.surfaceAttribution ?? null;
@@ -9305,63 +8184,11 @@ export class GISystem {
   }
 
   #bvhMaskEnabled() {
-    // ⚠ RE-REVERTED TO OPT-IN 2026-08-21, SAME DAY IT FLIPPED. The flip's
-    // premise (the §12.56 reframe blamed the race, the watchdog now
-    // re-rolls) survived the boot — no black frame, pipelines landed — but
-    // the user's first PLAY-mode look on the masked build was WASHED OUT
-    // (large blown-white regions) at 10 fps, i.e. the documented
-    // masked-side visual bug is REAL and still unfixed, exactly as this
-    // comment warned before the flip. Diagnose with
-    // `MIRROR=1 run-gi-emissive-cost.mjs` + `run-gi-mask-bisect.mjs`
-    // before the next attempt. The prize SHRANK with §14 R-A: traced hit
-    // shadows no longer need the mask (createGiBvhHitShade runs them at any
-    // density in its own pass) — what masking still buys is skipping the
-    // prepass trace + hit shade on non-mirror pixels.
-    //
-    // ⛔⛔ RE-REVERTED TO OPT-IN, FOURTH TIME (2026-08-24 evening) — and this
-    // time the failure was REPRODUCED AND ISOLATED on the user's Cornell box:
-    // reflections ON + masked = every diffuse wall PITCH BLACK while the
-    // emissive box and the mirror stay lit; reflections OFF = a perfect
-    // Cornell. AO exonerated by its own A/B. The standing condition for ever
-    // re-flipping was: a rig must assert that non-mirror gbuffer pixels
-    // SURVIVE the mask pass, and the clear semantics must be pinned.
-    //
-    // ⭐⭐ BOTH CONDITIONS ARE NOW MET (2026-08-25), so this is ON by default.
-    //
-    // The mechanism was not a race and not the compile wave — it is an OR in
-    // three's own `Background.update` (r185, Background.js:185):
-    //
-    //     if ( renderer.autoClear === true || forceClear === true ) {
-    //         renderContext.clearColor = renderer.autoClearColor === true;
-    //         renderContext.clearDepth = renderer.autoClearDepth === true;
-    //
-    // and `forceClear` is set by ANY opaque Color `scene.background`
-    // (Background.js:78). So pass 2's `renderer.autoClear = false` was simply
-    // ignored, the pass opened with a clear loadOp on every MRT attachment AND
-    // on depth, and only the masked meshes survived as gbuffer geometry — the
-    // screen gather then read `position.w == 0` on every wall. Sponza hid it
-    // because its mask covered 104 of 111 materials, so nearly every pixel was
-    // redrawn by pass 2 anyway. Fixed in `renderGiGBuffer` (see its note), and
-    // pinned by `npm run test:gi-gbuffer-clear` — 12 checks that snapshot the
-    // autoClear* flags at DRAW time, with a negative control that fails 2.
-    //
-    // THE RIG: `__giMaskCoverageProbe = true` reads back `gbuffer.position` and
-    // reports the share of texels carrying geometry, into the console and into
-    // `profile.frameStats.giMaskCoverage`. Bistro at ultra, both arms:
-    // mask OFF **4096/4096 = 100.0%**, mask ON **4096/4096 = 100.0%**. The
-    // wipe is gone.
-    //
-    // ⚠ AND THE MASK ONLY BECAME WORTH ITS RISK TODAY. It used to draw
-    // GI_MIRROR_LAYER — "reads a reflection", 104 of 111 materials — which
-    // excluded nothing. It now draws GI_SHARP_LAYER, §18's ladder rungs
-    // SHARP+MEDIUM (roughness floor <= 0.45), because all three consumers of
-    // the traced reflection multiply by `smoothstep(0.45, 0.15, roughness)` and
-    // a COARSE surface's contribution is provably zero at every texel. On
-    // Bistro that is 104 meshes of 1631, and 89% of reflective triangle area
-    // stops being traced for a result that was multiplied out.
-    // MEASURED: bvhReflect **23.22 → 10.09 ms**, the frame's largest pass.
-    //
-    // `__giBvhMask = false` is the escape hatch back to DENSE.
+    // MASKED MODE IS THE DEFAULT (2026-08-25). The prepass draws only
+    // GI_SHARP_LAYER (roughness floor <= 0.45) — every consumer multiplies the
+    // traced reflection by smoothstep(0.45, 0.15, roughness), so a coarser
+    // surface's contribution is provably zero. Measured on Bistro: bvhReflect
+    // 23.22 -> 10.09 ms. `__giBvhMask = false` is the dense hatch.
     return globalThis.__giBvhMask !== false;
   }
 
@@ -9401,8 +8228,7 @@ export class GISystem {
     // forever. GI now sizes off the DRS-free buffer: DRS keeps scaling the
     // scene render it was built for, and a manual renderScale drag still
     // resizes GI (it moves the buffer AND is not in `_drsScale`).
-    // `__giFollowDrs = true` restores the old coupling.
-    const drs = globalThis.__giFollowDrs === true ? 1 : (this.engine?._drsScale || 1);
+    const drs = this.engine?._drsScale || 1;
     const scale = (this.config.resolveScale ?? 0.5) / drs;
     let width = Math.max(16, Math.round(size.x * scale));
     let height = Math.max(16, Math.round(size.y * scale));
@@ -10025,204 +8851,6 @@ export class GISystem {
   }
 
 
-  /**
-   * §12.90 — CHOOSE THE SRC GATHER LATTICE FROM THE SCENE'S GEOMETRY.
-   *
-   * ⚠⚠ IT MUST RUN BEFORE `#buildScreenResolve`, AND THE FIRST VERSION DID NOT.
-   * The census originally lived inside `#reportThinMeshes`' loop, ~500 lines
-   * AFTER the SRC transport is built in the same `#rebuild()` — so
-   * `_giAdaptiveFit` was undefined at build time, `spacing0` fell back to the
-   * tier constant, and the receipt printed a decision the transport never saw.
-   * Every probe count came back bit-identical and the log looked like a
-   * success. Ordering is the whole of this method's existence; keep the call
-   * beside `#collectMeshes()`.
-   */
-  #chooseAdaptiveLattice(meshes) {
-    this._giAdaptiveFit = null;
-    globalThis.__giLod0ReachScale = 1;
-    // ⚠ ALL THREE OUTPUTS RESET TOGETHER, AND THE BIAS USED NOT TO. `#build`
-    // writes `__giGatherNormalBias` when the census fires but nothing ever
-    // cleared it, so a later rebuild whose census DECLINED — the user deletes
-    // the walls, or turns this flag off — kept shading with the old β. Turning
-    // the feature off would not have restored the baseline, which quietly
-    // poisons every A/B taken afterwards. One reset block, all three.
-    delete globalThis.__giGatherNormalBias;
-    // ⛔⛔ BACK TO OPT-IN (2026-08-24, hours after it went on) — AND THE REASON
-    // IS A MEASUREMENT ERROR OF MINE, NOT A FAULT IN THE MECHANISM.
-    //
-    // **IT IS A NO-OP AT THE TIER THE USER ACTUALLY RUNS.** Every number below
-    // was taken at QUALITY=high, where `SRC_QUALITY.high.spacing0` is 0.45 and
-    // the census moves it to 0.35. The user's project builds at **ultra**,
-    // where `spacing0` is ALREADY 0.35 — so the census picks the value the tier
-    // had, `__giLod0ReachScale` comes out 1, and the only thing that reaches
-    // them is β. They looked at their Level and said "I don't see any
-    // difference", and they were right; there was almost nothing to see.
-    // ⭐ THE RULE: a scene-adaptive default must be measured AT THE TIER THE
-    // SCENE SHIPS AT. `project.settings.build.quality` is where that lives, and
-    // no probe in this repo reads it — they all take QUALITY= from the
-    // environment and default to "high".
-    //
-    // So it stays off until it is measured at ultra. At high it is real (the
-    // numbers below hold) but it costs +110-190 MB of probe pool, and shipping
-    // a memory bill for a tier the user does not use is not a trade.
-    //
-    // `__giAdaptiveLattice = true` arms it.
-    //
-    // WHAT IT DOES: reads the scene's own separator thickness (46 separators on
-    // the Level, area-weighted p10 = 0.250 m — their walls ARE 0.25 m) and picks
-    // the gather lattice from it, instead of taking `SRC_QUALITY[tier].spacing0`
-    // on faith. s0 0.45 → 0.35, β = 0.162, LOD 0's reach held at 28.8 m.
-    //
-    // MEASURED ON THE LEVEL (`probe:gi-walk`, FREEZE=1, arms repeated):
-    //   leg0 checker    0.0653  →  0.0574 / 0.0453     (blockiness, lower better)
-    //   leg0 tail luma  0.0147  →  0.0237 / 0.0199     (BRIGHTER, not darker)
-    //   editor overlay  72 fps  →  64 / 66 fps, GPU 8.3 ms → 6.6 ms
-    //   memory          410 MB  →  597 / 518 MB        ← the real cost
-    //
-    // ⛔ THE "2.5× DARKER, 20 fps" RESULT THAT NEARLY KILLED THIS WAS §12.90b's
-    // BUG, NOT THE LATTICE. `LOD0_REACH = 64` is in CELLS, so refining s0 pulled
-    // LOD 0's reach 28.8 → 22.4 m — inside a 28 m house — and dropped its far
-    // end to LOD 1 at 0.70 m, COARSER than the 0.45 m it started with. Setting
-    // `__giLod0ReachPin = false` reproduces that run to 1.4% (leg0 tail luma
-    // 0.00587 vs the original 0.00579, checker 0.1234 vs 0.1256) and is kept as
-    // the regression arm. Identical trap to `REANCHOR_CHEBYSHEV`, found an hour
-    // apart, in a module where three constants are quietly denominated in cells.
-    //
-    // ⛔ AND THE OTHER NEAR-MISS: one `adapt` boot printed `gi never ready at
-    // 241.7s` while base booted in 9 s, and GISystem's own pool code has a
-    // ready-made mechanism for it (see #syncSrcPoolPressure: "this scene WANTS
-    // MORE PROBES THAN THE ARCHITECTURE CAN BACK ... c0 population goes as
-    // 1/s0²"). It looked settled. Repeating the arm booted in 7.1 s and 7.6 s,
-    // and then `base` — untouched — drew the same 242 s dead boot. It is a
-    // pre-existing intermittent, ~2 in 9 boots that evening, and it is worth
-    // chasing on its own. A plausible mechanism already written down in the
-    // codebase is the most dangerous kind, because it arrives pre-justified.
-    if (globalThis.__giAdaptiveLattice !== true) return;
-    // ── THE SEPARATOR CENSUS — the input the engine always measured and never
-    // used. What the SRC gather needs is not "is this thin" but "how thick is
-    // the thinnest thing that SEPARATES TWO ROOMS", because that is what its
-    // trilinear stencil must not reach through.
-    //
-    // ⚠ THICKNESS FROM THE LOCAL BOX × SCALE, NOT THE WORLD AABB. A 0.25 m wall
-    // rotated 45° has a world AABB whose min extent is ~3 m — the world box
-    // measures the ROTATION, not the wall. The local box does not.
-    // ⚠ A SEPARATOR, NOT MERELY A THIN THING. A 2 cm curtain rod is thin in one
-    // axis and tiny in the others; a wall is thin in ONE axis and broad in the
-    // other two. Requiring both other extents ≥ 1 m is what stops a decorative
-    // rod from dictating the lattice for a 28 m house.
-    const separators = [];
-    for (const mesh of meshes ?? []) {
-      // A proxied skinned mesh does not voxelize and is never a partition.
-      if (this.#skinnedGroupOf(mesh)) continue;
-      if (!mesh.geometry?.boundingBox) mesh.geometry?.computeBoundingBox?.();
-      const lb = mesh.geometry?.boundingBox;
-      if (!lb) continue;
-      const ls = lb.max.clone().sub(lb.min);
-      const sc = new THREE.Vector3().setFromMatrixScale(mesh.matrixWorld);
-      const ext = [ls.x * Math.abs(sc.x), ls.y * Math.abs(sc.y), ls.z * Math.abs(sc.z)]
-        .sort((x, y) => x - y);
-      // ext[0] = thickness, ext[1..2] = the face.
-      if (ext[0] > 0.01 && ext[0] < 1.0 && ext[1] >= 1.0 && ext[2] >= 1.0) {
-        separators.push({ t: ext[0], area: ext[1] * ext[2] });
-      }
-    }
-
-    // ── CHOOSE THE GATHER LATTICE FROM THAT CENSUS, NOT FROM A TABLE ────────
-    //
-    // `SRC_QUALITY[tier].spacing0` is 0.8/0.6/0.45/0.35 — a CONSTANT per quality
-    // tier that has never looked at the scene. On the user's 28 m blockout with
-    // 0.25 m partitions it hands the screen gather s0 = 0.45 m, and the gather's
-    // trilinear stencil then reaches `s0` PAST the shaded face — 1.8× the wall —
-    // so its far corners sit in the next room and vote at full weight.
-    //
-    // ⚠ THE FIX IS NOT A FINER LATTICE FOR ITS OWN SAKE; it is opening the
-    // window for the normal bias (§12.88). Both bounds are measured, not tuned:
-    //   leak-free   β > κ·s0 − w   (the far corner must not reach through)
-    //   no blackout β < 0.9·w      (β = 0.27 blacked a 0.25 m pillar on the
-    //                               user's Level, image-confirmed; 0.25 did not)
-    // so the window is `1.9·w − κ·s0`, and at the tier's 0.45 it is **0.025 m**
-    // wide — a knife edge, which is exactly what the sweep measured. It is
-    // narrow BECAUSE s0 is coarse. One rung finer (0.35) opens it to 0.125 m and
-    // β lands mid-window with 0.06 m of margin on both sides.
-    //
-    // κ is the off-axis penetration factor: a world-axis-aligned face gives
-    // exactly s0, an arbitrarily rotated one up to s0·√3.
-    //
-    // ⚠ AND IT REFUSES TO GUESS. Under 8 separators the scene has no wall
-    // population to speak of and the tier default ships unchanged — a rule that
-    // fires on one stray panel would be worse than no rule.
-    const sepInfo = (() => {
-      if (separators.length < 8) return null;
-      // Area-weighted p10: robust to a handful of odd panels, and weighting by
-      // FACE AREA is what makes the big partitions decide rather than the trim.
-      const sorted = [...separators].sort((a2, b2) => a2.t - b2.t);
-      const total = sorted.reduce((acc, x) => acc + x.area, 0);
-      let run = 0, w = sorted[sorted.length - 1].t;
-      for (const x of sorted) { run += x.area; if (run >= total * 0.10) { w = x.t; break; } }
-      return { w, count: separators.length };
-    })();
-    if (sepInfo) {
-      const tier = qualityTierOf(this.config);
-      const tierS0 = SRC_QUALITY[tier]?.spacing0 ?? 0.45;
-      const w = sepInfo.w;
-      const kappa = 1.0; // axis-aligned assumption; §12.90b refines it per scene
-      const betaMax = 0.9 * w;
-      // ⚠⚠ THE REFINEMENT IS CAPPED RELATIVE TO THE TIER, AND THE FIRST VERSION
-      // WAS NOT. The ladder is in ABSOLUTE metres because the leak is a property
-      // of the WALL, not of the preset — but filtering it by `x <= tierS0` alone
-      // let a 0.25 m wall drag EVERY tier down to the same 0.35 m lattice. On
-      // "low" (tier s0 = 0.8) that is a 2.3× refinement: the cheapest preset
-      // would have come out DENSER THAN "high", inverting the presets and
-      // spending exactly the frame budget the user picked "low" to save. Two
-      // standing rules land on it — over 60 fps under ANY conditions, and
-      // presets trade rays/probes but never energy ([[gi-preset-energy]]).
-      //
-      // 1.5× is where the two ends meet: probe keys are generated from gbuffer
-      // pixels, so a k× finer lattice multiplies distinct keys (and the bin
-      // budget behind them) by roughly k² — 1.5× is ~2.25× the pool, the most a
-      // tier can absorb without re-tiering. It is inert where it matters: at
-      // "high" the floor is 0.30 and the pick is still 0.35; at "ultra" the tier
-      // is already 0.35. It bites only on "low"/"medium", which is the point.
-      const REFINE_MAX = 1.5;
-      const floorS0 = tierS0 / REFINE_MAX;
-      const LADDER = [0.45, 0.40, 0.35, 0.30, 0.25].filter((x) => x <= tierS0);
-      let pick = null, capped = false;
-      for (const cand of LADDER) {              // coarsest first — spend nothing we need not
-        if (betaMax - Math.max(0, kappa * cand - w) < 0.5 * w) continue;
-        // The window opens here, but not within this tier's budget. Record that
-        // the CAP refused it rather than the geometry — a silent tier default
-        // and a capped one look identical in the receipt otherwise, and the
-        // remedy differs (raise Quality vs. the scene has no safe window).
-        if (cand < floorS0) { capped = true; break; }
-        pick = cand;
-        break;
-      }
-      const s0 = pick ?? tierS0;
-      const betaMin = Math.max(0, kappa * s0 - w);
-      const beta = betaMax > betaMin ? (betaMin + betaMax) / 2 : 0;
-      this._giAdaptiveFit = { w, s0, tierS0, beta, betaMin, betaMax, separators: sepInfo.count };
-      // §12.90b — HOLD LOD 0's REACH IN METRES. `LOD0_REACH` is in CELLS, so a
-      // finer s0 would pull LOD 0 in from 28.8 m to 22.4 m and drop the far end
-      // of this 28 m house to LOD 1 at 0.70 m — COARSER than the 0.45 m it had
-      // before. Set BEFORE the transport builds (this method runs first, by
-      // construction) and read by both twins through `lod0Reach()`.
-      // `__giLod0ReachPin = false` reproduces the pre-§12.90b behaviour, where
-      // the reach silently shrank with s0. It exists so the "2.5× darker" run
-      // can be re-measured against a fix rather than argued about.
-      globalThis.__giLod0ReachScale =
-        globalThis.__giLod0ReachPin === false ? 1 : tierS0 / s0;
-      console.log(
-        `[gi] §12.90 adaptive gather lattice: ${sepInfo.count} separators, thinnest (area-weighted p10) ` +
-        `${w.toFixed(3)}m → s0 ${tierS0.toFixed(2)} → ${s0.toFixed(2)}m, normal bias ${beta.toFixed(3)}m ` +
-        `(leak-free above ${betaMin.toFixed(3)}, blackout above ${betaMax.toFixed(3)})` +
-        (capped
-          ? ` — ⚠ a finer lattice WOULD open the window but is past this tier's ` +
-            `${REFINE_MAX}× refinement cap (floor ${floorS0.toFixed(2)}m); raising Quality is what buys it`
-          : "") +
-        (beta > 0 ? "" : " — ⚠ NO SAFE WINDOW at this wall thickness; bias off, the leak stands"),
-      );
-    }
-  }
 
   #rebuild() {
     // §12.66 BISECT HATCH: `__giOff = true` keeps GI from ever building —
@@ -10241,9 +8869,6 @@ export class GISystem {
     const props = this.config;
     const rayHitConfig = resolveRayHitConfig(props);
     const meshes = this.#collectMeshes();
-    // §12.90 — BEFORE the transport is built; see the method's header.
-    this.#chooseAdaptiveLattice(meshes);
-
     // Volume placement: manual (entity-centered, size props) or AUTO-FIT —
     // bounds wrap the GI-relevant scene content with headroom, and voxel/
     // probe densities are derived from fixed budgets so any world size stays
@@ -10829,9 +9454,8 @@ export class GISystem {
       light.shadowRange = diagU.clamp(12, 64);
       light.emitterSlots = emitterSlots;
     }
-    // Indirect-light ambient occlusion (createGiAoPass — screen-space since
-    // 2026-08-21; the occupancy-oracle ladder it replaces is priced in its
-    // header). The uniforms are live (aoStrength/aoRadius edit without a
+    // Indirect-light ambient occlusion (GTAO — see #armGtaoPass and
+    // createGiGtaoPass). The uniforms are live (aoStrength/aoRadius edit without a
     // rebuild); the `ao` prop itself is structural — off compiles the
     // resolve's sample out entirely. `node` is attached by #buildScreenResolve
     // once the gbuffer exists.
@@ -10855,7 +9479,7 @@ export class GISystem {
       volume,
       lightSlots,
       quality,
-      hasEmitterTrace: !!light.shadowTraceFn,
+
       span: diagU,
     });
     const screen = this.#buildScreenResolve({
@@ -10915,7 +9539,7 @@ export class GISystem {
       // site is immune to that.
       for (const [key, bundle] of Object.entries(screen)) {
         // A pass may carry a more useful public profiler label than its bundle
-        // key (the VXAO bundle is `vxaoPass`, the label is simply `vxao`).
+        // key.
         if ((bundle?.compute?.isNode ?? bundle?.compute) && !bundle.compute.__giPassName) {
           bundle.compute.__giPassName = key;
         }
@@ -10996,16 +9620,6 @@ export class GISystem {
         queue.push(screen.lightShadowWidePass.compute, screen.lightShadowWidePass2.compute);
         queueNoFeedback.push(screen.lightShadowWidePass.compute, screen.lightShadowWidePass2.compute);
         queueFeedbackOnly.push(screen.lightShadowWidePass.compute, screen.lightShadowWidePass2.compute);
-      }
-      if (screen.lightShadowHistoryPass) {
-        queue.push(screen.lightShadowHistoryPass.compute);
-        queueNoFeedback.push(screen.lightShadowHistoryPass.compute);
-        queueFeedbackOnly.push(screen.lightShadowHistoryPass.compute);
-      }
-      if (screen.lightShadowPostPass) {
-        queue.push(screen.lightShadowPostPass.compute);
-        queueNoFeedback.push(screen.lightShadowPostPass.compute);
-        queueFeedbackOnly.push(screen.lightShadowPostPass.compute);
       }
     }
     // Purge three's lights-hash memo — without this the FIRST build of a
@@ -11777,45 +10391,13 @@ export class GISystem {
   }
 
   /**
-   * §GI_SPATIAL_REBUILD Part 2 B2 — A POOL GROW STOPS BEING A TEARDOWN.
-   *
-   * ══ WHAT THE OLD PATH DID, AND WHY IT FLASHED ══════════════════════════════
-   *
-   * A pool grow needs exactly ONE thing rebuilt: the probe store (its dispatch
-   * counts are baked from the capacities). It got that by setting
-   * `state.screen.width = 0` so `#syncScreenResolveSize` would stop early-
-   * returning — which bought the store swap and, with it, THE ENTIRE RESIZE
-   * PATH: `gbuffer.setSize`, a fresh `createGiTargets` for every GI target, the
-   * emitter-shadow clear, and a rebuild of the tile cut, the emitter shadow
-   * pass, its filter and wide passes, and the irradiance temporal pair.
-   *
-   * The dimensions had not changed. Every one of those targets was recreated at
-   * the size it already was — and recreated means ZEROED, which threw away the
-   * §12.65 irradiance history, the emitter-shadow history and the light-shadow
-   * history. So a grow whose only real cost is a cold probe store also blanked
-   * every temporal accumulator that could have carried the picture across it.
-   * That is the user's "GI initializes twice" / "unlit → lit" flash: not one
-   * cold store, a whole cold screen chain.
-   *
-   * ══ WHAT THIS DOES INSTEAD ═════════════════════════════════════════════════
-   *
-   * Rebuilds the probe store, re-derives the three things that close over it
-   * (the screen-gather node, the reflection gather closure, the far-field
-   * average pass), rebuilds the resolve — which genuinely must be rebuilt, it
-   * BINDS the store's buffers for reflection hits — and splices it back into
-   * the queues at its own index. Every render target, every temporal history
-   * and every other pass is left alone.
-   *
-   * The cold store still has to re-converge; that is what S1 exists to delete.
-   * What this removes is the part that was never necessary: the irradiance
-   * temporal filter now holds the previous frame's answer and fades into the new
-   * one over its own window instead of starting from black.
-   *
-   * ⚠ SIZE-INVARIANT BY CONSTRUCTION, AND IT HAS TO STAY THAT WAY. The caller
-   * only reaches this when the resolve size is unchanged; a real resize still
-   * goes through `#syncScreenResolveSize`, which is the one path allowed to
-   * recreate targets. If a future pool dial ever changes a target's size, it
-   * belongs there, not here.
+   * §GI_SPATIAL_REBUILD Part 2 B2 — a pool grow rebuilds the probe store, the
+   * three things that close over it (screen-gather node, reflection gather
+   * closure, far-field average pass) and the resolve (it BINDS the store's
+   * buffers), splicing the resolve back into the queues at its own index.
+   * Every render target and temporal history is left alone.
+   * ⚠ SIZE-INVARIANT: a real resize still goes through #syncScreenResolveSize,
+   * the one path allowed to recreate targets.
    */
   #rebuildSrcProbesForPools(state) {
     const screen = state.screen;
@@ -11881,15 +10463,13 @@ export class GISystem {
       validEps: screen.lightShadow?.voxMax ?? 0.15,
     });
     screen.aoPass?.dispose?.();
-    screen.vxaoPass?.dispose?.();
-    screen.vxaoPass?.target?.dispose?.();
-    ({ aoPass: screen.aoPass, vxaoPass: screen.vxaoPass } = this.#armAoTerm({
+    screen.aoPass?.target?.dispose?.();
+    ({ aoPass: screen.aoPass } = this.#armGtaoPass({
       srcProbes: screen.srcProbes,
       gbuffer: screen.gbuffer,
       width,
       height,
       ao: screen.ao,
-      vxao: screen.vxao,
       occupancy: state.volume?.occupancyField,
     }));
     const emitterW = screen.emitterShadowWidth;
@@ -11909,7 +10489,6 @@ export class GISystem {
       emitter: screen.emitter,
       screenRadiance: screen.screenRadiance,
       ao: screen.ao,
-      vxao: screen.vxao,
       emitterTileCut: screen.emitterTileCutBundle && emitterW && emitterH
         ? { ...screen.emitterTileCutBundle, scaleX: emitterW / width, scaleY: emitterH / height }
         : null,
@@ -12685,8 +11264,7 @@ export class GISystem {
     // Per-build like the gbuffer it reads (the AO texture is only ever bound
     // by the resolve, which dies with the build).
     state.screen?.aoPass?.dispose?.();
-    state.screen?.vxaoPass?.dispose?.();
-    state.screen?.vxaoPass?.target?.dispose?.();
+    state.screen?.aoPass?.target?.dispose?.();
     // Per-build like the gbuffer it reads, and unlike the resolve targets: no
     // material is bound to a probe buffer, so nothing is stranded by this.
     state.screen?.srcProbes?.dispose?.();
@@ -12757,15 +11335,10 @@ export class GISystem {
     // resolve runs every frame (even in idle sleep), so edits land next frame.
     if (state.screen?.ao) {
       state.screen.ao.strength.value = Math.min(1, Math.max(0, cfg.aoStrength ?? 0.6));
-      state.screen.ao.radius.value = Math.min(3, Math.max(0.1, cfg.aoRadius ?? 0.6));
-    }
-    if (state.screen?.vxao) {
-      state.screen.vxao.strength.value = Math.min(1, Math.max(0, cfg.aoStrength ?? 0.6));
-      // THE RAY-TRACED ARM DERIVES ITS RADIUS FROM THE CASCADE (4 x the
-      // cascade-0 interval, see #armRtaoPass) — letting the authored metre
-      // constant win here would put back exactly the world-unit constant that
-      // re-derivation removed. `rtaoRadius` is absent only on the legacy arm.
-      state.screen.vxao.radius.value = state.screen.vxao.derivedRadius
+      // THE AO RADIUS IS DERIVED FROM THE CASCADE (see #armGtaoPass) — letting
+      // the authored metre constant win here would put back exactly the
+      // world-unit constant that re-derivation removed.
+      state.screen.ao.radius.value = state.screen.ao.derivedRadius
         ?? Math.min(3, Math.max(0.1, cfg.aoRadius ?? 0.6));
     }
   }
@@ -12778,14 +11351,12 @@ export class GISystem {
    * confidently about a subject they could not see. Selecting `ao` or
    * `reflections` therefore also prints the buffers' actual distribution
    * once, so "the AO view is nearly white" can be settled as a number
-   * (mean/p05/p50) instead of an impression, and so the two AO estimators can
-   * be compared even though the frame composes them with `min` (which, on its
-   * own, makes an isolated read of either impossible — see the vxao memo).
+   * (mean/p05/p50) instead of an impression.
    *
    * Fires once per selection, ~20 frames after the view arms so the textures
    * behind it have actually been written.
    */
-  #debugViewStats(termMode, { aoPass, vxaoPass, targets }) {
+  #debugViewStats(termMode, { aoPass, targets }) {
     if (this._giDebugStatsMode !== termMode) {
       this._giDebugStatsMode = termMode;
       this._giDebugStatsWait = 0;
@@ -12826,24 +11397,13 @@ export class GISystem {
       return `${label}: mean ${mean.toFixed(3)} min ${sorted[0].toFixed(3)} ` +
         `p05 ${pct(sorted, 0.05).toFixed(3)} p50 ${pct(sorted, 0.5).toFixed(3)} p95 ${pct(sorted, 0.95).toFixed(3)}`;
     };
-    if (termMode === "ao" || termMode === "ao-screen" || termMode === "ao-vxao") {
-      Promise.all([grab(aoPass?.target, "legacy screen AO"), grab(vxaoPass?.target, "AO")])
-        .then(([a, v]) => {
-          const lines = [];
-          const chan = (px) => {
-            const out = [];
-            if (!px) return out;
-            for (let i = 0; i < px.length; i += 4) out.push(px[i] / 255);
-            return out;
-          };
-          const av = chan(a.px);
-          const vv = chan(v.px);
-          if (a.px) lines.push(describe("legacy screen AO", av));
-          lines.push(v.px ? describe("AO", vv) : `AO: ${v.error ?? "not armed"}`);
-          if (av.length && vv.length && av.length === vv.length) {
-            lines.push(describe("min()", av.map((x, i) => Math.min(x, vv[i]))));
-          }
-          console.log(`[gi] debug view "${termMode}" — 1 is unoccluded, 0 is fully occluded:\n    ${lines.join("\n    ")}`);
+    if (termMode === "ao") {
+      grab(aoPass?.target, "AO")
+        .then((v) => {
+          const values = [];
+          if (v.px) for (let i = 0; i < v.px.length; i += 4) values.push(v.px[i] / 255);
+          const line = v.px ? describe("AO", values) : `AO: ${v.error ?? "not armed"}`;
+          console.log(`[gi] debug view "${termMode}" — 1 is unoccluded, 0 is fully occluded:\n    ${line}`);
         })
         .catch((error) => console.warn(`[gi] debug view "ao" stats FAILED: ${error?.message ?? error}`));
       return;
@@ -12926,7 +11486,6 @@ export class GISystem {
         const modeU = debugMesh.userData.__giDebugMode;
         const targets = this._giTargets;
         const aoPass = state.screen?.aoPass;
-        const vxaoPass = state.screen?.vxaoPass;
         let sampled = null;
         let second = null;
         let gPos = null;
@@ -12935,28 +11494,10 @@ export class GISystem {
         if (termMode === "indirect" && targets?.irradiance) {
           sampled = targets.irradiance;
           modeCode = 1;
-        } else if (termMode === "ao-screen") {
+        } else if (termMode === "ao") {
+          // ONE estimator (GTAO), so this IS the factor the resolve applies.
           sampled = aoPass?.target ?? null;
           if (sampled) modeCode = 2;
-        } else if (termMode === "ao-vxao") {
-          sampled = vxaoPass?.target ?? null;
-          if (sampled) modeCode = 2;
-        } else if (termMode === "ao") {
-          // THE FACTOR THE RESOLVE APPLIES, not whichever estimator answered
-          // first. The old order (`aoPass.target` else `vxaoPass.target`) made
-          // this view report the SCREEN term alone on every build where both
-          // are armed — which is every shipped one — so a weak screen AO read
-          // as "AO is weak" no matter what the world-space cone was doing.
-          // With both present the shader takes the same `min` giScreen does;
-          // with one present it degrades to that one.
-          if (aoPass?.target && vxaoPass?.target) {
-            sampled = aoPass.target;
-            second = vxaoPass.target;
-            modeCode = 3;
-          } else {
-            sampled = aoPass?.target ?? vxaoPass?.target ?? null;
-            if (sampled) modeCode = 2;
-          }
         } else if (termMode === "reflections" && targets?.radiance) {
           // The glossy field, Fresnel-weighted by the shader against the
           // gbuffer — see mode 4's note for why the raw buffer reads as a
@@ -12982,7 +11523,7 @@ export class GISystem {
           if (gPos && gPosU && gPosU.value !== gPos) gPosU.value = gPos;
           if (gNormal && gNormalU && gNormalU.value !== gNormal) gNormalU.value = gNormal;
           if (modeU.value !== modeCode) modeU.value = modeCode;
-          this.#debugViewStats(termMode, { aoPass, vxaoPass, targets });
+          this.#debugViewStats(termMode, { aoPass, targets });
         } else {
           // Mode is selected but no source texture exists — hide rather than
           // bind a null texture and crash the pipeline. The first time this
@@ -12994,8 +11535,7 @@ export class GISystem {
             (this._giDebugNoSourceHintShown ??= new Set()).add(termMode);
             console.log(
               `[gi] Debug View "${termMode}": no source texture is armed ` +
-              "(an AO view with the Ambient Occlusion toggle off — \"ao-vxao\" also needs the " +
-              "occupancy field, which lower quality tiers may not build; a reflections view with " +
+              "(an AO view with the Ambient Occlusion toggle off; a reflections view with " +
               "Reflections off; the indirect view before the first resolve). " +
               "The view is hidden until a source returns.",
             );
@@ -13262,9 +11802,8 @@ export class GISystem {
    *
    * True when both global delivery paths are armed: the transport samples every
    * tree emitter (`#lightTreeIsNeeSet`, i.e. `__giSrcLightTree`) and the screen's
-   * per-pixel cut shades every visible pixel with its own top-K
-   * (`__giEmitterTileCut`). W5b established that those two are ONE feature and
-   * flip together, so this asks for both rather than either.
+   * per-pixel cut shades every visible pixel with its own top-K. W5b
+   * established that those two are ONE feature and flip together.
    *
    * When it holds, the four analytic seats are no longer a delivery path — they
    * are a quality bonus (an analytic shadow channel) on top of an answer that
@@ -13279,7 +11818,7 @@ export class GISystem {
    * must go false with it, because then seats ARE the delivery path again.
    */
   #emitterDeliveryIsGlobal() {
-    return this.#lightTreeIsNeeSet() && globalThis.__giEmitterTileCut !== false;
+    return this.#lightTreeIsNeeSet();
   }
 
   /**
@@ -13382,7 +11921,7 @@ export class GISystem {
             `descent plus the per-pixel emitter tile cut; a seat only adds an analytic shadow channel.`
           : `Seats go to the ${MAX_EMITTERS} most apparent (power/d² to the camera, re-ranked as it moves — ` +
             `each flip cuts temporal history where that light lands). The rest emit through the FIELD only, ` +
-            `which is a coarser path: arm \`__giSrcLightTree\` + \`__giEmitterTileCut\` for full delivery.`),
+            `which is a coarser path: arm \`__giSrcLightTree\` for full delivery.`),
       );
     }
     const byMesh = new Map();
@@ -13457,7 +11996,7 @@ export class GISystem {
    * True when the TRANSPORT's NEE set is the whole tree — i.e. `[J]` samples
    * every candidate rather than the four promoted slots.
    *
-   * ⚠ THIS IS `__giSrcLightTree` AND NOT `__giEmitterTileCut`, and the
+   * ⚠ THIS IS `__giSrcLightTree` AND NOT THE SCREEN'S TILE CUT, and the
    * difference cost a measurement to find. R5 is a statement about the
    * TRANSPORT: an emitter [J] samples must not also be hit by chance. The tile
    * cut is a statement about the SCREEN: it decides which emitters the deferred
@@ -14214,10 +12753,7 @@ export class GISystem {
       //
       // The chroma follows the energy: the sparsest emitters here are the
       // saturated ones, so the undamped seats over-weighted green specifically.
-      // `__giEmitterSeatFill = false` restores the raw emissive for an A/B.
-      const seatFill = globalThis.__giEmitterSeatFill === false
-        ? 1
-        : (this._emitterFillByMesh?.get(info.mesh) ?? 1);
+      const seatFill = this._emitterFillByMesh?.get(info.mesh) ?? 1;
       slot.color.value.setRGB(info.r * seatFill, info.g * seatFill, info.b * seatFill);
       // SHAPE. fitEmitterShape (emitterShapes.js) maps every default three
       // geometry to its analytic kind — sphere, capsule, cylinder, frustum/
@@ -14307,7 +12843,7 @@ export class GISystem {
             `mesh FILL (slot:fill ${key}) — a seat is fitted to the whole mesh, so a scattered ` +
             "emissive (a string of bulbs in one glTF mesh) over-delivers by 1/fill. The light tree " +
             "already damps its own copy of these lamps; this is the same correction on the analytic " +
-            "seats the exact-reflection hit shading uses. `__giEmitterSeatFill = false` reverts.",
+            "seats the exact-reflection hit shading uses.",
         );
       }
     }
@@ -15257,12 +13793,11 @@ export class GISystem {
     // STATIC-SCENE SHADOW BVH ("light by voxels, shadows by BVH"): one
     // world-space BVH8 over every static placement — the screen shadow
     // channels trace exact triangles while injection/bounce stay voxel.
-    // `__giShadowStaticBvh = false` restores the records/DDA marcher.
     let staticBvhPacked = null;
     // Hoisted out of the block below so the §18.17 degrade rung can re-pack
     // the SAME item list without a UV region.
     let items = [];
-    if (dynObjectsOn && globalThis.__giShadowStaticBvh !== false) {
+    if (dynObjectsOn) {
       const t0 = performance.now();
       const geomByKey = new Map(geometries.map((g) => [g.key, g]));
       items = placements
@@ -15660,76 +14195,6 @@ export class GISystem {
    * nothing on the CPU has to be rebuilt when something moves.
    */
   /**
-   * The mover-occluder uniform bundle the gather applies analytically, created
-   * once and refreshed in place by #syncMoverOccluders every frame.
-   *
-   * Returns null (and the gather compiles WITHOUT the occlusion loop at all)
-   * unless `__giDiffuseSkipMovers` is on — the two halves are one change and
-   * shipping half of it is strictly worse than shipping neither: rays skipping
-   * movers with no analytic term back means movers stop casting indirect
-   * shadows entirely, and the analytic term with rays still hitting them means
-   * every mover shadow is applied twice.
-   */
-  #moverOccluders(lightSlots) {
-    // PARKED, NOT DEAD — and nothing calls this right now. Its one consumer was
-    // the cascade gather (`createIrradianceGather`'s analytic occlusion loop),
-    // deleted with the transport, so the bundle is never created and
-    // #syncMoverOccluders early-returns every frame at zero cost. It is kept
-    // because Phase 1-3 needs exactly this the moment diffuse rays start
-    // skipping movers again: the two halves of `__giDiffuseSkipMovers` are ONE
-    // change, and shipping either alone is strictly worse than shipping neither
-    // (rays skipping movers with no analytic term back = movers cast no indirect
-    // shadow; the analytic term with rays still hitting them = every mover
-    // shadow applied twice). `giProxySpheres` and run-gi-proxy-fit-test hang off
-    // it and stay green meanwhile.
-    // DEFAULT ON since 2026-08-08 (both halves flip together — see the
-    // transport half's measurement note in giField's createOccupancySceneTrace).
-    if (globalThis.__giDiffuseSkipMovers === false) return null;
-    const max = 2 * Math.min(64, Math.max(4, Number(globalThis.__giMaxDynamicObjects) || 16));
-    this._moverOccluders ??= {
-      max,
-      count: uniform(0),
-      // 2x the mover cap: a capsule proxy spends up to 4 slots on ONE mover, so
-      // sizing this to the mover count would silently drop occluders as soon as
-      // a couple of characters were on screen.
-      //
-      // SLOT ENCODING: w > 0 → sphere of radius w (the original record).
-      // w < 0 → ORIENTED BOX with bounding radius |w| (the gate), half
-      // extents in `halfs` and world rotation in `quats`. Boxes exist because
-      // the bounding-sphere proxy painted a smooth normal-dependent gradient
-      // across a big box mover's OWN faces (its surface is deep inside its
-      // bounding sphere — the user's rotating-cube screenshots, 2026-08-08);
-      // the box contour integral is exact for boxes, C¹ under rotation, and
-      // IDENTICALLY ZERO for a receiver on the box's own outward surface or
-      // inside it, so the self-artifact cannot exist by construction.
-      spheres: uniformArray(Array.from({ length: max }, () => new THREE.Vector4()), "vec4"),
-      halfs: uniformArray(Array.from({ length: max }, () => new THREE.Vector4()), "vec4"),
-      quats: uniformArray(Array.from({ length: max }, () => new THREE.Vector4(0, 0, 0, 1)), "vec4"),
-      // Per-occluder DIRECT-LIGHT VISIBILITY, one component per analytic
-      // light slot (x = slot 0 …). The analytic bounce used to give a mover
-      // its direct term UNSHADOWED ("external shadowing not modelled") —
-      // acceptable as a smooth over-estimate until a white cube stood in a
-      // dark nave and re-radiated the full sun ("the cube does not consider
-      // direct light occluders around it", user screenshot 2026-08-08).
-      // Filled by #syncMoverOccluders from ONE CPU shadow ray per
-      // (mover × light) per frame against the static-mesh BVH oracle,
-      // temporally smoothed so a mover crossing a shadow edge ramps over
-      // ~8 frames instead of popping — the only error class this term is
-      // allowed to add.
-      lightVis: uniformArray(Array.from({ length: max }, () => new THREE.Vector4(1, 1, 1, 1)), "vec4"),
-      // Mean albedo / emissive per mover — the same two the dynamic-object
-      // header carries at words 34..39 and that giField shades an exact hit
-      // with, so both paths agree about a mover's colour.
-      albedo: uniformArray(Array.from({ length: max }, () => new THREE.Vector4(1, 1, 1, 0)), "vec4"),
-      emissive: uniformArray(Array.from({ length: max }, () => new THREE.Vector4()), "vec4"),
-      // The SAME slot objects giField's dynamic shading loops over — shared
-      // uniforms, not a copy, so a light edit reaches both paths in one write.
-      lightSlots,
-    };
-    return this._moverOccluders;
-  }
-
-  /**
    * World bounding sphere per adopted mover, straight from the bounds the
    * dynamic set already maintains. CURRENT bounds, never the SWEPT ones: the
    * swept box is prev ∪ curr and would make a moving occluder's shadow smear
@@ -15741,17 +14206,6 @@ export class GISystem {
    * and, notably, will not change as it spins. That is the correct trade for
    * now: a smooth, slightly-wrong shadow beats a sharp, randomly-flickering
    * one, and multi-sphere fitting for elongated shapes is the follow-up.
-   */
-  /**
-   * Lazy, incrementally-built CPU BVH set over the STATIC meshes, for the
-   * mover direct-light shadow rays (moverLightVisTarget). One MeshBVH per
-   * frame so a Sponza-scale scene amortizes the build over ~a second with no
-   * rebuild hitch; until a mesh is in, rays pass through it — i.e. the term
-   * converges FROM the old unshadowed behavior, never past it. Keyed on the
-   * field object: any structural rebuild (which is what moves static meshes)
-   * starts a fresh set. Dynamic-mobility meshes are excluded — they move
-   * after the snapshot and a stale pose here would be a ghost occluder.
-   * `__giMoverDirectShadow = false` disables the whole term.
    */
   /**
    * A PHYSICS-DRIVEN PROP SMALLER THAN ~A VOXEL never enters the voxel
@@ -15802,234 +14256,6 @@ export class GISystem {
     return bodyType === "dynamic" || bodyType === "kinematic";
   }
 
-  #moverShadowOracle() {
-    if (globalThis.__giMoverDirectShadow === false) return null;
-    const field = this.state?.volume?.occupancyField;
-    const placements = field?.placements;
-    if (!placements) return null;
-    let o = this._moverShadowOracle;
-    if (!o || o.key !== field) {
-      const seen = new Set();
-      const queue = [];
-      for (const p of placements) {
-        const mesh = p.mesh;
-        if (!mesh || mesh.isInstancedMesh || seen.has(mesh)) continue;
-        seen.add(mesh);
-        if ((mesh.userData?.giMobility ?? "auto") === "dynamic") continue;
-        if (!mesh.geometry?.attributes?.position) continue;
-        queue.push(mesh);
-      }
-      o = this._moverShadowOracle = { key: field, queue, ready: [] };
-    }
-    if (o.queue.length) {
-      const mesh = o.queue.shift();
-      try {
-        // Session-cached per geometry (see moverOracleBvhCache) — a re-key
-        // after a structural rebuild costs matrix inverts, not BVH builds.
-        let bvh = moverOracleBvhCache.get(mesh.geometry);
-        if (!bvh) {
-          bvh = new MeshBVH(mesh.geometry);
-          moverOracleBvhCache.set(mesh.geometry, bvh);
-        }
-        if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
-        o.ready.push({
-          bvh,
-          mesh,
-          inv: new THREE.Matrix4().copy(mesh.matrixWorld).invert(),
-          // For the per-ray slab pre-reject. Static meshes by construction
-          // (dynamic-mobility ones are excluded above), so a snapshot is safe.
-          worldBox: new THREE.Box3().copy(mesh.geometry.boundingBox).applyMatrix4(mesh.matrixWorld),
-        });
-      } catch {
-        // A geometry MeshBVH cannot digest simply stays un-shadowing.
-      }
-    }
-    // A mesh ADOPTED as an exact mover after this snapshot still sits here at
-    // its build pose — a ghost occluder (a knocked-away crate would keep
-    // shadowing its old corner). Skip-flag, refreshed per frame, instead of a
-    // re-key: adoption churn is play-mode-normal and the flag is ~55 Set
-    // lookups.
-    for (const e of o.ready) {
-      e.skip = this._dynAdoptedKeys?.has(slotKeyOf(e.mesh, null)) === true;
-    }
-    return o;
-  }
-
-  #syncMoverOccluders() {
-    const bundle = this._moverOccluders;
-    if (!bundle) return;
-    const dyn = this._dynSet;
-    const oracle = this.#moverShadowOracle();
-    // ── CANDIDATES, TWO SOURCES, SEATED BY VISUAL WEIGHT ────────────────────
-    // The gather loop runs per resolve PIXEL, so every seat here is paid at
-    // screen resolution — and the first shipped version seated first-come
-    // until the array filled. With 15 crates + 24 cannonballs the cap became
-    // an arbitrary lottery AND the pixel loop ran full-length. Candidates are
-    // now ranked by projected size at the camera (boundR / distance) and only
-    // the top `__giMaxAnalyticOccluders` (default 16) are seated; the tail is
-    // exactly the movers whose occlusion the projected-size fade in the
-    // gather would have erased anyway.
-    const cand = (this._moverOccCand ??= []);
-    cand.length = 0;
-    const cam = this.engine?.camera;
-    if (cam?.getWorldPosition) cam.getWorldPosition(_mocCamera);
-    else _mocCamera.set(0, 0, 0);
-    const prioOf = (cx, cy, cz, r) => {
-      const dx = cx - _mocCamera.x;
-      const dy = cy - _mocCamera.y;
-      const dz = cz - _mocCamera.z;
-      return r / Math.max(Math.sqrt(dx * dx + dy * dy + dz * dz), 0.5);
-    };
-    if (dyn?.enabled && dyn.forEachEntry) {
-      dyn.forEachEntry((entry) => {
-        if (!entry?.boundsValid || entry.active === false) return;
-        const b = entry.currBounds;
-        if (!b || b.isEmpty?.()) return;
-        _msoBoundsC.copy(b.min).add(b.max).multiplyScalar(0.5);
-        const rB = _msoBoundsS.copy(b.max).sub(b.min).length() * 0.5;
-        if (!(rB > 1e-4)) return;
-        cand.push({
-          entry,
-          mesh: null,
-          surface: null,
-          cx: _msoBoundsC.x, cy: _msoBoundsC.y, cz: _msoBoundsC.z,
-          r: rB,
-          prio: prioOf(_msoBoundsC.x, _msoBoundsC.y, _msoBoundsC.z, rB),
-        });
-      });
-    }
-    // Sub-voxel analytic-only movers (#analyticOnlyMover): never voxelized,
-    // never adopted — this bundle is their ENTIRE existence to the GI.
-    for (const rec of this._analyticOnlyMovers ?? []) {
-      const mesh = rec.mesh;
-      if (!mesh || !mesh.parent || mesh.visible === false) continue;
-      const bs = mesh.geometry?.boundingSphere;
-      if (!bs) continue;
-      _mocCenter.copy(bs.center).applyMatrix4(mesh.matrixWorld);
-      mesh.getWorldScale(_obbScale);
-      const rW =
-        bs.radius * Math.max(Math.abs(_obbScale.x), Math.abs(_obbScale.y), Math.abs(_obbScale.z));
-      if (!(rW > 1e-4)) continue;
-      cand.push({
-        entry: null,
-        mesh,
-        surface: rec.surface,
-        cx: _mocCenter.x, cy: _mocCenter.y, cz: _mocCenter.z,
-        r: rW,
-        prio: prioOf(_mocCenter.x, _mocCenter.y, _mocCenter.z, rW),
-      });
-    }
-    cand.sort((a, b) => b.prio - a.prio);
-    const seatCap = Math.min(
-      bundle.max,
-      Math.max(1, Number(globalThis.__giMaxAnalyticOccluders) || 16),
-    );
-    const slots = bundle.lightSlots ?? [];
-    const lightCount = Math.min(4, slots.length);
-    const frame = this._frame ?? 0;
-    // Direct-light visibility rays are STAGGERED: each seated mover re-asks
-    // the oracle every 4th frame (stable per-mover phase), smoothed at 0.45
-    // per update ≈ the old 0.2-per-frame ramp. The rays were the sync loop's
-    // whole CPU cost — movers × lights × every static BVH, every frame.
-    const visFor = (holder, boundR) => {
-      const vis = (holder._giLightVis ??= [1, 1, 1, 1]);
-      if (!oracle) return vis;
-      const phase = (holder._giVisPhase ??= (this._moverVisPhase = ((this._moverVisPhase ?? 0) + 1) & 3));
-      if ((frame & 3) === phase) {
-        for (let li = 0; li < lightCount; li++) {
-          const target = moverLightVisTarget(oracle, _msoBoundsC, boundR, slots[li]);
-          vis[li] += (target - vis[li]) * 0.45;
-        }
-      }
-      return vis;
-    };
-    let n = 0;
-    const promoted = this._promotedEmitterMeshes;
-    for (const c of cand) {
-      if (n >= seatCap) break;
-      _msoBoundsC.set(c.cx, c.cy, c.cz);
-      if (c.entry) {
-        const entry = c.entry;
-        const vis = visFor(entry, c.r);
-        // ORIENTED-BOX record where the shape allows it (see the bundle's
-        // slot-encoding note): exact for box movers, tight for arbitrary
-        // meshes, and free of the bounding-sphere proxy's on-body gradient.
-        // Spheres keep their exact sphere; user-pinned sphere/capsule proxies
-        // are respected; instanced movers keep the AABB chain (their world
-        // matrix is per instance and not worth the decompose here).
-        if (moverObbRecord(entry, emitterFitScratch)) {
-          const r = emitterFitScratch;
-          const a2 = entry.surface?.albedo;
-          const e2 = entry.surface?.emissive;
-          bundle.spheres.array[n].set(r.center.x, r.center.y, r.center.z, -r.radius);
-          bundle.halfs.array[n].set(r.half.x, r.half.y, r.half.z, 0);
-          bundle.quats.array[n].copy(moverObbQuat);
-          bundle.albedo.array[n].set(a2?.[0] ?? 1, a2?.[1] ?? 1, a2?.[2] ?? 1, 0);
-          bundle.emissive.array[n].set(e2?.[0] ?? 0, e2?.[1] ?? 0, e2?.[2] ?? 0, 0);
-          bundle.lightVis.array[n].set(vis[0], vis[1], vis[2], vis[3]);
-          n++;
-          continue;
-        }
-        const spheres = giProxySpheres(entry.mesh, entry.currBounds, seatCap - n, entry.type);
-        if (!spheres.length) continue;
-        // Colour, so the mover's BOUNCE comes back with it. `entry.surface` is
-        // the diagnostics mirror writeSurface keeps of exactly the words the
-        // header carries, so this cannot drift from what the exact-hit path
-        // shades with. A promoted emitter's emissive is already zeroed there
-        // (isPromotedEmitter), which keeps the analytic emitter slot from being
-        // double-counted here too.
-        const a = entry.surface?.albedo;
-        const e = entry.surface?.emissive;
-        // ONE mover can occupy SEVERAL slots (a capsule is spheres along a
-        // segment), and every one of them carries that mover's colour — the
-        // shader has no notion of "these three belong together", it just sums
-        // spheres.
-        for (const s of spheres) {
-          bundle.spheres.array[n].set(s[0], s[1], s[2], s[3]);
-          bundle.albedo.array[n].set(a?.[0] ?? 1, a?.[1] ?? 1, a?.[2] ?? 1, 0);
-          bundle.emissive.array[n].set(e?.[0] ?? 0, e?.[1] ?? 0, e?.[2] ?? 0, 0);
-          bundle.lightVis.array[n].set(vis[0], vis[1], vis[2], vis[3]);
-          n++;
-        }
-        continue;
-      }
-      // Analytic-only: one exact sphere. Emissive comes from the scan-time
-      // surface — ZEROED while the mesh holds an emitter seat, or its light
-      // would arrive twice (once analytic-direct, once as bounce).
-      const holder = (this._analyticOnlyState ??= new WeakMap());
-      let st = holder.get(c.mesh);
-      if (!st) holder.set(c.mesh, (st = {}));
-      const vis = visFor(st, c.r);
-      const surf = c.surface;
-      // §12.70 W5b: the NEE set (seats, plus every tree candidate when a tree
-      // hatch is armed) — `promoted` alone left un-seated lamps delivering
-      // both their analytic direct and their bounce.
-      const isSeatedEmitter = this.#isNeeEmitterMesh(c.mesh)
-        || (promoted ? promoted.indexOf(c.mesh) !== -1 : false);
-      const ei = surf?.emissiveIntensity ?? 1;
-      bundle.spheres.array[n].set(c.cx, c.cy, c.cz, c.r);
-      bundle.albedo.array[n].set(surf?.color?.r ?? 1, surf?.color?.g ?? 1, surf?.color?.b ?? 1, 0);
-      bundle.emissive.array[n].set(
-        isSeatedEmitter ? 0 : (surf?.emissive?.r ?? 0) * ei,
-        isSeatedEmitter ? 0 : (surf?.emissive?.g ?? 0) * ei,
-        isSeatedEmitter ? 0 : (surf?.emissive?.b ?? 0) * ei,
-        0,
-      );
-      bundle.lightVis.array[n].set(vis[0], vis[1], vis[2], vis[3]);
-      n++;
-    }
-    // Zero the tail: a stale radius in an unused slot is a shadow cast by an
-    // object that no longer exists, and the loop's count gate is the only
-    // thing standing between that and the screen.
-    for (let i = n; i < bundle.max; i++) bundle.spheres.array[i].set(0, 0, 0, 0);
-    bundle.albedo.needsUpdate = true;
-    bundle.emissive.needsUpdate = true;
-    bundle.count.value = n;
-    bundle.spheres.needsUpdate = true;
-    bundle.halfs.needsUpdate = true;
-    bundle.quats.needsUpdate = true;
-    bundle.lightVis.needsUpdate = true;
-  }
 
   #refreshOccupancyTransforms(field) {
     if (!field?.placements) return;
@@ -16747,14 +14973,13 @@ export class GISystem {
       }
     }
     let seated = 0;
-    // §14 round 4: fitted bones ship as their flesh BOX by default (see
-    // skinnedBoxShape for why a capsule both self-shadowed and left slits on
-    // a boxy character); joint bridges stay spheres — a wedge that opens at
-    // a bent joint is round. `__giSkinnedProxyShape = "capsule"` reverts.
-    const boxMode = globalThis.__giSkinnedProxyShape !== "capsule";
+    // §14 round 4: fitted bones ship as their flesh BOX (see skinnedBoxShape
+    // for why a capsule both self-shadowed and left slits on a boxy
+    // character); joint bridges stay spheres — a wedge that opens at a bent
+    // joint is round.
     for (const [key, { mesh, segment }] of wanted) {
       if (live.has(key)) { seated++; continue; }
-      const asBox = boxMode && segment.he && !segment.bridge;
+      const asBox = segment.he && !segment.bridge;
       const shape = asBox ? skinnedBoxShape(segment) : skinnedCapsuleShape(segment);
       shape.matrixOf = asBox
         ? (out) => skinnedBoneMatrix(mesh, segment, out)
@@ -16940,8 +15165,8 @@ export class GISystem {
    * textures (irradiance, AO, radiance) and writes it as the lit image.
    *
    * The radiance/irradiance pair are already system-lifetime `_giTargets`,
-   * and the AO/VXAO targets live on `state.screen.aoPass`/`vxaoPass` for as
-   * long as those passes are armed — so the mesh has no textures of its own
+   * and the AO target lives on `state.screen.aoPass` for as
+   * long as that pass is armed — so the mesh has no textures of its own
    * to dispose. `#applyDebugVisibility` rewires `material.fragmentNode` (a
    * uniform-driven texture sample) per mode; for `off` the mesh is hidden.
    *
@@ -16990,12 +15215,11 @@ export class GISystem {
     const placeholder = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
     placeholder.needsUpdate = true;
     const texU = texture(placeholder);
-    // THE SECOND SOURCE. Two of these views show a COMPOSITION, not a buffer:
-    // the AO the resolve applies is `min(screen, vxao)` and the reflection the
-    // material shades with is the exact BVH hit where one resolved, over the
-    // glossy field everywhere else. Showing either half alone is the "can the
-    // instrument see its subject" failure — the view looked correct and
-    // reported the wrong term. A second texture binding is the whole cost.
+    // THE SECOND SOURCE. The reflection view shows a COMPOSITION, not a
+    // buffer: the material shades with the exact BVH hit where one resolved,
+    // over the glossy field everywhere else. Showing either half alone is the
+    // "can the instrument see its subject" failure — the view looked correct
+    // and reported the wrong term. A second texture binding is the whole cost.
     const placeholder2 = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
     placeholder2.needsUpdate = true;
     const tex2U = texture(placeholder2);
@@ -17052,11 +15276,6 @@ export class GISystem {
       const grey = (v) => vec4(sRGBTransferEOTF(vec3(v, v, v)), 1);
       If(modeU.equal(2), () => {
         sampled.assign(grey(sampled.r));
-      }).ElseIf(modeU.equal(3), () => {
-        // Exactly the resolve's composition (giScreen's `factor.min(...)`).
-        // Both AO buffers are written at resolve resolution, so at the shipped
-        // scale this is texel-for-texel the number the frame multiplies in.
-        sampled.assign(grey(sampled.r.min(second.r)));
       }).ElseIf(modeU.equal(4), () => {
         // ── WHY THIS VIEW IS WEIGHTED AND THE OTHERS ARE NOT ──────────────
         //

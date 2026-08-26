@@ -61,9 +61,8 @@
 //
 // ══ THE FILE IS TWO HALVES NOW, AND THEY COMPILE IN DIFFERENT KERNELS ═══════
 //
-// §12.53. `createSrcHitShader` is still the whole expression and still the
-// thing `test:gi-src-shade` gates against `srcRef.js` — but it is now a
-// COMPOSITION of two factories that the engine builds separately:
+// §12.53. Hit shading is a COMPOSITION of two factories that the engine builds
+// separately:
 //
 //   · `createSrcHitAttribution` — surfaceAt, the face-forward flip, R4's albedo
 //     ceiling. Cheap, and it needs the trace's hit record, so it stays in [E].
@@ -501,20 +500,8 @@ export function createSrcHitAttribution({
  *   here tracks it (R2), and there is deliberately no default.
  * @param {object} [options.count]  per-statistic incrementers; see
  *   `srcDeposit.js`'s STAT words.
- * @param {{slot: Node}|true} [options.sunSplit]  §12.82. Names ONE source as
- *   "the sun": its irradiance is left OUT of the returned radiance and its
- *   visibility is returned beside it, so `[E]`/`[J]` can cache the transfer and
- *   `[F]` can close the term against the sun's CURRENT angle every frame. `true`
- *   splits the `sun` bundle; `{slot}` splits the LIGHT SLOT whose index equals
- *   that node (the engine path — `kind` is a uniform, so which slot is the sun
- *   is a runtime fact and cannot be a build-time choice). `srcDeposit.js`'s
- *   `BIN_SR` note carries the whole argument.
- *
- * @returns {(P, n, rho, Le, emitter, rayIndex) => {L: Node, sunVis: Node|null}}
- *   `L` is the radiance MINUS the split source; `sunVis` is that source's
- *   visibility at the hit (0 when the cosine gate skipped its ray), or null
- *   when nothing was split. `createSrcHitShader` recombines the two and is the
- *   form the gate diffs against `srcRef.js`.
+ * @returns {(P, n, rho, Le, emitter, rayIndex) => {L: Node}}
+ *   `L` is the hit's radiance.
  */
 export function createSrcHitLighting({
   sun = null,
@@ -529,7 +516,6 @@ export function createSrcHitLighting({
   floorFraction = IMPORTANCE_FLOOR_FRACTION,
   lightTree = null,
   count = null,
-  sunSplit = null,
 } = {}) {
   if (voxelSize == null) {
     throw new Error(
@@ -554,37 +540,6 @@ export function createSrcHitLighting({
   // R5's flag both still speak in slot indices); only the [J] pick changes.
   const useTree = lightTree != null;
   const useNee = neeEmitters && emitters.length > 0 && !useTree;
-  // §12.82. `true` splits the `sun` bundle (the gate's path); `{slot}` splits a
-  // LIGHT SLOT by runtime index (the engine's). Exactly one, and asking for the
-  // slot form without slots is a wiring mistake that would silently split
-  // nothing and leave the sun accumulating exactly as before.
-  const splitSlot = sunSplit && sunSplit !== true ? sunSplit.slot : null;
-  const splitBundle = sunSplit === true;
-  /**
-   * ⚠ DIAGNOSTIC ONLY — DOUBLE-DELIVERS THE SUN ON PURPOSE.
-   *
-   * The split has two halves that a single image cannot separate: how much sun
-   * it REMOVES from the accumulator, and how much the cached transfer DELIVERS
-   * back at `[F]`. A picture that is darker than the un-split arm says only that
-   * the second is smaller than the first, never by how much or which one is
-   * wrong. With `keep`, the sun stays in `E` AND the transfer is still cached
-   * and closed, so `keep − unsplit` is the delivered half on its own and
-   * `unsplit − split` is the difference — two numbers from three runs.
-   */
-  const splitKeep = !!(sunSplit && sunSplit !== true && sunSplit.keep);
-  if (splitBundle && !sun) {
-    throw new Error(
-      "createSrcHitLighting: sunSplit === true splits the `sun` bundle, and none was supplied — " +
-      "the engine path passes `{slot}` instead (see §12.82)",
-    );
-  }
-  if (splitSlot != null && !lights.length) {
-    throw new Error(
-      "createSrcHitLighting: sunSplit.slot names a LIGHT SLOT and no slots were supplied — " +
-      "nothing would be split and the sun would keep accumulating, silently",
-    );
-  }
-  const splitting = splitBundle || splitSlot != null;
 
   return (Pin, nIn, rhoIn, emissiveIn, emitterIn, rayIndex) => {
     const P = vec3(Pin).toVar();
@@ -592,35 +547,6 @@ export function createSrcHitLighting({
 
     // ── E: irradiance arriving at the hit ───────────────────────────────────
     const E = vec3(0).toVar();
-    /**
-     * §12.82: the split source's VISIBILITY, and nothing else — no cosine and
-     * no irradiance, because those are the two things `[F]` re-evaluates. It
-     * stays 0 when the cosine gate skipped the ray, which is the honest answer:
-     * a back-facing hit never tested the sun, so the bin caches no transfer and
-     * waits for a ray rather than inventing one.
-     */
-    const sunVis = splitting ? float(0).toVar() : null;
-    /**
-     * ⭐ WHETHER THE SPLIT SOURCE COULD REACH THIS SURFACE AT ALL — 1 when the
-     * cosine gate passed, 0 when the hit faces away. NOT the same as `sunVis`,
-     * which is also 0 for a facing surface in shadow, and the difference is a
-     * measured bug and not a nicety.
-     *
-     * `BIN_SN` holds ONE normal for a whole bin, LAST WRITE WINS. Written for
-     * every hit, an AVERTED hit's normal lands in the bin and `[F]`'s
-     * `max(0, n̂·l)` then reads 0 — silencing the transfer that the bin's OTHER,
-     * sun-facing hits had accumulated over many frames. On the user's Level that
-     * cost **44% of the picture's luma at leg0 and 21% at leg1**, and made the
-     * blockiness WORSE (leg1 `checker` 0.0305 → 0.0557, rising instead of
-     * settling) because which normal won flipped frame to frame.
-     *
-     * Gating the STORE on this makes the split unbiased across the two
-     * populations: an averted hit contributes zero transfer (it never tested the
-     * sun) while still counting in the denominator, so a bin that is half
-     * averted delivers half the sun — which is the right answer — and the normal
-     * describes the half that actually transfers.
-     */
-    const sunFacing = splitting ? float(0).toVar() : null;
 
     // The sun. The cosine is clamped at zero BEFORE the shadow ray, because a
     // back-facing surface needs no trace to know the answer — and that early-out
@@ -635,10 +561,7 @@ export function createSrcHitLighting({
         const v = visibility ? float(visibility(P, n, l, null)).toVar() : float(1).toVar();
         // Only when a ray was cast — see the NEE site's note.
         if (count && visibility) count.shadowRays(1);
-        // Split: the ray still fires (visibility is the one term that cannot be
-        // made analytic) but its product is not folded into E.
-        if (splitBundle) { sunVis.assign(v); sunFacing.assign(1); }
-        if (!splitBundle || splitKeep) E.addAssign(vec3(sun.irradiance).mul(cos).mul(v));
+        E.addAssign(vec3(sun.irradiance).mul(cos).mul(v));
       });
     }
 
@@ -677,36 +600,17 @@ export function createSrcHitLighting({
     // rays for one stochastic sample, and that is a variance change that needs
     // its own energy A/B and its own flicker arm. Not here.
     //
-    // ── §12.82: ONE OF THESE SLOTS MAY BE "THE SUN", AND WHICH ONE IS A
-    //    RUNTIME FACT. `kind` is a uniform (R11 — adding a light must never
-    //    recompile), so the split cannot pick a slot at build time. It compares
-    //    the slot index against a uniform instead, and the ONLY thing that
-    //    changes for the chosen slot is where its product goes: the ray still
-    //    fires, the counters still count it, and every other slot is emitted
-    //    byte-identically to before.
     if (lights.length) {
       const terms = lights.map((slot) => lightTermsAt(slot, P, n, margin, maxRay));
-      /** Is slot `idx` (a node or a JS constant) the split sun? */
-      const isSplit = (idx) => (splitSlot == null ? null : float(idx).equal(float(splitSlot)));
       if (!visibility || terms.length === 1) {
         // Nothing to win: with no ray there is no expensive call to share, and
         // with one light there is already exactly one call site. Kept as the
         // straight-line form so those two cases stay byte-identical to before.
-        for (const [k, t] of terms.entries()) {
+        for (const t of terms) {
           If(t.E.x.max(t.E.y).max(t.E.z).greaterThan(0), () => {
             const v = visibility ? float(visibility(P, n, t.dirTo, t.maxT)).toVar() : float(1).toVar();
             if (count && visibility) count.shadowRays(1);
-            const mine = isSplit(k);
-            if (mine) {
-              sunVis.assign(select(mine, v, sunVis));
-              // `t.E > 0` is the gate this sits under and it ALREADY carries the
-              // cosine and `active` (see `lightTermsAt`), so reaching here IS
-              // the cosine test — no second dot product.
-              sunFacing.assign(select(mine, float(1), sunFacing));
-              E.addAssign(t.E.mul(v).mul(splitKeep ? float(1) : select(mine, float(0), float(1))));
-            } else {
-              E.addAssign(t.E.mul(v));
-            }
+            E.addAssign(t.E.mul(v));
           });
         }
       } else {
@@ -729,14 +633,7 @@ export function createSrcHitLighting({
           If(Ei.x.max(Ei.y).max(Ei.z).greaterThan(0), () => {
             const v = float(visibility(P, n, dirTo, maxT)).toVar();
             if (count) count.shadowRays(1);
-            const mine = isSplit(i);
-            if (mine) {
-              sunVis.assign(select(mine, v, sunVis));
-              sunFacing.assign(select(mine, float(1), sunFacing));
-              E.addAssign(Ei.mul(v).mul(splitKeep ? float(1) : select(mine, float(0), float(1))));
-            } else {
-              E.addAssign(Ei.mul(v));
-            }
+            E.addAssign(Ei.mul(v));
           });
         });
       }
@@ -848,95 +745,6 @@ export function createSrcHitLighting({
         out.addAssign(Le);
       });
     }
-    // §12.82: the TRANSFER, not the radiance — `ρ/π · V`, with no cosine and no
-    // irradiance in it, because those are exactly the two factors that go stale
-    // when the sun turns and exactly the two `[F]` re-evaluates. The `ρ` is the
-    // SAME clamped one the rest of the expression uses, so recombining the two
-    // halves at the deposit's own sun angle is an algebraic identity — which is
-    // what `createSrcHitShader` below does and what the gate asserts.
-    return {
-      L: out,
-      sunVis,
-      sunFacing,
-      sunTransfer: sunVis ? rho.mul(sunVis).mul(1 / Math.PI).toVar() : null,
-    };
-  };
-}
-
-/**
- * §4.4's hit shading, ASSEMBLED — attribution then lighting, one call, one
- * `vec3`. Returns `shadeHit(hit, dir, rayIndex) → vec3`, the exact shape
- * `createSrcDepositFrame` takes as its `shadeHit` option.
- *
- * ⚠ **IT RETURNS A `vec3` EVEN UNDER §12.82's SPLIT**, by closing the sun term
- * against the sun the deposit is actually looking at. That is not a convenience
- * for old callers: it is the IDENTITY the split has to satisfy, and putting it
- * here means `test:gi-src-shade` — which diffs this against `srcRef.js`'s
- * un-split `makeHitShader` — gates the split for free. If the two halves ever
- * stop summing to the whole, that gate says so before any image does.
- *
- * This is the ONE-KERNEL form. The engine has not used it since §12.53 (it
- * builds the two halves separately and puts them in [E] and [J]), and what
- * keeps it is that it is the form `test:gi-src-shade` gates against
- * `srcRef.js`'s `makeHitShader` and the form `scripts/gi-src-deposit.html`
- * traces with — one expression, comparable to the mirror line for line, with no
- * hit list or second dispatch in the way. A divergence between this and the
- * split pair is therefore a divergence between two compositions of the SAME two
- * factories, which is a class of bug the composition cannot have.
- */
-export function createSrcHitShader({
-  surfaceAt,
-  maxLoopAlbedo = MAX_LOOP_ALBEDO,
-  count = null,
-  ...lighting
-} = {}) {
-  const attribute = createSrcHitAttribution({ surfaceAt, maxLoopAlbedo, count });
-  const light = createSrcHitLighting({ ...lighting, count });
-  // What `[F]` will multiply the cached transfer by. The composer needs the
-  // same pair, or "recombined" would mean "recombined against something else".
-  const closeSun = sunTerm(lighting);
-  return (hit, dir, rayIndex) => {
-    const a = attribute(hit, dir);
-    const r = light(a.P, a.n, a.rho, a.emissive, a.emitter, rayIndex);
-    if (!r.sunTransfer) return r.L;
-    const { direction, irradiance } = closeSun();
-    return r.L.add(r.sunTransfer.mul(irradiance).mul(vec3(a.n).dot(direction).max(0)));
-  };
-}
-
-/**
- * The `{direction, irradiance}` of whichever source §12.82 split out — the pair
- * `[F]` closes the cached transfer against, resolved from the same options the
- * lighting factory was built from so the two cannot drift apart.
- *
- * ⚠ **RETURNS A THUNK, and that is not style.** For a light slot the pair is a
- * predicated select over the slot uniforms, i.e. real nodes with `toVar()`s in
- * them, and a node built outside a kernel body belongs to whichever builder
- * happens to be open. `[F]` and the composer are different kernels; each calls
- * this inside its own.
- *
- * `vector` is already the direction TOWARD a directional light and `color`
- * already carries its intensity (see `lightTermsAt`, whose `atten` is 1 for
- * `kind == 1`), so no conversion happens here — a conversion is precisely where
- * the two sides would drift.
- */
-export function sunTerm({ sun = null, lights = [], sunSplit = null } = {}) {
-  if (!sunSplit) return null;
-  if (sunSplit === true) {
-    return () => ({ direction: vec3(sun.direction).toVar(), irradiance: vec3(sun.irradiance).toVar() });
-  }
-  const idx = sunSplit.slot;
-  return () => {
-    const direction = vec3(0, 1, 0).toVar();
-    const irradiance = vec3(0).toVar();
-    for (const [k, slot] of lights.entries()) {
-      const take = float(idx).equal(float(k));
-      direction.assign(select(take, vec3(slot.vector), direction));
-      // `active` is folded in here rather than left to the resolve: a slot that
-      // goes dark must stop delivering on the very frame it does, and `[F]` has
-      // no other way to know — the cached transfer knows nothing about it.
-      irradiance.assign(select(take, vec3(slot.color).mul(float(slot.active ?? 1)), irradiance));
-    }
-    return { direction, irradiance };
+    return { L: out };
   };
 }

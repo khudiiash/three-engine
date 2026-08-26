@@ -36,8 +36,8 @@
 //                   is impossible when every emitter agrees on hue, so the
 //                   setDiff≥1 excess MUST collapse here or the instrument is
 //                   measuring something else.
-//   ARM=default     comma set: nocut (__giEmitterTileCut=false), nocomp
-//                   (__giTileCutCompensate=1), srcoff (__giSrcProbes=false),
+//   ARM=default     comma set: nocomp (__giTileCutCompensate=1),
+//                   srcoff (__giSrcProbes=false),
 //                   soft=<f> (__giTileCutFeather — the fix's dial)
 //   QUALITY=high    GI preset
 //   PNG=1           dump the frame + a setDiff overlay next to it
@@ -99,8 +99,7 @@ if (PROJECT) {
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
     const flags = new Set(String(armStr).split(",").map((s) => s.trim()).filter(Boolean));
-    if (flags.has("nocut")) { globalThis.__giEmitterTileCut = false; globalThis.__giSrcLightTree = false; }
-    if (flags.has("nocomp")) globalThis.__giTileCutCompensate = 1;
+      if (flags.has("nocomp")) globalThis.__giTileCutCompensate = 1;
     if (flags.has("srcoff")) globalThis.__giSrcProbes = false;
     for (const f of flags) {
       const m = /^soft=([\d.]+)$/.exec(f);
@@ -144,7 +143,6 @@ const result = await page.evaluate(async ({ lamps, colours, arm, quality, wantPn
   globalThis.__editorKeepRendering = true;
   if (!projectMode) globalThis.__giConfigOverride = { emissiveShadows: true };
   const flags = new Set(String(arm).split(",").map((s) => s.trim()).filter(Boolean));
-  if (flags.has("nocut")) { globalThis.__giEmitterTileCut = false; globalThis.__giSrcLightTree = false; }
   if (flags.has("nocomp")) globalThis.__giTileCutCompensate = 1;
   if (flags.has("srcoff")) globalThis.__giSrcProbes = false;
   for (const f of flags) {

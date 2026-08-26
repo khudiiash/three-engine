@@ -9,12 +9,11 @@
 //   · GRAIN: mean |4-neighbour Laplacian| within the penumbra — the
 //     "grainy" number;
 //   · penumbra coverage, so arms are comparing the same signal.
-// Arms (env ARM): "analytic" = the SHIPPING DEFAULT (deterministic
-// analytic-width, docs/GI_SHADOWS_PLAN.md §5 — its bar is flicker AND grain
-// at the static noise floor WHILE the sun rotates); the three stochastic-path
-// arms pin __giShadowAnalyticWidth=false: "on" = sun-disc + temporal,
-// "off" = temporal also off (raw dither baseline), "still" = temporal on +
-// static light (the convergence ceiling). ROT=deg/sec overrides rotation.
+// Arms (env ARM): "on" (default) = the SHIPPING analytic-width shadow
+// while the sun rotates (docs/GI_SHADOWS_PLAN.md §5 — its bar is flicker
+// AND grain at the static noise floor); "off" = temporal filtering also
+// off (raw dither baseline); "still" = static light (the convergence
+// ceiling). ROT=deg/sec overrides rotation.
 //
 //   node scripts/run-gi-shadow-motion.mjs [url]
 import puppeteer from "puppeteer-core";
@@ -47,8 +46,6 @@ await new Promise((r) => setTimeout(r, 5000));
 const result = await page.evaluate(async ({ arm, rotDegPerSec }) => {
   globalThis.__editorKeepRendering = true;
   // Build-time hatches — set BEFORE the GI entity below triggers the build.
-  // Analytic-width is the default; the stochastic arms pin it off.
-  if (arm === "off" || arm === "on" || arm === "still") globalThis.__giShadowAnalyticWidth = false;
   if (arm === "off") globalThis.__giShadowTemporal = false;
   const { THREE } = await import("/src/engine/index.js");
   await import("/src/modules/index.js");
@@ -135,7 +132,6 @@ const result = await page.evaluate(async ({ arm, rotDegPerSec }) => {
   const FRAMES = 14;
   const frames = [];
   const rawFingerprints = [];
-  const phases = [];
   const slotVecs = [];
   const slot0 = screen.lightShadow?.slots?.[0];
   for (let i = 0; i < FRAMES; i++) {
@@ -144,7 +140,6 @@ const result = await page.evaluate(async ({ arm, rotDegPerSec }) => {
     let sum = 0;
     for (let k = 0; k < raw.length; k += 7) sum += raw[k];
     rawFingerprints.push(Math.round(sum));
-    phases.push(system._giShadowFrameU?.value ?? -1);
     const v = slot0?.vector?.value;
     slotVecs.push(v ? `${v.x.toFixed(2)},${v.y.toFixed(2)},${v.z.toFixed(2)}` : "?");
     await new Promise((r) => setTimeout(r, 90));
@@ -180,38 +175,23 @@ const result = await page.evaluate(async ({ arm, rotDegPerSec }) => {
   // Same-instant stage comparison (the shadow moves fast — grabbing stages
   // seconds apart made the post-filter look like it ADDED noise).
   const rawLast = await grab(screen.targets.lightShadowRaw);
-  // The analytic-width arm has no accum stage (trace → one filter → final);
-  // its accum texture exists but is never written, and copyTextureToBuffer
-  // throws on a GPU texture no pass ever touched. Read final in its place so
-  // the stage table stays shaped.
-  const accumLast = screen.lightShadowHistoryPass
-    ? await grab(screen.targets.lightShadowAccum)
-    : await grab(screen.targets.lightShadow);
+  // The light-shadow chain is trace → one filter → final. There is no accum
+  // stage: the stochastic sun-disc arm that owned one was retired in §19.
   const finalLast = await grab(screen.targets.lightShadow);
   const rawG = grainOf(rawLast);
-  const accumG = grainOf(accumLast);
   const finalG = grainOf(finalLast);
   const grainSum = finalG.grain, penCount = finalG.n, grainN = finalG.n ? 1 : 0;
-  // Is the queue's post entry the CURRENT pass? And what does a manual
-  // dispatch of the current post pass produce?
+  // Are the two shipped passes actually in the queue? A silent drop reads as
+  // "the filter does nothing" rather than as a missing dispatch.
   const q = system.state.queue ?? [];
   const queueHas = {
     trace: q.includes(screen.lightShadowPass?.compute),
     filter: q.includes(screen.lightShadowFilterPass?.compute),
-    history: q.includes(screen.lightShadowHistoryPass?.compute),
-    post: q.includes(screen.lightShadowPostPass?.compute),
   };
-  let manualPostGrain = -1;
-  if (screen.lightShadowPostPass) {
-    engine.renderer.compute(screen.lightShadowPostPass.compute);
-    await new Promise((r) => setTimeout(r, 120));
-    manualPostGrain = grainOf(await grab(screen.targets.lightShadow)).grain;
-  }
-  // Is post ≈ identity? Mean |final − accum| near zero would mean the post's
-  // source is effectively its own target, not the accum texture.
-  let accumFinalDiff = 0;
-  for (let i = 0; i < finalLast.length; i++) accumFinalDiff += Math.abs(finalLast[i] - accumLast[i]);
-  accumFinalDiff /= finalLast.length;
+  // Mean |final − raw|: how much the filter actually moved the picture.
+  let filterDelta = 0;
+  for (let i = 0; i < finalLast.length; i++) filterDelta += Math.abs(finalLast[i] - rawLast[i]);
+  filterDelta /= finalLast.length;
   return {
     arm, rotDegPerSec: rotate ? rotDegPerSec : 0,
     shadowRes: `${W}x${H}`,
@@ -219,15 +199,11 @@ const result = await page.evaluate(async ({ arm, rotDegPerSec }) => {
     flicker: flickerN ? flickerSum / flickerN : 0,
     grain: grainN ? grainSum / grainN : 0,
     grainRaw: rawG.grain,
-    grainAccum: accumG.grain,
-    manualPostGrain,
-    accumFinalDiff,
-    stageN: { raw: rawG.n, accum: accumG.n, final: finalG.n },
+    filterDelta,
+    stageN: { raw: rawG.n, final: finalG.n },
     queueHas,
-    histWeight: system._giShadowHistWeightU?.value ?? null,
     lastMotion: system._giShadowLastMotion ?? null,
     rawFingerprints,
-    phases,
     slotVecs: [slotVecs[0], slotVecs[Math.floor(FRAMES / 2)], slotVecs[FRAMES - 1]],
   };
 }, { arm, rotDegPerSec });
@@ -239,9 +215,9 @@ if (result.fail) {
 }
 console.log(
   `GI-MOTION arm=${result.arm} rot=${result.rotDegPerSec}°/s res=${result.shadowRes} penumbraPx=${result.penumbraPx} ` +
-  `flicker=${result.flicker.toFixed(4)} grain=${result.grain.toFixed(4)} (raw=${result.grainRaw.toFixed(4)} accum=${result.grainAccum.toFixed(4)}) histWeight=${result.histWeight} lastMotion=${result.lastMotion}\n` +
-  `  rawFp=[${result.rawFingerprints}]\n  phases=[${result.phases}]\n  slot0=[${result.slotVecs.join(" | ")}]\n` +
-  `  manualPostGrain=${result.manualPostGrain.toFixed(4)} accumFinalDiff=${result.accumFinalDiff.toFixed(4)} ` +
+  `flicker=${result.flicker.toFixed(4)} grain=${result.grain.toFixed(4)} (raw=${result.grainRaw.toFixed(4)}) lastMotion=${result.lastMotion}\n` +
+  `  rawFp=[${result.rawFingerprints}]\n  slot0=[${result.slotVecs.join(" | ")}]\n` +
+  `  filterDelta=${result.filterDelta.toFixed(4)} ` +
   `stageN=${JSON.stringify(result.stageN)} queueHas=${JSON.stringify(result.queueHas)}`,
 );
 await browser.close();

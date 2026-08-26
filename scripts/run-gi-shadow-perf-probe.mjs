@@ -4,9 +4,8 @@
 // .timestamp), not from a pop count or a guess.
 //
 // Runs the real project and samples steady-state per-frame GPU time. Arms:
-//   ARM=bvh     static BVH8 shadow rays (shipped)
-//   ARM=voxel   __giShadowStaticBvh=false — the records/DDA marcher
-//   ARM=noshadow  __giLightShadow=false-ish baseline (gi shadows off)
+//   ARM=bvh     static BVH8 shadow rays (shipped, default)
+//   ARM=sah     __giStaticBvhStrategy="sah" — alternate BVH build heuristic
 // Run both and diff. Extra globals via PRESET_GLOBALS='{"__x":true}'.
 import puppeteer from "puppeteer-core";
 import { installTauriShim } from "./lib/tauriShim.mjs";
@@ -19,7 +18,6 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const ARMS = {
   bvh: {},
-  voxel: { __giShadowStaticBvh: false },
   sah: { __giStaticBvhStrategy: "sah" },
 };
 

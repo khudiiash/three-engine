@@ -149,3 +149,58 @@ the whole occupancy chain running unskipped (:3660-3730). 84 `.compute(` sites
 (occupancyField 17, giScreen 18, srcRays 10, srcProbes 8 …), per-cascade ×4,
 per-level ×4. Baked scene constants: occupancy 29 sites (:963-976, 1192-1210),
 srcProbes 21 (:1444, 1481-1492), every `.compute(N)`.
+
+---
+
+## F. STAGE 0.2 EXECUTION SPEC (written 08-26 evening from the sites above)
+
+**Mechanism.** Every `instancedArray(new TypedArray(N))` is a
+`StorageInstancedBufferAttribute` whose `.array` is copied into the GPU buffer
+the FIRST time the attribute is bound (`WebGPUAttributeUtils.createAttribute`,
+`mappedAtCreation`). After that the JS array is dead weight unless the code
+writes it CPU-side again (`addUpdateRange` + `needsUpdate`). So:
+
+1. **`detachCpuMirror(renderer, attr)` helper** (new, `releaseCompute.js`):
+   if `renderer.backend.get(attr)?.buffer` exists (uploaded) → `attr.array =
+   new attr.array.constructor(0)`; return true. Else return false (caller
+   retries next tick). Never call it on an attribute that is written CPU-side
+   later. Record `attr.__giBytes = byteLength` BEFORE detaching so size checks
+   keep working.
+2. **Detach set — GPU-only after build** (occupancyField.js:613-670): `bits`,
+   `atomicBits`, `staticBits`, `attrScratch`, `surfScratch`, `surfAlloc`;
+   srcDeposit.js:544-546 `scratch`, `payload`, `stats`; srcProbes.js:472-588
+   probe/hash/freeStack stores; srcProbes.js:1304-1306 + srcRays.js:123,143
+   per-pixel buffers; srcMerge.js:267-268 corners; the tile atlas is a
+   texture (no mirror). Poll a `pendingDetach` list in `GISystem#tick` after
+   `_fieldReadyOnce` / after the first unskipped SRC frame.
+   **KEEP mirrors** (CPU-written incrementally): `vertexBuffer`, `indexBuffer`,
+   `pairWork` (:4859-4894 `addUpdateRange`), `slotDynamic`, `slotMatrices`,
+   `localToWorld` (:4752), light-tree/emitter uniform arrays.
+3. **Size reads that touch `.array.byteLength` must switch to `__giBytes`:**
+   occupancyField.js:5246 (`readbackBits` cap), GISystem.js:15367-15385 (the
+   ladder, 3 sites). `readbackBits` uses `getArrayBufferAsync` (fresh buffer)
+   — unaffected otherwise.
+4. **Static-BVH staging** (dynamicObjects.js `queueRegionUpload` :1871-1880):
+   keep `staging` + `copy` on the block; in `confirmDispatch` (:2205-2215)
+   when `p.block.uploaded` flips true → `releaseComputeNodes(renderer,[copy])`
+   and drop the `staging` reference (needs `renderer` — pass it from the
+   caller that already has it, or stash it on the set at creation).
+5. **Build-only scratch** (`surfScratch`, `attrScratch`): after the fit ran
+   unskipped (the occupancy chain's `confirmDispatch` equivalent), detach
+   (step 2 covers it) — freeing the GPU side too requires the scratch to be
+   rebuilt per refit; defer GPU release to the ladder-allocate-once unit.
+6. **Sweeps at the three swap sites**: `#syncScreenResolveSize` (GISystem.js
+   ~:7859), `#rebuildSrcProbesForPools` (pool grow), the geometry-revision
+   chain re-mint — each must `collectStateComputeNodes(oldGen)` +
+   `releaseComputeNodes(renderer, …)` exactly as `#dispose` does at :12713.
+   Implement `occupancyField.dispose()` (:5486) to release its own nodes and
+   null its closures.
+7. **Allocate once**: compute `bitsBytes(dynWords, staticBvhWords, uv)` from
+   the region arithmetic BEFORE `makeField`; walk the ladder on the NUMBER
+   (GISystem.js:15361-15390) and call `makeField` exactly once.
+8. **`voxelizeOnce.js:358-361` copies**: keep only for non-Float32 /
+   interleaved attributes; otherwise reference three's arrays.
+
+**Gate:** Bistro settled heap < 2 GB and flat over 10 min orbit
+(`profile.frameStats.jsHeapMB`); `profile.textures` orphans < 50 MB; battery
+green; `probe:gi-heap-retainer` POKE=quality shows no per-rebuild climb.

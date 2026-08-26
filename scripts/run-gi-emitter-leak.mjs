@@ -9,15 +9,13 @@
 //   3. TINT — a mirror ball next to a TEXTURED cube: the reflection must
 //      carry the texture's mean color, not flat white.
 //
-// Env: SPHERE=1 legacy sphere-emitter model, NOTINT=1 disable the texture
-// mean-color, HEADED=1, TAG=<suffix>.
+// Env: NOTINT=1 disable the texture mean-color, HEADED=1, TAG=<suffix>.
 import puppeteer from "puppeteer-core";
 import sharp from "sharp";
 
 const url = process.argv[2] ?? "http://localhost:5233/";
-const SPHERE = !!process.env.SPHERE;
 const NOTINT = !!process.env.NOTINT;
-const TAG = process.env.TAG ?? `${SPHERE ? "sphere" : "box"}${NOTINT ? "-notint" : ""}`;
+const TAG = process.env.TAG ?? `box${NOTINT ? "-notint" : ""}`;
 
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
@@ -45,8 +43,7 @@ for (let i = 0; i < 40; i++) {
 await new Promise((r) => setTimeout(r, 3000));
 
 await page.evaluate(
-  async ({ SPHERE, NOTINT }) => {
-    if (SPHERE) globalThis.__giSphereEmitters = true;
+  async ({ NOTINT }) => {
     if (NOTINT) globalThis.__giNoTextureTint = true;
     const { THREE } = await import("/src/engine/index.js");
     await import("/src/modules/index.js");
@@ -115,7 +112,7 @@ await page.evaluate(
     giEntity.addComponent("global-illumination", { quality: "high" });
     console.log("GI-EL scene ready");
   },
-  { SPHERE, NOTINT },
+  { NOTINT },
 );
 
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));

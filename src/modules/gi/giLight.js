@@ -60,8 +60,8 @@ export const MAX_EMITTERS = 4;
 // rough materials (walls, floors) compile only the diffuse limit.
 // Materials with a roughness map/node stay on the full path, and GISystem
 // recompiles a material whose static roughness crosses a gate.
-export const GI_MIRROR_ROUGHNESS_MAX = 0.45;
-export const GI_SPECULAR_ROUGHNESS_MAX = 0.6;
+const GI_MIRROR_ROUGHNESS_MAX = 0.45;
+const GI_SPECULAR_ROUGHNESS_MAX = 0.6;
 
 /**
  * The compile-time roughness bucket of a material: 0 = mirror path,
@@ -209,8 +209,8 @@ export const GI_REFLECT_TIER = { SHARP: 0, MEDIUM: 1, COARSE: 2 };
  * about what "sharp" is, and the scene's own MIRROR materials then fail to
  * qualify as sharp — which is exactly what the first census showed: 0 sharp.
  */
-export const GI_TIER_SHARP_MAX = 0.15;
-export const GI_TIER_MEDIUM_MAX = 0.45;
+const GI_TIER_SHARP_MAX = 0.15;
+const GI_TIER_MEDIUM_MAX = 0.45;
 
 function tierFromRoughness(r) {
   if (!(r >= 0)) return GI_REFLECT_TIER.MEDIUM;
@@ -2242,16 +2242,12 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
           // set ONLY by the PURE DATAFLOW branch below, consumed at the
           // `hitPoint` offset and the `hitSurface.albedo`/`hitN` use sites
           // further down with the identical no-toVar/no-If discipline.
-          // Every other branch (v1, BVH-only, SDF-only) leaves these null,
-          // so hit shading there is byte-identical to before — unchanged.
+          // Every other branch (BVH-only, SDF-only) leaves these null, so
+          // hit shading there is byte-identical to before — unchanged.
           let bvhCol = null;
           let usedBvh = null;
           let nHit = null;
-          if (light.bvhReflectTexture && (globalThis.__giBvhV1 || globalThis.__giBvhV1Light)) {
-            // Exact v1 consumption (bisect hatch): direct .r, no toVar, no
-            // coverage branch — the executor-verified build.
-            mirrorT = light.bvhReflectTexture.sample(giUV).r;
-          } else if (light.bvhReflectTexture && light.mirrorTraceFn) {
+          if (light.bvhReflectTexture && light.mirrorTraceFn) {
             // PURE DATAFLOW, deliberately: the first version of this branch
             // hoisted the sample through `.toVar()` and gated the SDF trace
             // behind `If(flag)` — and rendered BLACK (bisected 2026-08-01:

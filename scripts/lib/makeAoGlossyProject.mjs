@@ -1,5 +1,5 @@
 // THE AO + GLOSSY RIG (2026-08-21) — the gate scene for the two indirect
-// completions: screen-space AO on the indirect term (createGiAoPass) and the
+// completions: GTAO on the indirect term (createGiGtaoPass) and the
 // half-res glossy radiance chain (createSrcGlossyGather, §12.71b v2).
 //
 // One room, three subjects, one pose:

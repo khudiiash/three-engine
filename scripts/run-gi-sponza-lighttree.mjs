@@ -75,12 +75,9 @@ async function runArm(treeOn, round) {
     localStorage.setItem("engine.projectRoot.v1", project);
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
-    // The two hatches flip TOGETHER — §12.70 W5b. The cut alone leaves the
-    // un-seated emitters delivering screen direct AND field emission. Set
-    // EXPLICITLY on both arms: they default ON, so the slots arm has to say
-    // `false` or it is a second tree arm.
+    // Set EXPLICITLY on both arms: it defaults ON, so the slots arm has to
+    // say `false` or it is a second tree arm.
     globalThis.__giSrcLightTree = on === true;
-    globalThis.__giEmitterTileCut = on === true;
   }, PROJECT, treeOn);
   await page.goto(url, { waitUntil: "load", timeout: 60000 });
   await page.waitForSelector(".hub-recent-open-btn", { timeout: 30000 });

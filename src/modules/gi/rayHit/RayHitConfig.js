@@ -140,7 +140,6 @@ export function resolveRayHitConfig(props = {}, runtime = globalThis) {
     enableDynamicOverlay: runtime.__giRayHitDynamicOverlay === true,
     enableComplexTriangles: runtime.__giRayHitComplexTriangles === true,
     visualizeTraversal: runtime.__giRayHitVisualizeTraversal === true,
-    validateAgainstLegacy: runtime.__giRayHitValidateLegacy === true,
     validateAgainstCPU: runtime.__giRayHitValidateCPU === true,
   });
 }

@@ -59,7 +59,7 @@ async function boot(label, dampOff) {
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
     globalThis.__giConfigOverride = { quality: "high" };
-    if (off) { globalThis.__giSrcLightTree = false; globalThis.__giEmitterTileCut = false; }
+    if (off) { globalThis.__giSrcLightTree = false; }
   }, PROJECT, dampOff);
   console.log(`[${label}] opening … (quality=high${dampOff ? ", damp OFF" : ", damp DEFAULT-ON"})`);
   await page.goto(url, { waitUntil: "load", timeout: 60000 });

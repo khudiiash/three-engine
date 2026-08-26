@@ -1,30 +1,14 @@
 // PHASE E GATE — DOES A SMALL, POWERFUL, UNSEEN EMITTER DELIVER ANY LIGHT?
 //
 // Plan Part 1, E4's new gate ("the gate that would have caught R5-over-dead-
-// delivery the day it shipped") and E0's discriminator in the same run.
+// delivery the day it shipped").
 //
-// Four arms, ABBA-free because the statistic is a RATIO AGAINST A DARK ARM
+// Two arms, ABBA-free because the statistic is a RATIO AGAINST A DARK ARM
 // rather than an arm-to-arm energy comparison — the emitter-off room is black,
 // so drift between rounds cannot manufacture a pass:
 //
-//   on-tree    bulb lit,  __giSrcLightTree = true,  __giEmitterTileCut = true
-//   off-tree   bulb dark, same hatches                        (the noise floor)
-//   on-field   bulb lit,  BOTH hatches false        (R5 zeroing disarmed)
-//   off-field  bulb dark, both hatches false
-//
-// ⚠ BOTH HATCHES ARE SET EXPLICITLY ON EVERY ARM. They default ON since
-// §12.70's flip, so `if (fieldArm) set false` leaves the "tree" arms reading
-// whatever the build shipped, and W5b's coupling warning fires if the cut is
-// armed alone. Every rig in this module has made this mistake once.
-//
-// VERDICTS
-//   · tree arm lit and field arm lit    → delivery works on both paths.
-//   · tree arm DARK and field arm lit   → E0 confirmed: R5 zeroes field
-//                                         emission over a delivery path that
-//                                         does not deliver. Phase E is a
-//                                         delivery hunt.
-//   · both dark                         → the bug is upstream of delivery
-//                                         (go to E1: the intensity fold).
+//   on   bulb lit,  __giSrcLightTree = true   (tree + tile-cut delivery)
+//   off  bulb dark, same hatches                        (the noise floor)
 //
 //   node scripts/run-gi-shadowed-bulb.mjs         (vite on :5201)
 //   STRENGTH=2000 BULBS=1 SETTLE=25000 SAMPLES=24 QUALITY=high
@@ -59,9 +43,7 @@ const DECOY_STRENGTH = Number(process.env.DECOY_STRENGTH ?? 200);
 // that can sever an un-seated emitter's screen-direct term while a five-lamp
 // rig stays healthy. Present in BOTH arms — see the rig's `fillerCount` note.
 const FILLERS = Number(process.env.FILLERS ?? 0);
-// Which arms to run. The default four are E0's full answer; a delivery hunt
-// re-runs one pair at a time.
-const ARMS = (process.env.ARMS ?? "on-tree,off-tree,on-field,off-field").split(",").map((s) => s.trim());
+const ARMS = (process.env.ARMS ?? "on,off").split(",").map((s) => s.trim());
 // EXTRA='{"__giSrcWorldKeys":true}' — dev globals set on EVERY arm before the
 // page loads. Both arms get them, so the lit-minus-dark delta stays the
 // statistic and the flag under test cannot be confounded with the emitter.
@@ -99,8 +81,7 @@ const browser = await puppeteer.launch({
 });
 
 async function runArm(arm) {
-  const lit = arm.startsWith("on");
-  const treeOn = arm.endsWith("tree");
+  const lit = arm === "on";
   const page = await browser.newPage();
   await page.setViewport({ width: 1200, height: 800, deviceScaleFactor: 1 });
   await installTauriShim(page, {});
@@ -121,15 +102,13 @@ async function runArm(arm) {
     const msg = e.message ?? String(e);
     if (!/save_scene/.test(msg)) console.log(`  pageerror: ${msg.slice(0, 200)}`);
   });
-  await page.evaluateOnNewDocument((project, tree, extra) => {
+  await page.evaluateOnNewDocument((project, extra) => {
     localStorage.setItem("engine.projectRoot.v1", project);
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
-    // BOTH, EXPLICITLY, ON EVERY ARM — see the header.
-    globalThis.__giSrcLightTree = tree;
-    globalThis.__giEmitterTileCut = tree;
+    globalThis.__giSrcLightTree = true;
     if (extra) for (const [k, v] of Object.entries(extra)) globalThis[k] = v;
-  }, roots[lit ? "on" : "off"], treeOn, EXTRA);
+  }, roots[lit ? "on" : "off"], EXTRA);
   await page.goto(url, { waitUntil: "load", timeout: 60000 });
   await page.waitForSelector(".hub-recent-open-btn", { timeout: 30000 });
   await page.evaluate((project) => {
@@ -209,7 +188,7 @@ async function runArm(arm) {
     return (sys?._promotedEmitterMeshes ?? []).map((m) => m?.name ?? m?.parent?.name ?? null);
   }).catch(() => []);
   await page.close();
-  return { arm, lit, treeOn, mean, std, peak, ticking: f1 > f0 + 20, lines, seats, emitterCount: live?.emitterCount ?? -1 };
+  return { arm, lit, mean, std, peak, ticking: f1 > f0 + 20, lines, seats, emitterCount: live?.emitterCount ?? -1 };
 }
 
 const results = [];
@@ -234,32 +213,22 @@ function verdict(onName, offName) {
   const noise = Math.max(off.std, 1e-6);
   return { on, off, delta: on.mean - off.mean, snr: (on.mean - off.mean) / noise, lit: on.mean - off.mean > Math.max(20 * noise, 0.002) };
 }
-const tree = verdict("on-tree", "off-tree");
-const field = verdict("on-field", "off-field");
+const delivery = verdict("on", "off");
 
-console.log(`\n== SHADOWED BULB (${BULBS} bulb(s), strength ${STRENGTH}, r=0.05m, hidden) ==`);
-for (const [name, v] of [["tree/tile-cut armed (DEFAULT)", tree], ["field emission (both hatches off)", field]]) {
-  if (!v) continue;
+console.log(`
+== SHADOWED BULB (${BULBS} bulb(s), strength ${STRENGTH}, r=0.05m, hidden) ==`);
+if (delivery) {
   console.log(
-    `  ${name.padEnd(36)} lit ${v.on.mean.toFixed(5)}  dark ${v.off.mean.toFixed(5)}  ` +
-    `delta ${v.delta.toExponential(2)}  snr ${v.snr.toFixed(1)}  → ${v.lit ? "DELIVERS" : "DELIVERS NOTHING"}`,
-  );
-}
-if (tree && field) {
-  console.log(
-    `\n  E0 VERDICT: ` +
-    (tree.lit && field.lit ? "both paths deliver — the emitter reaches the wall either way."
-      : !tree.lit && field.lit ? "SEVERED — field emission lights the wall, the armed tree/tile-cut path does NOT. "
-        + "R5 zeroes 95 emitters over a delivery path that delivers nothing. Phase E is a delivery hunt (E2)."
-      : !tree.lit && !field.lit ? "BOTH DARK — the bug is upstream of delivery; go to E1 (the intensity fold) first."
-      : "tree delivers, field does not — inverted from the report; re-read the rig before trusting it."),
+    `  ${"tree/tile-cut delivery".padEnd(36)} lit ${delivery.on.mean.toFixed(5)}  dark ${delivery.off.mean.toFixed(5)}  ` +
+    `delta ${delivery.delta.toExponential(2)}  snr ${delivery.snr.toFixed(1)}  → ${delivery.lit ? "DELIVERS" : "DELIVERS NOTHING"}`,
   );
 }
 writeFileSync(`${OUT}/result.json`, JSON.stringify({ results, strength: STRENGTH, bulbs: BULBS, quality: QUALITY }, null, 2));
 
 const ticking = results.every((r) => r.ticking);
-const pass = ticking && !!tree?.lit && !!field?.lit;
-console.log(`\nPHASE E GATE: ${pass ? "PASS" : "FAIL"} — ${ticking ? "loops ticking" : "A LOOP STALLED"}` +
-  `${tree ? `, tree path ${tree.lit ? "delivers" : "DEAD"}` : ""}${field ? `, field path ${field.lit ? "delivers" : "DEAD"}` : ""}`);
+const pass = ticking && !!delivery?.lit;
+console.log(`
+PHASE E GATE: ${pass ? "PASS" : "FAIL"} — ${ticking ? "loops ticking" : "A LOOP STALLED"}` +
+  `${delivery ? `, delivery path ${delivery.lit ? "delivers" : "DEAD"}` : ""}`);
 await browser.close();
 process.exit(pass ? 0 : 1);

@@ -27,7 +27,7 @@
 //   COST      the `gtao` pass group's GPU ms, reported.
 //
 //   node scripts/run-gi-gtao-probe.mjs         (vite on :5201)
-//   QUALITY=ultra SETTLE=20000 ARM=raytraced   (A/B against the RTAO arm)
+//   QUALITY=ultra SETTLE=20000
 import path from "node:path";
 import { mkdirSync } from "node:fs";
 import puppeteer from "puppeteer-core";
@@ -38,14 +38,12 @@ const url = process.argv[2] ?? "http://localhost:5201/";
 const QUALITY = process.env.QUALITY ?? "high";
 const SETTLE = Number(process.env.SETTLE ?? 18000);
 const VIEW = (process.env.VIEW ?? "1200x800").split("x").map(Number);
-// "gtao" (default) | "raytraced" | "legacy" — the three arms #armAoTerm can take.
-const ARM = process.env.ARM ?? "gtao";
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const root = path.resolve("scripts/.gi-gtao").replaceAll("\\", "/");
 mkdirSync(root, { recursive: true });
 await makeAoGlossyProject(root, { quality: QUALITY });
-console.log(`rig: 6x3x6 room, ceiling panel only light, contact box + metal sphere; quality ${QUALITY}; arm ${ARM}`);
+console.log(`rig: 6x3x6 room, ceiling panel only light, contact box + metal sphere; quality ${QUALITY}`);
 
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
@@ -71,15 +69,13 @@ page.on("pageerror", (e) => {
   const msg = e.message ?? String(e);
   if (!/save_scene/.test(msg)) { errors++; console.log(`  pageerror: ${msg.slice(0, 300)}`); }
 });
-await page.evaluateOnNewDocument((project, arm) => {
+await page.evaluateOnNewDocument((project) => {
   localStorage.setItem("engine.projectRoot.v1", project);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
   globalThis.__editorKeepRendering = true;
   globalThis.__giConfigOverride = { exactReflections: false };
-  if (arm === "raytraced") globalThis.__giAoRaytraced = true;
-  if (arm === "legacy") globalThis.__giAoLegacy = true;
   if (globalThis.__GTAO_DEBUG) globalThis.__giGtaoDebug = true;
-}, root, ARM);
+}, root);
 if (process.env.THIN !== undefined) {
   await page.evaluateOnNewDocument((t) => { globalThis.__giGtaoThin = t; }, Number(process.env.THIN));
 }

@@ -65,13 +65,6 @@
         // opt-in until this arm's gate proves it).
         globalThis.__giShadowTemporalDebug = true;
         globalThis.__giShadowTemporal = true;
-        // ANALYTIC-WIDTH is the DEFAULT (docs/GI_SHADOWS_PLAN.md §5):
-        // deterministic central-ray march × mid-field distanceTexture width,
-        // NO temporal chain. `?analytic=0` compiles the legacy stochastic
-        // sun-disc + temporal arm instead — that arm's reprojection/counter
-        // gates below only run there.
-        const analyticArm = new URLSearchParams(location.search).get("analytic") !== "0";
-        if (!analyticArm) globalThis.__giShadowAnalyticWidth = false;
         // `?kindmap=1` — FAIL-CLOSED ATTRIBUTION arm: compiles the marcher's
         // verdict SUB-KIND paint (GISystem's "sub" mode) into the sun's shadow
         // channel instead of a shadow, then histograms the raw readback below.
@@ -92,13 +85,6 @@
         // hatch) — that arm gates the voxel record-refit tail, which adoption
         // would legitimately bypass. `?dynobj=1` is the adoption arm.
         if (new URLSearchParams(location.search).get("dynamic") === "1") globalThis.__giDynamicObjects = false;
-        // `?staticbvh=1` — the static-scene BVH shadow arm. Without it the
-        // lightshadow arm pins the RECORD marcher (its pen-variant compile
-        // gate is meaningless under the BVH arm, which replaces that WGSL).
-        const staticBvhArm = new URLSearchParams(location.search).get("staticbvh") === "1";
-        if (new URLSearchParams(location.search).get("lightshadow") === "1" && !staticBvhArm) {
-          globalThis.__giShadowStaticBvh = false;
-        }
         // dynobj=1 → box mover (analytic OBB path); dynobj=2 → torus mover
         // (object-local BVH4 exact-triangle path).
         const dynObjArm = Number(new URLSearchParams(location.search).get("dynobj") ?? 0);
@@ -1204,23 +1190,17 @@
               break;
             }
           }
-          if (planeMode && !penVariantSeen && !staticBvhArm) {
-            throw new Error("lightshadow arm: the pen plane-trace variant never compiled into the resolve");
+          const shadowMarcher = engine.modules.get("gi").system.state.screen?.lightShadow?.marcher ?? "";
+          if (!/static-bvh8/.test(shadowMarcher)) {
+            throw new Error(`lightshadow arm: unexpected marcher "${shadowMarcher}" — the static-BVH8 shadow arm never engaged`);
           }
-          if (staticBvhArm) {
-            const m = engine.modules.get("gi").system.state.screen?.lightShadow?.marcher ?? "";
-            if (!/static-bvh8/.test(m)) {
-              throw new Error(`staticbvh arm: unexpected marcher "${m}" — the static-BVH arm never engaged`);
-            }
-          }
-          // SOFT ARM: the default is the stochastic sun-disc sample (exact
-          // march along a jittered direction — no extra WGSL function), with
-          // the density cone behind __giConeShadowDensity. Assert the bundle
-          // says so, and that the density pyramid still holds REAL fractions
-          // for the hatched arm — cross-checked against the level-0 bits (a
-          // level-1 cell's byte is round(255·popcount(children)/8) exactly).
-          const marcher = engine.modules.get("gi").system.state.screen?.lightShadow?.marcher ?? "";
-          if (analyticArm ? !/analytic-width/.test(marcher) : !/sun-disc|density-cone/.test(marcher)) {
+          // The shipping soft-shadow method is the deterministic analytic
+          // width (docs/GI_SHADOWS_PLAN.md §5). Assert the bundle says so, and
+          // that the density pyramid still holds REAL fractions — cross-checked
+          // against the level-0 bits (a level-1 cell's byte is
+          // round(255·popcount(children)/8) exactly).
+          const marcher = shadowMarcher;
+          if (!/analytic-width/.test(marcher)) {
             throw new Error(`lightshadow arm: unexpected soft-shadow marcher "${marcher}"`);
           }
           const occField = engine.modules.get("gi").system.state.volume.occupancyField;
@@ -1258,82 +1238,29 @@
           // settle window covers at least one frame's worth of geometry.
           const filterPass = engine.modules.get("gi").system.state.screen?.lightShadowFilterPass;
           if (!filterPass) throw new Error("lightshadow arm: filter pass missing from the screen bundle");
-          if (analyticArm) {
-            // ANALYTIC-WIDTH TOPOLOGY GATE: no temporal chain may exist —
-            // one trace pass, one history-free filter straight into the
-            // sampled target — and the width probe's WGSL function must have
-            // compiled into the shadow pass (an invalid pipeline there
-            // silently drops the whole compute batch, so presence of the
-            // function in the composed shader is the compile gate).
-            const sb = engine.modules.get("gi").system.state.screen;
-            if (sb.lightShadowHistoryPass || sb.lightShadowPostPass) {
-              throw new Error("analytic arm: temporal passes were built despite __giShadowAnalyticWidth");
-            }
-            if (filterPass.temporalCounter) {
-              throw new Error("analytic arm: filter pass compiled the temporal counter (history should be null)");
-            }
-            const shadowShader = engine.renderer._nodes?.getForCompute?.(sb.lightShadowPass.compute)?.computeShader ?? "";
-            // Under the kind-map paint the trace returns before the width
-            // probe multiply, so the probe legitimately never enters the graph.
-            if (!kindMap && !/giShadowWidthProbe/.test(shadowShader)) {
-              throw new Error("analytic arm: the width probe never compiled into the shadow pass");
-            }
-            console.log(
-              `GI-SMOKE LIGHTSHADOW-ANALYTIC marcher="${marcher}" widthProbe=compiled ` +
-              `temporalPasses=none pen-variant=${penVariantSeen ? "compiled" : "n/a (non-plane mode)"}`,
-            );
-          } else {
-          if (!filterPass.temporalCounter) throw new Error("lightshadow arm: temporal debug counter not compiled");
-          const readValid = async () =>
-            Array.from(new Uint32Array(await engine.renderer.getArrayBufferAsync(filterPass.temporalCounter.value)));
-          const screenBundle = engine.modules.get("gi").system.state.screen;
-          const shadowPixels = screenBundle.shadowWidth * screenBundle.shadowHeight;
-          // GROUND-TRUTH CONVENTION CHECK (temporary diagnostic): read back a
-          // gbuffer row, project each texel's stored world position with the
-          // camera VP in JS, and report where it lands vs its own pixel.
-          {
-            const gb = screenBundle.gbuffer;
-            const W = screenBundle.width, H = screenBundle.height;
-            const row = Math.floor(H / 2);
-            const pixels = await engine.renderer.readRenderTargetPixelsAsync(gb.rt, 0, row, W, 1, 0);
-            const cam = engine.camera;
-            cam.updateMatrixWorld(true);
-            const vp = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
-            const offsets = [];
-            for (let x = 0; x < W; x += 13) {
-              const w = pixels[x * 4 + 3];
-              if (w < 0.5) continue;
-              const p = new THREE.Vector4(pixels[x * 4], pixels[x * 4 + 1], pixels[x * 4 + 2], 1).applyMatrix4(vp);
-              if (p.w <= 0) continue;
-              const hx = (p.x / p.w * 0.5 + 0.5) * W;
-              const hyUp = (p.y / p.w * 0.5 + 0.5) * H;
-              const hyDown = (0.5 - p.y / p.w * 0.5) * H;
-              offsets.push(`x=${x}: hx=${hx.toFixed(1)} hyUp=${hyUp.toFixed(1)} hyDown=${hyDown.toFixed(1)} (row=${row})`);
-            }
-            console.log(`GI-SMOKE REPROJ-TRUTH ${offsets.slice(0, 6).join(" | ")}`);
+          // ANALYTIC-WIDTH TOPOLOGY GATE: no temporal chain may exist —
+          // one trace pass, one history-free filter straight into the
+          // sampled target — and the width probe's WGSL function must have
+          // compiled into the shadow pass (an invalid pipeline there
+          // silently drops the whole compute batch, so presence of the
+          // function in the composed shader is the compile gate).
+          const sb = engine.modules.get("gi").system.state.screen;
+          if (sb.lightShadowHistoryPass || sb.lightShadowPostPass) {
+            throw new Error("lightshadow arm: temporal passes were built despite the analytic-width default");
           }
-          // The page stopped the engine after the stats settle (line ~162) —
-          // every other assert reads state ACCUMULATED during boot, but this
-          // gate needs live frames. Restart for the window, stop again after.
-          engine.start();
-          const v0 = await readValid();
-          await new Promise((resolve) => setTimeout(resolve, 800));
-          const v1 = await readValid();
-          engine.stop();
-          const funnel = v1.map((v, i) => v - v0[i]);
-          if (funnel[0] < shadowPixels * 0.5) {
-            throw new Error(
-              `lightshadow arm: temporal reprojection nearly never validates — window delta: ` +
-              `threads=${funnel[1]} inBounds=${funnel[2]} histGeom=${funnel[3]} valid=${funnel[0]} ` +
-              `of ${shadowPixels}px/frame; absolute v0=[${v0}] v1=[${v1}]`,
-            );
+          if (filterPass.temporalCounter) {
+            throw new Error("lightshadow arm: filter pass compiled the temporal counter (history should be null)");
+          }
+          const shadowShader = engine.renderer._nodes?.getForCompute?.(sb.lightShadowPass.compute)?.computeShader ?? "";
+          // Under the kind-map paint the trace returns before the width
+          // probe multiply, so the probe legitimately never enters the graph.
+          if (!kindMap && !/giShadowWidthProbe/.test(shadowShader)) {
+            throw new Error("lightshadow arm: the width probe never compiled into the shadow pass");
           }
           console.log(
-            `GI-SMOKE LIGHTSHADOW pen-variant=${penVariantSeen ? "compiled" : "n/a (non-plane mode)"} ` +
-            `marcher="${marcher}" densityCells=${densityCells} partial=${partialCells} mismatches=0 ` +
-            `temporalValid=${funnel[0]} threads=${funnel[1]} inBounds=${funnel[2]} loose=${funnel[3]} of ${shadowPixels}px/frame over the window`,
+            `GI-SMOKE LIGHTSHADOW-ANALYTIC marcher="${marcher}" widthProbe=compiled ` +
+            `temporalPasses=none pen-variant=${penVariantSeen ? "compiled" : "n/a (non-plane mode)"}`,
           );
-          }
           if (kindMap) {
             // Read the RAW trace target (pre-filter — the bilateral would
             // smear the class bytes). The paint is deterministic per frame,
@@ -1504,62 +1431,6 @@
               throw new Error(
                 `[J] did not shrink with the bounce off (${jWith} vs ${jWithout} bytes) — the ` +
                 "gather is being built regardless of the flag",
-              );
-            }
-
-            // ── THE SPLIT ITSELF, AS A SIZE A/B (§12.53) ──────────────────
-            //
-            // The unit's claim is that the deposit stopped being the monster:
-            // ONE pipeline of it measured 49-56 s of a cold boot, and moving
-            // `shadeHit` into [J] is what was supposed to fix it. So the
-            // pre-split kernel is rebuilt HERE, in the same page and on the
-            // same adapter, and the shrink is asserted rather than remembered
-            // from another process (§13.14: the same kernel has read 47 s and
-            // 238 s across runs — a cross-process compile comparison in this
-            // module has never once been meaningful).
-            //
-            // The number to watch is the CRITICAL PATH: kernels compile in
-            // parallel, so what a boot waits on is the biggest one, and the
-            // split only pays if `max([E], [J])` beats the un-split [E].
-            globalThis.__giSrcSplitShade = false;
-            const uns = sp.setSize(sp.width + 4, sp.height);
-            const unsplitDeposit = wgslOf(uns.deposit.scatter).length;
-            const unsplitJ = uns.secondary ? wgslOf(uns.secondary.pass).length : 0;
-            const unsplitShades = !!uns.shading && !uns.shading.split;
-            uns.dispose();
-            globalThis.__giSrcSplitShade = undefined;
-            const splitPath = Math.max(withSecondary, jWith);
-            srcReport.shadeSplit = {
-              unsplitDeposit, unsplitJ, splitDeposit: withSecondary, splitJ: jWith,
-              criticalPath: splitPath, criticalRatio: +(splitPath / Math.max(1, unsplitDeposit)).toFixed(4),
-            };
-            console.log(
-              `GI-SMOKE STORAGE shade-split [E] ${(withSecondary / 1024).toFixed(1)}kB + [J] ` +
-              `${(jWith / 1024).toFixed(1)}kB vs UNSPLIT [E] ${(unsplitDeposit / 1024).toFixed(1)}kB` +
-              ` — critical path ${(splitPath / 1024).toFixed(1)}kB ` +
-              `(${(splitPath / Math.max(1, unsplitDeposit)).toFixed(3)}x)`,
-            );
-            if (!unsplitShades) {
-              throw new Error(
-                "`__giSrcSplitShade = false` did not rebuild the one-kernel deposit — the R12 " +
-                "hatch for the shading split is dead, and with it the only in-process A/B of it",
-              );
-            }
-            if (unsplitJ) {
-              throw new Error("the un-split arm built a [J] — it has nothing to put in one, and its hit list is not filled");
-            }
-            // The whole point, as one inequality.
-            if (!(withSecondary < unsplitDeposit * 0.75)) {
-              throw new Error(
-                `the split left [E] at ${(withSecondary / 1024).toFixed(1)}kB against the un-split ` +
-                `${(unsplitDeposit / 1024).toFixed(1)}kB — the shading did not actually leave the deposit`,
-              );
-            }
-            if (!(splitPath < unsplitDeposit)) {
-              throw new Error(
-                `the split's biggest kernel (${(splitPath / 1024).toFixed(1)}kB) is no smaller than ` +
-                `the un-split deposit (${(unsplitDeposit / 1024).toFixed(1)}kB) — the monster moved ` +
-                "instead of shrinking, and a boot waits on the biggest kernel",
               );
             }
           }

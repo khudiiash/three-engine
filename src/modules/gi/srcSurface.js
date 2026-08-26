@@ -182,7 +182,7 @@ const EMISSIVE_EPSILON = 1e-4;
  *   `surfaceRevision`; never for its slot NUMBERS — see the header.
  * @param {object} [options]
  * @param {() => Array<object|null>} [options.emitterMeshes] the NEE emitter set,
- *   as meshes, index-aligned with the `emitters` array `createSrcHitShader`
+ *   as meshes, index-aligned with the `emitters` array `createSrcHitLighting`
  *   gets. Interior nulls are expected (`_emitterInfos` parks seats).
  * @param {{retried?: (n) => void, missed?: (n) => void}} [options.count]
  * @param {boolean} [options.crossNumbering] TEST ONLY. Writes the palette under

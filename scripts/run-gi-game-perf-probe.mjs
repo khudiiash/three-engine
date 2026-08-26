@@ -123,7 +123,6 @@ const samplePhase = (frames) => page.evaluate(async (FRAMES) => {
     frameMsMax: at(1),
     emitters: sys?._emitterInfos?.length ?? 0,
     adoptedMovers: sys?._dynSet?.count?.() ?? -1,
-    occluderSlots: sys?._moverOccluders?.count?.value ?? 0,
     oracle: o ? { ready: o.ready?.length ?? 0, pending: o.queue?.length ?? 0 } : null,
     quietFrames: sys?._fieldQuietFrames ?? -1,
   };
