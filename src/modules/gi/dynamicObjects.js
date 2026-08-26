@@ -1380,6 +1380,15 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
   // returns the tile-centre UV there, so a scene that never asked for one is
   // bit-identical to the pre-§18.17 picture.
   const staticUvBaseUniform = uniform(0, "uint");
+  // §19 D3 — the slot-disable mask's absolute word index, as a UNIFORM.
+  // `baseWord` is `occupancyField.dynamicObjectWordOffset`, which MOVES WITH
+  // THE GRID RESOLUTION: baked as a literal it is a scene-dependent constant
+  // sitting inside the traversal call of every kernel that casts a static
+  // shadow ray, so two projects whose shaders are otherwise byte-identical
+  // miss each other's shader cache on the grid alone. Set once here — the
+  // value is fixed for the life of the set — so it costs one more uniform
+  // read on a call that already does two.
+  const staticMaskBaseUniform = uniform(baseWord + STATIC_MASK_WORD_BASE, "uint");
 
   // Persistent header-sync compute: uniform vec4s → bitcast f32 words in the
   // bits region (mask words pass through raw). Its own pipeline, 3 bindings —
@@ -1933,7 +1942,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       return bvh8MaskedTraceWgsl(
         vec3(origin), vec3(dir), float(tMin), float(tMax),
         staticNodeBaseUniform, staticTriBaseUniform,
-        uint(baseWord + STATIC_MASK_WORD_BASE), uint(anyHit ? 1 : 0), bits,
+        staticMaskBaseUniform, uint(anyHit ? 1 : 0), bits,
       ).toVar();
     },
 
@@ -1953,7 +1962,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       return bvh8ClosestSlotTraceWgsl(
         vec3(origin), vec3(dir), float(tMin), float(tMax),
         staticNodeBaseUniform, staticTriBaseUniform, staticUvBaseUniform,
-        uint(baseWord + STATIC_MASK_WORD_BASE), bits,
+        staticMaskBaseUniform, bits,
       ).toVar();
     },
 

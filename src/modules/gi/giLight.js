@@ -1379,7 +1379,13 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint, penumbraOut =
   // UNSHADOWED rather than not at all, a deliberate, BOUNDED exception to the
   // "too dim to trace ⇒ too dim to show" rule above: the leak is capped at
   // scale × cutoff luma, and only inside reflections.
-  const traceCut = emitterCutoff(params) * (params.traceCutoffScale ?? 1);
+  // §19 D3: the product may arrive as a NODE — `params.traceCutoff`, a uniform
+  // whose VALUE the caller computes once at build time. A preset- or
+  // scene-derived number baked into the WGSL text makes every scene a fresh
+  // shader-cache miss for a kernel that is otherwise byte-identical; a uniform
+  // costs one buffer read and holds the text still. The JS product stays for
+  // every caller that has no uniform to hand over.
+  const traceCut = params.traceCutoff ?? (emitterCutoff(params) * (params.traceCutoffScale ?? 1));
   If(
     slot.radius.greaterThan(0.001)
       .and(cosTheta.greaterThan(0.05))
@@ -1403,8 +1409,16 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint, penumbraOut =
       // a reflection — exact; occluders beyond the cap stop occluding (soft,
       // spatially plausible leak, reflections only).
       const rawMaxT = emitterSurfaceT(slot, samplePoint, rayDir, rayDist).sub(params.shadowMargin).max(0);
-      const marchCap = Number(params.maxTraceDistance);
-      const maxT = Number.isFinite(marchCap) && marchCap > 0 ? rawMaxT.min(marchCap).toVar() : rawMaxT;
+      // §19 D3: a node here too (same reason as `traceCut` above) — the
+      // reflection-hit cap is a WORLD DISTANCE, and world distances belong in
+      // uniforms whether they are derived from the volume or, as today, still
+      // a constant waiting to be.
+      const capNode = params.maxTraceDistance;
+      const capIsNode = capNode?.isNode === true;
+      const marchCap = capIsNode ? Number.NaN : Number(capNode);
+      const maxT = capIsNode
+        ? rawMaxT.min(capNode).toVar()
+        : (Number.isFinite(marchCap) && marchCap > 0 ? rawMaxT.min(marchCap).toVar() : rawMaxT);
       If(maxT.greaterThan(params.shadowMargin), () => {
         // Self-exclusion covers ONLY the lamp's own body + a couple of
         // field cells. Sphere slots: the bounding sphere ×1.5 (their body

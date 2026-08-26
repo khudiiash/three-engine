@@ -63,7 +63,7 @@ import {
   vec3,
   vec4,
 } from "three/tsl";
-import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt, emitterSlotShadow } from "./giLight.js";
+import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterCutoff, emitterDirectAt, emitterSlotShadow } from "./giLight.js";
 import { octDecodeTSL } from "./rayHit/rayHitTSL.js";
 import { DEBUG_LAYER, EDITOR_LAYER, GI_DEPTH_LAYER, GI_SHARP_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { readRenderTargetImage } from "../../engine/renderTargetImage.js";
@@ -830,6 +830,28 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
  */
 export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveWidth = width, resolveHeight = height, gather = null, cameraPosition = null, normalOffset, intensity, emitter = null, rawCopy = null, probes = null, sourceStride = 1, termMask = null, staticOcclude = null, dynOcclude = null, shadowReach = null }) {
   const widthU = uniform(width, "uint");
+  // ── §19 D3: THIS KERNEL'S WORLD NUMBERS ARE UNIFORMS, NOT WGSL LITERALS ───
+  //
+  // Built HERE, outside the `Fn`, so the value is unmistakably per-BUILD (one
+  // write when the pass is created) and the text is the same string on every
+  // scene. Baking a preset- or scene-derived float into the WGSL means two
+  // projects that differ only in their emitter cutoff miss each other's
+  // shader cache on a 226 kB kernel, for a number the GPU could have read
+  // from a buffer.
+  //
+  // `normalOffset` needs nothing here: GISystem already hands it over as a
+  // node (`volume.world.cellMax.mul(1.2).max(0.1)` — verified in the dumped
+  // WGSL as `max(nodeUniform * 1.2, 0.1)`), so only its two tuning constants
+  // are literals and those do not move with the scene.
+  const hitTraceScale = Number.isFinite(Number(globalThis.__giHitEmitterTraceScale))
+    ? Number(globalThis.__giHitEmitterTraceScale)
+    : 24;
+  // The PRODUCT, not the factors: `emitterSlotShadow` compares luma against
+  // `cutoff x scale` and nothing needs either half on its own.
+  const hitTraceCutU = uniform(emitterCutoff(emitter) * hitTraceScale);
+  const hitMarchCapU = uniform(Number.isFinite(Number(globalThis.__giHitEmitterMarchCap))
+    ? Number(globalThis.__giHitEmitterMarchCap)
+    : 16);
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
   const bvhTNode = texture(bvhShade.hit);
@@ -1010,9 +1032,9 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
                   recordShadowTrace: globalThis.__giHitRecordShadows === false
                     ? null
                     : (emitter.recordShadowTrace ?? null),
-                  traceCutoffScale: Number.isFinite(Number(globalThis.__giHitEmitterTraceScale))
-                    ? Number(globalThis.__giHitEmitterTraceScale)
-                    : 24,
+                  // §19 D3: the cutoff x scale product, as a uniform built at
+                  // the top of this function.
+                  traceCutoff: hitTraceCutU,
                   // ── §18.14: 4 m → 16 m (2026-08-25) ────────────────────────
                   //
                   // MEASURED, not guessed. The §18.13 colour probe read back
@@ -1046,9 +1068,10 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
                   // honest follow-up is to derive it from the GI volume extent,
                   // which GISystem knows and this kernel does not.
                   // `__giHitEmitterMarchCap` is the A/B.
-                  maxTraceDistance: Number.isFinite(Number(globalThis.__giHitEmitterMarchCap))
-                    ? Number(globalThis.__giHitEmitterMarchCap)
-                    : 16,
+                  // §19 D3: a uniform now, so the day it IS derived from the
+                  // volume extent the derivation is the only thing that
+                  // changes — not the kernel's text.
+                  maxTraceDistance: hitMarchCapU,
                 }
               : { ...emitter, shadowSample: () => float(1) };
             // Term 3 of 4.
