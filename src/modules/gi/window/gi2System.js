@@ -201,6 +201,31 @@ export function buildGi2Palette(surfaces) {
  * @param {{sky: object, ao: object}} [opts.env]
  * @param {object} [opts.shared]    cross-rebuild cache (the soup and its worker)
  */
+/**
+ * ⭐⭐ §19 STAGE 4.1 — WHY A RESIZE MUST STAMP A VERSION ON ITS NEW TEXTURES.
+ *
+ * three invalidates a cached bind group ONLY when
+ * `binding.generation !== textureData.generation` (Bindings.js:380), and
+ * `textureData.generation` is just `texture.version` (Textures.js:310). A
+ * freshly constructed `StorageTexture` has version 0 — so repointing
+ * `_giRadianceNode.value` from one brand-new texture to another is INVISIBLE to
+ * that check (`NodeSampledTexture.update()` returning true only re-reads the
+ * value; it does not force the rebind), and every material's cached bind group
+ * keeps naming the PREVIOUS texture. Destroy that texture and every later
+ * submit fails with
+ *
+ *   Destroyed texture [Texture "gi2Glossy"] used in a submit
+ *
+ * — measured on this exact tree: 212 of them across four resize hops WITH the
+ * deferred-retire queue already in place. ⭐⭐ THE QUEUE ALONE ONLY MOVES THE
+ * CRASH THREE FRAMES LATER, because the stale binding is never repaired; the
+ * unique version is what makes the swap actually rebind. `createGiTargets`
+ * learned this on the SRC path (`++targetGeneration`) and the GI2 gather was
+ * built without it. Storage textures take the `createTexture` branch regardless
+ * of version, so nothing else changes.
+ */
+let gi2TextureGeneration = 0;
+
 export function createGi2System({
   renderer, engine, tier = "high", resolveWidth, resolveHeight, gbuffer,
   lights = null, emitters = null, lightTree = null, env = null, shared = null,
@@ -274,6 +299,8 @@ export function createGi2System({
       aoOut.generateMipmaps = false;
       aoOut.minFilter = THREE.NearestFilter;
       aoOut.magFilter = THREE.NearestFilter;
+      // THE MATERIAL-FACING IRRADIANCE WHEN AO IS ON — see gi2TextureGeneration.
+      aoOut.version = ++gi2TextureGeneration;
     }
     gather = createGiGather({
       win, trace, cache,
@@ -298,6 +325,13 @@ export function createGi2System({
       // `emitterDirectPass` below reads, same solid-angle expression.
       emitters: emitters ?? null,
     });
+    // ⭐⭐ THE REBIND STAMP (see `gi2TextureGeneration`). Only the two textures
+    // MATERIALS sample need it — `irradiance` (when AO is off it is the one
+    // `_giIrradianceNode` points at) and `glossy` (`_giRadianceNode`). `lit` and
+    // the two halves are read by COMPUTE passes, which are re-recorded every
+    // frame off the live node and were never able to go stale.
+    gather.textures.irradiance.version = ++gi2TextureGeneration;
+    gather.textures.glossy.version = ++gi2TextureGeneration;
     gather.uniforms.projScale.value = projScaleOf(camera, height);
     // The Cornell panel is the harness rig's emitter and has no scene source.
     // Zeroed ONCE, at build: `shadeHit`'s panel NEE then contributes nothing
@@ -738,6 +772,80 @@ export function createGi2System({
     return { before, after, all: [...before, ...after] };
   };
 
+  // ══════════════════════════════════════════════ RESIZE HANDS THE OLD GATHER OVER
+  //
+  // ⭐⭐ A RESIZE MAY NOT DESTROY A TEXTURE THE SCENE PASS IS ABOUT TO SAMPLE.
+  //
+  // `gi2Glossy` and `gi2Irradiance` are read by EVERY material in the scene,
+  // through the persistent `_giRadianceNode` / `_giIrradianceNode`. Repointing
+  // `.value` is not enough on its own: Stage 1.2 removed the per-object bind
+  // group refresh, so a material that was already bound for this frame still
+  // names the PREVIOUS texture when the scene pass is encoded. Destroying it
+  // inside `setSize` — which runs from `#tick`, i.e. strictly BEFORE the frame
+  // is encoded — is therefore a use-after-free, and WebGPU reports it as
+  //
+  //   Destroyed texture [Texture "gi2Glossy"] used in a submit
+  //
+  // on the user's editor every time the frame governor moves the resolve
+  // (~30 s apart on Bistro). The old path never hit it because
+  // `createGiTargets` keeps texture IDENTITY across a resize (§19 0.5b) —
+  // `StorageTexture.setSize` drops only the GPU texture, so three re-creates
+  // the bind group off the same JS object — and `#retireTargets` defers the
+  // real destroy by three frames on top of that.
+  //
+  // The gather cannot keep identity yet (its factory mints its own textures and
+  // takes none), so it takes the OTHER half: NOTHING HERE IS DESTROYED ON THE
+  // SPOT. The dead gather — its five textures, the AO output, its own storage
+  // buffers and every compute node bound to them — is parked on `retired`, and
+  // GISystem takes it into the SAME three-frame queue (`#retireTargets`), which
+  // frees it only after the frames that can still name it have been submitted.
+  //
+  // ⚠ THE LIST IS SCOPED TO WHAT THE RESIZE ACTUALLY REPLACED. `win`, `cache`,
+  // the voxelizer and the soup all SURVIVE a resize, so `passesForRelease()`
+  // and the `storageAttributes` getter — which publish those too — must NOT be
+  // used here: releasing a survivor's buffer is the same crash wearing a
+  // different message ("Destroyed buffer used in a submit").
+  //
+  // ⚠ `__gi2ResizeDisposeNow = true` RESTORES THE BROKEN BEHAVIOUR ON PURPOSE.
+  // A fix for a crash is only believable next to a run that still crashes:
+  // without this hatch `run-gi-resize-probe`'s "0 uncaptured device errors"
+  // could equally mean "the listener never attached", which is the blind-
+  // instrument reading this project has been burned by before. It is the arm,
+  // not an option — nothing should ever ship with it set.
+  const retired = [];
+  const retireGather = (dead, deadAo, deadNodes) => {
+    if (!dead && !deadAo) return;
+    if (globalThis.__gi2ResizeDisposeNow === true) {
+      dead?.dispose();
+      deadAo?.dispose();
+      return;
+    }
+    const storageAttributes = dead
+      ? Object.values(dead.buffers).map((b) => b?.value).filter((a) => a?.isBufferAttribute === true)
+      : [];
+    const computeNodes = [];
+    if (dead) {
+      for (const p of Object.values(dead.passes)) {
+        if (Array.isArray(p)) computeNodes.push(...p);
+        else computeNodes.push(p);
+      }
+    }
+    for (const n of deadNodes ?? []) computeNodes.push(n);
+    retired.push({
+      storageAttributes,
+      computeNodes: computeNodes.filter((n) => n?.isComputeNode === true),
+      // ⭐⭐ THE TEXTURES MATERIALS ARE STILL BOUND TO. Repointing the persistent
+      // nodes does NOT reach a material's bind group on the GI2 path — see
+      // GISystem#rebindStaleGiTextures, which walks these to force the rebind
+      // three would have done itself if the per-object refresh still existed.
+      materialTextures: [dead?.textures.irradiance, dead?.textures.glossy, deadAo].filter(Boolean),
+      dispose() {
+        dead?.dispose();
+        deadAo?.dispose();
+      },
+    });
+  };
+
   const setSize = (w, h) => {
     const nw = Math.max(16, Math.round(w));
     const nh = Math.max(16, Math.round(h));
@@ -746,12 +854,17 @@ export function createGi2System({
     height = nh;
     const old = gather;
     const oldAo = aoOut;
+    // ⚠ CAPTURED BEFORE `buildGather()`, WHICH REASSIGNS BOTH. `emitterDirect`
+    // binds `gather.buffers.probeMeta` and `aoCompose` binds
+    // `gather.textures.irradiance` + `aoOut`; both belong to the DEAD gather and
+    // are re-minted against the new one, so both are retired with it.
+    const oldEmitterDirect = emitterDirect;
+    const oldAoCompose = aoCompose;
     aoOut = null;
     aoCompose = null;
     buildGather();
-    oldAo?.dispose();
     stampVoxNames();
-    old?.dispose();
+    retireGather(old, oldAo, [oldEmitterDirect, oldAoCompose]);
     return true;
   };
 
@@ -911,6 +1024,22 @@ export function createGi2System({
     get computeNodes() {
       return passesForRelease();
     },
+    /**
+     * The bundles a resize orphaned, handed over ONCE (the list is emptied).
+     *
+     * Same contract the occupancy field's `takeRetiredStorageAttributes` has,
+     * and for the same reason: this module has no way to know when a frame is
+     * safely past a submit, and GISystem's `#retireTargets` queue does. Each
+     * bundle is exactly that queue's shape — `{storageAttributes, computeNodes,
+     * dispose()}`. Returns `null` when there is nothing to hand over, so the
+     * caller's per-tick sweep costs one property read.
+     */
+    takeRetired() {
+      if (retired.length === 0) return null;
+      const out = retired.slice();
+      retired.length = 0;
+      return out;
+    },
     build, setSize, setCamera, setMovers, passes, stats, snapshot, describe,
     /**
      * How often the caller should pay for a `stats()` readback, in frames.
@@ -952,6 +1081,12 @@ export function createGi2System({
     },
     dispose() {
       disposed = true;
+      // A bundle the caller never took (a rebuild landing within a tick of a
+      // resize). `dispose()` itself only ever runs FROM the retire queue —
+      // GISystem hands this whole system to `#retireTargets` — so by here the
+      // deferral has already been paid and destroying is safe.
+      for (const bundle of retired) bundle.dispose();
+      retired.length = 0;
       aoOut?.dispose();
       aoOut = null;
       gather?.dispose();

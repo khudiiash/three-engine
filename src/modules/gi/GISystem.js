@@ -2306,6 +2306,14 @@ export class GISystem {
       const stale = this.state?.volume?.occupancyField?.takeRetiredStorageAttributes?.();
       if (stale) this.#retireStorageAttributes(stale);
     }
+    // §19 Stage 4.1 — and the same hand-over for GI2's gather (see the resize
+    // path). The resize branch takes its bundle on the spot; this sweep is the
+    // guarantee that a future second `setSize` caller cannot reintroduce
+    // "Destroyed texture gi2Glossy used in a submit" by forgetting to.
+    {
+      const orphaned = this.state?.screen?.gi2?.takeRetired?.();
+      if (orphaned) for (const bundle of orphaned) this.#retireTargets(bundle);
+    }
 
     // BOOT AMBIENT (the `bootAmbient` prop, DEFAULT OFF — a module may not put
     // light in a scene the author cannot see or switch off). When on, a neutral
@@ -8218,8 +8226,48 @@ export class GISystem {
       // nodes rather than minting new ones, which is what keeps a viewport drag
       // from re-keying every material that samples them.
       if (this._gi2?.setSize(width, height)) {
+        // ⭐⭐ AND THE GATHER IT JUST REPLACED IS RETIRED, NEVER DESTROYED.
+        //
+        // The two lines below repoint the persistent nodes, but a material that
+        // is ALREADY BOUND for this frame still names the previous textures
+        // when the scene pass is encoded — Stage 1.2 removed the per-object
+        // bind group refresh that used to hide this. `setSize` running inside
+        // `#tick` is therefore strictly before the submit that reads them, and
+        // destroying the old gather there is what produced
+        //
+        //   Destroyed texture [Texture "gi2Glossy"] used in a submit
+        //
+        // on the user's Bistro every time the governor moved the resolve. The
+        // SRC path never showed it because `createGiTargets` keeps texture
+        // identity across a resize; the gather cannot, so it hands the corpse
+        // over instead and this queue frees it three frames later.
+        //
+        // ⚠ THE QUEUE IS THE MARGIN, NOT THE REPAIR. What actually re-points a
+        // material at the new textures is the unique `version` gi2System stamps
+        // on them (see `gi2TextureGeneration` there) — without it three's
+        // generation check never fires, the cached bind group keeps the old
+        // texture forever, and this queue only moves the failure three frames
+        // downstream. Measured: 212 destroyed-texture errors over four hops
+        // with the queue alone.
+        const retiredGathers = this._gi2.takeRetired?.() ?? [];
+        // ⚠ AND THE CACHED CHAIN DIES WITH THE GATHER IT NAMES. `_gi2Passes` is
+        // normally rebuilt every tick, but `#tick` has early-outs ABOVE that
+        // rebuild (a compile wave, a missing renderer) while the render path
+        // below still dispatches whatever `_gi2Passes` last held. Three frames
+        // after a resize the retire queue frees the dead gather's buffers, and
+        // a chain still naming them submits "[Buffer …] used in submit while
+        // destroyed" from `computeGroup_*` — measured once on this tree. Null it
+        // so a stale chain cannot be dispatched at all.
+        this._gi2Passes = null;
         if (this._giIrradianceNode) this._giIrradianceNode.value = this._gi2.textures.irradiance;
         if (this._giRadianceNode) this._giRadianceNode.value = this._gi2.textures.glossy;
+        // ⭐⭐ AND NOW THE REBIND — THE ONLY THING THAT ACTUALLY REPAIRS A
+        // MATERIAL. Order matters: the nodes above must already carry the new
+        // textures, because the rebind reads them THROUGH the nodes.
+        for (const bundle of retiredGathers) {
+          this.#rebindStaleGiTextures(bundle.materialTextures);
+          this.#retireTargets(bundle);
+        }
       }
     } else if (tileCutOk) {
       screen.resolve.setSize(width, height, screen.ao?.width ?? width, screen.ao?.height ?? height, tileScale);
@@ -9112,6 +9160,79 @@ export class GISystem {
     return list.length;
   }
 
+  /**
+   * ⭐⭐ §19 STAGE 4.1 — FORCE THE MATERIAL BIND GROUPS OFF A DEAD GI TEXTURE.
+   *
+   * ## Why repointing the node is not enough, and why the retire queue is not
+   * enough either
+   *
+   * Every material samples GI through the persistent `_giIrradianceNode` /
+   * `_giRadianceNode`, and a GI2 resize gives them BRAND NEW textures (the
+   * gather mints its own; only `createGiTargets` on the SRC path can resize in
+   * place). Three propagates such a swap in exactly one place — `Bindings.
+   * _update`, reached from `Bindings.updateForRender` — and `Renderer` calls
+   * that ONLY when `this._nodes.needsRefresh(renderObject)` is true
+   * (Renderer.js:3707). **§19 Stage 1.2 removed the per-object refresh** (the
+   * SRC path kept it alive for free: `giMonitorNode` forced `hasNode`, so
+   * `needsRefresh` was true every frame and every swap self-healed). Without
+   * it nothing re-reads the node, and the cached GPU bind group keeps naming
+   * the previous texture for the life of the render object.
+   *
+   * ⛔ AND DISPOSING THE OLD TEXTURE DOES NOT REPAIR IT — it is what detonates
+   * it. `Textures._destroyTexture` walks `textureData.bindGroups` and clears
+   * `bindingsData.groups` / `.versions`, which is only the CACHE ARRAY;
+   * `bindingsData.group`, the bind group actually bound at draw time, is set
+   * exclusively inside `WebGPUBindingUtils.createBindings` and is left
+   * untouched. So the draw keeps submitting a destroyed texture — measured
+   * here as 238 uncaptured `Destroyed texture [Texture "gi2Glossy"] used in a
+   * submit` errors over four resize hops WITH the three-frame retire queue in
+   * place. ⭐⭐ **A DEFERRED DESTROY BUYS TIME FOR A REPAIR THAT HAS TO ACTUALLY
+   * HAPPEN; on its own it only moves the failure three frames downstream.**
+   *
+   * ## What this does
+   *
+   * The dead texture's own `bindGroups` set is the only enumeration of who
+   * bound it. For each, run three's own `Bindings._update`: the binding's
+   * `NodeSampledTexture.update()` re-reads `textureNode.value` (now the live
+   * texture), `updateTexture` materialises it, the generation test fires —
+   * because `gi2System` stamps a unique `version` on every new GI texture, see
+   * `gi2TextureGeneration` — and `backend.updateBindings` re-creates the GPU
+   * bind group. Exactly the work the removed per-object refresh used to do,
+   * paid once per resize instead of once per object per frame.
+   *
+   * Defensive throughout: these are three's underscore-private caches, and a
+   * rename must degrade to "the old bug", never to a crash mid-resize.
+   *
+   * @param {?Array<any>} textures the textures being retired
+   * @returns {number} how many bind groups were re-created
+   */
+  #rebindStaleGiTextures(textures) {
+    if (!textures?.length) return 0;
+    const renderer = this.engine?.renderer;
+    const bindings = renderer?._bindings;
+    const store = renderer?._textures;
+    if (typeof bindings?._update !== "function" || typeof store?.has !== "function") return 0;
+    let repaired = 0;
+    for (const texture of textures) {
+      if (!texture || store.has(texture) !== true) continue;
+      // A COPY: `_update` can add this bind group to the NEW texture's own set,
+      // and mutating a Set while iterating it is undefined behaviour.
+      const groups = store.get(texture)?.bindGroups;
+      if (!groups) continue;
+      for (const bindGroup of [...groups]) {
+        try {
+          bindings._update(bindGroup, [bindGroup]);
+          repaired++;
+        } catch { /* a three rename must degrade to the old bug, not a crash */ }
+      }
+    }
+    if (repaired > 0 && globalThis.__giLogComputeRelease === true) {
+      console.log(`[gi] §19 4.1: rebound ${repaired} bind groups off ${textures.length} retired GI textures`);
+    }
+    this._giRebindings = (this._giRebindings ?? 0) + repaired;
+    return repaired;
+  }
+
   #drainRetiredTargets() {
     if (this._retiredAttributes.length > 0) {
       const renderer = this.engine?.renderer;
@@ -9128,6 +9249,21 @@ export class GISystem {
     const keep = [];
     for (const entry of this._retiredTargets) {
       if (--entry.ttl > 0 || globalThis.__giKeepRetiredTargets) { keep.push(entry); continue; }
+      // §19 Stage 4.1 — a bundle may also OWN COMPUTE NODES, and they go FIRST.
+      //
+      // The GI2 gather is the case this was added for: a resize replaces it
+      // whole, and its ~20 kernels hold the bind groups that reference the very
+      // buffers the next branch destroys. `releaseComputeNodes` is what frees a
+      // bind group; destroying the buffer under a live one leaks the group and
+      // (before this queue) failed the next submit. No `harvest` set is passed
+      // deliberately — the harvest would sweep up the WINDOW and CACHE buffers
+      // the dead kernels also bound, which SURVIVE the resize. The bundle's own
+      // `storageAttributes` is the owner-scoped list, and its author owns that
+      // diff (the same contract `#retireStorageAttributes` states).
+      const ownedNodes = entry.targets?.computeNodes;
+      if (Array.isArray(ownedNodes) && ownedNodes.length) {
+        releaseComputeNodes(renderer, ownedNodes);
+      }
       // A retired bundle may OWN storage buffers as well as textures — the BVH
       // scene is five of them and the largest single allocation a rebuild
       // makes. `dispose()` only ever reached its atlas texture.

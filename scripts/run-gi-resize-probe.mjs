@@ -90,12 +90,48 @@ page.on("pageerror", (e) => {
   const msg = e.stack ?? e.message ?? String(e);
   if (!/save_scene/.test(msg)) console.log(`  pageerror: ${msg.slice(0, 300)}`);
 });
+// ⭐⭐ §19 Stage 4.1 — THE ERROR THIS PROBE COULD NOT SEE.
+//
+// A resize that destroys a texture a material's bind group still names does not
+// throw, does not reject and does not reach `pageerror`: WebGPU reports it on
+// the DEVICE, and the user reads it as
+//
+//   [gpu] UNCAPTURED DEVICE ERROR: Destroyed texture [Texture "gi2Glossy"]
+//   used in a submit.
+//
+// Every column this probe already prints (pipelines, modules, textures, heap)
+// is CLEAN while that fires every 30 seconds, so the probe was blind to the one
+// failure a resize actually produces. Counted twice on purpose — once from the
+// console line the engine's own handler prints, once from a listener on the
+// device itself (below) — because either half can be silenced independently.
+const consoleUncaptured = [];
+page.on("console", (m) => {
+  const t = m.text();
+  if (/UNCAPTURED DEVICE ERROR|Destroyed texture|Destroyed buffer/.test(t)) {
+    consoleUncaptured.push(t.slice(0, 300));
+    console.log(`  ⛔ ${t.slice(0, 260)}`);
+  }
+});
 
-await page.evaluateOnNewDocument((PROJECT) => {
+// `GI_RESIZE_DISPOSE_NOW=1` is the BEFORE arm: it restores §19 4.1's
+// synchronous `gather.dispose()` inside `setSize`, so a run that reports zero
+// uncaptured errors with the fix can be read against a run that reports them.
+const DISPOSE_NOW = process.env.GI_RESIZE_DISPOSE_NOW === "1";
+if (DISPOSE_NOW) console.log("  ⚠ BEFORE ARM: __gi2ResizeDisposeNow = true (the pre-4.1 synchronous dispose)");
+
+await page.evaluateOnNewDocument((PROJECT, disposeNow) => {
+  if (disposeNow) globalThis.__gi2ResizeDisposeNow = true;
   globalThis.__editorKeepRendering = true;
   localStorage.setItem("engine.projectRoot.v1", PROJECT);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([PROJECT]));
-  const c = { computePipeline: 0, renderPipeline: 0, shaderModule: 0, texture: 0, textureDestroyed: 0 };
+  const c = {
+    computePipeline: 0, renderPipeline: 0, shaderModule: 0, texture: 0, textureDestroyed: 0,
+    // §19 Stage 4.1 — the device's own error channel. `uncaptured` is every
+    // validation error the device reported; the two named counters are the
+    // use-after-free classes a resize produces, kept apart so a row can say
+    // WHICH resource was freed early.
+    uncaptured: 0, destroyedTexture: 0, destroyedBuffer: 0, uncapturedMsgs: [],
+  };
   globalThis.__GPU_COUNTERS__ = c;
   const patch = (proto, name, fn) => {
     if (!proto || typeof proto[name] !== "function") return;
@@ -111,7 +147,28 @@ await page.evaluateOnNewDocument((PROJECT) => {
     patch(GPUDevice.prototype, "createTexture", () => c.texture++);
   }
   if (globalThis.GPUTexture) patch(GPUTexture.prototype, "destroy", () => c.textureDestroyed++);
-}, PROJECT);
+  // The listener has to be attached to the DEVICE, and the only handle on the
+  // device this page will ever create is the one three asks for — so wrap the
+  // request rather than hunting for the renderer afterwards (it is created
+  // long before `engineInstance` resolves).
+  if (globalThis.GPUAdapter && typeof GPUAdapter.prototype.requestDevice === "function") {
+    const requestDevice = GPUAdapter.prototype.requestDevice;
+    GPUAdapter.prototype.requestDevice = function (...args) {
+      return requestDevice.apply(this, args).then((device) => {
+        try {
+          device.addEventListener("uncapturederror", (ev) => {
+            const msg = String(ev?.error?.message ?? ev?.error ?? "");
+            c.uncaptured++;
+            if (/Destroyed texture/.test(msg)) c.destroyedTexture++;
+            if (/Destroyed buffer/.test(msg)) c.destroyedBuffer++;
+            if (c.uncapturedMsgs.length < 24) c.uncapturedMsgs.push(msg.slice(0, 240));
+          });
+        } catch { /* a backend without the event must not break the probe */ }
+        return device;
+      });
+    };
+  }
+}, PROJECT, DISPOSE_NOW);
 
 await page.goto(url, { waitUntil: "load", timeout: 60000 });
 await page.waitForSelector(".hub-recent-open-btn", { timeout: 30000 });
@@ -256,6 +313,40 @@ const censusOnce = () => page.evaluate(async () => {
     })(),
     pendingMaterials: system?.reflectTierCensus?.()?.pendingMaterials ?? -1,
     unknownMaterials: system?.reflectTierCensus?.()?.unknownMaterials ?? -1,
+    // ── §19 Stage 4.1: the device error channel + GI texture liveness ──────
+    uncaptured: c.uncaptured ?? 0,
+    destroyedTexture: c.destroyedTexture ?? 0,
+    destroyedBuffer: c.destroyedBuffer ?? 0,
+    uncapturedMsgs: c.uncapturedMsgs ?? [],
+    // "Did the hop leave the material-facing nodes pointing at the LIVE
+    // gather?" Every material samples GI through these two persistent nodes; a
+    // resize that repoints them at a texture the gather no longer owns — or
+    // fails to repoint them at all — is exactly the bug, and it is invisible in
+    // a pipeline count. Identity, not size: two textures of equal size can
+    // still be the dead one and the live one.
+    giTransport: system?.transportState ?? null,
+    giTex: (() => {
+      const gi2 = system?.state?.screen?.gi2 ?? null;
+      const t = gi2?.textures ?? null;
+      const irr = system?._giIrradianceNode?.value ?? null;
+      const glo = system?._giRadianceNode?.value ?? null;
+      const dim = (tex) => (tex?.image ? `${tex.image.width}x${tex.image.height}` : "none");
+      return {
+        gi2: !!gi2,
+        irrLive: !!(t && irr && irr === t.irradiance),
+        gloLive: !!(t && glo && glo === t.glossy),
+        irrSize: dim(irr),
+        gloSize: dim(glo),
+        gatherSize: gi2 ? `${gi2.width}x${gi2.height}` : "none",
+        // A bundle still parked here means the hand-over has not been taken —
+        // benign for one tick, a leak if it never clears.
+        pendingRetired: Array.isArray(system?._retiredTargets) ? system._retiredTargets.length : -1,
+        // §19 4.1 — how many material bind groups the resize actually re-bound.
+        // ⛔ [[probe-blind-statistics]]: "0 uncaptured errors" next to "0 rebinds"
+        // would mean the repair never ran, not that it worked.
+        rebinds: system?._giRebindings ?? 0,
+      };
+    })(),
     log,
   };
 });
@@ -282,6 +373,16 @@ const record = async (label) => {
     ` heap ${s.heapMB.toFixed(0).padStart(5)}MB (${d("heapMB", 0).padStart(5)})` +
     ` resizeLog ${s.resizeEntries} runs ${s.rebuildRuns} asks ${s.rebuildAsks}` +
     ` merged ${s.mergedRebuilds}`,
+  );
+  // §19 Stage 4.1 — the liveness row, printed BESIDE the cost row rather than
+  // folded into it: a hop that costs nothing and leaves a destroyed texture
+  // bound is a pass on every column above.
+  console.log(
+    `           liveness      gi2 ${s.giTex.gatherSize.padEnd(9)}` +
+    ` irr ${s.giTex.irrLive ? "live" : "STALE"} ${s.giTex.irrSize.padEnd(9)}` +
+    ` glossy ${s.giTex.gloLive ? "live" : "STALE"} ${s.giTex.gloSize.padEnd(9)}` +
+    ` transport ${String(s.giTransport).padEnd(7)} rebinds ${String(s.giTex.rebinds).padStart(4)} retiredPending ${s.giTex.pendingRetired}` +
+    ` | uncaptured ${s.uncaptured} (destroyedTex ${s.destroyedTexture}, destroyedBuf ${s.destroyedBuffer})`,
   );
   return s;
 };
@@ -381,10 +482,35 @@ console.log(`  floor drain settled=${afterFast.floorDrainSettled} cycles=${after
 console.log(`  heap ${base.heapMB.toFixed(0)} -> ${afterFast.heapMB.toFixed(0)} MB`);
 console.log(`  rebuild log tail: ${JSON.stringify(afterFast.log.slice(-8))}`);
 
+// §19 Stage 4.1 receipts. The counters are cumulative, so the final row IS the
+// total across every hop of both phases.
+console.log(`  uncaptured device errors across ALL hops: ${afterFast.uncaptured}` +
+  ` (destroyed texture ${afterFast.destroyedTexture}, destroyed buffer ${afterFast.destroyedBuffer});` +
+  ` console lines naming one: ${consoleUncaptured.length}`);
+for (const msg of afterFast.uncapturedMsgs.slice(0, 6)) console.log(`    · ${msg}`);
+console.log(`  GI textures after the last hop: irradiance ${afterFast.giTex.irrLive ? "live" : "STALE"}` +
+  ` ${afterFast.giTex.irrSize}, glossy ${afterFast.giTex.gloLive ? "live" : "STALE"} ${afterFast.giTex.gloSize},` +
+  ` gather ${afterFast.giTex.gatherSize}, transport ${afterFast.giTransport}`);
+
 const fails = [];
 if (dResize > 0) fails.push(`fast round trip minted ${dResize} resolve-resize rebuilds (must be 0)`);
 if (dPipes > 4) fails.push(`fast round trip created ${dPipes} compute pipelines (must be ~0)`);
 if (maxConcurrentWaves > 1) fails.push(`${maxConcurrentWaves} compile waves ran concurrently (must be 1)`);
+// ⭐ THE GATE THE §19 4.1 FIX IS JUDGED BY. Zero, not "few": one of these is a
+// texture the scene sampled after it was freed.
+if (afterFast.uncaptured > 0) {
+  fails.push(`${afterFast.uncaptured} uncaptured device errors ` +
+    `(${afterFast.destroyedTexture} destroyed-texture, ${afterFast.destroyedBuffer} destroyed-buffer) — must be 0`);
+}
+if (consoleUncaptured.length > 0) {
+  fails.push(`${consoleUncaptured.length} console lines reported a destroyed resource in a submit — must be 0`);
+}
+if (afterFast.giTex.gi2 && (!afterFast.giTex.irrLive || !afterFast.giTex.gloLive)) {
+  fails.push("a GI material node no longer points at the live gather's texture after the hops");
+}
+if (base.giTransport === "alive" && afterFast.giTransport !== "alive") {
+  fails.push(`giTransport went ${base.giTransport} -> ${afterFast.giTransport} across the sweep (must stay alive)`);
+}
 console.log(fails.length ? `\nGI-RESIZE ${fails.length} FAILURES\n  - ${fails.join("\n  - ")}` : "\nGI-RESIZE ALL PASS");
 await browser.close();
 process.exit(fails.length ? 1 : 0);
