@@ -517,6 +517,14 @@ export function createGi2System({
   let cacheCleared = false;
   const t0 = performance.now();
   const marks = { build: 0, soup: 0, voxelizer: 0, occupancy: new Map(), firstLight: 0 };
+  /**
+   * §19 Stage 4.3b: first light against the SCENE-OPEN clock, or null when the
+   * light has not arrived (or the engine predates the stamp). Null, never 0 —
+   * "has not happened" and "happened instantly" are different answers and a
+   * gate must not be able to confuse them.
+   */
+  const firstLightFromSceneOpen = () => (marks.firstLight && engine?.sceneOpenAt
+    ? Math.round(marks.firstLight - engine.sceneOpenAt) : null);
   const counters = {
     soupTris: 0, soupMB: 0, soupBuildMs: 0, soupStallMs: 0, soupDropped: 0, soupTruncated: false,
     palClasses: 0, palEmissiveClasses: 0, palEmitterBand: 0, movers: 0, moverTris: 0, scrolls: 0,
@@ -842,12 +850,30 @@ export function createGi2System({
     // more often than by a mesh appearing, and re-running a 3 M-triangle worker
     // pass for a resize is three seconds of first-light latency bought for
     // nothing.
+    // ── §19 STAGE 4.3b (§R.2) — HOW MANY TIMES THE WORKER RAN, THIS SCENE ────
+    //
+    // The gate is "1 per scene open with merging on", and neither half of that
+    // could be read before: `store` outlives the GI2 system (it survives a
+    // resize on purpose), so a raw counter would carry the Level's builds into
+    // Bistro's number. Keyed on the engine's own scene-open stamp, which is the
+    // same anchor `firstLightFromSceneOpenMs` uses.
+    const sceneOpenAt = engine?.sceneOpenAt ?? 0;
+    if (store.soupBuildsFor !== sceneOpenAt) {
+      store.soupBuildsFor = sceneOpenAt;
+      store.soupBuilds = 0;
+    }
     let built = null;
     if (soupKey != null && store.soupKey === soupKey && store.soup) {
       built = store.soup;
       counters.soupBuildMs = 0;
       counters.soupStallMs = 0;
+      // ⭐ THE KEY HELD. Said out loud because "the soup was not rebuilt" is
+      // invisible otherwise — the only evidence used to be the ABSENCE of a
+      // build line, and an absence is not a receipt.
+      console.log(`[gi2] soup unchanged — the placement key held (${store.soupBuilds} worker run` +
+        `${store.soupBuilds === 1 ? "" : "s"} this scene open); no re-voxelize of the static set`);
     } else {
+      store.soupBuilds = (store.soupBuilds ?? 0) + 1;
       const builder = (store.builder ??= createTriangleSoupBuilder());
       try {
         built = await builder.build({
@@ -1262,6 +1288,16 @@ export function createGi2System({
       msToSoup: marks.soup ? Math.round(marks.soup - t0) : 0,
       msToVoxelizer: marks.voxelizer ? Math.round(marks.voxelizer - t0) : 0,
       msToFirstLight: marks.firstLight ? Math.round(marks.firstLight - t0) : 0,
+      // ⭐⭐ §19 STAGE 4.3b — THE NUMBER THE USER ACTUALLY COUNTS (audits §R).
+      //
+      // `msToFirstLight` is measured from the GI2 BUILD, i.e. from the moment
+      // GI stopped waiting — it was 2.8 s on a Bistro boot the user measured at
+      // 31 s, because 26.9 s of that boot was spent in front of the build, in
+      // `#readyToRebuild`. This one is measured from `engine.sceneOpenAt`
+      // (stamped by `Engine#clear`, which `deserializeScene` calls first), so
+      // the two numbers together say WHERE the time went instead of hiding it.
+      firstLightFromSceneOpenMs: firstLightFromSceneOpen(),
+      soupBuilds: store.soupBuilds ?? 0,
       occupancyMs: Object.fromEntries(marks.occupancy),
     };
     if (!r) return out;
@@ -1277,10 +1313,15 @@ export function createGi2System({
         if (!marks.firstLight && (lastGather.windowHits > 0 || lastGather.screenHits > 0)) {
           marks.firstLight = performance.now();
           out.msToFirstLight = Math.round(marks.firstLight - t0);
+          out.firstLightFromSceneOpenMs = firstLightFromSceneOpen();
           console.log(
             `[gi2] first light — ${lastGather.probesValid} valid probes, ` +
             `${lastGather.windowHits} window hits / ${lastGather.screenHits} screen hits / ` +
-            `${lastGather.skyMiss} sky, ${out.msToFirstLight} ms after the GI2 build started`,
+            `${lastGather.skyMiss} sky, ${out.msToFirstLight} ms after the GI2 build started` +
+            // §R: the headline. Quoted second, so the build-relative number the
+            // whole stage has been read against stays legible next to it.
+            (out.firstLightFromSceneOpenMs != null
+              ? ` — ${out.firstLightFromSceneOpenMs} ms FROM SCENE OPEN` : ""),
           );
         }
       }
@@ -1347,6 +1388,11 @@ export function createGi2System({
     msToSoup: marks.soup ? Math.round(marks.soup - t0) : 0,
     msToVoxelizer: marks.voxelizer ? Math.round(marks.voxelizer - t0) : 0,
     msToFirstLight: marks.firstLight ? Math.round(marks.firstLight - t0) : 0,
+    // §19 Stage 4.3b (§R.4): the readback-free half of the boot receipt, so
+    // `profile.frameStats.gi2` can answer "how long from scene open" without
+    // suspending the frame.
+    firstLightFromSceneOpenMs: firstLightFromSceneOpen(),
+    soupBuilds: store.soupBuilds ?? 0,
     occupancyMs: Object.fromEntries(marks.occupancy),
     gather: lastGather,
     voxelizer: lastVox,

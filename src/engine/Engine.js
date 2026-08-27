@@ -1719,6 +1719,12 @@ export class Engine extends EventEmitter {
   }
 
   clear({ resetSettings = true } = {}) {
+    // §19 Stage 4.3b (audits §R.4): the ONE timestamp every boot receipt is
+    // anchored on. `deserializeScene` calls this first thing, so it is the
+    // moment the user's scene-open begins — the clock GI's "first light" is
+    // quoted against (`profile.gi2.firstLightFromSceneOpenMs`) rather than the
+    // much later moment the asset gate happened to release the build.
+    this.sceneOpenAt = (globalThis.performance ?? Date).now();
     this.batchHierarchy(() => {
       // Parked instances are not roots and not in `entities`, so the sweep
       // below cannot see them — without this they are the one thing `clear()`

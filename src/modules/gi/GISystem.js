@@ -101,6 +101,17 @@ const FINGERPRINT_MIN_INTERVAL_MS = 250;
 // triggers a second full compile wave when the real geometry lands.
 const ASSET_LOAD_STABLE_MS = 250;
 const ASSET_LOAD_TIMEOUT_MS = 30_000;
+// §19 Stage 4.3b (D): how often the late-variant warm asks "has a material
+// variant appeared that the compile wave never saw". Fast enough that a merge
+// commit's proxies are warm long before the user can orbit onto them, slow
+// enough that the walk is free on a settled scene (a WeakSet hit per object).
+const WARM_VARIANT_DRAIN_MS = 200;
+// How many cold variants one idle callback may take, and the wall-clock budget
+// it stops at between them. A compile cannot be interrupted, so the budget is
+// checked BETWEEN objects: a batch of cheap ones drains fast, one expensive one
+// ends the batch by itself.
+const WARM_VARIANT_BATCH = 12;
+const WARM_VARIANT_BUDGET_MS = 60;
 // Frames a resize's outgoing resolve targets stay alive before being destroyed
 // (see #retireTargets). Two would do — the third is slack for a frame that is
 // dropped or re-encoded.
@@ -525,17 +536,64 @@ function giMaterialProgramKey(m) {
   return `${m.type ?? "?"}|${custom}|${props}`;
 }
 
+/**
+ * ⭐⭐ §19 STAGE 4.3b — THE KEY HAD FEWER DIMENSIONS THAN THE PIPELINE DOES.
+ *
+ * The attribute NAME list is not three's geometry key. `RenderObject#
+ * getGeometryCacheKey` carries each attribute's stride / offset / itemSize /
+ * `normalized` and whether the geometry is indexed, and `getCacheKey` adds
+ * `object.receiveShadow` and the skeleton's bone count — every one of them a
+ * different vertex layout or a different generated program, i.e. a different
+ * PIPELINE.
+ *
+ * THE RECEIPT (this stage, `probe:gi2-motion` orbit, Bistro): with the warm
+ * keyed on names alone, one pipeline still minted mid-orbit —
+ * `MeshPhysicalNodeMaterial_143`, and the new owner-join names it:
+ * `Bistro_Research_Exterior_Linde_Tree_Large`, `attrs=[normal,position,uv,uv1]`,
+ * visible, on a normal layer. Nothing about that mesh was hidden or late; its
+ * LAYOUT simply differed from the one object the wave warmed for that program,
+ * so the warm was a claim about a pipeline that had never been created.
+ * ⭐ A WARM SET IS ONLY AS HONEST AS THE KEY IT DEDUPS ON — a coarser key does
+ * not warm more variants, it silently promises variants it never warmed.
+ *
+ * ⚠ Cost is bounded and was measured: on Bistro the wave's "unique material
+ * variants" is the number this changes, and a boolean plus a layout string
+ * splits it by the number of distinct vertex layouts, not by mesh count (200
+ * crates from one exporter still share one).
+ */
+function giGeometryLayoutKey(geo) {
+  if (!geo?.attributes) return "";
+  let s = "";
+  for (const name of Object.keys(geo.attributes).sort()) {
+    const a = geo.attributes[name];
+    s += name;
+    if (a?.data) s += `/${a.data.stride}`;
+    if (a?.offset) s += `+${a.offset}`;
+    if (a?.itemSize) s += `x${a.itemSize}`;
+    if (a?.normalized) s += "n";
+    s += ",";
+  }
+  for (const name of Object.keys(geo.morphAttributes ?? {}).sort()) {
+    s += `morph-${name}:${geo.morphAttributes[name]?.length ?? 0},`;
+  }
+  return `${s}${geo.index ? "i" : ""}`;
+}
+
 function giCompileVariantKey(object) {
   const mat = object.material;
   const mats = Array.isArray(mat) ? mat : [mat];
   const geo = object.geometry;
-  const attrs = geo?.attributes ? Object.keys(geo.attributes).sort().join(",") : "";
-  const skin = object.isSkinnedMesh ? "s" : "";
+  const attrs = giGeometryLayoutKey(geo);
+  const skin = object.isSkinnedMesh ? `s${object.skeleton?.bones?.length ?? 0}` : "";
   const morph = geo?.morphAttributes && Object.keys(geo.morphAttributes).length ? "m" : "";
+  // `receiveShadow` is a per-OBJECT program switch, not a material property —
+  // two meshes sharing one material and one layout still need two pipelines
+  // when they disagree about it.
+  const shadow = object.receiveShadow ? "R" : "";
   const ids = globalThis.__giWaveKeyByUuid === true
     ? mats.map((m) => m?.uuid ?? m?.type ?? "?").join("+")
     : mats.map(giMaterialProgramKey).join("+");
-  return `${ids}|${attrs}|${skin}|${morph}`;
+  return `${ids}|${attrs}|${skin}|${morph}|${shadow}`;
 }
 
 /**
@@ -2671,6 +2729,13 @@ export class GISystem {
       }
     }
 
+    // §19 Stage 4.3b (D): the late-variant warm, in the same idle slot the
+    // R4b floor drain above already occupies. It only ever picks up a material
+    // variant that did not exist when the compile wave ran — merging's proxies
+    // above all — and it hands the compile to an idle callback, never to this
+    // frame. See #drainWarmVariants for the receipt it was built on.
+    this.#drainWarmVariants(renderer);
+
     // Belt-and-braces for the lights-hash memo bug (#purgeLightsHashMemo):
     // purge once more a few frames after every build, when async pipeline
     // compiles have settled. A purge is nearly free (one small map) and,
@@ -4512,8 +4577,48 @@ export class GISystem {
     // second full compile wave. Merging's own hold is bounded, so this cannot
     // deadlock; the stall bound below covers a stuck flag regardless.
     const pendingMerge = this.engine.merging?.settling ? 1 : 0;
-    const pending = pendingModels + pendingMeshes + pendingTextures + pendingMerge;
+    // ══ §19 STAGE 4.3b (§R.1) — GI2 BUILDS ON *GEOMETRY* READY ═══════════════
+    //
+    // ⭐⭐ THE TWO PARAGRAPHS ABOVE ARE THE SRC PATH'S REASONS, AND NEITHER OF
+    // THEM IS GI2's.
+    //
+    // Both were written against the SRC atlas: a build inside the texture tail
+    // seated 1532 placements into 768 slots, and a merge commit afterwards
+    // renumbered them. GI2 has NO SLOT ATLAS (§19 Stage 4.0b removed the cap),
+    // its soup is keyed on the SOURCE meshes (§R.2, `#collectMeshes`'s
+    // `_gi2SourceMeshes`), and the one thing a texture contributes to it — the
+    // palette's mean albedo — is a UNIFORM WRITE that `#retintGi2Palette`
+    // already performs when the KTX2 averages land. So under `GI2_PATH` the
+    // texture tail and the merge settle are not preconditions, they are
+    // FOLLOW-UPS, and waiting for them was the whole of the user's number:
+    // measured on this tree, Bistro spends **26.9 of its 29.7 s** from scene
+    // open sitting in this gate, and the Level 5.2 of 7.3.
+    //
+    // What GI2 genuinely needs is geometry: `positions`/`index` per geometry
+    // and a world matrix per placement, i.e. exactly `pendingModels` and
+    // `pendingMeshes`. That, and nothing else.
+    //
+    // ⚠ THE OLD PATH KEEPS THE OLD GATE. Its atlas is real and its reasons
+    // above are still true; this is a GI2 statement about GI2's inputs.
+    // `__giGi2GeometryGate = false` restores the old gate for a one-boot A/B.
+    const geometryGate = GI2_PATH && globalThis.__giGi2GeometryGate !== false;
+    const pending = pendingModels + pendingMeshes
+      + (geometryGate ? 0 : pendingTextures + pendingMerge);
     const now = performance.now();
+    if (!pending) {
+      // Said ONCE, on the release, and it names what is still outstanding —
+      // "GI built before the textures" has to be a receipt rather than a
+      // surprise, because the palette that follows is a re-tint (see
+      // `#retintGi2Palette`) and a missing re-tint would otherwise look like a
+      // colour bug with no timestamp attached.
+      if (geometryGate && !this._gi2GeometryGateLogged
+        && this._assetsReadySince != null && (pendingTextures || pendingMerge)) {
+        this._gi2GeometryGateLogged = true;
+        console.log(`[gi2] building on geometry-ready: ${pendingTextures} textures still loading, ` +
+          `merging settling=${pendingMerge ? "yes" : "no"} — neither is a GI2 input ` +
+          "(the palette re-tints when the texture averages arrive; the soup reads the SOURCE meshes)");
+      }
+    }
     if (!pending) {
       this._assetWaitStart = null;
       if (this._assetsReadySince == null) {
@@ -4542,10 +4647,20 @@ export class GISystem {
     if (!this._assetWaitStart) {
       this._assetWaitStart = now;
       this._deferredSince = now;
+      // One receipt per WAIT, not per session: the GI system outlives a scene
+      // swap, and a latch that never re-arms would report the geometry gate on
+      // the first scene only.
+      this._gi2GeometryGateLogged = false;
       console.log(
-        `[gi] build deferred — waiting for scene assets ` +
-        `(${pendingMeshes} mesh, ${pendingModels} model, ${pendingTextures} texture` +
-        `${pendingMerge ? ", merge settling" : ""}; avoids a double compile wave)`,
+        `[gi] build deferred — waiting for scene ` +
+        (geometryGate
+          // §R.1: naming what is NOT being waited for matters as much as what
+          // is — "deferred, 1204 texture" on the geometry arm would read as the
+          // old gate still being in force.
+          ? `GEOMETRY (${pendingMeshes} mesh, ${pendingModels} model; ` +
+            `${pendingTextures} texture / merge settling=${pendingMerge ? "yes" : "no"} NOT waited on)`
+          : `assets (${pendingMeshes} mesh, ${pendingModels} model, ${pendingTextures} texture` +
+            `${pendingMerge ? ", merge settling" : ""}; avoids a double compile wave)`),
       );
     }
     // The timeout measures a STALLED load, not a long one: Bistro's transcode
@@ -4617,6 +4732,377 @@ export class GISystem {
     await pass.compileAsync(renderer);
     this._warmedScenePass = pass;
     return true;
+  }
+
+  /**
+   * ⭐⭐⭐ §19 STAGE 4.3b — **`compileAsync` FRUSTUM-CULLS**, AND THAT IS THE
+   * WHOLE SPIKE CLASS.
+   *
+   * `Renderer.compileAsync(scene, camera, targetScene)` builds a render list
+   * through `_projectObject`, which begins:
+   *
+   *     if ( object.visible === false ) return;
+   *     ... if ( ! object.frustumCulled || frustum.intersectsObject( object ) )
+   *
+   * So handing it a mesh that is BEHIND THE CAMERA compiles nothing at all —
+   * silently, with no error and no return value to check. The compile wave
+   * passes one object per variant and the editor camera sees a fraction of the
+   * scene, so every variant whose only representative was off-screen at wave
+   * time was recorded as warmed and never compiled. The driver then mints that
+   * pipeline the first frame the camera swings onto it: 3.10's "a material
+   * came into view", frame #174 of every orbit, `MeshPhysicalNodeMaterial_143`
+   * — which the new owner-join in `probe:gi2-motion` finally named as
+   * `Bistro_Research_Exterior_Linde_Tree_Large`, a tree at the far end of the
+   * street.
+   *
+   * ⛔ THREE REFUTED THEORIES, EACH WITH ITS OWN RUN, BEFORE THIS ONE:
+   * `traverseVisible` → `traverse` (3.10, same two pipelines); the walk
+   * missing hidden objects (4.3b, same one pipeline); a key too coarse to
+   * separate vertex layouts and `receiveShadow` (4.3b, same one pipeline, and
+   * the finer key is KEPT because it is independently correct — see
+   * `giCompileVariantKey`). The bug was never in WHICH object we warmed; it
+   * was that the warm quietly did nothing.
+   *
+   * `frustumCulled` is restored in a `finally`, and it is the only thing
+   * touched: with culling off for this one call the object is added to the
+   * compile list wherever it is. A frame landing inside the await draws it
+   * without a frustum test, which is one extra draw of an object that is
+   * genuinely in the scene — never a wrong image.
+   */
+  async #compileObjectUnculled(renderer, object, camera, targetScene) {
+    const prevCulled = object.frustumCulled;
+    const prevVisible = object.visible;
+    object.frustumCulled = false;
+    // Only for a CAMERA-hidden object (LOD/occlusion): drawing it for a frame
+    // is a lost cull, nothing more. A merge/batch member is never flipped —
+    // its triangles are already on screen inside the proxy, and showing it
+    // would draw them twice.
+    const flipVisible = prevVisible === false && !!object.userData.cameraHidden;
+    if (flipVisible) object.visible = true;
+    try {
+      await renderer.compileAsync(object, camera, targetScene);
+    } finally {
+      object.frustumCulled = prevCulled;
+      if (flipVisible && object.visible === true) object.visible = prevVisible;
+    }
+  }
+
+  /** The PassNode the frame actually renders the scene through, or null. */
+  #activeScenePass() {
+    for (const o of this.engine?.renderOverrides ?? []) {
+      if (o.ownsCamera?.(this.engine)) return o.scenePass ?? null;
+    }
+    return null;
+  }
+
+  /**
+   * ⭐⭐ §19 STAGE 4.3b — THE WALK, AND `traverseVisible` IS THE WRONG ONE HERE.
+   *
+   * MEASURED (this stage, `probe:gi2-motion` orbit): with the drain walking
+   * `traverseVisible`, the `Uber(3)` spike went away and
+   * `MeshPhysicalNodeMaterial` still compiled at frame #174 — because the mesh
+   * wearing it was `visible === false` when the drain looked and TRUE when the
+   * camera reached it. Occlusion/LOD culling writes `visible` (Engine's
+   * visibility resolve, `userData.cameraHidden`) and static merging writes it
+   * too, so "not visible right now" and "will never be drawn" are different
+   * facts, and only the second one is a reason not to warm.
+   *
+   * ⚠ This is NOT a reversal of 3.10's refutation. That one was about the
+   * COMPILE WAVE, where the answer was "those objects do not exist yet" and
+   * `traverse` measured identical. The drain runs later, when they exist.
+   *
+   * So: prune only AUTHORED-hidden subtrees (a disabled entity, whose meshes
+   * genuinely cannot be drawn), and keep everything hidden-but-present — the
+   * same three flags `#autoFitAabb` and `selectionOutline` already test
+   * together. Manual recursion, because `Object3D.traverse` cannot prune.
+   */
+  #warmWalk(root, fn) {
+    const visit = (object) => {
+      const hiddenButPresent = object.userData.batchedInto
+        || object.userData.mergedInto || object.userData.cameraHidden;
+      if (object.visible === false && !hiddenButPresent) return;
+      if (this.#warmCandidate(object) && fn(object) === false) return;
+      for (const child of object.children) visit(child);
+    };
+    visit(root);
+  }
+
+  /** Is this object part of the frame's material set at all? */
+  #warmCandidate(object) {
+    if (!object.isMesh && !object.isLine && !object.isPoints && !object.isSprite) return false;
+    if (object.userData.__giDebug) return false;
+    const mask = object.layers.mask >>> 0;
+    // Editor-only helpers, HUD quads and shadow-merge depth proxies: the same
+    // three exclusions `#collectMeshes` makes, for the same reason — a variant
+    // nobody draws in the user's frame is not one whose compile can spike it.
+    if (mask === 0x80000000 || object.layers.isEnabled(UI_LAYER)) return false;
+    if (mask === ((1 << SHADOW_PROXY_LAYER) >>> 0)) return false;
+    return !!object.material;
+  }
+
+  /**
+   * ⭐⭐ §19 STAGE 4.3b (D) — THE VARIANT KEY, CHEAP ENOUGH TO ASK EVERY TICK.
+   *
+   * `giCompileVariantKey` calls `customProgramCacheKey()` and sorts a
+   * material's own properties — fine once per wave over 30 objects, far too
+   * much over 500 every 200 ms. But the thing it depends on is
+   * `material.version`, which three bumps on every `needsUpdate = true`, and
+   * that is exactly what `materialAsset` sets when a late KTX2 map lands.
+   *
+   * ⛔ AND THAT IS NOT AN OPTIMISATION, IT IS THE SECOND HALF OF THE FIX.
+   * §R.1 builds GI before the texture tail, so materials now GAIN MAPS after
+   * the compile wave has already compiled them — a program change on an
+   * EXISTING object, which an object-identity check (a `seen` WeakSet) is
+   * structurally blind to. Keying on the version catches both populations with
+   * one integer compare per object per tick, and rebuilds the string only for
+   * the material that actually moved.
+   */
+  #warmVariantKeyOf(object) {
+    const cache = (this._giWarmKeys ??= new WeakMap());
+    const mat = object.material;
+    const mats = Array.isArray(mat) ? mat : [mat];
+    let v = mats.length;
+    for (const m of mats) {
+      v = (Math.imul(v, 65599) + ((m?.id ?? 0) | 0) + ((m?.version ?? 0) | 0) * 7919) >>> 0;
+    }
+    const hit = cache.get(object);
+    if (hit !== undefined && hit.v === v) return hit.key;
+    const key = giCompileVariantKey(object);
+    cache.set(object, { v, key });
+    return key;
+  }
+
+  /**
+   * ⭐⭐ §19 STAGE 4.3b (D) — SEAL THE WARMED SET AGAINST THE LIVE SCENE.
+   *
+   * Called at the end of every compile wave. The wave has two exits — the
+   * per-object loop over `compileObjects`, and `#warmOverridePass`, which
+   * SKIPS that loop and compiles the whole scene through the PassNode — and
+   * only a walk of the live scene covers both plus anything that appeared
+   * while the wave ran. Marking a variant here means "the wave has already
+   * paid for this one", which is exactly what the drain needs to know.
+   */
+  #seedWarmedVariants(compiledWholeScene) {
+    const scene = this.engine?.scene;
+    if (!scene) return;
+    const warmed = (this._giWarmedVariants ??= new Set());
+    let seen = 0;
+    let cold = 0;
+    this.#warmWalk(scene, (object) => {
+      seen++;
+      const key = this.#warmVariantKeyOf(object);
+      // ⛔⛔ A SEED MAY ONLY CLAIM WHAT THE WAVE ACTUALLY COMPILED.
+      //
+      // The first cut marked every key the walk FOUND. That is true only on
+      // the whole-scene path (`#warmOverridePass`, or the non-background
+      // `compileAsync(scene, camera)`), where three compiled the entire render
+      // list. On the per-object path the wave compiles ONE OBJECT PER KEY from
+      // its own `compileSeen` set — so any key the wave's walk did not produce
+      // was marked warm having never been compiled, and the drain then had
+      // nothing left to find. That is exactly how `MeshPhysicalNodeMaterial`
+      // survived three different fixes: every one of them made the warm set
+      // more correct, and the seed kept lying about this key.
+      if (compiledWholeScene) warmed.add(key);
+      else if (!warmed.has(key)) cold++;
+    });
+    this._giWarmSealedAt = performance.now();
+    console.log(`[gi] §19 4.3b: warmed-variant set sealed — ${warmed.size} variants warm ` +
+      `over ${seen} meshes` +
+      (compiledWholeScene
+        ? " (the wave compiled the whole scene through the pass, so every live variant is warm)"
+        : `, ${cold} still COLD. Those are pipelines the driver would otherwise mint inside a ` +
+          "frame; the drain warms them off-frame, one per cycle."));
+  }
+
+  /**
+   * ⭐⭐ §19 STAGE 4.3b (D) — THE OFF-FRAME WARM FOR VARIANTS THAT DID NOT
+   * EXIST AT WAVE TIME. This is 3.10's two residual orbit spikes.
+   *
+   * THE RECEIPT IT IS BUILT ON (3.10's commit, `probe:gi2-motion`, Bistro,
+   * ARMS=orbit): exactly TWO render pipelines are created in a whole run —
+   * `Uber(3)` and `MeshPhysicalNodeMaterial` at frames #157/#174 — and the
+   * only two frames over 50 ms are #159/#176. Every CPU column on a spike
+   * frame matches a healthy one and `blockingDuration` is 0.00: nothing was
+   * RUNNING, the page was waiting for a pipeline the driver had just been
+   * handed. `traverseVisible` → `traverse` was measured and REFUTED (same two
+   * pipelines, same two frames): they are not hidden at wave time, they DO NOT
+   * EXIST at wave time, because static merging publishes its proxies after
+   * first light and the wave runs once per boot.
+   *
+   * So this is a DEFERRAL of the same work, not more of it:
+   *   · the warmed set is PERSISTENT and keyed on `giCompileVariantKey` (the
+   *     4.0 program key), so a re-walk of an unchanged scene warms nothing —
+   *     ⚠ without that it is [[gi-shadowmerge-invalidation-loop]] with a new
+   *     name, re-warming the whole scene after every rebuild forever;
+   *   · ONE variant per drain tick, so a torn-down merge cannot turn into a
+   *     hundred compiles in one frame;
+   *   · and the compile itself runs from an IDLE CALLBACK, never from the tick.
+   *     ⛔ THAT IS NOT TIDINESS. `compileAsync`'s synchronous half is the node
+   *     graph build + WGSL codegen, which the wave measured at up to 1105 ms
+   *     for a single `MeshPhysicalNodeMaterial` — calling it inline would
+   *     replace a 137 ms driver wait with a one-second main-thread stall, i.e.
+   *     it would fix the receipt by making the frame worse. The timeout keeps
+   *     a permanently busy page from starving it.
+   *
+   * ⚠ BOTH POPULATIONS, and §R.1 is why the second one matters: a NEW OBJECT
+   * (the merge proxy) and an EXISTING object whose MATERIAL CHANGED PROGRAM
+   * (a late KTX2 map landing on a material the wave already compiled — which
+   * only became possible once GI stopped waiting for the texture tail).
+   * `#warmVariantKeyOf` catches both for one integer compare per object.
+   *
+   * `__giWarmVariantDrain = false` disables it for a one-boot A/B.
+   */
+  #drainWarmVariants(renderer) {
+    if (globalThis.__giWarmVariantDrain === false) return;
+    if (this._compileWaveActive || this._warmDrainBusy) return;
+    const engine = this.engine;
+    const scene = engine?.scene;
+    const camera = engine?.camera;
+    if (!scene || !camera || !renderer?.compileAsync) return;
+    // Nothing to compare against until a wave has sealed the set — before that
+    // every key would read as new and the drain would duplicate the wave.
+    if (!this._giWarmSealedAt) return;
+    const now = performance.now();
+    if (now - (this._warmDrainAt ?? 0) < WARM_VARIANT_DRAIN_MS) return;
+    this._warmDrainAt = now;
+    const warmed = this._giWarmedVariants;
+    const picks = [];
+    const claimed = new Set();
+    let scanned = 0;
+    let cold = 0;
+    this.#warmWalk(scene, (object) => {
+      scanned++;
+      const key = this.#warmVariantKeyOf(object);
+      if (warmed.has(key) || claimed.has(key)) return;
+      cold++;
+      // A BATCH, not one — but a batch bounded by a WALL-CLOCK budget inside
+      // the callback rather than by its length. Most cold keys are a second
+      // vertex layout over a program the wave already compiled, so their
+      // shader module is cached and they cost a millisecond; a genuinely new
+      // program costs seconds. A fixed "one per cycle" prices every key at the
+      // expensive one and would leave a 200-key backlog draining for minutes.
+      if (picks.length < WARM_VARIANT_BATCH) {
+        picks.push({ object, key });
+        claimed.add(key);
+      }
+    });
+    this._giWarmScanned = scanned;
+    this._giWarmCold = cold;
+    if (!picks.length) {
+      if (!this._giWarmDrainedLogged && this._giWarmSealedAt) {
+        this._giWarmDrainedLogged = true;
+        console.log(`[gi] §19 4.3b: variant warm DRAINED — ${warmed.size} variants warm over ` +
+          `${scanned} meshes, 0 cold. No render pipeline should be created inside a frame from here.`);
+      }
+      return;
+    }
+    this._giWarmDrainedLogged = false;
+    // ⛔⛔ A KEY BECOMES WARM WHEN ITS COMPILE RETURNS, NEVER WHEN IT IS PICKED.
+    //
+    // The first batch version marked the whole batch warm up front so two ticks
+    // could not race the same key — and then broke out of the loop on the time
+    // budget, leaving eleven of twelve keys recorded as warm and never
+    // compiled. `probe:gi2-motion` printed `warmed 1 late variant(s)` and
+    // `DRAINED — 0 cold` in the same run that minted `Uber(3)` and
+    // `MeshPhysicalNodeMaterial` inside a frame. Same disease as the seed's,
+    // one layer down: ⭐ **a warm set that records INTENT instead of
+    // COMPLETION is a set that lies, and every downstream fix then measures as
+    // no change.** In-flight keys are held in their own set (so a second tick
+    // does not re-pick them) and released in the `finally`.
+    this._giWarmInFlight = claimed;
+    this._warmDrainBusy = true;
+    const run = async () => {
+      const t0 = performance.now();
+      let done = 0;
+      // The frame renders the scene through the postprocess PassNode's target
+      // + MRT when one owns the camera, and that is a DIFFERENT pipeline-cache
+      // context — warming the default framebuffer's would compile a program
+      // the frame never asks for. Same bind/restore `PassNode.compileAsync`
+      // does, at object granularity instead of whole-scene.
+      const pass = this.#activeScenePass();
+      const prevTarget = pass ? renderer.getRenderTarget() : null;
+      const prevMRT = pass ? renderer.getMRT() : null;
+      try {
+        if (pass) {
+          renderer.setRenderTarget(pass.renderTarget);
+          renderer.setMRT(pass._mrt ?? null);
+        }
+        // ⭐⭐ THE PIPELINE AWAIT IS INTERCEPTED, EXACTLY AS THE WAVE DOES IT.
+        //
+        // `Renderer.compileAsync` is synchronous down to the render-list build
+        // and then, per object, `await Promise.all(pipelinePromises)` +
+        // `yieldToMain()`. That await is DRIVER LATENCY, not main-thread work,
+        // and paying it per object serialised the drain: warming TWO variants
+        // measured **9891 ms**, which is why the tree at the end of the street
+        // still minted its pipeline mid-orbit — the drain was correct and
+        // simply too slow to finish before the camera arrived.
+        //
+        // ⛔ AND RUNNING THE `compileAsync` CALLS CONCURRENTLY IS NOT THE FIX —
+        // it was built and MEASURED WORSE: 7 warms in one batch put
+        // `RenderPipeline ×7, ShaderModule ×9, BindGroup ×808` inside frame
+        // #150 and took the orbit MAX from 128 ms to **752 ms**. Their
+        // main-thread halves (node build, codegen, bindings) interleave into
+        // one long task instead of overlapping. The latency is what must
+        // overlap, not the JS.
+        //
+        // So: collect the pipeline promises instead of awaiting them per
+        // object (the wave's `getForRender` trick), let the driver compile all
+        // of them on its own threads, and await them once at the end. Only the
+        // compile path passes a `promises` array, so the wrapper is inert for
+        // normal rendering.
+        const pipelines = renderer._pipelines;
+        const originalGetForRender = pipelines?.getForRender;
+        const driverInflight = [];
+        let wrapper = null;
+        if (originalGetForRender) {
+          wrapper = function (renderObject, promises) {
+            if (promises == null) return originalGetForRender.call(this, renderObject, promises);
+            const collected = [];
+            const result = originalGetForRender.call(this, renderObject, collected);
+            driverInflight.push(...collected);
+            return result;
+          };
+          pipelines.getForRender = wrapper;
+        }
+        try {
+          for (const { object, key } of picks) {
+            await this.#compileObjectUnculled(renderer, object, pass?.camera ?? camera, scene);
+            // Only now. See the banner above the in-flight set.
+            warmed.add(key);
+            done++;
+            if (performance.now() - t0 >= WARM_VARIANT_BUDGET_MS) break;
+          }
+        } finally {
+          // ⚠ ONLY IF IT IS STILL OURS. A compile wave can start mid-drain and
+          // installs its own wrapper on the same slot; restoring blindly would
+          // strip the wave's interception and leave it serialising on the
+          // driver — the §19 0.3 overlap bug with a new author.
+          if (wrapper && pipelines.getForRender === wrapper) {
+            pipelines.getForRender = originalGetForRender;
+          }
+        }
+        if (driverInflight.length) await Promise.all(driverInflight);
+        const first = picks[0].object;
+        const mat = Array.isArray(first.material) ? first.material[0] : first.material;
+        console.log(`[gi] §19 4.3b: warmed ${done} late variant(s) off-frame in ` +
+          `${Math.round(performance.now() - t0)} ms — first "${first.name || "?"}" / ` +
+          `${mat?.name || mat?.type || "?"} (${warmed.size} variants warm, ` +
+          `${Math.max(0, (this._giWarmCold ?? 0) - done)} still cold of ${this._giWarmScanned ?? 0} meshes; ` +
+          "they did not exist, were off-camera, or did not have this program when the wave ran)");
+      } catch (err) {
+        console.warn(`[gi] late-variant warm failed: ${err?.message ?? err}`);
+      } finally {
+        if (pass) {
+          renderer.setRenderTarget(prevTarget);
+          renderer.setMRT(prevMRT);
+        }
+        this._giWarmInFlight = null;
+        this._warmDrainBusy = false;
+      }
+    };
+    const idle = globalThis.requestIdleCallback;
+    if (typeof idle === "function") idle(() => { void run(); }, { timeout: 2000 });
+    else setTimeout(() => { void run(); }, 0);
   }
 
   /**
@@ -4852,6 +5338,23 @@ export class GISystem {
         compileSeen.add(key);
         compileObjects.push(object);
       });
+      // ⭐⭐ §19 STAGE 4.3b (D) — THE WAVE'S OWN MEMORY, AND IT IS PERSISTENT.
+      //
+      // The wave runs once per boot; merging publishes its proxies afterwards;
+      // the driver then compiles their render pipelines INSIDE a frame, which
+      // is 3.10's two >50 ms orbit spikes (#159/#176 following pipeline
+      // creations at #157/#174). The fix is not a second wave, it is a SET:
+      // `#drainWarmVariants` compares live variant keys against this and warms
+      // the difference off-frame, one per drain tick.
+      //
+      // ⚠ AND IT MUST BE PERSISTENT ACROSS WAVES, or the drain becomes
+      // [[gi-shadowmerge-invalidation-loop]] with a new name — after a rebuild
+      // every key would read as "not warmed last time" and the drain would
+      // re-warm the entire scene, forever. Keys, not objects: a variant is
+      // warm because its PROGRAM is in three's pipeline cache, and that cache
+      // outlives the mesh that provoked it.
+      this._giWarmedVariants ??= new Set();
+      for (const key of compileSeen) this._giWarmedVariants.add(key);
       if (compileObjects.length) {
         console.log(
           `[gi] compile wave: ${compileObjects.length} unique material variants ` +
@@ -5007,6 +5510,9 @@ export class GISystem {
       // objects: (single scene compile)" in the breakdown is that branch.
       const tWarmEarly = performance.now();
       const warmedEarly = await this.#warmOverridePass(renderer);
+      // §19 Stage 4.3b: which of the two exits this wave took decides what the
+      // warmed-variant seal is allowed to claim (see #seedWarmedVariants).
+      this._giWaveCompiledWholeScene = warmedEarly || !backgroundCompile;
       console.log(
         `[gi] postprocess pass warm (head): ${(performance.now() - tWarmEarly).toFixed(0)}ms, ` +
           `${warmedEarly ? "WARMED — the per-object material loop is SKIPPED" : "no override pass; per-object loop runs"}`,
@@ -5046,7 +5552,10 @@ export class GISystem {
               yieldStats.loopYields = (yieldStats.loopYields ?? 0) + 1;
             }
             const tObj = performance.now();
-            await renderer.compileAsync(object, engine.camera, compileTarget);
+            // §19 Stage 4.3b: UNCULLED. See #compileObjectUnculled — a bare
+            // `compileAsync` compiles nothing for an object outside the
+            // camera's frustum, which is most of the scene at wave time.
+            await this.#compileObjectUnculled(renderer, object, engine.camera, compileTarget);
             objTimings.push({
               name: object.material?.name || object.material?.type || object.name || "?",
               ms: performance.now() - tObj,
@@ -5484,6 +5993,13 @@ export class GISystem {
         // a manual remove+add after the wave always fixed it). Emitted on
         // failure too — a failed wave pinned the MRT just as long.
         engine.emit?.("gi-compile-wave-done");
+        // §19 Stage 4.3b (D): seal the warmed-variant set against the LIVE
+        // scene, not against the walk this wave happened to take. Both wave
+        // branches end here — the per-object loop AND `#warmOverridePass`,
+        // which skips that loop entirely by compiling the whole scene through
+        // the PassNode — and anything that appeared mid-wave is in it too. The
+        // drain below only ever warms what this did not.
+        this.#seedWarmedVariants(this._giWaveCompiledWholeScene === true);
         // DIAGNOSTIC: if the first REAL frame after the wave still stalls,
         // the wave compiled for the wrong render path (a postprocess
         // override renders through PassNode targets whose cache context
@@ -11327,7 +11843,8 @@ export class GISystem {
     // exists already (so the trace, the scroll and the gather are live from the
     // first tick), and the voxelizer is created when the soup lands. A boot that
     // waited here would block the whole editor on a 3 M-triangle worker pass.
-    if (GI2_PATH && screen?.gi2) this.#startGi2Build(meshes, screen.gi2);
+    // §R.2: the SOURCE meshes, not the drawn ones — see `#collectMeshes`.
+    if (GI2_PATH && screen?.gi2) this.#startGi2Build(this._gi2SourceMeshes ?? meshes, screen.gi2);
     // §M.1: the exact-reflection BVH scene is the MIRROR TIER's, and the mirror
     // tier comes back as its own unit (`bvhHitShade` / `bvhReflect` are not
     // dispatched under GI2 either — see the tick). Building it here would
@@ -15123,6 +15640,39 @@ export class GISystem {
 
   #collectMeshes() {
     const meshes = [];
+    // ══ §19 STAGE 4.3b (§R.2) — THE *SOURCE* MESH SET, FOR GI2 ONLY ══════════
+    //
+    // ⭐⭐ THE SET THE FIRST LIST RETURNS IS A FUNCTION OF WHETHER MERGING HAS
+    // COMMITTED, AND THAT IS WHY THE SOUP WAS BUILT TWICE.
+    //
+    // `meshes` (unchanged, above) is the DRAWN set: static merging hides each
+    // member (`visible = false` + `userData.mergedInto`) and parents ONE proxy
+    // at the scene root, so the walk picks up the proxy and skips the members —
+    // correct for everything that is about drawing or about layer tags, and the
+    // asymmetry `#autoFitAabb` already documents.
+    //
+    // But it means the placement set FLIPS when merging commits: 516 source
+    // placements before, 189 `Merged(N)` proxies after. `soupKey` is the
+    // geometry keys and the placement matrices, so it flips too, and the worker
+    // re-runs — measured on Bistro at 1.5 s of first-light latency plus a
+    // re-voxelization, for a set of triangles that did not move a millimetre.
+    // (The proxies are also the WORST possible soup input: each is one unique
+    // world-space geometry, so the dedup that ships 200 crates as one geometry
+    // + 200 placements cannot fire at all.)
+    //
+    // So GI2 reads the SOURCE meshes and ignores the proxies. Both facts are
+    // stamped by `engine/merging.js` on the same line of the same two build
+    // sites (`userData.mergedInto` on each member, `userData.mergeProxy` on the
+    // stand-in), so this is a read of merging's own contract, not a guess about
+    // it. `shadowMerge`'s proxies need no handling here: they live on
+    // SHADOW_PROXY_LAYER alone and the `editorOnly` test below already drops
+    // them, and it does not hide its members at all.
+    //
+    // ⚠ NOT A REPLACEMENT FOR `meshes`. The proxy is what is drawn, so it is
+    // what must be marked observed, bucketed and layer-tagged; a hidden member
+    // that gets the same tags costs nothing because nothing draws it.
+    const gi2Source = GI2_PATH ? [] : null;
+    let gi2SourceHash = 0;
     // Per-bucket material tally (see giRoughnessBucketOf): logged at build so
     // a slow scene reports WHY — bucket 3/0 materials compile and run the
     // mirror + hit-lighting path, buckets 1/2 are a fraction of that cost.
@@ -15145,7 +15695,13 @@ export class GISystem {
       // `cameraHidden` = hidden by LOD/occlusion only (see Engine's visibility
       // resolve): the mesh is still part of the world, so it must stay in the
       // field or the GI mesh set becomes a function of the camera.
-      if (object.visible === false && !object.userData.batchedInto && !object.userData.cameraHidden) return;
+      // §R.2: a MERGE MEMBER is hidden-but-present in exactly the sense
+      // `batchedInto` already names — its triangles are on screen, wearing the
+      // proxy's identity. It stays in the walk under GI2 so `gi2Source` can
+      // hold it; `meshes` still refuses it at the push site below.
+      const mergeMember = !!object.userData.mergedInto;
+      if (object.visible === false && !object.userData.batchedInto && !object.userData.cameraHidden
+        && !(GI2_PATH && mergeMember)) return;
       // InstancedMesh IS collected now — it contributes one atlas instance
       // slot per live instance, all sharing a single baked tile (see
       // #buildEntries). It used to be skipped outright, which meant every
@@ -15305,7 +15861,22 @@ export class GISystem {
           transparentEmissive++;
         }
         if (position && material && !material.transparent && !isVolume && !editorOnly && triCount <= MAX_TRIS_PER_MESH) {
-          meshes.push(object);
+          // §R.2. `meshes` = what is DRAWN (proxy in, member out) — unchanged.
+          // `gi2Source` = what OWNS the triangles (member in, proxy out), and
+          // that set does not move when merging commits or rebuilds.
+          if (!mergeMember) meshes.push(object);
+          if (gi2Source && !object.userData.mergeProxy) {
+            gi2Source.push(object);
+            // §R.2's receipt, accumulated where the walk already is: a cheap
+            // order-independent-enough hash of the source set's identity. It is
+            // what lets `#checkFingerprint` say "the DRAWN set changed and the
+            // SOURCE set did not" — which is the whole claim, and which a
+            // length comparison alone would not support.
+            const u = object.uuid;
+            let h = gi2SourceHash;
+            for (let i = 0; i < u.length; i += 4) h = (Math.imul(h, 31) + u.charCodeAt(i)) >>> 0;
+            gi2SourceHash = h;
+          }
         } else if (triCount > MAX_TRIS_PER_MESH) {
           console.warn(`[gi] skipping "${object.name || "mesh"}" (${Math.round(triCount)} tris > cap)`);
         }
@@ -15316,6 +15887,11 @@ export class GISystem {
     this._bucketTally = tally;
     this._tierTally = tierTally;
     this._dynamicSurfaces = dynamicSurfaces;
+    // §R.2: published rather than returned, because every existing caller of
+    // `#collectMeshes` wants the DRAWN set and exactly one caller
+    // (`#startGi2Build`) wants this one. Null off `GI2_PATH`.
+    this._gi2SourceMeshes = gi2Source;
+    this._gi2SourceSig = gi2Source ? `${gi2Source.length}:${gi2SourceHash}` : null;
     this._giTransparentEmissiveSkipped = transparentEmissive;
     // §19 STAGE 0.3: a RECEIPT, not a trigger. See the tag write site above —
     // nothing outside GI reacts to these bits any more, so this number is free
@@ -15687,6 +16263,33 @@ export class GISystem {
     }
     const fingerprint = this.#computeFingerprint(meshes);
     const contentChanged = fingerprint !== this._fingerprint;
+    // ── §19 STAGE 4.3b (§R.2) — THE RECEIPT THAT THE MERGE DID NOT MOVE GI2 ──
+    //
+    // A merge commit or rebuild swaps the DRAWN meshes (members hidden, one
+    // proxy per group) and therefore always changes the fingerprint. Under
+    // GI2 the placement set is the SOURCE meshes, which merging never touches
+    // — so this pair of facts, printed together, is what says the soup is safe.
+    // ⚠ Only when the source set really is unchanged: a scene edit that adds a
+    // mesh changes both, and must not be reported as a merge no-op.
+    if (GI2_PATH && contentChanged && this._gi2SourceSig != null
+      && this._gi2SourceSigSeen === this._gi2SourceSig) {
+      // ⚠ THROTTLED ON THE FACT IT REPORTS, NOT ON A TIMER. Every landing
+      // texture is a content change, so an unthrottled line fired several
+      // times a second through the whole asset tail — and a frame that
+      // carries a `console.log` runs a median 46.0 ms against 24.6 ms on this
+      // scene (`probe:gi2-motion`'s own measurement), so the receipt would
+      // have become the spike. The interesting quantity is the DRAWN count:
+      // one line per distinct value is one line per merge event.
+      const noopKey = `${meshes.length}:${this._gi2SourceMeshes?.length ?? 0}`;
+      if (this._gi2MergeNoopKey !== noopKey) {
+        this._gi2MergeNoopKey = noopKey;
+        const gi2 = this.state?.screen?.gi2;
+        console.log(`[gi2] merge rebuild: soup unchanged — the drawn mesh set moved ` +
+          `(${meshes.length} drawn) but the ${this._gi2SourceMeshes?.length ?? 0} SOURCE placements did not, ` +
+          `so the soup key holds (${gi2?.snapshot?.().soupBuilds ?? "?"} worker run(s) this scene open)`);
+      }
+    }
+    this._gi2SourceSigSeen = this._gi2SourceSig;
     // ── THE AUDIT (see the gate's banner) ───────────────────────────────────
     // The scan just ran on the slow wall-clock cadence and found a change the
     // content key had not announced. Shout once with the site name, and bump —

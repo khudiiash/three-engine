@@ -704,6 +704,15 @@ defineOp({
           scrolls: s.scrolls,
           firstOccupancyMs: s.occupancyMs ?? {},
           firstLightMs: s.msToFirstLight || null,
+          // ⭐⭐ §19 Stage 4.3b (audits §R): the number the USER measures.
+          // `firstLightMs` is quoted from the GI2 build — i.e. from after the
+          // asset gate — and on Bistro it read 2.8 s on a boot the user timed
+          // at 31 s. This one is quoted from `engine.sceneOpenAt`.
+          firstLightFromSceneOpenMs: s.firstLightFromSceneOpenMs ?? null,
+          // §R.2: worker runs of the triangle soup for THIS scene open. 1 is
+          // the gate; 2 means merging (or something else that swaps meshes)
+          // moved the placement set out from under the key.
+          soupBuilds: s.soupBuilds ?? 0,
           soupReadyMs: s.msToSoup || null,
           voxelizerReadyMs: s.msToVoxelizer || null,
           gather: {
@@ -942,7 +951,7 @@ defineOp({
   name: "profile.gi2",
   readOnly: true,
   description:
-    "GI2's own receipts (§19 Stage 3.4/K.8/L.7) — the window, the voxelizer budget, the dynamic layer and the screen-probe gather, read FRESH off the GPU rather than from the tick's 30-frame snapshot. Returns null when GI is not built or when the build constant `GI2_PATH` is false, i.e. when the SRC path is the lit one; that null is the answer to \"which transport is running\". The two boot numbers are `firstOccupancyMs` (per window level) and `firstLightMs`, both measured from the moment the GI2 build started, not from page load. `dynamic.voxelsSet` above zero every frame is what says an animated character is actually in the dynamic layer. Pass `kernelSamples` above zero to also get `kernelMs` — the per-kernel GPU cost of the exact ordered chain the last tick submitted, named by pass — which briefly suspends rendering the way profile.giPasses does. Use profile.frameStats.gi2 instead when you want the counters without paying for a readback.",
+    "GI2's own receipts (§19 Stage 3.4/K.8/L.7) — the window, the voxelizer budget, the dynamic layer and the screen-probe gather, read FRESH off the GPU rather than from the tick's 30-frame snapshot. Returns null when GI is not built or when the build constant `GI2_PATH` is false, i.e. when the SRC path is the lit one; that null is the answer to \"which transport is running\". The two boot numbers are `firstOccupancyMs` (per window level) and `firstLightMs`, both measured from the moment the GI2 build started, not from page load. `firstLightFromSceneOpenMs` (§19 Stage 4.3b) is the same event measured from SCENE OPEN — the clock the user counts on, which also includes everything GI waits for before it starts building; when the two disagree by seconds, the gap is the wait, not the GI. `soupBuilds` is how many times the triangle-soup worker ran for this scene open; 1 is the contract (a merge rebuild must not restart it). `dynamic.voxelsSet` above zero every frame is what says an animated character is actually in the dynamic layer. Pass `kernelSamples` above zero to also get `kernelMs` — the per-kernel GPU cost of the exact ordered chain the last tick submitted, named by pass — which briefly suspends rendering the way profile.giPasses does. Use profile.frameStats.gi2 instead when you want the counters without paying for a readback.",
   params: {
     kernelSamples: {
       type: "number",

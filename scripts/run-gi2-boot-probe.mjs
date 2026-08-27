@@ -226,16 +226,45 @@ await page.evaluateOnNewDocument((project) => {
 // inherit the Level's.
 let marks = null;
 const resetMarks = () => {
-  marks = { assetsReady: 0, firstLight: 0, occupancy: new Map(), built: 0, soup: null, placements: null, lines: [] };
+  marks = {
+    assetsReady: 0, firstLight: 0, occupancy: new Map(), built: 0, soup: null, placements: null, lines: [],
+    // ── §19 STAGE 4.3b / audits §R.4 — THE STAGE TABLE'S OWN SLOTS ──────────
+    //
+    // ⭐⭐ THE HEADLINE WAS ANCHORED ON THE WRONG EVENT FOR THE WHOLE STAGE.
+    // "3.4 s to first light" was measured from `[gi] scene assets ready`, i.e.
+    // from the moment the OLD asset gate released the build — every second the
+    // scene spent loading, transcoding and merging BEFORE that line was
+    // outside the number. The user counts from the moment they open the scene
+    // (31 s on Bistro). So `sceneOpen` is the anchor now and every other stage
+    // is quoted against it; `assetsReady` survives as one ROW of the table
+    // rather than as the origin.
+    sceneOpen: 0,
+    editorReady: 0,
+    deserializeStart: 0,  // polled: engine.sceneOpenAt moved (Engine#clear)
+    geometryReady: 0,      // polled: no model/mesh asset load still pending
+    texturesReady: 0,      // polled: textureLoadsInFlight() === 0
+    mergingSettled: 0,     // polled: engine.merging.settling === false
+    buildStart: 0,         // the gate opening — either path's "building" line
+    soupEnumerated: 0,     // `[gi2] soup N placements` (the walk reached the worker)
+    soupBuilt: 0,          // `[gi2] soup N tris` (the worker came back)
+    voxelizerLive: 0,      // `[gi2] window … voxelizer live`
+  };
 };
 resetMarks();
 page.on("console", (m) => {
   const t = m.text();
   const now = Date.now();
   if (/scene assets ready/.test(t) && !marks.assetsReady) marks.assetsReady = now;
+  // The gate opening, on EITHER path: the old texture-and-merge gate's line,
+  // or §R.1's geometry-ready release. One slot, because they are the same
+  // event — "GI stopped waiting and started building".
+  if (/scene assets ready|\[gi2\] building on geometry-ready/.test(t) && !marks.buildStart) marks.buildStart = now;
   const occ = /\[gi2\] first occupancy L(\d+) at (\d+) ms/.exec(t);
   if (occ && !marks.occupancy.has(occ[1])) marks.occupancy.set(occ[1], now);
   if (/\[gi2\] first light/.test(t) && !marks.firstLight) marks.firstLight = now;
+  if (/\[gi2\] soup \d+ placements/.test(t) && !marks.soupEnumerated) marks.soupEnumerated = now;
+  else if (/\[gi2\] soup \d+ tris/.test(t) && !marks.soupBuilt) marks.soupBuilt = now;
+  if (/voxelizer live/.test(t) && !marks.voxelizerLive) marks.voxelizerLive = now;
   // TWO different soup lines now (§19 Stage 4.0b): the ENUMERATION receipt
   // ("N placements, K past the old 768 cap") on the way in, and the built-soup
   // receipt ("N tris, M MB, palette …") on the way out. Kept apart, because the
@@ -244,7 +273,7 @@ page.on("console", (m) => {
   if (/\[gi2\] soup \d+ placements/.test(t)) marks.placements = t;
   else if (/\[gi2\] soup /.test(t)) marks.soup = t;
   if (/\[gi\] built/.test(t)) marks.built++;
-  if (/\[gi2\]|gi2|screen chain|unavailable|failed|Error|postprocess pass warm|wave breakdown|prewarm loop|SLOWEST PIPELINE|pipelines compiled|variant swap|\[gi\] (built|light shadows|quality|auto-fit|compile wave|transport)/.test(t)) {
+  if (/\[gi2\]|gi2|screen chain|unavailable|failed|Error|postprocess pass warm|wave breakdown|prewarm loop|SLOWEST PIPELINE|pipelines compiled|variant swap|build deferred|scene assets ready|4\.3b|warmed a late variant|\[gi\] (built|light shadows|quality|auto-fit|compile wave|transport)/.test(t)) {
     marks.lines.push(t.slice(0, 220));
     console.log(`    ${t.slice(0, 900)}`);
   }
@@ -262,6 +291,10 @@ await page.evaluate((project) => {
   row?.querySelector(".hub-recent-open-btn")?.click();
 }, PROJECT);
 await page.waitForFunction(() => !!globalThis.__editorApi, { timeout: 180000 });
+// §R.4's first stage. Page-global, not per-scene: the editor comes up once and
+// both scenes are opened into it, which is what the table's negative "editor
+// ready" offset says on the second scene.
+const editorReadyAt = Date.now();
 // The op surface exposes no engine, and §19 Stage 4.0's ownership-list gate
 // needs one. Resolved once, from the same module the editor boots from.
 await page.evaluate(async () => {
@@ -274,6 +307,44 @@ await page.evaluate(async () => {
   globalThis.__gi2 = () => {
     const sys = mod.engine?.modules?.get?.("gi")?.system;
     return sys?._gi2 ?? sys?.state?.screen?.gi2 ?? null;
+  };
+  // ── §19 STAGE 4.3b / §R.4 — THE THREE POLLED STAGES ───────────────────────
+  //
+  // Geometry-ready, textures-ready and merging-settled leave NO console line on
+  // either arm, so they cannot be captured the way first light is. They are
+  // read the same way `#readyToRebuild` reads them — the same predicates, so
+  // the table's "geometry ready" is exactly the moment §R.1's new gate is
+  // allowed to fire, not a proxy for it. Polled at the boot loop's 200 ms
+  // cadence, which is the resolution every row of this table has.
+  const tex = await import("/src/engine/textureAsset.js");
+  globalThis.__gi2BootStages = () => {
+    const engine = mod.engine;
+    if (!engine) return null;
+    let pendingModels = 0;
+    let pendingMeshes = 0;
+    for (const entity of engine.entities.values()) {
+      const model = entity.getComponent?.("model");
+      if (model?.props?.path && !model.root) pendingModels++;
+      const mesh = entity.getComponent?.("mesh");
+      if (mesh?.assetLoadsPending) pendingMeshes++;
+    }
+    return {
+      // ⭐⭐ THE SAMPLE CARRIES ITS OWN SCENE IDENTITY, AND IT HAS TO.
+      // The run opens two scenes into one editor. `deserializeScene` stamps
+      // `sceneOpenAt` and only THEN tears the old scene down, so for the first
+      // ~10 ms after `scene.open` the counters below still describe the
+      // PREVIOUS scene — fully loaded, nothing pending. The first cut read
+      // that and stamped "Bistro: geometry ready at 9 ms" on a scene that took
+      // 26 s. Same blind-instrument shape as [[probe-blind-statistics]]: the
+      // guard is not "wait a bit", it is "refuse a sample that is not about
+      // the scene being asked about".
+      sceneOpenAt: engine.sceneOpenAt ?? 0,
+      entities: engine.entities.size,
+      pendingModels,
+      pendingMeshes,
+      pendingTextures: tex.textureLoadsInFlight?.() ?? 0,
+      merging: !!engine.merging?.settling,
+    };
   };
 });
 
@@ -854,7 +925,48 @@ for (const name of SCENES) {
       if (mean != null) lum.push({ at: Date.now(), lum: +mean.toFixed(2) });
     } catch { /* a screenshot can race a resize; the next sample is 200 ms away */ }
   };
+  // ⭐⭐ §19 STAGE 4.3b — THIS IS THE ANCHOR NOW (audits §R.4).
+  //
+  // The instant the harness asks the editor to open the scene, which is the
+  // instant the user's own clock starts. `scene.open` → `openScenePath` →
+  // `deserializeScene` → `engine.clear()`, and the engine stamps
+  // `engine.sceneOpenAt` there, so the editor-side receipt
+  // (`profile.gi2.firstLightFromSceneOpenMs`) and this table measure from the
+  // SAME event, one in page time and one in wall clock.
+  const prevSceneOpenAt = await page
+    .evaluate(() => globalThis.__gi2BootStages?.()?.sceneOpenAt ?? 0).catch(() => 0);
   const openedAt = Date.now();
+  marks.sceneOpen = openedAt;
+  marks.editorReady = editorReadyAt;
+  const pollStages = async () => {
+    const s = await page.evaluate(() => globalThis.__gi2BootStages?.() ?? null).catch(() => null);
+    if (!s) return;
+    const now = Date.now();
+    // The sample must be ABOUT THIS SCENE (see `__gi2BootStages`) and the
+    // scene must have entities — an empty graph has nothing pending and would
+    // read as "everything ready" at 0 ms.
+    if (s.sceneOpenAt === prevSceneOpenAt) return;
+    // ⚠ THE OP CALL AND THE ENGINE'S OWN CLOCK ARE NOT THE SAME EVENT, and the
+    // gap between them is not GI's. `scene.open` → `openScenePath` does
+    // `leavePrefabMode` + `ensureEngine` + `invoke("load_scene")` + JSON.parse
+    // BEFORE `deserializeScene` calls `engine.clear()`, which is where
+    // `sceneOpenAt` is stamped and therefore where the editor-side
+    // `firstLightFromSceneOpenMs` starts counting. On this harness that read is
+    // a CDP round trip and measured 2.6 s on the Level — so without this row
+    // the two receipts disagree by seconds for a reason that has nothing to do
+    // with the engine.
+    if (!marks.deserializeStart) marks.deserializeStart = now;
+    if (!s.entities) return;
+    if (!marks.geometryReady && !s.pendingModels && !s.pendingMeshes) marks.geometryReady = now;
+    // ⚠ AND NOT BEFORE GEOMETRY. `textureLoadsInFlight()` is momentarily 0
+    // between batches — the first zero after the scene's entities exist lands
+    // while the models are still being fetched, which stamped "textures ready"
+    // BEFORE "geometry ready" and made the ordering claim below nonsense. A
+    // texture load cannot even start until the mesh that references it has
+    // loaded, so geometry-ready is the earliest honest floor for this row.
+    if (!marks.texturesReady && !s.pendingTextures && marks.geometryReady) marks.texturesReady = now;
+    if (!marks.mergingSettled && !s.merging && marks.geometryReady) marks.mergingSettled = now;
+  };
   const openCall = call("scene.open", { path: scenePath });
   // NOT awaited before the sampler starts: the whole point is to watch the
   // frame WHILE the scene opens and the wave runs.
@@ -862,6 +974,7 @@ for (const name of SCENES) {
   openCall.then((r) => { openSettled = r; }, (e) => { openSettled = { ok: false, error: String(e) }; });
   while (!openSettled) {
     await tryArm();
+    await pollStages();
     await sampleLum();
     await wait(200);
   }
@@ -872,18 +985,34 @@ for (const name of SCENES) {
     continue;
   }
 
-  // Wait for first light, or for the boot timeout. The anchor is `scene assets
-  // ready` when it arrives and `scene.open` otherwise — the gate is "after the
-  // scene's assets are in", and a scene whose assets were already resident
-  // never prints the line.
+  // Wait for first light, or for the boot timeout.
   const deadline = Date.now() + BOOT_TIMEOUT;
   while (Date.now() < deadline && !marks.firstLight) {
     await tryArm();
+    await pollStages();
     await sampleLum();
     await wait(200);
   }
-  const anchor = marks.assetsReady || openedAt;
+  // Keep polling briefly past first light — on the §R.1 arm the textures and
+  // the merge land AFTER the light, and "GI is not the last thing to appear"
+  // is a claim about exactly that ordering, so the table has to hold both.
+  {
+    const until = Date.now() + 15000;
+    while (Date.now() < until && !(marks.texturesReady && marks.mergingSettled)) {
+      await pollStages();
+      await sampleLum();
+      await wait(200);
+    }
+  }
+  // ⭐ THE ANCHOR IS SCENE OPEN. `assetsReady` is a ROW, not the origin — see
+  // `resetMarks`. `firstLightAfterAssets` is kept alongside so the number this
+  // probe has quoted all stage long stays comparable across the change.
+  const anchor = openedAt;
   const firstLightMs = marks.firstLight ? marks.firstLight - anchor : Infinity;
+  const firstLightAfterAssets = marks.firstLight && marks.assetsReady
+    ? marks.firstLight - marks.assetsReady : null;
+  const geomToLightMs = marks.firstLight && marks.geometryReady
+    ? marks.firstLight - marks.geometryReady : null;
 
   // ⚠ THE OCCUPANCY LINES ARRIVE AFTER FIRST LIGHT, NOT BEFORE. A ray hits the
   // window as soon as the COARSE levels hold bricks; the per-level receipts are
@@ -927,7 +1056,60 @@ for (const name of SCENES) {
   const giGpuMs = giPasses == null ? null
     : (giPasses.gi2TotalMs ?? 0) + (giPasses.screenTotalMs ?? 0) + (giPasses.queueTotalMs ?? 0);
 
-  console.log(`\n  boot: assets→first light ${Number.isFinite(firstLightMs) ? `${firstLightMs} ms` : "NEVER"}` +
+  // ══ §19 STAGE 4.3b — THE STAGE TABLE (audits §R.4) ════════════════════════
+  //
+  // ⭐⭐ ONE TABLE, ONE ORIGIN, AND THE ORIGIN IS THE USER'S. Every row is
+  // milliseconds after `scene.open`; the Δ column is the cost of the row
+  // itself, which is the only column a fix can be aimed at. `—` means the
+  // stage never happened in the observation window, and that is DIFFERENT from
+  // 0 — on the §R.1 arm "textures ready" legitimately lands after first light.
+  {
+    const stageRows = [
+      ["editor ready", marks.editorReady],
+      ["scene open (op call)", marks.sceneOpen],
+      ["deserialize start", marks.deserializeStart],
+      ["geometry ready", marks.geometryReady],
+      ["textures ready", marks.texturesReady],
+      ["merging settled", marks.mergingSettled],
+      ["GI build start", marks.buildStart],
+      ["  (old gate: assets ready)", marks.assetsReady],
+      ["soup enumerated", marks.soupEnumerated],
+      ["soup built", marks.soupBuilt],
+      ["voxelizer live", marks.voxelizerLive],
+      ...[...marks.occupancy.entries()].sort((a, b) => Number(a[0]) - Number(b[0]))
+        .map(([lvl, at]) => [`occupancy L${lvl}`, at]),
+      ["FIRST LIGHT", marks.firstLight],
+    ];
+    console.log(`\n  ── STAGES, FROM SCENE OPEN (§R.4) ─────────────────────────`);
+    console.log(`  ${"stage".padEnd(28)}${"at".padStart(10)}${"Δ".padStart(10)}`);
+    let prev = null;
+    for (const [label, at] of stageRows) {
+      const ms = at ? at - anchor : null;
+      const d = ms != null && prev != null ? ms - prev : null;
+      console.log(`  ${label.padEnd(28)}${(ms == null ? "—" : `${ms} ms`).padStart(10)}` +
+        `${(d == null ? "" : `${d >= 0 ? "+" : ""}${d}`).padStart(10)}`);
+      if (ms != null && !label.startsWith("  ")) prev = ms;
+    }
+    console.log(`  ${"".padEnd(28)}${"".padStart(10)}`);
+    console.log(`  first light FROM SCENE OPEN: ` +
+      `${Number.isFinite(firstLightMs) ? `${firstLightMs} ms` : "NEVER"}` +
+      `${firstLightAfterAssets != null ? `  (after the old assets-ready anchor: ${firstLightAfterAssets} ms)` : ""}` +
+      `${geomToLightMs != null ? `  (after geometry ready: ${geomToLightMs} ms)` : ""}`);
+    // ⭐ THE ORDERING CLAIM, PRINTED. §R's gate says GI must not be the last
+    // thing to appear after the textures land — a fact about two timestamps,
+    // and there is no reason to make a reader subtract them by hand.
+    if (marks.firstLight && marks.texturesReady) {
+      console.log(`  ordering: first light ${marks.firstLight <= marks.texturesReady ? "BEFORE" : "AFTER"} ` +
+        `textures ready (by ${Math.abs(marks.firstLight - marks.texturesReady)} ms)`);
+    }
+    if (gi2?.soupBuilds != null) {
+      console.log(`  soupBuilds this scene open: ${gi2.soupBuilds}` +
+        `${gi2.soupBuilds === 1 ? " (§R.2 PASS — merging did not restart the soup)" : " ⚠ §R.2"}` +
+        `${gi2.firstLightFromSceneOpenMs != null
+          ? `   editor-side firstLightFromSceneOpenMs ${gi2.firstLightFromSceneOpenMs} ms` : ""}`);
+    }
+  }
+  console.log(`\n  boot: assets→first light ${firstLightAfterAssets != null ? `${firstLightAfterAssets} ms` : "n/a"}` +
     `   occupancy ${occRows.length ? occRows.join(", ") : "none"}`);
   console.log(`  ${marks.placements ?? "  (no placement line — the content walk never ran)"}`);
   console.log(`  ${marks.soup ?? "  (no soup line — the window never received geometry)"}`);
@@ -1176,8 +1358,37 @@ for (const name of SCENES) {
     }
   }
 
-  gate(name, "first light after assets", Number.isFinite(firstLightMs) ? firstLightMs : -1,
-    FIRST_LIGHT_MS, Number.isFinite(firstLightMs) && firstLightMs <= FIRST_LIGHT_MS, "ms");
+  // ── §19 STAGE 4.3b — THE RE-ANCHORED GATE (§R) ────────────────────────────
+  //
+  // Level: ≤ 3 s FROM SCENE OPEN, full stop — a small scene has no excuse.
+  // Bistro: ≤ geometry-ready + 3 s, because the geometry load is the scene's
+  // bill and not GI's, and the whole point of §R.1 is that GI stops waiting for
+  // the TEXTURE tail on top of it. Two different gates, and the table above is
+  // what makes the difference auditable rather than a special case.
+  const bigScene = name.toLowerCase() === "bistro";
+  if (bigScene) {
+    gate(name, "first light − geometry ready", geomToLightMs ?? -1, FIRST_LIGHT_MS,
+      geomToLightMs != null && geomToLightMs <= FIRST_LIGHT_MS, "ms");
+    // "GI must not be the last thing to appear after textures land."
+    // ⚠ "TEXTURES NEVER FINISHED IN THE WINDOW" IS THE STRONGEST FORM OF THIS
+    // PASS, NOT A MISSING MEASUREMENT. The claim is that GI is not the last
+    // thing to appear; a texture tail still running when first light lands
+    // proves it more firmly than a timestamp comparison does. Only a boot with
+    // NO first light can fail this.
+    gate(name, "light before textures",
+      !marks.firstLight ? "no light"
+        : !marks.texturesReady ? "yes (tail still running)"
+          : marks.firstLight <= marks.texturesReady ? "yes" : "no",
+      "yes",
+      !!marks.firstLight && (!marks.texturesReady || marks.firstLight <= marks.texturesReady), "");
+  } else {
+    gate(name, "first light from scene open", Number.isFinite(firstLightMs) ? firstLightMs : -1,
+      FIRST_LIGHT_MS, Number.isFinite(firstLightMs) && firstLightMs <= FIRST_LIGHT_MS, "ms");
+  }
+  // §R.2: one soup per scene open, with merging on.
+  if (gi2?.soupBuilds != null) {
+    gate(name, "soupBuilds per scene open", gi2.soupBuilds, 1, gi2.soupBuilds === 1);
+  }
   gate(name, "GI GPU", giGpuMs == null ? -1 : +giGpuMs.toFixed(2), GI_GPU_MS,
     giGpuMs != null && giGpuMs <= GI_GPU_MS, "ms");
   gate(name, "transport alive", frameStats.giTransport ?? "null", "alive",

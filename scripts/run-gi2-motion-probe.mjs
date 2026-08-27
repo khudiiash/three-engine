@@ -215,6 +215,42 @@ const anchor = marks.assetsReady || openedAt;
 console.log(marks.firstLight
   ? `  first light at ${marks.firstLight - anchor} ms — settling ${SETTLE}s`
   : `  ⚠ NO FIRST LIGHT in ${BOOT_TIMEOUT / 1000}s — measuring anyway (the numbers describe a boot, not a steady state)`);
+// ⭐⭐ §19 STAGE 4.3b — FIRST LIGHT IS NO LONGER THE END OF THE LOAD.
+//
+// This probe took "boot done" to be first light + SETTLE, which was true while
+// `#readyToRebuild` held GI until every texture and the merge had landed: GI
+// was the LAST thing to appear. §R.1 makes GI build on geometry-ready, so
+// first light now arrives ~10 s BEFORE the KTX2 tail finishes — and the arms
+// were starting on a scene still decoding textures, still merging and still
+// minting materials. Three runs showed it the same way: ~50 pipelines created
+// "after boot" at a steady one per seven frames, 3.4 console logs per second,
+// and an orbit MAX of 578 ms with nothing camera-shaped about it.
+// ⭐ WHEN A CHANGE MOVES THE EVENT A PROBE ANCHORS ON, THE PROBE IS MEASURING A
+// DIFFERENT SUBJECT — that is not a regression, and reading it as one costs a
+// session.
+//
+// So the arms wait for QUIESCENCE, on the same two predicates
+// `#readyToRebuild` reads. Bounded, and it says so when the bound is hit.
+{
+  const quietBy = Date.now() + Number(process.env.QUIESCE_MS ?? 90000);
+  const armed = await page.evaluate(async () => {
+    const m = await import("/src/engine/textureAsset.js");
+    globalThis.__texInFlight = () => m.textureLoadsInFlight?.() ?? 0;
+    return true;
+  }).catch(() => false);
+  let last = null;
+  while (Date.now() < quietBy) {
+    last = await page.evaluate(() => ({
+      tex: globalThis.__texInFlight?.() ?? 0,
+      merging: !!globalThis.__giEngineForProbe?.merging?.settling,
+    })).catch(() => null);
+    if (last && !last.tex && !last.merging) break;
+    await wait(500);
+  }
+  console.log(`  asset quiescence: ${armed ? "" : "(texture probe unavailable) "}` +
+    `${last ? `${last.tex} textures in flight, merging settling=${last.merging}` : "unknown"}` +
+    `${last && (last.tex || last.merging) ? " — ⚠ BOUND HIT, the arms run on a still-loading scene" : " — clear"}`);
+}
 await wait(SETTLE * 1000);
 
 const settled = (await call("profile.frameStats", { settleMs: 1100 })).value ?? {};
@@ -1160,6 +1196,56 @@ console.log("");
     console.log(`  RENDER/COMPUTE PIPELINES CREATED AFTER BOOT: ${data.pipelines.length}`);
     for (const q of data.pipelines) {
       console.log(`    frame #${q.frame}  t=${f2(q.t)}  ${q.label || "(no label)"}`);
+    }
+    // ⭐⭐ §19 STAGE 4.3b — *WHOSE* PIPELINE. A label names the material's TYPE
+    // and its `material.id` (`renderPipeline_${name || type}_${id}`, see
+    // WebGPUPipelineUtils) and nothing about the object — so "warm the
+    // pipelines" had no target: two stages of receipts said
+    // `MeshPhysicalNodeMaterial_143` without ever saying which mesh that is,
+    // what layer it sits on, or whether it was visible when the warm looked.
+    // The id is the join back to the scene, and this is that join.
+    const ids = [...new Set(data.pipelines
+      .map((q) => /_(\d+)(?:\s|$)/.exec(q.label ?? "")?.[1])
+      .filter(Boolean)
+      .map(Number))];
+    if (ids.length) {
+      const who = await page.evaluate((wanted) => {
+        const eng = globalThis.__giEngineForProbe;
+        const scene = eng?.scene;
+        if (!scene) return null;
+        const want = new Set(wanted);
+        const out = [];
+        scene.traverse((o) => {
+          const mats = Array.isArray(o.material) ? o.material : [o.material];
+          for (const m of mats) {
+            if (!m || !want.has(m.id)) continue;
+            const chain = [];
+            for (let p = o; p && chain.length < 5; p = p.parent) chain.push(p.name || p.type);
+            out.push({
+              id: m.id, type: m.type, matName: m.name ?? "",
+              name: o.name ?? "", visible: o.visible !== false,
+              mask: (o.layers.mask >>> 0).toString(16),
+              merged: !!o.userData.mergedInto, proxy: !!o.userData.mergeProxy,
+              cameraHidden: !!o.userData.cameraHidden,
+              attrs: Object.keys(o.geometry?.attributes ?? {}).sort().join(","),
+              chain: chain.join(" <- "),
+            });
+          }
+        });
+        return out.slice(0, 12);
+      }, ids).catch(() => null);
+      if (!who?.length) {
+        console.log("    ⚠ nothing in the live scene wears those materials — the pipeline's owner " +
+          "was destroyed, or it is not a scene mesh (a nested render, an overlay, a postprocess quad).");
+      } else {
+        for (const w of who) {
+          console.log(`      mat#${w.id} ${w.matName || w.type} -> "${w.name}" ` +
+            `visible=${w.visible} mask=0x${w.mask} attrs=[${w.attrs}]` +
+            `${w.merged ? " MERGED-MEMBER" : ""}${w.proxy ? " MERGE-PROXY" : ""}` +
+            `${w.cameraHidden ? " CAMERA-HIDDEN" : ""}`);
+          console.log(`         ${w.chain}`);
+        }
+      }
     }
   }
   if (data.renderStacks?.length) {
