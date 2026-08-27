@@ -29,7 +29,14 @@ for (const arm of arms) {
       console.log(`PASS ${arm} — storage ${result.storageLimit}`);
       // Near-limit kernels (the page logs any at ≥6 storage buffers, named) —
       // the planning constraint for adding a binding to an existing kernel.
-      for (const l of logs) if (l.startsWith("GI-SMOKE STORAGE")) console.log(`  ${l}`);
+      // CENSUS and NOTE join STORAGE: the census says HOW MANY kernels the
+      // binding audit actually saw, which is the difference between "no kernel
+      // is over 8 storage buffers" and "no kernel was looked at" — the exact
+      // blindness §19 Stage 3.4 hit when GI2 emptied every list this page knew
+      // about. NOTE reports an arm that does not apply to the built transport.
+      for (const l of logs) {
+        if (/^GI-SMOKE (STORAGE|CENSUS|NOTE)/.test(l)) console.log(`  ${l}`);
+      }
       // The `?src=1` arm's whole output is these numbers; a bare PASS would
       // hide the probe counts and the hash load the arm exists to report.
       if (result.srcProbes) {
@@ -83,6 +90,14 @@ for (const arm of arms) {
     } else {
       failed++;
       console.error(`FAIL ${arm}:`, JSON.stringify(result).slice(0, 400));
+      // The receipts the arm DID produce before it died. The binding audit runs
+      // early and the transport assertions late, so an arm that fails on a
+      // transport check has usually already answered the one question that is
+      // transport-independent - is any kernel over the portable 8-storage-buffer
+      // limit - and printing only the error threw that away.
+      for (const l of logs) {
+        if (/^GI-SMOKE (STORAGE|CENSUS|NOTE)/.test(l)) console.log(`  ${l}`);
+      }
       console.error(logs.filter((l) => /error|Error|fail/i.test(l)).slice(-8).join("\n"));
     }
   } catch (err) {

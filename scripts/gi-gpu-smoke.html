@@ -333,6 +333,18 @@
           dynObjReport = { staticHeld: true, adopted: system._dynSet?.count() ?? 0, occupied: held.occupiedVoxels };
           console.log("GI-SMOKE DYNOBJ", JSON.stringify(dynObjReport));
           stats = await system.readRayHitStats();
+        } else if (dynObjArm && !engine.modules.get("gi").system.state?.volume?.occupancyField) {
+          // §19 Stage 3.4: the whole `dynobj` family is an OCCUPANCY-FIELD test
+          // — `readbackStats().occupiedVoxels`, the adoption sweep, the BVH
+          // upload. Under `GI2_PATH` there is no field, and throwing here took
+          // the BINDING AUDIT down with it: the one assertion in this page that
+          // is transport-independent (≤ 8 storage buffers per kernel) stopped
+          // running on the very transport it most needs to check. Say so and
+          // fall through to the audit; the arm returns to the GI2_PATH=false
+          // battery, and GI2's own dynamic layer is gated by
+          // `probe:gi2-voxelize` / `profile.gi2.dynamic`.
+          console.log(`GI-SMOKE NOTE dynobj=${dynObjArm} skipped — no occupancy field on this build ` +
+            "(GI2_PATH); the storage-binding audit below still runs over GI2's own kernels.");
         } else if (dynObjArm) {
           const system = engine.modules.get("gi").system;
           const occField = system.state.volume.occupancyField;
@@ -494,11 +506,27 @@
         } catch (e) {
           console.log(`GI-SMOKE NOTE occupancy chain not auditable: ${e?.message ?? e}`);
         }
+        // ⚠⚠ AND NEITHER IS GI2's CHAIN (§19 Stage 3.4). The window, the
+        // voxelizer, the dynamic layer and the whole screen-probe gather are
+        // dispatched from `#tick` in §M.2's order — NOT through `state.queue`,
+        // which is rate-gated and split into halves a window frame cannot be.
+        // Under `GI2_PATH` the three lists above are all EMPTY (no occupancy
+        // field, no SRC, a near-bare queue), so without this entry the smoke
+        // would audit nothing, find no kernel over the limit, and pass — the
+        // exact blindness the occupancy note above was written about, one
+        // transport later. `gi2.computeNodes` is the same published list
+        // `#dispose` releases, so it cannot drift from what actually runs.
+        const gi2AuditNodes = (state?.screen?.gi2?.computeNodes ?? [])
+          .map((node, index) => [node?.__giPassName ?? `gi2[${index}]`, node]);
         const auditNodes = [
           ...occAuditNodes,
+          ...gi2AuditNodes,
           ...(state?.queue ?? []).map((node, index) => [`queue[${index}]`, node]),
           ...(state?.screen?.srcProbes?.passes ?? []).map((node, index) => [`srcProbes[${index}]`, node]),
         ];
+        console.log(`GI-SMOKE CENSUS ${auditNodes.length} kernels: ${occAuditNodes.length} occupancy + ` +
+          `${gi2AuditNodes.length} gi2 + ${(state?.queue ?? []).length} queue + ` +
+          `${(state?.screen?.srcProbes?.passes ?? []).length} srcProbes`);
         // [J] BY IDENTITY, NOT BY INDEX. Its binding count is the number the
         // whole design rests on — the hit list rides `scratch`'s tail, the
         // hash→block words ride `hashKeys`', the counters ride the deposit's
