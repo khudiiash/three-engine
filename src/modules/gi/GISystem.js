@@ -458,6 +458,43 @@ function giCompileVariantKey(object) {
 }
 
 /**
+ * ⭐ §19 STAGE 4.3a — THE BUCKET AS THE *PIPELINE KEY* SEES IT.
+ *
+ * `#markObservedMaterial` appends the roughness bucket to every material's
+ * `customProgramCacheKey` so that same-bucket materials share a build and
+ * different-bucket ones do not steal each other's (audits §J.1). On the SRC
+ * path that is four keys per material, and it is correct there: buckets 0/3
+ * (`canMirror`) compile the exact-reflection blend and the mirror trace,
+ * bucket 2 (`fullyRough`) compiles only the diffuse limit, bucket 1 the
+ * directional chain without the mirror. Four arms, four texts.
+ *
+ * ⛔ UNDER `GI2_PATH` THREE OF THOSE FOUR ARMS EMIT BYTE-IDENTICAL CODE, and
+ * the key was still splitting them. `GICascadeLightNode.setup` has exactly
+ * three bucket-sensitive sites (`giLight.js:2286-2287`, `:2365`, `:2504`) and
+ * two of them are dead on this path by construction, not by configuration:
+ *   · `:2504` needs `light.mirrorSampleFn`, which `#buildLightUniforms` sets
+ *     to `null` unconditionally (`:10375`);
+ *   · `:2365` needs `light.bvhReflectColorTexture`, which only `#syncBvhScene`
+ *     ever assigns — and `#rebuild` does not even CALL it under `GI2_PATH`
+ *     (`:10662`), because the mirror tier is not dispatched on this path.
+ * That leaves `fullyRough` (bucket 2 → the diffuse limit, a genuinely smaller
+ * shader) as the only live distinction, so the key needs TWO values, not four.
+ *
+ * ⚠ NOT one value. Collapsing bucket 2 in with the rest would hand a fully
+ * rough material the directional build (bigger, and the reverse of what the
+ * bucket exists for) or hand a directional material the diffuse-only one —
+ * which is the mirror bug `#markObservedMaterial`'s own comment names, in the
+ * other direction. A key may only merge variants that generate the SAME TEXT.
+ */
+function giPipelineBucketOf(material) {
+  const bucket = giRoughnessBucketOf(material);
+  // `__giGi2BucketCollapse = false` restores the four-key split, so the
+  // collapse can be A/B'd on one boot instead of on one commit.
+  if (!GI2_PATH || globalThis.__giGi2BucketCollapse === false) return bucket;
+  return bucket === 2 ? 2 : 3;
+}
+
+/**
  * ⭐ §19 STAGE 1.3, F4 — ONE SUBMIT FOR A WHOLE CHAIN, ONCE ATTRIBUTION IS MOOT.
  *
  * `Renderer.compute` opens a command encoder, opens ONE compute pass, dispatches
@@ -3288,7 +3325,34 @@ export class GISystem {
       // either way, and that putting the multiply here is what keeps the lit
       // frame the composite feeds into the cache from being the AO-less one.
       if (GI2_PATH && this._gi2Passes?.after?.length) {
-        giCompute(renderer, this._gi2Passes.after, { deferrable: true });
+        // ⭐⭐ §19 STAGE 4.3a — DEFERRABLE, EXCEPT WHILE THE COMPILE WAVE OWNS
+        // THE FRAMES.
+        //
+        // `deferrable` trades a frame of this chain's freshness for a shorter
+        // frame: an unbuilt node whose graph build would blow the 12 ms budget
+        // is registered in `giSkippedComputes` and retried NEXT FRAME. That is
+        // the right trade at 60 fps, where "next frame" is 16 ms. It is the
+        // wrong one during the material wave, where a frame is a macrotask the
+        // wave hands back roughly once a SECOND — so a chain that needs three
+        // frames' worth of budget takes three seconds, and every one of those
+        // seconds is on the critical path to first light.
+        //
+        // MEASURED, Bistro, `probe:gi2-boot`'s compute-pipeline creation
+        // timeline: hzb/probePlace 1.33 s, probeTrace 1.72 s, resolveHalf
+        // 1.91 s, the AO trio 2.05 s — then a 1.25 s HOLE before
+        // `aoCompose`/`composite`/`inject` at 3.30 s. That hole is not compile
+        // time; it is the gather's tail waiting for a frame.
+        //
+        // ⭐ THE BUDGET'S UNIT IS "A FRAME", AND A FRAME IS ONLY CHEAP WHEN
+        // SOMEBODY IS RENDERING THEM. During the wave the main thread is
+        // already saturated by 180 material graph walks, so folding the
+        // gather's ~50 ms of TSL build into one of the wave's own macrotasks
+        // costs a frame nobody was going to see and buys the whole chain.
+        // The wave is bounded and rare, so this cannot become the permanent
+        // freeze the budget exists to prevent.
+        giCompute(renderer, this._gi2Passes.after, {
+          deferrable: !this._compileWaveActive || globalThis.__giGatherDeferInWave === true,
+        });
         // The GI2 receipt (§K.8 + §L.7). ONE readback, on a slow cadence —
         // it is also what latches `_transportAlive`, so it must not wait for
         // the first user request. 30 frames ≈ half a second at 60.
@@ -4715,6 +4779,23 @@ export class GISystem {
         early.push(...occNodes);
         const srcEarly = state?.screen?.srcProbes?.passes ?? [];
         early.push(...srcEarly);
+        // ⚠ §19 STAGE 4.3a — GI2'S CHAIN IS DELIBERATELY *NOT* WARMED HERE, AND
+        // THE ATTEMPT IS WORTH RECORDING. Under `GI2_PATH` both sources above
+        // are null (no occupancy field, no SRC), so this block warms nothing —
+        // and the obvious repair, pushing `state.screen.gi2.computeNodes`, was
+        // built and MEASURED WORSE. That list is `passesForRelease()`, i.e.
+        // every node the window owns, and it is a superset of the per-frame
+        // chain: it carries the radiance cache's relight family, which the boot
+        // never dispatches. One of them, `gi2.crop`, is **526 kB of WGSL with
+        // 1378 branches and took the driver 11.8 s to compile** — and the
+        // wave's tail awaits `giPendingComputePipelines`, so warming it took
+        // the Level's `computes` phase from 36 ms to 7056 ms while moving first
+        // light not at all (1412 ms vs 1373 ms baseline).
+        //
+        // ⭐ A PREWARM LIST MUST BE THE DISPATCH LIST, NOT THE OWNERSHIP LIST.
+        // The frame-starvation this was aimed at is real and is fixed where it
+        // actually lives — at the tick's `deferrable` flag, see §19 Stage 4.3a
+        // in `#tick`'s GI2 second half.
         let sinceEarly = performance.now();
         for (const node of early) {
           if (performance.now() - sinceEarly >= 8) {
@@ -4734,7 +4815,20 @@ export class GISystem {
       // first resumed frame — user-confirmed as ~HALF their startup freeze
       // (disabling the Post Processing module halved startup).
       const objTimings = [];
-      if (!(await this.#warmOverridePass(renderer))) {
+      // §19 Stage 4.3a: TIMED, UNCONDITIONALLY, AND AT *BOTH* CALL SITES.
+      // Only the tail call was ever timed (and only above 100 ms), so on a
+      // project whose camera is owned by a postprocess override — every real
+      // one — the wave's ENTIRE cost could hide in this line: a true return
+      // here skips the per-object loop completely, and `pass.compileAsync`
+      // then compiles the whole scene in one unyielded call. "slowest
+      // objects: (single scene compile)" in the breakdown is that branch.
+      const tWarmEarly = performance.now();
+      const warmedEarly = await this.#warmOverridePass(renderer);
+      console.log(
+        `[gi] postprocess pass warm (head): ${(performance.now() - tWarmEarly).toFixed(0)}ms, ` +
+          `${warmedEarly ? "WARMED — the per-object material loop is SKIPPED" : "no override pass; per-object loop runs"}`,
+      );
+      if (!warmedEarly) {
         if (backgroundCompile) {
           // ══ THIS LOOP YIELDS ON ITS OWN CLOCK, AND HAS TO ═════════════════
           //
@@ -5144,9 +5238,10 @@ export class GISystem {
       const tWarmPass = performance.now();
       await this.#warmOverridePass(renderer);
       const warmPassMs = performance.now() - tWarmPass;
-      if (warmPassMs > 100) {
-        console.log(`[gi] postprocess pass warm: ${warmPassMs.toFixed(0)}ms (inside "computes")`);
-      }
+      // §19 Stage 4.3a: unconditional — a silent stage is indistinguishable
+      // from an absent one, which is the same reason the breakdown below lost
+      // its own threshold.
+      console.log(`[gi] postprocess pass warm (tail): ${warmPassMs.toFixed(0)}ms (inside "computes")`);
       console.log(
         `[gi] compile wave: materials ${(t1 - t0).toFixed(0)}ms, computes ${(performance.now() - t1).toFixed(0)}ms ` +
           `(${backgroundCompile ? "viewport remained live" : "render suspended, app interactive"})`,
@@ -14714,7 +14809,10 @@ export class GISystem {
     // Appending the LIVE-derived bucket keys each variant separately while
     // still letting same-bucket materials share one build.
     const original = material.customProgramCacheKey.bind(material);
-    material.customProgramCacheKey = () => original() + "|gi" + giRoughnessBucketOf(material);
+    // §19 Stage 4.3a: `giPipelineBucketOf`, not `giRoughnessBucketOf` — under
+    // GI2_PATH three of the four buckets emit the same text, and a key that
+    // splits identical texts is pure duplicated codegen and driver compile.
+    material.customProgramCacheKey = () => original() + "|gi" + giPipelineBucketOf(material);
     // ⚠ NO `material.needsUpdate = true` HERE (§19 Stage 1.2, audits J.6 R1).
     // It existed only to rebuild the observer with `hasNode = true`, and it
     // recompiled EVERY material in the scene at boot. The key must still be

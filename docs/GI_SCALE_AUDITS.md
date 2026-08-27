@@ -1041,3 +1041,206 @@ PASS (the glow term is material-side, unaffected); `test:gi-lighttree-mover`
 (mover bounce through the dynamic layer); orbit paired medians ≤ 1.2×.
 Everything old-path-only (`test:gi-src-*`, `test:gi-occupancy`) keeps running
 with `GI2_PATH=false` until Stage 4 deletes it.
+
+---
+
+## N. STAGE 4.1 CUTOVER WORK LIST (read-only census 08-27, `gi19-stage0` @ `c67bc41`)
+
+Method: `GI2_PATH = true`, follow every `import` in `GISystem.js` / `giLight.js` / `giScreen.js` /
+`gi2System.js` and the call graph from `#rebuild` / `#tick` / `#dispose`. Baseline
+`src/modules/gi/**/*.js` = **68,099 lines / 59 files** (0.1 landed at 56,767; Stage 2-3 added the 10
+`window/` files). Build check after each step: `npx esbuild --bundle src/modules/gi/GISystem.js
+--format=esm --external:three --external:three/webgpu --external:three/tsl --outfile=/dev/null` (today
+1.6 MB, 57 ms).
+
+### N.1 KEEP — reachable under GI2 (30 files, 17,725 lines, untouched)
+
+`window/` (10 files, 7,055): gatherProbes 1981, windowVoxelize 1314, gi2System 984, windowDynamic 527,
+windowTrace 508, windowStore 471, radianceCache 383, triangleSoup.worker 373, windowFill 272, triangleSoup 242.
+
+Outside `window/` (10,670): giLight 2799, lightTree 1674 (**see R1**), bvh/bvhScene 1048 (mirror tier),
+emitterShapes 845, skinnedProxy 782 (**R3**), giConfig 587, releaseCompute 542, reflectionProbeCapture 446
+(mirror tier), voxelizeOnce 438 (`resolveMaterialSurface` / `serializeMeshForBake` are `#startGi2Build`'s
+inputs — rename, do not delete), slotRegistry 284 (**R7**), primitiveFit 228, reflectionProbes 225
+(`giLight.js:45` `sampleReflectionProbes` is in every shipping material), GlobalIlluminationComponent 157,
+lightTreeStore 141, giFn 106, bootAmbient 103, ReflectionProbeComponent 86, index 46 — plus two files whose
+names lie: **`srcOctahedral.js` 99 — the gather DOES import it** (`gatherProbes.js` -> `../srcOctahedral.js`,
+also reflectionProbes + reflectionProbeCapture) -> rename `giOctahedral.js`; **`rayHit/rayHitTSL.js` 34 —
+imported by `giScreen.js:68` and `dynamicObjects.js`** -> fold `octDecodeTSL` into `giFn.js` first.
+
+### N.2 DELETE — reachable only under `GI2_PATH = false` (24 files, 24,102 lines)
+
+occupancyField 5212, srcSystem 2361, rayHit/RayHitPacking 2040, srcRef 1720, srcProbes 1678, srcMath
+1472, srcDeposit 1450, srcScreenGather 764, srcMerge 763, srcRays 752, srcShade 750, srcMathTsl 727,
+srcTiles 703, **lightTreeGpu 689**, srcSurface 521, srcSeed 459, srcSecondary 434, srcVolumeRef 418,
+srcTrace 283, srcDebugViews 215, srcGizmos 214, rayHit/RayHitValidator 167, rayHit/RayHitDebug 165,
+rayHit/RayHitConfig 145.
+
+`lightTreeGpu.js` is a full delete, not a trim: its only consumers are `GISystem.js:6664/6718`
+(`createLightTreeEmitterImportance` / `createLightTreeRecordSlot`, both fed `volume.occupancyField.bits`
+-> null under GI2) and `srcSystem.js:73`; `gatherProbes.js` does its NEE from the emitter slots directly.
+
+**Ordered sequence (esbuild-green after each step):** 1 `GISystem.js` — cut the 25 SRC-only methods
+(N.3) and every `!GI2_PATH` arm; drop imports at lines 38-48 except `srcConfig`'s ALPHA_*. · 2
+`giScreen.js` — cut the 10 now-uncalled pass factories (N.3). · 3 `index.js:33-46` — the 18
+`rayHit/*` re-exports (**zero consumers**). · 4 delete `srcSystem.js` + its 13 leaves (srcGizmos,
+srcMerge, srcRays, srcSeed, srcShade, srcSecondary, srcTiles, srcTrace, srcScreenGather, srcDeposit,
+srcProbes, srcMathTsl, srcMath) as one closed cluster. · 5 delete `lightTreeGpu.js` (now zero
+consumers). · 6 delete `srcRef.js`, `srcVolumeRef.js`, `srcDebugViews.js`, `srcSurface.js`. · 7 move
+`createSrcWorld` (`srcVolume.js:98-141`, 44 lines) into `window/windowStore.js`, repoint
+`gi2System.js:69`, delete `srcVolume.js` (-540). · 8 delete `occupancyField.js`. · 9 move
+`octDecodeTSL` into `giFn.js`, repoint `giScreen.js:68` + `dynamicObjects.js`, delete `rayHit/`. ·
+10 fold ALPHA_MOTION_SAT / ALPHA_TRACK_{HOLD,REARM,THRESHOLD} / R0_OVER_S0 into `giConfig.js`, delete
+`srcConfig.js` (1095 -> ~45). · 11 rename `srcOctahedral.js` -> `giOctahedral.js` (3 importers). ·
+12 `dynamicObjects.js` — delete `createDynamicObjectSet` (1327-2541) + `composeFieldDynamics`
+(2541-2587) = -1,260; **do R3/R4 first** or the adoption and skinned-proxy machinery loses its home.
+
+### N.3 REWIRE — reachable under both; the GI2 use is a thin spine
+
+**GISystem.js SRC-only methods, cut outright (2,453 lines), as `line/len`:** `#buildOccupancyField`
+15303/465, `#buildLightShadow` 5424/437 (returns null at 5430, `!occ?.voxel`), `#acquireLightShadowNode`
+12237/243, `#buildEmitterRecordTrace` 5861/177 (null at 5863), `#syncSrcPoolPressure` 11771/175,
+`#rebuildSrcProbesForPools` 11557/160, `#refreshOccupancyTransforms` 16143/125, `#syncLightShadowNodes`
+12134/103 (`live` false), `#refreshOccupancyContent` 16027/91, `#maybeLogSrcProbeStats` 9453/71,
+`#clearEmitterShadowTargets` 9148/54, `#lightShadowSize` 9034/46, `#releaseLightShadowNode` 12497/46,
+`#emitterShadowScale` 9106/42, `#estimateSrcStoreBytes` 8903/34, `#lightShadowScale` 9080/26,
+`#srcPoolsForBuild` 11453/24, `#buildOccupancyView` 17228/21, `#srcPoolsRestored` 11484/21,
+`#surfacePoolHintForBuild` 11520/20, `#retireShadowDepth` 12480/17, `#persistSurfacePoolHint` 11540/17,
+`#poolPrefsKey` 11437/16, `#persistSrcPools` 11505/15, `#srcBinBudgetCap` 11477/7.
+
+**SRC arms inside shared methods** (measured SRC-token line density, x~2.5 for the comment blocks that
+go with them): `#buildScreenResolve` 6038/1325 @14% = -500; `#syncScreenResolveSize` 7684/431 @23% =
+-250; `#rebuild` 9737/1374 @6% = -250; `#tick` 2167/2114 @3% = -200;
+`#refreshDynamicObjects`+`#tryAdoptDynamic` 16268/382 @10% = -150. **GISystem total ~ -4,850 -> ~12,400.**
+
+**giScreen.js (-2,400 -> ~2,360).** DELETE, all uncalled once the GISystem arms go: `createGiResolve`
+590/410 (null at GISystem:6768), `createGiIrradianceTemporalPass` 3358/363 (`irrTemporalOn` false at
+6595), `createGiLightShadowPass` 1922/353, `createGiEmitterTileCutPass` 2486/292,
+`createGiLightShadowWidePass` 3029/267, `createGiLightShadowFilterPass` 2778/251,
+`createGiEmitterShadowPass` 2275/211 (`!GI2_PATH` at 7030), `createGiFarFieldAvgPass` 503/87 (gated on
+`srcProbes?.gather` at 6528), `createGiLightShadowHistoryPass` 3296/62, `createGiShadowClearPass` 4351/58.
+KEEP `createGiGBuffer`, `renderGiGBuffer`, `createGiGtaoPass`, `createGiAoFilterPass`,
+`createGiBvhHitShade`/`Reflect`/`Target`, `giBvhReflectStride`, `blitBvhAtlasTiles`,
+`readTexturePixelsGPU`, `computeCompressedTextureAverage`. TRIM `createGiTargets` 4046/305
+(GISystem:6053-6062 says its emitterShadow + irradiance channels are allocated and never written under GI2).
+
+**Named rewires (anchors):**
+- **R1 — the light tree feeds nothing.** `gi2System.js:206` destructures `lightTree` and the identifier
+  never appears again in the file (2 hits total, both signature/JSDoc). `GISystem.js:6088` passes
+  `this._lightTreeRegion`; `#refreshLightTree` (13925/147) still runs under GI2 (9988:
+  `(this._dynSet || GI2_PATH)`). Either wire the W1 region into `gatherProbes`' NEE, or `lightTree.js`
+  (1674) + `lightTreeStore.js` + `#refreshLightTree` are dead weight.
+- **R2 — the volume spine.** `createGi2Volume` (`gi2System.js:104`) is 38 lines whose only content is
+  `createSrcWorld` (`srcVolume.js:98`). Move it; the other 540 lines of `srcVolume.js`
+  (`createSrcDistance` 155, `createSrcWidthProbe` 186, `createSrcSoftShadowTrace` 299, `createSrcVolume`
+  501) all require an occupancy field.
+- **R3 — skinned proxies are already unreachable.** `#refreshSkinnedProxies` (16800/159) is called only
+  from `#refreshDynamicObjects` (16268), which returns at 16270 (`this._dynSet` is null — it is created
+  inside `#buildOccupancyField` at 15708). The plan keeps skinned proxies -> rewire onto `#gi2Movers`
+  (15900), which today only emits world boxes for `mesh.isSkinnedMesh`.
+- **R4 — adoption.** `#tryAdoptDynamic` (16530/120), `#evictRestingMover` (17003/61),
+  `#maybeRebuildStaticBvh` (16417/81) likewise unreachable; `#gi2Movers`:15908 reads `"auto"` as STATIC
+  by design. Rewire to `windowDynamic.setMovers` before N.2 step 12.
+- **R5 — portable audit.** `#auditPortableBindings` (4442/982) collects at 4456
+  (`state.volume.occupancyField.prewarmComputes()`) and 4463 (`state.screen.srcProbes.passes`) ->
+  `state.screen.gi2.computeNodes`. ~5 lines.
+- **R6 — content walk.** `#occupancyContentOf` (15941/86) **is** GI2's content walk
+  (`#startGi2Build`:15843) — rename `#gi2Content`, keep.
+- **R7 — slot registry.** `new SlotRegistry` (9891), `#syncSlots` (13772/99), `#buildEntries`
+  (13096/245) serve SRC's attribution palette (comment at 10441); under GI2 the only surviving consumer
+  is `#ensureSlotAlbedoAtlas` (8759), i.e. the mirror tier. Gate the entries/slots walk on it.
+- **R8 — reflection probes.** `#armReflectionProbeCapture` (8295) returns at 8298 (`!state.bvhScene`);
+  keep with the mirror tier — `reflectionProbes.js` itself is unconditional (material-side).
+  **R9 — giLight** has only two `GI2_PATH` branches (`:2036` `gi2Sample`, `:2224`) — collapse both.
+- **R10 — dynamicObjects survivors.** `giMobilityOf`/`giTraceOf` (171/179) feed `#gi2Movers` and
+  `#skinnedProxyGroups`; `buildBvhWords`/`buildStaticSceneBvhWords` (330-1318) stay for the mirror tier.
+
+### N.4 TEST / SCRIPT CENSUS
+
+| group | npm scripts | runner lines | `scripts/*.html` | html lines |
+|---|---|---|---|---|
+| **DELETE** | 36 | 11,241 | 14 | 9,803 |
+| **REWRITE** | 26 | 10,931 | 1 (`gi-gpu-smoke.html`) | 1,671 |
+| **KEEP** | 35 | 12,290 | 6 | 4,379 |
+
+**DELETE (SRC-only oracles):** the 7 `test:gi-rayhit*` (2,858); the 20 `test:gi-src-*` / `probe:gi-src-*` /
+`eyecheck:gi-src` (5,201; largest `run-gi-src-ref-test.mjs` 2,623, `run-gi-src-cost-probe.mjs` 650);
+`test:gi-occupancy` 330; `test:gi-surface-pool` 206; `test:gi-src-worldkeys` + `test:gi-worldkeys-flip` +
+`test:gi-spin-retention` 938; `probe:gi-gtao` 221 (reads `state.screen.vxaoPass.target`, a vxao remnant);
+`probe:gi-debug-views` 291 (built entirely on the three global-only SRC views); `probe:gi-boot` 1,098 (its
+own header says `probe:gi2-boot` supersedes it). Plus **31 orphaned SRC runners with no `package.json`
+entry (8,820 lines)** — largest `run-gi-flicker-frame.mjs` 1924, `run-gi-lightshadow.mjs` 716,
+`run-gi-real-shadow-probe.mjs` 702, six `run-blackframe-*`.
+
+**REWRITE** (asserts something GI2 must still satisfy, but reads an SRC internal):
+
+| script | reads today | must read instead |
+|---|---|---|
+| `test:gi-spawn` | `state.volume.occupancyField` | `windowDynamic` + `profile.gi2.dynamic` |
+| `test:gi-lighttree-nee` | `__giSrcLightTree`, the `srcSystem` boot line | drop the gate (tree unconditional); `lightTree.js` + `gi2.freshShades` |
+| `test:gi-lighttree-mover` | `volume.occupancyField.bitsBuffer` | `gi._lightTreeStore.bitsBuffer` (already the fallback arm) |
+| `test:gi-compute-release` | `screen.srcProbes.{passes,cpuMirrors}` | `screen.gi2.{computeNodes,storageAttributes}` |
+| `probe:gi-portable` | `occupancyField.passes()`, `srcProbes.passes[]` | `screen.gi2.computeNodes` + `gi2.occupancyMs` |
+| `probe:gi-walk` (1,424) | 21 `__giSrc*`, `srcRef`, `srcScreenGather` | `gatherProbes` + `radianceCache`; `gi2.{probesValid,reprojHits,freshShades}` |
+| `probe:gi-emitter-shadow` (982), `probe:gi-shadow-viewdist` | `occupancyField` + the `srcVolume` shadow trace | **both estimators die at step 7** — re-aim at GI2's probe-res emitter term, or delete |
+| `probe:gi-attribution` | `giPasses.srcProbes.{unattributedRate,shadedHitsPerFrame}` | `gi2.{windowHits,screenHits,skyMiss,freshShades}` |
+| `smoke:gi-gpu` | `result.srcProbes.*` | `result.gi2` — the branch comment already exists at `run-gi-gpu-smoke.mjs:90-92` |
+| `test:gi-src-volume` (698) | L83-562 is a `srcVolumeRef` CPU oracle; L563-698 is the `createSrcWorld` spine | **split the file**, keep the spine only |
+
+Also REWRITE, same shape: `test:gi-instanced`, `test:gi-sparse`, `test:gi-coverage`, `test:gi-colour-bleed`,
+`probe:gi-colour-seam`, `probe:gi-flat-walls`, `probe:gi-lowsun-blocky`, `probe:gi-ao-glossy`,
+`test:gi-probe-density`, `test:gi-gather-los`, `probe:gi-emissive-cost`, `test:gi-lighttree-sponza`,
+`test:gi-shadowed-bulb`, `test:gi-seat-churn`, `test:gi-emitter-size`. `test:gi-sunleak` (`__giEntity`
+only) and `test:gi-lightvis` (`cascade` in a comment) need **no** change — M.4 already names sunleak the
+GI2 gate. `scripts/lib/*` = 12 files / 2,861 lines, **all KEEP**, no SRC import anywhere.
+
+### N.5 PROFILE + DEBUG VIEWS
+
+`profile.giPasses` (`src/editor/api/ops/profile.js`): the `srcProbes` block (L186-318) goes `null` at
+its own L187 guard — no throw, but 17 fields vanish. Map: `totalMs`->`gi2TotalMs` (341);
+`dispatches`->`keys(gi2Ms)` (340); `megabytes`->`windowMB+cacheMB+soupMB`; `reanchors`->`scrolls`;
+`cascades[].live`->`probesValid`; `.capacity`->`probes`; `shadedHitsPerFrame`->`freshShades`+`windowHits`;
+`raysPerFrame`->`raysTraced`; `marcher` (324)->`describe().voxelizer`. **No equivalent yet:** `groupMs`
+(GI2 has no `passGroups`, only per-pass `__giPassName`), `loadFactor`, `meanProbeSteps`, `probeRayCap`,
+`unattributedRate`, `merge`/`seed`/`tiles`. Delete `SCREEN_PASSES` (L34-42 — all 8 keys name deleted
+passes) and the L349-351 note. In `profile.frameStats` only `giHold.fieldQuietFrames` (646) loses meaning;
+the `gi2` block (681-745, 23 fields) is already complete. **`profile.gi2` exists in source (L936-948) but
+is NOT registered in the live MCP tool list** — register it, or the "every feature drivable by an agent"
+rule fails exactly at the cutover.
+
+Debug views: the 5 enumerated `GI_DEBUG_VIEWS` (`giConfig.js:72-86` — `off`, `indirect`, `ao`,
+`reflections`, `reflections-exact`) **all survive**; verify the GI2 resolve writes `targets.irradiance` for
+`indirect` (GISystem:13016). The three global-only `__giDebugView` modes die with their backing files:
+`"sdf"` (GISystem:12971 -> `srcDebugViews.js:154`), `"occupancy"` (12972 -> `:62`), `"src-probes"` (7332 +
+12977-12986 -> `srcGizmos.js`). GI2 successors (a window occupancy slice off `windowStore`, probe gizmos
+off `gatherProbes`' probe buffer) are **not in scope for 4.1** — delete the modes and the stale comments
+at `giConfig.js:36-38, 67-70, 88-93`.
+
+### N.6 RISKS
+
+1. **The 25 k gate is not reachable by deletion.** 68,099 - 24,102 (N.2) - 10,115 (N.3) = **~33,900**. The
+   rest exists only as prose: `GISystem.js` is 8,891 comment / 8,114 code lines (51.5 %), `giScreen.js`
+   2,423 / 2,270. Either re-gate 4.1 at **<= 34 k**, or budget an archaeology amnesty that moves the
+   retired-mechanism banners into this document.
+2. **A shipped user-facing feature is already inert under GI2.** `LightComponent.js:107` `{key:"shadowMode",
+   label:"Shadow Source", options:["map","gi"]}` hides 13 inspector rows when set to `"gi"`;
+   `#publishGIShadowContract` (:367) writes `userData.giShadowMode`; `shadowFreeze.js:194` branches on it.
+   Under `GI2_PATH=true` `#buildLightShadow` returns null at 5430, so such a light silently falls back to
+   three's tiny map — a live regression on `c67bc41`, not merely a cutover risk. Decide: GI2 sun shadows
+   through the window trace, or retire the prop (a `LightComponent` schema change, which the GI
+   three-property rule does not cover).
+3. **Per-pixel analytic emitter shadows go with `createGiEmitterShadowPass` + the tile cut** (~1,200 lines
+   of giScreen) — the PLAN 4.4 trade, but the Level's lamps are the user's stated favourite term. Measure
+   before deleting; `emitterTileKeyed` (GISystem:7252) and `__giTileCutLive` die with it.
+4. **`lightTree` is plumbed into GI2 and never read** (R1) — do not bank `lightTree.js`'s 1,674 lines
+   as "kept" until `gatherProbes` consumes the region.
+5. **No non-GI module is at risk.** A repo-wide grep outside `src/modules/gi/` finds **zero** imports of
+   `src*.js`, `occupancyField.js` or `rayHit/`. `shadowMerge.js`, `merging.js`, `MeshComponent*`,
+   `frameGovernor.js`, `sceneSettings.js` and every `src/editor` file are clean; the entire editor
+   exposure is one file, `src/editor/api/ops/profile.js`. Likewise `index.js:33-46` — 18 `rayHit/*`
+   re-exports with **zero consumers** (the two scripts that use them import the files directly).
+6. **~60 `__gi*` flags become dead** — every `__giSrc*` (36), `__giRayHit*` (4), `__giNoOccupancy` /
+   `__giOccBudget` / `__giSparseField` / `__giNoDirtyBrick` / `__giNoHiResSdf`, `__giCascadeBranch`,
+   `__giC0DirRes`, the 5 `__giTileCut*` and the 6 `__giMerge*`/`__giParallax*`. The editor **sets** none
+   of them (read-only tests at `profile.js:106,110`); every setter is in `scripts/`. Sweep them with
+   N.4's DELETE group or they become 60 silent no-ops.

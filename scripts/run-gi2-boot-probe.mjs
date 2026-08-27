@@ -37,8 +37,74 @@
 //   SETTLE=10          seconds of steady state before the perf read
 //   FIRST_LIGHT_MS=3000 · GI_GPU_MS=4 · HEAP_MB=1500   the budgets
 //   HEADED=1
+import zlib from "node:zlib";
 import puppeteer from "puppeteer-core";
 import { installTauriShim } from "./lib/tauriShim.mjs";
+
+// ── MEAN LUMINANCE OF A COMPOSITOR SCREENSHOT (§19 Stage 4.3a) ──────────────
+//
+// ⚠ A WEBGPU CANVAS CANNOT BE `drawImage`d. The first version of this receipt
+// picked the viewport canvas correctly, sampled it 184 times, and reported a
+// mean of 0.00 on a boot that was plainly rendering — the instrument was blind
+// to its subject ([[probe-blind-statistics]]), not the scene black. The only
+// capture path that sees WebGPU content is the COMPOSITOR's, i.e. puppeteer's
+// `page.screenshot`, which hands back a PNG. Decoding it here (zlib is in the
+// standard library; a screenshot is 8-bit RGB/RGBA, non-interlaced) keeps the
+// probe dependency-free and keeps the sample off the page's main thread, which
+// is the thread the compile wave is busy blocking.
+function pngMeanLuminance(buf) {
+  if (buf.length < 8 || buf.readUInt32BE(0) !== 0x89504e47) return null;
+  let at = 8;
+  let w = 0; let h = 0; let depth = 0; let color = 0; let interlace = 0;
+  const idat = [];
+  while (at + 8 <= buf.length) {
+    const len = buf.readUInt32BE(at);
+    const type = buf.toString("ascii", at + 4, at + 8);
+    const body = buf.subarray(at + 8, at + 8 + len);
+    if (type === "IHDR") {
+      w = body.readUInt32BE(0); h = body.readUInt32BE(4);
+      depth = body[8]; color = body[9]; interlace = body[12];
+    } else if (type === "IDAT") idat.push(body);
+    else if (type === "IEND") break;
+    at += 12 + len;
+  }
+  if (!w || !h || depth !== 8 || interlace !== 0) return null;
+  const channels = color === 2 ? 3 : color === 6 ? 4 : color === 0 ? 1 : 0;
+  if (!channels) return null;
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const stride = w * channels;
+  const prev = Buffer.alloc(stride);
+  const cur = Buffer.alloc(stride);
+  let sum = 0;
+  for (let y = 0, p = 0; y < h; y++) {
+    const filter = raw[p++];
+    raw.copy(cur, 0, p, p + stride);
+    p += stride;
+    for (let i = 0; i < stride; i++) {
+      const a = i >= channels ? cur[i - channels] : 0;
+      const b = prev[i];
+      const c = i >= channels ? prev[i - channels] : 0;
+      let v = cur[i];
+      if (filter === 1) v += a;
+      else if (filter === 2) v += b;
+      else if (filter === 3) v += (a + b) >> 1;
+      else if (filter === 4) {
+        const pp = a + b - c;
+        const pa = Math.abs(pp - a); const pb = Math.abs(pp - b); const pc = Math.abs(pp - c);
+        v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+      }
+      cur[i] = v & 0xff;
+    }
+    for (let x = 0; x < w; x++) {
+      const i = x * channels;
+      sum += channels === 1
+        ? cur[i]
+        : 0.2126 * cur[i] + 0.7152 * cur[i + 1] + 0.0722 * cur[i + 2];
+    }
+    cur.copy(prev);
+  }
+  return sum / (w * h);
+}
 
 const url = (process.argv[2] ?? "http://127.0.0.1:5202/").replace(/\/$/, "");
 const PROJECT = (process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME").replaceAll("\\", "/");
@@ -69,15 +135,31 @@ const pageHook = () => {
   if (!globalThis.GPUDevice) return;
   patch(GPUDevice.prototype, "createShaderModule", function (orig, args) {
     const mod = orig.apply(this, args);
-    try { rec.bytesByModule.set(mod, (args[0]?.code ?? "").length); } catch { /* frozen */ }
+    try {
+      const code = args[0]?.code ?? "";
+      // §19 Stage 4.3a: the CONTENT SIGNATURE, not just the byte count. "How
+      // many distinct fragment programs did this boot mint" is the whole
+      // material-variant question, and a count of pipelines cannot answer it —
+      // four roughness buckets of one material are four pipelines over
+      // (possibly) four texts, or over one. Same cheap stride hash
+      // `run-gi-boot-probe` uses, so the two probes' numbers line up.
+      let h = 0;
+      for (let i = 0; i < code.length; i += 127) h = ((h * 33) ^ code.charCodeAt(i)) >>> 0;
+      rec.bytesByModule.set(mod, { bytes: code.length, sig: `${code.length}:${h.toString(36)}` });
+    } catch { /* frozen */ }
     return mod;
   });
   const note = (desc, kind, async) => {
     const mod = kind === "compute" ? desc?.compute?.module : (desc?.fragment?.module ?? desc?.vertex?.module);
     let bytes = 0;
-    try { bytes = rec.bytesByModule.get(mod) ?? 0; } catch { /* ditto */ }
+    let sig = "";
+    try {
+      const info = rec.bytesByModule.get(mod);
+      bytes = info?.bytes ?? 0;
+      sig = info?.sig ?? "";
+    } catch { /* ditto */ }
     rec.pipelines.push({
-      kind, async,
+      kind, async, sig,
       label: desc?.label ?? "",
       pass: globalThis.__giCurrentPassName?.() ?? "",
       bytes,
@@ -111,6 +193,13 @@ const page = await browser.newPage();
 await page.setViewport({ width: 1650, height: 970, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
 await page.evaluateOnNewDocument(pageHook);
+// FLAGS={"__giNoCompileWave":true} — the same hatch `run-gi-boot-probe` has.
+// An A/B of a boot-order claim needs to set a global BEFORE the page runs, and
+// without this the only way to test "is the compile wave what starves the
+// voxelizer" is to edit the engine, which makes the arms non-comparable.
+await page.evaluateOnNewDocument((flags) => {
+  for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
+}, JSON.parse(process.env.FLAGS ?? "{}"));
 await page.evaluateOnNewDocument((project) => {
   // Headless is never focused, and the editor suspends an unfocused viewport —
   // without this every frame number is a lie and GI never ticks at all.
@@ -138,7 +227,7 @@ page.on("console", (m) => {
   if (/\[gi2\] first light/.test(t) && !marks.firstLight) marks.firstLight = now;
   if (/\[gi2\] soup /.test(t)) marks.soup = t;
   if (/\[gi\] built/.test(t)) marks.built++;
-  if (/\[gi2\]|gi2|screen chain|unavailable|failed|Error|\[gi\] (built|light shadows|quality|auto-fit|compile wave|transport)/.test(t)) {
+  if (/\[gi2\]|gi2|screen chain|unavailable|failed|Error|postprocess pass warm|wave breakdown|prewarm loop|SLOWEST PIPELINE|pipelines compiled|variant swap|\[gi\] (built|light shadows|quality|auto-fit|compile wave|transport)/.test(t)) {
     marks.lines.push(t.slice(0, 220));
     console.log(`    ${t.slice(0, 900)}`);
   }
@@ -180,8 +269,80 @@ for (const name of SCENES) {
   console.log(`\n══ ${name} ═══════════════════════════════════════════════`);
   resetMarks();
   const ledgerBefore = await page.evaluate(() => globalThis.__gi2BootProbe?.pipelines.length ?? 0);
+  // ── THE VISUAL-SAFETY RECEIPT (§19 Stage 4.3a) ────────────────────────────
+  //
+  // Stage 4.3a lets materials keep DRAWING WITH THEIR OLD PROGRAM while the
+  // GI-injected variant compiles in the background. The failure that buys is
+  // not a slow boot, it is a WRONG FRAME: a material that swaps half-configured,
+  // or a scene that goes unlit for a second while the swap lands. Neither shows
+  // up in a first-light timestamp, so the swap needs its own instrument —
+  // the frame's mean luminance, sampled straight off the viewport canvas
+  // every 200 ms through the whole wave. The gate is a floor relative to the
+  // settled value, not an absolute: `never below 50% of the post-wave mean
+  // after first light`.
+  //
+  // ⚠ IF EVERY SAMPLE IS 0 THE INSTRUMENT IS BLIND, NOT THE SCENE BLACK
+  // ([[probe-blind-statistics]]) — the report says so rather than passing.
+  //
+  // ⚠ THE VIEWPORT IS NOT THE BIGGEST CANVAS EITHER — the editor keeps 4k
+  // offscreen canvases around (thumbnails, GI's slot-albedo atlas). Pick by
+  // ON-SCREEN box, which is what "the frame the user sees" means, and clip the
+  // capture to a small centred patch so a sample costs a few ms rather than a
+  // full-page PNG.
+  const lum = [];
+  let lumPick = "";
+  let clip = null;
+  const findClip = async () => {
+    const r = await page.evaluate(() => {
+      let best = null;
+      let area = 0;
+      for (const c of document.querySelectorAll("canvas")) {
+        const b = c.getBoundingClientRect();
+        const a = b.width * b.height;
+        if (a > area && b.width > 8 && b.height > 8) { area = a; best = { c, b }; }
+      }
+      if (!best) return null;
+      const { c, b } = best;
+      return {
+        x: b.x, y: b.y, w: b.width, h: b.height,
+        pick: `${c.className || c.id || "canvas"} ${c.width}x${c.height} on-screen ${Math.round(b.width)}x${Math.round(b.height)}`,
+      };
+    });
+    if (!r) return null;
+    lumPick = r.pick;
+    const w = Math.min(240, Math.floor(r.w));
+    const h = Math.min(160, Math.floor(r.h));
+    return { x: Math.round(r.x + (r.w - w) / 2), y: Math.round(r.y + (r.h - h) / 2), width: w, height: h };
+  };
+  // ⛔ OPT-IN (`LUM=1`), AND THAT IS NOT TIDINESS — IT IS THE MEASUREMENT.
+  // A compositor screenshot every 200 ms perturbs the very boot it is watching:
+  // with the sampler on, Bistro's first light read 7699 ms against 5447 ms on
+  // the same build minutes earlier, and the wave's own number moved 7231 →
+  // 4003 ms. So the visual receipt gets its OWN run and every timing run is
+  // clean. ⭐ An instrument heavy enough to change its subject must never be
+  // on by default in the arm that reports the subject's number.
+  const LUM = process.env.LUM === "1";
+  const sampleLum = async () => {
+    if (!LUM) return;
+    try {
+      clip ??= await findClip();
+      if (!clip) return;
+      const png = await page.screenshot({ clip, type: "png", captureBeyondViewport: false });
+      const mean = pngMeanLuminance(Buffer.from(png));
+      if (mean != null) lum.push({ at: Date.now(), lum: +mean.toFixed(2) });
+    } catch { /* a screenshot can race a resize; the next sample is 200 ms away */ }
+  };
   const openedAt = Date.now();
-  const opened = await call("scene.open", { path: scenePath });
+  const openCall = call("scene.open", { path: scenePath });
+  // NOT awaited before the sampler starts: the whole point is to watch the
+  // frame WHILE the scene opens and the wave runs.
+  let openSettled = null;
+  openCall.then((r) => { openSettled = r; }, (e) => { openSettled = { ok: false, error: String(e) }; });
+  while (!openSettled) {
+    await sampleLum();
+    await wait(200);
+  }
+  const opened = await openCall;
   if (!opened.ok) {
     console.log(`  FATAL scene.open: ${opened.error}`);
     failed++;
@@ -193,7 +354,10 @@ for (const name of SCENES) {
   // scene's assets are in", and a scene whose assets were already resident
   // never prints the line.
   const deadline = Date.now() + BOOT_TIMEOUT;
-  while (Date.now() < deadline && !marks.firstLight) await wait(250);
+  while (Date.now() < deadline && !marks.firstLight) {
+    await sampleLum();
+    await wait(200);
+  }
   const anchor = marks.assetsReady || openedAt;
   const firstLightMs = marks.firstLight ? marks.firstLight - anchor : Infinity;
 
@@ -205,7 +369,15 @@ for (const name of SCENES) {
   // Settle, then measure. `__editorKeepRendering` keeps the loop alive; the
   // wait is what separates "the first frames after a compile wave" from the
   // steady state every budget in §M.4 is written against.
-  await wait(SETTLE * 1000);
+  // Sampled, not slept: the wave outlives first light, and the frames the
+  // swap has to be judged on are exactly the ones in this window.
+  {
+    const until = Date.now() + SETTLE * 1000;
+    while (Date.now() < until) {
+      await sampleLum();
+      await wait(200);
+    }
+  }
 
   const frameStats = (await call("profile.frameStats", { settleMs: 1100 })).value ?? {};
   const gi2 = (await call("profile.gi2")).value ?? null;
@@ -235,6 +407,67 @@ for (const name of SCENES) {
     `   occupancy ${occRows.length ? occRows.join(", ") : "none"}`);
   console.log(`  ${marks.soup ?? "  (no soup line — the window never received geometry)"}`);
   console.log(`  pipelines: ${compute.length} compute + ${render.length} render, ${kB.toFixed(1)} kB WGSL`);
+  // ── THE MATERIAL-VARIANT CENSUS (§19 Stage 4.3a) ─────────────────────────
+  // `render.length` is the pipeline count; what the compile wave actually
+  // pays for is DISTINCT FRAGMENT TEXT, because that is what three's codegen
+  // walks and what the driver compiles. The gap between the two is the
+  // duplication a key collapse can delete.
+  {
+    const bySig = new Map();
+    for (const p of render) {
+      if (!p.sig) continue;
+      const e = bySig.get(p.sig) ?? { count: 0, bytes: p.bytes };
+      e.count++;
+      bySig.set(p.sig, e);
+    }
+    const groups = [...bySig.values()].sort((a, b) => b.bytes - a.bytes);
+    const dupes = groups.reduce((s, g) => s + (g.count - 1), 0);
+    console.log(`  fragments: ${render.length} render pipelines over ${groups.length} distinct fragment shaders ` +
+      `(${dupes} reuse an already-seen text); largest ${(groups[0]?.bytes ?? 0) / 1024 | 0} kB, ` +
+      `top ${groups.slice(0, 5).map((g) => `${Math.round(g.bytes / 1024)}kB×${g.count}`).join(" ")}`);
+  }
+  // ── WHEN DID EACH GI2 KERNEL'S PIPELINE GET CREATED? ─────────────────────
+  //
+  // The gap between "the voxelizer is live" and "the window holds occupancy"
+  // has two candidate mechanisms that a first-light timestamp cannot tell
+  // apart: the dispatches are FRAME-STARVED (a per-frame budget, few frames),
+  // or they are COMPILE-BLOCKED (a dispatch whose pipeline has not landed is
+  // skipped). Creation time per pass, against the same anchor as first light,
+  // separates them — a voxelize pipeline created at 1.2 s with occupancy at
+  // 3.8 s is starvation; one created at 3.5 s is the compile.
+  {
+    const epoch = await page.evaluate(() => globalThis.__gi2BootProbe?.epochAtT0 ?? 0);
+    const firstBy = new Map();
+    for (const p of ledger) {
+      if (p.kind !== "compute") continue;
+      const nm = p.pass || p.label || "(anon)";
+      if (!firstBy.has(nm)) firstBy.set(nm, epoch + p.at - anchor);
+    }
+    const line = [...firstBy.entries()].sort((a, b) => a[1] - b[1])
+      .map(([n, t]) => `${n}@${(t / 1000).toFixed(2)}s`).join(" ");
+    console.log(`  compute pipeline creation: ${line}`);
+  }
+  // ── THE SWAP'S VISUAL-SAFETY RECEIPT ─────────────────────────────────────
+  if (LUM) {
+    console.log(`  luminance source: ${lumPick || "(no canvas found)"}`);
+    const post = lum.slice(-15);
+    const settled = post.length ? post.reduce((s, p) => s + p.lum, 0) / post.length : 0;
+    const afterLight = marks.firstLight ? lum.filter((p) => p.at >= marks.firstLight) : [];
+    const floor = afterLight.length ? Math.min(...afterLight.map((p) => p.lum)) : null;
+    if (!lum.length || settled <= 0.01) {
+      console.log(`  luminance: ⚠ BLIND — ${lum.length} samples, settled mean ${settled.toFixed(2)}. ` +
+        "The canvas snapshot returned nothing; this run proves nothing about the swap.");
+    } else {
+      const pct = floor == null ? null : (100 * floor) / settled;
+      console.log(`  luminance: ${lum.length} samples, settled ${settled.toFixed(1)}, ` +
+        `min after first light ${floor == null ? "n/a" : floor.toFixed(1)} ` +
+        `(${pct == null ? "n/a" : `${pct.toFixed(0)}% of settled`}) — ` +
+        `${pct == null ? "no post-light samples" : pct >= 50 ? "PASS (≥50%)" : "FAIL (<50%)"}`);
+      const series = lum.filter((_, i) => i % 2 === 0).slice(-40)
+        .map((p) => `${((p.at - anchor) / 1000).toFixed(1)}s:${p.lum.toFixed(0)}`).join(" ");
+      console.log(`    series ${series}`);
+    }
+  }
   console.log(`  frame: ${frameStats.fps ?? "?"} fps, cpu ${frameStats.cpuMs ?? "?"} ms, gpu ${frameStats.gpuMs ?? "?"} ms` +
     `${frameStats.gpuMsIsReal ? "" : " (estimated)"}, heap ${heapMB.toFixed(0)} MB, transport ${frameStats.giTransport ?? "?"}`);
   if (gi2) {
