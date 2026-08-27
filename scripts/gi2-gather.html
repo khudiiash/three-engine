@@ -141,7 +141,7 @@
           win, trace, cache,
           positionTexture: gbufferRt.textures[0],
           normalTexture: gbufferRt.textures[1],
-          width: W, height: Hh, tier: TIER, crops: 8,
+          width: W, height: Hh, tier: TIER, crops: 24,
         });
         gather.setPalette(PALETTE);
         const gu = gather.uniforms;
@@ -241,7 +241,7 @@
           gu.statsOn.value = statsOn ? 1 : 0;
         };
 
-        const runFrame = async (n) => {
+        const runFrame = async (n, opts = {}) => {
           gather.beginFrame(n);
           camera.updateMatrixWorld(true);
           vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
@@ -257,11 +257,18 @@
           await compute(gather.passes.probeFilter);
           await compute(gather.passes.resolve);
           await compute(gather.passes.composite);
-          await compute(gather.passes.inject);
+          if (opts.inject !== false) await compute(gather.passes.inject);
           prevVp.copy(vp);
         };
 
         // ── crop plumbing ─────────────────────────────────────────────────
+        // The first eight are §3.1's receipts and their names are load-bearing
+        // (the node runner's parity table keys off them). The `wallLadder`
+        // rows below them are §3.2 item 4's instrument: the same wall, the
+        // same z, at eight HEIGHTS straddling the camera's own (−0.5), so a
+        // "horizontal tone step at camera height" is a number and not an
+        // impression. `sphereEdge` is the crescent item 2 is about — the crop
+        // named `sphere` sits where the bias already escapes the voxelization.
         const CROPS = [
           { name: "redWall", p: [-4.99, -0.5, -1.0] },
           { name: "greenWall", p: [4.99, -0.5, -1.0] },
@@ -271,6 +278,11 @@
           { name: "floorGreen", p: [4.2, -2.99, 0.0] },
           { name: "boxTop", p: [-2.0, -0.99, -1.5] },
           { name: "sphere", p: [2.0, -2.4, 1.9] },
+          { name: "sphereEdge", p: [2.30, -2.24, 1.79], diag: true },
+          { name: "panelSide", p: [0.0, 2.95, 1.5], diag: true },
+          ...[-2.0, -1.5, -1.0, -0.75, -0.25, 0.0, 0.5, 1.0].map((y) => ({
+            name: `wall@${y.toFixed(2)}`, p: [-4.99, y, -1.0], diag: true,
+          })),
         ];
         const cropArr = gather.buffers.cropIn.value.array;
         const writeCrops = () => {
@@ -281,7 +293,10 @@
             cropArr[i * 4 + 1] = Math.round(q.y);
             cropArr[i * 4 + 2] = 0;
             cropArr[i * 4 + 3] = 0;
-            meta.push({ name: c.name, want: c.p, px: Math.round(q.x), py: Math.round(q.y), onScreen: onScreen(q) });
+            meta.push({
+              name: c.name, want: c.p, px: Math.round(q.x), py: Math.round(q.y),
+              onScreen: onScreen(q), diag: !!c.diag,
+            });
           });
           gather.buffers.cropIn.value.needsUpdate = true;
           return meta;
@@ -292,7 +307,8 @@
           return CROPS.map((c, i) => {
             const b = i * 6 * 4;
             return {
-              name: c.name,
+              name: c.name, diag: !!c.diag,
+              px: cropArr[i * 4], py: cropArr[i * 4 + 1],
               pos: [f[b], f[b + 1], f[b + 2]], samples: f[b + 3],
               nrm: [f[b + 4], f[b + 5], f[b + 6]],
               irr: [f[b + 8], f[b + 9], f[b + 10]],
@@ -416,10 +432,478 @@
           `rays ${statsIn.raysTraced}/${statsIn.raysLaunched} (${(100 * statsIn.raysTraced / Math.max(1, statsIn.raysLaunched)).toFixed(1)} % yield), ` +
           `screen ${statsIn.screenHits} / window ${statsIn.windowHits} / sky ${statsIn.skyMiss}, ` +
           `fresh shades ${statsIn.freshShades}, hand-offs ${statsIn.handoffs}, injected ${statsIn.injectWrites}`);
-        for (const c of inFrame) {
+        say(`hysteresis: alpha forced to 0.5 on ${statsIn.alphaForced} of ${statsIn.raysTraced} traced rays = ` +
+          `${(100 * statsIn.alphaForced / Math.max(1, statsIn.raysTraced)).toFixed(1)} % — a rate near 50 % means the ` +
+          `test is firing on SHOT NOISE, not on lighting changes`);
+        for (const c of inFrame.filter((x) => !x.diag)) {
           say(`  ${c.name.padEnd(12)} pos ${c.pos.map((v) => v.toFixed(2)).join(",").padEnd(20)} ` +
             `E ${c.irr.map((v) => v.toFixed(3)).join(" ")}  albedo ${c.albedo.map((v) => v.toFixed(2)).join(" ")}  ` +
             `${c.samples} px`);
+        }
+
+        // ══════════════════════ THE COLOUR PROBE, STAGE BY STAGE (§3.2)
+        //
+        // ⭐ READ BACK EVERY STAGE; THE FIRST WRONG ONE IS THE SOURCE. A crop
+        // that comes out dark can be dark for four different reasons with one
+        // symptom: its probes were ANCHORED on another surface, their rays hit
+        // nothing (or hit themselves), the 3×3 filter pooled probes off this
+        // plane, or the resolve weighted them all to zero and fell back. The
+        // audit walks the pipeline in that order and prints, per crop, the
+        // four probes the resolve will actually use, with the trace evidence
+        // (texel fill, SELF-HIT fraction from the hit distance the alpha
+        // carries, sky fraction) beside the resolve's own weights.
+        const OCT_TBL = gatherMod.octTable(gd.oct).map((v) => [v.x, v.y, v.z, v.w]);
+        const OCTN = gd.oct * gd.oct;
+        const dumpBuffers = async () => ({
+          half: gather.frame & 1,
+          meta: new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.probeMeta.value)),
+          raw: new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.probeOct.value)),
+          filt: new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.probeFiltered.value)),
+          sh: new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.probeSh.value)),
+        });
+        /** Everything knowable about one probe, from the three buffers. */
+        const probeStat = (D, pi, N) => {
+          const mb = (D.half * gd.probeCount * 3 + pi * 3) * 4;
+          const pos = [D.meta[mb], D.meta[mb + 1], D.meta[mb + 2]];
+          const valid = D.meta[mb + 3];
+          const nrm = [D.meta[mb + 4], D.meta[mb + 5], D.meta[mb + 6]];
+          const depth = D.meta[mb + 7];
+          const prev = D.meta[mb + 8];
+          let fill = 0; let self = 0; let sky = 0; let dsum = 0;
+          // ⚠ A MEAN HIT DISTANCE CANNOT SEE A BIMODAL POPULATION. "d̄ = 4 m"
+          // is what 90 % of rays stopped at 0.3 m and 10 % at 38 m looks like,
+          // and those are two completely different diagnoses. Near and far are
+          // counted, and their radiance averaged, separately.
+          let near = 0; let nearL = 0; let farL = 0;
+          const texels = [];
+          const Er = [0, 0, 0]; const Ef = [0, 0, 0];
+          for (let t = 0; t < OCTN; t++) {
+            const ob = (D.half * gd.probeCount * OCTN + pi * OCTN + t) * 4;
+            const a = D.raw[ob + 3];
+            const nS = Math.floor(a / 1024);
+            const dist = a - nS * 1024;
+            if (nS > 0) {
+              fill++; dsum += dist;
+              if (dist < 0.06) self++;
+              if (dist > 39) sky++;
+              const l = lum([D.raw[ob], D.raw[ob + 1], D.raw[ob + 2]]);
+              if (dist < 1.0) { near++; nearL += l; } else { farL += l; }
+              const e0 = OCT_TBL[t];
+              texels.push({ t, dir: [e0[0], e0[1], e0[2]], dw: e0[3], dist: +dist.toFixed(3), L: +l.toFixed(4) });
+            }
+            const e = OCT_TBL[t];
+            const c = e[0] * N[0] + e[1] * N[1] + e[2] * N[2];
+            if (c > 0) {
+              const fb = (pi * OCTN + t) * 4;
+              for (let k = 0; k < 3; k++) { Er[k] += D.raw[ob + k] * c * e[3]; Ef[k] += D.filt[fb + k] * c * e[3]; }
+            }
+          }
+          // The SH2 evaluation the shipped resolve now does, mirrored exactly.
+          const L = [];
+          for (let i = 0; i < 9; i++) { const b = (pi * 9 + i) * 4; L.push([D.sh[b], D.sh[b + 1], D.sh[b + 2]]); }
+          const c1 = 0.429043; const c2 = 0.511664; const c3 = 0.743125;
+          const c4 = 0.886227; const c5 = 0.247708;
+          const Esh = [0, 1, 2].map((k) => Math.max(0,
+            c1 * L[8][k] * (N[0] * N[0] - N[1] * N[1]) + c3 * L[6][k] * N[2] * N[2] + c4 * L[0][k] - c5 * L[6][k]
+            + 2 * c1 * (L[4][k] * N[0] * N[1] + L[7][k] * N[0] * N[2] + L[5][k] * N[1] * N[2])
+            + 2 * c2 * (L[3][k] * N[0] + L[1][k] * N[1] + L[2][k] * N[2])));
+          return {
+            pi, pos, nrm, valid, depth, prev, fill, self, sky, near, texels,
+            nearL: near ? nearL / near : 0, farL: fill - near ? farL / (fill - near) : 0,
+            dmean: fill ? dsum / fill : 0, Eraw: Er, Efilt: Ef, Esh,
+          };
+        };
+        /** The resolve's own four corners and weights, mirrored on the CPU. */
+        const cornersOf = (D, px, py, P, N) => {
+          const TT = gd.tile;
+          const tfx = (px + 0.5) / TT - 0.5;
+          const tfy = (py + 0.5) / TT - 0.5;
+          const bx = Math.floor(tfx); const by = Math.floor(tfy);
+          const fx = tfx - bx; const fy = tfy - by;
+          const outArr = [];
+          for (let c = 0; c < 4; c++) {
+            const dx = c & 1; const dy = (c >> 1) & 1;
+            const ix = Math.min(Math.max(bx + dx, 0), gd.probeW - 1);
+            const iy = Math.min(Math.max(by + dy, 0), gd.probeH - 1);
+            const st = probeStat(D, iy * gd.probeW + ix, N);
+            const bl = (dx ? fx : 1 - fx) * (dy ? fy : 1 - fy);
+            const wp = Math.exp(-Math.abs(
+              N[0] * (st.pos[0] - P[0]) + N[1] * (st.pos[1] - P[1]) + N[2] * (st.pos[2] - P[2])) / (2 * wd.voxel0));
+            const wn = Math.max(0, N[0] * st.nrm[0] + N[1] * st.nrm[1] + N[2] * st.nrm[2]);
+            outArr.push({ ...st, ix, iy, bl, wp, wn, w: bl * wp * wn * wn * st.valid });
+          }
+          return outArr;
+        };
+        {
+          const D = await dumpBuffers();
+          const audit = [];
+          const WANT = ["floorSpot", "redWall", "boxTop", "sphere", "sphereEdge"];
+          say("");
+          say("PROBE AUDIT — placement → trace → filter → resolve, per crop");
+          for (const name of WANT) {
+            const c = inFrame.find((x) => x.name === name);
+            if (!c) continue;
+            const cs = cornersOf(D, c.px, c.py, c.pos, c.nrm);
+            const wsum = cs.reduce((a, x) => a + x.w, 0);
+            const E = [0, 1, 2].map((k) => (wsum > 1e-5
+              ? cs.reduce((a, x) => a + x.Esh[k] * x.w, 0) / wsum
+              : cs.slice().sort((a, b) => b.w - a.w)[0].Esh[k]));
+            say(`  ${name}  P ${c.pos.map((v) => v.toFixed(2)).join(",")}  N ${c.nrm.map((v) => v.toFixed(2)).join(",")}` +
+              `  px ${c.px},${c.py}  crop E ${lum(c.irr).toFixed(3)}  mirror E ${lum(E).toFixed(3)}` +
+              `  sumW ${wsum.toFixed(3)}${wsum <= 1e-5 ? "  <- ALL FOUR CORNERS REJECTED (fallback)" : ""}`);
+            for (const x of cs) {
+              say(`    probe ${String(x.pi).padStart(5)} @${x.ix},${x.iy} valid ${x.valid.toFixed(0)} ` +
+                `n ${x.nrm.map((v) => v.toFixed(2)).join(",").padEnd(17)} pos ${x.pos.map((v) => v.toFixed(2)).join(",").padEnd(20)} ` +
+                `| bl ${x.bl.toFixed(2)} wp ${x.wp.toFixed(2)} wn ${x.wn.toFixed(2)} w ${x.w.toFixed(3)} ` +
+                `| fill ${String(x.fill).padStart(2)}/${OCTN} self ${String(x.self).padStart(2)} sky ${String(x.sky).padStart(2)} ` +
+                `near<1m ${String(x.near).padStart(2)} L ${x.nearL.toFixed(3)} far L ${x.farL.toFixed(3)} ` +
+                `dm ${x.dmean.toFixed(2)} | Eraw ${lum(x.Eraw).toFixed(3)} Efilt ${lum(x.Efilt).toFixed(3)} Esh ${lum(x.Esh).toFixed(3)}`);
+            }
+            audit.push({ name, P: c.pos, N: c.nrm, px: c.px, py: c.py, cropE: c.irr, mirrorE: E, wsum, corners: cs });
+          }
+          results.probeAudit = audit;
+          // The full oct map of the dominant probe on the two crops that are
+          // still wrong, so the node runner can path-trace the SAME 64
+          // directions from the SAME point and say, per direction, whether the
+          // GPU stopped where the geometry actually is.
+          results.texelDump = ["sphere", "boxTop"].map((name) => {
+            const a = audit.find((x) => x.name === name);
+            if (!a) return null;
+            const best = a.corners.slice().sort((x, y) => y.w - x.w)[0];
+            return { name, probe: best.pi, pos: best.pos, nrm: best.nrm, texels: best.texels };
+          }).filter(Boolean);
+
+          // ── the wall ladder: irradiance and probe health versus HEIGHT ──
+          const ladder = inFrame.filter((x) => x.name.startsWith("wall@"));
+          say("  wall ladder (red wall, z = -1, camera eye y = -0.50)");
+          const ladderRows = [];
+          for (const c of ladder) {
+            const cs = cornersOf(D, c.px, c.py, c.pos, c.nrm);
+            const wsum = cs.reduce((a, x) => a + x.w, 0);
+            const selfPct = 100 * cs.reduce((a, x) => a + x.self, 0) / Math.max(1, cs.reduce((a, x) => a + x.fill, 0));
+            const row = {
+              name: c.name, y: c.pos[1], px: c.px, py: c.py, tileRow: Math.floor(c.py / gd.tile),
+              E: lum(c.irr), Eraw: cs.reduce((a, x) => a + lum(x.Eraw), 0) / 4,
+              Efilt: cs.reduce((a, x) => a + lum(x.Efilt), 0) / 4,
+              wsum, selfPct, samples: c.samples,
+              planeSpread: Math.max(...cs.map((x) => Math.abs(
+                c.nrm[0] * (x.pos[0] - c.pos[0]) + c.nrm[1] * (x.pos[1] - c.pos[1]) + c.nrm[2] * (x.pos[2] - c.pos[2])))),
+              reprojOther: cs.filter((x) => x.prev >= 0 && x.prev !== x.pi).length,
+            };
+            ladderRows.push(row);
+            say(`    y ${row.y.toFixed(2).padStart(6)} px ${String(row.px).padStart(4)},${String(row.py).padStart(3)} ` +
+              `tileRow ${String(row.tileRow).padStart(3)} | E ${row.E.toFixed(3)} Eraw ${row.Eraw.toFixed(3)} ` +
+              `Efilt ${row.Efilt.toFixed(3)} | sumW ${row.wsum.toFixed(2)} self ${row.selfPct.toFixed(1)}% ` +
+              `planeD ${row.planeSpread.toFixed(3)} m reproj-elsewhere ${row.reprojOther}/4`);
+          }
+          results.wallLadder = ladderRows;
+        }
+
+        // ══════════════ THE CACHE, READ AT SURFACES WE CAN NAME (§3.2 item 2)
+        //
+        // ⭐ THE PROBE'S OCT MAP SAID "ZERO ALONG THAT DIRECTION". THE CACHE IS
+        // WHERE THAT ZERO EITHER IS OR IS NOT. The texel dump established that
+        // the sphere's rays land where the analytic geometry says they should
+        // — 0/41 phantom blockers, distances within a voxel — and still bring
+        // back nothing along the directions with the highest cosine weight.
+        // That leaves exactly one stage between the trace and the texel: the
+        // radiance cache. So it is read directly, on the CPU, at surfaces this
+        // page can name, through the SAME addressing rule the kernel uses
+        // (brick = the voxel index's top bits, in-brick voxel = its bottom
+        // bits, face = the outward normal's dominant axis). No GPU code, no
+        // new pass: the buffer is already read back for `cacheHealth`.
+        const FACE_OF = (n) => {
+          const ax = Math.abs(n[0]); const ay = Math.abs(n[1]); const az = Math.abs(n[2]);
+          if (ax >= ay && ax >= az) return n[0] < 0 ? 1 : 0;
+          if (ay >= az) return n[1] < 0 ? 3 : 2;
+          return n[2] < 0 ? 5 : 4;
+        };
+        const cacheAt = (u32c, u32w, pt, n, level = 0) => {
+          const v = wd.voxel0 * (2 ** level);
+          // Half a cell INTO the surface, so the cell is the OCCUPIED one and
+          // not the empty one the surface point sits on the boundary of.
+          const q = [0, 1, 2].map((a) => Math.floor((pt[a] - n[a] * v * 0.5) / v));
+          const cx = q[0] & 63; const cy = q[1] & 63; const cz = q[2] & 63;
+          const vi = cx | (cy << 6) | (cz << 12);
+          const b = (cx >> 2) | ((cy >> 2) << 4) | ((cz >> 2) << 8);
+          const lv = (cx & 3) | ((cy & 3) << 2) | ((cz & 3) << 4);
+          const face = FACE_OF(n);
+          const m = u32c[cache.MAP_OFF + level * store.BRICKS_PER_LEVEL + b];
+          const word = m ? u32c[cache.DATA_OFF + (m - 1) * cacheMod.SLOT_WORDS
+            + lv * cacheMod.SLOT_FACES + face] : 0;
+          const base = level * store.LEVEL_WORDS;
+          const occ = (u32w[base + store.OCC_OFF + (vi >>> 5)] >>> (vi & 31)) & 1;
+          const faceBits = (u32w[base + store.FACE_OFF + (vi >>> 2)] >>> ((vi & 3) * 8)) & 255;
+          const pal = (u32w[base + store.PAL_OFF + (vi >>> 2)] >>> ((vi & 3) * 8)) & 255;
+          return { cell: q, vi, brick: b, slot: m, face, word, rgb: cacheMod.unpackRgbe(word), occ, faceBits, pal };
+        };
+        {
+          const u32c = new Uint32Array(await renderer.getArrayBufferAsync(cache.attribute));
+          const u32w = new Uint32Array(await renderer.getArrayBufferAsync(win.attribute));
+          const SURFACES = [
+            { name: "floor", p: [0, -3, 0], n: [0, 1, 0], wantPal: 1 },
+            { name: "ceiling", p: [0, 3, 0], n: [0, -1, 0], wantPal: 2 },
+            { name: "panel", p: [0, 2.9, 0], n: [0, -1, 0], wantPal: 0 },
+            { name: "wall -X (red)", p: [-5, 0, 0], n: [1, 0, 0], wantPal: 3 },
+            { name: "wall +X (green)", p: [5, 0, 0], n: [-1, 0, 0], wantPal: 4 },
+            { name: "wall -Z (seen)", p: [0, 0, -5], n: [0, 0, 1], wantPal: 5 },
+            { name: "wall +Z (behind)", p: [0, 0, 5], n: [0, 0, -1], wantPal: 6 },
+            { name: "wall +Z at y=0", p: [1.2, 0, 5], n: [0, 0, -1], wantPal: 6 },
+            { name: "box top", p: [-2, -1, -1.5], n: [0, 1, 0], wantPal: 7 },
+            { name: "box +Z face", p: [-2, -2, -0.5], n: [0, 0, 1], wantPal: 7 },
+          ];
+          say("  CACHE, read at named surfaces (level 0): the radiance a ray that hits here comes back with");
+          const rows = [];
+          for (const sf of SURFACES) {
+            const r = cacheAt(u32c, u32w, sf.p, sf.n);
+            const l = r.rgb ? lum(r.rgb) : 0;
+            rows.push({ ...sf, ...r, lumv: l });
+            say(`    ${sf.name.padEnd(16)} cell ${r.cell.join(",").padEnd(14)} occ ${r.occ} ` +
+              `faceBits ${r.faceBits.toString(2).padStart(6, "0")} pal ${String(r.pal).padStart(2)}` +
+              `${r.pal === sf.wantPal ? "" : `(want ${sf.wantPal})`} slot ${String(r.slot).padStart(4)} ` +
+              `face ${r.face} | cache ${r.rgb ? r.rgb.map((x) => x.toFixed(4)).join(" ") : "NEVER WRITTEN"} ` +
+              `lum ${l.toFixed(4)}`);
+          }
+          results.cacheSurfaces = rows;
+
+          // ⭐ EVERY NON-ZERO ENTRY ABOVE IS ON A SURFACE THE CAMERA CAN SEE.
+          // The one surface in this room that no pixel ever covers — the +Z
+          // wall, behind the camera — reads an explicitly WRITTEN zero (the
+          // RGBE word is non-zero, its mantissas are not). So the cache's
+          // whole content might be `injectLitFrame`'s and none of it §L.2's
+          // fresh-slot shading, and the crop table cannot tell those apart
+          // because every crop is on a visible surface.
+          //
+          // So: clear the cache and run the chain with the INJECTION PASS
+          // SWITCHED OFF. What is in the cache afterwards is `shadeHit`'s
+          // output and nothing else.
+          await compute(cache.clearPass);
+          await compute(cache.allocPass);
+          let ni = FRAMES + 400;
+          for (let i = 0; i < 40; i++) await runFrame(ni++, { inject: false });
+          {
+            const c2 = new Uint32Array(await renderer.getArrayBufferAsync(cache.attribute));
+            const w2 = new Uint32Array(await renderer.getArrayBufferAsync(win.attribute));
+            say("  CACHE, injection OFF — this is `shadeHit` alone:");
+            const shadeRows = [];
+            for (const sf of SURFACES) {
+              const r = cacheAt(c2, w2, sf.p, sf.n);
+              const l = r.rgb ? lum(r.rgb) : 0;
+              shadeRows.push({ ...sf, ...r, lumv: l });
+              say(`    ${sf.name.padEnd(16)} slot ${String(r.slot).padStart(4)} face ${r.face} | ` +
+                `${r.rgb ? r.rgb.map((x) => x.toFixed(4)).join(" ") : "NEVER WRITTEN"} lum ${l.toFixed(4)}`);
+            }
+            const ctl = cache.readControl(c2);
+            const st = await readStats();
+            say(`  shade-only arm: ${st.freshShades} fresh shades over 40 frames, ` +
+              `${shadeRows.filter((x) => x.lumv > 1e-4).length}/${shadeRows.length} named surfaces carry light`);
+            results.shadeOnly = { rows: shadeRows, ctl };
+
+            // ── and WHY: every intermediate of `shadeHit` at the same points
+            const sIn = gather.buffers.shadeIn.value.array;
+            const probes = SURFACES.filter((x) => x.name !== "wall -Z (seen)")
+              .slice(0, gather.SHADE_SLOTS);
+            probes.forEach((sf, i) => {
+              const r = cacheAt(c2, w2, sf.p, sf.n);
+              // the face's own sample point — the voxel centre pushed half a
+              // cell out along the face normal, exactly what the kernel uses
+              const v = wd.voxel0;
+              const centre = r.cell.map((c) => (c + 0.5) * v);
+              sIn[i * 8] = centre[0] + sf.n[0] * v * 0.5;
+              sIn[i * 8 + 1] = centre[1] + sf.n[1] * v * 0.5;
+              sIn[i * 8 + 2] = centre[2] + sf.n[2] * v * 0.5;
+              sIn[i * 8 + 3] = 0; // level
+              sIn[i * 8 + 4] = sf.n[0];
+              sIn[i * 8 + 5] = sf.n[1];
+              sIn[i * 8 + 6] = sf.n[2];
+              sIn[i * 8 + 7] = r.vi;
+            });
+            gather.buffers.shadeIn.value.needsUpdate = true;
+            await compute(gather.passes.shadeProbe);
+            const so = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.shadeOut.value));
+            say("  shadeHit, term by term (centre stratum of the panel shown for the NEE):");
+            say("    surface           albedo            emis   N.L(sun) sunHit  cosX   cosP     d   tStop   vis   E.r  shaded");
+            const shadeTerms = [];
+            probes.forEach((sf, i) => {
+              const b = i * 16;
+              const row = {
+                name: sf.name, albedo: [so[b], so[b + 1], so[b + 2]], emissive: so[b + 3],
+                ndl: so[b + 4], sunHit: so[b + 5], cosX: so[b + 6], cosP: so[b + 7],
+                d: so[b + 8], tStop: so[b + 9], vis: so[b + 10], Ecentre: so[b + 11],
+                shaded: [so[b + 12], so[b + 13], so[b + 14]],
+              };
+              shadeTerms.push(row);
+              say(`    ${sf.name.padEnd(16)} ${row.albedo.map((x) => x.toFixed(2)).join(",")}  ` +
+                `${row.emissive.toFixed(2)}  ${row.ndl.toFixed(3)}  ${row.sunHit.toFixed(0).padStart(5)}  ` +
+                `${row.cosX.toFixed(3)} ${row.cosP.toFixed(3)} ${row.d.toFixed(2).padStart(5)} ` +
+                `${row.tStop.toFixed(2).padStart(6)} ${row.vis.toFixed(0).padStart(4)} ` +
+                `${row.Ecentre.toFixed(3).padStart(6)} ${lum(row.shaded).toFixed(4)}`);
+            });
+            results.shadeTerms = shadeTerms;
+          }
+          // Restore: clear again and let the full chain refill it.
+          await compute(cache.clearPass);
+          await compute(cache.allocPass);
+          for (let i = 0; i < 60; i++) await runFrame(ni++);
+        }
+
+        // ── the wall column: every screen row, from the lit buffer ────────
+        //
+        // The ladder above samples eight heights through 9×9 blocks; mottling
+        // and a one-row step live BELOW that. This walks a 33-px-wide band of
+        // the red wall row by row, so a step at the camera's own height shows
+        // up as a row index and a ratio, and "mottling" becomes the spread
+        // WITHIN a tile row against the spread ACROSS tile rows.
+        const wallColumn = async (label) => {
+          const f = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.litBuf.value));
+          const cx = Math.round(project([-4.99, -0.5, -1.0]).x);
+          const yTop = Math.round(project([-4.99, 2.9, -1.0]).y);
+          const yBot = Math.round(project([-4.99, -2.9, -1.0]).y);
+          const y0 = Math.max(1, Math.min(yTop, yBot) + 4);
+          const y1 = Math.min(Hh - 2, Math.max(yTop, yBot) - 4);
+          const x0 = Math.max(0, cx - 16); const x1 = Math.min(W - 1, cx + 16);
+          const rows = [];
+          for (let y = y0; y <= y1; y++) {
+            let sum = 0; let n = 0;
+            for (let x = x0; x <= x1; x++) {
+              const b = (y * W + x) * 4;
+              if (f[b + 3] > 0.5) { sum += lum([f[b], f[b + 1], f[b + 2]]); n++; }
+            }
+            rows.push({ y, v: n ? sum / n : null, n });
+          }
+          const good = rows.filter((r) => r.v != null && r.n > 20);
+          const horizon = Math.round(project([-4.99, camera.position.y, -1.0]).y);
+          let step = { ratio: 1, y: null };
+          for (let i = 1; i < good.length; i++) {
+            if (good[i].y !== good[i - 1].y + 1) continue;
+            const r = good[i].v / Math.max(1e-9, good[i - 1].v);
+            if (Math.abs(Math.log(r)) > Math.abs(Math.log(step.ratio))) step = { ratio: r, y: good[i].y };
+          }
+          // Within-tile spread vs across-tile spread — the mottling number.
+          const byTile = new Map();
+          for (const r of good) {
+            const k = Math.floor(r.y / gd.tile);
+            if (!byTile.has(k)) byTile.set(k, []);
+            byTile.get(k).push(r.v);
+          }
+          const tileMeans = [...byTile.entries()].sort((a, b) => a[0] - b[0]).map(([k, v]) => ({
+            k, m: v.reduce((a, x) => a + x, 0) / v.length,
+          }));
+          const cv = (xs) => {
+            const m = xs.reduce((a, x) => a + x, 0) / xs.length;
+            return Math.sqrt(xs.reduce((a, x) => a + (x - m) * (x - m), 0) / xs.length) / Math.max(1e-9, m);
+          };
+          const withinCv = [...byTile.values()].filter((v) => v.length > 3).map(cv);
+          const acrossCv = cv(tileMeans.map((t) => t.m));
+          // ⚠ "ACROSS-TILE CV" CONTAINS THE WALL'S REAL GRADIENT. Irradiance
+          // on this wall genuinely rises toward the panel — the reference
+          // spans 1.74 to 2.11 over the same range — so a raw CV over forty
+          // tile rows is part signal and part mottling, and an A/B between
+          // two arms of the estimator can only move the second part. The
+          // detrended figure subtracts a 5-tile moving average first, which
+          // is the low-frequency term the eye reads as SHADING and not as
+          // BLOTCHES.
+          const ms = tileMeans.map((t) => t.m);
+          const resid = ms.map((v, i) => {
+            let sum = 0; let n2 = 0;
+            for (let k = Math.max(0, i - 2); k <= Math.min(ms.length - 1, i + 2); k++) { sum += ms[k]; n2++; }
+            return v / (sum / n2);
+          });
+          const detrended = Math.sqrt(resid.reduce((a, x) => a + (x - 1) * (x - 1), 0) / resid.length);
+          const withinMean = withinCv.reduce((a, x) => a + x, 0) / Math.max(1, withinCv.length);
+          let maxTileStep = { ratio: 1, k: null };
+          for (let i = 1; i < tileMeans.length; i++) {
+            if (tileMeans[i].k !== tileMeans[i - 1].k + 1) continue;
+            const r = tileMeans[i].m / Math.max(1e-9, tileMeans[i - 1].m);
+            if (Math.abs(Math.log(r)) > Math.abs(Math.log(maxTileStep.ratio))) maxTileStep = { ratio: r, k: tileMeans[i].k };
+          }
+          say(`  wall column [${label}] rows ${y0}..${y1}, horizon (camera height) row ${horizon}: ` +
+            `worst row step ${step.ratio.toFixed(3)}x at row ${step.y} ` +
+            `(${step.y === horizon ? "ON the horizon" : `${step.y - horizon} rows off it`}); ` +
+            `worst TILE-row step ${maxTileStep.ratio.toFixed(3)}x at tile row ${maxTileStep.k}`);
+          say(`  wall column [${label}]: CV within a tile row ${(100 * withinMean).toFixed(2)} %, across tile rows ` +
+            `${(100 * acrossCv).toFixed(2)} %, DETRENDED ${(100 * detrended).toFixed(2)} % — the last is the mottling`);
+          say(`  wall column [${label}] profile: ${tileMeans.map((t) => t.m.toFixed(3)).join(" ")}`);
+          return {
+            label, x0, x1, y0, y1, horizon, step, maxTileStep, withinCv: withinMean, acrossCv, detrended,
+            tileMeans, rows: good.map((r) => [r.y, +r.v.toFixed(4)]),
+          };
+        };
+        // ⭐ IS THE STEP A PLACE OR A SAMPLE? A single scan can only say where
+        // the worst step LANDED. Two scans of the same parked camera, twenty
+        // frames apart, say whether it is a property of the wall or of the
+        // noise: a structural step stays on its row, a sampling one moves.
+        // The third scan is the hysteresis A/B — §L.3's "force α = 0.5 on a
+        // large change" against the same wall with the force switched off.
+        {
+          // ⚠ ONE SCAN PER ARM IS BLIND. The first attempt read 14.60 % of
+          // across-tile CV with the hysteresis on and 18.28 % with it off and
+          // could have called that a result — except a SECOND scan of the
+          // same arm, forty frames later, read 16.10 %. The arm-to-arm
+          // difference was inside the arm's own spread. So each arm is scanned
+          // five times, ten frames apart, and compared by MEDIAN — the same
+          // paired discipline the motion instrument now uses.
+          let nn = FRAMES + 200;
+          const arm = async (label, apply, restore) => {
+            apply();
+            for (let i = 0; i < 24; i++) await runFrame(nn++); // let the arm take
+            const scans = [];
+            for (let k = 0; k < 5; k++) {
+              scans.push(await wallColumn(`${label} #${k}`));
+              for (let i = 0; i < 10; i++) await runFrame(nn++);
+            }
+            const st = await readStats();
+            restore();
+            const cvs = scans.map((x) => x.detrended).sort((a, b) => a - b);
+            const steps = scans.map((x) => x.step.y);
+            return {
+              label, scans, medCv: cvs[2], minCv: cvs[0], maxCv: cvs[4],
+              stepRows: steps, stepOnHorizon: steps.filter((y) => y === scans[0].horizon).length,
+              medStep: scans.map((x) => x.step.ratio).sort((a, b) => a - b)[2],
+              alphaForced: st.alphaForced,
+            };
+          };
+          const armBase = await arm("H=4 hyst ON", () => {}, () => {});
+          const armH8 = await arm("H=8 hyst ON", () => { gu.historyU.value = 8; }, () => { gu.historyU.value = gd.history; });
+          const armNoHyst = await arm("H=4 hyst OFF", () => { gu.hystOn.value = 0; }, () => { gu.hystOn.value = 1; });
+          const arms = [armBase, armH8, armNoHyst];
+          say("  MOTTLING, five scans per arm, ten frames apart (DETRENDED tile-row CV of the red wall):");
+          for (const a of arms) {
+            say(`    ${a.label.padEnd(14)} median CV ${(100 * a.medCv).toFixed(2)} % ` +
+              `(${(100 * a.minCv).toFixed(2)}–${(100 * a.maxCv).toFixed(2)} %)  ` +
+              `worst-step row ${a.stepRows.join(",")} — ${a.stepOnHorizon}/5 on the horizon, ` +
+              `median step ${a.medStep.toFixed(3)}x`);
+          }
+          say(`  the tone step is ${armBase.stepOnHorizon >= 4 ? "STRUCTURAL: it does not move off the horizon row" : "a SAMPLE: it wanders"}; ` +
+            `the arms' CV spreads ${arms.map((a) => `${(100 * a.minCv).toFixed(1)}-${(100 * a.maxCv).toFixed(1)}`).join(" | ")} ` +
+            `${Math.max(armBase.maxCv, armH8.maxCv) > Math.min(armBase.minCv, armH8.minCv) * 1.0 && armH8.medCv < armBase.minCv ? "SEPARATE" : "OVERLAP"}`);
+          results.wallColumn = armBase.scans[2];
+          results.mottlingArms = arms.map(({ scans, ...rest }) => rest);
+        }
+
+        // ══════════════════════ RESOLVE A/B: SH2 against the 4×64 oct sum
+        //
+        // §3.2 item 1's gate. The two arms differ ONLY in the diffuse
+        // integrator — same probes, same filtered oct map, same frame — so the
+        // ratio is the SH truncation error and nothing else.
+        {
+          writeCrops();
+          const shArm = await readCrops();
+          await compute(gather.passes.resolveOct);
+          const octArm = await readCrops();
+          await compute(gather.passes.resolve);
+          const rows = CROPS.map((c, i) => ({
+            name: c.name, diag: !!c.diag,
+            sh: lum(shArm[i].irr), oct: lum(octArm[i].irr),
+            ratio: lum(shArm[i].irr) / Math.max(1e-9, lum(octArm[i].irr)),
+          }));
+          results.resolveAB = rows;
+          const diffuse = rows.filter((r) => !r.diag && r.oct > 1e-3);
+          const worst = diffuse.reduce((a, r) => (Math.abs(r.ratio - 1) > Math.abs(a.ratio - 1) ? r : a), diffuse[0]);
+          say(`resolve A/B (SH2 / oct sum): ` + rows.filter((r) => !r.diag)
+            .map((r) => `${r.name} ${r.ratio.toFixed(3)}`).join(", "));
+          say(`resolve A/B: worst receipt crop ${worst.name} ${((worst.ratio - 1) * 100).toFixed(2)} % ` +
+            `(gate: <= 5 % on the diffuse crops)`);
         }
 
         // ── IS THE SCREEN SEGMENT EARNING ITS PLACE? ────────────────────
@@ -532,11 +1016,26 @@
 
         // ══════════════════════════════════════════ motion (§L.7 / Stage 3.5)
         //
-        // ⭐ THE STILLNESS TRAP. A parked number is not this system's number:
-        // reprojection succeeds trivially when nothing moves. So the orbit is
-        // measured frame by frame — max frame against parked, and the
-        // reprojection hit rate under motion, which is the counter that says
-        // whether the temporal term is still doing anything.
+        // ⭐ A PAIRED DESIGN, BECAUSE THE POPULATION IS NOISY. Stage 3.1 asked
+        // "is the worst orbit frame ≤ 1.2× the parked median" and got 1.91×.
+        // Then it printed the parked SPREAD: 1.96–4.30 ms across twelve frames
+        // of a camera that never moved. A max drawn from 60 samples of a
+        // distribution that wide is a max of the NOISE, and the noise is a GPU
+        // this machine shares with another agent's probes. Max/parked cannot
+        // discriminate; nothing about the estimator would change it.
+        //
+        // So: interleave. Four PAIRS of 30-frame windows — park at θ, then
+        // orbit from θ to θ+22.5° — and compare the two MEDIANS within each
+        // pair. Both windows do identical CPU work (the per-frame stats
+        // readback included, which the old design did in the orbit arm only
+        // and not in the parked one), so a pair differs in exactly one thing:
+        // whether the camera moved. Drift in the shared GPU's clocks moves
+        // both members of a pair together and cancels in the ratio.
+        //
+        // The mechanism counters travel with it: FRESH SHADES per frame (§L.2
+        // shades a hit only when its cache slot is fresh, so the trace kernel
+        // is data-dependent and motion is what changes the data) and the
+        // REPROJECTION hit rate (whether the temporal term still applies).
         {
           const frameMs = async (n) => {
             const t0 = performance.now();
@@ -544,70 +1043,85 @@
             const gpu = timestamps ? await renderer.resolveTimestampsAsync("compute") : null;
             return { gpu, wall: performance.now() - t0 };
           };
-          setCam(CAM_IN);
-          for (let n = 0; n < 8; n++) await runFrame(1000 + n); // settle
-          if (timestamps) await renderer.resolveTimestampsAsync("compute");
-          const parked = [];
-          for (let n = 0; n < 12; n++) parked.push((await frameMs(1100 + n)).gpu);
-          await compute(gather.passes.clearStats);
-          const orbit = [];
-          const refill = [];
-          const freshPerFrame = [];
-          let freshSeen = 0;
           const R0 = 4.0;
-          for (let i = 0; i < ORBIT_FRAMES; i++) {
-            const th = (i / (ORBIT_FRAMES - 1)) * (Math.PI / 2);
+          const poseAt = (th) => {
             camera.position.set(R0 * Math.sin(th), -0.5, R0 * Math.cos(th));
             camera.lookAt(0, -1.0, 0);
             camera.updateProjectionMatrix();
-            orbit.push((await frameMs(1200 + i)).gpu);
-            refill.push(lastRefilled);
-            // ⭐ WHAT MAKES A MOTION FRAME EXPENSIVE. §L.2 shades a hit only
-            // when its cache slot is FRESH, so the trace kernel's cost is DATA
-            // DEPENDENT — and the data that changes under motion is exactly
-            // which surfaces the probes can reach. Counting fresh shades per
-            // frame alongside the milliseconds is what turns "the orbit has a
-            // spike" into a mechanism instead of a number.
-            const st = await readStats();
-            freshPerFrame.push(st.freshShades - freshSeen);
-            freshSeen = st.freshShades;
+          };
+          const WIN = Math.max(6, Math.round(ORBIT_FRAMES / 2));
+          const PAIRS = 4;
+          const ARC = Math.PI / 2;
+          let nFrame = 1100;
+          // One window of `WIN` frames. `pose(i)` places the camera; every
+          // frame pays the same readback so the two arms are comparable.
+          const window30 = async (pose) => {
+            await compute(gather.passes.clearStats);
+            const ms = []; const fresh = []; const scrolled = [];
+            let seen = 0; let reprojHits = 0; let probesValid = 0;
+            for (let i = 0; i < WIN; i++) {
+              pose(i);
+              ms.push((await frameMs(nFrame++)).gpu);
+              scrolled.push(lastRefilled);
+              const st = await readStats();
+              fresh.push(st.freshShades - seen);
+              seen = st.freshShades;
+              reprojHits = st.reprojHits;
+              probesValid = st.probesValid;
+            }
+            const ok = ms.filter((x) => x != null);
+            const sorted = ok.slice().sort((a, b) => a - b);
+            return {
+              ms, fresh, scrolled,
+              med: sorted.length ? sorted[Math.floor(sorted.length / 2)] : null,
+              max: sorted.length ? sorted[sorted.length - 1] : null,
+              min: sorted.length ? sorted[0] : null,
+              freshTotal: fresh.reduce((a, x) => a + x, 0),
+              freshPerFrame: fresh.reduce((a, x) => a + x, 0) / WIN,
+              reprojPct: 100 * reprojHits / Math.max(1, probesValid),
+              scrolledFrames: scrolled.filter(Boolean).length,
+            };
+          };
+          const pairs = [];
+          for (let w = 0; w < PAIRS; w++) {
+            const th0 = (w / PAIRS) * ARC;
+            const th1 = ((w + 1) / PAIRS) * ARC;
+            poseAt(th0);
+            for (let i = 0; i < 6; i++) await runFrame(nFrame++); // settle at the pose
+            if (timestamps) await renderer.resolveTimestampsAsync("compute");
+            const parked = await window30(() => poseAt(th0));
+            const orbit = await window30((i) => poseAt(th0 + ((i + 1) / WIN) * (th1 - th0)));
+            pairs.push({ w, th0, th1, parked, orbit, ratio: orbit.med / Math.max(1e-9, parked.med) });
           }
-          const statsOrbit = await readStats();
-          const med = (xs) => xs.filter((x) => x != null).slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)] ?? null;
-          const ok = (arr) => arr.filter((x) => x != null);
-          const parkedMs = med(parked);
-          const orbitMax = ok(orbit).length ? Math.max(...ok(orbit)) : null;
-          const orbitMed = med(orbit);
-          // TWO POPULATIONS, KEPT APART ON PURPOSE. A frame that SCROLLED the
-          // window pays this harness's full-window ANALYTIC refill, which is
-          // not the §K.3 incremental voxelizer the shipping path will use — so
-          // folding it into "the gather's cost under motion" would price a
-          // kernel that is not going to exist. Both numbers are reported.
-          const gatherOnly = ok(orbit.filter((_, i) => !refill[i]));
-          const scrolled = ok(orbit.filter((_, i) => refill[i]));
-          const reproj = 100 * statsOrbit.reprojHits / Math.max(1, statsOrbit.probesValid);
-          say(`motion: parked ${parkedMs?.toFixed(3)} ms/frame (compute), orbit median ${orbitMed?.toFixed(3)}, ` +
-            `max ${orbitMax?.toFixed(3)} = ${orbitMax && parkedMs ? (orbitMax / parkedMs).toFixed(2) : "n/a"}× parked (want ≤ 1.2×)`);
-          say(`motion: ${scrolled.length}/${ORBIT_FRAMES} orbit frames scrolled the window (a full analytic refill) — ` +
-            `max on those ${scrolled.length ? Math.max(...scrolled).toFixed(3) : "—"} ms; max on the ` +
-            `${gatherOnly.length} gather-only frames ${gatherOnly.length ? Math.max(...gatherOnly).toFixed(3) : "—"} ms = ` +
-            `${gatherOnly.length && parkedMs ? (Math.max(...gatherOnly) / parkedMs).toFixed(2) : "n/a"}× parked`);
-          say(`motion: probe reprojection ${reproj.toFixed(1)} % over the 90° orbit; parked spread ` +
-            `${ok(parked).length ? `${Math.min(...ok(parked)).toFixed(3)}–${Math.max(...ok(parked)).toFixed(3)}` : "—"} ms`);
-          const worstI = orbit.indexOf(orbitMax);
-          say(`motion: fresh shades per orbit frame ${freshPerFrame.join(" ")} — the most expensive frame ` +
-            `(#${worstI}, ${orbitMax?.toFixed(3)} ms) shaded ${freshPerFrame[worstI]}, the cheapest ` +
-            `${freshPerFrame[orbit.indexOf(Math.min(...ok(orbit)))]}`);
+          const med = (xs) => {
+            const v = xs.filter((x) => x != null).slice().sort((a, b) => a - b);
+            return v.length ? v[Math.floor(v.length / 2)] : null;
+          };
+          const parkedAll = pairs.flatMap((p) => p.parked.ms);
+          const orbitAll = pairs.flatMap((p) => p.orbit.ms);
+          const pooled = med(orbitAll) / Math.max(1e-9, med(parkedAll));
+          const ratios = pairs.map((p) => p.ratio);
+          say(`motion (paired, ${PAIRS}×${WIN} parked / ${WIN} orbiting, medians):`);
+          for (const p of pairs) {
+            say(`  pair ${p.w} θ ${(p.th0 * 180 / Math.PI).toFixed(0)}→${(p.th1 * 180 / Math.PI).toFixed(0)}° ` +
+              `parked ${p.parked.med.toFixed(3)} ms (${p.parked.min.toFixed(2)}–${p.parked.max.toFixed(2)}) ` +
+              `orbit ${p.orbit.med.toFixed(3)} ms (${p.orbit.min.toFixed(2)}–${p.orbit.max.toFixed(2)}) ` +
+              `= ${p.ratio.toFixed(3)}× | fresh/frame ${p.parked.freshPerFrame.toFixed(1)} → ` +
+              `${p.orbit.freshPerFrame.toFixed(1)} | reproj ${p.parked.reprojPct.toFixed(1)} → ` +
+              `${p.orbit.reprojPct.toFixed(1)} % | scrolled ${p.orbit.scrolledFrames}/${WIN}`);
+          }
+          say(`motion: pooled orbit median ÷ parked median = ${pooled.toFixed(3)}× ` +
+            `(per-pair ${ratios.map((r) => r.toFixed(2)).join(" ")}; want ≤ 1.2×)`);
           results.motion = {
-            parkedMs, orbitMed, orbitMax,
-            ratio: orbitMax && parkedMs ? orbitMax / parkedMs : null,
-            gatherOnlyMax: gatherOnly.length ? Math.max(...gatherOnly) : null,
-            gatherOnlyRatio: gatherOnly.length && parkedMs ? Math.max(...gatherOnly) / parkedMs : null,
-            scrollFrames: scrolled.length, scrolledMax: scrolled.length ? Math.max(...scrolled) : null,
-            parkedMin: ok(parked).length ? Math.min(...ok(parked)) : null,
-            parkedMax: ok(parked).length ? Math.max(...ok(parked)) : null,
-            freshPerFrame,
-            reprojPct: reproj, orbit, refill, stats: statsOrbit,
+            design: "paired", pairs: PAIRS, windowFrames: WIN,
+            parkedMs: med(parkedAll), orbitMed: med(orbitAll), orbitMax: Math.max(...orbitAll.filter((x) => x != null)),
+            ratio: pooled, pooled, perPairRatio: ratios,
+            gatherOnlyRatio: pooled,
+            freshParked: pairs.reduce((a, p) => a + p.parked.freshPerFrame, 0) / PAIRS,
+            freshOrbit: pairs.reduce((a, p) => a + p.orbit.freshPerFrame, 0) / PAIRS,
+            reprojPct: pairs.reduce((a, p) => a + p.orbit.reprojPct, 0) / PAIRS,
+            reprojParkedPct: pairs.reduce((a, p) => a + p.parked.reprojPct, 0) / PAIRS,
+            detail: pairs,
           };
         }
 
@@ -627,6 +1141,7 @@
             ["probeTrace", gather.passes.probeTrace],
             ["probeFilter", gather.passes.probeFilter],
             ["resolve", gather.passes.resolve],
+            ["resolveOct", gather.passes.resolveOct],
             ["composite", gather.passes.composite],
             ["inject", gather.passes.inject],
             ["cacheAlloc", cache.allocPass],
@@ -654,7 +1169,7 @@
               `${String(storageBindings).padStart(2)} storage  ${workgroupVars} wg  ${(shader.length / 1024).toFixed(1)} kB`);
           }
           results.kernels = audit;
-          results.gatherMs = audit.filter((k) => !["cacheAlloc", "windowFill"].includes(k.name))
+          results.gatherMs = audit.filter((k) => !["cacheAlloc", "windowFill", "resolveOct"].includes(k.name))
             .reduce((s, k) => s + (k.ms ?? 0), 0);
           say(`gather total (the per-frame chain): ${results.gatherMs.toFixed(3)} ms of compute at ${W}×${Hh}`);
 

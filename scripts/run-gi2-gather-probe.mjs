@@ -252,33 +252,39 @@ for (const tier of tiers) {
     const SPP = 81 * 64;
     const parity = [];
     for (const c of r.cornell.crops) {
-      if (!(c.samples > 0)) { parity.push({ name: c.name, skipped: "no gbuffer samples" }); continue; }
+      if (!(c.samples > 0)) { parity.push({ name: c.name, diag: !!c.diag, skipped: "no gbuffer samples" }); continue; }
       const seed = 0x51ed + c.name.length * 7919;
       const E1 = refs[1].irradiance(c.pos, c.nrm, SPP, seed);
       const E2 = refs[2].irradiance(c.pos, c.nrm, SPP, seed);
       const E4 = refs[4].irradiance(c.pos, c.nrm, SPP, seed);
       parity.push({
-        name: c.name, pos: c.pos, nrm: c.nrm, gpu: c.irr, ref: E4, ref1: E1, ref2: E2,
+        name: c.name, diag: !!c.diag, pos: c.pos, nrm: c.nrm, gpu: c.irr, ref: E4, ref1: E1, ref2: E2,
         ratio: lum(c.irr) / Math.max(1e-9, lum(E4)),
         ratio1: lum(c.irr) / Math.max(1e-9, lum(E1)),
         ratio2: lum(c.irr) / Math.max(1e-9, lum(E2)),
         perChannel: [0, 1, 2].map((i) => c.irr[i] / Math.max(1e-9, E4[i])),
       });
     }
-    const within = parity.filter((p) => !p.skipped && Math.abs(p.ratio - 1) <= 0.15).length;
-    const within1 = parity.filter((p) => !p.skipped && Math.abs(p.ratio1 - 1) <= 0.15).length;
-    const within2 = parity.filter((p) => !p.skipped && Math.abs(p.ratio2 - 1) <= 0.15).length;
+    // ⭐ THE RECEIPT CROPS AND THE INSTRUMENT CROPS ARE SCORED APART. Stage
+    // 3.2 added a wall ladder and a sphere-crescent sample to DIAGNOSE items 3
+    // and 4; folding them into "6 of 8 bracketed" would silently redefine the
+    // gate every time the instrument grows a row. They are path-traced and
+    // printed exactly the same way, and counted nowhere.
+    const scoredRows = parity.filter((p) => !p.diag);
+    const within = scoredRows.filter((p) => !p.skipped && Math.abs(p.ratio - 1) <= 0.15).length;
+    const within1 = scoredRows.filter((p) => !p.skipped && Math.abs(p.ratio1 - 1) <= 0.15).length;
+    const within2 = scoredRows.filter((p) => !p.skipped && Math.abs(p.ratio2 - 1) <= 0.15).length;
     // A crop that sits BETWEEN one and four bounces is a gather that is
     // integrating correctly over a cache that has not yet fed itself all the
     // way. A crop outside that bracket is something else, and that is the
     // distinction worth counting.
-    const bracketed = parity.filter((p) => !p.skipped && p.ratio <= 1.15 && p.ratio1 >= 0.85).length;
-    const scored = parity.filter((p) => !p.skipped).length;
+    const bracketed = scoredRows.filter((p) => !p.skipped && p.ratio <= 1.15 && p.ratio1 >= 0.85).length;
+    const scored = scoredRows.filter((p) => !p.skipped).length;
     r.parity = { spp: SPP, rows: parity, within, within1, within2, bracketed, scored };
     console.log("");
     console.log(`  CORNELL PARITY (GPU irradiance ÷ CPU path tracer, ${SPP} spp)`);
     console.log("  crop          GPU E (rgb)                 ref E, 4 bounces            /b4      /b2      /b1     per-channel (b4)");
-    for (const p of parity) {
+    for (const p of parity.filter((x) => !x.diag)) {
       if (p.skipped) { console.log(`  ${p.name.padEnd(13)} ${p.skipped}`); continue; }
       console.log(
         `  ${p.name.padEnd(13)}${p.gpu.map((v) => v.toFixed(3).padStart(8)).join("")}   ` +
@@ -289,9 +295,76 @@ for (const tier of tiers) {
     }
     console.log(`  within 15 %: ${within}/${scored} against 4 bounces, ${within2}/${scored} against 2, ` +
       `${within1}/${scored} against 1; ${bracketed}/${scored} sit inside the [1-bounce, 4-bounce] bracket`);
+    const diagRows = parity.filter((x) => x.diag && !x.skipped);
+    if (diagRows.length) {
+      console.log("");
+      console.log(`  INSTRUMENT CROPS (not scored) — item 3/4 diagnostics`);
+      for (const p of diagRows) {
+        console.log(
+          `  ${p.name.padEnd(13)}${p.gpu.map((v) => v.toFixed(3).padStart(8)).join("")}   ` +
+          `${p.ref.map((v) => v.toFixed(3).padStart(8)).join("")}   ` +
+          `${p.ratio.toFixed(3).padStart(6)}   ${p.ratio2.toFixed(3).padStart(6)}   ${p.ratio1.toFixed(3).padStart(6)}`,
+        );
+      }
+    }
+    // ── THE TEXEL DUMP: the probe's own oct map, direction by direction ──
+    //
+    // ⭐ A CROP RATIO SAYS "DARK". IT NEVER SAYS "BLOCKED BY WHAT". The page
+    // ships the whole 64-texel map of the dominant probe on each crop that is
+    // still wrong — direction, stored hit distance, stored radiance — and the
+    // reference intersects the SAME 64 directions from the SAME point against
+    // the ANALYTIC geometry. A ray the GPU stopped at 0.3 m where the true
+    // surface is 8 m away has been stopped by something that is not in the
+    // scene, and the only thing in the window that is not in the scene is the
+    // conservative voxelization's own thickness.
+    if (r.texelDump?.length) {
+      console.log("");
+      console.log("  TEXEL DUMP — the GPU's oct map against the analytic geometry, per direction");
+      r.texelDumpReport = [];
+      for (const d of r.texelDump) {
+        const rnd = mulberry32(0x51ed);
+        const o = [0, 1, 2].map((i) => d.pos[i] + d.nrm[i] * 1e-3);
+        const rows = d.texels.map((t) => {
+          const h = refs[4].intersect(o, t.dir);
+          return {
+            ...t,
+            trueDist: h ? h.t : Infinity,
+            refL: lum(refs[4].radiance(o, t.dir, 0, rnd)),
+          };
+        });
+        const phantom = rows.filter((x) => x.dist < 1 && x.trueDist > 2);
+        const gpuMean = rows.reduce((a, x) => a + x.L, 0) / Math.max(1, rows.length);
+        const refMean = rows.reduce((a, x) => a + x.refL, 0) / Math.max(1, rows.length);
+        console.log(`  ${d.name}: probe ${d.probe} at ${d.pos.map((v) => v.toFixed(3)).join(",")} ` +
+          `n ${d.nrm.map((v) => v.toFixed(2)).join(",")} — ${rows.length} filled texels`);
+        console.log(`    mean stored radiance ${gpuMean.toFixed(4)} vs reference ${refMean.toFixed(4)} ` +
+          `= ${(gpuMean / Math.max(1e-9, refMean)).toFixed(3)}×; ` +
+          `${phantom.length}/${rows.length} texels stopped under 1 m where the geometry is over 2 m away`);
+        const worst = rows.slice().sort((a, b) => (b.refL - b.L) - (a.refL - a.L)).slice(0, 8);
+        console.log("    dir (x,y,z)              gpu d    true d     gpu L     ref L");
+        for (const x of worst) {
+          console.log(`    ${x.dir.map((v) => v.toFixed(2).padStart(6)).join(",")}  ` +
+            `${x.dist.toFixed(2).padStart(7)}  ${(x.trueDist === Infinity ? "sky" : x.trueDist.toFixed(2)).padStart(7)}  ` +
+            `${x.L.toFixed(4).padStart(8)}  ${x.refL.toFixed(4).padStart(8)}`);
+        }
+        r.texelDumpReport.push({
+          name: d.name, gpuMean, refMean, ratio: gpuMean / Math.max(1e-9, refMean),
+          phantom: phantom.length, filled: rows.length,
+        });
+      }
+    }
     if (r.hzbAB) {
+      console.log("");
       console.log(`  HZB screen segment, on / off: ` +
-        r.hzbAB.map((x) => `${x.name} ${x.ratio.toFixed(3)}`).join(", "));
+        r.hzbAB.filter((x) => !/^wall@|^sphereEdge/.test(x.name))
+          .map((x) => `${x.name} ${x.ratio.toFixed(3)}`).join(", "));
+    }
+    if (r.resolveAB) {
+      const worst = r.resolveAB.filter((x) => !x.diag && x.oct > 1e-3)
+        .reduce((a, x) => (Math.abs(x.ratio - 1) > Math.abs(a.ratio - 1) ? x : a));
+      console.log(`  RESOLVE A/B (SH2 / oct sum): worst receipt crop ${worst.name} ` +
+        `${((worst.ratio - 1) * 100).toFixed(2)} % — ` +
+        r.resolveAB.filter((x) => !x.diag).map((x) => `${x.name} ${x.ratio.toFixed(3)}`).join(", "));
     }
 
     table.push({
@@ -302,6 +375,11 @@ for (const tier of tiers) {
       offScreen: r.offScreen,
       firstLight: r.firstLight,
       motion: r.motion,
+      resolveAB: r.resolveAB,
+      wallColumn: r.wallColumn,
+      probeAudit: r.probeAudit,
+      texelDump: r.texelDumpReport,
+      mottlingArms: r.mottlingArms,
       kernels: r.kernels,
       gatherMs: r.gatherMs,
       image: r.image,
@@ -320,12 +398,12 @@ await browser.close();
 if (table.length) {
   console.log("");
   console.log("RECEIPTS — Stage 3.1");
-  console.log("tier     b4    b2    b1   brkt   2nd bnc   off-scr   1st light 50/90   orbit max/parked   reproj%   gather ms");
+  console.log("tier     b4    b2    b1   brkt   2nd bnc   off-scr   1st light 50/90   orbit/parked (paired)   reproj%   gather ms");
   for (const t of table) {
     const sb = t.secondBounce ? t.secondBounce.ratio.toFixed(3) : "—";
     const os = t.offScreen ? t.offScreen.ratio.toFixed(3) : "—";
     const fl = `${t.firstLight?.frame ?? "—"}/${t.firstLight?.frame90 ?? "—"}`;
-    const mo = t.motion?.gatherOnlyRatio ? `${t.motion.gatherOnlyRatio.toFixed(2)}×` : "—";
+    const mo = t.motion?.pooled ? `${t.motion.pooled.toFixed(2)}× (${t.motion.perPairRatio.map((x) => x.toFixed(2)).join("/")})` : "—";
     const rp = t.motion ? `${t.motion.reprojPct.toFixed(1)}` : "—";
     console.log(
       `${t.tier.padEnd(9)}${`${t.parity.within}/${t.parity.scored}`.padStart(4)}  ` +
@@ -333,7 +411,7 @@ if (table.length) {
       `${`${t.parity.within1}/${t.parity.scored}`.padStart(4)}  ` +
       `${`${t.parity.bracketed}/${t.parity.scored}`.padStart(5)}  ` +
       `${sb.padStart(8)}  ${os.padStart(8)}  ${fl.padStart(16)}   ` +
-      `${mo.padStart(16)}   ${rp.padStart(7)}   ${(t.gatherMs ?? 0).toFixed(3).padStart(9)}`,
+      `${mo.padStart(22)}   ${rp.padStart(7)}   ${(t.gatherMs ?? 0).toFixed(3).padStart(9)}`,
     );
   }
   console.log("");
@@ -350,6 +428,44 @@ if (table.length) {
   }
   const worst = Math.max(...table.flatMap((t) => t.kernels.map((k) => k.storageBindings)));
   console.log(`storage buffers, worst kernel: ${worst} (envelope 6); no workgroup memory; WGSL scene-free`);
+
+  // ── Stage 3.3's ≤ 4 ms budget lives at 1650×970, not at this page's size ──
+  //
+  // Every kernel in the chain is per-PIXEL or per-PROBE, and the probe grid is
+  // the pixel grid divided by a tier constant — so the chain scales with the
+  // pixel count and the scale factor is a ratio of areas, not a fit.
+  console.log("");
+  for (const t of table) {
+    const px = (t.gather?.width ?? 0) * (t.gather?.height ?? 0);
+    if (!px) continue;
+    const k = (1650 * 970) / px;
+    console.log(`${t.tier}: chain ${(t.gatherMs ?? 0).toFixed(3)} ms at ${t.gather.width}×${t.gather.height} ` +
+      `→ ${((t.gatherMs ?? 0) * k).toFixed(3)} ms scaled ×${k.toFixed(2)} to 1650×970 ` +
+      `(Stage 3.3 budget ≤ 4 ms) ${(t.gatherMs ?? 0) * k <= 4 ? "PASS" : "OVER"}`);
+  }
+
+  // ── the gate table, one line per Stage 3.1/3.2 receipt ────────────────────
+  console.log("");
+  console.log("GATES");
+  for (const t of table) {
+    const g = [];
+    g.push(["2nd bounce ≥ 1.05", t.secondBounce?.ratio, (v) => v >= 1.05]);
+    g.push(["off-screen ≥ 0.8", t.offScreen?.ratio, (v) => v >= 0.8]);
+    g.push(["time to first light (90 %)", t.firstLight?.frame90, (v) => v != null]);
+    g.push(["storage buffers ≤ 6", Math.max(...t.kernels.map((k) => k.storageBindings)), (v) => v <= 6]);
+    g.push(["workgroup vars = 0", Math.max(...t.kernels.map((k) => k.workgroupVars)), (v) => v === 0]);
+    g.push(["bracketed crops", t.parity.bracketed, (v) => v >= 6]);
+    g.push(["orbit ÷ parked (paired)", t.motion?.pooled, (v) => v != null && v <= 1.2]);
+    if (t.resolveAB) {
+      const w = t.resolveAB.filter((x) => !x.diag && x.oct > 1e-3)
+        .reduce((a, x) => (Math.abs(x.ratio - 1) > Math.abs(a.ratio - 1) ? x : a));
+      g.push(["SH2 ÷ oct sum, worst ≤ 5 %", Math.abs(w.ratio - 1) * 100, (v) => v <= 5]);
+    }
+    for (const [name, value, ok] of g) {
+      const v = typeof value === "number" ? value.toFixed(3) : String(value);
+      console.log(`  ${t.tier.padEnd(7)} ${name.padEnd(28)} ${v.padStart(9)}  ${ok(value) ? "PASS" : "FAIL"}`);
+    }
+  }
 }
 
 process.exit(failed ? 1 : 0);

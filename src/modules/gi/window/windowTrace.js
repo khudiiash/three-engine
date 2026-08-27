@@ -64,6 +64,80 @@
 // where `floor` may legitimately land either side, and both answers clamp to
 // the same cell.
 //
+// ══ `tMax` IS A DISTANCE, NOT A BRICK COUNT (Stage 3.2) ═════════════════════
+//
+// ⭐⭐ THE BUG THAT MADE EVERY FRESH SHADE BLACK. The brick loop tests
+// `t >= tMax` at its top, and `t` is the time the ray ENTERS a brick — so a
+// query whose limit falls inside a brick still walks that brick's voxels to
+// its far side and can report a hit up to A WHOLE BRICK (1 m at L0, 16 m at
+// L4) beyond the distance it was asked about.
+//
+// Every shadow ray toward an area light ends just short of that light, which
+// means it ends INSIDE the light's own brick. So every panel NEE ray in
+// `gatherProbes.shadeHit` walked on and hit the panel, `vis` came back 0, and
+// the fresh-slot shade — §L.2's ONLY source of light for surfaces the screen
+// cannot inject — wrote BLACK. Every time, on every surface, since Stage 3.1.
+//
+// It was invisible to every receipt the gather had: the Cornell crops all sit
+// on VISIBLE surfaces, whose cache entries `injectLitFrame` overwrites with
+// the real lit colour, so the crops measured the injection and never the
+// shade. It took reading the cache at the one surface in a Cornell box that
+// no pixel ever covers — the wall behind the camera — to see a written zero,
+// and then running the whole chain with the injection pass switched off to
+// see that the zero was universal (0 of 10 named surfaces carried light after
+// 38 141 fresh shades).
+//
+// The fix is one compare in the voxel loop: a voxel ENTERED at or after
+// `tMax` cannot block, and the loop stops there.
+//
+// ══ A RAY MAY NOT BEGIN INSIDE GEOMETRY (Stage 3.2 item 2) ══════════════════
+//
+// K.4's origin bias — half a level-0 cell along the geometric normal — exists
+// because a screen probe's anchor sits ON a surface, inside that surface's own
+// voxel. Half a cell clears a voxel the surface merely PASSES THROUGH. It
+// clears nothing at all on a surface the voxelizer had to DILATE, and
+// conservative triangle/voxel overlap dilates everything: the occupied set is
+// the surface grown by up to a cell diagonal. Measured on the harness's 1 m
+// sphere (centre 0.5 m radius, v0 = 0.25): a cell is marked whenever it
+// INTERSECTS the ball, so the occupied region reaches 0.75 m from the centre
+// and the biased origin at 0.625 m is inside it FOR EVERY NORMAL — not just
+// the oblique ones the first reading blamed. `probe:gi2-gather`'s probe audit
+// measured the consequence directly: 70–75 % of that sphere's probe rays
+// returned a hit at t < 6 cm. A probe reading its own darkness back, 3 rays in
+// 4. That is the black crescent.
+//
+// Two separate things follow, and conflating them is what made the first fix
+// attempt wrong:
+//
+//   1. THE BIAS IS A CALLER PARAMETER, in cells of `v_l` — the cell size of
+//      the level the origin sits on, not v0. A ray that starts outside the
+//      finest window starts in a coarser cell and needs a coarser bias.
+//
+//   2. THE ORIGIN ESCAPES. If the biased origin's own voxel is still
+//      occupied, push another WHOLE CELL along the normal, up to
+//      `ORIGIN_ESCAPE` times. This is not a bias that got bigger: it fires
+//      only where the voxelization is thicker than the surface, costs one
+//      occupancy read on the common path (free cell, loop breaks at once),
+//      and cannot move a ray that has no normal to move along.
+//
+// And for the origins the escape cannot save (a ray genuinely born inside a
+// solid — the leak test fires 1.4 % of its rays from inside the box), the
+// voxel containing the origin is tested by the face the ray LEAVES through
+// rather than by a seeded entry face:
+//
+//     a ray starting inside an occupied voxel ignores that voxel's ENTRY
+//     face and honours its EXIT face.
+//
+// Leaving a wall's voxel through the wall's own face still blocks — a ray
+// born inside a 5 cm wall ⊥ X and travelling +X leaves through the +X face,
+// whose bit that wall sets, so it is stopped. A ray born in the same voxel and
+// travelling +Z leaves through the +Z face, which a wall ⊥ X does not set, and
+// is correctly let through: it runs PARALLEL to the wall inside the wall's
+// cell, which is the thickening the face bits exist to remove. The seeded
+// "dominant axis" entry face this replaces was an invention — the ray made no
+// step to arrive where it was born, so there is no entry face to read, and
+// picking one fails closed on exactly the rays that are not blocked.
+//
 // ══ RETURN SHAPE ════════════════════════════════════════════════════════════
 //
 // A laid-out WGSL function cannot return a struct (occupancyField's traceBody
@@ -73,10 +147,22 @@
 // through f32 EXACTLY. That is a checked property, not a lucky fit: faceId is
 // 3 bits, level 3, and a 64³ voxel index 18.
 import {
-  Break, If, Loop, bitAnd, bitOr, exp2, float, int, select, shiftLeft, shiftRight, uint, vec3, vec4,
+  Break, If, Loop, bitAnd, bitOr, dot, exp2, float, int, select, shiftLeft, shiftRight, uint, vec3,
+  vec4,
 } from "three/tsl";
 import { sharedFn } from "../giFn.js";
 import { BMASK_OFF, BRICK, BRICKS, FACE_OFF, LEVEL_WORDS, N, OCC_OFF } from "./windowStore.js";
+
+/**
+ * How many whole cells the origin may walk along its normal to get out of an
+ * occupied voxel. Two clears the harness's sphere at every normal; three is
+ * the budget, and a ray that has not escaped by then is inside something and
+ * falls back on the exit-face rule.
+ */
+export const ORIGIN_ESCAPE = 3;
+
+/** The default origin bias, in cells of the level the origin sits on. */
+export const DEFAULT_BIAS_CELLS = 0.5;
 
 /** Face bit order: 0 = +X, 1 = −X, 2 = +Y, 3 = −Y, 4 = +Z, 5 = −Z. */
 export const FACE_BIT = { PX: 0, NX: 1, PY: 2, NY: 3, PZ: 4, NZ: 5 };
@@ -114,14 +200,62 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
       { name: "rd", type: "vec3" },
       { name: "rn", type: "vec3" },
       { name: "tMax", type: "float" },
+      { name: "biasCells", type: "float" },
     ],
-    body: (ro, rd, rn, tMax) => {
-      // K.4's bias: screen-probe origins sit ON surfaces, so push half a
-      // LEVEL-0 cell along the geometric normal. Derived from v0, never from
-      // probe spacing — the quantity that put the origin inside its own
-      // surface's voxel is the voxel (SRC's R2 rule, and it survives here).
-      const o = vec3(ro).add(vec3(rn).mul(float(voxel0 * 0.5))).toVar();
+    body: (ro, rd, rn, tMax, biasCells) => {
+      const n0 = vec3(rn).toVar();
       const d = vec3(rd).toVar();
+      // A zero normal means "no bias, no escape" — the leak test's rays are
+      // born in mid-air and have no surface to be pushed off.
+      const hasN = dot(n0, n0).greaterThan(0.25).toVar();
+      // The level of the UNBIASED origin. The bias is measured in THAT level's
+      // cells, so it has to be found before the bias is applied; the biased
+      // origin's own level is found again below, because the escape can walk
+      // the origin out of one window and into another.
+      const lvl0 = int(levels - 1).toVar();
+      for (let l = levels - 1; l >= 0; l--) {
+        const rel0 = vec3(ro).div(float(voxel0 * Math.pow(2, l))).floor().sub(vec3(originsU[l]));
+        const in0 = rel0.x.greaterThanEqual(0).and(rel0.y.greaterThanEqual(0)).and(rel0.z.greaterThanEqual(0))
+          .and(rel0.x.lessThan(N)).and(rel0.y.lessThan(N)).and(rel0.z.lessThan(N));
+        lvl0.assign(select(in0, int(l), lvl0));
+      }
+      const vl0 = float(voxel0).mul(exp2(lvl0.toFloat())).toVar();
+      const o = vec3(ro).add(n0.mul(vl0.mul(biasCells))).toVar();
+
+      // THE ESCAPE. See the header. The addressing is hoisted OUT of the loop:
+      // level, cell size, window origin and slot base cannot change while the
+      // origin walks a fraction of a cell, and recomputing the level's select
+      // chain three times per ray was measurable (probeTrace 0.34 → 0.48 ms
+      // when the naive form shipped). One occupancy read on the common path,
+      // because the first test finds a free cell and breaks.
+      const org0 = originAt(lvl0).toVar();
+      const slot0 = lvl0.toUint().mul(uint(LEVEL_WORDS)).add(uint(OCC_OFF)).toVar();
+      const dyn0 = useDynamic
+        ? uint(levels).add(lvl0.min(int(dynLevels - 1)).toUint()).mul(uint(LEVEL_WORDS)).add(uint(OCC_OFF)).toVar()
+        : null;
+      const useDyn0 = useDynamic ? lvl0.lessThan(int(dynLevels)) : null;
+      Loop({ start: 0, end: ORIGIN_ESCAPE, name: "gi2Escape" }, () => {
+        const c = o.div(vl0).floor().toVar();
+        const rel = c.sub(org0).toVar();
+        // A point outside the level's window reads as FREE: the escape must
+        // not push a ray that has simply left the window.
+        const inside = rel.x.greaterThanEqual(0).and(rel.y.greaterThanEqual(0)).and(rel.z.greaterThanEqual(0))
+          .and(rel.x.lessThan(N)).and(rel.y.lessThan(N)).and(rel.z.lessThan(N));
+        const vi = bitOr(bitOr(
+          bitAnd(c.x.toInt(), int(N - 1)).toUint(),
+          shiftLeft(bitAnd(c.y.toInt(), int(N - 1)).toUint(), uint(6))),
+        shiftLeft(bitAnd(c.z.toInt(), int(N - 1)).toUint(), uint(12))).toVar();
+        const bit = shiftLeft(uint(1), bitAnd(vi, uint(31))).toVar();
+        const word = shiftRight(vi, uint(5)).toVar();
+        // Never an `If()` around a buffer read — the idiom that rendered the
+        // BVH mirror pass black. The INDEX is in range, the VALUE is gated.
+        const st = bitAnd(buffer.element(slot0.add(word)), bit).toVar();
+        const dy = useDynamic
+          ? select(useDyn0, bitAnd(buffer.element(dyn0.add(word)), bit), uint(0)).toVar()
+          : uint(0);
+        const blocked = hasN.and(inside).and(bitOr(st, dy).notEqual(uint(0))).toVar();
+        If(blocked, () => { o.addAssign(n0.mul(vl0)); }).Else(() => { Break(); });
+      });
       // Signed floor on the reciprocal: an axis-parallel ray must produce a
       // huge, positive-or-negative crossing distance on its degenerate axis
       // rather than an inf/NaN that poisons the per-axis min.
@@ -177,6 +311,10 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
 
       // The brick the ray starts in, at the level it starts on.
       const bcell = o.div(float(voxel0 * BRICK).mul(exp2(level.toFloat()))).floor().toVar();
+      // "This is still the voxel the ray was born in." Cleared after the first
+      // voxel of the first brick, and again at the end of the first brick, so
+      // an empty starting brick cannot hand the flag to the next one.
+      const firstVox = float(1).toVar();
 
       Loop({ start: 0, end: steps, name: "gi2Brick" }, () => {
         used.addAssign(1);
@@ -252,7 +390,28 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
                 ? select(useDyn, bitAnd(buffer.element(dynBase.add(uint(OCC_OFF)).add(occWord)), occBit), uint(0)).toVar()
                 : uint(0);
 
-              If(bitOr(occStatic, occDyn).notEqual(uint(0)), () => {
+              // WHEN this voxel ends, and by which axis — computed BEFORE the
+              // face test, because the origin voxel is tested against the face
+              // the ray LEAVES by and that axis is not known until now.
+              const tv = vec3(
+                vcell.x.add(stepPos.x).mul(vl).sub(o.x).mul(inv.x),
+                vcell.y.add(stepPos.y).mul(vl).sub(o.y).mul(inv.y),
+                vcell.z.add(stepPos.z).mul(vl).sub(o.z).mul(inv.z),
+              ).toVar();
+              const tV = tv.x.min(tv.y).min(tv.z).toVar();
+              const axisV = select(tV.equal(tv.x), float(0), select(tV.equal(tv.y), float(1), float(2))).toVar();
+              const atOrigin = firstVox.greaterThan(0.5).toVar();
+              firstVox.assign(0);
+              // The distance this voxel would report a hit AT: where the ray
+              // entered it, or — for the voxel the ray was born in, which it
+              // can only be blocked by on the way OUT — where it leaves.
+              const tHit = select(atOrigin, tV, tv0).toVar();
+              // ⭐ `tMax` IS A DISTANCE. See the header: the brick loop's test
+              // is at brick granularity, so without this a bounded query walks
+              // on to the far side of the brick its limit fell inside.
+              If(tv0.greaterThanEqual(tMax), () => { Break(); });
+
+              If(bitOr(occStatic, occDyn).notEqual(uint(0)).and(tHit.lessThan(tMax)), () => {
                 const byteWord = shiftRight(vi, uint(2)).toVar();
                 const byteShift = bitAnd(vi, uint(3)).mul(uint(8)).toVar();
                 const fStatic = bitAnd(
@@ -265,28 +424,33 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
                   : uint(0);
                 const eFace = select(iAxis.equal(0), entryBits.x,
                   select(iAxis.equal(1), entryBits.y, entryBits.z)).toVar();
-                If(bitAnd(bitOr(fStatic, fDyn), shiftLeft(uint(1), eFace.toUint())).notEqual(uint(0)), () => {
+                // ⭐ THE ORIGIN VOXEL IS TESTED BY THE FACE THE RAY LEAVES BY.
+                // Both bits of an axis pair are always set together (occlusion
+                // along a line is reciprocal), so testing `entryBits[axisV]`
+                // tests the AXIS the ray exits on, and keeps the faceId
+                // convention every consumer already reads: the face whose
+                // outward normal opposes the ray.
+                const xFace = select(axisV.equal(0), entryBits.x,
+                  select(axisV.equal(1), entryBits.y, entryBits.z)).toVar();
+                const tFace = select(atOrigin, xFace, eFace).toVar();
+                If(bitAnd(bitOr(fStatic, fDyn), shiftLeft(uint(1), tFace.toUint())).notEqual(uint(0)), () => {
                   hit.assign(1);
-                  hitT.assign(tv0);
-                  packed.assign(eFace.add(level.toFloat().mul(8)).add(vi.toFloat().mul(64)));
+                  // A ray blocked by the voxel it was born in is blocked at
+                  // that voxel's far side, not at its own origin.
+                  hitT.assign(tHit);
+                  packed.assign(tFace.add(level.toFloat().mul(8)).add(vi.toFloat().mul(64)));
                   Break();
                 });
               });
 
-              const tv = vec3(
-                vcell.x.add(stepPos.x).mul(vl).sub(o.x).mul(inv.x),
-                vcell.y.add(stepPos.y).mul(vl).sub(o.y).mul(inv.y),
-                vcell.z.add(stepPos.z).mul(vl).sub(o.z).mul(inv.z),
-              ).toVar();
-              const tV = tv.x.min(tv.y).min(tv.z).toVar();
               If(tV.greaterThanEqual(tB), () => { Break(); }); // out of this brick
-              const axisV = select(tV.equal(tv.x), float(0), select(tV.equal(tv.y), float(1), float(2))).toVar();
               vcell.addAssign(stepOf(axisV));
               iAxis.assign(axisV);
               tv0.assign(tV);
             });
           });
 
+          firstVox.assign(0);
           If(hit.greaterThan(0.5), () => { Break(); });
           // Step to the next brick. `max` guards the one case where a level
           // hand-off re-derives a brick the ray has already passed: the brick
@@ -307,10 +471,13 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
    * @param {Node} dir     UNIT direction; `t` is then metres
    * @param {Node|number} tMax
    * @param {Node} [normal]  geometric normal for the origin bias; omit for none
+   * @param {Node|number} [biasCells]  origin bias in cells of the ORIGIN's own
+   *   level (`v_l`), default half a cell. The escape above may push further.
    */
-  const traceWindow = (origin, dir, tMax, normal = null) => {
+  const traceWindow = (origin, dir, tMax, normal = null, biasCells = DEFAULT_BIAS_CELLS) => {
     const r = traceFn(
       vec3(origin), vec3(dir), normal == null ? vec3(0, 0, 0) : vec3(normal), float(tMax),
+      float(biasCells),
     ).toVar();
     const zi = r.z.toUint().toVar();
     return {

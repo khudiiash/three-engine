@@ -86,13 +86,19 @@ import { octahedralUV } from "../srcOctahedral.js";
  * Tier constants. These, and only these, are compiled into the WGSL.
  *
  * `tile` and `rays` are PLAN §4.6's row; `oct` is §L's `O = 8` (64 directions);
- * `history` is §L.3's `H = 4`; `sh` selects §L.5's phone resolve.
+ * `history` is §L.3's `H = 4`; `sh` selects the resolve's DIFFUSE integrator.
+ *
+ * ⚠ `sh` is `true` on every tier since Stage 3.2. §L.5 offered "SH on phone,
+ * oct sum on desktop; measure both" — measured, the two agree to 1.5 % on the
+ * diffuse crops and the sum costs 4× the whole resolve. A tier row that can
+ * only ever hold one value is kept as a row so the A/B stays expressible, not
+ * because a tier is expected to differ.
  */
 export const GATHER_TIERS = {
   phone: { tile: 16, rays: 8, oct: 8, history: 4, sh: true },
   medium: { tile: 16, rays: 8, oct: 8, history: 4, sh: true },
-  high: { tile: 8, rays: 16, oct: 8, history: 4, sh: false },
-  ultra: { tile: 8, rays: 16, oct: 8, history: 4, sh: false },
+  high: { tile: 8, rays: 16, oct: 8, history: 4, sh: true },
+  ultra: { tile: 8, rays: 16, oct: 8, history: 4, sh: true },
 };
 
 /** HZB mips and the stackless walk's step budget (§L.2). */
@@ -224,6 +230,10 @@ export function createGiGather({
   const CROP_OUT_VEC = 6;
   const cropOut = instancedArray(new Float32Array(crops * CROP_OUT_VEC * 4), "vec4");
   const litBuf = instancedArray(new Float32Array(width * height * 4), "vec4");
+  /** `shadeHit` under a microscope — see `shadeProbePass`. Harness only. */
+  const SHADE_SLOTS = 12;
+  const shadeIn = instancedArray(new Float32Array(SHADE_SLOTS * 2 * 4), "vec4");
+  const shadeOut = instancedArray(new Float32Array(SHADE_SLOTS * 4 * 4), "vec4");
 
   // ── storage textures (§L.5's two outputs, plus the lit frame §L.2 reads) ──
   const mkTex = (name) => {
@@ -268,6 +278,15 @@ export function createGiGather({
     roughness: uniform(0.35),
     f0: uniform(0.04),
     injectAlpha: uniform(0.25),
+    // §L.3's biased hysteresis, as a UNIFORM arm rather than a compiled-in
+    // rule — the same discipline `hzbOn` follows. It is a claim about the
+    // estimator ("a big change is a lighting change") that only a measurement
+    // can settle, and the measurement needs both arms out of one binary.
+    hystOn: uniform(1),
+    // §L.3's history depth. A TIER CONSTANT in the table above and a uniform
+    // here for the same reason `hystOn` is: how much variance H buys, and what
+    // it costs in responsiveness, is a measurement.
+    historyU: uniform(H),
   };
   const palette = Array.from({ length: PAL_ENTRIES }, () => new THREE.Vector4(0, 0, 0, 0));
   const palU = uniformArray(palette, "vec4");
@@ -362,9 +381,53 @@ export function createGiGather({
     return { level, vi };
   };
 
-  /** Palette at a world point, pushed half a cell into its own surface. */
+  /**
+   * The world point a voxel FACE stands for: the voxel's centre, pushed half a
+   * cell out along the face's outward normal.
+   *
+   * ⭐ THE SHADE POINT BELONGS TO THE SLOT, NOT TO THE RAY. `shadeHit` writes
+   * ONE cache slot per (voxel, face) and the first ray to arrive wins it
+   * forever, so shading at wherever THAT ray happened to enter makes the
+   * stored radiance depend on which ray got there first. Deriving the point
+   * from the voxel and the face makes it the same point for every ray — and
+   * it also detaches the shade point from the trace's origin bias, which
+   * Stage 3.2 made a caller parameter with an escape on top (the old
+   * `o2 + n·0.5·v0 + d·t` reconstruction silently assumed the bias was still
+   * half a level-0 cell).
+   */
+  const faceSamplePoint = (levelF, voxF, hn) => {
+    const vl = float(v0).mul(exp2(levelF)).toVar();
+    const vi = voxF.toUint().toVar();
+    const org = win.originAt(levelF.toInt()).toVar();
+    // Un-torus: the slot index carries the low 6 bits of the world cell, and
+    // the level's origin says which 64-cell window those bits belong to.
+    const un = (slotBits, o1) => o1.toInt().add(bitAnd(slotBits.toInt().sub(o1.toInt()), int(N - 1))).toFloat();
+    const wc = vec3(
+      un(bitAnd(vi, uint(63)), org.x),
+      un(bitAnd(shiftRight(vi, uint(6)), uint(63)), org.y),
+      un(bitAnd(shiftRight(vi, uint(12)), uint(63)), org.z),
+    ).toVar();
+    return wc.add(0.5).mul(vl).add(hn.mul(vl.mul(0.5)));
+  };
+
+  /**
+   * Palette at a world point, pushed INTO its own surface.
+   *
+   * ⚠ THE PUSH IS AN EPSILON, NOT HALF A CELL. Half a cell is the right nudge
+   * for a surface that lies ON a cell boundary — which is what a wall or a
+   * floor built on the grid does — and it is a whole cell too far for one that
+   * lies INSIDE a cell. The harness's emissive panel is 10 cm below the top of
+   * its own voxel, so a 12.5 cm push read the CEILING's palette instead: the
+   * panel composited with emissive 0, and `injectLitFrame` then wrote that
+   * emission-free colour into the panel's own cache face, where every probe
+   * ray that hits the light reads it. Measured in the texel dump: box-top
+   * texels pointing straight at the panel stored 1.28 and 4.21 against a
+   * reference of 8.02. A tenth of a cell (2.5 cm at v0) is orders of magnitude
+   * above any gbuffer float error and cannot cross a cell a surface sits in.
+   */
+  const SURFACE_EPS = 0.1;
   const palAtWorld = (p, n) => {
-    const c = cellOfWorld(p.sub(n.mul(v0 * 0.5)));
+    const c = cellOfWorld(p.sub(n.mul(v0 * SURFACE_EPS)));
     return palAt(c.level.toFloat(), c.vi.toFloat());
   };
 
@@ -435,22 +498,46 @@ export function createGiGather({
     const probe = ty.mul(u.probeWU).add(tx).toVar();
     bump(STATS.probesPlaced, tx);
 
-    // ── the anchor: 4 Hammersley candidates, sky rejected ──────────────────
+    // ── the anchor: Hammersley candidates, sky rejected, SURFACE STICKY ────
+    //
+    // ⭐ A PROBE IS A PERSISTENT OBJECT, AND THE ANCHOR JITTER WAS DESTROYING
+    // IT. §L.1 picks the tile's anchor by a per-frame jitter and rejects only
+    // SKY. On a tile that straddles two surfaces — the box top is an 8-px
+    // sliver, exactly one tile row, seen 4° off grazing — consecutive frames
+    // anchor on different surfaces, §L.3's reprojection gate then rightly
+    // refuses to carry the oct map forward, and the probe restarts from
+    // nothing EVERY FRAME. Measured: 9 to 20 of 64 texels filled on the box
+    // top against 32 of 64 (a complete front hemisphere) on the floor.
+    //
+    // So the candidates are tried in two passes: first only those that agree
+    // with LAST frame's probe (normal and plane, the same two gates §L.3's
+    // reprojection uses — a normal alone cannot tell the box top from the
+    // floor 2 m below it), then any surface at all. The jitter still moves the
+    // anchor WITHIN the surface, which is what it is for; it no longer moves
+    // it BETWEEN surfaces, which it was never for.
+    const prevA = probeMeta.element(metaIdx(u.prevBase, probe, 0)).toVar();
+    const prevB = probeMeta.element(metaIdx(u.prevBase, probe, 1)).toVar();
     const pos = vec3(0).toVar();
     const nrm = vec3(0, 1, 0).toVar();
     const depth = float(0).toVar();
     const valid = float(0).toVar();
-    Loop({ start: 0, end: 4, name: "cand" }, ({ cand }) => {
+    Loop({ start: 0, end: 8, name: "cand" }, ({ cand }) => {
       If(valid.greaterThan(0.5), () => { Break(); });
-      const s = u.frame.mul(uint(4)).add(uint(cand)).toVar();
+      const s = u.frame.mul(uint(4)).add(bitAnd(uint(cand), uint(3))).toVar();
       const jx = radical2(bitAnd(s, uint(63))).toVar();
       const jy = rand01(s.add(probe.mul(uint(9781)))).toVar();
       const px = min(tx.mul(uint(T)).add(jx.mul(T).toUint()), u.widthU.sub(uint(1))).toVar();
       const py = min(ty.mul(uint(T)).add(jy.mul(T).toUint()), u.heightU.sub(uint(1))).toVar();
       const g = loadPos(px.toInt(), py.toInt()).toVar();
-      If(g.w.greaterThan(0.5), () => {
+      const cn = normalize(loadNrm(px.toInt(), py.toInt()).xyz).toVar();
+      const agree = dot(cn, prevB.xyz).greaterThan(0.9)
+        .and(dot(prevB.xyz, g.xyz.sub(prevA.xyz)).abs().lessThan(v0)).toVar();
+      // The second pass (candidates 4-7) drops the agreement requirement, and
+      // a tile with no previous probe never had one to keep.
+      const relaxed = prevA.w.lessThan(0.5).or(uint(cand).greaterThanEqual(uint(4))).toVar();
+      If(g.w.greaterThan(0.5).and(agree.or(relaxed)), () => {
         pos.assign(g.xyz);
-        nrm.assign(normalize(loadNrm(px.toInt(), py.toInt()).xyz));
+        nrm.assign(cn);
         depth.assign(u.viewProj.mul(vec4(g.xyz, 1)).w);
         valid.assign(1);
       });
@@ -470,11 +557,32 @@ export function createGiGather({
           const pi = pty.mul(u.probeWU).add(ptx).toVar();
           const pa = probeMeta.element(metaIdx(u.prevBase, pi, 0)).toVar();
           const pb = probeMeta.element(metaIdx(u.prevBase, pi, 1)).toVar();
-          // §L.3's two gates. The position tolerance is half a TILE's world
+          // §L.3's gates. The position tolerance is half a TILE's world
           // footprint at this depth — derived from the pixel size, never a
           // metric constant, so it is right at 1 m and at 100 m.
+          //
+          // ⭐ BUT A TILE'S FOOTPRINT IS NOT ISOTROPIC, AND ON A GRAZING
+          // SURFACE IT IS NOT EVEN CLOSE. §L.3's rule measures a 3-D distance
+          // against `0.5 · T · pixelWorldSize` — right for a surface facing
+          // the camera, wrong by `1/cos θ` for one seen edge-on. The box top
+          // is seen 4° off grazing, so its 8-px tile spans about TWO METRES of
+          // world space along the surface while the tolerance stays 0.25 m:
+          // the anchor jitter moves the probe further than the gate allows,
+          // every frame, and the probe's oct map is thrown away every frame.
+          // Measured 16 of 64 texels filled — exactly one frame's 16 rays.
+          //
+          // So the gate is split the way the geometry is. ACROSS the surface
+          // (the plane distance) it stays tight: that is what says "the same
+          // surface". ALONG the surface it is stretched by the slant, which is
+          // the tile's real footprint there. Both terms are still derived from
+          // the pixel size; nothing here is a metric constant.
           const pixWorld = depth.div(u.projScale).toVar();
-          const near = pos.sub(pa.xyz).length().lessThan(float(0.5 * T).mul(pixWorld).max(v0));
+          const tolN = float(0.5 * T).mul(pixWorld).max(v0).toVar();
+          const vdir = normalize(pos.sub(u.camPos)).toVar();
+          const slant = dot(nrm, vdir).abs().max(0.05).toVar();
+          const dlt = pos.sub(pa.xyz).toVar();
+          const near = dot(nrm, dlt).abs().lessThan(tolN)
+            .and(dlt.length().lessThan(tolN.div(slant)));
           const align = dot(nrm, pb.xyz).greaterThan(0.9);
           If(pa.w.greaterThan(0.5).and(near).and(align), () => {
             prevProbe.assign(pi.toFloat());
@@ -507,7 +615,7 @@ export function createGiGather({
   // and the emissive panel (one NEE shadow ray), plus the palette's own
   // emission. No indirect term — multibounce arrives through the cache's EMA
   // and through `injectLitFrame`, which is the point of §K.6.
-  const shadeHit = (p, n, levelF, voxF, seedU) => {
+  const shadeHit = (p, n, levelF, voxF) => {
     const pal = palAt(levelF, voxF).toVar();
     const E = vec3(0).toVar();
 
@@ -518,31 +626,74 @@ export function createGiGather({
       E.addAssign(u.sunColor.mul(ndl).mul(float(1).sub(sh)));
     });
 
-    // Panel NEE, skipped at or above the panel's own plane: its emission is
-    // already in `pal.w` there, and a light cannot illuminate itself without
-    // being counted twice.
+    // ══ THE PANEL, AS AN AREA LIGHT, ESTIMATED ONCE AND FOR ALL ═══════════
+    //
+    // ⭐⭐ THE FRESH SHADE IS WRITTEN WITH α = 1 AND NEVER REVISITED. §L.2's
+    // rule is "if the slot is fresh, shade it NOW", and the very next ray to
+    // reach that face reads the stored word instead of shading again. So for
+    // any surface `injectLitFrame` cannot reach — anything off screen, which
+    // is the whole reason this cache exists — ONE Monte-Carlo sample IS the
+    // surface's radiance, permanently. A random panel point was a coin flip
+    // whose result was kept forever.
+    //
+    // And the coin was loaded. The old shadow ray stopped `1.5·v0` short
+    // ALONG THE RAY, but the clearance it needs is along Y: the emitter's own
+    // voxel reaches from y = 2.75 to 3.0 for a panel whose surface is at 2.9,
+    // so a ray must lose 0.15 m of HEIGHT to clear it, and a grazing ray
+    // travelling 0.375 m loses only `0.375·wd.y`. From the +Z wall, samples
+    // toward the panel's near edge have wd.y ≈ 0.38 → 0.144 m — just short —
+    // and the ray ends INSIDE the emitter's cell, is blocked by the very
+    // light it is sampling, and writes BLACK. Measured: that wall, the one
+    // surface in the Cornell box no pixel ever covers, held an explicitly
+    // written zero after 160 frames while every visible surface held the
+    // right colour; the sphere, whose hemisphere faces it, read 0.10 of the
+    // reference.
+    //
+    // Both halves are fixed here:
+    //   · the ray stops at the emitter's own CELL PLANE, derived from v0 and
+    //     the panel's height — a distance in the geometry, not a fudge along
+    //     the ray;
+    //   · the estimate is a DETERMINISTIC 2×2 stratification of the panel,
+    //     four shadow rays, no random number. It costs four rays on a fresh
+    //     slot (96 of them per frame, measured) and it cannot be unlucky.
+    //
+    // Skipped at or above the panel's own plane: its emission is already in
+    // `pal.w` there, and a light cannot illuminate itself without being
+    // counted twice.
     If(p.y.lessThan(u.panelCentre.y.sub(0.05)), () => {
-      const r1 = rand01(seedU).sub(0.5).toVar();
-      const r2 = rand01(seedU.add(uint(0x9e3779b9))).sub(0.5).toVar();
-      const q = vec3(
-        u.panelCentre.x.add(r1.mul(2).mul(u.panelHalf.x)),
-        u.panelCentre.y,
-        u.panelCentre.z.add(r2.mul(2).mul(u.panelHalf.y)),
-      ).toVar();
-      const wv = q.sub(p).toVar();
-      const d2 = dot(wv, wv).max(1e-4).toVar();
-      const d = sqrt(d2).toVar();
-      const wd = wv.div(d).toVar();
-      const cosX = dot(n, wd).max(0).toVar();
-      // The panel faces −Y, so its own cosine toward `p` is `wd.y`.
-      const cosP = wd.y.max(0).toVar();
-      If(cosX.mul(cosP).greaterThan(1e-5), () => {
-        // Stop short of the panel's own VOXEL, not of the panel: at v0 the
-        // emitter's cell reaches below its surface, and a shadow ray run to the
-        // full distance is occluded by the very light it is sampling.
-        const vis = float(1).sub(traceWindow(p, wd, d.sub(float(v0 * 1.5)).max(0.05), n).hit).toVar();
-        E.addAssign(u.panelRadiance.mul(cosX).mul(cosP).mul(u.panelArea).div(d2).mul(vis));
-      });
+      // ⚠ MEASURE THE STOP FROM THE ORIGIN THE TRACE WILL ACTUALLY USE.
+      // `traceWindow` pushes the origin `biasCells · v_l` along the normal
+      // BEFORE it starts, so a `tMax` measured from `p` overshoots by exactly
+      // that much — and on a surface whose normal points AT the light (the
+      // floor, the box top) the whole overshoot is vertical, which is enough
+      // to end the ray inside the emitter's own voxel. Measured: with the
+      // brick-granularity `tMax` bug fixed, the four WALLS lit up and the
+      // floor and the box top stayed black, and this is the difference
+      // between them. Half a cell of margin on top absorbs the escape.
+      const pRay = p.add(n.mul(v0 * 0.5)).toVar();
+      const yStop = u.panelCentre.y.div(v0).floor().mul(v0).sub(v0 * 0.5).toVar();
+      for (let sy = 0; sy < 2; sy++) {
+        for (let sx = 0; sx < 2; sx++) {
+          const q = vec3(
+            u.panelCentre.x.add(u.panelHalf.x.mul(sx ? 0.5 : -0.5)),
+            u.panelCentre.y,
+            u.panelCentre.z.add(u.panelHalf.y.mul(sy ? 0.5 : -0.5)),
+          ).toVar();
+          const wv = q.sub(p).toVar();
+          const d2 = dot(wv, wv).max(1e-4).toVar();
+          const d = sqrt(d2).toVar();
+          const wd = wv.div(d).toVar();
+          const cosX = dot(n, wd).max(0).toVar();
+          // The panel faces −Y, so its own cosine toward `p` is `wd.y`.
+          const cosP = wd.y.max(0).toVar();
+          If(cosX.mul(cosP).greaterThan(1e-5), () => {
+            const tStop = yStop.sub(pRay.y).div(wd.y.max(1e-3)).min(d).max(0.05).toVar();
+            const vis = float(1).sub(traceWindow(p, wd, tStop, n).hit).toVar();
+            E.addAssign(u.panelRadiance.mul(cosX).mul(cosP)
+              .mul(u.panelArea.mul(0.25)).div(d2).mul(vis));
+          });
+        }
+      }
     });
 
     return pal.xyz.mul(1 / Math.PI).mul(E).add(vec3(pal.w));
@@ -700,10 +851,17 @@ export function createGiGather({
       // grazing ray is CENTIMETRES — so the window trace restarted on the
       // probe's own surface, inside its own voxel, and the analytic fill sets
       // all six face bits on a curved surface, so it hit itself at t ≈ 0 and
-      // returned its own darkness. 45 % of rays take this path. K.4's bias is
-      // half a LEVEL-0 CELL along the geometric normal; at any hand-off
-      // distance that is a harmless lateral nudge, and at a short one it is
-      // the only thing standing between the ray and its own surface.
+      // returned its own darkness. 45 % of rays take this path.
+      //
+      // ⚠ AND HALF A CELL WAS NOT ENOUGH. Stage 3.2's audit measured 70–75 %
+      // of that sphere's rays STILL hitting at t < 6 cm with the bias in
+      // place: conservative voxelization marks every cell the surface
+      // touches, so the occupied set reaches a cell diagonal beyond the
+      // surface and half a cell cannot clear it for ANY normal. The bias is a
+      // caller parameter now and `traceWindow` walks the origin out of an
+      // occupied voxel by whole cells — see `windowTrace.js`'s header. This
+      // call keeps the default half-cell; the escape does the rest, and only
+      // where it is needed.
       const bn = nrm.toVar();
       const r = traceWindow(o2, dir, float(RAY_MAX).sub(handoff), bn).raw.toVar();
       const zi = r.z.toUint().toVar();
@@ -712,12 +870,12 @@ export function createGiGather({
         const levelF = bitAnd(shiftRight(zi, uint(3)), uint(7)).toFloat().toVar();
         const voxF = shiftRight(zi, uint(6)).toFloat().toVar();
         const hn = normalOfFace(faceF).toVar();
-        const hp = o2.add(bn.mul(v0 * 0.5)).add(dir.mul(r.y)).toVar();
+        const hp = faceSamplePoint(levelF, voxF, hn).toVar();
         const c = cache.cacheRead(levelF, voxF, faceF).toVar();
         If(c.w.greaterThan(0.5), () => {
           rad.assign(c.xyz);
         }).Else(() => {
-          const s = shadeHit(hp, hn, levelF, voxF, seedBase.add(uint(1013))).toVar();
+          const s = shadeHit(hp, hn, levelF, voxF).toVar();
           // TSL: `.toVar()` IS LOAD-BEARING, NOT STYLE. A function call whose
           // result nothing consumes is never built into the shader: the node
           // graph is walked from its outputs, and an unused call node has no
@@ -744,16 +902,23 @@ export function createGiGather({
     const addr = octIdx(u.curBase, probe, texel.toUint()).toVar();
     const old = probeOct.element(addr).toVar();
     const nPrev = old.w.div(1024).floor().toVar();
-    const alpha = float(1).div(min(nPrev.add(1), float(H))).toVar();
+    const alpha = float(1).div(min(nPrev.add(1), u.historyU)).toVar();
     const lNew = dot(rad, vec3(0.2126, 0.7152, 0.0722)).toVar();
     const lOld = dot(old.xyz, vec3(0.2126, 0.7152, 0.0722)).toVar();
     // GI-1.0's biased hysteresis: a large radiance change drops most of the
     // history at once rather than crawling toward the new value over H frames.
-    const big = nPrev.greaterThan(0.5)
+    // ⚠ ONE SAMPLE CANNOT EVIDENCE A CHANGE. `lNew` is a SINGLE ray through a
+    // texel that spans 4π/64 sr; `lOld` is a mean of up to H of them. In a
+    // Cornell box a texel's radiance ranges over an order of magnitude inside
+    // its own solid angle, so "differs by more than 50 %" is the NOISE, not a
+    // change — and forcing α = 0.5 on it discards the history that was
+    // suppressing exactly that noise. Kept behind a uniform so the wall's
+    // mottling can be measured with it and without it.
+    const big = u.hystOn.greaterThan(0.5).and(nPrev.greaterThan(0.5))
       .and(lNew.sub(lOld).abs().greaterThan(max(lNew, lOld).mul(0.5))).toVar();
     If(big, () => { bump(STATS.alphaForced, xr); });
     const a = select(big, float(0.5), alpha).toVar();
-    const nNext = min(nPrev.add(1), float(H)).toVar();
+    const nNext = min(nPrev.add(1), u.historyU).toVar();
     probeOct.element(addr).assign(vec4(
       mix(old.xyz, rad, a),
       nNext.mul(1024).add(min(hitDist, float(1023))),
@@ -802,6 +967,9 @@ export function createGiGather({
       }
     }
 
+    // ── pass 1: the 3×3 bilateral, and what this probe has actually SEEN ──
+    const meanAcc = vec3(0).toVar();
+    const meanW = float(0).toVar();
     Loop({ start: 0, end: OCT, name: "ft" }, ({ ft }) => {
       const t = uint(ft).toVar();
       const acc = vec3(0).toVar();
@@ -816,12 +984,46 @@ export function createGiGather({
         wsum.addAssign(ww);
         if (j === centreSlot) centreA.assign(tv.w);
       }
+      const has = wsum.greaterThan(1e-5).toVar();
+      const val = select(has, acc.div(wsum.max(1e-5)), vec3(0)).toVar();
+      // A texel that NOTHING in the 3×3 has sampled is a HOLE, and it is
+      // marked as one — a negative alpha, a value the real alpha
+      // (n·1024 + distance) can never take.
       probeFiltered.element(probe.mul(uint(OCT)).add(t)).assign(vec4(
-        select(wsum.greaterThan(1e-5), acc.div(wsum.max(1e-5)), vec3(0)), centreA,
+        val, select(has, centreA, float(-1)),
       ));
+      const e0 = octU.element(t).toVar();
+      const cw = select(has, dot(e0.xyz, nrm).max(0).mul(e0.w), float(0)).toVar();
+      meanAcc.addAssign(val.mul(cw));
+      meanW.addAssign(cw);
     });
+    // The cosine-weighted mean radiance over the directions this probe HAS
+    // data for. Filling the holes with it is what turns `Σ L·cos·Δω` from a
+    // sum over a PARTIAL hemisphere into an estimate of the whole one.
+    const holeFill = meanAcc.div(meanW.max(1e-6)).toVar();
+    const anyData = meanW.greaterThan(1e-6).toVar();
 
-    // ── the 2×2 oct mip (§L.5's roughness cone) ────────────────────────────
+    // ── pass 2: patch the holes, build the 2×2 mip and the SH2 in ONE walk ─
+    //
+    // ⭐ §L.4 SAYS "SKIP TEXELS WITH n = 0" AND THAT IS RIGHT FOR THE FILTER
+    // AND WRONG FOR THE RESOLVE. A probe whose oct map is a quarter filled —
+    // measured 9 of 64 on the box top, against 32 of 64 (a complete front
+    // hemisphere) on the floor — hands the resolve a cosine sum over a
+    // QUARTER of the hemisphere and the resolve divides by nothing, so the
+    // surface reads a quarter as bright. That is the whole of "the box top is
+    // darker than the floor": the box top is an 8-px sliver, its tile's
+    // jittered anchor lands on a different surface most frames, the
+    // reprojection gate then rightly refuses to carry the map forward, and it
+    // never fills. Directions with no data are not black; they are unknown,
+    // and the least-committal estimate of an unknown direction is the mean of
+    // the known ones. Only the FRONT hemisphere is patched — the back is
+    // legitimately zero and filling it would double SH band 0.
+    //
+    // The mip walk and the SH projection are folded in here because both used
+    // to re-read all 64 texels this pass had just written: 128 buffer reads
+    // per probe to re-derive values that were in registers a moment earlier.
+    const sh = [];
+    for (let i = 0; i < 9; i++) sh.push(vec3(0).toVar());
     Loop({ start: 0, end: MIP_TEXELS, name: "mp" }, ({ mp }) => {
       const mi = uint(mp).toVar();
       const mx = bitAnd(mi, uint(MIP_RES - 1)).toVar();
@@ -830,29 +1032,28 @@ export function createGiGather({
       Loop({ start: 0, end: 4, name: "mq" }, ({ mq }) => {
         const qx = mx.mul(uint(2)).add(bitAnd(uint(mq), uint(1))).toVar();
         const qy = my.mul(uint(2)).add(shiftRight(uint(mq), uint(1))).toVar();
-        s.addAssign(probeFiltered.element(probe.mul(uint(OCT)).add(qy.mul(uint(O))).add(qx)).xyz);
+        const t = qy.mul(uint(O)).add(qx).toVar();
+        const addr = probe.mul(uint(OCT)).add(t).toVar();
+        const cur = probeFiltered.element(addr).toVar();
+        const e = octU.element(t).toVar();
+        const d = e.xyz.toVar();
+        const isHole = cur.w.lessThan(0).and(dot(d, nrm).greaterThan(0)).and(anyData).toVar();
+        const val = select(isHole, holeFill, cur.xyz).toVar();
+        If(isHole, () => { probeFiltered.element(addr).assign(vec4(val, 0)); });
+        s.addAssign(val);
+        const c = val.mul(e.w).toVar();
+        sh[0].addAssign(c.mul(0.282095));
+        sh[1].addAssign(c.mul(d.y.mul(0.488603)));
+        sh[2].addAssign(c.mul(d.z.mul(0.488603)));
+        sh[3].addAssign(c.mul(d.x.mul(0.488603)));
+        sh[4].addAssign(c.mul(d.x.mul(d.y).mul(1.092548)));
+        sh[5].addAssign(c.mul(d.y.mul(d.z).mul(1.092548)));
+        sh[6].addAssign(c.mul(d.z.mul(d.z).mul(3).sub(1).mul(0.315392)));
+        sh[7].addAssign(c.mul(d.x.mul(d.z).mul(1.092548)));
+        sh[8].addAssign(c.mul(d.x.mul(d.x).sub(d.y.mul(d.y)).mul(0.546274)));
       });
       probeFiltered.element(uint(MIP_BASE).add(probe.mul(uint(MIP_TEXELS))).add(mi))
         .assign(vec4(s.mul(0.25), 0));
-    });
-
-    // ── SH2 projection (§L.5's phone path) ─────────────────────────────────
-    const sh = [];
-    for (let i = 0; i < 9; i++) sh.push(vec3(0).toVar());
-    Loop({ start: 0, end: OCT, name: "sp" }, ({ sp }) => {
-      const t = uint(sp).toVar();
-      const e = octU.element(t).toVar();
-      const d = e.xyz.toVar();
-      const c = probeFiltered.element(probe.mul(uint(OCT)).add(t)).xyz.mul(e.w).toVar();
-      sh[0].addAssign(c.mul(0.282095));
-      sh[1].addAssign(c.mul(d.y.mul(0.488603)));
-      sh[2].addAssign(c.mul(d.z.mul(0.488603)));
-      sh[3].addAssign(c.mul(d.x.mul(0.488603)));
-      sh[4].addAssign(c.mul(d.x.mul(d.y).mul(1.092548)));
-      sh[5].addAssign(c.mul(d.y.mul(d.z).mul(1.092548)));
-      sh[6].addAssign(c.mul(d.z.mul(d.z).mul(3).sub(1).mul(0.315392)));
-      sh[7].addAssign(c.mul(d.x.mul(d.z).mul(1.092548)));
-      sh[8].addAssign(c.mul(d.x.mul(d.x).sub(d.y.mul(d.y)).mul(0.546274)));
     });
     for (let i = 0; i < 9; i++) probeSh.element(shIdx(probe, i)).assign(vec4(sh[i], 0));
   })().compute(dispatch2d(probeW, probeH), WG);
@@ -900,14 +1101,57 @@ export function createGiGather({
     const iv = fv.floor().toVar();
     const au = fu.sub(iu).toVar();
     const av = fv.sub(iv).toVar();
-    const tap = (ox, oy) => probeFiltered.element(
-      base.add(iv.add(oy).clamp(0, res - 1).toUint().mul(uint(res)))
-        .add(iu.add(ox).clamp(0, res - 1).toUint()),
-    ).xyz;
+    // ⭐ THE OCTAHEDRAL MAP HAS NO BORDER, IT HAS A FOLD — and clamping there
+    // is the horizontal tone step at camera height.
+    //
+    // The square's `u = ±1` edges are the directions with `d.y = 0, d.z ≤ 0`
+    // (fold the parameterization by hand and the y term drops out). Off a
+    // VERTICAL wall the reflection direction is `R = (−V.x, V.y, V.z)`, so
+    // `R.y` changes sign exactly where the pixel is at the CAMERA'S OWN
+    // HEIGHT, and `R.z < 0` for any wall in front of the camera — the whole
+    // edge condition, met along one screen row. A clamped bilinear tap there
+    // pulls its second sample from the wrong side of the fold, the glossy term
+    // jumps, and `f0 · glossy` is ~12 % of the composited wall. Measured: a
+    // 0.89× step at row 263, the horizon row, stable across four scans and
+    // both hysteresis arms — the only structural feature in an otherwise
+    // noise-dominated profile.
+    //
+    // The fold's rule: stepping off one axis mirrors the OTHER. It costs two
+    // compares and a subtract, and it is the difference between a seam and a
+    // sphere.
+    const tap = (ox, oy) => {
+      const su = iu.add(ox).toVar();
+      const sv = iv.add(oy).toVar();
+      const outU = su.lessThan(0).or(su.greaterThan(res - 1)).toVar();
+      const outV = sv.lessThan(0).or(sv.greaterThan(res - 1)).toVar();
+      const cu = su.clamp(0, res - 1).toVar();
+      const cv = sv.clamp(0, res - 1).toVar();
+      const wu = select(outV, float(res - 1).sub(cu), cu).toVar();
+      const wv = select(outU, float(res - 1).sub(cv), cv).toVar();
+      return probeFiltered.element(
+        base.add(wv.toUint().mul(uint(res))).add(wu.toUint()),
+      ).xyz;
+    };
     return mix(mix(tap(0, 0), tap(1, 0), au), mix(tap(0, 1), tap(1, 1), au), av);
   };
 
-  const resolvePass = Fn(() => {
+  // ⭐ §3.2 ITEM 1 — SH2 IS THE IRRADIANCE PATH ON EVERY TIER NOW.
+  //
+  // §L.5 offered the choice and said "measure both". Measured: the 4×64 oct
+  // cosine sum WAS the resolve, and the resolve was half the whole chain
+  // (1.46 ms of 2.89 at 960×540 ultra). The sum is 256 texel loads and 256
+  // MACs per pixel to integrate a signal that `probeFilter` has ALREADY
+  // projected onto 9 coefficients — and the texels it integrates are the
+  // COSINE-CONVOLVED mean radiance over an 8×8 map, a signal whose energy
+  // above l = 2 is small by construction. So the sum re-derives, per pixel,
+  // something the probe pass computed once per probe.
+  //
+  // The oct map is NOT retired: the glossy lobe needs a DIRECTION, which SH2
+  // cannot carry, so `octSample`'s bilinear tap (4 texels, not 64) stays. What
+  // is retired is the diffuse sum. Both arms are still built — `passes.resolve`
+  // ships the SH one, `passes.resolveOct` is the measurement arm the receipts
+  // A/B against, byte-identical in everything but the integrator.
+  const makeResolve = (useSh) => Fn(() => {
     const px = globalId.x.toVar();
     const py = globalId.y.toVar();
     If(px.greaterThanEqual(u.widthU).or(py.greaterThanEqual(u.heightU)), () => { Return(); });
@@ -948,7 +1192,7 @@ export function createGiGather({
           best.assign(pi.toFloat());
         });
         If(w.greaterThan(1e-5), () => {
-          E.addAssign((USE_SH ? irradianceFromSh(pi, Nn) : irradianceFromOct(pi, Nn)).mul(w));
+          E.addAssign((useSh ? irradianceFromSh(pi, Nn) : irradianceFromOct(pi, Nn)).mul(w));
           G.addAssign(mix(octSample(pi, Rr, false), octSample(pi, Rr, true), u.roughness).mul(w));
           wsum.addAssign(w);
         });
@@ -962,7 +1206,7 @@ export function createGiGather({
         // on a silhouette, and black there reads as a hard outline.
         If(best.greaterThanEqual(0), () => {
           const pi = best.toUint().toVar();
-          E.assign(USE_SH ? irradianceFromSh(pi, Nn) : irradianceFromOct(pi, Nn));
+          E.assign(useSh ? irradianceFromSh(pi, Nn) : irradianceFromOct(pi, Nn));
           G.assign(mix(octSample(pi, Rr, false), octSample(pi, Rr, true), u.roughness));
         });
       });
@@ -970,6 +1214,8 @@ export function createGiGather({
     textureStore(irradiance, coord, vec4(E, g.w));
     textureStore(glossy, coord, vec4(G, g.w));
   })().compute(dispatch2d(width, height), WG);
+  const resolvePass = makeResolve(USE_SH);
+  const resolveOctPass = makeResolve(false);
 
   // ══════════════════════════════════════════════ SHADER: composite
   //
@@ -1004,9 +1250,11 @@ export function createGiGather({
     const g = loadPos(px.toInt(), py.toInt()).toVar();
     If(g.w.greaterThan(0.5), () => {
       const Nn = normalize(loadNrm(px.toInt(), py.toInt()).xyz).toVar();
-      // Half a cell INTO the surface: a pixel sits ON the boundary and would
-      // otherwise address the empty voxel in front of it half the time.
-      const pIn = g.xyz.sub(Nn.mul(v0 * 0.5)).toVar();
+      // INTO the surface by the same epsilon `palAtWorld` uses, and for the
+      // same reason — see the note there. A pixel sits ON a cell boundary and
+      // would otherwise address the empty voxel in front of it half the time;
+      // half a CELL overshoots any surface that sits inside one.
+      const pIn = g.xyz.sub(Nn.mul(v0 * SURFACE_EPS)).toVar();
       const ax = Nn.x.abs();
       const ay = Nn.y.abs();
       const az = Nn.z.abs();
@@ -1101,6 +1349,53 @@ export function createGiGather({
     cropOut.element(base.add(uint(5))).assign(vec4(accA.mul(k), accEm.mul(k)));
   })().compute(crops);
 
+  // ══════════════════════════════════════════════ SHADER: shadeHit, exposed
+  //
+  // ⭐ THE ONE STAGE A CROP CANNOT SEE. Every crop in the receipts sits on a
+  // surface the camera can see, and every visible surface's cache entry is
+  // written by `injectLitFrame` — so the crops cannot say anything at all
+  // about §L.2's fresh-slot shading, which is the ONLY thing that lights the
+  // surfaces the camera CANNOT see. Running the chain with the injection pass
+  // switched off showed the whole cache going black; this pass says which
+  // term of `shadeHit` is the zero. Every intermediate the estimator computes
+  // comes out: palette, N·L to the sun and its shadow, the panel's two
+  // cosines, the shadow ray's length and its visibility, and the composed
+  // result the cache would store.
+  const shadeProbePass = Fn(() => {
+    const i = instanceIndex.toVar();
+    const a = shadeIn.element(i.mul(uint(2))).toVar();
+    const b = shadeIn.element(i.mul(uint(2)).add(uint(1))).toVar();
+    const p = a.xyz.toVar();
+    const levelF = a.w.toVar();
+    const n = b.xyz.toVar();
+    const voxF = b.w.toVar();
+    const pal = palAt(levelF, voxF).toVar();
+
+    const toSun = u.sunDir.negate().normalize().toVar();
+    const ndl = dot(n, toSun).max(0).toVar();
+    const sunSh = float(-1).toVar();
+    If(ndl.greaterThan(0.001), () => { sunSh.assign(traceWindow(p, toSun, RAY_MAX, n).hit); });
+
+    // The centre stratum of the panel, with every term of its NEE exposed.
+    const q = vec3(u.panelCentre.x, u.panelCentre.y, u.panelCentre.z).toVar();
+    const wv = q.sub(p).toVar();
+    const d2 = dot(wv, wv).max(1e-4).toVar();
+    const d = sqrt(d2).toVar();
+    const wd = wv.div(d).toVar();
+    const cosX = dot(n, wd).max(0).toVar();
+    const cosP = wd.y.max(0).toVar();
+    const yStop = u.panelCentre.y.div(v0).floor().mul(v0).sub(v0 * 0.5).toVar();
+    const tStop = yStop.sub(p.add(n.mul(v0 * 0.5)).y).div(wd.y.max(1e-3)).min(d).max(0.05).toVar();
+    const vis = float(1).sub(traceWindow(p, wd, tStop, n).hit).toVar();
+    const Ecentre = u.panelRadiance.mul(cosX).mul(cosP).mul(u.panelArea).div(d2).mul(vis).toVar();
+
+    const shaded = shadeHit(p, n, levelF, voxF).toVar();
+    shadeOut.element(i.mul(uint(4))).assign(vec4(pal.xyz, pal.w));
+    shadeOut.element(i.mul(uint(4)).add(uint(1))).assign(vec4(ndl, sunSh, cosX, cosP));
+    shadeOut.element(i.mul(uint(4)).add(uint(2))).assign(vec4(d, tStop, vis, Ecentre.x));
+    shadeOut.element(i.mul(uint(4)).add(uint(3))).assign(vec4(shaded, 0));
+  })().compute(SHADE_SLOTS);
+
   // ══════════════════════════════════════════════ SHADER: cold-start clears
   const clearProbesPass = Fn(() => {
     probeOct.element(instanceIndex).assign(vec4(0));
@@ -1145,7 +1440,11 @@ export function createGiGather({
   return {
     tier, T, R, O, H, STRIDE, USE_SH, probeW, probeH, probeCount, width, height,
     uniforms: u, palette, setPalette, beginFrame, get frame() { return frame; },
-    buffers: { probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf },
+    buffers: {
+      probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf,
+      shadeIn, shadeOut,
+    },
+    SHADE_SLOTS,
     textures: { irradiance, glossy, lit },
     passes: {
       hzbBuild: hzbBuildPass,
@@ -1154,9 +1453,11 @@ export function createGiGather({
       probeTrace: probeTracePass,
       probeFilter: probeFilterPass,
       resolve: resolvePass,
+      resolveOct: resolveOctPass,
       composite: compositePass,
       inject: injectPass,
       crop: cropPass,
+      shadeProbe: shadeProbePass,
       clearProbes: clearProbesPass,
       clearMeta: clearMetaPass,
       clearStats: clearStatsPass,
