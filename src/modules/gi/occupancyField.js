@@ -71,7 +71,7 @@ import {
   packSnorm2x16, select, shiftLeft, shiftRight, uint, uintBitsToFloat, uniform, uniformArray,
   unpackSnorm2x16, vec2, vec3, vec4,
 } from "three/tsl";
-import { cpuMirrorBytes, releaseComputeNodes } from "./releaseCompute.js";
+import { cpuMirrorBytes, releaseComputeNodes, releaseStorageAttributes } from "./releaseCompute.js";
 import { sharedFn } from "./giFn.js";
 import { createRayHitDebugBuffer } from "./rayHit/RayHitDebug.js";
 import { octDecodeTSL, octEncodeTSL } from "./rayHit/rayHitTSL.js";
@@ -884,6 +884,11 @@ export function createOccupancyField(bounds, res0, options = {}) {
   // `3` is the same integer on every scene.
   const PAIR_WORDS = 3;
   let pairWork = instancedArray(new Uint32Array(PAIR_WORDS), "uint");
+  // §19 Stage 0.2b — storage attributes the geometry re-mint below REPLACED.
+  // They may still be bound by a submit in flight (the "Destroyed buffer used
+  // in a submit" class), so the destroy belongs to the host's 3-frame retire
+  // queue, not to this file: `takeRetiredStorageAttributes` hands them over.
+  let retiredAttrs = [];
   let pairCount = 0;
   let geometryRevision = 0;
   // ── Incremental bookkeeping (see setGeometry). The buffers above are
@@ -4327,6 +4332,13 @@ export function createOccupancyField(bounds, res0, options = {}) {
       pairCount += count;
     }
 
+    // §19 Stage 0.2b: the three attributes about to be replaced own real GPU
+    // buffers (on Bistro the geometry pair is 100+ MB) and nothing destroyed
+    // them before this — three's `_destroyBindings` has no storage branch, so
+    // evicting `pairComputes` below frees the bind group and leaves the bytes.
+    for (const node of [vertexBuffer, indexBuffer, pairWork]) {
+      if (node?.value) retiredAttrs.push(node.value);
+    }
     vertexBuffer = instancedArray(vdataArr, "vec4");
     indexBuffer = instancedArray(idataArr, "uint");
     pairWork = instancedArray(pairWorkArr, "uint");
@@ -4939,6 +4951,38 @@ export function createOccupancyField(bounds, res0, options = {}) {
       .filter(Boolean)
       .map((n) => n.value)
       .filter(Boolean),
+    /**
+     * §19 Stage 0.2b — ALL TEN LIVE SITES, a strict SUPERSET of `cpuMirrors`.
+     *
+     * `cpuMirrors` answers "which JS twins may be detached"; this answers
+     * "which GPU BUFFERS die with this field", and the KEEP set is in it
+     * precisely because those buffers die too — they are simply written
+     * CPU-side while the field lives, so their twin has to stay.
+     *
+     * A GETTER, not a captured array: `vertexBuffer`, `indexBuffer` and
+     * `pairWork` are re-minted by `setGeometry`'s full-rebuild path, and a list
+     * frozen at build time would hand the sweep the OLD generation's
+     * attributes — the exact "destroyed a live buffer" mistake this unit is
+     * disciplined against.
+     */
+    get storageAttributes() {
+      return [
+        bits, atomicBits, staticBits, attrScratch, surfScratch, surfAlloc,
+        vertexBuffer, indexBuffer, pairWork, localToWorld,
+      ].filter(Boolean).map((n) => n.value).filter(Boolean);
+    },
+    /**
+     * §19 Stage 0.2b — storage attributes this field has REPLACED (the
+     * geometry re-mint), handed to the host's 3-frame retire queue and
+     * forgotten here. Empties itself, so a caller that polls it every tick
+     * never re-retires the same attribute.
+     */
+    takeRetiredStorageAttributes() {
+      if (retiredAttrs.length === 0) return null;
+      const out = retiredAttrs;
+      retiredAttrs = [];
+      return out;
+    },
     /** The renderer the two eviction sweeps need (re-mint + dispose). */
     setRenderer(r) { hostRenderer = r ?? null; },
     dynamicObjectWordOffset,
@@ -5081,8 +5125,30 @@ export function createOccupancyField(bounds, res0, options = {}) {
      *
      * Releases only nodes this field minted; idempotent (the arrays are nulled
      * so a second call sweeps nothing).
+     *
+     * ⛔ §19 STAGE 0.2b — AND EVICTING THE NODES STILL FREED NO MEMORY.
+     * `Bindings._destroyBindings` (three, Bindings.js:245) destroys uniform
+     * buffers and samplers and has NO storage-buffer branch, so the eviction
+     * above returns the bind group and the pipeline — bytes of nothing next to
+     * `bits`. `releaseStorageAttributes` is the only path to
+     * `GPUBuffer.destroy()`; see its header for the chain.
+     *
+     * @param {?(attrs: any[]) => void} retireAttributes when the caller owns a
+     *   deferred queue (GISystem's `#retireTargets`, 3 frames), the attributes
+     *   go there instead of being destroyed on the spot — a material or a
+     *   compute pass whose bind group re-points while the NEXT frame is being
+     *   encoded would otherwise fail validation with "Destroyed buffer used in
+     *   a submit". Only a caller that knows nothing is in flight may omit it.
      */
-    dispose() {
+    dispose(retireAttributes = null) {
+      // BEFORE the eviction: `storageAttributes` is a getter over live
+      // bindings, and nothing below changes it, but the ordering keeps the
+      // "harvest, then evict" rule this whole unit runs on visible.
+      const attrs = [
+        ...this.storageAttributes,
+        ...(retiredAttrs.length ? retiredAttrs : []),
+      ];
+      retiredAttrs = [];
       const nodes = [
         ...(computes?.full ?? []), ...(computes?.fast ?? []),
         ...mintedComputes, ...pairComputes,
@@ -5092,13 +5158,41 @@ export function createOccupancyField(bounds, res0, options = {}) {
         surfFinalizeCompute, dynSurfClearCompute, dynSurfAllocCompute,
         dynSurfFinalizeCompute, palettePass,
       ].filter(Boolean);
-      const released = releaseComputeNodes(hostRenderer, new Set(nodes));
+      // The harvest catches anything the list above does not name — a build
+      // variant's private scratch, say. Union, never a replacement: a node the
+      // renderer never saw contributes nothing to it.
+      const harvest = new Set(attrs);
+      const released = releaseComputeNodes(hostRenderer, new Set(nodes), harvest);
       computes = null;
       computesRevision = -1;
       mintedComputes = [];
       pairComputes = [];
+      let destroyed = 0;
+      if (retireAttributes) retireAttributes([...harvest]);
+      else destroyed = releaseStorageAttributes(hostRenderer, harvest);
+      // ── §I.2b: THE CLOSURE, NOT THE BUFFER ──────────────────────────────
+      //
+      // `releaseStorageAttributes` clears `attr.array`, and on Bistro that
+      // still freed nothing here: `rebuildGeometryBuffers` keeps `vdataArr` /
+      // `idataArr` / `pairWorkArr` in THIS factory's scope for the incremental
+      // spawn path, so the arrays survive their attributes. The typed-array
+      // census (run-gi-heap-retainer.mjs, ALLOC_CENSUS=1) measured 417 MB per
+      // generation live at `rebuildGeometryBuffers`, 15 of 18 allocations still
+      // reachable after three rebuilds and three gc()s — the largest single
+      // entry in the §I.2b "unaccounted" column.
+      //
+      // Safe only because dispose is TERMINAL: `setGeometry`'s incremental lane
+      // is the only reader and a disposed field never runs it again.
+      vdataArr = null;
+      idataArr = null;
+      pairWorkArr = null;
+      geoRanges = new Map();
+      slotPairInfo = new Map();
       if (globalThis.__giLogComputeRelease === true) {
-        console.log(`[gi] occupancy field dispose: released ${released}/${nodes.length} compute nodes`);
+        console.log(
+          `[gi] occupancy field dispose: released ${released}/${nodes.length} compute nodes, ` +
+          `${retireAttributes ? `retired ${harvest.size}` : `destroyed ${destroyed}/${harvest.size}`} storage buffers`,
+        );
       }
       return released;
     },

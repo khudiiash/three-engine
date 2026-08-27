@@ -636,6 +636,26 @@ defineOp({
       // which is why "mobile looks flat" and "mobile is black" are now
       // different reports with different receipts. See GISystem.transportState.
       giTransport: engine.modules?.get?.("gi")?.system?.transportState ?? null,
+      // ⭐ §19 STAGE 0.2b — THE QUANTITY THAT MUST BE FLAT ACROSS A REBUILD.
+      // Three's own counters (`Info.memory`), not a GI estimate: `count` is
+      // every storage attribute the renderer currently holds a GPU buffer for
+      // and `mb` is their bytes. Before 0.2b GI destroyed exactly ZERO of them
+      // — audit §I measured +1,853 MB of live storage per ultra↔high rebuild
+      // on Bistro, with `memoryMap` (`mapEntries`, a plain Map that pins every
+      // attribute it ever saw) climbing +733/+790/+934 entries alongside. A
+      // climbing `count` here IS the session-killer, whatever the heap says.
+      giStorage: (() => {
+        const info = engine?.renderer?.info;
+        const mem = info?.memory;
+        if (!mem) return null;
+        return {
+          count: mem.storageAttributes ?? null,
+          mb: mem.storageAttributesSize != null
+            ? +(mem.storageAttributesSize / 1e6).toFixed(1) : null,
+          mapEntries: info.memoryMap?.size ?? null,
+          freedByGi: engine.modules?.get?.("gi")?.system?._giFreedBuffers ?? 0,
+        };
+      })(),
       // §19 0.3b — the reflection-probe RECAPTURE channel. The atlas used to be
       // a one-shot whose content was decided by when a 159 kB kernel finished
       // compiling (reflectionProbeCapture.js's header has the 34% receipt), so

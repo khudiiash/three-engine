@@ -46,9 +46,15 @@
  *
  * @param {any} renderer
  * @param {Iterable<any>} nodes
+ * @param {?Set<any>} harvest when given, receives every STORAGE ATTRIBUTE the
+ *   evicted nodes bound — read out of the builder state BEFORE it is dropped,
+ *   because after the eviction nothing can enumerate it again. The caller owns
+ *   the destroy (`releaseStorageAttributes`) and owns the set DIFFERENCE
+ *   against the survivors: an attribute a surviving node still binds must
+ *   never be destroyed.
  * @returns {number} how many nodes were evicted
  */
-export function releaseComputeNodes(renderer, nodes) {
+export function releaseComputeNodes(renderer, nodes, harvest = null) {
   if (!renderer || !nodes) return 0;
   const bindings = renderer._bindings;
   const pipelines = renderer._pipelines;
@@ -63,6 +69,29 @@ export function releaseComputeNodes(renderer, nodes) {
   for (const node of nodes) {
     if (!node || typeof node !== "object") continue;
     try {
+      // ── §19 STAGE 0.2b: HARVEST BEFORE EVICTING ────────────────────────
+      // `Bindings._destroyBindings` (three renderers/common/Bindings.js:245)
+      // has branches for UNIFORM buffers and samplers and NONE for storage
+      // buffers, so everything below frees the bind group and the pipeline and
+      // leaves the GPU buffer — 1,853 MB per rebuild on Bistro, measured. The
+      // only path to `GPUBuffer.destroy()` is `renderer._attributes.delete`,
+      // and this builder state is the ONLY enumeration of what this node bound
+      // that cannot go stale. Read it here or lose it.
+      forEachStorageBinding(renderer, node, (binding) => {
+        const attribute = binding.attribute;   // live getter on NodeStorageBuffer
+        if (harvest && attribute) harvest.add(attribute);
+        // §I.2 — `StorageBuffer` (StorageBuffer.js:19) passes `attribute.array`
+        // to `Buffer` (Buffer.js:44), which stores it as `_buffer`, at FIRST
+        // BIND. `NodeStorageBuffer` overrides both the `buffer` and `attribute`
+        // getters, so nothing ever reads these two fields back — but they hold
+        // the full CPU twin, and `detachCpuMirror`'s zero-length swap cannot
+        // reach them. Null on the way out; `Buffer.release()` is three's own
+        // name for exactly this move.
+        if (binding.nodeUniform !== undefined) {
+          binding._buffer = null;
+          binding._attribute = null;
+        }
+      });
       // Bindings first: it reads `nodes.getForCompute(node)` to find the bind
       // groups when its own cache entry is already gone, so evicting the
       // pipeline first would leave the bind groups — and the buffers — alive.
@@ -81,6 +110,232 @@ export function releaseComputeNodes(renderer, nodes) {
     }
   }
   return released;
+}
+
+/**
+ * Walks the STORAGE BUFFER bindings of one or more compute nodes, out of
+ * three's node-builder state.
+ *
+ * `renderer._nodes` is a `NodeManager extends DataMap`; `get(node)
+ * .nodeBuilderState.bindings` is an array of `BindGroup`, each with its own
+ * `.bindings` array of `Binding` objects — the same array
+ * `Bindings._createBindings` (Bindings.js:200-224) walks to decide what to
+ * create, and the `isStorageBuffer` branch there is what put every one of
+ * these attributes into `renderer._attributes` and `info.memoryMap` in the
+ * first place.
+ *
+ * ⚠ TWO RULES, BOTH LOAD-BEARING:
+ *   · `has` BEFORE `get`. `DataMap.get` (DataMap.js:29-41) CREATES the record
+ *     when it is missing, so probing a node that was never dispatched would
+ *     seed a permanent empty entry.
+ *   · NEVER `nodes.getForCompute(node)` (NodeManager.js:451-471). It REBUILDS
+ *     the state it cannot find — on this project's SRC kernels a 16-27 s
+ *     recompile, of exactly the generation we are throwing away.
+ *
+ * @param {any} renderer
+ * @param {any} nodes a compute node, or an iterable of them
+ * @param {(binding: any) => void} fn
+ */
+function forEachStorageBinding(renderer, nodes, fn) {
+  const nodeCache = renderer?._nodes;
+  if (!nodeCache || typeof nodeCache.has !== "function" || !nodes) return;
+  const list = nodes[Symbol.iterator] && typeof nodes !== "function" ? nodes : [nodes];
+  for (const node of list) {
+    if (!node || typeof node !== "object") continue;
+    let groups = null;
+    try {
+      if (nodeCache.has(node) !== true) continue;
+      groups = nodeCache.get(node)?.nodeBuilderState?.bindings ?? null;
+    } catch { continue; }
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      const bindings = group?.bindings;
+      if (!Array.isArray(bindings)) continue;
+      for (const binding of bindings) {
+        if (binding?.isStorageBuffer !== true) continue;
+        try { fn(binding); } catch { /* one bad binding must not stop the sweep */ }
+      }
+    }
+  }
+}
+
+/**
+ * Every storage attribute the given (SURVIVING) compute nodes bind — the KEEP
+ * set for a swap-site diff. Read-only: evicts nothing, nulls nothing.
+ *
+ * @param {any} renderer
+ * @param {Iterable<any>} nodes
+ * @param {Set<any>} [into]
+ * @returns {Set<any>}
+ */
+export function harvestStorageAttributes(renderer, nodes, into = new Set()) {
+  forEachStorageBinding(renderer, nodes, (binding) => {
+    const attribute = binding.attribute;
+    if (attribute) into.add(attribute);
+  });
+  return into;
+}
+
+/**
+ * ⭐⭐ §19 STAGE 0.2b — THE ONLY PATH TO `GPUBuffer.destroy()` FOR A GI BUFFER.
+ *
+ * ## The chain, verified in three's own source
+ *
+ *   `renderer._attributes.delete(attr)`
+ *     → `Attributes.delete` (renderers/common/Attributes.js:46-58): calls
+ *       `super.delete` first (`DataMap.delete`, DataMap.js:49-64 — returns
+ *       `null` when the map never held the object) and does the rest ONLY on a
+ *       non-null result;
+ *     → `backend.destroyAttribute(attr)` (WebGPUBackend.js:2595)
+ *     → `WebGPUAttributeUtils.destroyAttribute` (:361-370):
+ *       `backend.get(attr).buffer.destroy()` then `backend.delete(attr)`;
+ *     → `info.destroyAttribute(attr)` (Info.js:324-338): `memoryMap.delete` and
+ *       the `storageAttributes` / `storageAttributesSize` counters come back
+ *       down.
+ *
+ * That last one is why nothing short of this frees anything.
+ * `Info.memoryMap` (Info.js:145) is a plain **`Map`**, `_createAttribute`
+ * (:264-273) `set`s every storage attribute into it at first bind, and its only
+ * `delete` is the line above — so until this runs, the attribute is strongly
+ * reachable from the renderer, the backend's `WeakMap` entry keyed by it can
+ * never die, and the GPU buffer is not even GC-reclaimable. Measured on Bistro:
+ * `memoryMap` +733/+790/+934 entries per rebuild, live GPU buffers +730/+763/
+ * +927, `gone 0` for every single storage bucket.
+ *
+ * ## Why the two `has` guards are not defensive noise
+ *
+ * `WebGPUAttributeUtils.destroyAttribute` does `data.buffer.destroy()` with no
+ * null check. `DataMap.get` CREATES a record, so a single earlier `get` on an
+ * attribute that never bound leaves a seeded-but-empty `{}` — enough to make
+ * `Attributes.delete` walk straight into `undefined.destroy()`. Probing BOTH
+ * maps with `has` is what makes this safe on an attribute that never bound, and
+ * idempotent on one already destroyed (the second call sees no entry).
+ *
+ * @param {any} renderer
+ * @param {Iterable<any>} attrs storage ATTRIBUTES (`node.value`), not nodes
+ * @returns {number} how many GPU buffers were destroyed
+ */
+export function releaseStorageAttributes(renderer, attrs) {
+  const attributes = renderer?._attributes;
+  const backend = renderer?.backend;
+  if (!attributes || !attrs) return 0;
+  let released = 0;
+  for (const attr of attrs) {
+    if (!attr) continue;
+    try {
+      if (attributes.has?.(attr) === true && backend?.has?.(attr) === true) {
+        attributes.delete(attr);
+        released++;
+      } else {
+        // Never bound (or already destroyed): there is no GPU buffer and no
+        // backend record, but `info.memoryMap` may still be pinning it — drop
+        // that and nothing else.
+        renderer.info?.memoryMap?.delete?.(attr);
+      }
+      // ⚠ THE CPU TWIN DIES EITHER WAY, and that is deliberately OUTSIDE the
+      // branch above: an attribute the backend never bound still carries its
+      // full JS array, and "never reached the GPU" is not a reason to keep it.
+      // `detachCpuMirror` may already have done this for a GPU-only buffer;
+      // for the KEEP set (the CPU-written buffers — `vertexBuffer`, `pairWork`,
+      // `localToWorld`, the region-uploader staging) this is the ONLY place it
+      // ever happens, and by here the attribute is unbindable anyway.
+      if (attr.array && attr.array.length > 0) {
+        attr.__giBytes = attr.array.byteLength;
+        attr.array = new attr.array.constructor(0);
+      }
+    } catch {
+      // A three rename must degrade to "leaks as before", never to a crash
+      // mid-rebuild.
+    }
+  }
+  return released;
+}
+
+/**
+ * §19 Stage 0.2b — §I.2, the half `detachCpuMirror` cannot reach on its own.
+ *
+ * `attr.array = new ctor(0)` frees nothing while the generation is LIVE,
+ * because `Buffer._buffer` captured the original array at first bind, strictly
+ * before the detach can run. That field lives on a `Binding` inside a
+ * `BindGroup` inside a `NodeBuilderState` — reachable from the owning compute
+ * NODE and from nowhere else (three's `_bindings` is a `WeakMap` keyed by bind
+ * group, which cannot be enumerated). So the detach has to be walked back from
+ * the nodes.
+ *
+ * Only ever nulls `_buffer` for an attribute the caller has ALREADY detached,
+ * and only on a `NodeStorageBuffer` (`nodeUniform !== undefined`), whose
+ * `buffer` and `attribute` getters both bypass these fields.
+ *
+ * @param {any} renderer
+ * @param {Iterable<any>} nodes
+ * @param {Iterable<any>|Set<any>} attrs the detached attributes
+ * @returns {number} how many captures were dropped
+ */
+export function nullStorageBindingArrays(renderer, nodes, attrs) {
+  if (!attrs) return 0;
+  const want = attrs instanceof Set ? attrs : new Set(attrs);
+  if (want.size === 0) return 0;
+  let dropped = 0;
+  forEachStorageBinding(renderer, nodes, (binding) => {
+    if (binding.nodeUniform === undefined || binding._buffer === null) return;
+    if (!want.has(binding.attribute)) return;
+    binding._buffer = null;
+    dropped++;
+  });
+  return dropped;
+}
+
+/**
+ * Every storage ATTRIBUTE a GI `state` owns, from the owners' published lists.
+ *
+ * The sibling of `collectStateComputeNodes`, and it exists for the one class
+ * the node harvest cannot cover: an attribute bound by something OUTSIDE the
+ * compute nodes (a material's render pipeline), or by a node whose builder
+ * state was already dropped. On a swap site this is also half of the KEEP set,
+ * so under-collecting here destroys a live buffer — which is why every owner
+ * publishes a SUPERSET of its `cpuMirrors` (the CPU-written buffers die at
+ * teardown too, they just may not be detached).
+ *
+ * `storageAttributes` and `cpuMirrors` are GETTERS on the resizable owners, so
+ * they are read, never walked into.
+ *
+ * @param {any} state
+ * @returns {any[]}
+ */
+export function collectStateStorageAttributes(state) {
+  const found = new Set();
+  if (!state) return [];
+  const seen = new Set();
+  const take = (list) => {
+    if (!Array.isArray(list)) return;
+    for (const attr of list) if (attr?.isBufferAttribute === true) found.add(attr);
+  };
+  const visit = (value, depth) => {
+    if (!value || depth > 6 || typeof value !== "object") return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const entry of value) visit(entry, depth + 1);
+      return;
+    }
+    // Same bail-outs as `collectStateComputeNodes` (an Object3D would climb
+    // `parent` into the whole scene graph), plus `isNode`: `state` is threaded
+    // with TSL graphs that are large, cyclic and never own a published list.
+    if (
+      value.isObject3D === true || value.isTexture === true ||
+      value.isMaterial === true || value.isRenderTarget === true ||
+      value.isBufferGeometry === true || value.isRenderer === true ||
+      value.isNode === true
+    ) return;
+    try { take(value.storageAttributes); } catch { /* a getter may not be ready */ }
+    try { take(value.cpuMirrors); } catch { /* ditto */ }
+    for (const key of Object.keys(value)) {
+      if (key === "storageAttributes" || key === "cpuMirrors") continue;
+      visit(value[key], depth + 1);
+    }
+  };
+  visit(state, 0);
+  return [...found];
 }
 
 /**
@@ -249,6 +504,35 @@ export function detachCpuMirror(renderer, attr) {
   } catch {
     return false;
   }
+  // ── §19 STAGE 0.2b / §I.2: THE SWAP ABOVE FREES NOTHING ON ITS OWN ──────
+  //
+  // `NodeStorageBuffer`'s constructor chain
+  // (NodeStorageBuffer.js:23 → StorageBuffer.js:19 → Buffer.js:44) stored
+  // `attribute.array` as `Buffer._buffer` at FIRST BIND — strictly before this
+  // function can run, because the GPU buffer has to exist for the guard above
+  // to pass. So the 709-759 MB `[gi] detached N CPU mirrors` reports is a
+  // bookkeeping line about the LIVE generation, not a free: the arrays stay
+  // pinned until `_destroyBindings` drops the bind group, i.e. until the
+  // teardown that would have dropped them anyway.
+  //
+  // `nullStorageBindingArrays` reaches the compute-side captures. This reaches
+  // ALL of them, including a material's bind group, which is enumerable from
+  // nowhere: detaching the ArrayBuffer frees the pages no matter who still
+  // holds a view. Nothing reads it back — `NodeStorageBuffer` overrides the
+  // `buffer` and `attribute` getters, `WebGPUBindingUtils.createBindings`
+  // (:320-324) resolves a storage binding through `backend.get(attr).buffer`
+  // (the GPU buffer), and the storage path never touches `Buffer.byteLength`.
+  // `__giDetachTransfer = false` is the hatch.
+  try {
+    const buffer = array.buffer;
+    if (
+      globalThis.__giDetachTransfer !== false &&
+      array.byteOffset === 0 && buffer && array.byteLength === buffer.byteLength &&
+      typeof buffer.transfer === "function" && buffer.detached !== true
+    ) {
+      buffer.transfer(0);
+    }
+  } catch { /* older engine, or a shared buffer: the zero-length swap stands */ }
   return true;
 }
 

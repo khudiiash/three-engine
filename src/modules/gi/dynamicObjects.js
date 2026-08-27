@@ -118,7 +118,7 @@ import {
   Fn, If, Loop, float, floatBitsToUint, instanceIndex, instancedArray, int,
   select, uint, uintBitsToFloat, uniform, uniformArray, vec2, vec3, vec4, wgslFn,
 } from "three/tsl";
-import { releaseComputeNodes } from "./releaseCompute.js";
+import { releaseComputeNodes, releaseStorageAttributes } from "./releaseCompute.js";
 import { sharedFn } from "./giFn.js";
 import { resolveMaterialSurface } from "./voxelizeOnce.js";
 import { octDecodeTSL, octEncodeTSL } from "./rayHit/rayHitTSL.js";
@@ -1433,6 +1433,19 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
   // there would tear down a dispatch that can still be in flight. Everything
   // in this queue is at least one confirm — i.e. one frame — old.
   const staleUploads = [];
+  // ── §19 STAGE 0.2b: THE EVICTION ABOVE STILL LEFT THE BYTES ─────────────
+  //
+  // `Bindings._destroyBindings` (three, Bindings.js:245) has branches for
+  // UNIFORM buffers and samplers and none for storage buffers, so evicting the
+  // uploader node returns the bind group and the pipeline and leaves the
+  // staging GPU buffer — the 125-160 MB the note above measured, per rebuild,
+  // for the session. `p.staging.value` is named EXPLICITLY rather than
+  // harvested off the node, and that is the whole safety argument here: an
+  // uploader binds TWO storage buffers, its own staging AND the field's
+  // shared `bits`, and a blind harvest would destroy the field.
+  //
+  // Same one-confirm delay as `staleUploads`, which they ride beside.
+  const staleStaging = [];
   // Persistent re-uploadable regions (createRegionUploader) — one pipeline
   // each, offered to the dispatcher only on the frames their bytes changed.
   const regionUploaders = [];
@@ -1772,6 +1785,22 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     /** Diagnostics. */
     stats: { adopted: 0, meshUploadsQueued: 0, poolWordsUsed: 0, overflowRejected: 0 },
 
+    /**
+     * §19 Stage 0.2b — the storage buffers this SET owns and that die with it.
+     *
+     * ⚠ `bits` IS NOT HERE, and that is the point: this set writes into the
+     * occupancy field's buffer, it does not own it. Publishing it would let a
+     * teardown of the set destroy the field's 449 MB out from under a live
+     * build. Only the persistent region-uploader staging buffers are ours (the
+     * one-shot ones are retired by `confirmDispatch`, see `staleStaging`).
+     */
+    get storageAttributes() {
+      const out = [];
+      for (const r of regionUploaders) if (r.staging?.value) out.push(r.staging.value);
+      for (const p of pendingComputes) if (p.staging?.value) out.push(p.staging.value);
+      return out.concat(staleStaging);
+    },
+
     has(key) { return entries.has(key); },
     count() { return entries.size; },
     /** Iterates live entries — the caller must not mutate during iteration
@@ -1882,7 +1911,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
           return true;
         },
       };
-      regionUploaders.push({ handle, compute });
+      regionUploaders.push({ handle, compute, staging });
       return handle;
     },
 
@@ -2232,6 +2261,10 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         if (renderer) releaseComputeNodes(renderer, staleUploads);
         staleUploads.length = 0;
       }
+      if (staleStaging.length) {
+        if (renderer) releaseStorageAttributes(renderer, staleStaging);
+        staleStaging.length = 0;
+      }
       if (headerCompute && headerDirty && !skipped.has(headerCompute)) headerDirty = false;
       for (const r of regionUploaders) {
         if (r.handle.dirty && !skipped.has(r.compute)) r.handle.dirty = false;
@@ -2244,6 +2277,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
           // are dead weight from here. Evicted on the NEXT confirm — see
           // `staleUploads`.
           staleUploads.push(p.compute);
+          if (p.staging?.value) staleStaging.push(p.staging.value);
           p.staging = null;
           pendingComputes.splice(i, 1);
         }

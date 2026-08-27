@@ -270,6 +270,10 @@ export function createSrcMergeFrame(store, bins, {
   // buffer made the headline unattributable.
   const statWords = MERGE_STRIDE * N;
   const stats = instancedArray(new Uint32Array(statWords), "uint").toAtomic();
+  // §19 Stage 0.2b — storage buffers minted inside the pass blocks below (the
+  // top cascade's sky-direction LUT), collected so `storageAttributes` can
+  // name every buffer this bundle owns and not only the ones in scope here.
+  const extraAttrs = [];
   /** Offset of cascade `c`'s word `w`. JS-side constant — folded at build. */
   const sw = (c, w) => uint(c * MERGE_STRIDE + w);
 
@@ -446,6 +450,7 @@ export function createSrcMergeFrame(store, bins, {
     // directional sky is armed, so an unarmed build binds nothing new.
     const wTop = Math.round(Math.sqrt(info.bins / 2));
     const skyDirTable = skyEnv ? instancedArray(binDirTable(wTop), "vec4") : null;
+    if (skyDirTable?.value) extraAttrs.push(skyDirTable.value);
     passes.push(Fn(() => {
       const i = instanceIndex.toVar();
       const o = uint(info.binBase).add(i).mul(uint(PAYLOAD_WORDS)).toVar();
@@ -631,6 +636,17 @@ export function createSrcMergeFrame(store, bins, {
      * which sizes itself from `bufferGPU.size`).
      */
     cpuMirrors: [cornerBlock, cornerWeight, stats].map((n) => n?.value).filter(Boolean),
+    /**
+     * §19 Stage 0.2b — the GPU buffers that die with this bundle. Published so
+     * a swap site can tell "this generation's" from "the survivor's" (the KEEP
+     * half of `#sweepOrphanedComputes`' diff) and so a teardown destroys them:
+     * three's `Bindings._destroyBindings` has no storage branch, so evicting
+     * the compute nodes returns the bind groups and leaves every byte.
+     */
+    get storageAttributes() {
+      return [cornerBlock, cornerWeight, stats]
+        .map((n) => n?.value).filter(Boolean).concat(extraAttrs);
+    },
     bytes: (cornerSize * 2 + statWords) * 4,
     w0,
     cascadeCount: N,

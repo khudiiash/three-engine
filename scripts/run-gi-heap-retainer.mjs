@@ -33,6 +33,7 @@
 //   REBUILDS=5       Phase A iterations
 //   CYCLES=2         Phase C iterations (0 skips)
 //   IDLE=60          Phase B seconds
+//   ALLOC_CENSUS=1  §I.2b: live typed-array bytes by allocation site (WeakRef)
 //   HEADED=1
 import puppeteer from "puppeteer-core";
 import { installTauriShim } from "./lib/tauriShim.mjs";
@@ -44,6 +45,9 @@ const ALT_SCENE = `${PROJECT}/scenes/Level.scene`;
 const REBUILDS = Number(process.env.REBUILDS ?? 5);
 const CYCLES = Number(process.env.CYCLES ?? 2);
 const IDLE = Number(process.env.IDLE ?? 60);
+// §I.2b instrument: WeakRef + allocation-stack census of every typed array
+// >= 2 MB. Opt-in — it proxies five global constructors.
+const ALLOC_CENSUS = process.env.ALLOC_CENSUS === "1";
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const browser = await puppeteer.launch({
@@ -77,7 +81,8 @@ page.on("pageerror", (e) => {
   if (!/save_scene/.test(msg)) console.log(`  pageerror: ${msg.slice(0, 300)}`);
 });
 
-await page.evaluateOnNewDocument((PROJECT) => {
+await page.evaluateOnNewDocument(({ PROJECT, ALLOC_CENSUS }) => {
+  globalThis.__ALLOC_CENSUS__ = ALLOC_CENSUS;
   globalThis.__editorKeepRendering = true;
   globalThis.__giLogComputeRelease = true;
   localStorage.setItem("engine.projectRoot.v1", PROJECT);
@@ -110,7 +115,76 @@ await page.evaluateOnNewDocument((PROJECT) => {
     });
   }
   if (globalThis.GPUTexture) patch(GPUTexture.prototype, "destroy", () => c.textureDestroyed++);
-}, PROJECT);
+
+  // ── §19 STAGE 0.2b / AUDIT §I.2b — TYPED-ARRAY ALLOCATION CENSUS ────────
+  //
+  // OPT-IN (`ALLOC_CENSUS=1`), because it proxies four global constructors.
+  //
+  // WHAT IT IS FOR. After 0.2b destroys the storage buffers, the GPU half of
+  // the climb is gone and the JS heap still moves. The arithmetic in §I.2b
+  // predicted this: a generation is 1,853 MB of which ~750 MB is detached CPU
+  // twins, leaving ~740 MB/rebuild that is neither a GPU buffer nor a renderer
+  // cache. The candidates are build-time CPU transients that never become a GPU
+  // buffer and may be closure-pinned — `buildStaticSceneBvhWords` (188 MB of
+  // words on Bistro, and built a SECOND time when the budget ladder drops UV),
+  // `voxelizeOnce`'s attribute copies, the occupancy build's pair and scratch
+  // arrays, `items` in `#syncBvhScene`.
+  //
+  // ⭐ READING CODE WILL NOT NAME THAT CLOSURE; a WeakRef will. Every typed
+  // array ≥ 2 MB is stamped with its allocation stack and held by a WeakRef,
+  // so after three `gc()`s "live bytes by allocation site" says which sites are
+  // still reachable and how much they hold. A transient shows up as ALLOCATED
+  // but not LIVE; a leak shows up as both, growing per rebuild.
+  //
+  // The proxy is `construct`-only: `array.constructor` resolves through the
+  // prototype to the ORIGINAL, so `new array.constructor(0)` — which is exactly
+  // what `detachCpuMirror` does — never re-enters this.
+  if (globalThis.__ALLOC_CENSUS__) {
+    const MIN_BYTES = 2 * 1024 * 1024;
+    const sites = new Map();   // stack -> { count, bytes, refs: [] }
+    globalThis.__ALLOC_SITES__ = sites;
+    for (const name of ["Uint32Array", "Float32Array", "Int32Array", "Uint16Array", "Uint8Array"]) {
+      const Original = globalThis[name];
+      if (typeof Original !== "function") continue;
+      // ⚠ AND THE PROTOTYPE'S `constructor` MUST FOLLOW THE PROXY, or this
+      // census silently breaks every render pipeline. three keys
+      // `typedArraysToVertexFormatPrefix` (WebGPUAttributeUtils.js:12-40) on the
+      // GLOBAL constructor — which is the proxy, since this runs before three
+      // loads — and looks it up with `attribute.array.constructor`
+      // (`_getVertexFormat`, :522), which `Reflect.construct` resolves through
+      // the prototype to the ORIGINAL. The map misses, `format` is undefined,
+      // and every `createRenderPipeline` throws
+      // "Cannot read properties of undefined (reading '0')". Measured: the
+      // first run of this census turned 234 pipelines into 6,453 and
+      // invalidated its own heap column.
+      const Wrapped = new Proxy(Original, {
+        construct(target, args, newTarget) {
+          const out = Reflect.construct(target, args, newTarget);
+          try {
+            if (out.byteLength >= MIN_BYTES) {
+              // Frames 0-2 are this proxy and the Error itself; the caller we
+              // want is the first frame outside them.
+              const stack = (new Error().stack ?? "").split("\n").slice(2, 6).join(" <- ")
+                .replace(/https?:\/\/[^/]+\//g, "").replace(/\?[^\s)]*/g, "");
+              let site = sites.get(stack);
+              if (!site) { site = { count: 0, bytes: 0, refs: [] }; sites.set(stack, site); }
+              site.count++;
+              site.bytes += out.byteLength;
+              site.refs.push(new WeakRef(out));
+            }
+          } catch { /* the census must never break an allocation */ }
+          return out;
+        },
+      });
+      globalThis[name] = Wrapped;
+      try {
+        Object.defineProperty(Original.prototype, "constructor", {
+          value: Wrapped, writable: true, configurable: true,
+        });
+      } catch { /* frozen prototype: the census degrades to broken pipelines */ }
+    }
+  }
+}, { PROJECT, ALLOC_CENSUS });
 
 await page.goto(url, { waitUntil: "load", timeout: 60000 });
 await page.waitForSelector(".hub-recent-open-btn", { timeout: 30000 });
@@ -170,12 +244,47 @@ const census = () => page.evaluate(async () => {
     rPipes: c.renderPipeline ?? 0,
     shaderModules: c.shaderModule ?? 0,
     texturesLive: (c.texture ?? 0) - (c.textureDestroyed ?? 0),
+    // §I.3 #6 — three's OWN counters for the quantity 0.2b exists to hold
+    // flat, and the plain Map that used to pin every attribute forever.
+    storageAttrs: renderer?.info?.memory?.storageAttributes ?? -1,
+    storageAttrMB: (renderer?.info?.memory?.storageAttributesSize ?? 0) / 1e6,
+    memoryMap: renderer?.info?.memoryMap?.size ?? -1,
+    // §I.2b — live typed-array bytes by allocation site, after the gc()s
+    // above. `allocMB` is everything ever allocated at >= 2 MB; `liveMB` is
+    // what is still reachable, which is the number that matters.
+    allocSites: (() => {
+      const sites = globalThis.__ALLOC_SITES__;
+      if (!sites) return null;
+      const out = [];
+      let liveTotal = 0, allocTotal = 0;
+      for (const [stack, site] of sites) {
+        let live = 0, kept = 0;
+        const alive = [];
+        for (const ref of site.refs) {
+          const arr = ref.deref();
+          if (arr === undefined) continue;
+          live += arr.byteLength; kept++; alive.push(ref);
+        }
+        site.refs = alive;                       // the census must not itself retain
+        liveTotal += live; allocTotal += site.bytes;
+        if (live > 0) out.push({ stack, liveMB: live / 1e6, liveCount: kept, madeMB: site.bytes / 1e6, made: site.count });
+      }
+      out.sort((a, b) => b.liveMB - a.liveMB);
+      return { liveMB: liveTotal / 1e6, allocMB: allocTotal / 1e6, top: out.slice(0, 12) };
+    })(),
   };
 });
 
 const rows = [];
 const record = async (label) => {
   const s = await census();
+  // §I.4's third gate line. Read through the editor op rather than the
+  // renderer, because "orphan" is a SCENE question (a texture no open scene
+  // references), which only the editor's asset graph can answer.
+  const tex = await call("profile.textures", {});
+  s.orphanMB = tex.ok
+    ? (tex.value?.notReferencedByOpenScene?.mb ?? tex.value?.notReferencedByOpenScene?.bytes / 1e6 ?? -1)
+    : -1;
   rows.push({ label, ...s });
   const prev = rows.length > 1 ? rows[rows.length - 2] : null;
   const d = (k) => prev ? (s[k] - prev[k] >= 0 ? "+" : "") + (k === "heapMB" || k === "bufferLiveMB" ? (s[k] - prev[k]).toFixed(0) : s[k] - prev[k]) : "";
@@ -185,8 +294,20 @@ const record = async (label) => {
     `  pipes ${String(s.pipeCaches).padStart(4)} (${d("pipeCaches")})` +
     `  progV/F/C ${s.progV}/${s.progF}/${s.progC} (${d("progV")}/${d("progF")}/${d("progC")})` +
     `  gpuBuf ${String(s.buffersLive).padStart(4)} (${d("buffersLive")}) ${s.bufferLiveMB.toFixed(0)}MB (${d("bufferLiveMB")})` +
-    `  sm ${s.shaderModules} (${d("shaderModules")})`,
+    `  sm ${s.shaderModules} (${d("shaderModules")})` +
+    `  stAttr ${s.storageAttrs} (${d("storageAttrs")}) ${s.storageAttrMB.toFixed(0)}MB` +
+    `  memMap ${s.memoryMap} (${d("memoryMap")})` +
+    `  texOrphan ${s.orphanMB < 0 ? "?" : s.orphanMB.toFixed(0) + "MB"}`,
   );
+  if (s.allocSites) {
+    console.log(
+      `           typed arrays >=2MB: live ${s.allocSites.liveMB.toFixed(0)}MB of ` +
+      `${s.allocSites.allocMB.toFixed(0)}MB ever allocated`,
+    );
+    for (const site of s.allocSites.top) {
+      console.log(`             ${site.liveMB.toFixed(0).padStart(5)}MB live x${site.liveCount} (made ${site.made}, ${site.madeMB.toFixed(0)}MB)  ${site.stack.slice(0, 190)}`);
+    }
+  }
 };
 
 // ---- Boot: open the target scene, settle, baseline ----

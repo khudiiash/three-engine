@@ -1297,6 +1297,33 @@ export function createSrcProbeSystem({
         ...(merge?.cpuMirrors ?? []),
       ];
     },
+    /**
+     * §19 Stage 0.2b — every SRC storage buffer that dies with this system, a
+     * strict SUPERSET of `cpuMirrors`: the three bundles below own buffers that
+     * are GPU-only but were never in the detach list (tile LUTs, the seed's and
+     * the gather's stat blocks), and a teardown has to destroy those too.
+     *
+     * Aggregated from the owners for the same reason `cpuMirrors` is: a list
+     * written here goes stale the moment a store gains a buffer, and this list
+     * is ALSO the KEEP half of a swap site's diff — under-collect it and the
+     * sweep destroys a buffer a surviving kernel still binds.
+     */
+    get storageAttributes() {
+      const seen = new Set();
+      for (const list of [
+        this.cpuMirrors,
+        store.storageAttributes, frame.storageAttributes,
+        rayStore.storageAttributes, binStore?.storageAttributes,
+        merge?.storageAttributes, tiles?.storageAttributes,
+        seed?.storageAttributes, gather?.storageAttributes,
+        glossy?.storageAttributes, secondary?.storageAttributes,
+        deposit?.storageAttributes, hashBlockFrame?.storageAttributes,
+      ]) {
+        if (!Array.isArray(list)) continue;
+        for (const attr of list) if (attr) seen.add(attr);
+      }
+      return [...seen];
+    },
     rayStore,
     rayFrame,
     binStore,

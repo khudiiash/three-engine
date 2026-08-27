@@ -560,6 +560,15 @@ export function createGiFarFieldAvgPass({ source, width, height, out }) {
     computeAccum,
     computeEma,
     dims,
+    /**
+     * §19 Stage 0.2b — the GPU buffers this pass owns. Published so a re-mint
+     * can destroy the generation it replaced: three's `_destroyBindings` has no
+     * storage branch, so evicting the compute node returns the bind group and
+     * leaves every byte.
+     */
+    get storageAttributes() {
+      return [accum, ema].map((n) => n?.value).filter(Boolean);
+    },
     /** §19 0.5b — see screenSizeUniforms. The EMA pass is one thread, always. */
     setSize(w, h) {
       dims.set(w, h);
@@ -2678,6 +2687,15 @@ export function createGiEmitterTileCutPass({
     compute, tilesX, tilesY, tileSize, tileCount, posBuf, idBuf, importance, baseWord,
     emitterCount, compCap, feather, dims,
     /**
+     * §19 Stage 0.2b — the GPU buffers this pass owns. Published so a re-mint
+     * can destroy the generation it replaced: three's `_destroyBindings` has no
+     * storage branch, so evicting the compute node returns the bind group and
+     * leaves every byte.
+     */
+    get storageAttributes() {
+      return [posBuf, idBuf].map((n) => n?.value).filter(Boolean);
+    },
+    /**
      * §19 0.5b — THE ONE PASS THAT CANNOT ALWAYS ABSORB A RESIZE, and it says
      * so rather than pretending. `posBuf`/`idBuf` are `instancedArray`s whose
      * LENGTH is `tileCount`, and the tile count is `ceil(w/tileSize) x
@@ -2941,6 +2959,15 @@ export function createGiLightShadowFilterPass({
     widthU,
     temporalCounter,
     dims,
+    /**
+     * §19 Stage 0.2b — the GPU buffers this pass owns. Published so a re-mint
+     * can destroy the generation it replaced: three's `_destroyBindings` has no
+     * storage branch, so evicting the compute node returns the bind group and
+     * leaves every byte.
+     */
+    get storageAttributes() {
+      return [temporalCounter].map((n) => n?.value).filter(Boolean);
+    },
     /** §19 0.5b — see screenSizeUniforms. */
     setSize(w, h, rw = w, rh = h) {
       dims.set(w, h, rw, rh);

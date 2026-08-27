@@ -606,6 +606,15 @@ export function createSrcTileAtlas(store, bins, {
     sampleTile,
     sampleTileRGBA,
     cosTable,
+    /**
+     * §19 Stage 0.2b — the GPU buffers that die with this bake. Lookup tables
+     * (`cosTable`, `skyDirTable`) are uploaded once and never rewritten, so
+     * they belong here exactly like `stats` does; nothing outside a rebuild
+     * ever binds them again.
+     */
+    get storageAttributes() {
+      return [cosTable, stats, skyDirTable].map((n) => n?.value).filter(Boolean);
+    },
     table,
     layout,
     tileSize,

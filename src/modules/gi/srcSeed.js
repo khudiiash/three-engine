@@ -409,6 +409,16 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
   return {
     passes,
     stats,
+    /**
+     * §19 Stage 0.2b — the GPU buffers that die with this bundle. Published so
+     * a swap site can tell "this generation's" from "the survivor's" (the KEEP
+     * half of `#sweepOrphanedComputes`' diff) and so a teardown destroys them:
+     * three's `Bindings._destroyBindings` has no storage branch, so evicting
+     * the compute nodes returns the bind groups and leaves every byte.
+     */
+    get storageAttributes() {
+      return [stats].map((n) => n?.value).filter(Boolean);
+    },
     bytes: SEED_WORDS * 4,
 
     /**

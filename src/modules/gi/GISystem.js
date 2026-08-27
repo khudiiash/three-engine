@@ -49,7 +49,7 @@ import { fitEmitterShape } from "./emitterShapes.js";
 import { fitSkinnedCapsules, rigRootOf, skinnedBoneMatrix, skinnedBoxShape, skinnedCapsuleMatrix, skinnedCapsuleShape } from "./skinnedProxy.js";
 
 import { DEBUG_LAYER, EDITOR_LAYER, GI_DYNAMIC_LAYER, GI_MIRROR_LAYER, GI_SHARP_LAYER, SHADOW_PROXY_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
-import { collectStateComputeNodes, cpuMirrorBytes, detachCpuMirror, purgeNodeBuilderCache, releaseComputeNodes } from "./releaseCompute.js";
+import { collectStateComputeNodes, collectStateStorageAttributes, cpuMirrorBytes, detachCpuMirror, harvestStorageAttributes, nullStorageBindingArrays, purgeNodeBuilderCache, releaseComputeNodes, releaseStorageAttributes } from "./releaseCompute.js";
 import { textureLoadsInFlight } from "../../engine/textureAsset.js";
 import { GICascadeLight, GI_REFLECT_TIER, MAX_EMITTERS, giReflectTierInfoOf, giReflectTierOf, giRoughnessBucketOf, giRoughnessFloorStats, giRoughnessSourceOf, registerGILight } from "./giLight.js";
 import { MAX_REFLECTION_PROBES, createReflectionProbeAtlas } from "./reflectionProbes.js";
@@ -1198,6 +1198,16 @@ export class GISystem {
     this._mirrorBucketMaterials = new Set();
     // Resolve targets replaced by a resize, awaiting a safe disposal frame.
     this._retiredTargets = [];
+    // ── §19 STAGE 0.2b ──────────────────────────────────────────────────
+    // Storage ATTRIBUTES a swap or a teardown orphaned, awaiting the same
+    // safe frame. Separate from `_retiredTargets` because the destroy is a
+    // different call — `renderer._attributes.delete`, the only path to
+    // `GPUBuffer.destroy()` for a storage buffer — and because an attribute
+    // has a `dispose()` that does NOTHING for GPU memory (it dispatches an
+    // event with no listener), which is exactly how the 0.3b swap path could
+    // look like it was freeing 4 per-pixel buffers a resize while freeing
+    // none. Same TTL, same drain site.
+    this._retiredAttributes = [];
     this._unsubs = [
       engine.onPreRender(() => this.#tick()),
       engine.on?.("hierarchy-changed", () => this.#queueRebakeCheck()) ?? (() => {}),
@@ -2056,6 +2066,14 @@ export class GISystem {
     // Runs before every early-out below: a retired target must be freed even
     // while a compile wave holds the rest of this tick.
     this.#drainRetiredTargets();
+    // §19 Stage 0.2b — the occupancy field's geometry re-mint replaces its
+    // vertex/index/pair buffers under live kernels; it hands the old ones over
+    // here rather than destroying them itself, because only this queue knows
+    // when a frame is safely past.
+    {
+      const stale = this.state?.volume?.occupancyField?.takeRetiredStorageAttributes?.();
+      if (stale) this.#retireStorageAttributes(stale);
+    }
 
     // BOOT AMBIENT (the `bootAmbient` prop, DEFAULT OFF — a module may not put
     // light in a scene the author cannot see or switch off). When on, a neutral
@@ -7381,7 +7399,7 @@ export class GISystem {
     // storage (`#dispose` swept exactly one site, teardown). Snapshot the
     // nodes reachable from `state` NOW; anything still reachable after the
     // rebuild is shared and must be left alone (see the sweep at the end).
-    const staleBefore = new Set(collectStateComputeNodes(state));
+    const staleBefore = this.#snapshotGeneration(state);
     // ── ⭐⭐ §19 0.3b — RESIZE, DO NOT RE-MINT ────────────────────────────
     //
     // Everything below used to be ~25 `create*` calls: the whole screen chain,
@@ -8396,15 +8414,63 @@ export class GISystem {
    * trade.
    */
   #retireTargets(targets) {
-    if (targets) this._retiredTargets.push({ targets, ttl: RETIRED_TARGET_FRAMES });
+    if (!targets) return;
+    // §19 0.3b's `swapStorageBuffer` hands this a raw BUFFER ATTRIBUTE, not a
+    // target. `BufferAttribute.dispose()` exists (it dispatches an event) but
+    // NOTHING listens for a standalone storage attribute, so the old path was
+    // a no-op on every per-pixel buffer a resize swapped. Route it to the
+    // destroy that actually exists.
+    if (targets.isBufferAttribute === true) {
+      this.#retireStorageAttributes([targets]);
+      return;
+    }
+    this._retiredTargets.push({ targets, ttl: RETIRED_TARGET_FRAMES });
+  }
+
+  /**
+   * §19 Stage 0.2b — queue storage attributes for destruction a few frames
+   * LATE, for exactly the reason `#retireTargets` gives above: a compute pass
+   * or a material re-points its bind group while the FOLLOWING frame is being
+   * encoded, and destroying the buffer before that submit lands fails
+   * validation with "Destroyed buffer used in a submit" — GI's storage
+   * equivalent of the texture case this queue was built for.
+   *
+   * ⚠ THE CALLER OWNS THE DIFF. Nothing here checks whether a surviving node
+   * still binds one of these; `#sweepOrphanedComputes` does that, and a caller
+   * that skips it destroys a live buffer.
+   */
+  #retireStorageAttributes(attrs) {
+    if (!attrs) return 0;
+    const list = [...attrs].filter(Boolean);
+    if (list.length === 0) return 0;
+    this._retiredAttributes.push({ attrs: list, ttl: RETIRED_TARGET_FRAMES });
+    return list.length;
   }
 
   #drainRetiredTargets() {
+    if (this._retiredAttributes.length > 0) {
+      const renderer = this.engine?.renderer;
+      const keep = [];
+      for (const entry of this._retiredAttributes) {
+        if (--entry.ttl > 0 || globalThis.__giKeepRetiredTargets) { keep.push(entry); continue; }
+        const freed = releaseStorageAttributes(renderer, entry.attrs);
+        this._giFreedBuffers = (this._giFreedBuffers ?? 0) + freed;
+      }
+      this._retiredAttributes = keep;
+    }
     if (this._retiredTargets.length === 0) return;
+    const renderer = this.engine?.renderer;
     const keep = [];
     for (const entry of this._retiredTargets) {
-      if (--entry.ttl > 0 || globalThis.__giKeepRetiredTargets) keep.push(entry);
-      else entry.targets.dispose();
+      if (--entry.ttl > 0 || globalThis.__giKeepRetiredTargets) { keep.push(entry); continue; }
+      // A retired bundle may OWN storage buffers as well as textures — the BVH
+      // scene is five of them and the largest single allocation a rebuild
+      // makes. `dispose()` only ever reached its atlas texture.
+      const owned = entry.targets?.storageAttributes;
+      if (Array.isArray(owned) && owned.length) {
+        this._giFreedBuffers = (this._giFreedBuffers ?? 0) + releaseStorageAttributes(renderer, owned);
+      }
+      entry.targets.dispose();
     }
     this._retiredTargets = keep;
   }
@@ -10865,7 +10931,7 @@ export class GISystem {
     const { width, height } = { width: screen.width, height: screen.height };
     // §19 Stage 0.2 — same eviction contract as the resize path; see the sweep
     // at the end of #syncScreenResolveSize for why this is a DIFF.
-    const staleBefore = new Set(collectStateComputeNodes(state));
+    const staleBefore = this.#snapshotGeneration(state);
     const before = screen.srcProbes;
     const next = before.setSize(width, height, this.#srcPoolsForBuild() ?? null);
     if (next === before) return false;          // setSize refused — nothing grew
@@ -11020,16 +11086,57 @@ export class GISystem {
    * @param {string} why for the `__giLogComputeRelease` receipt
    */
   #sweepOrphanedComputes(state, before, why) {
-    if (!before?.size) return 0;
+    if (!before?.nodes?.size) return 0;
+    const renderer = this.engine?.renderer;
     const after = new Set(collectStateComputeNodes(state));
     const orphans = [];
-    for (const node of before) if (!after.has(node)) orphans.push(node);
-    if (orphans.length === 0) return 0;
-    const released = releaseComputeNodes(this.engine?.renderer, orphans);
+    for (const node of before.nodes) if (!after.has(node)) orphans.push(node);
+
+    // ── §19 STAGE 0.2b: THE SAME DIFF, ONE LEVEL DOWN ─────────────────────
+    //
+    // Evicting the orphaned nodes frees their bind groups and pipelines and
+    // NOT ONE BYTE of the buffers those bind groups held: `_destroyBindings`
+    // (three, Bindings.js:245) has no `isStorageBuffer` branch. Measured on
+    // Bistro at 1,853 MB per rebuild, with every storage bucket reading
+    // `gone 0`.
+    //
+    // ⚠ AND AN ATTRIBUTE IS NOT AN ORPHAN JUST BECAUSE ITS NODE IS. Two passes
+    // routinely bind the same buffer, and 0.3b's in-place resize deliberately
+    // KEEPS nodes while swapping buffers under them. So the keep set is built
+    // from both halves of what survived — what the surviving nodes actually
+    // bind, and what the new generation's owners publish — and only the
+    // difference is retired. Same discipline as the node diff above, and the
+    // cost of getting it wrong is worse: not a recompile, a device error.
+    const keep = new Set(collectStateStorageAttributes(state));
+    harvestStorageAttributes(renderer, after, keep);
+    const harvest = new Set();
+    const released = orphans.length ? releaseComputeNodes(renderer, orphans, harvest) : 0;
+    for (const attr of before.attrs ?? []) harvest.add(attr);
+    const doomed = [];
+    for (const attr of harvest) if (!keep.has(attr)) doomed.push(attr);
+    const retired = this.#retireStorageAttributes(doomed);
     if (globalThis.__giLogComputeRelease === true) {
-      console.log(`[gi] ${why}: released ${released}/${orphans.length} orphaned compute nodes`);
+      console.log(
+        `[gi] ${why}: released ${released}/${orphans.length} orphaned compute nodes, ` +
+        `retired ${retired} storage buffers (${keep.size} kept)`,
+      );
     }
     return released;
+  }
+
+  /**
+   * §19 Stage 0.2b — what a generation-replacing site must remember about the
+   * generation it is ABOUT TO REPLACE, so the sweep afterwards can take the
+   * difference. Nodes AND storage attributes: an attribute can be published by
+   * an owner without any compute node in `state` binding it (a material's
+   * render pipeline, or a bundle whose passes live off `state`), and that half
+   * is invisible to a node-only snapshot.
+   */
+  #snapshotGeneration(state) {
+    return {
+      nodes: new Set(collectStateComputeNodes(state)),
+      attrs: new Set(collectStateStorageAttributes(state)),
+    };
   }
 
   #syncSrcPoolPressure(state) {
@@ -11630,6 +11737,7 @@ export class GISystem {
       node: mix(float(1), shadow, active),
     };
     this._lightShadowNodes.set(light, entry);
+    this.#retireShadowDepth(light);
     light.shadow.shadowNode = entry.node;
     // ⚠⚠ `autoUpdate`, NEVER `needsUpdate`, AND THE DISPOSE BELOW IS WHY.
     //
@@ -11671,6 +11779,50 @@ export class GISystem {
     return entry;
   }
 
+  /**
+   * §19 STAGE 0.2b (§I.4) — +67 MB OF SHADOW DEPTH PER GI REBUILD.
+   *
+   * Bucket census on Bistro across three rebuilds:
+   * `ShadowDepthTexture|4096x4096x1|depth24plus` made 3 → 6, **gone 0**, while
+   * `ShadowMap|4096x4096x1|rgba8unorm` stayed at 1 — the whole +68 MB/rebuild
+   * texture column, and the depth ATTACHMENT alone.
+   *
+   * `ShadowNode.setupRenderTarget` (three, ShadowNode.js:394-405) mints a fresh
+   * `DepthTexture` every time the node is set up and hangs it off a fresh
+   * `RenderTarget`, then `setupShadow` publishes both as `shadow.map`
+   * (:584-585). Taking a light for GI-traced shadows and handing it back both
+   * call `light.dispose()`, which resets that node — so a rebuild forces a new
+   * setup, i.e. a new pair, every time.
+   *
+   * Only the COLOUR half is ever reclaimed. `Textures._destroyRenderTarget`
+   * (Textures.js:552-582) frees `renderTargetData.depthTexture`, but that
+   * record only exists once the target has actually been RENDERED — and GI's
+   * light never renders its map. The depth texture, by contrast, reaches the
+   * GPU anyway: the shadow filter SAMPLES it, so `updateTexture` creates it and
+   * registers its own dispose handler. Colour texture: never created. Depth
+   * texture: created, and reachable only through `shadow.map`.
+   *
+   * Hence: dispose it explicitly, on the retire queue (a map rendered this
+   * frame is still in flight), and only when it is unmistakably three's own —
+   * `godraysShadow.js` parks ITS render target in the very same field, and
+   * destroying that would take the god-rays depth with it.
+   */
+  #retireShadowDepth(light) {
+    const map = light?.shadow?.map;
+    if (!map) return;
+    const depth = map.depthTexture;
+    if (map.texture?.name !== "ShadowMap" || depth?.name !== "ShadowDepthTexture") return;
+    light.shadow.map = null;
+    this.#retireTargets({
+      dispose() {
+        // The target first: when it WAS rendered, its own teardown already
+        // reaches the depth texture and the second call finds nothing to do.
+        try { map.dispose?.(); } catch { /* three may have dropped it already */ }
+        try { depth.dispose?.(); } catch { /* idem */ }
+      },
+    });
+  }
+
   /** Hands a light back to three's own shadow maps (see #syncLightShadowNodes). */
   #releaseLightShadowNode(light, entry) {
     entry.active.value = 0;
@@ -11698,6 +11850,7 @@ export class GISystem {
       // placeholder nothing samples. It keeps the inert `float(1)` above, which
       // is what stops the same crash for that case.
       if (!stillGi) light.shadow.autoUpdate = true;
+      this.#retireShadowDepth(light);
       light.dispose?.();
     }
   }
@@ -11804,24 +11957,69 @@ export class GISystem {
     // evicts. User-visible as ~2 GB of heap per GI settings change (6 GB after
     // a few; 13.4 GB killed the device outright). See releaseCompute.js.
     const stale = collectStateComputeNodes(state);
-    const released = releaseComputeNodes(this.engine?.renderer, stale);
+    // ── ⭐⭐ §19 STAGE 0.2b: AND THE BUFFERS, WHICH ARE THE WHOLE WEIGHT ───
+    //
+    // The eviction above returns bind groups and pipelines. It does NOT return
+    // one byte of storage: `Bindings._destroyBindings` (three,
+    // Bindings.js:245-289) destroys uniform buffers and samplers and has no
+    // `isStorageBuffer` branch, so the only path to `GPUBuffer.destroy()` is
+    // `renderer._attributes.delete` — which this module never called until now
+    // (`grep -rn "_attributes" src/modules/gi` returned 0 hits). Worse,
+    // `Info.memoryMap` (Info.js:145) is a plain Map that `set`s every storage
+    // attribute at first bind and only ever `delete`s it from that same call,
+    // so the attribute stayed strongly reachable from the renderer and the GPU
+    // buffer was not even GC-reclaimable.
+    //
+    // Measured on Bistro (audit §I, three ultra↔high rebuilds): JS heap
+    // +1,878 MB per rebuild, live GPU storage bytes +1,853 MB per rebuild,
+    // `memoryMap` +733/+790/+934 entries, and every storage bucket reading
+    // `gone 0`. Same number twice, because the CPU twin the bind group
+    // captured and the GPU buffer it bound die together or not at all.
+    //
+    // NOTHING SURVIVES A TEARDOWN, so there is no diff to take here — the
+    // published lists and the harvest are unioned and all of it is retired.
+    // Retired, not destroyed on the spot: this runs inside `#tick`, i.e.
+    // BEFORE this frame is encoded, and a material or pass whose bind group
+    // still names one of these would fail its submit.
+    const doomed = new Set(collectStateStorageAttributes(state));
+    for (const attr of this._dynSet?.storageAttributes ?? []) doomed.add(attr);
+    const released = releaseComputeNodes(this.engine?.renderer, stale, doomed);
     // §19 Stage 0.2: the field owns kernels the `state` walk cannot see — the
     // minted generation the geometry-revision re-mint replaced, and the build
     // variants only `computes` references. Its `dispose()` was `{}` until now.
     const occField = state.volume?.occupancyField;
     occField?.setRenderer?.(this.engine?.renderer);
-    occField?.dispose?.();
+    // The field hands its own attributes over rather than destroying them: it
+    // has no way to know a frame is mid-encode, and this queue does.
+    occField?.dispose?.((attrs) => { for (const attr of attrs) doomed.add(attr); });
+    const retiredBuffers = this.#retireStorageAttributes(doomed);
     // Nothing left to detach for a state that is going away.
     this._giPendingDetach = [];
+    // Its staging buffers were just retired, so the set must not outlive them:
+    // a rebuild that bails out early (no component, no scene) would otherwise
+    // leave a live object holding destroyed attributes. The build re-creates it.
+    this._dynSet = null;
     // ⚠ AND THE MATERIAL SIDE, WHICH IS THE BIGGER HALF. The compute eviction
     // alone left the heap climbing ~2.2 GB per rebuild; the bulk is 116
     // materials' re-injected GI node graphs piling up in `nodeBuilderCache`
     // under fresh cache keys. See purgeNodeBuilderCache.
     const purged = purgeNodeBuilderCache(this.engine?.renderer);
     if (globalThis.__giLogComputeRelease === true) {
+      // ⭐ THE RECEIPT THAT CANNOT REGRESS SILENTLY (§I.3 #6). `storageAttributes`
+      // / `storageAttributesSize` are counters three maintains itself, and they
+      // are exactly the quantity that must come back DOWN across a rebuild —
+      // reading them here, one line before the next build allocates, is the
+      // difference between "we called delete" and "the buffers are gone".
+      const mem = this.engine?.renderer?.info?.memory;
       console.log(
-        `[gi] dispose: released ${released}/${stale.length} compute nodes` +
-        `${purged ? ", purged the node-builder cache" : ""}`,
+        `[gi] dispose: released ${released}/${stale.length} compute nodes, ` +
+        `retired ${retiredBuffers} storage buffers` +
+        `${purged ? ", purged the node-builder cache" : ""}` +
+        (mem
+          ? ` — live storage attributes ${mem.storageAttributes} ` +
+            `(${(mem.storageAttributesSize / 1e6).toFixed(0)} MB), ` +
+            `memoryMap ${this.engine?.renderer?.info?.memoryMap?.size ?? -1}`
+          : ""),
       );
     }
   }
@@ -11878,13 +12076,34 @@ export class GISystem {
       if (!detachCpuMirror(renderer, entry.attr)) continue; // not uploaded yet
       this._giDetachCount = (this._giDetachCount ?? 0) + 1;
       this._giDetachBytes = (this._giDetachBytes ?? 0) + cpuMirrorBytes(entry.attr);
+      (this._giDetached ??= new Set()).add(entry.attr);
       list.splice(i, 1);
     }
     if (list.length === 0 && !this._giDetachLogged && (this._giDetachCount ?? 0) > 0) {
       this._giDetachLogged = true;
+      // ── §19 STAGE 0.2b / §I.2: THE DETACH DID NOT PAY UNTIL THIS LINE ────
+      //
+      // `detachCpuMirror`'s zero-length swap replaces `attr.array`, but the
+      // bind group captured the ORIGINAL array at first bind — `StorageBuffer`
+      // (three, StorageBuffer.js:19) passes `attribute.array` to `Buffer`
+      // (Buffer.js:44), which keeps it as `_buffer`, and that happens strictly
+      // BEFORE this drain can run, because the GPU buffer has to exist for the
+      // detach to be allowed at all. So "detached 25 CPU mirrors (709.4 MB)"
+      // was a bookkeeping line about the live generation, not a free.
+      //
+      // `NodeStorageBuffer` overrides the `buffer` and `attribute` getters, so
+      // nothing ever reads `_buffer` back; this walks the live generation's
+      // compute nodes and drops the capture. (`detachCpuMirror` also detaches
+      // the ArrayBuffer itself, which reaches holders this cannot enumerate —
+      // a material's bind group lives in a WeakMap keyed by BindGroup.)
+      const dropped = nullStorageBindingArrays(
+        renderer, collectStateComputeNodes(this.state), this._giDetached,
+      );
+      this._giDetached = null;
       console.log(
         `[gi] detached ${this._giDetachCount} CPU mirrors ` +
-          `(${(this._giDetachBytes / 1048576).toFixed(1)} MB)`,
+          `(${(this._giDetachBytes / 1048576).toFixed(1)} MB)` +
+          (dropped > 0 ? `, dropped ${dropped} bind-group captures` : ""),
       );
     }
   }

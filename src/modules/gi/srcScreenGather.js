@@ -569,6 +569,16 @@ export function createSrcScreenGather(store, tiles, {
     target,
     stats,
     /**
+     * §19 Stage 0.2b — the GPU buffers that die with this bundle. Published so
+     * a swap site can tell "this generation's" from "the survivor's" (the KEEP
+     * half of `#sweepOrphanedComputes`' diff) and so a teardown destroys them:
+     * three's `Bindings._destroyBindings` has no storage branch, so evicting
+     * the compute nodes returns the bind groups and leaves every byte.
+     */
+    get storageAttributes() {
+      return [stats].map((n) => n?.value).filter(Boolean);
+    },
+    /**
      * §13.9's C0↔C1 weight dial, live. GISystem pushes `__giGatherSmoothLive`
      * into it each frame when that global is set, so a probe can render both
      * arms in ONE boot at ONE pose — the within-boot dial the plan's method
