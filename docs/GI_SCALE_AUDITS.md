@@ -1244,3 +1244,298 @@ at `giConfig.js:36-38, 67-70, 88-93`.
    `__giC0DirRes`, the 5 `__giTileCut*` and the 6 `__giMerge*`/`__giParallax*`. The editor **sets** none
    of them (read-only tests at `profile.js:106,110`); every setter is in `scripts/`. Sweep them with
    N.4's DELETE group or they become 60 silent no-ops.
+
+---
+
+## O. THE PALETTE'S EMISSIVE INPUT — DIAGNOSIS + FIX SPEC (read-only analysis 08-27, `gi19-stage0` @ `70ea975`)
+
+Written for the finding in 4.0's commit body: *"Bistro's palette has 16 classes
+and ZERO with emission … while the emitter-seat resolver finds 95 lamps"*.
+⚠ `gatherProbes.js` is under concurrent edit (Stage 3.6, `history: 4 → 32`), so
+every anchor into that file below is by SYMBOL, never by line.
+
+### O.1 The divergence — it is a POPULATION cap, not a resolver difference
+
+**Both resolvers are the same function.** `#buildEntries` (`GISystem.js:13367`)
+and `#startGi2Build` (`:16113`) both call `resolveMaterialSurface`
+(`voxelizeOnce.js:193`) on the same `#collectMeshes()` list, and reduce it the
+same way (`emissive.rgb × emissiveIntensity`; peak vs mean). There is no second
+resolver to diverge from.
+
+**What differs is the MESH POPULATION each one is fed.**
+
+| path | source | cap |
+|---|---|---|
+| emitter seats | `#buildEntries` → `#placementsOf` (`:13344`) | none (only `MAX_INSTANCES_PER_MESH` per InstancedMesh) |
+| GI2 palette / soup / voxels | `#startGi2Build` → `#occupancyContentOf` (`:16459-16460`) | **`if (placements.length >= MAX_INSTANCE_SLOTS) break;`** |
+
+`MAX_INSTANCE_SLOTS = 768` (`slotRegistry.js:60`). **Bistro has 1532 mesh
+placements** — the constant's own header already records the symptom at the
+previous value: *"The 512 it shipped at cost Bistro two thirds of its geometry:
+`1020 of 1532 placements could not seat (slots 512)` … Overflow seating is
+first-come by collect order (GISystem breaks at this constant), so WHICH two
+thirds vanished was an accident of hierarchy order on top of it."*
+
+**And hierarchy order puts every lamp past the cut.** Counted directly from
+`C:/Users/Khudiiash/Documents/GAME/Sketchfab/Bistro_Godot/Bistro_Godot.prefab`
+(1532 `mesh` components, one material each, no material overrides in
+`Bistro.scene`), the emissive materials sit at these traversal indices:
+
+| material | emissive (graph prop) | strength | placements | traversal index |
+|---|---|---|---|---|
+| `Bistro_Sign_Letters` | `#ff0000` | 10 | 1 | **145** — inside 768 |
+| `MASTER_Focus_Glass` | `#ffffff` | 10 | 10 | **383-539** — inside, but `transparent` (see below) |
+| `Lantern` | `#ffffff` | 1 | 5 | 1156-1160 — CUT |
+| `Shopsign_Pharmacy` | `#00ff00` | 1 | 1 | 1240 — CUT |
+| `Paris_StringLights_01_White_Color` | `#ffffff` | 1 | 36 | 1299-1391, 1445+ — CUT |
+| `…_Red/Blue/Green/Pink_Color` | pure R/B/G/M | 1, 1, 10, 1 | 8 each | 1447+ — CUT |
+| `…_Orange_Color` | `#ffff00` (sic) | 1 | 5 | 1451+ — CUT |
+| `Spotlight_Emissive` / `Spotlight_Glass` | `#ffffff` | 1 | 5 + 5 | CUT |
+
+So the palette's input list contains **at most one** emissive placement
+(`Bistro_Sign_Letters`), and glass is excluded from `meshes` altogether —
+`#collectMeshes` keeps a mesh only `if (position && material &&
+!material.transparent && …)` (the `meshes.push(object)` guard).
+`0 of 15 classes with emission` follows without any resolver failing.
+
+⚠ **The cap is not a palette bug — it truncates GI2's whole world.** The same
+768 list feeds the triangle soup, the voxelizer and the static BVH, i.e. 764 of
+Bistro's placements have no occupancy, no bounce and no shadow under GI2. It is
+also the source of `GI_SPATIAL_REBUILD_PLAN.md:1554`'s *"no mesh/tri caps, 768
+placements"* — a blind statistic: 768 IS the cap, read as the scene's count.
+
+### O.2 Refuted, with the receipt for each
+
+* **(i) "the palette reads `material.emissive` and ignores maps/intensity"** —
+  REFUTED. Bistro's emissive is authored as `principledBsdf` graph props
+  (`emissive` + `emissiveStrength`), which `tslGraph.js:475` + `:105-108` turn
+  into `m.emissiveNode = mul(color, strength)`, which `constantColorOf`
+  (`voxelizeOnce.js:23-39`) folds. No `.mat` in the Bistro set has a top-level
+  `emissive`/`emissiveIntensity`/`emissiveMap` key at all.
+* **(ii) "the GPU texture average lands after the palette is built"** —
+  REFUTED *as the cause here*: 11 of Bistro's 12 emissive materials have **no
+  emissive texture**, so nothing waits on `pendingTextureAverages`. ⚠ but the
+  MECHANISM IS REAL and will bite the moment a compressed emissive map is
+  authored: `setPalette` is called from exactly one place
+  (`gi2System.js:503`, inside `build`), `build` is called from exactly one place
+  (`GISystem.js:10924`, inside `#rebuild`), and `#checkFingerprint`'s content
+  path (`:15219-15225`) re-runs `#buildEntries` / `#syncSlots` /
+  `#refreshOccupancyContent` and **never touches the palette**. The old path
+  re-tinted through `atlas.setSlotSurface`; GI2 has no equivalent. Fix it in
+  O.5(c) anyway.
+* **(iii) "node-graph emissive is unreadable"** — REFUTED, see (i). The one
+  textured emissive (`Lantern`, a `.basis` map) would take the
+  `textureScaleOf` path, which works.
+* **(iv) "the quantizer merged the lamp class away"** — NOT the cause today.
+  The commit's "16 classes" is `PAL_ENTRIES` (the array length the harness
+  prints), not the occupied count; the occupied count is the
+  `[gi2] soup … palette N of 15 classes` line. Measured over all 131 materials
+  / 1532 placements, Bistro's albedos occupy only **7 of the 27** buckets the
+  3-level lattice can produce, so the `slice(0, GI2_PAL_CLASSES)` cut
+  (`gi2System.js:165`) evicts **0 placements**. ⚠ It becomes a REAL risk the
+  moment O.5(a) admits the lamps: ranking is by **placement count**, and
+  `Bistro_Sign_Letters` is `n = 1` against walls at `n` in the hundreds.
+* **(v) something else** — yes: the population cap, O.1.
+
+### O.3 The design rule this fix must encode (from the user)
+
+*"The smaller the emitter, the more emission strength it needs to be considered
+as something emitting light to the scene."* The engine already implements this
+as the radiant-power gate `Φ = π·A·L` against `GI_EMITTER_MIN_POWER_FRACTION =
+0.002` (`GISystem.js:158`, `#emitterMinPowerFraction :13899`,
+`#belowEmitterPowerGate :13959`, admission recorded by
+`#recordEmitterAdmission :13924` from `collectEmitters`). **So the palette must
+not make every emissive map bounce.** Its emissive must follow the SAME
+admission decision the emitter resolver makes — which is already a single
+written function:
+
+```js
+#slotSurface(entry)                                   // GISystem.js:13820
+  const zeroed = entry.promoted || this.#isNeeEmitterMesh(entry.mesh)
+                                || this.#belowEmitterPowerGate(entry);
+```
+
+⚠⚠ **BUT `#isNeeEmitterMesh` IS WRONG UNDER GI2 AND WOULD RE-ZERO EVERYTHING.**
+It returns true for *every tree candidate* when `#lightTreeIsNeeSet()`
+(`:13777`) is true, and that is true under GI2 because `#rebuild` builds the
+tree region on this path (`:10249`, `(this._dynSet || GI2_PATH)`). But GI2 does
+**not** sample the tree at hits — 4.0's decision was "keep the plumbing, no tree
+NEE yet", and `gatherProbes`' `shadeHit` does NEE over `emitters ?? []`, i.e.
+the `MAX_EMITTERS = 4` slot uniforms only. Under GI2 the NEE set is the four
+seats. Reusing `#slotSurface` verbatim would zero all 95 and reproduce today's
+symptom through a different door.
+
+Therefore the three tiers the palette must produce on Bistro:
+
+| tier | count (Bistro) | palette emissive |
+|---|---|---|
+| seated in one of the 4 gather slots (`entry.promoted`) | 4 | **0** — `shadeHit`'s NEE already delivers them; non-zero is the 2.60× double-count of §12.26.7 |
+| admitted by the Φ gate, not seated | ~78 | **`emissive.rgb × emissiveIntensity`**, sub-cell damp applied |
+| culled below the Φ gate (`#belowEmitterPowerGate`) | 13 | **0** — the user's rule, and the whole point of the cull |
+
+### O.4 The class count — 16 is not the problem, the LATTICE is
+
+`PAL_ENTRIES = 16` (`gatherProbes.js`, `GI2_PAL_CLASSES = PAL_ENTRIES - 1`,
+last entry reserved black for `PAL_NONE`). The byte allows 255 and the storage
+is a `uniformArray(vec4)` of 16 = **256 bytes**; 64 classes = 1 KB, 255 = 4 KB,
+all far under the 64 KB binding limit, and `palAt`'s cost is one indexed
+uniform read at any N. There was never a reason for 16 beyond "a fixed table
+keeps scene numbers out of the WGSL", which holds at any fixed N.
+
+Placement-weighted per-channel albedo error, 131 Bistro materials / 1532
+placements (albedo = alpha-masked linear mean of each material's decoded
+diffuse map, since `.mat color` is `#ffffff` on 1447 of 1532 placements; a
+per-material mean, so these are a FLOOR on the true error):
+
+| scheme | mean abs err | p95 abs err |
+|---|---|---|
+| **3-level lattice (today)** | **0.1113** | **0.2306** |
+| 3-level + top-16 eviction | 0.1113 | 0.2306 (eviction never fires) |
+| 5-level lattice + top-64 | 0.0507 | 0.1012 |
+| RGB565 per voxel (2 B/voxel) | 0.0059 | 0.0097 |
+| weighted k-means, k=16 | 0.0120 | 0.0403 |
+| weighted k-means, k=64 | **0.0008** | **0.0041** |
+| weighted k-means, k=255 | 0.0000 | 0.0000 |
+
+**Read it as: k-means at the CURRENT 16 classes is 9x better than the lattice,
+and k-means at 64 is 140x better and beats per-voxel RGB565** — which would
+double the voxel store (256 KB → 512 KB per window level) and break
+`windowVoxelize`'s packed-word MAX merge (`windowVoxelize.js:28-30`, "max of
+packed words is max of fields"). So:
+
+> **RECOMMENDATION: keep one byte per voxel. Raise `PAL_ENTRIES` 16 → 64
+> (63 real classes + `PAL_NONE`), replace the fixed 3-level lattice with a
+> deterministic weighted median-cut/k-means over ~1500 placements
+> (microseconds, CPU, once per build), rank by AREA not placement count, and
+> RESERVE a band of 8 classes for admitted emitters.** Do NOT go to 255 (the
+> k=64 residual 0.0008 is already an order below the per-mesh-mean error the
+> resolver itself carries) and do NOT go RGB565.
+
+Also: `pal.w` is ONE FLOAT and `shadeHit` adds it as `vec3(pal.w)`, so a red
+lamp bounces GREY. A second `uniformArray(vec4)` for emissive RGB is 1 KB at 64
+classes; this file's own audit already budgeted "palette uniforms (N×2 vec4s)".
+
+### O.5 THE FIX — exact anchors
+
+**(a) Uncap the GI2 content walk — this is the precondition, do it first.**
+`GISystem.js:16460`, inside `#occupancyContentOf`:
+
+```js
+for (const instanceId of this.#placementsOf(mesh)) {
+  if (placements.length >= MAX_INSTANCE_SLOTS) break;      // <- the cut
+```
+
+The 768 exists for the SRC atlas's `localToWorld` uniform array
+(`slotRegistry.js:27-58`) — **which is not built under GI2**: `#rebuild`'s
+`const occField = GI2_PATH ? null : this.#buildOccupancyField(…)` (`:10159`).
+GI2's consumers are the soup (`triPal`, a storage buffer) and the voxel `pal`
+byte; neither has a slot ceiling. Take the cap from a parameter:
+`#occupancyContentOf(meshes, { cap = MAX_INSTANCE_SLOTS } = {})`, pass
+`{ cap: Infinity }` from `#startGi2Build` (`:16107`), leave `:15641` / `:16504`
+(SRC/BVH) on the default. Expected: Bistro `[gi2] soup requested:` goes
+768 → ~1500 static placements. Also fix the loop while there — `break` exits
+the INNER loop only, so today every mesh past the cut still pays
+`serializeMeshForBake` and still appends to `geometries` for zero placements.
+
+**(b) Make the palette's emissive the admission decision.**
+`GISystem.js:16110-16120`, `#startGi2Build`'s `enriched` map, replaces the raw
+resolve:
+
+```js
+emissive: (raw.emissive.r + raw.emissive.g + raw.emissive.b) / 3 * (raw.emissiveIntensity ?? 1),
+```
+
+`#buildEntries` has already run in the same `#rebuild` (`:10203`, well before
+`:10924`), so `state.entries` and `_emitterAdmittedMeshes` are live. Build
+`const entryOf = new Map(state.entries.map(e => [e.key, e]))` — `entry.key` and
+the placement key are both `slotKeyOf(mesh, instanceId)` — and take the
+emissive from a **new GI2 sibling of `#slotSurface`**:
+
+```js
+#gi2SlotEmissive(entry) {                    // next to #slotSurface :13820
+  if (!entry) return 0;                       // no entry => no emission
+  if (entry.promoted) return 0;               // the 4 gather NEE slots
+  if (this.#belowEmitterPowerGate(entry)) return 0;   // the user's cull
+  // NOT #isNeeEmitterMesh — see O.3; GI2 does not sample the tree at hits.
+  let r = entry.surface.emissive.r * entry.surface.emissiveIntensity;
+  let g = entry.surface.emissive.g * entry.surface.emissiveIntensity;
+  let b = entry.surface.emissive.b * entry.surface.emissiveIntensity;
+  const damp = this.#subCellEmissiveDamp(entry);      // :13998, default OFF
+  // …identical chroma-then-energy ramp as #slotSurface…
+  return (r + g + b) / 3;   // or the vec3, once (d)'s second uniformArray lands
+}
+```
+
+⚠ `#belowEmitterPowerGate` FAILS OPEN when no admission record exists — and at
+the FIRST build `collectEmitters` may not have run yet on a cold scene. That is
+the correct direction (keep emitting) but it means the first palette can be
+over-inclusive until the first `#refreshLightTree`; (c) is what corrects it.
+
+**(c) The re-tint path — the TABLE changes, the ASSIGNMENT must not.**
+The class→colour table is a `uniformArray(vec4)` (`gatherProbes.js`, `palette`
+/ `palU`, written by `setPalette`), so **re-tinting is a uniform write: no
+re-voxelize, no soup rebuild, no recompile.** The class ASSIGNMENT is not — it
+is baked into the worker's `triPal` (`triangleSoup.js:229`, `pal: (p.pal ??
+PAL_NONE) & 255`) and stamped into each voxel's `pal` byte
+(`windowVoxelize.js`). So:
+
+1. **Make the bucket key value-independent for emitters.** `gi2System.js:155`
+   keys on the emissive VALUE (`e > 1e-4`), so a lamp that resolves 0 at build
+   and 3.3 later CHANGES CLASS and needs a re-voxelize. Key instead on a static
+   fact: `emissivePending` — a new third field on `resolveMaterialSurface`'s
+   return, true where `emissiveTexture && !emissiveTexAvg`
+   (`voxelizeOnce.js:288` already computes exactly this) — OR'd with
+   `e > 1e-4`. Assignment is then stable from the first build.
+2. Stash the palette input on the system: `this._gi2PaletteInputs = { keys,
+   placementEntryKeys }` at `gi2System.js:500`, exposed through the returned
+   object.
+3. Add `#retintGi2Palette()` — re-resolve, recompute per-class means with the
+   SAME keys, `gi2.gather.setPalette(next)`. Call it from two places:
+   * `GISystem.js:3919`, the `--this._texAvgCount === 0 &&
+     pendingTextureAverages.size === 0` branch (the line that already promises
+     *"the palette re-tints on the next scan"*);
+   * `#checkFingerprint`'s content path, `:15221`, next to
+     `this.#syncSlots(entries)` — the old path's `atlas.setSlotSurface`
+     equivalent, so live material edits and seat/admission flips re-tint
+     without a rebuild.
+4. ⚠ `soupKey` (`:16155`) has NO material term, so a rebuild that changed only
+   materials reuses `store.soup` and its OLD `triPal`. That is CORRECT under
+   (c.1) and MUST STAY correct — if anyone later makes the class key depend on a
+   value that can change, the soup key has to gain that term or the palette
+   silently desynchronises from the voxels.
+5. ⚠ Stage 3.6 raises `history` 4 → 32, so alpha settles at `1/32`: a re-tint is
+   ~32 frames from fully visible. Expect the gate's A/B to need a longer settle
+   than the current `SETTLE=8000`.
+
+**(d) Class count.** `PAL_ENTRIES` 16 → 64 in `gatherProbes.js` (it is exported
+and `GI2_PAL_CLASSES = PAL_ENTRIES - 1` follows); replace `gi2System.js:143`'s
+lattice+count-rank with weighted median-cut ranked by an AREA proxy
+(placement count × the placement's world bounding-box area — available at
+build from `geometry.boundingBox` and the matrix, no soup needed) and reserve
+classes 56-62 for admitted emitters so a 1-placement lamp cannot be outvoted by
+a 400-placement wall. Add a second `uniformArray(vec4)` for emissive RGB and
+change `shadeHit`'s `.add(vec3(pal.w))` to the RGB read. Publish
+`palEmissiveClasses` next to `palClasses` in `profile.gi2`
+(`src/editor/api/ops/profile.js:695`) — the receipt this whole section exists
+because nobody had.
+
+### O.6 Gate
+
+1. `[gi2] soup requested:` on Bistro reads **~1500 static placements, not 768**
+   (O.5(a)), and `[gi2] soup … palette N of 63 classes` reports N > 7.
+2. `node scripts/run-gi2-lighttree-decide.mjs` on Bistro, with the subject
+   picker narrowed to **ADMITTED** out-of-slot candidates
+   (`outs = cands.filter(c => !seated.has(c.mesh) && sys._emitterAdmittedMeshes?.has(c.mesh))`):
+   * `palette: 64 classes, N with emission` with **N ≥ 1**, and the subject
+     lamp's own class among them;
+   * the receiver crop 1.2 m below that lamp **drops ≥ 10 %** when only that
+     class's `w` is zeroed, and is reversible within 25 % (the harness's own
+     existing check);
+   * **and the negative half**: assert the class of a lamp reported CULLED by
+     `[gi] emitter delivery: 13 placement(s) CULLED…` has `e == 0`, and that
+     each of the 4 seated meshes' class has `e == 0` (double-count guard).
+3. The Level's `run-gi2-lighttree-decide` is UNCHANGED: `emissive-at-hits`
+   still carries ~29 % ± noise, and `profile.gi2.palClasses` does not fall.
+4. `test:gi2-lightshadow`, `probe:gi2-voxelize`, `test:gi-emitter-tsl`,
+   `test:mcp-coverage` unchanged. ⚠ 4.0's warning stands: do NOT run GPU
+   batteries in parallel.

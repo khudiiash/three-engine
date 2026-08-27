@@ -57,11 +57,11 @@
 //    disjoint, so there is still no write race, and the yield rises from ~50 %
 //    to ~95 % of launched threads at R = 16.
 //
-// 3. THE ATLAS TEXEL'S ALPHA CARRIES TWO NUMBERS. §L.2 wants `(radiance,
-//    hitDistance)` in the texel and §L.3 wants the per-texel sample count in
-//    the alpha. There is one channel. It holds `n·1024 + min(dist, 1023)`:
-//    n ≤ H = 4 so the integer part is exact in f32, and the distance keeps
-//    ~0.3 mm of precision.
+// 3. THE ATLAS TEXEL'S ALPHA CARRIES THREE NUMBERS. §L.2 wants `(radiance,
+//    hitDistance)` in the texel, §L.3 wants the per-texel sample count, and
+//    §19 Stage 3.6's hysteresis wants the texel's own σ. There is one channel.
+//    It holds `n·2^18 + distQ·2^10 + sigQ`, three integer fields that fill
+//    exactly the 24 bits an f32 is exact over — see `PACK_N` below.
 //
 // 4. RGBE, NOT R11G11B10, IN THE CACHE — see `radianceCache.js`'s header.
 //
@@ -74,7 +74,7 @@
 import * as THREE from "three/webgpu";
 import {
   Break, Fn, If, Loop, Return, atomicAdd, bitAnd, bitOr, bitXor, dot, exp, exp2, float, globalId,
-  instanceIndex, instancedArray, int, ivec2, max, min, mix, normalize, select, shiftLeft,
+  instanceIndex, instancedArray, int, ivec2, log2, max, min, mix, normalize, select, shiftLeft,
   shiftRight, sqrt, step, storage, texture, textureStore, uint, uniform, uniformArray, vec2, vec3,
   vec4,
 } from "three/tsl";
@@ -86,7 +86,27 @@ import { octahedralUV } from "../srcOctahedral.js";
  * Tier constants. These, and only these, are compiled into the WGSL.
  *
  * `tile` and `rays` are PLAN §4.6's row; `oct` is §L's `O = 8` (64 directions);
- * `history` is §L.3's `H = 4`; `sh` selects the resolve's DIFFUSE integrator.
+ * `history` is §L.3's `H`; `sh` selects the resolve's DIFFUSE integrator.
+ *
+ * ⭐⭐ H IS 32, NOT 4, AND THAT IS THE WHOLE "GI IS NOISY" REPORT (§19 3.6).
+ *
+ * §L.3 wrote `H = 4` and the estimator inherited it. `H` is the cap on the
+ * per-texel sample count, so `α = 1/min(n+1, H)` settles at `1/H`: at 4 that
+ * is a FOUR-FRAME memory — one to four samples per direction — and a single
+ * Monte-Carlo ray through a 4π/64 sr texel has a variance an order of
+ * magnitude wide inside its own solid angle. Four of them averaged is still
+ * noise. The SRC path that this replaces was noiseless because its
+ * world-anchored accumulators ran `α ≈ 0.02`, a ~50-frame memory.
+ *
+ * The reason `H = 4` looked like a ceiling is that a screen-space probe used
+ * to be a per-frame object; it is not any more. Since 3.2 the anchor is
+ * STICKY and the probe is validated against its own WORLD POSITION and
+ * normal, so a long memory cannot smear across a camera move — the validation
+ * throws the history away when the surface under the probe changes. What a
+ * long memory CAN smear is a change in the WORLD, and that is what the
+ * variance-aware hysteresis below is for: it is the only thing in the chain
+ * whose job is to shorten the memory, and it must fire on a moved lamp and
+ * never on shot noise.
  *
  * ⚠ `sh` is `true` on every tier since Stage 3.2. §L.5 offered "SH on phone,
  * oct sum on desktop; measure both" — measured, the two agree to 1.5 % on the
@@ -95,10 +115,10 @@ import { octahedralUV } from "../srcOctahedral.js";
  * because a tier is expected to differ.
  */
 export const GATHER_TIERS = {
-  phone: { tile: 16, rays: 8, oct: 8, history: 4, sh: true, hzbSteps: 12 },
-  medium: { tile: 16, rays: 8, oct: 8, history: 4, sh: true, hzbSteps: 12 },
-  high: { tile: 8, rays: 16, oct: 8, history: 4, sh: true, hzbSteps: 12 },
-  ultra: { tile: 8, rays: 16, oct: 8, history: 4, sh: true, hzbSteps: 12 },
+  phone: { tile: 16, rays: 8, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2 },
+  medium: { tile: 16, rays: 8, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2 },
+  high: { tile: 8, rays: 16, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2 },
+  ultra: { tile: 8, rays: 16, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2 },
 };
 
 /** HZB mips and §L.2's step budget — the tier row's DEFAULT, not the value. */
@@ -119,13 +139,97 @@ export const STAT_STRIPE = 64;
  */
 export const EXHAUST_SLOTS = 256;
 export const EXHAUST_CLAIM = 15;
+/**
+ * The reprojection census (slots 16-20) exists because "86 % of probes
+ * reproject" is a rate, and a rate names no mechanism. Every probe that fails
+ * to carry its history forward fails for exactly ONE of five reasons and each
+ * is a different bug: no previous probe in that tile at all, the anchor left
+ * the screen, the plane gate (a different surface), the along-surface gate
+ * (the anchor moved further across its own surface than the tolerance allows)
+ * or the normal gate. They sum to `probesValid − reprojHits` by construction,
+ * which is the check that the census is not itself blind.
+ */
 export const STATS = {
   probesPlaced: 0, probesValid: 1, reprojHits: 2, raysLaunched: 3, raysTraced: 4,
   screenHits: 5, windowHits: 6, skyMiss: 7, freshShades: 8, alphaForced: 9,
-  injectWrites: 10, handoffs: 11,
+  injectWrites: 10, handoffs: 11, matureTexels: 12, texelsSeen: 13,
+  reprojNoPrev: 16, reprojOffScreen: 17, reprojPlane: 18, reprojSlant: 19, reprojAlign: 20,
 };
-export const STAT_SLOTS = 16;
+export const STAT_SLOTS = 24;
 export const STAT_WORDS = STAT_SLOTS * STAT_STRIPE;
+
+/**
+ * ══ THE OCT TEXEL'S ALPHA, REPACKED: n, HIT DISTANCE **AND** σ ══════════════
+ *
+ * §L.3's hysteresis has to answer "is this sample surprising?", and that
+ * question has no answer without a spread to measure the surprise against.
+ * The estimator has one spare word — the atlas texel's alpha — and Stage 3.5
+ * spent it on `n·1024 + min(dist, 1023)`.
+ *
+ * ⭐ THE STORED DISTANCE WAS NINE BITS TOO WIDE, AND NOTHING READ IT. `RAY_MAX`
+ * is 40 m, so a field with a range of 1023 m spent five bits describing
+ * distances no ray can have; and no SHIPPING consumer ever decoded it (only
+ * the harness's texel dump did). So the word is repacked into three integer
+ * fields that together fill exactly the 24 bits an f32 represents exactly:
+ *
+ *     a = n·2^18 + distQ·2^10 + sigQ          (max 63·2^18 + 255·2^10 + 1023
+ *                                              = 2^24 − 1, every value exact)
+ *
+ *   n     6 bits  the sample count, 0..63 — H is 32
+ *   distQ 8 bits  the hit distance, `dist = distQ · RAY_MAX/255` → 0.157 m,
+ *                 finer than a level-0 cell (0.25 m) on the desktop tiers
+ *   sigQ 10 bits  the RELATIVE standard deviation of the texel's luminance,
+ *                 LOG-quantized over [SIG_MIN, SIG_MIN·2^SIG_OCT]
+ *
+ * ⚠ σ IS LOG-QUANTIZED BECAUSE A LINEAR FIELD FREEZES IT. The variance is
+ * updated by an EMA whose per-frame step is `α·(δ²/σ² − 1)` ≈ 3 % of σ² at
+ * α = 1/32, i.e. ~1.5 % of σ. A linear 10-bit field over [0, 4] has a quantum
+ * of 0.004, so any texel with σ_rel below ~0.25 would round its own update
+ * away and sit still forever at whatever it happened to reach. Log-quantized,
+ * one step IS 0.9 % of σ everywhere, which resolves the update at every scale.
+ * (`sigQ` is a relative σ, not an absolute one, for the same reason: it has to
+ * mean the same thing on a texel worth 8 W/sr/m² and one worth 0.02.)
+ */
+export const PACK_N = 262144;
+export const PACK_D = 1024;
+export const DIST_Q = 255;
+export const SIG_Q = 1023;
+export const SIG_MIN = 1 / 1024;
+export const SIG_OCT = 13;
+/**
+ * §L.3's hysteresis, as a MODE rather than a switch.
+ *
+ * 0 = off (α = 1/min(n+1, H) always) · 1 = GI-1.0's `|new − prev| > 0.5·max`
+ * (Stage 3.5's shipped rule, kept as the A/B's other arm) · 2 = variance-aware
+ * (`|new − mean| > k·max(σ, ε)`) · 3 = variance-aware AND the hit distance
+ * moved by more than a cell · 4 = variance-aware, DECAYING.
+ *
+ * ⭐⭐ 4 EXISTS BECAUSE A RESET IS ITSELF A NOISE SOURCE. Measured at 480×270:
+ * mode 2 fires on 0.48 % of rays — fifty times less than GI-1.0's rule — and
+ * the at-rest temporal p95 still sat at 6.6 % against 3.0 % with the
+ * hysteresis switched off entirely. A reset sets `n ← 1`, i.e. α = 1, i.e.
+ * that texel takes ONE Monte-Carlo sample wholesale; half a percent of texels
+ * doing that every frame is a tail, and a p95 is exactly where a tail lives.
+ *
+ * So mode 4 does not reset, it SHORTENS: `n ← n/4`. One false surprise costs a
+ * step 4× larger instead of 32×, and `n` climbs back. A REAL change surprises
+ * the texel again and again — 32 → 8 → 2 → 1 in three samples — so sustained
+ * evidence still collapses the memory, and isolated evidence cannot. `n` is
+ * the strike counter; no second word is needed for one.
+ */
+export const HYST = { off: 0, legacy: 1, variance: 2, varianceAndDist: 3, decay: 4 };
+/** Mode 4's divisor. Three surprises take H = 32 to 1. */
+export const HYST_DECAY = 4;
+/** §L.3's `k`: how many σ a sample must miss the mean by to be a CHANGE. */
+export const HYST_K = 4;
+/**
+ * The relative floor under σ. A texel whose every ray so far has hit the same
+ * flat wall has a genuinely tiny σ, and `k·σ` on it would fire on the fifth
+ * decimal; 5 % of the mean is the smallest spread worth calling a spread.
+ */
+export const HYST_EPS_REL = 0.05;
+/** How many samples σ needs before the test is allowed to fire at all. */
+export const HYST_MIN_N = 4;
 
 /** Ray length in metres. A tier constant: it bounds the DDA, not the scene. */
 export const RAY_MAX = 40;
@@ -211,6 +315,8 @@ export function createGiGather({
   const OCT = O * O;
   const OCT_SHIFT = Math.log2(O);
   const H = spec.history;
+  /** §L.4's probe-space bilateral radius — 2 is a 5×5. See `makeShFilter`. */
+  const SH_R = spec.shRadius ?? 1;
   const STRIDE = OCT / R;
   const USE_SH = spec.sh;
   const MIP_RES = O / 2;
@@ -273,10 +379,53 @@ export function createGiGather({
   const hzb = instancedArray(new Float32Array(hzbWords), "float");
   const statsBuf = instancedArray(new Uint32Array(STAT_WORDS), "uint");
   const stats = storage(statsBuf.value, "uint", STAT_WORDS).toAtomic();
-  const cropIn = instancedArray(new Float32Array(crops * 4), "vec4");
+  // ⭐ §19 STAGE 4.0 — `crops: 0` MEANS THE CROP KERNEL IS NEVER BUILT.
+  //
+  // The crop sampler is a RECEIPT, not a frame stage: it exists so the
+  // harness pages can compare irradiance against a CPU path-trace at the same
+  // world point. It is also, measured at 4.3a, **526 kB of WGSL with 1378
+  // branches that took the driver 11.8 s to compile** — and because it lived
+  // in the gather's `passes` map it rode `passesForRelease()` into the
+  // system's ownership list, where any prewarm that touched that list dragged
+  // it in (the Level's `computes` phase went 36 ms → 7056 ms when one did).
+  // A kernel that only a receipt dispatches must only be BUILT by a receipt:
+  // the engine path passes `crops: 0` and gets no buffers, no `passes.crop`
+  // and no way for a warm loop to reach it; the harness pages pass their own
+  // count and are unchanged.
+  const cropIn = crops > 0 ? instancedArray(new Float32Array(crops * 4), "vec4") : null;
   const CROP_OUT_VEC = 6;
-  const cropOut = instancedArray(new Float32Array(crops * CROP_OUT_VEC * 4), "vec4");
+  const cropOut = crops > 0 ? instancedArray(new Float32Array(crops * CROP_OUT_VEC * 4), "vec4") : null;
   const litBuf = instancedArray(new Float32Array(width * height * 4), "vec4");
+  /**
+   * ⭐ THE NOISE RECEIPT'S BUFFER (§19 Stage 3.6). Harness only, like `cropIn`.
+   *
+   * "GI is noisy" is a report about a TEXTURE, and every instrument this file
+   * had reads a CROP — a 9×9 block averaged into one number, which is a
+   * low-pass filter applied to the exact quantity under complaint. So the
+   * resolved irradiance is dumped per pixel, together with the two things a
+   * noise statistic needs and the CPU cannot recover afterwards: its own 5×5
+   * box mean (the spatial high-pass's other half) and whether the pixel sits
+   * on a GEOMETRIC edge, where a difference from the neighbourhood is the
+   * scene and not the estimator.
+   */
+  //
+  // ⚠ IT WRITES EVERY SECOND PIXEL IN EACH AXIS, and the 5×5 box is still
+  // taken at FULL resolution around it. The statistic is a p50/p95 over
+  // hundreds of thousands of pixels either way, and the receipt reads this
+  // buffer back thirty times per arm: at 1650×970 the full grid is 25.6 MB a
+  // frame, which would make the instrument the page's wall time.
+  //
+  // ⚠ AND ON THE ENGINE PATH IT IS BUILT ONLY IF A RECEIPT ASKED FIRST. Stage
+  // 4.3a's lesson (`crops: 0`) is that a kernel only a receipt dispatches must
+  // only be BUILT by a receipt, or a prewarm that walks the pass list drags it
+  // into every boot. `gi2System` passes `crops: 0` and knows nothing about
+  // this one, so the switch is a global the probe sets BEFORE the GI build —
+  // `window.__gi2NoiseDump = true` — which keeps the decision at the receipt
+  // and out of the system's options.
+  const wantNoise = crops > 0 || globalThis.__gi2NoiseDump === true;
+  const noiseBuf = wantNoise
+    ? instancedArray(new Float32Array(
+      Math.ceil(width / 2) * Math.ceil(height / 2) * 4), "vec4") : null;
   /** `shadeHit` under a microscope — see `shadeProbePass`. Harness only. */
   const SHADE_SLOTS = 12;
   const shadeIn = instancedArray(new Float32Array(SHADE_SLOTS * 2 * 4), "vec4");
@@ -344,12 +493,33 @@ export function createGiGather({
     statsOn: uniform(1),
     roughness: uniform(0.35),
     f0: uniform(0.04),
+    // ⭐ AND IT STAYS 0.25 (§19 3.6), WHICH IS NOT WHAT THE STAGE EXPECTED.
+    //
+    // The cache face is a WORLD accumulator — the one place in this design
+    // that is not thrown away when the camera moves — and the pixel it is fed
+    // from used to carry the resolve's noise, so the plan was to lengthen its
+    // memory to α = 0.1. Measured at 1650×970 with everything else in place:
+    // 0.25 gives temporal p50/p95 0.50 % / 1.17 % and 0.1 gives 0.50 % / 1.18 %
+    // — the same number, because what was noisy about the injected pixel was
+    // the GLOSSY LOBE (see `injectPass`), and removing that from the injected
+    // colour is what fixed it. A longer memory is then pure lag on every world
+    // change, bought for nothing, so the shorter one ships. The receipt is
+    // `probe:gi2-gather`'s cache temporal σ at named voxel faces over 30
+    // frames (median 2.33 % → 0.51 %), not an argument about time constants.
     injectAlpha: uniform(0.25),
-    // §L.3's biased hysteresis, as a UNIFORM arm rather than a compiled-in
+    /** 1 restores Stage 3.5's "inject the whole composite" — see `injectPass`. */
+    injectGlossy: uniform(0),
+    /** 0 restores Stage 3.5's half-tile along-surface reprojection bound. */
+    reprojWide: uniform(1),
+    /** 1 restores §L.1's PER-FRAME anchor jitter — see `probePlace`. */
+    anchorJitter: uniform(0, "uint"),
+    // §L.3's biased hysteresis, as a UNIFORM MODE rather than a compiled-in
     // rule — the same discipline `hzbOn` follows. It is a claim about the
     // estimator ("a big change is a lighting change") that only a measurement
-    // can settle, and the measurement needs both arms out of one binary.
-    hystOn: uniform(1),
+    // can settle, and the measurement needs every arm out of one binary. See
+    // `HYST`: 0 off, 1 GI-1.0's, 2 variance-aware, 3 variance + distance,
+    // 4 (shipped) variance-aware and DECAYING.
+    hystOn: uniform(HYST.decay),
     // ⭐ THE OCT-MAP CARRY IS THE OTHER HALF OF `probePlace`, and it is the
     // only part of that kernel whose cost scales with the OCT MAP rather than
     // with the four candidate gbuffer reads §L.1 describes. A uniform arm so
@@ -622,8 +792,27 @@ export function createGiGather({
     const valid = float(0).toVar();
     Loop({ start: 0, end: 8, name: "cand" }, ({ cand }) => {
       If(valid.greaterThan(0.5), () => { Break(); });
-      const s = u.frame.mul(uint(4)).add(bitAnd(uint(cand), uint(3))).toVar();
-      const jx = radical2(bitAnd(s, uint(63))).toVar();
+      // ⭐⭐ THE ANCHOR STOPS MOVING WHEN THE CAMERA DOES (§19 Stage 3.6).
+      //
+      // §L.1's jitter re-picks the anchor's pixel INSIDE the tile every frame,
+      // and every consumer of the probe's world position then flickers with
+      // it: the resolve's plane weight `exp(−|N·(pa − P)|/2v₀)` and its normal
+      // weight are computed against an anchor that moved, so the four corner
+      // weights of a PARKED pixel change frame to frame even when every
+      // probe's oct map is perfectly settled. That is temporal noise the
+      // accumulator cannot touch, because it is not in the accumulator — and
+      // it is the reason a screen probe was never as quiet as the SRC path's
+      // world-anchored lattice.
+      //
+      // Multiplying the frame into the seed by a uniform makes it stop: at
+      // `anchorJitter = 0` the seed is `(cand, probe)` only, so a parked
+      // camera picks the SAME pixel every frame and a moving one still gets a
+      // fresh anchor because the tile covers a different world point. The
+      // jitter's real job — decorrelating neighbouring tiles so the grid does
+      // not print itself on the image — is done by the probe term, which is
+      // why the probe now seeds `jx` as well as `jy`.
+      const s = u.frame.mul(u.anchorJitter).mul(uint(4)).add(bitAnd(uint(cand), uint(3))).toVar();
+      const jx = radical2(bitAnd(s.add(probe.mul(uint(2654435761))), uint(63))).toVar();
       const jy = rand01(s.add(probe.mul(uint(9781)))).toVar();
       const px = min(tx.mul(uint(T)).add(jx.mul(T).toUint()), u.widthU.sub(uint(1))).toVar();
       const py = min(ty.mul(uint(T)).add(jy.mul(T).toUint()), u.heightU.sub(uint(1))).toVar();
@@ -645,7 +834,9 @@ export function createGiGather({
 
     // ── reprojection against last frame's probe grid (§L.3) ────────────────
     const prevProbe = float(-1).toVar();
+    const reprojFail = float(0).toVar();
     If(valid.greaterThan(0.5), () => {
+      reprojFail.assign(1); // off screen until proven otherwise
       const c = u.prevViewProj.mul(vec4(pos, 1)).toVar();
       If(c.w.greaterThan(1e-4), () => {
         const sx = c.x.div(c.w).mul(0.5).add(0.5).toVar();
@@ -675,25 +866,64 @@ export function createGiGather({
           // surface". ALONG the surface it is stretched by the slant, which is
           // the tile's real footprint there. Both terms are still derived from
           // the pixel size; nothing here is a metric constant.
+          //
+          // ⭐⭐ AND THE ALONG-SURFACE HALF WAS STILL HALF A TILE (§19 3.6).
+          //
+          // The jitter is free to put the anchor ANYWHERE in the tile, so two
+          // consecutive anchors on the SAME flat surface are up to a whole
+          // tile apart along it — `T · pixWorld / slant`. Gating that at HALF
+          // a tile refuses a probe that never left its own surface, on the
+          // sole evidence that the jitter happened to land in the far corner:
+          // measured 14 % of probes starting from nothing every frame with a
+          // camera that had not moved, which at H = 32 is 14 % of the screen
+          // permanently holding a 1-sample estimate. The along-surface bound
+          // is the tile's own diagonal (`√2 · T · pixWorld`, plus a cell of
+          // slack for the depth the anchor is read at); the ACROSS-surface
+          // bound is untouched, because that is the term that means "the same
+          // surface" and it is the one the box top needed tight.
           const pixWorld = depth.div(u.projScale).toVar();
           const tolN = float(0.5 * T).mul(pixWorld).max(v0).toVar();
+          // A uniform arm, not a rewrite: `reprojWide = 0` is Stage 3.5's
+          // along-surface bound exactly, so the receipts can measure the
+          // reprojection rate with and without the widening out of one binary.
+          const tolT = mix(tolN, float(Math.SQRT2 * T).mul(pixWorld).add(v0), u.reprojWide).toVar();
           const vdir = normalize(pos.sub(u.camPos)).toVar();
           const slant = dot(nrm, vdir).abs().max(0.05).toVar();
           const dlt = pos.sub(pa.xyz).toVar();
-          const near = dot(nrm, dlt).abs().lessThan(tolN)
-            .and(dlt.length().lessThan(tolN.div(slant)));
-          const align = dot(nrm, pb.xyz).greaterThan(0.9);
-          If(pa.w.greaterThan(0.5).and(near).and(align), () => {
+          const okPlane = dot(nrm, dlt).abs().lessThan(tolN).toVar();
+          const okSlant = dlt.length().lessThan(tolT.div(slant)).toVar();
+          const align = dot(nrm, pb.xyz).greaterThan(0.9).toVar();
+          const hasPrev = pa.w.greaterThan(0.5).toVar();
+          If(hasPrev.and(okPlane).and(okSlant).and(align), () => {
             prevProbe.assign(pi.toFloat());
+            reprojFail.assign(0);
             bump(STATS.reprojHits, tx);
+          }).Else(() => {
+            // ONE reason per probe, in the order the gates are argued: no
+            // previous probe at all, then the surface tests. A probe that
+            // fails two is counted under the first, so the five classes sum to
+            // `probesValid − reprojHits`.
+            reprojFail.assign(select(hasPrev.not(), float(2),
+              select(okPlane.not(), float(3), select(okSlant.not(), float(4), float(5)))));
           });
         });
       });
     });
 
+    // The census: a rate names no mechanism, so every miss says WHY. `bump`
+    // takes a COMPILE-TIME slot (it addresses a stripe), so the dispatch is
+    // five compares rather than one indexed add.
+    for (const [code, slot] of [
+      [1, STATS.reprojOffScreen], [2, STATS.reprojNoPrev], [3, STATS.reprojPlane],
+      [4, STATS.reprojSlant], [5, STATS.reprojAlign],
+    ]) {
+      If(reprojFail.greaterThan(code - 0.5).and(reprojFail.lessThan(code + 0.5)),
+        () => { bump(slot, tx); });
+    }
+
     probeMeta.element(metaIdx(u.curBase, probe, 0)).assign(vec4(pos, valid));
     probeMeta.element(metaIdx(u.curBase, probe, 1)).assign(vec4(nrm, depth));
-    probeMeta.element(metaIdx(u.curBase, probe, 2)).assign(vec4(prevProbe, 0, 0, 0));
+    probeMeta.element(metaIdx(u.curBase, probe, 2)).assign(vec4(prevProbe, reprojFail, 0, 0));
 
     // ── carry the oct map forward (§L.3) ───────────────────────────────────
     // Only R of the 64 texels are re-traced this frame; the other 56-59 are
@@ -1072,29 +1302,96 @@ export function createGiGather({
     });
 
     // ── §L.3 accumulation, in probe space ──────────────────────────────────
+    //
+    // ⭐⭐ ONE SAMPLE CANNOT EVIDENCE A CHANGE — AND STAGE 3.5 LET IT (§19 3.6).
+    //
+    // GI-1.0's rule was `|new − prev| > 0.5·max(new, prev) ⇒ α = 0.5`: a large
+    // radiance change drops most of the history at once instead of crawling
+    // toward the new value over H frames. The claim is right and the test is
+    // not. `lNew` is a SINGLE ray through a texel spanning 4π/64 sr; `lOld` is
+    // a mean of up to H of them. In a Cornell box a texel's radiance ranges
+    // over an order of magnitude INSIDE its own solid angle, so "differs by
+    // more than 50 %" is a description of the shot noise, not of a change —
+    // and it fired on 26 % of all rays on the live Bistro at rest, throwing
+    // away, a quarter of a million times a frame, the very history that was
+    // there to suppress that noise. It is the mechanism that turns a longer H
+    // into no improvement at all: the memory is reset faster than it builds.
+    //
+    // The test that CAN tell the two apart needs the texel's own spread. The
+    // repacked alpha (see `PACK_N`) carries it, updated as an exponential
+    // Welford beside the mean — `var ← (1−α)(var + α·δ²)` is the EMA form of
+    // the same recurrence and needs no second pass over the samples — and the
+    // rule becomes `|new − mean| > k·max(σ, ε·mean)`. Shot noise of any width
+    // is inside k = 4 of its own σ by construction; a lamp that moves is not.
+    //
+    // `hystOn` is a MODE (see `HYST`) rather than a switch so every arm — off,
+    // GI-1.0's, variance-aware, variance-and-distance — comes out of one
+    // binary and the receipts choose between them.
     const addr = octIdx(u.curBase, probe, texel.toUint()).toVar();
     const old = probeOct.element(addr).toVar();
-    const nPrev = old.w.div(1024).floor().toVar();
-    const alpha = float(1).div(min(nPrev.add(1), u.historyU)).toVar();
+    const packed = old.w.max(0).toVar();
+    const nPrev = packed.div(PACK_N).floor().toVar();
+    const rem = packed.sub(nPrev.mul(PACK_N)).toVar();
+    const distQ = rem.div(PACK_D).floor().toVar();
+    const sigQ = rem.sub(distQ.mul(PACK_D)).toVar();
+    const distPrev = distQ.mul(RAY_MAX / DIST_Q).toVar();
+    // σ_rel, out of the log field. `sigQ = 0` decodes to SIG_MIN, which is the
+    // "no spread measured yet" value and is below any ε floor.
+    const sigPrev = float(SIG_MIN).mul(exp2(sigQ.div(SIG_Q).mul(SIG_OCT))).toVar();
     const lNew = dot(rad, vec3(0.2126, 0.7152, 0.0722)).toVar();
     const lOld = dot(old.xyz, vec3(0.2126, 0.7152, 0.0722)).toVar();
-    // GI-1.0's biased hysteresis: a large radiance change drops most of the
-    // history at once rather than crawling toward the new value over H frames.
-    // ⚠ ONE SAMPLE CANNOT EVIDENCE A CHANGE. `lNew` is a SINGLE ray through a
-    // texel that spans 4π/64 sr; `lOld` is a mean of up to H of them. In a
-    // Cornell box a texel's radiance ranges over an order of magnitude inside
-    // its own solid angle, so "differs by more than 50 %" is the NOISE, not a
-    // change — and forcing α = 0.5 on it discards the history that was
-    // suppressing exactly that noise. Kept behind a uniform so the wall's
-    // mottling can be measured with it and without it.
-    const big = u.hystOn.greaterThan(0.5).and(nPrev.greaterThan(0.5))
+    bump(STATS.texelsSeen, xr);
+    If(nPrev.greaterThanEqual(u.historyU.toFloat().mul(0.5)), () => { bump(STATS.matureTexels, xr); });
+
+    const mode = u.hystOn.toVar();
+    const mature = nPrev.greaterThanEqual(float(HYST_MIN_N)).toVar();
+    const sigAbs = sigPrev.mul(lOld.abs()).toVar();
+    const band = max(sigAbs, lOld.abs().mul(HYST_EPS_REL)).max(1e-6).toVar();
+    const surprised = lNew.sub(lOld).abs().greaterThan(band.mul(HYST_K)).toVar();
+    // "The geometry under this texel moved": the hit distance changed by more
+    // than a level-0 cell. In CELLS, never in metres — the scene's own length.
+    const moved = distPrev.sub(min(hitDist, float(RAY_MAX))).abs().greaterThan(v0).toVar();
+    const legacy = mode.greaterThan(0.5).and(mode.lessThan(1.5))
+      .and(nPrev.greaterThan(0.5))
       .and(lNew.sub(lOld).abs().greaterThan(max(lNew, lOld).mul(0.5))).toVar();
+    const distArm = mode.greaterThan(2.5).and(mode.lessThan(3.5)).toVar();
+    const varArm = mode.greaterThan(1.5).and(mature).and(surprised)
+      .and(distArm.not().or(moved)).toVar();
+    const big = legacy.or(varArm).toVar();
     If(big, () => { bump(STATS.alphaForced, xr); });
-    const a = select(big, float(0.5), alpha).toVar();
-    const nNext = min(nPrev.add(1), u.historyU).toVar();
+    // A RESET, OR A SHORTENING — see `HYST`. Modes 2 and 3 restart the
+    // estimator (`n ← 1`, α = 1: the texel takes this sample whole and
+    // re-converges in a handful of frames). Mode 4 divides `n` instead, which
+    // makes an isolated false surprise a 4× step rather than a 32× one and
+    // still collapses the memory under sustained evidence. The legacy arm
+    // keeps GI-1.0's 0.5 exactly.
+    const soft = mode.greaterThan(3.5).toVar();
+    const nCut = max(nPrev.div(HYST_DECAY).floor(), float(1)).toVar();
+    const nUse = select(big.and(legacy.not()),
+      select(soft, nCut, float(0)), nPrev).toVar();
+    const a = select(legacy, float(0.5),
+      float(1).div(min(nUse.add(1), u.historyU))).toVar();
+    const nNext = select(big.and(legacy.not()),
+      nUse.add(1), min(nPrev.add(1), u.historyU)).toVar();
+    const mNew = mix(lOld, lNew, a).toVar();
+    const d0 = lNew.sub(lOld).toVar();
+    // The exponential Welford. On a reset the spread is re-seeded from the
+    // sample that caused it rather than zeroed: a σ of zero would make the
+    // NEXT sample surprising too, and the estimator would ring.
+    const varPrev = sigAbs.mul(sigAbs).toVar();
+    const hardReset = big.and(legacy.not()).and(soft.not()).toVar();
+    const varNext = select(hardReset,
+      d0.mul(d0).mul(0.25),
+      float(1).sub(a).mul(varPrev.add(a.mul(d0).mul(d0)))).toVar();
+    const sigRelNext = sqrt(varNext).div(max(mNew.abs(), 1e-6))
+      .clamp(SIG_MIN, SIG_MIN * Math.pow(2, SIG_OCT)).toVar();
+    const sigQNext = log2(sigRelNext.div(SIG_MIN)).div(SIG_OCT).mul(SIG_Q)
+      .add(0.5).floor().clamp(0, SIG_Q).toVar();
+    const distQNext = min(hitDist, float(RAY_MAX)).mul(DIST_Q / RAY_MAX)
+      .add(0.5).floor().clamp(0, DIST_Q).toVar();
     probeOct.element(addr).assign(vec4(
       mix(old.xyz, rad, a),
-      nNext.mul(1024).add(min(hitDist, float(1023))),
+      nNext.mul(PACK_N).add(distQNext.mul(PACK_D)).add(sigQNext),
     ));
   })().compute(dispatch2d(probeW * R, probeH), WG);
 
@@ -1139,9 +1436,9 @@ export function createGiGather({
       const tv = probeOct.element(octIdx(u.curBase, probe, t)).toVar();
       // §L.4: a texel nothing has sampled (n = 0) is a HOLE, not a black
       // sample — that is the difference between a filter and a fade. It is
-      // marked with a negative alpha, a value the real alpha (n·1024 +
-      // distance) can never take.
-      const has = tv.w.greaterThanEqual(1024).and(alive).toVar();
+      // marked with a negative alpha, a value the real alpha (see `PACK_N`)
+      // can never take.
+      const has = tv.w.greaterThanEqual(PACK_N).and(alive).toVar();
       const val = select(has, tv.xyz, vec3(0)).toVar();
       probeFiltered.element(filtIdx(probe, t)).assign(vec4(
         val, select(has, tv.w, float(-1)),
@@ -1214,13 +1511,29 @@ export function createGiGather({
 
   // ══════════════════════════════════════ SHADER: probeFilter, part 2 (§L.4)
   //
-  // §L.4's 3×3 probe-space bilateral, on the NINE COEFFICIENTS. The weights
-  // are the same ones the texel form used — plane distance in units of a
-  // level-0 cell (the scene's own length, never a metric constant) and normal
+  // §L.4's probe-space bilateral, on the NINE COEFFICIENTS. The weights are
+  // the same ones the texel form used — plane distance in units of a level-0
+  // cell (the scene's own length, never a metric constant) and normal
   // agreement raised to the fourth so a probe round a corner contributes
   // nothing — and they were already per-probe, so nothing about the filter's
   // shape changes; only what it is applied to.
-  const probeShFilterPass = Fn(() => {
+  //
+  // ⭐ THE RADIUS IS 2 (A 5×5) SINCE §19 STAGE 3.6, AND WIDTH IS THE CHEAP AXIS.
+  //
+  // §L.4 wrote 3×3 when the filter still ran over 64 OCT TEXELS: 576 buffer
+  // reads per probe, and widening it to 5×5 would have been 1600. Since 3.3
+  // the same filter runs on NINE COEFFICIENTS, so 3×3 is 81 reads and 5×5 is
+  // 225 — and the kernel it lives in was 0.05 ms of a 2.6 ms chain. Variance
+  // falls with the number of INDEPENDENT probes pooled, and at tile 8 a 5×5
+  // neighbourhood is 25 probes each of which traced its own directions from
+  // its own anchor: the same trade the AO rebuild found (`gi-vxao-rebuild`),
+  // which is that filter taps buy variance reduction about ten times cheaper
+  // than rays do. The plane and normal weights are what keep the extra reach
+  // from being a blur — a tap that is not on this surface is multiplied by
+  // zero whether it is one probe away or two.
+  //
+  // Both radii are built; `passes.probeShFilter3` is the A/B's other arm.
+  const makeShFilter = (radius) => Fn(() => {
     const tx = globalId.x.toVar();
     const ty = globalId.y.toVar();
     If(tx.greaterThanEqual(u.probeWU).or(ty.greaterThanEqual(u.probeHU)), () => { Return(); });
@@ -1235,8 +1548,8 @@ export function createGiGather({
     const wsum = float(0).toVar();
     // Unrolled in JS so the neighbour offsets are compile-time and no runtime
     // `%` is needed.
-    for (let oy = -1; oy <= 1; oy++) {
-      for (let ox = -1; ox <= 1; ox++) {
+    for (let oy = -radius; oy <= radius; oy++) {
+      for (let ox = -radius; ox <= radius; ox++) {
         const nx = tx.toInt().add(int(ox)).toVar();
         const ny = ty.toInt().add(int(oy)).toVar();
         const inB = nx.greaterThanEqual(int(0)).and(ny.greaterThanEqual(int(0)))
@@ -1247,9 +1560,14 @@ export function createGiGather({
         const nn = probeMeta.element(metaIdx(u.curBase, np, 1)).toVar();
         const wp = exp(dot(nrm, na.xyz.sub(pos)).abs().div(v0).negate()).toVar();
         const wn = dot(nrm, nn.xyz).max(0).toVar();
+        // ⚠ A SPATIAL TERM, NOT A BOX. At radius 2 the corner tap is 2.8
+        // probes away and a flat weight would let it count as much as the
+        // probe next door — that IS a blur. A Gaussian over the probe grid
+        // (σ = one probe) is the tent the 3×3 was implicitly close to.
+        const g = Math.exp(-(ox * ox + oy * oy) / 2);
         const w = select(
           inB.and(na.w.greaterThan(0.5)).and(ma.w.greaterThan(0.5)),
-          wp.mul(wn.mul(wn).mul(wn).mul(wn)), float(0),
+          wp.mul(wn.mul(wn).mul(wn).mul(wn)).mul(g), float(0),
         ).toVar();
         If(w.greaterThan(1e-5), () => {
           for (let i = 0; i < 9; i++) {
@@ -1264,6 +1582,8 @@ export function createGiGather({
       probeSh.element(shIdx(probe, i)).assign(vec4(acc[i].mul(inv), 0));
     }
   })().compute(dispatch2d(probeW, probeH), WG);
+  const probeShFilterPass = makeShFilter(SH_R);
+  const probeShFilter3Pass = makeShFilter(1);
 
   // ══════════════════════════════════════════════ SHADER: resolve (§L.5)
   //
@@ -1651,7 +1971,33 @@ export function createGiGather({
         select(ay.greaterThanEqual(az),
           select(Nn.y.lessThan(0), float(3), float(2)),
           select(Nn.z.lessThan(0), float(5), float(4)))).toVar();
-      const c = litNode.load(ivec2(px.toInt(), py.toInt())).xyz.toVar();
+      // ⭐ WHAT GOES INTO THE CACHE IS THE **DIFFUSE** LIT COLOUR (§19 3.6).
+      //
+      // §L.6 says "write the lit pixel", and Stage 3.5 wrote the composite —
+      // which is `albedo/π · E + f0 · glossy + emissive`. The glossy term is
+      // a FOUR-TEXEL BILINEAR TAP of the probe's own oct map: the one signal
+      // in the chain that no filter has touched, view-dependent by
+      // construction, and the noisiest thing the frame produces. Feeding it
+      // into a cache whose whole contract is "the radiance leaving this face,
+      // seen from anywhere" is both wrong (a face does not leave a specular
+      // lobe in every direction) and a noise pump — the cache's EMA then
+      // hands that noise back to `probeTrace`, which is a closed loop.
+      //
+      // So the injection takes the FILTERED irradiance and the emission and
+      // leaves the lobe out. `injectGlossy` restores the old sum as the A/B's
+      // other arm; the receipt is the cache's own temporal σ at a fixed face.
+      //
+      // ⚠ BY SUBTRACTION, NOT BY RE-DERIVATION. The first cut rebuilt the
+      // diffuse term from `palAtWorld × irradiance`, which walks the window's
+      // level chain a second time — measured at 1650×970 it took the whole
+      // kernel from 0.187 ms to 0.555. `composite` writes exactly
+      // `albedo/π·E + f0·glossy + emissive`, so the term to remove is one
+      // texture load and a multiply, and the two forms are the same number by
+      // construction rather than by two expressions agreeing.
+      const coord = ivec2(px.toInt(), py.toInt());
+      const litc = litNode.load(coord).xyz.toVar();
+      const diffuse = litc.sub(glossyNode.load(coord).xyz.mul(u.f0)).max(vec3(0)).toVar();
+      const c = mix(diffuse, litc, u.injectGlossy).toVar();
       // EVERY level that contains this point, not just level 0. A ray reads
       // the cache at whatever level IT hit on, and the trace hands off to
       // coarser levels the moment it leaves the finest window — so a face fed
@@ -1684,7 +2030,7 @@ export function createGiGather({
   // averaged and written to a readable buffer. The CPU reference then path-
   // traces the SAME world point with the SAME normal, so the comparison is
   // irradiance against irradiance and not two differently-scaled composites.
-  const cropPass = Fn(() => {
+  const cropPass = crops <= 0 ? null : Fn(() => {
     const i = instanceIndex.toVar();
     const q = cropIn.element(i).toVar();
     const cx = q.x.toInt().toVar();
@@ -1736,6 +2082,48 @@ export function createGiGather({
     cropOut.element(base.add(uint(4))).assign(vec4(accL.mul(k), 0));
     cropOut.element(base.add(uint(5))).assign(vec4(accA.mul(k), accEm.mul(k)));
   })().compute(crops);
+
+  // ══════════════════════════════════════════════ SHADER: noiseDump (§19 3.6)
+  //
+  // One vec4 per pixel: (luminance of the resolved irradiance, the same
+  // through a 5×5 BOX, an edge flag, the gbuffer's validity). The CPU makes
+  // both of §3.6's receipts out of it — TEMPORAL by accumulating `x` over 30
+  // frames per pixel, SPATIAL from `|x − y| / y` in one frame — and neither
+  // is computable after the fact from a crop or from the lit buffer.
+  //
+  // ⚠ THE BOX IS A PLAIN BOX AND THE EDGE FLAG IS SEPARATE, deliberately. A
+  // bilateral box would hide exactly the failure the receipt exists to find:
+  // a blotch that follows a surface's own plane is invisible to a filter that
+  // trusts the plane. The neighbourhood test only MARKS the pixel, and the
+  // statistic drops it; what the surviving pixels are compared against is the
+  // unweighted mean of their 25 neighbours.
+  const noiseDumpPass = !wantNoise ? null : Fn(() => {
+    const gx = globalId.x.toVar();
+    const gy = globalId.y.toVar();
+    If(gx.greaterThanEqual(u.halfWU).or(gy.greaterThanEqual(u.halfHU)), () => { Return(); });
+    const px = gx.mul(uint(2)).toVar();
+    const py = gy.mul(uint(2)).toVar();
+    const g = loadPos(px.toInt(), py.toInt()).toVar();
+    const n0 = normalize(loadNrm(px.toInt(), py.toInt()).xyz).toVar();
+    const LUMA = vec3(0.2126, 0.7152, 0.0722);
+    const box = float(0).toVar();
+    const edge = float(0).toVar();
+    for (let oy = -2; oy <= 2; oy++) {
+      for (let ox = -2; ox <= 2; ox++) {
+        const qx = px.toInt().add(int(ox)).clamp(int(0), u.widthU.toInt().sub(int(1))).toVar();
+        const qy = py.toInt().add(int(oy)).clamp(int(0), u.heightU.toInt().sub(int(1))).toVar();
+        const gg = loadPos(qx, qy).toVar();
+        const nn = normalize(loadNrm(qx, qy).xyz).toVar();
+        const same = gg.w.greaterThan(0.5).and(g.w.greaterThan(0.5))
+          .and(dot(nn, n0).greaterThan(0.95))
+          .and(dot(n0, gg.xyz.sub(g.xyz)).abs().lessThan(v0 * 0.5)).toVar();
+        box.addAssign(dot(irrNode.load(ivec2(qx, qy)).xyz, LUMA));
+        If(same.not(), () => { edge.assign(1); });
+      }
+    }
+    const here = dot(irrNode.load(ivec2(px.toInt(), py.toInt())).xyz, LUMA).toVar();
+    noiseBuf.element(gy.mul(u.halfWU).add(gx)).assign(vec4(here, box.div(25), edge, g.w));
+  })().compute(dispatch2d(halfW, halfH), WG);
 
   // ══════════════════════════════════════════════ SHADER: shadeHit, exposed
   //
@@ -1892,6 +2280,8 @@ export function createGiGather({
 
   const describe = () => ({
     tier, tile: T, rays: R, oct: O, history: H, stride: STRIDE, sh: USE_SH,
+    shRadius: SH_R, packN: PACK_N, packD: PACK_D, distQ: DIST_Q, sigQ: SIG_Q,
+    sigMin: SIG_MIN, sigOct: SIG_OCT, rayMax: RAY_MAX,
     width, height, halfW, halfH, probeW, probeH, probeCount,
     hzbMips: HZB_MIPS, hzbSteps: S_MAX, cropBlock: CROP_HALF * 2 + 1,
     bytes: {
@@ -1906,11 +2296,11 @@ export function createGiGather({
   });
 
   return {
-    tier, T, R, O, H, STRIDE, USE_SH, probeW, probeH, probeCount, width, height,
+    tier, T, R, O, H, SH_R, STRIDE, USE_SH, probeW, probeH, probeCount, width, height,
     uniforms: u, palette, setPalette, beginFrame, get frame() { return frame; },
     buffers: {
       probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf,
-      shadeIn, shadeOut, exhaustOut,
+      shadeIn, shadeOut, exhaustOut, noiseBuf,
     },
     SHADE_SLOTS, EXHAUST_SLOTS, EXH_VEC,
     textures: { irradiance, glossy, lit, irradianceHalf, glossyHalf },
@@ -1921,6 +2311,8 @@ export function createGiGather({
       probeTrace: probeTracePass,
       probeFilter: probeFilterPass,
       probeShFilter: probeShFilterPass,
+      /** §L.4's OLD radius, kept as the width A/B's other arm. */
+      probeShFilter3: probeShFilter3Pass,
       resolve: resolvePass,
       resolveOct: resolveOctPass,
       resolveShRaw: resolveShRawPass,
@@ -1934,6 +2326,7 @@ export function createGiGather({
       composite: compositePass,
       inject: injectPass,
       crop: cropPass,
+      noiseDump: noiseDumpPass,
       shadeProbe: shadeProbePass,
       exhaustProbe: exhaustProbePass,
       clearProbes: clearProbesPass,

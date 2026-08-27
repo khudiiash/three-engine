@@ -200,6 +200,17 @@ await page.evaluateOnNewDocument(pageHook);
 await page.evaluateOnNewDocument((flags) => {
   for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
 }, JSON.parse(process.env.FLAGS ?? "{}"));
+// ⭐ §19 STAGE 3.6 — ASK FOR THE NOISE KERNEL BEFORE THE GI BUILD.
+//
+// "GI is noisy" is a report about the resolved IRRADIANCE TEXTURE, and no
+// counter in `profile.gi2` can see a texture. `gatherProbes` builds a per-pixel
+// dump kernel only when a receipt asked for it first (Stage 4.3a's rule: a
+// kernel only a receipt dispatches must only be BUILT by a receipt), and this
+// is that asking. Set before the document runs, so it is set before the gather
+// factory reads it. `NOISE=0` leaves it out.
+if (process.env.NOISE !== "0") {
+  await page.evaluateOnNewDocument(() => { globalThis.__gi2NoiseDump = true; });
+}
 await page.evaluateOnNewDocument((project) => {
   // Headless is never focused, and the editor suspends an unfocused viewport —
   // without this every frame number is a lie and GI never ticks at all.
@@ -482,6 +493,124 @@ for (const name of SCENES) {
     console.log(`  rays: ${gi2.windowHits ?? 0} window / ${gi2.screenHits ?? 0} screen / ${gi2.skyMiss ?? 0} sky ` +
       `of ${gi2.raysTraced ?? 0} traced; ${gi2.probesValid ?? 0} of ${gi2.probesPlaced ?? 0} probes valid; ` +
       `${gi2.freshShades ?? 0} fresh shades, ${gi2.reprojHits ?? 0} reprojections`);
+    // ── §19 STAGE 3.6's three counters, as RATES ─────────────────────────
+    //
+    // ⭐ THE RAW NUMBERS DO NOT COMPARE ACROSS SCENES. "105 977 resets" means
+    // one thing on a 25 254-probe Bistro and another on the Level; the rate
+    // against the rays actually traced is the same quantity everywhere, and it
+    // is the one the user's report quoted (26 %). The reprojection census
+    // turns the miss rate into a MECHANISM — five gates, summing to the misses
+    // by construction.
+    {
+      const rt = Math.max(1, gi2.raysTraced ?? 0);
+      const pv = Math.max(1, gi2.probesValid ?? 0);
+      const miss = (gi2.probesValid ?? 0) - (gi2.reprojHits ?? 0);
+      const cls = {
+        offScreen: gi2.reprojOffScreen ?? 0, noPrev: gi2.reprojNoPrev ?? 0,
+        plane: gi2.reprojPlane ?? 0, slant: gi2.reprojSlant ?? 0, align: gi2.reprojAlign ?? 0,
+      };
+      const sum = Object.values(cls).reduce((a, x) => a + x, 0);
+      console.log(`  §3.6: history resets ${gi2.alphaForced ?? 0}/${rt} = ` +
+        `${(100 * (gi2.alphaForced ?? 0) / rt).toFixed(2)} % of traced rays; texel maturity ` +
+        `${(100 * (gi2.matureTexels ?? 0) / rt).toFixed(1)} % (n ≥ H/2); reprojection ` +
+        `${(100 * (gi2.reprojHits ?? 0) / pv).toFixed(2)} %`);
+      console.log(`  §3.6 reprojection census: ${miss} misses — ` +
+        Object.entries(cls).map(([k, v]) => `${k} ${v}`).join(", ") +
+        ` (sum ${sum}${sum === miss ? "" : ` ≠ ${miss} — THE CENSUS IS BLIND`})`);
+    }
+    // ── §19 STAGE 3.6's NOISE RECEIPT, on the real scene ─────────────────
+    //
+    // Thirty consecutive frames of the resolved irradiance, reduced IN THE
+    // PAGE — 30 × 6.4 MB across the CDP bridge would be most of this probe's
+    // wall time, and the reduction is two histograms.
+    const noise = await page.evaluate(async () => {
+      // The same accessor the crop-ownership gate below uses — the engine has
+      // no global of its own, and importing `engineInstance.js` from here
+      // would risk Vite's `?t=` twin and a SECOND Engine.
+      const eng = globalThis.__giEngineForProbe ?? null;
+      const g = eng?.modules?.get?.("gi")?.system?._gi2?.gather;
+      const r = eng?.renderer;
+      if (!g?.passes?.noiseDump || !g.buffers?.noiseBuf || !r) {
+        return { error: "the noise kernel was not built (set __gi2NoiseDump before the GI build)" };
+      }
+      const BINS = 2048; const LO = 1e-5; const HI = 100; const K = Math.log(HI / LO);
+      const mk = () => ({ b: new Float64Array(BINS), n: 0 });
+      const add = (h, v) => {
+        const t = Math.log(Math.min(HI, Math.max(LO, v)) / LO) / K;
+        h.b[Math.min(BINS - 1, Math.max(0, Math.floor(t * BINS)))]++; h.n++;
+      };
+      const pct = (h, p) => {
+        if (!h.n) return null;
+        let c = 0;
+        for (let i = 0; i < BINS; i++) { c += h.b[i]; if (c >= (h.n * p) / 100) return LO * Math.exp(K * ((i + 0.5) / BINS)); }
+        return HI;
+      };
+      const N = g.buffers.noiseBuf.value.array.length / 4;
+      const sum = new Float64Array(N); const sq = new Float64Array(N); const cnt = new Uint16Array(N);
+      const spat = [];
+      let lit = null;
+      const FRAMES = 30;
+      // ⚠ WARM THE KERNEL FIRST. The first `computeAsync` of a pass that has
+      // never run pays its pipeline creation, and the readback that follows it
+      // came back ALL ZEROES — which the statistic then read as "no lit
+      // pixels", every pixel failed `cnt == FRAMES`, and the temporal receipt
+      // reported n/a on a scene that was plainly lit. An instrument's first
+      // sample is not a sample.
+      for (let k = 0; k < 3; k++) {
+        await new Promise((res) => requestAnimationFrame(() => res()));
+        await r.computeAsync(g.passes.noiseDump);
+      }
+      for (let k = 0; k < FRAMES; k++) {
+        await new Promise((res) => requestAnimationFrame(() => res()));
+        await r.computeAsync(g.passes.noiseDump);
+        const f = new Float32Array(await r.getArrayBufferAsync(g.buffers.noiseBuf.value));
+        if (lit == null) {
+          const h = mk();
+          for (let i = 0; i < N; i++) if (f[i * 4 + 3] > 0.5) add(h, f[i * 4 + 1]);
+          // A scene-derived threshold, and it must come from a frame that HAS
+          // a scene: a zero median would admit every black pixel.
+          if (h.n > 0 && (pct(h, 50) ?? 0) > 0) lit = 0.1 * pct(h, 50);
+          else continue;
+        }
+        const hp = mk();
+        for (let i = 0; i < N; i++) {
+          if (!(f[i * 4 + 3] > 0.5)) continue;
+          const L = f[i * 4]; const B = f[i * 4 + 1];
+          if (!(B > lit)) continue;
+          sum[i] += L; sq[i] += L * L; cnt[i]++;
+          if (f[i * 4 + 2] < 0.5) add(hp, Math.abs(L - B) / B);
+        }
+        spat.push([pct(hp, 50), pct(hp, 95), hp.n]);
+      }
+      const th = mk();
+      // A pixel counts if it was lit in essentially every frame — not in ALL
+      // of them, so one frame in which the lit threshold clipped a flickering
+      // pixel does not delete it from the population.
+      const need = Math.max(2, spat.length - 2);
+      for (let i = 0; i < N; i++) {
+        if (cnt[i] < need) continue;
+        const m = sum[i] / cnt[i];
+        if (!(m > 0)) continue;
+        add(th, Math.sqrt(Math.max(0, sq[i] / cnt[i] - m * m)) / m);
+      }
+      const med = (xs) => {
+        const v = xs.filter((x) => x != null).sort((a, b) => a - b);
+        return v.length ? v[Math.floor(v.length / 2)] : null;
+      };
+      return {
+        pixels: N, frames: spat.length, litThreshold: lit,
+        temporal: { p50: pct(th, 50), p95: pct(th, 95), n: th.n },
+        spatial: { p50: med(spat.map((s) => s[0])), p95: med(spat.map((s) => s[1])), n: med(spat.map((s) => s[2])) },
+      };
+    });
+    if (noise?.error) console.log(`  §3.6 noise: ${noise.error}`);
+    else if (noise) {
+      const p = (v) => (v == null ? "n/a" : `${(100 * v).toFixed(2)} %`);
+      console.log(`  §3.6 noise (resolved irradiance, camera parked, ${noise.frames} frames, ` +
+        `${noise.pixels} sampled pixels): TEMPORAL p50 ${p(noise.temporal.p50)} p95 ${p(noise.temporal.p95)} ` +
+        `over ${noise.temporal.n} lit px | SPATIAL p50 ${p(noise.spatial.p50)} p95 ${p(noise.spatial.p95)} ` +
+        `over ${noise.spatial.n} lit non-edge px`);
+    }
     if (gi2.voxelizer) {
       const v = gi2.voxelizer;
       console.log(`  voxelizer: ${v.built} built / ${v.dirty} dirty, ${v.pairsWritten} of ${v.pairsNeeded} pairs, ` +

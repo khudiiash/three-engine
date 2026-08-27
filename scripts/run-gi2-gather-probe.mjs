@@ -211,7 +211,11 @@ for (const tier of tiers) {
   const target = `${url}${url.includes("?") ? "&" : "?"}tier=${encodeURIComponent(tier)}`;
   try {
     await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForFunction("globalThis.__GI2_GATHER_RESULT__ !== undefined", { timeout: 900000 });
+    // §19 Stage 3.6 added ~1 000 frames of arms (six cumulative levers, the
+    // panel-move re-convergence, the motion window and the cache σ) on top of
+    // Stage 3.5's page, and at 1650×970 that is well past fifteen minutes on a
+    // GPU this machine shares with another agent's probes.
+    await page.waitForFunction("globalThis.__GI2_GATHER_RESULT__ !== undefined", { timeout: 5400000 });
     const r = await page.evaluate("globalThis.__GI2_GATHER_RESULT__");
     console.log(`── ${tier} ${"─".repeat(Math.max(0, 62 - tier.length))}`);
     if (r?.text) console.log(r.text.split("\n").map((l) => `  ${l}`).join("\n"));
@@ -394,6 +398,11 @@ for (const tier of tiers) {
       exhausted: r.exhausted,
       texelDump: r.texelDumpReport,
       mottlingArms: r.mottlingArms,
+      levers: r.levers,
+      panelMove: r.panelMove,
+      motionNoise: r.motionNoise,
+      cacheSigma: r.cacheSigma,
+      reprojCensus: r.reprojCensus,
       kernels: r.kernels,
       gatherMs: r.gatherMs,
       chainMs: r.chainMs ?? r.gatherMs,
@@ -429,6 +438,65 @@ if (table.length) {
       `${mo.padStart(22)}   ${rp.padStart(7)}   ${(t.gatherMs ?? 0).toFixed(3).padStart(9)}`,
     );
   }
+  // ── §19 Stage 3.6: the noise, lever by lever ─────────────────────────────
+  //
+  // ⭐ THE ARMS ARE CUMULATIVE AND THE TABLE IS READ DOWNWARD. A lever that
+  // does nothing is two rows that do not differ; a lever that undoes an
+  // earlier one is a row that goes backwards. The two noise columns are
+  // INDEPENDENT axes — a change that trades one for the other (a wider filter
+  // buying spatial quiet with temporal lag, say) shows as one falling while
+  // the other rises, which no single "noise" number could report.
+  const pc = (v) => (v == null ? "    n/a" : `${(100 * v).toFixed(2)} %`.padStart(7));
+  for (const t of table) {
+    if (!t.levers?.length) continue;
+    console.log("");
+    console.log(`§19 STAGE 3.6 — NOISE, LEVER BY LEVER (${t.tier}, at rest, 30 frames per arm)`);
+    console.log("arm                       temporal p50/p95   spatial p50/p95    reset%   reproj%  mature%  conv 50/90");
+    for (const L of t.levers) {
+      console.log(
+        `${L.label.padEnd(24)}  ${pc(L.noise.temporal.p50)}/${pc(L.noise.temporal.p95)}  ` +
+        `${pc(L.noise.spatial.p50)}/${pc(L.noise.spatial.p95)}  ` +
+        `${L.alphaForcedPct.toFixed(2).padStart(7)}  ${L.reprojPct.toFixed(2).padStart(7)}  ` +
+        `${L.maturePct.toFixed(1).padStart(6)}   ` +
+        `${String(L.converge?.f50 ?? "—").padStart(3)}/${String(L.converge?.f90 ?? "—").padStart(3)}`,
+      );
+    }
+    const probeRows = t.levers.filter((L) => L.noise.shTemporal.n > 0);
+    if (probeRows.length) {
+      console.log("  probe SH DC (probe space, the same two axes):");
+      for (const L of probeRows) {
+        console.log(`    ${L.label.padEnd(22)} temporal ${pc(L.noise.shTemporal.p50)}/${pc(L.noise.shTemporal.p95)}  ` +
+          `spatial ${pc(L.noise.shSpatial.p50)}/${pc(L.noise.shSpatial.p95)}`);
+      }
+    }
+    console.log("  reprojection census, per arm (why a probe did NOT carry its history):");
+    for (const L of t.levers) {
+      console.log(`    ${L.label.padEnd(22)} ` + Object.entries(L.census)
+        .map(([k, v]) => `${k} ${String(v).padStart(6)}`).join("  "));
+    }
+    if (t.panelMove) {
+      console.log("  THE WORLD CHANGES — the emissive panel jumps 2 m:");
+      for (const arm of [t.panelMove.shipped, t.panelMove.h8, t.panelMove.baseline]) {
+        if (!arm) continue;
+        console.log(`    ${arm.label.padEnd(20)} worst crop covers 90 % of the change in ` +
+          `${arm.worstFrame ?? "never"} frames (locks at ${arm.worstLock ?? "never"}); mean fraction done ` +
+          Object.entries(arm.done ?? {}).map(([i, v]) => `@${i} ${v == null ? "—" : `${(100 * v).toFixed(0)} %`}`).join(" "));
+      }
+    }
+    if (t.motionNoise) {
+      const m = t.motionNoise;
+      console.log(`  UNDER MOTION: orbit temporal ${pc(m.orbit.temporal.p50)}/${pc(m.orbit.temporal.p95)} ` +
+        `spatial ${pc(m.orbit.spatial.p50)}/${pc(m.orbit.spatial.p95)} (reproj ${m.reprojDuringOrbit.toFixed(1)} %); ` +
+        `recovery after stopping — ` + (m.recovery ?? [m.after10]).map((r) => `+${r.at ?? 10} fr ` +
+          `${pc(r.temporal.p50)}/${pc(r.temporal.p95)} temporal ${pc(r.spatial.p95)} spatial`).join("; "));
+    }
+    if (t.cacheSigma) {
+      const cs = t.cacheSigma;
+      console.log(`  CACHE σ/mean at named faces over 30 frames: shipped median ${pc(cs.shipped?.median)} ` +
+        `worst ${pc(cs.shipped?.worst)}; baseline median ${pc(cs.baseline?.median)} worst ${pc(cs.baseline?.worst)}`);
+    }
+  }
+
   console.log("");
   console.log("PER-KERNEL COST (ms at the page's resolve resolution, statsOn = 0)");
   const names = [...new Set(table.flatMap((t) => t.kernels.map((k) => k.name)))];
@@ -487,6 +555,27 @@ if (table.length) {
       g.push(["half-res resolve, worst ≤ 5 %", Math.abs(w.ratio - 1) * 100, (v) => v <= 5]);
     }
     if (t.exhausted) g.push(["exhausted rays, sealed room", t.exhausted.pct, (v) => v <= 0.5]);
+    // ── §19 Stage 3.6's gates, scored on the SHIPPED arm (the last cumulative
+    // lever), never on the arms that only exist to be compared against it.
+    if (t.levers?.length) {
+      // The SHIPPED arm is the last CUMULATIVE row — the rows whose label
+      // starts with "·" are the alternatives each choice was measured against
+      // and scoring a gate on one of those would score a thing we did not ship.
+      const cumRows = t.levers.filter((L) => !L.label.startsWith("·"));
+      const ship = cumRows.at(-1) ?? t.levers.at(-1);
+      g.push(["noise: temporal p95 ≤ 1 %", 100 * (ship.noise.temporal.p95 ?? 9), (v) => v <= 1]);
+      g.push(["noise: spatial p95 ≤ 3 %", 100 * (ship.noise.spatial.p95 ?? 9), (v) => v <= 3]);
+      g.push(["history resets at rest ≤ 0.5 %", ship.alphaForcedPct, (v) => v <= 0.5]);
+      g.push(["reprojection at rest ≥ 99 %", ship.reprojPct, (v) => v >= 99]);
+      g.push(["probe accumulator 90 % ≤ 60 fr", ship.converge?.f90 ?? 999, (v) => v <= 60]);
+    }
+    if (t.panelMove?.shipped) {
+      g.push(["panel move re-converges ≤ 30 fr", t.panelMove.shipped.worstFrame ?? 999, (v) => v <= 30]);
+    }
+    if (t.motionNoise) {
+      g.push(["10 fr after stop: temporal ≤ 1 %", 100 * (t.motionNoise.after10.temporal.p95 ?? 9), (v) => v <= 1]);
+      g.push(["10 fr after stop: spatial ≤ 3 %", 100 * (t.motionNoise.after10.spatial.p95 ?? 9), (v) => v <= 3]);
+    }
     if (t.resolveAB) {
       const w = t.resolveAB.filter((x) => !x.diag && x.oct > 1e-3)
         .reduce((a, x) => (Math.abs(x.ratio - 1) > Math.abs(a.ratio - 1) ? x : a));

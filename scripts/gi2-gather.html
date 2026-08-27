@@ -46,8 +46,13 @@
         const TIER = params.get("tier") ?? "high";
         const W = Number(params.get("w") ?? 960);
         const Hh = Number(params.get("h") ?? 540);
-        const FRAMES = Number(params.get("frames") ?? 160);
-        const COLD_FRAMES = Number(params.get("cold") ?? 48);
+        // ⚠ THE CONVERGENCE BUDGET FOLLOWS H (§19 3.6). A probe traces 16 of
+        // its 64 directions per frame, so a TEXEL is sampled once every four
+        // frames: filling `H = 32` samples takes ~128 frames, and a page that
+        // read its parity at 160 with H = 4 would be reading a transient with
+        // H = 32 — and then blaming the longer memory for it.
+        const FRAMES = Number(params.get("frames") ?? 260);
+        const COLD_FRAMES = Number(params.get("cold") ?? 96);
         const ORBIT_FRAMES = Number(params.get("orbit") ?? 60);
         const WANT_PNG = params.get("png") !== "0";
 
@@ -160,7 +165,7 @@
           `cache ${cd.bricks} bricks × ${cd.slotBytes} B = ${cd.totalMB} MB`);
         say(`gather: ${gd.width}×${gd.height}, tile ${gd.tile} → ${gd.probeW}×${gd.probeH} = ${gd.probeCount} probes, ` +
           `${gd.rays} rays/probe/frame over an ${gd.oct}×${gd.oct} oct map (stride ${gd.stride}), H=${gd.history}, ` +
-          `resolve=${gd.sh ? "SH2" : "oct sum"}`);
+          `SH filter ${2 * gd.shRadius + 1}×${2 * gd.shRadius + 1}, resolve=${gd.sh ? "SH2" : "oct sum"}`);
         say(`gather buffers: ${Object.entries(gd.bytes).map(([k, v]) => `${k} ${(v / 1048576).toFixed(2)}MB`).join(", ")}`);
 
         // ══════════════════════════════════════════════════════ three.js scene
@@ -240,6 +245,11 @@
         const frameChain = (statsOn) => {
           gu.statsOn.value = statsOn ? 1 : 0;
         };
+        // §19 3.6's SH-filter WIDTH arm. The radius is compiled in (the
+        // neighbour offsets are unrolled in JS), so the A/B is a choice of
+        // KERNEL rather than of uniform — `runFrame` dispatches whichever this
+        // says, and everything downstream reads the same `shIdx` half.
+        let SH3 = false;
 
         const runFrame = async (n, opts = {}) => {
           gather.beginFrame(n);
@@ -255,7 +265,7 @@
           await compute(gather.passes.probePlace);
           await compute(gather.passes.probeTrace);
           await compute(gather.passes.probeFilter);
-          await compute(gather.passes.probeShFilter);
+          await compute(SH3 ? gather.passes.probeShFilter3 : gather.passes.probeShFilter);
           await compute(gather.passes.resolveHalf);
           await compute(gather.passes.resolveUpsample);
           await compute(gather.passes.composite);
@@ -339,6 +349,184 @@
           const scan = Math.min(cache.DATA_OFF + mapped * 384 + 4096, cache.MAP_OFF);
           for (let i = cache.DATA_OFF; i < scan; i++) if (u32[i]) written++;
           return { ...cache.readControl(u32), mapped, writtenWords: written, scanned: scan };
+        };
+
+        // ══════════════════════ THE NOISE RECEIPT (§19 STAGE 3.6) ════════════
+        //
+        // ⭐⭐ "GI IS NOISY" IS A REPORT ABOUT A TEXTURE, AND EVERY INSTRUMENT ON
+        // THIS PAGE READ A CROP. A crop is a 9×9 block averaged into one
+        // number — a low-pass filter applied to the exact quantity under
+        // complaint — and the mottling scan is a 33-px band of ONE wall. So
+        // before any lever is pulled there is a number for the thing itself,
+        // over every lit pixel, in two independent axes:
+        //
+        //   TEMPORAL  per-pixel σ over 30 consecutive frames ÷ that pixel's
+        //             own mean, with the camera parked. This is what "it
+        //             crawls / it boils" is. Reported p50 / p95.
+        //   SPATIAL   |L − (its own 5×5 box mean)| ÷ the box mean, per frame,
+        //             over lit pixels that are NOT on a geometric edge. This
+        //             is what "it is blotchy" is. Reported p50 / p95.
+        //
+        // ⚠ AND THE BAR IS SET FROM FIRST PRINCIPLES, NOT FROM THE SRC PATH.
+        // `test:gi-src-gather` reports a frameMean spread, which is a mean of
+        // means — it cannot see per-pixel variance at all, so it cannot supply
+        // this number and quoting it would be a blind statistic. The gate is
+        // therefore argued: 1 % temporal at p95 is below the ~1.5 % contrast
+        // step 8-bit sRGB can display in the midtones, so a pixel that moves
+        // less than that cannot be seen to move; 3 % spatial at p95 is the
+        // same argument with the eye's spatial contrast sensitivity peak
+        // (~3 % at 4 cycles/degree) in place of the display's quantum.
+        //
+        // Percentiles come out of a LOG-SPACED HISTOGRAM rather than a sort:
+        // 1.6 M pixels × 30 frames is 48 M samples and a sort per frame would
+        // be most of this page's wall time.
+        const HIST_BINS = 2048; const HIST_LO = 1e-5; const HIST_HI = 100;
+        const HIST_K = Math.log(HIST_HI / HIST_LO);
+        const mkHist = () => ({ bins: new Float64Array(HIST_BINS), n: 0 });
+        const histAdd = (h, v) => {
+          const t = Math.log(Math.min(HIST_HI, Math.max(HIST_LO, v)) / HIST_LO) / HIST_K;
+          h.bins[Math.min(HIST_BINS - 1, Math.max(0, Math.floor(t * HIST_BINS)))]++;
+          h.n++;
+        };
+        const histP = (h, p) => {
+          if (!h.n) return null;
+          const want = (h.n * p) / 100;
+          let c = 0;
+          for (let i = 0; i < HIST_BINS; i++) {
+            c += h.bins[i];
+            if (c >= want) return HIST_LO * Math.exp(HIST_K * ((i + 0.5) / HIST_BINS));
+          }
+          return HIST_HI;
+        };
+        const NPX = W * Hh;
+        const noiseFrame = async () => {
+          await compute(gather.passes.noiseDump);
+          return new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.noiseBuf.value));
+        };
+        /**
+         * Both receipts over `frames` frames. `advance(k)` runs the frame (so
+         * the same instrument serves the parked arm and the orbiting one).
+         *
+         * "Lit" is derived from the scene, never a constant: the threshold is
+         * a tenth of the MEDIAN box-mean over the valid pixels of the first
+         * frame, so a dark room and a bright one are judged the same way.
+         */
+        const noiseReceipt = async (label, {
+          frames = 30, advance = null, quiet = false, probeSpace = false,
+        } = {}) => {
+          const sum = new Float64Array(NPX);
+          const sq = new Float64Array(NPX);
+          const cnt = new Uint16Array(NPX);
+          const spatial = [];
+          let lit = null;
+          // Probe-space, the same two axes on the SH DC term.
+          const shSum = new Float64Array(gd.probeCount);
+          const shSq = new Float64Array(gd.probeCount);
+          const shCnt = new Uint16Array(gd.probeCount);
+          const shSpatial = [];
+          for (let k = 0; k < frames; k++) {
+            if (advance) await advance(k);
+            const f = await noiseFrame();
+            if (lit == null) {
+              const h = mkHist();
+              for (let i = 0; i < NPX; i++) if (f[i * 4 + 3] > 0.5) histAdd(h, f[i * 4 + 1]);
+              lit = 0.1 * (histP(h, 50) ?? 0);
+            }
+            const hp = mkHist();
+            for (let i = 0; i < NPX; i++) {
+              if (!(f[i * 4 + 3] > 0.5)) continue;
+              const L = f[i * 4]; const B = f[i * 4 + 1];
+              if (!(B > lit)) continue;
+              sum[i] += L; sq[i] += L * L; cnt[i]++;
+              if (f[i * 4 + 2] < 0.5) histAdd(hp, Math.abs(L - B) / B);
+            }
+            spatial.push({ p50: histP(hp, 50), p95: histP(hp, 95), n: hp.n });
+            // ── (c) the same two on the probe SH DC term ──────────────────
+            //
+            // ⚠ TWO MORE READBACKS A FRAME, so it is asked for and not always
+            // paid: the pixel receipt is the one the user's report is about,
+            // and the probe-space pair only says whether the noise is BORN in
+            // probe space or made by the resolve.
+            if (!probeSpace) continue;
+            const meta = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.probeMeta.value));
+            const sh = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.probeSh.value));
+            const half = gather.frame & 1;
+            const dc = new Float64Array(gd.probeCount);
+            for (let p = 0; p < gd.probeCount; p++) {
+              const b = p * 9 * 4;
+              dc[p] = lum([sh[b], sh[b + 1], sh[b + 2]]);
+              const mb = (half * gd.probeCount * 3 + p * 3) * 4;
+              if (meta[mb + 3] > 0.5 && dc[p] > 0) { shSum[p] += dc[p]; shSq[p] += dc[p] * dc[p]; shCnt[p]++; }
+            }
+            const sh5 = mkHist();
+            for (let py = 0; py < gd.probeH; py++) {
+              for (let px2 = 0; px2 < gd.probeW; px2++) {
+                const p = py * gd.probeW + px2;
+                const mb = (half * gd.probeCount * 3 + p * 3) * 4;
+                if (!(meta[mb + 3] > 0.5) || !(dc[p] > 0)) continue;
+                const P = [meta[mb], meta[mb + 1], meta[mb + 2]];
+                const Nn = [meta[mb + 4], meta[mb + 5], meta[mb + 6]];
+                let s = 0; let n2 = 0; let edge = false;
+                for (let oy = -2; oy <= 2 && !edge; oy++) {
+                  for (let ox = -2; ox <= 2; ox++) {
+                    const qx = px2 + ox; const qy = py + oy;
+                    if (qx < 0 || qy < 0 || qx >= gd.probeW || qy >= gd.probeH) { edge = true; break; }
+                    const q = qy * gd.probeW + qx;
+                    const qb = (half * gd.probeCount * 3 + q * 3) * 4;
+                    const dotN = Nn[0] * meta[qb + 4] + Nn[1] * meta[qb + 5] + Nn[2] * meta[qb + 6];
+                    const plane = Math.abs(Nn[0] * (meta[qb] - P[0]) + Nn[1] * (meta[qb + 1] - P[1])
+                      + Nn[2] * (meta[qb + 2] - P[2]));
+                    if (!(meta[qb + 3] > 0.5) || dotN < 0.95 || plane > wd.voxel0) { edge = true; break; }
+                    s += dc[q]; n2++;
+                  }
+                }
+                if (edge || n2 < 25) continue;
+                const m = s / n2;
+                if (m > 0) histAdd(sh5, Math.abs(dc[p] - m) / m);
+              }
+            }
+            shSpatial.push({ p50: histP(sh5, 50), p95: histP(sh5, 95), n: sh5.n });
+          }
+          const tempHist = mkHist();
+          for (let i = 0; i < NPX; i++) {
+            if (cnt[i] < frames) continue;
+            const m = sum[i] / cnt[i];
+            if (!(m > 0)) continue;
+            const v = Math.max(0, sq[i] / cnt[i] - m * m);
+            histAdd(tempHist, Math.sqrt(v) / m);
+          }
+          const shTemp = mkHist();
+          for (let p = 0; p < gd.probeCount; p++) {
+            if (shCnt[p] < frames) continue;
+            const m = shSum[p] / shCnt[p];
+            if (!(m > 0)) continue;
+            const v = Math.max(0, shSq[p] / shCnt[p] - m * m);
+            histAdd(shTemp, Math.sqrt(v) / m);
+          }
+          const medOf = (xs) => xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+          const out = {
+            label, frames, litThreshold: lit,
+            temporal: { p50: histP(tempHist, 50), p95: histP(tempHist, 95), n: tempHist.n },
+            spatial: {
+              p50: medOf(spatial.map((s) => s.p50)), p95: medOf(spatial.map((s) => s.p95)),
+              n: spatial[0]?.n ?? 0, perFrame: spatial,
+            },
+            shTemporal: { p50: histP(shTemp, 50), p95: histP(shTemp, 95), n: shTemp.n },
+            shSpatial: {
+              p50: medOf(shSpatial.map((s) => s.p50)), p95: medOf(shSpatial.map((s) => s.p95)),
+              n: shSpatial[0]?.n ?? 0,
+            },
+          };
+          const pc = (v) => (v == null ? "  n/a" : `${(100 * v).toFixed(2)} %`);
+          if (!quiet) {
+            say(`  NOISE [${label}] irradiance: temporal p50 ${pc(out.temporal.p50)} p95 ${pc(out.temporal.p95)} ` +
+              `(${out.temporal.n} px over ${frames} frames) | spatial p50 ${pc(out.spatial.p50)} ` +
+              `p95 ${pc(out.spatial.p95)} (${out.spatial.n} px/frame, edges excluded)`);
+            say(`  NOISE [${label}] probe SH DC: temporal p50 ${pc(out.shTemporal.p50)} p95 ${pc(out.shTemporal.p95)} ` +
+              `(${out.shTemporal.n} probes) | spatial p50 ${pc(out.shSpatial.p50)} p95 ${pc(out.shSpatial.p95)} ` +
+              `(${out.shSpatial.n} probes)`);
+          }
+          return out;
         };
 
         const results = {
@@ -434,9 +622,28 @@
           `rays ${statsIn.raysTraced}/${statsIn.raysLaunched} (${(100 * statsIn.raysTraced / Math.max(1, statsIn.raysLaunched)).toFixed(1)} % yield), ` +
           `screen ${statsIn.screenHits} / window ${statsIn.windowHits} / sky ${statsIn.skyMiss}, ` +
           `fresh shades ${statsIn.freshShades}, hand-offs ${statsIn.handoffs}, injected ${statsIn.injectWrites}`);
-        say(`hysteresis: alpha forced to 0.5 on ${statsIn.alphaForced} of ${statsIn.raysTraced} traced rays = ` +
-          `${(100 * statsIn.alphaForced / Math.max(1, statsIn.raysTraced)).toFixed(1)} % — a rate near 50 % means the ` +
-          `test is firing on SHOT NOISE, not on lighting changes`);
+        say(`hysteresis: the history was RESET on ${statsIn.alphaForced} of ${statsIn.raysTraced} traced rays = ` +
+          `${(100 * statsIn.alphaForced / Math.max(1, statsIn.raysTraced)).toFixed(2)} % — with a parked camera and a ` +
+          `static world this number is the rate at which the estimator throws away its own history on SHOT NOISE, ` +
+          `and it should be ~0`);
+        say(`texel maturity: ${statsIn.matureTexels} of ${statsIn.texelsSeen} sampled texels have n >= H/2 = ` +
+          `${(100 * statsIn.matureTexels / Math.max(1, statsIn.texelsSeen)).toFixed(1)} % (H = ${gd.history})`);
+        {
+          // ⭐ A RATE NAMES NO MECHANISM. `probesValid − reprojHits` is split
+          // into the five gates that can refuse a carry, and the split must
+          // ADD UP — a census that does not is blind to a sixth reason.
+          const miss = statsIn.probesValid - statsIn.reprojHits;
+          const cls = {
+            offScreen: statsIn.reprojOffScreen, noPrev: statsIn.reprojNoPrev,
+            plane: statsIn.reprojPlane, slant: statsIn.reprojSlant, align: statsIn.reprojAlign,
+          };
+          const sum = Object.values(cls).reduce((a, x) => a + x, 0);
+          say(`reprojection census: ${statsIn.reprojHits}/${statsIn.probesValid} carried = ` +
+            `${(100 * statsIn.reprojHits / Math.max(1, statsIn.probesValid)).toFixed(2)} %; the ${miss} misses are ` +
+            Object.entries(cls).map(([k, v]) => `${k} ${v}`).join(", ") +
+            ` (sum ${sum}${sum === miss ? "" : ` ≠ ${miss} — THE CENSUS IS BLIND`})`);
+          results.reprojCensus = { ...cls, miss, sum, hits: statsIn.reprojHits, valid: statsIn.probesValid };
+        }
         for (const c of inFrame.filter((x) => !x.diag)) {
           say(`  ${c.name.padEnd(12)} pos ${c.pos.map((v) => v.toFixed(2)).join(",").padEnd(20)} ` +
             `E ${c.irr.map((v) => v.toFixed(3)).join(" ")}  albedo ${c.albedo.map((v) => v.toFixed(2)).join(" ")}  ` +
@@ -456,6 +663,24 @@
         // carries, sky fraction) beside the resolve's own weights.
         const OCT_TBL = gatherMod.octTable(gd.oct).map((v) => [v.x, v.y, v.z, v.w]);
         const OCTN = gd.oct * gd.oct;
+        /**
+         * The oct texel's alpha, unpacked — the CPU mirror of `PACK_N` (§19
+         * 3.6). Every constant comes out of `describe()` so this cannot drift
+         * from the kernel that packed the word: n·2^18 + distQ·2^10 + sigQ,
+         * with σ LOG-quantized (see the note in gatherProbes.js).
+         */
+        const unpackAlpha = (a) => {
+          if (!(a > 0)) return { nS: 0, dist: 0, sigRel: 0 };
+          const nS = Math.floor(a / gd.packN);
+          const rem = a - nS * gd.packN;
+          const dq = Math.floor(rem / gd.packD);
+          const sq = rem - dq * gd.packD;
+          return {
+            nS,
+            dist: dq * (gd.rayMax / gd.distQ),
+            sigRel: gd.sigMin * Math.pow(2, (sq / gd.sigQ) * gd.sigOct),
+          };
+        };
         const dumpBuffers = async () => ({
           half: gather.frame & 1,
           meta: new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.probeMeta.value)),
@@ -471,7 +696,7 @@
           const nrm = [D.meta[mb + 4], D.meta[mb + 5], D.meta[mb + 6]];
           const depth = D.meta[mb + 7];
           const prev = D.meta[mb + 8];
-          let fill = 0; let self = 0; let sky = 0; let dsum = 0;
+          let fill = 0; let self = 0; let sky = 0; let dsum = 0; let nsum = 0; let sgsum = 0;
           // ⚠ A MEAN HIT DISTANCE CANNOT SEE A BIMODAL POPULATION. "d̄ = 4 m"
           // is what 90 % of rays stopped at 0.3 m and 10 % at 38 m looks like,
           // and those are two completely different diagnoses. Near and far are
@@ -483,16 +708,18 @@
             // TEXEL-MAJOR, mirroring `octIdx` — see gatherProbes.js.
             const ob = (D.half * gd.probeCount * OCTN + t * gd.probeCount + pi) * 4;
             const a = D.raw[ob + 3];
-            const nS = Math.floor(a / 1024);
-            const dist = a - nS * 1024;
+            const { nS, dist, sigRel } = unpackAlpha(a);
             if (nS > 0) {
-              fill++; dsum += dist;
-              if (dist < 0.06) self++;
+              fill++; dsum += dist; nsum += nS; sgsum += sigRel;
+              if (dist < 0.2) self++;
               if (dist > 39) sky++;
               const l = lum([D.raw[ob], D.raw[ob + 1], D.raw[ob + 2]]);
               if (dist < 1.0) { near++; nearL += l; } else { farL += l; }
               const e0 = OCT_TBL[t];
-              texels.push({ t, dir: [e0[0], e0[1], e0[2]], dw: e0[3], dist: +dist.toFixed(3), L: +l.toFixed(4) });
+              texels.push({
+                t, dir: [e0[0], e0[1], e0[2]], dw: e0[3],
+                dist: +dist.toFixed(3), L: +l.toFixed(4), n: nS, sig: +sigRel.toFixed(4),
+              });
             }
             const e = OCT_TBL[t];
             const c = e[0] * N[0] + e[1] * N[1] + e[2] * N[2];
@@ -514,6 +741,7 @@
             pi, pos, nrm, valid, depth, prev, fill, self, sky, near, texels,
             nearL: near ? nearL / near : 0, farL: fill - near ? farL / (fill - near) : 0,
             dmean: fill ? dsum / fill : 0, Eraw: Er, Efilt: Ef, Esh,
+            nmean: fill ? nsum / fill : 0, sigMean: fill ? sgsum / fill : 0,
           };
         };
         /** The resolve's own four corners and weights, mirrored on the CPU. */
@@ -884,6 +1112,372 @@
           results.mottlingArms = arms.map(({ scans, ...rest }) => rest);
         }
 
+        // ══════════════ §19 STAGE 3.6 — THE NOISE, ONE LEVER AT A TIME ═══════
+        //
+        // ⚠ `?levers=0` SKIPS THIS WHOLE SECTION, and the reason it can is
+        // that the gather's FACTORY DEFAULTS are the shipped state: nothing
+        // below is a uniform this page has to set to make the numbers above
+        // and below it describe what ships. Fifteen arms of ~190 settle frames
+        // each is most of this page's wall time, and the 3.3 gates do not
+        // depend on any of it.
+        //
+        // ⭐ EVERY LEVER IS A UNIFORM (OR A CHOICE OF KERNEL), SO "BASELINE" IS
+        // A STATE THIS BINARY CAN ENTER. Stage 3.5's estimator is not a
+        // previous commit to be checked out and re-timed on a GPU that has
+        // moved; it is `historyU = 4, hystOn = legacy, reprojWide = 0, the 3×3
+        // SH filter, injectAlpha = 0.25, the composite injected`. The arms are
+        // CUMULATIVE — each adds one lever to the last — so a lever that does
+        // nothing shows up as two rows that do not differ, and a lever that
+        // undoes another shows up as a row that goes backwards.
+        //
+        // ⚠ AND EVERY ARM SETTLES BEFORE IT IS MEASURED. H = 32 needs ~32
+        // frames per DIRECTION and each probe traces 16 of its 64 directions
+        // per frame, so a texel is sampled every fourth frame: a receipt taken
+        // 20 frames after the switch would be measuring the transient, and the
+        // longer memory would score WORSE than the shorter one for a reason
+        // that has nothing to do with either.
+        if (params.get("levers") !== "0") {
+          let nn = FRAMES + 900;
+          const BASE = {
+            historyU: 4, hystOn: gatherMod.HYST.legacy, reprojWide: 0,
+            injectAlpha: 0.25, injectGlossy: 1, sh3: true, anchorJitter: 1,
+          };
+          const setArm = (a) => {
+            for (const [k, v] of Object.entries(a)) {
+              if (k === "sh3") SH3 = v; else gu[k].value = v;
+            }
+          };
+          const SHIP = {
+            historyU: gd.history, hystOn: gatherMod.HYST.decay, reprojWide: 1,
+            injectAlpha: 0.25, injectGlossy: 0, sh3: false, anchorJitter: 0,
+          };
+          const settle = async (k) => { for (let i = 0; i < k; i++) await runFrame(nn++); };
+          /** One frame's counters, cleared first so they are PER FRAME. */
+          const frameStats = async () => {
+            await compute(gather.passes.clearStats);
+            await runFrame(nn++);
+            return readStats();
+          };
+          /**
+           * FRAMES TO 90 % OF SETTLED, with the probe grid cleared and the
+           * CACHE LEFT WARM — the number this measures is the accumulator's
+           * own convergence, not the cache's first light, which `firstLight`
+           * already reports at boot.
+           */
+          //
+          // ⚠⚠ AND IT LEAVES THE GRID SETTLED AGAIN. The first cut of this
+          // instrument cleared the probes, ran until the crop crossed 90 %,
+          // and handed the NEXT arm a grid that was nine frames old. With
+          // H = 32 a texel is sampled every fourth frame, so 80 settle frames
+          // is twenty samples of thirty-two — and every cumulative arm was
+          // measured on a HALF-BUILT accumulator while the alternative arms,
+          // which run no convergence test, were measured on a full one. The
+          // table read "α = 0.25 is 1.33 % here and 1.96 % there" for the same
+          // α. A settle is not optional bookkeeping; it is the arm.
+          const convergeFrames = async (maxF = 90) => {
+            await settle(30);
+            writeCrops();
+            const settled = lum((await readCrops()).find((x) => x.name === "floorSpot").irr);
+            await compute(gather.passes.clearProbes);
+            await compute(gather.passes.clearMeta);
+            let f50 = null; let f90 = null;
+            const series = [];
+            for (let i = 1; i <= maxF; i++) {
+              await runFrame(nn++);
+              writeCrops();
+              const e = lum((await readCrops()).find((x) => x.name === "floorSpot").irr);
+              series.push(+e.toFixed(4));
+              if (f50 == null && e > 0.5 * settled) f50 = i;
+              if (f90 == null && e > 0.9 * settled) { f90 = i; break; }
+            }
+            await settle(SETTLE);
+            return { settled, f50, f90, series };
+          };
+          /** ~4·H frames: `H` samples per texel at one sample every `stride`. */
+          const SETTLE = Math.max(80, 5 * gd.history);
+          const runArm = async (label, arm, { probeSpace = false, converge = false } = {}) => {
+            setArm(arm);
+            await settle(SETTLE);
+            const st = await frameStats();
+            const noise = await noiseReceipt(label, {
+              frames: 30, advance: async () => { await runFrame(nn++); }, probeSpace,
+            });
+            const conv = converge ? await convergeFrames() : null;
+            const row = {
+              label, arm: { ...arm }, noise, converge: conv,
+              alphaForced: st.alphaForced, raysTraced: st.raysTraced,
+              alphaForcedPct: 100 * st.alphaForced / Math.max(1, st.raysTraced),
+              reprojPct: 100 * st.reprojHits / Math.max(1, st.probesValid),
+              maturePct: 100 * st.matureTexels / Math.max(1, st.texelsSeen),
+              census: {
+                offScreen: st.reprojOffScreen, noPrev: st.reprojNoPrev,
+                plane: st.reprojPlane, slant: st.reprojSlant, align: st.reprojAlign,
+              },
+            };
+            say(`  LEVER ${label.padEnd(22)} reset ${row.alphaForcedPct.toFixed(2)} % | reproj ` +
+              `${row.reprojPct.toFixed(2)} % | mature ${row.maturePct.toFixed(1)} % | ` +
+              `converge 50/90 ${conv?.f50 ?? "—"}/${conv?.f90 ?? "—"} frames | census ` +
+              Object.entries(row.census).map(([k, v]) => `${k} ${v}`).join(" "));
+            return row;
+          };
+          const levers = [];
+          const cum = { ...BASE };
+          levers.push(await runArm("0 baseline (3.5)", { ...cum }, { probeSpace: true, converge: true }));
+          cum.historyU = gd.history;
+          levers.push(await runArm(`1 +H=${gd.history}`, { ...cum }));
+          cum.hystOn = gatherMod.HYST.variance;
+          levers.push(await runArm("2 +variance hyst", { ...cum }));
+          cum.reprojWide = 1;
+          levers.push(await runArm("3 +wide reproj", { ...cum }));
+          cum.sh3 = false;
+          levers.push(await runArm(`4 +SH ${2 * gd.shRadius + 1}x${2 * gd.shRadius + 1}`, { ...cum }));
+          cum.anchorJitter = 0;
+          levers.push(await runArm("5 +frozen anchor", { ...cum }));
+          cum.hystOn = gatherMod.HYST.decay;
+          levers.push(await runArm("6 +decaying hyst", { ...cum }));
+          cum.injectGlossy = 0;
+          levers.push(await runArm("7 +inject diffuse", { ...cum }, { probeSpace: true, converge: true }));
+          // ── the arms that are NOT on the ladder: what each choice was
+          // measured AGAINST. A cumulative table says a lever helped; it never
+          // says the alternative would have helped more.
+          for (const [label, over] of [
+            ["· hyst OFF", { hystOn: gatherMod.HYST.off }],
+            ["· hyst reset (n←1)", { hystOn: gatherMod.HYST.variance }],
+            ["· hyst reset AND dist", { hystOn: gatherMod.HYST.varianceAndDist }],
+            ["· inject a=0.1", { injectAlpha: 0.1 }],
+            ["· anchor jitter back", { anchorJitter: 1 }],
+            // ⭐ THE H CURVE IS THE TRADE ITSELF. Every frame of memory is a
+            // frame of lag, and the panel-move arm below prices the lag; this
+            // prices the quiet. Two numbers, one axis, and the choice of H is
+            // then an argument about which end of it the user wants.
+            ["· H=8", { historyU: 8 }],
+            ["· H=16", { historyU: 16 }],
+          ]) levers.push(await runArm(label, { ...cum, ...over }));
+          setArm(SHIP);
+          await settle(60);
+          results.levers = levers;
+
+          // ── the WORLD changes: the panel jumps 2 m ──────────────────────
+          //
+          // ⭐⭐ THIS IS THE ONLY RECEIPT THAT CAN CONDEMN A LONG MEMORY. H = 32
+          // and a hysteresis that never fires are together a 32-frame lag on
+          // every lighting change, and no at-rest noise number can see that.
+          // The panel is MOVED — in the analytic primitive buffer the
+          // voxelizer reads AND in the three.js mesh the gbuffer is rendered
+          // from, so the world really changed and not just one description of
+          // it — and the receipt is how many frames the floor takes to get 90 %
+          // of the way from its old irradiance to its new one.
+          {
+            const panelMesh = scene.children[0];
+            const prims = fill.prims.value;
+            const movePanel = async (dx) => {
+              prims.array[0] = PANEL.min[0] + dx;
+              prims.array[4] = PANEL.max[0] + dx;
+              prims.needsUpdate = true;
+              panelMesh.position.x = dx;
+              panelMesh.updateMatrixWorld(true);
+              gu.panelCentre.value.set(PANEL_INFO.centre[0] + dx, PANEL_INFO.centre[1], PANEL_INFO.centre[2]);
+              await compute(win.clearStaticPass);
+              await compute(fill.pass);
+              await compute(cache.allocPass);
+            };
+            const readE = async () => {
+              writeCrops();
+              const c = await readCrops();
+              return Object.fromEntries(c.filter((x) => !x.diag).map((x) => [x.name, lum(x.irr)]));
+            };
+            const armMove = async (label) => {
+              await settle(60);
+              const before = await readE();
+              await movePanel(2);
+              const WATCH = 200;
+              const series = [];
+              for (let i = 1; i <= WATCH; i++) { await runFrame(nn++); series.push(await readE()); }
+              await settle(250);
+              const after = await readE();
+              // 90 % of the way from `before` to `after`, on the crops that
+              // actually MOVED — a crop whose irradiance did not change cannot
+              // time a change, and averaging it in only dilutes the answer.
+              //
+              // ⚠ AND IT MUST STAY THERE. `findIndex` on "within 10 % of the
+              // final value" would be satisfied by a value on its way PAST the
+              // target, which a hysteresis that overshoots does on its first
+              // sample; the crossing counts only if every later frame in the
+              // window is also inside the band.
+              const moved = Object.keys(after).filter((k) => Math.abs(after[k] - before[k]) > 0.25 * before[k]);
+              const frames = moved.map((k) => {
+                const d = Math.abs(after[k] - before[k]);
+                const sgn = Math.sign(after[k] - before[k]);
+                // `frame` — the first frame that has covered 90 % of the
+                // distance. This is what "converges to the new state in N
+                // frames" means, and it is the number the gate reads.
+                const f90 = series.findIndex((s) => sgn * (s[k] - before[k]) >= 0.9 * d);
+                // `lock` — the frame after which it never leaves the ±10 %
+                // band again. Stricter, and the one that catches an estimator
+                // that gets there by overshooting and coming back.
+                let lock = -1;
+                for (let i = series.length - 1; i >= 0; i--) {
+                  if (Math.abs(series[i][k] - after[k]) <= 0.1 * d) lock = i; else break;
+                }
+                // ⭐ AND A PROFILE, BECAUSE "NEVER" IS NOT A MEASUREMENT. A
+                // crossing frame is a single threshold on a curve; when no arm
+                // crosses inside the window the table says "never" for every
+                // one of them and the arms stop being comparable. The FRACTION
+                // of the change completed at fixed frames is the curve itself,
+                // and it separates "slow" from "stuck" without a threshold.
+                const at = (i) => (i - 1 < series.length
+                  ? +(sgn * (series[i - 1][k] - before[k]) / d).toFixed(3) : null);
+                return {
+                  crop: k, before: +before[k].toFixed(3), after: +after[k].toFixed(3),
+                  frame: f90 < 0 ? null : f90 + 1, lock: lock < 0 ? null : lock + 1,
+                  done: { 10: at(10), 30: at(30), 60: at(60), 120: at(120), 200: at(200) },
+                  trace: [0, 1, 2, 4, 9, 19, 39, 79, 149, 199].filter((i) => i < series.length)
+                    .map((i) => +series[i][k].toFixed(3)),
+                };
+              });
+              await movePanel(0);
+              await settle(150);
+              // A crop that never settles is the WORST, not a row to skip.
+              const worstOf = (key) => (frames.length === 0 || frames.some((f) => f[key] == null)
+                ? null : Math.max(...frames.map((f) => f[key])));
+              const worstFrame = worstOf("frame");
+              const worstLock = worstOf("lock");
+              say(`  PANEL MOVES 2 m [${label}]: ` + frames.map((f) => `${f.crop} ${f.before}→${f.after} ` +
+                `90 % @${f.frame ?? "never"} lock @${f.lock ?? "never"}`).join(", "));
+              say(`  PANEL MOVES 2 m [${label}]: worst 90 % ${worstFrame ?? "never"} frames (want ≤ 30), ` +
+                `worst lock ${worstLock ?? "never"}`);
+              const meanDone = (i) => {
+                const xs = frames.map((f) => f.done[i]).filter((v) => v != null);
+                return xs.length ? xs.reduce((a, x) => a + x, 0) / xs.length : null;
+              };
+              const done = Object.fromEntries([10, 30, 60, 120, 200].map((i) => [i, meanDone(i)]));
+              say(`  PANEL MOVES 2 m [${label}]: fraction of the change completed — ` +
+                Object.entries(done).map(([i, v]) => `@${i} ${v == null ? "—" : (100 * v).toFixed(0)} %`).join(", "));
+              for (const f of frames) {
+                say(`    ${f.crop.padEnd(12)} ${f.before} → [${f.trace.join(" ")}] → ${f.after}  ` +
+                  `(frames 1 2 3 5 10 20 40 80 150 200)`);
+              }
+              return { label, before, after, frames, worstFrame, worstLock, done };
+            };
+            // ⭐⭐ AND THE BASELINE ARM IS HERE TO SHOW THAT ITS SPEED WAS AN
+            // ILLUSION. Stage 3.5's estimator "reaches 90 % of the change in
+            // 2 frames" on the box top — and its trace over the same window
+            // reads 0.52 0.50 0.45 0.41 0.46 0.36 0.41 0.54 1.69 against a
+            // target of 0.46. It did not converge; it happened to pass through
+            // the answer on its way somewhere else, twice. An estimator whose
+            // noise is larger than the change CANNOT BE TIMED, and both the
+            // 90 %-crossing and the LOCK frame are printed for exactly that
+            // reason: a fast crossing with no lock is noise wearing a result's
+            // clothes.
+            const moveShip = await armMove(`shipped (H=${gd.history})`);
+            setArm({ ...SHIP, historyU: 8 });
+            const moveH8 = await armMove("shipped, H=8");
+            setArm(BASE);
+            const moveBase = await armMove("baseline (3.5)");
+            setArm(SHIP);
+            await settle(60);
+            results.panelMove = { shipped: moveShip, h8: moveH8, baseline: moveBase };
+          }
+
+          // ── UNDER MOTION, and how fast it goes quiet again ──────────────
+          {
+            const R0 = 4.0;
+            const poseAt = (th) => {
+              camera.position.set(R0 * Math.sin(th), -0.5, R0 * Math.cos(th));
+              camera.lookAt(0, -1.0, 0);
+              camera.updateProjectionMatrix();
+            };
+            poseAt(0);
+            await settle(40);
+            // ⚠ THE TEMPORAL RECEIPT UNDER MOTION IS NOT THE SAME QUANTITY.
+            // A pixel that changes surface between frames has a σ made of the
+            // SCENE, so this number is an upper bound with the parallax
+            // included, reported for the trend and not against the at-rest
+            // gate. The gate applies to the window AFTER the camera stops.
+            const orbit = await noiseReceipt("orbit", {
+              frames: 30,
+              advance: async (k) => { poseAt(((k + 1) / 60) * (Math.PI / 4)); await runFrame(nn++); },
+            });
+            const stStop = await frameStats();
+            // ⭐ A RECOVERY PROFILE, NOT ONE SAMPLE. "Below the at-rest gate
+            // within 10 frames" is a threshold on a curve, and if it is missed
+            // the only thing a single reading says is "missed". The window is
+            // taken at +10, +40 and +100 so the shape is visible and the
+            // memory's own settling time can be read off it.
+            const recovery = [];
+            let waited = 0;
+            for (const at of [10, 40, 100]) {
+              await settle(at - waited);
+              waited = at;
+              recovery.push({
+                at, ...(await noiseReceipt(`${at} frames after stopping`, {
+                  frames: 30, advance: async () => { await runFrame(nn++); },
+                })),
+              });
+              waited += 30;
+            }
+            const after10 = recovery[0];
+            setCam(CAM_IN);
+            await settle(60);
+            results.motionNoise = {
+              orbit, after10, recovery,
+              reprojDuringOrbit: 100 * stStop.reprojHits / Math.max(1, stStop.probesValid),
+            };
+            say(`  motion: reprojection during the orbit ${results.motionNoise.reprojDuringOrbit.toFixed(1)} %`);
+          }
+
+          // ── the CACHE's own temporal σ, at faces we can name ────────────
+          //
+          // §L.6's injection is the one write that leaves probe space, so its
+          // noise is the one thing a probe-space receipt cannot see. A fixed
+          // set of voxel faces is read back over 30 frames and scored the same
+          // way the pixels were.
+          {
+            const cacheSigma = async (label) => {
+              const pts = [
+                { name: "floor", p: [0, -3, 0], n: [0, 1, 0] },
+                { name: "floor +z", p: [0, -3, 2], n: [0, 1, 0] },
+                { name: "wall -X", p: [-5, 0, 0], n: [1, 0, 0] },
+                { name: "wall +X", p: [5, 0, 0], n: [-1, 0, 0] },
+                { name: "wall +Z", p: [0, 0, 5], n: [0, 0, -1] },
+                { name: "box top", p: [-2, -1, -1.5], n: [0, 1, 0] },
+              ];
+              const u32w = new Uint32Array(await renderer.getArrayBufferAsync(win.attribute));
+              const acc = pts.map(() => ({ s: 0, q: 0, n: 0 }));
+              for (let k = 0; k < 30; k++) {
+                await runFrame(nn++);
+                const u32c = new Uint32Array(await renderer.getArrayBufferAsync(cache.attribute));
+                pts.forEach((pt, i) => {
+                  const v = cacheAt(u32c, u32w, pt.p, pt.n, 0);
+                  if (!v || !v.word) return;
+                  const l = lum(v.rgb);
+                  acc[i].s += l; acc[i].q += l * l; acc[i].n++;
+                });
+              }
+              const rows = acc.map((a, i) => {
+                if (a.n < 20) return { name: pts[i].name, cv: null, n: a.n };
+                const m = a.s / a.n;
+                return {
+                  name: pts[i].name, mean: +m.toFixed(4), n: a.n,
+                  cv: Math.sqrt(Math.max(0, a.q / a.n - m * m)) / Math.max(1e-9, m),
+                };
+              });
+              const cvs = rows.filter((r) => r.cv != null).map((r) => r.cv).sort((a, b) => a - b);
+              const med = cvs.length ? cvs[Math.floor(cvs.length / 2)] : null;
+              say(`  CACHE σ/mean over 30 frames [${label}]: median ${med == null ? "n/a" : `${(100 * med).toFixed(2)} %`}, worst ` +
+                `${cvs.length ? `${(100 * cvs[cvs.length - 1]).toFixed(2)} %` : "n/a"} over ${cvs.length} named faces`);
+              return { label, rows, median: med, worst: cvs.length ? cvs[cvs.length - 1] : null };
+            };
+            const shipCache = await cacheSigma("shipped");
+            setArm(BASE);
+            await settle(60);
+            const baseCache = await cacheSigma("baseline (3.5)");
+            setArm(SHIP);
+            await settle(60);
+            results.cacheSigma = { shipped: shipCache, baseline: baseCache };
+          }
+        }
+
         // ══════════════════════ RESOLVE A/B: SH2 against the 4×64 oct sum
         //
         // §3.2 item 1's gate. BOTH ARMS ARE RUN AT FULL RESOLUTION so the
@@ -1241,6 +1835,7 @@
             ["probeTrace", gather.passes.probeTrace],
             ["probeFilter", gather.passes.probeFilter],
             ["probeShFilter", gather.passes.probeShFilter],
+            ["probeShFilter3", gather.passes.probeShFilter3],
             ["resolveHalf", gather.passes.resolveHalf],
             ["resolveUpsample", gather.passes.resolveUpsample],
             ["resolveFull", gather.passes.resolve],
@@ -1285,7 +1880,7 @@
           }
           results.kernels = audit;
           const ARMS = ["cacheAlloc", "windowFill", "resolveOct", "resolveFull",
-            "resolveShRaw", "probeTraceNoHzb", "probePlaceNoCarry"];
+            "resolveShRaw", "probeTraceNoHzb", "probePlaceNoCarry", "probeShFilter3"];
           results.gatherMs = audit.filter((k) => !ARMS.includes(k.name))
             .reduce((s, k) => s + (k.ms ?? 0), 0);
           // ⭐ STAGE 3.3'S BUDGET EXCLUDES `composite`. It is the harness's
@@ -1301,6 +1896,9 @@
             `probeTrace's ${ms("probeTrace").toFixed(4)}; the oct-map carry costs ` +
             `${(ms("probePlace") - ms("probePlaceNoCarry")).toFixed(4)} ms of probePlace's ` +
             `${ms("probePlace").toFixed(4)}`);
+          say(`  the SH filter at radius ${gd.shRadius} (${2 * gd.shRadius + 1}²) costs ${ms("probeShFilter").toFixed(4)} ms ` +
+            `against ${ms("probeShFilter3").toFixed(4)} at radius 1 — ` +
+            `${(ms("probeShFilter") - ms("probeShFilter3")).toFixed(4)} ms of the chain's ${results.chainMs.toFixed(3)}`);
 
           // THE SIDE-EFFECT GUARD. A TSL call built for its side effect and not
           // pinned to the stack compiles to NOTHING, silently (see the note on
