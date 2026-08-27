@@ -417,6 +417,16 @@ boot spread — quote 3-rep paired means at SETTLE=40000 only; a junctioned
 
 ### Stage 1 — MATERIALS OUT OF THE WAVE (~1-2 sessions; shared by both paths)
 
+**Corrections from the 08-27 analysis (AUDITS §J is the spec):** a shipping
+material's GI text is ~30-45 kB, not 180-250 (that was the pre-`sharedFn`
+number); the bulk is two nested `sampleReflectionProbes` expansions + two
+bilaterals; `emitterDirectAt` is NOT in a shipping material (deferred arm).
+`giMonitorNode` forces `needsRefresh` because GI uniforms default to
+`objectGroup` (cloned per render object) — the fix is `.setGroup(renderGroup)`
+first, marker deletion second, same commit; the moved-lamp gate has NO
+receipt today (add a pixel test before deleting the marker). The "~100+
+variants" was a uuid count; the pipeline key multiplies by GI's 4 buckets.
+
 | unit | what | gate |
 |---|---|---|
 | **1.1 thin material hook** | per §4.5: two texture samples + emitter-direct over a ≤ 4-slot UBO; measure one material's WGSL with GI off / on before and after | GI-on material WGSL ≤ GI-off + 8 kB; Bistro material wave **< 3 s** |

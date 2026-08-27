@@ -560,3 +560,215 @@ the whole +68 MB/rebuild texture column.
   `test:gi-src-gather` green, and **no "Destroyed buffer used in a submit"** in
   the console across 3 rebuilds + a viewport resize + an SRC pool grow (the
   three swap sites 0.2 already enumerated).
+
+---
+
+## J. STAGE 1 EXECUTION SPEC — MATERIALS OUT OF THE WAVE (analysis 08-27, HEAD 0868955)
+
+For `GI_SCALE_PLAN.md` §4.5 / Stage 1.1-1.2. Read J.0 before believing §2.1's
+sizes: **the plan's line numbers and its 180-250 kB are both stale.**
+`#markObservedMaterial` is `GISystem.js:13960` (plan says `:14607`);
+`giCompileVariantKey` is `:440` (plan says `:465`); 180-250 kB is the
+**pre-roll** figure recorded at `giFn.js:12-13`, superseded by `sharedFn`.
+
+### J.0 What GI injects into a material TODAY (deferred path, bucket 3, ao+reflections on)
+
+GI is not a material property — it is a light. `registerGILight`
+(`giLight.js:2646-2650`) does `renderer.library.addLight(GICascadeLightNode,
+GICascadeLight)`, so `GICascadeLightNode.setup` (`:1858`) runs inside **every
+lit material's** `lightsNode` and contributes exactly two things:
+`context.irradiance.addAssign` (`:2070`) and `context.radiance.addAssign`
+(`:2645`). Terms, in emission order:
+
+| # | term | anchor `giLight.js` | binds | tex samples/px | text scale |
+|---|---|---|---|---|---|
+| 1 | face-forward N, samplePoint | :1883-1886 | `normalOffset` | 0 | ~8 stmts |
+| 2 | `giUV` = resolve VP × P | :1904-1917 | mat4 `_giResolveVPU` (`GISystem.js:6937`) | 0 | ~12 |
+| 3 | bilateral(irradiance), 4 taps | :1929-2046 | `giIrradianceNode`, `giPositionNode`, `giScreenTexel`, `giNestedView` | **8** | ~40 |
+| 4 | probe nested fallback | :2051-2059 → `reflectionProbes.js:107-190` | 8 slots × 2 vec4 + atlas | **16** | ~120 |
+| 5 | bilateral(emitter shadow) | :2082-2091 | `giEmitterShadowNode`, `giEmitterShadowTexel` | **8** | ~40 |
+| 6 | 4 emitter slot geometries | :2093-2108 | 4 × 11 uniforms | 0 | ~20 |
+| 7 | glossy cascade read | :2172-2175 | `giRadianceNode` | 1 | ~2 |
+| 8 | probes (directional) | :2213-2216 | same bundle, 2nd expansion | **16** | ~120 |
+| 9 | exact prefilter, 2 hex rings | :2262-2317 | `bvhReflectColorTexture`, `bvhReflectTexture` | **14** | ~70 |
+| 10 | exact blend | :2318-2331 | — | 1 | ~10 |
+| 11 | ~~mirror trace + per-hit shading~~ | :2333-2531 | **COMPILED OUT** — `mirrorSampleFn=null` (`GISystem.js:9912`) | 0 | 0 |
+| 12 | emitter specular glow | :2534-2578 | slots + `boxGlowMiss`/`shapeGlowMiss` (rolled) | 0 | ~75 + 2 fn |
+| 13 | roughness collapse | :2581-2590 | `intensityUniform` | 0 | ~6 |
+| 14 | sky/env miss | :2599-2626 | `giEnvMiss.node/intensity/rotY` | 1 | ~24 |
+
+≈ **65 texture fetches per reflective pixel**, ~550 emitted statements. At
+50-70 B/stmt that is **~30-45 kB estimated**, not 200 — *estimate only, the
+gate is a dump (J.5)*. **Not present on the shipping path**: `emitterDirectAt`
+(`:1266`, the 65-70 kB share in §G) — only the non-deferred arm calls it
+(`:2113`); emitter DIRECT diffuse + shadows are already in the irradiance
+texture (`:2083`). The two `sampleReflectionProbes` expansions (32 fetches) and
+the 12-tap prefilter are the real text, not the emitter loop.
+
+### J.1 The variant key
+
+* Pipeline key = `RenderObject.getMaterialCacheKey()` (`RenderObject.js:730+`):
+  `customProgramCacheKey()` + a walk of **every own material property** —
+  numbers reduced to on/off (except `side`), textures contributing `mapping` +
+  sampler data. So two same-shading Bistro materials still differ by which maps
+  are non-null and by **sampler settings**. That is the base variant count.
+* `NodeMaterial.customProgramCacheKey` (`NodeMaterial.js:426-438`) hashes every
+  own `*Node` child's `getCacheKey()`. `giMonitorNode` ends in `Node` → **it is
+  in the key**; the ONE shared `float(0)` (`GISystem.js:13973-13975`) is what
+  keeps it from minting a unique key per material.
+* GI then multiplies the count by up to **4**: `:13984-13985` appends
+  `"|gi" + giRoughnessBucketOf(material)`. On an import `material.roughnessMap`
+  ⇒ bucket 3 unconditionally (`giLight.js:143`), i.e. ~all of Bistro lands in
+  the heaviest arm (`canMirror` true) — the R4 floor demotion is OPT-IN and
+  REFUTED (`giLight.js:100-111`).
+* `giCompileVariantKey` (`:440-449`) = `material.uuid|attrs|skin|morph`. It is
+  **only the warm-list dedupe** at `:4364` — 112 uuids ⇒ the log's
+  `[gi] compile wave: N unique material variants` (`:4370-4373`) and the plan's
+  "~100+ variants". It is NOT the pipeline count. The honest count is
+  `probe:gi-boot`'s `N render pipelines over M distinct fragment shaders`
+  (`run-gi-boot-probe.mjs:727`).
+* Why `matchStockPbr`'s 26→3 does not hold here: it lives in
+  `src/engine/tslGraph.js:590` and is applied only from
+  `materialAsset.js:556/615` — i.e. to `.mat` **assets** (the GAME/Sponza 32/46,
+  `GI_SRC_REBUILD_PLAN.md:6386`). Bistro's materials come from glTF import and
+  never pass through it; they have no custom node slots to merge in the first
+  place, so their spread is maps+samplers+`side` × GI bucket.
+
+### J.2 `giMonitorNode` — mechanism and the exact replacement
+
+* `NodeMaterialObserver.containsNode` (`NodeMaterialObserver.js:268-284`) scans
+  **every enumerable own material property** for `.isNode` → `hasNode = true`
+  (`:112`). `needsRefresh` returns true immediately on `hasNode` (`:719-720`),
+  so `Renderer._renderObjectDirect` (`Renderer.js:3708-3718`) runs
+  `updateBefore` + `geometries/nodes/bindings.updateForRender` for **every
+  object every frame** = the 237 µs/draw at 453 draws (`GI_SCALE_PLAN.md:48`).
+* **Why it is load-bearing.** `UniformNode.groupNode` defaults to `objectGroup`
+  (`UniformNode.js:55`), and non-shared groups are **cloned per render object**
+  (`NodeBuilderState.js:133-150`). A per-object clone only re-uploads inside
+  that `needsRefresh` branch, so without the marker GI's uniforms freeze at
+  compile-time values — the moved lamp. The repo already states the same law at
+  `GISystem.js:6558-6559` ("the default object group's buffer does not
+  re-upload on a quiet scene"). Three's own lights avoid it:
+  `AnalyticLightNode.js:54` is `uniform(this.color).setGroup(renderGroup)`.
+* **The replacement is a group move, not a marker swap.** With `hasNode` false
+  the observer still returns true **once per render per material**
+  (`NodeMaterialObserver.js:724-730`, the `renderId` bump). A `renderGroup`
+  uniform is shared (not cloned), and `NodeManager.updateGroup`
+  (`NodeManager.js:114-142`) version-checks it, so one refresh per render is
+  exactly enough to upload it once and skip the other 452 draws. A per-object
+  clone would still be stale on 452 draws — **therefore the uniforms must move
+  first and the marker be deleted second, in that order, in one commit.**
+* Precedent already in-tree: `_giNestedViewU` at `GISystem.js:6945-6947`.
+
+### J.3 The thin hook (Stage 1.1)
+
+1. **STAYS**: the two reads and the BSDF weighting —
+   `context.irradiance += giIrr.sample(giUV).rgb` and
+   `context.radiance += giGlossy.sample(giUV).rgb`. Fresnel/roughness weighting
+   is `PhysicalLightingModel`'s, already free.
+2. **STAYS**: `giUV` (item 2). It is what makes nested/planar views correct
+   (`giLight.js:1892-1903`); a screen-space constant reintroduces the ghost.
+3. **MOVES** — bilateral ×2 (items 3+5, 16 fetches). The resolve owns the
+   half-res gbuffer position already; do the position-validated upsample ONCE
+   at resolve res and publish a full-res `irradiance`. Cost: one target. Saves
+   15 of 16 fetches per lit pixel.
+4. **MOVES** — both `sampleReflectionProbes` expansions (items 4+8, 32 fetches,
+   ~240 stmts). Largest single text term. The resolve and `bvhReflect` already
+   hold the probe bundle; the nested-view fallback becomes a resolve output.
+5. **MOVES, with a stated trade** — the 12-tap prefilter (item 9).
+   `giLight.js:2237-2247` argues it must stay because roughness is per-pixel and
+   the gbuffer mirror channel is ONE BIT. The counter is to widen that channel
+   to a roughness byte; do not move it silently — this is the one item that
+   changes an image, and `:2244` names the exact user report it fixed.
+6. **MOVES** — emitter specular glow (item 12). Reads only slot uniforms +
+   `reflected` + roughness, all reconstructible at resolve res. Precedent and
+   buffer both exist (`emitterShadowPass` runs at `emitterShadowScale × shadow`).
+   Trade: half-res glow silhouettes on ≤ 4 lamps.
+7. **ALREADY DONE — do not redo**: emitter direct diffuse + shadows
+   (`giLight.js:2083`), the mirror hit-shade block (`:2333-2531`, dead via
+   `GISystem.js:9910-9914`), and the `sharedFn` roll (`giFn.js:36-56`).
+8. **TARGET SHAPE**: 2 samples + `giEmitterGlow(slotUBO, R, roughness)` if 6 is
+   deferred. Gate: **GI-on fragment WGSL ≤ GI-off + 8 kB**.
+
+### J.4 Wiring the shared UBO (Stage 1.2) — exact anchors
+
+`renderGroup` is already imported in `GISystem.js`. Add `.setGroup(renderGroup)`
+at: `:6937` `_giResolveVPU`; `:5825`/`:11589` `_giLightShadowTexel`; `:6952`
+`_giEmitterShadowTexel`; `:9765-9791` all 11 emitter-slot uniforms ×4; `:7873-7874`
+probe `posFeather`/`halfActive` ×8; `:5963-5964` + `:6910-6911` `_giEnvMissIntensityU`
+/`_giEnvMissRotU`; `:1136-1160` `makeLightSlots` (×4, unused on today's path —
+do it so R11 stays true); `giLight.js:1825` `intensityUniform`. THEN delete
+`GISystem.js:13973-13976` (marker + `needsUpdate`).
+
+⚠ **Keep** `:13984-13985` (the roughness-bucket key) — it is unrelated to the
+observer — but its guard is the marker: `:13961` early-returns on
+`giMonitorNode?.isNode`. Replace it with an explicit sentinel
+(`material.__giKeyPatched`) or `#collectMeshes` re-wraps `customProgramCacheKey`
+on every scan (growing closure chain, drifting key).
+
+Expect **3-4** GI UBOs, not 1: `NodeBuilder._getBindGroup` (`NodeBuilder.js:672-714`)
+keys the shared group on the exact uniform-node-id SET, so each compiled bucket
+gets its own — and the cache is per render context, so the nested planar pass
+gets its own copy. Both correct; do not force dead reads to "fix" it.
+
+### J.5 Measuring it (the instrument exists)
+
+`probe:gi-boot` (`package.json:164`) with **`DUMP_RENDER=<dir>`**
+(`run-gi-boot-probe.mjs:539-563`) writes one `.wgsl` per **distinct fragment
+shader**, named `m00-<kB>kB-x<count>-<sig>.wgsl`, and prints
+`N render pipelines over M distinct fragment shaders` (`:727`). It patches
+`GPUDevice.prototype.createShaderModule` and deliberately prefers the FRAGMENT
+module (`:136-140` — taking the vertex one "made every material look like a
+2kB shader"). Run it GI-off vs GI-on, before and after. In-engine, only compute
+is instrumented (`GISystem.js:504-511` `device.__giShaderSource`, kB retained,
+text discarded); if a live number is wanted, three interns every distinct
+fragment string at `Pipelines.js:200` — `renderer._pipelines.programs.fragment`
+is `Map<wgsl, ProgrammableStage>`, and per object it is
+`renderObject.getNodeBuilderState().fragmentShader` (`RenderObject.js:403`,
+`NodeBuilderState.js:43`).
+
+### J.6 Risks
+
+* **R1 — boot order.** `#markObservedMaterial` sets `needsUpdate = true` on
+  every material (`:13976`); deleting it removes one whole recompile of all 112.
+  But the bucket key must be installed **before** first compile or same-bucket
+  variants collide (`:13977-13983` names the mirror bug). Install it at the same
+  `#collectMeshes` pass (`:13725`), sentinel-guarded (see J.4).
+* **R2 — the MRT override.** `#warmOverridePass` (`:4157-4172`) awaits
+  `override.scenePass.compileAsync` — the postprocess PassNode context, which
+  re-warms every material in the MRT attachment set. It adds no variants but it
+  **doubles the wave's exposure to any per-material size**, so measure J.5
+  after the postprocess warm, not before (`:4903`, `:4911-4913`).
+* **R3 — `hasNode` will NOT go false everywhere.** Uber/shader-graph materials
+  carry `colorNode`/`normalNode`/`roughnessNode` of their own
+  (`shadowMerge.js:704-708`), so they keep the per-object refresh regardless.
+  The win is the stock-PBR import population; on those, `object.static`
+  (`NodeMaterialObserver.js:732-736`) also becomes reachable for the first time.
+  Skinned/morph keep refreshing via `hasAnimation` (`:719`) — correct.
+* **R4 — the env black-out.** `scene.environmentNode = this._envIblBlack`
+  (`GISystem.js:2157-2159`, gated on `_transportAlive`, `:2153-2156`) is a SCENE
+  node — `containsNode` scans the MATERIAL (`:272`), so it is unaffected. But
+  item 14 (`light.giEnvMiss.node`, `giLight.js:2618`) IS a per-material env
+  texture. Moving it to `bvhReflect` (which already writes the −1 miss marker it
+  keys on) is the clean Stage 1.1 move; **do not** replace it with anything that
+  samples the environment unoccluded — that is the §12.64 leak.
+* **R5 — the moved-lamp gate has no receipt.** `__noSharedGiMarker` has **zero**
+  references outside its own definition, and the "95k-pixel" claim at
+  `:13955-13958` appears in no script or test. The nearest real harness is
+  `scripts/run-gi-move-cost.mjs` (no npm script; `node scripts/run-gi-move-cost.mjs`,
+  pass = `:238` `old-side > shadow-centre + 15`) plus `test:gi-lighttree-mover`
+  (`package.json:153`) which checks records, not pixels. **Stage 1.2 must add a
+  pixel-level moved-lamp test before it removes the marker** — otherwise the one
+  thing the marker protects is untested at the moment it is deleted.
+
+### J.7 Gate
+
+* `probe:gi-boot DUMP_RENDER=…` on Bistro: largest fragment shader **GI-on ≤
+  GI-off + 8 kB**; `distinct fragment shaders` recorded before/after.
+* `[gi] compile wave: materials …ms` (`GISystem.js:4911-4913`) **< 3000 ms**
+  (today 27241; `BISTRO_PERF.md:747-749` shows 68866/77381 under contention).
+* `profile.cpuFrame` renderEncode ÷ draws **≤ 40 µs** on Bistro (today 237).
+* The new pixel-level moved-lamp test green with the marker deleted, and RED
+  with the `.setGroup(renderGroup)` calls reverted — the group move must be
+  provably load-bearing, not merely present.
+* Battery: `smoke:gi-gpu`, `test:gi-lighttree-mover`, `run-gi-move-cost.mjs`.
