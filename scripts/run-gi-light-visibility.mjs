@@ -74,7 +74,23 @@ const result = await page.evaluate(async () => {
   // A REAL entity + LightComponent, because the entity-level toggle is the
   // path that was broken; a bare THREE.DirectionalLight would not exercise it.
   const lightEntity = engine.createEntity({ name: "Sun" });
-  lightEntity.addComponent("light", { kind: "directional", intensity: 4, color: "#ffffff" });
+  // ⭐ §19 STAGE 4.0 — THE LIGHT IS ON SHADOW SOURCE "gi", NOT "map".
+  //
+  // `shadowMode: "gi"` is a shipped inspector option whose entire GI-side
+  // contract is `light.userData.giShadowMode` plus the per-slot `giShadow`
+  // uniform — and under GI2 that contract was silently dead: the bundle
+  // `#buildLightShadow` returns is null without an occupancy field, so
+  // `wantsGi` could never latch and the light fell back to three's tiny map
+  // while the inspector kept hiding the rows that would size it.
+  //
+  // This harness already owns the only cheap, deterministic reading of the
+  // slot table, so it is where that regression is guarded: `giShadow` must
+  // track the light exactly the way `active` does, and it can only be 1 at
+  // all if a light-shadow bundle was built in the first place.
+  lightEntity.addComponent("light", {
+    kind: "directional", intensity: 4, color: "#ffffff",
+    castShadow: true, shadowMode: "gi",
+  });
   lightEntity.object3D.position.set(3, 6, 3);
 
   const giEntity = engine.createEntity({ name: "GI" });
@@ -124,6 +140,10 @@ const result = await page.evaluate(async () => {
   const sample = () => ({
     collected: system._lightObjects?.length ?? -1,
     activeSlots: system.state.lightSlots.filter((s) => s.active.value > 0.5).length,
+    // §19 Stage 4.0: the "gi" half of the same question. `giShadow` is what
+    // the shadow pass reads per frame and what `wantsGi` writes, so it reads 1
+    // exactly when a bundle exists AND this light claims it.
+    giShadowSlots: system.state.lightSlots.filter((s) => (s.giShadow?.value ?? 0) > 0.5).length,
     entityFlag: lightEntity.enabledInEditor,
     objectVisible: lightEntity.object3D.visible,
     lightVisible: lightEntity.getComponent("light")?.light?.visible ?? null,
@@ -131,6 +151,20 @@ const result = await page.evaluate(async () => {
 
   const steps = [];
   steps.push({ label: "light on", ...sample() });
+  // STRUCTURAL, read once: was a bundle built at all, and did the system hand
+  // this light its own `shadow.shadowNode`? `giShadowSlots === 0` has two very
+  // different causes — "no bundle" and "the light did not ask" — and only
+  // these say which.
+  const ls = system.state?.screen?.lightShadow ?? null;
+  const shadowRig = {
+    bundle: !!ls,
+    kind: ls?.gi2 ? "gi2-window" : ls ? "src-occupancy" : "none",
+    pass: !!system.state?.screen?.lightShadowPass,
+    filter: !!system.state?.screen?.lightShadowFilterPass,
+    claimed: system._lightShadowNodes?.size ?? 0,
+    shadowNode: !!lightEntity.getComponent("light")?.light?.shadow?.shadowNode,
+    mode: lightEntity.getComponent("light")?.light?.userData?.giShadowMode ?? null,
+  };
 
   const component = lightEntity.getComponent("light");
 
@@ -159,7 +193,7 @@ const result = await page.evaluate(async () => {
   await settle();
   steps.push({ label: "intensity 0", ...sample() });
 
-  return { steps };
+  return { steps, shadowRig };
 });
 
 if (result.error) {
@@ -171,10 +205,15 @@ if (result.error) {
 
 for (const s of result.steps) {
   console.log(
-    `${s.label.padEnd(22)} collected=${s.collected} activeSlots=${s.activeSlots}` +
+    `${s.label.padEnd(22)} collected=${s.collected} activeSlots=${s.activeSlots} giShadowSlots=${s.giShadowSlots}` +
       ` entityFlag=${s.entityFlag} object3D.visible=${s.objectVisible} light.visible=${s.lightVisible}`,
   );
 }
+const rig = result.shadowRig ?? {};
+console.log(
+  `shadow rig: bundle=${rig.bundle} (${rig.kind}) pass=${rig.pass} filter=${rig.filter} ` +
+    `claimedLights=${rig.claimed} shadowNode=${rig.shadowNode} userData.giShadowMode=${rig.mode}`,
+);
 
 const by = (label) => result.steps.find((s) => s.label === label);
 const checks = [
@@ -184,6 +223,14 @@ const checks = [
   ["component disabled stops GI", by("component disabled").activeSlots === 0],
   ["component re-enabled resumes GI", by("component re-enabled").activeSlots === 1],
   ["intensity 0 stops GI", by("intensity 0").activeSlots === 0],
+  // ── §19 Stage 4.0: Shadow Source "gi" is WIRED, not merely offered ──
+  ["a light-shadow bundle exists", rig.bundle === true],
+  ["the trace pass + its bilateral were built", rig.pass === true && rig.filter === true],
+  ["the light was handed a gi shadowNode", rig.claimed === 1 && rig.shadowNode === true],
+  ["gi shadows follow the light on", by("light on").giShadowSlots === 1],
+  ["gi shadows stop with the entity", by("entity disabled").giShadowSlots === 0],
+  ["gi shadows resume with the entity", by("entity re-enabled").giShadowSlots === 1],
+  ["gi shadows stop at intensity 0", by("intensity 0").giShadowSlots === 0],
 ];
 let failed = 0;
 for (const [name, ok] of checks) {

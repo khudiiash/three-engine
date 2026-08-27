@@ -245,6 +245,12 @@ await page.evaluate((project) => {
   row?.querySelector(".hub-recent-open-btn")?.click();
 }, PROJECT);
 await page.waitForFunction(() => !!globalThis.__editorApi, { timeout: 180000 });
+// The op surface exposes no engine, and §19 Stage 4.0's ownership-list gate
+// needs one. Resolved once, from the same module the editor boots from.
+await page.evaluate(async () => {
+  const mod = await import("/src/editor/engineInstance.js");
+  globalThis.__giEngineForProbe = mod.engine;
+});
 
 const call = async (op, args = {}) => {
   try {
@@ -519,6 +525,26 @@ for (const name of SCENES) {
     frameStats.giTransport === "alive");
   gate(name, "SRC kernels compiled", srcNames.length, 0, srcNames.length === 0);
   if (srcNames.length) console.log(`  ⚠ SRC kernels present: ${[...new Set(srcNames)].slice(0, 8).join(", ")}`);
+  // ── §19 STAGE 4.0: `gi2.crop` MUST NOT BE REACHABLE FROM THE ENGINE ────────
+  //
+  // ⚠ A PIPELINE LEDGER CANNOT ANSWER THIS ON ITS OWN. `gi2.crop` never
+  // appeared in the ledger even at 4.3a, because nothing DISPATCHES it — the
+  // damage was that it sat in `computeNodes`, the OWNERSHIP list, where any
+  // prewarm that walked that list dragged in 526 kB of WGSL and 11.8 s of
+  // driver compile (the Level's `computes` phase, 36 ms → 7056 ms). So the
+  // gate reads the ownership list itself, which is the thing that changed.
+  const owned = await page.evaluate(() => {
+    const mod = globalThis.__giEngineForProbe ?? null;
+    const sys = mod?.modules?.get?.("gi")?.system;
+    const nodes = sys?.state?.screen?.gi2?.computeNodes ?? null;
+    if (!nodes) return null;
+    return nodes.map((n) => n?.__giPassName ?? "(unnamed)");
+  });
+  if (owned) {
+    const crops = owned.filter((n) => /crop/i.test(n));
+    gate(name, "gi2.crop out of the ownership list", crops.length, 0, crops.length === 0);
+    console.log(`  gi2 ownership list: ${owned.length} compute nodes, ${crops.length} crop`);
+  }
   if (name.toLowerCase() === "bistro") {
     gate(name, "JS heap", +heapMB.toFixed(0), HEAP_MB, heapMB <= HEAP_MB, "MB");
   }

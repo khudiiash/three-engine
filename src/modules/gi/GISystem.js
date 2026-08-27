@@ -32,7 +32,7 @@ import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
 import { GI2_PATH, GI_QUALITY_LEVELS, GI_TERM_DEBUG_VIEWS, GI_TIER_GPU_BUDGET_BYTES, gi2TierOf, giDebugView, resolveGiConfig, sceneSkyRadiance, wgslPointerParametersSupported } from "./giConfig.js";
 import { createGi2System, createGi2Volume } from "./window/gi2System.js";
 import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
-import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
+import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGi2LightShadowPass, createGiAoFilterPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
 import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
 import { noteTextureAverage, pendingTextureAverages, resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
@@ -114,6 +114,26 @@ const RETIRED_TARGET_FRAMES = 3;
  * passes() doesn't run).
  */
 const OCC_DYNAMIC_QUIET_FRAMES = 90;
+/**
+ * ══ §19 STAGE 4.0 — GI2's DYNAMIC LAYER: HOW MANY SLOTS, AND WHO GETS THEM ══
+ *
+ * `windowDynamic` re-voxelizes every seated mover from its live matrix every
+ * frame, so the cap is a per-frame budget and not a memory one. 64 was the
+ * number `#gi2Movers` shipped with at Stage 3.4 and nothing measured since
+ * argues with it — a humanoid rig now spends ~12-16 of them on bone boxes
+ * (see `#gi2SkinnedMovers`), which is exactly what the old path's
+ * `#buildOccupancyField` widened its own cap for.
+ */
+const GI2_MOVER_CAP = 64;
+/**
+ * Frames a seated mover may sit still before it is eligible for eviction under
+ * CAP PRESSURE. Not a demotion clock — a resting mover costs one box's worth
+ * of dynamic voxels and nothing else, so there is no reason to evict it while
+ * slots are free. This is `#evictRestingMover`'s rule, restated for the
+ * window: the longest-rested loses, and a skinned rig never does (a rig that
+ * happens to be in an idle pose is still going to move).
+ */
+const GI2_MOVER_REST_FRAMES = 120;
 /**
  * CONVERGED-IDLE SLEEP (run-gi-perf.mjs, 2026-08-03: the full pipeline at
  * rest is ~2.3ms GPU at ultra — feedback ~1.4, transport ~0.8 — recomputing
@@ -446,6 +466,65 @@ function giBuildBudgetSpent() {
   return giFrameBuildMs >= (Number(globalThis.__giFrameBuildBudgetMs) || 12);
 }
 
+/**
+ * ⭐⭐ §19 STAGE 4.0 — THE WAVE'S DEDUPE KEY IS THE *PROGRAM*, NOT THE OBJECT.
+ *
+ * This key used to be `material.uuid`, which is an IDENTITY and never a
+ * PROGRAM: two glTF materials with the same maps, the same sampler settings
+ * and the same `side` compile byte-identical WGSL and share one pipeline, but
+ * they carry different uuids and the wave therefore re-walked 180–250 kB of
+ * GI-injected node graph for each of them. MEASURED at 4.3a by
+ * `probe:gi2-boot`'s content signature: Bistro warmed **179 "unique material
+ * variants" over 80 distinct fragment texts** — 2.2× duplicated codegen, all
+ * of it on the critical path to first light.
+ *
+ * The honest key is the one three's own pipeline cache uses
+ * (`RenderObject.getMaterialCacheKey`): `customProgramCacheKey()` — which for
+ * a `NodeMaterial` already hashes every `*Node` child AND carries the GI
+ * roughness bucket `#markObservedMaterial` appends — plus the own-property
+ * walk, where numbers reduce to on/off, `side` keeps its value, and a texture
+ * contributes its SAMPLER settings rather than its identity. Colours, uuids,
+ * names and intensities are deliberately absent: none of them changes a line
+ * of generated code, and every one of them was splitting the warm list.
+ *
+ * ⚠ A KEY MAY ONLY MERGE VARIANTS THAT GENERATE THE SAME TEXT — the same rule
+ * `giPipelineBucketOf` is written against. Merging on uniform VALUES would be
+ * that bug; this merges on program STRUCTURE, and the receipt is that the
+ * wave's count converges on the probe's independently-measured
+ * distinct-fragment count instead of sitting at 2.2× it.
+ *
+ * `__giWaveKeyByUuid = true` restores the identity key for a one-boot A/B.
+ */
+function giMaterialProgramKey(m) {
+  if (!m) return "?";
+  let custom = "";
+  try {
+    custom = String(m.customProgramCacheKey?.() ?? "");
+  } catch {
+    // A node graph mid-edit can throw here; falling back to the uuid is the
+    // conservative answer (its own variant, warmed on its own) rather than
+    // collapsing an unknown material onto someone else's pipeline.
+    custom = m.uuid ?? "";
+  }
+  let props = "";
+  // `Object.keys` = own enumerable, sorted so the string is order-stable
+  // across two materials built by different code paths.
+  for (const name of Object.keys(m).sort()) {
+    const v = m[name];
+    if (v === null || v === undefined) continue;
+    if (v.isTexture === true) {
+      props += `${name}=${v.mapping}/${v.wrapS}/${v.wrapT}/${v.magFilter}/${v.minFilter}/${v.anisotropy}/${v.colorSpace};`;
+    } else if (typeof v === "boolean") {
+      props += `${name}=${v ? 1 : 0};`;
+    } else if (typeof v === "number") {
+      // three keeps `side` whole (front/back/double are three different
+      // programs) and reduces every other number to on/off.
+      props += `${name}=${name === "side" ? v : (v !== 0 ? 1 : 0)};`;
+    }
+  }
+  return `${m.type ?? "?"}|${custom}|${props}`;
+}
+
 function giCompileVariantKey(object) {
   const mat = object.material;
   const mats = Array.isArray(mat) ? mat : [mat];
@@ -453,7 +532,9 @@ function giCompileVariantKey(object) {
   const attrs = geo?.attributes ? Object.keys(geo.attributes).sort().join(",") : "";
   const skin = object.isSkinnedMesh ? "s" : "";
   const morph = geo?.morphAttributes && Object.keys(geo.morphAttributes).length ? "m" : "";
-  const ids = mats.map((m) => m?.uuid ?? m?.type ?? "?").join("+");
+  const ids = globalThis.__giWaveKeyByUuid === true
+    ? mats.map((m) => m?.uuid ?? m?.type ?? "?").join("+")
+    : mats.map(giMaterialProgramKey).join("+");
   return `${ids}|${attrs}|${skin}|${morph}`;
 }
 
@@ -3223,15 +3304,12 @@ export class GISystem {
       if (GI2_PATH && state.screen.gi2) {
         const gi2 = state.screen.gi2;
         gi2.setCamera(this.engine.camera);
-        // Movers are BOXES with live matrices (see `#gi2Movers`): the set is
-        // fixed at build, the poses are not. Three writes into a mapped array
-        // per mover, no upload, no rebuild.
-        if (this._gi2Movers?.length && gi2.dynamic) {
-          for (const m of this._gi2Movers) {
-            if (m.identity) continue;
-            gi2.dynamic.setMatrix(m.slot, m.mesh.matrixWorld);
-          }
-        }
+        // Movers are BOXES with live matrices (see `#gi2Movers`): the poses,
+        // the "auto" motion watch and the cap's re-seat all live in one place
+        // now. §19 Stage 4.0 — the loop this replaced skipped every mover
+        // flagged `identity`, which was exactly the skinned ones, so a
+        // character's dynamic footprint was frozen at its bind pose.
+        this.#refreshGi2Movers(gi2);
         this._gi2Frame = (this._gi2Frame ?? 0) + 1;
         this._gi2Passes = gi2.passes(this._gi2Frame);
         // §19 Stage 3.5 — the light tree's own re-upload, when it has new
@@ -3243,6 +3321,35 @@ export class GISystem {
         // batch genuinely landed.
         const treeUploads = this._lightTreeStore?.pendingPasses() ?? null;
         if (treeUploads?.length) this._gi2Passes.before.push(...treeUploads);
+        // ── §19 STAGE 4.0: THE LIGHT-SHADOW CHAIN, SPLICED IN ────────────────
+        //
+        // Trace then bilateral, appended to the POST-gbuffer half because the
+        // trace reads this frame's g-buffer — the same position it occupied in
+        // the SRC frame queue (`queue.push(screen.lightShadowPass.compute)`).
+        //
+        // ⚠ GATED ON A LIGHT ACTUALLY CLAIMING IT, per frame, not on the pass
+        // existing: the bundle is built whenever the window is, and marching
+        // every shadow pixel for a scene where nobody set Shadow Source "gi"
+        // is the most expensive no-op the module can dispatch. `giShadow` is
+        // the uniform `#updateLightUniforms` clears for every off/hidden/map
+        // light, so this reads the same switch materials do.
+        //
+        // Pushed onto BOTH `after` and `all`: `all` is a snapshot
+        // (`[...before, ...after]`) taken inside `passes()`, and
+        // `profile.giPasses` / `profile.gi2` time `all`. A pass in one and not
+        // the other runs untimed, which is how a kernel goes missing from a
+        // ledger it is supposed to be accounted in.
+        const giShadowClaimed = (state.lightSlots ?? []).some((s) => (s?.giShadow?.value ?? 0) > 0.5);
+        if (giShadowClaimed && state.screen.lightShadowPass) {
+          const chain = [state.screen.lightShadowPass.compute];
+          if (state.screen.lightShadowFilterPass) chain.push(state.screen.lightShadowFilterPass.compute);
+          state.screen.lightShadowPass.compute.__giPassName ??= "gi2.lightShadow";
+          if (state.screen.lightShadowFilterPass) {
+            state.screen.lightShadowFilterPass.compute.__giPassName ??= "gi2.lightShadowFilter";
+          }
+          this._gi2Passes.after.push(...chain);
+          this._gi2Passes.all.push(...chain);
+        }
         // The chain's SHAPE, once per change. A frame with 0 "before" passes is
         // a window with no voxelizer (the soup has not landed); a frame with 0
         // "after" passes is a gather that was never built — two very different
@@ -6182,6 +6289,51 @@ export class GISystem {
         else this._giIrradianceNode.value = gi2.textures.irradiance;
         if (!this._giRadianceNode) this._giRadianceNode = texture(gi2.textures.glossy);
         else this._giRadianceNode.value = gi2.textures.glossy;
+        // ── §19 STAGE 4.0: THE GI2 LIGHT-SHADOW BUNDLE ─────────────────────
+        //
+        // `#buildLightShadow` (the SRC bundle) has already returned null by the
+        // time we get here — it needs `volume.occupancyField.voxel` and GI2 has
+        // no field. It is also the WRONG place to build this one: the trace
+        // this pass needs belongs to the window, which is created three lines
+        // up. So the bundle is minted HERE, and everything downstream — the
+        // persistent `_giLightShadowNode`, `inputs.lightShadow`, the bilateral,
+        // `#syncLightShadowNodes`' `live` gate and `profile.giPasses`'
+        // `giShadowLive` label — is reached unchanged.
+        //
+        // `span` is the TOP LEVEL's world extent × √3, i.e. the longest ray
+        // that can stay inside the window. It is derived from the tier's own
+        // geometry rather than authored as metres, which is the rule this
+        // module keeps re-learning: a constant in world units gets retracted.
+        // `biasCells` is left at the trace's own default so the origin escape
+        // stays level-correct.
+        if (!lightShadow && globalThis.__giNoLightShadows !== true) {
+          const topExtent = gi2.win.levelExtent(gi2.win.levels - 1);
+          lightShadow = {
+            gi2: true,
+            slots: lightSlots ?? [],
+            span: topExtent * Math.sqrt(3),
+            traceWindow: gi2.trace.traceWindow,
+            // The bilateral's plane epsilon: the FINEST cell, because that is
+            // the quantization of the thing the trace answers about.
+            voxMax: gi2.win.voxel0,
+            // ⛔ The analytic-penumbra machinery is occupancy-pyramid-shaped
+            // and does not exist on this path (see the pass's header). `pcss`
+            // false is what keeps the two wide passes and the dist channel
+            // from being built against a texture nothing writes.
+            pcss: false,
+            analyticPen: false,
+          };
+          if (!this._loggedGi2LightShadow) {
+            this._loggedGi2LightShadow = true;
+            console.log(
+              "[gi2] light shadows: one window ray per shadow pixel per gi-flagged slot, " +
+                `span ${lightShadow.span.toFixed(1)} m, plane eps ${gi2.win.voxel0} m. ` +
+                "⚠ HARD shadow + the existing bilateral — the analytic penumbra width machinery " +
+                "(cone march, width probes, PCSS dist channel, the two wide passes) is occupancy-field " +
+                "shaped and is OFF on this path; softness comes back as its own unit.",
+            );
+          }
+        }
       }
       // PERSISTENT, created once per system and repointed on resize — exactly
       // like its siblings above, and here it is not merely an optimisation:
@@ -6992,7 +7144,21 @@ export class GISystem {
         this._giShadowCheckerU ??= uniform(0, "uint").setGroup(renderGroup);
         this._giShadowCheckerFillU ??= uniform(0, "uint").setGroup(renderGroup);
       }
-      const lightShadowPass = inputs.lightShadow
+      // §19 Stage 4.0: the GI2 bundle takes the window trace and has no
+      // checkerboard — the trace is one ray, not a jittered cone march, so
+      // there is no disc sample for a temporal phase to integrate and a
+      // half-dispatch would only buy a stale half of a deterministic answer.
+      const lightShadowPass = inputs.lightShadow?.gi2
+        ? createGi2LightShadowPass({
+            gbuffer,
+            lightShadow: inputs.lightShadow,
+            traceWindow: inputs.lightShadow.traceWindow,
+            width: shadowW,
+            height: shadowH,
+            resolveWidth: width,
+            resolveHeight: height,
+          })
+        : inputs.lightShadow
         ? createGiLightShadowPass({
             gbuffer,
             lightShadow: inputs.lightShadow,
@@ -10636,12 +10802,19 @@ export class GISystem {
       }
       // The shadow pass is camera-dependent the same way (it reads the
       // per-frame gbuffer), so it rides every half too.
-      if (screen.lightShadowPass) {
+      //
+      // ⚠ §19 STAGE 4.0 — NOT UNDER `GI2_PATH`. There the same two kernels are
+      // spliced into `_gi2Passes.after` by the tick, in §M.2's order and
+      // gated per frame on a light actually claiming gi shadows. Queuing them
+      // here as well would dispatch each of them TWICE per frame — the trace
+      // is the most expensive per-pixel work the module does, so the
+      // duplicate is not a cosmetic accounting error.
+      if (screen.lightShadowPass && !GI2_PATH) {
         queue.push(screen.lightShadowPass.compute);
         queueNoFeedback.push(screen.lightShadowPass.compute);
         queueFeedbackOnly.push(screen.lightShadowPass.compute);
       }
-      if (screen.lightShadowFilterPass) {
+      if (screen.lightShadowFilterPass && !GI2_PATH) {
         queue.push(screen.lightShadowFilterPass.compute);
         queueNoFeedback.push(screen.lightShadowFilterPass.compute);
         queueFeedbackOnly.push(screen.lightShadowFilterPass.compute);
@@ -12699,6 +12872,13 @@ export class GISystem {
       if (this._gi2 === state.screen.gi2) this._gi2 = null;
       this._gi2Passes = null;
       this._gi2Movers = null;
+      // §19 Stage 4.0: the mover derivation's own state. `_gi2MoverMeshes`
+      // holds live scene meshes, so leaving it behind would keep a deleted
+      // scene's objects alive through this system.
+      this._gi2MoverMeshes = null;
+      this._gi2AutoWatch = null;
+      this._gi2Promoted = null;
+      this._gi2MoversDirty = false;
       this._gi2Stats = null;
     }
     // The gbuffer is per-build; the resolve TARGETS are not (see
@@ -15941,12 +16121,34 @@ export class GISystem {
       parts.push(p.geometryKey, e[12].toFixed(3), e[13].toFixed(3), e[14].toFixed(3), e[0].toFixed(3), e[5].toFixed(3), e[10].toFixed(3));
       return { ...p, albedo: s.albedo, emissive: s.emissive };
     });
+    // §19 Stage 4.0: the mesh list this build's movers are derived FROM, so a
+    // promotion can re-derive without re-walking the scene. Cleared with the
+    // build, like every other per-state field.
+    this._gi2MoverMeshes = meshes;
+    this._gi2Movers = null;
+    this._gi2Promoted = new Set();
+    this._loggedGi2SkinnedMovers = false;
     const movers = this.#gi2Movers(meshes);
     this._gi2Movers = movers;
     // A mover is in the DYNAMIC layer, re-voxelized from its live matrix every
     // frame — so it must not ALSO be baked into the static soup at its build
     // pose, or it leaves a permanent ghost of itself where it started.
     const moverMeshes = new Set(movers.map((m) => m.mesh));
+    // ── THE "auto" MOTION WATCH (§19 Stage 4.0) ──────────────────────────────
+    // Every mesh that is neither pinned nor already seated, recorded at its
+    // build pose. `#refreshGi2Movers` compares against this and promotes the
+    // first one that moves — the old path's "FIRST MOTION = ADOPTION POINT",
+    // which is the rule that keeps a mover's silhouette from being a per-frame
+    // voxel-membership function. A skinned rig is never here: it is seated
+    // unconditionally, because a rig always animates.
+    const watch = [];
+    for (const mesh of meshes) {
+      if (moverMeshes.has(mesh) || mesh.isSkinnedMesh) continue;
+      if (giMobilityOf(mesh) !== "auto") continue;
+      watch.push({ mesh, matrix: mesh.matrixWorld.clone() });
+    }
+    this._gi2AutoWatch = watch;
+    this._gi2MoversDirty = false;
     const staticPlacements = moverMeshes.size
       ? enriched.filter((p) => !moverMeshes.has(p.mesh))
       : enriched;
@@ -15972,54 +16174,241 @@ export class GISystem {
   }
 
   /**
+   * ══ §19 STAGE 4.0 — THE MOVERS, DERIVED FROM THE ENTITY SIDE ══════════════
+   *
    * The movers the dynamic layer voxelizes every frame (§K.5).
    *
-   * BOXES, not triangles, in this first cut: `windowDynamic` caps a mover at
-   * `MAX_MOVER_TRIS` and falls back to its box anyway above that, and a mover's
-   * job in the window is to OCCLUDE and to bounce — a character's silhouette at
-   * 0.25 m cells is its bounding box either way. The exact-dynamic adoption set
-   * and the skinned proxies are the same two sources the old path used; what
-   * changes is that neither needs a BVH block or a card table here.
+   * BOXES, not triangles: `windowDynamic` caps a mover at `MAX_MOVER_TRIS` and
+   * falls back to its box anyway above that, and a mover's job in the window is
+   * to OCCLUDE and to bounce.
+   *
+   * ⭐⭐ WHAT CHANGED AT 4.0, AND WHY IT IS NOT A TUNING CHANGE.
+   *
+   * Stage 3.4's version seated a skinned mesh as ONE WORLD BOX with
+   * `identity: true`, which the tick's pose loop then explicitly SKIPS
+   * (`if (m.identity) continue`). So a character's dynamic footprint was
+   * computed once, at build, from its bind-pose world box — and then frozen
+   * there for the life of the build. `profile.gi2.dynamic.voxelsSet` stayed
+   * comfortably above zero the whole time (measured 374 on the Level at 4.3a),
+   * which is exactly the shape of a receipt that cannot see its subject: the
+   * voxels existed, they just were not where the character was.
+   *
+   * The old path never had that problem because a rig did not ship as a box at
+   * all — `#refreshSkinnedProxies` fitted PER-BONE flesh boxes and re-read each
+   * bone's live matrix every frame. That machinery is intact and entirely
+   * independent of the occupancy field; the only thing that made it
+   * unreachable is its caller (`#refreshDynamicObjects` returns immediately
+   * because `_dynSet` is born inside `#buildOccupancyField`, audits §N.3 R3).
+   * So this reads `#skinnedProxyGroups()` directly and turns each fitted
+   * segment into one mover slot whose matrix IS the bone's — no
+   * `createDynamicObjectSet`, no BVH block, no card table.
+   *
+   * ⚠ "auto" IS STILL NOT "dynamic" AT BUILD TIME, and reading it as one put
+   * 64 of the Level's 111 meshes in the dynamic layer (the whole street
+   * re-voxelized every frame while the static window sat empty). What 4.0 adds
+   * is the other half of the old rule: `"auto"` means "the adoption machinery
+   * decides, by watching for MOTION", and `#refreshGi2Movers` now runs that
+   * watch. A mesh promoted there lands in `_gi2Promoted` and this method seats
+   * it on the next re-derive.
    */
   #gi2Movers(meshes) {
     const out = [];
     const box = new THREE.Box3();
+    const promoted = this._gi2Promoted;
+    // ── SKINNED RIGS FIRST: they are the ones with a hard claim on a slot ──
+    // A rig always animates, and if the cap is contended it must not lose to a
+    // crate. `covered` is every mesh a fitted rig speaks for, so the box arm
+    // below cannot seat the same body twice.
+    const covered = this.#gi2SkinnedMovers(out);
+    // How long each currently-seated rigid mover has been still, so a re-seat
+    // under cap pressure evicts the longest-RESTED rather than whatever the
+    // scene walk happened to reach last (`#evictRestingMover`'s rule).
+    const restOf = new Map();
+    for (const m of this._gi2Movers ?? []) if (m?.mesh && !m.skinned) restOf.set(m.mesh, m.restFrames ?? 0);
+    const rigid = [];
     for (const mesh of meshes) {
-      if (out.length >= 64) break;
+      if (covered.has(mesh)) continue;
       const mobility = giMobilityOf(mesh);
       const skinned = mesh.isSkinnedMesh === true;
-      // ⚠ "auto" IS NOT "dynamic", and reading it as one put 64 of the Level's
-      // 111 meshes in the dynamic layer — the whole street re-voxelized every
-      // frame while the static window sat empty. `giMobilityOf` defaults to
-      // "auto", which on the old path meant "the adoption machinery decides,
-      // by watching for MOTION"; GI2 does not run that machinery yet, so the
-      // honest reading of "auto" is STATIC — a mesh that never moves belongs in
-      // the soup, and one that does will be adopted when the adoption unit
-      // lands. Only an explicit tag, or a skeleton (a rig always animates),
-      // buys a mover slot.
-      if (mobility !== "dynamic" && !skinned) continue;
+      if (mobility === "static") continue;
+      // Explicit "dynamic", an unfitted skeleton (the fallback arm — better a
+      // root-following box than nothing), or an "auto" mesh the motion watch
+      // has already promoted.
+      if (mobility !== "dynamic" && !skinned && !promoted?.has(mesh)) continue;
       if (!mesh.geometry?.boundingBox) mesh.geometry?.computeBoundingBox?.();
       const bb = mesh.geometry?.boundingBox;
       if (!bb) continue;
-      // A SkinnedMesh's own matrix cancels out of its vertex positions, so its
-      // LOCAL box is meaningless — use the WORLD box and an identity matrix,
-      // which is what `#refreshSkinnedProxies` resolves to anyway.
-      const identity = skinned;
-      if (identity) {
-        box.copy(bb).applyMatrix4(mesh.matrixWorld);
-      } else {
-        box.copy(bb);
-      }
+      rigid.push({ mesh, skinned, rest: restOf.get(mesh) ?? 0 });
+    }
+    // Only pay for the sort when the slots are actually contended — the point
+    // of `GI2_MOVER_REST_FRAMES` is that a resting mover is CHEAP, so nothing
+    // is gained by ranking a list that fits.
+    if (out.length + rigid.length > GI2_MOVER_CAP) {
+      rigid.sort((a, b) => (a.rest >= GI2_MOVER_REST_FRAMES ? 1 : 0) - (b.rest >= GI2_MOVER_REST_FRAMES ? 1 : 0) || a.rest - b.rest);
+    }
+    for (const cand of rigid) {
+      if (out.length >= GI2_MOVER_CAP) break;
+      box.copy(cand.mesh.geometry.boundingBox);
       out.push({
         slot: out.length,
-        mesh,
-        identity,
+        mesh: cand.mesh,
+        node: cand.mesh,
+        identity: false,
         min: [box.min.x, box.min.y, box.min.z],
         max: [box.max.x, box.max.y, box.max.z],
-        matrix: identity ? new THREE.Matrix4() : mesh.matrixWorld.clone(),
+        matrix: cand.mesh.matrixWorld.clone(),
+        skinned: cand.skinned,
+        restFrames: cand.rest,
       });
     }
     return out;
+  }
+
+  /**
+   * The skinned half of `#gi2Movers`: one window mover per fitted bone box.
+   *
+   * `#skinnedProxyGroups()` is the SAME fit the old exact-dynamic path used
+   * (`fitSkinnedCapsules` → per-bone flesh boxes in BONE-LOCAL space, plus
+   * joint-bridge capsules), memoised on `_dynamicSurfaces` and dependent on
+   * nothing the occupancy field owns. Each segment ships as
+   * `min/max = center ± halfExtents` with `matrixOf` reading the live bone
+   * matrix — which is precisely `skinnedBoxShape` + `skinnedBoneMatrix`, i.e.
+   * the contract `#refreshSkinnedProxies` already writes against.
+   *
+   * ⚠ THE BRIDGES SHIP AS BOXES TOO. A bridge segment is a sphere/capsule in
+   * the exact path; the window has one primitive, so it takes the capsule's
+   * own unit bounds through `skinnedCapsuleMatrix` (which already carries the
+   * radius as scale). A voxelised sphere and a voxelised cube of the same
+   * radius differ by less than a cell at 0.25 m, and the bridge exists to
+   * close a wedge, not to be round.
+   *
+   * Returns the set of meshes the fitted rigs speak for, so the caller's box
+   * arm skips them.
+   */
+  #gi2SkinnedMovers(out) {
+    const covered = new Set();
+    if (globalThis.__gi2SkinnedMovers === false) return covered;
+    const groups = this.#skinnedProxyGroups();
+    if (!groups?.size) return covered;
+    const m4 = new THREE.Matrix4();
+    for (const group of groups.values()) {
+      const mesh = group.rep;
+      let seated = 0;
+      for (const segment of group.segments) {
+        if (out.length >= GI2_MOVER_CAP) break;
+        const asBox = !!segment.he && !segment.bridge;
+        const shape = asBox ? skinnedBoxShape(segment) : skinnedCapsuleShape(segment);
+        const matrixOf = asBox
+          ? (o) => skinnedBoneMatrix(mesh, segment, o)
+          : (o) => skinnedCapsuleMatrix(mesh, segment, o);
+        // A segment whose bone the representative skeleton does not carry
+        // (a foreign skin the fit could not map) has no live matrix — seating
+        // it would voxelize a box at the origin every frame.
+        if (!matrixOf(m4)) continue;
+        const c = shape.center;
+        const he = shape.halfExtents;
+        out.push({
+          slot: out.length,
+          mesh,
+          node: mesh,
+          identity: false,
+          skinned: true,
+          matrixOf,
+          min: [c.x - he.x, c.y - he.y, c.z - he.z],
+          max: [c.x + he.x, c.y + he.y, c.z + he.z],
+          matrix: m4.clone(),
+          restFrames: 0,
+        });
+        seated++;
+      }
+      if (seated) for (const m of group.meshes) covered.add(m);
+    }
+    if (covered.size && !this._loggedGi2SkinnedMovers) {
+      this._loggedGi2SkinnedMovers = true;
+      console.log(
+        `[gi2] skinned movers: ${groups.size} rig(s) → ${out.length} bone boxes in the dynamic layer ` +
+          "(the fitted flesh boxes, each on its own live bone matrix — not one frozen bind-pose box).",
+      );
+    }
+    return covered;
+  }
+
+  /**
+   * ⭐ §19 STAGE 4.0 — THE PER-FRAME MOVER UPKEEP (the adoption rule, GI2's
+   * terms). Called from the tick's GI2 first half, before `passes()`.
+   *
+   * Three jobs, in this order:
+   *
+   *  1. **Poses.** Every seated mover's live matrix goes into the dynamic
+   *     layer's mapped array. A bone mover reads `matrixOf`; a rigid one reads
+   *     `mesh.matrixWorld`. No upload, no rebuild — `windowDynamic` re-voxelizes
+   *     from the buffer it already owns.
+   *  2. **Promotion.** An `"auto"` mesh that has actually MOVED since the build
+   *     is what the old path adopted on first motion (`#refreshOccupancyTransforms`
+   *     → `#tryAdoptDynamic`), and the reason is not performance: a mover's
+   *     silhouette must stop being a per-frame voxel-membership function, which
+   *     is the measured popping mechanism. GI2 has no per-placement static
+   *     exclusion yet, so a promoted mesh keeps its static soup copy until the
+   *     next rebuild — the promotion is therefore ONCE PER MESH and says so out
+   *     loud rather than quietly re-minting the world.
+   *  3. **Eviction under cap pressure only.** A resting mover costs one box of
+   *     dynamic voxels; there is no reason to spend a re-seat on it while slots
+   *     are free. `GI2_MOVER_REST_FRAMES` decides who loses when they are not.
+   */
+  #refreshGi2Movers(gi2) {
+    if (!gi2?.dynamic) return;
+    const movers = this._gi2Movers;
+    const m4 = (this._gi2MoverMatrix ??= new THREE.Matrix4());
+    let moving = 0;
+    if (movers?.length) {
+      for (const m of movers) {
+        let live = null;
+        if (m.matrixOf) {
+          if (m.matrixOf(m4)) live = m4;
+        } else if (m.mesh) {
+          live = m.mesh.matrixWorld;
+        }
+        if (!live) continue;
+        if (m.matrix.equals(live)) {
+          m.restFrames = (m.restFrames ?? 0) + 1;
+        } else {
+          m.matrix.copy(live);
+          m.restFrames = 0;
+          moving++;
+        }
+        gi2.dynamic.setMatrix(m.slot, m.matrix);
+      }
+    }
+    this._gi2MoversMoving = moving;
+    // ── PROMOTION: the "auto" motion watch ────────────────────────────────
+    const watch = this._gi2AutoWatch;
+    if (watch?.length && globalThis.__gi2AdoptMovingAuto !== false) {
+      const promoted = (this._gi2Promoted ??= new Set());
+      let adopted = 0;
+      for (let i = watch.length - 1; i >= 0; i--) {
+        const w = watch[i];
+        const mesh = w.mesh;
+        if (!mesh?.parent) { watch.splice(i, 1); continue; }
+        if (w.matrix.equals(mesh.matrixWorld)) continue;
+        w.matrix.copy(mesh.matrixWorld);
+        watch.splice(i, 1);
+        promoted.add(mesh);
+        adopted++;
+      }
+      if (adopted) {
+        console.log(
+          `[gi2] dynamic layer: adopted ${adopted} "auto" mesh(es) that moved. ` +
+            "Their static soup copy stays until the next GI rebuild (GI2 has no per-placement " +
+            "static exclusion yet) — pin them \"Dynamic\" in the Mesh component to hold them out at build.",
+        );
+        this._gi2MoversDirty = true;
+      }
+    }
+    if (!this._gi2MoversDirty) return;
+    this._gi2MoversDirty = false;
+    const next = this.#gi2Movers(this._gi2MoverMeshes ?? []);
+    this._gi2Movers = next;
+    gi2.setMovers(next);
   }
 
   #occupancyContentOf(meshes) {

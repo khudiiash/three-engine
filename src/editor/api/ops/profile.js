@@ -937,13 +937,67 @@ defineOp({
   name: "profile.gi2",
   readOnly: true,
   description:
-    "GI2's own receipts (§19 Stage 3.4) — the window, the voxelizer budget, the dynamic layer and the screen-probe gather, read FRESH off the GPU rather than from the tick's 30-frame snapshot. Returns null when GI is not built or when the build constant `GI2_PATH` is false, i.e. when the SRC path is the lit one; that null is the answer to \"which transport is running\". The two boot numbers are `firstOccupancyMs` (per window level) and `firstLightMs`, both measured from the moment the GI2 build started, not from page load. Use profile.frameStats.gi2 instead when you want the same block without paying for a readback.",
-  params: {},
-  async run() {
-    const gi2 = engine?.modules?.get?.("gi")?.system?._gi2;
+    "GI2's own receipts (§19 Stage 3.4/K.8/L.7) — the window, the voxelizer budget, the dynamic layer and the screen-probe gather, read FRESH off the GPU rather than from the tick's 30-frame snapshot. Returns null when GI is not built or when the build constant `GI2_PATH` is false, i.e. when the SRC path is the lit one; that null is the answer to \"which transport is running\". The two boot numbers are `firstOccupancyMs` (per window level) and `firstLightMs`, both measured from the moment the GI2 build started, not from page load. `dynamic.voxelsSet` above zero every frame is what says an animated character is actually in the dynamic layer. Pass `kernelSamples` above zero to also get `kernelMs` — the per-kernel GPU cost of the exact ordered chain the last tick submitted, named by pass — which briefly suspends rendering the way profile.giPasses does. Use profile.frameStats.gi2 instead when you want the counters without paying for a readback.",
+  params: {
+    kernelSamples: {
+      type: "number",
+      default: 0,
+      description:
+        "Dispatches per GI2 kernel for the per-kernel `kernelMs` breakdown. 0 (default) skips the timing pass entirely and returns counters only, with no freeze. Max 200.",
+    },
+  },
+  async run({ kernelSamples = 0 } = {}) {
+    const sys = engine?.modules?.get?.("gi")?.system;
+    const gi2 = sys?._gi2;
     if (!gi2) return null;
     const stats = await gi2.stats(engine.renderer);
-    return { ...stats, describe: gi2.describe() };
+    const out = { ...stats, describe: gi2.describe(), kernelMs: null, kernelTotalMs: null };
+    const K = Math.max(0, Math.min(200, Math.round(kernelSamples)));
+    if (K < 1) return out;
+    const renderer = engine?.renderer;
+    // ⚠ SAME PRECONDITION AS `profile.giPasses`, SAID THE SAME WAY: without
+    // timestamp queries there are no per-pass numbers to report, and a block
+    // of zeros reads as "the chain is free" rather than "the instrument is
+    // blind" (memory: check the instrument can see its subject).
+    if (!renderer?.backend?.trackTimestamp) {
+      out.kernelMs = { error: "This adapter has no timestamp-query support, so per-kernel GPU timings are unavailable." };
+      return out;
+    }
+    // ⭐ THE CHAIN THE LAST TICK ACTUALLY SUBMITTED, not a re-derived plan.
+    // `_gi2Passes.all` is `before + after` in submit order (and it is where
+    // the light-shadow chain splices in), so a kernel that a stage SPLIT IN
+    // TWO shows up here without anybody remembering to add it — the same
+    // reasoning `gather.frameOrder` carries.
+    const chain = sys._gi2Passes?.all ?? [];
+    if (!chain.length) return out;
+    const wasSuspended = engine.renderSuspended;
+    engine.renderSuspended = true;
+    await new Promise((r) => setTimeout(r, 120));
+    try {
+      const kernelMs = {};
+      let total = 0;
+      for (let i = 0; i < chain.length; i++) {
+        const node = chain[i];
+        if (!node) continue;
+        const name = node.__giPassName ?? `gi2[${i}]`;
+        // Warm first (the first dispatch pays pipeline + bind-group setup),
+        // then K reps and ONE resolve whose RETURN VALUE is the batch — never
+        // a before/after subtraction of `info.compute.timestamp`, which is
+        // assigned per resolve and not accumulated (see profile.giPasses).
+        renderer.compute(node);
+        await renderer.resolveTimestampsAsync("compute");
+        for (let k = 0; k < K; k++) renderer.compute(node);
+        const dur = await renderer.resolveTimestampsAsync("compute");
+        const ms = +(((dur ?? 0)) / K).toFixed(4);
+        kernelMs[kernelMs[name] === undefined ? name : `${name} #${i}`] = ms;
+        total += ms;
+      }
+      out.kernelMs = kernelMs;
+      out.kernelTotalMs = +total.toFixed(3);
+    } finally {
+      engine.renderSuspended = wasSuspended;
+    }
+    return out;
   },
 });
 

@@ -119,6 +119,7 @@
     "test:sky": "node --test tests/cubemap-asset.test.mjs",
     "test:applytransform": "node scripts/run-apply-transform-test.mjs",
     "test:gi-lightvis": "node scripts/run-gi-light-visibility.mjs",
+    "test:gi2-lightshadow": "node scripts/run-gi2-light-shadow.mjs",
     "test:gi-sunleak": "node scripts/run-gi-sun-leak.mjs",
     "test:gi-primfit": "node scripts/run-gi-primitive-fit-test.mjs",
     "test:gi-rayhit": "node scripts/run-gi-ray-hit-phase0-test.mjs",

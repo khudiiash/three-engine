@@ -280,7 +280,13 @@ export function createGi2System({
       positionTexture: gbuffer.position,
       normalTexture: gbuffer.normal,
       width, height, tier,
-      crops: 8,
+      // ⭐ §19 STAGE 4.0 — ZERO, SO `gi2.crop` CANNOT EXIST ON THE ENGINE PATH.
+      // It is a harness receipt (526 kB of WGSL, 11.8 s of driver compile at
+      // 4.3a) that nothing in a frame dispatches, yet it rode `computeNodes`
+      // — the OWNERSHIP list — into every consumer that walks it. The harness
+      // pages construct their own gather and pass their own crop count; see
+      // `createGiGather`'s note at the buffers.
+      crops: 0,
       // §19 Stage 3.5 — THE 3.2 API GAP IS CLOSED (see the header note, now
       // historical). The gather takes the system's own nodes; nothing is
       // mirrored, and there is one authored description of the sun, of the
@@ -896,7 +902,9 @@ export function createGi2System({
           dynamic.metaBuffer.value, dynamic.xformBuffer.value);
       }
       if (soup) list.push(soup.tris.value, soup.triPal.value, soup.cellRange.value, soup.cellTris.value);
-      if (gather) for (const b of Object.values(gather.buffers)) list.push(b.value);
+      // `b?.value`: a harness-only buffer (the crop pair) is null on the
+      // engine path — see `crops: 0` above.
+      if (gather) for (const b of Object.values(gather.buffers)) list.push(b?.value);
       return list.filter((a) => a?.isBufferAttribute === true);
     },
     /** Everything `collectStateComputeNodes` has to see. */

@@ -2249,6 +2249,117 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
 }
 
 /**
+ * ══ ⭐⭐ §19 STAGE 4.0 — GI-TRACED LIGHT SHADOWS ON THE WINDOW ══════════════
+ *
+ * `Shadow Source = "gi"` is a SHIPPED inspector option (`LightComponent.js`,
+ * `shadowMode`), and under `GI2_PATH` it was a live regression, not a
+ * cutover risk: `#buildLightShadow` returns null the moment it cannot find
+ * `volume.occupancyField.voxel`, GI2 has no occupancy field, so a light set to
+ * "gi" silently fell back to three's own (tiny) shadow map while the inspector
+ * kept hiding the 13 map-mode rows that would have let anyone size it. This
+ * pass is the GI2 half of that contract.
+ *
+ * ONE RAY PER SHADOW PIXEL PER SLOT, through `traceWindow` — the same
+ * estimator every other GI2 term uses, so the direct shadow and the bounce
+ * cannot disagree about where a wall is (which is what "the indirect and the
+ * direct come from different suns" meant on the old path). Directional slots
+ * trace along the unit vector TOWARD the light for `span` metres and let the
+ * window's own slab exit clamp them; point/spot slots trace toward the
+ * position with `tMax` = the distance.
+ *
+ * ⛔ NO ANALYTIC PENUMBRA, DELIBERATELY, AND IT IS LOGGED.
+ * `#buildLightShadow`'s width machinery — the cone march, the width probes,
+ * `srcVolume`'s soft-shadow trace, the PCSS dist channel and the two wide
+ * passes — all read the occupancy pyramid's blurred distance field, and none
+ * of that exists here. A hard visibility term plus the existing bilateral is
+ * the honest first cut; anything else would be a softness invented from a
+ * blocker distance nobody measured. The bilateral is unchanged and
+ * resolution-stable (0.5b made every screen pass `setSize`-able), so it is
+ * REUSED rather than reimplemented.
+ *
+ * ⚠ THE DEFAULT IS 1 (unshadowed), for the same load-bearing reason the old
+ * pass documents: a pixel with no geometry, a slot with no gi-flagged light
+ * and a grazing receiver must all leave the light untouched. The one place
+ * that writes 0 instead is the terminator gate, where the GEOMETRIC N·L is
+ * ~0 while the SHADING normal can still carry real N·L — a skipped 1 there is
+ * a full-sun pixel on a grazing surface.
+ */
+export function createGi2LightShadowPass({
+  gbuffer, lightShadow, traceWindow, width, height, resolveWidth, resolveHeight,
+}) {
+  const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
+  const widthU = dims.widthU;
+  const positionNode = texture(gbuffer.position);
+  const normalNode = texture(gbuffer.normal);
+  const target = lightShadow.rawTarget ?? lightShadow.target;
+
+  const compute = Fn(() => {
+    const px = instanceIndex.mod(widthU);
+    const py = instanceIndex.div(widthU);
+    const coord = ivec2(px.toInt(), py.toInt());
+    // Nearest gbuffer texel at the (usually finer) resolve resolution — the
+    // shadow channel has its own budget, exactly as it did on the old path.
+    const gCoord = ivec2(
+      px.toFloat().add(0.5).mul(dims.sxU).toInt(),
+      py.toFloat().add(0.5).mul(dims.syU).toInt(),
+    );
+    const g0 = positionNode.load(gCoord).toVar();
+    const g1 = normalNode.load(gCoord).toVar();
+    // Exactly FOUR, because the target has four channels — a fifth gi light
+    // keeps its shadow map.
+    const vis = Array.from({ length: 4 }, () => float(1).toVar());
+    If(g0.w.greaterThan(0.5), () => {
+      const P = g0.xyz.toVar();
+      const rawN = g1.xyz.normalize().toVar();
+      lightShadow.slots.slice(0, vis.length).forEach((slot, index) => {
+        If(slot.giShadow.greaterThan(0.5).and(slot.active.greaterThan(0.5)), () => {
+          const isDir = float(slot.kind).toVar();
+          const rel = vec3(slot.vector).sub(P).toVar();
+          const pointDist = rel.length().max(1e-4).toVar();
+          // `vector` holds: point → world position, directional → the unit
+          // direction TOWARD the light. Same convention as giLight's
+          // `analyticDirectAt` and the old pass, so the three terms agree.
+          const dir = mix(rel.div(pointDist), vec3(slot.vector), isDir).normalize().toVar();
+          const dist = mix(pointDist, float(lightShadow.span), isDir).toVar();
+          // LIGHT-RELATIVE, NEVER CAMERA-RELATIVE (the old pass's note): a
+          // visibility term keyed to the camera flips coherently across a
+          // whole wall near grazing angles. The oriented normal is what the
+          // trace's origin-escape rule pushes along.
+          const cosSigned = dir.dot(rawN).toVar();
+          const cosRayNormal = cosSigned.abs().toVar();
+          const nOriented = rawN.mul(cosSigned.sign()).toVar();
+          vis[index].assign(0);
+          If(cosRayNormal.greaterThan(0.05), () => {
+            // ⭐ THE ORIGIN BIAS IS THE TRACE'S JOB, NOT THE CALLER'S.
+            // `traceWindow(o, d, tMax, n, biasCells)` pushes the origin out of
+            // its OWN voxel in cells of the origin's own level and escapes
+            // further if it is still inside — which is exactly the rule the
+            // old pass hand-rolled as `lift` in occupancy voxels, and it is
+            // level-correct here in a way a single world constant cannot be
+            // (memory: constants in world units get retracted).
+            const maxT = dist.mul(0.999).max(1e-3).toVar();
+            const r = traceWindow(P, dir, maxT, nOriented, lightShadow.biasCells);
+            vis[index].assign(select(r.hit.greaterThan(0.5), float(0), float(1)));
+          });
+        });
+      });
+    });
+    textureStore(target, coord, vec4(vis[0], vis[1], vis[2], vis[3]));
+  })().compute(width * height);
+
+  return {
+    compute,
+    widthU,
+    dims,
+    setSize(w, h, rw = w, rh = h) {
+      dims.set(w, h, rw, rh);
+      compute.count = w * h;
+      return true;
+    },
+  };
+}
+
+/**
  * EMITTER SHADOWS as their own pass at the shadow-channel budget
  * (2026-08-06). These traces used to run inside the resolve kernel — one
  * record march (or sphere trace) per RESOLVE pixel per emitter slot, so a
