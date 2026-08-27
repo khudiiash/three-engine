@@ -542,3 +542,46 @@ export function giDebugView(component = null) {
   if (typeof propValue === "string") return propValue;
   return "off";
 }
+
+// ══ §19 STAGE 3.4 — THE GI2 BUILD CONSTANT (audits §M) ═══════════════════════
+//
+// GI2 (the window + soup + voxelizer + dynamic layer + screen-probe gather +
+// radiance cache) is the lit path. The SRC chain and the dense occupancy field
+// are still IN the tree and still compile; this constant is what decides which
+// of the two `GISystem#rebuild` actually builds.
+//
+// ⚠ IT IS A MODULE-PRIVATE BUILD CONSTANT, NOT A PROPERTY AND NOT A `__gi*`
+// FLAG, and the distinction is the whole point:
+//
+//   · a component PROPERTY would be a knob — a scene could be saved on the old
+//     path and would then never migrate, which is exactly the "27 properties"
+//     failure `resolveGiConfig` exists to prevent;
+//   · a `__gi*` GLOBAL would be flippable at runtime, and the two paths do not
+//     share a build — flipping it mid-session would leave half a system;
+//   · a CONSTANT is edited in one place, in one commit, by someone who then
+//     runs both batteries. Stage 4 deletes the `false` branch and this line
+//     with it.
+//
+// Until then `GI2_PATH = false` restores the SRC path byte-for-byte, which is
+// what `test:gi-occupancy` and `test:gi-src-gather` keep gating.
+export const GI2_PATH = true;
+
+/**
+ * GI quality tier → GI2 window tier. A 1:1 map, published rather than inlined
+ * so `windowStore`/`gatherProbes`/`radianceCache`'s four tier tables and this
+ * module's four quality levels can never drift apart silently: every GI2 tier
+ * table is keyed `phone | medium | high | ultra`, and GI's authored ladder is
+ * `low | medium | high | ultra`. Only the bottom rung is renamed — "low" on a
+ * desktop and "phone" are the same envelope (3 levels, 0.5 m cells, 8 rays).
+ */
+export const GI2_TIER_BY_QUALITY = Object.freeze({
+  low: "phone",
+  medium: "medium",
+  high: "high",
+  ultra: "ultra",
+});
+
+/** The GI2 window tier for a component's props (via the settled quality). */
+export function gi2TierOf(props, runtime = globalThis) {
+  return GI2_TIER_BY_QUALITY[resolveGiConfig(props, runtime).quality] ?? "high";
+}

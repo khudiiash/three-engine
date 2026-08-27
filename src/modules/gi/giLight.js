@@ -41,6 +41,7 @@ import {
   vec4,
 } from "three/tsl";
 import { sharedFn } from "./giFn.js";
+import { GI2_PATH } from "./giConfig.js";
 import { sampleReflectionProbes } from "./reflectionProbes.js";
 
 // Fixed emitter slot count: slots are compiled into the material shader, so
@@ -2013,8 +2014,36 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
     // exact): wrong-surface taps are rejected, valid ones blend distance-
     // weighted, and with no valid tap the DARKEST tap wins — for additive
     // light a dark error is a dim pixel, a bright error is the dot.
-    const bilateral =
-      light.giPositionNode && light.giScreenTexel
+    //
+    // ══ §19 STAGE 3.4 / §M.3 — ONE SAMPLE UNDER GI2 ═══════════════════════
+    //
+    // Every word above is about a HALF-RES resolve. GI2's resolve (§L.5) runs
+    // at FULL resolution: `giUV` lands on the texel that holds exactly this
+    // pixel's GI, the four ±0.5-texel taps land on four DIFFERENT pixels'
+    // answers, and the validation then rejects three of them for being what
+    // they are. The bilateral is not merely unnecessary there — it is a
+    // 4×-cost blur of a signal that was already per-pixel.
+    //
+    // Collapsing it takes items 3 AND 5 of the J.0 table with it (8 + 8 texture
+    // fetches, ~80 emitted statements, the measured −8.4 kB that clears the J.7
+    // gate) — item 5 twice over, since GI2 does not build `emitterShadowPass`
+    // at all and `giEmitterShadowNode` is therefore null.
+    //
+    // The NESTED-VIEW stand-in survives, and must: a planar reflector renders
+    // this material against the MAIN camera's GI texture, where most of the
+    // mirrored image is off-screen. One tap there is a wrong tap, not a blurry
+    // one, and the world-space probe fallback is still the least-wrong answer.
+    const gi2Sample = GI2_PATH
+      ? (texNode, texel = null, nestedFallback = null) => {
+        void texel;
+        const v = vec4(texNode.sample(giUV)).toVar();
+        return light.giNestedView && nestedFallback
+          ? select(float(light.giNestedView).greaterThan(0.5), nestedFallback, v)
+          : v;
+      }
+      : null;
+    const bilateral = gi2Sample
+      ?? (light.giPositionNode && light.giScreenTexel
         ? (texNode, texel = light.giScreenTexel, nestedFallback = null) => {
             // FIXED-METRE HATCHES (2026-08-07, the ~0.196m block-size hunt).
             // Measured: block size on the floor is 0.196 + 0.14·probeSpacing
@@ -2137,7 +2166,7 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
               ? select(float(light.giNestedView).greaterThan(0.5), nestedFallback, resolved)
               : resolved;
           }
-        : null;
+        : null);
     // The nested-render stand-in for irradiance: the probe atlas sampled
     // along the surface NORMAL at roughness 1 — which the level ladder maps
     // to the atlas's COSINE-HEMISPHERE tile (E/π by construction, see
@@ -2174,7 +2203,27 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // The specular glow below still needs each slot's geometry and its
       // shadow factor, so the resolve pass packs the four shadows into one
       // RGBA texture — a fetch instead of up to four sphere traces per pixel.
-      if (light.emitterSlots?.length && light.giEmitterShadowNode) {
+      //
+      // ══ §19 STAGE 3.4 / §M.3: NO PACK, BUT STILL A GLOW ══════════════════
+      //
+      // GI2 does not build `emitterShadowPass`, so there IS no packed shadow
+      // texture and `giEmitterShadowNode` is null. Reading that as "no emitter
+      // data" silently deletes the SPECULAR GLOW — the near-emitter highlight a
+      // lamp puts on a glossy floor — and `test:gi-moved-lamp` measures exactly
+      // that highlight: it failed with "the emitter slot uniforms are not
+      // reaching the material" while the uniforms were demonstrably correct.
+      //
+      // The glow goes UNSHADOWED here, which is the same answer (and the same
+      // one-line justification) the §12.70 W4b tile-cut arm already gives: it
+      // is a near-emitter effect, the receiver is within a metre or two of the
+      // source, and an occluder between them at that range is rare enough that
+      // an unshadowed highlight beats no highlight. The DIFFUSE half of the
+      // emitter term is unaffected — it arrives through the irradiance texture,
+      // which under GI2 carries `gi2System`'s probe-space emitter NEE (one
+      // shadow ray per slot per probe per frame), shadows included.
+      if (GI2_PATH && light.emitterSlots?.length) {
+        for (const slot of light.emitterSlots) emitterData.push({ slot, shadow: float(1) });
+      } else if (light.emitterSlots?.length && light.giEmitterShadowNode) {
         // Same bilateral as the irradiance above — packed per-emitter shadow
         // factors smear across silhouettes identically, and min-per-channel
         // as the no-tap fallback is exactly "darkest shadow wins".

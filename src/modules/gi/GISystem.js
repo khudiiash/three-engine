@@ -29,7 +29,8 @@
 import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionGeometry, positionWorld, renderGroup, sRGBTransferEOTF, screenCoordinate, screenUV, select, sin, smoothstep, step, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
-import { GI_QUALITY_LEVELS, GI_TERM_DEBUG_VIEWS, GI_TIER_GPU_BUDGET_BYTES, giDebugView, resolveGiConfig, sceneSkyRadiance, wgslPointerParametersSupported } from "./giConfig.js";
+import { GI2_PATH, GI_QUALITY_LEVELS, GI_TERM_DEBUG_VIEWS, GI_TIER_GPU_BUDGET_BYTES, gi2TierOf, giDebugView, resolveGiConfig, sceneSkyRadiance, wgslPointerParametersSupported } from "./giConfig.js";
+import { createGi2System, createGi2Volume } from "./window/gi2System.js";
 import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
 import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
 import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
@@ -3167,6 +3168,63 @@ export class GISystem {
       // 2.25 M triangles at half res, every frame, on top of the main pass's
       // 484. It is CPU-encoding cost, not shading cost, so it scales with DRAW
       // COUNT and nothing else.
+      //
+      // ══ §19 STAGE 3.4 (§M.2): THE GI2 FRAME, FIRST HALF ══════════════════
+      //
+      // `window.setCamera` (scroll) → voxelizer budget → dynamic layer, ALL
+      // BEFORE the prepass, because none of them read this frame's g-buffer and
+      // every one of them must be current before the gather does. The second
+      // half (hzb → probePlace → probeTrace → probeFilter → emitterDirect →
+      // resolve → AO → composite → inject) is below the prepass, which is the
+      // one thing in the order that is a RENDER and not a dispatch.
+      //
+      // Rides `giCompute`, deferrable, like every other GI chain: on a boot
+      // frame whose pipelines are still compiling a partially-dispatched gather
+      // is exactly what a first frame already is (probes with no rays resolve
+      // black), and the alternative — blocking — is the §12.56 freeze.
+      if (GI2_PATH && state.screen.gi2) {
+        const gi2 = state.screen.gi2;
+        gi2.setCamera(this.engine.camera);
+        // Movers are BOXES with live matrices (see `#gi2Movers`): the set is
+        // fixed at build, the poses are not. Three writes into a mapped array
+        // per mover, no upload, no rebuild.
+        if (this._gi2Movers?.length && gi2.dynamic) {
+          for (const m of this._gi2Movers) {
+            if (m.identity) continue;
+            gi2.dynamic.setMatrix(m.slot, m.mesh.matrixWorld);
+          }
+        }
+        this._gi2Frame = (this._gi2Frame ?? 0) + 1;
+        this._gi2Passes = gi2.passes(this._gi2Frame);
+        // The chain's SHAPE, once per change. A frame with 0 "before" passes is
+        // a window with no voxelizer (the soup has not landed); a frame with 0
+        // "after" passes is a gather that was never built — two very different
+        // failures that both present as "GI2 produces no light".
+        const shape = `${this._gi2Passes.before.length}+${this._gi2Passes.after.length}`;
+        if (this._gi2ChainShape !== shape) {
+          this._gi2ChainShape = shape;
+          console.log(`[gi2] frame chain: ${this._gi2Passes.before.length} pre-gbuffer + ` +
+            `${this._gi2Passes.after.length} post-gbuffer dispatches`);
+        }
+        if (this._gi2Passes.before.length) {
+          // §19 Stage 0.2's idiom: `giSkippedComputes` is cleared at the end of
+          // every tick, so a size delta across THIS call means the batch was
+          // deferred (its pipelines are still compiling). The window's scroll
+          // is a ONE-SHOT re-key with no downstream re-request, so it must be
+          // held pending until a batch genuinely lands.
+          const gi2SkippedBefore = giSkippedComputes.size;
+          // ⚠ NOT DEFERRABLE, and the old occupancy chain's own comment is the
+          // precedent: "the field is also the critical path to first light, so
+          // it gets the frame's allowance ahead of every deferrable stage."
+          // This half IS the field — scroll, voxelize, dynamic. Deferring it
+          // behind a 179-variant material compile wave is what put Bistro's
+          // first occupancy at 4.35 s when the soup had landed at 1.0 s.
+          // The GATHER (below) stays deferrable: a partially-dispatched gather
+          // is a black probe, which is what a first frame already is.
+          giCompute(renderer, this._gi2Passes.before);
+          if (giSkippedComputes.size === gi2SkippedBefore) gi2.notePassesRan();
+        }
+      }
       mark("gi.gbufferPrepass");
       // ── HELD WHEN NOTHING IT DRAWS HAS CHANGED ───────────────────────────
       // The target is persistent and nothing ping-pongs it, so skipping the
@@ -3208,6 +3266,40 @@ export class GISystem {
         this._giMirrorDraws = this._gbufProxyStats?.maskRan === true
           ? (this._gbufProxyStats.maskDraws ?? 0)
           : null;
+      }
+      // ══ §19 STAGE 3.4 (§M.2): THE GI2 FRAME, SECOND HALF ═════════════════
+      //
+      // GTAO is dispatched further down with the rest of the screen chain, and
+      // `aoCompose` is INSIDE this list — which reads backwards until you note
+      // that the AO pass writes a PERSISTENT target and is one frame's latency
+      // either way, and that putting the multiply here is what keeps the lit
+      // frame the composite feeds into the cache from being the AO-less one.
+      if (GI2_PATH && this._gi2Passes?.after?.length) {
+        giCompute(renderer, this._gi2Passes.after, { deferrable: true });
+        // The GI2 receipt (§K.8 + §L.7). ONE readback, on a slow cadence —
+        // it is also what latches `_transportAlive`, so it must not wait for
+        // the first user request. 30 frames ≈ half a second at 60.
+        this._gi2StatsAt = (this._gi2StatsAt ?? 0) + 1;
+        // GI2 owns the cadence: it is tight while the window is filling (the
+        // per-frame counters are the only witness to "first occupancy" and the
+        // fill is over in a handful of frames) and slack once it has settled.
+        if (this._gi2StatsAt % state.screen.gi2.statsCadence() === 0 && !this._gi2StatsBusy) {
+          this._gi2StatsBusy = true;
+          state.screen.gi2.stats(renderer)
+            .then((s) => {
+              this._gi2Stats = s;
+              // §0.4's fail-open contract, GI2's terms: probes that FOUND a
+              // surface, and rays that came back from the window. Until both
+              // are positive the scene keeps its environment IBL.
+              if (!this._transportAlive && state.screen.gi2.transportAlive) {
+                this._transportAlive = true;
+                this._fieldReadyOnce = true;
+              }
+            })
+            .catch(() => { /* a readback on a lost device — the watchdog owns it */ })
+            .finally(() => { this._gi2StatsBusy = false; });
+        }
+        if (!this._transportWaveAt) this._transportWaveAt = performance.now();
       }
       // ── THE MASK-COVERAGE ASSERTION (§18) ───────────────────────────────
       // Reads back how much of the gbuffer carries geometry at all. It must be
@@ -5929,12 +6021,56 @@ export class GISystem {
       if (!this._giTargets) {
         this._giTargets = createGiTargets(width, height, shadowW, shadowH, { emitterWidth: emitterW, emitterHeight: emitterH });
         this._giTargetSize = { width, height };
-        this._giIrradianceNode = texture(this._giTargets.irradiance);
+        // §M.3: under GI2 the two textures materials sample are the GATHER's
+        // resolve outputs, not these render targets — the nodes are minted
+        // below, once the GI2 chain exists. Everything else here (the emitter
+        // shadow pack, the light-shadow channels, the temporal history) is
+        // still allocated because `createGiTargets` is one call and the
+        // targets are ~4 MB; what matters is that nothing DISPATCHES into
+        // them, and under GI2 nothing does.
+        if (!GI2_PATH) {
+          this._giIrradianceNode = texture(this._giTargets.irradiance);
+          this._giRadianceNode = texture(this._giTargets.radiance);
+        }
         this._giEmitterShadowNode = texture(this._giTargets.emitterShadow);
-        this._giRadianceNode = texture(this._giTargets.radiance);
         this.#clearEmitterShadowTargets(this._giTargets, emitterW, emitterH);
       }
       const targets = this._giTargets;
+      // ── §19 STAGE 3.4: THE GI2 CHAIN (§M.1 build, §M.2 order) ────────────
+      //
+      // Built HERE and not in `#rebuild` for one reason: it consumes the
+      // g-buffer created three lines up, and it must exist before the
+      // irradiance/glossy nodes are minted — every material's GI code is
+      // "sample these two textures", and which two is decided exactly once.
+      //
+      // The nodes are PERSISTENT and REPOINTED, never replaced (the same
+      // contract `_giShadowPosNode` carries): a node swap re-keys every
+      // material that samples it and buys a full compile wave on every
+      // rebuild and every resize.
+      let gi2 = null;
+      if (GI2_PATH) {
+        gi2 = createGi2System({
+          renderer,
+          engine: this.engine,
+          tier: gi2TierOf(this.config),
+          resolveWidth: width,
+          resolveHeight: height,
+          gbuffer,
+          lights: lightSlots,
+          emitters: emitterSlots,
+          lightTree: this._lightTreeRegion ?? null,
+          env: { sky: skyRadiance, ao, sunSlot },
+          // The soup survives a rebuild whose GEOMETRY did not change — see
+          // `gi2System.build`. Held on the system, not on `state`, because
+          // `state` is what a rebuild replaces.
+          shared: (this._gi2Shared ??= {}),
+        });
+        this._gi2 = gi2;
+        if (!this._giIrradianceNode) this._giIrradianceNode = texture(gi2.textures.irradiance);
+        else this._giIrradianceNode.value = gi2.textures.irradiance;
+        if (!this._giRadianceNode) this._giRadianceNode = texture(gi2.textures.glossy);
+        else this._giRadianceNode.value = gi2.textures.glossy;
+      }
       // PERSISTENT, created once per system and repointed on resize — exactly
       // like its siblings above, and here it is not merely an optimisation:
       // every gi light's `shadow.shadowNode` samples THIS node forever, and a
@@ -6021,7 +6157,13 @@ export class GISystem {
       // arrives once the mesh list is walked — they are system-lifetime
       // anyway (same reasoning as `_giTargets`), so creating them early costs
       // one half-res texture set and nothing else.
-      inputs.bvhShade = this.#bvhReflectionsEnabled()
+      // §M.1: THE MIRROR TIER IS OFF IN THE FIRST GI2 CUT, and the log line in
+      // `#startGi2Build` says so out loud. `bvhHitShade` traces the STATIC
+      // scene BVH — the structure `#syncBvhScene` builds and GI2 does not — so
+      // building the pass would mean building that BVH again for one consumer.
+      // It comes back as its own unit against the window's own trace; until
+      // then glossy is the gather's roughness-widened oct cone.
+      inputs.bvhShade = !GI2_PATH && this.#bvhReflectionsEnabled()
         ? {
             ...this.#ensureBvhTargets(width, height),
             lightSlots,
@@ -6041,7 +6183,11 @@ export class GISystem {
       // bundle rather than off `state` because it is a pure function of the
       // gbuffer — same lifetime, same resize, same dispose.
       let srcProbes = null;
-      if (srcProbesEnabled()) {
+      // §M.1: GI2 IS the transport. Not one SRC kernel is created — that is the
+      // 44-pipeline block `probe:gi2-boot` asserts is absent, and the reason
+      // `run-gi2-boot-probe` can fail on the mere PRESENCE of an `src#` name in
+      // the pipeline ledger rather than on a timing.
+      if (!GI2_PATH && srcProbesEnabled()) {
         try {
           // ── PHASE 5: LIGHTING + STATIC SURFACE (plan §12.28) ───────────
           //
@@ -6423,7 +6569,13 @@ export class GISystem {
       // boots lit (meanLum 0.437, ledger clean) + smoke:gi-gpu. The general
       // §12.56 watchdog stays as insurance for the classes that ARE real
       // (dead-[J], occluder, emitter-seat streaming).
-      const irrTemporalOn = globalThis.__giIrrTemporal !== false;
+      // §M.1: the §12.65 irradiance temporal pair filters `targets.irradiance`
+      // — the render target the SRC resolve wrote. Under GI2 nothing writes it
+      // and nothing samples it, so the pair is 0.198 ms/frame of MEASURED GPU
+      // spent smoothing a texture that is not in the picture. (GI2's only
+      // temporal term is §L.3's probe-space accumulation, by design: no history
+      // of the final image and no AO history — the user's rule.)
+      const irrTemporalOn = !GI2_PATH && globalThis.__giIrrTemporal !== false;
       if (irrTemporalOn) {
         targets.ensureIrradianceTemporal?.();
         this._giIrrPrevVPU ??= uniform(new THREE.Matrix4()).setGroup(renderGroup);
@@ -6436,8 +6588,23 @@ export class GISystem {
         srcProbes, gbuffer, width, height,
         validEps: inputs.lightShadow?.voxMax ?? 0.15,
       });
+      const gi2AoHost = GI2_PATH
+        ? { spacing0: (gi2?.win?.voxel0 ?? 0.25) * 2, passes: [], passGroups: [] }
+        : null;
+      if (gi2AoHost && ao) ao.computes = gi2AoHost.passes;
       const { aoPass } = this.#armGtaoPass({
-        srcProbes,
+        // §M.3 "AO stays GTAO". `#armGtaoPass` uses `srcProbes` for exactly two
+        // things: `spacing0` (the cascade's c0 interval, from which the AO
+        // radius is derived) and `passes` — the SRC dispatch list it APPENDS
+        // its own computes to. GI2 has neither, so it supplies a HOST: the
+        // window's level-0 cell as the scale, and an empty array that becomes
+        // GI2's AO segment. `ao.computes` publishes it to `gi2System`'s frame
+        // order, which splices it in immediately before the AO multiply.
+        //
+        // ⚠ It is not "an srcProbes wearing a hat". The two fields are the
+        // pass's whole contract with the transport, and naming the host after
+        // what it IS keeps the next reader from looking for a cascade.
+        srcProbes: srcProbes ?? (GI2_PATH ? gi2AoHost : null),
         gbuffer,
         width,
         height,
@@ -6574,7 +6741,14 @@ export class GISystem {
       } else if (globalThis.__giTileCutLive) {
         globalThis.__giTileCutLive = null;
       }
-      const resolve = createGiResolve({
+      // §M.1: GI2's own resolve (`gatherProbes`' §L.5 kernel) writes the two
+      // textures materials sample, so this one has nothing left to compute —
+      // its diffuse term came from the cascade gather (already null), its
+      // emitter direct is now the probe-space term, and its AO multiply moved
+      // into `gi2System`'s `aoCompose`. Not built rather than built-and-idle:
+      // an idle kernel is still a pipeline, still WGSL, and still something a
+      // later reader has to prove is unused.
+      const resolve = GI2_PATH ? null : createGiResolve({
         gbuffer,
         targets,
         rawCopy: irrTemporalOn ? targets.irradianceRaw : null,
@@ -6826,7 +7000,17 @@ export class GISystem {
       // history is invalid). The temporal CHAIN stays on; only the jitter is
       // gone, so the pass takes no frame uniform.
       const emitterTemporalWanted = globalThis.__giEmitterTemporal !== false;
-      const emitterShadowPass = inputs.emitter
+      // ── §M.3: NOT BUILT, NOT DISPATCHED, UNDER GI2 ──────────────────────
+      //
+      // The whole chain (trace → filter → history → post → wide₁ → wide₂, plus
+      // the tile cut) exists to give every SCREEN PIXEL an analytic emitter
+      // shadow, and it cost 10-20 ms to do it. GI2 replaces it with one shadow
+      // ray per emitter slot per PROBE per frame (`gi2System`'s
+      // `emitterDirectPass`), which is the quality trade PLAN §4.4 names: an
+      // emitter's penumbra is resolved at probe resolution and interpolated,
+      // not traced per pixel. Its marcher also needs a distance oracle, which
+      // under GI2 does not exist — `inputs.emitter.shadowTraceFn` is null.
+      const emitterShadowPass = inputs.emitter && !GI2_PATH
         ? createGiEmitterShadowPass({
             gbuffer,
             emitter: inputs.emitter,
@@ -7036,7 +7220,18 @@ export class GISystem {
       // Armed by EITHER radiance source: the legacy closure (harness) or the
       // glossy texture chain (§12.71b v2, the default). Materials sample the
       // persistent radiance target either way.
-      light.giRadianceNode = (radianceLookup || inputs.screenRadiance) ? this._giRadianceNode : null;
+      //
+      // ⚠ §19 STAGE 3.4: GI2 IS A THIRD RADIANCE SOURCE, and forgetting to say
+      // so compiled the ENTIRE glossy block out of every material — including
+      // the emitter SPECULAR GLOW, which lives inside it. `test:gi-moved-lamp`
+      // read the lamp's highlight at 0.1 lum against 30 on the old path and
+      // blamed the slot uniforms, which were demonstrably correct (the harness
+      // printed the moved centre): the block that consumes them was never
+      // emitted. GI2's glossy texture is the §L.5 oct-cone resolve, written
+      // every frame by the same pass that writes irradiance.
+      light.giRadianceNode = (GI2_PATH || radianceLookup || inputs.screenRadiance)
+        ? this._giRadianceNode
+        : null;
       // §12.71b v3 — the env-on-miss bundle: the scene's HDRI, sampled by
       // mirror pixels whose exact-reflection ray PROVABLY left the scene
       // (giLight's spec composite has the occlusion argument). Persistent
@@ -7105,11 +7300,16 @@ export class GISystem {
         this.engine.scene.add(srcProbes.gizmos.group);
         srcProbes.gizmos.setVisible(giDebugView() === "src-probes");
       }
-      return { gbuffer, srcProbes, resolve, bvhHitShade, bvhHitTemporal, irrTemporalPass, irrHistoryPass, aoPass, glossyTemporal, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, emitterShadowPass, emitterTileCut, emitterTileCutBundle: tileCutBundle, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
+      return { gbuffer, gi2, srcProbes, resolve, bvhHitShade, bvhHitTemporal, irrTemporalPass, irrHistoryPass, aoPass, glossyTemporal, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, emitterShadowPass, emitterTileCut, emitterTileCutBundle: tileCutBundle, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
-      console.warn("[gi] deferred resolve unavailable — falling back to per-material GI:", error?.message ?? error);
+      // ⚠ THE STACK, NOT JUST THE MESSAGE. This function builds ~20 passes
+      // across six modules and the fallback it takes is SILENT afterwards — a
+      // bare "Cannot read properties of undefined" here cost a whole debugging
+      // round in Stage 3.4 because nothing said which of the twenty threw.
+      console.warn("[gi] deferred resolve unavailable — falling back to per-material GI:", error?.message ?? error,
+        "\n", error?.stack ?? "(no stack)");
       return null;
     }
   }
@@ -7733,7 +7933,17 @@ export class GISystem {
     const tileScale = screen.emitterTileCutBundle
       ? { scaleX: emitterW / width, scaleY: emitterH / height }
       : null;
-    if (tileCutOk) {
+    if (!screen.resolve) {
+      // GI2 has no `createGiResolve` (§M.1). Its own resolve, HZB, probe
+      // buffers and two output textures are all sized to the viewport, so the
+      // resize is one call — and it repoints the persistent irradiance/glossy
+      // nodes rather than minting new ones, which is what keeps a viewport drag
+      // from re-keying every material that samples them.
+      if (this._gi2?.setSize(width, height)) {
+        if (this._giIrradianceNode) this._giIrradianceNode.value = this._gi2.textures.irradiance;
+        if (this._giRadianceNode) this._giRadianceNode.value = this._gi2.textures.glossy;
+      }
+    } else if (tileCutOk) {
       screen.resolve.setSize(width, height, screen.ao?.width ?? width, screen.ao?.height ?? height, tileScale);
     } else {
       const index = state.queue.indexOf(screen.resolve.compute);
@@ -8221,6 +8431,15 @@ export class GISystem {
   #syncBvhScene(entries) {
     const state = this.state;
     if (!state?.screen) return;
+    // ⚠ §M.1's MIRROR-TIER SKIP BELONGS HERE, NOT AT ONE CALL SITE. `#rebuild`
+    // is only one of FOUR routes into this function (the fingerprint scan, the
+    // in-place refit and the seat re-rank are the others), and gating just the
+    // build left `bvhReflect` alive on the incremental path — MEASURED at
+    // 2.956 ms of a 6.28 ms Bistro GI frame, i.e. the single reason the 4 ms
+    // gate missed, spent on a full-screen prepass whose consumer this path does
+    // not compile. The mirror tier returns as its own unit against the window's
+    // own trace.
+    if (GI2_PATH) return;
     const light = state.light;
     // §14 R-B: reflection probes trace their captures through this same BVH,
     // and they run at EVERY tier — so probes keep the BVH built where the
@@ -9626,10 +9845,19 @@ export class GISystem {
     // (this is where the mesh list lives) and BEFORE the volume, because the
     // composite graph and every trace close over it. Null only means the
     // explicit diagnostic backend hatch disabled occupancy.
-    const occField = this.#buildOccupancyField(
+    // ── §19 STAGE 3.4 (§M.1): GI2 DOES NOT BUILD THE DENSE FIELD ──────────
+    //
+    // The occupancy pyramid, the static shadow BVH it carries, the surface
+    // records and the whole attribution region are the SRC path's transport.
+    // GI2's transport is the window (`window/gi2System.js`), voxelized from a
+    // triangle soup built off-thread — so under `GI2_PATH` this whole call is
+    // skipped, and with it `buildStaticSceneBvhWords`, the record pool and the
+    // 136 MB the pyramid's allocation asks for. Three of the four heaviest
+    // boot stages (§E) go with it.
+    const occField = GI2_PATH ? null : this.#buildOccupancyField(
       props, meshes, bounds, { sizeX, sizeY, sizeZ }, quality, rayHitConfig,
     );
-    if (!occField) {
+    if (!occField && !GI2_PATH) {
       // §19 Stage 0.4: the null can now mean two very different things, and
       // blaming a diagnostic hatch for a refused allocation would send the
       // next reader looking for a flag nobody set.
@@ -9651,12 +9879,20 @@ export class GISystem {
     // shipping presets, every tuned constant in the shadow estimators is expressed
     // in coarse-cell units, and switching lattice and producer in one commit would
     // make an eye-check unattributable. `res: null` is a separate A/B (§12.6.5).
-    const volume = createSrcVolume({
-      occField,
-      bounds,
-      res,
-      rayHitMode: rayHitConfig.activeMode,
-    });
+    // §M.1: with no occupancy field there is no `createSrcVolume` — it refuses
+    // to exist without one, correctly. `createGi2Volume` supplies the SPINE the
+    // ~40 surviving `state.volume.*` call sites stand on (bounds, the world
+    // uniform bundle, `minCell`, `setBounds`) and nothing else; its two trace
+    // factories return null, which is what `#buildLightShadow` and
+    // `#buildEmitterRecordTrace` already test for.
+    const volume = GI2_PATH
+      ? createGi2Volume({ bounds, res, rayHitMode: rayHitConfig.activeMode })
+      : createSrcVolume({
+        occField,
+        bounds,
+        res,
+        rayHitMode: rayHitConfig.activeMode,
+      });
     // The cell size #slotSurface needs for the sub-cell emissive test, stashed
     // BEFORE the entries walk (which is where it is consumed) — `this.state`
     // is still the outgoing build's at that point.
@@ -9681,6 +9917,26 @@ export class GISystem {
     this._lightTreePoseCache = null;
     this._lightTreePoseCount = -1;
     globalThis.__giLightTreeLive = null;
+    // ── §19 STAGE 3.4: THE TREE HAS NO REGION TO LIVE IN YET ──────────────
+    //
+    // The packed tree is uploaded into the DYNAMIC SET's bump allocator, and
+    // `_dynSet` is created by `#buildOccupancyField` — which GI2 does not run.
+    // So `__giLightTreeLive` stays null and `test:gi-lighttree-mover` fails on
+    // "tree unreadable" rather than on anything it measures. Said out loud
+    // because a silent null here is indistinguishable from "this scene has no
+    // emitters", and because the gather's NEE is the tree's consumer-to-be: GI2
+    // lights a ray hit from the sun plus the palette's own emission today, and
+    // the per-probe emitter term (`gi2System`'s `emitterDirectPass`) reads the
+    // four SLOT uniforms, not the tree. Wiring the tree to `probeTrace`'s
+    // `shadeHit` is the unit that makes a 116-emitter scene's dim lamps carry.
+    if (GI2_PATH && this._emitterCands?.length) {
+      console.log(
+        `[gi2] light tree NOT built — its region rides the occupancy field's allocator, which this path ` +
+        `does not create. ${this._emitterCands.length} emitter candidates are served by the ${MAX_EMITTERS} ` +
+        "analytic slots only (per-probe NEE + the material glow); `test:gi-lighttree-mover` cannot read a " +
+        "tree that does not exist.",
+      );
+    }
     if (globalThis.__giLightTree !== false && this._dynSet && this._emitterCands?.length) {
       try {
         // Same STABLE order the refresh uses — see #lightTreeMeshes. If the
@@ -10195,12 +10451,18 @@ export class GISystem {
         queueNoFeedback.push(...emitterChain);
         queueFeedbackOnly.push(...emitterChain);
       }
-      queue.push(screen.resolve.compute);
-      queueNoFeedback.push(screen.resolve.compute);
-      // The resolve is camera-dependent, so it runs on BOTH halves of the
-      // split — it is 0.1ms and skipping it would stall GI against camera
-      // motion, which is the one thing measurement says is currently free.
-      queueFeedbackOnly.push(screen.resolve.compute);
+      // Null under GI2_PATH — the resolve moved into the gather (§M.1), and its
+      // chain is dispatched from `#tick` in §M.2's order rather than from these
+      // rate-gated queues (a GI2 frame is not separable into "feedback" and
+      // "no feedback" halves: every pass is camera-dependent).
+      if (screen.resolve) {
+        queue.push(screen.resolve.compute);
+        queueNoFeedback.push(screen.resolve.compute);
+        // The resolve is camera-dependent, so it runs on BOTH halves of the
+        // split — it is 0.1ms and skipping it would stall GI against camera
+        // motion, which is the one thing measurement says is currently free.
+        queueFeedbackOnly.push(screen.resolve.compute);
+      }
       // §14 R-A: hit shading rides every queue the resolve does (it reads the
       // per-frame gbuffer + this frame's prepass, so it is camera-dependent
       // the same way). The prepass itself is dispatched in the tick BEFORE
@@ -10338,7 +10600,17 @@ export class GISystem {
     this._stateBuiltAt = performance.now();
     this._pendingFit = null; // refit debounce restarts against fresh bounds
     this.#syncSlots(entries);
-    this.#syncBvhScene(entries);
+    // §M.1 step 2: the soup, off-thread. Deliberately NOT awaited — the window
+    // exists already (so the trace, the scroll and the gather are live from the
+    // first tick), and the voxelizer is created when the soup lands. A boot that
+    // waited here would block the whole editor on a 3 M-triangle worker pass.
+    if (GI2_PATH && screen?.gi2) this.#startGi2Build(meshes, screen.gi2);
+    // §M.1: the exact-reflection BVH scene is the MIRROR TIER's, and the mirror
+    // tier comes back as its own unit (`bvhHitShade` / `bvhReflect` are not
+    // dispatched under GI2 either — see the tick). Building it here would
+    // upload the whole scene's triangles a second time for a consumer that
+    // does not run.
+    if (!GI2_PATH) this.#syncBvhScene(entries);
     this._lightObjects = this.#collectLightObjects();
     this.#updateLightUniforms();
     this._structuralSig = this.#structuralSignature(component);
@@ -12218,6 +12490,32 @@ export class GISystem {
     this._lightShadowNodes?.clear();
     state.volume?.dispose?.();
     state.bvhScene?.dispose?.();
+    // ── §19 STAGE 3.4: GI2 ────────────────────────────────────────────────
+    //
+    // The window, the cache, the voxelizer's work buffer, the dynamic layer's
+    // soup and every gather buffer, PLUS the two storage textures materials
+    // sample. `dispose()` detaches the CPU mirrors (0.2b) and drops the
+    // attributes; the generic `collectStateStorageAttributes` /
+    // `collectStateComputeNodes` walks below then find them through
+    // `state.screen.gi2.storageAttributes` / `.computeNodes` and release the
+    // GPU side, which is why those two getters exist at all.
+    //
+    // ⚠ The irradiance/glossy NODES are NOT cleared: they are persistent
+    // (`_giIrradianceNode`), every material samples them, and the next build
+    // repoints `.value` at the new textures. Nulling them here would re-key
+    // every material and buy a compile wave per rebuild.
+    //
+    // ⚠ THE `dispose()` ITSELF RUNS AFTER THE RELEASE WALK BELOW, not here.
+    // Both collectors read `state`, and GI2's two getters answer honestly only
+    // while it is alive — disposing first would hand them an empty list and
+    // leak every kernel and every buffer it owns. Only the instance-level refs
+    // are dropped at this point.
+    if (state.screen?.gi2) {
+      if (this._gi2 === state.screen.gi2) this._gi2 = null;
+      this._gi2Passes = null;
+      this._gi2Movers = null;
+      this._gi2Stats = null;
+    }
     // The gbuffer is per-build; the resolve TARGETS are not (see
     // createGiTargets) — disposing them here would strand every material that
     // is still bound to them. Same rule for the BVH reflect target
@@ -12286,6 +12584,20 @@ export class GISystem {
     // The field hands its own attributes over rather than destroying them: it
     // has no way to know a frame is mid-encode, and this queue does.
     occField?.dispose?.((attrs) => { for (const attr of attrs) doomed.add(attr); });
+    // §19 Stage 3.4: GI2 goes through the RETIRE queue, not through an
+    // immediate `dispose()`. Its `irradiance`/`glossy` storage textures are
+    // sampled by every material in the scene through a persistent node, and
+    // destroying them inside `#tick` — i.e. before this frame is encoded — is
+    // the "Destroyed texture used in a submit" this queue exists for. The
+    // queue's contract is exactly GI2's shape: read `storageAttributes`, then
+    // `dispose()`, a few frames late.
+    //
+    // The soup's typed arrays are the ONE thing deliberately kept alive —
+    // `_gi2Shared` holds them so a rebuild that changed no geometry (a resize,
+    // a quality flip, a refit — most rebuilds) does not re-run a multi-second
+    // worker pass for an identical answer. On Bistro that is ~120 MB, and it is
+    // the same single copy the upload already referenced, not a second one.
+    if (state.screen?.gi2) this.#retireTargets(state.screen.gi2);
     const retiredBuffers = this.#retireStorageAttributes(doomed);
     // Nothing left to detach for a state that is going away.
     this._giPendingDetach = [];
@@ -15379,6 +15691,124 @@ export class GISystem {
    * Unique geometries (deduped by content identity, so 200 crates ship one
    * triangle range) + one placement per world instance.
    */
+  /**
+   * ══ §19 STAGE 3.4 (§M.1 step 2): FEED THE WINDOW ═══════════════════════════
+   *
+   * Reuses `#occupancyContentOf` verbatim — it is exactly the pair the soup
+   * builder's `packRequest` wants (deduped geometries by key, one placement per
+   * world instance with a stable slot) and it already carries the two rules
+   * that took a session each to learn: a skinned mesh does NOT ship its bind
+   * pose, and an exact-dynamic adoptee does not voxelize at all.
+   *
+   * The only thing added here is `pal` — the material CLASS index the palette
+   * quantizer assigns. `resolveMaterialSurface` is memoised per mesh for the
+   * call, because it walks a shader-graph material and a scene can place one
+   * mesh a hundred times.
+   *
+   * `soupKey` is what lets a rebuild that changed no geometry (a resize, a
+   * quality flip, a refit, a light edit — most rebuilds) skip the worker
+   * entirely. It is the geometry keys and the placement matrices, which is
+   * precisely what the soup is a function of.
+   */
+  #startGi2Build(meshes, gi2) {
+    const { geometries, placements } = this.#occupancyContentOf(meshes);
+    const surfaceOf = new Map();
+    const parts = [];
+    const enriched = placements.map((p) => {
+      let s = surfaceOf.get(p.mesh);
+      if (!s) {
+        const raw = resolveMaterialSurface(p.mesh.material, p.mesh.name);
+        s = {
+          albedo: [raw.color.r, raw.color.g, raw.color.b],
+          emissive: (raw.emissive.r + raw.emissive.g + raw.emissive.b) / 3 * (raw.emissiveIntensity ?? 1),
+        };
+        surfaceOf.set(p.mesh, s);
+      }
+      const e = p.matrix.elements;
+      parts.push(p.geometryKey, e[12].toFixed(3), e[13].toFixed(3), e[14].toFixed(3), e[0].toFixed(3), e[5].toFixed(3), e[10].toFixed(3));
+      return { ...p, albedo: s.albedo, emissive: s.emissive };
+    });
+    const movers = this.#gi2Movers(meshes);
+    this._gi2Movers = movers;
+    // A mover is in the DYNAMIC layer, re-voxelized from its live matrix every
+    // frame — so it must not ALSO be baked into the static soup at its build
+    // pose, or it leaves a permanent ghost of itself where it started.
+    const moverMeshes = new Set(movers.map((m) => m.mesh));
+    const staticPlacements = moverMeshes.size
+      ? enriched.filter((p) => !moverMeshes.has(p.mesh))
+      : enriched;
+    const soupKey = `${geometries.length}:${staticPlacements.length}:${parts.join(",")}`;
+    this._gi2BuildAt = performance.now();
+    // Said BEFORE the await, and that is the point: "the soup line never
+    // printed" has two causes — the worker never finished, or the walk never
+    // reached it — and only a line on this side tells them apart.
+    console.log(`[gi2] soup requested: ${geometries.length} geometries / ${staticPlacements.length} static placements` +
+      ` (${enriched.length - staticPlacements.length} held out as movers), ${movers.length} movers`);
+    gi2.build({ geometries, placements: staticPlacements, movers, soupKey })
+      .then((ok) => {
+        if (!ok || this.state?.screen?.gi2 !== gi2) return;
+        console.log(
+          `[gi2] window ${gi2.win.levels}×64³ @ ${gi2.win.voxel0} m (${gi2.win.describe().totalMB} MB) + ` +
+          `cache ${gi2.cache.describe().totalMB} MB, tier ${gi2.tier}, ` +
+          `${movers.length} movers — voxelizer live ${Math.round(performance.now() - this._gi2BuildAt)} ms after the build. ` +
+          "⚠ the MIRROR TIER (bvhHitShade / bvhReflect / the reflection-probe capture) is NOT dispatched on this " +
+          "path and comes back as its own unit — glossy is the gather's oct cone until then.",
+        );
+      })
+      .catch((err) => console.warn(`[gi2] build failed: ${err?.message ?? err}`));
+  }
+
+  /**
+   * The movers the dynamic layer voxelizes every frame (§K.5).
+   *
+   * BOXES, not triangles, in this first cut: `windowDynamic` caps a mover at
+   * `MAX_MOVER_TRIS` and falls back to its box anyway above that, and a mover's
+   * job in the window is to OCCLUDE and to bounce — a character's silhouette at
+   * 0.25 m cells is its bounding box either way. The exact-dynamic adoption set
+   * and the skinned proxies are the same two sources the old path used; what
+   * changes is that neither needs a BVH block or a card table here.
+   */
+  #gi2Movers(meshes) {
+    const out = [];
+    const box = new THREE.Box3();
+    for (const mesh of meshes) {
+      if (out.length >= 64) break;
+      const mobility = giMobilityOf(mesh);
+      const skinned = mesh.isSkinnedMesh === true;
+      // ⚠ "auto" IS NOT "dynamic", and reading it as one put 64 of the Level's
+      // 111 meshes in the dynamic layer — the whole street re-voxelized every
+      // frame while the static window sat empty. `giMobilityOf` defaults to
+      // "auto", which on the old path meant "the adoption machinery decides,
+      // by watching for MOTION"; GI2 does not run that machinery yet, so the
+      // honest reading of "auto" is STATIC — a mesh that never moves belongs in
+      // the soup, and one that does will be adopted when the adoption unit
+      // lands. Only an explicit tag, or a skeleton (a rig always animates),
+      // buys a mover slot.
+      if (mobility !== "dynamic" && !skinned) continue;
+      if (!mesh.geometry?.boundingBox) mesh.geometry?.computeBoundingBox?.();
+      const bb = mesh.geometry?.boundingBox;
+      if (!bb) continue;
+      // A SkinnedMesh's own matrix cancels out of its vertex positions, so its
+      // LOCAL box is meaningless — use the WORLD box and an identity matrix,
+      // which is what `#refreshSkinnedProxies` resolves to anyway.
+      const identity = skinned;
+      if (identity) {
+        box.copy(bb).applyMatrix4(mesh.matrixWorld);
+      } else {
+        box.copy(bb);
+      }
+      out.push({
+        slot: out.length,
+        mesh,
+        identity,
+        min: [box.min.x, box.min.y, box.min.z],
+        max: [box.max.x, box.max.y, box.max.z],
+        matrix: identity ? new THREE.Matrix4() : mesh.matrixWorld.clone(),
+      });
+    }
+    return out;
+  }
+
   #occupancyContentOf(meshes) {
     const geometries = [];
     const seen = new Set();

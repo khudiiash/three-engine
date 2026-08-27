@@ -152,6 +152,27 @@ defineOp({
         // Duplicate labels (one merge per cascade level) keep their index.
         queueMs[queueMs[e.pass] === undefined ? e.pass : `${e.pass} #${queueEntries.indexOf(e)}`] = value;
       }
+      // ── §19 STAGE 3.4: GI2's OWN CHAIN ──────────────────────────────────
+      //
+      // GI2's passes are NOT in `state.queue` — the queue is rate-gated,
+      // idle-skipped and split into feedback/no-feedback halves, none of which
+      // a window frame can be, so `#tick` dispatches them in §M.2's order
+      // directly. Timing them therefore needs its own list, and without it this
+      // op reports a GI frame of ~0 ms on a path that IS the GI frame.
+      //
+      // Read live off the system rather than re-derived: `_gi2Passes` is the
+      // exact ordered list the last tick submitted, so what is timed here is
+      // what actually ran — not a plan of what should have.
+      const gi2Ms = {};
+      let gi2TotalMs = 0;
+      const gi2Chain = sys._gi2Passes?.all ?? [];
+      for (let i = 0; i < gi2Chain.length; i++) {
+        const node = gi2Chain[i];
+        const name = node?.__giPassName ?? `gi2[${i}]`;
+        const ms = await timeOne(node);
+        gi2Ms[gi2Ms[name] === undefined ? name : `${name} #${i}`] = ms;
+        if (typeof ms === "number") gi2TotalMs += ms;
+      }
       // SRC probe population (opt-in via `__giSrcProbes`), timed PER GROUP.
       //
       // It used to be one number, on the stated grounds that "the interesting
@@ -314,6 +335,10 @@ defineOp({
         // timed for reference (what enabling them would cost) but excluded.
         screenTotalMs: +liveTotal.toFixed(3),
         srcProbes,
+        // §19 Stage 3.4. Empty on the SRC path; on GI2 this IS the GI frame,
+        // and `gi2TotalMs` is the number §M.4's 4 ms budget is written against.
+        gi2Ms,
+        gi2TotalMs: +gi2TotalMs.toFixed(3),
         queueMs,
         queueTotalMs: +queueEntries
           .filter((e) => !skipReason(e.pass))
@@ -629,6 +654,95 @@ defineOp({
       // stride can reclaim at zero visual cost (those materials' roughness
       // floor is above 0.45, where the exact reflection's weight is 0).
       giTiers: engine.modules?.get?.("gi")?.system?.reflectTierCensus?.() ?? null,
+      // ⭐ §19 STAGE 3.4 — THE GI2 RECEIPT (audits §K.8 + §L.7).
+      //
+      // Null on the SRC path, which is itself the reading that matters: this
+      // block existing at all says the window is the lit path. It is a
+      // SNAPSHOT, not a readback — the GPU counters it reports were fetched by
+      // `#tick` on its own slow cadence (every 30 GI frames), so asking for
+      // frame stats never costs a stall and never perturbs the number it is
+      // measuring.
+      //
+      // What each group answers, because a flat list of twenty counters is
+      // unreadable:
+      //   · `firstOccupancyMs` per level + `firstLightMs` — the two boot gates.
+      //     A level missing from the map has never built a brick.
+      //   · `voxelizer.overflowed` / `.starved` / `.deferred` — the budget's
+      //     own honesty. `starved > 0` means a brick could not advance AT ALL
+      //     and the window will never finish; `deferred` is merely "next frame".
+      //   · `gather.windowHits` / `.screenHits` / `.skyMiss` — where the rays
+      //     went. All three zero WITH `probesValid > 0` is a dead trace;
+      //     `probesValid` zero is a dead g-buffer, a different bug entirely.
+      //   · `gather.reprojHits` / `.alphaForced` — §L.3's temporal term, the
+      //     ONLY history in GI2. `alphaForced` climbing is a lighting change
+      //     being tracked, not an artefact.
+      //   · `soupMB` — the one number that is main-thread heap and is HELD
+      //     across rebuilds on purpose (see GISystem's dispose note).
+      gi2: (() => {
+        const s = engine.modules?.get?.("gi")?.system?._gi2Stats;
+        if (!s) return null;
+        return {
+          tier: s.tier,
+          built: s.built,
+          frame: s.frame,
+          windowMB: s.windowMB,
+          cacheMB: s.cacheMB,
+          soupTris: s.soupTris,
+          soupMB: s.soupMB,
+          soupBuildMs: Math.round(s.soupBuildMs ?? 0),
+          soupStallMs: +(s.soupStallMs ?? 0).toFixed(1),
+          soupTruncated: s.soupTruncated,
+          palClasses: s.palClasses,
+          probes: s.probes,
+          raysPerFrame: s.rays,
+          movers: s.movers,
+          scrolls: s.scrolls,
+          firstOccupancyMs: s.occupancyMs ?? {},
+          firstLightMs: s.msToFirstLight || null,
+          soupReadyMs: s.msToSoup || null,
+          voxelizerReadyMs: s.msToVoxelizer || null,
+          gather: {
+            probesPlaced: s.probesPlaced ?? null,
+            probesValid: s.probesValid ?? null,
+            raysTraced: s.raysTraced ?? null,
+            screenHits: s.screenHits ?? null,
+            windowHits: s.windowHits ?? null,
+            skyMiss: s.skyMiss ?? null,
+            freshShades: s.freshShades ?? null,
+            reprojHits: s.reprojHits ?? null,
+            alphaForced: s.alphaForced ?? null,
+            injectWrites: s.injectWrites ?? null,
+            handoffs: s.handoffs ?? null,
+          },
+          voxelizer: s.voxelizer
+            ? {
+              dirty: s.voxelizer.dirty,
+              built: s.voxelizer.built,
+              pairsWritten: s.voxelizer.pairsWritten,
+              pairsNeeded: s.voxelizer.pairsNeeded,
+              voxelsSet: s.voxelizer.voxelsSet,
+              dustVoxels: s.voxelizer.dustVoxels,
+              overflowed: s.voxelizer.overflowed,
+              starved: s.voxelizer.starved,
+              deferred: s.voxelizer.deferred,
+              resumed: s.voxelizer.resumed,
+              invalid: s.voxelizer.invalid,
+              slotFull: s.voxelizer.slotFull,
+              cellOverflow: s.voxelizer.cellOverflow,
+              perLevel: s.voxelizer.perLevel,
+            }
+            : null,
+          dynamic: s.dynamic
+            ? {
+              triangles: s.dynamic.trianglesPacked,
+              satItems: s.dynamic.satItems,
+              voxelsSet: s.dynamic.voxelsSet,
+              outside: s.dynamic.outside,
+              spanOverflow: s.dynamic.spanOverflow,
+            }
+            : null,
+        };
+      })(),
       // §19 Stage 0.4 — "alive" | "pending" | "dead" (null: GI never built).
       // The IBL blackout is gated on this: until the transport has PROVEN it
       // delivers light, materials keep their environment ambient. On a device
@@ -816,6 +930,20 @@ defineOp({
           ? "The loop is running and presenting NOTHING — rendering is suspended (a GI compile wave or a renderer resize). The viewport is frozen on its last image."
           : "The render loop is stopped: the editor suspends an unfocused viewport, so this is expected unless the viewport is the focused panel.",
     };
+  },
+});
+
+defineOp({
+  name: "profile.gi2",
+  readOnly: true,
+  description:
+    "GI2's own receipts (§19 Stage 3.4) — the window, the voxelizer budget, the dynamic layer and the screen-probe gather, read FRESH off the GPU rather than from the tick's 30-frame snapshot. Returns null when GI is not built or when the build constant `GI2_PATH` is false, i.e. when the SRC path is the lit one; that null is the answer to \"which transport is running\". The two boot numbers are `firstOccupancyMs` (per window level) and `firstLightMs`, both measured from the moment the GI2 build started, not from page load. Use profile.frameStats.gi2 instead when you want the same block without paying for a readback.",
+  params: {},
+  async run() {
+    const gi2 = engine?.modules?.get?.("gi")?.system?._gi2;
+    if (!gi2) return null;
+    const stats = await gi2.stats(engine.renderer);
+    return { ...stats, describe: gi2.describe() };
   },
 });
 
