@@ -1,12 +1,40 @@
 // GI2 — THE BUDGETED (brick, triangle) VOXELIZER (plan §5 Stage 2.3, audits §K.3)
 //
 // Fills the window store's `occ` / `face` / `pal` / `brickMask` from a packed
-// world-space triangle soup at a FIXED cost per frame. Seven dispatches do it —
-// `reset` ×2, `dirtyList` ×3 (count, prefix, scatter), `binPairs`, `voxelize`,
-// `finishBricks` — and every size in their WGSL is a tier constant, so the
-// shaders are scene-independent and cache-stable exactly as `windowStore.js`
-// and `windowTrace.js` are. Scene numbers live in uniforms or in buffer
-// CONTENTS, never in the kernel.
+// world-space triangle soup at a FIXED cost per frame. Nine dispatches do it —
+// `reset` ×2, `dirtyList` ×3 (count, prefix, scatter), `binCells`, `binPairs`,
+// `voxelize`, `finishBricks` — and every size in their WGSL is a tier constant,
+// so the shaders are scene-independent and cache-stable exactly as
+// `windowStore.js` and `windowTrace.js` are. Scene numbers live in uniforms or
+// in buffer CONTENTS, never in the kernel.
+//
+// ══ §19 STAGE 4.1b — THE WORK ITEM IS A (brick, cell, chunk), NOT A BRICK ════
+//
+// A pass costs what its SLOWEST THREAD costs. Stage 2.3 made `binPairs` one
+// thread per dirty brick, and a 16 m L4 brick's thread walked every triangle of
+// every 4 m soup cell it overlapped — 216 cells, ~430 000 triangles on Bistro —
+// in a single lane. One such brick in a scroll made the whole GI2 chain 63 ms
+// median / 146 ms max on that frame (0.14 ms without a scroll), while the rest
+// of the device idled. Stage 4.1 measured this and refuted the obvious fix: a
+// smaller DIRTY-BRICK budget makes it WORSE, because it does not shorten the
+// longest thread, it only multiplies the frames that pay for it.
+//
+// So `binCells` (one cheap thread per brick, `cellRange` counts only) expands
+// each brick into WORK ITEMS — one per (overlapped cell, chunk of ≤
+// `TRIS_PER_ITEM` triangles) — and `binPairs` runs ONE THREAD PER ITEM. The
+// budget moved with it: `cellLimitU` caps items per frame, which is a quantity
+// with a millisecond in it (items × 2 × TRIS_PER_ITEM triangle tests), where
+// "dirty bricks" never was.
+//
+// The resumable brick grew a second cursor to match. `cellCur` is how many of
+// the brick's items are finished; `pairCur` is how far into the item AT that
+// cursor the last frame got; `finishBricks` completes a brick only when the
+// resume point has reached the brick's whole item count. Because the item lanes
+// finish OUT OF ORDER, the new cursor is a REDUCTION — `atomicMin` over
+// (item, pairs) picks the lowest unfinished item — and items above it that did
+// finish are simply re-walked next frame, which changes no bit because every
+// write on this path is idempotent (`atomicOr` on occ/face, `atomicMax` on the
+// palette scratch).
 //
 // ══ WHY THE WORK UNIT IS A PAIR AND THE BUDGET IS PAIRS ══════════════════════
 //
@@ -149,7 +177,7 @@
 // `markAllDirty` (which writes STATE_DIRTY) zeroes the cursor itself.
 import * as THREE from "three/webgpu";
 import {
-  Break, Fn, If, Loop, Return, atomicAdd, atomicAnd, atomicLoad, atomicMax, atomicOr, atomicStore,
+  Break, Fn, If, Loop, Return, atomicAdd, atomicAnd, atomicLoad, atomicMax, atomicMin, atomicOr, atomicStore,
   bitAnd, bitNot, bitOr, exp2, float, instanceIndex, instancedArray, int, select, shiftLeft,
   shiftRight, storage, uint, uniform, vec3, vec4,
 } from "three/tsl";
@@ -209,12 +237,76 @@ export const DIST_BUCKETS = 8;
  * bounded by it — they need no scratch — so an empty window drains at the full
  * dirty list per frame and only occupied bricks ever queue.
  */
+/**
+ * `itemsPerFrame` is §19 Stage 4.1b's work-item list length, and `cellLimitU`
+ * (the per-frame budget) defaults to it. `setCellLimit` lowers it without
+ * re-allocating — which is what `probe:gi2-motion`'s `VOX_CELLS` sweep pins.
+ *
+ * ⛔ CALIBRATED, AND THE CALIBRATION SAYS **DO NOT TUNE THIS**. Bistro, ultra,
+ * dolly arm, ONE boot so one contention regime (`VOX_CELLS=32768,16384,8192,
+ * 4096`), the voxelize chain's real GPU ms off three's timestamp pool:
+ *
+ *     items/frame   chain ms med / p95 / MAX   busy%   slab frames med/max
+ *        32 768         0.17 / 2.83 / 3.53      12          2 / 4
+ *        16 384         0.17 / 2.58 / 3.38       7          2 / 2
+ *         8 192         0.17 / 2.58 / 3.12       9          2 / 4
+ *         4 096         0.16 / 2.32 / 2.69       9          2 / 4
+ *
+ * An EIGHTFOLD cut moves the max by 24 % and the slab latency not at all — the
+ * budget never binds, because a scroll slab on Bistro is already under 4 096
+ * items. What is left on a scroll frame is the chain's FIXED shape (the work
+ * buffer's clear, three dirty-list passes and `finishBricks` over 20 480 bricks,
+ * `voxelize` over the pair list), not the triangle walk 4.1b removed. So the
+ * 0.8 ms of spread across that sweep is this machine's mood, and shrinking the
+ * constant to chase it would be pricing a budget from a neighbouring statistic
+ * [[merging-limits-are-not-texture-budget]]. It stays large enough that a scroll
+ * BIGGER than Bistro's still has a ceiling, which is the whole reason it exists.
+ *
+ * ▶ The next lever for the voxelize chain is therefore its FIXED domains, not
+ * its budget: nine dispatches sized by the window rather than by the work.
+ */
 export const GI2_VOX_TIERS = {
-  phone: { pairsPerFrame: 32 * 1024, maxBuild: 1024 },
-  medium: { pairsPerFrame: 32 * 1024, maxBuild: 1024 },
-  high: { pairsPerFrame: 128 * 1024, maxBuild: 2048 },
-  ultra: { pairsPerFrame: 256 * 1024, maxBuild: 4096 },
+  phone: { pairsPerFrame: 32 * 1024, maxBuild: 1024, itemsPerFrame: 4 * 1024 },
+  medium: { pairsPerFrame: 32 * 1024, maxBuild: 1024, itemsPerFrame: 4 * 1024 },
+  high: { pairsPerFrame: 128 * 1024, maxBuild: 2048, itemsPerFrame: 16 * 1024 },
+  ultra: { pairsPerFrame: 256 * 1024, maxBuild: 4096, itemsPerFrame: 32 * 1024 },
 };
+
+/**
+ * ⭐⭐ §19 STAGE 4.1b — THE LONGEST THREAD IS THE FRAME, SO BOUND THE THREAD.
+ *
+ * `binPairs` used to be one thread per dirty BRICK, and that thread walked every
+ * triangle of every soup cell the brick overlapped — ≤ 216 cells at L4, ~430 k
+ * triangles on Bistro — SERIALLY. A compute pass costs what its slowest thread
+ * costs, so ONE scrolled L4 brick made the whole frame 63 ms median / 146 ms max
+ * while every other lane on the device sat idle. That is also why capping the
+ * DIRTY COUNT made it worse (the table in `dirtyLimitU`): admitting fewer bricks
+ * does not shorten the longest thread, it only multiplies the frames that pay
+ * for it.
+ *
+ * The work item is now a (brick, cell, CHUNK) triple, so no thread walks more
+ * than `TRIS_PER_ITEM` triangles whatever the scene's density is: 430 k
+ * triangles in one lane becomes ~210 lanes of 2048, the same total work on a
+ * machine that has the width for it.
+ *
+ * 2048 rather than 256 or 16 k: the walk reads 9 floats and runs one AABB reject
+ * per triangle, so the per-item overhead (the brick's transform, its cell range,
+ * one reserve, one feedback atomic) has to amortise over enough triangles to
+ * disappear — and 2048 still puts the worst thread at ~0.5 % of the old worst.
+ */
+export const TRIS_PER_ITEM = 2048;
+
+/**
+ * How many items ONE brick may be handed in a single frame. A FAIRNESS bound,
+ * not a budget: the item list is filled by `atomicAdd` in dirty-list (priority)
+ * order, and without a per-brick ceiling one L4 brick at the horizon could take
+ * the whole frame's list before the near L0 bricks the picture is actually made
+ * of ever reserve. It is also the emit loop's static bound.
+ */
+export const ITEMS_PER_BRICK = 4096;
+
+/** `feed`'s "no item of this brick failed" sentinel — see `binCells`. */
+export const FEED_NONE = 0xffffffff;
 
 // ── counters, in their own tiny buffer so `stats()` is a 144-byte readback ────
 export const CTR_PAIRS = 0; // the atomic write cursor into the pair list
@@ -237,6 +329,16 @@ export const CTR_LEVEL_PAIRS = 20; // + level
 export const CTR_LEVEL_BUILT = 28; // + level
 export const CTR_MAXCURSOR = 36; // the deepest pairCursor any brick carried
 export const CTR_LEVEL_DUST = 37; // + level
+// ── §19 Stage 4.1b, in the words the per-level blocks left free (25-27, 33-35).
+// `CTR_LEVEL_DIRTY` runs 12..16, `CTR_LEVEL_PAIRS` 20..24, `CTR_LEVEL_BUILT`
+// 28..32 and `CTR_LEVEL_DUST` 37..41 at the deepest tier (5 levels), so these
+// six are the only gaps left below the cumulative block.
+export const CTR_ITEMS = 25; // (brick, cell, chunk) work items ACCEPTED this frame
+export const CTR_ITEMWANT = 26; // Σ items every dirty brick still owed — the cut's size
+export const CTR_MAXCELL = 27; // the deepest CELL cursor any brick carried
+export const CTR_MAXTRIS = 33; // the largest triangle range ONE item walked (max thread work)
+export const CTR_ITEMOVF = 34; // bricks that got no items: the frame's item list was full
+export const CTR_ITEMCUT = 35; // bricks that got SOME of their items and stay DIRTY
 /**
  * ⭐⭐ THE ONE CUMULATIVE COUNTER, AND WHY IT HAD TO EXIST (§19 Stage 3.5).
  *
@@ -280,6 +382,8 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
   const spec = GI2_VOX_TIERS[tier] ?? GI2_VOX_TIERS.high;
   const PAIRS_CAP = opts.pairsPerFrame ?? spec.pairsPerFrame;
   const MAX_BUILD = opts.maxBuild ?? spec.maxBuild;
+  const ITEMS_CAP = opts.itemsPerFrame ?? spec.itemsPerFrame;
+  const EMIT_BOUND = Math.min(ITEMS_PER_BRICK, ITEMS_CAP);
 
   const { levels, voxel0, atomics: winAtomics } = win;
   const MAX_DIRTY = levels * BRICKS_PER_LEVEL;
@@ -305,17 +409,64 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
   // stable identity — and NOT by its dirty-list index, which is re-sorted by
   // camera distance every frame and would hand a resuming brick somebody else's
   // progress.
+  //
+  // §19 4.1b PUTS A SECOND CURSOR BESIDE IT, FOR THE SAME REASON AND WITH THE
+  // SAME LIFETIME. `cellCur` is how many of the brick's own (cell, chunk) work
+  // items are already finished; `pairCur` is now how far into the item AT that
+  // cursor the last frame got. Two words, one meaning: "resume here". Both live
+  // below `RESET_OFF` and both are keyed by (level, brick).
   const CUR_OFF = 0;
   const CUR_WORDS = levels * BRICKS_PER_LEVEL;
-  const BKT_OFF = CUR_OFF + CUR_WORDS;
+  const CEL_OFF = CUR_OFF + CUR_WORDS;
+  const CEL_WORDS = levels * BRICKS_PER_LEVEL;
+  const RESET_OFF = CEL_OFF + CEL_WORDS;
+  const BKT_OFF = RESET_OFF;
   const BKT_WORDS = NBUCKETS * 2; // [counts | cursors]
-  const SCR_OFF = BKT_OFF + BKT_WORDS;
+  // THE PER-BRICK FEEDBACK RECORD, and why the parallel walk needs one at all.
+  // With one thread per brick the reserve's outcome was known to the same lane
+  // that had to store the cursor. With one thread per ITEM the outcome is spread
+  // over hundreds of lanes that finish out of order, so the brick's new cursor
+  // is a REDUCTION: `atomicMin` of (item, pairs) packed into one word picks the
+  // FIRST item that did not finish, which is exactly where the brick must
+  // resume. Indexed by dirty-list slot — only bricks with a scratch slot get
+  // items, so the record is `MAX_BUILD` long and not `MAX_DIRTY`.
+  //   +0 packed (rel << 12 | pairsDone) of the lowest UNFINISHED item, or FEED_NONE
+  //   +1 emitEnd — the item index one past the last one emitted this frame
+  //   +2 nItems  — the brick's whole item count
+  //   +3 Σ pair demand of the items emitted, for `maxBrickPairs`
+  const FEED_OFF = BKT_OFF + BKT_WORDS;
+  const FEED_WORDS = MAX_BUILD * 4;
+  const SCR_OFF = FEED_OFF + FEED_WORDS;
   const SCR_WORDS = MAX_BUILD * BRICK_VOXELS;
   const DIR_OFF = SCR_OFF + SCR_WORDS;
   const DIR_WORDS = MAX_DIRTY;
-  const PAIR_OFF = DIR_OFF + DIR_WORDS;
+  // The work-item list: [dirtySlot | chunk << 15], [cellIndex], [rel] per item.
+  // `rel` is the item's offset from its brick's cell cursor rather than its
+  // absolute index, so the feedback packing needs 12 bits for it instead of 20
+  // — and the brick's cursor, which `binCells` has already normalised into the
+  // buffer, is the only thing needed to turn it back into an absolute index.
+  const ITM_OFF = DIR_OFF + DIR_WORDS;
+  const ITM_WORDS = ITEMS_CAP * 3;
+  const PAIR_OFF = ITM_OFF + ITM_WORDS;
   const PAIR_WORDS = PAIRS_CAP * 2;
-  const WORK_WORDS = PAIR_OFF + PAIR_WORDS;
+  // ⭐⭐ §19 STAGE 3.9 — THE DOMINANT-AXIS SCRATCH, ONE WORD PER SCRATCH VOXEL.
+  //
+  // It could not ride in the palette scratch beside it, and that is worth the
+  // 1 MB it costs at ultra. That word is resolved by `atomicMax` over
+  // `TAG | (palByte + 1)`, i.e. its max IS the palette rule; packing an area
+  // weight into its free high bits would silently re-order palette resolution
+  // (the biggest triangle's class instead of the highest index) and every
+  // palette receipt in `probe:gi2-voxelize` measures exactly that order. Two
+  // questions, two words.
+  //
+  // ⚠ APPENDED AT THE TAIL, so no existing offset moves — the dirty list, the
+  // cursors, the item list and the pair list are being restructured in parallel
+  // by 4.1b, and a shifted `SCR_OFF` would be a merge conflict that compiles.
+  // It sits above `RESET_OFF`, so `resetWorkPass` already zeroes it every frame
+  // and there is no second clear to keep in step.
+  const AX_OFF = PAIR_OFF + PAIR_WORDS;
+  const AX_WORDS = MAX_BUILD * BRICK_VOXELS;
+  const WORK_WORDS = AX_OFF + AX_WORDS;
 
   const work = instancedArray(new Uint32Array(WORK_WORDS), "uint");
   const workAttr = work.value;
@@ -345,6 +496,20 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
   const faceBitsU = uniform(1);
   const pairLimitU = uniform(PAIRS_CAP);
   const levelBudgetU = Array.from({ length: levels }, () => uniform(PAIRS_CAP));
+  /**
+   * ⭐ §19 STAGE 4.1b — THE BUDGET, ON THE QUANTITY THAT ACTUALLY COSTS.
+   *
+   * `pairLimitU` bounds what `binPairs` WRITES; it never bounded what it WALKS,
+   * and the walk is what a dense scene costs. This one bounds the walk: how many
+   * (brick, cell, chunk) work items `binCells` may put on the frame's list, each
+   * of which walks at most `TRIS_PER_ITEM` triangles twice. Frame cost is
+   * therefore ≤ items × 2 × TRIS_PER_ITEM triangle tests, spread over items
+   * lanes — a number with a millisecond in it, unlike "dirty bricks".
+   *
+   * Bricks that do not fit stay DIRTY with their cell cursor untouched and are
+   * re-offered next frame, exactly as an overflowed pair reserve already was.
+   */
+  const cellLimitU = uniform(ITEMS_CAP);
   /**
    * ⛔⛔ §19 STAGE 4.1 — THE DIRTY-BRICK CAP. BUILT, MEASURED, REFUTED; KEPT AS
    * A HARNESS HOOK AND AS THE RECEIPT THAT SAYS WHY.
@@ -379,8 +544,10 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
    * Admitting fewer bricks therefore buys no time and multiplies the number of
    * frames that each pay the worst brick's latency.
    *
-   * ▶ The lever is PER-BRICK WORK: a CELL cursor beside the existing pair
-   * cursor, so one brick walks a bounded slice of its cells per frame.
+   * ✅ THE LEVER WAS PER-BRICK WORK, and Stage 4.1b took it: the thread is no
+   * longer a brick but a (brick, cell, chunk) item, and `cellLimitU` above
+   * budgets THOSE. The table stays because it is the receipt that says why the
+   * obvious cap is the wrong one.
    *
    * Left in place because the sweep that produced the table above needs it, and
    * because the next attempt will want to A/B against it. Defaults to the whole
@@ -550,8 +717,8 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
   // resumable brick is made of. The offset is a tier constant, so the kernel is
   // still one store and still scene-free.
   const resetWorkPass = Fn(() => {
-    atomicStore(wk.element(instanceIndex.add(uint(CUR_WORDS))), uint(0));
-  })().compute(WORK_WORDS - CUR_WORDS);
+    atomicStore(wk.element(instanceIndex.add(uint(RESET_OFF))), uint(0));
+  })().compute(WORK_WORDS - RESET_OFF);
 
   // ═════════════════════════════════════════════════════ PASS: markAllDirty
   // One thread per (level, brick): state ← DIRTY, `wb` untouched. Scene load,
@@ -566,6 +733,11 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     const b = bitAnd(instanceIndex, uint(BRICKS_PER_LEVEL - 1)).toVar();
     atomicStore(winAtomics.element(tabBaseOf(level, b).add(uint(1))), uint(STATE_DIRTY));
     atomicStore(wk.element(uint(CUR_OFF).add(instanceIndex)), uint(0));
+    // The CELL cursor for the same reason and with more force: it counts items
+    // of an enumeration derived from `cellRange`, and `markAllDirty` is exactly
+    // the call a NEW SOUP makes. A stale cell cursor would skip the brick's
+    // first N cells against a grid that no longer has the same contents.
+    atomicStore(wk.element(uint(CEL_OFF).add(instanceIndex)), uint(0));
   })().compute(levels * BRICKS_PER_LEVEL);
 
   // ═══════════════════════════════════════════════════ PASS: dirtyList (count)
@@ -615,16 +787,26 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     });
   })().compute(levels * BRICKS_PER_LEVEL);
 
-  // ═══════════════════════════════════════════════════════════ PASS: binPairs
+  // ══════════════════════════════════════════════════════════ PASS: binCells
   //
-  // One thread per DIRTY BRICK, in priority order (thread i owns dirty-list
-  // entry i, and the list is bucket-sorted). Walks the ≤ MAX_CELLS grid cells
-  // the brick overlaps, AABB-rejects each triangle, counts, reserves, writes.
+  // §19 STAGE 4.1b — THE BRICK'S THREAD, WITH THE TRIANGLES TAKEN OUT OF IT.
   //
-  // Bindings: work, counters, window, cellRange, cellTris, tris = 6 — the
-  // portable envelope exactly, which is why the buckets, the scratch, the dirty
-  // list and the pair list all share ONE buffer.
-  const binPairsPass = Fn(() => {
+  // Still one thread per DIRTY BRICK, in priority order, but this thread never
+  // touches a triangle. It expands the brick into (cell, chunk) WORK ITEMS,
+  // reserves a run of the frame's item list for them, clears the brick if this
+  // is its first instalment, and writes the items out. Per cell it reads
+  // `cellRange`'s count and nothing else — an L4 brick costs 216 loads here
+  // where `binPairs` used to cost 430 000.
+  //
+  // THE ITEM ENUMERATION IS THE CURSOR'S ALPHABET, so it is deterministic and it
+  // is derived the SAME WAY TWICE: cells in (x, y, z) order over the brick's
+  // clamped grid span, and inside a cell `ceil(count / TRIS_PER_ITEM)` chunks.
+  // Empty cells contribute NO items. The counting loop and the emit loop are the
+  // two halves of one enumeration exactly as `walk(0)` and `walk(1)` are for
+  // pairs, and "resume at item N" means nothing if they can drift apart.
+  //
+  // Bindings: work, counters, window, cellRange = 4.
+  const binCellsPass = Fn(() => {
     const i = instanceIndex.toVar();
     const dirty = atomicLoad(ct.element(uint(CTR_DIRTY))).toVar();
     If(i.greaterThanEqual(dirty.min(uint(MAX_DIRTY))), () => { Return(); });
@@ -634,28 +816,23 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     // produced that table needs a way to pin the limit, and because the cut
     // itself is provably safe: `STATE_BUILDING` is written only under
     // `If(accept)` far below, so a brick skipped here is never touched by
-    // `finishBricks`, keeps its `brickMask` bit and its pair cursor, and simply
+    // `finishBricks`, keeps its `brickMask` bit and both its cursors, and simply
     // comes back next frame — the same contract the resumable brick already has
-    // when a partial reserve runs out mid-brick. The cut is placed BEFORE the
-    // count walk because that walk, not the SAT, is what a dense scene costs.
+    // when a partial reserve runs out mid-brick.
     If(i.toFloat().greaterThanEqual(float(dirtyLimitU)), () => {
       atomicAdd(ct.element(uint(CTR_DEFER)), uint(1));
       Return();
     });
 
-    // EARLY OUT ON A SPENT BUDGET — A BOUND, NOT AN OPTIMISATION.
+    // EARLY OUT ON A SPENT ITEM LIST — A BOUND, NOT AN OPTIMISATION.
     //
-    // The idea was that a brick the budget already rejected should not pay a
-    // full COUNT walk again, since that walk (not the SAT) is what a dense
-    // scene costs — 23 000-97 000 brick rejections over a Bistro-scale build,
-    // each re-reading thousands of triangles to learn again that it cannot have
-    // them. MEASURED, IT NEVER FIRES: `deferred` is 0 at every tier, because a
+    // Measured at Stage 4.1 as never firing (`deferred` 0 at every tier): a
     // 20 480-thread dispatch launches essentially all at once and every thread
-    // reads the cursor before any of them has filled it. It is kept because it
-    // still BOUNDS a pathological dirty list (one whose threads genuinely do
-    // start late), and it costs one atomic load — but the per-frame cost in the
-    // receipts is the cost WITH it, so nothing here is paid for by this line.
-    If(atomicLoad(ct.element(uint(CTR_PAIRS))).toFloat().greaterThanEqual(float(pairLimitU)), () => {
+    // reads the counter before any of them has filled it. Kept because it still
+    // BOUNDS a pathological dirty list whose threads genuinely do start late,
+    // and because it costs one atomic load — the per-frame numbers in the
+    // receipts are the numbers WITH it, so nothing is paid for by this line.
+    If(atomicLoad(ct.element(uint(CTR_ITEMS))).toFloat().greaterThanEqual(float(cellLimitU)), () => {
       atomicAdd(ct.element(uint(CTR_DEFER)), uint(1));
       Return();
     });
@@ -670,6 +847,7 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     const bl = float(voxel0 * BRICK).mul(exp2(level.toFloat())).toVar();
     const bmin = wb.mul(bl).toVar();
     const bmax = bmin.add(bl).toVar();
+    const levelBase = levelBaseOf(level).toVar();
 
     // ── the grid cells this brick overlaps ────────────────────────────────
     const dim = vec3(gridDimU).toVar();
@@ -688,6 +866,227 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     const nCells = nxy.mul(nz).toVar();
     const dimX = dim.x.toUint().toVar();
     const dimY = dim.y.toUint().toVar();
+    /** Soup cell index of this brick's k-th overlapped cell. */
+    const cellIndexOf = (k) => {
+      const kz = k.div(nxy).toVar();
+      const r = k.sub(kz.mul(nxy)).toVar();
+      const ky = r.div(nx).toVar();
+      const kx = r.sub(ky.mul(nx)).toVar();
+      return g0.x.toUint().add(kx)
+        .add(dimX.mul(g0.y.toUint().add(ky).add(dimY.mul(g0.z.toUint().add(kz)))));
+    };
+
+    // ── THE TWO CURSORS, NORMALISED ONCE AND WRITTEN BACK ─────────────────
+    //
+    // `windowStore`'s `scroll` re-points a slot and writes EMPTY_DIRTY without
+    // knowing this file exists, so a cursor stored by the brick that USED to own
+    // the slot is stale exactly then. Stage 2.5 applied that rule inside
+    // `binPairs`; with the walk spread over hundreds of lanes it has to be
+    // applied ONCE, here, and written back — otherwise every item lane would
+    // re-derive it and `finishBricks` would have to derive it a third time.
+    const curWord = uint(CUR_OFF).add(level.mul(uint(BRICKS_PER_LEVEL))).add(b).toVar();
+    const celWord = uint(CEL_OFF).add(level.mul(uint(BRICKS_PER_LEVEL))).add(b).toVar();
+    const state = atomicLoad(winAtomics.element(tab.add(uint(1)))).toVar();
+    //
+    // ⛔ THE LOADS ARE `toVar()`d BEFORE THE SELECT, AND THAT IS NOT STYLE.
+    // TSL emits a BARE `atomicLoad` inside `select()` as a discarded statement
+    // and substitutes `0u` for its value ("Invalid generated code, expected a
+    // uint" on the console, and a cursor that silently reads zero). Any atomic
+    // read that feeds a `select` has to land in a variable first — or be wrapped
+    // in an operation, which is why the pre-4.1b `select(…, atomicLoad(x).min(n))`
+    // survived and a plain `select(…, atomicLoad(x))` does not.
+    const restart = state.equal(uint(STATE_EMPTY_DIRTY)).toVar();
+    const cellStored = atomicLoad(wk.element(celWord)).toVar();
+    const pairStored = atomicLoad(wk.element(curWord)).toVar();
+    const cellCur = select(restart, uint(0), cellStored).toVar();
+    const pairCur = select(restart, uint(0), pairStored).toVar();
+
+    // ── how many items this brick owes IN TOTAL ───────────────────────────
+    const nItems = uint(0).toVar();
+    Loop({ start: 0, end: MAX_CELLS, name: "cntK" }, ({ cntK }) => {
+      const k = uint(cntK).toVar();
+      If(k.greaterThanEqual(nCells), () => { Break(); });
+      const count = cellRange.element(cellIndexOf(k).mul(uint(2)).add(uint(1))).toVar();
+      nItems.addAssign(count.add(uint(TRIS_PER_ITEM - 1)).div(uint(TRIS_PER_ITEM)));
+    });
+    const cur = cellCur.min(nItems).toVar();
+    const pcur = select(cur.lessThan(nItems), pairCur, uint(0)).toVar();
+    const owed = nItems.sub(cur).toVar();
+    atomicAdd(ct.element(uint(CTR_ITEMWANT)), owed);
+
+    // The feedback record, pre-armed for the case where nothing fails. Written
+    // for every brick with a scratch slot, accepted or not: `finishBricks` only
+    // reads it for bricks left in STATE_BUILDING, and the slot is the brick's
+    // own dirty index, so no two bricks can collide in it.
+    const hasSlot = i.lessThan(uint(MAX_BUILD));
+    const f = uint(FEED_OFF).add(i.min(uint(MAX_BUILD - 1)).mul(uint(4))).toVar();
+    If(hasSlot, () => {
+      atomicStore(wk.element(f), uint(FEED_NONE));
+      atomicStore(wk.element(f.add(uint(1))), cur);
+      atomicStore(wk.element(f.add(uint(2))), nItems);
+    });
+
+    const accept = float(0).toVar();
+    If(owed.equal(uint(0)), () => {
+      // Nothing left to walk — an empty brick, a brick whose cells hold no
+      // triangles at all, or the frame that closes a resumed one. No scratch
+      // slot, no item budget, always accepted: this is what lets an empty window
+      // drain at the full dirty list per frame instead of queueing 16 384
+      // nothings behind MAX_BUILD.
+      accept.assign(1);
+    }).Else(() => {
+      If(hasSlot.not(), () => {
+        atomicAdd(ct.element(uint(CTR_SLOTFULL)), uint(1));
+      }).Else(() => {
+        const want = owed.min(uint(EMIT_BOUND)).toVar();
+        const base = atomicAdd(ct.element(uint(CTR_ITEMS)), want).toVar();
+        // No `min(ITEMS_CAP)` here on purpose: `setCellLimit` clamps the uniform
+        // to the allocation, and an `ITEMS_CAP` float literal in the WGSL is
+        // exactly the kind of number the scene-free check exists to reject.
+        const room = float(cellLimitU).sub(base.toFloat()).toVar();
+        If(room.lessThan(1), () => {
+          atomicAdd(ct.element(uint(CTR_ITEMOVF)), uint(1));
+        }).Else(() => {
+          const take = want.min(room.toUint()).toVar();
+          const emitEnd = cur.add(take).toVar();
+          accept.assign(1);
+          atomicStore(wk.element(f.add(uint(1))), emitEnd);
+          If(emitEnd.lessThan(nItems), () => { atomicAdd(ct.element(uint(CTR_ITEMCUT)), uint(1)); });
+          // ── emit [cur, emitEnd) ───────────────────────────────────────
+          // `at` is the running ABSOLUTE item index at the start of each cell,
+          // so the cells before the cursor are skipped by arithmetic rather
+          // than by re-deriving where the cursor fell.
+          const at = uint(0).toVar();
+          Loop({ start: 0, end: MAX_CELLS, name: "emiK" }, ({ emiK }) => {
+            const k = uint(emiK).toVar();
+            If(k.greaterThanEqual(nCells), () => { Break(); });
+            If(at.greaterThanEqual(emitEnd), () => { Break(); });
+            const ci = cellIndexOf(k).toVar();
+            const count = cellRange.element(ci.mul(uint(2)).add(uint(1))).toVar();
+            const chunks = count.add(uint(TRIS_PER_ITEM - 1)).div(uint(TRIS_PER_ITEM)).toVar();
+            const lo = at.max(cur).toVar();
+            const hi = at.add(chunks).min(emitEnd).toVar();
+            Loop({ start: 0, end: EMIT_BOUND, name: "emiC" }, ({ emiC }) => {
+              const idx = lo.add(uint(emiC)).toVar();
+              If(idx.greaterThanEqual(hi), () => { Break(); });
+              const w = uint(ITM_OFF).add(base.add(idx.sub(cur)).mul(uint(3))).toVar();
+              // dirty slot (15) | chunk (17). The slot is < MAX_BUILD by the
+              // branch above, so it also fits the pair record's 13 bits.
+              atomicStore(wk.element(w), bitOr(i, shiftLeft(idx.sub(at), uint(15))));
+              atomicStore(wk.element(w.add(uint(1))), ci);
+              // RELATIVE to the cursor, not absolute: the feedback packs it into
+              // 12 bits and `EMIT_BOUND` is what bounds it.
+              atomicStore(wk.element(w.add(uint(2))), idx.sub(cur));
+            });
+            at.addAssign(chunks);
+          });
+        });
+      });
+    });
+
+    If(accept.greaterThan(0.5), () => {
+      // CLEAR the brick's own voxels on the FIRST instalment only — a resumed
+      // brick must accumulate onto what its earlier instalments wrote, or every
+      // frame would erase the last one.
+      //
+      // ⭐ IT MOVED OUT OF `binPairs` FOR A STRUCTURAL REASON, NOT A TIDY ONE:
+      // the walk is now hundreds of lanes that all write into this brick, and a
+      // clear inside THAT dispatch would race the writes it exists to precede.
+      // Its own dispatch orders it, at the cost of nothing — the clear was
+      // already one thread per brick.
+      If(cur.equal(uint(0)).and(pcur.equal(uint(0))), () => {
+        atomicAnd(
+          winAtomics.element(levelBase.add(uint(BMASK_OFF)).add(shiftRight(b, uint(5)))),
+          bitNot(shiftLeft(uint(1), bitAnd(b, uint(31)))),
+        );
+        // 16 rows of four x-consecutive voxels: `face` words are owned outright
+        // and stored; the `occ` nibble and the brickMask bit share a word with
+        // neighbours and are merged with atomicAnd.
+        Loop({ start: 0, end: BRICK * BRICK, name: "clrRow" }, ({ clrRow }) => {
+          const ly = bitAnd(uint(clrRow), uint(3)).toVar();
+          const lz = shiftRight(uint(clrRow), uint(2)).toVar();
+          const vi = voxIndexIn(b, uint(0), ly, lz).toVar();
+          atomicAnd(
+            winAtomics.element(levelBase.add(uint(OCC_OFF)).add(shiftRight(vi, uint(5)))),
+            bitNot(shiftLeft(uint(0xf), bitAnd(vi, uint(31)))),
+          );
+          atomicStore(winAtomics.element(levelBase.add(uint(FACE_OFF)).add(shiftRight(vi, uint(2)))), uint(0));
+          // `pal` goes to 255-per-byte on the shipping path (`finishBricks`
+          // merges the scratch over it, so this only matters if the brick ends
+          // up empty) and to 0 on the CONTROL path, because the naive packed
+          // `atomicMax` can never lower a byte and would otherwise leave every
+          // voxel reading 255 — a control arm that fails for the wrong reason
+          // proves nothing about the arm it is controlling.
+          atomicStore(
+            winAtomics.element(levelBase.add(uint(PAL_OFF)).add(shiftRight(vi, uint(2)))),
+            select(float(palModeU).greaterThan(0.5), uint(PAL_NONE_WORD), uint(0)),
+          );
+        });
+      });
+      // The normalised cursors, so `binPairs` and `finishBricks` read the same
+      // pair of numbers this thread decided on.
+      atomicStore(wk.element(celWord), cur);
+      atomicStore(wk.element(curWord), pcur);
+      atomicStore(winAtomics.element(tab.add(uint(1))), uint(STATE_BUILDING));
+    });
+  })().compute(MAX_DIRTY);
+
+  // ═══════════════════════════════════════════════════════════ PASS: binPairs
+  //
+  // ONE THREAD PER (brick, cell, chunk) WORK ITEM. It walks at most
+  // `TRIS_PER_ITEM` triangles of ONE soup cell, AABB-rejects them, counts,
+  // reserves its slice of the pair list and writes it — Stage 2.3's two-walk
+  // shape unchanged, with the brick's ≤ MAX_CELLS serial cell loop replaced by
+  // ≤ MAX_CELLS lanes. The whole of Stage 4.1's freeze was that one loop.
+  //
+  // Bindings: work, counters, window, cellRange, cellTris, tris = 6 — the
+  // portable envelope exactly, which is why the buckets, the feedback, the
+  // scratch, the dirty list, the item list and the pair list all share ONE
+  // buffer.
+  const binPairsPass = Fn(() => {
+    const s = instanceIndex.toVar();
+    const nWork = atomicLoad(ct.element(uint(CTR_ITEMS))).min(uint(ITEMS_CAP)).toVar();
+    If(s.greaterThanEqual(nWork), () => { Return(); });
+
+    const iw = uint(ITM_OFF).add(s.mul(uint(3))).toVar();
+    const w0 = atomicLoad(wk.element(iw)).toVar();
+    const i = bitAnd(w0, uint(0x7fff)).toVar(); // the brick's dirty-list slot
+    const chunk = shiftRight(w0, uint(15)).toVar();
+    const ci = atomicLoad(wk.element(iw.add(uint(1)))).toVar();
+    const rel = atomicLoad(wk.element(iw.add(uint(2)))).toVar();
+
+    const id = atomicLoad(wk.element(uint(DIR_OFF).add(i))).toVar();
+    const level = shiftRight(id, uint(12)).toVar();
+    const b = bitAnd(id, uint(BRICKS_PER_LEVEL - 1)).toVar();
+    const tab = tabBaseOf(level, b).toVar();
+    const wb = unpackWb(atomicLoad(winAtomics.element(tab))).toVar();
+
+    const bl = float(voxel0 * BRICK).mul(exp2(level.toFloat())).toVar();
+    const bmin = wb.mul(bl).toVar();
+    const bmax = bmin.add(bl).toVar();
+
+    const dim = vec3(gridDimU).toVar();
+    const cell = float(gridCellU).toVar();
+    // `g0` is the brick's first grid cell, and it is here for ONE reason: the
+    // de-duplication rule below accepts a triangle only from the min corner of
+    // (its cell range ∩ the brick's), so an item walking a single cell still has
+    // to know where the brick's range starts.
+    const g0 = bmin.sub(vec3(gridOriginU)).div(cell).floor().clamp(vec3(0), dim.sub(1)).toVar();
+    const dimX = dim.x.toUint().toVar();
+    const dimY = dim.y.toUint().toVar();
+    const dimXY = dimX.mul(dimY).toVar();
+    const gz = ci.div(dimXY).toVar();
+    const grem = ci.sub(gz.mul(dimXY)).toVar();
+    const gy = grem.div(dimX).toVar();
+    const gx = grem.sub(gy.mul(dimX)).toVar();
+
+    // THIS ITEM'S TRIANGLE RANGE — the chunk, and the whole reason a cell with
+    // 100 000 triangles no longer owns the frame.
+    const start = cellRange.element(ci.mul(uint(2))).toVar();
+    const count = cellRange.element(ci.mul(uint(2)).add(uint(1))).toVar();
+    const t0 = chunk.mul(uint(TRIS_PER_ITEM)).min(count).toVar();
+    const t1 = count.min(t0.add(uint(TRIS_PER_ITEM))).toVar();
+    atomicMax(ct.element(uint(CTR_MAXTRIS)), t1.sub(t0));
 
     // ── THE WALK, run twice: `mode` 0 counts, `mode` 1 writes ─────────────
     // The two passes must enumerate the same pairs in the same order, so they
@@ -696,7 +1095,7 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     // makes the pair CURSOR meaningful: "the first `skip` accepted triangles are
     // already done" is only a resumption point if both walks agree on which
     // triangle is first.
-    const need = uint(0).toVar(); // pairs this brick wants IN TOTAL
+    const need = uint(0).toVar(); // pairs THIS ITEM wants in total
     const dust = uint(0).toVar(); // sub-voxel triangles that skip the SAT
     const base = uint(0).toVar(); // this frame's slice of the pair list
     const take = uint(0).toVar(); // how many of `need` this frame can afford
@@ -769,25 +1168,19 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     // invocation, and this thread still owes its brick a state write. Every skip
     // below is therefore a POSITIVE `If`, not an early exit — the same reason
     // `occupancyField`'s voxelize guards its whole body instead of breaking.
+    //
+    // ⭐ THE LOOP BOUND IS `TRIS_PER_ITEM`, A TIER CONSTANT — not the cell's
+    // triangle count. That is the entire structural change of Stage 4.1b: the
+    // walk's worst case is now written into the WGSL instead of being read out
+    // of the scene at run time.
     const walk = (mode) => {
-      const cellName = `cellK${mode}`;
       const triName = `triJ${mode}`;
       const cursor = uint(0).toVar();
-      Loop({ start: 0, end: MAX_CELLS, name: cellName }, (params) => {
-        const k = uint(params[cellName]).toVar();
-        If(k.greaterThanEqual(nCells), () => { Break(); });
-        const kz = k.div(nxy).toVar();
-        const r = k.sub(kz.mul(nxy)).toVar();
-        const ky = r.div(nx).toVar();
-        const kx = r.sub(ky.mul(nx)).toVar();
-        const gx = g0.x.toUint().add(kx).toVar();
-        const gy = g0.y.toUint().add(ky).toVar();
-        const gz = g0.z.toUint().add(kz).toVar();
-        const ci = gx.add(dimX.mul(gy.add(dimY.mul(gz)))).toVar();
-        const start = cellRange.element(ci.mul(uint(2))).toVar();
-        const count = cellRange.element(ci.mul(uint(2)).add(uint(1))).toVar();
-        Loop({ start: 0, end: count, type: "uint", name: triName }, (inner) => {
-          const t = cellTris.element(start.add(uint(inner[triName]))).toVar();
+      Loop({ start: 0, end: TRIS_PER_ITEM, type: "uint", name: triName }, (inner) => {
+        {
+          const j = t0.add(uint(inner[triName])).toVar();
+          If(j.greaterThanEqual(t1), () => { Break(); });
+          const t = cellTris.element(start.add(j)).toVar();
           const p = readTri(t);
           const tlo = p[0].min(p[1]).min(p[2]).toVar();
           const thi = p[0].max(p[1]).max(p[2]).toVar();
@@ -833,133 +1226,92 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
               cursor.addAssign(1);
             }
           });
-        });
+        }
       });
     };
 
     walk(0);
     atomicAdd(ct.element(uint(CTR_NEEDED)), need);
-    // The largest single-brick demand in the frame. It used to be the floor a
-    // test cap had to clear; with the resumable cursor it is a receipt only —
-    // a cap BELOW it now converges instead of starving, which is precisely the
-    // property the cursor arm exists to prove.
-    atomicMax(ct.element(uint(CTR_MAXNEED)), need);
+    // The brick's whole demand, summed out of its items so `maxBrickPairs` keeps
+    // meaning what the probe's cursor sweep reads it as — the floor a test cap
+    // has to fall BELOW to prove the resumption path runs at all. Per-ITEM it
+    // would be ≤ TRIS_PER_ITEM and the sweep would be measuring the chunk size.
+    const feed = uint(FEED_OFF).add(i.mul(uint(4))).toVar();
+    atomicAdd(wk.element(feed.add(uint(3))), need);
 
-    // ── the resumable reserve ────────────────────────────────────────────
+    // ── the resumable reserve, now PER ITEM ──────────────────────────────
     //
-    // `skip` is where the last frame stopped. `windowStore`'s `scroll` re-points
-    // a slot and writes EMPTY_DIRTY without knowing this file exists, so a
-    // cursor stored by the brick that USED to own the slot is stale exactly
-    // then — state 0 forces a restart, and `markAllDirty` zeroes the word
-    // itself for the case where the slot did NOT move but its contents did.
+    // Only the item sitting ON the brick's cell cursor can carry a pair skip:
+    // every later item of the frame's run is being walked for the first time and
+    // starts at its own zero. `binCells` already normalised the cursor pair (the
+    // EMPTY_DIRTY staleness rule lives there now, applied once instead of once
+    // per lane), so this is a plain read of a word this frame agreed on.
     const curWord = uint(CUR_OFF).add(level.mul(uint(BRICKS_PER_LEVEL))).add(b).toVar();
-    const stateNow = atomicLoad(winAtomics.element(tab.add(uint(1)))).toVar();
-    skip.assign(select(
-      stateNow.equal(uint(STATE_EMPTY_DIRTY)),
-      uint(0),
-      atomicLoad(wk.element(curWord)).min(need),
-    ));
+    const pairStored = atomicLoad(wk.element(curWord)).toVar();
+    skip.assign(select(rel.equal(uint(0)), pairStored.min(need), uint(0)));
     const remaining = need.sub(skip).toVar();
+    const itemDone = float(0).toVar();
 
-    const accept = float(0).toVar();
     If(remaining.equal(uint(0)), () => {
-      // Nothing left to pair — an empty brick, a DUST-ONLY brick, or the frame
-      // that closes a resumed one. No scratch slot, no budget, always accepted:
-      // this is what lets an empty window drain in a couple of frames instead of
-      // queueing 16 384 nothings behind MAX_BUILD.
-      accept.assign(1);
+      // Nothing left to pair — an empty chunk, a DUST-ONLY chunk, or the frame
+      // that closes a resumed item.
+      itemDone.assign(1);
     }).Else(() => {
-      If(i.greaterThanEqual(uint(MAX_BUILD)), () => {
-        atomicAdd(ct.element(uint(CTR_SLOTFULL)), uint(1));
+      const lvBase = atomicAdd(ct.element(uint(CTR_LEVEL_PAIRS).add(level)), remaining).toVar();
+      const lvRoom = levelBudgetAt(level).sub(lvBase.toFloat()).toVar();
+      If(lvRoom.lessThan(1), () => {
+        atomicAdd(ct.element(uint(CTR_OVERFLOW)), uint(1));
       }).Else(() => {
-        const lvBase = atomicAdd(ct.element(uint(CTR_LEVEL_PAIRS).add(level)), remaining).toVar();
-        const lvRoom = levelBudgetAt(level).sub(lvBase.toFloat()).toVar();
-        If(lvRoom.lessThan(1), () => {
+        base.assign(atomicAdd(ct.element(uint(CTR_PAIRS)), remaining));
+        const room = float(pairLimitU).sub(base.toFloat()).min(lvRoom).toVar();
+        If(room.lessThan(1), () => {
           atomicAdd(ct.element(uint(CTR_OVERFLOW)), uint(1));
         }).Else(() => {
-          base.assign(atomicAdd(ct.element(uint(CTR_PAIRS)), remaining));
-          const room = float(pairLimitU).sub(base.toFloat()).min(lvRoom).toVar();
-          If(room.lessThan(1), () => {
-            atomicAdd(ct.element(uint(CTR_OVERFLOW)), uint(1));
-          }).Else(() => {
-            // THE PARTIAL RESERVE. Stage 2.3 failed the whole brick when its
-            // demand did not fit, which is what made a brick bigger than the cap
-            // unbuildable; it now takes WHATEVER IS LEFT and the cursor carries
-            // the rest to the next frame. Safe because the palette pack became a
-            // merge (see `finishBricks`) — the original all-or-nothing rule
-            // existed only because a half-filled scratch packed its missing half
-            // as 255.
-            take.assign(remaining.min(room.toUint()));
-            accept.assign(1);
-            slotOk.assign(1);
-          });
+          // THE PARTIAL RESERVE. Stage 2.3 failed the whole brick when its demand
+          // did not fit, which is what made a brick bigger than the cap
+          // unbuildable; it takes WHATEVER IS LEFT and the cursor carries the
+          // rest to the next frame. Safe because the palette pack is a merge
+          // (see `finishBricks`) — the all-or-nothing rule existed only because a
+          // half-filled scratch packed its missing half as 255.
+          take.assign(remaining.min(room.toUint()));
+          slotOk.assign(1);
+          itemDone.assign(select(skip.add(take).greaterThanEqual(need), float(1), float(0)));
+          // STRUCTURALLY UNREACHABLE, and counted anyway: this branch has
+          // `remaining ≥ 1` and `room ≥ 1`, so `take ≥ 1`. `starved` is an
+          // INVARIANT the probe asserts, not a failure mode the design tolerates.
+          If(take.equal(uint(0)), () => { atomicAdd(ct.element(uint(CTR_STARVED)), uint(1)); });
         });
       });
     });
 
-    If(accept.greaterThan(0.5), () => {
-      const newCursor = skip.add(take).toVar();
-      const done = newCursor.greaterThanEqual(need);
-      // CLEAR the brick's own voxels before anything re-writes them — but ONLY
-      // on the first instalment. A resumed brick must accumulate onto what its
-      // earlier instalments wrote, or every frame would erase the last one and
-      // the brick would converge to its final slice instead of its union.
-      If(skip.equal(uint(0)), () => {
-        atomicAnd(
-          winAtomics.element(levelBase.add(uint(BMASK_OFF)).add(shiftRight(b, uint(5)))),
-          bitNot(shiftLeft(uint(1), bitAnd(b, uint(31)))),
-        );
-        // 16 rows of four x-consecutive voxels: `face` words are owned outright
-        // and stored; the `occ` nibble and the brickMask bit share a word with
-        // neighbours and are merged with atomicAnd.
-        Loop({ start: 0, end: BRICK * BRICK, name: "clrRow" }, ({ clrRow }) => {
-          const ly = bitAnd(uint(clrRow), uint(3)).toVar();
-          const lz = shiftRight(uint(clrRow), uint(2)).toVar();
-          const vi = voxIndexIn(b, uint(0), ly, lz).toVar();
-          atomicAnd(
-            winAtomics.element(levelBase.add(uint(OCC_OFF)).add(shiftRight(vi, uint(5)))),
-            bitNot(shiftLeft(uint(0xf), bitAnd(vi, uint(31)))),
-          );
-          atomicStore(winAtomics.element(levelBase.add(uint(FACE_OFF)).add(shiftRight(vi, uint(2)))), uint(0));
-          // `pal` goes to 255-per-byte on the shipping path (`finishBricks`
-          // merges the scratch over it, so this only matters if the brick ends
-          // up empty) and to 0 on the CONTROL path, because the naive packed
-          // `atomicMax` can never lower a byte and would otherwise leave every
-          // voxel reading 255 — a control arm that fails for the wrong reason
-          // proves nothing about the arm it is controlling.
-          atomicStore(
-            winAtomics.element(levelBase.add(uint(PAL_OFF)).add(shiftRight(vi, uint(2)))),
-            select(float(palModeU).greaterThan(0.5), uint(PAL_NONE_WORD), uint(0)),
-          );
-        });
-      });
-      // A brick with nothing but dust never reserves a pair, so the write walk
-      // has to be reachable without `slotOk` — and a brick with NEITHER must
-      // still skip it, or an empty window would pay two walks per brick per
-      // frame for nothing.
-      If(slotOk.greaterThan(0.5).or(dust.greaterThan(uint(0))), () => {
-        walk(1);
-        atomicAdd(ct.element(uint(CTR_WRITTEN)), written);
-        atomicAdd(ct.element(uint(CTR_DUST)), dustWritten);
-        atomicAdd(ct.element(uint(CTR_LEVEL_DUST).add(level)), dustWritten);
-      });
-      // A finished brick stores 0 so the next scroll/dirty cycle starts clean,
-      // and `finishBricks` reads exactly this word to decide BUILT vs one-more-
-      // frame — the cursor IS the completion flag, so there is no second piece
-      // of state that could disagree with it.
-      atomicStore(wk.element(curWord), select(done, uint(0), newCursor));
-      atomicMax(ct.element(uint(CTR_MAXCURSOR)), newCursor);
-      If(newCursor.lessThan(need), () => { atomicAdd(ct.element(uint(CTR_RESUMED)), uint(1)); });
-      // STRUCTURALLY UNREACHABLE, and counted anyway: `accept` implies either
-      // `remaining == 0` or `take >= 1`, so a brick can never be accepted and
-      // make no progress. `starved` is now an INVARIANT the probe asserts, not
-      // a failure mode the design tolerates.
-      If(take.equal(uint(0)).and(remaining.greaterThan(uint(0))), () => {
-        atomicAdd(ct.element(uint(CTR_STARVED)), uint(1));
-      });
-      atomicStore(winAtomics.element(tab.add(uint(1))), uint(STATE_BUILDING));
+    // A chunk with nothing but dust never reserves a pair, so the write walk has
+    // to be reachable without `slotOk` — and a chunk with NEITHER must still skip
+    // it, or an empty window would pay two walks per item per frame for nothing.
+    If(slotOk.greaterThan(0.5).or(dust.greaterThan(uint(0))), () => {
+      walk(1);
+      atomicAdd(ct.element(uint(CTR_WRITTEN)), written);
+      atomicAdd(ct.element(uint(CTR_DUST)), dustWritten);
+      atomicAdd(ct.element(uint(CTR_LEVEL_DUST).add(level)), dustWritten);
     });
-  })().compute(MAX_DIRTY);
+
+    // ⭐⭐ THE FEEDBACK, AND WHY IT IS A REDUCTION.
+    //
+    // With one thread per brick the reserve's outcome was known to the lane that
+    // had to store the cursor. With one thread per item it is spread over
+    // hundreds of lanes that finish in any order, so the brick's resume point is
+    // `atomicMin` over (rel << 12 | pairsDone): the LOWEST item that did not
+    // finish wins, and its own pair progress rides in the low 12 bits — both
+    // fit because `rel < EMIT_BOUND` and `pairsDone ≤ TRIS_PER_ITEM`. Items
+    // ABOVE that point which did finish are simply re-walked next frame; the
+    // writes are idempotent (`atomicOr` on occ/face, `atomicMax` on the palette
+    // scratch), so re-doing them costs budget and changes no bit.
+    If(itemDone.lessThan(0.5), () => {
+      atomicMin(
+        wk.element(feed),
+        bitOr(shiftLeft(rel, uint(12)), skip.add(take).min(uint(4095))),
+      );
+    });
+  })().compute(ITEMS_CAP);
 
   // ═══════════════════════════════════════════════════════════ PASS: voxelize
   //
@@ -1009,6 +1361,30 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     ).toVar();
     faceMask.assign(select(float(faceBitsU).greaterThan(0.5), faceMask, uint(0)));
 
+    // ⭐⭐ §19 STAGE 3.9 — THIS TRIANGLE'S VOTE FOR THE VOXEL'S DOMINANT AXIS.
+    //
+    // The face MASK says which axes the surface is not parallel to; it cannot
+    // say which one it is MOST along, and that is the question a cache slot
+    // asks. The vote is `(weight, axis)` packed into one word so `atomicMax`
+    // resolves it — the heaviest triangle in the voxel names the axis, which is
+    // the area-weighted argmax §Q.1 asks for, expressed as the only reduction a
+    // storage buffer has.
+    //
+    // ⚠ THE AREA IS CLIPPED TO ONE VOXEL'S CROSS-SECTION FIRST. In voxel space
+    // a cell is a unit cube, so a surface can present at most ~1 of area inside
+    // it; a 10 m wall triangle and a 1 m one cover this voxel exactly the same,
+    // and letting the whole triangle's area vote would let one long triangle
+    // outrank every surface it merely passes beside. `+1` keeps a legitimate
+    // vote distinguishable from the 0 the frame's reset leaves behind.
+    const an = nn.abs().toVar();
+    const axMax = an.x.max(an.y).max(an.z).toVar();
+    const axIdx = select(an.x.greaterThanEqual(an.y).and(an.x.greaterThanEqual(an.z)), uint(0),
+      select(an.y.greaterThanEqual(an.z), uint(1), uint(2))).toVar();
+    const axVote = bitOr(
+      shiftLeft(nlen.mul(0.5).min(1).mul(axMax).mul(1048576).toUint().add(uint(1)), uint(2)),
+      axIdx,
+    ).toVar();
+
     // Palette byte of this triangle: 4 per word, 255 = none.
     const palByte = bitAnd(shiftRight(triPal.element(shiftRight(t, uint(2))), bitAnd(t, uint(3)).mul(uint(8))),
       uint(255)).toVar();
@@ -1052,6 +1428,17 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
         atomicOr(
           winAtomics.element(levelBase.add(uint(FACE_OFF)).add(shiftRight(vi, uint(2)))),
           shiftLeft(faceMask, byteShift),
+        );
+        // §19 Stage 3.9's vote, into the scratch `finishBricks` packs. It rides
+        // the SAT path only: `binPairs`' dust write has no area to weigh (a dust
+        // triangle is BELOW a quarter cell by definition) and a voxel that only
+        // ever saw dust honestly has no dominant normal — it reads as "not
+        // known" and its consumers fall back on the entry face, exactly as
+        // before this stage.
+        atomicMax(
+          wk.element(uint(AX_OFF).add(slot.mul(uint(BRICK_VOXELS)))
+            .add(lx.add(ly.mul(uint(4))).add(lz.mul(uint(16))))),
+          axVote,
         );
         If(palByte.notEqual(uint(PAL_NONE)), () => {
           If(float(palModeU).greaterThan(0.5), () => {
@@ -1143,10 +1530,50 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     // triangle ever reached still gets its dust palette. A half-built brick's
     // `brickMask` bit is clear, so the byte being provisionally empty for a
     // frame or two is invisible to the trace.
+    //
+    // ══ §19 4.1b — THE VERDICT IS NOW A REDUCTION OF THE ITEM FEEDBACK ══
+    //
+    // `binCells` normalised the brick's cursor pair and recorded how far it got
+    // to emit (`emitEnd`) out of how many items the brick owes (`nItems`);
+    // `binPairs`'s lanes folded the lowest UNFINISHED item into `feed` with an
+    // `atomicMin`. So:
+    //   feed == FEED_NONE → every emitted item finished → resume at `emitEnd`
+    //   otherwise         → resume at that item, with its own pair progress
+    // and the brick is BUILT only when the resume point has reached `nItems` —
+    // BOTH cursors home, which is what "a brick completes when its cells and its
+    // pairs are both done" means in one comparison.
+    //
+    // A brick with no scratch slot cannot have had items (`binCells` refuses it
+    // a slot before it emits any), so reaching STATE_BUILDING without one means
+    // it owed nothing: done, cursors zero, no record to read.
     const curWord = uint(CUR_OFF).add(level.mul(uint(BRICKS_PER_LEVEL))).add(b).toVar();
-    const cursorNow = atomicLoad(wk.element(curWord)).toVar();
-    const done = cursorNow.equal(uint(0)).toVar();
-    // "Nothing has claimed this byte" is the sentinel `binPairs` cleared to,
+    const celWord = uint(CEL_OFF).add(level.mul(uint(BRICKS_PER_LEVEL))).add(b).toVar();
+    //
+    // ⛔ EVERY ATOMIC READ IS `toVar()`d BEFORE IT REACHES A `select`: TSL emits
+    // a bare `atomicLoad` inside `select()` as a discarded statement and puts
+    // `0u` in its place, which read as "this brick owes nothing" and marked
+    // half-built bricks BUILT. See the same note in `binCells`.
+    const feed = uint(FEED_OFF).add(i.min(uint(MAX_BUILD - 1)).mul(uint(4))).toVar();
+    const fwRaw = atomicLoad(wk.element(feed)).toVar();
+    const emitRaw = atomicLoad(wk.element(feed.add(uint(1)))).toVar();
+    const itemsRaw = atomicLoad(wk.element(feed.add(uint(2)))).toVar();
+    const demandRaw = atomicLoad(wk.element(feed.add(uint(3)))).toVar();
+    const fw = select(hasSlot, fwRaw, uint(FEED_NONE)).toVar();
+    const emitEnd = select(hasSlot, emitRaw, uint(0)).toVar();
+    const nItems = select(hasSlot, itemsRaw, uint(0)).toVar();
+    const cellNow = atomicLoad(wk.element(celWord)).toVar();
+    const stuck = fw.notEqual(uint(FEED_NONE)).toVar();
+    const nextCell = select(stuck, cellNow.add(shiftRight(fw, uint(12))), emitEnd).toVar();
+    const nextPair = select(stuck, bitAnd(fw, uint(4095)), uint(0)).toVar();
+    const done = nextCell.greaterThanEqual(nItems).toVar();
+    const cursorNow = select(done, uint(0), nextCell).toVar();
+    atomicStore(wk.element(celWord), cursorNow);
+    atomicStore(wk.element(curWord), select(done, uint(0), nextPair));
+    atomicMax(ct.element(uint(CTR_MAXCELL)), nextCell);
+    atomicMax(ct.element(uint(CTR_MAXCURSOR)), nextPair);
+    // The brick's whole pair demand, accumulated by its items — see `binPairs`.
+    atomicMax(ct.element(uint(CTR_MAXNEED)), select(hasSlot, demandRaw, uint(0)));
+    // "Nothing has claimed this byte" is the sentinel `binCells` cleared to,
     // and the two arms clear to different ones (see the clear's own note).
     const noneByte = select(float(palModeU).greaterThan(0.5), uint(PAL_NONE), uint(0)).toVar();
 
@@ -1205,18 +1632,55 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
           });
         }
         atomicStore(winAtomics.element(palWord), word);
+
+        // ⭐⭐ §19 STAGE 3.9 — BITS 6-7 OF THE SAME FOUR VOXELS' FACE BYTES.
+        //
+        // A read-modify-write for the same reason the palette merge is one: the
+        // brick owns this word outright (four x-consecutive voxels inside it,
+        // and `vi & 3` spans exactly them because a brick starts on a multiple
+        // of 4), and `voxelize` has finished. Bits 0-5 are carried through
+        // untouched — they are the OR of every triangle's mask and this pass
+        // must not be able to lose one.
+        //
+        // ⚠ A RESUMED BRICK LETS ITS LAST INSTALMENT DECIDE. The vote scratch is
+        // per frame (`resetWorkPass` clears it), so a brick split over three
+        // budgets votes three times and the last write wins, rather than the
+        // heaviest triangle over all three. Accepting that is deliberate: the
+        // alternative is a fourth frame-crossing region for a tie-break between
+        // two triangles of one surface, and a brick is invisible to the trace
+        // (`brickMask` clear) until its closing instalment anyway.
+        //
+        // ⚠ AND THE CONTROL ARM WITHHOLDS IT with the face bits, so an arm whose
+        // claim is "withhold the bits and the identical rays pour through" does
+        // not quietly keep half a face byte.
+        const faceWord = levelBase.add(uint(FACE_OFF)).add(shiftRight(vi, uint(2))).toVar();
+        const abase = uint(AX_OFF).add(slotOfRow(i, ly, lz)).toVar();
+        const fw = atomicLoad(winAtomics.element(faceWord)).toVar();
+        for (let k = 0; k < 4; k++) {
+          const a = atomicLoad(wk.element(abase.add(uint(k)))).toVar();
+          If(a.notEqual(uint(0)), () => {
+            const code = select(float(faceBitsU).greaterThan(0.5),
+              bitAnd(a, uint(3)).add(uint(1)), uint(0)).toVar();
+            fw.assign(bitOr(
+              bitAnd(fw, uint(~(0b11000000 << (k * 8)) >>> 0)),
+              shiftLeft(code, uint(k * 8 + 6)),
+            ));
+          });
+        }
+        atomicStore(winAtomics.element(faceWord), fw);
       });
     });
 
-    // THE VERDICT. `binPairs` stores 0 in the pair cursor when the brick
-    // enumerated everything it owed and the running count otherwise, so this one
-    // word is the whole completion test — no second flag that could disagree.
-    // It is read ONCE, above, because the palette merge needs the same answer.
-    If(cursorNow.notEqual(uint(0)), () => {
+    // THE VERDICT, decided above because the palette merge needs the same
+    // answer: `done` is the ONE comparison ("the resume point reached the item
+    // count"), and the two cursor words are its consequence, not a second piece
+    // of state that could disagree with it.
+    If(done.not(), () => {
       // Mid-brick: back to DIRTY, mask left CLEAR. A half-built brick is
       // invisible to the trace for a frame or two, which is what the budget
       // buys; showing half of it would be a wrong answer rather than a late one.
       atomicStore(winAtomics.element(tab.add(uint(1))), uint(STATE_DIRTY));
+      atomicAdd(ct.element(uint(CTR_RESUMED)), uint(1));
       Return();
     });
 
@@ -1248,6 +1712,7 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
 
   return {
     tier, PAIRS_CAP, MAX_BUILD, MAX_DIRTY, MAX_CELLS, CELLS_AXIS, NBUCKETS,
+    ITEMS_CAP, TRIS_PER_ITEM, EMIT_BOUND,
     workWords: WORK_WORDS, workBytes: WORK_WORDS * 4,
     ctrBuffer: ctrBuf, ctrAttribute: ctrAttr, workBuffer: work, workAttribute: workAttr,
     STATE_BUILDING, CULL_FRACTION,
@@ -1284,7 +1749,7 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
       return [
         resetCtrPass, resetWorkPass,
         dirtyCountPass, dirtyPrefixPass, dirtyScatterPass,
-        binPairsPass, voxelizePass, finishBricksPass,
+        binCellsPass, binPairsPass, voxelizePass, finishBricksPass,
       ];
     },
 
@@ -1294,6 +1759,16 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     setLevelBudget,
     /** Lower the per-frame pair cap WITHOUT re-allocating — the overflow gate. */
     setPairLimit(n) { pairLimitU.value = Math.max(1, Math.min(PAIRS_CAP, n)); },
+    /**
+     * ⭐ §19 4.1b. How many (brick, cell, chunk) WORK ITEMS the frame may hand
+     * `binPairs`, and therefore the ms-bounded budget: each item walks at most
+     * `TRIS_PER_ITEM` triangles twice. Lowering it does NOT re-allocate; the
+     * remainder of a brick's items stay owed and resume at its cell cursor next
+     * frame, which is the property the probe's tiny-limit arm proves.
+     */
+    setCellLimit(n) { cellLimitU.value = Math.max(1, Math.min(ITEMS_CAP, Math.round(n))); },
+    /** What `setCellLimit` last accepted. */
+    get cellLimit() { return cellLimitU.value; },
     /**
      * ⛔ HARNESS ONLY. How many DIRTY BRICKS `binPairs` may walk this frame,
      * priority-ordered; the remainder stays dirty and comes back. Defaults to
@@ -1353,6 +1828,19 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
         dustVoxels: a[CTR_DUST],
         resumed: a[CTR_RESUMED],
         maxCursor: a[CTR_MAXCURSOR],
+        // ── §19 4.1b: the work-item receipt ────────────────────────────────
+        // `items` is what the frame actually walked, `itemsWanted` what the
+        // dirty list asked for; the gap IS the cut, and `itemCut` names how many
+        // bricks carry it. `maxItemTris` is the largest triangle range one
+        // THREAD walked — the number the whole restructure exists to bound, and
+        // the one to read when a frame is slow again.
+        items: Math.min(a[CTR_ITEMS], ITEMS_CAP),
+        itemsCursor: a[CTR_ITEMS],
+        itemsWanted: a[CTR_ITEMWANT],
+        itemOverflow: a[CTR_ITEMOVF],
+        itemCut: a[CTR_ITEMCUT],
+        maxItemTris: a[CTR_MAXTRIS],
+        maxCellCursor: a[CTR_MAXCELL],
         perLevel,
       };
     },
@@ -1362,10 +1850,12 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
       buckets: NBUCKETS, maxCells: MAX_CELLS, cellsAxis: CELLS_AXIS,
       coarseBrickMetres: COARSE_BRICK_M,
       cullFraction: CULL_FRACTION,
+      itemsPerFrame: ITEMS_CAP, trisPerItem: TRIS_PER_ITEM, itemsPerBrick: EMIT_BOUND,
       dustLimits: Array.from({ length: levels }, (_, l) => +(voxel0 * Math.pow(2, l) * CULL_FRACTION).toFixed(4)),
       workMB: +((WORK_WORDS * 4) / 1048576).toFixed(3),
       scratchMB: +((SCR_WORDS * 4) / 1048576).toFixed(3),
-      cursorKB: +((CUR_WORDS * 4) / 1024).toFixed(1),
+      cursorKB: +(((CUR_WORDS + CEL_WORDS) * 4) / 1024).toFixed(1),
+      itemListMB: +((ITM_WORDS * 4) / 1048576).toFixed(3),
       pairListMB: +((PAIR_WORDS * 4) / 1048576).toFixed(3),
     }),
 

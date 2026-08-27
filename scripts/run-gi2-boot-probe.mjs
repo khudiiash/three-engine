@@ -657,7 +657,11 @@ async function facadeBrickSpread(pose) {
         const big = [...byCls.values()].sort((a, b) => b.length - a.length)[0] ?? [];
         push(dOpenCls, cvOf(big));
         clsPerSlab.push(new Set(wall.map((r) => r.pal)).size);
-        for (const r of wall) { allBits++; if (r.bits === 63) fullBits++; }
+        // ⚠ MASK WITH 63. §19 Stage 3.9 put the voxel's dominant AXIS in bits
+        // 6-7 of this same byte, so the bare `=== 63` that measured Bistro's
+        // 95 % all-six share reads 0 % the moment an axis is written — a
+        // receipt that changes meaning without changing text.
+        for (const r of wall) { allBits++; if ((r.bits & 63) === 63) fullBits++; }
       }
     }
     const med = (a) => (a.length ? [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)] : null);

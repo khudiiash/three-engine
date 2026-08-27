@@ -196,8 +196,13 @@
             const sh = (t & 3) * 8;
             palWords[w] = ((palWords[w] & ~(255 << sh)) | (sb.pal[t] << sh)) >>> 0;
           }
+          // The DENSEST cell, which is what §19 4.1b's chunk split exists to
+          // survive: without it this number is the length of one `binPairs`
+          // thread's serial walk.
+          let maxCellTris = 0;
+          for (let c = 0; c < nCell; c++) if (counts[c] > maxCellTris) maxCellTris = counts[c];
           return {
-            triCount: n, entries, origin, cell, dim, nCell,
+            triCount: n, entries, origin, cell, dim, nCell, maxCellTris,
             arrays: { tris: sb.p.subarray(0, n * 9), triPal: palWords, cellRange, cellTris },
           };
         };
@@ -366,6 +371,14 @@
           let dustVoxels = 0;
           let resumed = 0;
           let maxCursor = 0;
+          // §19 4.1b: the work-item receipts. `peakItemTris` is the number the
+          // whole restructure exists to bound — the largest triangle range ONE
+          // THREAD walked — and it must never exceed `TRIS_PER_ITEM`.
+          let peakItems = 0;
+          let peakItemTris = 0;
+          let maxCellCursor = 0;
+          let itemCut = 0;
+          let itemOverflow = 0;
           const dustPerLevel = new Array(win.levels).fill(0);
           let last = null;
           for (let f = 1; f <= maxFrames; f++) {
@@ -377,6 +390,11 @@
             dustVoxels += s.dustVoxels;
             resumed += s.resumed;
             maxCursor = Math.max(maxCursor, s.maxCursor);
+            peakItems = Math.max(peakItems, s.items);
+            peakItemTris = Math.max(peakItemTris, s.maxItemTris);
+            maxCellCursor = Math.max(maxCellCursor, s.maxCellCursor);
+            itemCut += s.itemCut;
+            itemOverflow += s.itemOverflow;
             for (let l = 0; l < win.levels; l++) dustPerLevel[l] += s.perLevel[l].dust;
             for (let l = 0; l < win.levels; l++) {
               if (levelFrames[l] < 0 && s.perLevel[l].dirty === 0) levelFrames[l] = f - 1;
@@ -397,6 +415,7 @@
           return {
             frames, levelFrames, peakPairs, peakBrickPairs, deferred, overflowed, starved,
             slotFull, cellOverflow, dustVoxels, dustPerLevel, resumed, maxCursor, perFrame, last,
+            peakItems, peakItemTris, maxCellCursor, itemCut, itemOverflow,
           };
         };
 
@@ -478,6 +497,10 @@
             `overflow ${roomBuild.overflowed}, starved ${roomBuild.starved}, ` +
             `slotFull ${roomBuild.slotFull}, deferred ${roomBuild.deferred}, ` +
             `biggest brick ${roomBuild.peakBrickPairs} pairs, cellOverflow ${roomBuild.cellOverflow}`);
+          // §19 4.1b: the work-item shape of the same build.
+          say(`  work items: peak ${roomBuild.peakItems}/frame of ${vox.ITEMS_CAP}, max triangles one ` +
+            `THREAD walked ${roomBuild.peakItemTris} of ${vox.TRIS_PER_ITEM}, ${roomBuild.itemCut} brick-cuts, ` +
+            `${roomBuild.itemOverflow} item-overflows, deepest cell cursor ${roomBuild.maxCellCursor}`);
           results.roomBuild = {
             frames: roomBuild.frames, levelFrames: roomBuild.levelFrames, occupied: occ.total,
             occPerLevel: occ.per, peakPairs: roomBuild.peakPairs, overflowed: roomBuild.overflowed,
@@ -878,6 +901,87 @@
             `one brick's ${biggestBrick}; every one bit-identical in occ AND pal)`);
         }
 
+        // ══════════════════ §19 4.1b — THE CELL CURSOR, ON A TINY ITEM BUDGET
+        //
+        // The pair cursor's arm above breaks the budget that bounds what
+        // `binPairs` WRITES. This one breaks the budget that bounds what it
+        // WALKS, which is a different piece of state and a different failure:
+        // an item budget so small that a brick cannot be handed all of its
+        // (cell, chunk) items in one frame has to hand it the rest over the
+        // NEXT frames and land on the same window — and it cannot, unless the
+        // cell cursor, the per-item pair cursor and the palette merge all agree
+        // on where the brick stopped.
+        //
+        // ⭐ IT IS RUN AT SEVERAL LIMITS FOR THE REASON THE PAIR SWEEP IS: the
+        // item list is filled by `atomicAdd`, so WHERE a brick's run gets cut is
+        // not the same from run to run, and a bug that only fires when a brick
+        // splits between two particular cells shows up in maybe one run in
+        // three.
+        //
+        // ⚠ THE FLOOR IS 8 ITEMS PER FRAME, AND THAT IS A RUNTIME BOUND, NOT A
+        // CORRECTNESS ONE. A window is 16 384 bricks; at 2 items per frame the
+        // room converges (measured, bit-identical) in 2 419 frames and at 1 it
+        // needs about twice that, which is minutes of probe per tier for no
+        // extra coverage — every limit that finishes agrees to the bit, and a
+        // limit that merely ran out of frames would report "differs" for a
+        // reason that has nothing to do with the cursor.
+        {
+          const peakItems = Math.max(1, refBuild.peakItems ?? 1);
+          const limits = [8, 64, Math.max(1, Math.floor(peakItems / 4))]
+            .filter((c, i, a) => a.indexOf(c) === i)
+            .sort((a, b) => b - a);
+          const sweep = [];
+          const CELL_MAX_FRAMES = MAX_FRAMES * 4;
+          for (const c of limits) {
+            vox.setCellLimit(c);
+            await compute(win.clearStaticPass);
+            const run = await buildToClean([0, 0, 0], CELL_MAX_FRAMES);
+            const buf = await readWindow();
+            const od = occDiffBits(refBuf, buf);
+            let pd = 0;
+            for (let l = 0; l < win.levels; l++) {
+              const base = l * store.LEVEL_WORDS + store.PAL_OFF;
+              for (let w = 0; w < store.PAL_WORDS; w++) if (refBuf[base + w] !== buf[base + w]) pd++;
+            }
+            sweep.push({
+              limit: c, frames: run.frames, resumed: run.resumed, itemCut: run.itemCut,
+              maxCellCursor: run.maxCellCursor, peakItemTris: run.peakItemTris,
+              occDiff: od, palDiff: pd,
+            });
+            say(`  cell sweep: limit ${String(c).padStart(5)} -> ${String(run.frames).padStart(4)} frames, ` +
+              `${String(run.itemCut).padStart(5)} brick-cuts, deepest cell cursor ` +
+              `${String(run.maxCellCursor).padStart(4)}, ${od} occ bits differ, ${pd} pal words differ`);
+          }
+          vox.setCellLimit(vox.ITEMS_CAP);
+          results.cellCursor = {
+            limits, sweep, refFrames: refBuild.frames,
+            itemsCap: vox.ITEMS_CAP, trisPerItem: vox.TRIS_PER_ITEM,
+            peakItems: refBuild.peakItems, peakItemTris: refBuild.peakItemTris,
+          };
+          const stalled = sweep.filter((s) => s.frames >= CELL_MAX_FRAMES);
+          if (stalled.length) {
+            throw new Error(`the cell cursor never converged at limit ${stalled[0].limit} — a brick that was ` +
+              "handed part of its cells never got the rest");
+          }
+          const bad = sweep.filter((s) => s.occDiff || s.palDiff);
+          if (bad.length) {
+            throw new Error(`the cell-budgeted build differs from the one-frame build at ${bad.length} of ` +
+              `${sweep.length} limits: ${bad.map((s) => `limit ${s.limit} → ${s.occDiff} occ bits / ` +
+              `${s.palDiff} pal words`).join("; ")}`);
+          }
+          if (!sweep.some((s) => s.itemCut > 0)) {
+            throw new Error("no brick was ever cut mid-cell-list — the cell cursor never engaged and this arm " +
+              "proves nothing");
+          }
+          if (refBuild.peakItemTris > vox.TRIS_PER_ITEM) {
+            throw new Error(`one item walked ${refBuild.peakItemTris} triangles, above the ${vox.TRIS_PER_ITEM} ` +
+              "bound — the chunk split did not fire");
+          }
+          say(`cell cursor: PASS (${sweep.length} limits from ${limits[0]} down to ${limits.at(-1)}; every one ` +
+            `bit-identical in occ AND pal; max triangles one thread walked ${refBuild.peakItemTris} of ` +
+            `${vox.TRIS_PER_ITEM})`);
+        }
+
         // ═════════════════════════════ the palette, and its packed-atomic control
         {
           const legal = new Set([255, ...CORNELL_SCENE.map((p) => p.pal)]);
@@ -1074,9 +1178,15 @@
             let starved = 0;
             let dustVoxels = 0;
             let resumed = 0;
+            let peakItems = 0;
+            let peakItemTris = 0;
+            let itemCut = 0;
             for (let f = 1; f <= MAX_FRAMES; f++) {
               for (const p of rpasses) renderer.compute(p);
               const s = await rvox.stats(renderer);
+              peakItems = Math.max(peakItems, s.items);
+              peakItemTris = Math.max(peakItemTris, s.maxItemTris);
+              itemCut += s.itemCut;
               for (let l = 0; l < win.levels; l++) {
                 if (levelFrames[l] < 0 && s.perLevel[l].dirty === 0) levelFrames[l] = f - 1;
                 dustPerLevel[l] += s.perLevel[l].dust;
@@ -1107,7 +1217,7 @@
             return {
               cull, frames, levelFrames, occupied: occ.total, occPerLevel: occ.per,
               peakPairs, peakBrickPairs, totalPairs, deferred, overflowed, starved,
-              dustVoxels, dustPerLevel, resumed,
+              dustVoxels, dustPerLevel, resumed, peakItems, peakItemTris, itemCut,
               gpuMsPerFrame: gpuMs == null ? null : +(gpuMs / nf).toFixed(4),
               wallMsPerFrame: +(wallMs / nf).toFixed(4),
               secondsToFull: +((nf * (gpuMs == null ? wallMs / nf : gpuMs / nf)) / 1000).toFixed(3),
@@ -1134,6 +1244,20 @@
           say(`random cull: last level to finish OFF = L${lastLevel(noCull)} of L0..L${coarsest}, ` +
             `ON = L${lastLevel(withCull)}; frames ${noCull.frames} -> ${withCull.frames}; ` +
             `pairs ${noCull.totalPairs} -> ${withCull.totalPairs}`);
+          // §19 4.1b's own receipt on the biggest scene the harness has: the
+          // densest 4 m cell against the bound one thread is allowed to walk.
+          say(`random work items: densest cell ${rgrid.maxCellTris} triangles, chunk bound ` +
+            `${rvox.TRIS_PER_ITEM}, peak items/frame ${withCull.peakItems} of ${rvox.ITEMS_CAP}, ` +
+            `max triangles one THREAD walked ${withCull.peakItemTris}, ${withCull.itemCut} brick-cuts`);
+          results.randomItems = {
+            maxCellTris: rgrid.maxCellTris, trisPerItem: rvox.TRIS_PER_ITEM,
+            itemsCap: rvox.ITEMS_CAP, peakItems: withCull.peakItems,
+            peakItemTris: withCull.peakItemTris, itemCut: withCull.itemCut,
+          };
+          if (withCull.peakItemTris > rvox.TRIS_PER_ITEM) {
+            throw new Error(`one item walked ${withCull.peakItemTris} triangles, above the ` +
+              `${rvox.TRIS_PER_ITEM} bound — the chunk split did not fire on the 3 M-triangle scene`);
+          }
           results.random = { ...withCull, triangles: rgrid.triCount, listings: rgrid.entries,
             cpuBuildMs: +cpuMs.toFixed(0) };
           results.cullRandom = {
@@ -1445,10 +1569,12 @@
         {
           const named = [
             ["resetCtr", voxPasses[0]], ["resetWork", voxPasses[1]], ["dirtyCount", voxPasses[2]],
-            ["dirtyPrefix", voxPasses[3]], ["dirtyScatter", voxPasses[4]], ["binPairs", voxPasses[5]],
-            ["voxelize", voxPasses[6]], ["finishBricks", voxPasses[7]], ["markDirty", markDirty],
+            ["dirtyPrefix", voxPasses[3]], ["dirtyScatter", voxPasses[4]], ["binCells", voxPasses[5]],
+            ["binPairs", voxPasses[6]], ["voxelize", voxPasses[7]], ["finishBricks", voxPasses[8]],
+            ["markDirty", markDirty],
           ];
           const audit = [];
+          let cellWgsl = "";
           let binWgsl = "";
           let voxWgsl = "";
           for (const [name, node] of named) {
@@ -1456,6 +1582,7 @@
             const storageBindings = [...shader.matchAll(/var<storage[^>]*>/g)].length;
             const workgroupVars = [...shader.matchAll(/var<workgroup/g)].length;
             audit.push({ name, storageBindings, workgroupVars, bytes: shader.length });
+            if (name === "binCells") cellWgsl = shader;
             if (name === "binPairs") binWgsl = shader;
             if (name === "voxelize") voxWgsl = shader;
             say(`kernel ${name.padEnd(13)} ${(shader.length / 1024).toFixed(1)} kB, ` +
@@ -1512,7 +1639,9 @@
             say(`${name} float literals: ${literals.join(" ")}`);
             return { name, literals, foreign, grepped };
           };
-          const traceChecks = [check("binPairs", binWgsl), check("voxelize", voxWgsl)];
+          const traceChecks = [
+            check("binCells", cellWgsl), check("binPairs", binWgsl), check("voxelize", voxWgsl),
+          ];
           results.wgsl = traceChecks;
           const bad = traceChecks.filter((c) => c.foreign.length || c.grepped.length);
           if (bad.length) {

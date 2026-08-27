@@ -1663,3 +1663,50 @@ Bistro: the §3.8 SPLIT's BURIED share → ~0 and the three-pose dirt metric
 Cost ceiling unchanged (chain ≤ 4 ms; `traceWindow` untouched in cost —
 the attribution read is one extra byte fetch at the hit). Gates: all 3.6/
 3.7 + leak tests (0/10 000, control 100 %) + moved-lamp PASS/RED + sunleak.
+
+---
+
+## R. STAGE 4.3b SPEC — BOOT AS THE USER MEASURES IT (08-27 evening)
+
+**The user's number:** 31 s from opening the Bistro scene to GI appearing.
+**Ours:** 3.4 s — measured from `[gi] scene assets ready`, the moment the OLD
+asset gate releases the build. Live editor counters split the 31 s as:
+scene open → GI build start **~24 s** (asset load incl. the KTX2 transcode
+tail, merging settling, `#readyToRebuild`'s 250 ms-stable gate), then build →
+soup 1.1 s → occupancy 4.3 s → first light **7.4 s** (harness 3.4 s: the
+editor's material wave + attached sessions contend). The plan's Stage 4.3
+gate is re-anchored: **≤ 3 s from SCENE OPEN on the Level; Bistro ≤ (time to
+geometry ready) + 3 s**, printed as a stage table from scene open.
+
+**Mechanisms to remove (none is asset loading itself):**
+1. **GI2 waits for textures it does not need.** `#readyToRebuild` (GISystem,
+   grep) waits for `textureLoadsInFlight()` = every KTX2 transcode, and for
+   `merging.settling`. GI2 needs GEOMETRY (positions/index per geometry +
+   placements) and material IDENTITY for the palette; texture averages land
+   later through `#retintGi2Palette` (4.0b) — already designed for exactly
+   this. Under GI2_PATH: build on geometry-ready (models loaded, meshes
+   present), not texture-ready; keep the texture gate for the OLD path.
+2. **Merging restarts GI2.** The soup is keyed on placements; static merging
+   replaces meshes with proxies after boot → a new placement set → a second
+   soup build (0.9-1.4 s + a 20-35 ms stall) and re-voxelization. The soup
+   must be built from the SOURCE meshes (the ones merging consumes — read
+   `merging.js`'s member list / `shadowMerge`'s member handling; GI2's own
+   placement enumeration from 4.0b can take `mesh.userData.__mergeSource` or
+   whatever marks a merge member) and must IGNORE merge proxies, so a merge
+   rebuild is a no-op for the window. Receipt: `soupBuilds` per scene open = 1
+   with merging on.
+3. **Contention in the live editor** (7.4 vs 3.4 s): the voxelizer's serial
+   binPairs (4.1b) is the occupancy half; the gather kernels are already
+   non-deferrable (4.3a). After 4.1b, re-measure in the EDITOR, not the
+   harness: add `firstLightFromSceneOpenMs` to `profile.gi2` (anchor =
+   `scene_open` op / the editor's scene-load start).
+4. **The instrument**: `run-gi2-boot-probe` reports from SCENE OPEN (the
+   tauri shim's project-open timestamp), with stages: editor ready, geometry
+   ready, textures ready, merging settled, GI build start, soup, occupancy per
+   level, first light. The harness must stop quoting "after assets ready" as
+   the headline.
+
+Gate (PLAN Stage 4.3, re-anchored): Level first light ≤ 3 s from scene open
+(2 boots); Bistro first light ≤ geometry-ready + 3 s, and GI must not be the
+last thing to appear after textures land; `soupBuilds` = 1 per scene open;
+no regression of the battery.

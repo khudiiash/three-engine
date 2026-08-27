@@ -142,6 +142,24 @@ if (table.length) {
   }
 
   console.log("");
+  console.log("THE WORK ITEM (§19 4.1b) — one thread per (brick, cell, chunk), and its CELL cursor");
+  console.log("tier     trisPerItem  densest cell   max tris ONE THREAD walked   items/frame   cell-limit sweep (limit→frames, cuts, occ/pal diff)");
+  for (const t of table) {
+    const c = t.cellCursor;
+    const r = t.randomItems;
+    if (!c) continue;
+    // ⭐ `max tris one thread walked` is the number the whole stage exists to
+    // bound; `densest cell` is what ONE thread used to walk on top of every
+    // other cell the brick touched.
+    const sweep = (c.sweep ?? []).map((s) => `${s.limit}→${s.frames}f/${s.itemCut}c/${s.occDiff}+${s.palDiff}`).join("  ");
+    console.log(
+      `${t.tier.padEnd(9)}${String(c.trisPerItem).padStart(11)}   ${String(r?.maxCellTris ?? "—").padStart(12)}   ` +
+      `${String(Math.max(c.peakItemTris ?? 0, r?.peakItemTris ?? 0)).padStart(26)}   ` +
+      `${`${c.peakItems ?? "?"}/${c.itemsCap}`.padStart(11)}   ${sweep}`,
+    );
+  }
+
+  console.log("");
   console.log("THE DYNAMIC LAYER (2.5 §4) — a 1 m box crossing 3 m in 60 frames");
   console.log("tier     hits    wrong t   ghosts (lag)    sweep   static bits   gpu ms/frame   voxels/frame");
   for (const t of table) {

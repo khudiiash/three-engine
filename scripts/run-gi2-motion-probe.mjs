@@ -115,6 +115,12 @@ const MAX_FRAME_MS = Number(process.env.MAX_FRAME_MS ?? 33);
 const HARD_FRAME_MS = Number(process.env.HARD_FRAME_MS ?? 50);
 const P95_RATIO = Number(process.env.P95_RATIO ?? 1.3);
 const LOG_PER_S = Number(process.env.LOG_PER_S ?? 1);
+// §19 Stage 4.1b's own gate: the voxelize chain's GPU cost on EVERY moving
+// frame, not on average. The restructure's whole claim is that this number now
+// has a ceiling — one thread walks ≤ TRIS_PER_ITEM triangles, and the frame
+// walks ≤ cellLimit of them — so a MEAN would be the wrong statistic to gate
+// on twice over. [[probe-blind-statistics]]
+const VOX_MS = Number(process.env.VOX_MS ?? 3);
 
 // ── stats helpers (Node side; the page ships raw records) ───────────────────
 const median = (xs) => {
@@ -436,6 +442,10 @@ const installed = await page.evaluate(async () => {
     // ONE boot puts every arm under the same contention, which is the only way
     // to ask "does the dirty limit move this pass's cost at all".
     if (R.pin > 0 && gi2?.voxelizer) gi2.voxelizer.setDirtyLimit(R.pin);
+    // §19 4.1b's sweep, on the budget that actually bounds the walk. Same
+    // one-boot argument as `R.pin` above: an item limit compared across runs is
+    // a comparison of two GPU moods.
+    if (R.cells > 0 && gi2?.voxelizer?.setCellLimit) gi2.voxelizer.setCellLimit(R.cells);
     const snap = gi2?.snapshot ? gi2.snapshot() : null;
     const vx = snap?.voxelizer ?? null;
     const rec = {
@@ -459,6 +469,11 @@ const installed = await page.evaluate(async () => {
       // `windowVoxelize`'s `dirtyLimitU`), so the only writer is `VOX_SWEEP`'s
       // pin, and the sweep table has to be able to show what it pinned.
       voxLimit: gi2?.voxelizer?.dirtyLimit ?? 0,
+      // §19 4.1b. `cellLimit` is what the frame's item budget actually was;
+      // `vxItems` / `vxItemTris` lag with the rest of the readback and are here
+      // to say what shape the work had, not to time it.
+      cellLimit: gi2?.voxelizer?.cellLimit ?? 0,
+      vxItems: vx?.items ?? 0, vxItemTris: vx?.maxItemTris ?? 0, vxItemCut: vx?.itemCut ?? 0,
     };
     R.frames.push(rec);
     drainGpu();
@@ -520,11 +535,12 @@ console.log(`  base pose ${installed.base.p.map((n) => n.toFixed(1)).join(",")} 
 // A pose per FRAME (not per wall-clock millisecond) is deliberate: a hitching
 // frame must not be compensated for by a bigger camera step, or the arm would
 // silently reduce its own load exactly where the load is the question.
-const runArm = async (arm, label = arm, pin = 0) => {
+const runArm = async (arm, label = arm, pin = 0, cells = 0) => {
   console.log(`\n── ${label} ──────────────────────────────────────────────`);
-  const ok = await page.evaluate(({ arm, label, pin, PARK, MOVE, WHIP, TAIL, DOLLY_M }) => {
+  const ok = await page.evaluate(({ arm, label, pin, cells, PARK, MOVE, WHIP, TAIL, DOLLY_M }) => {
     const R = globalThis.__gi2Motion;
     R.pin = pin;
+    R.cells = cells;
     const B = R.base;
     const steps = [];
     const push = (seg, p, t) => steps.push({ seg, p, t });
@@ -563,7 +579,7 @@ const runArm = async (arm, label = arm, pin = 0) => {
     R.plan = { steps };
     R.done = false;
     return steps.length;
-  }, { arm, label, pin, PARK, MOVE, WHIP, TAIL, DOLLY_M });
+  }, { arm, label, pin, cells, PARK, MOVE, WHIP, TAIL, DOLLY_M });
   // Poll rather than sleep: a stalled arm must be reported as stalled, not
   // measured over a window it never filled.
   const deadline = Date.now() + 120_000;
@@ -593,13 +609,20 @@ const runArm = async (arm, label = arm, pin = 0) => {
 // voxelizer's dirty limit pinned. Reported per pinned value so "does the limit
 // move the pass" is answerable from one boot under one machine's contention.
 const SWEEP = (process.env.VOX_SWEEP ?? "").split(",").map((s) => Number(s.trim())).filter((n) => n > 0);
+// VOX_CELLS="1024,4096,16384,32768" — the same one-boot sweep, on §19 4.1b's
+// WORK-ITEM budget instead of the (refuted) dirty-brick one. This is the knob
+// that calibrates `GI2_VOX_TIERS.itemsPerFrame`: the arm answers "what does an
+// item budget of N cost per frame, and how many frames does the slab then take".
+const CELLS = (process.env.VOX_CELLS ?? "").split(",").map((s) => Number(s.trim())).filter((n) => n > 0);
 const armList = [];
-if (SWEEP.length) {
-  for (const arm of ARMS) for (const v of SWEEP) armList.push([arm, `${arm}@${v}`, v]);
+if (CELLS.length) {
+  for (const arm of ARMS) for (const v of CELLS) armList.push([arm, `${arm}#${v}`, 0, v]);
+} else if (SWEEP.length) {
+  for (const arm of ARMS) for (const v of SWEEP) armList.push([arm, `${arm}@${v}`, v, 0]);
 } else {
-  for (const arm of ARMS) armList.push([arm, arm, 0]);
+  for (const arm of ARMS) armList.push([arm, arm, 0, 0]);
 }
-for (const [arm, label, pin] of armList) await runArm(arm, label, pin);
+for (const [arm, label, pin, cells] of armList) await runArm(arm, label, pin, cells);
 
 // ══════════════════════════════════════════════════════════════════ THE REPORT
 const data = await page.evaluate(() => {
@@ -714,15 +737,48 @@ console.log("\n══ WHO LOGS ════════════════�
   if (!m.size) console.log("  (none)");
 }
 console.log("\n══ VOXELIZE CHAIN GPU MS, PER ARM (the engine's own sample) ══════");
-console.log("arm            n   median    p95     max   dirtyLimit");
+console.log("arm             n   median    p95     max   itemLimit   busy%   slab frames (med/max)");
+const voxRows = [];
 for (const [, arm] of armList) {
   const recs = data.frames.filter((f) => f.arm === arm && (f.seg === "moving" || f.seg === "tail"));
   const vm = recs.map((f) => f.voxMs).filter((v) => v > 0);
-  if (!vm.length) { console.log(`${arm.padEnd(13)} — no sample (the chain never batched, or no timestamp queries)`); continue; }
-  const lim = recs.map((f) => f.voxLimit).filter((v) => v > 0);
-  console.log(`${arm.padEnd(13)} ${String(vm.length).padStart(3)} ${f2(median(vm)).padStart(7)} ` +
+  if (!vm.length) { console.log(`${arm.padEnd(14)} — no sample (the chain never batched, or no timestamp queries)`); continue; }
+  const cl = recs.map((f) => f.cellLimit).filter((v) => v > 0);
+  // ⭐ SCROLL-TO-SLAB-COMPLETE LATENCY, AND WHAT IT IS ACTUALLY MEASURING.
+  //
+  // The voxelizer's own `dirty` count lags: `statsCadence` samples it every 30
+  // frames once the window has settled, so it cannot time an event that lasts a
+  // handful of frames — the instrument would be reporting its own sampling rate.
+  // `voxMs` is per-frame, so the run of consecutive frames on which the chain
+  // stays ABOVE its idle floor is the frames-to-drain signal, and it is the
+  // trade §19 4.1b buys: a bounded frame is paid for in more of them.
+  //
+  // The floor is derived from the arm's OWN parked segment rather than from a
+  // constant, because a chain that costs 0.14 ms idle on one machine costs
+  // something else on another, and the question is "above idle", not "above
+  // 0.2 ms".
+  const parkedVm = data.frames.filter((f) => f.arm === arm && f.seg === "parked").slice(5)
+    .map((f) => f.voxMs).filter((v) => v > 0);
+  const floor = Math.max(0.05, (median(parkedVm) || 0.15) * 3);
+  const runs = [];
+  let run = 0;
+  for (const f of recs) {
+    if (f.voxMs > floor) run++;
+    else if (run) { runs.push(run); run = 0; }
+  }
+  if (run) runs.push(run);
+  const busy = recs.filter((f) => f.voxMs > floor).length / Math.max(1, recs.length);
+  voxRows.push({
+    arm, n: vm.length, median: median(vm), p95: pct(vm, 95), max: Math.max(...vm),
+    floor, busyPct: busy * 100, slabMedian: median(runs), slabMax: runs.length ? Math.max(...runs) : 0,
+    slabs: runs.length, cellLimit: cl.length ? Math.max(...cl) : 0,
+  });
+  console.log(`${arm.padEnd(14)} ${String(vm.length).padStart(3)} ${f2(median(vm)).padStart(7)} ` +
     `${f2(pct(vm, 95)).padStart(7)} ${f2(Math.max(...vm)).padStart(7)}   ` +
-    (lim.length ? `${Math.min(...lim)}–${Math.max(...lim)}` : "—"));
+    `${(cl.length ? `${Math.min(...cl)}–${Math.max(...cl)}` : "—").padStart(9)}   ` +
+    `${(busy * 100).toFixed(0).padStart(5)}   ` +
+    `${median(runs).toFixed(0).padStart(3)}/${String(runs.length ? Math.max(...runs) : 0).padStart(3)}` +
+    ` over ${runs.length} slabs (floor ${f2(floor)} ms)`);
 }
 console.log("");
 {
@@ -736,8 +792,20 @@ console.log("");
 const lt = data.longtasks.filter((e) => e.ms > 20);
 console.log(`  longtasks  : ${data.longtasks.length} total, ${lt.length} over 20 ms` +
   (lt.length ? `, max ${f2(Math.max(...lt.map((e) => e.ms)))} ms` : ""));
+{
+  // §19 4.1b's structural receipt: the largest triangle range ONE THREAD walked
+  // anywhere in the run, against the bound the kernel was compiled with. This is
+  // the number that used to be "every triangle of every cell the brick touched".
+  const its = data.frames.map((f) => f.vxItems ?? 0);
+  const tri = data.frames.map((f) => f.vxItemTris ?? 0);
+  console.log(`  work items : peak ${Math.max(0, ...its)}/frame, max triangles ONE THREAD walked ` +
+    `${Math.max(0, ...tri)} of ${describe?.vox?.trisPerItem ?? "?"} ` +
+    `(sampled at the stats cadence, so a lower bound)`);
+}
 if (describe?.vox) {
-  console.log(`  voxelizer  : tier ${describe.vox.tier}, pairsPerFrame ${describe.vox.pairsPerFrame}, maxBuild ${describe.vox.maxBuild}` +
+  console.log(`  voxelizer  : tier ${describe.vox.tier}, pairsPerFrame ${describe.vox.pairsPerFrame}, ` +
+    `itemsPerFrame ${describe.vox.itemsPerFrame}, trisPerItem ${describe.vox.trisPerItem}, ` +
+    `maxBuild ${describe.vox.maxBuild}` +
     (gi2Final?.voxelizer ? `, live dirty ${gi2Final.voxelizer.dirty} built ${gi2Final.voxelizer.built} pairsWritten ${gi2Final.voxelizer.pairsWritten} deferred ${gi2Final.voxelizer.deferred}` : ""));
 }
 if (gi2Final) console.log(`  scrolls this run: ${gi2Final.scrolls ?? "?"}   probes ${gi2Final.probes ?? "?"}`);
@@ -755,6 +823,11 @@ for (const r of rows) {
     r.parkedMedian > 0 && r.p95 <= r.parkedMedian * P95_RATIO);
   gate(`${r.arm}: frames > ${HARD_FRAME_MS} ms`, r.over50, "0", r.over50 === 0);
   gate(`${r.arm}: console.log per second`, f2(r.logsPerS), `≤ ${LOG_PER_S}`, r.logsPerS <= LOG_PER_S);
+}
+// §19 4.1b. The MAX, per arm — the pass whose median was already 0.14 ms is not
+// the thing under test; the scroll frame is.
+for (const v of voxRows) {
+  gate(`${v.arm}: voxelize chain GPU ms, MAX`, f2(v.max), `≤ ${VOX_MS}`, v.max <= VOX_MS);
 }
 console.log(`\n${failed === 0 ? "ALL GATES PASS" : `${failed} GATE(S) FAILED`}`);
 await browser.close();

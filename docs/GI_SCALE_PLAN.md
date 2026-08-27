@@ -477,7 +477,7 @@ responsiveness the "things move a lot" mandate needs, without a knob.
 |---|---|---|
 | **4.1 cutover** | GI2 default; delete SRC (`src*.js`), `occupancyField.js`, `rayHit/`, record pools, old screen chain; keep `giConfig` (3 props), light tree, emitters, GTAO, BVH8 mirror path, skinned proxies | module ≤ 25 k lines; battery green; `component_types` still shows `quality` + `ao` + `reflections` only |
 | **4.2 Safari/iOS/Android** | Playwright WebKit envelope run + a real phone: Level scene 60 fps at low; Safari macOS medium at 60 fps with the same brightness as Chrome (colour probe) | receipts from the device, not the desktop |
-| **4.3 boot** | Bistro cold boot: time-to-first-light ≤ 3 s after assets ready; ≤ 20 kernels; cross-scene cache hits (second scene's compute compile < 1 s) | `probe:gi-boot` on the real project, 3 interleaved runs, sign test |
+| **4.3 boot** | **RE-ANCHORED 08-27 (user measured 31 s scene-open → GI vs our 3.4 s "after assets"):** first light ≤ 3 s from SCENE OPEN on the Level; Bistro ≤ geometry-ready + 3 s; GI2 builds on geometry-ready (not texture-ready), the soup comes from source meshes (merging cannot restart it, `soupBuilds` = 1); ≤ 20 kernels; cross-scene cache hits — AUDITS §R | `run-gi2-boot-probe` from scene open, stage table, 2 boots; then the EDITOR's own `firstLightFromSceneOpenMs` |
 
 ### What is deliberately NOT in this plan
 - Any new tuning property on the component (three properties stay three).
