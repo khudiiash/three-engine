@@ -158,6 +158,20 @@
         const DOM_ON = params.get("dom") !== "0";
         const ROT_ON = params.get("rot") !== "0";
         gu.domFaceOn.value = DOM_ON ? 1 : 0;
+        // ⭐ §19 STAGE 3.11a — THE THREE LEVERS THE MOTION RECEIPT NAMED, AS
+        // PAGE-WIDE PARAMETERS. The grain arms can A/B them inside one run, but
+        // the PARITY table and every gate below it run once, on whatever ships
+        // — so a candidate configuration has to be able to run the whole page,
+        // or "it is quieter" would be asserted without "and it is still right".
+        if (params.has("dither")) gu.probeDither.value = Number(params.get("dither"));
+        if (params.has("stick")) gu.anchorStick.value = Number(params.get("stick"));
+        if (params.has("alpha")) gu.octAlpha.value = Number(params.get("alpha"));
+        // §19 3.11: `contact=0` is HEAD — the window always wins in the first
+        // two cells — and is the arm every blob ratio below is read against.
+        if (params.has("contact")) gu.contactOn.value = Number(params.get("contact"));
+        say(`3.11a config: probeDither ${gu.probeDither.value}, anchorStick ${gu.anchorStick.value}, ` +
+          `octAlpha ${gu.octAlpha.value}, ditherWorld ${gu.ditherWorld.value}, ` +
+          `contactOn ${gu.contactOn.value}`);
         gu.sunDir.value.set(...SUN_DIR);
         gu.sunColor.value.set(...SUN_COLOR);
         gu.skyColor.value.set(...SKY_COLOR);
@@ -330,9 +344,12 @@
         // eight named places on the SAME eight surfaces are read in every arm —
         // the ratios are then comparable because the surface is the same one,
         // not because the coordinates happen to be.
-        const writeCrops = (xf = (p) => p) => {
+        // ⚠ `list` DEFAULTS TO `CROPS` AND THE TRIM ARM PASSES ITS OWN. The
+        // crop buffer has 24 slots and the receipt list uses 18; a second SCENE
+        // needs its own places, not a place in the first scene's list.
+        const writeCrops = (xf = (p) => p, list = CROPS) => {
           const meta = [];
-          CROPS.forEach((c, i) => {
+          list.forEach((c, i) => {
             const wp = xf(c.p);
             const q = project(wp);
             cropArr[i * 4] = Math.round(q.x);
@@ -347,10 +364,10 @@
           gather.buffers.cropIn.value.needsUpdate = true;
           return meta;
         };
-        const readCrops = async () => {
+        const readCrops = async (list = CROPS) => {
           await compute(gather.passes.crop);
           const f = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.cropOut.value));
-          return CROPS.map((c, i) => {
+          return list.map((c, i) => {
             const b = i * 6 * 4;
             return {
               name: c.name, diag: !!c.diag,
@@ -368,6 +385,73 @@
           new Uint32Array(await renderer.getArrayBufferAsync(gather.buffers.statsBuf.value)),
         );
         const lum = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+
+        /**
+         * §19 STAGE 3.11's LEAK GATE, on the contact rule itself.
+         *
+         * ⭐⭐ THE RAYS ARE CHOSEN SO THE RULE CAN FIRE ON THEM, which is the
+         * whole difference from the 3.9 leak receipt. Those rays are born in
+         * mid-air, mostly off-screen, and hit their wall metres away — the
+         * contact band never sees them and a 0 from that test is a null the
+         * instrument could not have broken. These start ON THE FLOOR within
+         * 45 cm of the −Z wall, in the camera's view, aimed into it: their hit
+         * is inside the band, their path is on screen, and the screen's verdict
+         * is the only thing between them and the outside of a sealed room.
+         *
+         * The CONTROL forces the verdict to "clear" for every band ray. If that
+         * does not send the escape rate to ~100 % the receipt is blind and its
+         * zero means nothing.
+         */
+        const contactLeak = async (n) => {
+          const arr = gather.buffers.contactIn.value.array;
+          let s = 0x2f6e2b17 >>> 0;
+          const rnd = () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = Math.imul(s ^ (s >>> 15), s | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+          for (let i = 0; i < n; i++) {
+            // Left and right of the doorway, so every ray's target is PLAIN
+            // 5 cm wall and not the trim under test.
+            const x = (rnd() < 0.5 ? -1 : 1) * (1.0 + rnd() * 3.4);
+            const z = -ROOM.hz + 0.05 + rnd() * 0.40;
+            const y = -ROOM.hy + 0.03 + rnd() * 0.12;
+            const jx = (rnd() * 2 - 1) * 0.35;
+            const jy = rnd() * 0.35;
+            const l = Math.hypot(jx, jy, 1);
+            const b = i * 8;
+            arr[b] = x; arr[b + 1] = y; arr[b + 2] = z; arr[b + 3] = 40;
+            arr[b + 4] = jx / l; arr[b + 5] = jy / l; arr[b + 6] = -1 / l; arr[b + 7] = 0;
+          }
+          gather.buffers.contactIn.value.needsUpdate = true;
+          const arm = async () => {
+            await compute(gather.passes.contactRay);
+            const f = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.contactOut.value));
+            let escaped = 0; let contact = 0; let cleared = 0; let seen = 0; let plain = 0;
+            for (let i = 0; i < n; i++) {
+              const hit = f[i * 4];
+              const fl = Math.round(f[i * 4 + 2]);
+              if (fl & 2) contact++;
+              if (fl & 4) seen++;
+              if (fl & 8) cleared++;
+              if (!(hit > 0.5)) { escaped++; if (!(fl & 1)) plain++; }
+            }
+            return { escaped, contact, cleared, seen, plain };
+          };
+          const a = await arm();
+          // ⚠ THE CONTROL TURNS THE RULE **ON** AS WELL AS FORCING IT. Read
+          // against a `contactOn = 0` arm the forced control reads 0 escapes
+          // and is not a control at all — it is the same null twice, which is
+          // the blind-statistics trap wearing a control's clothes.
+          const wasOn = gu.contactOn.value;
+          gu.contactOn.value = 1;
+          gu.contactForce.value = 1;
+          const c = await arm();
+          gu.contactForce.value = 0;
+          gu.contactOn.value = wasOn;
+          return { ...a, control: c.escaped, controlFired: c.cleared, controlBand: c.contact };
+        };
 
         /**
          * What the cache actually holds — the colour-probe method applied to a
@@ -1244,6 +1328,14 @@
         // that has nothing to do with either.
         if (params.get("levers") !== "0") {
           let nn = FRAMES + 900;
+          // ⭐ `?only=grain` RUNS ONE SECTION OF THIS BLOCK AND SKIPS THE REST.
+          // The lever ladder alone is seventeen arms × 350 frames, and a
+          // diagnosis that has to be re-run four times while a mechanism is
+          // isolated cannot pay for it every time. Nothing is deleted and no
+          // arm changes: the sections a name does not select simply do not run,
+          // and the receipts they would have produced are absent from the
+          // result rather than wrong in it.
+          const ONLY = params.get("only") ?? "";
           // ⚠ EVERY LIVE UNIFORM AN ARM CAN OVERRIDE HAS TO APPEAR HERE.
           // `cum` is built from this object and `runArm` sets `{...cum,
           // ...override}` — so a uniform that is NOT in it is never restored,
@@ -1341,6 +1433,7 @@
            */
           const SETTLE = 320;
           const runArm = async (label, arm, { probeSpace = false, converge = false } = {}) => {
+            if (ONLY) return null;
             setArm(arm);
             await settle(SETTLE);
             const st = await frameStats();
@@ -1408,7 +1501,7 @@
           ]) levers.push(await runArm(label, { ...cum, ...over }));
           setArm(SHIP);
           await settle(60);
-          results.levers = levers;
+          results.levers = levers.filter(Boolean);
 
           // ── the WORLD changes: the panel jumps 2 m ──────────────────────
           //
@@ -1420,7 +1513,7 @@
           // from, so the world really changed and not just one description of
           // it — and the receipt is how many frames the floor takes to get 90 %
           // of the way from its old irradiance to its new one.
-          {
+          if (!ONLY || ONLY === "panel") {
             const panelMesh = scene.children[0];
             const prims = fill.prims.value;
             const movePanel = async (dx) => {
@@ -1535,7 +1628,7 @@
           }
 
           // ── UNDER MOTION, and how fast it goes quiet again ──────────────
-          {
+          if (!ONLY || ONLY === "motion") {
             const R0 = 4.0;
             const poseAt = (th) => {
               camera.position.set(R0 * Math.sin(th), -0.5, R0 * Math.cos(th));
@@ -1581,13 +1674,254 @@
             say(`  motion: reprojection during the orbit ${results.motionNoise.reprojDuringOrbit.toFixed(1)} %`);
           }
 
+          // ══ §19 STAGE 3.11a — GRAIN UNDER MOTION, ON THE REPROJECTED PIXEL ══
+          //
+          // ⭐⭐ THE 3.10 SIGN RECEIPT IS BLIND WHILE THE CAMERA MOVES, AND THE
+          // USER'S REPORT IS ABOUT EXACTLY THAT CASE. It compares a screen
+          // pixel to ITSELF one frame ago; under an orbit those are two
+          // different world points, so the 27 % flips it reported could have
+          // been the scene flowing past and no amount of staring at that
+          // number settles it. This receipt compares each pixel to its own
+          // REPROJECTED previous value — the same surface point, one frame
+          // earlier — and follows the SIGN along the surface point's own
+          // trajectory (`src` in `reprojBuf`), so a flip is the estimate
+          // rattling and can be nothing else. Parallax is monotone and drops
+          // out; a re-quantized direction set does not.
+          //
+          // Four arms, one binary, one pose sequence:
+          //   world     the shipped 3.11a lattice, keyed to the WORLD cell
+          //   grid      3.10's lattice, keyed to the probe's SCREEN tile
+          //   centres   `probeDither = 0` — no lattice at all
+          //   noScreen  `hzbOn = 0` — the HZB segment's per-frame authority
+          //             flip removed, the lattice left alone
+          if (!ONLY || ONLY === "grain") {
+            const HALFW = Math.ceil(W / 2);
+            const HALFH = Math.ceil(Hh / 2);
+            const NHALF = HALFW * HALFH;
+            const GR_FRAMES = Number(params.get("grainFrames") ?? 30);
+            const SIGN_EPS = 1e-3;
+            const R0 = 4.0;
+            const poseAt = (th) => {
+              camera.position.set(R0 * Math.sin(th), -0.5, R0 * Math.cos(th));
+              camera.lookAt(0, -1.0, 0);
+              camera.updateProjectionMatrix();
+            };
+            const reprojFrame = async () => {
+              await compute(gather.passes.reprojDump);
+              return new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.reprojBuf.value));
+            };
+            /**
+             * `advance(k)` runs one frame. `lit` is derived from the scene the
+             * same way `noiseReceipt` derives it — a tenth of the median of the
+             * first frame's valid luminances — so a dark arm and a bright one
+             * are judged the same way and no threshold is a constant.
+             */
+            const grainReceipt = async (label, { frames = GR_FRAMES, advance }) => {
+              let lit = null;
+              const prevS = new Int8Array(NHALF);
+              const curS = new Int8Array(NHALF);
+              const hp = mkHist();
+              let steps = 0; let moved = 0; let flips = 0; let scored = 0; let reproj = 0;
+              // ── the same statistic ONE STAGE EARLIER ────────────────────
+              //
+              // ⭐⭐ A PIXEL'S ESTIMATE CAN MOVE FOR TWO REASONS AND THEY HAVE
+              // DIFFERENT FIXES. Either the PROBE it reads moved (its own oct
+              // map re-evaluated from a new anchor, blended against a
+              // reprojected predecessor), or the probe grid SLID under the
+              // pixel and the resolve interpolated four different probes with
+              // different weights. The probe half is measured the same way the
+              // pixel half is — each probe's SH DC against the DC of the probe
+              // it reprojected FROM, which `probeMeta` slot 2 already names —
+              // so the two numbers are the same quantity at two stages and the
+              // one that is larger owns the grain.
+              const pdcPrev = new Float64Array(gd.probeCount);
+              const pdcCur = new Float64Array(gd.probeCount);
+              const psPrev = new Int8Array(gd.probeCount);
+              const psCur = new Int8Array(gd.probeCount);
+              const php = mkHist();
+              let pSteps = 0; let pFlips = 0; let pMoved = 0; let pSeen = 0;
+              let firstFrame = true;
+              for (let k = 0; k < frames; k++) {
+                await advance(k);
+                {
+                  const meta = new Float32Array(
+                    await renderer.getArrayBufferAsync(gather.buffers.probeMeta.value));
+                  const shb = new Float32Array(
+                    await renderer.getArrayBufferAsync(gather.buffers.probeSh.value));
+                  const half = gather.frame & 1;
+                  psCur.fill(0);
+                  // ⚠ THE **RAW** SH, NOT THE FILTERED ONE. `probeSh`'s first
+                  // half is `probeShFilter`'s 5×5 POOL of the probe and its 24
+                  // neighbours; reading that to ask "did THIS probe's own
+                  // estimate move" answers with 25 probes' motion and calls it
+                  // one probe's. The unpooled coefficients live in the second
+                  // half (`shRawIdx`) and are the probe's own.
+                  for (let p = 0; p < gd.probeCount; p++) {
+                    const b = (gd.probeCount * 9 + p * 9) * 4;
+                    pdcCur[p] = lum([shb[b], shb[b + 1], shb[b + 2]]);
+                  }
+                  if (!firstFrame) {
+                    for (let p = 0; p < gd.probeCount; p++) {
+                      const mb = (half * gd.probeCount * 3 + p * 3) * 4;
+                      if (!(meta[mb + 3] > 0.5)) continue;
+                      const src = meta[(half * gd.probeCount * 3 + p * 3 + 2) * 4];
+                      if (!(src >= 0)) continue;
+                      const L = pdcCur[p];
+                      const P = pdcPrev[src];
+                      if (!(L > 0) || !(P > 0)) continue;
+                      pSeen++;
+                      const d = L - P;
+                      histAdd(php, Math.abs(d) / L);
+                      if (!(Math.abs(d) > SIGN_EPS * L)) continue;
+                      pMoved++;
+                      const sg = d > 0 ? 1 : -1;
+                      psCur[p] = sg;
+                      const ps = psPrev[src];
+                      if (ps !== 0) { pSteps++; if (sg !== ps) pFlips++; }
+                    }
+                  }
+                  pdcPrev.set(pdcCur);
+                  psPrev.set(psCur);
+                  firstFrame = false;
+                }
+                const f = await reprojFrame();
+                if (lit == null) {
+                  const h = mkHist();
+                  for (let i = 0; i < NHALF; i++) if (f[i * 4 + 3] > 0.5) histAdd(h, f[i * 4]);
+                  lit = 0.1 * (histP(h, 50) ?? 0);
+                }
+                curS.fill(0);
+                for (let i = 0; i < NHALF; i++) {
+                  if (!(f[i * 4 + 3] > 0.5)) continue;
+                  scored++;
+                  const s = f[i * 4 + 2];
+                  if (!(s >= 0)) continue;
+                  reproj++;
+                  const L = f[i * 4];
+                  const P = f[i * 4 + 1];
+                  if (!(L > lit) || !(P > 0)) continue;
+                  const d = L - P;
+                  histAdd(hp, Math.abs(d) / L);
+                  if (!(Math.abs(d) > SIGN_EPS * L)) continue;
+                  moved++;
+                  const sg = d > 0 ? 1 : -1;
+                  curS[i] = sg;
+                  const ps = prevS[s];
+                  if (ps !== 0) { steps++; if (sg !== ps) flips++; }
+                }
+                prevS.set(curS);
+              }
+              const out = {
+                label, frames,
+                p50: histP(hp, 50), p95: histP(hp, 95), n: hp.n,
+                movedPct: reproj ? (100 * moved) / reproj : null,
+                flipPct: steps ? (100 * flips) / steps : null,
+                reprojPct: scored ? (100 * reproj) / scored : null,
+                steps,
+                probe: {
+                  p50: histP(php, 50), p95: histP(php, 95), n: php.n,
+                  movedPct: pSeen ? (100 * pMoved) / pSeen : null,
+                  flipPct: pSteps ? (100 * pFlips) / pSteps : null,
+                  steps: pSteps,
+                },
+              };
+              say(`  GRAIN [${label}]: reprojected Δ p50 ${(100 * (out.p50 ?? 0)).toFixed(2)} % ` +
+                `p95 ${(100 * (out.p95 ?? 0)).toFixed(2)} % over ${out.n} samples | ` +
+                `moved ${out.movedPct?.toFixed(1)} % | SIGN FLIPS ` +
+                `${out.flipPct == null ? "n/a" : out.flipPct.toFixed(1)} % of ${out.steps} ` +
+                `| reprojected ${out.reprojPct?.toFixed(1)} % of valid px`);
+              say(`  GRAIN [${label}] PROBE SH DC: Δ p50 ${(100 * (out.probe.p50 ?? 0)).toFixed(2)} % ` +
+                `p95 ${(100 * (out.probe.p95 ?? 0)).toFixed(2)} % | moved ${out.probe.movedPct?.toFixed(1)} % ` +
+                `| SIGN FLIPS ${out.probe.flipPct == null ? "n/a" : out.probe.flipPct.toFixed(1)} % ` +
+                `of ${out.probe.steps}`);
+              return out;
+            };
+            // ⚠ EVERY ARM IS A ONE-UNIFORM DEPARTURE FROM `GBASE`, and the
+            // base is 3.10 exactly. A cumulative ladder cannot answer "who
+            // owns the flips" — it can only say a lever helped once the ones
+            // above it were pulled — and this is an OWNERSHIP question.
+            const GSHIP = {
+              ditherWorld: gu.ditherWorld.value, probeDither: gu.probeDither.value, hzbOn: 1,
+              octAlpha: gu.octAlpha.value, anchorJitter: 0, shadeProb: gd.shadeProb,
+              anchorStick: gu.anchorStick.value,
+            };
+            const setG = (over) => {
+              for (const [k, v] of Object.entries({ ...GSHIP, ...over })) gu[k].value = v;
+            };
+            const P310 = { anchorStick: 0, ditherWorld: 0, probeDither: 1 };
+            const ARMS = [
+              { name: "3.10", over: { ...P310 } },
+              { name: "sticky", over: {} },
+              // ⭐ THE PAIRING. A world-keyed lattice was refuted ALONE because
+              // the anchor it is keyed to was walking; with the anchor stuck,
+              // position and offset become constant TOGETHER and change on one
+              // event instead of two independent ones.
+              { name: "sticky + world latt", over: { ditherWorld: 1 } },
+              { name: "sticky + centres", over: { probeDither: 0 } },
+              { name: "sticky + alpha .25", over: { octAlpha: 0.25 } },
+              { name: "sticky+world+a.25", over: { ditherWorld: 1, octAlpha: 0.25 } },
+              { name: "sticky+centres+a.25", over: { probeDither: 0, octAlpha: 0.25 } },
+              { name: "3.10 centres", over: { ...P310, probeDither: 0 } },
+              { name: "3.10 alpha .25", over: { ...P310, octAlpha: 0.25 } },
+              { name: "3.10 octAlpha 1", over: { ...P310, octAlpha: 1 } },
+              { name: "3.10 no screen", over: { ...P310, hzbOn: 0 } },
+              { name: "3.10 world latt", over: { ...P310, ditherWorld: 1 } },
+              // ⭐ THE POSITIVE CONTROL. §L.1's per-frame anchor jitter is a
+              // KNOWN noise source that §19 3.6 removed; if this arm does not
+              // read worse than the base the instrument is blind and every
+              // null above it is worthless.
+              { name: "anchor jitter (ctrl)", over: { ...P310, anchorJitter: 1 } },
+            ];
+            say("");
+            say(`§19 STAGE 3.11a — GRAIN UNDER MOTION (${GR_FRAMES} frames of the 45° orbit, ` +
+              `each pixel against its own reprojected previous value)`);
+            const grain = [];
+            for (const a of ARMS) {
+              setG(a.over);
+              poseAt(0);
+              await settle(40);
+              // One frame at the start pose so `motionLum`'s previous half is
+              // this arm's and not the last arm's.
+              await runFrame(nn++);
+              await compute(gather.passes.reprojDump);
+              const orbitG = await grainReceipt(`${a.name} / orbit`, {
+                advance: async (k) => { poseAt(((k + 1) / 60) * (Math.PI / 4)); await runFrame(nn++); },
+              });
+              // The same instrument with the camera PARKED — its own null. A
+              // receipt that reads 27 % under motion means nothing until the
+              // identical receipt reads ~0 on a still camera.
+              await settle(40);
+              await runFrame(nn++);
+              await compute(gather.passes.reprojDump);
+              const restG = await grainReceipt(`${a.name} / at rest`, {
+                advance: async () => { await runFrame(nn++); },
+              });
+              // How often the anchor actually stayed put, measured DURING the
+              // orbit — the mechanism's own rate, not an assumption about it.
+              poseAt(0);
+              await settle(4);
+              await compute(gather.passes.clearStats);
+              poseAt(Math.PI / 240);
+              await runFrame(nn++);
+              const stG = await readStats();
+              const stickPct = 100 * stG.anchorSticky / Math.max(1, stG.probesValid);
+              say(`  GRAIN [${a.name}]: anchor stayed on its world point ${stickPct.toFixed(1)} % ` +
+                `of ${stG.probesValid} valid probes on a moving frame`);
+              grain.push({ arm: a.name, orbit: orbitG, rest: restG, stickPct });
+            }
+            setG({});
+            setCam(CAM_IN);
+            await settle(60);
+            results.motionGrain = { frames: GR_FRAMES, arms: grain };
+          }
+
           // ── the CACHE's own temporal σ, at faces we can name ────────────
           //
           // §L.6's injection is the one write that leaves probe space, so its
           // noise is the one thing a probe-space receipt cannot see. A fixed
           // set of voxel faces is read back over 30 frames and scored the same
           // way the pixels were.
-          {
+          if (!ONLY) {
             const cacheSigma = async (label) => {
               const pts = [
                 { name: "floor", p: [0, -3, 0], n: [0, 1, 0] },
@@ -2521,6 +2855,145 @@
           // later edit that appends a section does not inherit a turned room.
           await applyWorld(WORLDS[0]);
           await resetGather();
+        }
+
+        // ══ §19 STAGE 3.11 — THE TRIM ARM: CONTACT SCALE, WITH A REFERENCE ══
+        //
+        // ⭐⭐⭐ THE BLACK BLOBS ARE AT GEOMETRY FINER THAN A VOXEL, AND THE FLAT
+        // CORNELL HAS NO SUCH GEOMETRY. Every crop in the receipts above sits
+        // on a 5 cm wall, a 2 m box or a 1 m sphere — surfaces whose nearest
+        // neighbour is METRES away — so a probe standing on one never shoots a
+        // ray that lands in the conservatively DILATED shell of something 5 cm
+        // from it. The user's screenshot is nothing but that case: a door panel
+        // inside its frame, the recess around it, the foot of a planter, a
+        // cable against a wall. So the room grows the features the fault needs:
+        //
+        //   · a 5 cm LEDGE along the −Z wall at y = 1.2 m
+        //   · a DOOR FRAME — three 10 cm × 5 cm members standing 5 cm proud of
+        //     the wall — with a PANEL recessed 3 cm inside them
+        //   · a 30 cm POT standing on the floor
+        //
+        // all of them thinner than the 25 cm level-0 cell, all of them filled by
+        // the SAME analytic filler with the SAME conservative rule, and all of
+        // them path-traced by the SAME CPU reference in the node runner. The
+        // crops come in PAIRS — the blob and a flat control on the same
+        // surface, the same material and the same height — so "the recess is
+        // dark" is a ratio between two places in one room and not an
+        // impression about a screenshot.
+        if (params.get("trim") !== "0") {
+          const TRIM_FRAMES = Number(params.get("trimFrames") ?? 200);
+          const TRIM_TAPS = Number(params.get("trimTaps") ?? 6);
+          const { hy, hz } = ROOM;
+          const box = (min, max, pal) => ({ kind: KIND_BOX, min, max, pal });
+          // The wall's inner face is z = −hz; everything below stands PROUD of
+          // it toward +Z, so the recess is a real recess and not a hole in a
+          // slab the filler would have to subtract.
+          const TRIM_FEATURES = [
+            box([-2.0, 1.20, -hz], [2.0, 1.25, -hz + 0.20], 5), // the 5 cm ledge
+            box([-0.70, -hy, -hz], [-0.60, -0.60, -hz + 0.05], 5), // jamb −X
+            box([0.60, -hy, -hz], [0.70, -0.60, -hz + 0.05], 5), // jamb +X
+            box([-0.70, -0.60, -hz], [0.70, -0.50, -hz + 0.05], 5), // head
+            box([-0.60, -hy, -hz], [0.60, -0.60, -hz + 0.02], 5), // the panel, 3 cm in
+            box([1.40, -hy, -1.50], [1.70, -hy + 0.30, -1.20], 7), // the 30 cm pot
+          ];
+          const TRIM_SCENE = [PANEL, ...CORNELL_SCENE, ...TRIM_FEATURES];
+          // ⭐ THE CROPS COME IN PAIRS AND THE PAIRING IS THE RECEIPT. Each
+          // `pair` names the flat crop the blob is judged against: same wall,
+          // same albedo, same height, no trim within a metre.
+          // ⚠ EVERY BLOB CROP IS INSIDE THE CONTACT BAND, AND THE FIRST CUT OF
+          // THIS LIST WAS NOT. `panelInFrame` sat at the MIDDLE of a 1.2 m
+          // door — 0.6 m, i.e. 2.4 cells, from the nearest jamb — which is
+          // outside `CONTACT_AUTH_CELLS` by more than a factor of two, so the
+          // rule under test could not fire on it and the crop reported a
+          // healthy 1.077 while saying nothing. A receipt for a contact-scale
+          // fault has to be taken AT CONTACT SCALE: 10 cm from the jamb, 7 cm
+          // under the ledge, 5 cm from the pot.
+          const TRIM_CROPS = [
+            { name: "panelNearJamb", p: [-0.50, -1.5, -hz + 0.019], pair: "wallFlat" },
+            { name: "panelCorner", p: [-0.50, -0.70, -hz + 0.019], pair: "wallFlat" },
+            { name: "wallAboveLedge", p: [0, 1.35, -hz + 0.001], pair: "wallFlatHigh" },
+            { name: "wallUnderLedge", p: [0, 1.13, -hz + 0.001], pair: "wallFlatHigh" },
+            { name: "floorByPot", p: [1.35, -hy + 0.01, -1.35], pair: "floorFar" },
+            { name: "frameFace", p: [-0.65, -1.5, -hz + 0.049], pair: "wallFlat" },
+            { name: "wallFlat", p: [2.5, -1.5, -hz + 0.001] },
+            { name: "wallFlatHigh", p: [2.5, 1.35, -hz + 0.001] },
+            { name: "floorFar", p: [0, -hy + 0.01, -3.0] },
+            { name: "floorSpot", p: [0, -hy + 0.01, 0.0] },
+            { name: "greenWall", p: [4.99, -0.5, -1.0] },
+          ];
+          const TRIM_CAM = { eye: [0.6, -0.6, 3.2], at: [0, -1.8, -hz] };
+
+          say("");
+          say(`§19 STAGE 3.11 — THE TRIM ARM (${TRIM_SCENE.length} prims: the room plus a 5 cm ledge, ` +
+            `a 10×5 cm door frame with a 3 cm recess, a 30 cm pot)`);
+          fill.setScene(TRIM_SCENE);
+          buildMeshes(TRIM_SCENE);
+          setCam(TRIM_CAM);
+          await compute(cache.clearPass);
+          await compute(gather.passes.clearProbes);
+          await compute(gather.passes.clearMeta);
+          await compute(gather.passes.clearStats);
+          win.reset();
+          await placeWindow(true);
+          let nT = 60000;
+          await runFrame(nT++); // `writeCrops` needs `vp`
+          const trimMeta = writeCrops((p) => p, TRIM_CROPS);
+          for (let i = 1; i < TRIM_FRAMES; i++) await runFrame(nT++);
+          const taps = [];
+          for (let k = 0; k < TRIM_TAPS; k++) {
+            taps.push(await readCrops(TRIM_CROPS));
+            for (let i = 0; i < 4; i++) await runFrame(nT++);
+          }
+          const trimCrops = taps[0].map((c, i) => ({
+            ...c,
+            irr: [0, 1, 2].map((ch) => taps.reduce((s, t) => s + t[i].irr[ch], 0) / taps.length),
+            taps: taps.length,
+          }));
+          const trimStats = await readStats();
+          for (const c of trimCrops) {
+            const m = trimMeta.find((x) => x.name === c.name);
+            say(`  ${c.name.padEnd(15)} px ${String(c.px).padStart(4)},${String(c.py).padStart(4)} ` +
+              `${m.onScreen ? "  " : "OFF"} samples ${String(c.samples).padStart(4)} ` +
+              `pos ${c.pos.map((v) => v.toFixed(2)).join(",")} n ${c.nrm.map((v) => v.toFixed(2)).join(",")} ` +
+              `E ${c.irr.map((v) => v.toFixed(3)).join(",")}`);
+          }
+          // ── the contact census: how many rays the band actually claims ────
+          say(`  contact band: ${trimStats.contactBand ?? 0} of ${trimStats.raysTraced} rays traced ` +
+            `(${(100 * (trimStats.contactBand ?? 0) / Math.max(1, trimStats.raysTraced)).toFixed(2)} %), ` +
+            `screen saw ${trimStats.contactSeen ?? 0}, continued ${trimStats.contactCont ?? 0} ` +
+            `(${(100 * (trimStats.contactCont ?? 0) / Math.max(1, trimStats.raysTraced)).toFixed(2)} % of rays)`);
+
+          // ── THE LEAK ARM, ON THE CONTACT RULE ITSELF ─────────────────────
+          //
+          // ⭐⭐ THE OLD LEAK TEST CANNOT SEE THIS FIX AND WOULD HAVE PASSED
+          // BLIND. It shoots `traceWindow` directly, and the contact rule lives
+          // in `probeTrace` ABOVE that call — so 0/10 000 from it would have
+          // said nothing at all about whether the continuation walks through a
+          // wall. `contactRay` is the shipped decision, exposed: the same
+          // window trace, the same screen segment, the same authority test, on
+          // rays this page chooses. A ray "escapes" when the rule DISCARDS its
+          // hit (full continuation authority) and the continuation finds
+          // nothing — the 5 cm wall is the surface that must never be discarded.
+          const LEAK_N = 10000;
+          const leakRes = await contactLeak(LEAK_N);
+          say(`  5 cm-wall leak: ${leakRes.escaped} of ${LEAK_N} rays had their wall hit DISCARDED and ` +
+            `escaped; ${leakRes.contact} were in the contact band, ${leakRes.cleared} were granted ` +
+            `continuation authority | control (authority forced) ${leakRes.control} escapes ` +
+            `= ${(100 * leakRes.control / LEAK_N).toFixed(1)} %`);
+
+          results.trim = {
+            frames: TRIM_FRAMES, taps: TRIM_TAPS, cam: TRIM_CAM,
+            scene: TRIM_SCENE.map((p) => ({ kind: p.kind, min: p.min, max: p.max, pal: p.pal })),
+            crops: trimCrops.map((c, i) => ({ ...c, pair: TRIM_CROPS[i].pair ?? null })),
+            meta: trimMeta, stats: trimStats, leak: leakRes,
+          };
+          // Put the room back, so anything appended after this reads the room
+          // every other receipt was measured in.
+          fill.setScene(SCENE);
+          buildMeshes(SCENE);
+          setCam(CAM_IN);
+          await compute(win.clearStaticPass);
+          await compute(fill.pass);
         }
 
         if (validationErrors.length) throw new Error(`WebGPU validation: ${validationErrors[0]}`);

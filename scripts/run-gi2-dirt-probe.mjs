@@ -465,13 +465,25 @@ const energy = () => page.evaluate(async () => {
   await r.computeAsync(g.passes.noiseDump);
   const noise = new Float32Array(await r.getArrayBufferAsync(g.buffers.noiseBuf.value));
   const geo = new Float32Array(await r.getArrayBufferAsync(g.buffers.dirtyBuf.value));
-  const fac = []; const pav = [];
+  // ⭐⭐ §19 STAGE 3.11 — THE DIRECTIONALITY RECEIPT, OUT OF A DUMP THAT
+  // ALREADY EXISTS. "The door panel is darker than the wall beside it" needs
+  // two populations, and naming a door in Bistro would mean naming an entity
+  // and hoping the pose still frames it. The dump already separates them:
+  // `noiseDump`'s third word is 1 when the pixel's 5×5 neighbourhood is NOT
+  // one plane — a recess, a frame, a cable, a planter foot — and 0 on flat
+  // wall. DETAIL façade against FLAT façade is therefore the recess-vs-wall
+  // contrast, taken over every such pixel in the frame instead of over one
+  // 32-px crop somebody chose, and it costs a second accumulator on a buffer
+  // that is already being read back.
+  const fac = []; const pav = []; const facEdge = []; const facFlat = [];
   for (let i = 0; i < geo.length / 4; i++) {
     if (!(noise[i * 4 + 3] > 0.5)) continue;
     const ny = geo[i * 4 + 1];
     const v = noise[i * 4];
-    if (Math.abs(ny) < 0.4) fac.push(v);
-    else if (ny > 0.8) pav.push(v);
+    if (Math.abs(ny) < 0.4) {
+      fac.push(v);
+      if (noise[i * 4 + 2] > 0.5) facEdge.push(v); else facFlat.push(v);
+    } else if (ny > 0.8) pav.push(v);
   }
   const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
   const p75 = (a) => (a.length ? [...a].sort((x, y) => x - y)[Math.floor(a.length * 0.75)] : null);
@@ -485,6 +497,8 @@ const energy = () => page.evaluate(async () => {
   return {
     facadePx: fac.length, pavementPx: pav.length,
     facadeMean: mean(fac), pavementP75: p75(pav),
+    facadeEdgePx: facEdge.length, facadeFlatPx: facFlat.length,
+    facadeEdgeMean: mean(facEdge), facadeFlatMean: mean(facFlat),
     sky: rgb(u.skyColor), sun: rgb(u.sunColor), stats: st,
   };
 });
@@ -544,6 +558,49 @@ if (ARMS) {
   await arm("ARM injectAlpha=0 (H4 off)", { injectAlpha: 0 });
   await arm("ARM injectAlpha=0 + skyAtHit=0 (H4+H3 off)", { injectAlpha: 0, skyAtHit: 0 });
   await arm("ARM inject only (shadeProb=0, sky off)", { injectAlpha: 0.25, skyAtHit: 0, shadeProb: 0 });
+}
+
+// ══ §19 STAGE 3.11 — THE CONTACT RULE, ON THE SCENE THAT HAS THE SYMPTOM ═══
+//
+// ⭐⭐ THE TRIM ARM IN `gi2-gather.html` COULD NOT REPRODUCE THE BLOB, so this
+// is not a confirmation run — it is the only place the fault exists. Both arms
+// come out of one boot, one pose and one binary; the cache is emptied between
+// them because a world accumulator cannot be A/B'd without being emptied, and
+// each is given 320 frames to re-solve. `CONTACT=0` runs it as HEAD does.
+if (process.env.CONTACT !== "0") {
+  const setU = (set) => page.evaluate(async ({ set }) => {
+    const gi2 = globalThis.__gi2();
+    const u = gi2.gather.uniforms;
+    for (const [k, v] of Object.entries(set)) if (u[k]) u[k].value = v;
+    await globalThis.__giEngineForProbe.renderer.computeAsync(gi2.cache.clearPass);
+  }, { set });
+  const rows = [];
+  for (const [tag, set] of [["contact OFF (HEAD)", { contactOn: 0 }], ["contact ON (3.11)", { contactOn: 1 }]]) {
+    await setU(set);
+    await settleFrames(320);
+    const e = await energy();
+    const st = e.stats ?? {};
+    rows.push({ tag, e, st });
+    const pc = (a, b) => (a != null && b ? `${((100 * a) / b).toFixed(1)} %` : "—");
+    console.log(`\n  §3.11 ${tag}`);
+    console.log(`     façade ${e.facadeMean?.toFixed(4)} vs sunlit pavement p75 ${e.pavementP75?.toFixed(4)} ` +
+      `→ ${pc(e.facadeMean, e.pavementP75)}`);
+    console.log(`     RECESS/WALL: façade at geometric DETAIL ${e.facadeEdgeMean?.toFixed(4)} ` +
+      `(${e.facadeEdgePx} px) vs FLAT façade ${e.facadeFlatMean?.toFixed(4)} (${e.facadeFlatPx} px) ` +
+      `→ ${pc(e.facadeEdgeMean, e.facadeFlatMean)}   ⟵ under 50 % is the blob`);
+    if (st.raysTraced) {
+      console.log(`     contact band ${((100 * (st.contactBand ?? 0)) / st.raysTraced).toFixed(2)} % of rays, ` +
+        `screen saw ${((100 * (st.contactSeen ?? 0)) / st.raysTraced).toFixed(2)} %, continued ` +
+        `${((100 * (st.contactCont ?? 0)) / st.raysTraced).toFixed(2)} %`);
+    }
+  }
+  const [off, on] = rows;
+  const rel = (r) => (r.e.facadeEdgeMean && r.e.facadeFlatMean
+    ? r.e.facadeEdgeMean / r.e.facadeFlatMean : null);
+  const fp = (r) => (r.e.facadeMean && r.e.pavementP75 ? r.e.facadeMean / r.e.pavementP75 : null);
+  console.log(`\n  §3.11 BISTRO CONTRAST, before → after (single run, one boot, one pose):`);
+  console.log(`     recess ÷ flat wall   ${(100 * rel(off)).toFixed(1)} % → ${(100 * rel(on)).toFixed(1)} %`);
+  console.log(`     façade ÷ pavement    ${(100 * fp(off)).toFixed(1)} % → ${(100 * fp(on)).toFixed(1)} %`);
 }
 
 await browser.close();

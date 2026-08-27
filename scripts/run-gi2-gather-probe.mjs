@@ -386,6 +386,109 @@ for (const tier of tiers) {
       console.log(`  EXHAUSTED RAYS: ${e.rays}/${e.traced} = ${e.pct.toFixed(2)} % — ` +
         Object.entries(e.classes).map(([k, v]) => `${k} ${v}`).join(", ") + ` (of ${e.recorded} recorded)`);
     }
+    // ══ §19 STAGE 3.11a — GRAIN UNDER MOTION ═══════════════════════════════
+    //
+    // ⭐⭐ THE ORBIT COLUMN IS THE SUBJECT AND THE REST COLUMN IS ITS NULL.
+    // A sign-flip rate means nothing on its own — the same instrument has to
+    // read ~0 on a parked camera, or it is measuring itself. Both are printed
+    // for every arm, from one page load, on the same pose sequence.
+    if (r.motionGrain?.arms?.length) {
+      console.log("");
+      console.log(`  §19 3.11a GRAIN, per pixel against its own REPROJECTED previous value ` +
+        `(${r.motionGrain.frames} frames)`);
+      // ⚠ `flip%` IS CONDITIONED ON `moved`, so it is only readable BESIDE
+      // `moved%`: an arm that freezes most of the image reports flips over the
+      // minority that is left, and a rate over a shrinking denominator is the
+      // censoring trap. Δp50/Δp95 are uncensored and are the headline.
+      console.log("  arm                  stick%  ORBIT px: Δp50    Δp95  flip%  moved%  |  ORBIT probe RAW SH:" +
+        "  Δp50    Δp95  flip%  moved%  |  REST px Δp95");
+      for (const a of r.motionGrain.arms) {
+        const f = (x, d = 2) => (x == null ? "—" : (100 * x).toFixed(d));
+        const p = (x, d = 1) => (x == null ? "—" : x.toFixed(d));
+        const q = a.orbit.probe ?? {};
+        console.log(
+          `  ${a.arm.padEnd(20)}${p(a.stickPct).padStart(6)}` +
+          `${f(a.orbit.p50).padStart(15)} ${f(a.orbit.p95).padStart(7)} ${p(a.orbit.flipPct).padStart(6)} ` +
+          `${p(a.orbit.movedPct).padStart(7)}  |${f(q.p50).padStart(22)} ${f(q.p95).padStart(7)} ` +
+          `${p(q.flipPct).padStart(6)} ${p(q.movedPct).padStart(7)}  |${f(a.rest.p95).padStart(14)}`,
+        );
+      }
+    }
+    // ══ §19 STAGE 3.11 — THE TRIM ARM, AGAINST ITS OWN PATH TRACER ═════════
+    //
+    // ⭐⭐ THE PAIRING IS THE RECEIPT. Each sub-voxel crop is printed beside the
+    // FLAT crop on the same surface at the same height, and what is gated is
+    // the ratio of their ratios: a room that is uniformly dim moves both and
+    // says nothing, while a blob moves only one. The reference is the same
+    // tracer the flat room uses, over the primitive list the page actually
+    // voxelized — the trim features cannot be a second description of
+    // themselves.
+    if (r.trim?.crops?.length) {
+      const refs = {
+        1: makeReference(r.trim.scene, r.palette, r.light, 1),
+        4: makeReference(r.trim.scene, r.palette, r.light, 4),
+      };
+      const rows = [];
+      for (const c of r.trim.crops) {
+        if (!(c.samples > 0)) { rows.push({ name: c.name, skipped: "no gbuffer samples" }); continue; }
+        const seed = 0x51ed + c.name.length * 7919;
+        const E1 = refs[1].irradiance(c.pos, c.nrm, SPP, seed);
+        const E4 = refs[4].irradiance(c.pos, c.nrm, SPP, seed);
+        rows.push({
+          name: c.name, pair: c.pair, gpu: c.irr, ref: E4,
+          ratio: lum(c.irr) / Math.max(1e-9, lum(E4)),
+          ratio1: lum(c.irr) / Math.max(1e-9, lum(E1)),
+        });
+      }
+      console.log("");
+      console.log(`  §19 3.11 TRIM ARM (${r.trim.frames} frames, ${r.trim.taps} taps, ${SPP} spp reference)`);
+      console.log("  crop            GPU E (rgb)                 ref E, 4 bounces            /b4      /b1    vs its flat pair");
+      for (const p of rows) {
+        if (p.skipped) { console.log(`  ${p.name.padEnd(15)} ${p.skipped}`); continue; }
+        const pr = p.pair ? rows.find((q) => q.name === p.pair) : null;
+        const rel = pr && !pr.skipped ? (p.ratio / Math.max(1e-9, pr.ratio)) : null;
+        console.log(
+          `  ${p.name.padEnd(15)}${p.gpu.map((v) => v.toFixed(3).padStart(8)).join("")}   ` +
+          `${p.ref.map((v) => v.toFixed(3).padStart(8)).join("")}   ` +
+          `${p.ratio.toFixed(3).padStart(6)}  ${p.ratio1.toFixed(3).padStart(6)}   ` +
+          (rel == null ? "      —" : `${rel.toFixed(3).padStart(6)} of ${p.pair}`),
+        );
+      }
+      const flat = rows.filter((p) => !p.skipped && !p.pair);
+      const trimmed = rows.filter((p) => !p.skipped && p.pair);
+      const lo = Math.min(...flat.map((p) => p.ratio));
+      const hi = Math.max(...flat.map((p) => p.ratio));
+      // THE GATE: every sub-voxel crop inside the bracket the FLAT crops of the
+      // same room span. The bracket is measured, not asserted — a room whose
+      // flat crops sit at 0.6-0.8 of a path tracer sets a 0.6-0.8 bar for its
+      // recesses, and the blob is a crop that is BELOW its own room.
+      const out = trimmed.filter((p) => p.ratio < lo * 0.9);
+      console.log(`  flat crops span ${lo.toFixed(3)}–${hi.toFixed(3)} of the 4-bounce reference; ` +
+        `sub-voxel crops ${trimmed.map((p) => `${p.name} ${p.ratio.toFixed(3)}`).join(", ")}`);
+      console.log(`  TRIM GATE: ${trimmed.length - out.length}/${trimmed.length} sub-voxel crops inside ` +
+        `the flat bracket` + (out.length ? ` — OUT: ${out.map((p) => p.name).join(", ")}` : ""));
+      if (r.trim.leak) {
+        const L = r.trim.leak;
+        console.log(`  5 cm-wall leak on the CONTACT RULE: ${L.escaped}/10000 escaped ` +
+          `(${L.plain} of them without the rule firing) | ${L.contact} in the band, ${L.seen} the screen ` +
+          `could see, ${L.cleared} it vouched for | CONTROL (authority forced) ${L.control}/10000 ` +
+          `= ${(L.control / 100).toFixed(1)} %`);
+      }
+      const stC = r.trim.stats ?? {};
+      r.trimReport = {
+        rows, flatLo: lo, flatHi: hi, out: out.map((p) => p.name), leak: r.trim.leak,
+        contactPct: 100 * (stC.contactBand ?? 0) / Math.max(1, stC.raysTraced ?? 1),
+        contPct: 100 * (stC.contactCont ?? 0) / Math.max(1, stC.raysTraced ?? 1),
+        gates: {
+          inBracket: out.length === 0,
+          leak: (r.trim.leak?.escaped ?? 999) === 0,
+          leakControl: (r.trim.leak?.control ?? 0) >= 9000,
+        },
+      };
+      console.log(`  3.11 gates: ` + Object.entries(r.trimReport.gates)
+        .map(([k, v]) => `${k} ${v ? "PASS" : "FAIL"}`).join("  "));
+      if (Object.values(r.trimReport.gates).some((v) => !v)) failed++;
+    }
     if (r.hzbAB) {
       console.log("");
       console.log(`  HZB screen segment, on / off: ` +
@@ -588,6 +691,8 @@ for (const tier of tiers) {
       levers: r.levers,
       panelMove: r.panelMove,
       motionNoise: r.motionNoise,
+      motionGrain: r.motionGrain,
+      trim: r.trimReport,
       cacheSigma: r.cacheSigma,
       reprojCensus: r.reprojCensus,
       kernels: r.kernels,

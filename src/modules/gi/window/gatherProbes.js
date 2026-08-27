@@ -285,6 +285,12 @@ export const STATS = {
   // dominant axis at all, and those where that axis is not the gbuffer
   // normal's nearest. Slots 14 and 27 were the two the census never used.
   axisKnown: 14, axisMismatch: 27,
+  // §19 Stage 3.11a: probes whose anchor STAYED on its world point this frame.
+  anchorSticky: 28,
+  // §19 Stage 3.11: the contact band's census — rays whose window hit fell
+  // inside it, rays whose screen walk could SEE their path, and rays the
+  // screen vouched for and which therefore continued past the hit.
+  contactBand: 29, contactSeen: 30, contactCont: 31,
 };
 /**
  * §19 Stage 3.7's NEED CENSUS — three slots that are not receipts.
@@ -307,7 +313,7 @@ export const STAT_NEED = { fresh: 21, flag: 22, mature: 23 };
  * binding for one integer would not compile on the portable tier.
  */
 export const STAT_RAY_BUDGET = 24;
-export const STAT_SLOTS = 28;
+export const STAT_SLOTS = 32;
 export const STAT_WORDS = STAT_SLOTS * STAT_STRIPE;
 
 /**
@@ -394,6 +400,35 @@ export const RAY_MAX = 40;
  * not metres, so it follows the window's resolution at every tier.
  */
 export const CONTACT_CELLS = 4;
+
+/**
+ * ⭐⭐ §19 STAGE 3.11a — THE SUB-TEXEL LATTICE'S WORLD CELL, AS A FRACTION OF
+ * THE WINDOW'S OWN.
+ *
+ * The 4×4 lattice has to be a fixed function of WHERE a probe stands, not of
+ * WHICH TILE happens to cover it (see `probeTracePass`), so the key is the
+ * probe's world position quantized to a cell. Half a level-0 voxel: fine
+ * enough that two probes a tile apart at any useful depth land in different
+ * cells (so the lattice keeps decorrelating neighbours for the 5×5 SH filter),
+ * coarse enough that an anchor drifting a centimetre a frame under camera
+ * motion stays in its own cell for many frames. A FRACTION of what the scene
+ * measures, never a metric constant.
+ */
+export const DITHER_CELL_FRAC = 0.5;
+
+/**
+ * ⭐⭐ §19 STAGE 3.11 — THE CONTACT BAND, in level-0 cells.
+ *
+ * A window hit closer than this is inside the reach of the CONSERVATIVE
+ * voxelization's own thickness: a probe standing on geometry finer than a cell
+ * (a door panel in its frame, a pot's foot) shoots sideways and hits the
+ * DILATED shell of the thing beside it, where the true surface is centimetres
+ * away and the hemisphere is really open. Two cells is the dilation's own
+ * reach — one cell of overlap on each side of a surface that crosses a cell
+ * boundary — so it is the distance over which "the window says occluded" is
+ * not yet evidence. Past it the window is the authority again.
+ */
+export const CONTACT_AUTH_CELLS = 2;
 
 // ── CPU mirrors of the octahedral table (see `srcOctahedral.js`) ─────────────
 
@@ -615,6 +650,43 @@ export function createGiGather({
   const dirtyBuf = wantNoise
     ? instancedArray(new Float32Array(
       Math.ceil(width / 2) * Math.ceil(height / 2) * 4), "vec4") : null;
+  /**
+   * ⭐⭐ §19 STAGE 3.11a — THE RECEIPT THAT CAN SEE GRAIN UNDER MOTION.
+   *
+   * The 3.10 sign receipt compares a screen pixel to ITSELF one frame ago, and
+   * under camera motion that is a comparison between two different world
+   * points: the number it returns is dominated by parallax and cannot tell
+   * "the surface flowing past" from "the estimate rattling". So the moving
+   * receipt compares each pixel to its own REPROJECTED previous value — the
+   * same surface point, one frame earlier — which is the only comparison under
+   * motion that is about the estimator.
+   *
+   * `motionLum` is the half-res luminance of the last two frames (indexed by
+   * `curBase`/`prevBase`, the same double-buffer discipline the oct atlas
+   * uses); `reprojBuf` is what the CPU reads: `(here, thereReprojected, the
+   * reprojection's validity, the gbuffer's)`.
+   *
+   * ⚠ IT IS A DEBUG PASS AND READS NO PREVIOUS FRAME ON THE IMAGE PATH. The
+   * §T assertion is about what `resolve`/`composite` sample; this kernel is
+   * dispatched by a receipt, writes to a buffer nothing else binds, and is
+   * built only when `wantNoise` already built the noise dump.
+   */
+  const motionLum = wantNoise
+    ? instancedArray(new Float32Array(2 * Math.ceil(width / 2) * Math.ceil(height / 2)), "float") : null;
+  const reprojBuf = wantNoise
+    ? instancedArray(new Float32Array(
+      Math.ceil(width / 2) * Math.ceil(height / 2) * 4), "vec4") : null;
+  /**
+   * §19 Stage 3.11's leak gate — see `contactRayPass`. Harness only, and built
+   * only when a receipt asked for crops: `gi2System` passes `crops: 0` and this
+   * pass, its two buffers and its second `traceWindow` never enter a boot.
+   */
+  const wantContact = crops > 0;
+  const CONTACT_RAYS = 10000;
+  const contactIn = wantContact
+    ? instancedArray(new Float32Array(CONTACT_RAYS * 8), "vec4") : null;
+  const contactOut = wantContact
+    ? instancedArray(new Float32Array(CONTACT_RAYS * 4), "vec4") : null;
   /** `shadeHit` under a microscope — see `shadeProbePass`. Harness only. */
   const SHADE_SLOTS = 12;
   const shadeIn = instancedArray(new Float32Array(SHADE_SLOTS * 2 * 4), "vec4");
@@ -741,6 +813,52 @@ export function createGiGather({
      */
     probeDither: uniform(1),
     /**
+     * ⛔ §19 STAGE 3.11a — REFUTED, KEPT AS THE ARM THAT REFUTED IT. 1 keys the
+     * 4×4 lattice to the probe's WORLD CELL instead of its probe-GRID
+     * coordinate; 0 (shipped) is Stage 3.10's grid key.
+     *
+     * The theory was sound and the measurement said no. A world key is only as
+     * stable as the anchor that produces it, and under motion the anchor
+     * crosses a `DITHER_CELL` boundary every two or three frames — at which
+     * point a HASH jumps to an unrelated one of the sixteen offsets, where the
+     * grid key had only ever stepped to the neighbouring one. Measured on the
+     * 45° orbit at 960×540 high, reprojected sign flips: 24.0 % on the grid key,
+     * **45.0 %** on the world key; Δp95 11.01 → 18.36 %. The lattice was not
+     * the mechanism either way — see `probePlacePass`'s sticky anchor.
+     */
+    ditherWorld: uniform(0),
+    /**
+     * ⛔ §19 STAGE 3.11a — MEASURED, AND **OFF**. 1 keeps the probe on its
+     * previous world point while its tile still covers it; 0 is Stage 3.10's
+     * "the tile's own pixel, whatever it covers this frame".
+     *
+     * It does exactly what it was built to do at the PROBE — raw SH Δp95
+     * 37.58 → 28.98 %, sign flips 29.6 → 17.8 % — and it does not survive the
+     * `resolve`: the pixel's Δp95 goes the WRONG WAY, 11.01 → 11.91 %, and its
+     * flip rate 23.8 → 30.8 %. A stuck anchor sits wherever in its tile the
+     * world point happens to be rather than near the tile's centre, so the four
+     * probes a pixel interpolates stop being a grid, and the interpolation of
+     * quiet probes is noisier than the interpolation of walking ones. Kept as
+     * the arm that says so; see `probePlacePass` and the 3.11a grain table.
+     */
+    anchorStick: uniform(0),
+    /** ⛔ §19 3.11a's tile HAND-OFF — measured, off. See `probePlacePass`. */
+    anchorHandoff: uniform(0),
+    /**
+     * ⭐⭐ §19 STAGE 3.11 — the contact-band authority rule. 1 ships it, 0 is
+     * Stage 3.3's "the window always wins", the arm every blob ratio is read
+     * against. See `probeTracePass`.
+     */
+    contactOn: uniform(1),
+    /**
+     * ⚠ THE LEAK TEST'S CONTROL, AND NOTHING ELSE. 1 forces every contact-band
+     * ray to be treated as if the depth buffer had vouched for it, so the rule
+     * discards EVERY near hit. A leak receipt that reads 0 is worthless until
+     * the same instrument reads ~100 % with this on — the blind-statistics
+     * check, applied to a safety gate.
+     */
+    contactForce: uniform(0),
+    /**
      * ⭐⭐ §19 STAGE 3.10 — THE PROBE MAP'S ONLY TEMPORAL RULE, AND IT IS A
      * CONSTANT.
      *
@@ -758,7 +876,18 @@ export function createGiGather({
      * change 32× more slowly than the probe beside it that has just been
      * placed, for no variance in return.
      */
-    octAlpha: uniform(0.5),
+    // ⭐⭐ §19 STAGE 3.11a — AND IT IS 0.25 NOW, BECAUSE LAG IS ALLOWED AND
+    // GRAIN IS NOT. The blend cannot remove noise from a noiseless input, but
+    // it CAN slow the rate at which the estimator's own SPATIAL quantization
+    // is read out along a moving anchor — which is what the user is looking
+    // at. Measured on the 45° orbit, reprojected per-pixel Δ: p50 2.06 →
+    // 1.79 %, p95 11.01 → 10.26 %, sign flips 23.8 → 18.9 %; the probe's own
+    // raw SH Δp95 37.58 → 18.08 %. It buys that with LATENCY and nothing else:
+    // the moved-panel receipt goes 90 % at 8 frames → 12 (the gate is 30), and
+    // the converged value is untouched — the whole Cornell parity table is
+    // byte-identical at 0.5 and 0.25, which is the check that this is a rate
+    // and not a gain.
+    octAlpha: uniform(0.25),
     /**
      * The re-shade CADENCE, as a power-of-two stride over `(voxel, frame)`
      * rather than §P.1's coin flip. Deterministic: which faces are re-shaded
@@ -1213,6 +1342,142 @@ export function createGiGather({
     const nrm = vec3(0, 1, 0).toVar();
     const depth = float(0).toVar();
     const valid = float(0).toVar();
+    const sticky = float(0).toVar();
+
+    // ══ ⭐⭐⭐ §19 STAGE 3.11a — THE ANCHOR STAYS ON ITS WORLD POINT ══════════
+    //
+    // THE USER'S REPORT: at rest the image is clean, under camera motion it
+    // GRAINS. 3.10's own orbit arm read 27 % frame-to-frame sign flips and
+    // nobody could say whether that was parallax or noise, because the receipt
+    // compared a screen pixel to ITSELF and under motion those are two
+    // different world points. The 3.11a receipt compares each pixel — and each
+    // probe — to its own REPROJECTED predecessor, and it names the owner:
+    //
+    //   arm (45° orbit, 960×540 high)   pixel flips   probe SH flips
+    //   3.10 baseline                      24.0 %         32.6 %
+    //   octAlpha 1 (no probe memory)       33.8 %         48.0 %
+    //   texel centres (no 4×4 lattice)     31.1 %         32.3 %
+    //   no screen segment                  23.8 %         32.4 %
+    //   no re-shade                        23.8 %         32.4 %
+    //   anchor jitter back (control)       44.4 %         51.8 %
+    //
+    // Every arm reads ZERO at rest, and the control reads 58 % at rest, so the
+    // instrument is neither blind nor broken. Three suspects are REFUTED by
+    // it: the HZB segment's per-frame authority (23.8 vs 24.0), the cache's
+    // re-shade cadence (23.8), and the 4×4 sub-texel lattice — which does not
+    // move the PROBE number at all (32.3 vs 32.6). And `octAlpha = 1` making
+    // it WORSE is the positive identification: with the blend removed the
+    // probe's value is nothing but `trace(anchor)`, and `trace(anchor)` alone
+    // flips its sign half the time. The noise is in the INPUT, not the memory.
+    //
+    // ⭐⭐ WHICH MEANS IT IS THE ANCHOR. A screen probe re-anchors every frame
+    // to whatever world point its tile's pixel happens to cover, and the
+    // estimator it evaluates there is SPATIALLY quantized — 64 fixed
+    // directions against a cache holding one radiance per voxel FACE. Slide
+    // the origin two centimetres and a different set of faces answers. That
+    // spatial step is invisible while the camera is still (which is exactly
+    // why the at-rest receipts are perfect) and becomes a per-frame flicker
+    // the moment the anchor starts walking. Spatial aliasing, read out along a
+    // moving line.
+    //
+    // So the anchor stops walking. If the probe's PREVIOUS world point is
+    // still inside this tile and the gbuffer still shows the same surface
+    // there, the probe keeps that exact point — the same origin, the same 64
+    // rays, the same answer, frame after frame — and only when the tile slides
+    // off it does the anchor jump to a fresh point, once, which `octAlpha`
+    // then ramps. Deterministic in world space, no randomness, no history
+    // beyond the probe's own previous position, and IDENTITY at rest (the
+    // previous point is the point the candidate loop would have picked), so
+    // every §T at-rest receipt is untouched by construction.
+    //
+    // ⚠ THE OCCLUSION TEST IS NOT OPTIONAL. "Still inside the tile" is a
+    // statement about a projection; a point behind a door that just swung shut
+    // still projects into the tile. So the gbuffer AT THAT PIXEL has to agree
+    // it is the same surface (normal), on the same plane, and at the same
+    // distance — the third test is what refuses a point something has moved in
+    // front of.
+    // ⭐⭐⭐ AND THE POINT IS HANDED FROM TILE TO TILE, WHICH IS THE OTHER HALF.
+    //
+    // A probe that only ever kept its OWN previous point un-stuck the moment
+    // that point crossed a tile boundary — measured 70.7 % kept, i.e. ~30 % of
+    // probes jumping to a fresh anchor every frame, and 30 % of a 5×5 pool
+    // jumping is what the pixel receipt was still reading. But the point did
+    // not vanish: it walked into the NEIGHBOURING tile, whose probe is about to
+    // invent a fresh anchor of its own. So each tile looks at the nine previous
+    // probes around it (ITSELF FIRST, which is what keeps a parked camera
+    // byte-identical) and adopts the first anchor that now falls inside it.
+    // A world point then belongs to whichever tile currently covers it, for as
+    // long as the screen shows it — a world-persistent probe on a screen grid —
+    // and it carries its own history with it, because `stickSrc` names the
+    // probe whose oct map holds it (see the reprojection below).
+    //
+    // ⚠ A POINT PROJECTS INTO EXACTLY ONE TILE, so two tiles can never adopt
+    // the same anchor and the scan needs no arbitration between tiles. Two
+    // different previous anchors landing in ONE tile is possible and is settled
+    // by scan order, which is fixed — no hash, no frame index.
+    const stickSrc = float(-1).toVar();
+    If(u.anchorStick.greaterThan(0.5), () => {
+      Loop({ start: 0, end: 9, name: "stick" }, ({ stick }) => {
+        If(sticky.greaterThan(0.5), () => { Break(); });
+        // Self is scanned first: `k = 0` maps to the centre of the 3×3.
+        const k = uint(stick).toVar();
+        // ⛔ THE HAND-OFF IS MEASURED AND **OFF**. It does what it claims —
+        // the anchor survives a tile crossing, and the probe's OWN raw SH gets
+        // much quieter (Δp95 19.87 → 6.76 % on the centres arm, its moved
+        // share 82 → 49 %) — but the PIXEL gets worse (Δp95 10.92 → 11.18 at
+        // α = 0.25), and the reason is `resolve`: a handed-off anchor can sit
+        // anywhere in its new tile, so the four "corner probes" a pixel
+        // interpolates stop being anywhere near a grid and their weights swing
+        // frame to frame. Quieter probes, noisier interpolation of them. Kept
+        // as an arm because the probe-space number says the mechanism is real
+        // and a resolve that weighted probes by their actual positions would
+        // collect it.
+        If(k.greaterThan(uint(0)).and(u.anchorHandoff.lessThan(0.5)), () => { Break(); });
+        const m = select(k.equal(uint(0)), uint(4),
+          select(k.lessThanEqual(uint(4)), k.sub(uint(1)), k)).toVar();
+        const ox = m.sub(m.div(uint(3)).mul(uint(3))).toInt().sub(int(1)).toVar();
+        const oy = m.div(uint(3)).toInt().sub(int(1)).toVar();
+        const nx = tx.toInt().add(ox).toVar();
+        const ny = ty.toInt().add(oy).toVar();
+        If(nx.greaterThanEqual(0).and(ny.greaterThanEqual(0))
+          .and(nx.lessThan(u.probeWU.toInt())).and(ny.lessThan(u.probeHU.toInt())), () => {
+          const pi = ny.toUint().mul(u.probeWU).add(nx.toUint()).toVar();
+          const sa = probeMeta.element(metaIdx(u.prevBase, pi, 0)).toVar();
+          const sb = probeMeta.element(metaIdx(u.prevBase, pi, 1)).toVar();
+          If(sa.w.greaterThan(0.5), () => {
+            const cs = u.viewProj.mul(vec4(sa.xyz, 1)).toVar();
+            If(cs.w.greaterThan(1e-4), () => {
+              const sx = cs.x.div(cs.w).mul(0.5).add(0.5).mul(u.widthF).toVar();
+              const sy = float(1).sub(cs.y.div(cs.w).mul(0.5).add(0.5)).mul(u.heightF).toVar();
+              const inTile = sx.greaterThanEqual(0).and(sy.greaterThanEqual(0))
+                .and(sx.div(T).floor().toInt().equal(tx.toInt()))
+                .and(sy.div(T).floor().toInt().equal(ty.toInt())).toVar();
+              If(inTile, () => {
+                const qx = sx.floor().clamp(0, u.widthF.sub(1)).toInt().toVar();
+                const qy = sy.floor().clamp(0, u.heightF.sub(1)).toInt().toVar();
+                const g2 = loadPos(qx, qy).toVar();
+                const n2 = normalize(loadNrm(qx, qy).xyz).toVar();
+                const dlt2 = g2.xyz.sub(sa.xyz).toVar();
+                const same = g2.w.greaterThan(0.5)
+                  .and(dot(n2, sb.xyz).greaterThan(0.9))
+                  .and(dot(n2, dlt2).abs().lessThan(v0 * 0.5))
+                  .and(dot(dlt2, dlt2).lessThan(v0 * v0)).toVar();
+                If(same, () => {
+                  pos.assign(sa.xyz);
+                  nrm.assign(sb.xyz);
+                  depth.assign(cs.w);
+                  valid.assign(1);
+                  sticky.assign(1);
+                  stickSrc.assign(pi.toFloat());
+                  bump(STATS.anchorSticky, tx);
+                });
+              });
+            });
+          });
+        });
+      });
+    });
+
     Loop({ start: 0, end: 8, name: "cand" }, ({ cand }) => {
       If(valid.greaterThan(0.5), () => { Break(); });
       // ⭐⭐ THE ANCHOR STOPS MOVING WHEN THE CAMERA DOES (§19 Stage 3.6).
@@ -1258,7 +1523,25 @@ export function createGiGather({
     // ── reprojection against last frame's probe grid (§L.3) ────────────────
     const prevProbe = float(-1).toVar();
     const reprojFail = float(0).toVar();
-    If(valid.greaterThan(0.5), () => {
+    // ⭐⭐ §19 STAGE 3.11a — A STICKY ANCHOR IS ITS OWN PREDECESSOR, AND THAT
+    // IS HALF THE FIX.
+    //
+    // The reprojection asks "which probe held this surface point last frame",
+    // and for an anchor that did not move the answer is THIS probe — but the
+    // search would not have found it: the point's PREVIOUS screen position is
+    // in a different tile the moment the camera turns, so a probe whose trace
+    // is byte-identical frame to frame was blending `octAlpha` of a NEIGHBOUR's
+    // map into it every frame, and inheriting that neighbour's anchor motion
+    // and sub-texel offsets with it. Measured on the first cut of the sticky
+    // anchor, which did exactly that: the probe's own Δp95 fell 13.30 → 10.18 %
+    // while its sign-flip rate ROSE 32.5 → 40.0 %, because a stable value was
+    // being mixed with a moving one. Naming the probe itself costs nothing and
+    // makes a stuck anchor's texel exactly constant.
+    If(valid.greaterThan(0.5).and(sticky.greaterThan(0.5)), () => {
+      prevProbe.assign(stickSrc);
+      bump(STATS.reprojHits, tx);
+    });
+    If(valid.greaterThan(0.5).and(sticky.lessThan(0.5)), () => {
       reprojFail.assign(1); // off screen until proven otherwise
       const c = u.prevViewProj.mul(vec4(pos, 1)).toVar();
       If(c.w.greaterThan(1e-4), () => {
@@ -1897,7 +2180,16 @@ export function createGiGather({
   // cell-boundary solve. On "behind a surface" or off-screen the walk hands the
   // ray to `traceWindow` at the LAST UNOCCLUDED position, never at the position
   // that failed — §L.2's step-back.
-  const screenSegment = (p0, dir, segLen, outHit, outRad, outDist, laneU) => {
+  //
+  // ⭐⭐ §19 STAGE 3.11 — AND IT NOW REPORTS WHETHER IT COULD SEE AT ALL.
+  // "No hit" and "could not look" are the same value in `outHit` and opposite
+  // facts: the first is the depth buffer VOUCHING that the ray's path is
+  // clear, the second is the walk having left the screen or been lost behind a
+  // surface thicker than `HZB_THICKNESS`. The contact rule below hands the
+  // window's authority away only on the first, so the two have to be told
+  // apart. `outSeen` is 1 only when the walk ran the whole segment — to a hit,
+  // or to `k = 1` — with both endpoints in front of the camera.
+  const screenSegment = (p0, dir, segLen, outHit, outRad, outDist, outSeen, laneU) => {
     const c0 = u.viewProj.mul(vec4(p0, 1)).toVar();
     const c1 = u.viewProj.mul(vec4(p0.add(dir.mul(segLen)), 1)).toVar();
     If(c0.w.greaterThan(1e-3).and(c1.w.greaterThan(1e-3)), () => {
@@ -1958,14 +2250,19 @@ export function createGiGather({
               const fy = uv.y.mul(u.heightF).floor().clamp(0, u.heightF.sub(1)).toInt().toVar();
               outRad.assign(litNode.load(ivec2(fx, fy)).xyz);
               outDist.assign(worldT(k));
+              outSeen.assign(1);
               bump(STATS.screenHits, laneU);
             });
+            // ⚠ THIS `Break` IS ALSO THE "LOST IT" EXIT. Falling out of the
+            // thickness test means the ray went behind a surface further than
+            // the depth buffer can account for — the walk did not finish the
+            // segment and has NOT vouched for anything. `outSeen` stays 0.
             Break();
           });
         }).Else(() => {
           k.assign(kNext);
           mip.assign(min(mip.add(1), float(HZB_MIPS - 1)));
-          If(kNext.greaterThanEqual(0.9999), () => { Break(); });
+          If(kNext.greaterThanEqual(0.9999), () => { outSeen.assign(1); Break(); });
         });
       });
 
@@ -2060,8 +2357,46 @@ export function createGiGather({
     // basis by less than half a texel — and that residual is the very thing the
     // 4×4 lattice decorrelates. Setting `probeDither = 0` restores exact
     // centres and is the arm every number above was measured on.
-    const jx = mix(float(0.5), bitAnd(tx, uint(3)).toFloat().add(0.5).div(4), u.probeDither).toVar();
-    const jy = mix(float(0.5), bitAnd(ty, uint(3)).toFloat().add(0.5).div(4), u.probeDither).toVar();
+    //
+    // ⭐⭐⭐ §19 STAGE 3.11a — AND THE KEY IS THE WORLD CELL, NOT THE TILE.
+    //
+    // "Constant in time" was true of a PARKED camera and false of a moving
+    // one, and that qualification is the user's grain. The probe grid is a
+    // SCREEN grid: as the camera turns, the world point a probe stands on is
+    // covered by tile `(tx, ty)` on one frame and by `(tx±1, ty±1)` on the
+    // next, so its sub-texel offset — and therefore all 64 of its ray
+    // DIRECTIONS — change every frame. The value that comes back changes by
+    // the quantization step, in whichever direction the new offset happens to
+    // land, and `octAlpha`'s blend against the reprojected previous texel then
+    // averages two differently-quantized estimates of the same direction. That
+    // is a per-frame re-quantization, it ALTERNATES (a shifted tile shifts
+    // back), and an alternating error is exactly what the sign receipt calls
+    // noise: 3.10's own orbit arm reported 27 % flips against 0 % at rest.
+    //
+    // So the lattice is keyed to the probe's WORLD POSITION, quantized to
+    // `DITHER_CELL` (half a level-0 cell) and hashed to one of the sixteen
+    // points. A world point then gets the SAME sixteenth of a texel however
+    // the camera looks at it, which is what makes the offset a property of the
+    // scene instead of a property of the frame — and the neighbour
+    // decorrelation the 5×5 SH filter integrates survives, because two probes
+    // a tile apart still land in different cells at any useful depth.
+    //
+    // ⚠ IT IS A HASH AND STILL NOT A RANDOM NUMBER. `pcg` here is a fixed
+    // function of a quantized world coordinate: no frame, no probe index, no
+    // seed. The same point returns the same offset forever, which is the §T
+    // contract's whole demand. `ditherWorld = 0` is 3.10's grid key, kept as
+    // the arm the receipt is read against.
+    const qcell = ma.xyz.div(v0 * DITHER_CELL_FRAC).add(float(1 << 14)).floor().toVar();
+    const qh = pcg(
+      qcell.x.toUint().mul(uint(73856093))
+        .add(qcell.y.toUint().mul(uint(19349663)))
+        .add(qcell.z.toUint().mul(uint(83492791))),
+    ).toVar();
+    const lx = mix(bitAnd(tx, uint(3)).toFloat(), bitAnd(qh, uint(3)).toFloat(), u.ditherWorld).toVar();
+    const ly = mix(bitAnd(ty, uint(3)).toFloat(),
+      bitAnd(shiftRight(qh, uint(2)), uint(3)).toFloat(), u.ditherWorld).toVar();
+    const jx = mix(float(0.5), lx.add(0.5).div(4), u.probeDither).toVar();
+    const jy = mix(float(0.5), ly.add(0.5).div(4), u.probeDither).toVar();
     const dir = octDirJit(
       bitAnd(texel, uint(O - 1)).toFloat(), shiftRight(texel, uint(OCT_SHIFT)).toFloat(), jx, jy,
     ).toVar();
@@ -2112,13 +2447,98 @@ export function createGiGather({
     const sHit = float(0).toVar();
     const sRad = vec3(0).toVar();
     const sDist = float(RAY_MAX).toVar();
+    const sSeen = float(0).toVar();
     const contact = r.x.greaterThan(0.5).and(r.y.lessThan(v0 * CONTACT_CELLS)).toVar();
     If(u.hzbOn.greaterThan(0.5).and(contact), () => {
-      screenSegment(pos.add(nrm.mul(v0 * 0.5)), dir, r.y.add(v0), sHit, sRad, sDist, xr);
+      screenSegment(pos.add(nrm.mul(v0 * 0.5)), dir, r.y.add(v0), sHit, sRad, sDist, sSeen, xr);
     });
+    const sRaw = sHit.toVar();
     sHit.assign(select(
-      sHit.greaterThan(0.5).and(sDist.sub(r.y).abs().lessThan(v0)), float(1), float(0),
+      sRaw.greaterThan(0.5).and(sDist.sub(r.y).abs().lessThan(v0)), float(1), float(0),
     ));
+
+    // ══ ⭐⭐⭐ §19 STAGE 3.11 — AUTHORITY IN THE CONTACT BAND ════════════════
+    //
+    // THE BLACK BLOBS. After 3.9 the metre-wide blotches are gone and what is
+    // left sits at junctions of geometry FINER THAN A VOXEL: a door panel
+    // inside its frame, the recess around it, the foot of a planter, a cable
+    // against a wall. The mechanism is the conservative voxelization's own
+    // thickness. A probe standing on a 3 cm-deep panel shoots sideways and
+    // lands in the DILATED cell of the frame member 5 cm away — the window
+    // answers "occluded at half a cell" where the true surface is centimetres
+    // off and the hemisphere is genuinely open — and 3.3's screen segment
+    // could not overrule it, because it only ever ACCEPTED a screen hit that
+    // AGREED with the window. Disagreement — the depth buffer saying the space
+    // is clear where the window says it is solid — was thrown away, and that
+    // is exactly the evidence this fault produces.
+    //
+    // So in the first two cells the authority is the screen's, and only where
+    // the screen has actually LOOKED:
+    //
+    //   · the walk ran the whole segment (`sSeen`) and found NOTHING
+    //     (`sRaw = 0`) → the depth buffer has vouched that the ray's path is
+    //     clear to the window's hit, so the hit is a dilation artefact: the
+    //     trace CONTINUES from `t + 1 cell` and the ray reports what is
+    //     really there.
+    //   · the walk could not look (off-screen, or lost behind a surface
+    //     thicker than the HZB can account for) → the near hit keeps a
+    //     distance-weighted share of its occlusion, `w = smoothstep(0,
+    //     2·v_l, t)`, and the rest of the ray's radiance comes from what is
+    //     CACHED beyond the hit.
+    //
+    // ⭐⭐ AND THE SOFT BRANCH READS THE CACHE ONLY — NEVER THE SKY, NEVER A
+    // FRESH SHADE. That single restriction is what makes the branch unable to
+    // leak. The outside faces of a sealed wall are seen by no pixel and shaded
+    // by no ray, so their cache is zero: a soft ray that passes through a real
+    // 5 cm wall collects `(1−w) × 0` and gets DARKER, while a soft ray through
+    // a real opening collects the far surfaces the cache already holds. The
+    // failure mode of the approximation points away from the leak, which is
+    // the property a conservative structure has to keep. It is also why the
+    // soft branch costs one buffer read and not a second `shadeHit` —
+    // `probeTrace` is 53 kB of WGSL and a second copy of that estimator is
+    // the compile budget, not a detail.
+    const bandM = float(v0 * CONTACT_AUTH_CELLS);
+    const inBand = u.contactOn.greaterThan(0.5)
+      .and(r.x.greaterThan(0.5)).and(r.y.lessThan(bandM)).and(sHit.lessThan(0.5)).toVar();
+    const vouched = sSeen.greaterThan(0.5).and(sRaw.lessThan(0.5))
+      .or(u.contactForce.greaterThan(0.5)).toVar();
+    const contStart = r.y.add(v0).toVar();
+    const rc = vec4(0).toVar();
+    If(inBand, () => {
+      bump(STATS.contactBand, xr);
+      If(sSeen.greaterThan(0.5), () => { bump(STATS.contactSeen, xr); });
+      // ⚠ THE CONTINUATION'S "NORMAL" IS THE RAY'S OWN DIRECTION. `traceWindow`
+      // uses it for the bias and for the escape, and walking the origin FORWARD
+      // by whole cells while it is inside occupancy is exactly what has to
+      // happen here: the origin starts one cell past a hit that may itself be a
+      // dilated shell, and the escape is what carries it out of the rest of it.
+      rc.assign(traceWindow(pos.add(dir.mul(contStart)), dir,
+        float(RAY_MAX).sub(contStart), dir).raw);
+    });
+    const takeCont = inBand.and(vouched).toVar();
+    If(takeCont, () => { bump(STATS.contactCont, xr); });
+    // The effective hit the full evaluation below runs on.
+    const rEff = vec4(
+      select(takeCont, rc.x, r.x),
+      select(takeCont, rc.y.add(contStart), r.y),
+      select(takeCont, rc.z, r.z),
+      r.w,
+    ).toVar();
+    // The soft branch: `w` on the near hit's occlusion, and the cached
+    // radiance beyond it for the rest.
+    const sm = r.y.div(bandM).clamp(0, 1).toVar();
+    const softW = select(inBand.and(vouched.not()),
+      sm.mul(sm).mul(float(3).sub(sm.mul(2))), float(1)).toVar();
+    const softL = vec3(0).toVar();
+    If(inBand.and(vouched.not()).and(rc.x.greaterThan(0.5)), () => {
+      const zc = rc.z.toUint().toVar();
+      const eF = bitAnd(zc, uint(7)).toFloat().toVar();
+      const lF = bitAnd(shiftRight(zc, uint(3)), uint(7)).toFloat().toVar();
+      const vF = shiftRight(zc, uint(6)).toFloat().toVar();
+      const fF = dominantFace(lF, vF, eF, dir.negate()).toVar();
+      const cc = cache.cacheRead(lF, vF, fF).toVar();
+      softL.assign(cc.xyz.mul(select(cc.w.greaterThan(0.5), float(1), float(0))));
+    });
 
     // ── the radiance: the screen's own pixel, or the hit voxel's cache face ─
 
@@ -2129,8 +2549,13 @@ export function createGiGather({
       rad.assign(sRad);
       hitDist.assign(sDist);
     }).Else(() => {
-      const zi = r.z.toUint().toVar();
-      If(r.x.greaterThan(0.5), () => {
+      // ⚠ `rEff`, NOT `r` — see the contact rule above. Everything below reads
+      // the EFFECTIVE hit and nothing below knows whether it is the window's
+      // first hit or the continuation past a dilated one, which is the point:
+      // the slot, the shade point, the re-shade and the distance move together
+      // or the cache is fed from one surface and read at another.
+      const zi = rEff.z.toUint().toVar();
+      If(rEff.x.greaterThan(0.5), () => {
         const entryF = bitAnd(zi, uint(7)).toFloat().toVar();
         const levelF = bitAnd(shiftRight(zi, uint(3)), uint(7)).toFloat().toVar();
         const voxF = shiftRight(zi, uint(6)).toFloat().toVar();
@@ -2195,12 +2620,16 @@ export function createGiGather({
             bump(STATS.freshShades, xr);
           }).Else(() => { bump(STATS.reShades, xr); });
         });
-        hitDist.assign(r.y);
+        hitDist.assign(rEff.y);
         bump(STATS.windowHits, xr);
       }).Else(() => {
         rad.assign(u.skyColor);
         bump(STATS.skyMiss, xr);
       });
+      // The soft branch's mix. `softW` is 1 on every ray the contact rule did
+      // not touch, so this line is the identity everywhere else — including on
+      // the screen-hit path above, which `inBand` excludes by construction.
+      rad.assign(rad.mul(softW).add(softL.mul(float(1).sub(softW))));
     });
 
     // ── §19 STAGE 3.10: A FIXED-α BLEND, AND NOTHING ELSE ─────────────────
@@ -3018,6 +3447,79 @@ export function createGiGather({
     dirtyBuf.element(gy.mul(u.halfWU).add(gx)).assign(vec4(clipW, n0.y, g.y, g.w));
   })().compute(dispatch2d(halfW, halfH), WG);
 
+  // ══════════════════════════════════ SHADER: reprojDump (§19 3.11a)
+  //
+  // ⭐⭐ THE MOVING RECEIPT COMPARES A SURFACE POINT TO ITSELF, NOT A SCREEN
+  // PIXEL TO ITSELF. See `reprojBuf`. Both halves of `motionLum` are written
+  // and read by this one kernel: `curBase` takes this frame's luminance,
+  // `prevBase` still holds the previous frame's, and the reprojection reads
+  // the previous half at the pixel this surface point occupied THEN.
+  const reprojDumpPass = !wantNoise ? null : Fn(() => {
+    const gx = globalId.x.toVar();
+    const gy = globalId.y.toVar();
+    If(gx.greaterThanEqual(u.halfWU).or(gy.greaterThanEqual(u.halfHU)), () => { Return(); });
+    const i = gy.mul(u.halfWU).add(gx).toVar();
+    const half = u.halfWU.mul(u.halfHU).toVar();
+    const px = gx.mul(uint(2)).toVar();
+    const py = gy.mul(uint(2)).toVar();
+    const g = loadPos(px.toInt(), py.toInt()).toVar();
+    const LUMA = vec3(0.2126, 0.7152, 0.0722);
+    const here = dot(irrNode.load(ivec2(px.toInt(), py.toInt())).xyz, LUMA).toVar();
+    motionLum.element(u.curBase.mul(half).add(i)).assign(here);
+
+    const there = float(0).toVar();
+    // ⚠ THE SOURCE PIXEL'S INDEX, NOT A VALIDITY FLAG. The sign census has to
+    // follow the SURFACE POINT across frames — `sign(Δ_k)` at this pixel
+    // against `sign(Δ_{k−1})` at the pixel this point occupied then — and a
+    // boolean cannot carry that. −1 is "the reprojection missed".
+    const src = float(-1).toVar();
+    const c = u.prevViewProj.mul(vec4(g.xyz, 1)).toVar();
+    If(g.w.greaterThan(0.5).and(c.w.greaterThan(1e-4)), () => {
+      const sx = c.x.div(c.w).mul(0.5).add(0.5).toVar();
+      const sy = float(1).sub(c.y.div(c.w).mul(0.5).add(0.5)).toVar();
+      If(sx.greaterThanEqual(0).and(sx.lessThan(1)).and(sy.greaterThanEqual(0)).and(sy.lessThan(1)), () => {
+        // ⭐⭐ BILINEAR, AND THAT IS THE INSTRUMENT'S OWN BLIND-STATISTICS
+        // CHECK. A surface point's previous screen position is not a pixel
+        // centre; snapping it to the nearest one reads the previous frame's
+        // irradiance up to half a pixel AWAY, and on any field with spatial
+        // structure that sampling error lands in Δ and is then reported as the
+        // estimator rattling. Measured: nearest-neighbour put the orbit's pixel
+        // Δp95 at 11.01 % where the bilinear read of the SAME frames puts it
+        // far lower — most of what the first cut of this receipt called grain
+        // was the receipt's own `floor()`.
+        // ⚠ THE HALF-RES INDEX COMES FROM THE **FULL-RES** PIXEL THIS THREAD
+        // READ. Slot `gx` samples the gbuffer at full-res pixel `2gx`, whose
+        // screen coordinate is `(2gx+0.5)/W` — not `(gx+0.5)/halfW`. Mapping
+        // through `halfW` puts a quarter-pixel bias on every tap, and at rest,
+        // where the answer must be exact, it made the receipt report 1.39 %
+        // of motion on a frame that had not moved at all.
+        const fx = sx.mul(u.widthF).sub(0.5).mul(0.5).toVar();
+        const fy = sy.mul(u.heightF).sub(0.5).mul(0.5).toVar();
+        const x0 = fx.floor().toVar();
+        const y0 = fy.floor().toVar();
+        const ax = fx.sub(x0).toVar();
+        const ay = fy.sub(y0).toVar();
+        const cx0 = x0.clamp(0, u.halfWU.toFloat().sub(1)).toUint().toVar();
+        const cy0 = y0.clamp(0, u.halfHU.toFloat().sub(1)).toUint().toVar();
+        const cx1 = x0.add(1).clamp(0, u.halfWU.toFloat().sub(1)).toUint().toVar();
+        const cy1 = y0.add(1).clamp(0, u.halfHU.toFloat().sub(1)).toUint().toVar();
+        const base = u.prevBase.mul(half).toVar();
+        const t00 = motionLum.element(base.add(cy0.mul(u.halfWU)).add(cx0)).toVar();
+        const t10 = motionLum.element(base.add(cy0.mul(u.halfWU)).add(cx1)).toVar();
+        const t01 = motionLum.element(base.add(cy1.mul(u.halfWU)).add(cx0)).toVar();
+        const t11 = motionLum.element(base.add(cy1.mul(u.halfWU)).add(cx1)).toVar();
+        there.assign(mix(mix(t00, t10, ax), mix(t01, t11, ax), ay));
+        // The SIGN census still needs one integer identity for the surface
+        // point, and the nearest tap is the honest one: it names the pixel this
+        // point most belonged to, and a sign carried through it is carried
+        // through the same trajectory the bilinear value follows.
+        src.assign(cy0.add(ay.round().toUint()).min(u.halfHU.sub(uint(1)))
+          .mul(u.halfWU).add(cx0.add(ax.round().toUint()).min(u.halfWU.sub(uint(1)))).toFloat());
+      });
+    });
+    reprojBuf.element(i).assign(vec4(here, there, src, g.w));
+  })().compute(dispatch2d(halfW, halfH), WG);
+
   // ══════════════════════════════════════════════ SHADER: shadeHit, exposed
   //
   // ⭐ THE ONE STAGE A CROP CANNOT SEE. Every crop in the receipts sits on a
@@ -3140,9 +3642,10 @@ export function createGiGather({
     const sHit = float(0).toVar();
     const sRad = vec3(0).toVar();
     const sDist = float(RAY_MAX).toVar();
+    const sSeen = float(0).toVar();
     const contact = r.x.greaterThan(0.5).and(r.y.lessThan(v0 * CONTACT_CELLS)).toVar();
     If(u.hzbOn.greaterThan(0.5).and(contact), () => {
-      screenSegment(pos.add(nrm.mul(v0 * 0.5)), dir, r.y.add(v0), sHit, sRad, sDist, xr);
+      screenSegment(pos.add(nrm.mul(v0 * 0.5)), dir, r.y.add(v0), sHit, sRad, sDist, sSeen, xr);
     });
     If(r.x.greaterThan(0.5), () => { Return(); });
 
@@ -3161,6 +3664,59 @@ export function createGiGather({
     exhaustOut.element(base.add(uint(3))).assign(vec4(pos.add(dir.mul(RAY_MAX)), r.y));
 
   })().compute(dispatch2d(probeW * RAY_FRESH, probeH), WG);
+
+  // ══════════════════════ SHADER: contactRay (§19 3.11's leak gate)
+  //
+  // ⭐⭐ THE OLD LEAK TEST COULD NOT SEE THE CONTACT RULE, AND WOULD HAVE
+  // PASSED BLIND. `gi2-gather.html`'s 10 000-ray receipt calls `traceWindow`
+  // directly, and the rule lives one level ABOVE that call — so its 0/10 000
+  // says the DDA still blocks and says nothing whatever about whether the
+  // continuation walks through a 5 cm wall. This pass is the shipped decision,
+  // exposed on rays the page chooses: the same window trace, the same screen
+  // segment, the same `sSeen`/`vouched` test, the same continuation. A ray
+  // "escapes" when the rule DISCARDED its hit and the continuation found
+  // nothing — and a wall is the one surface that must never be discarded.
+  //
+  // Bindings: window, hzb, contactIn, contactOut, stats = 5.
+  const contactRayPass = !wantContact ? null : Fn(() => {
+    const i = instanceIndex.toVar();
+    const a0 = contactIn.element(i.mul(uint(2))).toVar();
+    const a1 = contactIn.element(i.mul(uint(2)).add(uint(1))).toVar();
+    const o = a0.xyz.toVar();
+    const d = a1.xyz.toVar();
+    const tMax = a0.w.toVar();
+    const r = traceWindow(o, d, tMax, vec3(0, 0, 0)).raw.toVar();
+    const sHit = float(0).toVar();
+    const sRad = vec3(0).toVar();
+    const sDist = float(RAY_MAX).toVar();
+    const sSeen = float(0).toVar();
+    If(u.hzbOn.greaterThan(0.5).and(r.x.greaterThan(0.5))
+      .and(r.y.lessThan(v0 * CONTACT_CELLS)), () => {
+      screenSegment(o, d, r.y.add(v0), sHit, sRad, sDist, sSeen, i);
+    });
+    const agree = sHit.greaterThan(0.5).and(sDist.sub(r.y).abs().lessThan(v0)).toVar();
+    const inBand = u.contactOn.greaterThan(0.5).and(r.x.greaterThan(0.5))
+      .and(r.y.lessThan(v0 * CONTACT_AUTH_CELLS)).and(agree.not()).toVar();
+    const vouched = sSeen.greaterThan(0.5).and(sHit.lessThan(0.5))
+      .or(u.contactForce.greaterThan(0.5)).toVar();
+    const take = inBand.and(vouched).toVar();
+    const contStart = r.y.add(v0).toVar();
+    const rc = vec4(0).toVar();
+    If(take, () => {
+      rc.assign(traceWindow(o.add(d.mul(contStart)), d, tMax.sub(contStart), d).raw);
+    });
+    contactOut.element(i).assign(vec4(
+      select(take, rc.x, r.x),
+      select(take, rc.y.add(contStart), r.y),
+      // bit 0 the rule fired, bit 1 the band, bit 2 the screen saw it,
+      // bit 3 the screen vouched — one word, so a page can census the WHY.
+      select(take, float(1), float(0))
+        .add(select(inBand, float(2), float(0)))
+        .add(select(sSeen.greaterThan(0.5), float(4), float(0)))
+        .add(select(vouched, float(8), float(0))),
+      r.y,
+    ));
+  })().compute(CONTACT_RAYS);
 
   // ══════════════════════════════════════════════ SHADER: cold-start clears
   const clearProbesPass = Fn(() => {
@@ -3229,9 +3785,10 @@ export function createGiGather({
     uniforms: u, palette, paletteEmissive, setPalette, beginFrame, get frame() { return frame; },
     buffers: {
       probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf,
-      shadeIn, shadeOut, exhaustOut, noiseBuf, dirtyBuf,
+      shadeIn, shadeOut, exhaustOut, noiseBuf, dirtyBuf, reprojBuf, motionLum,
+      contactIn, contactOut,
     },
-    SHADE_SLOTS, EXHAUST_SLOTS, EXH_VEC,
+    SHADE_SLOTS, EXHAUST_SLOTS, EXH_VEC, CONTACT_RAYS,
     textures: { irradiance, glossy, lit, irradianceHalf, glossyHalf },
     passes: {
       hzbBuild: hzbBuildPass,
@@ -3258,6 +3815,10 @@ export function createGiGather({
       inject: injectPass,
       crop: cropPass,
       noiseDump: noiseDumpPass,
+      /** §19 3.11a's moving receipt — see `reprojBuf`. Harness only. */
+      reprojDump: reprojDumpPass,
+      /** §19 3.11's leak gate — see `contactRayPass`. Harness only. */
+      contactRay: contactRayPass,
       shadeProbe: shadeProbePass,
       exhaustProbe: exhaustProbePass,
       clearProbes: clearProbesPass,
