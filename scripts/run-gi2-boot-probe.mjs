@@ -560,9 +560,15 @@ async function facadeBrickSpread(pose) {
     const words = new Uint32Array(await eng.renderer.getArrayBufferAsync(gi2.cache.attribute));
     const off = gi2.cache.describe().offsets;
     const lum = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-    const cvs = []; const ns = [];
+    const cvs = []; const ns = []; const means = [];
     const seen = new Set();
     let bricks = 0;
+    const ws = await import("/src/modules/gi/window/windowStore.js");
+    const winW = new Uint32Array(await eng.renderer.getArrayBufferAsync(gi2.win.attribute));
+    const dAir = []; const dWall = []; const dOpen = []; const dBuried = []; const dOpenCls = [];
+    const airFrac = []; const buriedFrac = []; const buriedRatio = []; const clsPerSlab = [];
+    let allBits = 0; let fullBits = 0;
+    const push = (arr, q) => { if (q) arr.push(q.cv); };
     for (const h of hits) {
       if (!h.hit || h.level !== 0) continue;
       const face = h.faceId;
@@ -587,10 +593,35 @@ async function facadeBrickSpread(pose) {
       const axis = face >> 1; // 0 = ±X, 1 = ±Y, 2 = ±Z
       const key3 = [cx & 3, cy & 3, cz & 3][axis];
       const vals = []; const counts = [];
+      // ⭐⭐ §19 STAGE 3.8's DECOMPOSITION — the same 16 voxels, split by the
+      // three things that can differ between two patches of one wall: the
+      // PALETTE CLASS (a second material inside the brick), the OCCUPANCY of
+      // the cell the face's own shade point falls in (a face buried in the far
+      // half of a two-cell-thick conservative wall shades from INSIDE the
+      // wall), and whether the voxel is a wall at all. Whatever the spread
+      // SURVIVES is the estimator's; the rest is the scene's, or the
+      // addressing's.
+      const rows = [];
+      const occAt = (x, y, z) => {
+        const i = (x & 63) | ((y & 63) << 6) | ((z & 63) << 12);
+        return (winW[ws.OCC_OFF + (i >> 5)] >>> (i & 31)) & 1;
+      };
+      const nOf = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]][face];
       for (let lv = 0; lv < 64; lv++) {
         const l3 = [lv & 3, (lv >> 2) & 3, (lv >> 4) & 3];
         if (l3[axis] !== key3) continue;
         const rgb = rc.unpackRgbe(words[off.DATA_OFF + slot * 384 + lv * 6 + face]);
+        const wcx = ((cx >> 2) << 2) | l3[0];
+        const wcy = ((cy >> 2) << 2) | l3[1];
+        const wcz = ((cz >> 2) << 2) | l3[2];
+        const wvi = wcx | (wcy << 6) | (wcz << 12);
+        rows.push({
+          lv, rgb,
+          occ: occAt(wcx, wcy, wcz),
+          buried: occAt(wcx + nOf[0], wcy + nOf[1], wcz + nOf[2]),
+          pal: (winW[ws.PAL_OFF + (wvi >> 2)] >>> ((wvi & 3) * 8)) & 255,
+          bits: (winW[ws.FACE_OFF + (wvi >> 2)] >>> ((wvi & 3) * 8)) & 255,
+        });
         if (!rgb) continue;
         vals.push(lum(rgb));
         if (gi2.cache.readCount) counts.push(gi2.cache.readCount(words, slot, lv, face));
@@ -600,12 +631,52 @@ async function facadeBrickSpread(pose) {
       const mean = vals.reduce((a, x) => a + x, 0) / vals.length;
       const sd = Math.sqrt(vals.reduce((a, x) => a + (x - mean) ** 2, 0) / vals.length);
       cvs.push((100 * sd) / Math.max(1e-9, mean));
+      means.push(mean);
       if (counts.length) ns.push(counts.reduce((a, x) => a + x, 0) / counts.length);
+      {
+        const cvOf = (a) => {
+          if (a.length < 5) return null;
+          const m = a.reduce((x, y) => x + y, 0) / a.length;
+          const v = Math.sqrt(a.reduce((x, y) => x + (y - m) ** 2, 0) / a.length);
+          return { cv: (100 * v) / Math.max(1e-9, m), mean: m };
+        };
+        const L = (r) => lum(r.rgb);
+        const lit = rows.filter((r) => r.rgb);
+        const air = lit.filter((r) => !r.occ);
+        const wall = lit.filter((r) => r.occ);
+        const open = wall.filter((r) => !r.buried);
+        const bur = wall.filter((r) => r.buried);
+        push(dAir, cvOf(air.map(L))); push(dWall, cvOf(wall.map(L)));
+        push(dOpen, cvOf(open.map(L))); push(dBuried, cvOf(bur.map(L)));
+        if (lit.length) airFrac.push(air.length / lit.length);
+        if (wall.length) buriedFrac.push(bur.length / wall.length);
+        const so = cvOf(open.map(L)); const sb = cvOf(bur.map(L));
+        if (so && sb) buriedRatio.push(sb.mean / Math.max(1e-9, so.mean));
+        const byCls = new Map();
+        for (const r of open) { if (!byCls.has(r.pal)) byCls.set(r.pal, []); byCls.get(r.pal).push(L(r)); }
+        const big = [...byCls.values()].sort((a, b) => b.length - a.length)[0] ?? [];
+        push(dOpenCls, cvOf(big));
+        clsPerSlab.push(new Set(wall.map((r) => r.pal)).size);
+        for (const r of wall) { allBits++; if (r.bits === 63) fullBits++; }
+      }
     }
     const med = (a) => (a.length ? [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)] : null);
     return {
       bricks, cvMedian: med(cvs), cvMin: cvs.length ? Math.min(...cvs) : null,
       cvMax: cvs.length ? Math.max(...cvs) : null, samplesMedian: med(ns),
+      // ⭐⭐ A σ/mean OF 0 IS EITHER A PERFECT SURFACE OR AN EMPTY ONE, and this
+      // gate has already reported the second as a PASS: a run whose façade
+      // slabs read all-zero printed "cache spread 0.0 % PASS" with 9.2 samples
+      // per face and a DIRT receipt that said ⚠ BLIND in the line above it. A
+      // coefficient of variation divides the spread away along with the signal,
+      // so the gate has to see the MEAN too — [[probe-blind-statistics]]: before
+      // believing a null, ask whether the instrument could see its subject.
+      cvMeanMedian: med(means),
+      dAir: med(dAir), dWall: med(dWall), dOpen: med(dOpen), dBuried: med(dBuried),
+      dOpenCls: med(dOpenCls), airFrac: med(airFrac), buriedFrac: med(buriedFrac),
+      buriedRatio: med(buriedRatio), clsPerSlab: med(clsPerSlab),
+      fullBitsPct: allBits ? (100 * fullBits) / allBits : null,
+      nOpen: dOpen.length, nBuried: dBuried.length, nOpenCls: dOpenCls.length,
     };
   }, { pose });
 }
@@ -1332,12 +1403,18 @@ for (const name of SCENES) {
           const bs = await facadeBrickSpread(pose);
           if (bs?.error) console.log(`   ${" ".repeat(16)} brick spread: ${bs.error}`);
           else {
+            console.log(`   ${" ".repeat(16)} §3.8 SPLIT — air ${bs.dAir?.toFixed(0) ?? "—"} % (${(100 * bs.airFrac).toFixed(0)} % of words) · ` +
+              `wall ${bs.dWall?.toFixed(0) ?? "—"} % · BURIED ${bs.dBuried?.toFixed(0) ?? "—"} % ` +
+              `(${(100 * bs.buriedFrac).toFixed(0)} % of wall, ${bs.buriedRatio?.toFixed(2) ?? "—"}× open) · ` +
+              `OPEN ${bs.dOpen?.toFixed(0) ?? "—"} % · OPEN+1class ${bs.dOpenCls?.toFixed(0) ?? "—"} % ` +
+              `[${bs.clsPerSlab} classes/slab, ${bs.fullBitsPct?.toFixed(0)} % of wall voxels carry all 6 face bits]`);
             console.log(`   ${" ".repeat(16)} §P.1 CACHE SPREAD across the 16 voxel faces of a brick's wall slab: ` +
               `${bs.bricks} bricks, σ/mean median ${bs.cvMedian?.toFixed(1)} % ` +
               `(${bs.cvMin?.toFixed(1)}-${bs.cvMax?.toFixed(1)} %), ` +
               `median samples per face ${bs.samplesMedian?.toFixed(1) ?? "n/a"}`);
-            gate(name, "cache spread over a brick", bs.bricks >= 6 ? +(bs.cvMedian ?? 999).toFixed(1) : "BLIND",
-              40, bs.bricks >= 6 && (bs.cvMedian ?? 999) <= 40, "%");
+            const spreadBlind = !(bs.bricks >= 6) || !(bs.cvMeanMedian > 1e-4);
+            gate(name, "cache spread over a brick", spreadBlind ? "BLIND" : +(bs.cvMedian ?? 999).toFixed(1),
+              40, !spreadBlind && (bs.cvMedian ?? 999) <= 40, "%");
           }
           const orb = await orbitNoise(pose);
           if (orb?.error) console.log(`   ${" ".repeat(16)} orbit: ${orb.error}`);
