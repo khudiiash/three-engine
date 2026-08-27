@@ -58,6 +58,7 @@
         const fillMod = await import("/src/modules/gi/window/windowFill.js");
         const traceMod = await import("/src/modules/gi/window/windowTrace.js");
         const voxMod = await import("/src/modules/gi/window/windowVoxelize.js");
+        const dynMod = await import("/src/modules/gi/window/windowDynamic.js");
         const {
           ROOM, CORNELL_SCENE, analyticVoxel, KIND_BOX,
         } = fillMod;
@@ -362,6 +363,10 @@
           let starved = 0;
           let slotFull = 0;
           let cellOverflow = 0;
+          let dustVoxels = 0;
+          let resumed = 0;
+          let maxCursor = 0;
+          const dustPerLevel = new Array(win.levels).fill(0);
           let last = null;
           for (let f = 1; f <= maxFrames; f++) {
             for (const p of voxPasses) renderer.compute(p);
@@ -369,6 +374,10 @@
             last = s;
             peakBrickPairs = Math.max(peakBrickPairs, s.maxBrickPairs);
             deferred += s.deferred;
+            dustVoxels += s.dustVoxels;
+            resumed += s.resumed;
+            maxCursor = Math.max(maxCursor, s.maxCursor);
+            for (let l = 0; l < win.levels; l++) dustPerLevel[l] += s.perLevel[l].dust;
             for (let l = 0; l < win.levels; l++) {
               if (levelFrames[l] < 0 && s.perLevel[l].dirty === 0) levelFrames[l] = f - 1;
             }
@@ -387,7 +396,7 @@
           }
           return {
             frames, levelFrames, peakPairs, peakBrickPairs, deferred, overflowed, starved,
-            slotFull, cellOverflow, perFrame, last,
+            slotFull, cellOverflow, dustVoxels, dustPerLevel, resumed, maxCursor, perFrame, last,
           };
         };
 
@@ -411,6 +420,38 @@
             total += n;
           }
           return { per, total };
+        };
+
+        /** Occupancy bits that differ between two window readbacks, static levels. */
+        const occDiffBits = (a, b) => {
+          let diff = 0;
+          for (let l = 0; l < win.levels; l++) {
+            const base = l * store.LEVEL_WORDS + store.OCC_OFF;
+            for (let w = 0; w < store.OCC_WORDS; w++) {
+              let x = (a[base + w] ^ b[base + w]) >>> 0;
+              while (x) { diff += x & 1; x >>>= 1; }
+            }
+          }
+          return diff;
+        };
+
+        /**
+         * FNV-1a over a named region of every STATIC level.
+         *
+         * A hash and not a count: "the mover changed no static bit" has to fail
+         * on a bit that MOVED as well as on a bit that appeared, and a popcount
+         * is blind to the first. Used before/after the mover run.
+         */
+        const hashStatic = (buf, off, words) => {
+          let h = 0x811c9dc5;
+          for (let l = 0; l < win.levels; l++) {
+            const base = l * store.LEVEL_WORDS + off;
+            for (let w = 0; w < words; w++) {
+              h ^= buf[base + w];
+              h = Math.imul(h, 0x01000193) >>> 0;
+            }
+          }
+          return h >>> 0;
         };
 
         const results = { tier: TIER, storageLimit: lim.maxStorageBuffersPerShaderStage, timestamps, checks: {} };
@@ -448,6 +489,47 @@
           if (occ.total < 1000) throw new Error(`the triangle voxelizer produced ${occ.total} occupied voxels`);
           if (roomBuild.starved) throw new Error(`${roomBuild.starved} bricks need more pairs than the whole cap`);
           if (roomBuild.cellOverflow) throw new Error(`${roomBuild.cellOverflow} bricks exceeded the cell loop bound`);
+        }
+
+        // ═══════════════════════════ THE PER-LEVEL CULL (2.5 §1) — ROOM ARM
+        //
+        // The room is not where the cull earns its keep (552 triangles, two
+        // frames either way); it is where the cull has to prove it BREAKS
+        // NOTHING. The Cornell walls are 10 m triangles and are never dust at
+        // any level, but the sphere's ~0.11 m facets are dust from L1 up, so
+        // this arm is the one that says what the cull does to a surface made of
+        // small triangles — and checks (b) and (c) below then run WITH the cull
+        // on, which is where "0 leaks / hand-off unchanged" is actually gated.
+        {
+          vox.setCull(false);
+          await place([0, 0, 0]);
+          const off = await buildToClean([0, 0, 0]);
+          const offOcc = countOcc(await readWindow());
+          vox.setCull(true);
+          await place([0, 0, 0]);
+          const on = await buildToClean([0, 0, 0]);
+          const on1 = await readWindow();
+          const onOcc = countOcc(on1);
+          say(`cull room: OFF ${off.frames} frames (per level ${off.levelFrames.join("/")}), ` +
+            `${offOcc.total} occupied [${offOcc.per.join("/")}], ${off.peakPairs} peak pairs` +
+            `  |  ON ${on.frames} frames (per level ${on.levelFrames.join("/")}), ` +
+            `${onOcc.total} occupied [${onOcc.per.join("/")}], ${on.peakPairs} peak pairs, ` +
+            `${on.dustVoxels} dust writes [${on.dustPerLevel.join("/")}]`);
+          results.cullRoom = {
+            off: { frames: off.frames, levelFrames: off.levelFrames, occ: offOcc.per, peak: off.peakPairs },
+            on: {
+              frames: on.frames, levelFrames: on.levelFrames, occ: onOcc.per, peak: on.peakPairs,
+              dust: on.dustVoxels, dustPerLevel: on.dustPerLevel,
+            },
+            dustLimits: vd.dustLimits,
+          };
+          if (on.dustVoxels === 0) {
+            throw new Error(
+              "the cull wrote no dust voxel anywhere in the room — with the sphere's ~0.11 m facets and a " +
+              `threshold of ${vd.dustLimits.join("/")} m the routed path did not run, so every number below ` +
+              "that credits it is measuring the pair path under another name",
+            );
+          }
         }
 
         // ══════════════════════════════════════════════════ (a) wall distances
@@ -661,6 +743,67 @@
           say("overflow -> DIRTY carry-over: PASS (same window, more frames)");
         }
 
+        // ══════════════ THE RESUMABLE BRICK (2.5 §2) — A CAP BELOW ONE BRICK
+        //
+        // The arm above deliberately keeps its cap ABOVE `maxBrickPairs`,
+        // because before Stage 2.5 a cap below it could not converge: the
+        // biggest brick demanded more pairs than a whole frame, was rejected
+        // whole, and was rejected again forever. It was COUNTED (`starved`)
+        // rather than solved.
+        //
+        // This arm sets the cap BELOW that number on purpose. The receipt is
+        // three things at once: it converges at all, `resumed` is non-zero (so
+        // at least one brick really did carry a cursor across a frame boundary,
+        // rather than the cap turning out to be generous), and the window it
+        // converges to is BIT-IDENTICAL to the one-frame reference — which is
+        // the property that says the instalments composed instead of the last
+        // one winning.
+        {
+          const biggestBrick = refBuild.peakBrickPairs ?? 0;
+          const cap = Math.max(8, Math.floor(biggestBrick / 2));
+          vox.setPairLimit(cap);
+          await compute(win.clearStaticPass);
+          const resumeRun = await buildToClean([0, 0, 0]);
+          const resumeBuf = await readWindow();
+          const resumeOcc = countOcc(resumeBuf);
+          const occDiff = occDiffBits(refBuf, resumeBuf);
+          // The palette too: the pack is a MERGE precisely so a brick built over
+          // N frames lands on the byte a one-frame build produces, and a diff
+          // that only looked at `occ` would have been blind to the half of the
+          // change that lives in `pal`.
+          let palDiff = 0;
+          for (let l = 0; l < win.levels; l++) {
+            const base = l * store.LEVEL_WORDS + store.PAL_OFF;
+            for (let w = 0; w < store.PAL_WORDS; w++) if (refBuf[base + w] !== resumeBuf[base + w]) palDiff++;
+          }
+          vox.setPairLimit(vox.PAIRS_CAP);
+          say(`cursor arm: cap ${cap} < biggest brick ${biggestBrick} -> ${resumeRun.frames} frames ` +
+            `(vs ${refBuild.frames}), ${resumeRun.resumed} brick-resumptions, deepest cursor ` +
+            `${resumeRun.maxCursor}, ${resumeRun.starved} starved, ${resumeOcc.total} vs ${refOcc.total} ` +
+            `occupied, ${occDiff} occ bits differ, ${palDiff} pal words differ`);
+          results.cursor = {
+            cap, biggestBrick, frames: resumeRun.frames, framesFull: refBuild.frames,
+            resumed: resumeRun.resumed, maxCursor: resumeRun.maxCursor, starved: resumeRun.starved,
+            occ: resumeOcc.total, occFull: refOcc.total, occDiff, palDiff,
+          };
+          if (resumeRun.frames >= MAX_FRAMES) {
+            throw new Error(`a cap of ${cap} (below the biggest brick's ${biggestBrick}) never converged in ` +
+              `${MAX_FRAMES} frames — the cursor did not carry the brick`);
+          }
+          if (resumeRun.starved !== 0) {
+            throw new Error(`${resumeRun.starved} bricks were accepted and made no progress — the reserve's ` +
+              "invariant (accept implies take >= 1 or nothing left) is broken");
+          }
+          if (resumeRun.resumed === 0) {
+            throw new Error(`no brick resumed at cap ${cap} — either the cap was not below one brick's demand ` +
+              `(${biggestBrick}) or the cursor never engaged, and either way this arm proves nothing`);
+          }
+          if (occDiff !== 0) throw new Error(`the resumed build differs in ${occDiff} occupancy bits`);
+          if (palDiff !== 0) throw new Error(`the resumed build differs in ${palDiff} palette words`);
+          say(`resumable brick: PASS (cap ${cap} < one brick's ${biggestBrick}, ` +
+            `${resumeRun.resumed} resumptions, bit-identical occ + pal)`);
+        }
+
         // ═════════════════════════════ the palette, and its packed-atomic control
         {
           const legal = new Set([255, ...CORNELL_SCENE.map((p) => p.pal)]);
@@ -836,62 +979,392 @@
           await compute(rmark);
           for (const p of rpasses) await compute(p);
 
-          await place([0, 0, 0]);
-          rpasses = rvox.passes([0, 0, 0], null);
-          await compute(rmark);
-          const levelFrames = new Array(win.levels).fill(-1);
-          let frames = MAX_FRAMES;
-          let peakPairs = 0;
-          let peakBrickPairs = 0;
-          let totalPairs = 0;
-          let deferred = 0;
-          let overflowed = 0;
-          let starved = 0;
-          for (let f = 1; f <= MAX_FRAMES; f++) {
-            for (const p of rpasses) renderer.compute(p);
-            const s = await rvox.stats(renderer);
-            for (let l = 0; l < win.levels; l++) {
-              if (levelFrames[l] < 0 && s.perLevel[l].dirty === 0) levelFrames[l] = f - 1;
+          // ONE BUILD, run twice — cull OFF (Stage 2.3's voxelizer, reached by
+          // a uniform rather than by a checkout) and cull ON. Same adapter, same
+          // session, same soup upload, same pipelines: a frames-per-level table
+          // is a RATIO, and a ratio measured across two runs of a probe is a
+          // measurement of the GPU's mood.
+          const runRandom = async (cull) => {
+            rvox.setCull(cull);
+            await place([0, 0, 0]);
+            rpasses = rvox.passes([0, 0, 0], null);
+            await compute(rmark);
+            const levelFrames = new Array(win.levels).fill(-1);
+            const dustPerLevel = new Array(win.levels).fill(0);
+            let frames = MAX_FRAMES;
+            let peakPairs = 0;
+            let peakBrickPairs = 0;
+            let totalPairs = 0;
+            let deferred = 0;
+            let overflowed = 0;
+            let starved = 0;
+            let dustVoxels = 0;
+            let resumed = 0;
+            for (let f = 1; f <= MAX_FRAMES; f++) {
+              for (const p of rpasses) renderer.compute(p);
+              const s = await rvox.stats(renderer);
+              for (let l = 0; l < win.levels; l++) {
+                if (levelFrames[l] < 0 && s.perLevel[l].dirty === 0) levelFrames[l] = f - 1;
+                dustPerLevel[l] += s.perLevel[l].dust;
+              }
+              peakPairs = Math.max(peakPairs, s.pairsWritten);
+              peakBrickPairs = Math.max(peakBrickPairs, s.maxBrickPairs);
+              totalPairs += s.pairsWritten;
+              deferred += s.deferred;
+              overflowed += s.overflowed;
+              starved += s.starved;
+              dustVoxels += s.dustVoxels;
+              resumed += s.resumed;
+              if (s.dirty === 0) { frames = f - 1; break; }
             }
-            peakPairs = Math.max(peakPairs, s.pairsWritten);
-            peakBrickPairs = Math.max(peakBrickPairs, s.maxBrickPairs);
-            totalPairs += s.pairsWritten;
-            deferred += s.deferred;
-            overflowed += s.overflowed;
-            starved += s.starved;
-            if (s.dirty === 0) { frames = f - 1; break; }
-          }
-          const rbuf = await readWindow();
-          const rocc = countOcc(rbuf);
-          say(`random build: ${frames} frames to 0 dirty (per level ${levelFrames.join("/")}), ` +
-            `${rocc.total} occupied [${rocc.per.join("/")}], peak ${peakPairs} pairs/frame, ` +
-            `${overflowed} brick-overflows, ${deferred} deferred, ` +
-            `biggest brick ${peakBrickPairs} pairs, ${starved} starved, ` +
-            `${totalPairs} (brick, tri) pairs of SAT in total`);
+            const occ = countOcc(await readWindow());
 
-          // The timed re-run, with no readback in the loop.
-          await place([0, 0, 0]);
-          rpasses = rvox.passes([0, 0, 0], null);
-          await compute(rmark);
-          if (timestamps) await renderer.resolveTimestampsAsync("compute");
-          const w0 = performance.now();
-          for (let f = 0; f < Math.max(4, frames); f++) for (const p of rpasses) renderer.compute(p);
-          await device.queue.onSubmittedWorkDone();
-          const wallMs = performance.now() - w0;
-          const gpuMs = timestamps ? ((await renderer.resolveTimestampsAsync("compute")) ?? 0) : null;
-          const nf = Math.max(4, frames);
-          results.random = {
-            triangles: rgrid.triCount, listings: rgrid.entries, cpuBuildMs: +cpuMs.toFixed(0),
-            frames, levelFrames, occupied: rocc.total, occPerLevel: rocc.per, peakPairs,
-            peakBrickPairs, totalPairs, deferred, overflowed, starved,
-            gpuMsPerFrame: gpuMs == null ? null : +(gpuMs / nf).toFixed(4),
-            wallMsPerFrame: +(wallMs / nf).toFixed(4),
-            secondsToFull: +((nf * (gpuMs == null ? wallMs / nf : gpuMs / nf)) / 1000).toFixed(3),
+            // The timed re-run of the SAME build, with no readback in the loop.
+            await place([0, 0, 0]);
+            rpasses = rvox.passes([0, 0, 0], null);
+            await compute(rmark);
+            if (timestamps) await renderer.resolveTimestampsAsync("compute");
+            const w0 = performance.now();
+            const nf = Math.max(4, frames);
+            for (let f = 0; f < nf; f++) for (const p of rpasses) renderer.compute(p);
+            await device.queue.onSubmittedWorkDone();
+            const wallMs = performance.now() - w0;
+            const gpuMs = timestamps ? ((await renderer.resolveTimestampsAsync("compute")) ?? 0) : null;
+            return {
+              cull, frames, levelFrames, occupied: occ.total, occPerLevel: occ.per,
+              peakPairs, peakBrickPairs, totalPairs, deferred, overflowed, starved,
+              dustVoxels, dustPerLevel, resumed,
+              gpuMsPerFrame: gpuMs == null ? null : +(gpuMs / nf).toFixed(4),
+              wallMsPerFrame: +(wallMs / nf).toFixed(4),
+              secondsToFull: +((nf * (gpuMs == null ? wallMs / nf : gpuMs / nf)) / 1000).toFixed(3),
+            };
           };
-          say(`random timing: gpu ${results.random.gpuMsPerFrame ?? "n/a"} ms/frame, ` +
-            `wall ${results.random.wallMsPerFrame} ms/frame over ${nf} frames`);
-          if (starved) say(`  WARNING: ${starved} bricks need more pairs than the whole cap`);
+
+          const noCull = await runRandom(false);
+          const withCull = await runRandom(true);
+          const report = (r) => say(
+            `random build cull ${r.cull ? "ON " : "OFF"}: ${r.frames} frames to 0 dirty ` +
+            `(per level ${r.levelFrames.join("/")}), ${r.occupied} occupied [${r.occPerLevel.join("/")}], ` +
+            `peak ${r.peakPairs} pairs/frame, ${r.totalPairs} pairs total, ${r.overflowed} overflows, ` +
+            `${r.deferred} deferred, biggest brick ${r.peakBrickPairs}, ${r.starved} starved, ` +
+            `${r.resumed} resumptions, ${r.dustVoxels} dust [${r.dustPerLevel.join("/")}], ` +
+            `gpu ${r.gpuMsPerFrame ?? "n/a"} ms/frame`);
+          report(noCull);
+          report(withCull);
+
+          // WHICH LEVEL FINISHES LAST is the claim. `levelFrames[l]` is the
+          // frame at which level l reached 0 dirty bricks, so the argmax is the
+          // straggler; Stage 2.3's defect is "argmax == the coarsest level".
+          const lastLevel = (r) => r.levelFrames.indexOf(Math.max(...r.levelFrames));
+          const coarsest = win.levels - 1;
+          say(`random cull: last level to finish OFF = L${lastLevel(noCull)} of L0..L${coarsest}, ` +
+            `ON = L${lastLevel(withCull)}; frames ${noCull.frames} -> ${withCull.frames}; ` +
+            `pairs ${noCull.totalPairs} -> ${withCull.totalPairs}`);
+          results.random = { ...withCull, triangles: rgrid.triCount, listings: rgrid.entries,
+            cpuBuildMs: +cpuMs.toFixed(0) };
+          results.cullRandom = {
+            triangles: rgrid.triCount, coarsest,
+            off: noCull, on: withCull,
+            lastLevelOff: lastLevel(noCull), lastLevelOn: lastLevel(withCull),
+          };
+          if (withCull.starved) throw new Error(`${withCull.starved} bricks made no progress with the cull on`);
+          if (withCull.dustVoxels === 0) {
+            throw new Error("the 3 M-triangle scene produced no dust voxel — the cull did not run");
+          }
+          if (lastLevel(withCull) === coarsest && lastLevel(noCull) === coarsest
+            && withCull.levelFrames[coarsest] >= noCull.levelFrames[coarsest]) {
+            throw new Error(`the coarsest level (L${coarsest}) still finishes last and no earlier ` +
+              `(${noCull.levelFrames[coarsest]} -> ${withCull.levelFrames[coarsest]} frames) — the cull did ` +
+              "not fix what Stage 2.3 named");
+          }
+          rvox.setCull(true);
           rvox.dispose();
+        }
+
+        // ═══════════════════════════════ THE DYNAMIC LAYER (2.5 §4) — MOVERS
+        //
+        // A 1 m box crossing the room, 3 m over 60 frames, voxelized into the
+        // L0/L1 mirror slots every frame while the STATIC layer is not touched
+        // at all. Three receipts, and one of them is about the instrument:
+        //
+        //  1. THE BOX IS WHERE IT IS. A ray from the room centre toward the
+        //     box's CURRENT centre must hit, at the distance a CPU ray/AABB
+        //     slab test says the box's near face is at, on every one of the 60
+        //     frames. A single miss is a frame where the mover was not in the
+        //     window.
+        //  2. THE BOX IS NOT WHERE IT WAS. A ray toward the centre the box held
+        //     `LAG` frames ago must NOT stop near that old distance.
+        //     ⚠ LAG IS DERIVED, NOT 10, AND THE REASON IS THE INSTRUMENT, NOT
+        //     THE RESULT. The box travels 3 m over 60 frames = 0.0508 m per
+        //     frame, so ten frames back is 0.5 m — exactly the box's own
+        //     half-width, and the VOXELIZED box is wider still by up to one L0
+        //     cell of conservative skirt (0.25 m at high, 0.5 m at phone). A ray
+        //     aimed at that point goes straight through the CURRENT box and hits
+        //     it legitimately, so a lag-10 test cannot tell a ghost from the real
+        //     object and would fail an implementation that has no ghosts at all.
+        //     `LAG` is therefore the smallest lag whose displacement clears
+        //     `HALF + v0`, which is 18 frames at high and 23 at phone. The lag-10
+        //     number is still reported — as the measurement of where the test
+        //     stops being able to see its subject, which is the sort of thing a
+        //     probe should say out loud rather than quietly pick around.
+        //  3. NO GHOST ANYWHERE ON THE PATH. At the last frame, one ray toward
+        //     each of the 60 positions the box ever held: only the ones the
+        //     FINAL box actually covers may hit near the box's distance. This is
+        //     the strong form of "cleared every frame" — 2 only proves it for
+        //     one lag, and this is tier-aware by construction.
+        {
+          const FRAMES = 60;
+          const HALF = 0.5; // a 1 m box
+          const TRAVEL = 3;
+          const BOX_Z = 3;
+          const V0 = win.levelVoxel(0);
+          const STEP = TRAVEL / (FRAMES - 1);
+          // The voxelized box's half-width in x: its own, plus one cell of the
+          // conservative skirt. Everything below is measured against THIS and
+          // not against the geometric box.
+          const REACH = HALF + V0;
+          const LAG = Math.min(FRAMES - 2, Math.ceil((REACH + 0.15) / STEP));
+          const LAG_WEAK = 10;
+          const posAt = (f) => [-TRAVEL / 2 + (TRAVEL * f) / (FRAMES - 1), 0, BOX_Z];
+
+          // Ray/AABB slab entry distance from the origin — the ORACLE. The box
+          // is axis-aligned and the mover's matrix is a pure translation, so the
+          // exact answer is closed form and there is no reason to compare
+          // against a second voxelization of the same box.
+          const slabEntry = (dir, c, r = HALF) => {
+            let t0 = -Infinity;
+            let t1 = Infinity;
+            for (let a = 0; a < 3; a++) {
+              const lo = c[a] - r;
+              const hi = c[a] + r;
+              if (Math.abs(dir[a]) < 1e-9) { if (0 < lo || 0 > hi) return null; continue; }
+              const ta = (lo - 0) / dir[a];
+              const tb = (hi - 0) / dir[a];
+              t0 = Math.max(t0, Math.min(ta, tb));
+              t1 = Math.min(t1, Math.max(ta, tb));
+            }
+            return t1 >= Math.max(t0, 0) ? Math.max(t0, 0) : null;
+          };
+          const unit = (p) => {
+            const n = Math.hypot(p[0], p[1], p[2]);
+            return [p[0] / n, p[1] / n, p[2] / n];
+          };
+
+          // The static layer the mover must not disturb.
+          await place([0, 0, 0]);
+          const movStatic = await buildToClean([0, 0, 0]);
+          const beforeBuf = await readWindow();
+          const beforeOcc = hashStatic(beforeBuf, store.OCC_OFF, store.OCC_WORDS);
+          const beforeFace = hashStatic(beforeBuf, store.FACE_OFF, store.FACE_WORDS);
+          const beforePal = hashStatic(beforeBuf, store.PAL_OFF, store.PAL_WORDS);
+
+          const dyn = dynMod.createWindowDynamic(win, vox, TIER);
+          const dd = dyn.describe();
+          say(`dynamic layer: ${dd.maxMovers} movers max, ${dd.maxDynTris} tris/level ` +
+            `(dispatch ${dd.dispatch} = ${dd.dynPairsPerFrame} items), span cap ${dd.spanMax}, ` +
+            `soup ${dd.soupMB} MB + scratch ${dd.scratchMB} MB`);
+
+          const moverSoup = dynMod.moverBoxSoup([-HALF, -HALF, -HALF], [HALF, HALF, HALF], 9);
+          const matrix = new THREE.Matrix4();
+          const setPose = (f) => {
+            const c = posAt(f);
+            matrix.makeTranslation(c[0], c[1], c[2]);
+            return c;
+          };
+          setPose(0);
+          const packed = dyn.setMovers([{ slot: 0, soup: moverSoup, matrix, pal: 9 }]);
+          say(`  movers: ${packed.movers} declared, ${packed.full} full / ${packed.boxed} boxed / ` +
+            `${packed.dropped} dropped, ${packed.triangles} triangles = ${packed.items} work items`);
+
+          const dynPasses = dyn.passes([0, 0, 0]);
+          // Warm the dynamic pipelines before anything is timed or trusted —
+          // three SKIPS a dispatch whose pipeline is not ready, and a skipped
+          // first frame reads exactly like a mover that failed to appear.
+          for (const p of dynPasses) await compute(p);
+
+          let misses = 0;
+          let wrongT = 0;
+          let staleHits = 0;
+          let staleWeakHits = 0;
+          let staleTested = 0;
+          // Frames on which the stale ray CANNOT tell a ghost from the real box,
+          // because the current box legally covers the old aim direction. Named
+          // and counted rather than assumed away: if it ever reaches
+          // `staleTested`, the arm has stopped being a test.
+          let staleUndiscriminating = 0;
+          // ONE-SIDED BY DESIGN. Voxelization can only make the box BIGGER, so a
+          // hit EARLIER than the analytic face is expected (up to a cell of
+          // skirt plus the cell the DDA reports entry into) and a hit LATER than
+          // it is a real error with almost no tolerance. A symmetric tolerance
+          // would have hidden exactly the failure that matters.
+          const tolEarly = 3 * V0 + 0.05;
+          const tolLate = 0.05;
+          const tol = tolEarly;
+          const trace = [];
+          const dynGpu = [];
+          for (let f = 0; f < FRAMES; f++) {
+            const c = setPose(f);
+            dyn.setMovers([{ slot: 0, soup: moverSoup, matrix, pal: 9 }]);
+            if (timestamps) await renderer.resolveTimestampsAsync("compute");
+            const t0 = performance.now();
+            for (const p of dynPasses) renderer.compute(p);
+            await device.queue.onSubmittedWorkDone();
+            const wall = performance.now() - t0;
+            const gpu = timestamps ? ((await renderer.resolveTimestampsAsync("compute")) ?? 0) : null;
+            dynGpu.push({ gpu, wall });
+
+            const rays = [];
+            const dCur = unit(c);
+            rays.push({ o: [0, 0, 0], d: dCur, tMax: 20 });
+            const stale = f >= LAG ? posAt(f - LAG) : null;
+            const staleWeak = f >= LAG_WEAK ? posAt(f - LAG_WEAK) : null;
+            if (stale) rays.push({ o: [0, 0, 0], d: unit(stale), tMax: 20 });
+            if (staleWeak) rays.push({ o: [0, 0, 0], d: unit(staleWeak), tMax: 20 });
+            const get = await shoot(rays);
+
+            const wantT = slabEntry(dCur, c);
+            const r0 = get(0);
+            if (!r0.hit) misses++;
+            else if (wantT == null || r0.t > wantT + tolLate || r0.t < wantT - tolEarly) wrongT++;
+            if (trace.length < 4 || f === FRAMES - 1) {
+              trace.push({ f, x: +c[0].toFixed(3), hit: r0.hit, t: +r0.t.toFixed(4),
+                want: wantT == null ? null : +wantT.toFixed(4), level: r0.level, face: r0.faceId });
+            }
+            if (stale) {
+              staleTested++;
+              // A GHOST is a stop near the box's distance that the box's CURRENT
+              // position cannot explain. "Explain" is the same slab test run
+              // against the current box INFLATED BY ONE L0 CELL — the shape the
+              // voxelizer actually built, skirt included.
+              //
+              // The first version of this test used a lateral-displacement rule
+              // (|Δx| > half-width + one cell) and reported 7 ghosts out of 42
+              // while the ghost sweep, on the same window, reported 0. The rule
+              // was wrong, not the layer: a ray aimed at the OLD centre CONVERGES
+              // toward the origin, so at the box's front face it is closer to the
+              // axis than the aim point is, and it clips the current box legally.
+              // A displacement threshold cannot see that; the slab test can.
+              const staleDist = Math.hypot(stale[0], stale[1], stale[2]);
+              const r1 = get(1);
+              if (r1.hit && r1.t < staleDist + 0.5 && slabEntry(unit(stale), c, REACH) == null) staleHits++;
+              const r2 = get(2);
+              const weakDist = Math.hypot(staleWeak[0], staleWeak[1], staleWeak[2]);
+              if (r2.hit && r2.t < weakDist + 0.5 && slabEntry(unit(staleWeak), c, REACH) == null) {
+                staleWeakHits++;
+              }
+              if (slabEntry(unit(stale), c, REACH) != null) staleUndiscriminating++;
+            }
+          }
+
+          // 3. THE GHOST SWEEP, from the final frame's window.
+          const finalC = posAt(FRAMES - 1);
+          const sweepRays = [];
+          for (let f = 0; f < FRAMES; f++) sweepRays.push({ o: [0, 0, 0], d: unit(posAt(f)), tMax: 20 });
+          const sweep = await shoot(sweepRays);
+          let ghosts = 0;
+          let legitimate = 0;
+          for (let f = 0; f < FRAMES; f++) {
+            const c = posAt(f);
+            const dist = Math.hypot(c[0], c[1], c[2]);
+            const r = sweep(f);
+            // "Legitimately hit" = the aim point lies inside the FINAL box as
+            // the voxelizer actually built it (its own half-width plus one cell
+            // of skirt), with a small margin for the ray clipping a corner on
+            // its way through the box's z-extent.
+            // Same rule as the lag test: the FINAL box, inflated by one cell,
+            // either explains this hit or it does not.
+            const near = slabEntry(unit(c), finalC, REACH) != null;
+            if (r.hit && r.t < dist + 0.5) { if (near) legitimate++; else ghosts++; }
+          }
+
+          const afterBuf = await readWindow();
+          const afterOcc = hashStatic(afterBuf, store.OCC_OFF, store.OCC_WORDS);
+          const afterFace = hashStatic(afterBuf, store.FACE_OFF, store.FACE_WORDS);
+          const afterPal = hashStatic(afterBuf, store.PAL_OFF, store.PAL_WORDS);
+          const dynStats = await dyn.stats(renderer);
+          const gpuMs = dynGpu.filter((g) => g.gpu != null).map((g) => g.gpu);
+          const meanGpu = gpuMs.length ? gpuMs.reduce((a, b) => a + b, 0) / gpuMs.length : null;
+          const meanWall = dynGpu.reduce((a, g) => a + g.wall, 0) / dynGpu.length;
+
+          trace.forEach((t) => say(`  mover f${String(t.f).padStart(2)} x ${t.x} hit ${t.hit} ` +
+            `t ${t.t} (want ${t.want}) L${t.level} face ${t.face}`));
+          say(`  mover rays: ${FRAMES - misses}/${FRAMES} hit, ${wrongT} at the wrong distance ` +
+            `(-${tolEarly.toFixed(3)}/+${tolLate.toFixed(2)} m); stale lag ${LAG} (${(LAG * STEP).toFixed(2)} m ` +
+            `> reach ${REACH.toFixed(2)} m): ${staleHits}/${staleTested} ghost hits, ` +
+            `${staleUndiscriminating} frames where the current box covers the old direction anyway; ` +
+            `lag ${LAG_WEAK} (${(LAG_WEAK * STEP).toFixed(2)} m): ${staleWeakHits}/${staleTested}`);
+          say(`  ghost sweep at the final frame: ${ghosts} of ${FRAMES} past positions still occupied ` +
+            `(${legitimate} legitimately near the final one)`);
+          say(`  dynamic pass: gpu ${meanGpu == null ? "n/a" : meanGpu.toFixed(4)} ms/frame, ` +
+            `wall ${meanWall.toFixed(3)} ms/frame, ${dynStats.satItems} SAT items, ` +
+            `${dynStats.voxelsSet} voxels/frame, ${dynStats.spanOverflow} span overflows, ` +
+            `${dynStats.outside} outside`);
+          say(`  static layer hashes occ ${beforeOcc} -> ${afterOcc}, face ${beforeFace} -> ${afterFace}, ` +
+            `pal ${beforePal} -> ${afterPal}`);
+
+          results.movers = {
+            frames: FRAMES, lag: LAG, lagWeak: LAG_WEAK, travel: TRAVEL, boxSize: 2 * HALF,
+            misses, wrongT, staleHits, staleWeakHits, staleTested, staleUndiscriminating, ghosts, legitimate,
+            tolEarly: +tolEarly.toFixed(4), tolLate, reach: +REACH.toFixed(4),
+            lagMetres: +(LAG * STEP).toFixed(3), trace,
+            gpuMsPerFrame: meanGpu == null ? null : +meanGpu.toFixed(4),
+            wallMsPerFrame: +meanWall.toFixed(3),
+            dyn: dynStats, packed, describe: dd,
+            staticFrames: movStatic.frames,
+            staticUnchanged: beforeOcc === afterOcc && beforeFace === afterFace && beforePal === afterPal,
+            hashes: { beforeOcc, afterOcc, beforeFace, afterFace, beforePal, afterPal },
+          };
+
+          if (misses !== 0) throw new Error(`the mover was missed on ${misses} of ${FRAMES} frames`);
+          if (wrongT !== 0) {
+            throw new Error(`${wrongT} of ${FRAMES} mover hits came back at the wrong distance ` +
+              `(tolerance -${tolEarly.toFixed(3)} / +${tolLate} m)`);
+          }
+          if (staleHits !== 0) {
+            throw new Error(`${staleHits} of ${staleTested} rays hit where the mover was ${LAG} frames ago — ` +
+              "the dynamic layer is keeping history");
+          }
+          if (staleUndiscriminating >= staleTested) {
+            throw new Error(`on all ${staleTested} frames the CURRENT box covers the stale direction, so the ` +
+              "lag arm cannot tell a ghost from the object and its 0 proves nothing");
+          }
+          if (ghosts !== 0) {
+            throw new Error(`${ghosts} of the mover's ${FRAMES} past positions are still occupied at the end`);
+          }
+          if (legitimate === 0) {
+            throw new Error("the ghost sweep found the box at NONE of the positions it should cover — the " +
+              "sweep is looking somewhere the mover never was");
+          }
+          if (!results.movers.staticUnchanged) {
+            throw new Error("the mover changed the STATIC layer: " +
+              `occ ${beforeOcc}/${afterOcc}, face ${beforeFace}/${afterFace}, pal ${beforePal}/${afterPal}`);
+          }
+          if (dynStats.voxelsSet === 0) {
+            throw new Error("the dynamic layer set no voxel — the receipts above are measuring an empty layer");
+          }
+          say(`movers: PASS (${FRAMES}/${FRAMES} hits at the right distance, 0 ghosts, static layer untouched)`);
+
+          // ── the blind-statistics control: with the mover set EMPTIED, the
+          // same rays must find nothing. Without it, "the ray hits the box" is
+          // equally consistent with "the ray hits something else that happens to
+          // be there", which is the shape of every false positive this probe has
+          // caught so far.
+          dyn.setMovers([]);
+          for (const p of dyn.passes([0, 0, 0])) renderer.compute(p);
+          await device.queue.onSubmittedWorkDone();
+          const cleared = await shoot([{ o: [0, 0, 0], d: unit(finalC), tMax: 20 }]);
+          const cr = cleared(0);
+          const finalDist = Math.hypot(finalC[0], finalC[1], finalC[2]);
+          const stillThere = cr.hit && cr.t < finalDist + 0.5;
+          say(`  control (no movers): hit ${cr.hit} t ${cr.t.toFixed(4)} — ` +
+            `${stillThere ? "STILL THERE" : "gone, as it must be"}`);
+          results.movers.controlHit = stillThere;
+          results.movers.controlT = cr.t;
+          if (stillThere) {
+            throw new Error("with the mover set emptied the ray STILL stops at the box's distance — the hits " +
+              "above were not the mover");
+          }
+          dyn.dispose();
         }
 
         // ══════════════════════════════════════════════════ the kernel receipts
@@ -933,6 +1406,12 @@
             "0.5", // the voxel centre, and the bucket's box midpoint
             "0.5001", // the SAT's conservativeEps: half a cell plus a hair
             "0.001", // the face-bit normal threshold (|n.a| > 1e-3)
+            // The Stage 2.5 cull fraction, listed BY NAME rather than left to
+            // the level-size allowance it happens to collide with at `high`
+            // (v0 = 0.25 m). At `phone` the levels are 0.5/1/2 and "0.25" would
+            // have read as a FOREIGN number — the check would have failed at one
+            // tier and passed at another for a reason unrelated to what it tests.
+            fmt(voxMod.CULL_FRACTION),
           ]);
           for (let l = 0; l < win.levels; l++) allowed.add(fmt(win.voxel0 * Math.pow(2, l)));
           // Addressing constants: whole numbers up to 16. The trace's own check

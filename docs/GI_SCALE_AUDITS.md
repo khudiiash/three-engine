@@ -973,3 +973,71 @@ kernel. Gates (PLAN Stage 3 rows): Cornell colour-probe parity; 2nd bounce
 present within 30 frames; off-screen lamp lights its corridor; GI ≤ 4 ms at
 1650×970 ultra, ≤ 2.5 ms on the phone rig; max frame time during a 10 s
 orbit ≤ 1.2× parked; no user-visible blocks.
+
+---
+
+## M. STAGE 3.4/4.0 INTEGRATION SPEC — GI2 AS THE LIT PATH (written 08-27 by the architect)
+
+Goal: `GISystem` builds and runs GI2 (window + soup + voxelizer + dynamic +
+gather + cache) INSTEAD of the SRC chain and the dense occupancy field, behind
+ONE module-private build constant `GI2_PATH = true` in `giConfig.js` (not a
+component property, not a `__gi*` flag; it exists only until Stage 4 deletes
+the old path). Materials keep consuming exactly what Stage 1.1 left them:
+two screen textures (`giIrradiance`, `giGlossy`) at resolve res + the
+emitter/light slot uniforms in the render group. AO stays GTAO. The BVH8
+mirror path stays at high/ultra (its own unit later; off in the first cut).
+
+### M.1 Build (`#rebuild` when GI2_PATH)
+1. Skip: `#buildOccupancyField`, `createSrcVolume`, `createSrcProbeSystem`,
+   the static shadow BVH (`buildStaticSceneBvhWords`), `buildBvhScene`,
+   reflection-probe capture, `#buildEntries`' record/attribution machinery.
+   Keep: `#collectMeshes` (tags, palette via `resolveMaterialSurface`),
+   light slots / emitter slots / light tree (the NEE source), the gbuffer
+   prepass (`renderGiGBuffer` — GI2 needs position/normal/depth at resolve
+   res), GTAO, the screen targets that the thin hook reads.
+2. `createTriangleSoupBuilder().build({geometries: serializeMeshForBake per
+   geometry, placements: static placements with pal from
+   resolveMaterialSurface})` — async, off-thread; GI2's window is created
+   immediately (tier from `resolveGiConfig`), the voxelizer waits for the
+   soup promise (log `[gi2] soup N tris, M MB, built in X ms off-thread`).
+   Movers (the `dynamicObjects` adoption list + skinned proxy boxes) →
+   `windowDynamic.setMovers` with per-mover local soups.
+3. Kernels are created once per build; NOTHING scene-sized is allocated on
+   the CPU (the soup lives in the worker; its transfer is the only copy).
+   All storage attributes go through 0.2b's `storageAttributes` publication;
+   all CPU mirrors detach.
+
+### M.2 Frame (`#tick` when GI2_PATH), in order
+`window.setCamera(cam)` (scroll) → `voxelizer.passes(cam, frustum)` (budget)
+→ `dynamic.passes(cam)` → gbuffer prepass (existing, content-key held) →
+`gather.passes()`: hzb, probePlace, probeTrace(+accumulate), probeFilter,
+resolve → GTAO (existing) → `injectLitFrame` (reads the frame's final colour
+from the previous frame's output target) → `relightBricks` budget. Sun
+direction/colour + emitter slots + sky intensity come from the existing
+uniforms (already in the render group). All passes ride `giCompute` (1.3's
+batched submit). Publish `profile.gi2` (K.8 + L.7) and set
+`_transportAlive` from the gather's `probesValid > 0 && windowHits > 0`.
+
+### M.3 Materials
+`giLight.js` `GICascadeLightNode.setup` is unchanged — it samples
+`giIrradianceNode`/`giRadianceNode`; GI2's resolve writes those two textures
+(full-res irradiance already, so the bilaterals (J.0 items 3+5) become a
+single sample when GI2_PATH — do that in the same commit: −8.4 kB, clears
+the J.7 gate). Emitter direct diffuse: today it arrives through the SRC
+irradiance texture (`giLight.js:2083`); GI2's gather must include emitter
+NEE at probe hits AND at the probe position itself (direct emitter light on
+the probe's surface via one shadow ray per emitter slot per probe per frame)
+so the texture carries the same term. The `emitterShadowPass` chain is NOT
+dispatched under GI2_PATH (its 10-20 ms was the price of per-pixel analytic
+emitter shadows; the probe-res term replaces it — the quality trade PLAN
+§4.4 names; measure on the Level's lamps).
+
+### M.4 Gates (run the OLD battery where it applies + the GI2 probes)
+Cornell colour probe (`__giColourProbe` receipts) within the 3.2 bracket;
+`test:gi-sunleak` (the harness must PASS on GI2 — 0 leak); the Level: first
+light ≤ 3 s after assets ready; Bistro: first light ≤ 3 s, GI GPU ≤ 4 ms at
+1650×970 ultra, heap ≤ 1.2 GB, zero SRC kernels compiled; `test:gi-moved-lamp`
+PASS (the glow term is material-side, unaffected); `test:gi-lighttree-mover`
+(mover bounce through the dynamic layer); orbit paired medians ≤ 1.2×.
+Everything old-path-only (`test:gi-src-*`, `test:gi-occupancy`) keeps running
+with `GI2_PATH=false` until Stage 4 deletes it.

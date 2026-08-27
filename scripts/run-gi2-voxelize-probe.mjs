@@ -102,6 +102,61 @@ if (table.length) {
   }
 
   console.log("");
+  console.log("THE PER-LEVEL CULL (2.5 §1) — frames to 0 dirty PER LEVEL, cull off vs on, one session");
+  console.log("tier     scene    cull  frames   per-level frames   last   pairs total     dust     gpu ms");
+  for (const t of table) {
+    const rows = [
+      t.cullRoom && ["room", t.cullRoom.off, t.cullRoom.on, null],
+      t.cullRandom && ["random", t.cullRandom.off, t.cullRandom.on, t.cullRandom],
+    ].filter(Boolean);
+    for (const [scene, off, on, meta] of rows) {
+      for (const [tag, r] of [["off", off], ["on ", on]]) {
+        const lf = (r.levelFrames ?? []).join("/");
+        const last = r.levelFrames ? `L${r.levelFrames.indexOf(Math.max(...r.levelFrames))}` : "—";
+        console.log(
+          `${t.tier.padEnd(9)}${scene.padEnd(9)}${tag}  ${String(r.frames).padStart(6)}   ${lf.padStart(16)}   ` +
+          `${last.padStart(4)}   ${String(r.totalPairs ?? r.peak ?? "—").padStart(11)}   ` +
+          `${String(r.dustVoxels ?? r.dust ?? 0).padStart(6)}   ` +
+          `${(r.gpuMsPerFrame == null ? "n/a" : r.gpuMsPerFrame.toFixed(3)).padStart(8)}`,
+        );
+      }
+      if (meta) {
+        console.log(`${" ".repeat(9)}└─ coarsest is L${meta.coarsest}; last level to finish ` +
+          `L${meta.lastLevelOff} → L${meta.lastLevelOn}; L${meta.coarsest} reached 0 dirty at frame ` +
+          `${meta.off.levelFrames[meta.coarsest]} → ${meta.on.levelFrames[meta.coarsest]}`);
+      }
+    }
+  }
+
+  console.log("");
+  console.log("THE RESUMABLE BRICK (2.5 §2) — a cap BELOW one brick's whole demand");
+  console.log("tier     cap     biggest brick   frames (vs full)   resumptions   deepest cursor   occ diff   pal diff");
+  for (const t of table) {
+    const c = t.cursor;
+    if (!c) continue;
+    console.log(
+      `${t.tier.padEnd(9)}${String(c.cap).padEnd(8)}${String(c.biggestBrick).padStart(13)}   ` +
+      `${`${c.frames} (${c.framesFull})`.padStart(16)}   ${String(c.resumed).padStart(11)}   ` +
+      `${String(c.maxCursor).padStart(14)}   ${String(c.occDiff).padStart(8)}   ${String(c.palDiff).padStart(8)}`,
+    );
+  }
+
+  console.log("");
+  console.log("THE DYNAMIC LAYER (2.5 §4) — a 1 m box crossing 3 m in 60 frames");
+  console.log("tier     hits    wrong t   ghosts (lag)    sweep   static bits   gpu ms/frame   voxels/frame");
+  for (const t of table) {
+    const m = t.movers;
+    if (!m) continue;
+    console.log(
+      `${t.tier.padEnd(9)}${`${m.frames - m.misses}/${m.frames}`.padEnd(8)}${String(m.wrongT).padStart(7)}   ` +
+      `${`${m.staleHits}/${m.staleTested} (${m.lag})`.padStart(12)}   ${`${m.ghosts}/${m.frames}`.padStart(6)}   ` +
+      `${(m.staticUnchanged ? "unchanged" : "CHANGED").padStart(11)}   ` +
+      `${(m.gpuMsPerFrame == null ? "n/a" : m.gpuMsPerFrame.toFixed(4)).padStart(12)}   ` +
+      `${String(m.dyn?.voxelsSet ?? "—").padStart(12)}`,
+    );
+  }
+
+  console.log("");
   const worst = table.reduce((n, t) => Math.max(n, Math.max(...t.kernels.map((k) => k.storageBindings))), 0);
   const wgVars = table.reduce((n, t) => n + t.kernels.reduce((m, k) => m + k.workgroupVars, 0), 0);
   console.log(`storage buffers, worst kernel: ${worst} (envelope 6); workgroup vars: ${wgVars}; ` +

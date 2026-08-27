@@ -83,6 +83,20 @@ export const PAL_NONE_WORD = 0xffffffff;
 export const STATE_EMPTY_DIRTY = 0;
 export const STATE_DIRTY = 1;
 export const STATE_BUILT = 2;
+/**
+ * Accepted by `binPairs` THIS frame: its pairs are in the pair list and
+ * `finishBricks` still owes it a brickMask OR, a palette pack and a verdict
+ * (BUILT if it finished, back to DIRTY if it only got part of the budget).
+ *
+ * It belongs HERE and not in `windowVoxelize.js` — where Stage 2.3 had to
+ * declare it locally, because that stage could not edit this file — because the
+ * state word is the STORE's vocabulary: the voxelizer, the fill and every later
+ * consumer have to agree on what 3 means. Sitting above `STATE_BUILT` is safe
+ * because every reader compares with `!=` or `<`: `dirtyCount` counts
+ * `state < STATE_BUILT`, so a BUILDING brick is deliberately invisible to the
+ * next scan until `finishBricks` has decided its fate.
+ */
+export const STATE_BUILDING = 3;
 
 /**
  * `brickTab` word 0 = the brick's world coord `wb`, 10 bits per axis, biased by
