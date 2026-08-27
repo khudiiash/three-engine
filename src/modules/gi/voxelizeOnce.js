@@ -326,7 +326,22 @@ export function resolveMaterialSurface(materialInput, meshName = "") {
       );
     }
   }
-  return { color, emissive, emissiveIntensity };
+  // ── §19 STAGE 4.0b (audits §O.5(c.1)): "THIS MATERIAL IS AN EMITTER, IT JUST
+  // DOES NOT KNOW HOW BRIGHT YET" ─────────────────────────────────────────────
+  //
+  // The GI2 palette's class ASSIGNMENT is baked into the soup's `triPal` and
+  // into every voxel's `pal` byte, so it must never depend on a VALUE that can
+  // still change; only the class→colour TABLE may be re-tinted (a uniform
+  // write). A texture-driven emissive resolves 0 until its average lands, so
+  // keying "is this an emitter class" on the resolved value alone would file
+  // an authored lantern under a DIFFUSE class and freeze it there — the
+  // re-tint could never rescue it, because a re-tint keeps the assignment.
+  //
+  // This is the static fact that fixes it: the material HAS an emissive
+  // texture and its mean is not in yet. `emissivePending` is OR'd into the
+  // palette's emitter test at build, so the class exists from the first build
+  // and the average only fills its colour in later.
+  return { color, emissive, emissiveIntensity, emissivePending: !!(emissiveTexture && !emissiveTexAvg) };
 }
 
 /**

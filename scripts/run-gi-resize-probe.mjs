@@ -131,6 +131,23 @@ await page.evaluateOnNewDocument((PROJECT, disposeNow) => {
     // use-after-free classes a resize produces, kept apart so a row can say
     // WHICH resource was freed early.
     uncaptured: 0, destroyedTexture: 0, destroyedBuffer: 0, uncapturedMsgs: [],
+    // ⭐⭐ §19 Stage 4.0b — THE OTHER USE-AFTER-FREE, AND IT IS A THROW.
+    //
+    // A retired generation's STORAGE BUFFER is not reported as "destroyed …
+    // used in a submit": `renderer._attributes.delete` removes the BACKEND
+    // RECORD, so `backend.get(binding.attribute).buffer` comes back `undefined`
+    // and `createBindGroup` throws SYNCHRONOUSLY, inside
+    // `_renderObjectDirect`:
+    //
+    //   Failed to execute 'createBindGroup' on 'GPUDevice': 'buffer' property
+    //   from 'GPUBufferBinding': Required member is undefined.
+    //
+    // A different channel from `uncapturederror` and from the console handler,
+    // so it needs its own counter. The descriptor's `label` is
+    // `bindGroup_<name>` — three's own name for the group — and the entry index
+    // says WHICH binding is dead, so this NAMES the culprit instead of proving
+    // one exists.
+    bindGroupThrows: 0, bindGroupMsgs: [],
   };
   globalThis.__GPU_COUNTERS__ = c;
   const patch = (proto, name, fn) => {
@@ -145,6 +162,30 @@ await page.evaluateOnNewDocument((PROJECT, disposeNow) => {
     patch(GPUDevice.prototype, "createRenderPipelineAsync", () => c.renderPipeline++);
     patch(GPUDevice.prototype, "createShaderModule", () => c.shaderModule++);
     patch(GPUDevice.prototype, "createTexture", () => c.texture++);
+    // WRAPPED, not patched: the point is to catch the THROW — and to re-throw
+    // it, so the engine behaves exactly as it does without the probe. An
+    // instrument that swallows the failure measures a different program.
+    if (typeof GPUDevice.prototype.createBindGroup === "function") {
+      const origCBG = GPUDevice.prototype.createBindGroup;
+      GPUDevice.prototype.createBindGroup = function (...args) {
+        try {
+          return origCBG.apply(this, args);
+        } catch (err) {
+          c.bindGroupThrows++;
+          if (c.bindGroupMsgs.length < 24) {
+            const d = args[0] ?? {};
+            const bad = [];
+            for (const e of d.entries ?? []) {
+              const r = e?.resource;
+              if (r && typeof r === "object" && "buffer" in r && r.buffer === undefined) bad.push(e.binding);
+            }
+            c.bindGroupMsgs.push(`${d.label ?? "(no label)"} — ${(d.entries ?? []).length} entries, ` +
+              `undefined buffer at binding(s) [${bad.join(",")}] — ${String(err?.message ?? err).slice(0, 120)}`);
+          }
+          throw err;
+        }
+      };
+    }
   }
   if (globalThis.GPUTexture) patch(GPUTexture.prototype, "destroy", () => c.textureDestroyed++);
   // The listener has to be attached to the DEVICE, and the only handle on the
@@ -318,6 +359,10 @@ const censusOnce = () => page.evaluate(async () => {
     destroyedTexture: c.destroyedTexture ?? 0,
     destroyedBuffer: c.destroyedBuffer ?? 0,
     uncapturedMsgs: c.uncapturedMsgs ?? [],
+    // §19 Stage 4.0b — the SYNCHRONOUS half: a bind group created against a
+    // buffer whose backend record is gone. Never reaches `uncapturederror`.
+    bindGroupThrows: c.bindGroupThrows ?? 0,
+    bindGroupMsgs: c.bindGroupMsgs ?? [],
     // "Did the hop leave the material-facing nodes pointing at the LIVE
     // gather?" Every material samples GI through these two persistent nodes; a
     // resize that repoints them at a texture the gather no longer owns — or
@@ -382,7 +427,8 @@ const record = async (label) => {
     ` irr ${s.giTex.irrLive ? "live" : "STALE"} ${s.giTex.irrSize.padEnd(9)}` +
     ` glossy ${s.giTex.gloLive ? "live" : "STALE"} ${s.giTex.gloSize.padEnd(9)}` +
     ` transport ${String(s.giTransport).padEnd(7)} rebinds ${String(s.giTex.rebinds).padStart(4)} retiredPending ${s.giTex.pendingRetired}` +
-    ` | uncaptured ${s.uncaptured} (destroyedTex ${s.destroyedTexture}, destroyedBuf ${s.destroyedBuffer})`,
+    ` | uncaptured ${s.uncaptured} (destroyedTex ${s.destroyedTexture}, destroyedBuf ${s.destroyedBuffer})` +
+    ` bindGroupThrows ${s.bindGroupThrows}`,
   );
   return s;
 };
@@ -488,6 +534,9 @@ console.log(`  uncaptured device errors across ALL hops: ${afterFast.uncaptured}
   ` (destroyed texture ${afterFast.destroyedTexture}, destroyed buffer ${afterFast.destroyedBuffer});` +
   ` console lines naming one: ${consoleUncaptured.length}`);
 for (const msg of afterFast.uncapturedMsgs.slice(0, 6)) console.log(`    · ${msg}`);
+console.log(`  createBindGroup throws across ALL hops: ${afterFast.bindGroupThrows}` +
+  " (a bind group built against a buffer whose backend record was already deleted)");
+for (const msg of afterFast.bindGroupMsgs.slice(0, 8)) console.log(`    · ${msg}`);
 console.log(`  GI textures after the last hop: irradiance ${afterFast.giTex.irrLive ? "live" : "STALE"}` +
   ` ${afterFast.giTex.irrSize}, glossy ${afterFast.giTex.gloLive ? "live" : "STALE"} ${afterFast.giTex.gloSize},` +
   ` gather ${afterFast.giTex.gatherSize}, transport ${afterFast.giTransport}`);
@@ -504,6 +553,14 @@ if (afterFast.uncaptured > 0) {
 }
 if (consoleUncaptured.length > 0) {
   fails.push(`${consoleUncaptured.length} console lines reported a destroyed resource in a submit — must be 0`);
+}
+// ⭐ §19 Stage 4.0b — AND THE SYNCHRONOUS HALF. `createBindGroup` throwing
+// `'buffer' … Required member is undefined` is a RENDER object being bound
+// against a storage/uniform buffer whose backend record a retire already
+// deleted. It never reaches `uncapturederror`, so the previous gate could read
+// clean while the user's editor threw on every governor resize.
+if (afterFast.bindGroupThrows > 0) {
+  fails.push(`${afterFast.bindGroupThrows} createBindGroup throws (undefined GPUBufferBinding.buffer) — must be 0`);
 }
 if (afterFast.giTex.gi2 && (!afterFast.giTex.irrLive || !afterFast.giTex.gloLive)) {
   fails.push("a GI material node no longer points at the live gather's texture after the hops");

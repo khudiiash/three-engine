@@ -226,7 +226,7 @@ await page.evaluateOnNewDocument((project) => {
 // inherit the Level's.
 let marks = null;
 const resetMarks = () => {
-  marks = { assetsReady: 0, firstLight: 0, occupancy: new Map(), built: 0, soup: null, lines: [] };
+  marks = { assetsReady: 0, firstLight: 0, occupancy: new Map(), built: 0, soup: null, placements: null, lines: [] };
 };
 resetMarks();
 page.on("console", (m) => {
@@ -236,7 +236,13 @@ page.on("console", (m) => {
   const occ = /\[gi2\] first occupancy L(\d+) at (\d+) ms/.exec(t);
   if (occ && !marks.occupancy.has(occ[1])) marks.occupancy.set(occ[1], now);
   if (/\[gi2\] first light/.test(t) && !marks.firstLight) marks.firstLight = now;
-  if (/\[gi2\] soup /.test(t)) marks.soup = t;
+  // TWO different soup lines now (§19 Stage 4.0b): the ENUMERATION receipt
+  // ("N placements, K past the old 768 cap") on the way in, and the built-soup
+  // receipt ("N tris, M MB, palette …") on the way out. Kept apart, because the
+  // whole point of 4.0b is the first one and a single slot would let the second
+  // overwrite it.
+  if (/\[gi2\] soup \d+ placements/.test(t)) marks.placements = t;
+  else if (/\[gi2\] soup /.test(t)) marks.soup = t;
   if (/\[gi\] built/.test(t)) marks.built++;
   if (/\[gi2\]|gi2|screen chain|unavailable|failed|Error|postprocess pass warm|wave breakdown|prewarm loop|SLOWEST PIPELINE|pipelines compiled|variant swap|\[gi\] (built|light shadows|quality|auto-fit|compile wave|transport)/.test(t)) {
     marks.lines.push(t.slice(0, 220));
@@ -422,6 +428,7 @@ for (const name of SCENES) {
 
   console.log(`\n  boot: assets→first light ${Number.isFinite(firstLightMs) ? `${firstLightMs} ms` : "NEVER"}` +
     `   occupancy ${occRows.length ? occRows.join(", ") : "none"}`);
+  console.log(`  ${marks.placements ?? "  (no placement line — the content walk never ran)"}`);
   console.log(`  ${marks.soup ?? "  (no soup line — the window never received geometry)"}`);
   console.log(`  pipelines: ${compute.length} compute + ${render.length} render, ${kB.toFixed(1)} kB WGSL`);
   // ── THE MATERIAL-VARIANT CENSUS (§19 Stage 4.3a) ─────────────────────────
@@ -489,7 +496,10 @@ for (const name of SCENES) {
     `${frameStats.gpuMsIsReal ? "" : " (estimated)"}, heap ${heapMB.toFixed(0)} MB, transport ${frameStats.giTransport ?? "?"}`);
   if (gi2) {
     console.log(`  gi2: tier ${gi2.tier}, window ${gi2.windowMB} MB + cache ${gi2.cacheMB} MB, ` +
-      `${gi2.soupTris} tris / ${gi2.soupMB} MB, ${gi2.probes} probes × ${gi2.rays / Math.max(1, gi2.probes)} rays`);
+      `${gi2.soupTris} tris / ${gi2.soupMB} MB, ${gi2.probes} probes × ${gi2.rays / Math.max(1, gi2.probes)} rays, ` +
+      // §19 Stage 4.0b: "N classes" and "N of them emit" are different facts.
+      `palette ${gi2.palClasses} classes / ${gi2.palEmissiveClasses ?? "?"} emissive ` +
+      `(band ${gi2.palEmitterBand ?? "?"})`);
     console.log(`  rays: ${gi2.windowHits ?? 0} window / ${gi2.screenHits ?? 0} screen / ${gi2.skyMiss ?? 0} sky ` +
       `of ${gi2.raysTraced ?? 0} traced; ${gi2.probesValid ?? 0} of ${gi2.probesPlaced ?? 0} probes valid; ` +
       `${gi2.freshShades ?? 0} fresh shades, ${gi2.reprojHits ?? 0} reprojections`);
@@ -673,6 +683,173 @@ for (const name of SCENES) {
     const crops = owned.filter((n) => /crop/i.test(n));
     gate(name, "gi2.crop out of the ownership list", crops.length, 0, crops.length === 0);
     console.log(`  gi2 ownership list: ${owned.length} compute nodes, ${crops.length} crop`);
+  }
+  // ══ §19 STAGE 4.0b — THE PAST-THE-CAP RAY ARM ════════════════════════════
+  //
+  // ⭐⭐ "1532 placements went into the soup" IS A STATEMENT ABOUT A JS ARRAY.
+  //
+  // Until 4.0b the GI2 content walk `break`ed at `MAX_INSTANCE_SLOTS = 768` —
+  // the SRC atlas's uniform-array ceiling, which GI2 does not build — so on
+  // Bistro 764 placements had no occupancy, no bounce, no shadow and no palette
+  // entry, and WHICH 764 was an accident of the prefab's hierarchy order (every
+  // lantern and string light sits past index 1156). A placement COUNT cannot
+  // tell "enumerated" apart from "in the world"; a ray can.
+  //
+  // So: pick three placements whose index is past the old cap, put the camera
+  // 2 m off each one (the window is camera-centred and 64³ per level — a
+  // lantern across the scene is simply not in it), let the voxelizer fill, and
+  // fire a `traceWindow` ray at its centre from the SAME 2 m. A hit inside the
+  // subject's bounding sphere is the receipt.
+  //
+  // ⚠ THE tMax IS THE GATE'S OWN GUARD. It stops at the far side of the
+  // subject's bounding sphere, so a wall BEHIND the lantern cannot produce the
+  // hit; and the reported `t` is printed next to the sphere's near/far bounds,
+  // so a hit from something in FRONT is visible rather than counted as a pass.
+  {
+    const subjects = await page.evaluate(() => {
+      const sys = globalThis.__giEngineForProbe?.modules?.get?.("gi")?.system;
+      const gi2 = sys?.state?.screen?.gi2;
+      if (!gi2 || !sys) return { error: "no gi2 system" };
+      const keys = gi2.paletteAssign?.keys ?? [];
+      const byKey = sys._gi2PaletteMeshByKey;
+      if (!keys.length || !byKey) return { error: "no palette assignment (the soup has not landed)" };
+      const CAP = 768;
+      const out = [];
+      // Evenly spread across the past-the-cap tail rather than the first three
+      // after it — three neighbours in hierarchy order are usually three copies
+      // of one prop, which would make this one measurement wearing three hats.
+      // ⚠ AND WHEN NOTHING IS PAST THE CAP, THE ARM STILL RUNS — on the LAST
+      // THIRD of the walk. `staticMerging` collapses Bistro's 1532 authored
+      // meshes to ~516 live ones, so on that scene today the 768 cut never
+      // fires; a probe that reported "n/a" there would leave "the walk reaches
+      // its own end" untested on the only scene big enough to matter. The row
+      // says which population it sampled.
+      const tail = keys.length - CAP;
+      const past = tail > 0;
+      const from = past ? CAP : Math.floor(keys.length * 0.67);
+      const span = keys.length - from;
+      if (span <= 0) return { error: `only ${keys.length} placements`, total: keys.length };
+      for (const f of [0.15, 0.5, 0.85]) {
+        const idx = Math.min(keys.length - 1, from + Math.floor(span * f));
+        const rec = byKey.get(keys[idx]);
+        const mesh = rec?.mesh;
+        if (!mesh?.parent || mesh.isInstancedMesh) continue;
+        mesh.updateWorldMatrix(true, false);
+        const g = mesh.geometry;
+        const pos = g?.attributes?.position;
+        if (!pos) continue;
+        // ⛔⛔ THE TARGET IS A POINT **ON THE GEOMETRY**, NOT THE BOUNDING-BOX
+        // CENTRE, and the first version of this arm proved why: `staticMerging`
+        // gives Bistro `Merged(4)` meshes whose world bound radius is 23.55 m,
+        // so "the centre" was a point in open air 20 m from any triangle and
+        // every one of its six rays missed — a FAIL that measured the subject
+        // picker, not the window. A triangle centroid is on the surface by
+        // construction, at any scale, for a merged batch and for a 3 cm prop
+        // alike.
+        const index3 = g.index;
+        const triCount = Math.floor((index3 ? index3.count : pos.count) / 3);
+        if (triCount < 1) continue;
+        const t3 = Math.floor(triCount / 2) * 3;
+        const vi = (k) => (index3 ? index3.getX(t3 + k) : t3 + k);
+        let lx = 0; let ly = 0; let lz = 0;
+        for (let k = 0; k < 3; k++) { const v = vi(k); lx += pos.getX(v); ly += pos.getY(v); lz += pos.getZ(v); }
+        lx /= 3; ly /= 3; lz /= 3;
+        const e = mesh.matrixWorld.elements;
+        const w = [
+          e[0] * lx + e[4] * ly + e[8] * lz + e[12],
+          e[1] * lx + e[5] * ly + e[9] * lz + e[13],
+          e[2] * lx + e[6] * ly + e[10] * lz + e[14],
+        ];
+        out.push({ index: idx, name: mesh.name || "(unnamed)", world: w, tris: triCount });
+      }
+      return { total: keys.length, pastCap: Math.max(0, tail), past, voxel0: gi2.win?.voxel0 ?? 0.25, subjects: out };
+    });
+    if (subjects?.error) {
+      console.log(`  §4.0b past-the-cap ray: ${subjects.error}`);
+    } else if (subjects?.subjects?.length) {
+      console.log(`\n  ── §4.0b ${subjects.past ? "PAST-THE-CAP" : "WALK-TAIL"} RAY ` +
+        `(${subjects.total} placements, ${subjects.pastCap} past 768` +
+        `${subjects.past ? "" : " — the cut never fired on this scene; sampling the last third instead"}) ──`);
+      let hits = 0;
+      // 2 m off a point ON the surface — a fixed distance, because the target
+      // is a triangle centroid and not a bound whose size varies by three
+      // orders of magnitude across a merged scene.
+      const D = 2;
+      const v0 = subjects.voxel0;
+      for (const s of subjects.subjects) {
+        // Six offsets: whichever direction is OPEN is the one that tests the
+        // subject rather than its neighbour. A subject reachable from NO
+        // direction is reported as such, not silently passed.
+        const dirs = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0.577, 0.577, 0.577], [-0.577, 0.577, -0.577]];
+        const res = await page.evaluate(async ({ s, D, dirs, v0 }) => {
+          const eng = globalThis.__giEngineForProbe;
+          const sys = eng?.modules?.get?.("gi")?.system;
+          const gi2 = sys?.state?.screen?.gi2;
+          if (!gi2?.trace || !eng?.renderer) return { error: "no live window" };
+          // The window follows the CAMERA. A subject anywhere else in the scene
+          // is outside all 64³ levels, so the ray would miss for a reason that
+          // has nothing to do with the cap. Park on it and let the voxelizer
+          // fill before asking.
+          await globalThis.__editorApi.call("viewport.setCamera", {
+            position: [s.world[0] + D * 0.7, s.world[1] + D * 0.5, s.world[2] + D * 0.7],
+            target: s.world,
+          });
+          await new Promise((r) => setTimeout(r, 3500));
+          const { createGi2RayShooter } = await import("/scripts/lib/gi2RayProbe.js");
+          const shoot = createGi2RayShooter(gi2, eng.renderer);
+          const rays = dirs.map((d) => ({
+            o: [s.world[0] + d[0] * D, s.world[1] + d[1] * D, s.world[2] + d[2] * D],
+            d: [-d[0], -d[1], -d[2]],
+            // Stops ONE VOXEL past the target: nothing behind the subject can
+            // produce this hit, so a pass cannot be borrowed from the wall
+            // behind it.
+            tMax: D + v0,
+          }));
+          const out = await shoot(rays);
+          // ⭐⭐ AND THE DIRECT ANSWER, BESIDE THE RAY. A ray can miss for
+          // reasons that are nothing to do with the cap — an origin born inside
+          // a neighbour, a target on a one-sided sliver, a step budget — so
+          // "does the window HOLD this placement" is asked of the window
+          // itself: the OCC bit and the PAL byte of the cell the target point
+          // falls in, at every level whose 64³ covers it. This is the receipt;
+          // the ray is the corroboration.
+          const store = await import("/src/modules/gi/window/windowStore.js");
+          const win = gi2.win;
+          const words = new Uint32Array(await eng.renderer.getArrayBufferAsync(win.attribute));
+          const cells = [];
+          for (let l = 0; l < win.levels; l++) {
+            const v = win.voxel0 * Math.pow(2, l);
+            const wc = [store.worldCell(s.world[0], v), store.worldCell(s.world[1], v), store.worldCell(s.world[2], v)];
+            const o = [win.origins[l * 3], win.origins[l * 3 + 1], win.origins[l * 3 + 2]];
+            if (!store.inWindow(wc, o)) continue;
+            const vi = store.voxelIndex(wc[0], wc[1], wc[2]);
+            const base = l * store.LEVEL_WORDS;
+            const occ = (words[base + store.OCC_OFF + (vi >>> 5)] >>> (vi & 31)) & 1;
+            const pal = (words[base + store.PAL_OFF + (vi >>> 2)] >>> ((vi & 3) * 8)) & 255;
+            cells.push({ l, occ, pal });
+          }
+          return { rays: out.map((r) => ({ hit: !!r.hit, t: +Number(r.t).toFixed(3) })), cells };
+        }, { s, D, dirs, v0 });
+        if (res?.error) { console.log(`   #${s.index} ${s.name}: ${res.error}`); continue; }
+        // The target is ON the surface, so an on-subject hit lands within a
+        // voxel of D — the window's own resolution, which is the tightest a
+        // voxelized world can be asked for.
+        const lo = D - 2 * v0;
+        const hi = D + v0;
+        const good = res.rays.filter((r) => r.hit && r.t >= lo && r.t <= hi);
+        // THE GATE IS THE OCCUPANCY, not the ray: a placement is "in the
+        // window" when the cell its own triangle sits in is marked occupied and
+        // carries a real palette class. The ray is printed beside it.
+        const occ = (res.cells ?? []).filter((c) => c.occ === 1 && c.pal !== 255);
+        if (occ.length) hits++;
+        console.log(`   #${s.index} "${s.name}" ${s.tris} tris — occupancy at the target: ` +
+          `${(res.cells ?? []).map((c) => `L${c.l} occ=${c.occ} pal=${c.pal}`).join(", ") || "OUTSIDE EVERY LEVEL"}` +
+          `; rays ${good.length}/${res.rays.length} inside [${lo.toFixed(2)}, ${hi.toFixed(2)}] m ` +
+          `(t: ${res.rays.map((r) => (r.hit ? r.t.toFixed(2) : "miss")).join(" ")})`);
+      }
+      gate(name, subjects.past ? "past-768 placements in window" : "walk-tail placements in window",
+        hits, subjects.subjects.length, hits === subjects.subjects.length, "/3");
+    }
   }
   if (name.toLowerCase() === "bistro") {
     gate(name, "JS heap", +heapMB.toFixed(0), HEAP_MB, heapMB <= HEAP_MB, "MB");

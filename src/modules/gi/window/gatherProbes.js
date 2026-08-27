@@ -129,8 +129,24 @@ export const HZB_THICKNESS = 0.1;
 export const HZB_ZBIAS = 0.02;
 /** A depth that means "sky" in the pyramid — larger than any scene. */
 export const HZB_FAR = 1e6;
-/** Palette slots. A material CLASS table, not a scene number; 15 is "no surface". */
-export const PAL_ENTRIES = 16;
+/**
+ * Palette slots. A material CLASS table, not a scene number; the LAST entry
+ * (`PAL_ENTRIES - 1`) is "no surface" and `palAt` clamps a stale/unvoxelized
+ * `PAL_NONE = 255` byte onto it.
+ *
+ * ⭐ §19 STAGE 4.0b — 16 → 64, and it is not a tuning change (audits §O.4).
+ * Measured over Bistro's 131 materials / 1532 placements, the fixed 3-level
+ * albedo lattice this table was built for carries 0.1113 mean absolute
+ * per-channel error; a weighted median cut at 64 classes carries 0.0008 —
+ * two orders better, and better than RGB565 PER VOXEL, which would double the
+ * voxel store and break `windowVoxelize`'s packed-word MAX merge. The byte
+ * allows 255; the cost of a class is 16 B of `palU` + 16 B of `palEmU`, so 64
+ * classes is 2 KB of uniform against a 64 KB binding limit, and `palAt` is one
+ * indexed uniform read at any N. 255 was declined on purpose: the k = 64
+ * residual is already an order below the ONE-COLOUR-PER-MESH error the
+ * resolver itself carries, so the extra classes would quantize noise.
+ */
+export const PAL_ENTRIES = 64;
 /** Striped statistics: one counter is 64 words, indexed by lane, summed on read. */
 export const STAT_STRIPE = 64;
 /**
@@ -533,6 +549,22 @@ export function createGiGather({
   };
   const palette = Array.from({ length: PAL_ENTRIES }, () => new THREE.Vector4(0, 0, 0, 0));
   const palU = uniformArray(palette, "vec4");
+  // ⭐ §19 STAGE 4.0b — THE EMISSIVE IS A COLOUR (audits §O.4).
+  //
+  // `pal.w` was ONE FLOAT and every consumer added it as `vec3(pal.w)`, so a
+  // RED lamp bounced GREY: the class carried its emitted ENERGY and threw its
+  // CHROMA away, on the one path (`shadeHit`) that is the entire delivery
+  // route for every emitter outside the four NEE slots. A second
+  // `uniformArray(vec4)` indexed by the SAME class byte is 1 KB at 64 classes
+  // and costs one more indexed uniform read on a fresh shade — `palIndexAt`
+  // reads the byte once and both tables are indexed with it, so the window
+  // buffer is not touched twice.
+  //
+  // `.w` is kept as the emissive MEAN. Nothing in the shaders reads it any
+  // more; it is what the crop/shade receipts and the harnesses print, and it
+  // is what makes "class 12 emits 3.30" answerable without a second readback.
+  const paletteEmissive = Array.from({ length: PAL_ENTRIES }, () => new THREE.Vector4(0, 0, 0, 0));
+  const palEmU = uniformArray(paletteEmissive, "vec4");
   const octU = uniformArray(octTable(O), "vec4");
   const mipU = uniformArray(mipOff.map((o, m) => new THREE.Vector4(o, mipW[m], mipH[m], 0)), "vec4");
 
@@ -587,14 +619,22 @@ export function createGiGather({
     return normalize(vec3(f.x.sub(sx.mul(fold)), f.y.sub(sy.mul(fold)), nz));
   };
 
-  /** Palette entry of a window voxel: `vec4(albedo.rgb, emissive)`. */
-  const palAt = (levelF, voxF) => {
+  /**
+   * The material CLASS byte of a window voxel, clamped onto the table.
+   *
+   * Split out at §19 Stage 4.0b because there are now TWO tables (albedo and
+   * emissive RGB) and reading the window word twice to index them would double
+   * the buffer traffic of every fresh shade for nothing.
+   */
+  const palIndexAt = (levelF, voxF) => {
     const vi = voxF.toUint().toVar();
     const wAddr = levelF.toUint().mul(uint(LEVEL_WORDS)).add(uint(PAL_OFF)).add(shiftRight(vi, uint(2)));
     const shiftBits = bitAnd(vi, uint(3)).mul(uint(8));
     const p = bitAnd(shiftRight(win.buffer.element(wAddr), shiftBits), uint(255)).toVar();
-    return palU.element(min(p, uint(PAL_ENTRIES - 1)));
+    return min(p, uint(PAL_ENTRIES - 1));
   };
+  /** Palette entry of a window voxel: `vec4(albedo.rgb, emissiveMean)`. */
+  const palAt = (levelF, voxF) => palU.element(palIndexAt(levelF, voxF));
 
   /**
    * The window cell a world point falls in, at the FINEST level whose window
@@ -671,10 +711,11 @@ export function createGiGather({
    * above any gbuffer float error and cannot cross a cell a surface sits in.
    */
   const SURFACE_EPS = 0.1;
-  const palAtWorld = (p, n) => {
+  const palIndexAtWorld = (p, n) => {
     const c = cellOfWorld(p.sub(n.mul(v0 * SURFACE_EPS)));
-    return palAt(c.level.toFloat(), c.vi.toFloat());
+    return palIndexAt(c.level.toFloat(), c.vi.toFloat());
   };
+  const palAtWorld = (p, n) => palU.element(palIndexAtWorld(p, n));
 
   /** Striped, uniform-gated counter (see the header's bend 5). */
   const bump = (slot, laneU) => {
@@ -947,7 +988,28 @@ export function createGiGather({
   // emission. No indirect term — multibounce arrives through the cache's EMA
   // and through `injectLitFrame`, which is the point of §K.6.
   const shadeHit = (p, n, levelF, voxF) => {
-    const pal = palAt(levelF, voxF).toVar();
+    const pi = palIndexAt(levelF, voxF).toVar();
+    const pal = palU.element(pi).toVar();
+    // ⭐⭐ §19 STAGE 4.0b — THE EMITTER GATE'S DECISION, ALREADY MADE ON THE CPU.
+    //
+    // `palEm.xyz` is `emissive.rgb × emissiveIntensity` for a class whose
+    // placements were ADMITTED by the radiant-power gate (Φ = π·A·L against
+    // `__giEmitterMinPowerFraction` of scene power), and exactly ZERO for the
+    // other two tiers:
+    //
+    //   · SEATED — a mesh holding one of the four NEE slots below. Its light
+    //     arrives through that NEE loop, and adding the class's emission on top
+    //     is the 2.60× double-count §12.26.7 measured. ONE representation per
+    //     emitter, and for a seat it is the slot.
+    //   · CULLED — below the gate. The user's rule, "the smaller the emitter,
+    //     the more emission strength it needs to be considered as emitting",
+    //     and the whole point of a cull: a culled bulb must not reach the scene
+    //     through the palette after being denied a slot, a tree node and a
+    //     field deposit. Its own glow is the raster material and is untouched.
+    //
+    // See `#gi2SlotEmissive` in GISystem — the decision is not re-derived here
+    // and must not be. This shader only reads the table.
+    const palEm = palEmU.element(pi).toVar();
     const E = vec3(0).toVar();
 
     const toSun = u.sunDir.negate().normalize().toVar();
@@ -1039,7 +1101,7 @@ export function createGiGather({
     //     slot (96 of them per frame, measured) and it cannot be unlucky.
     //
     // Skipped at or above the panel's own plane: its emission is already in
-    // `pal.w` there, and a light cannot illuminate itself without being
+    // `palEm.xyz` there, and a light cannot illuminate itself without being
     // counted twice.
     //
     // ⭐⭐ AND NOT COMPILED AT ALL WHEN THERE ARE SLOTS (§19 Stage 3.5). The
@@ -1091,7 +1153,7 @@ export function createGiGather({
       }
     });
 
-    return pal.xyz.mul(1 / Math.PI).mul(E).add(vec3(pal.w));
+    return pal.xyz.mul(1 / Math.PI).mul(E).add(palEm.xyz);
   };
 
   // ══════════════════════════════════════════════ the HZB screen segment
@@ -1938,9 +2000,15 @@ export function createGiGather({
     const out = vec3(0).toVar();
     If(g.w.greaterThan(0.5), () => {
       const Nn = normalize(loadNrm(px.toInt(), py.toInt()).xyz).toVar();
-      const pal = palAtWorld(g.xyz, Nn).toVar();
+      // §19 Stage 4.0b: the same class byte indexes both tables, and the
+      // emissive term is the class's RGB — `injectLitFrame` writes this colour
+      // straight back into the cache, so a grey lamp here would launder a red
+      // lamp's chroma out of the world's memory of light as well as out of the
+      // frame.
+      const pi = palIndexAtWorld(g.xyz, Nn).toVar();
+      const pal = palU.element(pi).toVar();
       out.assign(pal.xyz.mul(1 / Math.PI).mul(irrNode.load(coord).xyz)
-        .add(glossyNode.load(coord).xyz.mul(u.f0)).add(vec3(pal.w)));
+        .add(glossyNode.load(coord).xyz.mul(u.f0)).add(palEmU.element(pi).xyz));
     }).Else(() => {
       out.assign(u.skyColor);
     });
@@ -2061,13 +2129,17 @@ export function createGiGather({
           .and(dot(nn, cn).greaterThan(0.9))
           .and(dot(cn, g.xyz.sub(cg.xyz)).abs().lessThan(0.02));
         If(sameSurface, () => {
-          const pal = palAtWorld(g.xyz, nn).toVar();
+          const pi = palIndexAtWorld(g.xyz, nn).toVar();
+          const pal = palU.element(pi).toVar();
           accP.addAssign(g.xyz);
           accN.addAssign(nn);
           accE.addAssign(irrNode.load(ivec2(px, py)).xyz);
           accG.addAssign(glossyNode.load(ivec2(px, py)).xyz);
           accL.addAssign(litNode.load(ivec2(px, py)).xyz);
           accA.addAssign(pal.xyz);
+          // The crop receipt keeps ONE emissive number per sample (the readers
+          // print a column), so it is the class's MEAN — `palU.w`, which
+          // `setPalette` keeps in step with the RGB table for exactly this.
           accEm.addAssign(pal.w);
           n.addAssign(1);
         });
@@ -2265,10 +2337,26 @@ export function createGiGather({
 
   // ── JS-side plumbing ──────────────────────────────────────────────────────
   let frame = 0;
+  /**
+   * The class→colour tables. TWO uniform arrays, ONE call, and a re-tint is
+   * exactly this call again — no re-voxelize, no soup rebuild, no recompile,
+   * because the class ASSIGNMENT lives in the soup's `triPal` and each voxel's
+   * `pal` byte and is untouched here (audits §O.5(c)).
+   *
+   * `emissive` accepts a SCALAR (the Cornell rigs author a grey panel that way,
+   * and the CPU reference reads the same number back) or an `[r, g, b]`. Both
+   * fill `palEmU.xyz`; `palU.w` always carries the mean, which is what the crop
+   * and shade receipts print.
+   */
   const setPalette = (entries) => {
     for (let i = 0; i < PAL_ENTRIES; i++) {
       const e = entries[i] ?? { albedo: [0, 0, 0], emissive: 0 };
-      palette[i].set(e.albedo[0], e.albedo[1], e.albedo[2], e.emissive ?? 0);
+      const em = e.emissive ?? 0;
+      const er = Array.isArray(em) ? (em[0] ?? 0) : em;
+      const eg = Array.isArray(em) ? (em[1] ?? 0) : em;
+      const eb = Array.isArray(em) ? (em[2] ?? 0) : em;
+      palette[i].set(e.albedo[0], e.albedo[1], e.albedo[2], (er + eg + eb) / 3);
+      paletteEmissive[i].set(er, eg, eb, 0);
     }
   };
   const beginFrame = (n) => {
@@ -2297,7 +2385,7 @@ export function createGiGather({
 
   return {
     tier, T, R, O, H, SH_R, STRIDE, USE_SH, probeW, probeH, probeCount, width, height,
-    uniforms: u, palette, setPalette, beginFrame, get frame() { return frame; },
+    uniforms: u, palette, paletteEmissive, setPalette, beginFrame, get frame() { return frame; },
     buffers: {
       probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf,
       shadeIn, shadeOut, exhaustOut, noiseBuf,

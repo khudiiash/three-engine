@@ -3928,6 +3928,14 @@ export class GISystem {
                 console.log(
                   "[gi] bounce albedo: compressed-texture averages resolved on the GPU — the palette re-tints on the next scan (the CPU canvas cannot decode KTX2; without this, bounce albedo fell back to near-white base colors and washed the interior out)",
                 );
+                // §19 Stage 4.0b (audits §O.5(c)): the line above has promised
+                // this since the day it was written, and under GI2 nothing
+                // delivered it — the old path re-tinted through
+                // `atlas.setSlotSurface`, and `#checkFingerprint`'s content path
+                // never touches the palette. A textured emissive (Bistro's
+                // `Lantern.mat` is a `.basis`) therefore resolved BLACK at build
+                // and stayed black forever.
+                this.#retintGi2Palette("texture-averages");
               }
             });
         }
@@ -9213,6 +9221,7 @@ export class GISystem {
     const store = renderer?._textures;
     if (typeof bindings?._update !== "function" || typeof store?.has !== "function") return 0;
     let repaired = 0;
+    let skipped = 0;
     for (const texture of textures) {
       if (!texture || store.has(texture) !== true) continue;
       // A COPY: `_update` can add this bind group to the NEW texture's own set,
@@ -9220,17 +9229,99 @@ export class GISystem {
       const groups = store.get(texture)?.bindGroups;
       if (!groups) continue;
       for (const bindGroup of [...groups]) {
+        if (!this.#bindGroupIsBindable(bindGroup)) { skipped++; continue; }
         try {
           bindings._update(bindGroup, [bindGroup]);
           repaired++;
-        } catch { /* a three rename must degrade to the old bug, not a crash */ }
+        } catch (err) {
+          // ⛔⛔ NOT "degrade to the old bug" — a swallowed throw from
+          // `createBindGroup` DEGRADES TO A DEAD RENDERER. See
+          // `#bindGroupIsBindable`. So it is said out loud, once, rather than
+          // discarded: if this ever prints, the pre-flight below has a hole and
+          // the frame after it is already lost.
+          if (!this._warnedRebindThrow) {
+            this._warnedRebindThrow = true;
+            console.warn("[gi] §19 4.0b: a GI texture rebind threw — three's shared bind-group descriptor is now " +
+              `poisoned and every later createBindGroup in this process will fail: ${err?.message ?? err}`);
+          }
+        }
       }
     }
+    if (skipped > 0) this._giRebindSkipped = (this._giRebindSkipped ?? 0) + skipped;
     if (repaired > 0 && globalThis.__giLogComputeRelease === true) {
       console.log(`[gi] §19 4.1: rebound ${repaired} bind groups off ${textures.length} retired GI textures`);
     }
     this._giRebindings = (this._giRebindings ?? 0) + repaired;
     return repaired;
+  }
+
+  /**
+   * ⭐⭐ §19 STAGE 4.0b — CAN THREE STILL BUILD THIS BIND GROUP? THE PRE-FLIGHT
+   * THAT KEEPS A RESIZE FROM KILLING THE RENDERER.
+   *
+   * ## The failure this exists to stop, in order
+   *
+   * 1. A texture's `bindGroups` set (three's `Textures` data map) is APPEND
+   *    ONLY. `Bindings._update` adds a bind group to it and nothing ever
+   *    removes one — not even `_destroyBindings`, which tears the group down
+   *    (`backend.deleteBindGroupData`, `this.delete(bindGroup)`) and destroys
+   *    its uniform buffers. So on any scene with render-object churn — an LOD
+   *    swap, an occlusion cull, a shadow-merge rebuild — `gi2Irradiance`'s set
+   *    accumulates DEAD bind groups.
+   * 2. `#rebindStaleGiTextures` walks exactly that set and runs
+   *    `Bindings._update` on every entry, which is right for the live ones and
+   *    fatal for the dead: `_update` sees a changed texture generation, sets
+   *    `needsBindingsUpdate`, and calls `backend.updateBindings` →
+   *    `createBindGroup` — where binding 0, the `object` uniforms group, has no
+   *    backend buffer any more. `createBindGroup` throws
+   *    `'buffer' property from 'GPUBufferBinding': Required member is undefined`.
+   * 3. ⭐⭐ **AND CATCHING IT DOES NOT CONTAIN IT.**
+   *    `WebGPUBindingUtils.createBindGroup` builds into a MODULE-LEVEL
+   *    `_bindGroupDescriptor` and only clears `entries` AFTER the successful
+   *    `device.createBindGroup`. A throw leaves 15 stale entries — one of them
+   *    the poisoned undefined-buffer one — in the array that every LATER call
+   *    in the process reuses. So the next legitimate bind group, built for an
+   *    ordinary mesh inside `_renderObjectDirect`, inherits the corpse and
+   *    throws too, forever. Measured on Bistro: one bad rebind → **3201**
+   *    throws, entries growing 15, 30, 45 … and the editor at **0 fps**. The
+   *    user's report is that stack, and the try/catch around the rebind is why
+   *    the FIRST victim was invisible.
+   *
+   * So the rebind may not hand three a group it will choke on, and "wrap it in
+   * a try/catch" is not a substitute. Two tests, cheapest first:
+   *
+   *   · LIVENESS — `Bindings` still has a record for it. `_destroyBindings`
+   *     deletes that record at `usedTimes === 0`, so its absence IS "torn
+   *     down". `has` before `get`: `DataMap.get` CREATES.
+   *   · BUFFERS — every buffer binding in the group still has a backend
+   *     buffer. This is the direct precondition `createBindGroup` reads, so
+   *     checking it cannot be fooled by a state we have not thought of.
+   *
+   * ⚠ A three rename must degrade to "skip the rebind" (the old, survivable
+   * stale-texture bug), never to "assume bindable".
+   */
+  #bindGroupIsBindable(bindGroup) {
+    const renderer = this.engine?.renderer;
+    const bindings = renderer?._bindings;
+    const backend = renderer?.backend;
+    if (!bindGroup || !bindings || !backend) return false;
+    try {
+      if (bindings.has?.(bindGroup) !== true) return false;
+      if (bindings.get(bindGroup)?.bindGroup === undefined) return false;
+      for (const binding of bindGroup.bindings ?? []) {
+        if (binding?.isUniformBuffer === true) {
+          if (backend.has?.(binding) !== true) return false;
+          if (backend.get(binding)?.buffer === undefined) return false;
+        } else if (binding?.isStorageBuffer === true) {
+          const attribute = binding.attribute;
+          if (!attribute || backend.has?.(attribute) !== true) return false;
+          if (backend.get(attribute)?.buffer === undefined) return false;
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   #drainRetiredTargets() {
@@ -13982,6 +14073,68 @@ export class GISystem {
   }
 
   /**
+   * ⭐⭐ §19 STAGE 4.0b — THE GI2 PALETTE'S EMISSIVE, AS THE EMITTER GATE'S OWN
+   * DECISION (audits §O.3). The GI2 sibling of `#slotSurface`.
+   *
+   * The user's design rule is *"the smaller the emitter, the more emission
+   * strength it needs to be considered as something emitting light to the
+   * scene"*, and the engine already implements it ONCE, as the radiant-power
+   * gate `Φ = π·A·L` against `__giEmitterMinPowerFraction` of scene power
+   * (`collectEmitters` → `#recordEmitterAdmission` → `#belowEmitterPowerGate`).
+   * The palette must not make every emissive map bounce; it must follow THAT
+   * decision. So this asks the resolver's own answer and never re-derives Φ.
+   *
+   * THREE TIERS, and each one is a different reason for the same zero:
+   *
+   *   · SEATED (`entry.promoted`, i.e. one of the four `MAX_EMITTERS` analytic
+   *     slots) → **0**. `shadeHit` runs NEE over exactly those slots — sphere
+   *     solid angle plus a shadow ray — and then ADDS the class's emission on
+   *     top (`… .add(palEm.xyz)`). Both is the 2.60× double-count §12.26.7
+   *     measured on mean floor irradiance. THE DECISION: keep the SLOT NEE and
+   *     zero the palette. NEE is the sharper of the two (an analytic solid
+   *     angle and an exact shadow ray against a class byte smeared over a
+   *     voxel), and it is the representation the seats exist for.
+   *   · ADMITTED BUT UNSEATED → the resolved `emissive.rgb ×
+   *     emissiveIntensity`, sub-cell damp applied, i.e. the SAME strength the
+   *     seat resolver derives. This is the tier the whole unit exists for:
+   *     ~78 of Bistro's lamps have no slot, GI2 does not sample the light tree
+   *     at hits, and the palette is their ONLY delivery path.
+   *   · CULLED (`#belowEmitterPowerGate`) → **0**. The user's rule, and the
+   *     entire point of a cull: a bulb denied a slot, a tree node and a field
+   *     deposit must not come back through the palette. Its own glow is the
+   *     raster material and is untouched.
+   *
+   * ⚠⚠ AND NOT `#isNeeEmitterMesh` — that is the trap this method exists to
+   * avoid. It returns true for EVERY tree candidate whenever `#lightTreeIsNeeSet()`
+   * is true, and that is true under GI2 because `#rebuild` builds the tree
+   * region on this path. But GI2 does NOT sample the tree at hits (4.0's
+   * decision: keep the plumbing, no tree NEE yet) — `shadeHit`'s NEE is the
+   * four slot uniforms and nothing else. Reusing `#slotSurface` verbatim would
+   * zero all 95 admitted lamps and reproduce the exact symptom this fixes,
+   * through a different door.
+   *
+   * Returns `[r, g, b]`.
+   */
+  #gi2SlotEmissive(entry) {
+    if (!entry) return [0, 0, 0];
+    if (entry.promoted || this._promotedEmitterMeshes?.includes(entry.mesh)) return [0, 0, 0];
+    if (this.#belowEmitterPowerGate(entry)) return [0, 0, 0];
+    let r = entry.surface.emissive.r * entry.surface.emissiveIntensity;
+    let g = entry.surface.emissive.g * entry.surface.emissiveIntensity;
+    let b = entry.surface.emissive.b * entry.surface.emissiveIntensity;
+    const damp = this.#subCellEmissiveDamp(entry);
+    if (damp) {
+      // Chroma first, then energy — identical to `#slotSurface`'s ramp, because
+      // it is the same physical correction on the same quantity.
+      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      r = (lum + (r - lum) * damp.chroma) * damp.energy;
+      g = (lum + (g - lum) * damp.chroma) * damp.energy;
+      b = (lum + (b - lum) * damp.chroma) * damp.energy;
+    }
+    return [r, g, b];
+  }
+
+  /**
    * §18.7 — is this placement below the radiant-power gate, i.e. too small AND
    * too dim to deliver light worth computing? See `GI_EMITTER_MIN_POWER_FRACTION`.
    *
@@ -14806,6 +14959,8 @@ export class GISystem {
     // §18 W2: did this scan flip any layer bit that `shadowMerge`'s depth key
     // reads? See the write site below for what a missed flip costs.
     let depthKeyTagsChanged = false;
+    // §19 Stage 4.0b: emissive meshes the `!material.transparent` guard drops.
+    let transparentEmissive = 0;
     const visit = (object) => {
       // Batched members are hidden yet still drawn (engine/batching.js).
       // `cameraHidden` = hidden by LOD/occlusion only (see Engine's visibility
@@ -14955,6 +15110,21 @@ export class GISystem {
         // baking it into the SDF field would make a fog box shadow the room
         // like a solid crate.
         const isVolume = material?.isVolumeNodeMaterial || material?.userData?.isVolumeMaterial;
+        // §19 Stage 4.0b — SAY WHAT THE TRANSPARENCY GUARD COSTS. The guard
+        // below is KEPT (a transparent surface is not an occluder, and
+        // voxelizing glass would seal every window in the scene), but a
+        // transparent EMISSIVE mesh is a light the palette can never carry —
+        // Bistro's `MASTER_Focus_Glass` is ten of them. Counted here, reported
+        // by `#startGi2Build`, so it reads as a fact about the scene the author
+        // can act on rather than as an emitter that mysteriously does nothing.
+        // The node's PRESENCE only, no resolve: this runs per mesh on every
+        // 250 ms scan and must not walk a shader graph.
+        if (position && material?.transparent && !isVolume && !editorOnly
+          && (material.emissiveNode
+            || (material.emissive && (material.emissiveIntensity ?? 1) > 0
+              && (material.emissive.r + material.emissive.g + material.emissive.b) > 1e-4))) {
+          transparentEmissive++;
+        }
         if (position && material && !material.transparent && !isVolume && !editorOnly && triCount <= MAX_TRIS_PER_MESH) {
           meshes.push(object);
         } else if (triCount > MAX_TRIS_PER_MESH) {
@@ -14967,6 +15137,7 @@ export class GISystem {
     this._bucketTally = tally;
     this._tierTally = tierTally;
     this._dynamicSurfaces = dynamicSurfaces;
+    this._giTransparentEmissiveSkipped = transparentEmissive;
     // §19 STAGE 0.3: a RECEIPT, not a trigger. See the tag write site above —
     // nothing outside GI reacts to these bits any more, so this number is free
     // to keep climbing while the merge stays put, which is exactly the pair of
@@ -15355,6 +15526,11 @@ export class GISystem {
     const entries = this.#buildEntries(meshes);
     state.entries = entries;
     this.#syncSlots(entries);
+    // §19 Stage 4.0b: the GI2 sibling of `#syncSlots`' `atlas.setSlotSurface`.
+    // A live material edit, or a seat/admission flip, changes what
+    // `#gi2SlotEmissive` answers for a placement whose CLASS BYTE is unchanged
+    // — so the table moves and the world does not have to.
+    if (GI2_PATH) this.#retintGi2Palette("content-scan");
     // ⚠ A SEAT RE-RANK MUST NOT REBUILD THE BVH (2026-08-16).
     //
     // The seat flip used to be signalled by `this._fingerprint = null`, which
@@ -16240,23 +16416,15 @@ export class GISystem {
    * precisely what the soup is a function of.
    */
   #startGi2Build(meshes, gi2) {
-    const { geometries, placements } = this.#occupancyContentOf(meshes);
-    const surfaceOf = new Map();
+    // ⭐ UNCAPPED, and see `#occupancyContentOf`'s header for why the 768 was
+    // never GI2's number to obey.
+    const { geometries, placements } = this.#occupancyContentOf(meshes, { cap: Infinity });
     const parts = [];
-    const enriched = placements.map((p) => {
-      let s = surfaceOf.get(p.mesh);
-      if (!s) {
-        const raw = resolveMaterialSurface(p.mesh.material, p.mesh.name);
-        s = {
-          albedo: [raw.color.r, raw.color.g, raw.color.b],
-          emissive: (raw.emissive.r + raw.emissive.g + raw.emissive.b) / 3 * (raw.emissiveIntensity ?? 1),
-        };
-        surfaceOf.set(p.mesh, s);
-      }
+    const enriched = this.#gi2PaletteSurfaces(placements);
+    for (const p of placements) {
       const e = p.matrix.elements;
       parts.push(p.geometryKey, e[12].toFixed(3), e[13].toFixed(3), e[14].toFixed(3), e[0].toFixed(3), e[5].toFixed(3), e[10].toFixed(3));
-      return { ...p, albedo: s.albedo, emissive: s.emissive };
-    });
+    }
     // §19 Stage 4.0: the mesh list this build's movers are derived FROM, so a
     // promotion can re-derive without re-walking the scene. Cleared with the
     // build, like every other per-state field.
@@ -16289,12 +16457,36 @@ export class GISystem {
       ? enriched.filter((p) => !moverMeshes.has(p.mesh))
       : enriched;
     const soupKey = `${geometries.length}:${staticPlacements.length}:${parts.join(",")}`;
+    // §19 Stage 4.0b: the join a re-tint needs — key → the mesh whose material
+    // it re-resolves and the AREA it was weighted with. Held here (not on the
+    // occupancy field, which GI2 does not build) and replaced with the build.
+    this._gi2PaletteMeshByKey = new Map(staticPlacements.map((p) => [p.key, { mesh: p.mesh, area: p.area }]));
+    // A NEW build means a new assignment, so the previous build's table
+    // signature says nothing about this one — clearing it makes the first
+    // re-tint after a build unconditional (it writes what the build wrote, and
+    // says so once).
+    this._gi2PaletteSig = null;
     this._gi2BuildAt = performance.now();
     // Said BEFORE the await, and that is the point: "the soup line never
     // printed" has two causes — the worker never finished, or the walk never
     // reached it — and only a line on this side tells them apart.
-    console.log(`[gi2] soup requested: ${geometries.length} geometries / ${staticPlacements.length} static placements` +
-      ` (${enriched.length - staticPlacements.length} held out as movers), ${movers.length} movers`);
+    // ⭐ THE PAST-THE-CAP COUNT IS THE WHOLE RECEIPT FOR §19 Stage 4.0b. "1532
+    // placements" alone does not say the cut is gone — 768 next to it does.
+    const pastCap = Math.max(0, enriched.length - MAX_INSTANCE_SLOTS);
+    const skippedTransparent = this._giTransparentEmissiveSkipped ?? 0;
+    console.log(`[gi2] soup ${enriched.length} placements (${geometries.length} geometries), ` +
+      `${pastCap} past the old ${MAX_INSTANCE_SLOTS} cap — ` +
+      `${staticPlacements.length} static (${enriched.length - staticPlacements.length} held out as movers), ` +
+      `${movers.length} movers` +
+      // The `!material.transparent` guard in `#collectMeshes` is KEPT (a
+      // transparent surface is not an occluder and voxelizing glass would seal
+      // every window in the scene) — but an emissive one is a light the palette
+      // will never carry, and that is a fact about the SCENE the author can act
+      // on, not a bug. Bistro's `MASTER_Focus_Glass` is 10 such placements.
+      (skippedTransparent
+        ? `; ⚠ ${skippedTransparent} TRANSPARENT EMISSIVE placement(s) skipped by the mesh filter — ` +
+          "they occlude nothing and bounce nothing; split the glowing part into an opaque mesh to light the scene with it"
+        : ""));
     gi2.build({ geometries, placements: staticPlacements, movers, soupKey })
       .then((ok) => {
         if (!ok || this.state?.screen?.gi2 !== gi2) return;
@@ -16307,6 +16499,230 @@ export class GISystem {
         );
       })
       .catch((err) => console.warn(`[gi2] build failed: ${err?.message ?? err}`));
+  }
+
+  /**
+   * ⭐⭐ §19 STAGE 4.0b — THE PALETTE'S INPUT, IN ONE PLACE.
+   *
+   * Used by the build AND by `#retintGi2Palette`, and that is the point: two
+   * copies of "what colour is this placement" drift, and a drift here is a
+   * palette that silently disagrees with the class bytes already written into
+   * every voxel.
+   *
+   * Per placement:
+   *   · `albedo`      the resolved bounce colour (texture mean × base colour).
+   *   · `emissive`    `[r, g, b]` from `#gi2SlotEmissive` — the ADMISSION
+   *                   decision, not the raw material value.
+   *   · `area`        the placement's WORLD bounding-box surface area, the
+   *                   ranking weight (§O.4: rank by area, not by count).
+   *   · `emitter`     a STATIC flag: does this material carry an emissive
+   *                   expression at all, `emissivePending` included. Never the
+   *                   resolved value — see `buildGi2Palette`'s header for why
+   *                   the class assignment may not depend on anything a
+   *                   re-tint can change.
+   *   · `matKey`      the material's identity. BOTH halves of the palette
+   *                   bucket on it, so a class survives a re-tint by
+   *                   construction — see `buildGi2Palette`.
+   *   · `key`         `slotKeyOf(mesh, instanceId)`, the join back to
+   *                   `state.entries` and the handle a re-tint re-resolves by.
+   */
+  #gi2PaletteSurfaces(placements) {
+    const entryOf = new Map();
+    for (const e of this.state?.entries ?? []) entryOf.set(e.key, e);
+    const surfaceOf = new Map();
+    const box = (this._gi2PalBox ??= new THREE.Box3());
+    const size = (this._gi2PalSize ??= new THREE.Vector3());
+    return placements.map((p) => {
+      let s = surfaceOf.get(p.mesh);
+      if (!s) {
+        const raw = resolveMaterialSurface(p.mesh.material, p.mesh.name);
+        const mat = Array.isArray(p.mesh.material) ? p.mesh.material[0] : p.mesh.material;
+        // "Is this an emitter class" — a fact about the MATERIAL's shape, not
+        // about how bright it currently resolves.
+        const authored = Math.max(raw.emissive.r ?? 0, raw.emissive.g ?? 0, raw.emissive.b ?? 0)
+          * (raw.emissiveIntensity ?? 1);
+        s = {
+          albedo: [raw.color.r, raw.color.g, raw.color.b],
+          emitter: authored > 1e-4 || !!raw.emissivePending,
+          matKey: mat?.uuid ?? p.mesh.uuid,
+        };
+        surfaceOf.set(p.mesh, s);
+      }
+      const key = slotKeyOf(p.mesh, p.instanceId);
+      const entry = entryOf.get(key);
+      const bb = p.mesh.geometry?.boundingBox
+        ?? (p.mesh.geometry?.computeBoundingBox?.(), p.mesh.geometry?.boundingBox);
+      let area = 1;
+      if (bb) {
+        box.copy(bb).applyMatrix4(p.matrix);
+        box.getSize(size);
+        area = 2 * (size.x * size.y + size.y * size.z + size.z * size.x);
+      }
+      return {
+        ...p, key,
+        albedo: s.albedo,
+        emissive: this.#gi2SlotEmissive(entry),
+        area,
+        emitter: s.emitter,
+        matKey: s.matKey,
+      };
+    });
+  }
+
+  /**
+   * ⭐⭐ §19 STAGE 4.0b — THE RE-TINT (audits §O.5(c)). THE TABLE CHANGES, THE
+   * ASSIGNMENT MUST NOT.
+   *
+   * The class→colour tables are two `uniformArray(vec4)`s in `gatherProbes`
+   * (`palU` / `palEmU`), so re-tinting is a UNIFORM WRITE: no re-voxelize, no
+   * soup rebuild, no recompile, no compile wave. The class ASSIGNMENT is the
+   * opposite — it is baked into the worker's `triPal` and stamped into every
+   * voxel's `pal` byte — so this recomputes the per-class MEANS against the
+   * assignment the live build already produced and never re-clusters.
+   *
+   * TWO CALLERS, both of which used to leave the palette stale:
+   *   1. The GPU texture-average drain, whose own log line has promised *"the
+   *      palette re-tints on the next scan"* since the day it was written. The
+   *      old SRC path delivered on that through `atlas.setSlotSurface`; GI2 had
+   *      no equivalent, so a compressed emissive map (Bistro's `Lantern.mat` is
+   *      one) resolved to black at build and stayed black forever.
+   *   2. `#checkFingerprint`'s content path — a live material edit, or a
+   *      seat/admission flip, which changes what `#gi2SlotEmissive` answers for
+   *      a placement whose class byte is unchanged.
+   *
+   * ⚠ `soupKey` has NO material term, and that is CORRECT while the class
+   * assignment depends only on static facts (see `#gi2PaletteSurfaces`). If
+   * anyone ever makes the assignment depend on a value that can change, the
+   * soup key has to gain that term or the palette silently desynchronises from
+   * the voxels.
+   */
+  #retintGi2Palette(reason) {
+    const gi2 = this.state?.screen?.gi2;
+    const assign = gi2?.paletteAssign;
+    const gather = gi2?.gather;
+    if (!assign || !gather || !assign.keys?.length) return false;
+    // The placement list that PRODUCED the assignment, keyed — an index into
+    // `classOf` is only meaningful against that same list, so it is stashed at
+    // build rather than re-derived from a scene that may have changed.
+    const meshByKey = this._gi2PaletteMeshByKey;
+    if (!meshByKey) return false;
+    // `we` is the emissive's OWN weight, and keeping it separate from `w` is
+    // the fix for an intermittent palette wipe. See the `entry` guard below.
+    const acc = Array.from({ length: assign.classCount }, () => ({ w: 0, we: 0, ar: 0, ag: 0, ab: 0, er: 0, eg: 0, eb: 0 }));
+    const entryOf = new Map();
+    for (const e of this.state?.entries ?? []) entryOf.set(e.key, e);
+    const surfaceOf = new Map();
+    let touched = 0;
+    let noEntry = 0;
+    for (let i = 0; i < assign.keys.length; i++) {
+      const key = assign.keys[i];
+      const cls = assign.classOf[i];
+      if (key == null || !(cls >= 0) || cls >= assign.classCount) continue;
+      const rec = meshByKey.get(key);
+      if (!rec?.mesh?.parent) continue;
+      let s = surfaceOf.get(rec.mesh);
+      if (!s) {
+        const raw = resolveMaterialSurface(rec.mesh.material, rec.mesh.name);
+        s = { albedo: [raw.color.r, raw.color.g, raw.color.b] };
+        surfaceOf.set(rec.mesh, s);
+      }
+      // ⛔⛔ NO ENTRY MEANS **UNKNOWN**, AND UNKNOWN MUST NOT MEAN ZERO.
+      //
+      // `state.entries` is keyed by `slotKeyOf(mesh, instanceId)` on the mesh
+      // set the LAST scan walked; `assign.keys` is keyed on the set the BUILD
+      // walked. A `shadowMerge` rebuild between the two replaces the meshes, so
+      // the lookup misses even though the placement's mesh is still parented
+      // (it is a different object with the same role). Reading that miss as
+      // "this placement emits nothing" wiped every emissive class on Bistro —
+      // `palette 64 classes, 0 with emission` on one boot and 8 on the next,
+      // from the same code, because it depended on whether a merge rebuild
+      // happened to land inside the 250 ms scan window.
+      //
+      // Same asymmetry `#belowEmitterPowerGate` already states: a wrongly-kept
+      // emitter costs a little time, a wrongly-zeroed one silently deletes a
+      // light the user authored. So a placement with no entry contributes to
+      // the ALBEDO (which is read from the live material and is knowable) and
+      // to NOTHING ELSE; a class with no entry-backed placement keeps the
+      // emissive it already has.
+      const entry = entryOf.get(key);
+      const a = acc[cls];
+      const w = Math.max(1e-6, rec.area ?? 1);
+      if (entry) {
+        const em = this.#gi2SlotEmissive(entry);
+        a.we += w;
+        a.er += w * em[0]; a.eg += w * em[1]; a.eb += w * em[2];
+      } else {
+        noEntry++;
+      }
+      a.w += w;
+      a.ar += w * s.albedo[0]; a.ag += w * s.albedo[1]; a.ab += w * s.albedo[2];
+      touched++;
+    }
+    // ⛔⛔ A RE-TINT MAY ONLY EVER **CHANGE** A CLASS, NEVER **ERASE** ONE.
+    //
+    // `shadowMerge` rebuilds its proxies on its own cadence, and a rebuild
+    // creates NEW meshes: every key in `assign.keys` then points at a detached
+    // original, `rec.mesh.parent` is null, and the whole loop above skips. The
+    // first version published the result anyway — so a merge rebuild BLACKENED
+    // THE ENTIRE PALETTE, emissive included. Measured on Bistro: `palette 64
+    // classes, 0 with emission` on a boot that had logged 8 a minute earlier,
+    // and every arm of the §O gate reading zero. (Same shape as
+    // [[gi-shadowmerge-invalidation-loop]]: a rebuild's new objects are not a
+    // "change", they are a different population.)
+    //
+    // Two guards, and they are different failures:
+    //   · MOST OF THE POPULATION GONE → the assignment itself is stale (it is
+    //     keyed to placements that no longer exist), so a re-tint is not the
+    //     right repair at all. Decline, once, and leave the live table alone;
+    //     the mesh-set change is already driving a rebuild, which re-mints both.
+    //   · A SINGLE CLASS with no surviving placement → keep the value it has.
+    //     "Nothing contributed to this class this time" is not evidence that it
+    //     is black.
+    if (touched < assign.keys.length * 0.5) {
+      if (!this._warnedRetintPopulation) {
+        this._warnedRetintPopulation = true;
+        console.log(`[gi2] palette re-tint (${reason}) DECLINED — only ${touched} of ${assign.keys.length} ` +
+          "placements from the live assignment are still in the scene (a merge rebuild replaced them). " +
+          "The table is left alone; the rebuild that follows re-mints the assignment and the colours together.");
+      }
+      return false;
+    }
+    const curA = gather.palette;
+    const curE = gather.paletteEmissive;
+    const next = acc.map((a, i) => {
+      const pa = curA?.[i];
+      const pe = curE?.[i];
+      const keptAlbedo = pa ? [pa.x, pa.y, pa.z] : [0, 0, 0];
+      const keptEmissive = pe ? [pe.x, pe.y, pe.z] : (pa ? [pa.w, pa.w, pa.w] : [0, 0, 0]);
+      return {
+        albedo: a.w > 0 ? [a.ar / a.w, a.ag / a.w, a.ab / a.w] : keptAlbedo,
+        // The emissive has its OWN weight: only placements whose ENTRY was
+        // found contribute, so a class the scan could not resolve keeps what it
+        // has instead of going dark (see the `entry` guard above).
+        emissive: a.we > 0 ? [a.er / a.we, a.eg / a.we, a.eb / a.we] : keptEmissive,
+      };
+    });
+    // The reserved "no surface" entry stays black — `palAt` clamps every stale
+    // or unvoxelized byte onto it, and a non-black value there lights every
+    // hole in the window.
+    next[assign.classCount - 1] = { albedo: [0, 0, 0], emissive: [0, 0, 0] };
+    const emitting = next.filter((e, i) => i < assign.classCount - 1
+      && (e.emissive[0] + e.emissive[1] + e.emissive[2]) > 0).length;
+    // ⚠ A NO-OP RE-TINT IS NOT A RE-TINT. This runs on every content scan, and
+    // most content scans change nothing about a colour — writing the same 128
+    // vec4s and printing a line for it would be the "drain cycle N, no flips"
+    // spam this module has already paid for once. The signature is the table
+    // itself, at three decimals: below that nothing is visible anyway.
+    const sig = next.map((e) => `${e.albedo[0].toFixed(3)},${e.albedo[1].toFixed(3)},${e.albedo[2].toFixed(3)},` +
+      `${e.emissive[0].toFixed(3)},${e.emissive[1].toFixed(3)},${e.emissive[2].toFixed(3)}`).join("|");
+    if (sig === this._gi2PaletteSig) return false;
+    this._gi2PaletteSig = sig;
+    gather.setPalette(next);
+    console.log(`[gi2] palette re-tint (${reason}): ${touched} placements over ${assign.classCount} classes, ` +
+      `${emitting} with emission` +
+      (noEntry ? `, ${noEntry} with no live entry (emissive kept, not zeroed)` : "") +
+      " — uniform write only, no re-voxelize");
+    return true;
   }
 
   /**
@@ -16547,7 +16963,36 @@ export class GISystem {
     gi2.setMovers(next);
   }
 
-  #occupancyContentOf(meshes) {
+  /**
+   * ⭐⭐ §19 STAGE 4.0b — THE CAP IS THE SRC ATLAS'S, AND GI2 DOES NOT HAVE ONE.
+   *
+   * `MAX_INSTANCE_SLOTS` (768) exists for the SRC atlas's `localToWorld`
+   * uniform array (`slotRegistry.js`) — a real, fixed GPU binding. GI2 does not
+   * build that atlas at all (`#rebuild`'s `const occField = GI2_PATH ? null :
+   * …`); its consumers are the triangle soup's `triPal` (a storage buffer) and
+   * each voxel's `pal` byte, and neither has a slot ceiling. The soup already
+   * caps by TRIANGLES, largest-first per tier, which is a budget in the
+   * quantity that actually costs money.
+   *
+   * ⛔ WHAT THE SHARED CAP COST, MEASURED (audits §O.1). Bistro has 1532 mesh
+   * placements. The walk `break`s at 768, so 764 of them had NO OCCUPANCY, NO
+   * BOUNCE, NO SHADOW and NO PALETTE ENTRY under GI2 — and because the cut is
+   * first-come in hierarchy order, WHICH 764 was an accident of the prefab's
+   * traversal order. Every lantern, street light, string light and shop sign in
+   * that scene sits past index 1156, i.e. entirely on the wrong side of it.
+   * That is also where `GI_SPATIAL_REBUILD_PLAN.md`'s "no mesh/tri caps, 768
+   * placements" came from: 768 IS the cap, read as the scene's count —
+   * [[probe-blind-statistics]] with a number attached.
+   *
+   * So the cap is a PARAMETER now. `#startGi2Build` passes `Infinity`; the SRC
+   * and BVH callers keep the default, because their binding is real.
+   *
+   * ⚠ AND THE `break` ONLY EVER LEFT THE INNER LOOP. Every mesh past the cut
+   * still paid `serializeMeshForBake` (a full position/index copy) and still
+   * appended to `geometries` for zero placements. The outer guard below is
+   * what makes the capped path actually stop.
+   */
+  #occupancyContentOf(meshes, { cap = MAX_INSTANCE_SLOTS } = {}) {
     const geometries = [];
     const seen = new Set();
     const placements = [];
@@ -16566,6 +17011,7 @@ export class GISystem {
     // bundle sync must not walk a shader-graph material 24 times a frame.
     const analyticOnly = (this._analyticOnlyMovers = []);
     for (const mesh of meshes) {
+      if (placements.length >= cap) break;
       if (this.#analyticOnlyMover(mesh)) {
         analyticOnly.push({ mesh, surface: resolveMaterialSurface(mesh.material, mesh.name) });
         continue;
@@ -16593,7 +17039,7 @@ export class GISystem {
         geometries.push({ key: record.geometryKey, positions: record.positions, index: record.index, uvs: record.uvs });
       }
       for (const instanceId of this.#placementsOf(mesh)) {
-        if (placements.length >= MAX_INSTANCE_SLOTS) break;
+        if (placements.length >= cap) break;
         const matrix = new THREE.Matrix4();
         if (instanceId == null || !mesh.isInstancedMesh) {
           matrix.copy(mesh.matrixWorld);

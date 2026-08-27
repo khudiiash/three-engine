@@ -1539,3 +1539,81 @@ because nobody had.
 4. `test:gi2-lightshadow`, `probe:gi2-voxelize`, `test:gi-emitter-tsl`,
    `test:mcp-coverage` unchanged. ⚠ 4.0's warning stands: do NOT run GPU
    batteries in parallel.
+
+---
+
+## P. STAGE 3.7 SPEC — THE CACHE CONVERGES, RAYS GO WHERE NEEDED (from the user's 08-27 screenshots)
+
+**Symptoms (user's eyes, Bistro):** (1) "very dirty" — a spatially FIXED,
+temporally STABLE blotch pattern 0.3-1 m in world size on the shaded façade,
+near-black chairs and wall panels under a bright blue sky; (2) "very noisy on
+movement". The 3.6 receipts were green because they measure temporal noise
+and 5-px spatial noise; neither sees a stable 1 m blotch.
+
+**Mechanisms:**
+- P.1 **The cache is one-shot.** A voxel face is shaded ONCE on first hit
+  (`shadeHit`, α=1, a 2×2-stratified sun/NEE estimate) and never again —
+  `relightBricks` (K.6/K.7) was never implemented. Every bounce path reads a
+  permanently baked 4-sample error; the probe filter smears per-voxel errors
+  into blobs. This is the dirt.
+- P.2 **No sky irradiance at hits.** `shadeHit` = albedo × (sun × DDA shadow
+  + slot NEE + neighbour irradiance) + emissive. Outdoors the dominant
+  incident light on a shaded surface IS the sky; a hit voxel's outgoing
+  radiance omits it, so everything seen by bounce (awning undersides, chairs,
+  recesses, the whole shade side) is starved. The old lattice carried sky in
+  every bin.
+- P.3 **Fresh probes start from zero with 16 of 64 directions.** Camera
+  motion re-places tiles on new world positions; those probes show a 1-frame
+  16-ray estimate until history builds. With a converged cache the variance
+  is direction-sampling only (Cornell: 50 % in 1 frame); with a dirty cache
+  it is the dirt sampled at random.
+- P.4 The moved-lamp lag from 3.6 (H trades variance for lag) is the same
+  allocation problem: change needs rays, not forgetting.
+
+**The unit (gatherProbes.js + radianceCache.js; fixed per-frame budgets, no knobs):**
+1. **Cache accumulation.** Every window hit may contribute a shade sample:
+   with probability `p_shade` (tier: 1/4 desktop, 1/8 phone) the hit is
+   re-shaded (sun shadow ray + slot NEE + sky ray, see 2) and EMA'd into the
+   face slot with `α = 1/min(n+1, 16)` (a per-slot sample count `n` in the
+   slot's spare bits — RGBE has none: widen the slot to 2 u32 (RGBE + n·2^24
+   | flags) or keep a parallel u8 count buffer; say which, budget it). The
+   first shade stays α=1. Receipt: cache σ/mean over the named faces (3.6's
+   receipt) AND a NEW spatial receipt: variance of the cache across the 64
+   voxels of one flat-wall brick after 300 frames (< 3 %), on Cornell and on
+   a Bistro façade brick (pick by world coordinate).
+2. **Sky at hits.** Each shade sample traces ONE cosine-weighted ray from the
+   hit (biased by the origin-escape rule) into the window: miss → the scene
+   sky radiance along that direction (the same `sky` node the probes use, ×
+   the S1 intensity); hit → the cached radiance of what it hit (one indirect
+   bounce for free). Accumulated by (1), this converges to sky irradiance ×
+   visibility. Receipt: Cornell's b4 parity on the wall crops must not move
+   > 3 % (the Cornell sky is black); a new "open box" arm (the Cornell room
+   with the ceiling removed under a constant sky) where the CPU reference
+   with sky must be matched within 15 % on the floor and the shaded wall.
+3. **Need-driven ray allocation.** Per frame, per probe, `rays_i` ∝ need:
+   fresh (n=0) → all 64 directions this frame; flagged by the variance test →
+   32; mature → 8 (desktop) / 4 (phone); total clamped to the tier budget by
+   scaling the mature share first. Implement as a per-probe ray count in
+   probeMeta + a prefix-sum dispatch (or a fixed 64-thread block per probe
+   that early-outs — measure both; the block form needs no prefix pass).
+   Receipt: temporal p95 DURING a 90° orbit over 60 frames on Bistro
+   (the 3.3 paired instrument) — target ≤ 3 %; the moved-panel reconvergence
+   from 3.6 → ≥ 80 % at 30 frames.
+4. **Neighbour prior.** A fresh probe initialises its SH from the 3×3
+   neighbours' filtered SH (plane/normal-weighted; skip if none valid) with
+   n=1 so its own rays take over immediately. Receipt: first-frame irradiance
+   error of freshly placed probes vs their converged value (a harness arm
+   that hides then reveals a probe row) — median < 25 %.
+5. **The "dirty" receipt** (add to the boot probe): on Bistro, from the
+   user's three camera poses (store them in the probe: façade wide, doors
+   close-up, street overview — read the poses from the screenshots' gizmo /
+   ask the operator for `viewport_getCamera` values), the spatial variance of
+   the irradiance texture at a 1 m WORLD scale (box-blur radius = 1 m
+   projected, minus 4 m) over the façade region ÷ mean — report before/after;
+   target < 5 %. And the façade's mean irradiance vs the sunlit pavement's:
+   a shaded wall under a clear sky should read 15-30 % of the sunlit ground,
+   not < 5 %.
+
+Cost ceiling: the chain stays ≤ 4 ms at 1650×970 ultra (3.6: 3.21); the
+shade-sample budget is what bends. Gates: all 3.6 gates + the receipts above
++ `test:gi-moved-lamp` (+RED) + `test:gi-sunleak`.

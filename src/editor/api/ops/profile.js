@@ -693,6 +693,11 @@ defineOp({
           soupStallMs: +(s.soupStallMs ?? 0).toFixed(1),
           soupTruncated: s.soupTruncated,
           palClasses: s.palClasses,
+          // §19 Stage 4.0b (audits §O.4): "N classes" and "N of them emit" are
+          // different facts, and Bistro shipped `0 with emission` for three
+          // sessions because only the first was ever published.
+          palEmissiveClasses: s.palEmissiveClasses,
+          palEmitterBand: s.palEmitterBand,
           probes: s.probes,
           raysPerFrame: s.rays,
           movers: s.movers,

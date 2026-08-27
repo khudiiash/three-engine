@@ -127,60 +127,265 @@ export function createGi2Volume({ bounds, res = null, rayHitMode = undefined }) 
 }
 
 /**
- * Quantize per-placement surfaces into the gather's 16-entry palette.
+ * How many of the palette's classes are reserved for ADMITTED EMITTERS.
  *
- * §K.2 stores ONE BYTE per voxel, and §L.2 reads it as a material CLASS — a
+ * §O.4's "reserve a band of 8". A lamp is one placement against a wall's four
+ * hundred, so on any ranking a scene's emitters lose every vote — which is
+ * how Bistro shipped `0 of 15 classes with emission` while its own resolver
+ * was finding 95 lamps. The band takes them out of the contest entirely.
+ *
+ * The band sits at the TOP of the real range on purpose: `windowVoxelize`
+ * merges a shared cell with `max(packed word)`, so a lamp that shares a voxel
+ * with the wall behind it KEEPS ITS OWN CLASS instead of losing it. That is
+ * the difference between a small emitter that emits and one that silently
+ * does not.
+ */
+export const GI2_PAL_EMITTER_CLASSES = 8;
+
+/**
+ * Quantize per-placement surfaces into the gather's class table.
+ *
+ * §K.2 stores ONE BYTE per voxel and §L.2 reads it as a material CLASS — a
  * scene-independent table, not a per-mesh array, which is what keeps every
- * kernel's WGSL free of scene numbers. The clustering is a fixed 3×3×3 albedo
- * lattice plus an emissive bucket, ranked by how much SURFACE each class
- * covers (placement count is the only area proxy available before the soup is
- * built) — never by mesh id, so adding a prop cannot renumber the palette and
- * strand every voxel already written with the old index.
+ * kernel's WGSL free of scene numbers.
  *
- * @param {Array<{albedo:number[], emissive:number}>} surfaces per placement
- * @returns {{palette: Array<{albedo:number[], emissive:number}>, index: number[]}}
+ * ⭐⭐ §19 STAGE 4.0b — WHAT REPLACED THE 3-LEVEL LATTICE, AND WHY (audits §O.4).
+ *
+ * The old clustering was a fixed 3×3×3 albedo lattice ranked by PLACEMENT
+ * COUNT. Measured over Bistro's 131 materials / 1532 placements it used SEVEN
+ * of its 27 possible buckets and carried 0.1113 mean absolute per-channel
+ * albedo error; a weighted median cut at the same class count is 9× better and
+ * at 64 classes is 140× better. Two things changed:
+ *
+ *   1. **A weighted MEDIAN CUT, not a lattice.** Deterministic, ~1500 points,
+ *      microseconds on the CPU, once per build. Boxes split along their widest
+ *      channel at the WEIGHTED median, so classes land where the scene's
+ *      colours actually are instead of where a fixed grid says they might be.
+ *   2. **Ranked by AREA, not by placement count.** Count is a proxy for area
+ *      only when every placement is the same size, and in an imported scene it
+ *      is not: 400 cobblestones and one facade are 400 votes against 1 for a
+ *      surface the facade dominates. The weight here is the placement's world
+ *      bounding-box surface area, which is what a ray is actually likely to
+ *      hit.
+ *
+ * ⚠ THE ASSIGNMENT IS BAKED, THE TABLE IS NOT. A class index is written into
+ * the soup's `triPal` and into every voxel's `pal` byte; the colours are two
+ * uniform arrays. So this function's OUTPUT INDEX must be a function of facts
+ * that do not change while a build lives — which is why the emitter test below
+ * is `emitter` (a static flag the caller derives from "does this material have
+ * an emissive expression at all", `emissivePending` included) and NOT the
+ * resolved emissive value, and why a re-tint (`#retintGi2Palette`) recomputes
+ * the class MEANS against this same assignment instead of re-clustering.
+ *
+ * @param {Array<{albedo:number[], emissive:number[]|number, area:number,
+ *   emitter:boolean, matKey:string}>} surfaces per placement
+ * @returns {{palette: Array<{albedo:number[], emissive:number[]}>,
+ *   index: number[], emitterClasses: number[]}}
  */
 export function buildGi2Palette(surfaces) {
-  const q = (v) => Math.min(2, Math.max(0, Math.round(Math.min(1, Math.max(0, v)) * 2)));
-  const buckets = new Map();
-  const keys = [];
-  for (const s of surfaces) {
+  const rgbOf = (e) => (Array.isArray(e) ? [e[0] ?? 0, e[1] ?? 0, e[2] ?? 0] : [e ?? 0, e ?? 0, e ?? 0]);
+  const items = surfaces.map((s) => {
     const a = s?.albedo ?? [0.5, 0.5, 0.5];
-    const e = s?.emissive ?? 0;
-    // Emissive surfaces get their own classes: a lamp's albedo is irrelevant
-    // next to what it emits, and merging it into a neutral class would put the
-    // emission on every wall that shares the bucket.
-    const key = e > 1e-4
-      ? `e${q(Math.min(1, e / 8))}:${q(a[0])}${q(a[1])}${q(a[2])}`
-      : `d${q(a[0])}${q(a[1])}${q(a[2])}`;
-    keys.push(key);
-    const b = buckets.get(key);
-    if (b) {
-      b.n++;
-      b.r += a[0]; b.g += a[1]; b.b += a[2]; b.e += e;
-    } else {
-      buckets.set(key, { key, n: 1, r: a[0], g: a[1], b: a[2], e });
+    const e = rgbOf(s?.emissive ?? 0);
+    return {
+      a: [a[0] ?? 0, a[1] ?? 0, a[2] ?? 0],
+      e,
+      // ⚠ A ZERO WEIGHT MUST NOT EXIST. A degenerate placement (a flat quad's
+      // world box has zero area on one axis, a prop with no bounding box has
+      // none at all) would be invisible to every weighted median and could
+      // land the whole population on one side of a split.
+      w: Math.max(1e-6, s?.area ?? 1),
+      emitter: !!s?.emitter,
+      // The MATERIAL's identity. Both halves of the palette bucket on it,
+      // because it is the one property of a placement that a re-tint cannot
+      // change — see the diffuse block below for what happens when the key is a
+      // colour instead.
+      mk: s?.matKey ?? s?.emitterKey ?? "",
+    };
+  });
+
+  const palette = Array.from({ length: PAL_ENTRIES }, () => ({ albedo: [0, 0, 0], emissive: [0, 0, 0] }));
+  const index = new Array(items.length).fill(PAL_NONE);
+
+  // ── THE EMITTER BAND ──────────────────────────────────────────────────────
+  //
+  // Grouped by the caller's `matKey` — a MATERIAL identity, i.e. a fact
+  // that cannot move under a re-tint. Ranked by area × emitted luminance so a
+  // material whose placements were all CULLED by the power gate (it resolves
+  // to zero emission, by design) sinks to the tail and shares the last class
+  // instead of evicting a lamp that actually lights the scene.
+  const emitGroups = new Map();
+  items.forEach((it, i) => {
+    if (!it.emitter) return;
+    const g = emitGroups.get(it.mk) ?? { key: it.mk, w: 0, score: 0, ar: 0, ag: 0, ab: 0, er: 0, eg: 0, eb: 0, idx: [] };
+    const lum = 0.2126 * it.e[0] + 0.7152 * it.e[1] + 0.0722 * it.e[2];
+    g.w += it.w;
+    g.score += it.w * lum;
+    g.ar += it.w * it.a[0]; g.ag += it.w * it.a[1]; g.ab += it.w * it.a[2];
+    g.er += it.w * it.e[0]; g.eg += it.w * it.e[1]; g.eb += it.w * it.e[2];
+    g.idx.push(i);
+    emitGroups.set(it.mk, g);
+  });
+  const emitRanked = [...emitGroups.values()].sort((x, y) => (y.score - x.score) || (y.w - x.w) || (x.key < y.key ? -1 : 1));
+  const emitCount = Math.min(emitRanked.length, GI2_PAL_EMITTER_CLASSES);
+  const emitBase = GI2_PAL_CLASSES - emitCount;
+  if (emitCount > 0) {
+    // The tail beyond the band folds into the band's LAST class; its mean is
+    // the area-weighted mean of everything in it, which for a tail of culled
+    // materials is zero.
+    const tail = { w: 0, ar: 0, ag: 0, ab: 0, er: 0, eg: 0, eb: 0, idx: [] };
+    emitRanked.forEach((g, gi) => {
+      const cls = emitBase + Math.min(gi, emitCount - 1);
+      if (gi >= emitCount - 1) {
+        tail.w += g.w;
+        tail.ar += g.ar; tail.ag += g.ag; tail.ab += g.ab;
+        tail.er += g.er; tail.eg += g.eg; tail.eb += g.eb;
+        for (const i of g.idx) tail.idx.push(i);
+      } else {
+        palette[cls] = {
+          albedo: [g.ar / g.w, g.ag / g.w, g.ab / g.w],
+          emissive: [g.er / g.w, g.eg / g.w, g.eb / g.w],
+        };
+      }
+      for (const i of g.idx) index[i] = cls;
+    });
+    if (tail.w > 0) {
+      palette[emitBase + emitCount - 1] = {
+        albedo: [tail.ar / tail.w, tail.ag / tail.w, tail.ab / tail.w],
+        emissive: [tail.er / tail.w, tail.eg / tail.w, tail.eb / tail.w],
+      };
     }
   }
-  const ranked = [...buckets.values()].sort((x, y) => y.n - x.n).slice(0, GI2_PAL_CLASSES);
-  const slotOf = new Map(ranked.map((b, i) => [b.key, i]));
-  const palette = Array.from({ length: PAL_ENTRIES }, () => ({ albedo: [0, 0, 0], emissive: 0 }));
-  ranked.forEach((b, i) => {
-    palette[i] = { albedo: [b.r / b.n, b.g / b.n, b.b / b.n], emissive: b.e / b.n };
+
+  // ── THE DIFFUSE POPULATION ────────────────────────────────────────────────
+  //
+  // ⭐⭐ THE UNIT IS THE **MATERIAL**, NOT THE PLACEMENT, AND THAT IS NOT AN
+  // OPTIMISATION — IT IS THE ONLY THING THAT SURVIVES THE RE-TINT.
+  //
+  // A placement's albedo at BUILD time is not the albedo it will have. Bistro's
+  // `.mat color` is `#ffffff` on 1447 of 1532 placements and the real colour is
+  // the mean of a COMPRESSED diffuse map, which the CPU canvas cannot decode —
+  // it arrives later, off the GPU averager (`pendingTextureAverages`). So at
+  // the moment this function runs, every diffuse placement in that scene is
+  // pure white. Clustering by VALUE there collapses to ONE box (there is
+  // nothing to split), the assignment is then frozen at one class for the life
+  // of the build, and the re-tint can only ever repaint that single class.
+  //
+  // ⛔ MEASURED, on the first build of this design: `palette 9 of 63 classes`
+  // on Bistro — one diffuse class for 508 placements — while the Level, whose
+  // materials carry flat authored colours, happily used 43. The instrument that
+  // caught it is the class census itself, which is why §O.4 asked for it.
+  //
+  // Bucketing by material identity fixes it by construction: the key is a fact
+  // that no re-tint can change, and the top-K materials by AREA each get an
+  // EXACT class — zero quantization error, better than any k-means could do —
+  // while only the tail shares. The median cut below then operates on BUCKETS,
+  // and only when a scene has more diffuse materials than classes.
+  const buckets = new Map();
+  items.forEach((it, i) => {
+    if (it.emitter) return;
+    const b = buckets.get(it.mk) ?? { w: 0, r: 0, g: 0, b: 0, idx: [] };
+    b.w += it.w;
+    b.r += it.w * it.a[0]; b.g += it.w * it.a[1]; b.b += it.w * it.a[2];
+    b.idx.push(i);
+    buckets.set(it.mk, b);
   });
+  const K = Math.max(1, emitBase);
+  const groups = [...buckets.entries()].map(([key, b]) => ({
+    key, w: b.w, idx: b.idx, a: [b.r / b.w, b.g / b.w, b.b / b.w],
+  }));
+  if (groups.length) {
+    // Deterministic input order — the median cut's tie-breaks and the final
+    // ranking both read it, so two builds of the same scene must see the same
+    // list. Area first (that is the ranking that matters), key as the tiebreak.
+    groups.sort((x, y) => (y.w - x.w) || (x.key < y.key ? -1 : 1));
+    let boxes = groups.map((_, i) => [i]);
+    if (boxes.length > K) {
+      // More materials than classes: merge them with a WEIGHTED MEDIAN CUT over
+      // the bucket colours, largest colour-error box first. A box's error is
+      // its widest channel extent × the area sitting in it — splitting the
+      // widest-but-empty box first is how a median cut wastes its classes.
+      boxes = [groups.map((_, i) => i)];
+      const spread = (box) => {
+        let lo = [1e9, 1e9, 1e9];
+        let hi = [-1e9, -1e9, -1e9];
+        let w = 0;
+        for (const i of box) {
+          const g = groups[i];
+          w += g.w;
+          for (let c = 0; c < 3; c++) { if (g.a[c] < lo[c]) lo[c] = g.a[c]; if (g.a[c] > hi[c]) hi[c] = g.a[c]; }
+        }
+        let axis = 0;
+        let ext = -1;
+        for (let c = 0; c < 3; c++) { const d = hi[c] - lo[c]; if (d > ext) { ext = d; axis = c; } }
+        return { axis, ext, w, cost: ext * w };
+      };
+      while (boxes.length < K) {
+        let best = -1;
+        let bestCost = 0;
+        let bestInfo = null;
+        for (let b = 0; b < boxes.length; b++) {
+          if (boxes[b].length < 2) continue;
+          const s = spread(boxes[b]);
+          if (s.ext <= 1e-6) continue;
+          if (s.cost > bestCost) { bestCost = s.cost; best = b; bestInfo = s; }
+        }
+        if (best < 0) {
+          // ⭐ THE COLOURS CANNOT DISCRIMINATE (every remaining bucket is the
+          // same white). Spend the rest of the budget on AREA instead of
+          // leaving it unused: peel the biggest material out of the biggest box
+          // as its own class. That is exactly the placement a ray is most
+          // likely to hit, and it makes the class count a function of the
+          // scene rather than of how far the texture decode happened to get.
+          let bi = -1;
+          let bw = 0;
+          for (let b = 0; b < boxes.length; b++) {
+            if (boxes[b].length < 2) continue;
+            const s = spread(boxes[b]);
+            if (s.w > bw) { bw = s.w; bi = b; }
+          }
+          if (bi < 0) break;
+          const box = boxes[bi];
+          box.sort((x, y) => (groups[y].w - groups[x].w) || (x - y));
+          boxes.splice(bi, 1, box.slice(0, 1), box.slice(1));
+          continue;
+        }
+        const box = boxes[best];
+        const axis = bestInfo.axis;
+        box.sort((x, y) => (groups[x].a[axis] - groups[y].a[axis]) || (x - y));
+        const half = bestInfo.w / 2;
+        let acc = 0;
+        // `cut` stays in [1, len-1] BY CONSTRUCTION — an empty half would be a
+        // class that quantizes nothing and a box that never shrinks.
+        let cut = 1;
+        for (let k = 0; k < box.length - 1; k++) {
+          acc += groups[box[k]].w;
+          cut = k + 1;
+          if (acc >= half) break;
+        }
+        boxes.splice(best, 1, box.slice(0, cut), box.slice(cut));
+      }
+    }
+    // Ranked by area so class 0 is the scene's biggest surface — the fallback a
+    // placement takes when nothing else can be said about it.
+    const scored = boxes.map((box) => {
+      let w = 0; let r = 0; let g = 0; let b = 0;
+      for (const i of box) { const q = groups[i]; w += q.w; r += q.w * q.a[0]; g += q.w * q.a[1]; b += q.w * q.a[2]; }
+      return { box, w, albedo: [r / w, g / w, b / w] };
+    }).sort((x, y) => y.w - x.w);
+    scored.forEach((s, ci) => {
+      palette[ci] = { albedo: s.albedo, emissive: [0, 0, 0] };
+      for (const gi of s.box) for (const i of groups[gi].idx) index[i] = ci;
+    });
+  }
+
   // The last entry is "no surface" and MUST stay black: `palAt` clamps an
   // out-of-range byte (PAL_NONE = 255, an unvoxelized or stale cell) onto it,
   // and a non-black value there would light every hole in the window.
-  palette[PAL_ENTRIES - 1] = { albedo: [0, 0, 0], emissive: 0 };
-  // A placement whose class did not make the cut takes the nearest surviving
-  // class rather than PAL_NONE — "no surface" means the ray hit nothing, and
-  // handing it to a wall that simply lost a palette vote reads as a hole.
-  const index = keys.map((k) => {
-    const hit = slotOf.get(k);
-    if (hit != null) return hit;
-    return ranked.length ? 0 : PAL_NONE;
-  });
-  return { palette, index };
+  palette[PAL_ENTRIES - 1] = { albedo: [0, 0, 0], emissive: [0, 0, 0] };
+  const emitterClasses = [];
+  for (let c = emitBase; c < emitBase + emitCount; c++) emitterClasses.push(c);
+  return { palette, index, emitterClasses };
 }
 
 /**
@@ -256,8 +461,11 @@ export function createGi2System({
   const marks = { build: 0, soup: 0, voxelizer: 0, occupancy: new Map(), firstLight: 0 };
   const counters = {
     soupTris: 0, soupMB: 0, soupBuildMs: 0, soupStallMs: 0, soupDropped: 0, soupTruncated: false,
-    palClasses: 0, movers: 0, moverTris: 0, scrolls: 0,
+    palClasses: 0, palEmissiveClasses: 0, palEmitterBand: 0, movers: 0, moverTris: 0, scrolls: 0,
   };
+  // The class assignment this build baked into the soup and the voxel bytes —
+  // the ONLY thing `#retintGi2Palette` may reuse (see `build`).
+  let paletteAssign = null;
   let lastVox = null;
   let lastDyn = null;
   let lastGather = null;
@@ -530,11 +738,36 @@ export function createGi2System({
     placed = false;
     win.reset();
 
-    const surfaces = placements.map((p) => ({ albedo: p.albedo ?? [0.5, 0.5, 0.5], emissive: p.emissive ?? 0 }));
-    const { palette, index } = buildGi2Palette(surfaces);
+    const surfaces = placements.map((p) => ({
+      albedo: p.albedo ?? [0.5, 0.5, 0.5],
+      emissive: p.emissive ?? 0,
+      area: p.area ?? 1,
+      emitter: !!p.emitter,
+      matKey: p.matKey ?? "",
+    }));
+    const { palette, index, emitterClasses } = buildGi2Palette(surfaces);
+    const emLum = (e) => (Array.isArray(e) ? (e[0] + e[1] + e[2]) / 3 : (e ?? 0));
     counters.palClasses = palette.filter((e, i) => i < GI2_PAL_CLASSES
-      && (e.albedo[0] + e.albedo[1] + e.albedo[2] + e.emissive) > 0).length;
+      && (e.albedo[0] + e.albedo[1] + e.albedo[2] + emLum(e.emissive)) > 0).length;
+    // §O.4's missing receipt: how many classes actually CARRY emission. "16
+    // classes" and "0 of them emit" were the same number for three sessions
+    // because nobody published the second one.
+    counters.palEmissiveClasses = palette.filter((e, i) => i < GI2_PAL_CLASSES && emLum(e.emissive) > 0).length;
+    counters.palEmitterBand = emitterClasses.length;
     gather.setPalette(palette);
+    // ⭐ §19 Stage 4.0b — WHAT A RE-TINT NEEDS, AND ONLY THAT (audits §O.5(c)).
+    //
+    // The class ASSIGNMENT (this `index`, keyed to the placement list that
+    // produced it) is what got baked into `triPal` and the voxel bytes. A
+    // re-tint re-resolves the materials and recomputes each class's MEAN
+    // against this same assignment — never re-clusters, because re-clustering
+    // would renumber classes the world is already written with.
+    paletteAssign = {
+      classOf: index,
+      keys: placements.map((p) => p.key ?? null),
+      emitterClasses,
+      classCount: PAL_ENTRIES,
+    };
     const soupPlacements = placements.map((p, i) => ({
       geometryKey: p.geometryKey, matrix: p.matrix, pal: index[i], slot: p.slot,
     }));
@@ -578,7 +811,8 @@ export function createGi2System({
       `${Math.round(counters.soupBuildMs)} ms off-thread (main thread blocked ` +
       `${counters.soupStallMs.toFixed(1)} ms)` +
       (built.truncated ? ` — TRUNCATED at the tier cap, ${built.dropped} triangles dropped` : "") +
-      `; palette ${counters.palClasses} of ${GI2_PAL_CLASSES} classes`,
+      `; palette ${counters.palClasses} of ${GI2_PAL_CLASSES} classes, ` +
+      `${counters.palEmissiveClasses} with emission (${counters.palEmitterBand} in the reserved emitter band)`,
     );
 
     soup = uploadSoup(built);
@@ -990,6 +1224,12 @@ export function createGi2System({
 
   return {
     tier, win, trace, cache,
+    /**
+     * `{ classOf, keys, emitterClasses, classCount }` for the build that is
+     * live, or null before the first one. See `build` — a re-tint reuses this
+     * and never re-clusters.
+     */
+    get paletteAssign() { return paletteAssign; },
     get gather() { return gather; },
     get voxelizer() { return voxelizer; },
     get dynamic() { return dynamic; },

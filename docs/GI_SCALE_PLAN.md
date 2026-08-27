@@ -454,7 +454,14 @@ gate; voxelizer live at 1.4 s, all 5 levels occupied at 3.9 s), GI GPU
 cpu 17.7 / gpu 8.0 (the raster side is the frame now). Harness: Cornell 8/8
 crops bracketed, 2nd bounce 1.48, off-screen bounce 0.95, orbit 0.96×,
 exhausted rays 0 %, 0/10 000 leaks. Mirror tier OFF under GI2 (measured:
-+530 ms boot stall + 2.96 ms/frame). ▶ Stage 4 next.
++530 ms boot stall + 2.96 ms/frame). 3.6 (`209de92`): noiseless at rest —
+temporal p95 12.8 → 1.17 % (Bistro 2.3 %), resets 26 → 0.44 %, reprojection
+100 %, chain 3.2 ms; the trade is world-change lag (a moved lamp 32 % at 30
+frames with H=32) → **▶ 3.7 change-driven ray allocation**: texels the
+variance test flags get re-traced with extra rays next frame instead of
+forgetting their history (Lumen's importance-sampled probes) — the
+responsiveness the "things move a lot" mandate needs, without a knob.
+▶ Stage 4 next.
 
 | unit | what | gate |
 |---|---|---|

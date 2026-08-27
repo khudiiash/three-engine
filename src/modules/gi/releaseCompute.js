@@ -95,7 +95,53 @@ export function releaseComputeNodes(renderer, nodes, harvest = null) {
       // Bindings first: it reads `nodes.getForCompute(node)` to find the bind
       // groups when its own cache entry is already gone, so evicting the
       // pipeline first would leave the bind groups — and the buffers — alive.
-      bindings?.deleteForCompute?.(node);
+      //
+      // ⛔⛔ BUT ONLY FOR A NODE `Bindings` HAS ACTUALLY INITIALIZED, AND THAT
+      // GUARD IS THE §19 STAGE 4.0b CRASH FIX. Three's `deleteForCompute`
+      // (Bindings.js:157) is
+      //
+      //   const bindings = computeNodeData.bindings || this.nodes.getForCompute( computeNode ).bindings;
+      //   this._destroyBindings( bindings );
+      //
+      // and `computeNodeData.bindings` is set ONLY inside `getForCompute`, i.e.
+      // only once the node has actually been DISPATCHED. For a node that never
+      // ran, the fallback does two forbidden things at once:
+      //
+      //   1. `nodes.getForCompute` REBUILDS the builder state we are throwing
+      //      away — the exact call this file's `forEachStorageBinding` header
+      //      already forbids, and on an SRC kernel a 16-27 s recompile.
+      //   2. `_destroyBindings` then decrements `usedTimes` on every bind group
+      //      in that array WITHOUT a matching `_createBindings` increment,
+      //      because the node was never initialized in `Bindings`.
+      //
+      // (2) is the crash. `NodeBuilder._getBindGroup` (NodeBuilder.js:641-700)
+      // keeps a `_bindingGroupsCache` of SHARED bind groups, so the `render`
+      // group is ONE `BindGroup` instance shared by every render object AND
+      // every compute node — its GPU buffer is literally named
+      // `bindingBuffer<N>_render_(vertex,fragment,compute)`. One over-decrement
+      // per never-dispatched node drives that shared group's `usedTimes` to
+      // zero, and `_destroyBindings` then destroys a uniform buffer the whole
+      // scene is still bound to:
+      //
+      //   [Buffer "bindingBuffer818_render_(vertex,fragment,compute)"] used in
+      //   submit while destroyed.
+      //   TypeError: Failed to execute 'writeBuffer' … parameter 1 is not of
+      //     type 'GPUBuffer'                                (Bindings.updateBinding)
+      //   TypeError: Failed to execute 'createBindGroup' … 'buffer' property
+      //     from 'GPUBufferBinding': Required member is undefined
+      //                                       (Bindings.getForRender, next frame)
+      //
+      // Reachable since §19 4.1 gave the retire queue `computeNodes`: a GI2
+      // resize retires the whole gather, and FOUR of its kernels (`crop`,
+      // `noiseDump`, `shadeProbe`, `exhaustProbe`) are receipt-only and are
+      // never dispatched on the engine path. Measured on the Level: 49
+      // uncaptured device errors across four resize hops, 0 after this guard.
+      //
+      // A node with no `Bindings` entry owns no bind group, so there is nothing
+      // to free — skipping is not a leak, it is the correct refcount.
+      if (bindings?.has?.(node) === true && bindings.get(node)?.bindings !== undefined) {
+        bindings.deleteForCompute(node);
+      }
       pipelines?.delete?.(node);
       // LAST, and that is not cosmetic: `deleteForCompute` above falls back to
       // `nodes.getForCompute(node)` to find the bind groups when its own entry
