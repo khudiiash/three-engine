@@ -231,7 +231,9 @@
     "probe:gi-gtao": "node scripts/run-gi-gtao-probe.mjs",
     "probe:gi-reflect-black": "node scripts/run-gi-reflect-black-probe.mjs",
     "probe:gi2-trace": "node scripts/run-gi2-trace-probe.mjs",
-    "test:gi2-window": "node scripts/run-gi2-window-test.mjs"
+    "probe:gi2-soup": "node scripts/run-gi2-soup-probe.mjs",
+    "test:gi2-window": "node scripts/run-gi2-window-test.mjs",
+    "test:gi2-soup": "node scripts/run-gi2-soup-test.mjs"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.3",

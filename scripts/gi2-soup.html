@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>GI2 triangle soup — worker spawn + main-thread stall</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}pre{padding:12px}</style>
+  </head>
+  <body>
+    <pre id="log"></pre>
+    <script type="module">
+      // GI2 STAGE 2.2 — THE BROWSER HALF OF THE GATE.
+      //
+      // `scripts/run-gi2-soup-test.mjs` proves the ARITHMETIC in node. It cannot
+      // prove the thing Stage 2.2 actually buys, because node has no main thread
+      // to stall and no Vite to resolve `new Worker(new URL(...))`. This page
+      // answers exactly two questions, on a real browser, through the real
+      // module graph:
+      //
+      //   1. DOES THE WORKER SPAWN AND RUN? Under Vite dev the worker file is
+      //      served as a transformed ES module (so `{type:"module"}` is load-
+      //      bearing); under a build it is a hashed chunk. Both fail LOUDLY —
+      //      a 404 or a parse error — and both would otherwise only be found by
+      //      a user opening a packaged game.
+      //   2. WAS THE MAIN THREAD FREE? "It ran in a worker" is not the same
+      //      claim as "the main thread did not stall": the copy-and-post is
+      //      main-thread work and it is the part that scales with scene size.
+      //      Two independent instruments watch it — PerformanceObserver
+      //      ('longtask'), which by definition only reports ≥ 50 ms, and a 4 ms
+      //      interval TICKER whose largest gap is the honest number. The ticker
+      //      is the one that can fail the gate with a real measurement instead
+      //      of an absence of evidence (memory: "before believing any null, can
+      //      the instrument see its subject?").
+      //
+      // The scene is synthetic Bistro: 3 M small triangles over 110 × 36 × 110 m,
+      // spread across 24 distinct geometries so the copy the main thread pays for
+      // is a REAL ~108 MB, not one geometry instanced 24 times.
+      //
+      // Run: node scripts/run-gi2-soup-probe.mjs   (vite must be on :5202)
+      const out = document.querySelector("#log");
+      const lines = [];
+      const say = (line) => { lines.push(line); out.textContent += line + "\n"; };
+      const fail = (error) => {
+        console.error("GI2-SOUP FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__GI2_SOUP_RESULT__ = { pass: false, error: error?.message ?? String(error), text: lines.join("\n") };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const params = new URLSearchParams(location.search);
+        const GEOMS = Number(params.get("geoms") ?? 24);
+        const PER = Number(params.get("per") ?? 125000);
+        const STALL_GATE = Number(params.get("stallGate") ?? 50);   // ms, PLAN Stage 2.2
+        const BUILD_GATE = Number(params.get("buildGate") ?? 2000); // ms, PLAN Stage 2.2
+
+        const { createTriangleSoupBuilder } = await import("/src/modules/gi/window/triangleSoup.js");
+
+        // ── instruments ──────────────────────────────────────────────────────
+        const longTasks = [];
+        let observer = null;
+        try {
+          observer = new PerformanceObserver((list) => longTasks.push(...list.getEntries()));
+          observer.observe({ type: "longtask", buffered: true });
+        } catch { /* not supported — the ticker still answers */ }
+        const ticks = [];
+        let lastTick = performance.now();
+        const ticker = setInterval(() => {
+          const t = performance.now();
+          ticks.push([lastTick, t - lastTick]);
+          lastTick = t;
+        }, 4);
+        // OVERLAP, not containment: the gap that matters is the one the
+        // copy-and-post falls inside, and it STARTED at the tick before the
+        // build began. Filtering by its start time excluded exactly the gap the
+        // gate is about, and reported a comfortable 6 ms for a 14 ms stall.
+        const gapIn = (from, to) => ticks.reduce((m, [at, gap]) => (at + gap >= from && at <= to ? Math.max(m, gap) : m), 0);
+        const tasksIn = (from, to) => longTasks.filter((e) => e.startTime + e.duration >= from && e.startTime <= to);
+
+        // ── the synthetic scene, generated in yielding chunks ─────────────────
+        // Generation is the HARNESS's cost, not the builder's, so it is kept off
+        // the measured window by a yield per geometry — and reported separately
+        // so nobody mistakes one for the other.
+        let seed = 0x9e3779b9;
+        const rnd = () => {
+          seed ^= seed << 13; seed >>>= 0;
+          seed ^= seed >>> 17;
+          seed ^= seed << 5; seed >>>= 0;
+          return seed / 4294967296;
+        };
+        const geometries = new Map();
+        const placements = [];
+        const tGen0 = performance.now();
+        for (let g = 0; g < GEOMS; g++) {
+          const positions = new Float32Array(PER * 9);
+          for (let i = 0; i < PER; i++) {
+            const x = rnd() * 110 - 55, y = rnd() * 36, z = rnd() * 110 - 55;
+            for (let k = 0; k < 3; k++) {
+              positions[i * 9 + k * 3] = x + rnd() * 0.6;
+              positions[i * 9 + k * 3 + 1] = y + rnd() * 0.6;
+              positions[i * 9 + k * 3 + 2] = z + rnd() * 0.6;
+            }
+          }
+          geometries.set(`g${g}`, { positions, index: null });
+          placements.push({ geometryKey: `g${g}`, matrix: new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]), pal: g & 255 });
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        const genMs = performance.now() - tGen0;
+        const inputMB = (GEOMS * PER * 9 * 4) / 1048576;
+        say(`scene: ${GEOMS} geometries × ${PER.toLocaleString()} tris = ${(GEOMS * PER).toLocaleString()} triangles, ${inputMB.toFixed(1)} MB of input positions`);
+        say(`generated in ${genMs.toFixed(0)} ms (harness cost, outside the measured window)`);
+
+        // ── the build ────────────────────────────────────────────────────────
+        const builder = createTriangleSoupBuilder();
+        const tBuild0 = performance.now();
+        const soup = await builder.build({ geometries, placements });
+        const tBuild1 = performance.now();
+        const wallMs = tBuild1 - tBuild0;
+        const maxGap = gapIn(tBuild0, tBuild1);
+        const buildTasks = tasksIn(tBuild0, tBuild1);
+        const longestTask = buildTasks.reduce((m, e) => Math.max(m, e.duration), 0);
+        const longestOverall = longTasks.reduce((m, e) => Math.max(m, e.duration), 0);
+
+        say("");
+        say(`worker spawn        ${builder.lastSpawnMs.toFixed(1)} ms`);
+        say(`main-thread stall   ${soup.postStallMs.toFixed(1)} ms   (copy ${inputMB.toFixed(0)} MB + postMessage)`);
+        say(`worker build        ${soup.stats.buildMs.toFixed(0)} ms   (plan ${soup.stats.planMs.toFixed(0)} / soup ${soup.stats.soupMs.toFixed(0)} / grid ${soup.stats.gridMs.toFixed(0)})`);
+        say(`wall (post→result)  ${wallMs.toFixed(0)} ms`);
+        say(`longest main-thread task during the build: ${longestTask.toFixed(1)} ms  (${buildTasks.length} longtask entries; ticker max gap ${maxGap.toFixed(1)} ms)`);
+        say(`longest task overall (generation included): ${longestOverall.toFixed(1)} ms`);
+        say("");
+        say(`soup: ${soup.triCount.toLocaleString()} tris, ${(soup.bytes / 1048576).toFixed(1)} MB ` +
+          `(${(soup.tris.byteLength / 1048576).toFixed(1)} soup + ${(soup.cellTris.byteLength / 1048576).toFixed(1)} cellTris + ` +
+          `${(soup.cellRange.byteLength / 1048576).toFixed(2)} cellRange + ${(soup.triPal.byteLength / 1048576).toFixed(1)} pal)`);
+        say(`grid: ${soup.grid.dim.join("×")} cells of ${soup.grid.cell} m at [${soup.grid.origin.join(", ")}], ${soup.stats.cellEntries.toLocaleString()} entries, ${soup.dropped} dropped`);
+
+        // ── the transfer really was a transfer ───────────────────────────────
+        // A structured CLONE would leave a second 120 MB copy on the main thread
+        // and cost another ~100 ms; the arrays arriving detached-from-nobody but
+        // with the right lengths is what says the worker's buffers were moved.
+        const moved = soup.tris.buffer.byteLength > 0 && soup.tris.length === soup.triCount * 9;
+        say(`result arrays transferred: ${moved ? "yes" : "NO"}`);
+        // The caller's inputs survived (copyInputs defaults to true, because
+        // serializeMeshForBake hands out references to LIVE three.js geometry).
+        const inputsAlive = geometries.get("g0").positions.byteLength === PER * 9 * 4;
+        say(`caller's geometry survived the post: ${inputsAlive ? "yes" : "NO — live geometry was detached"}`);
+
+        // ── supersede: terminate + respawn under the real bundler ────────────
+        const small = new Map([["s", { positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), index: null }]]);
+        const smallPlacement = [{ geometryKey: "s", matrix: new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]), pal: 1 }];
+        const a = builder.build({ geometries: small, placements: smallPlacement });
+        const b = builder.build({ geometries: small, placements: smallPlacement });
+        let superseded = false;
+        await a.catch((err) => { superseded = err?.superseded === true; });
+        const second = await b;
+        say(`supersede: older rejected ${superseded ? "yes" : "NO"}, newer built ${second.triCount} tri`);
+        builder.dispose();
+        clearInterval(ticker);
+        observer?.disconnect();
+
+        const checks = [
+          ["worker produced the soup", soup.triCount === GEOMS * PER],
+          [`main-thread stall < ${STALL_GATE} ms`, maxGap < STALL_GATE && longestTask < STALL_GATE],
+          [`build ≤ ${BUILD_GATE} ms`, soup.stats.buildMs <= BUILD_GATE],
+          ["result transferred", moved],
+          ["caller's geometry intact", inputsAlive],
+          ["supersede + respawn", superseded && second.triCount === 1],
+        ];
+        say("");
+        for (const [name, pass] of checks) say(`${pass ? "ok  " : "FAIL"} ${name}`);
+        const pass = checks.every(([, c]) => c);
+        say(pass ? "PASSED" : "FAILED");
+        globalThis.__GI2_SOUP_RESULT__ = {
+          pass,
+          text: lines.join("\n"),
+          triCount: soup.triCount,
+          bytes: soup.bytes,
+          buildMs: soup.stats.buildMs,
+          wallMs,
+          spawnMs: builder.lastSpawnMs,
+          stallMs: soup.postStallMs,
+          longestTaskMs: longestTask,
+          longestTaskOverallMs: longestOverall,
+          tickerMaxGapMs: maxGap,
+          genMs,
+          inputMB,
+          dim: soup.grid.dim,
+          cellEntries: soup.stats.cellEntries,
+          checks: checks.map(([name, ok]) => ({ name, ok })),
+        };
+      } catch (err) {
+        fail(err);
+      }
+    </script>
+  </body>
+</html>
