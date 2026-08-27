@@ -66,6 +66,7 @@ import {
   sqrt,
   uint,
   uintBitsToFloat,
+  uniform,
 } from "three/tsl";
 import {
   BSTAT_ACC_L,
@@ -101,6 +102,7 @@ import {
   PROBE_RAYS,
   PROBE_WORDS,
   SLOT_EMPTY,
+  swapStorageBuffer,
 } from "./srcProbes.js";
 
 /**
@@ -117,6 +119,15 @@ import {
  */
 export function createSrcRayStore(store, { pixelCount }) {
   const { probeTotal } = store;
+  // §19 0.3b — the pixel count as a UNIFORM as well as a JS number. The
+  // strided transport's out-of-range guard (`createSrcRayFrame`, and its twin
+  // in `srcDeposit`) compared against `uint(pixelCount)`, which is a decimal
+  // LITERAL in the WGSL — the one thing in these two kernels that made a new
+  // resolution new SOURCE. As a uniform the text stops moving and a resize is a
+  // write. (The DISPATCH size is already resolution-independent: it is derived
+  // from the tier's ray ceiling, see the header below.)
+  let livePixelCount = Math.max(1, pixelCount | 0);
+  const pixelCountU = uniform(livePixelCount, "uint");
   const rayCount = instancedArray(new Uint32Array(probeTotal), "uint").toAtomic();
   const rayCursor = instancedArray(new Uint32Array(probeTotal), "uint").toAtomic();
   const rayTotal = instancedArray(new Uint32Array(1), "uint").toAtomic();
@@ -147,16 +158,41 @@ export function createSrcRayStore(store, { pixelCount }) {
     rayTotal,
     pixelRayBase,
     rayWork,
+    pixelCountU,
     /**
      * §19 Stage 0.2 — GPU-only after the first bind; `detachCpuMirror` drops
      * the JS twin three already copied into the GPU buffer. Nothing here is
      * ever written CPU-side again (readbacks go through `getArrayBufferAsync`,
      * which sizes itself from `bufferGPU.size`).
+     *
+     * ⚠ A GETTER since §19 0.3b: `setSize` mints fresh attributes for the two
+     * per-pixel buffers, and a list captured at construction would hand the
+     * detach queue the retired twins while the new ones kept their CPU arrays.
      */
-    cpuMirrors: [rayCount, rayCursor, rayTotal, pixelRayBase, rayWork]
-      .map((n) => n?.value).filter(Boolean),
-    pixelCount,
-    bytes: (probeTotal * 2 + 2 + pixelCount * 2) * 4,
+    get cpuMirrors() {
+      return [rayCount, rayCursor, rayTotal, pixelRayBase, rayWork]
+        .map((n) => n?.value).filter(Boolean);
+    },
+    get pixelCount() { return livePixelCount; },
+    get bytes() { return (probeTotal * 2 + 2 + livePixelCount * 2) * 4; },
+    /**
+     * §19 0.3b — resize the two per-pixel buffers in place. `pixelRayBase` is
+     * refilled with SLOT_EMPTY because it is NOT fully rewritten each frame
+     * (the strided dispatch touches one residue class), so a fresh entry must
+     * read as "no slice" rather than as offset 0. `rayWork`'s word 0 is a count
+     * the [D0] clear zeroes every frame, so zeros are correct there.
+     * Returns the retired attributes for the caller's retire queue.
+     */
+    setSize(nextPixelCount) {
+      const n = Math.max(1, nextPixelCount | 0);
+      if (n === livePixelCount) return [];
+      livePixelCount = n;
+      pixelCountU.value = n;
+      return [
+        swapStorageBuffer(pixelRayBase, n, SLOT_EMPTY),
+        swapStorageBuffer(rayWork, 1 + n, 0),
+      ].filter(Boolean);
+    },
     dispose() {
       for (const b of [rayCount, rayCursor, rayTotal, pixelRayBase, rayWork]) {
         b?.value?.dispose?.();
@@ -298,7 +334,7 @@ export function createSrcRayFrame(
   } = {},
 ) {
   const { probeTable, probeTotal, cascades, freeStack } = store;
-  const { rayCount, rayCursor, rayTotal, pixelRayBase, rayWork, pixelCount } = rays;
+  const { rayCount, rayCursor, rayTotal, pixelRayBase, rayWork, pixelCount, pixelCountU } = rays;
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const top = cascades[N - 1];
   if (surprise && !cap) {
@@ -348,8 +384,11 @@ export function createSrcRayFrame(
   // `t·stride + phase` runs past the end. Skip, never wrap — see
   // `transportPixel`'s header for why a wrap is a double deposit rather than a
   // wasted thread.
+  // §19 0.3b: the uniform when the store carries one (production), the literal
+  // otherwise (standalone rigs that build a store by hand) — the fallback keeps
+  // those probes' WGSL byte-identical to what they gated.
   const outOfRange = strided
-    ? (p) => p.greaterThanEqual(uint(pixelCount))
+    ? (p) => p.greaterThanEqual(pixelCountU ? uint(pixelCountU) : uint(pixelCount))
     : null;
   const dispatchCount = strided ? threads : pixelCount;
 
@@ -390,13 +429,14 @@ export function createSrcRayFrame(
   // pixel and the probe's budget is their sum. A probe covering forty pixels
   // gets forty times the rays of one covering a single pixel, which is what
   // makes the budget follow screen coverage instead of probe count.
-  passes.push(Fn(() => {
+  const d1Pass = Fn(() => {
     const i = pixelOf(instanceIndex.toVar());
     if (outOfRange) If(outOfRange(i), () => { Return(); });
     const probe = pixelProbe.element(i).toVar();
     If(probe.equal(uint(SLOT_EMPTY)), () => { Return(); });
     atomicAdd(rayCount.element(probe), uint(raysPerPixel));
-  })().compute(dispatchCount));
+  })().compute(dispatchCount);
+  passes.push(d1Pass);
 
   // ── [D1'] the per-probe cap (srcConfig's `probeRayCap`) ───────────────────
   // Clamped AT THE SOURCE, before anything reads a count: [D2] then propagates
@@ -635,7 +675,7 @@ export function createSrcRayFrame(
   // reads: ray r of pixel p is global index `pixelRayBase[p] + r`. A pixel
   // whose probe is SLOT_EMPTY keeps SLOT_EMPTY here, which is how the trace
   // knows not to fire.
-  passes.push(Fn(() => {
+  const d5Pass = Fn(() => {
     const i = pixelOf(instanceIndex.toVar());
     if (outOfRange) If(outOfRange(i), () => { Return(); });
     const probe = pixelProbe.element(i).toVar();
@@ -677,7 +717,8 @@ export function createSrcRayFrame(
     If(denied.not(), () => {
       atomicStore(rayWork.element(atomicAdd(rayWork.element(uint(0)), uint(1)).add(uint(1))), i);
     });
-  })().compute(dispatchCount));
+  })().compute(dispatchCount);
+  passes.push(d5Pass);
   // ⚠ `pixelRayBase` IS NO LONGER FULLY REWRITTEN EACH FRAME. With a strided
   // dispatch only this frame's residue class is touched, so every other entry
   // holds a base from whichever frame last owned it. That is safe for exactly
@@ -690,6 +731,16 @@ export function createSrcRayFrame(
   return {
     passes,
     raysPerPixel,
+    /**
+     * §19 0.3b — a resize. With a strided transport (production) the dispatch
+     * size is the tier's, not the resolution's, so there is nothing to do here
+     * and the guard rides `pixelCountU`. Unstrided rigs dispatch one thread per
+     * pixel and do need the counts moved.
+     */
+    setPixelCount(n) {
+      if (strided) return;
+      for (const pass of [d1Pass, d5Pass]) if (pass) pass.count = Math.max(1, n | 0);
+    },
 
     /** Total rays this frame — the top cascade's partition length. Async. */
     async readTotal(renderer) {

@@ -53,7 +53,7 @@ import { collectStateComputeNodes, cpuMirrorBytes, detachCpuMirror, purgeNodeBui
 import { textureLoadsInFlight } from "../../engine/textureAsset.js";
 import { GICascadeLight, GI_REFLECT_TIER, MAX_EMITTERS, giReflectTierInfoOf, giReflectTierOf, giRoughnessBucketOf, giRoughnessFloorStats, giRoughnessSourceOf, registerGILight } from "./giLight.js";
 import { MAX_REFLECTION_PROBES, createReflectionProbeAtlas } from "./reflectionProbes.js";
-import { createReflectionProbeBlur, createReflectionProbeCapture, createReflectionProbeHistory, createReflectionProbeScratch, createReflectionProbeUniforms } from "./reflectionProbeCapture.js";
+import { createReflectionProbeBlur, createReflectionProbeCapture, createReflectionProbeHistory, createReflectionProbeSchedule, createReflectionProbeScratch, createReflectionProbeUniforms } from "./reflectionProbeCapture.js";
 import { buildBvhScene } from "./bvh/bvhScene.js";
 import { RayHitMode, rayHitModeName, resolveRayHitConfig } from "./rayHit/RayHitConfig.js";
 import {
@@ -3048,6 +3048,14 @@ export class GISystem {
           // no longer exists — the whole street missing from GI's g-buffer.
           depthProxies: this.engine.shadowMerge?.gbufferGroups?.() ?? null,
         });
+        // §19 0.3b D4 — LATCHED SEPARATELY FROM `_gbufProxyStats`, because a
+        // HELD gbuffer leaves that record standing from whenever it was last
+        // written, and "the mask pass drew nothing" must not be inherited from
+        // a frame that did not run the mask pass at all. Null = unknown = the
+        // gate below dispatches.
+        this._giMirrorDraws = this._gbufProxyStats?.maskRan === true
+          ? (this._gbufProxyStats.maskDraws ?? 0)
+          : null;
       }
       // ── THE MASK-COVERAGE ASSERTION (§18) ───────────────────────────────
       // Reads back how much of the gbuffer carries geometry at all. It must be
@@ -3321,6 +3329,35 @@ export class GISystem {
       // hand-placed ones (and what the planar mirror's nested render lights
       // by, since nested arbitration kills every screen-keyed source).
       this.#syncAutoRoomProbes();
+      // ── ⭐ §19 0.3b — THE SECOND RECAPTURE MOMENT: THE FIELD SETTLED ────
+      //
+      // srcSystem publishes `__giSrcAtRest` when no responsiveness term is
+      // asking the transport for budget any more (its own note carries the
+      // hysteresis argument). ⚠ THAT IS AN INPUT SIGNAL, NOT A CONVERGENCE
+      // ONE, and the difference cost a wiring: with a parked camera the drive
+      // is back at rest ~4 s after boot (the boot hold is 3 s, the camera term
+      // fades in 0.4 s) while the field is still filling from black — so a bare
+      // rising edge fired at the one moment the atlas had least to capture, and
+      // on the transport-alive tick it did not fire at all because the edge had
+      // already passed.
+      //
+      // So the trigger is at rest HELD, not at rest ENTERED, and the window is
+      // `GI_IDLE_AFTER_FRAMES` — the same count the idle gate uses for the same
+      // claim ("well past probe-EMA convergence at the default smoothing"), so
+      // there is one definition of how long a still field takes to mean
+      // something rather than two.
+      //
+      // `===` and not `>=`: exactly one request per rest EPISODE. The counter
+      // keeps climbing afterwards, and a scene that leaves rest and returns
+      // genuinely is a new world worth re-capturing.
+      if (this._transportAlive && globalThis.__giSrcAtRest === true) {
+        this._giSrcRestFrames = (this._giSrcRestFrames ?? 0) + 1;
+        if (this._giSrcRestFrames === GI_IDLE_AFTER_FRAMES) {
+          this._reflProbeSchedule?.recapture("settle");
+        }
+      } else {
+        this._giSrcRestFrames = 0;
+      }
       if (this.#reflectionProbesEnabled() && state.bvhScene) {
         const rp = state.screen.reflProbes;
         const stale = !rp ||
@@ -3334,6 +3371,25 @@ export class GISystem {
         if (stale) this.#armReflectionProbeCapture(state);
         const armed = state.screen.reflProbes;
         if (armed) {
+          // ── §19 0.3b — DRAIN THE RECAPTURE REQUEST ─────────────────────
+          // BEFORE the slot sync scores what is due, so a request dirties every
+          // probe in time to be served THIS tick. The reset is exactly the one
+          // `#armReflectionProbeCapture`'s worldKey change already performs:
+          // dirty restarts the jitter/EMA at round 0 (alpha 1 = replace the
+          // stale world) rather than blending a new capture into an old one.
+          const ask = this._reflProbeSchedule?.take();
+          if (ask) {
+            let asked = 0;
+            for (const rec of [
+              ...(this._reflProbes?.values() ?? []),
+              ...(this._autoReflProbes ?? []),
+            ]) {
+              rec.dirty = true;
+              rec.rounds = 0;
+              asked++;
+            }
+            console.log(`[gi] reflection probes: recapture (${ask}) — ${asked} probe(s) re-queued`);
+          }
           const due = this.#syncReflectionProbeSlots();
           if (due) {
             const gpu = this._reflProbeGpu;
@@ -3511,6 +3567,41 @@ export class GISystem {
       frameSkip.add(state.screen?.bvhHitTemporal?.filter?.compute);
       frameSkip.add(state.screen?.bvhHitTemporal?.snapshot?.compute);
       frameSkip.add(state.screen?.bvhReflect?.compute);
+    }
+    // ── ⭐ §19 0.3b D4 — NO MIRROR PIXELS, NO HIT SHADE ────────────────────
+    //
+    // `bvhHitShade` is deliberately OUT of the prewarm wave (it is the 110 s
+    // kernel on Bistro), but it sits in `state.queue` — so the first post-wave
+    // tick dispatches it and the driver compiles it anyway, on a scene where
+    // the mirror mask covers ZERO pixels and every one of its threads is about
+    // to early-out. The cost of the feature was being paid by scenes that do
+    // not use it, which is the same shape §13.13 found for the light-shadow
+    // chain and §13.14.6 for the reflect prepass: gate on a CONSUMER, not on a
+    // tier.
+    //
+    // The signal is the mirror-mask pass's own draw count (see renderGiGBuffer).
+    // FAIL-OPEN in three separate directions, all of them "dispatch":
+    //   · the mask pass is off (`__giBvhMask = false`, or the wave forced it
+    //     off) — then `normal.w` is 1 everywhere by construction and every
+    //     pixel is a candidate, so there is nothing to gate on;
+    //   · the mask pass has not run yet this session — `null`, not 0;
+    //   · it ran and drew something — a drawn-but-occluded mirror still counts.
+    // Only "the mask ran and drew nothing at all" skips, and that is a fact
+    // about the frame, not an estimate.
+    //
+    // Flipping back is a DISPATCH decision, not a rebuild: a mirror walking
+    // into frame is dispatched on the very next tick and its pipeline compiles
+    // async from there, exactly as the light-shadow skip already works.
+    if (
+      state.screen?.bvhHitShade &&
+      this._giMirrorDraws === 0 &&
+      this._gbufferMask === true &&
+      globalThis.__giHitShadeMaskGate !== false
+    ) {
+      frameSkip.add(state.screen.bvhHitShade.compute);
+      frameSkip.add(state.screen.bvhHitTemporal?.filter?.compute);
+      frameSkip.add(state.screen.bvhHitTemporal?.snapshot?.compute);
+      this._bvhHitShadeMaskSkips = (this._bvhHitShadeMaskSkips ?? 0) + 1;
     }
     frameSkip.delete(undefined);
     const rateQueue = freeze === "all"
@@ -6126,6 +6217,10 @@ export class GISystem {
         // profile.giPasses' sum assertion honest (it errors on mismatch).
         srcProbes.passes.push(farAvg.computeAccum, farAvg.computeEma);
         srcProbes.passGroups?.push({ label: "far field", count: 2 });
+        // §19 0.3b — the PASS, not just the resolve's input bundle. A resize
+        // resizes it in place; re-creating it would push a second copy into the
+        // dispatch list above, which an in-place srcProbes resize now keeps.
+        inputs.farFieldPass = farAvg;
         inputs.farField = {
           node: this._giFarFieldNode,
           // The LIVE world uniforms — every F2 slide moves the feather with
@@ -7099,7 +7194,10 @@ export class GISystem {
         const blur = Math.max(1, Math.min(6, Math.round(Number(globalThis.__giAoFilterRadius) || 2)));
         const filterX = createGiAoFilterPass({ ...shared, source: rawTarget, target: tmp, axisX: 1, radius: blur });
         const filterY = createGiAoFilterPass({ ...shared, source: tmp, target: out, axisY: 1, radius: blur });
-        return { tmp, out, blur, computes: [filterX.compute, filterY.compute] };
+        // §19 0.3b: the PASSES, not only their computes — `setSize` below needs
+        // both ends of the separable pair, and the two intermediate textures are
+        // owned here rather than by the passes that write them.
+        return { tmp, out, blur, passes: [filterX, filterY], computes: [filterX.compute, filterY.compute] };
       })();
     const finalTarget = filtered ? filtered.out : rawTarget;
 
@@ -7119,21 +7217,52 @@ export class GISystem {
         `closed-form arc integral over a full-res gbuffer` +
         `${filtered ? `, bilateral r${filtered.blur}` : ", UNFILTERED"}, no temporal.`,
     );
-    return {
-      aoPass: {
-        compute: pass.compute,
-        target: finalTarget,
-        rawTarget,
-        node: ao.node,
-        width: rtWidth,
-        height: rtHeight,
-        dispose: () => {
-          rawTarget?.dispose?.();
-          filtered?.tmp?.dispose?.();
-          filtered?.out?.dispose?.();
-        },
+    const aoPass = {
+      compute: pass.compute,
+      target: finalTarget,
+      rawTarget,
+      node: ao.node,
+      width: rtWidth,
+      height: rtHeight,
+      /**
+       * ── §19 0.3b — THE AO GRID FOLLOWS THE RESOLVE, IN PLACE ────────────
+       *
+       * Takes the RESOLVE's size and re-derives its own from `scale`, because
+       * the scale is this method's decision and a caller that computed the AO
+       * size itself would be a second definition of it.
+       *
+       * ⚠ `ao.width`/`ao.height` are written here and not by the caller: they
+       * are the four ratios `createGiResolve` upsamples this term through, so
+       * the resolve's own `setSize` must be able to read them back straight
+       * after this call. (See the resize path's ordering comment.)
+       *
+       * The three textures are resized rather than replaced — `ao.node` is a
+       * `texture(finalTarget)` the resolve has already compiled against, and
+       * replacing the texture under it is the "Destroyed texture used in a
+       * submit" class this module documents at four other sites.
+       */
+      setSize: (resolveW, resolveH) => {
+        const w = Math.max(16, Math.round(resolveW * scale));
+        const h = Math.max(16, Math.round(resolveH * scale));
+        pass.setSize(w, h, resolveW, resolveH);
+        if (filtered) {
+          filtered.tmp.setSize(w, h);
+          filtered.out.setSize(w, h);
+          for (const f of filtered.passes) f.setSize(w, h, resolveW, resolveH);
+        }
+        aoPass.width = w;
+        aoPass.height = h;
+        ao.width = w;
+        ao.height = h;
+        return true;
+      },
+      dispose: () => {
+        rawTarget?.dispose?.();
+        filtered?.tmp?.dispose?.();
+        filtered?.out?.dispose?.();
       },
     };
+    return { aoPass };
   }
 
   /**
@@ -7253,203 +7382,137 @@ export class GISystem {
     // nodes reachable from `state` NOW; anything still reachable after the
     // rebuild is shared and must be left alone (see the sweep at the end).
     const staleBefore = new Set(collectStateComputeNodes(state));
+    // ── ⭐⭐ §19 0.3b — RESIZE, DO NOT RE-MINT ────────────────────────────
+    //
+    // Everything below used to be ~25 `create*` calls: the whole screen chain,
+    // a fresh srcProbes generation, fresh targets, and a splice back into three
+    // queues. Measured on the Level (`scripts/run-gi-resize-probe.mjs`, phase
+    // A) one DURABLE step cost +21 to +86 compute pipelines, +45 to +109 shader
+    // modules and +16 to +77 MB of heap — a compile wave wearing a different
+    // name, which is exactly what stage 0.3's settle gate could only make
+    // RARER, never cheaper.
+    //
+    // Two units removed the two obstructions. 0.5b made every giScreen kernel's
+    // WGSL byte-identical across resolutions and gave each pass a `setSize`.
+    // 0.3b did the same for the SRC side, where the obstruction was never the
+    // shader text but the per-pixel storage BUFFERS — swapped under their live
+    // nodes now (`swapStorageBuffer` in srcProbes.js carries the argument for
+    // why that costs a bind group and not a pipeline), so `srcProbes.setSize`
+    // returns THE SAME SYSTEM and the three passes that were blocked on its
+    // identity (`createGiResolve`, `createGiBvhHitShade`,
+    // `createGiFarFieldAvgPass`) stop being re-minted with it.
+    //
+    // So a resize is now: uniform writes, `StorageTexture.setSize` (which keeps
+    // the JS texture OBJECTS, so no material and no compute node learns it
+    // happened), `compute.count` writes, and four buffer swaps.
+    //
+    // ⚠ THE ONE SURVIVING RE-MINT IS THE TILE-CUT TRIO, and only when the tile
+    // GRID changes. `createGiEmitterTileCutPass`, `createGiEmitterShadowPass`
+    // and `createGiResolve` all bake `tilesX`/`tilesY`/`tileSize` because they
+    // index a storage buffer whose LENGTH is the tile count, and that buffer
+    // cannot change length under a compiled kernel holding baked bounds. The
+    // tile-cut pass's own `setSize` reports it by returning false; below, the
+    // `false` branches are the old code, unchanged.
     screen.width = width;
     screen.height = height;
     screen.shadowWidth = shadowW;
     screen.shadowHeight = shadowH;
     screen.gbuffer.setSize(width, height);
-    // The probe population is one thread per gbuffer pixel and its dispatch
-    // counts are baked into the compute nodes, so a resize rebuilds it. Returns
-    // a NEW system and disposes the old one — the assignment is the point.
-    if (screen.srcProbes) {
-      // §19 Stage 0.4: through the budget clamp, not the raw remembered pools —
-      // a resize must not re-seat a pool the build ladder already refused.
-      screen.srcProbes = screen.srcProbes.setSize(width, height, this.#srcPoolsForBuild() ?? null);
-      // Fresh buffers, so a fresh detach generation (and the latch that gates
-      // it must re-arm — the new passes have not dispatched yet).
-      this._srcRanOnce = false;
-      this.#queueCpuMirrorDetach(screen.srcProbes.cpuMirrors, "src");
-    }
-    // New targets at the new size; the persistent nodes are re-pointed at
-    // them, which is a binding refresh rather than a shader rebuild (every
-    // observed material has hasNode = true, so its bindings refresh per frame
-    // — see #markObservedMaterial).
-    const previousTargets = screen.targets;
     const emitterScale = this.#emitterShadowScale();
     const emitterW = Math.max(64, Math.round(shadowW * emitterScale));
     const emitterH = Math.max(64, Math.round(shadowH * emitterScale));
-    screen.targets = createGiTargets(width, height, shadowW, shadowH, { emitterWidth: emitterW, emitterHeight: emitterH });
+
+    // ── SRC, IN PLACE ────────────────────────────────────────────────────
+    // ⚠ POOLS ARE NOT PASSED, and that is a decision rather than an omission.
+    // Pool GROWTH has its own path (`#growSrcPools`, explicitly size-invariant)
+    // and it is a genuine rebuild — the capacities ARE the ladder's dispatch
+    // counts and the length of every probe-indexed buffer. Letting a resize
+    // double as one is how 0.4's budget clamp would get read twice; `null`
+    // means "keep what you were built with", which is what a resize wants.
+    const previousSrc = screen.srcProbes;
+    if (screen.srcProbes) {
+      screen.srcProbes = screen.srcProbes.setSize(width, height, null, {
+        // The retired per-pixel attributes may still be bound by a submit in
+        // flight — the "Destroyed buffer used in a submit" class. Same 3-frame
+        // queue the textures use.
+        retire: (attr) => this.#retireTargets(attr),
+      });
+      // Fresh buffers, so a fresh detach generation (and the latch that gates
+      // it must re-arm — the new passes have not dispatched yet). `cpuMirrors`
+      // is a GETTER on both stores for exactly this call.
+      this._srcRanOnce = false;
+      this.#queueCpuMirrorDetach(screen.srcProbes.cpuMirrors, "src");
+    }
+    // Not expected — see the pools note above — but a silently-swapped system
+    // would leave the resolve, the hit shade and the far-field average bound to
+    // disposed pools, which is the 2026-08-12 "monster compile whose diffuse
+    // term read zeros" failure. Say so rather than render it.
+    if (screen.srcProbes !== previousSrc) {
+      console.warn(
+        "[gi] §19 0.3b: srcProbes was REPLACED by a resize (a pool grow raced in) — " +
+        "the screen chain's gather bindings are stale; requesting a rebuild.",
+      );
+      this.requestRebuild("resolve-resize: srcProbes replaced");
+    }
+
+    // ── TARGETS, IN PLACE ────────────────────────────────────────────────
+    // `StorageTexture.setSize` keeps the JS object and drops only the GPU
+    // texture, so `_giIrradianceNode` & friends — which every observed material
+    // has ALREADY compiled against — never learn a resize happened. The
+    // re-points below are therefore no-ops; they stay as the executable
+    // statement of that contract.
+    screen.targets.setSize(width, height, shadowW, shadowH, { emitterWidth: emitterW, emitterHeight: emitterH });
     screen.emitterShadowWidth = emitterW;
     screen.emitterShadowHeight = emitterH;
-    // Fresh targets are zero = fully occluded; fail OPEN until the marcher's
-    // first dispatch lands (see #clearEmitterShadowTargets).
-    this.#clearEmitterShadowTargets(screen.targets, emitterW, emitterH);
-    // The stochastic arm's accumulate/history textures are lazy now — a
-    // resize on that arm must re-materialize them before the pass rebuilds
-    // below bind them (the history pass's existence records the arm).
-    // §12.65: same re-materialization contract for the irradiance trio.
+    // The lazily-materialized trios: resized by the call above when they exist,
+    // created at the CURRENT size when a temporal arm exists but its trio does
+    // not (the §12.65 contract).
     if (screen.irrTemporalPass) screen.targets.ensureIrradianceTemporal?.();
+    if (screen.emitterShadowHistoryPass) screen.targets.ensureEmitterTemporal?.();
+    // ⚠ RESIZED TEXTURES COME BACK ZEROED, and 0 in a visibility channel means
+    // FULLY OCCLUDED. Fail OPEN until the marcher's next dispatch lands — the
+    // same stamp a fresh build gets.
+    this.#clearEmitterShadowTargets(screen.targets, emitterW, emitterH);
     this._giTargets = screen.targets;
     this._giTargetSize = { width, height };
     this._giIrradianceNode.value = screen.targets.irradiance;
     this._giEmitterShadowNode.value = screen.targets.emitterShadow;
     this._giRadianceNode.value = screen.targets.radiance;
-    // The shadowNode's tap offsets are SHADOW-CHANNEL texels — this path
-    // skips #buildScreenResolve, so the uniform must follow the size here too.
+    // The shadowNode's tap offsets are SHADOW-CHANNEL texels — this path skips
+    // #buildScreenResolve, so the uniform must follow the size here too.
     this._giLightShadowTexel?.value.set(1 / shadowW, 1 / shadowH);
     this._giEmitterShadowTexel?.value.set(1 / emitterW, 1 / emitterH);
-    // Same swap for the gi light-shadow channel pack. The node is what every
-    // gi light's compiled shadow branch holds, so re-pointing it (rather than
-    // rebuilding it) is what keeps a viewport resize free of material
-    // recompiles — and the bundle has to carry the NEW texture into the
-    // resolve rebuild below, or the pass would write into the target that is
-    // about to be retired.
     if (this._giLightShadowNode) this._giLightShadowNode.value = screen.targets.lightShadow;
     if (this._giLightShadowDistNode) this._giLightShadowDistNode.value = screen.targets.lightShadowDist;
-    if (screen.lightShadow) {
-      screen.lightShadow = {
-        ...screen.lightShadow,
-        target: screen.targets.lightShadow,
-        rawTarget: screen.targets.lightShadowRaw,
-        distTarget: screen.lightShadow.pcss ? screen.targets.lightShadowDist : null,
-      };
-    }
-    // THE BVH TARGETS ARE REPLACED BEFORE THE HIT-SHADE PASS IS REBUILT, not
-    // after — it BINDS them (createGiBvhHitShade), so rebuilding it against
-    // the old, about-to-be-retired textures would hand it dead bindings and
-    // the pass would start failing a few frames later, when the retire timer
-    // fires.
-    let previousBvhTarget = null;
-    if (screen.bvhShade) {
-      previousBvhTarget = this._giBvhTarget;
-      this._giBvhTarget = createGiBvhTarget(width, height, {
-        // Div 3 (2026-08-22 late, the user's "ultra is 14 fps + dirty"):
-        // hit shading is whole-kernel register pressure, cost ∝ threads —
-        // at ultra's full-res resolve, div 2 measured ~17 ms of a 47.9 ms
-        // frame on the Level. Div 3 cuts it ~55%, and the coarser grid +
-        // §12.65 temporal reads SOFTER, which on the user's speckle
-        // complaint is the better side of the trade. `__giHitShadeFull`
-        // still forces 1 for A/Bs.
-        // ⚠ THIS DIVISOR AND THE PREPASS STRIDE INTERACT (2026-08-22). At
-        // stride 2 a divisor of 3 BEATS against the traced anchors — source
-        // texels 0,3,6,9 alternate even/odd, so every second row and column
-        // of the reflection was shaded from a REPLICATED texel, which is the
-        // "a lot of lines" report. The fix is the anchor SNAP in
-        // createGiBvhHitShade (which costs nothing), not a bigger grid:
-        // measured live at high on the user's Level, aligning by widening to
-        // div 2 took bvhHitShade 4.4 → 9.83 ms of a 16.6 ms 60 fps frame.
-        // Div 3 + snap samples 0,2,6,8 — uneven, but every sample is a real
-        // traced anchor with its own P/N/t, which is what the lines were
-        // about. Keep them in sync if either number moves.
-        radianceDiv: 3,
-      });
+
+    // ── THE EXACT-REFLECTION TARGETS ─────────────────────────────────────
+    // The shade grid is RE-SOLVED, not scaled (`radDiv` is
+    // `min(cap, max(2, sqrt(px / 178k)))`), and it is what `bvhHitShade` and
+    // its temporal pair are dispatched over.
+    let hitShadeW = 0;
+    let hitShadeH = 0;
+    if (this._giBvhTarget) {
+      const grid = this._giBvhTarget.setSize(width, height);
+      hitShadeW = grid.radianceWidth;
+      hitShadeH = grid.radianceHeight;
       this._giBvhTargetSize = { width, height };
       this._giBvhReflectNode.value = this._giBvhTarget.bvhReflect;
       this._giBvhColorNode.value = this._giBvhTarget.bvhColor;
       this._giBvhRadianceNode.value = this._giBvhTarget.bvhRadiance;
-      screen.bvhShade = {
-        ...screen.bvhShade,
-        hit: this._giBvhTarget.bvhReflect,
-        albedo: this._giBvhTarget.bvhColor,
-        target: this._giBvhTarget.bvhRadiance,
-      };
     }
-    const index = state.queue.indexOf(screen.resolve.compute);
-    const indexNoFeedback = state.queueNoFeedback.indexOf(screen.resolve.compute);
-    const indexFeedbackOnly = state.queueFeedbackOnly?.indexOf(screen.resolve.compute) ?? -1;
-    // §14 R-A: the hit-shade pass follows the resolve's rebuild+splice
-    // contract — it closes over the gather closure AND the bvh targets this
-    // resize is about to replace, so a stale instance is dead bindings. The
-    // temporal pair closes over the same targets plus the gbuffer, so it
-    // rebuilds here too (and ONLY here — a pool grow leaves it alone).
-    const oldHitShade = screen.bvhHitShade?.compute ?? null;
-    const hitShadeIndexes = oldHitShade
-      ? [
-          state.queue.indexOf(oldHitShade),
-          state.queueNoFeedback.indexOf(oldHitShade),
-          state.queueFeedbackOnly?.indexOf(oldHitShade) ?? -1,
-        ]
-      : null;
-    const oldHitFilter = screen.bvhHitTemporal?.filter?.compute ?? null;
-    const oldHitSnapshot = screen.bvhHitTemporal?.snapshot?.compute ?? null;
-    const hitFilterIndexes = oldHitFilter
-      ? [
-          state.queue.indexOf(oldHitFilter),
-          state.queueNoFeedback.indexOf(oldHitFilter),
-          state.queueFeedbackOnly?.indexOf(oldHitFilter) ?? -1,
-        ]
-      : null;
-    const hitSnapshotIndexes = oldHitSnapshot
-      ? [
-          state.queue.indexOf(oldHitSnapshot),
-          state.queueNoFeedback.indexOf(oldHitSnapshot),
-          state.queueFeedbackOnly?.indexOf(oldHitSnapshot) ?? -1,
-        ]
-      : null;
-    // BOTH gather inputs re-derive from the srcProbes the resize JUST rebuilt
-    // (line above), exactly as #buildScreenResolve derives them at build time.
-    // The first version passed only `gather: screen.gather` — the build-time
-    // CLOSURE over a srcProbes that setSize had just disposed — and omitted
-    // `screenGather` entirely. createGiResolve's `gather && !screenGather`
-    // fallback then INLINED the whole gatherAt into the resolve (the 58→323kB
-    // kernel pathology this module documents everywhere), bound to DEAD
-    // buffers nothing writes. Every post-resize resolve since [I] shipped was
-    // that: a monster compile whose diffuse term read zeros. Found 2026-08-12
-    // tracing the dynamic-resolution churn.
-    screen.screenGather = screen.srcProbes?.gather?.node ?? null;
-    screen.gather = screen.srcProbes?.gather
-      ? (point, normal) => screen.srcProbes.gather.gatherAt(point, normal).irradiance
-      : null;
-    // §12.71b v2: the glossy input re-derives from the srcProbes the resize
-    // just rebuilt, for exactly the reason the two lines above do — a stale
-    // texture node points at a disposed target.
-    screen.screenRadiance = screen.srcProbes?.glossy?.node ?? null;
-    // §13 F3: the far-field average pass closed over the gather target setSize
-    // just disposed — recreate it against the fresh one (its passes list is
-    // fresh too, so the old entries are already gone) and hand the new resolve
-    // the same persistent 1×1 texture node. Same gating as the build.
-    let farFieldInput = null;
-    if (screen.srcProbes?.gather?.target && this._detailExtent && this._detailAnchor &&
-        state.volume?.world?.min && globalThis.__giFarField !== false && this._giFarFieldTex) {
-      const farAvg = createGiFarFieldAvgPass({
-        source: screen.srcProbes.gather.target,
-        width: screen.srcProbes.gather.width,
-        height: screen.srcProbes.gather.height,
-        out: this._giFarFieldTex,
-      });
-      screen.srcProbes.passes.push(farAvg.computeAccum, farAvg.computeEma);
-      screen.srcProbes.passGroups?.push({ label: "far field", count: 2 });
-      farFieldInput = {
-        node: this._giFarFieldNode,
-        worldMin: state.volume.world.min,
-        worldSize: state.volume.world.size,
-        feather: 4 * (state.probeSpacing || 1),
-      };
-    }
-    // The glossy temporal pair and the AO pass follow the same recreate
-    // contract: both close over textures the srcProbes/gbuffer rebuild just
-    // replaced.
-    screen.glossyTemporal = this.#armGlossyTemporal({
-      srcProbes: screen.srcProbes, gbuffer: screen.gbuffer, width, height,
-      validEps: screen.lightShadow?.voxMax ?? 0.15,
-    });
-    screen.aoPass?.dispose?.();
-    screen.aoPass?.target?.dispose?.();
-    ({ aoPass: screen.aoPass } = this.#armGtaoPass({
-      srcProbes: screen.srcProbes,
-      gbuffer: screen.gbuffer,
-      width,
-      height,
-      ao: screen.ao,
-      occupancy: state.volume?.occupancyField,
-    }));
-    // §12.70 W4b: the tile cut is sized to the emitter grid AND bakes the
-    // gbuffer scale, so it rebuilds BEFORE the resolve and the shadow pass
-    // that consume its buffers — a stale sx/sy would rank tiles at the wrong
-    // world positions, and a stale idBuf would leave both consumers bound to
-    // a buffer the old dispatch no longer fills. recordSlot survives as-is
-    // (it closes over the bits node + base word, both resize-invariant).
-    if (screen.emitterTileCut) {
+
+    // ── THE AO GRID, BEFORE THE RESOLVE THAT UPSAMPLES IT ────────────────
+    // The resolve's four AO ratios are the mapping between the two grids, so
+    // `screen.ao.width/height` must be current before `resolve.setSize` reads
+    // them — going stale in either direction reads as AO sampled from the wrong
+    // texels.
+    screen.aoPass?.setSize?.(width, height);
+
+    // ── THE TILE CUT, AND THE ONE RE-MINT IT CAN FORCE ───────────────────
+    const tileCutOk = screen.emitterTileCut
+      ? screen.emitterTileCut.setSize(emitterW, emitterH, width, height) !== false
+      : true;
+    if (screen.emitterTileCut && !tileCutOk) {
       const oldCut = screen.emitterTileCut.compute;
       const cutIndexes = [
         state.queue.indexOf(oldCut),
@@ -7476,466 +7539,165 @@ export class GISystem {
         tilesY: screen.emitterTileCut.tilesY,
         tileSize: screen.emitterTileCut.tileSize,
       };
-      if (globalThis.__giTileCutLive) {
-        globalThis.__giTileCutLive = {
-          tilesX: screen.emitterTileCut.tilesX,
-          tilesY: screen.emitterTileCut.tilesY,
-          tileSize: screen.emitterTileCut.tileSize,
-          emitterW, emitterH, resolveW: width, resolveH: height,
-          posBuf: screen.emitterTileCut.posBuf,
-          idBuf: screen.emitterTileCut.idBuf,
-          compCap: screen.emitterTileCut.compCap,
-          feather: screen.emitterTileCut.feather,
-        };
-      }
       if (cutIndexes[0] >= 0) state.queue[cutIndexes[0]] = screen.emitterTileCut.compute;
       if (cutIndexes[1] >= 0) state.queueNoFeedback[cutIndexes[1]] = screen.emitterTileCut.compute;
       if (cutIndexes[2] >= 0) state.queueFeedbackOnly[cutIndexes[2]] = screen.emitterTileCut.compute;
     }
-    screen.resolve = createGiResolve({
-      gbuffer: screen.gbuffer,
-      targets: screen.targets,
-      // §12.65 fail-safe contract, same as the build: the resolve writes
-      // irradiance itself and the filter overwrites when alive.
-      rawCopy: screen.irrTemporalPass ? screen.targets.irradianceRaw : null,
-      width,
-      height,
-      gather: screen.gather,
-      screenGather: screen.screenGather,
-      // Same system-owned uniform the first build bound — the tick holds the
-      // only reference that matters, so a resize must not mint a new one.
-      cameraPosition: this._giResolveCamU,
-      normalOffset: screen.normalOffset,
-      intensity: screen.intensity,
-      emitter: screen.emitter,
-      screenRadiance: screen.screenRadiance,
-      ao: screen.ao,
-      emitterTileCut: screen.emitterTileCutBundle
-        ? { ...screen.emitterTileCutBundle, scaleX: emitterW / width, scaleY: emitterH / height }
-        : null,
-      farField: farFieldInput,
-    });
-    if (index >= 0) state.queue[index] = screen.resolve.compute;
-    if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
-    if (indexFeedbackOnly >= 0) state.queueFeedbackOnly[indexFeedbackOnly] = screen.resolve.compute;
-    // §14 R-A: hit shading rebuilds against the fresh bvh targets + fresh
-    // gather closure, splicing into the same queue slots; the temporal pair
-    // rebuilds beside it against the same fresh targets.
-    if (screen.bvhShade) {
-      screen.bvhHitShade = createGiBvhHitShade({
+    if (globalThis.__giTileCutLive && screen.emitterTileCut) {
+      globalThis.__giTileCutLive = {
+        tilesX: screen.emitterTileCut.tilesX,
+        tilesY: screen.emitterTileCut.tilesY,
+        tileSize: screen.emitterTileCut.tileSize,
+        emitterW, emitterH, resolveW: width, resolveH: height,
+        posBuf: screen.emitterTileCut.posBuf,
+        idBuf: screen.emitterTileCut.idBuf,
+        compCap: screen.emitterTileCut.compCap,
+        feather: screen.emitterTileCut.feather,
+      };
+    }
+
+    // BOTH gather inputs re-derive from the srcProbes above — the same
+    // derivation `#buildScreenResolve` performs at build time. They are the
+    // SAME objects now, but the 2026-08-12 failure this guards (a resolve that
+    // INLINED the whole gatherAt against dead buffers) was a missing
+    // re-derivation, and a line that costs nothing is the wrong place to save.
+    screen.screenGather = screen.srcProbes?.gather?.node ?? null;
+    screen.gather = screen.srcProbes?.gather
+      ? (point, normal) => screen.srcProbes.gather.gatherAt(point, normal).irradiance
+      : null;
+    screen.screenRadiance = screen.srcProbes?.glossy?.node ?? null;
+
+    // ── THE RESOLVE ──────────────────────────────────────────────────────
+    const tileScale = screen.emitterTileCutBundle
+      ? { scaleX: emitterW / width, scaleY: emitterH / height }
+      : null;
+    if (tileCutOk) {
+      screen.resolve.setSize(width, height, screen.ao?.width ?? width, screen.ao?.height ?? height, tileScale);
+    } else {
+      const index = state.queue.indexOf(screen.resolve.compute);
+      const indexNoFeedback = state.queueNoFeedback.indexOf(screen.resolve.compute);
+      const indexFeedbackOnly = state.queueFeedbackOnly?.indexOf(screen.resolve.compute) ?? -1;
+      screen.resolve = createGiResolve({
         gbuffer: screen.gbuffer,
-        bvhShade: screen.bvhShade,
-        width: this._giBvhTarget.radianceWidth,
-        height: this._giBvhTarget.radianceHeight,
-        resolveWidth: width,
-        resolveHeight: height,
+        targets: screen.targets,
+        rawCopy: screen.irrTemporalPass ? screen.targets.irradianceRaw : null,
+        width,
+        height,
         gather: screen.gather,
+        screenGather: screen.screenGather,
         cameraPosition: this._giResolveCamU,
         normalOffset: screen.normalOffset,
         intensity: screen.intensity,
         emitter: screen.emitter,
-        rawCopy: this._giBvhTarget.bvhRadianceRaw,
-        sourceStride: this.#bvhReflectStride(),
-        probes: this.#reflectionProbesEnabled()
-          ? (({ node, slots }) => ({ node, slots }))(this.#ensureReflProbeState())
-          : null,
-        termMask: this.#hitTermMask(),
-        ...this.#hitShadowBundle(),
-        shadowReach: this.#hitShadowReach(state.volume),
+        screenRadiance: screen.screenRadiance,
+        ao: screen.ao,
+        emitterTileCut: screen.emitterTileCutBundle ? { ...screen.emitterTileCutBundle, ...tileScale } : null,
+        farField: screen.farField ?? null,
       });
-      screen.bvhHitShade.compute.__giPassName = "bvhHitShade";
-      if (hitShadeIndexes) {
-        if (hitShadeIndexes[0] >= 0) state.queue[hitShadeIndexes[0]] = screen.bvhHitShade.compute;
-        if (hitShadeIndexes[1] >= 0) state.queueNoFeedback[hitShadeIndexes[1]] = screen.bvhHitShade.compute;
-        if (hitShadeIndexes[2] >= 0) state.queueFeedbackOnly[hitShadeIndexes[2]] = screen.bvhHitShade.compute;
-      }
-      screen.bvhHitTemporal = this.#armBvhHitTemporal({
-        gbuffer: screen.gbuffer, resolveWidth: width, resolveHeight: height,
-        validEps: screen.lightShadow?.voxMax ?? 0.15,
-      });
-      if (screen.bvhHitTemporal && hitFilterIndexes) {
-        if (hitFilterIndexes[0] >= 0) state.queue[hitFilterIndexes[0]] = screen.bvhHitTemporal.filter.compute;
-        if (hitFilterIndexes[1] >= 0) state.queueNoFeedback[hitFilterIndexes[1]] = screen.bvhHitTemporal.filter.compute;
-        if (hitFilterIndexes[2] >= 0) state.queueFeedbackOnly[hitFilterIndexes[2]] = screen.bvhHitTemporal.filter.compute;
-      }
-      if (screen.bvhHitTemporal && hitSnapshotIndexes) {
-        if (hitSnapshotIndexes[0] >= 0) state.queue[hitSnapshotIndexes[0]] = screen.bvhHitTemporal.snapshot.compute;
-        if (hitSnapshotIndexes[1] >= 0) state.queueNoFeedback[hitSnapshotIndexes[1]] = screen.bvhHitTemporal.snapshot.compute;
-        if (hitSnapshotIndexes[2] >= 0) state.queueFeedbackOnly[hitSnapshotIndexes[2]] = screen.bvhHitTemporal.snapshot.compute;
-      }
+      if (index >= 0) state.queue[index] = screen.resolve.compute;
+      if (indexNoFeedback >= 0) state.queueNoFeedback[indexNoFeedback] = screen.resolve.compute;
+      if (indexFeedbackOnly >= 0) state.queueFeedbackOnly[indexFeedbackOnly] = screen.resolve.compute;
     }
-    // §12.65: the irradiance temporal pair follows the resolve's own
-    // rebuild+splice contract — fresh targets at the new size, queue
-    // positions preserved so they stay BEHIND the resolve they consume.
-    if (screen.irrTemporalPass) {
-      const oldIrr = screen.irrTemporalPass.compute;
-      const oldIrrHist = screen.irrHistoryPass.compute;
-      const irrIndexes = [
-        state.queue.indexOf(oldIrr),
-        state.queueNoFeedback.indexOf(oldIrr),
-        state.queueFeedbackOnly?.indexOf(oldIrr) ?? -1,
-      ];
-      const irrHistIndexes = [
-        state.queue.indexOf(oldIrrHist),
-        state.queueNoFeedback.indexOf(oldIrrHist),
-        state.queueFeedbackOnly?.indexOf(oldIrrHist) ?? -1,
-      ];
-      screen.irrTemporalPass = createGiIrradianceTemporalPass({
-        gbuffer: screen.gbuffer,
-        source: screen.targets.irradianceRaw,
-        target: screen.targets.irradiance,
-        histIrr: screen.targets.irradianceHist,
-        histPos: screen.targets.irradianceHistPos,
-        width,
-        height,
-        // Same validity contract as the build-time site above.
-        validityAlpha: globalThis.__giIrrValidityHold === true,
-        history: {
-          prevViewProj: this._giIrrPrevVPU,
-          weight: this._giIrrHistWeightU,
-          validEps: screen.lightShadow?.voxMax ?? 0.15,
-          // ⚠ BOTH build sites must carry these or the resize/rebuild path
-          // silently drops the reject and the ghost returns on a viewport
-          // resize — the §12.65 "four dispatch paths" trap.
-          dynMin: (this._giDynRejectMinU ??= uniform(new THREE.Vector3())),
-          dynMax: (this._giDynRejectMaxU ??= uniform(new THREE.Vector3())),
-          dynActive: (this._giDynRejectActiveU ??= uniform(0)),
-        },
-      });
-      screen.irrHistoryPass = createGiLightShadowHistoryPass({
-        gbuffer: screen.gbuffer,
-        source: screen.targets.irradiance,
-        histShadow: screen.targets.irradianceHist,
-        histPos: screen.targets.irradianceHistPos,
-        width,
-        height,
-        resolveWidth: width,
-        resolveHeight: height,
-      });
-      if (irrIndexes[0] >= 0) state.queue[irrIndexes[0]] = screen.irrTemporalPass.compute;
-      if (irrIndexes[1] >= 0) state.queueNoFeedback[irrIndexes[1]] = screen.irrTemporalPass.compute;
-      if (irrIndexes[2] >= 0) state.queueFeedbackOnly[irrIndexes[2]] = screen.irrTemporalPass.compute;
-      if (irrHistIndexes[0] >= 0) state.queue[irrHistIndexes[0]] = screen.irrHistoryPass.compute;
-      if (irrHistIndexes[1] >= 0) state.queueNoFeedback[irrHistIndexes[1]] = screen.irrHistoryPass.compute;
-      if (irrHistIndexes[2] >= 0) state.queueFeedbackOnly[irrHistIndexes[2]] = screen.irrHistoryPass.compute;
+
+    // ── THE FAR-FIELD AVERAGE ────────────────────────────────────────────
+    // §13 F3. It reads the screen gather's TARGET, which setSize kept, so this
+    // is a count and a uniform. ⚠ IT MUST NOT BE RE-CREATED HERE ANY MORE:
+    // its two computes live in `srcProbes.passes`, and that list survives an
+    // in-place resize — a second `push` would dispatch the average twice and
+    // break `profile.giPasses`' sum assertion.
+    screen.farFieldPass?.setSize?.(
+      screen.srcProbes?.gather?.width ?? width,
+      screen.srcProbes?.gather?.height ?? height,
+    );
+
+    // ── THE GLOSSY TEMPORAL PAIR ─────────────────────────────────────────
+    // Same rule as the far field: `#armGlossyTemporal` appends to
+    // `srcProbes.passes`, so a re-arm on this path would double-dispatch it.
+    if (screen.glossyTemporal && screen.srcProbes?.glossy) {
+      const g = screen.srcProbes.glossy;
+      screen.glossyTemporal.filter.setSize(g.width, g.height, width, height);
+      screen.glossyTemporal.snapshot.setSize(g.width, g.height, width, height);
     }
-    // Emitter shadow pass + filter follow the same rebuild+splice contract
-    // (fresh targets at the new sizes; queue positions preserved so they
-    // stay AHEAD of the resolve that samples them).
+
+    // ── EXACT-REFLECTION HIT SHADING + ITS TEMPORAL PAIR ─────────────────
+    if (screen.bvhHitShade && hitShadeW > 0) {
+      screen.bvhHitShade.setSize(hitShadeW, hitShadeH, width, height);
+      screen.bvhHitTemporal?.filter?.setSize?.(hitShadeW, hitShadeH, width, height);
+      screen.bvhHitTemporal?.snapshot?.setSize?.(hitShadeW, hitShadeH, width, height);
+    }
+
+    // ── THE IRRADIANCE TEMPORAL PAIR (§12.65) ────────────────────────────
+    screen.irrTemporalPass?.setSize(width, height, width, height);
+    screen.irrHistoryPass?.setSize(width, height, width, height);
+
+    // ── THE EMITTER SHADOW CHAIN ─────────────────────────────────────────
+    // The trace is this module's 110 kB monster, so its `setSize` returning
+    // true is the single largest item this unit removes from a resize.
     if (screen.emitterShadowPass) {
-      const oldEmitter = screen.emitterShadowPass.compute;
-      const emitterIndexes = [
-        state.queue.indexOf(oldEmitter),
-        state.queueNoFeedback.indexOf(oldEmitter),
-        state.queueFeedbackOnly?.indexOf(oldEmitter) ?? -1,
-      ];
-      screen.emitterShadowPass = createGiEmitterShadowPass({
-        gbuffer: screen.gbuffer,
-        emitter: screen.emitter,
-        normalOffset: screen.normalOffset,
-        target: screen.targets.emitterShadowRaw,
-        // MUST match the build's choice (the wide pass's existence is the
-        // durable record of it) — building without the dist target here would
-        // leave the wide passes blurring by a texture nothing writes, i.e.
-        // shadows that go hard on the first viewport resize. Exactly the
-        // `frame`-omission class the light-shadow splice below documents.
-        distTarget: screen.emitterShadowWidePass ? screen.targets.emitterShadowDist : null,
-        width: emitterW,
-        height: emitterH,
-        resolveWidth: width,
-        resolveHeight: height,
-        cameraPosition: this._giResolveCamU,
-        tileCut: screen.emitterTileCutBundle ?? null,
-        // §14 Q7: the area sample is retired — the central ray is
-        // deterministic, so the build path passes no frame uniform either.
-        frame: null,
-      });
-      if (emitterIndexes[0] >= 0) state.queue[emitterIndexes[0]] = screen.emitterShadowPass.compute;
-      if (emitterIndexes[1] >= 0) state.queueNoFeedback[emitterIndexes[1]] = screen.emitterShadowPass.compute;
-      if (emitterIndexes[2] >= 0) state.queueFeedbackOnly[emitterIndexes[2]] = screen.emitterShadowPass.compute;
-    }
-    // The emitter temporal trio is sized to the EMITTER target, so a resize has
-    // to re-make it before the passes below bind it — same lazy contract the
-    // analytic arm gets a few dozen lines down.
-    const emitterTemporal = !!screen.emitterShadowHistoryPass;
-    if (emitterTemporal) screen.targets.ensureEmitterTemporal?.();
-    if (screen.emitterShadowFilterPass) {
-      const oldEmitterFilter = screen.emitterShadowFilterPass.compute;
-      const emitterFilterIndexes = [
-        state.queue.indexOf(oldEmitterFilter),
-        state.queueNoFeedback.indexOf(oldEmitterFilter),
-        state.queueFeedbackOnly?.indexOf(oldEmitterFilter) ?? -1,
-      ];
-      screen.emitterShadowFilterPass = createGiLightShadowFilterPass({
-        gbuffer: screen.gbuffer,
-        source: screen.targets.emitterShadowRaw,
-        // Must match the BUILD's choice or the chain silently breaks: writing
-        // straight to `emitterShadow` while the history/post passes still read
-        // `emitterShadowAccum` leaves the post pass filtering a stale buffer.
-        target: emitterTemporal
-          ? screen.targets.emitterShadowAccum
-          : screen.emitterShadowWidePass ? screen.targets.emitterShadowMid : screen.targets.emitterShadow,
-        width: emitterW,
-        height: emitterH,
-        resolveWidth: width,
-        resolveHeight: height,
-        planeEps: screen.lightShadow?.voxMax ?? 0.1,
-        cameraPos: this._giShadowWideCamU,
-        projScale: this._giShadowWideProjU,
-        softness: this._giEmitterSoftnessU,
-        history: emitterTemporal ? {
-          histShadow: screen.targets.emitterShadowHist,
-          histPos: screen.targets.emitterShadowHistPos,
-          prevViewProj: this._giShadowPrevVPU,
-          weight: this._giEmitterHistWeightU,
-          validEps: screen.lightShadow?.voxMax ?? 0.15,
-        } : null,
-      });
-      if (emitterFilterIndexes[0] >= 0) state.queue[emitterFilterIndexes[0]] = screen.emitterShadowFilterPass.compute;
-      if (emitterFilterIndexes[1] >= 0) state.queueNoFeedback[emitterFilterIndexes[1]] = screen.emitterShadowFilterPass.compute;
-      if (emitterFilterIndexes[2] >= 0) state.queueFeedbackOnly[emitterFilterIndexes[2]] = screen.emitterShadowFilterPass.compute;
-    }
-    if (screen.emitterShadowHistoryPass) {
-      const oldEmitterHist = screen.emitterShadowHistoryPass.compute;
-      const idx = [
-        state.queue.indexOf(oldEmitterHist),
-        state.queueNoFeedback.indexOf(oldEmitterHist),
-        state.queueFeedbackOnly?.indexOf(oldEmitterHist) ?? -1,
-      ];
-      screen.emitterShadowHistoryPass = createGiLightShadowHistoryPass({
-        gbuffer: screen.gbuffer,
-        source: screen.targets.emitterShadowAccum,
-        histShadow: screen.targets.emitterShadowHist,
-        histPos: screen.targets.emitterShadowHistPos,
-        width: emitterW,
-        height: emitterH,
-        resolveWidth: width,
-        resolveHeight: height,
-      });
-      if (idx[0] >= 0) state.queue[idx[0]] = screen.emitterShadowHistoryPass.compute;
-      if (idx[1] >= 0) state.queueNoFeedback[idx[1]] = screen.emitterShadowHistoryPass.compute;
-      if (idx[2] >= 0) state.queueFeedbackOnly[idx[2]] = screen.emitterShadowHistoryPass.compute;
-    }
-    if (screen.emitterShadowPostPass) {
-      const oldEmitterPost = screen.emitterShadowPostPass.compute;
-      const idx = [
-        state.queue.indexOf(oldEmitterPost),
-        state.queueNoFeedback.indexOf(oldEmitterPost),
-        state.queueFeedbackOnly?.indexOf(oldEmitterPost) ?? -1,
-      ];
-      screen.emitterShadowPostPass = createGiLightShadowFilterPass({
-        gbuffer: screen.gbuffer,
-        source: screen.targets.emitterShadowAccum,
-        target: screen.emitterShadowWidePass ? screen.targets.emitterShadowMid : screen.targets.emitterShadow,
-        width: emitterW,
-        height: emitterH,
-        resolveWidth: width,
-        resolveHeight: height,
-        planeEps: screen.lightShadow?.voxMax ?? 0.1,
-        cameraPos: this._giShadowWideCamU,
-        projScale: this._giShadowWideProjU,
-        softness: this._giEmitterSoftnessU,
-      });
-      if (idx[0] >= 0) state.queue[idx[0]] = screen.emitterShadowPostPass.compute;
-      if (idx[1] >= 0) state.queueNoFeedback[idx[1]] = screen.emitterShadowPostPass.compute;
-      if (idx[2] >= 0) state.queueFeedbackOnly[idx[2]] = screen.emitterShadowPostPass.compute;
-    }
-    // The emitter penumbra reconstruction — same rebuild+splice contract, and
-    // the same spec table the light channel's wide pair uses.
-    if (screen.emitterShadowWidePass) {
-      // Same envelope and the same 1/√2 per instance as the build path — a
-      // resize that re-derived a DIFFERENT penumbra would be a shadow that
-      // changes when the window does.
-      const emitterWideSpecs = [
-        { key: "emitterShadowWidePass", source: screen.targets.emitterShadowMid, target: screen.targets.emitterShadowWide },
-        { key: "emitterShadowWidePass2", source: screen.targets.emitterShadowWide, target: screen.targets.emitterShadow },
-      ];
-      for (const spec of emitterWideSpecs) {
-        const oldWide = screen[spec.key].compute;
-        const wideIndexes = [
-          state.queue.indexOf(oldWide),
-          state.queueNoFeedback.indexOf(oldWide),
-          state.queueFeedbackOnly?.indexOf(oldWide) ?? -1,
+      const ok = screen.emitterShadowPass.setSize(emitterW, emitterH, width, height);
+      if (!ok) {
+        const oldEmitter = screen.emitterShadowPass.compute;
+        const emitterIndexes = [
+          state.queue.indexOf(oldEmitter),
+          state.queueNoFeedback.indexOf(oldEmitter),
+          state.queueFeedbackOnly?.indexOf(oldEmitter) ?? -1,
         ];
-        screen[spec.key] = createGiLightShadowWidePass({
+        screen.emitterShadowPass = createGiEmitterShadowPass({
           gbuffer: screen.gbuffer,
-          source: spec.source,
-          dist: screen.targets.emitterShadowDist,
-          target: spec.target,
-          slots: null,
+          emitter: screen.emitter,
+          normalOffset: screen.normalOffset,
+          target: screen.targets.emitterShadowRaw,
+          // MUST match the build's choice (the wide pass's existence is the
+          // durable record of it) — building without the dist target here would
+          // leave the wide passes blurring by a texture nothing writes.
+          distTarget: screen.emitterShadowWidePass ? screen.targets.emitterShadowDist : null,
           width: emitterW,
           height: emitterH,
           resolveWidth: width,
           resolveHeight: height,
-          cameraPosition: this._giShadowWideCamU,
-          projScale: this._giShadowWideProjU,
-          radiusScale: Math.SQRT1_2,
-          searchWorld: this._giEmitterSearchWorldU,
-          capFrac: 0.25,
-          // §14: MUST match the build path — instance 2 carries the salt.
-          rotSalt: spec.key.endsWith("2") ? 1.2 : 0,
+          cameraPosition: this._giResolveCamU,
+          tileCut: screen.emitterTileCutBundle ?? null,
+          // §14 Q7: the area sample is retired — the central ray is
+          // deterministic, so the build path passes no frame uniform either.
+          frame: null,
         });
-        if (wideIndexes[0] >= 0) state.queue[wideIndexes[0]] = screen[spec.key].compute;
-        if (wideIndexes[1] >= 0) state.queueNoFeedback[wideIndexes[1]] = screen[spec.key].compute;
-        if (wideIndexes[2] >= 0) state.queueFeedbackOnly[wideIndexes[2]] = screen[spec.key].compute;
+        if (emitterIndexes[0] >= 0) state.queue[emitterIndexes[0]] = screen.emitterShadowPass.compute;
+        if (emitterIndexes[1] >= 0) state.queueNoFeedback[emitterIndexes[1]] = screen.emitterShadowPass.compute;
+        if (emitterIndexes[2] >= 0) state.queueFeedbackOnly[emitterIndexes[2]] = screen.emitterShadowPass.compute;
       }
     }
-    // Same rebuild + splice for the shadow pass (its own size, its own
-    // compute-count, the fresh targets).
-    if (screen.lightShadowPass) {
-      const oldPass = screen.lightShadowPass.compute;
-      const passIndexes = [
-        state.queue.indexOf(oldPass),
-        state.queueNoFeedback.indexOf(oldPass),
-        state.queueFeedbackOnly?.indexOf(oldPass) ?? -1,
-      ];
-      screen.lightShadowPass = createGiLightShadowPass({
-        gbuffer: screen.gbuffer,
-        lightShadow: screen.lightShadow,
-        width: shadowW,
-        height: shadowH,
-        resolveWidth: width,
-        resolveHeight: height,
-        // MUST match the build path's inputs. This splice originally omitted
-        // `frame`, which silently replaced the animated-jitter kernel with
-        // the static one on the FIRST viewport resize — the editor always
-        // resizes once at layout-settle, so every editor session ran frozen
-        // dither while the (never-resizing) smoke page validated the
-        // animated path. Probe signature: two same-state readbacks of the
-        // raw texture differing by ~1 pixel while the phase uniform climbs.
-        // (The trace is deterministic, so frame is always null — same rule.)
-        frame: null,
-        // Same MUST-match rule for the checkerboard parity (§12.80 Unit B):
-        // omitting it here would silently swap in the full-dispatch kernel on
-        // the first resize — the inverse of the frozen-dither bug above.
-        checker: globalThis.__giShadowCheckerboard !== false
-          ? (this._giShadowCheckerU ??= uniform(0, "uint").setGroup(renderGroup))
-          : null,
-        checkerFill: globalThis.__giShadowCheckerboard !== false
-          ? (this._giShadowCheckerFillU ??= uniform(0, "uint").setGroup(renderGroup))
-          : null,
-      });
-      if (passIndexes[0] >= 0) state.queue[passIndexes[0]] = screen.lightShadowPass.compute;
-      if (passIndexes[1] >= 0) state.queueNoFeedback[passIndexes[1]] = screen.lightShadowPass.compute;
-      if (passIndexes[2] >= 0) state.queueFeedbackOnly[passIndexes[2]] = screen.lightShadowPass.compute;
+    screen.emitterShadowFilterPass?.setSize(emitterW, emitterH, width, height);
+    screen.emitterShadowHistoryPass?.setSize(emitterW, emitterH, width, height);
+    screen.emitterShadowPostPass?.setSize(emitterW, emitterH, width, height);
+    screen.emitterShadowWidePass?.setSize(emitterW, emitterH, width, height);
+    screen.emitterShadowWidePass2?.setSize(emitterW, emitterH, width, height);
+
+    // ── THE ANALYTIC LIGHT-SHADOW CHAIN ──────────────────────────────────
+    screen.lightShadowPass?.setSize(shadowW, shadowH, width, height);
+    screen.lightShadowFilterPass?.setSize(shadowW, shadowH, width, height);
+    screen.lightShadowWidePass?.setSize(shadowW, shadowH, width, height);
+    screen.lightShadowWidePass2?.setSize(shadowW, shadowH, width, height);
+    // The bundle carries the textures the chain writes; setSize kept every one
+    // of them, so only the pcss choice is restated.
+    if (screen.lightShadow) {
+      screen.lightShadow = {
+        ...screen.lightShadow,
+        target: screen.targets.lightShadow,
+        rawTarget: screen.targets.lightShadowRaw,
+        distTarget: screen.lightShadow.pcss ? screen.targets.lightShadowDist : null,
+      };
     }
-    // And the filter pass riding behind it (same fresh targets, same splice).
-    if (screen.lightShadowFilterPass) {
-      const oldFilter = screen.lightShadowFilterPass.compute;
-      const filterIndexes = [
-        state.queue.indexOf(oldFilter),
-        state.queueNoFeedback.indexOf(oldFilter),
-        state.queueFeedbackOnly?.indexOf(oldFilter) ?? -1,
-      ];
-      screen.lightShadowFilterPass = createGiLightShadowFilterPass({
-        gbuffer: screen.gbuffer,
-        source: screen.targets.lightShadowRaw,
-        target: screen.lightShadowWidePass ? screen.targets.lightShadowMid : screen.targets.lightShadow,
-        width: shadowW,
-        height: shadowH,
-        resolveWidth: width,
-        resolveHeight: height,
-        planeEps: screen.lightShadow?.voxMax ?? 0.1,
-        cameraPos: this._giShadowWideCamU,
-        projScale: this._giShadowWideProjU,
-        history: null,
-      });
-      if (filterIndexes[0] >= 0) state.queue[filterIndexes[0]] = screen.lightShadowFilterPass.compute;
-      if (filterIndexes[1] >= 0) state.queueNoFeedback[filterIndexes[1]] = screen.lightShadowFilterPass.compute;
-      if (filterIndexes[2] >= 0) state.queueFeedbackOnly[filterIndexes[2]] = screen.lightShadowFilterPass.compute;
-    }
-    if (screen.lightShadowWidePass) {
-      const wideSpecs = [
-        { key: "lightShadowWidePass", source: screen.targets.lightShadowMid, target: screen.targets.lightShadowWide, capFrac: 0.08 },
-        { key: "lightShadowWidePass2", source: screen.targets.lightShadowWide, target: screen.targets.lightShadow, capFrac: 0.25 },
-      ];
-      for (const spec of wideSpecs) {
-        const oldWide = screen[spec.key].compute;
-        const wideIndexes = [
-          state.queue.indexOf(oldWide),
-          state.queueNoFeedback.indexOf(oldWide),
-          state.queueFeedbackOnly?.indexOf(oldWide) ?? -1,
-        ];
-        screen[spec.key] = createGiLightShadowWidePass({
-          gbuffer: screen.gbuffer,
-          source: spec.source,
-          dist: screen.targets.lightShadowDist,
-          target: spec.target,
-          slots: screen.lightShadow.slots,
-          span: screen.lightShadow.span,
-          width: shadowW,
-          height: shadowH,
-          resolveWidth: width,
-          resolveHeight: height,
-          cameraPosition: this._giShadowWideCamU,
-          projScale: this._giShadowWideProjU,
-          capFrac: spec.capFrac,
-          // §14: MUST match the build path — instance 2 carries the salt.
-          rotSalt: spec.key.endsWith("2") ? 1.2 : 0,
-        });
-        if (wideIndexes[0] >= 0) state.queue[wideIndexes[0]] = screen[spec.key].compute;
-        if (wideIndexes[1] >= 0) state.queueNoFeedback[wideIndexes[1]] = screen[spec.key].compute;
-        if (wideIndexes[2] >= 0) state.queueFeedbackOnly[wideIndexes[2]] = screen[spec.key].compute;
-      }
-    }
-    this.#retireTargets(previousTargets);
-    // Same follow-up for the BVH reflect compute (GI Phase 3 v1) — it is NOT
-    // part of state.queue/queueNoFeedback (see #tick's dispatch comment), so
-    // there is no index-splice step for it.
-    if (screen.bvhReflect) {
-      if (!previousBvhTarget) {
-        // Exact reflections without the shading bundle (an unshaded build):
-        // the targets were not swapped above, so do it here.
-        previousBvhTarget = this._giBvhTarget;
-        this._giBvhTarget = createGiBvhTarget(width, height, {
-        // Div 3 (2026-08-22 late, the user's "ultra is 14 fps + dirty"):
-        // hit shading is whole-kernel register pressure, cost ∝ threads —
-        // at ultra's full-res resolve, div 2 measured ~17 ms of a 47.9 ms
-        // frame on the Level. Div 3 cuts it ~55%, and the coarser grid +
-        // §12.65 temporal reads SOFTER, which on the user's speckle
-        // complaint is the better side of the trade. `__giHitShadeFull`
-        // still forces 1 for A/Bs.
-        // ⚠ THIS DIVISOR AND THE PREPASS STRIDE INTERACT (2026-08-22). At
-        // stride 2 a divisor of 3 BEATS against the traced anchors — source
-        // texels 0,3,6,9 alternate even/odd, so every second row and column
-        // of the reflection was shaded from a REPLICATED texel, which is the
-        // "a lot of lines" report. The fix is the anchor SNAP in
-        // createGiBvhHitShade (which costs nothing), not a bigger grid:
-        // measured live at high on the user's Level, aligning by widening to
-        // div 2 took bvhHitShade 4.4 → 9.83 ms of a 16.6 ms 60 fps frame.
-        // Div 3 + snap samples 0,2,6,8 — uneven, but every sample is a real
-        // traced anchor with its own P/N/t, which is what the lines were
-        // about. Keep them in sync if either number moves.
-        radianceDiv: 3,
-      });
-        this._giBvhTargetSize = { width, height };
-        this._giBvhReflectNode.value = this._giBvhTarget.bvhReflect;
-        this._giBvhColorNode.value = this._giBvhTarget.bvhColor;
-        this._giBvhRadianceNode.value = this._giBvhTarget.bvhRadiance;
-      }
-      const { compute } = createGiBvhReflect({
-        gbuffer: screen.gbuffer,
-        target: this._giBvhTarget.bvhReflect,
-        colorTarget: this._giBvhTarget.bvhColor,
-        width,
-        height,
-        bvhScene: screen.bvhReflect.bvhScene,
-        cameraPosition: this._bvhCameraPosition,
-        normalOffset: state.light.normalOffset,
-        maxDistance: state.light.mirrorRange ?? 24,
-        mask: this.#bvhMaskEnabled(),
-        dyn: this._dynSet ?? null,
-        strideDefault: this.#bvhReflectStride(),
-        // §17 R7a — whole-scene reflections through the static shadow BVH.
-        oneBvh: this.#oneBvhBundle(),
-      });
-      screen.bvhReflect = { compute, bvhScene: screen.bvhReflect.bvhScene, dynSet: this._dynSet ?? null };
-    }
-    this.#retireTargets(previousBvhTarget);
+
+    // ── THE BVH REFLECT PREPASS ──────────────────────────────────────────
+    // NOT part of state.queue (see #tick's dispatch comment), so there is no
+    // splice. Its dispatch is one thread per stride x stride BLOCK and the
+    // block grid is a uniform.
+    screen.bvhReflect?.pass?.setSize?.(width, height);
+
     // ⚠ THE DIFF IS THE SAFETY ARGUMENT, and releaseCompute.js prices getting it
     // wrong at a 16-27 s recompile: a node still reachable from `state` is still
-    // dispatched, so only what the rebuild ORPHANED may be evicted — and only
-    // now, after every replacement has been built and spliced.
+    // dispatched, so only what the rebuild ORPHANED may be evicted. On the happy
+    // path nothing is orphaned at all, which is this unit's whole point.
     this.#sweepOrphanedComputes(state, staleBefore, "resolve-resize");
   }
 
@@ -8068,10 +7830,26 @@ export class GISystem {
   }
 
   #ensureReflProbeState() {
+    // ── ⭐⭐ §19 0.3b — THE RECAPTURE CHANNEL OUTLIVES THE KERNELS ────────
+    //
+    // `#armReflectionProbeCapture` re-mints the capture whenever the BVH or the
+    // gather closure changes, so a request parked on the CAPTURE would be
+    // silently dropped by the next re-arm. This is session-lifetime state for
+    // the same reason the atlas and the slot uniforms are.
+    //
+    // The problem it solves (reflectionProbeCapture.js's own header carries the
+    // measurement): the capture is a one-shot in practice, so whatever the
+    // scene looked like when a 159 kB kernel finished compiling is what the
+    // atlas holds forever. §19 0.5's loop roll changed nothing about the
+    // estimator and moved the hit-shade rig's crops 34% — because it made the
+    // kernel compile 2.5x faster, so the capture fired EARLIER and baked a
+    // less-converged field. The image was reading a clock.
+    this._reflProbeSchedule ??= createReflectionProbeSchedule();
     if (!this._reflProbeGpu) {
       const atlas = createReflectionProbeAtlas();
       this._reflProbeGpu = {
         atlas,
+        schedule: this._reflProbeSchedule,
         node: texture(atlas),
         slots: Array.from({ length: MAX_REFLECTION_PROBES }, () => ({
           posFeather: uniform(new THREE.Vector4(0, 0, 0, 0.5)),
@@ -8127,6 +7905,9 @@ export class GISystem {
       : null;
     try {
       const capture = createReflectionProbeCapture({
+        // CALLER-OWNED (see #ensureReflProbeState): a request made while the
+        // old kernels were live must survive this re-arm.
+        schedule: this._reflProbeSchedule,
         scratch: gpu.scratch,
         history: gpu.history,
         bvhScene: state.bvhScene,
@@ -8324,7 +8105,7 @@ export class GISystem {
       // here first. Lazy + SYSTEM-lifetime either way — see #ensureBvhTargets.
       this.#ensureBvhTargets(width, height);
       if (!this._bvhCameraPosition) this._bvhCameraPosition = uniform(new THREE.Vector3());
-      const { compute } = createGiBvhReflect({
+      const reflectPass = createGiBvhReflect({
         gbuffer: state.screen.gbuffer,
         target: this._giBvhTarget.bvhReflect,
         colorTarget: this._giBvhTarget.bvhColor,
@@ -8345,7 +8126,14 @@ export class GISystem {
         // §17 R7a — whole-scene reflections through the static shadow BVH.
         oneBvh: this.#oneBvhBundle(),
       });
-      state.screen.bvhReflect = { compute, bvhScene, dynSet: this._dynSet ?? null };
+      // §19 0.3b: `pass` carries `setSize` — a viewport resize moves the block
+      // grid uniform and the dispatch count instead of re-minting this kernel.
+      state.screen.bvhReflect = {
+        pass: reflectPass,
+        compute: reflectPass.compute,
+        bvhScene,
+        dynSet: this._dynSet ?? null,
+      };
       // Hits are shaded when the screen chain was built with a `bvhShade`
       // bundle (#buildScreenResolve arms createGiBvhHitShade from it — §14
       // R-A) — that is the single source of truth for which texture carries
@@ -8885,13 +8673,26 @@ export class GISystem {
       // `emitterShadowDist` is deliberately NOT here: it holds a penumbra
       // width, and its zero-init already means "no blur", which is the
       // fail-SHARP direction and correct.
-      const clears = [
-        createGiShadowClearPass(targets.emitterShadow, emitterW, emitterH),
-        createGiShadowClearPass(targets.emitterShadowRaw, emitterW, emitterH),
-        createGiShadowClearPass(targets.emitterShadowMid, emitterW, emitterH),
-        createGiShadowClearPass(targets.emitterShadowWide, emitterW, emitterH),
-      ];
-      giCompute(renderer, clears.map((c) => c.compute));
+      // §19 0.3b — BUILT ONCE PER TARGET BUNDLE, RESIZED AFTERWARDS. The
+      // targets keep their identity across a resize now, so re-creating four
+      // compute nodes here would put four fresh pipelines on a path whose whole
+      // purpose this unit is to make free. They are 1 kB kernels and three's
+      // pipeline cache would likely absorb them, but "likely absorbed" is not a
+      // receipt and the probe counts `createComputePipeline` calls.
+      if (this._giEmitterClears?.targets !== targets) {
+        this._giEmitterClears = {
+          targets,
+          passes: [
+            createGiShadowClearPass(targets.emitterShadow, emitterW, emitterH),
+            createGiShadowClearPass(targets.emitterShadowRaw, emitterW, emitterH),
+            createGiShadowClearPass(targets.emitterShadowMid, emitterW, emitterH),
+            createGiShadowClearPass(targets.emitterShadowWide, emitterW, emitterH),
+          ],
+        };
+      } else {
+        for (const c of this._giEmitterClears.passes) c.setSize(emitterW, emitterH);
+      }
+      giCompute(renderer, this._giEmitterClears.passes.map((c) => c.compute));
     } catch (error) {
       // A failed clear must never take the build down — the worst case is
       // the old fail-closed behaviour for one compile window.
@@ -9196,6 +8997,12 @@ export class GISystem {
         const tilesLit = stats?.tiles?.lit ?? 0;
         if (rays > 0 && (deposits > 0 || tilesLit > 0)) {
           this._transportAlive = true;
+          // §19 0.3b — THE FIRST RECAPTURE MOMENT. This latch fires exactly
+          // once, on the first readback proving rays were fired AND something
+          // received them, which is the earliest instant at which the atlas
+          // would be capturing a field that has any light in it at all. Before
+          // it, whatever the capture baked was a picture of the dark.
+          this._reflProbeSchedule?.recapture("transport-steady");
           console.log(
             `[gi] transport alive: ${rays} rays, ${deposits} deposits, ${tilesLit} lit tiles`
             + `${this._transportWaveAt ? ` (${((performance.now() - this._transportWaveAt) / 1000).toFixed(1)}s after first dispatch)` : ""}`
@@ -11106,6 +10913,7 @@ export class GISystem {
       });
       screen.srcProbes.passes.push(farAvg.computeAccum, farAvg.computeEma);
       screen.srcProbes.passGroups?.push({ label: "far field", count: 2 });
+      screen.farFieldPass = farAvg;
       farFieldInput = {
         node: this._giFarFieldNode,
         worldMin: state.volume.world.min,

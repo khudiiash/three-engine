@@ -261,7 +261,10 @@ export function createSrcProbeSystem({
   const spacing0 = Number(globalThis.__giSrcSpacing0)
     || (Number.isFinite(spacing0Override) && spacing0Override > 0 ? spacing0Override : 0)
     || tier.spacing0;
-  const pixelCount = width * height;
+  // §19 0.3b — MUTABLE. `setSize` resizes this system in place now (see its
+  // header); every derived number below that a resolution moves is re-derived
+  // there, so none of them may be `const` any more.
+  let pixelCount = width * height;
 
   // Resolved pool sizes, floors-first (§12.77 Unit A). Precedence: the FIXED
   // hatches (`__giSrcC0Probes`/`__giSrcBinBudget` — freeze the pool for a
@@ -303,9 +306,10 @@ export function createSrcProbeSystem({
 
   const cameraU = uniform(new THREE.Vector3());
   const anchorU = uniform(new THREE.Vector3());
-  // Size in a uniform so a resize is a uniform write for the texel decode. The
-  // DISPATCH counts are baked into the compute nodes, so a resize still rebuilds
-  // the frame — see `setSize` on the returned object.
+  // Size in a uniform so a resize is a uniform write for the texel decode.
+  // §19 0.3b: and the dispatch counts follow it — `ComputeNode.count` is
+  // mutable and read every dispatch, so a resize no longer rebuilds the frame
+  // at all. See `setSize` on the returned object for the whole argument.
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
@@ -321,9 +325,10 @@ export function createSrcProbeSystem({
   // pixel `SRC_GATHER_SCALE`× too far left on a row `SRC_GATHER_SCALE`× too far
   // up — a plausible image, subtly sheared, of a scene that is not there.
   //
-  // The multipliers are JS constants, not uniforms, and that is safe for the
-  // reason `setSize` already documents: the dispatch counts are baked into the
-  // compute nodes, so a resolution change rebuilds this whole frame anyway.
+  // The SCALE is a JS constant and the WIDTHS are uniforms (§19 0.3b). The
+  // scale is graph shape — at 1 there is no map at all — and it does not move
+  // with the window; the widths do, and as literals they put the resolution
+  // straight back into a kernel 0.5b had just made resolution-stable.
   // ⚠ **1, NOT 2, AND THE 2 WAS MEASURED BEFORE IT WAS BACKED OUT.**
   //
   // At 2 this is worth ~5.6 ms on the user's editor (gather 7.55 → ~1.9 ms) and
@@ -350,11 +355,19 @@ export function createSrcProbeSystem({
   // Raising this to 2 is a one-token change once the bilateral exists, and the
   // 5.6 ms is already priced.
   const SRC_GATHER_SCALE = 1;
-  const gatherWidth = Math.max(1, Math.ceil(width / SRC_GATHER_SCALE));
-  const gatherHeight = Math.max(1, Math.ceil(height / SRC_GATHER_SCALE));
+  let gatherWidth = Math.max(1, Math.ceil(width / SRC_GATHER_SCALE));
+  let gatherHeight = Math.max(1, Math.ceil(height / SRC_GATHER_SCALE));
+  // §19 0.3b — UNIFORMS, not literals. `srcScreenGather`'s own kernel went
+  // resolution-stable in 0.5b, but the thread → gbuffer-pixel map is supplied
+  // from HERE, and `uint(gatherWidth)` / `uint(SCALE * width)` put the
+  // resolution straight back into its WGSL. The scale itself stays a JS
+  // constant: it is graph shape (it decides whether there is a map at all),
+  // and it does not move with the window.
+  const gatherWidthU = uniform(gatherWidth, "uint");
+  const gatherRowU = uniform(SRC_GATHER_SCALE * width, "uint");
   const gatherReadPixel = (i) => readPixel(
-    i.div(uint(gatherWidth)).mul(uint(SRC_GATHER_SCALE * width))
-      .add(i.mod(uint(gatherWidth)).mul(uint(SRC_GATHER_SCALE))),
+    i.div(uint(gatherWidthU)).mul(uint(gatherRowU))
+      .add(i.mod(uint(gatherWidthU)).mul(uint(SRC_GATHER_SCALE))),
   );
   // The GLOSSY gather's grid (§12.71b v2) — half the resolve, its own map
   // into the full-res gbuffer for exactly the shear reason above. 2 is safe
@@ -363,11 +376,13 @@ export function createSrcProbeSystem({
   // angular blur before it is a spatial one (the pass header has the full
   // argument).
   const GLOSSY_SCALE = 2;
-  const glossyWidth = Math.max(1, Math.ceil(width / GLOSSY_SCALE));
-  const glossyHeight = Math.max(1, Math.ceil(height / GLOSSY_SCALE));
+  let glossyWidth = Math.max(1, Math.ceil(width / GLOSSY_SCALE));
+  let glossyHeight = Math.max(1, Math.ceil(height / GLOSSY_SCALE));
+  const glossyWidthU = uniform(glossyWidth, "uint");
+  const glossyRowU = uniform(GLOSSY_SCALE * width, "uint");
   const glossyReadPixel = (i) => readPixel(
-    i.div(uint(glossyWidth)).mul(uint(GLOSSY_SCALE * width))
-      .add(i.mod(uint(glossyWidth)).mul(uint(GLOSSY_SCALE))),
+    i.div(uint(glossyWidthU)).mul(uint(glossyRowU))
+      .add(i.mod(uint(glossyWidthU)).mul(uint(GLOSSY_SCALE))),
   );
   const readPixel = (i) => {
     const t = texelOf(i);
@@ -549,7 +564,7 @@ export function createSrcProbeSystem({
   // user's editor and 94% of a 260 ms SRC chain.
   const strideU = uniform(1, "uint");
   const phaseU = uniform(0, "uint");
-  const naturalRays = pixelCount * tier.raysPerPixel;
+  let naturalRays = pixelCount * tier.raysPerPixel;
   // ── THE CEILING IS POLLED PER FRAME, NOT READ AT BUILD ────────────────────
   //
   // Same rule `__giSrcAlpha` follows two dozen lines up, and for the reason
@@ -611,6 +626,8 @@ export function createSrcProbeSystem({
   // and the TDZ ReferenceError silently cost the whole SRC build (the cost
   // probe read "1 kernels", 4.7% lit — a black scene wearing a probe failure).
   let restFactor = 1;
+  /** §19 0.3b — the hysteretic "the field has stopped being pushed" latch. */
+  let srcAtRest = false;
   /** §12.74: when the α-ramp motion signal last STARTED being continuously
    *  significant. 0 = not currently sustained. See the root-relax block. */
   let motionSustainSince = 0;
@@ -1103,6 +1120,8 @@ export function createSrcProbeSystem({
         // the transport's and a live ceiling change must keep moving it.
         rayWork: rayStore.rayWork,
         pixelCount,
+        // §19 0.3b — the resize-stable guard; see srcDeposit's own note.
+        pixelCountNode: rayStore.pixelCountU,
         raysPerPixel: tier.raysPerPixel,
         stride: strideU,
         phase: phaseU,
@@ -1718,6 +1737,40 @@ export function createSrcProbeSystem({
       const restDrive = Math.max(mLight, tr, camTerm, bootTerm, lightTerm);
       restFactor = restOn ? restFraction + (1 - restFraction) * restDrive : 1;
       globalThis.__giSrcRestFactorLive = restFactor;
+      // §19 0.3b — THE SETTLE SIGNAL, as a boolean the rest of the engine can
+      // latch a rising edge on. `restDrive` is the max of every responsiveness
+      // term (α motion ramp, an open light-tracking window, a recent camera
+      // move, the boot hold, the light-settle envelope), so `restDrive == 0` is
+      // exactly "nothing is asking the transport for budget any more" — the
+      // field has stopped changing for reasons other than its own convergence.
+      // Published rather than re-derived by consumers because the arithmetic
+      // (`restFraction + (1 - restFraction) * restDrive`) has a hatch in it, and
+      // a consumer comparing the FACTOR against a constant would read a pinned
+      // arm as permanently unsettled.
+      globalThis.__giSrcRestDriveLive = restDrive;
+      // ⚠ A SCHMITT TRIGGER, AND BOTH HALVES WERE MEASURED. ─────────────────
+      //
+      // ⚠ NOT `<= 0`. On the Level the drive settles to ~0.01-0.03 and never
+      // reaches zero — the α motion ramp keeps a hair of signal while the field
+      // is still converging, which is precisely the state this is supposed to
+      // call "settled". A zero test is a blind instrument
+      // ([[probe-blind-statistics]]): it reads "never settles" forever and
+      // every consumer silently never fires. Measured on the first wiring.
+      //
+      // ⚠ AND NOT ONE THRESHOLD. With a single 0.05 the drive crossed it back
+      // and forth and the rising-edge consumer fired EIGHT times in 45 parked
+      // seconds — each one resetting the reflection atlas's jitter/EMA to round
+      // 0, i.e. a "settled" signal that prevented settling. Enter at 0.05, hold
+      // until 0.15, so a boundary hover is one event.
+      //
+      // Both are FRACTIONS of a normalized 0..1 drive, not world units.
+      if (restOn) {
+        if (srcAtRest) { if (restDrive >= 0.15) srcAtRest = false; }
+        else if (restDrive <= 0.05) srcAtRest = true;
+      } else {
+        srcAtRest = false;
+      }
+      globalThis.__giSrcAtRest = srcAtRest;
       // The ceiling is live (see `readCeiling`) and the rest factor rides it.
       // Re-derived HERE, before the stride root, so `rootS` reads the stride
       // this frame actually refreshes at — the old order computed the root
@@ -2009,13 +2062,41 @@ export function createSrcProbeSystem({
     },
 
     /**
-     * A resize rebuilds the frame. The dispatch counts are compile-time
-     * constants on the compute nodes (three bakes `.compute(n)`), and the
-     * `pixelProbe` buffer is one entry per pixel — neither survives a resolution
-     * change, and pretending otherwise would run the population over a stale
-     * pixel count and silently drop the new edge of the screen.
+     * ── ⭐⭐ §19 0.3b — A RESIZE IS A RESIZE, NOT A REBUILD ─────────────────
+     *
+     * ⛔ THE DOC THAT USED TO SIT HERE WAS HALF FALSE, and it is why every
+     * consumer of this system re-minted on a viewport resize. It said "the
+     * dispatch counts are compile-time constants on the compute nodes (three
+     * bakes `.compute(n)`)". `.compute(n)` does bake `n` INTO THE NODE — and
+     * `ComputeNode.count` is a plain mutable field that `WebGPUBackend.compute`
+     * reads every dispatch (`computeNode.dispatchSize || computeNode.count`),
+     * re-deriving the workgroup split whenever it differs from the cached one.
+     * The in-shader bounds guard comes from `countNode`, which the node builds
+     * as `uniform(this.count,'uint').onObjectUpdate(() => this.count)` — so the
+     * guard is ALREADY a uniform read that follows the write for free. Nothing
+     * about a thread count was ever compile-time.
+     *
+     * What IS per-build is the per-pixel storage BUFFERS. Those are swapped
+     * under their live nodes (`swapStorageBuffer` in srcProbes.js carries the
+     * three-part argument for why that costs a bind group and not a pipeline),
+     * and the two kernels that compared against `uint(pixelCount)` now read a
+     * uniform instead.
+     *
+     * So this returns THE SAME SYSTEM for a pure resolution change. That is the
+     * contract the whole 0.3b wiring rests on: `createGiResolve`,
+     * `createGiBvhHitShade` and `createGiFarFieldAvgPass` all bind buffers and
+     * closures that belong to this object, and every one of them had to be
+     * re-minted purely because this method used to hand back a new one.
+     *
+     * A POOL GROW still rebuilds — the store's capacities are the dispatch
+     * counts of the ladder AND the length of every probe-indexed buffer, i.e.
+     * a different system, not a different size.
+     *
+     * @param {?Function} options.retire  receives each retired buffer attribute;
+     *   they may still be bound by a submit in flight, so the caller's own
+     *   deferred queue (GISystem's `#retireTargets`) owns the dispose.
      */
-    setSize(nextWidth, nextHeight, nextPools = null) {
+    setSize(nextWidth, nextHeight, nextPools = null, { retire = null } = {}) {
       // A pool grow rides THIS path (§12.77 Unit A): same dims + changed pools
       // is a real rebuild, not a no-op — the dispatch counts baked from the
       // capacities are exactly as compile-time as the ones baked from the
@@ -2026,6 +2107,48 @@ export function createSrcProbeSystem({
         (Number(nextPools.binBudget) || 0) > system.poolConfig.binBudget
       );
       if (nextWidth === system.width && nextHeight === system.height && !poolsChanged) return system;
+      // ── THE IN-PLACE PATH ───────────────────────────────────────────────
+      if (!poolsChanged) {
+        width = nextWidth;
+        height = nextHeight;
+        pixelCount = Math.max(1, width * height);
+        widthU.value = width;
+        naturalRays = pixelCount * tier.raysPerPixel;
+        gatherWidth = Math.max(1, Math.ceil(width / SRC_GATHER_SCALE));
+        gatherHeight = Math.max(1, Math.ceil(height / SRC_GATHER_SCALE));
+        gatherWidthU.value = gatherWidth;
+        gatherRowU.value = SRC_GATHER_SCALE * width;
+        glossyWidth = Math.max(1, Math.ceil(width / GLOSSY_SCALE));
+        glossyHeight = Math.max(1, Math.ceil(height / GLOSSY_SCALE));
+        glossyWidthU.value = glossyWidth;
+        glossyRowU.value = GLOSSY_SCALE * width;
+        const retired = [
+          ...frame.setSize(pixelCount),
+          ...rayStore.setSize(pixelCount),
+        ];
+        rayFrame?.setPixelCount?.(pixelCount);
+        gather?.setSize?.(gatherWidth, gatherHeight);
+        glossy?.setSize?.(glossyWidth, glossyHeight);
+        // Their `width`/`height` are what GISystem sizes the far-field average
+        // and the glossy temporal pair from, and `setSize` in srcScreenGather
+        // owns the kernel, not the bundle's public dimensions. Written here so
+        // there is exactly one place that knows both grids.
+        if (gather) { gather.width = gatherWidth; gather.height = gatherHeight; }
+        if (glossy) { glossy.width = glossyWidth; glossy.height = glossyHeight; }
+        // The stride is `max(fill, want)` over `pixelCount`/`naturalRays`, so
+        // both terms moved; re-deriving it here rather than waiting for the
+        // next ceiling change keeps the transport covering the WHOLE new screen
+        // on the very next frame (a stride left too small samples a crop — see
+        // `strideFor`).
+        rayStride = strideFor(rayCeiling);
+        strideU.value = rayStride;
+        publishTransport();
+        system.width = width;
+        system.height = height;
+        system.pixelCount = pixelCount;
+        if (retire) for (const attr of retired) retire(attr);
+        return system;
+      }
       // EVERY create arg forwards. The first version passed only the six it
       // could see, so `lighting`/`surfaces`/`sceneMotion`/`trackMotion`
       // defaulted to null and the FIRST viewport resize silently rebuilt the

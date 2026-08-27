@@ -309,7 +309,17 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
   // A receipt, because "the merge is healthy" and "the prepass is USING it" are
   // different facts: every rule below refuses groups silently, and a swap that
   // parks everything looks exactly like a swap that is working.
-  const proxyStats = { groups: 0, used: 0, unsafe: 0, parkedSharp: 0, parkedHidden: 0, hidden: 0 };
+  // §19 0.3b D4 adds `maskRan`/`maskDraws`: whether pass 2 below ran at all,
+  // and how many meshes it drew. That is the cheapest honest answer to "does
+  // this frame contain any reflective surface", and it is CPU-side — an actual
+  // mirror-PIXEL count would need a GPU readback per frame, which is the cost
+  // the thing it gates already is. It errs toward DISPATCHING: a mesh drawn but
+  // fully depth-rejected counts as one, so the gate can only ever be too
+  // generous, never too eager to skip.
+  const proxyStats = {
+    groups: 0, used: 0, unsafe: 0, parkedSharp: 0, parkedHidden: 0, hidden: 0,
+    maskRan: false, maskDraws: 0,
+  };
   if (depthProxies) {
     const sharpBit = 1 << GI_SHARP_LAYER;
     let anyDrawn = false;
@@ -430,7 +440,12 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
       renderer.autoClearStencil = false;
       scene.background = null;
       scene.backgroundNode = null;
+      // See proxyStats' note: the delta, not the absolute — `info` resets once
+      // per animation frame, so nested renders accumulate into it.
+      const drawsBefore = renderer.info?.render?.drawCalls ?? 0;
       renderer.render(scene, camera);
+      proxyStats.maskRan = true;
+      proxyStats.maskDraws = Math.max(0, (renderer.info?.render?.drawCalls ?? 0) - drawsBefore);
     }
   } finally {
     // ⚠ RESTORED HERE, NOT AFTER THE RENDER, and unconditionally: these meshes
@@ -2355,16 +2370,29 @@ export function createGiEmitterShadowPass({
     widthU,
     dims,
     /**
-     * §19 0.5b. ⚠ NOT sufficient when a `tileCut` bundle is bound: that
-     * bundle's `tilesX`/`tilesY`/`tileSize` are baked (they index a storage
-     * buffer whose LENGTH is the tile count), so a resize that changes the
-     * tile count must re-mint this pass with the fresh bundle. The tile-cut
-     * pass's own `setSize` reports that by returning false.
+     * §19 0.5b. ⚠ NOT sufficient when a `tileCut` bundle is bound AND the tile
+     * GRID moves: that bundle's `tilesX`/`tilesY`/`tileSize` are baked here
+     * (they index a storage buffer whose LENGTH is the tile count), so a resize
+     * that changes the tile count must re-mint this pass with the fresh bundle.
+     *
+     * §19 0.3b tightened the test from "is a tileCut bound" to "did the grid
+     * change" — the same question `createGiEmitterTileCutPass.setSize` asks of
+     * itself, and for the same reason: with the grid unchanged the baked
+     * constants are still correct and `idBuf`/`posBuf` are still the same
+     * buffers. The looser test made this — the module's 110 kB monster, the
+     * single most expensive kernel a resize could re-mint — re-mint on EVERY
+     * resize of any scene with emitters, which is every scene the tile cut
+     * exists for.
      */
     setSize(w, h, rw = w, rh = h) {
+      if (tileCut) {
+        const nx = Math.ceil(w / tileCut.tileSize);
+        const ny = Math.ceil(h / tileCut.tileSize);
+        if (nx !== tileCut.tilesX || ny !== tileCut.tilesY) return false;
+      }
       dims.set(w, h, rw, rh);
       compute.count = w * h;
-      return !tileCut;
+      return true;
     },
   };
 }

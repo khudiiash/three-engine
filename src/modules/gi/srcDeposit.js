@@ -645,6 +645,8 @@ export function createSrcDepositFrame(store, bins, {
   pixelProbe,
   pixelRayBase,
   pixelCount,
+  // §19 0.3b — the resize-stable twin of `pixelCount`. See srcRays' store.
+  pixelCountNode = null,
   raysPerPixel = 1,
   trace,
   shadeHit = null,
@@ -732,7 +734,13 @@ export function createSrcDepositFrame(store, bins, {
   // fallback is the old pixel-sized dispatch, which is what every gate runs.
   const strided = stride && phase && threads > 0;
   const pixelOf = strided ? (t) => transportPixel(t, stride, phase).toVar() : (t) => t;
-  const outOfRange = strided ? (p) => p.greaterThanEqual(uint(pixelCount)) : null;
+  // §19 0.3b: a uniform when the caller has one — this comparison was the only
+  // resolution literal left in [E]'s WGSL, and one literal is a whole driver
+  // compile per viewport size. The literal fallback keeps standalone rigs
+  // byte-identical to the text they gated.
+  const outOfRange = strided
+    ? (p) => p.greaterThanEqual(pixelCountNode ? uint(pixelCountNode) : uint(pixelCount))
+    : null;
   const dispatchCount = strided ? threads : pixelCount;
   // ── HOW WIDE IS [E] DISPATCHED, SAID OUT LOUD ─────────────────────────────
   //

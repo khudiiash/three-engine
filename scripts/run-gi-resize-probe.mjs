@@ -271,6 +271,12 @@ const record = async (label) => {
     ` want ${String(s.wantedSize).padEnd(9)} f${String(s.giFrame).padStart(6)} ${String(s.fps).padStart(3)}fps` +
     `${s.compileWaveActive ? " WAVE" : ""}${s.renderSuspended ? " SUSP" : ""}` +
     ` cPipes ${String(s.cPipes).padStart(4)} (${d("cPipes").padStart(5)})` +
+    // §19 0.3b: RENDER pipelines beside compute ones. Without this column a
+    // durable step that minted 3 compute pipelines and 33 shader modules is
+    // unreadable — 2 modules per render pipeline is the only arithmetic that
+    // closes, and a MATERIAL recompile on a resize is a different bug from a
+    // screen kernel re-mint.
+    ` rPipes ${String(s.rPipes).padStart(4)} (${d("rPipes").padStart(5)})` +
     ` shaderMods ${String(s.shaderModules).padStart(4)} (${d("shaderModules").padStart(5)})` +
     ` tex ${String(s.texturesLive).padStart(4)} (${d("texturesLive").padStart(5)})` +
     ` heap ${s.heapMB.toFixed(0).padStart(5)}MB (${d("heapMB", 0).padStart(5)})` +

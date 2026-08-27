@@ -289,3 +289,274 @@ Gate: `npm run probe:gi-portable` portable arm → 0 kernels over any counted
 limit; a forced `__giDeviceTier="low"` boot on Bistro must either fit the
 192 MB budget via the ladder or refuse GI with IBL intact (never a black
 scene); `test:gi-occupancy`, `smoke:gi-gpu` green.
+
+---
+
+## I. STAGE 0.2b EXECUTION SPEC — WHAT SURVIVES A REBUILD (measured 08-27 03:12-03:33)
+
+### I.0 The measurement
+
+`scripts/run-gi-heap-retainer.mjs`, unmodified in the repo, run from a
+scratchpad copy that adds four columns the shipped probe lacks: GPU **texture**
+bytes (estimated from the descriptor), live buffer/texture buckets keyed by
+`label|size` so a survivor can be NAMED, every map-like cache on
+`renderer._nodes` / `_pipelines` / `_bindings` / `_attributes` / `backend`, and
+`renderer.info.memory`. Bistro, `POKE=quality` (ultra↔high), `REBUILDS=3`,
+gi19-stage0 @222e9e8, worktree server on 5202.
+
+| census | JS heap | Δ | gpuBuf live | gpuBuf MB | Δ | gpuTex live | gpuTex MB | `info.memoryMap` | Δ | nbCache | pipes | progV/F/C |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| baseline  | 3900 |       | 10758 | 3236 |       | 435 | 1212 | 11428 |      | 60 | 209 | 61/73/114 |
+| rebuild-1 | 5373 | +1473 | 11488 | 4619 | +1382 | 431 | 1169 | 12161 | +733 | 69 | 221 | 64/76/114 |
+| rebuild-2 | 7231 | +1858 | 12251 | 6473 | +1854 | 433 | 1251 | 12951 | +790 | 52 | 235 | 76/88/115 |
+| rebuild-3 | 9129 | +1899 | 13178 | 8325 | +1852 | 437 | 1305 | 13885 | +934 | 42 | 237 | 76/88/118 |
+
+**Per-rebuild JS heap +1878 MB. Per-rebuild GPU storage-buffer bytes +1853 MB.
+They are the same number.** Textures move +68 MB/rebuild — 3.6 % — and every
+JS-side cache the 08-17 work was built around is flat or shrinking. The
+`idle-30s` row read all zeros because at 9.1 GB the page died, which is itself
+the receipt that this is still the session-killer the probe's header describes.
+
+**The one line that names it: in the live-bucket table every storage buffer
+reads `gone 0`.**
+
+    1620.9 MB  live 4 (made 4 gone 0)  |405232884      <- one per build (the largest single GI buffer)
+     975.7 MB  live 2 (made 2 gone 0)  |487874560
+     932.3 MB  live 3 (made 3 gone 0)  |310771200
+     921.7 MB  live 2 (made 2 gone 0)  |460873728
+     827.5 MB  live 5 (made 5 gone 0)  |165492344
+     435.3 MB  live 7 (made 7 gone 0)  |62186720
+     432.5 MB  live 5 (made 5 gone 0)  |86507520       <- `surfScratch`: 86.5 MB is §B's own figure, exactly
+     360.1 MB  live 3 (made 3 gone 0)  |120045732      <- exact-triangle pool (9 words/tri)
+       8.4 MB  live 2 (made 6 gone 4)  |4197324        <- three's own readback staging
+
+The ONLY buckets with a non-zero `gone` are the readback buffers three destroys
+itself. In three GI rebuilds on Bistro, GI destroyed exactly **zero** storage
+buffers.
+
+⚠ Measurement caveat: another session was editing GI sources during the run and
+vite pushed a page reload at 03:18:56 and 03:33:39. The three rebuild rows are
+monotone and internally consistent (a reload resets every counter to 0, which is
+exactly what the discarded `idle-30s` row shows), so the reloads landed outside
+them. Two repeat runs (03:34, 03:41) were destroyed by the same storm and by a
+working tree mid-edit: both reached `bistro open, gi built: false` — **no
+`[gi] built` at all within 300 s** — so GI was not building in that tree at
+03:42-03:48. Schedule this probe against a quiet tree, and treat
+`gi built: false` as "discard the run", never as a datum.
+
+### I.1 Ranked retention paths
+
+**#1 — GI never destroys a storage buffer, and `renderer.info.memoryMap` pins
+every one it ever made. ≈1,853 MB per rebuild — 99 % of the GPU half, and the
+JS heap tracks it 1:1.**
+
+Three receipts, all in three's own source:
+
+* `Bindings._destroyBindings` (`renderers/common/Bindings.js:248-289`) destroys
+  UNIFORM buffers and samplers. There is **no `isStorageBuffer` branch.** So
+  `releaseComputeNodes` — this module's entire eviction story since 08-17 —
+  provably cannot free a storage buffer. It frees the bind group and the
+  pipeline, which are bytes of nothing next to the buffer they bound.
+* The only path to `GPUBuffer.destroy()` for a storage attribute is
+  `renderer._attributes.delete(attr)` → `Attributes.delete`
+  (`renderers/common/Attributes.js:46-56`) → `backend.destroyAttribute` →
+  `WebGPUAttributeUtils.destroyAttribute` (`:361-370`, `data.buffer.destroy()`).
+  `grep -rn "_attributes" src/modules/gi` returns **0 hits**.
+* `Info.memoryMap` (`renderers/common/Info.js:145`) is a plain **`Map`**, and
+  `_createAttribute` (`:264-273`) `set`s every storage attribute into it at
+  first bind (`Bindings._createBindings:215-219` → `Attributes.update` →
+  `info.createStorageAttribute`). Its only `delete` is `info.destroyAttribute`
+  (`:324`), reached only from the call above. So the ATTRIBUTE is strongly
+  reachable from the renderer forever; the backend's `WeakMap` entry keyed by
+  that attribute therefore never dies either, and the GPU buffer is not even
+  GC-reclaimable.
+
+Receipt in the table: `info.memoryMap` grows **+733 / +790 / +934** entries per
+rebuild against live GPU buffers **+730 / +763 / +927**. Same number, both
+monotone, neither ever shrinks.
+
+**#2 — `detachCpuMirror` frees nothing while the generation is live: the bind
+group captured the ORIGINAL array. ≈700-760 MB per generation.**
+
+`NodeStorageBuffer`'s constructor
+(`renderers/common/nodes/NodeStorageBuffer.js:23`) calls
+`super('StorageBuffer_' + id, nodeUniform.value)` → `StorageBuffer`
+(`StorageBuffer.js:17-27`) calls `super(name, attribute.array)` and keeps
+`this._attribute = attribute` → `Buffer` (`Buffer.js:44`) stores
+`this._buffer = buffer`. `NodeStorageBuffer` overrides the `buffer` and
+`attribute` GETTERS, so releaseCompute.js's safety argument is right that
+nothing ever READS `_buffer` — but the field still holds a strong reference to
+the full typed array, and it was captured at first bind, which is strictly
+before `#drainCpuMirrors` can run. `attr.array = new ctor(0)` therefore frees
+nothing until `_destroyBindings` drops that BindGroup — i.e. until the dispose
+that would have dropped it anyway. `[gi] detached 25 CPU mirrors (709.4 MB)` is
+a bookkeeping line about the LIVE generation, not a free — it buys nothing back
+until that generation dies, which is the moment the array became collectable
+anyway. Nulling `_buffer` (and `_attribute`) at detach time is what makes 0.2's
+detach actually pay while a build is running.
+
+**#2b — ▶ OPEN, ~740 MB/rebuild unaccounted. Do NOT close 0.2b without it.**
+The arithmetic: a generation is 1,853 MB, of which 709-759 MB are detached (a
+0-length `attr.array`, so `info.memoryMap`'s strong reference to the attribute
+retains nothing) — predicted JS retention ≈1,100 MB/rebuild against a MEASURED
+1,878. The ~740 MB gap is not the GPU side (separately accounted) and not the
+caches (§I.2). Candidates in order: build-time CPU transients that never become
+a GPU buffer and may be closure-pinned — `buildStaticSceneBvhWords`
+(`dynamicObjects.js:544`; 188 MB of words on Bistro, and built a SECOND time at
+`GISystem.js:14778` when the budget ladder drops UV), `voxelizeOnce.js:358-361`'s
+attribute copies / `serializeMeshForBake`, the occupancy build's pair and
+scratch arrays, and `items` in `#syncBvhScene`. **Measure before fixing:** patch
+`Uint32Array`/`Float32Array` in the page to record a `new Error().stack` plus a
+`WeakRef` for every allocation ≥ 2 MB, then after three `gc()`s report live
+bytes grouped by allocation site. That names the closure; reading code will not.
+
+**#3 — 30 of ~55 `instancedArray` sites have no `cpuMirrors` entry at all.**
+`occupancyField.js:4938` publishes 6 of its 13 sites
+(`[bits, atomicBits, staticBits, attrScratch, surfScratch, surfAlloc]`);
+`srcSystem.js:1271`'s getter aggregates 19 more. Everything else —
+`bvh/bvhScene.js` (5), `giScreen.js` (5), `srcTiles.js` (3),
+`dynamicObjects.js` (3 staging), `srcSeed.js`, `srcScreenGather.js`, and
+occupancyField's geometry/slot buffers — keeps a full JS twin for the process's
+life, retained by #1. Fixing #2 without extending this list leaves that half in
+place.
+
+**#4 — one 4096² `ShadowDepthTexture` per rebuild, +67 MB.** Bucket:
+`ShadowDepthTexture|4096x4096x1|depth24plus` made 3 → 6 across three rebuilds,
+`gone 0`, while `ShadowMap|4096x4096x1|rgba8unorm` stayed at 1 — the depth
+attachment alone. `ShadowNode.setupRenderTarget`
+(`nodes/lighting/ShadowNode.js:395-404`) mints a fresh `DepthTexture` every time
+the node is set up, and a GI rebuild forces exactly that by handing lights back
+and forth (`#releaseLightShadowNode` / `#acquireLightShadowNode`). Accounts for
+the whole +68 MB/rebuild texture column.
+
+### I.2 Refuted here, with receipts
+
+* **Not the textures / render targets.** gpuTex live 435 → 437 across three
+  rebuilds. `giBvhAtlasBlit` reads `made 3 gone 2`, so `StorageTexture.dispose()`
+  DOES reach `backend.destroyTexture` and `#retireTargets` does fire.
+  `profile.textures.notReferencedByOpenScene` went 118.1 MB → 43.6 MB DURING the
+  run. §B's "127 orphans / 446 MB" is a standing-state figure, not a per-rebuild
+  one — it is not what is climbing.
+* **Not the material node graphs.** `nodeBuilderCache` 60 → 69 → 52 → 42:
+  `purgeNodeBuilderCache` works. `programs.vertex/fragment` 61/73 → 76/88 over
+  three rebuilds — three releases them itself on recompile
+  (`Pipelines.getForRender:166-172` decrements `usedTimes`, `:190/:204` release
+  at zero). `_pipelines.caches` 209 → 237. All three together are far under 1 %
+  of the climb. **The 08-17 diagnosis ("the bulk is 116 materials' node graphs")
+  no longer holds after 0.2 — the bulk is buffers.**
+* **Not a `collectStateComputeNodes` gap.** `[gi] dispose: released 83/83
+  compute nodes` on every single rebuild, and the pipeline cache is flat. The
+  walk's depth-4 limit is real (a `{compute}` wrapper reached through
+  `state.screen.<x>.passes[i]` sits at depth 5) but it is not what costs memory:
+  a compute NODE is nothing; its BUFFER is everything.
+* **Not `callHashCache` / `groupsData`.** Three's `ChainMap` is all `WeakMap`s
+  (`ChainMap.js:21`), so `NodeManager.dispose()` not clearing them is harmless.
+
+### I.3 The fix — exact anchors
+
+1. **`releaseCompute.js` — new `releaseStorageAttributes(renderer, attrs)`.**
+
+   ```js
+   export function releaseStorageAttributes(renderer, attrs) {
+     const attributes = renderer?._attributes;
+     const backend = renderer?.backend;
+     if (!attributes || !attrs) return 0;
+     let n = 0;
+     for (const attr of attrs) {
+       if (!attr) continue;
+       try {
+         // `has` BEFORE `delete`, and on BOTH maps. DataMap.get CREATES an
+         // entry, so a seeded-but-empty record makes Attributes.delete return
+         // truthy and walk into `data.buffer.destroy()` on undefined.
+         if (attributes.has?.(attr) !== true || backend?.has?.(attr) !== true) {
+           renderer.info?.memoryMap?.delete(attr); // never bound: only the Map entry exists
+           continue;
+         }
+         attributes.delete(attr); // -> destroyAttribute -> GPUBuffer.destroy + info.destroyAttribute
+         n++;
+       } catch { /* a three rename must degrade to "leaks as before" */ }
+     }
+     return n;
+   }
+   ```
+
+2. **`releaseCompute.js` — `releaseComputeNodes` (`:51`) HARVESTS the attributes
+   before it evicts, and nulls #2's capture.** This is the only enumeration that
+   cannot go stale, because it reads what the kernels actually bound rather than
+   a hand-written list:
+
+   ```js
+   const st = nodeCache?.has?.(node) ? nodeCache.get(node).nodeBuilderState : null;
+   for (const group of st?.bindings ?? [])
+     for (const b of group.bindings ?? []) {
+       if (b.isStorageBuffer && b.attribute) attrs.add(b.attribute);
+       b._buffer = null;   // #2, one line: nothing reads it back on a NodeStorageBuffer
+     }
+   ```
+
+   ⚠ NEVER `nodes.getForCompute(node)` here — it REBUILDS the state it cannot
+   find, which is the state we are discarding (this file's own banner prices
+   that at a 16-27 s recompile). Return the set to the caller; the delete must
+   be TTL-deferred (4).
+
+3. **`GISystem.js #dispose()` (`:11634`) and `#sweepOrphanedComputes` (`:10906`)
+   retire the harvested set.** The sweep already computes the exact set
+   difference that makes this safe: an attribute bound by a node that SURVIVED
+   the swap must never be destroyed, so harvest from the orphans only and
+   subtract the survivors' attributes.
+
+4. **TTL, never on the spot.** `#retireTargets` (`:8288`) /
+   `#drainRetiredTargets` (`:8292`) already price this exact hazard for textures
+   — "Destroyed texture used in a submit" — and a storage buffer is identical: a
+   material's bind group re-points while the following frame is being encoded.
+   Add `_retiredAttributes` beside `_retiredTargets` (`:1200`), same
+   `RETIRED_TARGET_FRAMES` (`:105`), drained at the same site (`:2058`).
+
+5. **Owners outside `state` publish `ownedAttributes`** — a SUPERSET of
+   `cpuMirrors`, because at teardown the CPU-written buffers die too:
+   * `occupancyField.js` — beside `cpuMirrors` (`:4938`), list all 13
+     `instancedArray` sites, and call `releaseStorageAttributes` from
+     `dispose()` (`:5085`, which today releases nodes only).
+   * `srcSystem.js dispose()` (`:2055`) — releases NOTHING today, not even
+     compute nodes; it survives only because `state.screen.srcProbes.passes` is
+     a flat array at exactly depth 4. Add
+     `releaseComputeNodes(renderer, system.passes)` +
+     `releaseStorageAttributes(renderer, ownedAttributes)`, stashing the
+     renderer at create time the way `occupancyField.setRenderer` does.
+   * `dynamicObjects.js confirmDispatch` (`:2227`) — `p.staging = null`
+     (`:2247`) drops the JS reference and leaves the GPU buffer; the static
+     BVH's one-shot staging alone is 125-160 MB on Bistro (this file's own
+     `:1427`). Push `p.staging.value` onto the same TTL retire list beside
+     `staleUploads` (`:2232`).
+   * `bvh/bvhScene.js dispose()` — 5 `instancedArray` sites, same treatment.
+
+6. **Publish the receipt so it cannot regress silently.**
+   `profile.frameStats.giStorageAttributes = renderer.info.memory.storageAttributes`
+   and `giStorageAttributesMB = renderer.info.memory.storageAttributesSize / 1e6`
+   — counters three already maintains, and exactly the quantity that must be
+   FLAT across rebuilds. Log them on the `[gi] dispose:` line.
+
+7. **Secondary (#4).** Dispose the shadow render target the previous ShadowNode
+   setup minted when GI takes a light (`#acquireLightShadowNode`) or hands it
+   back (`#releaseLightShadowNode`, `:11559`). Measure which side allocates
+   with the bucket table first — `ShadowDepthTexture|4096x4096x1|depth24plus`
+   must stay at its boot count.
+
+### I.4 Gate
+
+* `probe:gi-heap-retainer` `POKE=quality REBUILDS=3` on Bistro: JS heap flat
+  across the three rebuild rows within **±150 MB**, and `bufferLiveMB` flat
+  within **±150 MB** (today: +1878 / +1853 per rebuild).
+* `renderer.info.memory.storageAttributes` returns to within ±20 of its
+  post-first-build value after each rebuild; `info.memoryMap` grows by **< 50**
+  entries per rebuild (today +733 / +790 / +934).
+* `profile.textures.notReferencedByOpenScene.mb` **< 50 MB**.
+* `test:gi-compute-release` extended: `releaseStorageAttributes` (a) no-ops on
+  an attribute the backend never bound and still drops its `info.memoryMap`
+  entry, (b) calls `attributes.delete` exactly once per attribute, (c) never
+  touches an attribute a surviving node still binds, (d) `releaseComputeNodes`
+  never calls `getForCompute`.
+* Battery: `smoke:gi-gpu`, `test:gi-occupancy`, `test:gi-src-deposit`,
+  `test:gi-src-gather` green, and **no "Destroyed buffer used in a submit"** in
+  the console across 3 rebuilds + a viewport resize + an SRC pool grow (the
+  three swap sites 0.2 already enumerated).

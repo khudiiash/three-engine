@@ -387,6 +387,26 @@ work is bearable while GI2 is built. Sizes are rough session counts.
 
 ### Stage 0 — STOP THE BLEEDING (current path; ~2-3 sessions)
 
+**✅ SHIPPED 2026-08-26/27 on branch `gi19-stage0` (worktree `../engine-gi19`):**
+`bbc4734` 0.1 cut (−5155/+791, 0 regressions; CPU oracles + gather
+experiments kept until Stage 4) · `1087240` 0.2 memory (25 CPU mirrors
+detached = 662-759 MB, sweeps at 3 swap sites, `occupancyField.dispose()`,
+allocate-once ladder; per-rebuild climb 3294→1948 MB — residual = 0.2b) ·
+`0891a93` + `690eaa2` 0.5 (hitShade scene constants → uniforms; loop roll
+11→5 BVH descent sites, compile 2.1×; EVERY screen kernel byte-identical
+across resolutions + `setSize` APIs; recapture schedule) · `3a82272` 0.3
+loops (GI tag bits out of shadowMerge's key, drain parks, resize settle-gated
+5 hops +276 pipelines/+555 MB → 0/0, concurrent waves coalesced) · `222e9e8`
+0.4 mobile safety (IBL waits for a proven transport, tier drop on real
+device.lost, tier GPU byte budget + refuse-with-IBL, 3-axis census, WGSL
+pointer feature check). ▶ 0.3b wiring (resize without re-mint, recapture
+at steady, hitShade dispatch deferral) and 0.2b (residual GPU-generation
+climb) in flight; then the Bistro boot/heap measurement and merge to main.
+⚠ Instrument lessons: a single `test:gi-hit-shade` run has a 6.5% between-
+boot spread — quote 3-rep paired means at SETTLE=40000 only; a junctioned
+`node_modules` needs a private vite `cacheDir` per server.
+
+
 | unit | what | gate |
 |---|---|---|
 | **0.1 dead-code cut** (⚠ scope refined 08-26 evening: the CPU oracles — `srcRef.js`, `srcVolumeRef.js`, `RayHitPacking` mirrors, `lightTree` sampler, `RayHitValidator/Debug` — and the gather experiments STAY until Stage 4; they gate SRC kernels that 0.2 still touches. 0.1 cuts retired ARMS, their hatches, knobs and banners: ≈ 4-5 k lines now, the rest at cutover) | delete the census list: retired AO pair (~750 lines), RTAO arm (~440), incumbent per-mesh BLAS reflections (~600), sun split (~250), §12.90 adaptive lattice (~200), gather experiments (world keys / smooth / LOS / normal weights, ~500), non-default light-shadow arms (~350), parked mover occluders (284), skinned capsule arm (~110), CPU refs `srcRef.js` (1720) + `srcVolumeRef.js` (418) + `RayHitPacking` CPU mirrors (~1300) + `lightTree` CPU sampler (~500) + `bvhGpu.js`/`RayHitValidator`/`RayHitDebug` (617), the 19 comment-only flags, the 106 numeric knobs' non-default arms, the 15 ≥ 40-line retired-mechanism banners in GISystem.js. ≈ 7.5-8 k lines. Tests that only exercised deleted arms are deleted with them; `package.json` scripts pruned. | module ≤ 53 k lines; `npm run test:gi-*` battery green minus the deleted gates; Bistro/Level/Cornell render identical (`__giColourProbe` receipts) |

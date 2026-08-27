@@ -636,6 +636,18 @@ defineOp({
       // which is why "mobile looks flat" and "mobile is black" are now
       // different reports with different receipts. See GISystem.transportState.
       giTransport: engine.modules?.get?.("gi")?.system?.transportState ?? null,
+      // §19 0.3b — the reflection-probe RECAPTURE channel. The atlas used to be
+      // a one-shot whose content was decided by when a 159 kB kernel finished
+      // compiling (reflectionProbeCapture.js's header has the 34% receipt), so
+      // "how many times has it been re-captured, and what asked" is the receipt
+      // that the image is no longer reading a clock. `lastReason` is
+      // "transport-steady" (first proven light) or "settle" (SRC at rest).
+      giReflProbeRecapture: (() => {
+        const sched = engine.modules?.get?.("gi")?.system?._reflProbeSchedule;
+        return sched
+          ? { pending: sched.pending, lastReason: sched.lastReason, count: sched.count }
+          : null;
+      })(),
       // §18's masked-mode gate (armed by `__giMaskCoverageProbe`). `pct` is the
       // share of gbuffer texels carrying geometry; it must be IDENTICAL with
       // the mask on and off. Reported here as well as logged because a console

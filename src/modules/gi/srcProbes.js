@@ -1290,6 +1290,58 @@ export function createSrcHashBlockFrame(store, cascade = 0) {
  *   freshly claimed block from one carrying real history. Omit it and blocks
  *   go unstamped, which is correct only for a single-frame harness.
  */
+/**
+ * ── ⭐⭐ §19 0.3b — SWAP A PER-PIXEL STORAGE BUFFER UNDER A LIVE KERNEL ─────
+ *
+ * A viewport resize used to re-create the whole SRC system because the
+ * per-pixel buffers (`pixelHash`, `pixelProbe`, `pixelRayBase`, `rayWork`) are
+ * one entry per pixel and "a storage buffer cannot grow under a compiled
+ * kernel". The second half of that sentence is true of the BUFFER and false of
+ * the NODE, and the difference is what this function is:
+ *
+ *   · WGSL declares a storage buffer as a RUNTIME-SIZED `array<u32>` —
+ *     `WGSLNodeBuilder` appends the element count only for `uniform` buffers
+ *     (`bufferCountSnippet` is gated on `uniform.type === 'buffer'`). So the
+ *     kernel's TEXT does not know the length, and a new length is not new
+ *     source.
+ *   · `NodeStorageBuffer.attribute` is a live getter over `nodeUniform.value`,
+ *     and `Bindings._update` re-reads it every dispatch: a changed attribute
+ *     object sets `needsBindingsUpdate`, which calls `backend.updateBindings`
+ *     — a fresh BIND GROUP, not a fresh pipeline and not a fresh module.
+ *   · storage buffers ride `objectGroup`, whose `updateType` is OBJECT, so
+ *     `NodeManager.updateGroup` always returns true and that check is never
+ *     skipped.
+ *
+ * So: mint a new attribute, point the existing node at it, fix the dispatch
+ * counts, and the resize costs the buffer's bytes and nothing else.
+ *
+ * ⚠ THE OLD ATTRIBUTE IS RETURNED, NOT DISPOSED. Its GPU buffer may still be
+ * referenced by a submit this frame — the "Destroyed buffer used in a submit"
+ * class this module documents at four other sites — so disposal belongs to the
+ * caller's retire queue (GISystem's `#retireTargets`, 3 frames).
+ *
+ * ⚠ The new attribute carries a full CPU array again, so the caller must
+ * re-queue it for `detachCpuMirror` (§19 0.2) or the resize hands the JS heap
+ * back the twin that stage spent 662 MB removing. Every `cpuMirrors` list that
+ * can be resized is a GETTER for that reason.
+ *
+ * Built through `instancedArray` rather than `new StorageInstancedBufferAttribute`
+ * so the attribute is constructed by exactly the code that constructed the one
+ * it replaces; the throwaway node around it is a few dozen bytes on a path that
+ * runs once per durable resize.
+ */
+export function swapStorageBuffer(node, length, fill = 0) {
+  if (!node) return null;
+  const array = new Uint32Array(Math.max(1, length | 0));
+  if (fill !== 0) array.fill(fill);
+  const previous = node.value;
+  node.value = instancedArray(array, "uint").value;
+  // Not read by the storage path's codegen (see above), kept honest anyway so a
+  // future reader of `bufferCount` is not told the old length.
+  node.bufferCount = node.value.count;
+  return previous;
+}
+
 export function createSrcProbeFrame(store, {
   spacing0,
   camera,
@@ -1412,7 +1464,7 @@ export function createSrcProbeFrame(store, {
   for (let c = 0; c < N; c++) passes.push(createAgePass(store, c, { maxAge, retain, frameStamp }));
 
   // ── [B] cascade 0, from the gbuffer ───────────────────────────────────────
-  passes.push(createInsertPass(
+  const pixelInsertPass = createInsertPass(
     store, 0, pixelCount,
     (i) => {
       const px = readPixel(i);
@@ -1428,13 +1480,15 @@ export function createSrcProbeFrame(store, {
       return key;
     },
     (i, slot) => { pixelHash.element(i).assign(uint(slot)); },
-  ));
+  );
+  passes.push(pixelInsertPass);
   passes.push(createCompactPass(store, 0, { frameStamp }));
-  passes.push(createResolvePass(
+  const pixelResolvePass = createResolvePass(
     store, pixelCount,
     (i) => pixelHash.element(i),
     (i, probe) => { pixelProbe.element(i).assign(uint(probe)); },
-  ));
+  );
+  passes.push(pixelResolvePass);
 
   // ── the ladder ────────────────────────────────────────────────────────────
   for (let c = 1; c < N; c++) {
@@ -1510,8 +1564,27 @@ export function createSrcProbeFrame(store, {
      * ever written CPU-side again (readbacks go through `getArrayBufferAsync`,
      * which sizes itself from `bufferGPU.size`).
      */
-    cpuMirrors: [pixelHash, pixelProbe].map((n) => n?.value).filter(Boolean),
+    get cpuMirrors() {
+      return [pixelHash, pixelProbe].map((n) => n?.value).filter(Boolean);
+    },
     passes,
+    /**
+     * §19 0.3b — a resize as two buffer swaps and two dispatch counts.
+     * Returns the retired attributes for the caller's retire queue; see
+     * `swapStorageBuffer`. The [B] insert and its [C] resolve are the only
+     * pixel-sized passes here — the ladder above them is sized from the probe
+     * capacities, which a resolution change does not move.
+     */
+    setSize(nextPixelCount) {
+      const n = Math.max(1, nextPixelCount | 0);
+      const retired = [
+        swapStorageBuffer(pixelHash, n, SLOT_EMPTY),
+        swapStorageBuffer(pixelProbe, n, SLOT_EMPTY),
+      ].filter(Boolean);
+      pixelInsertPass.count = n;
+      pixelResolvePass.count = n;
+      return retired;
+    },
     /** Non-null when S1 locality retention is armed — for the boot line. */
     retain,
     /**
