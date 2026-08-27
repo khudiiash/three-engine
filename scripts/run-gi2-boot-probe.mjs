@@ -267,6 +267,14 @@ await page.waitForFunction(() => !!globalThis.__editorApi, { timeout: 180000 });
 await page.evaluate(async () => {
   const mod = await import("/src/editor/engineInstance.js");
   globalThis.__giEngineForProbe = mod.engine;
+  // The live GI2 system, wherever GISystem happens to keep it. TWO different
+  // accessors were already in use in this file (`_gi2` for the gather,
+  // `state.screen.gi2` for the trace); one helper, so a receipt cannot
+  // silently read `undefined` and report a null as a measurement.
+  globalThis.__gi2 = () => {
+    const sys = mod.engine?.modules?.get?.("gi")?.system;
+    return sys?._gi2 ?? sys?.state?.screen?.gi2 ?? null;
+  };
 });
 
 const call = async (op, args = {}) => {
@@ -278,6 +286,422 @@ const call = async (op, args = {}) => {
   } catch (err) {
     return { ok: false, error: err?.message ?? String(err) };
   }
+};
+
+/** Wait until the gather has advanced `n` frames (or `capMs`, whichever first). */
+const gatherFrame = () => page.evaluate(() => globalThis.__gi2()?.gather?.frame ?? 0);
+const settleFrames = async (n, capMs = 90000) => {
+  const f0 = await gatherFrame();
+  const deadline = Date.now() + capMs;
+  let f = f0;
+  while (f - f0 < n && Date.now() < deadline) { await wait(400); f = await gatherFrame(); }
+  return f - f0;
+};
+
+// == §19 STAGE 3.7 P.5 — THE THREE BISTRO POSES, DERIVED FROM THE SCENE =======
+//
+// ⭐ A CAMERA POSE CANNOT BE READ OFF A SCREENSHOT — BUT WHAT THE SCREENSHOTS
+// ARE OF IS IN THE SCENE. The user's three views are the café façade in shade,
+// the doors under the awning close up, and a wide shot down the street. All
+// three are anchored on one object the scene names — the bistro's own front
+// banner — and on one direction, which is where the street runs; and the
+// street's direction is a fact about the WORLD, which the window can be asked
+// with rays rather than a number to be guessed at.
+//
+// ⚠ `staticMerging` EATS THE MESH NAMES, so the lookup goes through the ENTITY
+// graph (`entity.list` / `entity.getBounds`), which survives merging. A
+// traverse of `engine.scene` on this project finds 189 objects all called
+// `Merged(N)` and no banner at all.
+async function bistroPoses() {
+  const bounds = async (needle) => {
+    const list = (await call("entity.list", { nameContains: needle })).value ?? [];
+    let agg = null;
+    for (const e of list.slice(0, 24)) {
+      const b = (await call("entity.getBounds", { id: e.id })).value;
+      if (!b || b.empty) continue;
+      agg ??= { min: [...b.min], max: [...b.max] };
+      for (let i = 0; i < 3; i++) {
+        agg.min[i] = Math.min(agg.min[i], b.min[i]);
+        agg.max[i] = Math.max(agg.max[i], b.max[i]);
+      }
+    }
+    return agg;
+  };
+  const banner = await bounds("FrontBanner");
+  if (!banner) return null;
+  const street = await bounds("Paris_Street_");
+  const B = banner.min.map((v, i) => (v + banner.max[i]) / 2);
+  const ground = street ? street.max[1] : banner.min[1] - 3.4;
+  const eye = ground + 1.65;
+  // The open direction, asked of the window: park ON the banner's own ground
+  // point (the window is camera-centred, so it has to be filled AROUND the
+  // question before the question is asked), fire a horizontal ring, and take
+  // the direction that runs furthest without hitting anything. That is the
+  // street, and it is the axis all three poses are laid out along.
+  await call("viewport.setCamera", { position: [B[0], eye, B[2]], target: [B[0] + 4, eye, B[2]] });
+  await settleFrames(90, 20000);
+  const ring = await page.evaluate(async ({ o }) => {
+    const eng = globalThis.__giEngineForProbe;
+    const gi2 = globalThis.__gi2();
+    if (!gi2?.trace || !eng?.renderer) return null;
+    const { createGi2RayShooter } = await import("/scripts/lib/gi2RayProbe.js");
+    const shoot = createGi2RayShooter(gi2, eng.renderer);
+    const dirs = [];
+    for (let k = 0; k < 24; k++) {
+      const a = (k / 24) * Math.PI * 2;
+      dirs.push([Math.cos(a), 0, Math.sin(a)]);
+    }
+    const out = await shoot(dirs.map((d) => ({ o, d, tMax: 30 })));
+    return dirs.map((d, i) => ({ d, t: out[i].hit ? out[i].t : 30 }));
+  }, { o: [B[0], eye, B[2]] });
+  if (!ring) return null;
+  const best = ring.reduce((a, b) => (b.t > a.t ? b : a));
+  const D = best.d;
+  const at = (k, y) => [B[0] + D[0] * k, y, B[2] + D[2] * k];
+  return {
+    banner: B.map((v) => +v.toFixed(2)), ground: +ground.toFixed(2),
+    dir: D.map((v) => +v.toFixed(2)), openRun: +best.t.toFixed(1),
+    list: [
+      { name: "facade-wide", position: at(6.0, eye), target: [B[0], ground + 2.2, B[2]] },
+      { name: "doors-close", position: at(2.2, eye), target: [B[0], ground + 1.6, B[2]] },
+      { name: "street-overview", position: at(22.0, ground + 4), target: at(2.0, ground + 3) },
+    ],
+  };
+}
+
+/**
+ * §P.5's "dirty" number, on one pose.
+ *
+ * ⭐⭐ THE 3.6 SPATIAL RECEIPT IS A FIVE-PIXEL BOX AND THE USER'S COMPLAINT IS A
+ * ONE-METRE BLOTCH. A 5×5 screen box at 6 m is about 4 cm of wall; a filter
+ * that narrow passes a 1 m blotch straight through unchanged, which is exactly
+ * how every 3.6 receipt came back green on a frame the user called "very
+ * dirty". So the statistic here is a BAND-PASS at the world scale of the
+ * complaint: the pixel's neighbourhood mean at a ONE-METRE radius minus its
+ * mean at FOUR, both radii PROJECTED from the pixel's own depth so that a metre
+ * is a metre at 2 m and at 40. What survives is variation on the 1-4 m scale —
+ * the blotches — with the scene's own shading gradient (which lives at 4 m and
+ * above) subtracted rather than argued about.
+ *
+ * The radii vary per pixel, so the box means come out of a SUMMED-AREA TABLE:
+ * an O(1) query at any radius, over ~400 k pixels, in one pass.
+ *
+ * ⚠ AND THE MASK IS THE GEOMETRY, NOT A RECTANGLE. "The façade" is every
+ * VERTICAL surface (|n·y| < 0.4) and "the pavement" every UP-FACING one
+ * (n·y > 0.8). A screen-space crop would have to be re-authored for every pose
+ * and would silently swallow the sky, the awning and the street furniture.
+ */
+async function dirtyReceipt(pose, frames = 220) {
+  await call("viewport.setCamera", { position: pose.position, target: pose.target });
+  const ran = await settleFrames(frames);
+  const out = await page.evaluate(async () => {
+    const eng = globalThis.__giEngineForProbe;
+    const g = globalThis.__gi2()?.gather;
+    const r = eng?.renderer;
+    if (!g?.passes?.noiseDump || !g.buffers?.dirtyBuf) {
+      return { error: "the noise kernel was not built (set __gi2NoiseDump before the GI build)" };
+    }
+    // An instrument's first sample is not a sample — see the temporal receipt.
+    for (let k = 0; k < 3; k++) {
+      await new Promise((res) => requestAnimationFrame(() => res()));
+      await r.computeAsync(g.passes.noiseDump);
+    }
+    const noise = new Float32Array(await r.getArrayBufferAsync(g.buffers.noiseBuf.value));
+    const geo = new Float32Array(await r.getArrayBufferAsync(g.buffers.dirtyBuf.value));
+    const d = g.describe();
+    const W = d.halfW; const H = d.halfH;
+    const projScale = g.uniforms.projScale.value;
+    // ⭐⭐ ONE SUMMED-AREA TABLE PER SURFACE CLASS, NOT ONE PER FRAME.
+    //
+    // The first cut built a single SAT over every valid pixel and took a
+    // façade pixel's 4 m box out of it — so the box averaged the façade
+    // TOGETHER WITH the street receding behind it to forty metres, and the
+    // "band" it produced was mostly the perspective gradient down the road.
+    // The control caught it: the same statistic over the FLAT street came back
+    // 20-45 %, indistinguishable from the façade's, on geometry that has no 1 m
+    // features at all. A façade pixel's neighbourhood is the FAÇADE.
+    const NP = (W + 1) * (H + 1);
+    const mk = () => ({ S: new Float64Array(NP), C: new Float64Array(NP), D: new Float64Array(NP), D2: new Float64Array(NP) });
+    const T = [mk(), mk()]; // 0 = façade (vertical), 1 = pavement (up-facing)
+    const cls = new Int8Array(W * H).fill(-1);
+    for (let y = 0; y < H; y++) {
+      const acc = [{ s: 0, c: 0, d: 0, d2: 0 }, { s: 0, c: 0, d: 0, d2: 0 }];
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x;
+        let k = -1;
+        if (noise[i * 4 + 3] > 0.5) {
+          const ny = geo[i * 4 + 1];
+          if (Math.abs(ny) <= 0.4) k = 0; else if (ny > 0.8) k = 1;
+        }
+        cls[i] = k;
+        if (k >= 0) {
+          const a = acc[k];
+          a.s += noise[i * 4]; a.c += 1; a.d += geo[i * 4]; a.d2 += geo[i * 4] * geo[i * 4];
+        }
+        for (let t = 0; t < 2; t++) {
+          const A = T[t]; const a = acc[t];
+          A.S[(y + 1) * (W + 1) + x + 1] = A.S[y * (W + 1) + x + 1] + a.s;
+          A.C[(y + 1) * (W + 1) + x + 1] = A.C[y * (W + 1) + x + 1] + a.c;
+          A.D[(y + 1) * (W + 1) + x + 1] = A.D[y * (W + 1) + x + 1] + a.d;
+          A.D2[(y + 1) * (W + 1) + x + 1] = A.D2[y * (W + 1) + x + 1] + a.d2;
+        }
+      }
+    }
+    const win = (A, x0, y0, x1, y1) => A[(y1 + 1) * (W + 1) + x1 + 1] - A[y0 * (W + 1) + x1 + 1]
+      - A[(y1 + 1) * (W + 1) + x0] + A[y0 * (W + 1) + x0];
+    const boxMean = (t, x, y, rad) => {
+      const A = T[t];
+      const x0 = Math.max(0, x - rad); const x1 = Math.min(W - 1, x + rad);
+      const y0 = Math.max(0, y - rad); const y1 = Math.min(H - 1, y + rad);
+      const c = win(A.C, x0, y0, x1, y1);
+      if (!(c > 0)) return null;
+      // ⚠ AND THE BOX REPORTS ITS OWN DEPTH SPREAD. A screen box is a world box
+      // only on a surface that faces the camera; at a few degrees off grazing a
+      // 4 m-wide screen box still spans thirty metres of street. The caller
+      // drops the PIXEL where that is true — not a bilateral weight (the box's
+      // contents stay unweighted, so a blotch that follows the surface's own
+      // plane is as visible as ever, which is `noiseDump`'s own warning), just
+      // a refusal to speak where the geometry makes the question meaningless.
+      const dm = win(A.D, x0, y0, x1, y1) / c;
+      const dv = Math.max(0, win(A.D2, x0, y0, x1, y1) / c - dm * dm);
+      return { m: win(A.S, x0, y0, x1, y1) / c, c, dm, dsd: Math.sqrt(dv) };
+    };
+    const band = []; const pband = []; const facL = []; const pavL = [];
+    let grazing = 0;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x;
+        const k = cls[i];
+        if (k < 0) continue;
+        const L = noise[i * 4];
+        (k === 0 ? facL : pavL).push(L);
+        const pixWorld = geo[i * 4] / projScale; // metres per FULL-res pixel
+        if (!(pixWorld > 0)) continue;
+        const r1 = Math.round(0.5 / pixWorld); // 1 m, in HALF-res pixels
+        const r4 = Math.round(2.0 / pixWorld);
+        if (r1 < 2 || r4 <= r1 || r4 > 240) continue;
+        const a = boxMean(k, x, y, r1); const b = boxMean(k, x, y, r4);
+        if (!a || !b || a.c < 9 || b.c < 25) continue;
+        if (b.dsd > 0.35 * b.dm) { grazing++; continue; }
+        (k === 0 ? band : pband).push(a.m - b.m);
+      }
+    }
+    const avg = (a) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0);
+    const pct = (a, q) => {
+      if (!a.length) return null;
+      const v = [...a].sort((x, y) => x - y);
+      return v[Math.min(v.length - 1, Math.floor(q * v.length))];
+    };
+    const sdOf = (a) => {
+      const m = avg(a);
+      return Math.sqrt(Math.max(0, avg(a.map((b) => b * b)) - m * m));
+    };
+    const mF = avg(facL);
+    const mP = avg(pavL);
+    const sun = pct(pavL, 0.75) ?? 0;
+    return {
+      facadePx: facL.length, pavementPx: pavL.length,
+      bandPx: band.length, pbandPx: pband.length, grazingDropped: grazing,
+      facadeMean: mF, pavementMean: mP, pavementP75: sun,
+      dirtPct: (100 * sdOf(band)) / Math.max(1e-9, mF),
+      bandP95Pct: (100 * (pct(band.map(Math.abs), 0.95) ?? 0)) / Math.max(1e-9, mF),
+      flatPct: (100 * sdOf(pband)) / Math.max(1e-9, mP),
+      ratioPct: (100 * mF) / Math.max(1e-9, sun),
+    };
+  });
+  return { ran, ...out };
+}
+
+/**
+ * §P.1's verification, and the number the whole stage is judged on: the SPREAD
+ * of the radiance cache ACROSS the 64 voxel faces of one brick on a flat wall.
+ *
+ * ⭐⭐ THE DIRT IS IN THE CACHE, AND THIS IS WHERE IT IS VISIBLE. A brick is 1 m
+ * at `v0 = 0.25`, which is the scale of the blotches; its 64 voxels on one flat
+ * façade all see nearly the same hemisphere, so their stored radiances should
+ * agree to a few percent. Anything else is the estimator, not the scene — and
+ * before §P.1 they disagreed by more than their own mean.
+ *
+ * The bricks are found by RAYS through the live window rather than by world
+ * arithmetic, so the level, the voxel index and the face are the same ones a
+ * gather ray would address; a CPU re-derivation of the toroidal index is
+ * exactly the kind of second implementation that drifts.
+ */
+async function facadeBrickSpread(pose) {
+  await call("viewport.setCamera", { position: pose.position, target: pose.target });
+  return page.evaluate(async ({ pose }) => {
+    const rc = await import("/src/modules/gi/window/radianceCache.js");
+    const eng = globalThis.__giEngineForProbe;
+    const gi2 = globalThis.__gi2();
+    if (!gi2?.cache) return { error: "no gi2 cache" };
+    const { createGi2RayShooter } = await import("/scripts/lib/gi2RayProbe.js");
+    const shoot = createGi2RayShooter(gi2, eng.renderer);
+    const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    const nz = (v) => { const l = Math.hypot(v[0], v[1], v[2]); return [v[0] / l, v[1] / l, v[2] / l]; };
+    const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const fwd = nz(sub(pose.target, pose.position));
+    const right = nz(cross(fwd, [0, 1, 0]));
+    const up = nz(cross(right, fwd));
+    const rays = [];
+    for (let i = -3; i <= 3; i++) {
+      for (let j = -2; j <= 2; j++) {
+        rays.push({
+          o: pose.position,
+          d: nz([
+            fwd[0] + right[0] * i * 0.09 + up[0] * j * 0.09,
+            fwd[1] + right[1] * i * 0.09 + up[1] * j * 0.09,
+            fwd[2] + right[2] * i * 0.09 + up[2] * j * 0.09,
+          ]),
+          tMax: 30,
+        });
+      }
+    }
+    const hits = await shoot(rays);
+    const words = new Uint32Array(await eng.renderer.getArrayBufferAsync(gi2.cache.attribute));
+    const off = gi2.cache.describe().offsets;
+    const lum = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    const cvs = []; const ns = [];
+    const seen = new Set();
+    let bricks = 0;
+    for (const h of hits) {
+      if (!h.hit || h.level !== 0) continue;
+      const face = h.faceId;
+      if (face === 2 || face === 3) continue; // a façade is VERTICAL
+      const vi = h.voxelIdx;
+      const cx = vi & 63; const cy = (vi >> 6) & 63; const cz = (vi >> 12) & 63;
+      const b = (cx >> 2) | ((cy >> 2) << 4) | ((cz >> 2) << 8);
+      const key = b + ":" + face;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const m = words[off.MAP_OFF + b];
+      if (!m) continue;
+      const slot = m - 1;
+      // ⭐ THE BRICK'S OWN SLAB, NOT ALL 64 VOXELS. A brick is 4×4×4; a wall
+      // passing through it occupies ONE 4×4 layer of that cube and the other
+      // 48 voxels are air, interior, or a different surface entirely. Scoring
+      // the spread over all 64 mixes "two neighbouring patches of one wall
+      // disagree" — which is the dirt — with "a wall and the air beside it
+      // disagree", which is not a defect. The layer is picked by the FACE: an
+      // ±X face means the wall lies at a fixed x inside the brick, so the
+      // comparable set is the 16 voxels that share the hit's own `cx & 3`.
+      const axis = face >> 1; // 0 = ±X, 1 = ±Y, 2 = ±Z
+      const key3 = [cx & 3, cy & 3, cz & 3][axis];
+      const vals = []; const counts = [];
+      for (let lv = 0; lv < 64; lv++) {
+        const l3 = [lv & 3, (lv >> 2) & 3, (lv >> 4) & 3];
+        if (l3[axis] !== key3) continue;
+        const rgb = rc.unpackRgbe(words[off.DATA_OFF + slot * 384 + lv * 6 + face]);
+        if (!rgb) continue;
+        vals.push(lum(rgb));
+        if (gi2.cache.readCount) counts.push(gi2.cache.readCount(words, slot, lv, face));
+      }
+      if (vals.length < 6) continue;
+      bricks++;
+      const mean = vals.reduce((a, x) => a + x, 0) / vals.length;
+      const sd = Math.sqrt(vals.reduce((a, x) => a + (x - mean) ** 2, 0) / vals.length);
+      cvs.push((100 * sd) / Math.max(1e-9, mean));
+      if (counts.length) ns.push(counts.reduce((a, x) => a + x, 0) / counts.length);
+    }
+    const med = (a) => (a.length ? [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)] : null);
+    return {
+      bricks, cvMedian: med(cvs), cvMin: cvs.length ? Math.min(...cvs) : null,
+      cvMax: cvs.length ? Math.max(...cvs) : null, samplesMedian: med(ns),
+    };
+  }, { pose });
+}
+
+/**
+ * §P.3's motion receipt: the temporal noise DURING a 90° orbit.
+ *
+ * ⭐ A PER-PIXEL σ OVER AN ORBIT IS MOSTLY PARALLAX, so this compares
+ * CONSECUTIVE frames and only at pixels whose SURFACE did not change under them
+ * — same view depth to 1 %, same normal-Y to 0.02, same world height to 5 cm.
+ * What is left is the ESTIMATOR moving under a moving camera, which is the
+ * thing the user called "very noisy on movement"; everything the scene itself
+ * did between the two frames is excluded by construction rather than argued
+ * about afterwards.
+ */
+async function orbitNoise(pose, frames = 60) {
+  await call("viewport.setCamera", { position: pose.position, target: pose.target });
+  await settleFrames(120);
+  return page.evaluate(async ({ pose, frames }) => {
+    const eng = globalThis.__giEngineForProbe;
+    const g = globalThis.__gi2()?.gather;
+    const r = eng?.renderer;
+    if (!g?.passes?.noiseDump || !g.buffers?.dirtyBuf) return { error: "no noise kernel" };
+    const T = pose.target; const P = pose.position;
+    const rad = Math.hypot(P[0] - T[0], P[2] - T[2]);
+    const th0 = Math.atan2(P[2] - T[2], P[0] - T[0]);
+    const BINS = 2048; const LO = 1e-5; const HI = 100; const K = Math.log(HI / LO);
+    const h = { b: new Float64Array(BINS), n: 0 };
+    const add = (v) => {
+      const t = Math.log(Math.min(HI, Math.max(LO, v)) / LO) / K;
+      h.b[Math.min(BINS - 1, Math.max(0, Math.floor(t * BINS)))]++; h.n++;
+    };
+    const pct = (q) => {
+      if (!h.n) return null;
+      let c = 0;
+      for (let i = 0; i < BINS; i++) { c += h.b[i]; if (c >= (h.n * q) / 100) return LO * Math.exp(K * ((i + 0.5) / BINS)); }
+      return HI;
+    };
+    let prevN = null; let prevG = null;
+    for (let k = 0; k <= frames; k++) {
+      const th = th0 + (k / frames) * (Math.PI / 2);
+      await globalThis.__editorApi.call("viewport.setCamera", {
+        position: [T[0] + rad * Math.cos(th), P[1], T[2] + rad * Math.sin(th)],
+        target: T,
+      });
+      await new Promise((res) => requestAnimationFrame(() => res()));
+      await new Promise((res) => requestAnimationFrame(() => res()));
+      await r.computeAsync(g.passes.noiseDump);
+      const n1 = new Float32Array(await r.getArrayBufferAsync(g.buffers.noiseBuf.value));
+      const g1 = new Float32Array(await r.getArrayBufferAsync(g.buffers.dirtyBuf.value));
+      if (prevN) {
+        for (let i = 0; i < g1.length / 4; i++) {
+          if (!(n1[i * 4 + 3] > 0.5) || !(prevN[i * 4 + 3] > 0.5)) continue;
+          const d1 = g1[i * 4];
+          if (!(d1 > 0) || Math.abs(d1 - prevG[i * 4]) > 0.01 * d1) continue;
+          if (Math.abs(g1[i * 4 + 1] - prevG[i * 4 + 1]) > 0.02) continue;
+          if (Math.abs(g1[i * 4 + 2] - prevG[i * 4 + 2]) > 0.05) continue;
+          const a = prevN[i * 4]; const b = n1[i * 4];
+          const m = (a + b) / 2;
+          if (m > 0) add(Math.abs(b - a) / m);
+        }
+      }
+      prevN = n1; prevG = g1;
+    }
+    return { frames, paired: h.n, p50: pct(50), p95: pct(95) };
+  }, { pose, frames });
+}
+
+/**
+ * ⭐ §19 STAGE 3.7's OWN BASELINE, OUT OF THE SAME BINARY (`PRE37=1`).
+ *
+ * The four uniforms below ARE stage 3.7: `shadeProb = 0` makes the radiance
+ * cache one-shot again (a face is shaded on its first hit and never revisited),
+ * `skyAtHit = 0` removes the sky term from `shadeHit`, `needRays = 0` gives
+ * every probe a flat `R` rays, and `priorOn = 0` starts a fresh probe from
+ * black. Set all four and this build's gather IS 3.6's.
+ *
+ * ⚠ AND IT MUST BE SET BEFORE THE FIRST RAY, not after first light: the cache
+ * is a world accumulator, so an arm applied ten seconds in would be measuring a
+ * partly-3.7 cache and calling it the baseline. So it is attempted on every
+ * poll of the boot loop and latches on the first one that finds a gather —
+ * which is the frame the gather is built, before it has traced anything.
+ */
+let armed = false;
+const tryArm = async () => {
+  if (armed || process.env.PRE37 !== "1") return;
+  armed = await page.evaluate(() => {
+    const g = globalThis.__gi2?.()?.gather;
+    if (!g?.uniforms?.shadeProb) return false;
+    g.uniforms.shadeProb.value = 0;
+    g.uniforms.skyAtHit.value = 0;
+    g.uniforms.needRays.value = 0;
+    g.uniforms.priorOn.value = 0;
+    return true;
+  }).catch(() => false);
+  if (armed) console.log("    §3.7 arm: PRE-3.7 (one-shot cache, no sky at hits, flat R, black-start probes)");
 };
 
 let failed = 0;
@@ -362,6 +786,7 @@ for (const name of SCENES) {
   let openSettled = null;
   openCall.then((r) => { openSettled = r; }, (e) => { openSettled = { ok: false, error: String(e) }; });
   while (!openSettled) {
+    await tryArm();
     await sampleLum();
     await wait(200);
   }
@@ -378,6 +803,7 @@ for (const name of SCENES) {
   // never prints the line.
   const deadline = Date.now() + BOOT_TIMEOUT;
   while (Date.now() < deadline && !marks.firstLight) {
+    await tryArm();
     await sampleLum();
     await wait(200);
   }
@@ -621,6 +1047,25 @@ for (const name of SCENES) {
         `over ${noise.temporal.n} lit px | SPATIAL p50 ${p(noise.spatial.p50)} p95 ${p(noise.spatial.p95)} ` +
         `over ${noise.spatial.n} lit non-edge px`);
     }
+    // ── §19 STAGE 3.7's ALLOCATION AND ACCUMULATION, AS RATES ────────────
+    //
+    // Three facts a per-kernel timing cannot give: how many rays the frame
+    // actually spent (the need-driven allocator's whole point is that this is
+    // no longer `probes × R`), how many hits re-shaded (P.1's cost), and how
+    // many probes started from a neighbour prior instead of from black.
+    {
+      const pv = Math.max(1, gi2.probesValid ?? 0);
+      const flat = (gi2.probes ?? 0) * ((gi2.rays ?? 0) / Math.max(1, gi2.probes ?? 1));
+      console.log(`  §3.7 allocation: ${gi2.probesFresh ?? "?"} fresh / ${gi2.probesFlag ?? "?"} flagged / ` +
+        `${gi2.probesMature ?? "?"} mature of ${pv} valid; mature share ${gi2.matureRays ?? "?"} rays; ` +
+        `${gi2.raysTraced ?? 0} rays traced against a flat-R budget of ${Math.round(flat)} ` +
+        `(${(100 * (gi2.raysTraced ?? 0) / Math.max(1, flat)).toFixed(0)} %); ` +
+        `${gi2.neighbourPrior ?? "?"} probes seeded from neighbours`);
+      console.log(`  §3.7 accumulation: ${gi2.freshShades ?? 0} first shades + ${gi2.reShades ?? 0} re-shades ` +
+        `of ${gi2.windowHits ?? 0} window hits ` +
+        `(${(100 * ((gi2.freshShades ?? 0) + (gi2.reShades ?? 0)) / Math.max(1, gi2.windowHits ?? 1)).toFixed(1)} % ` +
+        "— each one a sun ray, a sky ray and the slot NEE)");
+    }
     if (gi2.voxelizer) {
       const v = gi2.voxelizer;
       console.log(`  voxelizer: ${v.built} built / ${v.dirty} dirty, ${v.pairsWritten} of ${v.pairsNeeded} pairs, ` +
@@ -849,6 +1294,63 @@ for (const name of SCENES) {
       }
       gate(name, subjects.past ? "past-768 placements in window" : "walk-tail placements in window",
         hits, subjects.subjects.length, hits === subjects.subjects.length, "/3");
+    }
+  }
+  // ══ §19 STAGE 3.7 — THE DIRT, THE CACHE AND THE ORBIT, ON THE USER'S POSES ══
+  //
+  // ⚠ THIS ARM MOVES THE CAMERA AND SETTLES FOR HUNDREDS OF FRAMES, so it runs
+  // AFTER every timing gate above. A pose change scrolls the window, refills
+  // the voxelizer and re-places every probe; a `profile.giPasses` read taken
+  // after it would be measuring a transient, and `first light` would be
+  // measuring the receipt.
+  if (name.toLowerCase() === "bistro" && process.env.DIRTY !== "0") {
+    const poses = await bistroPoses();
+    if (!poses) {
+      console.log("\n  §3.7 dirty receipt: the scene names no `FrontBanner` entity — no poses derived");
+    } else {
+      console.log(`\n  ── §3.7 THE "DIRTY" RECEIPT (banner [${poses.banner}], ground ${poses.ground}, ` +
+        `street runs [${poses.dir}] for ${poses.openRun} m) ──`);
+      for (const pose of poses.list) {
+        const d = await dirtyReceipt(pose);
+        if (d.error) { console.log(`   ${pose.name.padEnd(16)} ${d.error}`); continue; }
+        console.log(`   ${pose.name.padEnd(16)} [${pose.position.map((v) => v.toFixed(1))}] → ` +
+          `[${pose.target.map((v) => v.toFixed(1))}], ${d.ran} frames`);
+        // ⚠ AND IT SAYS SO WHEN IT CANNOT SEE. A depth gate that rejected every
+        // pixel once printed "0.00 %" and PASSED its own budget — a blind
+        // instrument reporting the best possible number. Under a thousand
+        // measured pixels is not a measurement.
+        const blind = d.bandPx < 1000;
+        console.log(`   ${" ".repeat(16)} DIRT (1 m band ÷ façade mean) ` +
+          `${blind ? "⚠ BLIND" : `${d.dirtPct.toFixed(2)} %`} ` +
+          `(p95 |band| ${d.bandP95Pct.toFixed(2)} %) over ${d.bandPx} of ${d.facadePx} façade px ` +
+          `(${d.grazingDropped} dropped as grazing); ` +
+          `CONTROL — the same band on the FLAT street ${d.flatPct.toFixed(2)} % over ${d.pbandPx} px`);
+        console.log(`   ${" ".repeat(16)} façade ${d.facadeMean.toFixed(4)} vs sunlit pavement ` +
+          `${d.pavementP75.toFixed(4)} (p75 of ${d.pavementPx} up-facing px) = ` +
+          `${d.ratioPct.toFixed(1)} % — a shaded wall under a clear sky wants 15-30 %`);
+        if (pose.name === "facade-wide") {
+          const bs = await facadeBrickSpread(pose);
+          if (bs?.error) console.log(`   ${" ".repeat(16)} brick spread: ${bs.error}`);
+          else {
+            console.log(`   ${" ".repeat(16)} §P.1 CACHE SPREAD across the 16 voxel faces of a brick's wall slab: ` +
+              `${bs.bricks} bricks, σ/mean median ${bs.cvMedian?.toFixed(1)} % ` +
+              `(${bs.cvMin?.toFixed(1)}-${bs.cvMax?.toFixed(1)} %), ` +
+              `median samples per face ${bs.samplesMedian?.toFixed(1) ?? "n/a"}`);
+            gate(name, "cache spread over a brick", bs.bricks >= 6 ? +(bs.cvMedian ?? 999).toFixed(1) : "BLIND",
+              40, bs.bricks >= 6 && (bs.cvMedian ?? 999) <= 40, "%");
+          }
+          const orb = await orbitNoise(pose);
+          if (orb?.error) console.log(`   ${" ".repeat(16)} orbit: ${orb.error}`);
+          else {
+            console.log(`   ${" ".repeat(16)} §P.3 ORBIT (90° over ${orb.frames} frames, ` +
+              `frame-to-frame at same-surface pixels): p50 ${(100 * orb.p50).toFixed(2)} % ` +
+              `p95 ${(100 * orb.p95).toFixed(2)} % over ${orb.paired} pairs`);
+            gate(name, "orbit temporal p95", +(100 * orb.p95).toFixed(2), 3, 100 * orb.p95 <= 3, "%");
+          }
+        }
+        gate(name, `dirt @ ${pose.name}`, blind ? "BLIND" : +d.dirtPct.toFixed(2), 5,
+          !blind && d.dirtPct <= 5, "%");
+      }
     }
   }
   if (name.toLowerCase() === "bistro") {

@@ -21,12 +21,43 @@
 // TIER-CONSTANT offsets, the same discipline `windowStore.js` uses:
 //
 //   data  [0                      , CACHE_BRICKS·384)   the slots
+//   count [CNT_OFF                , +CACHE_BRICKS·96)   the sample count, 4/word
 //   map   [MAP_OFF                , +levels·4096)       brick → slot+1, 0 = none
 //   free  [FREE_OFF               , +CACHE_BRICKS)      the free queue
 //   ctl   [CTL_OFF                , +8)                 cursor / queue / counters
 //
 // Every offset is derived from `CACHE_BRICKS` and `levels`, both tier
 // constants, so the WGSL carries no scene number.
+//
+// ══ THE SAMPLE COUNT IS A PARALLEL BYTE, NOT A SECOND WORD (§19 3.7 P.1) ═════
+//
+// §P.1's estimator is `α = 1/min(n+1, N_CAP)` — a running mean over the shade
+// samples a face collects — and `n` has to live somewhere. RGBE has no spare
+// bit (that is the whole argument for RGBE over R11G11B10 below: the ZERO word
+// is the freshness sentinel, and a stolen bit would make it ambiguous), so the
+// two candidates §P.1 names were WIDENING the slot to 2 u32 and a PARALLEL
+// count. The count wins on budget, on bandwidth and on bindings.
+//
+//   · BUDGET. Widening doubles the pool — 48 → 96 MB on desktop — to carry six
+//     bits of state per 32 bits of payload. A byte per (voxel, face), four to a
+//     word, is `SLOT_WORDS/4 = 96` words per slot: 12.58 MB desktop, 3.15 MB
+//     phone, a 26 % surcharge on the pool and ~0.4 % of a 3 GB budget.
+//   · BANDWIDTH. One extra word per ACCUMULATE, against a doubled slot's every
+//     READ — and the cache is read by every one of the ~200 k rays a frame and
+//     written by a fraction of them.
+//   · BINDINGS, which is the one that actually decides it. `probeTrace` is the
+//     kernel that accumulates and it already stands at the envelope's six
+//     storage buffers exactly (window, cache, meta, oct, hzb, stats). A
+//     separate count BUFFER would be a seventh and the kernel would not
+//     compile on the portable tier. A fifth REGION of this buffer is free.
+//
+// ⚠ THE INCREMENT IS AN `atomicAdd` OF `1 << shift`, WHICH IS EXACT ONLY WHILE
+// THE FIELD CANNOT CARRY. Four counts share a word, so incrementing one byte
+// carries into its neighbour the moment that byte reaches 255. It is gated on
+// `n < nCap` (16), so a byte can only overshoot by the number of rays that
+// re-shade the same face in the same dispatch — tens, never 239. Reads clamp
+// anyway; the GATE is what protects the neighbour's count, which a clamp
+// could not repair.
 //
 // ══ WHY RGBE AND NOT R11G11B10 (§K.6 BENT, DELIBERATELY) ═════════════════════
 //
@@ -65,6 +96,17 @@ export const SLOT_FACES = 6;
 /** u32 words per slot, and the byte figure §K.6 budgets. */
 export const SLOT_WORDS = SLOT_VOXELS * SLOT_FACES; // 384
 export const SLOT_BYTES = SLOT_WORDS * 4; // 1536
+/** One BYTE of sample count per (voxel, face), four to a word (§P.1). */
+export const SLOT_CNT_WORDS = SLOT_WORDS / 4; // 96
+/**
+ * §P.1's `α = 1/min(n+1, N_CAP)`. Sixteen shade samples is a running mean whose
+ * standard error is a quarter of one sample's — enough to take a 4-sample sun/
+ * NEE/sky estimate from "the dirt" to a surface — and it is short enough that a
+ * world change is followed at 1/16 per sample rather than forgotten. The cap is
+ * what makes this an EMA rather than an unbounded average, i.e. what lets the
+ * cache still track a moved lamp.
+ */
+export const CACHE_N_CAP = 16;
 
 /** Pool size by tier (PLAN §4.6: phone 8 MB-class, desktop 32 k bricks). */
 export const CACHE_TIERS = {
@@ -148,7 +190,9 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
 
   const DATA_OFF = 0;
   const DATA_WORDS = CACHE_BRICKS * SLOT_WORDS;
-  const MAP_OFF = DATA_OFF + DATA_WORDS;
+  const CNT_OFF = DATA_OFF + DATA_WORDS;
+  const CNT_WORDS = CACHE_BRICKS * SLOT_CNT_WORDS;
+  const MAP_OFF = CNT_OFF + CNT_WORDS;
   const MAP_WORDS = levels * BRICKS_PER_LEVEL;
   const FREE_OFF = MAP_OFF + MAP_WORDS;
   const FREE_WORDS = CACHE_BRICKS;
@@ -275,6 +319,71 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
     },
   });
 
+  // ═══════════════════════════════════════════════ ACCUMULATE (a `sharedFn`)
+  //
+  // ⭐⭐ §19 STAGE 3.7 P.1 — THE CACHE WAS ONE-SHOT, AND THAT WAS THE DIRT.
+  //
+  // Until 3.7 a voxel face was shaded ONCE, on the first ray that reached it,
+  // with `α = 1` and a 2×2-stratified estimate of the panel plus one sun shadow
+  // ray — and then never again, because the next ray read the stored word.
+  // Four samples of a hemisphere is not an estimate of that hemisphere; it is
+  // one draw from a distribution an order of magnitude wide, kept FOREVER. Two
+  // neighbouring voxels on one flat wall therefore hold two unrelated draws,
+  // and the probe filter smears the pair into a blob 0.3–1 m across that does
+  // not move, does not fade and does not average out — which is exactly the
+  // "very dirty" the user photographed. Measured on Bistro's shaded façade
+  // before this function existed: the σ/mean ACROSS the 64 voxel faces of one
+  // 1 m brick had a median of 110 %, on a wall whose real radiance varies by a
+  // few percent across it.
+  //
+  // So a hit may now RE-shade (§P.1's `p_shade`), and the estimator becomes a
+  // running mean: `α = 1/min(n+1, nCap)`, `n` the byte in the parallel count
+  // region. The first sample still lands whole (`old == 0` ⇒ α = 1), so nothing
+  // about first light changes; sample 2 lands at ½, sample 16 at 1/16, and from
+  // there the face is an EMA that still follows a moved lamp.
+  //
+  // ⚠ THE α IS DERIVED FROM `n`, NEVER PASSED IN. `cacheWrite` below keeps its
+  // caller-supplied α because `injectLitFrame` is not a sampler — it writes an
+  // EXACT lit colour for a surface the camera can see and has its own time
+  // constant. Two producers, two rules, one word; the count belongs to the one
+  // that is estimating.
+  const cacheAccumFn = sharedFn({
+    name: "gi2CacheAccum",
+    type: "float",
+    inputs: [
+      { name: "level", type: "float" },
+      { name: "voxelIdx", type: "float" },
+      { name: "face", type: "float" },
+      { name: "rgb", type: "vec3" },
+      { name: "nCap", type: "float" },
+    ],
+    body: (levelF, voxelF, faceF, rgb, nCapF) => {
+      const { mapIdx, lv, faceU } = addressOf(levelF.toUint(), voxelF.toUint(), faceF.toUint());
+      const m = atomicLoad(atomics.element(mapIdx)).toVar();
+      const alpha = float(0).toVar();
+      If(m.notEqual(uint(0)), () => {
+        const slot = m.sub(uint(1)).toVar();
+        const sub = lv.mul(uint(SLOT_FACES)).add(faceU).toVar(); // 0..383
+        const addr = uint(DATA_OFF).add(slot.mul(uint(SLOT_WORDS))).add(sub).toVar();
+        const cAddr = uint(CNT_OFF).add(slot.mul(uint(SLOT_CNT_WORDS)))
+          .add(shiftRight(sub, uint(2))).toVar();
+        const shiftB = bitAnd(sub, uint(3)).mul(uint(8)).toVar();
+        const n = bitAnd(shiftRight(atomicLoad(atomics.element(cAddr)), shiftB), uint(255)).toVar();
+        const old = atomicLoad(atomics.element(addr)).toVar();
+        const cap = nCapF.max(1).toVar();
+        const a = select(old.equal(uint(0)), float(1),
+          float(1).div(n.toFloat().add(1).min(cap))).toVar();
+        atomicStore(atomics.element(addr), encodeRgbe(mix(decodeRgbe(old), rgb.max(vec3(0)), a)));
+        // Only while the byte cannot carry — see the header's note.
+        If(n.toFloat().lessThan(cap), () => {
+          atomicAdd(atomics.element(cAddr), shiftLeft(uint(1), shiftB));
+        });
+        alpha.assign(a);
+      });
+      return alpha;
+    },
+  });
+
   // ══════════════════════════════════════════════════════════ SHADER: alloc
   //
   // One thread per (static level, brick). Owns that brick's map entry outright.
@@ -321,6 +430,16 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
         Loop({ start: 0, end: SLOT_WORDS, name: "cacheZero" }, ({ cacheZero }) => {
           atomicStore(atomics.element(base.add(uint(cacheZero))), uint(0));
         });
+        // ⚠ AND THE COUNTS WITH THEM. A recycled slot that kept a previous
+        // brick's `n = 16` would give its FIRST sample α = 1/17 — the new
+        // face would inherit the old face's convergence and take a hundred
+        // samples to forget a wall it never was. The radiance word's zero is
+        // the freshness sentinel; the count has no sentinel and must be
+        // cleared with the data it describes.
+        const cbase = uint(CNT_OFF).add(slot.mul(uint(SLOT_CNT_WORDS))).toVar();
+        Loop({ start: 0, end: SLOT_CNT_WORDS, name: "cntZero" }, ({ cntZero }) => {
+          atomicStore(atomics.element(cbase.add(uint(cntZero))), uint(0));
+        });
         atomicStore(atomics.element(mapIdx), slot.add(uint(1)));
         atomicAdd(atomics.element(uint(CTL_OFF + CTL_ALLOC)), uint(1));
       });
@@ -345,23 +464,36 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
     bricks: CACHE_BRICKS,
     slotBytes: SLOT_BYTES,
     dataBytes: DATA_WORDS * 4,
+    countBytes: CNT_WORDS * 4,
     mapBytes: MAP_WORDS * 4,
     freeBytes: FREE_WORDS * 4,
     totalBytes: words * 4,
     totalMB: +((words * 4) / (1024 * 1024)).toFixed(2),
-    offsets: { DATA_OFF, MAP_OFF, FREE_OFF, CTL_OFF },
+    offsets: { DATA_OFF, CNT_OFF, MAP_OFF, FREE_OFF, CTL_OFF },
   });
 
   return {
     tier, bricks: CACHE_BRICKS, words,
     buffer, atomics, attribute,
-    DATA_OFF, MAP_OFF, FREE_OFF, CTL_OFF,
+    DATA_OFF, CNT_OFF, MAP_OFF, FREE_OFF, CTL_OFF,
     allocPass, clearPass,
     /** `(level, voxelIdx, face) → vec4(rgb, valid)`; all args float nodes. */
     cacheRead: (levelF, voxelF, faceF) => cacheReadFn(float(levelF), float(voxelF), float(faceF)),
     /** `(level, voxelIdx, face, rgb, alpha) → float`; 1 if the brick had a slot. */
     cacheWrite: (levelF, voxelF, faceF, rgb, alphaF) =>
       cacheWriteFn(float(levelF), float(voxelF), float(faceF), vec3(rgb), float(alphaF)),
+    /**
+     * §P.1's running mean: `(level, voxelIdx, face, rgb, nCap) → α used`.
+     * The α comes from the face's own sample count; the caller supplies only
+     * the cap. Returns 0 when the brick owns no slot.
+     */
+    cacheAccum: (levelF, voxelF, faceF, rgb, nCapF = CACHE_N_CAP) =>
+      cacheAccumFn(float(levelF), float(voxelF), float(faceF), vec3(rgb), float(nCapF)),
+    /** The sample count of one (slot, voxel, face), out of a CPU readback. */
+    readCount(u32, slot, lv, face) {
+      const sub = lv * SLOT_FACES + face;
+      return (u32[CNT_OFF + slot * SLOT_CNT_WORDS + (sub >> 2)] >>> ((sub & 3) * 8)) & 255;
+    },
     faceOfNormal, normalOfFace,
     /** Readback helper: the control words, decoded. */
     readControl(u32) {

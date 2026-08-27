@@ -263,6 +263,9 @@
           await compute(gather.passes.hzbBuild);
           for (const p of gather.passes.hzbReduce) await compute(p);
           await compute(gather.passes.probePlace);
+          // §19 Stage 3.7 P.3: the one-thread allocator, between the placement
+          // that classifies the probes and the trace that spends the rays.
+          await compute(gather.passes.rayBudget);
           await compute(gather.passes.probeTrace);
           await compute(gather.passes.probeFilter);
           await compute(SH3 ? gather.passes.probeShFilter3 : gather.passes.probeShFilter);
@@ -1150,6 +1153,22 @@
           const SHIP = {
             historyU: gd.history, hystOn: gatherMod.HYST.decay, reprojWide: 1,
             injectAlpha: 0.25, injectGlossy: 0, sh3: false, anchorJitter: 0,
+            shadeProb: gd.shadeProb, skyAtHit: 1, needRays: 1, priorOn: 1,
+          };
+          /**
+           * ⭐ §19 STAGE 3.7's OWN BASELINE — 3.6 EXACTLY, OUT OF THIS BINARY.
+           *
+           * `BASE` above is the 3.5 baseline the 3.6 lever table was written
+           * against, and comparing 3.7 to it would credit 3.7 with everything
+           * 3.6 already did. The four uniforms below are the whole of 3.7:
+           * `shadeProb = 0` makes the cache one-shot again (a face is shaded on
+           * first hit and never revisited), `skyAtHit = 0` removes the sky term
+           * from `shadeHit`, `needRays = 0` gives every probe a flat `R`, and
+           * `priorOn = 0` starts a fresh probe at zero. Set all four and the
+           * gather is 3.6's, compiled from 3.7's source.
+           */
+          const PRE37 = {
+            ...SHIP, shadeProb: 0, skyAtHit: 0, needRays: 0, priorOn: 0,
           };
           const settle = async (k) => { for (let i = 0; i < k; i++) await runFrame(nn++); };
           /** One frame's counters, cleared first so they are PER FRAME. */
@@ -1370,13 +1389,15 @@
             // reason: a fast crossing with no lock is noise wearing a result's
             // clothes.
             const moveShip = await armMove(`shipped (H=${gd.history})`);
+            setArm(PRE37);
+            const movePre37 = await armMove("3.6 (no need-driven rays, no prior)");
             setArm({ ...SHIP, historyU: 8 });
             const moveH8 = await armMove("shipped, H=8");
             setArm(BASE);
             const moveBase = await armMove("baseline (3.5)");
             setArm(SHIP);
             await settle(60);
-            results.panelMove = { shipped: moveShip, h8: moveH8, baseline: moveBase };
+            results.panelMove = { shipped: moveShip, pre37: movePre37, h8: moveH8, baseline: moveBase };
           }
 
           // ── UNDER MOTION, and how fast it goes quiet again ──────────────
@@ -1907,7 +1928,11 @@
           const traceWgsl = renderer._nodes?.getForCompute?.(gather.passes.probeTrace)?.computeShader ?? "";
           const injectWgsl = renderer._nodes?.getForCompute?.(gather.passes.inject)?.computeShader ?? "";
           const wgslHas = {
-            probeTraceWrites: /gi2CacheWrite/.test(traceWgsl),
+            // §19 Stage 3.7 P.1: `probeTrace` ACCUMULATES now (the running mean
+            // over the face's shade samples) and `injectLitFrame` still WRITES
+            // (an exact lit colour at a fixed α). Two producers, two functions,
+            // and each one has to survive TSL's output-driven graph walk.
+            probeTraceAccumulates: /gi2CacheAccum/.test(traceWgsl),
             probeTraceReads: /gi2CacheRead/.test(traceWgsl),
             probeTraceTraces: /gi2TraceWindow/.test(traceWgsl),
             injectWrites: /gi2CacheWrite/.test(injectWgsl),

@@ -73,10 +73,10 @@
 //    shipping cost with `statsOn = 0` and produces the receipts with it on.
 import * as THREE from "three/webgpu";
 import {
-  Break, Fn, If, Loop, Return, atomicAdd, bitAnd, bitOr, bitXor, dot, exp, exp2, float, globalId,
-  instanceIndex, instancedArray, int, ivec2, log2, max, min, mix, normalize, select, shiftLeft,
-  shiftRight, sqrt, step, storage, texture, textureStore, uint, uniform, uniformArray, vec2, vec3,
-  vec4,
+  Break, Fn, If, Loop, Return, atomicAdd, atomicLoad, atomicStore, bitAnd, bitOr, bitXor, dot, exp,
+  exp2, float, globalId, instanceIndex, instancedArray, int, ivec2, log2, max, min, mix, normalize,
+  select, shiftLeft, shiftRight, sqrt, step, storage, texture, textureStore, uint, uniform,
+  uniformArray, vec2, vec3, vec4,
 } from "three/tsl";
 import { LEVEL_WORDS, N, PAL_OFF } from "./windowStore.js";
 import { normalOfFace } from "./radianceCache.js";
@@ -115,11 +115,80 @@ import { octahedralUV } from "../srcOctahedral.js";
  * because a tier is expected to differ.
  */
 export const GATHER_TIERS = {
-  phone: { tile: 16, rays: 8, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2 },
-  medium: { tile: 16, rays: 8, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2 },
-  high: { tile: 8, rays: 16, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2 },
-  ultra: { tile: 8, rays: 16, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2 },
+  phone: { tile: 16, rays: 8, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 4, shadeProb: 0.03, skyRays: 2 },
+  medium: { tile: 16, rays: 8, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 4, shadeProb: 0.03, skyRays: 2 },
+  high: { tile: 8, rays: 16, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 8, shadeProb: 0.06, skyRays: 4 },
+  ultra: { tile: 8, rays: 16, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 8, shadeProb: 0.06, skyRays: 4 },
 };
+
+/**
+ * ⭐⭐ §19 STAGE 3.7 P.3 — `rays` ABOVE IS THE FRAME'S BUDGET NOW, NOT A COUNT.
+ *
+ * Until 3.7 every probe traced `R` directions every frame whatever it already
+ * knew: the probe just placed on a wall it has never seen and the probe that
+ * has stared at the same flat floor for two hundred frames drew the same 16
+ * rays. That single allocation is behind BOTH of the user's 3.7 reports — a
+ * probe reprojected onto new world space shows a 16-of-64-direction estimate
+ * for several frames ("very noisy on movement") while the settled probe beside
+ * it spends 16 rays re-measuring a number it already has to four decimals.
+ *
+ * So the count follows the probe's own state (`probePlace` classifies, the
+ * class rides `probeMeta` slot 2's `.z`):
+ *
+ *   FRESH    no history at all — the reprojection missed → one thread per oct
+ *            texel, i.e. the whole front hemisphere in ONE frame.
+ *   FLAGGED  reprojected, but fewer than half its front texels are mature
+ *            (`n ≥ H/2`) → 32. This is where a moved lamp lands: the decaying
+ *            hysteresis divides `n` on a real change, which un-matures the
+ *            texels, which buys the probe rays. §P.4's "change needs rays, not
+ *            forgetting" as a consequence of the maturity test rather than as
+ *            a second mechanism.
+ *   MATURE   everything else → `mature` (8 desktop / 4 phone), scaled DOWN by
+ *            `rayBudget` when the fresh and flagged shares would take the frame
+ *            past `probes × rays`. Mature bends because mature is converged.
+ */
+/**
+ * ⭐⭐ 32, NOT 64, AND THE MEASUREMENT IS WHY (§19 Stage 3.7).
+ *
+ * §P.3 says "fresh probes get all 64 directions" and asks for the block form
+ * and the prefix-sum form to be MEASURED against each other. Measured, at
+ * 960×540 ultra: a 64-wide block dispatches 8160×64 = 522 k threads to do
+ * 88 k rays' worth of work, and `probeTrace` cost 1.74 ms — 3.3 ns per THREAD
+ * against 3.6's 6.2 ns per thread on a quarter as many. The kernel had become
+ * launch-bound, and 83 % of the launches existed only to read one vec4 and
+ * return. That is the block form's bill, and §P.3 wanted it on the table.
+ *
+ * A 32-wide block loses almost nothing, because 64 was never 64 real rays.
+ * A world-oriented oct map puts about HALF its texels behind any given probe,
+ * so a 64-thread block (one texel each, no window to search) traces ~32 of
+ * them and idles the rest. At 32 threads each thread owns a TWO-texel window
+ * and takes the first front-facing one — a ~87 % yield, i.e. ~28 distinct
+ * directions, against the 64-thread block's ~32. Four directions of coverage
+ * for half the launches.
+ *
+ * The remaining waste — 261 k launches for 88 k rays at rest, where every
+ * probe is mature — is the block form's, and the honest next lever is a
+ * dispatch whose WIDTH follows the frame (narrow at rest, wide while the
+ * camera moves), which needs a mutable `count` rather than a second kernel.
+ */
+export const RAY_FRESH = 32;
+export const RAY_FLAG = 16;
+/** The floor under the mature share when the budget is tight. */
+export const RAY_MATURE_MIN = 2;
+/** Probe classes, as `probePlace` writes them into `probeMeta` slot 2's `.z`. */
+export const CLS_MATURE = 0;
+export const CLS_FLAG = 1;
+export const CLS_FRESH = 2;
+/**
+ * §P.1's cap on the cache's running mean. Sixteen samples, then an EMA.
+ *
+ * ⚠ THE RE-SHADE IS A PROBABILITY, NOT §K.6's RELIGHT QUEUE. The rays already
+ * visit exactly the faces that matter — a face nothing looks at needs no
+ * radiance — so the VISIT DISTRIBUTION is the relight priority, for free, with
+ * no list to maintain, no bricks to rank and no second kernel. The cost is
+ * bounded by the window-hit count times `shadeProb`, both of which are printed.
+ */
+export const SHADE_N_CAP = 16;
 
 /** HZB mips and §L.2's step budget — the tier row's DEFAULT, not the value. */
 export const HZB_MIPS = 5;
@@ -170,8 +239,31 @@ export const STATS = {
   screenHits: 5, windowHits: 6, skyMiss: 7, freshShades: 8, alphaForced: 9,
   injectWrites: 10, handoffs: 11, matureTexels: 12, texelsSeen: 13,
   reprojNoPrev: 16, reprojOffScreen: 17, reprojPlane: 18, reprojSlant: 19, reprojAlign: 20,
+  // §19 Stage 3.7: what the re-shading and the prior actually cost.
+  reShades: 25, neighbourPrior: 26,
 };
-export const STAT_SLOTS = 24;
+/**
+ * §19 Stage 3.7's NEED CENSUS — three slots that are not receipts.
+ *
+ * ⚠ THESE ARE CONSUMED AND ZEROED INSIDE THE FRAME, so they are deliberately
+ * NOT in `STATS`: `rayBudget` reads them the moment `probePlace` finishes and
+ * clears them behind itself, because the harness pages do not dispatch
+ * `clearStats` every frame and a census that accumulated over a hundred frames
+ * would starve the mature share to its floor forever. What a receipt reads is
+ * the TOTAL `rayBudget` republishes below — a value, written with a store, that
+ * is exactly this frame's and cannot drift whatever the caller's clear cadence.
+ */
+export const STAT_NEED = { fresh: 21, flag: 22, mature: 23 };
+/**
+ * ⚠ 24 IS NOT A COUNTER, IT IS THE RAY BUDGET'S OUTPUT — four words, not a
+ * stripe: `[0]` the mature share's ray count (which `probeTrace` reads back the
+ * same frame), `[1..3]` the fresh/flagged/mature probe totals for the receipts.
+ * It lives in the stats buffer because `probeTrace` stands at the envelope's
+ * six storage buffers exactly and stats is one it already has; a seventh
+ * binding for one integer would not compile on the portable tier.
+ */
+export const STAT_RAY_BUDGET = 24;
+export const STAT_SLOTS = 28;
 export const STAT_WORDS = STAT_SLOTS * STAT_STRIPE;
 
 /**
@@ -334,6 +426,22 @@ export function createGiGather({
   /** §L.4's probe-space bilateral radius — 2 is a 5×5. See `makeShFilter`. */
   const SH_R = spec.shRadius ?? 1;
   const STRIDE = OCT / R;
+  /**
+   * §P.3's mature share, and the WIDEST texel window any thread can own.
+   *
+   * A thread of a probe with `rays` rays owns `OCT/rays` consecutive texels and
+   * takes the first front-facing one, exactly as bend 2 describes — only now
+   * `rays` is per probe, so the window's width is a runtime value. The LOOP
+   * bound has to be compile-time, so it is the widest window the allocator can
+   * hand out (`OCT / RAY_MATURE_MIN`) with a runtime `Break` inside; a fresh
+   * probe's window is one texel wide and leaves after one iteration.
+   */
+  const MATURE_RAYS = spec.mature ?? Math.max(RAY_MATURE_MIN, R / 2);
+  const PICK_MAX = OCT / RAY_MATURE_MIN;
+  /** §P.2's sky samples per shade sample, and their stratification grid. */
+  const SKY_RAYS = spec.skyRays ?? 4;
+  const SKY_STRATA = SKY_RAYS >= 4 ? 2 : 1;
+  const SKY_ROWS = SKY_RAYS / SKY_STRATA;
   const USE_SH = spec.sh;
   const MIP_RES = O / 2;
   /**
@@ -442,6 +550,27 @@ export function createGiGather({
   const noiseBuf = wantNoise
     ? instancedArray(new Float32Array(
       Math.ceil(width / 2) * Math.ceil(height / 2) * 4), "vec4") : null;
+  /**
+   * ⭐ §19 STAGE 3.7 P.5 — THE GEOMETRY BESIDE THE NOISE, IN ITS OWN BUFFER.
+   *
+   * The "dirty" receipt is a spatial variance at a ONE-METRE WORLD SCALE over
+   * a NAMED REGION — the façade — and neither of those is computable from
+   * `noiseBuf`: a fixed 5×5 box is a screen-space filter whose world footprint
+   * changes with depth, and "the façade" is a statement about surface normals.
+   * So the same kernel writes the three numbers that turn a pixel into a place:
+   * its view depth (→ the projected size of a metre), its normal's Y (façade
+   * vs pavement) and its world height.
+   *
+   * ⚠ A SEPARATE BUFFER, NOT TWO VEC4 PER PIXEL, and that is the receipt's own
+   * wall time talking. The 3.6 temporal receipt reads `noiseBuf` back THIRTY
+   * times per arm; widening the stride would have put 6.4 MB a frame of
+   * geometry the temporal statistic never looks at across the CDP bridge, 30
+   * times, per arm. Two buffers means the dirty receipt pays for the geometry
+   * ONCE per pose and the temporal receipt pays nothing.
+   */
+  const dirtyBuf = wantNoise
+    ? instancedArray(new Float32Array(
+      Math.ceil(width / 2) * Math.ceil(height / 2) * 4), "vec4") : null;
   /** `shadeHit` under a microscope — see `shadeProbePass`. Harness only. */
   const SHADE_SLOTS = 12;
   const shadeIn = instancedArray(new Float32Array(SHADE_SLOTS * 2 * 4), "vec4");
@@ -546,6 +675,18 @@ export function createGiGather({
     // here for the same reason `hystOn` is: how much variance H buys, and what
     // it costs in responsiveness, is a measurement.
     historyU: uniform(H),
+    // ── §19 STAGE 3.7, and every one of these is an A/B arm ────────────────
+    /** §P.1's `p_shade`. 0 restores 3.6's one-shot cache exactly. */
+    shadeProb: uniform(spec.shadeProb ?? 0.25),
+    /** §P.1's `N_CAP`. 1 restores α = 1 (one-shot) with the re-shade still on. */
+    nCapU: uniform(SHADE_N_CAP),
+    /** §P.2's sky ray at every shade sample. 0 removes the term. */
+    skyAtHit: uniform(1),
+    /** §P.3's mature share. `rayBudget` scales it; 0 restores a flat `R`. */
+    needRays: uniform(1),
+    matureRaysU: uniform(MATURE_RAYS, "uint"),
+    /** §P.4's neighbour prior for a fresh probe. 0 restores "start at zero". */
+    priorOn: uniform(1),
   };
   const palette = Array.from({ length: PAL_ENTRIES }, () => new THREE.Vector4(0, 0, 0, 0));
   const palU = uniformArray(palette, "vec4");
@@ -722,6 +863,17 @@ export function createGiGather({
     If(u.statsOn.greaterThan(0.5), () => {
       atomicAdd(stats.element(uint(slot * STAT_STRIPE).add(bitAnd(laneU, uint(STAT_STRIPE - 1)))), uint(1));
     });
+  };
+  /**
+   * ⚠ THE NEED CENSUS IS NOT A RECEIPT AND MUST NOT BE GATED. `rayBudget`
+   * READS slots 21-23 the same frame `probePlace` writes them, so gating them
+   * on `statsOn` would make the frame's ray allocation depend on whether the
+   * receipts happened to be on — an instrument changing its subject, the
+   * failure the LUM sampler is opt-in for. One add per PROBE (not per ray),
+   * striped over 64 words, is ~25 k adds a frame at 1650×970.
+   */
+  const bumpRaw = (slot, laneU) => {
+    atomicAdd(stats.element(uint(slot * STAT_STRIPE).add(bitAnd(laneU, uint(STAT_STRIPE - 1)))), uint(1));
   };
 
   const loadPos = (x, y) => posNode.load(ivec2(x, y));
@@ -964,22 +1116,182 @@ export function createGiGather({
 
     probeMeta.element(metaIdx(u.curBase, probe, 0)).assign(vec4(pos, valid));
     probeMeta.element(metaIdx(u.curBase, probe, 1)).assign(vec4(nrm, depth));
-    probeMeta.element(metaIdx(u.curBase, probe, 2)).assign(vec4(prevProbe, reprojFail, 0, 0));
 
-    // ── carry the oct map forward (§L.3) ───────────────────────────────────
-    // Only R of the 64 texels are re-traced this frame; the other 56-59 are
+    // ── carry the oct map forward (§L.3), and CENSUS ITS MATURITY (§P.3) ───
+    // Only some of the 64 texels are re-traced this frame; the rest are
     // whatever the MATCHING previous probe held. No match ⇒ start at zero,
     // which is what `n = 0` in the alpha then means to every consumer.
+    //
+    // ⭐ THE CLASSIFIER RIDES A LOOP THAT ALREADY READS EVERY TEXEL. §P.3 wants
+    // a probe's ray count to follow its NEED, and "need" has to be measured
+    // somewhere; this loop already touches all 64 alphas, so counting how many
+    // FRONT-hemisphere texels are mature (`n ≥ H/2`, the same test
+    // `STATS.matureTexels` uses) costs a compare per texel and no new read. It
+    // also makes §P.4's moved-lamp case fall out for free: mode 4's decaying
+    // hysteresis divides `n` under sustained change, the texels stop being
+    // mature, and the probe is flagged into 32 rays on the very next frame.
+    // Change buys rays instead of forgetting history.
     const has = prevProbe.greaterThanEqual(0).and(valid.greaterThan(0.5)).toVar();
     const src = prevProbe.max(0).toUint().toVar();
+    const frontN = float(0).toVar();
+    const matureN = float(0).toVar();
     If(u.carryOn.greaterThan(0.5), () => {
       Loop({ start: 0, end: OCT, name: "carry" }, ({ carry }) => {
         const t = uint(carry).toVar();
         const prev = probeOct.element(octIdx(u.prevBase, src, t)).toVar();
-        probeOct.element(octIdx(u.curBase, probe, t)).assign(select(has, prev, vec4(0)));
+        const v = select(has, prev, vec4(0)).toVar();
+        probeOct.element(octIdx(u.curBase, probe, t)).assign(v);
+        const e0 = octU.element(t).toVar();
+        If(dot(e0.xyz, nrm).greaterThan(0), () => {
+          frontN.addAssign(1);
+          If(v.w.max(0).div(PACK_N).floor().greaterThanEqual(u.historyU.toFloat().mul(0.5)),
+            () => { matureN.addAssign(1); });
+        });
+      });
+    });
+
+    // ── §P.3: the class, and the census `rayBudget` reads next ─────────────
+    const ripe = matureN.div(frontN.max(1)).toVar();
+    const cls = select(valid.lessThan(0.5), float(CLS_MATURE),
+      select(has.not(), float(CLS_FRESH),
+        select(ripe.lessThan(0.5), float(CLS_FLAG), float(CLS_MATURE)))).toVar();
+    probeMeta.element(metaIdx(u.curBase, probe, 2)).assign(vec4(prevProbe, reprojFail, cls, ripe));
+    If(valid.greaterThan(0.5), () => {
+      If(cls.greaterThan(CLS_FLAG + 0.5), () => {
+        bumpRaw(STAT_NEED.fresh, tx);
+      }).Else(() => {
+        If(cls.greaterThan(CLS_MATURE + 0.5), () => {
+          bumpRaw(STAT_NEED.flag, tx);
+        }).Else(() => {
+          bumpRaw(STAT_NEED.mature, tx);
+        });
+      });
+    });
+
+    // ══ §19 STAGE 3.7 P.4 — A FRESH PROBE STARTS FROM ITS NEIGHBOURS ═══════
+    //
+    // ⭐⭐ ZERO IS THE ONE VALUE A FRESH PROBE'S IRRADIANCE CANNOT BE.
+    //
+    // A probe whose reprojection missed began at `vec4(0)` in every texel, and
+    // the resolve then read a probe whose cosine sum is zero over every
+    // direction it has not sampled yet. For one frame that surface is BLACK,
+    // and at 8-16 rays a frame it takes several frames to stop being black —
+    // the dark fringe that crawls along the edges of the frame whenever the
+    // camera turns, and half of "very noisy on movement".
+    //
+    // The least-committal estimate of a surface's irradiance is what the
+    // surfaces AROUND it measured, and the filtered SH of the 3×3 neighbours is
+    // exactly that: already computed, already plane- and normal-weighted,
+    // already in a buffer this kernel can bind. It is written with `n = 1`, so
+    // the probe's own first ray lands at α = ½ and its second at ⅓ — the prior
+    // is displaced by evidence within two frames and can never persist as a
+    // bias. Nine probes of SH is 81 vec4 reads, paid ONLY on fresh probes.
+    //
+    // ⚠ THE NEIGHBOURS' *PREVIOUS* META, because `probeSh` still holds LAST
+    // frame's filtered coefficients at this point in the frame (`probeFilter`
+    // has not run). Weighting last frame's SH by this frame's geometry would be
+    // a plane test against a probe that has since moved.
+    If(u.priorOn.greaterThan(0.5).and(has.not()).and(valid.greaterThan(0.5)), () => {
+      const acc = [];
+      for (let i = 0; i < 9; i++) acc.push(vec3(0).toVar());
+      const wsum = float(0).toVar();
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const nx = tx.toInt().add(int(ox)).toVar();
+          const ny = ty.toInt().add(int(oy)).toVar();
+          const inB = nx.greaterThanEqual(int(0)).and(ny.greaterThanEqual(int(0)))
+            .and(nx.lessThan(u.probeWU.toInt())).and(ny.lessThan(u.probeHU.toInt())).toVar();
+          const np = ny.clamp(int(0), u.probeHU.toInt().sub(int(1))).toUint()
+            .mul(u.probeWU).add(nx.clamp(int(0), u.probeWU.toInt().sub(int(1))).toUint()).toVar();
+          const na = probeMeta.element(metaIdx(u.prevBase, np, 0)).toVar();
+          const nn = probeMeta.element(metaIdx(u.prevBase, np, 1)).toVar();
+          const wp = exp(dot(nrm, na.xyz.sub(pos)).abs().div(v0).negate()).toVar();
+          const wn = dot(nrm, nn.xyz).max(0).toVar();
+          const w = select(inB.and(na.w.greaterThan(0.5)),
+            wp.mul(wn.mul(wn).mul(wn).mul(wn)), float(0)).toVar();
+          If(w.greaterThan(1e-5), () => {
+            for (let i = 0; i < 9; i++) {
+              acc[i].addAssign(probeSh.element(shIdx(np, i)).xyz.mul(w));
+            }
+            wsum.addAssign(w);
+          });
+        }
+      }
+      If(wsum.greaterThan(1e-5), () => {
+        const inv = float(1).div(wsum).toVar();
+        const c = acc.map((a) => a.mul(inv).toVar());
+        // `n = 1`, the hit distance parked at RAY_MAX, σ unmeasured.
+        const seedAlpha = float(PACK_N + DIST_Q * PACK_D).toVar();
+        Loop({ start: 0, end: OCT, name: "prior" }, ({ prior }) => {
+          const t = uint(prior).toVar();
+          const d = octU.element(t).xyz.toVar();
+          If(dot(d, nrm).greaterThan(0), () => {
+            const L = c[0].mul(0.282095)
+              .add(c[1].mul(d.y.mul(0.488603)))
+              .add(c[2].mul(d.z.mul(0.488603)))
+              .add(c[3].mul(d.x.mul(0.488603)))
+              .add(c[4].mul(d.x.mul(d.y).mul(1.092548)))
+              .add(c[5].mul(d.y.mul(d.z).mul(1.092548)))
+              .add(c[6].mul(d.z.mul(d.z).mul(3).sub(1).mul(0.315392)))
+              .add(c[7].mul(d.x.mul(d.z).mul(1.092548)))
+              .add(c[8].mul(d.x.mul(d.x).sub(d.y.mul(d.y)).mul(0.546274)))
+              .toVar();
+            // ⚠ CLAMPED. An order-2 SH reconstruction RINGS — its lobes go
+            // negative wherever the real distribution is sharper than the basis
+            // — and a negative prior is a black seed dressed as data, which is
+            // the exact failure this item exists to remove.
+            probeOct.element(octIdx(u.curBase, probe, t)).assign(vec4(L.max(vec3(0)), seedAlpha));
+          });
+        });
+        bumpRaw(STATS.neighbourPrior, tx);
       });
     });
   })().compute(dispatch2d(probeW, probeH), WG);
+
+  // ══════════════════════════════════════════════ SHADER: rayBudget (§P.3)
+  //
+  // ONE THREAD. It reads the need census `probePlace` has just written, decides
+  // what the MATURE share can afford, and publishes it where `probeTrace` can
+  // read it without a seventh binding.
+  //
+  // ⭐ THE FRESH AND FLAGGED SHARES ARE NOT NEGOTIABLE; THE MATURE SHARE IS. A
+  // fresh probe with 8 rays is the black fringe this stage exists to remove, so
+  // when the frame cannot afford everything the rays come out of the probes
+  // that are already converged — down to `RAY_MATURE_MIN`, never to zero,
+  // because a mature probe still has to notice the world changing.
+  //
+  // ⚠ AND THE ANSWER IS ROUNDED DOWN TO A POWER OF TWO. `probeTrace` divides
+  // the 64-texel map into `rays` disjoint windows; an arbitrary quotient makes
+  // the windows overlap, two threads write one texel, and the accumulator takes
+  // a write race that no receipt in this file could show as anything but noise.
+  const rayBudgetPass = Fn(() => {
+    const fresh = float(0).toVar();
+    const flag = float(0).toVar();
+    const mat = float(0).toVar();
+    Loop({ start: 0, end: STAT_STRIPE, name: "lane" }, ({ lane }) => {
+      const a = uint(STAT_NEED.fresh * STAT_STRIPE).add(uint(lane)).toVar();
+      const b = uint(STAT_NEED.flag * STAT_STRIPE).add(uint(lane)).toVar();
+      const c = uint(STAT_NEED.mature * STAT_STRIPE).add(uint(lane)).toVar();
+      fresh.addAssign(atomicLoad(stats.element(a)).toFloat());
+      flag.addAssign(atomicLoad(stats.element(b)).toFloat());
+      mat.addAssign(atomicLoad(stats.element(c)).toFloat());
+      // Consumed. See `STAT_NEED` — the census is per frame whether or not the
+      // caller clears the stats buffer, and this is what makes that true.
+      atomicStore(stats.element(a), uint(0));
+      atomicStore(stats.element(b), uint(0));
+      atomicStore(stats.element(c), uint(0));
+    });
+    const budget = u.probeWU.mul(u.probeHU).toFloat().mul(float(R)).toVar();
+    const spent = fresh.mul(RAY_FRESH).add(flag.mul(RAY_FLAG)).toVar();
+    const each = budget.sub(spent).div(mat.max(1)).toVar();
+    const pow2 = exp2(log2(each.max(1)).floor()).toVar();
+    const out = pow2.clamp(RAY_MATURE_MIN, u.matureRaysU.toFloat()).toUint().toVar();
+    const base = uint(STAT_RAY_BUDGET * STAT_STRIPE).toVar();
+    atomicStore(stats.element(base), out);
+    atomicStore(stats.element(base.add(uint(1))), fresh.toUint());
+    atomicStore(stats.element(base.add(uint(2))), flag.toUint());
+    atomicStore(stats.element(base.add(uint(3))), mat.toUint());
+  })().compute(1);
 
   // ══════════════════════════════════════════════ the shading of one hit
   //
@@ -987,7 +1299,9 @@ export function createGiGather({
   // and the emissive panel (one NEE shadow ray), plus the palette's own
   // emission. No indirect term — multibounce arrives through the cache's EMA
   // and through `injectLitFrame`, which is the point of §K.6.
-  const shadeHit = (p, n, levelF, voxF) => {
+  /** The packed `(face | level<<3 | voxel<<6)` word of a `traceWindow` result. */
+  const zi0 = (raw) => raw.z.toUint();
+  const shadeHit = (p, n, levelF, voxF, seedU = null) => {
     const pi = palIndexAt(levelF, voxF).toVar();
     const pal = palU.element(pi).toVar();
     // ⭐⭐ §19 STAGE 4.0b — THE EMITTER GATE'S DECISION, ALREADY MADE ON THE CPU.
@@ -1019,6 +1333,118 @@ export function createGiGather({
       E.addAssign(u.sunColor.mul(ndl).mul(float(1).sub(sh)));
     });
 
+    // ══ THE SKY, AT THE HIT (§19 Stage 3.7 P.2) ═══════════════════════════
+    //
+    // ⭐⭐ OUTDOORS THE DOMINANT LIGHT ON A SHADED SURFACE **IS** THE SKY, AND
+    // THIS ESTIMATOR DID NOT HAVE IT.
+    //
+    // `shadeHit` was `albedo × (sun × DDA shadow + slot NEE) + emissive`. Every
+    // one of those terms is zero on the shaded side of a Paris street at noon,
+    // so every voxel face the camera cannot see returned BLACK to the ray that
+    // hit it — awning undersides, chair seats, the recesses behind the doors,
+    // the whole north wall — and the second bounce off them was a bounce off
+    // nothing. The user's screenshot is precisely that: near-black chairs under
+    // a bright blue sky. The lattice this design replaced carried sky in every
+    // bin; the cache dropped it on the floor.
+    //
+    // ONE cosine-weighted ray per shade sample. Its estimator is `L(ω)·π` —
+    // the pdf of a cosine hemisphere sample is `cosθ/π`, so the weight cancels
+    // the cosine and leaves π — which is an irradiance in the same units as
+    // the sun term above (`L·cosθ`) and the slot term below (`L·Ω·cosθ`), so
+    // the three add. A single sample is a wide estimate; that is what §P.1's
+    // running mean is for, and the two items only work together.
+    //
+    // ⭐ AND A HIT IS NOT A MISS. A ray that lands on geometry returns THAT
+    // face's cached radiance, which makes this the SECOND BOUNCE — free, in
+    // the same ray, with no extra trace: a wall lit by the sky lights the
+    // chair in front of it as soon as the wall's own face has a sample. An
+    // unwritten face returns zero rather than the sky, because "no data" is
+    // not "open to the sky" and treating it as such is the leak §L.2's
+    // freshness sentinel exists to prevent.
+    if (seedU) If(u.skyAtHit.greaterThan(0.5), () => {
+      // A tangent frame from the face normal. Branchless (Duff et al.): the
+      // sign trick has no degenerate axis, which a `cross` with a fixed up
+      // vector has exactly where a face normal most often points.
+      const sgn = select(n.z.greaterThanEqual(0), float(1), float(-1)).toVar();
+      const a0 = float(-1).div(sgn.add(n.z)).toVar();
+      const b0 = n.x.mul(n.y).mul(a0).toVar();
+      const t1 = vec3(float(1).add(sgn.mul(n.x).mul(n.x).mul(a0)), sgn.mul(b0), sgn.negate().mul(n.x)).toVar();
+      const t2 = vec3(b0, sgn.add(n.y.mul(n.y).mul(a0)), n.y.negate()).toVar();
+      // ⭐ FOUR RAYS, 2x2-STRATIFIED, IN A LOOP — AND THE LOOP IS THE POINT.
+      //
+      // ONE cosine sample of a shaded facade's hemisphere is a coin flip: at
+      // ~40 % sky visibility the estimate is either `pi*L_sky` or `pi*(bounce)`
+      // and its relative sigma is about 100 %. Measured on Bistro with one ray:
+      // the cache's spread across the 64 voxel faces of a facade brick settled
+      // at 42 %, which is still the dirt. `SKY_RAYS` samples cut it by the
+      // square root, and stratifying `(r1, r2)` over a 2x2 grid cuts it further
+      // — the two halves of the hemisphere that differ most (up toward the sky,
+      // down toward the street) are then guaranteed one sample each rather than
+      // being sampled at random.
+      //
+      // ⚠ FOUR RAYS INSIDE A `Loop`, NOT FOUR CALL SITES. Compile time is the
+      // binding constraint on this kernel — `probeTrace` is 55 kB of WGSL and
+      // the slowest pipeline of the boot, and first light is gated on it — so
+      // extra samples must not be extra TEXT. `traceWindow` is a `sharedFn`
+      // (one WGSL function, called), so a loop around it costs four iterations
+      // at runtime and zero additional shader bytes.
+      //
+      // And it is the right place to spend: four sky rays at `p_shade = 1/4`
+      // buy the same variance reduction as one sky ray at `p_shade = 1`, for a
+      // third of the cost, because the sun ray and the four NEE rays are paid
+      // ONCE per shade sample instead of four times.
+      const acc = vec3(0).toVar();
+      Loop({ start: 0, end: SKY_RAYS, name: "skyRay" }, ({ skyRay }) => {
+        // ⚠ `skyRay` IS A NODE, NOT A JS NUMBER. The first cut of this loop did
+        // `skyRay % SKY_STRATA` and `skyRay * 0x9e3779b9` in JavaScript; both
+        // produced NaN, the NaN went into the cache through `encodeRgbe`, and
+        // the whole gather went dark — `0 rays traced`, `transport dead`, a
+        // 286-second pipeline. Every arithmetic on a loop variable is node
+        // arithmetic, which is why every other `Loop` in this file opens with
+        // `uint(<var>)`.
+        const k = uint(skyRay).toVar();
+        const u1 = rand01(seedU.add(k.mul(uint(0x9e3779b9)))).toVar();
+        const u2 = rand01(seedU.add(k.mul(uint(0x85ebca6b))).add(uint(1))).toVar();
+        const sx = bitAnd(k, uint(SKY_STRATA - 1)).toFloat().toVar();
+        const sy = shiftRight(k, uint(Math.log2(SKY_STRATA))).toFloat().toVar();
+        const r1 = u1.add(sx).div(SKY_STRATA).toVar();
+        const r2 = u2.add(sy).div(SKY_ROWS).toVar();
+        const rr = sqrt(r1).toVar();
+        const phi = r2.mul(2 * Math.PI).toVar();
+        const sd = normalize(t1.mul(rr.mul(phi.cos()))
+          .add(t2.mul(rr.mul(phi.sin())))
+          .add(n.mul(sqrt(float(1).sub(r1).max(0))))).toVar();
+        const sr = traceWindow(p, sd, float(RAY_MAX), n).raw.toVar();
+        If(sr.x.greaterThan(0.5), () => {
+          const hlv = bitAnd(shiftRight(zi0(sr), uint(3)), uint(7)).toFloat().toVar();
+          const hvx = shiftRight(zi0(sr), uint(6)).toFloat().toVar();
+          const c2 = cache.cacheRead(hlv, hvx, bitAnd(zi0(sr), uint(7)).toFloat()).toVar();
+          // ⭐⭐ THE COSINE RAY MUST NOT RE-COUNT WHAT NEE ALREADY SAMPLED.
+          //
+          // This is the oldest bug in light transport wearing a new hat, and
+          // the Cornell parity caught it the first time it ran: every crop came
+          // back 6-30 % ABOVE the 4-bounce reference and only 3 of 8 sat inside
+          // the [1-bounce, 4-bounce] bracket that had been 8 of 8 since 3.3.
+          // The panel's own light reaches this face by TWO routes now — the
+          // explicit shadow ray below (next-event estimation) and this cosine
+          // ray, which can land on the panel and read back its EMISSION out of
+          // the cache — and both were being added.
+          //
+          // The fix is the standard one and it is exact rather than a weight:
+          // the cosine ray keeps the hit's REFLECTED radiance and drops its
+          // EMITTED part, because emission is the half NEE owns. The emitted
+          // part is the palette's own `palEm` for the hit's class, which is the
+          // same table `shadeHit` adds at the end — so the two halves of the
+          // estimator subtract exactly what the other half added.
+          const hem = palEmU.element(palIndexAt(hlv, hvx)).xyz.toVar();
+          acc.addAssign(c2.xyz.mul(c2.w).sub(hem).max(vec3(0)));
+        }).Else(() => {
+          acc.addAssign(u.skyColor);
+        });
+      });
+      E.addAssign(acc.mul(Math.PI / SKY_RAYS));
+    });
+
     // ══ THE EMITTER SLOTS, AT THE HIT (§19 Stage 3.5) ═════════════════════
     //
     // Stage 3.4 lit a ray hit from the sun and the palette's own emission and
@@ -1046,14 +1472,31 @@ export function createGiGather({
     // re-shade (`STATS.freshShades`, ~10² per frame measured), and it is
     // `MAX_EMITTERS` rays there, gated on the slot being active and the
     // surface facing it.
-    for (const slot of emitters ?? []) {
+    // ⭐ ONE SLOT PER SHADE SAMPLE, PICKED AT RANDOM AND WEIGHTED BY THE COUNT
+    // (§19 Stage 3.7 P.1).
+    //
+    // Every slot used to be sampled on every shade, because a shade happened
+    // ONCE and a single unlucky estimate was kept forever — determinism was the
+    // only defence. Under a running mean it is the wrong trade: `N` slots at
+    // every sample costs `N` shadow rays for a variance that the accumulator
+    // would have removed anyway, and the rays are the entire cost of §P.1.
+    // Sampling ONE slot uniformly and multiplying by `N` is unbiased by
+    // construction (`E[N·f(k)] = Σf(k)`, and an inactive slot contributes zero
+    // to both sides), converges to the same value, and turns four shadow rays
+    // per shade into one — which is what buys §P.2's four sky rays.
+    const slotN = (emitters ?? []).length;
+    const slotPick = slotN > 1 && seedU
+      ? rand01(seedU.add(uint(0x51ed270b))).mul(slotN).floor().min(slotN - 1).toUint().toVar()
+      : null;
+    for (const [slotIdx, slot] of (emitters ?? []).entries()) {
       const centre = vec3(slot.center).toVar();
       const reff = float(slot.reff).max(1e-3).toVar();
-      const rgb = vec3(slot.color).toVar();
+      const rgb = vec3(slot.color).mul(slotPick ? slotN : 1).toVar();
       // `radius` is the bounding sphere and doubles as the ACTIVE gate —
       // `#refreshEmitterSlots` zeroes a retired slot's radius.
-      const active = float(slot.radius).greaterThan(1e-5)
+      let active = float(slot.radius).greaterThan(1e-5)
         .and(rgb.x.add(rgb.y).add(rgb.z).greaterThan(1e-6));
+      if (slotPick) active = active.and(slotPick.equal(uint(slotIdx)));
       If(active, () => {
         const wv = centre.sub(p).toVar();
         const d2 = dot(wv, wv).max(1e-4).toVar();
@@ -1129,8 +1572,18 @@ export function createGiGather({
       // between them. Half a cell of margin on top absorbs the escape.
       const pRay = p.add(n.mul(v0 * 0.5)).toVar();
       const yStop = u.panelCentre.y.div(v0).floor().mul(v0).sub(v0 * 0.5).toVar();
+      // ⭐ ONE OF THE FOUR STRATA PER SHADE SAMPLE (§19 Stage 3.7 P.1), for the
+      // reason the slot loop above gives at length: the deterministic 2×2 was
+      // Stage 3.5's defence against a one-shot estimate that could not be
+      // unlucky twice, and a running mean is a better defence for a quarter of
+      // the rays. The strata are still ENUMERATED (so the estimate stays a
+      // stratified one over samples, not a uniform one), just one at a time.
+      const stratum = seedU
+        ? rand01(seedU.add(uint(0x27d4eb2f))).mul(4).floor().min(3).toUint().toVar()
+        : null;
       for (let sy = 0; sy < 2; sy++) {
         for (let sx = 0; sx < 2; sx++) {
+          const takeIt = stratum ? stratum.equal(uint(sy * 2 + sx)) : null;
           const q = vec3(
             u.panelCentre.x.add(u.panelHalf.x.mul(sx ? 0.5 : -0.5)),
             u.panelCentre.y,
@@ -1143,11 +1596,13 @@ export function createGiGather({
           const cosX = dot(n, wd).max(0).toVar();
           // The panel faces −Y, so its own cosine toward `p` is `wd.y`.
           const cosP = wd.y.max(0).toVar();
-          If(cosX.mul(cosP).greaterThan(1e-5), () => {
+          const want = takeIt ? takeIt.and(cosX.mul(cosP).greaterThan(1e-5))
+            : cosX.mul(cosP).greaterThan(1e-5);
+          If(want, () => {
             const tStop = yStop.sub(pRay.y).div(wd.y.max(1e-3)).min(d).max(0.05).toVar();
             const vis = float(1).sub(traceWindow(p, wd, tStop, n).hit).toVar();
             E.addAssign(u.panelRadiance.mul(cosX).mul(cosP)
-              .mul(u.panelArea.mul(0.25)).div(d2).mul(vis));
+              .mul(u.panelArea.mul(takeIt ? 1 : 0.25)).div(d2).mul(vis));
           });
         }
       }
@@ -1247,10 +1702,35 @@ export function createGiGather({
   const probeTracePass = Fn(() => {
     const xr = globalId.x.toVar();
     const ty = globalId.y.toVar();
-    If(xr.greaterThanEqual(u.probeWU.mul(uint(R))).or(ty.greaterThanEqual(u.probeHU)), () => { Return(); });
-    const tx = xr.div(uint(R)).toVar();
-    const kRay = xr.sub(tx.mul(uint(R))).toVar();
+    // ⭐ THE DISPATCH IS ONE THREAD PER OCT TEXEL NOW, NOT PER RAY (§P.3).
+    //
+    // A per-probe ray count needs either a prefix sum over the probe grid (a
+    // second kernel, a second buffer, and a scatter that breaks the texel-major
+    // layout's coalescing) or a fixed block that early-outs. §P.3 asked for
+    // both to be measured; the block form is what ships, because the early-out
+    // costs ONE vec4 read — `probeMeta` slot 2, which the eight lanes of a
+    // warp-row read from the same address — before it returns, against a prefix
+    // pass that would have to run every frame whether or not the allocation
+    // changed. The threads that survive are the frame's real ray budget.
+    If(xr.greaterThanEqual(u.probeWU.mul(uint(RAY_FRESH))).or(ty.greaterThanEqual(u.probeHU)),
+      () => { Return(); });
+    const tx = xr.div(uint(RAY_FRESH)).toVar();
+    const kRay = xr.sub(tx.mul(uint(RAY_FRESH))).toVar();
     const probe = ty.mul(u.probeWU).add(tx).toVar();
+
+    // ── §P.3: how many rays does THIS probe get? ──────────────────────────
+    // `probePlace` wrote the class; `rayBudget` wrote the mature share. Both
+    // are the SAME FRAME's, and both are read before anything else so a thread
+    // that has no ray to trace leaves having touched 16 bytes.
+    const mc = probeMeta.element(metaIdx(u.curBase, probe, 2)).toVar();
+    const matureR = atomicLoad(stats.element(uint(STAT_RAY_BUDGET * STAT_STRIPE)))
+      .max(uint(RAY_MATURE_MIN)).min(uint(OCT)).toVar();
+    const cls = mc.z.toVar();
+    const raysU = select(u.needRays.greaterThan(0.5),
+      select(cls.greaterThan(CLS_FLAG + 0.5), uint(RAY_FRESH),
+        select(cls.greaterThan(CLS_MATURE + 0.5), uint(RAY_FLAG), matureR)),
+      uint(R)).toVar();
+    If(kRay.greaterThanEqual(raysU), () => { Return(); });
     bump(STATS.raysLaunched, xr);
 
     const ma = probeMeta.element(metaIdx(u.curBase, probe, 0)).toVar();
@@ -1259,14 +1739,20 @@ export function createGiGather({
     const pos = ma.xyz.toVar();
     const nrm = mb.xyz.toVar();
 
-    // ── the thread's texel window (§L bend 2) ──────────────────────────────
+    // ── the thread's texel window (§L bend 2, now a RUNTIME width) ─────────
+    //
+    // ⚠ THE WINDOWS MUST STAY DISJOINT OR TWO THREADS WRITE ONE TEXEL. That is
+    // why `rayBudget` hands back a POWER OF TWO and never an arbitrary
+    // quotient: `OCT / rays` is then exact, the windows tile the map, and the
+    // no-write-race property bend 2 relies on survives a per-probe count.
+    const strideU = uint(OCT).div(raysU).max(uint(1)).toVar();
     const rot = pcg(u.frame.mul(uint(2654435761)).add(probe)).toVar();
     const seedBase = pcg(probe.mul(uint(196613)).add(u.frame.mul(uint(83492791)))).toVar();
     const texel = int(-1).toVar();
     const dir = vec3(0, 1, 0).toVar();
-    Loop({ start: 0, end: STRIDE, name: "pick" }, ({ pick }) => {
-      If(texel.greaterThanEqual(0), () => { Break(); });
-      const t = bitAnd(kRay.mul(uint(STRIDE)).add(uint(pick)).add(rot), uint(OCT - 1)).toVar();
+    Loop({ start: 0, end: PICK_MAX, name: "pick" }, ({ pick }) => {
+      If(uint(pick).greaterThanEqual(strideU).or(texel.greaterThanEqual(0)), () => { Break(); });
+      const t = bitAnd(kRay.mul(strideU).add(uint(pick)).add(rot), uint(OCT - 1)).toVar();
       const tu = bitAnd(t, uint(O - 1)).toFloat().toVar();
       const tv = shiftRight(t, uint(OCT_SHIFT)).toFloat().toVar();
       const jx = rand01(seedBase.add(t.mul(uint(7919)))).toVar();
@@ -1337,10 +1823,28 @@ export function createGiGather({
         const hn = normalOfFace(faceF).toVar();
         const hp = faceSamplePoint(levelF, voxF, hn).toVar();
         const c = cache.cacheRead(levelF, voxF, faceF).toVar();
-        If(c.w.greaterThan(0.5), () => {
-          rad.assign(c.xyz);
-        }).Else(() => {
-          const s = shadeHit(hp, hn, levelF, voxF).toVar();
+        // ⭐⭐ §19 STAGE 3.7 P.1 — A HIT MAY RE-SHADE, AND THE RAY STILL CARRIES
+        // THE CACHED VALUE.
+        //
+        // Two different questions get two different answers here, and conflating
+        // them would undo 3.6. What the CACHE needs is another sample, so it can
+        // stop being a single Monte-Carlo draw kept forever. What the RAY needs
+        // is the best estimate of this face's radiance, which is the running
+        // mean the cache already holds — NOT the noisy sample just drawn. So the
+        // re-shade feeds the cache and the ray reads the cache; only a face that
+        // has never been shaded returns its own fresh sample, because there is
+        // nothing else to return. Returning the sample would have pumped the
+        // shade estimator's variance straight into the probe atlas, which is the
+        // closed loop `injectPass`'s glossy note describes from the other side.
+        const fresh = c.w.lessThan(0.5).toVar();
+        // Seeded from the VOXEL, the probe and the frame: two rays hitting the
+        // same face in one frame must not roll the same die (they would both
+        // re-shade or neither), and the same face across frames must not either.
+        const shadeSeed = pcg(seedBase.add(zi.mul(uint(2654435761)))).toVar();
+        const roll = rand01(shadeSeed).toVar();
+        rad.assign(c.xyz);
+        If(fresh.or(roll.lessThan(u.shadeProb)), () => {
+          const s = shadeHit(hp, hn, levelF, voxF, shadeSeed).toVar();
           // TSL: `.toVar()` IS LOAD-BEARING, NOT STYLE. A function call whose
           // result nothing consumes is never built into the shader: the node
           // graph is walked from its outputs, and an unused call node has no
@@ -1351,9 +1855,11 @@ export function createGiGather({
           // 2026-08-27: 614 bricks owned a slot and 0 of 239 872 slot words
           // carried radiance. Anything called for its SIDE EFFECT has to be
           // pinned to the stack.
-          cache.cacheWrite(levelF, voxF, faceF, s, 1).toVar();
-          rad.assign(s);
-          bump(STATS.freshShades, xr);
+          cache.cacheAccum(levelF, voxF, faceF, s, u.nCapU).toVar();
+          If(fresh, () => {
+            rad.assign(s);
+            bump(STATS.freshShades, xr);
+          }).Else(() => { bump(STATS.reShades, xr); });
         });
         hitDist.assign(r.y);
         bump(STATS.windowHits, xr);
@@ -1455,7 +1961,7 @@ export function createGiGather({
       mix(old.xyz, rad, a),
       nNext.mul(PACK_N).add(distQNext.mul(PACK_D)).add(sigQNext),
     ));
-  })().compute(dispatch2d(probeW * R, probeH), WG);
+  })().compute(dispatch2d(probeW * RAY_FRESH, probeH), WG);
 
   // ══════════════════════════════════════ SHADER: probeFilter, part 1 (§L.4)
   //
@@ -2195,6 +2701,13 @@ export function createGiGather({
     }
     const here = dot(irrNode.load(ivec2(px.toInt(), py.toInt())).xyz, LUMA).toVar();
     noiseBuf.element(gy.mul(u.halfWU).add(gx)).assign(vec4(here, box.div(25), edge, g.w));
+    // §19 Stage 3.7 P.5's geometry, in its own buffer: the view depth (the CPU
+    // divides by `projScale` to get a metre's size in pixels HERE), the normal's
+    // Y (façade against pavement) and the world height. Everything the dirty
+    // receipt needs to turn a pixel into a PLACE, and nothing the temporal
+    // receipt has to read back thirty times an arm.
+    const clipW = u.viewProj.mul(vec4(g.xyz, 1)).w.toVar();
+    dirtyBuf.element(gy.mul(u.halfWU).add(gx)).assign(vec4(clipW, n0.y, g.y, g.w));
   })().compute(dispatch2d(halfW, halfH), WG);
 
   // ══════════════════════════════════════════════ SHADER: shadeHit, exposed
@@ -2237,7 +2750,10 @@ export function createGiGather({
     const vis = float(1).sub(traceWindow(p, wd, tStop, n).hit).toVar();
     const Ecentre = u.panelRadiance.mul(cosX).mul(cosP).mul(u.panelArea).div(d2).mul(vis).toVar();
 
-    const shaded = shadeHit(p, n, levelF, voxF).toVar();
+    // A seed, so this microscope sees the SHIPPING estimator — the sky term and
+    // the stochastic NEE both key off it, and without one this pass would
+    // report a `shadeHit` that no ray ever computes.
+    const shaded = shadeHit(p, n, levelF, voxF, pcg(i.add(uint(12345)))).toVar();
     shadeOut.element(i.mul(uint(4))).assign(vec4(pal.xyz, pal.w));
     shadeOut.element(i.mul(uint(4)).add(uint(1))).assign(vec4(ndl, sunSh, cosX, cosP));
     shadeOut.element(i.mul(uint(4)).add(uint(2))).assign(vec4(d, tStop, vis, Ecentre.x));
@@ -2267,10 +2783,24 @@ export function createGiGather({
   const exhaustProbePass = Fn(() => {
     const xr = globalId.x.toVar();
     const ty = globalId.y.toVar();
-    If(xr.greaterThanEqual(u.probeWU.mul(uint(R))).or(ty.greaterThanEqual(u.probeHU)), () => { Return(); });
-    const tx = xr.div(uint(R)).toVar();
-    const kRay = xr.sub(tx.mul(uint(R))).toVar();
+    If(xr.greaterThanEqual(u.probeWU.mul(uint(RAY_FRESH))).or(ty.greaterThanEqual(u.probeHU)),
+      () => { Return(); });
+    const tx = xr.div(uint(RAY_FRESH)).toVar();
+    const kRay = xr.sub(tx.mul(uint(RAY_FRESH))).toVar();
     const probe = ty.mul(u.probeWU).add(tx).toVar();
+    // §19 Stage 3.7: the SAME per-probe allocation `probeTrace` uses. "It is
+    // the same ray and not a similar one" only stays true if the ray COUNT is
+    // the same too — a thread that `probeTrace` never launched has no ray to
+    // be diagnosed.
+    const emc = probeMeta.element(metaIdx(u.curBase, probe, 2)).toVar();
+    const ematR = atomicLoad(stats.element(uint(STAT_RAY_BUDGET * STAT_STRIPE)))
+      .max(uint(RAY_MATURE_MIN)).min(uint(OCT)).toVar();
+    const eRays = select(u.needRays.greaterThan(0.5),
+      select(emc.z.greaterThan(CLS_FLAG + 0.5), uint(RAY_FRESH),
+        select(emc.z.greaterThan(CLS_MATURE + 0.5), uint(RAY_FLAG), ematR)),
+      uint(R)).toVar();
+    If(kRay.greaterThanEqual(eRays), () => { Return(); });
+    const eStride = uint(OCT).div(eRays).max(uint(1)).toVar();
     const ma = probeMeta.element(metaIdx(u.curBase, probe, 0)).toVar();
     const mb = probeMeta.element(metaIdx(u.curBase, probe, 1)).toVar();
     If(ma.w.lessThan(0.5), () => { Return(); });
@@ -2281,9 +2811,9 @@ export function createGiGather({
     const seedBase = pcg(probe.mul(uint(196613)).add(u.frame.mul(uint(83492791)))).toVar();
     const texel = int(-1).toVar();
     const dir = vec3(0, 1, 0).toVar();
-    Loop({ start: 0, end: STRIDE, name: "epick" }, ({ epick }) => {
-      If(texel.greaterThanEqual(0), () => { Break(); });
-      const t = bitAnd(kRay.mul(uint(STRIDE)).add(uint(epick)).add(rot), uint(OCT - 1)).toVar();
+    Loop({ start: 0, end: PICK_MAX, name: "epick" }, ({ epick }) => {
+      If(uint(epick).greaterThanEqual(eStride).or(texel.greaterThanEqual(0)), () => { Break(); });
+      const t = bitAnd(kRay.mul(eStride).add(uint(epick)).add(rot), uint(OCT - 1)).toVar();
       const tu = bitAnd(t, uint(O - 1)).toFloat().toVar();
       const tv = shiftRight(t, uint(OCT_SHIFT)).toFloat().toVar();
       const jx = rand01(seedBase.add(t.mul(uint(7919)))).toVar();
@@ -2322,7 +2852,7 @@ export function createGiGather({
     exhaustOut.element(base.add(uint(2))).assign(vec4(r.w, rHalf.x, rHalf.y, rHalf.w));
     exhaustOut.element(base.add(uint(3))).assign(vec4(pos.add(dir.mul(RAY_MAX)), r.y));
 
-  })().compute(dispatch2d(probeW * R, probeH), WG);
+  })().compute(dispatch2d(probeW * RAY_FRESH, probeH), WG);
 
   // ══════════════════════════════════════════════ SHADER: cold-start clears
   const clearProbesPass = Fn(() => {
@@ -2368,6 +2898,8 @@ export function createGiGather({
 
   const describe = () => ({
     tier, tile: T, rays: R, oct: O, history: H, stride: STRIDE, sh: USE_SH,
+    metaVec: META_VEC, matureRays: MATURE_RAYS, rayFresh: RAY_FRESH, rayFlag: RAY_FLAG,
+    shadeProb: u.shadeProb.value, nCap: u.nCapU.value, skyRays: SKY_RAYS,
     shRadius: SH_R, packN: PACK_N, packD: PACK_D, distQ: DIST_Q, sigQ: SIG_Q,
     sigMin: SIG_MIN, sigOct: SIG_OCT, rayMax: RAY_MAX,
     width, height, halfW, halfH, probeW, probeH, probeCount,
@@ -2378,6 +2910,7 @@ export function createGiGather({
       probeFiltered: (probeCount * OCT + probeCount * MIP_TEXELS) * 16,
       probeSh: 2 * probeCount * 9 * 16,
       hzb: hzbWords * 4,
+      dirtyBuf: dirtyBuf ? halfW * halfH * 16 : 0,
       litBuf: width * height * 16,
       textures: 3 * width * height * 8 + 2 * halfW * halfH * 8,
     },
@@ -2388,7 +2921,7 @@ export function createGiGather({
     uniforms: u, palette, paletteEmissive, setPalette, beginFrame, get frame() { return frame; },
     buffers: {
       probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf,
-      shadeIn, shadeOut, exhaustOut, noiseBuf,
+      shadeIn, shadeOut, exhaustOut, noiseBuf, dirtyBuf,
     },
     SHADE_SLOTS, EXHAUST_SLOTS, EXH_VEC,
     textures: { irradiance, glossy, lit, irradianceHalf, glossyHalf },
@@ -2396,6 +2929,8 @@ export function createGiGather({
       hzbBuild: hzbBuildPass,
       hzbReduce: hzbReducePasses,
       probePlace: probePlacePass,
+      /** §P.3's one-thread allocator. Between `probePlace` and `probeTrace`. */
+      rayBudget: rayBudgetPass,
       probeTrace: probeTracePass,
       probeFilter: probeFilterPass,
       probeShFilter: probeShFilterPass,
@@ -2436,7 +2971,7 @@ export function createGiGather({
      * injection, and a consumer splices its own passes into a copy.
      */
     frameOrder: [
-      hzbBuildPass, ...hzbReducePasses, probePlacePass, probeTracePass,
+      hzbBuildPass, ...hzbReducePasses, probePlacePass, rayBudgetPass, probeTracePass,
       probeFilterPass, probeShFilterPass, resolveHalfPass, resolveUpsamplePass,
       compositePass, injectPass,
     ],
@@ -2448,6 +2983,13 @@ export function createGiGather({
         for (let j = 0; j < STAT_STRIPE; j++) s += u32[slot * STAT_STRIPE + j];
         out[k] = s;
       }
+      // §19 Stage 3.7's need census — four WORDS, not a stripe, and stored by
+      // `rayBudget` rather than accumulated (see `STAT_RAY_BUDGET`).
+      const b = STAT_RAY_BUDGET * STAT_STRIPE;
+      out.matureRays = u32[b];
+      out.probesFresh = u32[b + 1];
+      out.probesFlag = u32[b + 2];
+      out.probesMature = u32[b + 3];
       return out;
     },
     describe,
