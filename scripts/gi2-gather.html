@@ -1,0 +1,736 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>GI2 gather — screen probes on the window</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}pre{padding:12px;white-space:pre-wrap}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // GI2 STAGE 3.1 — THE GATHER, ON A CORNELL BOX.
+      //
+      // PLAN §5 Stage 3.1's gate is "Cornell: matches the reference render
+      // within the same tolerance the SRC path met; no temporal term outside
+      // probe space". This page produces the numbers that gate is read from,
+      // and every one of them is a RATIO against something computed
+      // independently — a CPU path tracer over the same analytic scene, run in
+      // the node runner, never a threshold this page could be tuned toward.
+      //
+      // THE WORLD is `windowFill.js`'s analytic Cornell room (10×6×10 m
+      // interior, 5 cm walls, a 2 m box, a 1 m sphere) plus one emissive
+      // ceiling panel, voxelized into the §K window. The SAME primitive list
+      // builds the three.js geometry the gbuffer is rendered from, so the
+      // surface the probes trace and the surface the camera sees are the same
+      // surface by construction and not by two descriptions agreeing.
+      //
+      // THE ROOM IS SEALED. That is not an oversight: the sun and the sky are
+      // wired all the way through (uniforms, a DDA shadow ray, a miss colour)
+      // and they contribute ≈ 0 inside, which is what a closed room should do
+      // and what the reference independently computes. The light in every
+      // receipt below is the panel's, arriving through the gather.
+      const out = document.querySelector("#log");
+      const lines = [];
+      const say = (line) => { lines.push(line); out.textContent += line + "\n"; };
+      const fail = (error) => {
+        const message = error?.stack ?? error?.message ?? String(error);
+        say(`FAILED: ${message}`);
+        globalThis.__GI2_GATHER_RESULT__ = { pass: false, error: message, text: lines.join("\n") };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const params = new URLSearchParams(location.search);
+        const TIER = params.get("tier") ?? "high";
+        const W = Number(params.get("w") ?? 960);
+        const Hh = Number(params.get("h") ?? 540);
+        const FRAMES = Number(params.get("frames") ?? 160);
+        const COLD_FRAMES = Number(params.get("cold") ?? 48);
+        const ORBIT_FRAMES = Number(params.get("orbit") ?? 60);
+        const WANT_PNG = params.get("png") !== "0";
+
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const { Fn, cameraPosition, dot, mrt, normalWorld, positionWorld, sign, vec4 } = TSL;
+        const store = await import("/src/modules/gi/window/windowStore.js");
+        const fillMod = await import("/src/modules/gi/window/windowFill.js");
+        const traceMod = await import("/src/modules/gi/window/windowTrace.js");
+        const cacheMod = await import("/src/modules/gi/window/radianceCache.js");
+        const gatherMod = await import("/src/modules/gi/window/gatherProbes.js");
+
+        // ══════════════════════════════════════════════════════════ the scene
+        //
+        // `CORNELL_SCENE` verbatim, plus the panel at palette 0. The fill takes
+        // the MINIMUM palette index in a shared cell, so 0 guarantees the panel
+        // wins any voxel it shares with the ceiling above it.
+        const { CORNELL_SCENE, KIND_BOX, ROOM } = fillMod;
+        const PANEL = { kind: KIND_BOX, min: [-1.5, 2.9, -1.5], max: [1.5, 3.0, 1.5], pal: 0 };
+        const SCENE = [PANEL, ...CORNELL_SCENE];
+        const PANEL_RADIANCE = 8;
+        const PALETTE = [
+          { albedo: [0.78, 0.78, 0.78], emissive: PANEL_RADIANCE }, // 0 ceiling panel
+          { albedo: [0.73, 0.73, 0.73], emissive: 0 }, // 1 floor
+          { albedo: [0.73, 0.73, 0.73], emissive: 0 }, // 2 ceiling
+          { albedo: [0.63, 0.065, 0.05], emissive: 0 }, // 3 −X wall, red
+          { albedo: [0.14, 0.45, 0.091], emissive: 0 }, // 4 +X wall, green
+          { albedo: [0.73, 0.73, 0.73], emissive: 0 }, // 5 −Z wall
+          { albedo: [0.73, 0.73, 0.73], emissive: 0 }, // 6 +Z wall
+          { albedo: [0.73, 0.73, 0.73], emissive: 0 }, // 7 box
+          { albedo: [0.73, 0.73, 0.73], emissive: 0 }, // 8 sphere
+        ];
+        while (PALETTE.length < gatherMod.PAL_ENTRIES) PALETTE.push({ albedo: [0, 0, 0], emissive: 0 });
+        const SUN_DIR = (() => { const d = [0.42, -0.83, 0.36]; const l = Math.hypot(...d); return d.map((v) => v / l); })();
+        const SUN_COLOR = [3.0, 2.9, 2.6];
+        const SKY_COLOR = [0.25, 0.34, 0.5];
+        const PANEL_INFO = {
+          centre: [0, PANEL.min[1], 0],
+          half: [(PANEL.max[0] - PANEL.min[0]) / 2, (PANEL.max[2] - PANEL.min[2]) / 2],
+          radiance: [PANEL_RADIANCE, PANEL_RADIANCE, PANEL_RADIANCE],
+          area: (PANEL.max[0] - PANEL.min[0]) * (PANEL.max[2] - PANEL.min[2]),
+        };
+
+        // ══════════════════════════════════════════════════════════ renderer
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view"), trackTimestamp: true });
+        await renderer.init();
+        if (renderer.backend?.isWebGPUBackend !== true) throw new Error("not a WebGPU backend");
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (e) => {
+          validationErrors.push(e.error?.message ?? String(e.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+        const timestamps = renderer.backend.trackTimestamp === true;
+        const storageLimit = device.limits.maxStorageBuffersPerShaderStage;
+
+        // ══════════════════════════════════════════════════════ window + gather
+        const win = store.createGiWindow(TIER, { dynamic: false });
+        const fill = fillMod.createWindowFill(win, { scene: SCENE });
+        const trace = traceMod.createWindowTrace(win, { dynamic: false });
+        const cache = cacheMod.createRadianceCache(win);
+
+        // ── the gbuffer (a minimal MRT of our own) ─────────────────────────
+        //
+        // `giScreen.createGiGBuffer` has the right SHAPE, but importing it
+        // drags `giLight`, `rayHitTSL`, `bvhScene` and `reflectionProbes` into
+        // a page that needs two attachments and one override material. So the
+        // shape is reproduced here and nothing else is loaded: RGBA32F world
+        // position with w = "geometry here", RGBA16F world normal, a depth
+        // buffer for correct occlusion.
+        const gbufferRt = new THREE.RenderTarget(W, Hh, {
+          count: 2, depthBuffer: true, stencilBuffer: false, generateMipmaps: false,
+          minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+        });
+        gbufferRt.textures[0].type = THREE.FloatType;
+        gbufferRt.textures[0].name = "output";
+        gbufferRt.textures[1].type = THREE.HalfFloatType;
+        gbufferRt.textures[1].name = "giNormal";
+        const gbufferMat = new THREE.MeshBasicNodeMaterial();
+        gbufferMat.name = "gi2 gbuffer";
+        gbufferMat.lights = false;
+        // FACE THE VIEWER. The wall slabs' inner faces already carry the right
+        // outward normal, but a sliver seen from behind would otherwise write
+        // an inverted normal — and every consumer (the probe hemisphere, the
+        // injection's face id, the resolve's plane test) reads that normal as
+        // "which way this surface looks".
+        const nFace = normalWorld.mul(sign(dot(normalWorld, cameraPosition.sub(positionWorld))));
+        const gbufferMrt = mrt({ output: vec4(positionWorld, 1), giNormal: vec4(nFace, 0) });
+
+        const gather = gatherMod.createGiGather({
+          win, trace, cache,
+          positionTexture: gbufferRt.textures[0],
+          normalTexture: gbufferRt.textures[1],
+          width: W, height: Hh, tier: TIER, crops: 8,
+        });
+        gather.setPalette(PALETTE);
+        const gu = gather.uniforms;
+        gu.sunDir.value.set(...SUN_DIR);
+        gu.sunColor.value.set(...SUN_COLOR);
+        gu.skyColor.value.set(...SKY_COLOR);
+        gu.panelCentre.value.set(...PANEL_INFO.centre);
+        gu.panelHalf.value.set(...PANEL_INFO.half);
+        gu.panelRadiance.value.set(...PANEL_INFO.radiance);
+        gu.panelArea.value = PANEL_INFO.area;
+
+        const wd = win.describe();
+        const cd = cache.describe();
+        const gd = gather.describe();
+        say(`tier ${TIER}: window ${wd.levels}×64³ @ ${wd.voxel0} m = ${wd.totalMB} MB; ` +
+          `cache ${cd.bricks} bricks × ${cd.slotBytes} B = ${cd.totalMB} MB`);
+        say(`gather: ${gd.width}×${gd.height}, tile ${gd.tile} → ${gd.probeW}×${gd.probeH} = ${gd.probeCount} probes, ` +
+          `${gd.rays} rays/probe/frame over an ${gd.oct}×${gd.oct} oct map (stride ${gd.stride}), H=${gd.history}, ` +
+          `resolve=${gd.sh ? "SH2" : "oct sum"}`);
+        say(`gather buffers: ${Object.entries(gd.bytes).map(([k, v]) => `${k} ${(v / 1048576).toFixed(2)}MB`).join(", ")}`);
+
+        // ══════════════════════════════════════════════════════ three.js scene
+        const scene = new THREE.Scene();
+        const mkMesh = (p) => {
+          let geo;
+          if (p.kind === KIND_BOX) {
+            geo = new THREE.BoxGeometry(p.max[0] - p.min[0], p.max[1] - p.min[1], p.max[2] - p.min[2]);
+            geo.translate((p.min[0] + p.max[0]) / 2, (p.min[1] + p.max[1]) / 2, (p.min[2] + p.max[2]) / 2);
+          } else {
+            const r = (p.max[0] - p.min[0]) / 2;
+            geo = new THREE.SphereGeometry(r, 48, 32);
+            geo.translate((p.min[0] + p.max[0]) / 2, (p.min[1] + p.max[1]) / 2, (p.min[2] + p.max[2]) / 2);
+          }
+          const m = new THREE.Mesh(geo, new THREE.MeshBasicNodeMaterial());
+          m.frustumCulled = false;
+          return m;
+        };
+        for (const p of SCENE) scene.add(mkMesh(p));
+
+        const VFOV = 80;
+        const camera = new THREE.PerspectiveCamera(VFOV, W / Hh, 0.05, 120);
+        const projScale = (Hh / 2) / Math.tan((VFOV * Math.PI) / 360);
+        gu.projScale.value = projScale;
+
+        const CAM_EYE = [0, -0.5, 4.8];
+        const CAM_IN = { eye: CAM_EYE, at: [0, -0.6, 0] }; // the panel is in frame
+        const CAM_OUT = { eye: CAM_EYE, at: [0, -2.8, 0] }; // pitched down, panel gone
+        const setCam = (c) => {
+          camera.position.set(...c.eye);
+          camera.lookAt(...c.at);
+          camera.updateMatrixWorld(true);
+          camera.updateProjectionMatrix();
+        };
+
+        const vp = new THREE.Matrix4();
+        const prevVp = new THREE.Matrix4();
+        const project = (p) => {
+          const v = new THREE.Vector3(...p).applyMatrix4(vp);
+          return { x: (v.x * 0.5 + 0.5) * W, y: (1 - (v.y * 0.5 + 0.5)) * Hh };
+        };
+        const onScreen = (q) => q.x >= 0 && q.x < W && q.y >= 0 && q.y < Hh;
+
+        // ══════════════════════════════════════════════════════ the frame
+        const compute = (p) => renderer.computeAsync(p);
+        const renderGbuffer = async () => {
+          const prevTarget = renderer.getRenderTarget();
+          const prevMRT = renderer.getMRT();
+          scene.overrideMaterial = gbufferMat;
+          renderer.setMRT(gbufferMrt);
+          renderer.setRenderTarget(gbufferRt);
+          renderer.setClearColor(0x000000, 0);
+          await renderer.renderAsync(scene, camera);
+          renderer.setRenderTarget(prevTarget);
+          renderer.setMRT(prevMRT);
+          scene.overrideMaterial = null;
+        };
+
+        let placedAt = null;
+        let lastRefilled = false;
+        const placeWindow = async (force = false) => {
+          lastRefilled = false;
+          const p = [camera.position.x, camera.position.y, camera.position.z];
+          if (!force && placedAt && p.every((v, i) => Math.abs(v - placedAt[i]) < 1e-6)) return false;
+          const receipt = win.setCamera(p);
+          placedAt = p;
+          if (!receipt.scrolled && !force) return false;
+          lastRefilled = true;
+          await compute(win.statsResetPass);
+          await compute(win.scrollPass);
+          await compute(win.clearStaticPass);
+          await compute(fill.pass);
+          await compute(cache.allocPass);
+          return true;
+        };
+
+        const frameChain = (statsOn) => {
+          gu.statsOn.value = statsOn ? 1 : 0;
+        };
+
+        const runFrame = async (n) => {
+          gather.beginFrame(n);
+          camera.updateMatrixWorld(true);
+          vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+          gu.prevViewProj.value.copy(n === 0 ? vp : prevVp);
+          gu.viewProj.value.copy(vp);
+          gu.camPos.value.copy(camera.position);
+          await placeWindow();
+          await renderGbuffer();
+          await compute(gather.passes.hzbBuild);
+          for (const p of gather.passes.hzbReduce) await compute(p);
+          await compute(gather.passes.probePlace);
+          await compute(gather.passes.probeTrace);
+          await compute(gather.passes.probeFilter);
+          await compute(gather.passes.resolve);
+          await compute(gather.passes.composite);
+          await compute(gather.passes.inject);
+          prevVp.copy(vp);
+        };
+
+        // ── crop plumbing ─────────────────────────────────────────────────
+        const CROPS = [
+          { name: "redWall", p: [-4.99, -0.5, -1.0] },
+          { name: "greenWall", p: [4.99, -0.5, -1.0] },
+          { name: "floorCentre", p: [0, -2.99, 1.0] },
+          { name: "floorSpot", p: [0, -2.99, 0.0] },
+          { name: "floorRed", p: [-4.2, -2.99, 0.0] },
+          { name: "floorGreen", p: [4.2, -2.99, 0.0] },
+          { name: "boxTop", p: [-2.0, -0.99, -1.5] },
+          { name: "sphere", p: [2.0, -2.4, 1.9] },
+        ];
+        const cropArr = gather.buffers.cropIn.value.array;
+        const writeCrops = () => {
+          const meta = [];
+          CROPS.forEach((c, i) => {
+            const q = project(c.p);
+            cropArr[i * 4] = Math.round(q.x);
+            cropArr[i * 4 + 1] = Math.round(q.y);
+            cropArr[i * 4 + 2] = 0;
+            cropArr[i * 4 + 3] = 0;
+            meta.push({ name: c.name, want: c.p, px: Math.round(q.x), py: Math.round(q.y), onScreen: onScreen(q) });
+          });
+          gather.buffers.cropIn.value.needsUpdate = true;
+          return meta;
+        };
+        const readCrops = async () => {
+          await compute(gather.passes.crop);
+          const f = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.cropOut.value));
+          return CROPS.map((c, i) => {
+            const b = i * 6 * 4;
+            return {
+              name: c.name,
+              pos: [f[b], f[b + 1], f[b + 2]], samples: f[b + 3],
+              nrm: [f[b + 4], f[b + 5], f[b + 6]],
+              irr: [f[b + 8], f[b + 9], f[b + 10]],
+              glossy: [f[b + 12], f[b + 13], f[b + 14]],
+              lit: [f[b + 16], f[b + 17], f[b + 18]],
+              albedo: [f[b + 20], f[b + 21], f[b + 22]], emissive: f[b + 23],
+            };
+          });
+        };
+        const readStats = async () => gather.readStats(
+          new Uint32Array(await renderer.getArrayBufferAsync(gather.buffers.statsBuf.value)),
+        );
+        const lum = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+
+        /**
+         * What the cache actually holds — the colour-probe method applied to a
+         * buffer: count the map entries that own a slot and the slot words that
+         * carry radiance, so "the cache is not working" can never be a theory
+         * about which of the two halves is broken.
+         */
+        const cacheHealth = async () => {
+          const u32 = new Uint32Array(await renderer.getArrayBufferAsync(cache.attribute));
+          let mapped = 0;
+          for (let i = 0; i < win.levels * 4096; i++) if (u32[cache.MAP_OFF + i]) mapped++;
+          let written = 0;
+          const scan = Math.min(cache.DATA_OFF + mapped * 384 + 4096, cache.MAP_OFF);
+          for (let i = cache.DATA_OFF; i < scan; i++) if (u32[i]) written++;
+          return { ...cache.readControl(u32), mapped, writtenWords: written, scanned: scan };
+        };
+
+        const results = {
+          tier: TIER, width: W, height: Hh, storageLimit, timestamps,
+          window: wd, cacheDesc: cd, gather: gd,
+          scene: SCENE, palette: PALETTE,
+          light: { sunDir: SUN_DIR, sunColor: SUN_COLOR, sky: SKY_COLOR, panel: PANEL_INFO, panelBox: PANEL },
+          room: ROOM,
+        };
+
+        // ══════════════════════════════════════════ cold start + first light
+        setCam(CAM_IN);
+        await placeWindow(true);
+        await compute(cache.clearPass);
+        await compute(cache.allocPass);
+        await compute(gather.passes.clearProbes);
+        await compute(gather.passes.clearMeta);
+        await compute(gather.passes.clearStats);
+        frameChain(true);
+
+        {
+          const buf = new Uint32Array(await renderer.getArrayBufferAsync(win.attribute));
+          let occ = 0;
+          for (let l = 0; l < win.levels; l++) {
+            const base = l * store.LEVEL_WORDS + store.OCC_OFF;
+            for (let w = 0; w < store.OCC_WORDS; w++) { let v = buf[base + w]; while (v) { occ += v & 1; v >>>= 1; } }
+          }
+          const ctl = await cacheHealth();
+          say(`fill: ${occ} occupied voxels; cache slots allocated ${ctl.allocated} (overflow ${ctl.overflow}), ` +
+            `map entries owning a slot ${ctl.mapped}`);
+          results.fill = { occupiedVoxels: occ, cache: ctl };
+          if (occ < 1000) throw new Error(`the fill produced ${occ} occupied voxels — the window is empty`);
+          if (ctl.allocated < 100) throw new Error(`the cache allocated ${ctl.allocated} slots — no brick reads BUILT`);
+        }
+
+        // A sanity check the receipts below all depend on: the projection this
+        // page uses to place crops must agree with the gbuffer the kernels
+        // read. Project a known world point, sample the gbuffer there, and
+        // require the world position that comes back to be the point — this is
+        // the screen-Y sign error that has cost this project a session before.
+        await runFrame(0);
+        {
+          const meta = writeCrops();
+          const c = await readCrops();
+          const probe = c.find((x) => x.name === "floorCentre");
+          const wantP = CROPS.find((x) => x.name === "floorCentre").p;
+          const err = Math.hypot(probe.pos[0] - wantP[0], probe.pos[1] - wantP[1], probe.pos[2] - wantP[2]);
+          say(`projection sanity: floorCentre wants ${wantP.map((v) => v.toFixed(2))}, gbuffer at that pixel is ` +
+            `${probe.pos.map((v) => v.toFixed(2))} (err ${err.toFixed(3)} m)`);
+          results.projectionSanity = { want: wantP, got: probe.pos, err, crops: meta };
+          if (!(err < 0.35)) throw new Error(`the crop pixel does not land on its world point (err ${err.toFixed(3)} m) — projection or row order is wrong`);
+        }
+
+        // ── time to first light ───────────────────────────────────────────
+        const firstLight = { series: [] };
+        for (let n = 1; n <= COLD_FRAMES; n++) {
+          await runFrame(n);
+          if (n % 2 === 0 || n <= 8) {
+            writeCrops();
+            const c = await readCrops();
+            firstLight.series.push({ frame: n, floorSpot: lum(c.find((x) => x.name === "floorSpot").irr) });
+          }
+        }
+        // Converge, then look back for the crossing.
+        for (let n = COLD_FRAMES + 1; n <= FRAMES; n++) await runFrame(n);
+        writeCrops();
+        const converged = await readCrops();
+        const convergedFloor = lum(converged.find((x) => x.name === "floorSpot").irr);
+        firstLight.converged = convergedFloor;
+        firstLight.frame = firstLight.series.find((s) => s.floorSpot > 0.5 * convergedFloor)?.frame ?? null;
+        // 50 % is reached almost immediately because §L.4's 3×3 filter pools
+        // nine probes whose texel ROTATIONS differ, so a probe's map is largely
+        // covered after one frame even though it traced 16 of 64 directions.
+        // The 90 % crossing is the number that describes convergence.
+        firstLight.frame90 = firstLight.series.find((s) => s.floorSpot > 0.9 * convergedFloor)?.frame ?? null;
+        say(`time to first light: floor spot reaches 50 % of its converged irradiance ` +
+          `(${convergedFloor.toFixed(4)}) at frame ${firstLight.frame ?? "never"}, 90 % at frame ` +
+          `${firstLight.frame90 ?? "never"} ` +
+          `[${firstLight.series.slice(0, 10).map((s) => s.floorSpot.toFixed(3)).join(" ")} …]`);
+        results.firstLight = firstLight;
+
+        // ══════════════════════════════════════════ Cornell parity (in frame)
+        const cropMeta = writeCrops();
+        const inFrame = await readCrops();
+        const statsIn = await readStats();
+        const cacheAfter = await cacheHealth();
+        results.cacheAfter = cacheAfter;
+        say(`cache after ${FRAMES} frames: ${cacheAfter.mapped} bricks own a slot, ` +
+            `${cacheAfter.writtenWords} of ${cacheAfter.scanned - cache.DATA_OFF} scanned words carry radiance`);
+        results.cornell = { crops: inFrame, cropMeta, stats: statsIn, frames: FRAMES };
+        say(`probes ${statsIn.probesValid}/${statsIn.probesPlaced} valid, reprojection ` +
+          `${(100 * statsIn.reprojHits / Math.max(1, statsIn.probesValid)).toFixed(1)} %; ` +
+          `rays ${statsIn.raysTraced}/${statsIn.raysLaunched} (${(100 * statsIn.raysTraced / Math.max(1, statsIn.raysLaunched)).toFixed(1)} % yield), ` +
+          `screen ${statsIn.screenHits} / window ${statsIn.windowHits} / sky ${statsIn.skyMiss}, ` +
+          `fresh shades ${statsIn.freshShades}, hand-offs ${statsIn.handoffs}, injected ${statsIn.injectWrites}`);
+        for (const c of inFrame) {
+          say(`  ${c.name.padEnd(12)} pos ${c.pos.map((v) => v.toFixed(2)).join(",").padEnd(20)} ` +
+            `E ${c.irr.map((v) => v.toFixed(3)).join(" ")}  albedo ${c.albedo.map((v) => v.toFixed(2)).join(" ")}  ` +
+            `${c.samples} px`);
+        }
+
+        // ── IS THE SCREEN SEGMENT EARNING ITS PLACE? ────────────────────
+        //
+        // ⭐ BLIND STATISTICS. §L.2 puts the HZB walk FIRST, ahead of the window
+        // trace, and it answers 10 % of rays out of the previous frame's lit
+        // image. If it is systematically wrong those rays are a leak that no
+        // other counter would name — "screen-hit %" says how often it fires,
+        // never whether it was right. So the same crops are read again with the
+        // segment switched OFF at the uniform, and the difference is reported.
+        {
+          gu.hzbOn.value = 0;
+          for (let n = FRAMES + 1; n <= FRAMES + 40; n++) await runFrame(n);
+          writeCrops();
+          const noHzb = await readCrops();
+          gu.hzbOn.value = 1;
+          for (let n = FRAMES + 41; n <= FRAMES + 80; n++) await runFrame(n);
+          writeCrops();
+          const withHzb = await readCrops();
+          const rows = CROPS.map((c, i) => ({
+            name: c.name,
+            on: lum(withHzb[i].irr), off: lum(noHzb[i].irr),
+            ratio: lum(withHzb[i].irr) / Math.max(1e-9, lum(noHzb[i].irr)),
+          }));
+          results.hzbAB = rows;
+          say(`HZB A/B (screen segment on ÷ off): ` +
+            rows.map((r) => `${r.name} ${r.ratio.toFixed(3)}`).join(", "));
+        }
+
+        // ── 2nd bounce: colour bleed on the floor ─────────────────────────
+        {
+          const fr = inFrame.find((x) => x.name === "floorRed");
+          const fg = inFrame.find((x) => x.name === "floorGreen");
+          const redness = (c) => c.irr[0] / Math.max(1e-6, c.irr[1]);
+          const ratio = redness(fr) / Math.max(1e-6, redness(fg));
+          say(`2nd bounce: floor under the RED wall r/g ${redness(fr).toFixed(3)}, under the GREEN wall ` +
+            `${redness(fg).toFixed(3)} → ratio ${ratio.toFixed(3)} (want ≥ 1.05)`);
+          results.secondBounce = { red: fr.irr, green: fg.irr, rednessRed: redness(fr), rednessGreen: redness(fg), ratio };
+        }
+
+        // ══════════════════════════════════════════ off-screen bounce
+        //
+        // The panel leaves the frame. Its light reaches the floor only through
+        // the window trace and the radiance cache — the screen segment cannot
+        // find a surface that is not on the screen. The receipt is the RATIO of
+        // the floor spot's irradiance to the in-frame arm, and the arm is only
+        // meaningful if the panel really left, so the panel's projected pixel
+        // is reported for both.
+        {
+          const panelInPix = project(PANEL_INFO.centre);
+          // The in-frame arm is re-read after the A/B above, not reused from
+          // before it: the A/B ran 80 more frames and the cache moved.
+          setCam(CAM_IN);
+          writeCrops();
+          const inNow = await readCrops();
+          const inSpot = inNow.find((x) => x.name === "floorSpot").irr;
+          setCam(CAM_OUT);
+          camera.updateMatrixWorld(true);
+          vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+          const panelOutPix = project(PANEL_INFO.centre);
+          for (let n = FRAMES + 81; n <= FRAMES + 120; n++) await runFrame(n);
+          writeCrops();
+          const outCrops = await readCrops();
+          const outSpot = outCrops.find((x) => x.name === "floorSpot").irr;
+          const ratio = lum(outSpot) / Math.max(1e-6, lum(inSpot));
+          say(`off-screen: panel projects to (${panelInPix.x.toFixed(0)},${panelInPix.y.toFixed(0)}) in frame ` +
+            `[${onScreen(panelInPix) ? "ON" : "OFF"}] and (${panelOutPix.x.toFixed(0)},${panelOutPix.y.toFixed(0)}) ` +
+            `after the pitch [${onScreen(panelOutPix) ? "ON" : "OFF"}]`);
+          say(`off-screen: floor spot E ${lum(inSpot).toFixed(4)} → ${lum(outSpot).toFixed(4)} = ` +
+            `${ratio.toFixed(3)} of in-frame (want ≥ 0.8)`);
+          results.offScreen = {
+            panelInPix, panelOutPix, panelInOnScreen: onScreen(panelInPix), panelOutOnScreen: onScreen(panelOutPix),
+            inSpot, outSpot, ratio, crops: outCrops,
+          };
+        }
+
+        // ══════════════════════════════════════════ the image (operator's eyes)
+        if (WANT_PNG) {
+          setCam(CAM_IN);
+          for (let n = FRAMES + 121; n <= FRAMES + 180; n++) await runFrame(n);
+          const f = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.litBuf.value));
+          const cv = document.createElement("canvas");
+          cv.width = W; cv.height = Hh;
+          const ctx = cv.getContext("2d");
+          const img = ctx.createImageData(W, Hh);
+          const enc = (v) => {
+            const t = v / (1 + v); // Reinhard, then sRGB
+            const s = t <= 0.0031308 ? t * 12.92 : 1.055 * Math.pow(t, 1 / 2.4) - 0.055;
+            return Math.max(0, Math.min(255, Math.round(s * 255)));
+          };
+          for (let i = 0; i < W * Hh; i++) {
+            img.data[i * 4] = enc(f[i * 4]);
+            img.data[i * 4 + 1] = enc(f[i * 4 + 1]);
+            img.data[i * 4 + 2] = enc(f[i * 4 + 2]);
+            img.data[i * 4 + 3] = 255;
+          }
+          ctx.putImageData(img, 0, 0);
+          results.png = cv.toDataURL("image/png");
+          // A few numbers about the image itself, so the report can describe it
+          // without anyone having to open the file.
+          let black = 0; let sum = 0; let mx = 0;
+          for (let i = 0; i < W * Hh; i++) {
+            const l = lum([f[i * 4], f[i * 4 + 1], f[i * 4 + 2]]);
+            if (l < 1e-4) black++;
+            sum += l; mx = Math.max(mx, l);
+          }
+          results.image = { blackPct: +(100 * black / (W * Hh)).toFixed(2), meanLum: sum / (W * Hh), maxLum: mx };
+          say(`image: ${results.image.blackPct} % of pixels are black, mean luminance ${results.image.meanLum.toFixed(4)}, max ${mx.toFixed(2)}`);
+        }
+
+        // ══════════════════════════════════════════ motion (§L.7 / Stage 3.5)
+        //
+        // ⭐ THE STILLNESS TRAP. A parked number is not this system's number:
+        // reprojection succeeds trivially when nothing moves. So the orbit is
+        // measured frame by frame — max frame against parked, and the
+        // reprojection hit rate under motion, which is the counter that says
+        // whether the temporal term is still doing anything.
+        {
+          const frameMs = async (n) => {
+            const t0 = performance.now();
+            await runFrame(n);
+            const gpu = timestamps ? await renderer.resolveTimestampsAsync("compute") : null;
+            return { gpu, wall: performance.now() - t0 };
+          };
+          setCam(CAM_IN);
+          for (let n = 0; n < 8; n++) await runFrame(1000 + n); // settle
+          if (timestamps) await renderer.resolveTimestampsAsync("compute");
+          const parked = [];
+          for (let n = 0; n < 12; n++) parked.push((await frameMs(1100 + n)).gpu);
+          await compute(gather.passes.clearStats);
+          const orbit = [];
+          const refill = [];
+          const freshPerFrame = [];
+          let freshSeen = 0;
+          const R0 = 4.0;
+          for (let i = 0; i < ORBIT_FRAMES; i++) {
+            const th = (i / (ORBIT_FRAMES - 1)) * (Math.PI / 2);
+            camera.position.set(R0 * Math.sin(th), -0.5, R0 * Math.cos(th));
+            camera.lookAt(0, -1.0, 0);
+            camera.updateProjectionMatrix();
+            orbit.push((await frameMs(1200 + i)).gpu);
+            refill.push(lastRefilled);
+            // ⭐ WHAT MAKES A MOTION FRAME EXPENSIVE. §L.2 shades a hit only
+            // when its cache slot is FRESH, so the trace kernel's cost is DATA
+            // DEPENDENT — and the data that changes under motion is exactly
+            // which surfaces the probes can reach. Counting fresh shades per
+            // frame alongside the milliseconds is what turns "the orbit has a
+            // spike" into a mechanism instead of a number.
+            const st = await readStats();
+            freshPerFrame.push(st.freshShades - freshSeen);
+            freshSeen = st.freshShades;
+          }
+          const statsOrbit = await readStats();
+          const med = (xs) => xs.filter((x) => x != null).slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)] ?? null;
+          const ok = (arr) => arr.filter((x) => x != null);
+          const parkedMs = med(parked);
+          const orbitMax = ok(orbit).length ? Math.max(...ok(orbit)) : null;
+          const orbitMed = med(orbit);
+          // TWO POPULATIONS, KEPT APART ON PURPOSE. A frame that SCROLLED the
+          // window pays this harness's full-window ANALYTIC refill, which is
+          // not the §K.3 incremental voxelizer the shipping path will use — so
+          // folding it into "the gather's cost under motion" would price a
+          // kernel that is not going to exist. Both numbers are reported.
+          const gatherOnly = ok(orbit.filter((_, i) => !refill[i]));
+          const scrolled = ok(orbit.filter((_, i) => refill[i]));
+          const reproj = 100 * statsOrbit.reprojHits / Math.max(1, statsOrbit.probesValid);
+          say(`motion: parked ${parkedMs?.toFixed(3)} ms/frame (compute), orbit median ${orbitMed?.toFixed(3)}, ` +
+            `max ${orbitMax?.toFixed(3)} = ${orbitMax && parkedMs ? (orbitMax / parkedMs).toFixed(2) : "n/a"}× parked (want ≤ 1.2×)`);
+          say(`motion: ${scrolled.length}/${ORBIT_FRAMES} orbit frames scrolled the window (a full analytic refill) — ` +
+            `max on those ${scrolled.length ? Math.max(...scrolled).toFixed(3) : "—"} ms; max on the ` +
+            `${gatherOnly.length} gather-only frames ${gatherOnly.length ? Math.max(...gatherOnly).toFixed(3) : "—"} ms = ` +
+            `${gatherOnly.length && parkedMs ? (Math.max(...gatherOnly) / parkedMs).toFixed(2) : "n/a"}× parked`);
+          say(`motion: probe reprojection ${reproj.toFixed(1)} % over the 90° orbit; parked spread ` +
+            `${ok(parked).length ? `${Math.min(...ok(parked)).toFixed(3)}–${Math.max(...ok(parked)).toFixed(3)}` : "—"} ms`);
+          const worstI = orbit.indexOf(orbitMax);
+          say(`motion: fresh shades per orbit frame ${freshPerFrame.join(" ")} — the most expensive frame ` +
+            `(#${worstI}, ${orbitMax?.toFixed(3)} ms) shaded ${freshPerFrame[worstI]}, the cheapest ` +
+            `${freshPerFrame[orbit.indexOf(Math.min(...ok(orbit)))]}`);
+          results.motion = {
+            parkedMs, orbitMed, orbitMax,
+            ratio: orbitMax && parkedMs ? orbitMax / parkedMs : null,
+            gatherOnlyMax: gatherOnly.length ? Math.max(...gatherOnly) : null,
+            gatherOnlyRatio: gatherOnly.length && parkedMs ? Math.max(...gatherOnly) / parkedMs : null,
+            scrollFrames: scrolled.length, scrolledMax: scrolled.length ? Math.max(...scrolled) : null,
+            parkedMin: ok(parked).length ? Math.min(...ok(parked)) : null,
+            parkedMax: ok(parked).length ? Math.max(...ok(parked)) : null,
+            freshPerFrame,
+            reprojPct: reproj, orbit, refill, stats: statsOrbit,
+          };
+        }
+
+        // ══════════════════════════════════════════ per-kernel cost
+        //
+        // With `statsOn = 0`: the counters above are an instrument, and an
+        // instrument that costs 130 k atomics must not be inside the number it
+        // is used to explain.
+        {
+          setCam(CAM_IN);
+          await runFrame(2000);
+          frameChain(false);
+          const kernels = [
+            ["hzbBuild", gather.passes.hzbBuild],
+            ...gather.passes.hzbReduce.map((p, i) => [`hzbReduce${i + 1}`, p]),
+            ["probePlace", gather.passes.probePlace],
+            ["probeTrace", gather.passes.probeTrace],
+            ["probeFilter", gather.passes.probeFilter],
+            ["resolve", gather.passes.resolve],
+            ["composite", gather.passes.composite],
+            ["inject", gather.passes.inject],
+            ["cacheAlloc", cache.allocPass],
+            ["windowFill", fill.pass],
+          ];
+          const REP = 24;
+          const audit = [];
+          for (const [name, node] of kernels) {
+            await compute(node);
+            if (timestamps) await renderer.resolveTimestampsAsync("compute");
+            let ms = null;
+            if (timestamps) {
+              const samples = [];
+              for (let s = 0; s < 3; s++) {
+                for (let f = 0; f < REP; f++) renderer.compute(node);
+                samples.push(((await renderer.resolveTimestampsAsync("compute")) ?? 0) / REP);
+              }
+              ms = samples.sort((a, b) => a - b)[1];
+            }
+            const shader = renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
+            const storageBindings = [...shader.matchAll(/var<storage[^>]*>/g)].length;
+            const workgroupVars = [...shader.matchAll(/var<workgroup/g)].length;
+            audit.push({ name, ms, kb: +(shader.length / 1024).toFixed(1), storageBindings, workgroupVars });
+            say(`kernel ${name.padEnd(12)} ${ms == null ? "  n/a" : ms.toFixed(4).padStart(8)} ms  ` +
+              `${String(storageBindings).padStart(2)} storage  ${workgroupVars} wg  ${(shader.length / 1024).toFixed(1)} kB`);
+          }
+          results.kernels = audit;
+          results.gatherMs = audit.filter((k) => !["cacheAlloc", "windowFill"].includes(k.name))
+            .reduce((s, k) => s + (k.ms ?? 0), 0);
+          say(`gather total (the per-frame chain): ${results.gatherMs.toFixed(3)} ms of compute at ${W}×${Hh}`);
+
+          // THE SIDE-EFFECT GUARD. A TSL call built for its side effect and not
+          // pinned to the stack compiles to NOTHING, silently (see the note on
+          // `.toVar()` in gatherProbes.js). The receipt for that is not a
+          // number, it is the presence of the function in the text.
+          const traceWgsl = renderer._nodes?.getForCompute?.(gather.passes.probeTrace)?.computeShader ?? "";
+          const injectWgsl = renderer._nodes?.getForCompute?.(gather.passes.inject)?.computeShader ?? "";
+          const wgslHas = {
+            probeTraceWrites: /gi2CacheWrite/.test(traceWgsl),
+            probeTraceReads: /gi2CacheRead/.test(traceWgsl),
+            probeTraceTraces: /gi2TraceWindow/.test(traceWgsl),
+            injectWrites: /gi2CacheWrite/.test(injectWgsl),
+          };
+          results.wgslHas = wgslHas;
+          say(`WGSL side effects: ${Object.entries(wgslHas).map(([k, v]) => `${k}=${v}`).join(" ")}`);
+          const missing = Object.entries(wgslHas).filter(([, v]) => !v).map(([k]) => k);
+          if (missing.length) throw new Error(`these calls were eliminated from the WGSL: ${missing.join(", ")}`);
+
+          const over = audit.filter((k) => k.storageBindings > 6);
+          if (over.length) {
+            throw new Error(`${over.map((k) => `${k.name}=${k.storageBindings}`).join(", ")} exceed the ` +
+              "portable envelope of 6 storage buffers per pass (PLAN §4.6)");
+          }
+          const wg = audit.filter((k) => k.workgroupVars > 0);
+          if (wg.length) throw new Error(`${wg.map((k) => k.name).join(", ")} use workgroup memory`);
+
+          // ── scene-free WGSL ────────────────────────────────────────────
+          // The room's own decimals, and the palette's, cannot be tier
+          // constants — every one of them reaches the GPU as buffer contents
+          // or a uniform, so finding one in the text means a scene number was
+          // compiled in and the browser's shader cache misses on every scene.
+          // ⚠ SUBSTRING MATCHING IS THE WRONG TEST, and it was the first thing
+          // tried: `PANEL_RADIANCE` is 8, and "8" occurs in every shader that
+          // shifts by 8 bits. The check parses the WGSL's FLOAT LITERALS and
+          // compares them numerically, and it only asks about scene numbers
+          // that no tier constant could equal — a value with at least two
+          // decimals that is not one of the round fractions a kernel legally
+          // contains. `2.9` (the panel plane) is added by hand for the same
+          // reason: one decimal, but nothing in an algorithm is 2.9.
+          const ROUND_OK = new Set([0.25, 0.5, 0.75, 0.05, 0.1, 0.02, 0.125, 1.5, 2.5, 3.5, 4.5, 0.01]);
+          const distinctive = (v) => {
+            const a = Math.abs(v);
+            if (!(a > 0)) return false;
+            if (ROUND_OK.has(a)) return false;
+            const dec = `${a}`.includes(".") ? `${a}`.split(".")[1].length : 0;
+            return dec >= 2;
+          };
+          const forbidden = new Set([2.9, 5.05, 3.05]);
+          for (const p of SCENE) for (const v of [...p.min, ...p.max]) if (distinctive(v)) forbidden.add(Math.abs(v));
+          for (const e of PALETTE) for (const v of e.albedo) if (distinctive(v)) forbidden.add(v);
+          for (const v of [...SUN_DIR, ...SUN_COLOR, ...SKY_COLOR]) if (distinctive(v)) forbidden.add(Math.abs(v));
+          const grepped = [];
+          const literalsByKernel = {};
+          for (const [name, node] of kernels) {
+            const shader = renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
+            const lits = [...new Set([...shader.matchAll(/(?<![\w.])\d+\.\d+(?:e-?\d+)?/g)].map((m) => Number(m[0])))];
+            literalsByKernel[name] = lits.sort((a, b) => a - b);
+            for (const f of forbidden) if (lits.some((l) => Math.abs(l - f) < 1e-6)) grepped.push(`${name}:${f}`);
+          }
+          results.sceneFree = { forbidden: [...forbidden], grepped, literals: literalsByKernel };
+          say(`scene-free WGSL: ${grepped.length === 0 ? "PASS" : `FAIL ${grepped.join(", ")}`} ` +
+            `(${forbidden.size} distinctive scene numbers grepped for, exact float-literal match)`);
+          say(`probeTrace float literals: ${literalsByKernel.probeTrace.join(" ")}`);
+          if (grepped.length) throw new Error(`scene numbers compiled into WGSL: ${grepped.join(", ")}`);
+          frameChain(true);
+        }
+
+        if (validationErrors.length) throw new Error(`WebGPU validation: ${validationErrors[0]}`);
+        results.pass = true;
+        results.text = lines.join("\n");
+        globalThis.__GI2_GATHER_RESULT__ = results;
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>
