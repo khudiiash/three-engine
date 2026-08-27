@@ -38,6 +38,10 @@ const mulv = (a, b) => [a[0] * b[0], a[1] * b[1], a[2] * b[2]];
 const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 const norm = (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
 const lum = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+/** A rotation, as its three COLUMNS — the form `windowFill.js` publishes. */
+const IDENTITY = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+const rot = (R, v) => [0, 1, 2].map((a) => R[0][a] * v[0] + R[1][a] * v[1] + R[2][a] * v[2]);
+const rotT = (R, v) => [0, 1, 2].map((k) => R[k][0] * v[0] + R[k][1] * v[1] + R[k][2] * v[2]);
 
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -59,18 +63,28 @@ function mulberry32(seed) {
  * `bounces` deep, and the sun is a DELTA direction so a bounce ray can never
  * hit it — the same reason the GPU's gather cannot double-count it.
  */
-function makeReference(scene, palette, light, bounces = 4) {
+function makeReference(scene, palette, light, bounces = 4, R = IDENTITY) {
   const EPS = 1e-4;
   const panel = light.panel;
   const sunTo = norm(mul(light.sunDir, -1));
-  const boxes = scene.map((p, i) => ({ ...p, i }));
+  // ⭐ §19 STAGE 3.9 — THE ROTATED ROOM IS INTERSECTED IN ITS OWN FRAME.
+  //
+  // `KIND_OBB` primitives (2) carry LOCAL `min`/`max` and the arm's rotation
+  // turns them. Rather than write an OBB intersector, the RAY is turned into
+  // that frame — `R` is orthonormal so `t` is the same number on both sides
+  // and only the normal has to come back — and the world-space primitives (the
+  // panel, the sphere) keep the intersector they already had. The two answers
+  // are compared by `t`, which is the only comparison that means anything
+  // across the two frames.
+  const boxes = scene.filter((p) => p.kind !== 2).map((p, i) => ({ ...p, i }));
+  const local = scene.filter((p) => p.kind === 2).map((p, i) => ({ ...p, kind: 0, i }));
 
-  const intersect = (o, d) => {
+  const intersectIn = (list, o, d) => {
     let bt = Infinity;
     let bn = null;
     let bp = -1;
-    for (const p of boxes) {
-      if (p.kind === 0) {
+    for (const p of list) {
+      if (p.kind !== 1) {
         let t0 = -Infinity, t1 = Infinity, a0 = 0, a1 = 0, s0 = -1, s1 = 1;
         let miss = false;
         for (let a = 0; a < 3 && !miss; a++) {
@@ -112,6 +126,15 @@ function makeReference(scene, palette, light, bounces = 4) {
     }
     return bn ? { t: bt, n: bn, pal: bp } : null;
   };
+
+  const intersect = local.length === 0
+    ? (o, d) => intersectIn(boxes, o, d)
+    : (o, d) => {
+      const a = intersectIn(boxes, o, d);
+      const b = intersectIn(local, rotT(R, o), rotT(R, d));
+      if (b && (!a || b.t < a.t)) return { t: b.t, n: rot(R, b.n), pal: b.pal };
+      return a;
+    };
 
   const occluded = (o, d, tMax) => {
     const h = intersect(o, d);
@@ -383,8 +406,172 @@ for (const tier of tiers) {
         r.resolveAB.filter((x) => !x.diag).map((x) => `${x.name} ${x.ratio.toFixed(3)}`).join(", "));
     }
 
+    // ══ §19 STAGE 3.9 — THE ROTATED ROOM, AGAINST ITS OWN REFERENCE ═══════
+    //
+    // ⭐⭐ THE SAME PATH TRACER, TURNED. Each world reports the primitive list
+    // the fill actually voxelized and the rotation the kernel actually held, so
+    // the reference cannot be a second description of the room that drifts from
+    // it; and each world runs the attribution rule OFF and ON, so the "before"
+    // in this receipt is the same binary at the same pose and not a memory of
+    // an earlier commit.
+    //
+    // The GATE is a comparison of RATIOS and not of radiances. A turned room's
+    // absolute irradiance differs (the panel does not turn with it, the walls
+    // meet the light at different angles), so "the rotated arm is dimmer" says
+    // nothing; "the rotated arm's GPU-over-reference ratio differs from the
+    // axis-aligned room's by more than 5 %" says the estimator lost something
+    // when the walls stopped agreeing with the grid, which is the whole claim.
+    if (r.rotated?.worlds?.length) {
+      const rotParity = (world, arm) => {
+        const refs = {
+          1: makeReference(world.scene, r.palette, { ...r.light, panel: world.panel }, 1, world.rot),
+          4: makeReference(world.scene, r.palette, { ...r.light, panel: world.panel }, 4, world.rot),
+        };
+        const rows = [];
+        for (const c of world.arms[arm].crops) {
+          if (!(c.samples > 0)) { rows.push({ name: c.name, diag: !!c.diag, skipped: true }); continue; }
+          const seed = 0x51ed + c.name.length * 7919;
+          const E1 = refs[1].irradiance(c.pos, c.nrm, SPP, seed);
+          const E4 = refs[4].irradiance(c.pos, c.nrm, SPP, seed);
+          rows.push({
+            name: c.name, diag: !!c.diag, gpu: c.irr, ref: E4,
+            ratio: lum(c.irr) / Math.max(1e-9, lum(E4)),
+            ratio1: lum(c.irr) / Math.max(1e-9, lum(E1)),
+          });
+        }
+        const s = rows.filter((p) => !p.diag && !p.skipped);
+        return {
+          rows,
+          scored: s.length,
+          within: s.filter((p) => Math.abs(p.ratio - 1) <= 0.15).length,
+          bracketed: s.filter((p) => p.ratio <= 1.15 && p.ratio1 >= 0.85).length,
+        };
+      };
+      console.log("");
+      console.log("  §19 STAGE 3.9 — ROTATED CORNELL (attribution off = 3.8's entry face, on = dominant face)");
+      const rotTable = [];
+      for (const world of r.rotated.worlds) {
+        for (const arm of ["off", "on"]) {
+          const par = rotParity(world, arm);
+          const sp = world.arms[arm].split;
+          const st = world.arms[arm].stats;
+          rotTable.push({ world: world.name, arm, parity: par, split: sp, leak: world.leak, stats: st });
+          const f = (x, d = 1) => (x == null || Number.isNaN(x) ? "—" : x.toFixed(d));
+          console.log(
+            `  ${`${world.name}/${arm}`.padEnd(12)} bracketed ${`${par.bracketed}/${par.scored}`.padStart(5)}  ` +
+            `within15% ${`${par.within}/${par.scored}`.padStart(5)}  ` +
+            `MIS-SLOTS ${f(sp.misPct).padStart(6)} % of ${String(sp.misN).padStart(5)} wall voxels, off by ` +
+            `${f(sp.misErrPct, 0).padStart(5)} %  |  spread ${f(sp.spread).padStart(5)} %  ` +
+            `open ${f(sp.dOpen).padStart(5)} %  buried ${f(sp.dBuried).padStart(5)} % ` +
+            `(${f(100 * sp.buriedFrac, 0)} % of words)  six-bits ${f(sp.fullBitsPct, 0)} %  ` +
+            `axis known ${f(sp.axKnownPct, 0)} % agree ${f(sp.axAgreePct, 0)} %  inject-mismatch ` +
+            `${st.axisKnown ? (100 * st.axisMismatch / st.axisKnown).toFixed(1) : "—"} %`,
+          );
+        }
+      }
+      // ⭐⭐ DISTANCE FROM THE REFERENCE, NOT DISTANCE FROM ANOTHER ARM.
+      //
+      // The Δ gate asks whether a rotated room's ratio matches the axis-aligned
+      // room's, and that question inherits BOTH arms' convergence state — which
+      // is why its own null floor is several percent. The question the fix is
+      // actually answerable on is `mean |ratio − 1|` over the flat crops: how
+      // far the estimator sits from a path tracer, in one room, with the rule
+      // off and on. It needs no second room to be meaningful and it cannot be
+      // moved by the other arm's luck.
+      // ⚠ THE SPHERE IS REPORTED AND NOT GATED, for a reason the fill states
+      // outright: a sphere's normal turns through a hemisphere inside one voxel,
+      // so `analyticVoxel` gives its voxels NO dominant axis and the rule under
+      // test cannot apply to them. What its crop ratio does measure is how a
+      // CURVED surface lands on the grid, and that is genuinely a different
+      // quantity once the room stops being grid-aligned — a comparison across
+      // rotations of a number the rotation redefines.
+      const CURVED = new Set(["sphere"]);
+      const meanErr = (row) => {
+        const rows = row.parity.rows.filter((p) => !p.diag && !p.skipped && !CURVED.has(p.name));
+        return rows.reduce((a, p) => a + Math.abs(p.ratio - 1), 0) / Math.max(1, rows.length);
+      };
+      console.log("  mean |ratio − 1| over the flat crops, attribution off → on:");
+      for (const world of r.rotated.worlds) {
+        const o = meanErr(rotTable.find((x) => x.world === world.name && x.arm === "off"));
+        const n = meanErr(rotTable.find((x) => x.world === world.name && x.arm === "on"));
+        console.log(`    ${world.name.padEnd(8)} ${(100 * o).toFixed(1)} % → ${(100 * n).toFixed(1)} % ` +
+          `(${n <= o ? "closer to the reference" : "further"})`);
+      }
+      // The crop ratios themselves, off against on, per world — the receipt a
+      // bracket count summarises away.
+      console.log("  per-crop GPU ÷ 4-bounce reference, attribution off → on:");
+      for (const world of r.rotated.worlds) {
+        const off = rotTable.find((x) => x.world === world.name && x.arm === "off").parity.rows;
+        const on = rotTable.find((x) => x.world === world.name && x.arm === "on").parity.rows;
+        console.log(`    ${world.name.padEnd(8)} ` + on.filter((p) => !p.diag && !p.skipped).map((p, i) => {
+          const o = off.filter((q) => !q.diag && !q.skipped)[i];
+          return `${p.name} ${o.ratio.toFixed(2)}→${p.ratio.toFixed(2)}`;
+        }).join("  "));
+      }
+      // The Δ gate: every scored crop of a rotated arm against the SAME crop of
+      // the axis-aligned room, both with the rule ON and both at the same frame
+      // count, so the comparison is the room's alignment and nothing else.
+      const base = rotTable.find((x) => x.world === "axis" && x.arm === "on");
+      const ratioOf = (row, name) => row.parity.rows.find((q) => q.name === name && !q.skipped)?.ratio;
+      // ⭐⭐ THE Δ GATE NEEDS ITS OWN NULL, AND THE PAGE ALREADY RAN IT.
+      //
+      // The axis-aligned room's OFF and ON arms are the same room, the same
+      // reference and a rule that provably does nothing there (0.0 % of its
+      // wall voxels have a mis-attributed slot in EITHER arm). Whatever those
+      // two arms differ by IS this instrument's own arm-to-arm spread — two
+      // independent convergences with different random streams — and a 5 %
+      // threshold read against a floor that has not been measured is a threshold
+      // read against a hope. The gate is `max(5 %, the measured floor)`.
+      const axOff = rotTable.find((x) => x.world === "axis" && x.arm === "off");
+      const nulls = base.parity.rows.filter((p) => !p.diag && !p.skipped).map((p) => {
+        const o = ratioOf(axOff, p.name);
+        return o == null ? 0 : Math.abs((p.ratio - o) / Math.max(1e-9, o));
+      });
+      const floor = Math.max(...nulls, 0);
+      const deltas = [];
+      for (const row of rotTable.filter((x) => x.arm === "on" && x.world !== "axis")) {
+        for (const p of row.parity.rows) {
+          if (p.diag || p.skipped) continue;
+          const b = ratioOf(base, p.name);
+          if (b == null) continue;
+          deltas.push({
+            world: row.world, name: p.name, curved: CURVED.has(p.name),
+            d: (p.ratio - b) / Math.max(1e-9, b),
+          });
+        }
+      }
+      const pick = (list) => list.reduce((a, x) => (Math.abs(x.d) > Math.abs(a.d) ? x : a),
+        { d: 0, name: "—", world: "—" });
+      const worst = pick(deltas.filter((x) => !x.curved));
+      const worstCurved = pick(deltas.filter((x) => x.curved));
+      const onRows = rotTable.filter((x) => x.arm === "on");
+      const gates = {
+        bracketed: onRows.every((x) => x.parity.bracketed === x.parity.scored),
+        delta: Math.abs(worst.d) <= Math.max(0.05, floor),
+        spread: onRows.filter((x) => x.world !== "axis").every((x) => (x.split.spread ?? 99) < 20),
+        // ⭐ THE FIX'S OWN GATE: no wall voxel may carry a slot on an axis that
+        // is not its own. The OFF arm is what says this gate can fail.
+        misSlots: onRows.every((x) => (x.split.misPct ?? 99) <= 1),
+        buried: onRows.filter((x) => x.world !== "axis").every((x) => (x.split.buriedFrac ?? 1) === 0),
+        leak: r.rotated.worlds.every((w) => w.leak.sealed === 0 && w.leak.control >= 0.9 * w.leak.rays),
+      };
+      console.log(`  Δ vs the axis-aligned room (rule ON), flat crops: worst ${worst.world}/${worst.name} ` +
+        `${(100 * worst.d).toFixed(2)} % against a gate of max(5 %, the axis room's own off↔on floor ` +
+        `${(100 * floor).toFixed(2)} %) | curved, reported not gated: ${worstCurved.world}/${worstCurved.name} ` +
+        `${(100 * worstCurved.d).toFixed(2)} %`);
+      console.log(`  ` + r.rotated.worlds.map((w) => `${w.name} leak ${w.leak.sealed}/${w.leak.rays}, control ` +
+        `${(100 * w.leak.control / w.leak.rays).toFixed(1)} %`).join(" | "));
+      console.log(`  3.9 gates: ${Object.entries(gates).map(([k, v]) => `${k} ${v ? "PASS" : "FAIL"}`).join("  ")}`);
+      r.rotatedReport = {
+        table: rotTable, worstDelta: worst, worstCurved, floor, gates,
+        frames: r.rotated.frames, taps: r.rotated.taps,
+      };
+      if (Object.values(gates).some((v) => !v)) failed++;
+    }
+
     table.push({
       tier,
+      rotated: r.rotatedReport,
       parity: { within, within1, within2, bracketed, scored, rows: parity },
       hzbAB: r.hzbAB,
       secondBounce: r.secondBounce,

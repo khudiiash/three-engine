@@ -168,6 +168,44 @@ export const DEFAULT_BIAS_CELLS = 0.5;
 export const FACE_BIT = { PX: 0, NX: 1, PY: 2, NY: 3, PZ: 4, NZ: 5 };
 
 /**
+ * ⭐⭐ §19 STAGE 3.9 — THE FACE BYTE'S SPARE BITS CARRY THE **DOMINANT NORMAL**.
+ *
+ * Bits 0-5 answer "can a ray travelling this way be stopped here?" — BLOCKING,
+ * and they stay permissive (Stage 3.8 measured 95 % of Bistro's façade voxels
+ * carrying all six, because `|n.a| > 1e-3` sets a pair for any wall that is not
+ * perfectly axis-aligned, and the 0/10 000 leak receipt depends on exactly
+ * that).
+ *
+ * Bits 6-7 answer a DIFFERENT question — "which of the six cache slots IS this
+ * voxel's surface?" — and 3.8's dirt is what happens when the first answer is
+ * used for the second: a grazing ray files its hit under the ±Y it happened to
+ * enter through, `faceSamplePoint` puts that slot's shade point inside the wall
+ * column, and `ORIGIN_ESCAPE` walks it out into open sun at 78-87× the wall's
+ * true radiance.
+ *
+ * ⚠ 0 MEANS "NOT KNOWN", NOT "X". Three producers write the face byte — the
+ * static voxelizer, the analytic fill and `windowDynamic` — and only the first
+ * two can compute an area-weighted argmax. A zero therefore has to be the SAFE
+ * value (fall back on the entry face, i.e. Stage 3.8's behaviour) rather than a
+ * legal axis, or every dynamic voxel in the world would claim to be an X wall.
+ *
+ * ⚠ NOTHING READ BITS 6-7 BEFORE THIS STAGE, so there was no two-sided or
+ * dyn-mirror flag to relocate. Grepped at 3eda2a7: `FACE_OFF` has five readers
+ * (`windowTrace` here, `windowFill`, `windowVoxelize`, `windowDynamic`, and the
+ * probes' CPU-side readbacks) and every one of them masks the byte with 255 and
+ * then tests one of bits 0-5 — the two-sidedness the §K.4 sketch imagined
+ * putting there is expressed by the PAIR rule (both bits of an axis go
+ * together) and the dynamic layer is a separate level slot, not a flag.
+ */
+export const FACE_AX_SHIFT = 6;
+export const FACE_AX_MASK = 0b11000000;
+export const FACE_AX_NONE = 0;
+/** Axis 0/1/2 → the 2-bit code stored in bits 6-7. */
+export const packFaceAxis = (a) => (a + 1) << FACE_AX_SHIFT;
+/** The stored byte → axis 0/1/2, or −1 for "not known". */
+export const unpackFaceAxis = (byte) => (((byte >>> FACE_AX_SHIFT) & 3) - 1);
+
+/**
  * The bit a ray stepping along `axis` in direction `sign` tests when it ENTERS
  * a voxel: moving +X you come in through the −X face. Exported because the CPU
  * mirror in the unit test must agree with the kernel bit-for-bit.

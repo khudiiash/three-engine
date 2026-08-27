@@ -271,7 +271,13 @@ const readStages = (pose) => page.evaluate(async ({ pose }) => {
           bit: (fb >>> f) & 1,
         });
       }
-      slab.push({ lv: k, occ, faceBits: fb, palByte: pb, faces, frontOcc, front2, backOcc });
+      // ⭐⭐ §19 STAGE 3.9 — bits 6-7 of the face byte are the voxel's DOMINANT
+      // NORMAL AXIS now (0 = not known, 1/2/3 = X/Y/Z), written by the SAT's
+      // area-weighted argmax. Read here so the probe can say two things 3.8
+      // could only assert: whether the voxelizer named an axis at all, and
+      // whether the slots this façade actually carries radiance in are the ones
+      // that axis allows.
+      slab.push({ lv: k, occ, faceBits: fb, ax: (fb >>> 6) & 3, palByte: pb, faces, frontOcc, front2, backOcc });
     }
     if (slab.length !== 16) continue;
     bricks.push({ face, axis, key3, slot, slab });
@@ -295,17 +301,43 @@ const readStages = (pose) => page.evaluate(async ({ pose }) => {
   const airFrac = []; const airVsWall = [];
   const cvOpen = []; const cvBuried = []; const buriedFrac = []; const buriedRatio = [];
   const cvOpenSameCls = [];
-  // Only voxels that are OCCUPIED and carry the outward face bit are wall
-  // voxels; the rest of the slab is air the layer happens to contain.
+  // ⭐⭐ §19 STAGE 3.9's OWN RECEIPT — the mis-attributed slots, counted.
+  //
+  // A wall voxel has ONE surface. Every cache word it holds on an axis that is
+  // not its dominant one is a word no honest producer should ever have written,
+  // and under 3.8's entry-face rule they ARE written — by the grazing rays that
+  // "hit" the façade through a face it does not have, whose shade point
+  // `ORIGIN_ESCAPE` then walked out into open sun. That is the 78-87× half of
+  // the BURIED split, named directly instead of inferred from a spread.
+  let axAll = 0; let axKnown = 0; let misWritten = 0; const misErr = [];
   for (const br of bricks) {
     const wall = br.slab.filter((v) => v.occ === 1);
     occN.push(wall.length);
-    bitFull.push(wall.filter((v) => v.faceBits === 63).length);
+    // ⚠ MASK WITH 63. §19 Stage 3.9 put the dominant AXIS in bits 6-7 of the
+    // same byte, so `faceBits === 63` — 3.8's test for "this voxel carries all
+    // six blocking bits" — is now false for every voxel that names an axis, and
+    // would have reported Bistro's 95 % as 0 % without one line of the reader
+    // changing meaning.
+    bitFull.push(wall.filter((v) => (v.faceBits & 63) === 63).length);
     bitOut.push(wall.filter((v) => ((v.faceBits >>> br.face) & 1) === 1).length);
-    for (const v of wall) bitPattern.set(v.faceBits, (bitPattern.get(v.faceBits) ?? 0) + 1);
+    for (const v of wall) bitPattern.set(v.faceBits & 63, (bitPattern.get(v.faceBits & 63) ?? 0) + 1);
     const classes = new Set(wall.map((v) => v.palByte));
     classN.push(classes.size);
     multiClass.push(classes.size > 1 ? 1 : 0);
+    // ── §19 Stage 3.9: the mis-attributed slots (see the note above) ──────
+    for (const v of wall) {
+      axAll++;
+      if (!v.ax) continue;
+      axKnown++;
+      const dom = v.ax - 1;
+      const domFaces = [v.faces[dom * 2], v.faces[dom * 2 + 1]].filter((f) => f.rgb).map((f) => lum(f.rgb));
+      const wrong = v.faces.filter((f) => (f.f >> 1) !== dom && f.rgb).map((f) => lum(f.rgb));
+      if (!wrong.length) continue;
+      misWritten++;
+      if (domFaces.length && domFaces[0] > 1e-9) {
+        misErr.push(Math.abs(Math.max(...wrong) - domFaces[0]) / domFaces[0]);
+      }
+    }
     // ── the decomposition, all on the OUTWARD face ───────────────────────
     {
       const all = br.slab.filter((v) => v.faces[br.face].rgb).map((v) => lum(v.faces[br.face].rgb));
@@ -402,6 +434,10 @@ const readStages = (pose) => page.evaluate(async ({ pose }) => {
     airFrac: med(airFrac), airVsWall: med(airVsWall),
     nCv37: cv37.length, nCvAir: cvAir.length, nCvSame: cvSameCls.length,
     nCvShaded: cvShaded.length, nCvInj: cvInjOnly.length,
+    axKnownPct: axAll ? (100 * axKnown) / axAll : null,
+    misPct: axAll ? (100 * misWritten) / axAll : null,
+    misErrPct: misErr.length ? 100 * med(misErr) : null,
+    axWallVoxels: axAll,
     cvOpen: med(cvOpen), cvBuried: med(cvBuried), buriedFrac: med(buriedFrac),
     buriedRatio: med(buriedRatio), cvOpenSameCls: med(cvOpenSameCls),
     nCvOpen: cvOpen.length, nCvBuried: cvBuried.length, nCvOpenSame: cvOpenSameCls.length,
@@ -461,6 +497,8 @@ const show = (tag, r) => {
   if (r?.error) { console.log(`  ${tag}: ${r.error}`); return; }
   console.log(`\n  ── ${tag} ── ${r.bricks} façade bricks, ${r.occPerSlab} occupied voxels per 16-voxel slab`);
   console.log(`     (a) FACE BITS  full-63 ${(100 * r.bitFullFrac).toFixed(0)}%  outward-bit set ${(100 * r.bitOutFrac).toFixed(0)}%   ${r.bitPatterns.join(" ")}`);
+  console.log(`     (a2) §3.9 AXIS ${r.axKnownPct?.toFixed(0) ?? "—"}% of ${r.axWallVoxels} wall voxels name a dominant axis; ` +
+    `MIS-ATTRIBUTED SLOTS ${r.misPct?.toFixed(1) ?? "—"}% of them, off by ${r.misErrPct?.toFixed(0) ?? "—"}%`);
   console.log(`     (b) PALETTE    ${r.classesPerSlab} distinct classes per slab (${(100 * r.multiClassFrac).toFixed(0)}% of slabs multi-class), their albedo σ/mean ${r.classAlbCvMedian?.toFixed(1) ?? "—"}%`);
   console.log(`     (c) CACHE out  σ/mean ${r.outCvMedian?.toFixed(1)}% [${r.outCvMin?.toFixed(0)}…${r.outCvMax?.toFixed(0)}]  n̄ ${r.outNMedian?.toFixed(1)}  written ${(100 * r.outWrittenFrac).toFixed(0)}%`);
   console.log(`     (d) CACHE oth  σ/mean ${r.otherCvMedian?.toFixed(1) ?? "—"}%  written ${(100 * r.otherWrittenFrac).toFixed(0)}%   counts ${r.nHist}`);

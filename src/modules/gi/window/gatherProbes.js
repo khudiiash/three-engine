@@ -78,7 +78,8 @@ import {
   select, shiftLeft, shiftRight, sqrt, step, storage, texture, textureStore, uint, uniform,
   uniformArray, vec2, vec3, vec4,
 } from "three/tsl";
-import { LEVEL_WORDS, N, PAL_OFF } from "./windowStore.js";
+import { FACE_OFF, LEVEL_WORDS, N, OCC_OFF, PAL_OFF } from "./windowStore.js";
+import { FACE_AX_SHIFT } from "./windowTrace.js";
 import { normalOfFace } from "./radianceCache.js";
 import { octahedralUV } from "../srcOctahedral.js";
 
@@ -241,6 +242,10 @@ export const STATS = {
   reprojNoPrev: 16, reprojOffScreen: 17, reprojPlane: 18, reprojSlant: 19, reprojAlign: 20,
   // §19 Stage 3.7: what the re-shading and the prior actually cost.
   reShades: 25, neighbourPrior: 26,
+  // §19 Stage 3.9's assertion, as a rate: injected pixels whose voxel names a
+  // dominant axis at all, and those where that axis is not the gbuffer
+  // normal's nearest. Slots 14 and 27 were the two the census never used.
+  axisKnown: 14, axisMismatch: 27,
 };
 /**
  * §19 Stage 3.7's NEED CENSUS — three slots that are not receipts.
@@ -687,6 +692,17 @@ export function createGiGather({
     matureRaysU: uniform(MATURE_RAYS, "uint"),
     /** §P.4's neighbour prior for a fresh probe. 0 restores "start at zero". */
     priorOn: uniform(1),
+    /**
+     * ⭐⭐ §19 STAGE 3.9's OWN CONTROL ARM. 0 files every hit and every
+     * injection under the ray's ENTRY face again — Stage 3.8's behaviour,
+     * exactly — out of the SAME binary, the same pipelines and the same warmed
+     * shader cache, so a rotated-arm ratio measured with it off and on differs
+     * by the attribution rule and by nothing else. The face byte and the two
+     * neighbour words are read in both arms; only the choice is switched, which
+     * is what makes the OFF arm a control for the RULE rather than for its cost
+     * (the cost is the kernel table's business, and it is measured with it on).
+     */
+    domFaceOn: uniform(1),
   };
   const palette = Array.from({ length: PAL_ENTRIES }, () => new THREE.Vector4(0, 0, 0, 0));
   const palU = uniformArray(palette, "vec4");
@@ -776,6 +792,80 @@ export function createGiGather({
   };
   /** Palette entry of a window voxel: `vec4(albedo.rgb, emissiveMean)`. */
   const palAt = (levelF, voxF) => palU.element(palIndexAt(levelF, voxF));
+
+  /**
+   * ⭐⭐ §19 STAGE 3.9 — THE SLOT A HIT BELONGS TO IS THE VOXEL'S, NOT THE RAY'S.
+   *
+   * Stage 3.8 measured the dirt and named it: `traceWindow` reports the face it
+   * ENTERED the voxel through, and with permissive face bits (95 % of Bistro's
+   * façade voxels carry all six) a grazing ray "hits" a wall through ±Y. That
+   * entry face then decided everything downstream — which cache word the hit
+   * read and re-shaded, where `faceSamplePoint` put the shade point, and which
+   * way `ORIGIN_ESCAPE` walked it. The shade point landed INSIDE the wall
+   * column and the escape pushed it out into open sun: 78-87× the wall's true
+   * radiance, in half the words of a façade slab.
+   *
+   * BLOCKING AND ATTRIBUTION ARE TWO DIFFERENT QUESTIONS. The bits stay
+   * permissive (they are what makes the leak receipt 0/10 000); this function
+   * answers the second one from the voxel's own DOMINANT NORMAL, written into
+   * the face byte's bits 6-7 by the producer that actually saw the triangles.
+   *
+   * ⚠ AND IT IS NOT IN `traceWindow`. 3.8 tried the exposed-face rule inside
+   * the trace — a `sharedFn` every ray class calls, sun and NEE shadow rays
+   * included — and GI GPU went 1.24 → 15.15 ms for a 37.8 → 26.2 % spread. Here
+   * it costs ONE face byte plus TWO occupancy words at the single site that
+   * needs an answer: the hit, once per ray, outside the DDA.
+   *
+   * The SIGN is the side whose outward neighbour is EMPTY, which is the half of
+   * the fix that addresses `buried` directly — a conservatively voxelized wall
+   * is two cells thick wherever its plane falls near a boundary, and the far
+   * cell's "outward" face on the near side has solid in front of it. When
+   * neither side or both sides are open, `hint` decides: the ray's own
+   * backward direction for a trace, the gbuffer normal for the injection, so
+   * both callers land on the face that looks at the light they carry.
+   *
+   * ⚠ THE NEIGHBOUR READ WRAPS AT THE WINDOW EDGE, exactly as every other
+   * toroidal index in this file does. A voxel on the 64th cell reads the far
+   * side of its own window as its neighbour; that is one cell in 64 per axis,
+   * at the window boundary where the trace has already handed off to a coarser
+   * level, and inventing a bounds test for it would cost every hit a compare.
+   */
+  const faceByteAt = (levelF, voxF) => {
+    const vi = voxF.toUint().toVar();
+    const wAddr = levelF.toUint().mul(uint(LEVEL_WORDS)).add(uint(FACE_OFF)).add(shiftRight(vi, uint(2)));
+    return bitAnd(shiftRight(win.buffer.element(wAddr), bitAnd(vi, uint(3)).mul(uint(8))), uint(255));
+  };
+  const dominantFace = (levelF, voxF, fallbackFaceF, hint) => {
+    const code = bitAnd(shiftRight(faceByteAt(levelF, voxF), uint(FACE_AX_SHIFT)), uint(3)).toVar();
+    const vi = voxF.toUint().toVar();
+    const cx = bitAnd(vi, uint(63)).toInt().toVar();
+    const cy = bitAnd(shiftRight(vi, uint(6)), uint(63)).toInt().toVar();
+    const cz = bitAnd(shiftRight(vi, uint(12)), uint(63)).toInt().toVar();
+    const isX = code.equal(uint(1));
+    const isY = code.equal(uint(2));
+    const sx = select(isX, int(1), int(0)).toVar();
+    const sy = select(isY, int(1), int(0)).toVar();
+    const sz = select(code.equal(uint(3)), int(1), int(0)).toVar();
+    const viOf = (dx, dy, dz) => bitOr(bitOr(
+      bitAnd(cx.add(dx), int(N - 1)).toUint(),
+      shiftLeft(bitAnd(cy.add(dy), int(N - 1)).toUint(), uint(6))),
+    shiftLeft(bitAnd(cz.add(dz), int(N - 1)).toUint(), uint(12))).toVar();
+    const viP = viOf(sx, sy, sz);
+    const viN = viOf(int(0).sub(sx), int(0).sub(sy), int(0).sub(sz));
+    const occBase = levelF.toUint().mul(uint(LEVEL_WORDS)).add(uint(OCC_OFF)).toVar();
+    const occOf = (v) => bitAnd(
+      win.buffer.element(occBase.add(shiftRight(v, uint(5)))), shiftLeft(uint(1), bitAnd(v, uint(31))),
+    ).toVar();
+    const occP = occOf(viP);
+    const occN = occOf(viN);
+    const base = code.sub(uint(1)).mul(uint(2)).toVar(); // 2·axis
+    const ha = select(isX, hint.x, select(isY, hint.y, hint.z)).toVar();
+    const hintFace = base.add(select(ha.greaterThanEqual(0), uint(0), uint(1))).toVar();
+    const onlyP = occP.equal(uint(0)).and(occN.notEqual(uint(0)));
+    const onlyN = occN.equal(uint(0)).and(occP.notEqual(uint(0)));
+    const dom = select(onlyP, base, select(onlyN, base.add(uint(1)), hintFace)).toVar();
+    return select(code.equal(uint(0)).or(u.domFaceOn.lessThan(0.5)), fallbackFaceF, dom.toFloat());
+  };
 
   /**
    * The window cell a world point falls in, at the FINEST level whose window
@@ -1418,7 +1508,11 @@ export function createGiGather({
         If(sr.x.greaterThan(0.5), () => {
           const hlv = bitAnd(shiftRight(zi0(sr), uint(3)), uint(7)).toFloat().toVar();
           const hvx = shiftRight(zi0(sr), uint(6)).toFloat().toVar();
-          const c2 = cache.cacheRead(hlv, hvx, bitAnd(zi0(sr), uint(7)).toFloat()).toVar();
+          // §19 Stage 3.9: the SECOND bounce reads the same slot the first one
+          // writes. A cosine ray that reads the entry face here would sample a
+          // word no ray ever fills and hand back a systematic zero.
+          const hf = dominantFace(hlv, hvx, bitAnd(zi0(sr), uint(7)).toFloat(), sd.negate()).toVar();
+          const c2 = cache.cacheRead(hlv, hvx, hf).toVar();
           // ⭐⭐ THE COSINE RAY MUST NOT RE-COUNT WHAT NEE ALREADY SAMPLED.
           //
           // This is the oldest bug in light transport wearing a new hat, and
@@ -1817,9 +1911,16 @@ export function createGiGather({
     }).Else(() => {
       const zi = r.z.toUint().toVar();
       If(r.x.greaterThan(0.5), () => {
-        const faceF = bitAnd(zi, uint(7)).toFloat().toVar();
+        const entryF = bitAnd(zi, uint(7)).toFloat().toVar();
         const levelF = bitAnd(shiftRight(zi, uint(3)), uint(7)).toFloat().toVar();
         const voxF = shiftRight(zi, uint(6)).toFloat().toVar();
+        // ⭐⭐ §19 STAGE 3.9 — the voxel's dominant face, not the ray's entry
+        // face. One byte and two occupancy words, at the hit; see
+        // `dominantFace`. Everything below reads `faceF` and nothing below
+        // knows which of the two produced it, which is the point: the slot,
+        // the shade point, the escape direction and the re-shade all move
+        // together or the cache holds two different surfaces in one word.
+        const faceF = dominantFace(levelF, voxF, entryF, dir.negate()).toVar();
         const hn = normalOfFace(faceF).toVar();
         const hp = faceSamplePoint(levelF, voxF, hn).toVar();
         const c = cache.cacheRead(levelF, voxF, faceF).toVar();
@@ -2589,9 +2690,35 @@ export function createGiGather({
               shiftLeft(bitAnd(wc.y.toInt(), int(63)).toUint(), uint(6))),
             shiftLeft(bitAnd(wc.z.toInt(), int(63)).toUint(), uint(12)),
           ).toVar();
-          // `.toVar()` for the same reason as in `probeTrace` - see the note there.
-          cache.cacheWrite(float(l), vi.toFloat(), face, c, u.injectAlpha).toVar();
-          if (l === 0) bump(STATS.injectWrites, px);
+          // ⭐⭐ §19 STAGE 3.9 — THE SCREEN AND THE RAYS MUST NAME THE SAME WORD.
+          //
+          // `radianceCache`'s own header says it: "if those two ever disagree,
+          // the screen would write light into a face no ray reads". Before 3.9
+          // they agreed by luck — the gbuffer normal's nearest axis and the
+          // ray's entry face are the same thing only on an axis-aligned wall
+          // hit head on. So the injection files under the VOXEL's dominant
+          // face too, with the gbuffer normal as the side hint (a visible
+          // surface faces the camera, so its outward neighbour is open and the
+          // hint is rarely what decides).
+          //
+          // The mismatch counters are the receipt for the assertion §Q.3 asks
+          // for: `axisKnown` counts pixels whose voxel names an axis at all,
+          // `axisMismatch` those where that axis is NOT the gbuffer normal's
+          // nearest — the honest disagreement rate between the two ways of
+          // asking, which on a flat wall should be a rounding error and on a
+          // corner voxel is real.
+          const domF = dominantFace(float(l), vi.toFloat(), face, Nn).toVar();
+          cache.cacheWrite(float(l), vi.toFloat(), domF, c, u.injectAlpha).toVar();
+          if (l === 0) {
+            bump(STATS.injectWrites, px);
+            const code = bitAnd(shiftRight(faceByteAt(float(l), vi.toFloat()), uint(FACE_AX_SHIFT)), uint(3)).toVar();
+            If(code.notEqual(uint(0)), () => {
+              bump(STATS.axisKnown, px);
+              If(code.sub(uint(1)).notEqual(face.div(2).floor().toUint()), () => {
+                bump(STATS.axisMismatch, px);
+              });
+            });
+          }
         });
       }
     });

@@ -128,10 +128,20 @@ export const CTL_WORDS = 8;
 /**
  * Face index of a world-space normal: 0 +X, 1 −X, 2 +Y, 3 −Y, 4 +Z, 5 −Z.
  *
- * This is the SAME numbering `windowTrace.js` returns as `faceId` — the entry
- * face of a ray is the outward face of the surface it hit, so a hit's face id
- * and an injected pixel's face id address the same slot word. If those two ever
- * disagree, the screen would write light into a face no ray reads.
+ * This is the SAME numbering `windowTrace.js` returns as `faceId`, and the rule
+ * that has to hold is that a hit and an injected pixel on one surface address
+ * the same slot word — if those two ever disagree, the screen writes light into
+ * a face no ray reads.
+ *
+ * ⚠⚠ §19 STAGE 3.9 — "THE ENTRY FACE IS THE SURFACE'S OWN FACE" WAS THE CLAIM,
+ * AND IT WAS FALSE. It holds only for a wall that agrees with the voxel grid and
+ * is hit head on. Bistro's façades do neither: 95 % of their wall voxels carry
+ * all six face bits, so a grazing ray files its hit under ±Y, reads a slot no
+ * pixel injects, and shades it from a point `ORIGIN_ESCAPE` walked into open
+ * sun — 78-87× the wall's radiance, in half the words of a slab. BOTH producers
+ * now go through `gatherProbes`' `dominantFace`, which reads the voxel's own
+ * dominant normal out of the face byte's bits 6-7; this function is what the
+ * fallback (and `injectLitFrame`'s side hint) is built from, not the rule.
  */
 export const faceOfNormal = (n) => {
   const ax = n.x.abs();

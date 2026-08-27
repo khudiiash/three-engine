@@ -1617,3 +1617,49 @@ and 5-px spatial noise; neither sees a stable 1 m blotch.
 Cost ceiling: the chain stays ≤ 4 ms at 1650×970 ultra (3.6: 3.21); the
 shade-sample budget is what bends. Gates: all 3.6 gates + the receipts above
 + `test:gi-moved-lamp` (+RED) + `test:gi-sunleak`.
+
+---
+
+## Q. STAGE 3.9 SPEC — FACE ATTRIBUTION BY DOMINANT NORMAL (from 3.8's diagnosis)
+
+**Mechanism (measured, 3.8):** the voxelizer sets face bit(±a) when |n.a| >
+1e-3, so 95 % of Bistro's façade voxels carry ALL SIX bits; the DDA files a
+hit under the ENTRY face; a grazing ray therefore "hits" a wall through ±Y,
+`faceSamplePoint` for that slot sits inside the wall column, `ORIGIN_ESCAPE`
+pushes the shade point out into open sun → that slot stores 78-87× the true
+wall radiance; half the words of a façade slab. Cornell hides it (axis-aligned
+walls). A fix inside `traceWindow` costs 15 ms (shared by every ray class).
+
+**Design:**
+1. **Blocking and attribution are two different questions.** Keep the
+   permissive bits for BLOCKING (0/10 000 leaks) — but decide WHICH slot a hit
+   reads/writes by the voxel's DOMINANT NORMAL, not by the entry face. Store
+   the dominant axis in the face byte's spare bits 6-7 (00 x, 01 y, 10 z; the
+   sign = the side of the pair whose outward neighbour is empty, else the
+   entry side); the two-sided/dyn-mirror flags move to `brickTab` or are
+   dropped (verify who reads bit 6/7 today). The voxelizer computes it as the
+   area-weighted |n| argmax over the triangles it SATs into the voxel
+   (`atomicMax` on a packed (weight, axis) word in the pal scratch, packed by
+   `finishBricks`) — no new buffer.
+2. **Shade point = the outward face plane along the dominant normal** (the
+   centre of that face, pushed by the bias along the dominant normal), so
+   the sky/sun/NEE rays start on the surface's real side; the origin escape
+   walks only along the dominant normal.
+3. **Inject** files under the same dominant face (gbuffer normal → nearest
+   axis; assert agreement with the voxel's stored axis and count mismatches).
+4. **Reads**: a probe ray hitting via any entry face reads the dominant-face
+   slot (one read, same cost); the 6-slot layout stays (a two-sided wall's
+   two dominant faces are ±a of one axis).
+
+**The instrument first — a ROTATED Cornell arm** in `gi2-gather.html`: the
+same room rotated 20° about Y (and a second arm 20° about X for floors),
+CPU reference = the same path tracer on the rotated analytic scene. Gate:
+the rotated arms' crops must sit in the SAME bracket as the axis-aligned
+room (8/8 bracketed, |Δ| ≤ 5 % vs the unrotated ratios), and the façade-
+brick spread on it (§3.8 SPLIT line) < 20 % with BURIED ≈ 0 words. Then
+Bistro: the §3.8 SPLIT's BURIED share → ~0 and the three-pose dirt metric
+(with the 3.8 blindness guard) before/after, 3 runs each, medians.
+
+Cost ceiling unchanged (chain ≤ 4 ms; `traceWindow` untouched in cost —
+the attribution read is one extra byte fetch at the hit). Gates: all 3.6/
+3.7 + leak tests (0/10 000, control 100 %) + moved-lamp PASS/RED + sunleak.

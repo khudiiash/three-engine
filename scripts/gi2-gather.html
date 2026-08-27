@@ -150,6 +150,14 @@
         });
         gather.setPalette(PALETTE);
         const gu = gather.uniforms;
+        // ⭐ `?dom=0` RUNS THIS WHOLE PAGE AS STAGE 3.8 DID. Every gate below —
+        // parity, noise, motion, the kernel table — then reads the pre-3.9
+        // attribution rule out of the SAME binary at the same resolution on the
+        // same GPU, which is the only way to answer "did the fix move a number
+        // that has nothing to do with it" without a second checkout.
+        const DOM_ON = params.get("dom") !== "0";
+        const ROT_ON = params.get("rot") !== "0";
+        gu.domFaceOn.value = DOM_ON ? 1 : 0;
         gu.sunDir.value.set(...SUN_DIR);
         gu.sunColor.value.set(...SUN_COLOR);
         gu.skyColor.value.set(...SKY_COLOR);
@@ -170,21 +178,39 @@
 
         // ══════════════════════════════════════════════════════ three.js scene
         const scene = new THREE.Scene();
-        const mkMesh = (p) => {
+        const mkMesh = (p, R = null) => {
           let geo;
-          if (p.kind === KIND_BOX) {
-            geo = new THREE.BoxGeometry(p.max[0] - p.min[0], p.max[1] - p.min[1], p.max[2] - p.min[2]);
-            geo.translate((p.min[0] + p.max[0]) / 2, (p.min[1] + p.max[1]) / 2, (p.min[2] + p.max[2]) / 2);
-          } else {
+          if (p.kind === fillMod.KIND_SPHERE) {
             const r = (p.max[0] - p.min[0]) / 2;
             geo = new THREE.SphereGeometry(r, 48, 32);
             geo.translate((p.min[0] + p.max[0]) / 2, (p.min[1] + p.max[1]) / 2, (p.min[2] + p.max[2]) / 2);
+          } else {
+            geo = new THREE.BoxGeometry(p.max[0] - p.min[0], p.max[1] - p.min[1], p.max[2] - p.min[2]);
+            geo.translate((p.min[0] + p.max[0]) / 2, (p.min[1] + p.max[1]) / 2, (p.min[2] + p.max[2]) / 2);
+          }
+          // ⭐ §19 STAGE 3.9 — A `KIND_OBB`'s min/max are LOCAL, so the raster
+          // geometry is turned by the SAME matrix the fill's uniform carries.
+          // The gbuffer the probes read and the voxels they trace are then one
+          // surface by construction, which is the whole reason this page builds
+          // its meshes from the fill's primitive list instead of a second
+          // description of the room.
+          if (p.kind === fillMod.KIND_OBB && R) {
+            geo.applyMatrix4(new THREE.Matrix4().set(
+              R[0][0], R[1][0], R[2][0], 0,
+              R[0][1], R[1][1], R[2][1], 0,
+              R[0][2], R[1][2], R[2][2], 0,
+              0, 0, 0, 1,
+            ));
           }
           const m = new THREE.Mesh(geo, new THREE.MeshBasicNodeMaterial());
           m.frustumCulled = false;
           return m;
         };
-        for (const p of SCENE) scene.add(mkMesh(p));
+        const buildMeshes = (prims, R = null) => {
+          for (const c of [...scene.children]) { scene.remove(c); c.geometry?.dispose(); c.material?.dispose(); }
+          for (const p of prims) scene.add(mkMesh(p, R));
+        };
+        buildMeshes(SCENE);
 
         const VFOV = 80;
         const camera = new THREE.PerspectiveCamera(VFOV, W / Hh, 0.05, 120);
@@ -300,16 +326,21 @@
           })),
         ];
         const cropArr = gather.buffers.cropIn.value.array;
-        const writeCrops = () => {
+        // `xf` turns a crop's world point with the arm's rotation, so the SAME
+        // eight named places on the SAME eight surfaces are read in every arm —
+        // the ratios are then comparable because the surface is the same one,
+        // not because the coordinates happen to be.
+        const writeCrops = (xf = (p) => p) => {
           const meta = [];
           CROPS.forEach((c, i) => {
-            const q = project(c.p);
+            const wp = xf(c.p);
+            const q = project(wp);
             cropArr[i * 4] = Math.round(q.x);
             cropArr[i * 4 + 1] = Math.round(q.y);
             cropArr[i * 4 + 2] = 0;
             cropArr[i * 4 + 3] = 0;
             meta.push({
-              name: c.name, want: c.p, px: Math.round(q.x), py: Math.round(q.y),
+              name: c.name, want: wp, px: Math.round(q.x), py: Math.round(q.y),
               onScreen: onScreen(q), diag: !!c.diag,
             });
           });
@@ -1989,6 +2020,404 @@
           say(`probeTrace float literals: ${literalsByKernel.probeTrace.join(" ")}`);
           if (grepped.length) throw new Error(`scene numbers compiled into WGSL: ${grepped.join(", ")}`);
           frameChain(true);
+        }
+
+        // ══════ §19 STAGE 3.9 — THE ROTATED ROOM, AND WHY IT HAD TO EXIST ═════
+        //
+        // ⭐⭐ CORNELL CANNOT SEE THE DIRT, AND THAT IS A PROPERTY OF CORNELL.
+        //
+        // Stage 3.8 measured the mechanism on Bistro and could not reproduce it
+        // here: an axis-aligned wall's face bits are ONE axis pair, so the entry
+        // face a ray files its hit under is always that wall's own face and the
+        // slab spread is 0.49 %. Every wall in this room agrees with the voxel
+        // grid, so the one question the fix is about — "which of six slots IS
+        // this voxel's surface?" — has a trivial answer in every crop the page
+        // reads. A gate that cannot fail is not a gate.
+        //
+        // So the SAME room is turned 20° about Y (the four side walls stop
+        // agreeing with the grid; floor and ceiling keep their ±Y normals) and,
+        // in a second arm, 20° about X (floor, ceiling and the ±Z walls tilt).
+        // A turned wall's normal has TWO non-zero components, so `|n.a| > 1e-3`
+        // sets two axis pairs — four of six bits — and a ray can now enter
+        // through a face that is not the wall's own. That is the mechanism, in a
+        // room whose light has a computable reference.
+        //
+        // ⚠ THE PANEL DOES NOT TURN, in either arm. `shadeHit`'s NEE block is
+        // written for a −Y-facing axis-aligned rectangle (its cosine is `wd.y`
+        // and its stop plane is derived from `panelCentre.y`), and generalising
+        // a SHIPPING estimator to serve a test rig would put the rig inside the
+        // thing under test. In the X arm the panel is lowered 0.5 m instead, so
+        // it clears the tilted ceiling: `y·cos20 + z·sin20 ≤ 2.86` at its far
+        // corner against the ceiling's own 3.0. The reference path-traces
+        // whatever the fill voxelizes, so a differently-placed panel changes the
+        // absolute irradiance and not the RATIO the gate reads.
+        //
+        // ⚠ AND EVERY ARM RUNS TWICE, off and on, out of ONE binary. The world
+        // is a uniform (the rotation) plus a buffer update (the primitives); the
+        // attribution rule is a uniform (`domFaceOn`). Nothing here recompiles,
+        // re-tiers or re-warms a shader cache between arms, so an arm-to-arm
+        // difference is the rotation or the rule and can be nothing else.
+        if (ROT_ON) {
+          const { rotY, rotX, rotateScene, applyRot, IDENTITY_ROT } = fillMod;
+          const ROT_FRAMES = Number(params.get("rotFrames") ?? 150);
+          // ⚠ THE CROPS ARE AVERAGED OVER `CROP_TAPS` FRAMES, and that is not
+          // polish. Each arm is an independent convergence with its own random
+          // stream, so a single-frame crop carries the arm's own Monte-Carlo
+          // phase — measured on the axis-aligned room, where the rule provably
+          // changes nothing (0.0 % mis-attributed slots in BOTH arms), two arms'
+          // ratios differed by up to 6 % from that alone. A Δ gate at 5 % read
+          // off single frames would be reading its own noise; averaging eight
+          // taps over the last stretch of each arm is what makes the comparison
+          // about the room.
+          const CROP_TAPS = Number(params.get("cropTaps") ?? 8);
+          const LEAK_RAYS = 10000;
+          const { hx, hy, hz } = ROOM;
+
+          // ── an arbitrary-ray kernel, for the leak receipt ─────────────────
+          // Three storage bindings (window + rays in + answers out), the same
+          // shape `gi2-trace.html` uses, because the claim "blocking is
+          // unchanged" has to be measured on the TRACE and not inferred from
+          // the fill.
+          const rayIn = TSL.instancedArray(new Float32Array(LEAK_RAYS * 12), "vec4");
+          const rayOut = TSL.instancedArray(new Float32Array(LEAK_RAYS * 4), "vec4");
+          const rayPass = TSL.Fn(() => {
+            const i = TSL.instanceIndex.toVar();
+            const b = i.mul(TSL.uint(3)).toVar();
+            const a0 = rayIn.element(b).toVar();
+            const a1 = rayIn.element(b.add(TSL.uint(1))).toVar();
+            const a2 = rayIn.element(b.add(TSL.uint(2))).toVar();
+            rayOut.element(i).assign(trace.traceWindow(a0.xyz, a1.xyz, a0.w, a2.xyz).raw);
+          })().compute(LEAK_RAYS);
+          const rayArr = rayIn.value.array;
+          const shoot = async (list) => {
+            for (let i = 0; i < LEAK_RAYS; i++) {
+              const r = list[i % list.length];
+              const b = i * 12;
+              rayArr[b] = r.o[0]; rayArr[b + 1] = r.o[1]; rayArr[b + 2] = r.o[2]; rayArr[b + 3] = 40;
+              rayArr[b + 4] = r.d[0]; rayArr[b + 5] = r.d[1]; rayArr[b + 6] = r.d[2]; rayArr[b + 7] = 0;
+            }
+            rayIn.value.needsUpdate = true;
+            await compute(rayPass);
+            const raw = new Float32Array(await renderer.getArrayBufferAsync(rayOut.value));
+            return (i) => traceMod.unpackTrace(raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]);
+          };
+          // The SAME 10 000 local points and directions in every arm — the
+          // rotation moves the room and the rays with it, so the arms differ by
+          // the room's alignment and not by which rays were drawn.
+          const rng = (() => {
+            let s = 0x1a2b3c4d >>> 0;
+            return () => {
+              s = (s + 0x6d2b79f5) >>> 0;
+              let t = Math.imul(s ^ (s >>> 15), s | 1);
+              t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+              return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+            };
+          })();
+          const LEAK_LOCAL = [];
+          for (let i = 0; i < LEAK_RAYS; i++) {
+            const o = [(rng() * 2 - 1) * (hx - 0.3), (rng() * 2 - 1) * (hy - 0.3), (rng() * 2 - 1) * (hz - 0.3)];
+            const z = rng() * 2 - 1;
+            const ph = rng() * 2 * Math.PI;
+            const r = Math.sqrt(Math.max(0, 1 - z * z));
+            LEAK_LOCAL.push({ o, d: [r * Math.cos(ph), r * Math.sin(ph), z] });
+          }
+
+          // ── the CPU mirror of `cellOfWorld` (the finest window that holds p) ─
+          const cellOfWorld = (p) => {
+            for (let l = 0; l < wd.levels; l++) {
+              const v = wd.voxel0 * (2 ** l);
+              const c = p.map((x) => Math.floor(x / v));
+              let inside = true;
+              for (let a = 0; a < 3; a++) {
+                const rel = c[a] - win.origins[l * 3 + a];
+                if (rel < 0 || rel >= 64) inside = false;
+              }
+              if (inside) return { level: l, c };
+            }
+            return null;
+          };
+
+          // ── the §3.8 SPLIT, on this room's own walls ──────────────────────
+          //
+          // The boot probe's decomposition, verbatim in spirit: one brick's
+          // 16-voxel slab along the surface's own face axis, split into the
+          // air the layer happens to contain, the wall voxels whose outward
+          // neighbour is OPEN, and the BURIED ones whose outward neighbour is
+          // solid — the voxels whose shade point starts inside the wall. What
+          // survives the split is the estimator's; the rest is addressing.
+          const SURFACES = [
+            { name: "−X", n: [1, 0, 0], at: (u, w) => [-hx - 0.02, u, w] },
+            { name: "+X", n: [-1, 0, 0], at: (u, w) => [hx + 0.02, u, w] },
+            { name: "−Z", n: [0, 0, 1], at: (u, w) => [w, u, -hz - 0.02] },
+            { name: "+Z", n: [0, 0, -1], at: (u, w) => [w, u, hz + 0.02] },
+            { name: "floor", n: [0, 1, 0], at: (u, w) => [w, -hy - 0.02, u] },
+          ];
+          const lum3 = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+          const statOf = (a) => {
+            if (a.length < 4) return null;
+            const m = a.reduce((x, y) => x + y, 0) / a.length;
+            const sd = Math.sqrt(a.reduce((x, y) => x + (y - m) ** 2, 0) / a.length);
+            return { n: a.length, mean: m, cv: (100 * sd) / Math.max(1e-9, m) };
+          };
+          const medOf = (a) => (a.length ? [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)] : null);
+          const wallSplit = async (R) => {
+            const winW = new Uint32Array(await renderer.getArrayBufferAsync(win.attribute));
+            const cW = new Uint32Array(await renderer.getArrayBufferAsync(cache.attribute));
+            const off = cache.describe().offsets;
+            const LW = store.LEVEL_WORDS;
+            const occAt = (lvl, x, y, z) => {
+              const i = (x & 63) | ((y & 63) << 6) | ((z & 63) << 12);
+              return (winW[lvl * LW + store.OCC_OFF + (i >> 5)] >>> (i & 31)) & 1;
+            };
+            const byteAt = (lvl, o, i) => (winW[lvl * LW + o + (i >> 2)] >>> ((i & 3) * 8)) & 255;
+            const seen = new Set();
+            const dAll = []; const dAir = []; const dWall = []; const dOpen = []; const dBuried = [];
+            const airFrac = []; const buriedFrac = []; const buriedRatio = [];
+            let bits = 0; let bitsFull = 0; let axKnown = 0; let axAgree = 0; let bricks = 0;
+            let misAll = 0; let misWritten = 0; const misErr = [];
+            for (const s of SURFACES) {
+              const nW = applyRot(R, s.n);
+              let a = 0;
+              for (let k = 1; k < 3; k++) if (Math.abs(nW[k]) > Math.abs(nW[a])) a = k;
+              const face = a * 2 + (nW[a] >= 0 ? 0 : 1);
+              const nOf = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]][face];
+              for (let iu = -2; iu <= 2; iu++) {
+                for (let iw = -4; iw <= 4; iw++) {
+                  const p = applyRot(R, s.at(iu * 1.0, iw * 1.0));
+                  const cw = cellOfWorld(p);
+                  if (!cw) continue;
+                  const { level, c } = cw;
+                  const cx = c[0] & 63; const cy = c[1] & 63; const cz = c[2] & 63;
+                  const b = (cx >> 2) | ((cy >> 2) << 4) | ((cz >> 2) << 8);
+                  const key = `${level}:${b}:${face}`;
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  const m = cW[off.MAP_OFF + level * 4096 + b];
+                  if (!m) continue;
+                  const slot = m - 1;
+                  const key3 = [cx & 3, cy & 3, cz & 3][a];
+                  const rows = [];
+                  for (let lv = 0; lv < 64; lv++) {
+                    const l3 = [lv & 3, (lv >> 2) & 3, (lv >> 4) & 3];
+                    if (l3[a] !== key3) continue;
+                    const wcx = ((cx >> 2) << 2) | l3[0];
+                    const wcy = ((cy >> 2) << 2) | l3[1];
+                    const wcz = ((cz >> 2) << 2) | l3[2];
+                    const wvi = wcx | (wcy << 6) | (wcz << 12);
+                    rows.push({
+                      rgb: cacheMod.unpackRgbe(cW[off.DATA_OFF + slot * 384 + lv * 6 + face]),
+                      all: [0, 1, 2, 3, 4, 5].map((f) => cacheMod.unpackRgbe(cW[off.DATA_OFF + slot * 384 + lv * 6 + f])),
+                      occ: occAt(level, wcx, wcy, wcz),
+                      buried: occAt(level, wcx + nOf[0], wcy + nOf[1], wcz + nOf[2]),
+                      bits: byteAt(level, store.FACE_OFF, wvi),
+                    });
+                  }
+                  const lit = rows.filter((r) => r.rgb);
+                  if (lit.length < 6) continue;
+                  bricks++;
+                  for (const r of rows.filter((q) => q.occ)) {
+                    bits++;
+                    if ((r.bits & 63) === 63) bitsFull++;
+                    const code = (r.bits >> 6) & 3;
+                    if (code) { axKnown++; if (code - 1 === a) axAgree++; }
+                    // ⭐⭐ THE MECHANISM ITSELF, AS A NUMBER. A wall voxel has ONE
+                    // surface; every slot on an axis that is not its dominant one
+                    // is a word no honest producer should ever write. Under the
+                    // entry-face rule they ARE written — by the grazing rays that
+                    // "hit" the wall through a face it does not have — and what
+                    // they hold is whatever `faceSamplePoint` + `ORIGIN_ESCAPE`
+                    // found by walking ALONG the wall instead of off it. That is
+                    // the dirt, and it is the same word 3.8 measured at 78-87× on
+                    // Bistro (there the escape found open sun; in a sealed room it
+                    // finds more wall, so the error is dark rather than bright —
+                    // the SIGN is the scene's, the disagreement is the bug's).
+                    const dom = code ? code - 1 : a;
+                    const dv = r.all[dom * 2] ?? r.all[dom * 2 + 1];
+                    const domL = [r.all[dom * 2], r.all[dom * 2 + 1]].filter(Boolean).map(lum3);
+                    const wrong = [];
+                    for (let f = 0; f < 6; f++) if ((f >> 1) !== dom && r.all[f]) wrong.push(lum3(r.all[f]));
+                    misAll++;
+                    if (wrong.length) {
+                      misWritten++;
+                      if (domL.length && domL[0] > 1e-9) {
+                        misErr.push(Math.abs(Math.max(...wrong) - domL[0]) / domL[0]);
+                      }
+                    }
+                    void dv;
+                  }
+                  const L = (r) => lum3(r.rgb);
+                  const air = lit.filter((r) => !r.occ);
+                  const wall = lit.filter((r) => r.occ);
+                  const open = wall.filter((r) => !r.buried);
+                  const bur = wall.filter((r) => r.buried);
+                  const push = (arr, q) => { if (q) arr.push(q.cv); };
+                  push(dAll, statOf(lit.map(L)));
+                  push(dAir, statOf(air.map(L)));
+                  push(dWall, statOf(wall.map(L)));
+                  push(dOpen, statOf(open.map(L)));
+                  push(dBuried, statOf(bur.map(L)));
+                  if (lit.length) airFrac.push(air.length / lit.length);
+                  if (wall.length) buriedFrac.push(bur.length / wall.length);
+                  const so = statOf(open.map(L)); const sb = statOf(bur.map(L));
+                  if (so && sb) buriedRatio.push(sb.mean / Math.max(1e-9, so.mean));
+                }
+              }
+            }
+            return {
+              bricks,
+              spread: medOf(dAll), dAir: medOf(dAir), dWall: medOf(dWall),
+              dOpen: medOf(dOpen), dBuried: medOf(dBuried),
+              airFrac: medOf(airFrac), buriedFrac: medOf(buriedFrac), buriedRatio: medOf(buriedRatio),
+              nBuried: dBuried.length,
+              fullBitsPct: bits ? (100 * bitsFull) / bits : null,
+              axKnownPct: bits ? (100 * axKnown) / bits : null,
+              axAgreePct: axKnown ? (100 * axAgree) / axKnown : null,
+              misPct: misAll ? (100 * misWritten) / misAll : null,
+              misErrPct: misErr.length ? 100 * medOf(misErr) : null,
+              misN: misAll,
+            };
+          };
+
+          // ── the three worlds ─────────────────────────────────────────────
+          // ⚠ THE TILTED ARMS NEED A LOWER PANEL, and the number is derived and
+          // not tuned: a horizontal 3 × 3 m panel whose top is at `y` has its
+          // highest LOCAL height at `R⁻¹` applied to its far corner, and the
+          // ceiling's inner plane is local y = 3. At 20° about X that is
+          // `0.94·y + 0.34·1.5 ≤ 3`; for the composite it is
+          // `0.117·1.5 + 0.94·y + 0.321·1.5 ≤ 3`. `y = 2.3` clears both with
+          // 0.18 m to spare, and 2.3 sits inside a cell the same way 2.9 did,
+          // so `yStop` (the NEE ray's stop plane, one voxel below the emitter's
+          // own) lands in the same relation to it.
+          const PANEL_LOW = { kind: KIND_BOX, min: [-1.5, 2.2, -1.5], max: [1.5, 2.3, 1.5], pal: 0 };
+          const mul3 = (A, B) => [0, 1, 2].map((k) => applyRot(A, B[k]));
+          const infoOf = (p) => ({
+            centre: [0, p.min[1], 0],
+            half: [(p.max[0] - p.min[0]) / 2, (p.max[2] - p.min[2]) / 2],
+            radiance: [PANEL_RADIANCE, PANEL_RADIANCE, PANEL_RADIANCE],
+            area: (p.max[0] - p.min[0]) * (p.max[2] - p.min[2]),
+          });
+          // ⭐ THE THIRD ROTATION IS THE ONE THAT REPRODUCES BISTRO'S BIT MASK.
+          //
+          // A single-axis turn leaves one component of every wall normal EXACTLY
+          // zero — a Y-rotated wall has `n.y = 0`, so `|n.a| > 1e-3` sets four
+          // bits and not six, and the ±Y grazing entry that 3.8's façade shows
+          // cannot happen at all. Measured on the first run of this arm: 4 % of
+          // wall voxels carried all six bits against Bistro's 95 %. The mechanism
+          // is still there (a Z-dominant wall entered through ±X), but the
+          // instrument would be reporting a weaker case than the one the fix is
+          // for. Composing the two turns gives every wall a normal with three
+          // non-zero components, which is the general case and Bistro's.
+          const WORLDS = [
+            { name: "axis", R: IDENTITY_ROT, panel: PANEL },
+            { name: "rotY20", R: rotY(20), panel: PANEL },
+            { name: "rotX20", R: rotX(20), panel: PANEL_LOW },
+            { name: "rotXY20", R: mul3(rotX(20), rotY(20)), panel: PANEL_LOW },
+          ];
+          const applyWorld = async (world) => {
+            const prims = [world.panel, ...rotateScene(CORNELL_SCENE, world.R)];
+            fill.setRotation(world.R);
+            fill.setScene(prims);
+            buildMeshes(prims, world.R);
+            const info = infoOf(world.panel);
+            gu.panelCentre.value.set(...info.centre);
+            gu.panelHalf.value.set(...info.half);
+            gu.panelArea.value = info.area;
+            setCam({ eye: applyRot(world.R, CAM_IN.eye), at: applyRot(world.R, CAM_IN.at) });
+            return { prims, info };
+          };
+          const resetGather = async () => {
+            await compute(cache.clearPass);
+            await compute(gather.passes.clearProbes);
+            await compute(gather.passes.clearMeta);
+            await compute(gather.passes.clearStats);
+            win.reset();
+            await placeWindow(true);
+          };
+
+          let nRot = 20000;
+          const rotOut = [];
+          say("");
+          say(`§19 STAGE 3.9 — ROTATED CORNELL (${ROT_FRAMES} frames per arm, ` +
+            `attribution off = Stage 3.8's entry face, on = the voxel's dominant face)`);
+          for (const world of WORLDS) {
+            const { prims, info } = await applyWorld(world);
+            const xf = (p) => applyRot(world.R, p);
+            const arms = {};
+            for (const armName of ["off", "on"]) {
+              gu.domFaceOn.value = armName === "on" ? 1 : 0;
+              await resetGather();
+              await runFrame(nRot++); // one frame first: `writeCrops` needs `vp`
+              const cropMeta = writeCrops(xf);
+              for (let i = 1; i < ROT_FRAMES; i++) await runFrame(nRot++);
+              // The crop average (see `CROP_TAPS`): eight reads four frames
+              // apart, averaged per channel. `pos`/`nrm` come from the gbuffer
+              // and are identical every tap, so only the estimate is averaged.
+              const taps = [];
+              for (let k = 0; k < CROP_TAPS; k++) {
+                taps.push(await readCrops());
+                for (let i = 0; i < 4; i++) await runFrame(nRot++);
+              }
+              const crops = taps[0].map((c, i) => ({
+                ...c,
+                irr: [0, 1, 2].map((ch) => taps.reduce((s, t) => s + t[i].irr[ch], 0) / taps.length),
+                lit: [0, 1, 2].map((ch) => taps.reduce((s, t) => s + t[i].lit[ch], 0) / taps.length),
+                taps: taps.length,
+              }));
+              const stats = await readStats();
+              const split = await wallSplit(world.R);
+              arms[armName] = { crops, cropMeta, stats, split };
+              const f1 = (x) => (x == null ? "—" : x.toFixed(1));
+              const f0 = (x) => (x == null ? "—" : x.toFixed(0));
+              say(`  ${world.name} / attribution ${armName}: ${split.bricks} wall bricks, ${split.misN} wall voxels | ` +
+                `MIS-ATTRIBUTED SLOTS ${f1(split.misPct)} % of wall voxels, off by ${f0(split.misErrPct)} % | ` +
+                `slab spread ${f1(split.spread)} % (wall ${f0(split.dWall)} %, open ${f0(split.dOpen)} %, ` +
+                `BURIED ${f0(split.dBuried)} % over ${split.nBuried} bricks, ` +
+                `${(100 * split.buriedFrac).toFixed(0)} % of wall words at ${f1(split.buriedRatio)}× open) | ` +
+                `all-six bits ${f0(split.fullBitsPct)} % | axis known ${f0(split.axKnownPct)} %, ` +
+                `agrees with the wall ${f0(split.axAgreePct)} % | ` +
+                `inject axis mismatch ${stats.axisKnown ? (100 * stats.axisMismatch / stats.axisKnown).toFixed(1) : "—"} % ` +
+                `of ${stats.axisKnown}`);
+            }
+            // ── the leak receipt, and its control. Blocking must be UNCHANGED:
+            // bits 0-5 are untouched by this stage and the rotated wall is the
+            // case that could have broken them.
+            const rays = LEAK_LOCAL.map((r) => ({ o: applyRot(world.R, r.o), d: applyRot(world.R, r.d) }));
+            const countLeaks = async () => {
+              const get = await shoot(rays);
+              let leaks = 0;
+              const samples = [];
+              for (let i = 0; i < LEAK_RAYS; i++) {
+                const r = get(i);
+                if (!r.hit) {
+                  leaks++;
+                  if (samples.length < 4) samples.push({ i, o: rays[i].o, d: rays[i].d, steps: r.steps });
+                }
+              }
+              return { leaks, samples };
+            };
+            const sealed = await countLeaks();
+            fill.setFaceBits(false);
+            await compute(win.clearStaticPass);
+            await compute(fill.pass);
+            const blind = await countLeaks();
+            fill.setFaceBits(true);
+            await compute(win.clearStaticPass);
+            await compute(fill.pass);
+            say(`  ${world.name} leak: ${sealed.leaks} of ${LEAK_RAYS} escape the 5 cm wall; ` +
+              `control (face bits withheld) ${(100 * blind.leaks / LEAK_RAYS).toFixed(1)} %`);
+            rotOut.push({
+              name: world.name, rot: world.R, panel: info,
+              scene: prims.map((p) => ({ kind: p.kind, min: p.min, max: p.max, pal: p.pal })),
+              arms, leak: { sealed: sealed.leaks, control: blind.leaks, rays: LEAK_RAYS, samples: sealed.samples },
+            });
+          }
+          gu.domFaceOn.value = DOM_ON ? 1 : 0;
+          results.rotated = { frames: ROT_FRAMES, taps: CROP_TAPS, worlds: rotOut };
+
+          // Put the page back the way the rest of the receipts found it, so a
+          // later edit that appends a section does not inherit a turned room.
+          await applyWorld(WORLDS[0]);
+          await resetGather();
         }
 
         if (validationErrors.length) throw new Error(`WebGPU validation: ${validationErrors[0]}`);
