@@ -87,6 +87,64 @@ export const GI2_PAL_CLASSES = PAL_ENTRIES - 1;
 const COARSE_FIRST_FRAMES = 90;
 
 /**
+ * ══ §19 STAGE 4.1 — WHERE THE MOVING FRAME GOES, AND ⛔ WHAT DOES NOT FIX IT ═
+ *
+ * THE REPORT: "60-70 fps static, heavy freezes when the camera moves." THE
+ * MEASUREMENT (`probe:gi2-motion`, Bistro, ultra, 1650×970, per-kernel GPU
+ * timestamps via `__giBatchCompute = false`): the whole GI2 pre-gbuffer chain
+ * costs **0.14 ms** on a frame where the window did not scroll and **63 ms
+ * median / 146 ms max** on a frame where it did. ONE kernel owns all of it —
+ * `binPairs`. Every other GI2 kernel stays under 2 ms in both cases, the raster
+ * half never exceeds 20 ms, and the CPU tick marks only ~20 ms of a 150 ms wall
+ * clock: the frame is not slow, it is WAITING on a GPU submission that ran long.
+ * That is also why `profile.frameStats`' EMA'd `gpuMs` shows nothing — 34 burst
+ * frames in 901 move a smoothed mean by about a millisecond.
+ *
+ * ⛔⛔ REFUTED, WITH RECEIPTS: BOUNDING THE DIRTY-BRICK COUNT.
+ *
+ * The obvious budget — measure the pass, admit fewer dirty bricks next frame —
+ * was built behind `setDirtyLimit` and MEASURED. It makes the report worse, and
+ * by a lot. An in-boot sweep (one session, so one machine's contention across
+ * every arm; `VOX_SWEEP=24,384,20480` on the dolly):
+ *
+ *     limit    voxelize ms med/max    moving frame med/max   frames > 50 ms
+ *        24        42.9 / 78.8            89.1 / 333.4              35
+ *       384         0.14 / 57.4           21.3 / 165.2               4
+ *     20480         0.15 / 63.9           18.4 / 138.4               5
+ *
+ * 384 and "no limit at all" are indistinguishable; 24 is a catastrophe. Over a
+ * whole three-arm run the controller took total voxelize GPU from **2 264 ms to
+ * 23 915 ms** (10.5x) and the gather's valid probes from 7 128 to 1 392 — the
+ * window never converged, so every frame paid instead of one in thirty.
+ *
+ * ⭐⭐ THE REASON, AND IT IS THE USEFUL PART: `binPairs` IS ONE THREAD PER
+ * BRICK, AND THE PASS COSTS WHAT ITS SLOWEST THREAD COSTS. A brick's count walk
+ * reads every triangle of every soup cell it overlaps. The soup grid is 4 m
+ * (`SOUP_CELL_SIZE`), so an L0 brick (1 m at ultra) touches ~8 cells while an L4
+ * brick (16 m) touches the loop's whole 6³ = 216 — at Bistro's density roughly
+ * 16 k triangles for a fine brick against ~430 k for a coarse one, which is tens
+ * of milliseconds of SERIAL work in a single lane. Running 2 048 such threads at
+ * once costs barely more than running 24, because the GPU has the width. So
+ * admitting fewer bricks buys no time; it only multiplies the number of frames
+ * that each pay the worst brick's latency.
+ *
+ * ▶ THE LEVER IS PER-BRICK WORK, NOT PER-FRAME BRICKS. The kernel already
+ * resumes on a PAIR cursor (§2.5); what it needs is a CELL cursor, so a brick
+ * walks a bounded slice of its soup cells per frame and comes back. That changes
+ * the resumption contract (both walks must agree on the first triangle, and the
+ * voxel clear keys on "first instalment"), which is why it is named here rather
+ * than attempted alongside a budget experiment.
+ *
+ * What survives: the MEASUREMENT. `counters.voxMs` / `voxMsPeak` publish the
+ * pre-gbuffer chain's real GPU cost into `snapshot()`, so a burst is visible in
+ * `profile.frameStats.gi2` with no readback and no suspended render loop — which
+ * is what made all of the above knowable in the first place.
+ */
+const VOX_MS_BUDGET = { phone: 1.0, medium: 1.0, high: 2.0, ultra: 2.0 };
+/** The boot allowance, held until the window reports occupancy. */
+const VOX_BOOT_MS = 6.0;
+
+/**
  * ══ THE VOLUME STAND-IN (§M.1) ═══════════════════════════════════════════════
  *
  * `createSrcVolume` refuses to exist without an occupancy field — correctly:
@@ -462,6 +520,13 @@ export function createGi2System({
   const counters = {
     soupTris: 0, soupMB: 0, soupBuildMs: 0, soupStallMs: 0, soupDropped: 0, soupTruncated: false,
     palClasses: 0, palEmissiveClasses: 0, palEmitterBand: 0, movers: 0, moverTris: 0, scrolls: 0,
+    // §19 Stage 4.1's receipts, and the reason the stage found anything:
+    // `voxMs` is the LAST measured GPU cost of the pre-gbuffer chain,
+    // `voxMsPeak` the worst since the build, `voxOverBudget` how many samples
+    // exceeded the frame's allowance. They ride `snapshot()`, so they cost no
+    // readback — which is the whole point, because a burst is exactly what a
+    // 30-frame readback cadence and an EMA'd `gpuMs` are both blind to.
+    voxMs: 0, voxMsPeak: 0, voxBudgetMs: VOX_BOOT_MS, voxSamples: 0, voxOverBudget: 0,
   };
   // The class assignment this build baked into the soup and the voxel bytes —
   // the ONLY thing `#retintGi2Palette` may reuse (see `build`).
@@ -908,6 +973,69 @@ export function createGi2System({
     u.projScale.value = projScaleOf(camera, height);
   };
 
+  // ═══════════ §19 STAGE 4.1: THE PRE-GBUFFER CHAIN'S REAL GPU COST ═════════
+  //
+  // ⛔ NOT A CONTROLLER ANY MORE — see the `VOX_MS_BUDGET` header for the sweep
+  // that refuted spending an ms budget by admitting fewer dirty bricks. What
+  // is left is the measurement, which is what named the mechanism and is worth
+  // keeping on its own: it costs one Map lookup a frame and it is the only
+  // per-frame GPU number in this module that a burst cannot hide from.
+  //
+  // three's `WebGPUTimestampQueryPool` keeps a Map from a pass's uid to its
+  // resolved GPU duration, and `backend.get(list).timestampUID` is that uid for
+  // the array `giCompute` batched. So the chain's real cost is readable a few
+  // frames later with no extra query, no readback and no suspended render loop.
+  //
+  // ⚠ READ THE POOL DIRECTLY, NOT THROUGH `backend.getTimestamp(uid)`: that
+  // accessor picks its pool from the uid PREFIX, and a batched ARRAY has no
+  // `isComputeNode`, so its uid says `r:` while its timestamp lives in the
+  // COMPUTE pool — the accessor would look in the wrong one and warn. Consuming
+  // the entry also stops three's Map, which nothing else in the engine reads and
+  // nothing ever clears, from growing for the life of the session.
+  const voxPending = [];
+  let lastBeforeList = null;
+
+  /** The window has filled and first light has arrived — `statsCadence`'s test. */
+  const windowSettled = () =>
+    (marks.occupancy.size >= win.levels && marks.firstLight > 0) ||
+    (marks.voxelizer > 0 && performance.now() - marks.voxelizer > 20_000);
+
+  const applyVoxSample = (ms) => {
+    counters.voxMs = +ms.toFixed(3);
+    counters.voxMsPeak = Math.max(counters.voxMsPeak, counters.voxMs);
+    counters.voxBudgetMs = windowSettled() ? (VOX_MS_BUDGET[tier] ?? 2.0) : VOX_BOOT_MS;
+    if (ms >= counters.voxBudgetMs) counters.voxOverBudget++;
+    counters.voxSamples++;
+  };
+
+  /** Collect whatever the renderer's last timestamp resolve landed for our chain. */
+  const drainVoxTimings = (r) => {
+    if (!voxPending.length) return;
+    const pools = r?.backend?.timestampQueryPool;
+    if (!pools) { voxPending.length = 0; return; }
+    const keep = [];
+    // ⚠ THE COMPUTE POOL, AND ONLY IT. The uid's `r:` prefix is a lie of
+    // three's own making (an array has no `isComputeNode`), but the timestamp
+    // is written by `initTimestampQuery(COMPUTE, uid)` — so compute is where it
+    // is, and consulting the render pool as a fallback would only expose this
+    // to a uid collision with a render context that happens to share an id.
+    const map = pools.compute?.timestamps;
+    for (const p of voxPending) {
+      let ms;
+      if (map?.has(p.uid)) { ms = map.get(p.uid); map.delete(p.uid); }
+      if (ms === undefined) {
+        // ~4 s of frames to resolve, then drop: a pass whose queries were
+        // evicted never lands and would otherwise hold this list forever.
+        p.age = (p.age ?? 0) + 1;
+        if (p.age < 240) keep.push(p);
+        continue;
+      }
+      applyVoxSample(ms);
+    }
+    voxPending.length = 0;
+    for (const p of keep) voxPending.push(p);
+  };
+
   /**
    * §M.2's frame order. Returns the compute nodes in the order they must be
    * dispatched; the caller submits them (through `giCompute`'s batched submit),
@@ -923,6 +1051,9 @@ export function createGi2System({
     if (!gather) return { before: [], after: [], all: [] };
     gather.beginFrame(frame);
     syncLighting();
+    // §19 Stage 4.1: whatever the renderer's last timestamp resolve landed for
+    // the pre-gbuffer chain. Publishes into `snapshot()`; drives nothing.
+    drainVoxTimings(renderer);
 
     const before = [];
     // The window's own bookkeeping. `statsResetPass` every frame (its receipts
@@ -958,6 +1089,11 @@ export function createGi2System({
       before.push(cache.allocPass);
     }
     if (dynamic) before.push(...dynamic.passes());
+    // The array the caller will hand to `giCompute`, kept so `notePassesRan`
+    // can ask the backend for its timestamp uid. Stored rather than passed back
+    // through a new argument: only the caller knows whether the batch actually
+    // landed, and `notePassesRan` is already the place it says so.
+    lastBeforeList = before;
 
     // ── after the g-buffer prepass ────────────────────────────────────────
     //
@@ -1003,7 +1139,11 @@ export function createGi2System({
       }
     }
 
-    return { before, after, all: [...before, ...after] };
+    // `scrollInList` so the caller's chain-shape receipt can EXCLUDE the one
+    // pass that is spliced in and out frame by frame under a moving camera —
+    // otherwise "the shape changed" is true on every other frame and the log
+    // that reports it becomes the stall (§19 Stage 4.1).
+    return { before, after, all: [...before, ...after], scrollInList: scrollInLastList };
   };
 
   // ══════════════════════════════════════════════ RESIZE HANDS THE OLD GATHER OVER
@@ -1315,7 +1455,20 @@ export function createGi2System({
      * the scroll is the one pass whose effect is a ONE-SHOT re-key that nothing
      * downstream re-requests. Same shape as the SRC path's `_srcRanOnce`.
      */
-    notePassesRan() { if (scrollInLastList) pendingScroll = false; },
+    notePassesRan() {
+      if (scrollInLastList) pendingScroll = false;
+      // §19 Stage 4.1 — and it belongs HERE for the same reason `pendingScroll`
+      // does: a deferred batch produced no GPU pass, so asking the backend for
+      // its timestamp would attribute the PREVIOUS frame's uid to this frame's
+      // dirty limit and teach the controller a lie.
+      if (!lastBeforeList || !renderer?.backend) return;
+      try {
+        const uid = renderer.backend.get(lastBeforeList)?.timestampUID;
+        if (uid && voxelizer) voxPending.push({ uid, age: 0 });
+        // Bounded: a device that never resolves must not grow this forever.
+        if (voxPending.length > 32) voxPending.splice(0, voxPending.length - 32);
+      } catch { /* a context three did not track — the seed's fallback covers it */ }
+    },
     get transportAlive() {
       return (lastGather?.probesValid ?? 0) > 0 && (lastGather?.windowHits ?? 0) > 0;
     },

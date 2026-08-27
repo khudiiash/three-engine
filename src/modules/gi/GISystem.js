@@ -3362,11 +3362,33 @@ export class GISystem {
         // a window with no voxelizer (the soup has not landed); a frame with 0
         // "after" passes is a gather that was never built — two very different
         // failures that both present as "GI2 produces no light".
-        const shape = `${this._gi2Passes.before.length}+${this._gi2Passes.after.length}`;
-        if (this._gi2ChainShape !== shape) {
+        //
+        // ⭐ §19 STAGE 4.1 — THE SCROLL IS NOT A SHAPE CHANGE, AND A CONSOLE
+        // LOG ON THE HOT PATH IS NOT FREE.
+        //
+        // The scroll pass is spliced in only on frames where the window origin
+        // stepped, so under a moving camera `before.length` alternated 14, 15,
+        // 14, 15 … and this printed on EVERY frame of a walk. Measured with
+        // `probe:gi2-motion` on Bistro: 8-15 lines per second while moving, and
+        // frames carrying a log ran a median 46 ms against 24.6 ms for frames
+        // that carried none. With devtools attached each line is also a
+        // serialize-and-post to the inspector, which is main-thread work inside
+        // the tick.
+        //
+        // The count that answers the diagnostic question ("0 before = no
+        // voxelizer, 0 after = no gather") is the one WITHOUT the frame-by-frame
+        // splices, so the key excludes the scroll — and a rate limit backs it
+        // up, because any future conditional pass would otherwise reintroduce
+        // exactly this.
+        const beforeShape = this._gi2Passes.before.length - (this._gi2Passes.scrollInList ? 1 : 0);
+        const shape = `${beforeShape}+${this._gi2Passes.after.length}`;
+        const nowMs = performance.now();
+        if (this._gi2ChainShape !== shape && nowMs - (this._gi2ChainShapeAt ?? -Infinity) > 5000) {
           this._gi2ChainShape = shape;
-          console.log(`[gi2] frame chain: ${this._gi2Passes.before.length} pre-gbuffer + ` +
-            `${this._gi2Passes.after.length} post-gbuffer dispatches`);
+          this._gi2ChainShapeAt = nowMs;
+          console.log(`[gi2] frame chain: ${beforeShape} pre-gbuffer + ` +
+            `${this._gi2Passes.after.length} post-gbuffer dispatches` +
+            `${this._gi2Passes.scrollInList ? " (+ the window scroll, on the frames it steps)" : ""}`);
         }
         if (this._gi2Passes.before.length) {
           // §19 Stage 0.2's idiom: `giSkippedComputes` is cleared at the end of

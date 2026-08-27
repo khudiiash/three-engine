@@ -345,6 +345,48 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
   const faceBitsU = uniform(1);
   const pairLimitU = uniform(PAIRS_CAP);
   const levelBudgetU = Array.from({ length: levels }, () => uniform(PAIRS_CAP));
+  /**
+   * ⛔⛔ §19 STAGE 4.1 — THE DIRTY-BRICK CAP. BUILT, MEASURED, REFUTED; KEPT AS
+   * A HARNESS HOOK AND AS THE RECEIPT THAT SAYS WHY.
+   *
+   * The premise was sound and the first half of it is still true: `pairLimitU`
+   * bounds how many pairs `binPairs` WRITES and does not bound how many it
+   * WALKS. Every dirty brick runs `walk(0)` — the counting walk over every
+   * triangle of every soup cell it overlaps — before any budget is consulted,
+   * and the spent-budget early-out below is documented as never firing. So a
+   * scroll that dirties a slab pays for the slab whatever the pair cap says.
+   *
+   * The conclusion drawn from that — "cap the DIRTY LIST instead" — is WRONG,
+   * and the measurement is unambiguous. `probe:gi2-motion`, Bistro, ultra, one
+   * boot so one contention regime (`VOX_SWEEP=24,384,20480`, dolly arm):
+   *
+   *     limit    binPairs chain ms med/max   moving frame med/max   > 50 ms
+   *        24         42.9 / 78.8               89.1 / 333.4           35
+   *       384          0.14 / 57.4              21.3 / 165.2            4
+   *     20480          0.15 / 63.9              18.4 / 138.4            5
+   *
+   * 384 and no cap at all are the same measurement; 24 is a disaster. Driven by
+   * a feedback controller over a whole three-arm run it took total voxelize GPU
+   * from 2 264 ms to 23 915 ms and the gather's valid probes from 7 128 to
+   * 1 392.
+   *
+   * ⭐⭐ THE REASON IS THE SHAPE OF THIS KERNEL: ONE THREAD PER BRICK, SO THE
+   * PASS COSTS WHAT ITS SLOWEST THREAD COSTS. The soup grid is 4 m, so an L0
+   * brick (1 m at ultra) touches ~8 cells and an L4 brick (16 m) touches the
+   * loop's whole `MAX_CELLS` = 6³ — at Bistro's density ~16 k triangles against
+   * ~430 k, tens of milliseconds of SERIAL work in one lane. Two thousand such
+   * threads cost barely more than twenty-four, because the GPU has the width.
+   * Admitting fewer bricks therefore buys no time and multiplies the number of
+   * frames that each pay the worst brick's latency.
+   *
+   * ▶ The lever is PER-BRICK WORK: a CELL cursor beside the existing pair
+   * cursor, so one brick walks a bounded slice of its cells per frame.
+   *
+   * Left in place because the sweep that produced the table above needs it, and
+   * because the next attempt will want to A/B against it. Defaults to the whole
+   * list, so nothing calls it and nothing behaves differently.
+   */
+  const dirtyLimitU = uniform(MAX_DIRTY);
 
   const asNode = (v, make) => (v && v.isNode ? v : make(v));
   const gridOriginU = asNode(soup.origin ?? soup.gridOrigin, (v) =>
@@ -586,6 +628,20 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     const i = instanceIndex.toVar();
     const dirty = atomicLoad(ct.element(uint(CTR_DIRTY))).toVar();
     If(i.greaterThanEqual(dirty.min(uint(MAX_DIRTY))), () => { Return(); });
+
+    // ⛔ THE DIRTY-BRICK CAP — a no-op at its default, and REFUTED as a budget
+    // (the sweep is in `dirtyLimitU`'s note). Kept because the harness that
+    // produced that table needs a way to pin the limit, and because the cut
+    // itself is provably safe: `STATE_BUILDING` is written only under
+    // `If(accept)` far below, so a brick skipped here is never touched by
+    // `finishBricks`, keeps its `brickMask` bit and its pair cursor, and simply
+    // comes back next frame — the same contract the resumable brick already has
+    // when a partial reserve runs out mid-brick. The cut is placed BEFORE the
+    // count walk because that walk, not the SAT, is what a dense scene costs.
+    If(i.toFloat().greaterThanEqual(float(dirtyLimitU)), () => {
+      atomicAdd(ct.element(uint(CTR_DEFER)), uint(1));
+      Return();
+    });
 
     // EARLY OUT ON A SPENT BUDGET — A BOUND, NOT AN OPTIMISATION.
     //
@@ -1238,6 +1294,15 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     setLevelBudget,
     /** Lower the per-frame pair cap WITHOUT re-allocating — the overflow gate. */
     setPairLimit(n) { pairLimitU.value = Math.max(1, Math.min(PAIRS_CAP, n)); },
+    /**
+     * ⛔ HARNESS ONLY. How many DIRTY BRICKS `binPairs` may walk this frame,
+     * priority-ordered; the remainder stays dirty and comes back. Defaults to
+     * the whole list and the engine never calls it — capping it was measured
+     * and REFUTED as a frame budget (`dirtyLimitU` carries the table).
+     */
+    setDirtyLimit(n) { dirtyLimitU.value = Math.max(1, Math.min(MAX_DIRTY, Math.round(n))); },
+    /** What `setDirtyLimit` last accepted. */
+    get dirtyLimit() { return dirtyLimitU.value; },
     /** 1 = the scratch+pack palette (shipping), 0 = the naive packed atomicMax. */
     setPalMode(mode) { palModeU.value = mode ? 1 : 0; },
     /** Harness-only: withhold the face bits so the entry-face test finds nothing. */
