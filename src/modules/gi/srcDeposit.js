@@ -128,6 +128,7 @@ import {
   BSTAT_WORDS,
   CASCADE_COUNT,
   MAX_LODS,
+  MIN_BLOCKS,
   SECONDARY_HIT_WORDS,
   SUM_SHIFT,
   SURPRISE_ONE,
@@ -400,6 +401,71 @@ export function createSrcShadeCounters(bins) {
  * now, which is the point — an assertion that has become impossible to trip by
  * accident is cheaper to keep than to re-derive later.
  */
+/**
+ * The bin store's GPU byte total, as ONE arithmetic that both the
+ * constructor's `throw` below and §19 Stage 0.4's tier byte budget read.
+ *
+ * ⚠ THE POINT IS THAT THERE IS ONE OF THEM. The budget runs BEFORE the store
+ * is created (that is what makes it a budget rather than a post-mortem), so it
+ * cannot ask the store how big it is — and a second copy of this layout in
+ * GISystem would be free to drift from the layout the store actually
+ * allocates, which is the failure "the budget said 180 MB and the device was
+ * lost at 240" is made of.
+ *
+ * @param {number} binTotal    bins across every cascade (Σ bins·blockCapacity)
+ * @param {number} blockTotal  bin blocks across every cascade — the per-block
+ *   statistics tail is one `BSTAT_WORDS` record each
+ * @param {number} [secondaryCapacity]  [J]'s hit-list capacity; 0 = no tail
+ */
+export function srcBinStoreBytes(binTotal, blockTotal, secondaryCapacity = 0) {
+  const binWords = binTotal * BIN_WORDS;
+  const hitCapacity = Math.max(0, Math.floor(secondaryCapacity));
+  const hitWords = hitCapacity > 0 ? 1 + hitCapacity * SEC_HIT_WORDS : 0;
+  const statWords = blockTotal * BSTAT_WORDS;
+  const scratchBytes = (binWords + hitWords + statWords) * 4;
+  const payloadBytes = binTotal * PAYLOAD_WORDS * 4;
+  return {
+    binWords,
+    hitWords,
+    statWords,
+    scratchBytes,
+    payloadBytes,
+    /** What the built store's own `bytes` field reports. */
+    bytes: scratchBytes + payloadBytes + STAT_WORDS * 4,
+  };
+}
+
+/**
+ * An UPPER BOUND on `srcBinStoreBytes` from the pool knob alone — no probe
+ * store, no allocation. §19 Stage 0.4's budget runs before either exists.
+ *
+ * ⚠ WHY A BOUND AND NOT THE EXACT NUMBER. `blockCapacities` additionally caps
+ * each cascade's block pool at that cascade's PROBE capacity (a block no probe
+ * slot can ever claim is waste), and that cap needs the probe-capacity ladder,
+ * which lives inside `srcProbes.createSrcProbeStore` and is not exported.
+ * Dropping the cap can only make the answer LARGER, which is the safe
+ * direction for a budget — and at every shipping (c0Probes, binBudget) pair the
+ * cap does not bind anyway (2.8 M bins buys 21,875 c0 blocks against 32,768
+ * slots). Fold this into a real planner the next time srcProbes.js is opened.
+ */
+export function srcBinStoreBoundBytes({
+  binBudget,
+  w0 = W0,
+  cascadeCount = CASCADE_COUNT,
+  secondaryCapacity = 0,
+} = {}) {
+  const perCascade = Math.max(1, Math.floor(binBudget / Math.max(1, cascadeCount)));
+  let binTotal = 0;
+  let blockTotal = 0;
+  for (let c = 0; c < cascadeCount; c++) {
+    const bins = binCount(c, w0);
+    const blocks = Math.max(MIN_BLOCKS, Math.floor(perCascade / bins));
+    binTotal += bins * blocks;
+    blockTotal += blocks;
+  }
+  return srcBinStoreBytes(binTotal, blockTotal, secondaryCapacity);
+}
+
 export function createSrcBinStore(store, {
   w0 = W0,
   maxBytes = 128 * 1024 * 1024,
@@ -440,14 +506,14 @@ export function createSrcBinStore(store, {
   // against a full worklist for exactly as long as anyone waited). So the
   // record rides `scratch`, which [E] already binds, exactly as [J]'s hit list
   // does and for the same measured reason.
-  const binWords = binTotal * BIN_WORDS;
+  // §19 Stage 0.4: the SAME arithmetic the tier byte budget runs before this
+  // constructor is reached — see `srcBinStoreBytes`. The throw below is now
+  // the assert behind that budget rather than the only thing checking.
   const hitCapacity = Math.max(0, Math.floor(secondaryCapacity));
+  const { binWords, hitWords, statWords, scratchBytes, payloadBytes } =
+    srcBinStoreBytes(binTotal, store.blockTotal, hitCapacity);
   const hitListBase = binWords;
-  const hitWords = hitCapacity > 0 ? 1 + hitCapacity * SEC_HIT_WORDS : 0;
   const blockStatBase = hitListBase + hitWords;
-  const statWords = store.blockTotal * BSTAT_WORDS;
-  const scratchBytes = (binWords + hitWords + statWords) * 4;
-  const payloadBytes = binTotal * PAYLOAD_WORDS * 4;
   if (scratchBytes > maxBytes || payloadBytes > maxBytes) {
     throw new Error(
       `createSrcBinStore: ${(binTotal / 1e6).toFixed(2)}M bins needs ` +

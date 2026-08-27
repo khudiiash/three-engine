@@ -123,6 +123,12 @@ export class Engine extends EventEmitter {
     this.sceneName = "Untitled";
     this.playing = false;
     this.rendererReady = false;
+    /**
+     * Unexpected `device.lost` events this session (see #watchDevice). NOT
+     * bumped by a settings-driven renderer rebuild, which is the distinction
+     * `renderer-rebuilt` subscribers need before reacting expensively.
+     */
+    this.deviceLostCount = 0;
     // ---- Game time --------------------------------------------------------
     // Everything a pause menu, a slow-motion effect, hitstop, or a debugger's
     // frame-step needs. `timeScale` multiplies the delta handed to update
@@ -597,6 +603,21 @@ export class Engine extends EventEmitter {
       // Only if this dead device is still the one the live renderer holds —
       // otherwise a rebuild has already moved on and this is a stale echo.
       if (this.renderer?.backend?.device !== device) return;
+      // ── §19 STAGE 0.4: THE COUNTER THAT SAYS "REAL LOSS" ─────────────────
+      //
+      // `renderer-rebuilt` is emitted by BOTH paths into #rebuildRenderer: an
+      // unexpected device loss (here) and a settings change that changes a
+      // constructor option (#applyRendererOptionsIfChanged). Its subscribers
+      // cannot tell them apart from the event alone, and one of them now has
+      // to: GI drops a quality tier on a real loss, and doing that on the
+      // ordinary first-boot settings rebuild would silently downgrade every
+      // session ([[playstop-device-destroy]] is the same trap from the other
+      // side — an expensive reaction fired off a settings diff).
+      //
+      // A monotonic count rather than a flag on the event: a subscriber
+      // compares it against what it last saw, so a listener that missed an
+      // event, or one that attached late, still reaches the right answer.
+      this.deviceLostCount = (this.deviceLostCount ?? 0) + 1;
       const canvas = this.renderer.domElement;
       console.warn("[gpu] rebuilding the renderer after an unexpected device loss");
       this.renderer.setAnimationLoop(null);

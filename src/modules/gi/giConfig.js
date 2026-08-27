@@ -160,6 +160,91 @@ export function giDeviceTierCeiling(runtime = globalThis) {
   return null;
 }
 
+/**
+ * ══ §19 STAGE 0.4 — THE TIER GPU BYTE BUDGET (INTERIM) ═════════════════════
+ *
+ * What GI is allowed to allocate on the GPU, per tier, BEFORE it allocates it:
+ * the occupancy `bits` buffer + the SRC bin store + the screen targets.
+ *
+ * ⚠ INTERIM, AND DELIBERATELY GENEROUS. GI2's own table (plan §4.6) is 48 MB
+ * at phone-low and 192 MB at ultra — an order of magnitude under these. These
+ * numbers are sized for the CURRENT architecture, whose `bits` buffer alone
+ * measures 321-491 MB on a real ultra scene, and their only job is to make the
+ * degrade ladder run BEFORE the allocation instead of after the device is
+ * lost. Tightening them toward §4.6 is GI2's work, not a tuning knob.
+ *
+ * ⚠ NOT A PROPERTY. Nothing reads this from a scene, a component or a global —
+ * it is keyed on the tier the device already resolved to, which is the whole
+ * argument of [[gi-one-property]]: a budget the author can raise is a budget
+ * that gets raised until the device dies.
+ *
+ * The low rung is what a `device.lost` tier drop lands on, and 192 MB is
+ * chosen against Safari's 256 MB `maxBufferSize` floor and the 350-450 MB page
+ * memory of an iPhone 14 or older — GI must fit inside a page that also holds
+ * the scene's textures and geometry.
+ */
+export const GI_TIER_GPU_BUDGET_BYTES = Object.freeze({
+  low: 192 * 1024 * 1024,
+  medium: 384 * 1024 * 1024,
+  high: 768 * 1024 * 1024,
+  ultra: 1536 * 1024 * 1024,
+});
+
+/**
+ * ══ §19 STAGE 0.4 — `unrestricted_pointer_parameters` ══════════════════════
+ *
+ * WGSL's baseline forbids a user function from taking a pointer INTO a storage
+ * (or uniform/workgroup) address space as a parameter; the
+ * `unrestricted_pointer_parameters` language feature lifts that. This module
+ * writes raw WGSL (`wgslFn`) in nine places that do exactly that, and they are
+ * not decoration — they are the hash table every probe is inserted through and
+ * every exact-geometry traversal:
+ *
+ *   srcProbes.js:274, 320       srcHashInsert / srcHashFind (`array<atomic<u32>>`)
+ *   dynamicObjects.js:608, 716, 838, 976   the mover BVH4 traversals
+ *   bvh/bvhScene.js:215-218     the static scene BVH8 traversal
+ *
+ * The failure is silent in the direction that matters: a pipeline that fails
+ * WGSL validation dispatches nothing and, under WebKit, logs nothing (319770).
+ * So the feature is READ, once, rather than discovered from a black frame.
+ *
+ * ⛔ THE PROBE HASH IS NOT OPTIONAL. Turning off the exact dynamic objects and
+ * the static BVH8 removes five of the seven sites; `srcHashInsert` is the SRC
+ * population itself and has no fallback arm today. Reporting that honestly is
+ * the point of this check — a device without the feature is a device GI cannot
+ * run on until those two kernels are ported to TSL, and the transport latch
+ * (§H.1) is what keeps the picture alive meanwhile.
+ *
+ * Memoized: `navigator.gpu.wgslLanguageFeatures` cannot change mid-session, and
+ * the error must be said once, not per rebuild.
+ */
+let ptrParamsChecked = false;
+let ptrParamsSupported = true;
+export function wgslPointerParametersSupported(runtime = globalThis) {
+  if (ptrParamsChecked) return ptrParamsSupported;
+  ptrParamsChecked = true;
+  const features = runtime?.navigator?.gpu?.wgslLanguageFeatures;
+  // ⚠ ABSENT ≠ UNSUPPORTED. `wgslLanguageFeatures` itself is newer than the
+  // feature it reports, and a WebGPU implementation that does not expose the
+  // set at all tells us nothing — treating that as "unsupported" would turn
+  // off exact geometry on every browser that predates the API. Only a set that
+  // EXISTS and does not contain the key is evidence.
+  if (!features || typeof features.has !== "function") return true;
+  ptrParamsSupported = features.has("unrestricted_pointer_parameters");
+  if (!ptrParamsSupported) {
+    console.error(
+      "[gi] ⛔ WGSL `unrestricted_pointer_parameters` is NOT supported here. Every raw-WGSL kernel "
+      + "that takes a storage pointer parameter fails validation, dispatches nothing, and (under "
+      + "WebKit) reports nothing: srcProbes.js srcHashInsert/srcHashFind, dynamicObjects.js's four "
+      + "mover-BVH traversals, bvh/bvhScene.js's static BVH8 traversal. Exact dynamic objects and "
+      + "the static BVH8 are being forced OFF for this session; the SRC probe hash has no fallback "
+      + "arm, so GI transport will not run at all — the environment IBL is left on and the scene is "
+      + "lit by direct light only (see profile.frameStats.giTransport).",
+    );
+  }
+  return ptrParamsSupported;
+}
+
 let warnedClamp = false;
 
 /** `tier` clamped to `ceiling` using GI_QUALITY_LEVELS' cost order. */

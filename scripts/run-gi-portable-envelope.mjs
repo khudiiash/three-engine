@@ -42,7 +42,9 @@
 //   POSE=px,py,pz,tx,ty,tz
 //   QUALITY=high        pinned per arm (the phone gets the BUILD's tier — see
 //                       project.json build.quality, "ultra" as of 2026-08-23)
-//   ARMS=desktop,portable
+//   ARMS=desktop,portable   also: `low` (portable limits + __giDeviceTier="low",
+//                       §19 Stage 0.4's tier byte budget + tier-drop landing
+//                       zone), `nolightshadow` (isolation arm, see armGlobals)
 //   SETTLE=12000  PNG=1
 import puppeteer from "puppeteer-core";
 import { writeFileSync, mkdirSync } from "node:fs";
@@ -71,7 +73,12 @@ const PORTABLE_CAP = {
 };
 
 const armGlobals = (arm) => ({
-  __giConfigOverride: { quality: QUALITY },
+  // ⚠ THE `low` ARM MUST NOT PIN THE QUALITY. `resolveGiConfig` applies
+  // `__giConfigOverride` LAST — after `giDeviceTierCeiling`'s clamp — so
+  // pinning `quality` here beats `__giDeviceTier` and the arm builds at the
+  // authored tier with a low tier's BY_TIER values underneath: a hybrid that
+  // is neither tier and measures nothing. The clamp is the point of the arm.
+  ...(arm === "low" ? {} : { __giConfigOverride: { quality: QUALITY } }),
   ...(arm === "portable" ? { __engineLimitsCap: PORTABLE_CAP } : {}),
   // ISOLATION ARM for the `Destroyed texture "ShadowDepthTexture"` storm the
   // portable arm shows: a baseline device has 4 storage textures, so
@@ -80,6 +87,20 @@ const armGlobals = (arm) => ({
   // desktop limits — if the storm appears here too, the limits are innocent
   // and the bug is in the fallback, which is a far smaller thing to fix.
   ...(arm === "nolightshadow" ? { __giNoLightShadows: true } : {}),
+  // §19 STAGE 0.4 — THE FORCED-LOW ARM. `low` is where a `device.lost` tier
+  // drop lands and where the 192 MB byte budget binds, and neither can be
+  // exercised from a desktop any other way: `giDeviceTierCeiling` detects no
+  // ceiling here, so every other arm builds at the authored tier. This arm
+  // pins BOTH the tier and the portable limits, because a phone has both. The
+  // gate is that the console shows either the budget ladder FITTING or GI
+  // refusing with IBL intact — never a black frame, and `meanLum` below is
+  // the instrument that can tell the difference (a black frame reads ~0).
+  ...(arm === "low" ? { __engineLimitsCap: PORTABLE_CAP, __giDeviceTier: "low" } : {}),
+  // GLOBALS='{"__giOccBudget":6.4e7}' — arbitrary extra hatches, applied last.
+  // A degrade ladder that no run has ever made FIRE is an untested ladder, and
+  // on the scenes it exists for it fires once and cannot be re-run; this is how
+  // a probe drives it deliberately ([[probe-blind-statistics]]).
+  ...JSON.parse(process.env.GLOBALS ?? "{}"),
 });
 
 const browser = await puppeteer.launch({
@@ -115,6 +136,23 @@ async function runArm(arm) {
     const msg = String(e.message ?? e);
     if (!/save_scene/.test(msg)) errors.push(`pageerror ${msg.slice(0, 300)}`);
   });
+  // ⚠ A NAVIGATION IS THE ONE FAILURE THIS PROBE CANNOT SEE FROM ITS CONSOLE.
+  // "Execution context was destroyed" is puppeteer telling us the page went
+  // away mid-evaluate, and the console log simply STOPS — with no line saying
+  // why, and nothing to distinguish a vite full-reload from an editor reload
+  // from a crash. Record every navigation in the same ordered stream.
+  page.on("framenavigated", (f) => {
+    if (f === page.mainFrame()) all.push(`${((Date.now() - t0) / 1000).toFixed(1)}s NAVIGATED ${f.url().slice(0, 160)}`);
+  });
+  // ⚠ THE LOG MUST SURVIVE THE THROW. `FULLLOG=1` wrote the file only on the
+  // success path, so the one run that most needs its console — an arm that
+  // died mid-evaluate with "Execution context was destroyed" — was the one run
+  // that produced nothing at all. An instrument that goes quiet exactly when
+  // its subject fails is not an instrument.
+  const dumpLog = () => {
+    if (process.env.FULLLOG === "1") writeFileSync(`${OUT}/${arm}.log`, all.join("\n"));
+  };
+  process.on("exit", dumpLog);
   await installTauriShim(page, {}); // read-only by construction
   await page.evaluateOnNewDocument((project, globals, wantPasses) => {
     localStorage.setItem("engine.projectRoot.v1", project);
@@ -149,10 +187,18 @@ async function runArm(arm) {
     const engine = await ensureEngine();
     if (!engine) return { fail: "no engine" };
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    // ⚠ "GI REFUSED" IS A RESULT, NOT A TIMEOUT. §19 Stage 0.4's byte budget
+    // can decline to build at all (an allocation this device cannot create),
+    // and that is a PASS condition of the forced-low gate — the scene must
+    // still be lit, by IBL and direct light, and this probe's frame-luminance
+    // readback is the only instrument that can say so. Waiting for
+    // `system.state` forever would turn the very outcome under test into
+    // "gi never ready" 240 seconds later, with no picture measured.
     {
       const end = performance.now() + 240_000;
       for (;;) {
-        if (engine.modules?.get?.("gi")?.system?.state) break;
+        const sys = engine.modules?.get?.("gi")?.system;
+        if (sys?.state || sys?._occRefusedForBudget) break;
         if (performance.now() > end) return { fail: "gi never ready" };
         await sleep(500);
       }
@@ -228,12 +274,18 @@ async function runArm(arm) {
       } catch (e) { passes = { error: String(e?.message ?? e) }; }
     }
 
-    // ── THE STORAGE-BUFFER CENSUS ──────────────────────────────────────────
+    // ── THE BINDING CENSUS: THREE AXES, NOT ONE (§19 Stage 0.4) ────────────
     //
     // gi-gpu-smoke audits `state.queue` + `srcProbes.passes` only — the
     // OCCUPANCY CHAIN is dispatched separately (occupancyField.passes()) and
     // has never been in the audited set, which is how a 9-buffer kernel got
     // past the portable pin. Census every GI compute node there is.
+    //
+    // And storage buffers were never the only floor. Safari grants 12 UNIFORM
+    // buffers per stage (the hit-shade kernel was measured wanting 16) and
+    // FOUR storage textures (the resolve writes 3, the BVH reflect target
+    // makes 4). A kernel over any one of the three has an invalid pipeline
+    // layout and dispatches nothing — identically, and identically silently.
     const census = [];
     {
       const nodes = [];
@@ -249,6 +301,8 @@ async function runArm(arm) {
         try { shader = renderer._nodes?.getForCompute?.(node)?.computeShader ?? ""; } catch { /* not built */ }
         if (!shader) continue;
         const lines = shader.split("\n").filter((l) => l.includes("var<storage"));
+        const uniformLines = shader.split("\n").filter((l) => l.includes("var<uniform"));
+        const storageTexLines = shader.split("\n").filter((l) => l.includes("texture_storage_"));
         // The WGSL names are `NodeBuffer_<nodeId>` and say nothing. The STRUCT
         // that each one is typed by does — `array<i32>` is the fit scratch,
         // `array<vec4<f32>>` the vertex pool — so carry the declaration too.
@@ -259,9 +313,15 @@ async function runArm(arm) {
           return (m?.[0] ?? "").replace(/\s+/g, " ").slice(0, 90);
         };
         census.push({
-          name, storage: lines.length, kb: +(shader.length / 1024).toFixed(0),
+          name,
+          storage: lines.length,
+          uniform: uniformLines.length,
+          storageTex: storageTexLines.length,
+          kb: +(shader.length / 1024).toFixed(0),
           lines: lines.map((l) => `${(l.match(/NodeBuffer_\d+/) ?? [""])[0]}  ${structOf(l)}`),
-          wgsl: lines.length > 8 ? shader : null,
+          uniformLines: uniformLines.map((l) => l.trim().slice(0, 110)),
+          storageTexLines: storageTexLines.map((l) => l.trim().slice(0, 110)),
+          wgsl: lines.length > 8 || uniformLines.length > 12 || storageTexLines.length > 4 ? shader : null,
         });
       }
     }
@@ -274,6 +334,17 @@ async function runArm(arm) {
       quality: system.config?.quality ?? null,
       meanLum: sum / n,
       darkFrac: dark / n,
+      // §19 Stage 0.4 — the IBL gate's own state. "alive" is the transport
+      // latch's proof; "dead" means GI is off AND the scene kept its
+      // environment IBL, which is the difference between a flat picture and a
+      // black one. `iblSuppressed` is the effect, read from the scene rather
+      // than inferred: with the gate working the two must agree.
+      transport: system.transportState ?? null,
+      iblSuppressed: !!engine.scene?.environmentNode,
+      hasEnvironment: !!engine.scene?.environment,
+      // §19 Stage 0.4's refusal. When true the numbers above describe a scene
+      // with NO GI at all, and `meanLum` is the whole verdict.
+      refused: !!system._occRefusedForBudget,
       src: src ? {
         live: stats.cascades?.map((c) => c.live) ?? null,
         rays: stats.rays?.rays ?? 0,
@@ -315,6 +386,8 @@ for (const arm of ARMS) {
     console.log(`  device limits: ${Object.entries(r.limits).map(([k, v]) =>
       `${k.replace("maxStorage", "stg").replace("maxUniform", "uni").replace("PerShaderStage", "")}=${v}`).join(" ")}`);
     console.log(`  canvas ${r.canvas}  quality ${r.quality}  frame meanLum ${r.meanLum.toFixed(4)} dark ${(r.darkFrac * 100).toFixed(1)}%`);
+    console.log(`  transport ${r.transport ?? "n/a"}${r.refused ? " (GI REFUSED — byte budget)" : ""}`
+      + `  ibl ${r.hasEnvironment ? (r.iblSuppressed ? "SUPPRESSED (GI owns the sky)" : "ON (gate holding)") : "no environment in scene"}`);
     if (typeof r.src === "string") console.log(`  src: ${r.src}`);
     else {
       const s = r.src;
@@ -325,18 +398,50 @@ for (const arm of ARMS) {
         `gather ${s.gatherLit}/${s.gatherPixels} mean ${s.gatherMeanLum?.toFixed?.(4)}`);
     }
     if (r.census?.length) {
-      const over = r.census.filter((c) => (c.storage ?? 0) > 8).sort((a, b) => b.storage - a.storage);
-      const near = r.census.filter((c) => (c.storage ?? 0) >= 6 && (c.storage ?? 0) <= 8);
-      console.log(`  census: ${r.census.length} kernels; ${over.length} OVER the portable 8, ${near.length} at 6-8`);
-      for (const c of over) {
-        console.log(`   ⛔ ${c.name}: ${c.storage} storage buffers (${c.kb}kB)`);
-        for (const l of c.lines) console.log(`        ${l.trim().slice(0, 150)}`);
+      // ── THREE AXES, AND THE DEVICE'S OWN LIMITS AS WELL ────────────────
+      // The baseline column is the portability verdict ("this will not run on
+      // a phone"); the device column is a verdict about THIS RUN ("that kernel
+      // dispatched nothing in the frame we just measured"). On the portable
+      // arm they coincide by construction, which is the arm's whole point.
+      const AXES = [
+        { key: "storage", base: 8, label: "storage buffers", dev: "maxStorageBuffersPerShaderStage", lines: "lines" },
+        { key: "uniform", base: 12, label: "uniform buffers", dev: "maxUniformBuffersPerShaderStage", lines: "uniformLines" },
+        { key: "storageTex", base: 4, label: "storage textures", dev: "maxStorageTexturesPerShaderStage", lines: "storageTexLines" },
+      ];
+      const overRows = [];
+      for (const ax of AXES) {
+        for (const c of r.census) {
+          const got = c[ax.key] ?? 0;
+          const hard = r.limits?.[ax.dev];
+          if (got > ax.base || (typeof hard === "number" && got > hard)) {
+            overRows.push({ c, ax, got, hard, overDevice: typeof hard === "number" && got > hard });
+          }
+        }
+      }
+      overRows.sort((a, b) => (b.got - b.ax.base) - (a.got - a.ax.base));
+      const maxOf = (key) => r.census.reduce((m, c) => Math.max(m, c[key] ?? 0), 0);
+      console.log(`  census: ${r.census.length} kernels; ${overRows.length} binding(s) over a counted limit `
+        + `(worst: ${maxOf("storage")} storage / ${maxOf("uniform")} uniform / ${maxOf("storageTex")} storage-tex)`);
+      // ⭐ THE TOP THREE PER AXIS, ALWAYS. A "0 over" line is only believable
+      // if the instrument can be shown to have seen its subject
+      // ([[probe-blind-statistics]]) — a census that silently found nothing to
+      // parse reports exactly the same zero as a clean build.
+      for (const ax of AXES) {
+        const top = [...r.census].sort((a, b) => (b[ax.key] ?? 0) - (a[ax.key] ?? 0)).slice(0, 3);
+        console.log(`    top ${ax.label} (baseline ${ax.base}, device ${r.limits?.[ax.dev] ?? "?"}): `
+          + top.map((c) => `${c.name}=${c[ax.key] ?? 0}`).join("  "));
+      }
+      for (const { c, ax, got, hard, overDevice } of overRows) {
+        console.log(`   ⛔ ${c.name}: ${got} ${ax.label} (baseline ${ax.base}`
+          + `${overDevice ? `, OVER THIS DEVICE'S ${hard}` : ""}) (${c.kb}kB)`);
+        for (const l of (c[ax.lines] ?? [])) console.log(`        ${String(l).trim().slice(0, 150)}`);
         if (c.wgsl) {
           writeFileSync(`${OUT}/${c.name.replace(/[^\w#-]/g, "_")}.wgsl`, c.wgsl);
           console.log(`        (full WGSL → ${OUT}/${c.name}.wgsl)`);
         }
       }
-      for (const c of near) console.log(`    · ${c.name}: ${c.storage} (${c.kb}kB)`);
+      const near = r.census.filter((c) => (c.storage ?? 0) >= 6 && (c.storage ?? 0) <= 8);
+      for (const c of near) console.log(`    · ${c.name}: ${c.storage} storage (${c.kb}kB)`);
     }
     if (r.passes && !r.passes.error) {
       // The op nests: screen passes under one key, the frame queue under

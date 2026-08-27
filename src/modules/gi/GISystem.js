@@ -29,7 +29,7 @@
 import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionGeometry, positionWorld, renderGroup, sRGBTransferEOTF, screenCoordinate, screenUV, select, sin, smoothstep, step, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
-import { GI_TERM_DEBUG_VIEWS, giDebugView, resolveGiConfig, sceneSkyRadiance } from "./giConfig.js";
+import { GI_QUALITY_LEVELS, GI_TERM_DEBUG_VIEWS, GI_TIER_GPU_BUDGET_BYTES, giDebugView, resolveGiConfig, sceneSkyRadiance, wgslPointerParametersSupported } from "./giConfig.js";
 import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
 import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
 import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
@@ -37,7 +37,9 @@ import { noteTextureAverage, pendingTextureAverages, resolveMaterialSurface, ser
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
 import { SRC_POOL_FLOORS, createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcPoolCeilings, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
-import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD, CASCADE_COUNT, R0_OVER_S0 as SRC_R0_OVER_S0, binCount } from "./srcConfig.js";
+import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD, CASCADE_COUNT, R0_OVER_S0 as SRC_R0_OVER_S0, binCount, srcQualityTier, srcTransportRays } from "./srcConfig.js";
+// §19 Stage 0.4: the ONE bin-store byte arithmetic — see srcBinStoreBytes.
+import { srcBinStoreBoundBytes } from "./srcDeposit.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { SURFACE_POOL_CEILINGS, bitsBytesFor, createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
@@ -1170,6 +1172,19 @@ export class GISystem {
     this._frame = 0;
     this._fingerprint = "";
     this._rebuildQueued = false;
+    // ── §19 STAGE 0.4 ─────────────────────────────────────────────────────
+    // Read ONCE, at GI init, before anything can compile: nine raw-WGSL
+    // kernels take storage-pointer parameters, and on an implementation
+    // without `unrestricted_pointer_parameters` they fail validation
+    // silently. False forces exact dynamic objects + the static BVH8 off for
+    // the session — a private field rather than another `__gi*` global,
+    // because it is a device fact and not a switch anyone may flip.
+    this._wgslPtrParams = wgslPointerParametersSupported();
+    // Has this build's transport ever delivered light? The IBL blackout hangs
+    // off it (see #tick) and `profile.frameStats.giTransport` publishes it.
+    this._transportAlive = false;
+    this._transportWaveAt = 0;
+    this._transportDeadLogged = false;
     this._lightsRefreshTicks = 0;
     // Baked mesh SDFs by CONTENT key (asset path or geometry hash) — shared
     // across mesh instances and across rebuilds. Session-lifetime, as is the
@@ -1198,9 +1213,69 @@ export class GISystem {
       // of device-lifetime state in the engine, did not.
       engine.on?.("renderer-rebuilt", () => {
         this.#dispose();
+        if (this.#absorbDeviceLoss()) return;   // refused: leave IBL, no rebuild
         this.requestRebuild("renderer-rebuilt");
       }) ?? (() => {}),
     ];
+  }
+
+  /**
+   * §19 Stage 0.4 — a `device.lost` must never rebuild GI AT THE SAME SIZE.
+   *
+   * ══ WHY THE SAME SIZE IS THE BUG ═══════════════════════════════════════
+   *
+   * The loss the phone reports is an OOM: Dawn drops the device when the
+   * allocation the GI build just made cannot be served, and two losses in two
+   * minutes blocks the whole GPU process. Rebuilding at the size that just
+   * killed the device is therefore not neutral, it is a LOOP — and each turn
+   * of it costs the user their canvas. Dropping a tier changes every cost the
+   * preset controls at once (`giConfig`'s BY_TIER note), which is exactly the
+   * lever a loss wants.
+   *
+   * ⚠ ONLY A REAL LOSS COUNTS. `renderer-rebuilt` also fires when a settings
+   * change alters a constructor option — routinely on the first boot, because
+   * a scene authoring `antialias:false` differs from the default
+   * ([[playstop-device-destroy]]). Reacting to that would downgrade every
+   * session's GI on boot for no reason at all. `engine.deviceLostCount` is
+   * bumped ONLY in Engine's `device.lost` handler, and this compares it
+   * against what it last saw rather than trusting a flag on the event.
+   *
+   * ⚠ AND IT DROPS FROM THE *RESOLVED* TIER, not the authored one. On a phone
+   * `giDeviceTierCeiling` has already clamped ultra→low, so an authored-tier
+   * drop from `ultra` would set `high` — a tier ABOVE the ceiling, i.e. no
+   * change at all, on the one device this exists for.
+   *
+   * @returns {boolean} true when GI must NOT be rebuilt (already at `low`).
+   */
+  #absorbDeviceLoss() {
+    const losses = this.engine?.deviceLostCount ?? 0;
+    const seen = this._deviceLossSeen ?? 0;
+    this._deviceLossSeen = losses;
+    if (losses <= seen) return false;           // a settings rebuild, not a loss
+    const resolved = this.config?.quality ?? "high";
+    const at = GI_QUALITY_LEVELS.indexOf(resolved);
+    if (at <= 0) {
+      console.error(
+        `[gi] device lost with GI already at "${resolved}" — NOT rebuilding GI. There is no cheaper `
+        + "tier to fall to, and a same-size rebuild is the loss loop that blocks the GPU process. The "
+        + "scene keeps its environment IBL and direct lighting; `__giDeviceTier = null` + a scene "
+        + "reload re-enables GI once the cause is understood.",
+      );
+      return true;
+    }
+    const next = GI_QUALITY_LEVELS[at - 1];
+    globalThis.__giDeviceTier = next;
+    // `config` caches on the AUTHORED quality string, which has not changed —
+    // only the ceiling under it has. Without this bust the rebuild re-reads the
+    // frozen pre-loss configuration and the drop is a log line and nothing else.
+    this._cfgKey = undefined;
+    this._cfg = undefined;
+    console.warn(
+      `[gi] device lost with GI at ${resolved} — rebuilding at ${next} `
+      + `(loss ${losses} this session; \`__giDeviceTier\` now "${next}", every tier-keyed budget `
+      + "follows it). A same-size rebuild is what turns one loss into a loop.",
+    );
+    return false;
   }
 
   /**
@@ -1937,6 +2012,26 @@ export class GISystem {
     this.component = null;
   }
 
+  /**
+   * §19 Stage 0.4 — has this build's transport ever delivered light?
+   *
+   * `profile.frameStats.giTransport` publishes this, and it is the ONE receipt
+   * that separates the three states a dark scene can be in and that look
+   * identical on screen: `"alive"` (the field works; a dark room is a dark
+   * room), `"pending"` (the chain has dispatched but no readback has proven
+   * delivery yet — normal for the first seconds of a build), and `"dead"` (ten
+   * seconds past the first dispatch with nothing delivered — a kernel this
+   * device refused). `null` means GI has not built at all.
+   *
+   * A "dead" reading is also the answer to "why does this phone still show
+   * flat IBL ambient": it is deliberate, and the console said so once.
+   */
+  get transportState() {
+    if (!this.state) return null;
+    if (this._transportAlive) return "alive";
+    return this._transportDeadLogged ? "dead" : "pending";
+  }
+
   /** Explicit diagnostic readback; never called from the frame path. */
   async readRayHitStats(renderer = this.engine.renderer) {
     const debug = this.state?.volume?.occupancyField?.rayHitDebug;
@@ -2021,7 +2116,25 @@ export class GISystem {
         // light is not in the scene yet. Hold IBL until the light is
         // committed AND the occupancy field has actually dispatched — then
         // the occluded-sky path is real and this suppression is honest.
-        const giLive = this.state?.light?.parent === scene && this._fieldReadyOnce === true;
+        //
+        // ⛔⛔ §19 STAGE 0.4 — AND THE TRANSPORT MUST HAVE PRODUCED LIGHT.
+        // "Dispatched" is not "delivered". On a phone or under WebKit a kernel
+        // whose pipeline fails validation dispatches NOTHING and logs nothing
+        // (WebKit 319770 runs a failed-compile pipeline as a silent no-op), so
+        // `_fieldReadyOnce` goes true on a chain that never traced a ray —
+        // and this line then removed every material's IBL in exchange for a
+        // field that is black. That is the user's "on mobile everything
+        // disappears, only the sky remains": the background still draws, the
+        // meshes lose their ambient, and nothing replaces it.
+        //
+        // `_transportAlive` is latched from the readback `#maybeLogSrcProbeStats`
+        // ALREADY takes every 60 frames (rays fired AND something deposited or
+        // a tile lit), so the proof costs no new GPU work. Until it latches the
+        // scene keeps its IBL and GI is merely additive — the failure mode
+        // becomes "no GI", which is survivable, instead of "no light".
+        const giLive = this.state?.light?.parent === scene
+          && this._fieldReadyOnce === true
+          && this._transportAlive === true;
         const install = !keep && !!scene.environment && giLive;
         if (install && !scene.environmentNode) {
           this._envIblBlack ??= THREE.TSL.vec3(0, 0, 0);
@@ -2037,6 +2150,29 @@ export class GISystem {
           scene.environmentNode = null;
         }
       }
+    }
+    // ── §19 STAGE 0.4: THE DEAD-TRANSPORT VERDICT ─────────────────────────
+    //
+    // The latch above fails OPEN, which means a device on which GI genuinely
+    // does not work is now indistinguishable from one where it simply has not
+    // landed yet — silently, forever. Ten seconds after the field's first
+    // dispatch is long past any legitimate wait (the two-strike dead-field
+    // watchdog gives its own signature 5 s plus 180 GI frames), so a transport
+    // that still has not fired a ray gets SAID OUT LOUD, once, and published
+    // where a probe can read it. Nothing is torn down: IBL is already on, the
+    // scene is lit, and that is the whole point of the gate.
+    // `this.state` in the condition, not just the clock: a build that was
+    // DISPOSED (a scene switch, or §H.2's refusal to rebuild at `low`) has no
+    // transport to have failed, and calling that "never produced light" would
+    // blame the device for a teardown we chose.
+    if (this.state && this._transportWaveAt > 0 && !this._transportAlive && !this._transportDeadLogged
+      && performance.now() - this._transportWaveAt > 10_000) {
+      this._transportDeadLogged = true;
+      console.error(
+        "[gi] transport never produced light — IBL left on; GI is effectively off on this device "
+        + `(${Math.round((performance.now() - this._transportWaveAt) / 1000)}s after the field's first dispatch, `
+        + "no rays with deposits or lit tiles in any readback). `profile.frameStats.giTransport` reads \"dead\".",
+      );
     }
     const bootStep = bootAmbientStep({
       enabled: this.config.bootAmbient === true
@@ -3428,6 +3564,11 @@ export class GISystem {
       this._atlasRevisionSeen = state.atlas.revision;
       this._occGeometrySeen = occGeometryRevision;
       this._fieldReadyOnce = true;
+      // §19 Stage 0.4: the dead-transport deadline starts at the field's FIRST
+      // dispatch of this build and is not re-armed by later refresh frames —
+      // an atlas bump ten minutes in must not restart a clock that has already
+      // returned its verdict. `#rebuild` clears it (a new build, a new proof).
+      this._transportWaveAt ||= performance.now();
       // THE DIRTY-BRICK PATH WENT WITH THE COMPOSITE IT NARROWED. It
       // recomposited only the union AABB of changed slots (`consumeDirtyBounds` →
       // `world.dirtyMin/Max`), preceded by the instance-grid and sparse-page-table
@@ -3922,24 +4063,46 @@ export class GISystem {
   }
 
   /**
-   * Every built GI compute kernel's storage-buffer count, against the PORTABLE
-   * WebGPU baseline of EIGHT. Silent unless something is over.
+   * Every built GI compute kernel's per-stage BINDING census, against the
+   * PORTABLE WebGPU baseline. Silent unless something is over.
    *
-   * ⚠ THE THRESHOLD IS THE SPEC BASELINE, NOT THIS DEVICE'S LIMIT — and that
-   * is the whole point. `resolveRendererLimits` asks desktop adapters for 16,
-   * so a regression here is INVISIBLE on the machine that ships it and fatal
-   * on the machine that runs it. Auditing against the device would reproduce
-   * exactly the blind spot this exists to remove.
+   * ⚠ THE WARN THRESHOLD IS THE SPEC BASELINE, NOT THIS DEVICE'S LIMIT — and
+   * that is the whole point. `resolveRendererLimits` asks desktop adapters for
+   * more, so a regression here is INVISIBLE on the machine that ships it and
+   * fatal on the machine that runs it. Auditing against the device alone would
+   * reproduce exactly the blind spot this exists to remove.
+   *
+   * ⚠ AND THE DEVICE LIMIT IS CHECKED TOO, AS AN ERROR (§19 Stage 0.4). Over
+   * the baseline is a portability bug — this build will not run on a phone.
+   * Over THIS DEVICE'S limit is a bug HERE, right now: the pipeline layout is
+   * invalid, the kernel never dispatches, and nothing throws. Two thresholds,
+   * two verdicts, because they mean different things.
+   *
+   * THREE COUNTS, not one (§C's envelope table). Storage buffers were the only
+   * audited axis and they are not the only floor: Safari grants 12 uniform
+   * buffers per stage (the hit-shade kernel was measured needing 16) and FOUR
+   * storage textures (the resolve writes 3, the BVH reflect target makes 4).
+   * A kernel over any one of them is as dead as a kernel over all three.
    *
    * The occupancy chain is included deliberately: it is dispatched outside
    * `state.queue`, which is why the nine-buffer surface-fit kernel went a week
    * unnoticed by a smoke whose job was to catch it.
+   *
+   * Logging only, on every device. The IBL gate (§H.1) is what protects the
+   * image; this names the kernel so the fix has an address.
    */
   #auditPortableBindings() {
     const renderer = this.engine?.renderer;
     const state = this.state;
     if (!renderer || !state) return;
-    const PORTABLE_STORAGE_BUFFERS = 8;
+    // The WebGPU spec's own defaults — what `requestDevice` hands back for a
+    // key nobody asked to raise, and therefore what a phone actually has.
+    const BASELINE = {
+      storage: { limit: 8, label: "storage buffers", device: "maxStorageBuffersPerShaderStage" },
+      uniform: { limit: 12, label: "uniform buffers", device: "maxUniformBuffersPerShaderStage" },
+      storageTexture: { limit: 4, label: "storage textures", device: "maxStorageTexturesPerShaderStage" },
+    };
+    const deviceLimits = renderer.backend?.device?.limits ?? null;
     const nodes = [];
     const push = (name, node) => { if (node && typeof node === "object") nodes.push([name, node]); };
     try {
@@ -3951,24 +4114,62 @@ export class GISystem {
     (state.queue ?? []).forEach((n, i) => push(n?.__giPassName ?? `queue#${i}`, n));
     (state.screen?.srcProbes?.passes ?? []).forEach((n, i) => push(n?.__giPassName ?? `src#${i}`, n));
 
-    const over = [];
+    // `var<storage` is a prefix of nothing else, but `var<uniform` must not
+    // also count `var<uniform>` inside a struct member — WGSL has no such
+    // form, so a plain occurrence scan is exact for all three. Counting
+    // `texture_storage_` catches every dimension/format variant at once.
+    const occurrences = (haystack, needle) => {
+      let n = 0;
+      for (let at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + needle.length)) n++;
+      return n;
+    };
+
+    const overBaseline = [];
+    const overDevice = [];
+    const census = [];
     for (const [name, node] of nodes) {
       let shader = "";
       try { shader = renderer._nodes?.getForCompute?.(node)?.computeShader ?? ""; } catch { continue; }
       if (!shader) continue;
-      let count = 0;
-      for (let at = shader.indexOf("var<storage"); at >= 0; at = shader.indexOf("var<storage", at + 11)) count++;
-      if (count > PORTABLE_STORAGE_BUFFERS) over.push(`${name} binds ${count}`);
+      const counts = {
+        storage: occurrences(shader, "var<storage"),
+        uniform: occurrences(shader, "var<uniform"),
+        storageTexture: occurrences(shader, "texture_storage_"),
+      };
+      census.push({ name, ...counts });
+      for (const [key, spec] of Object.entries(BASELINE)) {
+        const got = counts[key];
+        if (got > spec.limit) overBaseline.push(`${name} binds ${got} ${spec.label} (portable ${spec.limit})`);
+        const hard = deviceLimits?.[spec.device];
+        if (typeof hard === "number" && got > hard) {
+          overDevice.push(`${name} binds ${got} ${spec.label} against this device's ${spec.device}=${hard}`);
+        }
+      }
     }
-    if (!over.length) return;
+    // Kept for the probe and for anyone reading the system in a console: the
+    // full per-kernel census, not just the failures (a "0 over" result is only
+    // trustworthy if the instrument can be shown to have seen its subject —
+    // [[probe-blind-statistics]]).
+    this._portableCensus = census;
+
+    // ⛔ THIS DEVICE FIRST. A kernel over the live limit is not a future
+    // problem, it is a pass that produced nothing in the frame just rendered.
+    if (overDevice.length) {
+      console.error(
+        `[gi] ⛔⛔ OVER THIS DEVICE'S LIMITS — ${overDevice.length} compute kernel(s): `
+        + `${overDevice.join("; ")}. The pipeline layout is INVALID: the kernel never dispatches and `
+        + "WebGPU reports nothing. Whatever that kernel's chain produces is missing from this frame.",
+      );
+    }
+    if (!overBaseline.length) return;
     console.error(
-      `[gi] ⛔ PORTABLE LIMIT EXCEEDED — ${over.length} compute kernel(s) bind more than ` +
-        `${PORTABLE_STORAGE_BUFFERS} storage buffers (${over.join(", ")}). This build runs here only ` +
-        "because the adapter grants more than the WebGPU baseline; on a phone the pipeline layout is " +
-        "invalid, every bind group built from it fails, and that kernel's whole chain never runs — " +
-        "which for the occupancy chain means no field, no transport, and only screen-space emissive " +
-        "light survives. Fold two buffers into one (see occupancyField's pairWork) before shipping. " +
-        "`__giPortableAudit = false` silences this.",
+      `[gi] ⛔ PORTABLE LIMIT EXCEEDED — ${overBaseline.length} compute kernel binding(s) over the `
+        + `WebGPU baseline: ${overBaseline.join("; ")}. This build runs here only `
+        + "because the adapter grants more than the baseline; on a phone the pipeline layout is "
+        + "invalid, every bind group built from it fails, and that kernel's whole chain never runs — "
+        + "which for the occupancy chain means no field, no transport, and only screen-space emissive "
+        + "light survives. Fold two bindings into one (see occupancyField's pairWork) before shipping. "
+        + "`__giPortableAudit = false` silences this.",
     );
   }
 
@@ -7061,7 +7262,9 @@ export class GISystem {
     // counts are baked into the compute nodes, so a resize rebuilds it. Returns
     // a NEW system and disposes the old one — the assignment is the point.
     if (screen.srcProbes) {
-      screen.srcProbes = screen.srcProbes.setSize(width, height, this._srcPools ?? null);
+      // §19 Stage 0.4: through the budget clamp, not the raw remembered pools —
+      // a resize must not re-seat a pool the build ladder already refused.
+      screen.srcProbes = screen.srcProbes.setSize(width, height, this.#srcPoolsForBuild() ?? null);
       // Fresh buffers, so a fresh detach generation (and the latch that gates
       // it must re-arm — the new passes have not dispatched yet).
       this._srcRanOnce = false;
@@ -7749,6 +7952,12 @@ export class GISystem {
     const props = this.config;
     if (props.reflections === false) return false;
     if (globalThis.__giNoBvhReflections === true) return false;
+    // §19 Stage 0.4: the one-BVH reflect prepass traverses the static scene
+    // BVH8 (bvh/bvhScene.js:215-218), whose raw WGSL takes four storage-pointer
+    // parameters. Without `unrestricted_pointer_parameters` that pipeline is
+    // invalid and the prepass writes nothing — a black reflection target
+    // sampled by every mirror material, with no error anywhere.
+    if (this._wgslPtrParams === false) return false;
     // Exact BVH is a high/ultra feature. Presets are an actual performance
     // contract: a stale advanced flag stored by a previous high-quality edit
     // must not silently turn a Medium scene into a 100-200ms/frame workload.
@@ -8412,6 +8621,73 @@ export class GISystem {
     this._retiredTargets = keep;
   }
 
+  /**
+   * §19 Stage 0.4 — the SRC bin store's GPU bytes for the pools THIS build will
+   * ask for, before the store exists.
+   *
+   * `binScale` is the ladder's own rung (halving the bin budget), passed rather
+   * than read so the ladder can price a rung it has not committed to yet.
+   */
+  #estimateSrcStoreBytes(binScale = this._giBudgetBinScale ?? 1) {
+    if (!srcProbesEnabled()) return 0;
+    // The RESTORED pools, not `#srcPoolsForBuild` — that one already applies
+    // `_giBudgetBinScale`, and pricing a rung the ladder has not committed to
+    // would then scale twice.
+    const pools = this.#srcPoolsRestored();
+    const binBudget = Math.max(1, Math.round((pools?.binBudget ?? SRC_POOL_FLOORS.binBudget) * binScale));
+    // [J]'s hit list is `transportThreads × raysPerPixel`, and that product IS
+    // the tier's transport ray count by construction (srcSystem sizes the
+    // thread count as `transportRays / raysPerPixel`). Sizing it from the tier
+    // avoids reaching into a system that does not exist yet.
+    const secondaryCapacity = srcShadeEnabled() ? srcTransportRays(srcQualityTier(this.config)) : 0;
+    return srcBinStoreBoundBytes({ binBudget, secondaryCapacity }).bytes;
+  }
+
+  /**
+   * §19 Stage 0.4 — the screen targets' GPU bytes, APPROXIMATE.
+   *
+   * ⚠ IT IS AN ESTIMATE AND IT SAYS SO. `createGiTargets` builds ~20 storage
+   * textures across three resolutions plus two lazily-materialized temporal
+   * trios, and pricing it exactly would mean a second copy of that
+   * constructor's texture list — the thing `srcBinStoreBytes` exists to avoid.
+   * What this needs to be is the right ORDER for a ladder decision, and the
+   * per-pixel byte model below is that: it counts the resolutions the system
+   * has already computed against the format each group actually uses (rgba8 =
+   * 4 B, rgba16f = 8 B, rgba32f = 16 B), including both temporal trios as if
+   * armed (they are, on every tier that has an emitter or the §12.65 chain).
+   *
+   * Excluded and stated: the gbuffer (per-build, ~24 B/px — §C's own figure)
+   * is added, the BVH reflect target is not (it is created on demand and only
+   * on high/ultra with a mirror in the scene). Erring low there is deliberate:
+   * this is the smallest of the three budget terms and `bits` dominates it by
+   * an order of magnitude on every scene that reaches the ladder.
+   */
+  #estimateGiTargetBytes(resolveScale = this._giBudgetResolveScale ?? 1) {
+    const renderer = this.engine?.renderer;
+    if (!renderer) return 0;
+    const prev = this._giBudgetResolveScale ?? 1;
+    this._giBudgetResolveScale = resolveScale;
+    let bytes = 0;
+    try {
+      const resolve = this.#screenResolveSize();
+      const shadow = this.#lightShadowSize(resolve);
+      const emitterScale = this.#emitterShadowScale();
+      const emitterW = Math.max(64, Math.round(shadow.width * emitterScale));
+      const emitterH = Math.max(64, Math.round(shadow.height * emitterScale));
+      // Resolve res: irradiance + radiance (rgba16f) + the §12.65 irradiance
+      // temporal trio (raw/hist rgba16f, histPos rgba32f) + the gbuffer.
+      bytes += resolve.width * resolve.height * (8 + 8 + 8 + 8 + 16 + 24);
+      // Light-shadow res: five rgba8 channels (shadow, raw, mid, wide, dist).
+      bytes += shadow.width * shadow.height * (4 * 5);
+      // Emitter res: shadow/raw/mid/wide rgba8 + dist rgba16f + the stochastic
+      // accum/hist rgba16f + histPos rgba32f.
+      bytes += emitterW * emitterH * (4 * 4 + 8 + 8 + 8 + 16);
+    } finally {
+      this._giBudgetResolveScale = prev;
+    }
+    return bytes;
+  }
+
   /** Resolve resolution: half the drawing buffer, clamped to a PIXEL budget. */
   #screenResolveSize() {
     const renderer = this.engine.renderer;
@@ -8427,7 +8703,12 @@ export class GISystem {
     // scene render it was built for, and a manual renderScale drag still
     // resizes GI (it moves the buffer AND is not in `_drsScale`).
     const drs = this.engine?._drsScale || 1;
-    const scale = (this.config.resolveScale ?? 0.5) / drs;
+    // §19 Stage 0.4: the byte budget's LAST rung. `_giBudgetResolveScale` is 1
+    // unless #buildOccupancyField had to halve it to fit the tier's GPU budget;
+    // it multiplies the tier's own `resolveScale` rather than replacing it, so
+    // a preset that already resolves at half res halves again rather than
+    // jumping to some absolute size the preset never chose.
+    const scale = ((this.config.resolveScale ?? 0.5) * (this._giBudgetResolveScale ?? 1)) / drs;
     let width = Math.max(16, Math.round(size.x * scale));
     let height = Math.max(16, Math.round(size.y * scale));
     // TOTAL-PIXEL budget, not a per-axis clamp. Every screen-space GI pass
@@ -8895,6 +9176,33 @@ export class GISystem {
       // A rebuild between the request and its resolution retires these numbers.
       if (this.state !== state || state.screen?.srcProbes !== src) return;
       this._srcProbeStats = stats;
+      // ── §19 STAGE 0.4: THE TRANSPORT-ALIVE LATCH ────────────────────────
+      //
+      // The IBL blackout (#tick) hangs off this and nothing else, so it is
+      // deliberately parasitic on a readback that already happens: this method
+      // is the periodic one (every 60 GI frames, in-flight-guarded), and
+      // adding a second per-frame GPU→CPU map to prove liveness would cost
+      // exactly what §13 measured the `field ready` readback costing.
+      //
+      // ALIVE = rays fired AND something received them. Rays alone are not
+      // proof — [E] can trace into a field whose merge/tiles never dispatched,
+      // which is the "dead [J]" signature — so the second half asks the two
+      // consumers that would be black in that case. Latch-once: transport that
+      // has ever delivered has proven the pipelines compiled, and a later
+      // still frame legitimately deposits nothing.
+      if (!this._transportAlive) {
+        const rays = stats?.rays?.rays ?? 0;
+        const deposits = stats?.rays?.deposits ?? 0;
+        const tilesLit = stats?.tiles?.lit ?? 0;
+        if (rays > 0 && (deposits > 0 || tilesLit > 0)) {
+          this._transportAlive = true;
+          console.log(
+            `[gi] transport alive: ${rays} rays, ${deposits} deposits, ${tilesLit} lit tiles`
+            + `${this._transportWaveAt ? ` (${((performance.now() - this._transportWaveAt) / 1000).toFixed(1)}s after first dispatch)` : ""}`
+            + " — environment IBL may now be suppressed in favour of GI's occluded sky",
+          );
+        }
+      }
       if (globalThis.__giLogSrcProbes) console.log(formatSrcProbeFrame(stats));
       // UNCONDITIONAL WARNINGS, because these are the two failures that are
       // silent on screen. A dropped insert is a probe that does not exist —
@@ -9144,6 +9452,17 @@ export class GISystem {
     // The EXECUTION count, distinct from `rebuildAsks`: several asks coalesce
     // into one run, and the receipt reads honestly only with both numbers.
     this.rebuilds = (this.rebuilds ?? 0) + 1;
+    // ── §19 STAGE 0.4: EVERY BUILD RE-EARNS THE IBL BLACKOUT ──────────────
+    //
+    // A rebuild replaces every compute node in the system, so the previous
+    // build's proof that the transport works says nothing about this one's —
+    // and a rebuild is precisely when a kernel newly over a device limit, or a
+    // pipeline that fails to compile at a new size, first appears. Reset all
+    // three: the latch, the deadline clock (#tick re-arms it on the next first
+    // dispatch), and the once-per-build error.
+    this._transportAlive = false;
+    this._transportWaveAt = 0;
+    this._transportDeadLogged = false;
     this.#dispose();
     const component = this.component;
     const engine = this.engine;
@@ -9294,7 +9613,12 @@ export class GISystem {
       props, meshes, bounds, { sizeX, sizeY, sizeZ }, quality, rayHitConfig,
     );
     if (!occField) {
-      console.warn("[gi] occupancy was disabled by the diagnostic backend hatch; GI has no geometry transport");
+      // §19 Stage 0.4: the null can now mean two very different things, and
+      // blaming a diagnostic hatch for a refused allocation would send the
+      // next reader looking for a flag nobody set.
+      console.warn(this._occRefusedForBudget
+        ? "[gi] no occupancy field — the allocation was refused above; GI has no geometry transport and the environment IBL stays on"
+        : "[gi] occupancy was disabled by the diagnostic backend hatch; GI has no geometry transport");
     }
     // THE VOLUME IS NOW `srcVolume`, and `giField.js` is gone with it (§12.8.2).
     // What changed underneath this one line: the composited fp16 distance texture,
@@ -10613,8 +10937,49 @@ export class GISystem {
     return `gi.${kind}.${scene}`;
   }
 
-  /** The remembered pools for this scene, hydrated once per state. */
+  /**
+   * The pools this build may actually ask for: whatever the scene remembered,
+   * CLAMPED by §19 Stage 0.4's tier byte budget.
+   *
+   * ⚠ THE HINT IS A MEMORY OF DEMAND, NOT A LICENCE. `#srcPoolsRestored`
+   * re-seats a scene at its previously measured demand so the boot skips the
+   * grow ladder — but that demand was measured on whatever device measured it,
+   * and restoring an ultra desktop's 2.8 M bins on a phone is precisely the
+   * allocation that loses the device. The budget clamps it the same way it
+   * clamps a fresh build, and by the same ladder rung.
+   */
   #srcPoolsForBuild() {
+    const saved = this.#srcPoolsRestored();
+    const cap = this.#srcBinBudgetCap();
+    if (cap === Infinity) return saved;
+    // Under a cap the pools stop being optional: srcSystem's fallback is the
+    // FLOORS, and returning null would hand back a bigger pool than the one
+    // the ladder just refused.
+    return {
+      c0Probes: saved?.c0Probes ?? SRC_POOL_FLOORS.c0Probes,
+      binBudget: Math.min(saved?.binBudget ?? SRC_POOL_FLOORS.binBudget, cap),
+    };
+  }
+
+  /**
+   * §19 Stage 0.4 — the largest `binBudget` this build's byte budget allows,
+   * or `Infinity` when the ladder never had to halve.
+   *
+   * ⚠ A CAP, NOT A MULTIPLIER, and the difference is the growth ladder. A
+   * multiplier applied on the way out would be re-applied to whatever growth
+   * produced, so a scene under pressure would shrink a little further on every
+   * grow; a cap is idempotent and reads the same before the first build and
+   * after the fourth. `_srcPools` goes on holding the scene's true measured
+   * DEMAND, which is what `#persistSrcPools` writes.
+   */
+  #srcBinBudgetCap() {
+    const scale = this._giBudgetBinScale ?? 1;
+    if (scale >= 1) return Infinity;
+    return Math.max(1, Math.round((this._giBudgetBinBase ?? SRC_POOL_FLOORS.binBudget) * scale));
+  }
+
+  /** The remembered pools for this scene, hydrated once per state. */
+  #srcPoolsRestored() {
     if (this._srcPools) return this._srcPools;
     if (this._srcPoolsHydrated) return null;
     this._srcPoolsHydrated = true;
@@ -10695,7 +11060,7 @@ export class GISystem {
     // at the end of #syncScreenResolveSize for why this is a DIFF.
     const staleBefore = new Set(collectStateComputeNodes(state));
     const before = screen.srcProbes;
-    const next = before.setSize(width, height, this._srcPools ?? null);
+    const next = before.setSize(width, height, this.#srcPoolsForBuild() ?? null);
     if (next === before) return false;          // setSize refused — nothing grew
     screen.srcProbes = next;
     this._srcRanOnce = false;
@@ -10887,7 +11252,17 @@ export class GISystem {
       // store (the §12.48 dead-buffer class).
       if (this.state !== state || state.screen?.srcProbes !== src) return;
       const cur = src.poolConfig;
-      const ceilings = srcPoolCeilings(src.pixelCount);
+      // §19 Stage 0.4: growth may not walk back out of the byte budget the
+      // build ladder walked into. `_giBudgetBinScale` is 1 on every build that
+      // fit, so this is an identity on the desktop path — but on a build that
+      // had to halve the pool, the pressure signal is exactly as loud as it was
+      // and would otherwise re-grow straight back to the size that did not fit.
+      const rawCeilings = srcPoolCeilings(src.pixelCount);
+      const binCap = this.#srcBinBudgetCap();
+      const ceilings = binCap === Infinity ? rawCeilings : {
+        ...rawCeilings,
+        binBudget: Math.min(rawCeilings.binBudget, binCap),
+      };
       // `failed` = hash insert dropped; live near probeCapacity = the next
       // frames WILL drop (hash load 0.5 is exactly probes-full, so 0.75 of
       // probeCapacity is early warning, not paranoia). The bin signal is the
@@ -14186,7 +14561,13 @@ export class GISystem {
     // object-local BVH4 pool. Header is always needed when the feature is on;
     // the pool tier bounds how much unique mover geometry can go exact
     // (overflow keeps the voxel path — never a hole).
-    const dynObjectsOn = globalThis.__giDynamicObjects !== false;
+    // §19 Stage 0.4: `_wgslPtrParams` false kills BOTH halves of this branch —
+    // the mover BVH4 traversals AND the static scene BVH8 built inside it —
+    // because every one of those kernels takes a `ptr<storage, …>` parameter
+    // and would fail WGSL validation silently on a device without the language
+    // feature. Voxel transport and the records marcher are the fallback, which
+    // is the same degrade the device-limit ladder below already lands on.
+    const dynObjectsOn = globalThis.__giDynamicObjects !== false && this._wgslPtrParams !== false;
     const dynPoolWords = Number(globalThis.__giDynMeshWords) ||
       ({ low: 262144, medium: 393216, high: 786432, ultra: 1572864 }[quality] ?? 786432);
     // Mover cap by tier. 16 was one crate pile short: the user's spawned
@@ -14330,6 +14711,61 @@ export class GISystem {
       deviceLimits?.maxStorageBufferBindingSize ?? 134217728,
       deviceLimits?.maxBufferSize ?? 268435456,
     );
+    // ══ §19 STAGE 0.4 — THE TIER BYTE BUDGET RIDES THE SAME LADDER ═════════
+    //
+    // The device-limit ladder above asks ONE question: does the `bits` buffer
+    // fit in one binding? That is necessary and nowhere near sufficient. What
+    // loses a phone is the TOTAL — `bits` plus the SRC bin store plus the
+    // screen targets — against a page that is 350-450 MB on an iPhone 14, and
+    // nothing measured that sum before allocating it. The failure was not a
+    // validation error but a device LOSS, whose recovery (§H.2) then rebuilt
+    // at the same size.
+    //
+    // So the budget runs the SAME rungs, in the same order — cheapest feature
+    // first — and only then reaches for the two knobs that cost picture
+    // everywhere (the bin pool, the resolve resolution). Every rung logs its
+    // before/after megabytes, because a build that quietly degraded itself and
+    // a build that is simply worse look identical on screen.
+    //
+    // ⚠ THE TWO GATES ARE DIFFERENT QUESTIONS AND BOTH ARE ASKED. `bits` can
+    // be inside the tier budget and still exceed a single binding (a small
+    // device with a huge scene); the total can exceed the budget with `bits`
+    // comfortably bindable (a big pool on a small tier). A rung fires for
+    // either.
+    const tierBudget = GI_TIER_GPU_BUDGET_BYTES[quality] ?? GI_TIER_GPU_BUDGET_BYTES.high;
+    // Fresh per build: the ladder re-derives from this scene and this device,
+    // and inheriting the last scene's halvings would degrade a Cornell box
+    // because Bistro did not fit.
+    this._giBudgetBinScale = 1;
+    this._giBudgetResolveScale = 1;
+    this._occRefusedForBudget = false;
+    // What the halvings are halvings OF — the pool this build would have asked
+    // for. Snapshotted so the cap stays a fixed number as growth raises demand.
+    this._giBudgetBinBase = this.#srcPoolsRestored()?.binBudget ?? SRC_POOL_FLOORS.binBudget;
+    const MB = (b) => (b / 1048576).toFixed(0);
+    const otherBytes = () => this.#estimateSrcStoreBytes() + this.#estimateGiTargetBytes();
+    const totalBytes = (dynW, statW) => bitsBytes(dynW, statW) + otherBytes();
+    const overDevice = () => bitsBytes(dynWords, staticBvhWords) > deviceLimit;
+    const overBudget = () => totalBytes(dynWords, staticBvhWords) > tierBudget;
+    const over = () => overDevice() || overBudget();
+    /** One rung's receipt. `why` names which gate demanded it. */
+    const rung = (what, before) => {
+      const after = totalBytes(dynWords, staticBvhWords);
+      console.warn(
+        `[gi] budget ladder (${quality}, ${MB(tierBudget)}MB): ${what} — `
+        + `${MB(before)}MB → ${MB(after)}MB total `
+        + `(bits ${MB(bitsBytes(dynWords, staticBvhWords))}MB of a ${MB(deviceLimit)}MB binding limit, `
+        + `src ${MB(this.#estimateSrcStoreBytes())}MB, targets ~${MB(this.#estimateGiTargetBytes())}MB)`,
+      );
+    };
+    if (over()) {
+      console.warn(
+        `[gi] GI wants ${MB(totalBytes(dynWords, staticBvhWords))}MB of GPU memory at ${quality} `
+        + `(bits ${MB(bitsBytes(dynWords, staticBvhWords))} + src ${MB(this.#estimateSrcStoreBytes())} `
+        + `+ targets ~${MB(this.#estimateGiTargetBytes())}), over the ${MB(tierBudget)}MB tier budget `
+        + `or the ${MB(deviceLimit)}MB single-binding limit — walking the degrade ladder`,
+      );
+    }
     // ── §18.17 RUNG ZERO: THE UV REGION GOES BEFORE THE BVH DOES ───────────
     //
     // Textured reflections cost 3 words per static triangle, and on a scene
@@ -14337,27 +14773,87 @@ export class GISystem {
     // costs one feature (hits fall back to the per-slot mean albedo — exactly
     // the pre-§18.17 picture); losing the whole static BVH costs every exact
     // shadow AND every reflection in the scene. Cheapest thing first.
-    if (bitsBytes(dynWords, staticBvhWords) > deviceLimit && (staticBvhPacked?.uvWordCount ?? 0) > 0) {
-      console.warn(
-        `[gi] bits buffer ${(bitsBytes(dynWords, staticBvhWords) / 1048576).toFixed(0)}MB over the ` +
-          `${(deviceLimit / 1048576).toFixed(0)}MB device limit — dropping the reflection UV region ` +
-          "(reflections fall back to per-slot mean albedo)",
-      );
+    if (over() && (staticBvhPacked?.uvWordCount ?? 0) > 0) {
+      const before = totalBytes(dynWords, staticBvhWords);
       staticBvhPacked = items.length ? buildStaticSceneBvhWords(items, staticBvhStrategy(), { uvs: false }) : null;
       this._staticBvhItemsWantedUv = false;
       staticBvhWords = staticBvhPacked ? Math.ceil(staticBvhPacked.words.length * 1.5) : 0;
+      rung("dropped the reflection UV region (reflections fall back to per-slot mean albedo)", before);
     }
-    if (bitsBytes(dynWords, staticBvhWords) > deviceLimit && staticBvhWords > 0) {
-      console.warn(
-        `[gi] bits buffer ${(bitsBytes(dynWords, staticBvhWords) / 1048576).toFixed(0)}MB exceeds the device's ` +
-          `${(deviceLimit / 1048576).toFixed(0)}MB storage binding limit — dropping the static shadow BVH (records marcher fallback)`,
-      );
+    if (over() && staticBvhWords > 0) {
+      const before = totalBytes(dynWords, staticBvhWords);
       staticBvhPacked = null;
       staticBvhWords = 0;
+      rung("dropped the static shadow BVH (records marcher fallback)", before);
     }
-    if (bitsBytes(dynWords, staticBvhWords) > deviceLimit && dynWords > 0) {
-      console.warn("[gi] bits buffer still over the storage binding limit — disabling exact dynamic objects");
+    // ── EXACT TRIANGLES: THE MEASURED-DEMAND HINT IS NOT A LICENCE ─────────
+    //
+    // `#surfacePoolHintForBuild` re-seats the exact-triangle and surface-record
+    // pools at whatever this scene needed LAST time, to skip the forced resize
+    // rebuild. That hint was measured on some device; this build is on this
+    // one. Dropping it costs a possible resize rebuild later, which is a stall
+    // and not a loss — the right trade against an allocation that does not fit.
+    if (over() && (this._surfacePoolHint?.triangles || this._surfacePoolHint?.records)) {
+      const before = totalBytes(dynWords, staticBvhWords);
+      this._surfacePoolHint = null;
+      this._surfacePoolRebuilds = 0;
+      rung("dropped the measured exact-triangle / surface-record hint (derived sizes; a resize rebuild may follow)", before);
+    }
+    if (over() && dynWords > 0) {
+      const before = totalBytes(dynWords, staticBvhWords);
       dynWords = 0;
+      rung("disabled exact dynamic objects (movers fall back to the voxel path)", before);
+    }
+    // ── THE LAST TWO RUNGS COST PICTURE EVERYWHERE ────────────────────────
+    //
+    // Everything above removes a FEATURE from some surfaces. These two shrink
+    // the transport's memory and the traced pixel count for the whole scene,
+    // so they are last and they are bounded: a quarter of the tier's pools and
+    // a quarter of its pixels is the floor. Below that GI is not degraded, it
+    // is absent, and the honest answer is the tier drop §H.2 already owns.
+    // Neither touches `bits`, so neither can satisfy the binding-limit gate —
+    // they answer `overBudget` only.
+    while (overBudget() && (this._giBudgetBinScale ?? 1) > 0.25) {
+      const before = totalBytes(dynWords, staticBvhWords);
+      this._giBudgetBinScale = (this._giBudgetBinScale ?? 1) / 2;
+      rung(`halved the SRC bin budget (×${this._giBudgetBinScale} of the tier's pools)`, before);
+    }
+    while (overBudget() && (this._giBudgetResolveScale ?? 1) > 0.25) {
+      const before = totalBytes(dynWords, staticBvhWords);
+      this._giBudgetResolveScale = (this._giBudgetResolveScale ?? 1) / 2;
+      rung(`halved the resolve scale (×${this._giBudgetResolveScale} of the tier's resolution)`, before);
+    }
+    // ── WHERE THE LADDER STOPS BEING ADVICE ────────────────────────────────
+    //
+    // Over the tier BUDGET after every rung is a judgement call, and the call
+    // is to build: the budget is interim and generous, and refusing a scene its
+    // indirect light on an estimate is worse than being 20 % over on a desktop.
+    // §H.2's loss handler is the backstop — if this device does lose its GPU,
+    // the next build starts a tier lower.
+    if (overBudget()) {
+      console.error(
+        `[gi] ⛔ the ${quality} tier's ${MB(tierBudget)}MB GPU budget cannot be met — the ladder bottomed `
+        + `out at ${MB(totalBytes(dynWords, staticBvhWords))}MB (bits ${MB(bitsBytes(dynWords, staticBvhWords))}MB `
+        + "alone). Building anyway; a device that loses its GPU over this rebuilds one tier lower.",
+      );
+    }
+    // Over the DEVICE's own buffer limit is not a judgement call. `CreateBuffer`
+    // will reject the allocation, every bind group over it fails, and the
+    // chain dispatches nothing — GI dark, with a console full of validation
+    // errors and (on WebKit) not even those. Refusing here is the same outcome
+    // minus the wreckage, and it keeps the picture alive: no field means the
+    // transport never latches, so §H.1 leaves the environment IBL ON and the
+    // scene is lit by IBL + direct light rather than being black.
+    if (bitsBytes(dynWords, staticBvhWords) > deviceLimit) {
+      this._occRefusedForBudget = true;
+      console.error(
+        `[gi] ⛔⛔ GI REFUSED ON THIS DEVICE — after every degrade rung the occupancy bits buffer is still `
+        + `${MB(bitsBytes(dynWords, staticBvhWords))}MB against a ${MB(deviceLimit)}MB hard limit `
+        + "(maxBufferSize / maxStorageBufferBindingSize). That allocation cannot be created, so GI is not "
+        + "built: the environment IBL stays on and the scene keeps its direct lighting. Lower the GI "
+        + "quality, or build this scene at a smaller world scale — a volume's cell count is cubic in it.",
+      );
+      return null;
     }
     // ONE allocation, after the ladder has settled every size it can change.
     const field = makeField(dynWords, staticBvhWords);

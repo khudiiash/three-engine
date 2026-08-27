@@ -629,6 +629,13 @@ defineOp({
       // stride can reclaim at zero visual cost (those materials' roughness
       // floor is above 0.45, where the exact reflection's weight is 0).
       giTiers: engine.modules?.get?.("gi")?.system?.reflectTierCensus?.() ?? null,
+      // §19 Stage 0.4 — "alive" | "pending" | "dead" (null: GI never built).
+      // The IBL blackout is gated on this: until the transport has PROVEN it
+      // delivers light, materials keep their environment ambient. On a device
+      // that reads "dead", GI is off and the scene is lit by IBL + direct —
+      // which is why "mobile looks flat" and "mobile is black" are now
+      // different reports with different receipts. See GISystem.transportState.
+      giTransport: engine.modules?.get?.("gi")?.system?.transportState ?? null,
       // §18's masked-mode gate (armed by `__giMaskCoverageProbe`). `pct` is the
       // share of gbuffer texels carrying geometry; it must be IDENTICAL with
       // the mask on and off. Reported here as well as logged because a console
