@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>GI2 window trace — throughput + correctness</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}pre{padding:12px}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // GI2 STAGE 2.4 — THE FIRST RECEIPT.
+      //
+      // PLAN §5 Stage 2.4's gate is "ray throughput receipt (`probe:gi2-trace`
+      // rays/s at 3 tiers); < 6 storage buffers". Every ray budget downstream —
+      // probes per tile, rays per probe, the relight queue — is priced against
+      // the number this page prints, so it is measured on a REAL adapter with
+      // the shipping kernel, not estimated.
+      //
+      // A throughput number alone is worthless, though: a tracer that returns
+      // "miss" instantly is infinitely fast. So the same kernel, on the same
+      // data, answers three correctness questions first, and one of them
+      // carries its own blind-statistics control:
+      //
+      //   (a) DISTANCE — a ray from the room centre toward each wall hits at
+      //       that wall's distance, ±1 cell of the level it hit on.
+      //   (b) NO LEAKS — 10 000 rays from random interior points never escape a
+      //       5 cm wall … and the SAME rays, with the face bits withheld from
+      //       the FILL (not from the tracer), leak. Without that control the
+      //       first half only says "something blocked them".
+      //   (c) HAND-OFF — a ray starting inside L0's window and travelling past
+      //       it continues in L1 and hits a wall L0 cannot see. The page proves
+      //       the wall really is outside L0 before it believes the hit.
+      const out = document.querySelector("#log");
+      const lines = [];
+      const say = (line) => { lines.push(line); out.textContent += line + "\n"; };
+      const fail = (error) => {
+        console.error("GI2-TRACE FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__GI2_TRACE_RESULT__ = { pass: false, error: error?.message ?? String(error), text: lines.join("\n") };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const params = new URLSearchParams(location.search);
+        const TIER = params.get("tier") ?? "high";
+        // N by tier (the task's budget): phone 29k, high 100k, ultra 400k.
+        const RAYS_BY_TIER = { phone: 29000, medium: 29000, high: 100000, ultra: 400000 };
+        const RAYS = Number(params.get("rays") ?? RAYS_BY_TIER[TIER] ?? 100000);
+        const FRAMES = Number(params.get("frames") ?? 60);
+        const LEAK_RAYS = 10000;
+
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const { Fn, instanceIndex, instancedArray, uint, vec3 } = TSL;
+        const store = await import("/src/modules/gi/window/windowStore.js");
+        const fillMod = await import("/src/modules/gi/window/windowFill.js");
+        const traceMod = await import("/src/modules/gi/window/windowTrace.js");
+        const { ROOM, analyticVoxel, CORNELL_SCENE } = fillMod;
+        const { entryFaceBit, unpackTrace } = traceMod;
+
+        // ── renderer ─────────────────────────────────────────────────────────
+        const renderer = new THREE.WebGPURenderer({
+          canvas: document.querySelector("#view"),
+          trackTimestamp: true,
+        });
+        await renderer.init();
+        if (renderer.backend?.isWebGPUBackend !== true) throw new Error("not a WebGPU backend");
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (e) => {
+          validationErrors.push(e.error?.message ?? String(e.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+        const timestamps = renderer.backend.trackTimestamp === true;
+        const storageLimit = device.limits.maxStorageBuffersPerShaderStage;
+
+        // ── the window ───────────────────────────────────────────────────────
+        const win = store.createGiWindow(TIER);
+        const fill = fillMod.createWindowFill(win);
+        const { traceWindow, steps: STEP_BUDGET } = traceMod.createWindowTrace(win);
+        const d = win.describe();
+        say(`tier ${TIER}: ${d.levels} levels @ ${d.voxel0} m, windows ` +
+          `${d.extents.map((e) => e.extent + "m").join("/")}, step budget ${STEP_BUDGET}`);
+        say(`window: per level occ ${d.perLevelBytes.occ / 1024}K + face ${d.perLevelBytes.face / 1024}K + ` +
+          `pal ${d.perLevelBytes.pal / 1024}K + brickMask ${d.perLevelBytes.brickMask}B + ` +
+          `brickTab ${d.perLevelBytes.brickTab / 1024}K = ${(d.perLevelBytes.total / 1024).toFixed(1)}K; ` +
+          `static ${(d.staticBytes / 1048576).toFixed(2)} MB + dynamic ${(d.dynamicBytes / 1048576).toFixed(2)} MB ` +
+          `= ${d.totalMB} MB`);
+
+        // ── the ray kernel ───────────────────────────────────────────────────
+        // 3 vec4 in (origin+tMax, dir, normal), 1 vec4 out (the trace's own
+        // packed return). THREE storage bindings, which is the whole cost of a
+        // consumer: window + its rays + its answers.
+        const rayIn = instancedArray(new Float32Array(RAYS * 12), "vec4");
+        const rayOut = instancedArray(new Float32Array(RAYS * 4), "vec4");
+        const rayPass = Fn(() => {
+          const i = instanceIndex.toVar();
+          const b = i.mul(uint(3)).toVar();
+          const a0 = rayIn.element(b).toVar();
+          const a1 = rayIn.element(b.add(uint(1))).toVar();
+          const a2 = rayIn.element(b.add(uint(2))).toVar();
+          const r = traceWindow(a0.xyz, a1.xyz, a0.w, a2.xyz);
+          rayOut.element(i).assign(r.raw);
+        })().compute(RAYS);
+
+        const compute = (pass) => renderer.computeAsync(pass);
+
+        /**
+         * setCamera + scroll + clear + fill, in the order a frame would.
+         *
+         * `fresh` asks for a CENTRED placement. The hysteresis leaves the
+         * camera anywhere in the middle half of the window after a move, so a
+         * check that needs to know which level owns a given wall — (c) does —
+         * cannot use a nudged window and must ask for a fresh one.
+         */
+        const place = async (camPos, fresh = true) => {
+          if (fresh) win.reset();
+          const receipt = win.setCamera(camPos);
+          await compute(win.statsResetPass);
+          await compute(win.scrollPass);
+          await compute(win.clearStaticPass);
+          await compute(fill.pass);
+          return receipt;
+        };
+
+        // ── ray plumbing ─────────────────────────────────────────────────────
+        const rayArr = rayIn.value.array;
+        const writeRays = (list) => {
+          for (let i = 0; i < RAYS; i++) {
+            const r = list[i % list.length];
+            const b = i * 12;
+            rayArr[b] = r.o[0]; rayArr[b + 1] = r.o[1]; rayArr[b + 2] = r.o[2]; rayArr[b + 3] = r.tMax ?? 40;
+            rayArr[b + 4] = r.d[0]; rayArr[b + 5] = r.d[1]; rayArr[b + 6] = r.d[2]; rayArr[b + 7] = 0;
+            const n = r.n ?? [0, 0, 0];
+            rayArr[b + 8] = n[0]; rayArr[b + 9] = n[1]; rayArr[b + 10] = n[2]; rayArr[b + 11] = 0;
+          }
+          rayIn.value.needsUpdate = true;
+        };
+        const shoot = async (list) => {
+          writeRays(list);
+          await compute(rayPass);
+          const raw = new Float32Array(await renderer.getArrayBufferAsync(rayOut.value));
+          return (i) => unpackTrace(raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]);
+        };
+
+        const rng = (() => {
+          let s = 0x1a2b3c4d >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+        const unitDir = () => {
+          const z = rng() * 2 - 1;
+          const phi = rng() * 2 * Math.PI;
+          const r = Math.sqrt(Math.max(0, 1 - z * z));
+          return [r * Math.cos(phi), r * Math.sin(phi), z];
+        };
+        const { hx, hy, hz, wall } = ROOM;
+        const interiorPoint = (inset = 0.06) => [
+          (rng() * 2 - 1) * (hx - inset), (rng() * 2 - 1) * (hy - inset), (rng() * 2 - 1) * (hz - inset),
+        ];
+
+        const results = { tier: TIER, rays: RAYS, storageLimit, timestamps, checks: {} };
+
+        // ══════════════════════════════════════════════ place at the room centre
+        const centreReceipt = await place([0, 0, 0]);
+        {
+          const buf = new Uint32Array(await renderer.getArrayBufferAsync(win.attribute));
+          const cleared = buf[win.statsBase + store.STAT_SCROLL_CLEARED];
+          say(`scroll: CPU says ${centreReceipt.totalEntering} bricks enter, the pass cleared ${cleared}`);
+          results.scroll = { cpu: centreReceipt.totalEntering, gpu: cleared };
+          if (cleared !== centreReceipt.totalEntering) {
+            throw new Error(`scroll cleared ${cleared} bricks, the entering slabs are ${centreReceipt.totalEntering}`);
+          }
+          // Occupancy actually landed — a leak test on an empty window passes.
+          let occBits = 0;
+          for (let l = 0; l < win.levels; l++) {
+            const base = l * store.LEVEL_WORDS + store.OCC_OFF;
+            for (let w = 0; w < store.OCC_WORDS; w++) {
+              let v = buf[base + w];
+              while (v) { occBits += v & 1; v >>>= 1; }
+            }
+          }
+          say(`fill: ${occBits} occupied voxels across ${win.levels} levels`);
+          results.occupiedVoxels = occBits;
+          if (occBits < 1000) throw new Error(`the fill produced ${occBits} occupied voxels — the window is empty`);
+        }
+
+        // ══════════════════════════════════════════════════ (a) wall distances
+        {
+          const AX = [
+            { d: [1, 0, 0], want: hx, axis: 0, pos: true, name: "+X" },
+            { d: [-1, 0, 0], want: hx, axis: 0, pos: false, name: "−X" },
+            { d: [0, 1, 0], want: hy, axis: 1, pos: true, name: "+Y" },
+            { d: [0, -1, 0], want: hy, axis: 1, pos: false, name: "−Y" },
+            { d: [0, 0, 1], want: hz, axis: 2, pos: true, name: "+Z" },
+            { d: [0, 0, -1], want: hz, axis: 2, pos: false, name: "−Z" },
+          ];
+          const get = await shoot(AX.map((a) => ({ o: [0, 0, 0], d: a.d, tMax: 40 })));
+          const rows = [];
+          let bad = 0;
+          AX.forEach((a, i) => {
+            const r = get(i);
+            const cell = win.levelVoxel(r.level);
+            const err = Math.abs(r.t - a.want);
+            const wantFace = entryFaceBit(a.axis, a.pos);
+            const okT = r.hit && err <= cell + 1e-3;
+            const okF = r.hit && r.faceId === wantFace;
+            if (!okT || !okF) bad++;
+            rows.push(`${a.name} t ${r.t.toFixed(4)} (want ${a.want}, ±${cell}) L${r.level} face ${r.faceId}` +
+              `/${wantFace} steps ${r.steps}${okT && okF ? "" : "  ← WRONG"}`);
+          });
+          rows.forEach((r) => say(`  (a) ${r}`));
+          results.checks.distance = { pass: bad === 0, rows };
+          if (bad) throw new Error(`(a) ${bad} of 6 axis rays missed their wall or entered by the wrong face`);
+          say("(a) wall distances: PASS");
+        }
+
+        // ══════════════════════════════════════════════════════ (b) the leak test
+        const leakRays = [];
+        for (let i = 0; i < LEAK_RAYS; i++) leakRays.push({ o: interiorPoint(), d: unitDir(), tMax: 40 });
+        // CPU mirror walk: where SHOULD this ray have been stopped, and by what
+        // bits? Printed for every leaking ray, because "2 rays escaped" is not
+        // actionable and "they escaped at the +X/+Z edge where the voxel only
+        // carries Z bits" names the line.
+        const cpuWalk = (o, dir, v, maxSteps = 64) => {
+          const cell = [0, 1, 2].map((a) => Math.floor(o[a] / v));
+          const step = dir.map((c) => (c >= 0 ? 1 : -1));
+          const inv = dir.map((c) => 1 / (Math.abs(c) < 1e-12 ? (c < 0 ? -1e-12 : 1e-12) : c));
+          const tMaxA = [0, 1, 2].map((a) => ((cell[a] + (step[a] > 0 ? 1 : 0)) * v - o[a]) * inv[a]);
+          const tDelta = [0, 1, 2].map((a) => v * Math.abs(inv[a]));
+          const trail = [];
+          let axis = -1;
+          for (let k = 0; k < maxSteps; k++) {
+            const r = analyticVoxel(CORNELL_SCENE, [cell[0] * v, cell[1] * v, cell[2] * v], v);
+            const want = axis < 0 ? -1 : axis * 2 + (step[axis] > 0 ? 1 : 0);
+            if (r.occ) {
+              trail.push(`cell ${cell} occ face ${r.face.toString(2).padStart(6, "0")} entry ${want} ` +
+                `${want >= 0 && (r.face & (1 << want)) ? "BLOCKS" : "passes"}`);
+              if (want >= 0 && (r.face & (1 << want))) break;
+            }
+            axis = tMaxA[0] < tMaxA[1] ? (tMaxA[0] < tMaxA[2] ? 0 : 2) : (tMaxA[1] < tMaxA[2] ? 1 : 2);
+            cell[axis] += step[axis];
+            tMaxA[axis] += tDelta[axis];
+          }
+          return trail;
+        };
+
+        const countLeaks = async () => {
+          const get = await shoot(leakRays);
+          let leaks = 0;
+          let exhausted = 0;
+          let outside = 0;
+          const samples = [];
+          for (let i = 0; i < LEAK_RAYS; i++) {
+            const r = get(i);
+            if (!r.hit) {
+              leaks++;
+              if (r.steps >= STEP_BUDGET - 0.5) exhausted++;
+              if (samples.length < 6) samples.push({ i, o: leakRays[i].o, d: leakRays[i].d, steps: r.steps });
+              continue;
+            }
+            const p = leakRays[i];
+            const q = [0, 1, 2].map((a) => p.o[a] + p.d[a] * r.t);
+            const lim = [hx, hy, hz].map((h) => h + wall + win.levelVoxel(r.level) + 1e-3);
+            if (Math.abs(q[0]) > lim[0] || Math.abs(q[1]) > lim[1] || Math.abs(q[2]) > lim[2]) outside++;
+          }
+          return { leaks, exhausted, outside, samples };
+        };
+
+        const sealed = await countLeaks();
+        say(`  (b) face bits ON : ${sealed.leaks} leaks of ${LEAK_RAYS} ` +
+          `(${sealed.exhausted} step-exhausted, ${sealed.outside} hits beyond the shell)`);
+
+        // THE CONTROL. The flag is on the FILL — the tracer is byte-identical
+        // across both arms, so a difference can only be the bit.
+        fill.setFaceBits(false);
+        await compute(win.clearStaticPass);
+        await compute(fill.pass);
+        const blind = await countLeaks();
+        fill.setFaceBits(true);
+        await compute(win.clearStaticPass);
+        await compute(fill.pass);
+        const restored = await countLeaks();
+
+        const leakPct = (100 * blind.leaks) / LEAK_RAYS;
+        say(`  (b) face bits OFF: ${blind.leaks} leaks of ${LEAK_RAYS} = ${leakPct.toFixed(1)}% (the control)`);
+        results.checks.leak = {
+          sealed: sealed.leaks, control: blind.leaks, controlPct: +leakPct.toFixed(2),
+          exhausted: sealed.exhausted, outside: sealed.outside, restored: restored.leaks, rays: LEAK_RAYS,
+        };
+        if (sealed.leaks !== 0) {
+          for (const s of sealed.samples) {
+            say(`  (b) LEAK ray ${s.i} o ${s.o.map((n) => n.toFixed(4))} d ${s.d.map((n) => n.toFixed(4))} steps ${s.steps}`);
+            for (const line of cpuWalk(s.o, s.d, win.levelVoxel(0))) say(`        ${line}`);
+          }
+          throw new Error(`(b) ${sealed.leaks} of ${LEAK_RAYS} rays escaped the 5 cm wall`);
+        }
+        if (sealed.outside !== 0) throw new Error(`(b) ${sealed.outside} rays stopped outside the shell`);
+        if (blind.leaks < LEAK_RAYS * 0.9) {
+          throw new Error(
+            `(b) CONTROL DID NOT LEAK — with the face bits withheld only ${leakPct.toFixed(1)}% of rays escaped. ` +
+            "Something other than the entry-face bit is stopping them, so the 0-leak result above proves nothing.",
+          );
+        }
+        if (restored.leaks !== 0) throw new Error(`(b) the window did not recover: ${restored.leaks} leaks after re-fill`);
+        say("(b) 5 cm wall: PASS — 0 leaks sealed, control leaks " + leakPct.toFixed(1) + "%");
+
+        // ══════════════════════════════════════════════════════ (c) level hand-off
+        {
+          // Park the window so the room is OUTSIDE L0 and inside L1: half of
+          // L0's extent plus a margin, along −Z.
+          const camZ = -(win.levelExtent(0) / 2 + 8);
+          const receipt = await place([0, 0, camZ]);
+          // Prove the test is not vacuous BEFORE believing its answer: L0 must
+          // not contain the wall, L1 must.
+          const wallZ = -hz - wall / 2;
+          const contains = (l) => {
+            const v = win.levelVoxel(l);
+            const o = receipt.perLevel[l].origin;
+            const c = [0, 1, 2].map((a) => Math.floor([0, 0, wallZ][a] / v));
+            return store.inWindow(c, o);
+          };
+          const l0Sees = contains(0);
+          const l1Sees = win.levels > 1 && contains(1);
+          say(`  (c) camera z ${camZ}: the −Z wall is ${l0Sees ? "INSIDE" : "outside"} L0, ` +
+            `${l1Sees ? "inside" : "OUTSIDE"} L1`);
+          if (l0Sees) throw new Error("(c) the wall is inside L0's window — the hand-off is never exercised");
+          if (!l1Sees) throw new Error("(c) the wall is outside L1's window too — nothing can hit it");
+
+          const get = await shoot([{ o: [0, 0, camZ], d: [0, 0, 1], tMax: 60 }]);
+          const r = get(0);
+          const v1 = win.levelVoxel(1);
+          const wantT = -hz - camZ; // the shell's outer face is one cell before
+          const okT = r.hit && r.t >= wantT - wall - v1 - 1e-3 && r.t <= wantT + v1 + 1e-3;
+          say(`  (c) hit ${r.hit} t ${r.t.toFixed(4)} (want ~${wantT.toFixed(2)} ±${v1}) level ${r.level} ` +
+            `face ${r.faceId}/${entryFaceBit(2, true)} steps ${r.steps}`);
+          results.checks.handoff = { hit: r.hit, t: r.t, level: r.level, faceId: r.faceId, wantT, cell: v1 };
+          if (!r.hit) throw new Error("(c) the ray missed — the hand-off dropped it");
+          if (r.level !== 1) throw new Error(`(c) the hit came back at level ${r.level}, not 1`);
+          if (!okT) throw new Error(`(c) hit at t ${r.t}, expected ~${wantT} ±${v1}`);
+          if (r.faceId !== entryFaceBit(2, true)) throw new Error(`(c) wrong entry face ${r.faceId}`);
+          say("(c) level hand-off: PASS");
+        }
+
+        // ══════════════════════════════════════════════════════════ throughput
+        await place([0, 0, 0]);
+        {
+          const rays = [];
+          for (let i = 0; i < Math.min(RAYS, 200000); i++) {
+            rays.push({ o: interiorPoint(0.06), d: unitDir(), tMax: 40 });
+          }
+          writeRays(rays);
+          // Warm: the first dispatch pays pipeline + bind-group setup, which is
+          // not what "cost per frame" means.
+          await compute(rayPass);
+          if (timestamps) await renderer.resolveTimestampsAsync("compute");
+
+          // MEDIAN OF THREE BATCHES, not one. A single batch of this kernel
+          // swung 3× between runs on this adapter (479 / 1062 / 1524 M rays/s
+          // at `high`) — the dispatch is 0.07-0.2 ms, which is the same order
+          // as clock ramp and as whatever else is sharing the GPU. A receipt
+          // every downstream ray budget is priced against cannot be one sample.
+          const median = (xs) => xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+          const BATCHES = 3;
+          let gpuMs = null;
+          if (timestamps) {
+            const samples = [];
+            for (let s = 0; s < BATCHES; s++) {
+              for (let f = 0; f < FRAMES; f++) renderer.compute(rayPass);
+              samples.push((await renderer.resolveTimestampsAsync("compute")) ?? 0);
+            }
+            gpuMs = median(samples);
+            results.gpuSamples = samples.map((m) => +(m / FRAMES).toFixed(4));
+          }
+          const wallSamples = [];
+          for (let s = 0; s < BATCHES; s++) {
+            const t0 = performance.now();
+            for (let f = 0; f < FRAMES; f++) renderer.compute(rayPass);
+            await device.queue.onSubmittedWorkDone();
+            wallSamples.push(performance.now() - t0);
+          }
+          const wallMs = median(wallSamples);
+
+          const raw = new Float32Array(await renderer.getArrayBufferAsync(rayOut.value));
+          let hits = 0;
+          let stepSum = 0;
+          let exhausted = 0;
+          for (let i = 0; i < RAYS; i++) {
+            const r = unpackTrace(raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]);
+            if (r.hit) hits++;
+            stepSum += r.steps;
+            if (!r.hit && r.steps >= STEP_BUDGET - 0.5) exhausted++;
+          }
+          const perFrameGpu = gpuMs == null ? null : gpuMs / FRAMES;
+          const perFrameWall = wallMs / FRAMES;
+          const raysPerSecGpu = perFrameGpu ? (RAYS / perFrameGpu) * 1000 : null;
+          const raysPerSecWall = (RAYS / perFrameWall) * 1000;
+          results.throughput = {
+            rays: RAYS, frames: FRAMES,
+            gpuMsPerFrame: perFrameGpu == null ? null : +perFrameGpu.toFixed(4),
+            wallMsPerFrame: +perFrameWall.toFixed(4),
+            raysPerSecGpu: raysPerSecGpu == null ? null : Math.round(raysPerSecGpu),
+            raysPerSecWall: Math.round(raysPerSecWall),
+            hitRate: +(hits / RAYS).toFixed(4),
+            meanSteps: +(stepSum / RAYS).toFixed(2),
+            exhausted,
+            stepBudget: STEP_BUDGET,
+          };
+          say(`throughput: ${RAYS} rays × ${FRAMES} frames × 3 batches (median) — ` +
+            (perFrameGpu == null ? "no timestamps, " : `gpu ${perFrameGpu.toFixed(3)} ms/frame, `) +
+            `wall ${perFrameWall.toFixed(3)} ms/frame`);
+          say(`RAYS/S ${TIER}: ` +
+            (raysPerSecGpu == null ? "" : `${(raysPerSecGpu / 1e6).toFixed(2)} M/s (gpu timestamps), `) +
+            `${(raysPerSecWall / 1e6).toFixed(2)} M/s (wall clock)`);
+          say(`hit rate ${(100 * hits / RAYS).toFixed(1)}%, mean ${(stepSum / RAYS).toFixed(2)} steps/ray ` +
+            `(budget ${STEP_BUDGET}, ${exhausted} exhausted)`);
+          // The spread, printed rather than hidden behind the median: a sub-ms
+          // dispatch on a shared adapter is a noisy instrument, and a reader
+          // pricing a ray budget needs to see how noisy.
+          if (results.gpuSamples) say(`gpu ms/frame per batch: ${results.gpuSamples.join(" / ")}`);
+        }
+
+        // ══════════════════════════════════════════════════ the kernel receipts
+        {
+          const kernels = [
+            ["trace", rayPass], ["scroll", win.scrollPass], ["clear", win.clearStaticPass], ["fill", fill.pass],
+          ];
+          const audit = [];
+          let traceWgsl = "";
+          for (const [name, node] of kernels) {
+            const shader = renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
+            const storageBindings = [...shader.matchAll(/var<storage[^>]*>/g)].length;
+            const workgroupVars = [...shader.matchAll(/var<workgroup/g)].length;
+            audit.push({ name, storageBindings, workgroupVars, bytes: shader.length });
+            if (name === "trace") traceWgsl = shader;
+            say(`kernel ${name.padEnd(6)} ${(shader.length / 1024).toFixed(1)} kB, ` +
+              `${storageBindings} storage buffers, ${workgroupVars} workgroup vars`);
+          }
+          results.kernels = audit;
+          const over = audit.filter((k) => k.storageBindings > 6);
+          if (over.length) {
+            throw new Error(`${over.map((k) => `${k.name}=${k.storageBindings}`).join(", ")} exceed the ` +
+              "portable envelope of 6 storage buffers per pass (PLAN §4.6)");
+          }
+          const wg = audit.filter((k) => k.workgroupVars > 0);
+          if (wg.length) throw new Error(`${wg.map((k) => k.name).join(", ")} use workgroup memory`);
+
+          // THE TRACE KERNEL MUST NOT KNOW THE SCENE. Every number in its WGSL
+          // has to be a tier constant (64, 16, the region offsets, v0) or plain
+          // arithmetic — never a room dimension, or the browser's shader cache
+          // misses on every scene and PLAN §4.6's cache-stability claim is void.
+          // Grepping for the room's dimensions is the obvious test and the
+          // WRONG one: `hx` is 5, and "5" appears in any kernel as a shift
+          // amount or a loop bound. So the check is inverted — EVERY float
+          // literal in the trace's WGSL must be derivable from the tier, and
+          // anything else is named. That audits numbers nobody thought to grep
+          // for, which is the point.
+          const fmt = (n) => (Number.isInteger(n) ? `${n}.0` : `${n}`);
+          // v0, the half-cell origin bias, the brick size, and EVERY level's
+          // cell size — the start-level search is unrolled over the tier's
+          // levels, so `v0 · 2^l` is compiled in for each of them.
+          const allowed = new Set([fmt(win.voxel0 * 0.5), fmt(win.voxel0 * store.BRICK)]);
+          for (let l = 0; l < win.levels; l++) allowed.add(fmt(win.voxel0 * Math.pow(2, l)));
+          const literals = [...new Set([...traceWgsl.matchAll(/(?<![\w.])-?\d+\.\d+/g)].map((m) => m[0]))].sort();
+          const isAddressing = (s) => {
+            const v = Number(s);
+            // Addressing and axis-select constants: whole numbers up to the
+            // window's own size in cells.
+            return Number.isInteger(v) && Math.abs(v) <= store.N;
+          };
+          const foreign = literals.filter((s) => !allowed.has(s) && !isAddressing(s));
+          // Belt and braces: the analytic room's own decimals, which no legal
+          // tier constant can equal.
+          const roomDecimals = [`${hx + wall}`, `${hy + wall}`, `${wall}`, "2.5", "1.5"];
+          const grepped = roomDecimals.filter((n) => traceWgsl.includes(n));
+          say(`trace kernel float literals: ${literals.join(" ")}` +
+            `  (tier: v0 ${fmt(win.voxel0)}, bias ${fmt(win.voxel0 * 0.5)}, brick ${fmt(win.voxel0 * store.BRICK)})`);
+          results.trace = { bytes: traceWgsl.length, literals, foreign, grepped };
+          if (foreign.length || grepped.length) {
+            throw new Error("the trace kernel's WGSL carries numbers that are not tier constants: " +
+              [...foreign, ...grepped].join(", "));
+          }
+          say(`trace kernel: ${(traceWgsl.length / 1024).toFixed(1)} kB, scene-free`);
+        }
+
+        if (validationErrors.length) throw new Error(`WebGPU validation: ${validationErrors[0]}`);
+        results.pass = true;
+        results.text = lines.join("\n");
+        globalThis.__GI2_TRACE_RESULT__ = results;
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

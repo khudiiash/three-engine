@@ -888,3 +888,79 @@ pairs/frame + ms, cache slots used, probes traced, rays, hits/misses, cache
 hit ratio, time-to-first-occupancy per level, time-to-first-light. Gates in
 PLAN Stage 2 rows. First receipt to produce: `probe:gi2-trace` rays/s at 3
 tiers (K.4 alone, synthetic scene) — every ray budget bends to it.
+
+---
+
+## L. STAGE 3 DESIGN — THE GATHER (screen probes + resolve), written 08-27 by the architect
+
+Runs on the window (§K). Tier constants: tile size `T` (8 px desktop, 16 px
+phone), oct map `O = 8` (64 directions), rays/probe/frame `R` (8 low/medium,
+16 high/ultra), history frames `H = 4`. All dims are uniforms; WGSL scene-free.
+
+### L.1 Probe placement (`probePlace`, 2-D dispatch over tiles)
+One probe per `T×T` tile of the RESOLVE-res gbuffer. Pick the tile's anchor
+pixel by a per-frame Hammersley jitter (frame index uniform), reject sky/
+background pixels (try up to 4 candidates; a tile with no surface holds no
+probe → weight 0 in the resolve). Store per probe: world position, geometric
+normal (from the gbuffer), depth, `valid` bit, tileId. Anchor is pushed
+`0.5 · v0` along the normal (K.4 bias) before tracing.
+
+### L.2 Probe trace (`probeTrace`, one thread per (probe, ray))
+Ray directions: octahedral texel centres of the `O×O` map, cosine-weighted by
+the probe normal (hemisphere; the back hemisphere's texels store 0 and are
+skipped), `R` of the 64 per frame chosen by a per-frame stratified index so
+64 fill in `64/R` frames. Per ray: (1) HZB screen segment — closest-HZB
+stackless walk over the resolve-res depth for at most `S_MAX = 24` steps,
+relative thickness 0.1; on a screen hit, radiance = last frame's lit colour
+at that pixel (the `injectLitFrame` source), done; on "went behind a surface"
+or off-screen: step BACK to the last unoccluded position and hand off; (2)
+`traceWindow` (K.4) from the hand-off point; hit → read the hit voxel's face
+radiance from the cache (K.6) — if the slot is fresh (never shaded), shade it
+NOW (albedo × (sun × DDA shadow ray + NEE light tree) + emissive) and write
+it; miss → sky (the scene environment along `d`, times the S1 intensity).
+Write `(radiance, hitDistance)` into the probe's oct texel for this frame.
+Cost per frame = `probes × R` rays, constant by tier: ultra 25k×16 = 400k.
+
+### L.3 Probe accumulation (in the same kernel, per texel written)
+Reproject the probe's PREVIOUS oct map: find last frame's probe whose world
+position is within `0.5 · T · pixelWorldSize` and whose normal agrees
+(`dot > 0.9`); if found, `texel = lerp(prev, new, α)` with `α = 1/min(n+1,
+H)` per texel (n = that texel's sample count, stored in the texel's alpha) —
+GI-1.0's biased hysteresis: on a large radiance change (`|new−prev| >
+0.5·max`) force `α = 0.5`. If no matching previous probe: fresh (n = 0).
+This is the ONLY temporal term: probe-space, world-validated, no history of
+the final image, no AO history (user rule).
+
+### L.4 Probe filter (`probeFilter`, 2-D over tiles)
+3×3 probe-space bilateral: neighbours weighted by plane distance to this
+probe's plane (`exp(−|n·(p_i−p)|/v0)`) and normal agreement; per texel
+average of valid neighbours' texels (skip texels with n = 0). Output the
+filtered oct map (separate buffer; the raw map stays for accumulation).
+
+### L.5 Resolve (`resolve`, 2-D over resolve-res pixels)
+For pixel P with normal N: the 4 surrounding probes (tile corners) weighted
+by bilinear × plane distance × normal agreement (Lumen's weights), fall back
+to the nearest valid probe if all 4 are invalid; irradiance = Σ over the
+probe's oct texels of `L(ω) · max(0, N·ω) · solidAngle(ω)` (a 64-term sum
+per probe × 4 probes = 256 MACs; or precompute per probe a 9-coefficient SH
+in `probeFilter` and evaluate SH at N — do SH on phone tiers, oct sum on
+desktop; measure both). Glossy: the reflection direction's oct texel (bilinear
+in oct space) from the same 4 probes, cone-widened by roughness (mip of the
+oct map = the 2×2 average stored beside it). Output: full-res `irradiance`
+(RGBA16F) and `glossy` (RGBA16F) — the two textures Stage 1.1's thin hook
+already consumes. GTAO composes as today.
+
+### L.6 Lit-frame injection (`injectLitFrame`, 1/16 of pixels per frame)
+For a stratified subset of pixels: final lit colour (the frame's output before
+post) → the pixel's voxel face slot in the cache (EMA α 0.25), faceId from
+the pixel normal's dominant axis + sign. This is what makes VISIBLE surfaces'
+bounce colour exact within a frame; off-screen surfaces converge through L.2's
+fresh-slot shading.
+
+### L.7 Budgets and receipts
+`profile.gi2.gather`: probes placed/valid, rays traced, screen-hit %, window-
+hit %, sky %, fresh-slot shades, reprojection hit %, α forced count, ms per
+kernel. Gates (PLAN Stage 3 rows): Cornell colour-probe parity; 2nd bounce
+present within 30 frames; off-screen lamp lights its corridor; GI ≤ 4 ms at
+1650×970 ultra, ≤ 2.5 ms on the phone rig; max frame time during a 10 s
+orbit ≤ 1.2× parked; no user-visible blocks.
