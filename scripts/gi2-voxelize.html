@@ -758,23 +758,92 @@
         // converges to is BIT-IDENTICAL to the one-frame reference — which is
         // the property that says the instalments composed instead of the last
         // one winning.
+        //
+        // ⭐⭐ AND IT IS RUN AT SEVERAL CAPS, BECAUSE ONE CAP IS ONE THROW OF
+        // THE DICE. `dirtyScatter` hands out list slots with an `atomicAdd`, so
+        // which bricks get a scratch slot and where each brick's instalment
+        // boundary falls is NOT the same from run to run — and a merge bug that
+        // only fires when a particular brick splits at a particular triangle
+        // shows up in maybe one run in three. Stage 3.2 recorded exactly that
+        // as "pre-existing in 2.5's cursor merge" and the next run of the same
+        // command passed, which is how it survived. Six caps, from half the
+        // biggest brick down to a sixteenth, turn "sometimes" into "every time"
+        // — and after the fix, into a gate that means something.
         {
           const biggestBrick = refBuild.peakBrickPairs ?? 0;
-          const cap = Math.max(8, Math.floor(biggestBrick / 2));
-          vox.setPairLimit(cap);
-          await compute(win.clearStaticPass);
-          const resumeRun = await buildToClean([0, 0, 0]);
-          const resumeBuf = await readWindow();
-          const resumeOcc = countOcc(resumeBuf);
-          const occDiff = occDiffBits(refBuf, resumeBuf);
+          const caps = [2, 3, 4, 6, 10, 16]
+            .map((d) => Math.max(8, Math.floor(biggestBrick / d)))
+            .filter((c, i, a) => a.indexOf(c) === i);
+          const sweep = [];
+          let cap = caps[0];
+          let resumeRun = null;
+          let resumeBuf = null;
+          let resumeOcc = null;
+          let occDiff = 0;
+          let held = false; // the reported run is a DISAGREEING one
+          for (const c of caps) {
+            vox.setPairLimit(c);
+            await compute(win.clearStaticPass);
+            const run = await buildToClean([0, 0, 0]);
+            const buf = await readWindow();
+            const od = occDiffBits(refBuf, buf);
+            let pd = 0;
+            for (let l = 0; l < win.levels; l++) {
+              const base = l * store.LEVEL_WORDS + store.PAL_OFF;
+              for (let w = 0; w < store.PAL_WORDS; w++) if (refBuf[base + w] !== buf[base + w]) pd++;
+            }
+            sweep.push({ cap: c, frames: run.frames, resumed: run.resumed, occDiff: od, palDiff: pd });
+            say(`  cursor sweep: cap ${String(c).padStart(4)} -> ${String(run.frames).padStart(3)} frames, ` +
+              `${String(run.resumed).padStart(4)} resumptions, ${od} occ bits differ, ${pd} pal words differ`);
+            // Keep the FIRST cap that disagrees for the byte-level dump below;
+            // otherwise the last one, so a clean sweep still reports a run.
+            if (!held) {
+              cap = c; resumeRun = run; resumeBuf = buf; resumeOcc = countOcc(buf); occDiff = od;
+              held = od > 0 || pd > 0;
+            }
+          }
+          results.cursorSweep = sweep;
           // The palette too: the pack is a MERGE precisely so a brick built over
           // N frames lands on the byte a one-frame build produces, and a diff
           // that only looked at `occ` would have been blind to the half of the
           // change that lives in `pal`.
+          //
+          // ⭐ A COUNT OF DIFFERING WORDS CANNOT NAME A MECHANISM. "1 pal word
+          // differs" rode along for a whole stage as a known-bad because the
+          // receipt stopped at the count, and all four candidate causes (a dust
+          // write racing a SAT write, the tagged-index precedence, a stale
+          // scratch slot, a half-cleared brick) print that same line. So every
+          // differing word is dumped BYTE BY BYTE with the voxel it belongs to
+          // and the palette index on each side.
           let palDiff = 0;
+          const palDiffRows = [];
           for (let l = 0; l < win.levels; l++) {
             const base = l * store.LEVEL_WORDS + store.PAL_OFF;
-            for (let w = 0; w < store.PAL_WORDS; w++) if (refBuf[base + w] !== resumeBuf[base + w]) palDiff++;
+            for (let w = 0; w < store.PAL_WORDS; w++) {
+              if (refBuf[base + w] === resumeBuf[base + w]) continue;
+              palDiff++;
+              if (palDiffRows.length >= 8) continue;
+              const bytes = [];
+              for (let k = 0; k < 4; k++) {
+                const a = (refBuf[base + w] >>> (k * 8)) & 255;
+                const b = (resumeBuf[base + w] >>> (k * 8)) & 255;
+                if (a === b) continue;
+                const vi = w * 4 + k;
+                const occWord = refBuf[l * store.LEVEL_WORDS + store.OCC_OFF + (vi >>> 5)];
+                bytes.push({
+                  vi, ref: a, resumed: b,
+                  vox: [vi & 63, (vi >>> 6) & 63, (vi >>> 12) & 63],
+                  occupied: ((occWord >>> (vi & 31)) & 1) === 1,
+                });
+              }
+              palDiffRows.push({ level: l, word: w, bytes });
+            }
+          }
+          for (const row of palDiffRows) {
+            for (const b of row.bytes) {
+              say(`    pal diff: level ${row.level} voxel ${b.vox.join(",")} (vi ${b.vi}) ` +
+                `one-frame ${b.ref} resumed ${b.resumed} occupied ${b.occupied}`);
+            }
           }
           vox.setPairLimit(vox.PAIRS_CAP);
           say(`cursor arm: cap ${cap} < biggest brick ${biggestBrick} -> ${resumeRun.frames} frames ` +
@@ -784,8 +853,10 @@
           results.cursor = {
             cap, biggestBrick, frames: resumeRun.frames, framesFull: refBuild.frames,
             resumed: resumeRun.resumed, maxCursor: resumeRun.maxCursor, starved: resumeRun.starved,
-            occ: resumeOcc.total, occFull: refOcc.total, occDiff, palDiff,
+            occ: resumeOcc.total, occFull: refOcc.total, occDiff, palDiff, palDiffRows,
+            sweep,
           };
+          const badCaps = sweep.filter((s) => s.occDiff || s.palDiff);
           if (resumeRun.frames >= MAX_FRAMES) {
             throw new Error(`a cap of ${cap} (below the biggest brick's ${biggestBrick}) never converged in ` +
               `${MAX_FRAMES} frames — the cursor did not carry the brick`);
@@ -798,10 +869,13 @@
             throw new Error(`no brick resumed at cap ${cap} — either the cap was not below one brick's demand ` +
               `(${biggestBrick}) or the cursor never engaged, and either way this arm proves nothing`);
           }
-          if (occDiff !== 0) throw new Error(`the resumed build differs in ${occDiff} occupancy bits`);
-          if (palDiff !== 0) throw new Error(`the resumed build differs in ${palDiff} palette words`);
-          say(`resumable brick: PASS (cap ${cap} < one brick's ${biggestBrick}, ` +
-            `${resumeRun.resumed} resumptions, bit-identical occ + pal)`);
+          if (badCaps.length) {
+            throw new Error(`the resumed build differs from the one-frame build at ${badCaps.length} of ` +
+              `${sweep.length} caps: ${badCaps.map((s) => `cap ${s.cap} → ${s.occDiff} occ bits / ` +
+              `${s.palDiff} pal words`).join("; ")}`);
+          }
+          say(`resumable brick: PASS (${sweep.length} caps from ${caps[0]} down to ${caps.at(-1)}, all below ` +
+            `one brick's ${biggestBrick}; every one bit-identical in occ AND pal)`);
         }
 
         // ═════════════════════════════ the palette, and its packed-atomic control

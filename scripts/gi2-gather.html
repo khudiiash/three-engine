@@ -255,7 +255,9 @@
           await compute(gather.passes.probePlace);
           await compute(gather.passes.probeTrace);
           await compute(gather.passes.probeFilter);
-          await compute(gather.passes.resolve);
+          await compute(gather.passes.probeShFilter);
+          await compute(gather.passes.resolveHalf);
+          await compute(gather.passes.resolveUpsample);
           await compute(gather.passes.composite);
           if (opts.inject !== false) await compute(gather.passes.inject);
           prevVp.copy(vp);
@@ -478,7 +480,8 @@
           const texels = [];
           const Er = [0, 0, 0]; const Ef = [0, 0, 0];
           for (let t = 0; t < OCTN; t++) {
-            const ob = (D.half * gd.probeCount * OCTN + pi * OCTN + t) * 4;
+            // TEXEL-MAJOR, mirroring `octIdx` — see gatherProbes.js.
+            const ob = (D.half * gd.probeCount * OCTN + t * gd.probeCount + pi) * 4;
             const a = D.raw[ob + 3];
             const nS = Math.floor(a / 1024);
             const dist = a - nS * 1024;
@@ -494,7 +497,7 @@
             const e = OCT_TBL[t];
             const c = e[0] * N[0] + e[1] * N[1] + e[2] * N[2];
             if (c > 0) {
-              const fb = (pi * OCTN + t) * 4;
+              const fb = (t * gd.probeCount + pi) * 4;
               for (let k = 0; k < 3; k++) { Er[k] += D.raw[ob + k] * c * e[3]; Ef[k] += D.filt[fb + k] * c * e[3]; }
             }
           }
@@ -883,21 +886,61 @@
 
         // ══════════════════════ RESOLVE A/B: SH2 against the 4×64 oct sum
         //
-        // §3.2 item 1's gate. The two arms differ ONLY in the diffuse
-        // integrator — same probes, same filtered oct map, same frame — so the
-        // ratio is the SH truncation error and nothing else.
+        // §3.2 item 1's gate. BOTH ARMS ARE RUN AT FULL RESOLUTION so the
+        // comparison is about the integrator and not about the shipped path's
+        // 2×2 upsample — the upsample has its own arm below.
+        //
+        // ⚠ AND THE SH ARM IS `resolveShRaw`, NOT THE SHIPPED RESOLVE. §L.4's
+        // 3×3 bilateral runs on the SH COEFFICIENTS since §3.3, so the shipped
+        // resolve reads a POOLED SH while the oct sum still reads each probe's
+        // OWN map — comparing those two folds the filter into a number that is
+        // supposed to be about band limits, and it moved the sphere 5.6 → 16.1 %
+        // while the sphere's own irradiance moved 0.557 → 0.572. So the arm
+        // reads the UNPOOLED coefficients and the ratio is the truncation
+        // again. The shipped (pooled) value is printed beside it.
         {
+          // The SHIPPED path first, while the textures still hold it: the
+          // half-res evaluate + 2×2 upsample against the same kernel run at
+          // full res is the ONLY honest statement of what §3.3's lever 2 cost.
           writeCrops();
+          const halfArm = await readCrops();
+          await compute(gather.passes.resolve);
           const shArm = await readCrops();
+          // The truncation arm: SH2 over the SAME (unpooled) coefficients the
+          // oct sum integrates — see `resolveShRaw`.
+          await compute(gather.passes.resolveShRaw);
+          const shRawArm = await readCrops();
           await compute(gather.passes.resolveOct);
           const octArm = await readCrops();
-          await compute(gather.passes.resolve);
+          await compute(gather.passes.resolveHalf);
+          await compute(gather.passes.resolveUpsample);
           const rows = CROPS.map((c, i) => ({
             name: c.name, diag: !!c.diag,
-            sh: lum(shArm[i].irr), oct: lum(octArm[i].irr),
-            ratio: lum(shArm[i].irr) / Math.max(1e-9, lum(octArm[i].irr)),
+            sh: lum(shRawArm[i].irr), oct: lum(octArm[i].irr),
+            ratio: lum(shRawArm[i].irr) / Math.max(1e-9, lum(octArm[i].irr)),
+            shPooled: lum(shArm[i].irr),
           }));
           results.resolveAB = rows;
+          results.resolveScaleAB = CROPS.map((c, i) => ({
+            name: c.name, diag: !!c.diag,
+            half: lum(halfArm[i].irr), full: lum(shArm[i].irr),
+            ratio: lum(halfArm[i].irr) / Math.max(1e-9, lum(shArm[i].irr)),
+            glossyHalf: lum(halfArm[i].glossy), glossyFull: lum(shArm[i].glossy),
+            glossyRatio: lum(halfArm[i].glossy) / Math.max(1e-9, lum(shArm[i].glossy)),
+          }));
+          {
+            const sc = results.resolveScaleAB.filter((r) => !r.diag && r.full > 1e-3);
+            const w = sc.reduce((a, r) => (Math.abs(r.ratio - 1) > Math.abs(a.ratio - 1) ? r : a), sc[0]);
+            say(`  resolve scale A/B (half-res + 2×2 upsample ÷ full res): worst receipt crop ` +
+              `${w.name} ${((w.ratio - 1) * 100).toFixed(2)} % — ` +
+              sc.map((r) => `${r.name} ${r.ratio.toFixed(3)}`).join(", "));
+            const gs = results.resolveScaleAB.filter((r) => !r.diag && r.glossyFull > 1e-4);
+            if (gs.length) {
+              const gw = gs.reduce((a, r) => (Math.abs(r.glossyRatio - 1) > Math.abs(a.glossyRatio - 1) ? r : a), gs[0]);
+              say(`  glossy, same A/B: worst ${gw.name} ${((gw.glossyRatio - 1) * 100).toFixed(2)} % — ` +
+                gs.map((r) => `${r.name} ${r.glossyRatio.toFixed(3)}`).join(", "));
+            }
+          }
           const diffuse = rows.filter((r) => !r.diag && r.oct > 1e-3);
           const worst = diffuse.reduce((a, r) => (Math.abs(r.ratio - 1) > Math.abs(a.ratio - 1) ? r : a), diffuse[0]);
           say(`resolve A/B (SH2 / oct sum): ` + rows.filter((r) => !r.diag)
@@ -1125,6 +1168,63 @@
           };
         }
 
+        // ════════════════ THE EXHAUSTED RAYS, ONE BY ONE (§3.3 item 5)
+        //
+        // ⭐ THE ROOM IS SEALED, SO EVERY RAY MUST HIT SOMETHING. A miss is a
+        // leak, and the receipt for a leak is not its RATE — it is the rays.
+        {
+          await compute(gather.passes.clearStats);
+          await runFrame(3000);
+          await compute(gather.passes.exhaustProbe);
+          const raw = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.exhaustOut.value));
+          const st = await readStats();
+          const claimed = new Uint32Array(
+            await renderer.getArrayBufferAsync(gather.buffers.statsBuf.value),
+          )[gatherMod.EXHAUST_CLAIM * gatherMod.STAT_STRIPE];
+          const n = Math.min(claimed, gather.EXHAUST_SLOTS);
+          // ⚠ A PROBE SITS ON A WALL, AND `<` CALLS THAT OUTSIDE. The first cut of
+          // this classifier put 211 of 256 rays in "origin already outside"
+          // purely because a ceiling probe reports y = 3.00 against hy = 3. The
+          // test is "inside or on the boundary", with a cell of slack.
+          const inRoom = (q) => Math.abs(q[0]) <= ROOM.hx + wd.voxel0
+            && Math.abs(q[1]) <= ROOM.hy + wd.voxel0 && Math.abs(q[2]) <= ROOM.hz + wd.voxel0;
+          const rows = [];
+          for (let i = 0; i < n; i++) {
+            const b = i * gather.EXH_VEC * 4;
+            rows.push({
+              pos: [raw[b], raw[b + 1], raw[b + 2]], probe: raw[b + 3],
+              dir: [raw[b + 4], raw[b + 5], raw[b + 6]], texel: raw[b + 7],
+              used: raw[b + 8], hitHalf: raw[b + 9], tHalf: raw[b + 10], usedHalf: raw[b + 11],
+              end: [raw[b + 12], raw[b + 13], raw[b + 14]], t: raw[b + 15],
+            });
+          }
+          // THE CLASSES. Each ray falls in exactly one, and each names a
+          // different mechanism.
+          const cls = { originOutside: 0, stepBudget: 0, ranOutOfWindow: 0, ddaLeak: 0 };
+          for (const r of rows) {
+            if (!inRoom(r.pos)) cls.originOutside++;
+            else if (r.used >= trace.steps) cls.stepBudget++;
+            else if (r.hitHalf > 0.5) cls.ranOutOfWindow++;
+            else cls.ddaLeak++;
+          }
+          const pct = 100 * st.skyMiss / Math.max(1, st.raysTraced);
+          say("");
+          say(`EXHAUSTED RAYS (§3.3 item 5): ${st.skyMiss} of ${st.raysTraced} traced = ${pct.toFixed(2)} % ` +
+            `reach ${gatherMod.RAY_MAX} m in a SEALED room; ${n} of them recorded`);
+          say(`  origin outside the room ${cls.originOutside} | ` +
+            `brick step budget (${trace.steps}) ${cls.stepBudget} | ran out of window ${cls.ranOutOfWindow} | DDA leak ${cls.ddaLeak}`);
+          for (const r of rows.slice(0, 6)) {
+            say(`    p ${r.pos.map((v) => v.toFixed(2)).join(",")} ${inRoom(r.pos) ? "inside" : "OUTSIDE"} ` +
+              `d ${r.dir.map((v) => v.toFixed(2)).join(",")} | ${r.used.toFixed(0)} of ${trace.steps} DDA steps ` +
+              `| at half length: ${r.hitHalf > 0.5 ? `HIT at ${r.tHalf.toFixed(2)} m` : "miss"}`);
+          }
+          results.exhausted = {
+            rays: st.skyMiss, traced: st.raysTraced, pct, recorded: n, claimed,
+            classes: cls, sample: rows.slice(0, 32), traceSteps: trace.steps,
+          };
+          await compute(gather.passes.clearStats);
+        }
+
         // ══════════════════════════════════════════ per-kernel cost
         //
         // With `statsOn = 0`: the counters above are an instrument, and an
@@ -1140,8 +1240,21 @@
             ["probePlace", gather.passes.probePlace],
             ["probeTrace", gather.passes.probeTrace],
             ["probeFilter", gather.passes.probeFilter],
-            ["resolve", gather.passes.resolve],
+            ["probeShFilter", gather.passes.probeShFilter],
+            ["resolveHalf", gather.passes.resolveHalf],
+            ["resolveUpsample", gather.passes.resolveUpsample],
+            ["resolveFull", gather.passes.resolve],
             ["resolveOct", gather.passes.resolveOct],
+            ["resolveShRaw", gather.passes.resolveShRaw],
+            // ── MEASUREMENT ARMS, not shipped and not summed ──────────────
+            //
+            // The HZB screen segment is 24 stackless steps that ~5 % of rays
+            // convert into a hit; the other 95 % pay for it and then trace the
+            // window anyway. "What does the screen segment cost" is a question
+            // about `probeTrace`, and the only honest way to ask it is to run
+            // the SAME kernel with the uniform that gates the segment off.
+            ["probeTraceNoHzb", gather.passes.probeTrace, { hzbOn: 0 }],
+            ["probePlaceNoCarry", gather.passes.probePlace, { carryOn: 0 }],
             ["composite", gather.passes.composite],
             ["inject", gather.passes.inject],
             ["cacheAlloc", cache.allocPass],
@@ -1149,7 +1262,8 @@
           ];
           const REP = 24;
           const audit = [];
-          for (const [name, node] of kernels) {
+          for (const [name, node, arm] of kernels) {
+            for (const [k, v] of Object.entries(arm ?? {})) gu[k].value = v;
             await compute(node);
             if (timestamps) await renderer.resolveTimestampsAsync("compute");
             let ms = null;
@@ -1165,13 +1279,28 @@
             const storageBindings = [...shader.matchAll(/var<storage[^>]*>/g)].length;
             const workgroupVars = [...shader.matchAll(/var<workgroup/g)].length;
             audit.push({ name, ms, kb: +(shader.length / 1024).toFixed(1), storageBindings, workgroupVars });
-            say(`kernel ${name.padEnd(12)} ${ms == null ? "  n/a" : ms.toFixed(4).padStart(8)} ms  ` +
+            say(`kernel ${name.padEnd(17)} ${ms == null ? "  n/a" : ms.toFixed(4).padStart(8)} ms  ` +
               `${String(storageBindings).padStart(2)} storage  ${workgroupVars} wg  ${(shader.length / 1024).toFixed(1)} kB`);
+            for (const k of Object.keys(arm ?? {})) gu[k].value = 1;
           }
           results.kernels = audit;
-          results.gatherMs = audit.filter((k) => !["cacheAlloc", "windowFill", "resolveOct"].includes(k.name))
+          const ARMS = ["cacheAlloc", "windowFill", "resolveOct", "resolveFull",
+            "resolveShRaw", "probeTraceNoHzb", "probePlaceNoCarry"];
+          results.gatherMs = audit.filter((k) => !ARMS.includes(k.name))
             .reduce((s, k) => s + (k.ms ?? 0), 0);
-          say(`gather total (the per-frame chain): ${results.gatherMs.toFixed(3)} ms of compute at ${W}×${Hh}`);
+          // ⭐ STAGE 3.3'S BUDGET EXCLUDES `composite`. It is the harness's
+          // stand-in for the engine's own shading pass — albedo × irradiance +
+          // glossy × F0 — which on the real path is Stage 1.1's material hook
+          // inside a raster draw that would be running anyway. Counting it here
+          // would price a pass the gather does not own.
+          const ms = (n) => audit.find((k) => k.name === n)?.ms ?? 0;
+          results.chainMs = results.gatherMs - ms("composite");
+          say(`gather total: ${results.gatherMs.toFixed(3)} ms at ${W}×${Hh}; ` +
+            `chain excluding composite ${results.chainMs.toFixed(3)} ms (Stage 3.3 gate ≤ 4.0 at 1650×970)`);
+          say(`  HZB screen segment costs ${(ms("probeTrace") - ms("probeTraceNoHzb")).toFixed(4)} ms of ` +
+            `probeTrace's ${ms("probeTrace").toFixed(4)}; the oct-map carry costs ` +
+            `${(ms("probePlace") - ms("probePlaceNoCarry")).toFixed(4)} ms of probePlace's ` +
+            `${ms("probePlace").toFixed(4)}`);
 
           // THE SIDE-EFFECT GUARD. A TSL call built for its side effect and not
           // pinned to the stack compiles to NOTHING, silently (see the note on

@@ -1039,6 +1039,36 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     const any = uint(0).toVar();
     const setCount = uint(0).toVar();
 
+    // ⭐⭐ THE SAT-OVER-DUST PRECEDENCE LIVES IN THE SCRATCH, AND THE SCRATCH
+    // IS PER-FRAME. `SCR_TAG_SAT > SCR_TAG_DUST` decides the winner inside one
+    // frame's `atomicMax`; the moment the pack writes the winner into `pal` the
+    // tag is gone, and the byte is just a number. So a brick split across
+    // instalments could pack a DUST palette first (in a frame whose slice held
+    // no SAT triangle for that voxel) and then meet the exact SAT palette in a
+    // later frame, where `max(existing, new)` is a comparison of two indices
+    // with no notion of which is exact — and the dust index wins whenever it is
+    // numerically larger. Measured at ultra: level 3 voxels (0,62,0) and
+    // (1,62,0), which the FLOOR (SAT, palette 1) and the SPHERE (dust at a 2 m
+    // cell, palette 8) both reach, came out 8 in the resumed build and 1 in the
+    // one-frame build. It fires at 4 of 6 pair caps and at none of the others,
+    // which is why one run of the probe could pass and the next fail.
+    //
+    // The rule that restores the precedence WITHOUT a provenance bit in the
+    // byte: a SAT scratch entry merges on every instalment (SAT-over-SAT is a
+    // `max` in both builds, so the order cannot matter), and a DUST entry is
+    // held back until the brick's LAST instalment, where it fills only a byte
+    // nothing has claimed. That is exactly what the scratch's tag says, spread
+    // over frames: dust never overwrites a measured surface, and a voxel no SAT
+    // triangle ever reached still gets its dust palette. A half-built brick's
+    // `brickMask` bit is clear, so the byte being provisionally empty for a
+    // frame or two is invisible to the trace.
+    const curWord = uint(CUR_OFF).add(level.mul(uint(BRICKS_PER_LEVEL))).add(b).toVar();
+    const cursorNow = atomicLoad(wk.element(curWord)).toVar();
+    const done = cursorNow.equal(uint(0)).toVar();
+    // "Nothing has claimed this byte" is the sentinel `binPairs` cleared to,
+    // and the two arms clear to different ones (see the clear's own note).
+    const noneByte = select(float(palModeU).greaterThan(0.5), uint(PAL_NONE), uint(0)).toVar();
+
     Loop({ start: 0, end: BRICK * BRICK, name: "finRow" }, ({ finRow }) => {
       const ly = bitAnd(uint(finRow), uint(3)).toVar();
       const lz = shiftRight(uint(finRow), uint(2)).toVar();
@@ -1072,16 +1102,23 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
               shiftRight(triPal.element(shiftRight(payload, uint(2))), bitAnd(payload, uint(3)).mul(uint(8))),
               uint(255),
             ).toVar();
-            const fresh = select(bitAnd(s, uint(SCR_TAG_SAT)).notEqual(uint(0)), payload, dustPal).toVar();
+            const isSat = bitAnd(s, uint(SCR_TAG_SAT)).notEqual(uint(0)).toVar();
+            const fresh = select(isSat, payload, dustPal).toVar();
             const cur = bitAnd(shiftRight(word, uint(k * 8)), uint(255)).toVar();
             // PAL_NONE is 255 and would win a bare `max` against every real
             // index, in BOTH directions: a material-less dust triangle must not
             // erase a real palette, and a real palette must not lose to the
             // sentinel the clear left behind. `voxelize` can guard its own side
             // (it holds the byte); dust cannot, so the guard lives here.
+            //
+            // …and DUST waits for the closing instalment, into an unclaimed
+            // byte only — see the note above `curWord`.
+            const takeIt = fresh.notEqual(uint(PAL_NONE))
+              .and(isSat.or(done.and(cur.equal(noneByte)))).toVar();
             const merged = select(
-              fresh.equal(uint(PAL_NONE)), cur,
+              takeIt,
               select(cur.equal(uint(PAL_NONE)), fresh, cur.max(fresh)),
+              cur,
             ).toVar();
             word.assign(bitOr(bitAnd(word, uint(~(255 << (k * 8)) >>> 0)), shiftLeft(merged, uint(k * 8))));
           });
@@ -1093,8 +1130,8 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     // THE VERDICT. `binPairs` stores 0 in the pair cursor when the brick
     // enumerated everything it owed and the running count otherwise, so this one
     // word is the whole completion test — no second flag that could disagree.
-    const curWord = uint(CUR_OFF).add(level.mul(uint(BRICKS_PER_LEVEL))).add(b).toVar();
-    If(atomicLoad(wk.element(curWord)).notEqual(uint(0)), () => {
+    // It is read ONCE, above, because the palette merge needs the same answer.
+    If(cursorNow.notEqual(uint(0)), () => {
       // Mid-brick: back to DIRTY, mask left CLEAR. A half-built brick is
       // invisible to the trace for a frame or two, which is what the budget
       // buys; showing half of it would be a wrong answer rather than a late one.

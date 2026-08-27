@@ -95,13 +95,13 @@ import { octahedralUV } from "../srcOctahedral.js";
  * because a tier is expected to differ.
  */
 export const GATHER_TIERS = {
-  phone: { tile: 16, rays: 8, oct: 8, history: 4, sh: true },
-  medium: { tile: 16, rays: 8, oct: 8, history: 4, sh: true },
-  high: { tile: 8, rays: 16, oct: 8, history: 4, sh: true },
-  ultra: { tile: 8, rays: 16, oct: 8, history: 4, sh: true },
+  phone: { tile: 16, rays: 8, oct: 8, history: 4, sh: true, hzbSteps: 12 },
+  medium: { tile: 16, rays: 8, oct: 8, history: 4, sh: true, hzbSteps: 12 },
+  high: { tile: 8, rays: 16, oct: 8, history: 4, sh: true, hzbSteps: 12 },
+  ultra: { tile: 8, rays: 16, oct: 8, history: 4, sh: true, hzbSteps: 12 },
 };
 
-/** HZB mips and the stackless walk's step budget (§L.2). */
+/** HZB mips and §L.2's step budget — the tier row's DEFAULT, not the value. */
 export const HZB_MIPS = 5;
 export const HZB_STEPS = 24;
 /** §L.2's "relative thickness 0.1", and the bias that keeps a ray off its own pixel. */
@@ -113,6 +113,12 @@ export const HZB_FAR = 1e6;
 export const PAL_ENTRIES = 16;
 /** Striped statistics: one counter is 64 words, indexed by lane, summed on read. */
 export const STAT_STRIPE = 64;
+/**
+ * The debug arm's ring: how many EXHAUSTED rays `exhaustProbe` records.
+ * Its claim counter is stats slot 15, which no counter uses.
+ */
+export const EXHAUST_SLOTS = 256;
+export const EXHAUST_CLAIM = 15;
 export const STATS = {
   probesPlaced: 0, probesValid: 1, reprojHits: 2, raysLaunched: 3, raysTraced: 4,
   screenHits: 5, windowHits: 6, skyMiss: 7, freshShades: 8, alphaForced: 9,
@@ -123,6 +129,15 @@ export const STAT_WORDS = STAT_SLOTS * STAT_STRIPE;
 
 /** Ray length in metres. A tier constant: it bounds the DDA, not the scene. */
 export const RAY_MAX = 40;
+
+/**
+ * How near a window hit has to be, IN LEVEL-0 CELLS, for the screen segment
+ * to be worth running — §L.2's first segment, gated. Four cells is the reach
+ * over which one cached voxel FACE is coarser than the ray's own footprint;
+ * past it the screen has nothing the cache does not already have. In cells,
+ * not metres, so it follows the window's resolution at every tier.
+ */
+export const CONTACT_CELLS = 4;
 
 // ── CPU mirrors of the octahedral table (see `srcOctahedral.js`) ─────────────
 
@@ -188,6 +203,23 @@ export function createGiGather({
   const STRIDE = OCT / R;
   const USE_SH = spec.sh;
   const MIP_RES = O / 2;
+  /**
+   * ⭐ THE SCREEN SEGMENT'S STEP BUDGET IS A TIER CONSTANT NOW, AND IT IS 12.
+   *
+   * §L.2 asked for `S_MAX = 24`. Measured at 1650×970 ultra, the segment cost
+   * 0.756 ms of `probeTrace`'s 1.603 — the same kernel with the segment gated
+   * off runs at 0.847 — and it converted 5.1 % of traced rays into a screen
+   * hit. The other 95 % walked 24 stackless steps and then traced the window
+   * anyway. Its second product, the HAND-OFF (51 % of rays start their window
+   * trace part-way along), is already paid for in the first few steps: a
+   * stackless closest-depth walk covers most of its screen distance early,
+   * because every miss climbs a mip and doubles the stride.
+   *
+   * So the budget is halved rather than the segment removed. What that costs
+   * is a measurement, not an argument — `probe:gi2-gather` prints the
+   * screen-hit rate and the on/off crop ratios beside it.
+   */
+  const S_MAX = spec.hzbSteps ?? HZB_STEPS;
   const MIP_TEXELS = MIP_RES * MIP_RES;
   const { traceWindow } = trace;
   const v0 = win.voxel0;
@@ -222,7 +254,11 @@ export function createGiGather({
   const probeFiltered = instancedArray(
     new Float32Array((probeCount * OCT + probeCount * MIP_TEXELS) * 4), "vec4",
   );
-  const probeSh = instancedArray(new Float32Array(probeCount * 9 * 4), "vec4");
+  // TWO halves: [0] is what every consumer reads (`shIdx` — the FILTERED
+  // coefficients, and the address Stage 3.4's emitter term adds into), [1] is
+  // the per-probe RAW projection `probeShFilter` pools from (`shRawIdx`). The
+  // filtered half comes FIRST so no address outside this file had to change.
+  const probeSh = instancedArray(new Float32Array(2 * probeCount * 9 * 4), "vec4");
   const hzb = instancedArray(new Float32Array(hzbWords), "float");
   const statsBuf = instancedArray(new Uint32Array(STAT_WORDS), "uint");
   const stats = storage(statsBuf.value, "uint", STAT_WORDS).toAtomic();
@@ -234,10 +270,17 @@ export function createGiGather({
   const SHADE_SLOTS = 12;
   const shadeIn = instancedArray(new Float32Array(SHADE_SLOTS * 2 * 4), "vec4");
   const shadeOut = instancedArray(new Float32Array(SHADE_SLOTS * 4 * 4), "vec4");
+  /** §3.3 item 5's evidence — see `exhaustProbePass`. Harness only. */
+  const EXH_VEC = 4;
+  const exhaustOut = instancedArray(
+    new Float32Array(EXHAUST_SLOTS * EXH_VEC * 4), "vec4",
+  );
 
   // ── storage textures (§L.5's two outputs, plus the lit frame §L.2 reads) ──
-  const mkTex = (name) => {
-    const t = new THREE.StorageTexture(width, height);
+  const halfW = Math.max(1, Math.ceil(width / 2));
+  const halfH = Math.max(1, Math.ceil(height / 2));
+  const mkTexAt = (name, w, h) => {
+    const t = new THREE.StorageTexture(w, h);
     t.name = name;
     t.type = THREE.HalfFloatType;
     t.generateMipmaps = false;
@@ -245,15 +288,22 @@ export function createGiGather({
     t.magFilter = THREE.NearestFilter;
     return t;
   };
+  const mkTex = (name) => mkTexAt(name, width, height);
   const irradiance = mkTex("gi2Irradiance");
   const glossy = mkTex("gi2Glossy");
   const lit = mkTex("gi2Lit");
+  // §L.5's two outputs at HALF resolution — what `resolveHalf` writes and
+  // `resolveUpsample` reads. See the note above `makeResolve`.
+  const irradianceHalf = mkTexAt("gi2IrradianceHalf", halfW, halfH);
+  const glossyHalf = mkTexAt("gi2GlossyHalf", halfW, halfH);
 
   // ── uniforms ──────────────────────────────────────────────────────────────
   const u = {
     frame: uniform(0, "uint"),
     widthU: uniform(width, "uint"),
     heightU: uniform(height, "uint"),
+    halfWU: uniform(halfW, "uint"),
+    halfHU: uniform(halfH, "uint"),
     widthF: uniform(width),
     heightF: uniform(height),
     probeWU: uniform(probeW, "uint"),
@@ -283,6 +333,12 @@ export function createGiGather({
     // estimator ("a big change is a lighting change") that only a measurement
     // can settle, and the measurement needs both arms out of one binary.
     hystOn: uniform(1),
+    // ⭐ THE OCT-MAP CARRY IS THE OTHER HALF OF `probePlace`, and it is the
+    // only part of that kernel whose cost scales with the OCT MAP rather than
+    // with the four candidate gbuffer reads §L.1 describes. A uniform arm so
+    // "probePlace costs 0.76 ms" can be split into "0.1 for the placement and
+    // 0.66 for copying 64 texels per probe" instead of argued about.
+    carryOn: uniform(1),
     // §L.3's history depth. A TIER CONSTANT in the table above and a uniform
     // here for the same reason `hystOn` is: how much variance H buys, and what
     // it costs in responsiveness, is a measurement.
@@ -298,6 +354,8 @@ export function createGiGather({
   const litNode = texture(lit);
   const irrNode = texture(irradiance);
   const glossyNode = texture(glossy);
+  const irrHalfNode = texture(irradianceHalf);
+  const glossyHalfNode = texture(glossyHalf);
 
   // ── small shared maths ────────────────────────────────────────────────────
 
@@ -486,9 +544,33 @@ export function createGiGather({
   // ── probe buffer addressing ───────────────────────────────────────────────
   const metaIdx = (half, probe, slot) => half.mul(uint(probeCount * META_VEC))
     .add(probe.mul(uint(META_VEC))).add(uint(slot));
+  // ⭐⭐ TEXEL-MAJOR, NOT PROBE-MAJOR — THE LAYOUT WAS THE COST.
+  //
+  // Every kernel that walks a probe's oct map dispatches ONE THREAD PER
+  // PROBE with `WG = [8, 8]`, so the 32 lanes of a warp are 32 CONSECUTIVE
+  // PROBES, all reading texel `t` of their own map at the same moment. Laid
+  // out probe-major those 32 addresses are 64 vec4 = 1 kB apart: 32 separate
+  // cache lines fetched to use 16 bytes of each, an eighth of the bandwidth
+  // the hardware can deliver. Measured at 1650×970 ultra before the change:
+  // `probeFilter` moved 84 MB in 1.43 ms = 59 GB/s, and `probePlace`'s
+  // carry — 128 accesses of pure copying — was 0.615 ms of its 0.637.
+  //
+  // Indexing by TEXEL first makes a warp's 32 addresses consecutive, which
+  // is the same 84 MB in one eighth of the lines. Nothing about the
+  // algorithm changes; it is where the numbers live.
+  //
+  // ⚠ `probeTrace` is the one kernel that prefers the old order (its lanes
+  // are RAYS of one probe, not probes), and it is also the one that touches
+  // the map ONCE per thread — 32 accesses per probe against `probeFilter`'s
+  // 208 and the carry's 128. The trade is measured in the receipts, not
+  // assumed: `probeTrace` is timed on its own line.
   const octIdx = (half, probe, texel) => half.mul(uint(probeCount * OCT))
-    .add(probe.mul(uint(OCT))).add(texel);
+    .add(texel.mul(uint(probeCount))).add(probe);
+  /** The same order for the FILTERED map and its 2×2 mip. */
+  const filtIdx = (probe, texel) => texel.mul(uint(probeCount)).add(probe);
+  const mipIdx = (probe, texel) => uint(MIP_BASE).add(texel.mul(uint(probeCount))).add(probe);
   const shIdx = (probe, c) => probe.mul(uint(9)).add(uint(c));
+  const shRawIdx = (probe, c) => uint(probeCount * 9).add(probe.mul(uint(9))).add(uint(c));
 
   // ══════════════════════════════════════════════ SHADER: probePlace (§L.1)
   const probePlacePass = Fn(() => {
@@ -602,10 +684,12 @@ export function createGiGather({
     // which is what `n = 0` in the alpha then means to every consumer.
     const has = prevProbe.greaterThanEqual(0).and(valid.greaterThan(0.5)).toVar();
     const src = prevProbe.max(0).toUint().toVar();
-    Loop({ start: 0, end: OCT, name: "carry" }, ({ carry }) => {
-      const t = uint(carry).toVar();
-      const prev = probeOct.element(octIdx(u.prevBase, src, t)).toVar();
-      probeOct.element(octIdx(u.curBase, probe, t)).assign(select(has, prev, vec4(0)));
+    If(u.carryOn.greaterThan(0.5), () => {
+      Loop({ start: 0, end: OCT, name: "carry" }, ({ carry }) => {
+        const t = uint(carry).toVar();
+        const prev = probeOct.element(octIdx(u.prevBase, src, t)).toVar();
+        probeOct.element(octIdx(u.curBase, probe, t)).assign(select(has, prev, vec4(0)));
+      });
     });
   })().compute(dispatch2d(probeW, probeH), WG);
 
@@ -708,9 +792,9 @@ export function createGiGather({
   // cell-boundary solve. On "behind a surface" or off-screen the walk hands the
   // ray to `traceWindow` at the LAST UNOCCLUDED position, never at the position
   // that failed — §L.2's step-back.
-  const screenSegment = (p0, dir, outHit, outRad, outDist, outHandoff, laneU) => {
+  const screenSegment = (p0, dir, segLen, outHit, outRad, outDist, laneU) => {
     const c0 = u.viewProj.mul(vec4(p0, 1)).toVar();
-    const c1 = u.viewProj.mul(vec4(p0.add(dir.mul(RAY_MAX)), 1)).toVar();
+    const c1 = u.viewProj.mul(vec4(p0.add(dir.mul(segLen)), 1)).toVar();
     If(c0.w.greaterThan(1e-3).and(c1.w.greaterThan(1e-3)), () => {
       const s0 = vec2(
         c0.x.div(c0.w).mul(0.5).add(0.5),
@@ -729,16 +813,15 @@ export function createGiGather({
       // case (a ray parallel to the image plane) falls back to `k` itself.
       const worldT = (kk) => {
         const zk = float(1).div(mix(inv0, inv1, kk));
-        return select(dz.abs().lessThan(1e-3), kk, zk.sub(c0.w).div(dz)).clamp(0, 1).mul(RAY_MAX);
+        return select(dz.abs().lessThan(1e-3), kk, zk.sub(c0.w).div(dz)).clamp(0, 1).mul(segLen);
       };
       const pixLen = vec2(duv.x.mul(u.widthF), duv.y.mul(u.heightF)).length().max(1e-4).toVar();
       // Start two full-res texels along, so the first cell is never the probe's
       // own pixel.
       const k = min(float(2).div(pixLen), float(0.25)).toVar();
-      const kPrev = k.toVar();
       const mip = float(0).toVar();
 
-      Loop({ start: 0, end: HZB_STEPS, name: "hzbWalk" }, () => {
+      Loop({ start: 0, end: S_MAX, name: "hzbWalk" }, () => {
         const uv = s0.add(duv.mul(k)).toVar();
         If(uv.x.lessThan(0).or(uv.x.greaterThanEqual(1))
           .or(uv.y.lessThan(0)).or(uv.y.greaterThanEqual(1)), () => { Break(); });
@@ -775,17 +858,15 @@ export function createGiGather({
             Break();
           });
         }).Else(() => {
-          kPrev.assign(k);
           k.assign(kNext);
           mip.assign(min(mip.add(1), float(HZB_MIPS - 1)));
           If(kNext.greaterThanEqual(0.9999), () => { Break(); });
         });
       });
 
-      If(outHit.lessThan(0.5), () => {
-        outHandoff.assign(worldT(kPrev));
-        If(outHandoff.greaterThan(0.01), () => { bump(STATS.handoffs, laneU); });
-      });
+      // The counter kept its name and lost its job: it counts the rays whose
+      // screen walk ended WITHOUT a hit, which is what it always measured.
+      If(outHit.lessThan(0.5), () => { bump(STATS.handoffs, laneU); });
     });
   };
 
@@ -826,14 +907,47 @@ export function createGiGather({
     If(texel.lessThan(0), () => { Return(); });
     bump(STATS.raysTraced, xr);
 
-    // ── segment 1: the screen ──────────────────────────────────────────────
+    // ── segment 1: the window, from the PROBE, over the whole ray ────────
+    //
+    // ⭐ THE NORMAL BIAS AND THE ESCAPE. Half a cell clears a voxel the surface
+    // merely passes through and clears nothing at all on one the voxelizer had
+    // to DILATE — conservative triangle/voxel overlap dilates everything, so
+    // the occupied set reaches a cell diagonal beyond the surface.
+    // `traceWindow` walks the origin out of an occupied voxel by whole cells on
+    // top of the bias; this call keeps the default half-cell and lets the
+    // escape do the rest, and only where it is needed. Without it a probe on
+    // the harness's 1 m sphere hit ITSELF at t ≈ 0 in three rays of four and
+    // read back its own darkness.
+    const r = traceWindow(pos, dir, float(RAY_MAX), nrm).raw.toVar();
+
+    // ── segment 2: the screen, at CONTACT SCALE only ─────────────────────
+    //
+    // ⭐ WHERE THE SCREEN CAN BEAT THE WINDOW IS NEAR, AND ONLY NEAR. The cache
+    // holds one radiance per voxel FACE, so at four metres a `v0`-sized cell is
+    // already finer than the ray's own solid angle and the screen adds nothing;
+    // at four CELLS the voxel IS the contact and the lit pixel is the exact
+    // answer. Running the walk on every ray bought a screen hit for 5 % of them
+    // and paid the full stackless descent for the other 95 %.
+    //
+    // The gate is the window's OWN hit distance, in cells — the scene's
+    // measure, never a metric constant — and the walk is bounded to that
+    // distance plus a cell, so a short segment is a short walk. Its answer is
+    // taken only if the screen puts the surface within a cell of where the
+    // window put it: the two disagreeing means the walk marched past something
+    // the depth buffer could not show it, which is precisely the fault the
+    // hand-off used to turn into a leak.
     const sHit = float(0).toVar();
     const sRad = vec3(0).toVar();
     const sDist = float(RAY_MAX).toVar();
-    const handoff = float(0).toVar();
-    If(u.hzbOn.greaterThan(0.5), () => {
-      screenSegment(pos.add(nrm.mul(v0 * 0.5)), dir, sHit, sRad, sDist, handoff, xr);
+    const contact = r.x.greaterThan(0.5).and(r.y.lessThan(v0 * CONTACT_CELLS)).toVar();
+    If(u.hzbOn.greaterThan(0.5).and(contact), () => {
+      screenSegment(pos.add(nrm.mul(v0 * 0.5)), dir, r.y.add(v0), sHit, sRad, sDist, xr);
     });
+    sHit.assign(select(
+      sHit.greaterThan(0.5).and(sDist.sub(r.y).abs().lessThan(v0)), float(1), float(0),
+    ));
+
+    // ── the radiance: the screen's own pixel, or the hit voxel's cache face ─
 
     // ── segment 2: the window, then the cache ──────────────────────────────
     const rad = vec3(0).toVar();
@@ -842,28 +956,6 @@ export function createGiGather({
       rad.assign(sRad);
       hitDist.assign(sDist);
     }).Else(() => {
-      const far = handoff.greaterThan(0.01).toVar();
-      const o2 = pos.add(dir.mul(handoff)).add(dir.mul(select(far, float(0.01), float(0)))).toVar();
-      // ⭐ THE NORMAL BIAS SURVIVES THE HAND-OFF. Dropping it for a "far"
-      // origin looks obviously right and is the bug that made the 1 m sphere
-      // read 0.08 against a reference of 1.43: the hand-off distance is
-      // whatever the screen walk managed before it lost the ray, which for a
-      // grazing ray is CENTIMETRES — so the window trace restarted on the
-      // probe's own surface, inside its own voxel, and the analytic fill sets
-      // all six face bits on a curved surface, so it hit itself at t ≈ 0 and
-      // returned its own darkness. 45 % of rays take this path.
-      //
-      // ⚠ AND HALF A CELL WAS NOT ENOUGH. Stage 3.2's audit measured 70–75 %
-      // of that sphere's rays STILL hitting at t < 6 cm with the bias in
-      // place: conservative voxelization marks every cell the surface
-      // touches, so the occupied set reaches a cell diagonal beyond the
-      // surface and half a cell cannot clear it for ANY normal. The bias is a
-      // caller parameter now and `traceWindow` walks the origin out of an
-      // occupied voxel by whole cells — see `windowTrace.js`'s header. This
-      // call keeps the default half-cell; the escape does the rest, and only
-      // where it is needed.
-      const bn = nrm.toVar();
-      const r = traceWindow(o2, dir, float(RAY_MAX).sub(handoff), bn).raw.toVar();
       const zi = r.z.toUint().toVar();
       If(r.x.greaterThan(0.5), () => {
         const faceF = bitAnd(zi, uint(7)).toFloat().toVar();
@@ -890,7 +982,7 @@ export function createGiGather({
           rad.assign(s);
           bump(STATS.freshShades, xr);
         });
-        hitDist.assign(handoff.add(r.y));
+        hitDist.assign(r.y);
         bump(STATS.windowHits, xr);
       }).Else(() => {
         rad.assign(u.skyColor);
@@ -925,7 +1017,29 @@ export function createGiGather({
     ));
   })().compute(dispatch2d(probeW * R, probeH), WG);
 
-  // ══════════════════════════════════════════════ SHADER: probeFilter (§L.4)
+  // ══════════════════════════════════════ SHADER: probeFilter, part 1 (§L.4)
+  //
+  // ⭐⭐ §L.4 FILTERS THE OCT MAP; THE RESOLVE READS THE SH. Stage 3.2's shape
+  // ran a 3×3 bilateral over all 64 OCT TEXELS — 576 buffer reads per probe —
+  // and then projected the result onto 9 SH coefficients, which is the only
+  // thing the diffuse path consumes. But the bilateral's weights are PER PROBE
+  // (they were hoisted out of the texel loop for exactly that reason), and the
+  // SH projection is LINEAR, so
+  //
+  //     SH( Σ_j w_j · map_j / Σ w_j )  =  Σ_j w_j · SH(map_j) / Σ w_j
+  //
+  // — the filter can run on NINE COEFFICIENTS instead of sixty-four texels and
+  // land on the same numbers. The one place the two forms differ is the
+  // per-texel validity mask: the old form averaged a texel over only the
+  // neighbours that HAD it, then filled what nothing had with the pooled mean.
+  // Here each probe fills its own holes from its OWN cosine-weighted mean
+  // first, and the pooling that follows is over whole probes. On a probe with a
+  // complete front hemisphere — which is what the 99 % reprojection rate says
+  // is now the common case — there are no holes and the two are identical.
+  //
+  // So this kernel is per-probe with NO neighbourhood: copy the raw map, fill
+  // its holes, build the 2×2 mip the glossy tap reads, project the SH. 128
+  // reads instead of 640. Part 2 does the 3×3, on the coefficients.
   const probeFilterPass = Fn(() => {
     const tx = globalId.x.toVar();
     const ty = globalId.y.toVar();
@@ -933,64 +1047,23 @@ export function createGiGather({
     const probe = ty.mul(u.probeWU).add(tx).toVar();
     const ma = probeMeta.element(metaIdx(u.curBase, probe, 0)).toVar();
     const mb = probeMeta.element(metaIdx(u.curBase, probe, 1)).toVar();
-    const pos = ma.xyz.toVar();
     const nrm = mb.xyz.toVar();
+    const alive = ma.w.greaterThan(0.5).toVar();
 
-    // The 3×3 weights are PER PROBE, not per texel — hoisting them out of the
-    // 64-texel loop turns 576 weight evaluations into 9. Unrolled in JS so the
-    // neighbour offsets are compile-time and no runtime `%` is needed.
-    const nbIdx = [];
-    const nbW = [];
-    let centreSlot = 0;
-    for (let oy = -1; oy <= 1; oy++) {
-      for (let ox = -1; ox <= 1; ox++) {
-        if (ox === 0 && oy === 0) centreSlot = nbIdx.length;
-        const nx = tx.toInt().add(int(ox)).toVar();
-        const ny = ty.toInt().add(int(oy)).toVar();
-        const inB = nx.greaterThanEqual(int(0)).and(ny.greaterThanEqual(int(0)))
-          .and(nx.lessThan(u.probeWU.toInt())).and(ny.lessThan(u.probeHU.toInt())).toVar();
-        const np = ny.clamp(int(0), u.probeHU.toInt().sub(int(1))).toUint()
-          .mul(u.probeWU).add(nx.clamp(int(0), u.probeWU.toInt().sub(int(1))).toUint()).toVar();
-        const na = probeMeta.element(metaIdx(u.curBase, np, 0)).toVar();
-        const nn = probeMeta.element(metaIdx(u.curBase, np, 1)).toVar();
-        // Plane distance in units of a level-0 CELL — the scene's own length,
-        // not a metric constant — and a normal agreement raised to the fourth
-        // so a probe round a corner contributes nothing.
-        const wp = exp(dot(nrm, na.xyz.sub(pos)).abs().div(v0).negate()).toVar();
-        const wn = dot(nrm, nn.xyz).max(0).toVar();
-        const w = select(
-          inB.and(na.w.greaterThan(0.5)).and(ma.w.greaterThan(0.5)),
-          wp.mul(wn.mul(wn).mul(wn).mul(wn)), float(0),
-        ).toVar();
-        nbIdx.push(np);
-        nbW.push(w);
-      }
-    }
-
-    // ── pass 1: the 3×3 bilateral, and what this probe has actually SEEN ──
+    // ── pass 1: the raw map, and what this probe has actually SEEN ────────
     const meanAcc = vec3(0).toVar();
     const meanW = float(0).toVar();
     Loop({ start: 0, end: OCT, name: "ft" }, ({ ft }) => {
       const t = uint(ft).toVar();
-      const acc = vec3(0).toVar();
-      const wsum = float(0).toVar();
-      const centreA = float(0).toVar();
-      for (let j = 0; j < 9; j++) {
-        const tv = probeOct.element(octIdx(u.curBase, nbIdx[j], t)).toVar();
-        // §L.4: texels nothing has sampled (n = 0) are skipped, not averaged in
-        // as black — that is the difference between a filter and a fade.
-        const ww = select(tv.w.greaterThanEqual(1024), nbW[j], float(0)).toVar();
-        acc.addAssign(tv.xyz.mul(ww));
-        wsum.addAssign(ww);
-        if (j === centreSlot) centreA.assign(tv.w);
-      }
-      const has = wsum.greaterThan(1e-5).toVar();
-      const val = select(has, acc.div(wsum.max(1e-5)), vec3(0)).toVar();
-      // A texel that NOTHING in the 3×3 has sampled is a HOLE, and it is
-      // marked as one — a negative alpha, a value the real alpha
-      // (n·1024 + distance) can never take.
-      probeFiltered.element(probe.mul(uint(OCT)).add(t)).assign(vec4(
-        val, select(has, centreA, float(-1)),
+      const tv = probeOct.element(octIdx(u.curBase, probe, t)).toVar();
+      // §L.4: a texel nothing has sampled (n = 0) is a HOLE, not a black
+      // sample — that is the difference between a filter and a fade. It is
+      // marked with a negative alpha, a value the real alpha (n·1024 +
+      // distance) can never take.
+      const has = tv.w.greaterThanEqual(1024).and(alive).toVar();
+      const val = select(has, tv.xyz, vec3(0)).toVar();
+      probeFiltered.element(filtIdx(probe, t)).assign(vec4(
+        val, select(has, tv.w, float(-1)),
       ));
       const e0 = octU.element(t).toVar();
       const cw = select(has, dot(e0.xyz, nrm).max(0).mul(e0.w), float(0)).toVar();
@@ -1006,22 +1079,13 @@ export function createGiGather({
     // ── pass 2: patch the holes, build the 2×2 mip and the SH2 in ONE walk ─
     //
     // ⭐ §L.4 SAYS "SKIP TEXELS WITH n = 0" AND THAT IS RIGHT FOR THE FILTER
-    // AND WRONG FOR THE RESOLVE. A probe whose oct map is a quarter filled —
-    // measured 9 of 64 on the box top, against 32 of 64 (a complete front
-    // hemisphere) on the floor — hands the resolve a cosine sum over a
-    // QUARTER of the hemisphere and the resolve divides by nothing, so the
-    // surface reads a quarter as bright. That is the whole of "the box top is
-    // darker than the floor": the box top is an 8-px sliver, its tile's
-    // jittered anchor lands on a different surface most frames, the
-    // reprojection gate then rightly refuses to carry the map forward, and it
-    // never fills. Directions with no data are not black; they are unknown,
-    // and the least-committal estimate of an unknown direction is the mean of
-    // the known ones. Only the FRONT hemisphere is patched — the back is
+    // AND WRONG FOR THE RESOLVE. A probe whose oct map is a quarter filled
+    // hands the resolve a cosine sum over a QUARTER of the hemisphere and the
+    // resolve divides by nothing, so the surface reads a quarter as bright.
+    // Directions with no data are not black; they are unknown, and the
+    // least-committal estimate of an unknown direction is the mean of the
+    // known ones. Only the FRONT hemisphere is patched — the back is
     // legitimately zero and filling it would double SH band 0.
-    //
-    // The mip walk and the SH projection are folded in here because both used
-    // to re-read all 64 texels this pass had just written: 128 buffer reads
-    // per probe to re-derive values that were in registers a moment earlier.
     const sh = [];
     for (let i = 0; i < 9; i++) sh.push(vec3(0).toVar());
     Loop({ start: 0, end: MIP_TEXELS, name: "mp" }, ({ mp }) => {
@@ -1033,7 +1097,7 @@ export function createGiGather({
         const qx = mx.mul(uint(2)).add(bitAnd(uint(mq), uint(1))).toVar();
         const qy = my.mul(uint(2)).add(shiftRight(uint(mq), uint(1))).toVar();
         const t = qy.mul(uint(O)).add(qx).toVar();
-        const addr = probe.mul(uint(OCT)).add(t).toVar();
+        const addr = filtIdx(probe, t).toVar();
         const cur = probeFiltered.element(addr).toVar();
         const e = octU.element(t).toVar();
         const d = e.xyz.toVar();
@@ -1052,10 +1116,72 @@ export function createGiGather({
         sh[7].addAssign(c.mul(d.x.mul(d.z).mul(1.092548)));
         sh[8].addAssign(c.mul(d.x.mul(d.x).sub(d.y.mul(d.y)).mul(0.546274)));
       });
-      probeFiltered.element(uint(MIP_BASE).add(probe.mul(uint(MIP_TEXELS))).add(mi))
-        .assign(vec4(s.mul(0.25), 0));
+      probeFiltered.element(mipIdx(probe, mi)).assign(vec4(s.mul(0.25), 0));
     });
-    for (let i = 0; i < 9; i++) probeSh.element(shIdx(probe, i)).assign(vec4(sh[i], 0));
+    // ⚠ WRITTEN TO BOTH HALVES, AND THAT IS A SAFETY PROPERTY, NOT WASTE.
+    // `shIdx` — the address every OTHER consumer of this buffer uses, inside
+    // this file and outside it — is the FILTERED half, so a chain that never
+    // dispatches part 2 still reads a correct (merely unfiltered) SH rather
+    // than a stale buffer, and an emitter term added at `shIdx` after the
+    // filter still lands where the resolve looks. Nine vec4 writes per probe.
+    for (let i = 0; i < 9; i++) {
+      const v = vec4(sh[i], 0);
+      probeSh.element(shRawIdx(probe, i)).assign(v);
+      probeSh.element(shIdx(probe, i)).assign(v);
+    }
+  })().compute(dispatch2d(probeW, probeH), WG);
+
+  // ══════════════════════════════════════ SHADER: probeFilter, part 2 (§L.4)
+  //
+  // §L.4's 3×3 probe-space bilateral, on the NINE COEFFICIENTS. The weights
+  // are the same ones the texel form used — plane distance in units of a
+  // level-0 cell (the scene's own length, never a metric constant) and normal
+  // agreement raised to the fourth so a probe round a corner contributes
+  // nothing — and they were already per-probe, so nothing about the filter's
+  // shape changes; only what it is applied to.
+  const probeShFilterPass = Fn(() => {
+    const tx = globalId.x.toVar();
+    const ty = globalId.y.toVar();
+    If(tx.greaterThanEqual(u.probeWU).or(ty.greaterThanEqual(u.probeHU)), () => { Return(); });
+    const probe = ty.mul(u.probeWU).add(tx).toVar();
+    const ma = probeMeta.element(metaIdx(u.curBase, probe, 0)).toVar();
+    const mb = probeMeta.element(metaIdx(u.curBase, probe, 1)).toVar();
+    const pos = ma.xyz.toVar();
+    const nrm = mb.xyz.toVar();
+
+    const acc = [];
+    for (let i = 0; i < 9; i++) acc.push(vec3(0).toVar());
+    const wsum = float(0).toVar();
+    // Unrolled in JS so the neighbour offsets are compile-time and no runtime
+    // `%` is needed.
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        const nx = tx.toInt().add(int(ox)).toVar();
+        const ny = ty.toInt().add(int(oy)).toVar();
+        const inB = nx.greaterThanEqual(int(0)).and(ny.greaterThanEqual(int(0)))
+          .and(nx.lessThan(u.probeWU.toInt())).and(ny.lessThan(u.probeHU.toInt())).toVar();
+        const np = ny.clamp(int(0), u.probeHU.toInt().sub(int(1))).toUint()
+          .mul(u.probeWU).add(nx.clamp(int(0), u.probeWU.toInt().sub(int(1))).toUint()).toVar();
+        const na = probeMeta.element(metaIdx(u.curBase, np, 0)).toVar();
+        const nn = probeMeta.element(metaIdx(u.curBase, np, 1)).toVar();
+        const wp = exp(dot(nrm, na.xyz.sub(pos)).abs().div(v0).negate()).toVar();
+        const wn = dot(nrm, nn.xyz).max(0).toVar();
+        const w = select(
+          inB.and(na.w.greaterThan(0.5)).and(ma.w.greaterThan(0.5)),
+          wp.mul(wn.mul(wn).mul(wn).mul(wn)), float(0),
+        ).toVar();
+        If(w.greaterThan(1e-5), () => {
+          for (let i = 0; i < 9; i++) {
+            acc[i].addAssign(probeSh.element(shRawIdx(np, i)).xyz.mul(w));
+          }
+          wsum.addAssign(w);
+        });
+      }
+    }
+    const inv = select(wsum.greaterThan(1e-5), float(1).div(wsum.max(1e-5)), float(0)).toVar();
+    for (let i = 0; i < 9; i++) {
+      probeSh.element(shIdx(probe, i)).assign(vec4(acc[i].mul(inv), 0));
+    }
   })().compute(dispatch2d(probeW, probeH), WG);
 
   // ══════════════════════════════════════════════ SHADER: resolve (§L.5)
@@ -1069,15 +1195,25 @@ export function createGiGather({
       const e = octU.element(t).toVar();
       const c = dot(e.xyz, nrmP).toVar();
       If(c.greaterThan(0), () => {
-        E.addAssign(probeFiltered.element(probe.mul(uint(OCT)).add(t)).xyz.mul(c).mul(e.w));
+        E.addAssign(probeFiltered.element(filtIdx(probe, t)).xyz.mul(c).mul(e.w));
       });
     });
     return E;
   };
-  const irradianceFromSh = (probe, n) => {
+  /**
+   * Irradiance from NINE COEFFICIENTS ALREADY IN REGISTERS.
+   *
+   * ⭐ SH EVALUATION IS LINEAR IN THE COEFFICIENTS, AND THE RESOLVE'S 4-CORNER
+   * BLEND IS A WEIGHTED SUM — so `Σ w·eval(L_c, N) / Σ w` and `eval(Σ w·L_c /
+   * Σ w, N)` are THE SAME NUMBER, and Stage 3.2 was computing the first one.
+   * That is thirty-odd multiply-adds per channel, five times per pixel (four
+   * corners plus the fallback), to produce a value that one evaluation gives.
+   * Accumulating the coefficients instead and evaluating once is not an
+   * approximation and has no crop delta by construction; it is the same
+   * arithmetic with the sum pulled inside the linear map.
+   */
+  const shEval = (L, n) => {
     const c1 = 0.429043, c2 = 0.511664, c3 = 0.743125, c4 = 0.886227, c5 = 0.247708;
-    const L = [];
-    for (let i = 0; i < 9; i++) L.push(probeSh.element(shIdx(probe, i)).xyz.toVar());
     return L[8].mul(c1).mul(n.x.mul(n.x).sub(n.y.mul(n.y)))
       .add(L[6].mul(c3).mul(n.z.mul(n.z)))
       .add(L[0].mul(c4))
@@ -1090,10 +1226,19 @@ export function createGiGather({
       .add(L[2].mul(2 * c2).mul(n.z))
       .max(vec3(0));
   };
-  /** Bilinear tap of a probe's filtered oct map (or its 2×2 mip) along `d`. */
-  const octSample = (probe, d, useMip) => {
-    const res = useMip ? MIP_RES : O;
-    const base = useMip ? uint(MIP_BASE).add(probe.mul(uint(MIP_TEXELS))) : probe.mul(uint(OCT));
+  /**
+   * THE OCT TAP, SPLIT INTO A PLAN AND A FETCH.
+   *
+   * ⭐ THE FOUR CORNER PROBES SHARE ONE REFLECTION DIRECTION. Everything
+   * `octSample` computes before it touches the buffer — the octahedral
+   * projection, the floor, the bilinear fractions, and the FOLD's four
+   * compares — depends on `d` and the map resolution and on nothing else. Only
+   * the base address changes from corner to corner. Stage 3.2's shape rebuilt
+   * that whole preamble eight times per pixel (four corners × two mip levels)
+   * and again in the fallback; it is built TWICE here, once per resolution, and
+   * the per-corner cost drops to four loads and three lerps.
+   */
+  const octPlan = (d, res) => {
     const uvc = octahedralUV(d, res);
     const fu = uvc.u.sub(0.5).toVar();
     const fv = uvc.v.sub(0.5).toVar();
@@ -1119,7 +1264,8 @@ export function createGiGather({
     // The fold's rule: stepping off one axis mirrors the OTHER. It costs two
     // compares and a subtract, and it is the difference between a seam and a
     // sphere.
-    const tap = (ox, oy) => {
+    const offs = [];
+    for (const [ox, oy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
       const su = iu.add(ox).toVar();
       const sv = iv.add(oy).toVar();
       const outU = su.lessThan(0).or(su.greaterThan(res - 1)).toVar();
@@ -1128,11 +1274,16 @@ export function createGiGather({
       const cv = sv.clamp(0, res - 1).toVar();
       const wu = select(outV, float(res - 1).sub(cu), cu).toVar();
       const wv = select(outU, float(res - 1).sub(cv), cv).toVar();
-      return probeFiltered.element(
-        base.add(wv.toUint().mul(uint(res))).add(wu.toUint()),
-      ).xyz;
-    };
-    return mix(mix(tap(0, 0), tap(1, 0), au), mix(tap(0, 1), tap(1, 1), au), av);
+      offs.push(wv.toUint().mul(uint(res)).add(wu.toUint()).toVar());
+    }
+    return { offs, au, av };
+  };
+  /** Apply a plan to one probe, in the full map or in the mip. */
+  const octFetch = (plan, probe, useMip) => {
+    const t = plan.offs.map((o) => probeFiltered.element(
+      useMip ? mipIdx(probe, o) : filtIdx(probe, o),
+    ).xyz);
+    return mix(mix(t[0], t[1], plan.au), mix(t[2], t[3], plan.au), plan.av);
   };
 
   // ⭐ §3.2 ITEM 1 — SH2 IS THE IRRADIANCE PATH ON EVERY TIER NOW.
@@ -1151,17 +1302,30 @@ export function createGiGather({
   // is retired is the diffuse sum. Both arms are still built — `passes.resolve`
   // ships the SH one, `passes.resolveOct` is the measurement arm the receipts
   // A/B against, byte-identical in everything but the integrator.
-  const makeResolve = (useSh) => Fn(() => {
-    const px = globalId.x.toVar();
-    const py = globalId.y.toVar();
-    If(px.greaterThanEqual(u.widthU).or(py.greaterThanEqual(u.heightU)), () => { Return(); });
-    const coord = ivec2(px.toInt(), py.toInt());
+  const makeResolve = (useSh, half = false, rawSh = false) => Fn(() => {
+    const gxu = globalId.x.toVar();
+    const gyu = globalId.y.toVar();
+    If(half
+      ? gxu.greaterThanEqual(u.halfWU).or(gyu.greaterThanEqual(u.halfHU))
+      : gxu.greaterThanEqual(u.widthU).or(gyu.greaterThanEqual(u.heightU)), () => { Return(); });
+    // The half-res thread OWNS the top-left pixel of its 2×2 quad and reads
+    // the gbuffer THERE — not at a filtered centre. `resolveUpsample` maps
+    // back with exactly the same rule, so the surface a low-res sample was
+    // computed on is the surface the upsample tests against.
+    const px = (half ? gxu.mul(uint(2)).min(u.widthU.sub(uint(1))) : gxu).toVar();
+    const py = (half ? gyu.mul(uint(2)).min(u.heightU.sub(uint(1))) : gyu).toVar();
+    const coord = ivec2(gxu.toInt(), gyu.toInt());
     const g = loadPos(px.toInt(), py.toInt()).toVar();
     const E = vec3(0).toVar();
     const G = vec3(0).toVar();
+    // Hoisted so the half-res store below can key on them — see its note.
+    const Pv = vec3(0).toVar();
+    const Nv = vec3(0, 1, 0).toVar();
     If(g.w.greaterThan(0.5), () => {
       const P = g.xyz.toVar();
       const Nn = normalize(loadNrm(px.toInt(), py.toInt()).xyz).toVar();
+      Pv.assign(P);
+      Nv.assign(Nn);
       const V = normalize(P.sub(u.camPos)).toVar();
       const Rr = normalize(V.sub(Nn.mul(dot(V, Nn).mul(2)))).toVar();
 
@@ -1172,9 +1336,22 @@ export function createGiGather({
       const fx = tfx.sub(bx).toVar();
       const fy = tfy.sub(by).toVar();
 
+      // The tap geometry is a function of `Rr` alone — built once, applied
+      // four (or five) times. See `octPlan`.
+      const planFull = octPlan(Rr, O);
+      const planMip = octPlan(Rr, MIP_RES);
+      const glossyAt = (pi) => mix(
+        octFetch(planFull, pi, false),
+        octFetch(planMip, pi, true),
+        u.roughness,
+      );
+
       const wsum = float(0).toVar();
       const best = float(-1).toVar();
       const bestW = float(-1).toVar();
+      // The blended SH2, accumulated in COEFFICIENT space (see `shEval`).
+      const Lb = [];
+      for (let i = 0; i < 9; i++) Lb.push(vec3(0).toVar());
       for (let corner = 0; corner < 4; corner++) {
         const dx = corner & 1;
         const dy = (corner >> 1) & 1;
@@ -1192,30 +1369,160 @@ export function createGiGather({
           best.assign(pi.toFloat());
         });
         If(w.greaterThan(1e-5), () => {
-          E.addAssign((useSh ? irradianceFromSh(pi, Nn) : irradianceFromOct(pi, Nn)).mul(w));
-          G.addAssign(mix(octSample(pi, Rr, false), octSample(pi, Rr, true), u.roughness).mul(w));
+          if (useSh) {
+            const at = rawSh ? shRawIdx : shIdx;
+            for (let i = 0; i < 9; i++) Lb[i].addAssign(probeSh.element(at(pi, i)).xyz.mul(w));
+          } else {
+            E.addAssign(irradianceFromOct(pi, Nn).mul(w));
+          }
+          G.addAssign(glossyAt(pi).mul(w));
           wsum.addAssign(w);
         });
       }
+      // §L.5's fallback: the nearest VALID probe, unweighted, rather than a
+      // black pixel. A pixel whose four corners all fail the plane test sits
+      // on a silhouette, and black there reads as a hard outline. It is folded
+      // into the SAME accumulator with weight 1 rather than duplicating the
+      // evaluation — one `shEval` per pixel, on every path.
+      If(wsum.lessThan(1e-5).and(best.greaterThanEqual(0)), () => {
+        const pi = best.toUint().toVar();
+        if (useSh) {
+          const at = rawSh ? shRawIdx : shIdx;
+          for (let i = 0; i < 9; i++) Lb[i].assign(probeSh.element(at(pi, i)).xyz);
+        } else {
+          E.assign(irradianceFromOct(pi, Nn));
+        }
+        G.assign(glossyAt(pi));
+        wsum.assign(1);
+      });
       If(wsum.greaterThan(1e-5), () => {
+        if (useSh) {
+          const inv = float(1).div(wsum).toVar();
+          for (let i = 0; i < 9; i++) Lb[i].mulAssign(inv);
+          E.assign(shEval(Lb, Nn));
+        } else {
+          E.assign(E.div(wsum));
+        }
+        G.assign(G.div(wsum));
+      });
+    });
+    if (half) {
+      // ⭐⭐ THE UPSAMPLE'S EDGE TEST RIDES IN THE ALPHA IT WAS THROWING AWAY.
+      // A 2×2 upsample has to know whether each low-res sample belongs to
+      // this pixel's surface, and the obvious way to find out — re-read the
+      // gbuffer at each tap's own pixel — is EIGHT full-res texture loads
+      // per pixel. Measured, a full-res load costs ~0.036 ms per pixel-pass
+      // at 1650×970, so those eight WERE the upsample: 0.655 ms of which
+      // 0.29 was re-reading a surface description the low-res kernel had in
+      // registers when it wrote the sample.
+      //
+      // So it writes it down. The alpha of the two half-res targets is dead
+      // weight (`g.w`, a validity bit the upsample re-derives anyway), and
+      // it holds instead the two numbers the edge test needs: the sample's
+      // PLANE OFFSET `n·p` and the sign-carrying `n.y`. A sentinel below
+      // anything a real surface can produce marks a sample with no geometry.
+      textureStore(irradianceHalf, coord,
+        vec4(E, select(g.w.greaterThan(0.5), dot(Nv, Pv), float(-1e4))));
+      textureStore(glossyHalf, coord,
+        vec4(G, select(g.w.greaterThan(0.5), Nv.y, float(-9))));
+    } else {
+      textureStore(irradiance, coord, vec4(E, g.w));
+      textureStore(glossy, coord, vec4(G, g.w));
+    }
+  })().compute(dispatch2d(half ? halfW : width, half ? halfH : height), WG);
+  const resolvePass = makeResolve(USE_SH);
+  const resolveOctPass = makeResolve(false);
+  // ⭐ THE A/B'S OTHER HALF. §3.2's gate was "SH2 against the 4×64 oct cosine
+  // sum", and it meant the SH TRUNCATION ERROR and nothing else — same
+  // probes, same map, two integrators. §3.3 moved §L.4's 3×3 bilateral onto
+  // the coefficients, so the SHIPPED resolve reads a POOLED SH while the oct
+  // sum still reads the probe's own map, and comparing those two folds the
+  // filter into a number that is supposed to be about band limits. Measured:
+  // the sphere went 5.6 % → 16.1 % at 960×540 while the sphere's own
+  // irradiance moved 0.557 → 0.572, which is the arm moving, not the answer.
+  // So the A/B gets an arm that reads the UNPOOLED coefficients: same data as
+  // the oct sum, and the ratio is the truncation again.
+  const resolveShRawPass = makeResolve(true, false, true);
+  const resolveHalfPass = makeResolve(USE_SH, true);
+
+  // ══════════════════════════════ SHADER: resolveUpsample
+  //
+  // ⭐ THE RESOLVE IS THE ONLY KERNEL IN THE CHAIN THAT RUNS PER PIXEL AND
+  // DOES REAL WORK PER PIXEL, and what it computes is a signal that changes
+  // on the scale of a PROBE TILE (8 px) — four corner probes, bilinear ×
+  // plane × normal, one SH2 evaluation, one glossy lobe. Evaluating it four
+  // times inside every 2×2 quad is four evaluations of very nearly the same
+  // number. So `resolveHalf` evaluates one of the four and this pass puts
+  // the answer back on the full grid.
+  //
+  // ⚠ AND IT IS NOT A BILINEAR MAGNIFY. A low-res sample that belongs to the
+  // floor must not bleed onto the pillar in front of it — that is a halo
+  // along every silhouette, on exactly the edges a GI term is judged by. The
+  // four taps are weighted by the bilinear fractions MODULATED by whether
+  // each tap's gbuffer pixel is the same surface as this one (plane distance
+  // in cells, and normal agreement) — the same rule `giScreen`'s GTAO
+  // upsample uses, and the bilinear term is not optional there either: edge
+  // weights alone are a box filter, and a smooth gradient comes out as 2×2
+  // plateaus. When every tap is rejected the pixel takes the nearest one
+  // rather than black, for the same reason §L.5's own fallback exists.
+  const resolveUpsamplePass = Fn(() => {
+    const px = globalId.x.toVar();
+    const py = globalId.y.toVar();
+    If(px.greaterThanEqual(u.widthU).or(py.greaterThanEqual(u.heightU)), () => { Return(); });
+    const coord = ivec2(px.toInt(), py.toInt());
+    const g = loadPos(px.toInt(), py.toInt()).toVar();
+    const E = vec3(0).toVar();
+    const G = vec3(0).toVar();
+    If(g.w.greaterThan(0.5), () => {
+      const P = g.xyz.toVar();
+      const Nn = normalize(loadNrm(px.toInt(), py.toInt()).xyz).toVar();
+      const myPlane = dot(Nn, P).toVar();
+      const lowX = px.toFloat().add(0.5).mul(0.5).sub(0.5).toVar();
+      const lowY = py.toFloat().add(0.5).mul(0.5).sub(0.5).toVar();
+      const bx = lowX.floor().toVar();
+      const by = lowY.floor().toVar();
+      const fx = lowX.sub(bx).toVar();
+      const fy = lowY.sub(by).toVar();
+      const wsum = float(0).toVar();
+      const bestW = float(-1).toVar();
+      const bestE = vec3(0).toVar();
+      const bestG = vec3(0).toVar();
+      for (let d = 0; d < 4; d++) {
+        const dx = d & 1;
+        const dy = (d >> 1) & 1;
+        const bl = (dx ? fx : float(1).sub(fx)).mul(dy ? fy : float(1).sub(fy)).toVar();
+        const lx = bx.add(dx).clamp(0, float(halfW - 1)).toInt().toVar();
+        const ly = by.add(dy).clamp(0, float(halfH - 1)).toInt().toVar();
+        const ei = irrHalfNode.load(ivec2(lx, ly)).toVar();
+        const gi = glossyHalfNode.load(ivec2(lx, ly)).toVar();
+        // Plane distance in units of a level-0 CELL — the scene's own
+        // length, never a metric constant — and the normal's own sign, so
+        // a ceiling can never pass for the floor 6 m below it that shares
+        // its plane offset. Both come out of the sample's alpha.
+        const okTap = gi.w.greaterThan(-8).toVar();
+        const wp = exp(ei.w.sub(myPlane).abs().div(v0).negate()).toVar();
+        const wn = float(1).sub(gi.w.sub(Nn.y).abs().mul(0.5)).max(0).toVar();
+        const w = bl.mul(wp).mul(wn.mul(wn)).mul(select(okTap, float(1), float(0))).toVar();
+        If(okTap.and(bl.greaterThan(bestW)), () => {
+          bestW.assign(bl);
+          bestE.assign(ei.xyz);
+          bestG.assign(gi.xyz);
+        });
+        E.addAssign(ei.xyz.mul(w));
+        G.addAssign(gi.xyz.mul(w));
+        wsum.addAssign(w);
+      }
+      If(wsum.greaterThan(1e-4), () => {
         E.assign(E.div(wsum));
         G.assign(G.div(wsum));
       }).Else(() => {
-        // §L.5's fallback: the nearest VALID probe, unweighted, rather than a
-        // black pixel. A pixel whose four corners all fail the plane test sits
-        // on a silhouette, and black there reads as a hard outline.
-        If(best.greaterThanEqual(0), () => {
-          const pi = best.toUint().toVar();
-          E.assign(useSh ? irradianceFromSh(pi, Nn) : irradianceFromOct(pi, Nn));
-          G.assign(mix(octSample(pi, Rr, false), octSample(pi, Rr, true), u.roughness));
-        });
+        E.assign(bestE);
+        G.assign(bestG);
       });
     });
     textureStore(irradiance, coord, vec4(E, g.w));
     textureStore(glossy, coord, vec4(G, g.w));
   })().compute(dispatch2d(width, height), WG);
-  const resolvePass = makeResolve(USE_SH);
-  const resolveOctPass = makeResolve(false);
 
   // ══════════════════════════════════════════════ SHADER: composite
   //
@@ -1396,6 +1703,86 @@ export function createGiGather({
     shadeOut.element(i.mul(uint(4)).add(uint(3))).assign(vec4(shaded, 0));
   })().compute(SHADE_SLOTS);
 
+  // ══════════════════════════════════════════════ SHADER: exhaustProbe
+  //
+  // ⭐⭐ "3.6 % OF RAYS EXHAUST 40 m IN A SEALED ROOM" IS A RATE, AND A RATE
+  // NAMES NO MECHANISM. Four different faults produce it — a diagonal slip
+  // through a voxel corner, a gap at an L0/L1 hand-off, an origin that
+  // escapes through its own wall, a dust voxel that blocks nothing — and
+  // arguing between them from the rate is guesswork. So this kernel records
+  // the FIRST `EXHAUST_SLOTS` exhausted rays: where they started, where they
+  // pointed, how far the SCREEN segment carried them before handing over,
+  // and — the discriminating pair — what the SAME ray does traced from the
+  // probe with NO hand-off at all.
+  //
+  // That pair is the whole diagnostic. A ray that misses from both ends is a
+  // trace fault; a ray that HITS from the probe and MISSES from the hand-off
+  // point was carried through a wall by the screen walk, and the leak is in
+  // the hand-off, not in the DDA.
+  //
+  // It re-derives the ray exactly as `probeTrace` does — same rotation, same
+  // jitter, same texel window — so it is the same ray and not a similar one.
+  // Bindings: window, meta, hzb, stats, exhaustOut = 5.
+  const exhaustProbePass = Fn(() => {
+    const xr = globalId.x.toVar();
+    const ty = globalId.y.toVar();
+    If(xr.greaterThanEqual(u.probeWU.mul(uint(R))).or(ty.greaterThanEqual(u.probeHU)), () => { Return(); });
+    const tx = xr.div(uint(R)).toVar();
+    const kRay = xr.sub(tx.mul(uint(R))).toVar();
+    const probe = ty.mul(u.probeWU).add(tx).toVar();
+    const ma = probeMeta.element(metaIdx(u.curBase, probe, 0)).toVar();
+    const mb = probeMeta.element(metaIdx(u.curBase, probe, 1)).toVar();
+    If(ma.w.lessThan(0.5), () => { Return(); });
+    const pos = ma.xyz.toVar();
+    const nrm = mb.xyz.toVar();
+
+    const rot = pcg(u.frame.mul(uint(2654435761)).add(probe)).toVar();
+    const seedBase = pcg(probe.mul(uint(196613)).add(u.frame.mul(uint(83492791)))).toVar();
+    const texel = int(-1).toVar();
+    const dir = vec3(0, 1, 0).toVar();
+    Loop({ start: 0, end: STRIDE, name: "epick" }, ({ epick }) => {
+      If(texel.greaterThanEqual(0), () => { Break(); });
+      const t = bitAnd(kRay.mul(uint(STRIDE)).add(uint(epick)).add(rot), uint(OCT - 1)).toVar();
+      const tu = bitAnd(t, uint(O - 1)).toFloat().toVar();
+      const tv = shiftRight(t, uint(OCT_SHIFT)).toFloat().toVar();
+      const jx = rand01(seedBase.add(t.mul(uint(7919)))).toVar();
+      const jy = rand01(seedBase.add(t.mul(uint(7919))).add(uint(1))).toVar();
+      const d = octDirJit(tu, tv, jx, jy).toVar();
+      If(dot(d, nrm).greaterThan(0.02), () => {
+        texel.assign(t.toInt());
+        dir.assign(d);
+      });
+    });
+    If(texel.lessThan(0), () => { Return(); });
+
+    // The ray exactly as the shipping kernel traces it: the window from the
+    // probe, then the screen only at contact.
+    const r = traceWindow(pos, dir, float(RAY_MAX), nrm).raw.toVar();
+    const sHit = float(0).toVar();
+    const sRad = vec3(0).toVar();
+    const sDist = float(RAY_MAX).toVar();
+    const contact = r.x.greaterThan(0.5).and(r.y.lessThan(v0 * CONTACT_CELLS)).toVar();
+    If(u.hzbOn.greaterThan(0.5).and(contact), () => {
+      screenSegment(pos.add(nrm.mul(v0 * 0.5)), dir, r.y.add(v0), sHit, sRad, sDist, xr);
+    });
+    If(r.x.greaterThan(0.5), () => { Return(); });
+
+    // A ray that missed. What ELSE can be said about it, cheaply: how many DDA
+    // steps it burned (the brick budget is the one bound that can end a ray
+    // early), and where a HALF-LENGTH trace from the same origin ends up — a
+    // ray that misses at 40 m and also misses at 20 m left the room early;
+    // one that misses at 40 m having crossed no brick at all never started.
+    const rHalf = traceWindow(pos, dir, float(RAY_MAX * 0.5), nrm).raw.toVar();
+    const slot = atomicAdd(stats.element(uint(EXHAUST_CLAIM * STAT_STRIPE)), uint(1)).toVar();
+    If(slot.greaterThanEqual(uint(EXHAUST_SLOTS)), () => { Return(); });
+    const base = slot.mul(uint(EXH_VEC)).toVar();
+    exhaustOut.element(base).assign(vec4(pos, probe.toFloat()));
+    exhaustOut.element(base.add(uint(1))).assign(vec4(dir, texel.toFloat()));
+    exhaustOut.element(base.add(uint(2))).assign(vec4(r.w, rHalf.x, rHalf.y, rHalf.w));
+    exhaustOut.element(base.add(uint(3))).assign(vec4(pos.add(dir.mul(RAY_MAX)), r.y));
+
+  })().compute(dispatch2d(probeW * R, probeH), WG);
+
   // ══════════════════════════════════════════════ SHADER: cold-start clears
   const clearProbesPass = Fn(() => {
     probeOct.element(instanceIndex).assign(vec4(0));
@@ -1424,16 +1811,16 @@ export function createGiGather({
 
   const describe = () => ({
     tier, tile: T, rays: R, oct: O, history: H, stride: STRIDE, sh: USE_SH,
-    width, height, probeW, probeH, probeCount,
-    hzbMips: HZB_MIPS, hzbSteps: HZB_STEPS, cropBlock: CROP_HALF * 2 + 1,
+    width, height, halfW, halfH, probeW, probeH, probeCount,
+    hzbMips: HZB_MIPS, hzbSteps: S_MAX, cropBlock: CROP_HALF * 2 + 1,
     bytes: {
       probeMeta: 2 * probeCount * META_VEC * 16,
       probeOct: 2 * probeCount * OCT * 16,
       probeFiltered: (probeCount * OCT + probeCount * MIP_TEXELS) * 16,
-      probeSh: probeCount * 9 * 16,
+      probeSh: 2 * probeCount * 9 * 16,
       hzb: hzbWords * 4,
       litBuf: width * height * 16,
-      textures: 3 * width * height * 8,
+      textures: 3 * width * height * 8 + 2 * halfW * halfH * 8,
     },
   });
 
@@ -1442,26 +1829,55 @@ export function createGiGather({
     uniforms: u, palette, setPalette, beginFrame, get frame() { return frame; },
     buffers: {
       probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf,
-      shadeIn, shadeOut,
+      shadeIn, shadeOut, exhaustOut,
     },
-    SHADE_SLOTS,
-    textures: { irradiance, glossy, lit },
+    SHADE_SLOTS, EXHAUST_SLOTS, EXH_VEC,
+    textures: { irradiance, glossy, lit, irradianceHalf, glossyHalf },
     passes: {
       hzbBuild: hzbBuildPass,
       hzbReduce: hzbReducePasses,
       probePlace: probePlacePass,
       probeTrace: probeTracePass,
       probeFilter: probeFilterPass,
+      probeShFilter: probeShFilterPass,
       resolve: resolvePass,
       resolveOct: resolveOctPass,
+      resolveShRaw: resolveShRawPass,
+      // ⚠ THE FAST PATH IS A PAIR, and `passes.resolve` is deliberately NOT
+      // it: a consumer whose chain already lists `resolve` keeps a correct
+      // (full-res, slower) frame instead of a black one. Dispatch
+      // `resolveHalf` then `resolveUpsample` INSTEAD of `resolve`, or take
+      // `frameOrder` and stop hand-listing kernels.
+      resolveHalf: resolveHalfPass,
+      resolveUpsample: resolveUpsamplePass,
       composite: compositePass,
       inject: injectPass,
       crop: cropPass,
       shadeProbe: shadeProbePass,
+      exhaustProbe: exhaustProbePass,
       clearProbes: clearProbesPass,
       clearMeta: clearMetaPass,
       clearStats: clearStatsPass,
     },
+    /**
+     * THE PER-FRAME CHAIN, IN ORDER, as node objects.
+     *
+     * ⚠ Read this rather than hand-listing `passes.*`: a hand-written list
+     * cannot pick up a kernel that a later stage SPLITS IN TWO, and it fails
+     * SILENTLY — the new kernel simply never runs. `probeShFilter` was exactly
+     * that split (Stage 3.3), and the only reason a hand-written chain still
+     * produces light is that `probeFilter` deliberately writes its raw SH into
+     * both halves of `probeSh` as a fallback.
+     *
+     * `clearStats` and anything a consumer interleaves (an emitter term, AO)
+     * are NOT here — this is the gather's own order, from the HZB to the
+     * injection, and a consumer splices its own passes into a copy.
+     */
+    frameOrder: [
+      hzbBuildPass, ...hzbReducePasses, probePlacePass, probeTracePass,
+      probeFilterPass, probeShFilterPass, resolveHalfPass, resolveUpsamplePass,
+      compositePass, injectPass,
+    ],
     /** Sum a striped counter out of a readback. */
     readStats(u32) {
       const out = {};
@@ -1477,6 +1893,8 @@ export function createGiGather({
       irradiance.dispose();
       glossy.dispose();
       lit.dispose();
+      irradianceHalf.dispose();
+      glossyHalf.dispose();
     },
   };
 }

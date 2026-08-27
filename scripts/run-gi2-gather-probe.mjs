@@ -353,11 +353,23 @@ for (const tier of tiers) {
         });
       }
     }
+    if (r.exhausted) {
+      const e = r.exhausted;
+      console.log("");
+      console.log(`  EXHAUSTED RAYS: ${e.rays}/${e.traced} = ${e.pct.toFixed(2)} % — ` +
+        Object.entries(e.classes).map(([k, v]) => `${k} ${v}`).join(", ") + ` (of ${e.recorded} recorded)`);
+    }
     if (r.hzbAB) {
       console.log("");
       console.log(`  HZB screen segment, on / off: ` +
         r.hzbAB.filter((x) => !/^wall@|^sphereEdge/.test(x.name))
           .map((x) => `${x.name} ${x.ratio.toFixed(3)}`).join(", "));
+    }
+    if (r.resolveScaleAB) {
+      const sc = r.resolveScaleAB.filter((x) => !x.diag && x.full > 1e-3);
+      const w = sc.reduce((a, x) => (Math.abs(x.ratio - 1) > Math.abs(a.ratio - 1) ? x : a));
+      console.log(`  RESOLVE SCALE A/B (half-res + 2×2 upsample ÷ full res): worst ${w.name} ` +
+        `${((w.ratio - 1) * 100).toFixed(2)} % — ` + sc.map((x) => `${x.name} ${x.ratio.toFixed(3)}`).join(", "));
     }
     if (r.resolveAB) {
       const worst = r.resolveAB.filter((x) => !x.diag && x.oct > 1e-3)
@@ -376,12 +388,15 @@ for (const tier of tiers) {
       firstLight: r.firstLight,
       motion: r.motion,
       resolveAB: r.resolveAB,
+      resolveScaleAB: r.resolveScaleAB,
       wallColumn: r.wallColumn,
       probeAudit: r.probeAudit,
+      exhausted: r.exhausted,
       texelDump: r.texelDumpReport,
       mottlingArms: r.mottlingArms,
       kernels: r.kernels,
       gatherMs: r.gatherMs,
+      chainMs: r.chainMs ?? r.gatherMs,
       image: r.image,
       stats: r.cornell?.stats,
       gather: r.gather,
@@ -439,9 +454,14 @@ if (table.length) {
     const px = (t.gather?.width ?? 0) * (t.gather?.height ?? 0);
     if (!px) continue;
     const k = (1650 * 970) / px;
-    console.log(`${t.tier}: chain ${(t.gatherMs ?? 0).toFixed(3)} ms at ${t.gather.width}×${t.gather.height} ` +
-      `→ ${((t.gatherMs ?? 0) * k).toFixed(3)} ms scaled ×${k.toFixed(2)} to 1650×970 ` +
-      `(Stage 3.3 budget ≤ 4 ms) ${(t.gatherMs ?? 0) * k <= 4 ? "PASS" : "OVER"}`);
+    // ⭐ THE BUDGET IS THE CHAIN WITHOUT `composite`. That kernel is the
+    // harness's stand-in for the engine's own shading of the resolved
+    // irradiance (Stage 1.1's material hook, inside a raster draw that runs
+    // anyway); the gather does not own it and must not be priced for it.
+    console.log(`${t.tier}: chain ${(t.chainMs ?? 0).toFixed(3)} ms (+ composite ` +
+      `${((t.gatherMs ?? 0) - (t.chainMs ?? 0)).toFixed(3)}) at ${t.gather.width}×${t.gather.height} ` +
+      `→ ${((t.chainMs ?? 0) * k).toFixed(3)} ms scaled ×${k.toFixed(2)} to 1650×970 ` +
+      `(Stage 3.3 budget ≤ 4 ms) ${(t.chainMs ?? 0) * k <= 4 ? "PASS" : "OVER"}`);
   }
 
   // ── the gate table, one line per Stage 3.1/3.2 receipt ────────────────────
@@ -456,6 +476,17 @@ if (table.length) {
     g.push(["workgroup vars = 0", Math.max(...t.kernels.map((k) => k.workgroupVars)), (v) => v === 0]);
     g.push(["bracketed crops", t.parity.bracketed, (v) => v >= 6]);
     g.push(["orbit ÷ parked (paired)", t.motion?.pooled, (v) => v != null && v <= 1.2]);
+    {
+      const px = (t.gather?.width ?? 0) * (t.gather?.height ?? 0);
+      const k = px ? (1650 * 970) / px : 0;
+      g.push(["chain ms @1650×970 ≤ 4.0", (t.chainMs ?? 0) * k, (v) => v > 0 && v <= 4]);
+    }
+    if (t.resolveScaleAB) {
+      const sc = t.resolveScaleAB.filter((x) => !x.diag && x.full > 1e-3);
+      const w = sc.reduce((a, x) => (Math.abs(x.ratio - 1) > Math.abs(a.ratio - 1) ? x : a));
+      g.push(["half-res resolve, worst ≤ 5 %", Math.abs(w.ratio - 1) * 100, (v) => v <= 5]);
+    }
+    if (t.exhausted) g.push(["exhausted rays, sealed room", t.exhausted.pct, (v) => v <= 0.5]);
     if (t.resolveAB) {
       const w = t.resolveAB.filter((x) => !x.diag && x.oct > 1e-3)
         .reduce((a, x) => (Math.abs(x.ratio - 1) > Math.abs(a.ratio - 1) ? x : a));
