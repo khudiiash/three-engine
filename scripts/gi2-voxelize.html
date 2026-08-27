@@ -1607,6 +1607,7 @@
             "0.5", // the voxel centre, and the bucket's box midpoint
             "0.5001", // the SAT's conservativeEps: half a cell plus a hair
             "0.001", // the face-bit normal threshold (|n.a| > 1e-3)
+            "1048576", "1048576.0", // 3.9 axVote: the 2^20 fixed-point scale of (area*|n|) - a tier constant, not a scene number
             // The Stage 2.5 cull fraction, listed BY NAME rather than left to
             // the level-size allowance it happens to collide with at `high`
             // (v0 = 0.25 m). At `phone` the levels are 0.5/1/2 and "0.25" would
