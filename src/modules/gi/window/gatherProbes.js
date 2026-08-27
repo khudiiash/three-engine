@@ -717,6 +717,31 @@ export function createGiGather({
   // `resolveUpsample` reads. See the note above `makeResolve`.
   const irradianceHalf = mkTexAt("gi2IrradianceHalf", halfW, halfH);
   const glossyHalf = mkTexAt("gi2GlossyHalf", halfW, halfH);
+  // ── §19 STAGE 3.12 — the accumulator's memory ────────────────────────────
+  //
+  // ⭐⭐ THE OUTPUT TEXTURES CANNOT BE THE HISTORY, AND NOT FOR A STYLE REASON.
+  // A storage texture that is both SAMPLED and `textureStore`d inside one
+  // kernel is bound once, as `texture_2d<f32>`, and WGSL then rejects the store
+  // (`gi2System`'s AO note hit the same wall from the other side). So
+  // `resolveUpsample` reads THESE and writes `irradiance`/`glossy`, and one
+  // small kernel at the end of the frame copies the answer back here.
+  //
+  // ⚠ AND THE COPY IS A SEPARATE PASS RATHER THAN A PING-PONG. Materials bind
+  // `textures.irradiance` and `textures.glossy` by IDENTITY — `gi2System`
+  // stamps their `.version` and `GISystem#rebindStaleGiTextures` walks them —
+  // so the frame's output has to land in the same two objects every frame. A
+  // ping-pong would alternate which texture the scene is reading, which is the
+  // stale-binding crash `retireGather` exists to prevent, wearing a new hat.
+  //
+  // ⭐ THE ALPHA CARRIES THE GEOMETRY, exactly as the half-res pair's does
+  // (see the note in `makeResolve`): `irradianceHist.w` is the VIEW DEPTH this
+  // frame's camera saw at that pixel and `glossyHist.w` is that pixel's normal
+  // as a 5+5-bit octahedral key (0..1023 — an integer a half-float holds
+  // EXACTLY, which a packed 8+8 would not). Re-reading the gbuffer instead
+  // would answer with THIS frame's geometry at the PREVIOUS frame's pixel,
+  // which is the one thing a disocclusion test must not do.
+  const irradianceHist = mkTex("gi2IrradianceHist");
+  const glossyHist = mkTex("gi2GlossyHist");
 
   // ── uniforms ──────────────────────────────────────────────────────────────
   const u = {
@@ -807,11 +832,56 @@ export function createGiGather({
     anchorJitter: uniform(0, "uint"),
     /**
      * §19 Stage 3.10's 4×4 sub-texel LATTICE over the probe grid — see
-     * `probeTracePass`. 1 ships it, 0 is exact texel centres (the arm the
-     * quantization receipt was measured on). It is spatial and constant in
-     * time, so neither value moves the at-rest temporal number.
+     * `probeTracePass`. 1 was 3.10/3.11's ship, 0 is exact texel centres.
+     * It is spatial and constant in time, so neither value moves the at-rest
+     * temporal number.
+     *
+     * ⭐⭐ AND IT IS **0** SINCE §19 STAGE 3.12, WHICH IS THE STAGE'S FIRST HALF.
+     *
+     * 3.11a measured it as the biggest single lever on the moving image
+     * (reprojected pixel Δp50 −42 %, Δp95 −26 %) and could not ship it,
+     * because the lattice was carrying a job that was never its own: it was
+     * ANTI-ALIASING THE PANEL. A probe's direct light from a compact source
+     * arrived through whichever of the 64 oct directions happened to point at
+     * it, so with texel centres the Cornell crops fell out of bracket
+     * (floorCentre 1.05 → 1.55, boxTop 0.41 → 0.07) — a quantization of the
+     * SOURCE, dithered away at the price of re-quantizing every direction on
+     * every frame the anchor walks.
+     *
+     * 3.12 gives the compact source to NEE instead (`panelDirectPass` here, and
+     * on the engine path `gi2System`'s `emitterDirectPass`, which has always
+     * done this), so the lattice has nothing left to hide and the directions
+     * can be what §T says they are: fixed texel centres, the same ray from the
+     * same anchor every frame.
      */
-    probeDither: uniform(1),
+    probeDither: uniform(0),
+    /**
+     * ⭐⭐ §19 STAGE 3.12 — THE HARNESS PANEL IS AN EMITTER **SLOT** NOW.
+     *
+     * 1 delivers the Cornell panel's direct light at each probe by next-event
+     * estimation (`panelDirectPass`: four deterministic strata, one shadow ray
+     * each, added to the probe's SH) and, so that the two are not both counted,
+     * removes the panel class's EMISSION from every transport read in this
+     * file — `shadeHit`'s own term, the cosine ray's `hem` correction and
+     * `composite`'s pixel. That is exactly the "SEATED" tier `shadeHit`'s
+     * header already describes for a scene emitter that holds a slot: ONE
+     * representation per emitter, and for a seated one it is the slot.
+     *
+     * 0 is 3.11's arm — the panel reaches a probe only by being HIT — and it is
+     * what every crop ratio before this stage was measured on.
+     *
+     * ⚠ IT DOES NOT TOUCH `panelRadiance`, so `shadeHit`'s panel NEE still
+     * lights every cache face exactly as before, and the CPU reference (which
+     * reads the palette the page reports, not this uniform) is untouched. What
+     * moves is the PROBE's direct term and nothing else.
+     *
+     * ⚠ AND THE GLOSSY LOBE LOSES THE PANEL, deliberately and for the same
+     * reason a seated lamp loses it on the engine path: the lobe is a tap of
+     * the oct map, and the oct map is where the emission no longer is. At
+     * `f0 = 0.04` that is a 4 % term on the composite; the parity gate reads
+     * IRRADIANCE, which is the quantity NEE now owns end to end.
+     */
+    panelNee: uniform(1),
     /**
      * ⛔ §19 STAGE 3.11a — REFUTED, KEPT AS THE ARM THAT REFUTED IT. 1 keys the
      * 4×4 lattice to the probe's WORLD CELL instead of its probe-GRID
@@ -972,6 +1042,44 @@ export function createGiGather({
      * (the cost is the kernel table's business, and it is measured with it on).
      */
     domFaceOn: uniform(1),
+    // ── §19 STAGE 3.12 — THE RESOLVED IMAGE ACCUMULATES ───────────────────
+    /**
+     * ⭐⭐ SMOOTH ACCUMULATION OF A COMPLETE, NOISE-FREE EVALUATION — WHICH IS
+     * NOT A DENOISER, AND §T'S CLARIFICATION SAYS SO IN THE USER'S OWN WORDS:
+     * "in UE5 light just gradually accumulates, like light is slower than c".
+     *
+     * Every input to `resolveUpsample` is deterministic (fixed texel centres,
+     * a fixed shade quadrature, NEE for the compact sources), so this blend
+     * has nothing random to average away. What it has is the one thing 3.11a
+     * could name and not remove: the estimator's SPATIAL quantization being
+     * read out along an anchor that walks with the camera. A fixed α turns
+     * that read-out into a ramp — lag, which the user accepts, instead of
+     * grain, which the user does not.
+     *
+     * ⛔ IT IS A CONSTANT, NOT `1/(n+1)`, for the reason `octAlpha`'s header
+     * gives: a count-driven α makes a pixel that has been on screen for a
+     * second take a real world change 30× more slowly than the pixel beside
+     * it that has just been disoccluded, and buys no variance for it.
+     *
+     * 0 removes the pass's effect entirely (the arm every 3.11 number is read
+     * against); 1 is "no memory", which with a noiseless input is not noisy,
+     * only abrupt.
+     */
+    accumAlpha: uniform(0.25),
+    /** 0 restores 3.11 exactly: `resolveUpsample` writes the current frame. */
+    accumOn: uniform(1),
+    /**
+     * The neighbourhood clamp's half-width, as a FRACTION of the 2×2 low-res
+     * box the upsample already read.
+     *
+     * ⚠ IT IS NOT A VARIANCE CLAMP AND MUST NOT BE TIGHTENED INTO ONE. There is
+     * no noise for a tight clamp to remove and a tight clamp on a deterministic
+     * signal is a bias with a temporal edge on it (that is what a TAA "clamp
+     * ghost" is). What it bounds is REPROJECTION ERROR — a history tap whose
+     * geometry test passed but whose value belongs to something else — so it is
+     * deliberately generous: ±50 % of the box the current frame already spans.
+     */
+    accumClamp: uniform(0.5),
   };
   const palette = Array.from({ length: PAL_ENTRIES }, () => new THREE.Vector4(0, 0, 0, 0));
   const palU = uniformArray(palette, "vec4");
@@ -1001,6 +1109,8 @@ export function createGiGather({
   const glossyNode = texture(glossy);
   const irrHalfNode = texture(irradianceHalf);
   const glossyHalfNode = texture(glossyHalf);
+  const irrHistNode = texture(irradianceHist);
+  const glossyHistNode = texture(glossyHist);
 
   // ── small shared maths ────────────────────────────────────────────────────
 
@@ -1043,6 +1153,46 @@ export function createGiGather({
     const sx = step(0, f.x).mul(2).sub(1);
     const sy = step(0, f.y).mul(2).sub(1);
     return normalize(vec3(f.x.sub(sx.mul(fold)), f.y.sub(sy.mul(fold)), nz));
+  };
+
+  /**
+   * §19 STAGE 3.12 — a normal as ONE half-float, and back.
+   *
+   * 5 bits per octahedral axis is 0..1023, which a half-float represents
+   * EXACTLY (its significand holds every integer below 2048) — so the key
+   * survives an RGBA16F round trip bit for bit and can be compared without a
+   * tolerance. 5 bits is ~5° of angular error against a test that asks for
+   * `dot > 0.9` (25.8°), so the quantization cannot decide the test.
+   *
+   * ⚠ 8+8 BITS WOULD NOT SURVIVE. 65535 is above the half-float's exact-integer
+   * range; the value comes back rounded to the nearest even multiple of 4 and
+   * the decoded normal wanders. The budget here is the STORAGE FORMAT's, not
+   * the geometry's, which is why it is 5 and not "as many as fit".
+   */
+  const OCT5 = 31;
+  const packNormal5 = (n) => {
+    const l1 = n.x.abs().add(n.y.abs()).add(n.z.abs()).max(1e-6).toVar();
+    const ox = n.x.div(l1).toVar();
+    const oy = n.y.div(l1).toVar();
+    const sx = step(0, ox).mul(2).sub(1).toVar();
+    const sy = step(0, oy).mul(2).sub(1).toVar();
+    const fx = select(n.z.lessThan(0), float(1).sub(oy.abs()).mul(sx), ox).toVar();
+    const fy = select(n.z.lessThan(0), float(1).sub(ox.abs()).mul(sy), oy).toVar();
+    const qu = fx.mul(0.5).add(0.5).mul(OCT5).add(0.5).floor().clamp(0, OCT5).toVar();
+    const qv = fy.mul(0.5).add(0.5).mul(OCT5).add(0.5).floor().clamp(0, OCT5).toVar();
+    return qu.mul(OCT5 + 1).add(qv);
+  };
+  const unpackNormal5 = (key) => {
+    const qu = key.div(OCT5 + 1).floor().toVar();
+    const qv = key.sub(qu.mul(OCT5 + 1)).toVar();
+    const fx = qu.div(OCT5).mul(2).sub(1).toVar();
+    const fy = qv.div(OCT5).mul(2).sub(1).toVar();
+    const nz = float(1).sub(fx.abs()).sub(fy.abs()).toVar();
+    const sx = step(0, fx).mul(2).sub(1).toVar();
+    const sy = step(0, fy).mul(2).sub(1).toVar();
+    const ox = select(nz.lessThan(0), float(1).sub(fy.abs()).mul(sx), fx).toVar();
+    const oy = select(nz.lessThan(0), float(1).sub(fx.abs()).mul(sy), fy).toVar();
+    return normalize(vec3(ox, oy, nz));
   };
 
   /**
@@ -1814,6 +1964,32 @@ export function createGiGather({
   // and through `injectLitFrame`, which is the point of §K.6.
   /** The packed `(face | level<<3 | voxel<<6)` word of a `traceWindow` result. */
   const zi0 = (raw) => raw.z.toUint();
+  /**
+   * §19 STAGE 3.12 — THE HARNESS RIG'S "SEATED EMITTER" SWITCH.
+   *
+   * `emitters?.length` already decides, once, whether this build's emitter
+   * representation is the CALLER's slots or the Cornell rig's panel (see the
+   * panel block in `shadeHit`). On a slot build the seating decision is made on
+   * the CPU — `#gi2SlotEmissive` zeroes a seated class's `palEm` — and this is
+   * the identical decision for the one emitter the CPU cannot reach, taken as a
+   * uniform so the arm can be A/B'd inside one binary and one shader cache.
+   *
+   * On a slot build it is the identity and adds no WGSL.
+   */
+  //
+  // ⚠⚠ AND THE GATE IS `crops > 0`, NOT `!emitters?.length` ALONE — THE FIRST
+  // CUT OF THIS WOULD HAVE BLACKED OUT EVERY EMISSIVE SURFACE IN ANY SCENE
+  // WITH NO SEATED LAMPS. `gi2System` zeroes `panelRadiance` at build and
+  // leaves `panelNee` at its default 1, so a build that takes the rig branch
+  // on `!emitters?.length` alone would multiply the WHOLE palette's emission by
+  // `1 − 1` and deliver nothing in its place: the panel NEE that is supposed to
+  // replace it is the HARNESS's panel, which such a scene does not have.
+  // `crops` is the one argument that separates the rig from a scene (24 vs 0),
+  // and it is the same signal `panelDirectPass` is built on — the removal and
+  // the replacement are therefore the same build decision, which is the only
+  // shape in which "one representation per emitter" is safe.
+  const PANEL_RIG = !emitters?.length && crops > 0;
+  const emOf = (v) => (PANEL_RIG ? v.mul(float(1).sub(u.panelNee)) : v);
   const shadeHit = (p, n, levelF, voxF, seedU = null) => {
     const pi = palIndexAt(levelF, voxF).toVar();
     const pal = palU.element(pi).toVar();
@@ -1994,7 +2170,11 @@ export function createGiGather({
           // part is the palette's own `palEm` for the hit's class, which is the
           // same table `shadeHit` adds at the end — so the two halves of the
           // estimator subtract exactly what the other half added.
-          const hem = palEmU.element(palIndexAt(hlv, hvx)).xyz.toVar();
+          // §19 3.12: `emOf` is the identity on a slot build and zeroes the
+          // panel's emission on the rig build when the probe NEE owns it —
+          // and the subtraction then correctly removes NOTHING, because the
+          // cache no longer holds the emission to remove.
+          const hem = emOf(palEmU.element(palIndexAt(hlv, hvx)).xyz).toVar();
           acc.addAssign(c2.xyz.mul(c2.w).sub(hem).max(vec3(0)));
         }).Else(() => {
           acc.addAssign(u.skyColor);
@@ -2168,7 +2348,7 @@ export function createGiGather({
       }
     });
 
-    return pal.xyz.mul(1 / Math.PI).mul(E).add(palEm.xyz);
+    return pal.xyz.mul(1 / Math.PI).mul(E).add(emOf(palEm.xyz));
   };
 
   // ══════════════════════════════════════════════ the HZB screen segment
@@ -2864,6 +3044,98 @@ export function createGiGather({
   const probeShFilterPass = makeShFilter(SH_R);
   const probeShFilter3Pass = makeShFilter(1);
 
+  // ══════════════════════════════ SHADER: panelDirect (§19 Stage 3.12)
+  //
+  // ⭐⭐ THE COMPACT SOURCE IS SAMPLED AT THE PROBE, NOT FOUND BY A RAY.
+  //
+  // A 3 × 3 m panel six metres above a floor probe subtends ~0.24 sr. The oct
+  // map divides the sphere into 64 texels of ~0.20 sr each, so whether that
+  // probe "sees" the panel — and how much of it — is decided by whether one
+  // fixed direction happens to land inside a solid angle about its own size.
+  // That is a quantizer, it is the reason `probeDither` existed, and no amount
+  // of temporal filtering can fix it because it is not a temporal error: at
+  // rest it is a WRONG, PERFECTLY STABLE number (floorCentre 1.55 × the
+  // reference with the dither off, boxTop 0.07 ×).
+  //
+  // So the panel is estimated the way every other light in this engine already
+  // is: next-event, with the shadow ray as the only thing that is traced. Four
+  // deterministic strata over the panel's area, `L · cosP · (A/4) / d²` per
+  // stratum as the radiance-times-solid-angle a delta carries, projected onto
+  // the probe's SH — where `shEval`'s Ramamoorthi cosine convolution supplies
+  // the receiver's own `cosX`, which is why it is absent here.
+  //
+  // ⚠ THIS IS `gi2System.buildEmitterDirectPass`'S SHAPE, DELIBERATELY. Same
+  // slot in the chain (after the SH bilateral, before `resolveHalf` — the
+  // first kernel that reads the filtered half), same accumulate-then-write-once
+  // discipline for the nine coefficients, same "stop the shadow ray short of
+  // the emitter's own voxelized body" rule. A harness whose light arrives by a
+  // different mechanism from the engine's cannot gate the engine.
+  //
+  // ⚠ BUILT ONLY ON THE RIG (`PANEL_RIG`, which is `!emitters?.length &&
+  // crops > 0` — see its note). That is the same "do not compile the rig's WGSL
+  // into a scene build" rule the panel block in `shadeHit` learned the
+  // expensive way (four inlined DDAs, 2.5 s of pipeline compile, first light
+  // 1.8 → 3.6 s on the Level), AND it is what makes `emOf`'s removal of the
+  // emission safe: the two are one build decision, never two.
+  const panelDirectPass = !PANEL_RIG ? null : Fn(() => {
+    const gx = globalId.x.toVar();
+    const gy = globalId.y.toVar();
+    If(gx.greaterThanEqual(u.probeWU).or(gy.greaterThanEqual(u.probeHU)), () => { Return(); });
+    If(u.panelNee.lessThan(0.5), () => { Return(); });
+    const probe = gy.mul(u.probeWU).add(gx).toVar();
+    const a = probeMeta.element(metaIdx(u.curBase, probe, uint(0))).toVar();
+    If(a.w.lessThan(0.5), () => { Return(); });
+    const p = a.xyz.toVar();
+    const n = normalize(probeMeta.element(metaIdx(u.curBase, probe, uint(1))).xyz).toVar();
+    // The same skip `shadeHit`'s panel block takes, for the same reason: at or
+    // above the panel's own plane its emission is the surface's own and a light
+    // cannot illuminate itself without being counted twice.
+    If(p.y.greaterThanEqual(u.panelCentre.y.sub(0.05)), () => { Return(); });
+
+    const sh = [];
+    for (let i = 0; i < 9; i++) sh.push(vec3(0).toVar());
+    // ⚠ THE STOP PLANE IS MEASURED FROM THE ORIGIN THE TRACE WILL USE, which is
+    // `p` pushed half a cell along the normal — see the long note in
+    // `shadeHit`'s panel block. Getting this wrong does not dim the answer, it
+    // zeroes it, and only on the surfaces whose normal points at the light.
+    const pRay = p.add(n.mul(v0 * 0.5)).toVar();
+    const yStop = u.panelCentre.y.div(v0).floor().mul(v0).sub(v0 * 0.5).toVar();
+    for (let sy = 0; sy < 2; sy++) {
+      for (let sx = 0; sx < 2; sx++) {
+        const q = vec3(
+          u.panelCentre.x.add(u.panelHalf.x.mul(sx ? 0.5 : -0.5)),
+          u.panelCentre.y,
+          u.panelCentre.z.add(u.panelHalf.y.mul(sy ? 0.5 : -0.5)),
+        ).toVar();
+        const wv = q.sub(p).toVar();
+        const d2 = dot(wv, wv).max(1e-4).toVar();
+        const d = sqrt(d2).toVar();
+        const wd = wv.div(d).toVar();
+        const cosX = dot(n, wd).toVar();
+        const cosP = wd.y.max(0).toVar();
+        If(cosX.mul(cosP).greaterThan(1e-5), () => {
+          const tStop = yStop.sub(pRay.y).div(wd.y.max(1e-3)).min(d).max(0.05).toVar();
+          const vis = float(1).sub(traceWindow(p, wd, tStop, n).hit).toVar();
+          const c = u.panelRadiance.mul(cosP).mul(u.panelArea.mul(0.25)).div(d2).mul(vis).toVar();
+          sh[0].addAssign(c.mul(0.282095));
+          sh[1].addAssign(c.mul(wd.y.mul(0.488603)));
+          sh[2].addAssign(c.mul(wd.z.mul(0.488603)));
+          sh[3].addAssign(c.mul(wd.x.mul(0.488603)));
+          sh[4].addAssign(c.mul(wd.x.mul(wd.y).mul(1.092548)));
+          sh[5].addAssign(c.mul(wd.y.mul(wd.z).mul(1.092548)));
+          sh[6].addAssign(c.mul(wd.z.mul(wd.z).mul(3).sub(1).mul(0.315392)));
+          sh[7].addAssign(c.mul(wd.x.mul(wd.z).mul(1.092548)));
+          sh[8].addAssign(c.mul(wd.x.mul(wd.x).sub(wd.y.mul(wd.y)).mul(0.546274)));
+        });
+      }
+    }
+    for (let i = 0; i < 9; i++) {
+      const idx = shIdx(probe, i);
+      const cur = probeSh.element(idx).toVar();
+      probeSh.element(idx).assign(vec4(cur.xyz.add(sh[i]), 0));
+    }
+  })().compute(dispatch2d(probeW, probeH), WG);
+
   // ══════════════════════════════════════════════ SHADER: resolve (§L.5)
   //
   // Both integrators are built and `USE_SH` picks one per tier, which is what
@@ -3167,6 +3439,19 @@ export function createGiGather({
       const bestW = float(-1).toVar();
       const bestE = vec3(0).toVar();
       const bestG = vec3(0).toVar();
+      // ⭐ THE ACCUMULATOR'S CLAMP BOX IS THE FOUR TAPS THIS LOOP ALREADY READS.
+      //
+      // §19 3.12 asked for "±50 % of the 3×3 neighbourhood". A 3×3 of the
+      // low-res image is EIGHTEEN more texture loads per full-res pixel — at
+      // 1650×970 that is the whole 0.4 ms budget spent on a bound, not on the
+      // answer. The 2×2 the bilinear already fetched covers the same 4×4 block
+      // of full-res pixels this thread interpolates from, costs nothing, and is
+      // the box the current frame's value provably lies inside. See
+      // `accumClamp` for why generous is the point.
+      const loE = vec3(1e8).toVar();
+      const hiE = vec3(-1e8).toVar();
+      const loG = vec3(1e8).toVar();
+      const hiG = vec3(-1e8).toVar();
       for (let d = 0; d < 4; d++) {
         const dx = d & 1;
         const dy = (d >> 1) & 1;
@@ -3188,6 +3473,12 @@ export function createGiGather({
           bestE.assign(ei.xyz);
           bestG.assign(gi.xyz);
         });
+        If(okTap, () => {
+          loE.assign(min(loE, ei.xyz));
+          hiE.assign(max(hiE, ei.xyz));
+          loG.assign(min(loG, gi.xyz));
+          hiG.assign(max(hiG, gi.xyz));
+        });
         E.addAssign(ei.xyz.mul(w));
         G.addAssign(gi.xyz.mul(w));
         wsum.addAssign(w);
@@ -3199,9 +3490,147 @@ export function createGiGather({
         E.assign(bestE);
         G.assign(bestG);
       });
+
+      // ══ §19 STAGE 3.12 — LIGHT ARRIVES OVER FOUR FRAMES ══════════════════
+      //
+      // ⭐⭐ THIS IS NOT A DENOISER AND THE DISTINCTION IS THE WHOLE STAGE. A
+      // denoiser is a filter that removes VARIANCE from a stochastic estimate;
+      // there is no variance here, because there is no stochastic input left
+      // anywhere on this path (fixed texel centres, a fixed shade quadrature,
+      // NEE for the compact sources — §T). What this blend removes is the RATE
+      // at which a deterministic estimator's SPATIAL quantization is read out
+      // along an anchor that walks with the camera, which is the residue 3.11a
+      // named and could not remove at the probe.
+      //
+      // ⚠ THE VALIDATION IS THE PASS. A reprojected blend with a weak
+      // disocclusion test is a smear along every silhouette, and a smear is a
+      // worse artefact than the grain it replaces. Three independent gates,
+      // each of which alone would let something through:
+      //
+      //   · GEOMETRY. Each of the four history taps carries the DEPTH its own
+      //     frame's camera saw and its own frame's NORMAL (see the note at
+      //     `irradianceHist`). A tap counts only if its depth matches this
+      //     surface point's depth IN THAT CAMERA and its normal agrees within
+      //     `dot > 0.9`. Re-reading the gbuffer instead would compare this
+      //     frame's geometry at the old pixel, which is not the question.
+      //   · THE TOLERANCE IS THE PIXEL'S OWN WORLD SIZE, never a metric
+      //     constant: `depth / projScale` is what one pixel spans HERE, and
+      //     `slant` is how much further that reaches along a surface turned
+      //     away from the camera. The `+2 px` floor is the half-float's own
+      //     quantum at this depth (relative 4.9e-4 against a half-pixel
+      //     tolerance of ~4.8e-4 at `projScale ≈ 1040`) — without it the
+      //     STORAGE FORMAT would be deciding a geometric test.
+      //   · THE NEIGHBOURHOOD BOX. Even a tap that passes both can hold a
+      //     value from a surface that merely agrees about depth and normal
+      //     (a repeated tread, a parallel wall). `accumClamp` bounds it to the
+      //     2×2 low-res box this pixel interpolates from, widened by ±50 %.
+      //
+      // A pixel with no surviving tap takes the CURRENT frame whole. That is
+      // the correct answer for a disocclusion and it is what makes the
+      // at-rest receipt exact: with the camera parked every tap survives, the
+      // history equals the current value, and the blend is the identity.
+      // ⚠ THE BOX ALWAYS CONTAINS THIS PIXEL'S OWN ANSWER. A pixel WITH
+      // geometry can still have all four low-res taps rejected (a sliver of
+      // surface inside a 2×2 that is otherwise sky), and the accumulators would
+      // then still hold their ±1e8 sentinels — a clamp whose lower bound is
+      // above its upper bound, which is not a bound at all. Folding the
+      // finalized value in makes the box non-empty by construction and costs
+      // two register ops.
+      loE.assign(min(loE, E));
+      hiE.assign(max(hiE, E));
+      loG.assign(min(loG, G));
+      hiG.assign(max(hiG, G));
+      If(u.accumOn.greaterThan(0.5), () => {
+        const c = u.prevViewProj.mul(vec4(P, 1)).toVar();
+        If(c.w.greaterThan(1e-4), () => {
+          const sx = c.x.div(c.w).mul(0.5).add(0.5).toVar();
+          const sy = float(1).sub(c.y.div(c.w).mul(0.5).add(0.5)).toVar();
+          If(sx.greaterThanEqual(0).and(sx.lessThan(1))
+            .and(sy.greaterThanEqual(0)).and(sy.lessThan(1)), () => {
+            const V = normalize(P.sub(u.camPos)).toVar();
+            const pw = c.w.div(u.projScale.max(1e-3)).toVar();
+            const slant = float(1).div(dot(Nn, V).abs().max(0.1)).toVar();
+            const tol = pw.mul(slant).mul(0.5).max(pw.mul(2)).toVar();
+            const fx = sx.mul(u.widthF).sub(0.5).toVar();
+            const fy = sy.mul(u.heightF).sub(0.5).toVar();
+            const x0 = fx.floor().toVar();
+            const y0 = fy.floor().toVar();
+            const ax = fx.sub(x0).toVar();
+            const ay = fy.sub(y0).toVar();
+            const hE = vec3(0).toVar();
+            const hG = vec3(0).toVar();
+            const hW = float(0).toVar();
+            for (let t = 0; t < 4; t++) {
+              const dx = t & 1;
+              const dy = (t >> 1) & 1;
+              const bl = (dx ? ax : float(1).sub(ax)).mul(dy ? ay : float(1).sub(ay)).toVar();
+              const hx = x0.add(dx).clamp(0, float(width - 1)).toInt().toVar();
+              const hy = y0.add(dy).clamp(0, float(height - 1)).toInt().toVar();
+              const hi = irrHistNode.load(ivec2(hx, hy)).toVar();
+              const hg = glossyHistNode.load(ivec2(hx, hy)).toVar();
+              const okDepth = hi.w.greaterThan(0).and(hi.w.sub(c.w).abs().lessThan(tol)).toVar();
+              const okNrm = dot(unpackNormal5(hg.w.max(0)), Nn).greaterThan(0.9).toVar();
+              const w = bl.mul(select(okDepth.and(okNrm).and(hg.w.greaterThanEqual(0)),
+                float(1), float(0))).toVar();
+              hE.addAssign(hi.xyz.mul(w));
+              hG.addAssign(hg.xyz.mul(w));
+              hW.addAssign(w);
+            }
+            // ⚠ 0.999, NOT `> 0`. A partial set of surviving taps is a pixel
+            // ON a disocclusion boundary — half its history belongs to the
+            // thing that just moved away — and renormalizing a half-weight
+            // tap is how a silhouette acquires a one-frame trail. Either the
+            // whole bilinear footprint is the same surface or this pixel takes
+            // the current frame.
+            If(hW.greaterThan(0.999), () => {
+              const spanE = hiE.sub(loE).mul(u.accumClamp).toVar();
+              const spanG = hiG.sub(loG).mul(u.accumClamp).toVar();
+              const cE = hE.clamp(loE.sub(spanE), hiE.add(spanE)).toVar();
+              const cG = hG.clamp(loG.sub(spanG), hiG.add(spanG)).toVar();
+              const al = u.accumAlpha.clamp(0, 1).toVar();
+              E.assign(mix(cE, E, al));
+              G.assign(mix(cG, G, al));
+            });
+          });
+        });
+      });
     });
     textureStore(irradiance, coord, vec4(E, g.w));
     textureStore(glossy, coord, vec4(G, g.w));
+  })().compute(dispatch2d(width, height), WG);
+
+  // ══════════════════════════════ SHADER: imageHistory (§19 Stage 3.12)
+  //
+  // The accumulator's other half: copy the frame the scene is about to be lit
+  // by into the two history textures, with the geometry key that lets the NEXT
+  // frame decide whether each texel is still the same surface.
+  //
+  // ⭐ IT RUNS LAST, AFTER `composite` AND `injectLitFrame`, AND THAT IS FREE.
+  // Nothing between `resolveUpsample` and here writes `irradiance` — GTAO's
+  // compose (on the engine path) reads it and writes its own output texture,
+  // for the documented reason that the cache must remember UNOCCLUDED
+  // radiance — so the history is the accumulated, un-occluded irradiance,
+  // which is precisely what the next frame's blend is defined against.
+  //
+  // ⚠ THE DEPTH IS `viewProj.w`, NOT A DISTANCE. Next frame this same matrix is
+  // `prevViewProj`, so the two numbers are the same projection of the same
+  // point and can be compared without a reconstruction step in between.
+  const imageHistoryPass = Fn(() => {
+    const px = globalId.x.toVar();
+    const py = globalId.y.toVar();
+    If(px.greaterThanEqual(u.widthU).or(py.greaterThanEqual(u.heightU)), () => { Return(); });
+    const coord = ivec2(px.toInt(), py.toInt());
+    const g = loadPos(px.toInt(), py.toInt()).toVar();
+    // −1 in BOTH keys is the sky/no-geometry sentinel, and it has to be written
+    // rather than skipped: a texel left untouched holds whatever the last
+    // frame's geometry put there, which is the same class of bug as a probe
+    // returning early from a back-facing texel (see `probeTracePass`).
+    const depth = select(g.w.greaterThan(0.5),
+      u.viewProj.mul(vec4(g.xyz, 1)).w, float(-1)).toVar();
+    const key = select(g.w.greaterThan(0.5),
+      packNormal5(normalize(loadNrm(px.toInt(), py.toInt()).xyz)), float(-1)).toVar();
+    textureStore(irradianceHist, coord, vec4(irrNode.load(coord).xyz, depth));
+    textureStore(glossyHist, coord, vec4(glossyNode.load(coord).xyz, key));
   })().compute(dispatch2d(width, height), WG);
 
   // ══════════════════════════════════════════════ SHADER: composite
@@ -3224,8 +3653,14 @@ export function createGiGather({
       // frame.
       const pi = palIndexAtWorld(g.xyz, Nn).toVar();
       const pal = palU.element(pi).toVar();
+      // §19 3.12: the emissive term goes through `emOf` too. It has to — a
+      // seated emitter that still glowed HERE would be written straight back
+      // into its own cache face by `injectLitFrame` (which takes exactly this
+      // pixel minus the lobe), and the emission NEE owns would be back in the
+      // ray path one frame later, through the one door the palette does not
+      // guard.
       out.assign(pal.xyz.mul(1 / Math.PI).mul(irrNode.load(coord).xyz)
-        .add(glossyNode.load(coord).xyz.mul(u.f0)).add(palEmU.element(pi).xyz));
+        .add(glossyNode.load(coord).xyz.mul(u.f0)).add(emOf(palEmU.element(pi).xyz)));
     }).Else(() => {
       out.assign(u.skyColor);
     });
@@ -3764,6 +4199,10 @@ export function createGiGather({
     tier, tile: T, rays: R, oct: O, history: H, stride: STRIDE, sh: USE_SH,
     metaVec: META_VEC, matureRays: MATURE_RAYS, rayFresh: RAY_FRESH, rayFlag: RAY_FLAG,
     shadeProb: u.shadeProb.value, nCap: u.nCapU.value, skyRays: SKY_RAYS,
+    // §19 3.12's three, so a receipt can print the configuration it measured
+    // instead of the configuration someone believes shipped.
+    probeDither: u.probeDither.value, panelNee: u.panelNee.value,
+    accumAlpha: u.accumAlpha.value, panelRig: PANEL_RIG,
     shRadius: SH_R, packN: PACK_N, packD: PACK_D, distQ: DIST_Q, sigQ: SIG_Q,
     sigMin: SIG_MIN, sigOct: SIG_OCT, rayMax: RAY_MAX,
     width, height, halfW, halfH, probeW, probeH, probeCount,
@@ -3776,11 +4215,12 @@ export function createGiGather({
       hzb: hzbWords * 4,
       dirtyBuf: dirtyBuf ? halfW * halfH * 16 : 0,
       litBuf: width * height * 16,
-      textures: 3 * width * height * 8 + 2 * halfW * halfH * 8,
+      // §19 3.12 adds the two history textures: +2 full-res RGBA16F.
+      textures: 5 * width * height * 8 + 2 * halfW * halfH * 8,
     },
   });
 
-  return {
+  const api = {
     tier, T, R, O, H, SH_R, STRIDE, USE_SH, probeW, probeH, probeCount, width, height,
     uniforms: u, palette, paletteEmissive, setPalette, beginFrame, get frame() { return frame; },
     buffers: {
@@ -3789,7 +4229,14 @@ export function createGiGather({
       contactIn, contactOut,
     },
     SHADE_SLOTS, EXHAUST_SLOTS, EXH_VEC, CONTACT_RAYS,
-    textures: { irradiance, glossy, lit, irradianceHalf, glossyHalf },
+    textures: {
+      irradiance, glossy, lit, irradianceHalf, glossyHalf,
+      // §19 3.12. Read/written only by compute kernels, so no `.version` stamp
+      // is needed (that stamp exists for the two textures MATERIALS bind), and
+      // `dispose()` below hands them to `gi2System`'s retire queue with the
+      // rest of the gather on a resize.
+      irradianceHist, glossyHist,
+    },
     passes: {
       hzbBuild: hzbBuildPass,
       hzbReduce: hzbReducePasses,
@@ -3811,6 +4258,14 @@ export function createGiGather({
       // `frameOrder` and stop hand-listing kernels.
       resolveHalf: resolveHalfPass,
       resolveUpsample: resolveUpsamplePass,
+      /**
+       * §19 3.12's per-probe NEE for the Cornell rig's panel. `null` on any
+       * build with real emitter slots (`gi2System`'s `emitterDirectPass` is
+       * that build's version) and on any build with no crops.
+       */
+      panelDirect: panelDirectPass,
+      /** §19 3.12's accumulator memory — see `imageHistoryPass`. */
+      imageHistory: imageHistoryPass,
       composite: compositePass,
       inject: injectPass,
       crop: cropPass,
@@ -3841,9 +4296,20 @@ export function createGiGather({
      */
     frameOrder: [
       hzbBuildPass, ...hzbReducePasses, probePlacePass, rayBudgetPass, probeTracePass,
-      probeFilterPass, probeShFilterPass, resolveHalfPass, resolveUpsamplePass,
+      probeFilterPass, probeShFilterPass,
+      // §19 3.12: the rig's emitter NEE goes exactly where `gi2System` splices
+      // the engine's — immediately before `resolveHalf`, the first kernel that
+      // reads the filtered half of `probeSh`. `null` on every non-rig build,
+      // filtered out below so the chain shape does not change for them.
+      panelDirectPass,
+      resolveHalfPass, resolveUpsamplePass,
       compositePass, injectPass,
-    ],
+      // §19 3.12: LAST. It reads `irradiance`/`glossy` and writes only the two
+      // history textures, so a consumer that splices GTAO in after
+      // `resolveUpsample` (which is what `gi2System` does) still hands this the
+      // un-occluded irradiance the next frame's blend is defined against.
+      imageHistoryPass,
+    ].filter(Boolean),
     /** Sum a striped counter out of a readback. */
     readStats(u32) {
       const out = {};
@@ -3868,6 +4334,23 @@ export function createGiGather({
       lit.dispose();
       irradianceHalf.dispose();
       glossyHalf.dispose();
+      irradianceHist.dispose();
+      glossyHist.dispose();
     },
   };
+  // ⭐ §19 STAGE 3.12 — THE MOVING RECEIPT NEEDS A HANDLE ON A REAL SCENE.
+  //
+  // `reprojDump` and `reprojBuf` already exist and are already gated on
+  // `wantNoise`, but on the engine path `gi2System` builds this gather with
+  // `crops: 0` and does not re-export it, so `run-gi2-motion-probe` had no way
+  // to reach the one instrument that can answer 3.11a's question on Bistro
+  // rather than on a Cornell box.
+  //
+  // ⚠ IT IS PUBLISHED ONLY WHEN A PROBE ASKED FOR THE INSTRUMENT. The same
+  // flag that builds the buffers publishes the handle, so a normal editor
+  // session has neither — no global, no 25 MB of receipt buffers, and no way
+  // for a stale handle to keep a retired gather alive across a resize (a resize
+  // rebuilds the gather, which republishes).
+  if (globalThis.__gi2NoiseDump === true) globalThis.__gi2GatherProbe = api;
+  return api;
 }

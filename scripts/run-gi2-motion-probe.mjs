@@ -148,9 +148,19 @@ const browser = await puppeteer.launch({
 const page = await browser.newPage();
 await page.setViewport({ width: 1650, height: 970, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
+// ⚠ §19 3.12: `__gi2NoiseDump` HAS TO BE SET BEFORE THE GATHER IS BUILT, which
+// is before first light — `createGiGather` reads it once, to decide whether to
+// allocate the receipt buffers and build `reprojDump` at all (`gi2System` passes
+// `crops: 0`, so nothing else on the engine path turns them on). Setting it
+// after boot would leave the grain segment below reading a kernel that does not
+// exist, which it reports rather than scoring as zero. `GRAIN=0` opts out and
+// gets a gather with exactly the 3.11 memory footprint.
 await page.evaluateOnNewDocument((flags) => {
   for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
-}, JSON.parse(process.env.FLAGS ?? "{}"));
+}, {
+  ...(process.env.GRAIN === "0" ? {} : { __gi2NoiseDump: true }),
+  ...JSON.parse(process.env.FLAGS ?? "{}"),
+});
 if (process.env.SCRIPT_RELOAD === "1") {
   await page.evaluateOnNewDocument(() => { globalThis.__gi2MotionKeepScriptReload = true; });
 }
@@ -620,6 +630,92 @@ const installed = await page.evaluate(async () => {
   let prevReadbacks = 0;
   let lastNow = performance.now();
 
+  // ══ §19 STAGE 3.12 — the grain receipt's in-page half ═════════════════════
+  //
+  // The statistic is `gi2-gather.html`'s `grainReceipt`, verbatim in its
+  // arithmetic: each pixel against its own REPROJECTED previous value, a
+  // histogram of |Δ|/L, and a SIGN census that follows the surface point's own
+  // trajectory through `src` (the reprojected source pixel index that
+  // `reprojBuf` carries for exactly this). A flip is then the estimate
+  // reversing on one surface point and cannot be parallax.
+  R.grain = null;
+  R.grainMk = (want, label) => ({
+    label, want, frames: 0, chain: Promise.resolve(), lit: null, err: null,
+    prevS: null, curS: null, hist: new Float64Array(2001), hn: 0,
+    steps: 0, moved: 0, flips: 0, scored: 0, reproj: 0,
+  });
+  const histAdd = (G, v) => { G.hist[Math.min(2000, Math.max(0, Math.round(v * 1000)))]++; G.hn++; };
+  const histP = (G, p) => {
+    if (!G.hn) return null;
+    let acc = 0;
+    for (let i = 0; i <= 2000; i++) { acc += G.hist[i]; if (acc >= (p / 100) * G.hn) return i / 1000; }
+    return 2;
+  };
+  const grainReduce = (G, f) => {
+    const N = f.length / 4;
+    if (!G.prevS) { G.prevS = new Int8Array(N); G.curS = new Int8Array(N); }
+    if (G.lit == null) {
+      // The lit threshold is a tenth of the median VALID luminance, derived
+      // from the scene rather than chosen — a dark arm and a bright one are
+      // then judged the same way and no constant is a threshold.
+      const xs = [];
+      for (let i = 0; i < N; i++) if (f[i * 4 + 3] > 0.5) xs.push(f[i * 4]);
+      xs.sort((a, b) => a - b);
+      G.lit = xs.length ? 0.1 * xs[xs.length >> 1] : 0;
+    }
+    G.curS.fill(0);
+    for (let i = 0; i < N; i++) {
+      if (!(f[i * 4 + 3] > 0.5)) continue;
+      G.scored++;
+      const s = f[i * 4 + 2];
+      if (!(s >= 0)) continue;
+      G.reproj++;
+      const L = f[i * 4];
+      const P = f[i * 4 + 1];
+      if (!(L > G.lit) || !(P > 0)) continue;
+      const d = L - P;
+      histAdd(G, Math.abs(d) / L);
+      if (!(Math.abs(d) > 1e-3 * L)) continue;
+      G.moved++;
+      const sg = d > 0 ? 1 : -1;
+      G.curS[i] = sg;
+      const ps = G.prevS[s | 0];
+      if (ps !== 0) { G.steps++; if (sg !== ps) G.flips++; }
+    }
+    G.prevS.set(G.curS);
+  };
+  const grainTick = () => {
+    const G = R.grain;
+    const g = globalThis.__gi2GatherProbe;
+    // ⚠ THE BLIND-INSTRUMENT CHECK IS A FIELD, NOT A SILENT ZERO. Without
+    // `__gi2NoiseDump` set before boot the kernel is never built, and a receipt
+    // that then reported "0 flips" would be reporting its own absence.
+    if (!g?.passes?.reprojDump || !g?.buffers?.reprojBuf) {
+      G.err = "no reprojDump kernel — __gi2NoiseDump must be set before boot";
+      G.frames = G.want;
+      return;
+    }
+    G.frames++;
+    try {
+      eng.renderer.compute(g.passes.reprojDump);
+      const p = eng.renderer.getArrayBufferAsync(g.buffers.reprojBuf.value);
+      G.chain = G.chain.then(() => p).then((buf) => grainReduce(G, new Float32Array(buf)))
+        .catch((e) => { G.err ??= String(e?.message ?? e); });
+    } catch (e) { G.err ??= String(e?.message ?? e); }
+  };
+  R.grainSummary = () => {
+    const G = R.grain;
+    if (!G) return null;
+    return {
+      label: G.label, frames: G.frames, err: G.err,
+      p50: histP(G, 50), p95: histP(G, 95), n: G.hn,
+      movedPct: G.reproj ? (100 * G.moved) / G.reproj : null,
+      flipPct: G.steps ? (100 * G.flips) / G.steps : null,
+      reprojPct: G.scored ? (100 * G.reproj) / G.scored : null,
+      steps: G.steps,
+    };
+  };
+
   const rawEnd = stats.endPhaseFrame.bind(stats);
   stats.endPhaseFrame = function () {
     rawEnd();
@@ -729,6 +825,26 @@ const installed = await page.evaluate(async () => {
     } catch { /* a backend without a device */ }
     R.frames.push(rec);
     drainGpu();
+
+    // ⭐⭐ §19 STAGE 3.12 — THE REPROJECTED SIGN-FLIP RECEIPT, ON BISTRO.
+    //
+    // 3.11a's grain instrument only ever ran on the Cornell box, where "the
+    // camera moves" means a 4 m orbit in a sealed 10 m room. The user's report
+    // is about a street. This runs the SAME kernel (`gatherProbes.reprojDump`)
+    // on the same three camera arms this probe already drives, so the quantity
+    // is identical and only the world differs.
+    //
+    // ⚠ IT MUST BE DISPATCHED EXACTLY ONCE PER ENGINE FRAME. `reprojDump`
+    // writes this frame's luminance into `motionLum[curBase]` and reads the
+    // previous frame's out of `[prevBase]`, and those two flip on the gather's
+    // own `beginFrame` — so a dispatch every OTHER frame would compare a pixel
+    // to itself two frames ago and call the difference grain, while two
+    // dispatches in one frame would compare it to itself.
+    // ⚠ AND THE READBACK IS ISSUED HERE, NOT IN THE `.then()`. The copy is
+    // encoded when `getArrayBufferAsync` is CALLED; deferring the call into the
+    // reduction chain would read whatever frame happened to be current when the
+    // chain got round to it.
+    if (R.grain && R.grain.frames < R.grain.want) grainTick();
 
     // ── drive the camera ───────────────────────────────────────────────────
     const plan = R.plan;
@@ -909,6 +1025,109 @@ if (process.env.PROFILE) {
 }
 
 for (const [arm, label, pin, cells] of armList) await runArm(arm, label, pin, cells);
+
+// ══════════════ §19 STAGE 3.12 — GRAIN UNDER MOTION, ON THIS SCENE ══════════
+//
+// ⭐⭐ THE 3.11a/3.12 GRAIN RECEIPT MOVED OFF THE CORNELL BOX. Everything the
+// stage measured about motion grain was measured in a sealed 10 m room on a
+// 4 m orbit; the user's report is about a street. This runs the identical
+// statistic (each pixel against its own REPROJECTED previous value, with the
+// sign followed along the surface point's own trajectory) on the three camera
+// arms this probe already drives.
+//
+// ⚠ IT RUNS LAST, AND ITS FRAMES ARE NOT IN THE PERF TABLES. Each frame issues
+// a storage-buffer READBACK, which is a pipeline flush — a frame-time number
+// taken here would be measuring the instrument. The arms above have already
+// finished by the time this starts.
+//
+// ⚠ BOTH CONFIGURATIONS COME OUT OF ONE BOOT. `probeDither` and `accumOn` are
+// uniforms, so 3.11's arm and 3.12's arm run against the same voxelization, the
+// same converged cache and the same shader cache; a "before" measured on a
+// second boot would carry a different cache and a different contention.
+const GRAIN = process.env.GRAIN !== "0";
+const GRAIN_FRAMES = Number(process.env.GRAIN_FRAMES ?? 40);
+const grainRows = [];
+if (GRAIN) {
+  const armed = await page.evaluate(() => !!globalThis.__gi2GatherProbe?.passes?.reprojDump);
+  if (!armed) {
+    console.log("\n  ⚠ GRAIN SKIPPED — no `__gi2GatherProbe`. The receipt buffers are built only " +
+      "when `__gi2NoiseDump` is set before boot; run with FLAGS='{\"__gi2NoiseDump\":true}'.");
+  } else {
+    console.log(`\n── grain (reprojected sign flips, ${GRAIN_FRAMES} frames per arm) ─────────`);
+    const CFG = [
+      ["3.11 (dither 1, no accum)", { probeDither: 1, accumOn: 0 }],
+      ["3.12 (centres + accum)", { probeDither: 0, accumOn: 1 }],
+    ];
+    for (const arm of ARMS) {
+      for (const [name, cfg] of CFG) {
+        const label = `${arm} / ${name}`;
+        await page.evaluate(({ arm, label, cfg, frames, DOLLY_M }) => {
+          const R = globalThis.__gi2Motion;
+          const gu = globalThis.__gi2GatherProbe.uniforms;
+          for (const [k, v] of Object.entries(cfg)) if (gu[k]) gu[k].value = v;
+          const B = R.base;
+          const steps = [];
+          const rotY = (v, o, a) => {
+            const c = Math.cos(a), s = Math.sin(a);
+            const x = v[0] - o[0], z = v[2] - o[2];
+            return [o[0] + x * c - z * s, v[1], o[2] + x * s + z * c];
+          };
+          // ⚠ A SETTLE AT THE START POSE FIRST, and it is not padding: the
+          // accumulator's history and the probe map both carry the PREVIOUS
+          // arm's camera, and a receipt that started measuring on frame 1
+          // would score one arm's disocclusion as the next arm's grain.
+          for (let i = 0; i < 24; i++) steps.push({ seg: "grain-park", p: B.p, t: B.t });
+          for (let i = 0; i < frames; i++) {
+            const f = (i + 1) / frames;
+            if (arm === "orbit") steps.push({ seg: "grain", p: rotY(B.p, B.t, (Math.PI / 2) * f), t: B.t });
+            else if (arm === "dolly") {
+              const d = [B.t[0] - B.p[0], B.t[1] - B.p[1], B.t[2] - B.p[2]];
+              const len = Math.hypot(d[0], d[1], d[2]) || 1;
+              const u = d.map((v) => v / len);
+              const k = DOLLY_M * f;
+              steps.push({
+                seg: "grain",
+                p: [B.p[0] + u[0] * k, B.p[1] + u[1] * k, B.p[2] + u[2] * k],
+                t: [B.t[0] + u[0] * k, B.t[1] + u[1] * k, B.t[2] + u[2] * k],
+              });
+            } else steps.push({ seg: "grain", p: B.p, t: rotY(B.t, B.p, Math.PI * f) });
+          }
+          R.arm = label; R.seg = "grain-park";
+          R.plan = { steps }; R.planAt = 0; R.done = false;
+          // Armed AFTER the park segment is queued but counted from the first
+          // tick, so `want` covers the park too — the park's frames are still
+          // reduced (they are the instrument's own null) and the moving ones
+          // follow them in the same census.
+          R.grain = R.grainMk(steps.length, label);
+        }, { arm, label, cfg, frames: GRAIN_FRAMES, DOLLY_M });
+        const deadline = Date.now() + 180_000;
+        while (Date.now() < deadline) {
+          if (await page.evaluate(() => globalThis.__gi2Motion.done)) break;
+          await wait(200);
+        }
+        const row = await page.evaluate(async () => {
+          const R = globalThis.__gi2Motion;
+          await R.grain.chain;
+          return R.grainSummary();
+        });
+        row.arm = arm; row.cfg = name;
+        grainRows.push(row);
+        const f = (x, d = 2) => (x == null ? "—" : (100 * x).toFixed(d));
+        const p = (x, d = 1) => (x == null ? "—" : x.toFixed(d));
+        console.log(`  ${label.padEnd(34)} Δp50 ${f(row.p50).padStart(6)} %  Δp95 ${f(row.p95).padStart(7)} %  ` +
+          `flips ${p(row.flipPct).padStart(5)} % of ${String(row.steps).padStart(8)}  moved ${p(row.movedPct).padStart(5)} %  ` +
+          `reproj ${p(row.reprojPct).padStart(5)} %${row.err ? `  ⚠ ${row.err}` : ""}`);
+      }
+    }
+    // Leave the gather on what ships, so anything read after this is the
+    // shipped configuration and not the last arm's.
+    await page.evaluate(() => {
+      const gu = globalThis.__gi2GatherProbe.uniforms;
+      gu.probeDither.value = 0;
+      gu.accumOn.value = 1;
+    });
+  }
+}
 
 let profile = null;
 if (cdp) {

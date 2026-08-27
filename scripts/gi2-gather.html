@@ -169,9 +169,18 @@
         // §19 3.11: `contact=0` is HEAD — the window always wins in the first
         // two cells — and is the arm every blob ratio below is read against.
         if (params.has("contact")) gu.contactOn.value = Number(params.get("contact"));
+        // §19 STAGE 3.12 — the two new levers, same discipline: a candidate has
+        // to be able to run the WHOLE page, so they are page-wide parameters
+        // and not something only the grain table can set.
+        if (params.has("nee")) gu.panelNee.value = Number(params.get("nee"));
+        if (params.has("accum")) gu.accumOn.value = Number(params.get("accum"));
+        if (params.has("accumAlpha")) gu.accumAlpha.value = Number(params.get("accumAlpha"));
         say(`3.11a config: probeDither ${gu.probeDither.value}, anchorStick ${gu.anchorStick.value}, ` +
           `octAlpha ${gu.octAlpha.value}, ditherWorld ${gu.ditherWorld.value}, ` +
           `contactOn ${gu.contactOn.value}`);
+        say(`3.12 config: panelNee ${gu.panelNee.value} (probe-level NEE for the panel), ` +
+          `accumOn ${gu.accumOn.value} α ${gu.accumAlpha.value}, ` +
+          `panelDirect kernel ${gather.passes.panelDirect ? "built" : "absent"}`);
         gu.sunDir.value.set(...SUN_DIR);
         gu.sunColor.value.set(...SUN_COLOR);
         gu.skyColor.value.set(...SKY_COLOR);
@@ -309,10 +318,20 @@
           await compute(gather.passes.probeTrace);
           await compute(gather.passes.probeFilter);
           await compute(SH3 ? gather.passes.probeShFilter3 : gather.passes.probeShFilter);
+          // §19 STAGE 3.12 — the panel's direct light at the probe, by NEE, in
+          // the slot `gi2System` splices the engine's `emitterDirectPass` into:
+          // after the SH bilateral, before the first kernel that reads it.
+          if (gather.passes.panelDirect) await compute(gather.passes.panelDirect);
           await compute(gather.passes.resolveHalf);
           await compute(gather.passes.resolveUpsample);
           await compute(gather.passes.composite);
           if (opts.inject !== false) await compute(gather.passes.inject);
+          // §19 STAGE 3.12 — LAST, and unconditional. The accumulator's history
+          // is the frame the scene was lit by; skipping it on any frame the
+          // page runs would leave the NEXT frame blending against a stale one,
+          // and the at-rest receipt (which must read EXACTLY zero) would report
+          // motion that never happened.
+          await compute(gather.passes.imageHistory);
           prevVp.copy(vp);
         };
 
@@ -1573,8 +1592,27 @@
                 // and it separates "slow" from "stuck" without a threshold.
                 const at = (i) => (i - 1 < series.length
                   ? +(sgn * (series[i - 1][k] - before[k]) / d).toFixed(3) : null);
+                // ⭐⭐ §19 STAGE 3.12 — THE CURVE'S OWN SIGN CENSUS.
+                //
+                // "Light arrives gradually" is a claim about the SHAPE of this
+                // curve, not about when it gets there: an estimator that
+                // overshoots and comes back, or that ping-pongs on its way up,
+                // is exactly the grain the user is complaining about wearing a
+                // slower clock. A monotone approach has ONE sign in every
+                // frame-to-frame delta. Deltas below a thousandth of the total
+                // change are counted as flat, because a converged tail is
+                // arithmetic noise in the crop mean and not a direction.
+                const eps = 1e-3 * d;
+                let up = 0; let down = 0; let flat = 0;
+                for (let i = 1; i < series.length; i++) {
+                  const dd = (series[i][k] - series[i - 1][k]) * sgn;
+                  if (Math.abs(dd) <= eps) flat++;
+                  else if (dd > 0) up++;
+                  else down++;
+                }
                 return {
                   crop: k, before: +before[k].toFixed(3), after: +after[k].toFixed(3),
+                  signs: { toward: up, away: down, flat },
                   frame: f90 < 0 ? null : f90 + 1, lock: lock < 0 ? null : lock + 1,
                   done: { 10: at(10), 30: at(30), 60: at(60), 120: at(120), 200: at(200) },
                   trace: [0, 1, 2, 4, 9, 19, 39, 79, 149, 199].filter((i) => i < series.length)
@@ -1603,7 +1641,13 @@
                 say(`    ${f.crop.padEnd(12)} ${f.before} → [${f.trace.join(" ")}] → ${f.after}  ` +
                   `(frames 1 2 3 5 10 20 40 80 150 200)`);
               }
-              return { label, before, after, frames, worstFrame, worstLock, done };
+              // §19 3.12: MONOTONE or not, per crop, in the curve's own steps.
+              const away = frames.reduce((a, f) => a + f.signs.away, 0);
+              const toward = frames.reduce((a, f) => a + f.signs.toward, 0);
+              say(`  PANEL MOVES 2 m [${label}] MONOTONE? frame-to-frame delta signs — ` +
+                frames.map((f) => `${f.crop} ${f.signs.toward}↑/${f.signs.away}↓/${f.signs.flat}·`).join(", ") +
+                ` | total ${toward} toward, ${away} away`);
+              return { label, before, after, frames, worstFrame, worstLock, done, toward, away };
             };
             // ⭐⭐ AND THE BASELINE ARM IS HERE TO SHOW THAT ITS SPEED WAS AN
             // ILLUSION. Stage 3.5's estimator "reaches 90 % of the change in
@@ -1844,36 +1888,46 @@
               ditherWorld: gu.ditherWorld.value, probeDither: gu.probeDither.value, hzbOn: 1,
               octAlpha: gu.octAlpha.value, anchorJitter: 0, shadeProb: gd.shadeProb,
               anchorStick: gu.anchorStick.value,
+              // §19 3.12's two levers join the base so an arm can turn either
+              // one off and nothing else moves with it.
+              panelNee: gu.panelNee.value, accumOn: gu.accumOn.value,
             };
             const setG = (over) => {
               for (const [k, v] of Object.entries({ ...GSHIP, ...over })) gu[k].value = v;
             };
-            const P310 = { anchorStick: 0, ditherWorld: 0, probeDither: 1 };
+            // ⭐⭐ §19 STAGE 3.12 — AND THIS LADDER IS **CUMULATIVE**, WHICH THE
+            // 3.11a ONE DELIBERATELY WAS NOT.
+            //
+            // 3.11a was an OWNERSHIP question ("which of these five levers owns
+            // the flips") and a cumulative ladder cannot answer that. 3.12 is a
+            // BUILD: three changes that only make sense together — texel centres
+            // are wrong without NEE (the panel crops leave the bracket), and NEE
+            // is only worth its shadow rays because it lets the centres ship — so
+            // what has to be shown is each step's contribution ON TOP of the one
+            // before it, plus the base and the control at both ends.
+            //
+            // The 3.11a arms are retired here rather than kept: their table is in
+            // the 3.11 commit, and thirteen arms × 60 frames × two poses is
+            // twenty minutes of a GPU this machine shares with another agent.
+            const P311 = { probeDither: 1, panelNee: 0, accumOn: 0 };
             const ARMS = [
-              { name: "3.10", over: { ...P310 } },
-              { name: "sticky", over: {} },
-              // ⭐ THE PAIRING. A world-keyed lattice was refuted ALONE because
-              // the anchor it is keyed to was walking; with the anchor stuck,
-              // position and offset become constant TOGETHER and change on one
-              // event instead of two independent ones.
-              { name: "sticky + world latt", over: { ditherWorld: 1 } },
-              { name: "sticky + centres", over: { probeDither: 0 } },
-              { name: "sticky + alpha .25", over: { octAlpha: 0.25 } },
-              { name: "sticky+world+a.25", over: { ditherWorld: 1, octAlpha: 0.25 } },
-              { name: "sticky+centres+a.25", over: { probeDither: 0, octAlpha: 0.25 } },
-              { name: "3.10 centres", over: { ...P310, probeDither: 0 } },
-              { name: "3.10 alpha .25", over: { ...P310, octAlpha: 0.25 } },
-              { name: "3.10 octAlpha 1", over: { ...P310, octAlpha: 1 } },
-              { name: "3.10 no screen", over: { ...P310, hzbOn: 0 } },
-              { name: "3.10 world latt", over: { ...P310, ditherWorld: 1 } },
-              // ⭐ THE POSITIVE CONTROL. §L.1's per-frame anchor jitter is a
-              // KNOWN noise source that §19 3.6 removed; if this arm does not
-              // read worse than the base the instrument is blind and every
-              // null above it is worthless.
-              { name: "anchor jitter (ctrl)", over: { ...P310, anchorJitter: 1 } },
+              { name: "3.11 ship", over: { ...P311 } },
+              { name: "+ texel centres", over: { ...P311, probeDither: 0 } },
+              { name: "+ panel NEE", over: { ...P311, probeDither: 0, panelNee: 1 } },
+              { name: "+ image accum (3.12)", over: {} },
+              // ⚠ THE CONTROL TWICE, AND THE SECOND ONE IS THE POINT. §L.1's
+              // per-frame anchor jitter is a KNOWN noise source. Run with the
+              // accumulator OFF it says the instrument can still see noise; run
+              // with it ON it says whether the accumulator is a DENOISER. A
+              // smooth blend of a deterministic input must NOT be able to hide
+              // true noise — if the jittered arm's flip rate collapses with the
+              // filter on, the filter is doing something §T does not allow and
+              // the report has to say so.
+              { name: "anchor jitter (ctrl)", over: { ...P311, anchorJitter: 1 } },
+              { name: "anchor jitter + accum", over: { anchorJitter: 1 } },
             ];
             say("");
-            say(`§19 STAGE 3.11a — GRAIN UNDER MOTION (${GR_FRAMES} frames of the 45° orbit, ` +
+            say(`§19 STAGE 3.12 — GRAIN UNDER MOTION (${GR_FRAMES} frames of the 45° orbit, ` +
               `each pixel against its own reprojected previous value)`);
             const grain = [];
             for (const a of ARMS) {
@@ -2325,8 +2379,17 @@
             ["probeFilter", gather.passes.probeFilter],
             ["probeShFilter", gather.passes.probeShFilter],
             ["probeShFilter3", gather.passes.probeShFilter3],
+            // §19 3.12 — the two new kernels, in chain order. `panelDirect` is
+            // the rig's NEE; `imageHistory` is the accumulator's copy-back. The
+            // accumulation itself has NO kernel of its own — it lives inside
+            // `resolveUpsample`, so the accumulator's true cost is
+            // `resolveUpsample(accum 1) − resolveUpsample(accum 0)` plus
+            // `imageHistory`, which is why the arm below exists.
+            ...(gather.passes.panelDirect ? [["panelDirect", gather.passes.panelDirect]] : []),
             ["resolveHalf", gather.passes.resolveHalf],
             ["resolveUpsample", gather.passes.resolveUpsample],
+            ["resolveUpsampleNoAcc", gather.passes.resolveUpsample, { accumOn: 0 }],
+            ["imageHistory", gather.passes.imageHistory],
             ["resolveFull", gather.passes.resolve],
             ["resolveOct", gather.passes.resolveOct],
             ["resolveShRaw", gather.passes.resolveShRaw],
@@ -2369,7 +2432,11 @@
           }
           results.kernels = audit;
           const ARMS = ["cacheAlloc", "windowFill", "resolveOct", "resolveFull",
-            "resolveShRaw", "probeTraceNoHzb", "probePlaceNoCarry", "probeShFilter3"];
+            "resolveShRaw", "probeTraceNoHzb", "probePlaceNoCarry", "probeShFilter3",
+            // §19 3.12: the accumulator's OFF arm is a measurement, not a
+            // kernel the chain runs — summing it would price `resolveUpsample`
+            // twice and hand the budget a number no frame ever pays.
+            "resolveUpsampleNoAcc"];
           results.gatherMs = audit.filter((k) => !ARMS.includes(k.name))
             .reduce((s, k) => s + (k.ms ?? 0), 0);
           // ⭐ STAGE 3.3'S BUDGET EXCLUDES `composite`. It is the harness's
