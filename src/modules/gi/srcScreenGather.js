@@ -512,7 +512,13 @@ export function createSrcScreenGather(store, tiles, {
   target.version = (globalThis.__giSrcTargetVersion = (globalThis.__giSrcTargetVersion ?? 0) + 1);
 
   const stats = instancedArray(new Uint32Array(GG_WORDS), "uint").toAtomic();
-  const widthU = width;
+  // §19 0.5b: a UNIFORM, not the JS number it was — `uint(widthU)` baked the
+  // gather grid's width into the WGSL, so the pixel reconstruction was new
+  // source at every viewport size. Same reasoning as giScreen's
+  // `screenSizeUniforms`; the height never appears in this kernel, only in
+  // the dispatch count, which `ComputeNode.count` already carries as a
+  // uniform of its own.
+  const widthU = uniform(width, "uint");
 
   const reset = Fn(() => {
     for (let w = 0; w < GG_WORDS; w++) {
@@ -522,7 +528,7 @@ export function createSrcScreenGather(store, tiles, {
 
   const compute = Fn(() => {
     const i = instanceIndex.toVar();
-    const coord = ivec2(i.mod(uint(widthU)).toInt(), i.div(uint(widthU)).toInt());
+    const coord = ivec2(i.mod(widthU).toInt(), i.div(widthU).toInt());
     const E = vec3(0).toVar();
     // Validity rides the ALPHA: 1 where the gather found coverage, 0 where it
     // found nothing (no probes, no known bins — the resolve and the temporal
@@ -579,6 +585,19 @@ export function createSrcScreenGather(store, tiles, {
     node: texture(target),
     width,
     height,
+    /**
+     * §19 0.5b — a resize as a uniform write. NOTE the srcProbes system as a
+     * whole still re-mints on resize (its per-pixel BUFFERS change length),
+     * so this exists so the re-minted node's WGSL is the SAME TEXT as the
+     * retired one's: three's node cache and the driver's pipeline cache both
+     * hit, and the resize stops paying a compile for this kernel.
+     */
+    setSize(w, h) {
+      widthU.value = w;
+      target.setSize(w, h);
+      compute.count = w * h;
+      return true;
+    },
 
     async readStats(renderer) {
       const allocated = !!renderer?.backend?.get?.(stats.value)?.buffer;
@@ -682,11 +701,12 @@ export function createSrcGlossyGather(gatherAt, { readPixel, width, height, came
   const hist = mkTex("giSrcGlossyHist", THREE.HalfFloatType);
   const histPos = mkTex("giSrcGlossyHistPos", THREE.FloatType);
   const capU = uniform(cap);
-  const widthU = width;
+  // §19 0.5b — see the note on the diffuse gather's `widthU` above.
+  const widthU = uniform(width, "uint");
 
   const compute = Fn(() => {
     const i = instanceIndex.toVar();
-    const coord = ivec2(i.mod(uint(widthU)).toInt(), i.div(uint(widthU)).toInt());
+    const coord = ivec2(i.mod(widthU).toInt(), i.div(widthU).toInt());
     const E = vec3(0).toVar();
     const px = readPixel(i);
     If(px.valid, () => {
@@ -717,6 +737,13 @@ export function createSrcGlossyGather(gatherAt, { readPixel, width, height, came
     cap: capU,
     width,
     height,
+    /** §19 0.5b — see the diffuse gather's `setSize`. */
+    setSize(w, h) {
+      widthU.value = w;
+      for (const t of [target, raw, hist, histPos]) t.setSize(w, h);
+      compute.count = w * h;
+      return true;
+    },
     dispose() {
       target.dispose?.();
       raw.dispose?.();

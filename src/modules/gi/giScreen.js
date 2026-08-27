@@ -71,6 +71,78 @@ import { ALBEDO_ATLAS_GRID, ALBEDO_ATLAS_SIZE, ALBEDO_ATLAS_TILE } from "./bvh/b
 import { sampleReflectionProbes } from "./reflectionProbes.js";
 
 /**
+ * ── ⭐⭐ §19 STAGE 0.5b — THE SCREEN-SIZE UNIFORM BLOCK ────────────────────
+ *
+ * Every screen kernel in this file used to bake `height` and everything
+ * derived from it (`.div(height)`, `height - 1`, `aoHeight / height`,
+ * `resolveHeight / height`, `height * capFrac`) into its WGSL as a decimal
+ * LITERAL, while `width` already rode a uniform. Stage 0.3 measured the
+ * consequence and could only defer it: a new viewport size is genuinely NEW
+ * SOURCE for ~25 pipelines, so a window drag, a DRS step or a governor rung
+ * change is a compile wave wearing a different name — eight
+ * `resolve-resize (giCostScale …)` entries in three minutes on the user's
+ * Bistro, 82 orphaned compute nodes apiece.
+ *
+ * Built ONCE per pass and OUTSIDE the `Fn`, so the value is unmistakably
+ * per-BUILD and the kernel's text is the same string at every resolution.
+ * `setSize` then makes a resize what it should always have been: a handful
+ * of uniform writes plus `compute.count`.
+ *
+ * `count` IS the supported path, not a poke at a private field.
+ * `WebGPUBackend.compute` dispatches `computeNode.dispatchSize ||
+ * computeNode.count` and re-derives the workgroup split whenever the number
+ * differs from the one it cached; the in-shader bounds guard is emitted from
+ * `ComputeNode.countNode`, which the node itself creates as
+ * `uniform(this.count,"uint").onObjectUpdate(() => this.count)`. So the
+ * guard is ALREADY a uniform read that follows the write for free, and the
+ * guard's own WGSL is size-independent for the same reason.
+ *
+ * ⚠ DIVISORS STAY DIVISIONS. `x.div(widthF)`, never `x.mul(invWidth)`: the
+ * reciprocal is a different float and these numbers address TEXELS, where a
+ * one-ULP shift is a different `floor()` at a boundary. A resolution-
+ * stability refactor must not smuggle in a numerical change — the whole
+ * point is that the image is unchanged and only the TEXT stops moving.
+ *
+ * ⚠ f32 AND u32 BOTH, deliberately. A dimension used as a count or a
+ * comparison keeps its `uint`; a dimension used as a scale keeps its
+ * `float`. Converting between them in-shader would change the WGSL shape
+ * versus the literal it replaces, for nothing.
+ *
+ * An unused entry costs nothing: a `uniform()` no built node references is
+ * never emitted into the shader and never allocated a slot.
+ */
+function screenSizeUniforms(width, height, resolveWidth = width, resolveHeight = height) {
+  const u = {
+    width, height, resolveWidth, resolveHeight,
+    widthU: uniform(width, "uint"),
+    heightU: uniform(height, "uint"),
+    widthF: uniform(width),
+    heightF: uniform(height),
+    maxX: uniform(width - 1, "int"),
+    maxY: uniform(height - 1, "int"),
+    resolveWidthF: uniform(resolveWidth),
+    resolveHeightF: uniform(resolveHeight),
+    resolveMaxX: uniform(resolveWidth - 1, "int"),
+    resolveMaxY: uniform(resolveHeight - 1, "int"),
+    // The gbuffer scale. Every pass that runs below the resolve maps its own
+    // pixel to a gbuffer texel through this pair, and it moves with EITHER
+    // size — which is exactly why it could never be a literal.
+    sxU: uniform(resolveWidth / width),
+    syU: uniform(resolveHeight / height),
+    set(w, h, rw = w, rh = h) {
+      u.width = w; u.height = h; u.resolveWidth = rw; u.resolveHeight = rh;
+      u.widthU.value = w; u.heightU.value = h;
+      u.widthF.value = w; u.heightF.value = h;
+      u.maxX.value = w - 1; u.maxY.value = h - 1;
+      u.resolveWidthF.value = rw; u.resolveHeightF.value = rh;
+      u.resolveMaxX.value = rw - 1; u.resolveMaxY.value = rh - 1;
+      u.sxU.value = rw / w; u.syU.value = rh / h;
+    },
+  };
+  return u;
+}
+
+/**
  * Gbuffer for the GI resolve: world position (+ valid mask) and world normal,
  * rendered with a single override material so the prepass costs exactly ONE
  * pipeline no matter how many materials the scene has.
@@ -417,7 +489,11 @@ export function createGiFarFieldAvgPass({ source, width, height, out }) {
   const FX = 256;
   const accum = instancedArray(new Uint32Array(4), "uint").toAtomic();
   const ema = instancedArray(new Float32Array(4), "float");
-  const widthU = uint(width);
+  // §19 0.5b: `uint(width)` baked the gather size into the WGSL — and this
+  // pass is re-minted on every resize anyway (its SOURCE texture is replaced),
+  // so the literal bought nothing and cost a driver compile each time.
+  const dims = screenSizeUniforms(width, height);
+  const widthU = dims.widthU;
   const computeAccum = Fn(() => {
     const i = instanceIndex;
     const coord = ivec2(i.mod(widthU).toInt(), i.div(widthU).toInt());
@@ -465,7 +541,17 @@ export function createGiFarFieldAvgPass({ source, width, height, out }) {
     atomicStore(accum.element(uint(2)), uint(0));
     atomicStore(accum.element(uint(3)), uint(0));
   })().compute(1);
-  return { computeAccum, computeEma };
+  return {
+    computeAccum,
+    computeEma,
+    dims,
+    /** §19 0.5b — see screenSizeUniforms. The EMA pass is one thread, always. */
+    setSize(w, h) {
+      dims.set(w, h);
+      computeAccum.count = w * h;
+      return true;
+    },
+  };
 }
 
 /**
@@ -497,7 +583,33 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
   // Size lives in a uniform so a viewport resize is a uniform write, not a
   // shader rebuild (the WGSL stays byte-identical → three's node cache and
   // the driver's pipeline cache both hit).
-  const widthU = uniform(width, "uint");
+  //
+  // §19 0.5b: that claim was HALF TRUE until now — `width` rode the uniform
+  // and `height` was a literal in four places (`.div(height)` ×3, the AO
+  // upsample's ratios), so the sentence above described an intent the file
+  // did not keep. It keeps it now; see screenSizeUniforms.
+  const dims = screenSizeUniforms(width, height);
+  const widthU = dims.widthU;
+  // The AO texture's own size, and the two RATIOS the upsample maps by. The
+  // AO pass runs at half res, so these are ~0.5 at every sane resolution —
+  // but `ceil(width/2)/width` is 0.5004… at an odd width, which is a
+  // different literal and therefore a different kernel.
+  const aoWidth = ao?.width ?? width;
+  const aoHeight = ao?.height ?? height;
+  const aoMaxX = uniform(aoWidth - 1, "int");
+  const aoMaxY = uniform(aoHeight - 1, "int");
+  const aoToLowX = uniform(aoWidth / width);
+  const aoToLowY = uniform(aoHeight / height);
+  const aoToFullX = uniform(width / aoWidth);
+  const aoToFullY = uniform(height / aoHeight);
+  // The tile-cut bundle's `scaleX/scaleY` are `emitterW / width` — the ONE
+  // pair of numbers this kernel takes from the CALLER that moves with the
+  // window. `tilesX`/`tilesY`/`tileSize` stay baked on purpose: they index a
+  // storage buffer whose LENGTH is the tile count, so a tile-grid change is a
+  // re-mint (createGiEmitterTileCutPass's own setSize reports it).
+  const tileScaleU = emitterTileCut
+    ? uniform(new THREE.Vector2(emitterTileCut.scaleX ?? 1, emitterTileCut.scaleY ?? 1))
+    : null;
 
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
@@ -563,7 +675,7 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       // scale — a texture the same size as the resolve samples its own texel
       // centres and returns exactly what `load` did.
       if (screenGather) {
-        const guv = vec2(px.toFloat().add(0.5).div(width), py.toFloat().add(0.5).div(height));
+        const guv = vec2(px.toFloat().add(0.5).div(dims.widthF), py.toFloat().add(0.5).div(dims.heightF));
         const gs = screenGather.sample(guv).level(0).toVar();
         out.addAssign(gs.xyz.mul(intensity));
         // The gather's alpha is VALIDITY (srcScreenGather: 1 = coverage
@@ -584,8 +696,10 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       // compiles out when the component's `ao` prop is off, and is gated on
       // having a diffuse term at all — with none, `out` is zero here.
       if ((gather || screenGather) && ao?.node) {
-        const aoWidth = ao.width ?? width;
-        const aoHeight = ao.height ?? height;
+        // §19 0.5b: the 1:1 branch is a decision about the AO pass's SCALE,
+        // not about this frame's pixel count — GTAO is half-res at every
+        // resolution — so it stays a JS branch and does not re-shape the
+        // kernel on a resize. The numbers inside it are what moved.
         if (aoWidth === width && aoHeight === height) {
           out.mulAssign(ao.node.load(coord).x);
         } else {
@@ -596,8 +710,8 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
           // the already-bound gbuffer to weight the four low-res taps by
           // whether they belong to THIS surface. Texture reads only — no new
           // storage buffer, so the portable eight-buffer budget is unchanged.
-          const lowX = px.toFloat().add(0.5).mul(aoWidth / width).sub(0.5).toVar();
-          const lowY = py.toFloat().add(0.5).mul(aoHeight / height).sub(0.5).toVar();
+          const lowX = px.toFloat().add(0.5).mul(aoToLowX).sub(0.5).toVar();
+          const lowY = py.toFloat().add(0.5).mul(aoToLowY).sub(0.5).toVar();
           const baseX = lowX.floor().toVar();
           const baseY = lowY.floor().toVar();
           // THE BILINEAR FRACTIONS ARE NOT OPTIONAL. Weighting the 2x2 by the
@@ -612,11 +726,11 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
           const weight = float(0).toVar();
           const addAoTap = (dx, dy) => {
             const bilinear = (dx === 0 ? fx.oneMinus() : fx).mul(dy === 0 ? fy.oneMinus() : fy);
-            const lx = baseX.add(dx).toInt().clamp(0, aoWidth - 1).toVar();
-            const ly = baseY.add(dy).toInt().clamp(0, aoHeight - 1).toVar();
+            const lx = baseX.add(dx).toInt().clamp(int(0), aoMaxX).toVar();
+            const ly = baseY.add(dy).toInt().clamp(int(0), aoMaxY).toVar();
             // Must match createGiGtaoPass's low-pixel → gbuffer mapping.
-            const gx = lx.toFloat().add(0.5).mul(width / aoWidth).toInt().clamp(0, width - 1);
-            const gy = ly.toFloat().add(0.5).mul(height / aoHeight).toInt().clamp(0, height - 1);
+            const gx = lx.toFloat().add(0.5).mul(aoToFullX).toInt().clamp(int(0), dims.maxX);
+            const gy = ly.toFloat().add(0.5).mul(aoToFullY).toInt().clamp(int(0), dims.maxY);
             const tapP = positionNode.load(ivec2(gx, gy)).toVar();
             const tapN = normalNode.load(ivec2(gx, gy)).xyz.normalize().toVar();
             const sameNormal = smoothstep(0.7, 0.95, tapN.dot(N).abs());
@@ -683,7 +797,7 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       // radiance target pre-multiplied by intensity — the same convention as
       // the closure path, so giLight's specular blend is unchanged.
       if (screenRadiance) {
-        const ruv = vec2(px.toFloat().add(0.5).div(width), py.toFloat().add(0.5).div(height));
+        const ruv = vec2(px.toFloat().add(0.5).div(dims.widthF), py.toFloat().add(0.5).div(dims.heightF));
         reflectedOut.assign(screenRadiance.sample(ruv).level(0).xyz.mul(intensity));
       } else if (radiance?.lookup && cameraPosition) {
         const incident = P.sub(cameraPosition).normalize().toVar();
@@ -698,7 +812,7 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
         // here and its pixel count deserves its own budget.
         const packedShadow = texture(
           targets.emitterShadow,
-          vec2(px.toFloat().add(0.5).div(width), py.toFloat().add(0.5).div(height)),
+          vec2(px.toFloat().add(0.5).div(dims.widthF), py.toFloat().add(0.5).div(dims.heightF)),
         ).level(0).toVar();
         const shadowChannels = [packedShadow.x, packedShadow.y, packedShadow.z, packedShadow.w];
         // §12.70 W4b slice (ii): under the tile cut, the evaluated slots are
@@ -712,8 +826,8 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
         let slotSource = emitter;
         let tileComp = null;
         if (emitterTileCut) {
-          const spx = px.toFloat().add(0.5).mul(emitterTileCut.scaleX);
-          const spy = py.toFloat().add(0.5).mul(emitterTileCut.scaleY);
+          const spx = px.toFloat().add(0.5).mul(tileScaleU.x);
+          const spy = py.toFloat().add(0.5).mul(tileScaleU.y);
           const tile = spy.div(emitterTileCut.tileSize).toUint().min(uint(emitterTileCut.tilesY - 1))
             .mul(uint(emitterTileCut.tilesX))
             .add(spx.div(emitterTileCut.tileSize).toUint().min(uint(emitterTileCut.tilesX - 1)))
@@ -770,7 +884,37 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
     textureStore(radianceTarget, coord, vec4(reflectedOut, 1));
   })().compute(width * height);
 
-  return { compute, widthU };
+  return {
+    compute,
+    widthU,
+    dims,
+    /**
+     * §19 0.5b — a resize of the resolve. The AO grid moves WITH it (GTAO is
+     * sized from the resolve), so its dims are part of this call rather than
+     * a second thing to remember: the four ratios above are the mapping
+     * between the two grids, and going stale in either direction reads as AO
+     * sampled from the wrong texels.
+     *
+     * ⚠ The TARGETS this pass stores into are caller-owned. Resize them
+     * through `createGiTargets`'s own `setSize` — which keeps the texture
+     * OBJECTS — never by replacing them, or the bindings this compute node
+     * already holds point at dead textures.
+     */
+    setSize(w, h, aoW = null, aoH = null, tileScale = null) {
+      dims.set(w, h);
+      const naoW = aoW ?? w;
+      const naoH = aoH ?? h;
+      aoMaxX.value = naoW - 1;
+      aoMaxY.value = naoH - 1;
+      aoToLowX.value = naoW / w;
+      aoToLowY.value = naoH / h;
+      aoToFullX.value = w / naoW;
+      aoToFullY.value = h / naoH;
+      if (tileScaleU && tileScale) tileScaleU.value.set(tileScale.scaleX, tileScale.scaleY);
+      compute.count = w * h;
+      return true;
+    },
+  };
 }
 
 /**
@@ -829,7 +973,8 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
  * become a silent 4-multiply tax on every reflected pixel.
  */
 export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveWidth = width, resolveHeight = height, gather = null, cameraPosition = null, normalOffset, intensity, emitter = null, rawCopy = null, probes = null, sourceStride = 1, termMask = null, staticOcclude = null, dynOcclude = null, shadowReach = null }) {
-  const widthU = uniform(width, "uint");
+  const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
+  const widthU = dims.widthU;
   // ── §19 D3: THIS KERNEL'S WORLD NUMBERS ARE UNIFORMS, NOT WGSL LITERALS ───
   //
   // Built HERE, outside the `Fn`, so the value is unmistakably per-BUILD (one
@@ -884,6 +1029,13 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
   // material's bilinear upsample never sees it. Ultra (stride 1) is
   // unaffected by construction, which is why the artifact only ever showed at
   // high and below.
+  // §19 0.5b: the two ratios are UNIFORMS; the JS copies below survive only
+  // to answer "is this an identity mapping at all", which is a decision about
+  // the SHADE GRID's divisor (radianceDiv, `__giHitShadeFull`) and not about
+  // this frame's pixel count. `Math.round(width / 3)` makes the true ratio
+  // 2.997… at one size and 3.006… at the next, so as literals these two were
+  // the single largest reason a resize re-compiled the most expensive kernel
+  // in the file.
   const sx = resolveWidth / width;
   const sy = resolveHeight / height;
   const stride = Math.max(1, Math.round(sourceStride) || 1);
@@ -893,7 +1045,7 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
   // leave the bug it exists to prevent looking fixed.
   const snap = (v) => (stride > 1 ? int(v).div(int(stride)).mul(int(stride)) : int(v));
   const gAt = (sx !== 1 || sy !== 1 || stride > 1)
-    ? (c) => ivec2(snap(c.x.toFloat().mul(sx)), snap(c.y.toFloat().mul(sy)))
+    ? (c) => ivec2(snap(c.x.toFloat().mul(dims.sxU)), snap(c.y.toFloat().mul(dims.syU)))
     : (c) => c;
 
   const compute = Fn(() => {
@@ -1178,7 +1330,27 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
     if (rawCopy) textureStore(rawCopy, coord, vec4(bvhOut, bvhValid));
   })().compute(width * height);
 
-  return { compute, widthU };
+  return {
+    compute,
+    widthU,
+    dims,
+    /**
+     * §19 0.5b. `w`/`h` are the SHADE grid (bvhRadiance), `rw`/`rh` the
+     * resolve grid the gbuffer and the prepass targets live on. Both move on
+     * a viewport resize and the ratio between them is what this kernel reads,
+     * so both belong in one call.
+     *
+     * ⚠ NOT sufficient on its own when the shade grid's DIVISOR changes
+     * (`radianceDiv`, `__giHitShadeFull`) — that flips the `gAt` identity
+     * branch, which is graph shape, not a uniform. GISystem does not change
+     * the divisor on a resize; a future tier that does must re-mint.
+     */
+    setSize(w, h, rw = w, rh = h) {
+      dims.set(w, h, rw, rh);
+      compute.count = w * h;
+      return true;
+    },
+  };
 }
 
 /**
@@ -1218,7 +1390,8 @@ export function createGiGtaoPass({
     target.magFilter = THREE.LinearFilter;
   }
 
-  const widthU = uniform(width, "uint");
+  const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
+  const widthU = dims.widthU;
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
   const sx = resolveWidth / width;
@@ -1268,6 +1441,10 @@ export function createGiGtaoPass({
    */
   const MAX_REACH = 0.25;
   const maxPix = Math.max(4, Math.round(resolveHeight * MAX_REACH));
+  // §19 0.5b: both ends of the reach clamp are resolve-derived, so both are
+  // uniforms. They are the ONLY numbers in this kernel that move with the
+  // window — everything else here is a slice/step count or a world radius.
+  const maxPixU = uniform(maxPix);
   /**
    * ⭐⭐ THE MINIMUM STEP, IN GBUFFER TEXELS — the single number that decides
    * whether this estimator is correct or 45% too dark, measured.
@@ -1290,6 +1467,9 @@ export function createGiGtaoPass({
    * entirely swallowed by it.
    */
   const MIN_STEP = Math.max(Math.SQRT2, sx, sy);
+  // The PRODUCT is what the clamp reads (`STEPS * MIN_STEP`), and MIN_STEP is
+  // sx/sy-derived, so the product moves with the resolve grid.
+  const minReachU = uniform(STEPS * MIN_STEP);
   /**
    * `__giGtaoDebug = true` fills the target's unused y/z/w with the three
    * numbers that separate "the integral is wrong" from "the horizons are
@@ -1308,11 +1488,11 @@ export function createGiGtaoPass({
     // deliberately, and it is a large part of why GTAO is cheap here: the
     // horizon march reads full-resolution positions (so contacts stay sharp)
     // while only a quarter of the pixels pay for a march at all.
-    const baseX = px.toFloat().add(0.5).mul(sx).toVar();
-    const baseY = py.toFloat().add(0.5).mul(sy).toVar();
+    const baseX = px.toFloat().add(0.5).mul(dims.sxU).toVar();
+    const baseY = py.toFloat().add(0.5).mul(dims.syU).toVar();
     const sourceCoord = ivec2(
-      baseX.toInt().clamp(0, resolveWidth - 1),
-      baseY.toInt().clamp(0, resolveHeight - 1),
+      baseX.toInt().clamp(int(0), dims.resolveMaxX),
+      baseY.toInt().clamp(int(0), dims.resolveMaxY),
     ).toVar();
     const g0 = positionNode.load(sourceCoord).toVar();
     const nRaw = normalNode.load(sourceCoord).xyz.toVar();
@@ -1355,7 +1535,7 @@ export function createGiGtaoPass({
       // pressed against a wall (and a metre of AO covering a sixth of the
       // screen is not a look anyone asked for).
       const rPix = R.mul(float(projScale)).div(viewZ)
-        .clamp(float(STEPS * MIN_STEP), float(maxPix)).toVar();
+        .clamp(minReachU, maxPixU).toVar();
 
       if (DEBUG) dbgReach.assign(rPix);
 
@@ -1441,8 +1621,8 @@ export function createGiGtaoPass({
           // integral inside out (a uniformly bright frame — worth naming,
           // because it looks like "AO is off" rather than like a sign error).
           const tap = (dir) => {
-            const cx = baseX.add(omega.x.mul(offPix).mul(dir)).toInt().clamp(0, resolveWidth - 1);
-            const cy = baseY.add(omega.y.mul(offPix).mul(dir)).toInt().clamp(0, resolveHeight - 1);
+            const cx = baseX.add(omega.x.mul(offPix).mul(dir)).toInt().clamp(int(0), dims.resolveMaxX);
+            const cy = baseY.add(omega.y.mul(offPix).mul(dir)).toInt().clamp(int(0), dims.resolveMaxY);
             return positionNode.load(ivec2(cx, cy)).toVar();
           };
           const raise = (tp, horizon, low) => {
@@ -1512,7 +1692,35 @@ export function createGiGtaoPass({
   })().compute(width * height);
 
   compute.__giPassName = "gtao";
-  return { compute, target, node: texture(target), widthU, width, height, slices: SLICES, steps: STEPS };
+  const node = texture(target);
+  const pass = {
+    compute, target, node, widthU, dims,
+    width, height, slices: SLICES, steps: STEPS,
+    /**
+     * §19 0.5b. `THREE.StorageTexture.setSize` keeps the JS OBJECT and only
+     * drops the GPU texture (it calls `dispose()`, which the backend answers
+     * by re-creating at the new dimensions on next use) — so `node` above,
+     * and every binding built from it, survives. Replacing the texture
+     * instead is the "Destroyed texture used in a submit" class this module
+     * documents at four other sites.
+     *
+     * `maxPix` and the minimum step are the reach clamp's two ends and both
+     * are resolve-derived. The RESOLVE's AO-upsample ratios follow from
+     * `w`/`h` here, so a caller that resizes this pass must pass the same
+     * pair on to `resolve.setSize`.
+     */
+    setSize(w, h, rw = w, rh = h) {
+      dims.set(w, h, rw, rh);
+      pass.width = w;
+      pass.height = h;
+      maxPixU.value = Math.max(4, Math.round(rh * MAX_REACH));
+      minReachU.value = STEPS * Math.max(Math.SQRT2, rw / w, rh / h);
+      target.setSize(w, h);
+      compute.count = w * h;
+      return true;
+    },
+  };
+  return pass;
 }
 
 
@@ -1526,7 +1734,8 @@ export function createGiGtaoPass({
  * are dropped and the weights renormalize, so no bright halo at a silhouette.
  */
 export function createGiAoFilterPass({ gbuffer, source, target, width, height, resolveWidth = width, resolveHeight = height, cameraPosition, projScale, axisX = 0, axisY = 0, radius = 2 }) {
-  const widthU = uniform(width, "uint");
+  const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
+  const widthU = dims.widthU;
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
   const sourceNode = texture(source);
@@ -1537,11 +1746,14 @@ export function createGiAoFilterPass({ gbuffer, source, target, width, height, r
   // different surface than the tap was traced from, which reads as edge
   // dropout exactly at silhouettes.
   const gx = resolveWidth / width;
-  const gy = resolveHeight / height;
   const gbufferCoord = (ix, iy) => ivec2(
-    ix.toFloat().add(0.5).mul(gx).toInt().clamp(0, resolveWidth - 1),
-    iy.toFloat().add(0.5).mul(gy).toInt().clamp(0, resolveHeight - 1),
+    ix.toFloat().add(0.5).mul(dims.sxU).toInt().clamp(int(0), dims.resolveMaxX),
+    iy.toFloat().add(0.5).mul(dims.syU).toInt().clamp(int(0), dims.resolveMaxY),
   );
+  // §19 0.5b: the plane tolerance is `4 x gx` AO-pixel footprints, and `gx`
+  // is the resolve ratio — so the constant is a uniform, not a literal, and
+  // the two callers (X and Y axes) get the same one.
+  const tolScaleU = uniform(4 * gx);
   // ── WIDTH IS THE CHEAP AXIS, AND THAT IS THE WHOLE BUDGET ARGUMENT ──────
   //
   // The estimator behind this filter costs ~3.4 ns per RAY; a filter tap costs
@@ -1581,14 +1793,14 @@ export function createGiAoFilterPass({ gbuffer, source, target, width, height, r
       // coarser AO buffer has proportionally larger pixels and the tolerance
       // has to grow with them — otherwise a half-res AO rejects its own
       // legitimate neighbours and the filter degrades to a no-op.
-      const tol = dist.div(float(projScale).max(1e-3)).mul(4 * gx).max(1e-4).toVar();
+      const tol = dist.div(float(projScale).max(1e-3)).mul(tolScaleU).max(1e-4).toVar();
       const sum = float(0).toVar();
       const wsum = float(0).toVar();
       for (let k = -RADIUS; k <= RADIUS; k++) {
         const w0 = WEIGHTS[k + RADIUS];
         const sc = ivec2(
-          px.toInt().add(k * axisX).clamp(0, width - 1),
-          py.toInt().add(k * axisY).clamp(0, height - 1),
+          px.toInt().add(k * axisX).clamp(int(0), dims.maxX),
+          py.toInt().add(k * axisY).clamp(int(0), dims.maxY),
         ).toVar();
         const tapP = positionNode.load(gbufferCoord(sc.x, sc.y)).toVar();
         // Plane distance in this pixel's own footprint units: full weight
@@ -1610,7 +1822,18 @@ export function createGiAoFilterPass({ gbuffer, source, target, width, height, r
   })().compute(width * height);
 
   compute.__giPassName = axisX ? "aoFilterX" : "aoFilterY";
-  return { compute, widthU };
+  return {
+    compute,
+    widthU,
+    dims,
+    /** §19 0.5b — see screenSizeUniforms. */
+    setSize(w, h, rw = w, rh = h) {
+      dims.set(w, h, rw, rh);
+      tolScaleU.value = 4 * (rw / w);
+      compute.count = w * h;
+      return true;
+    },
+  };
 }
 
 /**
@@ -1632,11 +1855,10 @@ export function createGiAoFilterPass({ gbuffer, source, target, width, height, r
  * and the gbuffer is read at nearest-texel through the resolution ratio.
  */
 export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, resolveWidth, resolveHeight, frame = null, checker = null, checkerFill = null }) {
-  const widthU = uniform(width, "uint");
+  const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
+  const widthU = dims.widthU;
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
-  const sx = resolveWidth / width;
-  const sy = resolveHeight / height;
 
   const compute = Fn(() => {
     // ── CHECKERBOARD TRACE (§12.80 Unit B) ───────────────────────────────────
@@ -1664,8 +1886,8 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
     const coord = ivec2(px.toInt(), py.toInt());
     // Nearest gbuffer texel at the (usually finer) resolve resolution.
     const gCoord = ivec2(
-      px.toFloat().add(0.5).mul(sx).toInt(),
-      py.toFloat().add(0.5).mul(sy).toInt(),
+      px.toFloat().add(0.5).mul(dims.sxU).toInt(),
+      py.toFloat().add(0.5).mul(dims.syU).toInt(),
     );
     const g0 = positionNode.load(gCoord).toVar();
     const g1 = normalNode.load(gCoord).toVar();
@@ -1943,7 +2165,22 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
     }
   })().compute((checker ? Math.ceil(width / 2) : width) * height);
 
-  return { compute, widthU };
+  return {
+    compute,
+    widthU,
+    dims,
+    /**
+     * §19 0.5b. The checkerboard arm dispatches HALF the columns, so its
+     * count is `ceil(w/2)*h` — the same arithmetic the build uses, kept in
+     * one place so the two cannot drift (a count that disagrees with the
+     * kernel's own `px` reconstruction traces the wrong texels, silently).
+     */
+    setSize(w, h, rw = w, rh = h) {
+      dims.set(w, h, rw, rh);
+      compute.count = (checker ? Math.ceil(w / 2) : w) * h;
+      return true;
+    },
+  };
 }
 
 /**
@@ -1974,19 +2211,18 @@ export function createGiEmitterShadowPass({
   gbuffer, emitter, normalOffset, target, width, height, resolveWidth, resolveHeight,
   cameraPosition = null, distTarget = null, tileCut = null, frame = null,
 }) {
-  const widthU = uniform(width, "uint");
+  const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
+  const widthU = dims.widthU;
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
-  const sx = resolveWidth / width;
-  const sy = resolveHeight / height;
 
   const compute = Fn(() => {
     const px = instanceIndex.mod(widthU);
     const py = instanceIndex.div(widthU);
     const coord = ivec2(px.toInt(), py.toInt());
     const gCoord = ivec2(
-      px.toFloat().add(0.5).mul(sx).toInt(),
-      py.toFloat().add(0.5).mul(sy).toInt(),
+      px.toFloat().add(0.5).mul(dims.sxU).toInt(),
+      py.toFloat().add(0.5).mul(dims.syU).toInt(),
     );
     const g0 = positionNode.load(gCoord).toVar();
     const g1 = normalNode.load(gCoord).toVar();
@@ -2114,7 +2350,23 @@ export function createGiEmitterShadowPass({
     }
   })().compute(width * height);
 
-  return { compute, widthU };
+  return {
+    compute,
+    widthU,
+    dims,
+    /**
+     * §19 0.5b. ⚠ NOT sufficient when a `tileCut` bundle is bound: that
+     * bundle's `tilesX`/`tilesY`/`tileSize` are baked (they index a storage
+     * buffer whose LENGTH is the tile count), so a resize that changes the
+     * tile count must re-mint this pass with the fresh bundle. The tile-cut
+     * pass's own `setSize` reports that by returning false.
+     */
+    setSize(w, h, rw = w, rh = h) {
+      dims.set(w, h, rw, rh);
+      compute.count = w * h;
+      return !tileCut;
+    },
+  };
 }
 
 /**
@@ -2218,8 +2470,7 @@ export function createGiEmitterTileCutPass({
   const tilesXU = uniform(tilesX, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
-  const sx = resolveWidth / width;
-  const sy = resolveHeight / height;
+  const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
 
   const compute = Fn(() => {
     const tx = instanceIndex.mod(tilesXU);
@@ -2227,8 +2478,8 @@ export function createGiEmitterTileCutPass({
     // Tile-centre pixel in emitter-shadow res, scaled into gbuffer coords —
     // the per-pixel shadow pass's own mapping, applied at the tile centre.
     const gCoord = ivec2(
-      tx.toFloat().add(0.5).mul(tileSize).mul(sx).toInt(),
-      ty.toFloat().add(0.5).mul(tileSize).mul(sy).toInt(),
+      tx.toFloat().add(0.5).mul(tileSize).mul(dims.sxU).toInt(),
+      ty.toFloat().add(0.5).mul(tileSize).mul(dims.syU).toInt(),
     );
     const g0 = positionNode.load(gCoord).toVar();
     const g1 = normalNode.load(gCoord).toVar();
@@ -2395,7 +2646,30 @@ export function createGiEmitterTileCutPass({
 
   // importance/baseWord/emitterCount ride along so a viewport resize can
   // rebuild at new tile dims without re-deriving the tree plumbing.
-  return { compute, tilesX, tilesY, tileSize, tileCount, posBuf, idBuf, importance, baseWord, emitterCount, compCap, feather };
+  return {
+    compute, tilesX, tilesY, tileSize, tileCount, posBuf, idBuf, importance, baseWord,
+    emitterCount, compCap, feather, dims,
+    /**
+     * §19 0.5b — THE ONE PASS THAT CANNOT ALWAYS ABSORB A RESIZE, and it says
+     * so rather than pretending. `posBuf`/`idBuf` are `instancedArray`s whose
+     * LENGTH is `tileCount`, and the tile count is `ceil(w/tileSize) x
+     * ceil(h/tileSize)` — a real size change usually changes it, and a
+     * storage buffer cannot grow under a compiled kernel.
+     *
+     * Returns TRUE when the new size lands on the same tile grid (the common
+     * DRS wobble, and every resize small enough not to cross a tile
+     * boundary): then this is a uniform write like every sibling. FALSE means
+     * the caller must re-mint this pass — and, because they bind its buffers,
+     * the emitter shadow pass and the resolve with it.
+     */
+    setSize(w, h, rw = w, rh = h) {
+      const nx = Math.ceil(w / tileSize);
+      const ny = Math.ceil(h / tileSize);
+      if (nx !== tilesX || ny !== tilesY) return false;
+      dims.set(w, h, rw, rh);
+      return true;
+    },
+  };
 }
 
 /**
@@ -2418,7 +2692,8 @@ export function createGiLightShadowFilterPass({
   gbuffer, source, target, width, height, resolveWidth, resolveHeight, planeEps,
   history = null, softness = null, cameraPos = null, projScale = null,
 }) {
-  const widthU = uniform(width, "uint");
+  const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
+  const widthU = dims.widthU;
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
   const shadowNode = texture(source);
@@ -2436,8 +2711,6 @@ export function createGiLightShadowFilterPass({
     history && globalThis.__giShadowTemporalDebug === true
       ? instancedArray(new Uint32Array(4), "uint").toAtomic()
       : null;
-  const sx = resolveWidth / width;
-  const sy = resolveHeight / height;
 
   const compute = Fn(() => {
     const px = instanceIndex.mod(widthU);
@@ -2445,8 +2718,8 @@ export function createGiLightShadowFilterPass({
     const coord = ivec2(px.toInt(), py.toInt());
     const center = vec4(shadowNode.load(coord)).toVar();
     const gCoord = ivec2(
-      px.toFloat().add(0.5).mul(sx).toInt(),
-      py.toFloat().add(0.5).mul(sy).toInt(),
+      px.toFloat().add(0.5).mul(dims.sxU).toInt(),
+      py.toFloat().add(0.5).mul(dims.syU).toInt(),
     );
     const g0 = positionNode.load(gCoord).toVar();
     const out = center.toVar();
@@ -2468,7 +2741,7 @@ export function createGiLightShadowFilterPass({
       // keeps its support while the normal gate still preserves edges.
       const texelW = (cameraPos && projScale)
         ? P.sub(vec3(cameraPos)).length()
-            .div(float(projScale).max(1e-3).mul(height))
+            .div(float(projScale).max(1e-3).mul(dims.heightF))
             .toVar()
         : null;
       const eps = texelW
@@ -2497,12 +2770,12 @@ export function createGiLightShadowFilterPass({
             ? float(-(dx * dx + dy * dy)).div(sigma2).exp()
             : Math.exp(-(dx * dx + dy * dy) / (2 * 1.6 * 1.6));
           const tap = ivec2(
-            coord.x.add(dx).clamp(0, width - 1),
-            coord.y.add(dy).clamp(0, height - 1),
+            coord.x.add(dx).clamp(int(0), dims.maxX),
+            coord.y.add(dy).clamp(int(0), dims.maxY),
           ).toVar();
           const tg = ivec2(
-            tap.x.toFloat().add(0.5).mul(sx).toInt(),
-            tap.y.toFloat().add(0.5).mul(sy).toInt(),
+            tap.x.toFloat().add(0.5).mul(dims.sxU).toInt(),
+            tap.y.toFloat().add(0.5).mul(dims.syU).toInt(),
           ).toVar();
           const q0 = positionNode.load(tg).toVar();
           const q1 = normalNode.load(tg).toVar();
@@ -2542,16 +2815,16 @@ export function createGiLightShadowFilterPass({
         const valid = float(0).toVar();
         If(clip.w.greaterThan(1e-3), () => {
           const ndc = clip.xyz.div(clip.w).toVar();
-          const hx = ndc.x.mul(0.5).add(0.5).mul(width).toVar();
+          const hx = ndc.x.mul(0.5).add(0.5).mul(dims.widthF).toVar();
           // Row convention: texture row 0 is the TOP of the frame (NDC y=+1)
           // — proven by the smoke's per-axis agreement counters (the no-flip
           // arm read 0.8% row agreement, the flip ~full agreement; an early
           // "0 valid" reading against this flip was measured on a STOPPED
           // engine loop and led development astray for an hour — see the
           // smoke's restart note).
-          const hy = float(0.5).sub(ndc.y.mul(0.5)).mul(height).toVar();
+          const hy = float(0.5).sub(ndc.y.mul(0.5)).mul(dims.heightF).toVar();
           If(
-            hx.greaterThanEqual(0).and(hx.lessThan(width)).and(hy.greaterThanEqual(0)).and(hy.lessThan(height)),
+            hx.greaterThanEqual(0).and(hx.lessThan(dims.widthF)).and(hy.greaterThanEqual(0)).and(hy.lessThan(dims.heightF)),
             () => {
               if (temporalCounter) atomicAdd(temporalCounter.element(2), uint(1));
               const hc = ivec2(hx.toInt(), hy.toInt()).toVar();
@@ -2583,8 +2856,8 @@ export function createGiLightShadowFilterPass({
                   for (let dx = -1; dx <= 1; dx++) {
                     if (dx === 0 && dy === 0) continue;
                     const nc = ivec2(
-                      hc.x.add(dx).clamp(0, width - 1),
-                      hc.y.add(dy).clamp(0, height - 1),
+                      hc.x.add(dx).clamp(int(0), dims.maxX),
+                      hc.y.add(dy).clamp(int(0), dims.maxY),
                     ).toVar();
                     const np = histPosNode.load(nc).toVar();
                     const rEps = texelW
@@ -2635,7 +2908,18 @@ export function createGiLightShadowFilterPass({
     textureStore(target, coord, out);
   })().compute(width * height);
 
-  return { compute, widthU, temporalCounter };
+  return {
+    compute,
+    widthU,
+    temporalCounter,
+    dims,
+    /** §19 0.5b — see screenSizeUniforms. */
+    setSize(w, h, rw = w, rh = h) {
+      dims.set(w, h, rw, rh);
+      compute.count = w * h;
+      return true;
+    },
+  };
 }
 
 /**
@@ -2651,25 +2935,36 @@ export function createGiLightShadowWidePass({
   cameraPosition, capFrac = 0.1, searchFrac = null,
   projScale = null, radiusScale = 1, searchWorld = null, rotSalt = 0,
 }) {
-  const widthU = uniform(width, "uint");
+  const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
+  const widthU = dims.widthU;
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
   const sourceNode = texture(source);
   const distNode = texture(dist);
-  const sx = resolveWidth / width;
-  const sy = resolveHeight / height;
+  // §19 0.5b — THIS PASS WAS THE WORST OFFENDER: nine of its numbers are
+  // `height`-derived, because every penumbra radius here is expressed as a
+  // FRACTION OF FRAME HEIGHT (`capFrac`) and projected through it. All nine
+  // become uniforms; the estimator is untouched.
+  const texelUvU = uniform(new THREE.Vector2(1 / width, 1 / height));
+  // The resolution-proportional radius cap, in shadow texels, and its
+  // reciprocal-side use as the softness normalizer.
+  const capPixU = uniform(height * capFrac);
+  // The blocker-search radius: world-sized when the caller gives one (then
+  // `height` is only the world→texel projection), otherwise a fixed fraction
+  // of the height, or a bare 3.
+  const searchFixedU = uniform(searchFrac ? Math.max(3, Math.round(height * searchFrac)) : 3);
 
   const compute = Fn(() => {
     const px = instanceIndex.mod(widthU);
     const py = instanceIndex.div(widthU);
     const coord = ivec2(px.toInt(), py.toInt());
     const uv0 = vec2(
-      px.toFloat().add(0.5).div(width),
-      py.toFloat().add(0.5).div(height),
+      px.toFloat().add(0.5).div(dims.widthF),
+      py.toFloat().add(0.5).div(dims.heightF),
     ).toVar();
     const gCoord = ivec2(
-      px.toFloat().add(0.5).mul(sx).toInt(),
-      py.toFloat().add(0.5).mul(sy).toInt(),
+      px.toFloat().add(0.5).mul(dims.sxU).toInt(),
+      py.toFloat().add(0.5).mul(dims.syU).toInt(),
     );
     const center = vec4(sourceNode.load(coord)).toVar();
     const out = center.toVar();
@@ -2678,7 +2973,7 @@ export function createGiLightShadowWidePass({
       const P = g0.xyz.toVar();
       const N = vec3(normalNode.load(gCoord).xyz).normalize().toVar();
       const viewDist = P.sub(vec3(cameraPosition)).length().max(0.05).toVar();
-      const texelUv = vec2(1 / width, 1 / height);
+      const texelUv = vec2(texelUvU);
       // ONE IGN rotation for the whole kernel — the blocker search and the blur
       // both walk a disc, and a search that always probes the SAME EIGHT
       // COMPASS POINTS stamps eight offset copies of every shadow into the lit
@@ -2700,9 +2995,9 @@ export function createGiLightShadowWidePass({
       // scene then borrows blocker widths from further and further away, which
       // is how open floor metres from any occluder ends up carrying penumbra.
       const searchTx = searchWorld
-        ? float(searchWorld).mul(projScale ?? float(1.2)).div(viewDist).mul(height)
-            .clamp(3, height * capFrac).toVar()
-        : float(searchFrac ? Math.max(3, Math.round(height * searchFrac)) : 3);
+        ? float(searchWorld).mul(projScale ?? float(1.2)).div(viewDist).mul(dims.heightF)
+            .clamp(float(3), capPixU).toVar()
+        : searchFixedU;
       const t3 = texelUv.mul(searchTx);
       const blocker = vec4(distNode.load(coord)).toVar();
       if (searchFrac || searchWorld) {
@@ -2770,8 +3065,8 @@ export function createGiLightShadowWidePass({
         if (!slots) {
           return blockerCh[i].max(0).mul(radiusScale)
             .mul(proj).div(viewDist)
-            .mul(height)
-            .clamp(0, height * capFrac)
+            .mul(dims.heightF)
+            .clamp(float(0), capPixU)
             .toVar();
         }
         const slot = slots[i];
@@ -2782,7 +3077,7 @@ export function createGiLightShadowWidePass({
           .mul(slot.giShadow).mul(slot.active)
           .mul(radiusScale)
           .mul(proj).div(viewDist)
-          .mul(height) // → texels
+          .mul(dims.heightF) // → texels
           // RESOLUTION-PROPORTIONAL cap (`capFrac` of frame height), not a
           // fixed texel count: a fixed 40 was 13% of the probe rig's height
           // but only 5% at the real 900k budget — the 90° hard edge
@@ -2793,7 +3088,7 @@ export function createGiLightShadowWidePass({
           // shadow — the average over that footprint is what lifts the
           // shadow CORE toward its true partial visibility (Blender's 90°
           // look is mostly-lit wash, not a blurred black blob).
-          .clamp(0, height * capFrac)
+          .clamp(float(0), capPixU)
           .toVar();
       });
       const rMax = radii[0].max(radii[1]).max(radii[2]).max(radii[3]).toVar();
@@ -2809,7 +3104,7 @@ export function createGiLightShadowWidePass({
           : dbgMode === "vd" ? viewDist.div(30)
           : dbgMode === "span" ? float(span).div(30)
           : dbgMode === "soft" ? null
-          : rMax.div(height * capFrac);
+          : rMax.div(capPixU);
         if (paint) out.assign(vec4(paint, paint, paint, 1));
       }
       const wideBody = () => {
@@ -2820,7 +3115,7 @@ export function createGiLightShadowWidePass({
         for (let k = 0; k < 16; k++) {
           const tapR = rMax.mul(Math.sqrt((k + 0.5) / 16)).toVar();
           const a = rotA.add(k * 2.399963);
-          const uv = uv0.add(vec2(cos(a).mul(tapR).div(width), sin(a).mul(tapR).div(height))).toVar();
+          const uv = uv0.add(vec2(cos(a).mul(tapR).div(dims.widthF), sin(a).mul(tapR).div(dims.heightF))).toVar();
           const s = vec4(sourceNode.sample(uv).level(0)).toVar();
           const g = vec4(positionNode.sample(uv).level(0)).toVar();
           const rel = g.xyz.sub(P);
@@ -2875,7 +3170,25 @@ export function createGiLightShadowWidePass({
     textureStore(target, coord, out);
   })().compute(width * height);
 
-  return { compute, widthU };
+  return {
+    compute,
+    widthU,
+    dims,
+    /**
+     * §19 0.5b. `capFrac`, `searchFrac` and `radiusScale` are the pass's
+     * SPEC — they do not move on a resize. What moves is what they are a
+     * fraction OF, which is why the three derived numbers are re-derived
+     * here from the new height rather than scaled.
+     */
+    setSize(w, h, rw = w, rh = h) {
+      dims.set(w, h, rw, rh);
+      texelUvU.value.set(1 / w, 1 / h);
+      capPixU.value = h * capFrac;
+      searchFixedU.value = searchFrac ? Math.max(3, Math.round(h * searchFrac)) : 3;
+      compute.count = w * h;
+      return true;
+    },
+  };
 }
 
 /**
@@ -2887,24 +3200,33 @@ export function createGiLightShadowWidePass({
 export function createGiLightShadowHistoryPass({
   gbuffer, source, histShadow, histPos, width, height, resolveWidth, resolveHeight,
 }) {
-  const widthU = uniform(width, "uint");
+  const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
+  const widthU = dims.widthU;
   const positionNode = texture(gbuffer.position);
   const shadowNode = texture(source);
-  const sx = resolveWidth / width;
-  const sy = resolveHeight / height;
   const compute = Fn(() => {
     const px = instanceIndex.mod(widthU);
     const py = instanceIndex.div(widthU);
     const coord = ivec2(px.toInt(), py.toInt());
     const gCoord = ivec2(
-      px.toFloat().add(0.5).mul(sx).toInt(),
-      py.toFloat().add(0.5).mul(sy).toInt(),
+      px.toFloat().add(0.5).mul(dims.sxU).toInt(),
+      py.toFloat().add(0.5).mul(dims.syU).toInt(),
     );
     const g0 = positionNode.load(gCoord).toVar();
     textureStore(histShadow, coord, vec4(shadowNode.load(coord)));
     textureStore(histPos, coord, vec4(g0.xyz, g0.w));
   })().compute(width * height);
-  return { compute, widthU };
+  return {
+    compute,
+    widthU,
+    dims,
+    /** §19 0.5b — see screenSizeUniforms. */
+    setSize(w, h, rw = w, rh = h) {
+      dims.set(w, h, rw, rh);
+      compute.count = w * h;
+      return true;
+    },
+  };
 }
 
 /**
@@ -2972,16 +3294,20 @@ export function createGiIrradianceTemporalPass({
   //       honestly unlit rather than inventing light.
   validityAlpha = false,
 }) {
-  const widthU = uniform(width, "uint");
+  const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
+  const widthU = dims.widthU;
   const positionNode = texture(gbuffer.position);
   const irrNormalNode = texture(gbuffer.normal);
   const rawNode = texture(source);
   const histIrrNode = texture(histIrr);
   const histPosNode = texture(histPos);
+  // §19 0.5b: the JS copies decide only whether the mapping is an IDENTITY —
+  // a question about whether this pass runs on the resolve grid at all, not
+  // about the frame's pixel count. The multiply itself rides the uniforms.
   const sx = resolveWidth / width;
   const sy = resolveHeight / height;
   const gAt = (sx !== 1 || sy !== 1)
-    ? (c) => ivec2(c.x.toFloat().add(0.5).mul(sx).toInt(), c.y.toFloat().add(0.5).mul(sy).toInt())
+    ? (c) => ivec2(c.x.toFloat().add(0.5).mul(dims.sxU).toInt(), c.y.toFloat().add(0.5).mul(dims.syU).toInt())
     : (c) => c;
   const compute = Fn(() => {
     const px = instanceIndex.mod(widthU);
@@ -3053,11 +3379,11 @@ export function createGiIrradianceTemporalPass({
       const eps = float(epsMetres).max(1e-3).toVar();
       If(clip.w.greaterThan(1e-3), () => {
         const ndc = clip.xyz.div(clip.w).toVar();
-        const hx = ndc.x.mul(0.5).add(0.5).mul(width).toVar();
+        const hx = ndc.x.mul(0.5).add(0.5).mul(dims.widthF).toVar();
         // Row 0 is the TOP of the frame — the shadow filter's proven flip.
-        const hy = float(0.5).sub(ndc.y.mul(0.5)).mul(height).toVar();
+        const hy = float(0.5).sub(ndc.y.mul(0.5)).mul(dims.heightF).toVar();
         If(
-          hx.greaterThanEqual(0).and(hx.lessThan(width)).and(hy.greaterThanEqual(0)).and(hy.lessThan(height)),
+          hx.greaterThanEqual(0).and(hx.lessThan(dims.widthF)).and(hy.greaterThanEqual(0)).and(hy.lessThan(dims.heightF)),
           () => {
             const hc = ivec2(hx.toInt(), hy.toInt()).toVar();
             const hp = histPosNode.load(hc).toVar();
@@ -3081,8 +3407,8 @@ export function createGiIrradianceTemporalPass({
                 for (let dx = -1; dx <= 1; dx++) {
                   if (dx === 0 && dy === 0) continue;
                   const nc = ivec2(
-                    hc.x.add(dx).clamp(0, width - 1),
-                    hc.y.add(dy).clamp(0, height - 1),
+                    hc.x.add(dx).clamp(int(0), dims.maxX),
+                    hc.y.add(dy).clamp(int(0), dims.maxY),
                   ).toVar();
                   const np = histPosNode.load(nc).toVar();
                   const nd = np.xyz.sub(P).length().toVar();
@@ -3138,8 +3464,8 @@ export function createGiIrradianceTemporalPass({
         for (let dy = -1; dy <= 1; dy++) {
           for (let dx = -1; dx <= 1; dx++) {
             const nc = ivec2(
-              coord.x.add(dx).clamp(0, width - 1),
-              coord.y.add(dy).clamp(0, height - 1),
+              coord.x.add(dx).clamp(int(0), dims.maxX),
+              coord.y.add(dy).clamp(int(0), dims.maxY),
             ).toVar();
             const s = vec4(rawNode.load(nc)).toVar();
             const wTap = (dx === 0 && dy === 0)
@@ -3216,7 +3542,17 @@ export function createGiIrradianceTemporalPass({
         : validityAlpha ? vec4(out.xyz, outKnown)
         : out);
   })().compute(width * height);
-  return { compute, widthU };
+  return {
+    compute,
+    widthU,
+    dims,
+    /** §19 0.5b — see screenSizeUniforms. */
+    setSize(w, h, rw = w, rh = h) {
+      dims.set(w, h, rw, rh);
+      compute.count = w * h;
+      return true;
+    },
+  };
 }
 
 /**
@@ -3315,8 +3651,12 @@ export function createGiBvhReflect({
   const stride = giBvhReflectStride(strideDefault);
   const blocksW = Math.ceil(width / stride);
   const blocksH = Math.ceil(height / stride);
-  const widthU = uniform(width, "uint");
-  const heightU = uniform(height, "uint");
+  // §19 0.5b: `widthU`/`heightU` were already uniforms here (this kernel
+  // bounds-checks its replication writes against them) — `blocksW` is the
+  // one that was not, and it is the dispatch's own grid width.
+  const dims = screenSizeUniforms(width, height);
+  const widthU = dims.widthU;
+  const heightU = dims.heightU;
   const blocksWU = uniform(blocksW, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
@@ -3573,7 +3913,29 @@ export function createGiBvhReflect({
     }
   })().compute(blocksW * blocksH);
 
-  return { compute, widthU };
+  return {
+    compute,
+    widthU,
+    dims,
+    /**
+     * §19 0.5b. The dispatch is one thread per stride x stride BLOCK, so the
+     * count is the block grid — and `blocksW` is a uniform because the kernel
+     * reconstructs its own pixel from it.
+     *
+     * `stride` itself is NOT a uniform and must not become one: it is the JS
+     * loop bound of the replication writes, i.e. graph shape. A tier change
+     * that moves the stride re-mints this pass, which is what
+     * `#bvhReflectStride` already causes.
+     */
+    setSize(w, h) {
+      dims.set(w, h);
+      const bw = Math.ceil(w / stride);
+      const bh = Math.ceil(h / stride);
+      blocksWU.value = bw;
+      compute.count = bw * bh;
+      return true;
+    },
+  };
 }
 
 /** Monotonic texture version, see the comment in createGiTargets. */
@@ -3698,7 +4060,12 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
   lightShadowDist.name = "giLightShadowDist";
   lightShadowDist.version = version;
   if (import.meta.env?.DEV) globalThis.__giLastTargetVersion = version;
+  // §19 0.5b — the LIVE size, so the lazy `ensure*Temporal` factories below
+  // materialize at the CURRENT size rather than at the one this bundle was
+  // built with. Before `setSize` existed the two could not differ.
+  const size = { width, height, shadowWidth, shadowHeight, emitterWidth, emitterHeight };
   const targets = {
+    size,
     irradiance,
     emitterShadow,
     emitterShadowRaw,
@@ -3746,15 +4113,15 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
       // It stays because a self-feeding EMA in 8 bits is a real hazard and half
       // float costs one extra byte per texel on two emitter-sized targets — but
       // it is insurance, not a fix, and nothing measured has ever needed it.
-      const accum = new THREE.StorageTexture(emitterWidth, emitterHeight);
+      const accum = new THREE.StorageTexture(size.emitterWidth, size.emitterHeight);
       accum.type = THREE.HalfFloatType;
       accum.name = "giEmitterShadowAccum";
       accum.version = v;
-      const hist = new THREE.StorageTexture(emitterWidth, emitterHeight);
+      const hist = new THREE.StorageTexture(size.emitterWidth, size.emitterHeight);
       hist.type = THREE.HalfFloatType;
       hist.name = "giEmitterShadowHist";
       hist.version = v;
-      const histPos = new THREE.StorageTexture(emitterWidth, emitterHeight);
+      const histPos = new THREE.StorageTexture(size.emitterWidth, size.emitterHeight);
       histPos.type = THREE.FloatType;
       histPos.name = "giEmitterShadowHistPos";
       histPos.version = v;
@@ -3778,23 +4145,72 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
       // HalfFloat like `irradiance` itself — raw and hist carry the same
       // signal. The EMA-in-half-float hazard note on the emitter trio
       // applies unchanged (insurance; nothing measured has needed more).
-      const raw = new THREE.StorageTexture(width, height);
+      const raw = new THREE.StorageTexture(size.width, size.height);
       raw.type = THREE.HalfFloatType;
       raw.name = "giIrradianceRaw";
       raw.version = v;
-      const hist = new THREE.StorageTexture(width, height);
+      const hist = new THREE.StorageTexture(size.width, size.height);
       hist.type = THREE.HalfFloatType;
       hist.name = "giIrradianceHist";
       hist.version = v;
       // Full float world position, exactly like the shadow trios: half
       // precision at 50m is ~3cm — the same order as the validity epsilon.
-      const histPos = new THREE.StorageTexture(width, height);
+      const histPos = new THREE.StorageTexture(size.width, size.height);
       histPos.type = THREE.FloatType;
       histPos.name = "giIrradianceHistPos";
       histPos.version = v;
       this.irradianceRaw = raw;
       this.irradianceHist = hist;
       this.irradianceHistPos = histPos;
+    },
+    /**
+     * ── §19 0.5b: RESIZE THE TEXTURES, KEEP THE OBJECTS ────────────────────
+     *
+     * A resize used to REPLACE this whole bundle (`screen.targets =
+     * createGiTargets(...)`), which forced every consumer to be rebuilt
+     * against the new textures and every persistent material node to be
+     * re-pointed — the second half of the resize's real cost, next to the
+     * shader recompiles the uniform block above removes.
+     *
+     * `THREE.StorageTexture.setSize` changes `image.width/height` and calls
+     * `dispose()`; the backend answers a dispose by dropping the GPU texture
+     * and re-creating it at the new dimensions on next use. The JS OBJECT
+     * survives, so every `texture(...)` node, every material binding and
+     * every compute node's binding keeps pointing at the right thing.
+     *
+     * ⚠ THE CONTENTS ARE GONE, and a shadow channel that reads 0 means FULLY
+     * OCCLUDED. The caller must re-run `createGiShadowClearPass` over the
+     * emitter targets after this, exactly as it does after a fresh build —
+     * see #clearEmitterShadowTargets and this file's fail-OPEN note.
+     *
+     * ⚠ The lazily-materialized trios are resized only if they EXIST; a trio
+     * created after a resize is created at the current size by
+     * `ensure*Temporal`, which closes over the mutable `size` record below
+     * rather than the build-time arguments.
+     */
+    setSize(w, h, sw = w, sh = h, { emitterWidth: ew = sw, emitterHeight: eh = sh } = {}) {
+      size.width = w; size.height = h;
+      size.shadowWidth = sw; size.shadowHeight = sh;
+      size.emitterWidth = ew; size.emitterHeight = eh;
+      irradiance.setSize(w, h);
+      radiance.setSize(w, h);
+      this.irradianceRaw?.setSize(w, h);
+      this.irradianceHist?.setSize(w, h);
+      this.irradianceHistPos?.setSize(w, h);
+      emitterShadow.setSize(ew, eh);
+      emitterShadowRaw.setSize(ew, eh);
+      emitterShadowDist.setSize(ew, eh);
+      emitterShadowMid.setSize(ew, eh);
+      emitterShadowWide.setSize(ew, eh);
+      this.emitterShadowAccum?.setSize(ew, eh);
+      this.emitterShadowHist?.setSize(ew, eh);
+      this.emitterShadowHistPos?.setSize(ew, eh);
+      lightShadow.setSize(sw, sh);
+      lightShadowRaw.setSize(sw, sh);
+      lightShadowMid.setSize(sw, sh);
+      lightShadowWide.setSize(sw, sh);
+      lightShadowDist.setSize(sw, sh);
+      return true;
     },
     dispose() {
       irradiance.dispose();
@@ -3837,14 +4253,25 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
  * and the replay guard re-dispatches it on resolution either way.
  */
 export function createGiShadowClearPass(target, width, height) {
-  const w = Math.max(1, width | 0);
-  const total = w * Math.max(1, height | 0);
-  const clear = Fn(() => {
-    const x = instanceIndex.mod(uint(w)).toInt();
-    const y = instanceIndex.div(uint(w)).toInt();
+  // §19 0.5b: a uniform even here. It is a 1 kB kernel, but it is created once
+  // per shadow TARGET and re-created on every resize — and the whole point of
+  // the size-uniform block is that no screen kernel in this file has a reason
+  // to be new source at a new resolution.
+  const widthU = uniform(Math.max(1, width | 0), "uint");
+  const total = Math.max(1, width | 0) * Math.max(1, height | 0);
+  const compute = Fn(() => {
+    const x = instanceIndex.mod(widthU).toInt();
+    const y = instanceIndex.div(widthU).toInt();
     textureStore(target, ivec2(x, y), vec4(1));
-  });
-  return { compute: clear().compute(total) };
+  })().compute(total);
+  return {
+    compute,
+    setSize(w, h) {
+      widthU.value = Math.max(1, w | 0);
+      compute.count = Math.max(1, w | 0) * Math.max(1, h | 0);
+      return true;
+    },
+  };
 }
 
 /**
@@ -3940,7 +4367,13 @@ export function createGiBvhTarget(width, height, { radianceDiv = null } = {}) {
   bvhRadianceHistPos.magFilter = THREE.NearestFilter;
   bvhRadianceHistPos.name = "giBvhRadianceHistPos";
   bvhRadianceHistPos.version = version;
-  return {
+  /** The shade grid for a given resolve size — the build's own arithmetic. */
+  const shadeGrid = (w, h) => {
+    const solvedAt = Math.sqrt((w * h) / TARGET_RADIANCE_TEXELS);
+    const d = capDiv <= 1 ? capDiv : Math.min(capDiv, Math.max(2, solvedAt));
+    return [Math.max(1, Math.round(w / d)), Math.max(1, Math.round(h / d))];
+  };
+  const bundle = {
     bvhRadiance,
     bvhRadianceRaw,
     bvhRadianceHist,
@@ -3949,6 +4382,33 @@ export function createGiBvhTarget(width, height, { radianceDiv = null } = {}) {
     radianceHeight: radH,
     bvhReflect,
     bvhColor,
+    /**
+     * §19 0.5b — same texture-objects-survive contract as `createGiTargets`'s
+     * `setSize` (see its note): `StorageTexture.setSize` re-creates the GPU
+     * texture and keeps the JS object, so `_giBvhReflectNode` and friends —
+     * which every mirror material has ALREADY compiled against — never learn
+     * a resize happened.
+     *
+     * The shade grid is re-solved rather than scaled: `radDiv` is
+     * `min(cap, max(2, sqrt(pixels / 178k)))`, so it is not linear in the
+     * resolve size and a naive scale would drift off the texel budget the
+     * divisor exists to hold.
+     *
+     * Returns the new shade grid so the caller can hand it straight to
+     * `bvhHitShade.setSize`, which is the only consumer that needs it.
+     */
+    setSize(w, h) {
+      bvhReflect.setSize(w, h);
+      bvhColor.setSize(w, h);
+      const [rw, rh] = shadeGrid(w, h);
+      bvhRadiance.setSize(rw, rh);
+      bvhRadianceRaw.setSize(rw, rh);
+      bvhRadianceHist.setSize(rw, rh);
+      bvhRadianceHistPos.setSize(rw, rh);
+      bundle.radianceWidth = rw;
+      bundle.radianceHeight = rh;
+      return { radianceWidth: rw, radianceHeight: rh };
+    },
     dispose() {
       bvhReflect.dispose();
       bvhColor.dispose();
@@ -3958,6 +4418,7 @@ export function createGiBvhTarget(width, height, { radianceDiv = null } = {}) {
       bvhRadianceHistPos.dispose();
     },
   };
+  return bundle;
 }
 
 /**

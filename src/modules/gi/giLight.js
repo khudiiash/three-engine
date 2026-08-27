@@ -16,6 +16,7 @@
 import * as THREE from "three/webgpu";
 import {
   If,
+  Loop,
   abs,
   acos,
   cameraPosition,
@@ -1266,7 +1267,64 @@ export function emitterDirectAt(params, P, N, samplePoint) {
   const total = vec3(0).toVar();
   const shadows = [];
   const perSlot = [];
-  for (const [index, slot] of params.emitterSlots.entries()) {
+  const slotList = [...params.emitterSlots];
+  // ── ⭐⭐ §19 0.5-D1: THE TRACE IS ROLLED; THE ANALYTIC TERMS ARE NOT ───────
+  //
+  // This function used to be ONE JS loop, so it unrolled at graph-build time
+  // and each of MAX_EMITTERS = 4 iterations inlined the whole of
+  // `emitterSlotShadow` — an analytic shape evaluation, a record march AND a
+  // BVH descent, four times. In `createGiBvhHitShade` that is four of the
+  // kernel's twelve shadow-ray call sites where three would do, and §13.14.5's
+  // per-inline law says compile cost tracks CALL SITES, not bytes: measured
+  // 14.0 s → 5.5 s paired for this roll plus the light-slot one below, 8 → 2
+  // BVH descent sites in the dumped WGSL.
+  //
+  // What is rolled is EXACTLY the expensive half. The per-slot analytic terms
+  // (`emitterSlotFactor`, the luma fade, `active`) are cheap closed forms that
+  // no two slots share work on, and three callers — the material path at the
+  // bottom of this file, and both screen kernels — consume them PER SLOT
+  // (`shadows`, `perSlot`). Rolling them too would mean re-selecting four
+  // values back out of a loop that had no reason to hold them.
+  //
+  // This is the shape `createGiEmitterShadowPass` already ships (giScreen.js:
+  // slotKeys intersection → `select`-built virtual slot → one call →
+  // `shadowVars[k].assign(select(take, …))`) and the shape `srcShade.js` uses
+  // for its light slots. It is an EMISSION change, not an estimator change:
+  // each slot still gets its own full march, its own gates, its own result.
+  const shadowVars = params.shadowSample
+    // PRE-TRACED CHANNEL (2026-08-06): the resolve samples a filtered texture
+    // instead of marching, so there is no expensive call to share and the
+    // straight-line form stays byte-identical to before this roll existed.
+    // The same "nothing to win" carve-out `srcShade.js` makes for one light.
+    ? slotList.map((_, index) => float(params.shadowSample(index)).toVar())
+    : slotList.length > 1
+      ? (() => {
+        // DEFAULT 1 (unshadowed) — the fail-OPEN direction every visibility
+        // term in this module starts from: an iteration that never runs must
+        // leave the light untouched, never black it out.
+        const vars = slotList.map(() => float(1).toVar());
+        // Keys INTERSECTED, not listed: the seats carry fields the tile-cut
+        // pseudo-slots do not, and a second definition of "what a slot is"
+        // going stale here is exactly the bug this avoids.
+        const slotKeys = Object.keys(slotList[0] ?? {})
+          .filter((k) => slotList.every((s) => s?.[k] != null));
+        Loop({ start: int(0), end: int(slotList.length), type: "int", condition: "<" }, ({ i }) => {
+          const virt = {};
+          for (const key of slotKeys) {
+            let acc = slotList[0][key];
+            for (let k = 1; k < slotList.length; k++) acc = select(i.equal(int(k)), slotList[k][key], acc);
+            virt[key] = acc;
+          }
+          const s = float(emitterSlotShadow(params, virt, P, N, samplePoint)).toVar();
+          for (let k = 0; k < slotList.length; k++) {
+            vars[k].assign(select(i.equal(int(k)), s, vars[k]));
+          }
+        });
+        return vars;
+      })()
+      // One slot is already exactly one call site.
+      : slotList.map((slot) => float(emitterSlotShadow(params, slot, P, N, samplePoint)).toVar());
+  for (const [index, slot] of slotList.entries()) {
     const center = vec3(slot.center);
     const toEmitter = center.sub(P).toVar();
     const dist = toEmitter.length().max(1e-3).toVar();
@@ -1301,16 +1359,13 @@ export function emitterDirectAt(params, P, N, samplePoint) {
     emitterDirect.mulAssign(
       fadeT.mul(fadeT).mul(fadeT).mul(fadeT.mul(fadeT.mul(6).sub(15)).add(10)),
     );
-    // PRE-TRACED CHANNEL (2026-08-06): when the emitter shadows run as their
-    // own pass at their own pixel budget (giScreen's emitter shadow pass —
-    // the same split that took the direct arm from 22ms to 5.4ms at 4×
-    // pixels), the resolve just SAMPLES the filtered texture; the trace
-    // lives in exactly one kernel. The hit-shading pass (createGiBvhHitShade) keeps
-    // tracing inline — a reflection hit is a different world point than the
-    // pixel, so a screen-space sample would be the wrong surface's shadow.
-    const shadow = params.shadowSample
-      ? float(params.shadowSample(index)).toVar()
-      : emitterSlotShadow(params, slot, P, N, samplePoint);
+    // The visibility for this slot, computed above — pre-traced from the
+    // dedicated pass (giScreen's emitter shadow pass, the split that took the
+    // direct arm from 22ms to 5.4ms at 4× pixels) or marched in the rolled
+    // loop. The hit-shading pass marches inline because a reflection hit is a
+    // different world point than the pixel, so a screen-space sample would be
+    // the wrong surface's shadow.
+    const shadow = shadowVars[index];
     const active = step(0.001, slot.radius);
     total.addAssign(emitterDirect.mul(shadow).mul(active));
     shadows.push(shadow);
@@ -1575,38 +1630,91 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint, penumbraOut =
  */
 export function analyticDirectAt(lightSlots, P, N, shadowFn = null, oneSided = false) {
   const total = vec3(0).toVar();
-  for (const slot of lightSlots) {
-    If(slot.active.greaterThan(0.5), () => {
-      const isDir = float(slot.kind).toVar();
-      const rel = vec3(slot.vector).sub(P).toVar();
-      const pointDist = rel.length().max(1e-4).toVar();
-      // `vector` holds: point → world position, directional → the normalized
-      // direction TOWARD the light (cascadeGather.js uses the same convention).
-      const dirTo = mix(rel.div(pointDist), vec3(slot.vector), isDir).toVar();
-      let atten = mix(float(1).div(pointDist.mul(pointDist).max(1)), float(1), isDir);
-      // three's PointLight `distance` cutoff (0 = infinite) — GI must die
-      // where the renderer's own direct light does.
-      if (slot.range) {
-        const range = float(slot.range);
-        const ratio = pointDist.div(range.max(1e-4)).clamp(0, 1);
-        const r2 = ratio.mul(ratio);
-        const win = r2.mul(r2).oneMinus().clamp(0, 1);
-        atten = atten.mul(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
-      }
-      // See the `oneSided` note on the signature: `.abs()` is the FIELD-CELL
-      // convention (a cell straddling a wall must light from either side);
-      // `.max(0)` is the SURFACE convention, and a face-forwarded hit normal is
-      // a surface. Same expression `srcShade.js` uses for its own hits.
-      const cosH = (oneSided ? dirTo.dot(N).max(0) : dirTo.dot(N).abs()).toVar();
-      // `shadowFn` (optional, 2026-08-21 — reflection-hit realism): a caller
-      // that can afford a visibility march supplies it; the resolve's hit
-      // path passes an occupancy-cone closure so a reflected sunlit wall
-      // carries its shadow instead of full flat light. Absent → this graph
-      // is byte-identical to before the parameter existed.
-      const lit = vec3(slot.color).mul(atten).mul(cosH);
-      total.addAssign(shadowFn ? lit.mul(float(shadowFn(dirTo, isDir, pointDist, cosH)).clamp(0, 1)) : lit);
-    });
+  const slots = [...lightSlots];
+  /** One slot's closed-form terms. No ray, no shared work between slots. */
+  const termsAt = (slot) => {
+    const isDir = float(slot.kind).toVar();
+    const rel = vec3(slot.vector).sub(P).toVar();
+    const pointDist = rel.length().max(1e-4).toVar();
+    // `vector` holds: point → world position, directional → the normalized
+    // direction TOWARD the light (cascadeGather.js uses the same convention).
+    const dirTo = mix(rel.div(pointDist), vec3(slot.vector), isDir).toVar();
+    let atten = mix(float(1).div(pointDist.mul(pointDist).max(1)), float(1), isDir);
+    // three's PointLight `distance` cutoff (0 = infinite) — GI must die
+    // where the renderer's own direct light does.
+    if (slot.range) {
+      const range = float(slot.range);
+      const ratio = pointDist.div(range.max(1e-4)).clamp(0, 1);
+      const r2 = ratio.mul(ratio);
+      const win = r2.mul(r2).oneMinus().clamp(0, 1);
+      atten = atten.mul(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
+    }
+    // See the `oneSided` note on the signature: `.abs()` is the FIELD-CELL
+    // convention (a cell straddling a wall must light from either side);
+    // `.max(0)` is the SURFACE convention, and a face-forwarded hit normal is
+    // a surface. Same expression `srcShade.js` uses for its own hits.
+    const cosH = (oneSided ? dirTo.dot(N).max(0) : dirTo.dot(N).abs()).toVar();
+    // `shadowFn` (optional, 2026-08-21 — reflection-hit realism): a caller
+    // that can afford a visibility march supplies it; the resolve's hit
+    // path passes an occupancy-cone closure so a reflected sunlit wall
+    // carries its shadow instead of full flat light. Absent → this graph
+    // is byte-identical to before the parameter existed.
+    const lit = vec3(slot.color).mul(atten).mul(cosH).toVar();
+    return { isDir, dirTo, pointDist, cosH, lit };
+  };
+  // ── §19 0.5-D2: ONE VISIBILITY CALL SITE INSTEAD OF MAX_GI_LIGHTS ─────────
+  //
+  // `makeLightSlots()` always builds four slots — correctly; that is R11, and
+  // it is why adding a light is a uniform write and never a recompile. But
+  // with a `shadowFn` the JS loop inlined the whole visibility march four
+  // times, and in `createGiBvhHitShade` that is a BVH descent plus PCSS per
+  // slot. srcShade.js measured the identical shape at ~1.2 s of driver compile
+  // PER CALL SITE, on a kernel that was 66% of a GI boot's compile work.
+  //
+  // The roll keeps every property: still one ray per light, still gated so an
+  // inactive or unlit slot costs nothing, still four uniform slots. Only the
+  // NUMBER OF TIMES THE MARCH IS WRITTEN changes.
+  //
+  // No `shadowFn` (the field/cascade callers) → no expensive call to share, so
+  // the straight-line form stays, and its WGSL is what it always was.
+  if (!shadowFn || slots.length <= 1) {
+    for (const slot of slots) {
+      If(slot.active.greaterThan(0.5), () => {
+        const t = termsAt(slot);
+        total.addAssign(shadowFn
+          ? t.lit.mul(float(shadowFn(t.dirTo, t.isDir, t.pointDist, t.cosH)).clamp(0, 1))
+          : t.lit);
+      });
+    }
+    return total;
   }
+  // The cheap terms stay JS-unrolled OUTSIDE the loop (they are four
+  // independent closed forms; there is nothing to share and hoisting them
+  // keeps `slot.range`'s build-time branch per-slot), then one `select`
+  // funnel feeds the single march — the predicated-gather shape `srcShade.js`
+  // and `neeIrradiance` already use for exactly this reason.
+  const terms = slots.map(termsAt);
+  const actives = slots.map((slot) => float(slot.active).toVar());
+  Loop({ start: int(0), end: int(terms.length), type: "int", condition: "<" }, ({ i }) => {
+    const lit = vec3(0).toVar();
+    const dirTo = vec3(0, 1, 0).toVar();
+    const isDir = float(0).toVar();
+    const pointDist = float(0).toVar();
+    const cosH = float(0).toVar();
+    const active = float(0).toVar();
+    for (let k = 0; k < terms.length; k++) {
+      const take = i.equal(int(k));
+      lit.assign(select(take, terms[k].lit, lit));
+      dirTo.assign(select(take, terms[k].dirTo, dirTo));
+      isDir.assign(select(take, terms[k].isDir, isDir));
+      pointDist.assign(select(take, terms[k].pointDist, pointDist));
+      cosH.assign(select(take, terms[k].cosH, cosH));
+      active.assign(select(take, actives[k], active));
+    }
+    If(active.greaterThan(0.5), () => {
+      total.addAssign(lit.mul(float(shadowFn(dirTo, isDir, pointDist, cosH)).clamp(0, 1)));
+    });
+  });
   return total;
 }
 

@@ -51,10 +51,14 @@ import { MAX_REFLECTION_PROBES, REFL_PROBE_LEVEL_CONES, REFL_PROBE_LEVELS, REFL_
  */
 export function createReflectionProbeCapture({
   scratch, history, bvhScene, gatherAt, emitter, lightSlots, env, normalOffset, intensity, cap = 6,
-  uniforms, staticOcclude = null, dynOcclude = null, shadowReach = null,
+  uniforms, schedule = null, staticOcclude = null, dynOcclude = null, shadowReach = null,
 }) {
   const { centerU, maxDistU, rowU, jitterU, alphaU } = uniforms;
   const capU = uniform(cap);
+  // §19 0.5b — see createReflectionProbeSchedule. Owned by the caller when it
+  // wants the request to survive a re-arm (it should); a private one keeps
+  // this factory usable standalone in probes and fixtures.
+  const sched = schedule ?? createReflectionProbeSchedule();
   const shadows = globalThis.__giProbeShadows !== false;
   const historyNode = history ? texture(history) : null;
 
@@ -217,7 +221,87 @@ export function createReflectionProbeCapture({
     textureStore(scratch, coord, vec4(out, tOut));
   })().compute(REFL_PROBE_TILE * REFL_PROBE_TILE);
 
-  return { compute, cap: capU };
+  return {
+    compute,
+    cap: capU,
+    schedule: sched,
+    /** Ask for a full re-capture of every probe. See the schedule's header. */
+    recapture: (reason) => sched.recapture(reason),
+    /** Alias — `markDirty` is the word the probe records themselves use. */
+    markDirty: (reason) => sched.markDirty(reason),
+  };
+}
+
+/**
+ * ── ⭐⭐ §19 0.5b — THE ATLAS MUST NOT DEPEND ON COMPILE ORDER ─────────────
+ *
+ * The probe capture is a ONE-SHOT in practice: `#armReflectionProbeCapture`
+ * marks every probe dirty when the static world changes, the first non-wave
+ * tick captures each due probe once, and the refresh cadence afterwards only
+ * re-EMAs the same content. So whatever the scene looked like at the moment
+ * that first capture fired is what the atlas holds — and "that moment" is
+ * decided by when a 159 kB kernel finished compiling relative to when the
+ * transport first produced light.
+ *
+ * That is not a theory. §19 0.5's rolled emitter/light loops changed nothing
+ * about the estimator and moved the hit-shade rig's crops 34%; with
+ * `__giReflectionProbes:false` the roll and HEAD agreed exactly. The roll made
+ * the kernel compile 2.5x faster, the capture therefore fired EARLIER, and it
+ * baked a less-converged field into the atlas. A refactor that is provably an
+ * emission change came out looking like an image regression, because the image
+ * was reading a clock.
+ *
+ * The fix is not to slow anything down — it is to stop letting the FIRST
+ * capture be the only one. This is the request channel for that: a
+ * session-lifetime object (it must outlive `#armReflectionProbeCapture`, which
+ * re-mints the kernels whenever the BVH or the gather closure changes) that
+ * the GISystem tick drains.
+ *
+ * ── THE GISYSTEM SIDE (wiring, for the agent holding that file) ────────────
+ *   1. Own one: `this._reflProbeSchedule ??= createReflectionProbeSchedule()`,
+ *      created beside `#ensureReflProbeState` and passed into
+ *      `createReflectionProbeCapture` as `schedule` at GISystem.js:7920.
+ *   2. In the tick, right where `#syncReflectionProbeSlots` is called
+ *      (GISystem.js ~:3200): `const ask = gpu.schedule.take(); if (ask) { for
+ *      (const rec of [...this._reflProbes.values(), ...this._autoReflProbes])
+ *      { rec.dirty = true; rec.rounds = 0; } }` — the same reset
+ *      `#armReflectionProbeCapture`'s worldKey change already performs.
+ *   3. Fire it TWICE, on the two moments the atlas's content actually settles:
+ *      · the first steady frame after the compile wave AND after the transport
+ *        is proven alive (§H item 1's `_transportAlive`, i.e. the post-wave
+ *        `src.readStats` says rays > 0 and deposits/tiles > 0) —
+ *        `schedule.recapture("transport-steady")`;
+ *      · on `settle` (the SRC maturity/settle signal the retention valve
+ *        already publishes) — `schedule.recapture("settle")`.
+ *      Both are idempotent: a pending request is a single flag, so ten calls
+ *      before the tick drains cost one capture round each probe.
+ *
+ * Nothing here changes WHAT the capture renders — same kernel, same uniforms,
+ * same estimator. It changes only how many times it is allowed to run.
+ */
+export function createReflectionProbeSchedule() {
+  let pending = null;
+  let lastReason = null;
+  let count = 0;
+  return {
+    /** Request a full re-capture. Coalesces: the last reason wins. */
+    recapture(reason = "manual") { pending = reason; },
+    /** Same thing, named the way the per-probe records name it. */
+    markDirty(reason = "manual") { pending = reason; },
+    /** The tick drains this. Returns the reason ONCE, then null. */
+    take() {
+      if (!pending) return null;
+      const reason = pending;
+      pending = null;
+      lastReason = reason;
+      count++;
+      return reason;
+    },
+    /** Report-only, for `profile.*` and the probes. */
+    get pending() { return pending; },
+    get lastReason() { return lastReason; },
+    get count() { return count; },
+  };
 }
 
 /**
