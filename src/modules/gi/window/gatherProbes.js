@@ -188,9 +188,20 @@ export function octTable(res) {
  * @param {number} opts.height  resolve height
  * @param {string} [opts.tier]
  * @param {number} [opts.crops] query slots for the receipts
+ * @param {{dir: object, color: object}} [opts.sun]  the ENGINE's sun uniform
+ *   NODES — `dir` is the direction light TRAVELS, `color` its radiance. Passed
+ *   in rather than minted here (§19 Stage 3.5): Stage 3.4 had this factory
+ *   mint its own pair and `gi2System.syncLighting` copy three vectors into
+ *   them every frame, which is two authored descriptions of one light and the
+ *   shape a drift bug lives in. Omitted (the harnesses) → minted as before.
+ * @param {{color: object}} [opts.sky]  same, for the sky radiance.
+ * @param {Array<object>} [opts.emitters]  GISystem's emitter SLOT uniforms
+ *   (`center`, `reff`, `color`, `radius`). When present, `shadeHit` does slot
+ *   NEE at every ray hit — see the block inside it.
  */
 export function createGiGather({
   win, trace, cache, positionTexture, normalTexture, width, height, tier = win.tier, crops = 16,
+  sun = null, sky = null, emitters = null,
 }) {
   const spec = GATHER_TIERS[tier];
   if (!spec) throw new Error(`unknown gather tier "${tier}"`);
@@ -316,9 +327,15 @@ export function createGiGather({
     viewProj: uniform(new THREE.Matrix4()),
     prevViewProj: uniform(new THREE.Matrix4()),
     projScale: uniform(1),
-    sunDir: uniform(new THREE.Vector3(0, -1, 0)),
-    sunColor: uniform(new THREE.Vector3()),
-    skyColor: uniform(new THREE.Vector3()),
+    // ⭐ EXTERNAL WHEN OFFERED, MINTED WHEN NOT (§19 Stage 3.5). These three
+    // are the only uniforms in this file that describe something the ENGINE
+    // already owns, and the mirror that used to bridge them was three vector
+    // copies per frame plus a second place to be wrong. A consumer that hands
+    // in nodes gets its own values read by identity; a harness that hands in
+    // nothing gets exactly the uniforms this file has always had.
+    sunDir: sun?.dir ?? uniform(new THREE.Vector3(0, -1, 0)),
+    sunColor: sun?.color ?? uniform(new THREE.Vector3()),
+    skyColor: sky?.color ?? uniform(new THREE.Vector3()),
     panelCentre: uniform(new THREE.Vector3()),
     panelHalf: uniform(new THREE.Vector2(1, 1)),
     panelRadiance: uniform(new THREE.Vector3()),
@@ -710,6 +727,56 @@ export function createGiGather({
       E.addAssign(u.sunColor.mul(ndl).mul(float(1).sub(sh)));
     });
 
+    // ══ THE EMITTER SLOTS, AT THE HIT (§19 Stage 3.5) ═════════════════════
+    //
+    // Stage 3.4 lit a ray hit from the sun and the palette's own emission and
+    // NOTHING ELSE, so a wall lit by a lamp reflected that lamp only once
+    // `injectLitFrame` had written the voxel from a LIT PIXEL — i.e. only for
+    // surfaces the camera can see. Off screen (which is the entire reason a
+    // radiance cache exists) the second bounce off a lamp-lit surface simply
+    // never arrived: the fresh shade is written with α = 1 and never revisited
+    // (see the panel note below), so "a few frames late" was in fact "never"
+    // for anything the camera never looks at.
+    //
+    // The estimator is the SAME EXPRESSION `gi2System`'s per-probe
+    // `emitterDirectPass` and `giLight.emitterDirectAt` use — the sphere's
+    // analytic solid angle `Ω = min(π, π·reff²/d²)` and one `traceWindow`
+    // shadow ray — so one lamp delivers one energy on all three paths and a
+    // brightness difference between them is a bug, not a convention.
+    //
+    // The ray stops SHORT of the emitter's own body (`reff` plus half a
+    // level-0 cell) for the reason the panel block below spells out at
+    // length: the lamp's geometry is voxelized, and a ray run to the full
+    // distance is occluded by the very light it is sampling.
+    //
+    // Cost is bounded by the FRESH-SLOT count, not by the ray count — this
+    // runs only where `probeTrace` decided a cache slot is stale enough to
+    // re-shade (`STATS.freshShades`, ~10² per frame measured), and it is
+    // `MAX_EMITTERS` rays there, gated on the slot being active and the
+    // surface facing it.
+    for (const slot of emitters ?? []) {
+      const centre = vec3(slot.center).toVar();
+      const reff = float(slot.reff).max(1e-3).toVar();
+      const rgb = vec3(slot.color).toVar();
+      // `radius` is the bounding sphere and doubles as the ACTIVE gate —
+      // `#refreshEmitterSlots` zeroes a retired slot's radius.
+      const active = float(slot.radius).greaterThan(1e-5)
+        .and(rgb.x.add(rgb.y).add(rgb.z).greaterThan(1e-6));
+      If(active, () => {
+        const wv = centre.sub(p).toVar();
+        const d2 = dot(wv, wv).max(1e-4).toVar();
+        const d = sqrt(d2).toVar();
+        const wd = wv.div(d).toVar();
+        const cosX = dot(n, wd).toVar();
+        If(cosX.greaterThan(1e-3), () => {
+          const omega = float(Math.PI).min(float(Math.PI).mul(reff.mul(reff)).div(d2)).toVar();
+          const reach = d.sub(reff).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
+          const vis = float(1).sub(traceWindow(p, wd, reach, n).hit).toVar();
+          E.addAssign(rgb.mul(omega).mul(cosX).mul(vis));
+        });
+      });
+    }
+
     // ══ THE PANEL, AS AN AREA LIGHT, ESTIMATED ONCE AND FOR ALL ═══════════
     //
     // ⭐⭐ THE FRESH SHADE IS WRITTEN WITH α = 1 AND NEVER REVISITED. §L.2's
@@ -744,7 +811,21 @@ export function createGiGather({
     // Skipped at or above the panel's own plane: its emission is already in
     // `pal.w` there, and a light cannot illuminate itself without being
     // counted twice.
-    If(p.y.lessThan(u.panelCentre.y.sub(0.05)), () => {
+    //
+    // ⭐⭐ AND NOT COMPILED AT ALL WHEN THERE ARE SLOTS (§19 Stage 3.5). The
+    // panel IS an emitter — the harness rig's, hard-coded because the rig
+    // predates the slot uniforms — so a build that has real slots has no use
+    // for it, and `gi2System` was already zeroing `panelRadiance` every frame
+    // to switch it off. Zeroing a uniform does not remove WGSL: the block's
+    // FOUR inlined `traceWindow` DDAs were still compiled, and with the slot
+    // NEE above them `probeTrace` reached 51 kB and took **2.5 s** to compile
+    // — which on the Level pushed first light 1.8 → 3.6 s, past its own gate,
+    // for four shadow rays that provably contribute zero. This is the
+    // "unify if clean" the stage asked for, taken at the only place it is
+    // actually clean: ONE emitter representation per build, whichever one the
+    // caller supplied. The Cornell probes pass no `emitters` and get the panel
+    // exactly as before, so the 3.3 bracket is untouched.
+    if (!emitters?.length) If(p.y.lessThan(u.panelCentre.y.sub(0.05)), () => {
       // ⚠ MEASURE THE STOP FROM THE ORIGIN THE TRACE WILL ACTUALLY USE.
       // `traceWindow` pushes the origin `biasCells · v_l` along the normal
       // BEFORE it starts, so a `tMax` measured from `p` overshoots by exactly

@@ -237,7 +237,29 @@ export const CTR_LEVEL_PAIRS = 20; // + level
 export const CTR_LEVEL_BUILT = 28; // + level
 export const CTR_MAXCURSOR = 36; // the deepest pairCursor any brick carried
 export const CTR_LEVEL_DUST = 37; // + level
-export const CTR_WORDS = 48;
+/**
+ * ⭐⭐ THE ONE CUMULATIVE COUNTER, AND WHY IT HAD TO EXIST (§19 Stage 3.5).
+ *
+ * Every other word here is PER FRAME — `resetCtrPass` zeroes them at the top
+ * of each one, which is correct for a budget receipt and useless for a
+ * question about HISTORY. "When did level L first hold a built brick?" is a
+ * history question, and the per-frame word cannot answer it: a small scene
+ * fills in one or two frames, so a sampler reading every frame can still land
+ * AFTER the fill and see the (correct) all-zero settled state. `gi2System`
+ * papered over that with an UPPER BOUND ("≤ N ms, the window filled between
+ * two samples"), which is an admission that the instrument is blind to its
+ * subject, not a measurement of it.
+ *
+ * This word is never reset, so a single readback at ANY later time says
+ * whether the level was ever built — and the first sample that sees it
+ * non-zero bounds the time from above by ONE sampling interval instead of by
+ * however long the harness took to look. Cheap: `CTR_WORDS` grows by 16 and
+ * `resetCtrPass` dispatches over the per-frame prefix only.
+ */
+export const CTR_LEVEL_CUMBUILT = 48; // + level, NEVER RESET
+export const CTR_WORDS = 64;
+/** The prefix `resetCtrPass` zeroes — everything before the cumulative block. */
+export const CTR_FRAME_WORDS = CTR_LEVEL_CUMBUILT;
 
 /**
  * Builds the voxelizer for one window.
@@ -475,9 +497,12 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
   // the list has holes, and a hole read as a pair would voxelize triangle 0
   // into brick 0. Pairs store `tri + 1`, so a zeroed hole is self-identifying —
   // and that only holds if the region really is zero at the top of the frame.
+  // ⚠ `CTR_FRAME_WORDS`, NOT `CTR_WORDS`: the cumulative built-brick block
+  // above it is frame-crossing state (see its own note) and zeroing it would
+  // put the receipt back to being an upper bound.
   const resetCtrPass = Fn(() => {
     atomicStore(ct.element(instanceIndex), uint(0));
-  })().compute(CTR_WORDS);
+  })().compute(CTR_FRAME_WORDS);
 
   // Everything EXCEPT the pair cursors, which are the frame-crossing state the
   // resumable brick is made of. The offset is a tier constant, so the kernel is
@@ -1148,6 +1173,8 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     atomicStore(winAtomics.element(tab.add(uint(1))), uint(STATE_BUILT));
     atomicAdd(ct.element(uint(CTR_BUILT)), uint(1));
     atomicAdd(ct.element(uint(CTR_LEVEL_BUILT).add(level)), uint(1));
+    // The same event, into the word nothing resets — see `CTR_LEVEL_CUMBUILT`.
+    atomicAdd(ct.element(uint(CTR_LEVEL_CUMBUILT).add(level)), uint(1));
     atomicAdd(ct.element(uint(CTR_VOXELS)), setCount);
   })().compute(MAX_DIRTY);
 
@@ -1237,6 +1264,10 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
           // so the honest per-frame work number is `pairsWritten`.
           pairs: a[CTR_LEVEL_PAIRS + l],
           dust: a[CTR_LEVEL_DUST + l],
+          // CUMULATIVE, never reset: "has this level EVER held a built brick"
+          // survives the settled all-zero steady state the per-frame `built`
+          // returns to. `cumBuilt > 0` is what stamps first occupancy.
+          cumBuilt: a[CTR_LEVEL_CUMBUILT + l],
         });
       }
       return {

@@ -26,15 +26,13 @@
 //     the render group, written once per frame by `#updateLightUniforms` /
 //     `#refreshEmitterSlots`, and they are passed IN.
 //
-// ⚠ ONE DEVIATION FROM "PASS THE UNIFORM NODES IN", AND IT IS THE 3.2 API GAP.
-// `createGiGather` mints its OWN `sunDir` / `sunColor` / `skyColor` uniforms
-// and closes over them inside `probeTrace`. There is no way to hand it the
-// system's nodes without editing `gatherProbes.js`, which this unit may not do.
-// So the values are MIRRORED once per frame (three vector copies, in
-// `syncLighting`) rather than duplicated as a second authored source: the
-// system's uniform stays the only thing anyone writes, and the mirror is a
-// read. Listed as an API ask — `createGiGather({ sun, sky })` accepting nodes
-// removes it entirely.
+// ✅ THE 3.2 API GAP IS CLOSED (Stage 3.5). `createGiGather` used to mint its
+// OWN `sunDir` / `sunColor` / `skyColor` uniforms, so this unit MIRRORED three
+// vectors into them every frame. It takes `{ sun, sky }` NODES now and mints
+// only what it is not given (which is what keeps the harnesses working), so
+// the system's uniforms are read by identity and `syncLighting` writes nothing
+// but the camera. The historical note is kept because "why are there two
+// sunDirs" is the question the mirror would otherwise leave behind.
 //
 // ══ THE EMITTER TERM (§M.3) ═════════════════════════════════════════════════
 //
@@ -51,11 +49,13 @@
 //     term the irradiance texture used to carry, at probe resolution instead of
 //     per pixel — the trade PLAN §4.4 names, and the reason
 //     `emitterShadowPass` is not dispatched at all under `GI2_PATH`.
-//   · at a ray HIT — still open. A wall lit by a lamp the probe cannot see
-//     reflects the lamp's light only once `injectLitFrame` or a fresh-slot
-//     shade has written that voxel, so the SECOND bounce off an emitter-lit
-//     surface arrives a few frames late instead of immediately. Closing it
-//     means an emitter-slot NEE inside `shadeHit`, i.e. a `gatherProbes` edit.
+//   · at a ray HIT — CLOSED in Stage 3.5, inside `gatherProbes`' `shadeHit`
+//     (this system passes `emitters` to `createGiGather`). It was not "a few
+//     frames late": a fresh slot is shaded ONCE with α = 1 and never revisited,
+//     so for any surface `injectLitFrame` cannot reach — everything off screen,
+//     which is the whole point of the cache — the lamp's contribution was
+//     permanently absent, not merely delayed. Same `Ω = min(π, π·reff²/d²)`,
+//     same one shadow ray, same self-exclusion as the probe-position term.
 //
 // The projection is exact for the resolve's integrator, not an approximation of
 // it: `probeFilter` writes `SH_i = Σ L(ω)·Δω·Y_i(ω)`, so an emitter delivering
@@ -191,7 +191,11 @@ export function buildGi2Palette(surfaces) {
  * @param {number} opts.resolveWidth
  * @param {number} opts.resolveHeight
  * @param {{position: THREE.Texture, normal: THREE.Texture}} opts.gbuffer
- * @param {Array} [opts.lights]     GISystem light slots (`makeLightSlots`)
+ * @param {Array} [opts.lights]     GISystem light slots (`makeLightSlots`) —
+ *   unread since Stage 3.5 removed the lighting mirror (the sun arrives as
+ *   `env.sun`, two nodes). Kept on the signature because the slot list is what
+ *   a per-slot GI2 direct term would take, and dropping and re-adding a
+ *   parameter is a bigger diff than an honest note.
  * @param {Array} [opts.emitters]   GISystem emitter slots (uniform nodes)
  * @param {object} [opts.lightTree] the W1 region, when one exists
  * @param {{sky: object, ao: object}} [opts.env]
@@ -277,8 +281,23 @@ export function createGi2System({
       normalTexture: gbuffer.normal,
       width, height, tier,
       crops: 8,
+      // §19 Stage 3.5 — THE 3.2 API GAP IS CLOSED (see the header note, now
+      // historical). The gather takes the system's own nodes; nothing is
+      // mirrored, and there is one authored description of the sun, of the
+      // sky, and of each emitter slot.
+      sun: env?.sun ?? null,
+      sky: env?.sky ? { color: env.sky } : null,
+      // Slot NEE at every ray hit — second-bounce lamp light without waiting
+      // for `injectLitFrame` to see the surface. Same four slots the per-probe
+      // `emitterDirectPass` below reads, same solid-angle expression.
+      emitters: emitters ?? null,
     });
     gather.uniforms.projScale.value = projScaleOf(camera, height);
+    // The Cornell panel is the harness rig's emitter and has no scene source.
+    // Zeroed ONCE, at build: `shadeHit`'s panel NEE then contributes nothing
+    // for the life of the gather, and scene emitters arrive through the slot
+    // NEE above and through `emitterDirectPass`.
+    gather.uniforms.panelRadiance.value.set(0, 0, 0);
     for (const [key, node] of Object.entries(gather.passes)) {
       const stamp = (n, i) => {
         if (n && typeof n === "object") n.__giPassName ??= i == null ? `gi2.${key}` : `gi2.${key}#${i}`;
@@ -592,31 +611,23 @@ export function createGi2System({
   };
 
   /**
-   * Mirror the system's lighting uniforms into the gather's own (see the header
-   * note on the 3.2 API gap). `sun` is stored TOWARD the light by GISystem's
-   * light slots; the gather's `sunDir` is the direction light TRAVELS.
+   * The per-frame CAMERA uniforms, and only those.
+   *
+   * ⭐ §19 Stage 3.5 — THE LIGHTING MIRROR IS GONE. Stage 3.4 copied three
+   * vectors here every frame (the sun's direction and colour, the sky's
+   * radiance) because `createGiGather` minted its own uniforms and there was
+   * no way to hand it the system's. It takes `{sun, sky}` NODES now
+   * (`buildGather` passes them), so the values are read by identity: the
+   * engine writes them once, where it computes them (`#updateLightUniforms`),
+   * and there is no second place for them to be wrong.
+   *
+   * ⚠ `env.sunSlot` is consequently NOT read here any more. Picking the
+   * analytic sun out of the slot list is `#updateLightUniforms`' job and it
+   * already does it — reading the index a second time to re-derive the same
+   * answer was the mirror, not a safeguard.
    */
   const syncLighting = () => {
     const u = gather.uniforms;
-    // `sunSlot` is GISystem's §12.82 uniform: the index of the one directional
-    // slot it treats analytically, −1 for none. Read `.value` every frame —
-    // adding, hiding or dimming a light reshuffles the slot list and must never
-    // cost a GI rebuild (R11), so the index genuinely moves.
-    const sunSlot = env?.sunSlot?.value ?? env?.sunSlot ?? -1;
-    const slot = lights && sunSlot >= 0 && sunSlot < lights.length ? lights[sunSlot] : null;
-    if (slot && slot.active.value > 0.5) {
-      const v = slot.vector.value;
-      u.sunDir.value.set(-v.x, -v.y, -v.z);
-      u.sunColor.value.set(slot.color.value.r, slot.color.value.g, slot.color.value.b);
-    } else {
-      u.sunColor.value.set(0, 0, 0);
-    }
-    const sky = env?.sky?.value;
-    if (sky) u.skyColor.value.set(sky.r, sky.g, sky.b);
-    // The Cornell panel is the harness rig's emitter and has no scene source —
-    // zero its radiance so `shadeHit`'s NEE compiles to a no-op contribution.
-    // Scene emitters arrive through `emitterDirectPass` instead.
-    u.panelRadiance.value.set(0, 0, 0);
     u.camPos.value.copy(camPos);
     u.viewProj.value.copy(viewProj);
     u.prevViewProj.value.copy(prevViewProj);
@@ -680,29 +691,43 @@ export function createGi2System({
     // otherwise read as lifetime totals, and every §L.7 receipt is a
     // per-frame number. Striped and uniform-gated, so it is ~0.01 ms.
     if (!aoCompose && env?.ao?.node) aoCompose = buildAoComposePass();
-    const after = [
-      gather.passes.clearStats,
-      gather.passes.hzbBuild,
-      ...gather.passes.hzbReduce,
-      gather.passes.probePlace,
-      gather.passes.probeTrace,
-      gather.passes.probeFilter,
-    ];
-    if (emitterDirect) after.push(emitterDirect);
-    after.push(gather.passes.resolve);
-    // GTAO's own dispatches. `#armGtaoPass` appends them to whatever list the
-    // transport hands it — on the SRC path that was `srcProbes.passes`, here it
-    // is an array GISystem publishes as `ao.computes`. Read at PASS-BUILD time,
-    // not captured at construction: this system is created before the AO pass
-    // exists (it has to be — the AO pass reads the resolve's own size), so the
-    // array is empty on the first read and filled a few lines later.
-    for (const p of env?.ao?.computes ?? []) after.push(p);
-    // AO lands on the resolved irradiance, before anything reads it: the
-    // composite's lit frame feeds both `injectLitFrame` and the next frame's
-    // screen segment, and an unoccluded lit frame would put the AO-less answer
-    // into the cache and read it back as light.
-    if (aoCompose) after.push(aoCompose);
-    after.push(gather.passes.composite, gather.passes.inject);
+    // ══ THE CHAIN IS `frameOrder`, NOT A HAND-WRITTEN LIST ═══════════════════
+    //
+    // Stage 3.4 listed `passes.*` by hand and that list was already wrong the
+    // day it was written: 3.3 had SPLIT `probeFilter` into a prep + an SH
+    // bilateral (`probeShFilter`) and split `resolve` into `resolveHalf` +
+    // `resolveUpsample`, and a hand list cannot pick up a split — it fails
+    // SILENTLY (the new kernel simply never runs; here it meant the SH
+    // bilateral never ran and the FULL-RES resolve did, 1.02 → 1.93 ms).
+    // `gather.frameOrder` is the gather's own order and it is the only thing
+    // read here. This consumer's two extra kernels splice into a copy of it at
+    // points named by IDENTITY, never by index:
+    //
+    //   · the emitter SH add goes immediately BEFORE `resolveHalf` — the
+    //     first kernel that READS the filtered half of `probeSh`, which is
+    //     exactly where the term has to be for the resolve to integrate it;
+    //   · GTAO + its compose go immediately AFTER `resolveUpsample`, which is
+    //     the kernel that writes the full-res irradiance they scale.
+    const after = [gather.passes.clearStats];
+    for (const node of gather.frameOrder) {
+      if (emitterDirect && node === gather.passes.resolveHalf) after.push(emitterDirect);
+      after.push(node);
+      if (node === gather.passes.resolveUpsample) {
+        // GTAO's own dispatches. `#armGtaoPass` appends them to whatever list
+        // the transport hands it — on the SRC path that was `srcProbes.passes`,
+        // here it is an array GISystem publishes as `ao.computes`. Read at
+        // PASS-BUILD time, not captured at construction: this system is created
+        // before the AO pass exists (it has to be — the AO pass reads the
+        // resolve's own size), so the array is empty on the first read and
+        // filled a few lines later.
+        for (const p of env?.ao?.computes ?? []) after.push(p);
+        // AO lands on the resolved irradiance, before anything reads it: the
+        // composite's lit frame feeds both `injectLitFrame` and the next
+        // frame's screen segment, and an unoccluded lit frame would put the
+        // AO-less answer into the cache and read it back as light.
+        if (aoCompose) after.push(aoCompose);
+      }
+    }
 
     return { before, after, all: [...before, ...after] };
   };
@@ -769,31 +794,40 @@ export function createGi2System({
       if (voxelizer) {
         lastVox = await voxelizer.stats(r);
         out.voxelizer = lastVox;
-        // Per-level time-to-first-occupancy (§K.8): the first frame each level
-        // reported a built brick.
+        // Per-level time-to-first-occupancy (§K.8).
+        //
+        // ⭐ READ THE CUMULATIVE WORD (§19 Stage 3.5). `built`/`pairs` are PER
+        // FRAME and a small scene's window fills in one or two of them, so a
+        // sampler that reads every frame could still land after the fill and
+        // see the (correct) all-zero settled state — "no occupancy" was then
+        // indistinguishable from "no voxelizer", and the guard below had to
+        // stamp an UPPER BOUND to say anything at all. `cumBuilt` is never
+        // reset, so the first sample that sees it non-zero bounds the event by
+        // ONE sampling interval rather than by however long the harness took
+        // to look, and the bound path is now a fallback for a voxelizer too
+        // old to publish it rather than the normal answer.
         for (const lvl of lastVox.perLevel ?? []) {
-          if ((lvl.built > 0 || lvl.pairs > 0) && !marks.occupancy.has(lvl.level)) {
+          const occupied = (lvl.cumBuilt ?? 0) > 0 || lvl.built > 0 || lvl.pairs > 0;
+          if (occupied && !marks.occupancy.has(lvl.level)) {
             marks.occupancy.set(lvl.level, Math.round(performance.now() - t0));
-            console.log(`[gi2] first occupancy L${lvl.level} at ${marks.occupancy.get(lvl.level)} ms`);
+            console.log(`[gi2] first occupancy L${lvl.level} at ${marks.occupancy.get(lvl.level)} ms` +
+              ((lvl.cumBuilt ?? 0) > 0 ? ` (${lvl.cumBuilt} bricks built so far)` : ""));
           }
         }
-        // ⚠ BLIND-INSTRUMENT GUARD. Every voxelizer counter is PER FRAME and
-        // reset by the next frame's `resetCtr`, and a small scene's window
-        // fills in one or two frames — so a sampler that reads every frame can
-        // still land after the fill and see the (correct) all-zero steady
-        // state. "No occupancy" would then be indistinguishable from "no
-        // voxelizer", which is the failure this stage actually had. A ray that
-        // came back from the STATIC window is proof of occupancy that no
-        // sampling rate can miss, so it stamps an UPPER BOUND rather than
-        // leaving the receipt empty.
+        // ⚠ BLIND-INSTRUMENT GUARD, kept as a FALLBACK. A ray that came back
+        // from the STATIC window is proof of occupancy that no sampling rate
+        // can miss, so if the cumulative counters somehow said nothing this
+        // still stamps an upper bound rather than leaving the receipt empty.
         if (!marks.occupancy.size && (lastGather?.windowHits ?? 0) > 0 && marks.voxelizer) {
           const at = Math.round(performance.now() - t0);
           for (let l = 0; l < win.levels; l++) marks.occupancy.set(l, at);
           out.occupancyBound = true;
-          console.log(`[gi2] first occupancy: ≤ ${at} ms (the window filled between two stat samples — ` +
-            "the per-frame counters had already returned to their settled zeros; " +
-            `${lastGather.windowHits} rays came back from it)`);
+          console.log(`[gi2] first occupancy: ≤ ${at} ms (UPPER BOUND — no level reported a cumulative ` +
+            `built brick, yet ${lastGather.windowHits} rays came back from the window)`);
         }
+        out.cumBuilt = Object.fromEntries(
+          (lastVox.perLevel ?? []).map((l) => [l.level, l.cumBuilt ?? 0]),
+        );
         out.occupancyMs = Object.fromEntries(marks.occupancy);
       }
       if (dynamic) {
@@ -882,8 +916,20 @@ export function createGi2System({
      */
     statsCadence() {
       if (!voxelizer) return 12;
-      const levelsSeen = marks.occupancy.size >= win.levels;
-      const settled = levelsSeen || (marks.voxelizer && performance.now() - marks.voxelizer > 20_000);
+      // ⚠⚠ AND FIRST LIGHT IS ONE OF THE THINGS THE TIGHT CADENCE IS FOR
+      // (§19 Stage 3.5). This used to back off the moment every level had
+      // reported occupancy — which was safe only because the per-frame
+      // counters made that a slow, staggered event. The cumulative counter
+      // stamps every level on the FIRST sample that sees any brick, so the
+      // back-off arrived while the gather's pipelines were still compiling,
+      // and `first light` — which is stamped at READBACK time, not at the
+      // event — was then measured up to 30 frames late. On Bistro that read
+      // 9.8 s for a boot whose rays came back at ~5.
+      //
+      // ⭐ A CADENCE THAT BACKS OFF BEFORE THE LAST THING IT MEASURES HAS
+      // HAPPENED IS AN INSTRUMENT MEASURING ITS OWN SAMPLING RATE.
+      const filled = marks.occupancy.size >= win.levels && marks.firstLight > 0;
+      const settled = filled || (marks.voxelizer && performance.now() - marks.voxelizer > 20_000);
       return settled ? 30 : 1;
     },
     /**

@@ -243,12 +243,39 @@
         const deadline = performance.now() + 60_000;
         let stats = null;
         let settled = 0;
+        // GI2's orchestrator, latched by the boot loop below rather than read
+        // here: `system.state` does not exist until the component builds.
+        let gi2Boot = null;
+        let gi2BootStats = null;
         while (performance.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 500));
           const system = engine.modules.get("gi")?.system;
           if (!system?.state || engine.renderSuspended || validationErrors.length) continue;
           settled++;
           stats = await system.readRayHitStats();
+          // ── GI2's OWN BOOT GATE (§19 Stage 3.4) ─────────────────────────
+          //
+          // Under `GI2_PATH` `readRayHitStats()` returns null FOREVER: those
+          // counters live on the occupancy field's `rayHitDebug`, and GI2
+          // builds no occupancy field. So NEITHER exit below can ever fire and
+          // every GI2 arm sat out the full 60 s — frequently past the runner's
+          // 120 s page budget, where it reads as a hang rather than as a
+          // transport that simply has no ray-hit counters.
+          //
+          // GI2's liveness receipt is the gather's own: a ray that came BACK
+          // from the static window (`windowHits`) proves the scroll ran, the
+          // voxelizer built bricks and the trace found them — the GI2 spelling
+          // of "rays fired AND something deposited". `settled >= 8` keeps a few
+          // seconds of window fill inside the numbers the tally reports later,
+          // so the exit is not the first frame that happened to latch.
+          if (!stats) {
+            gi2Boot = system.state?.screen?.gi2 ?? system._gi2 ?? null;
+            if (gi2Boot) {
+              gi2BootStats = await gi2Boot.stats(engine.renderer);
+              if (settled >= 8 &&
+                ((gi2BootStats.windowHits ?? 0) > 0 || (gi2BootStats.screenHits ?? 0) > 0)) break;
+            }
+          }
           if (stats?.rays > 0 &&
             (!hybridMode || stats.brickSteps > 0) &&
             (!planeMode || stats.planeTests > 0) &&
@@ -484,6 +511,15 @@
         if (state?.rayHitConfig?.activeMode !== expectedActiveMode) {
           throw new Error(`ray-hit mode ${rayHitMode} did not activate (active=${state?.rayHitConfig?.activeMode})`);
         }
+        // ── WHICH TRANSPORT IS LIVE, ASKED OF THE BUILD ITSELF ─────────────
+        //
+        // `GI2_PATH` is a module-private build constant — this page cannot
+        // read it and must not try. The honest question is which system got
+        // BUILT: `screen.srcProbes` (the SRC path) or `screen.gi2` (the
+        // window + screen-probe path). Every transport tally below branches on
+        // these two and on nothing else, so an arm cannot end up asserting
+        // against a transport that is not in the build.
+        const gi2 = state?.screen?.gi2 ?? engine.modules.get("gi")?.system?._gi2 ?? null;
         // The SRC population's kernels are NOT in `state.queue` (they are
         // dispatched off the gbuffer, ahead of it), so the audit has to be told
         // about them explicitly or the arm would audit nothing and pass.
@@ -612,7 +648,20 @@
 
         // ── ?src=1 assertions ────────────────────────────────────────────
         let srcReport = null;
-        if (srcArm) {
+        if (srcArm && !state?.screen?.srcProbes && gi2) {
+          // ⚠ NOT A FAILURE UNDER GI2. `?src=1` sets `__giSrcProbes`, but
+          // GISystem gates the probe system behind `!GI2_PATH &&
+          // srcProbesEnabled()` — so on a GI2 build the flag is honoured by
+          // building NOTHING, and every assertion in this arm (readStats, the
+          // cascade ladder, the split rule, the tile bake, the gizmo draw, the
+          // [J] size A/B) is a statement about a transport that is not here.
+          // It used to die on `src.readStats(...)` of `undefined` and take the
+          // storage-binding audit's PASS down with it — the one assertion on
+          // this page that is transport-independent. Skip it by NAME and let
+          // the GI2 transport tally below carry the arm.
+          console.log("GI-SMOKE NOTE src arm skipped — this build has no SRC probe system " +
+            "(GI2_PATH); the GI-SMOKE GI2 transport tally below reports the live path instead.");
+        } else if (srcArm) {
           const src = state?.screen?.srcProbes;
           if (!src) throw new Error("src arm: __giSrcProbes was set but no probe system was built");
           // POLL until the tallies are live, don't read once. The dynobj arm
@@ -1061,6 +1110,94 @@
           }
         }
         if (validationErrors.length) throw new Error(validationErrors.join(" | "));
+        // ── THE GI2 TRANSPORT TALLY (§19 Stage 3.4) ───────────────────────
+        //
+        // The GI2 counterpart of the `?src=1` numbers above, and it runs on
+        // EVERY arm rather than behind a flag: GI2 is the LIT path, so whether
+        // its transport is alive is not one special arm's business, it is the
+        // page's. One `stats()` call = one readback.
+        //
+        // ⚠ THE COUNTERS ARE PER-FRAME. They are atomics cleared by
+        // `gather.passes.clearStats` at the top of every frame, so what is read
+        // here is the LAST RENDERED FRAME's numbers — the engine is stopped
+        // above, which freezes them rather than racing them. That is also why
+        // only the structural number is asserted unconditionally below.
+        let gi2Report = null;
+        if (gi2) {
+          let g = await gi2.stats(engine.renderer);
+          // ⚠ THE BOOT SAMPLE IS THE FALLBACK, NOT THE SOURCE. The read above
+          // is the frozen last rendered frame, which is the most current
+          // number this page can hold. But a readback that FAILED reports the
+          // same shape as one that measured nothing (`stats()` swallows the
+          // error into `statsError` and returns the structural fields alone),
+          // and an instrument fault must not be published as a measured zero
+          // — the boot loop's own latched sample is a real frame.
+          if ((g.statsError || g.probesPlaced === undefined) && gi2BootStats) g = gi2BootStats;
+          gi2Report = {
+            tier: g.tier, built: !!g.built, frame: g.frame,
+            probes: g.probes ?? 0, rays: g.rays ?? 0,
+            probesPlaced: g.probesPlaced ?? 0, probesValid: g.probesValid ?? 0,
+            reprojHits: g.reprojHits ?? 0,
+            raysLaunched: g.raysLaunched ?? 0, raysTraced: g.raysTraced ?? 0,
+            screenHits: g.screenHits ?? 0, windowHits: g.windowHits ?? 0,
+            skyMiss: g.skyMiss ?? 0,
+            freshShades: g.freshShades ?? 0, alphaForced: g.alphaForced ?? 0,
+            injectWrites: g.injectWrites ?? 0, handoffs: g.handoffs ?? 0,
+            windowMB: g.windowMB ?? 0, cacheMB: g.cacheMB ?? 0,
+            palClasses: g.palClasses ?? 0,
+            soupTris: g.soupTris ?? 0, soupMB: g.soupMB ?? 0, movers: g.movers ?? 0,
+            voxelizerBuilt: !!g.voxelizer, dynamicBuilt: !!g.dynamic,
+            msToFirstLight: g.msToFirstLight ?? 0,
+            occupancyMs: g.occupancyMs ?? {},
+            statsError: g.statsError ?? null,
+          };
+          console.log("GI-SMOKE GI2", JSON.stringify(gi2Report));
+          // ── THE ONE STRUCTURAL ASSERTION ─────────────────────────────────
+          //
+          // `rays` is `probeCount × raysPerProbe` — a BUILD-time product, not
+          // a per-frame counter, so it is nonzero the instant the gather
+          // exists and no sampling window can flake it. A BUILT GI2 that
+          // budgets zero rays is a gather that allocated no probes: the
+          // transport can never deliver anything, and every downstream number
+          // on this page would be a correct, verifiable zero.
+          if (gi2Report.built && !(gi2Report.rays > 0)) {
+            throw new Error(
+              `gi2: the transport is built but budgets ${gi2Report.rays} rays over ` +
+              `${gi2Report.probes} probes — the screen-probe gather allocated nothing`,
+            );
+          }
+          // ── AND THE PER-FRAME ONES, ON DEMAND ONLY ───────────────────────
+          //
+          // `windowHits`/`screenHits` say the transport LATCHED, which is the
+          // GI2 spelling of the SRC arm's `rays > 0`. But their value depends
+          // on when the last frame landed relative to the window fill, and a
+          // gate that can be argued about by timing is the gate that teaches
+          // you to re-run the suite (§12.39). `?requirerays=1` — the same flag
+          // that pins the SRC demand on — makes them failures; otherwise the
+          // numbers are printed and the demand is a NOTE, never a throw on
+          // `undefined`.
+          const gi2Demand = new URLSearchParams(location.search).get("requirerays") === "1";
+          const gi2Alive = gi2Report.windowHits > 0 || gi2Report.screenHits > 0;
+          if (!gi2Alive && gi2Demand) {
+            throw new Error(
+              "gi2: no ray came back from the window or the screen on the last frame " +
+              `(windowHits ${gi2Report.windowHits}, screenHits ${gi2Report.screenHits}, ` +
+              `probesValid ${gi2Report.probesValid}/${gi2Report.probesPlaced}, ` +
+              `launched ${gi2Report.raysLaunched}, traced ${gi2Report.raysTraced}) — ` +
+              "the transport never latched",
+            );
+          }
+          if (!gi2Alive) {
+            console.log("GI-SMOKE NOTE gi2 reported no window/screen hit on the last frame " +
+              `(probesValid ${gi2Report.probesValid}, launched ${gi2Report.raysLaunched}) — ` +
+              "these are PER-FRAME counters, so this is a sampling statement and not a " +
+              "verdict; `?requirerays=1` turns it into one.");
+          }
+        } else if (!state?.screen?.srcProbes) {
+          console.log("GI-SMOKE NOTE no transport tally — neither `screen.srcProbes` nor " +
+            "`screen.gi2` is on this system, so there are no per-frame transport numbers " +
+            "to report (the storage/binding census above still ran).");
+        }
         // ── WHO FEEDS THE TRAVERSAL COUNTERS, AND WHEN ────────────────────
         //
         // Every assertion below measures the ray-hit PROFILING counters, and the
@@ -1112,7 +1249,17 @@
           }
         }
         let surfaceAlloc = null;
-        if (planeMode) {
+        if (planeMode && !state?.volume?.occupancyField) {
+          // The surface-record pool is a property of the OCCUPANCY FIELD, and
+          // `GI2_PATH` builds none — GI2's medium is the window's brick table
+          // plus the triangle soup, both reported by GI-SMOKE GI2 below.
+          // Reading `.occupancyField.readbackSurfaceAlloc` unguarded threw on
+          // `undefined` and took the whole arm down with it, including the
+          // storage-binding audit's PASS.
+          console.log("GI-SMOKE NOTE surface-record pool assertions skipped — no occupancy " +
+            "field on this build (GI2_PATH); GI2's medium (window MB, soup tris, palette " +
+            "classes) is reported by the GI-SMOKE GI2 line above.");
+        } else if (planeMode) {
           surfaceAlloc = await engine.modules.get("gi").system.state.volume
             .occupancyField.readbackSurfaceAlloc(engine.renderer);
           if (!surfaceAlloc?.allocated) throw new Error("surface-record pool allocated zero records");
@@ -1471,28 +1618,51 @@
           surfaceAlloc,
           bindingAudit,
           srcProbes: srcReport,
+          // Mutually exclusive with `srcProbes` by construction: the page
+          // reports whichever transport it actually built, and the runner
+          // prints whichever one is present.
+          gi2: gi2Report,
         };
-        console.log(
-          `GI-SMOKE PASS storage=8 mode=${rayHitMode} rays=${stats.rays} ` +
-          `avgMacro=${stats.averageMacroSteps.toFixed(2)} avgBrick=${stats.averageBrickSteps.toFixed(2)} ` +
-          `maxMacro=${stats.maxMacroSteps} maxBrick=${stats.maxBrickSteps} ` +
-          (hybridMode
-            ? `coarse=${stats.coarseSteps} skipL3=${stats.coarseSkipsL3} ` +
-              `skipL4=${stats.coarseSkipsL4} descends=${stats.coarseDescends} ` +
-              `skip=${coarseSkip ? "on" : "off"} `
-            : "") +
-          (planeMode
-            ? `planeTests=${stats.planeTests} planeAccepts=${stats.planeAccepts} ` +
-              `planeRejects=${stats.planeRejects} boxFallbacks=${stats.surfaceFallbacks} ` +
-              `surfRecords=${surfaceAlloc.allocated}/${surfaceAlloc.capacity} `
-            : "") +
-          (exactMode
-            ? `complexTests=${stats.complexTests} triTests=${stats.triangleTests} ` +
-              `complexAccepts=${stats.complexAccepts} complexMisses=${stats.complexMisses} ` +
-              `poolTris=${surfaceAlloc.triangles ?? 0} complexOverflow=${surfaceAlloc.complexOverflowCells ?? 0} `
-            : "") +
-          `limitExits=0 invalid=0 aggregateGpuMs=${engine.stats.readout.gpuMs.toFixed(2)}`,
-        );
+        // ⚠ `stats` IS NULL ON A GI2 BUILD — `readRayHitStats()` reads the
+        // occupancy field's `rayHitDebug` and GI2 builds no field. This is the
+        // LAST thing the page does, AFTER `__GI_SMOKE_RESULT__` was already
+        // set to `{pass:true}`, so dereferencing `stats.rays` here threw a
+        // TypeError that `fail()` caught and used to flip a green arm red at
+        // the finish line — the least attributable failure this page can
+        // produce. With no field there are no traversal counters to print;
+        // the GI2 tally is the transport line instead.
+        if (stats) {
+          console.log(
+            `GI-SMOKE PASS storage=8 mode=${rayHitMode} rays=${stats.rays} ` +
+            `avgMacro=${stats.averageMacroSteps.toFixed(2)} avgBrick=${stats.averageBrickSteps.toFixed(2)} ` +
+            `maxMacro=${stats.maxMacroSteps} maxBrick=${stats.maxBrickSteps} ` +
+            (hybridMode
+              ? `coarse=${stats.coarseSteps} skipL3=${stats.coarseSkipsL3} ` +
+                `skipL4=${stats.coarseSkipsL4} descends=${stats.coarseDescends} ` +
+                `skip=${coarseSkip ? "on" : "off"} `
+              : "") +
+            (planeMode
+              ? `planeTests=${stats.planeTests} planeAccepts=${stats.planeAccepts} ` +
+                `planeRejects=${stats.planeRejects} boxFallbacks=${stats.surfaceFallbacks} ` +
+                `surfRecords=${surfaceAlloc?.allocated}/${surfaceAlloc?.capacity} `
+              : "") +
+            (exactMode
+              ? `complexTests=${stats.complexTests} triTests=${stats.triangleTests} ` +
+                `complexAccepts=${stats.complexAccepts} complexMisses=${stats.complexMisses} ` +
+                `poolTris=${surfaceAlloc?.triangles ?? 0} complexOverflow=${surfaceAlloc?.complexOverflowCells ?? 0} `
+              : "") +
+            `limitExits=0 invalid=0 aggregateGpuMs=${engine.stats.readout.gpuMs.toFixed(2)}`,
+          );
+        } else {
+          console.log(
+            `GI-SMOKE PASS storage=8 mode=${rayHitMode} transport=${gi2Report ? "gi2" : "none"} ` +
+            `rays/frame=${gi2Report?.rays ?? 0} probes=${gi2Report?.probes ?? 0} ` +
+            `probesValid=${gi2Report?.probesValid ?? 0} windowHits=${gi2Report?.windowHits ?? 0} ` +
+            `screenHits=${gi2Report?.screenHits ?? 0} skyMiss=${gi2Report?.skyMiss ?? 0} ` +
+            `injectWrites=${gi2Report?.injectWrites ?? 0} freshShades=${gi2Report?.freshShades ?? 0} ` +
+            `rayHitCounters=none aggregateGpuMs=${engine.stats.readout.gpuMs.toFixed(2)}`,
+          );
+        }
       } catch (error) {
         fail(error);
       }

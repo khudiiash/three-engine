@@ -85,6 +85,41 @@ for (const arm of arms) {
             `lum ${g.minLum}..${g.maxLum} mean ${g.meanLum}, contrast ${g.contrast}`);
         }
       }
+      // ── THE GI2 TRANSPORT TALLY (§19 Stage 3.4) ──────────────────────────
+      //
+      // `result.srcProbes` and `result.gi2` are mutually exclusive by
+      // construction — the page reports whichever transport it actually BUILT,
+      // detected by presence (`screen.srcProbes` vs `screen.gi2`) rather than
+      // from a build flag it cannot read. So this is the GI2 spelling of the
+      // block above, and it exists for the same reason: on a GI2 build a bare
+      // PASS would hide every number the arm produced, which is how a
+      // transport that budgets rays and lands none reads as green.
+      //
+      // ⚠ EVERY COUNTER HERE IS PER-FRAME (the gather's atomics are cleared at
+      // the top of each frame), so these are the last rendered frame's
+      // numbers, not lifetime totals. `rays` is the exception and is
+      // structural: probes × rays-per-probe, fixed when the gather is built.
+      if (result.gi2) {
+        const g = result.gi2;
+        console.log(`  gi2 transport: ${g.rays} rays/frame over ${g.probes} probes ` +
+          `(tier ${g.tier}, ${g.built ? "built" : "NOT BUILT"}, frame ${g.frame}), ` +
+          `probesValid ${g.probesValid}/${g.probesPlaced}, reproj ${g.reprojHits}, ` +
+          `launched ${g.raysLaunched} traced ${g.raysTraced}`);
+        console.log(`  gi2 hits: window ${g.windowHits}, screen ${g.screenHits}, ` +
+          `sky ${g.skyMiss}, handoffs ${g.handoffs}, first light ${g.msToFirstLight}ms`);
+        // The CACHE-WRITE line. `injectWrites` is the radiance cache's write
+        // counter and `freshShades` the fresh-slot shade count — together they
+        // say whether the frame put anything INTO the cache or only read it,
+        // which is the difference between a transport that is converging and
+        // one that is replaying a stale window.
+        console.log(`  gi2 cache: ${g.injectWrites} writes, ${g.freshShades} fresh shades, ` +
+          `${g.alphaForced} alpha-forced, ${g.cacheMB}MB cache / ${g.windowMB}MB window`);
+        console.log(`  gi2 medium: ${g.soupTris} soup tris (${g.soupMB}MB), ` +
+          `${g.palClasses} palette classes, ${g.movers} movers, ` +
+          `voxelizer ${g.voxelizerBuilt ? "built" : "none"}, ` +
+          `dynamic ${g.dynamicBuilt ? "built" : "none"}`);
+        if (g.statsError) console.log(`  gi2 stats error: ${g.statsError}`);
+      }
       const unfed = logs.find((l) => l.includes("traversal counters unfed"));
       if (unfed) console.log(`  note: ${unfed.replace("GI-SMOKE NOTE ", "")}`);
     } else {

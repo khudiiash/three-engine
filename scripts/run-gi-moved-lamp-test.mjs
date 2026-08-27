@@ -31,15 +31,34 @@
 // floor is the glow and ONLY the glow — a pure function of the slot uniforms.
 //
 // We sample a full-res crop at the SPECULAR HIGHLIGHT of the lamp's OLD
-// position and at the highlight of its NEW position, ~3 m away, after the
-// lamp has been held still for >= 2.5 s. PASS = the new-side crop is brighter
-// than the old-side crop by `MIN_MARGIN`.
+// position and at the highlight of its NEW position, ~3 m away, both BEFORE
+// the move and again after the lamp has been held still for >= 2.5 s. PASS =
+// each spot's OWN reading moved the way the glow moved: the new spot GAINED
+// at least `MIN_RISE`. (The two spots' separation is printed beside it but is
+// NOT a gate — the control arm clears it; see the block above `const pass`.)
 //
-// MEASURED SEPARATION, HEAD a48af3a (before Stage 1.2): old-spot 30.01 → 1.35
-// and new-spot 0.77 → 30.44, i.e. the after-move margin is 29.09 luminance and
-// the before-move margin is 29.24 the other way. The default threshold is HALF
-// of that, 14 — a margin the current code clears by 2x, and one the frozen-
-// uniform failure (glow left behind at the old spot, margin ≈ -29) inverts.
+// ⛔ WHY NOT THE ABSOLUTE MARGIN ANY MORE (the GI2 PEDESTAL). Until §19 the
+// gate was `after.new - after.old > 14` — one crop's absolute luminance
+// against the other's. Under GI2 a GLOSSY PEDESTAL sits under the highlight
+// and adds a large, near-equal constant to BOTH crops, which swamps a
+// difference-of-levels gate while leaving the mechanism untouched: measured
+// on GI2 the new spot rose +49.5 and the old spot fell -13.9 across the same
+// move that the absolute gate could no longer see. A per-spot DELTA cancels
+// the pedestal exactly, because the pedestal is in the before reading and the
+// after reading of the SAME crop and a constant added to both vanishes from
+// their difference. Nothing about the scene, the move or the crops changed —
+// only which arithmetic the assertion runs on them.
+//
+// MEASURED, HEAD a48af3a (before Stage 1.2, SRC path): old-spot 30.01 → 1.35
+// and new-spot 0.77 → 30.44 — Δnew +29.67, Δold -28.66, separation 58.33.
+// MEASURED on GI2: Δnew +49.5, Δold -13.9, separation 63.4.
+// MEASURED on the REVERT ARM (uniforms back in `objectGroup`, see below):
+// old-spot 30.64 → 30.62 and new-spot 1.06 → 1.59 — Δnew +0.53, Δold -0.02,
+// separation 0.55. RE-MEASURED on GI2's revert arm: old-spot 182.73 -> 150.13
+// and new-spot 199.42 -> 197.07 — Δnew **-2.35**, Δold -32.6, separation 30.25.
+// Note what GI2 changed: the old spot still goes dark (its TRANSPORT sees the
+// lamp leave) but the new spot does not light up, so Δnew is the half of the
+// story that stayed sensitive and separation is the half that stopped being.
 //
 // WHY THE DECOY MESHES. One floor mesh would be the only render object of its
 // material and would therefore win the once-per-render refresh every frame —
@@ -52,16 +71,34 @@
 // HOW TO RE-PROVE THE GROUP MOVE. There is no hatch — make GISystem's
 // `giUniform` return `uniform(...args)` without `.setGroup(renderGroup)` (and
 // giLight's `intensityUniform` likewise) and re-run: measured old-spot 30.64 →
-// 30.62 and new-spot 1.06 → 1.59, i.e. margin -29.03, RED. The glow simply
-// stays where the material was compiled.
+// 30.62 and new-spot 1.06 → 1.59 — Δnew +0.53 against a gate of 12 and a
+// RED. The glow simply stays where the material was compiled, so the new
+// crop's own reading never rises, which is the one thing a per-spot delta is
+// guaranteed to see.
 //
-// Env: HEADED=1, TAG=<suffix>, MIN_MARGIN=<lum> (default 14).
+// Env: HEADED=1, TAG=<suffix>, MIN_RISE=<lum> (default 12).
+// `MIN_SEPARATION` and `MIN_MARGIN` are RETIRED — see the
+// pedestal note above; it named a quantity this test no longer measures.
 import puppeteer from "puppeteer-core";
 import sharp from "sharp";
 
 const url = process.argv[2] ?? "http://localhost:5233/";
 const TAG = process.env.TAG ?? "on";
-const MIN_MARGIN = Number(process.env.MIN_MARGIN ?? 14);
+// ── THE TWO GATES, AND WHY THEY ARE DELTAS ──────────────────────────────────
+// The absolute margin (`after.new - after.old > 14`) was retired in §19: GI2
+// puts a GLOSSY PEDESTAL under the highlight that adds a large constant to
+// BOTH crops, so a difference-of-levels gate measures the pedestal as much as
+// the glow. These two measure each crop against ITSELF across the move, which
+// the pedestal cannot reach — it is present in both readings of a crop.
+//   MIN_RISE        the new spot must GAIN this much (measured +29.7 on SRC,
+//                   +49.5 on GI2, +0.53 with the uniforms frozen)
+//   MIN_SEPARATION  RETIRED AS A GATE (kept as an env knob only so an old
+//                   command line does not error). Δnew - Δold measured 30.25
+//                   on the FROZEN arm and 30.91 on the working one — it does
+//                   not discriminate, because GI2's transport darkens the old
+//                   spot whether or not the material uniforms move.
+const MIN_RISE = Number(process.env.MIN_RISE ?? 12);
+const MIN_SEPARATION = Number(process.env.MIN_SEPARATION ?? 24);
 const LAMP_OLD_X = -1.5;
 const LAMP_NEW_X = 1.5;
 const LAMP_Y = 4.0;
@@ -366,12 +403,42 @@ console.log(`before move: old-spot ${r2(before.old)}  new-spot ${r2(before.new)}
 console.log(`after  move: old-spot ${r2(after.old)}  new-spot ${r2(after.new)}  (new-old ${r2(after.new - after.old)})`);
 console.log(`swing: old-spot ${r2(before.old - after.old)} darker, new-spot ${r2(after.new - before.new)} brighter`);
 
-const margin = after.new - after.old;
-const pass = margin > MIN_MARGIN;
+// THE GATE. Per-spot deltas, not levels — see the constants at the top. Both
+// raw crop readings are still printed above, so a failure is attributable to
+// a spot rather than only to the derived number.
+const dNew = after.new - before.new; // the glow ARRIVING (positive when it works)
+const dOld = after.old - before.old; // the glow LEAVING (negative when it works)
+const separation = dNew - dOld;
+const margin = after.new - after.old; // the retired absolute gate, kept as a receipt
+console.log(
+  `deltas: Δnew ${r2(dNew)} (need >${MIN_RISE})  Δold ${r2(dOld)}  ` +
+  `separation Δnew-Δold ${r2(separation)} [receipt, NOT a gate — see below]  ` +
+  `[absolute after-move margin ${r2(margin)}, no longer gated — GI2 pedestal]`,
+);
+// ⛔⛔ SEPARATION IS A RECEIPT, NOT A GATE, AND THE REVERT ARM IS WHY.
+//
+// It was written as a second gate (`separation > 24`) and the control arm was
+// run to check it. The control arm PASSED it: with the uniforms frozen,
+// Δnew -2.35 / Δold -32.6 / separation **30.25** — comfortably over a gate of
+// 24, on the arm where the mechanism is switched off. GI2's TRANSPORT still
+// darkens the old spot when the lamp leaves (the window is voxelized from the
+// live scene and does not care what the material's uniforms say), so the
+// separation is carried almost entirely by Δold and says nothing about
+// whether the glow ARRIVED. On the healthy arm it read 30.91 against that
+// same 24 — thinner than the broken arm's. A gate that a broken arm clears
+// more comfortably than a working one is measuring the wrong thing twice.
+//
+// ⭐ Δnew IS the mechanism: on GI2 it is +27.9 working and −2.35 frozen, and
+// `MIN_RISE = 12` sits between them with 2.3x head-room below and the whole
+// sign of the number above. One gate, and it is the one the control arm can
+// actually fail.
+const pass = dNew > MIN_RISE;
 console.log(
   pass
-    ? `PASS: after the move the new-side crop leads the old-side crop by ${r2(margin)} lum (>${MIN_MARGIN})`
-    : `FAIL: after the move the new-side crop leads by only ${r2(margin)} lum (need >${MIN_MARGIN}) — the emitter slot uniforms are not reaching the material`,
+    ? `PASS: the glow MOVED — the new spot gained ${r2(dNew)} lum (>${MIN_RISE}) while the old spot ` +
+      `changed ${r2(dOld)} (separation ${r2(separation)}, reported only)`
+    : `FAIL: the glow did not move — new spot gained ${r2(dNew)} lum (need >${MIN_RISE}), old spot ` +
+      `changed ${r2(dOld)} — the emitter slot uniforms are not reaching the material`,
 );
 console.log(`SHOT scripts/gi-diag-moved-lamp-${TAG}-after.png`);
 await browser.close();

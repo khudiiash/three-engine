@@ -45,6 +45,7 @@ import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { SURFACE_POOL_CEILINGS, bitsBytesFor, createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
 import { buildLightTree, collectEmitters, estimateLightTreeWords } from "./lightTree.js";
+import { createLightTreeStore } from "./lightTreeStore.js";
 import { fitPrimitive } from "./primitiveFit.js";
 import { fitEmitterShape } from "./emitterShapes.js";
 import { fitSkinnedCapsules, rigRootOf, skinnedBoneMatrix, skinnedBoxShape, skinnedCapsuleMatrix, skinnedCapsuleShape } from "./skinnedProxy.js";
@@ -3196,6 +3197,15 @@ export class GISystem {
         }
         this._gi2Frame = (this._gi2Frame ?? 0) + 1;
         this._gi2Passes = gi2.passes(this._gi2Frame);
+        // §19 Stage 3.5 — the light tree's own re-upload, when it has new
+        // bytes. It rides the NON-deferrable half deliberately: `_dynSet`'s
+        // uploader rode the field's dispatch, which is the same half, and a
+        // tree write that keeps losing its frame is the "the light lags the
+        // lamp" bug the whole W5 unit exists to close. `pendingPasses` does not
+        // clear the dirty flag — `confirmUploads` below does, and only when the
+        // batch genuinely landed.
+        const treeUploads = this._lightTreeStore?.pendingPasses() ?? null;
+        if (treeUploads?.length) this._gi2Passes.before.push(...treeUploads);
         // The chain's SHAPE, once per change. A frame with 0 "before" passes is
         // a window with no voxelizer (the soup has not landed); a frame with 0
         // "after" passes is a gather that was never built — two very different
@@ -3222,7 +3232,10 @@ export class GISystem {
           // The GATHER (below) stays deferrable: a partially-dispatched gather
           // is a black probe, which is what a first frame already is.
           giCompute(renderer, this._gi2Passes.before);
-          if (giSkippedComputes.size === gi2SkippedBefore) gi2.notePassesRan();
+          if (giSkippedComputes.size === gi2SkippedBefore) {
+            gi2.notePassesRan();
+            this._lightTreeStore?.confirmUploads();
+          }
         }
       }
       mark("gi.gbufferPrepass");
@@ -6059,7 +6072,11 @@ export class GISystem {
           lights: lightSlots,
           emitters: emitterSlots,
           lightTree: this._lightTreeRegion ?? null,
-          env: { sky: skyRadiance, ao, sunSlot },
+          // §19 Stage 3.5: the gather reads the SUN and the SKY as nodes, not
+          // as a per-frame copy of them (`gi2System`'s lighting mirror is
+          // gone). `sun` is written by `#updateLightUniforms`, right where the
+          // §12.82 sun slot is chosen; `skyRadiance` is already a node.
+          env: { sky: skyRadiance, ao, sunSlot, sun: this.#giSunNodes() },
           // The soup survives a rebuild whose GEOMETRY did not change — see
           // `gi2System.build`. Held on the system, not on `state`, because
           // `state` is what a rebuild replaces.
@@ -8439,6 +8456,30 @@ export class GISystem {
     // gate missed, spent on a full-screen prepass whose consumer this path does
     // not compile. The mirror tier returns as its own unit against the window's
     // own trace.
+    // ── §19 STAGE 3.5: THE MIRROR TIER STAYS OFF, AND IT IS MEASURED ──────
+    //
+    // 3.5 was asked to re-enable the exact-mirror path at high/ultra IF the
+    // existing machinery could carry itself. It cannot, on either axis, and
+    // both numbers come from the scene rather than from an argument:
+    //
+    //   · PER FRAME — `bvhReflect` is a full-screen prepass and measured
+    //     2.956 ms of a 6.28 ms Bistro GI frame (that is the measurement in
+    //     the note above, and the reason this skip had to live here rather
+    //     than at one call site). GI2's WHOLE chain on Bistro at ultra
+    //     measures 1.73-2.45 ms, so arming the prepass roughly triples it and
+    //     lands near 4.7-5.4 ms against a 4 ms gate. It does not fit.
+    //   · AT BOOT — `buildBvhScene` is synchronous on the main thread and
+    //     measured 530 ms over Bistro's 517 meshes / 1.51 M triangles. That
+    //     is half a second of frozen UI added to a boot whose first light
+    //     already misses its 3 s gate at 3.9-5.0 s. GI2's own transport went
+    //     off-thread (the triangle soup: 2.83 M triangles for 15-30 ms of
+    //     main-thread stall) precisely to stop paying costs of this shape.
+    //
+    // ⭐ So this is a MEASURED NO-FIT, not "not wired yet". The unit that
+    // brings the mirror tier back has to move the BVH build off-thread and
+    // price the prepass against the window's own trace BEFORE a consumer is
+    // worth wiring to it. Glossy stays the gather's oct cone until then,
+    // which the boot log already says out loud.
     if (GI2_PATH) return;
     const light = state.light;
     // §14 R-B: reflection probes trace their captures through this same BVH,
@@ -9916,28 +9957,35 @@ export class GISystem {
     this._lightTreeUploader = null;
     this._lightTreePoseCache = null;
     this._lightTreePoseCount = -1;
+    // The GI2 host is PER BUILD, like the region inside `_dynSet` it replaces:
+    // a region's base word is baked into whatever reads it, so it cannot
+    // survive a rebuild that repacks the tree. Freed here rather than in
+    // `#retireTargets` because it does not live on `state`.
+    this._lightTreeStore?.dispose();
+    this._lightTreeStore = null;
     globalThis.__giLightTreeLive = null;
-    // ── §19 STAGE 3.4: THE TREE HAS NO REGION TO LIVE IN YET ──────────────
+    // ── §19 STAGE 3.5: THE TREE HAS A REGION ON BOTH PATHS ────────────────
     //
-    // The packed tree is uploaded into the DYNAMIC SET's bump allocator, and
-    // `_dynSet` is created by `#buildOccupancyField` — which GI2 does not run.
-    // So `__giLightTreeLive` stays null and `test:gi-lighttree-mover` fails on
-    // "tree unreadable" rather than on anything it measures. Said out loud
-    // because a silent null here is indistinguishable from "this scene has no
-    // emitters", and because the gather's NEE is the tree's consumer-to-be: GI2
-    // lights a ray hit from the sun plus the palette's own emission today, and
-    // the per-probe emitter term (`gi2System`'s `emitterDirectPass`) reads the
-    // four SLOT uniforms, not the tree. Wiring the tree to `probeTrace`'s
-    // `shadeHit` is the unit that makes a 116-emitter scene's dim lamps carry.
-    if (GI2_PATH && this._emitterCands?.length) {
-      console.log(
-        `[gi2] light tree NOT built — its region rides the occupancy field's allocator, which this path ` +
-        `does not create. ${this._emitterCands.length} emitter candidates are served by the ${MAX_EMITTERS} ` +
-        "analytic slots only (per-probe NEE + the material glow); `test:gi-lighttree-mover` cannot read a " +
-        "tree that does not exist.",
-      );
-    }
-    if (globalThis.__giLightTree !== false && this._dynSet && this._emitterCands?.length) {
+    // 3.4 could not build it under `GI2_PATH`: the packed words are uploaded
+    // into the DYNAMIC SET's bump allocator, and `_dynSet` is created by
+    // `#buildOccupancyField`, which GI2 does not run. `__giLightTreeLive`
+    // stayed null and `test:gi-lighttree-mover` failed on "tree unreadable"
+    // rather than on anything it measures — a STRUCTURAL failure that a real
+    // `#refreshLightTree` regression would be indistinguishable from.
+    //
+    // ⭐ THE DEPENDENCY WAS ONE CALL, not the bookkeeping. Everything the tree
+    // does per frame — `#lightTreeMeshes`' stable order, the 20-float pose
+    // scan keyed by MESH, the repack, the capacity refusal — never touched the
+    // dynamic set. Only `createRegionUploader` did. `lightTreeStore.js` is that
+    // one call standing on its own ~15 KB buffer, and `#lightTreeHost` picks
+    // whichever host this build actually has.
+    //
+    // Still true, and still a later unit: GI2's ray hits are lit by the four
+    // analytic SLOTS (`shadeHit`'s NEE, Stage 3.5) and not by the tree, so a
+    // 116-emitter scene's dim lamps carry only once the descent is wired to
+    // `probeTrace`. What changed here is that the tree is now LIVE and
+    // measurable on this path instead of absent.
+    if (globalThis.__giLightTree !== false && (this._dynSet || GI2_PATH) && this._emitterCands?.length) {
       try {
         // Same STABLE order the refresh uses — see #lightTreeMeshes. If the
         // build collected in candidate order and the refresh in id order, the
@@ -10098,7 +10146,8 @@ export class GISystem {
           // an unused reservation costs nothing per frame — nothing walks it.
           const growthFloor = Math.max(tree.emitterCount, LIGHT_TREE_MIN_CAPACITY_EMITTERS);
           const capacity = Math.ceil(estimateLightTreeWords(Math.max(1, growthFloor)) * 1.25);
-          const uploader = this._dynSet.createRegionUploader(Math.max(capacity, tree.words.length));
+          const want = Math.max(capacity, tree.words.length);
+          const uploader = this.#lightTreeHost(want)?.createRegionUploader(want) ?? null;
           if (uploader && uploader.write(tree.words)) {
             this._lightTreeUploader = uploader;
             this._lightTreeRegion = {
@@ -12000,9 +12049,50 @@ export class GISystem {
         );
       }
       state.sunSlot.value = best;
+      // ── §19 STAGE 3.5: THE ONE AUTHORED SUN, AS TWO NODES ────────────────
+      //
+      // GI2's gather used to mint its own `sunDir`/`sunColor` and
+      // `gi2System.syncLighting` copied this same slot into them every frame —
+      // two authored descriptions of one light, re-derived from `sunSlot` in a
+      // second place. The gather takes NODES now, and these are them: written
+      // HERE, where the slot has just been chosen, at the cost of the two
+      // stores the mirror was doing anyway.
+      //
+      // ⚠ `vector` on a DIRECTIONAL slot points TOWARD the light; every
+      // consumer of `sunDir` wants the direction light TRAVELS. The negation
+      // lives here, once, rather than at each reader.
+      const sunNodes = this.#giSunNodes();
+      const sunSlotObj = best >= 0 ? state.lightSlots[best] : null;
+      if (sunSlotObj && sunSlotObj.active.value > 0.5) {
+        const v = sunSlotObj.vector.value;
+        sunNodes.dir.value.set(-v.x, -v.y, -v.z);
+        const c = sunSlotObj.color.value;
+        sunNodes.color.value.set(c.r, c.g, c.b);
+      } else {
+        // No sun means exactly zero radiance, on the frame it stops existing —
+        // the direction is left alone because a zero colour already removes it
+        // and a zeroed direction would normalize to garbage.
+        sunNodes.color.value.set(0, 0, 0);
+      }
     }
     this.#syncLightShadowNodes(lights);
     this.#logLightInput();
+  }
+
+  /**
+   * The two nodes that ARE the sun for anything that wants it as a direction
+   * plus a colour rather than as a slot index (§19 Stage 3.5 — GI2's gather).
+   *
+   * Created lazily and held on the SYSTEM, not on `state`: a GI rebuild
+   * replaces `state` and every kernel compiled against these nodes would then
+   * be reading a dead uniform. `#updateLightUniforms` writes them; nobody else
+   * may. See `createGiGather({ sun })`.
+   */
+  #giSunNodes() {
+    return (this._giSunNodes ??= {
+      dir: uniform(new THREE.Vector3(0, -1, 0)),
+      color: uniform(new THREE.Vector3()),
+    });
   }
 
   /**
@@ -12575,6 +12665,10 @@ export class GISystem {
     // still names one of these would fail its submit.
     const doomed = new Set(collectStateStorageAttributes(state));
     for (const attr of this._dynSet?.storageAttributes ?? []) doomed.add(attr);
+    // The GI2 light-tree host owns its own words (§19 Stage 3.5) — same rule,
+    // and for the same reason `_dynSet`'s staging is here: a region whose base
+    // word is baked into a reader cannot outlive the build that baked it.
+    for (const attr of this._lightTreeStore?.storageAttributes ?? []) doomed.add(attr);
     const released = releaseComputeNodes(this.engine?.renderer, stale, doomed);
     // §19 Stage 0.2: the field owns kernels the `state` walk cannot see — the
     // minted generation the geometry-revision re-mint replaced, and the build
@@ -12605,6 +12699,8 @@ export class GISystem {
     // a rebuild that bails out early (no component, no scene) would otherwise
     // leave a live object holding destroyed attributes. The build re-creates it.
     this._dynSet = null;
+    this._lightTreeStore = null;
+    this._lightTreeUploader = null;
     // ⚠ AND THE MATERIAL SIDE, WHICH IS THE BIGGER HALF. The compute eviction
     // alone left the heap climbing ~2.2 GB per rebuild; the bulk is 116
     // materials' re-injected GI node graphs piling up in `nodeBuilderCache`
@@ -13763,6 +13859,25 @@ export class GISystem {
     for (const cand of this._emitterCands ?? []) if (cand?.mesh) meshes.push(cand.mesh);
     meshes.sort((a, b) => a.id - b.id);
     return meshes;
+  }
+
+  /**
+   * Whoever owns the words the packed tree lives in, this build (§19 Stage 3.5).
+   *
+   * The occupancy field's dynamic set when there is one — ONE bump allocator
+   * over the field's region is what keeps the tree from overlapping a BVH
+   * block or a card table, and that argument still stands wherever the field
+   * exists. Under `GI2_PATH` there is no field, so the tree gets its own
+   * buffer (`lightTreeStore.js`) instead of not being built at all.
+   *
+   * @param {number} words the reservation, in u32 words
+   */
+  #lightTreeHost(words) {
+    if (this._dynSet) return this._dynSet;
+    if (!GI2_PATH) return null;
+    this._lightTreeStore?.dispose();
+    this._lightTreeStore = createLightTreeStore(words);
+    return this._lightTreeStore;
   }
 
   /**

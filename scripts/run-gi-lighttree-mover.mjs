@@ -55,7 +55,12 @@ const READ_TREE = async () => {
   const anyId = (ids.value ?? ids)?.[0]?.id;
   const engine = api.entities.live(anyId)?.engine;
   const gi = engine?.modules?.get?.("gi")?.system;
-  const bits = gi?.state?.volume?.occupancyField?.bitsBuffer;
+  // TWO HOSTS SINCE §19 STAGE 3.5. On the SRC path the packed tree lives in a
+  // region of the occupancy field's `bits`; under GI2_PATH there is no field,
+  // so it lives in its own buffer (`lightTreeStore.js`). Same words, same
+  // `live.abs`, different owner — a detail this gate has to know because it
+  // reads the block straight out of the buffer.
+  const bits = gi?.state?.volume?.occupancyField?.bitsBuffer ?? gi?._lightTreeStore?.bitsBuffer;
   const renderer = engine?.renderer;
   if (!bits || !renderer) return { fail: "no bits buffer / renderer" };
   // Whole-buffer read + slice: the W1 gate's duplicate-three trap says an
