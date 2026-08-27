@@ -9200,13 +9200,19 @@ export class GISystem {
    * ## What this does
    *
    * The dead texture's own `bindGroups` set is the only enumeration of who
-   * bound it. For each, run three's own `Bindings._update`: the binding's
+   * bound it. For each, repoint the bindings that name it: the binding's
    * `NodeSampledTexture.update()` re-reads `textureNode.value` (now the live
    * texture), `updateTexture` materialises it, the generation test fires —
    * because `gi2System` stamps a unique `version` on every new GI texture, see
    * `gi2TextureGeneration` — and `backend.updateBindings` re-creates the GPU
    * bind group. Exactly the work the removed per-object refresh used to do,
    * paid once per resize instead of once per object per frame.
+   *
+   * ⛔⛔ §19 STAGE 4.0c — AND IT MAY NOT BE `Bindings._update`. That is what
+   * 4.1 shipped, and it repointed EVERY binding in the group, not only the GI
+   * ones: 649 material texture slots across 89 Bistro materials came out
+   * holding another material's albedo. `#rebindGiBindingsOnly` is the whole
+   * argument and the receipt.
    *
    * Defensive throughout: these are three's underscore-private caches, and a
    * rename must degrade to "the old bug", never to a crash mid-resize.
@@ -9220,19 +9226,33 @@ export class GISystem {
     const bindings = renderer?._bindings;
     const store = renderer?._textures;
     if (typeof bindings?._update !== "function" || typeof store?.has !== "function") return 0;
+    // ⭐⭐ THE SET THAT MAKES THE REPAIR SURGICAL (§19 4.0c). A binding is
+    // repointed if and ONLY IF it currently names one of these. Every other
+    // binding in the group — the material's own map, normalMap, roughnessMap —
+    // is not read at all, so the GPU keeps the entry it already had.
+    const dead = new Set(textures.filter(Boolean));
     let repaired = 0;
     let skipped = 0;
     for (const texture of textures) {
       if (!texture || store.has(texture) !== true) continue;
-      // A COPY: `_update` can add this bind group to the NEW texture's own set,
+      // A COPY: the repair adds this bind group to the NEW texture's own set,
       // and mutating a Set while iterating it is undefined behaviour.
       const groups = store.get(texture)?.bindGroups;
       if (!groups) continue;
       for (const bindGroup of [...groups]) {
         if (!this.#bindGroupIsBindable(bindGroup)) { skipped++; continue; }
         try {
-          bindings._update(bindGroup, [bindGroup]);
-          repaired++;
+          // `__giRebindLegacyUpdate = true` is the BEFORE ARM, kept for the
+          // same reason `__gi2ResizeDisposeNow` is: a run that reports zero
+          // foreign texture bindings is only a result if the arm that reports
+          // 649 can still be produced. `scripts/run-gi-texmix-probe.mjs`
+          // TEXMIX_ARM=__giRebindLegacyUpdate.
+          if (globalThis.__giRebindLegacyUpdate === true) {
+            bindings._update(bindGroup, [bindGroup]);
+            repaired++;
+          } else if (this.#rebindGiBindingsOnly(bindGroup, dead)) {
+            repaired++;
+          }
         } catch (err) {
           // ⛔⛔ NOT "degrade to the old bug" — a swallowed throw from
           // `createBindGroup` DEGRADES TO A DEAD RENDERER. See
@@ -9253,6 +9273,105 @@ export class GISystem {
     }
     this._giRebindings = (this._giRebindings ?? 0) + repaired;
     return repaired;
+  }
+
+  /**
+   * ⭐⭐ §19 STAGE 4.0c — REPOINT THE GI TEXTURES IN THIS GROUP, AND NOTHING
+   * ELSE. THE FIX FOR "EVERY MATERIAL IN BISTRO SAMPLES THE SAME IVY LEAF".
+   *
+   * ## The bug 4.1's rebind shipped, in one sentence
+   *
+   * `Bindings._update` calls `binding.update()` on EVERY binding in the group,
+   * and for a `NodeSampledTexture` that means `this.texture = textureNode.value`
+   * — pulled from a node the material DOES NOT OWN.
+   *
+   * Three resolves `map` through a MODULE-LEVEL `_propertyCache`
+   * (`MaterialNode.getTexture` → `getCache`): there is exactly ONE
+   * `MaterialReferenceNode('map')`, and therefore ONE `TextureNode`, in the
+   * whole process, and every material's `map` binding is a clone pointing at
+   * it (`NodeBuilderState.createBindings` clones the BINDING, never the node).
+   * Measured on Bistro: 15 such shared nodes, one of them behind **91**
+   * materials. What normally keeps materials apart is
+   * `Nodes.updateForRender(renderObject)` running immediately before
+   * `Bindings.updateForRender(renderObject)` and setting that one node to THIS
+   * object's texture — and `NodeMaterialObserver.needsRefresh` grants that to
+   * only ONE render object per builder state per render (it tests
+   * `this.renderId`, an OBSERVER field, not a per-object one). So at any
+   * instant the shared node holds one arbitrary material's map, and 661 of
+   * Bistro's 2197 sampled bindings name something different from their node.
+   *
+   * Calling `_update` on those groups therefore did not repair 4104 GI
+   * textures; it OVERWROTE 649 material texture slots with whatever the shared
+   * nodes happened to hold. `scripts/run-gi-texmix-probe.mjs` on Bistro:
+   * foreign bindings **0** at boot, **0** after the texture-average drain,
+   * **649 across 89 materials** after five resize hops — with node drift
+   * collapsing 661 → 12 as it happened, which is the conversion stated as a
+   * number. That is the user's screenshot: one leaf albedo on the pavement,
+   * the walls, the awnings and the scooter, each in its OWN UV space,
+   * perspective-correct, with no console error and 67 fps. Nothing complains,
+   * because a bind group naming the wrong texture is a perfectly valid one.
+   *
+   * ⭐⭐ **A SHARED NODE IS NOT A CHANNEL TO THE OBJECT IN FRONT OF YOU.**
+   * `binding.update()` is only correct for a binding whose node was refreshed
+   * FOR THIS RENDER OBJECT, and outside `_renderObjectDirect` nothing has been.
+   *
+   * ## What this does instead
+   *
+   * Exactly the `isSampledTexture` half of `_update`, restricted to bindings
+   * that currently name a texture being retired. Those are ours by
+   * construction — GI owns the node behind them — so pulling their node is
+   * safe. Every other binding is not touched at all.
+   *
+   * `cacheIndex` is passed as 0 deliberately: three's per-group cache is keyed
+   * `cacheIndex*10 + texture.id` against a summed `version`, and `_update`
+   * builds that key only over the bindings `nodes.updateGroup` did not skip —
+   * frame state this path cannot reproduce. Zero means "build it, bind it,
+   * cache nothing"; the next genuine refresh writes the cache entry correctly,
+   * and it cannot collide with a stale one because the new GI textures carry
+   * fresh `gi2TextureGeneration` versions AND fresh `texture.id`s.
+   *
+   * @param {any} bindGroup a bind group naming at least one retired GI texture
+   * @param {Set<any>} dead the textures being retired
+   * @returns {boolean} whether anything in this group was repointed
+   */
+  #rebindGiBindingsOnly(bindGroup, dead) {
+    const renderer = this.engine?.renderer;
+    const backend = renderer?.backend;
+    const store = renderer?._textures;
+    if (!backend || typeof store?.updateTexture !== "function") return false;
+    let needsBindingsUpdate = false;
+    let touched = 0;
+    for (const binding of bindGroup.bindings ?? []) {
+      if (binding?.isSampledTexture !== true) continue;
+      // ⛔ THE WHOLE FIX IS THIS TEST. A binding that does not name a dying
+      // texture is a binding whose node we do not own; reading it IS the bug.
+      // Counted, so "the repair ran" and "the repair stayed in its lane" are
+      // two different numbers rather than one hopeful one.
+      if (dead.has(binding.texture) !== true) {
+        this._giRebindLeftAlone = (this._giRebindLeftAlone ?? 0) + 1;
+        continue;
+      }
+      const live = binding.textureNode?.value;
+      // Nothing live to point at (a non-node binding, or a node still holding
+      // the corpse): leave it to the retire queue's three-frame margin rather
+      // than invent a target. Same outcome `_update` reached here.
+      if (!live || live === binding.texture) continue;
+      if (binding.update() !== true) continue;
+      touched++;
+      const texture = binding.texture;
+      store.updateTexture(texture);
+      const data = store.get(texture);
+      if (binding.generation !== data.generation) {
+        binding.generation = data.generation;
+        needsBindingsUpdate = true;
+      }
+      // Three tracks who binds a texture so `_destroyTexture` can find them;
+      // the new texture has to inherit this group or the NEXT resize is blind
+      // to it (the append-only set `#bindGroupIsBindable` documents).
+      data.bindGroups?.add(bindGroup);
+    }
+    if (needsBindingsUpdate) backend.updateBindings(bindGroup, [bindGroup], 0, 0);
+    return touched > 0;
   }
 
   /**
