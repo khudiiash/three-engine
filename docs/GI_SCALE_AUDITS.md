@@ -1710,3 +1710,73 @@ Gate (PLAN Stage 4.3, re-anchored): Level first light ≤ 3 s from scene open
 (2 boots); Bistro first light ≤ geometry-ready + 3 s, and GI must not be the
 last thing to appear after textures land; `soupBuilds` = 1 per scene open;
 no regression of the battery.
+
+---
+
+## S. STAGE 3.11 SPEC — CONTACT SCALE: black blobs at sub-voxel geometry (user screenshot 5, 08-27 23:24)
+
+**Symptom:** after 3.9 the 1 m blotches are gone; what remains are BLACK BLOBS
+at geometry junctions — door panels and frame recesses, under the planter,
+along the lamp cable — plus "flatter, less GI overall".
+
+**Mechanism (to verify with a receipt, then fix):** a probe on a surface finer
+than the 25 cm voxel (a door panel inside a frame, the pot's foot) shoots
+sideways rays that hit the CONSERVATIVELY DILATED voxels of the adjacent
+frame/wall/pot — the window says "occluded at 0-2 cells" where the true
+surface is 5 cm away and the hemisphere is really open. 3.3 restricted the
+screen (HZB) segment to rays whose window hit is < 4 cells and takes its
+answer only if it AGREES within a cell — so a dilated near-hit wins even when
+the depth buffer can see the space is clear. Lumen never traces its coarse
+structure in the first metres for this reason (screen trace + fine mesh
+SDFs); Brixelizer biases by cascade.
+
+**The unit (gatherProbes.js):**
+1. **Authority in the contact band** (hits with t < `CONTACT_CELLS` = 2 · v_l):
+   if the screen segment could see the ray's path (start and end on-screen,
+   depth valid) and says CLEAR up to the window's hit distance, the ray
+   continues past the window hit (re-enter `traceWindow` from t_hit + 1 cell)
+   — the screen is the fine geometry there. If the screen cannot see it
+   (off-screen / behind), the near hit counts with a distance weight
+   `w = smoothstep(0, CONTACT_CELLS, t)` on its OCCLUSION (the returned
+   radiance is blended with the continuation ray's) — a half-occluded
+   contact, not a wall.
+2. **Instrument — a Cornell "trim" arm** in the gather harness: the analytic
+   room with sub-voxel features — a 5 cm ledge along one wall at 1.2 m, a
+   door frame (10 cm × 5 cm recess) and a 30 cm pot on the floor — voxelized
+   by the analytic filler with the real rule (conservative), CPU reference =
+   the path tracer on the analytic trim scene. Crops: the panel INSIDE the
+   frame, the wall 10 cm above the ledge, the floor 5 cm from the pot. Gate:
+   each crop within the same bracket as the flat crops (today they are the
+   black blobs: report their ratio on HEAD first — expect 0.2-0.5 of b4).
+3. **Directionality receipt on Bistro** ("flatter"): façade-vs-sunlit-
+   pavement ratio (3.7's, currently 61-78 %) and a NEW wall-vs-recess
+   contrast (the door panel vs the flat wall beside it, each a 32-px crop
+   from the user's doors-close pose): after 3.9 the buried-slot over-light is
+   gone (78× energy removed), so "less GI" is partly CORRECT energy; the
+   receipt says whether the recess is now too dark (< 0.5 of the wall = the
+   blob) or the wall too flat. Report before/after.
+4. Cost: the continuation ray is only taken in the contact band (measure the
+   % of rays) — chain stays ≤ 4 ms.
+
+Gates: the trim-arm crops in bracket; flat Cornell 8/8 unchanged; leaks
+0/10 000 (the continuation must not pass a real wall — a wall is ≥ 2 cells
+of dilation only for dust; test the 5 cm wall arm explicitly); all 3.9/3.10
+gates; Bistro doors-close contrast before/after (single run, quoted as such).
+
+---
+
+## T. THE DETERMINISM CONTRACT (user rule, 08-27 night — supersedes §L.2/L.3's sampling and 3.6's hysteresis)
+
+"There must be no noise at all — that was the initial idea of radiance
+cascades." Noiseless BY CONSTRUCTION: every screen probe traces ALL 64 oct
+directions every frame at deterministic texel centres (no subset, no in-texel
+jitter, no per-probe hash, no hysteresis); the oct map is REPLACED each frame
+(a complete evaluation, like an RC cascade); the resolve reads no previous-
+frame image; the only temporal state is the world radiance cache's
+convergence, whose shade sampling is a fixed pattern indexed by the slot's
+sample count. Budget is held by probe SPACING per tier (16 px at ultra/high ≈
+6.3k probes × 64 = 406k rays/frame; 24-32 px phone), never by rays per probe.
+Receipts: temporal p95 at rest ≈ 0 % (byte-identical frames apart from cache
+convergence); orbit temporal p95 ≤ 2 % (reinterpolation only); a moved panel
+responds within 1-2 frames; no previous-frame texture bound on the image
+path (asserted). The 3.10 temporal denoiser was withdrawn on this rule.

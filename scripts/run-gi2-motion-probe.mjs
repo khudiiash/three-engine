@@ -275,11 +275,104 @@ const installed = await page.evaluate(async () => {
   R.readbacks = 0;
 
   // ── long tasks (main-thread blocks between ticks) ─────────────────────────
-  try {
-    new PerformanceObserver((list) => {
-      for (const e of list.getEntries()) R.longtasks.push({ t: e.startTime, ms: e.duration });
-    }).observe({ entryTypes: ["longtask"] });
-  } catch { /* not every build ships longtask */ }
+  // ⚠⚠ AND THE OBSERVER SAYS WHETHER IT CAN SEE ITS SUBJECT. "0 long tasks in a
+  // run containing a 186 ms frame" is either a finding or a broken instrument,
+  // and a `try/catch` that swallows an unsupported entry type makes the two
+  // indistinguishable — the exact blind-statistic trap this repo keeps
+  // relearning. `supportedEntryTypes` is reported alongside the count.
+  R.obsTypes = (globalThis.PerformanceObserver?.supportedEntryTypes ?? []).slice();
+  R.obsArmed = [];
+  for (const type of ["longtask", "long-animation-frame"]) {
+    try {
+      new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          const rec = { t: e.startTime, ms: e.duration, type };
+          // ⭐ LoAF IS THE ONE THAT ANSWERS THIS STAGE'S QUESTION. A long task
+          // says "the main thread was busy"; a long ANIMATION FRAME breaks the
+          // same wall clock into the scripts that ran (with the function and
+          // the URL that invoked each), the render phase, and — by
+          // subtraction — the part that was NOT the page at all.
+          if (type === "long-animation-frame") {
+            rec.blocking = e.blockingDuration;
+            rec.renderStart = e.renderStart - e.startTime;
+            rec.styleLayout = e.styleAndLayoutStart ? e.styleAndLayoutStart - e.startTime : 0;
+            rec.scripts = (e.scripts ?? []).map((sc) => ({
+              ms: sc.duration, name: sc.sourceFunctionName || sc.name,
+              url: (sc.sourceURL || "").split("?")[0].replace(/^https?:\/\/[^/]+/, ""),
+              invoker: sc.invoker, invokerType: sc.invokerType,
+              forced: sc.forcedStyleAndLayoutDuration, pause: sc.pauseDuration,
+            })).sort((a, b) => b.ms - a.ms).slice(0, 4);
+          }
+          R.longtasks.push(rec);
+        }
+      }).observe({ type, buffered: true });
+      R.obsArmed.push(type);
+    } catch { /* this Chrome does not ship it */ }
+  }
+
+  // ══ §19 STAGE 3.10 ITEM 5 — WHO OWNS A BLOCK THAT IS *NOT* IN THE TICK ════
+  //
+  // 4.1b left two ~115-136 ms frames at fixed orbit indices with `voxMs` idle,
+  // no scroll, no readback, no log, and only ~21 ms of the 136 marked by the
+  // tick's own phases. "Outside the tick" is a very short list of things on a
+  // single-threaded page: a TIMER callback, an IDLE callback, a WORKER message,
+  // a promise continuation, or the garbage collector. Each of the first three
+  // is wrappable at its registration point, which turns "something blocked"
+  // into a NAME and a duration; GC is not, so it is inferred from a heap
+  // measurement per frame instead (a `usedJSHeapSize` that DROPS across a slow
+  // frame is a collection, and one that leaps is the allocation that caused it).
+  //
+  // ⚠ THE LABEL IS THE CALLBACK'S OWN SOURCE, NOT ITS REGISTRATION STACK.
+  // Capturing `new Error().stack` at every `setTimeout` would cost more than
+  // the thing it measures — the engine registers hundreds a second — while the
+  // function's `name`, or its first 70 characters when it is anonymous, is
+  // free and has been enough to name every owner this repo has hunted.
+  R.cb = new Map();
+  R.cbEvents = [];
+  const noteCb = (kind, fn) => {
+    if (typeof fn !== "function") return fn;
+    let label;
+    try { label = `${kind}:${fn.name || String(fn).replace(/\s+/g, " ").slice(0, 70)}`; }
+    catch { label = `${kind}:<unprintable>`; }
+    return function wrapped(...a) {
+      const t0 = performance.now();
+      try { return fn.apply(this, a); } finally {
+        const d = performance.now() - t0;
+        const e = R.cb.get(label) ?? { n: 0, ms: 0, max: 0 };
+        e.n++; e.ms += d; if (d > e.max) e.max = d;
+        R.cb.set(label, e);
+        if (d > 8) R.cbEvents.push({ t: t0, ms: d, label });
+      }
+    };
+  };
+  for (const k of ["setTimeout", "setInterval", "requestIdleCallback"]) {
+    const orig = globalThis[k];
+    if (typeof orig !== "function") continue;
+    globalThis[k] = function (fn, ...rest) { return orig.call(this, noteCb(k, fn), ...rest); };
+  }
+  {
+    const origThen = Promise.prototype.then;
+    // ⚠ ONLY THE REJECTION-FREE FAST PATH IS WRAPPED AND ONLY THE *FULFILLED*
+    // HANDLER. A promise continuation is the one "outside the tick" class that
+    // is genuinely hot (every `await` in the engine goes through it), so the
+    // wrapper has to be a closure and nothing else — no stack, no allocation
+    // beyond the one closure `then` was already going to allocate.
+    Promise.prototype.then = function (onOk, onErr) {
+      return origThen.call(this, typeof onOk === "function" ? noteCb("then", onOk) : onOk, onErr);
+    };
+  }
+  {
+    const addEL = Worker.prototype.addEventListener;
+    Worker.prototype.addEventListener = function (type, fn, ...rest) {
+      return addEL.call(this, type, type === "message" ? noteCb("worker", fn) : fn, ...rest);
+    };
+    const d = Object.getOwnPropertyDescriptor(Worker.prototype, "onmessage");
+    if (d?.set) {
+      Object.defineProperty(Worker.prototype, "onmessage", {
+        ...d, set(fn) { d.set.call(this, noteCb("worker.onmessage", fn)); },
+      });
+    }
+  }
 
   // ── per-pass GPU timestamps ───────────────────────────────────────────────
   //
@@ -322,9 +415,101 @@ const installed = await page.evaluate(async () => {
       } catch { /* a context three did not track */ }
       return out;
     };
+    // ⭐⭐ §19 STAGE 3.10 ITEM 5 — COUNT THE RENDERS, AND NAME THE CALLER OF A
+    // SLOW ONE. The sampling profile put the 4.1b spikes inside
+    // `renderer.render → _renderScene → updateMatrixWorld / _projectObject`,
+    // which is ORDINARY scene rendering — so the question is not what the
+    // frame did, it is HOW MANY TIMES it did it and who asked. A count per
+    // frame answers the first; `new Error().stack` on the calls that actually
+    // run long answers the second, and costs nothing on the calls that do not.
+    R.renderN = 0;
+    R.renderMs = 0;
+    R.renderStacks = [];
+    // ⭐⭐⭐ THE DEVICE ITSELF. The 4.1b spikes have ZERO long tasks, 17 ms of
+    // CPU inside `renderer.render` out of a 165 ms frame, and a sampling
+    // profiler that only manages a third of the samples the window should hold
+    // — i.e. the main thread is NOT RUNNING JAVASCRIPT for ~130 ms. On a page
+    // whose only other engine is the GPU, the short list of things that block
+    // a thread that is not running is: a pipeline the driver is compiling, a
+    // shader module it is translating, and a queue too deep to accept another
+    // frame. All three are WebGPU device calls, so all three are wrappable at
+    // the device, which turns "the frame stalled" into a count and a cost.
+    R.api = new Map();
+    R.frameApi = {};
+    // ⭐⭐ THE SWAP CHAIN. LoAF puts the spike between the end of the rAF
+    // script and the START of the browser's render phase, with zero blocking
+    // time — the page was not busy, the browser was refusing to begin the
+    // frame. On a WebGPU canvas the thing that makes it refuse is the
+    // presentation surface: `configure()` tears the swap chain down and builds
+    // it again, and every texture the renderer sized to the old one with it.
+    // So the canvas dimensions are recorded per frame and `configure` is
+    // counted, which turns "the compositor waited" into either a resize with a
+    // timestamp or a ruled-out hypothesis.
+    R.configs = 0;
+    R.pipelines = [];
+    try {
+      const CC = globalThis.GPUCanvasContext?.prototype;
+      if (CC?.configure && !CC.__gi2MotionWrapped) {
+        CC.__gi2MotionWrapped = true;
+        const orig = CC.configure;
+        CC.configure = function (...a) {
+          R.configs++;
+          R.frameApi.configure = (R.frameApi.configure ?? 0) + 1;
+          return orig.apply(this, a);
+        };
+      }
+    } catch { /* no WebGPU canvas context on this build */ }
+    const dev = backend?.device;
+    if (dev && !dev.__gi2MotionApiWrapped) {
+      dev.__gi2MotionApiWrapped = true;
+      for (const m of [
+        "createRenderPipeline", "createRenderPipelineAsync",
+        "createComputePipeline", "createComputePipelineAsync",
+        "createShaderModule", "createBindGroup", "createBindGroupLayout",
+      ]) {
+        const orig = dev[m];
+        if (typeof orig !== "function") continue;
+        dev[m] = function (...a) {
+          const t0 = performance.now();
+          const r = orig.apply(this, a);
+          const d = performance.now() - t0;
+          const e = R.api.get(m) ?? { n: 0, ms: 0, max: 0 };
+          e.n++; e.ms += d; if (d > e.max) e.max = d;
+          R.api.set(m, e);
+          R.frameApi[m] = (R.frameApi[m] ?? 0) + 1;
+          R.frameApi[`${m}Ms`] = (R.frameApi[`${m}Ms`] ?? 0) + d;
+          // ⭐ AND WHICH ONE. A pipeline count says a hitch is compilation; the
+          // pipeline's LABEL says whose material, which is the difference
+          // between "warm the pipelines" and a fix that can be aimed.
+          if (m.startsWith("createRenderPipeline") || m.startsWith("createComputePipeline")) {
+            let label = a[0]?.label || "";
+            try {
+              const v = a[0]?.vertex?.entryPoint ?? "";
+              const f = a[0]?.fragment?.entryPoint ?? "";
+              label += ` [${v}/${f}]`;
+            } catch { /* a descriptor shape three changed */ }
+            R.pipelines.push({ t: performance.now(), frame: R.frames.length, label });
+          }
+          return r;
+        };
+      }
+    }
     const rawRender = renderer.render.bind(renderer);
     renderer.render = function (scene, camera) {
+      const t0 = performance.now();
       const out = rawRender(scene, camera);
+      const d = performance.now() - t0;
+      R.renderN++;
+      R.renderMs += d;
+      if (d > 12) {
+        let st = "";
+        try { st = String(new Error().stack ?? "").split("\n").slice(1, 7).map((l) => l.trim()).join(" | "); }
+        catch { /* no stack */ }
+        R.renderStacks.push({
+          t: t0, ms: d, frame: R.frames.length, scene: scene?.name || scene?.type || "?",
+          children: scene?.children?.length ?? -1, stack: st,
+        });
+      }
       try {
         const ctx = backend.get(renderer._renderContext ?? {});
         if (ctx?.timestampUID) {
@@ -474,7 +659,38 @@ const installed = await page.evaluate(async () => {
       // to say what shape the work had, not to time it.
       cellLimit: gi2?.voxelizer?.cellLimit ?? 0,
       vxItems: vx?.items ?? 0, vxItemTris: vx?.maxItemTris ?? 0, vxItemCut: vx?.itemCut ?? 0,
+      // §19 Stage 3.10 item 5: the GC witness. `usedJSHeapSize` is a 20 ns
+      // property read; a slow frame across which it FALLS is a collection, and
+      // one across which it leaps names the allocation that bought it. Neither
+      // can be seen in a phase mark, because neither is in the tick.
+      heap: performance.memory?.usedJSHeapSize ?? 0,
+      // How many times the frame drew the SCENE, and what those calls cost on
+      // the CPU. `renderMs` is wall clock inside `renderer.render`, so a frame
+      // whose `dt` is 180 ms with `renderMs` 160 has its answer on this line.
+      renderN: R.renderN, renderMs: R.renderMs,
+      draws: renderer?.info?.render?.drawCalls ?? 0,
+      api: R.frameApi,
+      cw: renderer?.domElement?.width ?? 0, ch: renderer?.domElement?.height ?? 0,
+      texMB: Math.round((renderer?.info?.memory?.textures ?? 0)),
+      geoN: renderer?.info?.memory?.geometries ?? 0,
     };
+    R.renderN = 0;
+    R.renderMs = 0;
+    R.frameApi = {};
+    // ⭐⭐⭐ IS THE GPU BEHIND? `onSubmittedWorkDone` resolves when everything
+    // submitted so far has retired, so the latency of that promise measured
+    // from the END of the tick is exactly "how far behind the queue is". A
+    // frame whose wall clock is 160 ms with 20 ms of CPU, no long task and no
+    // device call has nothing left to be waiting for except this — and the
+    // number distinguishes a GPU that is genuinely busy from a compositor that
+    // simply did not schedule us.
+    try {
+      const q = renderer?.backend?.device?.queue;
+      if (q?.onSubmittedWorkDone) {
+        const t0 = performance.now();
+        q.onSubmittedWorkDone().then(() => { rec.gpuDrainMs = performance.now() - t0; });
+      }
+    } catch { /* a backend without a device */ }
     R.frames.push(rec);
     drainGpu();
 
@@ -622,7 +838,47 @@ if (CELLS.length) {
 } else {
   for (const arm of ARMS) armList.push([arm, arm, 0, 0]);
 }
+// ══ §19 STAGE 3.10 ITEM 5 — A REAL JS SAMPLING PROFILE, VIA CDP ═══════════
+//
+// The in-page wrappers above name a block that arrives through a TIMER, an
+// IDLE callback, a WORKER message or a promise continuation. They cannot name
+// one that arrives inside a call the engine makes itself — a pipeline
+// compilation inside `renderer.render`, a typed-array copy, a `Map` rehash —
+// and "outside the tick" was inferred from the phase marks summing to 21 of
+// 136 ms, which is exactly the shape a call the marks do not BRACKET makes.
+//
+// So `PROFILE=1` attaches Chrome's own sampler through the DevTools protocol
+// and, for every frame over the spike threshold, prints what the main thread
+// was actually executing during that frame's wall clock. No page change, real
+// function names and file:line (vite serves unminified source), and it is off
+// by default because a 200 µs sampler is not free and the GATE run must be
+// measured without it.
+//
+// ⚠ THE TWO CLOCKS HAVE TO BE TIED TOGETHER, AND ONE `evaluate` DOES IT.
+// `Profiler.stop` returns timestamps in the profiler's own microsecond domain;
+// the frame records are `performance.now()` milliseconds. Reading
+// `performance.now()` in the page immediately after `Profiler.start()` gives
+// one point in both domains, and `profile.startTime` gives the other, so the
+// map is an offset. The round-trip skew is a millisecond or two against a
+// block of a hundred, which is well inside what "which function" needs.
+let cdp = null;
+let profZero = null;
+if (process.env.PROFILE) {
+  cdp = await page.target().createCDPSession();
+  await cdp.send("Profiler.enable");
+  await cdp.send("Profiler.setSamplingInterval", { interval: 200 });
+  await cdp.send("Profiler.start");
+  profZero = await page.evaluate(() => performance.now());
+  console.log("  JS sampling profiler ARMED (200 µs) — timings carry its overhead");
+}
+
 for (const [arm, label, pin, cells] of armList) await runArm(arm, label, pin, cells);
+
+let profile = null;
+if (cdp) {
+  ({ profile } = await cdp.send("Profiler.stop"));
+  await cdp.send("Profiler.disable");
+}
 
 // ══════════════════════════════════════════════════════════════════ THE REPORT
 const data = await page.evaluate(() => {
@@ -630,6 +886,12 @@ const data = await page.evaluate(() => {
   return {
     frames: R.frames, longtasks: R.longtasks, logCount: R.logCount,
     logTexts: [...R.logTexts].sort((a, b) => b[1] - a[1]).slice(0, 12),
+    obsTypes: R.obsTypes, obsArmed: R.obsArmed,
+    cb: [...R.cb].map(([label, e]) => ({ label, ...e })).sort((a, b) => b.max - a.max).slice(0, 20),
+    renderStacks: R.renderStacks.sort((a, b) => b.ms - a.ms).slice(0, 12),
+    api: [...R.api].map(([m, e]) => ({ m, ...e })).sort((a, b) => b.ms - a.ms),
+    pipelines: R.pipelines,
+    cbEvents: R.cbEvents.sort((a, b) => b.ms - a.ms).slice(0, 40),
   };
 });
 if (process.env.JSON) {
@@ -789,9 +1051,214 @@ console.log("");
   console.log(`  readbacks: ${rb} over ${movingAll.length} moving frames ` +
     `(${rbFrames.length} frames) — median dt ${f2(dtRb)} ms on a readback frame vs ${f2(dtNo)} ms without`);
 }
+// ══ §19 STAGE 3.10 ITEM 5 — THE SPIKE TABLE ═══════════════════════════════
+//
+// One row per frame over the threshold, with everything that can explain it on
+// the same line: what the tick's own phases accounted for, what the GPU chain
+// cost, whether the window scrolled, whether a readback or a log landed, and
+// what the JS heap did across it. The column that matters is `unmarked` — the
+// wall clock the tick did NOT account for. That is the block.
+{
+  const SPIKE = Number(process.env.SPIKE_MS ?? 50);
+  const spikes = data.frames
+    .map((f, i) => ({ ...f, i }))
+    .filter((f) => f.dt > SPIKE && f.seg !== "boot");
+  console.log(`
+══ SPIKES (> ${SPIKE} ms) ══ ${spikes.length} of ${data.frames.length} frames`);
+  if (spikes.length) {
+    console.log("  #     arm/seg          dt     marked  unmarked   voxMs  scroll  rb  log   ΔheapMB");
+    let prevHeap = null;
+    for (const f of data.frames) {
+      const h = f.heap || 0;
+      if (spikes.includes(f)) { /* placeholder, replaced below */ }
+      prevHeap = h;
+    }
+    for (const f of spikes) {
+      const prev = data.frames[f.i - 1];
+      const marked = Object.values(f.phases ?? {}).reduce((a, v) => a + v, 0);
+      const dHeap = prev?.heap ? (f.heap - prev.heap) / 1048576 : 0;
+      console.log(
+        `  ${String(f.i).padStart(4)}  ${`${f.arm}/${f.seg}`.padEnd(15)} ${f2(f.dt).padStart(7)} ` +
+        `${f2(marked).padStart(7)} ${f2(f.dt - marked).padStart(9)} ${f2(f.voxMs).padStart(7)} ` +
+        `${String(f.scrolls - (prev?.scrolls ?? f.scrolls)).padStart(6)} ${String(f.readbacks).padStart(3)} ` +
+        `${String(f.logs).padStart(4)} ${dHeap.toFixed(1).padStart(9)}`,
+      );
+      console.log(`        renders ${f.renderN} costing ${f2(f.renderMs)} ms CPU, ` +
+        `${f.draws} draw calls` +
+        (Object.keys(f.api ?? {}).length
+          ? `; device: ${Object.entries(f.api).filter(([k]) => !k.endsWith("Ms"))
+            .map(([k, v]) => `${k.replace("create", "")} ×${v}` +
+              (f.api[`${k}Ms`] > 1 ? ` (${f2(f.api[`${k}Ms`])} ms)` : "")).join(", ")}`
+          : "; no device calls"));
+      {
+        const pv = data.frames[f.i - 1];
+        console.log(`        canvas ${f.cw}×${f.ch}` +
+          (pv && (pv.cw !== f.cw || pv.ch !== f.ch) ? `  ⚠ CHANGED from ${pv.cw}×${pv.ch}` : " (unchanged)") +
+          `, textures ${f.texMB}${pv && pv.texMB !== f.texMB ? ` (was ${pv.texMB})` : ""}` +
+          `, geometries ${f.geoN}${pv && pv.geoN !== f.geoN ? ` (was ${pv.geoN})` : ""}`);
+      }
+      console.log(`        queue drain after the tick: ${f2(f.gpuDrainMs ?? NaN)} ms` +
+        `  (prev frame ${f2(data.frames[f.i - 1]?.gpuDrainMs ?? NaN)}, ` +
+        `${f2(data.frames[f.i - 2]?.gpuDrainMs ?? NaN)})`);
+      // The long-animation-frame entries that OVERLAP this frame's wall clock.
+      // This is the row that answers "what was the browser doing", because LoAF
+      // accounts for the whole frame — the scripts, the render phase, and the
+      // remainder that belongs to neither.
+      for (const e of data.longtasks.filter((x) => x.t + x.ms > f.t - f.dt && x.t < f.t)) {
+        console.log(`        ${e.type} ${f2(e.ms)} ms` +
+          (e.blocking != null
+            ? ` (blocking ${f2(e.blocking)}, render phase at +${f2(e.renderStart)}, ` +
+              `style/layout at +${f2(e.styleLayout)})`
+            : ""));
+        for (const sc of e.scripts ?? []) {
+          console.log(`            ${f2(sc.ms).padStart(8)} ms  ${sc.invokerType ?? "?"} ` +
+            `${sc.invoker ?? ""} ${sc.name ?? ""} ${sc.url ?? ""}`);
+        }
+      }
+      const g = Object.entries(f.gpu ?? {}).sort((a, b) => b[1] - a[1]).slice(0, 4);
+      if (g.length) {
+        console.log(`        GPU: ${g.map(([k, v]) => `${k} ${f2(v)} ms`).join(", ")} ` +
+          `(sum ${f2(Object.values(f.gpu).reduce((a, v) => a + v, 0))} ms)`);
+      }
+      for (const l of (f.logLines ?? []).slice(0, 2)) console.log(`        log: ${l}`);
+    }
+  }
+  {
+    // The same numbers for the frames that were FINE, so a spike row can be
+    // read as a difference rather than as an absolute.
+    const ok = data.frames.filter((f) => f.seg === "moving" && f.dt <= SPIKE);
+    console.log(`  the ${ok.length} moving frames that were NOT spikes, for contrast: ` +
+      `dt ${f2(median(ok.map((f) => f.dt)))} ms, renders ${median(ok.map((f) => f.renderN))}, ` +
+      `renderMs ${f2(median(ok.map((f) => f.renderMs)))}, draws ${median(ok.map((f) => f.draws))}, ` +
+      `queue drain ${f2(median(ok.map((f) => f.gpuDrainMs ?? 0)))} ms`);
+  }
+  // The in-page wrappers: what came in through a timer, an idle callback, a
+  // worker message or a promise continuation, ranked by the WORST single call.
+  if (data.cb?.length) {
+    console.log("\n  callbacks outside the tick (worst single call first):");
+    for (const c of data.cb.filter((c) => c.max > 4).slice(0, 12)) {
+      console.log(`    ${f2(c.max).padStart(8)} ms max  ${f2(c.ms).padStart(9)} ms total  ` +
+        `${String(c.n).padStart(6)} calls   ${c.label}`);
+    }
+    if (data.cbEvents?.length) {
+      console.log("  the individual calls over 8 ms, worst first:");
+      for (const e of data.cbEvents.slice(0, 10)) {
+        console.log(`    t=${f2(e.t).padStart(10)}  ${f2(e.ms).padStart(8)} ms  ${e.label}`);
+      }
+    }
+  }
+  if (data.api?.length) {
+    console.log("");
+    console.log("  WebGPU device calls over the whole run:");
+    for (const a of data.api) {
+      console.log(`    ${String(a.n).padStart(6)} ×  ${f2(a.ms).padStart(9)} ms total  ` +
+        `${f2(a.max).padStart(8)} ms worst   ${a.m}`);
+    }
+  }
+  if (data.pipelines?.length) {
+    console.log("");
+    console.log(`  RENDER/COMPUTE PIPELINES CREATED AFTER BOOT: ${data.pipelines.length}`);
+    for (const q of data.pipelines) {
+      console.log(`    frame #${q.frame}  t=${f2(q.t)}  ${q.label || "(no label)"}`);
+    }
+  }
+  if (data.renderStacks?.length) {
+    console.log("  the `renderer.render` calls that ran over 12 ms, worst first:");
+    for (const r of data.renderStacks.slice(0, 6)) {
+      console.log(`    frame #${r.frame}  ${f2(r.ms).padStart(8)} ms  scene "${r.scene}" ` +
+        `(${r.children} children)`);
+      console.log(`        ${r.stack}`);
+    }
+  }
+  // The sampling profile, attributed to each spike's own wall clock.
+  if (profile && profZero != null) {
+    const byId = new Map(profile.nodes.map((n) => [n.id, n]));
+    const times = [];
+    let t = profile.startTime;
+    for (const d of profile.timeDeltas) { t += d; times.push(t); }
+    const toPage = (us) => profZero + (us - profile.startTime) / 1000;
+    const name = (n) => {
+      const cf = n.callFrame ?? {};
+      const f = cf.functionName || "(anonymous)";
+      const u = (cf.url || "").replace(/^https?:\/\/[^/]+/, "").split("?")[0];
+      return `${f}  ${u}:${(cf.lineNumber ?? 0) + 1}`;
+    };
+    // ⭐⭐ SELF TIME NAMES THE VICTIM; THE STACK NAMES THE OWNER. `updateMatrixWorld`
+    // is hot on every frame of every three.js app ever written — the question a
+    // spike asks is what CALLED it this time, and only the ancestor chain
+    // answers that. The profile stores the tree as `children`, so the parent
+    // map has to be inverted once.
+    const parent = new Map();
+    for (const n of profile.nodes) for (const c of n.children ?? []) parent.set(c, n.id);
+    const chainOf = (id, depth = 7) => {
+      const out = [];
+      let cur = id;
+      while (cur != null && out.length < depth) {
+        const n = byId.get(cur);
+        if (!n) break;
+        out.push(name(n).split("  ")[0] || "?");
+        cur = parent.get(cur);
+      }
+      return out.reverse().join(" › ");
+    };
+    const attribute = (t0, t1, limit = 8) => {
+      const self = new Map();
+      const stacks = new Map();
+      let n = 0;
+      for (let k = 0; k < profile.samples.length; k++) {
+        const pt = toPage(times[k]);
+        if (pt < t0 || pt > t1) continue;
+        n++;
+        const node = byId.get(profile.samples[k]);
+        if (!node) continue;
+        self.set(name(node), (self.get(name(node)) ?? 0) + 1);
+        const ch = chainOf(profile.samples[k]);
+        stacks.set(ch, (stacks.get(ch) ?? 0) + 1);
+      }
+      return {
+        n,
+        top: [...self].sort((a, b) => b[1] - a[1]).slice(0, limit),
+        stacks: [...stacks].sort((a, b) => b[1] - a[1]).slice(0, 5),
+      };
+    };
+    console.log(`
+  JS SAMPLING PROFILE: ${profile.samples.length} samples over ` +
+      `${f2((profile.endTime - profile.startTime) / 1000)} ms`);
+    for (const f of spikes.slice(0, 6)) {
+      const a = attribute(f.t - f.dt, f.t);
+      console.log(`  frame #${f.i} (${f2(f.dt)} ms, ${f.arm}/${f.seg}) — ${a.n} samples:`);
+      for (const [k, c] of a.top) {
+        console.log(`      ${((100 * c) / Math.max(1, a.n)).toFixed(0).padStart(3)} %  ` +
+          `${f2((c * (profile.endTime - profile.startTime) / 1000) / profile.samples.length).padStart(7)} ms  ${k}`);
+      }
+      console.log("     — the stacks those samples sat in:");
+      for (const [k, c] of a.stacks) {
+        console.log(`      ${((100 * c) / Math.max(1, a.n)).toFixed(0).padStart(3)} %  ${k}`);
+      }
+    }
+    const all = attribute(-Infinity, Infinity, 10);
+    console.log("  whole run, hottest self time:");
+    for (const [k, c] of all.top) {
+      console.log(`      ${((100 * c) / Math.max(1, all.n)).toFixed(1).padStart(5)} %  ${k}`);
+    }
+  }
+}
+
 const lt = data.longtasks.filter((e) => e.ms > 20);
 console.log(`  longtasks  : ${data.longtasks.length} total, ${lt.length} over 20 ms` +
-  (lt.length ? `, max ${f2(Math.max(...lt.map((e) => e.ms)))} ms` : ""));
+  (lt.length ? `, max ${f2(Math.max(...lt.map((e) => e.ms)))} ms` : "") +
+  ` [observers armed: ${(data.obsArmed ?? []).join(", ") || "NONE"}]`);
+for (const e of data.longtasks.filter((x) => x.ms > 60).sort((a, b) => b.ms - a.ms).slice(0, 6)) {
+  console.log(`    ${e.type} t=${f2(e.t)} ${f2(e.ms)} ms` +
+    (e.blocking != null
+      ? ` — blocking ${f2(e.blocking)}, render phase starts at +${f2(e.renderStart)}`
+      : ""));
+  for (const sc of e.scripts ?? []) {
+    console.log(`        script ${f2(sc.ms).padStart(8)} ms  ${sc.invokerType ?? "?"}  ` +
+      `${sc.invoker ?? ""}  ${sc.name ?? ""}  ${sc.url ?? ""}` +
+      (sc.pause > 1 ? `  [paused ${f2(sc.pause)} ms]` : ""));
+  }
+}
 {
   // §19 4.1b's structural receipt: the largest triangle range ONE THREAD walked
   // anywhere in the run, against the bound the kernel was compiled with. This is

@@ -453,6 +453,37 @@
           const cnt = new Uint16Array(NPX);
           const spatial = [];
           let lit = null;
+          // ══ THE SIGN RECEIPT (§19 Stage 3.10) ═══════════════════════════
+          //
+          // ⭐⭐ σ/mean CANNOT TELL CONVERGENCE FROM NOISE, AND THIS STAGE IS
+          // ABOUT EXACTLY THAT DIFFERENCE. A pixel walking smoothly from 2.0
+          // to 2.1 over thirty frames and a pixel rattling between 2.04 and
+          // 2.06 have the same standard deviation; one is light arriving late
+          // (the user's "like light is slower than c", which is allowed) and
+          // the other is grain (which is not). The discriminator is the SIGN
+          // of the frame-to-frame delta: a monotone ramp never flips it, and
+          // white noise flips it half the time.
+          //
+          // `still` is the other half of the same receipt — the share of
+          // pixels that did not move at all beyond a relative epsilon well
+          // under the 8-bit display quantum. On a deterministic estimator with
+          // a settled cache that number is the one that should read 100 %.
+          //
+          // ⚠ THE EPSILON IS 1e-3 RELATIVE AND THAT IS A MEASUREMENT, NOT A
+          // TASTE. At 1e-4 a fully converged deterministic image still reports
+          // ~20 % flips, because the last bits of an f16 store and the
+          // non-associative reductions above it dither at that scale — the
+          // instrument was reading its own quantization floor and calling it
+          // noise (the blind-statistics trap from the other end). 1e-3 is 0.1 %
+          // of the pixel's own value, still an order of magnitude under the
+          // ~1.5 % contrast step 8-bit sRGB can show in the midtones, so
+          // nothing visible is being filtered out.
+          const SIGN_EPS = 1e-3;
+          const prevL = new Float64Array(NPX);
+          const prevS = new Int8Array(NPX);
+          const flips = new Uint32Array(NPX);
+          const steps = new Uint32Array(NPX);
+          const moved = new Uint32Array(NPX);
           // Probe-space, the same two axes on the SH DC term.
           const shSum = new Float64Array(gd.probeCount);
           const shSq = new Float64Array(gd.probeCount);
@@ -472,6 +503,17 @@
               const L = f[i * 4]; const B = f[i * 4 + 1];
               if (!(B > lit)) continue;
               sum[i] += L; sq[i] += L * L; cnt[i]++;
+              if (cnt[i] > 1) {
+                steps[i]++;
+                const d = L - prevL[i];
+                if (Math.abs(d) > SIGN_EPS * Math.max(L, 1e-6)) {
+                  moved[i]++;
+                  const sg = d > 0 ? 1 : -1;
+                  if (prevS[i] !== 0 && sg !== prevS[i]) flips[i]++;
+                  prevS[i] = sg;
+                }
+              }
+              prevL[i] = L;
               if (f[i * 4 + 2] < 0.5) histAdd(hp, Math.abs(L - B) / B);
             }
             spatial.push({ p50: histP(hp, 50), p95: histP(hp, 95), n: hp.n });
@@ -537,6 +579,24 @@
             const v = Math.max(0, shSq[p] / shCnt[p] - m * m);
             histAdd(shTemp, Math.sqrt(v) / m);
           }
+          // ── the sign census, over the pixels the temporal histogram scored ──
+          const flipHist = mkHist();
+          let stillPx = 0;
+          let scoredPx = 0;
+          let totalSteps = 0;
+          let totalMoved = 0;
+          let totalFlips = 0;
+          for (let i = 0; i < NPX; i++) {
+            if (cnt[i] < frames) continue;
+            scoredPx++;
+            totalSteps += steps[i];
+            totalMoved += moved[i];
+            totalFlips += flips[i];
+            if (moved[i] === 0) { stillPx++; continue; }
+            // A flip needs two consecutive MOVES to be possible, so the rate is
+            // scored against `moved − 1`, never against the frame count.
+            if (moved[i] > 1) histAdd(flipHist, flips[i] / (moved[i] - 1));
+          }
           const medOf = (xs) => xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)];
           const out = {
             label, frames, litThreshold: lit,
@@ -550,12 +610,24 @@
               p50: medOf(shSpatial.map((s) => s.p50)), p95: medOf(shSpatial.map((s) => s.p95)),
               n: shSpatial[0]?.n ?? 0,
             },
+            sign: {
+              flipP50: histP(flipHist, 50), flipP95: histP(flipHist, 95),
+              stillPct: scoredPx ? (100 * stillPx) / scoredPx : null,
+              movedPct: totalSteps ? (100 * totalMoved) / totalSteps : null,
+              flipRate: totalMoved > scoredPx ? totalFlips / (totalMoved - scoredPx) : null,
+              n: scoredPx,
+            },
           };
           const pc = (v) => (v == null ? "  n/a" : `${(100 * v).toFixed(2)} %`);
           if (!quiet) {
             say(`  NOISE [${label}] irradiance: temporal p50 ${pc(out.temporal.p50)} p95 ${pc(out.temporal.p95)} ` +
               `(${out.temporal.n} px over ${frames} frames) | spatial p50 ${pc(out.spatial.p50)} ` +
               `p95 ${pc(out.spatial.p95)} (${out.spatial.n} px/frame, edges excluded)`);
+            say(`  SIGN  [${label}]: pixels that never moved ${out.sign.stillPct?.toFixed(1)} %, `
+              + `frames on which a pixel moved ${out.sign.movedPct?.toFixed(1)} %, `
+              + `sign-flip rate ${out.sign.flipRate == null ? "n/a" : (100 * out.sign.flipRate).toFixed(1)} % `
+              + `(per-pixel p50 ${pc(out.sign.flipP50)} p95 ${pc(out.sign.flipP95)}) `
+              + `— 0 % is a monotone ramp, 50 % is white noise`);
             say(`  NOISE [${label}] probe SH DC: temporal p50 ${pc(out.shTemporal.p50)} p95 ${pc(out.shTemporal.p95)} ` +
               `(${out.shTemporal.n} probes) | spatial p50 ${pc(out.shSpatial.p50)} p95 ${pc(out.shSpatial.p95)} ` +
               `(${out.shSpatial.n} probes)`);
@@ -1172,7 +1244,21 @@
         // that has nothing to do with either.
         if (params.get("levers") !== "0") {
           let nn = FRAMES + 900;
+          // ⚠ EVERY LIVE UNIFORM AN ARM CAN OVERRIDE HAS TO APPEAR HERE.
+          // `cum` is built from this object and `runArm` sets `{...cum,
+          // ...override}` — so a uniform that is NOT in it is never restored,
+          // and the first arm that touches it silently poisons every row below
+          // (which is the same class of bug as a hand-written pass list). The
+          // §19 3.10 defaults are read off the gather itself rather than
+          // re-typed, so the ladder cannot drift from what ships.
+          const DEFAULTS = {
+            shadeProb: gd.shadeProb, shadeStrideU: gu.shadeStrideU.value,
+            octAlpha: gu.octAlpha.value, probeDither: gu.probeDither.value,
+            injectAlpha: gu.injectAlpha.value,
+            skyAtHit: 1, needRays: 1, priorOn: gu.priorOn.value,
+          };
           const BASE = {
+            ...DEFAULTS,
             historyU: 4, hystOn: gatherMod.HYST.legacy, reprojWide: 0,
             injectAlpha: 0.25, injectGlossy: 1, sh3: true, anchorJitter: 1,
           };
@@ -1182,9 +1268,9 @@
             }
           };
           const SHIP = {
+            ...DEFAULTS,
             historyU: gd.history, hystOn: gatherMod.HYST.decay, reprojWide: 1,
-            injectAlpha: 0.25, injectGlossy: 0, sh3: false, anchorJitter: 0,
-            shadeProb: gd.shadeProb, skyAtHit: 1, needRays: 1, priorOn: 1,
+            injectGlossy: 0, sh3: false, anchorJitter: 0,
           };
           /**
            * ⭐ §19 STAGE 3.7's OWN BASELINE — 3.6 EXACTLY, OUT OF THIS BINARY.
@@ -1243,8 +1329,17 @@
             await settle(SETTLE);
             return { settled, f50, f90, series };
           };
-          /** ~4·H frames: `H` samples per texel at one sample every `stride`. */
-          const SETTLE = Math.max(80, 5 * gd.history);
+          /**
+           * ⚠ 320, NOT 160 (§19 Stage 3.10). The old figure was `5·H` — five
+           * probe-history lifetimes — and the probe has no history worth the
+           * name any more. What has to settle after an arm switch is the WORLD
+           * CACHE, whose time constant is `shadeStrideU` frames per Neumann
+           * sweep times however many bounces the room needs; at 160 frames the
+           * ladder's at-rest row was still reading a cache re-solving from the
+           * PREVIOUS arm and reporting the transient as noise (the settled
+           * receipt over the same binary reads 0.00 %).
+           */
+          const SETTLE = 320;
           const runArm = async (label, arm, { probeSpace = false, converge = false } = {}) => {
             setArm(arm);
             await settle(SETTLE);
@@ -1286,22 +1381,30 @@
           cum.hystOn = gatherMod.HYST.decay;
           levers.push(await runArm("6 +decaying hyst", { ...cum }));
           cum.injectGlossy = 0;
-          levers.push(await runArm("7 +inject diffuse", { ...cum }, { probeSpace: true, converge: true }));
+          levers.push(await runArm("7 +inject diffuse", { ...cum }));
+          cum.injectAlpha = gu.injectAlpha.value;
+          levers.push(await runArm("8 +no screen injection", { ...cum }, { probeSpace: true, converge: true }));
           // ── the arms that are NOT on the ladder: what each choice was
           // measured AGAINST. A cumulative table says a lever helped; it never
           // says the alternative would have helped more.
+          //
+          // ⭐⭐ §19 STAGE 3.10 REPLACED THE ARMS, BECAUSE IT REPLACED THE
+          // LEVERS. `hystOn` and `historyU` still exist as uniforms (the
+          // `probePlace` carry reads `historyU`) but nothing on the trace path
+          // reads either any more, so an arm over them measures the same
+          // binary twice and prints it as evidence. What IS live is the list
+          // below, and the column that matters for every row of it is `flip%`:
+          // the at-rest σ that is left has to be a RAMP, and each of these
+          // arms is a candidate owner of any residual that is NOT.
           for (const [label, over] of [
-            ["· hyst OFF", { hystOn: gatherMod.HYST.off }],
-            ["· hyst reset (n←1)", { hystOn: gatherMod.HYST.variance }],
-            ["· hyst reset AND dist", { hystOn: gatherMod.HYST.varianceAndDist }],
-            ["· inject a=0.1", { injectAlpha: 0.1 }],
+            ["· injection back (a=0.25)", { injectAlpha: 0.25 }],
+            ["· no re-shade", { shadeProb: 0 }],
+            ["· shade stride 4", { shadeStrideU: 4 }],
+            ["· shade stride 64", { shadeStrideU: 64 }],
+            ["· octAlpha 1 (no probe memory)", { octAlpha: 1 }],
+            ["· octAlpha 0.25", { octAlpha: 0.25 }],
+            ["· texel centres (no dither)", { probeDither: 0 }],
             ["· anchor jitter back", { anchorJitter: 1 }],
-            // ⭐ THE H CURVE IS THE TRADE ITSELF. Every frame of memory is a
-            // frame of lag, and the panel-move arm below prices the lag; this
-            // prices the quiet. Two numbers, one axis, and the choice of H is
-            // then an argument about which end of it the user wants.
-            ["· H=8", { historyU: 8 }],
-            ["· H=16", { historyU: 16 }],
           ]) levers.push(await runArm(label, { ...cum, ...over }));
           setArm(SHIP);
           await settle(60);

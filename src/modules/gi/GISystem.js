@@ -4789,6 +4789,44 @@ export class GISystem {
       compileTarget.fog = engine.scene.fog;
       engine.scene.updateMatrixWorld(true);
       const compileSeen = new Set();
+      // ⭐⭐⭐ §19 STAGE 3.10 — `traverse`, NOT `traverseVisible`, AND THAT ONE
+      // WORD IS THE TWO RESIDUAL ~150 ms ORBIT SPIKES.
+      //
+      // THE RECEIPT (`probe:gi2-motion`, Bistro, ultra, ARMS=orbit): exactly
+      // TWO render pipelines are created in a whole run, at frames #157 and
+      // #174 — `renderPipeline_Uber(3)_407` and
+      // `renderPipeline_MeshPhysicalNodeMaterial_143` — and the two frames
+      // over 50 ms are #159 and #176. Every CPU column on a spike frame is
+      // identical to a healthy one (3 renders, 20 ms of `renderer.render`,
+      // 551 draws, `voxMs` 0.17, no readback, no log, no GC), and the
+      // long-animation-frame entry reads `blockingDuration 0.00` with the
+      // browser's RENDER PHASE starting +137 ms after the rAF script ended.
+      // Nothing was running: the page was waiting for a pipeline the driver
+      // had only just been handed. At MOVE=240 the same pair moves with the
+      // CAMERA (#252/#254 and #286/#288), which is what says "a material came
+      // into view", not "a timer fired".
+      //
+      // ⛔ REFUTED, WITH ITS OWN RECEIPT: `traverseVisible` → `traverse`.
+      // The obvious reading is that the wave was DESIGNED to miss them —
+      // `traverseVisible` stops at any `visible === false` node, and a merged
+      // proxy is hidden exactly while the merge that owns it is being built.
+      // Measured: with a full `traverse`, the same two pipelines are still
+      // created at the same two frames (#157 `Uber(3)_410`, #174
+      // `MeshPhysicalNodeMaterial_140`) and the same two frames still exceed
+      // 150 ms. They are not hidden at wave time — THEY DO NOT EXIST at wave
+      // time, because merging publishes its proxies after first light and the
+      // wave runs once per boot. `traverseVisible` is therefore kept (it is
+      // the cheaper walk and it is not the bug).
+      //
+      // ▶ THE FIX THIS POINTS AT, unbuilt: the wave needs a persistent set of
+      // warmed variant keys, and the material drain that already re-walks
+      // every material every few seconds needs to warm — off-frame, one per
+      // cycle — any key that is not in it. That is a DEFERRAL of the same
+      // work, not more of it, and it is the only shape that can catch a
+      // variant created after the wave. ⚠ It must key against a persistent
+      // set, or it becomes the [[gi-shadowmerge-invalidation-loop]] again:
+      // "different from last time" is not "changed" for an object that did
+      // not exist last time.
       engine.scene.traverseVisible((object) => {
         if (object.isLight) {
           // A clone keeps the live light's bind groups owned by the live

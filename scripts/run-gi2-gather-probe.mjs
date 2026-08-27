@@ -648,6 +648,23 @@ if (table.length) {
         `${String(L.converge?.f50 ?? "—").padStart(3)}/${String(L.converge?.f90 ?? "—").padStart(3)}`,
       );
     }
+    // ⭐⭐ §19 STAGE 3.10 — THE COLUMN THAT SEPARATES LAG FROM GRAIN.
+    // σ/mean scores a monotone ramp and white noise identically; the sign of
+    // the frame-to-frame delta does not. 0 % flips is light arriving late
+    // (allowed), 50 % is grain (not). `still` is the share of scored pixels
+    // that did not move at all beyond 1e-4 relative — on a deterministic
+    // estimator over a settled cache that is the number that should read 100.
+    console.log("arm                        still%   moved%   flip%   flip p50/p95");
+    for (const L of t.levers) {
+      const sg = L.noise.sign;
+      if (!sg) continue;
+      console.log(
+        `${L.label.padEnd(24)}  ${(sg.stillPct ?? 0).toFixed(1).padStart(6)}  ` +
+        `${(sg.movedPct ?? 0).toFixed(1).padStart(6)}  ` +
+        `${(sg.flipRate == null ? NaN : 100 * sg.flipRate).toFixed(1).padStart(6)}  ` +
+        `${pc(sg.flipP50)}/${pc(sg.flipP95)}`,
+      );
+    }
     const probeRows = t.levers.filter((L) => L.noise.shTemporal.n > 0);
     if (probeRows.length) {
       console.log("  probe SH DC (probe space, the same two axes):");
@@ -672,10 +689,15 @@ if (table.length) {
     }
     if (t.motionNoise) {
       const m = t.motionNoise;
+      console.log(`  UNDER MOTION: orbit sign — still ${(m.orbit.sign?.stillPct ?? 0).toFixed(1)} %, `
+        + `moved ${(m.orbit.sign?.movedPct ?? 0).toFixed(1)} %, flips `
+        + `${m.orbit.sign?.flipRate == null ? "n/a" : (100 * m.orbit.sign.flipRate).toFixed(1)} %`);
       console.log(`  UNDER MOTION: orbit temporal ${pc(m.orbit.temporal.p50)}/${pc(m.orbit.temporal.p95)} ` +
         `spatial ${pc(m.orbit.spatial.p50)}/${pc(m.orbit.spatial.p95)} (reproj ${m.reprojDuringOrbit.toFixed(1)} %); ` +
         `recovery after stopping — ` + (m.recovery ?? [m.after10]).map((r) => `+${r.at ?? 10} fr ` +
-          `${pc(r.temporal.p50)}/${pc(r.temporal.p95)} temporal ${pc(r.spatial.p95)} spatial`).join("; "));
+          `${pc(r.temporal.p50)}/${pc(r.temporal.p95)} temporal ${pc(r.spatial.p95)} spatial ` +
+          `still ${(r.sign?.stillPct ?? 0).toFixed(1)} % flips ` +
+          `${r.sign?.flipRate == null ? "n/a" : (100 * r.sign.flipRate).toFixed(1)} %`).join("; "));
     }
     if (t.cacheSigma) {
       const cs = t.cacheSigma;
@@ -751,6 +773,27 @@ if (table.length) {
       const cumRows = t.levers.filter((L) => !L.label.startsWith("·"));
       const ship = cumRows.at(-1) ?? t.levers.at(-1);
       g.push(["noise: temporal p95 ≤ 1 %", 100 * (ship.noise.temporal.p95 ?? 9), (v) => v <= 1]);
+      // §19 Stage 3.10: the noise gate proper. Whatever is left of the at-rest
+      // temporal σ has to be a RAMP — a deterministic estimator over a cache
+      // that is still filling — and a ramp does not change sign. 15 % leaves
+      // room for the handful of pixels that sit on a converged plateau and
+      // dither in the last bit of an f16 store; 50 % would be white noise.
+      // ⚠ SCORED ON THE SETTLED WINDOW, NOT ON THE LADDER'S ROW. A lever arm
+      // is measured 160 frames after the uniforms changed, and the world cache
+      // has a time constant several times that — so the ladder's at-rest row
+      // is always reading a cache re-converging from the PREVIOUS arm, which
+      // is a transient and not the estimator. `motionNoise.recovery` at +100
+      // frames is the same instrument over the SHIPPED arm after a long
+      // settle, and that is the one this stage's claim is about.
+      const rest = t.motionNoise?.recovery?.at(-1) ?? ship.noise;
+      g.push(["at rest (settled): temporal p95 ≤ 0.3 %", 100 * (rest.temporal.p95 ?? 9), (v) => v <= 0.3]);
+      // ⚠ `flipRate` IS NULL WHEN NOTHING MOVED AT ALL, WHICH IS THE BEST
+      // POSSIBLE RESULT AND NOT A MISSING MEASUREMENT. The claim is scored as
+      // a pair: a frozen image (`still` ≈ 100 %) passes with no flip rate to
+      // report, and anything that does move has to move monotonically.
+      g.push(["at rest (settled): still % ≥ 95", rest.sign?.stillPct ?? 0, (v) => v >= 95]);
+      g.push(["at rest (settled): sign-flip ≤ 15 %",
+        rest.sign?.flipRate == null ? 0 : 100 * rest.sign.flipRate, (v) => v <= 15]);
       g.push(["noise: spatial p95 ≤ 3 %", 100 * (ship.noise.spatial.p95 ?? 9), (v) => v <= 3]);
       g.push(["history resets at rest ≤ 0.5 %", ship.alphaForcedPct, (v) => v <= 0.5]);
       g.push(["reprojection at rest ≥ 99 %", ship.reprojPct, (v) => v >= 99]);
@@ -760,6 +803,21 @@ if (table.length) {
       g.push(["panel move re-converges ≤ 30 fr", t.panelMove.shipped.worstFrame ?? 999, (v) => v <= 30]);
     }
     if (t.motionNoise) {
+      // §19 Stage 3.10's motion gate. The orbit's temporal σ is NOT a noise
+      // number (a pixel that changes surface between frames has a σ made of
+      // the scene — see the page's own warning), so what is gated under motion
+      // is the SIGN rate: reinterpolation and parallax move a pixel smoothly,
+      // grain does not.
+      // ⚠ 35 %, AND THE BAR IS ARGUED RATHER THAN COPIED FROM THE AT-REST ONE.
+      // A pixel under an orbiting camera changes SURFACE, so its value reverses
+      // direction for reasons that are the scene and not the estimator — it
+      // crosses a silhouette, a shadow edge, a colour boundary. What the number
+      // still separates is a scene reversing at its own scale from white noise
+      // reversing every frame: the 3.5 baseline reads 55 % at REST, i.e. the
+      // orbit's honest ceiling is well under that.
+      g.push(["orbit: sign-flip rate ≤ 35 %",
+        t.motionNoise.orbit?.sign?.flipRate == null ? 999 : 100 * t.motionNoise.orbit.sign.flipRate,
+        (v) => v <= 35]);
       g.push(["10 fr after stop: temporal ≤ 1 %", 100 * (t.motionNoise.after10.temporal.p95 ?? 9), (v) => v <= 1]);
       g.push(["10 fr after stop: spatial ≤ 3 %", 100 * (t.motionNoise.after10.spatial.p95 ?? 9), (v) => v <= 3]);
     }

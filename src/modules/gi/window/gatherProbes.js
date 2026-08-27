@@ -115,11 +115,50 @@ import { octahedralUV } from "../srcOctahedral.js";
  * only ever hold one value is kept as a row so the A/B stays expressible, not
  * because a tier is expected to differ.
  */
+/**
+ * ⭐⭐⭐ §19 STAGE 3.10 — THE TILE IS 16 AND `rays` IS DEAD, BECAUSE THE
+ * ESTIMATOR IS NOT A MONTE-CARLO ONE ANY MORE.
+ *
+ * THE USER'S RULE: "there must be NO noise at all — that was the initial idea
+ * of radiance cascades", and then: "we can use some kind of temporal
+ * accumulation, but it must not be noise — in UE5 light just gradually
+ * accumulates, smoothly, like light is slower than c."
+ *
+ * Those two sentences are one contract, and it is a contract about the INPUT,
+ * not about a filter on the output:
+ *
+ *   · NO STOCHASTIC INPUT ANYWHERE ON THE IMAGE PATH. Every probe evaluates
+ *     its COMPLETE fixed direction set — all 64 octahedral texels, at their
+ *     texel CENTRES — every frame. No jitter inside the texel, no per-frame
+ *     rotation, no subset chosen by a hash, no per-probe seed. Two consecutive
+ *     frames of a parked camera trace the same rays and get the same answer,
+ *     so "temporal noise at rest" is not small — it is ZERO by construction.
+ *   · SMOOTHING IS ALLOWED, GRAIN IS NOT. An EMA over noise-free evaluations
+ *     can only add LAG (light arriving late, which is what UE5 looks like); it
+ *     can never add grain, because there is no grain in what it averages. So
+ *     the probe map keeps a FIXED-α blend against the reprojected previous map
+ *     (`octAlpha`) and the world cache keeps its own EMA — and every
+ *     variance-driven, hash-driven and count-driven rule that used to sit on
+ *     top of them is gone. See `probeTracePass`.
+ *
+ * ⚠ WHAT THIS COSTS, AND WHERE IT IS PAID BACK. Sixty-four directions a frame
+ * is 4× the old per-probe budget, so the probe GRID gives 4× back: tile 16 at
+ * desktop (was 8), tile 24 on phone (was 16). At 1650×970 that is 104×61 =
+ * 6 344 probes × 64 = 406 k rays a frame against 25 254 × 16 = 404 k — the
+ * SAME ray budget, spent completely instead of stochastically. About half the
+ * texels of a world-oriented oct map face away from the probe and cost one
+ * `uniformArray` read and a store, so the traced count is ~200 k.
+ *
+ * ⛔ `rays`, `mature` AND `history` ARE NOT READ BY THE TRACE ANY MORE. They
+ * stay in the row because `probePlace`'s carry arm, `rayBudget` and the
+ * harness's lever table still name them, and deleting a row a receipt sets
+ * would make the A/B unexpressible rather than unnecessary.
+ */
 export const GATHER_TIERS = {
-  phone: { tile: 16, rays: 8, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 4, shadeProb: 0.03, skyRays: 2 },
-  medium: { tile: 16, rays: 8, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 4, shadeProb: 0.03, skyRays: 2 },
-  high: { tile: 8, rays: 16, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 8, shadeProb: 0.06, skyRays: 4 },
-  ultra: { tile: 8, rays: 16, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 8, shadeProb: 0.06, skyRays: 4 },
+  phone: { tile: 24, rays: 8, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 4, shadeProb: 0.03, skyRays: 2 },
+  medium: { tile: 24, rays: 8, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 4, shadeProb: 0.03, skyRays: 2 },
+  high: { tile: 16, rays: 16, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 8, shadeProb: 0.06, skyRays: 4 },
+  ultra: { tile: 16, rays: 16, oct: 8, history: 32, sh: true, hzbSteps: 12, shRadius: 2, mature: 8, shadeProb: 0.06, skyRays: 4 },
 };
 
 /**
@@ -656,13 +695,80 @@ export function createGiGather({
     // change, bought for nothing, so the shorter one ships. The receipt is
     // `probe:gi2-gather`'s cache temporal σ at named voxel faces over 30
     // frames (median 2.33 % → 0.51 %), not an argument about time constants.
-    injectAlpha: uniform(0.25),
+    //
+    // ⛔⛔ AND IT IS 0 SINCE §19 STAGE 3.10, BECAUSE IT WAS THE LAST OSCILLATOR
+    // IN THE CHAIN — MEASURED, NOT ARGUED.
+    //
+    // With the trace made deterministic the at-rest temporal σ did NOT go to
+    // zero; it went to 1.16 % p95, which σ alone could not explain. The SIGN
+    // receipt (`probe:gi2-gather`'s `flip%` column — the share of frame-to-
+    // frame deltas that reverse direction; 0 % is a ramp, 50 % is white noise)
+    // named the owner in one table:
+    //
+    //     arm                     still%   moved%   flip%   flip p50/p95
+    //     shipped (injection on)     0.3     90.0    24.5   24.96 / 44.33
+    //     · no injection            10.2      6.7     2.1    0.00 /  0.00
+    //     · shade stride 4           0.3     94.2    53.5   49.89 / 72.22
+    //     · shade stride 64          0.0     64.8    33.3   33.40 / 55.70
+    //
+    // ⭐⭐ TWO PRODUCERS, ONE WORD, TWO DIFFERENT ANSWERS. `injectLitFrame`
+    // pulls a face 25 % toward the SCREEN's resolved colour on the frame its
+    // 4×4 rotation reaches it; `shadeHit` pushes it back toward the ANALYTIC
+    // estimate on the frame the cadence reaches it. Neither is noisy on its
+    // own and the two do not agree, so the word ping-pongs — and the more
+    // often the shade fires the worse it gets, which is what the two stride
+    // rows prove. It was invisible while the probe averaged 32 stochastic
+    // samples per texel; a deterministic estimator shows it immediately.
+    //
+    // ⚠ ZERO DOES NOT REMOVE THE INJECTION. `cacheWrite` forces α = 1 on a
+    // face whose word is still 0, so the screen keeps SEEDING faces no ray has
+    // shaded yet and stops OVERWRITING faces the estimator owns. The
+    // multibounce it used to carry is carried by `shadeHit`'s own cosine rays,
+    // which read the same cache; the receipts that price the difference are
+    // the parity crops, `2nd bounce` and `off-screen`.
+    injectAlpha: uniform(0),
     /** 1 restores Stage 3.5's "inject the whole composite" — see `injectPass`. */
     injectGlossy: uniform(0),
     /** 0 restores Stage 3.5's half-tile along-surface reprojection bound. */
     reprojWide: uniform(1),
     /** 1 restores §L.1's PER-FRAME anchor jitter — see `probePlace`. */
     anchorJitter: uniform(0, "uint"),
+    /**
+     * §19 Stage 3.10's 4×4 sub-texel LATTICE over the probe grid — see
+     * `probeTracePass`. 1 ships it, 0 is exact texel centres (the arm the
+     * quantization receipt was measured on). It is spatial and constant in
+     * time, so neither value moves the at-rest temporal number.
+     */
+    probeDither: uniform(1),
+    /**
+     * ⭐⭐ §19 STAGE 3.10 — THE PROBE MAP'S ONLY TEMPORAL RULE, AND IT IS A
+     * CONSTANT.
+     *
+     * The texel's new value is a COMPLETE, deterministic evaluation of that
+     * direction (see `probeTracePass`), so the blend against the reprojected
+     * previous value has nothing to hide and nothing to average away: it
+     * exists to make the world cache's convergence STEPS and a moved lamp
+     * arrive as a ramp rather than as an edge. `α = 1` is "no memory at all"
+     * and is a legitimate arm — with a noiseless input it is not noisy, only
+     * abrupt. A disoccluded probe takes α = 1 whatever this says.
+     *
+     * ⛔ IT IS NOT `1/min(n+1, H)`. That schedule exists to average SAMPLES,
+     * and there are no samples any more — only evaluations. A count-driven α
+     * would make a probe that has been still for a second take a real world
+     * change 32× more slowly than the probe beside it that has just been
+     * placed, for no variance in return.
+     */
+    octAlpha: uniform(0.5),
+    /**
+     * The re-shade CADENCE, as a power-of-two stride over `(voxel, frame)`
+     * rather than §P.1's coin flip. Deterministic: which faces are re-shaded
+     * this frame is a function of the frame index, and — because the shade
+     * itself is now a fixed function of the face (see `shadeHit`) — a re-shade
+     * that lands on a converged face writes back the value already there.
+     * The cadence therefore controls LATENCY and COST and cannot control
+     * noise, which is the property that lets it be a round number.
+     */
+    shadeStrideU: uniform(16, "uint"),
     // §L.3's biased hysteresis, as a UNIFORM MODE rather than a compiled-in
     // rule — the same discipline `hzbOn` follows. It is a claim about the
     // estimator ("a big change is a lighting change") that only a measurement
@@ -675,7 +781,13 @@ export function createGiGather({
     // with the four candidate gbuffer reads §L.1 describes. A uniform arm so
     // "probePlace costs 0.76 ms" can be split into "0.1 for the placement and
     // 0.66 for copying 64 texels per probe" instead of argued about.
-    carryOn: uniform(1),
+    // ⛔ OFF SINCE §19 STAGE 3.10. `probeTrace` writes EVERY texel of every
+    // probe every frame and reads the previous value it needs directly out of
+    // the previous half (one buffer read, at the texel it is already writing),
+    // so copying all 64 texels forward in `probePlace` is 64 reads and 64
+    // writes per probe of work whose only consumer overwrites it. Kept as an
+    // arm because the carry is also what the maturity CENSUS rides on.
+    carryOn: uniform(0),
     // §L.3's history depth. A TIER CONSTANT in the table above and a uniform
     // here for the same reason `hystOn` is: how much variance H buys, and what
     // it costs in responsiveness, is a measurement.
@@ -683,15 +795,43 @@ export function createGiGather({
     // ── §19 STAGE 3.7, and every one of these is an A/B arm ────────────────
     /** §P.1's `p_shade`. 0 restores 3.6's one-shot cache exactly. */
     shadeProb: uniform(spec.shadeProb ?? 0.25),
-    /** §P.1's `N_CAP`. 1 restores α = 1 (one-shot) with the re-shade still on. */
-    nCapU: uniform(SHADE_N_CAP),
+    /**
+     * §P.1's `N_CAP` — and it is **1** since §19 Stage 3.10, the value the old
+     * header called "one-shot" and dismissed.
+     *
+     * ⭐⭐ A RUNNING MEAN AVERAGES SAMPLES. THERE ARE NO SAMPLES ANY MORE.
+     * `shadeHit` is a fixed function of the face now (a fixed cosine set, every
+     * emitter slot, every panel stratum), so the 2nd, 3rd and 16th shade of a
+     * face compute the same number as the 1st, up to whatever the CACHE under
+     * them has learned since. Averaging sixteen of those is not variance
+     * reduction; it is a 16× brake on the Neumann iteration the cache IS.
+     * Measured at cap 16 with the screen injection off, the Cornell crops sat
+     * ~25 % under the reference after a 260-frame settle — not a bias, an
+     * unfinished convergence. α = 1 is Gauss–Seidel on the same operator and
+     * it cannot be noisy, because what it writes is deterministic.
+     *
+     * ⚠ HOW FAST LIGHT SPREADS IS NOW ONE NUMBER (`shadeStrideU`, how often a
+     * face is revisited) instead of two that multiply.
+     */
+    nCapU: uniform(1),
     /** §P.2's sky ray at every shade sample. 0 removes the term. */
     skyAtHit: uniform(1),
     /** §P.3's mature share. `rayBudget` scales it; 0 restores a flat `R`. */
     needRays: uniform(1),
     matureRaysU: uniform(MATURE_RAYS, "uint"),
-    /** §P.4's neighbour prior for a fresh probe. 0 restores "start at zero". */
-    priorOn: uniform(1),
+    /**
+     * §P.4's neighbour prior for a fresh probe. 0 restores "start at zero".
+     *
+     * ⛔ OFF SINCE §19 STAGE 3.10, AND FOR THE REASON THE ITEM WAS WRITTEN.
+     * The prior existed because a fresh probe held a 16-of-64-direction
+     * estimate for several frames and read BLACK over everything it had not
+     * sampled yet. A fresh probe now evaluates its whole front hemisphere on
+     * the frame it is placed, so there is no hole for a prior to fill — and
+     * seeding one would put a NEIGHBOUR's irradiance into a probe whose own
+     * answer is already complete, i.e. a bias with no missing data to excuse
+     * it. Kept as an arm; it costs 81 vec4 reads on fresh probes when set.
+     */
+    priorOn: uniform(0),
     /**
      * ⭐⭐ §19 STAGE 3.9's OWN CONTROL ARM. 0 files every hit and every
      * injection under the ray's ENTRY face again — Stage 3.8's behaviour,
@@ -1493,12 +1633,53 @@ export function createGiGather({
         // arithmetic, which is why every other `Loop` in this file opens with
         // `uint(<var>)`.
         const k = uint(skyRay).toVar();
-        const u1 = rand01(seedU.add(k.mul(uint(0x9e3779b9)))).toVar();
-        const u2 = rand01(seedU.add(k.mul(uint(0x85ebca6b))).add(uint(1))).toVar();
-        const sx = bitAnd(k, uint(SKY_STRATA - 1)).toFloat().toVar();
-        const sy = shiftRight(k, uint(Math.log2(SKY_STRATA))).toFloat().toVar();
-        const r1 = u1.add(sx).div(SKY_STRATA).toVar();
-        const r2 = u2.add(sy).div(SKY_ROWS).toVar();
+        // ⭐⭐ §19 STAGE 3.10 — STRATUM CENTRES, NOT A HASH INSIDE THE STRATUM.
+        //
+        // The two `rand01` draws that used to sit here were the last stochastic
+        // input the cache had, and they are the mechanism behind BOTH faults
+        // 3.7/3.8 chased: a face's value depended on a hash of whichever ray
+        // happened to reach it, so two neighbouring voxels on one flat wall
+        // held two unrelated draws (the spatial "dirt"), and re-shading one
+        // face twice gave two different answers (the temporal one).
+        //
+        // The stratum CENTRE is a fixed 2×2 (or 2×1) cosine quadrature of the
+        // hemisphere. It is BIASED — four directions cannot integrate a
+        // hemisphere exactly — and it is bias of exactly the kind RC accepts.
+        // The tangent frame is built from the FACE NORMAL alone (Duff), so
+        // every face sharing a normal evaluates the SAME four world
+        // directions: neighbouring faces on one wall agree by construction,
+        // and re-shading is IDEMPOTENT. That last property is what makes the
+        // cadence in `probeTrace` a latency knob instead of a noise source,
+        // and what lets the cache's EMA converge monotonically to a fixed
+        // point instead of rattling around a mean.
+        //
+        // ⚠⚠ AND IT IS A HAMMERSLEY SET, NOT THE 2×2 STRATUM CENTRES — THE
+        // FIRST CUT OF THIS CHANGE WAS DEGENERATE AND THE CORNELL PARITY SAW
+        // IT IMMEDIATELY. Freezing `(r1, r2)` at the centres of a 2×2 grid
+        // gives `r2 ∈ {¼, ¾}`, and `r2` is the AZIMUTH: all four rays then lie
+        // in ONE PLANE through the normal, sampling a 2-D slice of a 3-D
+        // hemisphere. Measured that way, `floorCentre` came back at 1.65× the
+        // 4-bounce reference and 4 of 8 crops left the bracket. Randomness had
+        // been hiding a quadrature that was never designed — the jitter filled
+        // in the azimuths the strata did not.
+        //
+        // `(k + ½)/N` for the elevation and the VAN DER CORPUT radical inverse
+        // for the azimuth is the standard fixed low-discrepancy answer: four
+        // distinct elevations and four distinct azimuths (0°, 180°, 90°, 270°)
+        // for N = 4, two and two for the phone's N = 2, and it degrades
+        // gracefully if a tier ever asks for more.
+        //
+        // ⚠ THE RADICAL INVERSE IS UNROLLED OVER `log2(SKY_RAYS)` BITS, NOT
+        // `radical2`. That helper loops 32 times and this is inside a loop that
+        // already runs `SKY_RAYS` times inside the hottest kernel in the chain
+        // — measured, it put 1.0 ms on `probeTrace` alone. `k < SKY_RAYS`, so
+        // every bit above `log2(SKY_RAYS)` is zero and contributes nothing.
+        const bits = Math.max(1, Math.log2(SKY_RAYS));
+        const r1 = k.toFloat().add(0.5).div(SKY_RAYS).toVar();
+        const r2 = float(0).toVar();
+        for (let b = 0; b < bits; b++) {
+          r2.addAssign(bitAnd(shiftRight(k, uint(b)), uint(1)).toFloat().mul(2 ** -(bits - b)));
+        }
         const rr = sqrt(r1).toVar();
         const phi = r2.mul(2 * Math.PI).toVar();
         const sd = normalize(t1.mul(rr.mul(phi.cos()))
@@ -1566,31 +1747,30 @@ export function createGiGather({
     // re-shade (`STATS.freshShades`, ~10² per frame measured), and it is
     // `MAX_EMITTERS` rays there, gated on the slot being active and the
     // surface facing it.
-    // ⭐ ONE SLOT PER SHADE SAMPLE, PICKED AT RANDOM AND WEIGHTED BY THE COUNT
-    // (§19 Stage 3.7 P.1).
+    // ⭐⭐ EVERY SLOT, EVERY SHADE — §19 STAGE 3.7 P.1's RANDOM PICK RETIRED
+    // (§19 Stage 3.10).
     //
-    // Every slot used to be sampled on every shade, because a shade happened
-    // ONCE and a single unlucky estimate was kept forever — determinism was the
-    // only defence. Under a running mean it is the wrong trade: `N` slots at
-    // every sample costs `N` shadow rays for a variance that the accumulator
-    // would have removed anyway, and the rays are the entire cost of §P.1.
-    // Sampling ONE slot uniformly and multiplying by `N` is unbiased by
-    // construction (`E[N·f(k)] = Σf(k)`, and an inactive slot contributes zero
-    // to both sides), converges to the same value, and turns four shadow rays
-    // per shade into one — which is what buys §P.2's four sky rays.
-    const slotN = (emitters ?? []).length;
-    const slotPick = slotN > 1 && seedU
-      ? rand01(seedU.add(uint(0x51ed270b))).mul(slotN).floor().min(slotN - 1).toUint().toVar()
-      : null;
-    for (const [slotIdx, slot] of (emitters ?? []).entries()) {
+    // 3.7 sampled ONE slot uniformly and multiplied by `N`: unbiased by
+    // construction (`E[N·f(k)] = Σf(k)`), four shadow rays per shade turned
+    // into one, and the variance handed to the running mean to remove. Under
+    // the new contract that trade is not available at any price — the estimate
+    // it produces is a random variable, so a wall lit by four lamps would
+    // carry the wrong lamp's colour on any given re-shade and the cache's own
+    // memory is what would smear the four together. Worse, it is not even a
+    // *converging* random variable while the cache tracks: after the count
+    // saturates every re-shade is a fresh draw at a fixed α.
+    //
+    // The cost it gives back is `MAX_EMITTERS` (4) shadow rays per shade
+    // instead of one, paid only on the faces the cadence selects — and it is
+    // the price of a deterministic lamp colour, which is the whole stage.
+    for (const slot of (emitters ?? [])) {
       const centre = vec3(slot.center).toVar();
       const reff = float(slot.reff).max(1e-3).toVar();
-      const rgb = vec3(slot.color).mul(slotPick ? slotN : 1).toVar();
+      const rgb = vec3(slot.color).toVar();
       // `radius` is the bounding sphere and doubles as the ACTIVE gate —
       // `#refreshEmitterSlots` zeroes a retired slot's radius.
-      let active = float(slot.radius).greaterThan(1e-5)
+      const active = float(slot.radius).greaterThan(1e-5)
         .and(rgb.x.add(rgb.y).add(rgb.z).greaterThan(1e-6));
-      if (slotPick) active = active.and(slotPick.equal(uint(slotIdx)));
       If(active, () => {
         const wv = centre.sub(p).toVar();
         const d2 = dot(wv, wv).max(1e-4).toVar();
@@ -1666,15 +1846,18 @@ export function createGiGather({
       // between them. Half a cell of margin on top absorbs the escape.
       const pRay = p.add(n.mul(v0 * 0.5)).toVar();
       const yStop = u.panelCentre.y.div(v0).floor().mul(v0).sub(v0 * 0.5).toVar();
-      // ⭐ ONE OF THE FOUR STRATA PER SHADE SAMPLE (§19 Stage 3.7 P.1), for the
-      // reason the slot loop above gives at length: the deterministic 2×2 was
-      // Stage 3.5's defence against a one-shot estimate that could not be
-      // unlucky twice, and a running mean is a better defence for a quarter of
-      // the rays. The strata are still ENUMERATED (so the estimate stays a
-      // stratified one over samples, not a uniform one), just one at a time.
-      const stratum = seedU
-        ? rand01(seedU.add(uint(0x27d4eb2f))).mul(4).floor().min(3).toUint().toVar()
-        : null;
+      // ⭐⭐ ALL FOUR STRATA, EVERY SHADE — 3.7's ONE-OF-FOUR RETIRED (§19 3.10).
+      //
+      // Stage 3.5 enumerated the 2×2; 3.7 picked one at random per sample and
+      // let the running mean re-assemble it for a quarter of the rays. The
+      // same objection the slot loop above spells out applies here and is
+      // sharper, because the four corners of a 2 m panel differ most exactly
+      // where the receipt looks (a crop near one end of it): a random corner
+      // per re-shade is a random VALUE per re-shade, and the cache's memory
+      // would be storing that randomness rather than removing it. Four
+      // shadow rays, always the same four, so re-shading a converged face
+      // writes back the number already in it.
+      const stratum = null;
       for (let sy = 0; sy < 2; sy++) {
         for (let sx = 0; sx < 2; sx++) {
           const takeIt = stratum ? stratum.equal(uint(sy * 2 + sx)) : null;
@@ -1793,71 +1976,108 @@ export function createGiGather({
   };
 
   // ══════════════════════════════════════════════ SHADER: probeTrace (§L.2/3)
+  //
+  // ⭐⭐⭐ §19 STAGE 3.10 — ONE THREAD PER (PROBE, OCT TEXEL), AND THE THREAD
+  // OWNS THAT TEXEL OUTRIGHT. THE COMPLETE EVALUATION.
+  //
+  // Everything §L bend 1 and bend 2 argued for is REMOVED here, deliberately,
+  // and both deserve their epitaph because both were right about the estimator
+  // they were written for and wrong about the one the user asked for:
+  //
+  //   ⛔ THE IN-TEXEL JITTER (bend 1). Its argument was that fixed texel
+  //      centres make the estimator BIASED — a light falling between two
+  //      centres is under-counted at every probe and no amount of filtering
+  //      removes it — while a jittered sample is an unbiased estimate of the
+  //      texel's mean. Both halves are true. The half it did not price is that
+  //      an unbiased estimate of a mean is a RANDOM VARIABLE, and a random
+  //      variable on the image path is the noise the user is looking at. RC's
+  //      own contract is the other trade: take the bias, keep the determinism,
+  //      and buy the angular resolution back with `O` if it is ever visible.
+  //      The direction now comes from `octU` — the SAME table `probeFilter`
+  //      projects the SH against and `resolve` integrates over — so the ray's
+  //      direction and the basis direction cannot drift apart.
+  //   ⛔ THE TEXEL WINDOW AND THE PER-FRAME ROTATION (bend 2). A thread owned
+  //      `64/R` consecutive texels and took the first front-facing one, so
+  //      which direction a texel got and WHEN was a function of a per-probe,
+  //      per-frame hash. With every texel evaluated every frame there is no
+  //      window to search, no rotation to decorrelate and no write race to
+  //      avoid: thread `k` writes texel `k`.
+  //   ⛔ §P.3's NEED-DRIVEN RAY COUNT, and with it `rayBudget`'s mature share,
+  //      the FRESH/FLAGGED/MATURE classes and the maturity census that fed
+  //      them. They allocated a scarce ray budget; the budget is not scarce
+  //      per probe any more, it is spent completely and the PROBE GRID is
+  //      where it is now allocated (tile 16 — see `GATHER_TIERS`).
+  //   ⛔ §19 3.6's VARIANCE-AWARE HYSTERESIS and its exponential Welford. Its
+  //      entire job was to tell a real world change apart from SHOT NOISE in a
+  //      single ray. There is no shot noise left to be fooled by, so the test
+  //      has nothing to decide and the σ field it maintained has no reader.
+  //
+  // What is left is the contract in three lines: evaluate the texel, blend it
+  // against the reprojected previous value at a FIXED α, store it. Every texel
+  // of every live probe is written every frame, which is also why `probePlace`
+  // no longer carries the map forward.
   const probeTracePass = Fn(() => {
     const xr = globalId.x.toVar();
     const ty = globalId.y.toVar();
-    // ⭐ THE DISPATCH IS ONE THREAD PER OCT TEXEL NOW, NOT PER RAY (§P.3).
-    //
-    // A per-probe ray count needs either a prefix sum over the probe grid (a
-    // second kernel, a second buffer, and a scatter that breaks the texel-major
-    // layout's coalescing) or a fixed block that early-outs. §P.3 asked for
-    // both to be measured; the block form is what ships, because the early-out
-    // costs ONE vec4 read — `probeMeta` slot 2, which the eight lanes of a
-    // warp-row read from the same address — before it returns, against a prefix
-    // pass that would have to run every frame whether or not the allocation
-    // changed. The threads that survive are the frame's real ray budget.
-    If(xr.greaterThanEqual(u.probeWU.mul(uint(RAY_FRESH))).or(ty.greaterThanEqual(u.probeHU)),
+    If(xr.greaterThanEqual(u.probeWU.mul(uint(OCT))).or(ty.greaterThanEqual(u.probeHU)),
       () => { Return(); });
-    const tx = xr.div(uint(RAY_FRESH)).toVar();
-    const kRay = xr.sub(tx.mul(uint(RAY_FRESH))).toVar();
+    const tx = xr.div(uint(OCT)).toVar();
+    const texel = xr.sub(tx.mul(uint(OCT))).toVar();
     const probe = ty.mul(u.probeWU).add(tx).toVar();
-
-    // ── §P.3: how many rays does THIS probe get? ──────────────────────────
-    // `probePlace` wrote the class; `rayBudget` wrote the mature share. Both
-    // are the SAME FRAME's, and both are read before anything else so a thread
-    // that has no ray to trace leaves having touched 16 bytes.
-    const mc = probeMeta.element(metaIdx(u.curBase, probe, 2)).toVar();
-    const matureR = atomicLoad(stats.element(uint(STAT_RAY_BUDGET * STAT_STRIPE)))
-      .max(uint(RAY_MATURE_MIN)).min(uint(OCT)).toVar();
-    const cls = mc.z.toVar();
-    const raysU = select(u.needRays.greaterThan(0.5),
-      select(cls.greaterThan(CLS_FLAG + 0.5), uint(RAY_FRESH),
-        select(cls.greaterThan(CLS_MATURE + 0.5), uint(RAY_FLAG), matureR)),
-      uint(R)).toVar();
-    If(kRay.greaterThanEqual(raysU), () => { Return(); });
-    bump(STATS.raysLaunched, xr);
+    const addr = octIdx(u.curBase, probe, texel).toVar();
 
     const ma = probeMeta.element(metaIdx(u.curBase, probe, 0)).toVar();
     const mb = probeMeta.element(metaIdx(u.curBase, probe, 1)).toVar();
-    If(ma.w.lessThan(0.5), () => { Return(); });
-    const pos = ma.xyz.toVar();
     const nrm = mb.xyz.toVar();
-
-    // ── the thread's texel window (§L bend 2, now a RUNTIME width) ─────────
+    // ⭐⭐⭐ THE SUB-TEXEL POINT IS A 4×4 LATTICE OVER THE PROBE GRID —
+    // SPATIAL, FIXED, AND NOT A HASH. §19 STAGE 3.10's ONE MEASURED DEVIATION.
     //
-    // ⚠ THE WINDOWS MUST STAY DISJOINT OR TWO THREADS WRITE ONE TEXEL. That is
-    // why `rayBudget` hands back a POWER OF TWO and never an arbitrary
-    // quotient: `OCT / rays` is then exact, the windows tile the map, and the
-    // no-write-race property bend 2 relies on survives a per-probe count.
-    const strideU = uint(OCT).div(raysU).max(uint(1)).toVar();
-    const rot = pcg(u.frame.mul(uint(2654435761)).add(probe)).toVar();
-    const seedBase = pcg(probe.mul(uint(196613)).add(u.frame.mul(uint(83492791)))).toVar();
-    const texel = int(-1).toVar();
-    const dir = vec3(0, 1, 0).toVar();
-    Loop({ start: 0, end: PICK_MAX, name: "pick" }, ({ pick }) => {
-      If(uint(pick).greaterThanEqual(strideU).or(texel.greaterThanEqual(0)), () => { Break(); });
-      const t = bitAnd(kRay.mul(strideU).add(uint(pick)).add(rot), uint(OCT - 1)).toVar();
-      const tu = bitAnd(t, uint(O - 1)).toFloat().toVar();
-      const tv = shiftRight(t, uint(OCT_SHIFT)).toFloat().toVar();
-      const jx = rand01(seedBase.add(t.mul(uint(7919)))).toVar();
-      const jy = rand01(seedBase.add(t.mul(uint(7919))).add(uint(1))).toVar();
-      const d = octDirJit(tu, tv, jx, jy).toVar();
-      If(dot(d, nrm).greaterThan(0.02), () => {
-        texel.assign(t.toInt());
-        dir.assign(d);
-      });
+    // Texel CENTRES alone were measured and they do not hold: with every probe
+    // in the scene sampling the same 64 directions, a COMPACT bright source is
+    // quantized the same way at every probe and nothing downstream can undo it.
+    // Cornell, at rest, tile 16, centres only:
+    //
+    //     floorCentre (directly under the panel)   1.62 × the 4-bounce ref
+    //     floorSpot   (1 m away from it)           0.96 ×
+    //
+    // — a 60 % error a metre from a correct one, which is the signature of a
+    // quantization step and not of a bias a gain could absorb. §L bend 1 said
+    // exactly this would happen; what it got wrong was the CURE (a per-frame
+    // jitter, i.e. noise), not the disease.
+    //
+    // The cure that is not noise is to move the offset from TIME to SPACE. The
+    // probe's own grid coordinates pick one of 16 sub-texel points, so within
+    // any 4×4 block of probes all sixteen appear exactly once — and the SH
+    // bilateral that runs next is 5×5, i.e. it always spans a whole block. The
+    // quantization error is therefore integrated away by a filter that already
+    // exists, at zero extra rays, while each probe's own offset is CONSTANT IN
+    // TIME: a parked camera traces the identical ray from the identical point
+    // every frame, so this buys the parity back without putting one bit of
+    // per-frame randomness on the image path.
+    //
+    // ⚠ THE SH BASIS STAYS AT THE TEXEL CENTRE (`octU`). The sample point is
+    // inside its own texel by construction, so the direction disagrees with the
+    // basis by less than half a texel — and that residual is the very thing the
+    // 4×4 lattice decorrelates. Setting `probeDither = 0` restores exact
+    // centres and is the arm every number above was measured on.
+    const jx = mix(float(0.5), bitAnd(tx, uint(3)).toFloat().add(0.5).div(4), u.probeDither).toVar();
+    const jy = mix(float(0.5), bitAnd(ty, uint(3)).toFloat().add(0.5).div(4), u.probeDither).toVar();
+    const dir = octDirJit(
+      bitAnd(texel, uint(O - 1)).toFloat(), shiftRight(texel, uint(OCT_SHIFT)).toFloat(), jx, jy,
+    ).toVar();
+    // ⚠ THE BACK HEMISPHERE IS *WRITTEN*, NOT SKIPPED. Nothing carries the map
+    // forward any more, so a texel this kernel returns from early would hold
+    // whatever the same slot held two frames ago — a different probe, on a
+    // different surface, at full strength. `n = 0` is the hole marker every
+    // consumer already understands (`probeFilter`'s `has`), and a back-facing
+    // hole is left at zero rather than filled, which is what keeps SH band 0
+    // from being doubled.
+    If(ma.w.lessThan(0.5).or(dot(dir, nrm).lessThanEqual(0.02)), () => {
+      probeOct.element(addr).assign(vec4(0));
+      Return();
     });
-    If(texel.lessThan(0), () => { Return(); });
+    const pos = ma.xyz.toVar();
+    bump(STATS.raysLaunched, xr);
     bump(STATS.raysTraced, xr);
 
     // ── segment 1: the window, from the PROBE, over the whole ray ────────
@@ -1938,14 +2158,27 @@ export function createGiGather({
         // shade estimator's variance straight into the probe atlas, which is the
         // closed loop `injectPass`'s glossy note describes from the other side.
         const fresh = c.w.lessThan(0.5).toVar();
-        // Seeded from the VOXEL, the probe and the frame: two rays hitting the
-        // same face in one frame must not roll the same die (they would both
-        // re-shade or neither), and the same face across frames must not either.
-        const shadeSeed = pcg(seedBase.add(zi.mul(uint(2654435761)))).toVar();
-        const roll = rand01(shadeSeed).toVar();
+        // ⭐⭐ §19 STAGE 3.10 — A CADENCE, NOT A COIN FLIP.
+        //
+        // §P.1 rolled a die per (voxel, probe, frame) so that two rays hitting
+        // one face in one frame would not both re-shade. Under the new
+        // contract that die is the last stochastic input left on the path, and
+        // it does not need to be one: `shadeHit` is now a FIXED FUNCTION of
+        // the face (see its header), so two rays that both re-shade the same
+        // face in the same frame compute and store the same number, and
+        // "which faces are re-shaded this frame" is free to be a deterministic
+        // function of `(voxel, frame)`. What the cadence controls is LATENCY
+        // and COST; it cannot control noise, because there is none to control.
+        //
+        // ⚠ STILL GATED ON `shadeProb > 0`, which is the `PRE37` arm's whole
+        // meaning ("the cache is one-shot again"). The VALUE of `shadeProb` no
+        // longer sets the rate — `shadeStrideU` does — but zero still means
+        // never.
+        const track = bitAnd(zi.mul(uint(2654435761)).add(u.frame),
+          u.shadeStrideU.max(uint(1)).sub(uint(1))).equal(uint(0)).toVar();
         rad.assign(c.xyz);
-        If(fresh.or(roll.lessThan(u.shadeProb)), () => {
-          const s = shadeHit(hp, hn, levelF, voxF, shadeSeed).toVar();
+        If(fresh.or(u.shadeProb.greaterThan(0).and(track)), () => {
+          const s = shadeHit(hp, hn, levelF, voxF, uint(1)).toVar();
           // TSL: `.toVar()` IS LOAD-BEARING, NOT STYLE. A function call whose
           // result nothing consumes is never built into the shader: the node
           // graph is walked from its outputs, and an unused call node has no
@@ -1970,99 +2203,47 @@ export function createGiGather({
       });
     });
 
-    // ── §L.3 accumulation, in probe space ──────────────────────────────────
+    // ── §19 STAGE 3.10: A FIXED-α BLEND, AND NOTHING ELSE ─────────────────
     //
-    // ⭐⭐ ONE SAMPLE CANNOT EVIDENCE A CHANGE — AND STAGE 3.5 LET IT (§19 3.6).
+    // ⭐⭐ THE INPUT IS NOISELESS, SO THE MEMORY HAS ONE JOB LEFT.
     //
-    // GI-1.0's rule was `|new − prev| > 0.5·max(new, prev) ⇒ α = 0.5`: a large
-    // radiance change drops most of the history at once instead of crawling
-    // toward the new value over H frames. The claim is right and the test is
-    // not. `lNew` is a SINGLE ray through a texel spanning 4π/64 sr; `lOld` is
-    // a mean of up to H of them. In a Cornell box a texel's radiance ranges
-    // over an order of magnitude INSIDE its own solid angle, so "differs by
-    // more than 50 %" is a description of the shot noise, not of a change —
-    // and it fired on 26 % of all rays on the live Bistro at rest, throwing
-    // away, a quarter of a million times a frame, the very history that was
-    // there to suppress that noise. It is the mechanism that turns a longer H
-    // into no improvement at all: the memory is reset faster than it builds.
+    // `rad` is a COMPLETE evaluation of this texel's direction — the same ray
+    // every frame, from the same anchor, against the same world — so the only
+    // reasons it can differ from last frame's are the three the user is happy
+    // to see as LAG rather than as grain: the world cache converging under it,
+    // the world itself changing, and the probe's own anchor having moved with
+    // the camera. A fixed α turns each of those into a ramp. There is nothing
+    // for it to average out, because there is nothing random to average.
     //
-    // The test that CAN tell the two apart needs the texel's own spread. The
-    // repacked alpha (see `PACK_N`) carries it, updated as an exponential
-    // Welford beside the mean — `var ← (1−α)(var + α·δ²)` is the EMA form of
-    // the same recurrence and needs no second pass over the samples — and the
-    // rule becomes `|new − mean| > k·max(σ, ε·mean)`. Shot noise of any width
-    // is inside k = 4 of its own σ by construction; a lamp that moves is not.
-    //
-    // `hystOn` is a MODE (see `HYST`) rather than a switch so every arm — off,
-    // GI-1.0's, variance-aware, variance-and-distance — comes out of one
-    // binary and the receipts choose between them.
-    const addr = octIdx(u.curBase, probe, texel.toUint()).toVar();
-    const old = probeOct.element(addr).toVar();
-    const packed = old.w.max(0).toVar();
-    const nPrev = packed.div(PACK_N).floor().toVar();
-    const rem = packed.sub(nPrev.mul(PACK_N)).toVar();
-    const distQ = rem.div(PACK_D).floor().toVar();
-    const sigQ = rem.sub(distQ.mul(PACK_D)).toVar();
-    const distPrev = distQ.mul(RAY_MAX / DIST_Q).toVar();
-    // σ_rel, out of the log field. `sigQ = 0` decodes to SIG_MIN, which is the
-    // "no spread measured yet" value and is below any ε floor.
-    const sigPrev = float(SIG_MIN).mul(exp2(sigQ.div(SIG_Q).mul(SIG_OCT))).toVar();
-    const lNew = dot(rad, vec3(0.2126, 0.7152, 0.0722)).toVar();
-    const lOld = dot(old.xyz, vec3(0.2126, 0.7152, 0.0722)).toVar();
+    // ⚠ THE PREVIOUS VALUE IS READ HERE, NOT CARRIED BY `probePlace`. Slot 2's
+    // `.x` is the reprojected source probe (`-1` when the reprojection missed),
+    // and this thread already owns exactly one texel — so one read of
+    // `probeOct[prevBase, src, texel]` replaces a 64-texel copy per probe. A
+    // miss, or a previous texel that was a hole, means DISOCCLUSION: α = 1, the
+    // current frame whole, which is the one case where an abrupt answer is the
+    // correct one.
+    const mc = probeMeta.element(metaIdx(u.curBase, probe, 2)).toVar();
+    const src = mc.x.toVar();
+    const prevV = probeOct.element(
+      octIdx(u.prevBase, src.max(0).toUint(), texel),
+    ).toVar();
+    const hasPrev = src.greaterThanEqual(0).and(prevV.w.greaterThanEqual(PACK_N)).toVar();
+    const a = select(hasPrev, u.octAlpha.clamp(0, 1), float(1)).toVar();
     bump(STATS.texelsSeen, xr);
-    If(nPrev.greaterThanEqual(u.historyU.toFloat().mul(0.5)), () => { bump(STATS.matureTexels, xr); });
-
-    const mode = u.hystOn.toVar();
-    const mature = nPrev.greaterThanEqual(float(HYST_MIN_N)).toVar();
-    const sigAbs = sigPrev.mul(lOld.abs()).toVar();
-    const band = max(sigAbs, lOld.abs().mul(HYST_EPS_REL)).max(1e-6).toVar();
-    const surprised = lNew.sub(lOld).abs().greaterThan(band.mul(HYST_K)).toVar();
-    // "The geometry under this texel moved": the hit distance changed by more
-    // than a level-0 cell. In CELLS, never in metres — the scene's own length.
-    const moved = distPrev.sub(min(hitDist, float(RAY_MAX))).abs().greaterThan(v0).toVar();
-    const legacy = mode.greaterThan(0.5).and(mode.lessThan(1.5))
-      .and(nPrev.greaterThan(0.5))
-      .and(lNew.sub(lOld).abs().greaterThan(max(lNew, lOld).mul(0.5))).toVar();
-    const distArm = mode.greaterThan(2.5).and(mode.lessThan(3.5)).toVar();
-    const varArm = mode.greaterThan(1.5).and(mature).and(surprised)
-      .and(distArm.not().or(moved)).toVar();
-    const big = legacy.or(varArm).toVar();
-    If(big, () => { bump(STATS.alphaForced, xr); });
-    // A RESET, OR A SHORTENING — see `HYST`. Modes 2 and 3 restart the
-    // estimator (`n ← 1`, α = 1: the texel takes this sample whole and
-    // re-converges in a handful of frames). Mode 4 divides `n` instead, which
-    // makes an isolated false surprise a 4× step rather than a 32× one and
-    // still collapses the memory under sustained evidence. The legacy arm
-    // keeps GI-1.0's 0.5 exactly.
-    const soft = mode.greaterThan(3.5).toVar();
-    const nCut = max(nPrev.div(HYST_DECAY).floor(), float(1)).toVar();
-    const nUse = select(big.and(legacy.not()),
-      select(soft, nCut, float(0)), nPrev).toVar();
-    const a = select(legacy, float(0.5),
-      float(1).div(min(nUse.add(1), u.historyU))).toVar();
-    const nNext = select(big.and(legacy.not()),
-      nUse.add(1), min(nPrev.add(1), u.historyU)).toVar();
-    const mNew = mix(lOld, lNew, a).toVar();
-    const d0 = lNew.sub(lOld).toVar();
-    // The exponential Welford. On a reset the spread is re-seeded from the
-    // sample that caused it rather than zeroed: a σ of zero would make the
-    // NEXT sample surprising too, and the estimator would ring.
-    const varPrev = sigAbs.mul(sigAbs).toVar();
-    const hardReset = big.and(legacy.not()).and(soft.not()).toVar();
-    const varNext = select(hardReset,
-      d0.mul(d0).mul(0.25),
-      float(1).sub(a).mul(varPrev.add(a.mul(d0).mul(d0)))).toVar();
-    const sigRelNext = sqrt(varNext).div(max(mNew.abs(), 1e-6))
-      .clamp(SIG_MIN, SIG_MIN * Math.pow(2, SIG_OCT)).toVar();
-    const sigQNext = log2(sigRelNext.div(SIG_MIN)).div(SIG_OCT).mul(SIG_Q)
-      .add(0.5).floor().clamp(0, SIG_Q).toVar();
+    If(hasPrev, () => { bump(STATS.matureTexels, xr); });
+    // `n` is a plain WITNESS now — it is the hole marker `probeFilter` tests
+    // (`w >= PACK_N`) and the census `STATS.matureTexels` reports, and no α is
+    // derived from it. σ is written as zero: the field that carried the
+    // exponential Welford's spread has no reader left, and leaving a stale
+    // value in it would be a number a future reader could believe.
+    const nNext = min(prevV.w.max(0).div(PACK_N).floor().add(1), u.historyU).toVar();
     const distQNext = min(hitDist, float(RAY_MAX)).mul(DIST_Q / RAY_MAX)
       .add(0.5).floor().clamp(0, DIST_Q).toVar();
     probeOct.element(addr).assign(vec4(
-      mix(old.xyz, rad, a),
-      nNext.mul(PACK_N).add(distQNext.mul(PACK_D)).add(sigQNext),
+      mix(prevV.xyz, rad, a),
+      nNext.mul(PACK_N).add(distQNext.mul(PACK_D)),
     ));
-  })().compute(dispatch2d(probeW * RAY_FRESH, probeH), WG);
+  })().compute(dispatch2d(probeW * OCT, probeH), WG);
 
   // ══════════════════════════════════════ SHADER: probeFilter, part 1 (§L.4)
   //
