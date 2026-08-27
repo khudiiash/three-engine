@@ -445,6 +445,17 @@ variants" was a uuid count; the pipeline key multiplies by GI's 4 buckets.
 
 ### Stage 3 — THE GATHER (~3-4 sessions)
 
+**✅ SHIPPED 08-27 (`72c3e58` 3.1, `bc976ad` 3.2, `7db6078` 3.3, `32effdd`
+3.4, `3.5`) — measured by `run-gi2-boot-probe` on the final tree:** Level
+first light **1.41 s** after assets, GI GPU **1.05 ms**, heap 335 MB; Bistro
+(ultra, 1650×970) first light **5.47 s** (the 4.2 s material wave is the
+gate; voxelizer live at 1.4 s, all 5 levels occupied at 3.9 s), GI GPU
+**2.17 ms**, heap 1.92 GB, 36 compute pipelines, 0 SRC kernels, 43 fps at
+cpu 17.7 / gpu 8.0 (the raster side is the frame now). Harness: Cornell 8/8
+crops bracketed, 2nd bounce 1.48, off-screen bounce 0.95, orbit 0.96×,
+exhausted rays 0 %, 0/10 000 leaks. Mirror tier OFF under GI2 (measured:
++530 ms boot stall + 2.96 ms/frame). ▶ Stage 4 next.
+
 | unit | what | gate |
 |---|---|---|
 | **3.1 screen probes** | placement, oct maps, N rays/frame by tier, HZB first segment + step-back hand-off, hit shading via palette + sun DDA ray + light tree NEE, probe-space accumulation with position/normal validation | Cornell: matches the reference render ([[gi-colour-probe-method]] receipts) within the same tolerance the SRC path met; no temporal term outside probe space |
