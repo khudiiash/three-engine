@@ -1,0 +1,981 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>GI2 window voxelizer — correctness + throughput</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}pre{padding:12px}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // GI2 STAGE 2.3 — THE VOXELIZER RECEIPT.
+      //
+      // PLAN §5 Stage 2.3's gate is "Bistro: all levels occupied within 2 s of
+      // assets ready (coarse first), L0 within 5 s; the 5 cm wall at the 0.25 m
+      // level = 0 leak WITH the entry-face test and 100 % leak WITHOUT it".
+      // This page produces both halves on a real adapter, from REAL TRIANGLES
+      // rather than the analytic filler Stage 2.4 had to use.
+      //
+      // THE ORACLE IS `traceWindow`. `windowFill.js` already proved the tracer
+      // is right on data whose ground truth is a closed form; so the honest
+      // Stage 2.3 question is not "does the voxelizer look right" but "does the
+      // SAME tracer, given the SAME scene expressed as triangles, answer the
+      // SAME three questions". Hence (a) axis-ray distances, (b) 0/10 000 leaks
+      // with its face-bit control, (c) level hand-off — verbatim from
+      // `run-gi2-trace-probe.mjs` — plus two things only a voxelizer can be
+      // asked: a voxel-by-voxel occupancy DIFF against the analytic fill, and
+      // whether the palette byte survived four-voxels-to-a-word atomics.
+      //
+      // AND THE BUDGET IS TESTED BY BREAKING IT. `setPairLimit` drops the cap to
+      // a fraction of one frame's demand; the window must reach the SAME final
+      // occupancy, just over more frames. A budget nobody has seen overflow is
+      // not a budget.
+      const out = document.querySelector("#log");
+      const lines = [];
+      const say = (line) => { lines.push(line); out.textContent += line + "\n"; };
+      const fail = (error) => {
+        console.error("GI2-VOXELIZE FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__GI2_VOX_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: lines.join("\n"),
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const params = new URLSearchParams(location.search);
+        const TIER = params.get("tier") ?? "high";
+        const WANT_RANDOM = params.get("random") !== "0";
+        const RANDOM_TRIS = Number(params.get("randomTris") ?? 3000000);
+        const MAX_FRAMES = Number(params.get("maxFrames") ?? 600);
+        const LEAK_RAYS = 10000;
+
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const { Fn, instanceIndex, instancedArray, uint } = TSL;
+        const store = await import("/src/modules/gi/window/windowStore.js");
+        const fillMod = await import("/src/modules/gi/window/windowFill.js");
+        const traceMod = await import("/src/modules/gi/window/windowTrace.js");
+        const voxMod = await import("/src/modules/gi/window/windowVoxelize.js");
+        const {
+          ROOM, CORNELL_SCENE, analyticVoxel, KIND_BOX,
+        } = fillMod;
+        const { entryFaceBit, unpackTrace } = traceMod;
+        const { hx, hy, hz, wall } = ROOM;
+
+        // ══════════════════════════════════════════════ CPU TRIANGLE SOUP
+        //
+        // The Stage 2.2 contract, built here so Stage 2.3 does not wait on it:
+        //   tris      f32 ×9 per triangle, world space
+        //   triPal    u32, one byte per triangle, four per word, 255 = none
+        //   cellRange u32 ×2 per 4 m cell (start, count)
+        //   cellTris  u32
+        // A triangle is listed in EVERY cell its AABB touches — the voxelizer's
+        // own de-duplication rule depends on that being true, not on it being
+        // minimal.
+        class SoupBuilder {
+          constructor(capacity) {
+            this.p = new Float32Array(capacity * 9);
+            this.pal = new Uint8Array(capacity);
+            this.n = 0;
+          }
+          tri(a, b, c, pal) {
+            const o = this.n * 9;
+            this.p[o] = a[0]; this.p[o + 1] = a[1]; this.p[o + 2] = a[2];
+            this.p[o + 3] = b[0]; this.p[o + 4] = b[1]; this.p[o + 5] = b[2];
+            this.p[o + 6] = c[0]; this.p[o + 7] = c[1]; this.p[o + 8] = c[2];
+            this.pal[this.n] = pal;
+            this.n++;
+          }
+          /** Axis-aligned box SHELL: 12 triangles. */
+          box(min, max, pal) {
+            const [x0, y0, z0] = min;
+            const [x1, y1, z1] = max;
+            const v = [
+              [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+              [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+            ];
+            const quads = [
+              [0, 1, 2, 3], [5, 4, 7, 6], [4, 0, 3, 7],
+              [1, 5, 6, 2], [4, 5, 1, 0], [3, 2, 6, 7],
+            ];
+            for (const q of quads) {
+              this.tri(v[q[0]], v[q[1]], v[q[2]], pal);
+              this.tri(v[q[0]], v[q[2]], v[q[3]], pal);
+            }
+          }
+          /** UV sphere, `lat` × `lon` → 2·lat·lon triangles (poles degenerate-free). */
+          sphere(c, r, lat, lon, pal) {
+            const P = (i, j) => {
+              const th = (Math.PI * i) / lat;
+              const ph = (2 * Math.PI * j) / lon;
+              return [
+                c[0] + r * Math.sin(th) * Math.cos(ph),
+                c[1] + r * Math.cos(th),
+                c[2] + r * Math.sin(th) * Math.sin(ph),
+              ];
+            };
+            for (let i = 0; i < lat; i++) {
+              for (let j = 0; j < lon; j++) {
+                const a = P(i, j), b = P(i + 1, j), d = P(i + 1, j + 1), e = P(i, j + 1);
+                if (i !== 0) this.tri(a, b, d, pal);
+                if (i !== lat - 1) this.tri(a, d, e, pal);
+              }
+            }
+          }
+        }
+
+        /** Counting-sort the soup into a `cell` m uniform grid (the contract's 4 m). */
+        const buildGrid = (sb, cell, pad = 2) => {
+          const n = sb.n;
+          const lo = [Infinity, Infinity, Infinity];
+          const hi = [-Infinity, -Infinity, -Infinity];
+          for (let t = 0; t < n; t++) {
+            const o = t * 9;
+            for (let a = 0; a < 3; a++) {
+              const v0 = sb.p[o + a], v1 = sb.p[o + 3 + a], v2 = sb.p[o + 6 + a];
+              const mn = Math.min(v0, v1, v2);
+              const mx = Math.max(v0, v1, v2);
+              if (mn < lo[a]) lo[a] = mn;
+              if (mx > hi[a]) hi[a] = mx;
+            }
+          }
+          const origin = lo.map((v) => Math.floor(v / cell) * cell - pad * cell);
+          const dim = [0, 1, 2].map((a) => Math.max(1, Math.ceil((hi[a] - origin[a]) / cell) + pad));
+          const nCell = dim[0] * dim[1] * dim[2];
+          const counts = new Uint32Array(nCell);
+          const cellOf = (v, a) => Math.min(dim[a] - 1, Math.max(0, Math.floor((v - origin[a]) / cell)));
+          const span = new Int32Array(6);
+          const spanOf = (t) => {
+            const o = t * 9;
+            for (let a = 0; a < 3; a++) {
+              const v0 = sb.p[o + a], v1 = sb.p[o + 3 + a], v2 = sb.p[o + 6 + a];
+              span[a] = cellOf(Math.min(v0, v1, v2), a);
+              span[3 + a] = cellOf(Math.max(v0, v1, v2), a);
+            }
+          };
+          let entries = 0;
+          for (let t = 0; t < n; t++) {
+            spanOf(t);
+            for (let z = span[2]; z <= span[5]; z++) {
+              for (let y = span[1]; y <= span[4]; y++) {
+                const rowBase = dim[0] * (y + dim[1] * z);
+                for (let x = span[0]; x <= span[3]; x++) { counts[rowBase + x]++; entries++; }
+              }
+            }
+          }
+          const cellRange = new Uint32Array(nCell * 2);
+          let run = 0;
+          for (let c = 0; c < nCell; c++) {
+            cellRange[c * 2] = run;
+            cellRange[c * 2 + 1] = counts[c];
+            run += counts[c];
+          }
+          const cursor = new Uint32Array(nCell);
+          const cellTris = new Uint32Array(Math.max(1, entries));
+          for (let t = 0; t < n; t++) {
+            spanOf(t);
+            for (let z = span[2]; z <= span[5]; z++) {
+              for (let y = span[1]; y <= span[4]; y++) {
+                const rowBase = dim[0] * (y + dim[1] * z);
+                for (let x = span[0]; x <= span[3]; x++) {
+                  const c = rowBase + x;
+                  cellTris[cellRange[c * 2] + cursor[c]] = t;
+                  cursor[c]++;
+                }
+              }
+            }
+          }
+          // triPal: one byte per triangle, four to a word.
+          const palWords = new Uint32Array(Math.ceil(Math.max(1, n) / 4));
+          palWords.fill(0xffffffff);
+          for (let t = 0; t < n; t++) {
+            const w = t >> 2;
+            const sh = (t & 3) * 8;
+            palWords[w] = ((palWords[w] & ~(255 << sh)) | (sb.pal[t] << sh)) >>> 0;
+          }
+          return {
+            triCount: n, entries, origin, cell, dim, nCell,
+            arrays: { tris: sb.p.subarray(0, n * 9), triPal: palWords, cellRange, cellTris },
+          };
+        };
+
+        const uploadSoup = (g) => ({
+          tris: instancedArray(g.arrays.tris, "float"),
+          triPal: instancedArray(g.arrays.triPal, "uint"),
+          cellRange: instancedArray(g.arrays.cellRange, "uint"),
+          cellTris: instancedArray(g.arrays.cellTris, "uint"),
+          origin: g.origin, cell: g.cell, dim: g.dim,
+        });
+
+        // ── the room, as triangles, matching CORNELL_SCENE primitive for primitive
+        const SPHERE_LAT = 14;
+        const SPHERE_LON = 18;
+        const buildRoomSoup = () => {
+          const sb = new SoupBuilder(8 * 12 + 2 * SPHERE_LAT * SPHERE_LON);
+          for (const p of CORNELL_SCENE) {
+            if (p.kind === KIND_BOX) sb.box(p.min, p.max, p.pal);
+            else {
+              const c = [0, 1, 2].map((a) => (p.min[a] + p.max[a]) * 0.5);
+              sb.sphere(c, (p.max[0] - p.min[0]) * 0.5, SPHERE_LAT, SPHERE_LON, p.pal);
+            }
+          }
+          return sb;
+        };
+
+        const rngFor = (seed) => {
+          let s = seed >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        };
+
+        /** N small random triangles in a 110 × 36 × 110 m box — the Bistro stand-in. */
+        const buildRandomSoup = (n) => {
+          const rnd = rngFor(0x51f3a9c1);
+          const sb = new SoupBuilder(n);
+          const E = [110, 36, 110];
+          const a = [0, 0, 0], b = [0, 0, 0], c = [0, 0, 0];
+          for (let i = 0; i < n; i++) {
+            for (let k = 0; k < 3; k++) {
+              const centre = (rnd() - 0.5) * E[k];
+              const s = 0.1 + rnd() * 0.3;
+              a[k] = centre;
+              b[k] = centre + (rnd() - 0.5) * 2 * s;
+              c[k] = centre + (rnd() - 0.5) * 2 * s;
+            }
+            sb.tri(a, b, c, (i & 63) + 1);
+          }
+          return sb;
+        };
+
+        // ══════════════════════════════════════════════════════════ renderer
+        const renderer = new THREE.WebGPURenderer({
+          canvas: document.querySelector("#view"), trackTimestamp: true,
+        });
+        await renderer.init();
+        if (renderer.backend?.isWebGPUBackend !== true) throw new Error("not a WebGPU backend");
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (e) => {
+          validationErrors.push(e.error?.message ?? String(e.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+        const timestamps = renderer.backend.trackTimestamp === true;
+        const lim = device.limits;
+        const triCap = Math.floor(Math.min(lim.maxStorageBufferBindingSize, lim.maxBufferSize) / 36);
+
+        const win = store.createGiWindow(TIER);
+        const d = win.describe();
+        say(`tier ${TIER}: ${d.levels} levels @ ${d.voxel0} m, windows ` +
+          `${d.extents.map((e) => e.extent + "m").join("/")}, window ${d.totalMB} MB`);
+
+        // ══════════════════════════════════════════ the room soup + voxelizer
+        const roomSoup = buildRoomSoup();
+        const roomGrid = buildGrid(roomSoup, 4.0);
+        say(`room soup: ${roomGrid.triCount} triangles, grid ${roomGrid.dim.join("x")} @ 4 m ` +
+          `(${roomGrid.nCell} cells, ${roomGrid.entries} listings)`);
+
+        const soup = uploadSoup(roomGrid);
+        const vox = voxMod.createWindowVoxelizer(win, soup, TIER);
+        const vd = vox.describe();
+        say(`voxelizer: ${vd.pairsPerFrame} pairs/frame, maxBuild ${vd.maxBuild} bricks, ` +
+          `${vd.maxCells} cells/brick max, work ${vd.workMB} MB ` +
+          `(scratch ${vd.scratchMB} + pairs ${vd.pairListMB})`);
+
+        const fill = fillMod.createWindowFill(win);
+        const { traceWindow, steps: STEP_BUDGET } = traceMod.createWindowTrace(win);
+
+        // ── the ray kernel (identical in shape to gi2-trace's) ────────────────
+        const RAYS = 12000;
+        const rayIn = instancedArray(new Float32Array(RAYS * 12), "vec4");
+        const rayOut = instancedArray(new Float32Array(RAYS * 4), "vec4");
+        const rayPass = Fn(() => {
+          const i = instanceIndex.toVar();
+          const b = i.mul(uint(3)).toVar();
+          const a0 = rayIn.element(b).toVar();
+          const a1 = rayIn.element(b.add(uint(1))).toVar();
+          const a2 = rayIn.element(b.add(uint(2))).toVar();
+          const r = traceWindow(a0.xyz, a1.xyz, a0.w, a2.xyz);
+          rayOut.element(i).assign(r.raw);
+        })().compute(RAYS);
+
+        const compute = (p) => renderer.computeAsync(p);
+        const rayArr = rayIn.value.array;
+        const writeRays = (list) => {
+          for (let i = 0; i < RAYS; i++) {
+            const r = list[i % list.length];
+            const b = i * 12;
+            rayArr[b] = r.o[0]; rayArr[b + 1] = r.o[1]; rayArr[b + 2] = r.o[2]; rayArr[b + 3] = r.tMax ?? 40;
+            rayArr[b + 4] = r.d[0]; rayArr[b + 5] = r.d[1]; rayArr[b + 6] = r.d[2]; rayArr[b + 7] = 0;
+            const n = r.n ?? [0, 0, 0];
+            rayArr[b + 8] = n[0]; rayArr[b + 9] = n[1]; rayArr[b + 10] = n[2]; rayArr[b + 11] = 0;
+          }
+          rayIn.value.needsUpdate = true;
+        };
+        const shoot = async (list) => {
+          writeRays(list);
+          await compute(rayPass);
+          const raw = new Float32Array(await renderer.getArrayBufferAsync(rayOut.value));
+          return (i) => unpackTrace(raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]);
+        };
+
+        // ── window placement, then a triangle build ───────────────────────────
+        const place = async (camPos) => {
+          win.reset();
+          const receipt = win.setCamera(camPos);
+          await compute(win.statsResetPass);
+          await compute(win.scrollPass);
+          await compute(win.clearStaticPass);
+          return receipt;
+        };
+
+        let voxPasses = vox.passes([0, 0, 0], null);
+        const markDirty = vox.markAllDirty();
+
+        /**
+         * Run frames until nothing is dirty. Returns the receipt.
+         *
+         * The stats are read AFTER the frame's dispatches, never before: the
+         * counters are zeroed and re-filled by the frame itself, so a read
+         * taken first reports the PREVIOUS build's numbers — which is exactly
+         * how the first version of this loop concluded "0 frames, 0 voxels"
+         * about a window it had not touched yet. `frames` is therefore the
+         * count of PRODUCTIVE frames, and detecting the end costs one extra
+         * (empty) frame.
+         */
+        const buildToClean = async (camPos, maxFrames = MAX_FRAMES) => {
+          voxPasses = vox.passes(camPos, null);
+          await compute(markDirty);
+          const levelFrames = new Array(win.levels).fill(-1);
+          const perFrame = [];
+          let frames = maxFrames;
+          let peakPairs = 0;
+          let peakBrickPairs = 0;
+          let deferred = 0;
+          let overflowed = 0;
+          let starved = 0;
+          let slotFull = 0;
+          let cellOverflow = 0;
+          let last = null;
+          for (let f = 1; f <= maxFrames; f++) {
+            for (const p of voxPasses) renderer.compute(p);
+            const s = await vox.stats(renderer);
+            last = s;
+            peakBrickPairs = Math.max(peakBrickPairs, s.maxBrickPairs);
+            deferred += s.deferred;
+            for (let l = 0; l < win.levels; l++) {
+              if (levelFrames[l] < 0 && s.perLevel[l].dirty === 0) levelFrames[l] = f - 1;
+            }
+            peakPairs = Math.max(peakPairs, s.pairsWritten);
+            overflowed += s.overflowed;
+            starved += s.starved;
+            slotFull += s.slotFull;
+            cellOverflow += s.cellOverflow;
+            if (perFrame.length < 8) {
+              perFrame.push({
+                f, dirty: s.dirty, pairs: s.pairsWritten, needed: s.pairsNeeded,
+                overflow: s.overflowed, built: s.built, invalid: s.invalid,
+              });
+            }
+            if (s.dirty === 0) { frames = f - 1; break; }
+          }
+          return {
+            frames, levelFrames, peakPairs, peakBrickPairs, deferred, overflowed, starved,
+            slotFull, cellOverflow, perFrame, last,
+          };
+        };
+
+        // ── window readback helpers ──────────────────────────────────────────
+        const readWindow = async () => new Uint32Array(await renderer.getArrayBufferAsync(win.attribute));
+        const occOf = (buf, l, vi) =>
+          (buf[l * store.LEVEL_WORDS + store.OCC_OFF + (vi >>> 5)] >>> (vi & 31)) & 1;
+        const palOf = (buf, l, vi) =>
+          (buf[l * store.LEVEL_WORDS + store.PAL_OFF + (vi >>> 2)] >>> ((vi & 3) * 8)) & 255;
+        const countOcc = (buf) => {
+          const per = [];
+          let total = 0;
+          for (let l = 0; l < win.levels; l++) {
+            let n = 0;
+            const base = l * store.LEVEL_WORDS + store.OCC_OFF;
+            for (let w = 0; w < store.OCC_WORDS; w++) {
+              let v = buf[base + w];
+              while (v) { n += v & 1; v >>>= 1; }
+            }
+            per.push(n);
+            total += n;
+          }
+          return { per, total };
+        };
+
+        const results = { tier: TIER, storageLimit: lim.maxStorageBuffersPerShaderStage, timestamps, checks: {} };
+
+        // ══════════════════════════════════════════ THE ROOM, FROM TRIANGLES
+        const centreReceipt = await place([0, 0, 0]);
+        // Warm every pipeline ONCE, and only after the window has been PLACED —
+        // three compiles compute pipelines asynchronously and SKIPS a dispatch
+        // whose pipeline is not ready, so a first frame that silently does
+        // nothing would read as "the voxelizer needs one extra frame", which is
+        // a lie about the algorithm. Warming before `place` warms them against
+        // a window whose brick table carries no VALID marker, which is a
+        // different lie.
+        await compute(markDirty);
+        for (const p of voxPasses) await compute(p);
+        await compute(rayPass);
+        const roomBuild = await buildToClean([0, 0, 0]);
+        {
+          const buf = await readWindow();
+          const occ = countOcc(buf);
+          say(`build @origin: ${roomBuild.frames} frames to 0 dirty ` +
+            `(per level ${roomBuild.levelFrames.join("/")}), ${occ.total} occupied voxels ` +
+            `[${occ.per.join("/")}], peak ${roomBuild.peakPairs} pairs/frame, ` +
+            `overflow ${roomBuild.overflowed}, starved ${roomBuild.starved}, ` +
+            `slotFull ${roomBuild.slotFull}, deferred ${roomBuild.deferred}, ` +
+            `biggest brick ${roomBuild.peakBrickPairs} pairs, cellOverflow ${roomBuild.cellOverflow}`);
+          results.roomBuild = {
+            frames: roomBuild.frames, levelFrames: roomBuild.levelFrames, occupied: occ.total,
+            occPerLevel: occ.per, peakPairs: roomBuild.peakPairs, overflowed: roomBuild.overflowed,
+            starved: roomBuild.starved, slotFull: roomBuild.slotFull,
+            cellOverflow: roomBuild.cellOverflow, firstFrames: roomBuild.perFrame,
+            enteringBricks: centreReceipt.totalEntering,
+          };
+          if (roomBuild.frames >= MAX_FRAMES) throw new Error("the room never reached 0 dirty bricks");
+          if (occ.total < 1000) throw new Error(`the triangle voxelizer produced ${occ.total} occupied voxels`);
+          if (roomBuild.starved) throw new Error(`${roomBuild.starved} bricks need more pairs than the whole cap`);
+          if (roomBuild.cellOverflow) throw new Error(`${roomBuild.cellOverflow} bricks exceeded the cell loop bound`);
+        }
+
+        // ══════════════════════════════════════════════════ (a) wall distances
+        {
+          const AX = [
+            { d: [1, 0, 0], want: hx, axis: 0, pos: true, name: "+X" },
+            { d: [-1, 0, 0], want: hx, axis: 0, pos: false, name: "-X" },
+            { d: [0, 1, 0], want: hy, axis: 1, pos: true, name: "+Y" },
+            { d: [0, -1, 0], want: hy, axis: 1, pos: false, name: "-Y" },
+            { d: [0, 0, 1], want: hz, axis: 2, pos: true, name: "+Z" },
+            { d: [0, 0, -1], want: hz, axis: 2, pos: false, name: "-Z" },
+          ];
+          const get = await shoot(AX.map((a) => ({ o: [0, 0, 0], d: a.d, tMax: 40 })));
+          const rows = [];
+          let bad = 0;
+          AX.forEach((a, i) => {
+            const r = get(i);
+            const cell = win.levelVoxel(r.level);
+            const err = Math.abs(r.t - a.want);
+            const wantFace = entryFaceBit(a.axis, a.pos);
+            const okT = r.hit && err <= cell + 1e-3;
+            const okF = r.hit && r.faceId === wantFace;
+            if (!okT || !okF) bad++;
+            rows.push(`${a.name} t ${r.t.toFixed(4)} (want ${a.want}, +-${cell}) L${r.level} ` +
+              `face ${r.faceId}/${wantFace} steps ${r.steps}${okT && okF ? "" : "  <- WRONG"}`);
+          });
+          rows.forEach((r) => say(`  (a) ${r}`));
+          results.checks.distance = { pass: bad === 0, rows };
+          if (bad) throw new Error(`(a) ${bad} of 6 axis rays missed their wall or entered by the wrong face`);
+          say("(a) wall distances: PASS");
+        }
+
+        // ═══════════════════════════════════════════════════════ (b) the leaks
+        const rng = rngFor(0x1a2b3c4d);
+        const unitDir = () => {
+          const z = rng() * 2 - 1;
+          const phi = rng() * 2 * Math.PI;
+          const r = Math.sqrt(Math.max(0, 1 - z * z));
+          return [r * Math.cos(phi), r * Math.sin(phi), z];
+        };
+        const interiorPoint = (inset = 0.06) => [
+          (rng() * 2 - 1) * (hx - inset), (rng() * 2 - 1) * (hy - inset), (rng() * 2 - 1) * (hz - inset),
+        ];
+        const leakRays = [];
+        for (let i = 0; i < LEAK_RAYS; i++) leakRays.push({ o: interiorPoint(), d: unitDir(), tMax: 40 });
+
+        const countLeaks = async () => {
+          let leaks = 0;
+          let exhausted = 0;
+          let outside = 0;
+          const samples = [];
+          // The ray kernel dispatches RAYS at a time; LEAK_RAYS is walked in
+          // chunks so the two never have to agree on a size.
+          for (let off = 0; off < LEAK_RAYS; off += RAYS) {
+            const chunk = leakRays.slice(off, Math.min(LEAK_RAYS, off + RAYS));
+            const get = await shoot(chunk);
+            for (let i = 0; i < chunk.length; i++) {
+              const r = get(i);
+              if (!r.hit) {
+                leaks++;
+                if (r.steps >= STEP_BUDGET - 0.5) exhausted++;
+                if (samples.length < 6) samples.push({ i: off + i, o: chunk[i].o, d: chunk[i].d, steps: r.steps });
+                continue;
+              }
+              const p = chunk[i];
+              const q = [0, 1, 2].map((a) => p.o[a] + p.d[a] * r.t);
+              const limit = [hx, hy, hz].map((h) => h + wall + win.levelVoxel(r.level) + 1e-3);
+              if (Math.abs(q[0]) > limit[0] || Math.abs(q[1]) > limit[1] || Math.abs(q[2]) > limit[2]) outside++;
+            }
+          }
+          return { leaks, exhausted, outside, samples };
+        };
+
+        const sealed = await countLeaks();
+        say(`  (b) face bits ON : ${sealed.leaks} leaks of ${LEAK_RAYS} ` +
+          `(${sealed.exhausted} step-exhausted, ${sealed.outside} hits beyond the shell)`);
+
+        // THE CONTROL, on the DATA: the face bits are withheld by the
+        // VOXELIZER, so the tracer is byte-identical across both arms and the
+        // difference can only be the bit.
+        vox.setFaceBits(false);
+        await buildToClean([0, 0, 0]);
+        const blind = await countLeaks();
+        vox.setFaceBits(true);
+        await buildToClean([0, 0, 0]);
+        const restored = await countLeaks();
+        const leakPct = (100 * blind.leaks) / LEAK_RAYS;
+        say(`  (b) face bits OFF: ${blind.leaks} leaks of ${LEAK_RAYS} = ${leakPct.toFixed(1)}% (the control)`);
+        results.checks.leak = {
+          sealed: sealed.leaks, control: blind.leaks, controlPct: +leakPct.toFixed(2),
+          exhausted: sealed.exhausted, outside: sealed.outside, restored: restored.leaks, rays: LEAK_RAYS,
+        };
+        if (sealed.leaks !== 0) {
+          for (const s of sealed.samples) {
+            say(`  (b) LEAK ray ${s.i} o ${s.o.map((n) => n.toFixed(4))} ` +
+              `d ${s.d.map((n) => n.toFixed(4))} steps ${s.steps}`);
+          }
+          throw new Error(`(b) ${sealed.leaks} of ${LEAK_RAYS} rays escaped the 5 cm triangle wall`);
+        }
+        if (sealed.outside !== 0) throw new Error(`(b) ${sealed.outside} rays stopped outside the shell`);
+        if (blind.leaks < LEAK_RAYS * 0.9) {
+          throw new Error(
+            `(b) CONTROL DID NOT LEAK — with the face bits withheld only ${leakPct.toFixed(1)}% of rays escaped, ` +
+            "so something other than the entry-face bit is stopping them and the 0-leak result proves nothing.",
+          );
+        }
+        if (restored.leaks !== 0) throw new Error(`(b) the window did not recover: ${restored.leaks} leaks`);
+        say(`(b) 5 cm triangle wall: PASS - 0 leaks sealed, control leaks ${leakPct.toFixed(1)}%`);
+
+        // ══════════════════════════════════════════════════════ (c) hand-off
+        {
+          const camZ = -(win.levelExtent(0) / 2 + 8);
+          const receipt = await place([0, 0, camZ]);
+          const handoffBuild = await buildToClean([0, 0, camZ]);
+          const wallZ = -hz - wall / 2;
+          const contains = (l) => {
+            const v = win.levelVoxel(l);
+            const o = receipt.perLevel[l].origin;
+            const c = [0, 1, 2].map((a) => Math.floor([0, 0, wallZ][a] / v));
+            return store.inWindow(c, o);
+          };
+          const l0Sees = contains(0);
+          const l1Sees = win.levels > 1 && contains(1);
+          say(`  (c) camera z ${camZ}: the -Z wall is ${l0Sees ? "INSIDE" : "outside"} L0, ` +
+            `${l1Sees ? "inside" : "OUTSIDE"} L1 (built in ${handoffBuild.frames} frames)`);
+          if (l0Sees) throw new Error("(c) the wall is inside L0's window — the hand-off is never exercised");
+          if (!l1Sees) throw new Error("(c) the wall is outside L1's window too — nothing can hit it");
+          const get = await shoot([{ o: [0, 0, camZ], d: [0, 0, 1], tMax: 60 }]);
+          const r = get(0);
+          const v1 = win.levelVoxel(1);
+          const wantT = -hz - camZ;
+          const okT = r.hit && r.t >= wantT - wall - v1 - 1e-3 && r.t <= wantT + v1 + 1e-3;
+          say(`  (c) hit ${r.hit} t ${r.t.toFixed(4)} (want ~${wantT.toFixed(2)} +-${v1}) level ${r.level} ` +
+            `face ${r.faceId}/${entryFaceBit(2, true)} steps ${r.steps}`);
+          results.checks.handoff = {
+            hit: r.hit, t: r.t, level: r.level, faceId: r.faceId, wantT, cell: v1, frames: handoffBuild.frames,
+          };
+          if (!r.hit) throw new Error("(c) the ray missed — the hand-off dropped it");
+          if (r.level !== 1) throw new Error(`(c) the hit came back at level ${r.level}, not 1`);
+          if (!okT) throw new Error(`(c) hit at t ${r.t}, expected ~${wantT} +-${v1}`);
+          if (r.faceId !== entryFaceBit(2, true)) throw new Error(`(c) wrong entry face ${r.faceId}`);
+          say("(c) level hand-off: PASS");
+        }
+
+        // ══════════════════════════ the reference build, then the budget break
+        await place([0, 0, 0]);
+        const refBuild = await buildToClean([0, 0, 0]);
+        const refBuf = await readWindow();
+        const refOcc = countOcc(refBuf);
+
+        {
+          // OVERFLOW → DIRTY CARRY-OVER. Drop the cap far below one frame's
+          // demand: the SAME final occupancy must appear, over more frames,
+          // with a non-zero overflow count in between. Without the low-cap arm
+          // the retry path is code nobody has executed.
+          //
+          // TWO THINGS THE FIRST VERSION OF THIS ARM GOT WRONG, both of which
+          // made it pass for the wrong reason:
+          //   · a cap BELOW the largest single-brick demand starves that brick
+          //     forever, so the run never converges — and it "passed" only
+          //     because a starved brick is never cleared and therefore still
+          //     held the reference build's bits. The cap is now chosen above
+          //     `maxBrickPairs`, which the counters report;
+          //   · the window is CLEARED first, so "the same occupancy" is a thing
+          //     the low-cap run produced rather than a thing it inherited.
+          const demand = Math.max(1, refBuild.peakPairs);
+          const biggestBrick = refBuild.peakBrickPairs ?? 0;
+          const low = Math.max(64, biggestBrick + 1, Math.floor(demand / 8));
+          vox.setPairLimit(low);
+          await compute(win.clearStaticPass);
+          const slow = await buildToClean([0, 0, 0]);
+          const slowBuf = await readWindow();
+          const slowOcc = countOcc(slowBuf);
+          let occDiff = 0;
+          for (let l = 0; l < win.levels; l++) {
+            const base = l * store.LEVEL_WORDS + store.OCC_OFF;
+            for (let w = 0; w < store.OCC_WORDS; w++) {
+              if (refBuf[base + w] !== slowBuf[base + w]) {
+                let x = (refBuf[base + w] ^ slowBuf[base + w]) >>> 0;
+                while (x) { occDiff += x & 1; x >>>= 1; }
+              }
+            }
+          }
+          vox.setPairLimit(vox.PAIRS_CAP);
+          say(`overflow arm: cap ${low} (of ${vox.PAIRS_CAP}, demand ${demand}, ` +
+            `biggest brick ${biggestBrick}) -> ${slow.frames} frames vs ${refBuild.frames}, ` +
+            `${slow.overflowed} brick-overflows, ${slow.starved} starved, ` +
+            `${slowOcc.total} vs ${refOcc.total} occupied, ${occDiff} voxel bits differ`);
+          results.overflow = {
+            cap: low, fullCap: vox.PAIRS_CAP, demand, biggestBrick,
+            framesLow: slow.frames, framesFull: refBuild.frames,
+            overflowed: slow.overflowed, starved: slow.starved,
+            occLow: slowOcc.total, occFull: refOcc.total, occDiff,
+          };
+          if (slow.frames >= MAX_FRAMES) {
+            throw new Error(`the low cap never converged in ${MAX_FRAMES} frames`);
+          }
+          if (slow.starved !== 0) {
+            throw new Error(`${slow.starved} bricks starved at cap ${low} — the arm measured starvation, ` +
+              "not carry-over");
+          }
+          if (slow.overflowed === 0) {
+            throw new Error(`the low cap (${low}) never overflowed a brick — the carry-over path did not run`);
+          }
+          if (slow.frames <= refBuild.frames) {
+            throw new Error(`the low cap finished in ${slow.frames} frames, not more than ${refBuild.frames}`);
+          }
+          if (occDiff !== 0) {
+            throw new Error(`the low cap converged to a DIFFERENT window: ${occDiff} voxel bits differ`);
+          }
+          say("overflow -> DIRTY carry-over: PASS (same window, more frames)");
+        }
+
+        // ═════════════════════════════ the palette, and its packed-atomic control
+        {
+          const legal = new Set([255, ...CORNELL_SCENE.map((p) => p.pal)]);
+          const boxPrim = CORNELL_SCENE[6];
+          const scan = (buf) => {
+            let corrupt = 0;
+            let boxPal = 0;
+            let boxOutside = 0;
+            let occTotal = 0;
+            for (let l = 0; l < win.levels; l++) {
+              const v = win.levelVoxel(l);
+              const o = win.origins.slice(l * 3, l * 3 + 3);
+              for (let vi = 0; vi < store.VOXELS_PER_LEVEL; vi++) {
+                if (!occOf(buf, l, vi)) continue;
+                occTotal++;
+                const p = palOf(buf, l, vi);
+                if (!legal.has(p)) corrupt++;
+                if (p === boxPrim.pal) {
+                  boxPal++;
+                  const cx = (vi & 63), cy = (vi >>> 6) & 63, cz = (vi >>> 12) & 63;
+                  const wc = [
+                    o[0] + (((cx - o[0]) % 64) + 64) % 64,
+                    o[1] + (((cy - o[1]) % 64) + 64) % 64,
+                    o[2] + (((cz - o[2]) % 64) + 64) % 64,
+                  ];
+                  let out = false;
+                  for (let a = 0; a < 3; a++) {
+                    const lo = wc[a] * v;
+                    const hi2 = lo + v;
+                    if (!(boxPrim.min[a] - v <= hi2 && boxPrim.max[a] + v >= lo)) out = true;
+                  }
+                  if (out) boxOutside++;
+                }
+              }
+            }
+            return { corrupt, boxPal, boxOutside, occTotal };
+          };
+          const good = scan(refBuf);
+          vox.setPalMode(0);
+          await buildToClean([0, 0, 0]);
+          const naiveBuf = await readWindow();
+          const naive = scan(naiveBuf);
+          vox.setPalMode(1);
+          await buildToClean([0, 0, 0]);
+          say(`palette scratch+pack: ${good.corrupt} illegal bytes of ${good.occTotal} occupied, ` +
+            `box pal on ${good.boxPal} voxels, ${good.boxOutside} of them outside the box`);
+          say(`palette naive packed atomicMax (control): ${naive.corrupt} illegal bytes of ${naive.occTotal}, ` +
+            `box pal on ${naive.boxPal} voxels, ${naive.boxOutside} outside the box`);
+          results.palette = { good, naive };
+          if (good.corrupt !== 0) {
+            throw new Error(`the shipping palette wrote ${good.corrupt} bytes no triangle carried`);
+          }
+          if (good.boxOutside !== 0) {
+            throw new Error(`the box's palette index reached ${good.boxOutside} voxels outside the box`);
+          }
+          if (naive.corrupt === 0) {
+            throw new Error(
+              "the NAIVE packed atomicMax corrupted nothing — either the scene never puts two palettes in one " +
+              "word, or the control did not actually run, and either way the scratch's cost is unjustified",
+            );
+          }
+          say(`palette: PASS (the packed atomicMax corrupts ${naive.corrupt} bytes; the scratch corrupts 0)`);
+        }
+
+        // ══════════════════════ the occupancy diff against the analytic fill
+        {
+          await compute(win.clearStaticPass);
+          await compute(fill.pass);
+          const anaBuf = await readWindow();
+          const perLevel = [];
+          const insideSolid = (vmin, v) => {
+            const vmax = [vmin[0] + v, vmin[1] + v, vmin[2] + v];
+            for (const p of CORNELL_SCENE) {
+              if (p.kind !== KIND_BOX) continue;
+              let all = true;
+              for (let a = 0; a < 3; a++) if (!(p.min[a] <= vmin[a] && p.max[a] >= vmax[a])) all = false;
+              if (all) return true;
+            }
+            return false;
+          };
+          for (let l = 0; l < win.levels; l++) {
+            const v = win.levelVoxel(l);
+            const o = win.origins.slice(l * 3, l * 3 + 3);
+            let both = 0, triOnly = 0, anaOnly = 0, anaOnlyInterior = 0, triOnlyAdjacent = 0;
+            const occA = (vi) => occOf(anaBuf, l, vi);
+            for (let vi = 0; vi < store.VOXELS_PER_LEVEL; vi++) {
+              const t = occOf(refBuf, l, vi);
+              const a = occA(vi);
+              if (t && a) { both++; continue; }
+              if (!t && !a) continue;
+              const cx = (vi & 63), cy = (vi >>> 6) & 63, cz = (vi >>> 12) & 63;
+              const wc = [
+                o[0] + (((cx - o[0]) % 64) + 64) % 64,
+                o[1] + (((cy - o[1]) % 64) + 64) % 64,
+                o[2] + (((cz - o[2]) % 64) + 64) % 64,
+              ];
+              if (t) {
+                triOnly++;
+                // Expected class: the SAT's conservativeEps puts one extra
+                // voxel outside every planar surface, so a triangle-only voxel
+                // touching an analytic-occupied neighbour is the slab edge, not
+                // a disagreement about where the wall is.
+                let adj = false;
+                for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+                  const nvi = ((cx + dx) & 63) | (((cy + dy) & 63) << 6) | (((cz + dz) & 63) << 12);
+                  if (occA(nvi)) { adj = true; break; }
+                }
+                if (adj) triOnlyAdjacent++;
+              } else {
+                anaOnly++;
+                // Expected class: a solid's INTERIOR. The analytic filler marks
+                // it; a triangle SHELL cannot and does not need to (the shell is
+                // 6-separating, so no ray gets inside to notice).
+                if (insideSolid([wc[0] * v, wc[1] * v, wc[2] * v], v)) anaOnlyInterior++;
+              }
+            }
+            const union = both + triOnly + anaOnly;
+            perLevel.push({
+              level: l, voxel: v, both, triOnly, anaOnly, triOnlyAdjacent, anaOnlyInterior,
+              mismatchPct: +((100 * (triOnly + anaOnly)) / Math.max(1, union)).toFixed(2),
+              unexplained: (triOnly - triOnlyAdjacent) + (anaOnly - anaOnlyInterior),
+            });
+          }
+          perLevel.forEach((r) => say(
+            `  occ diff L${r.level} @${r.voxel}m: both ${r.both}, tri-only ${r.triOnly} ` +
+            `(${r.triOnlyAdjacent} slab-edge), analytic-only ${r.anaOnly} (${r.anaOnlyInterior} solid interior) ` +
+            `= ${r.mismatchPct}% of the union, ${r.unexplained} unexplained`));
+          results.occDiff = perLevel;
+          say("occ diff vs the analytic fill: reported (see the classes above)");
+        }
+
+        // ══════════════════════════════════════════════════════ throughput
+        const timeBuild = async (label, camPos, frames) => {
+          voxPasses = vox.passes(camPos, null);
+          await compute(markDirty);
+          if (timestamps) await renderer.resolveTimestampsAsync("compute");
+          const t0 = performance.now();
+          for (let f = 0; f < frames; f++) for (const p of voxPasses) renderer.compute(p);
+          await device.queue.onSubmittedWorkDone();
+          const wallMs = performance.now() - t0;
+          const gpuMs = timestamps ? ((await renderer.resolveTimestampsAsync("compute")) ?? 0) : null;
+          const s = await vox.stats(renderer);
+          return {
+            label, frames, wallMsPerFrame: +(wallMs / frames).toFixed(4),
+            gpuMsPerFrame: gpuMs == null ? null : +(gpuMs / frames).toFixed(4),
+            dirtyLeft: s.dirty,
+          };
+        };
+        await place([0, 0, 0]);
+        results.roomTiming = await timeBuild("room", [0, 0, 0], Math.max(4, refBuild.frames));
+        say(`room timing: ${results.roomTiming.frames} frames, ` +
+          `gpu ${results.roomTiming.gpuMsPerFrame ?? "n/a"} ms/frame, ` +
+          `wall ${results.roomTiming.wallMsPerFrame} ms/frame, dirty left ${results.roomTiming.dirtyLeft}`);
+
+        // ══════════════════════════════════ THE BISTRO-SCALE THROUGHPUT SCENE
+        if (WANT_RANDOM) {
+          const want = Math.min(RANDOM_TRIS, triCap);
+          if (want < RANDOM_TRIS) {
+            say(`random scene capped at ${want} triangles by maxStorageBufferBindingSize ` +
+              `(${(lim.maxStorageBufferBindingSize / 1048576).toFixed(0)} MB)`);
+          }
+          const t0 = performance.now();
+          const rsb = buildRandomSoup(want);
+          const rgrid = buildGrid(rsb, 4.0);
+          const cpuMs = performance.now() - t0;
+          say(`random soup: ${rgrid.triCount} triangles in 110x36x110 m, grid ${rgrid.dim.join("x")} ` +
+            `(${rgrid.nCell} cells, ${rgrid.entries} listings), built on the CPU in ${cpuMs.toFixed(0)} ms`);
+
+          const rsoup = uploadSoup(rgrid);
+          const rvox = voxMod.createWindowVoxelizer(win, rsoup, TIER);
+          const rmark = rvox.markAllDirty();
+          let rpasses = rvox.passes([0, 0, 0], null);
+          await compute(rmark);
+          for (const p of rpasses) await compute(p);
+
+          await place([0, 0, 0]);
+          rpasses = rvox.passes([0, 0, 0], null);
+          await compute(rmark);
+          const levelFrames = new Array(win.levels).fill(-1);
+          let frames = MAX_FRAMES;
+          let peakPairs = 0;
+          let peakBrickPairs = 0;
+          let totalPairs = 0;
+          let deferred = 0;
+          let overflowed = 0;
+          let starved = 0;
+          for (let f = 1; f <= MAX_FRAMES; f++) {
+            for (const p of rpasses) renderer.compute(p);
+            const s = await rvox.stats(renderer);
+            for (let l = 0; l < win.levels; l++) {
+              if (levelFrames[l] < 0 && s.perLevel[l].dirty === 0) levelFrames[l] = f - 1;
+            }
+            peakPairs = Math.max(peakPairs, s.pairsWritten);
+            peakBrickPairs = Math.max(peakBrickPairs, s.maxBrickPairs);
+            totalPairs += s.pairsWritten;
+            deferred += s.deferred;
+            overflowed += s.overflowed;
+            starved += s.starved;
+            if (s.dirty === 0) { frames = f - 1; break; }
+          }
+          const rbuf = await readWindow();
+          const rocc = countOcc(rbuf);
+          say(`random build: ${frames} frames to 0 dirty (per level ${levelFrames.join("/")}), ` +
+            `${rocc.total} occupied [${rocc.per.join("/")}], peak ${peakPairs} pairs/frame, ` +
+            `${overflowed} brick-overflows, ${deferred} deferred, ` +
+            `biggest brick ${peakBrickPairs} pairs, ${starved} starved, ` +
+            `${totalPairs} (brick, tri) pairs of SAT in total`);
+
+          // The timed re-run, with no readback in the loop.
+          await place([0, 0, 0]);
+          rpasses = rvox.passes([0, 0, 0], null);
+          await compute(rmark);
+          if (timestamps) await renderer.resolveTimestampsAsync("compute");
+          const w0 = performance.now();
+          for (let f = 0; f < Math.max(4, frames); f++) for (const p of rpasses) renderer.compute(p);
+          await device.queue.onSubmittedWorkDone();
+          const wallMs = performance.now() - w0;
+          const gpuMs = timestamps ? ((await renderer.resolveTimestampsAsync("compute")) ?? 0) : null;
+          const nf = Math.max(4, frames);
+          results.random = {
+            triangles: rgrid.triCount, listings: rgrid.entries, cpuBuildMs: +cpuMs.toFixed(0),
+            frames, levelFrames, occupied: rocc.total, occPerLevel: rocc.per, peakPairs,
+            peakBrickPairs, totalPairs, deferred, overflowed, starved,
+            gpuMsPerFrame: gpuMs == null ? null : +(gpuMs / nf).toFixed(4),
+            wallMsPerFrame: +(wallMs / nf).toFixed(4),
+            secondsToFull: +((nf * (gpuMs == null ? wallMs / nf : gpuMs / nf)) / 1000).toFixed(3),
+          };
+          say(`random timing: gpu ${results.random.gpuMsPerFrame ?? "n/a"} ms/frame, ` +
+            `wall ${results.random.wallMsPerFrame} ms/frame over ${nf} frames`);
+          if (starved) say(`  WARNING: ${starved} bricks need more pairs than the whole cap`);
+          rvox.dispose();
+        }
+
+        // ══════════════════════════════════════════════════ the kernel receipts
+        {
+          const named = [
+            ["resetCtr", voxPasses[0]], ["resetWork", voxPasses[1]], ["dirtyCount", voxPasses[2]],
+            ["dirtyPrefix", voxPasses[3]], ["dirtyScatter", voxPasses[4]], ["binPairs", voxPasses[5]],
+            ["voxelize", voxPasses[6]], ["finishBricks", voxPasses[7]], ["markDirty", markDirty],
+          ];
+          const audit = [];
+          let binWgsl = "";
+          let voxWgsl = "";
+          for (const [name, node] of named) {
+            const shader = renderer._nodes?.getForCompute?.(node)?.computeShader ?? "";
+            const storageBindings = [...shader.matchAll(/var<storage[^>]*>/g)].length;
+            const workgroupVars = [...shader.matchAll(/var<workgroup/g)].length;
+            audit.push({ name, storageBindings, workgroupVars, bytes: shader.length });
+            if (name === "binPairs") binWgsl = shader;
+            if (name === "voxelize") voxWgsl = shader;
+            say(`kernel ${name.padEnd(13)} ${(shader.length / 1024).toFixed(1)} kB, ` +
+              `${storageBindings} storage buffers, ${workgroupVars} workgroup vars`);
+          }
+          results.kernels = audit;
+          const over = audit.filter((k) => k.storageBindings > 6);
+          if (over.length) {
+            throw new Error(`${over.map((k) => `${k.name}=${k.storageBindings}`).join(", ")} exceed the ` +
+              "portable envelope of 6 storage buffers per pass (PLAN §4.6)");
+          }
+          const wg = audit.filter((k) => k.workgroupVars > 0);
+          if (wg.length) throw new Error(`${wg.map((k) => k.name).join(", ")} use workgroup memory`);
+
+          // SCENE-FREE WGSL, the same inverted test `gi2-trace.html` runs: every
+          // float literal must be derivable from the TIER or be a named
+          // algorithm constant. Grepping for the room's numbers is the obvious
+          // test and the wrong one — "5" is also a shift amount.
+          const fmt = (n) => (Number.isInteger(n) ? `${n}.0` : `${n}`);
+          const allowed = new Set([
+            fmt(win.voxel0 * 0.5), fmt(win.voxel0 * store.BRICK),
+            "0.5", // the voxel centre, and the bucket's box midpoint
+            "0.5001", // the SAT's conservativeEps: half a cell plus a hair
+            "0.001", // the face-bit normal threshold (|n.a| > 1e-3)
+          ]);
+          for (let l = 0; l < win.levels; l++) allowed.add(fmt(win.voxel0 * Math.pow(2, l)));
+          // Addressing constants: whole numbers up to 16. The trace's own check
+          // allows up to 64 because it indexes the window directly; the
+          // voxelizer's largest legal whole-number float is 8 (the distance
+          // bucket count), so the tighter bound is what lets 36.0 and 110.0 —
+          // the random scene's own extents — read as FOREIGN instead of hiding
+          // inside a generous allowance.
+          const isAddressing = (s) => {
+            const v = Number(s);
+            return Number.isInteger(v) && Math.abs(v) <= 16;
+          };
+          // Belt and braces, matched against the EXTRACTED LITERALS and never
+          // as a substring of the whole shader: "36" appears inside the
+          // generated identifier `nodeVar36`, and a substring grep that fires
+          // on a variable name is an instrument that cannot see its subject.
+          const sceneNumbers = [
+            `${hx + wall}`, `${hy + wall}`, `${wall}`, "2.5", "1.5", "110.0", "36.0",
+          ];
+          const check = (name, wgsl) => {
+            const literals = [...new Set([...wgsl.matchAll(/(?<![\w.])-?\d+\.\d+/g)].map((m) => m[0]))].sort();
+            const foreign = literals.filter((s) => !allowed.has(s) && !isAddressing(s));
+            const grepped = sceneNumbers.filter((n) => literals.includes(n) && !allowed.has(n) && !isAddressing(n));
+            say(`${name} float literals: ${literals.join(" ")}`);
+            return { name, literals, foreign, grepped };
+          };
+          const traceChecks = [check("binPairs", binWgsl), check("voxelize", voxWgsl)];
+          results.wgsl = traceChecks;
+          const bad = traceChecks.filter((c) => c.foreign.length || c.grepped.length);
+          if (bad.length) {
+            throw new Error("scene numbers in the voxelizer's WGSL: " +
+              bad.map((c) => `${c.name} [${[...c.foreign, ...c.grepped].join(", ")}]`).join("; "));
+          }
+          say("voxelizer kernels: scene-free");
+        }
+
+        if (validationErrors.length) throw new Error(`WebGPU validation: ${validationErrors[0]}`);
+        results.pass = true;
+        results.text = lines.join("\n");
+        globalThis.__GI2_VOX_RESULT__ = results;
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

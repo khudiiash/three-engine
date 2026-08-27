@@ -232,6 +232,7 @@
     "probe:gi-reflect-black": "node scripts/run-gi-reflect-black-probe.mjs",
     "probe:gi2-trace": "node scripts/run-gi2-trace-probe.mjs",
     "probe:gi2-soup": "node scripts/run-gi2-soup-probe.mjs",
+    "probe:gi2-voxelize": "node scripts/run-gi2-voxelize-probe.mjs",
     "test:gi2-window": "node scripts/run-gi2-window-test.mjs",
     "test:gi2-soup": "node scripts/run-gi2-soup-test.mjs"
   },
