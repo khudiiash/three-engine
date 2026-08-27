@@ -835,13 +835,22 @@ construction. `occ` at level l+1 is NOT derived from level l.
 ### K.4 Trace (`traceWindow(o, d, tMax) → {t, face, level, voxelIdx}`)
 Two-level DDA per level: step BRICKS (16 per axis) on `brickMask` (a brick
 with mask 0 is skipped in one step); inside an occupied brick, step voxels
-on `occ`; on an occupied voxel test the ENTRY FACE bit — if set, hit; if the
-entry face bit is clear (a triangle crosses the voxel but not this face) the
-ray continues (this is the 6-separating guarantee: a 5 cm wall sets exactly
-the faces it crosses, so it blocks face-stepping paths and never the ones it
-does not cross). Level hand-off: start at the finest level whose window
-contains `o` (usually L0); when the ray exits that window, continue at l+1
-from the exit point (`t` carried). Bias: ray origin pushed `0.5 · v_0` along
+on `occ`; on an occupied voxel test the ENTRY FACE bit — if set, hit; if clear, the
+ray continues. **FACE-BIT RULE (corrected 08-27, commit ee6b4c0 — the
+original "faces it crosses" wording was wrong and would let +X rays through
+a wall ⊥X):** bit(±a) is set iff the surface inside the voxel is NOT parallel
+to axis a (its normal has an `a` component, |n.a| > 1e-3); both bits of a
+pair are set together. A wall ⊥X sets ±X only → blocks every X-stepping ray
+and passes rays travelling along it; a floor ⊥Y stops vertical rays and does
+not thicken horizontal ones. Receipt: 0/10 000 leaks through a 5 cm wall,
+100 % leak in the control with the bits withheld. DDA: nested Amanatides–Woo on INTEGER cells (brick loop outside, ≤ 13-step
+voxel loop inside, crossing times recomputed from the origin, exactly one
+axis per step) — an ε-advance DDA that re-derives the cell from the position
+leaked 2/10 000 near cell edges. Level hand-off: start at the finest level whose
+window contains `o` (usually L0); when the ray exits that window, continue at
+l+1 from the exit point (`t` carried). Measured: ~1 G rays/s (~1 ns/ray,
+8.1 steps) on an RTX-class GPU at 400 k rays/dispatch; smaller dispatches
+are launch-bound. Bias: ray origin pushed `0.5 · v_0` along
 the geometric normal (screen-probe origins are ON surfaces). The dynamic
 layer (K.5) is OR'd into both `occ` and the face test at L0/L1. No workgroup
 memory, ONE storage buffer + uniforms = ≤ 3 bindings.

@@ -6624,6 +6624,16 @@ export class GISystem {
             // user photographed on the Sponza mirror).
             ...this.#hitShadowBundle(),
             shadowReach: this.#hitShadowReach(volume),
+            // §19 Stage 1.1 / J.6 R4 — the env-on-miss term moved OUT of every
+            // lit material and into this kernel's traced-miss branch (read the
+            // note there for why that branch is the only occlusion-correct
+            // place for an HDRI sample). The same three persistent nodes the
+            // material path gets through `light.giEnvMiss`, so an environment
+            // change stays a uniform write; null when the scene has no
+            // environment node, which compiles the term out exactly as before.
+            env: this._giEnvMissNode
+              ? { node: this._giEnvMissNode, intensity: this._giEnvMissIntensityU, rotY: this._giEnvMissRotU }
+              : null,
           })
         : null;
       const bvhHitTemporal = bvhHitShade

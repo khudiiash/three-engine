@@ -21,7 +21,6 @@ import {
   acos,
   cameraPosition,
   cos,
-  equirectUV,
   float,
   int,
   materialRoughness,
@@ -1216,6 +1215,88 @@ export function emitterAngularRadius(slot) {
 }
 
 /**
+ * ONE SLOT'S SPECULAR GLOW, AS A WGSL FUNCTION (§19 Stage 1.1, item 12).
+ *
+ * The body is the math that used to be stamped out INLINE once per emitter
+ * slot in `GICascadeLightNode.setup` — the slot's area shape vs the
+ * roughness-widened reflection lobe, energy-conserving (Karis
+ * representative-area ratio), occluded by the slot's diffuse-direction
+ * penumbra. Nothing about the estimate changed; only WHERE it is emitted.
+ * Measured on Bistro: 8.29 kB of inlined glow + 4.99 kB of its two helper
+ * functions in every lit material's fragment WGSL.
+ *
+ * WHY A FUNCTION AND NOT A RESOLVE-RES PASS. J.3.6 wanted this at resolve
+ * resolution; J.3.8 names the fallback this is — "2 samples +
+ * `giEmitterGlow(slotUBO, R, roughness)` **if 6 is deferred**". It is
+ * deferred, and the reason is structural rather than tasteful: every term
+ * here is a function of the shading pixel's ROUGHNESS (`spread = α²` widens
+ * the cone and `energy` divides by it), and the GI gbuffer carries no
+ * roughness. `renderGiGBuffer` shades every mesh through ONE
+ * `scene.overrideMaterial`, which by construction cannot read the material it
+ * overrides (createGiGBuffer's mask note says exactly this — it is why the
+ * mirror mask is a BIT written by a second layer pass and not a value).
+ * Moving the glow therefore needs J.3.5's roughness channel first; the
+ * function form takes the same ~13 kB out of every lit material today without
+ * changing a single shaded value.
+ *
+ * `kind` 0 — a plain sphere slot, or a slot carrying no kind uniform at all —
+ * takes neither branch, which is exactly what the old `if (slot.kind)` JS
+ * test compiled to for those slots.
+ */
+const emitterGlowFn = sharedFn({
+  name: "giEmitterGlow",
+  type: "vec3",
+  inputs: [
+    { name: "P", type: "vec3" },
+    { name: "R", type: "vec3" },
+    { name: "roughness", type: "float" },
+    { name: "shadow", type: "float" },
+    { name: "radius", type: "float" },
+    { name: "reff", type: "float" },
+    { name: "kind", type: "float" },
+    { name: "color", type: "vec3" },
+    { name: "center", type: "vec3" },
+    { name: "half", type: "vec3" },
+    { name: "bx", type: "vec3" },
+    { name: "by", type: "vec3" },
+    { name: "bz", type: "vec3" },
+  ],
+  body: (P, R, roughness, shadow, radius, reff, kind, color, center, half, bx, by, bz) => {
+    const toEmitter = vec3(center).sub(P).toVar();
+    const dist = toEmitter.length().max(1e-3).toVar();
+    const dirToEmitter = toEmitter.div(dist).toVar();
+    const cosAng = dirToEmitter.dot(R);
+    // Angular size from the slot's effective radius (exact for spheres,
+    // mean-projected-area for boxes) — drives softness and energy.
+    const sinR = float(reff).div(dist).clamp(0, 1).toVar();
+    // GGX-ish lobe widening: alpha = roughness², small floor for AA.
+    const spread = roughness.mul(roughness).add(0.015).toVar();
+    const effSin = sinR.add(spread).min(1).toVar();
+    const cosEff = effSin.mul(effSin).oneMinus().max(0).sqrt().toVar();
+    // Sphere slots: cone test around the direction to center (a disc
+    // highlight is CORRECT for a sphere). Box slots: angular distance from
+    // the reflected ray to the box's actual silhouette — the reflection of a
+    // cube lamp is a cube, tilted the way the lamp is tilted, not the disc
+    // the sphere model drew ("reflections from emissives look like a sphere"
+    // report). Shaped slots (capsule/cylinder/frustum/disc/torus): the same
+    // silhouette contract via their SDF (shapeGlowMiss) — a torus lamp
+    // reflects as a ring.
+    const inCone = float(smoothstep(cosEff, mix(cosEff, 1, 0.35), cosAng)).toVar();
+    If(kind.greaterThan(0.5).and(kind.lessThan(1.5)), () => {
+      const miss = boxGlowMiss(P, R, center, half, bx, by, bz);
+      inCone.assign(smoothstep(0.0, spread, miss).oneMinus());
+    }).ElseIf(kind.greaterThan(1.5), () => {
+      const miss = shapeGlowMiss(P, R, kind, center, half, bx, by, bz);
+      inCone.assign(smoothstep(0.0, spread, miss).oneMinus());
+    });
+    const energy = sinR.mul(sinR).div(effSin.mul(effSin).max(1e-6));
+    // `active` was `step(0.001, slot.radius)` at the call site; it multiplies
+    // the same way here and keeps an empty slot contributing exactly zero.
+    return vec3(color).mul(inCone).mul(energy).mul(shadow).mul(step(0.001, radius));
+  },
+});
+
+/**
  * Promoted emissive emitters as analytic AREA lights (sphere or oriented
  * box, per slot), with SDF sphere-traced penumbrae:
  * E = color · geometricFactor · shadow (see emitterSlotFactor).
@@ -2102,8 +2183,13 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
           : light.giEmitterShadowNode.sample(giUV)).toVar();
         const channels = [packed.x, packed.y, packed.z, packed.w];
         light.emitterSlots.forEach((slot, index) => {
-          const toEmitter = vec3(slot.center).sub(positionWorld).toVar();
-          const dist = toEmitter.length().max(1e-3).toVar();
+          // §19 Stage 1.1: the per-slot GEOMETRY (toEmitter/dist/direction/
+          // active) used to be materialised here as four `.toVar()`s a slot —
+          // 1.9 kB of Bistro's fragment WGSL — for one consumer, the specular
+          // glow. It now lives inside `emitterGlowFn`, which recomputes it
+          // from `slot.center` exactly as this did, so the slot's entry is
+          // the two things the call site cannot derive: which slot, and its
+          // shadow channel.
           emitterData.push({
             slot,
             // §12.70 W4b: under the tile cut the packed channels are keyed to
@@ -2113,9 +2199,6 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
             // effect the seats still cover); re-keying the material path is
             // W5's business if it ever shows.
             shadow: light.emitterTileKeyed ? float(1) : (channels[index] ?? float(1)),
-            dist,
-            dirToEmitter: toEmitter.div(dist).toVar(),
-            active: step(0.001, slot.radius),
           });
         });
       }
@@ -2291,23 +2374,46 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
           // cover the disc evenly enough that no rotation hash is needed (a
           // per-pixel rotation would need a temporal filter to stop crawling;
           // a fixed pattern needs none, the same trade the AO pass records).
-          const RINGS = [
-            [1, [[1, 0], [0.5, 0.866], [-0.5, 0.866], [-1, 0], [-0.5, -0.866], [0.5, -0.866]]],
-            [0.5, [[0.866, 0.5], [0, 1], [-0.866, 0.5], [-0.866, -0.5], [0, -1], [0.866, -0.5]]],
-          ];
-          for (const [scale, ring] of RINGS) {
-            for (const [ox, oy] of ring) {
-              const uv = giUV.add(vec2(step2.x.mul(ox * scale), step2.y.mul(oy * scale)));
-              const tap = light.bvhReflectColorTexture.sample(uv);
-              // Only real shaded hits average in. A neighbour that is a traced
-              // MISS (alpha −1, the env term's marker) or was never traced
-              // (alpha 0) carries no radiance, and letting its zero into the
-              // mean is how a blur turns a glossy edge into a dark rim.
-              const w = step(0.5, tap.a);
-              sum.addAssign(vec3(tap.rgb).mul(w));
-              wsum.addAssign(w);
-            }
-          }
+          //
+          // ── §19 STAGE 1.1: A LOOP, NOT TWELVE UNROLLED COPIES ─────────────
+          //
+          // The pattern is unchanged and so is every tap: ring r ∈ {0,1} at
+          // radius scale 1 / 0.5, tap k ∈ 0..5 at k·60° + r·30°, which
+          // reproduces the two literal tables this replaced exactly (the only
+          // difference is that 0.866 is now `cos(π/6)` to full precision — a
+          // 3e-5 relative move of a tap offset measured in TEXELS).
+          //
+          // WHY IT DID NOT MOVE OUT OF THE MATERIAL. Task item 4 sets the bar
+          // at 8 kB of shader text: measured on Bistro's largest fragment the
+          // prefilter is 7621 B (7.44 kB) — UNDER it — so the term stays here,
+          // where the roughness it needs is exact and per-pixel, and the user
+          // report this block's own header names ("when roughness or metalness
+          // get less mirror light, I need it smoothed out") keeps its fix.
+          // Rolling the unrolled taps into a loop is not a move: same texture,
+          // same taps, same weights, same mean — it just stops paying for
+          // twelve copies of the body in every lit material's WGSL.
+          //
+          // `.level(0)` rather than `.sample()`: textureSampleLevel is legal in
+          // ANY control flow (implicit-derivative sampling inside a loop is the
+          // one thing WGSL's uniformity rules can refuse), and the target has
+          // no mips, so it returns exactly what the unrolled `.sample()` did.
+          const RINGS = 2;
+          const PER_RING = 6;
+          Loop({ start: int(0), end: int(RINGS * PER_RING), type: "int", condition: "<" }, ({ i }) => {
+            const ring = float(i.div(int(PER_RING)));
+            const k = float(i.mod(int(PER_RING)));
+            const ang = k.mul(Math.PI / 3).add(ring.mul(Math.PI / 6));
+            const sc = float(1).sub(ring.mul(0.5));
+            const uv = giUV.add(vec2(step2.x.mul(cos(ang).mul(sc)), step2.y.mul(sin(ang).mul(sc))));
+            const tap = light.bvhReflectColorTexture.sample(uv).level(0);
+            // Only real shaded hits average in. A neighbour that is a traced
+            // MISS (alpha −1, the env term's marker) or was never traced
+            // (alpha 0) carries no radiance, and letting its zero into the
+            // mean is how a blur turns a glossy edge into a dark rim.
+            const w = step(0.5, tap.a);
+            sum.addAssign(vec3(tap.rgb).mul(w));
+            wsum.addAssign(w);
+          });
           exactRgb.assign(sum.div(wsum));
         }
         // THE HIT IS SHADED WHERE IT IS TRACED (see giScreen.js
@@ -2548,43 +2654,20 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // surfaces the widened-cone glow otherwise washes out diffuse
       // shadows entirely) AND to the mirror path (mirror pixels are
       // low-roughness, where the glow is sharp and correct).
+      //
+      // §19 Stage 1.1: ONE CALL PER SLOT into `emitterGlowFn` (declared above
+      // — read its header for why the term did not move to a resolve-res pass
+      // and what would have to exist first). The body is the same math this
+      // loop used to inline four times over; `kind` 0 takes neither shape
+      // branch, which is what the old `if (slot.kind)` compiled to.
       let glow = vec3(0);
-      for (const { slot, shadow, dist, dirToEmitter, active } of emitterData) {
-        const cosAng = dirToEmitter.dot(reflected);
-        // Angular size from the slot's effective radius (exact for spheres,
-        // mean-projected-area for boxes) — drives softness and energy.
-        const sinR = float(emitterAngularRadius(slot)).div(dist).clamp(0, 1).toVar();
-        // GGX-ish lobe widening: alpha = roughness², small floor for AA.
-        const spread = roughness.mul(roughness).add(0.015).toVar();
-        const effSin = sinR.add(spread).min(1).toVar();
-        const cosEff = effSin.mul(effSin).oneMinus().max(0).sqrt().toVar();
-        // Sphere slots: cone test around the direction to center (a disc
-        // highlight is CORRECT for a sphere). Box slots: angular distance
-        // from the reflected ray to the box's actual silhouette — the
-        // reflection of a cube lamp is a cube, tilted the way the lamp is
-        // tilted, not the disc the sphere model drew ("reflections from
-        // emissives look like a sphere" report). Shaped slots (capsule/
-        // cylinder/frustum/disc/torus): the same silhouette contract via
-        // their SDF (shapeGlowMiss) — a torus lamp reflects as a ring.
-        const inCone = float(smoothstep(cosEff, mix(cosEff, 1, 0.35), cosAng)).toVar();
-        if (slot.kind) {
-          const kindG = float(slot.kind);
-          If(kindG.greaterThan(0.5).and(kindG.lessThan(1.5)), () => {
-            const miss = boxGlowMiss(
-              positionWorld, reflected,
-              vec3(slot.center), vec3(slot.half), vec3(slot.bx), vec3(slot.by), vec3(slot.bz),
-            );
-            inCone.assign(smoothstep(0.0, spread, miss).oneMinus());
-          }).ElseIf(kindG.greaterThan(1.5), () => {
-            const miss = shapeGlowMiss(
-              positionWorld, reflected, kindG,
-              vec3(slot.center), vec3(slot.half), vec3(slot.bx), vec3(slot.by), vec3(slot.bz),
-            );
-            inCone.assign(smoothstep(0.0, spread, miss).oneMinus());
-          });
-        }
-        const energy = sinR.mul(sinR).div(effSin.mul(effSin).max(1e-6));
-        glow = glow.add(vec3(slot.color).mul(inCone).mul(energy).mul(shadow).mul(active));
+      for (const { slot, shadow } of emitterData) {
+        glow = glow.add(emitterGlowFn(
+          positionWorld, reflected, roughness, shadow,
+          float(slot.radius), float(emitterAngularRadius(slot)), float(slot.kind ?? 0),
+          vec3(slot.color), vec3(slot.center), vec3(slot.half),
+          vec3(slot.bx), vec3(slot.by), vec3(slot.bz),
+        ));
       }
 
       const diffuseLimit = irradiance.div(Math.PI);
@@ -2614,25 +2697,33 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // hit composites AFTER this and wins. `step` zeroes the whole term
       // when the scene has no environment — black would otherwise DARKEN
       // the miss against today's field fallback.
+      //
+      // ── §19 STAGE 1.1 / J.6 R4: THE LOOKUP MOVED, THE PROOF DID NOT ──────
+      //
+      // The Y-rotation, `equirectUV` and the environment fetch used to be
+      // emitted here, in every lit material — 1868 B of Bistro's largest
+      // fragment, one texture binding and one fetch per reflective pixel.
+      // They now run inside `createGiBvhHitShade`'s traced-miss branch, which
+      // is the ONLY place that can see the -2 marker the proof rests on, and
+      // which writes the radiance into the same texel whose alpha already
+      // carried the marker (see that kernel's note). So the material's
+      // env-miss term is now: read the texel, weight it, mix.
+      //
+      // ⚠ THE ANTI-LEAK GUARD IS UNCHANGED and still both halves: the sample
+      // happens only on a ray that ran the whole static BVH and left the
+      // scene (kernel side), and the WEIGHT here is still the marker's own
+      // negative alpha times the mirror gate (material side). Nothing samples
+      // an environment unoccluded — that is the §12.64 leak.
+      //
+      // `step(1e-4, intensity)` is kept: with no environment the kernel
+      // leaves rgb at 0, and mixing toward black would DARKEN the miss
+      // against today's field fallback rather than leaving it alone.
       if (light.giEnvMiss && light.bvhReflectColorTexture) {
-        const missA = light.bvhReflectColorTexture.sample(giUV).a;
-        const envW = missA.negate().clamp(0, 1)
+        const envTexel = light.bvhReflectColorTexture.sample(giUV);
+        const envW = envTexel.a.negate().clamp(0, 1)
           .mul(smoothstep(0.45, 0.15, roughness))
           .mul(step(1e-4, float(light.giEnvMiss.intensity)));
-        // Match three's own environment orientation: the lookup vector is
-        // rotated by the scene's environmentRotation (Y), then equirectUV
-        // (three's node, so the mapping convention cannot drift).
-        const rot = float(light.giEnvMiss.rotY);
-        const cr = cos(rot);
-        const sr = sin(rot);
-        const rd = vec3(
-          reflected.x.mul(cr).add(reflected.z.mul(sr)),
-          reflected.y,
-          reflected.z.mul(cr).sub(reflected.x.mul(sr)),
-        );
-        const envRad = vec3(light.giEnvMiss.node.sample(equirectUV(rd)).rgb)
-          .mul(float(light.giEnvMiss.intensity));
-        spec = mix(spec, envRad.add(glow).mul(light.intensityUniform), envW);
+        spec = mix(spec, vec3(envTexel.rgb).add(glow).mul(light.intensityUniform), envW);
       }
       if (light._mirrorOut) {
         spec = mix(

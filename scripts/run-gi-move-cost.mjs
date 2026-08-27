@@ -34,6 +34,23 @@ page.on("console", (message) => {
 });
 page.on("pageerror", (error) => console.log(`pageerror: ${error.stack ?? error.message}`));
 
+// ⚠ WITHOUT THIS THE ENGINE LOOP IS ASLEEP AND EVERY NUMBER BELOW IS A LIE
+// (§19 Stage 1.1). editorFramePacing suspends the engine (`host.stop()`)
+// whenever the viewport is idle+unfocused, which a headless page always is —
+// so this script's whole premise (animate an object, watch the GI shadow
+// follow it) never happened: the lamp moved in the scene graph while the
+// render loop was parked, both frame-time arms measured a stopped engine, and
+// `old-side > shadow-centre + 15` failed because NEITHER position had been
+// shaded. `__editorKeepRendering` is editorFramePacing's own documented
+// harness hatch and is set the same way run-gi-moved-lamp-test.mjs sets it
+// (which measured 148 > 121 with a hatched copy of this script).
+//
+// Set via evaluateOnNewDocument so it lands before any module evaluates —
+// the pacing module reads it when it installs, not per frame.
+await page.evaluateOnNewDocument(() => {
+  globalThis.__editorKeepRendering = true;
+});
+
 await page.goto(url, { waitUntil: "load", timeout: 30000 });
 for (let i = 0; i < 40; i++) {
   const ready = await page.evaluate(() => {

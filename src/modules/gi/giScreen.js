@@ -38,6 +38,7 @@ import {
   atomicStore,
   cos,
   cross,
+  equirectUV,
   float,
   fract,
   instanceIndex,
@@ -996,7 +997,7 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
  * shipping graph is byte-identical to the pre-instrument one and this cannot
  * become a silent 4-multiply tax on every reflected pixel.
  */
-export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveWidth = width, resolveHeight = height, gather = null, cameraPosition = null, normalOffset, intensity, emitter = null, rawCopy = null, probes = null, sourceStride = 1, termMask = null, staticOcclude = null, dynOcclude = null, shadowReach = null }) {
+export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveWidth = width, resolveHeight = height, gather = null, cameraPosition = null, normalOffset, intensity, emitter = null, rawCopy = null, probes = null, sourceStride = 1, termMask = null, staticOcclude = null, dynOcclude = null, shadowReach = null, env = null }) {
   const dims = screenSizeUniforms(width, height, resolveWidth, resolveHeight);
   const widthU = dims.widthU;
   // ── §19 D3: THIS KERNEL'S WORLD NUMBERS ARE UNIFORMS, NOT WGSL LITERALS ───
@@ -1343,6 +1344,46 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
         // the encoding is invisible to every other consumer.
         If(hitTexel.x.lessThan(-1.5), () => {
           bvhValid.assign(-1);
+          // ── §19 STAGE 1.1 / J.6 R4: THE SKY IS EVALUATED HERE NOW ────────
+          //
+          // The environment lookup used to live in every lit material (24
+          // statements + a texture binding + a fetch, `giLight.js`'s "THE SKY
+          // IS PART OF THE MIRROR" block). It belongs here for the reason
+          // that block's own header gives: the ONE case where sampling the
+          // HDRI is occlusion-correct is a ray that ran the WHOLE static BVH
+          // and left the scene — and that proof is `hitTexel.x < -1.5`, a
+          // value only this kernel and the prepass can see. Writing the
+          // radiance into the marker pixel's rgb keeps the proof and the
+          // sample in the same place; the material now reads the answer.
+          //
+          // ⚠ THIS IS NOT AN UNOCCLUDED ENVIRONMENT SAMPLE — that is the
+          // §12.64 leak (per-material IBL running everywhere), and the guard
+          // against it is that this store is INSIDE the traced-miss branch
+          // and nowhere else. Every other pixel keeps its shaded hit (alpha
+          // 1) or its "never traced" zero (alpha 0), exactly as before.
+          //
+          // The alpha stays -1, so both downstream readers are unchanged: the
+          // material's exact-hit blend clamps it to 0, and the 12-tap
+          // prefilter's `step(0.5, tap.a)` still refuses to average a miss
+          // texel into a glossy mean (letting the sky into that mean is how a
+          // window rim turns into a bright fringe).
+          if (env && cameraPosition) {
+            const incidentE = P.sub(vec3(cameraPosition)).normalize();
+            const rE = reflect(incidentE, g1.xyz.normalize()).toVar();
+            // Match three's own environment orientation: rotate the lookup
+            // vector by the scene's environmentRotation (Y), then equirectUV
+            // (three's node, so the mapping convention cannot drift). Same
+            // three lines the material ran, same uniforms.
+            const rot = float(env.rotY);
+            const cr = cos(rot);
+            const sr = sin(rot);
+            const rd = vec3(
+              rE.x.mul(cr).add(rE.z.mul(sr)),
+              rE.y,
+              rE.z.mul(cr).sub(rE.x.mul(sr)),
+            );
+            bvhOut.assign(vec3(env.node.sample(equirectUV(rd)).rgb).mul(float(env.intensity)));
+          }
         });
       }
     });
