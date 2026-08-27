@@ -426,6 +426,13 @@ let giCurrentComputeNode = null;
 //     which is the yield-budgeted path this budget exists to defer work TO.
 const giBuiltNodes = new WeakSet();
 let giFrameBuildMs = 0;
+/**
+ * Identity for a BATCHED compute group (§19 Stage 1.3 / F4). three keys a
+ * pass's timestamp query pair on the group's `id`, which every ComputeNode has
+ * and an array does not — see the assignment site in `giCompute`. Starts high
+ * enough that it can never be confused with a node id in a log.
+ */
+let giBatchIds = 1_000_000;
 
 /** Called once per GI tick — see the budget note above. */
 function giResetFrameBuildBudget() {
@@ -448,10 +455,81 @@ function giCompileVariantKey(object) {
   return `${ids}|${attrs}|${skin}|${morph}`;
 }
 
+/**
+ * ⭐ §19 STAGE 1.3, F4 — ONE SUBMIT FOR A WHOLE CHAIN, ONCE ATTRIBUTION IS MOOT.
+ *
+ * `Renderer.compute` opens a command encoder, opens ONE compute pass, dispatches
+ * every node in the array into it, ends the pass and submits (WebGPUBackend
+ * `beginCompute` / `finishCompute`, r185). So a call with N nodes costs ONE
+ * `queue.submit()` and a call per node costs N — and this module dispatched
+ * per node ON PURPOSE, because a pipeline is created synchronously inside the
+ * first dispatch of its node and `giCurrentComputeNode` is what tells that
+ * pipeline which PASS it belongs to (§13.14.8 — five sessions of "which kernel
+ * is the slow one"). Measured on Bistro: **80 `renderer.compute` calls and 111
+ * `queue.submit()`s per frame**, ~44 of them the SRC probe chain alone.
+ *
+ * The attribution is only ever at stake on a node's FIRST dispatch, or while one
+ * of its pipelines is still compiling. `giBuiltNodes` records the first, and
+ * `giPendingByNode` the second — so when every node in the list is built and
+ * none is pending, nothing inside this call can create a pipeline and the array
+ * form is free. Anything else falls back to the loop, unchanged.
+ *
+ * ⚠ ORDER IS PRESERVED, and that matters because these chains are
+ * order-dependent. Dispatches inside one WebGPU compute pass execute in issue
+ * order with the implicit barriers the spec requires between them — the same
+ * guarantee three's own multi-stage examples rely on when they pass an array.
+ * A skipped node (its pipeline not ready) is still skipped INDIVIDUALLY by the
+ * backend guard in `installAsyncComputePipelines` and still registers in
+ * `giSkippedComputes`, because `giDispatchDepth` is held for the whole call.
+ *
+ * `__giBatchCompute = false` restores the per-node loop for an A/B.
+ */
 function giCompute(renderer, nodes, { deferrable = false } = {}) {
   giDispatchDepth++;
   try {
     const list = Array.isArray(nodes) ? nodes : [nodes];
+    if (list.length > 1 && globalThis.__giBatchCompute !== false) {
+      let batchable = true;
+      for (let i = 0; i < list.length; i++) {
+        const node = list[i];
+        // A falsy entry would make the array form throw where the loop simply
+        // skips it, so those take the loop too rather than being filtered into
+        // a fresh array on the hot path.
+        if (!node || !giBuiltNodes.has(node) || (giPendingByNode.get(node) ?? 0) > 0) {
+          batchable = false;
+          break;
+        }
+      }
+      if (batchable) {
+        // ⚠ THE GROUP NEEDS AN `id`, AND THAT IS A TIMESTAMP CORRECTNESS BUG,
+        // NOT A COSMETIC ONE. `Backend.updateTimeStampUID` builds the key for
+        // this pass's GPU timestamp pair as `<prefix>:<group.id>:f<frame>`, and
+        // an array has no `id` — so every batched group in a frame would hash to
+        // `…:undefined:f<n>`, `allocateQueriesForContext` would hand two passes
+        // the same query indices, and `profile.frameStats.gpuMs` (which runs
+        // with `trackTimestamp` ON in this engine — `gpuMsIsReal` is true on a
+        // normal frame) would silently read one pass's timing for another's.
+        // A monotonic id per array restores exactly what a ComputeNode gives it.
+        if (list.id === undefined) list.id = giBatchIds++;
+        // ⚠ A REAL NODE AS THE OWNER, NOT `null`, EVEN THOUGH THE GATE ABOVE
+        // SAYS NONE OF THEM CAN COMPILE. If three ever does create a pipeline
+        // inside here — a program cache key that moved under us, a disposed
+        // pipeline — the wrapper in `installAsyncComputePipelines` charges the
+        // compile to `giCurrentComputeNode`, and `null` means it is charged to
+        // NOBODY: `giNodesPending` then reports this chain ready while one of
+        // its kernels is still compiling, and the occupancy chain's guard exists
+        // precisely because half-executing that chain is itself the damage.
+        // Attributing to `list[0]` can misname a kernel in a log; attributing to
+        // nobody can dispatch half a chain. Only one of those is recoverable.
+        giCurrentComputeNode = list[0];
+        try {
+          renderer.compute(list);
+        } finally {
+          giCurrentComputeNode = null;
+        }
+        return;
+      }
+    }
     // One at a time, so the current-node tracker stays truthful for the
     // pipeline each dispatch creates. three accepts arrays, but an array
     // dispatch would leave every pipeline in it attributed to the ARRAY.
@@ -1132,16 +1210,50 @@ const emitterFitScratch = {
   exHalf: new THREE.Vector3(),
 };
 
+/**
+ * §19 STAGE 1.2 — EVERY GI UNIFORM A MATERIAL READS LIVES IN THE SHARED
+ * RENDER GROUP.
+ *
+ * `UniformNode.groupNode` defaults to `objectGroup`, and a non-shared group is
+ * CLONED PER RENDER OBJECT (NodeBuilderState.createBindings). A clone only
+ * re-uploads inside three's `NodeMaterialObserver.needsRefresh` branch, which
+ * for a plain PBR material is true exactly ONCE PER RENDER (the `renderId`
+ * bump) — so draw 1 of a material would see a moved lamp and draws 2..N would
+ * shade it at its compile-time pose. GI used to hide that by stamping
+ * `giMonitorNode` on every material, which forces `hasNode` and therefore a
+ * full per-object refresh EVERY frame: 237 us/draw over 453 draws on Bistro.
+ *
+ * `renderGroup` is SHARED — one buffer for the whole render, version-checked by
+ * `NodeManager.updateGroup` — so one refresh per render uploads it once and the
+ * other 452 draws read the same fresh values. That is what lets the marker go.
+ * Precedent in-tree: `_giNestedViewU`, `_giIrrPrevVPU`, the shadow checkers,
+ * and three's own `AnalyticLightNode` (`uniform(this.color).setGroup(renderGroup)`).
+ *
+ * ⚠ Use this for anything `GICascadeLightNode.setup` can reach. A GI uniform
+ * read only by a COMPUTE kernel does not need it (compute binds its own group),
+ * but nothing breaks if it has it.
+ *
+ * ⚠ PROVEN LOAD-BEARING, not assumed. Dropping the `.setGroup(renderGroup)`
+ * below (and giLight's `intensityUniform`) while keeping the marker deleted
+ * makes `npm run test:gi-moved-lamp` go RED: a 3 m lamp move left its specular
+ * glow behind at the old spot — the measured margin flips from +29.31 to
+ * -29.03 luminance, a swing of 0.02 where the shipping code swings 28.6. That
+ * is the A/B to re-run if this ever looks like dead ceremony.
+ */
+function giUniform(...args) {
+  return uniform(...args).setGroup(renderGroup);
+}
+
 function makeLightSlots() {
   return Array.from({ length: MAX_GI_LIGHTS }, () => ({
-    active: uniform(0),
-    kind: uniform(0),
-    vector: uniform(new THREE.Vector3()),
-    color: uniform(new THREE.Color(0, 0, 0)),
+    active: giUniform(0),
+    kind: giUniform(0),
+    vector: giUniform(new THREE.Vector3()),
+    color: giUniform(new THREE.Color(0, 0, 0)),
     // three PointLight `distance` cutoff (0 = infinite) — GI must die
     // where the renderer's own direct light does, or the mismatch reads
     // as light being "cut" at a circle.
-    range: uniform(0),
+    range: giUniform(0),
     // ── GI-TRACED DIRECT SHADOWS (LightComponent's `shadowMode: "gi"`) ──
     // `soft` = the light's own angular RADIUS in radians (a sun's authored
     // "Angle", halved by LightComponent). `srcRadius` = a point/spot source's
@@ -1154,13 +1266,13 @@ function makeLightSlots() {
     // angle. So a scene that never opts into gi shadows keeps byte-identical
     // field behaviour, and the feature can only change lights that asked for
     // it (see #updateLightUniforms and cascadeGather's per-slot k).
-    soft: uniform(0),
-    srcRadius: uniform(0),
+    soft: giUniform(0),
+    srcRadius: giUniform(0),
     // 1 only while the screen resolve should trace this slot's shadow cone:
     // the light asked for gi shadows AND the device/binding gate passed AND
     // the slot is live. A uniform rather than a build-time switch because
     // flipping a light's Shadow Source must not need a GI rebuild.
-    giShadow: uniform(0),
+    giShadow: giUniform(0),
   }));
 }
 
@@ -2895,13 +3007,35 @@ export class GISystem {
     mark("gi.lightTree");
     this.#refreshLightTree();
     mark("gi.atlasTransforms");
-    // Slot transforms track live matrices — dragging a mesh updates its
-    // uniforms here, which bumps the atlas revision and re-runs the
-    // composite below. That IS the whole cost of moving scene geometry.
-    state.atlas.refreshTransforms();
+    // ── §19 STAGE 1.3 — THE O(SLOTS) LOOPS, AND WHY THEY STILL RUN ──────────
+    //
+    // Three loops here re-read every slot's live `matrixWorld` and act on the
+    // ones that moved. The Stage 1.3 brief asked for them to be gated on the
+    // content key's `transforms` sub-version. They are NOT, and the reason is a
+    // measurement plus a postmortem:
+    //
+    //   · MEASURED on Bistro: `gi.atlasTransforms` 0.174 ms and
+    //     `gi.occupancyTransforms` 0.091 ms of a 22.8 ms CPU frame. Gating them
+    //     is worth a quarter of a millisecond.
+    //   · These loops ARE the engine's motion detector for GI geometry — an
+    //     epsilon compare against a cached matrix, which sees a move made by a
+    //     script, by physics or by an animation, none of which announce
+    //     anything (contentKey.js' banner). Gating them on a key those routes
+    //     do not bump would make the key's own weakest case its blind spot, and
+    //     `#refreshOccupancyTransforms` carries the postmortem for exactly that
+    //     failure: a skip that "only" missed static-mobility meshes left their
+    //     bounced light wrong for an arbitrary time and then teleported.
+    //
+    // So they keep running, and instead they FEED the key: `refreshTransforms`
+    // already returns "did anything move", so the two expensive O(scene) walks
+    // this stage removed (the g-buffer hold and ShadowFreeze) get a measured
+    // transform signal for free. One cheap loop replaces two costly ones —
+    // which is the unit's goal, arrived at from the other end.
+    const atlasMoved = state.atlas.refreshTransforms();
     // Same contract for the exact-reflection BVH scene (GI Phase 3 v1): a
     // moving mesh is a per-mesh uniform update, never a buffer rebuild.
     state.bvhScene?.refreshTransforms();
+    if (atlasMoved) this.engine?.content?.bump("transforms", "gi:slot-moved");
     // And for the occupancy pyramid: matrices only. Its triangle buffers and
     // work list are rotation/translation invariant by construction, so a drag
     // never touches them — see #buildOccupancyField.
@@ -5822,7 +5956,7 @@ export class GISystem {
       // The shadowNode's tap offsets are SHADOW-CHANNEL texels (its own
       // resolution since the pass split); runs on every build (and
       // #syncScreenResolveSize covers the resize path).
-      (this._giLightShadowTexel ??= uniform(new THREE.Vector2())).value.set(1 / shadowW, 1 / shadowH);
+      (this._giLightShadowTexel ??= giUniform(new THREE.Vector2())).value.set(1 / shadowW, 1 / shadowH);
       // The gbuffer POSITION feeds the shadowNode's tap validity (see
       // #acquireLightShadowNode). The gbuffer is per-build, so the persistent
       // node re-points here every time; a resize reuses the same render
@@ -5960,8 +6094,8 @@ export class GISystem {
           // The per-frame poll guards on _giEnvMissNode and writes ALL of
           // these — creating the node without its siblings would crash the
           // first tick after a build whose reflection block never ran.
-          this._giEnvMissIntensityU ??= uniform(0);
-          this._giEnvMissRotU ??= uniform(0);
+          this._giEnvMissIntensityU ??= giUniform(0);
+          this._giEnvMissRotU ??= giUniform(0);
           this._giSkyEnvIntensityU ??= uniform(0);
           srcProbes = createSrcProbeSystem({
             gbuffer, width, height, props: this.config, volume, sky: skyRadiance,
@@ -6907,8 +7041,8 @@ export class GISystem {
         return t;
       })();
       this._giEnvMissNode ??= texture(this._giEnvPlaceholder);
-      this._giEnvMissIntensityU ??= uniform(0);
-      this._giEnvMissRotU ??= uniform(0);
+      this._giEnvMissIntensityU ??= giUniform(0);
+      this._giEnvMissRotU ??= giUniform(0);
       light.giEnvMiss = {
         node: this._giEnvMissNode,
         intensity: this._giEnvMissIntensityU,
@@ -6934,7 +7068,7 @@ export class GISystem {
       // so NESTED renders (the planar reflector's mirrored pass) read each
       // point's OWN GI instead of stamping the main view's image across the
       // mirrored geometry (the "double reflection" ghost, 2026-08-22).
-      light.giViewProj = (this._giResolveVPU ??= uniform(new THREE.Matrix4()));
+      light.giViewProj = (this._giResolveVPU ??= giUniform(new THREE.Matrix4()));
       // Whether the CURRENT render is a nested view. renderGroup +
       // onRenderUpdate is the mechanism: re-evaluated per RENDER, so the
       // planar reflector flipping `globalThis.__giNestedRender` around its
@@ -6948,7 +7082,7 @@ export class GISystem {
       // The emitter pack is a SMALLER buffer (emitterShadowScale × shadow
       // size) — its bilateral taps need its own texel or they collapse onto
       // one texel and stop discriminating (see giLight's tap comment).
-      this._giEmitterShadowTexel ??= uniform(new THREE.Vector2());
+      this._giEmitterShadowTexel ??= giUniform(new THREE.Vector2());
       this._giEmitterShadowTexel.value.set(1 / emitterW, 1 / emitterH);
       light.giEmitterShadowTexel = this._giEmitterShadowTexel;
       if (srcProbes) {
@@ -7870,8 +8004,8 @@ export class GISystem {
         schedule: this._reflProbeSchedule,
         node: texture(atlas),
         slots: Array.from({ length: MAX_REFLECTION_PROBES }, () => ({
-          posFeather: uniform(new THREE.Vector4(0, 0, 0, 0.5)),
-          halfActive: uniform(new THREE.Vector4(0, 0, 0, 0)),
+          posFeather: giUniform(new THREE.Vector4(0, 0, 0, 0.5)),
+          halfActive: giUniform(new THREE.Vector4(0, 0, 0, 0)),
         })),
         scratch: createReflectionProbeScratch(),
         history: createReflectionProbeHistory(),
@@ -9762,9 +9896,9 @@ export class GISystem {
     const emitterSlots =
       props.emissiveShadows !== false
         ? Array.from({ length: MAX_EMITTERS }, () => ({
-            center: uniform(new THREE.Vector3()),
-            radius: uniform(0),
-            color: uniform(new THREE.Color(0, 0, 0)),
+            center: giUniform(new THREE.Vector3()),
+            radius: giUniform(0),
+            color: giUniform(new THREE.Color(0, 0, 0)),
             // Slot SHAPE (see giLight emitterSlotFactor): kind 0 = sphere,
             // 1 = oriented box, 2 = capsule, 3 = cylinder, 4 = frustum/cone,
             // 5 = disc/ring, 6 = torus (fitted per frame by
@@ -9775,20 +9909,20 @@ export class GISystem {
             // sphere — trace self-exclusion and the active gate. exHalf =
             // the conservative OBB the sphere-arm marchers exclude (a
             // torus's spans ring+tube; a disc's is its thin plate).
-            kind: uniform(0),
-            half: uniform(new THREE.Vector3(0.1, 0.1, 0.1)),
-            bx: uniform(new THREE.Vector3(1, 0, 0)),
-            by: uniform(new THREE.Vector3(0, 1, 0)),
-            bz: uniform(new THREE.Vector3(0, 0, 1)),
-            reff: uniform(0),
-            exHalf: uniform(new THREE.Vector3(0.1, 0.1, 0.1)),
+            kind: giUniform(0),
+            half: giUniform(new THREE.Vector3(0.1, 0.1, 0.1)),
+            bx: giUniform(new THREE.Vector3(1, 0, 0)),
+            by: giUniform(new THREE.Vector3(0, 1, 0)),
+            bz: giUniform(new THREE.Vector3(0, 0, 1)),
+            reff: giUniform(0),
+            exHalf: giUniform(new THREE.Vector3(0.1, 0.1, 0.1)),
             // 1 while this emitter is MOVING (translating or turning), decaying
             // over a few frames at rest. The feedback pass cuts its history
             // retain per cell by the moving emitters' share of that cell's
             // light — a moving lamp's pool follows it instead of trailing a
             // ~20-frame EMA wake, while statically-lit cells keep full
             // smoothing (see createBounceFeedback's emitter-motion cut).
-            moved: uniform(0),
+            moved: giUniform(0),
           }))
         : null;
     // ══ THE DIFFUSE TRANSPORT USED TO BE BUILT HERE ═══════════════════════════
@@ -10597,12 +10731,19 @@ export class GISystem {
    *
    * ## The conservative rule
    *
-   * Returns `null` — "re-render unconditionally" — the moment it sees geometry
-   * whose silhouette can change without its world matrix moving. Skinned meshes
-   * and morph targets deform in the vertex shader, so nothing this walk can read
-   * moves when the g-buffer should. A miss here is stale GI (wrong indirect
+   * Returns `null` — "re-render unconditionally" — whenever it cannot see the
+   * inputs that decide what gets drawn. A miss here is stale GI (wrong indirect
    * light on moved geometry), which is a visible artifact and not a crash, so
    * the rule is deliberately biased towards doing the work.
+   *
+   * ⚠ §19 STAGE 1.3 NARROWED WHAT "CANNOT SEE" MEANS. It used to include "a
+   * skinned or morphing mesh exists anywhere", because such a mesh deforms in
+   * the vertex shader and no world matrix moves when its silhouette does. That
+   * is true of the MATRIX and false of the mesh: `skeleton.bones` and
+   * `morphTargetInfluences` are the exact deformation inputs, and reading them
+   * (see #deformerDigest) answers "did it deform" instead of "could it". Only a
+   * deformer whose pose is genuinely unreadable — a SkinnedMesh with no skeleton
+   * bound yet — still returns `null`.
    *
    * ⚠ THE CAMERA IS PART OF THE KEY, unlike `fingerprintCasters`' content hash.
    * A g-buffer is view-dependent in a way a shadow map is not: every pixel holds
@@ -10626,7 +10767,6 @@ export class GISystem {
     const scene = this.engine?.scene;
     if (!scene || !camera) return null;
     let h = 0x811c9dc5;
-    let dynamic = false;
     const mix = (v) => {
       h = Math.imul(h ^ (v | 0), 0x01000193) >>> 0;
     };
@@ -10674,20 +10814,100 @@ export class GISystem {
     // long as the camera sits still. Texture ids are per-object and monotonic,
     // so a new target can never collide with the old one.
     mix(rt?.textures?.[0]?.id ?? -1);
+    // ── §19 STAGE 1.3 — THE SCENE HALF IS CACHED, THE DEFORMING HALF IS NOT ──
+    //
+    // The old body was ONE walk answering TWO questions with wildly different
+    // costs and cadences, and paying the expensive one's price for both:
+    //
+    //   RIGID   "did any drawn mesh move / appear / vanish?" — O(scene), 3 637
+    //           objects on Bistro at 0.20 ms, and it changes only when the
+    //           engine does something it already announces. Cached on
+    //           `engine.content` (see #gbufferSceneKey).
+    //   DEFORM  "did anything deform in the vertex shader?" — O(deformers ×
+    //           bones), one mesh on Bistro, and it can change on ANY frame with
+    //           no event at all. Walked every frame (see #deformerDigest).
+    //
+    // Splitting them is also what makes the hold reachable on this scene for
+    // the first time. The old rule bailed to `null` the moment it saw a skinned
+    // mesh anywhere, and Bistro contains exactly one — a visible character
+    // under `Bistro_Godot/Player`. So the hold could NEVER engage, and the
+    // prepass paid its full 6.45 ms every parked frame to redraw an identical
+    // g-buffer. The bail was never about the mesh EXISTING; it was about not
+    // being able to see its pose. The pose is right there: `skeleton.bones`.
+    const scenePart = this.#gbufferSceneKey(scene);
+    if (scenePart === null) return null;
+    mix(scenePart);
+    const deformPart = this.#deformerDigest();
+    if (deformPart === null) return null;
+    mix(deformPart);
+    return h;
+  }
+
+  /**
+   * The RIGID half of the g-buffer key — walked only when `engine.content` moves.
+   *
+   * ⚠⚠ THE CONTENT VERSION IS A CHANGE SIGNAL, NOT A PROOF OF NO CHANGE.
+   * `entity.position.x += 1` from a script reaches `Object3D` with no setter and
+   * no event (contentKey.js has the full argument), so this keeps an AUDIT: it
+   * re-walks every `AUDIT_FRAMES`th frame regardless, compares against the
+   * cached value, heals on the spot and shouts once naming the site. That bounds
+   * a missing producer to three frames of stale GI instead of "stale until
+   * something else in the scene happens", and it turns a silent lighting bug
+   * into a console line pointing at the producer set.
+   *
+   * With no content key at all (a fixture with no Engine) it degrades to the
+   * old behaviour — a walk every frame — because a cache with no invalidation
+   * source is worse than no cache.
+   */
+  #gbufferSceneKey(scene) {
+    const key = this.engine?.content;
+    const AUDIT_FRAMES = Number(globalThis.__giGbufferAuditFrames) || 4;
+    const frame = (this._gbufSceneFrame = (this._gbufSceneFrame ?? 0) + 1);
+    const fresh = !!key && this._gbufSceneValid === true && this._gbufSceneVersion === key.version;
+    if (fresh && frame % AUDIT_FRAMES !== 0) return this._gbufSceneValue;
+    const walked = this.#walkGbufferScene(scene);
+    if (fresh && walked !== this._gbufSceneValue) key.auditDisagreed("gi.gbufferScene");
+    this._gbufSceneValue = walked;
+    this._gbufSceneVersion = key?.version ?? 0;
+    this._gbufSceneValid = !!key;
+    return walked;
+  }
+
+  /**
+   * The walk itself. Also collects the deforming meshes, because the traversal
+   * that finds them is the one being paid for — and because a mesh cannot
+   * ACQUIRE a skeleton or morph targets without being rebuilt and re-added,
+   * which is a hierarchy edit and therefore a content bump. (`shadowFreeze.js`
+   * makes the same argument for `sceneHasDeformingCaster`, and learned the hard
+   * way that a ModelComponent swapping in a skinned GLB announces itself as
+   * `component-changed:mesh` — which does bump this key.)
+   */
+  #walkGbufferScene(scene) {
+    let h = 0x811c9dc5;
+    const mix = (v) => {
+      h = Math.imul(h ^ (v | 0), 0x01000193) >>> 0;
+    };
     const skipLayers = (1 << EDITOR_LAYER) | (1 << UI_LAYER) | (1 << DEBUG_LAYER) | (1 << SHADOW_PROXY_LAYER);
+    const deformers = [];
     scene.traverse((object) => {
-      if (dynamic || !object.isMesh) return;
-      if (object.isSkinnedMesh || object.morphTargetInfluences?.length) {
-        dynamic = true;
-        return;
-      }
-      // Not drawn into the g-buffer ⇒ not part of its identity.
+      if (!object.isMesh) return;
+      // Not drawn into the g-buffer ⇒ not part of its identity. ⚠ THIS NOW
+      // APPLIES TO DEFORMERS TOO, and that is a correctness fix rather than a
+      // relaxation: the old order tested "is it skinned" BEFORE the layer skip
+      // and before `visible`, so an editor-only or hidden character disabled the
+      // hold for the whole session over geometry the prepass never draws.
       if ((object.layers.mask & skipLayers) !== 0) return;
+      // Collected BEFORE the visibility early-out: the digest re-reads `visible`
+      // itself every frame, so a mesh hidden directly (not through its entity,
+      // which is the only path the content key observes) cannot fall out of the
+      // deformer list and take its pose with it.
+      if (object.isSkinnedMesh || object.morphTargetInfluences?.length) deformers.push(object);
       mix(object.visible === false ? 1 : 2);
       if (object.visible === false) return;
       mix(object.id);
       mix(object.geometry?.id ?? -1);
-      mixMatrix(object.matrixWorld);
+      const e = object.matrixWorld.elements;
+      for (let i = 0; i < 16; i++) mix(Math.round(e[i] * 1e4));
       // Per-instance transforms live in a buffer this walk cannot see, but three
       // bumps `instanceMatrix.version` on every upload — the "did the silhouette
       // move" signal for two integers instead of a walk over N matrices.
@@ -10696,7 +10916,71 @@ export class GISystem {
         mix(object.instanceMatrix?.version ?? -1);
       }
     });
-    return dynamic ? null : h;
+    this._gbufferDeformers = deformers;
+    return h;
+  }
+
+  /**
+   * ⭐ THE POSE OF EVERY DEFORMING MESH, instead of "a deformer exists, give up".
+   *
+   * A skinned mesh's silhouette is a function of its BONES, and the bones are
+   * ordinary Object3Ds this can read. Hashing them answers the real question
+   * ("did it deform?") where the old bail answered a proxy for it ("could it
+   * deform?") — and on any scene with a character present but not animating,
+   * those two answers differ by the entire prepass.
+   *
+   * ⚠ LOCAL TRS, NOT `bone.matrixWorld`. `matrixWorld` is recomputed inside
+   * `renderer.render`, so at preRender time it still holds the PREVIOUS frame's
+   * pose, while an AnimationMixer writes `position`/`quaternion`/`scale`
+   * directly during the scripts phase and is therefore already this frame's.
+   * Same reasoning as the camera pair above: read the input the writer touches,
+   * not the derived value the renderer refreshes. (The mesh's own
+   * `matrixWorld` IS mixed in, one matrix, so root motion under a parent this
+   * walk never visits still releases the hold — one frame late at worst.)
+   *
+   * Returns `null` — never hold — for a deformer whose pose is unreadable: a
+   * SkinnedMesh with no skeleton bound yet. That is the old conservative rule,
+   * kept exactly where it is actually justified.
+   *
+   * `__giDeformerDigest = false` restores the blanket bail for an A/B.
+   */
+  #deformerDigest() {
+    const list = this._gbufferDeformers;
+    if (!list || list.length === 0) return 0;
+    if (globalThis.__giDeformerDigest === false) return null;
+    let h = 0x9e3779b9;
+    const mix = (v) => {
+      h = Math.imul(h ^ (v | 0), 0x01000193) >>> 0;
+    };
+    for (let i = 0; i < list.length; i++) {
+      const mesh = list[i];
+      if (mesh.visible === false) {
+        mix(1);
+        continue;
+      }
+      mix(2);
+      const e = mesh.matrixWorld.elements;
+      for (let m = 0; m < 16; m++) mix(Math.round(e[m] * 1e4));
+      const influences = mesh.morphTargetInfluences;
+      if (influences) {
+        for (let m = 0; m < influences.length; m++) mix(Math.round(influences[m] * 1e4));
+      }
+      if (mesh.isSkinnedMesh) {
+        const bones = mesh.skeleton?.bones;
+        if (!bones) return null;
+        for (let b = 0; b < bones.length; b++) {
+          const bone = bones[b];
+          const p = bone.position;
+          const q = bone.quaternion;
+          const s = bone.scale;
+          mix(Math.round(p.x * 1e4)); mix(Math.round(p.y * 1e4)); mix(Math.round(p.z * 1e4));
+          mix(Math.round(q.x * 1e4)); mix(Math.round(q.y * 1e4));
+          mix(Math.round(q.z * 1e4)); mix(Math.round(q.w * 1e4));
+          mix(Math.round(s.x * 1e4)); mix(Math.round(s.y * 1e4)); mix(Math.round(s.z * 1e4));
+        }
+      }
+    }
+    return h;
   }
 
   #fieldInputHash() {
@@ -11586,7 +11870,7 @@ export class GISystem {
     // sub-texel-thin banner edge — falls back to the MIN of the taps, dark
     // by policy. The position texture is NearestFilter, so tap validity is
     // per-texel exact, never interpolated across the very edges it guards.
-    const texel = (this._giLightShadowTexel ??= uniform(new THREE.Vector2(1 / 512, 1 / 512)));
+    const texel = (this._giLightShadowTexel ??= giUniform(new THREE.Vector2(1 / 512, 1 / 512)));
     // RESOLVE-CAMERA PROJECTION, NOT screenUV (2026-08-22, "shadows in the
     // mirror look very weird"): this branch compiles into every lit
     // material, and a planar reflector re-renders those materials from the
@@ -11600,7 +11884,7 @@ export class GISystem {
     // to screenUV in the main render and correct per WORLD POINT in nested
     // ones: main-view-visible points get their true shadow, everything else
     // rejects to the documented dark policy — stable, never a stamp.
-    const shadowVpU = (this._giResolveVPU ??= uniform(new THREE.Matrix4()));
+    const shadowVpU = (this._giResolveVPU ??= giUniform(new THREE.Matrix4()));
     const shadowUV = (() => {
       const clip = vec4(shadowVpU.mul(vec4(positionWorld, 1)));
       const w = clip.w.max(1e-4);
@@ -13946,33 +14230,44 @@ export class GISystem {
   }
 
   /**
-   * Marks a material so three's NodeMaterialObserver treats it as
-   * node-driven (`hasNode` true → uniforms refreshed EVERY frame).
-   * Without this, plain materials only refresh their uniform buffers when
-   * something the observer monitors changes (own matrix, material props,
-   * known light data) — our GI uniforms (emitter centers/colors, intensity,
-   * light slots) are invisible to it, so on a STATIC receiver they freeze
-   * at compile-time values: a moved lamp kept lighting its old position
-   * (harness-proven: move ≈ no image change, rebuild at the same spot ≈
-   * 95k-pixel change). The marker is an inert extra property — builders
-   * ignore unknown props; `containsNode` only checks `.isNode`.
+   * Installs GI's ROUGHNESS-BUCKET CACHE KEY on a material. Nothing else.
+   *
+   * ══ WHAT USED TO BE HERE, AND WHY IT IS GONE (§19 Stage 1.2) ═════════════
+   *
+   * This method also hung an inert `material.giMonitorNode = float(0)` on
+   * every lit material, purely so three's `NodeMaterialObserver.containsNode`
+   * would see an own property with `.isNode` and set `hasNode = true`.
+   * `needsRefresh` returns true immediately on `hasNode`, so `Renderer.
+   * _renderObjectDirect` re-ran `updateBefore` + `geometries/nodes/bindings.
+   * updateForRender` for EVERY object EVERY frame: measured 237 us/draw over
+   * 453 draws on Bistro, the single largest line in `profile.cpuFrame`.
+   *
+   * It bought one real thing: GI's uniforms reaching a static receiver. They
+   * default to `objectGroup`, which is CLONED PER RENDER OBJECT, and a clone
+   * only re-uploads inside that same `needsRefresh` branch — so without the
+   * marker a moved lamp kept lighting its old position on every draw but the
+   * first of each material.
+   *
+   * The fix is a group move, not a marker: every GI uniform a material reads
+   * is now created through `giUniform` (see its comment) in the SHARED
+   * `renderGroup`, which is uploaded once per render and version-checked. The
+   * observer's `renderId` bump still grants one refresh per render per
+   * material, and for a shared group one is exactly enough — so the per-object
+   * refresh, and the marker that forced it, are both dead weight. The
+   * `needsUpdate = true` that used to follow the marker (one full recompile of
+   * every material at boot) went with it.
+   *
+   * The lamp is now guarded by a test rather than by a comment:
+   * `npm run test:gi-moved-lamp` (audits §J.6 R5 — it had none).
    */
   #markObservedMaterial(material) {
-    if (!material || material.giMonitorNode?.isNode) return;
-    // ONE SHARED marker instance for every material (§13.15.2). The observer
-    // only needs SOME own property with `.isNode`; but `customProgramCacheKey`
-    // walks own node properties and hashes each node's IDENTITY
-    // (Node.customCacheKey() → this.id), so a fresh `float(0)` per material
-    // put a unique id into every key and silently defeated the sharing this
-    // very override promises below — the entire material compile wave stayed
-    // one codegen per material (26× for Sponza) even after the stock-PBR
-    // expression removed the per-material graph nodes. A shared instance
-    // contributes the SAME id to every key, so same-bucket materials collide
-    // and share one build, which is the documented intent.
-    // A/B hatch (R12): __noSharedGiMarker restores the per-material marker.
-    material.giMonitorNode = globalThis.__noSharedGiMarker
-      ? float(0)
-      : (GISystem._giMonitorMarker ??= float(0));
+    // EXPLICIT SENTINEL, not "is the marker there?" (audits §J.4). The guard
+    // used to read `material.giMonitorNode?.isNode`; with the marker gone the
+    // idempotence has to be stated, or `#collectMeshes` re-wraps
+    // `customProgramCacheKey` on EVERY scan — a closure chain that grows
+    // without bound and a key that drifts as it grows.
+    if (!material || material.__giKeyPatched === true) return;
+    material.__giKeyPatched = true;
     // CACHE-KEY OVERRIDE: three's material cache key reduces numeric
     // properties to on/off, so same-structure materials with different
     // static roughness hash IDENTICALLY — and since the GI light node
@@ -13983,8 +14278,12 @@ export class GISystem {
     // still letting same-bucket materials share one build.
     const original = material.customProgramCacheKey.bind(material);
     material.customProgramCacheKey = () => original() + "|gi" + giRoughnessBucketOf(material);
-    // Recompile so the observer is rebuilt with hasNode = true.
-    material.needsUpdate = true;
+    // ⚠ NO `material.needsUpdate = true` HERE (§19 Stage 1.2, audits J.6 R1).
+    // It existed only to rebuild the observer with `hasNode = true`, and it
+    // recompiled EVERY material in the scene at boot. The key must still be
+    // installed BEFORE first compile or same-bucket variants collide (the
+    // mirror bug named above) — that is why the call site is `#collectMeshes`'
+    // scan, which runs ahead of the compile wave, and not a lazy hook.
   }
 
   #collectLightObjects() {
@@ -14017,6 +14316,30 @@ export class GISystem {
     const nowMs = performance.now();
     if (nowMs - (this._lastScanAt ?? 0) < FINGERPRINT_MIN_INTERVAL_MS) return;
     this._lastScanAt = nowMs;
+    // ── §19 STAGE 1.3 — THE THIRD FULL-SCENE WALK, ON THE ENGINE'S KEY ───────
+    //
+    // `#collectMeshes` is the heaviest of the three: a hand-recursed walk that
+    // also marks every material observed, refreshes its mirror bucket, re-tiers
+    // it and rewrites four layer bits. The 250 ms floor above collapses a drag's
+    // event burst, but on a scene where nothing at all is happening it still ran
+    // four times a second forever to re-derive an unchanged answer.
+    //
+    // The key covers everything this scan reads: a mesh added or removed is a
+    // hierarchy edit, a material assignment and an in-place `.mat` edit both
+    // bump `materials` (materialAsset.js), visibility is written in one place in
+    // `Engine#tick`, and geometry swaps arrive as component changes.
+    //
+    // ⚠ AND IT IS STILL AUDITED. `#computeFingerprint` hashes each material's
+    // RESOLVED albedo/emissive, which a shader-graph node can change without any
+    // route this key watches, so a scan runs on a slow wall-clock cadence
+    // whatever the key says. The audit compares and shouts, so a missing
+    // producer surfaces as a named console line instead of as "GI stopped
+    // noticing my colour edits". `__giScanAuditMs` tunes it; 0 disables the
+    // key gate entirely and restores the 250 ms scan.
+    const contentKey = this.engine?.content;
+    const auditMs = Number(globalThis.__giScanAuditMs ?? 2000);
+    const auditDue = !(auditMs > 0) || nowMs - (this._lastScanAuditAt ?? 0) >= auditMs;
+    const scanFresh = !!contentKey && this._scanContentVersion === contentKey.version && !auditDue;
 
     // A material became a mirror while reflections were gated off for want of
     // one (`#hasReflectionConsumer`). Rebuild so the prepass exists — this is
@@ -14115,6 +14438,24 @@ export class GISystem {
       }
     }
 
+    // ── THE GATE ────────────────────────────────────────────────────────────
+    // Placed AFTER the auto-fit watcher (which runs on its own 3-10 s clock and
+    // owns its own cadence) and immediately before the walk it protects.
+    //
+    // ⚠ NOT in front of the emitter seat re-rank below when seats actually
+    // follow the camera: that ranking is a function of the CAMERA, which this
+    // key deliberately does not track (a camera term here would make the key
+    // move every frame of every orbit and buy nothing). On the shipping global
+    // delivery model `#emitterSeatsFollowCamera()` is false, so the scan is
+    // skipped outright; on the camera-ranked arm it still runs every 250 ms,
+    // exactly as before.
+    if (scanFresh && !this.#emitterSeatsFollowCamera()) return;
+    // Snapshotted BEFORE the walk: `#syncSlots` / `#refreshOccupancyContent`
+    // below can themselves bump the key, and recording the post-walk value
+    // would mark this scan as having covered a change it never saw.
+    const scannedVersion = contentKey?.version ?? 0;
+    this._lastScanAuditAt = nowMs;
+
     const meshes = this.#collectMeshes();
     // Refresh the light LIST here (cadence); uniforms read live per frame.
     this._lightObjects = this.#collectLightObjects();
@@ -14145,6 +14486,16 @@ export class GISystem {
     }
     const fingerprint = this.#computeFingerprint(meshes);
     const contentChanged = fingerprint !== this._fingerprint;
+    // ── THE AUDIT (see the gate's banner) ───────────────────────────────────
+    // The scan just ran on the slow wall-clock cadence and found a change the
+    // content key had not announced. Shout once with the site name, and bump —
+    // so every OTHER consumer of the key (the g-buffer hold, ShadowFreeze) also
+    // gives up whatever it was holding on the strength of the same claim.
+    if (contentChanged && contentKey && this._scanContentVersion === scannedVersion &&
+        this._fingerprint !== undefined) {
+      contentKey.auditDisagreed("gi.meshScan");
+    }
+    this._scanContentVersion = scannedVersion;
     if (!contentChanged && !seatsChanged) return;
     this._fingerprint = fingerprint;
     // Mesh set / material / geometry change: rebuild the entry list and

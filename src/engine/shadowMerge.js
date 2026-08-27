@@ -174,6 +174,11 @@ const SKIP_LAYERS =
  */
 export function applyCastShadow(mesh, value, engine) {
   if (!mesh) return;
+  // A caster appearing in or leaving a shadow map is a content change for
+  // ShadowFreeze (which keys on the caster set) and for GI's depth proxies.
+  // Bumped unconditionally — this is an authoring path, not a per-frame one,
+  // and the `owned` branch below returns early on the common case.
+  engine?.content?.bump("visibility", "applyCastShadow");
   const owned = !!mesh.userData.shadowMergedInto;
   if (owned) {
     // Remember what the author wants; #teardown replays it.
@@ -324,6 +329,15 @@ export class ShadowMergeSystem {
     this._reason = reason;
     this._dirtiedAt = performance.now();
     if (this._dirtySince === 0) this._dirtySince = this._dirtiedAt;
+    // The proxies this system swaps in and out ARE the geometry GI's g-buffer
+    // prepass draws (GI_DEPTH_LAYER), so a swap changes what that pass would
+    // produce even though no entity moved. And `#watchForMotion` reaches here
+    // with "caster-moved"/"caster-geometry-swapped" — a MEASURED producer for
+    // anything that writes Object3D directly. See contentKey.js.
+    this.engine?.content?.bump(
+      reason === "caster-moved" ? "transforms" : "hierarchy",
+      `shadowMerge:${reason}`,
+    );
   }
 
   /**

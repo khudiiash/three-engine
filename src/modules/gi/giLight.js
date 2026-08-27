@@ -29,6 +29,7 @@ import {
   normalWorld,
   positionWorld,
   reflect,
+  renderGroup,
   screenUV,
   select,
   sin,
@@ -1822,7 +1823,15 @@ export class GICascadeLight extends THREE.Light {
     // hits shade from the indirect field alone.
     this.hitLighting = true;
     // Live-tunable without recompiles.
-    this.intensityUniform = uniform(1);
+    //
+    // §19 Stage 1.2 — SHARED GROUP. This uniform is read by every lit
+    // material's `GICascadeLightNode.setup` (the roughness collapse and the
+    // non-deferred gather), and `UniformNode`'s default `objectGroup` is
+    // CLONED PER RENDER OBJECT. Once `giMonitorNode` stopped forcing a
+    // per-object refresh every frame, an object-group clone would have frozen
+    // at its compile-time value on every draw but the first of each material.
+    // See GISystem's `giUniform` for the full argument and its A/B receipt.
+    this.intensityUniform = uniform(1).setGroup(renderGroup);
     this.normalOffset = 0.35;
   }
 }

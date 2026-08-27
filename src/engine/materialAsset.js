@@ -8,6 +8,7 @@ import { migrateLegacyGraph } from "./shaderGraph.js";
 
 import { compileShaderGraph, invalidateShaderTextureCache, loadShaderTexture, matchStockPbr, migrateGraph } from "./tslGraph.js";
 import { loadTextureAsset } from "./textureAsset.js";
+import { bumpSceneContent } from "./contentKey.js";
 
 
 export const MATERIAL_PIPELINE_DEFAULTS = {
@@ -515,6 +516,15 @@ function applyStockPbr(entry, material, stock, generation) {
 
 export function applyMaterialDef(entry, def) {
 
+  // ⭐ THE ONE PLACE AN IN-PLACE MATERIAL EDIT LANDS. This file's own header
+  // says in-place edits "need no notification" — true for the renderer, which
+  // re-reads the mutated instance every draw, and false for anything holding a
+  // FINGERPRINT of what will be drawn. GI's mesh scan hashes each material's
+  // resolved albedo and emissive; the shadow merge's depth key reads alphaMap
+  // and displacement. Both are caches, and both are now gated on the engine
+  // content key. See contentKey.js.
+  bumpSceneContent("materials", "materialAsset:applyMaterialDef");
+
   // If the new def switches the material kind (surface ↔ volume), swap the
 
   // underlying instance so the new type's slots are clean.
@@ -804,6 +814,7 @@ export function updateMaterialAsset(path, def) {
 export function updateMaterialPipeline(path, pipeline) {
   const entry = cache.get(assetKey(path));
   if (!entry) return;
+  bumpSceneContent("materials", "materialAsset:pipeline");
   entry.def = { ...entry.def, pipeline: { ...pipeline } };
   applyMaterialPipeline(entry.material, pipeline);
   notifyMaterial(path);

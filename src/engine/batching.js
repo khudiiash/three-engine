@@ -220,6 +220,12 @@ export class BatchSystem {
     }
     if (!moved) return;
     mesh.instanceMatrix.needsUpdate = true;
+    // ⭐ ANOTHER MEASURED PRODUCER for the engine content key (contentKey.js):
+    // this comparison already proved a member's world matrix changed, by
+    // whatever route wrote it. GI's g-buffer hold and ShadowFreeze both key on
+    // `instanceMatrix.version`, which is what `needsUpdate` bumps — but they
+    // only read it when they walk, and the key is what tells them to.
+    this.engine?.content?.bump("transforms", "batching:instance-moved");
     // The batch is culled as one object, so its bound has to follow its members.
     mesh.computeBoundingSphere();
   }

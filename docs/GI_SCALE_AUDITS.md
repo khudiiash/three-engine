@@ -772,3 +772,119 @@ is `Map<wgsl, ProgrammableStage>`, and per object it is
   with the `.setGroup(renderGroup)` calls reverted — the group move must be
   provably load-bearing, not merely present.
 * Battery: `smoke:gi-gpu`, `test:gi-lighttree-mover`, `run-gi-move-cost.mjs`.
+
+---
+
+## K. STAGE 2 DESIGN — THE WINDOW (written 08-27 by the architect; Stage 2.1 builds exactly this)
+
+Everything here is a TIER CONSTANT (levels, 64³, brick 4³, pool sizes) so every
+kernel's WGSL is scene-independent and cache-stable. Scene numbers live in
+uniforms (origins, counts) or in buffer CONTENTS. No `__gi*` flags.
+
+### K.1 Levels and addressing
+- `L` levels of `N = 64` cells per axis; voxel size `v_l = v0 · 2^l`
+  (desktop high 4 levels v0 0.25 m → 16/32/64/128 m windows; ultra 5 levels
+  adds 256 m; phone/medium 3 levels v0 0.5 m → 32/64/128 m).
+- World cell of point p at level l: `wc = floor(p / v_l)` (i32x3). Window
+  origin per level `o_l` (i32x3, uniform), snapped to a BRICK (4-cell)
+  boundary and recentred on the camera only when the camera leaves the
+  central half of the window (hysteresis — no thrash on small moves).
+- **Toroidal address** (no data ever moves): `idx = (wc.x & 63) | (wc.y & 63)
+  << 6 | (wc.z & 63) << 12`. In-window test: `all(wc - o_l >= 0 && < 64)`.
+  A brick's identity = its world brick coord `wb = wc >> 2`; the brick table
+  stores `wb` so a slot holding a STALE brick (from before the scroll) is
+  detected by `stored_wb != wb` and treated as EMPTY-DIRTY.
+
+### K.2 Per-level storage (one storage buffer for the whole window, offsets are tier constants)
+| region | per level | contents |
+|---|---|---|
+| `occ` | 64³ bits = 8192 u32 = 32 KB | occupancy bit, DDA fast path |
+| `face` | 64³ bytes = 65536 u32 = 256 KB | bit0-5 = triangle crosses face +X −X +Y −Y +Z −Z; bit6 two-sided/foliage; bit7 = dynamic-layer mirror (see K.5) |
+| `pal` | 64³ bytes = 256 KB | palette index (albedo+emissive class from `resolveMaterialSurface`; 255 = none) |
+| `brickMask` | 16³ bits = 128 u32 | brick has ≥ 1 occupied voxel — the DDA's level-1 skip |
+| `brickTab` | 16³ × 2 u32 = 32 KB | `wb` (packed i32x3, 10 bits each) + state (EMPTY / DIRTY / BUILT / cache slot id) |
+| **total** | **~580 KB** | ×5 levels = 2.9 MB desktop, ×3 = 1.7 MB phone |
+Face bits mip: NONE — each level voxelizes from triangles independently (as
+Brixelizer/SmartGI), so a thin wall is 6-separating at every level by
+construction. `occ` at level l+1 is NOT derived from level l.
+
+### K.3 Voxelizer (the existing 13-axis SAT, re-scoped)
+- Triangle source: ONE packed GPU soup built in a Web Worker from
+  `serializeMeshForBake` output — fp32 world positions (36 B/tri) + 1 B palette
+  index, plus a COARSE GRID (cell 4 m, `gridDim` uniform) of triangle-index
+  ranges (counting sort in the worker). Bistro 3 M tris ≈ 120 MB (desktop
+  only; phone tiers cap the soup at 1 M tris and fall back to per-mesh boxes
+  above it — logged). Uploaded once per scene; per-cell upload is a Stage 4
+  refinement if phones need it.
+- Work unit = (brick, triangle) PAIR: a `binPairs` kernel walks the DIRTY
+  bricks (from a GPU list, k bricks per frame, sorted frustum-first then by
+  distance), gathers the grid cells overlapping each brick, AABB-rejects
+  triangles, and appends surviving pairs to a bounded pair list (atomic
+  counter; cap = tier constant, overflow = brick stays DIRTY for next frame).
+  The `voxelize` kernel runs one thread per pair: SAT over the triangle's
+  voxel span inside the brick, `atomicOr` occ bit, face bits from the
+  triangle plane's sign against each face plane it crosses, palette via
+  `atomicMax` (deterministic winner). Then `finishBricks` ORs `occ` into
+  `brickMask`, marks BUILT, allocates a cache slot (K.6) if any voxel set.
+- Budget is PAIRS per frame (fixed cost), not bricks: `PAIRS_PER_FRAME` by
+  tier (phone 32k, desktop 256k). Coarse levels first at boot (L3 has 64×
+  fewer bricks per metre — the whole window has occupancy within frames);
+  L0 refines behind it. Receipt counters: bricks dirty/built/overflowed,
+  pairs/frame, ms.
+
+### K.4 Trace (`traceWindow(o, d, tMax) → {t, face, level, voxelIdx}`)
+Two-level DDA per level: step BRICKS (16 per axis) on `brickMask` (a brick
+with mask 0 is skipped in one step); inside an occupied brick, step voxels
+on `occ`; on an occupied voxel test the ENTRY FACE bit — if set, hit; if the
+entry face bit is clear (a triangle crosses the voxel but not this face) the
+ray continues (this is the 6-separating guarantee: a 5 cm wall sets exactly
+the faces it crosses, so it blocks face-stepping paths and never the ones it
+does not cross). Level hand-off: start at the finest level whose window
+contains `o` (usually L0); when the ray exits that window, continue at l+1
+from the exit point (`t` carried). Bias: ray origin pushed `0.5 · v_0` along
+the geometric normal (screen-probe origins are ON surfaces). The dynamic
+layer (K.5) is OR'd into both `occ` and the face test at L0/L1. No workgroup
+memory, ONE storage buffer + uniforms = ≤ 3 bindings.
+
+### K.5 Dynamic layer
+Movers (the `dynamicObjects` adoption set) and skinned proxy boxes are
+voxelized EVERY FRAME into a second `occ`+`face`+`pal` set for L0 and L1
+only (2 × 544 KB), cleared per frame, from their own (small) triangle lists
+via the same pair kernel with a separate budget (`DYN_PAIRS_PER_FRAME`). A
+mover's brick in the static layer is NOT touched (its static bits stay; a
+mover that stops is re-adopted as static by the existing quiet-frames rule,
+which then marks its bricks DIRTY once).
+
+### K.6 Radiance cache (the world's memory of light)
+- Pool of brick slots, `CACHE_BRICKS` by tier (phone 8k, desktop 32k), each
+  slot = 4³ voxels × 6 face directions × R11G11B10 = 64 × 24 B = 1536 B
+  (phone 12 MB, desktop 48 MB). Allocated at `finishBricks`, freed when a
+  brick is evicted by scroll (the slot id lives in `brickTab`).
+- Written by (a) the screen-probe rays' hit shading (K.7) — every hit
+  computes `L_out(face) = pal.albedo × (sun × DDAshadow + NEE(lightTree) +
+  cached irradiance from the hit brick's own SH-of-neighbours) + pal.emissive`
+  and EMA-writes it into the hit voxel's face slot; and (b) `injectLitFrame`:
+  1/16 of screen pixels per frame write their final lit radiance into their
+  voxel's face slot (exact shading for what is visible). Read by every ray
+  hit as the radiance it returns (cheap path) — so bounce colour is available
+  off-screen as soon as ANY ray has shaded that voxel, and multibounce comes
+  free from the EMA.
+- Relight queue: `RELIGHT_BRICKS_PER_FRAME` bricks (most recently hit, then
+  nearest) re-shade all 64×6 faces per frame so a moved lamp updates the
+  cache in bounded latency (Lumen's "fixed cost, variable latency").
+
+### K.7 Kernel list (fixed; ~12 GI2 kernels + GTAO 3 + mirror tier)
+`scroll` (per level, per brick) · `binPairs` · `voxelize` · `finishBricks` ·
+`dynVoxelize` · `probePlace` (per 8×8 tile: pick the surface, jitter) ·
+`probeTrace` (N rays/probe, HZB first segment → `traceWindow`, hit shade →
+cache write + oct map accumulate) · `probeFilter` (3×3 probe space) ·
+`resolve` (per pixel: 4 probes × plane+normal weights → irradiance, glossy)
+· `injectLitFrame` · `relightBricks` · `cacheEvict`. Every dispatch count is
+a uniform or a tier constant; every WGSL is scene-independent.
+
+### K.8 Budgets (from PLAN §4.6) and receipts
+`profile.gi2`: window MB, bricks resident/dirty/built/overflow per level,
+pairs/frame + ms, cache slots used, probes traced, rays, hits/misses, cache
+hit ratio, time-to-first-occupancy per level, time-to-first-light. Gates in
+PLAN Stage 2 rows. First receipt to produce: `probe:gi2-trace` rays/s at 3
+tiers (K.4 alone, synthetic scene) — every ray budget bends to it.

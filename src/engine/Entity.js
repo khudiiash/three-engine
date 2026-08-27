@@ -173,6 +173,15 @@ export class Entity extends EventEmitter {
     this.object3D.name = value;
   }
 
+  /**
+   * ⚠ THE LIVE VECTOR, SO `entity.position.x += 1` BYPASSES THE SETTER BELOW
+   * AND ITS CONTENT-KEY BUMP. That is deliberate (a proxied Vector3 on the
+   * script hot path would cost more than the walks the key removes), and it is
+   * why every consumer of `engine.content` keeps a periodic audit — see
+   * contentKey.js. Code that writes through this getter in a way GI or
+   * ShadowFreeze must see within the frame should call
+   * `engine.content.bump("transforms", …)` itself.
+   */
   get position() {
     return this.object3D.position;
   }
@@ -182,6 +191,7 @@ export class Entity extends EventEmitter {
     // and from serialized transforms.
     if (Array.isArray(value)) this.object3D.position.fromArray(value);
     else this.object3D.position.copy(value);
+    /** @type {any} */ (this.engine)?.content?.bump("transforms", "entity.position");
   }
 
   get rotation() {
@@ -191,6 +201,7 @@ export class Entity extends EventEmitter {
   set rotation(value) {
     if (Array.isArray(value)) this.object3D.rotation.set(value[0], value[1], value[2]);
     else this.object3D.rotation.copy(value);
+    /** @type {any} */ (this.engine)?.content?.bump("transforms", "entity.rotation");
   }
 
   get quaternion() {
@@ -199,6 +210,7 @@ export class Entity extends EventEmitter {
 
   set quaternion(value) {
     this.object3D.quaternion.copy(value);
+    /** @type {any} */ (this.engine)?.content?.bump("transforms", "entity.quaternion");
   }
 
   get scale() {
@@ -208,6 +220,7 @@ export class Entity extends EventEmitter {
   set scale(value) {
     if (Array.isArray(value)) this.object3D.scale.fromArray(value);
     else this.object3D.scale.copy(value);
+    /** @type {any} */ (this.engine)?.content?.bump("transforms", "entity.scale");
   }
 
   get visible() {
@@ -216,6 +229,7 @@ export class Entity extends EventEmitter {
 
   set visible(value) {
     this.object3D.visible = value;
+    /** @type {any} */ (this.engine)?.content?.bump("visibility", "entity.visible");
   }
 
   get up() {
@@ -473,6 +487,7 @@ export class Entity extends EventEmitter {
     if (position) this.object3D.position.fromArray(position);
     if (rotation) this.object3D.rotation.set(rotation[0], rotation[1], rotation[2]);
     if (scale) this.object3D.scale.fromArray(scale);
+    /** @type {any} */ (this.engine)?.content?.bump("transforms", "entity.setTransform");
   }
 
   dispose() {

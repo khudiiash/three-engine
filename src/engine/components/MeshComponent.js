@@ -308,6 +308,12 @@ export class MeshComponent extends Component {
     // material so Material 1 covers the entire primitive instead of only group
     // 0. Once a second slot is used, preserve all slots for authored geometry.
     this.mesh.material = hasExtraMaterial && this.mesh.geometry?.groups?.length ? materials : materials[0];
+    // A material assignment changes what GI's mesh scan fingerprints (albedo
+    // and emissive are hashed through `resolveMaterialSurface`) and can change
+    // a caster's depth key. It also arrives from a `subscribeMaterial`
+    // callback — an ASSET edit, with no component prop change and therefore no
+    // `hierarchy-changed`. See contentKey.js.
+    this.entity?.engine?.content?.bump("materials", "mesh:material-slots");
   }
 
   async #loadGeometry(path) {

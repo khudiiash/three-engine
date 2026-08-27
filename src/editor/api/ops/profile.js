@@ -720,6 +720,13 @@ defineOp({
           })),
         };
       })(),
+      // ⭐ §19 STAGE 1.3 — THE ENGINE CONTENT KEY. `counts` says which kind of
+      // change is churning; `auditsMissed` is the number that matters: it is
+      // non-zero only when a consumer's periodic re-walk found a change no
+      // producer announced, i.e. a hole in the producer set (see
+      // engine/contentKey.js). A settled, parked scene should show a version
+      // that is not moving and `auditsMissed: 0`.
+      contentKey: engine.content?.stats?.() ?? null,
       giColourProbe: {
         wait: engine.modules?.get?.("gi")?.system?._colourProbeWait ?? null,
         done: engine.modules?.get?.("gi")?.system?._colourProbeDone ?? null,

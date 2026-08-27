@@ -371,6 +371,12 @@ export class InstancerComponent extends Component {
   #fillMatrices(count) {
     const mesh = this.instancedMesh;
     const rng = makeRng(this.props.seed ?? 0);
+    // Every branch below ends in `instanceMatrix.needsUpdate = true`, i.e. a
+    // whole new set of placements. GI's g-buffer hold and ShadowFreeze both
+    // fingerprint `instanceMatrix.version`, but they only look when the
+    // engine content key says something moved — so say it once, here, where
+    // the rescatter starts. See contentKey.js.
+    this.entity?.engine?.content?.bump("transforms", "instancer:rescatter");
 
     const tmp = new THREE.Matrix4();
     const tmpPos = new THREE.Vector3();

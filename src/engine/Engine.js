@@ -27,6 +27,7 @@ import { BatchSystem } from "./batching.js";
 import { MergeSystem } from "./merging.js";
 import { ShadowMergeSystem } from "./shadowMerge.js";
 import { ShadowFreezeSystem } from "./shadowFreeze.js";
+import { SceneContentKey, setActiveContentKey } from "./contentKey.js";
 import { FrameGovernorSystem } from "./frameGovernor.js";
 import { LodSystem } from "./lod/LodSystem.js";
 import { ImpostorSystem } from "./lod/ImpostorSystem.js";
@@ -213,6 +214,17 @@ export class Engine extends EventEmitter {
     // `Component._viewOnlyActive`. The main loop ticks this set directly
     // rather than scanning every entity's component map each frame.
     this.viewOnlyComponents = new Set();
+    // ⭐ ONE CONTENT KEY FOR THE WHOLE SCENE. Three systems used to answer
+    // "has anything changed?" with their own full-scene traversal every frame
+    // (ShadowFreeze, GI's g-buffer hold, GI's mesh scan). They read this
+    // instead and walk only when it moves. Constructed FIRST among the systems
+    // below, because several of them bump it from their own constructors.
+    // See contentKey.js — including why it is a change signal and not a proof
+    // of no-change, and what every consumer owes in return.
+    this.content = new SceneContentKey();
+    // Published for module-level code with no engine handle (materialAsset.js'
+    // in-place edits). See contentKey.js.
+    setActiveContentKey(this.content);
     // Merges repeated (geometry, material) pairs into instanced draw calls.
     // Driven from #tick's pre-render phase, gated by settings.performance.
     this.batching = new BatchSystem(this);
@@ -373,6 +385,12 @@ export class Engine extends EventEmitter {
   flushHierarchyChanged() {
     if (!this._hierarchyDirty || this._hierarchyBatchDepth > 0) return;
     this._hierarchyDirty = false;
+    // ⭐ THE CONTENT KEY IS BUMPED HERE, NOT IN A LISTENER, and that ordering is
+    // the whole point: the bump is visible to every `hierarchy-changed` handler
+    // as it runs, so a listener that rebuilds something and then asks "is my
+    // cache stale?" gets the right answer in the same turn. A listener
+    // registered alongside the others would race them.
+    this.content.bump("hierarchy", "hierarchy-changed");
     super.emit("hierarchy-changed");
   }
 
@@ -473,6 +491,10 @@ export class Engine extends EventEmitter {
     // setting is only what a camera set to "inherit" falls back to. Re-applied
     // every tick anyway; this is just so the state is right before the first one.
     this.applyCullingSettings();
+    // Scene settings reach shadows, layers, tone mapping and every merge
+    // system's enablement — treat the whole scene as changed rather than
+    // enumerate which setting touches which cache.
+    this.content.bump("hierarchy", "settings-changed");
     this.emit("settings-changed", this.settings);
     // "Might the renderer be rebuilt as a result of this call": the decision
     // itself now lands at end of tick, so this is an upper bound, kept for
@@ -669,6 +691,12 @@ export class Engine extends EventEmitter {
         this.rendererReady = true;
         // Notify renderer-owning consumers before the new animation loop can
         // render. Pipelines and timestamp query sets belong to the old device.
+        // ⚠ AND THE CONTENT KEY, because every held image (shadow map,
+        // g-buffer) is now an EMPTY texture on a fresh device while the scene
+        // it was derived from is byte-for-byte identical — the exact failure
+        // shadowFreeze.js' renderer-identity check exists for, arriving here
+        // by the cache this key gates.
+        this.content.bump("hierarchy", "renderer-rebuilt");
         this.emit("renderer-rebuilt");
         if (this.loopActive) this.renderer.setAnimationLoop(() => this.#tick());
       } catch (err) {
@@ -715,6 +743,9 @@ export class Engine extends EventEmitter {
       // would drift for as long as the tween had left to run.
       this.tweens.clear();
     }
+    // Play/Stop restores a whole scene snapshot — transforms, visibility and
+    // materials all at once, and often to values identical to the ones held.
+    this.content.bump("hierarchy", "play-changed");
     this.emit("play-changed", playing);
   }
 
@@ -1042,7 +1073,15 @@ export class Engine extends EventEmitter {
       // through. Marked here because this loop is the only writer of
       // `visible` and the only place both terms are known.
       entity.object3D.userData.cameraHidden = authored && !next;
-      if (entity.object3D.visible !== next) entity.object3D.visible = next;
+      if (entity.object3D.visible !== next) {
+        entity.object3D.visible = next;
+        // THE ONE WRITER OF ENTITY VISIBILITY IS THE ONE PRODUCER OF ITS KEY.
+        // LOD, occlusion culling and enabledInEditor/enabledInGame all reach
+        // the scene graph through this single assignment, so bumping HERE
+        // covers all three without any of them knowing the key exists — and
+        // covers them by observation, which no event wiring can promise.
+        this.content.bump("visibility", "visibility-resolve");
+      }
     }
     // First of the per-frame systems, and ahead of every update callback: a
     // timer that comes due this frame should have had its effect before any

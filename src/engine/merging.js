@@ -765,6 +765,11 @@ export class MergeSystem {
     this._invalidateTally[reason] = (this._invalidateTally[reason] ?? 0) + 1;
     this._dirtiedAt = performance.now();
     if (this._dirtySince === 0) this._dirtySince = this._dirtiedAt;
+    // Every reason that reaches here is a real scene change this system has
+    // already decided it must rebuild for, so it is also a change the engine's
+    // content key must carry to GI and ShadowFreeze. Cheap: an integer, and
+    // this is an EVENT path, not a per-frame one.
+    this.engine?.content?.bump("hierarchy", `merging:${reason}`);
   }
 
   /**
@@ -1007,6 +1012,14 @@ export class MergeSystem {
       this._urgent = true;
       this._invalidateReason = "member-moved";
       this._invalidateTally["member-moved"] = (this._invalidateTally["member-moved"] ?? 0) + 1;
+      // ⭐ A MEASURED PRODUCER, not an announced one. This watcher compares
+      // live `matrixWorld` elements, so it catches a mesh moved by a script,
+      // by physics or by an animation — every route that writes straight to
+      // Object3D and therefore has no setter and no event. That makes it the
+      // backstop the content key's own producers cannot be: it costs nothing
+      // extra (the comparison already ran) and it is amortised over
+      // WATCH_WINDOW_FRAMES, so a move can be reported a few frames late.
+      this.engine?.content?.bump("transforms", "merging:member-moved");
     }
   }
 
