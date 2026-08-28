@@ -561,6 +561,8 @@ user accepts GI2 by eye (`GI2_PATH = false` is the safety net).
 | 5.4d chain | faces already NEE-lit; loop exonerated; single bounce isolated; coarse-face origin escape (FACETRUTH 0.84 → 1.00) |
 | 5.5a/b | glossy from the RC probes; worker BVH exact shadow rays (uniform swap, no rebuild; OBB slab exclusion) — Cornell median 0.104 PASSES, gain 0.85 (0.9ᵏ tax on ρ = 1 walls), at rest 1.67 %; BVH arm OFF on main (Bistro 3 fps — cost/gate owed) |
 
+**THE GATE ABOVE EVERY NUMBER (user, 2026-08-29 02:30): "we must never see artifacts. Light must arrive in natural gradients, without hard edges or rapid changes. Like Lumen does."** Spatial: gather weights continuous per pixel (no visibility/coverage/known-fraction switches), a newborn probe fades in by age (weight 0 → 1 over ~10-20 frames), flat-surface second differences at the reference's floor. Temporal: no pixel changes more than ~3 %/frame under motion, on a light change or at boot; arrival is a monotone ramp over ~0.3-0.5 s (world-space α is the sanctioned accumulator; no history on the image path). Receipts: `probe:gi2-runner` per-frame step p90/max, the cold probe's newborn ramp, the Cornell d² lines.
+
 **Open:** Bistro at scale — probe spots/checkerboards on motion (population + seeding), the BVH arm's cost and 2 M-triangle cap, boot 17 s from scene open, the pinned Bistro truth re-read; blotch σ 10-16 % on the box (fixed-direction structure); at-rest Δ 1.7-2.8 % (target 1 %); Box·+Z (a seated emitter's own face lit only by bounce); the user's scene authoring (albedo 1.0 walls; sky:sun 3:1; AO off).
 
 ### What is deliberately NOT in this plan
