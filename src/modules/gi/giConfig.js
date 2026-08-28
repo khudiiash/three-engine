@@ -638,7 +638,11 @@ export const GI2_PATH = true;
  * the system is constructed, so a harness page can arm the stage without a
  * commit and nothing can flip it under a live chain.
  */
-export const RC5_PATH = false;
+// 08-28 21:00 — DEFAULT ON (user: iterate in the editor; Cornell phase). The
+// old world-probe path still builds beside it until 5.4 removes it, so the
+// chain costs more than it will; `globalThis.__gi2Rc5 = false` pre-boot
+// restores the shipped 4.x path for an A/B.
+export const RC5_PATH = true;
 
 /** The build-time value, harness override included. Read ONCE per build. */
 /**
