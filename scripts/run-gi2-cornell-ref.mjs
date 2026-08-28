@@ -1273,6 +1273,207 @@ if (ARMS.length) {
   result.arms = armRows;
 }
 
+
+// ══════════════════════ §19 5.4d — WHAT A KNOWN BIN CARRIES (`FACETRUTH=1`) ══
+//
+// ⭐⭐⭐ THE SINGLE-BOUNCE ARM PUT THE LOSS IN `J`, AND `J` IS ONE NUMBER: the
+// face cache's DIRECT word at the hit, `ρ/π·(Esun + Enee)`. Everything else in
+// the one-bounce field is transport of that number. So this block reads the
+// SHIPPING estimator at the voxel faces the camera can see (`shadeTerms`, via
+// `gi2FaceTermProbe` — not a transcription of it) and scores each face against
+// the reference's OWN next-event estimator at the same point:
+//
+//     truth(p, n) = neeE(p, n)   ← `makeSceneTracer(scene, 0).irradiance`: the
+//                                  emissive triangles, area-sampled and
+//                                  occlusion-tested against the real mesh.
+//
+// `Enee` and `truth` are the same physical quantity — irradiance at (p, n) from
+// the admitted emitters — computed by two independent programs, so their ratio
+// is the direct term's own gain with no transport, no probes and no cascades in
+// it. Grouped by DISTANCE TO THE LAMP, because the ladder the gate measures is
+// ordered by how far a surface's light has to travel.
+if (process.env.FACETRUTH) {
+  console.log("");
+  console.log("  ── §19 5.4d — THE FACE CACHE'S DIRECT TERM vs THE REFERENCE'S NEE ───");
+  const FJ = await page.evaluate(async ({ eye, aim }) => {
+    try {
+      const eng = globalThis.__giEngineForProbe;
+      const gi2 = globalThis.__gi2();
+      if (!gi2?.gather?.internals) return JSON.stringify({ error: "no gather internals" });
+      const ws = await import("/src/modules/gi/window/windowStore.js");
+      const { createGi2RayShooter } = await import("/scripts/lib/gi2RayProbe.js");
+      const { createGi2FaceTermProbe } = await import("/scripts/lib/gi2FaceTermProbe.js");
+      const terms = createGi2FaceTermProbe(gi2, eng.renderer);
+      const v0 = gi2.win.voxel0;
+      const NRM = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+      const winW = new Uint32Array(await eng.renderer.getArrayBufferAsync(gi2.win.attribute));
+      const lvlBase = (l) => l * ws.LEVEL_WORDS;
+      const occAt = (l, x, y, z) => {
+        const i = (x & 63) | ((y & 63) << 6) | ((z & 63) << 12);
+        return (winW[lvlBase(l) + ws.OCC_OFF + (i >> 5)] >>> (i & 31)) & 1;
+      };
+      const faceByte = (l, x, y, z) => {
+        const i = (x & 63) | ((y & 63) << 6) | ((z & 63) << 12);
+        return (winW[lvlBase(l) + ws.FACE_OFF + (i >> 2)] >>> ((i & 3) * 8)) & 255;
+      };
+      // ⭐⭐⭐ THE POPULATION IS THE OCCUPANCY, NOT A CAMERA FAN. `probe:gi2-
+      // faceterm` enumerates the wall from the window's own bits and never
+      // shoots a ray; 5.4d's two dead runs were both the shooter, and the whole
+      // question — what does a face's DIRECT term carry, near the lamp and far
+      // from it — is about faces, not about what the camera can see.
+      //
+      // ⚠ THE BUFFER INDEX IS TOROIDAL, SO THE WORLD CELL MUST BE UNWRAPPED.
+      // The lattice stores `worldCell & 63` and the window covers
+      // `[origin, origin + 64)`, so the world cell is the one congruent to the
+      // index inside that span. Skipping this puts every face at a position up
+      // to 64 cells wrong and scores the reference at the wrong point.
+      const unwrap = (idx, org) => org + (((idx - org) % 64) + 64) % 64;
+      const seen = new Map();
+      const levelCensus = [0, 0, 0, 0, 0, 0, 0, 0];
+      let occTotal = 0;
+      for (let l = 0; l < gi2.win.levels; l++) {
+        const vl = v0 * (1 << l);
+        const ox = gi2.win.origins[l * 3];
+        const oy = gi2.win.origins[l * 3 + 1];
+        const oz = gi2.win.origins[l * 3 + 2];
+        for (let z = 0; z < 64; z++) {
+          for (let y = 0; y < 64; y++) {
+            for (let x = 0; x < 64; x++) {
+              if (!occAt(l, x, y, z)) continue;
+              occTotal++;
+              // The voxel's own dominant axis (§19 3.9's rule) and the SIDE
+              // whose outward neighbour is empty — that side faces the room.
+              const code = (faceByte(l, x, y, z) >>> 6) & 3;
+              if (!code) continue;
+              const ax = code - 1;
+              const e = [0, 0, 0]; e[ax] = 1;
+              const occP = occAt(l, x + e[0], y + e[1], z + e[2]);
+              const occN = occAt(l, x - e[0], y - e[1], z - e[2]);
+              let face = -1;
+              if (!occP && occN) face = 2 * ax;
+              else if (!occN && occP) face = 2 * ax + 1;
+              else continue; // interior or isolated — no side faces the room
+              levelCensus[Math.min(7, l)]++;
+              const wc = [unwrap(x, ox), unwrap(y, oy), unwrap(z, oz)];
+              const n = NRM[face];
+              seen.set(`${l}|${wc}|${face}`, {
+                p: [(wc[0] + 0.5) * vl + n[0] * vl * 0.5,
+                  (wc[1] + 0.5) * vl + n[1] * vl * 0.5,
+                  (wc[2] + 0.5) * vl + n[2] * vl * 0.5],
+                n, level: l, voxelIdx: (x & 63) | ((y & 63) << 6) | ((z & 63) << 12), face,
+              });
+            }
+          }
+        }
+      }
+      const rejCell = occTotal;
+      const rejFace = 0;
+      const hits = { length: occTotal };
+      // Evenly SUBSAMPLED, never truncated: taking the first 600 of a map
+      // built by a z-major scan would take one slab of the room and call it the
+      // scene. [[probe-blind-statistics]]
+      const allFaces = [...seen.values()];
+      const step = Math.max(1, Math.ceil(allFaces.length / 600));
+      const faces = allFaces.filter((_, i) => i % step === 0).slice(0, 600);
+      const res = await terms(faces);
+      return JSON.stringify({
+        faces, out: res.faces ?? res, diag: res.diag ?? null,
+        census: { occupied: occTotal, levels: levelCensus, kept: seen.size, sampled: faces.length },
+      });
+    } catch (e) { return JSON.stringify({ error: `${e && e.message}` }); }
+  }, { eye, aim });
+  const F = JSON.parse(FJ ?? '{"error":"nothing"}');
+  if (F.error) console.log(`  SKIPPED — ${F.error}`);
+  else {
+    // ⚠ THE TRUTH IS THE REFERENCE'S OWN NEE, AT ZERO BOUNCES. `Lo` returns
+    // immediately at depth 0 when `bounces` is 0, so `irradiance` is exactly
+    // `neeE(p, n)`. Nothing about the cascades enters it.
+    const direct = makeSceneTracer(
+      { tris: R.scene.tri, triMat: R.scene.triMat, mats: R.scene.mats, sky: [0, 0, 0] }, 0,
+    );
+    const lamp = (R.slots.find((s) => s.radius > 1e-5) || {}).center || [0, 0, 0];
+    const rows = [];
+    for (let i = 0; i < F.faces.length; i++) {
+      const fc = F.faces[i];
+      const o = F.out[i];
+      if (!o) continue;
+      const nee = o.Enee || o.enee || null;
+      if (!nee) continue;
+      const truth = direct.irradiance(fc.p, fc.n, 1, 12345 + i, 256);
+      const d = Math.hypot(fc.p[0] - lamp[0], fc.p[1] - lamp[1], fc.p[2] - lamp[2]);
+      rows.push({
+        d, gpu: lum(nee), ref: lum(truth), level: fc.level, face: fc.face,
+        stored: lum(o.stored || [0, 0, 0]), storedValid: o.storedValid || 0,
+      });
+    }
+    const lit = rows.filter((r) => r.ref > 1e-4);
+    // ⚠ THE POPULATION IS PRINTED BEFORE THE TABLE, ALWAYS. 5.4d's first cut
+    // rejected every hit and printed an all-zero table under a "0 faces" line;
+    // the line is what made that legible as a miss instead of a measurement.
+    const c = F.census || {};
+    console.log(`  occupied voxels ${c.occupied ?? "—"} · room-facing by level `
+      + `[${(c.levels ?? []).join(",")}] · kept ${c.kept ?? "—"} · sampled ${c.sampled ?? "—"}`);
+    console.log(`  ${lit.length} faces of ${rows.length} with a lit reference   `
+      + `(lamp at [${lamp.map((v) => v.toFixed(2))}])`);
+    const bands = [[0, 1.5], [1.5, 2.5], [2.5, 3.5], [3.5, 5], [5, 99]];
+    console.log(`  ${"distance to lamp".padEnd(20)}${"faces".padStart(7)}${"Enee(gpu)".padStart(12)}`
+      + `${"E_direct(ref)".padStart(15)}${"ratio".padStart(9)}${"cached word".padStart(13)}`);
+    for (const [lo, hi] of bands) {
+      const b = lit.filter((r) => r.d >= lo && r.d < hi);
+      if (!b.length) continue;
+      const mg = b.reduce((a, r) => a + r.gpu, 0) / b.length;
+      const mr = b.reduce((a, r) => a + r.ref, 0) / b.length;
+      const mc = b.reduce((a, r) => a + r.stored, 0) / b.length;
+      console.log(`  ${`${lo}-${hi} m`.padEnd(20)}${String(b.length).padStart(7)}`
+        + `${f(mg, 4).padStart(12)}${f(mr, 4).padStart(15)}`
+        + `${f(mg / Math.max(1e-9, mr), 3).padStart(9)}${f(mc, 4).padStart(13)}`);
+    }
+    const all = lit.reduce((a, r) => a + r.gpu, 0) / Math.max(1, lit.length);
+    const allr = lit.reduce((a, r) => a + r.ref, 0) / Math.max(1, lit.length);
+    console.log(`  ${"ALL".padEnd(20)}${String(lit.length).padStart(7)}${f(all, 4).padStart(12)}`
+      + `${f(allr, 4).padStart(15)}${f(all / Math.max(1e-9, allr), 3).padStart(9)}`);
+    // ⭐ AND BY CASCADE BAND, because the ladder the gate measures is ordered by
+    // how far a surface's light travels and the BAND is what "far" means to this
+    // transport: a level `l` face is `v0·2^l` across and is answered by cascade
+    // `l`'s interval. A term that degrades with the band is a different bug from
+    // one that degrades with distance.
+    // By ORIENTATION: a floor face (+Y) sees the lamp straight on, a ceiling
+    // face (−Y) sees it edge-on, and the vertical faces are the walls and the
+    // boxes. If the direct term degrades with geometry rather than with
+    // distance, this is the table that says so.
+    const FN = ["+X wall", "-X wall", "+Y floor", "-Y ceiling", "+Z wall", "-Z wall"];
+    console.log("");
+    console.log(`  ${"orientation".padEnd(20)}${"faces".padStart(7)}${"Enee/ref".padStart(12)}`
+      + `${"stored/ref".padStart(13)}`);
+    for (let fi = 0; fi < 6; fi++) {
+      const b = lit.filter((r) => r.face === fi);
+      if (!b.length) continue;
+      const mg = b.reduce((a2, r) => a2 + r.gpu, 0) / b.length;
+      const mr = b.reduce((a2, r) => a2 + r.ref, 0) / b.length;
+      const mc = b.reduce((a2, r) => a2 + r.stored, 0) / b.length;
+      console.log(`  ${FN[fi].padEnd(20)}${String(b.length).padStart(7)}`
+        + `${f(mg / Math.max(1e-9, mr), 3).padStart(12)}`
+        + `${f(mc / Math.max(1e-9, mr), 3).padStart(13)}`);
+    }
+    console.log("");
+    console.log(`  ${"cascade band".padEnd(20)}${"faces".padStart(7)}${"Enee/ref".padStart(12)}`
+      + `${"stored/ref".padStart(13)}${"written".padStart(10)}`);
+    for (let l = 0; l < 8; l++) {
+      const b = lit.filter((r) => r.level === l);
+      if (!b.length) continue;
+      const mg = b.reduce((a2, r) => a2 + r.gpu, 0) / b.length;
+      const mr = b.reduce((a2, r) => a2 + r.ref, 0) / b.length;
+      const mc = b.reduce((a2, r) => a2 + r.stored, 0) / b.length;
+      const wv = b.filter((r) => r.storedValid > 0.5).length;
+      console.log(`  ${`c${l}`.padEnd(20)}${String(b.length).padStart(7)}`
+        + `${f(mg / Math.max(1e-9, mr), 3).padStart(12)}`
+        + `${f(mc / Math.max(1e-9, mr), 3).padStart(13)}`
+        + `${`${wv}/${b.length}`.padStart(10)}`);
+    }
+    result.faceTruth = { rows: rows.length, lit: lit.length, ratio: all / Math.max(1e-9, allr) };
+  }
+}
+
 if (OUT) { writeFileSync(OUT, JSON.stringify(result, null, 1)); console.log(`  wrote ${OUT}`); }
 if (REF && existsSync(REF)) {
   const before = JSON.parse(readFileSync(REF, "utf8"));
