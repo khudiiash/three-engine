@@ -735,6 +735,59 @@ export function createGiGather({
     ? instancedArray(new Float32Array(
       Math.ceil(width / 2) * Math.ceil(height / 2) * 4), "vec4") : null;
   /**
+   * ⭐⭐ §19 STAGE 3.18 — WHY A PIXEL FLIPPED, NOT JUST THAT IT DID.
+   *
+   * `reprojBuf` says a surface point's estimate reversed direction. It cannot
+   * say WHICH of the world path's candidate mechanisms did it, and every one of
+   * them is a different fix. So `resolveHalf` — the only kernel that has the
+   * answer in registers — writes, per half-res pixel and PER CASCADE, the four
+   * numbers its own composite is made of:
+   *
+   *   `cov`   Σ tri·live: does a live lattice exist around this point (0..1).
+   *   `fresh` Σ tri·live·[ready < 0.75]: how much of that lattice is SEEDED
+   *           rather than traced — the α = 1 first-trace population.
+   *   `claim` what this cascade actually spent of the pixel's irradiance,
+   *           `cov/covFull · band · rem` — the fall-through, in one number.
+   *   `vis`   Σ tri·live·vis / cov: the Chebyshev weight, averaged.
+   *
+   * plus the resolve's OWN luminance, before `resolveUpsample`'s image blend,
+   * so the accumulation's contribution is a subtraction rather than an argument.
+   * The CPU keeps the previous frame's copy and looks it up through the SAME
+   * `src` index the sign census follows, so every classification is about one
+   * surface point across two frames.
+   *
+   * ⚠ HARNESS ONLY, and `wantNoise` gates the BUILD — `resolveHalf` keeps its
+   * shipped storage-buffer count (§Y.2's 6-binding envelope) on every boot the
+   * probe did not ask for.
+   */
+  const DIAG_VEC = 3;
+  const diagBuf = wantNoise
+    ? instancedArray(new Float32Array(
+      Math.ceil(width / 2) * Math.ceil(height / 2) * DIAG_VEC * 4), "vec4") : null;
+  /**
+   * ⭐⭐⭐ §19 STAGE 3.18 — THE REPROJECTION'S OWN UNCERTAINTY, PER PIXEL.
+   *
+   * The moving census asks whether a surface point's estimate REVERSED between
+   * two frames. It gets the previous value by interpolating the previous frame
+   * at a sub-pixel position, and that interpolation has an error whose sign is
+   * arbitrary — so below some amplitude the census is reporting its own
+   * resampling and calling it grain. At rest the error is exactly zero (the
+   * point lands on its own pixel), which is why every at-rest receipt in this
+   * file has been clean and every MOVING one has carried this silently.
+   *
+   * `reprojErr` is that error, estimated the standard way: the same tap
+   * evaluated to a HIGHER order (Catmull-Rom over 4×4) minus the bilinear one.
+   * Two estimates of one quantity that differ only in order of accuracy bound
+   * the lower one's error, so a delta smaller than `reprojErr` is not evidence
+   * about the estimator and the CPU census drops it. A separate float buffer
+   * rather than a fifth channel: `reprojBuf`'s four are read by `gi2-gather`'s
+   * own `grainReceipt` at a fixed stride, and widening it would have made that
+   * receipt silently wrong.
+   */
+  const reprojErr = wantNoise
+    ? instancedArray(new Float32Array(
+      Math.ceil(width / 2) * Math.ceil(height / 2) * 2), "vec2") : null;
+  /**
    * §19 Stage 3.11's leak gate — see `contactRayPass`. Harness only, and built
    * only when a receipt asked for crops: `gi2System` passes `crops: 0` and this
    * pass, its two buffers and its second `traceWindow` never enter a boot.
@@ -884,6 +937,25 @@ export function createGiGather({
     injectAlpha: uniform(0),
     /** 1 restores Stage 3.5's "inject the whole composite" — see `injectPass`. */
     injectGlossy: uniform(0),
+    /**
+     * ⭐⭐ §19 STAGE 3.18 — THE MOVING RECEIPT'S OWN NOISE FLOOR, AS AN ARM.
+     *
+     * `reprojDump` compares a surface point's luminance to a BILINEAR read of
+     * the previous frame at that point's previous screen position. That read
+     * has an error, the error is second-order in the field's spatial curvature
+     * and it is NOT zero — and its sign is arbitrary, so it lands in the flip
+     * census as an estimator reversing direction. At rest the error is exactly
+     * zero (the point is at its own pixel), which is why the at-rest receipt
+     * cannot see it and why every moving number has carried it silently.
+     *
+     * 1 makes the kernel dump the surface's ALBEDO instead of its irradiance —
+     * a field that is a pure function of the world point, cannot change between
+     * two frames by construction, and has the same spatial structure the
+     * irradiance is read across. Whatever flip rate the census then reports is
+     * the INSTRUMENT, and every number it reports for the real field must be
+     * read against it. [[probe-blind-statistics]]
+     */
+    reprojNull: uniform(0),
     /** 0 restores Stage 3.5's half-tile along-surface reprojection bound. */
     reprojWide: uniform(1),
     /** 1 restores §L.1's PER-FRAME anchor jitter — see `probePlace`. */
@@ -3517,6 +3589,14 @@ export function createGiGather({
     // Hoisted so the half-res store below can key on them — see its note.
     const Pv = vec3(0).toVar();
     const Nv = vec3(0, 1, 0).toVar();
+    // ── §19 3.18: the flip classifier's registers (see `diagBuf`) ───────────
+    // Declared OUT here, beside `Pv`/`Nv` and for the same reason: the store
+    // is in the `half` tail, outside the `g.w > 0.5` guard, so a pixel with no
+    // geometry writes zeros rather than leaving the previous frame's answer
+    // for the CPU to classify. [[probe-blind-statistics]]
+    const DIAG = !!(half && worldTap && wantNoise && diagBuf && world);
+    const dgs = DIAG
+      ? Array.from({ length: world.taps.cascades }, () => vec4(0).toVar()) : null;
     If(g.w.greaterThan(0.5), () => {
       const P = g.xyz.toVar();
       const Nn = normalize(loadNrm(px.toInt(), py.toInt()).xyz).toVar();
@@ -3681,6 +3761,10 @@ export function createGiGather({
            */
           const cov = float(0).toVar();
           const faceCov = float(0).toVar();
+          // §19 3.18's classifier inputs, accumulated beside `cov` so they are
+          // the SAME sums the composite is made of and not a re-derivation.
+          const freshCov = DIAG ? float(0).toVar() : null;
+          const visCov = DIAG ? float(0).toVar() : null;
 
           for (let c8 = 0; c8 < 8; c8++) {
             const cdx = c8 & 1;
@@ -3707,8 +3791,11 @@ export function createGiGather({
             // the cascade above, 1 traced. A seeded probe carries a real merged
             // field (its parent's) and its absence is what §V.6 measured as the
             // scroll's motion cost, so the test is `> 0.25`, not `> 0.5`.
-            const alive = i0.w.greaterThan(0.5)
-              .and(world.taps.infoAt(cell, 2).w.greaterThan(0.25)).toVar();
+            // `ready` is read ONCE into a var: §19 3.18's classifier needs the
+            // three-valued number itself (0 re-keyed / 0.5 seeded / 1 traced),
+            // not only the predicate the composite tests.
+            const rdy = world.taps.infoAt(cell, 2).w.toVar();
+            const alive = i0.w.greaterThan(0.5).and(rdy.greaterThan(0.25)).toVar();
             const tri = (cdx ? fr.frac.x : float(1).sub(fr.frac.x))
               .mul(cdy ? fr.frac.y : float(1).sub(fr.frac.y))
               .mul(cdz ? fr.frac.z : float(1).sub(fr.frac.z)).toVar();
@@ -3733,6 +3820,11 @@ export function createGiGather({
             // edge — which is the hand-off, and the whole hand-off.
             cov.addAssign(tri.mul(live));
             faceCov.addAssign(tri.mul(live).mul(wf));
+            if (DIAG) {
+              freshCov.addAssign(tri.mul(live)
+                .mul(select(rdy.lessThan(0.75), float(1), float(0))));
+              visCov.addAssign(tri.mul(live).mul(vis));
+            }
             // ⭐⭐ THE FALLBACK IS TWO-TIER, AND THE SECOND TIER IS NOT OPTIONAL.
             //
             // It prefers an ADMISSIBLE probe (one that passed the face gate) by
@@ -3784,6 +3876,12 @@ export function createGiGather({
             wsum.addAssign(claim);
             rem.subAssign(claim);
           });
+          if (DIAG) {
+            const row = vec4(cov, freshCov, claim, visCov.div(cov.max(1e-4))).toVar();
+            for (let c = 0; c < dgs.length; c++) {
+              If(cc.equal(uint(c)), () => { dgs[c].assign(row); });
+            }
+          }
           admAny.assign(max(admAny, faceCov));
         });
       } else {
@@ -3873,6 +3971,20 @@ export function createGiGather({
         vec4(E, select(g.w.greaterThan(0.5), dot(Nv, Pv), float(-1e4))));
       textureStore(glossyHalf, coord,
         vec4(G, select(g.w.greaterThan(0.5), Nv.y, float(-9))));
+      if (DIAG) {
+        // ⚠ THE RESOLVE'S OWN LUMINANCE RIDES IN THE LAST CASCADE'S `.w`, and
+        // it is the ONE number that makes the image accumulation falsifiable:
+        // `reprojBuf` reads `irradiance`, which is `resolveUpsample`'s output
+        // AFTER the 3.12 blend, so a sign census on it alone cannot separate
+        // "the field moved" from "the blend switched validity". Same census,
+        // two signals, one subtraction.
+        const base = gyu.mul(u.halfWU).add(gxu).mul(uint(DIAG_VEC)).toVar();
+        const LUMA_D = vec3(0.2126, 0.7152, 0.0722);
+        for (let c = 0; c < dgs.length; c++) {
+          diagBuf.element(base.add(uint(c))).assign(c === dgs.length - 1
+            ? vec4(dgs[c].xyz, dot(E, LUMA_D)) : dgs[c]);
+        }
+      }
     } else {
       textureStore(irradiance, coord, vec4(E, g.w));
       textureStore(glossy, coord, vec4(G, g.w));
@@ -4419,7 +4531,17 @@ export function createGiGather({
     const py = gy.mul(uint(2)).toVar();
     const g = loadPos(px.toInt(), py.toInt()).toVar();
     const LUMA = vec3(0.2126, 0.7152, 0.0722);
-    const here = dot(irrNode.load(ivec2(px.toInt(), py.toInt())).xyz, LUMA).toVar();
+    /**
+     * The signal this census is about, at one FULL-RES pixel. `reprojNull = 1`
+     * makes it the ALBEDO — a field that provably did not change between the
+     * two frames — so the same census can report its own floor. Everything
+     * downstream, the error bar included, goes through this one function, or
+     * the floor arm would be measured by a bar built from a different field.
+     */
+    const signalAt = (ix, iy) => select(u.reprojNull.greaterThan(0.5),
+      dot(palAtWorld(loadPos(ix, iy).xyz, normalize(loadNrm(ix, iy).xyz)).xyz, LUMA),
+      dot(irrNode.load(ivec2(ix, iy)).xyz, LUMA));
+    const here = signalAt(px.toInt(), py.toInt()).toVar();
     motionLum.element(u.curBase.mul(half).add(i)).assign(here);
 
     const there = float(0).toVar();
@@ -4428,6 +4550,22 @@ export function createGiGather({
     // against `sign(Δ_{k−1})` at the pixel this point occupied then — and a
     // boolean cannot carry that. −1 is "the reprojection missed".
     const src = float(-1).toVar();
+    /** §19 3.18 — this tap's own error bar. See `reprojErr`. */
+    const err = float(0).toVar();
+    /**
+     * ⭐⭐⭐ §19 3.18 — HOW FAR THE TAP LANDED FROM A SAMPLE CENTRE, 0 … 0.5.
+     *
+     * The error bars above ESTIMATE the resampling error. This removes it:
+     * where the reprojected point lands on a texel centre the previous value is
+     * READ, not interpolated, and the comparison is exact whatever the field's
+     * spatial content. The sub-pixel phase is a function of the camera and the
+     * geometry and is INDEPENDENT of the estimator, so selecting on it draws an
+     * unbiased sample of the same surfaces — which is what makes "score only
+     * the exact taps" a stronger census rather than a smaller one.
+     *
+     * ⚠ 1 WHERE THE REPROJECTION MISSED, so a dropped tap can never look exact.
+     */
+    const phase = float(1).toVar();
     const c = u.prevViewProj.mul(vec4(g.xyz, 1)).toVar();
     If(g.w.greaterThan(0.5).and(c.w.greaterThan(1e-4)), () => {
       const sx = c.x.div(c.w).mul(0.5).add(0.5).toVar();
@@ -4464,6 +4602,61 @@ export function createGiGather({
         const t01 = motionLum.element(base.add(cy1.mul(u.halfWU)).add(cx0)).toVar();
         const t11 = motionLum.element(base.add(cy1.mul(u.halfWU)).add(cx1)).toVar();
         there.assign(mix(mix(t00, t10, ax), mix(t01, t11, ax), ay));
+        // ── §19 3.18: the same tap, one order higher ─────────────────────
+        //
+        // Catmull-Rom over the 4×4 that contains the bilinear 2×2. The
+        // DIFFERENCE between the two is this tap's own error bar; `reprojErr`
+        // carries it and the CPU census refuses to score a delta smaller than
+        // it. ⚠ CLAMPED ON BOTH AXES with the same `clamp` the bilinear taps
+        // use, so an edge pixel degrades to a repeated sample rather than
+        // reading another row — the wrap is what would put a spurious error
+        // bar on exactly the pixels a whip pan disoccludes.
+        const crw = (t) => [
+          t.mul(t.mul(t.mul(-0.5).add(1)).sub(0.5)),
+          t.mul(t).mul(t.mul(1.5).sub(2.5)).add(1),
+          t.mul(t.mul(t.mul(-1.5).add(2)).add(0.5)),
+          t.mul(t).mul(t.mul(0.5).sub(0.5)),
+        ];
+        const wx = crw(ax);
+        const wy = crw(ay);
+        const cubic = float(0).toVar();
+        for (let jy = 0; jy < 4; jy++) {
+          const cy = y0.add(jy - 1).clamp(0, u.halfHU.toFloat().sub(1)).toUint().toVar();
+          const rowv = float(0).toVar();
+          for (let jx = 0; jx < 4; jx++) {
+            const cx = x0.add(jx - 1).clamp(0, u.halfWU.toFloat().sub(1)).toUint().toVar();
+            rowv.addAssign(motionLum.element(base.add(cy.mul(u.halfWU)).add(cx)).mul(wx[jx]));
+          }
+          cubic.addAssign(rowv.mul(wy[jy]));
+        }
+        // ⭐⭐⭐ AND A SECOND BAR, BECAUSE THE FIRST ONE CANNOT SEE A SHARP FIELD.
+        //
+        // The bicubic residual bounds the error of a SMOOTH field, and it reads
+        // near zero on a blocky one — both interpolants agree inside a block and
+        // both are wrong at its edge. So the tap's error is also estimated the
+        // way an error is estimated when the truth is known: reconstruct THIS
+        // pixel's value from its own frame's neighbours at the SAME sub-pixel
+        // geometry and compare against the value that is known exactly.
+        //
+        // ⚠ THE NEIGHBOURS COME FROM THE TEXTURE, NEVER FROM `motionLum`. This
+        // kernel writes `motionLum[curBase]` at the top and there is no barrier
+        // inside a dispatch, so reading a neighbour's slot would read whatever
+        // that thread had or had not written yet — a race, and a different one
+        // per launch. [[tsl-atomic-select-trap]]'s sibling.
+        //
+        // ⚠ AND IT IS SCALED. The reconstruction spans TWO half-res pixels where
+        // the real tap spans one, and a bilinear error goes as the square of the
+        // span — hence `0.25` — times `4a(1−a)`, which is the error's own shape
+        // in the fraction: exact at a tap centre, worst half-way between.
+        const sAt = (dx, dy) => signalAt(
+          px.toInt().add(dx).clamp(0, u.widthU.toInt().sub(1)),
+          py.toInt().add(dy).clamp(0, u.heightU.toInt().sub(1)),
+        );
+        const est = mix(mix(sAt(-2, -2), sAt(2, -2), ax),
+          mix(sAt(-2, 2), sAt(2, 2), ax), ay).toVar();
+        const shape = max(ax.mul(float(1).sub(ax)), ay.mul(float(1).sub(ay))).mul(4).toVar();
+        err.assign(max(cubic.sub(there).abs(), est.sub(here).abs().mul(0.25).mul(shape)));
+        phase.assign(max(min(ax, float(1).sub(ax)), min(ay, float(1).sub(ay))));
         // The SIGN census still needs one integer identity for the surface
         // point, and the nearest tap is the honest one: it names the pixel this
         // point most belonged to, and a sign carried through it is carried
@@ -4473,6 +4666,7 @@ export function createGiGather({
       });
     });
     reprojBuf.element(i).assign(vec4(here, there, src, g.w));
+    reprojErr.element(i).assign(vec2(err, phase));
   })().compute(dispatch2d(halfW, halfH), WG);
 
   // ══════════════════════════════════════════════ SHADER: shadeHit, exposed
@@ -4770,6 +4964,8 @@ export function createGiGather({
     buffers: {
       probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf,
       shadeIn, shadeOut, exhaustOut, noiseBuf, dirtyBuf, reprojBuf, motionLum,
+      /** §19 3.18's flip classifier — `DIAG_VEC` vec4 per half-res pixel. */
+      diagBuf, diagVec: DIAG_VEC, reprojErr,
       contactIn, contactOut,
       ...(world ? world.buffers : null),
     },

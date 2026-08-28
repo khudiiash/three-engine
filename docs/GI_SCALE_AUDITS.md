@@ -3142,3 +3142,129 @@ cannot resolve 8 m, and the corridor is the only receipt that has truth in it.
 single lattice. (3) The frame-time and voxelize-chain gates `probe:gi2-motion`
 fails on BOTH paths — §18's mandate, and now unblocked by a window that
 actually finishes its bricks.
+
+---
+
+## Z. STAGE 3.18 — THE BISTRO MOTION FLIP ROW WAS THE RECEIPT
+
+⭐⭐⭐ **THE OWNER IS `reprojDump`, NOT THE WORLD PATH, AND A FIELD THAT CANNOT
+CHANGE PROVES IT.** `u.reprojNull = 1` makes the moving census dump the surface
+ALBEDO instead of its irradiance — a pure function of the world point, identical
+in two consecutive frames by construction. Bistro, ultra, world path, same boot,
+same arms, the historical statistic verbatim:
+
+| Bistro moving sign flips | orbit | dolly | whip |
+|---|---|---|---|
+| **world path (the row §Y failed on)** | 34.7 % | 25.3 % | 22.3 % |
+| **NULL — the ALBEDO, which did not change** | **34.1 %** | **31.6 %** | **24.3 %** |
+| shipping SCREEN path, same instrument | 49.9 % | 28.8 % | 46.7 % |
+
+**The number being gated is at or below the floor its own instrument produces on
+a field with nothing in it to flip, and the path that ships is 15-29 points
+WORSE on the same census.** The census reads the previous frame by bilinear
+interpolation at a sub-pixel position; that read has an error, the error's sign
+is arbitrary, and the sign chain then compares two independent draws of it. At
+rest the reprojection is exact and the error is zero, which is why every at-rest
+receipt in this document is clean and why three stages of real architecture
+(3.14 → 3.15 → 3.16 → 3.17) moved this row by less than two points.
+
+### Z.1 THE FOUR THINGS THAT WERE MEASURED BEFORE THAT CONCLUSION
+
+1. **AT REST THE FIELD IS EXACT.** The grain arm's settle is now scored on its
+   own (`GRAIN_PARK`, `PARKED` vs `MOVING` in the row below each arm). Orbit,
+   60 parked frames after a settle: **0.0 % flips of 187 859 steps**. §T holds
+   on Bistro and every flip in the table is motion-induced.
+2. **NO RESOLVE-SIDE TERM OWNS IT.** `GRAIN_CFG` runs arbitrary uniform arms out
+   of one boot, each bracketed by a fresh `base`. Orbit: base 25.3-26.0 %,
+   `wpVisOn = 0` **26.0**, `wpCascadesOn = 0` **22.5**, `wpAlpha = 1` **27.7**,
+   `wpCovFull = 1` **25.1**, `wpFaceOn = 0` **25.4**. Every candidate — the
+   Chebyshev weight, the cascade fall-through, the probe EMA, the hand-off gate,
+   the face gate — moves the number by less than the arm-to-arm spread.
+   ⚠ **THE FIRST ARM OF A BLOCK READS ~10 POINTS HIGH** (35.7 against 23-26)
+   because the region is being lit for the first time; a single unbracketed arm
+   is not a measurement.
+3. **THE IMAGE ACCUMULATION IS A MITIGATION, NOT A CAUSE.** `imageHistory` and
+   `resolveUpsample`'s blend ARE live under `WORLD_PROBES` (they are in
+   `world.frameOrder`) and they are the only thing in the chain that lowers the
+   number: `accumOn = 0` reads **42.4 / 38.5 / 35.4** against 34.7 / 25.3 / 22.3.
+   Candidate (e) is refuted in the opposite direction to the one suspected.
+4. **THE CLASS CENSUS (`CLASSIFY=1`).** `resolveHalf` writes, per half-res pixel
+   and per cascade, `cov` / `fresh` / `claim` / `vis` — the four sums its own
+   composite is made of — plus its pre-blend luminance (`diagBuf`). Share of
+   flips / share of steps, ultra, world:
+
+   | arm | re-key (Δcov or Δfresh) | band (Δclaim) | vis (ΔChebyshev) | value only |
+   |---|---|---|---|---|
+   | orbit | 32.0 / 20.9 | 3.8 / 2.7 | 31.3 / 25.1 | 32.9 / 51.2 |
+   | dolly | 47.7 / 24.1 | 1.3 / 0.6 | 22.7 / 10.5 | 28.3 / 64.8 |
+   | whip | 29.0 / 9.7 | 3.7 / 1.3 | 21.6 / 10.8 | 45.6 / 78.2 |
+
+   ⚠ **AND IT IS CORRELATIONAL, WHICH THE UNIFORM ARMS THEN SETTLED.** A
+   reprojection that lands a pixel away puts a SPATIAL gradient into every one
+   of those deltas, so `re-key` leading with lift 1.5-3.0 is consistent with a
+   scroll AND with the classifier reading its own displacement. Item 2 is what
+   decides: disabling each named mechanism moves nothing. The pre-blend census
+   in the same run reads **48-54 % on every arm and every configuration** —
+   white noise, which is what a resampling error is.
+
+### Z.2 THE INSTRUMENT, FIXED (`scripts/run-gi2-motion-probe.mjs`, `gatherProbes.js`)
+
+* **`reprojErr`** — the tap's own error bar, per pixel: `max(` Catmull-Rom minus
+  bilinear (the smooth-field residual), a same-field reconstruction of this
+  pixel from its own frame's neighbours at the same sub-pixel geometry (the
+  sharp-field one) `)`. `EPS_K=1` refuses to score a delta smaller than it.
+* **`phase`** — how far the tap landed from a sample centre. `EXACT_EPS=0.15`
+  scores only taps where the previous value is READ rather than interpolated,
+  which removes the error instead of estimating it. The sub-pixel phase is a
+  function of the camera and the geometry and not of the estimator, so this is a
+  stronger census rather than a smaller one. Under it, Bistro ultra world:
+
+  | | orbit | dolly | whip |
+  |---|---|---|---|
+  | world path, whole arm | **22.3 %** | **10.8 %** | **12.4 %** |
+  | NULL (albedo), whole arm | 11.8 % | 5.4 % | 5.9 % |
+  | world path, MOVING only | 22.8 % | 24.9 % | 21.6 % |
+  | NULL, MOVING only | 12.6 % | 14.6 % | 10.8 % |
+
+  ⭐ **The floor is halved and the field's own residual is what is left**: ~10
+  points above a field that cannot change. That residual is the honest subject
+  of any future stage on this row, and it is NOT ≤ 15 % on the moving segment.
+* **`PARKED` / `MOVING` split**, **`GRAIN_PARK`**, **`GRAIN_CFG`** (arbitrary
+  uniform arms out of one boot, defaults restored between them), **`reprojNull`**
+  (the floor arm), **`diagBuf`** (`CLASSIFY=1`). The probe now prints the floor
+  warning above its own table.
+
+⚠ **NO FIELD CHANGE SHIPPED, DELIBERATELY.** Nothing was found that moves the
+row above the instrument's own floor, and a change that cannot be shown to help
+is a change that cannot be shown not to hurt. The only edit reaching a shipping
+kernel is a `.toVar()` hoist of `ready` in the world resolve (one read, same
+test) so the classifier can read the three-valued number.
+
+### Z.3 THE GATE TABLE (unchanged, as it must be)
+
+| gate | 3.17 | **3.18** |
+|---|---|---|
+| Cornell bracketed, phone/high/ultra | 8/8 | **8/8 · 8/8 · 8/8** |
+| storage buffers, worst kernel | 6 | **6** (`gi2.worldTrace`) |
+| chain ms @1650×970 phone/high/ultra | 2.218 / — / 2.415 | **2.195 / 2.409 / 2.424** |
+| at rest still / flips / p95 | 100 / 0 / 0.001 | **100 / 0 / 0.001** (all tiers) |
+| Cornell orbit sign-flip | 5.759 % | **5.758 %** (phone 5.484, high 5.682) |
+| panel move re-converges | 9 fr (phone 11) | **9 fr** (phone 11), 133↑/0↓ monotone |
+| thin-wall interior ultra / phone | 0.38 / 0.19 % | **0.38 / 0.19 %** |
+| 5 cm leak + four rotations | 0 / 0 / 3 / 2 per 10 000 | **0 / 0 / 3 / 2** |
+| trim sub-voxel crops | 5/6 | **6/6** |
+| `test:gi2-lightshadow` | PASS | **PASS** |
+| `test:gi-sunleak` | PASS | **PASS** (worst leak 0.00000) |
+| `test:gi-moved-lamp` | PASS | **PASS** (Δnew 29.06) |
+| `smoke:gi-gpu` | PASS | **PASS** (`gi2.worldTrace` 6 storage) |
+| `run-gi-resize-probe` | PASS 0/0 | **PASS 0/0** |
+
+⚠ `reprojection at rest ≥ 99 %` still FAILS on all tiers — §Y's dead
+screen-probe gate, unchanged.
+
+▶ **WHAT IS ACTUALLY LEFT ON THIS ROW.** ~10 points of exact-tap flips above the
+null, and a re-convergence transient the park control now names: after a camera
+JUMP the field churns for more than ten still frames (dolly park 9.5 %, whip
+park 11.0 %, against orbit's 0.0 % after a long settle). That transient is real,
+it is measurable with a still camera, and it is the first thing a future stage
+should chase — not the moving flip rate, which cannot resolve it.

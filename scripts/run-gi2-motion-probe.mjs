@@ -159,6 +159,9 @@ await page.evaluateOnNewDocument((flags) => {
   for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
 }, {
   ...(process.env.GRAIN === "0" ? {} : { __gi2NoiseDump: true }),
+  ...(process.env.CLASSIFY === "1" ? { __gi2Classify: true } : {}),
+  ...(process.env.EPS_K ? { __gi2EpsK: Number(process.env.EPS_K) } : {}),
+  ...(process.env.EXACT_EPS ? { __gi2ExactEps: Number(process.env.EXACT_EPS) } : {}),
   ...JSON.parse(process.env.FLAGS ?? "{}"),
 });
 if (process.env.SCRIPT_RELOAD === "1") {
@@ -283,6 +286,10 @@ const installed = await page.evaluate(async () => {
     frames: [], plan: null, planAt: 0, arm: "boot", seg: "boot",
     longtasks: [], logCount: 0, pending: [], base: null, done: true,
     dispatchLabel: new Map(), pin: 0,
+    // §19 3.18 — `CLASSIFY=1`. Off by default: the class census reads a second
+    // buffer three times the size of `reprojBuf` every grain frame, which is a
+    // pipeline flush the flip RATE itself does not need.
+    classify: globalThis.__gi2Classify === true,
   };
   globalThis.__gi2Motion = R;
 
@@ -639,10 +646,39 @@ const installed = await page.evaluate(async () => {
   // `reprojBuf` carries for exactly this). A flip is then the estimate
   // reversing on one surface point and cannot be parallax.
   R.grain = null;
+  // ⭐⭐ §19 STAGE 3.18 — AND WHY EACH FLIP HAPPENED.
+  //
+  // `CLS` is the classifier's vocabulary, and its ORDER is its priority: a
+  // flipping pixel is attributed to the FIRST mechanism whose input actually
+  // moved between the two frames, read out of `diagBuf` at this pixel and at
+  // the reprojected source pixel. `base` counts the same classes over every
+  // SCORED step, so a class can be read as a LIFT (its share of flips against
+  // its share of steps) rather than as a share that a common event would win
+  // by being common. [[probe-blind-statistics]]
+  const CLS = ["rekey", "band", "vis", "value"];
+  const CLS_T = Number(globalThis.__gi2ClsThreshold ?? 0.02);
   R.grainMk = (want, label) => ({
-    label, want, frames: 0, chain: Promise.resolve(), lit: null, err: null,
+    label, want, frames: 0, chain: Promise.resolve(), lit: null, litR: null, err: null,
     prevS: null, curS: null, hist: new Float64Array(2001), hn: 0,
-    steps: 0, moved: 0, flips: 0, scored: 0, reproj: 0,
+    steps: 0, moved: 0, flips: 0, scored: 0, reproj: 0, dropped: 0,
+    // ⭐⭐ §19 3.18 — THE PARK FRAMES ARE SCORED SEPARATELY, NOT DISCARDED.
+    //
+    // Every grain arm already begins with a settle at the start pose, and the
+    // census has always folded those frames into the same totals — where they
+    // read as "moved 0 %" and vanish. Scored on their own they are the control
+    // this stage could not otherwise get: the SAME scene, the SAME boot, the
+    // SAME instrument, with the camera not moving. A field that flips there is
+    // churning on its own, and no camera-side fix can reach it.
+    park: { steps: 0, flips: 0, moved: 0, reproj: 0 },
+    move: { steps: 0, flips: 0, moved: 0, reproj: 0 },
+    // §19 3.18 — the classifier's own state. `prevD` is the previous frame's
+    // `diagBuf` and `prevV` says which of its pixels had geometry, because a
+    // pixel that was sky carries stale diagnostics that must not be compared.
+    dv: 0, prevD: null, prevV: null, curV: null,
+    prevSR: null, curSR: null, stepsR: 0, flipsR: 0,
+    cls: Object.fromEntries(CLS.map((k) => [k, 0])),
+    base: Object.fromEntries(CLS.map((k) => [k, 0])),
+    clsUnk: 0, baseUnk: 0,
   });
   const histAdd = (G, v) => { G.hist[Math.min(2000, Math.max(0, Math.round(v * 1000)))]++; G.hn++; };
   const histP = (G, p) => {
@@ -651,9 +687,39 @@ const installed = await page.evaluate(async () => {
     for (let i = 0; i <= 2000; i++) { acc += G.hist[i]; if (acc >= (p / 100) * G.hn) return i / 1000; }
     return 2;
   };
-  const grainReduce = (G, f) => {
+  // ⭐⭐⭐ §19 3.18 — THE UNCERTAINTY GATE. `EPS_K` multiplies the kernel's own
+  // error bar (`reprojErr`, the bicubic-minus-bilinear residual of the tap the
+  // census reads). 0 is the historical statistic verbatim — every delta over a
+  // tenth of a percent scored, including the ones that are the resampling. 1
+  // scores only deltas the instrument can actually resolve.
+  const EPS_K = Number(globalThis.__gi2EpsK ?? 0);
+  // ⭐⭐⭐ §19 3.18 — THE EXACT-TAP CENSUS. A pixel is scored only when its
+  // reprojection landed within `EXACT_EPS` of a sample centre, where the
+  // previous value is read rather than interpolated. 0.5 is every pixel (the
+  // historical statistic); 0.05 keeps the taps whose comparison is exact.
+  const EXACT_EPS = Number(globalThis.__gi2ExactEps ?? 0.5);
+  const grainReduce = (G, f, d = null, dv = 0, seg = "grain", er = null) => {
+    const S = seg === "grain-park" ? G.park : G.move;
     const N = f.length / 4;
     if (!G.prevS) { G.prevS = new Int8Array(N); G.curS = new Int8Array(N); }
+    if (d && !G.prevD) {
+      G.dv = dv;
+      G.prevD = new Float32Array(N * dv * 4);
+      G.prevV = new Uint8Array(N);
+      G.curV = new Uint8Array(N);
+      G.prevSR = new Int8Array(N);
+      G.curSR = new Int8Array(N);
+    }
+    if (d && G.litR == null) {
+      // The pre-blend signal gets its OWN lit threshold, derived the same way.
+      // Sharing the image's would judge two differently-scaled signals by one
+      // constant, which is how a "no change" arm becomes a "no data" arm.
+      const xs = [];
+      const off = (dv - 1) * 4 + 3;
+      for (let i = 0; i < N; i++) if (f[i * 4 + 3] > 0.5) xs.push(d[i * dv * 4 + off]);
+      xs.sort((a, b) => a - b);
+      G.litR = xs.length ? 0.1 * xs[xs.length >> 1] : 0;
+    }
     if (G.lit == null) {
       // The lit threshold is a tenth of the median VALID luminance, derived
       // from the scene rather than chosen — a dark arm and a bright one are
@@ -664,25 +730,81 @@ const installed = await page.evaluate(async () => {
       G.lit = xs.length ? 0.1 * xs[xs.length >> 1] : 0;
     }
     G.curS.fill(0);
+    if (d) { G.curV.fill(0); G.curSR.fill(0); }
+    const NC = dv;
     for (let i = 0; i < N; i++) {
       if (!(f[i * 4 + 3] > 0.5)) continue;
       G.scored++;
+      if (d) G.curV[i] = 1;
       const s = f[i * 4 + 2];
       if (!(s >= 0)) continue;
       G.reproj++;
+      S.reproj++;
       const L = f[i * 4];
       const P = f[i * 4 + 1];
+      // ══ §19 3.18 — the SAME census on the pre-blend signal ════════════════
+      // `resolveHalf`'s own luminance, tracked through the same `src`. Its flip
+      // rate against the image's is the image accumulation's whole effect.
+      if (d) {
+        const j = i * NC * 4 + (NC - 1) * 4 + 3;
+        const k = (s | 0) * NC * 4 + (NC - 1) * 4 + 3;
+        const LR = d[j];
+        const PR = G.prevV[s | 0] ? G.prevD[k] : -1;
+        if (LR > G.litR && PR > 0 && Math.abs(LR - PR) > 1e-3 * LR) {
+          const sgR = LR - PR > 0 ? 1 : -1;
+          G.curSR[i] = sgR;
+          const psR = G.prevSR[s | 0];
+          if (psR !== 0) { G.stepsR++; if (sgR !== psR) G.flipsR++; }
+        }
+      }
       if (!(L > G.lit) || !(P > 0)) continue;
-      const d = L - P;
-      histAdd(G, Math.abs(d) / L);
-      if (!(Math.abs(d) > 1e-3 * L)) continue;
+      const dd = L - P;
+      histAdd(G, Math.abs(dd) / L);
+      // ⚠ THE FLOOR IS THE LARGER OF THE TWO. `1e-3·L` is the historical
+      // amplitude floor; `EPS_K · reprojErr[i]` is what this tap could resolve
+      // on this pixel this frame. A delta under either is not evidence.
+      if (!(Math.abs(dd) > 1e-3 * L)) continue;
+      if (er && EPS_K > 0 && !(Math.abs(dd) > EPS_K * er[i * 2])) { G.dropped++; continue; }
+      if (er && EXACT_EPS < 0.5 && !(er[i * 2 + 1] <= EXACT_EPS)) { G.dropped++; continue; }
       G.moved++;
-      const sg = d > 0 ? 1 : -1;
+      S.moved++;
+      const sg = dd > 0 ? 1 : -1;
       G.curS[i] = sg;
       const ps = G.prevS[s | 0];
-      if (ps !== 0) { G.steps++; if (sg !== ps) G.flips++; }
+      if (ps !== 0) {
+        G.steps++;
+        S.steps++;
+        const flipped = sg !== ps;
+        if (flipped) { G.flips++; S.flips++; }
+        // ── classify, on the resolve's own inputs ─────────────────────────
+        if (d) {
+          const si = s | 0;
+          if (!G.prevV[si]) { G.baseUnk++; if (flipped) G.clsUnk++; } else {
+            let dCov = 0; let dFresh = 0; let dClaim = 0; let dVis = 0;
+            for (let c = 0; c < NC; c++) {
+              const a = i * NC * 4 + c * 4;
+              const b = si * NC * 4 + c * 4;
+              dCov = Math.max(dCov, Math.abs(d[a] - G.prevD[b]));
+              dFresh = Math.max(dFresh, Math.abs(d[a + 1] - G.prevD[b + 1]));
+              dClaim = Math.max(dClaim, Math.abs(d[a + 2] - G.prevD[b + 2]));
+              // The LAST cascade's `.w` is the resolve luminance, not `vis`.
+              if (c < NC - 1) dVis = Math.max(dVis, Math.abs(d[a + 3] - G.prevD[b + 3]));
+            }
+            const key = (dFresh > CLS_T || dCov > CLS_T) ? "rekey"
+              : dClaim > CLS_T ? "band"
+                : dVis > CLS_T ? "vis" : "value";
+            G.base[key]++;
+            if (flipped) G.cls[key]++;
+          }
+        }
+      }
     }
     G.prevS.set(G.curS);
+    if (d) {
+      G.prevD.set(d);
+      G.prevV.set(G.curV);
+      G.prevSR.set(G.curSR);
+    }
   };
   const grainTick = () => {
     const G = R.grain;
@@ -699,7 +821,23 @@ const installed = await page.evaluate(async () => {
     try {
       eng.renderer.compute(g.passes.reprojDump);
       const p = eng.renderer.getArrayBufferAsync(g.buffers.reprojBuf.value);
-      G.chain = G.chain.then(() => p).then((buf) => grainReduce(G, new Float32Array(buf)))
+      // §19 3.18 — `diagBuf` is issued in the SAME encode as `reprojBuf`, for
+      // the reason the note above `grainTick`'s readback already gives: the
+      // copy happens when `getArrayBufferAsync` is CALLED, so two calls one
+      // `await` apart would describe two different frames.
+      const wantD = R.classify && g.buffers.diagBuf;
+      const pd = wantD ? eng.renderer.getArrayBufferAsync(g.buffers.diagBuf.value) : null;
+      // ⚠ THE SEGMENT IS CAPTURED AT DISPATCH, NOT READ IN THE `.then()`. The
+      // reduction lands frames later, by which time `R.seg` names a different
+      // part of the plan — and the park control would then be scored with the
+      // moving frames it exists to be compared against.
+      const seg = R.seg;
+      const pe = g.buffers.reprojErr
+        ? eng.renderer.getArrayBufferAsync(g.buffers.reprojErr.value) : null;
+      G.chain = G.chain.then(() => Promise.all([p, pd, pe]))
+        .then(([buf, dbuf, ebuf]) => grainReduce(G, new Float32Array(buf),
+          dbuf ? new Float32Array(dbuf) : null, g.buffers.diagVec ?? 0, seg,
+          ebuf ? new Float32Array(ebuf) : null))
         .catch((e) => { G.err ??= String(e?.message ?? e); });
     } catch (e) { G.err ??= String(e?.message ?? e); }
   };
@@ -713,6 +851,19 @@ const installed = await page.evaluate(async () => {
       flipPct: G.steps ? (100 * G.flips) / G.steps : null,
       reprojPct: G.scored ? (100 * G.reproj) / G.scored : null,
       steps: G.steps,
+      // §19 3.18 — the pre-blend census and the class shares.
+      flipPctRaw: G.stepsR ? (100 * G.flipsR) / G.stepsR : null,
+      stepsRaw: G.stepsR,
+      cls: { ...G.cls, unknown: G.clsUnk },
+      base: { ...G.base, unknown: G.baseUnk },
+      droppedPct: (G.moved + G.dropped)
+        ? (100 * G.dropped) / (G.moved + G.dropped) : null,
+      parkFlipPct: G.park.steps ? (100 * G.park.flips) / G.park.steps : null,
+      parkMovedPct: G.park.reproj ? (100 * G.park.moved) / G.park.reproj : null,
+      parkSteps: G.park.steps,
+      moveFlipPct: G.move.steps ? (100 * G.move.flips) / G.move.steps : null,
+      moveMovedPct: G.move.reproj ? (100 * G.move.moved) / G.move.reproj : null,
+      moveSteps: G.move.steps,
     };
   };
 
@@ -1046,6 +1197,8 @@ for (const [arm, label, pin, cells] of armList) await runArm(arm, label, pin, ce
 // second boot would carry a different cache and a different contention.
 const GRAIN = process.env.GRAIN !== "0";
 const GRAIN_FRAMES = Number(process.env.GRAIN_FRAMES ?? 40);
+// §19 3.18 — the settle at the arm's start pose, scored as its own control.
+const GRAIN_PARK = Number(process.env.GRAIN_PARK ?? 24);
 const grainRows = [];
 if (GRAIN) {
   const armed = await page.evaluate(() => !!globalThis.__gi2GatherProbe?.passes?.reprojDump);
@@ -1054,13 +1207,36 @@ if (GRAIN) {
       "when `__gi2NoiseDump` is set before boot; run with FLAGS='{\"__gi2NoiseDump\":true}'.");
   } else {
     console.log(`\n── grain (reprojected sign flips, ${GRAIN_FRAMES} frames per arm) ─────────`);
+    // ⛔⛔ §19 3.18 — THIS CENSUS HAS A FLOOR AND IT IS THE SIZE OF THE NUMBER.
+    // Measured on Bistro: the ALBEDO — a field that provably does not change
+    // between two frames — read 34.1 / 31.6 / 24.3 % through this exact
+    // statistic, against the world path's own 34.7 / 25.3 / 22.3 %, and the
+    // SHIPPING screen path read 49.9 / 28.8 / 46.7 %. The reprojection
+    // interpolates the previous frame at a sub-pixel position and the sign of
+    // that resampling error is arbitrary, so below some amplitude this census
+    // is reporting its own resampling. Never quote a moving flip rate without
+    // the floor beside it. [[probe-blind-statistics]]
+    console.log("  ⚠ the moving flip rate has a FLOOR — measure it beside the arm:");
+    console.log("    GRAIN_CFG='[[\"base\",{}],[\"NULL\",{\"reprojNull\":1}]]'"
+      + "  ·  EXACT_EPS=0.15 scores only taps that landed on a sample centre");
     // §19 3.13: `probeDither` is read by `probeTrace`, which the WORLD path does
     // not build — running the 3.11/3.12 pair there would print two identical
     // rows and label one of them a comparison. The world arm gets its own pair
     // (the lattice, and the lattice with the image accumulation off) and the
     // 3.12 row comes from the OTHER boot, which is what a before/after is.
     const worldArm = await page.evaluate(() => globalThis.__gi2WorldProbes === true);
-    const CFG = worldArm ? [
+    // ⭐⭐ §19 3.18 — THE ISOLATION ARMS, AS UNIFORMS OUT OF ONE BOOT.
+    //
+    // The class census (`CLASSIFY=1`) is CORRELATIONAL: it says which of the
+    // resolve's inputs moved on a flipping pixel, and a reprojection that lands
+    // a pixel away puts a SPATIAL gradient in every one of those deltas. The
+    // arms below are causal instead — each disables exactly one mechanism
+    // through a uniform the resolve already reads, on the same boot, the same
+    // voxelization and the same cache, so the flip rate's MOVE is the
+    // mechanism's own contribution and nothing else's.
+    //   GRAIN_CFG='[["vis off",{"wpVisOn":0}],["c0 only",{"wpCascadesOn":0}]]'
+    const EXTRA = JSON.parse(process.env.GRAIN_CFG ?? "null");
+    const CFG = EXTRA ? EXTRA.map(([n, o]) => [n, { accumOn: 1, ...o }]) : worldArm ? [
       ["3.13 (world lattice)", { accumOn: 1 }],
       ["3.13 (world, no accum)", { accumOn: 0 }],
     ] : [
@@ -1070,9 +1246,21 @@ if (GRAIN) {
     for (const arm of ARMS) {
       for (const [name, cfg] of CFG) {
         const label = `${arm} / ${name}`;
-        await page.evaluate(({ arm, label, cfg, frames, DOLLY_M }) => {
+        await page.evaluate(({ arm, label, cfg, frames, DOLLY_M, park }) => {
           const R = globalThis.__gi2Motion;
           const gu = globalThis.__gi2GatherProbe.uniforms;
+          // ⚠ RESTORE THE DEFAULTS FIRST. An arm that turns a term OFF and the
+          // next that never mentions it would otherwise run with it still off,
+          // and the table would read as though the second arm's change did the
+          // first arm's work. Snapshotted once, on the first arm.
+          // ⚠ ONLY THE ARMS' OWN KEYS. `u` also carries `frame`, `curBase` and
+          // `prevBase`, which are PER-FRAME STATE — restoring those would rewind
+          // the round-robin phase and the motion double-buffer at every arm
+          // boundary, which is the instrument editing its own subject.
+          const D = (globalThis.__gi2GrainDefaults ??= Object.fromEntries(
+            Object.entries(gu).filter(([k, n]) => /^(wp|accum|probeDither|reproj|inject|hzbOn)/.test(k)
+              && n && typeof n.value === "number").map(([k, n]) => [k, n.value])));
+          for (const [k, v] of Object.entries(D)) gu[k].value = v;
           for (const [k, v] of Object.entries(cfg)) if (gu[k]) gu[k].value = v;
           const B = R.base;
           const steps = [];
@@ -1085,7 +1273,7 @@ if (GRAIN) {
           // accumulator's history and the probe map both carry the PREVIOUS
           // arm's camera, and a receipt that started measuring on frame 1
           // would score one arm's disocclusion as the next arm's grain.
-          for (let i = 0; i < 24; i++) steps.push({ seg: "grain-park", p: B.p, t: B.t });
+          for (let i = 0; i < park; i++) steps.push({ seg: "grain-park", p: B.p, t: B.t });
           for (let i = 0; i < frames; i++) {
             const f = (i + 1) / frames;
             if (arm === "orbit") steps.push({ seg: "grain", p: rotY(B.p, B.t, (Math.PI / 2) * f), t: B.t });
@@ -1108,7 +1296,7 @@ if (GRAIN) {
           // reduced (they are the instrument's own null) and the moving ones
           // follow them in the same census.
           R.grain = R.grainMk(steps.length, label);
-        }, { arm, label, cfg, frames: GRAIN_FRAMES, DOLLY_M });
+        }, { arm, label, cfg, frames: GRAIN_FRAMES, DOLLY_M, park: GRAIN_PARK });
         const deadline = Date.now() + 180_000;
         while (Date.now() < deadline) {
           if (await page.evaluate(() => globalThis.__gi2Motion.done)) break;
@@ -1126,6 +1314,22 @@ if (GRAIN) {
         console.log(`  ${label.padEnd(34)} Δp50 ${f(row.p50).padStart(6)} %  Δp95 ${f(row.p95).padStart(7)} %  ` +
           `flips ${p(row.flipPct).padStart(5)} % of ${String(row.steps).padStart(8)}  moved ${p(row.movedPct).padStart(5)} %  ` +
           `reproj ${p(row.reprojPct).padStart(5)} %${row.err ? `  ⚠ ${row.err}` : ""}`);
+        console.log(`      dropped by the error bar ${p(row.droppedPct).padStart(5)} % of deltas`);
+        console.log(`      PARKED flips ${p(row.parkFlipPct).padStart(5)} % of ${String(row.parkSteps).padStart(8)}` +
+          ` (moved ${p(row.parkMovedPct).padStart(5)} %)   MOVING flips ${p(row.moveFlipPct).padStart(5)} %` +
+          ` of ${String(row.moveSteps).padStart(8)} (moved ${p(row.moveMovedPct).padStart(5)} %)`);
+        // §19 3.18 — the class census, printed only when it was collected.
+        if (row.cls && row.base && Object.values(row.base).some((n) => n > 0)) {
+          const tot = Object.values(row.cls).reduce((a, b) => a + b, 0) || 1;
+          const btot = Object.values(row.base).reduce((a, b) => a + b, 0) || 1;
+          const cells = Object.keys(row.cls).map((k) => {
+            const sf = (100 * row.cls[k]) / tot;
+            const sb = (100 * row.base[k]) / btot;
+            return `${k} ${sf.toFixed(1)}%/${sb.toFixed(1)}%`;
+          });
+          console.log(`      pre-blend flips ${p(row.flipPctRaw).padStart(5)} % of ` +
+            `${String(row.stepsRaw).padStart(8)}   class (of flips / of steps): ${cells.join("  ")}`);
+        }
       }
     }
     // Leave the gather on what ships, so anything read after this is the
