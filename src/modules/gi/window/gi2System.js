@@ -534,7 +534,38 @@ export function createGi2System({
    * swaps the storage attributes and flips the uniform, rebuilding NOTHING.
    * See `shadowBvh.js`'s slot header for why a rebuild here is not an option.
    */
-  const shadowBvh = rc5BvhShadowEnabled() ? (store.bvhSlot ??= createShadowBvhSlot()) : null;
+  /**
+   * §19 6.2c — MINTED ONLY WHEN THE ARM CAN ACTUALLY RUN FOR THIS SCENE.
+   *
+   * The slot is three storage bindings on the emitter-direct kernel, and the
+   * smoke measures that kernel at 8 OF 8 with them and 7 without. 8 passes on a
+   * baseline device with ZERO headroom, so a scene that will never trace a
+   * triangle must not pay them: on the phone tier `kickShadowBvh` returns early
+   * forever, and above the size gate it does too, and in both cases the old code
+   * still compiled the traversal in and bound a placeholder.
+   *
+   * ⚠ THE SIZE HALF IS ONLY KNOWABLE ON A REBUILD, AND THAT IS NOT A BUG I AM
+   * HIDING. `buildGather()` runs at module setup — before `build()` has been handed
+   * a single geometry — so at the FIRST gather there is no soup and no triangle
+   * count to gate on. The two ways to make it knowable are both worse than the
+   * binding: defer the first gather until the soup lands (that is first light,
+   * and §19 spends the whole plan buying it back), or rebuild the gather when
+   * the soup arrives (forbidden — a gather rebuild re-creates the irradiance
+   * textures and leaves every material bound to a destroyed one, which is the
+   * black-frame failure the persistent slot exists to make unreachable).
+   *
+   * So the tier half is exact and immediate, and the size half applies from the
+   * moment a soup has been seen for this store — i.e. every rebuild, and every
+   * boot after the first. A cold first gather on an over-gate scene pays the
+   * three bindings for one build and never traces them.
+   */
+  const shadowSlotFor = (triCount) => {
+    if (!rc5BvhShadowEnabled()) return null;
+    if (tier === "phone") return null;
+    if (triCount != null && triCount > rc5BvhShadowMaxTris()) return null;
+    return (store.bvhSlot ??= createShadowBvhSlot());
+  };
+  let shadowBvh = shadowSlotFor(store.lastSoupTris ?? null);
   let emitterDirect = null;
   let aoCompose = null;
   let aoOut = null;
@@ -640,6 +671,9 @@ export function createGi2System({
   // `gi2.textures.*` through a PERSISTENT `texture()` node whose `.value` is
   // repointed — the same contract `_giShadowPosNode` already has.
   const buildGather = () => {
+    // Re-decided per gather build: by the second one a soup HAS been seen, so
+    // the size gate becomes real and an over-gate scene drops to 7 bindings.
+    shadowBvh = shadowSlotFor(store.lastSoupTris ?? null);
     // ══ WHY AO GETS ITS OWN OUTPUT TEXTURE ═══════════════════════════════════
     //
     // The obvious shape — read the gather's `irradiance`, multiply, store back
@@ -692,7 +726,7 @@ export function createGi2System({
       // first bounce carried a conservative shadow the picture no longer had.
       // Read at graph-build time and gated by the same arm, so an unarmed build
       // constructs not one node of it.
-      shadowBvh: rc5BvhShadowEnabled() ? shadowBvh : null,
+      shadowBvh,
       positionTexture: gbuffer.position,
       normalTexture: gbuffer.normal,
       width, height, tier,
@@ -1109,6 +1143,10 @@ export function createGi2System({
     // renderer is about to upload. The copy is freed the moment the worker
     // takes ownership; the reordered tree it sends back is the only lasting
     // allocation.
+    // What the NEXT gather build gates its slot on. Recorded before the kick so
+    // it survives a failed or skipped build — the binding decision depends on
+    // the scene, never on whether a tree happened to land.
+    store.lastSoupTris = built.triCount;
     kickShadowBvh(built);
     voxelizer = createWindowVoxelizer(win, soup, tier);
     dynamic = createWindowDynamic(win, voxelizer, tier);
