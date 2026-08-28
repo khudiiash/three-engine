@@ -538,7 +538,9 @@ user accepts GI2 by eye (`GI2_PATH = false` is the safety net).
 
 **Budget/memory (ultra):** live ≈ 20k/5k/1.2k/0.3k probes × 32/128/512/2048 dirs × 8 B ≈ 5 MB per cascade for J/β/count, same again for I → ~40 MB; rays ~1.1 M/frame; chain target ≤ 3 ms. Phone: Δs0 1 m, N 2-3, `traceSlots` small.
 
-**Units (one at a time, each gated; new module `src/modules/gi/window/rc/`, behind `RC5_PATH`; old world probes + radiance-cache bounce stay until 5.4):**
+**PORT, DON'T REWRITE (user, 17:00: "we had quite good looking GI and reflections… reuse something").** The old SRC path is still in the tree and is the paper: `srcConfig` (β 4, γ 4, 4 cascades, W0 4 = 32 dirs, r0/s0 1.6, LOD overlap 0.9, irradiance tile 6+1, α 0.1), `srcMath`/`srcMathTsl` (bins, parent/children, Morton, R2, LOD keys), `srcOctahedral`, `srcMerge` (8-corner cone merge, LOS), `srcDeposit` (bin layout), `srcRays` (Alg. 3), `srcProbes` (hashed sparse probes, LOD, age). Stage 5 reuses them and replaces ONLY the transport (`traceWindow` + coverage instead of occupancyField/rayHit/BVH8 hit shading) and the hit radiance (5.3). Rays from on-screen surfaces (Alg. 3, R2, world-space α) as the paper and the old path did — the deterministic-anchor variant above is the fallback arm if the at-rest Δ reads as noise (gate ≤ 1 %). Reflections: the old BVH8 mirror path returns on the worker-built BVH as 5.5.
+
+**Units (one at a time, each gated; ported RC core under `src/modules/gi/window/rc/`, behind `RC5_PATH`; old world probes + radiance-cache bounce stay until 5.4):**
 
 | unit | builds | gate |
 |---|---|---|
