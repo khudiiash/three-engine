@@ -117,6 +117,78 @@ import {
  * probe counters: the counter block's layout belongs to the population, and a
  * ray total living inside it would make the two modules share a clear pass.
  */
+/**
+ * @@@ SS19 STAGE 6.1 - THE PER-PROBE RAY FLOOR, AND IT IS THE PAPER'S OWN
+ * FUTURE-WORK LINE ("a fixed ray budget per probe").
+ *
+ * [D1] below prices a probe's rays by its SCREEN COVERAGE, and says so in its
+ * own comment: "A probe covering forty pixels gets forty times the rays of one
+ * covering a single pixel." From an elevated pose a c0 probe on the far
+ * pavement covers ONE pixel and the RC path fires `raysPerPixel = 1`, so that
+ * probe puts ONE RAY INTO 32 c0 BINS PER FRAME. Its tile then knows one
+ * direction, and `srcScreenGather`'s renormalisation (`acc/wsum`) hands that
+ * single bin's radiance to the pixel as the WHOLE hemisphere's irradiance - at
+ * full strength, beside a settled neighbour reporting a 32-bin mean. Trilinear
+ * weight peaks inside a probe's own cell, so each disagreeing probe OWNS its
+ * 0.5 m cell: the user's white ovals, one per probe.
+ *
+ * @@ 6.1's TILE FADE WAS HALF THE FIX AND ONLY HALF. Fading a newborn's
+ * authority buys the probe 16 frames to gather evidence - but a probe that gets
+ * ONE ray per frame does not converge in 16 frames or in 16 000. The fade
+ * defers the disagreement; the floor removes it.
+ *
+ * So a live probe fires at least `RAY_FLOOR` rays per frame no matter how few
+ * pixels it covers, spawned from the pixels it DOES have: each of its `k`
+ * pixels fires `ceil(RAY_FLOOR / k)` rays instead of one. At c0's 32 bins that
+ * fills the lobe in ~4 frames and keeps it filled.
+ *
+ * /!\ THE DIRECTIONS ADVANCE FOR FREE, AND THAT IS WHY NO SECOND COUNTER IS
+ * ADDED. A ray's direction is `rayDirection(n, ...)` with `n = pixelRayBase[p]
+ * + k` - its place in the GLOBAL R2 sequence. `pixelRayBase` is claimed from an
+ * atomic cursor in scheduler order, so `n` moves every frame, and `jitterX/Y`
+ * are per-frame uniforms on top. A 1-pixel probe firing 8 CONSECUTIVE R2
+ * indices therefore gets 8 well-spread directions this frame and 8 different
+ * ones next frame - deterministic, no frame-global randomness, exactly the
+ * advancing index the artifact needs. ONE ray per frame is what froze it: R2's
+ * spread is a property of a RUN of indices, and a run of one has none.
+ *
+ * /!\ A PROBE WITH ZERO PIXELS STAYS AT ZERO, deliberately. Rays originate at
+ * PIXELS (`srcMathTsl`'s standing rule - a probe-origin ray is the
+ * self-occlusion artifact, not a fix for it), so a probe nothing on screen
+ * feeds has no origin to fire from and the floor cannot reach it. Those probes
+ * are off-screen or fully occluded; they are not the ones making spots.
+ *
+ * `__giSrcRayFloor = 0` restores the pre-6.1 pure-coverage budget.
+ */
+export const RAY_FLOOR = (() => {
+  const raw = Number(globalThis.__giSrcRayFloor);
+  if (Number.isFinite(raw) && raw >= 0) return Math.floor(raw);
+  // /!\ DEFAULT OFF, AND THE RECEIPT IS WHY. At 8 the mechanism WORKS -- the
+  // transport is alive (Cornell: rays 24410, 77.4 % hit, deposits 49109, black
+  // 0) and sparse probes get their floor -- but the Cornell gate REGRESSES:
+  // p90 |log ratio| 0.104 -> 0.506, and two surfaces cross the 10 % blotch
+  // bound. THE CAUSE IS NAMED AND IT IS AN ORDERING BUG, NOT A TUNING ONE:
+  // [D1a] raises `rayCount` BEFORE [D1\'] snapshots the natural count into
+  // `rayCursor`, so [D1\'\']'s `capped/natural` is measured against the BOOSTED
+  // demand -- the decay's alpha compensation then divides by a denominator that
+  // no longer means "what this probe would have asked for unaided", and the
+  // whole field's energy shifts with it. The fix is to snapshot the natural
+  // count BEFORE the floor raises it (move [D1a] after [D1\']'s store, or have
+  // [D1a] write `rayCursor` itself), which is a reordering.
+  //
+  // Until that lands the floor is code, not behaviour: at 0 `floorOn` is false,
+  // `probeBoost` is never bound, and every kernel here emits pre-6.1 WGSL.
+  // `__giSrcRayFloor = 8` arms it and reproduces both halves of the receipt.
+  return 0;
+})();
+
+/**
+ * The ceiling on the per-pixel multiplier. A probe covering ONE pixel wants
+ * `RAY_FLOOR` rays from it, and beyond that the floor is met by definition, so
+ * `RAY_FLOOR` is the natural cap rather than a chosen one.
+ */
+const RAY_BOOST_MAX = Math.max(1, RAY_FLOOR);
+
 export function createSrcRayStore(store, { pixelCount }) {
   const { probeTotal } = store;
   // §19 0.3b — the pixel count as a UNIFORM as well as a JS number. The
@@ -152,7 +224,16 @@ export function createSrcRayStore(store, { pixelCount }) {
   // waited. R7 said fold, don't multiply bindings; this is that rule with a
   // measurement attached.
   const rayWork = instancedArray(new Uint32Array(1 + pixelCount), "uint").toAtomic();
+  // ── §19 STAGE 6.1 — THE PER-PROBE RAY FLOOR (`probeBoost`) ────────────────
+  //
+  // How many rays EACH of this probe's pixels fires this frame. `raysPerPixel`
+  // everywhere the probe already has enough pixels to meet the floor, and more
+  // where it does not — see [D1a]. One u32 per probe, and it is the ONE word
+  // that lets [D5] and the deposit's [E] loop agree on a per-pixel count that
+  // is no longer a compile-time constant.
+  const probeBoost = instancedArray(new Uint32Array(probeTotal), "uint");
   return {
+    probeBoost,
     rayCount,
     rayCursor,
     rayTotal,
@@ -170,7 +251,7 @@ export function createSrcRayStore(store, { pixelCount }) {
      * detach queue the retired twins while the new ones kept their CPU arrays.
      */
     get cpuMirrors() {
-      return [rayCount, rayCursor, rayTotal, pixelRayBase, rayWork]
+      return [rayCount, rayCursor, rayTotal, pixelRayBase, rayWork, probeBoost]
         .map((n) => n?.value).filter(Boolean);
     },
     get pixelCount() { return livePixelCount; },
@@ -194,7 +275,7 @@ export function createSrcRayStore(store, { pixelCount }) {
       ].filter(Boolean);
     },
     dispose() {
-      for (const b of [rayCount, rayCursor, rayTotal, pixelRayBase, rayWork]) {
+      for (const b of [rayCount, rayCursor, rayTotal, pixelRayBase, rayWork, probeBoost]) {
         b?.value?.dispose?.();
       }
     },
@@ -334,7 +415,13 @@ export function createSrcRayFrame(
   } = {},
 ) {
   const { probeTable, probeTotal, cascades, freeStack } = store;
-  const { rayCount, rayCursor, rayTotal, pixelRayBase, rayWork, pixelCount, pixelCountU } = rays;
+  const {
+    rayCount, rayCursor, rayTotal, pixelRayBase, rayWork, pixelCount, pixelCountU, probeBoost,
+  } = rays;
+  // SS19 6.1 - the floor needs a per-probe word; a store built before this stage
+  // (standalone rigs that assemble one by hand) has none, and then this build is
+  // the pre-6.1 one, WGSL included.
+  const floorOn = RAY_FLOOR > 1 && !!probeBoost;
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const top = cascades[N - 1];
   if (surprise && !cap) {
@@ -418,6 +505,11 @@ export function createSrcRayFrame(
     const w = i.mul(PROBE_WORDS).toVar();
     probeTable.element(w.add(PROBE_RAYS)).assign(uint(0));
     probeTable.element(w.add(PROBE_RAYOFF)).assign(uint(SLOT_EMPTY));
+    // SS19 6.1 - the floor's per-pixel multiplier. Cleared to `raysPerPixel`
+    // rather than to 0 so a probe [D1a] never visits (the upper cascades, whose
+    // pixels are their children's) still hands [D5] and [E] the pre-6.1
+    // constant. A ZERO here would deny every claim.
+    if (floorOn) probeBoost.element(i).assign(uint(raysPerPixel));
     If(i.equal(uint(0)), () => {
       atomicStore(rayTotal.element(uint(0)), uint(0));
       atomicStore(rayWork.element(uint(0)), uint(0));
@@ -437,6 +529,44 @@ export function createSrcRayFrame(
     atomicAdd(rayCount.element(probe), uint(raysPerPixel));
   })().compute(dispatchCount);
   passes.push(d1Pass);
+
+  // -- [D1a] SS19 6.1 - THE PER-PROBE FLOOR --------------------------------
+  //
+  // BETWEEN [D1] AND [D1'], AND THE POSITION IS THE WHOLE CORRECTNESS
+  // ARGUMENT. `rayCount` here is the NATURAL count `k * raysPerPixel` - [D1]
+  // has finished summing and [D1'] has not yet clamped - so `k`, the probe's
+  // pixel population, is recoverable exactly once, right here. After the clamp
+  // it is gone; before [D1] it does not exist.
+  //
+  // The pass raises the count to the floor and publishes the multiplier every
+  // later stage needs. [D2]/[D3]/[D4] then propagate and partition the RAISED
+  // sums with no change of their own (they read `rayCount` and nothing else),
+  // [D5] claims `probeBoost` per pixel instead of the constant, and the
+  // deposit's [E] loops the same word. ONE definition of "how many rays does
+  // this pixel fire", three consumers - the discipline [D1'] states for the
+  // clamp, applied to the floor.
+  //
+  // /!\ AND THE CAP STILL BINDS. [D1'] clamps AFTER this, so the floor ASKS and
+  // the tier's budget ANSWERS: on a scene already at its ray ceiling the floor
+  // is granted out of the same envelope rather than on top of it, and
+  // `capped/natural` ([D1'']) reports the dilution honestly to the decay. The
+  // floor is a REDISTRIBUTION toward sparse probes, not a new allocation.
+  if (floorOn) {
+    const c0f = cascades[0];
+    passes.push(Fn(() => {
+      const i = instanceIndex.add(uint(c0f.probeBase)).toVar();
+      const n = atomicLoad(rayCount.element(i)).toVar();
+      // No pixels, no origins - see RAY_FLOOR's note. `probeBoost` keeps [D0]'s
+      // `raysPerPixel`, which no [D5] thread will ever read for this probe.
+      If(n.equal(uint(0)), () => { Return(); });
+      const k = n.div(uint(raysPerPixel)).max(uint(1)).toVar();
+      // Integer ceil, no float round trip: ceil(F/k) == (F + k - 1) / k.
+      const per = uint(RAY_FLOOR).add(k).sub(uint(1)).div(k)
+        .clamp(uint(1), uint(RAY_BOOST_MAX)).toVar();
+      probeBoost.element(i).assign(per.mul(uint(raysPerPixel)));
+      atomicStore(rayCount.element(i), k.mul(per).mul(uint(raysPerPixel)));
+    })().compute(c0f.probeCapacity));
+  }
 
   // ── [D1'] the per-probe cap (srcConfig's `probeRayCap`) ───────────────────
   // Clamped AT THE SOURCE, before anything reads a count: [D2] then propagates
@@ -521,6 +651,21 @@ export function createSrcRayFrame(
         );
       });
       const capEff = uint(cap).shiftLeft(shift).toVar();
+      // SS19 6.1 - THE CAP MUST BE A MULTIPLE OF **THIS PROBE'S** SLICE, NOT OF
+      // `raysPerPixel`. [D5] hands out WHOLE slices of width `probeBoost` and
+      // denies any claim that would cross the segment end, so a capped segment
+      // that is not a multiple of that width leaves a tail allocated-but-
+      // unclaimed - which the coverage gate reads, correctly, as lost rays. The
+      // pre-6.1 build got this for free because every slice was `raysPerPixel`
+      // and `cap` was already floored to a multiple of it (srcConfig); with a
+      // per-probe width the flooring has to happen per probe. `max(rpp)` keeps
+      // a probe whose slice alone exceeds the cap firing ONE slice rather than
+      // none - a floored-to-zero cap would silence exactly the sparse probes
+      // the floor exists to feed.
+      if (floorOn) {
+        const rpp = probeBoost.element(i).max(uint(1)).toVar();
+        capEff.assign(capEff.div(rpp).mul(rpp).max(rpp));
+      }
       If(n.greaterThan(capEff), () => {
         atomicStore(rayCount.element(i), capEff);
       });
@@ -675,6 +820,11 @@ export function createSrcRayFrame(
   // reads: ray r of pixel p is global index `pixelRayBase[p] + r`. A pixel
   // whose probe is SLOT_EMPTY keeps SLOT_EMPTY here, which is how the trace
   // knows not to fire.
+  // SS19 6.1 - how many rays THIS pixel fires. The floor's word when it is
+  // armed, the compile-time constant when it is not, so an off build's WGSL is
+  // byte-identical to pre-6.1. Twin of the deposit's own loop bound.
+  const perPixel = (probe) => (floorOn ? probeBoost.element(probe) : uint(raysPerPixel));
+
   const d5Pass = Fn(() => {
     const i = pixelOf(instanceIndex.toVar());
     if (outOfRange) If(outOfRange(i), () => { Return(); });
@@ -689,7 +839,7 @@ export function createSrcRayFrame(
     // pass would be a second definition of the winner set, the exact
     // mismatch the transportPixel discipline exists to prevent.
     if (!cap) {
-      pixelRayBase.element(i).assign(atomicAdd(rayCursor.element(probe), uint(raysPerPixel)));
+      pixelRayBase.element(i).assign(atomicAdd(rayCursor.element(probe), perPixel(probe)));
       atomicStore(rayWork.element(atomicAdd(rayWork.element(uint(0)), uint(1)).add(uint(1))), i);
       return;
     }
@@ -709,9 +859,10 @@ export function createSrcRayFrame(
     // cursor pointed at.
     const w = probe.mul(PROBE_WORDS).toVar();
     const rayOff = probeTable.element(w.add(PROBE_RAYOFF)).toVar();
-    const off = atomicAdd(rayCursor.element(probe), uint(raysPerPixel)).toVar();
+    const rpp = perPixel(probe).toVar();
+    const off = atomicAdd(rayCursor.element(probe), rpp).toVar();
     const denied = rayOff.equal(uint(SLOT_EMPTY)).or(
-      off.add(uint(raysPerPixel)).greaterThan(rayOff.add(probeTable.element(w.add(PROBE_RAYS)))),
+      off.add(rpp).greaterThan(rayOff.add(probeTable.element(w.add(PROBE_RAYS)))),
     ).toVar();
     pixelRayBase.element(i).assign(select(denied, uint(SLOT_EMPTY), off));
     If(denied.not(), () => {
