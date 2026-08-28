@@ -173,14 +173,30 @@ const seg = async (label, n, moving) => {
   }
   const pct = rows.map((r) => (r.valid ? (100 * r.black) / r.valid : NaN));
   const fr = rows.map((r) => r.fresh);
+  const lv = rows.map((r) => r.live);
   console.log(`  ${label.padEnd(8)} black% mean ${f(mean(pct), 2)} max ${f(Math.max(...pct), 2)}` +
     `  |  fresh/frame mean ${Math.round(mean(fr))} max ${Math.max(...fr)}` +
-    `  |  live ${rows[rows.length - 1].live}  meanE ${f(rows[rows.length - 1].meanE, 4)}`);
-  return { rows, pct, fr };
+    `  |  live ${lv[0]}->${lv[lv.length - 1]} (churn ${Math.max(...lv) - Math.min(...lv)})` +
+    `  meanE ${f(rows[rows.length - 1].meanE, 4)}`);
+  return { rows, pct, fr, lv };
 };
 
 for (let i = 0; i < SETTLE; i++) await readOne();
 const parked = await seg("PARKED", 16, false);
+// ⚠ THE HEALTH GATE, BEFORE ANY ARM IS BELIEVED. The first paired run of this
+// probe produced one arm at `meanE 0.0000 / live 0 / black 100 %` on every
+// frame — a DEAD BOOT (the known intermittent one), not a result — and the two
+// arms were tabulated against each other anyway. A dead arm must stop the run,
+// not be differenced. [[probe-blind-statistics]]
+{
+  const last = parked.rows[parked.rows.length - 1];
+  if (!(last.meanE > 1e-3) || !(last.live > 0) || mean(parked.pct) > 50) {
+    console.log(`  FATAL health gate: parked meanE ${f(last.meanE, 4)}, live ${last.live}, ` +
+      `black ${f(mean(parked.pct), 2)} % — this boot never lit. Nothing below would be a measurement.`);
+    await browser.close();
+    process.exit(1);
+  }
+}
 const moving = await seg("MOVING", MOVE, true);
 const after = await seg("RECOVER", RECOVER, false);
 const base = mean(parked.pct);
@@ -190,4 +206,6 @@ const rec = after.pct.findIndex((p) => p <= base + 0.05);
 console.log(`  frames to recover: ${rec < 0 ? `>${RECOVER}` : rec}`);
 console.log(`  black% moving : ${moving.pct.map((p) => p.toFixed(1)).join(" ")}`);
 console.log(`  fresh   moving: ${moving.fr.join(" ")}`);
+console.log(`  live    moving: ${moving.lv.join(" ")}`);
+console.log(`  meanE   moving: ${moving.rows.map((r) => r.meanE.toFixed(3)).join(" ")}`);
 await browser.close();
