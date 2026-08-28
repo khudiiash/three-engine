@@ -368,9 +368,30 @@ export function createRcHitShading({
       // coherent step, and every address refreshes at exactly the same rate.
       const mixed = a.mul(uint(2654435761)).toVar();
       const phaseOfAddr = bitXor(mixed, shiftRight(mixed, uint(16))).toVar();
-      const due = ercPeriodMask
+      // ⭐⭐⭐ §19 STAGE 5.4d — THE BUDGET IS OFF, BECAUSE IT WAS NOT A LATENCY
+      // KNOB, IT WAS A LOSS.
+      //
+      // Hop (b), measured at 88 faces on Cornel: the cached `E_rc` word held
+      // 0.700 of what `gatherAt` said at the SAME point and normal at c0 (c1
+      // 0.974, ALL 0.758). The two are the same quantity — this block writes the
+      // second into the first — so the gap is the refresh alone: with the phase
+      // budget a face's word is up to `period` frames old, and inside a loop
+      // that is still climbing, "old" is systematically LOW. It never catches
+      // up, because the field it is chasing is itself built out of these words.
+      // A quarter of the second bounce was being spent on a saving of 3/4 of one
+      // buffer read.
+      //
+      // A hit face now refreshes on the frame it is hit. `ercAlpha` (rcSystem's
+      // `__gi2RcErcAlpha`, shipped 1) still decides how much of the new value
+      // lands, and at α = 1 the write stays ORDER-FREE — every ray reaching a
+      // face in one frame computes the same number from the same point, so which
+      // lands last cannot change the word (§T).
+      //
+      // `__gi2RcErcPeriod = 1` restores 5.3b's phase budget for the A/B.
+      const budgeted = (globalThis.__gi2RcErcPeriod ?? 0) !== 0;
+      const due = (ercPeriodMask && budgeted)
         ? fresh.or(bitAnd(phaseOfAddr, ercPeriodMask).equal(bitAnd(ercPhase, ercPeriodMask)))
-        : fresh;
+        : fresh.or(true);
       If(due, () => {
         const g = vec3(gatherAt(hp, hn).irradiance).toVar();
         cache.ercWrite(lF, vF, fF, g, ercAlpha).toVar();
