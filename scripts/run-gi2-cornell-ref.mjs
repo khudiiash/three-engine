@@ -1325,67 +1325,86 @@ if (process.env.FACETRUTH) {
           rays.push({ o: eye, d, tMax: 40 });
         }
       }
+      // ⚠⚠ A FRESH COMPUTE NODE'S FIRST `computeAsync` COMPILES THE PIPELINE AND
+      // DOES NOT RUN IT — `gi2FaceTermProbe`'s header records a whole battery
+      // lost to exactly this, and `createGi2RayShooter` has no warm-up of its
+      // own. Un-warmed, every ray reads `hit: false` (raw x = 0) and the census
+      // says "475 rays, 0 kept" on a camera pointing straight into a closed box,
+      // where 100 % of them must hit. Two throwaway dispatches, then the batches.
+      await shoot(rays.slice(0, 4));
+      await shoot(rays.slice(0, 4));
       const hits = [];
       for (let b = 0; b < rays.length; b += 63) hits.push(...await shoot(rays.slice(b, b + 63)));
       const winW = new Uint32Array(await eng.renderer.getArrayBufferAsync(gi2.win.attribute));
-      const occAt = (x, y, z) => {
+      // ⭐⭐ EVERY READ IS LEVEL-RELATIVE, AND THE FIRST CUT WAS NOT. The window
+      // is CASCADE_COUNT stacked 64³ lattices, `LEVEL_WORDS` apart, and a level
+      // `l` cell is `v0 · 2^l` across. Reading level 0's words for a hit the DDA
+      // reported on level 2 asks a different lattice about a cell index that
+      // means something else there — and on Cornel, where the eye is 6.8 m out,
+      // EVERY camera hit is coarse. That is the whole of the 0-face receipt.
+      const lvlBase = (l) => l * ws.LEVEL_WORDS;
+      const occAt = (l, x, y, z) => {
         const i = (x & 63) | ((y & 63) << 6) | ((z & 63) << 12);
-        return (winW[ws.OCC_OFF + (i >> 5)] >>> (i & 31)) & 1;
+        return (winW[lvlBase(l) + ws.OCC_OFF + (i >> 5)] >>> (i & 31)) & 1;
       };
-      const faceByte = (x, y, z) => {
+      const faceByte = (l, x, y, z) => {
         const i = (x & 63) | ((y & 63) << 6) | ((z & 63) << 12);
-        return (winW[ws.FACE_OFF + (i >> 2)] >>> ((i & 3) * 8)) & 255;
+        return (winW[lvlBase(l) + ws.FACE_OFF + (i >> 2)] >>> ((i & 3) * 8)) & 255;
       };
       const NRM = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
       // `gatherProbes.dominantFace`'s rule, transcribed — the VOXEL's dominant
       // axis, not the ray's entry face (§19 3.9). Reading the entry face files a
       // grazing hit under a side no ray ever fills and hands back a zero.
-      const domFace = (wc, hint) => {
-        const code = (faceByte(wc[0], wc[1], wc[2]) >>> 6) & 3;
+      const domFace = (l, wc, hint) => {
+        const code = (faceByte(l, wc[0], wc[1], wc[2]) >>> 6) & 3;
         if (!code) return -1;
         const ax = code - 1;
         const e = [0, 0, 0]; e[ax] = 1;
-        const occP = occAt(wc[0] + e[0], wc[1] + e[1], wc[2] + e[2]);
-        const occN = occAt(wc[0] - e[0], wc[1] - e[1], wc[2] - e[2]);
+        const occP = occAt(l, wc[0] + e[0], wc[1] + e[1], wc[2] + e[2]);
+        const occN = occAt(l, wc[0] - e[0], wc[1] - e[1], wc[2] - e[2]);
         if (!occP && occN) return 2 * ax;
         if (!occN && occP) return 2 * ax + 1;
         return 2 * ax + (hint[ax] >= 0 ? 0 : 1);
       };
       const seen = new Map();
+      const levelCensus = [0, 0, 0, 0, 0, 0, 0, 0];
+      let rejCell = 0;
+      let rejFace = 0;
       for (let k = 0; k < hits.length; k++) {
         const h = hits[k];
-        // ⛔ 5.4d FIRST CUT RETURNED AN EMPTY POPULATION AND PRINTED A TABLE OF
-        // ZEROS. `h.level !== 0` is Bistro's filter, where the camera stands
-        // inside the level-0 window; on Cornel the eye is 6.8 m out and EVERY
-        // hit comes back on a coarser level, so the loop rejected all 475 of
-        // them and the receipt said "0 faces" as if that were a measurement.
-        // [[probe-blind-statistics]] — the count is printed above the table for
-        // exactly this reason. Accepting a coarse hit needs the level's own
-        // voxel size AND its own window words (`level * LEVEL_WORDS` into the
-        // attribute buffer); until that is written this block only measures a
-        // scene the camera stands inside.
-        if (!h || !h.hit || h.level !== 0) continue;
+        if (!h || !h.hit) continue;
+        const l = h.level | 0;
+        levelCensus[Math.min(7, l)]++;
+        // The level's own cell size. `v0 · 2^l` is `windowStore`'s ladder and
+        // `traceWindow` reports the level it stopped on, so the hit point must
+        // be quantised with THAT size or the cell index is another level's.
+        const vl = v0 * (1 << l);
         const d = dirs[k];
-        const t = h.t + 0.02;
+        const t = h.t + vl * 0.05;
         const hp = [eye[0] + d[0] * t, eye[1] + d[1] * t, eye[2] + d[2] * t];
-        const cell = hp.map((c) => Math.floor(c / v0));
+        const cell = hp.map((c) => Math.floor(c / vl));
         const vi = (cell[0] & 63) | ((cell[1] & 63) << 6) | ((cell[2] & 63) << 12);
-        if (vi !== h.voxelIdx) continue;
-        const face = domFace(cell, [-d[0], -d[1], -d[2]]);
-        if (face < 0) continue;
-        const key = `${cell}|${face}`;
+        // The toroidal index must agree with the one the DDA filed, or the hit
+        // point reconstruction is wrong and every term below is another cell's.
+        if (vi !== h.voxelIdx) { rejCell++; continue; }
+        const face = domFace(l, cell, [-d[0], -d[1], -d[2]]);
+        if (face < 0) { rejFace++; continue; }
+        const key = `${l}|${cell}|${face}`;
         if (seen.has(key)) continue;
         const n = NRM[face];
         seen.set(key, {
-          p: [(cell[0] + 0.5) * v0 + n[0] * v0 * 0.5,
-            (cell[1] + 0.5) * v0 + n[1] * v0 * 0.5,
-            (cell[2] + 0.5) * v0 + n[2] * v0 * 0.5],
-          n, level: 0, voxelIdx: vi, face,
+          p: [(cell[0] + 0.5) * vl + n[0] * vl * 0.5,
+            (cell[1] + 0.5) * vl + n[1] * vl * 0.5,
+            (cell[2] + 0.5) * vl + n[2] * vl * 0.5],
+          n, level: l, voxelIdx: vi, face,
         });
       }
       const faces = [...seen.values()].slice(0, 600);
       const res = await terms(faces);
-      return JSON.stringify({ faces, out: res.faces ?? res, diag: res.diag ?? null });
+      return JSON.stringify({
+        faces, out: res.faces ?? res, diag: res.diag ?? null,
+        census: { hits: hits.length, levels: levelCensus, rejCell, rejFace, kept: seen.size },
+      });
     } catch (e) { return JSON.stringify({ error: `${e && e.message}` }); }
   }, { eye, aim });
   const F = JSON.parse(FJ ?? '{"error":"nothing"}');
@@ -1408,11 +1427,17 @@ if (process.env.FACETRUTH) {
       const truth = direct.irradiance(fc.p, fc.n, 1, 12345 + i, 256);
       const d = Math.hypot(fc.p[0] - lamp[0], fc.p[1] - lamp[1], fc.p[2] - lamp[2]);
       rows.push({
-        d, gpu: lum(nee), ref: lum(truth),
-        stored: lum(o.stored || [0, 0, 0]),
+        d, gpu: lum(nee), ref: lum(truth), level: fc.level,
+        stored: lum(o.stored || [0, 0, 0]), storedValid: o.storedValid || 0,
       });
     }
     const lit = rows.filter((r) => r.ref > 1e-4);
+    // ⚠ THE POPULATION IS PRINTED BEFORE THE TABLE, ALWAYS. 5.4d's first cut
+    // rejected every hit and printed an all-zero table under a "0 faces" line;
+    // the line is what made that legible as a miss instead of a measurement.
+    const c = F.census || {};
+    console.log(`  rays hit ${c.hits ?? "—"} · by level [${(c.levels ?? []).join(",")}]`
+      + ` · rejected cell ${c.rejCell ?? "—"} face ${c.rejFace ?? "—"} · kept ${c.kept ?? "—"}`);
     console.log(`  ${lit.length} faces of ${rows.length} with a lit reference   `
       + `(lamp at [${lamp.map((v) => v.toFixed(2))}])`);
     const bands = [[0, 1.5], [1.5, 2.5], [2.5, 3.5], [3.5, 5], [5, 99]];
@@ -1432,6 +1457,26 @@ if (process.env.FACETRUTH) {
     const allr = lit.reduce((a, r) => a + r.ref, 0) / Math.max(1, lit.length);
     console.log(`  ${"ALL".padEnd(20)}${String(lit.length).padStart(7)}${f(all, 4).padStart(12)}`
       + `${f(allr, 4).padStart(15)}${f(all / Math.max(1e-9, allr), 3).padStart(9)}`);
+    // ⭐ AND BY CASCADE BAND, because the ladder the gate measures is ordered by
+    // how far a surface's light travels and the BAND is what "far" means to this
+    // transport: a level `l` face is `v0·2^l` across and is answered by cascade
+    // `l`'s interval. A term that degrades with the band is a different bug from
+    // one that degrades with distance.
+    console.log("");
+    console.log(`  ${"cascade band".padEnd(20)}${"faces".padStart(7)}${"Enee/ref".padStart(12)}`
+      + `${"stored/ref".padStart(13)}${"written".padStart(10)}`);
+    for (let l = 0; l < 8; l++) {
+      const b = lit.filter((r) => r.level === l);
+      if (!b.length) continue;
+      const mg = b.reduce((a2, r) => a2 + r.gpu, 0) / b.length;
+      const mr = b.reduce((a2, r) => a2 + r.ref, 0) / b.length;
+      const mc = b.reduce((a2, r) => a2 + r.stored, 0) / b.length;
+      const wv = b.filter((r) => r.storedValid > 0.5).length;
+      console.log(`  ${`c${l}`.padEnd(20)}${String(b.length).padStart(7)}`
+        + `${f(mg / Math.max(1e-9, mr), 3).padStart(12)}`
+        + `${f(mc / Math.max(1e-9, mr), 3).padStart(13)}`
+        + `${`${wv}/${b.length}`.padStart(10)}`);
+    }
     result.faceTruth = { rows: rows.length, lit: lit.length, ratio: all / Math.max(1e-9, allr) };
   }
 }
