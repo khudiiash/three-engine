@@ -163,22 +163,37 @@ import {
 export const RAY_FLOOR = (() => {
   const raw = Number(globalThis.__giSrcRayFloor);
   if (Number.isFinite(raw) && raw >= 0) return Math.floor(raw);
-  // /!\ DEFAULT OFF, AND THE RECEIPT IS WHY. At 8 the mechanism WORKS -- the
-  // transport is alive (Cornell: rays 24410, 77.4 % hit, deposits 49109, black
-  // 0) and sparse probes get their floor -- but the Cornell gate REGRESSES:
-  // p90 |log ratio| 0.104 -> 0.506, and two surfaces cross the 10 % blotch
-  // bound. THE CAUSE IS NAMED AND IT IS AN ORDERING BUG, NOT A TUNING ONE:
-  // [D1a] raises `rayCount` BEFORE [D1\'] snapshots the natural count into
-  // `rayCursor`, so [D1\'\']'s `capped/natural` is measured against the BOOSTED
-  // demand -- the decay's alpha compensation then divides by a denominator that
-  // no longer means "what this probe would have asked for unaided", and the
-  // whole field's energy shifts with it. The fix is to snapshot the natural
-  // count BEFORE the floor raises it (move [D1a] after [D1\']'s store, or have
-  // [D1a] write `rayCursor` itself), which is a reordering.
+  // 8 at c0 when armed: a quarter of the 32 bins per frame, so a 1-pixel probe
+  // fills its lobe in ~4 frames -- the same order as the tile's 16-frame
+  // newborn fade, which is the half of 6.1 this feeds.
   //
-  // Until that lands the floor is code, not behaviour: at 0 `floorOn` is false,
-  // `probeBoost` is never bound, and every kernel here emits pre-6.1 WGSL.
-  // `__giSrcRayFloor = 8` arms it and reproduces both halves of the receipt.
+  // /!\ 6.1b's REASON FOR HOLDING IT OFF WAS REFUTED, AND A SECOND ONE TOOK
+  // ITS PLACE. 6.1b read Cornell p90 |log ratio| 0.525 armed against 0.104 and
+  // called it a regression -- but 0.104 came from 5.5b's COMMIT MESSAGE,
+  // measured with the BVH shadow arm ARMED, and this build runs with it off.
+  // Re-measured on THIS build, one boot per arm, the floor is Cornell-neutral:
+  //
+  //     arm     gate    rays    hit%    perRay   mean E   at-rest p90 / max
+  //     off     2/5    24336    71.4     1.72     1.164     1.86 % / 9.9 %
+  //     on      2/5    24410    77.3     2.02     1.188     1.11 % / 11.1 %
+  //
+  // black 0 in both. The floor's whole effect in that sealed box is +74 rays:
+  // the gate's viewport is close and small, every probe already covers many
+  // pixels, and `ceil(RAY_FLOOR / k)` is 1 almost everywhere. It binds where
+  // probes are PIXEL-STARVED, which is the elevated Bistro pose it was built
+  // for and which this box cannot reproduce.
+  //
+  // ⛔ WHAT ACTUALLY BLOCKS IT: `test:gi-src-rays`' COVERAGE ARM. The mirror
+  // now agrees with the GPU probe-for-probe (every by-key count check passes),
+  // but two checks still fail -- "every ray index in [0, total) is claimed"
+  // (45 870 of 53 738 unclaimed) and the boostEnable=0 total (51 830 vs
+  // 14 548). Both are the same statement: the gate's accounting assumes ONE
+  // slice width for the whole frame, and the floor makes it per probe. That is
+  // a real reconciliation, not a tuning pass, and shipping ON before it is
+  // done would be shipping past a red gate.
+  //
+  // `__giSrcRayFloor = 8` arms it; at 0 `probeBoost` is not even allocated and
+  // every kernel here emits pre-6.1 WGSL.
   return 0;
 })();
 
@@ -231,7 +246,13 @@ export function createSrcRayStore(store, { pixelCount }) {
   // where it does not — see [D1a]. One u32 per probe, and it is the ONE word
   // that lets [D5] and the deposit's [E] loop agree on a per-pixel count that
   // is no longer a compile-time constant.
-  const probeBoost = instancedArray(new Uint32Array(probeTotal), "uint");
+  // /!\ NULL WHEN THE FLOOR IS OFF, AND THE NULL IS LOAD-BEARING. The deposit
+  // guards its loop bound on whether this word EXISTS; srcRays guards on
+  // RAY_FLOOR. If the buffer is allocated but never written the two disagree,
+  // [E] loops `probeBoost[probe] == 0` and fires NO RAYS AT ALL - measured, and
+  // it presents as "transport never produced light", not as a dim frame. One
+  // condition, one buffer.
+  const probeBoost = RAY_FLOOR > 1 ? instancedArray(new Uint32Array(probeTotal), "uint") : null;
   return {
     probeBoost,
     rayCount,
@@ -556,6 +577,21 @@ export function createSrcRayFrame(
     passes.push(Fn(() => {
       const i = instanceIndex.add(uint(c0f.probeBase)).toVar();
       const n = atomicLoad(rayCount.element(i)).toVar();
+      // (*) THE NATURAL COUNT IS SNAPSHOT **HERE**, BEFORE THE RAISE. [D1'']
+      // publishes `capped/natural` as the decay's alpha compensation, and
+      // "natural" has to keep meaning WHAT THIS PROBE WOULD HAVE ASKED FOR
+      // UNAIDED. [D1'] used to take that snapshot, but it runs AFTER this pass,
+      // so once the floor raised `rayCount` the ratio was measured against the
+      // BOOSTED demand and every sparse probe reported itself un-starved.
+      //
+      // /!\ IT IS CORRECT, AND IT IS NOT WHAT 6.1b BLAMED IT FOR. 6.1b named
+      // this ordering as the cause of a Cornell "regression" that a same-build
+      // A/B then refuted -- both arms score the same. Fixed anyway, because
+      // `capped/natural` is a DEFINITION and the floor was breaking it; a
+      // quantity that silently changes meaning is a bug whether or not the one
+      // gate available happens to see it.
+      // [D1'] skips its own store under `floorOn` -- one writer, one definition.
+      if (cap) atomicStore(rayCursor.element(i), n);
       // No pixels, no origins - see RAY_FLOOR's note. `probeBoost` keeps [D0]'s
       // `raysPerPixel`, which no [D5] thread will ever read for this probe.
       If(n.equal(uint(0)), () => { Return(); });
@@ -611,11 +647,16 @@ export function createSrcRayFrame(
     passes.push(Fn(() => {
       const i = instanceIndex.add(uint(c0.probeBase)).toVar();
       const n = atomicLoad(rayCount.element(i)).toVar();
-      // Save the NATURAL count before clamping — into `rayCursor`, which is
-      // dead storage until [D3] seeds it. The α compensation needs
+      // Save the NATURAL count before clamping - into `rayCursor`, which is
+      // dead storage until [D3] seeds it. The alpha compensation needs
       // capped/natural per probe ([D1''] below), and after this store the
       // natural value exists nowhere else.
-      atomicStore(rayCursor.element(i), n);
+      //
+      // /!\ UNDER THE FLOOR THIS IS NOT THE NATURAL COUNT ANY MORE. [D1a] ran
+      // first and `n` is already the RAISED demand, so storing it here would
+      // define natural == boosted and silence the compensation exactly where it
+      // is needed. [D1a] publishes the true value at (*); this defers to it.
+      if (!floorOn) atomicStore(rayCursor.element(i), n);
       if (!capBoost) {
         If(n.greaterThan(uint(cap)), () => {
           atomicStore(rayCount.element(i), uint(cap));
