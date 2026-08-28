@@ -1652,6 +1652,17 @@ export class MergeSystem {
     proxy.userData.batchProxy = true;
     proxy.userData.mergeProxy = true;
     proxy.userData.engineOwned = true;
+    // ⭐ HOW MANY MEMBERS THIS PROXY STANDS IN FOR, readable from the proxy
+    // alone. `mergedInto` already points member → proxy; the reverse fact a
+    // consumer needs is "is EVERY member of this group in my set?", and that is
+    // a comparison against a count it has already accumulated. The selection
+    // outline uses it to stamp ONE proxy instead of N members when a whole
+    // group is selected — the proxy's geometry IS the concatenated members in
+    // world space, so the silhouette is identical and the mask pass stops
+    // re-submitting the subtree mesh by mesh. A count and not the member list:
+    // a list here would be a second strong reference to meshes `#teardown`
+    // exists to let go of.
+    proxy.userData.proxyMemberCount = members.length;
     this.#proxyParent().add(proxy);
     this.#invalidateBundle();
 
@@ -1793,6 +1804,8 @@ export class MergeSystem {
     proxy.userData.batchProxy = true;
     proxy.userData.mergeProxy = true;
     proxy.userData.engineOwned = true;
+    // See the same line in `#buildSameMaterialGroup` for what reads this.
+    proxy.userData.proxyMemberCount = members.length;
     this.#proxyParent().add(proxy);
     this.#invalidateBundle();
 

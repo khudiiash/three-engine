@@ -58,6 +58,61 @@ import { vmSingleton } from "./singleton.js";
  * actually selected. Nothing is allocated or rendered when the selection is
  * empty.
  *
+ * ⭐⭐ WHAT THAT COST MODEL MISSED, AND THE TWO THINGS THAT FIX IT (2026-08-28).
+ * "fps drops 2 times when the Bistro entity is selected". A 400-mesh subtree
+ * was the biggest thing measured above; a 1 536-mesh import is not that scene,
+ * and on it the mask pass submitted 850 depth-only draws EVERY FRAME. The frame
+ * is CPU-bound at ~40 µs per draw (see the `bistro-cpu-is-draws` receipt) — so
+ * the mask pass alone cost more than the picture it decorates: 44.5 ms of CPU
+ * with the root selected against 20.8 ms without, 20 fps against 38. Neither
+ * half of the old model was wrong; the missing terms were WHAT it draws and HOW
+ * OFTEN.
+ *
+ *   WHAT — the main pass draws that subtree as 187 merge proxies, and the mask
+ *   pass drew all 1 206 members individually, because the stamping loop
+ *   force-shows every member a merge hid. A proxy's geometry IS its members
+ *   concatenated in world space, so when the selection covers a WHOLE group the
+ *   proxy's silhouette is identical and it is one draw instead of N. Partially
+ *   covered groups keep the member path — stamping the proxy there would
+ *   outline meshes nobody selected. See `coveredProxies`. Measured: 850 → 343
+ *   draws per mask render, and the two masks agree on 450 912 covered texels
+ *   with ZERO of 464 544 differing (`probe:outline-root`, which renders it both
+ *   ways and compares the readback).
+ *
+ *   HOW OFTEN — the mask is a pure function of (selection, camera, target size,
+ *   where those objects are). On a parked camera none of that moves, so the
+ *   render is skipped entirely and the targets keep last frame's ring: a hit is
+ *   ZERO draws, not cheaper ones. The declared inputs are the cache key; the
+ *   undeclared ones (a script writing straight through `entity.position`) are
+ *   caught by `stampFingerprint`, the per-frame audit contentKey.js's banner
+ *   requires of every consumer. It walks the ~500 stamped objects, not the
+ *   1 536 meshes beneath them, which is what keeps the audit cheaper than the
+ *   thing it is guarding. Measured on an empty-scene box: 362 hits, 0 renders.
+ *
+ * TOGETHER, on Bistro with the root selected: the mask went from 850 draws
+ * EVERY frame to 171 per frame parked and 330 orbiting; CPU 42.3 → 27.3 ms
+ * parked (deselected 18.0) and 43.3 → 31.4 ms orbiting (deselected 19.2); fps
+ * 20 → 32 parked (deselected 46) and 19 → 25 orbiting (deselected 38). The
+ * "selecting halves the frame rate" report is 2.35x → 1.51x parked and
+ * 2.26x → 1.64x orbiting. ⚠ Ratios move a few points run to run with what else
+ * is on the GPU; the DRAW counts do not, which is why they are the receipt.
+ *
+ * ⚠ AND WHAT IS LEFT, NAMED. Parked is 1.5x rather than 1.0x for one reason
+ * the receipt states outright — the scene's Player rig animates in the editor
+ * and sits under the same prefab root, so exactly half the parked frames
+ * re-render with `miss: pose` (66 of 132; zero `audit`, zero `content`). One
+ * moving character re-submits all ~340 static draws because the mask is a
+ * single target that must be cleared; a second target holding the static half
+ * (blit it, then draw only the movers) would close that, and is not built. On a
+ * selection with nothing animating the cache is total: 362 hits, 0 renders.
+ * Orbiting is 1.64x because every frame there is a real mask render of the same
+ * geometry the main pass already drew — the structural fix for THAT is writing
+ * the mask inside the main pass, which this module's whole safety contract
+ * exists to avoid.
+ *
+ * `selectionOutlineStats()` reports all of it: `maskDraws` (counted by the
+ * renderer, not inferred), `hits`/`renders`, and `misses` BY REASON.
+ *
  * KNOWN LIMITS, deliberate:
  *   - The outline is not occluded. A selected object behind a wall still shows
  *     its silhouette, because the mask pass has no scene depth to test against
@@ -88,6 +143,22 @@ const ACTIVE_BIT = 1 << SELECTION_ACTIVE_LAYER;
 
 const _size = new THREE.Vector2();
 
+/**
+ * Every reason the frame cache can decline to answer, as a zeroed histogram.
+ *
+ * Named individually because "the cache never hits" is the same observation for
+ * all of them and a different bug in each: `disabled` is the probe's own switch,
+ * `cold` is the first frame of a selection, `notlive` means the ring was
+ * cleared, and `selection`/`camera`/`size`/`dpi`/`content` are the declared key terms.
+ * `pose` is a skinned/morphed mesh in the selection having moved — expected
+ * work, not a fault. `audit` is the key agreeing while the walk disagreed about
+ * anything ELSE — the only one of these that indicates a missing producer.
+ */
+const MISS_REASONS = {
+  disabled: 0, cold: 0, notlive: 0,
+  selection: 0, camera: 0, size: 0, dpi: 0, content: 0, audit: 0, pose: 0,
+};
+
 const state = vmSingleton("selectionOutline", () => ({
   /** @type {THREE.Object3D[]} Roots whose subtrees are outlined. */
   roots: [],
@@ -95,6 +166,21 @@ const state = vmSingleton("selectionOutline", () => ({
   activeRoot: null,
   /** @type {{mesh: THREE.Mesh, active: boolean}[]} Flattened, cached. */
   entries: [],
+  /** Bumped by refreshEntries; the cheap "is this a different selection" term. */
+  entriesRev: 0,
+  /** How many selected meshes are skinned/morphed — receipt only, see refreshEntries. */
+  animated: 0,
+  /**
+   * @type {THREE.Object3D[]|null} What the last mask render actually submitted
+   * — merge/batch proxies plus the meshes that draw themselves. The audit walks
+   * THIS, not `entries`, which is why the audit stays cheap on a 1 600-mesh
+   * subtree that collapses to ~200 proxies.
+   */
+  stampObjects: null,
+  /** @type {any} Frame cache: the declared key, the audit hash, and counters. */
+  cache: null,
+  /** @type {any} Last pass's receipt — see selectionOutlineStats. */
+  stats: null,
   /** Set when the scene tree may have changed under a selected root. */
   dirty: false,
   enabled: true,
@@ -193,6 +279,220 @@ function refreshEntries() {
     collectMeshes(root, false, entries, seen);
   }
   state.entries = entries;
+  // Bumped whenever the SET changes, so the frame cache below never has to
+  // compare two mesh lists — a selection change is one integer apart.
+  state.entriesRev = (state.entriesRev ?? 0) + 1;
+  // ⭐⭐ THE SHAPES THAT MOVE WITHOUT MOVING. A skinned or morphed mesh changes
+  // silhouette with no transform write, no visibility flip and no attribute
+  // version bump — the pose lives in bone matrices and influence weights.
+  //
+  // The first version of the cache handled that by refusing to cache ANY
+  // selection containing one, and on Bistro that turned out to be the whole
+  // feature: the scene's `Player` rig sits under the same prefab root as the
+  // 1 535 static building meshes, so ONE skinned character held every one of
+  // them hostage and the cache never engaged once — 123 misses in 123 parked
+  // frames, and `animated: 1` is the count that said so. A blanket opt-out
+  // keyed on the presence of a hard case is not a conservative choice; it is
+  // the feature not shipping.
+  //
+  // So they are WATCHED instead, exactly, in `stampFingerprint`. This count is
+  // kept only as the receipt that a selection contains any.
+  let animated = 0;
+  for (const { mesh } of entries) {
+    if (mesh.isSkinnedMesh || mesh.morphTargetInfluences?.length) animated++;
+  }
+  state.animated = animated;
+}
+
+/* ------------------------- cache-key ingredients -------------------------- */
+
+/**
+ * Exact float hashing. `Math.imul` over the IEEE bit pattern, not over the
+ * value: two positions a micrometre apart must not collide, and a rounded or
+ * quantised hash is exactly the "it only updates when you move far enough"
+ * class of bug.
+ */
+const _f32 = new Float32Array(1);
+const _i32 = new Int32Array(_f32.buffer);
+const HASH_SEED = 2166136261;
+
+function hashFloat(h, v) {
+  _f32[0] = v;
+  return Math.imul(h ^ _i32[0], 16777619) >>> 0;
+}
+
+function hashInt(h, v) {
+  return Math.imul(h ^ (v | 0), 16777619) >>> 0;
+}
+
+/**
+ * Everything about the camera that moves a silhouette on screen: the world
+ * matrix (position + orientation) and the projection (fov, aspect, zoom, near,
+ * far). `updateMatrixWorld` first because this runs in PRE-render, before the
+ * renderer has refreshed it — hashing a stale matrix would hold the ring one
+ * frame behind the camera, which reads as the outline "swimming".
+ *
+ * LIMIT: a camera parented under something that moved is only seen once that
+ * parent's own matrix has been updated. The editor viewport camera is
+ * unparented, so this is exact there.
+ */
+function cameraHash(camera) {
+  camera.updateMatrixWorld();
+  let h = HASH_SEED;
+  const m = camera.matrixWorld.elements;
+  for (let i = 0; i < 16; i++) h = hashFloat(h, m[i]);
+  const p = camera.projectionMatrix.elements;
+  for (let i = 0; i < 16; i++) h = hashFloat(h, p[i]);
+  return h;
+}
+
+/**
+ * THE AUDIT, in the sense contentKey.js means it.
+ *
+ * `engine.content.version` is a sufficient CHANGE signal and explicitly NOT a
+ * proof of no change — `entity.position.x += 1` from a script, physics
+ * write-back and an animation mixer all bypass its setters. Its own banner
+ * requires every consumer to keep a cheap periodic re-walk. This is ours, and
+ * it runs EVERY frame rather than every N because it walks the STAMP LIST
+ * (~200 objects on Bistro once whole merge groups collapse to their proxies),
+ * not the 1 600 meshes underneath it.
+ *
+ * What it covers: the object left the scene, was hidden or shown, moved,
+ * had its geometry swapped or re-uploaded, was re-posed (bone matrices, morph
+ * influences), or — for a batch proxy — had its instance matrices re-synced.
+ * Rotation is sampled off-diagonally as well as on, so a 180° flip is not a
+ * fixed point.
+ *
+ * What it does NOT cover, and does not need to: the mask renders with an
+ * OVERRIDE material, so nothing a material does — including a `positionNode`
+ * that animates vertices in the shader — can move this silhouette.
+ */
+const _fp = { stat: 0, anim: 0 };
+
+function stampFingerprint(objects) {
+  let h = hashInt(HASH_SEED, objects.length);
+  let a = HASH_SEED;
+  for (let i = 0; i < objects.length; i++) {
+    const o = objects[i];
+    h = hashInt(h, o.id);
+    h = hashInt(h, o.parent ? 1 : 0);
+    h = hashInt(h, o.visible ? 1 : 0);
+    const e = o.matrixWorld.elements;
+    h = hashFloat(h, e[0]);
+    h = hashFloat(h, e[1]);
+    h = hashFloat(h, e[5]);
+    h = hashFloat(h, e[6]);
+    h = hashFloat(h, e[10]);
+    h = hashFloat(h, e[12]);
+    h = hashFloat(h, e[13]);
+    h = hashFloat(h, e[14]);
+    const g = o.geometry;
+    h = hashInt(h, g?.id ?? 0);
+    h = hashInt(h, g?.attributes?.position?.version ?? 0);
+    if (o.isInstancedMesh) {
+      h = hashInt(h, o.count);
+      h = hashInt(h, o.instanceMatrix?.version ?? 0);
+    }
+    // ⭐ THE POSE. A skinned mesh's silhouette is its bone matrices and nothing
+    // above sees them; a morph target's is its influence weights. Both are
+    // small contiguous arrays, so watching them exactly costs less than the one
+    // draw it saves — and it is what lets a selection that merely CONTAINS a
+    // character still cache the 1 500 static meshes beside it.
+    //
+    // ⚠ ONE FRAME LATE, deliberately. `skeleton.update()` runs inside the
+    // renderer, so in PRE-render `boneMatrices` still holds last frame's pose:
+    // the first frame of a movement re-renders the mask one frame after it
+    // began. On a 2 px ring over a moving character that is not observable, and
+    // the alternative — forcing a skeleton update here — would do the animation
+    // system's work twice every frame to fix a frame of lag nobody can see.
+    const bones = o.isSkinnedMesh ? o.skeleton?.boneMatrices : null;
+    if (bones) {
+      // Strided so a 4 000-bone rig cannot turn the audit into the cost. Every
+      // bone contributes its translation column; a rotation-only change still
+      // moves a child bone's translation, so nothing static hashes as moving.
+      const stride = bones.length > 4096 ? 16 * Math.ceil(bones.length / 4096) : 16;
+      for (let b = 12; b < bones.length; b += stride) {
+        a = hashFloat(a, bones[b]);
+        a = hashFloat(a, bones[b + 1]);
+        a = hashFloat(a, bones[b + 2]);
+      }
+    }
+    const morphs = o.morphTargetInfluences;
+    if (morphs) for (let m = 0; m < morphs.length; m++) a = hashFloat(a, morphs[m]);
+  }
+  _fp.stat = h;
+  _fp.anim = a;
+  return _fp;
+}
+
+/** A member's stand-in in the main pass, or null if it draws itself. */
+function proxyOf(mesh) {
+  const data = mesh.userData;
+  if (!data) return null;
+  return data.mergedInto ?? data.batchedInto ?? null;
+}
+
+/**
+ * Decides, per proxy, whether the selection covers the WHOLE group.
+ *
+ * ⭐ WHY THIS IS THE WHOLE FIX. The main pass draws Bistro's 1 204 merged
+ * meshes as 189 proxies; the mask pass was drawing all 1 204 individually,
+ * because the stamping loop force-shows every merged member. The frame is
+ * CPU-bound at ~40 µs per draw, so selecting the root doubled the frame — the
+ * mask cost more than the picture. A proxy's geometry IS its members
+ * concatenated in world space (merging.js) and a batch's instance matrices ARE
+ * its members' world matrices (batching.js), so when every member is selected
+ * IN THE SAME CHANNEL the proxy's silhouette is identical, pixel for pixel,
+ * to the union of theirs.
+ *
+ * A PARTIALLY covered group keeps the member path: stamping the proxy there
+ * would outline meshes the user did not select, which is a correctness bug,
+ * not a performance trade. Mixed channels (some members active, some merely
+ * selected) are partial for the same reason — one draw carries one colour.
+ *
+ * @return {Map<any, boolean>} proxy → active channel, for fully covered groups.
+ */
+function coveredProxies(entries) {
+  // The escape hatch, and the receipt rig in one. `run-outline-root-probe.mjs`
+  // renders the SAME selection both ways and compares the mask texel for texel
+  // — a claim of "identical silhouette" that is measured rather than argued
+  // needs a way to draw the other one. Also the one-line revert if a proxy is
+  // ever found whose geometry is NOT its members.
+  if (/** @type {any} */ (globalThis).__outlineNoProxyCollapse) return new Map();
+  /** @type {Map<any, {count: number, active: boolean, mixed: boolean}>} */
+  const cover = new Map();
+  for (const { mesh, active } of entries) {
+    if (!mesh.parent) continue;
+    const proxy = proxyOf(mesh);
+    if (!proxy) continue;
+    const seen = cover.get(proxy);
+    if (!seen) cover.set(proxy, { count: 1, active, mixed: false });
+    else {
+      seen.count++;
+      if (seen.active !== active) seen.mixed = true;
+    }
+  }
+  const covered = new Map();
+  for (const [proxy, seen] of cover) {
+    // `proxyMemberCount` absent ⇒ a proxy from a build that predates the
+    // accessor, or something else entirely wearing `mergedInto`. Unknown total
+    // is never "covered": fall back to the members, which is always correct.
+    const total = proxy.userData?.proxyMemberCount ?? 0;
+    if (!total || seen.mixed || seen.count !== total) continue;
+    // A proxy the engine has hidden or detached draws nothing; its members do.
+    if (!proxy.parent || !proxy.visible) continue;
+    // ⚠ NOT A PROXY INSIDE A RENDER BUNDLE. `merging.js#proxyParent` parks the
+    // proxies under a `BundleGroup` when `performance.renderBundles` is on, and
+    // a bundle RECORDS its render list and replays it — the recording is keyed
+    // on (group, camera, render context), so the mask pass's two channel
+    // sub-passes share one recording and the second would replay the first's
+    // list. The members are outside the bundle and draw honestly, so falling
+    // back to them is both correct and free. (renderBundles is off by default
+    // and measured net-zero while GI is on — see the render-bundles receipt.)
+    if (proxy.parent.isBundleGroup) continue;
+    covered.set(proxy, seen.active);
+  }
+  return covered;
 }
 
 function ensureTargets(width, height) {
@@ -347,9 +647,16 @@ function buildFullscreenMaterials(radius) {
  *   the outline the same apparent thickness on a HiDPI display.
  * @param {boolean} [options.playing] Play mode never shows the editor outline;
  *   passing true clears any live ring instead of rendering one.
+ * @param {number} [options.contentVersion] `engine.content.HIERARCHY` — not
+ *   `.version`. See the cache block for why the broad counter cannot be used
+ *   here. Part of the cache key; omitting it only costs a redraw the audit
+ *   would have caught anyway, so the offscreen screenshot path need not thread
+ *   it.
+ * @param {number} [options.contentFull] `engine.content.version`, recorded but
+ *   NOT part of the key — the receipt for the paragraph above.
  * @return {boolean} True when the targets now hold a live ring.
  */
-export function updateSelectionOutlineMask({ renderer, scene, camera, width, height, pixelRatio, playing = false }) {
+export function updateSelectionOutlineMask({ renderer, scene, camera, width, height, pixelRatio, playing = false, contentVersion, contentFull }) {
   if (!renderer || !scene || !camera) return false;
   const wants = !playing && state.enabled && state.roots.length > 0;
   if (wants) refreshEntries();
@@ -381,20 +688,158 @@ export function updateSelectionOutlineMask({ renderer, scene, camera, width, hei
   if (!state.compositeMaterial || state.radius !== radius) buildFullscreenMaterials(radius);
   if (state.overlayRadiusU) state.overlayRadiusU.value = radius;
 
+  // ---------------------------- THE STATIC CACHE ----------------------------
+  //
+  // The mask is a pure function of (what is selected, where the camera is, how
+  // big the target is, where those objects are). None of that changes on a
+  // parked camera, and re-deriving it every frame is what made "selected" cost
+  // as much as "drawn". The targets persist between frames — nothing else
+  // writes them and we only clear them on purpose (clearRing) — so a hit is
+  // literally zero GPU work, not a cheaper redraw.
+  //
+  // The key is the declared inputs; `stampFingerprint` is the audit that
+  // catches the undeclared ones (see its own header). Both must agree.
+  //
+  // `__outlineNoCache` (with `__outlineNoProxyCollapse`) reproduces the exact
+  // pre-08-28 behaviour, so `run-outline-root-probe.mjs` can measure before and
+  // after in ONE boot of a scene that takes minutes to reach first light — a
+  // cross-session A/B on this engine is not a controlled experiment (the GI
+  // compile wave, the merge budget and the frame governor all differ boot to
+  // boot). Also the revert switch if the cache is ever caught holding a stale
+  // ring in the field.
+  //
+  // ⭐ AND EVERY MISS SAYS WHICH TERM MOVED. A cache that silently never hits
+  // looks exactly like a cache that is working — the frame is simply as slow as
+  // before, and there is nothing to read. `misses` is a histogram by reason, so
+  // "the camera is not actually parked", "the content key churns", "something
+  // in the selection is animating" and "an undeclared writer is moving the
+  // geometry" are four different lines instead of one absent hit count. On the
+  // day this shipped it separated the third from the fourth on Bistro, which is
+  // the difference between "expected work" and "a producer is missing".
+  //
+  // THE KEY'S CONTENT TERM IS `content.HIERARCHY`, NOT `.version`.
+  //
+  // `.version` moves for ANY change the engine announces, and most of those
+  // cannot touch this mask: a material edit (the mask uses an override
+  // material), a settings change, and `visibility-resolve`, which bumps every
+  // time occlusion culling or LOD flips one mesh anywhere in the scene.
+  // `.hierarchy` is the one axis the stamp fingerprint genuinely cannot see —
+  // an object APPEARING under a selected root — and even that is belt and
+  // braces, because `hierarchy-changed` already calls
+  // `invalidateSelectionOutline` (ViewportPanel), which moves `entriesRev`.
+  // Everything else the mask depends on is measured directly, on the objects
+  // themselves.
+  //
+  // ⚠ AND THAT NARROWING IS NOT WHY THE CACHE WORKS — it is insurance, and the
+  // honest measurement says so: on parked Bistro `contentChurn` came back 0 of
+  // 131 frames, i.e. `.version` was stable and the broad key would have hit
+  // too. The receipt is kept live rather than deleted because "the content key
+  // is quiet on THIS scene" is not a property of the engine: a scene with
+  // occlusion culling actively flipping meshes would churn it every frame, and
+  // then the broad key would silently cost the whole feature. Read
+  // `contentChurn` before blaming this term for anything.
+  const cache = (state.cache ??= {
+    key: null, fpStat: 0, fpAnim: 0, hits: 0, renders: 0, audits: 0,
+    frames: 0, contentChurn: 0, lastContentFull: null,
+    misses: { ...MISS_REASONS },
+  });
+  cache.misses ??= { ...MISS_REASONS };
+  cache.frames = (cache.frames ?? 0) + 1;
+  if (contentFull !== undefined) {
+    if (cache.lastContentFull != null && contentFull !== cache.lastContentFull) cache.contentChurn++;
+    cache.lastContentFull = contentFull;
+  }
+  const key = {
+    rev: state.entriesRev ?? 0,
+    cam: cameraHash(camera),
+    w, h, radius,
+    content: contentVersion ?? null,
+  };
+  const prev = cache.key;
+  // ⚠ ONE REASON PER LINE, NOT ONE BUCKET FOR ALL OF THEM. The first version of
+  // this collapsed "the switch is off", "no ring live", "nothing cached yet"
+  // and "the selection holds a skinned mesh" into a single `off`, and the probe
+  // then reported `off:123` for a cache that was refusing to engage — a count
+  // that named the symptom and hid all four candidate causes. Splitting them is
+  // what identified the real one (a character under the building's prefab root)
+  // in one run instead of four. An instrument that cannot distinguish its own
+  // failure modes is not an instrument.
+  let miss = null;
+  if (/** @type {any} */ (globalThis).__outlineNoCache) miss = "disabled";
+  else if (!prev || !state.stampObjects) miss = "cold";
+  else if (!state.ringLive) miss = "notlive";
+  else if (prev.rev !== key.rev) miss = "selection";
+  else if (prev.cam !== key.cam) miss = "camera";
+  else if (prev.w !== key.w || prev.h !== key.h) miss = "size";
+  else if (prev.radius !== key.radius) miss = "dpi";
+  else if (prev.content !== key.content) miss = "content";
+  else {
+    const fp = stampFingerprint(state.stampObjects);
+    if (fp.stat !== cache.fpStat) {
+      // ⭐ THE KEY SAID "NOTHING CHANGED" AND THE WALK DISAGREED, about
+      // something that is not a pose — the same shape of hole contentKey.js's
+      // `auditDisagreed` reports (a script writing straight through
+      // `entity.position`, physics write-back, a geometry swap nobody
+      // announced). Redrawing heals it on the spot; a CLIMBING `audits` is the
+      // receipt that a producer is missing somewhere and should be fixed there.
+      miss = "audit";
+      cache.audits++;
+    } else if (fp.anim !== cache.fpAnim) {
+      // ⭐⭐ NOT A HOLE — AN ANIMATION IS PLAYING INSIDE THE SELECTION, and it
+      // is kept a SEPARATE reason for two reasons that both matter. It would
+      // otherwise be counted as `audit` and read as a bug in the producer set
+      // (that is exactly how it read on Bistro at first: 66 "audits" on a
+      // parked camera, which is alarming until you know that the scene's Player
+      // rig sits under the same prefab root as the 1 535 building meshes and is
+      // animating in the editor). And it names the ONE remaining cost on a
+      // parked camera: one moving character forces all ~340 static draws to be
+      // re-submitted, because the mask is one target that has to be cleared.
+      // The fix, if that ever matters, is a second target holding the static
+      // half — blit it, then draw only the movers on top. Not built: it is a
+      // third render target and a new clear/blit path through the file's
+      // stability contract, for a case that is free the moment nothing in the
+      // selection is animating.
+      miss = "pose";
+    }
+  }
+  if (!miss) {
+    cache.hits++;
+    return true;
+  }
+  cache.misses[miss] = (cache.misses[miss] ?? 0) + 1;
+  cache.lastMiss = miss;
+
   // Stamp the isolation layer. `visible` is forced only for meshes a SYSTEM
   // hid while still drawing them — a static-batching member renders through
   // its proxy, so its own flag says nothing about whether it is on screen
   // (batching.js sets it false by design). A mesh the USER hid stays hidden
   // and gets no outline, which is the honest answer.
+  //
+  // ⭐ WHOLE GROUPS COLLAPSE TO THEIR PROXY FIRST — see `coveredProxies`. What
+  // is left in `state.entries` after that is only the meshes the main pass
+  // draws individually anyway, so the mask pass now costs what the picture
+  // costs instead of a multiple of it.
+  const covered = coveredProxies(state.entries);
   const stamped = [];
+  /** The objects the mask actually submits — what the next frame's audit walks. */
+  const stampObjects = [];
   let hasActive = false;
   let hasSelected = false;
+  for (const [proxy, active] of covered) {
+    stamped.push({ mesh: proxy, mask: proxy.layers.mask, visible: proxy.visible });
+    stampObjects.push(proxy);
+    proxy.layers.mask = active ? ACTIVE_BIT : SELECTED_BIT;
+    if (active) hasActive = true;
+    else hasSelected = true;
+  }
   for (const { mesh, active } of state.entries) {
     if (!mesh.parent) continue; // removed from the scene since we collected it
-    const forceVisible =
-      !mesh.visible && !!(mesh.userData?.batchedInto || mesh.userData?.mergedInto);
+    const proxy = proxyOf(mesh);
+    if (proxy && covered.has(proxy)) continue; // its proxy carries it
+    const forceVisible = !mesh.visible && !!proxy;
     if (!mesh.visible && !forceVisible) continue;
     stamped.push({ mesh, mask: mesh.layers.mask, visible: mesh.visible });
+    stampObjects.push(mesh);
     mesh.layers.mask = active ? ACTIVE_BIT : SELECTED_BIT;
     if (forceVisible) mesh.visible = true;
     if (active) hasActive = true;
@@ -404,6 +849,14 @@ export function updateSelectionOutlineMask({ renderer, scene, camera, width, hei
     clearRing(renderer);
     return false;
   }
+  // ⚠ `render.drawCalls`, NOT `render.calls`. The latter counts RENDER CALLS —
+  // one per `renderer.render()` — so it reported "1" for a pass submitting 850
+  // draws, and the first run of the probe printed "1 mask draw" for the exact
+  // pass this change exists to shrink. `drawCalls`
+  // accumulates per draw and resets once per animation frame (Info.reset), so a
+  // delta across this synchronous block is exactly this pass.
+  const callsBefore = renderer.info?.render?.drawCalls ?? 0;
+  let maskDraws = 0;
 
   // Cast: three's own runtime takes `(renderer, scene, state)` for both of
   // these — its shipped `@types` declaration drops the `scene` parameter.
@@ -443,6 +896,13 @@ export function updateSelectionOutlineMask({ renderer, scene, camera, width, hei
       renderer.render(scene, camera);
     }
     scene.overrideMaterial = null;
+    // The receipt the whole fix is judged on: how many draws the mask pass
+    // actually submitted, counted by the renderer rather than inferred from
+    // the stamp list (frustum culling removes some of what we stamped).
+    // `info` is reset once per animation frame, so a delta taken inside this
+    // synchronous block is exactly this pass. Read before the dilate quad so
+    // the number is geometry draws, not geometry + 1.
+    maskDraws = (renderer.info?.render?.drawCalls ?? 0) - callsBefore;
 
     renderer.setRenderTarget(state.dilateTarget);
     renderer.autoClear = true;
@@ -462,8 +922,71 @@ export function updateSelectionOutlineMask({ renderer, scene, camera, width, hei
     renderer.shadowMap.enabled = prevShadows;
     utils.restoreRendererAndSceneState(renderer, scene, rendererState);
   }
+  // AFTER the restore, never inside the stamped window: the loop above forces
+  // merged members visible and rewrites their layer bits, and a fingerprint
+  // taken there would describe a state no later frame can ever reproduce —
+  // every subsequent frame would "detect a change" and redraw.
+  state.stampObjects = stampObjects;
+  cache.key = key;
+  {
+    const fp = stampFingerprint(stampObjects);
+    cache.fpStat = fp.stat;
+    cache.fpAnim = fp.anim;
+  }
+  cache.renders++;
+  state.stats = {
+    entries: state.entries.length,
+    proxies: covered.size,
+    meshes: stamped.length - covered.size,
+    stamped: stamped.length,
+    maskDraws,
+    animated: state.animated ?? 0,
+    renders: cache.renders,
+    hits: cache.hits,
+    audits: cache.audits,
+  };
   state.ringLive = true;
   return true;
+}
+
+/**
+ * What the last mask pass did, for probes and `profile.*` receipts.
+ *
+ * `maskDraws` is the number this whole change exists to move: the draws the
+ * mask pass submitted, counted by the renderer. `hits` is how many frames since
+ * the last real render cost nothing at all, and `audits` is how many times the
+ * declared cache key claimed "unchanged" while the stamp-list walk disagreed —
+ * a non-zero, CLIMBING audits count means a producer is missing, exactly as
+ * contentKey.js describes.
+ */
+/**
+ * The live mask/dilate targets — for a probe that needs to read the ring back
+ * as PIXELS. Not part of the effect's contract: nothing in the editor may hold
+ * these across a `renderer-rebuilt` (see the stability note on
+ * applySelectionOutlineOverlay), and nothing may render into them.
+ */
+export function selectionOutlineTargets() {
+  return { mask: state.maskTarget, dilate: state.dilateTarget };
+}
+
+export function selectionOutlineStats() {
+  return {
+    ...(state.stats ?? { entries: 0, proxies: 0, meshes: 0, stamped: 0, maskDraws: 0 }),
+    ringLive: state.ringLive,
+    hits: state.cache?.hits ?? 0,
+    renders: state.cache?.renders ?? 0,
+    audits: state.cache?.audits ?? 0,
+    // WHY it re-rendered, by reason. Read this before concluding the cache
+    // does not work: "never hits" is the same observation for six different
+    // causes, and only this separates them.
+    misses: { ...(state.cache?.misses ?? {}) },
+    lastMiss: state.cache?.lastMiss ?? null,
+    // Frames this function was asked for a mask, and how many of them saw
+    // `engine.content.version` move. A churn equal to `frames` is the receipt
+    // that the broad content key is unusable as a cache term on this scene.
+    frames: state.cache?.frames ?? 0,
+    contentChurn: state.cache?.contentChurn ?? 0,
+  };
 }
 
 /**
@@ -474,6 +997,12 @@ export function updateSelectionOutlineMask({ renderer, scene, camera, width, hei
  * never-rendered target needs no clear.
  */
 function clearRing(renderer) {
+  // Unconditionally, even on the early return: the cache holds the ONLY reason
+  // a later frame may skip the mask render, and a cleared (or never-rendered)
+  // target must never be reachable through it. Dropping `stampObjects` here
+  // also lets go of the meshes — a deselected subtree must not stay pinned.
+  if (state.cache) state.cache.key = null;
+  state.stampObjects = null;
   if (!state.ringLive) return;
   state.ringLive = false;
   if (!state.maskTarget || !renderer) return;
@@ -696,4 +1225,9 @@ export function disposeSelectionOutline() {
   state.roots = [];
   state.activeRoot = null;
   state.entries = [];
+  // The targets these described are gone; a surviving key would let the next
+  // frame skip the render that has to repopulate the NEW ones.
+  state.cache = null;
+  state.stampObjects = null;
+  state.stats = null;
 }

@@ -183,6 +183,13 @@ export class BatchSystem {
       instanced.raycast = () => {};
       instanced.userData.batchProxy = true;
       instanced.userData.engineOwned = true;
+      // How many member meshes this proxy stands in for — the same field
+      // merging.js writes on its merge proxies, for the same reason: a
+      // consumer holding a set of member meshes needs to answer "is the WHOLE
+      // batch in my set?" from the proxy alone. `instanced.count` is the same
+      // number today but is a live draw parameter (a culling pass may lower
+      // it), so the fact is recorded separately rather than inferred.
+      instanced.userData.proxyMemberCount = members.length;
 
       const cache = new Float32Array(members.length * 16);
       for (let i = 0; i < members.length; i++) {

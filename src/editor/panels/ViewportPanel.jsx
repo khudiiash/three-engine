@@ -1204,6 +1204,17 @@ function setupSelectionOutline() {
       scene: engine.scene,
       camera: viewport.camera,
       playing: engine.playing,
+      // ⚠ `hierarchy`, NOT `version`. The broad counter moves for every change
+      // the engine announces and most of those cannot touch a mask drawn with
+      // an override material — a material edit, a settings change, or
+      // `visibility-resolve` firing because occlusion culling flipped one mesh
+      // anywhere in the scene. `hierarchy` is the one axis the outline's own
+      // per-frame audit cannot see. Full reasoning at the cache block in
+      // selectionOutline.js; `contentChurn` there is the live receipt (measured
+      // 0 of 131 frames on parked Bistro, so this is insurance, not a rescue).
+      contentVersion: engine.content?.hierarchy,
+      // Recorded, not keyed — the receipt for the line above.
+      contentFull: engine.content?.version,
     });
   });
   engine.onPostRender(() => {
