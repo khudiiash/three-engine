@@ -5085,3 +5085,192 @@ measuring, it is guessing. [[probe-blind-statistics]]
   GI2 2.09× against a truth of 5.69×. ⚠ And the pinned "façade column" is a
   SCREEN column — `FAC1` and `FAC6` are 35 m apart in world space — so the fall
   is a statistic about a screen strip, not about one wall.
+
+---
+
+## §AJ — THE CORNELL BOX AS A PER-PIXEL GATE, AND WHAT IT FOUND (2026-08-28)
+
+**User, 15:24 (screenshot of their own `Cornel.scene`):** *"i believe cornell box
+shows best how fucked up the GI is."* Cloudy grey blotches on the ceiling; the
+back wall a washed patch with dark upper corners; the red and green walls bright
+in blobs and dark in others; the tall box's faces nearly BLACK; seams and dots on
+the floor at the lattice scale.
+
+**The existing Cornell gate read 8/8 on that picture.** `probe:gi2-gather`
+averages 81 pixels into one world point at each of eight crops and asks whether
+that MEAN sits inside the [1-bounce, 4-bounce] bracket. Every complaint above is
+about a DISTRIBUTION — a variance, a tail, a spatial derivative — and averaging
+81 pixels is precisely the operation that deletes all three.
+[[probe-blind-statistics]]: **before believing a gate, ask whether its
+instrument can see its subject.**
+
+### §AJ.1 — the new gate (`npm run probe:gi2-cornell`)
+
+`scripts/run-gi2-cornell-ref.mjs` + `scripts/lib/gi2SceneReference.mjs`.
+
+* The scene is read from the LIVE engine (`giSystem.state.entries` — GI's own
+  participant list, with the albedo/emissive its own resolver assigned) and
+  path-traced on the CPU: NEE over the emissive triangles plus an emission-free
+  cosine bounce to 4 vertices, stratified, deterministic.
+* `E_ref` is the incident IRRADIANCE — exactly what `gi2.textures.irradiance`
+  holds — so the old 8-crop parity keeps its meaning as a secondary line.
+* The reference's OWN noise is measured per pixel (two independent halves) and
+  reported; the blotch metrics score only pixels whose reference is under 2 %.
+  Measured: p50 1.81 %, p90 5.81 %, 13 186 of 24 336 pixels under 2 % at
+  2048 spp.
+* Cached to disk keyed on the scene, the pose and the sample budget, and the
+  cache is verified against the gbuffer's own world positions before use.
+
+Four scores, per pixel and per surface: **(a)** |log(E_gi2/E_ref)| median/p90;
+**(b)** a BLACK CENSUS by surface; **(c)** the residual's σ after removing each
+surface's mean, and its SECOND DIFFERENCE at 0.25 m and 0.5 m lags against the
+reference's own floor; **(d)** the per-surface energy ratio.
+
+**BEFORE, on the user's `Cornel.scene`, 24 336 px, ultra, world probes:**
+
+| | |
+|---|---|
+| (a) median / p90 abs-log-ratio | **0.528 / 1.443** (gate 0.15 / 0.35) |
+| (b) black pixels | **667 of 21 532** — `Mesh·+Z` 519/5031 (10.3 %), `Box·+Z` 115/501 (23.0 %), `Red·+Z` 33 |
+| (c) σ(residual)/mean | **26–119 %** against a reference floor of **1.1–1.3 %** |
+| (c) d² at 0.25 m | 0.032–0.28 against 0.011–0.19 |
+| (d) ratio | `Red·+Z` 0.69 · `Mesh·+Z` 0.79 · `Ceiling` 0.71 · `Floor` 1.05 · `Green·-Z` 1.79 · `Box·-X` 1.80 |
+| gate | **0/5** |
+
+⭐ **The MEAN is nearly right and everything else is wrong.** Global gain 1.05×:
+the emitter, the palette and the transport carry the right total energy. The
+picture is broken in the DISTRIBUTION, which is why a gate made of means
+certified it.
+
+**The image AT REST is exactly stable**: two dumps 180 gather frames apart with
+the camera parked differ by |ΔE|/E p50 0.00 %, p90 0.00 %, max 0.0 % over
+23 514 px. The no-noise rule holds; the fault is not temporal.
+⚠ But the converged state is BOOT-DEPENDENT: four boots of the same scene at the
+same pose gave global gains 1.047, 1.089, 0.718, 0.735 (the last two after
+another agent's in-flight `windowTrace.js` edit). The chain converges to a fixed
+point that depends on ray arrival order.
+
+### §AJ.2 — the black faces: NOT the cache (`run-gi2-cornell-black.mjs`)
+
+The colour-probe method, stage by stage, at the 600 black pixels with the same
+surfaces' 280 brightest pixels as the control:
+
+| stage | black pixels (`Mesh·+Z`, 554) | lit control (same surface) |
+|---|---|---|
+| window voxel occupied | 100 % | 100 % |
+| dominant-axis code | 100 % | 100 % |
+| cache brick owns a slot | 100 % | 100 % |
+| face ever WRITTEN | **100 %**, n̄ 1.4 | 100 %, n̄ 1.1 |
+| STORED radiance | **0.1125** | 0.1411 |
+| `shadeHit` right now | Ebnc 0.182 + Enee 0.048 | Ebnc 0.422 |
+| the PIXEL | **0.0030** | 0.4914 |
+
+**The cache is warm, correctly filed and holds light at the very faces whose
+pixels are black.** Every candidate the brief listed is refuted: not a cold
+fallback, not a face never selected for shading, not the §19 3.9 attribution
+trap, not a dead parent probe.
+
+⚠ Two instrument bugs had to be fixed first, and both produced a full table of
+zeros that read like the fault: (1) the probe read level 0 everywhere, and this
+window is a CLIPMAP — **level 0 holds 1203 voxels, the floor's neighbourhood
+only; the back wall, the ceiling and the tall box are all at level 1 (0.5 m)**;
+(2) "occupied" and "carries a dominant-axis code" were reported as one column.
+
+### §AJ.2b — WHERE the light is lost: the FAR CASCADE'S CLAIM (`run-gi2-cornell-resolve.mjs`)
+
+`gather.buffers.diagBuf` (needs `__gi2NoiseDump` pre-boot), read at the same
+pixels. One column separates black from lit, and it is the same column on every
+surface:
+
+| `Mesh·+Z` | E | c0 cov/claim | c1 cov/claim/vis | **c2 cov/claim** | faceCov |
+|---|---|---|---|---|---|
+| BLACK (354) | 0.0030 | 0.00 / 0.00 | 1.00 / 1.00 / 0.17 | **0.51 / 0.38** | 0.64 |
+| LIT (40) | 0.4914 | 0.00 / 0.00 | 1.00 / 1.00 / 0.14 | **0.00 / 0.00** | 0.33 |
+
+`Red·+Z`: black c2 0.55/0.35 against lit 0.00/0.00. `Green·-Z`: black c2 0.43.
+
+⭐⭐ **THE BLACK PIXELS ARE EXACTLY THE PIXELS WHERE CASCADE 2 TAKES A SHARE OF
+THE MERGE.** c2's interval is 20–100 m. In a 5 m sealed room every c2 ray is
+`blockedNear` — "hit before `t0` → radiance 0, T = 0" — so **c2's field is
+identically zero by construction**, and where it claims 35–38 % of the merge it
+contributes that zero and drags the pixel from ~0.4 to ~0.003.
+
+**THE EXACT CHANGE (in `worldProbes.js`, which this agent does not own):** a
+cascade must not take CLAIM where it has no DATA. The trace already knows this
+per ray — `blockedNear` is computed three lines above the `hitRadiance` call —
+and the fact never reaches the merge. Either (a) carry a per-probe "fraction of
+my rays that terminated inside my own band" alongside `cov`, and multiply the
+cascade's claim by it, so a cascade whose every ray was blocked before `t0`
+forfeits its claim to the finer cascades; or (b) equivalently, treat
+`blockedNear` on ALL rays of a probe as "this probe is not live for the merge",
+the same way `wpCovFull` already gates the eight-corner hand-off. Either form is
+energy-preserving: the claim it gives up is redistributed to cascades that DID
+measure the band.
+
+### §AJ.3 — the blotches: neither the smoother, nor the cadence, nor the directions
+
+**Every uniform lever, one boot, one pose, one reference** (the gate's `ARMS=`
+sweep — `cacheSmoothU`, `coldFillU`, `shadeStrideU`, `nCapU` are all uniforms):
+
+| arm | med abs-log | black | σ̄/mean | σ max | chain ms |
+|---|---|---|---|---|---|
+| baseline (smooth 0.85, cold 0, stride 16, nCap 1) | 0.527 | 674 | 65.7 % | 119.6 % | 1.31 |
+| smooth 0 | 0.517 | 673 | 68.2 % | 123.7 % | 0.94 |
+| smooth 0.5 | 0.536 | 674 | 67.5 % | 122.9 % | 1.30 |
+| smooth 0.95 | 0.511 | 669 | 66.3 % | 118.1 % | 1.37 |
+| smooth 0.85 + coldFill | 0.582 | 636 | 79.8 % | 123.4 % | 1.24 |
+| stride 4 | 0.527 | 653 | 67.4 % | 120.9 % | 1.61 |
+| stride 1 (16× the re-shades) | 0.527 | 654 | 67.3 % | 120.9 % | **2.42** |
+| stride 1 + coldFill | 0.613 | 621 | 86.9 % | 144.3 % | 2.29 |
+| nCap 8 | 0.597 | 622 | 80.9 % | 125.5 % | 0.95 |
+
+⛔ **NOTHING MOVES.** The plane smoother across its whole range moves σ̄ by two
+points. Sixteen times the re-shading — 1.31 → 2.42 ms of chain, the entire
+60 fps headroom — moves it by nothing. Cold-fill and a longer running mean make
+it WORSE.
+
+**And the DIRECTIONS lever is refuted too, by ground truth**
+(`scripts/run-gi2-quadrature.mjs`, offline: the same fixed Hammersley cosine set
+`shadeTerms` builds, evaluated against the path-traced radiance, sub-path noise
+averaged away, so only the direction quantization remains):
+
+| N | σ̄/mean | mean abs bias | samples driven black |
+|---|---|---|---|
+| 4 (ships) | **17.6 %** | 1.3 % | **0** |
+| 8 | 14.0 % | 5.1 % | 0 |
+| 16 | 11.1 % | 5.0 % | 0 |
+| 32 | 10.0 % | 5.0 % | 0 |
+| GPU as shipped | **51.9 %** | — | 805 |
+
+⭐⭐ **FOUR DIRECTIONS ACCOUNT FOR 17.6 OF 51.9 POINTS AND FOR NOT ONE BLACK
+PIXEL.** Sixteen directions would buy 6.5 points at 4× the shade rays. The
+quadrature is not the fault, and `SKY_RAYS` should NOT be raised on this
+evidence.
+
+⭐ **Where the other 34 points come from — the argument the numbers support.**
+`shadeHit` reads the cache to shade the cache: it is a Neumann iteration whose
+own operator carries the 17.6 % direction error. At the fixed point the error
+satisfies `δ = Qδ + ε`, so it is amplified by `1/(1−ρ)` where ρ is the transport
+operator's spectral radius. **The user's Cornell box has albedo 1.0 white walls**
+— ρ is near 1 — and 17.6 % × ~3 ≈ 52 %, which is what the GPU reads. That also
+explains why a SPATIAL smoother cannot help: the error is not independent
+between neighbouring faces, it is a deterministic function of what their shared
+direction set hits, so averaging over space averages correlated numbers.
+
+### §AJ.4 — what this leaves open
+
+1. Fix the c2 claim (§AJ.2b) — owned by `worldProbes.js`.
+2. Then re-run `probe:gi2-cornell`; the black census must go to 0 and (a) should
+   improve. The 45–119 % σ will NOT be fixed by it, and the next unit is the
+   self-amplification, not more rays.
+3. `probe:gi2-cornell` and `probe:gi2-cornell-black` both had to work around a
+   submit-timing fault: **`await renderer.computeAsync(pass)` followed
+   immediately by `getArrayBufferAsync` returns the buffer UNWRITTEN.**
+   `scripts/lib/gi2StageProbe.js` reads 308 040 floats of exactly zero on this
+   scene (6 attempts, `max 0`) while the same frame's `litBuf` has 42 825
+   non-zero entries; `gi2RayProbe.js`'s shooter returns `hit:false, steps:0` for
+   the same reason and has no retry at all. Dispatching and then letting three
+   real frames go by fixes it. ⚠ **Every §19 probe built on those two libs is
+   currently capable of reporting a table of zeros as a measurement** —
+   `scripts/lib/gi2PixelDump.js` carries a WITNESS lane (`12345` written
+   unconditionally by every thread) so the two cases can never be confused again.
