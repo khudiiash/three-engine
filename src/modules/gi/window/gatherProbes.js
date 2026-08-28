@@ -560,6 +560,16 @@ export function createGiGather({
   win, trace, cache, positionTexture, normalTexture, width, height, tier = win.tier, crops = 16,
   sun = null, sky = null, emitters = null, worldProbes = null,
   /**
+   * ⭐⭐ §19 STAGE 5.5b (this half, 5.4d) — `createShadowBvhGpu`'s handle, or
+   * null. Present ⇒ the FACE cache's emitter NEE asks the TRIANGLES whether the
+   * lamp is visible, exactly as `rcDirect` asks at the pixel; absent ⇒ it asks
+   * the voxel window and not one node of the BVH is constructed. The two paths
+   * shadow ONE lamp, and a difference between them is a bug rather than a
+   * convention — which is the whole reason this is a parameter and not a second
+   * estimator.
+   */
+  shadowBvh = null,
+  /**
    * ⭐⭐⭐ §19 STAGE 5.3 — THE FACE CACHE IS **DIRECT ONLY** WHEN THE CASCADES
    * OWN THE PICTURE, AND THAT IS WHAT MAKES THE LOOP HAVE ONE FIXED POINT.
    *
@@ -766,6 +776,8 @@ export function createGiGather({
    * `__gi2BounceAlbedoMax = 1` restores the uncapped arm (every pre-5.3d number).
    */
   const BOUNCE_ALBEDO_MAX = Number(globalThis.__gi2BounceAlbedoMax ?? (rc5 ? 0.9 : 1));
+  /** §19 5.4d — the exact-shadow handle for the face NEE; see `shadowBvh`. */
+  const BVH = (rc5 && shadowBvh) ? shadowBvh : null;
   const T = spec.tile;
   const R = spec.rays;
   const O = spec.oct;
@@ -3035,7 +3047,16 @@ export function createGiGather({
           // occlusion — the same length error at the far end of the ray.
           const endM = rc5 ? vLevel.mul(0.5) : float(v0 * 0.5);
           const reach = d.sub(excl).sub(endM).max(endM).toVar();
-          const vis = float(1).sub(traceWindow(pRay, wd, reach, n).hit).toVar();
+          // ⭐⭐⭐ §19 5.4d — THE TRIANGLES, WHEN THE ARM IS ARMED. `traceWindow`
+          // asks DILATED OCCUPANCY whether the lamp is visible from this face;
+          // the pixel's own term (`rcDirect`) has asked the triangles since
+          // 5.5b, so without this the same lamp cast two different shadows —
+          // exact at the pixel, conservative through the whole transport.
+          // `anyHitFrom` also needs no voxel slack, which is why `endM` folds
+          // out of `reach` on this arm: dilation is what that margin paid for.
+          const vis = float(1).sub(BVH
+            ? BVH.anyHitFrom(pRay, wd, d.sub(excl).max(1e-3), n)
+            : traceWindow(pRay, wd, reach, n).hit).toVar();
           Enee.addAssign(rgb.mul(omega).mul(cosX).mul(vis));
         });
       });

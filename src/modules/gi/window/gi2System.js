@@ -686,6 +686,13 @@ export function createGi2System({
     const prev = gather;
     gather = createGiGather({
       win, trace, cache,
+      // ⭐⭐ §19 STAGE 5.5b's OTHER HALF. `rcDirect` shadows the lamp with
+      // TRIANGLES at the pixel; without this line the FACE cache still shadowed
+      // the same lamp with the dilated voxel window, so the transport's whole
+      // first bounce carried a conservative shadow the picture no longer had.
+      // Read at graph-build time and gated by the same arm, so an unarmed build
+      // constructs not one node of it.
+      shadowBvh: rc5BvhShadowEnabled() ? shadowBvh : null,
       positionTexture: gbuffer.position,
       normalTexture: gbuffer.normal,
       width, height, tier,
