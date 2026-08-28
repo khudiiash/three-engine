@@ -533,6 +533,12 @@ export function createGi2System({
    */
   let rc = null;
   const RC5 = rc5PathEnabled();
+  /**
+   * §19 5.4b — the old world path is not BUILT under RC5 (`worldProbes`' LEAN
+   * arm), so its resolve must not be DISPATCHED either. One name, read once,
+   * so the two halves of the cut cannot disagree.
+   */
+  const RC5_CUT = RC5 && (globalThis.__gi2Rc5Cut ?? 1) !== 0;
 
   let frame = 0;
   let disposed = false;
@@ -1317,7 +1323,6 @@ export function createGi2System({
     const after = [gather.passes.clearStats];
     for (const node of gather.frameOrder) {
       if (emitterDirect && node === gather.passes.resolveHalf) after.push(emitterDirect);
-      after.push(node);
       // ⭐⭐ §19 STAGE 5.2 — THE CASCADES SIT BETWEEN THE TWO HALVES OF THE
       // RESOLVE, AND BOTH SIDES ARE FORCED.
       //
@@ -1330,7 +1335,27 @@ export function createGi2System({
       // GTAO would compose occlusion onto the world probes' answer, not this
       // one. 5.1 pushed them at the END of the list, which was correct while
       // nothing downstream read them.
-      if (rc && node === gather.passes.resolveHalf) after.push(...rc.frameOrder);
+      //
+      // ⭐⭐⭐ §19 STAGE 5.4b — UNDER RC5 THE CASCADES TAKE `resolveHalf`'s
+      // PLACE INSTEAD OF STANDING BEHIND IT.
+      //
+      // 5.2's splice ran BOTH: the world resolve wrote `irradianceHalf` and
+      // `rcMerge` overwrote every texel of it a few kernels later. The user
+      // paid for that twice over — the world resolve is the lattice's only
+      // consumer, so keeping it also kept three lattices alive (~13 kernels,
+      // ~70 MB, the slowest pipeline of the boot). `worldProbes` LEAN now
+      // builds none of it; dropping the resolve here is what makes that safe,
+      // because a resolve reading a 4-word lattice is a kernel computing zero.
+      //
+      // ⚠ `glossyHalf` HAS NO OTHER WRITER YET — see the report's gatherProbes
+      // patch. Until it lands, RC5 + this cut is an irradiance-only frame.
+      if (rc && node === gather.passes.resolveHalf) {
+        if (RC5_CUT) { after.push(...rc.frameOrder); continue; }
+        after.push(node);
+        after.push(...rc.frameOrder);
+        continue;
+      }
+      after.push(node);
       if (node === gather.passes.resolveUpsample) {
         // GTAO's own dispatches. `#armGtaoPass` appends them to whatever list
         // the transport hands it — on the SRC path that was `srcProbes.passes`,

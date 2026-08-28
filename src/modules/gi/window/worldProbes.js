@@ -92,6 +92,7 @@ import {
 import { BMASK_OFF, LEVEL_WORDS, N, OCC_OFF } from "./windowStore.js";
 import { normalOfFace } from "./radianceCache.js";
 
+import { rc5PathEnabled } from "../giConfig.js";
 /**
  * Tier constants. `cells`, `spacing`, `ratio` and `cascades` are compiled into
  * the WGSL (they are the addressing); `traceSlots` is the frame's ray budget
@@ -323,6 +324,34 @@ export function stepLatticeOrigin(camCell, prev, cells, blk = 4) {
 export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const spec = WORLD_TIERS[tier];
   if (!spec) throw new Error(`unknown world-probe tier "${tier}"`);
+  /**
+   * ⭐⭐⭐ §19 STAGE 5.4b — UNDER RC5 THE LATTICE IS NOT BUILT AT ALL.
+   *
+   * 5.2 shipped the cascades BESIDE the world probes and said so in its own
+   * message: "the engine currently pays both resolves; the world path dies in
+   * 5.4". It did not die, and the user paid for it — Bistro at RC5 boots long
+   * and runs 6-25 fps because three lattices still allocate ~70 MB of CPU
+   * mirrors, compile ~13 kernels (the world TRACE is the slowest pipeline of
+   * the boot) and dispatch every one of them every frame into a field whose
+   * only consumer, `resolveHalf`, is overwritten by `rcMerge` a few kernels
+   * later.
+   *
+   * LEAN is not a uniform and not a branch inside a kernel: it is a BUILD arm.
+   * Nothing is allocated, no `Fn` is constructed, `frameOrder` is empty and
+   * `describe().bytes` reports zeros — so `profile_gi2` says the lattice is
+   * gone rather than that it is idle. `__gi2Rc5 = false` pre-boot is the full
+   * old path, byte for byte, which is the A/B this stage has to keep.
+   *
+   * ⚠ THE TAPS STILL EXIST. `gatherProbes`' `resolveHalf` closes over
+   * `world.taps.*` at build time; the taps are node FACTORIES over the
+   * (now 4-word) buffers and cost nothing to keep, and the pass that uses them
+   * is dropped from the chain by `gi2System` under the same gate.
+   */
+  // `__gi2Rc5Cut = 0` PRE-BOOT IS 5.2 EXACTLY, OUT OF THIS BINARY — the same
+  // discipline `__gi2Cascades` and `__gi2Intervals` keep, and for the same
+  // reason: an A/B against the previous COMMIT is an A/B across a different
+  // shader cache and a different night's driver.
+  const LEAN = rc5PathEnabled() && (globalThis.__gi2Rc5Cut ?? 1) !== 0;
   const C = spec.cells;
   const CB = Math.log2(C);
   const CELLS = C * C * C;
@@ -546,7 +575,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   // separate `wpOwn` would not compile there; a wider stride costs the same
   // 25 MB and no binding.
   const OCT_W = SPLIT_OWN ? 3 : 2;
-  const wpOct = instancedArray(new Uint32Array(ALL_CELLS * OCT * OCT_W), "uint");
+  const wpOct = instancedArray(new Uint32Array(LEAN ? 4 : ALL_CELLS * OCT * OCT_W), "uint");
   /**
    * ⭐⭐ §19 3.17 — THE SH LIVES INSIDE `wpInfo`, AND THAT IS THE PORTABLE
    * ENVELOPE, NOT TIDINESS.
@@ -569,7 +598,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
    * a binding.
    */
   const INFO_VEC = 12;
-  const wpInfo = instancedArray(new Float32Array(ALL_CELLS * INFO_VEC * 4), "vec4");
+  const wpInfo = instancedArray(new Float32Array(LEAN ? 4 : ALL_CELLS * INFO_VEC * 4), "vec4");
   /**
    * ONE buffer for the compaction, because the trace stands at the portable
    * envelope's six storage bindings exactly (window, cache, oct, info, list,
@@ -585,7 +614,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const BASE_OFF = 2 * CELLS;
   const CTL_OFF = BASE_OFF + BLOCKS;
   const LIST_WORDS = CTL_OFF + 8;
-  const wpList = instancedArray(new Uint32Array(LIST_WORDS * NC), "uint");
+  const wpList = instancedArray(new Uint32Array(LEAN ? 4 : LIST_WORDS * NC), "uint");
 
   // ── uniforms owned here (merged into the gather's bag by the caller) ──────
   const wu = {
@@ -1027,7 +1056,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   // function of (cascade, cell, origin, occupancy) — run it twice on one frame
   // and it writes the same bytes, which is what lets it run every frame instead
   // of maintaining state nobody can audit.
-  const allocPass = Fn(() => {
+  const allocPass = LEAN ? null : Fn(() => {
     const gc = instanceIndex.toVar();
     const casc = shiftRight(gc, uint(CELLB)).toVar();
     const cell = bitAnd(gc, uint(CELLS - 1)).toVar();
@@ -1267,7 +1296,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   // Nothing races, so each list is a pure function of its flags — which is what
   // makes "which probes update this frame" a pure function of the frame index
   // and therefore makes a parked camera byte-identical (§T).
-  const countPass = Fn(() => {
+  const countPass = LEAN ? null : Fn(() => {
     const gb = instanceIndex.toVar();
     const casc = gb.div(uint(BLOCKS)).toVar();
     const b = gb.sub(casc.mul(uint(BLOCKS))).toVar();
@@ -1279,7 +1308,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     listAt(casc, uint(BASE_OFF).add(b)).assign(n);
   })().compute(BLOCKS * NC);
 
-  const scanPass = Fn(() => {
+  const scanPass = LEAN ? null : Fn(() => {
     const casc = instanceIndex.toVar();
     const run = uint(0).toVar();
     Loop({ start: 0, end: BLOCKS, name: "wpScan" }, ({ wpScan }) => {
@@ -1291,7 +1320,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     listAt(casc, uint(CTL_OFF)).assign(run);
   })().compute(NC);
 
-  const fillPass = Fn(() => {
+  const fillPass = LEAN ? null : Fn(() => {
     const gb = instanceIndex.toVar();
     const casc = gb.div(uint(BLOCKS)).toVar();
     const b = gb.sub(casc.mul(uint(BLOCKS))).toVar();
@@ -1413,7 +1442,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   // is already walking L3/L4's metre-scale voxels by the time it is forty
   // metres out. The cascade decides where probes STAND; the window decides what
   // a ray sees, at the resolution the distance deserves.
-  const tracePass = Fn(() => {
+  const tracePass = LEAN ? null : Fn(() => {
     const k = globalId.x.toVar();
     const texel = globalId.y.toVar();
     If(texel.greaterThanEqual(uint(OCT)), () => { Return(); });
@@ -1920,7 +1949,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   // the 5 cm partition this exists to see. Biasing along `dir` would step the
   // ray straight through the wall and the census would read "visible" for
   // exactly the corners that are not.
-  const mergeVisPass = !(INTERVALS && NC > 1) ? null : Fn(() => {
+  const mergeVisPass = (LEAN || !(INTERVALS && NC > 1)) ? null : Fn(() => {
     const k = instanceIndex.toVar();
     const rr = roundRobin(k);
     If(rr.kLocal.greaterThanEqual(rr.live), () => { Return(); });
@@ -2009,7 +2038,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     wpOct.element(addr).assign(encodeRgbe(own.add(parent)));
     if (!SPLIT_OWN) wpOct.element(addr.add(uint(1))).assign(clearT(w1));
   })().compute([Math.ceil(SLOTS[ci] / 8), OCT_GROUPS], [8, 8, 1]);
-  const mergePasses = (INTERVALS && NC > 1)
+  const mergePasses = (!LEAN && INTERVALS && NC > 1)
     // COARSEST FIRST: c1 takes c2's field, then c0 takes the c1 that already
     // has it. One frame, whole chain. Reverse this and light arrives one
     // cascade per frame — correct in the limit, visibly laggy in motion.
@@ -2043,7 +2072,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   // of freezing on the scroll frame's snapshot. It is still a pure function of
   // (occupancy, origins, parent maps) — §T holds — and at rest the set is empty,
   // so a parked camera pays nothing and stays byte-identical.
-  const seedPass = !(INTERVALS && NC > 1) ? null : Fn(() => {
+  const seedPass = (LEAN || !(INTERVALS && NC > 1)) ? null : Fn(() => {
     const gc = instanceIndex.toVar();
     const casc = shiftRight(gc, uint(CELLB)).toVar();
     const i0 = wpInfo.element(infoIdx(gc, 0)).toVar();
@@ -2135,7 +2164,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   // OTHER SIDE of walls as often as not, and pooling across them is the leak
   // this design's visibility test is built to prevent, re-introduced one stage
   // earlier where nothing can see it.
-  const shPass = Fn(() => {
+  const shPass = LEAN ? null : Fn(() => {
     const k = instanceIndex.toVar();
     const rr = roundRobin(k);
     If(rr.kLocal.greaterThanEqual(rr.live), () => { Return(); });
@@ -2239,7 +2268,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   // probe carries between its updates has to include this term, so the add and
   // the projection are the same event; adding it every frame to every probe
   // would multiply it by the round-robin period.
-  const neePass = !emitterSh ? null : Fn(() => {
+  const neePass = (LEAN || !emitterSh) ? null : Fn(() => {
     const k = instanceIndex.toVar();
     const rr = roundRobin(k);
     If(rr.kLocal.greaterThanEqual(rr.live), () => { Return(); });
@@ -2262,11 +2291,11 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   })().compute(TRACE_SLOTS);
 
   // ══════════════════════════════════════════ SHADER: clear (harness only)
-  const clearPass = Fn(() => {
+  const clearPass = LEAN ? null : Fn(() => {
     const i = instanceIndex.toVar();
     wpOct.element(i).assign(uint(0));
   })().compute(ALL_CELLS * OCT * OCT_W);
-  const clearInfoPass = Fn(() => {
+  const clearInfoPass = LEAN ? null : Fn(() => {
     wpInfo.element(instanceIndex).assign(vec4(0));
   })().compute(ALL_CELLS * 3);
 
@@ -2407,7 +2436,11 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // ⚠ NO FUNCTIONS IN HERE. `describe()` crosses `page.evaluate` in every
     // receipt this module has; a method would be dropped by the structured
     // clone and read as `undefined` at the far end.
-    bytes: {
+    // §19 5.4b — the build arm, so a receipt cannot report a lattice that was
+    // not built. `bytes` below are ZERO under it, not "small": nothing is
+    // allocated and nothing is dispatched.
+    lean: LEAN,
+    bytes: LEAN ? { oct: 0, sh: 0, info: 0, infoTotal: 0, list: 0 } : {
       oct: ALL_CELLS * OCT * OCT_W * 4,
       // §19 3.17 — one array; the split is kept in the receipt because the two
       // halves are still two different things to reason about.
@@ -2416,7 +2449,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       infoTotal: ALL_CELLS * INFO_VEC * 16,
       list: LIST_WORDS * NC * 4,
     },
-    totalMB: +(((ALL_CELLS * OCT * OCT_W * 4) + (ALL_CELLS * 9 * 16) + (ALL_CELLS * 3 * 16)
+    totalMB: LEAN ? 0 : +(((ALL_CELLS * OCT * OCT_W * 4) + (ALL_CELLS * 9 * 16) + (ALL_CELLS * 3 * 16)
       + LIST_WORDS * NC * 4) / 1048576).toFixed(2),
   });
 
@@ -2484,7 +2517,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
      * frame behind its own map — which is the shape of bug §V.6's re-keyed slab
      * already cost this stage once.
      */
-    frameOrder: [
+    frameOrder: LEAN ? [] : [
       allocPass, seedPass, countPass, scanPass, fillPass,
       // `mergeVis` between the trace and the merges: it needs this frame's own
       // probe placement, and its eight bits are what the merges weight by.
