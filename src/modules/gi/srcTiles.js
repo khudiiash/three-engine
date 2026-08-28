@@ -117,7 +117,21 @@ import { PAYLOAD_SEED_BASE, PAYLOAD_WORDS } from "./srcDeposit.js";
  */
 const SEED_WEIGHT = (() => {
   const raw = Number(globalThis.__gi2MergeSeedWeight);
-  return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : 0.25;
+  return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : 1;
+})();
+/**
+ * §19 5.4f — the frames over which a probe's seed confidence falls 1 → 0. Also
+ * the point past which this whole mechanism is a no-op: a block older than this
+ * bakes bit-identically to the pre-5.4d build. `__gi2MergeSeedRamp` overrides.
+ */
+const SEED_RAMP = (() => {
+  const raw = Number(globalThis.__gi2MergeSeedRamp);
+  // 30, THE SAME RAMP D3'S MATURITY USES, and measured rather than matched: at
+  // 8 frames the seeds expired long before the probes' own rays had covered
+  // their lobes, so the Bistro recover black% fell only 12.32 -> 5.27 and never
+  // reached the parked base. The seed has to outlive the fill it is standing
+  // in for. Cornell is safe at ANY finite ramp — see `seedW`.
+  return Number.isFinite(raw) && raw > 0 ? raw : 30;
 })();
 
 /** Sub-samples per bin axis in the cosine quadrature. §12.2's bias fix. */
@@ -315,6 +329,39 @@ export function createSrcTileAtlas(store, bins, {
     const block = i.div(uint(texels)).toVar();
     const t = i.mod(uint(texels)).toVar();
 
+    // ⭐⭐⭐ §19 STAGE 5.4f — THE SEED'S CONFIDENCE IS THE **PROBE'S AGE**, AND
+    // THE BIN'S OWN COUNT CANNOT PROVIDE IT.
+    //
+    // The brief asked for `1 − ownCount/N0` off `BIN_COUNT`. That expression
+    // has no range here, by construction: a bin is SEEDED only when it is
+    // UNKNOWN, and UNKNOWN means `count < MIN_WEIGHT` — a sixty-fourth of one
+    // ray (`srcDeposit`). So `ownCount/N0` is under 0.004 for every seeded bin
+    // that can exist and the weight is identically 1 — the equal-confidence arm
+    // that put 37 black pixels on the Cornell gate.
+    //
+    // The quantity that actually separates the two failures is how much
+    // evidence THE PROBE has: Bistro's black squares are newborn probes on a
+    // walk frontier, Cornell's regression was settled probes whose few genuinely
+    // unsampled directions were being overruled by a coarse parent. So the
+    // weight ramps off the CLAIM STAMP — the same word D3's maturity term reads
+    // four hundred lines below, already bound, no new storage and no new pass:
+    //
+    //   age 0            w_seed 1      a probe with no rays takes the parent's
+    //                                  cone whole and its tile covers the lobe
+    //   age >= SEED_RAMP w_seed 0      seeded bins drop out of BOTH sums, so a
+    //                                  settled probe bakes BIT-IDENTICALLY to
+    //                                  the pre-5.4d build
+    //
+    // That second line is the Cornell guarantee, and it is structural rather
+    // than measured: after `SEED_RAMP` frames this term contributes nothing to
+    // `acc`, `wsum` or `known`, so a steady scene cannot tell 5.4f from off.
+    const seedW = float(SEED_WEIGHT).toVar();
+    if (maturityOn) {
+      const st = stampStack.element(uint(stampBase).add(block)).toVar();
+      seedW.assign(float(uint(frameStamp).sub(st)).div(float(SEED_RAMP)).oneMinus().clamp(0, 1));
+    }
+    const seedLive = seedW.greaterThan(0).toVar();
+
     const base = uint(info.binBase).add(block.mul(uint(nBins))).toVar();
     const row = t.mul(uint(nBins)).toVar();
     const acc = vec3(0).toVar();
@@ -361,8 +408,11 @@ export function createSrcTileAtlas(store, bins, {
         const wRaw = payload.element(o.add(uint(3))).toVar();
         const seeded = wRaw.lessThanEqual(float(PAYLOAD_SEED_BASE)).toVar();
         const T = select(seeded, float(PAYLOAD_SEED_BASE).sub(wRaw), wRaw).toVar();
-        const cwEff = select(seeded, cw.mul(float(SEED_WEIGHT)), cw).toVar();
-        If(wRaw.greaterThanEqual(0).or(seeded), () => {
+        const cwEff = select(seeded, cw.mul(seedW), cw).toVar();
+        // A seed at `w_seed == 0` is not admitted AT ALL — not with weight
+        // zero, which would still inflate `known` and therefore `cover`'s
+        // sampled fraction. Absent means absent.
+        If(wRaw.greaterThanEqual(0).or(seeded.and(seedLive)), () => {
           // ── L + T·sky, CORRECT IN BOTH CASES IT CAN MEET ────────────────
           //
           // The merge composites the sky ONCE at the top and multiplies its
