@@ -1,0 +1,383 @@
+// §19 STAGE 5.1 — RADIANCE CASCADES ON THE WINDOW: THE PORT
+//
+// ⭐⭐⭐ THE ONE-SENTENCE VERSION: this file is `srcSystem.js` with the scene
+// -sized transport cut out and GI2's window put in its place. Nothing about the
+// cascades is re-derived — the probes, the LOD ladder, Algorithm 3's ray
+// budget, the equal-area bins and the deposit are the SHIPPED SRC modules,
+// imported and called. Two closures change hands and that is the whole port:
+//
+//     trace(P, ω, reach, n)  →  `traceWindow` — the two-level bit-DDA over the
+//                               toroidal window, with §AG's coverage
+//                               throughput T. The old `occupancyField` /
+//                               `rayHit/` BVH8 never return.
+//     shadeHit(r, ω, n)      →  GI2's hit radiance — the voxel's dominant face,
+//                               the radiance cache's running value, a fresh
+//                               face shaded on the spot. (5.3 replaces this
+//                               with palette albedo × (direct + E_probes)/π.)
+//
+// ══ WHY A PORT AND NOT THE REWRITE THIS STAGE STARTED AS ═════════════════════
+//
+// The user, 08-28: "before this rebuild we had quite good looking GI and
+// reflections — maybe we could reuse something". He is right, and the audit
+// agrees: the SRC path IS the paper (β = 4, γ = 4, W0 = 4 branching ×4 per
+// cascade, r0/s0 = 1.6, LOD overlap 0.9, the eight-corner cone merge, Alg. 3's
+// R2 ray store), gated by a CPU mirror in `srcRef.js`. It died on SCALE — 491
+// MB of occupancy bits over Bistro's AABB, a 155 s pipeline-compile wave, 6 fps
+// — and on nothing else. GI2 solved exactly that: a fixed 64³×5 window, a
+// bit-DDA that costs the same in any scene, a bounded soup, a bounded cache.
+//
+// ══ WHAT IS DIFFERENT FROM `srcSystem`, AND IT IS THREE THINGS ══════════════
+//
+//   1. THE POOLS ARE BOUNDED BY TIER, not by `expectedC0Probes(pixelCount)`.
+//      That growth term is the scale trap in one line: a 4 K viewport asked for
+//      131 072 c0 slots to hold 1 788 live probes, and every per-probe pass
+//      swept the whole allocation every frame. `rcConfig.RC_TIERS` is the
+//      envelope now, and the LOD ladder (Chebyshev distance, already in
+//      `srcProbes`) is what makes a bounded pool cover an unbounded scene.
+//   2. THE RAY CEILING IS THE TIER's, spent through `srcRays`' own stride/phase
+//      mechanism — a smaller dispatch, never a skipped one.
+//   3. NO SECONDARY, NO ATTRIBUTION SPLIT, NO SURPRISE. 5.1 is probes, rays and
+//      the interval deposit; the merge is 5.2 and the second bounce is 5.3, and
+//      each of those is a `null` here rather than a stub.
+//
+// ⚠ THE SHIPPED PATH IS UNTOUCHED. Nothing in this file is constructed unless
+// `RC5_PATH` is on; `gi2System` builds it beside the world probes and both
+// light independently.
+import * as THREE from "three/webgpu";
+import { If, bitAnd, ivec2, shiftRight, step, texture, uint, uniform, vec3 } from "three/tsl";
+import {
+  DEPOSIT_SCALE, createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters,
+} from "../../srcDeposit.js";
+import { createSrcProbeFrame, createSrcProbeStore } from "../../srcProbes.js";
+import { createSrcRayFrame, createSrcRayStore } from "../../srcRays.js";
+import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "../../srcMath.js";
+import { normalOfFace } from "../radianceCache.js";
+import { CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0, rcIntervalCensus, rcTierSpec } from "./rcConfig.js";
+
+/**
+ * @param {object} opts
+ * @param {object} opts.win       from `createGiWindow`
+ * @param {object} opts.trace     from `createWindowTrace` — CALLED, never rebuilt
+ * @param {object} opts.cache     from `createRadianceCache`
+ * @param {{position: THREE.Texture, normal: THREE.Texture}} opts.gbuffer
+ * @param {number} opts.width
+ * @param {number} opts.height
+ * @param {string} [opts.tier]
+ * @param {object} opts.kit  the gather's published closures — `u` (its uniform
+ *   bag), `dominantFace`, `faceSamplePoint`, `shadeHit`. ⚠ PASSED, NOT REBUILT:
+ *   `shadeHit` alone inlines a sun ray, four sky rays and every emitter slot's
+ *   NEE — ~25 kB of WGSL and, measured at Stage 3.5, 2.5 s of pipeline compile
+ *   when it was duplicated.
+ */
+export function createRcCascades({
+  win, trace, cache, gbuffer, width, height, tier = win.tier, kit,
+}) {
+  const spec = rcTierSpec(tier);
+  const { u, dominantFace, faceSamplePoint, shadeHit } = kit;
+  const { traceWindow } = trace;
+  const spacing0 = Number(globalThis.__gi2RcSpacing0) || spec.spacing0;
+  const maxLods = Math.max(1, Math.min(MAX_LODS, spec.lods));
+  const pixelCount = Math.max(1, width * height);
+
+  // ── the pools, bounded by the tier and by nothing else ───────────────────
+  const store = createSrcProbeStore({
+    c0Probes: spec.c0Probes,
+    cascadeCount: CASCADE_COUNT,
+    w0: W0,
+    binBudget: spec.binBudget,
+  });
+
+  // ── uniforms ──────────────────────────────────────────────────────────────
+  const cameraU = uniform(new THREE.Vector3());
+  const anchorU = uniform(new THREE.Vector3());
+  const widthU = uniform(width, "uint");
+  const frameStampU = uniform(1, "uint");
+  const jitterXU = uniform(0, "uint");
+  const jitterYU = uniform(0, "uint");
+  const strideU = uniform(1, "uint");
+  const phaseU = uniform(0, "uint");
+  const lmaxU = uniform(spec.lmax);
+  /**
+   * The temporal blend. `keep = 1 − α` multiplies every accumulator before this
+   * frame's rays land on it — `srcConfig.TEMPORAL_ALPHA` (0.1), the value the
+   * old path shipped and the user liked the look of.
+   *
+   * ⚠ AND IT IS THE ONE THING IN THIS STAGE THE NO-NOISE RULE HAS TO BE
+   * MEASURED AGAINST, not argued about. R2 + jitter is a STOCHASTIC direction
+   * set; at rest it converges, and whether the residual reads as shimmer is a
+   * number (`probe:gi2-rc`'s at-rest Δ), not a taste. `__gi2RcJitter = 0`
+   * freezes the sequence, which makes a parked camera byte-identical by
+   * construction and is the fallback arm if the measurement says so.
+   */
+  const keepU = uniform(1 - TEMPORAL_ALPHA);
+  const influxLiftU = uniform(1);
+
+  // ── the gbuffer, read exactly as `srcSystem` reads it ─────────────────────
+  const positionNode = texture(gbuffer.position);
+  const normalNode = texture(gbuffer.normal);
+  const texelOf = (i) => ivec2(i.mod(widthU).toInt(), i.div(widthU).toInt());
+  /**
+   * ⚠ BOTH CHANNELS, AND THE FACE-FORWARD FLIP. `position.w > 0.5` alone
+   * admitted 46 % of the smoke scene's pixels — void pixels whose position is
+   * the origin and whose normal is ZERO — each of which inserted a probe at the
+   * world origin and fired a hemisphere around `normalize(0)`. And the flip
+   * toward the camera lives HERE, at the engine boundary, because it is a
+   * gbuffer fact: a double-sided wall seen from inside a room has its normal
+   * pointing out, and a hemisphere around it samples the outside of the room.
+   */
+  const readPixel = (i) => {
+    const t = texelOf(i);
+    const g0 = positionNode.load(t).toVar();
+    const nrm = normalNode.load(t).xyz.toVar();
+    const facing = step(0, nrm.dot(vec3(cameraU).sub(g0.xyz))).mul(2).sub(1).toVar();
+    return {
+      position: g0.xyz,
+      valid: g0.w.greaterThan(0.5).and(nrm.dot(nrm).greaterThan(0.25)),
+      normal: nrm.mul(facing),
+    };
+  };
+  const readNormal = (i) => readPixel(i).normal;
+
+  // ══ THE TWO CLOSURES THAT ARE THE WHOLE PORT ═══════════════════════════════
+  //
+  // `srcDeposit` calls `trace(P, ω, reach, n)` and reads `.hit` and `.t`; the
+  // raw vec4 rides along for the shade, which needs the packed (level, voxel,
+  // face) the DDA found.
+  //
+  // ⭐⭐ AND THE ORIGIN NORMAL IS THE FIFTH ARGUMENT, WHICH IS THE WHOLE ANCHOR
+  // STORY. `srcDeposit` fires from the RAW gbuffer point (`gatherNormalBias`
+  // ships at 0 and belongs to the gather, not to this ray), and conservative
+  // voxelization means that point's own voxel is OCCUPIED — measured, 15.1 % of
+  // a sealed room's pixels. Handing `traceWindow` the normal spends its
+  // half-cell bias and its origin escape on exactly that: the ray leaves the
+  // surface it is standing on instead of being born inside it, which is the
+  // paper's Fig 7 recess bias and Stage 5.1's anchor census.
+  const rcTrace = (P, dir, reach, n = null, nrm = null) => {
+    const w = nrm ? traceWindow(P, dir, reach, nrm) : traceWindow(P, dir, reach);
+    return { hit: w.hit, t: w.t, raw: w.raw, throughput: w.throughput };
+  };
+
+  /**
+   * What a ray brings back — `gatherProbes.hitRadiance`'s body, reached through
+   * the gather's own closures so the two paths' fields are comparable texel for
+   * texel: the voxel's DOMINANT face (not the ray's entry face), the cache's
+   * running value, and a fresh face shaded on the spot because there is nothing
+   * else to return.
+   *
+   * ⚠ NO TRACKED RE-SHADE. The world path owns the cache's refresh cadence
+   * (`u.shadeProb` / `u.shadeStrideU`); a second source firing it would double
+   * every boot's shading work for a value only the cache reads. A FRESH face is
+   * still shaded here — it has no other answer — and that shade is accumulated,
+   * so both paths converge to one cache.
+   *
+   * ⭐ AND THE HIT IS WEIGHTED BY WHAT SURVIVED THE THIN VOXELS (§AG). `T` is a
+   * product of per-class constants over the voxels the ray actually met, so it
+   * is deterministic and it is exactly 1 in every scene with no cables,
+   * railings or foliage in it — this multiply is a provable no-op there.
+   */
+  // ⚠ ASSIGNED BELOW, WHERE THE BIN STORE EXISTS. `rcShade` is a closure the
+  // deposit calls while IT is being constructed, which is after the bins — so
+  // the late binding is the construction order, not laziness.
+  let shadeCounters = null;
+  const rcShade = (r, dir) => {
+    const raw = r.raw;
+    const rad = vec3(0).toVar();
+    const zi = raw.z.toUint().toVar();
+    If(raw.x.greaterThan(0.5), () => {
+      const entryF = bitAnd(zi, uint(7)).toFloat().toVar();
+      const levelF = bitAnd(shiftRight(zi, uint(3)), uint(7)).toFloat().toVar();
+      const voxF = shiftRight(zi, uint(6)).toFloat().toVar();
+      const faceF = dominantFace(levelF, voxF, entryF, dir.negate()).toVar();
+      const hn = normalOfFace(faceF).toVar();
+      const hp = faceSamplePoint(levelF, voxF, hn).toVar();
+      const c = cache.cacheRead(levelF, voxF, faceF).toVar();
+      // The deposit's `shaded` tally is `srcShade`'s counter, and this path is
+      // not `srcShade` — without this line every receipt reads "NO HIT SHADING"
+      // on a frame whose shader is running, which is the blind-instrument
+      // failure the counter's own docstring warns about.
+      shadeCounters?.shaded(1);
+      rad.assign(c.xyz);
+      If(c.w.lessThan(0.5), () => {
+        const s = shadeHit(hp, hn, levelF, voxF, uint(1)).toVar();
+        // `.toVar()` is load-bearing — a call for side effect alone is DCE'd.
+        cache.cacheAccum(levelF, voxF, faceF, s, u.nCapU, u.cacheSmoothU).toVar();
+        rad.assign(s);
+      });
+    }).Else(() => {
+      rad.assign(u.skyColor);
+    });
+    return rad.mul(r.throughput);
+  };
+
+  // ── the frames, in the order `srcSystem` builds them ─────────────────────
+  const frame = createSrcProbeFrame(store, {
+    spacing0,
+    camera: vec3(cameraU),
+    anchor: vec3(anchorU),
+    pixelCount,
+    maxLods,
+    readPixel,
+    frameStamp: frameStampU,
+  });
+
+  const rayStore = createSrcRayStore(store, { pixelCount });
+  // The dispatch size is baked (three bakes `.compute(n)`), so it comes from the
+  // TIER's ceiling and is resolution-INDEPENDENT: a viewport resize is a
+  // uniform write to `stride`/`phase`, never a rebuild.
+  const threads = Math.max(1, Math.min(pixelCount, spec.rays));
+  const rayFrame = createSrcRayFrame(store, rayStore, {
+    pixelProbe: frame.pixelProbe,
+    raysPerPixel: 1,
+    stride: strideU,
+    phase: phaseU,
+    threads,
+  });
+
+  const bins = createSrcBinStore(store, { w0: W0, secondaryCapacity: 0 });
+  shadeCounters = createSrcShadeCounters(bins);
+
+  const deposit = createSrcDepositFrame(store, bins, {
+    pixelProbe: frame.pixelProbe,
+    pixelRayBase: rayStore.pixelRayBase,
+    rayWork: rayStore.rayWork,
+    pixelCount,
+    pixelCountNode: rayStore.pixelCountU,
+    raysPerPixel: 1,
+    stride: strideU,
+    phase: phaseU,
+    threads,
+    lmax: lmaxU,
+    // 5.1 is the INLINE form: no attribution record, no [J], no surprise.
+    attribute: null,
+    secondary: null,
+    surprise: null,
+    trace: rcTrace,
+    shadeHit: (r, dir) => rcShade(r, dir),
+    readPixel,
+    readNormal,
+    camera: vec3(cameraU),
+    spacing0,
+    jitterX: jitterXU,
+    jitterY: jitterYU,
+    keep: keepU,
+    frameStamp: frameStampU,
+    influxLift: influxLiftU,
+    maxLods,
+  });
+
+  // ── the per-frame drivers ────────────────────────────────────────────────
+  const jitterOn = (globalThis.__gi2RcJitter ?? 1) !== 0;
+  let frameIndex = 0;
+  const setCamera = (pos) => {
+    const p = Array.isArray(pos) ? pos : [pos.x, pos.y, pos.z];
+    cameraU.value.set(p[0], p[1], p[2]);
+    // ⭐ THE ANCHOR IS THE CAMERA, ROUNDED TO THE COARSEST LATTICE. Probe keys
+    // are anchor-relative, so an anchor that moved every frame would rename
+    // every probe every frame; snapping it to the top cascade's spacing means a
+    // walk re-keys nothing until the camera crosses one coarse cell.
+    const top = spacing0 * (1 << (CASCADE_COUNT - 1));
+    anchorU.value.set(
+      Math.floor(p[0] / top) * top, Math.floor(p[1] / top) * top, Math.floor(p[2] / top) * top,
+    );
+    return { anchor: [anchorU.value.x, anchorU.value.y, anchorU.value.z] };
+  };
+  const beginFrame = (n = null) => {
+    frameIndex = n == null ? frameIndex + 1 : n;
+    frameStampU.value = (frameIndex + 1) >>> 0;
+    if (jitterOn) {
+      jitterXU.value = (jitterXU.value + R2_ALPHA1_FX) >>> 0;
+      jitterYU.value = (jitterYU.value + R2_ALPHA2_FX) >>> 0;
+    }
+    const stride = Math.max(1, Math.ceil(pixelCount / threads));
+    strideU.value = stride;
+    phaseU.value = stride > 1 ? frameStampU.value % stride : 0;
+    return frameIndex;
+  };
+  const setSize = (w, h) => {
+    const nw = Math.max(1, Math.round(w));
+    const nh = Math.max(1, Math.round(h));
+    if (nw * nh > pixelCount) return false; // the pools are sized for this frame
+    widthU.value = nw;
+    if (rayStore.pixelCountU) rayStore.pixelCountU.value = nw * nh;
+    return true;
+  };
+
+  const census = rcIntervalCensus(spacing0, maxLods, CASCADE_COUNT);
+  const describe = () => ({
+    tier,
+    spacing0,
+    cascades: CASCADE_COUNT,
+    w0: W0,
+    maxLods,
+    pixelCount,
+    threads,
+    rays: threads,
+    depositScale: DEPOSIT_SCALE,
+    alpha: TEMPORAL_ALPHA,
+    jitter: jitterOn,
+    pools: { c0Probes: spec.c0Probes, binBudget: spec.binBudget, binTotal: bins.binTotal },
+    intervals: census.rows.map((r) => ({
+      lod: r.lod, reach: r.reach, gaps: r.gaps, overlaps: r.overlaps,
+      bands: r.bands.map((b) => [b.t0, b.t1]),
+    })),
+    gaps: census.gaps,
+    overlaps: census.overlaps,
+    bytes: {
+      // Every storage attribute the three stores own, counted from the arrays
+      // themselves so a layout change cannot make this number a fiction.
+      probes: byteSum(store),
+      bins: byteSum(bins),
+      rays: byteSum(rayStore),
+    },
+    get totalMB() {
+      return +(((byteSum(store) + byteSum(bins) + byteSum(rayStore)) / 1048576).toFixed(2));
+    },
+  });
+
+  return {
+    tier, spacing0, store, bins, rayStore, frame, rayFrame, deposit, census,
+    uniforms: {
+      rcCamera: cameraU, rcAnchor: anchorU, rcWidth: widthU, rcFrameStamp: frameStampU,
+      rcJitterX: jitterXU, rcJitterY: jitterYU, rcStride: strideU, rcPhase: phaseU,
+      rcLmax: lmaxU, rcKeep: keepU, rcInfluxLift: influxLiftU,
+    },
+    passes: {
+      populate: frame.passes,
+      rays: rayFrame.passes,
+      deposit: deposit.passes,
+    },
+    /** The one order that works: probes, then Algorithm 3's budget, then the deposit. */
+    frameOrder: [...frame.passes, ...rayFrame.passes, ...deposit.passes],
+    setCamera, beginFrame, setSize, describe,
+    readStats: (renderer) => deposit.readStats(renderer),
+    /** Every GPU-only storage attribute, for the caller's retire queue. */
+    storageAttributes: () => [
+      ...attrsOf(store), ...attrsOf(bins), ...attrsOf(rayStore), ...attrsOf(frame),
+    ],
+    /**
+     * ⚠ THE ARRAY IS EMPTIED BEFORE `dispose()`. Under three's WebGPU backend
+     * that is what actually releases the buffer; dropping the reference alone
+     * leaves it alive until GC, and `gi2System`'s retire queue is the only
+     * place this may be called from.
+     */
+    dispose() {
+      for (const a of [...attrsOf(store), ...attrsOf(bins), ...attrsOf(rayStore), ...attrsOf(frame)]) {
+        a.array = a.array?.constructor ? new a.array.constructor(0) : new Uint32Array(0);
+        a.dispose?.();
+      }
+    },
+  };
+}
+
+/** Every storage attribute hanging off a store object, without naming its keys. */
+function attrsOf(obj) {
+  const out = [];
+  for (const v of Object.values(obj ?? {})) {
+    const a = v?.value;
+    if (a?.isBufferAttribute === true && !out.includes(a)) out.push(a);
+  }
+  return out;
+}
+function byteSum(obj) {
+  return attrsOf(obj).reduce((a, x) => a + (x.array?.byteLength ?? 0), 0);
+}

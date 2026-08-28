@@ -79,6 +79,8 @@ import { createWindowVoxelizer } from "./windowVoxelize.js";
 import { createWindowDynamic, moverBoxSoup } from "./windowDynamic.js";
 import { createTriangleSoupBuilder, SoupSupersededError, PAL_NONE } from "./triangleSoup.js";
 import { createGiGather, GATHER_TIERS, PAL_ENTRIES, STATS } from "./gatherProbes.js";
+import { createRcCascades } from "./rc/rcSystem.js";
+import { rc5PathEnabled } from "../giConfig.js";
 import { detachCpuMirror } from "../releaseCompute.js";
 
 /** Real palette classes; entry `PAL_ENTRIES - 1` is reserved for "no surface". */
@@ -516,6 +518,13 @@ export function createGi2System({
   let emitterDirect = null;
   let aoCompose = null;
   let aoOut = null;
+  /**
+   * §19 STAGE 5.1 — the ported radiance cascades, or `null`. Built with the
+   * gather and retired with it: every kernel in it closes over the gather's
+   * `shadeHit`, its uniform bag and its palette, so it cannot outlive one.
+   */
+  let rc = null;
+  const RC5 = rc5PathEnabled();
 
   let frame = 0;
   let disposed = false;
@@ -694,6 +703,34 @@ export function createGi2System({
     // it would be) and still a kernel to compile, a pass to record and a bind
     // group to keep alive on every frame of every world-path boot.
     emitterDirect = (emitters?.length && !gather.worldProbes) ? buildEmitterDirectPass() : null;
+    // ⭐ §19 STAGE 5.1 — THE CASCADES, BESIDE THE WORLD PROBES AND NOT INSTEAD
+    // OF THEM. `RC5_PATH` off builds not one node of this (and imports nothing
+    // from `srcProbes`/`srcDeposit` into any live chain), which is the gate
+    // "the shipped path stays byte-identical" stated as code rather than as an
+    // intention. The kit is the gather's PUBLISHED closures — one definition of
+    // the hit estimator, reached from two kernels.
+    rc = RC5
+      ? createRcCascades({
+        win,
+        trace,
+        cache,
+        gbuffer,
+        width,
+        height,
+        tier,
+        kit: {
+          u: gather.uniforms,
+          dominantFace: gather.internals.dominantFace,
+          faceSamplePoint: gather.internals.faceSamplePoint,
+          shadeHit: gather.internals.shadeHit,
+        },
+      })
+      : null;
+    if (rc) {
+      rc.frameOrder.forEach((n, i) => {
+        if (n && typeof n === "object") n.__giPassName ??= `gi2.rc#${i}`;
+      });
+    }
     // The new gather's lattice buffers, queued for their mirror detach. Re-set
     // (not appended) because a resize replaces the gather and the DEAD one's
     // attributes go to the retire queue, which frees them outright.
@@ -1018,6 +1055,7 @@ export function createGi2System({
     viewProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     if (!placed) prevViewProj.copy(viewProj);
     const receipt = win.setCamera([camPos.x, camPos.y, camPos.z]);
+    rc?.setCamera([camPos.x, camPos.y, camPos.z]);
     // THE SCROLL IS NOT A PER-FRAME PASS. It re-keys every brick the camera's
     // move invalidated, and on a frame with no move it is a 4096-thread
     // dispatch that writes nothing. `win.setCamera` already answers "did the
@@ -1147,6 +1185,10 @@ export function createGi2System({
     frame = frameIndex >>> 0;
     if (!gather) return { before: [], after: [], all: [] };
     gather.beginFrame(frame);
+    // §19 5.1 — the cascades' own per-frame drivers: the R2 jitter, the frame
+    // stamp the decay recognises a fresh block by, and the ray phase. Camera and
+    // anchor are set in `setCamera`, where the window's are.
+    rc?.beginFrame(frame);
     syncLighting();
     // §19 Stage 4.1: whatever the renderer's last timestamp resolve landed for
     // the pre-gbuffer chain. Publishes into `snapshot()`; drives nothing.
@@ -1262,6 +1304,13 @@ export function createGi2System({
       }
     }
 
+    // ⭐ §19 5.1 — THE CASCADES RUN LAST, AND THAT IS THE ONLY PLACE THEY CAN.
+    // Their probe population and their deposit both read the G-BUFFER, which
+    // the caller renders between `before` and `after`; and 5.2's merge will
+    // feed the resolve, so the chain grows forward from here rather than being
+    // spliced into the middle of a list that is already ordered by identity.
+    if (rc) after.push(...rc.frameOrder);
+
     // `scrollInList` so the caller's chain-shape receipt can EXCLUDE the one
     // pass that is spliced in and out frame by frame under a moving camera —
     // otherwise "the shape changed" is true on every other frame and the log
@@ -1310,11 +1359,12 @@ export function createGi2System({
   // instrument reading this project has been burned by before. It is the arm,
   // not an option — nothing should ever ship with it set.
   const retired = [];
-  const retireGather = (dead, deadAo, deadNodes) => {
-    if (!dead && !deadAo) return;
+  const retireGather = (dead, deadAo, deadNodes, deadRc = null) => {
+    if (!dead && !deadAo && !deadRc) return;
     if (globalThis.__gi2ResizeDisposeNow === true) {
       dead?.dispose();
       deadAo?.dispose();
+      deadRc?.dispose();
       return;
     }
     const storageAttributes = dead
@@ -1328,6 +1378,14 @@ export function createGi2System({
       }
     }
     for (const n of deadNodes ?? []) computeNodes.push(n);
+    // §19 5.1 — the cascades go with the gather they closed over, through the
+    // SAME three-frame queue: their storage attributes must be released (a
+    // dropped reference is not a freed buffer here) and their compute nodes
+    // must outlive every frame that can still name them.
+    if (deadRc) {
+      storageAttributes.push(...deadRc.storageAttributes());
+      computeNodes.push(...deadRc.frameOrder);
+    }
     retired.push({
       storageAttributes,
       computeNodes: computeNodes.filter((n) => n?.isComputeNode === true),
@@ -1339,6 +1397,7 @@ export function createGi2System({
       dispose() {
         dead?.dispose();
         deadAo?.dispose();
+        deadRc?.dispose();
       },
     });
   };
@@ -1357,11 +1416,12 @@ export function createGi2System({
     // are re-minted against the new one, so both are retired with it.
     const oldEmitterDirect = emitterDirect;
     const oldAoCompose = aoCompose;
+    const oldRc = rc;
     aoOut = null;
     aoCompose = null;
     buildGather();
     stampVoxNames();
-    retireGather(old, oldAo, [oldEmitterDirect, oldAoCompose]);
+    retireGather(old, oldAo, [oldEmitterDirect, oldAoCompose], oldRc);
     return true;
   };
 
@@ -1541,6 +1601,8 @@ export function createGi2System({
     window: win.describe(),
     cache: cache.describe(),
     gather: gather?.describe() ?? null,
+    rc5: RC5,
+    rc: rc?.describe() ?? null,
     voxelizer: voxelizer?.describe() ?? null,
     dynamic: dynamic?.describe() ?? null,
   });
@@ -1581,6 +1643,7 @@ export function createGi2System({
       // `b?.value`: a harness-only buffer (the crop pair) is null on the
       // engine path — see `crops: 0` above.
       if (gather) for (const b of Object.values(gather.buffers)) list.push(b?.value);
+      if (rc) list.push(...rc.storageAttributes());
       return list.filter((a) => a?.isBufferAttribute === true);
     },
     /** Everything `collectStateComputeNodes` has to see. */
@@ -1665,6 +1728,8 @@ export function createGi2System({
       retired.length = 0;
       aoOut?.dispose();
       aoOut = null;
+      rc?.dispose();
+      rc = null;
       gather?.dispose();
       voxelizer?.dispose();
       dynamic?.dispose();
@@ -1698,6 +1763,7 @@ export function createGi2System({
     }
     if (emitterDirect) list.push(emitterDirect);
     if (aoCompose) list.push(aoCompose);
+    if (rc) list.push(...rc.frameOrder);
     return list.filter((n) => n?.isComputeNode === true);
   }
 }

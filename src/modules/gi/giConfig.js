@@ -620,6 +620,33 @@ export function giDebugView(component = null) {
 export const GI2_PATH = true;
 
 /**
+ * ⭐⭐⭐ §19 STAGE 5 — RADIANCE CASCADES RESTORED ON THE WINDOW, AND THIS IS
+ * THE ONE SWITCH THAT BUILDS THEM.
+ *
+ * `false` (shipped) is byte-for-byte the path Stage 4 ends at: not a node of
+ * `window/rc/` is constructed, no SRC module is imported by the GI2 chain, and
+ * `smoke:gi-gpu` / the Cornell battery see exactly the kernels they saw before
+ * this stage. `true` builds the PORTED cascades beside the world probes — both
+ * light, and 5.4 is where the old one is deleted rather than switched off.
+ *
+ * A CONSTANT, for the same three reasons `GI2_PATH` is one: a property would be
+ * a knob a scene could be saved with, a `__gi*` global would be flippable
+ * mid-session between two builds that do not share a chain, and a constant is
+ * edited in one commit by someone who then runs both batteries.
+ *
+ * ⚠ `globalThis.__gi2Rc5` OVERRIDES IT AT BUILD TIME ONLY — read once, where
+ * the system is constructed, so a harness page can arm the stage without a
+ * commit and nothing can flip it under a live chain.
+ */
+export const RC5_PATH = false;
+
+/** The build-time value, harness override included. Read ONCE per build. */
+export function rc5PathEnabled(runtime = globalThis) {
+  const hatch = runtime?.__gi2Rc5;
+  return hatch === undefined ? RC5_PATH : hatch === true;
+}
+
+/**
  * GI quality tier → GI2 window tier. A 1:1 map, published rather than inlined
  * so `windowStore`/`gatherProbes`/`radianceCache`'s four tier tables and this
  * module's four quality levels can never drift apart silently: every GI2 tier

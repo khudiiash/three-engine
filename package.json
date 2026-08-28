@@ -254,6 +254,7 @@
     "test:gi2-soup": "node scripts/run-gi2-soup-test.mjs",
     "probe:gi2-cornell": "node scripts/run-gi2-cornell-ref.mjs",
     "probe:gi2-covleak": "node scripts/run-gi2-covleak-probe.mjs",
+    "probe:gi2-rc": "node scripts/run-gi2-rc-probe.mjs",
     "probe:gi2-cornell-black": "node scripts/run-gi2-cornell-black.mjs",
     "probe:gi2-cornell-resolve": "node scripts/run-gi2-cornell-resolve.mjs",
     "probe:gi2-quadrature": "node scripts/run-gi2-quadrature.mjs"

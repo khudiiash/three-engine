@@ -1055,7 +1055,14 @@ export function createSrcDepositFrame(store, bins, {
       // gate's diff bit-exact (see `srcRef.js`'s `traceAndDeposit` header).
       const n = base.add(k).toVar();
       const dir = rayDirection(n, Nrm, jitterX, jitterY).toVar();
-      const r = trace(P, dir, reach, n);
+      // ⭐ §19 5.1 — `Nrm` IS A FIFTH ARGUMENT, AND EVERY OLDER CALLER IGNORES
+      // IT. `createSrcSceneTrace`'s marcher takes four; GI2's `traceWindow`
+      // takes an origin NORMAL and spends it on the half-cell bias and the
+      // origin escape — which is the difference between a ray that leaves a
+      // conservatively voxelized surface and one that is born inside it (the
+      // paper's Fig 7 recess bias, and Stage 5.1's anchor census). JS drops
+      // extra arguments, so the SRC path's WGSL is byte-identical.
+      const r = trace(P, dir, reach, n, Nrm);
       const hit = r.hit.greaterThan(0.5).toVar();
       const d = select(hit, r.t, float(-1)).toVar();
 

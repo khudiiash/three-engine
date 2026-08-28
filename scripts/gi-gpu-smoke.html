@@ -108,6 +108,12 @@
         // how much. Build-time: the budget is baked into the WGSL.
         const raySteps = Number(new URLSearchParams(location.search).get("raysteps") ?? 0);
         if (raySteps > 0) globalThis.__giSrcRaySteps = raySteps;
+        // `?rc5=1` — §19 Stage 5.1: build the ported radiance cascades BESIDE
+        // the shipped GI2 chain (`giConfig.RC5_PATH`'s build-time hatch). The
+        // smoke's own assertions are unchanged and still describe the old path,
+        // which is the point: this arm proves the two coexist and that the
+        // shipped one still lights with the cascades' kernels in the frame.
+        if (new URLSearchParams(location.search).get("rc5") === "1") globalThis.__gi2Rc5 = true;
         // `?sky=N` — SRC's c0-only resolve composites the scene's own Sky Light
         // where a bin's transmittance survived, and `skyIntensity` DEFAULTS TO
         // ZERO. So without this the whole gather is a correct, verifiable,

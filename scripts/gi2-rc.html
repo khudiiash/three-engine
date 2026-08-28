@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>GI2 — Stage 5.1: the ported radiance cascades</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}pre{padding:12px;white-space:pre-wrap}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ §19 STAGE 5.1's GATE, AND WHAT EACH LINE OF IT CAN ACTUALLY SEE ═════
+      //
+      // Five receipts, and every one of them is read off the SHIPPING kernels
+      // rather than a transcription of them: the page builds `createGiGather`
+      // (for its published `shadeHit`/`dominantFace`/`faceSamplePoint`), the
+      // real window + fill + trace + cache, and `createRcCascades` on top.
+      //
+      //   (i)   INTERVAL CENSUS — the CPU side proves the PARTITION (every
+      //         distance band owned by exactly one cascade, per LOD, out of
+      //         `srcConfig`'s own boundaries), and the GPU side proves nothing
+      //         was DROPPED (`noBlock`, deposits per ray, and the deposit's own
+      //         ray/hit tallies).
+      //   (ii)  ANCHOR CENSUS — every ray of this path leaves a GBUFFER SURFACE
+      //         POINT displaced along its normal, which is the paper's ray
+      //         splitting and the reason a probe centre recessed into a wall
+      //         does not bias the field. The census walks the position texture
+      //         against the window buffer and counts origins that are inside an
+      //         OPAQUE (coverage class 3) voxel — the failure the recessed
+      //         probe centre used to produce.
+      //   (iii) LEAK — the 5 cm wall, on doors and corridor geometry, with the
+      //         camera on the DARK side and every light source behind the wall.
+      //         Any deposited radiance at all is a leak, and the instrument
+      //         sums the bins rather than sampling a crop, so it cannot miss
+      //         one by looking at the wrong place.
+      //   (iv)  COST — ms per phase (populate / rays / deposit), rays/frame and
+      //         bytes, per tier.
+      //   (v)   A PER-DIRECTION DUMP of one probe's block: 32 c0 bins with
+      //         their R/G/B/T/COUNT words, which is the layout 5.2's merge
+      //         reads.
+      //
+      // ⚠ MEASURED FROM THE SECOND FRAME. A fresh compute node's first dispatch
+      // writes nothing (three compiles the pipeline on it), so frame 0 is a
+      // warm-up in every timing and every tally here.
+      const out = document.querySelector("#log");
+      const lines = [];
+      const say = (l) => { lines.push(l); out.textContent += l + "\n"; };
+      const fail = (error) => {
+        console.error("GI2-RC FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__GI2_RC_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: lines.join("\n"),
+        };
+      };
+      globalThis.addEventListener("error", (e) => fail(e.error ?? e.message));
+      globalThis.addEventListener("unhandledrejection", (e) => fail(e.reason));
+
+      try {
+        const params = new URLSearchParams(location.search);
+        const TIER = params.get("tier") ?? "ultra";
+        const FRAMES = Number(params.get("frames") ?? 8);
+        const W = Number(params.get("w") ?? 160);
+        const H = Number(params.get("h") ?? 90);
+        // The stage's own switch, armed from the page so the receipt does not
+        // need a commit — read ONCE, at construction, by `rc5PathEnabled`.
+        globalThis.__gi2Rc5 = true;
+
+        const THREE = await import("three/webgpu");
+        const { mrt, vec4, normalWorld, positionWorld, cameraPosition, dot, sign } =
+          await import("three/tsl");
+        const store = await import("/src/modules/gi/window/windowStore.js");
+        const fillMod = await import("/src/modules/gi/window/windowFill.js");
+        const traceMod = await import("/src/modules/gi/window/windowTrace.js");
+        const cacheMod = await import("/src/modules/gi/window/radianceCache.js");
+        const gatherMod = await import("/src/modules/gi/window/gatherProbes.js");
+        const rcMod = await import("/src/modules/gi/window/rc/rcSystem.js");
+        const rcCfg = await import("/src/modules/gi/window/rc/rcConfig.js");
+        const depMod = await import("/src/modules/gi/srcDeposit.js");
+        const { KIND_BOX } = fillMod;
+
+        const box = (min, max, pal) => ({ kind: KIND_BOX, min, max, pal });
+        const WALL = 0.05;
+
+        // ══ THE THREE WORLDS ═════════════════════════════════════════════════
+        //
+        // `open` is the census/cost world — a lit Cornell room, nothing sealed,
+        // so the probes, the ray budget and the deposit all run at full width.
+        // `doors` and `corridor` are the LEAK worlds: the camera stands in a
+        // sealed dark volume and every light source is on the far side of a
+        // 5 cm wall, so the honest reading of any deposited radiance is zero.
+        // ⭐⭐ THE LEAK WORLDS FIT INSIDE L0, AND THAT IS THE RECEIPT'S OWN
+        // INTEGRITY. §AG made a THIN voxel DIM a ray instead of stopping it, by
+        // design: at L2 a 5 cm wall covers 5 % of a 1 m voxel and the DDA
+        // attenuates rather than blocks. Measured on the first run of this page
+        // — a 30 m sealed corridor read 4 829 lit bins and Σ 1 330 of sun that
+        // had crossed its walls at the COARSE levels, which is the shipped
+        // coverage rule doing exactly what it says, not a transport leak. A
+        // 5 cm gate therefore has to be posed where 5 cm is resolved: L0 spans
+        // 64·v₀ (16 m at ultra, 32 m at phone), so both sealed volumes are
+        // ≤ 12 m across and the camera stands in the middle of them.
+        const HX = 4, HY = 3, HZ = 4;
+        const shell = (pal) => [
+          box([-HX - WALL, -HY - WALL, -HZ - WALL], [HX + WALL, -HY, HZ + WALL], pal),
+          box([-HX - WALL, HY, -HZ - WALL], [HX + WALL, HY + WALL, HZ + WALL], pal),
+          box([-HX - WALL, -HY, -HZ - WALL], [-HX, HY, HZ + WALL], pal),
+          box([HX, -HY, -HZ - WALL], [HX + WALL, HY, HZ + WALL], pal),
+          box([-HX - WALL, -HY, -HZ - WALL], [HX + WALL, HY, -HZ], pal),
+          box([-HX - WALL, -HY, HZ], [HX + WALL, HY, HZ + WALL], pal),
+        ];
+        const WORLDS = {
+          open: {
+            scene: [box([-1.5, HY - 0.1, -1.5], [1.5, HY, 1.5], 0), ...shell(1)],
+            eye: [0, -0.5, 3], at: [0, -1, -2], sun: [0, 0, 0], panel: 8,
+          },
+          // The partition splits the room at x = 0; the panel is on the +X side
+          // and the camera on the −X side. Nothing else lights the dark half.
+          doors: {
+            scene: [
+              box([1.5, HY - 0.1, -1.5], [3.5, HY, 1.5], 0),
+              box([-WALL / 2, -HY, -HZ], [WALL / 2, HY, HZ], 1),
+              ...shell(1),
+            ],
+            eye: [-2, -0.5, 0], at: [0, -0.5, 0], sun: [0, 0, 0], panel: 8,
+          },
+          // Corridor geometry with the +X window CLOSED by a 5 cm slab and the
+          // panel dark: the only light is the SUN, outside. The interior must
+          // read black, and every ray in the frame starts inside it.
+          corridor: {
+            scene: [
+              box([-3 - WALL, -3 - WALL, -6 - WALL], [3 + WALL, -3, 6 + WALL], 1),
+              box([-3 - WALL, 3, -6 - WALL], [3 + WALL, 3 + WALL, 6 + WALL], 1),
+              box([-3 - WALL, -3, -6 - WALL], [-3, 3, 6 + WALL], 1),
+              box([3, -3, -6 - WALL], [3 + WALL, 3, 6 + WALL], 1),
+              box([-3 - WALL, -3, -6 - WALL], [3 + WALL, 3, -6], 1),
+              box([-3 - WALL, -3, 6], [3 + WALL, 3, 6 + WALL], 1),
+            ],
+            eye: [0, -1, 0], at: [0, -1, 5], sun: [-0.55, -0.72, 0.42], panel: 0,
+          },
+        };
+        const PALETTE_OF = (panelRadiance) => {
+          const p = [
+            { albedo: [0.78, 0.78, 0.78], emissive: panelRadiance },
+            { albedo: [0.73, 0.73, 0.73], emissive: 0 },
+          ];
+          while (p.length < gatherMod.PAL_ENTRIES) p.push({ albedo: [0, 0, 0], emissive: 0 });
+          return p;
+        };
+
+        // ══════════════════════════════════════════════════════════ renderer
+        const renderer = new THREE.WebGPURenderer({
+          canvas: document.querySelector("#view"), trackTimestamp: true,
+        });
+        await renderer.init();
+        if (renderer.backend?.isWebGPUBackend !== true) throw new Error("not a WebGPU backend");
+        // ⚠ GPU TIMESTAMPS OR NOTHING. Wall time around `computeAsync` measures
+        // the SUBMIT, not the kernel: the first cut of this page read the
+        // deposit at 0.120 ms for 921 600 rays — 7.7 G rays/s, which is not a
+        // number this hardware can produce and was the CPU handing work off.
+        const timestamps = renderer.backend.trackTimestamp === true;
+        const device = renderer.backend.device;
+        const validation = [];
+        device.addEventListener?.("uncapturederror", (e) => {
+          validation.push(e.error?.message ?? String(e.error));
+          console.error("WebGPU validation error:", validation.at(-1));
+        });
+
+        const win = store.createGiWindow(TIER, { dynamic: false });
+        const fill = fillMod.createWindowFill(win, { scene: WORLDS.open.scene });
+        const trace = traceMod.createWindowTrace(win, { dynamic: false });
+        const cache = cacheMod.createRadianceCache(win, { tier: TIER });
+
+        const gbufferRt = new THREE.RenderTarget(W, H, {
+          count: 2, depthBuffer: true, stencilBuffer: false, generateMipmaps: false,
+          minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+        });
+        gbufferRt.textures[0].type = THREE.FloatType;
+        gbufferRt.textures[0].name = "output";
+        gbufferRt.textures[1].type = THREE.FloatType; // harness reads it back on the CPU
+        gbufferRt.textures[1].name = "giNormal";
+        const gbufferMat = new THREE.MeshBasicNodeMaterial();
+        gbufferMat.lights = false;
+        const nFace = normalWorld.mul(sign(dot(normalWorld, cameraPosition.sub(positionWorld))));
+        const gbufferMrt = mrt({ output: vec4(positionWorld, 1), giNormal: vec4(nFace, 0) });
+
+        const t0Build = performance.now();
+        const gather = gatherMod.createGiGather({
+          win, trace, cache,
+          positionTexture: gbufferRt.textures[0],
+          normalTexture: gbufferRt.textures[1],
+          width: W, height: H, tier: TIER, crops: 0,
+        });
+        const rc = rcMod.createRcCascades({
+          win, trace, cache,
+          gbuffer: { position: gbufferRt.textures[0], normal: gbufferRt.textures[1] },
+          width: W, height: H, tier: TIER,
+          kit: {
+            u: gather.uniforms,
+            dominantFace: gather.internals.dominantFace,
+            faceSamplePoint: gather.internals.faceSamplePoint,
+            shadeHit: gather.internals.shadeHit,
+          },
+        });
+        const rd = rc.describe();
+        say(`tier ${TIER} — Δs₀ ${rd.spacing0} m, ${rd.cascades} cascades, W0 ${rd.w0} ` +
+          `(${rd.w0 * rd.w0 * 2} dirs at c0, ×4 per cascade), ${rd.maxLods} LODs, α ${rd.alpha}`);
+        say(`pools: ${rd.pools.c0Probes} c0 probes, ${rd.pools.binBudget} bin budget → ` +
+          `${(rd.pools.binTotal / 1e6).toFixed(2)}M bins; ${rd.totalMB} MB total ` +
+          `(probes ${(rd.bytes.probes / 1048576).toFixed(1)} + bins ` +
+          `${(rd.bytes.bins / 1048576).toFixed(1)} + rays ${(rd.bytes.rays / 1048576).toFixed(1)})`);
+        say(`gbuffer ${W}×${H} = ${rd.pixelCount} px, ray ceiling ${rd.rays}/frame, ` +
+          `jitter ${rd.jitter ? "on (R2)" : "FROZEN"}, build ${Math.round(performance.now() - t0Build)} ms`);
+
+        // ── (i) THE INTERVAL CENSUS, ON THE CPU ─────────────────────────────
+        say("");
+        say("(i) INTERVAL CENSUS — every band owned by exactly one cascade, per LOD");
+        for (const row of rd.intervals) {
+          say(`  lod ${row.lod}: ` + row.bands.map(([a, b], c) =>
+            `c${c} [${a.toFixed(2)}, ${b.toFixed(2)})`).join(" ") +
+            `  reach ${row.reach.toFixed(1)} m  gaps ${row.gaps} overlaps ${row.overlaps}`);
+        }
+        say(`  TOTAL gaps ${rd.gaps}, overlaps ${rd.overlaps}` +
+          (rd.intervals.length > 1
+            ? `; LOD seam ratio ${(rd.intervals[1].bands[0][0] / rd.intervals[0].reach).toFixed(3)} ` +
+              "(0.9 by design — the ladders overlap, the cascades do not)" : ""));
+
+        // ══════════════════════════════════════════════════ the three.js scene
+        const camera = new THREE.PerspectiveCamera(70, W / H, 0.05, 400);
+        let scene = null;
+        const buildScene = (prims) => {
+          if (scene) scene.traverse((o) => o.geometry?.dispose?.());
+          scene = new THREE.Scene();
+          for (const p of prims) {
+            const g = new THREE.BoxGeometry(
+              p.max[0] - p.min[0], p.max[1] - p.min[1], p.max[2] - p.min[2],
+            );
+            g.translate((p.min[0] + p.max[0]) / 2, (p.min[1] + p.max[1]) / 2, (p.min[2] + p.max[2]) / 2);
+            const m = new THREE.Mesh(g, new THREE.MeshBasicNodeMaterial());
+            m.frustumCulled = false;
+            scene.add(m);
+          }
+        };
+        const compute = (p) => renderer.computeAsync(p);
+        const renderGbuffer = async () => {
+          scene.overrideMaterial = gbufferMat;
+          renderer.setMRT(gbufferMrt);
+          renderer.setRenderTarget(gbufferRt);
+          renderer.setClearColor(0x000000, 0);
+          await renderer.renderAsync(scene, camera);
+          renderer.setRenderTarget(null);
+          renderer.setMRT(null);
+          scene.overrideMaterial = null;
+        };
+
+        const gu = gather.uniforms;
+        const runWorld = async (name, { measure = false } = {}) => {
+          const w = WORLDS[name];
+          buildScene(w.scene);
+          fill.setScene(w.scene);
+          gather.setPalette(PALETTE_OF(w.panel));
+          const sl = Math.hypot(...w.sun) || 1;
+          gu.sunDir.value.set(w.sun[0] / sl, w.sun[1] / sl, w.sun[2] / sl);
+          gu.sunColor.value.set(...(w.panel === 0 ? [3, 2.9, 2.6] : [0, 0, 0]));
+          gu.skyColor.value.set(0, 0, 0);
+          gu.panelRadiance.value.set(0, 0, 0);
+          camera.position.set(...w.eye);
+          camera.lookAt(...w.at);
+          camera.updateMatrixWorld(true);
+          camera.updateProjectionMatrix();
+          gu.projScale.value = (H / 2) / Math.tan((70 * Math.PI) / 360);
+
+          // ⭐⭐⭐ THE POOL IS WORLD-SPACE AND OUTLIVES THE WORLD, WHICH IS THE
+          // ONE THING THAT CAN FAKE A LEAK HERE. A bin block claimed in the LIT
+          // world is not decayed in the DARK one — the decay only touches
+          // blocks something still references — so its radiance sits in the
+          // pool and the leak sum reads it as light on the dark side. Measured:
+          // the "leak" was Σ 106 610 against the lit world's Σ 197 743, and
+          // `keep = 0` did not move it (a decay that never runs cannot decay).
+          // Zeroing the buffer is the only reset that reaches an ORPHANED
+          // block, and it costs one upload in a harness that has all day.
+          rc.bins.scratch.value.array.fill(0);
+          rc.bins.scratch.value.needsUpdate = true;
+          win.reset();
+          win.setCamera(w.eye);
+          await compute(win.statsResetPass);
+          await compute(win.scrollPass);
+          await compute(win.clearStaticPass);
+          await compute(fill.pass);
+          await compute(cache.allocPass);
+
+          const ms = { populate: 0, rays: 0, deposit: 0 };
+          for (let f = 0; f < FRAMES; f++) {
+            // ⭐⭐ THE FIRST FRAME OF EACH WORLD RESETS THE BINS, AND THE FIRST
+            // CUT OF THIS PAGE DID NOT — which is how a leak gate reads 239
+            // lit bins on a sealed dark room and calls it a transport failure.
+            // The accumulators are world-space and persist across worlds; the
+            // temporal decay fades them by `keep` per frame, so the LIT world's
+            // deposits were still 0.9⁶ = 0.53 of their value when the dark
+            // world was measured (Σ 106 706 against the lit world's 197 623 —
+            // the ratio names the mechanism exactly). `keep = 0` on the decay
+            // pass zeroes them, which is the reset the store already has.
+            rc.uniforms.rcKeep.value = f === 0 ? 0 : 1 - rd.alpha;
+            gather.beginFrame(f, camera.position);
+            gu.camPos.value.copy(camera.position);
+            rc.beginFrame(f);
+            rc.setCamera(w.eye);
+            await renderGbuffer();
+            // Timed per PHASE, and only from frame 1: the first dispatch of a
+            // fresh node compiles its pipeline and writes nothing.
+            const timed = measure && f > 0;
+            for (const [key, list] of Object.entries(rc.passes)) {
+              const t = performance.now();
+              for (const p of list) await compute(p);
+              const gpu = timestamps ? await renderer.resolveTimestampsAsync("compute") : null;
+              if (timed) ms[key] += Number.isFinite(gpu) ? gpu : performance.now() - t;
+            }
+          }
+          const n = Math.max(1, FRAMES - 1);
+          return { ms: Object.fromEntries(Object.entries(ms).map(([k, v]) => [k, v / n])) };
+        };
+
+        const BW = depMod.BIN_WORDS;
+        const binRadiance = async () => {
+          const u32 = new Uint32Array(await renderer.getArrayBufferAsync(rc.bins.scratch.value));
+          let written = 0;
+          let lit = 0;
+          let sum = 0;
+          for (const c of rc.bins.cascades) {
+            for (let b = 0; b < c.blockCapacity; b++) {
+              for (let k = 0; k < c.bins; k++) {
+                const o = (c.binBase + b * c.bins + k) * BW;
+                if (!u32[o + depMod.BIN_COUNT]) continue;
+                written++;
+                const r = u32[o] + u32[o + 1] + u32[o + 2];
+                if (r > 0) { lit++; sum += r / depMod.DEPOSIT_SCALE; }
+              }
+            }
+          }
+          return { written, lit, sum };
+        };
+        // ⭐⭐ THE POSITIVE CONTROL, AND THE LEAK GATE IS WORTHLESS WITHOUT IT.
+        // "0 bins carrying radiance" on a sealed dark room is a PASS only if the
+        // same summation over the same buffer reads a LIT room as lit —
+        // otherwise the gate is measuring its own blindness, which is the exact
+
+        // ══ (iii) THE LEAK, FIRST — ON A POOL NOTHING HAS WRITTEN YET ═══════
+        //
+        // ⚠ ORDER IS PART OF THIS INSTRUMENT, and the first cut of this page
+        // got it wrong. The bin pool is WORLD-SPACE and outlives a world: a
+        // block claimed while the LIT room was on screen is not decayed once
+        // nothing references it any more, so its radiance sits in the pool and
+        // a later sum reads it as light on the dark side of the wall. Measured
+        // in that order, the "leak" was Σ 106 610 against the lit world's
+        // Σ 197 743 — a 0.54 ratio that names the mechanism — and neither
+        // `keep = 0` nor zeroing the attribute could move it (a decay that
+        // never runs cannot decay, and a storage attribute's `needsUpdate` is
+        // not a re-upload). The dark worlds therefore run FIRST, on a pool this
+        // page has never written to, and the lit control comes after them.
+        const leaks = {};
+        for (const name of ["doors", "corridor"]) {
+          await runWorld(name);
+          const st = await rc.readStats(renderer);
+          const b = await binRadiance();
+          leaks[name] = { rays: st.rays, hits: st.hits, ...b };
+        }
+        say("");
+        say("(iii) LEAK — the camera sealed on the dark side of a 5 cm wall, every light behind it");
+        for (const [name, l] of Object.entries(leaks)) {
+          say(`  ${name.padEnd(9)} rays ${l.rays} · bins written ${l.written} · ` +
+            `bins carrying radiance ${l.lit} · Σ ${l.sum.toFixed(4)}` +
+            `${l.lit === 0 ? "   PASS" : "   ← LEAK"}`);
+        }
+
+
+        // ══ (iv) COST + (i) the GPU half, on the open world ══════════════════
+        const cost = await runWorld("open", { measure: true });
+        const stats = await rc.readStats(renderer);
+        say("");
+        say(`(iv) COST — ${timestamps ? "GPU timestamps" : "WALL TIME (no timestamps)"}, ` +
+          "per frame, averaged over the frames after the warm-up");
+        say(`  populate ${cost.ms.populate.toFixed(3)} ms · rays ${cost.ms.rays.toFixed(3)} ms · ` +
+          `deposit (trace + shade) ${cost.ms.deposit.toFixed(3)} ms · ` +
+          `chain ${(cost.ms.populate + cost.ms.rays + cost.ms.deposit).toFixed(3)} ms`);
+        say(`  rays ${stats.rays} · hits ${stats.hits} (${(stats.hitRate * 100).toFixed(1)}%) · ` +
+          `deposits ${stats.deposits} (${stats.perRay.toFixed(2)}/ray) · shaded ${stats.shaded}`);
+        say(`  bytes: ${rd.totalMB} MB · mean hit ${stats.meanT.toFixed(2)} m · ` +
+          `max ${stats.maxT.toFixed(1)} m`);
+        say(`  DROPPED: noBlock ${stats.noBlock} (deposits the block pool refused), ` +
+          `clamped ${stats.clamped} (radiance past Lmax)`);
+        const orphanRays = Math.max(0, stats.rays - stats.deposits);
+        say(`  orphans (rays that deposited into no cascade at all): ${orphanRays}`);
+
+        // ── (v) ONE PROBE'S DIRECTION DUMP ──────────────────────────────────
+        //
+        // The bin words, straight out of `scratch`: a c0 block is `binCount(0)`
+        // consecutive bins of `BIN_WORDS` u32 each, in the equal-area bin order
+        // `srcMath.binMorton` defines. This is the layout 5.2's merge reads.
+        // failure `probe-blind-statistics` exists to catch.
+        const control = await binRadiance();
+        say(`  CONTROL (the lit open world, the leak gate's own summation): bins written ` +
+          `${control.written} · carrying radiance ${control.lit} · Σ ${control.sum.toFixed(2)}` +
+          `${control.lit === 0 ? "   ← THE INSTRUMENT IS BLIND" : ""}`);
+        const scratchU32 = new Uint32Array(await renderer.getArrayBufferAsync(rc.bins.scratch.value));
+        const c0 = rc.bins.cascades[0];
+        let dumpBlock = -1;
+        for (let b = 0; b < c0.blockCapacity && dumpBlock < 0; b++) {
+          for (let k = 0; k < c0.bins; k++) {
+            if (scratchU32[(c0.binBase + b * c0.bins + k) * BW + depMod.BIN_COUNT] > 0) { dumpBlock = b; break; }
+          }
+        }
+        say("");
+        say(`(v) PER-DIRECTION DUMP — c0 block ${dumpBlock} of ${c0.blockCapacity}, ` +
+          `${c0.bins} bins × ${BW} words (R,G,B,T,COUNT…), fixed point ÷${depMod.DEPOSIT_SCALE}`);
+        if (dumpBlock >= 0) {
+          const rows = [];
+          for (let k = 0; k < c0.bins; k++) {
+            const o = (c0.binBase + dumpBlock * c0.bins + k) * BW;
+            const cnt = scratchU32[o + depMod.BIN_COUNT];
+            if (!cnt) continue;
+            rows.push(`b${k}:[${(scratchU32[o] / depMod.DEPOSIT_SCALE).toFixed(2)},` +
+              `${(scratchU32[o + 1] / depMod.DEPOSIT_SCALE).toFixed(2)},` +
+              `${(scratchU32[o + 2] / depMod.DEPOSIT_SCALE).toFixed(2)}]` +
+              `T${(scratchU32[o + depMod.BIN_T] / depMod.DEPOSIT_SCALE).toFixed(2)}` +
+              `n${(cnt / depMod.DEPOSIT_SCALE).toFixed(2)}`);
+          }
+          say(`  filled ${rows.length}/${c0.bins} directions`);
+          say("  " + rows.slice(0, 12).join(" "));
+        }
+
+        // ── (ii) THE ANCHOR CENSUS ──────────────────────────────────────────
+        //
+        // Every ray of this path leaves a gbuffer surface point displaced along
+        // its own normal. Walk those origins against the window buffer and
+        // count the ones that are inside an OPAQUE voxel — a ray born there is
+        // the recessed-probe bias the paper's §5 names.
+        const winBuf = new Uint32Array(await renderer.getArrayBufferAsync(win.attribute));
+        const posBuf = await renderer.readRenderTargetPixelsAsync(gbufferRt, 0, 0, W, H, 0);
+        const nrmBuf = await renderer.readRenderTargetPixelsAsync(gbufferRt, 0, 0, W, H, 1);
+        // ⚠ THE CENSUS MIRRORS `traceWindow`, NOT AN IDEA OF IT. The ray origin
+        // this path fires from is the RAW gbuffer point (`srcDeposit` applies no
+        // bias of its own — `gatherNormalBias` ships at 0 and belongs to the
+        // gather), and `traceWindow` is what moves it: half a cell of the
+        // origin's own level along the normal, then up to `ORIGIN_ESCAPE` whole
+        // cells while it is still inside an occupied voxel. Counting the RAW
+        // point instead would score the conservative voxelization's own
+        // dilation as a ray born in geometry — 15.1 % of a sealed room on the
+        // first run of this page, none of it real.
+        const viOf = (x, y, z) => ((x & 63) | ((y & 63) << 6) | ((z & 63) << 12)) >>> 0;
+        const classAt = (p) => {
+          for (let l = 0; l < win.levels; l++) {
+            const v = win.levelVoxel(l);
+            const c = p.map((x) => Math.floor(x / v));
+            const rel = [0, 1, 2].map((a) => c[a] - win.origins[l * 3 + a]);
+            if (rel.some((r) => r < 0 || r >= 64)) continue;
+            const vi = viOf(c[0], c[1], c[2]);
+            const base = l * store.LEVEL_WORDS;
+            const occ = (winBuf[base + store.OCC_OFF + (vi >>> 5)] >>> (vi & 31)) & 1;
+            const cov = (winBuf[base + store.COV_OFF + (vi >>> 4)] >>> ((vi & 15) * 2)) & 3;
+            return { level: l, voxel: v, occ, cov };
+          }
+          return null;
+        };
+        const escaped = (p, n) => {
+          const l0 = classAt(p);
+          if (!l0) return { at: null, steps: 0 };
+          const v = l0.voxel;
+          let q = [p[0] + n[0] * v * 0.5, p[1] + n[1] * v * 0.5, p[2] + n[2] * v * 0.5];
+          for (let s = 0; s <= traceMod.ORIGIN_ESCAPE; s++) {
+            const a = classAt(q);
+            if (!a?.occ) return { at: a, steps: s };
+            q = [q[0] + n[0] * v, q[1] + n[1] * v, q[2] + n[2] * v];
+          }
+          return { at: classAt(q), steps: traceMod.ORIGIN_ESCAPE + 1 };
+        };
+        let valid = 0;
+        let rawInside = 0;
+        let inside = 0;
+        let insideOpaque = 0;
+        let stepsSum = 0;
+        const stuck = [];
+        for (let i = 0; i < W * H; i++) {
+          if (!(posBuf[i * 4 + 3] > 0.5)) continue;
+          const nx = nrmBuf[i * 4], ny = nrmBuf[i * 4 + 1], nz = nrmBuf[i * 4 + 2];
+          const nl = Math.hypot(nx, ny, nz);
+          if (nl < 0.5) continue;
+          valid++;
+          const p = [posBuf[i * 4], posBuf[i * 4 + 1], posBuf[i * 4 + 2]];
+          if (classAt(p)?.occ) rawInside++;
+          const e = escaped(p, [nx / nl, ny / nl, nz / nl]);
+          stepsSum += e.steps;
+          if (e.at?.occ) {
+            inside++;
+            if (e.at.cov === 3) {
+              insideOpaque++;
+              if (stuck.length < 4) stuck.push({ p, n: [nx / nl, ny / nl, nz / nl], at: e.at });
+            }
+          }
+        }
+        say("");
+        say(`(ii) ANCHOR CENSUS — ${valid} ray origins, mirroring traceWindow's own bias + escape`);
+        say(`  raw gbuffer points inside an occupied voxel ${rawInside} ` +
+          `(${((rawInside / Math.max(1, valid)) * 100).toFixed(2)}% — the conservative voxelization's ` +
+          `dilation, which is what the escape exists for)`);
+        say(`  AFTER the bias + escape: occupied ${inside} · OPAQUE (class 3) ${insideOpaque} · ` +
+          `mean escape ${(stepsSum / Math.max(1, valid)).toFixed(2)} cells` +
+          ` (${((insideOpaque / Math.max(1, valid)) * 1e6).toFixed(1)} ppm)`);
+        // ⚠ AND THE SURVIVORS ARE NAMED, NOT COUNTED. A census that reports "2"
+        // and nothing else cannot be acted on; the position, the normal and the
+        // window level say whether it is a two-slab corner (the mirror's own
+        // level choice at a seam) or a ray genuinely born in a wall.
+        for (const k of stuck) {
+          say(`    stuck: p [${k.p.map((x) => x.toFixed(3))}] n [${k.n.map((x) => x.toFixed(2))}] ` +
+            `L${k.at.level} v ${k.at.voxel} cov ${k.at.cov}`);
+        }
+
+        // ── (iii) THE LEAK ──────────────────────────────────────────────────
+        const gate = {
+          intervalGaps: rd.gaps,
+          intervalOverlaps: rd.overlaps,
+          orphanRays,
+          noBlock: stats.noBlock,
+          anchorsInsideOpaque: insideOpaque,
+          leaks: Object.fromEntries(Object.entries(leaks).map(([k, v]) => [k, v.lit])),
+          controlLit: control.lit,
+          validation: validation.length,
+        };
+        const pass = rd.gaps === 0 && rd.overlaps === 0 && orphanRays === 0
+          && insideOpaque === 0 && Object.values(gate.leaks).every((v) => v === 0)
+          && control.lit > 0 && validation.length === 0;
+        say("");
+        say(`GATE ${pass ? "PASS" : "FAIL"} — ${JSON.stringify(gate)}`);
+        globalThis.__GI2_RC_RESULT__ = {
+          pass, tier: TIER, gate, describe: rd, cost: cost.ms, stats, leaks, control,
+          anchors: { valid, rawInside, inside, insideOpaque },
+          text: lines.join("\n"),
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>
