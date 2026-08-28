@@ -761,6 +761,10 @@ export function createGi2System({
         // hook, the `indirect` view, every `probe:gi2-*` — is unchanged and
         // cannot tell which estimator filled it. See `rcMerge.js`.
         irradianceHalf: gather.textures.irradianceHalf,
+        // §19 5.5a — the specular half of the same destination. 5.4b's cut
+        // removed `resolveHalf`, which was `glossyHalf`'s only writer; the
+        // cascades take over BOTH stores or the frame has no specular term.
+        glossyHalf: gather.textures.glossyHalf,
       })
       : null;
     if (rc) {
