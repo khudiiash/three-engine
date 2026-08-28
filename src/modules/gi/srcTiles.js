@@ -134,6 +134,56 @@ const SEED_RAMP = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 30;
 })();
 
+/**
+ * ⭐⭐⭐ §19 STAGE 6.1 — THE NEWBORN FADE (Lumen's new-probe fade), AND WHY IT
+ * IS A SCALE ON THE TILE RATHER THAN A GATHER WEIGHT.
+ *
+ * THE SPOTS. At an elevated Bistro pose the `indirect` view shows one white
+ * oval per 0.5 m c0 probe. The mechanism is in `srcRays.js` [D1] and it is
+ * written in that pass's own comment: "A probe covering forty pixels gets forty
+ * times the rays of one covering a single pixel." A probe on the far pavement
+ * covers ONE pixel, so it fires `raysPerPixel` rays into 32 c0 bins — its tile
+ * knows one or two directions, and `srcScreenGather`'s renormalisation
+ * (`acc/wsum`) then reports that ONE bin's radiance as the whole hemisphere's
+ * irradiance AT FULL STRENGTH. Its settled neighbour two cells away reports a
+ * 32-bin mean. Trilinear weight peaks inside a probe's own cell, so each
+ * disagreeing probe OWNS its cell: one hard-edged spot per probe.
+ *
+ * ⭐⭐ THE FADE CANNOT DARKEN, AND THAT IS ALGEBRA RATHER THAN TUNING.
+ * `srcScreenGather` accumulates `acc += rgb·w` / `wsum += a·w` and divides
+ * ONCE. Scaling a tile's rgb AND its alpha by the same `fade` is therefore
+ * IDENTICAL to scaling that corner's trilinear weight — and because the result
+ * is a RATIO, a neighbourhood whose corners are ALL equally young divides the
+ * fade straight back out. So this can only ever move authority BETWEEN corners,
+ * never remove light: there is no black-square failure mode and no floor is
+ * needed to avoid one. A newborn among settled neighbours is interpolated
+ * THROUGH; a whole newborn frontier is unchanged.
+ *
+ * ⚠ SMOOTHSTEP, NEVER A THRESHOLD (the user's rule: light arrives in natural
+ * gradients, no hard edges, no rapid changes). `3s²−2s³` is C1 at both ends, so
+ * the ramp has no edge in TIME either — a probe does not pop in at frame N.
+ *
+ * ⚠ AND IT IS STRUCTURALLY A NO-OP ONCE SETTLED, the same guarantee 5.4f
+ * gives: past `NEWBORN_FADE` frames `fade == 1` exactly and the tile is
+ * bit-identical to the pre-6.1 build. That is the Cornell gate's safety, and it
+ * holds by construction rather than by measurement.
+ *
+ * `__gi2TileNewbornFade = 0` restores 5.4f. Rides `maturityOn`'s claim stamp —
+ * no new storage, no new pass, no new uniform, no new buffer read (the stamp is
+ * already fetched for `seedW` on the same thread).
+ */
+const NEWBORN_FADE = (() => {
+  const raw = Number(globalThis.__gi2TileNewbornFade);
+  // 16 frames ≈ a quarter second at 60 fps, and it is the same ORDER as the ray
+  // budget it stands in for: a one-pixel probe firing `raysPerPixel` rays needs
+  // tens of frames to cover 32 bins, so a shorter ramp hands the pixel back to
+  // the newborn while it is still a one-bin estimate.
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 16;
+})();
+/** The residual weight at age 0. See the floor's note inside the bake. */
+const NEWBORN_FLOOR = 1 / 64;
+
 /** Sub-samples per bin axis in the cosine quadrature. §12.2's bias fix. */
 export const COSINE_SUB = 4;
 
@@ -356,9 +406,28 @@ export function createSrcTileAtlas(store, bins, {
     // than measured: after `SEED_RAMP` frames this term contributes nothing to
     // `acc`, `wsum` or `known`, so a steady scene cannot tell 5.4f from off.
     const seedW = float(SEED_WEIGHT).toVar();
+    // §19 6.1's newborn fade rides the SAME fetched stamp — see NEWBORN_FADE.
+    // 1 on every build that cannot read a stamp, which is the pre-6.1 tile.
+    const newbornFade = float(1).toVar();
     if (maturityOn) {
       const st = stampStack.element(uint(stampBase).add(block)).toVar();
-      seedW.assign(float(uint(frameStamp).sub(st)).div(float(SEED_RAMP)).oneMinus().clamp(0, 1));
+      const age = float(uint(frameStamp).sub(st)).toVar();
+      seedW.assign(age.div(float(SEED_RAMP)).oneMinus().clamp(0, 1));
+      if (NEWBORN_FADE > 0) {
+        const s = age.div(float(NEWBORN_FADE)).clamp(0, 1).toVar();
+        // ⚠ THE FLOOR IS NOT A TUNING CONSTANT, IT IS THE ONE PLACE THE RATIO
+        // ARGUMENT BREAKS. `fade == 0` writes alpha 0, and if the pixel's whole
+        // 8-corner neighbourhood is born on the SAME frame — which is exactly
+        // what a walk frontier is — every corner writes 0, `wsum` is 0, and
+        // `gatherAt` returns `known = false`: a BLACK square, the artifact this
+        // stage exists to remove. At a floor of 1/64 a uniformly newborn
+        // neighbourhood divides the floor back out and resolves to precisely
+        // its unfaded value, while a newborn beside a settled probe still
+        // carries 1/64 of its trilinear weight and cannot own its cell.
+        newbornFade.assign(float(NEWBORN_FLOOR).add(
+          s.mul(s).mul(float(3).sub(s.mul(2))).mul(1 - NEWBORN_FLOOR),
+        ));
+      }
     }
     const seedLive = seedW.greaterThan(0).toVar();
 
@@ -634,7 +703,12 @@ export function createSrcTileAtlas(store, bins, {
     // `const w = weight * cov; acc.r += c[0]*w; acc.w += w`), so the two twins
     // implemented different estimators under the hatch and only the GPU was
     // wrong. `test:gi-src-gather` cannot see it while the flag is off.
-    textureStore(atlas, coord, vec4(E.mul(cover), cover));
+    // §19 6.1 — RGB **AND** ALPHA, and the pair is the whole mechanism: the
+    // gather divides `Σ rgb·w` by `Σ a·w`, so scaling both is a scale on this
+    // corner's WEIGHT and the ratio is untouched when every corner scales the
+    // same way. Scaling rgb alone would be a dimmer, which is the bug.
+    const fadedCover = cover.mul(newbornFade).toVar();
+    textureStore(atlas, coord, vec4(E.mul(fadedCover), fadedCover));
   })().compute(blocks * texels));
 
   /**
