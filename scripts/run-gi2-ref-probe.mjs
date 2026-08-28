@@ -135,9 +135,16 @@ const OUT = process.env.OUT ?? "";
 const ARM_PRESETS = {
   field: { rcTermField: 1, rcTermDirect: 0 },
   direct: { rcTermField: 0, rcTermDirect: 1 },
+  // ⚠ `noSky`/`noSun` ARE NOT VIABLE AS UNIFORM ARMS ON A LIVE BOOT:
+  // `GISystem.#tick` republishes `skyColor` from `sceneSkyRadiance` and
+  // `sunColor` from the light every frame, so the write survives exactly one
+  // tick and the arm measures the baseline a second time. They are kept
+  // because the SKIPPED/equal reading is itself the receipt — an arm that
+  // reads `share ≈ 0 %` here means the write was reverted, not that the term
+  // is empty. The honest sky split is the reference's own `E_sky_p` /
+  // `E_hit_p` columns, which are printed per point above.
   noSky: { skyColor: 0 },
   noSun: { sunColor: 0 },
-  noSkyField: { skyColor: 0, rcTermDirect: 0 },
 };
 const ARMS = (process.env.ARMS ?? "").split(/[,|]/).map((s) => s.trim()).filter(Boolean)
   .map((spec) => {
@@ -1188,9 +1195,15 @@ for (const [key, mk, label] of [["a", poseStreet, "STREET OVERVIEW"], ["b", pose
           const n = u[s.k];
           if (!n) return { error: `no uniform ${s.k}` };
           const v = n.value;
-          if (v && typeof v === "object" && "x" in v) {
-            before.push({ k: s.k, vec: [v.x, v.y, v.z] });
-            v.set(s.v, s.v, s.v);
+          // ⚠ `skyColor`/`sunColor` are THREE.Color (r/g/b), NOT Vector3
+          // (x/y/z) — the first cut of this tested only `"x" in v`, fell to
+          // the scalar branch and REPLACED the Color object with a number, and
+          // the next `sceneSkyRadiance` tick threw `out.setRGB is not a
+          // function` on every frame for the rest of the boot.
+          if (v && typeof v === "object" && ("x" in v || "r" in v)) {
+            const c = "r" in v ? ["r", "g", "b"] : ["x", "y", "z"];
+            before.push({ k: s.k, vec: c.map((a) => v[a]), comp: c });
+            for (const a of c) v[a] = s.v;
           } else { before.push({ k: s.k, num: v }); n.value = s.v; }
         }
         return { ok: true, before };
@@ -1206,7 +1219,7 @@ for (const [key, mk, label] of [["a", poseStreet, "STREET OVERVIEW"], ["b", pose
         const gi2 = globalThis.__gi2();
         const u = { ...(gi2.rc?.uniforms ?? {}), ...gi2.gather.uniforms };
         for (const b of before) {
-          if (b.vec) u[b.k].value.set(b.vec[0], b.vec[1], b.vec[2]);
+          if (b.vec) b.comp.forEach((a, i) => { u[b.k].value[a] = b.vec[i]; });
           else u[b.k].value = b.num;
         }
       }, { before: set.before });
