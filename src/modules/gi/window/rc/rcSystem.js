@@ -404,6 +404,9 @@ export function createRcCascades({
   const deposit = createSrcDepositFrame(store, bins, {
     pixelProbe: frame.pixelProbe,
     pixelRayBase: rayStore.pixelRayBase,
+    // SS19 6.1 - the per-probe ray floor. [D5] and [E] must agree on how
+    // many rays a pixel fires, and this is the one word that says so.
+    probeBoost: rayStore.probeBoost ?? null,
     rayWork: rayStore.rayWork,
     pixelCount,
     pixelCountNode: rayStore.pixelCountU,

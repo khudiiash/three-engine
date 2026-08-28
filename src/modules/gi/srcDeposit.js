@@ -686,6 +686,15 @@ export function createSrcBinStore(store, {
 export function createSrcDepositFrame(store, bins, {
   pixelProbe,
   pixelRayBase,
+  /**
+   * SS19 STAGE 6.1 - the per-probe ray floor's per-pixel multiplier
+   * (`srcRays`' `probeBoost`). [E] loops THIS instead of the compile-time
+   * `raysPerPixel`, because [D5] claimed a slice of exactly this width and
+   * the two must be the same number or the deposit walks off its segment.
+   * `null` (every pre-6.1 caller and every standalone rig) keeps the
+   * constant bound and the WGSL byte-identical.
+   */
+  probeBoost = null,
   pixelCount,
   // §19 0.3b — the resize-stable twin of `pixelCount`. See srcRays' store.
   pixelCountNode = null,
@@ -1203,7 +1212,13 @@ export function createSrcDepositFrame(store, bins, {
     // survive becoming a GPU index. The cascade scatter below still unrolls on
     // its own JS `c`, deliberately: N=4 iterations of a few atomics, and those
     // read `chain[c]`/`blocks[c]`/`bounds[c]`, JS arrays of captured nodes.
-    Loop({ start: uint(0), end: uint(raysPerPixel), type: "uint", condition: "<" }, ({ i: k }) => {
+    // SS19 6.1 - THE BOUND IS THE FLOOR'S WORD, AND IT MUST BE THE SAME ONE
+    // [D5] CLAIMED WITH. `pixelRayBase[i]` is a slice of width
+    // `probeBoost[probe]`; looping a different count either leaves rays
+    // unfired (a probe that asked for the floor and never got it) or writes
+    // past the slice into the next pixel's (a silent double deposit).
+    const rpp = probeBoost ? probeBoost.element(probe0).toVar() : uint(raysPerPixel);
+    Loop({ start: uint(0), end: rpp, type: "uint", condition: "<" }, ({ i: k }) => {
       // `n` is the ray's place in the global R2 sequence. It is handed to the
       // trace and the shading as a fourth/third argument that neither real
       // implementation uses — a SYNTHETIC one does, and that is what makes the
