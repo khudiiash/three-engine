@@ -780,7 +780,11 @@ export function rc5PathEnabled(runtime = globalThis) {
  */
 export function rc5BvhShadowEnabled(runtime = globalThis) {
   if (!rc5PathEnabled(runtime)) return false;
-  return (runtime?.__gi2Rc5BvhShadow ?? 1) !== 0;
+  // 08-29 00:30: DEFAULT OFF until the arm swap stops rebuilding the gather —
+  // the rebuild re-creates the gather textures and the materials stay bound
+  // to the destroyed ones (the frame goes black after the BVH lands while the
+  // irradiance readback is lit). `__gi2Rc5BvhShadow = 1` arms it.
+  return (runtime?.__gi2Rc5BvhShadow ?? 0) !== 0;
 }
 
 /**
