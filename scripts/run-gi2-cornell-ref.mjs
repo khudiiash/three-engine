@@ -900,16 +900,30 @@ if (convSeries.length >= 3) {
       const eng = globalThis.__giEngineForProbe;
       const rc = globalThis.__gi2()?.rc;
       if (!rc) return null;
-      const [d, j] = await Promise.all([rc.readStats(eng.renderer), rc.readHitStats(eng.renderer)]);
-      return JSON.stringify({ d, j, describe: rc.describe() });
+      const [d, j, m] = await Promise.all([
+        rc.readStats(eng.renderer), rc.readHitStats(eng.renderer),
+        rc.readMergeStats ? rc.readMergeStats(eng.renderer) : null,
+      ]);
+      return JSON.stringify({ d, j, m, describe: rc.describe() });
     });
     if (rcj) {
-      const { d, j, describe } = JSON.parse(rcj);
+      const { d, j, m, describe } = JSON.parse(rcj);
       console.log(`  [E] rays ${d.rays} hits ${d.hits} (${pct(d.hitRate)}) deposits ${d.deposits} ` +
         `perRay ${f(d.perRay, 2)} noBlock ${d.noBlock} clamped ${d.clamped} maxL ${f(d.maxRadianceFraction, 3)}`);
       console.log(`  [J] ${j ? `${j.hits}/${j.capacity} shaded${j.bounce ? " +bounce" : " (single)"}` +
         `  BOUNCE-CLAMPED ${j.clamped}  OVERFLOW ${d.secondaryOverflow}` : "not built (inline arm)"}` +
         `   hitRadiance ${describe.hitRadiance}  hitList ${describe.pools.hitList}`);
+      // ⭐⭐ §19 5.4d — THE BIN CENSUS, PER CASCADE. A gain measured on the
+      // picture cannot say whether a direction was DARK or ABSENT, and those
+      // want opposite fixes: an orphaned bin kept `L_self + T·sky` because no
+      // parent bin in that direction was ever filled. `cycle` names the
+      // direction schedule the fill ran under, because the whole point of the
+      // census is to compare two of them.
+      if (Array.isArray(m?.cascades)) {
+        console.log(`  merge census (cycle ${describe.cycleK ?? "—"}, jitter ${describe.jitter}): `
+          + m.cascades.map((c, i) => `c${i} orphan ${pct(c.orphanRate ?? 0)}`
+            + (c.orphanLiveRate != null ? `/live ${pct(c.orphanLiveRate)}` : "")).join("  "));
+      }
     }
   } catch (e) { console.log(`  [E]/[J] tallies unavailable: ${e?.message}`); }
   console.log(`  samples ${convSeries.length} · mean E ${f(convSeries[0].mean, 4)} → ${f(finalMean, 4)}`);
