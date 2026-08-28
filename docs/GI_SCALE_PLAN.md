@@ -515,6 +515,38 @@ user accepts GI2 by eye (`GI2_PATH = false` is the safety net).
 
 **Open after 08-28:** the far cascade's near band (agent in flight); the gather ignoring throughput T; cache DIRECTIONS (4 sky rays/face is the variance floor; ≈ ×1.5 rays); the BVH8 mirror tier (no sharp reflections on GI2 yet); bounce colour fidelity (64-class palette); 4.1 cutover HELD until the user accepts GI2 by eye.
 
+### Stage 5 — RADIANCE CASCADES RESTORED ON THE WINDOW (user decision 2026-08-28: "Do that")
+
+**Why.** Audits §AA-§AJ: every 08-28 fix removed a real bug and exposed the next symptom of one missing foundation. Checked against `docs/SplitRadianceCascadesPaper.txt` §3-§5, the world-probe path has spacing ×4 / interval ×4 / **directions ×1** (64 at every cascade — no angular branching, so Δω ≫ Δs at every band end: the paper's Fig 2 streaks, ours as fixed-direction blotches), a per-same-direction merge (**no cone averaging**, the source of RC's smoothness), rays from **probe centres** (the paper's Fig 7/8 recess bias — every escape/burrow/claim workaround of 08-28 is this), and a 4-ray self-lit face cache instead of a **secondary probe cache**. The old SRC path had the paper (`srcConfig` β = 4, R2, Alg. 3) and failed on scale, not math. Stage 5 keeps GI2's transport (window, bit-DDA, coverage, soup, budgets, boot, material hook, GTAO, movers) and puts the paper's contract back on top.
+
+**The contract (deterministic — §T and the no-noise rule hold: complete fixed direction sets, no stochastic input; the only temporal element is world-space α accumulation and a fixed round-robin cadence).**
+
+| element | rule |
+|---|---|
+| cascades | n = 0..N−1; N = 4 ultra/high, 3 medium, 2-3 phone. Toroidal camera-centred lattices as now, 32³ cells each |
+| spacing | Δs_n = Δs0·2ⁿ (Δs0 0.5 m ultra/high, 1.0 m phone) → extents 16/32/64/128 m |
+| directions | Ω_n = 32·4ⁿ (equal-area map, 2Θ×Θ, Θ_n = 4·2ⁿ: 8×4, 16×8, 32×16, 64×32); parent map m_n(ω_{n+1,u,v}) = ω_{n,⌊u/2⌋,⌊v/2⌋} (4→1, Morton-contiguous) |
+| intervals | t₀ = 1.6·Δs0, t_n = t₀·4ⁿ; cascade n traces [t_{n−1}, t_n) with t_{−1} = 0; the last cascade to RAY_MAX then sky |
+| storage per direction | J (radiance, RGBE/half3), β (transmittance), count; merged I_n pre-averaged for n−1 only. Sparse: live probes only (allocPass liveness), compact index per cascade, budget `traceSlots` per tier; ~constant texels per cascade (live probes ÷4 per cascade × directions ×4) |
+| ray origins (ray splitting, deterministic) | a probe stores up to 8 ANCHORS = surface samples (position + normal) of the finer probes mapping to it (c0 anchors = the gbuffer/soup surface samples that allocated the cell); direction ω is traced from the anchor with max(n_a·ω) > 0, interval measured from the anchor; no anchor faces ω → count 0 (unused by construction) |
+| schedule | every live probe traces its complete direction set on a fixed cadence: c0 every frame, c1 every 2, c2 every 4, c3 every 8 (~1.1 M rays/frame ultra ≈ 1.1 ms at 1 G rays/s); α accumulation per direction in world space |
+| merge (Eq. 7) | back-to-front: I_n(p,ω) = J_n + β_n · mean over the 4 children ω_q of Interp8(I_{n+1})(p, ω_q); Interp8 = sparse trilinear over LIVE parents, liveness-renormalised, with the visibility weights (Chebyshev/face) as the leak guard; children with count 0 skipped (renormalise; all zero → 0) |
+| shade | per c0 probe: cosine-weighted irradiance from I_0 (SH2 or a 6×6 oct map); pixels resolve by the existing 8-probe visibility-weighted interpolation (resolveHalf/resolveUpsample stay; screen tiles retired) |
+| hit radiance (2nd bounce) | J at a hit = emission + palette albedo × (direct(hit) + E_probes(hit)) / π; direct = sun shadow ray + emitter NEE (seats, power gate) cached per brick face (DIRECT ONLY — the face cache stops lighting itself); E_probes = the covering cascade's merged I_n evaluated against the hit normal (the paper's secondary cache, realised on the same lattices) |
+| LOD | the toroidal extents are the LOD; beyond the last extent the last cascade's rays reach RAY_MAX/sky |
+| movers | dynamic layer unchanged; c0 re-traces every frame |
+
+**Budget/memory (ultra):** live ≈ 20k/5k/1.2k/0.3k probes × 32/128/512/2048 dirs × 8 B ≈ 5 MB per cascade for J/β/count, same again for I → ~40 MB; rays ~1.1 M/frame; chain target ≤ 3 ms. Phone: Δs0 1 m, N 2-3, `traceSlots` small.
+
+**Units (one at a time, each gated; new module `src/modules/gi/window/rc/`, behind `RC5_PATH`; old world probes + radiance-cache bounce stay until 5.4):**
+
+| unit | builds | gate |
+|---|---|---|
+| **5.1 lattice + anchors + trace** | `rcLattice.js` (liveness, compaction, anchors), `rcTrace.js` (interval trace per cascade via `traceWindow` with coverage T, deposit J/β/count, cadence, α) | interval census (every band owned exactly once, orphans 0); leaks 0/10 000 corridor/doors on the deposited J; rays/frame + ms per tier; anchors: 0 probes tracing from inside geometry |
+| **5.2 merge + shade + resolve** | `rcMerge.js` (Eq. 7 cone merge, pre-averaged), irradiance per c0, wiring into resolveHalf/resolveUpsample | Cornell per-pixel gate on the user's Cornel.scene (median |log ratio| < 0.15, black 0, blotch σ < 10 %); pinned Bistro ref medians < 0.15 both poses; Cornell 8/8 |
+| **5.3 hit radiance from probes** | `rcHit.js`: direct-only face cache + E_probes at hits | Cornell energy per surface 0.9-1.1; convergence monotone, image still at rest (Δ 0.00 %); `probe:gi2-faceterm` σ < 10 % |
+| **5.4 flip + tiers + cut** | `RC5_PATH` default on; phone/medium tiers; delete the old world-probe path and the cache's bounce term | full battery: runner no step > 10 %, motion at the null floor, leaks 0, first light ≤ 3 s, chain ≤ 3 ms ultra, smoke incl. phone, memory envelope; then Bistro by the user's eye |
+
 ### What is deliberately NOT in this plan
 - Any new tuning property on the component (three properties stay three).
 - Temporal AO (killed 08-26; GTAO has no history).
