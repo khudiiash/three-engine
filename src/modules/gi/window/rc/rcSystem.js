@@ -90,6 +90,12 @@ export function createRcCascades({
   // `resolveUpsample` reads. Absent, the merge's resolve writes irradiance
   // only and the frame is 5.4b exactly (a specular slot with no producer).
   glossyHalf = null,
+  // §19 STAGE 5.5b — `createShadowBvhGpu`'s handle, or `null`. Present, the
+  // seated emitter's shadow ray is traced against the scene's TRIANGLES;
+  // absent, against the window's voxels exactly as 5.3d shipped. Nothing else
+  // in this file reads it — the whole exact/voxel choice lives in one
+  // expression inside `rcDirect`.
+  shadowBvh = null,
 }) {
   const spec = rcTierSpec(tier);
   const { u, dominantFace, faceSamplePoint, shadeHit } = kit;
@@ -477,6 +483,11 @@ export function createRcCascades({
       // build has no slots or the arm is off.
       direct: createRcEmitterDirect({
         trace, voxel0: win.voxel0, emitters, gbuffer, camera: vec3(cameraU), width, height,
+        // §19 5.5b — the exact triangle arm when the worker BVH has landed,
+        // `null` (the voxel arm) when it has not. Handed down rather than
+        // reached for: `rcSystem` does not own the BVH's lifetime, `gi2System`
+        // does, and a pass that captured a global would go stale on a rebuild.
+        bvh: shadowBvh ?? null,
       }),
     })
     : null;

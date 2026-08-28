@@ -78,10 +78,12 @@ import { createRadianceCache } from "./radianceCache.js";
 import { createWindowVoxelizer } from "./windowVoxelize.js";
 import { createWindowDynamic, moverBoxSoup } from "./windowDynamic.js";
 import { createTriangleSoupBuilder, SoupSupersededError, PAL_NONE } from "./triangleSoup.js";
+import { createShadowBvhBuilder, createShadowBvhGpu, SHADOW_BVH_TRI_CAP } from "./shadowBvh.js";
 import { createGiGather, GATHER_TIERS, PAL_ENTRIES, STATS } from "./gatherProbes.js";
 import { createRcCascades } from "./rc/rcSystem.js";
 import { rcHitPathEnabled } from "./rc/rcConfig.js";
 import { rc5PixelNeeEnabled } from "../giConfig.js";
+import { rc5BvhShadowEnabled } from "../giConfig.js";
 import { rc5PathEnabled } from "../giConfig.js";
 import { detachCpuMirror } from "../releaseCompute.js";
 
@@ -523,6 +525,14 @@ export function createGi2System({
   let voxelizer = null;
   let dynamic = null;
   let soup = null;
+  /**
+   * §19 STAGE 5.5b — `createShadowBvhGpu`'s handle once the worker BVH lands,
+   * `null` until then. NOT awaited anywhere: first light is served by the voxel
+   * arm exactly as 5.4d shipped, and the exact arm arrives as a SWAP —
+   * `swapShadowBvh` rebuilds the gather the same way `setSize` does and nothing
+   * else in the system knows it happened.
+   */
+  let shadowBvh = null;
   let emitterDirect = null;
   let aoCompose = null;
   let aoOut = null;
@@ -765,6 +775,11 @@ export function createGi2System({
         // removed `resolveHalf`, which was `glossyHalf`'s only writer; the
         // cascades take over BOTH stores or the frame has no specular term.
         glossyHalf: gather.textures.glossyHalf,
+        // §19 STAGE 5.5b — the exact triangle shadow arm, or `null` while the
+        // worker is still building it. Read HERE, at graph-build time, which is
+        // exactly why `swapShadowBvh` has to rebuild the gather rather than
+        // poke a uniform: the two arms are different kernels.
+        shadowBvh: rc5BvhShadowEnabled() ? shadowBvh : null,
       })
       : null;
     if (rc) {
@@ -1056,12 +1071,68 @@ export function createGi2System({
     );
 
     soup = uploadSoup(built);
+    // ── §19 STAGE 5.5b — THE BVH, FIRED AND NOT AWAITED ──────────────────────
+    //
+    // Deliberately AFTER `uploadSoup` and BEFORE the voxelizer: the worker owns
+    // its copy from this instant, so its build overlaps everything below —
+    // voxelization, the dynamic set, the whole pipeline compile wave. On a
+    // scene where that wave is seconds long the tree lands inside it and the
+    // swap is invisible; on a trivial scene the build is milliseconds. Neither
+    // case blocks first light, because nothing here is awaited.
+    //
+    // ⚠ THE COPY IS MANDATORY. `build()` TRANSFERS the array, and `built.tris`
+    // is still referenced by the `instancedArray` above (and by `store.soup`,
+    // which survives a rebuild) — transferring it would detach a buffer the
+    // renderer is about to upload. The copy is freed the moment the worker
+    // takes ownership; the reordered tree it sends back is the only lasting
+    // allocation.
+    kickShadowBvh(built);
     voxelizer = createWindowVoxelizer(win, soup, tier);
     dynamic = createWindowDynamic(win, voxelizer, tier);
     stampVoxNames();
     setMovers(movers);
     marks.voxelizer = performance.now();
     return true;
+  };
+
+  /**
+   * Starts (or restarts) the exact-shadow BVH build for a soup. Fire and
+   * forget: every failure path here ends with `shadowBvh` still `null` and the
+   * voxel arm still serving, which is a picture the user has already seen
+   * rather than a black frame.
+   */
+  const kickShadowBvh = (built) => {
+    if (!rc5BvhShadowEnabled() || !built?.triCount) return;
+    // ⛔ NOT ON PHONE. The tree is tens of MB of storage buffer on top of a
+    // budget the phone tier is already at, and a 64-deep stack of `u32` per
+    // thread is a register cost a tile GPU pays badly. The voxel arm is the
+    // phone arm, and it is stated here rather than inside a tier table so the
+    // reason travels with the decision.
+    if (tier === "phone") {
+      console.log("[gi2] exact shadow rays: OFF on the phone tier — the voxel arm serves");
+      return;
+    }
+    const builder = (store.bvhBuilder ??= createShadowBvhBuilder());
+    const t0 = performance.now();
+    builder.build({ tris: built.tris.slice(), triCount: built.triCount, triCap: SHADOW_BVH_TRI_CAP })
+      .then((bvh) => {
+        if (disposed) return;
+        const wall = performance.now() - t0;
+        console.log(
+          `[gi2] shadow bvh ${bvh.triCount} tris, ${bvh.nodeCount} nodes, ` +
+          `${(bvh.bytes / 1048576).toFixed(1)} MB, built in ${Math.round(bvh.stats?.buildMs ?? 0)} ms ` +
+          `off-thread (${Math.round(wall)} ms wall, depth ${bvh.stats?.maxDepth ?? "?"})` +
+          (bvh.stats?.truncated ? ` — TRUNCATED at the ${SHADOW_BVH_TRI_CAP} triangle cap` : ""),
+        );
+        const gpu = createShadowBvhGpu(bvh);
+        if (gpu) swapShadowBvh(gpu);
+      })
+      .catch((err) => {
+        // A superseding build is routine (two scene opens in a row), a real
+        // failure is not — but neither is fatal, so both are one line and the
+        // voxel arm keeps the frame.
+        console.warn(`[gi2] shadow bvh unavailable: ${err?.message ?? err} — the direct term stays on the voxels`);
+      });
   };
 
   const uploadSoup = (g) => {
@@ -1474,6 +1545,48 @@ export function createGi2System({
         deadRc?.dispose();
       },
     });
+  };
+
+  /**
+   * ⭐⭐ §19 STAGE 5.5b — THE SWAP, AND IT IS A REBUILD ON PURPOSE.
+   *
+   * The exact arm binds two storage buffers the voxel arm does not, so the two
+   * are different WGSL and no uniform can choose between them at run time. That
+   * leaves exactly one honest way to serve first light on the voxel arm and
+   * still end up on the exact one: build the gather without the BVH, and
+   * REBUILD it — once, when the worker's tree lands — through the very path
+   * `setSize` already uses for the same reason.
+   *
+   * The cost is one pipeline compile of the direct pass, off the first-light
+   * path, once per scene open. The alternative (awaiting the BVH before the
+   * first frame) puts a multi-second worker build in front of first light,
+   * which is the exact cost §19 exists to have deleted; and the other
+   * alternative (a capacity-sized buffer filled in place) would allocate
+   * 72 MB on every scene whether or not it needed one.
+   *
+   * ⚠ RETIRE THE OLD GATHER, do not just drop it — `emitterDirect` and
+   * `aoCompose` bind textures and buffers that belong to the dead one, the same
+   * three-object dance `setSize` performs. Getting this wrong leaks a whole
+   * cascade set per swap.
+   */
+  const swapShadowBvh = (gpu) => {
+    if (!gpu || disposed) return false;
+    shadowBvh = gpu;
+    const old = gather;
+    const oldAo = aoOut;
+    const oldEmitterDirect = emitterDirect;
+    const oldAoCompose = aoCompose;
+    const oldRc = rc;
+    aoOut = null;
+    aoCompose = null;
+    buildGather();
+    stampVoxNames();
+    retireGather(old, oldAo, [oldEmitterDirect, oldAoCompose], oldRc);
+    console.log(
+      `[gi2] exact shadow rays LIVE — ${gpu.triCount} tris / ${gpu.nodeCount} nodes, ` +
+      `${gpu.mb.toFixed(1)} MB on the GPU; the direct term is off the voxels`,
+    );
+    return true;
   };
 
   const setSize = (w, h) => {

@@ -106,11 +106,20 @@ const TAP_W = [0.05, 0.12, 0.20, 0.26, 0.20, 0.12, 0.05];
  * @param {number} o.height
  */
 export function createRcEmitterDirect({
-  trace, voxel0, emitters, gbuffer, camera, width, height,
+  trace, voxel0, emitters, gbuffer, camera, width, height, bvh = null,
 }) {
   if (!emitters?.length) return null;
   const { traceWindow } = trace;
   const v0 = voxel0;
+  /**
+   * §19 5.5b — the exact arm, or `null`. A JS-time constant, not a uniform:
+   * the two arms are different KERNELS (one binds two extra storage buffers),
+   * so the choice is made where the graph is built and a build that has no BVH
+   * emits not one node of the traversal. `gi2System` swaps arms by rebuilding
+   * this pass when the worker's BVH lands, which is also why the voxel arm can
+   * serve first light with no special case here.
+   */
+  const BVH = bvh ?? null;
   const slots = emitters.slice(0, SLOTS);
   const halfW = Math.max(1, Math.ceil(width / 2));
   const halfH = Math.max(1, Math.ceil(height / 2));
@@ -236,9 +245,28 @@ export function createRcEmitterDirect({
             // trace self-exclusion and the active gate"). `max` with `reff`
             // makes it a provable no-op for every spherical fit, where the two
             // are equal by construction.
-            const reach = d.sub(float(slot.radius).max(reff)).sub(float(v0 * 0.5))
-              .max(v0 * 0.5).toVar();
-            const h = traceWindow(P, wd, reach, Nf).hit.toVar();
+            //
+            // §19 5.5b — AND THE VOXEL SLACK IS GONE ON THE EXACT ARM. The
+            // extra `v0/2` above is the WINDOW ray's cost of living: its
+            // occupancy bits are DILATED, so a ray must stop half a cell short
+            // of the lamp shell or the lamp's own bits shadow it. Exact
+            // triangles have no dilation, so the exact arm stops at the
+            // bounding sphere and nothing else, and a receiver pressed against
+            // the lamp keeps its contact shadow instead of losing the last
+            // 12.5 cm of it.
+            const clear = float(slot.radius).max(reff).toVar();
+            const reach = BVH
+              ? d.sub(clear).max(1e-3).toVar()
+              : d.sub(clear).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
+            // ⭐⭐⭐ THE ONE LINE STAGE 5.5b EXISTS FOR. `traceWindow` asks the
+            // voxels whether anything is between here and the lamp; `anyHitFrom`
+            // asks the TRIANGLES. The difference only shows on a ray that starts
+            // ON geometry — which is every ray in this pass — and it is the
+            // difference between a lamp-mesh face that is lit and one that is
+            // black. See `window/shadowBvh.js`.
+            const h = (BVH
+              ? bvh.anyHitFrom(P, wd, reach, Nf)
+              : traceWindow(P, wd, reach, Nf).hit).toVar();
             v[k].assign(float(1).sub(h));
           });
         });
