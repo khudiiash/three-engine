@@ -498,6 +498,23 @@ user accepts GI2 by eye (`GI2_PATH = false` is the safety net).
 | **4.2 Safari/iOS/Android** | Playwright WebKit envelope run + a real phone: Level scene 60 fps at low; Safari macOS medium at 60 fps with the same brightness as Chrome (colour probe) | receipts from the device, not the desktop |
 | **4.3 boot** | **RE-ANCHORED 08-27 (user measured 31 s scene-open → GI vs our 3.4 s "after assets"):** first light ≤ 3 s from SCENE OPEN on the Level; Bistro ≤ geometry-ready + 3 s; GI2 builds on geometry-ready (not texture-ready), the soup comes from source meshes (merging cannot restart it, `soupBuilds` = 1); ≤ 20 kernels; cross-scene cache hits — AUDITS §R | `run-gi2-boot-probe` from scene open, stage table, 2 boots; then the EDITOR's own `firstLightFromSceneOpenMs` |
 
+**Stage 4 status ledger, 2026-08-28 (quality units, receipts in AUDITS §AA-§AH; every unit fast-forwarded to `main` the hour it landed):**
+
+| unit | verdict | receipt |
+|---|---|---|
+| 4.3c orbit spike / jump transient | a new merged proxy's never-drawn material minted in-frame → HOLD the swap until warm; seed→own REPLACE → `wpSeedRamp` | orbit MAX 100 → 22 ms; dolly jump 51 → 3.9 % (§AA) |
+| 4.3d the red/green FLOOD | the emitter ADMISSION record never ran at boot → power gate failed open, seat-fill `?? 1`; NOT world-path-specific, NOT the GPU blit (refuted by a solid-colour receipt) | pavement chroma 0.155 → 0.023, seat share 177 → 0.3 % |
+| 4.4 the puddles | the RADIANCE CACHE's per-face values (adjacent 0.25 m faces of one plane unrelated); world probes default ON again | `probe:gi2-puddle` tile-lag p90 12.1 (screen) vs 7.4 % (world) (§AC) |
+| 4.5 debug views on GI2 | window trace views (occupancy/sdf/probes), E/π display; found the palette dying on resize | Bistro receipts per view (§AB) |
+| 4.6/4.7 instruments | `probe:gi2-ref` (path-traced truth, pinned 39 pts), `probe:gi2-runner` (the runner's steps) | flatness = cascade hand-off not a term; runner steps = per-pixel bimodality, field steady in time (§AE) |
+| 4.8 cache face estimator | a face is 100 % second bounce read out of the cache (Neumann iteration) → write-time plane smoother | face σ 12.5 → 10.1 %, world tile-lag p90 7.5 → 6.4 % (§AD) |
+| 4.9 the hand-off | fallback never fires (premise refuted); real: rejected corners renormalised onto survivors + c0 allocPass burrowing into −X walls (the src-probes MOSAIC) | ground steps > 10 % 42 → 3, spread 1.58 → 0.26, mix 0.00 (§AF) |
+| 4.10 SH zeros / ×2 schedule | C¹ non-negative SH reconstruction (zeros 2 → 0); the ×2 cascade schedule BUILT and RETRACTED (fall 2.53 → 2.54× on truth 7.2×) — a far cascade owns pixels it never traces the near field for | pinned ref pose B |log ratio| 2.93 → 1.25 (§AH) |
+| 4.11 coverage class | a thin voxel is not a wall: 2-bit coverage, rays DIM through thin voxels; the string-light ceiling over the street is gone | 29.9 % of upward rays cross thin geometry; leaks 0/10 000 ×3 tiers (§AG) |
+| editor | selection outline draws merge proxies + caches the mask | Bistro root: 850 → 171 draws parked |
+
+**Open after 08-28:** the far cascade's near band (agent in flight); the gather ignoring throughput T; cache DIRECTIONS (4 sky rays/face is the variance floor; ≈ ×1.5 rays); the BVH8 mirror tier (no sharp reflections on GI2 yet); bounce colour fidelity (64-class palette); 4.1 cutover HELD until the user accepts GI2 by eye.
+
 ### What is deliberately NOT in this plan
 - Any new tuning property on the component (three properties stay three).
 - Temporal AO (killed 08-26; GTAO has no history).
