@@ -3566,7 +3566,16 @@ export function createGiGather({
           // façade sampled 60 cm out into an open street sees far less of its
           // own occlusion, and the street-overview receipt measured the result:
           // far façades 1.67× the screen path's irradiance.
-          const Pb = P.add(Nn.mul(u.wpBias.mul(world.taps.spacingOf(0)))).toVar();
+          //
+          // ⭐⭐ §19 3.15 — AND NOW IT IS A UNIFORM, WHICH IS THE TELL. `K.biasLen`
+          // is `wpBias · mix(s_0, s_c, wpBiasPerCasc)`, so both readings are one
+          // boot apart instead of one build apart. Under the interval merge the
+          // doors receipt reads CASCADE 0 (its pixels are inside c0's 16 m
+          // extent), where `s_0` and `s_c` are the same 15 cm — so flipping this
+          // must NOT move the thin-feature ratio. If it does, the resolve is
+          // still reading a coarse cascade for a near recess and the merge is
+          // not doing what this stage claims. See `wpBiasPerCasc`.
+          const Pb = P.add(Nn.mul(K.biasLen)).toVar();
           const fr = world.taps.cellFrameAt(Pb, K.sp);
           // 1 in the inner 90 % of this cascade; the LAST cascade has nothing
           // coarser to hand to, so it takes the whole remainder.
@@ -3618,8 +3627,12 @@ export function createGiGather({
             const inside = select(isLast, float(1), select(inLat, float(1), float(0))).toVar();
             const cell = world.taps.cellAtG(K.base, wcx, wcy, wcz).toVar();
             const i0 = world.taps.infoAt(cell, 0).toVar();
+            // §19 3.15: `ready` is three-valued — 0 re-keyed, 0.5 SEEDED from
+            // the cascade above, 1 traced. A seeded probe carries a real merged
+            // field (its parent's) and its absence is what §V.6 measured as the
+            // scroll's motion cost, so the test is `> 0.25`, not `> 0.5`.
             const alive = i0.w.greaterThan(0.5)
-              .and(world.taps.infoAt(cell, 2).w.greaterThan(0.5)).toVar();
+              .and(world.taps.infoAt(cell, 2).w.greaterThan(0.25)).toVar();
             const tri = (cdx ? fr.frac.x : float(1).sub(fr.frac.x))
               .mul(cdy ? fr.frac.y : float(1).sub(fr.frac.y))
               .mul(cdz ? fr.frac.z : float(1).sub(fr.frac.z)).toVar();
@@ -3681,7 +3694,13 @@ export function createGiGather({
           // there being a weight to divide by. `admAny` remembers, across
           // cascades, whether any probe anywhere was face-admissible; that, not
           // `wsum`, is what the two-tier fallback below keys on.
-          const claim = cov.clamp(0, 1).mul(band).mul(rem).toVar();
+          // §19 3.15: `cov / wpCovFull`, saturated — the fall-through is a GATE
+          // on "is this cascade live here", not a proportion. See `wpCovFull`:
+          // under the interval merge a coarser cascade's map is only complete
+          // where a finer one owns its near band, so a proportional shortfall
+          // leaks into a map with a hole in it. `wpCovFull = 1` is 3.14's
+          // proportional hand-off, out of the same binary.
+          const claim = cov.div(u.wpCovFull.max(1e-3)).clamp(0, 1).mul(band).mul(rem).toVar();
           If(claim.greaterThan(1e-4), () => {
             const k = select(wsumC.greaterThan(1e-5), claim.div(wsumC.max(1e-5)), float(0)).toVar();
             for (let i = 0; i < 9; i++) Lb[i].addAssign(Lc[i].mul(k));
@@ -4716,6 +4735,14 @@ export function createGiGather({
       worldCount: world?.passes.count ?? null,
       worldScan: world?.passes.scan ?? null,
       worldFill: world?.passes.fill ?? null,
+      // §19 3.15. `worldMerge` is an ARRAY (one per cascade below the top) and
+      // `worldSeed` is null on any build without cascades — both are reached
+      // through `frameOrder` by every consumer; these names exist so a kernel
+      // TABLE (the chain-shape receipt, the per-kernel timing census) can still
+      // print them one by one.
+      worldSeed: world?.passes.seed ?? null,
+      worldMergeVis: world?.passes.mergeVis ?? null,
+      worldMerge: world?.passes.merge ?? [],
       worldTrace: world?.passes.trace ?? null,
       worldSh: world?.passes.sh ?? null,
       worldNee: world?.passes.nee ?? null,
@@ -4748,8 +4775,14 @@ export function createGiGather({
       // are listed rather than folded because each is a different SHAPE (per
       // cell, per block, one thread, per block) and a fold would need workgroup
       // memory, which the portable envelope does not allow.
-      world.passes.alloc, world.passes.count, world.passes.scan, world.passes.fill,
-      world.passes.trace, world.passes.sh, world.passes.nee,
+      //
+      // ⚠⚠ §19 3.15 — `world.frameOrder`, NOT A HAND-LIST OF `world.passes.*`.
+      // This list WAS a hand-list, and 3.15 split the lattice's chain in two
+      // places at once (a seed before the compaction, `NC−1` merges between the
+      // trace and the SH). A hand-list cannot pick up a split and fails
+      // SILENTLY — the same failure this very object's own doc-comment warns
+      // about two lines below, which had already been made here.
+      ...world.frameOrder,
       resolveHalfPass, resolveUpsamplePass,
       compositePass, injectPass, imageHistoryPass,
     ] : [

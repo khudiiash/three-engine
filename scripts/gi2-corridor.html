@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>GI2 corridor — the far-field reference (§19 stage 3.15)</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}pre{padding:12px;white-space:pre-wrap}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ §19 STAGE 3.15 — THE CORRIDOR, AND WHY IT HAD TO EXIST ═════════════
+      //
+      // 3.14's flip verdict failed on ONE number it could not defend: far
+      // façades read 1.61× "the screen path", against a ±15 % gate. The verdict
+      // said so itself — "1.6× the screen path is not the same claim as 1.6×
+      // the truth", and on the doors pose the screen path is the arm that reads
+      // dark places at 10.4 % of a wall while the world path reads 70 %. A gate
+      // whose reference is another estimator is not a gate; it is a comparison.
+      //
+      // The Cornell rig HAS truth — a CPU path tracer over the same analytic
+      // primitives — and no far field: it is a 5 m box entirely inside cascade
+      // 0, so every receipt it produces is about the one cascade that was never
+      // in question. Bistro HAS a far field and no truth.
+      //
+      // This page is the missing quadrant: the analytic room STRETCHED to 60 m
+      // along Z, with the emissive panel at the far end and a sun through a side
+      // window, so the same path tracer that arbitrates Cornell can arbitrate
+      // surfaces 5, 15, 30 and 50 m from the camera. Same primitives, same
+      // palette, same lights, same `makeReference` — the only thing that changed
+      // is the distance, which is the one variable the far-field question is
+      // about.
+      //
+      // ⭐ AND IT IS THE SAME BRACKET, NOT A NEW GATE. The Cornell parity asks
+      // "is the GPU's irradiance between the 1-bounce and 1.15 × the 4-bounce
+      // reference"; this asks exactly that, at four distances. "Within the same
+      // bracket as the flat room" is then a comparison of two bracket counts
+      // and not of two numbers with different units.
+      const log = document.querySelector("#log");
+      const lines = [];
+      const say = (s) => { lines.push(s); log.textContent = lines.join("\n"); };
+      const params = new URLSearchParams(location.search);
+      const TIER = params.get("tier") ?? "ultra";
+      const W = Number(params.get("w") ?? 960);
+      const Hh = Number(params.get("h") ?? 540);
+      const FRAMES = Number(params.get("frames") ?? 220);
+      const TAPS = Number(params.get("taps") ?? 12);
+
+      try {
+        // ⭐ READ BEFORE THE BUILD. `__gi2WorldProbes`, `__gi2Cascades` and
+        // `__gi2Intervals` are ADDRESSING, not levers: `createGiGather` and
+        // `createWorldProbes` read them once to decide which kernels exist.
+        // Setting one afterwards would do nothing, silently.
+        globalThis.__gi2WorldProbes = (params.get("world") ?? "1") !== "0";
+        if (params.has("casc")) globalThis.__gi2Cascades = Number(params.get("casc"));
+        if (params.has("intervals")) globalThis.__gi2Intervals = Number(params.get("intervals"));
+        if (params.has("r0")) globalThis.__gi2R0 = Number(params.get("r0"));
+
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const { mrt, normalWorld, positionWorld, sign, dot, cameraPosition, vec4 } = TSL;
+        const store = await import("/src/modules/gi/window/windowStore.js");
+        const fillMod = await import("/src/modules/gi/window/windowFill.js");
+        const traceMod = await import("/src/modules/gi/window/windowTrace.js");
+        const cacheMod = await import("/src/modules/gi/window/radianceCache.js");
+        const gatherMod = await import("/src/modules/gi/window/gatherProbes.js");
+
+        // ══════════════════════════════════════════════════════════ the room
+        //
+        // The Cornell box's own construction — axis-aligned slabs, palette per
+        // surface, one emissive panel — with `hz` taken from 5 m to 30 m. Every
+        // constant below is a coordinate; nothing here is tuned.
+        const { KIND_BOX } = fillMod;
+        const HX = 3;      // half width  (x)
+        const HY = 3;      // half height (y)
+        const Z0 = 0;      // near wall's inner face
+        const Z1 = 60;     // far wall's inner face
+        const T = 0.4;     // wall thickness — 1.6 × L0's voxel, so a wall is a
+                           // wall at every window level and not a sliver the
+                           // coarse levels round away.
+        // The side WINDOW: the only opening, and it is at the NEAR end. With
+        // the emissive panel at the far end that puts one source at each end of
+        // the corridor and leaves the middle lit by nothing but transport —
+        // which is the quantity a cascade hierarchy either carries or does not.
+        //
+        // ⚠ IT WAS AT z = 20 ON THE FIRST CUT AND THE 5 m CROPS READ 0.006.
+        // A ratio against a truth of 0.006 is a ratio against zero: the noise
+        // of the reference itself was 30 % there, so the crop could neither pass
+        // nor fail. A receipt whose reference cannot resolve its own answer is
+        // not a strict receipt, it is an absent one.
+        const WZ0 = 7, WZ1 = 11, WY0 = -0.5, WY1 = 2.0;
+        const box = (min, max, pal) => ({ kind: KIND_BOX, min, max, pal });
+        const PANEL = box([-2, HY - 0.1, Z1 - 5], [2, HY, Z1 - 1], 0);
+        const SCENE = [
+          PANEL,
+          box([-HX - T, -HY - T, Z0 - T], [HX + T, -HY, Z1 + T], 1),          // floor
+          box([-HX - T, HY, Z0 - T], [HX + T, HY + T, Z1 + T], 2),            // ceiling
+          box([-HX - T, -HY, Z0 - T], [-HX, HY, Z1 + T], 3),                  // −X wall, red
+          // +X wall, green — four slabs around the window opening.
+          box([HX, -HY, Z0 - T], [HX + T, HY, WZ0], 4),
+          box([HX, -HY, WZ1], [HX + T, HY, Z1 + T], 4),
+          box([HX, -HY, WZ0], [HX + T, WY0, WZ1], 4),
+          box([HX, WY1, WZ0], [HX + T, HY, WZ1], 4),
+          box([-HX - T, -HY, Z0 - T], [HX + T, HY, Z0], 5),                   // near wall
+          box([-HX - T, -HY, Z1], [HX + T, HY, Z1 + T], 6),                   // far wall
+        ];
+        const PANEL_RADIANCE = 8;
+        const PALETTE = [
+          { albedo: [0.78, 0.78, 0.78], emissive: PANEL_RADIANCE }, // 0 panel
+          { albedo: [0.73, 0.73, 0.73], emissive: 0 }, // 1 floor
+          { albedo: [0.73, 0.73, 0.73], emissive: 0 }, // 2 ceiling
+          { albedo: [0.63, 0.065, 0.05], emissive: 0 }, // 3 −X wall, red
+          { albedo: [0.14, 0.45, 0.091], emissive: 0 }, // 4 +X wall, green
+          { albedo: [0.73, 0.73, 0.73], emissive: 0 }, // 5 near wall
+          { albedo: [0.73, 0.73, 0.73], emissive: 0 }, // 6 far wall
+        ];
+        while (PALETTE.length < gatherMod.PAL_ENTRIES) PALETTE.push({ albedo: [0, 0, 0], emissive: 0 });
+        // The sun comes IN through the +X window: −X, down, and along +Z.
+        const SUN_DIR = (() => { const d = [-0.55, -0.72, 0.42]; const l = Math.hypot(...d); return d.map((v) => v / l); })();
+        const SUN_COLOR = [3.0, 2.9, 2.6];
+        // ⭐⭐ THE SKY IS BLACK HERE, AND THAT IS THE RECEIPT'S OWN INTEGRITY.
+        //
+        // `hitRadiance` credits `skyColor` to any ray that reaches `RAY_MAX`
+        // without hitting — and RAY_MAX IS 40 m WHILE THIS CORRIDOR IS 60. A
+        // probe standing at z = 8 fires a ray down +Z, marches 40 m of empty
+        // corridor, hits nothing, and is paid a skyful of light for it. With a
+        // 0.32-luminance sky that single policy put 0.14 of irradiance on the
+        // near crops against a path-traced truth of 0.009 — fifteen times over,
+        // and NONE of it about the merge this stage builds.
+        //
+        // A sealed interior's miss is not sky; it is "past my horizon". Black
+        // is what the two paths can AGREE on (the reference's escaped rays
+        // return `light.sky` too), so the residual is transport and nothing
+        // else. The finding itself is kept and reported, not tuned away: the
+        // cascade LATTICE reaches 256 m and the cascade RAYS reach 40, and the
+        // last cascade's sky credit is the seam between them.
+        const SKY_COLOR = [0, 0, 0];
+        const PANEL_INFO = {
+          centre: [0, PANEL.min[1], (PANEL.min[2] + PANEL.max[2]) / 2],
+          half: [(PANEL.max[0] - PANEL.min[0]) / 2, (PANEL.max[2] - PANEL.min[2]) / 2],
+          radiance: [PANEL_RADIANCE, PANEL_RADIANCE, PANEL_RADIANCE],
+          area: (PANEL.max[0] - PANEL.min[0]) * (PANEL.max[2] - PANEL.min[2]),
+        };
+
+        // ══════════════════════════════════════════════════════════ renderer
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view"), trackTimestamp: false });
+        await renderer.init();
+        if (renderer.backend?.isWebGPUBackend !== true) throw new Error("not a WebGPU backend");
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (e) => {
+          validationErrors.push(e.error?.message ?? String(e.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        const win = store.createGiWindow(TIER, { dynamic: false });
+        const fill = fillMod.createWindowFill(win, { scene: SCENE });
+        const trace = traceMod.createWindowTrace(win, { dynamic: false });
+        const cache = cacheMod.createRadianceCache(win);
+
+        const gbufferRt = new THREE.RenderTarget(W, Hh, {
+          count: 2, depthBuffer: true, stencilBuffer: false, generateMipmaps: false,
+          minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+        });
+        gbufferRt.textures[0].type = THREE.FloatType;
+        gbufferRt.textures[0].name = "output";
+        gbufferRt.textures[1].type = THREE.HalfFloatType;
+        gbufferRt.textures[1].name = "giNormal";
+        const gbufferMat = new THREE.MeshBasicNodeMaterial();
+        gbufferMat.name = "gi2 gbuffer";
+        gbufferMat.lights = false;
+        const nFace = normalWorld.mul(sign(dot(normalWorld, cameraPosition.sub(positionWorld))));
+        const gbufferMrt = mrt({ output: vec4(positionWorld, 1), giNormal: vec4(nFace, 0) });
+
+        const gather = gatherMod.createGiGather({
+          win, trace, cache,
+          positionTexture: gbufferRt.textures[0],
+          normalTexture: gbufferRt.textures[1],
+          width: W, height: Hh, tier: TIER, crops: 16,
+        });
+        gather.setPalette(PALETTE);
+        const gu = gather.uniforms;
+        gu.sunDir.value.set(...SUN_DIR);
+        gu.sunColor.value.set(...SUN_COLOR);
+        gu.skyColor.value.set(...SKY_COLOR);
+        gu.panelCentre.value.set(...PANEL_INFO.centre);
+        gu.panelHalf.value.set(...PANEL_INFO.half);
+        gu.panelRadiance.value.set(...PANEL_INFO.radiance);
+        gu.panelArea.value = PANEL_INFO.area;
+        // The bias-independence TELL: `?perCasc=1` scales the resolve's surface
+        // bias by the SAMPLED cascade's spacing instead of the finest's. Under
+        // 3.14 that one constant moved the far field AND the doors receipt
+        // together; under the interval merge it must not move either.
+        if (params.has("perCasc")) gu.wpBiasPerCasc.value = Number(params.get("perCasc"));
+        if (params.has("covFull")) gu.wpCovFull.value = Number(params.get("covFull"));
+
+        const gd = gather.describe();
+        say(`tier ${TIER} — world probes ${gd.worldProbes ? "ON" : "off"}` +
+          (gd.world ? `, ${gd.world.cascades} cascade(s), intervals ${gd.world.intervals ? "ON" : "off"}` +
+            `, t=[${(gd.world.tStart ?? []).map((v) => v.toFixed(2)).join(", ")}] → ` +
+            `[${(gd.world.tEnd ?? []).map((v) => v.toFixed(2)).join(", ")}] m` +
+            `, merges ${gd.world.mergePasses}, seed ${gd.world.seeded ? "on" : "off"}` +
+            `, spacings ${gd.world.spacings.join("/")} m, ${gd.world.totalMB} MB` : ""));
+
+        // ══════════════════════════════════════════════════════ three.js scene
+        const scene = new THREE.Scene();
+        for (const p of SCENE) {
+          const geo = new THREE.BoxGeometry(p.max[0] - p.min[0], p.max[1] - p.min[1], p.max[2] - p.min[2]);
+          geo.translate((p.min[0] + p.max[0]) / 2, (p.min[1] + p.max[1]) / 2, (p.min[2] + p.max[2]) / 2);
+          const m = new THREE.Mesh(geo, new THREE.MeshBasicNodeMaterial());
+          m.frustumCulled = false;
+          scene.add(m);
+        }
+
+        const VFOV = 70;
+        const camera = new THREE.PerspectiveCamera(VFOV, W / Hh, 0.05, 400);
+        gu.projScale.value = (Hh / 2) / Math.tan((VFOV * Math.PI) / 360);
+        const CAM_Z = 3;
+        // ⚠ LOW AND SLIGHTLY DOWN. The crops at 5 m are the tightest: a floor
+        // 2.5 m below the eye subtends 26° at 5 m and the frame is ±35°, so an
+        // eye at head height would put the nearest floor crop off the bottom of
+        // the image and the receipt would read "no gbuffer sample" — a null the
+        // instrument produced, not the scene.
+        camera.position.set(0, -0.5, CAM_Z);
+        camera.lookAt(0, -0.9, Z1);
+        camera.updateMatrixWorld(true);
+        camera.updateProjectionMatrix();
+
+        const vp = new THREE.Matrix4();
+        const prevVp = new THREE.Matrix4();
+        const project = (p) => {
+          const v = new THREE.Vector3(...p).applyMatrix4(vp);
+          return { x: (v.x * 0.5 + 0.5) * W, y: (1 - (v.y * 0.5 + 0.5)) * Hh };
+        };
+        const onScreen = (q) => q.x >= 0 && q.x < W && q.y >= 0 && q.y < Hh;
+
+        // ══════════════════════════════════════════════════════ the frame
+        const compute = (p) => renderer.computeAsync(p);
+        const renderGbuffer = async () => {
+          scene.overrideMaterial = gbufferMat;
+          renderer.setMRT(gbufferMrt);
+          renderer.setRenderTarget(gbufferRt);
+          renderer.setClearColor(0x000000, 0);
+          await renderer.renderAsync(scene, camera);
+          renderer.setRenderTarget(null);
+          renderer.setMRT(null);
+          scene.overrideMaterial = null;
+        };
+        let placedAt = null;
+        const placeWindow = async (force = false) => {
+          const p = [camera.position.x, camera.position.y, camera.position.z];
+          if (!force && placedAt && p.every((v, i) => Math.abs(v - placedAt[i]) < 1e-6)) return false;
+          const receipt = win.setCamera(p);
+          placedAt = p;
+          if (!receipt.scrolled && !force) return false;
+          await compute(win.statsResetPass);
+          await compute(win.scrollPass);
+          await compute(win.clearStaticPass);
+          await compute(fill.pass);
+          await compute(cache.allocPass);
+          return true;
+        };
+        // ⭐ THE CHAIN IS `frameOrder`. 3.15 adds a seed kernel before the
+        // compaction and `NC−1` merges between the trace and the SH; a page
+        // that hand-listed `passes.*` would have run 3.14's chain and reported
+        // it as 3.15's, silently.
+        const runFrame = async (n) => {
+          gather.beginFrame(n, camera.position);
+          camera.updateMatrixWorld(true);
+          vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+          gu.prevViewProj.value.copy(n === 0 ? vp : prevVp);
+          gu.viewProj.value.copy(vp);
+          gu.camPos.value.copy(camera.position);
+          await placeWindow();
+          await renderGbuffer();
+          for (const node of gather.frameOrder) await compute(node);
+          prevVp.copy(vp);
+        };
+
+        // ── the crops: four distances, a WALL and a FLOOR at each ─────────────
+        //
+        // ⭐ THE WALL IS THE RECEIPT AND THE FLOOR IS THE CONTROL. §V.3's own
+        // rule: a floor's irradiance is dominated by whatever is directly above
+        // it and every path gets that roughly right, so a floor that agrees
+        // proves nothing about the far field. A VERTICAL surface forty metres
+        // down a corridor is lit by the corridor's own bounce, which is exactly
+        // the quantity a lattice with a horizon cannot know. Both are reported;
+        // only the pair tells you whether a disagreement is about DISTANCE or
+        // about ORIENTATION.
+        const DISTANCES = [5, 15, 30, 50];
+        const CROPS = [];
+        for (const d of DISTANCES) {
+          const z = CAM_Z + d;
+          CROPS.push({ name: `wall@${d}m`, p: [-HX + 0.01, 0.0, z], d, kind: "wall" });
+          CROPS.push({ name: `floor@${d}m`, p: [0, -HY + 0.01, z], d, kind: "floor" });
+        }
+        const cropArr = gather.buffers.cropIn.value.array;
+        const writeCrops = () => {
+          const meta = [];
+          CROPS.forEach((c, i) => {
+            const q = project(c.p);
+            cropArr[i * 4] = Math.round(q.x);
+            cropArr[i * 4 + 1] = Math.round(q.y);
+            cropArr[i * 4 + 2] = 0;
+            cropArr[i * 4 + 3] = 0;
+            meta.push({ name: c.name, want: c.p, px: Math.round(q.x), py: Math.round(q.y), onScreen: onScreen(q) });
+          });
+          gather.buffers.cropIn.value.needsUpdate = true;
+          return meta;
+        };
+        const readCrops = async () => {
+          await compute(gather.passes.crop);
+          const f = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.cropOut.value));
+          return CROPS.map((c, i) => {
+            const b = i * 6 * 4;
+            return {
+              name: c.name, d: c.d, kind: c.kind,
+              px: cropArr[i * 4], py: cropArr[i * 4 + 1],
+              pos: [f[b], f[b + 1], f[b + 2]], samples: f[b + 3],
+              nrm: [f[b + 4], f[b + 5], f[b + 6]],
+              irr: [f[b + 8], f[b + 9], f[b + 10]],
+              lit: [f[b + 16], f[b + 17], f[b + 18]],
+              albedo: [f[b + 20], f[b + 21], f[b + 22]], emissive: f[b + 23],
+            };
+          });
+        };
+
+        // ══════════════════════════════════════════════════════════ the run
+        await placeWindow(true);
+        // ⚠ `vp` BEFORE `writeCrops`, NOT AFTER THE FIRST FRAME. A crop is
+        // written as a PIXEL and the pixel comes from the view-projection; on
+        // the first cut this ran while `vp` was still identity and every crop
+        // landed off-screen, which the receipt then reported as "no gbuffer
+        // sample" — a broken instrument wearing the costume of a broken scene.
+        vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+        const cropMeta = writeCrops();
+        for (let n = 0; n < FRAMES; n++) await runFrame(n);
+
+        // ⚠ AVERAGED OVER `TAPS` FRAMES, and that is not smoothing away a
+        // result: a crop is ONE PIXEL and the world cache's shade cadence is a
+        // deterministic stride, so a single frame samples one phase of it. The
+        // average is over consecutive frames of a PARKED camera, which under §T
+        // differ only by that cadence.
+        const acc = CROPS.map(() => [0, 0, 0]);
+        for (let t = 0; t < TAPS; t++) {
+          await runFrame(FRAMES + t);
+          const cs = await readCrops();
+          cs.forEach((c, i) => { for (let k = 0; k < 3; k++) acc[i][k] += c.irr[k] / TAPS; });
+        }
+        const crops = (await readCrops()).map((c, i) => ({ ...c, irr: acc[i] }));
+
+        const stats = gather.readStats(
+          new Uint32Array(await renderer.getArrayBufferAsync(gather.buffers.statsBuf.value)),
+        );
+        let live = null;
+        if (gather.world) {
+          live = gather.world.readLive(
+            new Uint32Array(await renderer.getArrayBufferAsync(gather.world.buffers.wpList.value)),
+          );
+          say(`live probes per cascade: ${live.join(" / ")} of ${gather.world.cellCount} cells each; ` +
+            `slots ${gather.world.slots.join(" / ")}`);
+        }
+        // §19 3.15 — the merge census (see `mergeFor`): transparent texels
+        // seen, those the parent answered, those the chain truncated on.
+        // ⚠ WORLD PATH ONLY. These three slots are dead on the world path and
+        // very much alive on the SCREEN one, so printing them for `?world=0`
+        // reports a screen-probe statistic under a merge caption.
+        if (gather.world && stats.matureTexels > 0) {
+          const tot = stats.matureTexels;
+          say(`merge: ${tot} transparent texels — parent answered ${stats.handoffs} ` +
+            `(${((100 * stats.handoffs) / tot).toFixed(1)}%), chain truncated to sky ` +
+            `${stats.texelsSeen} (${((100 * stats.texelsSeen) / tot).toFixed(1)}%)`);
+        }
+        say(`stats: ${JSON.stringify(stats)}`);
+        for (const c of crops) {
+          say(`  ${c.name.padEnd(12)} px(${c.px},${c.py}) pos ${c.pos.map((v) => v.toFixed(2)).join(",")} ` +
+            `n ${c.nrm.map((v) => v.toFixed(2)).join(",")} irr ${c.irr.map((v) => v.toFixed(4)).join(",")}`);
+        }
+        if (validationErrors.length) say(`⛔ ${validationErrors.length} WebGPU validation error(s): ${validationErrors[0]}`);
+
+        globalThis.__GI2_CORRIDOR_RESULT__ = {
+          pass: validationErrors.length === 0,
+          error: validationErrors[0] ?? null,
+          tier: TIER, frames: FRAMES, taps: TAPS, width: W, height: Hh,
+          describe: gd, live, stats, crops, cropMeta,
+          camera: { eye: camera.position.toArray(), z0: CAM_Z },
+          scene: SCENE, palette: PALETTE,
+          light: { sunDir: SUN_DIR, sunColor: SUN_COLOR, sky: SKY_COLOR, panel: PANEL_INFO },
+          text: lines.join("\n"),
+        };
+      } catch (e) {
+        say(`FAILED: ${e.stack ?? e.message}`);
+        globalThis.__GI2_CORRIDOR_RESULT__ = { pass: false, error: String(e.stack ?? e.message), text: lines.join("\n") };
+      }
+    </script>
+  </body>
+</html>

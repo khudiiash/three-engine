@@ -118,20 +118,117 @@ export const WORLD_TIERS = {
 
 /** The distance moments' quantization range, in units of the CASCADE's spacing. */
 export const DIST_CELLS = 8;
-/** 12 bits each for the two moments, 8 for the sample count. */
+/** 12 bits each for the two moments, 6 for the sample count, 1 for T. */
 export const DQ = 4095;
+
+/**
+ * ══ §19 STAGE 3.15 — THE RAY INTERVALS (Sannikov's rule, in this lattice) ════
+ *
+ * `BETA` is the INTERVAL growth per cascade and `R0_CELLS · s_0` is the finest
+ * interval's length, so cascade `i` traces only
+ *
+ *     t_i     = r0 · (β^i − 1)/(β − 1)      …the interval's START
+ *     t_{i+1} = r0 · (β^{i+1} − 1)/(β − 1)  …its END, `RAY_MAX` on the last
+ *
+ * and stores, per direction, the radiance it found IN THAT BAND plus a
+ * TRANSMITTANCE bit: 0 if something stopped the ray inside the band, 1 if
+ * nothing did. `mergePass` then adds `T · parent` per direction, so a cascade's
+ * stored map is the WHOLE radiance field seen from that probe — its own near
+ * band at its own spatial resolution, the far bands at the resolution the
+ * cascades that own them can still resolve. Contiguous by construction (a GAP
+ * is a distance band no cascade owns, i.e. light silently dropped; an OVERLAP
+ * double-counts it — `srcConfig.intervalBoundaries`' own rule, which this
+ * engine had and this lattice had lost).
+ *
+ * ⭐⭐ WHY β = 4 AND NOT 2, AND WHY 64 DIRECTIONS IS ENOUGH HERE.
+ *
+ * RC's usual branching is spacing ×2 / interval ×4 / DIRECTIONS ×4, and the
+ * directions grow because the interval outruns the spacing. This lattice grows
+ * spacing ×4 as well (`WORLD_TIERS.ratio`), so β = 4 makes interval and spacing
+ * grow at the SAME rate and the angular demand per cascade is CONSTANT rather
+ * than compounding. Concretely: 64 texels over the sphere is a 28.6° cone,
+ * which at cascade `i`'s interval end subtends `0.5 · t_{i+1}` — 1.0 m at c0
+ * (spacing 0.5), 5 m at c1 (spacing 2), 20 m at c2 (spacing 8). The SAME ~2.4×
+ * angular deficit at every cascade.
+ *
+ * ⚠ SO THE CONSEQUENCE OF KEEPING 64 IS NAMED, NOT HIDDEN: every cascade is
+ * ~2.4× coarser in angle than in space, uniformly. A 16×16 oct map on c1/c2
+ * would close it exactly — and would cost 4× their rays (30 % of the budget →
+ * +90 % total) and 4× their `wpOct` (50 → 184 MB, past the portable envelope's
+ * ceiling before the window is counted). NOT TAKEN. Because the deficit is
+ * uniform it reads as one global softness in the far field rather than as a
+ * cascade-boundary artefact, which is the failure mode 3.14 actually had.
+ */
+export const BETA = 4;
+/**
+ * r0, the finest cascade's interval length, in cells of the FINEST spacing.
+ *
+ * ⭐⭐ 8, AND THE RULE IT COMES FROM IS `t_{i+1} >= 2 * s_{i+1}` — THE PARENT'S
+ * INTERVAL MUST START FURTHER OUT THAN THE PARENT'S OWN PROBE SPACING.
+ *
+ * The merge interpolates the parent's map AT THE CHILD'S POSITION, and the
+ * child can be up to `s_{i+1}` from the parent it reads. If the parent's
+ * interval starts at `t_{i+1} ~ s_{i+1}`, that offset is comparable to the
+ * whole near end of the band and the hand-off loses energy: the child asks
+ * "what is beyond 10 m from ME" and is answered "beyond 10 m from somewhere
+ * else eight metres away".
+ *
+ * ⭐ THE CORRIDOR SWEPT IT AND THE ARMS RANK EXACTLY BY `t_{i+1}/s_{i+1}`
+ * (wall crops, GPU / 4-bounce path-traced truth, ultra):
+ *
+ *   r0  t = [t0,t1,t2]   t1/s1  t2/s2 |  5 m    15 m   30 m   50 m
+ *    2  [0, 1,  5]        0.5    0.63 | 0.209  0.404  3.064  0.119
+ *    4  [0, 2, 10]        1.0    1.25 | 1.227  0.376  2.888  0.119
+ *    8  [0, 4, 20]        2.0    2.50 | 1.161  0.458  2.877  0.118
+ *   12  [0, 6, 30]        3.0    3.75 | 1.839  0.500  2.875  0.118
+ *   16  [0, 8, 40]        4.0    —    | 1.633  0.614  2.872  0.118
+ *
+ * r0 = 2 is a COLLAPSE — the 5 m crop reads a fifth of the truth — and it is
+ * the only arm whose ratios are below 1 on both sides of the hand-off. Past
+ * r0 = 8 the far cascade's band is squeezed toward nothing (at 16, `t2 = 40`
+ * = `RAY_MAX` and c2 has no band at all, which is 3.14 with extra steps), and
+ * the 5 m crop drifts back up as c1 takes work c0 should be doing. 8 is both
+ * the best total error and the smallest value that satisfies the rule.
+ *
+ * ⚠ ASYMPTOTICALLY the ratio is `R0_CELLS / (BETA − 1)`, so anything ≥ 6 keeps
+ * `t/s ≥ 2` at every cascade. 8 is that with margin, and it is a power of two.
+ */
+export const R0_CELLS = 8;
+/** `[t_0 … t_{NC−1}]` — cascade i's interval START. `t_0` is always 0. */
+export function intervalStarts(spacing0, cascades, r0Cells = R0_CELLS) {
+  const r0 = r0Cells * spacing0;
+  return Array.from({ length: cascades }, (_, i) => r0 * ((BETA ** i - 1) / (BETA - 1)));
+}
+/**
+ * `[t_1 … t_NC]` — cascade i's interval END. The LAST cascade ends at the
+ * window's own horizon (`RAY_MAX`): past that there is no occupancy to march
+ * and the only honest answer is the sky, which is why the last cascade is also
+ * the ONLY one that credits sky on a miss.
+ */
+export function intervalEnds(spacing0, cascades, rayMax, r0Cells = R0_CELLS) {
+  const s = intervalStarts(spacing0, cascades, r0Cells);
+  return s.map((_, i) => (i === cascades - 1 ? rayMax : Math.min(rayMax, s[i + 1])));
+}
+
 /**
  * The cascade hand-off band, as a fraction of a cascade's extent.
  *
  * ⭐ A HARD CASCADE BOUNDARY IS A VISIBLE EDGE THAT MOVES WITH THE CAMERA —
  * the one failure mode a world-anchored design can still have, because the
- * lattice bounds are the only thing in it that is camera-relative. The outer
- * 10 % of each cascade fades its own confidence to zero, so a pixel's
- * irradiance crosses from cascade to cascade over 1.6 m (c0) or 6.4 m (c1) —
- * both wider than the hysteretic origin step (2 m / 8 m) that moves the
- * boundary, so a scroll cannot uncover a hard edge.
+ * lattice bounds are the only thing in it that is camera-relative.
+ *
+ * ⭐⭐ 0.10 → 0.15, WHICH IS §V.6's OWN ARITHMETIC AND 3.15's MERGE IS WHAT
+ * MAKES IT SAFE. `stepLatticeOrigin` moves an origin in blocks of `blk = 4`
+ * cells, so the boundary jumps `blk/C = 0.125` of the extent on a scroll — a
+ * band NARROWER than that can be crossed entirely in one step, which is a pop
+ * by construction and is the mechanism §V.6 named for 3.14's +2.0/+5.5/+3.0
+ * points of motion flips. 3.14 could not simply widen it, because a wider band
+ * imported more of c1's 1.6×-too-bright far field into the near field. Under
+ * the interval merge there is no such import: c0 and c1 now describe the SAME
+ * total radiance field and differ only in spatial resolution, so blending them
+ * over a wider band costs nothing but a little softness.
  */
-export const BAND = 0.10;
+export const BAND = 0.15;
 
 /**
  * The hysteretic origin step for one lattice axis, in whole BLOCKS of cells.
@@ -205,6 +302,31 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const SPC = Array.from({ length: NC }, (_, c) => SP0 * RATIO ** c);
   const EXT = SPC.map((s) => C * s);
   const DMAX = SPC.map((s) => DIST_CELLS * s);
+  /**
+   * ⭐ `globalThis.__gi2Intervals = 0` IS 3.14, OUT OF 3.15'S BINARY.
+   *
+   * The same discipline `__gi2Cascades` follows and for the same reason: every
+   * 3.15 receipt is a comparison against "each cascade traces to the horizon
+   * and the resolve picks the finest that covers you", and an A/B against a
+   * previous COMMIT is an A/B across a different shader cache and a different
+   * night's driver. Off: `TSTART = 0` and `TEND = RAY_MAX` on every cascade,
+   * every miss credits sky, the merge and seed kernels are not built, and
+   * `wpAlpha` goes back to 0.25 — 3.14 exactly, on one page.
+   *
+   * Read BEFORE the build, because it is what the kernels ARE.
+   */
+  const INTERVALS = (globalThis.__gi2Intervals ?? 1) !== 0;
+  /**
+   * `globalThis.__gi2R0` overrides `R0_CELLS` — the ONE number the interval
+   * geometry has, exposed so "is the chain losing energy at its hops" is an
+   * experiment rather than an argument. Longer intervals mean fewer cascades
+   * carry a given distance and fewer positional hand-offs; shorter ones mean
+   * each cascade works nearer its own probe spacing. Both are defensible and
+   * only a receipt can choose.
+   */
+  const R0C = Math.max(1, globalThis.__gi2R0 ?? R0_CELLS);
+  const TSTART = INTERVALS ? intervalStarts(SP0, NC, R0C) : SPC.map(() => 0);
+  const TEND = INTERVALS ? intervalEnds(SP0, NC, RAY_MAX, R0C) : SPC.map(() => RAY_MAX);
   /**
    * The window level cascade `c` reads its LIVENESS from.
    *
@@ -287,8 +409,17 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
      * none: the probe does not move, so its 64 rays are the same rays every
      * time) — it exists so the world cache's convergence STEPS and a moved lamp
      * arrive as a ramp. 1 is a legitimate arm and is not noisy, only abrupt.
+     *
+     * ⛔⛔ AND UNDER THE INTERVAL MERGE IT MUST BE 1, WHICH IS NOT A TUNING
+     * CHOICE BUT AN ALGEBRAIC ONE. `mergePass` writes `own + T·parent` back
+     * into the same texel, so the value the next trace would blend against is
+     * already MERGED — `mix(merged, own, 0.25)` re-mixes the far field into the
+     * near band and the next merge adds it again. The EMA and an in-place merge
+     * cannot both be right, and the merge is the one the stage is for. §T is
+     * satisfied without it anyway: a world probe's 64 rays are the same 64 rays
+     * from the same point every update, so α was never removing noise here.
      */
-    wpAlpha: uniform(0.25),
+    wpAlpha: uniform(INTERVALS ? 1 : 0.25),
     /** 0 removes the resolve's visibility term — the LEAK RECEIPT'S CONTROL. */
     wpVisOn: uniform(1),
     /** 0 removes the probe-face gate; the other half of the same control. */
@@ -323,6 +454,53 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
      * one binary, like every other lever in this module.
      */
     wpCascadesOn: uniform(1),
+    /**
+     * ⭐⭐ §19 3.15 — THE BIAS-INDEPENDENCE TELL, AS A UNIFORM.
+     *
+     * 0 = the bias is `wpBias · s_0` on every cascade (shipped). 1 = it is
+     * `wpBias · s_c`, the SAMPLED cascade's spacing — 3.14's first cut, which
+     * §V.4 showed moved the doors thin-feature ratio (33.9 ↔ 70.3 %) and the
+     * far-field ratio (1.609 ↔ 1.671, with a black band past 55 m) IN THE SAME
+     * DIRECTION. One displacement constant with authority over both a 14 cm
+     * recess and a 40 m façade is the clearest evidence "pick the finest
+     * cascade that covers you" is not RC's merge.
+     *
+     * Under the interval merge those are DIFFERENT CASCADES' INTERVALS and the
+     * coupling has nowhere to live: a doors pixel at 6 m reads c0, whose
+     * spacing IS `s_0`, so `s_0` and `s_c` are the same 15 cm there and the
+     * ratio cannot move. Flipping this uniform and re-reading the doors receipt
+     * is therefore the single cheapest test of whether the merge is real — and
+     * it is a UNIFORM, so both arms are one boot and one shader cache.
+     */
+    // ⚠ SEEDED FROM A GLOBAL so the BISTRO probes can set it. The rig pages
+    // take `?perCasc=1`, but `run-gi2-doors-probe` and friends boot the real
+    // editor and reach the engine only through `FLAGS={...}` — and the doors
+    // receipt is precisely where this tell has to be read.
+    wpBiasPerCasc: uniform(globalThis.__gi2BiasPerCasc ?? 0),
+    /**
+     * ⭐⭐ §19 3.15 — THE COVERAGE AT WHICH A CASCADE CLAIMS THE WHOLE PIXEL.
+     *
+     * 3.14's hand-off was PROPORTIONAL: a cascade claimed `Σ tri·live`, so a
+     * pixel whose c0 corners were 60 % live gave 40 % of itself to c1. That was
+     * safe there because every cascade traced to the horizon — c1's answer was
+     * complete, merely coarser. Under the interval merge it is NOT: a coarse
+     * cascade's map is complete only where a FINER one owns its near band, and
+     * near a wall the finer cascade's own corners are exactly what is missing.
+     * So the shortfall flowed into a map with a hole in it, and the hole was
+     * systematic — the corridor's 15 m crops read 0.35 of the path-traced truth
+     * against 3.14's 0.86 on the same geometry.
+     *
+     * The spec's own words are "the finest cascade that is LIVE at that point",
+     * which is a GATE, not a proportion. This is that gate with a soft edge: a
+     * cascade with `cov ≥ wpCovFull` takes the pixel outright, below that it
+     * ramps. 1.0 is 3.14's proportional hand-off exactly, which is what makes
+     * this measurable rather than asserted.
+     *
+     * ⚠ CONTINUITY IS STILL THE BAND'S JOB, and that is why this is safe: past
+     * a lattice's edge `cov` reaches 0 anyway, and `bandAt` has already faded
+     * the cascade out over the outer 15 % before it gets there.
+     */
+    wpCovFull: uniform(0.5),
   };
   /** One origin per cascade (i32 cell coords, in that cascade's own spacing). */
   const originsU = Array.from({ length: NC }, () => uniform(new THREE.Vector3()));
@@ -361,6 +539,36 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const octIdxW = (gc, texel) => gc.mul(uint(OCT * 2)).add(texel.mul(uint(2)));
   /** The list word `off` inside cascade `casc`'s own run. */
   const listAt = (cascU, off) => wpList.element(cascU.mul(uint(LIST_WORDS)).add(off));
+  /**
+   * Is this world lattice cell inside that cascade's current window?
+   *
+   * ⚠ DEFINED HERE, NOT WITH THE RESOLVE'S TAPS, because §19 3.15's merge and
+   * seed kernels need it too — a toroidal address that is not first proved to
+   * be inside its window aliases onto a cell `C · s_c` metres away, which is up
+   * to 256 m at c2 and reads as a perfectly plausible radiance.
+   */
+  const inLatticeAt = (org, wcx, wcy, wcz) => {
+    const rx = wcx.sub(org.x).toVar();
+    const ry = wcy.sub(org.y).toVar();
+    const rz = wcz.sub(org.z).toVar();
+    return rx.greaterThanEqual(0).and(ry.greaterThanEqual(0)).and(rz.greaterThanEqual(0))
+      .and(rx.lessThan(C)).and(ry.lessThan(C)).and(rz.lessThan(C));
+  };
+  /**
+   * §19 3.15 — cascade `c`'s PARENT's constants, indexed by `c` so a kernel
+   * whose cascade is a runtime value can reach them through the same `pick*`
+   * chain everything else uses. The last cascade has no parent and points at
+   * itself; every caller checks `c < NC−1` before using these.
+   */
+  const P_OF = (c) => Math.min(c + 1, NC - 1);
+  const SPC_PARENT = Array.from({ length: NC }, (_, c) => SPC[P_OF(c)]);
+  const DMAX_PARENT = Array.from({ length: NC }, (_, c) => DMAX[P_OF(c)]);
+  const BASE_PARENT = Array.from({ length: NC }, (_, c) => P_OF(c) * CELLS);
+  const ORG_PARENT = Array.from({ length: NC }, (_, c) => originsU[P_OF(c)]);
+  /** …and its CHILD's, for the interval-start rule (`coveredFromBelow`). */
+  const F_OF = (c) => Math.max(c - 1, 0);
+  const SPC_FINER = Array.from({ length: NC }, (_, c) => SPC[F_OF(c)]);
+  const ORG_FINER = Array.from({ length: NC }, (_, c) => originsU[F_OF(c)]);
 
   // ── window reads ──────────────────────────────────────────────────────────
   const viOf = (x, y, z) => bitOr(bitOr(
@@ -430,13 +638,26 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   // `DIST_CELLS · s_c` — a compile-time float on the resolve's side (the
   // cascade is a JS loop index there) and a three-way select on the trace's.
   const quantD = (d, dmax) => d.div(dmax).clamp(0, 1).mul(DQ).add(0.5).floor().toUint();
-  const packMoments = (nU, meanF, rmsF, dmax) => bitOr(
-    bitOr(shiftLeft(nU.min(uint(255)), uint(24)), shiftLeft(quantD(rmsF, dmax), uint(12))),
-    quantD(meanF, dmax),
+  /**
+   * ⭐⭐ THE TRANSMITTANCE IS ONE BIT AND IT COST NOTHING. `n` was declared 8
+   * bits at 24 and then written `.min(uint(63))` — six bits of payload in an
+   * eight-bit field, so bits 30 and 31 have been free since 3.13. `T` goes at
+   * 30, which is why `nOf` now MASKS instead of shifting: a raw `w >> 24` would
+   * have read `n + 64` on every transparent texel and every `n > 0` test in the
+   * file would have kept working, silently, while `n` itself became garbage.
+   */
+  const T_BIT = 1 << 30;
+  const packMoments = (nU, meanF, rmsF, dmax, tU = null) => bitOr(
+    bitOr(shiftLeft(nU.min(uint(63)), uint(24)), shiftLeft(quantD(rmsF, dmax), uint(12))),
+    tU === null ? quantD(meanF, dmax) : bitOr(quantD(meanF, dmax), shiftLeft(tU, uint(30))),
   );
   const meanOf = (w, dmax) => bitAnd(w, uint(DQ)).toFloat().mul(dmax).div(DQ);
   const rmsOf = (w, dmax) => bitAnd(shiftRight(w, uint(12)), uint(DQ)).toFloat().mul(dmax).div(DQ);
-  const nOf = (w) => shiftRight(w, uint(24));
+  const nOf = (w) => bitAnd(shiftRight(w, uint(24)), uint(63));
+  /** 1 = this direction ESCAPED its interval, so the parent's map applies. */
+  const tOf = (w) => bitAnd(shiftRight(w, uint(30)), uint(1));
+  /** The same word with `T` cleared — the merge's idempotence (see `mergeFor`). */
+  const clearT = (w) => bitAnd(w, uint((~T_BIT) >>> 0));
 
   // ══════════════════════════════════════════ SHADER: probeAlloc (§U.1)
   //
@@ -684,21 +905,150 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // path already does — walk the origin FORWARD out of any dilated shell).
     bump(STATS.raysLaunched, k);
     bump(STATS.raysTraced, k);
-    const r = traceWindow(pos, dir, float(RAY_MAX), select(faced, faceN, dir)).raw.toVar();
-    const rd = hitRadiance(r, dir, k).toVar(); // (rgb, hitDistance)
+
+    // ══ §19 STAGE 3.15 — THE RAY IS INTERVAL-LIMITED ═════════════════════════
+    //
+    // `[t_i, t_{i+1})`, with `t_0 = 0` so the finest cascade keeps 3.13's origin
+    // escape verbatim and every coarser one starts in the air `t_i` metres out.
+    //
+    // ⚠ AND THAT ADVANCED ORIGIN IS ALLOWED TO BE INSIDE A WALL. It looks like
+    // a leak and it is the opposite: if something blocks this direction before
+    // `t_i`, the FINER cascade's own texel recorded `T = 0` there, and the merge
+    // multiplies this cascade's whole contribution by it. A coarse ray that
+    // starts buried is masked out by construction, so the trace does not have to
+    // know — which is exactly the property "pick the finest cascade that covers
+    // you" did not have, and why one bias constant could move both ends of the
+    // scene in 3.14.
+    //
+    // ⭐⭐⭐ AND THE START IS `t_i` ONLY WHERE A FINER CASCADE EXISTS TO OWN THE
+    // NEAR BAND. THIS IS THE ONE PLACE RC'S RULE CANNOT BE COPIED VERBATIM, AND
+    // THE CORRIDOR RECEIPT IS WHAT SAID SO.
+    //
+    // RC's interval decomposition rests on an assumption this lattice cannot
+    // meet: that CASCADE 0 COVERS THE WHOLE DOMAIN. Sannikov's c0 is a grid over
+    // the entire scene, so `[0, t_1)` is always somebody's job. Here the
+    // cascades are a CLIPMAP — c0 is 16 m of camera-centred lattice — and a
+    // surface fifty metres down a corridor has no c0, no c1, and therefore
+    // nobody to carry its first ten metres of light. The panel five metres from
+    // that surface falls into the gap.
+    //
+    // ⛔ MEASURED, NOT ARGUED: with the textbook rule, the corridor's 50 m crops
+    // read **0.0000** against a path-traced 1.79 — the far field went BLACK, and
+    // 3.14's over-bright 0.21 was the better answer. The interval that no
+    // cascade owns is light that is silently dropped, which is precisely the gap
+    // `srcConfig.intervalBoundaries` was written to make impossible one
+    // architecture ago.
+    //
+    // So: cascade `i` traces `[t_i, t_{i+1})` where cascade `i−1`'s lattice
+    // contains its probe, and `[0, t_{i+1})` where it does not. The lattices are
+    // camera-centred and each is 4× the last, so containment is monotone in `i`
+    // — "c_{i−1} does not have me" means no finer cascade does, and this one
+    // must carry the near band itself. Nothing double-counts: a cascade's merge
+    // reads parent probes AT ITS OWN PROBE'S POSITION, so a parent read through
+    // the merge is by construction covered from below and using `t_{i+1}`.
+    //
+    // ⚠ THE ONE IMPRECISION IS A SHELL ONE CELL THICK. A c0 probe on the very
+    // face of its lattice can interpolate a c1 probe just outside it, which
+    // traced from 0 and therefore double-counts `[0, 2)` — at a probe whose
+    // `bandAt` weight is already 0. The alternative (dilating the test) moves
+    // the same error to pixels in the hand-off band, where c0 dominates. Both
+    // are ~zero-weighted; this one is one line shorter.
+    //
+    // ⭐ AND IT CLOSES THE VISIBILITY HOLE FOR FREE. A probe that traces from 0
+    // records a first-hit distance from 0, so `octTapVisAt`'s Chebyshev test has
+    // real near-field moments at exactly the probes a fall-through pixel reads.
+    // Under the textbook rule c1's smallest storable distance was `t_1 = 2 m`,
+    // larger than any pixel-to-probe distance it would ever be asked about, and
+    // its visibility term was silently inert.
+    const fSp = pickF(rr.casc, SPC_FINER).toVar();
+    const fOrg = pickV(rr.casc, ORG_FINER).toVar();
+    const fc = pos.div(fSp).floor().toVar();
+    const coveredBelow = rr.casc.greaterThan(uint(0))
+      .and(inLatticeAt(fOrg, fc.x, fc.y, fc.z)).toVar();
+    const t0 = select(coveredBelow, pickF(rr.casc, TSTART), float(0)).toVar();
+    const t1 = pickF(rr.casc, TEND).toVar();
+    const isLast = rr.casc.greaterThanEqual(uint(NC - 1)).toVar();
+
+    // ⭐⭐⭐ THE RAY LEAVES THE PROBE, NOT THE INTERVAL START — AND ONLY THE
+    // RADIANCE IS INTERVAL-LIMITED. THE SEALED CORNELL ROOM MEASURED WHY.
+    //
+    // The obvious build advances the origin to `t_i` and traces `t_{i+1} − t_i`.
+    // In a room whose free path is smaller than `t_i`, that origin lands INSIDE
+    // OR BEYOND A WALL — and `traceWindow`'s escape then does exactly its job,
+    // walking the origin forward out of the dilated shell, which puts the ray
+    // OUTSIDE THE SEALED ROOM. It flies to the horizon, misses, and the chain
+    // pays SKY. In a 10×6×10 m Cornell room c1's band starts at 4 m and c2's at
+    // 20 m, so this is not an edge case, it is most of their directions.
+    //
+    // ⛔ MEASURED: the thin-wall interior receipt — a 5 cm partition with the
+    // panel entirely on the far side — read **5.99 % of the lit side against
+    // 3.14's 0.05 %**, and the CONTROL (visibility and face both off) read the
+    // same 5.99 %. That equality is the whole diagnosis: nothing in the RESOLVE
+    // was leaking, and nothing in the merge's parent tap was either (a
+    // line-of-sight gate on it, `mergeVisPass`, moved the number by 0.4 points).
+    // Sky was already in the field, put there by rays that started outside the
+    // room. ⭐ **An escape rule written for a probe's own origin is wrong for an
+    // interval start: one is "get me out of the surface I am standing on", the
+    // other is "get me past the surface that is blocking me".**
+    //
+    // So the ray starts AT THE PROBE and runs to `t_{i+1}`, and the interval is
+    // applied to the RESULT:
+    //   hit before `t_i`  → radiance 0, T = 0.  Blocked before my band; the
+    //                       finer cascade owns both the light and the occluder.
+    //   hit inside        → the hit's radiance, T = 0.
+    //   miss              → sky and T = 0 on the LAST cascade (nothing is
+    //                       coarser, and a ray that leaves the window has left
+    //                       the scene); radiance 0 and T = 1 on any other.
+    //
+    // This is RC's decomposition unchanged — cascade `i` still contributes only
+    // `[t_i, t_{i+1})` — with the occlusion evaluated from the place the light
+    // is actually being gathered. It is strictly MORE correct than the textbook
+    // form, which assumes the finer cascade's `T` covers the near segment; that
+    // holds only when the finer probe is at the same point, and it never is.
+    //
+    // ⚠ AND IT IS NOT MORE EXPENSIVE OVERALL. c0 holds 70 % of the slots and its
+    // rays got 10× SHORTER (0→4 m against 3.14's 0→40); c1 halves; only c2, at
+    // 10 % of the slots, pays 3.14's full length. Receipt: the chain is 2.477 ms
+    // against 3.14's 2.544 at the same resolution.
+    const r = traceWindow(pos, dir, t1, select(faced, faceN, dir)).raw.toVar();
+    const hitAny = r.x.greaterThan(0.5).toVar();
+    const inBand = hitAny.and(r.y.greaterThanEqual(t0)).toVar();
+    const blockedNear = hitAny.and(r.y.lessThan(t0)).toVar();
+    const rd = hitRadiance(r, dir, k).toVar(); // (rgb, hitDistance); sky on a miss
+
+    // ⭐⭐ SKY IS CREDITED BY THE LAST CASCADE ALONE, AND THAT IS WHAT KEEPS THE
+    // MERGE ENERGY-EXACT. `hitRadiance` returns `skyColor` on any miss, so a
+    // non-final cascade would otherwise contribute sky AND then add its parent's
+    // sky through `T` — the same photon twice, once per cascade. A non-final
+    // miss stores radiance 0 and `T = 1`: "nothing in my band, ask my parent".
+    const rgbNew = INTERVALS
+      ? select(inBand, rd.xyz,
+        select(hitAny.not().and(isLast), u.skyColor, vec3(0))).toVar()
+      : rd.xyz.toVar();
+    // Transparent ONLY on a clean miss by a non-final cascade. A near hit is
+    // OPAQUE (`blockedNear`) — the far field does not reach this probe in this
+    // direction and asking the parent for it would be the leak, one level up.
+    const tNew = INTERVALS
+      ? select(hitAny.not().and(isLast.not()).and(blockedNear.not()), uint(1), uint(0)).toVar()
+      : uint(0).toVar();
+    // The moment is the TRUE first-hit distance from the probe — near hits
+    // included — which is what makes `octTapVisAt`'s Chebyshev test meaningful
+    // on every cascade a fall-through pixel can read.
+    const dGlobal = INTERVALS ? select(hitAny, r.y, t1).toVar() : rd.w.toVar();
 
     const prev0 = wpOct.element(addr).toVar();
     const prev1 = wpOct.element(addr.add(uint(1))).toVar();
     const had = nOf(prev1).greaterThan(uint(0)).and(fresh.not()).toVar();
-    const a = select(had, wu.wpAlpha.clamp(0, 1), float(1)).toVar();
-    const rgb = mix(decodeRgbe(prev0), rd.xyz, a).toVar();
-    const d = min(rd.w, dmax).toVar();
-    const m1 = mix(meanOf(prev1, dmax), d, a).toVar();
+    // Under the merge α is 1 by algebra, not by taste — see `wpAlpha`.
+    const a = INTERVALS ? float(1).toVar() : select(had, wu.wpAlpha.clamp(0, 1), float(1)).toVar();
+    const rgb = INTERVALS ? rgbNew : mix(decodeRgbe(prev0), rgbNew, a).toVar();
+    const d = min(dGlobal, dmax).toVar();
+    const m1 = INTERVALS ? d : mix(meanOf(prev1, dmax), d, a).toVar();
     const pr = rmsOf(prev1, dmax).toVar();
-    const m2 = mix(pr.mul(pr), d.mul(d), a).toVar();
+    const m2 = INTERVALS ? d.mul(d) : mix(pr.mul(pr), d.mul(d), a).toVar();
     wpOct.element(addr).assign(encodeRgbe(rgb));
     wpOct.element(addr.add(uint(1))).assign(
-      packMoments(nOf(prev1).add(uint(1)).min(uint(63)), m1, sqrt(m2.max(0)), dmax),
+      packMoments(nOf(prev1).add(uint(1)).min(uint(63)), m1, sqrt(m2.max(0)), dmax, tNew),
     );
     // ⚠ AN ARRAY `count` IS A DISPATCH SIZE IN WORKGROUPS, NOT IN THREADS
     // (`ComputeNode.compute`: a number sets `count`, an array sets
@@ -706,6 +1056,324 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // because it is `dispatchSize`, three generates NO bounds check, which is
     // why the two guards at the top of this kernel are written by hand.
   })().compute([Math.ceil(TRACE_SLOTS / 8), Math.ceil(OCT / 8)], [8, 8, 1]);
+
+  // ═══════════════════════════════ §19 STAGE 3.15 — THE MERGE ════════════════
+  //
+  // ⭐⭐ `L_i(ω) = L_i^own(ω) + T_i^own(ω) · L_{i+1}(ω)`, PER DIRECTION, and the
+  // parent's `L_{i+1}` is ALREADY MERGED with ITS parent — so one pass per
+  // cascade, coarsest-first, composes the whole chain. That single line is what
+  // 3.14 did not have. 3.14 had every cascade trace to the horizon and then
+  // asked the RESOLVE to choose between three answers that disagreed; RC never
+  // chooses, because no two cascades describe the same interval.
+  //
+  // ── the four decisions in it ──────────────────────────────────────────────
+  //
+  // 1. **IT IS `NC−1` DISPATCHES, NOT ONE.** Cascade `i`'s merge READS cascade
+  //    `i+1`'s texels and WRITES cascade `i`'s. Fold them into one dispatch and
+  //    c0's threads read c1's words while c1's threads write them — a
+  //    read-write hazard inside a dispatch, which is the one thing §T's
+  //    "byte-identical frames" cannot survive. Separate dispatches are the
+  //    barrier, and coarsest-first is the order that makes one frame compose
+  //    all three levels rather than one level per frame.
+  //
+  // 2. **IT MERGES IN PLACE, AND THE TRACE IS WHAT MAKES THAT SAFE.** `own` is
+  //    read exactly once — by this pass, in the same frame the trace wrote it,
+  //    over the same round-robin batch. A probe's next update overwrites `own`
+  //    from scratch, so nothing ever needs the pre-merge value again and the
+  //    lattice does not pay a second 50 MB to hold it. The cost is the honest
+  //    one: a probe's merged map is as stale as its PARENT was at its own last
+  //    update — ≤ one round-robin period, 3 frames at c0.
+  //
+  // 3. **THE T BIT IS CLEARED ON THE WAY OUT.** Run this kernel twice on one
+  //    frame and the second run sees `T = 0` and returns — the merge is
+  //    idempotent, which is the same property `allocPass` has and for the same
+  //    auditing reason. It also means a probe whose parent moved on but which
+  //    has not re-traced keeps its last complete answer instead of accumulating.
+  //
+  // 4. **A MISSING PARENT PAYS SKY, NOT BLACK.** If the parent lattice has no
+  //    live probe here (past its extent, or a cascade whose liveness level the
+  //    window has not voxelized yet — §V.3's `c2 live 0/32768` boot), then the
+  //    chain ENDS at this cascade and a direction that escaped it escapes the
+  //    scene. Crediting sky there is what keeps the energy exactly once: the
+  //    last cascade credits sky on its own misses, and a truncated chain credits
+  //    it at the truncation. Black would have made an intermittently-late
+  //    voxelization read as "the far field is unlit", which is precisely the
+  //    3.13 boundary-clamp failure wearing a different hat.
+  const OCT_GROUPS = Math.ceil(OCT / 8);
+  /**
+   * The parent's radiance at `pos` for one direction: trilinear over its eight
+   * surrounding probes, weighted by liveness alone.
+   *
+   * ⚠ LIVENESS ALONE — no face gate and no visibility. The parent is being
+   * asked "what does the far field look like from around here", not "can you
+   * see me": a parent probe representing the other side of a wall is discounted
+   * by the CHILD's own `T`, which is 0 in exactly the directions that wall
+   * blocks. Adding a second refusal here would be [[§V.1's cov-is-not-vis]]
+   * bug one level down, where nothing would measure it.
+   */
+  const parentTap = (pcBase, pcSp, pcOrg, pos, texel, visBits = null) => {
+    const g = pos.div(pcSp).sub(0.5).toVar();
+    const b = g.floor().toVar();
+    const f = g.sub(b).toVar();
+    const acc = vec3(0).toVar();
+    const cov = float(0).toVar();
+    const accV = vec3(0).toVar();
+    const covV = float(0).toVar();
+    for (let c8 = 0; c8 < 8; c8++) {
+      const dx = c8 & 1;
+      const dy = (c8 >> 1) & 1;
+      const dz = (c8 >> 2) & 1;
+      const rx = b.x.add(dx).toVar();
+      const ry = b.y.add(dy).toVar();
+      const rz = b.z.add(dz).toVar();
+      const inLat = inLatticeAt(pcOrg, rx, ry, rz);
+      const cell = slotOf(rx.toInt(), ry.toInt(), rz.toInt()).add(pcBase).toVar();
+      const pAddr = octIdxW(cell, texel).toVar();
+      const pw1 = wpOct.element(pAddr.add(uint(1))).toVar();
+      const okay = wpInfo.element(infoIdx(cell, 0)).w.greaterThan(0.5)
+        .and(wpInfo.element(infoIdx(cell, 2)).w.greaterThan(0.25))
+        .and(nOf(pw1).greaterThan(uint(0)))
+        .and(inLat).toVar();
+      const tri = (dx ? f.x : float(1).sub(f.x))
+        .mul(dy ? f.y : float(1).sub(f.y))
+        .mul(dz ? f.z : float(1).sub(f.z)).toVar();
+      const w = select(okay, tri, float(0)).toVar();
+      const rad = decodeRgbe(wpOct.element(pAddr)).toVar();
+      acc.addAssign(rad.mul(w));
+      cov.addAssign(w);
+      if (visBits !== null) {
+        const seen = bitAnd(shiftRight(visBits, uint(c8)), uint(1)).equal(uint(1));
+        const wv = select(seen, w, float(0)).toVar();
+        accV.addAssign(rad.mul(wv));
+        covV.addAssign(wv);
+      }
+    }
+    if (visBits === null) return { acc, cov };
+    // ⭐⭐ THE GATED SUM IF IT HAS ANYTHING, THE UNGATED ONE IF IT DOES NOT.
+    // A probe in a pocket whose eight parents are all occluded would otherwise
+    // read `cov = 0` and be paid SKY — the truncated chain, on a probe with a
+    // perfectly good coarse neighbourhood. Same two-tier shape as the resolve's
+    // `wf.max(0.001)` fallback: prefer the admissible answer, never black for
+    // want of one.
+    return {
+      acc: select(covV.greaterThan(1e-4), accV, acc),
+      cov: select(covV.greaterThan(1e-4), covV, cov),
+    };
+  };
+
+  // ═══════════════════ SHADER: worldProbeMergeVis (§19 3.15, the thin-wall fix)
+  //
+  // ⭐⭐ §V.1's "COVERAGE IS NOT VISIBILITY" IS ABOUT THE RESOLVE'S HAND-OFF.
+  // THE MERGE'S PARENT TAP IS THE OPPOSITE CASE AND NEEDS THE OPPOSITE ANSWER.
+  //
+  // The hand-off asks "which cascade answers for this point", and there an
+  // occluded probe IS the answer — folding its refusal in invited the coarse
+  // cascade to answer instead, and thin-wall interior went 0.03 % → 0.56 % on
+  // that one term. The merge asks something else entirely: it INTERPOLATES a
+  // directional radiance field ACROSS SPACE, from probes up to `s_{i+1}` away.
+  // That is DDGI's own question, and DDGI's answer has always been that such an
+  // interpolation without a line-of-sight weight leaks through thin geometry.
+  //
+  // ⛔ MEASURED: with an unweighted parent tap the Cornell thin-wall interior
+  // read **5.62 % against 3.14's 0.05 %** — a 5 cm partition with the panel
+  // entirely on one side, the dark side inheriting the lit side's far field
+  // through a c1 parent standing a metre away on the wrong side of it. The
+  // CONTROL (visibility and face both off) read 5.63 %, which is the tell: the
+  // leak was not passing through any of the RESOLVE's terms, it was already in
+  // the field. `wpCovFull = 1` did not move it either. Both refutations in §W.
+  //
+  // ⚠ ONE THREAD PER PROBE, NOT PER TEXEL, AND THAT IS THE ONLY REASON IT IS
+  // AFFORDABLE. Whether parent corner `k` is visible from this probe does not
+  // depend on which of the 64 directions is being merged, so it is computed
+  // once and packed as EIGHT BITS into `wpInfo[1].w` — a component `allocPass`
+  // has always written as 0. Eight short rays per updated probe against the
+  // trace's 64 long ones is ~11 % more rays, and they stop at the parent.
+  //
+  // ⚠ THE BIAS NORMAL IS THE FACE, NOT THE RAY. `traceWindow`'s default origin
+  // bias is half a cell of the origin's level — 12.5 cm at L0, more than twice
+  // the 5 cm partition this exists to see. Biasing along `dir` would step the
+  // ray straight through the wall and the census would read "visible" for
+  // exactly the corners that are not.
+  const mergeVisPass = !(INTERVALS && NC > 1) ? null : Fn(() => {
+    const k = instanceIndex.toVar();
+    const rr = roundRobin(k);
+    If(rr.kLocal.greaterThanEqual(rr.live), () => { Return(); });
+    If(rr.casc.greaterThanEqual(uint(NC - 1)), () => { Return(); });
+    const gc = slotCell(rr).toVar();
+    const i0 = wpInfo.element(infoIdx(gc, 0)).toVar();
+    If(i0.w.lessThan(0.5), () => { Return(); });
+    const pos = i0.xyz.toVar();
+    const faced = i0.w.greaterThan(1.5).toVar();
+    const i1 = wpInfo.element(infoIdx(gc, 1)).toVar();
+    const faceN = i1.xyz.toVar();
+    const pcSp = pickF(rr.casc, SPC_PARENT).toVar();
+    const pcBase = pickU(rr.casc, BASE_PARENT).toVar();
+    const g = pos.div(pcSp).sub(0.5).toVar();
+    const b = g.floor().toVar();
+    const bits = uint(0).toVar();
+    for (let c8 = 0; c8 < 8; c8++) {
+      const rx = b.x.add(c8 & 1).toVar();
+      const ry = b.y.add((c8 >> 1) & 1).toVar();
+      const rz = b.z.add((c8 >> 2) & 1).toVar();
+      const cell = slotOf(rx.toInt(), ry.toInt(), rz.toInt()).add(pcBase).toVar();
+      const pp = wpInfo.element(infoIdx(cell, 0)).toVar();
+      const d = pp.xyz.sub(pos).toVar();
+      const L = d.length().toVar();
+      const dir = d.div(L.max(1e-4)).toVar();
+      const blocked = traceWindow(
+        pos, dir, L.sub(0.02).max(0), select(faced, faceN, dir),
+      ).hit.greaterThan(0.5).toVar();
+      // A DEAD parent's `pos` is still its cell centre, so `L` is meaningful and
+      // the bit is simply ignored downstream — `okay` already rejects it.
+      const seen = blocked.not().or(L.lessThan(0.05)).toVar();
+      bits.assign(bitOr(bits, select(seen, uint(1 << c8), uint(0))));
+    }
+    wpInfo.element(infoIdx(gc, 1)).assign(vec4(i1.xyz, bits.toFloat()));
+  })().compute(TRACE_SLOTS);
+  /** Cascade `ci`'s merge with cascade `ci+1`. One thread per (slot, texel). */
+  const mergeFor = (ci) => Fn(() => {
+    const kLocal = globalId.x.toVar();
+    const texel = globalId.y.toVar();
+    If(texel.greaterThanEqual(uint(OCT)), () => { Return(); });
+    If(kLocal.greaterThanEqual(uint(SLOTS[ci])), () => { Return(); });
+    const rr = roundRobin(kLocal.add(uint(SLOT_BASE[ci])));
+    If(rr.kLocal.greaterThanEqual(rr.live), () => { Return(); });
+    const gc = slotCell(rr).toVar();
+    const i0 = wpInfo.element(infoIdx(gc, 0)).toVar();
+    If(i0.w.lessThan(0.5), () => { Return(); });
+    const addr = octIdxW(gc, texel).toVar();
+    const w1 = wpOct.element(addr.add(uint(1))).toVar();
+    // A back-hemisphere HOLE (n = 0) is not a direction this probe owns, and an
+    // OPAQUE direction (T = 0) already has its answer. Both return, and the
+    // second is what makes this pass idempotent.
+    If(nOf(w1).equal(uint(0)).or(tOf(w1).equal(uint(0))), () => { Return(); });
+    // The eight line-of-sight bits `mergeVisPass` packed for this probe.
+    const visBits = wpInfo.element(infoIdx(gc, 1)).w.max(0).toUint().toVar();
+    const p = parentTap(
+      uint((ci + 1) * CELLS), float(SPC[ci + 1]), originsU[ci + 1], i0.xyz, texel, visBits,
+    );
+    // ⭐ THE MERGE'S OWN CENSUS, IN THREE SLOTS THAT ARE DEAD ON THIS PATH.
+    // `handoffs`, `matureTexels` and `texelsSeen` are all written by screen-path
+    // kernels that `useWorld` does not build, so they read 0 on every world boot
+    // and are free to say something true instead. What they say is the one
+    // question a merge can fail silently on: **did the parent answer?** A
+    // truncated chain is not an error — the last cascade has no parent by
+    // construction — but a chain truncating at c0 or c1 means the coarse lattice
+    // has no live probe there and the pixel is getting sky where it should be
+    // getting the far field, which is exactly the failure 3.13's boundary clamp
+    // turned out to be. It is worth one atomic to know the rate.
+    const answered = p.cov.greaterThan(1e-4).toVar();
+    bump(STATS.matureTexels, kLocal);
+    If(answered, () => { bump(STATS.handoffs, kLocal); })
+      .Else(() => { bump(STATS.texelsSeen, kLocal); });
+    const parent = select(answered, p.acc.div(p.cov.max(1e-4)), u.skyColor).toVar();
+    // `own` is 0 here by construction (a transparent texel found nothing in its
+    // band), but the sum is written as the formula rather than as the shortcut:
+    // the day a cascade learns to store partial transmittance, this line is
+    // already right and the one that says `assign(parent)` is silently wrong.
+    const own = decodeRgbe(wpOct.element(addr)).toVar();
+    wpOct.element(addr).assign(encodeRgbe(own.add(parent)));
+    wpOct.element(addr.add(uint(1))).assign(clearT(w1));
+  })().compute([Math.ceil(SLOTS[ci] / 8), OCT_GROUPS], [8, 8, 1]);
+  const mergePasses = (INTERVALS && NC > 1)
+    // COARSEST FIRST: c1 takes c2's field, then c0 takes the c1 that already
+    // has it. One frame, whole chain. Reverse this and light arrives one
+    // cascade per frame — correct in the limit, visibly laggy in motion.
+    ? Array.from({ length: NC - 1 }, (_, i) => NC - 2 - i).map(mergeFor)
+    : [];
+
+  // ══════════════════════ SHADER: worldProbeSeed (§19 3.15, spec item 2) ═════
+  //
+  // ⭐⭐ "LIGHT ARRIVES COMPLETE" IS THE WHOLE POINT OF RC, AND A RE-KEYED SLAB
+  // WAS THE ONE PLACE THIS LATTICE STILL BROKE IT. §V.6 measured the cost: a
+  // scroll sets `ready = 0` on the entering cells and they contribute NOTHING
+  // until their own round-robin turn — 3 frames at c0, SEVEN at c1 — which is
+  // 3.14's +2.0/+5.5/+3.0 points of motion sign-flips against 3.13.
+  //
+  // A fresh probe is not, however, ignorant: the cascade above it covers 64×
+  // the volume, changes 64× more slowly, and has ALREADY MERGED the whole far
+  // chain into its map. So a fresh probe takes its parent's answer until its
+  // own first trace replaces it. That is not an approximation bolted on — it is
+  // what a cascade hierarchy means, applied at the one moment the lattice
+  // admits it does not know something.
+  //
+  // ⚠ THE SEED IS THE NEAREST PARENT PROBE, NOT AN INTERPOLATION OF EIGHT, and
+  // the reason is a budget rather than a principle: an interp8 seed is 8 reads
+  // × 64 texels in a kernel dispatched over every cell of every cascade. The
+  // seed lives at most one round-robin period and is replaced by a complete
+  // trace; paying 8× for a value with a 3-frame half-life is the wrong trade.
+  // `mergePass`, whose value persists, does pay it.
+  //
+  // ⚠ AND IT RE-SEEDS EVERY FRAME UNTIL THE PROBE TRACES. Deliberately: a probe
+  // waiting seven frames for c1's turn tracks its parent the whole way instead
+  // of freezing on the scroll frame's snapshot. It is still a pure function of
+  // (occupancy, origins, parent maps) — §T holds — and at rest the set is empty,
+  // so a parked camera pays nothing and stays byte-identical.
+  const seedPass = !(INTERVALS && NC > 1) ? null : Fn(() => {
+    const gc = instanceIndex.toVar();
+    const casc = shiftRight(gc, uint(CELLB)).toVar();
+    const i0 = wpInfo.element(infoIdx(gc, 0)).toVar();
+    If(i0.w.lessThan(0.5), () => { Return(); });                       // dead cell
+    const i2 = wpInfo.element(infoIdx(gc, 2)).toVar();
+    If(i2.w.greaterThan(0.75), () => { Return(); });                   // already traced
+    // The LAST cascade has no parent to take from; its fresh probes wait for
+    // their own trace, which is 2 frames at its slot share.
+    If(casc.greaterThanEqual(uint(NC - 1)), () => { Return(); });
+    const pcSp = pickF(casc, SPC_PARENT).toVar();
+    const pcBase = pickU(casc, BASE_PARENT).toVar();
+    const pcOrg = pickV(casc, ORG_PARENT).toVar();
+    const dmax = pickF(casc, DMAX).toVar();
+    const pDmax = pickF(casc, DMAX_PARENT).toVar();
+    // The nearest parent CELL — `round` of the same frame `parentTap` floors.
+    const g = i0.xyz.div(pcSp).sub(0.5).toVar();
+    const nb = g.add(0.5).floor().toVar();
+    If(inLatticeAt(pcOrg, nb.x, nb.y, nb.z).not(), () => { Return(); });
+    const pc = slotOf(nb.x.toInt(), nb.y.toInt(), nb.z.toInt()).add(pcBase).toVar();
+    If(wpInfo.element(infoIdx(pc, 0)).w.lessThan(0.5), () => { Return(); });
+    If(wpInfo.element(infoIdx(pc, 2)).w.lessThan(0.25), () => { Return(); });
+
+    const faced = i0.w.greaterThan(1.5).toVar();
+    const faceN = wpInfo.element(infoIdx(gc, 1)).xyz.toVar();
+    const sh = [];
+    for (let i = 0; i < 9; i++) sh.push(vec3(0).toVar());
+    Loop({ start: 0, end: OCT, name: "wpSeed" }, ({ wpSeed }) => {
+      const t = uint(wpSeed).toVar();
+      const dst = octIdxW(gc, t).toVar();
+      const src = octIdxW(pc, t).toVar();
+      const e = octU.element(t).toVar();
+      const d = e.xyz.toVar();
+      // The child's own hemisphere rule still applies — a seeded probe that
+      // represents a face must not answer for the half it does not own, or the
+      // seed becomes a leak that the trace then has to undo.
+      const own = faced.not().or(dot(d, faceN).greaterThan(0.02)).toVar();
+      const sw1 = wpOct.element(src.add(uint(1))).toVar();
+      const has = nOf(sw1).greaterThan(uint(0)).and(own).toVar();
+      const rad = select(has, decodeRgbe(wpOct.element(src)), vec3(0)).toVar();
+      // The parent's moments are in the PARENT's units; re-quantize into ours
+      // and clamp, so `octTapVisAt` reads a distance and not a scale error.
+      const m = min(meanOf(sw1, pDmax), dmax).toVar();
+      wpOct.element(dst).assign(select(has, encodeRgbe(rad), uint(0)));
+      wpOct.element(dst.add(uint(1))).assign(
+        select(has, packMoments(uint(1), m, m, dmax, uint(0)), uint(0)),
+      );
+      const c = rad.mul(e.w).mul(select(has, float(1), float(0))).toVar();
+      sh[0].addAssign(c.mul(0.282095));
+      sh[1].addAssign(c.mul(d.y.mul(0.488603)));
+      sh[2].addAssign(c.mul(d.z.mul(0.488603)));
+      sh[3].addAssign(c.mul(d.x.mul(0.488603)));
+      sh[4].addAssign(c.mul(d.x.mul(d.y).mul(1.092548)));
+      sh[5].addAssign(c.mul(d.y.mul(d.z).mul(1.092548)));
+      sh[6].addAssign(c.mul(d.z.mul(d.z).mul(3).sub(1).mul(0.315392)));
+      sh[7].addAssign(c.mul(d.x.mul(d.z).mul(1.092548)));
+      sh[8].addAssign(c.mul(d.x.mul(d.x).sub(d.y.mul(d.y)).mul(0.546274)));
+    });
+    for (let i = 0; i < 9; i++) wpSh.element(shIdxW(gc, i)).assign(vec4(sh[i], 0));
+    // ⭐ 0.5, NOT 1. `ready` is now three-valued — 0 re-keyed, 0.5 SEEDED, 1
+    // traced — so the resolve can accept a seeded probe (it carries a real
+    // field) while `shPass` can still tell "has this probe ever traced" and
+    // this kernel can tell "should I keep seeding it".
+    wpInfo.element(infoIdx(gc, 2)).assign(vec4(i2.xyz, 0.5));
+  })().compute(ALL_CELLS);
 
   // ══════════════════════════════════════════ SHADER: worldProbeSh (§U.2)
   //
@@ -854,25 +1522,28 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
    * probes stand for.
    */
   const CASC_PREF = Array.from({ length: NC }, (_, c) => 64 ** (NC - 1 - c));
-  const cascConst = (ccU) => ({
-    sp: pickF(ccU, SPC).toVar(),
-    dmax: pickF(ccU, DMAX).toVar(),
-    org: pickV(ccU, originsU).toVar(),
-    base: ccU.mul(uint(CELLS)).toVar(),
-    pref: pickF(ccU, CASC_PREF).toVar(),
-  });
+  const cascConst = (ccU) => {
+    const sp = pickF(ccU, SPC).toVar();
+    return {
+      sp,
+      dmax: pickF(ccU, DMAX).toVar(),
+      org: pickV(ccU, originsU).toVar(),
+      base: ccU.mul(uint(CELLS)).toVar(),
+      pref: pickF(ccU, CASC_PREF).toVar(),
+      /**
+       * §19 3.15 — the surface bias AS A LENGTH, so the resolve stops choosing
+       * which spacing to multiply by and the choice becomes one uniform the
+       * receipts can flip. `wpBiasPerCasc = 0` is `s_0` (shipped, 15 cm
+       * everywhere); `1` is `s_c` (3.14's first cut, 15/60/240 cm). See
+       * `wpBiasPerCasc` — this is the bias-independence tell's only lever.
+       */
+      biasLen: wu.wpBias.mul(mix(float(SPC[0]), sp, wu.wpBiasPerCasc.clamp(0, 1))).toVar(),
+    };
+  };
   /** The lattice cell coords a world point falls between, and the fractions. */
   const cellFrameAt = (p, sp) => {
     const g = p.div(sp).sub(0.5).toVar();
     return { base: g.floor().toVar(), frac: g.sub(g.floor()).toVar(), g };
-  };
-  /** Is this world lattice cell inside that cascade's current window? */
-  const inLatticeAt = (org, wcx, wcy, wcz) => {
-    const rx = wcx.sub(org.x).toVar();
-    const ry = wcy.sub(org.y).toVar();
-    const rz = wcz.sub(org.z).toVar();
-    return rx.greaterThanEqual(0).and(ry.greaterThanEqual(0)).and(rz.greaterThanEqual(0))
-      .and(rx.lessThan(C)).and(ry.lessThan(C)).and(rz.lessThan(C));
   };
   /**
    * ⭐⭐ THE HAND-OFF BAND — 3.14's answer to the horizon 3.13 measured.
@@ -944,6 +1615,10 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     slots: SLOTS.slice(), slotBase: SLOT_BASE.slice(),
     traceSlots: TRACE_SLOTS, block: BLOCK, blocks: BLOCKS, oct: OCT,
     raysPerFrame: TRACE_SLOTS * OCT, distMax: DMAX.slice(),
+    // §19 3.15 — what every receipt has to print to be about this stage.
+    intervals: INTERVALS, beta: BETA, r0: R0C * SP0, r0Cells: R0C,
+    tStart: TSTART.slice(), tEnd: TEND.slice(),
+    mergePasses: mergePasses.length, seeded: !!seedPass,
     // ⚠ NO FUNCTIONS IN HERE. `describe()` crosses `page.evaluate` in every
     // receipt this module has; a method would be dropped by the structured
     // clone and read as `undefined` at the far end.
@@ -1003,12 +1678,28 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     offsets: { FLAG_OFF, LIST_OFF, BASE_OFF, CTL_OFF, LIST_WORDS },
     passes: {
       alloc: allocPass, count: countPass, scan: scanPass, fill: fillPass,
-      trace: tracePass, sh: shPass, nee: neePass,
+      seed: seedPass, trace: tracePass, mergeVis: mergeVisPass, sh: shPass, nee: neePass,
+      /** §19 3.15 — coarsest-first, one per cascade below the top. */
+      merge: mergePasses.slice(),
       clear: clearPass, clearInfo: clearInfoPass,
     },
-    /** §U's per-frame order. The caller splices it into `frameOrder`. */
-    frameOrder: [allocPass, countPass, scanPass, fillPass, tracePass, shPass, neePass]
-      .filter(Boolean),
+    /**
+     * §U's per-frame order. The caller splices it into `frameOrder`.
+     *
+     * ⚠ THE SEED RUNS AFTER `alloc` AND BEFORE THE COMPACTION, and the merges
+     * run between `trace` and `sh`. Both positions are the only ones that work:
+     * `seedPass` reads the fresh flag `allocPass` writes and must be visible to
+     * the resolve on the SAME frame the scroll happens; the merges must see the
+     * trace's `own` and must be seen by the SH projection, or a probe's SH is a
+     * frame behind its own map — which is the shape of bug §V.6's re-keyed slab
+     * already cost this stage once.
+     */
+    frameOrder: [
+      allocPass, seedPass, countPass, scanPass, fillPass,
+      // `mergeVis` between the trace and the merges: it needs this frame's own
+      // probe placement, and its eight bits are what the merges weight by.
+      tracePass, mergeVisPass, ...mergePasses, shPass, neePass,
+    ].filter(Boolean),
     taps: {
       cascades: NC, spacingOf: (c) => SPC[c], extentOf: (c) => EXT[c],
       cascConst, cellFrameAt, inLatticeAt, bandAt, clampAt, cellAtG,

@@ -2257,3 +2257,453 @@ the last hop.
 them has a pre-boot arm hatch. They say the tree is green, not that the world
 path is: adding a `FLAGS` hatch to the three that lack one is a prerequisite for
 the flip receipt these are supposed to be.
+
+---
+
+## W. STAGE 3.15 — RADIANCE CASCADES PROPER: INTERVAL-LIMITED PROBES AND THE PER-DIRECTION MERGE
+
+**Why:** 3.14's verdict named its own successor. Three world-anchored cascades
+each traced their COMPLETE 64-direction set TO THE HORIZON, and the resolve
+picked "the finest cascade that covers you" — so three estimators answered the
+same question from three different places and disagreed. The tell was a single
+constant: the surface bias moved the doors thin-feature ratio (33.9 to 70.3 %)
+and the far-field ratio (1.609 to 1.671) in the SAME direction. ⭐⭐ **A
+displacement constant should not have authority over both a 14 cm recess and a
+40 m façade, and in a real interval merge it cannot, because those are
+different cascades' ray intervals.**
+
+### W.1 THE INTERVALS AS BUILT
+
+`t_i = r0·(β^i − 1)/(β − 1)`, β = 4, `r0 = R0_CELLS · s_0`; the last cascade
+ends at the window's own horizon `RAY_MAX = 40 m`.
+
+| tier | c0 | c1 | c2 |
+|---|---|---|---|
+| ultra / high (s = 0.5 / 2 / 8 m) | **[0, 4) m** | **[4, 20) m** | **[20, 40] m** |
+| phone / medium (s = 1 / 4 m) | **[0, 8) m** | **[8, 40] m** | — |
+
+Each direction stores radiance **and a TRANSMITTANCE BIT** — 1 if the ray
+escaped its band, 0 if something stopped it. The bit cost nothing: `n` was
+declared eight bits at 24 and then written `.min(63)`, so bits 30-31 have been
+free since 3.13. (`nOf` now MASKS rather than shifts — a raw `w >> 24` would
+have read `n + 64` on every transparent texel, and every `n > 0` test in the
+file would have kept working while `n` itself became garbage.)
+
+**β = 4 AND 64 DIRECTIONS, AND THE CONSEQUENCE STATED.** RC's usual branching is
+spacing ×2 / interval ×4 / **directions ×4**, and the directions grow because
+the interval outruns the spacing. This lattice grows spacing ×4 as well, so β = 4
+makes interval and spacing grow at the SAME rate and the angular demand is
+CONSTANT rather than compounding: 64 texels over the sphere is a 28.6° cone,
+which at cascade `i`'s interval end subtends `0.5 · t_{i+1}` — 2 m at c0
+(spacing 0.5), 10 m at c1 (spacing 2), 20 m at c2 (spacing 8). **The same ~2.4×
+angular deficit at every cascade, not a growing one.** A 16×16 map on c1/c2
+would close it exactly and would cost 4× their rays (+90 % of the total budget)
+and 4× their `wpOct` (50 to 184 MB, past the portable envelope before the window
+is counted). **NOT TAKEN.** Because the deficit is uniform it reads as one
+global softness in the far field rather than as a cascade-boundary artefact —
+which is the failure mode 3.14 actually had.
+
+### W.2 ⭐⭐⭐ RC's RULE CANNOT BE COPIED VERBATIM INTO A CLIPMAP, AND THE CORRIDOR MEASURED IT
+
+The textbook rule — cascade `i` traces `[t_i, t_{i+1})` — rests on an assumption
+this lattice cannot meet: **that cascade 0 covers the whole domain.** Sannikov's
+c0 is a grid over the entire scene, so `[0, t_1)` is always somebody's job. Here
+the cascades are a CLIPMAP: c0 is 16 m of camera-centred lattice, c1 is 64 m,
+c2 is 256 m. A surface fifty metres down a corridor has no c0 and no c1, and
+therefore **nobody to carry its first twenty metres of light** — including the
+emissive panel five metres from it.
+
+⛔ **Measured, not argued: with the textbook rule the corridor's 50 m crops read
+0.0000 against a path-traced 1.79.** The far field went BLACK, and 3.14's
+over-bright 0.21 was the better answer. An interval that no cascade owns is
+light silently dropped — exactly the gap `srcConfig.intervalBoundaries` was
+written to make impossible one architecture ago.
+
+**The rule as shipped:** cascade `i` CONTRIBUTES `[t_i, t_{i+1})` where cascade
+`i−1`'s lattice contains its probe, and `[0, t_{i+1})` where it does not. The
+lattices are camera-centred and each is 4× the last, so containment is monotone
+in `i` — "c_{i−1} does not have me" means no finer cascade does. Nothing
+double-counts, because a cascade's merge reads parent probes AT ITS OWN PROBE'S
+POSITION, so any parent reached through the merge is by construction covered
+from below. The one imprecision is a shell one cell thick at each lattice face,
+where `bandAt` has already faded that cascade's weight to zero.
+
+⭐ **And it closes the visibility hole for free.** A probe that traces from 0
+records a first-hit distance from 0, so `octTapVisAt`'s Chebyshev test has real
+near-field moments at exactly the probes a fall-through pixel reads. Under the
+textbook rule c1's smallest storable distance was `t_1`, larger than any
+pixel-to-probe distance it would ever be asked about, and its visibility term
+was silently inert.
+
+### W.3 THE MERGE PASS
+
+`L_i(ω) = L_i^own(ω) + T_i^own(ω) · interp8(L_{i+1} at this probe, ω)`, and the
+parent is already merged with ITS parent, so one pass per cascade composes the
+whole chain in one frame. Four decisions:
+
+1. **`NC−1` DISPATCHES, COARSEST FIRST — not one.** c0's merge READS c1's texels
+   and WRITES c0's; folded into one dispatch that is a read-write hazard inside
+   a dispatch, which is the one thing §T's byte-identical frames cannot survive.
+   Separate dispatches are the barrier.
+2. **IT MERGES IN PLACE, AND THE TRACE IS WHAT MAKES THAT SAFE.** `own` is read
+   exactly once, by this pass, in the frame the trace wrote it, over the same
+   round-robin batch. A probe's next update rewrites `own` from scratch. The
+   lattice does not pay a second 50 MB to hold it; the cost is that a probe's
+   merged map is as stale as its parent was at its own last update (at most one
+   round-robin period).
+3. **THE T BIT IS CLEARED ON THE WAY OUT** — run the kernel twice on one frame
+   and the second run returns. The merge is idempotent, like `allocPass`.
+4. **A MISSING PARENT PAYS SKY, NOT BLACK.** If the parent lattice has no live
+   probe here, the chain ENDS and a direction that escaped this cascade escaped
+   the scene. Black would make an intermittently-late voxelization read as "the
+   far field is unlit" — the 3.13 boundary-clamp failure in a different hat.
+   Census, in three stat slots that are dead on the world path (`handoffs`,
+   `matureTexels`, `texelsSeen`): on the corridor, **the parent answered 91.1 %
+   of transparent texels; 8.9 % truncated.**
+
+**α MUST BE 1, AND THAT IS ALGEBRA RATHER THAN TASTE.** The merge writes
+`own + T·parent` back into the same texel, so the value the next trace would
+blend against is already merged: `mix(merged, own, 0.25)` re-mixes the far field
+into the near band and the next merge adds it again. §T is satisfied without the
+EMA anyway — a world probe traces the same 64 rays from the same point every
+update, so α was never removing noise here.
+
+**THE SEED.** A re-keyed slab was the one place this lattice still broke "light
+arrives complete": §V.6 measured it as 3.14's +2.0/+5.5/+3.0 points of motion
+sign-flips. A fresh probe now takes its nearest parent probe's merged map (and
+its moments, re-quantized into its own units) until its own first trace, and
+`ready` becomes three-valued — 0 re-keyed, 0.5 SEEDED, 1 traced. It re-seeds
+every frame until the probe traces, so a probe waiting seven frames for c1's
+turn tracks its parent the whole way. At rest the set is empty and a parked
+camera pays nothing.
+
+### W.4 ⭐⭐ `t_{i+1} >= 2·s_{i+1}` — THE RULE THE SWEEP FOUND
+
+The merge interpolates the parent's map AT THE CHILD'S POSITION, and the child
+can be up to `s_{i+1}` from the parent it reads. If the parent's interval starts
+at `t_{i+1}` comparable to `s_{i+1}`, that offset is comparable to the whole
+near end of the band and the hand-off loses energy — the child asks "what is
+beyond 10 m from ME" and is answered "beyond 10 m from somewhere else eight
+metres away".
+
+Corridor, wall crops, GPU divided by the 4-bounce path-traced truth, ultra.
+**The arms rank exactly by `t_{i+1}/s_{i+1}`:**
+
+| `R0_CELLS` | t = [t0,t1,t2] | t1/s1 | t2/s2 | 5 m | 15 m | 30 m | 50 m |
+|---|---|---|---|---|---|---|---|
+| 2 | [0, 1, 5] | 0.50 | 0.63 | **0.209** | 0.404 | 3.064 | 0.119 |
+| 4 | [0, 2, 10] | 1.00 | 1.25 | 1.227 | 0.376 | 2.888 | 0.119 |
+| **8 (shipped)** | **[0, 4, 20]** | **2.00** | **2.50** | **1.161** | **0.458** | **2.877** | **0.118** |
+| 12 | [0, 6, 30] | 3.00 | 3.75 | 1.839 | 0.500 | 2.875 | 0.118 |
+| 16 | [0, 8, 40] | 4.00 | — | 1.633 | 0.614 | 2.872 | 0.118 |
+
+`r0 = 2` is a COLLAPSE — the 5 m crop reads a fifth of the truth. Past `r0 = 8`
+the far cascade's band is squeezed toward nothing (at 16, `t2 = RAY_MAX` and c2
+has no band at all, which is 3.14 with extra steps) and the 5 m crop drifts back
+up as c1 takes work c0 should be doing. Asymptotically the ratio is
+`R0_CELLS/(β−1)`, so anything at or above 6 keeps `t/s >= 2` at every cascade.
+**8 is the smallest power of two that satisfies the rule, and it is the best
+total error.**
+
+### W.5 THE CORRIDOR — A FAR-FIELD RECEIPT WITH TRUTH IN IT
+
+`probe:gi2-corridor` (`scripts/gi2-corridor.html` + `run-gi2-corridor-probe.mjs`)
+is the instrument 3.14's verdict said was missing. The Cornell rig HAS truth and
+no far field (a 5 m box entirely inside cascade 0); Bistro HAS a far field and no
+truth. This is the missing quadrant: the analytic room stretched to 60 m along Z,
+the emissive panel on the ceiling at the far end, a sun through a side window at
+the NEAR end, and the SAME `makeReference` CPU path tracer — now lifted into
+`scripts/lib/gi2Reference.mjs` so the two probes cannot drift — evaluated at
+5 / 15 / 30 / 50 m from the camera, at 1, 2 and 4 bounces, 150 000 spp.
+
+**The gate is the flat room's own bracket, not a new number**: GPU irradiance at
+least the 1-bounce reference and at most 1.15× the 4-bounce one, exactly what
+Cornell parity asks. This replaces "within ±15 % of the screen path", which had
+no truth in it.
+
+⭐⭐ **THE SKY IS BLACK IN THIS SCENE, AND FINDING OUT WHY IS ITSELF A RECEIPT.**
+`hitRadiance` credits `skyColor` to any ray that reaches `RAY_MAX` without
+hitting, and **`RAY_MAX` is 40 m while the corridor is 60**. A probe at z = 8
+fires down +Z, marches 40 m of empty corridor, hits nothing, and is paid a skyful
+of light. With a 0.32-luminance sky that one policy put 0.14 of irradiance on the
+near crops against a path-traced 0.009 — fifteen times over, and none of it about
+the merge. **The cascade LATTICE reaches 256 m and the cascade RAYS reach 40; the
+last cascade's sky credit is the seam between them, and in an interior it is a
+leak.** Black is what the two paths can agree on, so the residual is transport.
+
+### W.6 WHAT THE CORRIDOR SAYS ABOUT 3.14 vs 3.15 (ultra, 700 frames, wall crops)
+
+| ÷ 4-bounce truth | 5 m | 15 m | 30 m | 50 m | bracketed | Σ\|ln ratio\| |
+|---|---|---|---|---|---|---|
+| 3.12 screen path | 1.887 | 0.741 | 0.156 | **0.002** | 2/8 | 9.01 |
+| 3.14 cascades to the horizon | 1.953 | 0.607 | 3.295 | 0.119 | 3/8 | 4.49 |
+| **3.15 interval merge** | **1.166** | 0.460 | **2.930** | 0.119 | 3/8 | **4.14** |
+
+▶ 3.15 is the closest arm overall and much the closest at 5 m; it is DARKER at
+15 m (0.460 vs 0.607), and that row is a measured regression with an un-isolated
+mechanism. Two candidates were REFUTED cheaply and are recorded so nobody
+re-proposes them:
+* **the fall-through's coverage proportion** — `wpCovFull` makes the hand-off a
+  saturating gate rather than a proportion (`1.0` reproduces 3.14's behaviour);
+  the 15 m row moved 0.348 to 0.378 and nothing else moved. Coverage is ~1 at
+  these crops.
+* **cache convergence** — 160 frames vs 700 frames moved 15 m by 0.03. It is
+  converged, not warming up.
+
+▶ **AND THE TWO BIGGEST ERRORS BELONG TO NEITHER ARM'S ESTIMATOR.** At 30 m both
+arms are ~3× too bright and at 50 m both are ~8× too dark, and the two numbers
+are within 1 % of each other across the arms — so the merge is not the variable
+there. 30 m is §V.3's own unmeasured candidate, now measured: **a coarse probe
+stands where its own escape put it, up to 4× its liveness voxel (14 m at c2),
+and a probe pushed outside the building measures the sunlit EXTERIOR.** 50 m is
+resolution: past c1's ±32 m only c2 exists, and 8 m probes cannot resolve an area
+light five metres away. Both are cascade-schedule problems (16 / 64 / 256 m
+extents against a 40 m ray reach), not interval-merge problems.
+
+### W.7 ⭐⭐⭐ THE SEALED ROOM: AN ESCAPE RULE WRITTEN FOR A PROBE IS WRONG FOR AN INTERVAL START
+
+The first build did the obvious thing — advance the origin to `t_i`, trace
+`t_{i+1} − t_i`. In a room whose free path is smaller than `t_i`, that origin
+lands INSIDE OR BEYOND A WALL, and `traceWindow`'s escape then does exactly its
+job: it walks the origin forward out of the dilated shell, which puts the ray
+**outside the sealed room**. It flies to the horizon, misses, and the chain pays
+SKY. In a 10x6x10 m Cornell room c1's band starts at 4 m and c2's at 20 m, so
+this is not an edge case — it is most of their directions.
+
+⛔ **The thin-wall interior receipt read 5.99 % of the lit side against 3.14's
+0.05 %, and the CONTROL (visibility and face both off) read the same 5.99 %.**
+That equality is the whole diagnosis: nothing in the RESOLVE was leaking. Two
+candidate fixes were built and both were REFUTED by that same number:
+
+* **the fall-through's coverage proportion** (`wpCovFull = 1` reproduces 3.14's
+  proportional hand-off) — thin-wall unchanged at 5.62 %;
+* **a line-of-sight gate on the merge's parent tap** (`mergeVisPass`, eight
+  short rays per updated probe packed as eight bits into `wpInfo[1].w`) —
+  thin-wall 5.62 to 5.99 %, i.e. nothing.
+
+Sky was already in the field, put there by rays that started outside the room.
+⭐⭐ **An escape rule written for a probe's own origin is wrong for an interval
+start: one says "get me out of the surface I am standing on", the other would
+have to say "get me past the surface that is blocking me", and those are
+opposite instructions.**
+
+**THE FIX — the ray leaves the PROBE and only the RADIANCE is interval-limited:**
+
+| the ray | stored |
+|---|---|
+| hit before `t_i` | radiance 0, **T = 0** — blocked before my band; the finer cascade owns both the light and the occluder |
+| hit inside `[t_i, t_{i+1})` | the hit's radiance, T = 0 |
+| miss, last cascade | sky, T = 0 |
+| miss, any other cascade | radiance 0, **T = 1** |
+
+This is RC's decomposition unchanged — cascade `i` still contributes only its own
+band — with the occlusion evaluated from the place the light is actually being
+gathered. It is strictly MORE correct than the textbook form, which assumes the
+finer cascade's `T` covers the near segment; that holds only when the finer probe
+is at the same point, and it never is.
+
+▶ **thin-wall interior 5.99 % → 0.39 %, against a control of 0.82 %.** Note the
+shape of that pair: 3.14 reads 0.05 % with a control of 0.05 %, so its visibility
+term is doing NOTHING there (both sit on the instrument's floor); 3.15 reads half
+its own control, which is the first arm on this receipt where the term is
+measurably working.
+
+⚠ **AND IT IS CHEAPER, NOT DEARER.** c0 holds 70 % of the slots and its rays got
+ten times SHORTER (0→4 m against 3.14's 0→40); c1 halves; only c2, at 10 % of the
+slots, pays 3.14's full length. Chain **2.396 ms against 3.14's 2.544** at
+1650x970, both against a 4 ms budget.
+
+`mergeVisPass` was KEPT even though it did not fix what it was built for: the
+merge does interpolate a directional field across space from probes up to
+`s_{i+1}` away, DDGI's argument for a visibility weight there is sound, and it
+costs eight short rays per updated probe (~11 % more rays, measured inside the
+chain number above).
+
+### W.8 ⭐⭐ THE BIAS-INDEPENDENCE TELL — 28.7 POINTS BECOMES 2.2
+
+3.14's verdict rested on one observation: **a single displacement constant moved
+the doors thin-feature ratio and the far-field ratio together**, which no correct
+interval decomposition can allow, because a 14 cm recess and a 40 m façade are
+different cascades' bands. `wpBiasPerCasc` makes both readings ONE BOOT apart
+(0 = `wpBias·s_0`, 15 cm everywhere; 1 = `wpBias·s_c`, 15/60/240 cm).
+
+Bistro doors pose, PINNED (eye [1.26, 1.96, −1.66] → [−0.55, 1.51, −0.81]), the
+SCREEN arm's own darkest-1 % population (1124 px) measured on every arm — a
+shared pick, so it is the same 1124 pixels every time. AO off.
+
+| arm | darkest-1 % ÷ wall (irradiance) | `irrP05` | no live corner |
+|---|---|---|---|
+| 3.12 screen path | 23.0 % | 0.1156 | — |
+| 3.14, bias `s_0` | 55.5 % | 0.1456 | 0 % |
+| 3.14, bias `s_c` | **26.8 %** | — | 0 % |
+| **3.15, bias `s_0`** | **54.8 %** | 0.1207 | 0 % |
+| **3.15, bias `s_c`** | **57.0 %** | 0.1176 | 0 % |
+
+▶ ⭐⭐ **THE TELL PASSES, AND ON THE SAME POSE AND THE SAME 1124 PIXELS RATHER
+THAN AGAINST §V.4's OLDER BOOT. One constant moves 3.14's ratio 28.7 points
+(55.5 to 26.8 %, 52 % relative) and 3.15's 2.2 points (54.8 to 57.0 %, 4 %
+relative) — THIRTEEN TIMES LESS SENSITIVE.** (§V.4 measured 3.14's coupling as
+36.4 points on a different boot; the same effect, larger, because that boot's
+populations were darker.) The picked pixels sit at p50 6.08 m / p95 6.49 m, entirely
+inside c0's 16 m extent where `s_0` and `s_c` are the same 15 cm, so the residual
+2.2 points is c1's share inside the hand-off BAND and nothing else. The coupling
+that condemned "pick the finest cascade that covers you" has nowhere left to
+live.
+
+⚠ **AND THE GATE ITSELF IS STILL NOT MET: 54.8 % against ≥ 70 %.** It is 2.4x
+the screen path on the same pixels, `irrP05` is non-zero on every arm here, and
+"no live corner in ANY cascade" is 0 % — but the mean is where 3.14 left it.
+This gate is not what 3.15 moved.
+
+### W.9 THE RECEIPT TABLE (3.12 / 3.14 / 3.15, ONE BINARY)
+
+`?world=0` is 3.12, `?intervals=0` is 3.14, default is 3.15. Cornell rig at
+960x540 (`probe:gi2-gather`, ultra); Bistro doors at the pinned pose.
+
+| receipt | 3.14 (intervals off) | **3.15** | gate |
+|---|---|---|---|
+| Cornell bracketed | 8/8 | **8/8** | 8/8 |
+| Cornell within 15 % of the 2-bounce ref | 7/8 | **8/8** | — |
+| 5 cm-wall leak | 0/10 000 (control 92.1 %) | **0/10 000 (control 92.1 %)** | 0 |
+| leak, all four rotations | 0/10 000, control 100 % | **0/10 000, control 100 %** | 0 |
+| thin-wall interior, worst | 0.05 % (control 0.05 %) | **0.39 % (control 0.82 %)** | ≤ 5 % |
+| trim: sub-voxel crops in the flat bracket | 5/6 | **5/6** | 6/6 |
+| at rest: still % / sign flips / temporal p95 | 100 / 0 / 0.001 % | **100 / 0 / 0.001 %** | 95 / — / 0.3 % |
+| orbit ÷ parked (paired) | 1.000 | **1.019** | — |
+| orbit sign-flip rate | 6.411 % | **6.062 %** | ≤ 35 % |
+| panel move re-converges | 18 fr | **5 fr** | ≤ 30 |
+| chain ms @1650x970 | 2.544 | **2.396** | ≤ 4.0 |
+| storage buffers, worst kernel | 6 | **6** | ≤ 6 |
+| cold noise: temporal p95 | 0.723 % | **1.576 %** | ≤ 1 % ⛔ |
+| lattice bytes (GPU) | 66.75 MB | **66.75 MB** | — |
+| **Bistro doors: darkest-1 % ÷ wall** | 55.5 % | **54.8 %** | ≥ 70 % ⛔ |
+| Bistro doors: `irrP05` of that set | 0.1456 | **0.1207** | > 0 |
+| Bistro doors: no live corner anywhere | 0 % | **0 %** | 0 % |
+| **corridor 5 m ÷ path-traced truth** | 1.953 | **1.166** | bracket |
+| corridor 15 m | 0.607 | **0.460** | bracket |
+| corridor 30 m | 3.295 | **2.930** | bracket |
+| corridor 50 m | 0.119 | **0.119** | bracket |
+| corridor bracketed | 3/8 | **3/8** | — |
+
+**The one gate 3.15 loses is `cold noise: temporal p95`, 0.723 → 1.576 %, and it
+is `wpAlpha = 1`.** That arm measures 30 frames FROM COLD while the radiance
+cache is still converging; with the EMA gone a probe's map STEPS to each new
+cache value instead of ramping to it. §U.2 predicted exactly this ("1 is a
+legitimate arm and is not noisy, only abrupt") and the settled receipt is
+untouched at 0.001 % with 100 % still pixels and zero sign flips. The same
+constant is why the panel move re-converges in 5 frames instead of 18. It cannot
+be turned down without breaking the merge's algebra (§W.3).
+
+**THE PHONE TIER (two cascades, `[0, 8)` and `[8, 40]`) BUILDS AND PASSES**, and
+that matters because it is the portable envelope's arm: Cornell 8/8 · thin-wall
+interior **0.19 % against a 0.31 % control** · storage buffers 6 of 6 · no
+workgroup memory · chain 2.183 ms · panel move 6 frames · at rest 100 % still,
+0 sign flips, temporal p95 0.001 %. The same two structurally-blind FAILs and the
+same cold-noise row (1.859 %).
+
+⚠ Two gates read FAIL on every world arm and are **structurally blind, not
+failing**, exactly as §V.5 recorded: `reprojection at rest ≥ 99 %` reads 0/0
+because nothing reprojects on a path where nothing moves, and §3.9's rotated-room
+`delta` predates this stage.
+
+### W.10 THE ENGINE GATES (shipping path, `WORLD_PROBES = false`)
+
+`test:gi-sunleak` **PASS** — sealed interior worst leak 0.00000 against 0.002.
+`test:gi-moved-lamp` **PASS** — the new spot gains 29.06 lum (gate > 12), the old
+loses 29.05, separation 58.11.
+`smoke:gi-gpu` **PASS** (exit 0) — gi2 transport 280 rays/frame over 35 probes,
+probesValid 35/35, first light 339 ms, cache 15.08 MB / window 2.815 MB.
+`run-gi-resize-probe` **ALL PASS** — uncaptured device errors 0 / createBindGroup
+throws 0 across every hop, textures live and transport alive after the last.
+
+⚠ Same caveat §V.8 records: these four run the SHIPPING path because the flip did
+not happen, so they say the tree is green, not that the world path is.
+
+### W.11 THE FLIP VERDICT — `WORLD_PROBES` STAYS `false`
+
+**WHAT 3.15 SET OUT TO DO, IT DID.** ⭐⭐ The bias-independence tell — the one
+thing 3.14's verdict named as the proof that its resolve was not RC's merge — is
+now measured on one pose, one pick, one binary: **one constant moves 3.14's doors
+ratio 28.7 points and 3.15's 2.2.** The far field has a REFERENCE for the first
+time (`probe:gi2-corridor`, a 60 m room and a CPU path tracer), and against it
+3.15 is the closest of the three arms. The chain got CHEAPER (2.396 vs 2.544 ms)
+because c0's rays are ten times shorter. A moved panel re-converges in 5 frames
+instead of 18. §T is untouched: 100 % still, zero sign flips, temporal p95
+0.001 %.
+
+**PASS** — Cornell 8/8 · Cornell within 15 % of the 2-bounce reference 8/8
+(3.14: 7/8) · 5 cm leak 0/10 000 with its 92.1 % control, and 0/10 000 on all
+four rotated rooms · thin-wall interior 0.39 % against a 0.82 % control (the
+first arm where that term measurably works) · §T at rest · orbit ÷ parked 1.019,
+orbit sign-flips 6.062 % (3.14: 6.411) · panel move 5 frames · chain 2.396 ms ·
+storage buffers 6 of 6 · lattice unchanged at 66.75 MB · doors "no live corner in
+any cascade" 0 % · corridor total error the lowest of the three arms · all four
+engine gates.
+
+**FAIL — the doors thin-feature ratio, 54.8 % against ≥ 70 %.** It is 2.4x the
+screen path on the same 1124 pixels and level with 3.14's 55.5 %, so the gate is
+not something the interval merge moved in either direction. What 3.15 removed
+was its DEPENDENCE on a constant that has no business setting it.
+
+**FAIL — the corridor's 30 m and 50 m rows, and NEITHER IS THE MERGE.** Both
+arms read 30 m ~3x too bright and 50 m ~8x too dark, agreeing with each other to
+within 1 %, so the variable is not the interval decomposition. ⭐ Both are
+CASCADE-SCHEDULE problems and they are now named with numbers:
+1. **30 m — the coarse probe's ESCAPE.** §V.3 listed it as an unmeasured
+   candidate; the corridor measures it. A probe is pushed out of geometry by up
+   to 4x its liveness voxel — 14 m at c2 — and a probe 14 m outside a building
+   measures the SUNLIT EXTERIOR. 3.15 2.930, 3.14 3.295, truth 1.0.
+2. **50 m — resolution.** Past c1's ±32 m only c2 exists, and 8 m probes cannot
+   resolve an area light five metres away. Both arms 0.119.
+3. And the frame around both: **the cascade LATTICE reaches 256 m while the
+   cascade RAYS reach `RAY_MAX = 40 m`.** A 256 m lattice of probes that can see
+   40 m is mostly unreachable, while the 16 → 64 m gap is where all the error
+   is. The extents (16/64/256) were chosen against the window's levels, not
+   against the ray budget.
+
+**FAIL — cold-noise temporal p95, 0.723 → 1.576 %** — `wpAlpha = 1`, which the
+merge's algebra requires (§W.3) and which is the same constant that took the
+panel move from 18 frames to 5. It is a convergence RAMP, not steady-state noise:
+the settled gate is 0.001 %.
+
+**FAIL — Bistro motion sign-flips, above 3.14's on all three arms**
+(`probe:gi2-motion`, world lattice arm, same session, `FLAGS` as the arm):
+
+| reprojected sign flips | §V.6's 3.13 | 3.14 | **3.15** |
+|---|---|---|---|
+| orbit | 25.2 % | 26.9 % | **35.1 %** |
+| dolly | 17.2 % | 21.6 % | **26.4 %** |
+| whip | 15.8 % | 17.6 % | **23.3 %** |
+| orbit MAX frame ms | 118.0 | 143.3 | **113.4** |
+| PARKED median frame ms | — | 18.3 | **15.5** |
+
+▶ **This is `wpAlpha = 1` again, and it is the same trade the cold-noise row
+records.** With the probe-map EMA gone — which the merge's algebra forbids
+(§W.3) — a probe steps to each new value instead of ramping to it, and a
+reprojected comparison under motion counts every step as a sign change. The
+`accum` arms in the same table say the image-space accumulator is still doing its
+work on both arms (3.15 orbit 35.1 % with it, 40.9 % without; 3.14 26.9 / 39.3),
+so the remaining lever for this row is at the image, not at the probe. ⚠ Note
+that 3.15 is FASTER on the same runs — parked median 15.5 ms against 18.3, orbit
+MAX 113.4 against 143.3 — so this is not a cost of doing more work.
+
+The frame-time and voxelize-chain gates fail on BOTH world arms and on §19 4.1's
+own record; §V.6 already attributes them to the `binPairs` scroll burst, which
+this stage does not touch.
+
+**NOT RUN, and therefore not claimed:** `probe:gi2-farfield` (superseded for this
+stage by the corridor, which has truth in it) and `probe:gi2-boot` (Level/Bistro
+first light and JS heap).
+
+▶ ⭐⭐ **AND THE TWO REMAINING FAILURES 3.15 OWNS ARE THE SAME ONE.** Cold-noise
+p95 and Bistro motion flips are both `wpAlpha = 1`, and α cannot come back while
+the merge writes `own + T·parent` into the texel the next trace would blend
+against. The way to have both is to keep `own` and `merged` in separate words —
++25 MB of `wpOct` (66.75 → 92 MB) for an EMA on the merged value. That is a
+measurable trade and it is the first thing to try if this row blocks the flip
+again.
+
+▶ **NEXT, IN ORDER.** (1) The coarse-probe escape budget — it is the largest
+single error in the far field and it is one constant. (2) The cascade extent
+schedule against `RAY_MAX`, which currently disagree by 6x. (3) The 15 m corridor
+row, the one place the merge itself is behind 3.14.

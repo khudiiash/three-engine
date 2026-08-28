@@ -67,6 +67,13 @@
         // of 3.14's binary, on this page's own shader cache. Read at build for
         // the same reason `?world` is: it is the addressing, not a lever.
         if (params.has("casc")) globalThis.__gi2Cascades = Number(params.get("casc"));
+        // §19 3.15: `?intervals=0` is 3.14 (every cascade traces to the horizon,
+        // no merge, no seed) and `?r0=N` sweeps the interval geometry. Read at
+        // BUILD for the same reason `?world` and `?casc` are — they decide which
+        // kernels exist, and setting one afterwards would do nothing, silently.
+        if (params.has("intervals")) globalThis.__gi2Intervals = Number(params.get("intervals"));
+        if (params.has("r0")) globalThis.__gi2R0 = Number(params.get("r0"));
+        if (params.has("perCasc")) globalThis.__gi2BiasPerCasc = Number(params.get("perCasc"));
 
         const THREE = await import("three/webgpu");
         const TSL = await import("three/tsl");
@@ -181,6 +188,8 @@
         // §19 3.11: `contact=0` is HEAD — the window always wins in the first
         // two cells — and is the arm every blob ratio below is read against.
         if (params.has("contact")) gu.contactOn.value = Number(params.get("contact"));
+        // §19 3.15's fall-through gate — a UNIFORM, so both readings are one boot.
+        if (params.has("covFull") && gu.wpCovFull) gu.wpCovFull.value = Number(params.get("covFull"));
         // §19 STAGE 3.12 — the two new levers, same discipline: a candidate has
         // to be able to run the WHOLE page, so they are page-wide parameters
         // and not something only the grain table can set.
