@@ -14897,6 +14897,56 @@ export class GISystem {
       // §12.70 W5b: the NEE set as a lookup — #isNeeEmitterMesh asks it once
       // per entry during the palette bake and once per mover per frame.
       this._emitterCandMeshes = new Set(bright.map((c) => c?.mesh).filter(Boolean));
+      // ⭐⭐ §19 STAGE 4.3 — THE ADMISSION RECORD IS A FACT ABOUT THE EMITTERS,
+      // NOT ABOUT THE TREE'S GPU BUFFER, AND IT BELONGS WHERE THE CANDIDATE SET
+      // IS MINTED.
+      //
+      // `#recordEmitterAdmission` feeds TWO corrections that have nothing to do
+      // with the light tree's words:
+      //
+      //   · `#belowEmitterPowerGate` — the user's own rule ("the smaller the
+      //     emitter, the more emission it needs to count"), Φ = π·A·L against
+      //     `__giEmitterMinPowerFraction` of scene power;
+      //   · `_emitterFillByMesh` — §18.15's SEAT FILL DAMPING, the only thing
+      //     standing between a seat fitted to a WHOLE MESH and the 1/fill
+      //     over-delivery §13.7g measured at ~285×.
+      //
+      // Both were reachable ONLY from the light-tree build inside `#rebuild`,
+      // and that build is guarded on `this._emitterCands?.length`. ⛔ MEASURED
+      // on the user's Bistro (2026-08-28): the boot line reads `1 lights (GPU),
+      // **0 emitters**` and the soup line `palette 62 of 63 classes, 0 with
+      // emission` — at `#rebuild` time NOT ONE emissive material has resolved
+      // yet (a `.mat` graph's `emissiveNode` lands after the first GI build), so
+      // the block is skipped, no region is ever created, and
+      // `#refreshLightTree`'s own `if (!uploader || !region) return` then makes
+      // the miss PERMANENT for the session. `_emitterCands` catches up through
+      // `#checkFingerprint` — 95 candidates, four seated — but the admission
+      // record never does: `_emitterFillByMesh` stays `undefined`, `?? 1` reads
+      // as "nothing needed damping", and the power gate fails open on every
+      // placement (`emitter delivery: 0 placement(s) CULLED`).
+      //
+      // ⭐ SO THE CALL MOVES INTO THE CALLEE. `#buildEntries` is the ONE place
+      // `_emitterCands` is assigned, so every path that mints a candidate set —
+      // `#rebuild` and `#checkFingerprint`'s content path alike — now mints the
+      // admission record with it, and no caller has to remember. (The lesson
+      // [[shadow-freeze-counted-unrendered-ticks]] records: a caller-position
+      // dependency belongs inside the callee as a checked precondition.)
+      // `collectEmitters` is microseconds at these counts — it already runs per
+      // light-tree refresh — and it is PURE: it reads meshes and returns a
+      // description, touching no GPU state.
+      if (bright.length) {
+        try {
+          const admissionMeshes = this.#lightTreeMeshes();
+          this.#recordEmitterAdmission(
+            admissionMeshes,
+            collectEmitters(admissionMeshes, { minPowerFraction: this.#emitterMinPowerFraction() }),
+          );
+        } catch (err) {
+          // ⚠ FAILS OPEN, like the gate it feeds. A throw here must leave the
+          // previous record standing rather than zero every emitter.
+          console.warn(`[gi] emitter admission scan failed (non-fatal): ${err?.message ?? err}`);
+        }
+      }
       const chosen = this.#chooseEmitterSeats(bright);
       this._promotedEmitterMeshes = chosen.map((cand) => cand?.mesh ?? null);
       for (const cand of chosen) {
