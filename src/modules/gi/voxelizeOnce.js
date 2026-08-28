@@ -351,11 +351,22 @@ export function resolveMaterialSurface(materialInput, meshName = "") {
  */
 const geometryCopyCache = new WeakMap(); // geometry -> { version, positions, index }
 
-export function serializeMeshForBake(mesh) {
+export function serializeMeshForBake(mesh, { geometryOnly = false } = {}) {
   const position = mesh.geometry?.attributes?.position;
   if (!position) return null;
   mesh.updateWorldMatrix(true, false);
-  const surface = resolveMaterialSurface(mesh.material, mesh.name);
+  // ⭐ §19 STAGE 6.7 — THE SURFACE WALK IS NOT THE GEOMETRY'S, AND IT WAS THE
+  // BOOT FRAME'S BIGGEST SINGLE LINE.
+  //
+  // `resolveMaterialSurface` walks a shader-graph material (constantColorOf /
+  // textureValueOf, depth 8, plus a texture-average lookup) and `matrix`
+  // allocates a fresh 16-element array. Both of this module's remaining
+  // consumers — `#occupancyContentOf`'s pack and the static-BVH repack — read
+  // ONLY `positions`/`index`/`uvs`, and GI2 gets its colours from
+  // `#gi2PaletteSurfaces`, which resolves the surface itself and memoises it
+  // per mesh. On Bistro the walk therefore ran 1531 times for nothing inside
+  // the 1339 ms boot frame (`serializeMeshForBake` 179 ms of it).
+  const surface = geometryOnly ? null : resolveMaterialSurface(mesh.material, mesh.name);
   // Vertex/index copies cached per geometry (big character models cost real
   // milliseconds to slice per request; a drag only changes the matrix).
   let cached = geometryCopyCache.get(mesh.geometry);
@@ -409,7 +420,7 @@ export function serializeMeshForBake(mesh) {
     };
     geometryCopyCache.set(mesh.geometry, cached);
   }
-  return {
+  const record = {
     // Identity for the worker's incremental diffing + geometry cache: the
     // key changes when geometry content does, so edits re-ship exactly once.
     id: mesh.id,
@@ -417,11 +428,14 @@ export function serializeMeshForBake(mesh) {
     positions: cached.positions,
     index: cached.index,
     uvs: cached.uvs,
-    matrix: [...mesh.matrixWorld.elements],
-    color: { r: surface.color.r, g: surface.color.g, b: surface.color.b },
-    emissive: { r: surface.emissive.r, g: surface.emissive.g, b: surface.emissive.b },
-    emissiveIntensity: surface.emissiveIntensity,
   };
+  if (surface) {
+    record.matrix = [...mesh.matrixWorld.elements];
+    record.color = { r: surface.color.r, g: surface.color.g, b: surface.color.b };
+    record.emissive = { r: surface.emissive.r, g: surface.emissive.g, b: surface.emissive.b };
+    record.emissiveIntensity = surface.emissiveIntensity;
+  }
+  return record;
 }
 
 const toRecords = (meshesOrRecords) =>
