@@ -200,6 +200,47 @@ export const FLAG_FRESH = 2;
 export const FLAG_BLOCKNEW = 4;
 
 /**
+ * ⭐⭐⭐ §19 STAGE 5.4a — THE COLD-START WINDOW, AS A COUNTDOWN IN THE FLAG WORD.
+ *
+ * `FLAG_BLOCKNEW` means "claimed THIS frame" and is cleared by the very next
+ * age sweep, so the cadence override it drives lasts exactly one frame. That is
+ * enough for the block-recycling hazard it was written for and NOT ENOUGH for a
+ * probe that was born because the camera moved: on its birth frame it gets one
+ * frame of rays into an equal-area bin set that a single frame's directions
+ * cannot cover, so most of its bins resolve UNKNOWN. Its child's merge then
+ * finds no parent corner and an orphaned transparent bin votes L = 0 with full
+ * coverage — the user's "checkerboards building every time I move my camera"
+ * (0.5-1 m squares = one c0 probe footprint each), filling in over the 10-20
+ * frames the cadence needs to visit c1/c2/c3 again.
+ *
+ * So the bit becomes a COUNTDOWN. Bits 3-6 hold `WARM_FRAMES` at the claim and
+ * are decremented by one on every age sweep; while the field is non-zero the
+ * deposit raises its reach and scatter gate to the probe's own cascade exactly
+ * as `FLAG_BLOCKNEW` does. A newborn therefore traces EVERY cascade for its
+ * first `WARM_FRAMES` frames — long enough for the ray budget to cover its bin
+ * set — and then falls back onto the cadence like any veteran.
+ *
+ * The cost is bounded by CAMERA MOTION and by nothing else: the population that
+ * carries it is the births of the last `WARM_FRAMES` frames (`COUNTER_FRESH`
+ * per cascade, summed over the window), which is zero at rest and proportional
+ * to newly disoccluded screen area while walking.
+ *
+ * `__gi2RcWarmFrames = 0` restores 5.3d's one-frame behaviour.
+ */
+export const FLAG_WARM_SHIFT = 3;
+export const FLAG_WARM_MASK = 0x78;      // bits 3-6, so a countdown up to 15
+export const FLAG_WARM_ONE = 1 << FLAG_WARM_SHIFT;
+/** Frames a newborn probe ignores the cadence for. */
+export const WARM_FRAMES = (() => {
+  const raw = Number(globalThis.__gi2RcWarmFrames);
+  if (Number.isFinite(raw)) return Math.max(0, Math.min(15, Math.floor(raw)));
+  return 8;
+})();
+/** The flag word a claim writes: alive + fresh + blocknew + a full countdown. */
+export const FLAG_CLAIMED = FLAG_ALIVE | FLAG_FRESH | FLAG_BLOCKNEW
+  | (WARM_FRAMES << FLAG_WARM_SHIFT);
+
+/**
  * Fixed-point ONE for the per-block INFLUX WORD (§12.40.4's α compensation).
  *
  * One word per block, riding `freeStack`'s tail beside the claim stamps,
@@ -957,8 +998,17 @@ export function createAgePass(store, cascade, {
       // what makes the bit mean EXACTLY ONE FRAME: the age pass runs before
       // compaction, so a block claimed on frame f is flagged for f and settled
       // by the sweep at the head of f+1.
-      probeTable.element(w.add(PROBE_FLAGS))
-        .assign(flags.bitAnd(uint(~(FLAG_FRESH | FLAG_BLOCKNEW) >>> 0)));
+      // §19 5.4a — and the warm countdown ticks HERE, in the same store: one
+      // decrement per sweep, saturating at zero. `max(w,1) − 1` would need a
+      // branch; the subtract is masked so an already-zero field stays zero.
+      {
+        const settled = flags.bitAnd(uint(~(FLAG_FRESH | FLAG_BLOCKNEW) >>> 0)).toVar();
+        const warm = settled.bitAnd(uint(FLAG_WARM_MASK)).toVar();
+        If(warm.notEqual(uint(0)), () => {
+          settled.assign(settled.sub(uint(FLAG_WARM_ONE)));
+        });
+        probeTable.element(w.add(PROBE_FLAGS)).assign(settled);
+      }
       const r = hashInsertWgsl(
         key, hashKey(key), uint(c.hashBase), uint(c.hashCapacity),
         uint(MAX_PROBE_STEPS), hashKeys,
@@ -1083,8 +1133,13 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
           // deposit's cadence override reads this bit and nothing else, so
           // forgetting it here would leave the §16 retry path producing exactly
           // the black the flag exists to remove. See `FLAG_BLOCKNEW`.
+          // §19 5.4a — and it re-opens the FULL warm window: this probe has
+          // never held a ray either, so a one-frame override would leave the
+          // retry path making exactly the checkerboard the window removes.
           probeTable.element(sw.add(PROBE_FLAGS)).assign(
-            probeTable.element(sw.add(PROBE_FLAGS)).bitOr(uint(FLAG_BLOCKNEW)),
+            probeTable.element(sw.add(PROBE_FLAGS))
+              .bitAnd(uint(~FLAG_WARM_MASK >>> 0))
+              .bitOr(uint(FLAG_BLOCKNEW | (WARM_FRAMES << FLAG_WARM_SHIFT))),
           );
         });
       });
@@ -1147,7 +1202,8 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
     probeTable.element(w.add(PROBE_FLAGS)).assign(
       select(block.equal(uint(SLOT_EMPTY)),
         uint(FLAG_ALIVE | FLAG_FRESH),
-        uint(FLAG_ALIVE | FLAG_FRESH | FLAG_BLOCKNEW)),
+        // §19 5.4a — a claim opens the WARM WINDOW, not just this frame's bit.
+        uint(FLAG_CLAIMED)),
     );
     probeTable.element(w.add(PROBE_PARENT)).assign(uint(SLOT_EMPTY));
     probeTable.element(w.add(PROBE_HASH)).assign(h);
