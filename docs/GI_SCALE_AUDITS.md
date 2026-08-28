@@ -5274,3 +5274,459 @@ direction set hits, so averaging over space averages correlated numbers.
    currently capable of reporting a table of zeros as a measurement** —
    `scripts/lib/gi2PixelDump.js` carries a WITNESS lane (`12345` written
    unconditionally by every thread) so the two cases can never be confused again.
+
+## §AK — THE SEGMENT HAS TWO ENDS, AND THE CELL HAS EIGHT CORNERS (08-28)
+
+Three units on one tree at HEAD `22ea234`, each with its own BUILD-TIME arm so
+any receipt below can be attributed to exactly one of them:
+`__gi2ExitFace = 0` (AK.1–3), `__gi2CovCorners = 0` (AK.4), `__gi2CascData = 0`
+(AK.5). Working tree at every measurement: `package.json`,
+`scripts/run-gi2-band-probe.mjs`, `src/modules/gi/window/windowTrace.js`,
+`src/modules/gi/window/worldProbes.js` modified; `scripts/gi2-covleak.html` and
+`scripts/run-gi2-covleak-probe.mjs` new. Another agent's untracked Cornell
+scripts were present throughout and untouched.
+
+### AK.1 — ⭐⭐⭐ THE PHONE LEAK WAS NEVER INTERMITTENT, AND NEVER THE COVERAGE CLASS
+
+§AI.7 flagged the phone tier leaking **3 and 2 rays of 10 000** through the
+rotated Cornell's 5 cm wall (`probe:gi2-gather`'s rotX20/rotXY20 arms) against
+§AH.5's 0/10 000, and §AG.8 then recorded the same arms reading 0/10 000 twice
+more *in the very battery that saw the 3* — which is what made it read as a
+lottery. It is not one.
+
+⭐ **AN INSTRUMENT THAT FIRES ONCE PER BATTERY CANNOT ARBITRATE A
+THREE-IN-TEN-THOUSAND EVENT.** `probe:gi2-covleak` (NEW — `scripts/gi2-covleak.html`)
+holds the scene, the rays and the tier fixed and sweeps the one variable the
+gather rig leaves floating: WHERE THE CAMERA STANDS, and with it the phase of the
+voxel lattice against the rotated wall. Same window, same `windowFill`, same
+`traceWindow`, same 10 000 rays, twelve placements.
+
+| tier | axis | rotY20 | rotX20 | rotXY20 | total |
+|---|---|---|---|---|---|
+| **phone** (0.5 m) | 0 | 0 | **3 at every one of 12 placements** | **2 at every one of 12** | 60 / 480 000 |
+| high (0.25 m) | 0 | 0 | 0 | 0 | 0 / 480 000 |
+| ultra (0.25 m) | 0 | 0 | 0 | 0 | 0 / 480 000 |
+
+**The same ray indices, every placement, every run.** The "intermittency" was the
+TIER: §AH.5's "0/10 000, control 92.1 %" is the high/ultra reading (the trim
+arm's control is 92.1 % at 0.25 m and 86.5 % at 0.5 m — the number identifies
+the tier), and §AG.8's "0/10 000 in the two later arms" were the other two tiers
+of the same battery. Nobody had run the phone arm twice.
+
+### AK.2 — the mechanism, read out of the window buffer at the crossing
+
+The rig walks each leaking ray analytically in the room's own un-rotated frame,
+finds where it really crosses a surface, and reads that voxel back out of the
+window. **Every leaking ray, at every level, without exception:**
+
+    crosses pal 1 (floor) / pal 2 (ceiling)
+    L0: occ 1  brick 1  cov 3  face 0b111100  | entry bit 0, exit bit 1
+
+⭐⭐ **`cov 3` AT EVERY LEAK — §AG's classes are not involved**, exactly as §AG.8
+argued structurally (`windowFill` writes `COV_OPAQUE` into every occupied voxel,
+so a rotated Cornell has no path to a class below 3). The bug is one axis of the
+FACE BYTE. `rotX(20)` turns the floor normal `(0,1,0)` into `(0, 0.94, 0.34)` —
+**`n.x` stays EXACTLY zero** — so the fill sets ±Y and ±Z and never ±X
+(`0b111100`, read back at every leak). An X-DOMINANT ray enters that slab's voxel
+through an ±X face whose bit the slab does not set, is waved through, and leaves
+through the −Y face it descended by: a face the slab DOES set, and one nobody was
+asking about.
+
+⭐⭐⭐ **THE ENTRY-FACE TEST USES THE AXIS OF A VOXEL BOUNDARY AS A PROXY FOR THE
+DIRECTION THE RAY IS TRAVELLING, AND THE TWO DIVERGE WHEN THE CELL IS BIG.** At
+0.5 m the ray crosses the 5 cm slab while moving 0.13 m in y — inside one cell,
+without ever crossing a y boundary there. At 0.25 m it meets a y boundary first,
+which is why high and ultra read 0/10 000 of the identical rays.
+
+⚠ AND THE MIRROR HAD TO BE TESTED BEFORE IT WAS BELIEVED. Its first form
+subtracted the window ORIGIN from the world cell; `windowTrace` indexes
+TOROIDALLY (`worldCell & 63`), the origin only deciding whether the cell is in
+the window at all. The mirror read a voxel up to 32 m away, reported `occ 0`
+everywhere, and would have "proved" the wall was never voxelized. A one-line
+self-test — a point 1 cm inside the ceiling slab must read occupied, the room's
+centre must not — is what caught it. [[probe-blind-statistics]]
+
+### AK.3 — ⛔⛔ THE FIX WORKS, AND IT IS RETRACTED TO AN ARM
+
+A voxel is a SEGMENT of the ray, bounded by an entry crossing and an exit
+crossing, and the surface inside it is crossed if it faces EITHER end. Testing
+both costs **no extra load** (the same face byte is already fetched), **no
+constant**, and it seals the leak completely:
+
+| | `__gi2ExitFace = 0` (shipped) | exit face ON |
+|---|---|---|
+| `probe:gi2-covleak`, 3 tiers × 4 rotations × 12 phases | 60 / 1 440 000 | **0 / 1 440 000** |
+| `probe:gi2-gather` TIER=phone rotX20 / rotXY20 leak | **3 / 2 of 10 000** | **0 / 0** |
+| control (face bits withheld) | 100 % | 100 % |
+| Cornell bracketed crops | 8/8 | 8/8 |
+| 3.9 per-arm bracketed | axis 8/8 · rotY20 7/8 · rotX20 7/8 · rotXY20 7/8 | axis 8/8 · rotY20 **8/8** · rotX20 7/8 · rotXY20 7/8 |
+| 3.11 contact leak / control | 1 / 10 000, 86.5 % | 1 / 10 000, 86.5 % |
+| chain ms @1650×970 | 1.799 | 1.815 |
+| `probe:gi2-sky` rays dimmed / mean `T` (Bistro) | — | **29.5 % / 0.872** (§AG.6: 29.9 % / 0.871) |
+
+⭐ The leak appears and disappears with the flag, Bistro's thin-geometry census
+does not move, and the two tilted arms' 7/8 rotated-crop bracket reads 7/8 in
+BOTH arms — that one is not this unit's, and neither is the trim arm's contact
+leak, identical to the ray.
+
+⛔⛔ **AND THEN IT DARKENS THE USER'S CORNELL BOX, WHICH IS THE TRADE THIS
+PROJECT DOES NOT TAKE.** `probe:gi2-cornell` on `Cornel.scene`, one flag at a
+time, everything else fixed:
+
+| arm | black px | median \|log ratio\| | global gain |
+|---|---|---|---|
+| 4.12 (both off) | **703** | 0.555 | 1.070× |
+| exit face only | **946** | 0.779 | 0.566× |
+| 8-corner min only (AK.4) | **683** | 0.521 | 1.191× |
+| exit face + 8-corner min | **8595** | 2.378 | — |
+
+⛔⛔ **AND THE FOUR ROWS ABOVE ARE VOID — SEE AK.5.** Taken before the
+distribution was: `probe:gi2-cornell` on this scene converges to one of TWO
+fixed points (~688 black or ~8590) and eight alternating boots on a still tree
+show the flag has nothing to do with which. 8595 is the collapsed mode, and
+946 at a global gain of 0.566× sits nearer that family than the good one
+(1.07–1.19×). The exit-face test stays OFF for the reason below — an
+occlusion-semantics change for the whole engine, bought with 3 rays in 10 000
+at the lowest tier — and NOT because these numbers say so.
+
+⭐⭐ **WHY, AND IT IS THE SAME SENTENCE AS THE FIX: the exit axis proves the ray
+moved a whole cell, and NOT WHICH SIDE OF THE SURFACE it moved on.** In an
+ANALYTIC scene (`windowFill`'s solid slabs — the rig the leak was found in) the
+two coincide. Under CONSERVATIVE TRIANGLE VOXELIZATION they do not: a surface is
+dilated into every cell it touches, so the cell ABOVE a floor carries the floor's
+±Y bits, and a ray crossing that cell UPWARD — away from a floor it never meets —
+exits through a face the floor sets and is stopped. The entry test never asked
+that question because a ray ENTERING through the floor's own axis really is
+crossing it.
+
+⚠⚠ **AND THE PAIR IS NOT THE SUM OF ITS PARTS: 946 and 683 compose to 8595.**
+That is what a self-amplifying transport does with a systematic over-occlusion —
+§AJ.3's `δ = Qδ + ε` on albedo-1.0 white walls, where ρ is near 1.
+
+▶ **THE LEAK IS THEREFORE STILL OPEN, AND IT IS NAMED TO THE BIT:** 3 rays in
+10 000 at the 0.5 m cell, on a floor whose `n.x` is exactly zero. Sealing it
+needs to know which side of the surface the ray is on, and occupancy plus six
+RECIPROCAL face bits cannot express that. **It is a missing bit, not a missing
+threshold** — and any rule with a threshold in it would be tuning an algorithm to
+a receipt. The arm stays compiled (`__gi2ExitFace = 1`) so the next unit that
+adds a signed face rule can measure against it in one command.
+
+### AK.4 — ⭐⭐ THE DEFERRAL IS DECIDED AT THE PROBE AND READ AT THE PIXEL
+
+§AI.9's first open row. 4.12 asked `latticeCovAt` at the probe's own position;
+`DARK1`'s c2 probe stands where c1's coverage is **1.000** and answers a pixel
+**six metres away** where c1's coverage is **0.27**. Both of 4.12's conditions
+pass, the near band is deferred, and the cascade it is deferred to has nothing
+live where the answer is actually read.
+
+The liveness question is asked over the SAME VOLUME the containment question
+already used — `holdsCell`'s `pos ± spOwn`, this cascade's own cell plus the one
+cell beyond that the trilinear blend reaches — at its eight corners, and the
+deferral takes the **MIN**. Never a mean: a mean lets a fully live half of the
+cell pay for a dead half, which is the arithmetic that hid `DARK1` inside a
+1.000.
+
+⚠ **AND IT IS A TSL `Loop`, NOT A JS ONE.** Unrolled, the eight taps added
+**163 kB of WGSL to `worldTrace`** (98 → 261 kB on `smoke:gi-gpu`'s storage
+audit) — and §19 4.3a's receipt says a kernel's WGSL size is paid at BOOT, in
+pipeline compile, in front of first light. One copy inside a loop costs the same
+64 scalar loads and none of the text (197 kB).
+
+**The A/B: two consecutive boots, one flag, one sun** (`probe:gi2-ref`,
+`FLAGS={"__gi2CovCorners":0}` on the first; both printed
+`sun 10,10,10 dir [-0.07,-0.44,0.90]`):
+
+| pinned | 4.12 (centre tap) | shipped (8-corner min) |
+|---|---|---|
+| **`DARK1`** (truth 0.4607) | **0.0020** | **0.0177** — 8.9× |
+| `DARK2` (truth 0.4851) | 0.1362 | 0.1418 |
+| `DARK3` (truth 0.3909) | 0.1368 | 0.1432 |
+| `SOFF1` (truth 0.1359) | 0.0402 | 0.0506 |
+| `SOFF3` (truth 0.0721) | 0.0502 | 0.0540 |
+| pose B signal-set mean \|log ratio\| | 1.166 | **1.006** |
+| pose B outside [0.7, 1.4] | 11 of 17 | **10 of 17** |
+| pose B signal-set median \|ratio−1\| | 0.405 | 0.404 |
+| pose B zero census | 0 | **0** |
+| pose A signal-set median \|ratio−1\| | 0.106 | **0.044** |
+| pose A signal-set mean \|log ratio\| | 0.493 | 0.491 |
+| pose A zero census | 4 (0.00 %) | 177 (0.16 %) |
+| ⛔ GATE — pixels at 0 where `E_ref > 0.05` | 0 | **0 (pass)** |
+
+⭐ **The pin §AI.9 named as the open row is the one that moved**, and it moved by
+the mechanism: a probe that read its own coverage as 1.000 and its pixel's as
+0.27 stops deferring. `DARK1` is still 26× short of truth — better, not solved.
+
+⚠ **THE ONE COST IS BOUNDED AND NAMED:** pose A's zero census 4 → 177 pixels of
+112 464 (0.16 %). Widening a probe's own band means a probe in a genuinely
+occluded near-field pocket now OWNS that pocket and reports its measured darkness
+rather than deferring it — and the ⛔ gate says every one of those 177 pixels has
+a path-traced truth under 0.05.
+
+⚠ **THIS SESSION'S 4.12 ARM DOES NOT REPRODUCE §AI.5's 4.12 COLUMN** (pose B
+signal-set median 0.405 here against 0.276 there) on a tree that is HEAD
+`22ea234` plus this unit alone, with the same sun direction. Whatever moved is
+between SESSIONS, not between arms — which is why the table above is one boot
+pair taken minutes apart and quotes no number from another day.
+[[probe-blind-statistics]]
+
+## §AL — THE CACHE IS LIT BY THE PROBES NOW, AND THAT WAS NOT THE CORNELL FAULT (08-28)
+
+Measured on a tree at HEAD `540d631` ("stage 4.13 instrument"), which advanced
+to `e67a78d` ("Stage 5 spec") under this unit without touching any file it
+reads. THIS UNIT'S ONLY SOURCE EDIT AT EVERY MEASUREMENT:
+`src/modules/gi/window/gatherProbes.js`. Also modified in the tree throughout,
+by the other agent and untouched here: `worldProbes.js`, `windowTrace.js`,
+`scripts/run-gi2-band-probe.mjs` — so every before/after pair below is one boot
+pair taken minutes apart, never across sessions. [[probe-blind-statistics]] Harness
+`http://127.0.0.1:5202/`, one battery at a time.
+
+### §AL.1 — what was built
+
+§AJ.3 named the mechanism: `shadeTerms` lit each cache face with FOUR RAW CACHE
+FACE READS (`cacheRead` at each cosine ray's hit), which is `δ = Qδ + ε` — a
+Neumann iteration over the ERROR as well as over the light, compounding by
+~1/(1−ρ), ≈3× at the user's albedo-1.0 Cornell walls. Offline the same fixed
+4-direction set scores σ 16.4 %; the GPU reads 52.0 %.
+
+Lumen's shape is the fix: the surface cache is lit by the RADIANCE CACHE, never
+by itself. So under `__gi2CacheFromProbes` (a BUILD arm, default ON; `0`
+restores 3.10's body and nothing else):
+
+* `worldResolveInto(P, N, acc)` — `resolveHalf`'s OWN world block, **moved, not
+  copied**: same eight corners, same trilinear × live × wrapped-cosine × FACE ×
+  CHEBYSHEV, same 4.9 ramp, same coarsest-preferred tail. `planFull = null`
+  skips the glossy tap, which is all a cache face does not need. One
+  implementation, two consumers — a second transcription would have been a
+  second place for the bias, the band, the ramp and the tail to drift, and a
+  cache lit by a DRIFTED resolve is a cache the screen disagrees with
+  everywhere.
+* `shadeTerms`' whole indirect term becomes ONE SH2 resolve of that field at the
+  face, `Ebnc = shEval(Lb/wsum, n)`. The face's own four sky rays, four slot-NEE
+  rays and (on the rig) four panel rays are **not compiled at all** on this arm.
+* ⚠ SKY AND EMITTER COME FROM THE PROBE TOO, AND THEY MUST. `worldProbes.shPass`
+  projects traced radiance that credits `skyColor` on a miss, and `neePass` ADDS
+  `emitterSh` into the SAME nine words. There is no separable "bounce only"
+  field to read, so keeping the face's own sky rays or NEE rays beside it would
+  count that light twice. What survives at the face is the one term the probe
+  does not carry: the DIRECT SUN, whose shadow ray is unchanged.
+* Leak rule = the screen's, verbatim: `faceSamplePoint` already sits on the
+  voxel's face plane and the resolve then applies its own per-cascade `biasLen`
+  along `n`, exactly as it does at a gbuffer position. No world-unit constant
+  was minted. [[gi-colour-probe-method]]
+
+⭐⭐ **AND THE TDZ THAT SAID THIS WAS IMPOSSIBLE IS NOT REAL.** `world` is a
+`const` ~1000 lines below `shadeTerms`, and `createWorldProbes` builds the
+kernel that inlines `shadeHit` from inside its own initializer — a temporal dead
+zone only if `Fn` bodies run EAGERLY. Measured (`Fn(cb)`, then `cb()`): the
+callback runs at neither point; it runs when the shader is BUILT, by which time
+`world` is assigned. `worldProbes.js`'s own note claims otherwise and is wrong
+about `Fn`. That measurement is the whole reason this unit could be built at all.
+
+### §AL.2 — the receipt on the thing it targets: 4× smoother cache faces
+
+`probe:gi2-faceterm`, Bistro, pinned pose, arm `w 0.85 · cold 0`:
+
+| | cache-lit (`=0`) | probe-lit (ships) |
+|---|---|---|
+| adjacent face pair \|La−Lb\|/max p50 | 24.7 % | **4.3 %** |
+| adjacent face pair p90 | 91.0 % | **22.9 %** |
+| brick σ/mean (shade) p50 / p90 | 61.4 % / 119.3 % | **25.9 % / 58.7 %** |
+| stored σ/mean p50 | 49.7 % | **29.5 %** |
+| mean face radiance | 0.03039 | 0.01998 (−34 %) |
+
+⭐ The smoother's authority collapsed with it: across `w = 0 → 0.85` the pair
+p50 moved 36.1 → 24.7 % before and 4.3 → 4.3 % after. The cache no longer NEEDS
+a spatial smoother, which is the tell that the variance was self-generated.
+
+⭐⭐ **AND THE −34 % IS THE SAME FINDING.** `1/(1−ρ)` inflates the MEAN as well
+as the spread; the old cache was over-bright by its own feedback.
+
+### §AL.3 — the refutation: this is not what the Cornell gate was measuring
+
+`probe:gi2-cornell`, the user's `Cornel.scene`, one boot pair minutes apart:
+
+| | `=0` | `=1` |
+|---|---|---|
+| median \|log ratio\| | 0.655 | 0.677 |
+| p90 \|log ratio\| | 1.681 | 1.900 |
+| black px | 804 | 889 |
+| global gain | 0.718× | 0.631× |
+| gate | 0/5 | 0/5 |
+| σ/mean, the 7 surfaces | 19.9 / 23.0 / 34.0 / 45.5 / 59.9 / 76.2 / 117.7 % | 16.6 / 21.5 / 32.5 / 39.9 / 62.2 / 89.3 / 120.5 % |
+| d²@0.25, worst two | 0.284 / 0.127 | 0.281 / 0.137 |
+
+`probe:gi2-quadrature` re-scored on those two dumps: **GPU σ̄ 52.0 % → 52.8 %.**
+
+⛔ **THE §AJ.3 HYPOTHESIS IS REFUTED AT THE GATE.** Removing the self-lighting
+*entirely* does not move the number it was said to produce. §AJ.2b had already
+localised the Cornell loss downstream ("the light exists in the world and is
+lost between the cache and the pixel — that is the RESOLVE"); §AL.2 shows the
+cache term itself really was ~4× too noisy and is now fixed; the gate still
+cannot see it because the resolve dominates. Two independent faults, and the
+c2-claim fix (§AJ.4 item 1, `worldProbes.js`) has to land before the gate moves.
+
+⚠ THE ENERGY COUPLING IS THE THING TO WATCH. The compounding was PROPPING UP a
+field the resolve under-reads, so removing it makes Cornell dimmer (0.718 →
+0.631) before it makes it right. Expect the flip to be measurable in the other
+direction once the claim is fixed.
+
+⚠ Verifying the arm is not optional: `gate.gather.cacheFromProbes` is written
+into the gate JSON (`false` / `true` on the pair above) for exactly that reason.
+The first read of this unit's neutral result should be "is the arm live", and
+here it demonstrably was. [[probe-blind-statistics]]
+
+### §AL.4 — the albedo ceiling: MEASURED, REFUTED, NOT SHIPPED
+
+`__gi2BounceAlbedoMax = 0.9` (default `1` = off), same scene, one boot, against
+the `=1` column above:
+
+median 0.677 → **2.237**, p90 1.900 → **10.550**, black 889 → **8694**;
+`Ceiling·-Z` energy ratio 0.42 → **0.02**, `Mesh·+Z` 0.49 → **0.00**,
+`Floor·+Z` 0.61 → 0.33.
+
+⛔ A closed albedo-1.0 box transports nearly everything through many bounces, so
+a 10 % per-bounce tax is `0.9^n` and the field collapses. The textbook "ρ < 1 or
+the Neumann series diverges" rule is about a series summed ONCE; this loop is
+re-evaluated every frame against a live field, and §T's α accumulation is what
+bounds it. The violence of the response is itself the receipt that ρ ≈ 1 here.
+The arm stays in the source at its identity value so the measurement is
+reproducible; the ceiling itself is **refuted, do not re-propose**.
+
+### §AL.5 — cost and the standing gates
+
+| gate | `=0` | `=1` (ships) |
+|---|---|---|
+| `probe:gi2-gather` bracketed crops, phone/high/ultra | 8/8 ×3 | **8/8 ×3** |
+| chain ms @1650×970, high / ultra (limit 4.0) | 2.801 / 2.856 | 2.903 / 2.952 |
+| chain ms, phone | 1.145 | — |
+| time to first light (90 %), high / ultra | 50 / 50 fr | 50 / 50 fr |
+| `high` orbit ÷ parked (paired) | 1.283 **FAIL** | **1.004 PASS** |
+| `gi2.worldTrace` WGSL / storage buffers | 166 kB / 6 | 197 kB / **6** |
+| `probe:gi2-puddle` wall curvature p90 @ tile lag | — | 9.72 % PASS (< 10) |
+| `probe:gi2-ref` pose A / B signal-set median | — | 0.134 / 0.418 |
+| `probe:gi2-motion` orbit MAX / whip MAX | 132.6 / 30.1 ms | 131.4 / 40.9 ms |
+| `test:gi-moved-lamp` · `smoke:gi-gpu` (incl. phone) | — | PASS · PASS |
+| Cornell image at rest, 180 gather frames apart | 0.00 % | **0.00 %** |
+
++0.10 ms of chain and +31 kB of WGSL to replace nine DDA rays with one resolve.
+The ray saving does not show as a win because the resolve is the largest
+expression in the chain and a fresh shade was already RARE (n̄ 1.4): the cost is
+per SHADE, and shades are ~10² per frame, so neither side of the trade is where
+the frame is spent.
+
+Pose B's 0.418 sits inside §AK's own recorded session drift (0.405 against
+§AI.5's 0.276 on ONE arm with the same sun), so it is not attributed here.
+`orbit: MAX` is the same pre-existing ~1 s `update` longtask in both arms.
+`whip: MAX` 30.1 → 40.9 ms is a single frame's maximum and the only unexplained
+motion row — re-measure it before spending anything on it.
+
+### §AL.6 — what this leaves open
+
+1. The Cornell gate is still 0/5 and it is the RESOLVE (§AJ.2b / §AJ.4 item 1).
+   Re-run this pair the moment the c2 claim lands; §AL.3's energy coupling
+   predicts the direction of the flip.
+2. The face bounce is now at LATTICE resolution (0.5 m at c0) where it used to
+   be four rays into the face's own neighbourhood. A 5.5 m Cornell box is ~11
+   probes across. If the gate improves and DETAIL is what is then missing, this
+   is the first place to look — not the direction count.
+3. `census.y` / `census.z` in `shadeTerms` no longer mean "sky rays that MISSED /
+   hit a WARM face" on this arm (they are 0 and the resolve's `wsum`), so
+   `probe:gi2-faceterm`'s census LINE reads a constant `0 % MISS, 25 % WARM,
+   75 % COLD`. The term σ table above it is correct; that one line is not, on
+   this arm only, and it should be re-cut rather than read.
+
+### AK.5 — ⛔⛔⛔ THE CORNELL GATE IS BISTABLE, AND THAT IS THE RESULT
+
+§AJ.2b's fix is built: a cascade must not take CLAIM where it has no DATA.
+`blockedNear` — computed in the trace since 3.15 and thrown away three lines
+later — is stored in **bit 31 of the moments word**, the last free bit of a field
+whose `n` has been six bits in an eight-bit slot since 3.13. `shPass`, already
+one thread per probe reading every moment word, counts it over the probe's own
+hemisphere; a probe whose EVERY own direction was blocked before its band writes
+`ready = 0.2` instead of 1.
+
+⭐ **AND NOTHING DOWNSTREAM HAD TO BE EDITED.** `ready` was already
+three-valued (0 re-keyed / 0.5 seeded / 1 traced) and everything that asks "is
+this probe worth reading" asks `> 0.25` — the resolve's `alive`, `parentTap`'s
+gate, `seedPass`'s parent test. A fourth rung BELOW that threshold forfeits the
+claim, and the merge's own algebra redistributes it to the cascades that did
+measure the band: energy-preserving, not a subtraction. `seedPass` gained the one
+line that stops it putting such a probe straight back on the books at 0.5. It is
+not a death either — `allocPass` still lists the cell, so the probe traces again
+on its next turn and `shPass` writes 1 the moment one ray lands in the band.
+
+⛔⛔ **AND IT CANNOT BE MEASURED TODAY.** `probe:gi2-cornell` on the user's
+`Cornel.scene`, **eight alternating boots on a still tree** —
+`src/modules/gi/window/gatherProbes.js` md5 `1f61b28b…` identical before the
+first boot and after the eighth, the scene file untouched since 15:24:
+
+| boot | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| `__gi2CascData = 0` — black px | 691 | 685 | **8566** | **8598** |
+| `__gi2CascData = 1` — black px | 684 | **4643** | 691 | **8598** |
+
+**The scene converges to one of two fixed points — ~688 black or ~8590 — and the
+flag has nothing to do with which.** §AJ's own nine-arm lever sweep read
+621–674 with no collapse in it at all, so the bimodality is NEWER THAN §AJ and it
+is not this unit's: it shows in the OFF arm just as often. §AJ had already named
+the shape of it — *"the converged state is BOOT-DEPENDENT … the chain converges
+to a fixed point that depends on ray arrival order"* — with a spread of 1.05 to
+0.72 in global gain; the collapsed mode reads **0.113×**.
+
+⭐⭐ **SO EVERY SINGLE-BOOT A/B TAKEN ON THIS GATE TODAY IS A STATEMENT ABOUT
+WHICH MODE THE BOOT LANDED IN**, including both of the pairs that looked
+decisive before the distribution was taken:
+
+| pair | reading | what it looked like | what it was |
+|---|---|---|---|
+| 8595 → 872 (C off → on, exit face on) | −90 % black | the fix working | collapsed boot → good boot |
+| 683 → 8597 (C off → on, exit face off) | +12× black | the fix breaking the box | good boot → collapsed boot |
+
+⛔ **BOTH ARE VOID, AND SO IS THE FOUR-ROW BISECT IN AK.3** (703 / 946 / 683 /
+8595): 8595 is the collapsed mode, and 946 with a global gain of 0.566× sits
+much nearer the collapsed family (0.113–0.647×) than the good one (1.07–1.19×).
+`__gi2ExitFace` stays OFF for the reason AK.3 gives — an occlusion-semantics
+change for the whole engine, bought with 3 rays in 10 000 at the lowest tier —
+but the Cornell numbers are NOT what says so, and this ledger must not be read as
+if they were.
+
+▶ **THE FIRST THING THE NEXT UNIT ON THIS PATH OWES IS A SINGLE-VALUED GATE.**
+Until `probe:gi2-cornell` returns the same census twice, no quality unit
+downstream of the resolve can be arbitrated at all — which is §AH.5's
+un-arbitrable runner, one instrument along. The likeliest place to look is what
+changed between §AJ's stable nine and today's bimodal eight: this session's
+worktree carries an in-flight 540/−392-line rewrite of `gatherProbes.js` from
+another agent, and the resolve is where §AJ located the fault in the first place.
+
+⚠ The RIG arm (`RIG=1`, the deterministic generated project) read **20 black of
+21 084** in the one boot taken, median |log ratio| 0.638 — a different and far
+healthier picture than the user's scene, and the arm to build the stable gate on.
+
+### AK.6 — the battery, and what it is worth
+
+| receipt | reading |
+|---|---|
+| `probe:gi2-covleak` (NEW) | shipped **60 / 1 440 000** (phone rotX20/rotXY20 only); `__gi2ExitFace = 1` **0 / 1 440 000** |
+| `probe:gi2-trace` ×3 tiers | PASS — 0 / 10 000, control 100 %; 535 / 1134 / 1040 M rays/s; 3 storage buffers |
+| `probe:gi2-voxelize` ×3 tiers | PASS — 0 / 10 000, 0 occ + 0 pal words differ over every resumption and cell sweep, 0 illegal palette bytes |
+| `test:gi2-window` · `test:gi2-coverage` | PASS 12 643 checks · PASS 27 checks |
+| `probe:gi2-gather` ×3 tiers | Cornell bracketed **8/8 / 8/8 / 8/8**; storage 6 / 6 / 6; chain **1.815 / 2.376 / 3.472** ms (gate 4.0) |
+| `probe:gi2-sky` (Bistro) | dimmed 29.5 %, mean `T` 0.872, sky reach 12.7 → 13.3 %, census identical to §AG.6 |
+| `probe:gi2-ref` A/B (Bistro, `sun dir [-0.07,-0.44,0.90]`) | AK.4's table — `DARK1` ×8.9, pose B mean \|log\| 1.166 → 1.006, gate 0 / 0 |
+| `smoke:gi-gpu` | **PASS 2/2**, `gi2.worldTrace` 6 storage buffers, 197 kB |
+| `probe:gi2-cornell` | **bistable — see AK.5. No arbitration.** |
+
+⚠ **NOT RE-TAKEN THIS SESSION, and named rather than assumed:** `probe:gi2-band`
+(the orphan census), `probe:gi2-doors`, `probe:gi2-corridor`,
+`test:gi-moved-lamp`, and `probe:gi2-motion`'s dolly voxelize chain. The GPU was
+shared with another agent's battery all evening and the three Bistro probes each
+cost a boot; they are the first thing to run on a still tree.
+
+▶ **THE DOLLY VOXELIZE CHAIN (§AI.7's `MAX 3.21` against a 3 ms cap) IS ALREADY
+ATTRIBUTED BY THE LEDGER, and the attribution says NOISE.** §AG.8 measured that
+same chain **on §AG's own commit** — the one that added the 4×4 sample grid — at
+orbit 2.92 / dolly 2.80 / whip 0.20, all PASS. §AI's unit touched `worldProbes`
+and `gatherProbes` and did not go near the voxelizer, so 2.80 → 3.21 happened
+across two batteries with NO change to the pass in between. Three runs of
+`ARMS=dolly npm run probe:gi2-motion` would close it; the argument does not
+depend on them.

@@ -565,6 +565,44 @@ export function createGiGather({
    * pre-boot global, then the build constant.
    */
   const useWorld = worldProbes ?? (globalThis.__gi2WorldProbes ?? WORLD_PROBES) === true;
+  /**
+   * ⭐⭐⭐ §19 STAGE 4.14 (§AL) — THE CACHE IS LIT BY THE PROBES, NOT BY ITSELF.
+   *
+   * §AJ's per-pixel Cornell gate scored 0/5 and `probe:gi2-quadrature` said
+   * why: OFFLINE, a face shaded with the four fixed directions `shadeTerms`
+   * uses, against the TRUE incoming radiance, has σ 17.6 %. On the GPU the same
+   * face reads 51.9 %. The three-fold difference is not the quadrature — it is
+   * that each of those four rays reads a NEIGHBOURING CACHE FACE, which is
+   * itself a four-ray estimate of the same kind. That is a Neumann iteration
+   * over the error as well as over the light: it compounds by ~1/(1−ρ), and
+   * with the user's albedo-1.0 white Cornell walls ρ ≈ 1 and the factor is ≈ 3.
+   * Face writes are rare (n̄ 1.4 samples), so the running mean never gets to
+   * average it away — the blotch IS the cache's memory of one bad draw.
+   *
+   * Lumen's shape is the fix and it is structural, not a tuning: the surface
+   * cache is lit by the RADIANCE CACHE (the world probes), never by itself. So
+   * a face's whole indirect+sky+emitter term becomes ONE SH2 resolve of the
+   * probe field at the face — 64 filtered directions per probe, spatially
+   * interpolated over eight corners, face- and Chebyshev-gated — instead of
+   * four raw cache reads plus four sky rays plus four NEE rays. The loop
+   * probes → faces → probes still exists (it is the multi-bounce), but it now
+   * passes through a SMOOTH, LOW-VARIANCE field, so what compounds is the
+   * light and not the noise.
+   *
+   * ⛔ `__gi2CacheFromProbes = 0` builds the 3.10 body instead — the A/B arm.
+   * It is a BUILD arm and not a uniform on purpose: `probeTrace`/the world
+   * trace is the slowest pipeline of the boot and compiling both bodies would
+   * pay for the retired one in first light, every boot, forever.
+   */
+  const CACHE_FROM_PROBES = useWorld && (globalThis.__gi2CacheFromProbes ?? 1) !== 0;
+  /**
+   * §AL's SECOND arm, measured separately and shipped only if it earns it: a
+   * ceiling on the albedo the BOUNCE term multiplies. The standard energy
+   * safety rule for an iterative gather (`ρ < 1` or the Neumann series does not
+   * converge); the user's Cornell walls are authored at exactly 1.0, which is
+   * the one value at which it does not. 1 = off.
+   */
+  const BOUNCE_ALBEDO_MAX = Number(globalThis.__gi2BounceAlbedoMax ?? 1);
   const T = spec.tile;
   const R = spec.rays;
   const O = spec.oct;
@@ -2290,6 +2328,64 @@ export function createGiGather({
       census.x.assign(float(1).sub(sh));
     });
 
+    // ══ §19 4.14 (§AL) — THE BOUNCE, SKY AND EMITTER TERMS AS **ONE** SH2
+    //    RESOLVE OF THE WORLD PROBES ═════════════════════════════════════════
+    //
+    // ⭐⭐⭐ THE ONE READ THAT REPLACED NINE RAYS AND THE SELF-AMPLIFICATION
+    // WITH THEM. See `CACHE_FROM_PROBES` for the mechanism; this is where it
+    // lands. `worldResolveInto` is `resolveHalf`'s OWN world block — the same
+    // eight corners, the same trilinear × live × wrapped-cosine × FACE ×
+    // CHEBYSHEV weights, the same 4.9 ramp and the same coarsest-preferred
+    // tail — so a cache face and the pixel in front of it are lit by the same
+    // arithmetic reading the same lattice, and a disagreement between them is
+    // a bug rather than a convention.
+    //
+    // ⭐⭐ THE LEAK RULE IS THE SCREEN'S, VERBATIM, AND THAT IS WHY IT IS SAFE.
+    // `p` is `faceSamplePoint`, which already sits ON the voxel's face plane
+    // (cell centre + n·v/2), and the resolve then applies its OWN per-cascade
+    // `biasLen` along `n` exactly as it does at a gbuffer position. A face on
+    // one side of a thin wall therefore samples from the same offset point,
+    // with the same face gate and the same distance-moment test, as the PIXEL
+    // on that face — which is the discipline `probe:gi2-doors`/`corridor`
+    // measure at 0 leaks. Nothing here re-derives a bias in world units.
+    //
+    // ⚠ SKY AND THE EMITTERS COME FROM THE PROBE TOO, AND THEY HAVE TO. The
+    // probe's stored SH is `shPass`'s projection of its traced radiance (which
+    // credits `skyColor` on a miss) PLUS `worldProbes.neePass`'s `emitterSh`
+    // added into the SAME nine words. There is no separable "bounce only"
+    // field to read, so keeping this face's own four sky rays or its own four
+    // NEE rays beside it would count that light TWICE. What survives at the
+    // face is the term the probe does NOT carry: the DIRECT SUN, whose shadow
+    // ray is above and stays exactly as it was.
+    //
+    // Cost: one resolve (~9 SH loads + 8 distance taps per live corner, and the
+    // `w > 1e-5` guard skips the half of the corners below a face's plane)
+    // against 1 sun + 4 sky + 4 NEE = 9 DDA rays. Chain ms is in the receipt.
+    if (CACHE_FROM_PROBES) {
+      const Lp = [];
+      for (let i = 0; i < 9; i++) Lp.push(vec3(0).toVar());
+      const wsumP = float(0).toVar();
+      const admP = float(0).toVar();
+      worldResolveInto(p, n, {
+        Lb: Lp, G: null, wsum: wsumP, admAny: admP, planFull: null, dgs: null, dgFb: null,
+      });
+      // ⚠ THE SAME NORMALISE-THEN-EVALUATE THE RESOLVE DOES, and for the same
+      // reason: SH evaluation is LINEAR in the coefficients, so one `shEval` of
+      // the blended words is the eight-corner blend of eight evaluations, bit
+      // for bit and at an eighth of the cost.
+      If(wsumP.greaterThan(1e-5), () => {
+        const inv = float(1).div(wsumP).toVar();
+        for (let i = 0; i < 9; i++) Lp[i].mulAssign(inv);
+        Ebnc.addAssign(shEval(Lp, n));
+      });
+      // The census columns keep their MEANING: `y` counted sky-miss rays and
+      // there are none, `z` counted informative bounce reads and is now the
+      // resolve's own confidence. A stale column is a blind statistic
+      // [[probe-blind-statistics]], so both are written rather than left.
+      census.y.assign(0);
+      census.z.assign(wsumP);
+    }
+
     // ══ THE SKY, AT THE HIT (§19 Stage 3.7 P.2) ═══════════════════════════
     //
     // ⭐⭐ OUTDOORS THE DOMINANT LIGHT ON A SHADED SURFACE **IS** THE SKY, AND
@@ -2318,7 +2414,7 @@ export function createGiGather({
     // unwritten face returns zero rather than the sky, because "no data" is
     // not "open to the sky" and treating it as such is the leak §L.2's
     // freshness sentinel exists to prevent.
-    if (seedU) If(u.skyAtHit.greaterThan(0.5), () => {
+    if (seedU && !CACHE_FROM_PROBES) If(u.skyAtHit.greaterThan(0.5), () => {
       // A tangent frame from the face normal. Branchless (Duff et al.): the
       // sign trick has no degenerate axis, which a `cross` with a fixed up
       // vector has exactly where a face normal most often points.
@@ -2505,7 +2601,7 @@ export function createGiGather({
     // The cost it gives back is `MAX_EMITTERS` (4) shadow rays per shade
     // instead of one, paid only on the faces the cadence selects — and it is
     // the price of a deterministic lamp colour, which is the whole stage.
-    for (const slot of (emitters ?? [])) {
+    for (const slot of (CACHE_FROM_PROBES ? [] : (emitters ?? []))) {
       const centre = vec3(slot.center).toVar();
       const reff = float(slot.reff).max(1e-3).toVar();
       const rgb = vec3(slot.color).toVar();
@@ -2576,7 +2672,7 @@ export function createGiGather({
     // actually clean: ONE emitter representation per build, whichever one the
     // caller supplied. The Cornell probes pass no `emitters` and get the panel
     // exactly as before, so the 3.3 bracket is untouched.
-    if (!emitters?.length) If(p.y.lessThan(u.panelCentre.y.sub(0.05)), () => {
+    if (!emitters?.length && !CACHE_FROM_PROBES) If(p.y.lessThan(u.panelCentre.y.sub(0.05)), () => {
       // ⚠ MEASURE THE STOP FROM THE ORIGIN THE TRACE WILL ACTUALLY USE.
       // `traceWindow` pushes the origin `biasCells · v_l` along the normal
       // BEFORE it starts, so a `tMax` measured from `p` overshoots by exactly
@@ -2638,7 +2734,13 @@ export function createGiGather({
   const shadeHit = (p, n, levelF, voxF, seedU = null) => {
     const t = shadeTerms(p, n, levelF, voxF, seedU);
     const E = t.Esun.add(t.Emiss).add(t.Ebnc).add(t.Enee).toVar();
-    return t.pal.xyz.mul(1 / Math.PI).mul(E).add(t.palEm);
+    // §19 4.14 (§AL) arm 2 — the bounce-albedo ceiling. `min`, not a scale: it
+    // touches ONLY the surfaces authored at or above the ceiling and is the
+    // identity everywhere else, so a scene with no white-on-white wall in it
+    // cannot measure this arm at all. See `BOUNCE_ALBEDO_MAX`.
+    const alb = BOUNCE_ALBEDO_MAX < 1
+      ? t.pal.xyz.min(vec3(BOUNCE_ALBEDO_MAX)) : t.pal.xyz;
+    return alb.mul(1 / Math.PI).mul(E).add(t.palEm);
   };
 
   // ══════════════════════════ §19 STAGE 3.13 — WHAT A RAY BRINGS BACK ════════
@@ -3772,6 +3874,435 @@ export function createGiGather({
   // is retired is the diffuse sum. Both arms are still built — `passes.resolve`
   // ships the SH one, `passes.resolveOct` is the measurement arm the receipts
   // A/B against, byte-identical in everything but the integrator.
+  /**
+   * ⭐⭐⭐ §19 STAGE 4.14 (§AL) — THE WORLD PROBES' IRRADIANCE AT A POINT, AS A
+   * FUNCTION. One implementation, TWO consumers: the pixel and the CACHE FACE.
+   *
+   * Every line below is `resolveHalf`'s world block, moved and not rewritten —
+   * the cascade loop, the eight corners, trilinear × live × wrapped-cosine ×
+   * face × Chebyshev, the 4.9 ramp, the coarsest-preferred tail. §AJ's finding
+   * is that a cache face was lit by FOUR RAW CACHE FACES (a Neumann iteration
+   * on a 4-ray estimate, compounding ~1/(1−ρ) — ×3 at the user's albedo 1.0
+   * walls, and the 51.9 % the GPU reads against 17.6 % offline). Lumen's answer
+   * is that the surface cache is lit by the RADIANCE CACHE, never by itself, so
+   * the face's bounce term is this — a 64-direction, spatially filtered,
+   * SH2-projected field, whose variance is a hundredth of a 4-ray draw's.
+   *
+   * ⚠ A COPY WOULD HAVE BEEN THE BUG. `shadeTerms`' own header says it: a second
+   * transcription is a second place for the bias, the band, the ramp and the
+   * tail to drift, and a cache lit by a DRIFTED resolve is a cache the screen
+   * disagrees with everywhere. So the block is CALLED, and `makeResolve` calls
+   * the same one.
+   *
+   * ⚠ AND IT IS LAZY, WHICH IS WHY IT CAN BE. `world` is a `const` ~1000 lines
+   * BELOW `shadeTerms`, and `createWorldProbes` builds its trace kernel — the
+   * kernel that inlines `shadeHit` — from inside its own initializer. That is a
+   * temporal dead zone only if the kernel body runs EAGERLY, and measured, a
+   * TSL `Fn(cb)()` does not run `cb` at all until the shader is BUILT: by then
+   * `world` is assigned. (worldProbes.js's own note claims otherwise; it is
+   * about a `const` read at module-evaluation time, not inside an `Fn`.)
+   *
+   * @param P   the world point (the resolve applies its own per-cascade bias)
+   * @param Nn  the receiver normal
+   * @param acc `{ Lb[9], G, wsum, admAny, planFull, dgs, dgFb }` — the caller's
+   *   accumulators. `planFull` null skips the GLOSSY tap entirely, which is what
+   *   a cache face wants: it has no view vector and no specular lobe.
+   */
+  function worldResolveInto(P, Nn, acc) {
+    const { Lb, G, wsum, admAny, planFull } = acc;
+    const dgs = acc.dgs ?? null;
+    const dgFb = acc.dgFb ?? null;
+    const DIAG = !!dgs;
+    // == §19 STAGE 3.14 -- THE CASCADES, FINEST FIRST =====================
+    //
+    // Per cascade, the EIGHT lattice probes around the pixel, weighted
+    // trilinear x wrapped cosine x face x visibility — DDGI's weight set
+    // with §U's face term added, each of the four doing a different job:
+    //
+    //   TRILINEAR   the interpolation itself, and the reason camera motion
+    //               is smooth: the probes do not move, only these weights.
+    //   WRAPPED     `((n.d)/2 + 1/2)^2` on the direction to the probe. A
+    //   COSINE      probe behind the shading plane contributes nothing,
+    //               which removes the "the lit room's probe lights the dark
+    //               side's wall" case without tracing anything.
+    //   FACE        the probe's own assignment. A probe that had to be
+    //               pushed out of geometry REPRESENTS one side of that
+    //               geometry, and a pixel looking the other way must not
+    //               read it.
+    //   VISIBILITY  the probe's own hit-distance moments (`octTapVisAt`).
+    //               The only one of the four that can refuse a probe whose
+    //               normal agrees but whose LINE OF SIGHT is blocked -- a
+    //               floor pixel beside a partition, which is the interior
+    //               leak this stage is gated on.
+    //
+    // ⭐⭐ AND THEN THE CASCADES COMPOSITE, WHICH IS THE WHOLE OF 3.14.
+    //
+    // A cascade answers a pixel with a CONFIDENCE — `Σ tri·live·vis`, which
+    // is 1 when all eight of its corners exist and can see the point and
+    // falls smoothly to 0 as they stop existing — times its hand-off BAND
+    // (`bandAt`: 1 inside the inner 90 %, ramping to 0 at the outer face).
+    // The cascades are then alpha-composited finest first: cascade 0 spends
+    // what confidence it has, cascade 1 spends what is left, cascade 2
+    // (which CLAMPS to its own boundary, so it always answers) takes the
+    // remainder. Nothing chooses a cascade; the weights choose, and they
+    // are continuous in the pixel's position — which is why a camera
+    // walking out of the 16 m cube produces no edge, and why "the finest
+    // cascade whose corners are all admissible wins" is a description of
+    // the arithmetic rather than a branch in it.
+    //
+    // ⚠ THE SAMPLE POINT IS BIASED ALONG THE NORMAL, PER CASCADE. Without
+    // the bias a pixel's own surface occludes it from every probe above it
+    // and the visibility term reads ~0 everywhere; the bias is a fraction
+    // of the SAMPLED cascade's spacing, so it is 15 cm against 0.5 m probes
+    // and 2.4 m against 8 m ones — the scene's own length at each scale.
+    //
+    // ⚠ ONE `Loop`, NOT `NC` COPIES. See `cascConst` in `worldProbes.js`:
+    // three copies of this block is three copies of the largest expression
+    // in `resolveHalf`, and its size is paid at boot in pipeline compile,
+    // in front of the first-light number this stage is gated on.
+    const NCASC = world.taps.cascades;
+    /**
+     * The last cascade this pixel may reach. `wpCascadesOn = 0` pins it to
+     * cascade 0, which — because the last cascade is the one that CLAMPS —
+     * is 3.13's single lattice with its boundary extrapolation, exactly.
+     * The arm that says the cascades fixed the horizon, out of one binary.
+     */
+    const lastC = select(u.wpCascadesOn.greaterThan(0.5), uint(NCASC - 1), uint(0)).toVar();
+    /** How much of this pixel's irradiance is still unclaimed. */
+    const rem = float(1).toVar();
+    /**
+     * ⭐⭐⭐ §19 4.9 — THE TAIL: WHAT PAYS FOR WHAT NOBODY COULD SEE.
+     *
+     * Every cascade now spends only the share of its claim its VISIBLE,
+     * face-admissible corners actually carried (see the composite), and the
+     * rest stays in `rem` and falls down the chain. What survives the last
+     * cascade has to land somewhere, and §L.5's rule is that it may not
+     * land on black: a pixel in a pocket smaller than the lattice — a 3 cm
+     * cable, a pot rim, the recess `probe:gi2-ref` found reading EXACTLY
+     * zero against a truth of 0.111 — has no visible probe anywhere, and
+     * zero is a claim of certainty the resolve does not have.
+     *
+     * So the tail is the CASCADES' OWN ANSWERS, `Σ_c Lc_c / pref_c` over
+     * `Σ_c wsumC_c / pref_c` — the COARSEST preferred by exactly the ratio
+     * 4.8's fallback used to prefer the FINEST. Coarsest, because the
+     * tail's whole job is to be smoother than the thing that could not
+     * answer: an 8 m lattice's blend cannot vary at the pixel scale
+     * whatever its weights do, while a nearest-probe pick varies at
+     * nothing else. A peaked fallback hands the pixel back the same
+     * speckle under another name.
+     *
+     * ⚠ AND IT IS CHEBYSHEV-GATED, WHICH IS WHY IT DOES NOT LEAK. `Lc`
+     * and `wsumC` are the visibility-weighted sums, so the tail reads the
+     * same probes the cascade did and refuses the same ones. [[§V.1]] —
+     * folding visibility OUT of a hand-off is what took the thin-wall
+     * interior from 0.03 % to 0.56 %, and this hand-off does not.
+     *
+     * ⭐ THE `1e-4` FLOOR IS THE POCKET, AND IT IS THE ONLY TERM THAT MAY
+     * READ AN OCCLUDED PROBE. Where NOTHING is visible at any cascade —
+     * the 3 cm cable, the pot rim, the recess `probe:gi2-ref` caught
+     * reading EXACTLY zero against a truth of 0.111 — every `wsumC` is
+     * ~1e-6 and the ratio above is 0/0. `mW = Σ tri·live·(wf + 1e-4)`, the
+     * region's own face-admissible mean (DC only; a mean has no direction
+     * worth carrying), enters at a ten-thousandth so it is invisible
+     * wherever anything at all can be seen and is the whole answer where
+     * nothing can. Black is not an answer; it is the absence of one.
+     */
+    const tW = float(0).toVar();
+    const tL = [];
+    for (let i = 0; i < 9; i++) tL.push(vec3(0).toVar());
+    const tG = planFull ? vec3(0).toVar() : null;
+    Loop({ start: 0, end: NCASC, name: "wpCasc" }, ({ wpCasc }) => {
+      const cc = uint(wpCasc).toVar();
+      If(cc.greaterThan(lastC).or(rem.lessThan(1e-3)), () => { Break(); });
+      const isLast = cc.greaterThanEqual(lastC).toVar();
+      const K = world.taps.cascConst(cc);
+      // ⭐⭐ THE BIAS IS THE FINEST CASCADE'S SPACING ON EVERY CASCADE, AND
+      // THE FAR-FIELD RECEIPT IS WHAT SAYS SO.
+      //
+      // The first cut scaled it by the SAMPLED cascade's spacing, on the
+      // reading that every length in this file should be a fraction of what
+      // the lattice measures. But what this bias has to clear is the
+      // PIXEL'S OWN SURFACE — a fact about the geometry, not about the
+      // cascade sampling it — and at c1 that made it 60 cm, at c2 2.4 m. A
+      // façade sampled 60 cm out into an open street sees far less of its
+      // own occlusion, and the street-overview receipt measured the result:
+      // far façades 1.67× the screen path's irradiance.
+      //
+      // ⭐⭐ §19 3.15 — AND NOW IT IS A UNIFORM, WHICH IS THE TELL. `K.biasLen`
+      // is `wpBias · mix(s_0, s_c, wpBiasPerCasc)`, so both readings are one
+      // boot apart instead of one build apart. Under the interval merge the
+      // doors receipt reads CASCADE 0 (its pixels are inside c0's 16 m
+      // extent), where `s_0` and `s_c` are the same 15 cm — so flipping this
+      // must NOT move the thin-feature ratio. If it does, the resolve is
+      // still reading a coarse cascade for a near recess and the merge is
+      // not doing what this stage claims. See `wpBiasPerCasc`.
+      const Pb = P.add(Nn.mul(K.biasLen)).toVar();
+      const fr = world.taps.cellFrameAt(Pb, K.sp);
+      // 1 in the inner 90 % of this cascade; the LAST cascade has nothing
+      // coarser to hand to, so it takes the whole remainder.
+      const band = select(isLast, float(1), world.taps.bandAt(fr.g, K.org)).toVar();
+
+      const Lc = [];
+      for (let i = 0; i < 9; i++) Lc.push(vec3(0).toVar());
+      const Gc = planFull ? vec3(0).toVar() : null;
+      const wsumC = float(0).toVar();
+      /**
+       * ⭐⭐ COVERAGE IS NOT WEIGHT, AND IT IS NOT VISIBILITY EITHER — the
+       * 5 cm partition measured it.
+       *
+       * The first cut made a cascade's authority `Σ tri·live·vis`, on the
+       * reading that a cascade which cannot SEE the point cannot answer for
+       * it. That is exactly backwards: a probe that exists here and is
+       * occluded from the pixel IS the answer — "no light arrives from
+       * there" — and folding its refusal into the hand-off invited the 2 m
+       * cascade, whose probes straddle a 5 cm wall, to answer instead. The
+       * thin-wall interior receipt went 0.03 % → 0.56 % on that one term.
+       *
+       * So `cov` asks only "does a live lattice exist around this point",
+       * which is the one question the hand-off is about; `faceCov` asks
+       * "does any of it REPRESENT this surface", which is what the
+       * two-tier fallback is about; and `vis` shapes the radiance and
+       * nothing else.
+       */
+      const cov = float(0).toVar();
+      const faceCov = float(0).toVar();
+      /**
+       * ⭐⭐ §19 4.9 — WHAT THE CASCADE *COULD* HAVE CARRIED, so that what it
+       * DID carry is a fraction of something and not a bare magnitude.
+       *
+       * `Σ tri·live·wc0²`: the weight these eight corners would sum to if
+       * every one of them were visible and admissible. `wsumC / wcosC` is
+       * then "how much of this cascade can actually see the point", on a
+       * fixed 0..1 scale — the input to the composite's ramp, and the only
+       * form of the question that means the same thing at a lattice edge
+       * (where `cov` is small) as in the middle of one.
+       *
+       * The wrapped cosine sits in BOTH sums because it SHAPES rather than
+       * rejects: it is ~0.6 even for a perfect corner, so leaving it out of
+       * the denominator would read every healthy pixel as half-blind.
+       */
+      const wcosC = float(0).toVar();
+      /** This cascade's own regional mean — the tail's input. See `tW`. */
+      const mW = float(0).toVar();
+      const mL0 = vec3(0).toVar();
+      const mG = planFull ? vec3(0).toVar() : null;
+      // §19 3.18's classifier inputs, accumulated beside `cov` so they are
+      // the SAME sums the composite is made of and not a re-derivation.
+      const freshCov = DIAG ? float(0).toVar() : null;
+      const visCov = DIAG ? float(0).toVar() : null;
+
+      for (let c8 = 0; c8 < 8; c8++) {
+        const cdx = c8 & 1;
+        const cdy = (c8 >> 1) & 1;
+        const cdz = (c8 >> 2) & 1;
+        const rx = fr.base.x.add(cdx).toVar();
+        const ry = fr.base.y.add(cdy).toVar();
+        const rz = fr.base.z.add(cdz).toVar();
+        // ⭐ THE CLAMP IS THE LAST CASCADE'S ALONE NOW. On a finer cascade
+        // a corner outside the lattice is simply ABSENT — its weight is
+        // zero and the pixel's confidence falls, which is what hands it to
+        // the next cascade. 3.13 clamped on the only lattice it had and
+        // extrapolated the near room's ambient onto far façades; that is
+        // the 64.5 % thin-feature reading this stage exists to beat.
+        const inLat = world.taps.inLatticeAt(K.org, rx, ry, rz);
+        const [cwx, cwy, cwz] = world.taps.clampAt(K.org, rx, ry, rz);
+        const wcx = select(isLast, cwx, rx).toVar();
+        const wcy = select(isLast, cwy, ry).toVar();
+        const wcz = select(isLast, cwz, rz).toVar();
+        const inside = select(isLast, float(1), select(inLat, float(1), float(0))).toVar();
+        const cell = world.taps.cellAtG(K.base, wcx, wcy, wcz).toVar();
+        const i0 = world.taps.infoAt(cell, 0).toVar();
+        // §19 3.15: `ready` is three-valued — 0 re-keyed, 0.5 SEEDED from
+        // the cascade above, 1 traced. A seeded probe carries a real merged
+        // field (its parent's) and its absence is what §V.6 measured as the
+        // scroll's motion cost, so the test is `> 0.25`, not `> 0.5`.
+        // `ready` is read ONCE into a var: §19 3.18's classifier needs the
+        // three-valued number itself (0 re-keyed / 0.5 seeded / 1 traced),
+        // not only the predicate the composite tests.
+        const rdy = world.taps.infoAt(cell, 2).w.toVar();
+        const alive = i0.w.greaterThan(0.5).and(rdy.greaterThan(0.25)).toVar();
+        const tri = (cdx ? fr.frac.x : float(1).sub(fr.frac.x))
+          .mul(cdy ? fr.frac.y : float(1).sub(fr.frac.y))
+          .mul(cdz ? fr.frac.z : float(1).sub(fr.frac.z)).toVar();
+        const toP = i0.xyz.sub(Pb).toVar();
+        const dist = toP.length().max(1e-4).toVar();
+        const dirP = toP.div(dist).toVar();
+        const wc0 = dot(Nn, dirP).mul(0.5).add(0.5).toVar();
+        const faceN = world.taps.infoAt(cell, 1).xyz.toVar();
+        const wf = mix(float(1),
+          select(i0.w.greaterThan(1.5), dot(Nn, faceN).max(0), float(1)),
+          u.wpFaceOn.clamp(0, 1)).toVar();
+        const live = select(alive, float(1), float(0)).mul(inside).toVar();
+        const vis = world.taps.octTapVisAt(
+          octPlan(dirP.negate(), O), cell, dist, K.dmax, K.sp,
+        ).toVar();
+        /** The shaping-only weight — the composite's denominator. */
+        const wCos = tri.mul(live).mul(wc0.mul(wc0)).toVar();
+        const w = wCos.mul(wf).mul(vis).toVar();
+        // ⭐ COVERAGE IS NOT THE WEIGHT. `w` carries the wrapped cosine and
+        // the face term, which SHAPE a probe's contribution and are ~0.6
+        // even for a perfect corner; dividing the hand-off by that would
+        // send every pixel to the coarse cascade. `cov` sums to exactly 1
+        // when all eight corners are real, and to 0 past the lattice's
+        // edge — which is the hand-off, and the whole hand-off.
+        cov.addAssign(tri.mul(live));
+        faceCov.addAssign(tri.mul(live).mul(wf));
+        wcosC.addAssign(wCos);
+        if (DIAG) {
+          freshCov.addAssign(tri.mul(live)
+            .mul(select(rdy.lessThan(0.75), float(1), float(0))));
+          visCov.addAssign(tri.mul(live).mul(vis));
+        }
+        // The tail's input: face-admissible, NOT Chebyshev-gated, DC only.
+        const mw = tri.mul(live).mul(wf.add(1e-4)).toVar();
+        mW.addAssign(mw);
+        // ⚠ `wsumC` IS SUMMED OUTSIDE THE BRANCH, and that is not tidiness.
+        // It is `visFrac`'s numerator, and the whole point of 4.9 is that
+        // the ramp sees the small values 4.8's `select(wsumC > 1e-5, …, 0)`
+        // rounded to nothing.
+        wsumC.addAssign(w);
+        // ⭐⭐⭐ THE ARGMAX'S READ SITE IS GONE; THE BLEND'S GUARD STAYS —
+        // AND THE DIFFERENCE BETWEEN THOSE TWO THRESHOLDS IS THE WHOLE
+        // POINT OF THIS STAGE.
+        //
+        // `If(cand > bestW)` was a SWITCH: crossing it changed which probe
+        // the pixel read, at full weight, with no continuity anywhere. `w >
+        // 1e-5` is a CUT-OFF: below it a corner's contribution to the blend
+        // is at most 1e-5 of it, so skipping the read moves the answer by
+        // less than the format can hold. One is a cliff, the other is
+        // arithmetic — and a first cut of 4.9 removed both, on the reading
+        // that "no thresholds" is a principle rather than a measurement.
+        // ⛔ `probe:gi2-runner` priced it: 16.4 → 19.3 ms per frame on
+        // Bistro, `probe:gi2-motion` orbit MAX 29 → 160 ms. For a ground
+        // pixel the four corners BELOW its plane have `wc0² ≈ 0`, and this
+        // guard is what stops the resolve reading nine SH words and an oct
+        // tap for each of them. [[feedback-gi-60fps-floor]]
+        //
+        // The `Else` keeps the pocket case alive at one read instead of
+        // ten: where every corner is refused, the tail's regional mean is
+        // the only answer there is, and it needs the DC word.
+        If(w.greaterThan(1e-5), () => {
+          const sh0 = world.taps.shAt(cell, 0).xyz.toVar();
+          const radv = planFull ? world.taps.octTapRad(planFull, cell).toVar() : null;
+          Lc[0].addAssign(sh0.mul(w));
+          for (let i = 1; i < 9; i++) Lc[i].addAssign(world.taps.shAt(cell, i).xyz.mul(w));
+          if (planFull) Gc.addAssign(radv.mul(w));
+          mL0.addAssign(sh0.mul(mw));
+          if (planFull) mG.addAssign(radv.mul(mw));
+        }).Else(() => {
+          mL0.addAssign(world.taps.shAt(cell, 0).xyz.mul(mw));
+        });
+      }
+      // ── the composite ────────────────────────────────────────────────
+      //
+      // ⭐⭐⭐ §19 4.9 — A CASCADE THAT CANNOT SEE THE POINT HANDS ON, AND IT
+      // HANDS ON SMOOTHLY.
+      //
+      // 4.8 spent the whole claim whichever way the weights fell, on the
+      // reading that `wsumC = 0` with `cov = 1` is the dark side of a wall
+      // and the right answer there is DARK. That reading survives — the
+      // deficit never becomes brightness, and a cascade that hands on hands
+      // to one whose OWN visibility test it must pass in turn, so nothing
+      // is ever given a free pass around Chebyshev [[§V.1]]. What 4.8 got
+      // wrong is the EDGE: `select(wsumC > 1e-5, …, 0)` is a switch, and a
+      // pixel one ulp on the wrong side of it was multiplied by zero.
+      //
+      // ⚠ THE COVERAGE GATE IS LEFT EXACTLY AS 3.15 SHIPPED IT. A first cut
+      // of 4.9 made it a `smoothstep` over the same edge for the smoother
+      // derivative, and that is a REAL energy change at every lattice edge
+      // (`cov = 0.25` claims 0.16 instead of 0.5) for a discontinuity that
+      // was never there — `clamp` is already continuous, and no receipt
+      // implicates its kink. Only the terms that actually SWITCH are
+      // touched by this stage.
+      const claim = cov.div(u.wpCovFull.max(1e-3)).clamp(0, 1).mul(band).mul(rem).toVar();
+      /**
+       * ⭐⭐⭐ THE RAMP THAT REPLACED THE SWITCH.
+       *
+       * `visFrac` is the share of this cascade's OWN admissible weight that
+       * survived Chebyshev — 1 where every corner can see the point, 0 in a
+       * pocket. 4.8 turned that into a step twice over: `select(wsumC >
+       * 1e-5, claim/wsumC, 0)` multiplied the pixel by ZERO one ulp below
+       * the gate (`probe:gi2-ref`'s eight exact zeros, with a live probe
+       * 0.5 m away holding 0.111), and the `admAny < 1e-3` fallback then
+       * swapped in one argmax corner's raw SH. Both are one `smoothstep`
+       * now, over the same edge the coverage gate uses.
+       *
+       * ⭐⭐⭐ ⚠ AND IT SATURATES AT `VIS_RAMP`, WHICH IS 5 % AND NOT 50 %.
+       * MEASURED, NOT CHOSEN.
+       *
+       * `VIS_RAMP` is the width of the region 4.8's `1e-5` switch lived in,
+       * three orders of magnitude wider so that it RAMPS instead of
+       * switching — and not one bit wider than that. Above it a cascade
+       * spends its whole claim exactly as 4.8 did, so §V.1's rule survives
+       * verbatim ("`wsumC` small with `cov` 1 is the dark side of a wall,
+       * and DARK is the answer"), the `rem < 1e-3` break still fires on the
+       * first cascade for almost every pixel rather than running all three,
+       * and no pixel that was not AT the cliff moves at all.
+       *
+       * ⛔ THE PROPORTIONAL VERSION WAS WRITTEN FIRST AND `probe:gi2-ref`
+       * REFUTED IT. Spending `visFrac` of the claim and deferring the rest
+       * reads well — "a cascade spends what it could see" — but a typical
+       * Bistro pixel measures `visFrac` ≈ 0.5, so it handed HALF of every
+       * pixel down to the 2 m and 8 m lattices: pose A's median |ratio−1|
+       * went 0.863 → 1.000 and pose B's 0.461 → 0.662 against the path
+       * tracer, over-bright in exactly the shadowed places (FAC2 23×,
+       * SOFF2 6.9×, PAVE1 3.9×) — which is §V.1's leak, re-derived from
+       * first principles and measured within the hour. A hand-off may be
+       * made CONTINUOUS; it may not be made PROPORTIONAL.
+       */
+      const VIS_RAMP = 0.05;
+      const visFrac = wsumC.div(wcosC.max(1e-5)).toVar();
+      const ansC = smoothstep(float(0), float(VIS_RAMP), visFrac).toVar();
+      const spend = claim.mul(ansC).toVar();
+      const k = spend.div(wsumC.max(1e-9)).toVar();
+      for (let i = 0; i < 9; i++) Lb[i].addAssign(Lc[i].mul(k));
+      if (planFull) G.addAssign(Gc.mul(k));
+      wsum.addAssign(spend);
+      rem.subAssign(spend);
+      // The tail's accumulation, COARSEST-preferred — `1/pref` is exactly
+      // the inverse of the finest-first ratio 4.8's fallback used, and it
+      // is a weighted mean rather than a choice, so it is continuous in the
+      // pixel's position like everything else here. See `tW`.
+      const tw = float(1).div(K.pref).toVar();
+      const tmw = tw.mul(1e-4).toVar();
+      tW.addAssign(wsumC.mul(tw).add(mW.mul(tmw)));
+      tL[0].addAssign(Lc[0].mul(tw).add(mL0.mul(tmw)));
+      for (let i = 1; i < 9; i++) tL[i].addAssign(Lc[i].mul(tw));
+      if (planFull) tG.addAssign(Gc.mul(tw).add(mG.mul(tmw)));
+      if (DIAG) {
+        const row = vec4(cov, freshCov, claim, visCov.div(cov.max(1e-4))).toVar();
+        for (let c = 0; c < dgs.length; c++) {
+          If(cc.equal(uint(c)), () => { dgs[c].assign(row); });
+        }
+      }
+      admAny.assign(max(admAny, faceCov));
+    });
+    // ── ⭐⭐⭐ THE TAIL ───────────────────────────────────────────────────
+    //
+    // Whatever no cascade could see is paid here, at the region's own mean
+    // (see `tW`). This is §L.5's "never a black pixel" and §19 3.14's
+    // two-tier fallback, as ONE weighted mean instead of a threshold over
+    // an argmax — so it is continuous in the pixel's position, and the
+    // pixel next to it reads a value 8 cm away rather than a different
+    // probe entirely.
+    //
+    // ⭐⭐ AND IT IS WHAT MAKES THE CLAIM CONSERVE. `wsum` is now exactly
+    // `Σ spend + rem`, which is 1 for every pixel any cascade covered — the
+    // `csum` column of `diagBuf`'s fallback row, and a lit pixel below 0.99
+    // there is a bug rather than a taste. A pixel NO cascade covered has no
+    // tail to pay it, keeps `wsum = 0`, and stays black on purpose.
+    const hasT = select(tW.greaterThan(1e-12), float(1), float(0)).toVar();
+    const tailK = rem.mul(hasT).div(tW.max(1e-12)).toVar();
+    for (let i = 0; i < 9; i++) Lb[i].addAssign(tL[i].mul(tailK));
+    if (planFull) G.addAssign(tG.mul(tailK));
+    wsum.addAssign(rem.mul(hasT));
+    if (DIAG) {
+      dgFb.x.assign(admAny);
+      dgFb.y.assign(rem.mul(hasT));
+      dgFb.z.assign(wsum);
+    }
+  }
+
   const makeResolve = (useSh, half = false, rawSh = false, worldTap = false) => Fn(() => {
     const gxu = globalId.x.toVar();
     const gyu = globalId.y.toVar();
@@ -3858,394 +4389,7 @@ export function createGiGather({
        */
       const admAny = worldTap ? float(0).toVar() : null;
       if (worldTap) {
-        // == §19 STAGE 3.14 -- THE CASCADES, FINEST FIRST =====================
-        //
-        // Per cascade, the EIGHT lattice probes around the pixel, weighted
-        // trilinear x wrapped cosine x face x visibility — DDGI's weight set
-        // with §U's face term added, each of the four doing a different job:
-        //
-        //   TRILINEAR   the interpolation itself, and the reason camera motion
-        //               is smooth: the probes do not move, only these weights.
-        //   WRAPPED     `((n.d)/2 + 1/2)^2` on the direction to the probe. A
-        //   COSINE      probe behind the shading plane contributes nothing,
-        //               which removes the "the lit room's probe lights the dark
-        //               side's wall" case without tracing anything.
-        //   FACE        the probe's own assignment. A probe that had to be
-        //               pushed out of geometry REPRESENTS one side of that
-        //               geometry, and a pixel looking the other way must not
-        //               read it.
-        //   VISIBILITY  the probe's own hit-distance moments (`octTapVisAt`).
-        //               The only one of the four that can refuse a probe whose
-        //               normal agrees but whose LINE OF SIGHT is blocked -- a
-        //               floor pixel beside a partition, which is the interior
-        //               leak this stage is gated on.
-        //
-        // ⭐⭐ AND THEN THE CASCADES COMPOSITE, WHICH IS THE WHOLE OF 3.14.
-        //
-        // A cascade answers a pixel with a CONFIDENCE — `Σ tri·live·vis`, which
-        // is 1 when all eight of its corners exist and can see the point and
-        // falls smoothly to 0 as they stop existing — times its hand-off BAND
-        // (`bandAt`: 1 inside the inner 90 %, ramping to 0 at the outer face).
-        // The cascades are then alpha-composited finest first: cascade 0 spends
-        // what confidence it has, cascade 1 spends what is left, cascade 2
-        // (which CLAMPS to its own boundary, so it always answers) takes the
-        // remainder. Nothing chooses a cascade; the weights choose, and they
-        // are continuous in the pixel's position — which is why a camera
-        // walking out of the 16 m cube produces no edge, and why "the finest
-        // cascade whose corners are all admissible wins" is a description of
-        // the arithmetic rather than a branch in it.
-        //
-        // ⚠ THE SAMPLE POINT IS BIASED ALONG THE NORMAL, PER CASCADE. Without
-        // the bias a pixel's own surface occludes it from every probe above it
-        // and the visibility term reads ~0 everywhere; the bias is a fraction
-        // of the SAMPLED cascade's spacing, so it is 15 cm against 0.5 m probes
-        // and 2.4 m against 8 m ones — the scene's own length at each scale.
-        //
-        // ⚠ ONE `Loop`, NOT `NC` COPIES. See `cascConst` in `worldProbes.js`:
-        // three copies of this block is three copies of the largest expression
-        // in `resolveHalf`, and its size is paid at boot in pipeline compile,
-        // in front of the first-light number this stage is gated on.
-        const NCASC = world.taps.cascades;
-        /**
-         * The last cascade this pixel may reach. `wpCascadesOn = 0` pins it to
-         * cascade 0, which — because the last cascade is the one that CLAMPS —
-         * is 3.13's single lattice with its boundary extrapolation, exactly.
-         * The arm that says the cascades fixed the horizon, out of one binary.
-         */
-        const lastC = select(u.wpCascadesOn.greaterThan(0.5), uint(NCASC - 1), uint(0)).toVar();
-        /** How much of this pixel's irradiance is still unclaimed. */
-        const rem = float(1).toVar();
-        /**
-         * ⭐⭐⭐ §19 4.9 — THE TAIL: WHAT PAYS FOR WHAT NOBODY COULD SEE.
-         *
-         * Every cascade now spends only the share of its claim its VISIBLE,
-         * face-admissible corners actually carried (see the composite), and the
-         * rest stays in `rem` and falls down the chain. What survives the last
-         * cascade has to land somewhere, and §L.5's rule is that it may not
-         * land on black: a pixel in a pocket smaller than the lattice — a 3 cm
-         * cable, a pot rim, the recess `probe:gi2-ref` found reading EXACTLY
-         * zero against a truth of 0.111 — has no visible probe anywhere, and
-         * zero is a claim of certainty the resolve does not have.
-         *
-         * So the tail is the CASCADES' OWN ANSWERS, `Σ_c Lc_c / pref_c` over
-         * `Σ_c wsumC_c / pref_c` — the COARSEST preferred by exactly the ratio
-         * 4.8's fallback used to prefer the FINEST. Coarsest, because the
-         * tail's whole job is to be smoother than the thing that could not
-         * answer: an 8 m lattice's blend cannot vary at the pixel scale
-         * whatever its weights do, while a nearest-probe pick varies at
-         * nothing else. A peaked fallback hands the pixel back the same
-         * speckle under another name.
-         *
-         * ⚠ AND IT IS CHEBYSHEV-GATED, WHICH IS WHY IT DOES NOT LEAK. `Lc`
-         * and `wsumC` are the visibility-weighted sums, so the tail reads the
-         * same probes the cascade did and refuses the same ones. [[§V.1]] —
-         * folding visibility OUT of a hand-off is what took the thin-wall
-         * interior from 0.03 % to 0.56 %, and this hand-off does not.
-         *
-         * ⭐ THE `1e-4` FLOOR IS THE POCKET, AND IT IS THE ONLY TERM THAT MAY
-         * READ AN OCCLUDED PROBE. Where NOTHING is visible at any cascade —
-         * the 3 cm cable, the pot rim, the recess `probe:gi2-ref` caught
-         * reading EXACTLY zero against a truth of 0.111 — every `wsumC` is
-         * ~1e-6 and the ratio above is 0/0. `mW = Σ tri·live·(wf + 1e-4)`, the
-         * region's own face-admissible mean (DC only; a mean has no direction
-         * worth carrying), enters at a ten-thousandth so it is invisible
-         * wherever anything at all can be seen and is the whole answer where
-         * nothing can. Black is not an answer; it is the absence of one.
-         */
-        const tW = float(0).toVar();
-        const tL = [];
-        for (let i = 0; i < 9; i++) tL.push(vec3(0).toVar());
-        const tG = vec3(0).toVar();
-        Loop({ start: 0, end: NCASC, name: "wpCasc" }, ({ wpCasc }) => {
-          const cc = uint(wpCasc).toVar();
-          If(cc.greaterThan(lastC).or(rem.lessThan(1e-3)), () => { Break(); });
-          const isLast = cc.greaterThanEqual(lastC).toVar();
-          const K = world.taps.cascConst(cc);
-          // ⭐⭐ THE BIAS IS THE FINEST CASCADE'S SPACING ON EVERY CASCADE, AND
-          // THE FAR-FIELD RECEIPT IS WHAT SAYS SO.
-          //
-          // The first cut scaled it by the SAMPLED cascade's spacing, on the
-          // reading that every length in this file should be a fraction of what
-          // the lattice measures. But what this bias has to clear is the
-          // PIXEL'S OWN SURFACE — a fact about the geometry, not about the
-          // cascade sampling it — and at c1 that made it 60 cm, at c2 2.4 m. A
-          // façade sampled 60 cm out into an open street sees far less of its
-          // own occlusion, and the street-overview receipt measured the result:
-          // far façades 1.67× the screen path's irradiance.
-          //
-          // ⭐⭐ §19 3.15 — AND NOW IT IS A UNIFORM, WHICH IS THE TELL. `K.biasLen`
-          // is `wpBias · mix(s_0, s_c, wpBiasPerCasc)`, so both readings are one
-          // boot apart instead of one build apart. Under the interval merge the
-          // doors receipt reads CASCADE 0 (its pixels are inside c0's 16 m
-          // extent), where `s_0` and `s_c` are the same 15 cm — so flipping this
-          // must NOT move the thin-feature ratio. If it does, the resolve is
-          // still reading a coarse cascade for a near recess and the merge is
-          // not doing what this stage claims. See `wpBiasPerCasc`.
-          const Pb = P.add(Nn.mul(K.biasLen)).toVar();
-          const fr = world.taps.cellFrameAt(Pb, K.sp);
-          // 1 in the inner 90 % of this cascade; the LAST cascade has nothing
-          // coarser to hand to, so it takes the whole remainder.
-          const band = select(isLast, float(1), world.taps.bandAt(fr.g, K.org)).toVar();
-
-          const Lc = [];
-          for (let i = 0; i < 9; i++) Lc.push(vec3(0).toVar());
-          const Gc = vec3(0).toVar();
-          const wsumC = float(0).toVar();
-          /**
-           * ⭐⭐ COVERAGE IS NOT WEIGHT, AND IT IS NOT VISIBILITY EITHER — the
-           * 5 cm partition measured it.
-           *
-           * The first cut made a cascade's authority `Σ tri·live·vis`, on the
-           * reading that a cascade which cannot SEE the point cannot answer for
-           * it. That is exactly backwards: a probe that exists here and is
-           * occluded from the pixel IS the answer — "no light arrives from
-           * there" — and folding its refusal into the hand-off invited the 2 m
-           * cascade, whose probes straddle a 5 cm wall, to answer instead. The
-           * thin-wall interior receipt went 0.03 % → 0.56 % on that one term.
-           *
-           * So `cov` asks only "does a live lattice exist around this point",
-           * which is the one question the hand-off is about; `faceCov` asks
-           * "does any of it REPRESENT this surface", which is what the
-           * two-tier fallback is about; and `vis` shapes the radiance and
-           * nothing else.
-           */
-          const cov = float(0).toVar();
-          const faceCov = float(0).toVar();
-          /**
-           * ⭐⭐ §19 4.9 — WHAT THE CASCADE *COULD* HAVE CARRIED, so that what it
-           * DID carry is a fraction of something and not a bare magnitude.
-           *
-           * `Σ tri·live·wc0²`: the weight these eight corners would sum to if
-           * every one of them were visible and admissible. `wsumC / wcosC` is
-           * then "how much of this cascade can actually see the point", on a
-           * fixed 0..1 scale — the input to the composite's ramp, and the only
-           * form of the question that means the same thing at a lattice edge
-           * (where `cov` is small) as in the middle of one.
-           *
-           * The wrapped cosine sits in BOTH sums because it SHAPES rather than
-           * rejects: it is ~0.6 even for a perfect corner, so leaving it out of
-           * the denominator would read every healthy pixel as half-blind.
-           */
-          const wcosC = float(0).toVar();
-          /** This cascade's own regional mean — the tail's input. See `tW`. */
-          const mW = float(0).toVar();
-          const mL0 = vec3(0).toVar();
-          const mG = vec3(0).toVar();
-          // §19 3.18's classifier inputs, accumulated beside `cov` so they are
-          // the SAME sums the composite is made of and not a re-derivation.
-          const freshCov = DIAG ? float(0).toVar() : null;
-          const visCov = DIAG ? float(0).toVar() : null;
-
-          for (let c8 = 0; c8 < 8; c8++) {
-            const cdx = c8 & 1;
-            const cdy = (c8 >> 1) & 1;
-            const cdz = (c8 >> 2) & 1;
-            const rx = fr.base.x.add(cdx).toVar();
-            const ry = fr.base.y.add(cdy).toVar();
-            const rz = fr.base.z.add(cdz).toVar();
-            // ⭐ THE CLAMP IS THE LAST CASCADE'S ALONE NOW. On a finer cascade
-            // a corner outside the lattice is simply ABSENT — its weight is
-            // zero and the pixel's confidence falls, which is what hands it to
-            // the next cascade. 3.13 clamped on the only lattice it had and
-            // extrapolated the near room's ambient onto far façades; that is
-            // the 64.5 % thin-feature reading this stage exists to beat.
-            const inLat = world.taps.inLatticeAt(K.org, rx, ry, rz);
-            const [cwx, cwy, cwz] = world.taps.clampAt(K.org, rx, ry, rz);
-            const wcx = select(isLast, cwx, rx).toVar();
-            const wcy = select(isLast, cwy, ry).toVar();
-            const wcz = select(isLast, cwz, rz).toVar();
-            const inside = select(isLast, float(1), select(inLat, float(1), float(0))).toVar();
-            const cell = world.taps.cellAtG(K.base, wcx, wcy, wcz).toVar();
-            const i0 = world.taps.infoAt(cell, 0).toVar();
-            // §19 3.15: `ready` is three-valued — 0 re-keyed, 0.5 SEEDED from
-            // the cascade above, 1 traced. A seeded probe carries a real merged
-            // field (its parent's) and its absence is what §V.6 measured as the
-            // scroll's motion cost, so the test is `> 0.25`, not `> 0.5`.
-            // `ready` is read ONCE into a var: §19 3.18's classifier needs the
-            // three-valued number itself (0 re-keyed / 0.5 seeded / 1 traced),
-            // not only the predicate the composite tests.
-            const rdy = world.taps.infoAt(cell, 2).w.toVar();
-            const alive = i0.w.greaterThan(0.5).and(rdy.greaterThan(0.25)).toVar();
-            const tri = (cdx ? fr.frac.x : float(1).sub(fr.frac.x))
-              .mul(cdy ? fr.frac.y : float(1).sub(fr.frac.y))
-              .mul(cdz ? fr.frac.z : float(1).sub(fr.frac.z)).toVar();
-            const toP = i0.xyz.sub(Pb).toVar();
-            const dist = toP.length().max(1e-4).toVar();
-            const dirP = toP.div(dist).toVar();
-            const wc0 = dot(Nn, dirP).mul(0.5).add(0.5).toVar();
-            const faceN = world.taps.infoAt(cell, 1).xyz.toVar();
-            const wf = mix(float(1),
-              select(i0.w.greaterThan(1.5), dot(Nn, faceN).max(0), float(1)),
-              u.wpFaceOn.clamp(0, 1)).toVar();
-            const live = select(alive, float(1), float(0)).mul(inside).toVar();
-            const vis = world.taps.octTapVisAt(
-              octPlan(dirP.negate(), O), cell, dist, K.dmax, K.sp,
-            ).toVar();
-            /** The shaping-only weight — the composite's denominator. */
-            const wCos = tri.mul(live).mul(wc0.mul(wc0)).toVar();
-            const w = wCos.mul(wf).mul(vis).toVar();
-            // ⭐ COVERAGE IS NOT THE WEIGHT. `w` carries the wrapped cosine and
-            // the face term, which SHAPE a probe's contribution and are ~0.6
-            // even for a perfect corner; dividing the hand-off by that would
-            // send every pixel to the coarse cascade. `cov` sums to exactly 1
-            // when all eight corners are real, and to 0 past the lattice's
-            // edge — which is the hand-off, and the whole hand-off.
-            cov.addAssign(tri.mul(live));
-            faceCov.addAssign(tri.mul(live).mul(wf));
-            wcosC.addAssign(wCos);
-            if (DIAG) {
-              freshCov.addAssign(tri.mul(live)
-                .mul(select(rdy.lessThan(0.75), float(1), float(0))));
-              visCov.addAssign(tri.mul(live).mul(vis));
-            }
-            // The tail's input: face-admissible, NOT Chebyshev-gated, DC only.
-            const mw = tri.mul(live).mul(wf.add(1e-4)).toVar();
-            mW.addAssign(mw);
-            // ⚠ `wsumC` IS SUMMED OUTSIDE THE BRANCH, and that is not tidiness.
-            // It is `visFrac`'s numerator, and the whole point of 4.9 is that
-            // the ramp sees the small values 4.8's `select(wsumC > 1e-5, …, 0)`
-            // rounded to nothing.
-            wsumC.addAssign(w);
-            // ⭐⭐⭐ THE ARGMAX'S READ SITE IS GONE; THE BLEND'S GUARD STAYS —
-            // AND THE DIFFERENCE BETWEEN THOSE TWO THRESHOLDS IS THE WHOLE
-            // POINT OF THIS STAGE.
-            //
-            // `If(cand > bestW)` was a SWITCH: crossing it changed which probe
-            // the pixel read, at full weight, with no continuity anywhere. `w >
-            // 1e-5` is a CUT-OFF: below it a corner's contribution to the blend
-            // is at most 1e-5 of it, so skipping the read moves the answer by
-            // less than the format can hold. One is a cliff, the other is
-            // arithmetic — and a first cut of 4.9 removed both, on the reading
-            // that "no thresholds" is a principle rather than a measurement.
-            // ⛔ `probe:gi2-runner` priced it: 16.4 → 19.3 ms per frame on
-            // Bistro, `probe:gi2-motion` orbit MAX 29 → 160 ms. For a ground
-            // pixel the four corners BELOW its plane have `wc0² ≈ 0`, and this
-            // guard is what stops the resolve reading nine SH words and an oct
-            // tap for each of them. [[feedback-gi-60fps-floor]]
-            //
-            // The `Else` keeps the pocket case alive at one read instead of
-            // ten: where every corner is refused, the tail's regional mean is
-            // the only answer there is, and it needs the DC word.
-            If(w.greaterThan(1e-5), () => {
-              const sh0 = world.taps.shAt(cell, 0).xyz.toVar();
-              const radv = world.taps.octTapRad(planFull, cell).toVar();
-              Lc[0].addAssign(sh0.mul(w));
-              for (let i = 1; i < 9; i++) Lc[i].addAssign(world.taps.shAt(cell, i).xyz.mul(w));
-              Gc.addAssign(radv.mul(w));
-              mL0.addAssign(sh0.mul(mw));
-              mG.addAssign(radv.mul(mw));
-            }).Else(() => {
-              mL0.addAssign(world.taps.shAt(cell, 0).xyz.mul(mw));
-            });
-          }
-          // ── the composite ────────────────────────────────────────────────
-          //
-          // ⭐⭐⭐ §19 4.9 — A CASCADE THAT CANNOT SEE THE POINT HANDS ON, AND IT
-          // HANDS ON SMOOTHLY.
-          //
-          // 4.8 spent the whole claim whichever way the weights fell, on the
-          // reading that `wsumC = 0` with `cov = 1` is the dark side of a wall
-          // and the right answer there is DARK. That reading survives — the
-          // deficit never becomes brightness, and a cascade that hands on hands
-          // to one whose OWN visibility test it must pass in turn, so nothing
-          // is ever given a free pass around Chebyshev [[§V.1]]. What 4.8 got
-          // wrong is the EDGE: `select(wsumC > 1e-5, …, 0)` is a switch, and a
-          // pixel one ulp on the wrong side of it was multiplied by zero.
-          //
-          // ⚠ THE COVERAGE GATE IS LEFT EXACTLY AS 3.15 SHIPPED IT. A first cut
-          // of 4.9 made it a `smoothstep` over the same edge for the smoother
-          // derivative, and that is a REAL energy change at every lattice edge
-          // (`cov = 0.25` claims 0.16 instead of 0.5) for a discontinuity that
-          // was never there — `clamp` is already continuous, and no receipt
-          // implicates its kink. Only the terms that actually SWITCH are
-          // touched by this stage.
-          const claim = cov.div(u.wpCovFull.max(1e-3)).clamp(0, 1).mul(band).mul(rem).toVar();
-          /**
-           * ⭐⭐⭐ THE RAMP THAT REPLACED THE SWITCH.
-           *
-           * `visFrac` is the share of this cascade's OWN admissible weight that
-           * survived Chebyshev — 1 where every corner can see the point, 0 in a
-           * pocket. 4.8 turned that into a step twice over: `select(wsumC >
-           * 1e-5, claim/wsumC, 0)` multiplied the pixel by ZERO one ulp below
-           * the gate (`probe:gi2-ref`'s eight exact zeros, with a live probe
-           * 0.5 m away holding 0.111), and the `admAny < 1e-3` fallback then
-           * swapped in one argmax corner's raw SH. Both are one `smoothstep`
-           * now, over the same edge the coverage gate uses.
-           *
-           * ⭐⭐⭐ ⚠ AND IT SATURATES AT `VIS_RAMP`, WHICH IS 5 % AND NOT 50 %.
-           * MEASURED, NOT CHOSEN.
-           *
-           * `VIS_RAMP` is the width of the region 4.8's `1e-5` switch lived in,
-           * three orders of magnitude wider so that it RAMPS instead of
-           * switching — and not one bit wider than that. Above it a cascade
-           * spends its whole claim exactly as 4.8 did, so §V.1's rule survives
-           * verbatim ("`wsumC` small with `cov` 1 is the dark side of a wall,
-           * and DARK is the answer"), the `rem < 1e-3` break still fires on the
-           * first cascade for almost every pixel rather than running all three,
-           * and no pixel that was not AT the cliff moves at all.
-           *
-           * ⛔ THE PROPORTIONAL VERSION WAS WRITTEN FIRST AND `probe:gi2-ref`
-           * REFUTED IT. Spending `visFrac` of the claim and deferring the rest
-           * reads well — "a cascade spends what it could see" — but a typical
-           * Bistro pixel measures `visFrac` ≈ 0.5, so it handed HALF of every
-           * pixel down to the 2 m and 8 m lattices: pose A's median |ratio−1|
-           * went 0.863 → 1.000 and pose B's 0.461 → 0.662 against the path
-           * tracer, over-bright in exactly the shadowed places (FAC2 23×,
-           * SOFF2 6.9×, PAVE1 3.9×) — which is §V.1's leak, re-derived from
-           * first principles and measured within the hour. A hand-off may be
-           * made CONTINUOUS; it may not be made PROPORTIONAL.
-           */
-          const VIS_RAMP = 0.05;
-          const visFrac = wsumC.div(wcosC.max(1e-5)).toVar();
-          const ansC = smoothstep(float(0), float(VIS_RAMP), visFrac).toVar();
-          const spend = claim.mul(ansC).toVar();
-          const k = spend.div(wsumC.max(1e-9)).toVar();
-          for (let i = 0; i < 9; i++) Lb[i].addAssign(Lc[i].mul(k));
-          G.addAssign(Gc.mul(k));
-          wsum.addAssign(spend);
-          rem.subAssign(spend);
-          // The tail's accumulation, COARSEST-preferred — `1/pref` is exactly
-          // the inverse of the finest-first ratio 4.8's fallback used, and it
-          // is a weighted mean rather than a choice, so it is continuous in the
-          // pixel's position like everything else here. See `tW`.
-          const tw = float(1).div(K.pref).toVar();
-          const tmw = tw.mul(1e-4).toVar();
-          tW.addAssign(wsumC.mul(tw).add(mW.mul(tmw)));
-          tL[0].addAssign(Lc[0].mul(tw).add(mL0.mul(tmw)));
-          for (let i = 1; i < 9; i++) tL[i].addAssign(Lc[i].mul(tw));
-          tG.addAssign(Gc.mul(tw).add(mG.mul(tmw)));
-          if (DIAG) {
-            const row = vec4(cov, freshCov, claim, visCov.div(cov.max(1e-4))).toVar();
-            for (let c = 0; c < dgs.length; c++) {
-              If(cc.equal(uint(c)), () => { dgs[c].assign(row); });
-            }
-          }
-          admAny.assign(max(admAny, faceCov));
-        });
-        // ── ⭐⭐⭐ THE TAIL ───────────────────────────────────────────────────
-        //
-        // Whatever no cascade could see is paid here, at the region's own mean
-        // (see `tW`). This is §L.5's "never a black pixel" and §19 3.14's
-        // two-tier fallback, as ONE weighted mean instead of a threshold over
-        // an argmax — so it is continuous in the pixel's position, and the
-        // pixel next to it reads a value 8 cm away rather than a different
-        // probe entirely.
-        //
-        // ⭐⭐ AND IT IS WHAT MAKES THE CLAIM CONSERVE. `wsum` is now exactly
-        // `Σ spend + rem`, which is 1 for every pixel any cascade covered — the
-        // `csum` column of `diagBuf`'s fallback row, and a lit pixel below 0.99
-        // there is a bug rather than a taste. A pixel NO cascade covered has no
-        // tail to pay it, keeps `wsum = 0`, and stays black on purpose.
-        const hasT = select(tW.greaterThan(1e-12), float(1), float(0)).toVar();
-        const tailK = rem.mul(hasT).div(tW.max(1e-12)).toVar();
-        for (let i = 0; i < 9; i++) Lb[i].addAssign(tL[i].mul(tailK));
-        G.addAssign(tG.mul(tailK));
-        wsum.addAssign(rem.mul(hasT));
-        if (DIAG) {
-          dgFb.x.assign(admAny);
-          dgFb.y.assign(rem.mul(hasT));
-          dgFb.z.assign(wsum);
-        }
+        worldResolveInto(P, Nn, { Lb, G, wsum, admAny, planFull, dgs, dgFb });
       } else {
       for (let corner = 0; corner < 4; corner++) {
         const dx = corner & 1;
@@ -5303,6 +5447,10 @@ export function createGiGather({
     worldProbes: useWorld, world: world?.describe() ?? null,
     metaVec: META_VEC, matureRays: MATURE_RAYS, rayFresh: RAY_FRESH, rayFlag: RAY_FLAG,
     shadeProb: u.shadeProb.value, nCap: u.nCapU.value, skyRays: SKY_RAYS,
+    // §19 4.14 (§AL)'s two arms, so a receipt cannot claim a stage it did not
+    // build. `cacheFromProbes` is a BUILD arm; reading it off a uniform would
+    // be reading the wrong thing.
+    cacheFromProbes: CACHE_FROM_PROBES, bounceAlbedoMax: BOUNCE_ALBEDO_MAX,
     // §19 4.5's two arms, printed rather than believed.
     cacheSmooth: u.cacheSmoothU.value, coldFill: u.coldFillU.value,
     // §19 3.12's three, so a receipt can print the configuration it measured
