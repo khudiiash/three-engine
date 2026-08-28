@@ -58,8 +58,8 @@
 // point of `createSrcHashBlockFrame`) plus three textures. No kernel in this
 // file is anywhere near the limit and no kernel in 5.1 gains a binding.
 import {
-  Fn, If, Return, float, instanceIndex, ivec2, max, sqrt, step, texture, textureStore, uint,
-  uniform, vec3, vec4,
+  Fn, If, Return, float, instanceIndex, ivec2, max, reflect, sqrt, step, texture,
+  textureStore, uint, uniform, vec3, vec4,
 } from "three/tsl";
 import { createSrcHashBlockFrame } from "../../srcProbes.js";
 import { createSrcMergeFrame, formatSrcMerge } from "../../srcMerge.js";
@@ -100,6 +100,18 @@ import { MAX_LODS, W0 } from "../../srcConfig.js";
 export function createRcMerge({
   store, bins, spacing0, anchor, camera, sky, frameStamp,
   gbuffer, irradianceHalf, width, height,
+  /**
+   * ⭐⭐⭐ §19 STAGE 5.5a — `gather.textures.glossyHalf`, AND WITHOUT IT RC5 IS
+   * AN IRRADIANCE-ONLY FRAME.
+   *
+   * 5.4b cut `resolveHalf` out of the chain, and `resolveHalf` was the ONLY
+   * writer of `glossyHalf` — so `resolveUpsample` magnified a texture nothing
+   * had written, `gi2.textures.glossy` read zero and every material's
+   * `_giRadianceNode` multiplied Fresnel by black. The `reflections` debug view
+   * was 0 % non-black, which is not "reflections are dark": it is "the term has
+   * no producer". `null` here is 5.4b exactly.
+   */
+  glossyHalf = null,
   maxLods = MAX_LODS, losOccupied = null, skyEnv = null,
   /**
    * ⭐⭐ §19 STAGE 5.3/5.3d — `rcDirect.createRcEmitterDirect`, the SEATED
@@ -192,6 +204,55 @@ export function createRcMerge({
   const fieldTermU = uniform(1);
   const directTermU = uniform(1);
 
+  // ══ §19 STAGE 5.5a — THE GLOSSY LOBE, WHICH IS A DIRECTIONAL READ OF THE
+  //    SAME MERGED CASCADES AND NOT A SECOND ESTIMATOR ═══════════════════════
+  //
+  // ⭐⭐⭐ THE PAPER ALREADY ANSWERED THIS (§3.2). A merged cascade probe does
+  // not store an irradiance; it stores CONE RADIANCE PER DIRECTION, and the
+  // diffuse answer is that field integrated against a cosine. An anisotropic
+  // BRDF reads the SAME probes in a DIFFERENT direction — the reflected one —
+  // with the same eight-corner visibility weights. So there is no new gather
+  // here, no new buffer, no second field: `gatherAt` has taken a `sampleDir`
+  // since §12.71b (that is what `createSrcGlossyGather` fed it on the old
+  // path), and this arm hands it `R` instead of `N`.
+  //
+  // ⚠ AND THE COST IS HONEST ABOUT ITSELF: a second direction is a second
+  // eight-corner walk in the same kernel. Nothing is shared between the two
+  // reads except the LOD arithmetic, because the tile taps ARE the answer.
+  //
+  // ══ ROUGHNESS → CASCADE, AND WHAT THAT CAN AND CANNOT MEAN HERE ═══════════
+  //
+  // §3.2's rule is "wider cones at coarser cascades = rougher lobes": c0's 32
+  // directions subtend ~28°, c1's 128 ~14°, c2's 512 ~7°, c3's 2048 ~3.5°, so
+  // reading a rough lobe from a coarse cascade is reading it at the angular
+  // resolution the lobe actually has.
+  //
+  // ⚠ IN THIS PORT THE MAPPING IS NOT THE WHOLE STORY AND SAYING SO IS THE
+  // POINT. The bake (`srcTiles`) resolves every cascade onto the SAME 6×6
+  // octahedral tile, so what the LOD choice moves is which cascade's radiance
+  // the tap reads, not how many texels it is spread over — the tile's own
+  // filter caps the sharpness at ~30° no matter which cascade answers. The
+  // offset therefore buys the CORRECT MONOTONE DIRECTION (rougher ⇒ coarser,
+  // farther-reaching, more pre-averaged) and not yet a sharp mirror. A sharp
+  // lobe needs the tile to carry the cascade's own direction count, which is a
+  // bake change and is 5.5b's, not this one's.
+  //
+  // `roughnessU` mirrors `gatherProbes`' `u.roughness` (0.35) — the scene-wide
+  // material roughness the old glossy arm blended its two oct resolutions with.
+  // There is no per-pixel roughness in the gbuffer on either path; when one
+  // arrives this uniform is the node it replaces, and nothing else moves.
+  const glossyWriteU = uniform(1);
+  const roughnessU = uniform(0.35);
+  /** Cascades of offset at roughness 1. 0 disables the mapping (c-nearest). */
+  const glossyLobeU = uniform(1.5);
+  /**
+   * The firefly cap, in the same units and with the same hue-preserving shape
+   * `createSrcGlossyGather` used — a single bright bin read through a narrow
+   * lobe is a pixel-wide white dot, and the diffuse read never sees one because
+   * a cosine integral of the same probe averages it away.
+   */
+  const glossyCapU = uniform(6);
+
   const resolvePass = Fn(() => {
     const i = instanceIndex.toVar();
     const gx = i.mod(halfWU).toVar();
@@ -217,6 +278,10 @@ export function createRcMerge({
      * makes every silhouette's 2×2 taps mutually acceptable, which is a halo.
      */
     const a = float(-1e4).toVar();
+    // §19 5.5a — the glossy pair, declared beside the irradiance pair and for
+    // the same reason: the store is outside the geometry guard.
+    const G = glossyHalf ? vec3(0).toVar() : null;
+    const ga = glossyHalf ? float(-9).toVar() : null;
     If(g.w.greaterThan(0.5), () => {
       // `normalize` on a zero normal is NaN and a NaN alpha poisons four
       // full-res pixels, so the length is floored rather than assumed. (The
@@ -225,6 +290,13 @@ export function createRcMerge({
       const len2 = nrm.dot(nrm).toVar();
       const Nn = nrm.div(sqrt(max(len2, float(1e-12)))).toVar();
       a.assign(Nn.dot(g.xyz));
+      // ⚠ AND THE GLOSSY TARGET'S ALPHA IS A DIFFERENT NUMBER ENTIRELY —
+      // `resolveUpsample` reads the PAIR: `irradianceHalf.w` is the plane
+      // offset and `glossyHalf.w` is the normal's y (its `okTap` test is
+      // `> -8`, its `wn` is `1 − |gi.w − N.y|·0.5`). A ceiling and the floor
+      // six metres under it share a plane offset; only the y separates them.
+      // Same raw normal as the plane offset, for the same reason.
+      if (glossyHalf) ga.assign(Nn.y);
       // ⭐ THE GATHER TAKES THE CAMERA-FACED NORMAL, THE ALPHA DOES NOT.
       //
       // Two different jobs. The deposit filled these probes' bins along the
@@ -243,9 +315,36 @@ export function createRcMerge({
         // normal, like the gather: the hemisphere a lamp lights is the
         // hemisphere the field was filled over.
         if (direct) E.addAssign(direct.directAt(g.xyz, Nf, gx, gy).mul(directTermU));
+        // ── §19 5.5a: THE SAME PROBES, READ TOWARD `R` ────────────────────
+        if (glossyHalf) {
+          // The view vector is `P − camera`; `reflect` mirrors it about the
+          // FACED normal, so a back-facing gbuffer normal (double-sided
+          // geometry seen from the inside) reflects into the hemisphere the
+          // deposit actually filled instead of straight into the wall.
+          const R = reflect(g.xyz.sub(vec3(camera)).normalize(), Nf).toVar();
+          // Rougher ⇒ coarser cascade. See the uniform block's header for what
+          // this does and does not buy at the current tile resolution.
+          const lobe = roughnessU.mul(glossyLobeU).toVar();
+          // ÷π — the gather returns a COSINE-HEMISPHERE IRRADIANCE and the
+          // specular slot wants an OUTGOING RADIANCE to multiply by F. This is
+          // §12.71b's convention verbatim (`createSrcGlossyGather` divides by
+          // exactly this) and it is the reason the new writer's output is
+          // comparable to the old `glossyHalf` rather than π× brighter.
+          const Gr = vec3(gather.gatherAt(g.xyz, Nf, R, lobe).irradiance)
+            .mul(float(1 / Math.PI)).toVar();
+          // Hue-preserving soft cap. A narrow lobe onto one hot bin is a white
+          // dot; the diffuse read never produces one because its cosine
+          // integral averages the same probe over the hemisphere.
+          const lum = Gr.x.mul(0.2126).add(Gr.y.mul(0.7152)).add(Gr.z.mul(0.0722)).toVar();
+          G.assign(Gr.mul(float(glossyCapU).div(lum.max(glossyCapU))).mul(glossyWriteU));
+        }
       });
     });
     textureStore(irradianceHalf, ivec2(gx.toInt(), gy.toInt()), vec4(E, a));
+    // ⚠ UNCONDITIONAL, like the irradiance store. A texel skipped because it
+    // has no geometry must be WRITTEN with the −9 sentinel, not left holding
+    // last frame's answer for the upsample's `okTap` to accept.
+    if (glossyHalf) textureStore(glossyHalf, ivec2(gx.toInt(), gy.toInt()), vec4(G, ga));
   })().compute(halfW * halfH);
 
   return {
@@ -270,6 +369,12 @@ export function createRcMerge({
     uniforms: {
       rcResolveWrite: writeU, rcResolveWidth: widthU, rcResolveHeight: heightU,
       rcTermField: fieldTermU, rcTermDirect: directTermU,
+      // §19 5.5a. `rcGlossyWrite = 0` is the 5.4b control (black specular
+      // slot) with the read still paid, so the arm prices itself; `rcGlossyLobe
+      // = 0` reads the glossy direction from the pixel's OWN cascade, which is
+      // the roughness→cascade mapping's identity.
+      rcGlossyWrite: glossyWriteU, rcGlossyRoughness: roughnessU,
+      rcGlossyLobe: glossyLobeU, rcGlossyCap: glossyCapU,
       ...(direct?.uniforms ?? {}),
     },
     direct,

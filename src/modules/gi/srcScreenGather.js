@@ -263,7 +263,7 @@ export function createSrcScreenGather(store, tiles, {
    * IS the normal and the graph is byte-identical to what every gather gate
    * measured.
    */
-  const gatherAt = (position, normal, sampleDir = null) => {
+  const gatherAt = (position, normal, sampleDir = null, lodOffset = null) => {
     const N = vec3(normal).normalize().toVar();
     // ── §12.88: SAMPLE THE LATTICE FROM IN FRONT OF THE SURFACE ────────────
     //
@@ -290,6 +290,15 @@ export function createSrcScreenGather(store, tiles, {
     // population inserts at (every corner misses, silently) and a positive one
     // past the last shell would index a LOD the 4-bit key cannot hold.
     if (lodBias) lodF.assign(lodF.add(float(lodBias)).clamp(0, maxLods - 1));
+    // ⭐ §19 5.5a — A SECOND, PER-CALL OFFSET, AND IT IS THE PAPER'S LOBE DIAL.
+    //
+    // `lodBias` above is a BUILD constant — one number for the whole gather.
+    // The glossy read needs a NODE, because §3.2's rule is "a rougher lobe is
+    // read from a coarser cascade" and roughness is a uniform the material side
+    // moves. Same re-clamp, same window, and `null` (every caller but
+    // `rcMerge`'s glossy arm) leaves the graph byte-identical to what every
+    // gather gate measured.
+    if (lodOffset) lodF.assign(lodF.add(float(lodOffset)).clamp(0, maxLods - 1));
     // `lodShells` on the CPU returns one or two shells; a GPU kernel cannot
     // branch on a list length, so both are written out and the second is
     // guarded by its own weight. `min(maxLods - 1)` matches the mirror's clamp

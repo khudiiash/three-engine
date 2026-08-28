@@ -86,6 +86,10 @@ export function createRcCascades({
   // html`), the merge/bake/resolve trio is not built at all and this object is
   // exactly what 5.1 shipped — the population, the rays and the deposit.
   irradianceHalf = null,
+  // §19 STAGE 5.5a — `gather.textures.glossyHalf`, the OTHER texture
+  // `resolveUpsample` reads. Absent, the merge's resolve writes irradiance
+  // only and the frame is 5.4b exactly (a specular slot with no producer).
+  glossyHalf = null,
 }) {
   const spec = rcTierSpec(tier);
   const { u, dominantFace, faceSamplePoint, shadeHit } = kit;
@@ -464,6 +468,7 @@ export function createRcCascades({
       frameStamp: frameStampU,
       gbuffer,
       irradianceHalf,
+      glossyHalf,
       width,
       height,
       maxLods,
