@@ -156,7 +156,7 @@ const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : NaN);
 
 // ════════════════════════════════════════════════════════════════════ BOOT
 const browser = await puppeteer.launch({
-  executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  executablePath: process.env.CHROME_PATH ?? "C:/Program Files/Google/Chrome/Application/chrome.exe",
   headless: process.env.HEADED ? false : "new",
   args: [
     "--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage",
