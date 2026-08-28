@@ -112,6 +112,33 @@ const WARM_VARIANT_DRAIN_MS = 200;
 // ends the batch by itself.
 const WARM_VARIANT_BATCH = 12;
 const WARM_VARIANT_BUDGET_MS = 60;
+// ⭐⭐ §19 STAGE 4.3c — HOW LONG A MERGE PROXY MAY BE HELD OUT OF THE GRAPH
+// waiting for its pipeline. The hold is what makes the warm PROACTIVE rather
+// than reactive: the proxy is not drawn — and therefore cannot mint a pipeline
+// inside a frame — until the compile that mints it off-frame has returned.
+// Bounded because a compile that never resolves (a device loss, a material the
+// driver refuses) must cost a merged draw call, never a hole in the scene: at
+// the bound the proxy goes back into the graph and takes its chances, which is
+// exactly the pre-4.3c behaviour and no worse.
+const WARM_HOLD_MAX_MS = 10_000;
+// ⭐⭐ §19 4.3c — THE URGENT BATCH DOES NOT STOP AT 60 ms, AND THAT IS THE
+// DIFFERENCE BETWEEN 14 SECONDS AND ONE COMPILE'S WORTH.
+//
+// The drain intercepts `getForRender`'s pipeline promises so `compileAsync`
+// returns after only its main-thread half, and awaits every driver compile
+// TOGETHER at the end of the batch — i.e. the driver latencies OVERLAP. The
+// 60 ms budget breaks the loop after the first pick (one uber material's
+// codegen is far more than 60 ms), which turns that one concurrent await into
+// N serial ones: measured, 9 held proxies at 2-14 s each, of which exactly ONE
+// was warm by the time the arm started. A batch that is holding merge proxies
+// out of the graph runs to the end of the held set instead.
+// ⚠ This is NOT 4.3b's refuted "run the compileAsync calls concurrently"
+// (orbit MAX 128 → 752 ms). The calls stay sequential and keep their
+// `yieldToMain` between them; only the DRIVER waits overlap, which is what 4.3b
+// built the interception for in the first place.
+const WARM_URGENT_BUDGET_MS = 3_000;
+/** How long a drain batch may be in flight before it is written off. */
+const WARM_DRAIN_STUCK_MS = 30_000;
 // Frames a resize's outgoing resolve targets stay alive before being destroyed
 // (see #retireTargets). Two would do — the third is slack for a frame that is
 // dropped or re-encoded.
@@ -2302,6 +2329,16 @@ export class GISystem {
   dispose() {
     for (const unsub of this._unsubs) unsub?.();
     this._unsubs = [];
+    // §19 4.3c: a held merge proxy is OUT OF THE SCENE GRAPH. GI going away
+    // must not take the merge with it — put every hold back, warm or not.
+    if (this._giWarmHolds?.length) {
+      for (const h of this._giWarmHolds) {
+        if (h.rev !== (this.engine?.merging?._rebuildCount ?? 0)) continue;
+        h.parent.add(h.proxy);
+        for (const mesh of h.members) mesh.visible = false;
+      }
+      this._giWarmHolds.length = 0;
+    }
     // Give the environment's material IBL back (§12.64) — only if the black
     // node is still OURS; a user/script that replaced it keeps their node.
     const scene = this.engine?.scene;
@@ -2729,6 +2766,17 @@ export class GISystem {
       }
     }
 
+    // ⭐⭐ §19 Stage 4.3c: PROACTIVE, and the ORDER of these three is the fix.
+    //
+    // This runs in `onPreRender`, which the engine calls AFTER `merging.sync()`
+    // and BEFORE the draw — so on the very frame a rebuild publishes, the hold
+    // gets there before the proxy's first draw ever happens. Hold, then release
+    // anything the last cycle warmed, then drain (which now takes the held
+    // proxies at the head of its queue, ahead of the walk's incidental finds).
+    if (globalThis.__giWarmProactive !== false) {
+      this.#holdColdMergeProxies();
+      this.#releaseWarmHolds();
+    }
     // §19 Stage 4.3b (D): the late-variant warm, in the same idle slot the
     // R4b floor drain above already occupies. It only ever picks up a material
     // variant that did not exist when the compile wave ran — merging's proxies
@@ -4888,8 +4936,17 @@ export class GISystem {
     const warmed = (this._giWarmedVariants ??= new Set());
     let seen = 0;
     let cold = 0;
+    const known = (this._giWarmSeenMaterials ??= new WeakSet());
     this.#warmWalk(scene, (object) => {
       seen++;
+      // §19 4.3c: every material the scene wears at seal time is one three has
+      // already been asked to draw. `#holdColdMergeProxies` needs that fact —
+      // "the warmed SET does not have this key" and "the DRIVER does not have
+      // this pipeline" are different claims, and holding on the first one takes
+      // proxies out of the graph that would have drawn without a compile.
+      const om = object.material;
+      if (Array.isArray(om)) { for (const m of om) if (m) known.add(m); }
+      else if (om) known.add(om);
       const key = this.#warmVariantKeyOf(object);
       // ⛔⛔ A SEED MAY ONLY CLAIM WHAT THE WAVE ACTUALLY COMPILED.
       //
@@ -4912,6 +4969,250 @@ export class GISystem {
         ? " (the wave compiled the whole scene through the pass, so every live variant is warm)"
         : `, ${cold} still COLD. Those are pipelines the driver would otherwise mint inside a ` +
           "frame; the drain warms them off-frame, one per cycle."));
+  }
+
+  /**
+   * The rule merging's own `#teardown` uses to decide whether a member draws
+   * once it stops being merged — duplicated here rather than exported because a
+   * hold is a temporary teardown and must agree with the real one exactly. A
+   * member whose component was disabled while it was merged stays hidden.
+   */
+  #memberShouldDraw(mesh) {
+    const component = this.engine?.entities?.get(mesh.userData.entityId)?.components?.get("mesh");
+    return component ? component.enabled && component.materialRenderable !== false : true;
+  }
+
+  /**
+   * ⭐⭐⭐ §19 STAGE 4.3c — THE WARM IS PROACTIVE NOW, AND THE HOLD IS WHY.
+   *
+   * 4.3b's drain is REACTIVE in the only sense that matters: it wakes on its own
+   * 200 ms cadence, hands the compile to an idle callback, and the driver mints
+   * the pipeline whenever it gets round to it. A merge proxy published in
+   * between is DRAWN first, and the driver then compiles its pipeline INSIDE
+   * that frame. 4.3b's own commit records the residue ("a merge rebuild seconds
+   * before the arm still leaves 2") and this stage's forced-merge arm names it:
+   *
+   *   forced rebuild, 187 → 189 groups, three fresh uber materials
+   *     Uber(8)_711, Uber(6)_710 — ON CAMERA, minted in the first frame after
+   *       the merge; `renderer.render` 70.7 ms on that frame;
+   *     Uber(3)_709 — a `Merged(3)` proxy at the far end of the street, minted
+   *       at orbit frame #246: **89.4 ms, 74.7 of it unmarked**, which is the
+   *       ~107 ms spike 3.17 measured on both paths.
+   *
+   * Making the drain faster cannot close this. The same run shows the drain
+   * spending **7445 ms and 2355 ms on ONE variant each** — that is driver
+   * latency, not main-thread work, and 4.3b already measured that running the
+   * compiles concurrently is WORSE (orbit MAX 128 → 752 ms). ⭐ **When the fix
+   * cannot be "finish sooner", the fix is "do not draw it yet."**
+   *
+   * So the swap is HELD: the moment merging publishes a rebuild — in GI's own
+   * `onPreRender`, which the engine runs AFTER `merging.sync()` and BEFORE the
+   * draw, so this frame is the proxy's first and it has not happened yet — every
+   * new proxy whose variant is cold is TAKEN OUT OF THE SCENE GRAPH and its
+   * members are put back on screen in its place. The image is identical (the
+   * members are the same triangles, wearing materials the compile wave already
+   * paid for); the only cost is the merge's own draw-call saving, for as long as
+   * the compile takes.
+   *
+   * ⛔ REMOVED FROM THE GRAPH, NOT `visible = false`, AND THAT IS THE WHOLE
+   * MECHANISM. `Renderer.compileAsync` projects the object it is handed through
+   * `_projectObject`, whose first line is `if ( object.visible === false )
+   * return;` — hiding the proxy would make its own warm compile NOTHING, which
+   * is 4.3b's frustum-cull defect with a new author. And the reverse dodge (flip
+   * `visible` true for the duration of the compile, as `#compileObjectUnculled`
+   * does for a camera-hidden object) hands a frame landing inside the await
+   * exactly the draw this is preventing. Detached, the proxy is unreachable by
+   * the render list and fully visible to `compileAsync`, which needs no scene
+   * membership at all — `targetScene` supplies the lights and the cache keys
+   * (three's `sceneRef`).
+   *
+   * ⚠ A STALE HOLD IS DROPPED, NEVER RE-ATTACHED. `merging.#teardown` disposes
+   * `group.mesh.geometry` on the next rebuild; re-attaching that proxy would
+   * draw a disposed geometry. The hold records the rebuild counter it was taken
+   * at, and a hold from an older rebuild is simply forgotten — teardown has
+   * already restored its members' visibility by the same rule `#memberShouldDraw`
+   * uses, so there is nothing left to undo.
+   *
+   * `__giWarmProactive = false` restores the 4.3b behaviour for a one-boot A/B.
+   */
+  #holdColdMergeProxies() {
+    // ⛔ NO DRAIN, NO HOLD. `__giWarmVariantDrain = false` is 4.3b's one-boot
+    // A/B; with it set nothing would ever warm the held keys and every hold
+    // would sit out its full bound before going back unwarmed — the A/B arm
+    // would then be measuring this hold's timeout rather than the drain.
+    if (globalThis.__giWarmVariantDrain === false) return;
+    const engine = this.engine;
+    const merging = engine?.merging;
+    if (!merging?.enabled) return;
+    const rev = merging._rebuildCount ?? 0;
+    if (rev === this._giWarmMergeRev) return;
+    // ⛔ NOT "THE FIRST REBUILD" — "WHILE THE SCENE IS STILL LOADING". The
+    // first cut skipped only the first rev it saw and the boot merge STILL got
+    // held: Bistro rebuilds two or three times as geometry and then textures
+    // land, so `#2` is as much a boot rebuild as `#1`. The honest predicate is
+    // the one `#readyToRebuild` already uses — a texture tail in flight means
+    // the page is saturated, the drain is 6-14 s per variant, and a hold taken
+    // now will time out rather than complete.
+    const loading = this._giWarmMergeRev === undefined || textureLoadsInFlight() > 0;
+    this._giWarmMergeRev = rev;
+    // ⛔⛔ THE BOOT MERGE IS NOT HELD, AND THE QUIESCED CONTROL IS WHY.
+    //
+    // The first rebuild this system ever sees is the one that lands during
+    // boot, and boot is already a compile storm: the drain is working through
+    // ordinary cold variants at 6-14 s each, so the boot proxies' own compiles
+    // queue behind them and time out. MEASURED (quiesced orbit, no forced
+    // merge): 2 proxies held at rebuild #2, **both released UNWARM at the 10 s
+    // bound**, and the pipelines they had been holding back were then minted at
+    // arm frames #22-24 — inside the PARKED segment, 3 frames over 50 ms and a
+    // MAX of 115.5 ms on an arm that reads 26.2 ms without this. The hold did
+    // not remove that cost, it DEFERRED it out of boot and into the receipt.
+    // ⭐ A DEFERRAL IS ONLY A FIX WHERE THE THING IT DEFERS INTO IS CHEAPER.
+    // Boot already pays for these pipelines with nobody looking, and 4.3b's
+    // quiesced arm proves they do not spike a later orbit.
+    //
+    // ⚠ IT STILL WALKS. The boot proxies' materials have to enter the seen-set
+    // on this pass, or the NEXT rebuild reads every one of them as novel and
+    // holds the whole merge.
+    // ⛔ Before the wave has sealed the warmed set every key reads as cold, so a
+    // hold here would take the ENTIRE merge out of the graph on the strength of
+    // a set that is empty because nothing has run yet, not because nothing is
+    // warm. Boot's own proxies are covered by the wave itself.
+    if (!this._giWarmSealedAt) return;
+    const warmed = this._giWarmedVariants;
+    if (!warmed) return;
+    const held = (this._giWarmHolds ??= []);
+    const queue = (this._giWarmPriority ??= []);
+    const known = (this._giWarmSeenMaterials ??= new WeakSet());
+    const now = performance.now();
+    let taken = 0;
+    let coldKeys = 0;
+    for (const group of merging.groups ?? []) {
+      const proxy = group?.mesh;
+      if (!proxy?.parent || !this.#warmCandidate(proxy)) continue;
+      const key = this.#warmVariantKeyOf(proxy);
+      // ⛔⛔ A COLD KEY IS NOT A MISSING PIPELINE, AND THE FIRST CUT HELD NINE
+      // PROXIES ON THAT CONFUSION.
+      //
+      // `_giWarmedVariants` records what WE compiled. A rebuild replaces every
+      // proxy with a new mesh, and a proxy wearing a CACHED uber material
+      // (`merging.#uberFor`'s cache) at the SAME vertex layout needs no new
+      // pipeline at all — three's cache key is (material, layout, context) and
+      // it hits. Holding those is pure loss: they draw fine, and they sit out
+      // of the graph until the bound while the genuinely new one queues behind
+      // them. What actually costs a compile is a material three has never been
+      // asked to draw, which is exactly what the seen-set answers.
+      //
+      // MEASURED (forced merge, Bistro, 189 groups): 9 cold keys, **3 new
+      // materials** — and the pipelines the run created were three, wearing
+      // those three materials (`Uber(3)_709`, `Uber(6)_710`, `Uber(8)_711`).
+      const mats = Array.isArray(proxy.material) ? proxy.material : [proxy.material];
+      let novel = false;
+      for (const m of mats) {
+        if (!m) continue;
+        if (!known.has(m)) novel = true;
+        known.add(m);
+      }
+      if (warmed.has(key)) continue;
+      coldKeys++;
+      if (!novel || loading) continue;
+      const parent = proxy.parent;
+      parent.remove(proxy);
+      // A BundleGroup is a RECORDING: removing a proxy from one without moving
+      // its version leaves the recording drawing geometry that is no longer
+      // there. Same rule merging's own `#invalidateBundle` states.
+      if (parent.isBundleGroup === true || "needsUpdate" in parent) parent.needsUpdate = true;
+      const members = [];
+      for (const member of group.members ?? []) {
+        const mesh = member?.mesh;
+        if (!mesh || !this.#memberShouldDraw(mesh)) continue;
+        mesh.visible = true;
+        members.push(mesh);
+      }
+      held.push({ proxy, parent, members, key, rev, at: now });
+      // The queue is ORDERED and the drain takes from its head: a held proxy is
+      // the only cold variant with a visible cost attached, so it must never
+      // wait behind the scene walk's incidental finds (the same run watched the
+      // drain spend 7.4 s on a `MeshPhysicalNodeMaterial` while the merge proxy
+      // it was holding up compiled itself inside a frame).
+      if (!queue.some((q) => q.key === key)) queue.push({ object: proxy, key, rev });
+      taken++;
+    }
+    if (taken) {
+      console.log(`[gi] §19 4.3c: merge rebuild #${rev} — ${coldKeys} cold key(s), ${taken} of them ` +
+        "wearing a material three has never drawn; those are held OUT OF THE GRAPH (their members " +
+        "draw in their place) until the pipeline exists off-frame.");
+    }
+  }
+
+  /**
+   * Put a held proxy back the moment its variant is warm — or at the bound, or
+   * when the group it belonged to has been torn down under it. Runs every tick;
+   * it is a length check on an array that is empty on a settled scene.
+   */
+  #releaseWarmHolds() {
+    const held = this._giWarmHolds;
+    if (!held?.length) return;
+    const warmed = this._giWarmedVariants;
+    const rev = this.engine?.merging?._rebuildCount ?? 0;
+    const now = performance.now();
+    let released = 0;
+    let expired = 0;
+    // ⭐⭐ §19 4.3c — AND THE RELEASE WAITS FOR A STILL CAMERA TOO.
+    //
+    // Re-attaching a proxy is its first draw in every pass that draws it, and
+    // two of those passes — GI's g-buffer prepass and the shadow map — have
+    // their own pipeline cache which no object-level warm can reach (the
+    // second-context warm was built for exactly this and measured as a thrash;
+    // the banner in `#drainWarmVariants` has the numbers). So the release costs
+    // what it costs; the only thing left to choose is WHEN, and §18's mandate
+    // answers that. The bound is the escape: a camera that never stops still
+    // gets its merge back, it just gets it late.
+    const ce = this.engine?.camera?.matrixWorld?.elements;
+    const relKey = ce
+      ? `${ce[12].toFixed(3)},${ce[13].toFixed(3)},${ce[14].toFixed(3)},`
+        + `${ce[0].toFixed(4)},${ce[6].toFixed(4)},${ce[9].toFixed(4)}`
+      : "";
+    const camStill = relKey === this._giWarmRelKey;
+    this._giWarmRelKey = relKey;
+    // ⭐ A HOLD THAT NEVER LETS GO HAS TO SAY SO WHILE IT IS HAPPENING. A run
+    // ending with "3 proxies still held" and NO drain log at all is two
+    // different failures — the batch never started, or it started and never
+    // finished — and neither is visible from outside. One line every two
+    // seconds, only while something is actually held, is the difference.
+    if (now - (this._giWarmHoldReportAt ?? 0) > 2000) {
+      this._giWarmHoldReportAt = now;
+      const q = this._giWarmPriority?.length ?? 0;
+      const warmCount = held.reduce((n, h) => n + (warmed?.has(h.key) ? 1 : 0), 0);
+      console.log(`[gi] §19 4.3c: ${held.length} proxy/proxies held ` +
+        `${Math.round((now - held[0].at) / 100) / 10}s — queue ${q}, ${warmCount} already warm, ` +
+        `drain ${this._warmDrainBusy ? "BUSY" : "idle"}, camera ${camStill ? "still" : "moving"}`);
+    }
+    for (let i = held.length - 1; i >= 0; i--) {
+      const h = held[i];
+      // Torn down under us: `#teardown` has already disposed this geometry and
+      // restored the members. Forget it — re-attaching would draw a corpse.
+      if (h.rev !== rev) { held.splice(i, 1); continue; }
+      const timedOut = now - h.at >= WARM_HOLD_MAX_MS;
+      if (!warmed?.has(h.key) && !timedOut) continue;
+      if (!camStill && !timedOut) continue;
+      // ⚠ ONE PER TICK. Re-attaching a proxy is a new render object in every
+      // pass that draws it (colour, GI g-buffer, the shadow map), and putting
+      // three of them back on one frame is one frame paying for three. They are
+      // ready at the same moment because they were compiled in one batch, so
+      // without this the batching of the FIX re-creates the shape of the BUG.
+      if (released + expired > 0) break;
+      held.splice(i, 1);
+      if (timedOut && !warmed?.has(h.key)) expired++;
+      else released++;
+      h.parent.add(h.proxy);
+      if (h.parent.isBundleGroup === true || "needsUpdate" in h.parent) h.parent.needsUpdate = true;
+      for (const mesh of h.members) mesh.visible = false;
+    }
+    if (released || expired) {
+      console.log(`[gi] §19 4.3c: ${released} held merge proxy/proxies back in the graph, warm` +
+        (expired ? `; ${expired} released UNWARM at the ${WARM_HOLD_MAX_MS / 1000}s bound ` +
+          "(the compile never returned — this one can still spike, and that is the pre-4.3c cost)" : ""));
+    }
   }
 
   /**
@@ -4954,7 +5255,21 @@ export class GISystem {
    */
   #drainWarmVariants(renderer) {
     if (globalThis.__giWarmVariantDrain === false) return;
-    if (this._compileWaveActive || this._warmDrainBusy) return;
+    if (this._compileWaveActive) return;
+    if (this._warmDrainBusy) {
+      // ⛔ A STUCK BATCH DISABLES THE WARM FOR THE REST OF THE SESSION. The
+      // flag is cleared in a `finally`, so the only way to stay set is an await
+      // that never settles — a driver promise the device drops, an idle
+      // callback the page never schedules. Both are real and both are silent:
+      // the drain simply stops, no log, and every later cold variant spikes on
+      // its first draw. 30 s is far past the worst compile measured (14 s).
+      if (performance.now() - (this._warmDrainBusyAt ?? 0) < WARM_DRAIN_STUCK_MS) return;
+      console.warn("[gi] §19 4.3c: the late-variant warm batch never finished " +
+        `(${Math.round((performance.now() - (this._warmDrainBusyAt ?? 0)) / 1000)}s) — releasing the ` +
+        "drain so later variants can still be warmed. Anything it was holding falls back to its bound.");
+      this._warmDrainBusy = false;
+      this._giWarmInFlight = null;
+    }
     const engine = this.engine;
     const scene = engine?.scene;
     const camera = engine?.camera;
@@ -4963,11 +5278,77 @@ export class GISystem {
     // every key would read as new and the drain would duplicate the wave.
     if (!this._giWarmSealedAt) return;
     const now = performance.now();
-    if (now - (this._warmDrainAt ?? 0) < WARM_VARIANT_DRAIN_MS) return;
-    this._warmDrainAt = now;
     const warmed = this._giWarmedVariants;
+    // ⭐⭐ §19 4.3c — THE PRIORITY QUEUE, AND IT IS ALSO THE ONLY ROUTE TO A HELD
+    // PROXY. `#warmWalk` starts at the scene, and `#holdColdMergeProxies` has
+    // just taken the cold proxies OUT of it — so a held proxy is unreachable by
+    // the walk by construction and must be carried here explicitly. It is
+    // ordered, taken at the head, and it BYPASSES THE CADENCE: waiting up to
+    // 200 ms plus an idle callback is the reactive half this stage removes, and
+    // every millisecond of it is one the merge is drawing unmerged.
+    const rev = engine.merging?._rebuildCount ?? 0;
+    const queue = this._giWarmPriority;
+    if (queue?.length) {
+      // A stale entry (its rebuild was torn down) points at a proxy whose
+      // geometry merging has disposed — warming it would compile a pipeline for
+      // something that can never be drawn.
+      for (let i = queue.length - 1; i >= 0; i--) {
+        const q = queue[i];
+        // ⛔ AND A FAILED COMPILE MUST LEAVE THE QUEUE. A key that throws never
+        // reaches `warmed`, and `urgent` is what suspends the drain's cadence —
+        // so without this the drain re-picks the same failure every single tick
+        // forever, which is a busy loop wearing a fix's clothes. Three attempts,
+        // then it goes back to the ordinary walk and its hold expires at the
+        // bound like any other.
+        if (q.rev !== rev || warmed?.has(q.key) || (q.tries ?? 0) >= 3) queue.splice(i, 1);
+      }
+    }
+    const urgent = (queue?.length ?? 0) > 0;
+    // ⭐⭐⭐ §19 4.3c — A COMPILE IS A ~100 ms STALL WHEREVER IT HAPPENS, SO IT
+    // HAPPENS WHILE THE CAMERA IS STILL.
+    //
+    // The drain's own `compileAsync` is off-frame in the sense that no DRAW
+    // waits for it, and it is emphatically not free: measured this stage, an
+    // ordinary `MeshPhysicalNodeMaterial` pick took **8888 ms** and the frame
+    // its driver work landed on ran **116.7 ms with 100.2 of them unmarked** —
+    // the page not running JavaScript, waiting for the driver. That is the same
+    // ~100 ms the first DRAW of a cold variant costs, so warming buys nothing
+    // by being cheaper; it buys by choosing WHEN.
+    //
+    // ⭐ §18's mandate is the moving number. A parked frame that runs 116 ms is
+    // a hitch nobody sees; the same 116 ms mid-orbit is the user's report. So
+    // ordinary drain batches wait for a camera that has not moved since the
+    // last tick — and if the camera never stops, nothing is lost: the variant
+    // stays cold and pays exactly the same stall on its first draw, which is
+    // the pre-4.3b behaviour and not a regression of it.
+    //
+    // ⛔ URGENT BATCHES IGNORE THIS. A held proxy is not drawing at all until
+    // its compile returns, so deferring it to stillness would hold the merge
+    // out of the graph for as long as the user keeps moving.
+    if (!urgent) {
+      const e = camera.matrixWorld.elements;
+      const camKey = `${e[12].toFixed(3)},${e[13].toFixed(3)},${e[14].toFixed(3)},`
+        + `${e[0].toFixed(4)},${e[6].toFixed(4)},${e[9].toFixed(4)}`;
+      const camStill = camKey === this._giWarmCamKey;
+      this._giWarmCamKey = camKey;
+      if (!camStill) return;
+    }
+    if (!urgent && now - (this._warmDrainAt ?? 0) < WARM_VARIANT_DRAIN_MS) return;
+    this._warmDrainAt = now;
     const picks = [];
     const claimed = new Set();
+    if (queue?.length) {
+      for (const q of queue) {
+        if (picks.length >= WARM_VARIANT_BATCH || claimed.has(q.key)) continue;
+        // ⚠ `tries` is counted where the compile is ATTEMPTED, not here: the
+        // batch's time budget can end a cycle before the tail of `picks` is
+        // reached, and charging an attempt to a key that was never handed to
+        // the driver would retire a perfectly good pick after three cycles it
+        // spent waiting behind somebody else's two-second compile.
+        picks.push({ object: q.object, key: q.key, q });
+        claimed.add(q.key);
+      }
+    }
     let scanned = 0;
     let cold = 0;
     this.#warmWalk(scene, (object) => {
@@ -4981,7 +5362,12 @@ export class GISystem {
       // shader module is cached and they cost a millisecond; a genuinely new
       // program costs seconds. A fixed "one per cycle" prices every key at the
       // expensive one and would leave a 200-key backlog draining for minutes.
-      if (picks.length < WARM_VARIANT_BATCH) {
+      // §19 4.3c: while merge proxies are held, the walk's incidental finds do
+      // NOT join the batch. A held proxy is the only cold variant with a
+      // visible cost attached, and one ordinary `MeshPhysicalNodeMaterial` in
+      // the same batch spends the whole budget (6-14 s measured) with the merge
+      // waiting behind it.
+      if (!urgent && picks.length < WARM_VARIANT_BATCH) {
         picks.push({ object, key });
         claimed.add(key);
       }
@@ -5011,9 +5397,21 @@ export class GISystem {
     // does not re-pick them) and released in the `finally`.
     this._giWarmInFlight = claimed;
     this._warmDrainBusy = true;
+    this._warmDrainBusyAt = now;
+    const queuedAt = performance.now();
     const run = async () => {
       const t0 = performance.now();
       let done = 0;
+      // §19 4.3c diagnostic (`__giWarmTrace = true`): "warmed 1 variant in
+      // 14108 ms" does not say WHICH 14 seconds — the wait for the idle slot,
+      // one pick's node build, or the driver at the end — and those want three
+      // different fixes. Off by default: a log per pick would itself fail this
+      // probe's logs-per-second gate.
+      const trace = globalThis.__giWarmTrace === true;
+      if (trace) {
+        console.log(`[gi] 4.3c trace: batch START ${Math.round(t0 - queuedAt)} ms after queueing, `
+          + `${picks.length} pick(s)${urgent ? " URGENT" : ""}`);
+      }
       // The frame renders the scene through the postprocess PassNode's target
       // + MRT when one owns the camera, and that is a DIFFERENT pipeline-cache
       // context — warming the default framebuffer's would compile a program
@@ -5064,14 +5462,44 @@ export class GISystem {
           };
           pipelines.getForRender = wrapper;
         }
+        const budget = urgent ? WARM_URGENT_BUDGET_MS : WARM_VARIANT_BUDGET_MS;
+        const compiled = [];
         try {
-          for (const { object, key } of picks) {
+          for (const { object, key, q } of picks) {
+            if (q) q.tries = (q.tries ?? 0) + 1;
+            const tp = performance.now();
             await this.#compileObjectUnculled(renderer, object, pass?.camera ?? camera, scene);
-            // Only now. See the banner above the in-flight set.
-            warmed.add(key);
+            if (trace) {
+              console.log(`[gi] 4.3c trace: colour pick "${object.name || "?"}" `
+                + `${Math.round(performance.now() - tp)} ms, ${driverInflight.length} driver promise(s) so far`);
+            }
+            compiled.push({ object, key });
             done++;
-            if (performance.now() - t0 >= WARM_VARIANT_BUDGET_MS) break;
+            if (performance.now() - t0 >= budget) break;
           }
+          // ⛔⛔⛔ §19 4.3c — THE SECOND-CONTEXT WARM WAS BUILT, MEASURED AND
+          // REMOVED, AND THE MEASUREMENT IS WHY IT IS WRITTEN DOWN HERE.
+          //
+          // A pipeline is cached per (render object, RENDER CONTEXT), and this
+          // engine draws every mesh in three of them: the colour pass above,
+          // GI's own g-buffer prepass (`renderGiGBuffer` sets
+          // `scene.overrideMaterial` and binds `gbuffer.rt` + `mrtNode`), and
+          // the shadow map. Warming only the first is why an early cut of this
+          // stage measured a 111 ms frame ON THE RELEASE, carrying
+          // `renderPipeline_GI gbuffer` and `renderPipeline_ShadowMaterial`.
+          //
+          // So the drain was taught to re-bind the g-buffer's target + MRT +
+          // override material and compile each pick a second time. MEASURED, and
+          // it is a thrash: **73 render pipelines in one run**, `GI gbuffer_415`
+          // and `Background.material_126` re-created in PAIRS on fourteen
+          // consecutive frames, against 3 for the same arm without it. Binding a
+          // context from outside the pass that owns it does not reproduce that
+          // pass's cache key — it mints a pipeline the prepass then never asks
+          // for, every cycle, forever.
+          // ⭐ A WARM THAT DOES NOT HIT THE FRAME'S OWN CACHE KEY IS NOT A WARM,
+          // IT IS AN ALLOCATOR. The release's remaining cost is handled where it
+          // belongs instead — see `#releaseWarmHolds`, which lets go one proxy
+          // at a time and only while the camera is still.
         } finally {
           // ⚠ ONLY IF IT IS STILL OURS. A compile wave can start mid-drain and
           // installs its own wrapper on the same slot; restoring blindly would
@@ -5081,7 +5509,26 @@ export class GISystem {
             pipelines.getForRender = originalGetForRender;
           }
         }
+        const tDrv = performance.now();
         if (driverInflight.length) await Promise.all(driverInflight);
+        if (trace) {
+          console.log(`[gi] 4.3c trace: ${driverInflight.length} driver compile(s) resolved in `
+            + `${Math.round(performance.now() - tDrv)} ms`);
+        }
+        // ⛔⛔⛔ §19 4.3c — WARM MEANS THE *DRIVER* HAS IT, NOT THAT
+        // `compileAsync` RETURNED.
+        //
+        // 4.3b's rule ("a key becomes warm when its compile returns") was
+        // written before the interception existed, and the interception makes
+        // it false: `getForRender` hands the pipeline promises to US, so
+        // `compileAsync` now returns while the driver is still compiling.
+        // Marking warm there is a set that records DISPATCH, one layer below
+        // the INTENT-not-COMPLETION bug 4.3b already fixed twice — and with the
+        // hold reading this set, it released a proxy whose pipeline did not
+        // exist yet: the first cut's 111 ms release frame carries
+        // `RenderPipeline ×2` for exactly that reason. After the await, and only
+        // after it.
+        for (const { key } of compiled) warmed.add(key);
         const first = picks[0].object;
         const mat = Array.isArray(first.material) ? first.material[0] : first.material;
         console.log(`[gi] §19 4.3b: warmed ${done} late variant(s) off-frame in ` +
@@ -5101,7 +5548,11 @@ export class GISystem {
       }
     };
     const idle = globalThis.requestIdleCallback;
-    if (typeof idle === "function") idle(() => { void run(); }, { timeout: 2000 });
+    // §19 4.3c: still an idle callback — the compile's synchronous half is a
+    // node-graph build and WGSL codegen the frame must not carry — but a batch
+    // that is holding a merge out of the graph gets a tighter deadline, because
+    // every millisecond of it is a millisecond the scene draws unmerged.
+    if (typeof idle === "function") idle(() => { void run(); }, { timeout: urgent ? 200 : 2000 });
     else setTimeout(() => { void run(); }, 0);
   }
 

@@ -178,7 +178,11 @@ page.on("console", (m) => {
   const t = m.text();
   if (/scene assets ready/.test(t) && !marks.assetsReady) marks.assetsReady = Date.now();
   if (/\[gi2\] first light/.test(t) && !marks.firstLight) marks.firstLight = Date.now();
-  if (/\[gi2\]|\[gi\] (built|quality|auto-fit|follow|compile wave)/.test(t)) {
+  // §19 4.3c: the hold/release pair has to be STREAMED, not left to the top-12
+  // `logTexts` table — "0 pipelines during the arm" is the same output whether
+  // the held proxies came back warm or are still sitting outside the graph, and
+  // those are a fix and a hole in the scene respectively.
+  if (/\[gi2\]|\[gi\] (§19 )?4\.3c|\[gi\] (built|quality|auto-fit|follow|compile wave)/.test(t)) {
     marks.lines.push(t.slice(0, 200));
     console.log(`    ${t.slice(0, 240)}`);
   }
@@ -284,6 +288,9 @@ const installed = await page.evaluate(async () => {
 
   const R = {
     frames: [], plan: null, planAt: 0, arm: "boot", seg: "boot",
+    // §19 4.3c: the run's coarse phase, which the arm labels cannot carry —
+    // "settled", "merge-forced" (the rebuild's own 2 s gap) and "arms".
+    phase: "boot",
     longtasks: [], logCount: 0, pending: [], base: null, done: true,
     dispatchLabel: new Map(), pin: 0,
     // §19 3.18 — `CLASSIFY=1`. Off by default: the class census reads a second
@@ -541,7 +548,14 @@ const installed = await page.evaluate(async () => {
               const f = a[0]?.fragment?.entryPoint ?? "";
               label += ` [${v}/${f}]`;
             } catch { /* a descriptor shape three changed */ }
-            R.pipelines.push({ t: performance.now(), frame: R.frames.length, label });
+            // §19 4.3c: WHEN, in the run's own segmentation. "2 pipelines after
+            // boot" is not a gate anybody can act on — "2 pipelines DURING THE
+            // ORBIT" is, and the same two arriving in the idle gap between a
+            // forced merge and the arm is the fix working rather than failing.
+            R.pipelines.push({
+              t: performance.now(), frame: R.frames.length, label,
+              arm: R.arm, seg: R.seg, phase: R.phase ?? "boot",
+            });
           }
           return r;
         };
@@ -679,6 +693,13 @@ const installed = await page.evaluate(async () => {
     cls: Object.fromEntries(CLS.map((k) => [k, 0])),
     base: Object.fromEntries(CLS.map((k) => [k, 0])),
     clsUnk: 0, baseUnk: 0,
+    // ⭐⭐ §19 3.19 — THE SERIES, NOT THE MEAN. 3.18's park control says a
+    // post-JUMP park flips 9.5-11 % where a settled park flips 0.0, and a
+    // whole-segment percentage cannot tell a transient that DECAYS from a field
+    // that churns forever — which is the entire question. One row per reduced
+    // frame, with the classes it flipped on, makes the decay visible and dates
+    // the frame the field goes quiet. [[probe-blind-statistics]]
+    perFrame: [],
   });
   const histAdd = (G, v) => { G.hist[Math.min(2000, Math.max(0, Math.round(v * 1000)))]++; G.hn++; };
   const histP = (G, p) => {
@@ -731,6 +752,9 @@ const installed = await page.evaluate(async () => {
     }
     G.curS.fill(0);
     if (d) { G.curV.fill(0); G.curSR.fill(0); }
+    // §19 3.19: this frame's own row is the DELTA of the running counters.
+    const f0 = { steps: G.steps, flips: G.flips, moved: G.moved, reproj: G.reproj };
+    const c0 = { ...G.cls };
     const NC = dv;
     for (let i = 0; i < N; i++) {
       if (!(f[i * 4 + 3] > 0.5)) continue;
@@ -799,6 +823,14 @@ const installed = await page.evaluate(async () => {
         }
       }
     }
+    G.perFrame.push({
+      seg,
+      steps: G.steps - f0.steps,
+      flips: G.flips - f0.flips,
+      moved: G.moved - f0.moved,
+      reproj: G.reproj - f0.reproj,
+      cls: d ? Object.fromEntries(CLS.map((k) => [k, G.cls[k] - c0[k]])) : null,
+    });
     G.prevS.set(G.curS);
     if (d) {
       G.prevD.set(d);
@@ -864,6 +896,7 @@ const installed = await page.evaluate(async () => {
       moveFlipPct: G.move.steps ? (100 * G.move.flips) / G.move.steps : null,
       moveMovedPct: G.move.reproj ? (100 * G.move.moved) / G.move.reproj : null,
       moveSteps: G.move.steps,
+      perFrame: G.perFrame,
     };
   };
 
@@ -1175,6 +1208,92 @@ if (process.env.PROFILE) {
   console.log("  JS sampling profiler ARMED (200 µs) — timings carry its overhead");
 }
 
+// ══ §19 STAGE 4.3c — THE FORCED-MERGE ARM ═══════════════════════════════════
+//
+// ⭐⭐ THE QUIESCED RUN IS THE EASY HALF, AND 4.3b ONLY EVER MEASURED THAT ONE.
+// Its receipt reads "0 pipelines created, MAX 26.2 ms" — taken after the probe
+// waits for `merging.settling` to clear. But the same commit records "a merge
+// rebuild seconds before the arm still leaves 2", because the late-variant
+// drain is REACTIVE: it wakes on its own 200 ms cadence, hands the compile to
+// an idle callback, and a merge proxy published in between is DRAWN before its
+// pipeline exists. The user's editor merges after every edit, so the quiesced
+// arm is not the case that hitches.
+//
+// `MERGE_ARM=1` makes the probe reproduce it deliberately: force one rebuild,
+// wait for it to land, then leave exactly `MERGE_GAP_MS` (2 s by default)
+// before the arm starts — the same window the reactive drain loses.
+//
+// ⚠ `_urgent` IS WHAT MAKES IT LAND. `invalidate()` alone only marks the system
+// dirty; `sync()` then holds it for SETTLE_MS and throttles it against
+// MIN_REBUILD_INTERVAL_MS, so a plain invalidate on a quiet scene can sit for
+// half a second and land inside the arm instead of before it — which measures
+// a different thing and says nothing about the gap.
+const MERGE_ARM = process.env.MERGE_ARM === "1";
+const MERGE_GAP_MS = Number(process.env.MERGE_GAP_MS ?? 2000);
+if (MERGE_ARM) {
+  console.log("\n── forced merge rebuild ─────────────────────────────────");
+  const before = await page.evaluate((wantNew) => {
+    const R = globalThis.__gi2Motion;
+    R.phase = "merge-forced";
+    R.mergePipeAt = R.pipelines.length;
+    const m = globalThis.__giEngineForProbe?.merging;
+    if (!m) return { ok: false };
+    const n = m._rebuildCount ?? 0;
+    // ⭐⭐ AND THE REBUILD HAS TO ACTUALLY MINT MATERIALS, OR THE ARM MEASURES
+    // NOTHING. A rebuild whose groups come out the same shape hits
+    // `merging.#uberFor`'s cache and every proxy wears a material three has
+    // already drawn — no pipeline, no spike, and a run that PASSES without
+    // testing anything (measured: 189 → 189 groups, 0 new materials, 0
+    // pipelines, and the fix's own log never fired). Evicting N cache entries
+    // makes the next rebuild mint exactly N fresh uber materials, which is the
+    // shape of the case 4.3b left open, at a size it names.
+    // ⚠ The evicted entries are NOT disposed — their texture arrays leak for the
+    // rest of the run. That is a deliberate probe-only cost: `dispose()` here
+    // would free arrays the CURRENT proxies are still drawing with.
+    let evicted = 0;
+    if (wantNew > 0 && m._uberCache?.size) {
+      for (const key of [...m._uberCache.keys()].reverse()) {
+        if (evicted >= wantNew) break;
+        m._uberCache.delete(key);
+        evicted++;
+      }
+    }
+    m.invalidate("probe:forced-merge");
+    m._urgent = true;
+    return { ok: true, n, evicted, groups: m.groups?.length ?? 0, enabled: m.enabled };
+  }, Number(process.env.MERGE_NEW ?? 3));
+  if (!before.ok || !before.enabled) {
+    console.log(`  ⚠ merging is ${before.ok ? "DISABLED" : "absent"} on this scene — the forced-merge ` +
+      "arm measures nothing here; run it on a scene with `performance.staticMerging`.");
+  } else {
+    const deadline = Date.now() + 30_000;
+    let landed = null;
+    while (Date.now() < deadline) {
+      landed = await page.evaluate((n) => {
+        const m = globalThis.__giEngineForProbe?.merging;
+        return { n: m?._rebuildCount ?? 0, dirty: !!m?._dirty, groups: m?.groups?.length ?? 0, want: n };
+      }, before.n);
+      if (landed.n > before.n && !landed.dirty) break;
+      await wait(100);
+    }
+    console.log(`  ${before.evicted} uber cache entr(ies) evicted — rebuild #${landed?.n} landed ` +
+      `(${before.groups} → ${landed?.groups} groups)` +
+      `${landed && landed.n <= before.n ? " — ⚠ NEVER LANDED, the arm below is a quiesced run" : ""}`);
+    await page.evaluate(() => {
+      const R = globalThis.__gi2Motion;
+      R.mergeLandedAt = performance.now();
+      R.mergeLandedPipe = R.pipelines.length;
+    });
+    await wait(MERGE_GAP_MS);
+    console.log(`  ${MERGE_GAP_MS} ms gap elapsed — arming`);
+  }
+}
+await page.evaluate(() => {
+  const R = globalThis.__gi2Motion;
+  R.phase = "arms";
+  R.armPipeAt = R.pipelines.length;
+});
+
 for (const [arm, label, pin, cells] of armList) await runArm(arm, label, pin, cells);
 
 // ══════════════ §19 STAGE 3.12 — GRAIN UNDER MOTION, ON THIS SCENE ══════════
@@ -1243,7 +1362,11 @@ if (GRAIN) {
       ["3.11 (dither 1, no accum)", { probeDither: 1, accumOn: 0 }],
       ["3.12 (centres + accum)", { probeDither: 0, accumOn: 1 }],
     ];
-    for (const arm of ARMS) {
+    // §19 3.19: `GRAIN_ARMS` lets the grain census run arms the PERF tables have
+    // no use for — `jump` is a single teleport followed by a still camera, which
+    // is a post-jump transient and not a frame-time arm.
+    const G_ARMS = (process.env.GRAIN_ARMS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    for (const arm of (G_ARMS.length ? G_ARMS : ARMS)) {
       for (const [name, cfg] of CFG) {
         const label = `${arm} / ${name}`;
         await page.evaluate(({ arm, label, cfg, frames, DOLLY_M, park }) => {
@@ -1287,6 +1410,34 @@ if (GRAIN) {
                 p: [B.p[0] + u[0] * k, B.p[1] + u[1] * k, B.p[2] + u[2] * k],
                 t: [B.t[0] + u[0] * k, B.t[1] + u[1] * k, B.t[2] + u[2] * k],
               });
+            } else if (arm === "jump") {
+              // ⭐⭐⭐ §19 3.19 — ONE TELEPORT, THEN A STILL CAMERA.
+              //
+              // 3.18's park control reads dolly-park 9.5 % and whip-park 11.0 %
+              // against orbit-park's 0.0 %, and the difference between those
+              // arms is not the motion — it is that orbit runs FIRST, from the
+              // pose the camera was already parked at, while dolly and whip
+              // begin by snapping back to base from wherever the previous arm
+              // left off. The 9.5 % is a POST-JUMP transient, and the whole-arm
+              // percentage cannot separate it from the moving grain.
+              //
+              // This arm is that transient and nothing else: a settle at base
+              // (its own control, which must read ~0), then a single 20 m
+              // teleport, then GRAIN_FRAMES frames with the camera NOT MOVING.
+              // ⭐ From the second held frame on, the reprojection is EXACT —
+              // the camera has not moved, so the tap reads the previous value
+              // rather than interpolating it, and 3.18's resampling floor is
+              // gone. Every flip after that frame is the field changing on its
+              // own, which is the one thing this row could never say before.
+              const d = [B.t[0] - B.p[0], B.t[1] - B.p[1], B.t[2] - B.p[2]];
+              const len = Math.hypot(d[0], d[1], d[2]) || 1;
+              const u = d.map((v) => v / len);
+              const k = DOLLY_M;
+              steps.push({
+                seg: "grain",
+                p: [B.p[0] + u[0] * k, B.p[1] + u[1] * k, B.p[2] + u[2] * k],
+                t: [B.t[0] + u[0] * k, B.t[1] + u[1] * k, B.t[2] + u[2] * k],
+              });
             } else steps.push({ seg: "grain", p: B.p, t: rotY(B.t, B.p, Math.PI * f) });
           }
           R.arm = label; R.seg = "grain-park";
@@ -1318,6 +1469,55 @@ if (GRAIN) {
         console.log(`      PARKED flips ${p(row.parkFlipPct).padStart(5)} % of ${String(row.parkSteps).padStart(8)}` +
           ` (moved ${p(row.parkMovedPct).padStart(5)} %)   MOVING flips ${p(row.moveFlipPct).padStart(5)} %` +
           ` of ${String(row.moveSteps).padStart(8)} (moved ${p(row.moveMovedPct).padStart(5)} %)`);
+        // ⭐⭐ §19 3.19 — THE DECAY, FRAME BY FRAME. Printed for any arm whose
+        // moving segment is a STILL camera (`jump`), and on request otherwise:
+        // "9.5 % over the segment" is the same number whether the field settles
+        // in three frames or never settles at all, and those are opposite
+        // findings. `f2+` is the row that matters — from the second held frame
+        // the camera has not moved, so the reprojection is exact and the
+        // resampling floor is not in it.
+        // ⭐⭐⭐ §19 3.19 — THE PARK ROW MINUS ITS FIRST FRAME, ON EVERY ARM.
+        //
+        // A `grain-park` segment does not start parked: it starts by SNAPPING
+        // the camera back to base from wherever the previous arm ended, and
+        // that one frame's reprojection is at §Z's floor — a 20 m tap error
+        // whose sign is arbitrary. It carries ~7 400 of a park segment's ~62 000
+        // steps, so a park that is otherwise EXACTLY still still reports 9-12 %.
+        // That is 3.18's "dolly park 9.5 %, whip park 11.0 %" in full, and the
+        // row below is the same statistic with the jump frame taken out.
+        if (row.perFrame?.length) {
+          const pk2 = row.perFrame.filter((r) => r.seg === "grain-park");
+          const withSteps = pk2.findIndex((r) => r.steps > 0);
+          const tail2 = withSteps < 0 ? [] : pk2.slice(withSteps + 1);
+          const st = tail2.reduce((a2, r) => a2 + r.steps, 0);
+          const fl = tail2.reduce((a2, r) => a2 + r.flips, 0);
+          const f1 = withSteps < 0 ? null : pk2[withSteps];
+          console.log(`      PARK, first scored frame ${f1 && f1.steps ? ((100 * f1.flips) / f1.steps).toFixed(1) : "—"} %`
+            + ` of ${f1?.steps ?? 0} steps (the camera JUMPED into this park) · `
+            + `every park frame AFTER it ${st ? ((100 * fl) / st).toFixed(2) : "—"} % of ${st} steps`);
+        }
+        if (row.perFrame?.length && (arm === "jump" || process.env.GRAIN_SERIES === "1")) {
+          const mv = row.perFrame.filter((r) => r.seg === "grain");
+          const pk = row.perFrame.filter((r) => r.seg === "grain-park");
+          const pctOf = (rs) => {
+            const s = rs.reduce((a, r) => a + r.steps, 0);
+            const fl = rs.reduce((a, r) => a + r.flips, 0);
+            return s ? (100 * fl) / s : null;
+          };
+          const tail = mv.slice(1);
+          console.log(`      park ${p(pctOf(pk))} % · jump frame ${p(pctOf(mv.slice(0, 1)))} % · ` +
+            `HELD-STILL frames 2+ ${p(pctOf(tail))} % of ${tail.reduce((a, r) => a + r.steps, 0)} steps`);
+          const ser = (rs) => rs.map((r) => (r.steps ? ((100 * r.flips) / r.steps).toFixed(1) : "—")).join(" ");
+          console.log(`      per-frame flips %, park:   ${ser(pk)}`);
+          console.log(`      per-frame flips %, moving: ${ser(mv)}`);
+          console.log(`      per-frame STEPS,   moving: ${mv.map((r) => r.steps).join(" ")}`);
+          if (mv.some((r) => r.cls)) {
+            const clsRow = (r) => (r.cls
+              ? Object.entries(r.cls).filter(([, v]) => v > 0).map(([k, v]) => `${k}${v}`).join("/") || "-"
+              : "-");
+            console.log(`      per-frame flip classes: ${mv.slice(0, 12).map(clsRow).join("  ")}`);
+          }
+        }
         // §19 3.18 — the class census, printed only when it was collected.
         if (row.cls && row.base && Object.values(row.base).some((n) => n > 0)) {
           const tot = Object.values(row.cls).reduce((a, b) => a + b, 0) || 1;
@@ -1627,7 +1827,32 @@ console.log("");
     console.log("");
     console.log(`  RENDER/COMPUTE PIPELINES CREATED AFTER BOOT: ${data.pipelines.length}`);
     for (const q of data.pipelines) {
-      console.log(`    frame #${q.frame}  t=${f2(q.t)}  ${q.label || "(no label)"}`);
+      console.log(`    frame #${q.frame}  t=${f2(q.t)}  [${q.phase ?? "?"}/${q.arm ?? "?"}/${q.seg ?? "?"}]  ` +
+        `${q.label || "(no label)"}`);
+    }
+    // ⭐ §19 4.3c — AND WHETHER THE HOLD ACTUALLY LET GO. A proxy still out of
+    // the graph at the end of the run has not been warmed, it has been HIDDEN,
+    // and the two produce the same "0 pipelines" line.
+    {
+      const holds = await page.evaluate(() => {
+        const sys = globalThis.__giSysForProbe?.();
+        for (const k of Object.keys(sys ?? {})) {
+          if (k === "_giWarmHolds") return { n: sys[k]?.length ?? 0 };
+        }
+        return { n: null };
+      }).catch(() => ({ n: null }));
+      console.log(`  merge proxies STILL held out of the graph at the end of the run: ` +
+        `${holds.n ?? "unknown"}${holds.n ? "  ⚠ those are drawing as members, not as a merge" : ""}`);
+    }
+    // ⭐ §19 4.3c — THE GATE IS THE ARM'S OWN COUNT. A pipeline minted in the
+    // merge gap is the proactive warm doing its job off-frame; a pipeline
+    // minted inside a moving arm is the 107 ms spike.
+    {
+      const inArms = data.pipelines.filter((q) => q.phase === "arms");
+      const inGap = data.pipelines.filter((q) => q.phase === "merge-forced");
+      const moving = inArms.filter((q) => q.seg === "moving");
+      console.log(`  → ${inGap.length} in the forced-merge gap (off-frame, good), ` +
+        `${inArms.length} during the arms (${moving.length} of them on a MOVING frame)`);
     }
     // ⭐⭐ §19 STAGE 4.3b — *WHOSE* PIPELINE. A label names the material's TYPE
     // and its `material.id` (`renderPipeline_${name || type}_${id}`, see

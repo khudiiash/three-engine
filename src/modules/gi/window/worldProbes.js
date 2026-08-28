@@ -553,6 +553,32 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
      * (`SPLIT_OWN` off) α is still 1 by algebra, not by taste — see `mergeFor`.
      */
     wpAlpha: uniform(SPLIT_OWN ? 0.25 : (INTERVALS ? 1 : 0.25)),
+    /**
+     * ⭐⭐⭐ §19 3.19 — HOW MANY UPDATES A RE-KEYED PROBE TAKES TO STOP QUOTING
+     * ITS PARENT. `1` is 3.18 verbatim (the first own trace REPLACES the seed),
+     * which is what makes it a one-boot A/B arm rather than a commit.
+     *
+     * THE RECEIPT (`probe:gi2-motion`, Bistro ultra, world, `GRAIN_ARMS`):
+     * a park segment that the camera JUMPS into reads, frame by frame,
+     *   dolly  — 41.5  56.0  1.5  29.4  13.6  0.3  4.7 … 5.1 … 6.3 … 3.4 …
+     *   whip   —  61.0  2.2  19.7  1.0  0.9  0.2  0.6  1.8  1.9  6.1 …
+     * against an orbit park that never leaves 0.0-0.4 %. Two things are visible
+     * in those rows and neither is in a segment mean: the transient DECAYS over
+     * about six frames, and what is left of it BEATS at the round-robin period
+     * — a probe re-keyed by the scroll takes its own turn a few frames later,
+     * and on that turn the value the resolve reads jumps from its parent's
+     * merged answer to its own first trace in ONE step. Eight corners doing
+     * that on different frames is a pixel whose delta changes sign every time
+     * another corner catches up.
+     *
+     * So the composed word RAMPS: on update `n` of a seeded probe it moves
+     * `min(1, n / wpSeedRamp)` of the way from what it held to what this trace
+     * measured, reaching the trace exactly at `n = wpSeedRamp`. Monotone by
+     * construction (every step is a positive fraction of the same gap), and
+     * `own` — word 2, the probe's own band — is untouched at α = 1, so the
+     * merge still cannot double-count the parent's far chain (see `fresh`).
+     */
+    wpSeedRamp: uniform(4),
     /** 0 removes the resolve's visibility term — the LEAK RECEIPT'S CONTROL. */
     wpVisOn: uniform(1),
     /** 0 removes the probe-face gate; the other half of the same control. */
@@ -1331,6 +1357,9 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // `INTERVALS && !SPLIT_OWN` arm is byte-for-byte 3.15 and the pre-interval
     // arm is byte-for-byte 3.14.
     const prevOwn = wpOct.element(addr.add(uint(OWN_W))).toVar();
+    // §19 3.19: the COMPOSED word as it stands — the seed's value on a probe
+    // that has never traced. Read before anything writes `addr`.
+    const prevComposed = wpOct.element(addr).toVar();
     const prev1 = wpOct.element(addr.add(uint(1))).toVar();
     const had = nOf(prev1).greaterThan(uint(0)).and(fresh.not()).toVar();
     // Under the IN-PLACE merge α is 1 by algebra, not by taste — see `wpAlpha`.
@@ -1348,7 +1377,24 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // last cascade, or `NC = 1`) is already its own final answer, and a texel
     // the merge WILL touch is overwritten this same frame by `mergeFor`, which
     // recomposes it from word 2. Nothing downstream ever sees a half-state.
-    wpOct.element(addr).assign(packedRgb);
+    // ⭐⭐ §19 3.19 — THE SEED RAMP, AND IT IS ON WORD 0 ONLY.
+    //
+    // `wpSeedRamp = 1` is 3.18 byte-for-byte (`a0` collapses to 1). Above 1 the
+    // composed word — the ONLY word the resolve reads — walks from the seed to
+    // this trace's answer over that many of the probe's own updates, while
+    // word 2 keeps taking the trace at α = 1.
+    // ⚠ A probe with `n = 0` never held a seed: `prevComposed` is whatever the
+    // slot held before the cell was re-keyed, so it takes `a0 = 1` and this is
+    // inert for it. And a TRANSPARENT texel is recomposed by `mergeFor` in this
+    // same frame regardless — the ramp reaches only the opaque ones, which are
+    // exactly the texels the merge leaves alone.
+    const nPrev = nOf(prev1).toVar();
+    const a0 = emaOn
+      ? select(nPrev.greaterThan(uint(0)),
+        min(float(1), nPrev.toFloat().div(wu.wpSeedRamp.max(1))), float(1)).toVar()
+      : float(1).toVar();
+    const rgb0 = emaOn ? mix(decodeRgbe(prevComposed), rgb, a0).toVar() : rgb;
+    wpOct.element(addr).assign(emaOn ? encodeRgbe(rgb0) : packedRgb);
     if (SPLIT_OWN) wpOct.element(addr.add(uint(2))).assign(packedRgb);
     wpOct.element(addr.add(uint(1))).assign(
       packMoments(nOf(prev1).add(uint(1)).min(uint(63)), m1, sqrt(m2.max(0)), dmax, tNew),

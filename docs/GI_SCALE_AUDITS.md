@@ -3268,3 +3268,178 @@ JUMP the field churns for more than ten still frames (dolly park 9.5 %, whip
 park 11.0 %, against orbit's 0.0 % after a long settle). That transient is real,
 it is measurable with a still camera, and it is the first thing a future stage
 should chase — not the moving flip rate, which cannot resolve it.
+
+---
+
+## AA. STAGE 4.3c — THE MERGE'S OWN PIPELINES, AND THE POST-JUMP TRANSIENT
+
+### AA.1 THE ~107 ms ORBIT SPIKE IS A MERGE PROXY'S FIRST DRAW
+
+4.3b left this open in one clause — "a merge rebuild seconds before the arm still
+leaves 2" — because its quiesced arm waits for `merging.settling` to clear, and a
+user's editor merges after every edit. `probe:gi2-motion` gains `MERGE_ARM=1`,
+which forces one rebuild (`invalidate` + `_urgent`, since a plain invalidate can
+sit out `SETTLE_MS` and land *inside* the arm) and then leaves exactly
+`MERGE_GAP_MS` before arming. `MERGE_NEW=n` evicts n entries from
+`merging._uberCache` first, because a rebuild whose groups come out the same
+shape hits that cache, mints no materials, and the arm then passes without
+testing anything (measured: 189 → 189 groups, 0 new materials, 0 pipelines).
+
+Named on the first run: forced rebuild, 187 → 189 groups, three fresh uber
+materials. `Uber(8)`/`Uber(6)` were on camera and minted inside the first frame
+after the merge (`renderer.render` **70.7 ms**); `Uber(3)_709` belonged to a
+`Merged(3)` at the far end of the street and minted at orbit frame #246 —
+**89.4 ms, 74.7 of them unmarked**, the page waiting on the driver. That is
+3.17's ~107 ms on both paths.
+
+**Making the drain faster cannot close it.** The same run has the drain spending
+7445 ms and 2355 ms on ONE variant each, and 4.3b already measured concurrent
+compiles as worse (MAX 128 → 752 ms). ⭐ **When the fix cannot be "finish sooner",
+the fix is "do not draw it yet."**
+
+So the swap is HELD. In GI's `onPreRender` — which the engine runs after
+`merging.sync()` and before the draw, so the publishing frame is the proxy's
+first and it has not happened yet — every new proxy whose material three has
+never drawn is taken OUT OF THE SCENE GRAPH and its members are put back on
+screen in its place. Same triangles, wearing materials the compile wave already
+paid for.
+
+Four things had to be right, each with its own failed cut:
+
+* ⛔ **REMOVED FROM THE GRAPH, NOT `visible = false`.** `_projectObject` returns
+  on `visible === false`, so hiding the proxy makes its own warm compile nothing
+  (4.3b's frustum-cull defect with a new author); flipping `visible` back for the
+  compile hands a frame inside the await exactly the draw this prevents.
+* ⛔ **A COLD KEY IS NOT A MISSING PIPELINE.** The first cut held 9 of 189
+  proxies because `_giWarmedVariants` records what *we* compiled. A rebuild mints
+  new meshes, but a proxy wearing a cached uber material at the same vertex
+  layout hits three's own pipeline cache. Keying the hold on "a material three
+  has never been asked to draw" gives **3** — exactly how many pipelines the run
+  created.
+* ⛔ **WARM MEANS THE DRIVER HAS IT.** With `getForRender`'s promises
+  intercepted, `compileAsync` returns while the driver is still compiling;
+  marking warm there released a proxy whose pipeline did not exist yet (that
+  cut's 111 ms release frame carries `RenderPipeline ×2`). After the await, only.
+* ⛔ **THE BOOT MERGE IS NOT HELD** (`textureLoadsInFlight() > 0`). Held during
+  the texture tail, both boot proxies timed out and their pipelines were then
+  minted at arm frames #22-24 — **3 frames over 50 ms, MAX 115.5** on an arm that
+  reads 26.2 without it. ⭐ **A deferral is only a fix where the thing it defers
+  into is cheaper.**
+
+⛔ **AND THE SECOND-CONTEXT WARM WAS BUILT, MEASURED AND REMOVED.** A pipeline is
+cached per (render object, render context) and this engine draws in three: the
+colour pass, GI's g-buffer prepass, and the shadow map. Re-binding the g-buffer's
+target + MRT + override material and compiling each pick a second time produced
+**73 render pipelines in one run**, with `GI gbuffer_415` and
+`Background.material_126` re-created in PAIRS on fourteen consecutive frames
+(three's `compileAsync` calls `_background.update` with whatever context is
+bound). ⭐ **A warm that does not hit the frame's own cache key is not a warm, it
+is an allocator.** The release's residue is handled where it belongs instead: one
+proxy per tick, and only while the camera is still — a 100 ms parked frame is a
+hitch nobody sees, the same 100 ms mid-orbit is the user's report. The same rule
+now gates ordinary drain batches, whose own compiles were measured at 8888 ms for
+one pick and a 116.7 ms frame with 100.2 unmarked.
+
+**THE RECEIPT** (Bistro ultra, world path, forced merge with 3 fresh uber
+materials 2 s before the arm, same code, `__giWarmProactive` the only difference):
+
+| forced-merge orbit | proactive OFF (4.3b) | ON (4.3c) |
+|---|---|---|
+| render pipelines during the arms | **1** (`Uber(3)`, moving frame #255) | **0** |
+| orbit MAX | **100.20 ms** | **22.40 ms** |
+| frames > 50 ms | **1** | **0** |
+| p95 / parked median | 20.20 / 14.00 | 20.30 / 14.20 |
+
+⚠ **OPEN, AND THE INSTRUMENT NOW SAYS SO EVERY TWO SECONDS.** Under continuous
+rAF load a single `compileAsync` on a held proxy can stall inside three's own
+per-object `yieldToMain` loop: the traced run prints `batch START … 1 pick
+URGENT` and no pick ever completes, and the run ends with 3 proxies still held
+(drawing as members — correct image, +8 % draws, no hitch). A 30 s watchdog now
+releases a stuck batch so the warm is not disabled for the rest of the session,
+`tries >= 3` retires a key that keeps failing, and `WARM_HOLD_MAX_MS` puts the
+proxy back regardless.
+
+### AA.2 THE POST-JUMP TRANSIENT IS THE SEED→OWN REPLACEMENT, AND IT BEATS AT THE ROUND-ROBIN PERIOD
+
+§Z closed on "dolly park 9.5 %, whip park 11.0 %, orbit park 0.0 %" and could not
+say what churns. Two instruments answer it. `perFrame` scores each reduced frame
+on its own — a segment mean cannot tell a transient that DECAYS from a field that
+churns forever, and those are opposite findings. And a `jump` arm settles at base,
+TELEPORTS 20 m once, and then holds the camera still, so from its second held
+frame the reprojection is EXACT and 3.18's resampling floor is gone.
+
+Reproduced first: orbit park 0.1 %, **dolly park 9.3 %, whip park 8.5 %**. Then,
+frame by frame:
+
+```
+dolly park:  —  41.5 56.0  1.5 29.4 13.6  0.3  4.7  0.1  0.6  5.1  2.5  6.3 …
+whip  park:  —   —    —   61.0  2.2 19.7  1.0  0.9  0.2  0.6  1.8  1.9  6.1 …
+orbit park:  —   —    —    0.0  0.0  0.0  0.0  0.0  0.0  0.1  0.1  0.4  0.2 …
+```
+
+It decays over about six frames, and what is left BEATS every four or five frames
+— the round-robin period. `CLASSIFY=1` puts **rekey at 99.4 % of flips against
+11.9 % of steps**, and the mechanism follows: a probe re-keyed by the scroll is
+SEEDED with its parent's merged answer (`ready = 0.5`), and on its own turn its
+first trace REPLACES that value in one step (`fresh` ⇒ α = 1). Eight corners
+doing that on different frames is a pixel whose delta changes sign every time
+another corner catches up.
+
+⭐ **The jump arm is the control that proves the estimator itself is fine**: one
+frame at the floor (98.1 %), one frame of 8 steps, and then **0 steps at all** for
+37 held frames. §T holds; what oscillates is the hand-off, not the field.
+
+**THE FIX** (`wpSeedRamp`, default 4; `1` is 3.18 byte-for-byte): the COMPOSED
+word — the only word the resolve reads — moves `min(1, n / wpSeedRamp)` of the
+way from what it held toward this trace's answer, reaching it exactly at
+`n = wpSeedRamp`. Monotone by construction, every step a positive fraction of the
+same gap. `own` (word 2) still takes the trace at α = 1, so the merge cannot
+double-count the parent's far chain, and a transparent texel is recomposed by
+`mergeFor` in the same frame regardless — the ramp reaches exactly the opaque
+texels the merge leaves alone.
+
+Bracketed A-B-A, one boot, dolly arm, `GRAIN_CFG`:
+
+| dolly arm | park total | the jump frame | park after it | MOVING |
+|---|---|---|---|---|
+| warm-up (no jump) | 0.0 % | 0.1 % | 0.03 % | 41.2 % |
+| ramp1 A (3.18) | 5.8 % | **51.2 %** | 1.68 % | 39.7 % |
+| **ramp4 (3.19)** | **3.9 %** | **3.9 %** | 3.88 % | 40.3 % |
+| ramp1 B (3.18) | 6.9 % | **57.0 %** | 2.14 % | 39.8 % |
+
+The step is gone (51/57 → 3.9) and it is spread rather than hidden: the tail
+rises 1.7/2.1 → 3.9 because four small same-signed steps move more frames than
+one big one. Park total 5.8/6.9 → **3.9 %**; the moving row is unchanged inside
+§Z's arm-to-arm spread.
+
+⚠ **THE BRIEF'S GATE — "dolly/whip park ≤ orbit park (≈0 %)" — IS NOT REACHED AND
+CANNOT BE BY THIS ROUTE.** A park segment's FIRST frame is a camera jump, and its
+reprojection sits at §Z's own floor whatever the field does. The jump arm's
+0-step tail is the honest form of the same statement.
+
+### AA.3 THE GATE TABLE
+
+| gate | 3.18 | **4.3c** |
+|---|---|---|
+| Cornell orbit sign-flip (world lattice) phone/high/ultra | 11.5 / 18.1 / 17.8 | **11.5 / 18.0 / 17.8** |
+| at rest: REST px Δp95 / grain sign flips | 0.00 / 0.0 % | **0.00 / 0.0 %** (all tiers) |
+| panel move MONOTONE (shipped H=32) | 133↑ / 0↓ | **136↑ / 0↓** |
+| trim sub-voxel crops, three tiers | 6/6 · 5/6 · 5/6 | **6/6 · 5/6 · 5/6** |
+| 5 cm leak + four rotations, per 10 000 | 0 / 0 / 3 / 2 | **0 / 0 / 3 / 2** |
+| gather chain ms @960×540, three tiers | — | **0.465 / 0.852 / 1.080** |
+| `test:gi2-lightshadow` | PASS | **PASS** |
+| `test:gi-sunleak` | PASS | **PASS** (worst leak 0.00000) |
+| `test:gi-moved-lamp` | PASS | **PASS** (Δnew 29.06) |
+| `smoke:gi-gpu` | PASS | **PASS** (worst kernel 6 storage) |
+| `run-gi-resize-probe` | PASS 0/0 | **GI-RESIZE ALL PASS** |
+| `probe:gi2-motion` orbit, forced merge, MAX | 100.20 ms · 1 pipeline | **22.40 ms · 0 pipelines** |
+
+⭐ The Cornell rows are IDENTICAL because that room never scrolls: `wpSeedRamp`
+only reaches a probe the lattice re-keyed, so the one scene in the battery that
+cannot re-key is the one that proves the ramp is inert where it should be.
+
+⚠ **AA.2 SHIPS ON A PATH THAT WENT OPT-IN UNDER IT.** `cc3af36` (another editor,
+09:10, `gatherProbes.js` only) flipped `WORLD_PROBES` back to `__gi2WorldProbes
+=== true` after the Bistro red/green flood. Every receipt above was taken before
+that commit with world probes ON, and `wpSeedRamp` reaches nothing while they are
+off — re-read this section when the world path comes back.
