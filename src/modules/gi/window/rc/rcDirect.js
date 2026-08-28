@@ -259,7 +259,36 @@ export function createRcEmitterDirect({
             // so both are computed and the branch picks one. Cheap: two
             // subtractions, no trace.
             const reachVox = d.sub(clear).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
-            const reachBvh = d.sub(clear).max(1e-3).toVar();
+            // ⭐⭐⭐ AND THE EXACT ARM'S CLEARANCE IS THE OBB'S SLAB EXIT, NOT
+            // THE BOUNDING SPHERE — this is the "no shadow on the wall behind
+            // the tall box" report.
+            //
+            // `radius` is the emitter's BOUNDING SPHERE, so for a TALL box it
+            // is the half-DIAGONAL: a metre or more on a lamp whose actual
+            // half-width is 15 cm. Stopping the ray `radius` short of the seat
+            // centre therefore carves a metre-wide sphere out of every shadow
+            // ray aimed at it, and anything inside that sphere — including the
+            // emitter's OWN body, which is exactly what should be shadowing
+            // the wall behind it — is never tested. The wall reads unshadowed
+            // and the lamp appears to shine through itself.
+            //
+            // `exHalf` is already the conservative world-axis OBB that GISystem
+            // documents as "the OBB the sphere-arm marchers exclude", so the
+            // right quantity is the slab EXIT along this ray: from the centre,
+            // travelling back toward the shading point, the ray leaves the box
+            // at `min_i(exHalf_i / |wd_i|)`. For a sphere fit (`exHalf` set to
+            // `radius` on every axis) an axis-aligned ray gives back `radius`
+            // exactly, so nothing spherical moves; for a tall box seen from the
+            // side it gives the half-WIDTH, and the box occludes again.
+            //
+            // ⚠ Clamped ABOVE by `clear`: the slab exit must never exceed the
+            // bounding sphere, or a numerically tiny `wd` component would push
+            // the stop point past the lamp and let the lamp shadow itself —
+            // the failure this whole stage exists to delete.
+            const ex = vec3(slot.exHalf).abs().max(1e-4).toVar();
+            const aw = vec3(wd).abs().max(1e-6).toVar();
+            const slab = ex.x.div(aw.x).min(ex.y.div(aw.y)).min(ex.z.div(aw.z)).toVar();
+            const reachBvh = d.sub(slab.min(clear)).max(1e-3).toVar();
             // ⭐⭐⭐ THE ONE LINE STAGE 5.5b EXISTS FOR. `traceWindow` asks the
             // voxels whether anything is between here and the lamp; `anyHitFrom`
             // asks the TRIANGLES. The difference only shows on a ray that starts
