@@ -78,7 +78,7 @@ import { createRadianceCache } from "./radianceCache.js";
 import { createWindowVoxelizer } from "./windowVoxelize.js";
 import { createWindowDynamic, moverBoxSoup } from "./windowDynamic.js";
 import { createTriangleSoupBuilder, SoupSupersededError, PAL_NONE } from "./triangleSoup.js";
-import { createShadowBvhBuilder, createShadowBvhSlot, SHADOW_BVH_TRI_CAP } from "./shadowBvh.js";
+import { createShadowBvhBuilder, createShadowBvhSlot } from "./shadowBvh.js";
 import { createGiGather, GATHER_TIERS, PAL_ENTRIES, STATS } from "./gatherProbes.js";
 import { createRcCascades } from "./rc/rcSystem.js";
 import { rcHitPathEnabled } from "./rc/rcConfig.js";
@@ -1150,7 +1150,18 @@ export function createGi2System({
     }
     const builder = (store.bvhBuilder ??= createShadowBvhBuilder());
     const t0 = performance.now();
-    builder.build({ tris: built.tris.slice(), triCount: built.triCount, triCap: SHADOW_BVH_TRI_CAP })
+    // ⭐⭐ §19 6.2 — THE SOUP THIS TREE INDEXES, CAPTURED BY VALUE. The BVH is
+    // now a permutation of THIS soup's triangle order, so it is only meaningful
+    // against THIS buffer. A rebuild between the post and the reply installs a
+    // new soup with a different order, and filling the slot with the new buffer
+    // and the old tree would test the wrong triangles at every leaf — a subtle,
+    // scene-dependent wrong answer rather than a crash. Holding the reference
+    // here makes the pair inseparable.
+    const soupAtKick = soup;
+    // ⛔ NO triCap. 5.5b passed one because the worker MATERIALIZED the
+    // triangles; 6.2 ships a 4 B/tri index into `soupAtKick` instead, so the
+    // whole scene fits and a cap would only re-open the light leak it closed.
+    builder.build({ tris: built.tris.slice(), triCount: built.triCount })
       .then((bvh) => {
         if (disposed) return;
         const wall = performance.now() - t0;
@@ -1158,17 +1169,18 @@ export function createGi2System({
           `[gi2] shadow bvh ${bvh.triCount} tris, ${bvh.nodeCount} nodes, ` +
           `${(bvh.bytes / 1048576).toFixed(1)} MB, built in ${Math.round(bvh.stats?.buildMs ?? 0)} ms ` +
           `off-thread (${Math.round(wall)} ms wall, depth ${bvh.stats?.maxDepth ?? "?"})` +
-          (bvh.stats?.truncated ? ` — TRUNCATED at the ${SHADOW_BVH_TRI_CAP} triangle cap` : ""),
+          (bvh.stats?.truncated ? " — TRUNCATED at the f32 exact-index ceiling (16.7 M triangles)" : ""),
         );
         // ⭐ THE WHOLE SWAP: two storage attributes and a uniform. No pass is
         // rebuilt, so no gather texture is re-created, so no material is left
         // pointing at a destroyed one — the failure that rendered the frame
         // black while the gate's readback of the very same irradiance texture
         // came back lit.
-        if (shadowBvh?.fill(bvh)) {
+        if (shadowBvh?.fill(bvh, soupAtKick?.tris?.value)) {
           console.log(
             `[gi2] exact shadow rays LIVE — ${shadowBvh.triCount} tris / ` +
             `${shadowBvh.nodeCount} nodes, ${shadowBvh.mb.toFixed(1)} MB bound in place ` +
+          `(+0 MB of triangles — the tree indexes the soup's own buffer) ` +
             `(no rebuild); the direct term is off the voxels`,
           );
         }
