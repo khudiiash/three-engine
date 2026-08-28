@@ -170,7 +170,7 @@ const hit = (re) => CONSOLE.filter((l) => re.test(l));
 console.log(`
 ══ kickShadowBvh verdict ══════════════════════════════════`);
 for (const l of hit(/shadow bvh|exact shadow rays|soup d+ tris/)) console.log(`  ${l.slice(0,240)}`);
-const built = hit(/[gi2] shadow bvh d+ tris/);
+const built = hit(/\[gi2\] shadow bvh \d+ tris/);
 const bailed = hit(/exact shadow rays: OFF/);
 const unavail = hit(/shadow bvh unavailable/);
 console.log(built.length ? `  VERDICT: BUILT` : bailed.length ? `  VERDICT: BAILED (size/tier gate)` : unavail.length ? `  VERDICT: THREW` : `  VERDICT: kickShadowBvh produced NO line at all`);
