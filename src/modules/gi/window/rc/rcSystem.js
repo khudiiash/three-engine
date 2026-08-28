@@ -125,6 +125,36 @@ export function createRcCascades({
    */
   const keepU = uniform(1 - TEMPORAL_ALPHA);
   const influxLiftU = uniform(1);
+  /**
+   * ⭐⭐ §19 STAGE 5.3b — THE SECONDARY CACHE'S BUDGET, AS ONE POWER-OF-TWO.
+   *
+   * A hit face re-gathers the merged field on the frame whose stamp matches its
+   * own low address bits, so the cost is `1/period` of the hits and the set that
+   * refreshes rotates over the whole cache deterministically. A face that has
+   * NEVER been gathered ignores the budget entirely — "no data" must not read as
+   * "no light" for a whole period — so the budget only ever rate-limits the
+   * REFRESH, never the first value, and convergence is unaffected at the front.
+   *
+   * `1` is "every hit face, every frame" and is the arm to compare against.
+   */
+  const ercPeriod = (() => {
+    const raw = Number(globalThis.__gi2RcErcPeriod);
+    const p = Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 4;
+    return 1 << Math.max(0, Math.min(10, Math.round(Math.log2(p))));
+  })();
+  const ercMaskU = uniform(ercPeriod - 1, "uint");
+  /**
+   * The blend a refresh applies. SHIPPED AT 1, and that is a correctness
+   * property rather than a taste: at α = 1 every ray that reaches a face writes
+   * the same number, so the word does not depend on how many rays arrived or in
+   * which order (§T). Anything below 1 buys temporal smoothing the cascade bins
+   * already provide through `TEMPORAL_ALPHA` and pays for it in both latency and
+   * order-dependence.
+   */
+  const ercAlpha = (() => {
+    const raw = Number(globalThis.__gi2RcErcAlpha);
+    return Number.isFinite(raw) && raw > 0 && raw <= 1 ? raw : 1;
+  })();
 
   // ── the gbuffer, read exactly as `srcSystem` reads it ─────────────────────
   const positionNode = texture(gbuffer.position);
@@ -262,7 +292,29 @@ export function createRcCascades({
    * the eighth binding `gatherAt` needs and the reason the split exists.
    */
   const hitShading = hitCapacity > 0
-    ? createRcHitShading({ cache, kit, counters: shadeCounters })
+    ? createRcHitShading({
+      cache,
+      kit,
+      counters: shadeCounters,
+      // ⭐⭐⭐ §19 STAGE 5.3b — THE MERGED FIELD, REACHED THROUGH A THUNK.
+      //
+      // `resolve` is constructed BELOW (it needs the bins this line's deposit is
+      // about to fill), and [J]'s kernel body is not walked until `hit` is built
+      // AFTER it — so the indirection is a build-order fact, not an abstraction.
+      // The alternative was two `createRcHitShading` calls, which is two places
+      // for the shade point and the face normal to drift apart.
+      gatherAt: (P, n) => resolve.gather.gatherAt(P, n),
+      ercAlpha,
+      ercPhase: frameStampU,
+      // ⚠ PASSED EVEN AT PERIOD 1, where the mask is 0 and `addr & 0 == stamp & 0`
+      // is the constant TRUE — i.e. "every hit face, every frame", which is the
+      // no-budget arm this has to be A/B'd against. Omitting the node there
+      // would silently mean the opposite (refresh only on the first ever hit).
+      ercPeriodMask: ercMaskU,
+      // §19 5.3b — nine `atomicStore`s per hit dropped from the deposit; [J]
+      // recovers P/N from the address and never wanted `Le`. See `rcHit`.
+      compact: true,
+    })
     : null;
 
   const deposit = createSrcDepositFrame(store, bins, {
@@ -291,6 +343,9 @@ export function createRcCascades({
     secondary: hitCapacity > 0
       ? { base: bins.hitListBase, capacity: hitCapacity }
       : null,
+    // §19 5.3b — P, N and Le are functions of the address word the record
+    // already carries, so the append stops writing them. `rcHit`'s `compact`.
+    hitFields: hitShading ? { P: false, N: false, Le: false } : null,
     surprise: null,
     trace: rcTrace,
     shadeHit: hitShading ? null : ((r, dir) => rcShade(r, dir)),
@@ -347,10 +402,12 @@ export function createRcCascades({
   //   shade(P, n, ρ, Le, T, addr) → the DIRECT-ONLY face cache (`rcHit.js`)
   //   gatherAt(P, n)              → the merged cascade field, unchanged
   //
-  // `bounce: true` is what builds the gather, and its `ρ · E/π` is `E_rc`'s
-  // half of the expression — the same integral the pixel resolve runs, at a
-  // world point with no screen grid, which is the seam `srcScreenGather`'s
-  // header opened for exactly this call site.
+  // ⭐⭐⭐ §19 STAGE 5.3b — `bounce: "cached"`, NOT `true`. 5.3 asked this pass
+  // to build its own `srcScreenGather` and fire it once per RECORD; the shade
+  // closure now owns that term and pays it once per FACE, out of the cache's
+  // secondary region (`rcHit.shade`). Same integral, same anchor, same eight
+  // corners — the only thing that changed is how many times a frame evaluates
+  // it, which on the 5.1 gate at ultra was 3.03 ms of a 9.58 ms chain.
   //
   // ⚠ BETWEEN THE SCATTER AND THE RESOLVE, NECESSARILY. The list does not exist
   // until the scatter writes it, and [F] turns the accumulators into the
@@ -360,9 +417,8 @@ export function createRcCascades({
   const hit = (hitShading && resolve)
     ? createSrcSecondaryFrame(store, bins, {
       shade: hitShading.shade,
-      bounce: true,
-      tiles: resolve.tiles,
-      lookup: resolve.hashBlock.lookup,
+      bounce: "cached",
+      hitFields: { P: false, N: false, Le: false },
       spacing0,
       // The SAME camera and anchor the population, the merge and the pixel
       // gather use. A gather placed from a second anchor reads plausible light
@@ -458,6 +514,15 @@ export function createRcCascades({
       hitList: hitCapacity,
     },
     hitRadiance: hit ? "probes" : "cache",
+    // §19 5.3b — the secondary cache's budget, published so a cost reading and
+    // a convergence reading can be attributed to the same number.
+    erc: hit
+      ? {
+        period: ercPeriod,
+        alpha: ercAlpha,
+        mb: +(((cache.describe?.().ercBytes ?? 0) / 1048576).toFixed(2)),
+      }
+      : null,
     intervals: census.rows.map((r) => ({
       lod: r.lod, reach: r.reach, gaps: r.gaps, overlaps: r.overlaps,
       bands: r.bands.map((b) => [b.t0, b.t1]),
@@ -484,7 +549,7 @@ export function createRcCascades({
     uniforms: {
       rcCamera: cameraU, rcAnchor: anchorU, rcWidth: widthU, rcFrameStamp: frameStampU,
       rcJitterX: jitterXU, rcJitterY: jitterYU, rcStride: strideU, rcPhase: phaseU,
-      rcLmax: lmaxU, rcKeep: keepU, rcInfluxLift: influxLiftU,
+      rcLmax: lmaxU, rcKeep: keepU, rcInfluxLift: influxLiftU, rcErcMask: ercMaskU,
       ...(resolve?.uniforms ?? {}),
     },
     passes: {

@@ -678,18 +678,40 @@ export const RC5_PATH = false;
  *     one: energy 1.96× and Box·-X at 4.08×. That over-weighting IS why the
  *     seat exists.
  *
- * So the shipped 5.3 arm is the seat, carried where 5.2 carried it — inside the
- * face cache's direct term, at hits — and the lamp's first bounce is a NAMED
- * HOLE rather than a term evaluated in the wrong place. Closing it belongs at
- * the probe: the seat's NEE added into the c0 irradiance the gather already
- * interpolates over eight probes, which is the one place in this chain that has
- * a smoothing stage behind it.
+ * ══ ⭐⭐⭐ §19 STAGE 5.3b — THE THIRD ARM IS THE ANSWER, AND IT IS THE SECOND
+ *    ONE WITH ITS ENERGY FIXED ═════════════════════════════════════════════
  *
- * `__gi2Rc5Emission = 1` takes the geometric arm; `__gi2Rc5PixelNee = 1` adds
- * the pixel-analytic one (`rcMerge`'s `directAt`). Both are the A/B rows above.
+ * Read the 1.955 again: it is not a random over-delivery, it is a RATIO OF
+ * AREAS. The panel is 4.5 m² and its voxel shell presents about twice that to
+ * the room, so the transport hands the room about twice the power the gate
+ * admitted. Nothing about the geometric arm's PLACE was wrong — the paper lights
+ * emitters exactly this way, by rays hitting them — only its SCALE.
+ *
+ * `gatherProbes`' `emitterVoxelScale` fixes the scale where the error is made,
+ * per voxel: `L_vox = L_e · coverage / n_exposed`, so each voxel radiates
+ * exactly the power of the surface §AG's coverage says is inside it. That makes
+ * the geometric arm energy-exact by construction rather than by a tuned
+ * constant, and it fixes the near-field outlier (Box·-X 4.08×) as well as the
+ * global gain, because a slab's SIDE faces are then radiating a slab's share
+ * instead of a panel's.
+ *
+ * So the cascades now light emitters the way the paper does — the seat's four
+ * analytic shadow rays are not evaluated anywhere on this path, and there is no
+ * double count to guard. The ADMISSION GATE IS UNTOUCHED and is still the only
+ * gate: a culled emitter's `palEm` is `[0,0,0]`, and no fraction of zero is
+ * light.
+ *
+ * `__gi2Rc5SeatNee = 1` restores 5.3's shipped arm (the seat, gain 0.303);
+ * `__gi2Rc5EmitRaw = 1` keeps the emission but drops the conservation (5.3's
+ * 1.955 row); `__gi2Rc5PixelNee = 1` adds the pixel-analytic seat term
+ * (`rcMerge`'s `directAt`, the 0.365 row). All three are the A/B rows above.
  */
 export function rc5SeatNeeEnabled(runtime = globalThis) {
-  return (runtime?.__gi2Rc5Emission ?? 0) === 0;
+  // §19 5.3b — the DEFAULT flipped: the transport carries the lamp. `__gi2Rc5Emission`
+  // is still honoured as 5.3's opt-IN spelling so an old harness page reads the
+  // same arm it named.
+  if ((runtime?.__gi2Rc5Emission ?? 0) !== 0) return false;
+  return (runtime?.__gi2Rc5SeatNee ?? 0) !== 0;
 }
 
 /** Under the cascades, does a PROMOTED emitter keep its palette emission? */

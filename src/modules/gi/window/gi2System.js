@@ -511,7 +511,13 @@ export function createGi2System({
   // ── the scene-independent half: built once, never rebuilt by content ──────
   const win = createGiWindow(tier, { dynamic: true });
   const trace = createWindowTrace(win);
-  const cache = createRadianceCache(win, { tier });
+  // ⭐ §19 STAGE 5.3b — the SECONDARY (irradiance) region is built only for the
+  // cascades. On the shipped chain `erc` is false and the cache allocates
+  // exactly the words 5.3 allocated, which is "RC5 off is byte-identical"
+  // stated where the memory is spent rather than only where the kernels are.
+  const cache = createRadianceCache(win, {
+    tier, erc: rc5PathEnabled() && rcHitPathEnabled(),
+  });
 
   let gather = null;
   let voxelizer = null;

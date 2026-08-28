@@ -87,7 +87,9 @@
 // same `T` to the cached direct half. One number, one meaning, both terms — and
 // `T` is exactly 1 in a scene with no cables, railings or foliage in it, where
 // this whole paragraph is a provable no-op.
-import { If, bitAnd, dot, float, shiftLeft, shiftRight, sqrt, uint, vec3 } from "three/tsl";
+import {
+  If, bitAnd, dot, float, mix, select, shiftLeft, shiftRight, sqrt, uint, vec3,
+} from "three/tsl";
 import { normalOfFace } from "../radianceCache.js";
 
 /**
@@ -119,14 +121,34 @@ export const unpackAddr = (a) => ({
  *   second transcription of `shadeHit` cost 2.5 s of pipeline compile at 3.5.
  * @param {object} [o.counters]  `createSrcShadeCounters(bins)` — the tally the
  *   deposit's own receipt reads as "NO HIT SHADING" when it is missing.
+ * @param {Function} [o.gatherAt]  §19 5.3b — the merged field's eight-probe
+ *   resolve. Present ⇒ [J] adds `ρ·E_rc/π` out of the cache's SECONDARY region;
+ *   absent ⇒ [J] is direct-only and the caller must supply the bounce itself.
+ * @param {number} [o.ercAlpha]  blend toward the new gather on a refresh. 1 (the
+ *   shipped value) makes the write order-free; see `shade`.
+ * @param {object} [o.ercPhase]  a uint node — the frame stamp the budget's phase
+ *   test compares a face's address against.
+ * @param {object} [o.ercPeriodMask]  a uint node, `period − 1` (a power-of-two
+ *   mask). Absent ⇒ every hit face refreshes every frame.
+ * @param {boolean} [o.compact]  drop `P`/`N`/`Le` from the record (§19 5.3b).
  */
-export function createRcHitShading({ cache, kit, counters = null }) {
+export function createRcHitShading({
+  cache, kit, counters = null, gatherAt = null,
+  ercAlpha = 1, ercPhase = null, ercPeriodMask = null, compact = true,
+}) {
   const { u, dominantFace, faceSamplePoint, shadeHit, hitPalette } = kit;
   if (typeof hitPalette !== "function") {
     throw new Error(
       "createRcHitShading: the gather must publish `hitPalette` — [J] multiplies the cascade " +
       "field by the hit's ρ and adds it to a cache word `shadeHit` wrote, and two transcriptions " +
       "of that albedo are two chances for the halves to disagree about which surface they are on",
+    );
+  }
+  if (gatherAt && !(cache.ercRead && cache.ercWrite)) {
+    throw new Error(
+      "createRcHitShading: the radiance cache was built without `erc` — §19 5.3b caches E_rc PER " +
+      "FACE in a second region of the cache's own buffer, and without it [J] is back to a gather " +
+      "per ray (5.3 measured that at 3.03 ms of a 9.58 ms ultra chain)",
     );
   }
 
@@ -136,13 +158,28 @@ export function createRcHitShading({ cache, kit, counters = null }) {
    * Runs for every ray, hit or miss, exactly as the inline shader did — a miss
    * leaves `slot` EMPTY in `srcDeposit` and falls out of the append with no
    * test of its own.
+   *
+   * ⭐⭐ §19 STAGE 5.3b — `compact` DROPS **P**, **N** AND **Le** FROM THE
+   * RECORD, AND IT IS A DEPOSIT SAVING, NOT A TIDY-UP. All three are FUNCTIONS
+   * OF `addr`, which the record carries anyway: the face's normal IS
+   * `normalOfFace(face)` and its shade point IS `faceSamplePoint(level, voxel,
+   * n)` — the two expressions this closure filled them with — while `Le` was
+   * never read by anyone, because a face's emission reaches [J] inside the CACHE
+   * WORD `shadeHit` wrote, which is where the one-representation rule puts it.
+   * Nine `atomicStore`s per hit, on the pass that runs for every ray in the
+   * frame, to carry values the reader recomputes from a word it already loads.
+   *
+   * ⚠ THE RECORD'S STRIDE IS UNCHANGED. `SECONDARY_HIT_WORDS` is still 16 and
+   * the shipped path's layout with it — only these writes, and the matching
+   * reads in [J], are gone. A stride change would have been a second meaning for
+   * the same buffer and a silent misread the first time a gate ran the old path.
    */
   const attribute = (r, dir) => {
     const zi = r.raw.z.toUint().toVar();
-    const P = vec3(0).toVar();
-    const N = vec3(0).toVar();
+    const P = compact ? null : vec3(0).toVar();
+    const N = compact ? null : vec3(0).toVar();
     const rho = vec3(0).toVar();
-    const Le = vec3(0).toVar();
+    const Le = compact ? null : vec3(0).toVar();
     const addr = uint(0).toVar();
     // §AG's coverage, carried through ρ — see the header. Held as its own word
     // too, because [J]'s direct half needs it and ρ is already spoken for.
@@ -152,15 +189,20 @@ export function createRcHitShading({ cache, kit, counters = null }) {
       const levelF = bitAnd(shiftRight(zi, uint(3)), uint(7)).toFloat().toVar();
       const voxF = shiftRight(zi, uint(6)).toFloat().toVar();
       const faceF = dominantFace(levelF, voxF, entryF, dir.negate()).toVar();
-      const hn = normalOfFace(faceF).toVar();
-      N.assign(hn);
-      // ⭐ THE SHADE POINT BELONGS TO THE SLOT, NOT TO THE RAY (§19 3.9): the
-      // voxel's face plane, so every ray reaching this face shades the same
-      // point and re-shading is idempotent.
-      P.assign(faceSamplePoint(levelF, voxF, hn));
-      const pal = hitPalette(levelF, voxF);
+      // `wantEmissive` false on the compact build: the emission the record used
+      // to carry costs a coverage read and six occupancy bits under §19 5.3b's
+      // energy conservation, once per RAY, for a word nobody reads.
+      const pal = hitPalette(levelF, voxF, !compact);
       rho.assign(pal.rho.mul(T));
-      Le.assign(pal.Le);
+      if (!compact) {
+        const hn = normalOfFace(faceF).toVar();
+        N.assign(hn);
+        // ⭐ THE SHADE POINT BELONGS TO THE SLOT, NOT TO THE RAY (§19 3.9): the
+        // voxel's face plane, so every ray reaching this face shades the same
+        // point and re-shading is idempotent.
+        P.assign(faceSamplePoint(levelF, voxF, hn));
+        Le.assign(pal.Le);
+      }
       addr.assign(packAddr(zi, faceF));
     });
     // ⚠ `emitter` CARRIES `T`, and the record has no spare word for it. That
@@ -173,24 +215,67 @@ export function createRcHitShading({ cache, kit, counters = null }) {
   };
 
   /**
-   * [J]'s DIRECT half: the face cache, read; shaded and accumulated where the
-   * word is fresh.
+   * [J]'s half: BOTH terms of the hit's radiance, out of TWO WORDS OF ONE
+   * BUFFER at ONE address.
    *
    * ⚠ THE CACHE STORES THE FACE'S OWN RADIANCE, NOT THE RAY'S. The accumulate
    * takes the unattenuated shade `s`; only the value handed back to the deposit
    * is multiplied by this ray's coverage. Getting that backwards would write a
    * cable's shadow into a wall's memory of the sun.
    *
-   * ⭐ AND THE SHADE IS `Le + ρ/π · (sun + NEE)` — a FIXED function of the face
-   * with no stochastic input anywhere in it, which is what makes the cadence a
-   * latency knob instead of a noise source and what lets the EMA converge to a
-   * point rather than rattle around a mean.
+   * ⭐ AND THE DIRECT SHADE IS `Le + ρ/π · (sun + NEE)` — a FIXED function of
+   * the face with no stochastic input anywhere in it, which is what makes the
+   * cadence a latency knob instead of a noise source.
+   *
+   * ══ ⭐⭐⭐ §19 STAGE 5.3b — `E_rc` IS A PROPERTY OF THE FACE, SO IT IS PAID
+   *    ONCE PER FACE ══════════════════════════════════════════════════════════
+   *
+   * 5.3 called `gatherAt` once per HIT — a hash lookup, eight probe corners and
+   * a tile-atlas read each — for a number that cannot depend on the ray:
+   * `faceSamplePoint` pins the query point to the voxel's face plane and
+   * `normalOfFace` pins the normal to the face, so every ray landing on a face
+   * asks the merged field the identical question. Measured on the 5.1 gate at
+   * ultra that was **3.03 ms of a 9.58 ms chain** spent recomputing one value
+   * 600 000 times.
+   *
+   * So `E_rc` becomes a CACHED PER-FACE WORD in the cache's secondary region,
+   * refreshed on a budget, and the deposit reads
+   *
+   *     L(H) = direct_face(H)·T  +  ρ · E_rc(H) / π
+   *
+   * with ONE address and TWO loads. It needs no append list of its own: the
+   * refresh queue IS the hit list the deposit already writes, which is exactly
+   * "the faces hit this frame" and is therefore free.
+   *
+   * ⚠ THE REFRESH IS ORDER-FREE, WHICH IS WHY IT NEEDS NO QUEUE AND NO SORT.
+   * Every ray reaching a face in one frame computes `gatherAt(faceP, faceN)`
+   * from the same point, the same normal and the same merged field, so they all
+   * write the SAME value — which of them lands last cannot change the word, and
+   * §T holds without the pass enumerating faces in a fixed order. `ercAlpha = 1`
+   * keeps that true exactly; a smaller α would make the result depend on how
+   * many rays happened to hit the face, which is why the shipped value is 1 and
+   * why the temporal smoothing this could have bought is left to the cascade
+   * bins, where `TEMPORAL_ALPHA` already lives.
+   *
+   * ⚠ AND `E_rc` IS THE FIELD, NEVER THE FACE'S OWN LIGHT. `shadeHit` under
+   * `rc5` is direct-only and `injectLitFrame` is not built, so this term comes
+   * exclusively from the merged cascades: the loop is probes → hits → probes,
+   * whose gain is the albedo, and never cache → cache, whose gain was 1/(1−ρ)
+   * at the user's ρ = 1.0 walls.
    */
-  const shade = (P, n, rho, Le, T, addr) => {
-    const { faceF, levelF, voxF } = unpackAddr(uint(addr));
+  const shade = (P0, n0, rho, Le, T, addr) => {
+    const a = uint(addr).toVar();
+    const { faceF, levelF, voxF } = unpackAddr(a);
     const fF = faceF.toVar();
     const lF = levelF.toVar();
     const vF = voxF.toVar();
+    // The face's own geometry, recovered from the address instead of carried
+    // through six words of the record — see `attribute`'s `compact` note. Both
+    // expressions are [E]'s, verbatim, so the shade point is the same point.
+    const hn = normalOfFace(fF).toVar();
+    const hp = faceSamplePoint(lF, vF, hn).toVar();
+
+    // ── the DIRECT half ────────────────────────────────────────────────────
     const L = vec3(0).toVar();
     const c = cache.cacheRead(lF, vF, fF).toVar();
     counters?.shaded(1);
@@ -199,11 +284,36 @@ export function createRcHitShading({ cache, kit, counters = null }) {
       // `seedU` is `uint(1)` and is dropped by `shadeHit` under `rc5` — see the
       // header. `.toVar()` on the accumulate is load-bearing: a call for side
       // effect alone is dead-code-eliminated.
-      const s = shadeHit(P, n, lF, vF, uint(1)).toVar();
+      const s = shadeHit(hp, hn, lF, vF, uint(1)).toVar();
       cache.cacheAccum(lF, vF, fF, s, u.nCapU, u.cacheSmoothU).toVar();
       L.assign(s);
     });
-    return { L: L.mul(T) };
+
+    // ── the SECONDARY half: the merged field at this face, on a budget ──────
+    let Lb = null;
+    if (gatherAt) {
+      const e = cache.ercRead(lF, vF, fF).toVar();
+      const fresh = e.w.lessThan(0.5).toVar();
+      const E = e.xyz.toVar();
+      // THE BUDGET, AS A PHASE TEST ON THE ADDRESS — no counter, no queue, no
+      // per-face age word. A face refreshes on the frame whose stamp matches its
+      // own low bits, so the cost is 1/period of the hits and the refreshed SET
+      // rotates deterministically over the whole cache. A never-gathered face
+      // jumps the queue: "no data" must not be read as "no light" for a whole
+      // period, which is the same rule the direct word's zero sentinel follows.
+      const due = ercPeriodMask
+        ? fresh.or(bitAnd(a, ercPeriodMask).equal(bitAnd(ercPhase, ercPeriodMask)))
+        : fresh;
+      If(due, () => {
+        const g = vec3(gatherAt(hp, hn).irradiance).toVar();
+        cache.ercWrite(lF, vF, fF, g, ercAlpha).toVar();
+        E.assign(select(fresh, g, mix(e.xyz, g, float(ercAlpha))));
+      });
+      // ρ ALREADY CARRIES `T` (`attribute` folds the coverage into it), so this
+      // half is attenuated exactly once and by the same number as the other.
+      Lb = rho.mul(E).mul(1 / Math.PI).toVar();
+    }
+    return { L: L.mul(T), Lb };
   };
 
   return { attribute, shade };

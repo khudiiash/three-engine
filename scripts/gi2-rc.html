@@ -58,6 +58,10 @@
         const params = new URLSearchParams(location.search);
         const TIER = params.get("tier") ?? "ultra";
         const FRAMES = Number(params.get("frames") ?? 8);
+        // §19 5.3b — the secondary cache's refresh budget, as a URL arm so the
+        // "gather every hit face every frame" control (`erc=1`) and the shipped
+        // budget can be timed in the same session on the same adapter.
+        if (params.get("erc") != null) globalThis.__gi2RcErcPeriod = Number(params.get("erc"));
         const W = Number(params.get("w") ?? 160);
         const H = Number(params.get("h") ?? 90);
         // The stage's own switch, armed from the page so the receipt does not
@@ -166,7 +170,10 @@
         const win = store.createGiWindow(TIER, { dynamic: false });
         const fill = fillMod.createWindowFill(win, { scene: WORLDS.open.scene });
         const trace = traceMod.createWindowTrace(win, { dynamic: false });
-        const cache = cacheMod.createRadianceCache(win, { tier: TIER });
+        // §19 5.3b — this page IS the cascade gate, so the cache it builds must
+        // carry the SECONDARY (irradiance) region [J] reads. Without `erc` the
+        // page would time a [J] that cannot compile in the engine.
+        const cache = cacheMod.createRadianceCache(win, { tier: TIER, erc: true });
 
         const gbufferRt = new THREE.RenderTarget(W, H, {
           count: 2, depthBuffer: true, stencilBuffer: false, generateMipmaps: false,

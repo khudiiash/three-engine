@@ -218,7 +218,21 @@ export function createSrcSecondaryFrame(store, bins, {
   losWorld = null,
   surprise = null,
   capacity = 0,
+  /**
+   * ⭐ §19 STAGE 5.3b — WHICH RECORD WORDS THIS PASS ACTUALLY READS.
+   *
+   * The record's STRIDE never changes (`SEC_HIT_WORDS` is 16 for every build);
+   * this only says whether a field was written and is therefore worth loading.
+   * The cascade build recovers `P`, `N` and `Le` from `SEC_RAY`'s packed
+   * (level, voxel, face) address — see `rcHit`'s `compact` note — so the deposit
+   * skips nine `atomicStore`s per hit and this pass skips the matching loads.
+   * Every other caller leaves it at the default and is byte-identical.
+   */
+  hitFields = null,
 } = {}) {
+  const readsP = hitFields?.P !== false;
+  const readsN = hitFields?.N !== false;
+  const readsLe = hitFields?.Le !== false;
   const { scratch, stats, hitListBase, hitCapacity } = bins;
   if (!(capacity > 0) || capacity > hitCapacity) {
     throw new Error(
@@ -232,7 +246,11 @@ export function createSrcSecondaryFrame(store, bins, {
       "§12.53, and a pass without it deposits a second bounce onto an unlit hit",
     );
   }
-  if (bounce && typeof lookup !== "function") {
+  // §19 5.3b — `bounce: "cached"` means the SHADE closure supplies the term
+  // (from the face cache) and this pass builds no gather of its own; only
+  // `bounce === true` still asks for the per-record screen gather.
+  const wantGather = bounce === true;
+  if (wantGather && typeof lookup !== "function") {
     throw new Error("createSrcSecondaryFrame: `lookup` is required with `bounce` — the gather resolves probe corners per hit");
   }
   if (surprise && surprise.statBase !== bins.blockStatBase) {
@@ -268,7 +286,7 @@ export function createSrcSecondaryFrame(store, bins, {
   // NOT BUILT WITHOUT `bounce`: that is what makes the single-bounce build cost
   // this kernel one storage binding and ~zero WGSL rather than a runtime branch
   // nobody can see the size of.
-  const gather = bounce
+  const gather = wantGather
     ? createSrcScreenGather(store, tiles, {
         lookup, spacing0, camera, anchor, maxLods, w0, lodBias: lodBiasU,
         losOccupied, losWorld,
@@ -288,11 +306,17 @@ export function createSrcSecondaryFrame(store, bins, {
     // CreateShaderModule rather than producing a wrong picture.
     const raw = (w) => atomicLoad(scratch.element(e.add(uint(w))));
     const word = (w) => uintBitsToFloat(raw(w));
-    const P = vec3(word(SEC_P + 0), word(SEC_P + 1), word(SEC_P + 2)).toVar();
-    const n = vec3(word(SEC_N + 0), word(SEC_N + 1), word(SEC_N + 2)).toVar();
+    const P = readsP
+      ? vec3(word(SEC_P + 0), word(SEC_P + 1), word(SEC_P + 2)).toVar()
+      : vec3(0).toVar();
+    const n = readsN
+      ? vec3(word(SEC_N + 0), word(SEC_N + 1), word(SEC_N + 2)).toVar()
+      : vec3(0).toVar();
     const rho = vec3(word(SEC_RHO + 0), word(SEC_RHO + 1), word(SEC_RHO + 2)).toVar();
     const slot = raw(SEC_SLOT).toVar();
-    const Le = vec3(word(SEC_LE + 0), word(SEC_LE + 1), word(SEC_LE + 2)).toVar();
+    const Le = readsLe
+      ? vec3(word(SEC_LE + 0), word(SEC_LE + 1), word(SEC_LE + 2)).toVar()
+      : vec3(0).toVar();
     const emitter = word(SEC_EMITTER).toVar();
     // A u32 all the way through — `hashKey` is `Math.imul`-exact on the ray
     // index and a float round-trip past 2^24 would move NEE's pick.
@@ -311,9 +335,16 @@ export function createSrcSecondaryFrame(store, bins, {
     // ρ/π · E_atlas, against LAST frame's bake ([H] runs after the deposit), the
     // temporal fixed point R4 models. Held separately from `Ld` so that
     // `SEC_CLAMPED` can report the loop's own saturation.
+    //
+    // ⭐ §19 STAGE 5.3b — OR THE SHADE CLOSURE BRINGS ITS OWN. The cascades
+    // resolve `ρ·E_rc/π` from a CACHED PER-FACE word rather than from a gather
+    // this pass fires per record (see `rcHit.shade`), so `bounce` is false there
+    // and the term arrives as `shaded.Lb`. It is still held apart from `Ld` for
+    // the same reason it always was: `SEC_CLAMPED` reports the LOOP's own
+    // saturation, and folding the two would make that instrument blind.
     const Lb = gather
       ? rho.mul(gather.gatherAt(P, n).irradiance).mul(1 / Math.PI).toVar()
-      : null;
+      : (shaded.Lb ? vec3(shaded.Lb).toVar() : null);
     const L = (Lb ? Ld.add(Lb) : Ld).toVar();
 
     // The fixed point conversion, IDENTICAL to the one [E] used to do — same
@@ -377,6 +408,14 @@ export function createSrcSecondaryFrame(store, bins, {
      * existence reads this instead.
      */
     bounce: !!gather,
+    /**
+     * §19 5.3b — WHERE the bounce came from, kept SEPARATE from `bounce`.
+     * `bounce` has meant "this pass built its own screen gather" since §12.53
+     * and `test:gi-src-secondary` asserts it `=== true`; the cascades' term
+     * arrives from the shade closure's face cache instead, which is a different
+     * fact and needs a different word.
+     */
+    bounceSource: gather ? "gather" : (bounce ? "shade" : null),
     /** The tail and the counters both ride buffers this pass does not own. */
     bytes: 0,
 
@@ -403,12 +442,17 @@ export function createSrcSecondaryFrame(store, bins, {
     async readStats(renderer) {
       const allocated = !!renderer?.backend?.get?.(stats.value)?.buffer;
       if (!allocated) {
-        return { dispatched: false, bounce: !!gather, hits: 0, clamped: 0, overflow: 0, capacity };
+        return {
+          dispatched: false, bounce: !!gather,
+          bounceSource: gather ? "gather" : (bounce ? "shade" : null),
+          hits: 0, clamped: 0, overflow: 0, capacity,
+        };
       }
       const v = new Uint32Array(await renderer.getArrayBufferAsync(stats.value));
       return {
         dispatched: true,
         bounce: !!gather,
+        bounceSource: gather ? "gather" : (bounce ? "shade" : null),
         hits: v[STAT_SECONDARY] >>> 0,
         clamped: v[STAT_SEC_CLAMPED] >>> 0,
         overflow: v[STAT_SEC_OVERFLOW] >>> 0,
@@ -428,7 +472,7 @@ export function formatSrcSecondary(s) {
   // `shaded` and not `bounce`, because that is what the counter measures since
   // §12.53: every entry [J] shaded, whether or not the atlas term was built.
   return `[J] ${s.hits}/${s.capacity} shaded` +
-    (s.bounce ? " +bounce" : " (single)") +
+    (s.bounce ? " +bounce" : s.bounceSource === "shade" ? " +bounce(face cache)" : " (single)") +
     (s.clamped ? ` (${s.clamped} BOUNCE-CLAMPED)` : "") +
     (s.overflow ? `  SEC-OVERFLOW ${s.overflow}` : "");
 }

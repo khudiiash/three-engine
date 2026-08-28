@@ -78,10 +78,11 @@ import {
   select, shiftLeft, shiftRight, smoothstep, sqrt, step, storage, texture, textureStore, uint, uniform,
   uniformArray, vec2, vec3, vec4,
 } from "three/tsl";
-import { FACE_OFF, LEVEL_WORDS, N, OCC_OFF, PAL_OFF } from "./windowStore.js";
+import { COV_OFF, COV_REPR, FACE_OFF, LEVEL_WORDS, N, OCC_OFF, PAL_OFF } from "./windowStore.js";
 import { FACE_AX_SHIFT } from "./windowTrace.js";
 import { normalOfFace } from "./radianceCache.js";
 import { octahedralUV } from "../srcOctahedral.js";
+import { rc5SeatNeeEnabled } from "../giConfig.js";
 import { createWorldProbes, worldCascadeCount } from "./worldProbes.js";
 
 /**
@@ -636,7 +637,15 @@ export function createGiGather({
    * the shader and `#gi2SlotEmissive` cannot disagree about which
    * representation a promoted emitter has. Both together is §12.26.7's 2.60×.
    */
-  const RC5_EMITTER_EMISSION = rc5 && (globalThis.__gi2Rc5Emission ?? 0) !== 0;
+  const RC5_EMITTER_EMISSION = rc5 && !rc5SeatNeeEnabled();
+  /**
+   * ⭐⭐⭐ §19 STAGE 5.3b — AND THE EMISSION IS ENERGY-CONSERVED PER VOXEL.
+   *
+   * `__gi2Rc5EmitRaw = 1` is 5.3's measured arm (gain 1.955, Box·-X 4.08) —
+   * the palette's authored `L_e` handed to every exposed face of a voxelized
+   * panel. See `emitterVoxelScale` for what replaces it and why.
+   */
+  const RC5_EMIT_CONSERVE = RC5_EMITTER_EMISSION && (globalThis.__gi2Rc5EmitRaw ?? 0) === 0;
   /**
    * §AL's SECOND arm, measured separately and shipped only if it earns it: a
    * ceiling on the albedo the BOUNCE term multiplies. The standard energy
@@ -2312,6 +2321,115 @@ export function createGiGather({
   // shape in which "one representation per emitter" is safe.
   const PANEL_RIG = !emitters?.length && crops > 0;
   const emOf = (v) => (PANEL_RIG ? v.mul(float(1).sub(u.panelNee)) : v);
+
+  // ══ ⭐⭐⭐ §19 STAGE 5.3b — EMISSION IN THE TRANSPORT, ENERGY-CONSERVED ═════
+  //
+  // ══ THE PROBLEM, STATED AS A POWER ═════════════════════════════════════════
+  //
+  // The admission gate's own number is `Φ = π · A_mesh · L_e`: the radiant power
+  // of a one-sided Lambertian surface of area `A_mesh` and radiance `L_e`. It is
+  // what `collectEmitters` weighs a lamp with, and it is what the offline
+  // reference integrates (`gi2SceneReference`'s NEE is a ONE-SIDED cosine over
+  // the emissive TRIANGLES).
+  //
+  // The voxelized lamp is not that surface. A 2 cm panel lands in a 0.5 m cell
+  // as a SLAB, and a slab radiates from every face a ray can reach. 5.3 measured
+  // the consequence with the palette handed the authored `L_e` straight through:
+  // global gain **1.955×** and Box·-X at **4.08×** on the user's Cornell box —
+  // the panel's own area replaced by its voxel shell's, with the near-field
+  // surfaces worst hit because they see the shell's SIDES that the panel has
+  // none of.
+  //
+  // ══ THE FIX IS PER VOXEL, NOT PER CLASS, AND THAT IS WHY IT IS EXACT ═══════
+  //
+  // §AG already stores, per voxel, the thing the correction needs: COVERAGE —
+  // "Σ over the triangles that reach it of the area they present INSIDE it,
+  // projected on each triangle's dominant normal axis, divided by cell²". That
+  // is `A_surface_in_voxel / cell²`, one-sided, in exactly the units `A_mesh` is
+  // measured in. And the six occupancy bits around the voxel say how many of its
+  // faces a ray can actually reach.
+  //
+  // So a voxel radiating `L_vox` from `n_exposed` faces emits
+  //
+  //     Φ_vox = π · L_vox · n_exposed · cell²
+  //
+  // and the surface inside it is authored to emit
+  //
+  //     Φ_auth = π · L_e · coverage · cell²
+  //
+  // Setting them equal gives the whole of this unit:
+  //
+  //     ⭐ L_vox = L_e · coverage / n_exposed
+  //
+  // EVERY voxel then radiates exactly the power of the surface it contains,
+  // whatever shape the emitter is, whatever the cell size, however many of its
+  // faces happen to be buried in a neighbour. A solid glowing box's surface
+  // voxel (coverage 1, one exposed face) keeps `L_e` — correct. A thin panel's
+  // interior voxel (coverage 1, front and back exposed) halves it — correct, and
+  // it is exactly the 2× the 5.3 measurement found. An edge voxel spreads the
+  // same power over three faces instead of two, which is a small lateral spill
+  // and NOT an energy error.
+  //
+  // ⚠ IT IS LOCAL, WHICH IS WHY THERE IS NO TABLE, NO CENSUS AND NO READBACK.
+  // A per-class `A_mesh / A_vox` ratio computed on the CPU would have needed the
+  // occupancy of a window that moves with the camera, at whichever level the ray
+  // hit — three quantities the CPU does not have and cannot keep current. Both
+  // terms here are read from the window itself, at the level the ray hit, in the
+  // frame it hit it.
+  //
+  // ⚠ AND IT IS PAID ONCE PER FACE, NOT ONCE PER RAY. The only consumer is
+  // `shadeTerms`, which runs when a cache word is FRESH; `hitPalette` takes its
+  // emissive branch only on the non-compact build (see `rcHit`).
+  //
+  // ⛔ THE ADMISSION GATE IS STILL THE GATE. This scales what an ADMITTED class
+  // emits; a culled emitter's `palEm` is `[0,0,0]` on the CPU and no fraction of
+  // zero is light. Dim string-light emitters stay culled.
+  /** §AG's coverage class of one voxel, as the fraction `COV_REPR` names. */
+  const coverageAt = (levelF, voxF) => {
+    const vi = voxF.toUint().toVar();
+    const wAddr = levelF.toUint().mul(uint(LEVEL_WORDS)).add(uint(COV_OFF))
+      .add(shiftRight(vi, uint(4)));
+    const cls = bitAnd(
+      shiftRight(win.buffer.element(wAddr), bitAnd(vi, uint(15)).mul(uint(2))), uint(3),
+    ).toVar();
+    return select(cls.equal(uint(0)), float(COV_REPR[0]),
+      select(cls.equal(uint(1)), float(COV_REPR[1]),
+        select(cls.equal(uint(2)), float(COV_REPR[2]), float(COV_REPR[3]))));
+  };
+  /**
+   * How many of a voxel's six faces a ray can reach — the neighbours that are
+   * EMPTY. Floored at 1: a fully buried voxel radiates nowhere, and dividing its
+   * power by zero would be an infinity in a table nobody would think to read.
+   */
+  const exposedFaceCount = (levelF, voxF) => {
+    const vi = voxF.toUint().toVar();
+    const cx = bitAnd(vi, uint(63)).toInt().toVar();
+    const cy = bitAnd(shiftRight(vi, uint(6)), uint(63)).toInt().toVar();
+    const cz = bitAnd(shiftRight(vi, uint(12)), uint(63)).toInt().toVar();
+    const occBase = levelF.toUint().mul(uint(LEVEL_WORDS)).add(uint(OCC_OFF)).toVar();
+    const n = float(0).toVar();
+    for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+      // The torus wrap is `dominantFace`'s, verbatim — the slot index carries
+      // the low 6 bits of the world cell and a neighbour is the next slot.
+      const v = bitOr(bitOr(
+        bitAnd(cx.add(int(dx)), int(N - 1)).toUint(),
+        shiftLeft(bitAnd(cy.add(int(dy)), int(N - 1)).toUint(), uint(6))),
+      shiftLeft(bitAnd(cz.add(int(dz)), int(N - 1)).toUint(), uint(12))).toVar();
+      const bit = bitAnd(
+        win.buffer.element(occBase.add(shiftRight(v, uint(5)))),
+        shiftLeft(uint(1), bitAnd(v, uint(31))),
+      ).toVar();
+      n.addAssign(select(bit.equal(uint(0)), float(1), float(0)));
+    }
+    return n.max(1);
+  };
+  /** `L_vox / L_e` for one voxel — the whole of the paragraph above. */
+  const emitterVoxelScale = (levelF, voxF) =>
+    coverageAt(levelF, voxF).div(exposedFaceCount(levelF, voxF));
+  /** The palette's emission for a voxel, under whichever arm is armed. */
+  const emissionAt = (pi, levelF, voxF) => (RC5_EMIT_CONSERVE
+    ? emOf(palEmU.element(pi).xyz.mul(emitterVoxelScale(levelF, voxF)))
+    : emOf(palEmU.element(pi).xyz));
   /**
    * ⭐⭐ §19 STAGE 4.5 — `shadeHit`, SPLIT INTO ITS TERMS SO A RECEIPT CAN WEIGH
    * THEM. One implementation, two consumers.
@@ -2765,7 +2883,12 @@ export function createGiGather({
       }
     });
 
-    return { pal, palEm: emOf(palEm.xyz), Esun, Emiss, Ebnc, Enee, census };
+    // §19 5.3b — the emission the face RADIATES, not the one the material
+    // authors: energy-conserved against this voxel's own coverage and exposed
+    // faces. `emissionAt` is the identity on every arm but the cascades'.
+    return {
+      pal, palEm: emissionAt(pi, levelF, voxF), Esun, Emiss, Ebnc, Enee, census,
+    };
   };
 
   /**
@@ -2781,12 +2904,18 @@ export function createGiGather({
    * would be two chances for the bounce term and the direct term to disagree
    * about what surface they are on.
    */
-  const hitPalette = (levelF, voxF) => {
+  const hitPalette = (levelF, voxF, wantEmissive = true) => {
     const pi = palIndexAt(levelF, voxF).toVar();
     const pal = palU.element(pi).xyz.toVar();
     return {
       rho: (BOUNCE_ALBEDO_MAX < 1 ? pal.min(vec3(BOUNCE_ALBEDO_MAX)) : pal).toVar(),
-      Le: emOf(palEmU.element(pi).xyz).toVar(),
+      // ⚠ §19 5.3b — BUILT ONLY WHEN THE CALLER WANTS IT. This closure runs once
+      // per RAY in [E]'s attribution (921 600 of them at ultra), and the
+      // energy-conserving emission below costs a coverage read plus six
+      // occupancy bits. The compact record does not carry `Le` at all — [J]
+      // takes a face's emission out of the CACHE WORD `shadeHit` wrote — so on
+      // that build not one node of this is constructed.
+      Le: wantEmissive ? emissionAt(pi, levelF, voxF).toVar() : null,
     };
   };
 

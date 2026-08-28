@@ -667,6 +667,17 @@ export function createSrcDepositFrame(store, bins, {
   shadeHit = null,
   attribute = null,
   secondary = null,
+  /**
+   * ⭐ §19 STAGE 5.3b — WHICH RECORD WORDS THE APPEND ACTUALLY WRITES.
+   *
+   * The STRIDE is `SEC_HIT_WORDS` for every build and does not move; this only
+   * says whether a field is worth storing. The cascade build's reader recovers
+   * `P`, `N` and `Le` from the packed (level, voxel, face) address it already
+   * loads (`rcHit`'s `compact` note), so nine `atomicStore`s per hit — on the
+   * pass that runs for every ray in the frame — buy nothing. `null` (every
+   * other caller) writes all of them, byte-identically.
+   */
+  hitFields = null,
   readPixel,
   readNormal,
   camera,
@@ -684,6 +695,9 @@ export function createSrcDepositFrame(store, bins, {
   phase = null,
   threads = 0,
 } = {}) {
+  const writesP = hitFields?.P !== false;
+  const writesN = hitFields?.N !== false;
+  const writesLe = hitFields?.Le !== false;
   const { probeTable, freeStack } = store;
   const { scratch, payload, stats, binTotal, w0 } = bins;
   // The hit list is a REGION of a buffer this kernel also writes bins into, so
@@ -1109,10 +1123,10 @@ export function createSrcDepositFrame(store, bins, {
       // denominators every reading of `unattributedRate` has ever used.
       const sec = secondary && attribute
         ? {
-            P: vec3(0).toVar(),
-            N: vec3(0).toVar(),
+            P: writesP ? vec3(0).toVar() : null,
+            N: writesN ? vec3(0).toVar() : null,
             rho: vec3(0).toVar(),
-            Le: vec3(0).toVar(),
+            Le: writesLe ? vec3(0).toVar() : null,
             emitter: float(-1).toVar(),
             slot: uint(SLOT_EMPTY).toVar(),
             sumL: uint(SLOT_EMPTY).toVar(),
@@ -1124,10 +1138,10 @@ export function createSrcDepositFrame(store, bins, {
         : null;
       if (attribute) {
         const a = attribute(r, dir);
-        sec.P.assign(vec3(a.P));
-        sec.N.assign(vec3(a.n));
+        if (sec.P) sec.P.assign(vec3(a.P));
+        if (sec.N) sec.N.assign(vec3(a.n));
         sec.rho.assign(vec3(a.rho));
-        sec.Le.assign(vec3(a.emissive));
+        if (sec.Le) sec.Le.assign(vec3(a.emissive));
         if (a.emitter != null) sec.emitter.assign(float(a.emitter));
         if (a.ray != null) sec.ray.assign(uint(a.ray));
       }
@@ -1296,12 +1310,16 @@ export function createSrcDepositFrame(store, bins, {
           If(idx.lessThan(uint(secondary.capacity)), () => {
             const e = uint(secondary.base + 1).add(idx.mul(uint(SEC_HIT_WORDS))).toVar();
             const put = (w, v) => { atomicStore(scratch.element(e.add(uint(w))), v); };
-            put(SEC_P + 0, floatBitsToUint(sec.P.x));
-            put(SEC_P + 1, floatBitsToUint(sec.P.y));
-            put(SEC_P + 2, floatBitsToUint(sec.P.z));
-            put(SEC_N + 0, floatBitsToUint(sec.N.x));
-            put(SEC_N + 1, floatBitsToUint(sec.N.y));
-            put(SEC_N + 2, floatBitsToUint(sec.N.z));
+            if (sec.P) {
+              put(SEC_P + 0, floatBitsToUint(sec.P.x));
+              put(SEC_P + 1, floatBitsToUint(sec.P.y));
+              put(SEC_P + 2, floatBitsToUint(sec.P.z));
+            }
+            if (sec.N) {
+              put(SEC_N + 0, floatBitsToUint(sec.N.x));
+              put(SEC_N + 1, floatBitsToUint(sec.N.y));
+              put(SEC_N + 2, floatBitsToUint(sec.N.z));
+            }
             put(SEC_RHO + 0, floatBitsToUint(sec.rho.x));
             put(SEC_RHO + 1, floatBitsToUint(sec.rho.y));
             put(SEC_RHO + 2, floatBitsToUint(sec.rho.z));
@@ -1312,9 +1330,11 @@ export function createSrcDepositFrame(store, bins, {
             // rather than left as whatever last frame's entry held: a reader
             // added later gets a defined value instead of a stale one that
             // happens to decode (the rule the reserved pair shipped under).
-            put(SEC_LE + 0, floatBitsToUint(sec.Le.x));
-            put(SEC_LE + 1, floatBitsToUint(sec.Le.y));
-            put(SEC_LE + 2, floatBitsToUint(sec.Le.z));
+            if (sec.Le) {
+              put(SEC_LE + 0, floatBitsToUint(sec.Le.x));
+              put(SEC_LE + 1, floatBitsToUint(sec.Le.y));
+              put(SEC_LE + 2, floatBitsToUint(sec.Le.z));
+            }
             put(SEC_EMITTER, floatBitsToUint(sec.emitter));
             // The ray index is a u32 and is stored as one — [J] hands it
             // straight to `hashKey`, which is where NEE's stratified draw comes

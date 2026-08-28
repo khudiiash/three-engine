@@ -198,8 +198,25 @@ export function unpackRgbe(word) {
  * @param {object} [opts]
  * @param {string} [opts.tier]    defaults to the window's
  * @param {number} [opts.bricks]  override the pool size (harness only)
+ * @param {boolean} [opts.erc]  build the §19 5.3b PER-FACE IRRADIANCE region.
+ *
+ * ⭐⭐⭐ §19 STAGE 5.3b — WHY `E_rc` LIVES IN **THIS** BUFFER AND NOT A SECOND
+ * ONE. [J] already binds the cache, and the portable tier allows EIGHT storage
+ * buffers per kernel; a ninth binding is not a cost, it is a kernel that does
+ * not compile. A second REGION of the same `instancedArray` is therefore not an
+ * optimisation — it is the only shape in which a secondary cache can exist at
+ * all on the phone tier.
+ *
+ * The region is a PARALLEL array with the SAME addressing as the direct one
+ * (`slot × SLOT_WORDS + lv × 6 + face`, one RGBE word), so `ercRead` and
+ * `cacheRead` cannot disagree about which face they are on; appending it AFTER
+ * `CTL` leaves every existing offset — and every harness that prints them —
+ * numerically unchanged.
+ *
+ * OFF by default: the shipped GI2 chain allocates not one word of it, so 5.3's
+ * memory receipt (`describe().totalMB`) is the same number it was.
  */
-export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}) {
+export function createRadianceCache(win, { tier = win.tier, bricks = null, erc = false } = {}) {
   const spec = CACHE_TIERS[tier];
   if (!spec) throw new Error(`unknown cache tier "${tier}"`);
   const CACHE_BRICKS = bricks ?? spec.bricks;
@@ -214,7 +231,9 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
   const FREE_OFF = MAP_OFF + MAP_WORDS;
   const FREE_WORDS = CACHE_BRICKS;
   const CTL_OFF = FREE_OFF + FREE_WORDS;
-  const words = CTL_OFF + CTL_WORDS;
+  const ERC_OFF = CTL_OFF + CTL_WORDS;
+  const ERC_WORDS = erc ? CACHE_BRICKS * SLOT_WORDS : 0;
+  const words = ERC_OFF + ERC_WORDS;
 
   const buffer = instancedArray(new Uint32Array(words), "uint");
   const attribute = buffer.value;
@@ -296,18 +315,19 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
    * thing it says, rather than the most interesting thing it might have meant.
    * The split is kept because it is cheaper, not because it fixed anything.
    */
-  const readInline = (levelU, voxelU, faceU0) => {
+  const readInlineAt = (regionOff, levelU, voxelU, faceU0) => {
     const { mapIdx, lv, faceU } = addressOf(levelU, voxelU, faceU0);
     const m = atomicLoad(atomics.element(mapIdx)).toVar();
     // Index with a CLAMPED slot even when there is none: a read of slot 0 is
     // harmless and gated below, while an `If()` around a buffer read is the
     // idiom that rendered the BVH mirror pass black (windowTrace's note).
     const slot = m.max(uint(1)).sub(uint(1)).toVar();
-    const addr = uint(DATA_OFF).add(slot.mul(uint(SLOT_WORDS))).add(lv.mul(uint(SLOT_FACES))).add(faceU).toVar();
+    const addr = uint(regionOff).add(slot.mul(uint(SLOT_WORDS))).add(lv.mul(uint(SLOT_FACES))).add(faceU).toVar();
     const word = atomicLoad(atomics.element(addr)).toVar();
     const ok = m.notEqual(uint(0)).and(word.notEqual(uint(0)));
     return vec4(decodeRgbe(word), select(ok, float(1), float(0)));
   };
+  const readInline = (levelU, voxelU, faceU0) => readInlineAt(DATA_OFF, levelU, voxelU, faceU0);
   const cacheReadFn = sharedFn({
     name: "gi2CacheRead",
     type: "vec4",
@@ -359,6 +379,69 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
       return done;
     },
   });
+
+  // ═══════════════ §19 STAGE 5.3b — THE SECONDARY (IRRADIANCE) CACHE ════════
+  //
+  // ⭐⭐⭐ WHAT THIS REGION HOLDS, AND WHY IT IS NOT THE SAME QUANTITY AS THE
+  // ONE ABOVE. `DATA` is a face's outgoing RADIANCE from the DIRECT lights —
+  // `Le + ρ/π·(sun + NEE)`, a fixed function of the geometry and the lights.
+  // `ERC` is the face's incoming IRRADIANCE from the MERGED CASCADES, i.e. the
+  // paper's secondary cache: everything the field carries at that face, sky and
+  // bounce alike. [J] adds `ρ·E_rc/π` to the direct word and deposits the sum,
+  // so the two regions are the two halves of one hit's radiance and MUST share
+  // an address, which is why this is a parallel array and not a second table.
+  //
+  // ⚠ IT IS DELIBERATELY **NOT** ACCUMULATED WITH THE COUNT-CAPPED α THE DIRECT
+  // TERM USES. That α (`1/(n+1)` up to `nCap`) converges a NOISY estimator onto
+  // its mean; `gatherAt` is not noisy — it is a deterministic eight-probe
+  // interpolation of a field that already carries `TEMPORAL_ALPHA` — so
+  // averaging it again would only add latency, and the user's rule is that
+  // nothing on this path may buy quality with history. The blend here is a
+  // caller's α whose SHIPPED VALUE IS 1: the refresh writes what the field says
+  // now, which makes the write ORDER-FREE (every ray that reaches a face in one
+  // frame computes the same value from the same point and normal, so which of
+  // them lands last cannot change the word) and keeps §T.
+  const ercReadFn = erc ? sharedFn({
+    name: "gi2ErcRead",
+    type: "vec4",
+    inputs: [
+      { name: "level", type: "float" },
+      { name: "voxelIdx", type: "float" },
+      { name: "face", type: "float" },
+    ],
+    body: (levelF, voxelF, faceF) =>
+      readInlineAt(ERC_OFF, levelF.toUint(), voxelF.toUint(), faceF.toUint()),
+  }) : null;
+
+  const ercWriteFn = erc ? sharedFn({
+    name: "gi2ErcWrite",
+    type: "float",
+    inputs: [
+      { name: "level", type: "float" },
+      { name: "voxelIdx", type: "float" },
+      { name: "face", type: "float" },
+      { name: "rgb", type: "vec3" },
+      { name: "alpha", type: "float" },
+    ],
+    body: (levelF, voxelF, faceF, rgb, alpha) => {
+      const { mapIdx, lv, faceU } = addressOf(levelF.toUint(), voxelF.toUint(), faceF.toUint());
+      const m = atomicLoad(atomics.element(mapIdx)).toVar();
+      const done = float(0).toVar();
+      If(m.notEqual(uint(0)), () => {
+        const slot = m.sub(uint(1)).toVar();
+        const addr = uint(ERC_OFF).add(slot.mul(uint(SLOT_WORDS)))
+          .add(lv.mul(uint(SLOT_FACES))).add(faceU).toVar();
+        const old = atomicLoad(atomics.element(addr)).toVar();
+        const a = select(old.equal(uint(0)), float(1), alpha).toVar();
+        atomicStore(
+          atomics.element(addr),
+          encodeRgbe(mix(decodeRgbe(old), rgb.max(vec3(0)), a)),
+        );
+        done.assign(1);
+      });
+      return done;
+    },
+  }) : null;
 
   // ═══════════════════════════════════════════════ ACCUMULATE (a `sharedFn`)
   //
@@ -557,6 +640,18 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
         Loop({ start: 0, end: SLOT_CNT_WORDS, name: "cntZero" }, ({ cntZero }) => {
           atomicStore(atomics.element(cbase.add(uint(cntZero))), uint(0));
         });
+        // §19 5.3b — AND THE IRRADIANCE REGION, FOR THE SAME REASON. A recycled
+        // slot that kept a previous brick's `E_rc` would hand [J] a valid-
+        // looking word for a face that has never been gathered, and the refresh
+        // budget would then leave a stranger's bounce in place for `period`
+        // frames — the freshness sentinel is the zero word, so it has to be
+        // written at exactly the same moment the direct one is.
+        if (erc) {
+          const ebase = uint(ERC_OFF).add(slot.mul(uint(SLOT_WORDS))).toVar();
+          Loop({ start: 0, end: SLOT_WORDS, name: "ercZero" }, ({ ercZero }) => {
+            atomicStore(atomics.element(ebase.add(uint(ercZero))), uint(0));
+          });
+        }
         atomicStore(atomics.element(mapIdx), slot.add(uint(1)));
         atomicAdd(atomics.element(uint(CTL_OFF + CTL_ALLOC)), uint(1));
       });
@@ -584,16 +679,30 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
     countBytes: CNT_WORDS * 4,
     mapBytes: MAP_WORDS * 4,
     freeBytes: FREE_WORDS * 4,
+    ercBytes: ERC_WORDS * 4,
     totalBytes: words * 4,
     totalMB: +((words * 4) / (1024 * 1024)).toFixed(2),
-    offsets: { DATA_OFF, CNT_OFF, MAP_OFF, FREE_OFF, CTL_OFF },
+    offsets: { DATA_OFF, CNT_OFF, MAP_OFF, FREE_OFF, CTL_OFF, ERC_OFF },
   });
 
   return {
-    tier, bricks: CACHE_BRICKS, words,
+    tier, bricks: CACHE_BRICKS, words, erc: !!erc,
     buffer, atomics, attribute,
-    DATA_OFF, CNT_OFF, MAP_OFF, FREE_OFF, CTL_OFF,
+    DATA_OFF, CNT_OFF, MAP_OFF, FREE_OFF, CTL_OFF, ERC_OFF,
     allocPass, clearPass,
+    /**
+     * §19 5.3b — the SECONDARY cache: `(level, voxelIdx, face) → vec4(E, valid)`
+     * and its α-blended write. Both are `null` unless the cache was built with
+     * `erc`, so a caller that forgot the flag fails at build with a TypeError
+     * on the closure rather than by silently reading the direct region.
+     */
+    ercRead: ercReadFn
+      ? ((levelF, voxelF, faceF) => ercReadFn(float(levelF), float(voxelF), float(faceF)))
+      : null,
+    ercWrite: ercWriteFn
+      ? ((levelF, voxelF, faceF, rgb, alphaF) =>
+        ercWriteFn(float(levelF), float(voxelF), float(faceF), vec3(rgb), float(alphaF)))
+      : null,
     /** `(level, voxelIdx, face) → vec4(rgb, valid)`; all args float nodes. */
     cacheRead: (levelF, voxelF, faceF) => cacheReadFn(float(levelF), float(voxelF), float(faceF)),
     /** `(level, voxelIdx, face, rgb, alpha) → float`; 1 if the brick had a slot. */
