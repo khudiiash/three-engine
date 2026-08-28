@@ -114,33 +114,31 @@ console.log(`  settled: ${settled.fps ?? "?"} fps, cpu ${f2(settled.cpuMs)} ms, 
 // back to its entity through `userData.entityId` — the same link the picker
 // uses. `TARGET` narrows by name when a scene has several emitters.
 const target = await page.evaluate((want) => {
+  // The emission does NOT live on `mesh.material.emissive` for an authored
+  // material — it is an `emissiveNode` on the material asset. The GI system has
+  // already resolved that for its own admission pass: `_emitterCands` is the
+  // list it built, each entry carrying the mesh and its power. Reading the
+  // engine's own answer beats re-deriving it, and it guarantees the probe drags
+  // a mesh the GI actually treats as an emitter.
   const eng = globalThis.__giEngineForProbe;
-  const best = { lum: 0 };
-  const seen = new Map();
-  eng?.scene?.traverse?.((o) => {
-    const mats = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
-    let lum = 0;
-    for (const m of mats) {
-      const c = m?.emissive; if (!c) continue;
-      const i = m.emissiveIntensity ?? 1;
-      lum = Math.max(lum, (0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b) * i);
-    }
-    if (!(lum > 0)) return;
-    let n = o, id = null;
-    while (n && !id) { id = n.userData?.entityId ?? n.userData?.entity?.id ?? null; n = n.parent; }
-    if (!id) return;
-    const prev = seen.get(id) ?? 0;
-    if (lum > prev) seen.set(id, lum);
-  });
-  for (const [id, lum] of seen) {
-    const ent = eng.getEntity?.(id) ?? eng.entities?.get?.(id) ?? null;
+  const sys = globalThis.__giSysForProbe();
+  const cands = sys?._emitterCands ?? [];
+  let best = null;
+  for (const c of cands) {
+    const mesh = c?.mesh; if (!mesh) continue;
+    let n = mesh, id = null;
+    while (n && !id) { id = n.userData?.entityId ?? null; n = n.parent; }
+    if (!id) continue;
+    const ent = eng.getEntity?.(id);
     const name = ent?.name ?? String(id);
     if (want && !name.toLowerCase().includes(want.toLowerCase())) continue;
-    const obj = ent?.object3D ?? ent?.object ?? null;
-    const p = obj ? [obj.position.x, obj.position.y, obj.position.z] : [0, 0, 0];
-    if (lum > best.lum) Object.assign(best, { id, name, lum, pos: p });
+    const lum = c.power ?? c.lum ?? c.luminance ?? 1;
+    if (!best || lum > best.lum) {
+      const o = ent?.object3D;
+      best = { id, name, lum, pos: o ? [o.position.x, o.position.y, o.position.z] : [0, 0, 0], cands: cands.length };
+    }
   }
-  return best.lum > 0 ? best : null;
+  return best;
 }, TARGET);
 if (!target) { console.log("FATAL: no emissive mesh found"); await browser.close(); process.exit(2); }
 console.log(`  target: "${target.name}" (${target.id}) emissive luminance ${f2(target.lum)} at ${target.pos.map((v) => v.toFixed(2)).join(", ")}`);
@@ -194,8 +192,12 @@ await page.evaluate(({ ms, base, amp }) => {
     const t = performance.now() - t0;
     if (t >= ms) { R.seg = "tail"; R.dragEndedAt = performance.now(); R.dragDone = true; return; }
     const u = Math.sin((t / ms) * Math.PI * 2) * amp;
-    globalThis.__editorApi.call("entity.setTransform", { id: R.target.id, position: { x: base[0] + u, y: base[1], z: base[2] } })
-      .catch(() => {});
+    // ⚠ VERIFY THE DRAG ACTUALLY MOVED SOMETHING. A silent `.catch` here let a
+    // whole Bistro run report "no freeze" from a drag that never happened —
+    // the op refused and the probe measured a parked scene twice.
+    globalThis.__editorApi.call("entity.setTransform", { id: R.target.id, position: [base[0] + u, base[1], base[2]] })
+      .then(() => { R.moved = (R.moved ?? 0) + 1; })
+      .catch((e) => { R.setErr ??= String(e?.message ?? e); });
     requestAnimationFrame(step);
   };
   requestAnimationFrame(step);
@@ -205,8 +207,9 @@ await wait((TAIL / 60) * 1000 + 500);
 
 const R = await page.evaluate(() => {
   const R = globalThis.__gi2Drag; R.restore?.();
-  return { frames: R.frames };
+  return { frames: R.frames, moved: R.moved ?? 0, setErr: R.setErr ?? null, endPos: R.endPos ?? null };
 });
+console.log(`  setTransform: ${R.moved} accepted${R.setErr ? `, FIRST ERROR: ${R.setErr}` : ""}`);
 await browser.close();
 
 const segs = { park: [], drag: [], tail: [] };
