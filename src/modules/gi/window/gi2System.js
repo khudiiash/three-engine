@@ -83,7 +83,7 @@ import { createGiGather, GATHER_TIERS, PAL_ENTRIES, STATS } from "./gatherProbes
 import { createRcCascades } from "./rc/rcSystem.js";
 import { rcHitPathEnabled } from "./rc/rcConfig.js";
 import { rc5PixelNeeEnabled } from "../giConfig.js";
-import { rc5BvhShadowEnabled } from "../giConfig.js";
+import { rc5BvhShadowEnabled, rc5BvhShadowMaxTris } from "../giConfig.js";
 import { rc5PathEnabled } from "../giConfig.js";
 import { detachCpuMirror } from "../releaseCompute.js";
 
@@ -1126,6 +1126,19 @@ export function createGi2System({
    */
   const kickShadowBvh = (built) => {
     if (!shadowBvh || !built?.triCount || shadowBvh.ready) return;
+    // ⭐⭐ THE COST GATE. Above it the tree is never built, never uploaded and
+    // never traced — `readyU` stays 0 and `rcDirect`'s branch takes the voxel
+    // side forever. Said out loud, because "the exact arm did nothing" is
+    // otherwise indistinguishable from "the exact arm is broken".
+    const maxTris = rc5BvhShadowMaxTris();
+    if (built.triCount > maxTris) {
+      console.log(
+        `[gi2] exact shadow rays: OFF — ${built.triCount} soup triangles is over the ` +
+        `${maxTris} budget (a BVH2 descent per ray is the frame at this size; ` +
+        `__gi2Rc5BvhShadowMax raises it). The voxel arm serves.`,
+      );
+      return;
+    }
     // ⛔ NOT ON PHONE. The tree is tens of MB of storage buffer on top of a
     // budget the phone tier is already at, and a 64-deep stack of `u32` per
     // thread is a register cost a tile GPU pays badly. The voxel arm is the
