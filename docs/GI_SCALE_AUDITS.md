@@ -5693,10 +5693,15 @@ if they were.
 ▶ **THE FIRST THING THE NEXT UNIT ON THIS PATH OWES IS A SINGLE-VALUED GATE.**
 Until `probe:gi2-cornell` returns the same census twice, no quality unit
 downstream of the resolve can be arbitrated at all — which is §AH.5's
-un-arbitrable runner, one instrument along. The likeliest place to look is what
-changed between §AJ's stable nine and today's bimodal eight: this session's
-worktree carries an in-flight 540/−392-line rewrite of `gatherProbes.js` from
-another agent, and the resolve is where §AJ located the fault in the first place.
+un-arbitrable runner, one instrument along. ⭐ **AND THE CHANGE BETWEEN §AJ's STABLE NINE AND TODAY'S BIMODAL EIGHT NOW HAS
+A COMMIT ID.** The eight boots above ran against an in-flight 540/−392-line
+rewrite of `gatherProbes.js` that has since landed as **`e04a5df` — "stage 4.14:
+the cache face is lit from the probes' resolved irradiance, not from itself"**.
+That is a change to the transport OPERATOR of the very Neumann iteration §AJ.3
+priced at `1/(1−ρ)` on albedo-1.0 white walls — exactly the kind of change that
+moves which fixed point the chain falls into, and the resolve is where §AJ
+located the fault to begin with. The md5 receipt says the file did not move
+DURING the eight boots; it says nothing about it having moved before them.
 
 ⚠ The RIG arm (`RIG=1`, the deterministic generated project) read **20 black of
 21 084** in the one boot taken, median |log ratio| 0.638 — a different and far

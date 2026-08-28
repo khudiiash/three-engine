@@ -452,6 +452,15 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
    */
   const COV_BELOW = Math.max(0, globalThis.__gi2CovBelow ?? 0.5);
   /**
+   * §19 4.13 — over how much of the coarse cell the liveness question is asked.
+   * `1` (shipped) takes the MIN over the cell's eight corners at `holdsCell`'s
+   * own ± spacing margin; `__gi2CovCorners = 0` compiles 4.12's single tap at
+   * the probe's own position, which is the only arm that can arbitrate `DARK1`
+   * — a pixel six metres from a probe that read its own coverage as 1.000.
+   * Build-time, for §AI.3's reason.
+   */
+  const COV_CORNERS = (globalThis.__gi2CovCorners ?? 1) !== 0;
+  /**
    * ⭐⭐ §19 3.16 FIX 2 — `RAY_MAX` IS PER-CASCADE, AND THE LAST CASCADE'S IS
    * ITS OWN LATTICE'S EXTENT.
    *
@@ -949,8 +958,66 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const nOf = (w) => bitAnd(shiftRight(w, uint(24)), uint(63));
   /** 1 = this direction ESCAPED its interval, so the parent's map applies. */
   const tOf = (w) => bitAnd(shiftRight(w, uint(30)), uint(1));
+  /**
+   * ⭐⭐⭐ §19 4.14 — BIT 31, THE LAST FREE ONE: THIS DIRECTION WAS BLOCKED
+   * BEFORE THE PROBE'S OWN BAND EVEN STARTED.
+   *
+   * `blockedNear` has been computed in the trace since 3.15 and thrown away
+   * three lines later. It is the difference between the two ways a texel can
+   * hold radiance 0:
+   *
+   *   · `T = 1`, a CLEAN MISS — "nothing in my band, ask my parent", and the
+   *     merge does exactly that, so the texel ends up carrying real light;
+   *   · `T = 0` with this bit — OPAQUE BEFORE MY BAND. The parent must not be
+   *     asked (that would be the leak one level up) and this cascade has
+   *     nothing of its own. The texel is a measured, permanent zero.
+   *
+   * A probe ALL of whose texels are the second kind has no data at all, and
+   * §AJ measured what that costs: in the user's 5 m Cornell box, c2's band is
+   * 20–100 m, every one of its rays is blocked at ~2 m, its field is
+   * identically zero — and the resolve still hands it 35–38 % of the pixel,
+   * dragging 0.49 to 0.003. 667 black pixels, all of them exactly there.
+   */
+  const bnOf = (w) => bitAnd(shiftRight(w, uint(31)), uint(1));
   /** The same word with `T` cleared — the merge's idempotence (see `mergeFor`). */
   const clearT = (w) => bitAnd(w, uint((~T_BIT) >>> 0));
+  /**
+   * §19 4.14 — the `ready` ladder's fourth rung, and it sits BELOW every gate.
+   *
+   * `ready` was three-valued: 0 re-keyed, 0.5 seeded, 1 traced, and everything
+   * that asks "is this probe worth reading" asks `> 0.25`. A probe that traced
+   * and measured NOTHING IN ITS OWN BAND now writes 0.2 instead of 1, so the
+   * resolve's `alive`, `parentTap`'s gate and `seedPass`'s parent test all say
+   * no WITHOUT ONE OF THEM BEING EDITED — the claim it forfeits is redistributed
+   * to the cascades that did measure the band, which is what makes the fix
+   * energy-preserving rather than a subtraction.
+   *
+   * ⚠ AND IT IS NOT A DEATH. `allocPass` still lists the cell, so the probe
+   * traces again on its next turn and `shPass` writes 1 the moment one ray
+   * lands inside the band. Nothing here is remembered longer than one round.
+   */
+  const READY_EMPTY = 0.2;
+  /**
+   * ⛔ §19 4.14 — BUILT AND **DEFAULT-OFF**, because the only instrument that
+   * can see it cannot arbitrate it today. `__gi2CascData = 1` compiles it.
+   *
+   * `probe:gi2-cornell` on the user's `Cornel.scene`, EIGHT alternating boots
+   * on a still tree (`gatherProbes.js` md5 identical before and after all
+   * eight), black census:
+   *
+   *     off  691   685  8566  8598
+   *     on   684  4643   691  8598
+   *
+   * **The scene converges to one of two fixed points and the flag has nothing
+   * to do with which.** §AJ's own nine-arm sweep read 621–674 with no collapse
+   * at all, so the bimodality is newer than §AJ and is not this unit's: it
+   * shows in the OFF arm too. Until the gate is single-valued, every
+   * single-boot A/B on it — including the pair that appeared to prove this unit
+   * works (8595 → 872) and the pair that appeared to prove it harms
+   * (683 → 8597) — is a statement about which mode the boot landed in.
+   * [[probe-blind-statistics]]
+   */
+  const CASC_DATA = (globalThis.__gi2CascData ?? 0) !== 0;
 
   // ══════════════════════════════════════════ SHADER: probeAlloc (§U.1)
   //
@@ -1507,7 +1574,52 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       const fHi = pos.add(spOwn).div(fSp).floor().toVar();
       const holdsCell = inLatticeAt(fOrg, fLo.x, fLo.y, fLo.z)
         .and(inLatticeAt(fOrg, fHi.x, fHi.y, fHi.z)).toVar();
-      const fCov = latticeCovAt(fBase, fSp, fOrg, pos).toVar();
+      // ⭐⭐⭐ §19 4.13 — THE DEFERRAL WAS DECIDED AT THE PROBE AND READ AT THE
+      // PIXEL. `DARK1` is the pin that proves one tap cannot answer it: its c2
+      // probe stands where c1's coverage is **1.000** — c1 is fully live THERE
+      // — and the pixel that probe answers is **six metres away**, where c1's
+      // coverage is **0.27**. Both of 4.12's conditions pass at the point, the
+      // near band is deferred, and the cascade it is deferred to has nothing
+      // live where the answer is actually read: `DARK1` measured 0.0022 against
+      // a path-traced 0.4607 and did not move at 4.12.
+      //
+      // ⭐ THE EXTENT WAS ALREADY DECIDED, AND IT IS `holdsCell`'s. That test
+      // asks its BOX question over `pos ± spOwn` — this cascade's own cell plus
+      // the one cell beyond it that the trilinear blend reaches — precisely
+      // because a probe is read across that whole span. Asking the LIVENESS
+      // question on a SMALLER extent than the CONTAINMENT question was the
+      // inconsistency; both are the same volume now, and the deferral takes the
+      // WORST corner of it. A cascade defers its near band only where the finer
+      // one is live everywhere its own answer will be read.
+      //
+      // ⚠ EIGHT TAPS WHERE 4.12 HAD ONE, and that is the honest cost: 64 scalar
+      // `wpInfo[…].w` loads, the same eight corners for every one of a probe's
+      // 64 oct texels, so every texel after the first reads them out of cache.
+      // Still no SH, still no branch, still nothing added to the ray itself.
+      // ⚠ `min`, NEVER A MEAN — a mean lets a fully live half of the cell pay
+      // for a dead half, which is the arithmetic that hid `DARK1` inside a
+      // 1.000 in the first place.
+      // ⚠ A TSL `Loop`, NOT A JS ONE, AND THE REASON IS THE SAME AS
+      // `cascConst`'s. `latticeCovAt` is eight addressed loads and a trilinear
+      // product; unrolled eight more times it added **163 kB of WGSL to
+      // `worldTrace`** (98 → 261 kB, measured by `smoke:gi-gpu`'s storage
+      // audit), and §19 4.3a's receipt says a kernel's WGSL size is paid at
+      // BOOT, in pipeline compile, in front of first light. One copy inside a
+      // loop costs the same 64 loads and none of the text.
+      const fCov = float(1).toVar();
+      if (COV_CORNERS) {
+        Loop({ start: 0, end: 8, name: "wpCovCorner" }, ({ wpCovCorner }) => {
+          const kk = uint(wpCovCorner).toVar();
+          const cp = vec3(
+            select(bitAnd(kk, uint(1)).equal(uint(0)), pos.x.sub(spOwn), pos.x.add(spOwn)),
+            select(bitAnd(kk, uint(2)).equal(uint(0)), pos.y.sub(spOwn), pos.y.add(spOwn)),
+            select(bitAnd(kk, uint(4)).equal(uint(0)), pos.z.sub(spOwn), pos.z.add(spOwn)),
+          ).toVar();
+          fCov.assign(fCov.min(latticeCovAt(fBase, fSp, fOrg, cp)));
+        });
+      } else {
+        fCov.assign(latticeCovAt(fBase, fSp, fOrg, pos));
+      }
       coveredBelow = rr.casc.greaterThan(uint(0)).and(holdsCell)
         .and(fCov.greaterThanEqual(wu.wpCovBelow)).toVar();
     }
@@ -1656,7 +1768,13 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     wpOct.element(addr).assign(emaOn ? encodeRgbe(rgb0) : packedRgb);
     if (SPLIT_OWN) wpOct.element(addr.add(uint(2))).assign(packedRgb);
     wpOct.element(addr.add(uint(1))).assign(
-      packMoments(nOf(prev1).add(uint(1)).min(uint(63)), m1, sqrt(m2.max(0)), dmax, tNew),
+      bitOr(
+        packMoments(nOf(prev1).add(uint(1)).min(uint(63)), m1, sqrt(m2.max(0)), dmax, tNew),
+        // §19 4.14 — bit 31. Written unconditionally (0 when the direction did
+        // measure something), so the word is a complete statement every frame
+        // and a probe cannot inherit a stale "blocked" from a scene that moved.
+        shiftLeft(select(blockedNear, uint(1), uint(0)), uint(31)),
+      ),
     );
     // ⚠ AN ARRAY `count` IS A DISPATCH SIZE IN WORKGROUPS, NOT IN THREADS
     // (`ComputeNode.compute`: a number sets `count`, an array sets
@@ -1932,6 +2050,13 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     If(i0.w.lessThan(0.5), () => { Return(); });                       // dead cell
     const i2 = wpInfo.element(infoIdx(gc, 2)).toVar();
     If(i2.w.greaterThan(0.75), () => { Return(); });                   // already traced
+    // §19 4.14 — …and a probe that traced and found its whole band blocked is
+    // NOT a candidate for a parent seed. Seeding it would hand it the coarser
+    // cascade's field and put it straight back on the resolve's books at
+    // `ready = 0.5`, which is the claim this stage just took away.
+    if (CASC_DATA) {
+      If(i2.w.greaterThan(READY_EMPTY * 0.5).and(i2.w.lessThan(0.25)), () => { Return(); });
+    }
     // The LAST cascade has no parent to take from; its fresh probes wait for
     // their own trace, which is 2 frames at its slot share.
     If(casc.greaterThanEqual(uint(NC - 1)), () => { Return(); });
@@ -2021,12 +2146,33 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     const faceN = wpInfo.element(infoIdx(gc, 1)).xyz.toVar();
 
     // Pass 1: the cosine-weighted mean over the directions this probe HAS.
+    //
+    // ⭐⭐⭐ §19 4.14 — AND THE CENSUS THAT DECIDES WHETHER THIS PROBE HAS A
+    // BAND AT ALL, taken in the loop that was already reading every moment
+    // word. `bnOf` is the trace's own `blockedNear`, per direction: a texel
+    // that is opaque BEFORE this cascade's interval starts holds a measured,
+    // permanent zero that the merge is forbidden to fill from the parent. When
+    // EVERY direction of the probe's own hemisphere is that, the probe has no
+    // data, and a cascade with no data must not take a claim (§AJ).
+    //
+    // ⚠ `nHas`, NOT `OCT` — a texel this probe has never traced is unknown, not
+    // empty, and a probe halfway through its first round must not be condemned
+    // on the four directions that have landed. And the front-hemisphere test is
+    // the SAME one pass 2 projects with: a faced probe does not own the half it
+    // cannot see, so directions there are not evidence either way.
     const acc = vec3(0).toVar();
     const wsum = float(0).toVar();
+    const nHas = float(0).toVar();
+    const nBlocked = float(0).toVar();
     Loop({ start: 0, end: OCT, name: "wpMean" }, ({ wpMean }) => {
       const t = uint(wpMean).toVar();
       const addr = octIdxW(gc, t).toVar();
       const w1 = wpOct.element(addr.add(uint(1))).toVar();
+      const e0 = octU.element(t).toVar();
+      const own0 = nOf(w1).greaterThan(uint(0))
+        .and(select(faced, dot(e0.xyz, faceN).greaterThan(0), true)).toVar();
+      nHas.addAssign(select(own0, float(1), float(0)));
+      nBlocked.addAssign(select(own0.and(bnOf(w1).equal(uint(1))), float(1), float(0)));
       If(nOf(w1).greaterThan(uint(0)), () => {
         const e = octU.element(t).toVar();
         const cw = select(faced, dot(e.xyz, faceN).max(0), float(1)).mul(e.w).toVar();
@@ -2065,7 +2211,14 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     });
     for (let i = 0; i < 9; i++) wpInfo.element(shIdxW(gc, i)).assign(vec4(sh[i], 0));
     const i2 = wpInfo.element(infoIdx(gc, 2)).toVar();
-    wpInfo.element(infoIdx(gc, 2)).assign(vec4(i2.xyz, 1));
+    // §19 4.14 — `READY_EMPTY` instead of 1 when every own direction was
+    // blocked before the band. `__gi2CascData = 0` compiles the unconditional
+    // 1 that 4.13 wrote, which is the only arm that can arbitrate this.
+    const rdyOut = CASC_DATA
+      ? select(nHas.greaterThan(0.5).and(nBlocked.greaterThanEqual(nHas)),
+        float(READY_EMPTY), float(1)).toVar()
+      : float(1);
+    wpInfo.element(infoIdx(gc, 2)).assign(vec4(i2.xyz, rdyOut));
     // The two counters every existing receipt prints as "probes" — reused so
     // `profile.gi2` and the boot probe keep meaning what they say, one bump per
     // probe UPDATED this frame rather than per probe placed on a screen tile.

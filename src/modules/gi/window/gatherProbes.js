@@ -594,7 +594,11 @@ export function createGiGather({
    * trace is the slowest pipeline of the boot and compiling both bodies would
    * pay for the retired one in first light, every boot, forever.
    */
-  const CACHE_FROM_PROBES = useWorld && (globalThis.__gi2CacheFromProbes ?? 1) !== 0;
+  // 08-28 18:00: DEFAULT OFF — §AK.6 measured the Cornell gate BISTABLE across
+  // boots with this on (black census ~690 vs ~8600 on identical boots: a loop
+  // with gain ≈ 1 in an albedo-1 box has two fixed points). Stage 5 replaces
+  // the loop; until then the shipped path keeps one fixed point. `= 1` opts in.
+  const CACHE_FROM_PROBES = useWorld && (globalThis.__gi2CacheFromProbes ?? 0) !== 0;
   /**
    * §AL's SECOND arm, measured separately and shipped only if it earns it: a
    * ceiling on the albedo the BOUNCE term multiplies. The standard energy

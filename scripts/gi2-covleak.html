@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>GI2 — the rotated 5 cm wall, many placements</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}pre{padding:12px}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // §19 4.13 — THE WALL INVARIANT, MEASURED WHERE IT IS INTERMITTENT.
+      //
+      // §AI.7 flagged the PHONE tier leaking 3 and 2 rays of 10 000 through the
+      // rotated Cornell's 5 cm wall (`probe:gi2-gather`'s rotX20/rotXY20 arms),
+      // against 0/10 000 in §AH.5 — and §AG.8 then recorded the same arms
+      // reading 0/10 000 twice more in the very battery that saw the 3. An
+      // instrument that fires once per battery cannot arbitrate a three-in-ten
+      // -thousand event: the gather rig takes ONE leak reading per world, on
+      // whatever window placement ~1 200 frames of arms happened to leave
+      // behind, and that placement is the only thing that differs between the
+      // runs that leak and the runs that do not.
+      //
+      // So this page holds the scene, the rays and the tier fixed and SWEEPS
+      // THE ONE FREE VARIABLE — where the camera stands, and with it the phase
+      // of the voxel lattice against the rotated wall. Same window, same fill,
+      // same `traceWindow`, same 10 000 rays; `placements` of them.
+      //
+      // ⚠ AND IT DIAGNOSES, NOT ONLY COUNTS. A leaking ray is walked again on
+      // the CPU through the window buffer that was just read back, naming the
+      // first voxel it passed through that was OCCUPIED and did not stop it,
+      // with that voxel's face byte, coverage class and the axis the ray
+      // entered by. "2 rays escaped" is not actionable; "they entered an
+      // X-normal wall voxel through its −Y face, whose bit that slab never
+      // sets" is.
+      const out = document.querySelector("#log");
+      const lines = [];
+      const say = (line) => { lines.push(line); out.textContent += line + "\n"; };
+      const fail = (error) => {
+        console.error("GI2-COVLEAK FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__GI2_COVLEAK_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: lines.join("\n"),
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const params = new URLSearchParams(location.search);
+        const TIER = params.get("tier") ?? "phone";
+        const LEAK_RAYS = Number(params.get("rays") ?? 10000);
+        const PLACEMENTS = Number(params.get("placements") ?? 12);
+        const WANT = (params.get("worlds") ?? "axis,rotY20,rotX20,rotXY20").split(",");
+
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const { Fn, instanceIndex, instancedArray, uint } = TSL;
+        const store = await import("/src/modules/gi/window/windowStore.js");
+        const fillMod = await import("/src/modules/gi/window/windowFill.js");
+        const traceMod = await import("/src/modules/gi/window/windowTrace.js");
+        const {
+          ROOM, CORNELL_SCENE, KIND_BOX, IDENTITY_ROT, rotX, rotY, applyRot, applyRotT, rotateScene,
+        } = fillMod;
+        const { unpackTrace } = traceMod;
+
+        // ── renderer ─────────────────────────────────────────────────────────
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        if (renderer.backend?.isWebGPUBackend !== true) throw new Error("not a WebGPU backend");
+
+        const win = store.createGiWindow(TIER);
+        const fill = fillMod.createWindowFill(win);
+        const { traceWindow } = traceMod.createWindowTrace(win);
+        const d = win.describe();
+        say(`tier ${TIER}: ${d.levels} levels @ ${d.voxel0} m, windows ` +
+          `${d.extents.map((e) => e.extent + "m").join("/")}, step budget ${d.traceSteps}`);
+        say(`sweep: ${PLACEMENTS} camera placements × ${LEAK_RAYS} rays × ${WANT.length} worlds`);
+
+        // ── the ray kernel (three storage bindings, as `gi2-trace.html`) ─────
+        const rayIn = instancedArray(new Float32Array(LEAK_RAYS * 12), "vec4");
+        const rayOut = instancedArray(new Float32Array(LEAK_RAYS * 4), "vec4");
+        const rayPass = Fn(() => {
+          const i = instanceIndex.toVar();
+          const b = i.mul(uint(3)).toVar();
+          const a0 = rayIn.element(b).toVar();
+          const a1 = rayIn.element(b.add(uint(1))).toVar();
+          const a2 = rayIn.element(b.add(uint(2))).toVar();
+          rayOut.element(i).assign(traceWindow(a0.xyz, a1.xyz, a0.w, a2.xyz).raw);
+        })().compute(LEAK_RAYS);
+        const compute = (pass) => renderer.computeAsync(pass);
+        const rayArr = rayIn.value.array;
+        const shoot = async (list) => {
+          for (let i = 0; i < LEAK_RAYS; i++) {
+            const r = list[i];
+            const b = i * 12;
+            rayArr[b] = r.o[0]; rayArr[b + 1] = r.o[1]; rayArr[b + 2] = r.o[2]; rayArr[b + 3] = 40;
+            rayArr[b + 4] = r.d[0]; rayArr[b + 5] = r.d[1]; rayArr[b + 6] = r.d[2]; rayArr[b + 7] = 0;
+          }
+          rayIn.value.needsUpdate = true;
+          await compute(rayPass);
+          const raw = new Float32Array(await renderer.getArrayBufferAsync(rayOut.value));
+          return (i) => unpackTrace(raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]);
+        };
+
+        // ── the SAME 10 000 local rays in every arm, as the gather rig ───────
+        const rng = (() => {
+          let s = 0x1a2b3c4d >>> 0;
+          return () => {
+            s = (s + 0x6d2b79f5) >>> 0;
+            let t = Math.imul(s ^ (s >>> 15), s | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        })();
+        const { hx, hy, hz } = ROOM;
+        const LEAK_LOCAL = [];
+        for (let i = 0; i < LEAK_RAYS; i++) {
+          const o = [(rng() * 2 - 1) * (hx - 0.3), (rng() * 2 - 1) * (hy - 0.3), (rng() * 2 - 1) * (hz - 0.3)];
+          const z = rng() * 2 - 1;
+          const ph = rng() * 2 * Math.PI;
+          const r = Math.sqrt(Math.max(0, 1 - z * z));
+          LEAK_LOCAL.push({ o, d: [r * Math.cos(ph), r * Math.sin(ph), z] });
+        }
+
+        // ── the four worlds, verbatim from `gi2-gather.html`'s Stage 3.9 ─────
+        const PANEL = { kind: KIND_BOX, min: [-1.5, 2.9, -1.5], max: [1.5, 3.0, 1.5], pal: 0 };
+        const PANEL_LOW = { kind: KIND_BOX, min: [-1.5, 2.2, -1.5], max: [1.5, 2.3, 1.5], pal: 0 };
+        const mul3 = (A, B) => [0, 1, 2].map((k) => applyRot(A, B[k]));
+        const WORLDS = [
+          { name: "axis", R: IDENTITY_ROT, panel: PANEL },
+          { name: "rotY20", R: rotY(20), panel: PANEL },
+          { name: "rotX20", R: rotX(20), panel: PANEL_LOW },
+          { name: "rotXY20", R: mul3(rotX(20), rotY(20)), panel: PANEL_LOW },
+        ].filter((w) => WANT.includes(w.name));
+
+        // The gather rig's own camera, and the sweep around it. The room is
+        // 10 × 6 × 10 m and every tier's L0 window is at least 32 m, so every
+        // placement below holds the whole room at level 0 — the sweep changes
+        // the lattice PHASE and nothing else.
+        const CAM_EYE = [0, -0.5, 4.8];
+        const jitter = (k) => {
+          // A deterministic low-discrepancy walk over one voxel of each tier,
+          // times three, so the phase sweep is dense in the interval that
+          // matters and identical between runs.
+          const g = 0.618033988749895;
+          const f = (n, s) => ((n + 1) * s * g) % 1;
+          const v = d.voxel0;
+          return [
+            CAM_EYE[0] + (f(k, 1) - 0.5) * 3 * v,
+            CAM_EYE[1] + (f(k, 2) - 0.5) * 3 * v,
+            CAM_EYE[2] + (f(k, 3) - 0.5) * 3 * v,
+          ];
+        };
+
+        // ── the CPU diagnosis ────────────────────────────────────────────────
+        //
+        // Walks the ray through level `l`'s voxels from its origin, reading the
+        // window buffer that was just read back, and reports the first OCCUPIED
+        // voxel that failed to stop it and why. The face rule mirrored here is
+        // `windowTrace`'s: the entry face is the axis last crossed (the ray's
+        // dominant axis for the voxel it was born in), face id = 2·axis + (the
+        // ray goes negative along it).
+        const viOf = (x, y, z) => ((x & 63) | ((y & 63) << 6) | ((z & 63) << 12)) >>> 0;
+        /** occ / face / cov / brick bit of the level-`l` voxel holding world point `p`. */
+        const readAt = (buf, p, level) => {
+          const v = win.levelVoxel(level);
+          const base = level * store.LEVEL_WORDS;
+          const c = p.map((x) => Math.floor(x / v));
+          const rel = [0, 1, 2].map((a) => c[a] - win.origins[level * 3 + a]);
+          if (rel.some((r) => r < 0 || r >= 64)) return null;
+          // ⚠ THE ADDRESS IS TOROIDAL AND ABSOLUTE. `windowTrace` indexes with
+          // `worldCell & 63`, never with `worldCell − origin`: the origin only
+          // decides whether the cell is IN the window, and a mirror that
+          // subtracts it reads a voxel up to 32 m away that is reliably empty.
+          const vi = viOf(c[0], c[1], c[2]);
+          const b = ((c[0] >> 2) & 15) | (((c[1] >> 2) & 15) << 4) | (((c[2] >> 2) & 15) << 8);
+          return {
+            cell: c,
+            occ: (buf[base + store.OCC_OFF + (vi >>> 5)] >>> (vi & 31)) & 1,
+            face: (buf[base + store.FACE_OFF + (vi >>> 2)] >>> ((vi & 3) * 8)) & 63,
+            cov: (buf[base + store.COV_OFF + (vi >>> 4)] >>> ((vi & 15) * 2)) & 3,
+            brick: (buf[base + store.BMASK_OFF + (b >>> 5)] >>> (b & 31)) & 1,
+          };
+        };
+        const diagnose = (buf, o, dir, level, maxCells = 200) => {
+          const v = win.levelVoxel(level);
+          const base = level * store.LEVEL_WORDS;
+          const org = [win.origins[level * 3], win.origins[level * 3 + 1], win.origins[level * 3 + 2]];
+          const c = o.map((x) => Math.floor(x / v));
+          const step = dir.map((x) => (x >= 0 ? 1 : -1));
+          const inv = dir.map((x) => (Math.abs(x) > 1e-12 ? 1 / x : Infinity));
+          const tNext = [0, 1, 2].map((a) => ((c[a] + (step[a] > 0 ? 1 : 0)) * v - o[a]) * inv[a]);
+          const tDelta = [0, 1, 2].map((a) => Math.abs(v * inv[a]));
+          // The birth voxel is tested by the face the ray LEAVES by; every
+          // later voxel by the face it entered through.
+          let axis = tNext.indexOf(Math.min(...tNext));
+          const passed = [];
+          for (let n = 0; n < maxCells; n++) {
+            const rel = [0, 1, 2].map((a) => c[a] - org[a]);
+            if (rel.some((r) => r < 0 || r >= 64)) return { passed, escaped: "left the window" };
+            const vi = viOf(rel[0], rel[1], rel[2]);
+            const occ = (buf[base + store.OCC_OFF + (vi >>> 5)] >>> (vi & 31)) & 1;
+            if (occ) {
+              const face = (buf[base + store.FACE_OFF + (vi >>> 2)] >>> ((vi & 3) * 8)) & 255;
+              const cov = (buf[base + store.COV_OFF + (vi >>> 4)] >>> ((vi & 15) * 2)) & 3;
+              const faceId = axis * 2 + (dir[axis] >= 0 ? 0 : 1);
+              const stopped = (face & (1 << faceId)) !== 0;
+              passed.push({ cell: c.slice(), axis, faceId, face: face & 63, cov, stopped });
+              if (stopped) return { passed, escaped: null };
+            }
+            axis = tNext.indexOf(Math.min(...tNext));
+            c[axis] += step[axis];
+            tNext[axis] += tDelta[axis];
+          }
+          return { passed, escaped: "ran out of cells" };
+        };
+
+        const results = { tier: TIER, rays: LEAK_RAYS, placements: PLACEMENTS, worlds: [] };
+        let totalLeaks = 0;
+        for (const world of WORLDS) {
+          const prims = [world.panel, ...rotateScene(CORNELL_SCENE, world.R)];
+          fill.setRotation(world.R);
+          fill.setScene(prims);
+          const rays = LEAK_LOCAL.map((r) => ({ o: applyRot(world.R, r.o), d: applyRot(world.R, r.d) }));
+          let selfTested = false;
+          const perPlacement = [];
+          const samples = [];
+          for (let k = 0; k < PLACEMENTS; k++) {
+            const cam = applyRot(world.R, jitter(k));
+            win.reset();
+            win.setCamera(cam);
+            await compute(win.statsResetPass);
+            await compute(win.scrollPass);
+            await compute(win.clearStaticPass);
+            await compute(fill.pass);
+            const get = await shoot(rays);
+            let leaks = 0;
+            const bad = [];
+            for (let i = 0; i < LEAK_RAYS; i++) {
+              if (!get(i).hit) { leaks++; if (bad.length < 3) bad.push({ i, steps: get(i).steps }); }
+            }
+            perPlacement.push(leaks);
+            totalLeaks += leaks;
+            if (leaks && samples.length < 6) {
+              const buf = new Uint32Array(await renderer.getArrayBufferAsync(win.attribute));
+              if (!selfTested) {
+                selfTested = true;
+                // ⚠ THE MIRROR IS TESTED BEFORE IT IS BELIEVED. A point 1 cm
+                // inside the ceiling slab must read occupied and the room's
+                // centre must not; if the addressing were off by an origin the
+                // face bytes below would be a fiction.
+                const inWall = readAt(buf, applyRot(world.R, [0, 3.02, 0]), 0);
+                const inAir = readAt(buf, applyRot(world.R, [0, 0, 0]), 0);
+                let occBits = 0;
+                for (let l = 0; l < win.levels; l++) {
+                  const b0 = l * store.LEVEL_WORDS + store.OCC_OFF;
+                  for (let w = 0; w < store.OCC_WORDS; w++) {
+                    let v2 = buf[b0 + w];
+                    while (v2) { occBits += v2 & 1; v2 >>>= 1; }
+                  }
+                }
+                say(`    [mirror self-test] buffer words ${buf.length}, occupied voxels ${occBits}`);
+                say(`    [mirror self-test] L0 origin [${[0, 1, 2].map((a) => win.origins[a])}] ` +
+                  `ceiling slab occ ${inWall?.occ ?? "off-window"} face ` +
+                  `0b${(inWall?.face ?? 0).toString(2).padStart(6, "0")}, room centre occ ${inAir?.occ ?? "off-window"}`);
+              }
+              for (const b of bad) {
+                if (samples.length >= 6) break;
+                const r = rays[b.i];
+                // ── where the ray REALLY crosses a surface (analytic, in the
+                // room's own un-rotated frame) and what the window says there ─
+                let cross = null;
+                for (let t = 0.005; t < 40 && !cross; t += 0.005) {
+                  const p = [r.o[0] + r.d[0] * t, r.o[1] + r.d[1] * t, r.o[2] + r.d[2] * t];
+                  const q = applyRotT(world.R, p);
+                  for (const pr of prims) {
+                    const hit = pr.kind === 1
+                      ? (() => {
+                          const c = [0, 1, 2].map((a) => (pr.min[a] + pr.max[a]) / 2);
+                          const rad = (pr.max[0] - pr.min[0]) / 2;
+                          return Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) <= rad;
+                        })()
+                      : [0, 1, 2].every((a) => q[a] >= pr.min[a] && q[a] <= pr.max[a]);
+                    if (hit) { cross = { t, p, local: q, pal: pr.pal }; break; }
+                  }
+                }
+                const per = [];
+                for (let l = 0; l < win.levels; l++) {
+                  per.push(cross ? { level: l, at: readAt(buf, cross.p, l) } : null);
+                }
+                // The entry/exit axes of the crossing voxel, from the ray's own
+                // slab times — the two faces `windowTrace` could have tested.
+                let faces = null;
+                if (cross) {
+                  const v = win.levelVoxel(0);
+                  const c = cross.p.map((x) => Math.floor(x / v));
+                  const tIn = []; const tOut = [];
+                  for (let a = 0; a < 3; a++) {
+                    const lo = (c[a] * v - r.o[a]) / r.d[a];
+                    const hi = ((c[a] + 1) * v - r.o[a]) / r.d[a];
+                    tIn.push(Math.min(lo, hi)); tOut.push(Math.max(lo, hi));
+                  }
+                  const inAx = tIn.indexOf(Math.max(...tIn));
+                  const outAx = tOut.indexOf(Math.min(...tOut));
+                  faces = {
+                    entryFace: inAx * 2 + (r.d[inAx] >= 0 ? 0 : 1),
+                    exitFace: outAx * 2 + (r.d[outAx] >= 0 ? 0 : 1),
+                  };
+                }
+                samples.push({ placement: k, cam, i: b.i, o: r.o, d: r.d, steps: b.steps, cross, per, faces });
+              }
+            }
+          }
+          const worst = Math.max(...perPlacement);
+          const nBad = perPlacement.filter((n) => n > 0).length;
+          say(`  ${world.name.padEnd(8)} leaks ${perPlacement.reduce((a, b) => a + b, 0)} over ` +
+            `${PLACEMENTS} placements (${nBad} placements leaked, worst ${worst}/${LEAK_RAYS}) ` +
+            `[${perPlacement.join(",")}]`);
+          for (const s of samples) {
+            say(`    ray ${s.i} @ placement ${s.placement} steps ${s.steps} ` +
+              `o [${s.o.map((x) => x.toFixed(2))}] d [${s.d.map((x) => x.toFixed(3))}]`);
+            if (!s.cross) { say("      no analytic surface crossing within 40 m — the ray really does miss"); continue; }
+            say(`      crosses pal ${s.cross.pal} at t ${s.cross.t.toFixed(3)} ` +
+              `world [${s.cross.p.map((x) => x.toFixed(2))}] local [${s.cross.local.map((x) => x.toFixed(2))}] ` +
+              `| entry face ${s.faces.entryFace}, exit face ${s.faces.exitFace}`);
+            s.per.forEach((p) => {
+              if (!p?.at) { say(`      L${p?.level ?? "?"}: off-window`); return; }
+              const a = p.at;
+              const eBit = (a.face >> s.faces.entryFace) & 1;
+              const xBit = (a.face >> s.faces.exitFace) & 1;
+              say(`      L${p.level}: occ ${a.occ} brick ${a.brick} cov ${a.cov} ` +
+                `face 0b${a.face.toString(2).padStart(6, "0")} | entry bit ${eBit}, exit bit ${xBit}` +
+                `${a.occ && !eBit && xBit ? "   ← ENTRY MISSES, EXIT WOULD CATCH" : ""}` +
+                `${a.occ && !eBit && !xBit ? "   ← NEITHER FACE BLOCKS" : ""}`);
+            });
+          }
+          results.worlds.push({ name: world.name, perPlacement, samples });
+        }
+
+        results.totalLeaks = totalLeaks;
+        results.pass = totalLeaks === 0;
+        say("");
+        say(`TOTAL ${totalLeaks} leaks of ${LEAK_RAYS * PLACEMENTS * WORLDS.length} rays — ` +
+          `${totalLeaks === 0 ? "PASS" : "FAIL"}`);
+        results.text = lines.join("\n");
+        globalThis.__GI2_COVLEAK_RESULT__ = results;
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

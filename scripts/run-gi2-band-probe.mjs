@@ -247,7 +247,21 @@ const bandAt = (pts) => page.evaluate(async ({ pts }) => {
       const o = org[Math.max(0, cc - 1)];
       const holds = cc > 0 && inLat(o, lo[0], lo[1], lo[2]) && inLat(o, hi[0], hi[1], hi[2]);
       const fCov = cc > 0 ? covAt(cc - 1, pp).cov : 1;
-      const defers = holds && fCov >= (w.covBelow ?? 0.5);
+      // §19 4.13 — the shipped rule takes the MIN over the coarse cell's eight
+      // corners, at `holdsCell`'s own ± spacing margin, because the deferral is
+      // decided at the PROBE and read at PIXELS a whole cell away. `finerCov`
+      // (the 4.12 centre tap) is kept beside it: `DARK1`'s row is the pair
+      // 1.000 / 0.27, and one number cannot show that.
+      let fCovMin = 1;
+      if (cc > 0) {
+        for (let k = 0; k < 8; k++) {
+          const cp = [
+            pp[0] + (k & 1 ? sp : -sp), pp[1] + (k & 2 ? sp : -sp), pp[2] + (k & 4 ? sp : -sp),
+          ];
+          fCovMin = Math.min(fCovMin, covAt(cc - 1, cp).cov);
+        }
+      }
+      const defers = holds && fCovMin >= (w.covBelow ?? 0.5);
       // ⚠ THE CENSUS IS ALWAYS TAKEN AGAINST 3.15's `t0`, WHETHER OR NOT THIS
       // BUILD DEFERS. That is what makes the column an A/B: the same set of
       // directions is counted in both arms, and `nearDark%` — how many of them
@@ -258,7 +272,7 @@ const bandAt = (pts) => page.evaluate(async ({ pts }) => {
         probe: {
           pos: pp.map((v) => +v.toFixed(2)),
           dist: +Math.hypot(pp[0] - pt.P[0], pp[1] - pt.P[1], pp[2] - pt.P[2]).toFixed(2),
-          contained, defers, t0, finerCov: +fCov.toFixed(3),
+          contained, defers, t0, finerCov: +fCov.toFixed(3), finerCovMin: +fCovMin.toFixed(3),
           ...census(best.gc, cc, t0, pt.N),
         },
       });
@@ -317,7 +331,7 @@ for (const key of ["a", "b"]) {
     `bands [${R.tStart.map((v, i) => `${f(v, 1)}–${f(R.tEnd[i], 0)}`).join("  ")}]  ` +
     `splitOwn ${R.splitOwn}  covBelow ${R.covBelow}  thinT ${R.thinT}`);
   console.log("\n  ── PER PINNED POINT — the answering cascade's probe, and its band ──");
-  console.log("  tag     cc  cov    dist   contained  defers  t0     finerCov  minHit  meanHit  " +
+  console.log("  tag     cc  cov    dist   contained  defers  t0     finerCov  covMin  minHit  meanHit  " +
     "near%  nearDark%");
   for (const r of R.rows) {
     for (const p of r.per) {
@@ -325,7 +339,7 @@ for (const key of ["a", "b"]) {
       const b = p.probe;
       console.log(`  ${r.tag.padEnd(7)} c${p.cc}  ${f(p.cov, 2)}   ${f(b.dist, 2).padStart(5)}  ` +
         `${String(b.contained).padEnd(9)}  ${String(b.defers).padEnd(6)}  ` +
-        `${f(b.t0, 1).padStart(5)}  ${f(b.finerCov, 3).padStart(8)}  ` +
+        `${f(b.t0, 1).padStart(5)}  ${f(b.finerCov, 3).padStart(8)}  ${f(b.finerCovMin, 3).padStart(6)}  ` +
         `${String(b.minHit ?? "—").padStart(6)}  ${String(b.meanHit ?? "—").padStart(7)}  ` +
         `${f(100 * b.shareNear, 1).padStart(5)}  ${f(100 * b.shareNearDark, 1).padStart(9)}`);
     }

@@ -44,6 +44,26 @@
 // is already spent, because the trace reads one bit either way, and because a
 // later one-sided/foliage rule needs the direction back.
 //
+// ⛔⛔ §19 4.13 — READING THE RULE AT BOTH ENDS OF THE SEGMENT WAS BUILT AND
+// RETRACTED TO AN ARM (`__gi2ExitFace = 1`); see `EXIT_FACE` for the numbers.
+// It seals the leak below and darkens a triangle-voxelized room, because the
+// exit axis proves the ray moved a cell and not which SIDE of the surface it
+// moved on. The paragraph below stands as the shipped rule. The rest of this
+// note is the OPEN defect it describes.
+//
+// §19 4.13 — THE RULE READ AT BOTH ENDS OF THE SEGMENT. The
+// paragraph above is right about which surfaces a ray crosses and wrong about
+// which STEP it crosses them on. A voxel is a segment bounded by an entry
+// crossing and an exit crossing, and until 4.13 only the entry end was asked.
+// A floor TILTED 20° about X keeps `n.x` exactly zero, so it sets ±Y and ±Z and
+// not ±X; an X-dominant ray enters its slab voxel through an ±X face, is waved
+// through, and leaves through the −Y face it descended by — a face the slab
+// does set. Measured: 3 and 2 rays of 10 000 at the phone tier's 0.5 m cell
+// (`probe:gi2-covleak`, `probe:gi2-gather`'s rotX20/rotXY20), 0 at 0.25 m.
+// Testing the EXIT face as well seals it, costs no load (same byte), and cannot
+// touch the grazing exemption: a ray running along a wall enters AND leaves on
+// the wall's tangent axes, and neither bit is set.
+//
 // ══ THE THEOREM HAS A PRECONDITION: ONE AXIS PER STEP ════════════════════════
 //
 // The no-leak argument above says "the ray must make an X step to cross the
@@ -281,6 +301,40 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
   const { levels, dynLevels, voxel0, buffer, originsU, originAt } = win;
   const useDynamic = dynamic && dynLevels > 0;
   const VOXEL_STEPS = BRICK * 3 + 1;
+  /**
+   * ⛔⛔ §19 4.13 — BUILT, MEASURED, AND **DEFAULT-OFF**. `__gi2ExitFace = 1`
+   * compiles it; the shipped default is the entry-face-only test.
+   *
+   * It does exactly what it claims — the phone tier's rotated 5 cm wall goes
+   * 3 and 2 of 10 000 to **0 of 1 440 000** (`probe:gi2-covleak`, 12 lattice
+   * phases × 4 rotations × 3 tiers) and Bistro's thin-geometry census does not
+   * move (`probe:gi2-sky` 29.5 % dimmed against §AG's 29.9 %). It also DARKENS
+   * THE USER'S CORNELL BOX, and that is the trade this project does not take.
+   *
+   * ⭐⭐ WHY, AND IT IS THE SAME SENTENCE AS THE FIX: the exit axis proves the
+   * ray moved a whole cell, and NOT which side of the surface it moved on. In
+   * an ANALYTIC scene (`windowFill`, solid slabs) the two coincide. Under
+   * CONSERVATIVE TRIANGLE VOXELIZATION they do not: a surface is dilated into
+   * every cell it touches, so the cell above a floor carries ±Y bits, and a ray
+   * crossing that cell UPWARD — away from the floor it never meets — now exits
+   * through a face the floor sets and is stopped. `probe:gi2-cornell` on the
+   * user's `Cornel.scene`, one flag, everything else fixed:
+   *
+   *     4.12                     703 black px   median |log| 0.555   gain 1.070×
+   *     + exit face              946            0.779                0.566×
+   *     + exit face + 4.13 min  8595            2.378                 —
+   *     + 8-corner min alone     683            0.521                1.191×
+   *
+   * ⚠ AND THE PAIR IS NOT THE SUM OF ITS PARTS — 946 and 683 compose to 8595,
+   * which is what a self-amplifying transport does with a systematic
+   * over-occlusion (§AJ.3's `1/(1−ρ)` on albedo-1.0 white walls).
+   *
+   * ▶ THE LEAK IS THEREFORE STILL OPEN, and named: 3 rays in 10 000 at the
+   * 0.5 m cell, on a floor whose `n.x` is exactly zero. Sealing it needs the
+   * side of the surface the ray is on, which occupancy plus six reciprocal face
+   * bits cannot express — not a threshold, a missing bit.
+   */
+  const EXIT_FACE = (globalThis.__gi2ExitFace ?? 0) !== 0;
 
   const traceFn = sharedFn({
     name: "gi2TraceWindow",
@@ -542,8 +596,53 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
                 // outward normal opposes the ray.
                 const xFace = select(axisV.equal(0), entryBits.x,
                   select(axisV.equal(1), entryBits.y, entryBits.z)).toVar();
-                const tFace = select(atOrigin, xFace, eFace).toVar();
-                If(bitAnd(bitOr(fStatic, fDyn), shiftLeft(uint(1), tFace.toUint())).notEqual(uint(0)), () => {
+                // ⭐⭐⭐ §19 4.13 — AND THE RAY IS TESTED BY BOTH FACES IT USES,
+                // NOT ONLY THE ONE IT CAME IN BY. A voxel is a SEGMENT of the
+                // ray, bounded by an entry crossing and an exit crossing, and
+                // the surface inside it is crossed if it faces EITHER end.
+                //
+                // ⛔ THE PHONE TIER'S ROTATED WALL IS WHAT PROVED IT, and the
+                // mechanism has nothing to do with §AG's classes (every leaking
+                // ray's voxel reads `cov 3` — `probe:gi2-covleak`). `rotX(20)`
+                // leaves the floor and ceiling normals with `n.x` EXACTLY zero,
+                // so `windowFill`/`windowVoxelize` set only the ±Y and ±Z bits
+                // (0b111100 — read back at every leak). An X-DOMINANT ray then
+                // enters that slab's voxel through an ±X face whose bit the slab
+                // never sets, is waved through, and leaves through the −Y face
+                // it descended by — a face the slab DOES set, and that nobody
+                // was asking about. At 0.5 m cells it happens to 3 rays in
+                // 10 000; at 0.25 m the ray meets a Y boundary first and it is
+                // 0 in 10 000, which is why only the phone tier ever saw it.
+                //
+                // ⚠ IT CANNOT OVER-OCCLUDE A GRAZING RAY. The exit axis is a
+                // boundary the ray provably crossed a WHOLE CELL to reach — the
+                // same evidence the entry test runs on, read at the other end of
+                // the same segment. A ray running ALONG a wall inside its voxel
+                // enters and leaves on the wall's own tangent axes, and neither
+                // bit is set, exactly as before. Nor does it cost a load: both
+                // faces come out of the byte already fetched.
+                //
+                // ⚠ THE ORIGIN VOXEL IS UNTOUCHED. Its `eFace` is a SEED — the
+                // ray's dominant axis, not a crossing — so OR-ing it in would
+                // start blocking rays born inside a surface, which is a
+                // different stage's decision and a much larger one.
+                const oFace = select(atOrigin, xFace, eFace).toVar();
+                const bits = bitOr(fStatic, fDyn).toVar();
+                const oHit = bitAnd(bits, shiftLeft(uint(1), oFace.toUint())).notEqual(uint(0)).toVar();
+                let blocked = oHit;
+                let tFace = oFace;
+                if (EXIT_FACE) {
+                  const xHit = atOrigin.not()
+                    .and(bitAnd(bits, shiftLeft(uint(1), xFace.toUint())).notEqual(uint(0))).toVar();
+                  blocked = oHit.or(xHit).toVar();
+                  // The reported faceId stays the ENTRY face wherever the entry
+                  // face is what stopped the ray, so every hit that existed
+                  // before this stage reports byte-for-byte what it always did;
+                  // only the newly sealed ones name the exit face, which is the
+                  // face they actually cross.
+                  tFace = select(oHit, oFace, xFace).toVar();
+                }
+                If(blocked, () => {
                   // ⭐⭐ §AG — THE ONE BRANCH. Up to here the voxel has been
                   // decided to BLOCK this ray; the only remaining question is
                   // whether it is a SURFACE or something the surface bit was
