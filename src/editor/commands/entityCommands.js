@@ -288,6 +288,18 @@ export class BatchCommand {
     this.label = label ?? commands[0]?.label ?? "Batch";
   }
 
+  // Computed, not stored: only true when every wrapped command is itself
+  // transform-only (e.g. a multi-select gizmo drag's per-entity
+  // SetTransformCommands). A mixed batch (transform + structural) still
+  // takes CommandBus's full refresh() — the safe default.
+  get transformOnly() {
+    return this.commands.length > 0 && this.commands.every((c) => c.transformOnly);
+  }
+
+  get entityIds() {
+    return this.commands.flatMap((c) => c.entityIds ?? []);
+  }
+
   do() {
     for (const c of this.commands) c.do();
   }

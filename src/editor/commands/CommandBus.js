@@ -22,7 +22,36 @@ class CommandBus {
     this.undoStack.push(command);
     if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
     this.redoStack.length = 0;
-    this.#afterMutation();
+    this.#afterMutation(command);
+  }
+
+  /**
+   * Like execute(), but a burst of calls sharing the same `coalesceKey`
+   * arriving within `windowMs` of each other collapses into the ONE undo
+   * entry already on top of the stack (extended in place to the new end
+   * state) instead of minting a new entry per call. `top.coalesceAt` slides
+   * forward on every merge, so a continuous multi-second burst (e.g. a
+   * script or MCP client calling entity.setTransform once per frame) stays
+   * one entry for its whole duration, not one per 300ms slice.
+   *
+   * For API/MCP-driven per-frame mutations only — the viewport gizmo's own
+   * live-drag path is untouched: it calls updateTransform() directly during
+   * the drag and only reaches the bus once, via execute(), on pointer-up.
+   */
+  executeCoalesced(command, coalesceKey, windowMs = 300) {
+    const now = performance.now();
+    const top = this.undoStack.at(-1);
+    if (coalesceKey != null && top?.coalesceKey === coalesceKey && now - (top.coalesceAt ?? -Infinity) <= windowMs) {
+      command.do();
+      top.after = command.after;
+      top.coalesceAt = now;
+      this.redoStack.length = 0;
+      this.#afterMutation(top);
+      return;
+    }
+    command.coalesceKey = coalesceKey ?? null;
+    command.coalesceAt = now;
+    this.execute(command);
   }
 
   undo() {
@@ -30,7 +59,7 @@ class CommandBus {
     if (!command) return;
     command.undo();
     this.redoStack.push(command);
-    this.#afterMutation();
+    this.#afterMutation(command);
   }
 
   redo() {
@@ -38,7 +67,7 @@ class CommandBus {
     if (!command) return;
     command.do();
     this.undoStack.push(command);
-    this.#afterMutation();
+    this.#afterMutation(command);
   }
 
   clearHistory() {
@@ -92,8 +121,22 @@ class CommandBus {
     return taken.length;
   }
 
-  #afterMutation() {
-    useSceneStore.getState().refresh();
+  /**
+   * `command` (or, for a coalesced merge, the top-of-stack entry it merged
+   * into) may declare `transformOnly` + `entityIds`: a command that only
+   * moved/rotated/scaled entities, never touching the hierarchy, tags or
+   * components. For those we skip the whole-scene mirror rebuild — which
+   * replaces the store's entity map and invalidates every React subscriber —
+   * in favor of the lazy per-id updateTransform() the viewport gizmo already
+   * uses for live drags. Structural commands (create/delete/reparent/rename/
+   * component edits) still take the full refresh(), same as before.
+   */
+  #afterMutation(command) {
+    if (command?.transformOnly && command.entityIds?.length) {
+      useSceneStore.getState().updateTransform(command.entityIds);
+    } else {
+      useSceneStore.getState().refresh();
+    }
     useSceneStore.getState().markDirty();
     // In Prefab Mode the edit belongs to the staged prefab, not the scene.
     // (No-op when no prefab is staged.)
