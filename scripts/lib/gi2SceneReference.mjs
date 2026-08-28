@@ -274,8 +274,32 @@ export function makeSceneTracer(scene, bounces = 4) {
       // through the emitter's own back face.
       const cosE = -(gn[i3] * wx + gn[i3 + 1] * wy + gn[i3 + 2] * wz);
       if (cosE <= 0) continue;
-      if (occluded(px + nx * EPS * 10, py + ny * EPS * 10, pz + nz * EPS * 10,
-        wx, wy, wz, d - 1e-3)) continue;
+      // ⭐⭐⭐ §19 5.3e — THE SHADOW RAY IS AIMED FROM THE **OFFSET ORIGIN**,
+      // AND ITS BACK-OFF IS RELATIVE. THIS IS THE BUG THAT MADE THE CORNELL
+      // GATE'S TRUTH 1.5-3.7× TOO DARK.
+      //
+      // The old form offset the origin by `EPS*10` along `n` but kept `w` and
+      // `d` measured from `p`, then asked for occluders inside `d − 1e-3`. Two
+      // different rays: the offset origin's ray crosses the LIGHT TRIANGLE'S
+      // OWN PLANE at `d − ε·(n·n_L)/(ω·n_L)`, which for a receiver whose normal
+      // is not parallel to the light face's is LARGER than the 1 mm the tMax
+      // reserved — so the sample's own triangle answered the query and the
+      // sample was thrown away. Measured on the user's Cornell floor: 35-53 %
+      // of the FRONT-facing samples were discarded, every one of them
+      // `Light·-Y → Light·-Y`, and the discarded fraction is a smooth function
+      // of position, so it reads as a SHAPE error rather than as noise and the
+      // split-half noise estimate cannot see it. The direct term came out
+      // 1.5× too dark on the floor and 3.7× on the back wall, which is most of
+      // the "blotch σ" every gate since §AJ has charged to the estimator.
+      //
+      // The fix is to ask the question the estimator means: the ray FROM the
+      // offset origin TO the sample, stopped a RELATIVE hair short of it, so
+      // the target's own plane is out of range at every distance and scale.
+      const ox = px + nx * EPS * 10, oy = py + ny * EPS * 10, oz = pz + nz * EPS * 10;
+      let sx = qx - ox, sy = qy - oy, sz = qz - oz;
+      const sd = Math.sqrt(Math.max(1e-12, sx * sx + sy * sy + sz * sz));
+      sx /= sd; sy /= sd; sz /= sd;
+      if (occluded(ox, oy, oz, sx, sy, sz, sd * (1 - 1e-4))) continue;
       const em = mats[triMat[ti]].emissive;
       const w = (cosX * cosE * emitArea) / (d2 * ns);
       out[0] += em[0] * w; out[1] += em[1] * w; out[2] += em[2] * w;

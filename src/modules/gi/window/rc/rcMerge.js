@@ -172,6 +172,25 @@ export function createRcMerge({
    * with no store, which is the control the at-rest Δ needs.
    */
   const writeU = uniform(1);
+  /**
+   * ⭐⭐ §19 STAGE 5.3e — THE TWO TERM MASKS, AND THEY EXIST SO THE BLOTCH
+   * QUESTION IS ONE BOOT.
+   *
+   * The resolved pixel is a SUM of two independent estimators — the merged
+   * cascade field (`gather.gatherAt`) and the seated emitter's analytic direct
+   * term (`direct.directAt`) — and 5.3d's open front is "which of them carries
+   * the ovals". Arming each ALONE by rebuilding is two boots and a build flag
+   * (`__gi2Rc5SeatNee`) that also moves the CPU palette, so the two arms are
+   * not the same picture minus a term: the transport arm puts the lamp's
+   * emission back into `palEm` and measures a different estimator entirely.
+   *
+   * A live multiplier is the honest split: 1/1 is the shipped image, 1/0 is
+   * exactly its field half and 0/1 exactly its direct half, byte for byte, in
+   * one boot with one probe population and one reference. Both default to 1,
+   * so the shipped WGSL differs from 5.3d by two `mul`s against a uniform 1.
+   */
+  const fieldTermU = uniform(1);
+  const directTermU = uniform(1);
 
   const resolvePass = Fn(() => {
     const i = instanceIndex.toVar();
@@ -218,12 +237,12 @@ export function createRcMerge({
       If(len2.greaterThan(0.25), () => {
         const facing = step(0, Nn.dot(vec3(camera).sub(g.xyz))).mul(2).sub(1).toVar();
         const Nf = Nn.mul(facing).toVar();
-        E.assign(gather.gatherAt(g.xyz, Nf).irradiance);
+        E.assign(gather.gatherAt(g.xyz, Nf).irradiance.mul(fieldTermU));
         // §19 5.3/5.3d — the seated emitters, analytically, at the shading
         // point, times this texel's FILTERED visibility. Against the FACED
         // normal, like the gather: the hemisphere a lamp lights is the
         // hemisphere the field was filled over.
-        if (direct) E.addAssign(direct.directAt(g.xyz, Nf, gx, gy));
+        if (direct) E.addAssign(direct.directAt(g.xyz, Nf, gx, gy).mul(directTermU));
       });
     });
     textureStore(irradianceHalf, ivec2(gx.toInt(), gy.toInt()), vec4(E, a));
@@ -250,6 +269,7 @@ export function createRcMerge({
     passes: [...merge.passes, ...tiles.passes, ...(direct?.passes ?? []), resolvePass],
     uniforms: {
       rcResolveWrite: writeU, rcResolveWidth: widthU, rcResolveHeight: heightU,
+      rcTermField: fieldTermU, rcTermDirect: directTermU,
       ...(direct?.uniforms ?? {}),
     },
     direct,

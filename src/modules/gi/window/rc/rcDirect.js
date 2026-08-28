@@ -75,8 +75,8 @@
 // zeroes those pixels analytically.
 import * as THREE from "three/webgpu";
 import {
-  Fn, If, Return, dot, float, instanceIndex, ivec2, max, sqrt, step, texture, textureStore, uint,
-  uniform, vec3, vec4,
+  Fn, If, Return, dot, float, instanceIndex, ivec2, max, mix, sqrt, step, texture, textureStore,
+  uint, uniform, vec3, vec4,
 } from "three/tsl";
 import { emitterShapeGain } from "../emitterShapeGain.js";
 
@@ -138,6 +138,19 @@ export function createRcEmitterDirect({
   const nrmN = texture(gbuffer.normal);
   const visAN = texture(visA);
   const visBN = texture(visB);
+  /**
+   * §19 5.3e — THE SHADOW BYPASS, and it is an instrument rather than a knob.
+   *
+   * `directAt` is a product of two things with very different smoothness: an
+   * ANALYTIC `Ω·cosθ·L` that is a rational function of the shading point, and a
+   * TRACED 0..1 visibility that is a binary ray against 0.25 m occupancy bits.
+   * A blotch measurement on their product cannot say which one carries the
+   * structure. At 0 the visibility is replaced by 1 everywhere and what remains
+   * is the analytic factor alone, so `σ(E_shipped − E_bypassed)` is exactly the
+   * spatial structure the SHADOW contributed — the number the 5.3e attribution
+   * turns on. Default 1; the shipped graph gains one `mix` against a uniform.
+   */
+  const shadowU = uniform(1);
   const widthU = uniform(width, "uint");
   const heightU = uniform(height, "uint");
   const halfWU = uniform(halfW, "uint");
@@ -288,7 +301,7 @@ export function createRcEmitterDirect({
    */
   const gainOf = slots.map((slot) => emitterShapeGain(slot));
   const directAt = (P, n, gx, gy) => {
-    const vis = visAN.load(ivec2(gx.toInt(), gy.toInt())).toVar();
+    const vis = mix(vec4(1, 1, 1, 1), visAN.load(ivec2(gx.toInt(), gy.toInt())), shadowU).toVar();
     const E = vec3(0).toVar();
     for (let k = 0; k < slots.length; k++) {
       const slot = slots[k];
@@ -326,7 +339,7 @@ export function createRcEmitterDirect({
     directAt,
     /** The FILTERED visibility (V writes back into A) — for a debug read. */
     texture: visA,
-    uniforms: { rcDirectWidth: widthU, rcDirectHeight: heightU },
+    uniforms: { rcDirectWidth: widthU, rcDirectHeight: heightU, rcDirectShadow: shadowU },
     halfW,
     halfH,
     setSize(w, h) {

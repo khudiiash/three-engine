@@ -608,7 +608,15 @@ for (const q of px) {
 }
 
 // ── the cache key: the scene, the pose and the sample budget ────────────────
+/**
+ * ⚠ AND THE TRACER'S OWN VERSION. A cached reference is a TRUTH on disk; when
+ * the estimator that produced it is corrected the cache must miss, or the next
+ * run scores a fixed build against the old bug. Bump on any change to
+ * `gi2SceneReference.mjs`'s estimator. 2 = §19 5.3e's NEE self-shadow fix.
+ */
+const REF_VERSION = 2;
 const sceneHash = createHash("sha1").update(JSON.stringify({
+  REF_VERSION,
   tri: R.scene.tri.map((v) => Math.round(v * 1e4)), triMat: R.scene.triMat,
   mats: R.scene.mats, sky: R.sky, BOUNCES, SPP,
   pose: POSE_ENV, SIZE, stride: R.stride, dumpW: R.dumpW, dumpH: R.dumpH,
@@ -1095,6 +1103,42 @@ if (ARMS.length) {
       surfaces: sr,
     };
   };
+  /**
+   * ⭐ §19 5.3e — THE σ OF WHAT AN ARM REMOVED, per surface, normalised by the
+   * SAME reference mean `sigmaRel` uses.
+   *
+   * `sigmaRel` scores an arm's residual against the reference, which for a
+   * TERM MASK is the wrong question — a direct-only arm is missing the whole
+   * bounce field and its residual is dominated by that absence. What names the
+   * blotch carrier is the structure of the term the mask DELETED:
+   * `σ(E_baseline − E_arm)`, which for `rcTermDirect:0` is exactly σ of the
+   * analytic direct term and for `rcTermField:0` exactly σ of the cascade
+   * field. Their quadrature sum against the baseline's own σ is the check that
+   * the split is complete.
+   */
+  const deltaSigma = (Enew) => {
+    const out = [];
+    const bs = new Map();
+    rows.forEach((r, i) => {
+      if (r.emitFace) return;
+      if (!bs.has(r.surf)) bs.set(r.surf, []);
+      bs.get(r.surf).push({ ...r, d: lum(r.E) - lum(Enew[i]) });
+    });
+    for (const [name, list] of bs) {
+      if (name === "unclassified" || list.length < 24) continue;
+      const quiet = list.filter((r) => r.noise < 0.02 && lum(r.ref) > LIT);
+      if (quiet.length <= 8) continue;
+      const d = quiet.map((r) => r.d);
+      const md = mean(d);
+      const mr = mean(list.map((r) => lum(r.ref)));
+      out.push({
+        name,
+        sigmaRel: Math.sqrt(mean(d.map((v) => (v - md) ** 2))) / Math.max(1e-9, mr),
+        meanRel: md / Math.max(1e-9, mr),
+      });
+    }
+    return out;
+  };
   const base = rescore(rows.map((r) => r.E));
   console.log("");
   console.log("  ── THE UNIFORM ARMS (one boot, one pose, one reference) ─────────────");
@@ -1108,7 +1152,10 @@ if (ARMS.length) {
   for (const arm of ARMS) {
     const set = await page.evaluate(async ({ arm, ARM_FRAMES }) => {
       const gi2 = globalThis.__gi2();
-      const u = gi2.gather.uniforms;
+      // §19 5.3e — the RC resolve's own uniforms (`rcTermField`/`rcTermDirect`,
+      // `rcKeep`, the cadence) live on `gi2.rc`, not on the gather. An arm that
+      // names one of those must reach it or the split is two boots.
+      const u = { ...(gi2.rc?.uniforms ?? {}), ...gi2.gather.uniforms };
       const before = {};
       for (const [k, v] of Object.entries(arm.set)) {
         if (!u[k]) return { error: `no uniform ${k}` };
@@ -1164,11 +1211,26 @@ if (ARMS.length) {
     // hundred microseconds and only a timestamp query can see that.
     const prof = ARM_MS > 0 ? await call("profile.gi2", { kernelSamples: ARM_MS }) : { ok: false };
     const ms = prof.ok ? (prof.value?.kernelTotalMs ?? NaN) : NaN;
-    const r = { name: arm.name, ...rescore(Enew), ms };
+    const r = { name: arm.name, ...rescore(Enew), ms, delta: deltaSigma(Enew) };
     armRows.push(r);
     show(r);
   }
   console.log("");
+  console.log("  per-surface σ(TERM REMOVED)/refmean  [what the mask deleted]");
+  {
+    const dn = [...new Set(armRows.flatMap((a) => (a.delta ?? []).map((s2) => s2.name)))];
+    const cols = armRows.filter((a) => a.delta);
+    if (cols.length) {
+      console.log(`  ${"surface".padEnd(16)}${cols.map((a) => a.name.slice(0, 13).padStart(15)).join("")}`);
+      for (const n of dn) {
+        console.log(`  ${n.padEnd(16)}` + cols.map((a) => {
+          const s2 = a.delta.find((x) => x.name === n);
+          return (s2 ? `${pct(s2.sigmaRel)}/${pct(s2.meanRel)}` : "—").padStart(15);
+        }).join(""));
+      }
+      console.log("");
+    }
+  }
   console.log("  per-surface σ(residual)/mean by arm");
   const names = [...new Set(armRows.flatMap((a) => a.surfaces.map((s) => s.name)))];
   console.log(`  ${"surface".padEnd(16)}${armRows.map((a) => a.name.slice(0, 13).padStart(15)).join("")}`);
