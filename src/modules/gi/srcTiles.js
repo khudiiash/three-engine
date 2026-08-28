@@ -91,6 +91,7 @@ import {
   instanceIndex,
   instancedArray,
   ivec2,
+  select,
   sin,
   texture,
   textureStore,
@@ -107,7 +108,17 @@ import {
 } from "./srcConfig.js";
 import { binDirTable, tileCosineWeights } from "./srcMath.js";
 import { octahedralUV } from "./srcOctahedral.js";
-import { PAYLOAD_WORDS } from "./srcDeposit.js";
+import { PAYLOAD_SEED_BASE, PAYLOAD_WORDS } from "./srcDeposit.js";
+
+/**
+ * §19 5.4e — what one PARENT-SEEDED bin is worth against one MEASURED bin in
+ * the tile's renormalization. `__gi2MergeSeedWeight` is the A/B; 1 reproduces
+ * 5.4d's equal-confidence arm and 0 reproduces the pre-5.4d exclusion.
+ */
+const SEED_WEIGHT = (() => {
+  const raw = Number(globalThis.__gi2MergeSeedWeight);
+  return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : 0.25;
+})();
 
 /** Sub-samples per bin axis in the cosine quadrature. §12.2's bias fix. */
 export const COSINE_SUB = 4;
@@ -330,8 +341,28 @@ export function createSrcTileAtlas(store, bins, {
         // the rest renormalize over what was found — feeding one in as black is
         // a hard cliff at the edge of every sparsely-sampled region, and at 0.78
         // rays per bin (§12.13.4) that edge is everywhere rather than exotic.
-        const T = payload.element(o.add(uint(3))).toVar();
-        If(T.greaterThanEqual(0), () => {
+        // ⭐⭐⭐ §19 STAGE 5.4e — THREE STATES, TWO WEIGHTS.
+        //
+        // `srcDeposit.PAYLOAD_SEED_BASE` carries the encoding: `w >= 0` is a
+        // MEASURED bin, `w == PAYLOAD_UNKNOWN` (−1) is one no ray sampled, and
+        // `w <= −2` is a bin `srcMerge` SEEDED from the parent cascade's cone so
+        // a newborn probe's tile covers the whole lobe instead of extrapolating
+        // from the handful of directions its first rays happened to hit.
+        //
+        // ⚠ AND A SEED MUST NOT VOTE LIKE A MEASUREMENT. 5.4d gave it the same
+        // weight and the Cornell gate priced that exactly: black 0 → 37 of
+        // 21476, gain 0.436× → 0.368×. It enters the SAME renormalization at
+        // `SEED_WEIGHT` of a measured bin's `cw`, in the numerator and the
+        // denominator alike — so where the probe has its own rays they dominate
+        // (a lobe of measured bins outvotes the seeds 4:1 per bin), and where it
+        // has none the seeds are all there is and renormalize to exactly the
+        // parent's answer. No branch on "how new is this probe", no second
+        // estimator, no ramp to get out of step: one weight, two populations.
+        const wRaw = payload.element(o.add(uint(3))).toVar();
+        const seeded = wRaw.lessThanEqual(float(PAYLOAD_SEED_BASE)).toVar();
+        const T = select(seeded, float(PAYLOAD_SEED_BASE).sub(wRaw), wRaw).toVar();
+        const cwEff = select(seeded, cw.mul(float(SEED_WEIGHT)), cw).toVar();
+        If(wRaw.greaterThanEqual(0).or(seeded), () => {
           // ── L + T·sky, CORRECT IN BOTH CASES IT CAN MEET ────────────────
           //
           // The merge composites the sky ONCE at the top and multiplies its
@@ -365,8 +396,8 @@ export function createSrcTileAtlas(store, bins, {
             payload.element(o),
             payload.element(o.add(uint(1))),
             payload.element(o.add(uint(2))),
-          ).add(SB.mul(T)).mul(cw));
-          wsum.addAssign(cw);
+          ).add(SB.mul(T)).mul(cwEff));
+          wsum.addAssign(cwEff);
           known.addAssign(uint(1));
         });
       });

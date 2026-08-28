@@ -137,7 +137,7 @@ import {
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
-import { PAYLOAD_WORDS } from "./srcDeposit.js";
+import { PAYLOAD_SEED_BASE, PAYLOAD_WORDS } from "./srcDeposit.js";
 import {
   FLAG_ALIVE,
   PROBE_BLOCK,
@@ -643,7 +643,10 @@ export function createSrcMergeFrame(store, bins, {
         payload.element(o).assign(outL.x);
         payload.element(o.add(uint(1))).assign(outL.y);
         payload.element(o.add(uint(2))).assign(outL.z);
-        payload.element(o.add(uint(3))).assign(outT);
+        // §19 5.4e — A SEEDED BIN IS MARKED, so the bake can trust it less than
+        // a measured one. `T` rides the sign: `w = PAYLOAD_SEED_BASE − outT`.
+        payload.element(o.add(uint(3)))
+          .assign(select(unknownSelf, float(PAYLOAD_SEED_BASE).sub(outT), outT));
         atomicAdd(stats.element(sw(c, MERGE_MERGED)), uint(1));
         If(outT.equal(0), () => { atomicAdd(stats.element(sw(c, MERGE_OPAQUE)), uint(1)); });
       }).Else(() => {
