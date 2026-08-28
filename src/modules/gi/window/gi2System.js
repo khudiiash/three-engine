@@ -724,6 +724,13 @@ export function createGi2System({
           faceSamplePoint: gather.internals.faceSamplePoint,
           shadeHit: gather.internals.shadeHit,
         },
+        // ⭐⭐ §19 STAGE 5.2 — THE DESTINATION IS THE ENGINE'S OWN HALF-RES
+        // TEXTURE, AND THAT IS THE WHOLE RESOLVE. `resolveUpsample` reads this,
+        // writes `textures.irradiance`, and everything after it — the 3.12
+        // accumulator, GTAO's compose, the lit-frame injection, the material
+        // hook, the `indirect` view, every `probe:gi2-*` — is unchanged and
+        // cannot tell which estimator filled it. See `rcMerge.js`.
+        irradianceHalf: gather.textures.irradianceHalf,
       })
       : null;
     if (rc) {
@@ -1287,6 +1294,19 @@ export function createGi2System({
     for (const node of gather.frameOrder) {
       if (emitterDirect && node === gather.passes.resolveHalf) after.push(emitterDirect);
       after.push(node);
+      // ⭐⭐ §19 STAGE 5.2 — THE CASCADES SIT BETWEEN THE TWO HALVES OF THE
+      // RESOLVE, AND BOTH SIDES ARE FORCED.
+      //
+      // AFTER `resolveHalf`: their population and their deposit both read the
+      // G-BUFFER (rendered between `before` and `after`), and their own resolve
+      // OVERWRITES `irradianceHalf` — which only means anything if it runs
+      // after the kernel that wrote it. BEFORE `resolveUpsample`: that is the
+      // kernel that magnifies the half-res image into the texture materials
+      // bind, so a cascade chain dispatched after it would be a frame late and
+      // GTAO would compose occlusion onto the world probes' answer, not this
+      // one. 5.1 pushed them at the END of the list, which was correct while
+      // nothing downstream read them.
+      if (rc && node === gather.passes.resolveHalf) after.push(...rc.frameOrder);
       if (node === gather.passes.resolveUpsample) {
         // GTAO's own dispatches. `#armGtaoPass` appends them to whatever list
         // the transport hands it — on the SRC path that was `srcProbes.passes`,
@@ -1304,12 +1324,13 @@ export function createGi2System({
       }
     }
 
-    // ⭐ §19 5.1 — THE CASCADES RUN LAST, AND THAT IS THE ONLY PLACE THEY CAN.
-    // Their probe population and their deposit both read the G-BUFFER, which
-    // the caller renders between `before` and `after`; and 5.2's merge will
-    // feed the resolve, so the chain grows forward from here rather than being
-    // spliced into the middle of a list that is already ordered by identity.
-    if (rc) after.push(...rc.frameOrder);
+    // ⚠ 5.1's tail push is GONE — the chain is spliced by identity above. A
+    // build whose gather somehow published no `resolveHalf` would drop the
+    // cascades silently, so it is asserted rather than assumed.
+    if (rc && !after.includes(rc.frameOrder[0])) {
+      console.warn("[gi2] rc: no `resolveHalf` in the gather's frame order — cascades appended at the tail");
+      after.push(...rc.frameOrder);
+    }
 
     // `scrollInList` so the caller's chain-shape receipt can EXCLUDE the one
     // pass that is spliced in and out frame by frame under a moving camera —

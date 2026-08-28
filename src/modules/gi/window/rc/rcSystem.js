@@ -52,6 +52,7 @@ import { createSrcProbeFrame, createSrcProbeStore } from "../../srcProbes.js";
 import { createSrcRayFrame, createSrcRayStore } from "../../srcRays.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "../../srcMath.js";
 import { normalOfFace } from "../radianceCache.js";
+import { createRcMerge } from "./rcMerge.js";
 import { CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0, rcIntervalCensus, rcTierSpec } from "./rcConfig.js";
 
 /**
@@ -71,6 +72,11 @@ import { CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0, rcIntervalCensus, rcTierSp
  */
 export function createRcCascades({
   win, trace, cache, gbuffer, width, height, tier = win.tier, kit,
+  // §19 STAGE 5.2 — `gather.textures.irradianceHalf`, the texture
+  // `resolveUpsample` reads. Absent (5.1's own harness page, `scripts/gi2-rc.
+  // html`), the merge/bake/resolve trio is not built at all and this object is
+  // exactly what 5.1 shipped — the population, the rays and the deposit.
+  irradianceHalf = null,
 }) {
   const spec = rcTierSpec(tier);
   const { u, dominantFace, faceSamplePoint, shadeHit } = kit;
@@ -265,8 +271,62 @@ export function createRcCascades({
     maxLods,
   });
 
+  // ══ §19 STAGE 5.2 — [G] THE MERGE, [H] THE TILES, [I] THE PIXEL ═══════════
+  //
+  // Three shipped modules and one kernel — see `rcMerge.js`. Built only when a
+  // destination texture was handed in, so 5.1's own gate page keeps a build
+  // with no merge in it and every 5.1 number stays comparable.
+  const resolve = irradianceHalf
+    ? createRcMerge({
+      store,
+      bins,
+      spacing0,
+      // ⭐ THE SAME `anchorU` THE POPULATION USED, not a second one. Probe keys
+      // are anchor-relative; a merge or a gather that places the lattice from a
+      // different anchor reads plausible light from the wrong probes, and no
+      // energy check in this repository can see that.
+      anchor: vec3(anchorU),
+      camera: vec3(cameraU),
+      // The gather's OWN sky uniform — the same node `rcShade` returns on a
+      // miss, so the two ends of the transport cannot disagree about what an
+      // escaping ray found. It enters the field ONCE: a miss lands past every
+      // cascade (`own = N` in `srcDeposit`), which deposits `(0, T = 1)` and no
+      // radiance, so the top cascade's composite below is the only sky term.
+      sky: u.skyColor,
+      frameStamp: frameStampU,
+      gbuffer,
+      irradianceHalf,
+      width,
+      height,
+      maxLods,
+    })
+    : null;
+
   // ── the per-frame drivers ────────────────────────────────────────────────
-  const jitterOn = (globalThis.__gi2RcJitter ?? 1) !== 0;
+  /**
+   * ⭐⭐ §19 5.2 — THE DEFAULT IS THE DETERMINISTIC ARM NOW, AND IT IS A
+   * MEASUREMENT, NOT A PREFERENCE.
+   *
+   * 5.1 shipped R2 jitter on and owed the at-rest Δ. Taken (the user's
+   * `Cornel.scene`, `probe:gi2-cornell`, camera parked, 180 gather frames apart
+   * after a 20 s settle):
+   *
+   *     jitter on (R2)   |ΔE|/E  p50 0.60 %   p90 2.20 %   max 26.8 %
+   *     jitter FROZEN    |ΔE|/E  p50 0.36 %   p90 1.29 %   max 10.2 %
+   *
+   * and the picture is the same one either way (median |log ratio| 0.472 vs
+   * 0.478, per-surface blotch σ within a point of each other, black census 0 on
+   * both). So the jitter buys nothing the gate can see and costs a factor of
+   * ~2 in residual shimmer, which is the one thing the no-noise rule spends its
+   * budget on: complete fixed direction sets per probe every frame, never a
+   * stochastic sequence averaged over time.
+   *
+   * ⚠ THE REMAINING 1.29 % IS NOT THIS DIAL. Both arms share it; it is the
+   * radiance cache's own refresh cadence arriving through `shadeHit`, which 5.3
+   * replaces with the direct-only face cache + E_probes. `__gi2RcJitter = 1`
+   * restores the paper's R2 arm.
+   */
+  const jitterOn = (globalThis.__gi2RcJitter ?? 0) !== 0;
   let frameIndex = 0;
   const setCamera = (pos) => {
     const p = Array.isArray(pos) ? pos : [pos.x, pos.y, pos.z];
@@ -299,6 +359,7 @@ export function createRcCascades({
     if (nw * nh > pixelCount) return false; // the pools are sized for this frame
     widthU.value = nw;
     if (rayStore.pixelCountU) rayStore.pixelCountU.value = nw * nh;
+    if (resolve && !resolve.setSize(nw, nh)) return false;
     return true;
   };
 
@@ -322,6 +383,9 @@ export function createRcCascades({
     })),
     gaps: census.gaps,
     overlaps: census.overlaps,
+    resolve: resolve
+      ? { half: [resolve.halfW, resolve.halfH], tiles: resolve.tiles.layout, tileSize: resolve.tiles.tileSize }
+      : null,
     bytes: {
       // Every storage attribute the three stores own, counted from the arrays
       // themselves so a layout change cannot make this number a fiction.
@@ -340,19 +404,44 @@ export function createRcCascades({
       rcCamera: cameraU, rcAnchor: anchorU, rcWidth: widthU, rcFrameStamp: frameStampU,
       rcJitterX: jitterXU, rcJitterY: jitterYU, rcStride: strideU, rcPhase: phaseU,
       rcLmax: lmaxU, rcKeep: keepU, rcInfluxLift: influxLiftU,
+      ...(resolve?.uniforms ?? {}),
     },
     passes: {
       populate: frame.passes,
       rays: rayFrame.passes,
       deposit: deposit.passes,
+      merge: resolve?.merge.passes ?? [],
+      tiles: resolve?.tiles.passes ?? [],
+      resolve: resolve ? [resolve.resolvePass] : [],
     },
-    /** The one order that works: probes, then Algorithm 3's budget, then the deposit. */
-    frameOrder: [...frame.passes, ...rayFrame.passes, ...deposit.passes],
+    resolve,
+    /**
+     * The one order that works: probes, the c0 key→block tail, Algorithm 3's
+     * budget, the deposit, then 5.2's merge → bake → pixel.
+     *
+     * ⚠ `hashPass` SITS ABOVE THE RAYS, and that is correctness rather than
+     * taste (`srcSystem`'s own note): the hash slot LAYOUT is rebuilt every
+     * frame by the compaction with scheduler-dependent contention, so a key's
+     * slot index does not survive the rebuild and a tail written at the END of
+     * a frame is misaligned with the next frame's keys. Both of its inputs
+     * (`hashSlot`, `PROBE_BLOCK`) are settled by compaction and neither changes
+     * again inside the frame.
+     */
+    frameOrder: [
+      ...frame.passes,
+      ...(resolve ? [resolve.hashPass] : []),
+      ...rayFrame.passes,
+      ...deposit.passes,
+      ...(resolve ? resolve.passes : []),
+    ],
     setCamera, beginFrame, setSize, describe,
     readStats: (renderer) => deposit.readStats(renderer),
+    /** 5.2's own receipt: the merge's orphan/corner census and the bake's coverage. */
+    readMergeStats: (renderer) => (resolve ? resolve.readStats(renderer) : Promise.resolve(null)),
     /** Every GPU-only storage attribute, for the caller's retire queue. */
     storageAttributes: () => [
       ...attrsOf(store), ...attrsOf(bins), ...attrsOf(rayStore), ...attrsOf(frame),
+      ...(resolve?.storageAttributes() ?? []),
     ],
     /**
      * ⚠ THE ARRAY IS EMPTIED BEFORE `dispose()`. Under three's WebGPU backend
@@ -361,7 +450,9 @@ export function createRcCascades({
      * place this may be called from.
      */
     dispose() {
-      for (const a of [...attrsOf(store), ...attrsOf(bins), ...attrsOf(rayStore), ...attrsOf(frame)]) {
+      resolve?.dispose();
+      for (const a of [...attrsOf(store), ...attrsOf(bins), ...attrsOf(rayStore), ...attrsOf(frame),
+        ...(resolve?.storageAttributes() ?? [])]) {
         a.array = a.array?.constructor ? new a.array.constructor(0) : new Uint32Array(0);
         a.dispose?.();
       }

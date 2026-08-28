@@ -188,10 +188,18 @@
           normalTexture: gbufferRt.textures[1],
           width: W, height: H, tier: TIER, crops: 0,
         });
+        // §19 5.2 — the DESTINATION. In the engine this is
+        // `gather.textures.irradianceHalf` (the texture `resolveUpsample`
+        // magnifies); here it is a texture of the same shape and type, so the
+        // page builds and TIMES the same three units the engine dispatches.
+        const irrHalf = new THREE.StorageTexture(Math.ceil(W / 2), Math.ceil(H / 2));
+        irrHalf.type = THREE.HalfFloatType;
+        irrHalf.name = "rcProbeIrradianceHalf";
         const rc = rcMod.createRcCascades({
           win, trace, cache,
           gbuffer: { position: gbufferRt.textures[0], normal: gbufferRt.textures[1] },
           width: W, height: H, tier: TIER,
+          irradianceHalf: irrHalf,
           kit: {
             u: gather.uniforms,
             dominantFace: gather.internals.dominantFace,
@@ -286,7 +294,7 @@
           await compute(fill.pass);
           await compute(cache.allocPass);
 
-          const ms = { populate: 0, rays: 0, deposit: 0 };
+          const ms = Object.fromEntries(Object.keys(rc.passes).map((k) => [k, 0]));
           for (let f = 0; f < FRAMES; f++) {
             // ⭐⭐ THE FIRST FRAME OF EACH WORLD RESETS THE BINS, AND THE FIRST
             // CUT OF THIS PAGE DID NOT — which is how a leak gate reads 239
@@ -376,9 +384,11 @@
         say("");
         say(`(iv) COST — ${timestamps ? "GPU timestamps" : "WALL TIME (no timestamps)"}, ` +
           "per frame, averaged over the frames after the warm-up");
+        const chainMs = Object.values(cost.ms).reduce((a, b) => a + b, 0);
         say(`  populate ${cost.ms.populate.toFixed(3)} ms · rays ${cost.ms.rays.toFixed(3)} ms · ` +
           `deposit (trace + shade) ${cost.ms.deposit.toFixed(3)} ms · ` +
-          `chain ${(cost.ms.populate + cost.ms.rays + cost.ms.deposit).toFixed(3)} ms`);
+          `merge ${(cost.ms.merge ?? 0).toFixed(3)} ms · tiles ${(cost.ms.tiles ?? 0).toFixed(3)} ms · ` +
+          `resolve ${(cost.ms.resolve ?? 0).toFixed(3)} ms · chain ${chainMs.toFixed(3)} ms`);
         say(`  rays ${stats.rays} · hits ${stats.hits} (${(stats.hitRate * 100).toFixed(1)}%) · ` +
           `deposits ${stats.deposits} (${stats.perRay.toFixed(2)}/ray) · shaded ${stats.shaded}`);
         say(`  bytes: ${rd.totalMB} MB · mean hit ${stats.meanT.toFixed(2)} m · ` +
@@ -387,6 +397,13 @@
           `clamped ${stats.clamped} (radiance past Lmax)`);
         const orphanRays = Math.max(0, stats.rays - stats.deposits);
         say(`  orphans (rays that deposited into no cascade at all): ${orphanRays}`);
+        // §19 5.2 — [G]'s and [H]'s own census. `orphanLiveRate` is the number
+        // that can cost visible long-range light (an orphan with selfT == 0 is
+        // byte-identical to a merge); `meanCorners` separates "the parent
+        // lattice is thin" from "the parents are there and their bins are
+        // unknown", which are different fixes.
+        const mstats = await rc.readMergeStats(renderer);
+        if (mstats?.line) say(`  ${mstats.line}`);
 
         // ── (v) ONE PROBE'S DIRECTION DUMP ──────────────────────────────────
         //
@@ -528,7 +545,7 @@
         say("");
         say(`GATE ${pass ? "PASS" : "FAIL"} — ${JSON.stringify(gate)}`);
         globalThis.__GI2_RC_RESULT__ = {
-          pass, tier: TIER, gate, describe: rd, cost: cost.ms, stats, leaks, control,
+          pass, tier: TIER, gate, describe: rd, cost: cost.ms, stats, leaks, control, merge: mstats?.merge ?? null, tiles: mstats?.tiles ?? null,
           anchors: { valid, rawInside, inside, insideOpaque },
           text: lines.join("\n"),
         };
