@@ -778,6 +778,43 @@ export function rc5PathEnabled(runtime = globalThis) {
  * simply the frames before the build finishes. So this flag turns off a
  * REPLACEMENT, never a requirement.
  */
+/**
+ * ⭐⭐ §19 5.5b — THE ARM IS GATED BY SOUP SIZE, AND THE NUMBER IS A MEASURED
+ * COST, NOT A TASTE.
+ *
+ * The exact arm's per-ray cost is a BVH2 descent: ~40 levels of pointer chasing
+ * and a leaf of Möller-Trumbore, against a voxel ray's fixed bit-DDA. On a
+ * Cornell box that is nothing — the tree is 20 nodes deep in total and the ray
+ * exits at its first leaf. On the user's Bistro (2.8 M triangles) it is the
+ * dominant term of the frame and the editor read 3 fps.
+ *
+ * So the arm turns itself off by scene size. Below the threshold the exact rays
+ * fix a class of bug no slab size can (an emitter shadowing itself); above it,
+ * the voxel arm serves and the BVH is never built, never uploaded and never
+ * traced. `__gi2Rc5BvhShadowMax` moves the line for a measurement;
+ * `__gi2Rc5BvhShadow = 1` does NOT override it.
+ *
+ * ⭐⭐ AND 250 k IS A CORRECTNESS NUMBER BEFORE IT IS A PERFORMANCE ONE. The
+ * builder's `triCap` keeps a PREFIX of the soup, so a scene over it loses its
+ * tail of small props from the BVH — and a dropped triangle on the exact arm
+ * does not fall back to the voxel arm, it simply stops casting a shadow. The
+ * measurement on the user's Bistro: 2 827 888 soup triangles, capped to
+ * 2 000 000, so **827 888 occluders silently stopped shadowing** while the
+ * tree cost 90.6 MB of VRAM, 3.3 s of worker build and pushed the heap to
+ * 2107 MB. A budget that admits a scene it must then truncate is a budget that
+ * ships a light leak; 250 k is comfortably under every cap in the chain, so an
+ * admitted scene's tree is always COMPLETE. It is ~11 MB and ~0.5 s to build.
+ *
+ * ⚠ The threshold is on the SOUP's triangle count, which is what the BVH is
+ * built from — not on the scene's, which the tier cap has already cut.
+ */
+export const RC5_BVH_SHADOW_MAX_TRIS = 250_000;
+
+export function rc5BvhShadowMaxTris(runtime = globalThis) {
+  const hatch = Number(runtime?.__gi2Rc5BvhShadowMax);
+  return Number.isFinite(hatch) && hatch >= 0 ? hatch : RC5_BVH_SHADOW_MAX_TRIS;
+}
+
 export function rc5BvhShadowEnabled(runtime = globalThis) {
   if (!rc5PathEnabled(runtime)) return false;
   // 08-29 00:30: DEFAULT OFF until the arm swap stops rebuilding the gather —
@@ -790,7 +827,10 @@ export function rc5BvhShadowEnabled(runtime = globalThis) {
   // 08-29 01:50: DEFAULT OFF again — on Bistro (2.8 M tris) the arm reads
   // 3 fps in the user's editor; re-enable per tier/triangle count once its
   // per-frame cost and the 2 M-triangle cap are measured. `= 1` arms it.
-  return (runtime?.__gi2Rc5BvhShadow ?? 0) !== 0;
+  // Back ON by default, and only because `rc5BvhShadowMaxTris` now bounds what
+  // it can cost. The 3 fps Bistro report was an UNBOUNDED arm; the fix for that
+  // is a budget, not a permanently-off feature that no scene benefits from.
+  return (runtime?.__gi2Rc5BvhShadow ?? 1) !== 0;
 }
 
 /**
