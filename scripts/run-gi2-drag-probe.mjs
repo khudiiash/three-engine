@@ -147,8 +147,19 @@ console.log(`  target: "${target.name}" (${target.id}) emissive luminance ${f2(t
 const installed = await page.evaluate(async ({ target, amp }) => {
   const eng = globalThis.__giEngineForProbe;
   if (!eng?.stats) return { ok: false, why: "no engine.stats" };
-  const R = { frames: [], seg: "park", logs: [], frameLogs: [], done: false, i: 0 };
+  const R = { frames: [], seg: "park", logs: [], frameLogs: [], done: false, i: 0, longtasks: [] };
   globalThis.__gi2Drag = R;
+  // §19 6.5c — MAIN-THREAD BLOCKS THAT HAPPEN BETWEEN TICKS. The phase marks
+  // summed to a quarter of the drag; whatever spent the other three quarters
+  // did it outside `beginPhase`/`endPhase`, which is exactly what a longtask
+  // entry sees. `attribution` names the container, not the function, so this
+  // bounds the search rather than ending it — the CDP sampling profile does
+  // the naming.
+  try {
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) R.longtasks.push({ seg: R.seg, t: +e.startTime.toFixed(1), ms: +e.duration.toFixed(1), name: e.name });
+    }).observe({ entryTypes: ["longtask"] });
+  } catch { /* no longtask support */ }
   for (const k of ["log", "info", "warn", "error"]) {
     const orig = console[k].bind(console);
     console[k] = (...a) => { try { const s = String(a[0] ?? "").slice(0, 110); R.frameLogs.push(s); } catch {} return orig(...a); };
@@ -209,9 +220,36 @@ await wait((PARK / 60) * 1000 + 300);
 // The drag: `entity.setTransform` once per animation frame, exactly as the
 // editor's translate gizmo does while the pointer is held.
 console.log(`  dragging "${target.name}" for ${DRAG_MS} ms …`);
-await page.evaluate(({ ms, base, amp }) => {
+// CDP SAMPLING PROFILE, armed for the drag only. 100 µs is fine enough that a
+// 300 ms frame carries ~3000 samples, so a self-time table over nine frames is
+// a census and not an anecdote.
+const cdp = await page.target().createCDPSession();
+try {
+  await cdp.send("Profiler.enable");
+  await cdp.send("Profiler.setSamplingInterval", { interval: 100 });
+  await cdp.send("Profiler.start");
+} catch (e) { console.log(`  (profiler unavailable: ${e.message})`); }
+await page.evaluate(async ({ ms, base, amp, gizmo }) => {
   const R = globalThis.__gi2Drag;
   R.seg = "drag";
+  // ── DRIVE=gizmo — WHAT THE TRANSLATE GIZMO ACTUALLY DOES ────────────────
+  //
+  // `entity.setTransform` is NOT the editor's live drag path, and the
+  // difference is the whole measurement. TransformControls writes the
+  // Object3D directly and, per frame, calls only
+  // `useSceneStore.updateTransform(id)` (a lazy one-key clone) plus
+  // `engine.emit("transform-changed")`; the undoable
+  // `commandBus.execute(SetTransformCommand)` fires ONCE, on pointer-UP
+  // (ViewportPanel.jsx:591 vs :615). Driving the op per frame instead routes
+  // every frame through `commandBus.#afterMutation` →
+  // `useSceneStore.refresh()`, which re-mirrors all 1532 entities and
+  // replaces the store map — a cost the user's drag never pays.
+  let store = null, eng = globalThis.__giEngineForProbe;
+  if (gizmo) {
+    const m = await import("/src/editor/store/sceneStore.js");
+    store = m.useSceneStore;
+  }
+  const ent = eng.getEntity(R.target.id);
   const t0 = performance.now();
   const step = () => {
     const t = performance.now() - t0;
@@ -220,14 +258,25 @@ await page.evaluate(({ ms, base, amp }) => {
     // ⚠ VERIFY THE DRAG ACTUALLY MOVED SOMETHING. A silent `.catch` here let a
     // whole Bistro run report "no freeze" from a drag that never happened —
     // the op refused and the probe measured a parked scene twice.
-    globalThis.__editorApi.call("entity.setTransform", { id: R.target.id, position: [base[0] + u, base[1], base[2]] })
-      .then(() => { R.moved = (R.moved ?? 0) + 1; })
-      .catch((e) => { R.setErr ??= String(e?.message ?? e); });
+    if (gizmo) {
+      // The gizmo's own per-frame work, verbatim.
+      ent.object3D.position.set(base[0] + u, base[1], base[2]);
+      store.getState().updateTransform(R.target.id);
+      eng.emit("transform-changed", { entityId: R.target.id });
+      R.moved = (R.moved ?? 0) + 1;
+    } else {
+      globalThis.__editorApi.call("entity.setTransform", { id: R.target.id, position: [base[0] + u, base[1], base[2]] })
+        .then(() => { R.moved = (R.moved ?? 0) + 1; })
+        .catch((e) => { R.setErr ??= String(e?.message ?? e); });
+    }
     requestAnimationFrame(step);
   };
   requestAnimationFrame(step);
-}, { ms: DRAG_MS, base: target.pos, amp: AMP });
+}, { ms: DRAG_MS, base: target.pos, amp: AMP, gizmo: process.env.DRIVE === "gizmo" });
 await page.waitForFunction(() => globalThis.__gi2Drag?.dragDone === true, { timeout: DRAG_MS + 120000, polling: 250 });
+const profile = await (async () => {
+  try { const r = await cdp.send("Profiler.stop"); return r.profile; } catch (e) { console.log(`  (profiler: ${e.message})`); return null; }
+})();
 await wait((TAIL / 60) * 1000 + 500);
 
 const R = await page.evaluate(() => {
@@ -288,4 +337,31 @@ for (const f of R.frames) if (f.seg === "drag") for (const l of f.logs) allLogs.
 console.log("  every line during the DRAG (top 18):");
 for (const [l, n] of [...allLogs.entries()].sort((a, b) => b[1] - a[1]).slice(0, 18)) console.log(`    ${String(n).padStart(4)}×  ${l}`);
 
+// ── who spent the unmarked time ────────────────────────────────────────────
+{
+  const lts = R.longtasks ?? [];
+  const drag = lts.filter((l) => l.seg === "drag");
+  console.log(`
+  LONGTASKS: ${lts.length} total, ${drag.length} during the drag, ` +
+    `sum ${f2(drag.reduce((a, l) => a + l.ms, 0))} ms, max ${f2(Math.max(0, ...drag.map((l) => l.ms)))} ms`);
+  for (const l of drag.slice(0, 8)) console.log(`    ${f2(l.ms).padStart(9)} ms  ${l.name}`);
+}
+if (profile) {
+  // Self time per function: each sample charges the LEAF node it landed in.
+  const byId = new Map(profile.nodes.map((n) => [n.id, n]));
+  const self = new Map();
+  const dt = profile.timeDeltas ?? [];
+  profile.samples.forEach((id, i) => {
+    const n = byId.get(id); if (!n) return;
+    const cf = n.callFrame;
+    const key = `${cf.functionName || "(anonymous)"}  ${String(cf.url || "").split("/").slice(-1)[0]}:${cf.lineNumber + 1}`;
+    self.set(key, (self.get(key) ?? 0) + (dt[i] ?? 0) / 1000);
+  });
+  const total = [...self.values()].reduce((a, b) => a + b, 0);
+  console.log(`
+  SAMPLING PROFILE over the drag — ${f2(total)} ms of samples, top 20 by SELF time:`);
+  for (const [k, v] of [...self.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20)) {
+    console.log(`    ${f2(v).padStart(9)} ms  ${(100 * v / total).toFixed(1).padStart(5)}%  ${k}`);
+  }
+}
 if (process.env.JSON) { fs.writeFileSync(process.env.JSON, JSON.stringify({ target, settled, report, frames: R.frames }, null, 1)); console.log(`\n  frames → ${process.env.JSON}`); }
