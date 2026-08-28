@@ -365,6 +365,27 @@ export class ShadowMergeSystem {
     if (!this._dirty && this.groups.length === 0) return;
     if (this._dirty) {
       const now = performance.now();
+      const movingCaster0 = this._dirtyReason === "caster-moved";
+      // ⭐ 08-29 §19 6.5 — TIME THE MOTION, NOT THE NOTIFICATION.
+      //
+      // `caster-moved` fires exactly ONCE per mover: `#watchForMotion` remembers
+      // it in `_movers` and skips it forever after, which is right — re-baking a
+      // mover into a fresh proxy every frame is worse than not merging it. But it
+      // means the settle clock was started by the drag's FIRST frame and then
+      // never touched again, so `settling` expired 400 ms later, MID-DRAG, and
+      // the starvation exemption above (which only applies while `settling` is
+      // true) never got the chance to hold anything. That is the 453 ms frame
+      // this arm keeps measuring.
+      //
+      // The engine's content key moves its `transforms` sub-version on every
+      // write, so it is the signal that says "still moving" after the mover has
+      // stopped announcing itself. While one is outstanding, a moving scene keeps
+      // pushing the clock and the re-bake lands when the drag actually STOPS.
+      const transformVersion = this.engine?.content?.transforms ?? 0;
+      if (movingCaster0 && transformVersion !== this._casterMotionSeen) {
+        this._casterMotionSeen = transformVersion;
+        this._dirtiedAt = now;
+      }
       const settling = now - (this._dirtiedAt ?? 0) < SETTLE_MS;
       const starving = now - (this._dirtySince ?? now) > MAX_DEFER_MS;
       // 08-29 (§19 6.5): a caster that is STILL MOVING must never be re-baked
