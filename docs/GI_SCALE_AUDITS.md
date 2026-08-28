@@ -3446,6 +3446,168 @@ off — re-read this section when the world path comes back.
 
 ---
 
+## §AE — THE RUNNER: THE PUDDLES ARE THE FLICKER (08-28)
+
+**The report** (user, 11:40, Bistro, play mode, world probes default since
+`80f390b`): *"I have just tested with a character running around bistro:
+lighting still jumps a lot, no smooth transitions, it just dark->bright->dark
+rapidly, it is distracting, it must go smoothly and naturally. Otherwise, it
+won't be usable in games."*
+
+**The verdict in one line: the field does not flicker — it is SPATIALLY
+BIMODAL, and the camera samples it. §AC measured that structure at rest; this
+section measures what it costs in motion, and every other candidate is
+excluded by an arm rather than by an argument.**
+
+### AE.1 — the instrument
+
+`probe:gi2-runner` (`scripts/run-gi2-runner-probe.mjs` + the in-page kernel
+`scripts/lib/gi2PointProbe.js`). It drives **the scene's own Player rig** — the
+`addEntity` override in `Bistro.scene`: `charactercontroller` root, `Body` with
+`skinnedmesh` `Character/Chainer/CH` and an `animation` with `playInEditor:
+true`, which `#gi2SkinnedMovers` seats as **27 bone boxes**. Bistro's 1532
+prefab meshes are all `giMobility = "static"` (`GISystem.js:18408`), so that rig
+IS the entire dynamic layer; a box the harness invents would measure a different
+scene.
+
+Per rendered frame it records irradiance at ten named populations — four fixed
+GROUND points, four fixed FAÇADE points, the pavement 1.5 m beside the runner,
+and the runner's own body pixels — together with `diagBuf`'s per-cascade
+`(cov, fresh, claim, vis)` at the SAME pixels, the resolve's pre-blend luminance
+out of the last cascade's `.w`, and the world lattice ORIGINS. The runner moves
+a fixed **8.3 cm per frame** (5 m/s ÷ 60 fps), so every number is a statement
+about "5 m/s at 60 fps" whatever the harness's own frame rate turns out to be.
+
+**Three blindnesses had to be removed before any number meant anything:**
+
+1. ⛔⛔ **THE FIRST TWO BATTERIES RAN ON A DEAD BOOT.** 890 frames × 3 arms, a
+   full attribution table, cross-arm controls — all of it computed on an
+   irradiance field whose median was **1.6e-5 with R = B = 0**, the half-float
+   denormal floor of a black texture. `[gi2] first light` had never arrived (the
+   intermittent dead boot, ~2 in 9) and every "200 % lighting jump" was the last
+   representable bit of nothing moving. A settle timer is not evidence that a
+   field exists. The probe now prints the whole frame's distribution FIRST and
+   **refuses to run the arms** below p50 1e-3.
+2. ⛔ **`toFixed(6)` ON A DIM FIELD IS A ONE-DIGIT SERIES**, and a one-digit
+   series steps 100 % whenever its last bit moves. Six SIGNIFICANT figures, so
+   the receipt's resolution does not depend on how bright the scene is.
+3. ⛔ **`diagBuf`'s LAST CASCADE `.w` IS NOT `vis`** — it carries the resolve's
+   own luminance (`gatherProbes.js:4099`). Reading it as `vis` made the vis
+   column a restatement of the step it was meant to explain; 21 % of the first
+   attribution table was that tautology.
+
+⚠ **THE TREE THESE NUMBERS CAME OFF.** `dc00466` plus two other editors'
+UNCOMMITTED work in the same worktree: `gatherProbes.js` (mtime 12:20:39) and
+`radianceCache.js` (12:09:57). Both batteries below ran after those two edits
+and before any later one, so they are internally comparable — but they are not a
+receipt on `dc00466` alone, and a re-run after those land may move the absolute
+numbers. Every conclusion here is a CROSS-ARM SUBTRACTION inside one boot, which
+is the reading that survives.
+
+### AE.2 — the step distributions (Bistro ultra, 886 frames/arm, 30.6 m legs)
+
+Frame's own scale: irradiance p50 **0.613-0.648**, pavement p50 0.485.
+`sprd` = (hi−lo)/mean WITHIN one frame's own samples. τ = autocorrelation
+lag in frames.
+
+| series | seg | px | **sprd** | E p50 | step p50 | p90 | max | >10 % | >25 % | τ |
+|---|---|---|---|---|---|---|---|---|---|---|
+| g0 ground | out | 25 | **1.65** | 0.393 | 7.6 % | 35.5 % | 51.5 % | 45 | 16 | 2 |
+| g2 ground | back | 25 | 0.31 | 0.076 | 2.0 % | 53.3 % | 144 % | 6 | 3 | — |
+| g3 ground | out | 10 | 0.05 | 0.583 | 2.2 % | 4.3 % | 28.7 % | 8 | 3 | 28 |
+| f2 façade | out | 14 | **0.96** | 0.217 | 3.9 % | 10.8 % | 34.9 % | 27 | 2 | 2 |
+| f3 façade | out | 7 | **1.30** | 0.254 | 13.4 % | **54.2 %** | 114 % | **186** | 97 | 18 |
+| near pavement | out | 25 | 0.10 | 0.333 | 2.2 % | 7.5 % | 58.7 % | 23 | 7 | 61 |
+| **body** | out | 31 | **1.84** | 0.249 | 3.8 % | 20.4 % | 128 % | 78 | 27 | 52 |
+| **body** | park | 17 | **1.51** | 0.246 | 0.0 % | 0.1 % | 0.4 % | **0** | 0 | 11 |
+
+### AE.3 — the controls, which are subtractions
+
+| control | what it changes | result |
+|---|---|---|
+| **run − static** | the camera follow ONLY | **g0 35.5 % → 0.0 %, f0 17.8 → 0.0, f2 10.8 → 0.0, f3 54.2 → 0.0. ZERO steps > 10 % on any fixed point over 367 frames × 4.** |
+| **run − nodyn** | `gi2.setMovers([])`, `voxelsSet` 1682 → 0 | f3 54.2 vs 57.9, body 20.4 vs 18.5, near 7.5 vs 6.1 — **null** |
+| **run − faceoff** | `wpFaceOn = 0` | f3 54.2 → **79.3** (worse), body 20.4 → 20.6 — **not the face gate** |
+| **run − visoff** | `wpVisOn = 0` | f3 54.2 → 61.9, body 20.4 → 18.3 — **not Chebyshev** |
+| out vs back | same ground, opposite direction | f3: 53 big-step half-metre bins, **0 on both legs**; body: 59 bins, **35 on both** |
+
+**Attribution of the 626 steps over 10 % (run arm), by the resolve's own
+registers:**
+
+| class | share | evidence |
+|---|---|---|
+| **F  spatial speckle re-sampled** | **59.1 %** | every resolve weight flat, and the frame's OWN samples already disagree by > 50 % of the mean |
+| C  corner liveness (`cov`) | 14.1 % | `gatherProbes.js:3889` |
+| C  hand-off claim | 8.5 % | `gatherProbes.js:4004` |
+| D  window scroll | 6.1 % | 33 scroll frames of 886, all cascade 0; lift only 1.8× |
+| C  Chebyshev `vis` | 4.3 % | `worldProbes.js:1955` |
+| F  probe radiance moved (fixed pt) | 3.5 % | |
+| D  seeded probe ramping (`fresh`) | 2.9 % | `wpSeedRamp`, `worldProbes.js:582` |
+| C  dominant cascade flip | 1.1 % | |
+| A  traversal | 0.5 % | |
+
+**The three largest steps all have the same shape** — one frame, adjacent
+pixels of one flat surface:
+
+```
+g1 ground  L 0.0272 -> 0.4899 (179 %)   pixels 1 (0.0272)  ->  3 (lo 0.0282 hi 0.7246 sd 0.327)
+g2 ground  L 0.0853 -> 0.5237 (144 %)   pixels 1 (0.0853)  -> 20 (lo 0.0698 hi 0.7746 sd 0.262)
+body       L 0.2549 -> 0.0558 (128 %)   pixels 3 (lo 0.0539 hi 0.6501) -> 2 (lo 0.0509 hi 0.0606)
+```
+
+**26× between neighbouring pixels of one 35 cm patch of flat pavement, inside
+one frame** — and in the static arm every one of those pixels holds its value to
+0.1 % for 367 frames. The field is stable in TIME and bimodal in SPACE. §AC's
+structure function says the same thing at rest: world path second difference
+p90 **7.4 % at the tile lag, 14.5 % at lag 16, 19.9 % at lag 32**.
+
+### AE.4 — what this leaves, and what to measure next
+
+Excluded by measurement, not by reading: the dynamic layer (B), the camera's
+image accumulation (E — `preMove/postMove` = 1.00-1.02 on every top step, so
+the pre-blend half-res resolve ALREADY carries the step), the face gate, the
+Chebyshev term, and — at 9 % of steps — the whole scroll/seed lifecycle (D).
+
+⚠ **THE TWO REMAINING PER-PIXEL DISCONTINUITIES ARE THE ONLY ONES `diagBuf`
+CANNOT SEE**, which is exactly why 59 % of the steps read "all terms flat":
+
+- **`gatherProbes.js:4056-4073` — the two-tier fallback.** `fbTrig =
+  wsum < 1e-5 OR admAny < 1e-3` is a HARD THRESHOLD, and when it trips the
+  resolve `assign`s ONE corner's raw SH over the smoothly-interpolated
+  eight-corner composite. `admAny` is `max` of `faceCov = Σ tri·live·wf`, and
+  **`faceCov` is in no diagnostic.**
+- **`gatherProbes.js:3941` — the argmax** `If(cand > bestW)` that chooses which
+  corner that is. An argmax over `tri·live·max(wf,0.001)·pref` changes its
+  winner between neighbouring pixels with no continuity anywhere.
+
+**▶ THE NEXT MEASUREMENT IS ONE CHANNEL.** Add `faceCov` and a `fallbackFired`
+flag to `diagBuf` (it has three vec4 and the last one's `.w` is already spoken
+for, so this is a fourth row, harness-only under `wantNoise`) and re-run
+`probe:gi2-runner`. If the F class collapses onto `fallbackFired`, the fix is to
+make the fallback a RAMP rather than a switch and the argmax a soft-max — and
+the receipt is this same table.
+
+### AE.5 — the gate, so a fix has a target
+
+At 5 m/s and 60 fps the runner covers 8.3 cm per frame.
+
+1. **No step > 10 % of E between consecutive frames on any series** (p99, not
+   p50 — a mean cannot see a flicker), and **zero steps over 25 %**. Today:
+   f3 has 186 and 97.
+2. **p90 step ≤ 2 % per frame on the fixed ground and façade points.** Today
+   10.8-54.2 %.
+3. **τ ≥ 30 frames (0.5 s) on every series.** Today the stepping series run
+   τ = 2-18; a bright/dark phase lasting 2-5 frames IS "dark→bright→dark
+   rapidly".
+4. **Spatial: `sprd` ≤ 0.25 on any single flat surface patch.** Today
+   0.96-1.84 on façades and on the body. This is the gate the other three
+   follow from — a field a camera cannot make flicker is a field whose
+   neighbouring pixels agree.
+5. **The park control's p90 ≤ 0.5 %.** Today PASS (0.0-0.1 %) — the field does
+   not churn on its own, and no motion-side or temporal fix is called for.
+
+---
+
 ## §AC — THE PUDDLES: WHAT MAKES ONE FLAT WALL DISAGREE WITH ITSELF (08-28)
 
 **The report** (user screenshot 08-28 10:13, Bistro, `indirect` view = the raw
