@@ -812,7 +812,7 @@ export function rc5PathEnabled(runtime = globalThis) {
  * ⚠ The threshold is on the SOUP's triangle count, which is what the BVH is
  * built from — not on the scene's, which the tier cap has already cut.
  */
-export const RC5_BVH_SHADOW_MAX_TRIS = 4_000_000;
+export const RC5_BVH_SHADOW_MAX_TRIS = 250_000; // 08-29: provisional 4 M retracted until the Bistro build/timings are measured
 
 export function rc5BvhShadowMaxTris(runtime = globalThis) {
   const hatch = Number(runtime?.__gi2Rc5BvhShadowMax);
