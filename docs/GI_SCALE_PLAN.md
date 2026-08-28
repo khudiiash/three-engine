@@ -549,6 +549,20 @@ user accepts GI2 by eye (`GI2_PATH = false` is the safety net).
 | **5.3 hit radiance from probes** | `rcHit.js`: direct-only face cache + E_probes at hits | Cornell energy per surface 0.9-1.1; convergence monotone, image still at rest (Δ 0.00 %); `probe:gi2-faceterm` σ < 10 % |
 | **5.4 flip + tiers + cut** | `RC5_PATH` default on; phone/medium tiers; delete the old world-probe path and the cache's bounce term | full battery: runner no step > 10 %, motion at the null floor, leaks 0, first light ≤ 3 s, chain ≤ 3 ms ultra, smoke incl. phone, memory envelope; then Bistro by the user's eye |
 
+**Stage 5 status, 2026-08-29 02:00 (receipts in AUDITS and the commit messages; `main` follows every unit):**
+
+| unit | verdict |
+|---|---|
+| 5.1 port | the old SRC core (the paper) on the window transport; census/leaks 0; RC5 off byte-identical |
+| 5.2 merge+shade+resolve | first RC picture: black 671 → 0, blotch σ halved, not bistable |
+| 5.3-5.3b hit radiance | direct-only face cache, E_rc from probes; emitters conserved per voxel through coverage; energy 0.30 → 0.88 (old truth) |
+| 5.3c-e | at-rest aliased sweep fixed; projected law refuted; cadence ON; LOD hypothesis refuted; the Cornell REFERENCE was self-occluded (fixed) |
+| 5.4a-c parallel | seed-parent (ON), old path not built under RC5 (4 → 43 fps), corrected truth: RC 0.44× |
+| 5.4d chain | faces already NEE-lit; loop exonerated; single bounce isolated; coarse-face origin escape (FACETRUTH 0.84 → 1.00) |
+| 5.5a/b | glossy from the RC probes; worker BVH exact shadow rays (uniform swap, no rebuild; OBB slab exclusion) — Cornell median 0.104 PASSES, gain 0.85 (0.9ᵏ tax on ρ = 1 walls), at rest 1.67 %; BVH arm OFF on main (Bistro 3 fps — cost/gate owed) |
+
+**Open:** Bistro at scale — probe spots/checkerboards on motion (population + seeding), the BVH arm's cost and 2 M-triangle cap, boot 17 s from scene open, the pinned Bistro truth re-read; blotch σ 10-16 % on the box (fixed-direction structure); at-rest Δ 1.7-2.8 % (target 1 %); Box·+Z (a seated emitter's own face lit only by bounce); the user's scene authoring (albedo 1.0 walls; sky:sun 3:1; AO off).
+
 ### What is deliberately NOT in this plan
 - Any new tuning property on the component (three properties stay three).
 - Temporal AO (killed 08-26; GTAO has no history).
