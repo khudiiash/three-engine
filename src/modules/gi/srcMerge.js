@@ -98,14 +98,33 @@ import {
   float,
   floor,
   instanceIndex,
+  bool,
   instancedArray,
   int,
+  select,
   ivec3,
   sin,
   uint,
   vec3,
 } from "three/tsl";
 import { CASCADE_COUNT, W0 } from "./srcConfig.js";
+
+/**
+ * §19 5.4d — the unknown-bin promotion, as one build-time switch so the arm is
+ * an A/B rather than a checkout. Read once at module load, like every other
+ * `__gi2*` build gate in this module's neighbourhood.
+ */
+// ⛔ DEFAULT **OFF**, AND THE RECEIPT IS WHY. On a moving Bistro the promotion
+// is a clear win (recover black 12.32 % -> 0.03 %, frames-to-recover >24 -> 3);
+// on the Cornell gate it REGRESSES the one check that was passing — black
+// 0/21476 -> 37/21476, global gain 0.436x -> 0.368x, median-after-gain 0.432 ->
+// 0.491. Making an unknown bin KNOWN also puts it in `srcTiles`' renormalizing
+// denominator, so a tile that averaged its few bright sampled bins now averages
+// them with the parent's coarser, dimmer cone. That is the right estimate and
+// the wrong WEIGHT: the seed should carry less confidence than a measured bin,
+// not equal confidence. Until the bake can weight a seeded bin below a sampled
+// one, the standing gate ("Cornell not worse, black 0") keeps this off.
+const SEED_PARENT = (globalThis.__gi2MergeSeedParent ?? 0) !== 0;
 import { LOS_OCC_HI, LOS_OCC_LO, LOS_PATH_HI, LOS_PATH_LO, binDirTable, mergeLosWeight, worldKeysEnabled } from "./srcMath.js";
 import {
   cellPosition,
@@ -501,13 +520,54 @@ export function createSrcMergeFrame(store, bins, {
       const o = uint(info.binBase).add(block.mul(uint(nBins))).add(m)
         .mul(uint(PAYLOAD_WORDS)).toVar();
 
-      // AN UNKNOWN SELF BIN STAYS UNKNOWN. It is not "no light" — no ray
-      // sampled this direction, so there is nothing for the parent to shine
-      // through. Merging a parent into it would invent an interval estimate
-      // this probe never made, and at 0.78 rays per bin (§12.13.4) that
-      // invention would be most of the buffer.
-      const selfT = payload.element(o.add(uint(3))).toVar();
-      If(selfT.lessThan(0), () => { Return(); });
+      // ⭐⭐⭐ §19 STAGE 5.4d — AN UNKNOWN SELF BIN IS **TRANSPARENT**, NOT ABSENT.
+      //
+      // It used to `Return()` here, and the argument was that no ray sampled
+      // this direction so there is nothing for the parent to shine THROUGH.
+      // That argument is right about the interval and wrong about the tile.
+      // `srcTiles` integrates a probe's hemisphere over the bins it can read,
+      // and an unknown bin contributes NOTHING to that sum — so a newborn
+      // probe, whose rays follow its pixel coverage and whose bins are mostly
+      // unsampled on the first frames, bakes a PARTIAL-HEMISPHERE integral.
+      // A partial sum of a positive integrand is a dark tile, and a dark tile
+      // one c0 footprint across is the user's black square. The hole is not in
+      // the interval; it is in the QUADRATURE that reads it.
+      //
+      // The paper's own ray-splitting value for "no hit in this interval" is
+      // `J = 0, β = 1` — emit nothing, occlude nothing — and that is exactly
+      // what "no ray sampled it" should mean to a merge: the near field is
+      // unmeasured, so let the parent cascade's cone pass through unattenuated
+      // and let the probe's own rays REFINE it as they land. The estimate is
+      // the parent's, which is the best information that exists for this
+      // direction, instead of a zero nobody measured.
+      //
+      // ⚠ AND ONLY WHERE A PARENT ACTUALLY CONTRIBUTED. If no corner is known
+      // either (`wsum == 0` below) the bin is left UNKNOWN exactly as before —
+      // promoting it to `L = 0, T = 1` with no parent behind it would mint the
+      // full-coverage black vote of 5.3c, which is the failure this whole
+      // stage exists to remove. `unknownSelf` carries that decision down.
+      //
+      // ⚠ THE BACK HEMISPHERE IS NOT AFFECTED, and it is not guarded here
+      // because it is not decided here: the bin set is over the SPHERE, and
+      // `srcTiles`' bake weights every bin by `max(0, dot(n, d))` — a bin
+      // pointing into the surface is multiplied by zero whatever this pass
+      // writes into it. Excluding it a second time in the merge would be a
+      // second definition of the same rejection, in a file that cannot see the
+      // probe's normal.
+      const selfTRaw = payload.element(o.add(uint(3))).toVar();
+      // `__gi2MergeSeedParent = 0` restores the pre-5.4d `Return()` — the arm
+      // every black-square number before this was measured on.
+      if (!SEED_PARENT) { If(selfTRaw.lessThan(0), () => { Return(); }); }
+      const unknownSelf = (SEED_PARENT ? selfTRaw.lessThan(0) : bool(false)).toVar();
+      const selfT = select(unknownSelf, float(1), selfTRaw).toVar();
+      const selfL = vec3(
+        payload.element(o),
+        payload.element(o.add(uint(1))),
+        payload.element(o.add(uint(2))),
+      ).toVar();
+      // The words under an UNKNOWN payload are whatever the last resolve left;
+      // they are not a radiance and must not be added to one.
+      If(unknownSelf, () => { selfL.assign(vec3(0)); });
       atomicAdd(stats.element(sw(c, MERGE_BINS)), uint(1));
 
       const record = uint(recordBase).add(block.mul(uint(MERGE_CORNERS))).toVar();
@@ -575,11 +635,10 @@ export function createSrcMergeFrame(store, bins, {
         const invW = float(1).div(wsum).toVar();
         const parentL = acc.mul(invW).toVar();
         const parentT = accT.mul(invW).toVar();
-        const outL = vec3(
-          payload.element(o),
-          payload.element(o.add(uint(1))),
-          payload.element(o.add(uint(2))),
-        ).add(parentL.mul(selfT)).toVar();
+        // §19 5.4d — `selfL`, which is ZERO for a promoted unknown: the merge
+        // writes the parent's cone straight through (`0 + parentL·1`) and the
+        // bin becomes KNOWN, so the tile's quadrature covers it from birth.
+        const outL = selfL.add(parentL.mul(selfT)).toVar();
         const outT = selfT.mul(parentT).toVar();
         payload.element(o).assign(outL.x);
         payload.element(o.add(uint(1))).assign(outL.y);
@@ -589,7 +648,10 @@ export function createSrcMergeFrame(store, bins, {
         If(outT.equal(0), () => { atomicAdd(stats.element(sw(c, MERGE_OPAQUE)), uint(1)); });
       }).Else(() => {
         // NO PARENT CONTRIBUTED. The bin keeps its own interval and stays
-        // transparent above it — NOT a black vote — so temporal accumulation
+        // transparent above it — NOT a black vote — and a bin that was UNKNOWN
+        // on the way in stays UNKNOWN on the way out (§19 5.4d): the promotion
+        // above is a way to SPEND a parent, never a way to invent a zero.
+        // so temporal accumulation
         // can fill it in on a later frame and `srcGather`'s `L + T·sky` still
         // gives it the c0-only answer meanwhile. A fixed-radius fallback here
         // is precisely the cliff R1 forbids.
