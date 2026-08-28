@@ -784,7 +784,10 @@ export function rc5BvhShadowEnabled(runtime = globalThis) {
   // the rebuild re-creates the gather textures and the materials stay bound
   // to the destroyed ones (the frame goes black after the BVH lands while the
   // irradiance readback is lit). `__gi2Rc5BvhShadow = 1` arms it.
-  return (runtime?.__gi2Rc5BvhShadow ?? 0) !== 0;
+  // 08-29 01:10: DEFAULT ON again — the swap no longer rebuilds anything
+  // (persistent slot + uniform-gated arm, 636bba3); the black frame is
+  // unreachable. `__gi2Rc5BvhShadow = 0` restores the voxel arm.
+  return (runtime?.__gi2Rc5BvhShadow ?? 1) !== 0;
 }
 
 /**
