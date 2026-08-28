@@ -325,6 +325,7 @@ export class ShadowMergeSystem {
   }
 
   invalidate(reason = "unknown") {
+    this._dirtyReason = reason;
     this._dirty = true;
     this._reason = reason;
     this._dirtiedAt = performance.now();
@@ -366,7 +367,13 @@ export class ShadowMergeSystem {
       const now = performance.now();
       const settling = now - (this._dirtiedAt ?? 0) < SETTLE_MS;
       const starving = now - (this._dirtySince ?? now) > MAX_DEFER_MS;
-      if (settling && !starving && this.groups.length > 0) return;
+      // 08-29 (§19 6.5): a caster that is STILL MOVING must never be re-baked
+      // on the starvation clock — that was the 455-484 ms frame two seconds
+      // into every gizmo drag (the tally named shadowMerge, not merging).
+      // Starvation exists for producers that keep dirtying from elsewhere;
+      // motion settles by itself, and the mover is already left out.
+      const movingCaster = this._dirtyReason === "caster-moved";
+      if (settling && (!starving || movingCaster) && this.groups.length > 0) return;
       this._building = true;
       try {
         this.#rebuild();
