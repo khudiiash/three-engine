@@ -4833,3 +4833,255 @@ pointing at `update` in a vite dep chunk and at react-dom. Neither number can be
 laid at §AG's door, and neither should be read as clearing it: **the pass §AG
 added work to is the voxelize chain, and that one has its own gate, and it
 passes.** Re-take both baselines on a clean tree.
+
+## §AI — CONTAINMENT IS NOT PAYMENT: THE NEAR BAND NOBODY OWNED (08-28)
+
+**The brief**: fix the world-probe path's far-field darkness at the mechanism.
+§AH.2 had named the shape of it from the field's own numbers — `DARK2` reads 0
+while c2 claims the pixel outright and c1, whose lattice contains the point, has
+almost no live probe there — and asked whether §3.15's "trace `[0, t_{i+1})`
+where the finer lattice does not contain the probe" clause was implemented at
+all.
+
+### AI.1 — it IS implemented, and it asks the wrong question
+
+`worldProbes.js` has the clause, verbatim:
+
+```js
+const fc = pos.div(fSp).floor();
+const coveredBelow = casc > 0 && inLatticeAt(originOf(casc - 1), fc.x, fc.y, fc.z);
+const t0 = select(coveredBelow, tStart[casc], 0);
+```
+
+⭐⭐ **`inLatticeAt` IS A BOX TEST.** A clipmap cascade's lattice is 64 m of
+camera-centred *address space*; whether anything is ALIVE in it thirty metres
+out is a different fact, decided cell by cell by `allocPass` out of the window's
+occupancy. Where the two disagree the near band is handed to a cascade that
+cannot pay it — and the light is not dropped loudly. It is written as radiance
+`0` with `T = 0`, which also tells the merge that the parent must not answer
+either. **A cascade defers, its child is dead, and the interval belongs to
+nobody.**
+
+### AI.2 — the proof, as a readback: `probe:gi2-band`
+
+No existing instrument could see this. `probe:gi2-ref` reads the FIELD and can
+say a probe is dark; it cannot say WHICH RANGE OF DISTANCES the probe was
+allowed to see, because that is a property of the trace's CLASSIFICATION and not
+of the value stored. Two words hold it and nothing else read them:
+
+- `wpOct` word 1's moments — the TRUE first-hit distance, near hits included
+  (§3.15 stores it unconditionally so the Chebyshev test stays meaningful).
+- `wpOct` word 2 — the probe's OWN radiance, which a `blockedNear` texel writes
+  as exactly zero.
+
+So a texel with a stored first hit BELOW its `t0`, `own = 0` and `T = 0` is a
+direction whose light was measured and then thrown away. Counted by
+cosine-weighted solid angle, that IS the missing near field — as a number.
+
+**Bistro, pose B, HEAD `e9ba895` (the coverage-class unit, tree clean):**
+
+| | c1 (sp 2 m, band from 4 m) | c2 (sp 8 m, band from 20 m) |
+|---|---|---|
+| live probes | 6912 | 697 |
+| …contained by the finer lattice's BOX | 318 | 288 |
+| …of those, where finer coverage < 0.5 — **orphaned** | **198** | **166** |
+| mean discarded near-band share | 30.3 % of the sphere | 44.0 % |
+| …over the orphans | 17.0 % | 31.2 % |
+
+And at the pin §AH indicted, the whole story in one row: the c2 probe that
+answers `DARK2` at claim 1.00 stands **2.77 m from the pixel**, has a **mean
+first hit at 14.6 m**, is contained by c1's box, sees c1 coverage **0.25** — and
+stores radiance zero in **100.0 %** of its directions. A wall one metre from
+that probe is invisible to it.
+
+### AI.3 — what shipped
+
+**The ownership test is COVERAGE now, not containment**, and it is `wpCovFull`'s
+twin: "the finest cascade that is LIVE at that point" is what the spec says
+about the resolve, and the same words decide who owns the near band. Two
+conditions, each a different way to be unpaid:
+
+- **the finer lattice must hold the whole CELL this probe speaks for**, not
+  merely its centre — a probe answers pixels across its own cell and one cell
+  beyond it through the trilinear blend, so a c2 probe one metre inside c1's
+  boundary is read by pixels several metres outside it. The margin is the
+  cascade's own spacing, and it costs no buffer read: a lattice is a box, so two
+  corners decide it.
+- **the finer lattice must actually be LIVE there** — `latticeCovAt` ≥
+  `wpCovBelow` (0.5), the same liveness-weighted trilinear sum the resolve
+  spends as a claim and `irradianceAtCasc` normalises by.
+
+⚠ **IT COSTS NOTHING IN RAY LENGTH.** §3.15 already starts the ray AT THE PROBE
+and runs it to `t_{i+1}`, applying the interval to the RESULT; widening a
+probe's own band to `[0, t_{i+1})` changes only how its hits are classified. The
+whole spend is eight scalar liveness loads per ray.
+
+⚠ **AND THE DOUBLE COUNT IT OPENS IS SELF-LIMITING**, by the merge's own
+algebra: a child adds its parent's map only where its own texel is TRANSPARENT,
+and `T = 1` means the child's ray missed cleanly over the whole of
+`[0, t_{i+1})` — so the segment the parent would re-credit is a segment the
+child has just measured to be empty. What is left is the parallax between two
+probes at most a coarse cell apart, against a near band that was being dropped
+in full.
+
+**Also shipped: the thin-voxel throughput is spent.** §AG made a class-<3 voxel
+DIM a ray instead of stopping it and returned the surviving `T` beside the hit;
+until this stage nothing multiplied by it, so a ray that crossed a cable slab
+and found a wall credited that wall at FULL radiance — the cables treated as
+perfectly transparent, wrong by the same coverage fraction as the pre-§AG error
+and in the other direction. The hit and the sky are weighted by `T`. ⚠ The
+remaining `1 − T` is credited to NOTHING, deliberately: the physical answer
+needs `L_thin`, the DDA remembers how much it lost and not WHERE, and every
+estimate for it is a constant somebody picked. This credits the term it can
+prove and understates by a dark object's own bounce — monotone, and it never
+invents light. [[gi-one-property]]
+
+**Two arms, and the first is BUILD-TIME on purpose.** `__gi2CovBelow = 0`
+compiles §3.15's containment test verbatim — not the new test with its threshold
+zeroed, which would leave the cell margin standing and "restore" a stage that
+never existed. `__gi2ThinT = 0` restores the un-weighted hit.
+
+### AI.4 — ⭐⭐⭐ AND THE SCENE MOVED UNDER THE FIRST RECEIPT
+
+The first before/after pair read a façade fall of `truth 7.22×` and then
+`truth 5.70×` — **the PATH-TRACED TRUTH moved by 27 % between two boots of one
+tree**, and `DARK1`'s truth moved 12×. The cause is in the probe's own header,
+two lines above the table:
+
+```
+before:  sun 10,10,10 dir [-0.17,-0.97,-0.17]
+after:   sun 10,10,10 dir [-0.07,-0.44,0.90]
+```
+
+`scenes/Bistro.scene` had been saved four minutes earlier by the user's live
+editor: the sun had been rotated. ⭐⭐ **A worktree that shares a PROJECT with a
+live session has no baseline that survives a coffee break** —
+[[probe-blind-statistics]] one level out, where the instrument is fine and the
+SUBJECT moved. Every cross-boot GI receipt taken here must print `sun dir` and
+refuse to compare two runs that disagree on it. The A/B below is two consecutive
+boots with one flag between them, and both printed `dir [-0.07,-0.44,0.90]`.
+
+### AI.5 — the A/B, one tree, one sun, one pinned point set
+
+`probe:gi2-ref`, back-to-back, `FLAGS={"__gi2CovBelow":0,"__gi2ThinT":0}` on the
+first:
+
+| pinned, both poses | 4.11 (3.15's rule) | 4.12 (shipped) |
+|---|---|---|
+| **pose B signal-set median \|ratio−1\|** | 0.402 | **0.276** |
+| **pose B signal-set mean \|log ratio\|** | 1.557 | **1.078** |
+| pose B outside [0.7, 1.4] | 10 of 17 | **8 of 17** |
+| pose B zero census | 1 | **0** |
+| pose A signal-set median \|ratio−1\| | 0.186 | **0.133** |
+| pose A signal-set mean \|log ratio\| | 0.520 | **0.473** |
+| pose A zero census | 150 (0.13 %) | **94 (0.08 %)** |
+| ⛔ GATE — pixels at 0 where `E_ref > 0.05` | 0 | **0 (pass)** |
+
+and the points that moved, against an unchanged truth:
+
+| pin | `E_ref` | 4.11 | 4.12 |
+|---|---|---|---|
+| **DARK2** | 0.4851 | 0.0017 | **0.1381** (81×) |
+| **DARK3** | 0.3907 | 0.0018 | **0.1388** (77×) |
+| FAC3 | 1.6504 | 0.9874 | **1.2062** |
+| FAC2 | 1.7609 | 1.2923 | **1.4719** |
+| FAC5 | 1.2102 | 1.0932 | **1.1652** |
+| FAC1 | 2.1952 | 2.2777 | **2.1871** |
+| WBRT1 | 1.5342 | 2.5516 | **2.4484** |
+| SOFF1 | 0.1341 | 0.0744 | 0.0458 ⛔ *worse* |
+
+**And the band census re-run after the fix says it is the same mechanism that
+moved**: the discarded near-band share over the ORPHANED probes goes
+**17.0 % → 0.0 % (c1)** and **31.2 % → 0.0 % (c2)** — and over EVERY contained
+probe, orphaned or not, 30.3 % → 9.6 % (c1) and 44.0 % → 18.5 % (c2), on an
+unchanged 6912 / 697 live probes. `DARK2`/`DARK3`'s answering probe goes from
+100 % of its hemisphere discarded to 0 %.
+
+### AI.7 — the battery, on a still tree at HEAD `e9ba895`
+
+`git status --short src/modules/gi/window/` showed nothing but this unit's own
+`worldProbes.js` for every run below, and the sun read `dir [-0.07,-0.44,0.90]`
+throughout. ⭐ Where a receipt could be attributed between §AG's coverage unit
+and this one it WAS, by re-running the same probe with
+`FLAGS={"__gi2CovBelow":0,"__gi2ThinT":0}`; the two are one commit apart and
+"it moved since §AH" says nothing about which commit moved it.
+
+| receipt | 4.11 arm | 4.12 (shipped) | §AH.5 |
+|---|---|---|---|
+| `probe:gi2-gather` Cornell bracketed | — | **8/8 phone, high, ultra** | 8/8 |
+| storage buffers (portable envelope) | — | **6 / 6 / 6** | 6 |
+| chain ms @1650×970 (gate ≤ 4.0) | — | **1.608 / 1.944 / 1.960** | 1.936 / 2.327 / 2.804 |
+| 5 cm-wall leak, high + ultra | — | **0 / 10 000**, control 92.1 % | 0 / 10 000 |
+| 5 cm-wall leak, **phone** | — | ⛔ 3 and 2 / 10 000 on rotX20/rotXY20 | 0 / 10 000 |
+| `probe:gi2-corridor` | — | **4/8, walls 2/4** — unmoved | 4/8, 2/4 |
+| `probe:gi2-doors` recess ÷ wall irrBefore | 118.1 % / 103.0 % | 115.6 % / **103.1 %** | 103.5 % |
+| `probe:gi2-puddle` wall curvature p90 @ tile lag | **8.80 % PASS** | **8.64 % PASS** | 13.77 % FAIL |
+| `probe:gi2-motion` | — | 7 gates fail, orbit MAX 266.7 ms | 6 fail, 151.5 ms |
+| `test:gi-moved-lamp` | — | **PASS, +29.02 lum** | PASS, +29.06 |
+| `smoke:gi-gpu` | — | **PASS 2/2**, `gi2.worldTrace` 6 buffers / 98 kB | PASS 2/2, 6 / 88 kB |
+
+⭐⭐ **THE PUDDLE GATE IS §AG's, NOT THIS STAGE'S, AND THE ARM IS WHY WE KNOW.**
+`probe:gi2-puddle` has failed since §AC (13.03 %, then 13.77 %) and now passes at
+8.64 % — a headline this unit could have claimed. Its own 4.11 arm reads
+**8.80 %**, so the coverage class bought 5 points of it and the near band bought
+0.16. The same arm clears `probe:gi2-doors`: 118.1 % on 4.11 against 115.6 %
+here, i.e. the recess ratio is where §AG left it and not where this stage put it.
+
+⛔ **AND ONE NEWLY FAILING GATE IS FLAGGED, NOT OWNED: the PHONE tier's 5 cm-wall
+leak.** 3 and 2 rays of 10 000 escape on the two tilted rotations, against
+§AH.5's 0/10 000; high and ultra are still 0. The rig traces the WINDOW
+directly, through the face bits and the coverage classes — the world lattice's
+near band is not in its path at all — and the phone tier is the one with a 0.5 m
+voxel, where a thin-class voxel is a large fraction of a 5 cm wall. It belongs
+to §AG's ledger; it is recorded here because this battery is where it showed up.
+
+▶ `probe:gi2-motion`'s extra failure is the same shape: `dolly: voxelize chain
+GPU ms MAX 3.21` against a limit of 3 — the VOXELIZE chain, which is the pass
+§AG added work to.
+
+### AI.8 — ⭐ THE RUNNER IS ARBITRABLE AGAIN, AND THE ANSWER IS "NOT THIS UNIT"
+
+§AH.5 could not arbitrate `probe:gi2-runner` at all: its two runs straddled an
+hour of another agent's edits and disagreed by a field-wide halving. Two
+back-to-back runs on this still tree:
+
+| arm "run" | run 1 | run 2 |
+|---|---|---|
+| `f3` façade out — step p90 | 73.7 % | 74.3 % |
+| `f3` façade out — steps > 10 % | 232 of 308 | 236 of 308 |
+| `g0` ground out — step p90 | 26.7 % | 25.7 % |
+| `f3` façade out — spatial spread p50 | 1.86 | 1.89 |
+| median frame | 19.0 ms | 19.2 ms |
+
+⭐ **Two runs, one tree, ~1 % apart on every series — the instrument works and
+the tree is still.** The targets (f3 p90 down, ground ≤ 3 %) are NOT met and
+this unit does not move them: 63.8 % of the steps over 10 % are attributed
+`F spatial speckle re-sampled`, with 4–7 pixels per patch and an intra-patch
+spread of 1.86 — **the patch disagrees with ITSELF within one frame**, which is
+a spatial fault the temporal series only re-samples. That is §AC/§AD's puddle
+term, at a different pose, and it is the next thing this path owes.
+
+⚠ **AND THE BATTERY'S LAST STEP MEASURED THE WRONG SCENE.** `probe:gi2-band`
+did not `scene.open` — it read whatever the previous probe had left the editor
+holding, and reported a corridor rig's eight c2 probes in Bistro's name. Fixed
+(every other gi2 probe opens its scene explicitly; this one does now).
+⭐ An instrument that inherits its subject from the last thing that ran is not
+measuring, it is guessing. [[probe-blind-statistics]]
+
+### AI.9 — ▶ OPEN, and both are specific now
+
+- **▶ THE DEFERRAL IS DECIDED AT THE PROBE AND READ AT THE PIXEL.** `DARK1` did
+  not move (0.0026 → 0.0022 against a truth of 0.4607). Its c2 probe sees finer
+  coverage **1.000** — c1 is fully live where the PROBE stands — while c1's
+  coverage at the PIXEL, six metres away, is **0.27**. Both conditions pass and
+  the near band is still deferred to a cascade that cannot answer the pixel.
+  The fix is the same test taken over the coarse cell's eight CORNERS rather
+  than at its centre (a `min` instead of the centre tap, at the same eight
+  loads); it is not in this unit because it widens the band over a large
+  fraction of the lattice and that deserves its own receipt.
+- **▶ THE FAÇADE'S BASE IS A LEAK, NOT A DARKNESS, AND THIS STAGE DOES NOT TOUCH
+  IT.** `FAC4` 41×, `SOFF2` 16×, `FAC6` 2.7× over a path-traced truth, unmoved
+  by both arms to three decimals. The façade FALL is compressed from that end:
+  GI2 2.09× against a truth of 5.69×. ⚠ And the pinned "façade column" is a
+  SCREEN column — `FAC1` and `FAC6` are 35 m apart in world space — so the fall
+  is a statistic about a screen strip, not about one wall.

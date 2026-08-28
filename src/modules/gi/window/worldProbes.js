@@ -444,6 +444,14 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const REACH_LATTICE = (globalThis.__gi2Reach ?? 1) !== 0;
   const SPLIT_OWN = INTERVALS && NC > 1 && (globalThis.__gi2SplitOwn ?? 1) !== 0;
   /**
+   * §19 4.12 — the coverage a FINER cascade must have at a coarse probe before
+   * that probe is allowed to defer its near band to it. `0` compiles 3.15's
+   * containment-only rule verbatim (see `coveredBelow`); anything above it
+   * compiles the cell-margin + liveness test. Build-time, because an arm that
+   * only half-restores the stage it is compared against proves nothing.
+   */
+  const COV_BELOW = Math.max(0, globalThis.__gi2CovBelow ?? 0.5);
+  /**
    * ⭐⭐ §19 3.16 FIX 2 — `RAY_MAX` IS PER-CASCADE, AND THE LAST CASCADE'S IS
    * ITS OWN LATTICE'S EXTENT.
    *
@@ -720,6 +728,30 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
      * the cascade out over the outer 15 % before it gets there.
      */
     wpCovFull: uniform(0.5),
+    /**
+     * ⭐⭐⭐ §19 4.12 — THE COVERAGE AT WHICH A CASCADE MAY DEFER ITS NEAR BAND,
+     * AND IT IS `wpCovFull`'s TWIN FOR THE SAME REASON. §3.15's ownership rule
+     * tested LATTICE CONTAINMENT: a coarse probe whose position falls inside
+     * the finer cascade's box hands `[0, t_i)` to it and traces only
+     * `[t_i, t_{i+1})`. ⭐⭐ CONTAINMENT IS NOT PAYMENT.
+     *
+     * ⛔ MEASURED (`probe:gi2-band`, Bistro pose B, HEAD e9ba895): of 697 live
+     * c2 probes, 288 are contained by c1's lattice and **166 of those stand
+     * where c1's liveness-weighted coverage is below a half** — the deferral is
+     * to nobody. At `DARK2` the answering c2 probe (claim 1.00 at the pixel,
+     * 2.77 m from it) has a mean first hit at **14.6 m** and **100 % of its
+     * directions store radiance exactly zero**, because every one of them hit
+     * inside a band it was told it did not own. The pixel reads 0.0028 against
+     * a path-traced 0.6377. A wall one metre from that probe is invisible to it.
+     *
+     * "The finest cascade that is LIVE at that point" is what the spec says
+     * about the resolve; the same words decide who owns the near band.
+     * `__gi2CovBelow = 0` restores 3.15's containment-only test, which is what
+     * makes this an arm rather than a rewrite.
+     */
+    wpCovBelow: uniform(COV_BELOW),
+    /** §19 4.12 — 1 weights a hit by §AG's thin-voxel throughput, 0 is 4.11. */
+    wpThinT: uniform(globalThis.__gi2ThinT === 0 ? 0 : 1),
   };
   /** One origin per cascade (i32 cell coords, in that cascade's own spacing). */
   const originsU = Array.from({ length: NC }, () => uniform(new THREE.Vector3()));
@@ -795,6 +827,41 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const F_OF = (c) => Math.max(c - 1, 0);
   const SPC_FINER = Array.from({ length: NC }, (_, c) => SPC[F_OF(c)]);
   const ORG_FINER = Array.from({ length: NC }, (_, c) => originsU[F_OF(c)]);
+  const BASE_FINER = Array.from({ length: NC }, (_, c) => F_OF(c) * CELLS);
+
+  /**
+   * §19 4.12 — a lattice's LIVENESS-WEIGHTED TRILINEAR COVERAGE at a world
+   * point: `Σ tri · live` over the eight cells around it, which is exactly the
+   * number `irradianceAtCasc` normalises by, `parentTap` weights with and the
+   * resolve spends as a claim. Isolated here because the trace kernel needs it
+   * ~600 lines before either of those exists, and because the ownership rule
+   * asking the SAME question as the resolve is the whole point of 4.12.
+   *
+   * ⚠ EIGHT SCALAR LOADS, NO SH. The coefficients are 9 vec4 per cell and this
+   * wants none of them — only `wpInfo[gc].w`, the liveness `allocPass` wrote.
+   */
+  const latticeCovAt = (base, sp, org, p) => {
+    const g = p.div(sp).sub(0.5).toVar();
+    const b = g.floor().toVar();
+    const fr = g.sub(b).toVar();
+    const cov = float(0).toVar();
+    for (let c8 = 0; c8 < 8; c8++) {
+      const dx = c8 & 1;
+      const dy = (c8 >> 1) & 1;
+      const dz = (c8 >> 2) & 1;
+      const rx = b.x.add(dx).toVar();
+      const ry = b.y.add(dy).toVar();
+      const rz = b.z.add(dz).toVar();
+      const cell = slotOf(rx.toInt(), ry.toInt(), rz.toInt()).add(base).toVar();
+      const ok = inLatticeAt(org, rx, ry, rz)
+        .and(wpInfo.element(infoIdx(cell, 0)).w.greaterThan(0.5));
+      const tri = (dx ? fr.x : float(1).sub(fr.x))
+        .mul(dy ? fr.y : float(1).sub(fr.y))
+        .mul(dz ? fr.z : float(1).sub(fr.z));
+      cov.addAssign(select(ok, tri, float(0)));
+    }
+    return cov;
+  };
 
   // ── window reads ──────────────────────────────────────────────────────────
   const viOf = (x, y, z) => bitOr(bitOr(
@@ -1374,11 +1441,76 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // Under the textbook rule c1's smallest storable distance was `t_1 = 2 m`,
     // larger than any pixel-to-probe distance it would ever be asked about, and
     // its visibility term was silently inert.
+    //
+    // ⭐⭐⭐ §19 4.12 — AND "A FINER CASCADE EXISTS" IS A QUESTION ABOUT LIVE
+    // PROBES, NOT ABOUT A BOX. THE BAND PROBE IS WHAT SAID SO.
+    //
+    // 3.15's test was `inLatticeAt(finer, floor(pos / s_{i−1}))` — pure
+    // geometry. A clipmap's lattice is a 64 m cube around the camera; whether
+    // anything LIVES in it thirty metres out is a different fact entirely, and
+    // `allocPass` decides it from the window's occupancy, cell by cell. Where
+    // the two disagree the near band is deferred to nobody and silently lost.
+    //
+    // ⛔ MEASURED (`probe:gi2-band`, Bistro pose B): 166 of the 288 contained
+    // c2 probes stand where c1's coverage is under a half; the c2 probe that
+    // answers `DARK2` at claim 1.00 discards **100 %** of its hemisphere's
+    // radiance (mean first hit 14.6 m, every texel `own = 0`) and the pixel
+    // reads 0.0028 against a path-traced 0.6377. §AH.2 named this from the
+    // field's own numbers — "c1's lattice contains the point; c1 has almost no
+    // live probe there; nobody pays `[0, 20)`" — and this is the mechanism.
+    //
+    // TWO CONDITIONS, AND EACH IS A DIFFERENT WAY TO BE UNPAID:
+    //
+    //   · THE FINER LATTICE MUST HOLD THE WHOLE CELL THIS PROBE SPEAKS FOR,
+    //     not merely its centre. A probe answers pixels across its own cell and
+    //     one cell beyond it through the trilinear blend, so a c2 probe sitting
+    //     one metre inside c1's boundary is read by pixels several metres
+    //     OUTSIDE it — where c1 answers nothing at all. The margin is this
+    //     cascade's own spacing, which is the reach of its own interpolation,
+    //     and it costs no buffer read: the lattice is a box, so its two extreme
+    //     corners decide it.
+    //   · THE FINER LATTICE MUST ACTUALLY BE LIVE THERE — `latticeCovAt ≥
+    //     wpCovBelow`, the same liveness-weighted trilinear coverage the
+    //     resolve spends as a claim and `irradianceAtCasc` normalises by.
+    //
+    // ⚠ AND IT COSTS NOTHING IN RAY LENGTH. The ray already leaves the probe
+    // and runs to `t_{i+1}` (see the next block — the interval is applied to
+    // the RESULT, not to the origin), so widening a probe's own band to
+    // `[0, t_{i+1})` changes only how its hits are CLASSIFIED. The whole spend
+    // is the eight liveness loads above.
+    //
+    // ⚠ THE DOUBLE-COUNT THIS OPENS IS SELF-LIMITING, and the merge's own
+    // algebra is why. A child adds its parent's map only where its own texel is
+    // TRANSPARENT, and `T = 1` means the child's ray MISSED CLEANLY over the
+    // whole of `[0, t_{i+1})` — so the segment the parent would re-credit is a
+    // segment the child has just measured to be empty. What is left is the
+    // parallax between two probes at most a coarse cell apart, against a near
+    // band that was being dropped in full.
+    //
+    // ⚠ `__gi2CovBelow = 0` IS A BUILD-TIME BRANCH, NOT A UNIFORM SET TO ZERO,
+    // and it has to be: a zero threshold still leaves the CELL margin standing,
+    // which is 4.12 with one of its two conditions removed rather than 4.11.
+    // An arm that is not byte-for-byte the stage it claims to restore cannot
+    // arbitrate anything — and this worktree's scene moves under it, so the
+    // only honest A/B is two boots minutes apart with one flag between them.
     const fSp = pickF(rr.casc, SPC_FINER).toVar();
     const fOrg = pickV(rr.casc, ORG_FINER).toVar();
-    const fc = pos.div(fSp).floor().toVar();
-    const coveredBelow = rr.casc.greaterThan(uint(0))
-      .and(inLatticeAt(fOrg, fc.x, fc.y, fc.z)).toVar();
+    let coveredBelow;
+    if (COV_BELOW <= 0) {
+      const fc = pos.div(fSp).floor().toVar();
+      coveredBelow = rr.casc.greaterThan(uint(0))
+        .and(inLatticeAt(fOrg, fc.x, fc.y, fc.z)).toVar();
+    } else {
+      const fBase = pickU(rr.casc, BASE_FINER).toVar();
+      const spOwn = pickF(rr.casc, SPC).toVar();
+      const fLo = pos.sub(spOwn).div(fSp).floor().toVar();
+      const fHi = pos.add(spOwn).div(fSp).floor().toVar();
+      const holdsCell = inLatticeAt(fOrg, fLo.x, fLo.y, fLo.z)
+        .and(inLatticeAt(fOrg, fHi.x, fHi.y, fHi.z)).toVar();
+      const fCov = latticeCovAt(fBase, fSp, fOrg, pos).toVar();
+      coveredBelow = rr.casc.greaterThan(uint(0)).and(holdsCell)
+        .and(fCov.greaterThanEqual(wu.wpCovBelow)).toVar();
+    }
     const t0 = select(coveredBelow, pickF(rr.casc, TSTART), float(0)).toVar();
     const t1 = pickF(rr.casc, TEND).toVar();
     const isLast = rr.casc.greaterThanEqual(uint(NC - 1)).toVar();
@@ -1440,10 +1572,34 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // non-final cascade would otherwise contribute sky AND then add its parent's
     // sky through `T` — the same photon twice, once per cascade. A non-final
     // miss stores radiance 0 and `T = 1`: "nothing in my band, ask my parent".
+    //
+    // ⭐⭐ §19 4.12 — AND THE HIT IS WEIGHTED BY WHAT SURVIVED THE THIN VOXELS.
+    //
+    // §AG made a class-<3 voxel DIM a ray instead of stopping it, and returned
+    // the surviving throughput `T_thin` beside the hit. Until this line nothing
+    // spent it: a ray that crossed a cable slab and then found a wall credited
+    // that wall at FULL radiance, i.e. the cables were treated as perfectly
+    // transparent — the opposite of the pre-§AG error and wrong by the same
+    // coverage fraction. `T_thin` is a product of per-class constants over the
+    // voxels the ray actually met, so it is deterministic (§T) and it is 1 in
+    // every scene with no cables, railings or foliage in it: this multiply is a
+    // provable no-op there, which is why it needs no separate arm to be safe.
+    //
+    // ⚠ THE REMAINDER IS CREDITED TO NOTHING, AND THAT IS A DELIBERATE FLOOR.
+    // The physical answer is `T·L_hit + (1−T)·L_thin`, and `L_thin` — the
+    // cable's own bounce — is not knowable from the DDA's product: the ray
+    // remembers HOW MUCH it lost, not WHERE. Every estimate for it is a
+    // constant somebody picked ([[gi-one-property]] forbids the knob and
+    // [[gi-colour-probe-method]] forbids the world-unit guess), so this credits
+    // the term it can prove and under-states by a dark object's own bounce.
+    // Monotone, never invents light, and exactly reversible if a receipt asks.
+    // `__gi2ThinT = 0` restores the un-weighted hit, so the band rule and this
+    // multiply are two arms of ONE boot pair rather than one unarbitrable diff.
+    const thinT = mix(float(1), r.w.fract().mul(256 / 255).min(1), wu.wpThinT).toVar();
     const rgbNew = INTERVALS
-      ? select(inBand, rd.xyz,
-        select(hitAny.not().and(isLast), u.skyColor, vec3(0))).toVar()
-      : rd.xyz.toVar();
+      ? select(inBand, rd.xyz.mul(thinT),
+        select(hitAny.not().and(isLast), u.skyColor.mul(thinT), vec3(0))).toVar()
+      : rd.xyz.mul(thinT).toVar();
     // Transparent ONLY on a clean miss by a non-final cascade. A near hit is
     // OPAQUE (`blockedNear`) — the far field does not reach this probe in this
     // direction and asking the parent for it would be the leak, one level up.
@@ -2092,6 +2248,9 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // build. `reachLast` is the number fix 2 actually moves.
     placeInCell: PLACE_IN_CELL, reachLattice: REACH_LATTICE, splitOwn: SPLIT_OWN,
     reachLast: REACH_LAST, octWords: OCT_W, alpha: SPLIT_OWN ? 0.25 : (INTERVALS ? 1 : 0.25),
+    // §19 4.12 — the two arms of the near-band unit, so a receipt cannot claim
+    // a stage it did not build. `covBelow = 0` is 3.15's containment-only rule.
+    covBelow: COV_BELOW, thinT: globalThis.__gi2ThinT === 0 ? 0 : 1,
     // ⚠ NO FUNCTIONS IN HERE. `describe()` crosses `page.evaluate` in every
     // receipt this module has; a method would be dropped by the structured
     // clone and read as `undefined` at the far end.
