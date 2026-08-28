@@ -123,6 +123,18 @@ page.on("pageerror", (error) => console.log(`pageerror: ${error.stack ?? error.m
 // false`, `engine.time._frame` frozen at 419 and two byte-identical
 // screenshots 4 s apart across a 3 m lamp move. `__editorKeepRendering` is
 // that module's own documented harness hatch.
+// ⭐ §19 3.16 — `FLAGS='{"__gi2WorldProbes":true}'` RUNS THIS GATE ON THE WORLD
+// PROBE PATH, OUT OF THE SHIPPING BINARY. §V.8 and §W.10 recorded the same
+// caveat twice in a row: these engine gates run the SHIPPING path because the
+// flip has not happened, so a green tree says the tree is green and says
+// NOTHING about the path being flipped to. The gi2 probes have had this hook
+// since 3.13; the engine gates did not, which is why "the first time the world
+// path runs it" was still true at 3.16.
+await page.evaluateOnNewDocument(
+  (f) => { Object.assign(globalThis, f); },
+  JSON.parse(process.env.FLAGS ?? "{}"),
+);
+
 await page.evaluateOnNewDocument(() => {
   globalThis.__editorKeepRendering = true;
   // AND CUT THE HMR SOCKET. This test holds ~40 s of live state on the page;

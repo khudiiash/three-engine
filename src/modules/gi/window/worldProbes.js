@@ -325,8 +325,82 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
    * only a receipt can choose.
    */
   const R0C = Math.max(1, globalThis.__gi2R0 ?? R0_CELLS);
+  /**
+   * ══ §19 STAGE 3.16 — THE THREE FIXES 3.15's VERDICT NAMED, EACH ITS OWN ARM ═
+   *
+   * All three are read BEFORE the build and all three are BINARIES, for the
+   * discipline `__gi2Cascades` and `__gi2Intervals` set: a 3.16-against-3.15
+   * comparison across two COMMITS is a comparison across two shader caches and
+   * two nights' drivers. `?fix316=0` on the rig pages turns all three off and
+   * reproduces 3.15 exactly, out of one binary.
+   *
+   * 1. `__gi2CoarsePlace` — a coarse probe stays inside its OWN cell.
+   * 2. `__gi2Reach`       — the last cascade traces to its LATTICE's extent.
+   * 3. `__gi2SplitOwn`    — `own` and `merged` are separate words, so α returns.
+   */
+  const PLACE_IN_CELL = (globalThis.__gi2CoarsePlace ?? 1) !== 0;
+  /**
+   * ⛔⛔ §19 3.16 — REACH SHIPS **OFF**, AND THAT IS A MEASUREMENT REVERSING THE
+   * SPEC. It was built exactly as `REACH_LAST` describes below, and then
+   * refuted by the receipt it was built for. `probe:gi2-farfield`, Bistro
+   * street-overview, pose pinned, 3417 paired façade pixels, ONE reference:
+   *
+   * | far-façade irradiance | screen | reach OFF (40 m) | reach ON (256 m) |
+   * |---|---|---|---|
+   * | 30–40 m p50 | 1.071 | 2.559 | 2.808 |
+   * | 40–55 m p50 | 1.243 | 2.353 | 2.621 |
+   * | **55–75 m p50** | **4.212** | **3.875** | **0.000** |
+   * | ÷ screen p50 | — | 1.505 | 1.668 |
+   * | within ±30 % of screen | — | 33.2 % | 27.1 % |
+   *
+   * ⭐⭐ **A LONGER RAY STOPS MISSING AND STARTS HITTING, AND A HIT ON A BRICK
+   * THE CACHE HAS NOT LIT YET IS BLACK WHERE THE MISS WAS SKY.** That is §W.3's
+   * own "a missing parent pays SKY, NOT BLACK" one level down — in the trace
+   * rather than in the merge. At `RAY_MAX` the far band was paid a sky it had a
+   * right to; at the lattice's extent it is paid the radiance of a far street
+   * the cache converges to LAST. The band only the last cascade can answer for
+   * went to exactly 0.0000 on all thirty of its samples.
+   *
+   * And it buys nothing where truth exists: the corridor's 50 m crop reads
+   * 0.119 with reach off and 0.116 with it on against a path-traced 1.0,
+   * because that row is c1's ±32 m extent and c2's 8 m probes — resolution, not
+   * ray length (§W.11's own second item).
+   *
+   * ⚠ THE IMPLEMENTATION STAYS AS AN ARM (`__gi2Reach = 1`), because the
+   * diagnosis is now specific rather than general: reach becomes right the day
+   * the last cascade can tell "there is nothing there" from "that is not lit
+   * yet". Until then `RAY_MAX` is the honest horizon and sky at it is the
+   * honest answer.
+   */
+  const REACH_LATTICE = (globalThis.__gi2Reach ?? 0) !== 0;
+  const SPLIT_OWN = INTERVALS && NC > 1 && (globalThis.__gi2SplitOwn ?? 1) !== 0;
+  /**
+   * ⭐⭐ §19 3.16 FIX 2 — `RAY_MAX` IS PER-CASCADE, AND THE LAST CASCADE'S IS
+   * ITS OWN LATTICE'S EXTENT.
+   *
+   * §W.11 named the frame around the corridor's two worst rows: **the cascade
+   * LATTICE reaches 256 m while the cascade RAYS reach 40.** A c2 probe stands
+   * anywhere in a 256 m cube and can see 40 m of it, so most of that lattice is
+   * probes whose every direction misses, is paid SKY, and then reports the sky
+   * as the far field. On a 100 m street those are exactly the façades this
+   * cascade exists to carry.
+   *
+   * The honest horizon is the one the OCCUPANCY has. The window's coarsest
+   * level is `C · s_{NC−1}` across and `windowTrace` already steps up into it,
+   * so the last cascade's interval ends where its own lattice does — 256 m at
+   * ultra/high, 64 m on the phone tiers. Every inner cascade is unchanged,
+   * because `t_{i+1}` was never `RAY_MAX` there.
+   *
+   * ⚠ AND THE SKY CREDIT MOVES WITH IT, WHICH IS THE POINT. `hitRadiance` pays
+   * `skyColor` on a miss, and that credit is only true at a distance where
+   * there is genuinely nothing left to hit. `RAY_MAX = 40` in a 60 m corridor
+   * made it a LEAK (§W.5); at the lattice's own extent it is the answer.
+   */
+  const REACH_LAST = REACH_LATTICE ? EXT[NC - 1] : RAY_MAX;
   const TSTART = INTERVALS ? intervalStarts(SP0, NC, R0C) : SPC.map(() => 0);
-  const TEND = INTERVALS ? intervalEnds(SP0, NC, RAY_MAX, R0C) : SPC.map(() => RAY_MAX);
+  const TEND = INTERVALS
+    ? intervalEnds(SP0, NC, REACH_LAST, R0C)
+    : SPC.map(() => REACH_LAST);
   /**
    * The window level cascade `c` reads its LIVENESS from.
    *
@@ -371,11 +445,22 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   //
   // Indexed by the GLOBAL cell `gc = cascade · CELLS + cell`. `wpOct` is the
   // whole cost of this design and it is deliberately the only thing that scales
-  // with the lattice: two u32 per (cell, texel).
-  //   word 0  RGBE radiance (0 = never written — the same sentinel the cache's
-  //           own words use, so "no data" and "black" stay distinguishable)
-  //   word 1  n<<24 | rmsQ<<12 | meanQ   — the two distance moments
-  const wpOct = instancedArray(new Uint32Array(ALL_CELLS * OCT * 2), "uint");
+  // with the lattice: `OCT_W` u32 per (cell, texel).
+  //   word 0  MERGED RGBE radiance — what `shPass` and every resolve tap read
+  //           (0 = never written, the same sentinel the cache's own words use,
+  //           so "no data" and "black" stay distinguishable)
+  //   word 1  n<<24 | T<<30 | rmsQ<<12 | meanQ   — the two distance moments
+  //   word 2  OWN RGBE radiance, §19 3.16 fix 3 — the probe's own band, the
+  //           only thing its 64 rays measure and therefore the only thing an
+  //           EMA may be applied to. Built ONLY under `SPLIT_OWN`.
+  //
+  // ⚠ A THIRD WORD, NOT A FOURTH BUFFER. The trace kernel binds exactly six
+  // storage buffers (window, cache, oct, info, list, stats) and the phone tier
+  // has exactly six — see `wpList`'s comment, which spent the same coin. A
+  // separate `wpOwn` would not compile there; a wider stride costs the same
+  // 25 MB and no binding.
+  const OCT_W = SPLIT_OWN ? 3 : 2;
+  const wpOct = instancedArray(new Uint32Array(ALL_CELLS * OCT * OCT_W), "uint");
   /** Nine SH2 coefficients per cell. What the resolve reads. */
   const wpSh = instancedArray(new Float32Array(ALL_CELLS * 9 * 4), "vec4");
   /**
@@ -418,8 +503,25 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
      * cannot both be right, and the merge is the one the stage is for. §T is
      * satisfied without it anyway: a world probe's 64 rays are the same 64 rays
      * from the same point every update, so α was never removing noise here.
+     *
+     * ⭐⭐ §19 3.16 FIX 3 — AND THAT ALGEBRA IS A CONSEQUENCE OF ONE WORD, NOT
+     * OF THE MERGE. The forcing clause above is "`mergePass` writes `own +
+     * T·parent` back INTO THE SAME TEXEL". 3.15's verdict measured what that
+     * cost — cold noise p95 0.723 → 1.576 % and Bistro motion flips 26.9/21.6/
+     * 17.6 → 35.1/26.4/23.3 % — and named the fix: hold `own` and `merged` in
+     * separate words. `SPLIT_OWN` does exactly that, as a THIRD u32 inside
+     * `wpOct` rather than a fourth storage binding (the portable envelope's six
+     * are already all spent — see `wpList`'s comment), for +25 MB at ultra.
+     *
+     * With the split, α is an EMA on `own` — the probe's own band, the thing
+     * its 64 rays actually measure — and `mergePass` recomposes `merged` from
+     * the accumulated `own` every time it runs. Nothing re-mixes, because the
+     * value α blends against is never the merged one. 0.5, which is §U.2's
+     * "fixed α between COMPLETE evaluations" (§T allows it: a world probe's 64
+     * rays are the same rays from the same point, so this ramps the CACHE's
+     * convergence and removes no noise that was ever there).
      */
-    wpAlpha: uniform(INTERVALS ? 1 : 0.25),
+    wpAlpha: uniform(SPLIT_OWN ? 0.5 : (INTERVALS ? 1 : 0.25)),
     /** 0 removes the resolve's visibility term — the LEAK RECEIPT'S CONTROL. */
     wpVisOn: uniform(1),
     /** 0 removes the probe-face gate; the other half of the same control. */
@@ -536,7 +638,13 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const unTorus = (bits, o) => o.toInt().add(bitAnd(bits.toInt().sub(o.toInt()), int(C - 1)));
   const infoIdx = (gc, k) => gc.mul(uint(3)).add(uint(k));
   const shIdxW = (gc, k) => gc.mul(uint(9)).add(uint(k));
-  const octIdxW = (gc, texel) => gc.mul(uint(OCT * 2)).add(texel.mul(uint(2)));
+  const octIdxW = (gc, texel) => gc.mul(uint(OCT * OCT_W)).add(texel.mul(uint(OCT_W)));
+  /**
+   * §19 3.16 — the word an EMA is allowed to touch. Under `SPLIT_OWN` it is
+   * word 2 (`own`); otherwise it IS word 0, and the merge's in-place algebra
+   * (§W.3) is what forces α = 1 there.
+   */
+  const OWN_W = SPLIT_OWN ? 2 : 0;
   /** The list word `off` inside cascade `casc`'s own run. */
   const listAt = (cascU, off) => wpList.element(cascU.mul(uint(LIST_WORDS)).add(off));
   /**
@@ -756,17 +864,94 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       const nn = normalOfFace(faceF).toVar();
       faceN.assign(nn);
       state.assign(0);
+      // ⭐⭐⭐ §19 3.16 FIX 1 — AN ESCAPE BUDGET IN VOXELS IS A DISPLACEMENT IN
+      // METRES, AND AT c2 THAT IS FOURTEEN OF THEM.
+      //
+      // The rule below it (3.13's, kept verbatim for cascade 0) walks the cell
+      // centre along its dominant normal in whole cells OF THE ORIGIN'S OWN
+      // WINDOW LEVEL. `LMIN` ties that level to the cascade's spacing, so the
+      // step is `v_l = s_c / 2`: 0.125 m at c0, 1 m at c1, **4 m at c2**, and
+      // three of them is 14 m. ⛔ MEASURED, not argued: the corridor's 30 m
+      // crops read 2.93× a path-traced truth on BOTH world arms (§W.6), and the
+      // mechanism is a c2 probe pushed clean through the building's wall into
+      // the SUNLIT EXTERIOR, where it measures the exterior and hands it back
+      // down the merge as the interior's far field.
+      //
+      // ⭐⭐ A PROBE IS ITS CELL'S REPRESENTATIVE, SO ITS PLACEMENT MUST STAY
+      // INSIDE ITS CELL. That is the whole rule, and it is not a smaller
+      // budget — a budget in the same units would be 4 m at c2 and 0.125 m at
+      // c0, i.e. the same mistake divided. The search is over the FINER
+      // cascade's cells inside this one (`s_c / RATIO`: 0.5 m at c1, 2 m at
+      // c2), the 3³ neighbourhood of the centre, nearest first, deterministic:
+      // z outer, y, x inner, strict `<` on the squared offset, so ties break by
+      // that order and two frames with the same occupancy place the probe at
+      // the same point. Max displacement is `√3 · s_c/RATIO = 0.43 · s_c`,
+      // inside the cell on every axis and — the receipt — never as much as one
+      // whole cell. Nothing free in the 3³ means the cell is BURIED and holds
+      // NO probe, which is 3.13's own answer to the same question.
+      //
+      // ⚠ AND THE FACE FOLLOWS THE MOVE. `faceN` is the hemisphere the probe
+      // owns; under the old rule it was the escape direction by construction
+      // (the walk WAS along `nn`). A lateral placement keeps that invariant
+      // only if the face is re-read from the offset actually taken, or the
+      // probe spends its rays on the half it moved away from.
       // Whole cells of the ORIGIN's own level, up to the trace's own escape
       // budget. Beyond that the cell is buried and holds no probe: a probe
       // inside a solid is the classic lattice leak, and refusing to place one
       // is cheaper and safer than any weight that tries to discount it.
-      Loop({ start: 1, end: 4, name: "wpEscape" }, ({ wpEscape }) => {
-        const q = p.add(nn.mul(vl.mul(float(wpEscape).add(0.5)))).toVar();
-        const qc = cellOfWorld(q);
-        If(occAt(qc.level.toUint(), qc.vi).not(), () => {
-          pos.assign(q);
-          state.assign(2);
-          Break();
+      const escapeAlongNormal = () => {
+        Loop({ start: 1, end: 4, name: "wpEscape" }, ({ wpEscape }) => {
+          const q = p.add(nn.mul(vl.mul(float(wpEscape).add(0.5)))).toVar();
+          const qc = cellOfWorld(q);
+          If(occAt(qc.level.toUint(), qc.vi).not(), () => {
+            pos.assign(q);
+            state.assign(2);
+            Break();
+          });
+        });
+      };
+      const placeInsideCell = () => {
+        const sf = pickF(casc, SPC_FINER).toVar();
+        const best = float(1e9).toVar();
+        Loop({ start: 0, end: 3, name: "wpPlaceZ" }, ({ wpPlaceZ }) => {
+          const oz = float(wpPlaceZ).sub(1).toVar();
+          Loop({ start: 0, end: 3, name: "wpPlaceY" }, ({ wpPlaceY }) => {
+            const oy = float(wpPlaceY).sub(1).toVar();
+            Loop({ start: 0, end: 3, name: "wpPlaceX" }, ({ wpPlaceX }) => {
+              const ox = float(wpPlaceX).sub(1).toVar();
+              const off = vec3(ox, oy, oz).toVar();
+              const d2 = dot(off, off).toVar();
+              // `> 0.5` skips the centre (known occupied); `< best` is both the
+              // nearest-first rule and the early-out that keeps this ~8 reads.
+              If(d2.greaterThan(0.5).and(d2.lessThan(best)), () => {
+                const q = p.add(off.mul(sf)).toVar();
+                const qc = cellOfWorld(q);
+                If(occAt(qc.level.toUint(), qc.vi).not(), () => {
+                  best.assign(d2);
+                  pos.assign(q);
+                  faceN.assign(off.div(sqrt(d2).max(1e-6)));
+                  state.assign(2);
+                });
+              });
+            });
+          });
+        });
+      };
+      if (!PLACE_IN_CELL || NC === 1) escapeAlongNormal();
+      else If(casc.equal(uint(0)), escapeAlongNormal).Else(placeInsideCell);
+      // ⭐ THE RECEIPT, AND IT IS TAKEN AFTER THE BRANCH SO BOTH ARMS ARE
+      // MEASURED BY THE SAME INSTRUMENT. `wpCoarseMoved` counts every relocated
+      // coarse probe; `wpCoarseFar` counts those that ended up further than ONE
+      // OF THEIR OWN CELLS from the centre they represent — 3.15's escape rule
+      // could reach 3.5 · s_c/2 = 1.75 cells (14 m at c2), the in-cell search
+      // 0.43. A census inside the `else` would only ever have been able to
+      // report the arm that cannot fail.
+      If(casc.greaterThan(uint(0)).and(state.greaterThan(1.5)), () => {
+        const off = pos.sub(p).abs().toVar();
+        bump(STATS.wpCoarseMoved, cell);
+        If(off.length().greaterThan(sp), () => { bump(STATS.wpCoarseFar, cell); });
+        If(max(max(off.x, off.y), off.z).greaterThan(sp.mul(0.5)), () => {
+          bump(STATS.wpCoarseOut, cell);
         });
       });
       If(state.lessThan(0.5), () => { dead(); Return(); });
@@ -886,7 +1071,13 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     const pos = i0.xyz.toVar();
     const faced = i0.w.greaterThan(1.5).toVar();
     const faceN = wpInfo.element(infoIdx(gc, 1)).xyz.toVar();
-    const fresh = wpInfo.element(infoIdx(gc, 2)).w.lessThan(0.5).toVar();
+    // ⚠ `< 0.75`, NOT `< 0.5` — a SEEDED probe (`ready = 0.5`) has never traced.
+    // Its map is its parent's MERGED field, so blending a first trace against
+    // it would fold the far chain into `own` and the merge would add it again.
+    // Under `SPLIT_OWN` that is the one place the split could leak the very
+    // double-count it exists to avoid; under the in-place merge α is 1 and this
+    // is inert, so it is safe to state once for both.
+    const fresh = wpInfo.element(infoIdx(gc, 2)).w.lessThan(0.75).toVar();
 
     const dir = octU.element(texel).xyz.toVar();
     const addr = octIdxW(gc, texel).toVar();
@@ -897,6 +1088,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     If(faced.and(dot(dir, faceN).lessThanEqual(0.02)), () => {
       wpOct.element(addr).assign(uint(0));
       wpOct.element(addr.add(uint(1))).assign(uint(0));
+      if (SPLIT_OWN) wpOct.element(addr.add(uint(2))).assign(uint(0));
       Return();
     });
 
@@ -1036,17 +1228,30 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // on every cascade a fall-through pixel can read.
     const dGlobal = INTERVALS ? select(hitAny, r.y, t1).toVar() : rd.w.toVar();
 
-    const prev0 = wpOct.element(addr).toVar();
+    // ⭐⭐ §19 3.16 FIX 3 — THE EMA READS `own`, NOT THE TEXEL EVERYTHING ELSE
+    // READS. `OWN_W` is word 2 under the split and word 0 without it, so the
+    // `INTERVALS && !SPLIT_OWN` arm is byte-for-byte 3.15 and the pre-interval
+    // arm is byte-for-byte 3.14.
+    const prevOwn = wpOct.element(addr.add(uint(OWN_W))).toVar();
     const prev1 = wpOct.element(addr.add(uint(1))).toVar();
     const had = nOf(prev1).greaterThan(uint(0)).and(fresh.not()).toVar();
-    // Under the merge α is 1 by algebra, not by taste — see `wpAlpha`.
-    const a = INTERVALS ? float(1).toVar() : select(had, wu.wpAlpha.clamp(0, 1), float(1)).toVar();
-    const rgb = INTERVALS ? rgbNew : mix(decodeRgbe(prev0), rgbNew, a).toVar();
+    // Under the IN-PLACE merge α is 1 by algebra, not by taste — see `wpAlpha`.
+    // Under the split it is a real EMA again, on the only value that is the
+    // probe's own measurement.
+    const emaOn = !INTERVALS || SPLIT_OWN;
+    const a = emaOn ? select(had, wu.wpAlpha.clamp(0, 1), float(1)).toVar() : float(1).toVar();
+    const rgb = emaOn ? mix(decodeRgbe(prevOwn), rgbNew, a).toVar() : rgbNew;
     const d = min(dGlobal, dmax).toVar();
-    const m1 = INTERVALS ? d : mix(meanOf(prev1, dmax), d, a).toVar();
+    const m1 = emaOn ? mix(meanOf(prev1, dmax), d, a).toVar() : d;
     const pr = rmsOf(prev1, dmax).toVar();
-    const m2 = INTERVALS ? d.mul(d) : mix(pr.mul(pr), d.mul(d), a).toVar();
-    wpOct.element(addr).assign(encodeRgbe(rgb));
+    const m2 = emaOn ? mix(pr.mul(pr), d.mul(d), a).toVar() : d.mul(d);
+    const packedRgb = encodeRgbe(rgb).toVar();
+    // Word 0 gets `own` too: a texel the merge will not touch (opaque, or the
+    // last cascade, or `NC = 1`) is already its own final answer, and a texel
+    // the merge WILL touch is overwritten this same frame by `mergeFor`, which
+    // recomposes it from word 2. Nothing downstream ever sees a half-state.
+    wpOct.element(addr).assign(packedRgb);
+    if (SPLIT_OWN) wpOct.element(addr.add(uint(2))).assign(packedRgb);
     wpOct.element(addr.add(uint(1))).assign(
       packMoments(nOf(prev1).add(uint(1)).min(uint(63)), m1, sqrt(m2.max(0)), dmax, tNew),
     );
@@ -1271,9 +1476,17 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // band), but the sum is written as the formula rather than as the shortcut:
     // the day a cascade learns to store partial transmittance, this line is
     // already right and the one that says `assign(parent)` is silently wrong.
-    const own = decodeRgbe(wpOct.element(addr)).toVar();
+    // ⭐⭐ §19 3.16 — `own` COMES OUT OF ITS OWN WORD, WHICH IS WHAT MAKES THE
+    // MERGE IDEMPOTENT WITHOUT CLEARING `T`. 3.15 read `own` from the texel it
+    // was about to overwrite, so the ONLY thing that could stop a second run
+    // from accumulating was destroying the transmittance bit on the way out —
+    // and that same aliasing is what forced `wpAlpha = 1` (§W.3). With word 2
+    // holding `own`, this line recomputes the same value from the same inputs
+    // however many times it runs, `T` survives for the next merge, and the
+    // trace is free to blend `own` against its own history.
+    const own = decodeRgbe(wpOct.element(addr.add(uint(OWN_W)))).toVar();
     wpOct.element(addr).assign(encodeRgbe(own.add(parent)));
-    wpOct.element(addr.add(uint(1))).assign(clearT(w1));
+    if (!SPLIT_OWN) wpOct.element(addr.add(uint(1))).assign(clearT(w1));
   })().compute([Math.ceil(SLOTS[ci] / 8), OCT_GROUPS], [8, 8, 1]);
   const mergePasses = (INTERVALS && NC > 1)
     // COARSEST FIRST: c1 takes c2's field, then c0 takes the c1 that already
@@ -1356,6 +1569,11 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       wpOct.element(dst.add(uint(1))).assign(
         select(has, packMoments(uint(1), m, m, dmax, uint(0)), uint(0)),
       );
+      // ⚠ THE SEED IS A `merged` VALUE AND ONLY A `merged` VALUE. `own` stays 0
+      // until this probe's first real trace, which `fresh` (`ready < 0.75`)
+      // takes at α = 1 — so the parent's far chain is never blended into the
+      // band this probe is supposed to measure for itself.
+      if (SPLIT_OWN) wpOct.element(dst.add(uint(2))).assign(uint(0));
       const c = rad.mul(e.w).mul(select(has, float(1), float(0))).toVar();
       sh[0].addAssign(c.mul(0.282095));
       sh[1].addAssign(c.mul(d.y.mul(0.488603)));
@@ -1491,7 +1709,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const clearPass = Fn(() => {
     const i = instanceIndex.toVar();
     wpOct.element(i).assign(uint(0));
-  })().compute(ALL_CELLS * OCT * 2);
+  })().compute(ALL_CELLS * OCT * OCT_W);
   const clearInfoPass = Fn(() => {
     wpInfo.element(instanceIndex).assign(vec4(0));
   })().compute(ALL_CELLS * 3);
@@ -1619,16 +1837,20 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     intervals: INTERVALS, beta: BETA, r0: R0C * SP0, r0Cells: R0C,
     tStart: TSTART.slice(), tEnd: TEND.slice(),
     mergePasses: mergePasses.length, seeded: !!seedPass,
+    // §19 3.16 — the three arms, so a receipt cannot claim a stage it did not
+    // build. `reachLast` is the number fix 2 actually moves.
+    placeInCell: PLACE_IN_CELL, reachLattice: REACH_LATTICE, splitOwn: SPLIT_OWN,
+    reachLast: REACH_LAST, octWords: OCT_W, alpha: SPLIT_OWN ? 0.5 : (INTERVALS ? 1 : 0.25),
     // ⚠ NO FUNCTIONS IN HERE. `describe()` crosses `page.evaluate` in every
     // receipt this module has; a method would be dropped by the structured
     // clone and read as `undefined` at the far end.
     bytes: {
-      oct: ALL_CELLS * OCT * 2 * 4,
+      oct: ALL_CELLS * OCT * OCT_W * 4,
       sh: ALL_CELLS * 9 * 16,
       info: ALL_CELLS * 3 * 16,
       list: LIST_WORDS * NC * 4,
     },
-    totalMB: +(((ALL_CELLS * OCT * 2 * 4) + (ALL_CELLS * 9 * 16) + (ALL_CELLS * 3 * 16)
+    totalMB: +(((ALL_CELLS * OCT * OCT_W * 4) + (ALL_CELLS * 9 * 16) + (ALL_CELLS * 3 * 16)
       + LIST_WORDS * NC * 4) / 1048576).toFixed(2),
   });
 

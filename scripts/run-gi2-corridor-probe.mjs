@@ -32,17 +32,25 @@ import { lum, makeReference } from "./lib/gi2Reference.mjs";
 
 const url = (process.argv[2] ?? "http://127.0.0.1:5202/scripts/gi2-corridor.html").replace(/\/$/, "");
 const tiers = (process.env.TIER ?? "ultra").split(",").map((t) => t.trim()).filter(Boolean);
-const arms = (process.env.ARMS ?? "3.15,3.14").split(",").map((t) => t.trim()).filter(Boolean);
+const arms = (process.env.ARMS ?? "3.16,3.15").split(",").map((t) => t.trim()).filter(Boolean);
 const SPP = Number(process.env.SPP ?? 150000);
 const FRAMES = process.env.FRAMES ?? "";
 
 /** Each arm's query, and nothing else about it. */
 const ARM_QUERY = {
-  "3.15": "",
-  "3.14": "intervals=0",
-  "3.13": "casc=1&intervals=0",
+  // §19 3.16 — the default arm is all three fixes ON; "3.15" is the SAME
+  // BINARY with `fix316=0`, which is what makes the two columns comparable.
+  "3.16": "",
+  "3.16+reach": "reach=1",
+  "3.16-place": "reach=0&split=0",
+  "3.16-reach": "place=0&split=0&reach=1",   // reach ships OFF — refuted, see worldProbes
+  "3.16-split": "place=0&reach=0",
+  "3.15": "fix316=0",
+  "3.14": "intervals=0&fix316=0",
+  "3.13": "casc=1&intervals=0&fix316=0",
   "3.12": "world=0",
-  "3.15-bias": "perCasc=1",
+  "3.15-bias": "fix316=0&perCasc=1",
+  "3.16-bias": "perCasc=1",
   "3.15-prop": "covFull=1",
   "3.15-r8": "r0=8",
   "3.15-r2": "r0=2",

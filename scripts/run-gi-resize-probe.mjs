@@ -119,6 +119,18 @@ page.on("console", (m) => {
 const DISPOSE_NOW = process.env.GI_RESIZE_DISPOSE_NOW === "1";
 if (DISPOSE_NOW) console.log("  ⚠ BEFORE ARM: __gi2ResizeDisposeNow = true (the pre-4.1 synchronous dispose)");
 
+// ⭐ §19 3.16 — `FLAGS='{"__gi2WorldProbes":true}'` RUNS THIS GATE ON THE WORLD
+// PROBE PATH, OUT OF THE SHIPPING BINARY. §V.8 and §W.10 recorded the same
+// caveat twice in a row: these engine gates run the SHIPPING path because the
+// flip has not happened, so a green tree says the tree is green and says
+// NOTHING about the path being flipped to. The gi2 probes have had this hook
+// since 3.13; the engine gates did not, which is why "the first time the world
+// path runs it" was still true at 3.16.
+await page.evaluateOnNewDocument(
+  (f) => { Object.assign(globalThis, f); },
+  JSON.parse(process.env.FLAGS ?? "{}"),
+);
+
 await page.evaluateOnNewDocument((PROJECT, disposeNow) => {
   if (disposeNow) globalThis.__gi2ResizeDisposeNow = true;
   globalThis.__editorKeepRendering = true;

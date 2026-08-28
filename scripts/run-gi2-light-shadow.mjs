@@ -42,6 +42,17 @@ const browser = await puppeteer.launch({
   ],
 });
 const page = await browser.newPage();
+// ⭐ §19 3.16 — `FLAGS='{"__gi2WorldProbes":true}'` RUNS THIS GATE ON THE WORLD
+// PROBE PATH, OUT OF THE SHIPPING BINARY. §V.8 and §W.10 recorded the same
+// caveat twice in a row: these engine gates run the SHIPPING path because the
+// flip has not happened, so a green tree says the tree is green and says
+// NOTHING about the path being flipped to. The gi2 probes have had this hook
+// since 3.13; the engine gates did not, which is why "the first time the world
+// path runs it" was still true at 3.16.
+await page.evaluateOnNewDocument(
+  (f) => { Object.assign(globalThis, f); },
+  JSON.parse(process.env.FLAGS ?? "{}"),
+);
 await page.setViewport({ width: 1200, height: 800, deviceScaleFactor: 1 });
 page.on("console", (m) => {
   const t = m.text();

@@ -73,6 +73,18 @@
         // kernels exist, and setting one afterwards would do nothing, silently.
         if (params.has("intervals")) globalThis.__gi2Intervals = Number(params.get("intervals"));
         if (params.has("r0")) globalThis.__gi2R0 = Number(params.get("r0"));
+        // §19 3.16 — the three fixes, each its own binary. `fix316=0` turns all
+        // three off and reproduces 3.15 out of the SAME page and shader cache;
+        // `place`/`reach`/`split` isolate one at a time.
+        const fx = params.get("fix316");
+        if (fx !== null) {
+          globalThis.__gi2CoarsePlace = Number(fx);
+          globalThis.__gi2Reach = Number(fx);
+          globalThis.__gi2SplitOwn = Number(fx);
+        }
+        if (params.has("place")) globalThis.__gi2CoarsePlace = Number(params.get("place"));
+        if (params.has("reach")) globalThis.__gi2Reach = Number(params.get("reach"));
+        if (params.has("split")) globalThis.__gi2SplitOwn = Number(params.get("split"));
         if (params.has("perCasc")) globalThis.__gi2BiasPerCasc = Number(params.get("perCasc"));
 
         const THREE = await import("three/webgpu");
@@ -190,6 +202,11 @@
         if (params.has("contact")) gu.contactOn.value = Number(params.get("contact"));
         // §19 3.15's fall-through gate — a UNIFORM, so both readings are one boot.
         if (params.has("covFull") && gu.wpCovFull) gu.wpCovFull.value = Number(params.get("covFull"));
+        // §19 3.16 — the probe-map EMA, as a page-wide parameter. It is only
+        // MEANINGFUL under `SPLIT_OWN`: without the split, `mergePass` writes
+        // `own + T·parent` into the texel the next trace would blend against
+        // and the algebra forces 1 (§W.3). `wpAlpha` there is a bug, not an arm.
+        if (params.has("wpAlpha") && gu.wpAlpha) gu.wpAlpha.value = Number(params.get("wpAlpha"));
         // §19 STAGE 3.12 — the two new levers, same discipline: a candidate has
         // to be able to run the WHOLE page, so they are page-wide parameters
         // and not something only the grain table can set.

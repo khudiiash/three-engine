@@ -55,6 +55,18 @@
         if (params.has("casc")) globalThis.__gi2Cascades = Number(params.get("casc"));
         if (params.has("intervals")) globalThis.__gi2Intervals = Number(params.get("intervals"));
         if (params.has("r0")) globalThis.__gi2R0 = Number(params.get("r0"));
+        // §19 3.16 — the three fixes, each its own binary. `fix316=0` turns all
+        // three off and reproduces 3.15 out of the SAME page and shader cache;
+        // `place`/`reach`/`split` isolate one at a time.
+        const fx = params.get("fix316");
+        if (fx !== null) {
+          globalThis.__gi2CoarsePlace = Number(fx);
+          globalThis.__gi2Reach = Number(fx);
+          globalThis.__gi2SplitOwn = Number(fx);
+        }
+        if (params.has("place")) globalThis.__gi2CoarsePlace = Number(params.get("place"));
+        if (params.has("reach")) globalThis.__gi2Reach = Number(params.get("reach"));
+        if (params.has("split")) globalThis.__gi2SplitOwn = Number(params.get("split"));
 
         const THREE = await import("three/webgpu");
         const TSL = await import("three/tsl");

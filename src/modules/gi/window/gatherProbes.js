@@ -306,6 +306,18 @@ export const STATS = {
   axisKnown: 14, axisMismatch: 27,
   // §19 Stage 3.11a: probes whose anchor STAYED on its world point this frame.
   anchorSticky: 28,
+  // §19 Stage 3.16: the coarse-probe PLACEMENT census. `wpCoarseMoved` counts
+  // cascade > 0 probes whose cell centre was inside geometry and which were
+  // therefore relocated; `wpCoarseFar` counts those that ended up further than
+  // ONE of their own cells away — the quantity 3.15's origin-escape rule made
+  // 14 m at c2 (§W.11) and the in-cell search makes 0 by construction. Slots 15
+  // `wpCoarseOut` counts those that ended up OUTSIDE THE CELL THEY REPRESENT,
+  // which is the rule itself and the discriminating one: 3.15's first escape
+  // step is `1.5 · s_c/2` = 0.75 cells, outside the cell but under one whole
+  // cell, so the ">1 cell" test alone reads 0 on BOTH arms on a thin-walled
+  // scene. Slots 15, 21 and 22 were free; all three are written by
+  // `worldProbes.allocPass` only.
+  wpCoarseMoved: 15, wpCoarseFar: 21, wpCoarseOut: 22,
   // §19 Stage 3.11: the contact band's census — rays whose window hit fell
   // inside it, rays whose screen walk could SEE their path, and rays the
   // screen vouched for and which therefore continued past the hit.

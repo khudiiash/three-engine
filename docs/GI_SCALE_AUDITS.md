@@ -2707,3 +2707,197 @@ again.
 single error in the far field and it is one constant. (2) The cascade extent
 schedule against `RAY_MAX`, which currently disagree by 6x. (3) The 15 m corridor
 row, the one place the merge itself is behind 3.14.
+
+---
+
+## X. STAGE 3.16 — THE THREE MECHANICAL FIXES 3.15's VERDICT NAMED, MEASURED
+
+**One binary, five arms.** `__gi2CoarsePlace`, `__gi2Reach` and `__gi2SplitOwn`
+are read before the build like `__gi2Intervals`; `?fix316=0` on the rig pages
+(and the matching `FLAGS` on the Bistro probes) is 3.15 exactly. Every number
+below is a same-session pair, never a comparison against §W's night.
+
+### X.1 FIX 1 — THE COARSE PROBE STAYS INSIDE ITS OWN CELL
+
+`worldProbes.allocPass`. For `c > 0` a buried cell centre is now placed at the
+nearest FREE point of the 3³ neighbourhood of FINER-cascade cells inside its own
+cell (`s_c/RATIO` = 0.5 m at c1, 2 m at c2), z-outer/y/x-inner, strict `<` on the
+squared offset so ties break deterministically; nothing free means DEAD. `faceN`
+becomes the offset actually taken, because the old rule's face WAS its escape
+direction and a lateral placement has to keep that invariant. c0 keeps 3.13's
+escape verbatim.
+
+⭐ **THE CENSUS IS TAKEN AFTER THE BRANCH, SO IT MEASURES BOTH ARMS**
+(`STATS.wpCoarseMoved` / `wpCoarseFar` / `wpCoarseOut`, three slots dead on this
+path). Corridor, ultra, 700 frames, identical geometry:
+
+| | relocated | > 1 own cell | OUTSIDE its own cell |
+|---|---|---|---|
+| 3.15 | 26 912 | **0** | **26 912 (100 %)** |
+| **3.16** | 26 912 | **0** | **0** |
+
+⛔⛔ **AND THE ROW IT WAS BUILT FOR DOES NOT MOVE: corridor 30 m, 2.930 → 2.926
+against a path-traced 1.0.** §W.6 attributed that row to "a probe pushed outside
+the building measures the sunlit exterior, up to 14 m at c2". The instrument now
+says every relocated coarse probe was indeed outside its cell and none is any
+more, and the 30 m ratio is unchanged to three decimals. **§W.6's mechanism is
+REFUTED.** ⭐⭐ *"> 1 cell" was the wrong statistic and reads 0 on BOTH arms —
+3.15's first escape step is `1.5 · s_c/2` = 0.75 cells, outside the cell but
+under one whole cell. The 14 m figure was arithmetic on the escape budget, not a
+measurement of what the escape did.* What remains at 30 m and 50 m is the
+schedule §W.11 named third: c1's extent is ±32 m and past it only 8 m probes
+exist, so the far half of a 60 m corridor is spatially low-passed — GPU 0.013 /
+0.127 / 0.206 at 15 / 30 / 50 m against a truth of 0.025 / 0.043 / 1.775 is one
+smooth blurred ramp, not two separate errors.
+
+### X.2 FIX 2 — REACH: BUILT, MEASURED, **REVERTED** (ships `__gi2Reach = 0`)
+
+`TEND[NC−1]` becomes the last cascade's own lattice extent (256 m ultra, 64 m
+phone) instead of `RAY_MAX = 40`. `probe:gi2-farfield`, Bistro street-overview,
+pose pinned by the screen arm's own reference, 3417 paired façade pixels:
+
+| far-façade irradiance | screen | reach OFF | reach ON |
+|---|---|---|---|
+| 30–40 m p50 | 1.071 | 2.559 | 2.808 |
+| 40–55 m p50 | 1.243 | 2.353 | 2.621 |
+| **55–75 m p50** | **4.212** | **3.875** | **0.000** |
+| ÷ screen p50 | — | 1.505 | 1.668 |
+| within ±30 % | — | 33.2 % | 27.1 % |
+
+⭐⭐ **A LONGER RAY STOPS MISSING AND STARTS HITTING, AND A HIT ON A BRICK THE
+CACHE HAS NOT LIT YET IS BLACK WHERE THE MISS WAS SKY.** This is §W.3's own
+"a missing parent pays SKY, NOT BLACK" one level down — in the trace instead of
+the merge. The band only the last cascade can answer for went to exactly 0.0000
+on all thirty of its samples. On the corridor, where truth exists, reach is inert
+(50 m 0.119 → 0.116). Kept as an arm; it becomes right the day the last cascade
+can tell "there is nothing there" from "that is not lit yet".
+
+### X.3 FIX 3 — `own` AND `merged` IN SEPARATE WORDS, AND α COMES BACK
+
+⭐⭐ **A THIRD u32 INSIDE `wpOct`, NOT A FOURTH STORAGE BINDING.** The trace
+kernel stands at the portable envelope's six exactly; a `wpOwn` buffer would not
+compile on the phone tier. Stride 2 → 3 words (word 0 merged, 1 moments + T, 2
+own): **66.75 → 90.75 MB at ultra (+24.00), 5.56 → 7.56 on phone**, storage
+buffers still **6 of 6 on both tiers**. `mergeFor` recomposes `merged` from word
+2 every run, so it is idempotent WITHOUT clearing `T`, and the trace is free to
+blend `own` against its own history. `fresh` becomes `ready < 0.75` so a SEEDED
+probe's first trace takes α = 1 — otherwise the parent's merged far chain would
+be blended into the band this probe is supposed to measure for itself, which is
+the exact double-count the split exists to prevent.
+
+| ultra | 3.14 | 3.15 | 3.16 α 0.5 | 3.16 α 0.25 |
+|---|---|---|---|---|
+| cold noise temporal p95 | 0.723 % | 1.576 % | **1.206 %** | **0.729 % PASS** |
+| panel move re-converges | 18 fr | 5 fr | 7 fr | 9 fr |
+| chain ms @1650×970 | 2.544 | 2.396 | 2.407 | 2.486 |
+| orbit sign-flip rate | 6.411 % | 6.062 % | **5.753 %** | 5.759 % |
+| at rest still/flips/p95 | 100/0/0.001 | 100/0/0.001 | **100/0/0.001** | 100/0/0.001 |
+
+▶ **The gate is REACHABLE and 0.5 does not reach it.** 0.25 is §U.2's own value
+and lands on 3.14's own number. 0.5 ships because it is what the stage specified
+and it keeps the panel-move margin; the pair is recorded so the choice is a
+receipt rather than a knob.
+
+⛔ **BUT BISTRO'S MOTION FLIPS DO NOT REACH 3.14's, AND §W's MECHANISM IS ONLY
+HALF RIGHT** (`probe:gi2-motion`, world arm, same session):
+
+| reprojected sign flips | 3.14 (§W) | 3.15 | **3.16** |
+|---|---|---|---|
+| orbit | 26.9 % | 34.6 % | **35.4 %** |
+| dolly | 21.6 % | 31.2 % | **24.2 %** |
+| whip | 17.6 % | 28.2 % | **23.2 %** |
+
+⭐ dolly and whip improve by 7 and 5 points; orbit does not move. And the MOVED
+POPULATION DOUBLES (orbit 22.3 → 43.7 % of reprojected pixels), which is the ramp
+doing exactly what it was asked to do: a probe that ramps changes on more frames
+than one that steps. Two of three arms improved on the rate; the absolute flip
+count did not.
+
+### X.4 THE TABLE (ultra, one session, `?world=1`)
+
+| receipt | 3.12 screen | 3.15 | **3.16** | gate |
+|---|---|---|---|---|
+| Cornell bracketed | — | 8/8 | **8/8** | 8/8 |
+| Cornell within 15 % of the 2-bounce ref | — | 8/8 | **8/8** | — |
+| 5 cm leak (control) | — | 0/10 000 (92.1 %) | **0/10 000 (92.1 %)** | 0 |
+| leak, four rotations | — | 0/10 000 (100 %) | **0/10 000 (100 %)** | 0 |
+| thin-wall interior (control) | — | 0.39 % (0.82) | **0.39 % (0.83)** | ≤ 5 % |
+| trim sub-voxel crops | — | 5/6 | **5/6** (out: `floorByPot`) | 6/6 |
+| at rest still/flips/p95 | — | 100/0/0.001 | **100/0/0.001** | 95/—/0.3 |
+| orbit ÷ parked (paired) | — | 1.019 | **0.994** | — |
+| orbit sign-flip rate | — | 6.062 % | **5.753 %** | ≤ 35 % |
+| panel move re-converges | — | 5 fr | **7 fr** | ≤ 10 |
+| chain ms @1650×970 | — | 2.396 | **2.407** | ≤ 4.0 |
+| storage buffers, worst kernel | — | 6 | **6** | ≤ 6 |
+| cold noise temporal p95 | — | 1.576 % | **1.206 %** ⛔ | ≤ 1 % |
+| lattice bytes (GPU) | — | 66.75 MB | **90.75 MB** | — |
+| coarse probes outside their own cell | — | 100 % | **0 %** | 0 |
+| Bistro doors darkest-1 % ÷ wall (AO off, shared pick n 1124) | 25.5 % | 43.8 % | **34.0 %** ⛔ | ≥ 70 % |
+| corridor 5 / 15 / 30 / 50 m ÷ truth | 1.887/0.741/0.156/0.002 | 1.166/0.461/2.930/0.119 | **1.184/0.511/2.926/0.119** | bracket |
+| corridor bracketed | 2/8 | 3/8 | **3/8** ⛔ | 8/8 |
+| Bistro far façades ÷ screen p50 | 1.000 | 1.505 | **1.505** | — |
+
+**PHONE (two cascades):** Cornell 8/8 · storage buffers 6/6 · chain 2.025 →
+**2.129 ms** · thin-wall **0.19 % against a 0.31 % control** · trim **6/6** ·
+at rest 100/0/0.001 · panel move 6 → **9 fr** · cold noise 1.949 → **1.468 %** ⛔
+· lattice 5.56 → **7.56 MB** · ⛔ **rotated-room leaks rotX20 3/10 000 and
+rotXY20 2/10 000 — IDENTICAL ON BOTH ARMS, i.e. pre-existing and never before
+measured on this tier** (§W's phone paragraph did not run the rotations).
+
+### X.5 ⭐⭐ THE ENGINE GATES, RUN ON THE WORLD PATH FOR THE FIRST TIME
+
+§V.8 and §W.10 both recorded the same caveat — "these run the SHIPPING path
+because the flip did not happen, so they say the tree is green, not that the
+world path is". The gi2 probes have had a `FLAGS` pre-boot hatch since 3.13; the
+engine gates did not. They do now (`FLAGS='{"__gi2WorldProbes":true}'` on all
+five), and the caveat is discharged:
+
+| gate | shipping path | **world path** |
+|---|---|---|
+| `test:gi-sunleak` | PASS | **PASS** |
+| `test:gi-moved-lamp` (+ revert arm) | PASS | **PASS** |
+| `smoke:gi-gpu` | PASS | **PASS** |
+| `run-gi-resize-probe` | PASS 0/0 | **PASS 0/0** |
+| `test:gi2-lightshadow` | PASS ratio 0.041 | ⛔⛔ **FAIL ratio 0.989** |
+
+⛔⛔ **THE GI LIGHT-SHADOW IS ABSENT ON THE WORLD PATH, AND IT IS NOT 3.16's.**
+Shadowed floor ÷ lit floor is 0.041 on the shipping path, **0.989 on 3.16 and
+1.0000 on 3.15** — the shadow is not weak, it is gone. Every structural sub-check
+passes (bundle built, trace + bilateral exist, the light claims a `shadowNode`,
+the slot asks for a gi shadow, the chain is dispatched, the lit floor is lit);
+only "the shadowed floor is dark" fails. ⭐⭐ **This is what a pre-boot hatch
+buys: one gate, first run, and it names a whole missing feature that three
+stages of world-probe receipts could not see.** [[probe-blind-statistics]]
+
+### X.6 THE FLIP VERDICT — `WORLD_PROBES` STAYS `false`
+
+**PASS** — Cornell 8/8 on both tiers · leaks 0/10 000 and four rotations at ultra
+· thin-wall 0.39 % against a 0.83 % control · §T at rest 100 %/0 flips/0.001 % on
+both tiers · orbit ÷ parked 0.994 (3.15: 1.019) and orbit flips 5.753 % (6.062)
+· panel move 7 frames · chain 2.407 / 2.129 ms · storage buffers 6 of 6 on both
+tiers · coarse probes outside their own cell 100 % → 0 % · four of the five
+engine gates on the world path.
+
+**FAIL, and exactly which:**
+1. `test:gi2-lightshadow` on the world path — ratio 0.989 against ≤ 0.2, a whole
+   feature missing. Pre-existing (3.15 reads 1.0000), first ever measured.
+2. corridor bracket 3/8, walls 1/4 — the 30 m and 50 m rows, unchanged by all
+   three fixes and now attributed BY MEASUREMENT to the cascade extent schedule.
+3. cold noise temporal p95 1.206 % against ≤ 1 % at the specified α 0.5;
+   **0.729 % at α 0.25**, so this row is one constant away.
+4. Bistro motion flips 35.4 / 24.2 / 23.2 against 3.14's 26.9 / 21.6 / 17.6.
+5. doors thin-feature 34.0 % against ≥ 70 % — reported, not gated, per §W.8's own
+   note that there is no truth for that crop. The trim rig is the truth for
+   sub-voxel geometry and its one failing crop is `floorByPot` — **the floor
+   beside the pot, the same class as the doors crop**.
+6. phone rotated-room leaks 3/10 000 and 2/10 000 — pre-existing, first measured.
+
+**NOT RUN, and therefore not claimed:** `probe:gi2-boot` (Level/Bistro first
+light and JS heap), so the boot-time and heap rows of the flip gate are
+unmeasured. The `emitterDirect` splice was already removed under world probes at
+3.14 (`gi2System` line 664) and needed no change.
+
+▶ **NEXT, IN ORDER.** (1) `test:gi2-lightshadow` on the world path — a missing
+feature outranks a ratio, and it is now a red test rather than an argument.
+(2) The cascade extent schedule, the only surviving explanation for the
+corridor's 30 m and 50 m rows. (3) α 0.25 — one constant, one measured receipt.
