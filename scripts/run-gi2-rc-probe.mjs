@@ -12,7 +12,7 @@ const w = process.env.W ?? "1280";
 const h = process.env.H ?? "720";
 
 const browser = await puppeteer.launch({
-  executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  executablePath: process.env.CHROME_PATH ?? "C:/Program Files/Google/Chrome/Application/chrome.exe",
   headless: process.env.HEADED ? false : "new",
   args: ["--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage"],
 });

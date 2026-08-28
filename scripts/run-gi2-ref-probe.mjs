@@ -127,7 +127,7 @@ const f = (v, n = 4) => (Number.isFinite(v) ? v.toFixed(n) : "—");
 const med = (a) => (a.length ? a.slice().sort((x, y) => x - y)[Math.floor(a.length / 2)] : NaN);
 
 const browser = await puppeteer.launch({
-  executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  executablePath: process.env.CHROME_PATH ?? "C:/Program Files/Google/Chrome/Application/chrome.exe",
   headless: process.env.HEADED ? false : "new",
   args: [
     "--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage",

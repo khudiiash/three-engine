@@ -24,7 +24,7 @@ const POSE = process.env.POSE ? process.env.POSE.split("|").map((s) => s.split("
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const browser = await puppeteer.launch({
-  executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  executablePath: process.env.CHROME_PATH ?? "C:/Program Files/Google/Chrome/Application/chrome.exe",
   headless: process.env.HEADED ? false : "new",
   args: ["--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage",
     "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding"],
