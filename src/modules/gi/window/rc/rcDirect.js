@@ -255,18 +255,34 @@ export function createRcEmitterDirect({
             // the lamp keeps its contact shadow instead of losing the last
             // 12.5 cm of it.
             const clear = float(slot.radius).max(reff).toVar();
-            const reach = BVH
-              ? d.sub(clear).max(1e-3).toVar()
-              : d.sub(clear).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
+            // The voxel arm's reach and the exact arm's are DIFFERENT NUMBERS,
+            // so both are computed and the branch picks one. Cheap: two
+            // subtractions, no trace.
+            const reachVox = d.sub(clear).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
+            const reachBvh = d.sub(clear).max(1e-3).toVar();
             // ⭐⭐⭐ THE ONE LINE STAGE 5.5b EXISTS FOR. `traceWindow` asks the
             // voxels whether anything is between here and the lamp; `anyHitFrom`
             // asks the TRIANGLES. The difference only shows on a ray that starts
             // ON geometry — which is every ray in this pass — and it is the
             // difference between a lamp-mesh face that is lit and one that is
             // black. See `window/shadowBvh.js`.
-            const h = (BVH
-              ? bvh.anyHitFrom(P, wd, reach, Nf)
-              : traceWindow(P, wd, reach, Nf).hit).toVar();
+            const h = float(0).toVar();
+            if (BVH) {
+              // ⭐⭐ A RUNTIME BRANCH ON A UNIFORM, NOT A JS-TIME CHOICE — and
+              // that is what makes 5.5b free of a mid-session rebuild. Both
+              // arms are compiled into ONE kernel; `readyU` is uniform across
+              // every invocation, so a warp takes one side and the other costs
+              // nothing. When the worker's tree lands, `slot.fill` swaps the
+              // storage attributes and flips this uniform: no pass rebuilt, no
+              // texture re-created, no material left bound to a dead one.
+              If(BVH.readyU.equal(0), () => {
+                h.assign(traceWindow(P, wd, reachVox, Nf).hit);
+              }).Else(() => {
+                h.assign(BVH.anyHitFrom(P, wd, reachBvh, Nf));
+              });
+            } else {
+              h.assign(traceWindow(P, wd, reachVox, Nf).hit);
+            }
             v[k].assign(float(1).sub(h));
           });
         });
