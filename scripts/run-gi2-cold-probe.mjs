@@ -126,6 +126,15 @@ const rig = await page.evaluate(async (opts) => {
             if (L > globalThis.__coldLitT) lit++;
           }
         }
+        // ⚠⚠ EVERY COUNTER EXCEPT `live` READS ZERO THROUGH THIS PATH, AND IT
+        // IS THE INSTRUMENT, NOT THE ENGINE. `getArrayBufferAsync` resolves a
+        // frame or more after the dispatch, by which time the NEXT frame's
+        // `createHashClearPass` has already zeroed FRESH/FAILED/STEPS/NOBLOCK/
+        // BOOSTED/HELD/RETIRED/AGESUM (srcProbes.js:745). `COUNTER_LIVE` is the
+        // one word that pass deliberately does NOT reset, which is exactly why
+        // it is the only one that ever reads non-zero here. Births are
+        // therefore reported as the LIVE DELTA (a lower bound: it nets
+        // retirements out), never as `fresh`.
         let fresh = 0; let live = 0;
         if (rc && readSrcProbeStats) {
           try {
@@ -205,7 +214,11 @@ console.log(`\n  EXCESS BLACK moving: mean ${f(mean(excess), 2)} pp  max ${f(Mat
 const rec = after.pct.findIndex((p) => p <= base + 0.05);
 console.log(`  frames to recover: ${rec < 0 ? `>${RECOVER}` : rec}`);
 console.log(`  black% moving : ${moving.pct.map((p) => p.toFixed(1)).join(" ")}`);
-console.log(`  fresh   moving: ${moving.fr.join(" ")}`);
+console.log(`  fresh   moving: ${moving.fr.join(" ")}   (see the note in frame(): this word is cleared before the readback lands)`);
+{
+  const d = moving.lv.map((v, i) => (i ? v - moving.lv[i - 1] : 0));
+  console.log(`  births>=  moving: ${d.map((v) => (v > 0 ? `+${v}` : v)).join(" ")}`);
+}
 console.log(`  live    moving: ${moving.lv.join(" ")}`);
 console.log(`  meanE   moving: ${moving.rows.map((r) => r.meanE.toFixed(3)).join(" ")}`);
 await browser.close();
