@@ -596,6 +596,21 @@ export function createGi2System({
   let lastVox = null;
   let lastDyn = null;
   let lastGather = null;
+  /**
+   * ⭐⭐⭐ RC5-MARKER — the RC core's own receipts, read alongside `lastGather`.
+   *
+   * Under RC5 the old world-probe lattice is not built (`worldProbes`' LEAN
+   * arm, §19 5.4b), so `lastGather.windowHits` never leaves 0 — it is bumped
+   * only inside `createWorldProbes`' own trace, which RC5 never constructs.
+   * `lastRc` (the deposit's own rays/hits/deposits, same shape as the legacy
+   * SRC path's `stats.rays`) and `lastRcMerge` (the bake's tiles.lit) are what
+   * `stats()`'s first-light line and `transportAlive` read instead, under
+   * `rc` truthy — which is exactly `rc5PathEnabled()` (see `buildGather`'s
+   * `rc = RC5 ? createRcCascades(...) : null`), so `__gi2Rc5 = false` keeps
+   * both markers byte-identical to the pre-RC5 path.
+   */
+  let lastRc = null;
+  let lastRcMerge = null;
 
   // ── camera / lighting mirrors ─────────────────────────────────────────────
   const camPos = new THREE.Vector3();
@@ -1537,22 +1552,51 @@ export function createGi2System({
         const u32 = new Uint32Array(await r.getArrayBufferAsync(gather.buffers.statsBuf.value));
         lastGather = gather.readStats(u32);
         Object.assign(out, lastGather);
+        // ⭐⭐⭐ RC5-MARKER — read the RC core's own receipt alongside the
+        // gather's. `rc` is non-null exactly when `rc5PathEnabled()` was true
+        // at build (see the field's own comment), so this is the "under
+        // rc5PathEnabled() derive from the RC core" branch; `rc` null (the
+        // `__gi2Rc5 = false` control) skips it and the old path is untouched.
+        if (rc) {
+          try {
+            lastRc = await rc.readStats(r);
+            out.rc = lastRc;
+          } catch { /* rc disposed mid-rebuild */ }
+          try {
+            lastRcMerge = await rc.readMergeStats(r);
+            out.rcMerge = lastRcMerge;
+          } catch { /* the inline hit-shading arm builds no `resolve` */ }
+        }
         // §K.8's time-to-first-light: the first frame on which any ray came
         // back from the window with radiance. Stamped from the receipt rather
         // than from a pixel readback — a mean over the frame can be argued
         // about, a hit count cannot.
-        if (!marks.firstLight && (lastGather.windowHits > 0 || lastGather.screenHits > 0)) {
+        //
+        // Under RC5 the window/screen hit counters are the wrong instrument
+        // (see the field comment on `lastRc`) — "any ray came back with
+        // radiance" is instead the deposit's own rays/hits, the same contract
+        // the legacy SRC path already latches `_transportAlive` from.
+        const rcLit = rc && (lastRc?.rays ?? 0) > 0
+          && ((lastRc?.hits ?? 0) > 0 || (lastRcMerge?.tiles?.lit ?? 0) > 0);
+        const oldLit = lastGather.windowHits > 0 || lastGather.screenHits > 0;
+        if (!marks.firstLight && (rc ? rcLit : oldLit)) {
           marks.firstLight = performance.now();
           out.msToFirstLight = Math.round(marks.firstLight - t0);
           out.firstLightFromSceneOpenMs = firstLightFromSceneOpen();
           console.log(
-            `[gi2] first light — ${lastGather.probesValid} valid probes, ` +
-            `${lastGather.windowHits} window hits / ${lastGather.screenHits} screen hits / ` +
-            `${lastGather.skyMiss} sky, ${out.msToFirstLight} ms after the GI2 build started` +
-            // §R: the headline. Quoted second, so the build-relative number the
-            // whole stage has been read against stays legible next to it.
-            (out.firstLightFromSceneOpenMs != null
-              ? ` — ${out.firstLightFromSceneOpenMs} ms FROM SCENE OPEN` : ""),
+            rc
+              ? `[gi2] first light — ${lastGather.probesValid} valid probes, ` +
+                `${lastRc.hits} rc hits / ${lastRcMerge?.tiles?.lit ?? 0} lit tiles, ` +
+                `${out.msToFirstLight} ms after the GI2 build started` +
+                (out.firstLightFromSceneOpenMs != null
+                  ? ` — ${out.firstLightFromSceneOpenMs} ms FROM SCENE OPEN` : "")
+              : `[gi2] first light — ${lastGather.probesValid} valid probes, ` +
+                `${lastGather.windowHits} window hits / ${lastGather.screenHits} screen hits / ` +
+                `${lastGather.skyMiss} sky, ${out.msToFirstLight} ms after the GI2 build started` +
+                // §R: the headline. Quoted second, so the build-relative number the
+                // whole stage has been read against stays legible next to it.
+                (out.firstLightFromSceneOpenMs != null
+                  ? ` — ${out.firstLightFromSceneOpenMs} ms FROM SCENE OPEN` : ""),
           );
         }
         // ⭐⭐ §19 3.17 — THE PER-CASCADE LIVE COUNT, IN THE RECEIPT EVERY PROBE
@@ -1798,6 +1842,20 @@ export function createGi2System({
       } catch { /* a context three did not track — the seed's fallback covers it */ }
     },
     get transportAlive() {
+      // ⭐⭐⭐ RC5-MARKER — `windowHits` is the old world-probe lattice's own
+      // counter (§19 5.4b: not built under RC5), so it never leaves 0 on this
+      // path; the RC core's deposit hits (+ the bake's lit tiles) are the
+      // equivalent "rays fired AND something deposited" receipt. `rc` is
+      // non-null exactly under `rc5PathEnabled()` — see its declaration.
+      //
+      // ⚠ NOT GATED ON `lastGather.probesValid` — that counts SCREEN probes
+      // (`gatherProbes`' own placement pass), a different population from the
+      // cascades' rays, and it read 0 on a live Cornell RC5 boot (25101 tiles
+      // lit) — gating on it here would have kept this exact fix dead.
+      if (rc) {
+        return (lastRc?.rays ?? 0) > 0
+          && ((lastRc?.hits ?? 0) > 0 || (lastRcMerge?.tiles?.lit ?? 0) > 0);
+      }
       return (lastGather?.probesValid ?? 0) > 0 && (lastGather?.windowHits ?? 0) > 0;
     },
     dispose() {
