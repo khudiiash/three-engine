@@ -1170,6 +1170,62 @@ export function createGiGather({
      * face is revisited) instead of two that multiply.
      */
     nCapU: uniform(1),
+    /**
+     * ⭐⭐ §19 STAGE 4.5 — THE CACHE'S PLANE SMOOTHER, `w`. 0 is 4.4 exactly.
+     *
+     * See `radianceCache.cacheAccumFn`. §AD measured the whole of this wall's
+     * radiance in the SECOND BOUNCE — every sky ray hits, the sun never does,
+     * the NEE is zero — which makes the estimator a Neumann iteration over the
+     * cache's own field and its spatial noise self-sustaining. `w` is how much
+     * of a face's write is its six valid neighbours' mean; the operator is
+     * row-stochastic, so it is a smoother and not a gain.
+     *
+     * ⚠ A UNIFORM, SO BOTH ARMS COME OUT OF ONE BINARY, ONE SHADER CACHE AND
+     * ONE BOOT. The whole §AD table is measured by settling, flipping this, and
+     * settling again inside a single run — which is also the only way to keep
+     * the before and after on one wall, at one pose, with one voxelization.
+     */
+    // ⭐ 0.85 IS MEASURED, NOT CHOSEN. §AD's width sweep, one boot, one wall,
+    // four arms — w 0 / 0.5 / 0.85, cold-fill off — moved the adjacent-face pair
+    // p50 19.1 → 17.3 → 16.9 % and its p90 59.6 → 54.7 → 50.7 %, with the
+    // brick's stored σ/mean 12.5 → 11.5 → 10.1 %. The mean face radiance over
+    // the same sweep held at −0.7 % and −2.2 %, which is the ENERGY CONTROL: a
+    // row-stochastic operator cannot move the mean, and a sweep that did would
+    // have said the weights were wrong before any gate ran.
+    cacheSmoothU: uniform(0.85),
+    /**
+     * ⭐⭐ §19 STAGE 4.5 — A COLD HIT IS "NO DATA", NOT "BLACK". 0 is 4.4 exactly.
+     *
+     * A cosine ray that lands on a voxel face no producer has written yet reads
+     * `valid = 0` and contributes EXACTLY ZERO to the quadrature — while still
+     * counting in its denominator. On §AD's wall 8.1 % of the sky rays land that
+     * way, so the term carries a binary ±1/4 step per face on top of a
+     * systematic deficit, and which faces are cold is decided by ray arrival
+     * order rather than by the scene. §19 3.17 already made this argument for
+     * the PRIMARY hit (`unlitFallback`: "a longer ray stops missing and starts
+     * hitting, and a cold hit was black where the miss was sky"); this is the
+     * same lesson one bounce deeper, and the cheapest honest answer is to divide
+     * by the samples that carried information instead of by all four.
+     *
+     * ⚠ AND THE DENOMINATOR IS FLOORED AT HALF THE RAY COUNT, WHICH IS THE WHOLE
+     * SAFETY ARGUMENT. Reweighting says "the directions I could not measure look
+     * like the ones I could" — true for a façade whose neighbours are simply not
+     * shaded yet, false for a sealed room where COLD means dark. Flooring at
+     * `SKY_RAYS/2` bounds the extrapolation at 2×: a face that measured one
+     * informative direction of four cannot quadruple itself, and a face with
+     * none stores zero exactly as before. The corridor and doors receipts are
+     * where that bound is checked.
+     */
+    // ⛔ MEASURED AND NOT SHIPPED, WHICH IS WHY THE ARM IS STILL HERE. Cold-fill
+    // is the best single lever §AD found on the cache's spread — with w 0.85 it
+    // took the brick's stored σ/mean 10.1 → 6.3 % — and it costs ENERGY: +8.4 %
+    // on the wall's mean radiance in one run and +11.0 % in another, straddling
+    // the ≤ 10 % gate rather than passing it. A gate a change passes on some
+    // runs is a change that fails. It is also the one term here that
+    // EXTRAPOLATES — it pays an unmeasured direction the mean of the measured
+    // ones — so it is exactly the arm that should not ship on a receipt this
+    // thin. Flip it with the doors and corridor gates in the same run.
+    coldFillU: uniform(0),
     /** §P.2's sky ray at every shade sample. 0 removes the term. */
     skyAtHit: uniform(1),
     /** §P.3's mature share. `rayBudget` scales it; 0 restores a flat `R`. */
@@ -2147,7 +2203,25 @@ export function createGiGather({
   // shape in which "one representation per emitter" is safe.
   const PANEL_RIG = !emitters?.length && crops > 0;
   const emOf = (v) => (PANEL_RIG ? v.mul(float(1).sub(u.panelNee)) : v);
-  const shadeHit = (p, n, levelF, voxF, seedU = null) => {
+  /**
+   * ⭐⭐ §19 STAGE 4.5 — `shadeHit`, SPLIT INTO ITS TERMS SO A RECEIPT CAN WEIGH
+   * THEM. One implementation, two consumers.
+   *
+   * §AC named the fault ("the variance is in the radiance cache, not in the
+   * probes") and then had to guess which HALF of the estimator carries it — the
+   * 4-ray sky quadrature, the binary sun shadow ray, the second bounce the
+   * cosine rays read back, or the emitter NEE. A guess is exactly what
+   * [[gi-colour-probe-method]] forbids: read every stage, the first wrong one is
+   * the source. So the terms are accumulated SEPARATELY and summed at the end;
+   * `shadeHit` is that sum, byte for byte, and `scripts/lib/gi2FaceTermProbe.js`
+   * builds its own kernel around the same function and writes each term out.
+   *
+   * ⚠ THE PROBE MUST MEASURE THE SHIPPING ESTIMATOR, NOT A COPY OF IT. A second
+   * transcription of this body into a harness lib would have been a third place
+   * for the Duff frame, the Hammersley azimuth and the `hem` subtraction to
+   * drift, and a receipt that measures a drifted copy is worse than no receipt.
+   */
+  const shadeTerms = (p, n, levelF, voxF, seedU = null) => {
     const pi = palIndexAt(levelF, voxF).toVar();
     const pal = palU.element(pi).toVar();
     // ⭐⭐ §19 STAGE 4.0b — THE EMITTER GATE'S DECISION, ALREADY MADE ON THE CPU.
@@ -2170,13 +2244,21 @@ export function createGiGather({
     // See `#gi2SlotEmissive` in GISystem — the decision is not re-derived here
     // and must not be. This shader only reads the table.
     const palEm = palEmU.element(pi).toVar();
-    const E = vec3(0).toVar();
+    // The four terms, each in its own accumulator. `E` below is their sum and
+    // is what the estimator has always computed.
+    const Esun = vec3(0).toVar();
+    const Emiss = vec3(0).toVar();
+    const Ebnc = vec3(0).toVar();
+    const Enee = vec3(0).toVar();
+    /** (sun visibility 0/1, sky rays that MISSED, sky rays that hit a WARM face). */
+    const census = vec3(0).toVar();
 
     const toSun = u.sunDir.negate().normalize().toVar();
     const ndl = dot(n, toSun).max(0).toVar();
     If(ndl.greaterThan(0.001), () => {
       const sh = traceWindow(p, toSun, RAY_MAX, n).hit.toVar();
-      E.addAssign(u.sunColor.mul(ndl).mul(float(1).sub(sh)));
+      Esun.addAssign(u.sunColor.mul(ndl).mul(float(1).sub(sh)));
+      census.x.assign(float(1).sub(sh));
     });
 
     // ══ THE SKY, AT THE HIT (§19 Stage 3.7 P.2) ═══════════════════════════
@@ -2239,7 +2321,8 @@ export function createGiGather({
       // buy the same variance reduction as one sky ray at `p_shade = 1`, for a
       // third of the cost, because the sun ray and the four NEE rays are paid
       // ONCE per shade sample instead of four times.
-      const acc = vec3(0).toVar();
+      const accHit = vec3(0).toVar();
+      const accMiss = vec3(0).toVar();
       Loop({ start: 0, end: SKY_RAYS, name: "skyRay" }, ({ skyRay }) => {
         // ⚠ `skyRay` IS A NODE, NOT A JS NUMBER. The first cut of this loop did
         // `skyRay % SKY_STRATA` and `skyRay * 0x9e3779b9` in JavaScript; both
@@ -2332,12 +2415,22 @@ export function createGiGather({
           // and the subtraction then correctly removes NOTHING, because the
           // cache no longer holds the emission to remove.
           const hem = emOf(palEmU.element(palIndexAt(hlv, hvx)).xyz).toVar();
-          acc.addAssign(c2.xyz.mul(c2.w).sub(hem).max(vec3(0)));
+          accHit.addAssign(c2.xyz.mul(c2.w).sub(hem).max(vec3(0)));
+          census.z.addAssign(c2.w);
         }).Else(() => {
-          acc.addAssign(u.skyColor);
+          accMiss.addAssign(u.skyColor);
+          census.y.addAssign(1);
         });
       });
-      E.addAssign(acc.mul(Math.PI / SKY_RAYS));
+      // §19 4.5: the divisor is the INFORMATIVE sample count, floored at half
+      // the ray count — see `coldFillU`. With every ray informative (the common
+      // case) this is `Math.PI / SKY_RAYS` exactly, so the arm is free where it
+      // has nothing to correct.
+      const nInfo = census.y.add(census.z).toVar();
+      const denom = select(u.coldFillU.greaterThan(0.5),
+        nInfo.max(float(SKY_RAYS * 0.5)), float(SKY_RAYS)).toVar();
+      Ebnc.addAssign(accHit.mul(Math.PI).div(denom));
+      Emiss.addAssign(accMiss.mul(Math.PI).div(denom));
     });
 
     // ══ THE EMITTER SLOTS, AT THE HIT (§19 Stage 3.5) ═════════════════════
@@ -2401,7 +2494,7 @@ export function createGiGather({
           const omega = float(Math.PI).min(float(Math.PI).mul(reff.mul(reff)).div(d2)).toVar();
           const reach = d.sub(reff).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
           const vis = float(1).sub(traceWindow(p, wd, reach, n).hit).toVar();
-          E.addAssign(rgb.mul(omega).mul(cosX).mul(vis));
+          Enee.addAssign(rgb.mul(omega).mul(cosX).mul(vis));
         });
       });
     }
@@ -2498,14 +2591,25 @@ export function createGiGather({
           If(want, () => {
             const tStop = yStop.sub(pRay.y).div(wd.y.max(1e-3)).min(d).max(0.05).toVar();
             const vis = float(1).sub(traceWindow(p, wd, tStop, n).hit).toVar();
-            E.addAssign(u.panelRadiance.mul(cosX).mul(cosP)
+            Enee.addAssign(u.panelRadiance.mul(cosX).mul(cosP)
               .mul(u.panelArea.mul(takeIt ? 1 : 0.25)).div(d2).mul(vis));
           });
         }
       }
     });
 
-    return pal.xyz.mul(1 / Math.PI).mul(E).add(emOf(palEm.xyz));
+    return { pal, palEm: emOf(palEm.xyz), Esun, Emiss, Ebnc, Enee, census };
+  };
+
+  /**
+   * The estimator itself: albedo/π against the sum of the four terms, plus the
+   * face's own emission. Unchanged since 3.12 — only the accumulators above it
+   * were split.
+   */
+  const shadeHit = (p, n, levelF, voxF, seedU = null) => {
+    const t = shadeTerms(p, n, levelF, voxF, seedU);
+    const E = t.Esun.add(t.Emiss).add(t.Ebnc).add(t.Enee).toVar();
+    return t.pal.xyz.mul(1 / Math.PI).mul(E).add(t.palEm);
   };
 
   // ══════════════════════════ §19 STAGE 3.13 — WHAT A RAY BRINGS BACK ════════
@@ -2575,7 +2679,7 @@ export function createGiGather({
       If(fresh.or(u.shadeProb.greaterThan(0).and(track)), () => {
         const s = shadeHit(hp, hn, levelF, voxF, uint(1)).toVar();
         // `.toVar()` is load-bearing — see `probeTracePass`'s note.
-        cache.cacheAccum(levelF, voxF, faceF, s, u.nCapU).toVar();
+        cache.cacheAccum(levelF, voxF, faceF, s, u.nCapU, u.cacheSmoothU).toVar();
         If(fresh, () => {
           if (unlitFallback) {
             // `palAt` is the same albedo `shadeHit` multiplies its own E by, so
@@ -3132,7 +3236,7 @@ export function createGiGather({
           // 2026-08-27: 614 bricks owned a slot and 0 of 239 872 slot words
           // carried radiance. Anything called for its SIDE EFFECT has to be
           // pinned to the stack.
-          cache.cacheAccum(levelF, voxF, faceF, s, u.nCapU).toVar();
+          cache.cacheAccum(levelF, voxF, faceF, s, u.nCapU, u.cacheSmoothU).toVar();
           If(fresh, () => {
             rad.assign(s);
             bump(STATS.freshShades, xr);
@@ -4961,6 +5065,8 @@ export function createGiGather({
     worldProbes: useWorld, world: world?.describe() ?? null,
     metaVec: META_VEC, matureRays: MATURE_RAYS, rayFresh: RAY_FRESH, rayFlag: RAY_FLAG,
     shadeProb: u.shadeProb.value, nCap: u.nCapU.value, skyRays: SKY_RAYS,
+    // §19 4.5's two arms, printed rather than believed.
+    cacheSmooth: u.cacheSmoothU.value, coldFill: u.coldFillU.value,
     // §19 3.12's three, so a receipt can print the configuration it measured
     // instead of the configuration someone believes shipped.
     probeDither: u.probeDither.value, panelNee: u.panelNee.value,
@@ -4988,6 +5094,17 @@ export function createGiGather({
     /** §19 3.13 — the configuration, for a consumer that has to branch on it. */
     worldProbes: useWorld, world,
     uniforms: u, palette, paletteEmissive, setPalette, beginFrame, get frame() { return frame; },
+    /**
+     * §19 Stage 4.5. The shade estimator's own pieces, for a RECEIPT kernel that
+     * has to weigh them term by term (`scripts/lib/gi2FaceTermProbe.js`).
+     *
+     * ⚠ NOTHING IN THE ENGINE MAY DISPATCH THROUGH THESE. They are node
+     * factories, not passes: a harness lib composes them into its own kernel and
+     * that kernel is built only when a receipt asks for it (§19 Stage 4.3a's
+     * rule). Exporting them is what keeps the receipt measuring the SHIPPING
+     * estimator instead of a transcription of it.
+     */
+    internals: { shadeTerms, shadeHit, dominantFace, faceSamplePoint, cellOfWorld, palAt },
     buffers: {
       probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf,
       shadeIn, shadeOut, exhaustOut, noiseBuf, dirtyBuf, reprojBuf, motionLum,

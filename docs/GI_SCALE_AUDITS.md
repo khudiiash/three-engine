@@ -3955,3 +3955,209 @@ drives a view · **5 resize hops × 3 views ON leave 0 destroyed-texture errors*
 Standing gates re-run green on this tree: `smoke:gi-gpu` (0 FAIL),
 `test:gi-moved-lamp` (Δnew 29.06 > 12), `probe:gi-resize` (ALL PASS — 0
 uncaptured device errors, 0 destroyed textures, fast round trip 0 pipelines).
+
+## §AD — THE PUDDLES, NAMED: THE SECOND BOUNCE IS THE WHOLE TERM (08-28)
+
+§AC proved the variance lives in the radiance cache's per-face values and could
+not say **which of the four things `shadeHit` adds** produces it. That mattered,
+because the four have four different fixes: a 4-ray sky quadrature is fixed by
+directions, a binary sun by a small cone, a cold second bounce by what a miss
+pays, and an emitter NEE nowhere near here.
+
+### AD.1 — the instrument: the shipping estimator, split at the source
+
+`probe:gi2-faceterm` (`scripts/run-gi2-faceterm-probe.mjs`,
+`scripts/lib/gi2FaceTermProbe.js`). `shadeHit` was refactored into `shadeTerms`,
+which accumulates the sun, the sky-miss, the bounce and the NEE into four
+separate registers and returns them; `shadeHit` is their sum, and the probe's
+kernel calls the SAME function and writes each register out.
+
+⭐ **A RECEIPT MUST MEASURE THE SHIPPING ESTIMATOR, NOT A TRANSCRIPTION OF IT.**
+A second copy of the Duff frame, the Hammersley azimuth and the `hem`
+subtraction in a harness file would have been a third place for them to drift.
+
+**Three blindnesses had to be removed before any number meant anything**, and
+all three printed a full, well-formatted table of zeros:
+
+1. ⭐⭐ **"FIRE IT TWICE" IS A RULE SIZED FOR A 64-RAY KERNEL.** The doors and
+   far-field probes both record that a fresh compute node's first `computeAsync`
+   compiles rather than runs. This kernel inlines the whole of `shadeHit`; two
+   dispatches were still not enough, with **no validation error and no rejected
+   promise** — `pushErrorScope` came back clean. A WITNESS pass (same
+   `instancedArray`, same 4096-wide dispatch, a body of one assignment) wrote all
+   4096 slots while the real one wrote none, which localised it to the body in
+   one battery instead of an argument. The fix is to dispatch, WAIT, read back,
+   and repeat until the thread index each thread stamps into its last output word
+   appears. **Every thread stamps its own index precisely because every real
+   channel may legally be zero** — "0.0 % of the faces written, 100 % of the sky
+   rays hit a COLD face" reads exactly like an unlit wall.
+2. ⭐⭐ **THE WALL IS A STAIRCASE, SO A BRICK LAYER IS THE WRONG POPULATION.**
+   §AC's wall runs at 45° to both horizontal axes; its conservative voxelization
+   steps diagonally, and the SAT's area-weighted argmax gives neighbouring steps
+   different dominant axes. Scoring the 16 voxels of one axis-aligned brick layer
+   found FOUR bricks in the whole frame. The population is every occupied voxel
+   of the bricks the rays hit whose dominant face is the wall's, at any layer.
+3. ⭐ **AND THE FIRST CUT VOTED ON THE RAY'S ENTRY FACE.** §19 3.9's own lesson,
+   forgotten one file over: 95 % of Bistro's façade voxels carry all six blocking
+   bits, so a grazing ray on this wall files its hit under −X. The vote must use
+   the voxel's dominant face — `gatherProbes.dominantFace`'s rule, transcribed
+   for the CPU.
+
+⚠ **AND `[gi2] first light NEVER` IS NOW A FATAL IN THIS PROBE.** A broken shader
+module produced a complete table of zeros AND a VERDICT block comparing two arms
+of them. A receipt that can report a pass on a chain that never lit is worse than
+no receipt.
+
+### AD.2 — the term, and it is not close
+
+Bistro, ultra, §AC's pose, 40 occupied faces on the wall, world path:
+
+| term | σ(term)/mean(total) | **share of the mean** |
+|---|---|---|
+| sun | — | **0.0 %** |
+| sky (miss) | — | **0.0 %** |
+| **bounce (the cache, read back)** | **20.0 %** | **100.0 %** |
+| emitter NEE | — | **0.0 %** |
+
+The census says why: **the sun is invisible from every face on this wall, and
+NOT ONE of the four sky rays ever misses** — a Paris street is a canyon, so every
+ray hits geometry (91.9 % a warm face, 8.1 % a cold one).
+
+⭐⭐ **SO THE ESTIMATOR IS A NEUMANN ITERATION OVER THE CACHE'S OWN FIELD.** A
+face's value is the mean of four other faces' values, which means any spread the
+cache carries is re-injected into every face that looks at it. That is a
+qualitatively different fault from "a 4-sample estimate is noisy": the noise is
+SELF-SUSTAINING, and more rays fired into a noisy field buy less than they should.
+
+Baseline spread on that wall: adjacent-face pairs `|La−Lb|/max` **p50 21.1 %,
+p90 77.0 %** (both faces above 10 % of the wall mean: p50 19.1 %, p90 59.6 %);
+brick σ/mean p50 20.0 %; what the cache STORES, σ/mean 12.5 %.
+
+⚠ The unfloored pair p90 pinned at **exactly 77.0 %** across arms that differ
+everywhere else — a tail of pairs where one face is essentially black, so the
+ratio is 1 by construction and no smoother can move it. The puddle probe's own
+FLOOR discipline, applied one layer down.
+
+### AD.3 — the fix: a plane smoother at the WRITE
+
+`radianceCache.cacheAccumFn` blends the estimate toward the mean of the face's
+six AXIS neighbours at the same face id: `mix(estimate, neighbourhood mean, w)`.
+
+- **At the write, not the read.** Six neighbour reads per SHADE (~10⁴ a frame),
+  not per ray HIT (~10⁵). It also smooths the field every LATER bounce reads, so
+  one sweep pays into the whole iteration.
+- **An IIR, not a 7-tap box.** A sweep runs every time the face is revisited, so
+  the converged kernel is ~√(w/(1−w)) cells wide — [[gi-vxao-rebuild]]'s "width
+  is the cheap axis", applied to a cache instead of to an AO filter.
+- **Six axis neighbours, not a tangential 3×3** — see the staircase above; a
+  tangential filter would have found two valid taps of eight on this very wall.
+- **An invalid tap is dropped, never averaged in as black**, or every silhouette
+  darkens by the open fraction of its neighbourhood.
+- ⭐ **ENERGY IS PRESERVED BY CONSTRUCTION**: `1−w` on self and `w/k` on the k
+  valid neighbours sum to 1, so the operator is row-stochastic and can only move
+  light ALONG a surface.
+
+### AD.4 — the width sweep (one boot, one wall, one face list)
+
+Cold-fill OFF in the first three arms, which makes the sweep its own ENERGY
+CONTROL: a row-stochastic operator must hold the mean, and one that did not would
+have said the weights were wrong before any gate ran.
+
+| arm | pair p50 | LIT p50 | LIT p90 | brick σ/mean | stored σ/mean | mean E | ΔE |
+|---|---|---|---|---|---|---|---|
+| w 0 (4.4) | 21.1 % | 19.1 % | 59.6 % | 20.0 % | 12.5 % | 0.02687 | — |
+| w 0.5 | 19.0 % | 17.3 % | 54.7 % | 19.3 % | 11.5 % | 0.02667 | **−0.7 %** |
+| **w 0.85 (ships)** | **17.3 %** | **16.9 %** | **50.7 %** | **19.1 %** | **10.1 %** | 0.02627 | **−2.2 %** |
+| w 0.85 + cold-fill | 16.6 % | 16.0 % | 49.1 % | 17.6 % | **6.3 %** | 0.02913 | **+8.4 %** |
+
+### AD.5 — cold-fill: MEASURED AND NOT SHIPPED
+
+A cosine ray landing on a face no producer has written reads `valid = 0`,
+contributes exactly zero, and still counts in the denominator. `coldFillU`
+divides by the INFORMATIVE sample count instead, floored at half the ray count so
+the extrapolation is bounded at 2×. It is the best single lever found — stored
+σ/mean 10.1 → 6.3 % — and it costs **+8.4 % of the wall's mean radiance in one
+run and +11.0 % in another**, straddling the ≤ 10 % energy gate rather than
+passing it. ⛔ **A gate a change passes on some runs is a change that fails.** It
+is also the one term here that EXTRAPOLATES — it pays an unmeasured direction the
+mean of the measured ones. `coldFillU = 0` ships; the arm stays in the binary for
+a run that can afford the doors and corridor gates on it.
+
+### AD.6 — the image, and one clean negative
+
+`probe:gi2-puddle`, §AC's pose, wall second difference p90:
+
+| lag | world 4.4 | **world 4.5** | screen 4.4 | screen 4.5 |
+|---|---|---|---|---|
+| 4 | 2.62 % | 2.54 % | 4.58 % | 4.56 % |
+| **8 (tile)** | **7.53 %** | **6.43 %** | **12.10 %** | **12.13 %** |
+| 16 | 14.62 % | 13.51 % | 31.47 % | 31.49 % |
+| 32 | 20.07 % | 18.23 % | 56.50 % | 56.02 % |
+
+**Every lag moves the same way on the world path**, which is the shape that says
+a real change rather than a run-to-run wobble. It is a **15 % improvement, not
+the 2× this stage was aiming for** — the target was < 4 %.
+
+⭐⭐ **AND THE SCREEN PATH DOES NOT MOVE AT ALL (12.10 → 12.13 %), WHICH IS
+EVIDENCE AND NOT A DISAPPOINTMENT.** The cache is shared by both paths, so a fix
+inside it must move both — unless the screen path's puddles are dominated by
+something else. §AC.6 already measured that path at 3.6–4× worse at this
+separation, with a probe grid that RE-ANCHORS as the camera moves. **The cache
+carries the world path's puddles; it does not carry the screen path's.**
+
+### AD.7 — what is left, and what would pay
+
+The residual is not spatially uncorrelated noise — the sweep flattens (w 0.5 →
+0.85 buys 1.7 points of pair p50 against the first step's 2.1), which is what a
+STRUCTURED residual looks like. That structure is the 4-direction quantization
+itself: which four faces a shade point happens to see. The remaining levers are
+therefore about DIRECTIONS, and both were costed and neither was run:
+
+- **more sky rays at once** — 4 → 16 is ~×1.5 on `probeTrace`'s ray count, which
+  the 60 fps floor cannot obviously absorb on Bistro;
+- **a fixed sequence of direction subsets accumulated over updates** (4 sets of 4
+  over four re-shades) — free in rays, but it is a 4× brake on exactly the
+  Neumann iteration AD.2 identifies, and §19 3.10 already retracted `nCap = 16`
+  for being a 16× one.
+
+### AD.8 — the gates (world path, shipped default, 08-28)
+
+| gate | 4.4 | **4.5** |
+|---|---|---|
+| `probe:gi2-puddle` world, tile lag p90 | 7.53 % | **6.43 % PASS (< 10 %)** |
+| `probe:gi2-puddle` screen, tile lag p90 | 12.10 % | 12.13 % FAIL (unmoved) |
+| face σ/mean, brick, p50 | 20.0 % | **19.1 %** |
+| stored σ/mean, brick, p50 | 12.5 % | **10.1 %** |
+| wall mean face radiance | 0.02687 | **0.02627 (−2.2 %, ≤ 10 % PASS)** |
+| Cornell bracketed, 4 rig variants | 8/8 | **8/8 PASS** |
+| chain ms @1650×970 (rig, ultra) | — | **2.406 PASS (≤ 4)** |
+| storage buffers, worst kernel | 6 | **6 PASS** (`gi2.worldTrace` 79 → 87 kB WGSL) |
+| doors: recess ÷ wall irrBefore | 101.7 % | **101.8 %** — no dark recess, no leak |
+| `test:gi-moved-lamp` | Δnew 29.06 | **PASS, Δnew 29.06** |
+| `smoke:gi-gpu` | PASS | **PASS** (the phone-tier arm runs the smoother too) |
+| `probe:gi2-motion` gates failed | 5 | **5** |
+| orbit MAX frame ms | 28.60 | **29.40** (limit ≤ 33 PASS) |
+| orbit frames > 50 ms | 0 | **0 PASS** |
+| orbit voxelize chain GPU MAX | — | **2.85 ms PASS (≤ 3)** |
+
+⚠ **NOT RE-CAPTURED: the Bistro sign-flip census** against its `reprojNull`
+floor. The Cornell rig's own flip gate reads 5.69 % against a 35 % limit, and the
+smoother is purely SPATIAL and applied at the write, so it cannot add temporal
+noise — but that is an argument, not a receipt.
+
+⚠ **NOT RUN: `probe:gi2-corridor`.** The gather rig's own leak gate passed in the
+same session.
+
+### AD.9 — two traps that cost a battery each
+
+- ⚠⚠ **`smooth` IS A RESERVED WGSL KEYWORD, AND A LAYOUT'S INPUT NAME *IS* THE
+  PARAMETER NAME.** `{ name: "smooth", type: "float" }` produced
+  `[Invalid ShaderModule "compute"]`, four §12.56 watchdog re-rolls, "transport
+  never produced light", and no first light. Nothing about that name reaches JS,
+  so it reads as a free choice and is not one.
+- ⛔ **AND THE LEADING THEORY FOR THAT FAILURE WAS WRONG.** "A `sharedFn` must not
+  be called from inside another `sharedFn`" is plausible, is consistent with
+  `giFn.js`'s header, matched the symptom exactly — and was refuted by the
+  module's own message the moment the console was READ instead of filtered for the
+  patterns someone expected. [[gi-colour-probe-method]]: take the FIRST thing the
+  failing stage says, not the most interesting thing it might have meant.

@@ -83,7 +83,7 @@
 // module's memory names): every read here is an `atomicLoad` whose VALUE is
 // then compared.
 import {
-  Fn, If, Loop, atomicAdd, atomicLoad, atomicStore, atomicSub, bitAnd, bitOr, ceil, exp2, float,
+  Fn, If, Loop, atomicAdd, atomicLoad, atomicStore, atomicSub, bitAnd, bitOr, ceil, exp2, float, int,
   instanceIndex, instancedArray, log2, max, mix, select, shiftLeft, shiftRight, storage, uint, vec3,
   vec4,
 } from "three/tsl";
@@ -107,6 +107,13 @@ export const SLOT_CNT_WORDS = SLOT_WORDS / 4; // 96
  * cache still track a moved lamp.
  */
 export const CACHE_N_CAP = 16;
+
+/**
+ * §19 Stage 4.5's plane smoother steps one cell at a time through the TOROIDAL
+ * voxel index (64 cells per axis), with the same wrap rule every other
+ * neighbour read in this chain uses.
+ */
+const N_MASK = 63;
 
 /** Pool size by tier (PLAN §4.6: phone 8 MB-class, desktop 32 k bricks). */
 export const CACHE_TIERS = {
@@ -267,6 +274,40 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
   // makes this one WGSL function per shader instead of an inlined body at every
   // call site (see `giFn.js`), and floats keep the signature portable across the
   // three call sites (probe trace, injection, relight) without a cast rule.
+  /**
+   * The read, INLINE — the body `cacheReadFn` wraps, as a plain JS composer so
+   * that a caller which is ITSELF a `sharedFn` can use it.
+   *
+   * The plane smoother needs a neighbour's word from inside `cacheAccumFn`,
+   * which is itself a `sharedFn`. Splitting the body out is the conservative
+   * shape for that: nothing else in this chain calls one layout'd function from
+   * inside another (`shadeHit` and `hitRadiance` call `traceWindow` and
+   * `cacheRead`, but those callers are plain JS inlined into the kernel), and
+   * `giFn.js`'s header is a long account of how this class of codegen fails.
+   *
+   * ⛔ NESTING IS NOT WHAT KILLED THE SMOOTHER'S FIRST BUILD, and the refuted
+   * theory is recorded here because it cost a battery. That build came back
+   * `[Invalid ShaderModule "compute"]` with the watchdog re-rolling four times
+   * and no first light; nesting was the leading suspect and the split was made
+   * on it. The module's own message — once the console was READ instead of
+   * filtered for the patterns someone expected — said `error: 'smooth' is a
+   * reserved keyword`, which is the layout input name three lines below.
+   * [[gi-colour-probe-method]]: read the stage that failed and take the FIRST
+   * thing it says, rather than the most interesting thing it might have meant.
+   * The split is kept because it is cheaper, not because it fixed anything.
+   */
+  const readInline = (levelU, voxelU, faceU0) => {
+    const { mapIdx, lv, faceU } = addressOf(levelU, voxelU, faceU0);
+    const m = atomicLoad(atomics.element(mapIdx)).toVar();
+    // Index with a CLAMPED slot even when there is none: a read of slot 0 is
+    // harmless and gated below, while an `If()` around a buffer read is the
+    // idiom that rendered the BVH mirror pass black (windowTrace's note).
+    const slot = m.max(uint(1)).sub(uint(1)).toVar();
+    const addr = uint(DATA_OFF).add(slot.mul(uint(SLOT_WORDS))).add(lv.mul(uint(SLOT_FACES))).add(faceU).toVar();
+    const word = atomicLoad(atomics.element(addr)).toVar();
+    const ok = m.notEqual(uint(0)).and(word.notEqual(uint(0)));
+    return vec4(decodeRgbe(word), select(ok, float(1), float(0)));
+  };
   const cacheReadFn = sharedFn({
     name: "gi2CacheRead",
     type: "vec4",
@@ -275,18 +316,8 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
       { name: "voxelIdx", type: "float" },
       { name: "face", type: "float" },
     ],
-    body: (levelF, voxelF, faceF) => {
-      const { mapIdx, lv, faceU } = addressOf(levelF.toUint(), voxelF.toUint(), faceF.toUint());
-      const m = atomicLoad(atomics.element(mapIdx)).toVar();
-      // Index with a CLAMPED slot even when there is none: a read of slot 0 is
-      // harmless and gated below, while an `If()` around a buffer read is the
-      // idiom that rendered the BVH mirror pass black (windowTrace's note).
-      const slot = m.max(uint(1)).sub(uint(1)).toVar();
-      const addr = uint(DATA_OFF).add(slot.mul(uint(SLOT_WORDS))).add(lv.mul(uint(SLOT_FACES))).add(faceU).toVar();
-      const word = atomicLoad(atomics.element(addr)).toVar();
-      const ok = m.notEqual(uint(0)).and(word.notEqual(uint(0)));
-      return vec4(decodeRgbe(word), select(ok, float(1), float(0)));
-    },
+    body: (levelF, voxelF, faceF) =>
+      readInline(levelF.toUint(), voxelF.toUint(), faceF.toUint()),
   });
 
   // ═════════════════════════════════════════════════════ WRITE (a `sharedFn`)
@@ -357,6 +388,48 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
   // EXACT lit colour for a surface the camera can see and has its own time
   // constant. Two producers, two rules, one word; the count belongs to the one
   // that is estimating.
+  //
+  // ⭐⭐ §19 STAGE 4.5 — AND THE SURFACE IS SMOOTH, SO THE CACHE OF IT MUST BE.
+  //
+  // §AD's face-term census settles what §AC could only bound. On the terrace
+  // wall NOT ONE of the four sky rays ever misses (a Paris street is a canyon),
+  // the sun is invisible from every face, the emitter NEE is zero, and **100 %
+  // of a face's radiance is the SECOND BOUNCE it reads back out of this cache**.
+  // The estimator is therefore a Neumann iteration whose input is the cache's
+  // own field: a face's value is the mean of four other faces' values, so any
+  // spread the cache carries is re-injected into every face that looks at it.
+  // Measured on that wall: adjacent faces 21.6 % apart at p50, 77.0 % at p90.
+  //
+  // The cheapest place to break the loop is the WRITE. `mix(estimate,
+  // neighbourhood mean, w)` is one Jacobi sweep of a screened-Poisson smoother
+  // over the surface, taken where a face is already being written — six
+  // neighbour reads per SHADE (~10⁴ a frame), not per ray HIT (~10⁵ a frame).
+  // And because a sweep runs every time the face is revisited it is an IIR, not
+  // a 7-tap box: the converged kernel is ~√(w/(1−w)) cells wide, which is
+  // [[gi-vxao-rebuild]]'s "width is the cheap axis" applied to a cache instead
+  // of to an AO filter — variance bought with taps, not with rays.
+  //
+  // ⚠ ENERGY IS PRESERVED BY CONSTRUCTION, and that is why this shape and not a
+  // blur. The weights — `1−w` on self, `w/k` on each of the k VALID neighbours —
+  // sum to exactly 1, so the operator is row-stochastic: it moves light ALONG a
+  // surface and can neither create nor destroy it. Presets and fixes trade rays,
+  // never energy.
+  //
+  // ⚠ AND IT IS THE SIX AXIS NEIGHBOURS, NOT A TANGENTIAL 3×3. §AD's wall runs
+  // at 45° to both horizontal axes, so its conservative voxelization is a
+  // STAIRCASE: consecutive cells of one wall differ along the face's own normal
+  // axis as often as along a tangential one. A filter that walked only the
+  // tangential plane would have found two valid taps of eight on the very wall
+  // the complaint is about. Six axis neighbours catch the flat wall and the
+  // diagonal one with the same six reads.
+  //
+  // ⚠ AN INVALID TAP IS DROPPED, NEVER AVERAGED IN AS BLACK. A neighbour that is
+  // air, that belongs to an unallocated brick, or that no producer has reached
+  // yet is NO DATA — counting a zero for it would darken every silhouette on the
+  // surface by the open fraction of its neighbourhood, which is a bias in the
+  // shape of an outline. The weight goes back to self, so a face with no valid
+  // neighbours stores its own estimate exactly as before.
+  const NB = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
   const cacheAccumFn = sharedFn({
     name: "gi2CacheAccum",
     type: "float",
@@ -366,11 +439,45 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
       { name: "face", type: "float" },
       { name: "rgb", type: "vec3" },
       { name: "nCap", type: "float" },
+      // ⚠⚠ `smoothW`, NOT `smooth` — THE LAYOUT'S INPUT NAME *IS* THE WGSL
+      // PARAMETER NAME, AND `smooth` IS A RESERVED KEYWORD. A whole battery died
+      // on this: the module failed with "error: 'smooth' is a reserved keyword",
+      // the §12.56 watchdog re-rolled the pipeline four times, "transport never
+      // produced light", and first light NEVER arrived. Nothing about this name
+      // reaches JS, so it reads as a free choice and is not one.
+      { name: "smoothW", type: "float" },
     ],
-    body: (levelF, voxelF, faceF, rgb, nCapF) => {
+    body: (levelF, voxelF, faceF, rgb0, nCapF, smoothF) => {
       const { mapIdx, lv, faceU } = addressOf(levelF.toUint(), voxelF.toUint(), faceF.toUint());
       const m = atomicLoad(atomics.element(mapIdx)).toVar();
       const alpha = float(0).toVar();
+      // ── the plane smoother, evaluated before the store ────────────────────
+      const rgb = vec3(rgb0).toVar();
+      If(smoothF.greaterThan(0.001), () => {
+        const vi = voxelF.toUint().toVar();
+        const cx = bitAnd(vi, uint(63)).toInt().toVar();
+        const cy = bitAnd(shiftRight(vi, uint(6)), uint(63)).toInt().toVar();
+        const cz = bitAnd(shiftRight(vi, uint(12)), uint(63)).toInt().toVar();
+        const acc = vec3(0).toVar();
+        const cnt = float(0).toVar();
+        for (const [dx, dy, dz] of NB) {
+          // Toroidal, exactly as `gatherProbes.dominantFace`'s neighbour read
+          // is: a voxel on the 64th cell reads the far side of its own window.
+          // One cell in 64 per axis, at the boundary the trace has already
+          // handed off to a coarser level.
+          const nvi = bitOr(
+            bitOr(bitAnd(cx.add(int(dx)), int(N_MASK)).toUint(),
+              shiftLeft(bitAnd(cy.add(int(dy)), int(N_MASK)).toUint(), uint(6))),
+            shiftLeft(bitAnd(cz.add(int(dz)), int(N_MASK)).toUint(), uint(12)),
+          ).toVar();
+          const c = readInline(levelF.toUint(), nvi, faceF.toUint()).toVar();
+          acc.addAssign(c.xyz.mul(c.w));
+          cnt.addAssign(c.w);
+        }
+        If(cnt.greaterThan(0.5), () => {
+          rgb.assign(mix(rgb0, acc.div(cnt), smoothF));
+        });
+      });
       If(m.notEqual(uint(0)), () => {
         const slot = m.sub(uint(1)).toVar();
         const sub = lv.mul(uint(SLOT_FACES)).add(faceU).toVar(); // 0..383
@@ -497,8 +604,9 @@ export function createRadianceCache(win, { tier = win.tier, bricks = null } = {}
      * The α comes from the face's own sample count; the caller supplies only
      * the cap. Returns 0 when the brick owns no slot.
      */
-    cacheAccum: (levelF, voxelF, faceF, rgb, nCapF = CACHE_N_CAP) =>
-      cacheAccumFn(float(levelF), float(voxelF), float(faceF), vec3(rgb), float(nCapF)),
+    cacheAccum: (levelF, voxelF, faceF, rgb, nCapF = CACHE_N_CAP, smoothF = 0) =>
+      cacheAccumFn(float(levelF), float(voxelF), float(faceF), vec3(rgb), float(nCapF),
+        float(smoothF)),
     /** The sample count of one (slot, voxel, face), out of a CPU readback. */
     readCount(u32, slot, lv, face) {
       const sub = lv * SLOT_FACES + face;
