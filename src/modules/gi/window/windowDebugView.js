@@ -51,8 +51,8 @@
 import * as THREE from "three/webgpu";
 import {
   Fn, If, bitAnd, cameraPosition, cameraProjectionMatrixInverse, cameraWorldMatrix, exp, float,
-  floor, min, positionGeometry, screenUV, select, shiftRight, texture, uint, uniform, uniformArray,
-  varying, vec2, vec3, vec4,
+  floor, min, positionGeometry, screenCoordinate, screenUV, select, shiftRight, texture, uint,
+  uniform, uniformArray, varying, vec2, vec3, vec4,
 } from "three/tsl";
 import { LEVEL_WORDS, PAL_OFF } from "./windowStore.js";
 
@@ -209,6 +209,34 @@ export function createGi2DebugView({ win, trace, palEntries = 64, tile = 16, wor
     return node;
   };
 
+  /**
+   * ⭐ §AG — THE ORDERED DITHER THAT MAKES THIN GEOMETRY LOOK THIN.
+   *
+   * A 4x4 Bayer threshold in [0, 1) from the pixel's own screen position,
+   * built out of the 2x2 kernel [[0,2],[3,1]] the standard way
+   * (`b4 = 4·b2(x>>1, y>>1) + b2(x, y)`). Ordered rather than random for the
+   * reason every other estimator in §19 is deterministic: a stipple that
+   * crawls between frames is unreadable, and this one is a pure function of
+   * the pixel.
+   */
+  const bayer4 = (px) => {
+    const b2 = (x, y) => select(
+      x.lessThan(1), select(y.lessThan(1), float(0), float(3)),
+      select(y.lessThan(1), float(2), float(1)),
+    );
+    const lx = px.x.mod(2).toVar();
+    const ly = px.y.mod(2).toVar();
+    const hx = px.x.div(2).floor().mod(2).toVar();
+    const hy = px.y.div(2).floor().mod(2).toVar();
+    return b2(hx, hy).mul(4).add(b2(lx, ly)).div(16);
+  };
+  /**
+   * The colour a THIN voxel is stippled in. Cyan because no material palette in
+   * a street scene is, so "cable" and "wall painted teal" cannot be confused —
+   * the one thing this view exists to keep straight.
+   */
+  const THIN_TINT = vec3(0.10, 0.90, 1.00);
+
   material.fragmentNode = Fn(() => {
     // ⚠ ONE `out` AND ONE `return`. A `return` inside an `If` body is a JS
     // return from the callback — TSL discards it, and the shader falls through
@@ -274,6 +302,9 @@ export function createGi2DebugView({ win, trace, palEntries = 64, tile = 16, wor
       const faceId = r.faceId.toVar();
       const level = r.level.toVar();
       const voxel = r.voxelIdx.toVar();
+      // §AG — how much of this ray survived the THIN voxels it crossed on the
+      // way to whatever it hit. 1 wherever there was nothing thin.
+      const thru = r.throughput.toVar();
       If(hit.greaterThan(0.5), () => {
         If(modeU.equal(uint(GI2_VIEW.OCCUPANCY)), () => {
           // ── THE VOXEL WORLD THE RAYS SEE ────────────────────────────────
@@ -378,6 +409,29 @@ export function createGi2DebugView({ win, trace, palEntries = 64, tile = 16, wor
             ));
           });
         }
+      });
+
+      // ── §AG: THIN GEOMETRY, STIPPLED ─────────────────────────────────────
+      //
+      // ⭐⭐ AND IT HAS TO BE DRAWN FROM THE THROUGHPUT, NOT FROM THE HIT.
+      // Before this stage a cable STOPPED the ray, so the occupancy view drew
+      // it as a black wall — that picture is what the user reported. Now the
+      // ray walks through it, so the cable is not the hit any more and a view
+      // that shaded only the hit voxel would show the wall BEHIND the cable and
+      // no cable at all: the bug fixed and the geometry invisible, which is a
+      // worse instrument than the wrong one.
+      //
+      // `1 − T` IS EXACTLY "how much of this pixel's ray the thin stuff took",
+      // so it is the stipple density, and the two failure modes read apart at a
+      // glance: a cable is a thin cyan line over the façade behind it, a
+      // MISCLASSIFIED wall is a solid cyan wall.
+      If(modeU.equal(uint(GI2_VIEW.OCCUPANCY)), () => {
+        const veil = float(1).sub(thru).clamp(0, 1).toVar();
+        const d = bayer4(floor(screenCoordinate.xy)).toVar();
+        // The tint carries the hit's own shading so a stippled surface still
+        // reads as a surface; full cyan only where the ray was stopped by the
+        // thin geometry itself (`T` under `THROUGHPUT_MIN`).
+        out.assign(select(d.lessThan(veil), THIN_TINT.mul(veil.mul(0.7).add(0.3)), out));
       });
     });
     // A MISS IS BLACK, not a dark sky tint. The receipt behind these views

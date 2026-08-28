@@ -70,7 +70,8 @@ import {
   uint, uniform, vec3,
 } from "three/tsl";
 import {
-  BMASK_OFF, BRICK, FACE_OFF, LEVEL_WORDS, N, OCC_OFF, PAL_NONE, PAL_OFF, PAL_WORDS,
+  BMASK_OFF, BRICK, COV_OFF, COV_OPAQUE, FACE_OFF, LEVEL_WORDS, N, OCC_OFF, PAL_NONE, PAL_OFF,
+  PAL_WORDS,
   VOXELS_PER_LEVEL,
 } from "./windowStore.js";
 import { buildTriangleSoup } from "./triangleSoup.worker.js";
@@ -345,6 +346,28 @@ export function createWindowDynamic(win, voxelizer, tier = win.tier, opts = {}) 
         atomicOr(
           winAtomics.element(slotBase.add(uint(FACE_OFF)).add(shiftRight(vi, uint(2)))),
           shiftLeft(faceMask, bitAnd(vi, uint(3)).mul(uint(8))),
+        );
+        // ⭐ §AG — A MOVER IS SOLID. Class 3, unconditionally.
+        //
+        // Not a shortcut taken for want of a better estimate: a character, a
+        // vehicle, a door is a closed shell, and the thin-geometry problem this
+        // class exists for is STATIC set dressing — cables, railings, foliage —
+        // which is voxelized by the SAT path with a real per-voxel area behind
+        // it. Deriving coverage here would mean running the 4×4 estimator on
+        // every mover triangle every frame to answer a question whose answer is
+        // known.
+        //
+        // ⚠ AND `windowTrace` DOES NOT READ THIS. It forces class 3 on any
+        // `occDyn` hit without a fetch, which is the cheaper of two identical
+        // answers. This write exists so the OCCUPANCY DEBUG VIEW — which reads
+        // the class straight out of the buffer to decide its dither — draws a
+        // mover as the solid it is instead of as gauze, and so anything that
+        // later reads the layer directly finds it honest. One `atomicOr` per
+        // dynamic voxel: OR-ing 3 into a 2-bit lane lands 3 whatever the
+        // per-frame clear left.
+        atomicOr(
+          winAtomics.element(slotBase.add(uint(COV_OFF)).add(shiftRight(vi, uint(4)))),
+          shiftLeft(uint(COV_OPAQUE), bitAnd(vi, uint(15)).mul(uint(2))),
         );
         const b = torusBrick(cx, cy, cz).toVar();
         atomicOr(

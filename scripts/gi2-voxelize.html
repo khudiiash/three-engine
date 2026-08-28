@@ -1614,7 +1614,27 @@
             // have read as a FOREIGN number — the check would have failed at one
             // tier and passed at another for a reason unrelated to what it tests.
             fmt(voxMod.CULL_FRACTION),
+            // ⭐ §AG's COVERAGE ESTIMATOR, listed BY NAME for the same reason
+            // the cull fraction is: these are algorithm constants of the
+            // kernel, invariant across every scene, and the claim the check
+            // protects ("the voxelizer's WGSL is the same text in every scene")
+            // is satisfied by them exactly as it is by `v0 · 2^l`.
+            //
+            // ⚠ AND `1.5` IS ALSO ONE OF THE ANALYTIC ROOM'S DIMENSIONS. The
+            // axis projection needs `axF > 0.5 && axF < 1.5` to name the middle
+            // of three cases, so the collision is real and the resolution is the
+            // same as `probe:gi2-trace`'s: the allowlist is the authority, the
+            // scene-number grep only catches what the allowlist cannot account
+            // for. The primary inverted-literal check still audits every literal.
+            fmt(voxMod.COV_FIX), // the per-voxel area scratch's fixed point
+            "1.5", // the 3-way axis select's upper bound (and, unluckily, a room number)
           ]);
+          // The 4 x 4 sample grid's own offsets, (i + 0.5) / 4 — derived from
+          // `COV_SAMPLES_AXIS` rather than typed, so widening the grid cannot
+          // widen the allowlist past what the kernel actually carries.
+          for (let i = 0; i < voxMod.COV_SAMPLES_AXIS; i++) {
+            allowed.add(fmt((i + 0.5) / voxMod.COV_SAMPLES_AXIS));
+          }
           for (let l = 0; l < win.levels; l++) allowed.add(fmt(win.voxel0 * Math.pow(2, l)));
           // Addressing constants: whole numbers up to 16. The trace's own check
           // allows up to 64 because it indexes the window directly; the

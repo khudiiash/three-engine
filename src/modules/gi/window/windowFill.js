@@ -41,7 +41,8 @@ import {
   instanceIndex, instancedArray, int, select, shiftLeft, shiftRight, uint, uniform, vec3,
 } from "three/tsl";
 import {
-  BMASK_OFF, BRICK, BTAB_OFF, FACE_OFF, LEVEL_WORDS, N, OCC_OFF, PAL_NONE, PAL_OFF, STATE_BUILT,
+  BMASK_OFF, BRICK, BTAB_OFF, COV_OFF, COV_OPAQUE, FACE_OFF, LEVEL_WORDS, N, OCC_OFF, PAL_NONE,
+  PAL_OFF, STATE_BUILT,
 } from "./windowStore.js";
 import { FACE_AX_SHIFT } from "./windowTrace.js";
 
@@ -451,6 +452,23 @@ export function createWindowFill(win, { scene = CORNELL_SCENE, rotation = IDENTI
         bitNot(shiftLeft(uint(255), byteShift)),
       );
       atomicOr(atomics.element(levelBase.add(uint(PAL_OFF)).add(byteWord)), shiftLeft(pal, byteShift));
+      // ⭐ §AG — EVERY ANALYTIC VOXEL IS CLASS 3, AND THAT IS THE POINT OF THIS
+      // FILE. Its scene is SOLIDS — a 5 cm wall slab, a 2 m box, a 1 m sphere —
+      // and a solid is exactly what the opaque class means. It keeps the §V.1
+      // thin-wall gate (0 leaks of 10 000) measuring the ENTRY-FACE BIT and
+      // nothing else: if the analytic wall could be partial, a leak in
+      // `probe:gi2-trace` would no longer distinguish a broken face rule from a
+      // coverage estimate that under-counted, and the control arm's "withhold
+      // the bits and the identical rays pour through" would compare two things
+      // at once.
+      //
+      // One `atomicOr` and no clear beside it: OR-ing 3 into a 2-bit lane lands
+      // 3 whatever was there, so a re-fill without a scroll needs no AND (which
+      // `pal`, whose merge is not idempotent, does).
+      atomicOr(
+        atomics.element(levelBase.add(uint(COV_OFF)).add(shiftRight(vi, uint(4)))),
+        shiftLeft(uint(COV_OPAQUE), bitAnd(vi, uint(15)).mul(uint(2))),
+      );
 
       const b = bitOr(
         bitOr(shiftRight(bitAnd(vi, uint(63)), uint(2)),

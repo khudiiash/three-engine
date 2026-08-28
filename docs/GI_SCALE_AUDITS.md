@@ -4798,3 +4798,38 @@ arms**. The runner numbers in that battery are a statement about a moving tree.
 ⭐ **The re-measurement is one command on a still tree:**
 `npm run probe:gi2-runner` twice, `FLAGS='{"__gi2ShClamp":1}'` on one of them.
 [[probe-blind-statistics]]
+
+### AG.8 The rest of the battery (08-28, one machine, mixed working tree)
+
+| receipt | reading |
+|---|---|
+| `test:gi2-window` | PASS, 12 643 checks; a level slot is 655 872 B, ultra window 4.378 MB |
+| `test:gi2-coverage` (NEW, CPU) | PASS, 27 checks |
+| `probe:gi2-gather` Cornell | **8/8 inside the [1-bounce, 4-bounce] bracket**; TRIM GATE 6/6 sub-voxel crops |
+| `probe:gi2-gather` 5 cm wall, axis + rotY20 | **0 of 10 000**, control 100 % |
+| `probe:gi2-gather` 5 cm wall, rotX20 / rotXY20 | 3 and 2 of 10 000 in ONE arm; **0/10 000 in the two later arms of the same battery** |
+| `smoke:gi-gpu` (phone tier) | 2/2 arms PASS, 0 FAIL; window 3.128 MB, worst kernel 6 storage buffers |
+| `test:gi-moved-lamp` | PASS — the new spot gained 29.02 lum (gate > 12) |
+| `probe:gi2-motion` | **voxelize chain GPU ms MAX: orbit 2.92, dolly 2.80, whip 0.20 — all PASS against the 3 ms cap** |
+| `probe:gi2-faceterm` | sky-miss share on the §AC wall still **0.0 %** — unchanged, and it cannot move until the gather weights by `T` |
+| `probe:gi2-corridor` | 4/8 bracketed, the §W/§X shape; the corridor is boxes, so every voxel in it is class 3 and §AG is inert there |
+
+⚠ THE INTERMITTENT ROTATED LEAK IS NOT THE CLASSES, and the reason is
+structural rather than statistical: those rooms are filled by `windowFill`,
+which writes `COV_OPAQUE` into **every** occupied voxel unconditionally. There is
+no path by which a rotated Cornell holds a voxel below class 3. The same
+analytic fill measured 0/10 000 in `probe:gi2-trace` at all three tiers, and the
+same rotated worlds measured 0/10 000 in two of the three arms of the very
+battery that saw the 3.
+
+⛔ **AND TWO OF THE LISTED RECEIPTS ARE NOT ATTRIBUTABLE THIS SESSION.**
+`gatherProbes.js` (+52/−6), `worldProbes.js` and `run-gi2-ref-probe.mjs` were
+being edited by another agent in the same working tree while these ran, along
+with `ViewportPanel.jsx`, `selectionOutline.js`, `batching.js` and `merging.js`.
+`probe:gi2-ref` read median |ratio−1| 0.531 (signal set 0.492) against the 0.123
+/ 0.276 the task quotes, and `probe:gi2-motion`'s WHOLE-FRAME gates fail (orbit
+MAX 162 ms, whip 2.7 console lines/s) with the long-animation-frame trace
+pointing at `update` in a vite dep chunk and at react-dom. Neither number can be
+laid at §AG's door, and neither should be read as clearing it: **the pass §AG
+added work to is the voxelize chain, and that one has its own gate, and it
+passes.** Re-take both baselines on a clean tree.

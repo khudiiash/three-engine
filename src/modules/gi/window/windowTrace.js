@@ -138,6 +138,33 @@
 // step to arrive where it was born, so there is no entry face to read, and
 // picking one fails closed on exactly the rays that are not blocked.
 //
+// ══ §AG — A THIN VOXEL DOES NOT STOP A RAY, IT DIMS IT ══════════════════════
+//
+// ⭐⭐ Occupancy is one bit, so until this stage a 2 cm cable and a 20 cm wall
+// were the SAME OBJECT to this loop. On Bistro the string-light cables
+// voxelized into a continuous slab across the whole street and the balcony
+// ironwork into black walls; everything below lost most of its sky, and the
+// indirect went flat and the bounce black. `windowStore.js`'s COVERAGE block
+// has the diagnosis and the four classes.
+//
+// The rule here is one branch: a voxel of class < 3 that the entry-face test
+// would have stopped the ray at instead multiplies the ray's THROUGHPUT by
+// `1 − COV_ATTEN[class]` and the DDA CONTINUES. The hit that is reported is the
+// first class-3 voxel; the throughput is returned beside it, so the caller can
+// weight that hit's radiance by `T` and credit `1 − T` to what the thin voxels
+// were.
+//
+//   · DETERMINISTIC (§T). No stochastic termination, no dither, no frame index
+//     — `T` is a product of per-class constants over the voxels the ray met, so
+//     two identical rays in two frames return the identical number.
+//   · THE WALL INVARIANT IS UNTOUCHED. A surface is class 3 and class 3 breaks
+//     the loop exactly as an occupied voxel always did; the §V.1 gate's 5 cm
+//     wall is class 3 at every level.
+//   · ONE EXTRA BUFFER READ, and only on the path that was already reading the
+//     face byte — i.e. only inside a voxel that is occupied AND blocks. The
+//     DYNAMIC layer is not read at all: a mover is solid by decree, so an
+//     `occDyn` hit is class 3 without a fetch.
+//
 // ══ RETURN SHAPE ════════════════════════════════════════════════════════════
 //
 // A laid-out WGSL function cannot return a struct (occupancyField's traceBody
@@ -146,12 +173,37 @@
 // 16777213 at its maximum — exactly one below 2^24, so every value round-trips
 // through f32 EXACTLY. That is a checked property, not a lucky fit: faceId is
 // 3 bits, level 3, and a 64³ voxel index 18.
+//
+// ⭐ AND THAT IS WHY THE THROUGHPUT RIDES IN `w`'s FRACTION. `packed` has no
+// spare bit (all 24 are spoken for), `hit` is compared against 0.5 by every
+// caller and `t` is a distance — so the one component with room is the STEP
+// COUNT, whose integer part is all anyone ever wanted from it. `w = used +
+// round(T·255)/256` keeps `floor(w)` exactly the old step count for the two
+// receipts in `gatherProbes` that read `raw.w` directly, and hands the wrapper
+// eight bits of throughput for free. Exact in f32: `used < 2^15` and the
+// fraction is a multiple of 1/256, so 23 bits of mantissa cover both.
 import {
   Break, If, Loop, bitAnd, bitOr, dot, exp2, float, int, select, shiftLeft, shiftRight, uint, vec3,
   vec4,
 } from "three/tsl";
 import { sharedFn } from "../giFn.js";
-import { BMASK_OFF, BRICK, BRICKS, FACE_OFF, LEVEL_WORDS, N, OCC_OFF } from "./windowStore.js";
+import {
+  BMASK_OFF, BRICK, BRICKS, COV_ATTEN, COV_OFF, COV_OPAQUE, FACE_OFF, LEVEL_WORDS, N, OCC_OFF,
+} from "./windowStore.js";
+
+/**
+ * The throughput at which a ray gives up and reports a hit.
+ *
+ * A BACKSTOP, not a tuning knob: without it a ray grazing along a cable could
+ * cross fifty class-0 voxels and still report "nothing there", and a dense
+ * canopy would never cast a shadow at all. 0.05 is 3 class-2 voxels, 11
+ * class-1 voxels or 49 class-0 ones — one lattice, one hedge, or a cable the
+ * ray is travelling ALONG rather than across.
+ *
+ * It also bounds nothing about cost: the brick step budget already does that,
+ * and a ray that never stops costs exactly what a MISS has always cost.
+ */
+export const THROUGHPUT_MIN = 0.05;
 
 /**
  * How many whole cells the origin may walk along its normal to get out of an
@@ -337,6 +389,9 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
       const hitT = float(-1).toVar();
       const packed = float(0).toVar();
       const used = float(0).toVar();
+      // §AG. 1 = nothing dimmed this ray yet. Every class < 3 voxel it is
+      // stopped by multiplies it; the caller weights the hit by it.
+      const thru = float(1).toVar();
       // The axis last crossed decides the entry face. The ray's first cell has
       // no crossing yet, so it is seeded with the ray's DOMINANT axis — the
       // face it would most likely have come through, and the one that fails
@@ -460,6 +515,23 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
                       shiftRight(buffer.element(dynBase.add(uint(FACE_OFF)).add(byteWord)), byteShift), uint(255),
                     ), uint(0)).toVar()
                   : uint(0);
+                // ⭐⭐ §AG — THE VOXEL'S COVERAGE CLASS, read HERE and not
+                // inside the face-bit branch below on purpose. `fStatic` above
+                // is the existing proof that a buffer read at THIS nesting is
+                // safe; one level deeper is a conditional read, which is the
+                // idiom that rendered the BVH mirror pass black, and the saving
+                // would be a fetch on voxels whose face test fails — 5 % of
+                // Bistro's façade voxels, since 95 % of them carry all six bits.
+                //
+                // ⚠ THE DYNAMIC LAYER IS NOT READ. A mover is solid by decree,
+                // so `occDyn` forces class 3 without a second fetch.
+                const covRaw = bitAnd(
+                  shiftRight(
+                    buffer.element(slotBase.add(uint(COV_OFF)).add(shiftRight(vi, uint(4)))),
+                    bitAnd(vi, uint(15)).mul(uint(2)),
+                  ), uint(3),
+                ).toVar();
+                const cls = select(occDyn.notEqual(uint(0)), uint(COV_OPAQUE), covRaw).toVar();
                 const eFace = select(iAxis.equal(0), entryBits.x,
                   select(iAxis.equal(1), entryBits.y, entryBits.z)).toVar();
                 // ⭐ THE ORIGIN VOXEL IS TESTED BY THE FACE THE RAY LEAVES BY.
@@ -472,12 +544,32 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
                   select(axisV.equal(1), entryBits.y, entryBits.z)).toVar();
                 const tFace = select(atOrigin, xFace, eFace).toVar();
                 If(bitAnd(bitOr(fStatic, fDyn), shiftLeft(uint(1), tFace.toUint())).notEqual(uint(0)), () => {
-                  hit.assign(1);
-                  // A ray blocked by the voxel it was born in is blocked at
-                  // that voxel's far side, not at its own origin.
-                  hitT.assign(tHit);
-                  packed.assign(tFace.add(level.toFloat().mul(8)).add(vi.toFloat().mul(64)));
-                  Break();
+                  // ⭐⭐ §AG — THE ONE BRANCH. Up to here the voxel has been
+                  // decided to BLOCK this ray; the only remaining question is
+                  // whether it is a SURFACE or something the surface bit was
+                  // never meant to describe.
+                  //
+                  // An array cannot be indexed by a runtime value in WGSL — the
+                  // same constraint `stepOf` works around — so the classes are
+                  // a select chain over tier constants. ⚠ CLASS 3 FALLS OUT AT
+                  // ATTENUATION 0, and that is not an oversight: `T` is the
+                  // throughput TO the hit, so the opaque voxel that ends the ray
+                  // must not also dim the radiance the caller reads at it.
+                  let atten = float(0);
+                  for (let c = 0; c < 3; c++) atten = select(cls.equal(uint(c)), float(COV_ATTEN[c]), atten);
+                  thru.mulAssign(float(1).sub(atten));
+                  // Opaque, or dimmed past the point where "it got through" is
+                  // an honest answer. Both report the hit the old code did.
+                  If(cls.equal(uint(COV_OPAQUE)).or(thru.lessThan(float(THROUGHPUT_MIN))), () => {
+                    hit.assign(1);
+                    // A ray blocked by the voxel it was born in is blocked at
+                    // that voxel's far side, not at its own origin.
+                    hitT.assign(tHit);
+                    packed.assign(tFace.add(level.toFloat().mul(8)).add(vi.toFloat().mul(64)));
+                    Break();
+                  });
+                  // …otherwise the DDA falls through and keeps walking. That is
+                  // the whole of the cable slab's removal.
                 });
               });
 
@@ -499,7 +591,9 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
         });
       });
 
-      return vec4(hit, hitT, packed, used);
+      // §AG's throughput rides in `w`'s FRACTION — see the RETURN SHAPE note.
+      // `floor(w)` is still exactly the step count every existing reader wants.
+      return vec4(hit, hitT, packed, used.add(thru.clamp(0, 1).mul(255).round().div(256)));
     },
   });
 
@@ -524,7 +618,20 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
       faceId: bitAnd(zi, uint(7)),
       level: bitAnd(shiftRight(zi, uint(3)), uint(7)),
       voxelIdx: shiftRight(zi, uint(6)),
-      steps: r.w,
+      steps: r.w.floor(),
+      /**
+       * ⭐ §AG — HOW MUCH OF THE RAY SURVIVED THE THIN VOXELS ON THE WAY.
+       *
+       * 1 when nothing partial was crossed, which is every ray in every scene
+       * that has no cables, railings or foliage in it — so a caller that
+       * ignores this field gets exactly the answer it got before this stage,
+       * which is why `traceWindow`'s old call sites did not have to move.
+       *
+       * A caller that uses it weights the HIT radiance by `T` and credits the
+       * remaining `1 − T` to what the thin voxels were (their palette albedo
+       * against the sky/parent estimate, or simply to the sky on a miss).
+       */
+      throughput: r.w.fract().mul(256 / 255).min(1),
       raw: r,
     };
   };
@@ -541,6 +648,8 @@ export function unpackTrace(x, y, z, w) {
     faceId: zi & 7,
     level: (zi >>> 3) & 7,
     voxelIdx: zi >>> 6,
-    steps: w,
+    steps: Math.floor(w),
+    // §AG — see the wrapper. `floor` is the step count, the fraction is T.
+    throughput: Math.min(1, (w - Math.floor(w)) * (256 / 255)),
   };
 }

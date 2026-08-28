@@ -60,15 +60,95 @@ export const BRICKS_PER_LEVEL = BRICKS * BRICKS * BRICKS; // 4096
 export const OCC_WORDS = VOXELS_PER_LEVEL / 32; // 8192   — 1 bit / voxel
 export const FACE_WORDS = VOXELS_PER_LEVEL / 4; // 65536  — 1 byte / voxel
 export const PAL_WORDS = VOXELS_PER_LEVEL / 4; // 65536  — 1 byte / voxel
+/**
+ * ⭐⭐ §AG — THE COVERAGE CLASS. 2 bits / voxel, 16 voxels to a word.
+ *
+ * See the COVERAGE block below for what the two bits mean. They needed a
+ * region of their own rather than the palette byte's two spare bits, and the
+ * reason is a READER THIS FILE DOES NOT OWN: `gatherProbes.palIndexAt`
+ * resolves a stale or unvoxelized byte with `min(p, PAL_ENTRIES - 1)`, so a
+ * class-1 voxel of palette 5 would arrive as `0b01_000101` = 69, clamp to 63,
+ * and read as the RESERVED "no surface" class — every thin voxel in the scene
+ * black at a stroke. `bitAnd(p, 63)` there fixes it and is one line; it is also
+ * one line in a file another agent is editing this hour, and a merge that drops
+ * it fails silently and globally. 64 KB per level slot (+11 % of the window)
+ * buys a region nothing else reads and no coordination at all.
+ */
+export const COV_WORDS = VOXELS_PER_LEVEL / 16; // 16384  — 2 bits / voxel
 export const BMASK_WORDS = BRICKS_PER_LEVEL / 32; // 128 — 1 bit / brick
 export const BTAB_WORDS = BRICKS_PER_LEVEL * 2; // 8192   — wb + state / brick
 
 export const OCC_OFF = 0;
 export const FACE_OFF = OCC_OFF + OCC_WORDS; // 8192
 export const PAL_OFF = FACE_OFF + FACE_WORDS; // 73728
-export const BMASK_OFF = PAL_OFF + PAL_WORDS; // 139264
-export const BTAB_OFF = BMASK_OFF + BMASK_WORDS; // 139392
-export const LEVEL_WORDS = BTAB_OFF + BTAB_WORDS; // 147584 = 576.5 KB
+export const COV_OFF = PAL_OFF + PAL_WORDS; // 139264
+export const BMASK_OFF = COV_OFF + COV_WORDS; // 155648
+export const BTAB_OFF = BMASK_OFF + BMASK_WORDS; // 155776
+export const LEVEL_WORDS = BTAB_OFF + BTAB_WORDS; // 163968 = 640.5 KB
+
+// ══ COVERAGE (§AG) ═══════════════════════════════════════════════════════════
+//
+// ⭐⭐ THE VOXELIZER MADE EVERY SURFACE A SLAB, AND THE STREET LOST ITS SKY.
+//
+// Occupancy is ONE BIT, so a 2 cm cable and a 20 cm wall are the same object to
+// the DDA: both stop every ray that enters them through a set face bit. On
+// Bistro that turned the balcony ironwork into black walls and the string-light
+// cables into a CONTINUOUS SLAB across the whole street at cable height (the
+// user's `sdf` view, 08-28 12:40). Everything below lost most of its sky, so the
+// indirect went flat and dull and the bounce came back black.
+//
+// The dust cull cannot reach it: that drops triangles whose largest AABB extent
+// is under a quarter cell, and a cable's triangles are LONG and thin.
+//
+// So each voxel also carries HOW MUCH OF ITS OWN CROSS-SECTION its surfaces
+// fill, quantised to four classes. A ray entering a class < 3 voxel does not
+// stop: it multiplies its throughput by `1 − COV_ATTEN[class]` and walks on.
+//
+//   class 0  < 12 %   a cable, a wire, a thin railing bar        6 % blocked
+//   class 1  < 35 %   ironwork, sparse foliage, trim            24 % blocked
+//   class 2  < 70 %   dense foliage, a lattice                  50 % blocked
+//   class 3  ≥ 70 %   A SURFACE. Opaque, and the DDA stops.    100 % blocked
+//
+// ⚠ CLASS 3 IS THE INVARIANT. A 5 cm plaster wall presents ~one whole cell² of
+// area inside its voxel at EVERY level (its triangles are metres across), so it
+// is class 3 everywhere and the §V.1 thin-wall gate — 0 leaks of 10 000 — is
+// untouched by any of this. The classes only ever describe what was never a
+// surface in the first place.
+
+/** The class an opaque surface carries; the only one that stops a ray. */
+export const COV_OPAQUE = 3;
+/** Class edges, as a fraction of the voxel's cross-section. */
+export const COV_EDGES = [0.12, 0.35, 0.70];
+/** The fraction of a ray a voxel of each class removes. Class 3 is total. */
+export const COV_ATTEN = [0.06, 0.24, 0.5, 1.0];
+/**
+ * The coverage a STORED class stands for when a resumed brick adds to it.
+ *
+ * A brick too big for one frame's budget is built over several instalments, and
+ * the per-voxel area scratch they accumulate into is per-FRAME. So the pack
+ * folds this frame's sum onto what the stored class already means —
+ * `class(sum + COV_REPR[stored])` — and the value is the class's MIDPOINT
+ * rather than its lower edge, deliberately: the recovery then errs toward
+ * OPAQUE, the safe direction for the wall invariant, while class 0 stays a
+ * fixed point for anything genuinely thin (0.06 plus a cable's 3 % is still
+ * under the 12 % edge, however many instalments it takes).
+ */
+export const COV_REPR = [0.06, 0.235, 0.525, 1.0];
+/** Coverage fraction → class. The CPU mirror of the pack's quantiser. */
+export const covClassOf = (f) => (
+  f >= COV_EDGES[2] ? 3 : f >= COV_EDGES[1] ? 2 : f >= COV_EDGES[0] ? 1 : 0);
+/** Word holding voxel `vi`'s class, relative to `COV_OFF`. */
+export const covWordOf = (vi) => vi >>> 4;
+/** Bit offset of voxel `vi`'s class inside that word. */
+export const covShiftOf = (vi) => (vi & 15) * 2;
+/**
+ * A BRICK's x-run of four voxels occupies EIGHT ALIGNED BITS of one coverage
+ * word — `vi` is a multiple of 4 at the start of every brick row, so the shift
+ * is one of {0, 8, 16, 24} and a brick's clear is one `atomicAnd` per row with
+ * a byte mask. The word is shared with three neighbouring bricks along x, which
+ * is exactly `occ`'s situation and is why the clear has to be a merge.
+ */
+export const covRowMask = (vi) => (0xff << ((vi & 15) * 2)) >>> 0;
 
 /** Scratch tail: receipts only, never read by the trace. */
 export const STATS_WORDS = 16;
@@ -326,6 +406,14 @@ export function createGiWindow(tier = "high", { dynamic = true } = {}) {
         const byteWord = shiftRight(vi, uint(2)).toVar();
         atomicStore(atomics.element(levelBase.add(uint(FACE_OFF)).add(byteWord)), uint(0));
         atomicStore(atomics.element(levelBase.add(uint(PAL_OFF)).add(byteWord)), uint(PAL_NONE_WORD));
+        // §AG: the row's four coverage classes are EIGHT aligned bits of a word
+        // four bricks share along x, so this one is a merge like `occ`, not a
+        // store like `face`. Cleared to class 0 — a voxel whose occ bit is
+        // clear has no class, and the DDA never reads one.
+        atomicAnd(
+          atomics.element(levelBase.add(uint(COV_OFF)).add(shiftRight(vi, uint(4)))),
+          bitNot(shiftLeft(uint(0xff), bitAnd(vi, uint(15)).mul(uint(2)))),
+        );
       });
       atomicAdd(atomics.element(uint(statsBase + STAT_SCROLL_CLEARED)), uint(1));
     });
@@ -342,16 +430,19 @@ export function createGiWindow(tier = "high", { dynamic = true } = {}) {
   // alone (the slots keep their identity; only their contents go). The dynamic
   // layer runs this every frame (K.5); the harness runs it to re-fill.
   const makeClearPass = (firstSlot, slotCount) => {
-    const CONTENT_WORDS = OCC_WORDS + FACE_WORDS + PAL_WORDS + BMASK_WORDS;
+    const CONTENT_WORDS = OCC_WORDS + FACE_WORDS + PAL_WORDS + COV_WORDS + BMASK_WORDS;
     return Fn(() => {
       const idx = instanceIndex.toVar();
       const s = idx.div(uint(CONTENT_WORDS)).toVar();
       const w = idx.sub(s.mul(uint(CONTENT_WORDS))).toVar();
       const base = s.add(uint(firstSlot)).mul(uint(LEVEL_WORDS)).toVar();
-      // occ | face | brickMask → 0, pal → 255. The four content regions are
-      // CONTIGUOUS from word 0 (K.2's table is the layout, not a description of
-      // it), so the word offset is the thread's own and only `pal` needs a
-      // different value — two compares against tier constants, one write.
+      // occ | face | cov | brickMask → 0, pal → 255. The FIVE content regions
+      // are CONTIGUOUS from word 0 (K.2's table is the layout, not a
+      // description of it), so the word offset is the thread's own and only
+      // `pal` needs a different value — two compares against tier constants,
+      // one write. `cov` clears to class 0 and that is safe by construction:
+      // its voxels' occ bits are cleared in the same pass, and the DDA reads a
+      // class only inside an occupied voxel.
       const inPal = w.greaterThanEqual(uint(PAL_OFF)).and(w.lessThan(uint(PAL_OFF + PAL_WORDS)));
       atomicStore(atomics.element(base.add(w)), select(inPal, uint(PAL_NONE_WORD), uint(0)));
     })().compute(slotCount * CONTENT_WORDS);
@@ -427,6 +518,7 @@ export function createGiWindow(tier = "high", { dynamic = true } = {}) {
     occ: OCC_WORDS * 4,
     face: FACE_WORDS * 4,
     pal: PAL_WORDS * 4,
+    cov: COV_WORDS * 4,
     brickMask: BMASK_WORDS * 4,
     brickTab: BTAB_WORDS * 4,
     total: LEVEL_WORDS * 4,

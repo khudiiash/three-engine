@@ -83,7 +83,8 @@
         say(`tier ${TIER}: ${d.levels} levels @ ${d.voxel0} m, windows ` +
           `${d.extents.map((e) => e.extent + "m").join("/")}, step budget ${STEP_BUDGET}`);
         say(`window: per level occ ${d.perLevelBytes.occ / 1024}K + face ${d.perLevelBytes.face / 1024}K + ` +
-          `pal ${d.perLevelBytes.pal / 1024}K + brickMask ${d.perLevelBytes.brickMask}B + ` +
+          `pal ${d.perLevelBytes.pal / 1024}K + cov ${d.perLevelBytes.cov / 1024}K + ` +
+          `brickMask ${d.perLevelBytes.brickMask}B + ` +
           `brickTab ${d.perLevelBytes.brickTab / 1024}K = ${(d.perLevelBytes.total / 1024).toFixed(1)}K; ` +
           `static ${(d.staticBytes / 1048576).toFixed(2)} MB + dynamic ${(d.dynamicBytes / 1048576).toFixed(2)} MB ` +
           `= ${d.totalMB} MB`);
@@ -467,6 +468,20 @@
           // levels, so `v0 · 2^l` is compiled in for each of them.
           const allowed = new Set([fmt(win.voxel0 * 0.5), fmt(win.voxel0 * store.BRICK)]);
           for (let l = 0; l < win.levels; l++) allowed.add(fmt(win.voxel0 * Math.pow(2, l)));
+          // ⭐ §AG's ALGORITHM CONSTANTS ARE NOT SCENE NUMBERS, AND THE GUARD
+          // HAS TO KNOW THE DIFFERENCE. The claim it protects is "the trace's
+          // WGSL is the same text in every scene, so the browser's shader cache
+          // hits across scenes" (PLAN §4.6) — which a per-class attenuation
+          // compiled from `COV_ATTEN` satisfies exactly as `v0 · 2^l` does, and
+          // a room dimension does not. They are read from the STORE rather than
+          // typed here, so a change to the table cannot silently widen the
+          // allowlist past what the trace actually carries.
+          for (const a of store.COV_ATTEN) allowed.add(fmt(a));
+          allowed.add(fmt(traceMod.THROUGHPUT_MIN));
+          // …and the throughput's 8-bit packing into `w`'s fraction (see
+          // `windowTrace`'s RETURN SHAPE note): `used + round(T·255)/256`.
+          allowed.add("255.0");
+          allowed.add("256.0");
           const literals = [...new Set([...traceWgsl.matchAll(/(?<![\w.])-?\d+\.\d+/g)].map((m) => m[0]))].sort();
           const isAddressing = (s) => {
             const v = Number(s);
@@ -477,8 +492,24 @@
           const foreign = literals.filter((s) => !allowed.has(s) && !isAddressing(s));
           // Belt and braces: the analytic room's own decimals, which no legal
           // tier constant can equal.
+          //
+          // ⚠ AND ONE OF THEM NOW COLLIDES WITH A DECLARED ALGORITHM CONSTANT.
+          // §AG's `THROUGHPUT_MIN` is 0.05 and this room's walls are 5 cm, so
+          // the grep fired on a number the tracer is entitled to carry — a false
+          // positive, and one that would have been "fixed" by nudging the
+          // constant, which is tuning an algorithm to please a test. The
+          // allowlist is the authority on what the kernel may contain; this grep
+          // only catches what the allowlist has no account of, so anything the
+          // allowlist explains is not the room's number appearing by accident.
+          // The primary (inverted-literal) check above is untouched and still
+          // audits every literal in the file.
           const roomDecimals = [`${hx + wall}`, `${hy + wall}`, `${wall}`, "2.5", "1.5"];
-          const grepped = roomDecimals.filter((n) => traceWgsl.includes(n));
+          const excused = roomDecimals.filter((n) => allowed.has(n));
+          const grepped = roomDecimals.filter((n) => !allowed.has(n) && traceWgsl.includes(n));
+          if (excused.length) {
+            say(`  (the room decimals ${excused.join(", ")} are ALSO declared tracer constants — ` +
+              "excused from the grep, audited by the allowlist)");
+          }
           say(`trace kernel float literals: ${literals.join(" ")}` +
             `  (tier: v0 ${fmt(win.voxel0)}, bias ${fmt(win.voxel0 * 0.5)}, brick ${fmt(win.voxel0 * store.BRICK)})`);
           results.trace = { bytes: traceWgsl.length, literals, foreign, grepped };

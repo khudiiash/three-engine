@@ -293,7 +293,11 @@ const ok = (group, cond, msg) => {
 // ─────────────────────────────────────────────── layout receipts
 {
   const G = "layout";
-  ok(G, LEVEL_WORDS * 4 === 590336, `a level slot is 590336 B (got ${LEVEL_WORDS * 4})`);
+  // 640.5 KB since §AG: 576.5 KB of occ/face/pal/masks/table + 64 KB of the
+  // 2-bit COVERAGE class. The number is asserted rather than described because
+  // a region silently changing size is how a consumer starts reading the wrong
+  // one, and every kernel in GI2 bakes these offsets into its WGSL.
+  ok(G, LEVEL_WORDS * 4 === 655872, `a level slot is 655872 B (got ${LEVEL_WORDS * 4})`);
   for (const [tier, spec] of Object.entries(GI2_TIERS)) {
     const win = createGiWindow(tier);
     const d = win.describe();

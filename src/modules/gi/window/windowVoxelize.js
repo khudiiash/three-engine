@@ -183,9 +183,9 @@ import {
 } from "three/tsl";
 import { sharedFn } from "../giFn.js";
 import {
-  BMASK_OFF, BRICK, BRICKS_PER_LEVEL, BTAB_OFF, FACE_OFF, LEVEL_WORDS, OCC_OFF, PAL_NONE,
-  PAL_NONE_WORD, PAL_OFF, STATE_BUILDING, STATE_BUILT, STATE_DIRTY, STATE_EMPTY_DIRTY, WB_BIAS,
-  WB_MASK, WB_VALID,
+  BMASK_OFF, BRICK, BRICKS_PER_LEVEL, BTAB_OFF, COV_EDGES, COV_OFF, COV_OPAQUE, COV_REPR, FACE_OFF,
+  LEVEL_WORDS, OCC_OFF, PAL_NONE, PAL_NONE_WORD, PAL_OFF, STATE_BUILDING, STATE_BUILT, STATE_DIRTY,
+  STATE_EMPTY_DIRTY, WB_BIAS, WB_MASK, WB_VALID,
 } from "./windowStore.js";
 
 /**
@@ -223,6 +223,101 @@ export const DUST_FACE_MASK = 0b111111;
 export const SCR_TAG_SAT = 0x80000000;
 export const SCR_TAG_DUST = 0x40000000;
 export const SCR_VALUE_MASK = 0x3fffffff;
+
+// ══ §AG — THE COVERAGE ESTIMATOR ═════════════════════════════════════════════
+//
+// ⭐⭐ WHAT A VOXEL'S COVERAGE IS: Σ over the triangles that reach it of the
+// area they present INSIDE it, projected on each triangle's dominant normal
+// axis, divided by the voxel's cross-section (cell²). In VOXEL SPACE — where
+// the voxelizer already works and a cell is a unit cube — the divisor is 1 and
+// the whole quantity is a 2D area in [0, 1].
+//
+// ⛔ THE FIRST FORM WAS WRONG AND THE ERROR IS INSTRUCTIVE. "Overlap of the
+// triangle's projected AABB with the voxel square, times the triangle's fill
+// ratio (A₂/B₂)" is one min/max per voxel and reads right for a cable. It reads
+// CATASTROPHICALLY wrong for a wall: a wall quad is two triangles, each filling
+// HALF its own bounding box, and a voxel in the middle of one of them — which
+// that triangle covers 100 % of — scores 1 × 0.5 = class 2. Every plain wall in
+// the scene would have become 50 % transparent, which is precisely the
+// invariant this whole class exists not to break. A fill RATIO is a global
+// average and the question is LOCAL.
+//
+// So the estimator SAMPLES: a fixed 4 × 4 grid over the voxel's cross-section,
+// point-in-triangle at each. Deterministic (§T — a fixed pattern, no jitter, no
+// frame index), 1/16 resolution, and exactly 1.0 in a wall's interior. The AABB
+// form survives as a FLOOR under it, for the one case sampling cannot see: a
+// sliver thinner than a sixteenth of a cell that misses every sample point but
+// is really there. `max` of the two, because each is right where the other is
+// blind, and a hundred leaves in one coarse voxel then still sum to opaque.
+export const COV_SAMPLES_AXIS = 4;
+/** Fixed-point scale of the per-voxel area scratch. 12 bits is 1/4096 of a cell². */
+export const COV_FIX = 4096;
+
+/**
+ * The CPU mirror of the GPU estimator, on one triangle and one voxel.
+ *
+ * Everything is in VOXEL SPACE (world / cell size); `corner` is the voxel's
+ * integer minimum corner. Returns the fraction of that voxel's cross-section —
+ * taken perpendicular to the triangle's own dominant normal axis — the triangle
+ * covers, in [0, 1].
+ *
+ * It exists so `test:gi2-coverage` can pin the four named cases (a wall
+ * interior, a 2 cm cable, a 45° railing bar, a leaf) WITHOUT A GPU, and so a
+ * disagreement between this and the kernel is a bug with a name rather than a
+ * receipt nobody can reproduce.
+ */
+export function coverageOfTriangleInVoxel(a0, a1, a2, corner) {
+  const e1 = [a1[0] - a0[0], a1[1] - a0[1], a1[2] - a0[2]];
+  const e2 = [a2[0] - a0[0], a2[1] - a0[1], a2[2] - a0[2]];
+  const n = [
+    e1[1] * e2[2] - e1[2] * e2[1],
+    e1[2] * e2[0] - e1[0] * e2[2],
+    e1[0] * e2[1] - e1[1] * e2[0],
+  ];
+  const an = n.map(Math.abs);
+  const ax = an[0] >= an[1] && an[0] >= an[2] ? 0 : (an[1] >= an[2] ? 1 : 2);
+  // Cyclic (u, v) so the projection keeps a consistent handedness per axis.
+  const U = (ax + 1) % 3;
+  const V = (ax + 2) % 3;
+  const p = [a0, a1, a2].map((q) => [q[U] - corner[U], q[V] - corner[V]]);
+  const S = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
+  // ⚠ A DEGENERATE PROJECTION COVERS EVERYTHING, WHICH IS THE WRONG ANSWER.
+  // Three collinear points make all three edge functions identically 0, every
+  // sample tests `>= 0` and passes, and the estimator returns 1.0 — a
+  // zero-area triangle reported as an opaque wall. `voxelize` rejects
+  // degenerate triangles before it gets here (`nlen < 1e-12`, needed for the
+  // face bits anyway) and the dominant axis makes `|S| >= 2A/sqrt(3)` for
+  // everything else, so this can only fire on input the caller already
+  // refuses — which is exactly why it must not be left to the caller.
+  if (!(Math.abs(S) > 1e-12)) return 0;
+  const o = S >= 0 ? 1 : -1;
+  // ── the 4 × 4 sample grid ──────────────────────────────────────────────
+  const K = COV_SAMPLES_AXIS;
+  let hits = 0;
+  for (let j = 0; j < K; j++) {
+    const sv = (j + 0.5) / K;
+    for (let i = 0; i < K; i++) {
+      const su = (i + 0.5) / K;
+      let inside = true;
+      for (let k = 0; k < 3 && inside; k++) {
+        const A = p[k];
+        const B = p[(k + 1) % 3];
+        const c = ((B[0] - A[0]) * (sv - A[1]) - (B[1] - A[1]) * (su - A[0])) * o;
+        if (c < 0) inside = false;
+      }
+      if (inside) hits++;
+    }
+  }
+  const sampled = hits / (K * K);
+  // ── the sliver floor ───────────────────────────────────────────────────
+  const lo = [Math.min(p[0][0], p[1][0], p[2][0]), Math.min(p[0][1], p[1][1], p[2][1])];
+  const hi = [Math.max(p[0][0], p[1][0], p[2][0]), Math.max(p[0][1], p[1][1], p[2][1])];
+  const ou = Math.max(0, Math.min(hi[0], 1) - Math.max(lo[0], 0));
+  const ov = Math.max(0, Math.min(hi[1], 1) - Math.max(lo[1], 0));
+  const box = (hi[0] - lo[0]) * (hi[1] - lo[1]);
+  const fill = box > 1e-9 ? Math.min(1, Math.abs(S) * 0.5 / box) : 0;
+  return Math.min(1, Math.max(sampled, ou * ov * fill));
+}
 
 /** Priority buckets per level: 2 frustum classes × 8 distance buckets. */
 export const FRUSTUM_CLASSES = 2;
@@ -365,6 +460,14 @@ export const CTR_ITEMCUT = 35; // bricks that got SOME of their items and stay D
  * never fires.
  */
 export const CTR_ORPHAN = 42; // bricks reclaimed from STATE_BUILDING this frame
+/**
+ * §AG — THE COVERAGE HISTOGRAM, four words in the gap below the cumulative
+ * block. `finishBricks` counts the class it PACKS for every occupied voxel it
+ * closes, so `probe:gi2-voxelize` can say what fraction of a scene the
+ * voxelizer now believes is thin — the receipt that separates "the classes are
+ * doing nothing" from "the classes are wrong".
+ */
+export const CTR_COV0 = 43; // + class (43, 44, 45, 46)
 export const CTR_CUMORPHAN = 53; // …and over the whole session, NEVER RESET
 /**
  * ⭐⭐ THE ONE CUMULATIVE COUNTER, AND WHY IT HAD TO EXIST (§19 Stage 3.5).
@@ -493,7 +596,23 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
   // and there is no second clear to keep in step.
   const AX_OFF = PAIR_OFF + PAIR_WORDS;
   const AX_WORDS = MAX_BUILD * BRICK_VOXELS;
-  const WORK_WORDS = AX_OFF + AX_WORDS;
+  // ⭐⭐ §AG — THE COVERAGE SCRATCH, ONE WORD PER SCRATCH VOXEL.
+  //
+  // It cannot ride in either word beside it, and for the same reason those two
+  // are separate from each other: this one's reduction is `atomicAdd` (coverage
+  // is a SUM over the triangles that reach the voxel — a hundred leaves in one
+  // coarse cell are opaque together and transparent apart), while the palette's
+  // is `atomicMax` over a tag and the axis vote's is `atomicMax` over a weight.
+  // Packing an addend into the free high bits of a max-resolved word would let
+  // a carry re-order the max. Three questions, three words — 1 MB at ultra.
+  //
+  // It sits above `RESET_OFF`, so `resetWorkPass` zeroes it every frame and
+  // there is no second clear to keep in step. That per-frame lifetime is what
+  // makes the pack's `COV_REPR` recovery necessary for a resumed brick; see
+  // `finishBricks`.
+  const COVSCR_OFF = AX_OFF + AX_WORDS;
+  const COVSCR_WORDS = MAX_BUILD * BRICK_VOXELS;
+  const WORK_WORDS = COVSCR_OFF + COVSCR_WORDS;
 
   const work = instancedArray(new Uint32Array(WORK_WORDS), "uint");
   const workAttr = work.value;
@@ -521,6 +640,18 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
   // "0 leaks" only means something next to an arm where the bits are withheld
   // and the identical rays pour straight through.
   const faceBitsU = uniform(1);
+  /**
+   * ⭐ §AG'S CONTROL ARM, ON THE DATA AND NOT ON THE TRACER — the same shape
+   * `faceBitsU` and `cullOnU` already have, and for the same reason.
+   *
+   * 0 packs `COV_OPAQUE` into every occupied voxel, so the window is exactly
+   * the solid-slab window of Stage 4.8 and `traceWindow` — the same compiled
+   * pipeline, the same extra buffer read per hit — behaves exactly as it did
+   * before this stage. That is what makes "the cable slab is gone" a statement
+   * about the classes rather than about a rebuild, and it is what lets the leak
+   * receipts be run in both arms without a second build.
+   */
+  const covOnU = uniform(1);
   const pairLimitU = uniform(PAIRS_CAP);
   const levelBudgetU = Array.from({ length: levels }, () => uniform(PAIRS_CAP));
   /**
@@ -672,6 +803,102 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
       const rad = h.x.mul(n.x.abs()).add(h.y.mul(n.y.abs())).add(h.z.mul(n.z.abs()));
       ok.assign(select(n.dot(v0).abs().greaterThan(rad), float(0), ok));
       return ok;
+    },
+  });
+
+  // ═══════════════════════════════════════════════ SHARED FN: §AG's coverage
+  //
+  // The kernel form of `coverageOfTriangleInVoxel` above — read that comment
+  // first; this is the same estimator with the same two terms and the same 4×4
+  // grid. A `sharedFn` for the reason the SAT is one: 16 sample points times
+  // three edge functions stamped out at each call site is exactly the WGSL
+  // bloat `giFn.js` exists to prevent.
+  //
+  // ⚠ `axF` IS PASSED IN, NOT RE-DERIVED. The caller has already computed the
+  // triangle's normal, its length and its dominant axis for the face bits and
+  // the §Q.1 vote; recomputing a cross product per voxel to answer a question
+  // that is constant over the triangle would be the whole cost of the estimator
+  // paid twice.
+  //
+  // ⚠ A vec3 CANNOT BE INDEXED BY A RUNTIME AXIS IN WGSL, so the projection is
+  // three selects per component — `windowTrace`'s `stepOf` constraint, met the
+  // same way. (u, v) are the CYCLIC successors of the axis, so the projection's
+  // handedness is consistent and the orientation flip below is the triangle's
+  // own winding rather than an artefact of the axis choice.
+  const coverageFn = sharedFn({
+    name: "gi2Coverage",
+    type: "float",
+    inputs: [
+      { name: "a0", type: "vec3" }, { name: "a1", type: "vec3" }, { name: "a2", type: "vec3" },
+      { name: "corner", type: "vec3" }, { name: "axF", type: "float" },
+    ],
+    body: (a0, a1, a2, corner, axF) => {
+      const isX = axF.lessThan(0.5).toVar();
+      const isY = axF.greaterThan(0.5).and(axF.lessThan(1.5)).toVar();
+      const pu = (p) => select(isX, p.y, select(isY, p.z, p.x));
+      const pv = (p) => select(isX, p.z, select(isY, p.x, p.y));
+      const cu = pu(corner).toVar();
+      const cv = pv(corner).toVar();
+      const u0 = pu(a0).sub(cu).toVar(); const v0 = pv(a0).sub(cv).toVar();
+      const u1 = pu(a1).sub(cu).toVar(); const v1 = pv(a1).sub(cv).toVar();
+      const u2 = pu(a2).sub(cu).toVar(); const v2 = pv(a2).sub(cv).toVar();
+
+      // TWICE the signed area of the projection. Its SIGN is the winding, and
+      // folding it into the three edge functions turns "all the same sign" into
+      // three `>= 0` compares.
+      const S = u1.sub(u0).mul(v2.sub(v0)).sub(u2.sub(u0).mul(v1.sub(v0))).toVar();
+      const o = select(S.greaterThanEqual(0), float(1), float(-1)).toVar();
+      // ⚠ A DEGENERATE PROJECTION COVERS EVERYTHING — see the CPU mirror's note.
+      // Applied at the RETURN rather than as an early exit, because a `Return()`
+      // inside a laid-out WGSL function is a whole-invocation exit and this is a
+      // value, not a pass.
+      const live = select(S.abs().greaterThan(1e-12), float(1), float(0)).toVar();
+
+      // Edge k from P_k to P_{k+1}: c_k(s) = a_k·s.u + b_k·s.v + w_k, times the
+      // winding. Written as three linear forms so the 16 samples below are two
+      // adds each instead of a fresh cross product each.
+      const ea = [];
+      const eb = [];
+      const ew = [];
+      const P = [[u0, v0], [u1, v1], [u2, v2]];
+      for (let k = 0; k < 3; k++) {
+        const A = P[k];
+        const B = P[(k + 1) % 3];
+        const du = B[0].sub(A[0]).toVar();
+        const dv = B[1].sub(A[1]).toVar();
+        ea.push(dv.negate().mul(o).toVar());
+        eb.push(du.mul(o).toVar());
+        ew.push(dv.mul(A[0]).sub(du.mul(A[1])).mul(o).toVar());
+      }
+      // `a_k · s.u` and `b_k · s.v` take only four values each — precomputed so
+      // the sample loop is adds and compares only.
+      const K = COV_SAMPLES_AXIS;
+      const au = ea.map((a) => Array.from({ length: K }, (_, i) => a.mul((i + 0.5) / K).toVar()));
+      const bv = eb.map((b) => Array.from({ length: K }, (_, j) => b.mul((j + 0.5) / K).toVar()));
+      const hits = float(0).toVar();
+      for (let j = 0; j < K; j++) {
+        for (let i = 0; i < K; i++) {
+          let ok = null;
+          for (let k = 0; k < 3; k++) {
+            const c = au[k][i].add(bv[k][j]).add(ew[k]).greaterThanEqual(0);
+            ok = ok === null ? c : ok.and(c);
+          }
+          hits.addAssign(select(ok, float(1), float(0)));
+        }
+      }
+      const sampled = hits.div(float(K * K)).toVar();
+
+      // THE SLIVER FLOOR. A cable's projection can be thinner than 1/16 of a
+      // cell and miss every sample point while being genuinely present; without
+      // this its voxel would read 0 and a canopy of such slivers would never
+      // add up to an occluder at all.
+      const lu = u0.min(u1).min(u2).toVar(); const hu = u0.max(u1).max(u2).toVar();
+      const lv = v0.min(v1).min(v2).toVar(); const hv = v0.max(v1).max(v2).toVar();
+      const ou = hu.min(1).sub(lu.max(0)).max(0).toVar();
+      const ov = hv.min(1).sub(lv.max(0)).max(0).toVar();
+      const box = hu.sub(lu).mul(hv.sub(lv)).toVar();
+      const fill = S.abs().mul(0.5).div(box.max(1e-9)).min(1).toVar();
+      return sampled.max(ou.mul(ov).mul(fill)).min(1).mul(live);
     },
   });
 
@@ -1059,6 +1286,17 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
             winAtomics.element(levelBase.add(uint(PAL_OFF)).add(shiftRight(vi, uint(2)))),
             select(float(palModeU).greaterThan(0.5), uint(PAL_NONE_WORD), uint(0)),
           );
+          // §AG: the row's four coverage classes are eight ALIGNED bits of a
+          // word four bricks share along x (see `covRowMask`), so this clear is
+          // a merge like `occ`'s and not a store like `face`'s. Cleared to 0
+          // rather than to `COV_OPAQUE` because `finishBricks` packs a class
+          // for every voxel the scratch claimed and the brick's occ bits are
+          // cleared on this same line — an unclaimed voxel is an EMPTY voxel,
+          // and the DDA never reads a class it has no occ bit for.
+          atomicAnd(
+            winAtomics.element(levelBase.add(uint(COV_OFF)).add(shiftRight(vi, uint(4)))),
+            bitNot(shiftLeft(uint(0xff), bitAnd(vi, uint(15)).mul(uint(2)))),
+          );
         });
       });
       // The normalised cursors, so `binPairs` and `finishBricks` read the same
@@ -1192,10 +1430,30 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
         // `triPal` binding to spend (see the file header); `finishBricks`
         // resolves the tag.
         If(hasScratch, () => {
+          const svox = i.mul(uint(BRICK_VOXELS)).add(lx.add(ly.mul(uint(4))).add(lz.mul(uint(16)))).toVar();
           atomicMax(
-            wk.element(uint(SCR_OFF).add(i.mul(uint(BRICK_VOXELS)))
-              .add(lx.add(ly.mul(uint(4))).add(lz.mul(uint(16))))),
+            wk.element(uint(SCR_OFF).add(svox)),
             bitOr(uint(SCR_TAG_DUST), t.add(uint(1))),
+          );
+          // ⭐⭐ §AG — DUST CARRIES COVERAGE TOO, AND IT IS THE CHEAPEST TERM
+          // IN THE FILE.
+          //
+          // A dust triangle is smaller than a quarter cell in every axis, so it
+          // lies WHOLLY inside its centroid's voxel and there is nothing to
+          // clip: its projected area IS its contribution. And the projection on
+          // the dominant axis needs no normalize — `area · |n̂_a|` is just
+          // `|(e1 × e2)_a| / 2`, so the largest component of the raw cross
+          // product, halved, is the answer.
+          //
+          // This is what makes a canopy occlude in AGGREGATE without making one
+          // leaf a wall: each leaf adds ~3 % of a coarse cell, thirty of them
+          // reach class 3, five of them stay class 1. Before this the dust path
+          // wrote all six face bits and stopped every ray outright.
+          const cr = p[1].sub(p[0]).cross(p[2].sub(p[0])).abs().toVar();
+          const projA = cr.x.max(cr.y).max(cr.z).mul(0.5).toVar();
+          atomicAdd(
+            wk.element(uint(COVSCR_OFF).add(svox)),
+            projA.div(vLevel.mul(vLevel)).min(1).mul(float(COV_FIX)).toUint(),
           );
         });
         dustWritten.addAssign(1);
@@ -1478,6 +1736,25 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
             .add(lx.add(ly.mul(uint(4))).add(lz.mul(uint(16))))),
           axVote,
         );
+        // ⭐⭐ §AG — THIS TRIANGLE'S SHARE OF THE VOXEL'S CROSS-SECTION.
+        //
+        // A SUM, not a max, and that is the whole difference between a canopy
+        // and a leaf: one leaf covers 3 % of a coarse cell and thirty of them
+        // cover it, and only an `atomicAdd` says so. Within a frame the sum is
+        // exact — `binPairs`' cursor enumerates each (brick, triangle) pair
+        // once — and across frames a resumed brick's instalments are folded by
+        // `COV_REPR` in `finishBricks`, which is the one place this reduction
+        // differs from the two idempotent ones beside it.
+        //
+        // Fixed point because a storage buffer has no atomic float. 1/4096 of a
+        // cell² is four times finer than the 4 × 4 sample grid can resolve, so
+        // the quantisation is never the limiting error.
+        atomicAdd(
+          wk.element(uint(COVSCR_OFF).add(slot.mul(uint(BRICK_VOXELS)))
+            .add(lx.add(ly.mul(uint(4))).add(lz.mul(uint(16))))),
+          coverageFn(q0, q1, q2, vec3(cx, cy, cz), axIdx.toFloat())
+            .mul(float(COV_FIX)).toUint(),
+        );
         If(palByte.notEqual(uint(PAL_NONE)), () => {
           If(float(palModeU).greaterThan(0.5), () => {
             // THE SHIPPING PATH: one u32 per voxel of scratch, where `max` is
@@ -1706,6 +1983,56 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
           });
         }
         atomicStore(winAtomics.element(faceWord), fw);
+
+        // ⭐⭐ §AG — THE COVERAGE CLASS OF THE SAME FOUR VOXELS.
+        //
+        // ⚠ AND NOT A PLAIN STORE, BECAUSE THIS WORD IS NOT THE BRICK'S. Four
+        // voxels of `pal` or `face` are one whole word and the brick owns it;
+        // four voxels of `cov` are ONE BYTE of a word FOUR BRICKS share along
+        // x. What saves it from a CAS is that the split is exactly on byte
+        // boundaries — `vi` is a multiple of 4 at the start of every brick row,
+        // so brick `bx` owns bits [(bx&3)·8, +8) and nothing else — so an
+        // `atomicAnd` of the complement followed by an `atomicOr` of the new
+        // byte touches only bits this thread owns, and a neighbouring brick's
+        // lane in the same word is untouched by both. One thread per brick, so
+        // the read below cannot race its own write either.
+        const covWord = levelBase.add(uint(COV_OFF)).add(shiftRight(vi, uint(4))).toVar();
+        const covSh = bitAnd(vi, uint(15)).mul(uint(2)).toVar();
+        const cbase = uint(COVSCR_OFF).add(slotOfRow(i, ly, lz)).toVar();
+        const cw = atomicLoad(winAtomics.element(covWord)).toVar();
+        const newByte = uint(0).toVar();
+        for (let k = 0; k < 4; k++) {
+          const sc = atomicLoad(wk.element(cbase.add(uint(k)))).toVar();
+          const stored = bitAnd(shiftRight(cw, covSh.add(uint(k * 2))), uint(3)).toVar();
+          // ⭐ THE RESUMED BRICK'S RECOVERY. The scratch is per FRAME, so an
+          // instalment sees only its own slice of the voxel's triangles; the
+          // stored class is what the earlier ones added up to, and `COV_REPR`
+          // turns it back into a number this one can add to. Monotone by
+          // construction (`COV_REPR[c]` is inside class `c`'s own band, so a
+          // brick can never lose a class it has already earned) and biased
+          // toward opaque, which is the direction the wall invariant needs.
+          let repr = float(COV_REPR[3]);
+          for (let c = 2; c >= 0; c--) repr = select(stored.equal(uint(c)), float(COV_REPR[c]), repr);
+          const f = sc.toFloat().div(float(COV_FIX)).add(repr).toVar();
+          // The edges ASCEND, so a plain chain of overwrites is the quantiser —
+          // the last one whose edge `f` clears wins.
+          let cls = uint(0);
+          for (let c = 0; c < 3; c++) cls = select(f.greaterThanEqual(float(COV_EDGES[c])), uint(c + 1), cls);
+          const clsV = cls.toVar();
+          // Nothing added here this frame → the stored class stands. And the
+          // control arm packs `COV_OPAQUE` everywhere, so the window it leaves
+          // is bit-for-bit the solid-slab window of Stage 4.8.
+          const finalCls = select(sc.equal(uint(0)), stored,
+            select(float(covOnU).greaterThan(0.5), clsV, uint(COV_OPAQUE))).toVar();
+          newByte.assign(bitOr(newByte, shiftLeft(finalCls, uint(k * 2))));
+          // The histogram, on the CLOSING instalment only — a brick counted at
+          // every instalment would report its voxels once per frame it took.
+          If(done.and(bitAnd(shiftRight(nib, uint(k)), uint(1)).notEqual(uint(0))), () => {
+            atomicAdd(ct.element(uint(CTR_COV0).add(finalCls)), uint(1));
+          });
+        }
+        atomicAnd(winAtomics.element(covWord), bitNot(shiftLeft(uint(0xff), covSh)));
+        atomicOr(winAtomics.element(covWord), shiftLeft(newByte, covSh));
       });
     });
 
@@ -1827,6 +2154,17 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
      * in the SAME session.
      */
     setCull(on) { cullOnU.value = on ? 1 : 0; },
+    /**
+     * §AG's control arm, ON THE DATA. Off packs `COV_OPAQUE` into every
+     * occupied voxel, so the window is the solid-slab window this stage
+     * replaced and `traceWindow` — same pipeline, same buffer reads — behaves
+     * exactly as it did before it. Requires a re-voxelize (`markAllDirty`) to
+     * take effect, because the class is written at pack time and not read at
+     * trace time.
+     */
+    setCoverage(on) { covOnU.value = on ? 1 : 0; },
+    /** What `setCoverage` last accepted. */
+    get coverageOn() { return covOnU.value > 0.5; },
 
     /** The per-frame receipt (§K.8). A 144-byte readback, not the work buffer. */
     async stats(renderer) {
@@ -1882,6 +2220,12 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
         itemCut: a[CTR_ITEMCUT],
         maxItemTris: a[CTR_MAXTRIS],
         maxCellCursor: a[CTR_MAXCELL],
+        // ── §AG: what fraction of the scene the voxelizer calls THIN ───────
+        // Counted at the pack, over occupied voxels of bricks that CLOSED this
+        // frame. `covClasses[3] / Σ` on a street scene is the receipt that says
+        // whether the classes are doing anything at all; a scene of walls is
+        // ~all 3 and that is the correct answer for it.
+        covClasses: [a[CTR_COV0], a[CTR_COV0 + 1], a[CTR_COV0 + 2], a[CTR_COV0 + 3]],
         perLevel,
       };
     },
@@ -1893,8 +2237,11 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
       cullFraction: CULL_FRACTION,
       itemsPerFrame: ITEMS_CAP, trisPerItem: TRIS_PER_ITEM, itemsPerBrick: EMIT_BOUND,
       dustLimits: Array.from({ length: levels }, (_, l) => +(voxel0 * Math.pow(2, l) * CULL_FRACTION).toFixed(4)),
+      covEdges: COV_EDGES.slice(),
+      covSamplesAxis: COV_SAMPLES_AXIS,
       workMB: +((WORK_WORDS * 4) / 1048576).toFixed(3),
       scratchMB: +((SCR_WORDS * 4) / 1048576).toFixed(3),
+      covScratchMB: +((COVSCR_WORDS * 4) / 1048576).toFixed(3),
       cursorKB: +(((CUR_WORDS + CEL_WORDS) * 4) / 1024).toFixed(1),
       itemListMB: +((ITM_WORDS * 4) / 1048576).toFixed(3),
       pairListMB: +((PAIR_WORDS * 4) / 1048576).toFixed(3),
