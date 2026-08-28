@@ -6,7 +6,59 @@ import { vmSingleton } from "../singleton.js";
 const ids = vmSingleton("consoleStoreIds", () => ({ next: 1 }));
 const MAX_ENTRIES = 500;
 
-export const useConsoleStore = vmSingleton("consoleStore", () => create((set) => ({
+// Entries queued by push() (the console tee's hot path) but not yet committed
+// to the store, plus whether a flush is already scheduled. Both are VM-wide
+// for the same reason `ids` is: a duplicated module copy must share one queue
+// and one flush loop, not fork them.
+const pending = vmSingleton("consoleStorePending", () => []);
+const flushState = vmSingleton("consoleStoreFlushState", () => ({ scheduled: false }));
+
+const scheduleTick =
+  typeof requestAnimationFrame === "function" ? requestAnimationFrame : (fn) => setTimeout(fn, 50);
+
+function scheduleFlush() {
+  if (flushState.scheduled) return;
+  flushState.scheduled = true;
+  scheduleTick(flushPending);
+}
+
+// Drains everything push() queued since the last flush into ONE store commit.
+// GI logs hundreds of lines within a single boot-time tick; without this, each
+// line was its own synchronous `set()` (a React re-render) on top of its own
+// eager format() call. Coalescing to at most one commit per animation frame
+// turns a burst of N lines into O(1) re-renders instead of O(N).
+function flushPending() {
+  flushState.scheduled = false;
+  if (pending.length === 0) return;
+  const batch = pending.splice(0, pending.length);
+  const state = useConsoleStore.getState();
+  let entries = state.entries.concat(batch);
+  if (entries.length > MAX_ENTRIES) entries = entries.slice(entries.length - MAX_ENTRIES);
+  let unreadErrors = state.unreadErrors;
+  for (const entry of batch) if (entry.level === "error") unreadErrors++;
+  useConsoleStore.setState({ entries, unreadErrors });
+}
+
+// `args` is kept as the raw, unformatted console arguments. Formatting
+// (JSON.stringify etc.) is real work, and doing it here — on every log line,
+// whether or not anyone ever looks at it — was the other half of the boot
+// stall. `message` defers it to whichever consumer looks at the entry first
+// (the panel rendering a visible row, or the `console.read` op), and caches
+// the result so scrolling past it twice doesn't format it twice.
+function makeEntry(level, args, time) {
+  let cached;
+  return {
+    id: ids.next++,
+    level,
+    time,
+    get message() {
+      if (cached === undefined) cached = format(args);
+      return cached;
+    },
+  };
+}
+
+export const useConsoleStore = vmSingleton("consoleStore", () => create(() => ({
   entries: [],
   // Number of error-level entries the user hasn't seen yet. Incremented when a
   // new error lands, reset to zero when the Console panel becomes active (i.e.
@@ -14,24 +66,22 @@ export const useConsoleStore = vmSingleton("consoleStore", () => create((set) =>
   // draw the red-dot indicator.
   unreadErrors: 0,
 
-  push(level, message) {
-    set((state) => {
-      const entries = [...state.entries, { id: ids.next++, level, message, time: new Date() }];
-      if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES);
-      return {
-        entries,
-        unreadErrors: level === "error" ? state.unreadErrors + 1 : state.unreadErrors,
-      };
-    });
+  // Called by the console tee. Must stay O(1) — no formatting, no store
+  // commit — see scheduleFlush/flushPending above for why.
+  push(level, args) {
+    pending.push(makeEntry(level, args, new Date()));
+    scheduleFlush();
   },
 
   clear() {
-    set({ entries: [], unreadErrors: 0 });
+    pending.length = 0;
+    flushState.scheduled = false;
+    useConsoleStore.setState({ entries: [], unreadErrors: 0 });
   },
 
   /** Called by the editor shell when the Console tab becomes the active tab. */
   markConsoleRead() {
-    set({ unreadErrors: 0 });
+    useConsoleStore.setState({ unreadErrors: 0 });
   },
 })));
 
@@ -88,26 +138,32 @@ export function installConsoleCapture() {
   for (const level of ["log", "info", "warn", "error"]) {
     const original = console[level].bind(console);
     console[level] = (...args) => {
-      const message = format(args);
       try {
-        // The ORIGINAL arguments, not the flattened string: devtools then
+        // The ORIGINAL arguments, not a flattened string: devtools then
         // reports each line's real call site and keeps objects inspectable.
-        // Logging the formatted copy instead made every line in the browser
+        // Logging a formatted copy instead made every line in the browser
         // console read as `consoleStore.js:<line>`, which hid the origin of
         // exactly the messages someone opens devtools to trace.
         original(...args);
       } catch {
-        original(message);
+        // format() is the expensive path (JSON.stringify attempts); it's
+        // only worth paying for on this rare fallback, when the real
+        // console itself couldn't take the raw args.
+        try {
+          original(format(args));
+        } catch {
+          // args are pathological even as a string — nothing left to try.
+        }
       }
-      useConsoleStore.getState().push(level === "info" ? "log" : level, message);
+      useConsoleStore.getState().push(level === "info" ? "log" : level, args);
     };
   }
   window.addEventListener("error", (e) => {
-    useConsoleStore.getState().push("error", `${e.message}${errorDetail(e.error, e)}`);
+    useConsoleStore.getState().push("error", [`${e.message}${errorDetail(e.error, e)}`]);
   });
   window.addEventListener("unhandledrejection", (e) => {
     const reason = e.reason;
     const head = reason?.message ?? reason;
-    useConsoleStore.getState().push("error", `Unhandled rejection: ${head}${errorDetail(reason, null)}`);
+    useConsoleStore.getState().push("error", [`Unhandled rejection: ${head}${errorDetail(reason, null)}`]);
   });
 }
