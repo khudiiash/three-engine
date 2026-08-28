@@ -5735,3 +5735,33 @@ and `gatherProbes` and did not go near the voxelizer, so 2.80 → 3.21 happened
 across two batteries with NO change to the pass in between. Three runs of
 `ARMS=dolly npm run probe:gi2-motion` would close it; the argument does not
 depend on them.
+
+## §AM — the palette emitter band does not self-heal (OPEN, not §19 6.2's to fix)
+
+Found while explaining why every gi2 probe reported the user's Bistro as having
+**0 emitters** when the live editor seats four lamps. The seat half of that was a
+harness race and is fixed (`scripts/lib/gi2EmitterWait.mjs`, 6.2b): `first light`
+fires on geometry-ready, a `.mat` carries its emissive on `emissiveNode`, that
+node lands with the material tail up to ~27 s later, and `#checkFingerprint`
+re-mints the entries afterwards — so `_emitterInfos` catches up on its own and a
+probe only has to wait for it. **The palette band does not catch up.**
+`GISystem.js:18176` files a placement as `emitter: authored > 1e-4 ||
+raw.emissivePending`, and for a `.mat` whose graph has not compiled yet BOTH are
+false — `emissivePending` (`voxelizeOnce.js:344`) covers only a *texture* awaiting
+its average, never a material asset awaiting its node. So at the first build every
+placement is filed non-emitter, the 8 classes `GI2_PAL_EMITTER_CLASSES` reserves
+go unused, and the assignment is stamped into the soup's `triPal` and into every
+voxel's `pal` byte. `soupKey` has no material term, so a re-tint recomputes
+colours against an assignment it cannot change and nothing ever revisits it. That
+is the `palette 62 of 63 classes, 0 with emission` half of the boot line, and
+unlike the seats it persists for the entire scene-open — confirmed still present
+in the 6.2 doors run, on a soup of 2 827 888 triangles, four lamps in the scene.
+`window/gi2System.js:204` records the same shape once before ("Bistro shipped
+`0 of 15 classes with emission` while its own resolver was finding 95 lamps"),
+which makes this the second sighting and not a one-off.
+
+The fix is almost certainly to widen `emissivePending` to mean "this mesh's
+material asset has not finished loading" rather than its current texture-only
+meaning — i.e. keep the placement in the emitter band until the material can
+answer. It is deliberately NOT bundled into 6.2: 6.2 is the shadow tree, this is
+the palette, and the two share nothing but the boot line that reported them.

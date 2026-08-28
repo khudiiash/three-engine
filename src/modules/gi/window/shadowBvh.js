@@ -218,9 +218,9 @@ const bvhAnyHitFn = wgslFn(/* wgsl */ `
 				let n = u32( count );
 				for ( var i: u32 = 0u; i < n; i = i + 1u ) {
 
-					// ⭐ §19 6.2 — THE INDIRECTION. `tris` is the SOUP'S OWN
+					// ⭐ §19 6.2 — THE INDIRECTION. tris is the SOUP'S OWN
 					// buffer, in the soup's order, so a leaf's contiguous run
-					// addresses `triIdx` and THAT addresses the triangle. One
+					// addresses triIdx and THAT addresses the triangle. One
 					// extra u32 load per candidate buys back 32 B/tri of VRAM —
 					// and with it the 828 k triangles the 5.5b cap silently dropped.
 					let o = triIdx[ first + i ] * 9u;
