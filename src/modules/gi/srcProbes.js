@@ -234,7 +234,12 @@ export const FLAG_WARM_ONE = 1 << FLAG_WARM_SHIFT;
 export const WARM_FRAMES = (() => {
   const raw = Number(globalThis.__gi2RcWarmFrames);
   if (Number.isFinite(raw)) return Math.max(0, Math.min(15, Math.floor(raw)));
-  return 8;
+  // 08-28 22:40: DEFAULT 0 — refuted by its own Bistro receipt (moving black
+  // 5.06 → 8.63 %, recovery 13.8 → 52.8 %): forcing every cascade for newborn
+  // probes makes them compete for a FIXED ray budget, so each fills sparser.
+  // The mechanism to fix is budget PRIORITY for fresh c0 probes + parent
+  // seeding, not a longer window. `__gi2RcWarmFrames = 8` re-arms the arm.
+  return 0;
 })();
 /** The flag word a claim writes: alive + fresh + blocknew + a full countdown. */
 export const FLAG_CLAIMED = FLAG_ALIVE | FLAG_FRESH | FLAG_BLOCKNEW
