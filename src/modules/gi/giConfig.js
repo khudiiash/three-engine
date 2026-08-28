@@ -787,7 +787,10 @@ export function rc5BvhShadowEnabled(runtime = globalThis) {
   // 08-29 01:10: DEFAULT ON again — the swap no longer rebuilds anything
   // (persistent slot + uniform-gated arm, 636bba3); the black frame is
   // unreachable. `__gi2Rc5BvhShadow = 0` restores the voxel arm.
-  return (runtime?.__gi2Rc5BvhShadow ?? 1) !== 0;
+  // 08-29 01:50: DEFAULT OFF again — on Bistro (2.8 M tris) the arm reads
+  // 3 fps in the user's editor; re-enable per tier/triangle count once its
+  // per-frame cost and the 2 M-triangle cap are measured. `= 1` arms it.
+  return (runtime?.__gi2Rc5BvhShadow ?? 0) !== 0;
 }
 
 /**
