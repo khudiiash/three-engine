@@ -229,7 +229,11 @@ defineOp({
       rotation: rotation ?? before.rotation,
       scale: scale ?? before.scale,
     };
-    commandBus.execute(new SetTransformCommand(id, after, before));
+    // executeCoalesced, not execute: a script/agent calling this once per
+    // frame (dragging something live) must not mint one undo entry per
+    // frame. Consecutive calls on the same entity within 300ms collapse
+    // into the single entry already on top of the stack.
+    commandBus.executeCoalesced(new SetTransformCommand(id, after, before), `entity.setTransform:${id}`);
     return describeEntity(entity);
   },
 });

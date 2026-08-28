@@ -11,6 +11,11 @@ export class SetTransformCommand {
     this.after = after;
     this.before = before ?? engine.getEntity(entityId).getTransform();
     this.label = "Transform";
+    // Tells CommandBus#afterMutation this never touched the hierarchy, tags
+    // or components, so it can update just this entity's mirrored transform
+    // instead of rebuilding the whole scene store.
+    this.transformOnly = true;
+    this.entityIds = [entityId];
   }
 
   do() {

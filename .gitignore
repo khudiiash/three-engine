@@ -63,3 +63,4 @@ vite.energy.config.mjs
 .vite-cold/
 vite.cold.config.mjs
 .vite-bvh/
+.vite-tx/
