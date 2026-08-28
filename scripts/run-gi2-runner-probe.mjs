@@ -649,6 +649,24 @@ const installed = await page.evaluate(async ({ path }) => {
       // The mean cannot tell them apart. The spread within one frame's own
       // samples can: lo/hi/sd over the very pixels the mean averaged.
       const Ls = [];
+      // ⭐⭐⭐ §19 4.9 — THE OWNERSHIP MOSAIC, PER PIXEL.
+      //
+      // The user's `src-probes` screenshot of a Bistro façade shows c0's 0.5 m
+      // cells as a PATCHWORK on one flat wall: light-blue c0-owned cells with
+      // green c1-owned gaps between them. Two adjacent pixels of one plane
+      // answered by two different lattices holding two different values IS the
+      // per-pixel bimodality, and no column in this probe could see it — the
+      // `d` rows below are MEANS over the cluster, and a mean over a mosaic is
+      // a smooth number describing a checkerboard. [[probe-blind-statistics]]
+      //
+      // So the argmax over each PIXEL's own `claim` row is kept, and the
+      // fraction of the patch that disagrees with the patch's modal owner is
+      // reported beside the spread. `mixD` is what it costs: the mean
+      // luminance of the minority owner against the majority's, so "they
+      // disagree about who answers" and "they disagree about the answer" are
+      // two numbers rather than one worry.
+      const owners = [];
+      const ownL = [];
       const dg = Array.from({ length: DV }, () => [0, 0, 0, 0]);
       for (let k = 0; k < sp.n; k++) {
         const o = (sp.from + k) * OV * 4;
@@ -674,6 +692,18 @@ const installed = await page.evaluate(async ({ path }) => {
           const q = o + (3 + c) * 4;
           dg[c][0] += raw[q]; dg[c][1] += raw[q + 1]; dg[c][2] += raw[q + 2]; dg[c][3] += raw[q + 3];
         }
+        // Which cascade SPENT this pixel — the argmax of its own claim column.
+        // ⚠ `NC` — the IN-PAGE cascade count. `NCASC` is a Node-side const and
+        // referencing it here throws once per frame inside `page.evaluate`,
+        // which empties every series and inflates the frame time the same
+        // receipt is reading. The reducer runs in the browser.
+        let dom = -1; let dc = -1;
+        for (let c = 0; c < NC; c++) {
+          const cl = raw[o + (3 + c) * 4 + 2];
+          if (cl > dc) { dc = cl; dom = c; }
+        }
+        owners.push(dom);
+        ownL.push(LUM(raw[o + 4], raw[o + 5], raw[o + 6]));
       }
       if (!n) { out[sp.key] = { n: 0 }; continue; }
       // ⚠⚠ SIGNIFICANT FIGURES, NOT DECIMAL PLACES. `toFixed(6)` on a field
@@ -684,12 +714,26 @@ const installed = await page.evaluate(async ({ path }) => {
       // does not depend on how bright the scene happens to be.
       const mu = Ls.reduce((a, x) => a + x, 0) / n;
       const sd = Math.sqrt(Ls.reduce((a, x) => a + (x - mu) * (x - mu), 0) / n);
+      const tally = new Map();
+      for (const d of owners) tally.set(d, (tally.get(d) ?? 0) + 1);
+      let modal = -1; let best = -1;
+      for (const [d, c] of tally) if (c > best) { best = c; modal = d; }
+      const mix = owners.length ? 1 - best / owners.length : 0;
+      const maj = ownL.filter((_, i) => owners[i] === modal);
+      const min_ = ownL.filter((_, i) => owners[i] !== modal);
+      const avg = (xs) => (xs.length ? xs.reduce((a, x) => a + x, 0) / xs.length : NaN);
+      const mA = avg(maj); const mI = avg(min_);
       out[sp.key] = {
         n,
         E: [sig(r / n), sig(g / n), sig(b / n)],
         L: sig(LUM(r / n, g / n, b / n)),
         pre: sig(pre / n),
         lo: sig(Math.min(...Ls)), hi: sig(Math.max(...Ls)), sd: sig(sd),
+        // The ownership mosaic: what share of this patch is answered by a
+        // cascade OTHER than its modal one, and how far apart the two groups'
+        // luminances are.
+        mix: +mix.toFixed(4),
+        mixD: Number.isFinite(mI) && mA > 1e-6 ? +Math.abs(mI - mA) / mA : 0,
         d: dg.map((v) => v.map((x) => +(x / n).toFixed(4))),
       };
     }
@@ -827,13 +871,13 @@ const installed = await page.evaluate(async ({ path }) => {
   };
   R.finish = async () => { await Promise.all(R.pending); return { frames: R.frames, err: R.err }; };
   return {
-    ok: true, hasDiag: sampler.hasDiag, DV: sampler.DV, NC,
+    ok: true, hasDiag: sampler.hasDiag, DV: sampler.DV, DC: sampler.DC, NC,
     world: world?.describe?.() ?? null, hasPlayer: !!player,
   };
 }, { path });
 
 if (!installed.ok) { console.log(`FATAL install: ${installed.why}`); await browser.close(); process.exit(1); }
-console.log(`  recorder in: diag ${installed.hasDiag ? `yes (${installed.DV} cascades)` : "NO — __gi2NoiseDump missed"}` +
+console.log(`  recorder in: diag ${installed.hasDiag ? `yes (${installed.DC} cascade rows + 1 fallback row of ${installed.DV})` : "NO — __gi2NoiseDump missed"}` +
   `, world ${installed.world ? `${installed.world.cascades}×${installed.world.cells}³ spacings ${installed.world.spacings.join("/")} m, ` +
     `extents ${installed.world.extents.join("/")} m` : "OFF"}` +
   `, player ${installed.hasPlayer ? "yes" : "no"}`);
@@ -950,6 +994,12 @@ const SERIES_KEYS = [
 ];
 const KIND = (k) => (k === "near" ? "moving" : k === "body" ? "body" : k[0] === "g" ? "ground" : "façade");
 const FIXED = (k) => k[0] === "g" || k[0] === "f";
+/**
+ * §19 4.9. `diagBuf` is `DC` cascade rows then ONE fallback row; the fallback
+ * row is always the last, so its index is `DV - 1` on every tier.
+ */
+const NCASC = installed.DC ?? installed.DV ?? 0;
+const FBROW = Math.max(0, (installed.DV ?? 0) - 1);
 
 // ⭐⭐⭐ THE LIT FLOOR, DERIVED FROM THE FRAME RATHER THAN CHOSEN.
 //
@@ -1020,24 +1070,33 @@ const tauOf = (frames, key, seg) => {
 const classify = (st) => {
   const A = st.a.ser[st.key]; const B = st.b.ser[st.key];
   const dA = A.d ?? []; const dB = B.d ?? [];
-  const ind = { fresh: 0, cov: 0, claim: 0, vis: 0, scroll: 0, pre: NaN };
-  // ⚠⚠ THE LAST CASCADE'S `.w` IS NOT `vis`. `resolveHalf` writes
-  // `vec4(cov, fresh, claim, vis)` for every cascade EXCEPT the last, where the
-  // fourth slot carries the resolve's OWN LUMINANCE instead
-  // (`gatherProbes.js:4099`). Reading it as `vis` makes the vis column a
-  // restatement of the step it is supposed to explain, and 21 % of this
-  // probe's first attribution table was exactly that tautology.
+  const ind = { fresh: 0, cov: 0, claim: 0, vis: 0, scroll: 0, pre: NaN, fb: 0, face: 0, csum: NaN };
+  // ⚠⚠ THE LAST *ROW* IS NOT A CASCADE. `resolveHalf` writes `NCASC` rows of
+  // `vec4(cov, fresh, claim, vis)` and then §19 4.9's FALLBACK row
+  // `vec4(faceCov, tail, csum, luminance)`. Scoring that row as a fourth
+  // cascade reads `faceCov` as `cov` and the resolve's own luminance as `vis`
+  // — the tautology that was 21 % of this probe's first attribution table,
+  // re-created one row over. `NCASC` comes from the gather itself.
   let domA = -1; let domB = -1; let cA = -1; let cB = -1;
-  for (let c = 0; c < dA.length; c++) {
+  for (let c = 0; c < Math.min(NCASC, dA.length); c++) {
     if (!dA[c] || !dB[c]) continue;
     ind.cov = Math.max(ind.cov, Math.abs(dB[c][0] - dA[c][0]));
     ind.fresh = Math.max(ind.fresh, Math.abs(dB[c][1] - dA[c][1]));
     ind.claim = Math.max(ind.claim, Math.abs(dB[c][2] - dA[c][2]));
-    if (c < dA.length - 1 && dA[c][0] > 0.05 && dB[c][0] > 0.05) {
+    if (dA[c][0] > 0.05 && dB[c][0] > 0.05) {
       ind.vis = Math.max(ind.vis, Math.abs(dB[c][3] - dA[c][3]));
     }
     if (dA[c][2] > cA) { cA = dA[c][2]; domA = c; }
     if (dB[c][2] > cB) { cB = dB[c][2]; domB = c; }
+  }
+  // ⭐⭐ §19 4.9 — THE TWO SWITCHES §AE COULD NOT SEE. `tail` is the share of
+  // this sample's pixels the fallback carried (0/1 per pixel before 4.9, a
+  // ramp after it), `faceCov` its own input, and `csum` the conservation sum.
+  const fbA = dA[FBROW]; const fbB = dB[FBROW];
+  if (fbA && fbB) {
+    ind.fb = Math.abs(fbB[1] - fbA[1]);
+    ind.face = Math.abs(fbB[0] - fbA[0]);
+    ind.csum = Math.min(fbA[2], fbB[2]);
   }
   // Which cascade SPENT the pixel. A flip here is the hand-off changing hands,
   // and both `cov` and `claim` can stay flat through one.
@@ -1059,6 +1118,12 @@ const classify = (st) => {
   if (ind.cov > 0.03) return { cls: "C corner liveness (cov)", ind };
   if (ind.claim > 0.03) return { cls: "C hand-off claim", ind };
   if (ind.vis > 0.05) return { cls: "C Chebyshev vis", ind };
+  // ⭐⭐ §19 4.9. Deliberately BELOW every C class and ABOVE both F classes: the
+  // question §AE left open is whether the "every weight flat" residual is the
+  // fallback switching, so the fallback may only claim a step no cascade term
+  // explains. A share here is a measurement of that residual, not a re-priced
+  // one.
+  if (ind.fb > 0.03) return { cls: "G fallback switch", ind };
   // ⭐⭐ THE RESIDUAL IS NOT "UNKNOWN" — IT IS A NAMED MECHANISM. Every weight
   // the resolve builds its composite from is flat, and the answer still moved.
   // What is left is the RADIANCE the eight corners hold — and if the field is
@@ -1074,7 +1139,7 @@ const armReport = (arm) => {
   const frames = results[arm] ?? [];
   if (!frames.length) return;
   console.log(`\n══ arm "${arm}" ═══════════════════════════════════════════════`);
-  console.log(`  series  kind    seg     n  px50 sprd    E p50    step p50   p90      max     >${STEP_PCT}%  >${BIG_PCT}%   τ`);
+  console.log(`  series  kind    seg     n  px50 sprd  mix  mixD    E p50    step p50   p90      max     >${STEP_PCT}%  >${BIG_PCT}%   τ`);
   for (const key of SERIES_KEYS) {
     for (const seg of ["park", "out", "back"]) {
       const st = stepsOf(frames, key, seg);
@@ -1085,8 +1150,11 @@ const armReport = (arm) => {
       const spr = frames.filter((fr) => fr.seg === seg && fr.ser?.[key]?.n > 1 && fr.ser[key].L > 1e-6)
         .map((fr) => (fr.ser[key].hi - fr.ser[key].lo) / fr.ser[key].L);
       const npx = frames.filter((fr) => fr.seg === seg && fr.ser?.[key]?.n).map((fr) => fr.ser[key].n);
+      const mixes = frames.filter((fr) => fr.seg === seg && fr.ser?.[key]?.n).map((fr) => fr.ser[key].mix ?? 0);
+      const mixDs = frames.filter((fr) => fr.seg === seg && fr.ser?.[key]?.n).map((fr) => fr.ser[key].mixD ?? 0);
       console.log(`  ${key.padEnd(6)} ${KIND(key).padEnd(7)} ${seg.padEnd(6)} ${String(rs.length).padStart(4)}  ` +
-        `${String(pctl(npx, 50)).padStart(3)} ${f(pctl(spr, 50), 2).padStart(5)}  ` +
+        `${String(pctl(npx, 50)).padStart(3)} ${f(pctl(spr, 50), 2).padStart(5)} ` +
+        `${f(pctl(mixes, 50), 2).padStart(4)} ${f(pctl(mixDs, 90), 2).padStart(5)} ` +
         `${f(pctl(Ls, 50), 4).padStart(7)}  ${f(100 * pctl(rs, 50), 1).padStart(7)}% ` +
         `${f(100 * pctl(rs, 90), 1).padStart(6)}% ${f(100 * Math.max(...rs), 1).padStart(7)}%  ` +
         `${String(rs.filter((r) => r > STEP_PCT / 100).length).padStart(5)} ` +
@@ -1108,6 +1176,38 @@ const armReport = (arm) => {
   for (const [k, v] of Object.entries(cls).sort((a, b) => b[1] - a[1])) {
     console.log(`    ${k.padEnd(30)} ${String(v).padStart(5)}   ${f((100 * v) / Math.max(1, tot), 1)} %`);
   }
+  // ⭐⭐⭐ §19 4.9 — THE FALLBACK CENSUS, A SECOND CUT OF THE SAME STEPS.
+  //
+  // The attribution above is a PRIORITY ORDER, so a step whose `cov` also moved
+  // is scored as C even when the fallback switched under it. That answers "what
+  // is the leading term"; it does not answer "how many of these steps have a
+  // fallback switch in them at all", which is the question §AE.4 left open. So
+  // the same population is cut a second time, on the raw co-occurrence.
+  const withFb = all.filter((t) => t.ind.fb > 0.03);
+  const fFlat = all.filter((t) => t.ind.fresh <= 0.03 && !t.ind.scroll
+    && !t.ind.dom && t.ind.cov <= 0.03 && t.ind.claim <= 0.03 && t.ind.vis <= 0.05);
+  const fFlatFb = fFlat.filter((t) => t.ind.fb > 0.03);
+  console.log(`  fallback census: ${withFb.length} of ${tot} steps `
+    + `(${f((100 * withFb.length) / Math.max(1, tot), 1)} %) carry a tail switch > 0.03; `
+    + `of the ${fFlat.length} "every cascade weight flat" steps, ${fFlatFb.length} `
+    + `(${f((100 * fFlatFb.length) / Math.max(1, fFlat.length), 1)} %) do.`);
+  // The population statistic, over every recorded sample rather than the steps.
+  let nS = 0; let inFb = 0; let fbSum = 0; let csMin = Infinity; let csBad = 0;
+  for (const fr of frames) {
+    for (const key of SERIES_KEYS) {
+      const v = fr.ser?.[key];
+      if (!(v?.n) || !v.d?.[FBROW]) continue;
+      nS++; fbSum += v.d[FBROW][1];
+      if (v.d[FBROW][1] > 0.001) inFb++;
+      const cs = v.d[FBROW][2];
+      csMin = Math.min(csMin, cs);
+      if (cs < 0.99) csBad++;
+    }
+  }
+  console.log(`  tail weight: mean ${f(fbSum / Math.max(1, nS), 4)} over ${nS} samples; `
+    + `${f((100 * inFb) / Math.max(1, nS), 1)} % of samples carry any tail.  `
+    + `conservation Σcontrib: min ${f(csMin, 4)}, ${csBad} samples `
+    + `(${f((100 * csBad) / Math.max(1, nS), 1)} %) below 0.99.`);
   all.sort((a, b) => b.r - a.r);
   console.log(`\n  the three largest steps:`);
   for (const t of all.slice(0, 3)) {
@@ -1213,6 +1313,11 @@ console.log(`  GATE 2  p90 step ≤ 2 % per frame on the fixed ground and façad
 console.log(`  GATE 3  autocorrelation time τ ≥ 30 frames (0.5 s) on every series.`);
 console.log(`  GATE 4  the park segment's p90 ≤ 0.5 % — a field that churns while the`);
 console.log(`          root is still cannot be fixed on the motion side.`);
+console.log(`  GATE 5  ⭐ THE OWNERSHIP MOSAIC. \`mix\` is the share of one patch's pixels`);
+console.log(`          answered by a cascade OTHER than the patch's modal one, \`mixD\` the`);
+console.log(`          gap between the two groups' luminances. On ONE FLAT SURFACE the`);
+console.log(`          answering cascade must not flip cell-to-cell: target mix ≤ 0.05,`);
+console.log(`          and where a real blend boundary crosses a patch, mixD ≤ 0.10.`);
 
 if (JSON_OUT) {
   writeFileSync(JSON_OUT, JSON.stringify({

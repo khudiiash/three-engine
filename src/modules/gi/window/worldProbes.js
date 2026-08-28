@@ -957,9 +957,9 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       // budget. Beyond that the cell is buried and holds no probe: a probe
       // inside a solid is the classic lattice leak, and refusing to place one
       // is cheaper and safer than any weight that tries to discount it.
-      const escapeAlongNormal = () => {
-        Loop({ start: 1, end: 4, name: "wpEscape" }, ({ wpEscape }) => {
-          const q = p.add(nn.mul(vl.mul(float(wpEscape).add(0.5)))).toVar();
+      const escapeAlongNormal = (dir, nm) => {
+        Loop({ start: 1, end: 4, name: nm }, ({ [nm]: kk }) => {
+          const q = p.add(dir.mul(vl.mul(float(kk).add(0.5)))).toVar();
           const qc = cellOfWorld(q);
           If(occAt(qc.level.toUint(), qc.vi).not(), () => {
             pos.assign(q);
@@ -968,8 +968,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
           });
         });
       };
-      const placeInsideCell = () => {
-        const sf = pickF(casc, SPC_FINER).toVar();
+      const placeInsideCell = (sf) => {
         const best = float(1e9).toVar();
         Loop({ start: 0, end: 3, name: "wpPlaceZ" }, ({ wpPlaceZ }) => {
           const oz = float(wpPlaceZ).sub(1).toVar();
@@ -995,8 +994,52 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
           });
         });
       };
-      if (!PLACE_IN_CELL || NC === 1) escapeAlongNormal();
-      else If(casc.equal(uint(0)), escapeAlongNormal).Else(placeInsideCell);
+      /**
+       * ⭐⭐⭐ §19 4.9 — CASCADE 0's ESCAPE IS THREE RULES NOW, AND THE USER SAW
+       * WHY IN ONE SCREENSHOT.
+       *
+       * The `src-probes` view of a Bistro façade showed c0's 0.5 m cells as a
+       * PATCHWORK: scattered light-blue (c0-owned) cells with green (c1-owned)
+       * gaps between them on ONE FLAT WALL. A gap is a cell `allocPass` marked
+       * DEAD, and the resolve's `cov = Σ tri·live` then hands that pixel to the
+       * 2 m cascade while its neighbour keeps the 0.5 m one — two different
+       * answers, cell to cell, along a surface that is one plane. That is
+       * §AE's per-pixel bimodality (0.028 against 0.725 on a 35 cm patch) seen
+       * directly, and it is not a weight problem: the weights are trilinear and
+       * smooth. It is a PRESENCE BIT that flips.
+       *
+       * ⭐⭐ AND THE BIT FLIPS ON A COIN. The rule (3.13's, kept verbatim for c0
+       * while 3.16 moved the coarse cascades to an in-cell search) walks the
+       * cell centre along `nn` — `dominantFace`'s normal, whose SIDE comes from
+       * "whichever neighbour is empty" and, when neither or both are, from a
+       * fixed `+1` hint. On a wall facing −X that hint is simply WRONG, the
+       * walk goes deeper into the geometry, three steps of `v_l` find nothing,
+       * and the cell is buried. Which voxels hit the ambiguous case is a
+       * property of the local occupancy — so it alternates along the wall, and
+       * so does the lattice.
+       *
+       * So c0 now tries, in order and STOPPING AT THE FIRST SUCCESS:
+       *   1. `+nn`, exactly as before — every cell that placed yesterday places
+       *      at the same point today, so this cannot move any probe that
+       *      already worked. The receipts of §V..§AD stand.
+       *   2. `−nn`, which is the coin landing the other way and costs three
+       *      reads on the cells that failed.
+       *   3. the 3³ in-cell search at the WINDOW VOXEL step — 3.16's rule, at
+       *      c0's own scale, so the displacement bound is `√3·v_l = 0.43·s_0`,
+       *      the same "inside its own cell" guarantee the coarse cascades get.
+       * A cell that fails all three really is buried deeper than half a cell in
+       * every direction, and refusing to place a probe inside a solid is still
+       * the right answer.
+       */
+      const c0Escape = () => {
+        escapeAlongNormal(nn, "wpEscape");
+        If(state.lessThan(1.5), () => {
+          escapeAlongNormal(nn.negate(), "wpEscapeBack");
+          If(state.lessThan(1.5), () => { placeInsideCell(vl); });
+        });
+      };
+      if (!PLACE_IN_CELL || NC === 1) c0Escape();
+      else If(casc.equal(uint(0)), c0Escape).Else(() => placeInsideCell(pickF(casc, SPC_FINER).toVar()));
       // ⭐ THE RECEIPT, AND IT IS TAKEN AFTER THE BRANCH SO BOTH ARMS ARE
       // MEASURED BY THE SAME INSTRUMENT. `wpCoarseMoved` counts every relocated
       // coarse probe; `wpCoarseFar` counts those that ended up further than ONE

@@ -25,9 +25,10 @@
 //      material samples, i.e. what the user's eye sees) , gbuffer normal .y
 //   2  irradiance BEFORE AO .xyz (`gather.textures.irradiance`, the resolve's
 //      own output after §19 3.12's image blend) , the lit composite's luminance
-//   3.. `diagBuf`, one vec4 PER CASCADE, exactly as `resolveHalf` wrote it:
-//        (cov, freshCov, claim, visCov/cov) — and in the LAST cascade's `.w`,
-//        the resolve's own luminance BEFORE `resolveUpsample`'s image blend.
+//   3.. `diagBuf`, exactly as `resolveHalf` wrote it: `DC` CASCADE rows
+//        (cov, freshCov, claim, visCov/cov), then §19 4.9's FALLBACK row
+//        (faceCov, tail, csum) — and in that LAST row's `.w`, the resolve's
+//        own luminance BEFORE `resolveUpsample`'s image blend.
 //
 // ⭐⭐ THE LAST ROW IS WHAT MAKES THE ATTRIBUTION A MEASUREMENT. A jump in the
 // final irradiance with the pre-blend luminance steady is the ACCUMULATOR
@@ -70,6 +71,12 @@ export function createGi2PointSampler({ renderer, gi2, screen }) {
   const halfH = Math.max(1, Math.ceil(height / 2));
   const diagBuf = gather.buffers?.diagBuf ?? null;
   const DV = diagBuf ? (gather.buffers?.diagVec ?? 0) : 0;
+  /**
+   * §19 4.9: how many of those rows are CASCADES. Row `DV - 1` is the
+   * FALLBACK row — `(faceCov, tail, csum, luma)` — and a caller that scores it
+   * as another cascade reads `faceCov` as `cov`.
+   */
+  const DC = diagBuf ? (gather.buffers?.diagCasc ?? DV) : 0;
   const OUT_VEC = 3 + DV;
 
   const irrAfterTex = gi2.textures.irradiance;
@@ -154,7 +161,7 @@ export function createGi2PointSampler({ renderer, gi2, screen }) {
   };
 
   return {
-    MAX_PTS, OUT_VEC, DV, hasDiag: !!diagBuf, width, height, halfW, halfH,
+    MAX_PTS, OUT_VEC, DV, DC, hasDiag: !!diagBuf, width, height, halfW, halfH,
     /**
      * Dispatch on THIS frame and issue the readback immediately. The copy is
      * encoded when `getArrayBufferAsync` is CALLED, so deferring the call into

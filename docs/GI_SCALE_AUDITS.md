@@ -4161,3 +4161,206 @@ same session.
   module's own message the moment the console was READ instead of filtered for the
   patterns someone expected. [[gi-colour-probe-method]]: take the FIRST thing the
   failing stage says, not the most interesting thing it might have meant.
+
+---
+
+## §AF — THE HAND-OFF'S CLIFFS, AND WHAT THE FLICKER ACTUALLY WAS (08-28)
+
+**The brief** (§AE.4): add `faceCov` and a `fallbackFired` flag to `diagBuf`,
+re-run `probe:gi2-runner`, and if the 59 % "F spatial speckle" class collapses
+onto the fallback, make the fallback a ramp and the argmax a soft-max.
+
+**The measurement came back 0.0 %, and that is the finding.** Everything below
+follows from taking that seriously instead of shipping the fix it was meant to
+justify.
+
+### AF.1 — the instrument, and what it refuted
+
+`diagBuf` is four rows now, not three (`gatherProbes.js` `DIAG_VEC`). Rows 0..2
+are the cascades, unchanged; row 3 is `(faceCov, tail, csum, luminance)`, and the
+resolve's own pre-blend luminance MOVED there from the last cascade's `.w` —
+which incidentally gives the last cascade its `vis` column back (§AE.1's third
+blindness). `buffers.diagCasc` publishes how many rows are cascades, because a
+reader that scores the fallback row as a fourth cascade reads `faceCov` as `cov`.
+
+`probe:gi2-runner`, Bistro, 886 frames × 2 arms, the scene's own Player rig,
+against the SHIPPED 4.8 resolve with only the new row added:
+
+| | run arm | static arm |
+|---|---|---|
+| steps > 10 % | 606 | 107 |
+| …carrying a fallback switch > 0.03 | **0 (0.0 %)** | **0 (0.0 %)** |
+| of the "every cascade weight flat" steps (381 / 61), …with one | **0 (0.0 %)** | **0 (0.0 %)** |
+| samples with ANY fallback weight | **0.0 % of 3997** | **0.0 % of 5873** |
+
+⛔ **`fbTrig` NEVER FIRES ON BISTRO.** `admAny = max faceCov` is ≥ 1e-3 at every
+sample of every frame, and `wsum` is 1 by construction once a cascade spends its
+claim. The two-tier fallback and its argmax are real per-pixel discontinuities
+and they are not this scene's flicker. [[probe-blind-statistics]] — the column
+§AE asked for was worth adding precisely because it could have said yes.
+
+### AF.2 — what the same table says instead
+
+The residual is not "unknown": the largest steps carry their own explanation in
+the columns that DID move.
+
+```
+g0 ground, frame 552, ONE pixel both frames, sd 0:  L 0.1499 → 0.8938 (142 %)
+   cov,fresh,claim,vis   c0 [0,0,0,0]  c1 [0.9449,0,1,0.7436]  c2 [0,0,0,0]
+                      →  c0 [0,0,0,0]  c1 [0.9727,0,1,0.8081]  c2 [0,0,0,0]
+```
+
+`Δvis` of **0.065** against a **6× move in the answer**. That ratio is the
+resolve's own derivative: with `E = Σ w·L / Σ w`, one corner's `vis` moving by δ
+moves the answer by `tri·δ·(L_j − E) / Σ w`, so a corner arriving that holds 20×
+the current estimate swings it by 20δ. **The estimator renormalises the REJECTED
+corners' share onto the survivors** — one visible probe out of eight speaks for
+all eight, at full weight — and that is an amplifier, not a blend.
+
+### AF.3 — and then the user's screenshot named the cause
+
+`src-probes` on a Bistro façade: c0's 0.5 m cells are a **patchwork** —
+light-blue (c0-owned) cells with green (c1-owned) gaps between them, **on one
+flat wall**. A gap is a cell `allocPass` marked DEAD; `cov = Σ tri·live` then
+hands that pixel to the 2 m cascade while its neighbour keeps the 0.5 m one. Two
+lattices, two values, cell to cell, along one plane. **The weights were never the
+problem — they are trilinear and smooth. A PRESENCE BIT was flipping.**
+
+⭐⭐ **AND IT FLIPS ON A COIN.** `worldProbes.js allocPass`: cascade 0 alone still
+used 3.13's escape — walk the cell centre along `nn` for three steps of `v_l`.
+`nn` is `dominantFace`'s normal, whose SIDE comes from "whichever neighbour is
+empty" and, when neither or both are, from a fixed `+1` hint. On a wall facing
+`−X` that hint is simply wrong: the walk goes deeper into the geometry, finds
+nothing, and the cell is buried (`state 0` → `i0.w < 0.5` → dead). Which voxels
+hit the ambiguous case is a property of the local occupancy, so it alternates
+along the wall — and so does the lattice. 3.16 had already moved the COARSE
+cascades to a 3³ in-cell search and left c0, the one cascade whose placement
+decides what a surface looks like, on the coin.
+
+### AF.4 — what shipped
+
+1. **`allocPass`, cascade 0 — three rules, first success wins.** `+nn` exactly as
+   before (so every cell that placed yesterday places at the same point today,
+   and §V..§AD's receipts stand), then `−nn` (the coin the other way, three reads
+   on the cells that failed), then 3.16's 3³ in-cell search at the WINDOW VOXEL
+   step — displacement bound `√3·v_l = 0.43·s_0`, the same "inside its own cell"
+   guarantee the coarse cascades get. Strictly ADDITIVE: it can only place probes
+   where there were none.
+2. **The resolve's two switches, retired.** `select(wsumC > 1e-5, claim/wsumC, 0)`
+   multiplied a whole pixel by ZERO one ulp below the gate — which is what
+   `probe:gi2-ref` caught: pixels at exactly 0 with a live, ready,
+   face-admissible probe 0.5 m away. It is a `smoothstep` over
+   `visFrac = wsumC / Σ tri·live·wc0²` now. And `fbTrig`'s `admAny < 1e-3` plus
+   its argmax are gone entirely, replaced by a TAIL: `Σ_c Lc_c/pref_c` over
+   `Σ_c wsumC_c/pref_c` — the cascades' own answers, COARSEST-preferred by the
+   inverse of the ratio the argmax used to prefer the finest, plus a `1e-4`
+   face-admissible regional mean for the pocket where nothing is visible at any
+   cascade. Coarsest because a tail's job is to be smoother than what could not
+   answer; a peaked fallback hands the pixel back the same speckle under another
+   name. The tail is Chebyshev-gated throughout, so §V.1's rule stands.
+3. **Claim conservation is a checked number.** `wsum = Σ spend + rem` is 1 for
+   every pixel any cascade covered — `csum` in the diag row, and the probe
+   reports how many samples fall below 0.99. Measured: **0 of 9 870, min 1.0000.**
+4. **The ownership mosaic is a receipt now.** `probe:gi2-runner` keeps each
+   PIXEL's own argmax over the `claim` columns and reports `mix` (the share of a
+   patch answered by a cascade other than its modal one) and `mixD` (how far
+   apart the two groups' luminances are). A mean over a mosaic is a smooth number
+   describing a checkerboard; this is the column that can see one.
+
+### AF.5 — two fixes written, measured, and RETRACTED inside the hour
+
+- ⛔ **THE PROPORTIONAL HAND-OFF.** "A cascade spends what it could see" reads
+  well — `spend = claim · visFrac`, deficit to the next cascade. A typical Bistro
+  pixel measures `visFrac ≈ 0.5`, so it handed HALF of every pixel down to the
+  2 m and 8 m lattices: `probe:gi2-ref` median |ratio−1| 0.863 → 1.000 (pose A)
+  and 0.461 → 0.662 (pose B), over-bright in exactly the shadowed places
+  (FAC2 23×, SOFF2 6.9×, PAVE1 3.9×). That is §V.1's leak, re-derived from first
+  principles and refuted by measurement the same afternoon. **A hand-off may be
+  made CONTINUOUS; it may not be made PROPORTIONAL.** The shipped ramp saturates
+  at `VIS_RAMP = 0.05`, three orders of magnitude wider than the `1e-5` switch it
+  replaces and not one bit wider than that.
+- ⛔⛔ **"NO THRESHOLDS" IS A PRINCIPLE, NOT A MEASUREMENT.** The first cut also
+  removed `If(w > 1e-5)` from the corner loop, on the reading that the brief said
+  to replace *every* threshold. But `If(cand > bestW)` is a SWITCH — crossing it
+  changes which probe a pixel reads, at full weight — while `w > 1e-5` is a
+  CUT-OFF: below it a corner's contribution is at most 1e-5 of the blend. For a
+  ground pixel the four corners BELOW its plane have `wc0² ≈ 0`, and that guard
+  is what stops the resolve reading nine SH words and an oct tap for each of
+  them. Priced: **16.4 → 19.3 ms per frame on Bistro** and `probe:gi2-motion`
+  orbit MAX **29 → 160 ms**. [[feedback-gi-60fps-floor]]
+
+### AF.6 — ▶ OPEN, and it is not the hand-off
+
+⚠ **`shEval` ENDS IN `.max(vec3(0))`, AND THAT IS A PER-PIXEL CLIFF NOBODY HAS
+PRICED.** `probe:gi2-ref` pose B, `DARK3 at [4.42,14.82,-29.05]`, reads `E_gi2`
+EXACTLY 0.00000 against a path-traced 0.638 — at the SAME world position, before
+AND after 4.9, across three separate boots. The 4.9 tail cannot lift it, and that
+is the diagnosis: the tail only pays what the cascades did not spend, and here
+they spent it all. What is left is the SH2 evaluation itself going negative along
+that normal and being clamped — a truncated SH2 rings, and the clamp turns a
+smoothly-varying negative into a flat zero that neighbouring pixels straddle.
+▶ The next measurement is one channel: the DC term `L[0]·0.886` beside `E` at the
+same pixel. If DC is positive where `E` is zero, the fix is a non-negative
+reconstruction, and it is an ENERGY change that needs its own receipt cycle.
+
+### AF.7 — the receipts
+
+`probe:gi2-runner`, Bistro, 886 frames/arm, ARMS=run,static. "before" is the
+shipped 4.8 resolve with only the new diag row added; "after" is 4.9 complete
+(placement + ramp + tail + read guard).
+
+| run arm, series/seg | sprd b→a | p90 b→a | > 10 % b→a | mix (after) |
+|---|---|---|---|---|
+| g0 ground out | 1.58 → **0.26** | 32.5 % → **8.5 %** | 42 → **3** | 0.00 |
+| g0 ground back | 0.18 → **0.11** | 35.9 % → **5.6 %** | 85 → **1** | 0.00 |
+| g2 ground out | 0.16 → 0.20 | 11.2 % → 17.9 % | 4 → 6 | 0.00 |
+| g3 ground out | 0.06 → 0.07 | 3.3 % → 3.3 % | 5 → 5 | 0.00 |
+| f0 façade out | 0.79 → **0.65** | 22.9 % → **17.6 %** | 8 → 6 | 0.00 |
+| f2 façade out | 0.86 → 0.90 | 10.6 % → **9.6 %** | 23 → **17** | 0.00 |
+| f2 façade back | 0.13 → 0.17 | 2.9 % → 2.8 % | 2 → **0** | 0.00 |
+| f3 façade out | 0.98 → 1.16 | 52.5 % → **47.1 %** | 168 → 187 | 0.00 |
+| near pavement out | 0.09 → 0.11 | 6.6 % → 7.8 % | 21 → 24 | 0.00 |
+| body out | 1.58 → 1.77 | 18.2 % → 19.7 % | 78 → **69** | 0.00 (mixD 0.46) |
+| **all series, > 10 %** | | | **606 → 479** | |
+
+- **Ownership mosaic (GATE 5, new): `mix = 0.00` on every fixed ground and
+  façade patch.** The answering cascade no longer flips pixel-to-pixel on a flat
+  surface. The one non-zero is `body back` at 0.06 with `mixD` 0.53 — a moving
+  skinned mesh straddling a genuine cascade boundary, which is what a real blend
+  boundary is supposed to look like. ⚠ There is no BEFORE for this column; it was
+  built in this session, so it certifies the after state and does not by itself
+  measure the change.
+- **Conservation: 0 samples below 0.99, min `csum` 1.0000**, over 3 690 (run) +
+  5 872 (static) samples.
+- **Perf, same session, same tree: 55.6 fps / 17.5 ms with 4.9 against
+  55.8 fps / 17.7 ms at HEAD.** Neutral. `probe:gi2-motion` orbit MAX
+  **142.3 ms with 4.9 against 151.2 ms at HEAD** — ⚠ that spike is PRE-EXISTING
+  and is one frame in the run (`frames > 50 ms` = 1); §AD's "orbit MAX 29.40" is
+  from another session and is not this tree's baseline. 8 gates fail with 4.9
+  against 6 at HEAD; the two extra are both marginal (`whip p95/parked` 1.30 vs
+  a 1.30 limit, `dolly voxelize chain` 3.15 vs 3).
+- `probe:gi2-gather`: **Cornell bracketed 8/8** on high and ultra and on all four
+  rotations; **5 cm-wall leak 0/10 000 with a 100 % control on all four
+  rotations**; ultra chain **1.721 ms** (limit 4.0).
+- `probe:gi2-doors`, ao=true (as authored): **recess ÷ wall irrBefore 100.4 %**
+  (target ≈ 101.8 %).
+- `probe:gi2-corridor`: bracketed 4/8, walls 2/4, both arms — unmoved.
+- `probe:gi2-puddle`: wall curvature p90 at the tile lag **13.03 %**, against
+  12.82 % before 4.9 in the same session. ⚠ The 6.43 % in the brief is from
+  another tree state; 4.9 did not move this number, and it did not fix it.
+- `probe:gi2-ref`: pose A median |ratio−1| **0.905**, pose B **0.585**, against a
+  same-session HEAD baseline of 0.863 / 0.461. ⚠⚠ **THIS RECEIPT HAS RUN-TO-RUN
+  SCATTER OF THE SAME ORDER AS THE EFFECT**: it re-picks its 19 sample points
+  from each boot's own frame, and four runs of it this session read pose A at
+  0.733 / 0.863 / 0.905 / 1.000 — one of which was a partially-dead lattice
+  (`probe NONE — no live corner in any cascade`). Single runs of it cannot
+  arbitrate a change this size. [[probe-blind-statistics]]
+- `test:gi-moved-lamp` **PASS** (+29.06 lum). `smoke:gi-gpu` **PASS 2/2**.
+
+⚠⚠ **THE LAST BATTERY RAN ACROSS A MOVING TREE.** Another agent modified six
+files in `src/modules/gi/window/` (`windowStore` +108 lines, `windowFill`,
+`windowVoxelize`, `windowTrace`, `windowDynamic`, `windowDebugView`) between
+13:41 and 13:51, i.e. during the HEAD-baseline runs above. The 4.9 arm and the
+HEAD arm of the perf comparison are therefore not guaranteed to differ only by
+4.9. Every number in this section that is a CROSS-ARM SUBTRACTION inside one
+battery still holds; the two perf baselines are the ones to re-take.

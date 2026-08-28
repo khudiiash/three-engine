@@ -75,7 +75,7 @@ import * as THREE from "three/webgpu";
 import {
   Break, Fn, If, Loop, Return, atomicAdd, atomicLoad, atomicStore, bitAnd, bitOr, bitXor, dot, exp,
   exp2, float, globalId, instanceIndex, instancedArray, int, ivec2, log2, max, min, mix, normalize,
-  select, shiftLeft, shiftRight, sqrt, step, storage, texture, textureStore, uint, uniform,
+  select, shiftLeft, shiftRight, smoothstep, sqrt, step, storage, texture, textureStore, uint, uniform,
   uniformArray, vec2, vec3, vec4,
 } from "three/tsl";
 import { FACE_OFF, LEVEL_WORDS, N, OCC_OFF, PAL_OFF } from "./windowStore.js";
@@ -777,17 +777,42 @@ export function createGiGather({
    *           `cov/covFull · band · rem` — the fall-through, in one number.
    *   `vis`   Σ tri·live·vis / cov: the Chebyshev weight, averaged.
    *
+   * ⭐⭐⭐ §19 STAGE 4.9 — AND A FOURTH ROW, BECAUSE THE CASCADE ROWS WERE BLIND
+   * TO THE TWO DISCONTINUITIES THAT MATTERED. §AE attributed 59 % of the
+   * runner's > 10 % steps to "every resolve weight flat", which is what a
+   * diagnostic says when the thing that moved is not in it. The two switches
+   * outside the cascade rows were the hand-off's FALLBACK (`faceCov`, and the
+   * hard `admAny < 1e-3` trigger over it) and the argmax that chose which
+   * corner it read. Both live after the cascade loop, so they get their own row
+   * — index `DIAG_VEC - 1`, always the last one whatever a tier's cascade count
+   * turns out to be:
+   *
+   *   `faceCov` max over cascades of Σ tri·live·wf — "does any lattice anywhere
+   *           REPRESENT this surface", the fallback's own input.
+   *   `tail`  the weight the fallback/tail actually carried this pixel, 0..1.
+   *           Under 4.9 it is the RAMP; before 4.9 it was the 0/1 `fbTrig`.
+   *   `csum`  Σ over cascades of what each contributed, plus the tail. The
+   *           conservation check: a lit pixel below 0.99 is a bug, and it is
+   *           the one number that makes "claimed and contributed nothing"
+   *           visible from the CPU.
+   *
    * plus the resolve's OWN luminance, before `resolveUpsample`'s image blend,
    * so the accumulation's contribution is a subtraction rather than an argument.
    * The CPU keeps the previous frame's copy and looks it up through the SAME
    * `src` index the sign census follows, so every classification is about one
    * surface point across two frames.
    *
+   * ⚠ THE LUMINANCE MOVED WITH IT. It used to ride in the LAST CASCADE's `.w`,
+   * which cost that cascade its `vis` column (§AE.1's third blindness). It now
+   * rides in the FALLBACK row's `.w`, so every cascade row carries all four of
+   * its own numbers and the reader's rule — "the last row's `.w` is the
+   * resolve's luminance" — is unchanged.
+   *
    * ⚠ HARNESS ONLY, and `wantNoise` gates the BUILD — `resolveHalf` keeps its
    * shipped storage-buffer count (§Y.2's 6-binding envelope) on every boot the
    * probe did not ask for.
    */
-  const DIAG_VEC = 3;
+  const DIAG_VEC = 4;
   const diagBuf = wantNoise
     ? instancedArray(new Float32Array(
       Math.ceil(width / 2) * Math.ceil(height / 2) * DIAG_VEC * 4), "vec4") : null;
@@ -3728,6 +3753,12 @@ export function createGiGather({
     const DIAG = !!(half && worldTap && wantNoise && diagBuf && world);
     const dgs = DIAG
       ? Array.from({ length: world.taps.cascades }, () => vec4(0).toVar()) : null;
+    /**
+     * §19 4.9's fourth row — `(faceCov, tail, csum, luma)`. It is the ONE
+     * register set that lives OUTSIDE the cascade loop, which is exactly why
+     * §AE's table could not see the switches that live there either.
+     */
+    const dgFb = DIAG ? vec4(0).toVar() : null;
     If(g.w.greaterThan(0.5), () => {
       const P = g.xyz.toVar();
       const Nn = normalize(loadNrm(px.toInt(), py.toInt()).xyz).toVar();
@@ -3759,12 +3790,13 @@ export function createGiGather({
       // The blended SH2, accumulated in COEFFICIENT space (see `shEval`).
       const Lb = [];
       for (let i = 0; i < 9; i++) Lb.push(vec3(0).toVar());
-      // The world path's fallback carries VALUES, not an index: a lattice cell
-      // is addressed by three coordinates and re-deriving them after the loop
-      // would be a second set of eight taps.
-      const bestL = [];
-      if (worldTap) for (let i = 0; i < 9; i++) bestL.push(vec3(0).toVar());
-      const bestG = worldTap ? vec3(0).toVar() : null;
+      // ⭐⭐ §19 4.9 RETIRED THE WORLD PATH'S ARGMAX. `If(cand > bestW)` chose
+      // ONE corner's raw SH and the fallback then `assign`ed it over the whole
+      // eight-corner blend — an argmax has no continuity anywhere, so two
+      // neighbouring pixels of one flat surface could read two different
+      // probes at full weight. Its job (a pixel no admissible probe represents
+      // must not read black) is done by the TAIL below, which is a weighted
+      // mean and therefore continuous. The screen path keeps §L.5's version.
       /**
        * The largest face-admissible coverage ANY cascade found — the world
        * path's fallback trigger.
@@ -3837,6 +3869,47 @@ export function createGiGather({
         const lastC = select(u.wpCascadesOn.greaterThan(0.5), uint(NCASC - 1), uint(0)).toVar();
         /** How much of this pixel's irradiance is still unclaimed. */
         const rem = float(1).toVar();
+        /**
+         * ⭐⭐⭐ §19 4.9 — THE TAIL: WHAT PAYS FOR WHAT NOBODY COULD SEE.
+         *
+         * Every cascade now spends only the share of its claim its VISIBLE,
+         * face-admissible corners actually carried (see the composite), and the
+         * rest stays in `rem` and falls down the chain. What survives the last
+         * cascade has to land somewhere, and §L.5's rule is that it may not
+         * land on black: a pixel in a pocket smaller than the lattice — a 3 cm
+         * cable, a pot rim, the recess `probe:gi2-ref` found reading EXACTLY
+         * zero against a truth of 0.111 — has no visible probe anywhere, and
+         * zero is a claim of certainty the resolve does not have.
+         *
+         * So the tail is the CASCADES' OWN ANSWERS, `Σ_c Lc_c / pref_c` over
+         * `Σ_c wsumC_c / pref_c` — the COARSEST preferred by exactly the ratio
+         * 4.8's fallback used to prefer the FINEST. Coarsest, because the
+         * tail's whole job is to be smoother than the thing that could not
+         * answer: an 8 m lattice's blend cannot vary at the pixel scale
+         * whatever its weights do, while a nearest-probe pick varies at
+         * nothing else. A peaked fallback hands the pixel back the same
+         * speckle under another name.
+         *
+         * ⚠ AND IT IS CHEBYSHEV-GATED, WHICH IS WHY IT DOES NOT LEAK. `Lc`
+         * and `wsumC` are the visibility-weighted sums, so the tail reads the
+         * same probes the cascade did and refuses the same ones. [[§V.1]] —
+         * folding visibility OUT of a hand-off is what took the thin-wall
+         * interior from 0.03 % to 0.56 %, and this hand-off does not.
+         *
+         * ⭐ THE `1e-4` FLOOR IS THE POCKET, AND IT IS THE ONLY TERM THAT MAY
+         * READ AN OCCLUDED PROBE. Where NOTHING is visible at any cascade —
+         * the 3 cm cable, the pot rim, the recess `probe:gi2-ref` caught
+         * reading EXACTLY zero against a truth of 0.111 — every `wsumC` is
+         * ~1e-6 and the ratio above is 0/0. `mW = Σ tri·live·(wf + 1e-4)`, the
+         * region's own face-admissible mean (DC only; a mean has no direction
+         * worth carrying), enters at a ten-thousandth so it is invisible
+         * wherever anything at all can be seen and is the whole answer where
+         * nothing can. Black is not an answer; it is the absence of one.
+         */
+        const tW = float(0).toVar();
+        const tL = [];
+        for (let i = 0; i < 9; i++) tL.push(vec3(0).toVar());
+        const tG = vec3(0).toVar();
         Loop({ start: 0, end: NCASC, name: "wpCasc" }, ({ wpCasc }) => {
           const cc = uint(wpCasc).toVar();
           If(cc.greaterThan(lastC).or(rem.lessThan(1e-3)), () => { Break(); });
@@ -3892,6 +3965,26 @@ export function createGiGather({
            */
           const cov = float(0).toVar();
           const faceCov = float(0).toVar();
+          /**
+           * ⭐⭐ §19 4.9 — WHAT THE CASCADE *COULD* HAVE CARRIED, so that what it
+           * DID carry is a fraction of something and not a bare magnitude.
+           *
+           * `Σ tri·live·wc0²`: the weight these eight corners would sum to if
+           * every one of them were visible and admissible. `wsumC / wcosC` is
+           * then "how much of this cascade can actually see the point", on a
+           * fixed 0..1 scale — the input to the composite's ramp, and the only
+           * form of the question that means the same thing at a lattice edge
+           * (where `cov` is small) as in the middle of one.
+           *
+           * The wrapped cosine sits in BOTH sums because it SHAPES rather than
+           * rejects: it is ~0.6 even for a perfect corner, so leaving it out of
+           * the denominator would read every healthy pixel as half-blind.
+           */
+          const wcosC = float(0).toVar();
+          /** This cascade's own regional mean — the tail's input. See `tW`. */
+          const mW = float(0).toVar();
+          const mL0 = vec3(0).toVar();
+          const mG = vec3(0).toVar();
           // §19 3.18's classifier inputs, accumulated beside `cov` so they are
           // the SAME sums the composite is made of and not a re-derivation.
           const freshCov = DIAG ? float(0).toVar() : null;
@@ -3942,7 +4035,9 @@ export function createGiGather({
             const vis = world.taps.octTapVisAt(
               octPlan(dirP.negate(), O), cell, dist, K.dmax, K.sp,
             ).toVar();
-            const w = tri.mul(wf).mul(live).mul(wc0.mul(wc0)).mul(vis).toVar();
+            /** The shaping-only weight — the composite's denominator. */
+            const wCos = tri.mul(live).mul(wc0.mul(wc0)).toVar();
+            const w = wCos.mul(wf).mul(vis).toVar();
             // ⭐ COVERAGE IS NOT THE WEIGHT. `w` carries the wrapped cosine and
             // the face term, which SHAPE a probe's contribution and are ~0.6
             // even for a perfect corner; dividing the hand-off by that would
@@ -3951,62 +4046,128 @@ export function createGiGather({
             // edge — which is the hand-off, and the whole hand-off.
             cov.addAssign(tri.mul(live));
             faceCov.addAssign(tri.mul(live).mul(wf));
+            wcosC.addAssign(wCos);
             if (DIAG) {
               freshCov.addAssign(tri.mul(live)
                 .mul(select(rdy.lessThan(0.75), float(1), float(0))));
               visCov.addAssign(tri.mul(live).mul(vis));
             }
-            // ⭐⭐ THE FALLBACK IS TWO-TIER, AND THE SECOND TIER IS NOT OPTIONAL.
+            // The tail's input: face-admissible, NOT Chebyshev-gated, DC only.
+            const mw = tri.mul(live).mul(wf.add(1e-4)).toVar();
+            mW.addAssign(mw);
+            // ⚠ `wsumC` IS SUMMED OUTSIDE THE BRANCH, and that is not tidiness.
+            // It is `visFrac`'s numerator, and the whole point of 4.9 is that
+            // the ramp sees the small values 4.8's `select(wsumC > 1e-5, …, 0)`
+            // rounded to nothing.
+            wsumC.addAssign(w);
+            // ⭐⭐⭐ THE ARGMAX'S READ SITE IS GONE; THE BLEND'S GUARD STAYS —
+            // AND THE DIFFERENCE BETWEEN THOSE TWO THRESHOLDS IS THE WHOLE
+            // POINT OF THIS STAGE.
             //
-            // It prefers an ADMISSIBLE probe (one that passed the face gate) by
-            // a factor of a thousand, so a pixel with any admissible corner
-            // never falls back to a probe representing the other side of a
-            // wall. But a pixel with NO admissible corner has to read
-            // SOMETHING: a sub-lattice feature — a 3 cm cable, a pot rim, a
-            // bracket — can sit in a pocket where all eight cells were pushed
-            // out of nearby geometry and face away from it, and black there is
-            // the thin-feature fault the screen path was condemned for,
-            // re-created one stage down. `max(wf, 0.001)` is the whole rule;
-            // `K.pref` adds the third tier the cascades needed — a finer
-            // cascade's candidate outranks a coarser one's by 64×, the ratio of
-            // the volumes their probes stand for.
-            const cand = tri.mul(live).mul(wf.max(0.001)).mul(K.pref).toVar();
-            If(cand.greaterThan(bestW), () => {
-              bestW.assign(cand);
-              best.assign(1);
-              for (let i = 0; i < 9; i++) bestL[i].assign(world.taps.shAt(cell, i).xyz);
-              bestG.assign(world.taps.octTapRad(planFull, cell));
-            });
+            // `If(cand > bestW)` was a SWITCH: crossing it changed which probe
+            // the pixel read, at full weight, with no continuity anywhere. `w >
+            // 1e-5` is a CUT-OFF: below it a corner's contribution to the blend
+            // is at most 1e-5 of it, so skipping the read moves the answer by
+            // less than the format can hold. One is a cliff, the other is
+            // arithmetic — and a first cut of 4.9 removed both, on the reading
+            // that "no thresholds" is a principle rather than a measurement.
+            // ⛔ `probe:gi2-runner` priced it: 16.4 → 19.3 ms per frame on
+            // Bistro, `probe:gi2-motion` orbit MAX 29 → 160 ms. For a ground
+            // pixel the four corners BELOW its plane have `wc0² ≈ 0`, and this
+            // guard is what stops the resolve reading nine SH words and an oct
+            // tap for each of them. [[feedback-gi-60fps-floor]]
+            //
+            // The `Else` keeps the pocket case alive at one read instead of
+            // ten: where every corner is refused, the tail's regional mean is
+            // the only answer there is, and it needs the DC word.
             If(w.greaterThan(1e-5), () => {
-              for (let i = 0; i < 9; i++) Lc[i].addAssign(world.taps.shAt(cell, i).xyz.mul(w));
-              Gc.addAssign(world.taps.octTapRad(planFull, cell).mul(w));
-              wsumC.addAssign(w);
+              const sh0 = world.taps.shAt(cell, 0).xyz.toVar();
+              const radv = world.taps.octTapRad(planFull, cell).toVar();
+              Lc[0].addAssign(sh0.mul(w));
+              for (let i = 1; i < 9; i++) Lc[i].addAssign(world.taps.shAt(cell, i).xyz.mul(w));
+              Gc.addAssign(radv.mul(w));
+              mL0.addAssign(sh0.mul(mw));
+              mG.addAssign(radv.mul(mw));
+            }).Else(() => {
+              mL0.addAssign(world.taps.shAt(cell, 0).xyz.mul(mw));
             });
           }
           // ── the composite ────────────────────────────────────────────────
           //
-          // ⚠ A CASCADE THAT COVERS THE POINT SPENDS ITS CLAIM EVEN IF ITS
-          // WEIGHTS CAME OUT ZERO. `wsumC = 0` with `cov = 1` is the dark side
-          // of a wall — eight live probes, every one of them occluded — and the
-          // right answer there is DARK, not "pass it to the 8 m cascade". So
-          // the claim is consumed either way and only the RADIANCE is gated on
-          // there being a weight to divide by. `admAny` remembers, across
-          // cascades, whether any probe anywhere was face-admissible; that, not
-          // `wsum`, is what the two-tier fallback below keys on.
-          // §19 3.15: `cov / wpCovFull`, saturated — the fall-through is a GATE
-          // on "is this cascade live here", not a proportion. See `wpCovFull`:
-          // under the interval merge a coarser cascade's map is only complete
-          // where a finer one owns its near band, so a proportional shortfall
-          // leaks into a map with a hole in it. `wpCovFull = 1` is 3.14's
-          // proportional hand-off, out of the same binary.
+          // ⭐⭐⭐ §19 4.9 — A CASCADE THAT CANNOT SEE THE POINT HANDS ON, AND IT
+          // HANDS ON SMOOTHLY.
+          //
+          // 4.8 spent the whole claim whichever way the weights fell, on the
+          // reading that `wsumC = 0` with `cov = 1` is the dark side of a wall
+          // and the right answer there is DARK. That reading survives — the
+          // deficit never becomes brightness, and a cascade that hands on hands
+          // to one whose OWN visibility test it must pass in turn, so nothing
+          // is ever given a free pass around Chebyshev [[§V.1]]. What 4.8 got
+          // wrong is the EDGE: `select(wsumC > 1e-5, …, 0)` is a switch, and a
+          // pixel one ulp on the wrong side of it was multiplied by zero.
+          //
+          // ⚠ THE COVERAGE GATE IS LEFT EXACTLY AS 3.15 SHIPPED IT. A first cut
+          // of 4.9 made it a `smoothstep` over the same edge for the smoother
+          // derivative, and that is a REAL energy change at every lattice edge
+          // (`cov = 0.25` claims 0.16 instead of 0.5) for a discontinuity that
+          // was never there — `clamp` is already continuous, and no receipt
+          // implicates its kink. Only the terms that actually SWITCH are
+          // touched by this stage.
           const claim = cov.div(u.wpCovFull.max(1e-3)).clamp(0, 1).mul(band).mul(rem).toVar();
-          If(claim.greaterThan(1e-4), () => {
-            const k = select(wsumC.greaterThan(1e-5), claim.div(wsumC.max(1e-5)), float(0)).toVar();
-            for (let i = 0; i < 9; i++) Lb[i].addAssign(Lc[i].mul(k));
-            G.addAssign(Gc.mul(k));
-            wsum.addAssign(claim);
-            rem.subAssign(claim);
-          });
+          /**
+           * ⭐⭐⭐ THE RAMP THAT REPLACED THE SWITCH.
+           *
+           * `visFrac` is the share of this cascade's OWN admissible weight that
+           * survived Chebyshev — 1 where every corner can see the point, 0 in a
+           * pocket. 4.8 turned that into a step twice over: `select(wsumC >
+           * 1e-5, claim/wsumC, 0)` multiplied the pixel by ZERO one ulp below
+           * the gate (`probe:gi2-ref`'s eight exact zeros, with a live probe
+           * 0.5 m away holding 0.111), and the `admAny < 1e-3` fallback then
+           * swapped in one argmax corner's raw SH. Both are one `smoothstep`
+           * now, over the same edge the coverage gate uses.
+           *
+           * ⭐⭐⭐ ⚠ AND IT SATURATES AT `VIS_RAMP`, WHICH IS 5 % AND NOT 50 %.
+           * MEASURED, NOT CHOSEN.
+           *
+           * `VIS_RAMP` is the width of the region 4.8's `1e-5` switch lived in,
+           * three orders of magnitude wider so that it RAMPS instead of
+           * switching — and not one bit wider than that. Above it a cascade
+           * spends its whole claim exactly as 4.8 did, so §V.1's rule survives
+           * verbatim ("`wsumC` small with `cov` 1 is the dark side of a wall,
+           * and DARK is the answer"), the `rem < 1e-3` break still fires on the
+           * first cascade for almost every pixel rather than running all three,
+           * and no pixel that was not AT the cliff moves at all.
+           *
+           * ⛔ THE PROPORTIONAL VERSION WAS WRITTEN FIRST AND `probe:gi2-ref`
+           * REFUTED IT. Spending `visFrac` of the claim and deferring the rest
+           * reads well — "a cascade spends what it could see" — but a typical
+           * Bistro pixel measures `visFrac` ≈ 0.5, so it handed HALF of every
+           * pixel down to the 2 m and 8 m lattices: pose A's median |ratio−1|
+           * went 0.863 → 1.000 and pose B's 0.461 → 0.662 against the path
+           * tracer, over-bright in exactly the shadowed places (FAC2 23×,
+           * SOFF2 6.9×, PAVE1 3.9×) — which is §V.1's leak, re-derived from
+           * first principles and measured within the hour. A hand-off may be
+           * made CONTINUOUS; it may not be made PROPORTIONAL.
+           */
+          const VIS_RAMP = 0.05;
+          const visFrac = wsumC.div(wcosC.max(1e-5)).toVar();
+          const ansC = smoothstep(float(0), float(VIS_RAMP), visFrac).toVar();
+          const spend = claim.mul(ansC).toVar();
+          const k = spend.div(wsumC.max(1e-9)).toVar();
+          for (let i = 0; i < 9; i++) Lb[i].addAssign(Lc[i].mul(k));
+          G.addAssign(Gc.mul(k));
+          wsum.addAssign(spend);
+          rem.subAssign(spend);
+          // The tail's accumulation, COARSEST-preferred — `1/pref` is exactly
+          // the inverse of the finest-first ratio 4.8's fallback used, and it
+          // is a weighted mean rather than a choice, so it is continuous in the
+          // pixel's position like everything else here. See `tW`.
+          const tw = float(1).div(K.pref).toVar();
+          const tmw = tw.mul(1e-4).toVar();
+          tW.addAssign(wsumC.mul(tw).add(mW.mul(tmw)));
+          tL[0].addAssign(Lc[0].mul(tw).add(mL0.mul(tmw)));
+          for (let i = 1; i < 9; i++) tL[i].addAssign(Lc[i].mul(tw));
+          tG.addAssign(Gc.mul(tw).add(mG.mul(tmw)));
           if (DIAG) {
             const row = vec4(cov, freshCov, claim, visCov.div(cov.max(1e-4))).toVar();
             for (let c = 0; c < dgs.length; c++) {
@@ -4015,6 +4176,30 @@ export function createGiGather({
           }
           admAny.assign(max(admAny, faceCov));
         });
+        // ── ⭐⭐⭐ THE TAIL ───────────────────────────────────────────────────
+        //
+        // Whatever no cascade could see is paid here, at the region's own mean
+        // (see `tW`). This is §L.5's "never a black pixel" and §19 3.14's
+        // two-tier fallback, as ONE weighted mean instead of a threshold over
+        // an argmax — so it is continuous in the pixel's position, and the
+        // pixel next to it reads a value 8 cm away rather than a different
+        // probe entirely.
+        //
+        // ⭐⭐ AND IT IS WHAT MAKES THE CLAIM CONSERVE. `wsum` is now exactly
+        // `Σ spend + rem`, which is 1 for every pixel any cascade covered — the
+        // `csum` column of `diagBuf`'s fallback row, and a lit pixel below 0.99
+        // there is a bug rather than a taste. A pixel NO cascade covered has no
+        // tail to pay it, keeps `wsum = 0`, and stays black on purpose.
+        const hasT = select(tW.greaterThan(1e-12), float(1), float(0)).toVar();
+        const tailK = rem.mul(hasT).div(tW.max(1e-12)).toVar();
+        for (let i = 0; i < 9; i++) Lb[i].addAssign(tL[i].mul(tailK));
+        G.addAssign(tG.mul(tailK));
+        wsum.addAssign(rem.mul(hasT));
+        if (DIAG) {
+          dgFb.x.assign(admAny);
+          dgFb.y.assign(rem.mul(hasT));
+          dgFb.z.assign(wsum);
+        }
       } else {
       for (let corner = 0; corner < 4; corner++) {
         const dx = corner & 1;
@@ -4049,18 +4234,17 @@ export function createGiGather({
       // on a silhouette, and black there reads as a hard outline. It is folded
       // into the SAME accumulator with weight 1 rather than duplicating the
       // evaluation — one `shEval` per pixel, on every path.
-      // §19 3.14: on the world path the trigger is `admAny`, not `wsum` — see
-      // `admAny`'s own note. "No probe anywhere represents this surface" is the
-      // thin-feature case the second tier exists for; "every probe says dark"
-      // is an ANSWER and must survive.
-      const fbTrig = worldTap
-        ? wsum.lessThan(1e-5).or(admAny.lessThan(1e-3)).and(best.greaterThanEqual(0))
-        : wsum.lessThan(1e-5).and(best.greaterThanEqual(0));
-      If(fbTrig, () => {
-        if (worldTap) {
-          for (let i = 0; i < 9; i++) Lb[i].assign(bestL[i]);
-          G.assign(bestG);
-        } else {
+      //
+      // ⛔ §19 4.9 REMOVED THE WORLD PATH'S COPY OF IT. `wsum < 1e-5 OR admAny
+      // < 1e-3` was a HARD THRESHOLD that `assign`ed one argmax corner's raw SH
+      // over the whole eight-corner blend — one of the two per-pixel switches
+      // §AE could not see, and the one `probe:gi2-ref` caught choosing a
+      // different probe for two neighbouring pixels of one surface. The tail
+      // above does its job continuously, so there is nothing left to trigger.
+      // The screen path, which has no cascades and no tail, keeps it.
+      if (!worldTap) {
+        const fbTrig = wsum.lessThan(1e-5).and(best.greaterThanEqual(0));
+        If(fbTrig, () => {
           const pi = best.toUint().toVar();
           if (useSh) {
             const at = rawSh ? shRawIdx : shIdx;
@@ -4069,9 +4253,9 @@ export function createGiGather({
             E.assign(irradianceFromOct(pi, Nn));
           }
           G.assign(glossyAt(pi));
-        }
-        wsum.assign(1);
-      });
+          wsum.assign(1);
+        });
+      }
       If(wsum.greaterThan(1e-5), () => {
         if (useSh || worldTap) {
           const inv = float(1).div(wsum).toVar();
@@ -4103,18 +4287,26 @@ export function createGiGather({
       textureStore(glossyHalf, coord,
         vec4(G, select(g.w.greaterThan(0.5), Nv.y, float(-9))));
       if (DIAG) {
-        // ⚠ THE RESOLVE'S OWN LUMINANCE RIDES IN THE LAST CASCADE'S `.w`, and
-        // it is the ONE number that makes the image accumulation falsifiable:
+        // ⚠ THE RESOLVE'S OWN LUMINANCE RIDES IN THE LAST ROW'S `.w`, and it is
+        // the ONE number that makes the image accumulation falsifiable:
         // `reprojBuf` reads `irradiance`, which is `resolveUpsample`'s output
         // AFTER the 3.12 blend, so a sign census on it alone cannot separate
         // "the field moved" from "the blend switched validity". Same census,
         // two signals, one subtraction.
+        //
+        // §19 4.9: the last ROW is the FALLBACK row now, not the last cascade —
+        // so the cascade rows keep their own `vis` column (§AE.1's third
+        // blindness) and the reader's rule is unchanged. Rows between the last
+        // cascade and the fallback row exist on tiers with fewer cascades and
+        // are written as zeros rather than left stale.
         const base = gyu.mul(u.halfWU).add(gxu).mul(uint(DIAG_VEC)).toVar();
         const LUMA_D = vec3(0.2126, 0.7152, 0.0722);
-        for (let c = 0; c < dgs.length; c++) {
-          diagBuf.element(base.add(uint(c))).assign(c === dgs.length - 1
-            ? vec4(dgs[c].xyz, dot(E, LUMA_D)) : dgs[c]);
+        for (let c = 0; c < DIAG_VEC - 1; c++) {
+          diagBuf.element(base.add(uint(c)))
+            .assign(c < dgs.length ? dgs[c] : vec4(0));
         }
+        diagBuf.element(base.add(uint(DIAG_VEC - 1)))
+          .assign(vec4(dgFb.xyz, dot(E, LUMA_D)));
       }
     } else {
       textureStore(irradiance, coord, vec4(E, g.w));
@@ -5110,6 +5302,12 @@ export function createGiGather({
       shadeIn, shadeOut, exhaustOut, noiseBuf, dirtyBuf, reprojBuf, motionLum,
       /** §19 3.18's flip classifier — `DIAG_VEC` vec4 per half-res pixel. */
       diagBuf, diagVec: DIAG_VEC, reprojErr,
+      /**
+       * How many of `diagVec`'s rows are CASCADES. The rest are §19 4.9's
+       * fallback row, and a reader that treats it as a fourth cascade reads
+       * `faceCov` as `cov` — which is how a diagnostic becomes the bug.
+       */
+      diagCasc: world ? world.taps.cascades : 0,
       contactIn, contactOut,
       ...(world ? world.buffers : null),
     },
