@@ -234,8 +234,92 @@ if (!firstLight) {
 const [eye, aim] = POSE_ENV.split("|").map((s) => s.split(",").map(Number));
 await call("viewport.setCamera", { position: eye, target: aim });
 console.log(`  first light yes · pose eye [${eye.map((v) => v.toFixed(2))}] → [${aim.map((v) => v.toFixed(2))}] · settling ${SETTLE}s`);
-await wait(SETTLE * 1000);
-const settled = await settleFrames(FRAMES);
+
+// ═══════════════════════════════════════════════════ CONVERGENCE, FROM BOOT
+//
+// ⭐⭐ §19 STAGE 5.3 — THE LOOP IS `probes → hits → probes` NOW, SO "DOES IT
+// CONVERGE" STOPPED BEING A THING TO ARGUE ABOUT.
+//
+// A hit's radiance reads the merged field, and the field is fed by hits: that
+// is a fixed-point iteration whose gain is the albedo, and §AK.6 has already
+// shown what a gain near 1 does when the iteration passes through a NOISY
+// intermediate (two fixed points, and a gate that lands on either one across
+// identical boots). The direct-only face cache removes the cache's own loop;
+// what remains has to be MEASURED, not asserted, and it has to be measured
+// FROM BOOT rather than from a settled state — a monotone climb to a value and
+// a damped oscillation around it look identical once you are standing on it.
+//
+// So: the gate's own pixels, sampled every poll from the moment the camera is
+// parked, reduced to one mean. Two questions, both answerable from that curve:
+//
+//   · FRAMES TO 90 %  — the first gather frame whose mean is within 10 % of the
+//                       final one, and never leaves. That is first-light
+//                       latency for the SECOND BOUNCE, which no `[gi2] first
+//                       light` line can see.
+//   · MONOTONE        — the largest DROP between consecutive samples, as a
+//                       fraction of the final mean. A rising series with a
+//                       small dip is integration; a series that overshoots and
+//                       comes back is a gain above 1 being clamped somewhere.
+//
+// ⚠ THE SAMPLER IS BUILT ONCE AND CACHED ON THE PAGE. `createGi2PixelDump`
+// allocates GPU resources; rebuilding it per poll would measure the allocator.
+const CONV = Number(process.env.CONV ?? 1);
+const convSetup = CONV ? await page.evaluate(async ({ TARGET }) => {
+  try {
+    const eng = globalThis.__giEngineForProbe;
+    const sys = globalThis.__giSys();
+    const gi2 = globalThis.__gi2();
+    const { createGi2PixelDump, GI2_PIXEL_OUT_VEC } = await import("/scripts/lib/gi2PixelDump.js");
+    const stride = Math.max(1, Math.round(gi2.width / Math.max(24, TARGET / 4)));
+    const dump = createGi2PixelDump({ renderer: eng.renderer, gi2, screen: sys.state?.screen, stride });
+    const awaitFrame = () => new Promise((r) => { const off = eng.onPostRender(() => { off(); r(); }); });
+    globalThis.__convSample = async () => {
+      const d = await dump.read(awaitFrame);
+      const OV = GI2_PIXEL_OUT_VEC;
+      let sum = 0;
+      let n = 0;
+      for (let y = 0; y < dump.dumpH; y++) {
+        for (let x = 0; x < dump.dumpW; x++) {
+          const b = (y * dump.dumpW + x) * OV * 4;
+          if (d[b + 3] < 0.5) continue;
+          sum += 0.2126 * d[b + 8] + 0.7152 * d[b + 9] + 0.0722 * d[b + 10];
+          n++;
+        }
+      }
+      return { mean: n ? sum / n : 0, px: n, frame: gi2.gather?.frame ?? 0 };
+    };
+    return JSON.stringify({ ok: true, stride, px: dump.dumpW * dump.dumpH });
+  } catch (e) { return JSON.stringify({ error: `${e?.message}` }); }
+}, { TARGET }) : null;
+const convSeries = [];
+const convPoll = async () => {
+  if (!CONV || !convSetup || JSON.parse(convSetup).error) return;
+  try {
+    const v = await page.evaluate(() => globalThis.__convSample?.());
+    if (v && Number.isFinite(v.mean)) convSeries.push(v);
+  } catch { /* a poll that races a rebuild is a missing sample, not a failure */ }
+};
+{
+  const deadline = Date.now() + SETTLE * 1000;
+  await convPoll();
+  while (Date.now() < deadline) { await wait(400); await convPoll(); }
+}
+// The same wait `settleFrames` does, with the sampler in the loop: the climb
+// continues well past the SETTLE window and a curve that stops at 20 s cannot
+// answer "monotone".
+let settled = 0;
+{
+  const f0 = await gatherFrame();
+  const dl = Date.now() + 180000;
+  let fr = f0;
+  while (fr - f0 < FRAMES && Date.now() < dl) {
+    await convPoll();
+    await wait(250);
+    fr = await gatherFrame();
+  }
+  settled = fr - f0;
+}
+await convPoll();
 console.log(`  settled ${settled} gather frames`);
 
 // ══════════════════════════════════════════════════════ THE PAGE-SIDE READ
@@ -756,6 +840,64 @@ const result = {
     return ok.map((r) => ({ p: r.p, n: r.n, surf: name, E: lum(r.E), ref: lum(r.ref) }));
   }),
 };
+
+// ══════════════════════════════════════════════ CONVERGENCE — THE RECEIPT
+if (convSeries.length >= 3) {
+  const finalMean = convSeries[convSeries.length - 1].mean;
+  const f0 = convSeries[0].frame;
+  // The first sample within 10 % of the final value that is never left again —
+  // "reached and stayed", which a first-crossing alone does not establish.
+  let idx90 = convSeries.length - 1;
+  for (let i = convSeries.length - 1; i >= 0; i--) {
+    if (Math.abs(convSeries[i].mean - finalMean) <= 0.1 * Math.abs(finalMean)) idx90 = i;
+    else break;
+  }
+  let maxDrop = 0;
+  for (let i = 1; i < convSeries.length; i++) {
+    const d = convSeries[i - 1].mean - convSeries[i].mean;
+    if (d > maxDrop) maxDrop = d;
+  }
+  const dropRel = finalMean > 0 ? maxDrop / finalMean : NaN;
+  console.log("");
+  console.log("  ── CONVERGENCE FROM BOOT (the gate's own pixels, every poll) ────────");
+  // §19 5.3 — [E]'s and [J]'s tallies beside the curve. A hit list that dropped
+  // entries and a genuinely dim bounce are the same picture; only this says
+  // which. Silent when the cascades are not built.
+  try {
+    const rcj = await page.evaluate(async () => {
+      const eng = globalThis.__giEngineForProbe;
+      const rc = globalThis.__gi2()?.rc;
+      if (!rc) return null;
+      const [d, j] = await Promise.all([rc.readStats(eng.renderer), rc.readHitStats(eng.renderer)]);
+      return JSON.stringify({ d, j, describe: rc.describe() });
+    });
+    if (rcj) {
+      const { d, j, describe } = JSON.parse(rcj);
+      console.log(`  [E] rays ${d.rays} hits ${d.hits} (${pct(d.hitRate)}) deposits ${d.deposits} ` +
+        `perRay ${f(d.perRay, 2)} noBlock ${d.noBlock} clamped ${d.clamped} maxL ${f(d.maxRadianceFraction, 3)}`);
+      console.log(`  [J] ${j ? `${j.hits}/${j.capacity} shaded${j.bounce ? " +bounce" : " (single)"}` +
+        `  BOUNCE-CLAMPED ${j.clamped}  OVERFLOW ${d.secondaryOverflow}` : "not built (inline arm)"}` +
+        `   hitRadiance ${describe.hitRadiance}  hitList ${describe.pools.hitList}`);
+    }
+  } catch (e) { console.log(`  [E]/[J] tallies unavailable: ${e?.message}`); }
+  console.log(`  samples ${convSeries.length} · mean E ${f(convSeries[0].mean, 4)} → ${f(finalMean, 4)}`);
+  console.log(`  frames to 90 % of final   ${convSeries[idx90].frame - f0}   ` +
+    `(gather frame ${convSeries[idx90].frame}, ${convSeries[idx90] === convSeries[convSeries.length - 1] ? "NEVER SETTLED" : "held"})`);
+  console.log(`  largest drop between samples ${pct(dropRel, 2)}   ` +
+    `[monotone: ≤ 2 %]  → ${dropRel <= 0.02 ? "MONOTONE" : "NOT MONOTONE"}`);
+  const step = Math.max(1, Math.floor(convSeries.length / 10));
+  console.log(`  curve  ${convSeries.filter((_, i) => i % step === 0).map((v) => f(v.mean, 3)).join(" ")}`);
+  result.convergence = {
+    samples: convSeries.length,
+    framesTo90: convSeries[idx90].frame - f0,
+    settled: convSeries[idx90] !== convSeries[convSeries.length - 1],
+    maxDropRel: dropRel,
+    monotone: dropRel <= 0.02,
+    first: convSeries[0].mean,
+    final: finalMean,
+    series: convSeries.map((v) => [v.frame - f0, +v.mean.toFixed(5)]),
+  };
+}
 
 // ═══════════════════════════════════════════ THE IMAGE AT REST (must be 0)
 //

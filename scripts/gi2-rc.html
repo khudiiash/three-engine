@@ -187,6 +187,12 @@
           positionTexture: gbufferRt.textures[0],
           normalTexture: gbufferRt.textures[1],
           width: W, height: H, tier: TIER, crops: 0,
+          // §19 5.3 — THIS PAGE IS THE CASCADE GATE, so it must build the
+          // cascade CONTRACT: a DIRECT-ONLY face cache. With `rc5` false the
+          // page would time a `shadeHit` carrying four cosine sky rays the
+          // engine's cascade build no longer compiles, and the deposit's ms
+          // would be a number no shipped frame pays.
+          rc5: true,
         });
         // §19 5.2 — the DESTINATION. In the engine this is
         // `gather.textures.irradianceHalf` (the texture `resolveUpsample`
@@ -205,6 +211,10 @@
             dominantFace: gather.internals.dominantFace,
             faceSamplePoint: gather.internals.faceSamplePoint,
             shadeHit: gather.internals.shadeHit,
+            // §19 5.3 — [J]'s albedo/emission, from the same two palette
+            // tables `shadeHit` reads. Required whenever the merge exists,
+            // because the merge is what gives a hit a field to gather.
+            hitPalette: gather.internals.hitPalette,
           },
         });
         const rd = rc.describe();

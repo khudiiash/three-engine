@@ -49,11 +49,42 @@ export { CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0 };
  * c0 chain, and beyond it there is no probe and the sky answers.
  */
 export const RC_TIERS = {
-  ultra: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 1_100_000, lods: 5, lmax: 16 },
-  high: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 900_000, lods: 5, lmax: 16 },
-  medium: { spacing0: 0.5, c0Probes: 8192, binBudget: 350_000, rays: 450_000, lods: 4, lmax: 16 },
-  phone: { spacing0: 1.0, c0Probes: 4096, binBudget: 175_000, rays: 200_000, lods: 3, lmax: 16 },
+  ultra: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 1_100_000, lods: 5, lmax: 16, hitList: 600_000 },
+  high: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 900_000, lods: 5, lmax: 16, hitList: 500_000 },
+  medium: { spacing0: 0.5, c0Probes: 8192, binBudget: 350_000, rays: 450_000, lods: 4, lmax: 16, hitList: 250_000 },
+  phone: { spacing0: 1.0, c0Probes: 4096, binBudget: 175_000, rays: 200_000, lods: 3, lmax: 16, hitList: 120_000 },
 };
+
+/**
+ * §19 STAGE 5.3 — [J]'s HIT LIST, AND WHY IT IS A TIER CONSTANT AND NOT THE
+ * RAY COUNT.
+ *
+ * The exact bound is one entry per ray, which is what the old path used and
+ * what makes overflow impossible. At 16 words × 4 B that is 70 MB at the ultra
+ * ceiling, on top of a `scratch` buffer that already holds 700 k bins — past
+ * half of WebGPU's 128 MiB `maxStorageBufferBindingSize` for a list whose
+ * OCCUPANCY is the hit rate, measured at ~24 % on Bistro (§AG: ~76 % of rays
+ * miss, and a miss is never appended).
+ *
+ * So the list is sized at roughly half the ray ceiling — comfortably above the
+ * measured hit rate, comfortably under the binding limit — and `STAT_SEC_
+ * OVERFLOW` is the instrument that says the bound was wrong rather than the
+ * dropping being acceptable. ⚠ A SEALED SCENE IS THE STRESS CASE, not an open
+ * one: in the Cornell box nearly every ray hits, and the gate's own viewport is
+ * what keeps `threads` far below the ceiling there.
+ */
+/**
+ * §19 5.3's A/B, and it is a BUILD arm because it has to be: `__gi2Rc5Hit = 0`
+ * restores 5.2 exactly — the inline `shadeHit` at the deposit AND the face
+ * cache's own sky rays and `injectLitFrame` writes, which are the same decision
+ * seen from the gather's side (`createGiGather`'s `rc5`). Splitting them would
+ * give an arm that is neither build: a direct-only cache read inline is 5.2's
+ * arrangement with 5.3's estimator and half of 5.3's light.
+ */
+export const rcHitPathEnabled = (runtime = globalThis) => (runtime?.__gi2Rc5Hit ?? 1) !== 0;
+
+export const rcHitCapacity = (spec, threads) =>
+  Math.max(1, Math.min(Math.max(1, Math.floor(threads)), spec.hitList ?? 500_000));
 
 export const rcTierSpec = (tier) => ({ ...(RC_TIERS[tier] ?? RC_TIERS.high) });
 

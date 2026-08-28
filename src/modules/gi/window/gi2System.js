@@ -80,6 +80,8 @@ import { createWindowDynamic, moverBoxSoup } from "./windowDynamic.js";
 import { createTriangleSoupBuilder, SoupSupersededError, PAL_NONE } from "./triangleSoup.js";
 import { createGiGather, GATHER_TIERS, PAL_ENTRIES, STATS } from "./gatherProbes.js";
 import { createRcCascades } from "./rc/rcSystem.js";
+import { rcHitPathEnabled } from "./rc/rcConfig.js";
+import { rc5PixelNeeEnabled } from "../giConfig.js";
 import { rc5PathEnabled } from "../giConfig.js";
 import { detachCpuMirror } from "../releaseCompute.js";
 
@@ -665,6 +667,11 @@ export function createGi2System({
       // for `injectLitFrame` to see the surface. Same four slots the per-probe
       // `emitterDirectPass` below reads, same solid-angle expression.
       emitters: emitters ?? null,
+      // ⭐⭐ §19 STAGE 5.3 — the face cache becomes DIRECT ONLY when the
+      // cascades own the picture. See `createGiGather`'s `rc5` note: the sky
+      // rays and `injectLitFrame` both write TOTAL radiance into the same
+      // words the merged field is about to contribute again at every hit.
+      rc5: RC5 && rcHitPathEnabled(),
     });
     if (prev?.palette?.length) {
       const n = Math.min(prev.palette.length, gather.palette.length);
@@ -718,11 +725,19 @@ export function createGi2System({
         width,
         height,
         tier,
+        // §19 5.3 — the seated emitters' direct term at the pixel. The same
+        // four slots `emitterDirectPass` reads on the screen path and
+        // `worldProbes.neePass` reads on the world one; the cascades had no
+        // carrier for a promoted lamp at all until this.
+        emitters: rc5PixelNeeEnabled() ? (emitters ?? null) : null,
         kit: {
           u: gather.uniforms,
           dominantFace: gather.internals.dominantFace,
           faceSamplePoint: gather.internals.faceSamplePoint,
           shadeHit: gather.internals.shadeHit,
+          // §19 5.3 — the albedo/emission [J] deposits with, from the same two
+          // tables and under the same two rules `shadeHit` reads them.
+          hitPalette: gather.internals.hitPalette,
         },
         // ⭐⭐ §19 STAGE 5.2 — THE DESTINATION IS THE ENGINE'S OWN HALF-RES
         // TEXTURE, AND THAT IS THE WHOLE RESOLVE. `resolveUpsample` reads this,
@@ -1637,6 +1652,14 @@ export function createGi2System({
      */
     get paletteAssign() { return paletteAssign; },
     get gather() { return gather; },
+    /**
+     * §19 5.3 — the live cascade system, for the receipts. `describe()` already
+     * rides `describe`, but the deposit's and [J]'s TALLIES need the renderer
+     * (they are GPU readbacks), and a gate that cannot read `secondaryOverflow`
+     * cannot tell a dim second bounce from a hit list that dropped a third of
+     * its entries — the two look identical in every image statistic.
+     */
+    get rc() { return rc; },
     get voxelizer() { return voxelizer; },
     get dynamic() { return dynamic; },
     get width() { return width; },

@@ -101,6 +101,26 @@ export function createRcMerge({
   store, bins, spacing0, anchor, camera, sky, frameStamp,
   gbuffer, irradianceHalf, width, height,
   maxLods = MAX_LODS, losOccupied = null, skyEnv = null,
+  /**
+   * ⭐⭐ §19 STAGE 5.3 — `rcHit.createRcDirectAt`, the SEATED emitter's direct
+   * term. `null` builds not one node of it.
+   *
+   * The field cannot carry a seated lamp: `#gi2SlotEmissive` zeroes a promoted
+   * emitter's palette emission, so a ray that hits it reads nothing, which is
+   * the ONE-REPRESENTATION rule working exactly as intended. Both shipped paths
+   * therefore add the NEE term at the PROBE (`emitterDirectPass`,
+   * `worldProbes.neePass`) and the cascades had it NOWHERE — see the closure's
+   * own header for the measurement.
+   *
+   * ⚠ NO DOUBLE COUNT, AND THE ARGUMENT IS THE ZERO: the merged field's
+   * contribution at this pixel is what RAYS brought back, and a ray that lands
+   * on the lamp brings back `ρ/π·(sun + NEE) + palEm` with `palEm = 0`. The
+   * lamp's own emission enters the picture through this term and through no
+   * other. The SECOND bounce of the same lamp is a different term entirely —
+   * it is `Enee` inside the face cache at whatever surface the lamp lit, which
+   * the field does carry, and which this add does not touch.
+   */
+  directAt = null,
 }) {
   const halfW = Math.max(1, Math.ceil(width / 2));
   const halfH = Math.max(1, Math.ceil(height / 2));
@@ -190,7 +210,12 @@ export function createRcMerge({
       // must be the raw one or every tap is rejected on the flipped surfaces.
       If(len2.greaterThan(0.25), () => {
         const facing = step(0, Nn.dot(vec3(camera).sub(g.xyz))).mul(2).sub(1).toVar();
-        E.assign(gather.gatherAt(g.xyz, Nn.mul(facing)).irradiance);
+        const Nf = Nn.mul(facing).toVar();
+        E.assign(gather.gatherAt(g.xyz, Nf).irradiance);
+        // §19 5.3 — the seated emitters, analytically, at the shading point.
+        // Against the FACED normal, like the gather: the hemisphere a lamp
+        // lights is the hemisphere the field was filled over.
+        if (directAt) E.addAssign(directAt(g.xyz, Nf));
       });
     });
     textureStore(irradianceHalf, ivec2(gx.toInt(), gy.toInt()), vec4(E, a));
@@ -198,6 +223,9 @@ export function createRcMerge({
 
   return {
     hashPass: hashBlock.pass,
+    /** §19 5.3 — [J] resolves probe corners at every hit through the same
+     * single-buffer key → block closure this file's screen kernel uses. */
+    hashBlock,
     merge,
     tiles,
     gather,

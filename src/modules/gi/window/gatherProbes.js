@@ -557,6 +557,33 @@ export function octTable(res) {
 export function createGiGather({
   win, trace, cache, positionTexture, normalTexture, width, height, tier = win.tier, crops = 16,
   sun = null, sky = null, emitters = null, worldProbes = null,
+  /**
+   * ⭐⭐⭐ §19 STAGE 5.3 — THE FACE CACHE IS **DIRECT ONLY** WHEN THE CASCADES
+   * OWN THE PICTURE, AND THAT IS WHAT MAKES THE LOOP HAVE ONE FIXED POINT.
+   *
+   * `RC5_PATH` puts the second bounce where the paper puts it: the merged
+   * cascade field, read at each hit by [J] (`rc/rcHit.js`). The cache's job
+   * shrinks to the term the field does NOT carry — the DIRECT one, a sun
+   * shadow ray plus emitter NEE under the admission gate — and the two writers
+   * that used to put *total* radiance into the same words are removed:
+   *
+   *   · `shadeTerms`' four cosine sky rays (and the `CACHE_FROM_PROBES` SH
+   *     read that replaced them at 4.14) — the field carries sky and bounce
+   *     both, at the top cascade's composite, so keeping either here counts
+   *     that light TWICE;
+   *   · `injectLitFrame`, which EMAs a visible pixel's FINAL lit colour into
+   *     its own voxel face — total radiance by construction, and no way to
+   *     decompose it back into a direct half.
+   *
+   * ⚠ AND IT IS WHAT §AK.6's BISTABILITY WAS ABOUT. A cache lit by itself in
+   * an albedo-1 box is a Neumann iteration with gain ≈ 1 and TWO fixed points
+   * (the 08-28 measurement: black census ~690 vs ~8600 on identical boots).
+   * Direct-only, the cache is a pure function of the lights and the geometry —
+   * it cannot be an input to itself at all — so the only loop left is the one
+   * the paper models, probes → hits → probes, whose gain is the albedo and
+   * whose accumulation is `α`.
+   */
+  rc5 = false,
 }) {
   const spec = GATHER_TIERS[tier];
   if (!spec) throw new Error(`unknown gather tier "${tier}"`);
@@ -598,7 +625,18 @@ export function createGiGather({
   // boots with this on (black census ~690 vs ~8600 on identical boots: a loop
   // with gain ≈ 1 in an albedo-1 box has two fixed points). Stage 5 replaces
   // the loop; until then the shipped path keeps one fixed point. `= 1` opts in.
-  const CACHE_FROM_PROBES = useWorld && (globalThis.__gi2CacheFromProbes ?? 0) !== 0;
+  // §19 5.3: `rc5` refuses it outright — that arm reads the WORLD probes into
+  // the cache, which under the cascades is the same double count the sky rays
+  // are, arriving through a second door.
+  const CACHE_FROM_PROBES = useWorld && !rc5 && (globalThis.__gi2CacheFromProbes ?? 0) !== 0;
+  /**
+   * ⭐⭐ §19 STAGE 5.3 — THE SEAT'S NEE LOOP IS NOT BUILT WHEN THE PALETTE
+   * CARRIES THE LAMP. `giConfig.rc5EmitterEmissionEnabled` is the one decision
+   * (its docstring holds the measurement); this reads the same two globals so
+   * the shader and `#gi2SlotEmissive` cannot disagree about which
+   * representation a promoted emitter has. Both together is §12.26.7's 2.60×.
+   */
+  const RC5_EMITTER_EMISSION = rc5 && (globalThis.__gi2Rc5Emission ?? 0) !== 0;
   /**
    * §AL's SECOND arm, measured separately and shipped only if it earns it: a
    * ceiling on the albedo the BOUNCE term multiplies. The standard energy
@@ -2605,7 +2643,7 @@ export function createGiGather({
     // The cost it gives back is `MAX_EMITTERS` (4) shadow rays per shade
     // instead of one, paid only on the faces the cadence selects — and it is
     // the price of a deterministic lamp colour, which is the whole stage.
-    for (const slot of (CACHE_FROM_PROBES ? [] : (emitters ?? []))) {
+    for (const slot of ((CACHE_FROM_PROBES || RC5_EMITTER_EMISSION) ? [] : (emitters ?? []))) {
       const centre = vec3(slot.center).toVar();
       const reff = float(slot.reff).max(1e-3).toVar();
       const rgb = vec3(slot.color).toVar();
@@ -2735,8 +2773,32 @@ export function createGiGather({
    * face's own emission. Unchanged since 3.12 — only the accumulators above it
    * were split.
    */
+  /**
+   * ⭐ §19 STAGE 5.3 — THE PALETTE PAIR A HIT IS DEPOSITED WITH, read out of
+   * the SAME two tables and under the SAME two rules `shadeHit` applies below,
+   * because [J] multiplies the cascade field by this ρ and adds it to a cache
+   * word `shadeHit` wrote. Two transcriptions of "the albedo of this voxel"
+   * would be two chances for the bounce term and the direct term to disagree
+   * about what surface they are on.
+   */
+  const hitPalette = (levelF, voxF) => {
+    const pi = palIndexAt(levelF, voxF).toVar();
+    const pal = palU.element(pi).xyz.toVar();
+    return {
+      rho: (BOUNCE_ALBEDO_MAX < 1 ? pal.min(vec3(BOUNCE_ALBEDO_MAX)) : pal).toVar(),
+      Le: emOf(palEmU.element(pi).xyz).toVar(),
+    };
+  };
+
   const shadeHit = (p, n, levelF, voxF, seedU = null) => {
-    const t = shadeTerms(p, n, levelF, voxF, seedU);
+    // ⭐⭐ §19 5.3 — `seedU` IS DROPPED ON THE CASCADE BUILD, and that single
+    // `null` is the whole "direct only" change: the four cosine sky rays are
+    // the one block in `shadeTerms` it gates, so passing `null` removes them
+    // from the WGSL as well as from the estimator. `Emiss`/`Ebnc` are then
+    // provably zero (nothing else writes them with `CACHE_FROM_PROBES` off),
+    // so the sum below is `Esun + Enee` — the sun shadow ray and the emitter
+    // slots under the power gate — and every other line here is untouched.
+    const t = shadeTerms(p, n, levelF, voxF, rc5 ? null : seedU);
     const E = t.Esun.add(t.Emiss).add(t.Ebnc).add(t.Enee).toVar();
     // §19 4.14 (§AL) arm 2 — the bounce-albedo ceiling. `min`, not a scale: it
     // touches ONLY the surfaces authored at or above the ceiling and is the
@@ -4799,7 +4861,14 @@ export function createGiGather({
   })().compute(dispatch2d(width, height), WG);
 
   // ══════════════════════════════════════════════ SHADER: injectLitFrame (§L.6)
-  const injectPass = Fn(() => {
+  //
+  // ⭐⭐ §19 STAGE 5.3 — NOT BUILT AT ALL UNDER `rc5`. This pass writes a
+  // visible pixel's FINAL DIFFUSE LIT COLOUR into its own voxel face, which is
+  // `ρ/π · E_total + Le` — total radiance, including exactly the bounce and sky
+  // the cascade field is about to add a second time at every hit. There is no
+  // decomposition back to a direct half, so the only correct treatment is not
+  // to write. `null` falls out of `frameOrder`'s own `.filter(Boolean)`.
+  const injectPass = rc5 ? null : Fn(() => {
     const gx = globalId.x.toVar();
     const gy = globalId.y.toVar();
     const px = gx.mul(uint(4)).add(bitAnd(u.frame, uint(3))).toVar();
@@ -5494,7 +5563,7 @@ export function createGiGather({
      * rule). Exporting them is what keeps the receipt measuring the SHIPPING
      * estimator instead of a transcription of it.
      */
-    internals: { shadeTerms, shadeHit, dominantFace, faceSamplePoint, cellOfWorld, palAt },
+    internals: { shadeTerms, shadeHit, dominantFace, faceSamplePoint, cellOfWorld, palAt, hitPalette },
     buffers: {
       probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf,
       shadeIn, shadeOut, exhaustOut, noiseBuf, dirtyBuf, reprojBuf, motionLum,

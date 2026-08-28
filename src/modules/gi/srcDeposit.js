@@ -224,7 +224,22 @@ export const SEC_RHO = 6;   // albedo AFTER `clampLoopAlbedo` — R4's in-loop �
 export const SEC_SLOT = 9;  // destination bin's WORD base, already ×BIN_WORDS
 export const SEC_LE = 10;   // raw emissive — R5's zeroing is [J]'s (it owns the NEE set)
 export const SEC_EMITTER = 13; // R5 flag as float bits; < 0 = not an NEE light
-export const SEC_RAY = 14;  // the ray's index in the global R2 sequence (a u32, not float bits)
+/**
+ * The ray's index in the global R2 sequence (a u32, not float bits) — what
+ * `srcShade`'s stratified NEE draw is a pure function of.
+ *
+ * ⭐ §19 STAGE 5.3 — AND IT IS AN OPAQUE **CARRIER WORD** WHEN THE ATTRIBUTION
+ * SAYS SO. `attribute` may return a `ray` node; supplied, it is stored here
+ * instead of `n`, and [J] receives it as its `rayIndex` argument unchanged. The
+ * window path's direct estimator is a COMPLETE FIXED SET (one sun ray, every
+ * emitter slot — no draw), so it has no use for an R2 index, and it does need
+ * the hit's (level, voxel, face) to address the face cache, which is exactly
+ * one u32 (`rcHit.js`'s `packAddr`). Reusing the word instead of widening the
+ * record keeps `SECONDARY_HIT_WORDS` at 16 — a 17th word is another 2.4 MB of
+ * hit list at the tier ceiling — and keeps the old path byte-identical,
+ * because a build that passes no `ray` writes `n` exactly as it always did.
+ */
+export const SEC_RAY = 14;
 /**
  * The owning block's `BSTAT_SUM_L` word address, or `SLOT_EMPTY` when the
  * surprise bundle is off. §12.52's per-block evidence sums a deposit's LUMA,
@@ -1101,6 +1116,10 @@ export function createSrcDepositFrame(store, bins, {
             emitter: float(-1).toVar(),
             slot: uint(SLOT_EMPTY).toVar(),
             sumL: uint(SLOT_EMPTY).toVar(),
+            // §19 5.3 — the carrier word. `n` unless the attribution overrides
+            // it; see `SEC_RAY`. Initialised to the ray index so the assign
+            // below is the ONLY difference between the two builds.
+            ray: n.toVar(),
           }
         : null;
       if (attribute) {
@@ -1110,6 +1129,7 @@ export function createSrcDepositFrame(store, bins, {
         sec.rho.assign(vec3(a.rho));
         sec.Le.assign(vec3(a.emissive));
         if (a.emitter != null) sec.emitter.assign(float(a.emitter));
+        if (a.ray != null) sec.ray.assign(uint(a.ray));
       }
 
       // Radiance at the hit, in fixed point — the INLINE form ONLY. With
@@ -1298,8 +1318,9 @@ export function createSrcDepositFrame(store, bins, {
             put(SEC_EMITTER, floatBitsToUint(sec.emitter));
             // The ray index is a u32 and is stored as one — [J] hands it
             // straight to `hashKey`, which is where NEE's stratified draw comes
-            // from, so a float round-trip here would move the pick.
-            put(SEC_RAY, n);
+            // from, so a float round-trip here would move the pick. §19 5.3:
+            // `sec.ray` IS `n` unless the attribution replaced it.
+            put(SEC_RAY, sec.ray);
             put(SEC_SUML, sec.sumL);
           }).Else(() => {
             atomicAdd(stats.element(uint(STAT_SEC_OVERFLOW)), uint(1));

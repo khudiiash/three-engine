@@ -641,6 +641,67 @@ export const GI2_PATH = true;
 export const RC5_PATH = false;
 
 /** The build-time value, harness override included. Read ONCE per build. */
+/**
+ * ⭐⭐⭐ §19 STAGE 5.3 — WHICH REPRESENTATION A SEATED EMITTER GETS UNDER THE
+ * CASCADES. MEASURED BOTH WAYS; THE SEAT KEEPS IT, AND NEITHER ARM IS THE
+ * ANSWER.
+ *
+ * The ONE-REPRESENTATION rule (§12.26.7's 2.60× double count) says an admitted
+ * emitter is either a palette EMISSION the transport samples geometrically, or
+ * an NEE SEAT sampled analytically at each shading point — never both.
+ * `#gi2SlotEmissive` picks the seat and zeroes the emission.
+ *
+ * ⚠ AND THE CASCADES INHERIT A HOLE FROM THAT CHOICE. A seated lamp is
+ * INVISIBLE TO THE TRANSPORT: a ray that hits it reads a cache word with no
+ * emission in it. The face cache still carries `Enee`, so the lamp's SECOND
+ * bounce is fine — but its FIRST bounce reaches a pixel only if somebody
+ * evaluates NEE at the pixel, and 5.1/5.2 evaluated it nowhere. Both shipped
+ * paths do (`gi2System.emitterDirectPass` at each screen probe,
+ * `worldProbes.neePass` at each lattice probe); the cascades had no equivalent.
+ *
+ * ══ THE TWO ARMS, ON THE USER'S Cornel.scene, EVERYTHING ELSE HELD ══════════
+ *
+ *   arm                              gain   median |log|   blotch σ (Green·-Z)
+ *   neither (5.1/5.2 shape)          0.303      1.195           45 %
+ *   seat NEE, at the PIXEL           0.365      1.011           95 %
+ *   palette EMISSION, geometric      1.955      0.818          144 %
+ *
+ * Neither wins, and the two failures are opposite and both instructive:
+ *
+ *   · AT THE PIXEL, a binary shadow ray against a voxelized lamp is a HARD
+ *     ALIASED EDGE with no interpolation behind it. `emitterDirectPass` gets
+ *     away with the same expression because it runs at a PROBE and the pixel
+ *     reads eight of them; per pixel it doubles the blotch and takes the
+ *     second-difference check from 0 failing surfaces to 6.
+ *   · GEOMETRICALLY, the lamp is 4.5 m² of thin panel voxelized into 0.5 m
+ *     cells, so the solid angle a ray set measures is several times the real
+ *     one: energy 1.96× and Box·-X at 4.08×. That over-weighting IS why the
+ *     seat exists.
+ *
+ * So the shipped 5.3 arm is the seat, carried where 5.2 carried it — inside the
+ * face cache's direct term, at hits — and the lamp's first bounce is a NAMED
+ * HOLE rather than a term evaluated in the wrong place. Closing it belongs at
+ * the probe: the seat's NEE added into the c0 irradiance the gather already
+ * interpolates over eight probes, which is the one place in this chain that has
+ * a smoothing stage behind it.
+ *
+ * `__gi2Rc5Emission = 1` takes the geometric arm; `__gi2Rc5PixelNee = 1` adds
+ * the pixel-analytic one (`rcMerge`'s `directAt`). Both are the A/B rows above.
+ */
+export function rc5SeatNeeEnabled(runtime = globalThis) {
+  return (runtime?.__gi2Rc5Emission ?? 0) === 0;
+}
+
+/** Under the cascades, does a PROMOTED emitter keep its palette emission? */
+export function rc5EmitterEmissionEnabled(runtime = globalThis) {
+  return rc5PathEnabled(runtime) && !rc5SeatNeeEnabled(runtime);
+}
+
+/** The pixel-analytic seat term in `rcMerge` — the blotchy arm, opt-in. */
+export function rc5PixelNeeEnabled(runtime = globalThis) {
+  return rc5PathEnabled(runtime) && (runtime?.__gi2Rc5PixelNee ?? 0) !== 0;
+}
+
 export function rc5PathEnabled(runtime = globalThis) {
   const hatch = runtime?.__gi2Rc5;
   return hatch === undefined ? RC5_PATH : hatch === true;

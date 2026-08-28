@@ -52,8 +52,13 @@ import { createSrcProbeFrame, createSrcProbeStore } from "../../srcProbes.js";
 import { createSrcRayFrame, createSrcRayStore } from "../../srcRays.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "../../srcMath.js";
 import { normalOfFace } from "../radianceCache.js";
+import { createSrcSecondaryFrame, formatSrcSecondary } from "../../srcSecondary.js";
 import { createRcMerge } from "./rcMerge.js";
-import { CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0, rcIntervalCensus, rcTierSpec } from "./rcConfig.js";
+import { createRcDirectAt, createRcHitShading } from "./rcHit.js";
+import {
+  CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0, rcHitCapacity, rcHitPathEnabled, rcIntervalCensus,
+  rcTierSpec,
+} from "./rcConfig.js";
 
 /**
  * @param {object} opts
@@ -72,6 +77,9 @@ import { CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0, rcIntervalCensus, rcTierSp
  */
 export function createRcCascades({
   win, trace, cache, gbuffer, width, height, tier = win.tier, kit,
+  // §19 5.3 — GISystem's emitter SLOT uniforms, the same four `shadeTerms`
+  // does NEE against at a hit. Absent, the seated-emitter term is not built.
+  emitters = null,
   // §19 STAGE 5.2 — `gather.textures.irradianceHalf`, the texture
   // `resolveUpsample` reads. Absent (5.1's own harness page, `scripts/gi2-rc.
   // html`), the merge/bake/resolve trio is not built at all and this object is
@@ -239,8 +247,23 @@ export function createRcCascades({
     threads,
   });
 
-  const bins = createSrcBinStore(store, { w0: W0, secondaryCapacity: 0 });
+  // ⭐⭐ §19 STAGE 5.3 — THE HIT LIST IS ALLOCATED WHENEVER [J] CAN BE BUILT.
+  // 5.1/5.2's own harness page (`scripts/gi2-rc.html`) hands in no destination
+  // texture, so it gets no merge, no tiles and therefore no field to gather at
+  // a hit — that build keeps the INLINE arm and its tail is not allocated, so
+  // every 5.1 byte figure stays comparable.
+  const hitCapacity = (irradianceHalf && rcHitPathEnabled()) ? rcHitCapacity(spec, threads) : 0;
+  const bins = createSrcBinStore(store, { w0: W0, secondaryCapacity: hitCapacity });
   shadeCounters = createSrcShadeCounters(bins);
+
+  /**
+   * §19 5.3's two closures — see `rcHit.js`. Built only on the split arm: with
+   * `attribute` the deposit does NOT bind the radiance cache at all, which is
+   * the eighth binding `gatherAt` needs and the reason the split exists.
+   */
+  const hitShading = hitCapacity > 0
+    ? createRcHitShading({ cache, kit, counters: shadeCounters })
+    : null;
 
   const deposit = createSrcDepositFrame(store, bins, {
     pixelProbe: frame.pixelProbe,
@@ -253,12 +276,24 @@ export function createRcCascades({
     phase: phaseU,
     threads,
     lmax: lmaxU,
-    // 5.1 is the INLINE form: no attribution record, no [J], no surprise.
-    attribute: null,
-    secondary: null,
+    // ⭐⭐⭐ §19 STAGE 5.3 — WHICH KERNEL SHADES, AND IT IS EXACTLY ONE OF THEM.
+    //
+    // Split arm: this kernel TRACES, ATTRIBUTES and APPENDS; `rcHit`'s [J]
+    // below shades the record and deposits the radiance. The deposit sheds the
+    // radiance cache binding (7 of 8) and stops paying `shadeHit` for the ~76 %
+    // of rays that miss. Inline arm (no destination texture): 5.1's form,
+    // unchanged, because there is no merged field to read at a hit.
+    //
+    // ⚠ `srcDeposit` REFUSES BOTH — supplying `shadeHit` and `attribute`
+    // together would shade every hit twice and deposit it twice, with no tally
+    // that says so.
+    attribute: hitShading ? hitShading.attribute : null,
+    secondary: hitCapacity > 0
+      ? { base: bins.hitListBase, capacity: hitCapacity }
+      : null,
     surprise: null,
     trace: rcTrace,
-    shadeHit: (r, dir) => rcShade(r, dir),
+    shadeHit: hitShading ? null : ((r, dir) => rcShade(r, dir)),
     readPixel,
     readNormal,
     camera: vec3(cameraU),
@@ -299,6 +334,46 @@ export function createRcCascades({
       width,
       height,
       maxLods,
+      directAt: createRcDirectAt({ trace, voxel0: win.voxel0, emitters }),
+    })
+    : null;
+
+  // ══ §19 STAGE 5.3 — [J], THE HIT RADIANCE ═════════════════════════════════
+  //
+  // `srcSecondary.js` verbatim — the shipped [J], which has read this exact hit
+  // list and deposited into these exact bins since §12.53. Two closures change
+  // hands and that is the whole of 5.3's transport work:
+  //
+  //   shade(P, n, ρ, Le, T, addr) → the DIRECT-ONLY face cache (`rcHit.js`)
+  //   gatherAt(P, n)              → the merged cascade field, unchanged
+  //
+  // `bounce: true` is what builds the gather, and its `ρ · E/π` is `E_rc`'s
+  // half of the expression — the same integral the pixel resolve runs, at a
+  // world point with no screen grid, which is the seam `srcScreenGather`'s
+  // header opened for exactly this call site.
+  //
+  // ⚠ BETWEEN THE SCATTER AND THE RESOLVE, NECESSARILY. The list does not exist
+  // until the scatter writes it, and [F] turns the accumulators into the
+  // payload — a deposit landing after it is not merely a frame late, it is
+  // ADDRESSED WRONG, because [C] re-claims blocks every frame and an entry's
+  // `SEC_SLOT` is only meaningful inside the frame that produced it.
+  const hit = (hitShading && resolve)
+    ? createSrcSecondaryFrame(store, bins, {
+      shade: hitShading.shade,
+      bounce: true,
+      tiles: resolve.tiles,
+      lookup: resolve.hashBlock.lookup,
+      spacing0,
+      // The SAME camera and anchor the population, the merge and the pixel
+      // gather use. A gather placed from a second anchor reads plausible light
+      // from the wrong probes and no energy check in this repository sees it.
+      camera: vec3(cameraU),
+      anchor: vec3(anchorU),
+      lmax: lmaxU,
+      maxLods,
+      w0: W0,
+      surprise: null,
+      capacity: hitCapacity,
     })
     : null;
 
@@ -376,7 +451,13 @@ export function createRcCascades({
     depositScale: DEPOSIT_SCALE,
     alpha: TEMPORAL_ALPHA,
     jitter: jitterOn,
-    pools: { c0Probes: spec.c0Probes, binBudget: spec.binBudget, binTotal: bins.binTotal },
+    pools: {
+      c0Probes: spec.c0Probes, binBudget: spec.binBudget, binTotal: bins.binTotal,
+      // §19 5.3 — 0 on the inline arm, which is how a receipt tells the two
+      // builds apart without reading a flag.
+      hitList: hitCapacity,
+    },
+    hitRadiance: hit ? "probes" : "cache",
     intervals: census.rows.map((r) => ({
       lod: r.lod, reach: r.reach, gaps: r.gaps, overlaps: r.overlaps,
       bands: r.bands.map((b) => [b.t0, b.t1]),
@@ -410,6 +491,8 @@ export function createRcCascades({
       populate: frame.passes,
       rays: rayFrame.passes,
       deposit: deposit.passes,
+      /** §19 5.3 — [J]. `null` on the inline arm. */
+      hit: hit ? [hit.pass] : [],
       merge: resolve?.merge.passes ?? [],
       tiles: resolve?.tiles.passes ?? [],
       resolve: resolve ? [resolve.resolvePass] : [],
@@ -431,11 +514,20 @@ export function createRcCascades({
       ...frame.passes,
       ...(resolve ? [resolve.hashPass] : []),
       ...rayFrame.passes,
-      ...deposit.passes,
+      // §19 5.3 — [E] decay, [E] scatter, [J], [F] resolve. `deposit.passes` is
+      // that list minus [J], and slicing it by index at the call site would put
+      // the frame order at the mercy of its length (`srcDeposit`'s own note is
+      // why `decay`/`scatter`/`resolve` are published by name).
+      ...(hit
+        ? [deposit.decay, deposit.scatter, hit.pass, deposit.resolve]
+        : deposit.passes),
       ...(resolve ? resolve.passes : []),
     ],
     setCamera, beginFrame, setSize, describe,
     readStats: (renderer) => deposit.readStats(renderer),
+    /** §19 5.3 — [J]'s own line: entries shaded, and whether the bound held. */
+    readHitStats: (renderer) => (hit ? hit.readStats(renderer) : Promise.resolve(null)),
+    formatHitStats: formatSrcSecondary,
     /** 5.2's own receipt: the merge's orphan/corner census and the bake's coverage. */
     readMergeStats: (renderer) => (resolve ? resolve.readStats(renderer) : Promise.resolve(null)),
     /** Every GPU-only storage attribute, for the caller's retire queue. */
@@ -450,6 +542,7 @@ export function createRcCascades({
      * place this may be called from.
      */
     dispose() {
+      hit?.dispose();
       resolve?.dispose();
       for (const a of [...attrsOf(store), ...attrsOf(bins), ...attrsOf(rayStore), ...attrsOf(frame),
         ...(resolve?.storageAttributes() ?? [])]) {

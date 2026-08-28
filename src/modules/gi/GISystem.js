@@ -29,7 +29,7 @@
 import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionGeometry, positionWorld, renderGroup, sRGBTransferEOTF, screenCoordinate, screenUV, select, sin, smoothstep, step, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
-import { GI2_PATH, GI_DEBUG_VIEW_DOC, GI_QUALITY_LEVELS, GI_TERM_DEBUG_VIEWS, GI_TIER_GPU_BUDGET_BYTES, GI_VOLUME_DEBUG_VIEWS, gi2TierOf, giDebugView, giDebugViewsFor, resolveGiConfig, sceneSkyRadiance, wgslPointerParametersSupported } from "./giConfig.js";
+import { GI2_PATH, rc5EmitterEmissionEnabled, GI_DEBUG_VIEW_DOC, GI_QUALITY_LEVELS, GI_TERM_DEBUG_VIEWS, GI_TIER_GPU_BUDGET_BYTES, GI_VOLUME_DEBUG_VIEWS, gi2TierOf, giDebugView, giDebugViewsFor, resolveGiConfig, sceneSkyRadiance, wgslPointerParametersSupported } from "./giConfig.js";
 import { createGi2System, createGi2Volume } from "./window/gi2System.js";
 import { createGi2DebugView, gi2ViewCode } from "./window/windowDebugView.js";
 import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
@@ -15654,7 +15654,14 @@ export class GISystem {
    */
   #gi2SlotEmissive(entry) {
     if (!entry) return [0, 0, 0];
-    if (entry.promoted || this._promotedEmitterMeshes?.includes(entry.mesh)) return [0, 0, 0];
+    // ⭐⭐ §19 STAGE 5.3 — THE SEAT NO LONGER OWNS THE LAMP UNDER THE CASCADES.
+    // A promoted emitter's light reaches the picture through the transport (a
+    // ray that hits it reads this table) instead of through four analytic
+    // shadow rays at every shading point. `rc5EmitterEmissionEnabled` carries
+    // the whole argument and the measurement behind it; the ONE-representation
+    // rule is intact either way, and the admission gate below is unchanged.
+    if ((entry.promoted || this._promotedEmitterMeshes?.includes(entry.mesh))
+      && !rc5EmitterEmissionEnabled()) return [0, 0, 0];
     if (this.#belowEmitterPowerGate(entry)) return [0, 0, 0];
     let r = entry.surface.emissive.r * entry.surface.emissiveIntensity;
     let g = entry.surface.emissive.g * entry.surface.emissiveIntensity;
