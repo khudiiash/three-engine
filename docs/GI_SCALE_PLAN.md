@@ -469,8 +469,18 @@ chain 0.99 ms, 8/8 bracketed, first light frame 1 — held off-default by its
 ±8 m horizon → **3.14 cascades** (2 m / 8 m spacing over 64 / 256 m sharing
 the ray budget). **The gather is now 3D radiance cascades inside the
 window** — world-anchored, complete, interpolated — the user's original
-idea, made affordable by §4.1-4.2. The screen-probe path stays until the
-cascades' receipts are ≥ 3.12's on every row. ▶ Stage 4 next.
+idea, made affordable by §4.1-4.2. 3.14-3.17 (08-28): cascades 0.5/2/8 m → RC PROPER (interval-limited traces,
+per-direction merge, two textbook corrections: a clipmap has no cascade 0
+over the whole domain; the ray must leave the PROBE, not the interval start)
+→ **`WORLD_PROBES` DEFAULT ON at `274ed6d`** (`__gi2WorldProbes = false` =
+screen probes). 3.17 also fixed a WINDOW bug that hit both paths: bricks
+stranded BUILDING on boot frames (L4 4096/4096 orphaned on every Bistro
+boot — the far field was never voxelized). Open rows: the corridor's 9 m
+light pool at 8 m probe spacing (extent schedule), Bistro motion flips
+35/24/23 %, Level heap +136 MB (one boot), phone panel 11 fr, phone rotated
+leaks 3/2 per 10 000, `probe:gi2-motion` orbit MAX ~107 ms on both paths
+(a reactive proxy-material warm; §18). ▶ Stage 4 next — HELD until the
+user accepts GI2 by eye (`GI2_PATH = false` is the safety net).
 
 | unit | what | gate |
 |---|---|---|
