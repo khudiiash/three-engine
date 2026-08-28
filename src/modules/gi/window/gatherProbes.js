@@ -106,7 +106,13 @@ import { createWorldProbes } from "./worldProbes.js";
 // motion flips above one earlier arm) are not the user's complaints, and on
 // those (noise under motion, thin-feature blobs, first light) the world path is
 // strictly better. `__gi2WorldProbes = false` pre-boot restores screen probes.
-export const WORLD_PROBES = (globalThis.__gi2WorldProbes ?? true) !== false;
+//
+// 08-28 09:00 (user screenshots): DEFAULT OFF AGAIN. On Bistro the world path
+// floods the WHOLE scene red (the neon sign) or green (the seated lamps) —
+// admitted emitters over-weighted by orders of magnitude in the world probes'
+// emitter path. Screen probes show normal colours. `__gi2WorldProbes = true`
+// pre-boot opts back in while the energy bug is fixed.
+export const WORLD_PROBES = globalThis.__gi2WorldProbes === true;
 
 /**
  * Tier constants. These, and only these, are compiled into the WGSL.
