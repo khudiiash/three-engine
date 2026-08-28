@@ -82,6 +82,25 @@ import { FACE_OFF, LEVEL_WORDS, N, OCC_OFF, PAL_OFF } from "./windowStore.js";
 import { FACE_AX_SHIFT } from "./windowTrace.js";
 import { normalOfFace } from "./radianceCache.js";
 import { octahedralUV } from "../srcOctahedral.js";
+import { createWorldProbes } from "./worldProbes.js";
+
+/**
+ * ⭐⭐⭐ §19 STAGE 3.13 — THE ONE BUILD CONSTANT (audits §U).
+ *
+ * `true` puts the diffuse path on the WORLD-ANCHORED lattice
+ * (`worldProbes.js`) and stops building the screen-probe placement, trace,
+ * filter and SH bilateral altogether; `false` is 3.12 exactly, out of the same
+ * source.
+ *
+ * ⚠ IT FLIPS ONLY WHEN EVERY RECEIPT BEATS 3.12'S — orbit sign flips, Δp50/p95,
+ * the §T at-rest trio, the moved panel, the Cornell bracket, the leak gate, the
+ * thin-wall interior arm and the chain's own milliseconds. Until then the
+ * constant stays `false` and the receipts drive the world path through
+ * `globalThis.__gi2WorldProbes`, which is the same "a receipt asks for it
+ * BEFORE the build" discipline `__gi2NoiseDump` follows — one binary, one
+ * shader cache, both arms expressible from one checkout.
+ */
+export const WORLD_PROBES = false;
 
 /**
  * Tier constants. These, and only these, are compiled into the WGSL.
@@ -492,10 +511,15 @@ export function octTable(res) {
  */
 export function createGiGather({
   win, trace, cache, positionTexture, normalTexture, width, height, tier = win.tier, crops = 16,
-  sun = null, sky = null, emitters = null,
+  sun = null, sky = null, emitters = null, worldProbes = null,
 }) {
   const spec = GATHER_TIERS[tier];
   if (!spec) throw new Error(`unknown gather tier "${tier}"`);
+  /**
+   * §19 3.13. The explicit option wins (a harness arm), then the receipt's
+   * pre-boot global, then the build constant.
+   */
+  const useWorld = worldProbes ?? (globalThis.__gi2WorldProbes ?? WORLD_PROBES) === true;
   const T = spec.tile;
   const R = spec.rays;
   const O = spec.oct;
@@ -569,10 +593,18 @@ export function createGiGather({
   // ── buffers ───────────────────────────────────────────────────────────────
   const META_VEC = 3; // (pos, valid) (normal, viewDepth) (prevProbe, 0,0,0)
   const probeMeta = instancedArray(new Float32Array(2 * probeCount * META_VEC * 4), "vec4");
-  const probeOct = instancedArray(new Float32Array(2 * probeCount * OCT * 4), "vec4");
+  // ⭐ §19 3.13 — THE TWO BIG ONES ARE STUBS UNDER `WORLD_PROBES`, and the two
+  // small ones are not. `probeOct` (13 MB at 1650×970) and `probeFiltered`
+  // (8 MB) are read only by kernels this path does not build, so allocating
+  // them would be 21 MB of nothing. `probeMeta` and `probeSh` stay full size
+  // because `gi2System`'s spliced `emitterDirectPass` still addresses them by
+  // `probeCount` — it is a redundant dispatch on this path (the lattice does
+  // its own NEE) and it must be a HARMLESS one, not an out-of-bounds one.
+  const octWords = useWorld ? 4 : 2 * probeCount * OCT * 4;
+  const probeOct = instancedArray(new Float32Array(octWords), "vec4");
   const MIP_BASE = probeCount * OCT;
   const probeFiltered = instancedArray(
-    new Float32Array((probeCount * OCT + probeCount * MIP_TEXELS) * 4), "vec4",
+    new Float32Array(useWorld ? 4 : (probeCount * OCT + probeCount * MIP_TEXELS) * 4), "vec4",
   );
   // TWO halves: [0] is what every consumer reads (`shIdx` — the FILTERED
   // coefficients, and the address Stage 3.4's emitter term adds into), [1] is
@@ -1462,7 +1494,7 @@ export function createGiGather({
   const shRawIdx = (probe, c) => uint(probeCount * 9).add(probe.mul(uint(9))).add(uint(c));
 
   // ══════════════════════════════════════════════ SHADER: probePlace (§L.1)
-  const probePlacePass = Fn(() => {
+  const probePlacePass = useWorld ? null : Fn(() => {
     const tx = globalId.x.toVar();
     const ty = globalId.y.toVar();
     If(tx.greaterThanEqual(u.probeWU).or(ty.greaterThanEqual(u.probeHU)), () => { Return(); });
@@ -1927,7 +1959,7 @@ export function createGiGather({
   // the 64-texel map into `rays` disjoint windows; an arbitrary quotient makes
   // the windows overlap, two threads write one texel, and the accumulator takes
   // a write race that no receipt in this file could show as anything but noise.
-  const rayBudgetPass = Fn(() => {
+  const rayBudgetPass = useWorld ? null : Fn(() => {
     const fresh = float(0).toVar();
     const flag = float(0).toVar();
     const mat = float(0).toVar();
@@ -2351,6 +2383,142 @@ export function createGiGather({
     return pal.xyz.mul(1 / Math.PI).mul(E).add(emOf(palEm.xyz));
   };
 
+  // ══════════════════════════ §19 STAGE 3.13 — WHAT A RAY BRINGS BACK ════════
+  //
+  // ⭐ THE HIT'S RADIANCE, LIFTED OUT OF `probeTrace` SO THE WORLD LATTICE CAN
+  // CALL IT INSTEAD OF COPYING IT. Every line of it is 3.7-3.10's, unchanged:
+  // the voxel's DOMINANT face (not the ray's entry face), the cache's running
+  // value for the ray, a deterministic re-shade cadence that feeds the cache
+  // and NOT the ray, and a fresh slot shaded on the spot because there is
+  // nothing else to return. Returns `(rgb, hitDistance)`.
+  //
+  // ⚠ A SECOND CALL SITE IS FREE ONLY BECAUSE ONLY ONE PATH IS BUILT. `shadeHit`
+  // inlines a sun ray, four sky rays, every emitter slot and (on the rig) four
+  // panel strata — ~25 kB of WGSL, 2.5 s of pipeline compile when it was
+  // duplicated at 3.5. `useWorld` gates `probeTracePass` out of the build, so
+  // the text exists once per binary either way.
+  const hitRadiance = (r, dir, laneU) => {
+    const rad = vec3(0).toVar();
+    const hitDist = float(RAY_MAX).toVar();
+    const zi = r.z.toUint().toVar();
+    If(r.x.greaterThan(0.5), () => {
+      const entryF = bitAnd(zi, uint(7)).toFloat().toVar();
+      const levelF = bitAnd(shiftRight(zi, uint(3)), uint(7)).toFloat().toVar();
+      const voxF = shiftRight(zi, uint(6)).toFloat().toVar();
+      const faceF = dominantFace(levelF, voxF, entryF, dir.negate()).toVar();
+      const hn = normalOfFace(faceF).toVar();
+      const hp = faceSamplePoint(levelF, voxF, hn).toVar();
+      const c = cache.cacheRead(levelF, voxF, faceF).toVar();
+      const fresh = c.w.lessThan(0.5).toVar();
+      const track = bitAnd(zi.mul(uint(2654435761)).add(u.frame),
+        u.shadeStrideU.max(uint(1)).sub(uint(1))).equal(uint(0)).toVar();
+      rad.assign(c.xyz);
+      If(fresh.or(u.shadeProb.greaterThan(0).and(track)), () => {
+        const s = shadeHit(hp, hn, levelF, voxF, uint(1)).toVar();
+        // `.toVar()` is load-bearing — see `probeTracePass`'s note.
+        cache.cacheAccum(levelF, voxF, faceF, s, u.nCapU).toVar();
+        If(fresh, () => {
+          rad.assign(s);
+          bump(STATS.freshShades, laneU);
+        }).Else(() => { bump(STATS.reShades, laneU); });
+      });
+      hitDist.assign(r.y);
+      bump(STATS.windowHits, laneU);
+    }).Else(() => {
+      rad.assign(u.skyColor);
+      bump(STATS.skyMiss, laneU);
+    });
+    return vec4(rad, hitDist);
+  };
+
+  /**
+   * §19 3.12's COMPACT-SOURCE NEE, as nine SH coefficients at a point.
+   *
+   * One expression, two builds: the emitter SLOTS when the caller supplied
+   * them (the engine path — identical to `gi2System.emitterDirectPass`, which
+   * is the point: one lamp, one energy, three paths) and the Cornell rig's
+   * panel when it did not (`PANEL_RIG`). `n` is the receiver's face normal or
+   * the zero vector for an open-air world probe, and `faced` says which — the
+   * `cos > 0` CULL is only safe where a normal exists, and `shEval`'s cosine
+   * convolution supplies the receiver's cosine at the pixel either way.
+   */
+  const shAdd = (sh, c, d) => {
+    sh[0].addAssign(c.mul(0.282095));
+    sh[1].addAssign(c.mul(d.y.mul(0.488603)));
+    sh[2].addAssign(c.mul(d.z.mul(0.488603)));
+    sh[3].addAssign(c.mul(d.x.mul(0.488603)));
+    sh[4].addAssign(c.mul(d.x.mul(d.y).mul(1.092548)));
+    sh[5].addAssign(c.mul(d.y.mul(d.z).mul(1.092548)));
+    sh[6].addAssign(c.mul(d.z.mul(d.z).mul(3).sub(1).mul(0.315392)));
+    sh[7].addAssign(c.mul(d.x.mul(d.z).mul(1.092548)));
+    sh[8].addAssign(c.mul(d.x.mul(d.x).sub(d.y.mul(d.y)).mul(0.546274)));
+  };
+  const emitterSh = (!emitters?.length && !PANEL_RIG) ? null : (p, n, faced) => {
+    const sh = [];
+    for (let i = 0; i < 9; i++) sh.push(vec3(0).toVar());
+    for (const slot of (emitters ?? [])) {
+      const centre = vec3(slot.center).toVar();
+      const reff = float(slot.reff).max(1e-3).toVar();
+      const rgb = vec3(slot.color).toVar();
+      const active = float(slot.radius).greaterThan(1e-5)
+        .and(rgb.x.add(rgb.y).add(rgb.z).greaterThan(1e-6));
+      If(active, () => {
+        const wv = centre.sub(p).toVar();
+        const d2 = dot(wv, wv).max(1e-4).toVar();
+        const d = sqrt(d2).toVar();
+        const wd = wv.div(d).toVar();
+        const facing = select(faced, dot(n, wd).greaterThan(1e-3), true).toVar();
+        If(facing, () => {
+          const omega = float(Math.PI).min(float(Math.PI).mul(reff.mul(reff)).div(d2)).toVar();
+          const reach = d.sub(reff).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
+          const vis = float(1).sub(traceWindow(p, wd, reach, select(faced, n, wd)).hit).toVar();
+          If(vis.greaterThan(0.001), () => { shAdd(sh, rgb.mul(omega).mul(vis), wd); });
+        });
+      });
+    }
+    if (PANEL_RIG) {
+      // §19 3.12's `panelNee` arm, honoured here too: 0 gives the panel back to
+      // the TRANSPORT (`emOf` stops zeroing its emission) and this term must go
+      // with it, or the rig's light is counted twice on the world path and once
+      // on the screen path — two arms measuring two different scenes.
+      If(u.panelNee.greaterThan(0.5).and(p.y.lessThan(u.panelCentre.y.sub(0.05))), () => {
+        const pRay = p.add(select(faced, n, vec3(0, 1, 0)).mul(v0 * 0.5)).toVar();
+        const yStop = u.panelCentre.y.div(v0).floor().mul(v0).sub(v0 * 0.5).toVar();
+        for (let sy = 0; sy < 2; sy++) {
+          for (let sx = 0; sx < 2; sx++) {
+            const q = vec3(
+              u.panelCentre.x.add(u.panelHalf.x.mul(sx ? 0.5 : -0.5)),
+              u.panelCentre.y,
+              u.panelCentre.z.add(u.panelHalf.y.mul(sy ? 0.5 : -0.5)),
+            ).toVar();
+            const wv = q.sub(p).toVar();
+            const d2 = dot(wv, wv).max(1e-4).toVar();
+            const d = sqrt(d2).toVar();
+            const wd = wv.div(d).toVar();
+            const cosP = wd.y.max(0).toVar();
+            const facing = select(faced, dot(n, wd).greaterThan(1e-3), true).toVar();
+            If(facing.and(cosP.greaterThan(1e-5)), () => {
+              const tStop = yStop.sub(pRay.y).div(wd.y.max(1e-3)).min(d).max(0.05).toVar();
+              const vis = float(1).sub(traceWindow(p, wd, tStop, select(faced, n, wd)).hit).toVar();
+              shAdd(sh, u.panelRadiance.mul(cosP).mul(u.panelArea.mul(0.25)).div(d2).mul(vis), wd);
+            });
+          }
+        }
+      });
+    }
+    return sh;
+  };
+
+  // ══════════════════════════ §19 STAGE 3.13 — THE LATTICE ══════════════════
+  const world = !useWorld ? null : createWorldProbes({
+    win, trace, cache, tier,
+    kit: {
+      u, octU, cellOfWorld, dominantFace, hitRadiance, emitterSh, bump, STATS,
+      RAY_MAX, OCT, O,
+    },
+  });
+  if (world) Object.assign(u, world.uniforms);
+
   // ══════════════════════════════════════════════ the HZB screen segment
   //
   // Stackless closest-depth walk. The screen path of a straight world ray is a
@@ -2493,7 +2661,7 @@ export function createGiGather({
   // against the reprojected previous value at a FIXED α, store it. Every texel
   // of every live probe is written every frame, which is also why `probePlace`
   // no longer carries the map forward.
-  const probeTracePass = Fn(() => {
+  const probeTracePass = useWorld ? null : Fn(() => {
     const xr = globalId.x.toVar();
     const ty = globalId.y.toVar();
     If(xr.greaterThanEqual(u.probeWU.mul(uint(OCT))).or(ty.greaterThanEqual(u.probeHU)),
@@ -2877,7 +3045,7 @@ export function createGiGather({
   // So this kernel is per-probe with NO neighbourhood: copy the raw map, fill
   // its holes, build the 2×2 mip the glossy tap reads, project the SH. 128
   // reads instead of 640. Part 2 does the 3×3, on the coefficients.
-  const probeFilterPass = Fn(() => {
+  const probeFilterPass = useWorld ? null : Fn(() => {
     const tx = globalId.x.toVar();
     const ty = globalId.y.toVar();
     If(tx.greaterThanEqual(u.probeWU).or(ty.greaterThanEqual(u.probeHU)), () => { Return(); });
@@ -2992,7 +3160,7 @@ export function createGiGather({
   // zero whether it is one probe away or two.
   //
   // Both radii are built; `passes.probeShFilter3` is the A/B's other arm.
-  const makeShFilter = (radius) => Fn(() => {
+  const makeShFilter = (radius) => useWorld ? null : Fn(() => {
     const tx = globalId.x.toVar();
     const ty = globalId.y.toVar();
     If(tx.greaterThanEqual(u.probeWU).or(ty.greaterThanEqual(u.probeHU)), () => { Return(); });
@@ -3077,7 +3245,7 @@ export function createGiGather({
   // expensive way (four inlined DDAs, 2.5 s of pipeline compile, first light
   // 1.8 → 3.6 s on the Level), AND it is what makes `emOf`'s removal of the
   // emission safe: the two are one build decision, never two.
-  const panelDirectPass = !PANEL_RIG ? null : Fn(() => {
+  const panelDirectPass = (!PANEL_RIG || useWorld) ? null : Fn(() => {
     const gx = globalId.x.toVar();
     const gy = globalId.y.toVar();
     If(gx.greaterThanEqual(u.probeWU).or(gy.greaterThanEqual(u.probeHU)), () => { Return(); });
@@ -3254,7 +3422,7 @@ export function createGiGather({
   // is retired is the diffuse sum. Both arms are still built — `passes.resolve`
   // ships the SH one, `passes.resolveOct` is the measurement arm the receipts
   // A/B against, byte-identical in everything but the integrator.
-  const makeResolve = (useSh, half = false, rawSh = false) => Fn(() => {
+  const makeResolve = (useSh, half = false, rawSh = false, worldTap = false) => Fn(() => {
     const gxu = globalId.x.toVar();
     const gyu = globalId.y.toVar();
     If(half
@@ -3300,10 +3468,103 @@ export function createGiGather({
 
       const wsum = float(0).toVar();
       const best = float(-1).toVar();
-      const bestW = float(-1).toVar();
+      const bestW = float(worldTap ? 0 : -1).toVar();
       // The blended SH2, accumulated in COEFFICIENT space (see `shEval`).
       const Lb = [];
       for (let i = 0; i < 9; i++) Lb.push(vec3(0).toVar());
+      // The world path's fallback carries VALUES, not an index: a lattice cell
+      // is addressed by three coordinates and re-deriving them after the loop
+      // would be a second set of eight taps.
+      const bestL = [];
+      if (worldTap) for (let i = 0; i < 9; i++) bestL.push(vec3(0).toVar());
+      const bestG = worldTap ? vec3(0).toVar() : null;
+      if (worldTap) {
+        // == §19 STAGE 3.13 -- THE EIGHT LATTICE PROBES AROUND THE PIXEL ======
+        //
+        // Trilinear x wrapped cosine x face x visibility, which is DDGI's
+        // weight set with §U's face term added, and each of the four is doing a
+        // different job:
+        //
+        //   TRILINEAR   the interpolation itself, and the reason camera motion
+        //               is smooth: the probes do not move, only these weights.
+        //   WRAPPED     `((n.d)/2 + 1/2)^2` on the direction to the probe. A
+        //   COSINE      probe behind the shading plane contributes nothing,
+        //               which removes the "the lit room's probe lights the dark
+        //               side's wall" case without tracing anything.
+        //   FACE        the probe's own assignment. A probe that had to be
+        //               pushed out of geometry REPRESENTS one side of that
+        //               geometry, and a pixel looking the other way must not
+        //               read it.
+        //   VISIBILITY  the probe's own hit-distance moments (`octTapVis`).
+        //               The only one of the four that can refuse a probe whose
+        //               normal agrees but whose LINE OF SIGHT is blocked -- a
+        //               floor pixel beside a partition, which is the interior
+        //               leak this stage is gated on.
+        //
+        // ⚠ THE SAMPLE POINT IS BIASED ALONG THE NORMAL. Without it a pixel's
+        // own surface occludes it from every probe above it and the visibility
+        // term reads ~0 everywhere; the bias is a fraction of the LATTICE
+        // SPACING, so it is the scene's own length at every tier.
+        const SPW = world.spacing;
+        const Pb = P.add(Nn.mul(world.uniforms.wpBias.mul(SPW))).toVar();
+        const fr = world.taps.cellFrame(Pb);
+        for (let c8 = 0; c8 < 8; c8++) {
+          const cdx = c8 & 1;
+          const cdy = (c8 >> 1) & 1;
+          const cdz = (c8 >> 2) & 1;
+          // Clamped into the lattice, never rejected by it — see
+          // `clampToLattice`. A pixel beyond the lattice's 16 m reach then
+          // extrapolates from its nearest boundary probe instead of
+          // compositing black, which is what 3.13's Bistro doors receipt
+          // caught (6.3 % of the dark pixels had no live corner, p95 15 m).
+          const [wcx, wcy, wcz] = world.taps.clampToLattice(
+            fr.base.x.add(cdx), fr.base.y.add(cdy), fr.base.z.add(cdz),
+          );
+          const cell = world.taps.cellAt(wcx, wcy, wcz).toVar();
+          const i0 = world.taps.infoAt(cell, 0).toVar();
+          const alive = i0.w.greaterThan(0.5)
+            .and(world.taps.infoAt(cell, 2).w.greaterThan(0.5)).toVar();
+          const tri = (cdx ? fr.frac.x : float(1).sub(fr.frac.x))
+            .mul(cdy ? fr.frac.y : float(1).sub(fr.frac.y))
+            .mul(cdz ? fr.frac.z : float(1).sub(fr.frac.z)).toVar();
+          const toP = i0.xyz.sub(Pb).toVar();
+          const dist = toP.length().max(1e-4).toVar();
+          const dirP = toP.div(dist).toVar();
+          const wc0 = dot(Nn, dirP).mul(0.5).add(0.5).toVar();
+          const faceN = world.taps.infoAt(cell, 1).xyz.toVar();
+          const wf = mix(float(1),
+            select(i0.w.greaterThan(1.5), dot(Nn, faceN).max(0), float(1)),
+            world.uniforms.wpFaceOn.clamp(0, 1)).toVar();
+          const live = select(alive, float(1), float(0)).toVar();
+          const wGeo = tri.mul(wf).mul(live).toVar();
+          const vis = world.taps.octTapVis(octPlan(dirP.negate(), O), cell, dist).toVar();
+          const w = wGeo.mul(wc0.mul(wc0)).mul(vis).toVar();
+          // ⭐⭐ THE FALLBACK IS TWO-TIER, AND THE SECOND TIER IS NOT OPTIONAL.
+          //
+          // It prefers an ADMISSIBLE probe (one that passed the face gate) by a
+          // factor of a thousand, so a pixel with any admissible corner never
+          // falls back to a probe representing the other side of a wall. But a
+          // pixel with NO admissible corner has to read SOMETHING: a
+          // sub-lattice feature — a 3 cm cable, a pot rim, a bracket — can sit
+          // in a pocket where all eight cells were pushed out of nearby
+          // geometry and face away from it, and black there is the thin-feature
+          // fault the screen path was condemned for, re-created one stage down.
+          // `max(wf, 0.001)` is the whole rule: one expression, no branch, and
+          // the ordering it encodes is exactly the priority.
+          const cand = tri.mul(live).mul(wf.max(0.001)).toVar();
+          If(cand.greaterThan(bestW), () => {
+            bestW.assign(cand);
+            best.assign(1);
+            for (let i = 0; i < 9; i++) bestL[i].assign(world.taps.shAt(cell, i).xyz);
+            bestG.assign(world.taps.octTapRad(planFull, cell));
+          });
+          If(w.greaterThan(1e-5), () => {
+            for (let i = 0; i < 9; i++) Lb[i].addAssign(world.taps.shAt(cell, i).xyz.mul(w));
+            G.addAssign(world.taps.octTapRad(planFull, cell).mul(w));
+            wsum.addAssign(w);
+          });
+        }
+      } else {
       for (let corner = 0; corner < 4; corner++) {
         const dx = corner & 1;
         const dy = (corner >> 1) & 1;
@@ -3331,24 +3592,30 @@ export function createGiGather({
           wsum.addAssign(w);
         });
       }
+      }
       // §L.5's fallback: the nearest VALID probe, unweighted, rather than a
       // black pixel. A pixel whose four corners all fail the plane test sits
       // on a silhouette, and black there reads as a hard outline. It is folded
       // into the SAME accumulator with weight 1 rather than duplicating the
       // evaluation — one `shEval` per pixel, on every path.
       If(wsum.lessThan(1e-5).and(best.greaterThanEqual(0)), () => {
-        const pi = best.toUint().toVar();
-        if (useSh) {
-          const at = rawSh ? shRawIdx : shIdx;
-          for (let i = 0; i < 9; i++) Lb[i].assign(probeSh.element(at(pi, i)).xyz);
+        if (worldTap) {
+          for (let i = 0; i < 9; i++) Lb[i].assign(bestL[i]);
+          G.assign(bestG);
         } else {
-          E.assign(irradianceFromOct(pi, Nn));
+          const pi = best.toUint().toVar();
+          if (useSh) {
+            const at = rawSh ? shRawIdx : shIdx;
+            for (let i = 0; i < 9; i++) Lb[i].assign(probeSh.element(at(pi, i)).xyz);
+          } else {
+            E.assign(irradianceFromOct(pi, Nn));
+          }
+          G.assign(glossyAt(pi));
         }
-        G.assign(glossyAt(pi));
         wsum.assign(1);
       });
       If(wsum.greaterThan(1e-5), () => {
-        if (useSh) {
+        if (useSh || worldTap) {
           const inv = float(1).div(wsum).toVar();
           for (let i = 0; i < 9; i++) Lb[i].mulAssign(inv);
           E.assign(shEval(Lb, Nn));
@@ -3382,8 +3649,8 @@ export function createGiGather({
       textureStore(glossy, coord, vec4(G, g.w));
     }
   })().compute(dispatch2d(half ? halfW : width, half ? halfH : height), WG);
-  const resolvePass = makeResolve(USE_SH);
-  const resolveOctPass = makeResolve(false);
+  const resolvePass = useWorld ? null : makeResolve(USE_SH);
+  const resolveOctPass = useWorld ? null : makeResolve(false);
   // ⭐ THE A/B'S OTHER HALF. §3.2's gate was "SH2 against the 4×64 oct cosine
   // sum", and it meant the SH TRUNCATION ERROR and nothing else — same
   // probes, same map, two integrators. §3.3 moved §L.4's 3×3 bilateral onto
@@ -3394,8 +3661,13 @@ export function createGiGather({
   // irradiance moved 0.557 → 0.572, which is the arm moving, not the answer.
   // So the A/B gets an arm that reads the UNPOOLED coefficients: same data as
   // the oct sum, and the ratio is the truncation again.
-  const resolveShRawPass = makeResolve(true, false, true);
-  const resolveHalfPass = makeResolve(USE_SH, true);
+  const resolveShRawPass = useWorld ? null : makeResolve(true, false, true);
+  // ⚠ THE IDENTITY IS THE SAME EITHER WAY. `gi2System` splices its emitter term
+  // immediately before `passes.resolveHalf` and GTAO immediately after
+  // `passes.resolveUpsample`; both splice points have to survive the flip or a
+  // consumer's chain silently loses a stage (§19 3.4's lesson, from the other
+  // side). So the half-res resolve keeps its NAME and changes its BODY.
+  const resolveHalfPass = makeResolve(USE_SH, true, false, useWorld);
 
   // ══════════════════════════════ SHADER: resolveUpsample
   //
@@ -4025,7 +4297,7 @@ export function createGiGather({
   // It re-derives the ray exactly as `probeTrace` does — same rotation, same
   // jitter, same texel window — so it is the same ray and not a similar one.
   // Bindings: window, meta, hzb, stats, exhaustOut = 5.
-  const exhaustProbePass = Fn(() => {
+  const exhaustProbePass = useWorld ? null : Fn(() => {
     const xr = globalId.x.toVar();
     const ty = globalId.y.toVar();
     If(xr.greaterThanEqual(u.probeWU.mul(uint(RAY_FRESH))).or(ty.greaterThanEqual(u.probeHU)),
@@ -4154,7 +4426,7 @@ export function createGiGather({
   })().compute(CONTACT_RAYS);
 
   // ══════════════════════════════════════════════ SHADER: cold-start clears
-  const clearProbesPass = Fn(() => {
+  const clearProbesPass = useWorld ? null : Fn(() => {
     probeOct.element(instanceIndex).assign(vec4(0));
   })().compute(2 * probeCount * OCT);
   const clearMetaPass = Fn(() => {
@@ -4188,7 +4460,25 @@ export function createGiGather({
       paletteEmissive[i].set(er, eg, eb, 0);
     }
   };
-  const beginFrame = (n) => {
+  /**
+   * §19 3.13. The lattice's own placement, on the SAME call the caller already
+   * makes for the window — `beginFrame` is the one point every consumer of this
+   * factory passes through, and a second "and also call `world.setCamera`"
+   * contract is exactly the caller-position dependency the shadow-freeze bug
+   * was made of.
+   *
+   * ⭐ `pos` FALLS BACK TO `u.camPos`, AND THAT IS WHAT KEEPS `gi2System`
+   * UNEDITED. That consumer calls `beginFrame(frame)` and then `syncLighting()`
+   * -- so at this instant `u.camPos` holds the PREVIOUS frame's position, and
+   * the lattice's origin therefore steps one frame after the window's. It is a
+   * hysteretic, block-aligned step that only fires when the camera leaves the
+   * central half of a 16 m cube, and the entering slab needs several frames of
+   * round-robin to fill either way, so one frame of lag on the trigger is not
+   * reachable by any receipt. Silently NOT following the camera would have
+   * been: the lattice would sit where the scene opened, forever.
+   */
+  const beginFrame = (n, pos = null) => {
+    if (world) world.setCamera(pos ?? u.camPos.value);
     frame = n;
     u.frame.value = n >>> 0;
     u.curBase.value = n & 1;
@@ -4197,6 +4487,9 @@ export function createGiGather({
 
   const describe = () => ({
     tier, tile: T, rays: R, oct: O, history: H, stride: STRIDE, sh: USE_SH,
+    // §19 3.13. `worldProbes` is the CONFIGURATION, not the constant: a receipt
+    // that prints the constant would report what someone believes shipped.
+    worldProbes: useWorld, world: world?.describe() ?? null,
     metaVec: META_VEC, matureRays: MATURE_RAYS, rayFresh: RAY_FRESH, rayFlag: RAY_FLAG,
     shadeProb: u.shadeProb.value, nCap: u.nCapU.value, skyRays: SKY_RAYS,
     // §19 3.12's three, so a receipt can print the configuration it measured
@@ -4217,16 +4510,20 @@ export function createGiGather({
       litBuf: width * height * 16,
       // §19 3.12 adds the two history textures: +2 full-res RGBA16F.
       textures: 5 * width * height * 8 + 2 * halfW * halfH * 8,
+      worldProbes: world ? Object.values(world.describe().bytes).reduce((a, b) => a + b, 0) : 0,
     },
   });
 
   const api = {
     tier, T, R, O, H, SH_R, STRIDE, USE_SH, probeW, probeH, probeCount, width, height,
+    /** §19 3.13 — the configuration, for a consumer that has to branch on it. */
+    worldProbes: useWorld, world,
     uniforms: u, palette, paletteEmissive, setPalette, beginFrame, get frame() { return frame; },
     buffers: {
       probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf,
       shadeIn, shadeOut, exhaustOut, noiseBuf, dirtyBuf, reprojBuf, motionLum,
       contactIn, contactOut,
+      ...(world ? world.buffers : null),
     },
     SHADE_SLOTS, EXHAUST_SLOTS, EXH_VEC, CONTACT_RAYS,
     textures: {
@@ -4279,6 +4576,17 @@ export function createGiGather({
       clearProbes: clearProbesPass,
       clearMeta: clearMetaPass,
       clearStats: clearStatsPass,
+      // §19 3.13's lattice, under `world*` names so nothing that walks this map
+      // by key can confuse a world kernel with a screen one.
+      worldAlloc: world?.passes.alloc ?? null,
+      worldCount: world?.passes.count ?? null,
+      worldScan: world?.passes.scan ?? null,
+      worldFill: world?.passes.fill ?? null,
+      worldTrace: world?.passes.trace ?? null,
+      worldSh: world?.passes.sh ?? null,
+      worldNee: world?.passes.nee ?? null,
+      worldClear: world?.passes.clear ?? null,
+      worldClearInfo: world?.passes.clearInfo ?? null,
     },
     /**
      * THE PER-FRAME CHAIN, IN ORDER, as node objects.
@@ -4294,7 +4602,23 @@ export function createGiGather({
      * are NOT here — this is the gather's own order, from the HZB to the
      * injection, and a consumer splices its own passes into a copy.
      */
-    frameOrder: [
+    frameOrder: (useWorld ? [
+      // ══ §19 STAGE 3.13 — THE WORLD PATH'S ORDER ═════════════════════════════
+      //
+      // ⛔ NO HZB. The screen segment is `probeTrace`'s first ray segment and
+      // `probeTrace` is not built here; a depth pyramid nothing samples is
+      // 0.2 ms of pure cost. §U.3's "keep the HZB contact term" is kept where it
+      // still exists — GTAO, which `gi2System` splices after `resolveUpsample`.
+      //
+      // The four compaction kernels are ~65 k serial iterations between them and
+      // are listed rather than folded because each is a different SHAPE (per
+      // cell, per block, one thread, per block) and a fold would need workgroup
+      // memory, which the portable envelope does not allow.
+      world.passes.alloc, world.passes.count, world.passes.scan, world.passes.fill,
+      world.passes.trace, world.passes.sh, world.passes.nee,
+      resolveHalfPass, resolveUpsamplePass,
+      compositePass, injectPass, imageHistoryPass,
+    ] : [
       hzbBuildPass, ...hzbReducePasses, probePlacePass, rayBudgetPass, probeTracePass,
       probeFilterPass, probeShFilterPass,
       // §19 3.12: the rig's emitter NEE goes exactly where `gi2System` splices
@@ -4309,7 +4633,7 @@ export function createGiGather({
       // `resolveUpsample` (which is what `gi2System` does) still hands this the
       // un-occluded irradiance the next frame's blend is defined against.
       imageHistoryPass,
-    ].filter(Boolean),
+    ]).filter(Boolean),
     /** Sum a striped counter out of a readback. */
     readStats(u32) {
       const out = {};

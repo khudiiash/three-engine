@@ -33,6 +33,7 @@
 //
 // Env: PROJECT · SCENE=Bistro · SETTLE=14 · FRAMES=240 · AO=both|on|off · HEADED=1
 import puppeteer from "puppeteer-core";
+import { readFileSync, writeFileSync } from "node:fs";
 import { installTauriShim } from "./lib/tauriShim.mjs";
 
 const url = process.argv[2] ?? "http://127.0.0.1:5202/";
@@ -41,6 +42,26 @@ const SCENE = process.env.SCENE ?? "Bistro";
 const SETTLE = Number(process.env.SETTLE ?? 14);
 const FRAMES = Number(process.env.FRAMES ?? 240);
 const AO_ARMS = (process.env.AO ?? "both").toLowerCase();
+// ⭐⭐ §19 3.13 — THE DARKEST 1 % IS SELF-SELECTED, SO ACROSS TWO BOOTS IT IS
+// TWO DIFFERENT PIXEL SETS AND THE RATIO IS NOT A BEFORE/AFTER.
+//
+// Each arm ranks the frame by its OWN final luminance, so "the darkest 1 %"
+// under the screen probes and under the world lattice are different places and
+// a comparison between their two ratios says nothing about whether the cable
+// got brighter. `PICK_OUT` writes this boot's populations to a file and
+// `PICK_IN` reads them back into the next one — the pose, the resolution and
+// the dump stride are identical across the two runs, so the indices name the
+// same pixels. The world arm must be run with the SCREEN arm's pick.
+const PICK_OUT = process.env.PICK_OUT ?? "";
+const PICK_IN = process.env.PICK_IN ?? "";
+// ⚠⚠ AND THE POSE HAS TO BE PINNED TOO, OR THE SHARED PICK IS A LIE. The pose
+// is DERIVED (banner bounds, an openness ring, a scored standoff search) and it
+// came back 11 cm apart on two boots of the same arm — at 2 m that is ~40 px of
+// parallax, which moves a 1 124-pixel cable population off the cable and turns
+// the receipt into a comparison between a cable and a wall. `POSE=ex,ey,ez|ax,
+// ay,az` skips the derivation entirely; the runs that share a pick must share
+// this too.
+const POSE_ENV = process.env.POSE ?? "";
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const browser = await puppeteer.launch({
@@ -59,6 +80,13 @@ await installTauriShim(page, {});
 // kernel see the gbuffer at all" — it is only BUILT when a receipt asked for it
 // before the gather factory runs.
 await page.evaluateOnNewDocument(() => { globalThis.__gi2NoiseDump = true; });
+// §19 3.13: the same pre-boot hatch the motion and boot probes already have.
+// `FLAGS='{"__gi2WorldProbes":true}'` puts the diffuse path on the world-
+// anchored lattice, and it has to be set BEFORE the gather factory runs — which
+// is why it is a global and not an editor op.
+await page.evaluateOnNewDocument((flags) => {
+  for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
+}, JSON.parse(process.env.FLAGS ?? "{}"));
 await page.evaluateOnNewDocument((project) => {
   globalThis.__editorKeepRendering = true;
   localStorage.setItem("engine.projectRoot.v1", project);
@@ -629,6 +657,25 @@ const readFrame = (pick) => page.evaluate(async ({ pick }) => {
 
   const out = { crops: {}, meta: {} };
   for (const k of Object.keys(chosen)) out.crops[k] = stats(chosen[k]);
+  // ⭐ TWO QUESTIONS, TWO POPULATIONS. With a shared pick the table above
+  // answers "did the OTHER arm's dark pixels get brighter"; this answers "is
+  // this arm's own worst 1 % still dark", which is the question a self-selected
+  // population is the right instrument for. Both are printed; neither replaces
+  // the other.
+  if (pick) {
+    out.ownDarkest = stats(cap(darkest));
+    out.ownWall = stats(cap(pop.wall));
+    let nOther = 0; let nJ = 0;
+    for (const i of darkest) {
+      if (cls[i] !== 1 && cls[i] !== 2) nOther++;
+      if (jdist[i] <= 3) nJ++;
+    }
+    out.ownDark = {
+      n: darkest.length,
+      offPlanePct: +(100 * nOther / Math.max(1, darkest.length)).toFixed(1),
+      nearJunctionPct: +(100 * nJ / Math.max(1, darkest.length)).toFixed(1),
+    };
+  }
 
   // ⭐⭐ WHAT ARE THE BLACK PIXELS, GEOMETRICALLY? "the darkest 1 % reads 1.6 %
   // of the wall" is only an answer to the user's report if those pixels are AT
@@ -700,7 +747,12 @@ const readFrame = (pick) => page.evaluate(async ({ pick }) => {
   return out;
 }, { pick });
 
-const pose = await doorsPose();
+const pose = POSE_ENV
+  ? (() => {
+    const [e, t] = POSE_ENV.split("|").map((v) => v.split(",").map(Number));
+    return { name: "doors PINNED", position: e, target: t, ground: t[1] - 1.15, pinned: true };
+  })()
+  : await doorsPose();
 if (!pose) { console.log("FATAL: no FrontBanner — cannot derive the doors pose"); await browser.close(); process.exit(1); }
 console.log(`  coarse pose ${pose.name}  eye ${pose.position.map((v) => v.toFixed(2))} → ${pose.target.map((v) => v.toFixed(2))}`);
 await call("viewport.setCamera", { position: pose.position, target: pose.target });
@@ -712,7 +764,7 @@ await settleFrames(60);
 // the front plane's centroid come out of the DUMP, and the camera is put back
 // on that normal at eye height — "2 m in front of the doors, looking at the
 // doors" as a measured fact rather than a hope about a banner's bounding box.
-{
+if (!pose.pinned) {
   const probeMeta = (await readFrame(null))?.meta;
   const FN = probeMeta?.facadeNormal;
   const C = probeMeta?.frontCentroid;
@@ -799,6 +851,12 @@ const show = (tag, r) => {
       `f/irr ${R(lum(A.final) / Math.max(1e-9, lum(A.irrAfter)), lum(B.final) / Math.max(1e-9, lum(B.irrAfter)))}`);
   };
   for (const a of ["recess", "recessDeep", "darkest"]) { ratio(a, "frame"); ratio(a, "wall"); }
+  if (r.ownDarkest && r.ownWall) {
+    const A = r.ownDarkest; const B = r.ownWall;
+    console.log(`     RATIOS ownDarkest÷ownWall (this arm's OWN worst 1 %, n ${A.n}): ` +
+      `irrBefore ${R(lum(A.irrBefore), lum(B.irrBefore))}  final ${R(lum(A.final), lum(B.final))}  ` +
+      `| off-plane ${r.ownDark.offPlanePct} %  within 3px of a depth jump ${r.ownDark.nearJunctionPct} %`);
+  }
   ratio("frame", "wall");
   ratio("halo", "haloRef");
 };
@@ -809,9 +867,84 @@ const giEntity = entities.find((e) => (e.components ?? []).some((c) => c.type ==
 const authoredAo = await page.evaluate(() => globalThis.__giSys()?.config?.ao ?? null);
 console.log(`  GI entity ${giEntity?.name ?? "NONE"} (${giEntity?.id ?? "—"})   config.ao as opened = ${authoredAo}`);
 
-const first = await readFrame(null);
-show(`ARM ao=${authoredAo} (AS AUTHORED)`, first);
-const pick = first?.pick ?? null;
+const loadedPick = PICK_IN ? JSON.parse(readFileSync(PICK_IN, "utf8")) : null;
+if (loadedPick) console.log(`  pick loaded from ${PICK_IN} — measuring the OTHER arm's pixels ` +
+  `(${Object.entries(loadedPick).map(([k, v]) => `${k} ${v.length}`).join(", ")})`);
+const first = await readFrame(loadedPick);
+show(`ARM ao=${authoredAo} (AS AUTHORED)${loadedPick ? " — SHARED PICK" : ""}`, first);
+const pick = loadedPick ?? first?.pick ?? null;
+if (PICK_OUT && first?.pick) {
+  writeFileSync(PICK_OUT, JSON.stringify(first.pick));
+  console.log(`  pick written to ${PICK_OUT}`);
+}
+
+// ── §19 3.13: WHY are these pixels dark on the world path? ──────────────────
+//
+// The lattice can only fail a pixel in one of two ways — no live probe in the
+// eight cells around it, or every one of them refused by the face gate — and
+// those have different fixes. So the same picked pixels are asked, on the CPU,
+// through the SAME addressing the resolve uses.
+if (pick?.darkest) {
+  const lat = await page.evaluate(async ({ idx }) => {
+    const eng = globalThis.__giEngineForProbe;
+    const gi2 = globalThis.__gi2();
+    const g = gi2?.gather;
+    if (!g?.worldProbes || !g.world) return { skip: "not a world-probe build" };
+    const w = g.world.describe();
+    const { createGi2StageDump } = await import("/scripts/lib/gi2StageProbe.js");
+    const dump = createGi2StageDump({ renderer: eng.renderer, gi2, screen: globalThis.__giSys().state.screen, stride: 2 });
+    const D = await dump.read();
+    const V = 6;
+    const at = (i, v, c) => D[(i * V + v) * 4 + c];
+    const info = new Float32Array(await eng.renderer.getArrayBufferAsync(g.buffers.wpInfo.value));
+    const list = new Uint32Array(await eng.renderer.getArrayBufferAsync(g.buffers.wpList.value));
+    const o = g.uniforms.wpOrigin.value;
+    const C = w.cells; const SP = w.spacing; const CB = Math.log2(C);
+    const bias = g.uniforms.wpBias.value * SP;
+    let n = 0; let noCorner = 0; let faceOnly = 0; let sumAlive = 0; let sumAdm = 0;
+    const depths = [];
+    for (const i of idx) {
+      if (!(at(i, 0, 3) > 0.5)) continue;
+      const P = [at(i, 0, 0), at(i, 0, 1), at(i, 0, 2)];
+      const N = [at(i, 1, 0), at(i, 1, 1), at(i, 1, 2)];
+      const Pb = P.map((v, k) => v + N[k] * bias);
+      const base = Pb.map((v) => Math.floor(v / SP - 0.5));
+      let alive = 0; let adm = 0;
+      for (let c = 0; c < 8; c++) {
+        const wc = [base[0] + (c & 1), base[1] + ((c >> 1) & 1), base[2] + ((c >> 2) & 1)];
+        const rel = [wc[0] - o.x, wc[1] - o.y, wc[2] - o.z];
+        if (rel.some((v) => v < 0 || v >= C)) continue;
+        const cell = (wc[0] & (C - 1)) | ((wc[1] & (C - 1)) << CB) | ((wc[2] & (C - 1)) << (2 * CB));
+        const st = info[(cell * 3 + 0) * 4 + 3];
+        const rdy = info[(cell * 3 + 2) * 4 + 3];
+        if (!(st > 0.5) || !(rdy > 0.5)) continue;
+        alive++;
+        const fN = [info[(cell * 3 + 1) * 4], info[(cell * 3 + 1) * 4 + 1], info[(cell * 3 + 1) * 4 + 2]];
+        const wf = st > 1.5 ? Math.max(0, N[0] * fN[0] + N[1] * fN[1] + N[2] * fN[2]) : 1;
+        if (wf > 0) adm++;
+      }
+      n++; sumAlive += alive; sumAdm += adm;
+      if (alive === 0) noCorner++;
+      else if (adm === 0) faceOnly++;
+      depths.push(Math.hypot(P[0] - eng.camera.position.x, P[1] - eng.camera.position.y, P[2] - eng.camera.position.z));
+    }
+    depths.sort((a, b) => a - b);
+    return {
+      n, noCornerPct: +(100 * noCorner / Math.max(1, n)).toFixed(1),
+      faceRejectPct: +(100 * faceOnly / Math.max(1, n)).toFixed(1),
+      meanAlive: +(sumAlive / Math.max(1, n)).toFixed(2),
+      meanAdmissible: +(sumAdm / Math.max(1, n)).toFixed(2),
+      live: list[w.cellCount * 2 + w.blocks], cells: w.cellCount, traceSlots: w.traceSlots,
+      depthP50: +(depths[Math.floor(depths.length / 2)] ?? 0).toFixed(2),
+      depthP95: +(depths[Math.floor(depths.length * 0.95)] ?? 0).toFixed(2),
+    };
+  }, { idx: pick.darkest });
+  if (lat?.skip) console.log(`  lattice diagnostic: ${lat.skip}`);
+  else if (lat) console.log(`  LATTICE at the darkest pixels (n ${lat.n}): live probes ${lat.live}/${lat.cells} ` +
+    `(budget ${lat.traceSlots}/frame); of the 8 corners, ${lat.meanAlive} alive and ${lat.meanAdmissible} admissible ` +
+    `on average; ${lat.noCornerPct} % have NO live corner, ${lat.faceRejectPct} % have live corners but all face-rejected; ` +
+    `pixel distance p50 ${lat.depthP50} m p95 ${lat.depthP95} m`);
+}
 
 // ── ARM 2: flip `ao`. STRUCTURAL — it rebuilds the whole GI chain ───────────
 if (AO_ARMS === "both" && giEntity && pick) {

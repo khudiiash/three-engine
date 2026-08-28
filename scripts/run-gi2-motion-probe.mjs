@@ -1054,7 +1054,16 @@ if (GRAIN) {
       "when `__gi2NoiseDump` is set before boot; run with FLAGS='{\"__gi2NoiseDump\":true}'.");
   } else {
     console.log(`\n── grain (reprojected sign flips, ${GRAIN_FRAMES} frames per arm) ─────────`);
-    const CFG = [
+    // §19 3.13: `probeDither` is read by `probeTrace`, which the WORLD path does
+    // not build — running the 3.11/3.12 pair there would print two identical
+    // rows and label one of them a comparison. The world arm gets its own pair
+    // (the lattice, and the lattice with the image accumulation off) and the
+    // 3.12 row comes from the OTHER boot, which is what a before/after is.
+    const worldArm = await page.evaluate(() => globalThis.__gi2WorldProbes === true);
+    const CFG = worldArm ? [
+      ["3.13 (world lattice)", { accumOn: 1 }],
+      ["3.13 (world, no accum)", { accumOn: 0 }],
+    ] : [
       ["3.11 (dither 1, no accum)", { probeDither: 1, accumOn: 0 }],
       ["3.12 (centres + accum)", { probeDither: 0, accumOn: 1 }],
     ];
@@ -1123,7 +1132,7 @@ if (GRAIN) {
     // shipped configuration and not the last arm's.
     await page.evaluate(() => {
       const gu = globalThis.__gi2GatherProbe.uniforms;
-      gu.probeDither.value = 0;
+      if (gu.probeDither) gu.probeDither.value = 0;
       gu.accumOn.value = 1;
     });
   }

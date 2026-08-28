@@ -56,6 +56,14 @@
         const ORBIT_FRAMES = Number(params.get("orbit") ?? 60);
         const WANT_PNG = params.get("png") !== "0";
 
+        // ⭐⭐ §19 STAGE 3.13 — `?world=1` PUTS THE DIFFUSE PATH ON THE LATTICE,
+        // AND IT HAS TO BE SET BEFORE THE FACTORY RUNS. `createGiGather` reads
+        // this once, at build, to decide which kernels exist at all — the same
+        // "a receipt asks for the instrument before the build" discipline
+        // `__gi2NoiseDump` follows. Setting it afterwards would do nothing, and
+        // silently.
+        if (params.has("world")) globalThis.__gi2WorldProbes = params.get("world") !== "0";
+
         const THREE = await import("three/webgpu");
         const TSL = await import("three/tsl");
         const { Fn, cameraPosition, dot, mrt, normalWorld, positionWorld, sign, vec4 } = TSL;
@@ -300,8 +308,16 @@
         // says, and everything downstream reads the same `shIdx` half.
         let SH3 = false;
 
+        // ⭐⭐ §19 STAGE 3.13 — THE CHAIN IS `frameOrder`, FOR THE REASON
+        // `gi2System` ALREADY LEARNED. A hand-written list cannot pick up a
+        // kernel a later stage adds or splits, and it fails SILENTLY. 3.13 adds
+        // seven kernels and removes eight, so this page would have been running
+        // an empty chain against a full one and reporting the difference as the
+        // stage's result. The two page-level deviations from the raw order —
+        // the SH-filter WIDTH arm and `opts.inject` — are expressed as
+        // substitutions on the way past.
         const runFrame = async (n, opts = {}) => {
-          gather.beginFrame(n);
+          gather.beginFrame(n, camera.position);
           camera.updateMatrixWorld(true);
           vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
           gu.prevViewProj.value.copy(n === 0 ? vp : prevVp);
@@ -309,29 +325,14 @@
           gu.camPos.value.copy(camera.position);
           await placeWindow();
           await renderGbuffer();
-          await compute(gather.passes.hzbBuild);
-          for (const p of gather.passes.hzbReduce) await compute(p);
-          await compute(gather.passes.probePlace);
-          // §19 Stage 3.7 P.3: the one-thread allocator, between the placement
-          // that classifies the probes and the trace that spends the rays.
-          await compute(gather.passes.rayBudget);
-          await compute(gather.passes.probeTrace);
-          await compute(gather.passes.probeFilter);
-          await compute(SH3 ? gather.passes.probeShFilter3 : gather.passes.probeShFilter);
-          // §19 STAGE 3.12 — the panel's direct light at the probe, by NEE, in
-          // the slot `gi2System` splices the engine's `emitterDirectPass` into:
-          // after the SH bilateral, before the first kernel that reads it.
-          if (gather.passes.panelDirect) await compute(gather.passes.panelDirect);
-          await compute(gather.passes.resolveHalf);
-          await compute(gather.passes.resolveUpsample);
-          await compute(gather.passes.composite);
-          if (opts.inject !== false) await compute(gather.passes.inject);
-          // §19 STAGE 3.12 — LAST, and unconditional. The accumulator's history
-          // is the frame the scene was lit by; skipping it on any frame the
-          // page runs would leave the NEXT frame blending against a stale one,
-          // and the at-rest receipt (which must read EXACTLY zero) would report
-          // motion that never happened.
-          await compute(gather.passes.imageHistory);
+          for (const node of gather.frameOrder) {
+            if (opts.inject === false && node === gather.passes.inject) continue;
+            if (SH3 && node === gather.passes.probeShFilter) {
+              await compute(gather.passes.probeShFilter3);
+              continue;
+            }
+            await compute(node);
+          }
           prevVp.copy(vp);
         };
 
@@ -444,7 +445,18 @@
             arr[b + 4] = jx / l; arr[b + 5] = jy / l; arr[b + 6] = -1 / l; arr[b + 7] = 0;
           }
           gather.buffers.contactIn.value.needsUpdate = true;
+          // ⚠⚠ §19 3.13 — THE HZB IS THIS INSTRUMENT'S PRECONDITION, AND ON THE
+          // WORLD PATH THE FRAME NO LONGER BUILDS IT. `contactRay` re-runs the
+          // shipped contact-authority decision, which asks the depth pyramid
+          // whether the ray's path was clear; against a pyramid nobody filled
+          // it reads "clear" and the receipt reports 50 % escapes — an artefact
+          // of the instrument, not a leak. So the pyramid is built HERE, beside
+          // the kernel that needs it, which is also the honest statement of what
+          // the number means on this path: the contact rule is exercised
+          // OUT-OF-BAND, because the world diffuse path does not run it at all.
           const arm = async () => {
+            await compute(gather.passes.hzbBuild);
+            for (const q of gather.passes.hzbReduce) await compute(q);
             await compute(gather.passes.contactRay);
             const f = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.contactOut.value));
             let escaped = 0; let contact = 0; let cleared = 0; let seen = 0; let plain = 0;
@@ -626,7 +638,12 @@
             // paid: the pixel receipt is the one the user's report is about,
             // and the probe-space pair only says whether the noise is BORN in
             // probe space or made by the resolve.
-            if (!probeSpace) continue;
+            // §19 3.13: `probeMeta`/`probeSh` are SCREEN-probe buffers. The
+            // world path binds neither, so they have no GPU allocation at all
+            // and a readback throws — which is the correct shape: a probe-space
+            // statistic about probes that do not exist is not a smaller number,
+            // it is a different question.
+            if (!probeSpace || gd.worldProbes) continue;
             const meta = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.probeMeta.value));
             const sh = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.probeSh.value));
             const half = gather.frame & 1;
@@ -751,8 +768,8 @@
         await placeWindow(true);
         await compute(cache.clearPass);
         await compute(cache.allocPass);
-        await compute(gather.passes.clearProbes);
-        await compute(gather.passes.clearMeta);
+        if (gather.passes.clearProbes) await compute(gather.passes.clearProbes);
+        if (gather.passes.clearMeta) await compute(gather.passes.clearMeta);
         await compute(gather.passes.clearStats);
         frameChain(true);
 
@@ -835,9 +852,25 @@
           `${(100 * statsIn.alphaForced / Math.max(1, statsIn.raysTraced)).toFixed(2)} % — with a parked camera and a ` +
           `static world this number is the rate at which the estimator throws away its own history on SHOT NOISE, ` +
           `and it should be ~0`);
-        say(`texel maturity: ${statsIn.matureTexels} of ${statsIn.texelsSeen} sampled texels have n >= H/2 = ` +
+        if (!gd.worldProbes) say(`texel maturity: ${statsIn.matureTexels} of ${statsIn.texelsSeen} sampled texels have n >= H/2 = ` +
           `${(100 * statsIn.matureTexels / Math.max(1, statsIn.texelsSeen)).toFixed(1)} % (H = ${gd.history})`);
-        {
+        if (gd.worldProbes) {
+          const w = gd.world;
+          say(`§19 3.13 LATTICE: ${w.cells}³ = ${w.cellCount} cells at ${w.spacing} m (${w.extent} m cube), ` +
+            `${w.traceSlots} probes updated per frame × ${w.oct} directions = ${w.raysPerFrame} rays/frame budget; ` +
+            `${w.totalMB} MB (oct ${(w.bytes.oct / 1048576).toFixed(2)} + sh ${(w.bytes.sh / 1048576).toFixed(2)} + ` +
+            `info ${(w.bytes.info / 1048576).toFixed(2)} + list ${(w.bytes.list / 1048576).toFixed(2)})`);
+          const lst = new Uint32Array(await renderer.getArrayBufferAsync(gather.buffers.wpList.value));
+          say(`  live probes ${lst[w.cellCount * 2 + w.blocks]} of ${w.cellCount} candidate cells ` +
+            `(${(100 * lst[w.cellCount * 2 + w.blocks] / w.cellCount).toFixed(1)} %); ` +
+            `round-robin period ${Math.ceil(lst[w.cellCount * 2 + w.blocks] / w.traceSlots)} frame(s)`);
+          results.lattice = { ...w, live: lst[w.cellCount * 2 + w.blocks] };
+        }
+        // ⚠ THE REPROJECTION CENSUS IS A SCREEN-PROBE INSTRUMENT and reads
+        // 0/0 — BLIND, correctly — on the world path, where nothing reprojects
+        // because nothing moves. Printing it there would be a null with no
+        // subject, which is the one thing this file's receipts must not do.
+        if (!gd.worldProbes) {
           // ⭐ A RATE NAMES NO MECHANISM. `probesValid − reprojHits` is split
           // into the five gates that can refuse a carry, and the split must
           // ADD UP — a census that does not is blind to a sixth reason.
@@ -974,7 +1007,11 @@
           }
           return outArr;
         };
-        {
+        // §19 3.13: the probe audit, the texel dump and the wall ladder all read
+        // SCREEN-probe buffers (`probeOct`, `probeFiltered`) which the world path
+        // does not allocate. Skipped rather than emptied — an audit of a buffer
+        // nobody filled prints numbers that look like measurements.
+        if (!gd.worldProbes) {
           const D = await dumpBuffers();
           const audit = [];
           const WANT = ["floorSpot", "redWall", "boxTop", "sphere", "sphereEdge"];
@@ -1425,8 +1462,8 @@
             await settle(30);
             writeCrops();
             const settled = lum((await readCrops()).find((x) => x.name === "floorSpot").irr);
-            await compute(gather.passes.clearProbes);
-            await compute(gather.passes.clearMeta);
+            if (gather.passes.clearProbes) await compute(gather.passes.clearProbes);
+            if (gather.passes.clearMeta) await compute(gather.passes.clearMeta);
             let f50 = null; let f90 = null;
             const series = [];
             for (let i = 1; i <= maxF; i++) {
@@ -1787,7 +1824,13 @@
               let firstFrame = true;
               for (let k = 0; k < frames; k++) {
                 await advance(k);
-                {
+                // §19 3.13: the PROBE half of this receipt is screen-probe
+                // specific — it follows each probe to the probe it reprojected
+                // FROM, and a world probe never reprojects because it never
+                // moves. Its answer on the world path is 0 flips by
+                // construction, so measuring it would be reporting the design
+                // as a result. The PIXEL half below is the receipt.
+                if (!gd.worldProbes) {
                   const meta = new Float32Array(
                     await renderer.getArrayBufferAsync(gather.buffers.probeMeta.value));
                   const shb = new Float32Array(
@@ -1891,6 +1934,7 @@
               // §19 3.12's two levers join the base so an arm can turn either
               // one off and nothing else moves with it.
               panelNee: gu.panelNee.value, accumOn: gu.accumOn.value,
+              ...(gd.worldProbes ? { wpAlpha: gu.wpAlpha.value } : null),
             };
             const setG = (over) => {
               for (const [k, v] of Object.entries({ ...GSHIP, ...over })) gu[k].value = v;
@@ -1910,7 +1954,23 @@
             // the 3.11 commit, and thirteen arms × 60 frames × two poses is
             // twenty minutes of a GPU this machine shares with another agent.
             const P311 = { probeDither: 1, panelNee: 0, accumOn: 0 };
-            const ARMS = [
+            // ⭐⭐ §19 STAGE 3.13 — THE WORLD ARM NEEDS ITS OWN LADDER, AND ITS
+            // POSITIVE CONTROL LIVES IN THE OTHER ARM.
+            //
+            // Four of the six rows below are levers the world path does not
+            // have: `probeDither` and `anchorJitter` are read by `probeTrace`
+            // and `probePlace`, neither of which is built. Running them would
+            // print six identical rows and call the last one a result. What the
+            // world path CAN vary is its own two — the image accumulation and
+            // the probe map's α — and the blind-statistics check is met by the
+            // SCREEN arm of the same page on the same GPU, where the anchor
+            // jitter drives this identical instrument (the same `reprojDump`
+            // kernel, the same statistic) to tens of percent.
+            const ARMS = gd.worldProbes ? [
+              { name: "world lattice (3.13)", over: {} },
+              { name: "world, no image accum", over: { accumOn: 0 } },
+              { name: "world, probe alpha 1", over: { accumOn: 0, wpAlpha: 1 } },
+            ] : [
               { name: "3.11 ship", over: { ...P311 } },
               { name: "+ texel centres", over: { ...P311, probeDither: 0 } },
               { name: "+ panel NEE", over: { ...P311, probeDither: 0, panelNee: 1 } },
@@ -2041,6 +2101,12 @@
           // full res is the ONLY honest statement of what §3.3's lever 2 cost.
           writeCrops();
           const halfArm = await readCrops();
+          // §19 3.13: the three alternative integrators all read `probeSh` at
+          // SCREEN-probe addresses, which the world path does not fill. Skipped
+          // rather than faked — an A/B whose arms are not both live is a number
+          // with no meaning, and `resolveScaleAB`'s gate keys off its absence.
+          if (!gather.passes.resolve) { results.resolveAB = null; results.resolveScaleAB = null; }
+          else {
           await compute(gather.passes.resolve);
           const shArm = await readCrops();
           // The truncation arm: SH2 over the SAME (unpooled) coefficients the
@@ -2084,6 +2150,7 @@
             .map((r) => `${r.name} ${r.ratio.toFixed(3)}`).join(", "));
           say(`resolve A/B: worst receipt crop ${worst.name} ${((worst.ratio - 1) * 100).toFixed(2)} % ` +
             `(gate: <= 5 % on the diffuse crops)`);
+          }
         }
 
         // ── IS THE SCREEN SEGMENT EARNING ITS PLACE? ────────────────────
@@ -2309,7 +2376,7 @@
         //
         // ⭐ THE ROOM IS SEALED, SO EVERY RAY MUST HIT SOMETHING. A miss is a
         // leak, and the receipt for a leak is not its RATE — it is the rays.
-        {
+        if (gather.passes.exhaustProbe) {
           await compute(gather.passes.clearStats);
           await runFrame(3000);
           await compute(gather.passes.exhaustProbe);
@@ -2372,6 +2439,15 @@
           await runFrame(2000);
           frameChain(false);
           const kernels = [
+            // §19 3.13's seven, first, so the world arm's table reads in chain
+            // order. Every row whose node is `null` is filtered out below.
+            ["worldAlloc", gather.passes.worldAlloc],
+            ["worldCount", gather.passes.worldCount],
+            ["worldScan", gather.passes.worldScan],
+            ["worldFill", gather.passes.worldFill],
+            ["worldTrace", gather.passes.worldTrace],
+            ["worldSh", gather.passes.worldSh],
+            ["worldNee", gather.passes.worldNee],
             ["hzbBuild", gather.passes.hzbBuild],
             ...gather.passes.hzbReduce.map((p, i) => [`hzbReduce${i + 1}`, p]),
             ["probePlace", gather.passes.probePlace],
@@ -2406,7 +2482,7 @@
             ["inject", gather.passes.inject],
             ["cacheAlloc", cache.allocPass],
             ["windowFill", fill.pass],
-          ];
+          ].filter((r) => r[1]);
           const REP = 24;
           const audit = [];
           for (const [name, node, arm] of kernels) {
@@ -2452,7 +2528,7 @@
             `probeTrace's ${ms("probeTrace").toFixed(4)}; the oct-map carry costs ` +
             `${(ms("probePlace") - ms("probePlaceNoCarry")).toFixed(4)} ms of probePlace's ` +
             `${ms("probePlace").toFixed(4)}`);
-          say(`  the SH filter at radius ${gd.shRadius} (${2 * gd.shRadius + 1}²) costs ${ms("probeShFilter").toFixed(4)} ms ` +
+          if (gather.passes.probeShFilter) say(`  the SH filter at radius ${gd.shRadius} (${2 * gd.shRadius + 1}²) costs ${ms("probeShFilter").toFixed(4)} ms ` +
             `against ${ms("probeShFilter3").toFixed(4)} at radius 1 — ` +
             `${(ms("probeShFilter") - ms("probeShFilter3")).toFixed(4)} ms of the chain's ${results.chainMs.toFixed(3)}`);
 
@@ -2460,7 +2536,8 @@
           // pinned to the stack compiles to NOTHING, silently (see the note on
           // `.toVar()` in gatherProbes.js). The receipt for that is not a
           // number, it is the presence of the function in the text.
-          const traceWgsl = renderer._nodes?.getForCompute?.(gather.passes.probeTrace)?.computeShader ?? "";
+          const traceWgsl = renderer._nodes?.getForCompute?.(
+            gather.passes.probeTrace ?? gather.passes.worldTrace)?.computeShader ?? "";
           const injectWgsl = renderer._nodes?.getForCompute?.(gather.passes.inject)?.computeShader ?? "";
           const wgslHas = {
             // §19 Stage 3.7 P.1: `probeTrace` ACCUMULATES now (the running mean
@@ -2521,7 +2598,10 @@
           results.sceneFree = { forbidden: [...forbidden], grepped, literals: literalsByKernel };
           say(`scene-free WGSL: ${grepped.length === 0 ? "PASS" : `FAIL ${grepped.join(", ")}`} ` +
             `(${forbidden.size} distinctive scene numbers grepped for, exact float-literal match)`);
-          say(`probeTrace float literals: ${literalsByKernel.probeTrace.join(" ")}`);
+          {
+            const k = literalsByKernel.probeTrace ? "probeTrace" : "worldTrace";
+            say(`${k} float literals: ${(literalsByKernel[k] ?? []).join(" ")}`);
+          }
           if (grepped.length) throw new Error(`scene numbers compiled into WGSL: ${grepped.join(", ")}`);
           frameChain(true);
         }
@@ -2831,8 +2911,8 @@
           };
           const resetGather = async () => {
             await compute(cache.clearPass);
-            await compute(gather.passes.clearProbes);
-            await compute(gather.passes.clearMeta);
+            if (gather.passes.clearProbes) await compute(gather.passes.clearProbes);
+            if (gather.passes.clearMeta) await compute(gather.passes.clearMeta);
             await compute(gather.passes.clearStats);
             win.reset();
             await placeWindow(true);
@@ -2997,8 +3077,8 @@
           buildMeshes(TRIM_SCENE);
           setCam(TRIM_CAM);
           await compute(cache.clearPass);
-          await compute(gather.passes.clearProbes);
-          await compute(gather.passes.clearMeta);
+          if (gather.passes.clearProbes) await compute(gather.passes.clearProbes);
+          if (gather.passes.clearMeta) await compute(gather.passes.clearMeta);
           await compute(gather.passes.clearStats);
           win.reset();
           await placeWindow(true);
@@ -3061,6 +3141,121 @@
           setCam(CAM_IN);
           await compute(win.clearStaticPass);
           await compute(fill.pass);
+        }
+
+        // ══ §19 STAGE 3.13 — THE THIN-WALL INTERIOR ARM (audits §U.5) ══════
+        //
+        // ⭐⭐ A PROBE LATTICE'S CLASSIC FAILURE IS A PROBE ON THE WRONG SIDE OF A
+        // WALL, AND NO RECEIPT ABOVE THIS ONE CAN SEE IT. Cornell is a SEALED
+        // BOX: every probe in it is in the one lit room, so the interpolation
+        // never has to decide between two rooms and the leak the lattice can
+        // actually produce has no opportunity to appear. So the room is SPLIT
+        // by a 5 cm partition and the panel is moved entirely onto the +X side.
+        // The −X half is then a sealed dark room whose true irradiance is zero,
+        // and the receipt is one ratio: what the dark side reads as a fraction
+        // of the lit side.
+        //
+        // ⚠ TWO CAMERA POSES, ONE WORLD. The crops are read out of the RESOLVED
+        // image, so a crop is only readable where the camera can see it — and
+        // no camera inside a split room can see both halves. The lit half is
+        // measured from the lit half and the dark half from the dark half,
+        // which is also the honest test for the screen-probe arm: its probes
+        // exist where the camera looks, and giving it a pose inside the dark
+        // room is giving it every chance.
+        //
+        // ⚠ AND THE CONTROL IS THE POINT (blind statistics). A leak receipt that
+        // reads 0 is worthless until the SAME instrument reads large with the
+        // two defences switched off. On the world path that is `wpVisOn = 0`
+        // and `wpFaceOn = 0`; the screen path has no such switch, so its row
+        // reports the measurement without a control and says so.
+        if (params.get("thin") !== "0") {
+          const THIN_FRAMES = Number(params.get("thinFrames") ?? 200);
+          const { hy, hz } = ROOM;
+          const box = (min, max, pal) => ({ kind: KIND_BOX, min, max, pal });
+          const THIN_PANEL = box([1.0, 2.9, -1.5], [4.0, 3.0, 1.5], 0);
+          const THIN_WALL = box([-0.025, -hy, -hz], [0.025, hy, hz], 5);
+          const THIN_SCENE = [THIN_PANEL, ...CORNELL_SCENE.filter((q) => q.kind !== fillMod.KIND_SPHERE), THIN_WALL];
+          const THIN_CROPS = [
+            { name: "litWall", p: [0.030, -1.0, 1.0] },
+            { name: "litFloor", p: [2.5, -hy + 0.01, 1.0] },
+            { name: "litFar", p: [4.90, -1.0, 1.0] },
+            { name: "darkWall", p: [-0.030, -1.0, 1.0] },
+            { name: "darkFloor", p: [-2.5, -hy + 0.01, 1.0] },
+            { name: "darkFar", p: [-4.90, -1.0, 1.0] },
+          ];
+          const LIT_CAM = { eye: [3.2, -0.6, 3.4], at: [0.6, -1.6, -0.5] };
+          const DARK_CAM = { eye: [-3.2, -0.6, 3.4], at: [-0.6, -1.6, -0.5] };
+          say("");
+          say(`§19 STAGE 3.13 — THIN-WALL INTERIOR (a 5 cm partition at x = 0, the panel entirely on +X)`);
+          fill.setScene(THIN_SCENE);
+          buildMeshes(THIN_SCENE);
+          await compute(cache.clearPass);
+          if (gather.passes.clearProbes) await compute(gather.passes.clearProbes);
+          if (gather.passes.clearMeta) await compute(gather.passes.clearMeta);
+          if (gather.passes.worldClear) await compute(gather.passes.worldClear);
+          if (gather.passes.worldClearInfo) await compute(gather.passes.worldClearInfo);
+          // The panel moved, so the NEE that owns it has to move with it or the
+          // dark side would be measured against a light that is not there.
+          gu.panelCentre.value.set(2.5, THIN_PANEL.min[1], 0);
+          gu.panelHalf.value.set(1.5, 1.5);
+          gu.panelArea.value = 3 * 3;
+          let nX = 70000;
+          const thinArm = async (label) => {
+            const readSide = async (cam) => {
+              setCam(cam);
+              win.reset();
+              await placeWindow(true);
+              for (let i = 0; i < THIN_FRAMES; i++) await runFrame(nX++);
+              writeCrops((q) => q, THIN_CROPS);
+              const taps = [];
+              for (let k = 0; k < 4; k++) {
+                taps.push(await readCrops(THIN_CROPS));
+                for (let i = 0; i < 4; i++) await runFrame(nX++);
+              }
+              return THIN_CROPS.map((c, i) => ({
+                name: c.name,
+                E: taps.reduce((a, t) => a + lum(t[i].irr), 0) / taps.length,
+                px: taps[0][i].px, py: taps[0][i].py, samples: taps[0][i].samples,
+              }));
+            };
+            const lit = await readSide(LIT_CAM);
+            const dark = await readSide(DARK_CAM);
+            const at = (rows, n) => rows.find((r) => r.name === n)?.E ?? 0;
+            const row = {
+              label,
+              litWall: at(lit, "litWall"), litFloor: at(lit, "litFloor"), litFar: at(lit, "litFar"),
+              darkWall: at(dark, "darkWall"), darkFloor: at(dark, "darkFloor"),
+              darkFar: at(dark, "darkFar"),
+            };
+            row.wallRatio = row.darkWall / Math.max(1e-9, row.litWall);
+            row.floorRatio = row.darkFloor / Math.max(1e-9, row.litFloor);
+            row.farRatio = row.darkFar / Math.max(1e-9, row.litFar);
+            row.worst = Math.max(row.wallRatio, row.floorRatio, row.farRatio);
+            say(`  THIN [${label}] lit wall ${row.litWall.toFixed(4)} floor ${row.litFloor.toFixed(4)} ` +
+              `far ${row.litFar.toFixed(4)} | dark wall ${row.darkWall.toFixed(4)} ` +
+              `floor ${row.darkFloor.toFixed(4)} far ${row.darkFar.toFixed(4)} | ` +
+              `RATIOS wall ${(100 * row.wallRatio).toFixed(2)} % floor ${(100 * row.floorRatio).toFixed(2)} % ` +
+              `far ${(100 * row.farRatio).toFixed(2)} % — worst ${(100 * row.worst).toFixed(2)} % (gate ≤ 5 %)`);
+            return row;
+          };
+          const thin = [await thinArm(gd.worldProbes ? "world lattice" : "screen probes (3.12)")];
+          if (gd.worldProbes) {
+            gu.wpVisOn.value = 0;
+            gu.wpFaceOn.value = 0;
+            thin.push(await thinArm("CONTROL — no visibility, no face"));
+            gu.wpVisOn.value = 1;
+            gu.wpFaceOn.value = 1;
+          }
+          results.thinWall = { frames: THIN_FRAMES, arms: thin, world: gd.worldProbes };
+          // Put the room back.
+          gu.panelCentre.value.set(...PANEL_INFO.centre);
+          gu.panelHalf.value.set(...PANEL_INFO.half);
+          gu.panelArea.value = PANEL_INFO.area;
+          fill.setScene(SCENE);
+          buildMeshes(SCENE);
+          setCam(CAM_IN);
+          win.reset();
+          await placeWindow(true);
         }
 
         if (validationErrors.length) throw new Error(`WebGPU validation: ${validationErrors[0]}`);

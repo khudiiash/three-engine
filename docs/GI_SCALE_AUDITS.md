@@ -1780,3 +1780,50 @@ Receipts: temporal p95 at rest ≈ 0 % (byte-identical frames apart from cache
 convergence); orbit temporal p95 ≤ 2 % (reinterpolation only); a moved panel
 responds within 1-2 frames; no previous-frame texture bound on the image
 path (asserted). The 3.10 temporal denoiser was withdrawn on this rule.
+
+---
+
+## U. STAGE 3.13 SPEC — WORLD-ANCHORED PROBES (RC's cascade 0 inside the window)
+
+**Why:** 3.11/3.12 measured the last motion residual: screen probes WALK with
+the camera, so each frame reads the world cache's (voxel-quantized) light at
+a slightly different world point; an EMA shrinks the amplitude (dp50 −90 %)
+but cannot remove the sign flips (~17 %) because the input itself changes.
+Radiance cascades are noiseless under motion because their probes are
+WORLD-anchored: the interpolation weights change smoothly, the probes do not.
+
+**Design (deterministic, window-bounded, fixed budget):**
+1. A world-space probe lattice L_p that follows the camera TOROIDALLY like
+   the window (K.1): spacing s_p = 0.5 m (ultra/high) / 1 m (phone) over a
+   16-24 m cube = 32³-48³ candidate cells; only cells whose voxel column is
+   near a surface (occ within ±1 cell, from the window's L0/L1) hold a live
+   probe — Bistro-scale ≈ 6-10k live probes, the same order as today's
+   screen probes. Probe position = the cell centre pushed out of geometry by
+   the origin-escape rule (deterministic); a probe carries the face it
+   represents (dominant normal from 3.9's bits) so a thin wall gets two.
+2. Each live probe traces its COMPLETE fixed direction set (64, texel
+   centres) every N frames by a deterministic round-robin over cells (e.g.
+   1/4 of probes per frame → the 406k-ray budget), hits read the cache /
+   NEE / sky exactly as screen probes do; the oct map is REPLACED on update
+   and smoothed with a fixed α between complete updates (§T allows it).
+3. Screen resolve: per pixel, the 8 lattice probes around the surface point,
+   weighted trilinear × normal agreement × visibility (the window's
+   occupancy between pixel and probe — one short DDA per corner, or the
+   probe's own hit-distance map as in DDGI's Chebyshev test, deterministic),
+   evaluate SH2 at the pixel normal. No screen probes on the diffuse path
+   (keep the HZB contact term for the first cells and GTAO); glossy stays
+   on the window trace from the pixel.
+4. Motion: camera motion changes only the weights (smooth); a scroll of the
+   lattice re-keys the entering slab of probes (fresh probes get a full
+   trace on their first update — bounded by the round-robin budget, so
+   light "arrives" over ≤ N frames, never grain).
+5. Receipts: reprojected sign flips during the 45° orbit ≈ 0 % (the walking-
+   anchor term is gone by construction — this is the number 3.12 could not
+   reach); at rest unchanged; moved panel monotone; Cornell bracket ≥ 7/8;
+   leaks 0/10 000; chain ≤ 4 ms (the probe update is the same ray budget;
+   the resolve reads 8 probes instead of 4).
+6. Memory: 10k probes × (64 texels RGBA16 + SH2 + meta) ≈ 6 MB desktop.
+
+This is the RC contract in full: world-anchored, complete, interpolated. It
+replaces the screen-probe diffuse path once its receipts beat 3.12's; the
+screen-probe code stays until then (one build constant).
