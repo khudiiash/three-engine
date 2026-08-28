@@ -198,8 +198,16 @@ const installed = await page.evaluate(async ({ target, amp }) => {
       const dd = v - (prevSub.get(k) ?? 0); prevSub.set(k, v);
       if (dd > 0.3) subs[k] = +dd.toFixed(2);
     }
+    // §19 6.5d — WHO INVALIDATED THE MERGE THIS FRAME. `_invalidateReason` is
+    // the last one named and `_invalidateTally` counts them by name, so a
+    // per-frame delta of the tally attributes each merge rebuild to its producer
+    // instead of leaving it to be argued about.
+    const mrg = eng.merging ?? null;
     R.frames.push({
       seg: R.seg, ms: now - last, phases, subs,
+      why: mrg?._invalidateReason ?? null,
+      tally: mrg?._invalidateTally ? { ...mrg._invalidateTally } : null,
+      mrebuilds: mrg?._rebuildCount ?? 0, urgent: !!mrg?._urgent, mdirty: !!mrg?._dirty,
       rebuilds: sys?.rebuilds ?? 0, asks: sys?.rebuildAsks ?? 0,
       soup: store?.soupBuilds ?? gi2?.snapshot?.()?.soupBuilds ?? 0,
       cv: eng.content?.version ?? 0,
@@ -329,6 +337,26 @@ for (const [name, fs_] of Object.entries(segs)) {
 const slow = R.frames.filter((f) => f.ms > 40).slice(0, 400);
 const owners = new Map();
 for (const f of slow) for (const l of f.logs) owners.set(l, (owners.get(l) ?? 0) + 1);
+{
+  console.log();
+  console.log("  MERGE INVALIDATION, per frame (every frame where the tally moved or a rebuild ran):");
+  let prev = null, prevR = null;
+  for (const f of R.frames) {
+    const t = f.tally ?? {};
+    if (prev) {
+      const d = [];
+      for (const k of new Set([...Object.keys(t), ...Object.keys(prev)])) {
+        const dd = (t[k] ?? 0) - (prev[k] ?? 0);
+        if (dd) d.push(`${k} +${dd}`);
+      }
+      const rebuilt = (f.mrebuilds ?? 0) - (prevR ?? 0);
+      if (d.length || rebuilt) {
+        console.log(`    [${f.seg}] ${f2(f.ms)} ms  merging ${f2(f.phases?.merging ?? 0)} ms  rebuild+${rebuilt}  urgent=${f.urgent}  last="${f.why}"  ${d.join(", ") || "(no tally move)"}`);
+      }
+    }
+    prev = t; prevR = f.mrebuilds ?? 0;
+  }
+}
 console.log(`\n  slow frames (>40 ms): ${R.frames.filter((f) => f.ms > 40).length} of ${R.frames.length}`);
 console.log("  lines emitted on slow frames (top 14):");
 for (const [l, n] of [...owners.entries()].sort((a, b) => b[1] - a[1]).slice(0, 14)) console.log(`    ${String(n).padStart(4)}×  ${l}`);
