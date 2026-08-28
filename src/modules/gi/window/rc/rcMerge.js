@@ -102,8 +102,15 @@ export function createRcMerge({
   gbuffer, irradianceHalf, width, height,
   maxLods = MAX_LODS, losOccupied = null, skyEnv = null,
   /**
-   * ⭐⭐ §19 STAGE 5.3 — `rcHit.createRcDirectAt`, the SEATED emitter's direct
-   * term. `null` builds not one node of it.
+   * ⭐⭐ §19 STAGE 5.3/5.3d — `rcDirect.createRcEmitterDirect`, the SEATED
+   * emitter's direct term AND its filtered shadow. `null` builds not one node
+   * of it.
+   *
+   * §19 5.3d — a BUNDLE now, not a bare closure: the visibility is traced and
+   * cross-bilaterally filtered in three half-res passes of its own (see
+   * `rcDirect.js` for why the filter is the whole difference between 5.3's
+   * blotchy 0.365 arm and the old path's picture), and `directAt` takes the
+   * half-res texel so it can read them.
    *
    * The field cannot carry a seated lamp: `#gi2SlotEmissive` zeroes a promoted
    * emitter's palette emission, so a ray that hits it reads nothing, which is
@@ -120,7 +127,7 @@ export function createRcMerge({
    * it is `Enee` inside the face cache at whatever surface the lamp lit, which
    * the field does carry, and which this add does not touch.
    */
-  directAt = null,
+  direct = null,
 }) {
   const halfW = Math.max(1, Math.ceil(width / 2));
   const halfH = Math.max(1, Math.ceil(height / 2));
@@ -212,10 +219,11 @@ export function createRcMerge({
         const facing = step(0, Nn.dot(vec3(camera).sub(g.xyz))).mul(2).sub(1).toVar();
         const Nf = Nn.mul(facing).toVar();
         E.assign(gather.gatherAt(g.xyz, Nf).irradiance);
-        // §19 5.3 — the seated emitters, analytically, at the shading point.
-        // Against the FACED normal, like the gather: the hemisphere a lamp
-        // lights is the hemisphere the field was filled over.
-        if (directAt) E.addAssign(directAt(g.xyz, Nf));
+        // §19 5.3/5.3d — the seated emitters, analytically, at the shading
+        // point, times this texel's FILTERED visibility. Against the FACED
+        // normal, like the gather: the hemisphere a lamp lights is the
+        // hemisphere the field was filled over.
+        if (direct) E.addAssign(direct.directAt(g.xyz, Nf, gx, gy));
       });
     });
     textureStore(irradianceHalf, ivec2(gx.toInt(), gy.toInt()), vec4(E, a));
@@ -230,9 +238,21 @@ export function createRcMerge({
     tiles,
     gather,
     resolvePass,
-    /** [G] → [H] → [I]. `hashPass` is NOT here: it belongs above the rays. */
-    passes: [...merge.passes, ...tiles.passes, resolvePass],
-    uniforms: { rcResolveWrite: writeU, rcResolveWidth: widthU, rcResolveHeight: heightU },
+    /**
+     * [G] → [H] → [I]. `hashPass` is NOT here: it belongs above the rays.
+     *
+     * §19 5.3d — the emitter shadow's three passes sit immediately before the
+     * pixel resolve that reads them. They depend on the gbuffer and the window
+     * bits alone, so their position is free; putting them adjacent to their one
+     * consumer is what keeps "the visibility this pixel multiplies is the
+     * visibility computed for this pixel this frame" readable at the call site.
+     */
+    passes: [...merge.passes, ...tiles.passes, ...(direct?.passes ?? []), resolvePass],
+    uniforms: {
+      rcResolveWrite: writeU, rcResolveWidth: widthU, rcResolveHeight: heightU,
+      ...(direct?.uniforms ?? {}),
+    },
+    direct,
     halfW, halfH,
     setSize(w, h) {
       const nw = Math.max(1, Math.round(w));
@@ -242,6 +262,7 @@ export function createRcMerge({
       heightU.value = nh;
       halfWU.value = Math.max(1, Math.ceil(nw / 2));
       halfHU.value = Math.max(1, Math.ceil(nh / 2));
+      if (direct && !direct.setSize(nw, nh)) return false;
       return true;
     },
     bytes: (merge.bytes ?? 0) + (tiles.bytes ?? 0),
@@ -261,6 +282,7 @@ export function createRcMerge({
       merge.dispose?.();
       tiles.atlas?.dispose?.();
       gather.dispose?.();
+      direct?.dispose?.();
     },
   };
 }

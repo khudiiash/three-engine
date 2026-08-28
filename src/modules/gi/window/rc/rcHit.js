@@ -374,87 +374,13 @@ export function createRcHitShading({
   return { attribute, shade, hitFields };
 }
 
-/**
- * ⭐⭐⭐ §19 STAGE 5.3 — THE SEATED EMITTER'S DIRECT TERM, AT THE SHADING POINT.
- *
- * ══ THE HOLE THIS CLOSES, AND WHY NO IMAGE STATISTIC NAMED IT ══════════════
- *
- * An emitter admitted by the radiant-power gate and SEATED into one of the four
- * NEE slots has its palette emission set to EXACTLY ZERO (`GISystem`'s
- * `#gi2SlotEmissive`: `entry.promoted → [0,0,0]`). That is the ONE
- * REPRESENTATION rule and it is right — §12.26.7 measured the 2.60× double
- * count when both were on. But it has a consequence the cascades inherit
- * whole: a ray that hits the lamp reads a cache word with no emission in it, so
- * **a seated lamp is invisible to the transport**. Its light exists only in the
- * NEE term, and the NEE term is evaluated where somebody evaluates it.
- *
- * Both shipped paths evaluate it at the PROBE — `gi2System`'s
- * `emitterDirectPass` adds each slot's analytic solid angle into `probeSh` on
- * the screen path, and `worldProbes.neePass` does the identical add at every
- * lattice probe on the world path. So on both of them the lamp's DIRECT light
- * is part of `gi2.textures.irradiance`, which is the convention every gate in
- * this repository is written against.
- *
- * 5.1/5.2 shipped the cascades with NEITHER: the deposit lights a HIT from the
- * face cache (which does carry `Enee` — the second bounce of the lamp is fine),
- * and the pixel resolve reads only the merged field. The lamp's FIRST bounce
- * had no carrier at all. Measured on the user's Cornel.scene, that is the whole
- * of the 5.2/5.3 energy residual: per-surface ratios 0.21-0.73, global gain
- * 0.30×, and a black census of ZERO — the picture is complete and uniformly
- * too dark, which is exactly what a missing ADDITIVE term looks like and
- * exactly what "median |log ratio|" cannot attribute.
- *
- * ⚠ AND THE INSTRUMENT THAT SHOULD HAVE SAID SO LIED IN THE OTHER DIRECTION:
- * the gate's own `emitter slots` line prints `L[0,0,0]` for every slot, because
- * it reads `s.color ?? s.rgb` off `state.emitterSlots` and the live uniform is
- * neither. A receipt that reads zero for a light that is working is worse than
- * no receipt — the slots ARE lit, and the deficit was never about them.
- *
- * ══ WHY IT IS THE SAME EXPRESSION, NOT A SIMILAR ONE ════════════════════════
- *
- * `Ω = min(π, π·r_eff²/d²)`, one `traceWindow` shadow ray, `L·Ω·cosθ` — byte for
- * byte what `shadeTerms`' slot loop, `gi2System`'s `emitterDirectPass` and
- * `giLight.emitterDirectAt` all compute, so one lamp delivers one energy on
- * every path and a brightness difference between two of them is a bug rather
- * than a convention.
- *
- * ⚠ THE RAY STOPS SHORT OF THE LAMP'S OWN BODY (`r_eff` plus half a level-0
- * cell). The lamp's geometry is voxelized; a ray run to the full distance is
- * occluded by the very light it is sampling and writes black — the failure the
- * panel block's own header spends a page on.
- *
- * @param {Array<object>} emitters  GISystem's slot uniforms. Empty or absent →
- *   `null`, and NOT ONE NODE of this is built (the arm every pre-5.3 receipt
- *   was taken on).
- */
-export function createRcDirectAt({ trace, voxel0, emitters }) {
-  if (!emitters?.length) return null;
-  const { traceWindow } = trace;
-  const v0 = voxel0;
-  return (P, n) => {
-    const E = vec3(0).toVar();
-    for (const slot of emitters) {
-      const centre = vec3(slot.center).toVar();
-      const reff = float(slot.reff).max(1e-3).toVar();
-      const rgb = vec3(slot.color).toVar();
-      // `radius` is the bounding sphere and doubles as the ACTIVE gate —
-      // `#refreshEmitterSlots` zeroes a retired slot's radius.
-      const active = float(slot.radius).greaterThan(1e-5)
-        .and(rgb.x.add(rgb.y).add(rgb.z).greaterThan(1e-6));
-      If(active, () => {
-        const wv = centre.sub(P).toVar();
-        const d2 = dot(wv, wv).max(1e-4).toVar();
-        const d = sqrt(d2).toVar();
-        const wd = wv.div(d).toVar();
-        const cosX = dot(n, wd).toVar();
-        If(cosX.greaterThan(1e-3), () => {
-          const omega = float(Math.PI).min(float(Math.PI).mul(reff.mul(reff)).div(d2)).toVar();
-          const reach = d.sub(reff).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
-          const vis = float(1).sub(traceWindow(P, wd, reach, n).hit).toVar();
-          E.addAssign(rgb.mul(omega).mul(cosX).mul(vis));
-        });
-      });
-    }
-    return E;
-  };
-}
+// ⭐ §19 STAGE 5.3d — `createRcDirectAt` LIVED HERE AND HAS MOVED TO
+// `rcDirect.js`, WHOLE. 5.3's version traced ONE BINARY SHADOW RAY PER PIXEL
+// and showed it to the user; the measurement that put it behind a hatch (gain
+// 0.365, blotch σ 45 → 95 %) was measuring the missing FILTER, not the missing
+// term — the engine's own emitter chain traced per pixel too and ran the result
+// through a bilateral and two wide passes before any material sampled it. The
+// replacement is that shape on the window's trace, and it keeps the solid-angle
+// expression byte-for-byte so one lamp still delivers one energy on every path.
+// There is deliberately no copy of it left in this file: two transcriptions of
+// `Ω = min(π, π·r_eff²/d²)` are two chances for the paths to disagree.

@@ -83,6 +83,7 @@ import { FACE_AX_SHIFT } from "./windowTrace.js";
 import { normalOfFace } from "./radianceCache.js";
 import { octahedralUV } from "../srcOctahedral.js";
 import { rc5SeatNeeEnabled } from "../giConfig.js";
+import { emitterShapeGain } from "./emitterShapeGain.js";
 import { createWorldProbes, worldCascadeCount } from "./worldProbes.js";
 
 /**
@@ -644,8 +645,24 @@ export function createGiGather({
    * `__gi2Rc5EmitRaw = 1` is 5.3's measured arm (gain 1.955, Box·-X 4.08) —
    * the palette's authored `L_e` handed to every exposed face of a voxelized
    * panel. See `emitterVoxelScale` for what replaces it and why.
+   *
+   * ⭐⭐ §19 STAGE 5.3d — GATED ON `rc5` ALONE, NOT ON THE SEAT. The two
+   * questions are independent and 5.3b's `RC5_EMITTER_EMISSION &&` conflated
+   * them:
+   *
+   *   · WHICH representation does a PROMOTED emitter get? — the seat, decided
+   *     once on the CPU by `#gi2SlotEmissive`, which writes `palEm = [0,0,0]`.
+   *     No fraction of zero is light, so the scale below is a provable no-op
+   *     for exactly the classes the seat owns.
+   *   · IS WHATEVER THE PALETTE DOES HOLD SPREAD OVER A VOXEL SHELL INSTEAD OF
+   *     THE SURFACE INSIDE IT? — always yes, and it is a voxelization fact with
+   *     no opinion about seats. Bistro's ~91 ADMITTED-BUT-UNSEATED lamps reach
+   *     the room through this table and through nothing else; tying their
+   *     conservation to the seat switch would have handed every one of them its
+   *     raw `L_e` the moment the seat came back — 5.3's 1.955× arm, silently,
+   *     on the one scene where the seats are not the story.
    */
-  const RC5_EMIT_CONSERVE = RC5_EMITTER_EMISSION && (globalThis.__gi2Rc5EmitRaw ?? 0) === 0;
+  const RC5_EMIT_CONSERVE = rc5 && (globalThis.__gi2Rc5EmitRaw ?? 0) === 0;
   /**
    * ⭐⭐⭐ §19 STAGE 5.3c — AND THE POWER IS SPREAD BY PROJECTED AREA, NOT BY A
    * FACE COUNT. 5.3b's `L_vox = L_e · cov / n_exposed` fixed the emitter's TOTAL
@@ -721,8 +738,34 @@ export function createGiGather({
    * safety rule for an iterative gather (`ρ < 1` or the Neumann series does not
    * converge); the user's Cornell walls are authored at exactly 1.0, which is
    * the one value at which it does not. 1 = off.
+   *
+   * ⭐⭐⭐ §19 STAGE 5.3d — THE DEFAULT IS **0.9 ON THE RC PATH** AND 1
+   * EVERYWHERE ELSE, AND IT IS THE CLOSED-ROOM FIXED POINT RATHER THAN A TASTE.
+   *
+   * The RC transport is `probes → hits → probes`: a fixed-point iteration whose
+   * gain IS the albedo. At ρ = 1.0 in a sealed room the Neumann series `Σ ρⁿ`
+   * has no limit, so "settled" can only ever mean "settled to within the decay
+   * rate" — which is exactly the shape of 5.3c's residual (at-rest Δ p90
+   * 4.7-5.5 %, a slow drift with NO period, on bounce-lit surfaces only, after
+   * the aliased face sweep was removed). A ceiling gives the series a radius
+   * (1/(1−0.9) = 10 bounces of headroom) and the loop a real fixed point.
+   *
+   * ⚠ IT IS A `min`, SO IT IS THE IDENTITY ON EVERY SURFACE AUTHORED BELOW 0.9,
+   * and it touches ONLY the palette the RC HIT RADIANCE multiplies —
+   * `hitPalette.rho` (what [J] multiplies the cascade field by) and `shadeHit`'s
+   * `alb` (the direct-only face cache). Materials, the raster path, the world
+   * probes and the screen probes are untouched, because `rc5` is false in every
+   * one of those builds; there is no second transcription to keep in step.
+   *
+   * ⚠ AND THE OFFLINE REFERENCE TRUNCATES AT `BOUNCES = 4`, so it is ITSELF a
+   * partial sum. On a ρ = 1.0 wall its terms do not shrink and truncation costs
+   * it a fixed share of the tail; capping ρ shrinks GI2's tail by ~10 % per
+   * bounce and moves the two truncations TOWARD each other, so the per-surface
+   * ratio is where the cost of this arm — if it has one — has to be read.
+   *
+   * `__gi2BounceAlbedoMax = 1` restores the uncapped arm (every pre-5.3d number).
    */
-  const BOUNCE_ALBEDO_MAX = Number(globalThis.__gi2BounceAlbedoMax ?? 1);
+  const BOUNCE_ALBEDO_MAX = Number(globalThis.__gi2BounceAlbedoMax ?? (rc5 ? 0.9 : 1));
   const T = spec.tile;
   const R = spec.rays;
   const O = spec.oct;
@@ -2904,6 +2947,12 @@ export function createGiGather({
       const centre = vec3(slot.center).toVar();
       const reff = float(slot.reff).max(1e-3).toVar();
       const rgb = vec3(slot.color).toVar();
+      // §19 5.3d — the SAME directional gain the pixel's analytic term applies
+      // (`rcDirect.shapeGain`). One lamp, one energy, on both halves of the
+      // transport: without it the second bounce would be computed from the
+      // lamp's MEAN projected area while the first is computed from its actual
+      // one, and every surface's ratio would carry the difference.
+      const gain = rc5 ? emitterShapeGain(slot) : null;
       // `radius` is the bounding sphere and doubles as the ACTIVE gate —
       // `#refreshEmitterSlots` zeroes a retired slot's radius.
       const active = float(slot.radius).greaterThan(1e-5)
@@ -2915,8 +2964,16 @@ export function createGiGather({
         const wd = wv.div(d).toVar();
         const cosX = dot(n, wd).toVar();
         If(cosX.greaterThan(1e-3), () => {
-          const omega = float(Math.PI).min(float(Math.PI).mul(reff.mul(reff)).div(d2)).toVar();
-          const reach = d.sub(reff).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
+          const g = gain ? gain(wd) : float(1);
+          const omega = float(Math.PI)
+            .min(float(Math.PI).mul(reff.mul(reff)).mul(g).div(d2)).toVar();
+          // §19 5.3d — the self-exclusion is the BOUNDING sphere, not the
+          // mean-projected radius: for a box lamp `reff` stops the ray inside
+          // the lamp's own voxels. See `rcDirect.js` for the measurement.
+          // `max` keeps every spherical fit byte-identical, and the arm is
+          // `rc5`-gated so the shipped chain's pins do not move under it.
+          const excl = rc5 ? float(slot.radius).max(reff) : reff;
+          const reach = d.sub(excl).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
           const vis = float(1).sub(traceWindow(p, wd, reach, n).hit).toVar();
           Enee.addAssign(rgb.mul(omega).mul(cosX).mul(vis));
         });

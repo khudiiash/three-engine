@@ -75,11 +75,16 @@ import {
   atomicLoad,
   atomicStore,
   atomicSub,
+  bitAnd,
+  bitXor,
   float,
   floor,
   instanceIndex,
   instancedArray,
   int,
+  ivec3,
+  select,
+  shiftRight,
   uint,
   vec3,
   wgslFn,
@@ -95,6 +100,7 @@ import {
   keySecondary,
   keyWorldCell,
   latticeOrigin,
+  latticeOriginCell,
   lodAtDistance,
   lodOuterRadius,
   nearestCell,
@@ -161,6 +167,37 @@ export const PROBE_BLOCK = 7;
 
 export const FLAG_ALIVE = 1;
 export const FLAG_FRESH = 2;
+/**
+ * ⭐⭐⭐ §19 STAGE 5.3d — "THIS PROBE'S BIN BLOCK WAS CLAIMED **THIS FRAME**",
+ * AND IT EXISTS BECAUSE OF THE CADENCE.
+ *
+ * A claim STAMPS the block, and `srcDeposit`'s decay reads that stamp and
+ * multiplies by ZERO — a recycled block must not light a new probe with a dead
+ * one's answer. That was complete while every cascade was traced every frame:
+ * the block was zeroed and refilled inside one frame.
+ *
+ * §19 5.3c's cadence broke exactly that pairing. `cascadeDue` gates the scatter,
+ * so a block claimed at cascade `c` on a frame when `c` is not due is zeroed and
+ * then receives NO RAYS for up to `2^c − 1` frames. Its bins read UNKNOWN, its
+ * child's merge finds no parent corner (`MERGE_ORPHAN_LIVE`), and an orphaned
+ * transparent bin keeps `L_self = 0` with `T_self = 1` — a KNOWN bin whose
+ * value is zero, i.e. a BLACK VOTE with full coverage in the tile the gather
+ * interpolates. That is 5.3c's `black 0 → 7-33`.
+ *
+ * ⭐ THE FIX IS "A FRESH BLOCK IS ALWAYS DUE", not "never claim off-cadence":
+ * skipping the claim leaves the SAME orphan (an absent parent and an empty one
+ * are the same absence to `srcMerge`). So the flag rides the probe record —
+ * which `srcDeposit` already binds, unlike `freeStack`, and the portable
+ * 8-storage-buffer limit is why that mattered — and the deposit raises its OWN
+ * reach and scatter gate to the highest cascade in the pixel's chain carrying
+ * it. The cost is the full-reach march for the handful of pixels standing over
+ * a probe that was born this frame, which is what they cost before the cadence.
+ *
+ * Set by BOTH claim sites (a new probe's birth claim and §16's blockless-
+ * survivor retry) and cleared by the age pass on the next frame's survivor
+ * sweep, which runs before compaction — so the bit means one frame, exactly.
+ */
+export const FLAG_BLOCKNEW = 4;
 
 /**
  * Fixed-point ONE for the per-block INFLUX WORD (§12.40.4's α compensation).
@@ -916,7 +953,12 @@ export function createAgePass(store, cascade, {
       probeTable.element(w.add(PROBE_AGE)).assign(age);
       // No longer newborn. Set BEFORE the re-insert so a consumer that reads
       // the flag through the hash this frame sees the settled value.
-      probeTable.element(w.add(PROBE_FLAGS)).assign(flags.bitAnd(uint(~FLAG_FRESH >>> 0)));
+      // §19 5.3d — `FLAG_BLOCKNEW` is cleared with `FLAG_FRESH`, and this is
+      // what makes the bit mean EXACTLY ONE FRAME: the age pass runs before
+      // compaction, so a block claimed on frame f is flagged for f and settled
+      // by the sweep at the head of f+1.
+      probeTable.element(w.add(PROBE_FLAGS))
+        .assign(flags.bitAnd(uint(~(FLAG_FRESH | FLAG_BLOCKNEW) >>> 0)));
       const r = hashInsertWgsl(
         key, hashKey(key), uint(c.hashBase), uint(c.hashCapacity),
         uint(MAX_PROBE_STEPS), hashKeys,
@@ -1036,6 +1078,14 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
             freeStack.element(uint(blockStamp).add(rblock)).assign(frameStamp);
           }
           probeTable.element(sw.add(PROBE_BLOCK)).assign(rblock);
+          // §19 5.3d — A RETRIED CLAIM IS AS FRESH AS A BIRTH CLAIM. Same
+          // stamp, same zeroing decay, same "it has never held a ray"; the
+          // deposit's cadence override reads this bit and nothing else, so
+          // forgetting it here would leave the §16 retry path producing exactly
+          // the black the flag exists to remove. See `FLAG_BLOCKNEW`.
+          probeTable.element(sw.add(PROBE_FLAGS)).assign(
+            probeTable.element(sw.add(PROBE_FLAGS)).bitOr(uint(FLAG_BLOCKNEW)),
+          );
         });
       });
       Return();
@@ -1090,7 +1140,15 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
 
     probeTable.element(w.add(PROBE_KEY)).assign(key);
     probeTable.element(w.add(PROBE_AGE)).assign(uint(0));
-    probeTable.element(w.add(PROBE_FLAGS)).assign(uint(FLAG_ALIVE | FLAG_FRESH));
+    // §19 5.3d — `FLAG_BLOCKNEW` only where a block was actually claimed. A
+    // probe whose claim FAILED has no bins at all (`SLOT_EMPTY`), and the
+    // deposit's cadence override must not spend a full-reach march on a chain
+    // entry that has nowhere to put the answer.
+    probeTable.element(w.add(PROBE_FLAGS)).assign(
+      select(block.equal(uint(SLOT_EMPTY)),
+        uint(FLAG_ALIVE | FLAG_FRESH),
+        uint(FLAG_ALIVE | FLAG_FRESH | FLAG_BLOCKNEW)),
+    );
     probeTable.element(w.add(PROBE_PARENT)).assign(uint(SLOT_EMPTY));
     probeTable.element(w.add(PROBE_HASH)).assign(h);
     probeTable.element(w.add(PROBE_RAYS)).assign(uint(0));
@@ -1355,6 +1413,60 @@ export function createSrcProbeFrame(store, {
   // probe this frame (anchor-relative retention's jump guard — see the
   // retention bundle below).
   retainKill = null,
+  /**
+   * ⭐⭐⭐ §19 STAGE 5.3d — SEED (AND FEED) THE TRILINEAR CORNERS, BY
+   * IMPORTANCE-SAMPLING THE WEIGHT THE GATHER IS ABOUT TO USE.
+   *
+   * ══ THE FAILURE, NAMED PRECISELY ═══════════════════════════════════════════
+   *
+   * "One probe per pixel, not eight" (the block comment above) is the paper's
+   * choice and it has a consequence the paper's own note waves at: on a FLAT
+   * surface every pixel rounds the same way in the wall's normal axis, so
+   * exactly ONE lattice sheet is ever seeded and the four corners on the other
+   * side of the wall are permanently dead. The gather renormalises over what it
+   * finds, so that is harmless — until the population thins. Pull the camera
+   * back and a 0.5 m cell subtends a handful of pixels; cells whose region no
+   * pixel's ROUND lands in are never seeded at all, and a shading point whose
+   * eight corners are ALL silent divides 0 by 0. 5.3c named that as the
+   * distance-dependent quantity after refuting the LOD hypothesis (LOD0 reaches
+   * 32 m; the Cornell box never leaves LOD 0, and the dark spots still arrive).
+   *
+   * ⚠ AND SEEDING THE NEIGHBOURS AS EXTRA INSERTS DOES NOTHING, which is the
+   * trap this option exists to avoid. A probe that is ALIVE but received no rays
+   * has no known bin; `srcMerge` refuses to merge a parent into an unknown self
+   * bin and the tile bakes it at alpha 0, so the gather renormalises it away
+   * exactly as if it did not exist. An extra insert pass buys pool pressure and
+   * not one photon. THE CORNERS HAVE TO BE FED, and the ray budget is fixed.
+   *
+   * ══ SO THE PIXEL'S ONE RAY IS ASSIGNED BY TRILINEAR WEIGHT ═════════════════
+   *
+   * `nearestCell` is `floor(f + 0.5)`. Replace the constant 0.5 with a per-pixel
+   * dither `d ∈ [0,1)³` and it becomes STOCHASTIC ROUNDING: axis `a` takes
+   * `ceil` with probability `frac(f_a)` and `floor` otherwise, so a corner is
+   * chosen with EXACTLY its trilinear weight and the expected cell is the
+   * pixel's own position. Three consequences, all of them the point:
+   *
+   *   · every corner of every occupied cell is seeded AND fed, in proportion to
+   *     how much the gather will weight it — dead corners stop existing;
+   *   · the ray COUNT is unchanged. A lattice point is the corner of eight
+   *     cells, so what it loses from its own cell it takes back from the seven
+   *     around it; the budget, the stride and the dispatch are untouched;
+   *   · a probe's bins hold the trilinear-weighted average of the rays around
+   *     it, which is precisely the quantity the gather's trilinear
+   *     reconstruction assumes they hold. The estimator became MORE consistent,
+   *     not less.
+   *
+   * ⚠ THE DITHER IS A HASH OF THE PIXEL INDEX AND CARRIES NO FRAME TERM, and
+   * that is the no-noise rule rather than an implementation shortcut: a frame
+   * term would re-roll every pixel's corner every frame and put a stochastic
+   * sequence inside a loop whose gain is the albedo — the exact shape 5.3c's
+   * at-rest instrument was built to catch. Static in screen space, a parked
+   * camera assigns the identical corner to the identical pixel forever, so this
+   * arm contributes ZERO to the at-rest Δ by construction.
+   *
+   * `d = vec3(0.5)` is `nearestCell` verbatim, which is what `false` builds.
+   */
+  cornerSpread = false,
 } = {}) {
   const { probeTable } = store;
   const N = store.cascadeCount;
@@ -1388,8 +1500,52 @@ export function createSrcProbeFrame(store, {
   //
   // Anchor-relative (the shipped default) is exactly what it always was.
   const worldKeys = worldKeysEnabled();
-  const keyCellOf = (position, L) =>
-    worldKeys ? worldCellAt(position, anchor, L.spacing) : nearestCell(position, L.origin, L.spacing);
+  /**
+   * §19 5.3d — `nearestCell` with a dithered threshold. `floor(f + d)` at
+   * `d = 0.5` IS `roundHalfUp(f)`, so the `cornerSpread: false` build is
+   * byte-identical to `nearestCell` and every pre-5.3d receipt keeps its meaning.
+   */
+  const ditheredCell = (position, origin, spacing, d) => {
+    const s = float(spacing).toVar();
+    const f = vec3(position).sub(vec3(origin)).div(s).toVar();
+    return ivec3(
+      int(floor(f.x.add(d.x))), int(floor(f.y.add(d.y))), int(floor(f.z.add(d.z))),
+    );
+  };
+  /**
+   * The per-pixel dither, from the pixel index and NOTHING ELSE — no frame, no
+   * jitter, no camera. See `cornerSpread`: a frame term would be a stochastic
+   * sequence inside a ρ-gain loop, which is the one thing the no-noise rule
+   * spends its budget refusing.
+   *
+   * A multiplicative-xorshift hash, so pixels one apart land in different
+   * corners (the spread wants to be spatially decorrelated, not smooth) and
+   * every corner gets its weight's share of a cell's pixels.
+   */
+  const pixelDither = (i) => {
+    const m = uint(i).mul(uint(2654435761)).toVar();
+    const h1 = bitXor(m, shiftRight(m, uint(15))).mul(uint(2246822519)).toVar();
+    const h2 = bitXor(h1, shiftRight(h1, uint(13))).mul(uint(3266489917)).toVar();
+    const h3 = bitXor(h2, shiftRight(h2, uint(16))).mul(uint(668265263)).toVar();
+    const q = (h) => float(bitAnd(h, uint(1023))).mul(1 / 1024);
+    return vec3(q(h1), q(h2), q(h3)).toVar();
+  };
+  const keyCellOf = (position, L, dither = null) => {
+    if (!dither) {
+      return worldKeys
+        ? worldCellAt(position, anchor, L.spacing)
+        : nearestCell(position, L.origin, L.spacing);
+    }
+    if (!worldKeys) return ditheredCell(position, L.origin, L.spacing, dither);
+    // `worldCellAt`'s integer split, with the dithered round in place of the
+    // exact one — the f32 division still only ever sees a camera-relative
+    // offset, which is the whole reason that function exists (trap 4).
+    const originCell = latticeOriginCell(anchor, L.spacing).toVar();
+    const local = ditheredCell(
+      position, vec3(originCell).mul(float(L.spacing)), L.spacing, dither,
+    );
+    return ivec3(originCell).add(local);
+  };
   /**
    * World position of the cell a key names.
    *
@@ -1471,7 +1627,8 @@ export function createSrcProbeFrame(store, {
       const key = uint(KEY_EMPTY).toVar();
       If(px.valid, () => {
         const L = latticeAt(px.position, 0);
-        const cell = keyCellOf(px.position, L).toVar();
+        // §19 5.3d — the trilinear-weight corner draw. `null` is `nearestCell`.
+        const cell = keyCellOf(px.position, L, cornerSpread ? pixelDither(i) : null).toVar();
         // `secondary` is 0: the multibounce cache inserts into the same maps
         // under the key's secondary bit, and it is Phase 5's caller, not this
         // one's parameter — a flag here would be a knob nothing sets.

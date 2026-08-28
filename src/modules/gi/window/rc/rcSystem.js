@@ -54,7 +54,8 @@ import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "../../srcMath.js";
 import { normalOfFace } from "../radianceCache.js";
 import { createSrcSecondaryFrame, formatSrcSecondary } from "../../srcSecondary.js";
 import { createRcMerge } from "./rcMerge.js";
-import { createRcDirectAt, createRcHitShading } from "./rcHit.js";
+import { createRcHitShading } from "./rcHit.js";
+import { createRcEmitterDirect } from "./rcDirect.js";
 import {
   CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0, rcHitCapacity, rcHitPathEnabled, rcIntervalCensus,
   rcTierSpec,
@@ -288,6 +289,44 @@ export function createRcCascades({
   };
 
   // ── the frames, in the order `srcSystem` builds them ─────────────────────
+  /**
+   * ⭐⭐⭐ §19 STAGE 5.3d — THE CORNER SPREAD, ON BY DEFAULT ON THIS PATH.
+   *
+   * The user's report is "dark spots when the camera goes further", and 5.3c
+   * named the distance-dependent quantity after refuting the LOD hypothesis:
+   * the probe POPULATION. `srcProbes.cornerSpread` carries the mechanism — a
+   * pixel's ONE ray is assigned to a trilinear corner drawn with that corner's
+   * own weight instead of always to the nearest one, so every corner of every
+   * occupied cell is seeded AND fed at no extra ray cost, and a shading point
+   * can no longer interpolate a set of eight silent probes.
+   *
+   * ⛔⛔ §19 5.3d — MEASURED AND SHIPPED **OFF**, AND BOTH HALVES OF THE
+   * MEASUREMENT ARE THE REASON. On the user's Cornel.scene, everything else
+   * held (RC5, seat + analytic direct, ρ ≤ 0.9, the fresh-block cadence fix):
+   *
+   *     arm                 gain    median |log|   median after removing gain
+   *     corner spread ON    1.487       0.434            0.291
+   *     corner spread OFF   0.992       0.431            0.433
+   *
+   * It does exactly what it was built to do — the field's SHAPE improves by a
+   * third once the gain is divided out, which is dead corners being filled —
+   * and it arrives with a **1.5× energy inflation whose mechanism is not
+   * attributed**. Per-surface blotch σ is unchanged to within a point on every
+   * surface (green 92.9 vs 95.8, red 55.1 vs 54.9, box 47.5 vs 47.8, floor
+   * 46.1 vs 47.9), so the spread is neither the cause of nor the cure for the
+   * blotch; it is purely a population change with an unexplained scale on it.
+   *
+   * ⛔ AN UNATTRIBUTED 1.5× IS NOT SHIPPABLE, and dividing it out would be
+   * exactly the tuned constant [[gi-colour-probe-method]] forbids. The arm
+   * stays, the receipt stays, and the next session owes it one measurement:
+   * whether a probe fed by a trilinear-weighted neighbourhood is being counted
+   * once per corner somewhere downstream of the deposit (the merge's corner
+   * renormalisation and `srcRays`' per-probe influx compensation are the two
+   * candidates — both are per-probe quantities that just changed population).
+   *
+   * `__gi2RcCornerSpread = 1` arms it (the 1.487/0.291 row above).
+   */
+  const cornerSpread = (globalThis.__gi2RcCornerSpread ?? 0) !== 0;
   const frame = createSrcProbeFrame(store, {
     spacing0,
     camera: vec3(cameraU),
@@ -296,6 +335,7 @@ export function createRcCascades({
     maxLods,
     readPixel,
     frameStamp: frameStampU,
+    cornerSpread,
   });
 
   const rayStore = createSrcRayStore(store, { pixelCount });
@@ -427,7 +467,12 @@ export function createRcCascades({
       width,
       height,
       maxLods,
-      directAt: createRcDirectAt({ trace, voxel0: win.voxel0, emitters }),
+      // §19 5.3d — the seated emitter's analytic direct term with its own
+      // traced-and-filtered visibility. See `rcDirect.js`; `null` when the
+      // build has no slots or the arm is off.
+      direct: createRcEmitterDirect({
+        trace, voxel0: win.voxel0, emitters, gbuffer, camera: vec3(cameraU), width, height,
+      }),
     })
     : null;
 
@@ -547,6 +592,8 @@ export function createRcCascades({
     depositScale: DEPOSIT_SCALE,
     alpha: TEMPORAL_ALPHA,
     jitter: jitterOn,
+    /** §19 5.3d — which corner rule the population ran under. */
+    cornerSpread,
     pools: {
       c0Probes: spec.c0Probes, binBudget: spec.binBudget, binTotal: bins.binTotal,
       // §19 5.3 — 0 on the inline arm, which is how a receipt tells the two

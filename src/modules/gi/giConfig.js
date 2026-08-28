@@ -707,11 +707,24 @@ export const RC5_PATH = false;
  * (`rcMerge`'s `directAt`, the 0.365 row). All three are the A/B rows above.
  */
 export function rc5SeatNeeEnabled(runtime = globalThis) {
-  // §19 5.3b — the DEFAULT flipped: the transport carries the lamp. `__gi2Rc5Emission`
-  // is still honoured as 5.3's opt-IN spelling so an old harness page reads the
-  // same arm it named.
+  // ⭐⭐⭐ §19 5.3d — THE DEFAULT IS THE SEAT AGAIN, AND IT IS THE REFERENCE'S
+  // OWN SPLIT RATHER THAN A PREFERENCE. See `rc5PixelNeeEnabled` below and
+  // `rcDirect.js`'s header: the gate's truth is
+  // `E = NEE_direct + cosine bounce with emission REMOVED at every hit`, so an
+  // admitted+SEATED lamp must reach a pixel analytically and must NOT be in the
+  // transport. 5.3b/5.3c put it in the transport instead and got the energy
+  // right (gain 0.879) with the SILHOUETTE wrong — the tall box's lit side at
+  // 1.85× and the ceiling at 0.35× are a voxel slab's angular spread, not a
+  // panel's, and no per-voxel scale can fix a shape.
+  //
+  // ⚠ THE TWO SWITCHES MOVE TOGETHER OR THE LAMP IS COUNTED TWICE / NOT AT ALL.
+  // `rc5PixelNeeEnabled` is defined as this one, so there is exactly one
+  // decision and it cannot be half-applied.
+  //
+  // `__gi2Rc5Emission = 1` (5.3's opt-in spelling) and `__gi2Rc5SeatNee = 0`
+  // both restore 5.3b/5.3c's transport arm, with the analytic term off.
   if ((runtime?.__gi2Rc5Emission ?? 0) !== 0) return false;
-  return (runtime?.__gi2Rc5SeatNee ?? 0) !== 0;
+  return (runtime?.__gi2Rc5SeatNee ?? 1) !== 0;
 }
 
 /** Under the cascades, does a PROMOTED emitter keep its palette emission? */
@@ -719,9 +732,24 @@ export function rc5EmitterEmissionEnabled(runtime = globalThis) {
   return rc5PathEnabled(runtime) && !rc5SeatNeeEnabled(runtime);
 }
 
-/** The pixel-analytic seat term in `rcMerge` — the blotchy arm, opt-in. */
+/**
+ * ⭐⭐⭐ §19 5.3d — THE PIXEL-ANALYTIC SEAT TERM, AND IT IS NOW THE SAME
+ * DECISION AS THE SEAT ITSELF.
+ *
+ * A seated emitter has `palEm = [0,0,0]` (`#gi2SlotEmissive`), so the transport
+ * carries no first bounce for it; the analytic term at the pixel is its ONLY
+ * carrier. Deriving this from `rc5SeatNeeEnabled` rather than from a second
+ * global is what makes "counted once" a property of the code instead of a rule
+ * two hatches have to be set consistently to obey — the failure 5.3 measured in
+ * both directions (0.303 with neither, 1.955 with both).
+ *
+ * ⚠ 5.3 SHIPPED THIS OFF FOR A REASON THAT NO LONGER HOLDS: it was a BINARY
+ * shadow ray per pixel with nothing behind it (blotch σ 45 → 95 %). `rcDirect`
+ * traces the same ray and then runs it through the cross-bilateral the engine's
+ * own emitter chain always had. The filter is the change; the term is 5.3's.
+ */
 export function rc5PixelNeeEnabled(runtime = globalThis) {
-  return rc5PathEnabled(runtime) && (runtime?.__gi2Rc5PixelNee ?? 0) !== 0;
+  return rc5PathEnabled(runtime) && rc5SeatNeeEnabled(runtime);
 }
 
 export function rc5PathEnabled(runtime = globalThis) {

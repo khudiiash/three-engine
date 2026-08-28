@@ -112,6 +112,7 @@ import {
   atomicLoad,
   atomicMax,
   atomicStore,
+  bool,
   float,
   floatBitsToUint,
   floor,
@@ -146,8 +147,10 @@ import {
   transportPixel,
 } from "./srcMathTsl.js";
 import {
+  FLAG_BLOCKNEW,
   INFLUX_ONE,
   PROBE_BLOCK,
+  PROBE_FLAGS,
   PROBE_PARENT,
   PROBE_WORDS,
   SLOT_EMPTY,
@@ -1059,17 +1062,9 @@ export function createSrcDepositFrame(store, bins, {
     const lod = floor(lodAtDistance(chebyshev(P, camera), spacing0, maxLods)).toVar();
     const bounds = [];
     for (let c = 0; c < N; c++) bounds.push(intervalBoundary(c, lod, spacing0).toVar());
-    // §19 5.3c — the reach is the DUE cascade's boundary. `bounds` is strictly
-    // increasing, so the last branch that fires wins and the result is
-    // `bounds[min(cascadeDue, N−1)]` with no loop and no divergence.
-    let reach = bounds[N - 1];
-    if (cascadeDue) {
-      const rd = float(bounds[0]).toVar();
-      for (let c = 1; c < N; c++) {
-        rd.assign(select(int(cascadeDue).greaterThanEqual(int(c)), bounds[c], rd));
-      }
-      reach = rd;
-    }
+    // §19 5.3c/5.3d — the reach is the DUE cascade's boundary, and `dueEff`
+    // below is what "due" means for THIS pixel. Computed after the chain,
+    // because a freshly claimed block in the chain raises it.
 
     // THE ANCESTOR CHAIN, walked once per pixel rather than once per ray. Every
     // ray from this pixel deposits into the same chain — it is a property of the
@@ -1097,6 +1092,63 @@ export function createSrcDepositFrame(store, bins, {
         blk.assign(probeTable.element(chain[c].mul(PROBE_WORDS).add(PROBE_BLOCK)));
       });
       blocks.push(blk);
+    }
+
+    // ══ ⭐⭐⭐ §19 STAGE 5.3d — A FRESHLY CLAIMED BLOCK IS ALWAYS DUE ═════════
+    //
+    // 5.3c's cadence gates the scatter on `cascadeDue`, and `createCompactPass`
+    // claims blocks on EVERY frame. A block claimed at cascade `c` on a frame
+    // when `c` is not due is therefore ZEROED by the decay (the claim stamp) and
+    // then receives no rays for up to `2^c − 1` frames. Its bins read unknown,
+    // its child's merge finds no parent corner, and `srcMerge` leaves an
+    // orphaned TRANSPARENT bin at `L_self = 0, T_self = 1` — a bin that is
+    // KNOWN and BLACK, which the tile bakes at full coverage and the gather
+    // interpolates as a black vote. That is 5.3c's `black 0 → 7-33`.
+    //
+    // ⚠ NOT FIXABLE BY SKIPPING THE CLAIM. An absent parent and an empty parent
+    // are the SAME absence to the merge, so deferring the claim reproduces the
+    // orphan exactly. The block has to be FILLED on the frame it is zeroed,
+    // which is what it always was before the cadence — so the pixel raises its
+    // own reach and its own scatter gate to the highest cascade in its chain
+    // carrying `FLAG_BLOCKNEW`.
+    //
+    // ⚠ AND IT IS PER PIXEL, WHICH IS WHY IT IS AFFORDABLE. Only the pixels
+    // standing over a probe born this frame march the full reach; every other
+    // pixel keeps 5.3c's shortened one and the cadence keeps its saving. At
+    // rest that is a handful of pixels per frame, and during a walk it is
+    // exactly the pixels whose field does not exist yet.
+    //
+    // ⚠ `probeTable`, NOT `freeStack` — the block STAMP would have been the
+    // direct test and lives in a buffer this kernel does not bind. At 7 of the
+    // portable 8 that is not a style choice.
+    const dueEff = cascadeDue ? int(cascadeDue).toVar() : null;
+    const blockNew = [];
+    if (cascadeDue) {
+      for (let c = 0; c < N; c++) {
+        const fresh = bool(false).toVar();
+        if (c > 0) {
+          If(chain[c].notEqual(uint(SLOT_EMPTY)).and(blocks[c].notEqual(uint(SLOT_EMPTY))), () => {
+            const fl = probeTable.element(chain[c].mul(PROBE_WORDS).add(uint(PROBE_FLAGS)))
+              .toVar();
+            If(fl.bitAnd(uint(FLAG_BLOCKNEW)).notEqual(uint(0)), () => {
+              fresh.assign(true);
+              dueEff.assign(dueEff.max(int(c)));
+            });
+          });
+        }
+        blockNew.push(fresh);
+      }
+    }
+    // The reach is the effective due cascade's boundary. `bounds` is strictly
+    // increasing, so the last branch that fires wins and the result is
+    // `bounds[min(dueEff, N−1)]` with no loop and no divergence.
+    let reach = bounds[N - 1];
+    if (dueEff) {
+      const rd = float(bounds[0]).toVar();
+      for (let c = 1; c < N; c++) {
+        rd.assign(select(dueEff.greaterThanEqual(int(c)), bounds[c], rd));
+      }
+      reach = rd;
     }
 
     // ══ THE RAY LOOP IS A GPU LOOP, AND IT HALVES THE KERNEL (§13.17) ═══════
@@ -1246,8 +1298,16 @@ export function createSrcDepositFrame(store, bins, {
         // §19 5.3c — `c <= cascadeDue` is the cadence. It is ANDed rather than
         // wrapped around the block so a miss (`own == N`) cannot deposit its
         // all-clear into a cascade whose turn it is not — see `cascadeDue`.
+        // §19 5.3d — `dueEff`, not `cascadeDue`: a chain entry whose block was
+        // claimed THIS frame is due whatever the schedule says. See the block
+        // above for why an unfilled fresh block reads as black.
+        // ⚠ THE SCHEDULE IS OVERRIDDEN PER CASCADE, NOT WHOLESALE. `dueEff`
+        // buys the REACH (one ray, one length), but only the cascade whose
+        // block is actually new may take an off-schedule deposit — the cascades
+        // below it are FROZEN by the decay this frame, and depositing into a
+        // frozen accumulator adds evidence that will never be aged out.
         const dueC = cascadeDue
-          ? int(cascadeDue).greaterThanEqual(int(c))
+          ? int(cascadeDue).greaterThanEqual(int(c)).or(blockNew[c])
           : null;
         const owns = dueC ? int(c).lessThanEqual(own).and(dueC) : int(c).lessThanEqual(own);
         If(blk.equal(uint(SLOT_EMPTY)).and(chain[c].notEqual(uint(SLOT_EMPTY)))
