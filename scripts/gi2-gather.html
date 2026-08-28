@@ -418,7 +418,9 @@
           await compute(gather.passes.crop);
           const f = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.cropOut.value));
           return list.map((c, i) => {
-            const b = i * 6 * 4;
+            // §19 3.17 — nine vec4 per crop (the per-cascade census rides in
+            // slots 6..8; this rig does not print it, but the STRIDE is shared).
+            const b = i * 9 * 4;
             return {
               name: c.name, diag: !!c.diag,
               px: cropArr[i * 4], py: cropArr[i * 4 + 1],

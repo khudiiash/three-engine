@@ -340,6 +340,33 @@ export const CTR_MAXTRIS = 33; // the largest triangle range ONE item walked (ma
 export const CTR_ITEMOVF = 34; // bricks that got no items: the frame's item list was full
 export const CTR_ITEMCUT = 35; // bricks that got SOME of their items and stay DIRTY
 /**
+ * ⭐⭐ §19 STAGE 3.17 — BRICKS RECLAIMED OUT OF `STATE_BUILDING`.
+ *
+ * `STATE_BUILDING` was a state NO PASS COULD LEAVE. `binCells` writes it, and
+ * only `finishBricks` — in the SAME frame, over the SAME dirty list — can move
+ * it on. But `giCompute` dispatches this chain `deferrable`, and it skips
+ * UNBUILT nodes one at a time once the frame's build budget is spent: on a boot
+ * frame `binCells` compiles and runs while `finishBricks` is still skipped, and
+ * every brick that frame accepted is left BUILDING. The dirty scan then tested
+ * `state < STATE_BUILT` — which is 0 and 1 — so a BUILDING brick was invisible
+ * to the scan, invisible to `finishBricks` (it only reads the dirty list), and
+ * its `brickMask` bit stayed CLEAR: invisible to the trace as well.
+ *
+ * ⛔ MEASURED, not argued (`__gi2WindowCensus`, Bistro, ultra, world path):
+ * L4 4096/4096 bricks stuck BUILDING, 0 occupied voxels, 0 mask bits — and
+ * L3 3283, L2 2629, L1 1407, L0 777. The gradient is `coarseFirst`: the coarse
+ * levels head the dirty list for exactly the boot frames whose pipelines are
+ * still compiling, so the coarsest level loses ALL of its bricks. That is why
+ * `first occupancy L4` never printed and why cascade 2 read 0/32768 live.
+ *
+ * The scan now takes `state != STATE_BUILT`, so a brick orphaned in BUILDING is
+ * re-enqueued on the next frame with its cursors intact and resumes. Counted
+ * because a self-healing path that heals silently cannot be told from one that
+ * never fires.
+ */
+export const CTR_ORPHAN = 42; // bricks reclaimed from STATE_BUILDING this frame
+export const CTR_CUMORPHAN = 53; // …and over the whole session, NEVER RESET
+/**
  * ⭐⭐ THE ONE CUMULATIVE COUNTER, AND WHY IT HAD TO EXIST (§19 Stage 3.5).
  *
  * Every other word here is PER FRAME — `resetCtrPass` zeroes them at the top
@@ -747,10 +774,19 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     const tab = tabBaseOf(level, b).toVar();
     const stored = atomicLoad(winAtomics.element(tab)).toVar();
     const state = atomicLoad(winAtomics.element(tab.add(uint(1)))).toVar();
-    If(state.lessThan(uint(STATE_BUILT)), () => {
+    // §19 3.17 — `!= BUILT`, not `< BUILT`: `STATE_BUILDING` (3) is an ORPHAN
+    // at scan time. Nothing is legitimately BUILDING here — `binCells` writes
+    // that state later in this same frame and `finishBricks` clears it before
+    // the frame ends — so a brick found in it lost its chain to a deferred
+    // dispatch and must be re-enqueued. See `CTR_ORPHAN`.
+    If(state.notEqual(uint(STATE_BUILT)), () => {
       If(bitAnd(stored, uint(WB_VALID)).equal(uint(0)), () => {
         atomicAdd(ct.element(uint(CTR_INVALID)), uint(1));
       }).Else(() => {
+        If(state.equal(uint(STATE_BUILDING)), () => {
+          atomicAdd(ct.element(uint(CTR_ORPHAN)), uint(1));
+          atomicAdd(ct.element(uint(CTR_CUMORPHAN)), uint(1));
+        });
         const bucket = bucketFn(level.toFloat(), unpackWb(stored)).toUint().min(uint(NBUCKETS - 1)).toVar();
         atomicAdd(wk.element(uint(BKT_OFF).add(bucket)), uint(1));
         atomicAdd(ct.element(uint(CTR_DIRTY)), uint(1));
@@ -778,7 +814,9 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     const tab = tabBaseOf(level, b).toVar();
     const stored = atomicLoad(winAtomics.element(tab)).toVar();
     const state = atomicLoad(winAtomics.element(tab.add(uint(1)))).toVar();
-    If(state.lessThan(uint(STATE_BUILT)).and(bitAnd(stored, uint(WB_VALID)).notEqual(uint(0))), () => {
+    // Same rule as the count pass — the two must agree exactly or the prefix
+    // sum hands out slots for bricks the scatter never writes.
+    If(state.notEqual(uint(STATE_BUILT)).and(bitAnd(stored, uint(WB_VALID)).notEqual(uint(0))), () => {
       const bucket = bucketFn(level.toFloat(), unpackWb(stored)).toUint().min(uint(NBUCKETS - 1)).toVar();
       const slot = atomicAdd(wk.element(uint(BKT_OFF + NBUCKETS).add(bucket)), uint(1)).toVar();
       If(slot.lessThan(uint(MAX_DIRTY)), () => {
@@ -1827,6 +1865,9 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
         voxelsSet: a[CTR_VOXELS],
         dustVoxels: a[CTR_DUST],
         resumed: a[CTR_RESUMED],
+        // §19 3.17 — bricks reclaimed out of the orphan state (see CTR_ORPHAN).
+        orphaned: a[CTR_ORPHAN],
+        orphanedTotal: a[CTR_CUMORPHAN],
         maxCursor: a[CTR_MAXCURSOR],
         // ── §19 4.1b: the work-item receipt ────────────────────────────────
         // `items` is what the frame actually walked, `itemsWanted` what the

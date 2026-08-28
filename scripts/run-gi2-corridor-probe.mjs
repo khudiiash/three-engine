@@ -40,7 +40,11 @@ const FRAMES = process.env.FRAMES ?? "";
 const ARM_QUERY = {
   // §19 3.16 — the default arm is all three fixes ON; "3.15" is the SAME
   // BINARY with `fix316=0`, which is what makes the two columns comparable.
-  "3.16": "",
+  // §19 3.17 — the default arm. "3.16" is the SAME BINARY with reach off,
+  // which is what 3.16 actually shipped.
+  "3.17": "",
+  "3.16": "reach=0",
+  "3.17-noreach": "reach=0",
   "3.16+reach": "reach=1",
   "3.16-place": "reach=0&split=0",
   "3.16-reach": "place=0&split=0&reach=1",   // reach ships OFF — refuted, see worldProbes

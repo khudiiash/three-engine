@@ -100,7 +100,13 @@ import { createWorldProbes } from "./worldProbes.js";
  * BEFORE the build" discipline `__gi2NoiseDump` follows — one binary, one
  * shader cache, both arms expressible from one checkout.
  */
-export const WORLD_PROBES = false;
+// §19 3.17 (08-28): DEFAULT ON. The architect overruled the row-by-row flip
+// gate: the rows still failing (a 9 m light pool on the 60 m corridor rig that
+// 8 m probes cannot resolve; +136 MB on one boot; 11 vs 10 phone frames;
+// motion flips above one earlier arm) are not the user's complaints, and on
+// those (noise under motion, thin-feature blobs, first light) the world path is
+// strictly better. `__gi2WorldProbes = false` pre-boot restores screen probes.
+export const WORLD_PROBES = (globalThis.__gi2WorldProbes ?? true) !== false;
 
 /**
  * Tier constants. These, and only these, are compiled into the WGSL.
@@ -640,7 +646,15 @@ export function createGiGather({
   // and no way for a warm loop to reach it; the harness pages pass their own
   // count and are unchanged.
   const cropIn = crops > 0 ? instancedArray(new Float32Array(crops * 4), "vec4") : null;
-  const CROP_OUT_VEC = 6;
+  /**
+   * §19 3.17 — 6 → 9. Slots 6..8 are the PER-CASCADE CENSUS the corridor's 30 m
+   * row needed: `(that cascade's own irradiance at this crop's point and
+   * normal, its hand-off band weight there)`. Written only on the world path,
+   * only by the rig's crop kernel, and it is what turns "the far field is 2.9×
+   * the truth" from an argument into a reading — one line per cascade says
+   * which one is carrying the light and how much of the pixel it owns.
+   */
+  const CROP_OUT_VEC = 9;
   const cropOut = crops > 0 ? instancedArray(new Float32Array(crops * CROP_OUT_VEC * 4), "vec4") : null;
   const litBuf = instancedArray(new Float32Array(width * height * 4), "vec4");
   /**
@@ -2409,7 +2423,41 @@ export function createGiGather({
   // panel strata — ~25 kB of WGSL, 2.5 s of pipeline compile when it was
   // duplicated at 3.5. `useWorld` gates `probeTracePass` out of the build, so
   // the text exists once per binary either way.
-  const hitRadiance = (r, dir, laneU) => {
+  /**
+   * ⭐⭐ §19 STAGE 3.17 — `unlitFallback`: WHAT A HIT PAYS WHEN THE CACHE HAS
+   * NOTHING TO SAY YET.
+   *
+   * §X.2 measured the hole and then reverted the feature that exposed it: with
+   * the last cascade tracing to its lattice extent, its far band went from SKY
+   * (3.875) to EXACTLY 0.0000 on all thirty of its samples. ⭐ **A LONGER RAY
+   * STOPS MISSING AND STARTS HITTING, AND A COLD HIT WAS BLACK WHERE THE MISS
+   * WAS SKY.** A fresh slot IS shaded on the spot below — but that shade is
+   * DIRECT plus a cosine gather that reads the cache, so every secondary hit
+   * whose own slot is cold contributes zero. In a street canyon sixty metres
+   * out, that is every one of them: the fresh shade is a strict UNDER-estimate
+   * of what the same slot converges to, and its floor is black.
+   *
+   * `unlitFallback(hp, hn)` is the caller's own estimate of the IRRADIANCE at
+   * the hit — the world path passes its PARENT cascade's field, interpolated at
+   * the hit point and evaluated at the hit's normal, which is occlusion-aware
+   * by construction and is therefore never "raw sky through a wall". The hit
+   * then pays `max(fresh shade, albedo·E/π)` componentwise.
+   *
+   * ⭐ `max`, NOT A REPLACEMENT AND NOT A SUM. The two terms estimate the SAME
+   * quantity — the converged outgoing radiance of that face — from two
+   * directions: the fresh shade has the direct term exactly and the indirect
+   * term floored at zero; the cascade has the whole field at lattice
+   * resolution. Summing would double-count the direct light on a sunlit façade;
+   * replacing would throw it away. The larger of two under-estimates is the
+   * only combination that is wrong in neither case, and both converge to the
+   * same value once the cache fills, at which point this branch stops running
+   * (`fresh` is false).
+   *
+   * ⚠ IT DOES NOT ENTER THE CACHE. `cacheAccum` still stores the SHADE, so the
+   * cache converges to its own physically-derived answer and the fallback can
+   * never become a fixed point of itself.
+   */
+  const hitRadiance = (r, dir, laneU, unlitFallback = null) => {
     const rad = vec3(0).toVar();
     const hitDist = float(RAY_MAX).toVar();
     const zi = r.z.toUint().toVar();
@@ -2430,7 +2478,14 @@ export function createGiGather({
         // `.toVar()` is load-bearing — see `probeTracePass`'s note.
         cache.cacheAccum(levelF, voxF, faceF, s, u.nCapU).toVar();
         If(fresh, () => {
-          rad.assign(s);
+          if (unlitFallback) {
+            // `palAt` is the same albedo `shadeHit` multiplies its own E by, so
+            // the two terms differ only in which E they used.
+            const fb = palAt(levelF, voxF).xyz.mul(unlitFallback(hp, hn)).mul(1 / Math.PI).toVar();
+            rad.assign(max(s, fb));
+          } else {
+            rad.assign(s);
+          }
           bump(STATS.freshShades, laneU);
         }).Else(() => { bump(STATS.reShades, laneU); });
       });
@@ -2527,6 +2582,10 @@ export function createGiGather({
     kit: {
       u, octU, cellOfWorld, dominantFace, hitRadiance, emitterSh, bump, STATS,
       RAY_MAX, OCT, O,
+      // §19 3.17 — the SH2 cosine evaluation, so the lattice's own trace can
+      // ask its parent cascade for the irradiance at a cold hit (see
+      // `hitRadiance`'s `unlitFallback`). ONE formula, two call sites.
+      shEval,
     },
   });
   if (world) Object.assign(u, world.uniforms);
@@ -3344,7 +3403,12 @@ export function createGiGather({
    * approximation and has no crop delta by construction; it is the same
    * arithmetic with the sum pulled inside the linear map.
    */
-  const shEval = (L, n) => {
+  // ⚠ §19 3.17 — A `function`, NOT A `const` ARROW, AND THAT IS HOISTING RATHER
+  // THAN STYLE: `createWorldProbes` is called ~900 lines above this point and
+  // its trace kernel now evaluates the parent cascade's SH through this exact
+  // formula. A `const` would be in its temporal dead zone there; moving the
+  // definition up would put a resolve helper in the middle of the shading kit.
+  function shEval(L, n) {
     const c1 = 0.429043, c2 = 0.511664, c3 = 0.743125, c4 = 0.886227, c5 = 0.247708;
     return L[8].mul(c1).mul(n.x.mul(n.x).sub(n.y.mul(n.y)))
       .add(L[6].mul(c3).mul(n.z.mul(n.z)))
@@ -3357,7 +3421,7 @@ export function createGiGather({
       .add(L[1].mul(2 * c2).mul(n.y))
       .add(L[2].mul(2 * c2).mul(n.z))
       .max(vec3(0));
-  };
+  }
   /**
    * THE OCT TAP, SPLIT INTO A PLAN AND A FETCH.
    *
@@ -4268,6 +4332,25 @@ export function createGiGather({
     cropOut.element(base.add(uint(3))).assign(vec4(accG.mul(k), 0));
     cropOut.element(base.add(uint(4))).assign(vec4(accL.mul(k), 0));
     cropOut.element(base.add(uint(5))).assign(vec4(accA.mul(k), accEm.mul(k)));
+    // §19 3.17 — the per-cascade census (see `CROP_OUT_VEC`). The crop's own
+    // averaged point and normal, asked of each cascade ALONE, next to the
+    // hand-off weight the resolve would give it there.
+    if (world) {
+      const cp = accP.mul(k).toVar();
+      const cnn = normalize(accN.mul(k)).toVar();
+      for (let c = 0; c < 3; c++) {
+        if (c >= world.taps.cascades) {
+          cropOut.element(base.add(uint(6 + c))).assign(vec4(0));
+          continue;
+        }
+        const fr = world.taps.cellFrameAt(cp, float(world.taps.spacingOf(c)));
+        const bw = world.taps.bandAt(fr.g, vec3(world.origins[c])).toVar();
+        cropOut.element(base.add(uint(6 + c)))
+          .assign(vec4(world.taps.irradianceAtCasc(uint(c), cp, cnn), bw));
+      }
+    } else {
+      for (let c = 0; c < 3; c++) cropOut.element(base.add(uint(6 + c))).assign(vec4(0));
+    }
   })().compute(crops);
 
   // ══════════════════════════════════════════════ SHADER: noiseDump (§19 3.6)

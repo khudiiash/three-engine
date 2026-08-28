@@ -324,7 +324,9 @@
           await compute(gather.passes.crop);
           const f = new Float32Array(await renderer.getArrayBufferAsync(gather.buffers.cropOut.value));
           return CROPS.map((c, i) => {
-            const b = i * 6 * 4;
+            // §19 3.17 — nine vec4, not six. Slots 6..8 are the per-cascade
+            // census: (that cascade's own irradiance here, its band weight).
+            const b = i * 9 * 4;
             return {
               name: c.name, d: c.d, kind: c.kind,
               px: cropArr[i * 4], py: cropArr[i * 4 + 1],
@@ -333,6 +335,10 @@
               irr: [f[b + 8], f[b + 9], f[b + 10]],
               lit: [f[b + 16], f[b + 17], f[b + 18]],
               albedo: [f[b + 20], f[b + 21], f[b + 22]], emissive: f[b + 23],
+              casc: [0, 1, 2].map((k) => ({
+                irr: [f[b + 24 + k * 4], f[b + 25 + k * 4], f[b + 26 + k * 4]],
+                band: f[b + 27 + k * 4],
+              })),
             };
           });
         };
@@ -384,9 +390,17 @@
             `${stats.texelsSeen} (${((100 * stats.texelsSeen) / tot).toFixed(1)}%)`);
         }
         say(`stats: ${JSON.stringify(stats)}`);
+        const lum3 = (v) => 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
         for (const c of crops) {
           say(`  ${c.name.padEnd(12)} px(${c.px},${c.py}) pos ${c.pos.map((v) => v.toFixed(2)).join(",")} ` +
             `n ${c.nrm.map((v) => v.toFixed(2)).join(",")} irr ${c.irr.map((v) => v.toFixed(4)).join(",")}`);
+          // §19 3.17 — the per-cascade census. `band` is the hand-off weight the
+          // resolve would give that cascade AT THIS POINT; `E` is what that
+          // cascade's own SH says the irradiance is, alone.
+          if (c.casc) {
+            say(`  ${" ".repeat(12)} per cascade: ` + c.casc
+              .map((k, ci) => `c${ci} E ${lum3(k.irr).toFixed(4)} band ${k.band.toFixed(3)}`).join("   "));
+          }
         }
         if (validationErrors.length) say(`⛔ ${validationErrors.length} WebGPU validation error(s): ${validationErrors[0]}`);
 

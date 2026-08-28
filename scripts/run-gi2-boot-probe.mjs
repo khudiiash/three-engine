@@ -1327,8 +1327,25 @@ for (const name of SCENES) {
       const v = gi2.voxelizer;
       console.log(`  voxelizer: ${v.built} built / ${v.dirty} dirty, ${v.pairsWritten} of ${v.pairsNeeded} pairs, ` +
         `${v.voxelsSet} voxels, overflow ${v.overflowed}, starved ${v.starved}, deferred ${v.deferred}, ` +
-        `resumed ${v.resumed}, invalid ${v.invalid ?? "?"}, slotFull ${v.slotFull ?? "?"}, cellOvf ${v.cellOverflow ?? "?"}`);
+        `resumed ${v.resumed}, invalid ${v.invalid ?? "?"}, slotFull ${v.slotFull ?? "?"}, cellOvf ${v.cellOverflow ?? "?"}, ` +
+        `orphans reclaimed ${v.orphaned ?? "?"} this frame / ${v.orphanedTotal ?? "?"} total`);
       console.log(`             per level: ${(v.perLevel ?? []).map((l) => `L${l.level} ${l.built}b/${l.dirty}d/${l.pairs}p`).join("  ")}`);
+      // ⭐ CUMULATIVE, never reset — "has this level EVER held a built brick".
+      // The per-frame `built` is 0 on a settled window, so the line above
+      // cannot tell "never voxelized" from "finished voxelizing".
+      console.log(`             cumBuilt:  ${(v.perLevel ?? []).map((l) => `L${l.level} ${l.cumBuilt ?? "?"}` +
+        `${l.dust != null ? `(${l.dust}dust)` : ""}`).join("  ")}`);
+    }
+    if (gi2.windowCensus) {
+      for (const c of gi2.windowCensus) {
+        console.log(`             census L${c.level}: ${c.occVoxels} occ voxels, ${c.brickMaskBits} mask bits, ` +
+          `${c.invalidWb} invalid wb, states ${JSON.stringify(c.state)}`);
+      }
+    }
+    if (gi2.windowCensusError) console.log(`             census error: ${gi2.windowCensusError}`);
+    // §19 3.17 — the world lattice's own liveness, per cascade.
+    if (gi2.worldLive) {
+      console.log(`  world probes: live ${gi2.worldLive.join(" / ")} of ${gi2.worldCells} cells each`);
     }
     if (gi2.dynamic) {
       console.log(`  dynamic: ${gi2.dynamic.trianglesPacked} mover tris, ${gi2.dynamic.voxelsSet} voxels, ` +

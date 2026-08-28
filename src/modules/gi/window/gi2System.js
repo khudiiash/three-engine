@@ -67,7 +67,12 @@ import {
   sqrt, texture, textureStore, uint, vec3, vec4,
 } from "three/tsl";
 import { createSrcWorld } from "../srcVolume.js";
-import { createGiWindow } from "./windowStore.js";
+import {
+  createGiWindow,
+  // §19 3.17 — the census below reads the window buffer's own layout.
+  BMASK_OFF as WIN_BMASK_OFF, BTAB_OFF as WIN_BTAB_OFF, LEVEL_WORDS as WIN_LEVEL_WORDS,
+  OCC_OFF as WIN_OCC_OFF, WB_VALID as WIN_WB_VALID,
+} from "./windowStore.js";
 import { createWindowTrace } from "./windowTrace.js";
 import { createRadianceCache } from "./radianceCache.js";
 import { createWindowVoxelizer } from "./windowVoxelize.js";
@@ -1388,6 +1393,46 @@ export function createGi2System({
             (out.firstLightFromSceneOpenMs != null
               ? ` — ${out.firstLightFromSceneOpenMs} ms FROM SCENE OPEN` : ""),
           );
+        }
+        // ⭐⭐ §19 3.17 — THE PER-CASCADE LIVE COUNT, IN THE RECEIPT EVERY PROBE
+        // ALREADY READS. §V.3 named "c2 live 0/32768 on Bistro" from a rig page
+        // that happens to print it; three stages of ENGINE-path receipts could
+        // not see the same fact, because nothing on this path read `wpList`. It
+        // is `LIST_WORDS · NC · 4` bytes at the stats cadence, and it is the
+        // only witness to "this cascade exists at all".
+        // ⭐ §19 3.17 — THE WINDOW CENSUS, opt-in (`__gi2WindowCensus = true`).
+        // "L4 never printed first occupancy" is a claim about a COUNTER; this
+        // reads the buffer the trace and `allocPass` actually sample, per level:
+        // occupied voxels, brickMask bits, and the brick-table state histogram.
+        // 3.9 MB of readback, so it is behind a flag and off on every gate.
+        if (globalThis.__gi2WindowCensus === true) {
+          try {
+            const wb = new Uint32Array(await r.getArrayBufferAsync(win.attribute));
+            const pc = (x) => { let n = 0; while (x) { x &= x - 1; n++; } return n; };
+            out.windowCensus = Array.from({ length: win.levels }, (_, l) => {
+              const base = l * WIN_LEVEL_WORDS;
+              let occ = 0;
+              for (let w = 0; w < 8192; w++) occ += pc(wb[base + WIN_OCC_OFF + w]);
+              let mask = 0;
+              for (let w = 0; w < 128; w++) mask += pc(wb[base + WIN_BMASK_OFF + w]);
+              const state = {};
+              let invalid = 0;
+              for (let b = 0; b < 4096; b++) {
+                const t = base + WIN_BTAB_OFF + b * 2;
+                if ((wb[t] & WIN_WB_VALID) === 0) invalid++;
+                const s = wb[t + 1];
+                state[s] = (state[s] ?? 0) + 1;
+              }
+              return { level: l, occVoxels: occ, brickMaskBits: mask, invalidWb: invalid, state };
+            });
+          } catch (err) { out.windowCensusError = err?.message ?? String(err); }
+        }
+        if (gather.world) {
+          try {
+            const lw = new Uint32Array(await r.getArrayBufferAsync(gather.world.buffers.wpList.value));
+            out.worldLive = gather.world.readLive(lw);
+            out.worldCells = gather.world.cellCount;
+          } catch { /* a lattice disposed mid-rebuild */ }
         }
       }
       if (voxelizer) {

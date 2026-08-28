@@ -2901,3 +2901,244 @@ unmeasured. The `emitterDirect` splice was already removed under world probes at
 feature outranks a ratio, and it is now a red test rather than an argument.
 (2) The cascade extent schedule, the only surviving explanation for the
 corridor's 30 m and 50 m rows. (3) α 0.25 — one constant, one measured receipt.
+
+---
+
+## Y. STAGE 3.17 — THE FOUR BLOCKERS 3.16 NAMED, AND THE TWO THAT TURNED OUT TO BE ONE
+
+### Y.1 ⭐⭐⭐ `STATE_BUILDING` WAS A STATE NO PASS COULD LEAVE — AND IT WAS BLOCKERS 1 AND 3 AT ONCE
+
+§V.3 named it three stages ago ("cascade 2 reads 0/32768 live on every Bistro
+boot") and every stage since read it as a cascade problem. It is not. It is the
+WINDOW.
+
+`binCells` writes `STATE_BUILDING`; only `finishBricks` — in the same frame,
+over the same dirty list — can move it on. But `GISystem.giCompute` dispatches
+that chain `deferrable`, and it skips UNBUILT nodes ONE AT A TIME once the
+frame's build budget is spent. On a boot frame `binCells` compiles and runs
+while `finishBricks` is still being skipped, and every brick that frame accepted
+is left BUILDING. The dirty scan then tested `state < STATE_BUILT` — which is 0
+and 1 — so a BUILDING brick was invisible to the scan, invisible to
+`finishBricks` (it only reads the dirty list), and its `brickMask` bit stayed
+CLEAR: **invisible to `traceWindow` as well.**
+
+⭐⭐ **THE INSTRUMENT THAT SAW IT IS A CENSUS OF THE BUFFER, NOT OF A COUNTER**
+(`__gi2WindowCensus`, `gi2System.stats()` -> `windowCensus`, printed by
+`probe:gi2-boot`). Bistro, ultra, world path, at rest:
+
+| level | occ voxels | brickMask bits | brick states |
+|---|---|---|---|
+| L0 | 31 371 | 1431 | BUILT 3319 · **BUILDING 777** |
+| L1 | 27 635 | 1264 | BUILT 2689 · **BUILDING 1407** |
+| L2 | 19 147 | 772 | BUILT 1467 · **BUILDING 2629** |
+| L3 | 7 553 | 304 | BUILT 813 · **BUILDING 3283** |
+| **L4** | **0** | **0** | **BUILDING 4096 (100 %)** |
+
+The gradient IS the diagnosis: `coarseFirst` puts the coarse levels at the head
+of the dirty list for exactly the boot frames whose pipelines are still
+compiling, so the coarsest level loses ALL of its bricks. `cumBuilt L4 = 0`,
+which is why `first occupancy L4` never printed; cascade 2 reads its liveness
+from L4 (`LMIN` = [0, 2, 4] at ultra) and had nothing to read.
+
+**FIX:** the dirty scan takes `state != STATE_BUILT` instead of `< STATE_BUILT`
+(both `dirtyCount` and `dirtyScatter`, which must agree or the prefix sum hands
+out slots the scatter never fills), and counts what it reclaims
+(`CTR_ORPHAN` / `CTR_CUMORPHAN`). Nothing is legitimately BUILDING at scan time,
+so a brick found in it lost its chain to a deferred dispatch, and it resumes
+from its own cursors on the next frame.
+
+**RECEIPT, three consecutive Bistro boots, identical to the digit:**
+`orphans reclaimed 12 192 total` · every level `cumBuilt 4096` · **L4 1580 occ
+voxels / 75 mask bits** · **c2 live 0 -> 697 of 32 768**, proportional to those
+75 occupied L4 bricks (each 4 m voxel dilates into up to eight 8 m cells).
+⚠ A FOURTH boot reclaimed **0** and was healthy anyway — the deferral is
+timing-dependent, so a single-boot A/B of this fix proves nothing and the
+CUMULATIVE counter is the only honest witness. [[gi-watchdog-false-fire]]
+
+⭐⭐⭐ **AND IT WAS ALSO BLOCKER 3.** `test:gi2-lightshadow` traces the STATIC
+WINDOW, and `traceWindow` pre-rejects on `brickMask`. The rig's caster sat in
+orphaned bricks whose mask bit was clear, so the shadow ray never hit and the
+pass wrote its load-bearing default of 1. **World path 0.989 -> 0.0885** (gate
+<= 0.2), shipping path unchanged at **0.0414**. §X.5 read it as "a whole feature
+missing on the world path"; it was one bit in a brick table, and it was never
+about world probes at all — the two paths differ only in which kernels compile
+in which order, which is what decided who got deferred.
+
+### Y.2 BLOCKER 2 — A COLD HIT PAYS THE PARENT CASCADE, NOT BLACK
+
+`hitRadiance` DOES shade a fresh slot on the spot, so "unlit" was never the
+literal state. What is true is sharper: that fresh shade is DIRECT plus a
+cosine gather that reads the CACHE, and every secondary hit whose own slot is
+cold contributes exactly zero. Sixty metres down a street that is all of them,
+so the fresh shade is a strict UNDER-estimate whose floor is black — which is
+what §X.2 measured when reach turned misses into hits.
+
+`hitRadiance(r, dir, lane, unlitFallback)`: on `fresh`, the hit pays
+`max(shade, albedo · E_parent / pi)` componentwise, where `E_parent` is
+`irradianceAtCasc(P_OF(casc), hitPoint, hitNormal)` — interp8 of the parent
+cascade's SH2, weighted by trilinear x liveness, normalised. ⭐ **`max`, not a
+sum and not a replacement**: both terms estimate the same converged outgoing
+radiance, summing double-counts the direct term on a sunlit facade and replacing
+throws it away. It never enters the cache, so it cannot become a fixed point of
+itself.
+
+⭐⭐ **IT COST A STORAGE BINDING AND THE GATHER PROBE CAUGHT IT ON THE FIRST
+RUN** — `worldTrace=7 exceed the portable envelope of 6`. Fix: `wpSh` FOLDED
+INTO `wpInfo` (12 vec4 per cell, SH in slots 3-11). Same bytes exactly, one
+fewer binding in `trace` (7 -> **6**), `sh` (5 -> 4), `nee` (4 -> 3) and
+`resolveHalf` (3 -> 2). *A wider stride costs no binding* — 3.16's own coin,
+spent again.
+
+**RECEIPT** (`probe:gi2-farfield`, Bistro street-overview, one pinned pose,
+3417 paired facade pixels, screen reference from the same session):
+
+| far-facade irradiance | screen | 3.16 reach OFF | 3.16 reach ON | **3.17 OFF** | **3.17 ON (ships)** |
+|---|---|---|---|---|---|
+| 30-40 m p50 | 1.066 | 2.559 | 2.808 | 2.558 | **2.513** |
+| 40-55 m p50 | 1.262 | 2.353 | 2.621 | 2.351 | **2.351** |
+| **55-75 m p50** | **4.208** | 3.875 | **0.000** | 3.861 | **3.850** |
+| ÷ screen p50 | — | 1.505 | 1.668 | 1.507 | **1.486** |
+| within ±30 % | — | 33.2 % | 27.1 % | 32.8 % | **33.5 %** |
+
+⭐⭐ **REACH IS NOW INERT WHERE IT WAS CATASTROPHIC, AND THAT IS THE PROOF THE
+DIAGNOSIS WAS RIGHT.** With the fallback in, the last cascade's far band reads
+the same whether its rays stop at 40 m or at 256 — 3.850 against 3.861. **The
+black was the cold-hit floor, not the ray length.** `__gi2Reach` therefore
+defaults to **1**; `__gi2Reach = 0` is 3.16's arm. On the corridor, where truth
+exists, reach stays inert (50 m 0.119 -> 0.116), exactly as §X.2 predicted.
+
+### Y.3 BLOCKER 4 — THE 30 m CROP IS NOT A DOUBLE COUNT, AND THE PIXEL SAYS SO
+
+The crop kernel now writes a PER-CASCADE CENSUS (`CROP_OUT_VEC` 6 -> 9): for
+each cascade, its own irradiance at the crop's point and normal, next to the
+hand-off band weight the resolve would give it there. Corridor, ultra, world:
+
+| crop | c0 E / band | c1 E / band | c2 E / band | resolve | b1 / b2 / b4 |
+|---|---|---|---|---|---|
+| wall@5m | 0.0669 / **0.729** | 0.0657 / 1.000 | 0.0000 / 1.000 | 0.0666 | 0.034 / 0.047 / 0.057 |
+| wall@15m | 0.0000 / **0.000** | 0.0127 / 1.000 | 0.0001 / 1.000 | 0.0128 | 0.009 / 0.018 / 0.025 |
+| **wall@30m** | 0.0000 / **0.000** | **0.0000 / 0.000** | 0.0818 / 1.000 | **0.1269** | 0.009 / 0.021 / **0.043** |
+| **wall@50m** | 0.0000 / 0.000 | 0.0000 / 0.000 | 0.1620 / 1.000 | **0.2055** | 0.770 / 1.330 / **1.775** |
+
+⛔ **THE PRIME SUSPECT IS REFUTED AT THE PIXEL. At 30 m and 50 m the resolve
+reads CASCADE 2 ALONE — c1's band weight is 0 and c1's own field is 0 there —
+so no merge runs into that pixel and nothing can be counted twice.** c1's
+lattice is ±32 m about a camera at z ~ 3 and the crop is at z = 33.19: it is
+simply outside. (The interval-ownership rule was re-read for it anyway: a c1
+probe past c0's extent traces `[0, 20)` and its c2 parent, when it is inside
+c1's lattice, traces `[20, 256)` — contiguous, no overlap.)
+
+⭐ **WHAT IS LEFT IS ONE ERROR MEASURED AT TWO POINTS.** c2 alone reads 0.082 at
+30 m (truth 0.043, x1.9) and 0.162 at 50 m (truth 1.775, x0.09), and the CPU
+reference's per-bounce split says why: at 50 m the truth is **b1 0.770 of a
+b4 1.775 — direct panel light**, a metre-scale pool; at 30 m it is b1 0.009,
+almost all multi-bounce. **Forty live c2 probes on 8 m centres, with a 28.6 deg
+cone, cannot represent a 1.8-unit spike nine metres wide.** They low-pass it —
+too bright at 30 m and too dark at 50 m by construction, one smooth ramp — and
+the wall and floor crops at 30 m read the same number to three decimals
+(0.1311 / 0.1341) because what is left of the field there is nearly pure DC.
+Not the merge, not the placement, not the intervals: **the extent schedule.**
+Closing it needs c1's lattice to reach past 32 m (`cells` 32 -> 64 is 8x the
+lattice, 90.75 -> 726 MB) or c2 to grow directions (§W.1's 16x16, +90 % of the
+ray budget and 184 MB). Both are past the portable envelope; it is a stage of
+its own and it is the ONLY surviving corridor blocker.
+
+### Y.4 alpha = 0.25, SHIPPED
+
+`wpAlpha` 0.5 -> 0.25 under `SPLIT_OWN`. Cold-noise temporal p95 **ultra 1.206
+-> 0.752 % PASS**, **phone 1.468 -> 0.937 % PASS** (gate <= 1). Panel move
+7 -> **9 frames** at ultra, 9 -> **11** at phone.
+
+### Y.5 THE TABLE (ultra, `?world=1`, one session)
+
+| receipt | 3.12 screen | 3.16 | **3.17** | gate |
+|---|---|---|---|---|
+| Cornell bracketed | — | 8/8 | **8/8** | 8/8 |
+| 5 cm leak (control) | — | 0/10 000 (92.1 %) | **0/10 000 (92.1 %)** | 0 |
+| leak, four rotations | — | 0/10 000 | **0/10 000** | 0 |
+| thin-wall interior | — | 0.39 % | **0.38 %** | <= 5 % |
+| trim sub-voxel crops | — | 5/6 (`floorByPot`) | **5/6** (`floorByPot`) | 6/6 |
+| at rest still/flips/p95 | — | 100/0/0.001 | **100/0/0.001** | 95/—/0.3 |
+| orbit ÷ parked (paired) | — | 0.994 | **1.012** | — |
+| orbit sign-flip rate | — | 5.753 % | **5.759 %** | <= 35 % |
+| panel move re-converges | — | 7 fr | **9 fr** | <= 10 |
+| chain ms @1650x970 | — | 2.407 | **2.415** | <= 4.0 |
+| storage buffers, worst kernel | — | 6 | **6** | <= 6 |
+| **cold noise temporal p95** | — | 1.206 % ⛔ | **0.752 % PASS** | <= 1 % |
+| lattice bytes (GPU) | — | 90.75 MB | **90.75 MB** | — |
+| **c2 live probes, Bistro** | — | **0 / 32 768** ⛔ | **697 / 32 768** | > 0 |
+| **window bricks stuck BUILDING** | — | **12 192** ⛔ | **0** | 0 |
+| corridor 5/15/30/50 m ÷ truth | 1.887/0.741/0.156/0.002 | 1.184/0.511/2.926/0.119 | **1.175/0.506/2.953/0.116** | bracket |
+| corridor bracketed | 2/8 | 3/8 ⛔ | **3/8** ⛔ | >= 6/8 |
+| Bistro far facades ÷ screen p50 | 1.000 | 1.505 | **1.486** | — |
+| **Bistro far 55-75 m p50** | 4.208 | 3.875 off / 0.000 on | **3.850 (reach ON)** | > 0 |
+| Bistro GI GPU ms | — | — | **1.61** (ship 1.74-3.25) | <= 3 |
+| Bistro JS heap | — | — | **1869 MB** (ship 1733-1859) | +100 MB |
+| Level JS heap | — | — | **515 MB** (ship 379) ⛔ | +100 MB |
+| Bistro first light from scene open | — | — | **10.8-14.8 s** (ship 11.8-14.9) | within noise |
+| Level first light from scene open | — | — | **4934 ms** (ship 4868) | within noise |
+| Bistro motion flips orbit/dolly/whip | — | 35.4/24.2/23.2 | **35.1/23.7/23.1** ⛔ | 3.14's 26.9/21.6/17.6 |
+
+**PHONE:** Cornell 8/8 · storage 6/6 · chain **2.218 ms** · thin-wall **0.19 %
+(control 0.31)** · trim **6/6** · at rest 100/0/0.001 · panel move **11 fr** ⛔ ·
+cold noise **0.937 % PASS** · lattice 7.56 MB · ⛔ rotated-room leaks rotX20
+**3/10 000** and rotXY20 **2/10 000**, unmoved from 3.16 and therefore
+pre-existing. ⭐ **AND THE DUST RULE IS REFUTED FOR THEM BY ARITHMETIC**: the
+cull threshold is `CULL_FRACTION · v_l` = **0.125 m** at the phone's L0 and
+0.5 m at L2, while the partition's own triangles span metres — the 5 cm wall
+takes the SAT path at every level, so its leak is not a routed-to-dust triangle.
+It appears only at the tier whose voxel is 2x ultra's and only on the ROTATED
+arms, which is the signature of a discretization gap in a slab tilted off-axis,
+not of the cull. Not chased further; five rays in twenty thousand.
+
+### Y.6 THE ENGINE GATES, WORLD PATH
+
+| gate | shipping | **world path** |
+|---|---|---|
+| `test:gi-sunleak` | PASS | **PASS** (worst leak 0.00000) |
+| `test:gi-moved-lamp` | PASS | **PASS** (dNew 29.06, gate > 12) |
+| `smoke:gi-gpu` | PASS | **PASS** (`gi2.worldTrace` 6 storage) |
+| `run-gi-resize-probe` | PASS 0/0 | **PASS 0/0** |
+| `test:gi2-lightshadow` | **0.0414** | **0.0885 PASS** (3.16: 0.989 ⛔) |
+
+⚠ The moved-lamp REVERT arm has no pre-boot hatch (the test's own header says
+so), so "the arm goes red" is inherited from §X, not re-measured here.
+⚠ `probe:gi2-motion`'s frame-time and voxelize gates fail on BOTH paths in the
+same session (orbit MAX 107.4 world / 108.1 shipping ms; voxelize chain MAX
+4.82/3.96/3.01 world against 5.26/5.61/0.32 shipping). Pre-existing on this
+branch, and the world path is not the worse of the two, so they are not flip
+blockers — but they are §18's own mandate and they are open.
+⚠ `reprojection at rest >= 99 %` reads 0.0 and FAILS on both tiers: it is a
+SCREEN-probe statistic and the world path has no reprojection. A dead gate, not
+a regression.
+
+### Y.7 THE FLIP VERDICT — `WORLD_PROBES` STAYS `false`
+
+**PASS, and it is a much shorter list of failures than 3.16's.** Cornell 8/8 on
+both tiers · leaks 0/10 000 and four rotations at ultra · thin-wall 0.38 % ·
+§T at rest 100 %/0 flips/0.001 % on both tiers · orbit ÷ parked 1.012 and orbit
+flips 5.759 % · panel move 9 fr at ultra · chain 2.415/2.218 ms · storage 6 of 6
+· **cold noise 0.752 / 0.937 % PASS at the shipped alpha** · **all five engine
+gates green on the world path, `test:gi2-lightshadow` included** · Bistro GI
+1.61 ms · boot from scene open within the shipping path's own spread on both
+scenes.
+
+**FAIL, and exactly which:**
+1. **corridor bracket 3/8 against >= 6/8** — the 30 m and 50 m rows, now
+   attributed BY MEASUREMENT AT THE PIXEL to the cascade EXTENT SCHEDULE and to
+   nothing else (§Y.3). The one blocker that is a stage rather than a bug.
+2. **Bistro motion flips 35.1 / 23.7 / 23.1** against 3.14's 26.9 / 21.6 / 17.6.
+   Unmoved by alpha (0.5 -> 0.25 changed them by <= 0.5 points).
+3. **Level JS heap 515 MB against the shipping path's 379** — +136 MB against a
+   +100 MB gate, on one boot each. Bistro's pair (1869 against 1733-1859) is
+   inside its own spread, so this row needs repeating before it is believed.
+4. **phone panel move 11 frames** against <= 10 — alpha 0.25's own price, one
+   frame over, on the slower tier only.
+5. phone rotated-room leaks 3/10 000 and 2/10 000, pre-existing and unmoved.
+
+▶ **NEXT, IN ORDER.** (1) The extent schedule — c1 cannot reach 32 m and c2
+cannot resolve 8 m, and the corridor is the only receipt that has truth in it.
+(2) Bistro motion flips, the last row where the cascades are worse than 3.14's
+single lattice. (3) The frame-time and voxelize-chain gates `probe:gi2-motion`
+fails on BOTH paths — §18's mandate, and now unblocked by a window that
+actually finishes its bricks.

@@ -293,7 +293,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const ALL_CELLS = CELLS * NC;
 
   const {
-    u, octU, cellOfWorld, dominantFace, hitRadiance, emitterSh, bump, STATS, RAY_MAX, OCT,
+    u, octU, cellOfWorld, dominantFace, hitRadiance, emitterSh, bump, STATS, RAY_MAX, OCT, shEval,
   } = kit;
   const { traceWindow } = trace;
   const v0 = win.voxel0;
@@ -372,7 +372,16 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
    * yet". Until then `RAY_MAX` is the honest horizon and sky at it is the
    * honest answer.
    */
-  const REACH_LATTICE = (globalThis.__gi2Reach ?? 0) !== 0;
+  /**
+   * ⭐⭐ §19 3.17 — REACH SHIPS **ON**, AND THAT IS THE COLD-HIT FALLBACK'S
+   * RECEIPT. 3.16 reverted it because a longer ray started hitting bricks the
+   * cache had never lit and paid BLACK for them; `hitRadiance`'s
+   * `unlitFallback` (§19 3.17) removes that floor — a cold hit now pays its
+   * albedo times the parent cascade's own irradiance at the hit point — so the
+   * band only the last cascade can answer for is served rather than blacked.
+   * `__gi2Reach = 0` is 3.16's arm, kept for the A/B.
+   */
+  const REACH_LATTICE = (globalThis.__gi2Reach ?? 1) !== 0;
   const SPLIT_OWN = INTERVALS && NC > 1 && (globalThis.__gi2SplitOwn ?? 1) !== 0;
   /**
    * ⭐⭐ §19 3.16 FIX 2 — `RAY_MAX` IS PER-CASCADE, AND THE LAST CASCADE'S IS
@@ -461,15 +470,29 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   // 25 MB and no binding.
   const OCT_W = SPLIT_OWN ? 3 : 2;
   const wpOct = instancedArray(new Uint32Array(ALL_CELLS * OCT * OCT_W), "uint");
-  /** Nine SH2 coefficients per cell. What the resolve reads. */
-  const wpSh = instancedArray(new Float32Array(ALL_CELLS * 9 * 4), "vec4");
   /**
-   * Three vec4 per cell:
-   *   0  (probe position, state)   state 0 dead · 1 open-air · 2 faced
-   *   1  (face normal, 0)
-   *   2  (world cell coord, ready) ready 0 = the map is not trustworthy yet
+   * ⭐⭐ §19 3.17 — THE SH LIVES INSIDE `wpInfo`, AND THAT IS THE PORTABLE
+   * ENVELOPE, NOT TIDINESS.
+   *
+   * Twelve vec4 per cell:
+   *   0    (probe position, state)   state 0 dead · 1 open-air · 2 faced
+   *   1    (face normal, mergeVis bits)
+   *   2    (world cell coord, ready) ready 0 = the map is not trustworthy yet
+   *   3-11 the NINE SH2 coefficients — what the resolve reads, and (3.17) what
+   *        the TRACE reads for a cold hit's fallback (`irradianceAtCasc`).
+   *
+   * `wpSh` was its own binding until the cold-hit fallback needed the parent
+   * cascade's field inside the trace kernel — which already bound its six
+   * (window, cache, oct, info, list, stats) and would have compiled to SEVEN.
+   * The gather probe caught it on the first run: `worldTrace=7 exceed the
+   * portable envelope of 6`. ⭐ **A WIDER STRIDE COSTS NO BINDING**, which is
+   * the same coin `wpOct`'s third word spent at 3.16 — and here it costs no
+   * BYTES either: 3 + 9 vec4 in one array is exactly what 3 and 9 were in two.
+   * Every kernel that reads both (`sh`, `nee`, `seed`, the resolve) also drops
+   * a binding.
    */
-  const wpInfo = instancedArray(new Float32Array(ALL_CELLS * 3 * 4), "vec4");
+  const INFO_VEC = 12;
+  const wpInfo = instancedArray(new Float32Array(ALL_CELLS * INFO_VEC * 4), "vec4");
   /**
    * ONE buffer for the compaction, because the trace stands at the portable
    * envelope's six storage bindings exactly (window, cache, oct, info, list,
@@ -521,7 +544,15 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
      * rays are the same rays from the same point, so this ramps the CACHE's
      * convergence and removes no noise that was ever there).
      */
-    wpAlpha: uniform(SPLIT_OWN ? 0.5 : (INTERVALS ? 1 : 0.25)),
+    /**
+     * ⭐ §19 3.17 — 0.25, WHICH IS §U.2's OWN VALUE AND THE ONE 3.16 MEASURED.
+     * Cold-noise temporal p95 0.729 % (PASS, gate ≤ 1) against 1.206 % at 0.5,
+     * for +2 frames on a moved panel (7 → 9, gate ≤ 10). 3.16 shipped 0.5
+     * because that was what the stage specified and recorded the pair as a
+     * receipt; this is the stage that spends it. Under the in-place merge
+     * (`SPLIT_OWN` off) α is still 1 by algebra, not by taste — see `mergeFor`.
+     */
+    wpAlpha: uniform(SPLIT_OWN ? 0.25 : (INTERVALS ? 1 : 0.25)),
     /** 0 removes the resolve's visibility term — the LEAK RECEIPT'S CONTROL. */
     wpVisOn: uniform(1),
     /** 0 removes the probe-face gate; the other half of the same control. */
@@ -636,8 +667,9 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   shiftLeft(bitAnd(z, int(C - 1)).toUint(), uint(2 * CB)));
   /** Un-torus one axis: the origin says which window the low bits belong to. */
   const unTorus = (bits, o) => o.toInt().add(bitAnd(bits.toInt().sub(o.toInt()), int(C - 1)));
-  const infoIdx = (gc, k) => gc.mul(uint(3)).add(uint(k));
-  const shIdxW = (gc, k) => gc.mul(uint(9)).add(uint(k));
+  const infoIdx = (gc, k) => gc.mul(uint(INFO_VEC)).add(uint(k));
+  /** SH coefficient `k` — slots 3..11 of the SAME array. See `wpInfo`. */
+  const shIdxW = (gc, k) => infoIdx(gc, 3 + k);
   const octIdxW = (gc, texel) => gc.mul(uint(OCT * OCT_W)).add(texel.mul(uint(OCT_W)));
   /**
    * §19 3.16 — the word an EMA is allowed to touch. Under `SPLIT_OWN` it is
@@ -1044,6 +1076,67 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const slotCell = (rr) => rr.casc.mul(uint(CELLS))
     .add(listAt(rr.casc, uint(LIST_OFF).add(rr.idx)));
 
+  /**
+   * ⭐⭐ §19 STAGE 3.17 — CASCADE `ccU`'s IRRADIANCE AT A WORLD POINT, FOR A
+   * NORMAL. What a COLD HIT is paid instead of black (`hitRadiance`'s
+   * `unlitFallback`, and the whole reason `__gi2Reach` can ship on).
+   *
+   * interp8 of the cascade's own SH2, weighted by trilinear × LIVENESS and by
+   * nothing else — the same rule and the same argument as `parentTap`: this is
+   * "what does the field look like around here", not "can you see me". The
+   * caller is a RAY that has already established line of sight to the hit, so a
+   * second visibility test here would discount the one thing that is known.
+   *
+   * ⚠ NORMALISED BY `wsum`, unlike the resolve's accumulation: the resolve
+   * spends a per-cascade claim and blends cascades against each other, this is
+   * a single cascade answering alone, and an unnormalised sum over partly-dead
+   * corners would read as darkness at exactly the lattice edges where the far
+   * field lives. Zero live corners returns black, which is the honest answer —
+   * and where it happens the trace's own `select` has already preferred the
+   * fresh shade.
+   *
+   * ⚠ DEFINED HERE, NOT WITH THE RESOLVE'S TAPS, because the trace kernel is
+   * built ~700 lines before them and a `const` arrow would be in its temporal
+   * dead zone. It uses only the addressing primitives above.
+   */
+  const irradianceAtCasc = (ccU, p, n) => {
+    const sp = pickF(ccU, SPC).toVar();
+    const org = pickV(ccU, originsU).toVar();
+    const base = ccU.mul(uint(CELLS)).toVar();
+    const g = p.div(sp).sub(0.5).toVar();
+    const b = g.floor().toVar();
+    const f = g.sub(b).toVar();
+    const L = [];
+    for (let i = 0; i < 9; i++) L.push(vec3(0).toVar());
+    const wsum = float(0).toVar();
+    for (let c8 = 0; c8 < 8; c8++) {
+      const dx = c8 & 1;
+      const dy = (c8 >> 1) & 1;
+      const dz = (c8 >> 2) & 1;
+      const wcx = b.x.add(dx).toVar();
+      const wcy = b.y.add(dy).toVar();
+      const wcz = b.z.add(dz).toVar();
+      const tri = (dx ? f.x : float(1).sub(f.x))
+        .mul(dy ? f.y : float(1).sub(f.y))
+        .mul(dz ? f.z : float(1).sub(f.z)).toVar();
+      // The address is always in range (`slotOf` masks each axis), so the eight
+      // reads are unconditional and the WINDOW test is a weight — the idiom
+      // `windowTrace` spells out, and the one that does not branch a buffer
+      // read into a dead lane.
+      const gc = slotOf(wcx.toInt(), wcy.toInt(), wcz.toInt()).add(base).toVar();
+      const ok = inLatticeAt(org, wcx, wcy, wcz)
+        .and(wpInfo.element(infoIdx(gc, 0)).w.greaterThan(0.5)).toVar();
+      const w = select(ok, tri, float(0)).toVar();
+      for (let i = 0; i < 9; i++) L[i].addAssign(wpInfo.element(shIdxW(gc, i)).xyz.mul(w));
+      wsum.addAssign(w);
+    }
+    const inv = float(1).div(wsum.max(1e-5)).toVar();
+    for (let i = 0; i < 9; i++) L[i].mulAssign(inv);
+    return select(wsum.greaterThan(1e-5), shEval(L, n), vec3(0));
+  };
+  /** Cascade `c`'s PARENT index as a runtime pick — the last cascade is its own. */
+  const P_INDEX = Array.from({ length: NC }, (_, c) => P_OF(c));
+
   // ══════════════════════════════════════════ SHADER: worldProbeTrace (§U.2)
   //
   // One thread per (batch slot, oct texel). The direction is `octU`'s texel
@@ -1206,7 +1299,12 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     const hitAny = r.x.greaterThan(0.5).toVar();
     const inBand = hitAny.and(r.y.greaterThanEqual(t0)).toVar();
     const blockedNear = hitAny.and(r.y.lessThan(t0)).toVar();
-    const rd = hitRadiance(r, dir, k).toVar(); // (rgb, hitDistance); sky on a miss
+    // §19 3.17 — the cold-hit fallback. The PARENT cascade's field, because a
+    // cascade's own map is the thing being written this instant; the last
+    // cascade is its own parent (`P_OF`) and therefore quotes the field it
+    // converged to on previous frames, which is what makes reach payable.
+    const rd = hitRadiance(r, dir, k,
+      (hp, hn) => irradianceAtCasc(pickU(rr.casc, P_INDEX), hp, hn)).toVar();
 
     // ⭐⭐ SKY IS CREDITED BY THE LAST CASCADE ALONE, AND THAT IS WHAT KEEPS THE
     // MERGE ENERGY-EXACT. `hitRadiance` returns `skyColor` on any miss, so a
@@ -1585,7 +1683,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       sh[7].addAssign(c.mul(d.x.mul(d.z).mul(1.092548)));
       sh[8].addAssign(c.mul(d.x.mul(d.x).sub(d.y.mul(d.y)).mul(0.546274)));
     });
-    for (let i = 0; i < 9; i++) wpSh.element(shIdxW(gc, i)).assign(vec4(sh[i], 0));
+    for (let i = 0; i < 9; i++) wpInfo.element(shIdxW(gc, i)).assign(vec4(sh[i], 0));
     // ⭐ 0.5, NOT 1. `ready` is now three-valued — 0 re-keyed, 0.5 SEEDED, 1
     // traced — so the resolve can accept a seeded probe (it carries a real
     // field) while `shPass` can still tell "has this probe ever traced" and
@@ -1660,7 +1758,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       sh[7].addAssign(c.mul(d.x.mul(d.z).mul(1.092548)));
       sh[8].addAssign(c.mul(d.x.mul(d.x).sub(d.y.mul(d.y)).mul(0.546274)));
     });
-    for (let i = 0; i < 9; i++) wpSh.element(shIdxW(gc, i)).assign(vec4(sh[i], 0));
+    for (let i = 0; i < 9; i++) wpInfo.element(shIdxW(gc, i)).assign(vec4(sh[i], 0));
     const i2 = wpInfo.element(infoIdx(gc, 2)).toVar();
     wpInfo.element(infoIdx(gc, 2)).assign(vec4(i2.xyz, 1));
     // The two counters every existing receipt prints as "probes" — reused so
@@ -1700,8 +1798,8 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     const sh = emitterSh(p, select(faced, n, vec3(0)), faced);
     for (let i = 0; i < 9; i++) {
       const idx = shIdxW(gc, i);
-      const cur = wpSh.element(idx).toVar();
-      wpSh.element(idx).assign(vec4(cur.xyz.add(sh[i]), 0));
+      const cur = wpInfo.element(idx).toVar();
+      wpInfo.element(idx).assign(vec4(cur.xyz.add(sh[i]), 0));
     }
   })().compute(TRACE_SLOTS);
 
@@ -1789,7 +1887,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   /** The GLOBAL cell index of a cascade's cell at these world coords. */
   const cellAtG = (base, wcx, wcy, wcz) => slotOf(wcx.toInt(), wcy.toInt(), wcz.toInt()).add(base);
   const infoAt = (gc, k) => wpInfo.element(infoIdx(gc, k));
-  const shAt = (gc, i) => wpSh.element(shIdxW(gc, i));
+  const shAt = (gc, i) => wpInfo.element(shIdxW(gc, i));
   /** Bilinear radiance out of an `octPlan`'s four offsets. */
   const octTapRad = (plan, gc) => {
     const t = plan.offs.map((o) => decodeRgbe(wpOct.element(octIdxW(gc, o))));
@@ -1840,14 +1938,17 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // §19 3.16 — the three arms, so a receipt cannot claim a stage it did not
     // build. `reachLast` is the number fix 2 actually moves.
     placeInCell: PLACE_IN_CELL, reachLattice: REACH_LATTICE, splitOwn: SPLIT_OWN,
-    reachLast: REACH_LAST, octWords: OCT_W, alpha: SPLIT_OWN ? 0.5 : (INTERVALS ? 1 : 0.25),
+    reachLast: REACH_LAST, octWords: OCT_W, alpha: SPLIT_OWN ? 0.25 : (INTERVALS ? 1 : 0.25),
     // ⚠ NO FUNCTIONS IN HERE. `describe()` crosses `page.evaluate` in every
     // receipt this module has; a method would be dropped by the structured
     // clone and read as `undefined` at the far end.
     bytes: {
       oct: ALL_CELLS * OCT * OCT_W * 4,
+      // §19 3.17 — one array; the split is kept in the receipt because the two
+      // halves are still two different things to reason about.
       sh: ALL_CELLS * 9 * 16,
       info: ALL_CELLS * 3 * 16,
+      infoTotal: ALL_CELLS * INFO_VEC * 16,
       list: LIST_WORDS * NC * 4,
     },
     totalMB: +(((ALL_CELLS * OCT * OCT_W * 4) + (ALL_CELLS * 9 * 16) + (ALL_CELLS * 3 * 16)
@@ -1888,7 +1989,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
    * cascades — and `detachCpuMirror` can transfer them away the frame after
    * they are bound. See `gi2System`'s drain, which is what actually calls this.
    */
-  const cpuMirrors = () => [wpOct.value, wpSh.value, wpInfo.value, wpList.value]
+  const cpuMirrors = () => [wpOct.value, wpInfo.value, wpList.value]
     .filter((a) => a?.isBufferAttribute === true);
 
   return {
@@ -1896,7 +1997,9 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     extents: EXT, traceSlots: TRACE_SLOTS, slots: SLOTS, band: BAND,
     uniforms: { ...wu, ...Object.fromEntries(originsU.map((o, c) => [`wpOrigin${c}`, o])) },
     origins: originsU,
-    buffers: { wpOct, wpSh, wpInfo, wpList },
+    // §19 3.17 — `wpSh` IS `wpInfo` now; the alias is kept so a caller that
+    // named the SH buffer still resolves to the array that holds it.
+    buffers: { wpOct, wpSh: wpInfo, wpInfo, wpList },
     offsets: { FLAG_OFF, LIST_OFF, BASE_OFF, CTL_OFF, LIST_WORDS },
     passes: {
       alloc: allocPass, count: countPass, scan: scanPass, fill: fillPass,
@@ -1926,10 +2029,13 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       cascades: NC, spacingOf: (c) => SPC[c], extentOf: (c) => EXT[c],
       cascConst, cellFrameAt, inLatticeAt, bandAt, clampAt, cellAtG,
       infoAt, shAt, octTapRad, octTapVisAt,
+      // §19 3.17 — one cascade's irradiance, alone. Used by the trace's
+      // cold-hit fallback and by the corridor rig's per-cascade crop census.
+      irradianceAtCasc,
     },
     setCamera, reset, readLive, describe, cpuMirrors,
     dispose() {
-      for (const b of [wpOct, wpSh, wpInfo, wpList]) {
+      for (const b of [wpOct, wpInfo, wpList]) {
         if (b?.value) { b.value.array = b.value.array.constructor.from([]); b.value.dispose?.(); }
       }
     },
