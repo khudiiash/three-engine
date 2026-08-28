@@ -546,6 +546,64 @@ export function createRcCascades({
    * restores the paper's R2 arm.
    */
   const jitterOn = (globalThis.__gi2RcJitter ?? 0) !== 0;
+  /**
+   * ⭐⭐⭐ §19 STAGE 5.4d — THE DIRECTION CYCLE: A COMPLETE SET IN K FRAMES,
+   * WITH NO RANDOMNESS ANYWHERE IN IT.
+   *
+   * Frozen (5.2's default) the R2 offset is the SAME every frame, so the rays a
+   * pixel splits fill the SAME subset of each coarse probe's 128/512/2048 bins
+   * for ever and the rest stay UNKNOWN — the coupon-collector reason the paper
+   * jitters at all. A bin that is never filled is not dark, it is absent, and a
+   * surface whose light arrives through those directions is short by the
+   * unfilled fraction while a surface facing the lamp is not. That is exactly
+   * the shape 5.4d measured with the loop cut out: one bounce at 0.90× on the
+   * lamp-facing wall and 0.33× on the surface fed from far directions.
+   *
+   * The paper's answer is a random offset per frame, which fills every bin but
+   * makes the field a stochastic average over time — the one thing the user's
+   * no-noise rule forbids, and it measured 2.20 % at-rest p90 against frozen's
+   * 1.29 %.
+   *
+   * So: the offset walks a FIXED PERIODIC SEQUENCE indexed by the frame — the
+   * same K offsets, in the same order, for every probe and every boot. Within K
+   * frames every bin has been visited exactly as often as every other; after
+   * that the sequence repeats, so the α-accumulated field converges to a
+   * PERIODIC fixed point rather than to a distribution. There is no frame-global
+   * random number, nothing is averaged to remove noise, and two boots parked at
+   * the same pose on the same frame index hold the same field bit for bit.
+   *
+   * ⚠ K IS A COMPLETENESS BUDGET, NOT A SMOOTHING WINDOW. It must cover a
+   * coarse probe's bin/ray ratio (16 of 32 filled at c0 in 5.1's census), so 16
+   * is the floor and 32 the safe value; larger only lengthens the period the
+   * field cycles over.
+   *
+   * ⛔⛔ ARMED BY `__gi2RcCycle = 32`, AND THE DEFAULT IS 0 (5.2's frozen arm)
+   * BECAUSE THE ARM MEASURED AS A NULL. The coupon-collector story predicts
+   * that a complete cycle ADDS energy to exactly the far-fed surfaces. It adds
+   * nothing (Cornel.scene, the user's pose, corrected reference):
+   *
+   *     arm                  global (1 bounce)   global (full loop)
+   *     frozen (shipped)           0.637               0.505
+   *     cycle K = 32               0.635               0.498
+   *
+   * per surface within 0.01 everywhere (Mesh·+Z 0.33 → 0.33, Ceiling·-Z 0.43 →
+   * 0.43), at-rest Δ p90 2.63 % → 2.71 %. Unchanged on both axes.
+   *
+   * ⭐⭐ AND THE REASON IS STRUCTURAL, WHICH IS WHY NO SCHEDULE COULD HAVE WON:
+   * `srcTiles` bakes `E = π·Σ(L·cw)/Σ(cw)` over the bins that are KNOWN and
+   * `srcMerge` averages over the children that are KNOWN, so an unfilled bin is
+   * RENORMALISED AWAY rather than spent as a dark vote. Filling more of them
+   * changes WHICH directions are represented, never the SCALE — unless the
+   * unvisited directions were systematically brighter than the visited ones,
+   * and on this scene they are not. The deficit is in what a KNOWN bin carries.
+   *
+   * `__gi2RcJitter = 1` still restores the paper's stochastic arm.
+   */
+  const CYCLE_K = (() => {
+    if (jitterOn) return 0;
+    const raw = Number(globalThis.__gi2RcCycle);
+    return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 0;
+  })();
   let frameIndex = 0;
   const setCamera = (pos) => {
     const p = Array.isArray(pos) ? pos : [pos.x, pos.y, pos.z];
@@ -566,6 +624,15 @@ export function createRcCascades({
     if (jitterOn) {
       jitterXU.value = (jitterXU.value + R2_ALPHA1_FX) >>> 0;
       jitterYU.value = (jitterYU.value + R2_ALPHA2_FX) >>> 0;
+    } else if (CYCLE_K > 1) {
+      // The k-th offset of the cycle, computed FROM the frame index rather than
+      // accumulated into the uniform: an accumulator drifts with however many
+      // times `beginFrame` happened to run (a paused editor, a probe's manual
+      // pumping, a resize), and then "the same frame index" would not mean the
+      // same field. `Math.imul` is the same wrap the GPU's `uint` multiply does.
+      const k = ((frameIndex % CYCLE_K) + CYCLE_K) % CYCLE_K;
+      jitterXU.value = Math.imul(R2_ALPHA1_FX, k) >>> 0;
+      jitterYU.value = Math.imul(R2_ALPHA2_FX, k) >>> 0;
     }
     const stride = Math.max(1, Math.ceil(pixelCount / threads));
     strideU.value = stride;
@@ -597,6 +664,8 @@ export function createRcCascades({
     depositScale: DEPOSIT_SCALE,
     alpha: TEMPORAL_ALPHA,
     jitter: jitterOn,
+    /** The deterministic cycle's period; 0 = frozen (5.2) or the paper's R2. */
+    cycleK: CYCLE_K,
     /** §19 5.3d — which corner rule the population ran under. */
     cornerSpread,
     pools: {

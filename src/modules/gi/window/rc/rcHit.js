@@ -285,6 +285,29 @@ export function createRcHitShading({
    * whose gain is the albedo, and never cache → cache, whose gain was 1/(1−ρ)
    * at the user's ρ = 1.0 walls.
    */
+  /**
+   * ⭐⭐⭐ §19 STAGE 5.4d — THE BOUNCE CAP: THE ONE ARM THAT SEPARATES THE LOOP
+   * FROM THE TRANSPORT.
+   *
+   * The shipped chain is a fixed-point iteration — probes → faces → hits →
+   * deposit → merge → tile → probes — and a gain measured on its converged
+   * answer cannot say WHICH hop loses energy, because every hop is inside the
+   * loop. `__gi2Rc5BounceCap = 1` cuts the return edge: a hit brings back its
+   * DIRECT face radiance and nothing else, so the field is exactly
+   *
+   *     analytic direct at the pixel  +  ONE bounce through the transport
+   *
+   * which is precisely `makeSceneTracer`'s `BOUNCES = 1` (`Lo` at depth 0 is
+   * NEE at the hit and a cosine ray that returns 0). Two quantities defined the
+   * same way, on the same pixels: the ratio is the TRANSPORT's gain with the
+   * loop removed. ≈1 ⇒ the transport is exact and the loss is the E_rc hop;
+   * <1 ⇒ one bounce is already short and the loop only compounds it.
+   *
+   * ⚠ AN INSTRUMENT, NOT A QUALITY KNOB. It removes the second bounce and every
+   * bounce after it, so the picture under it is wrong by construction.
+   */
+  const bounceCap = (globalThis.__gi2Rc5BounceCap ?? 0) !== 0;
+
   const shade = (P0, n0, rho, Le, T, addr) => {
     const a = uint(addr).toVar();
     const { faceF, levelF, voxF } = unpackAddr(a);
@@ -313,7 +336,7 @@ export function createRcHitShading({
 
     // ── the SECONDARY half: the merged field at this face, on a budget ──────
     let Lb = null;
-    if (gatherAt) {
+    if (gatherAt && !bounceCap) {
       const e = cache.ercRead(lF, vF, fF).toVar();
       const fresh = e.w.lessThan(0.5).toVar();
       const E = e.xyz.toVar();

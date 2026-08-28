@@ -474,10 +474,19 @@ const RJSON = await page.evaluate(async ({ TARGET }) => {
   // three Vector3/Color, an array, or a uniform node depending on how the
   // seat was filled. Coerce every one, and say so when a field could not be
   // read rather than printing a shape.
+  // ⭐⭐ §19 5.4d — AND A COLOUR IS `r,g,b`, WHICH IS WHY THIS PRINTED A DEAD
+  // LAMP. `THREE.Color` has NO `x`/`y`/`z` and is not indexable, so every
+  // seated emitter's radiance read `[0,0,0]` and the receipt said the slots
+  // were empty on a boot whose picture was demonstrably lit BY THOSE SLOTS —
+  // the same class of blind statistic as 4e8dece, one line above the numbers a
+  // whole stage was reasoned from. Read the container FIRST (a node's `.value`
+  // is the object, not a bag of keys), then every naming convention it could
+  // use. [[probe-blind-statistics]]
   const num3 = (v) => {
     if (!v) return [0, 0, 0];
-    const g = (k, j) => Number(v[k] ?? v[j] ?? v.value?.[k] ?? v.value?.[j] ?? 0);
-    const out = [g("x", 0), g("y", 1), g("z", 2)];
+    const src = (v.isColor || v.isVector3 || Array.isArray(v)) ? v : (v.value ?? v);
+    const g = (k, c, j) => Number(src?.[k] ?? src?.[c] ?? src?.[j] ?? 0);
+    const out = [g("x", "r", 0), g("y", "g", 1), g("z", "b", 2)];
     return out.map((q) => (Number.isFinite(q) ? q : 0));
   };
   const num1 = (v) => {
@@ -538,8 +547,15 @@ if (!(px.length > 0) || !(irrP50 > 1e-3) || !(R.probes > 0)) {
   await browser.close();
   process.exit(1);
 }
-console.log(`  emitter slots ${R.slots.length}: ` + (R.slots.map((s) =>
-  `c[${s.center.map((v) => v.toFixed(2))}] reff ${f(s.reff, 2)} L[${s.color.map((v) => v.toFixed(2))}]`).join(" · ") || "none"));
+// ⚠ AN ALL-ZERO SLOT PRINTS THE FIELD NAMES IT ACTUALLY FOUND. A reader must
+// be able to tell "this lamp is dark" from "this printer cannot read this
+// object", and only the second one has a `keys` list worth showing.
+console.log(`  emitter slots ${R.slots.length}: ` + (R.slots.map((s) => {
+  const dead = !(s.radius > 1e-5) && !(s.color.reduce((a, b) => a + b, 0) > 1e-6);
+  return `c[${s.center.map((v) => v.toFixed(2))}] reff ${f(s.reff, 2)} `
+    + `r ${f(s.radius, 2)} L[${s.color.map((v) => v.toFixed(2))}]`
+    + (dead && s.keys ? ` {${s.keys}}` : "");
+}).join(" · ") || "none"));
 console.log(`  sky [${R.sky.map((v) => v.toFixed(3))}]  sun [${R.sunColor.map((v) => v.toFixed(3))}]  ` +
   `worldProbes ${R.gather.worldProbes}  cacheSmooth ${R.gather.cacheSmooth}  coldFill ${R.gather.coldFill}  skyRays ${R.gather.skyRays}`);
 for (const m of R.scene.meshes) {
@@ -884,16 +900,30 @@ if (convSeries.length >= 3) {
       const eng = globalThis.__giEngineForProbe;
       const rc = globalThis.__gi2()?.rc;
       if (!rc) return null;
-      const [d, j] = await Promise.all([rc.readStats(eng.renderer), rc.readHitStats(eng.renderer)]);
-      return JSON.stringify({ d, j, describe: rc.describe() });
+      const [d, j, m] = await Promise.all([
+        rc.readStats(eng.renderer), rc.readHitStats(eng.renderer),
+        rc.readMergeStats ? rc.readMergeStats(eng.renderer) : null,
+      ]);
+      return JSON.stringify({ d, j, m, describe: rc.describe() });
     });
     if (rcj) {
-      const { d, j, describe } = JSON.parse(rcj);
+      const { d, j, m, describe } = JSON.parse(rcj);
       console.log(`  [E] rays ${d.rays} hits ${d.hits} (${pct(d.hitRate)}) deposits ${d.deposits} ` +
         `perRay ${f(d.perRay, 2)} noBlock ${d.noBlock} clamped ${d.clamped} maxL ${f(d.maxRadianceFraction, 3)}`);
       console.log(`  [J] ${j ? `${j.hits}/${j.capacity} shaded${j.bounce ? " +bounce" : " (single)"}` +
         `  BOUNCE-CLAMPED ${j.clamped}  OVERFLOW ${d.secondaryOverflow}` : "not built (inline arm)"}` +
         `   hitRadiance ${describe.hitRadiance}  hitList ${describe.pools.hitList}`);
+      // ⭐⭐ §19 5.4d — THE BIN CENSUS, PER CASCADE. A gain measured on the
+      // picture cannot say whether a direction was DARK or ABSENT, and those
+      // want opposite fixes: an orphaned bin kept `L_self + T·sky` because no
+      // parent bin in that direction was ever filled. `cycle` names the
+      // direction schedule the fill ran under, because the whole point of the
+      // census is to compare two of them.
+      if (Array.isArray(m?.cascades)) {
+        console.log(`  merge census (cycle ${describe.cycleK ?? "—"}, jitter ${describe.jitter}): `
+          + m.cascades.map((c, i) => `c${i} orphan ${pct(c.orphanRate ?? 0)}`
+            + (c.orphanLiveRate != null ? `/live ${pct(c.orphanLiveRate)}` : "")).join("  "));
+      }
     }
   } catch (e) { console.log(`  [E]/[J] tallies unavailable: ${e?.message}`); }
   console.log(`  samples ${convSeries.length} · mean E ${f(convSeries[0].mean, 4)} → ${f(finalMean, 4)}`);
