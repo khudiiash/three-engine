@@ -195,6 +195,29 @@ export const MIN_WEIGHT = DEPOSIT_SCALE >> 6;
 /** Resolved payload: rgb + transmittance, with T < 0 meaning UNKNOWN. */
 export const PAYLOAD_WORDS = 4;
 export const PAYLOAD_UNKNOWN = -1;
+/**
+ * ⭐⭐ §19 STAGE 5.4e — THE THIRD STATE OF THE PAYLOAD'S `w`, AND WHY IT LIVES
+ * IN THE SIGN RATHER THAN IN A FIFTH WORD.
+ *
+ * 5.4d lets an unknown bin carry the PARENT's cone so a newborn probe's tile
+ * covers the whole lobe. `srcTiles` renormalizes over the bins it can read, so
+ * that promotion also gave a SEEDED bin the same vote as a MEASURED one — and
+ * the Cornell gate priced it exactly: black 0 → 37 of 21476, gain 0.436× →
+ * 0.368×. The estimate was right and the CONFIDENCE was wrong.
+ *
+ * So `w` carries three states in one float:
+ *
+ *   `w >= 0`                 MEASURED — `T = w`, full weight
+ *   `w == PAYLOAD_UNKNOWN`   UNKNOWN  — no ray, excluded from the quadrature
+ *   `w <= PAYLOAD_SEED_BASE` SEEDED   — `T = −w + PAYLOAD_SEED_BASE`, and the
+ *                                       bake weights it by `SEED_WEIGHT`
+ *
+ * `−2` and not `−1−ε`: `T ∈ [0,1]`, so the seeded encoding occupies `[−3,−2]`
+ * and cannot collide with the unknown sentinel at `−1` for any legal `T`. A
+ * fifth payload word would cost 4 bytes on every bin at every cascade to carry
+ * one bit, and the bins are the memory (`gi-thin-geometry-and-field-memory`).
+ */
+export const PAYLOAD_SEED_BASE = -2;
 
 /**
  * ══ [J]'s HIT LIST — A REGION OF `scratch`, NOT A BUFFER OF ITS OWN ═════════
