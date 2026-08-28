@@ -104,6 +104,7 @@
 import { writeFileSync } from "node:fs";
 import puppeteer from "puppeteer-core";
 import { installTauriShim } from "./lib/tauriShim.mjs";
+import { reportEmitterSeats } from "./lib/gi2EmitterWait.mjs";
 
 const url = (process.argv[2] ?? "http://127.0.0.1:5202/").replace(/\/$/, "");
 const PROJECT = (process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME").replaceAll("\\", "/");
@@ -203,6 +204,13 @@ if (!opened.ok) { console.log(`FATAL scene.open: ${opened.error}`); await browse
   while (Date.now() < dl && !firstLight) await wait(250);
 }
 console.log(`  first light ${firstLight ? "yes" : "NEVER"} — settling ${SETTLE}s`);
+
+// ⭐ `first light` is GEOMETRY-ready, and a .mat's emissiveNode lands with the
+// MATERIAL tail — up to ~27 s later on Bistro. Reading emitters before that
+// reports 0 seats on a scene with four lamps. Waited for explicitly, and AHEAD
+// of the settle, so SETTLE stays a settle rather than an accidental (and far
+// too short) emitter wait.
+await reportEmitterSeats(page);
 await wait(SETTLE * 1000);
 
 const settled = (await call("profile.frameStats", { settleMs: 1100 })).value ?? {};
