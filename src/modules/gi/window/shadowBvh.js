@@ -73,20 +73,23 @@ import * as THREE from "three/webgpu";
 import { attributeArray, float, select, uniform, wgslFn } from "three/tsl";
 
 /**
- * Peak triangles admitted into the shadow BVH, per tier. This is a GPU MEMORY
- * budget and nothing else: the soup is 36 B/tri, so 2 M triangles is 72 MB of
- * `tris` plus ~16 MB of nodes. Bistro's 2.8 M lands under the cap after the
- * soup's own largest-first ordering; a scene that exceeds it loses its SMALL
- * props from exact shadowing and keeps them in the voxel arm's, which is the
- * same failure mode the soup's `triCap` already has and degrades the same way.
+ * ⛔ RETIRED IN §19 STAGE 6.2 — KEPT ONLY SO A STALE IMPORT FAILS LOUDLY
+ * RATHER THAN SILENTLY RE-TRUNCATING THE TREE.
  *
- * ⚠ 2 M * 36 B = 72 MB is under WebGPU's DEFAULT `maxStorageBufferBindingSize`
- * of 128 MiB. Raising this constant past ~3.5 M triangles makes the `tris`
- * binding un-creatable on a default-limits device, which fails at BUFFER
- * CREATION with a validation error rather than degrading — check the limit
- * before touching the number.
+ * 5.5b capped the BVH at 2 M triangles because it MATERIALIZED A COPY of them
+ * at 36 B/tri, and 2.83 M of those is 102 MB. The cap was therefore a LIGHT
+ * LEAK: it kept a PREFIX and dropped 828 k of Bistro's triangles, and not one
+ * of them cast an exact shadow.
+ *
+ * 6.2 deleted the copy — the tree indexes the soup's own already-resident
+ * `instancedArray`, at 4 B/tri — so the memory reason for a cap no
+ * longer exists and the tree is COMPLETE. The only ceiling left is the f32
+ * exact-integer range (16.7 M triangles), which the worker folds in itself.
+ *
+ * `Infinity` rather than a deletion, because a bare number here would
+ * quietly cap the tree again the moment someone re-passed it.
  */
-export const SHADOW_BVH_TRI_CAP = 2_000_000;
+export const SHADOW_BVH_TRI_CAP = Infinity;
 
 /** Triangles per leaf. 8 measured better than 4 (fewer nodes) and than 16. */
 export const SHADOW_BVH_LEAF = 8;
@@ -128,6 +131,7 @@ const bvhAnyHitFn = wgslFn(/* wgsl */ `
 		rd: vec3f,
 		maxT: f32,
 		nodes: ptr<storage, array<f32>, read>,
+		triIdx: ptr<storage, array<u32>, read>,
 		tris: ptr<storage, array<f32>, read>
 	) -> f32 {
 
@@ -214,7 +218,12 @@ const bvhAnyHitFn = wgslFn(/* wgsl */ `
 				let n = u32( count );
 				for ( var i: u32 = 0u; i < n; i = i + 1u ) {
 
-					let o = ( first + i ) * 9u;
+					// ⭐ §19 6.2 — THE INDIRECTION. tris is the SOUP'S OWN
+					// buffer, in the soup's order, so a leaf's contiguous run
+					// addresses triIdx and THAT addresses the triangle. One
+					// extra u32 load per candidate buys back 32 B/tri of VRAM —
+					// and with it the 828 k triangles the 5.5b cap silently dropped.
+					let o = triIdx[ first + i ] * 9u;
 					let a = vec3f( tris[ o ], tris[ o + 1u ], tris[ o + 2u ] );
 					let b = vec3f( tris[ o + 3u ], tris[ o + 4u ], tris[ o + 5u ] );
 					let c = vec3f( tris[ o + 6u ], tris[ o + 7u ], tris[ o + 8u ] );
@@ -298,6 +307,9 @@ export function createShadowBvhSlot() {
   nodes[4] = -1; nodes[5] = -1; nodes[6] = -1; // max < min: unenterable
   nodes[3] = 0; nodes[7] = 0;                  // a leaf holding nothing
   const tris = new Float32Array(9);
+  // A single index, pointing at that placeholder triangle. Never traversed: the
+  // placeholder node's box is unenterable, so the loop below it never runs.
+  const triIdx = new Uint32Array(1);
 
   // `.toReadOnly()` so the emitted `var<storage, ...>` access mode matches the
   // `read` annotation on the WGSL ptr parameters — a mismatch is a pipeline
@@ -308,6 +320,17 @@ export function createShadowBvhSlot() {
   // 12-byte-stride arrays off by a growing offset. Same trap `bvhScene.js`
   // documents for its own position buffer.
   const nodesBuffer = attributeArray(nodes, "float").toReadOnly();
+  const triIdxBuffer = attributeArray(triIdx, "uint").toReadOnly();
+  // ⭐⭐⭐ §19 6.2 — THIS ONE IS BORROWED, NOT OWNED. After fill it points at
+  // the SOUP'S OWN `instancedArray` — the identical world-space triangle buffer
+  // the voxelizer and `windowDynamic` already keep resident for the life of the
+  // window. Binding it costs ZERO new VRAM; materializing a leaf-ordered copy of
+  // it cost 102 MB on Bistro and forced the cap that was leaking light.
+  //
+  // Sharing one `StorageBufferAttribute` across two nodes is safe because three
+  // keys the GPUBuffer off the attribute, so both nodes resolve to one buffer.
+  // This node is `.toReadOnly()` and the soup's is not; the ACCESS MODE lives on
+  // the node, not the buffer, so the two declarations coexist.
   const trisBuffer = attributeArray(tris, "float").toReadOnly();
 
   /**
@@ -324,7 +347,7 @@ export function createShadowBvhSlot() {
    * `1.0` when ANYTHING lies in `(origin, origin + dir*maxT)`, else `0.0`.
    * Raw: the caller owns the origin offset.
    */
-  const anyHit = (origin, dir, maxT) => bvhAnyHitFn(origin, dir, maxT, nodesBuffer, trisBuffer);
+  const anyHit = (origin, dir, maxT) => bvhAnyHitFn(origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer);
 
   /**
    * ⭐⭐ THE SELF-HIT EPSILON, AND WHY IT IS ALONG THE NORMAL.
@@ -371,17 +394,29 @@ export function createShadowBvhSlot() {
      * the same mechanism `gi2TextureGeneration` exists for on the texture side,
      * where the gather measured 212 destroyed-texture errors without it.
      */
-    fill(bvh) {
+    fill(bvh, soupTris) {
       if (!bvh || !(bvh.nodeCount > 0) || !(bvh.triCount > 0)) return false;
+      // ⭐ 6.2 — WITHOUT THE SOUP THERE ARE NO TRIANGLES TO TEST. The tree is
+      // now nothing but indices into the caller's buffer, so filling the nodes
+      // while leaving `tris` on the 1-triangle placeholder would traverse a real
+      // tree into garbage and report shadows that are not there. Refuse instead:
+      // `readyU` stays 0 and the voxel arm keeps serving a picture that is merely
+      // soft rather than wrong.
+      if (!soupTris) return false;
       const nodeAttr = new THREE.StorageBufferAttribute(bvh.nodes, 1);
-      const triAttr = new THREE.StorageBufferAttribute(bvh.tris, 1);
+      const idxAttr = new THREE.StorageBufferAttribute(bvh.triIdx, 1);
       nodeAttr.version++;
-      triAttr.version++;
+      idxAttr.version++;
       nodesBuffer.value = nodeAttr;
-      trisBuffer.value = triAttr;
+      triIdxBuffer.value = idxAttr;
+      trisBuffer.value = soupTris;
       state.nodeCount = bvh.nodeCount;
       state.triCount = bvh.triCount;
-      state.bytes = bvh.nodes.byteLength + bvh.tris.byteLength;
+      // The soup is NOT counted: it was already resident before this stage
+      // existed and is not freed if the arm turns off. Counting it here would
+      // book 102 MB of someone else's memory against the BVH and make the
+      // stage look like a regression it is the opposite of.
+      state.bytes = bvh.nodes.byteLength + bvh.triIdx.byteLength;
       state.stats = bvh.stats ?? null;
       readyU.value = 1;
       return true;

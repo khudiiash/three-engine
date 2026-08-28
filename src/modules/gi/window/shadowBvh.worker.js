@@ -31,12 +31,13 @@
 // integer above it. Both counts are asserted against `F32_EXACT_MAX` below
 // rather than left to produce a BVH that silently traverses the wrong subtree.
 //
-// There is NO separate triangle-index buffer. The builder permutes a Uint32
-// index array while it splits and then materializes `tris` ONCE in leaf order,
-// so a leaf is a contiguous run `[first, first+count)` of the output array and
-// the GPU's inner loop is a straight sequential read. That costs one 36 B/tri
-// copy at build time and saves an indirection on every single leaf triangle for
-// the life of the BVH.
+// THE TRIANGLES ARE NOT COPIED (§19 Stage 6.2). The builder permutes a Uint32
+// index array while it splits, and that permutation IS the output: a leaf's
+// contiguous run `[first, first+count)` indexes `triIdx`, and each entry indexes
+// the SOUP'S OWN `instancedArray` — the same world-space buffer the voxelizer
+// and `windowDynamic` already keep resident. 4 B/tri instead of 36, which is why
+// the whole scene fits and there is no cap. See section 4 for the full argument
+// and the one indirection it costs the GPU.
 //
 // ══ NODE-TESTABLE BY CONSTRUCTION ════════════════════════════════════════════
 //
@@ -76,6 +77,33 @@ const F32_EXACT_MAX = 16777216;
  *  the builder. Offsets: 0..2 min, 3..5 max, 6..8 centroid. */
 const TB_STRIDE = 9;
 const TB_CENT = 6;
+
+/**
+ * ⭐⭐⭐ NODE BOUNDS ARE STORED DILATED BY THIS, AND IT IS A CORRECTNESS
+ * CONSTANT — NOT SLOP.
+ *
+ * A slab test on a box whose face the ray lies EXACTLY IN degenerates. Take a
+ * ray with dy = 0 starting at y = 6 against a node with maxY = 6: the shader's
+ * finite pseudo-infinity gives invDir.y = 1e20, so t1y = (6 - 6) * 1e20 = 0 and
+ * tmax = min(..., 0) = 0, while entry is the real x/z entry distance. `tmax <
+ * entry` is then TRUE and THE WHOLE SUBTREE IS REJECTED — including a triangle
+ * the ray genuinely intersects along its edge.
+ *
+ * That is a MISSED OCCLUDER, which on a shadow ray means a LIGHT LEAK, and it
+ * fires precisely where it is most visible: axis-aligned rays against
+ * axis-aligned architecture — a corridor, a doorway, a Cornell box, Bistro.
+ * `scripts/run-gi2-shadow-bvh-check.mjs` caught 15 of them in 600 axis-aligned
+ * rays and ZERO in 3000 random ones, which is exactly why that script does not
+ * trust a random battery.
+ *
+ * 0.1 mm is far below the 5 cm wall the corridor probe measures and below the
+ * 2 mm self-hit normal offset, so it cannot close a real gap or create a
+ * self-shadow; a BVH box is allowed to be conservative, and the triangle test
+ * behind it is what decides. The SAH deliberately sweeps the UNPADDED bounds —
+ * padding is a traversal property, and feeding it back into the cost function
+ * would bias splits for no benefit.
+ */
+const NODE_BOUNDS_EPS = 1e-4;
 
 const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Number(process.hrtime.bigint() / 1000n) / 1000);
 
@@ -152,6 +180,11 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
   const capReq = triCap == null || !Number.isFinite(triCap) ? Infinity : Math.max(0, Math.floor(triCap));
   // The format's own ceiling is folded into the cap rather than thrown on, so a
   // 20 M-triangle scene produces a working 16 M-triangle BVH instead of an error.
+  // ⚠ SINCE 6.2 THIS IS THE ONLY CEILING THAT NORMALLY APPLIES: callers stopped
+  // passing a `triCap`, because the memory reason for one went away with the
+  // triangle copy. `truncated` should now read false on every real scene, and if
+  // it ever reads true the scene has more than 16.7 M triangles and the f32 node
+  // indices — not the budget — are what ran out.
   const cap = Math.min(capReq, F32_EXACT_MAX - 1);
   const n = Math.min(inCount, cap);
   const truncated = n < inCount;
@@ -164,12 +197,12 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
     nodes[0] = 1e30; nodes[1] = 1e30; nodes[2] = 1e30;
     nodes[4] = -1e30; nodes[5] = -1e30; nodes[6] = -1e30;
     nodes[3] = 0; nodes[7] = 0;
-    const emptyTris = new Float32Array(0);
+    const emptyIdx = new Uint32Array(0);
     return {
       nodeCount: 1,
       triCount: 0,
       nodes,
-      tris: emptyTris,
+      triIdx: emptyIdx,
       bytes: nodes.byteLength,
       stats: {
         buildMs: nowMs() - tStart, maxDepth: 0, leafCount: 1, meanLeafTris: 0,
@@ -321,8 +354,15 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
       if (cz < cMinZ) cMinZ = cz; if (cz > cMaxZ) cMaxZ = cz;
     }
     const no = self * 8;
-    nodes[no] = bMinX; nodes[no + 1] = bMinY; nodes[no + 2] = bMinZ;
-    nodes[no + 4] = bMaxX; nodes[no + 5] = bMaxY; nodes[no + 6] = bMaxZ;
+    // Dilated on write, tight in `bMin*/bMax*` for the SAH below. See
+    // NODE_BOUNDS_EPS: a ray lying in a box's face plane is rejected by an exact
+    // slab test, and a rejected subtree on a shadow ray is a light leak.
+    nodes[no] = bMinX - NODE_BOUNDS_EPS;
+    nodes[no + 1] = bMinY - NODE_BOUNDS_EPS;
+    nodes[no + 2] = bMinZ - NODE_BOUNDS_EPS;
+    nodes[no + 4] = bMaxX + NODE_BOUNDS_EPS;
+    nodes[no + 5] = bMaxY + NODE_BOUNDS_EPS;
+    nodes[no + 6] = bMaxZ + NODE_BOUNDS_EPS;
 
     if (count <= leafSize) {
       nodes[no + 3] = start; nodes[no + 7] = count;
@@ -484,17 +524,37 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
   if (nodeCount > F32_EXACT_MAX) throw new Error(`[shadowBvh] node count ${nodeCount} exceeds the f32 exact-integer range`);
   const tBuild = nowMs();
 
-  // ── 4. MATERIALIZE ─────────────────────────────────────────────────────────
+  // ── 4. EMIT THE PERMUTATION ────────────────────────────────────────────────
   //
-  // One pass, gathering by the permutation. After this a leaf is a contiguous
-  // run and the index array is dead — it never reaches the GPU.
-  const outTris = new Float32Array(n * 9);
-  for (let i = 0; i < n; i++) {
-    const src = perm[i] * 9, dst = i * 9;
-    outTris[dst] = tris[src]; outTris[dst + 1] = tris[src + 1]; outTris[dst + 2] = tris[src + 2];
-    outTris[dst + 3] = tris[src + 3]; outTris[dst + 4] = tris[src + 4]; outTris[dst + 5] = tris[src + 5];
-    outTris[dst + 6] = tris[src + 6]; outTris[dst + 7] = tris[src + 7]; outTris[dst + 8] = tris[src + 8];
-  }
+  // ⭐⭐⭐ §19 STAGE 6.2 — THE TRIANGLES ARE ALREADY ON THE GPU, SO WE SHIP AN
+  // INDEX AND NOT A COPY. This reverses the "there is NO separate triangle-index
+  // buffer" decision at the top of this file, and it reverses it on a fact that
+  // decision did not have: `gi2System.uploadSoup` does
+  // `instancedArray(g.tris, "float")` and keeps it resident for the life of the
+  // window — it is listed in `storageAttributes` and `windowDynamic` reads it.
+  // The soup's 9-float-per-triangle WORLD-SPACE array IS a bound storage buffer
+  // already.
+  //
+  // So materializing a leaf-ordered COPY of it was 36 B/tri of pure duplication:
+  // 102 MB on Bistro's 2.83 M triangles. THAT is what forced the 2 M-triangle
+  // cap, and the cap was a LIGHT LEAK — 828 k triangles casting no exact shadow.
+  //
+  // A Uint32 permutation is 4 B/tri, NINE TIMES smaller, and it is the array the
+  // builder was already maintaining. The complete tree therefore costs LESS than
+  // the truncated copy did, the cap disappears instead of being raised, and the
+  // 102 MB scattered gather this section used to be (`reorderMs`) disappears
+  // with it.
+  //
+  // THE PRICE, said out loud: the GPU's leaf loop gains one indirection
+  // (`triIdx[first+i]` ahead of the nine float reads) and its triangle reads go
+  // from sequential to scattered. That is the standard indexed-BVH layout —
+  // three-mesh-bvh, Embree and this repo's own retired `bvhScene.js` all pay it
+  // — and an ANY-HIT ray's cost is bounded by its first blocker, not by the tree.
+  //
+  // `perm` is ALREADY "soup triangle indices in leaf order", so there is no pass
+  // here at all: a leaf's `[first, first+count)` run now indexes THIS array, and
+  // each entry indexes the soup.
+  const outIdx = perm.length === n ? perm : perm.subarray(0, n).slice();
 
   // A view of the exact length over the (over-)allocated pool, copied down only
   // when the slack is worth a copy — same rule as the soup: transferring 1 MB of
@@ -507,8 +567,8 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
     nodeCount,
     triCount: n,
     nodes: nodesOut,
-    tris: outTris,
-    bytes: nodesOut.byteLength + outTris.byteLength,
+    triIdx: outIdx,
+    bytes: nodesOut.byteLength + outIdx.byteLength,
     // ── receipts ─────────────────────────────────────────────────────────────
     stats: {
       buildMs: tEnd - tStart,
@@ -533,7 +593,7 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
 
 /** Every distinct ArrayBuffer a built BVH owns — the postMessage transfer list. */
 export function shadowBvhTransferables(bvh) {
-  return [...new Set([bvh.nodes.buffer, bvh.tris.buffer])];
+  return [...new Set([bvh.nodes.buffer, bvh.triIdx.buffer])];
 }
 
 // ── WORKER PLUMBING ──────────────────────────────────────────────────────────

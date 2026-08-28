@@ -794,21 +794,25 @@ export function rc5PathEnabled(runtime = globalThis) {
  * traced. `__gi2Rc5BvhShadowMax` moves the line for a measurement;
  * `__gi2Rc5BvhShadow = 1` does NOT override it.
  *
- * ⭐⭐ AND 250 k IS A CORRECTNESS NUMBER BEFORE IT IS A PERFORMANCE ONE. The
- * builder's `triCap` keeps a PREFIX of the soup, so a scene over it loses its
- * tail of small props from the BVH — and a dropped triangle on the exact arm
- * does not fall back to the voxel arm, it simply stops casting a shadow. The
- * measurement on the user's Bistro: 2 827 888 soup triangles, capped to
- * 2 000 000, so **827 888 occluders silently stopped shadowing** while the
- * tree cost 90.6 MB of VRAM, 3.3 s of worker build and pushed the heap to
- * 2107 MB. A budget that admits a scene it must then truncate is a budget that
- * ships a light leak; 250 k is comfortably under every cap in the chain, so an
- * admitted scene's tree is always COMPLETE. It is ~11 MB and ~0.5 s to build.
+ * ⭐⭐ 250 k WAS A CORRECTNESS NUMBER, AND §19 STAGE 6.2 RETIRED THE REASON.
+ *
+ * The 5.5b builder MATERIALIZED the triangles at 36 B/tri, so it needed a
+ * `triCap`, and that cap kept a PREFIX: a scene over it lost the tail of its
+ * small props, and a dropped triangle does not fall back to the voxel arm — it
+ * simply stops casting a shadow. Measured on the user's Bistro: 2 827 888 soup
+ * triangles capped to 2 000 000, so **827 888 occluders silently stopped
+ * shadowing**, for 90.6 MB of VRAM and 3.3 s of build. 250 k sat under every cap
+ * in the chain purely so an ADMITTED scene's tree would be complete.
+ *
+ * 6.2 ships a 4 B/tri index into the soup's OWN resident buffer instead of a
+ * copy, so the tree is complete at ANY size and no cap exists to leak through.
+ * What is left is a pure PERFORMANCE gate, and it is set from the measurement
+ * below rather than from a fear of truncation.
  *
  * ⚠ The threshold is on the SOUP's triangle count, which is what the BVH is
  * built from — not on the scene's, which the tier cap has already cut.
  */
-export const RC5_BVH_SHADOW_MAX_TRIS = 250_000;
+export const RC5_BVH_SHADOW_MAX_TRIS = 4_000_000;
 
 export function rc5BvhShadowMaxTris(runtime = globalThis) {
   const hatch = Number(runtime?.__gi2Rc5BvhShadowMax);
