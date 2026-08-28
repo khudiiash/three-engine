@@ -1273,6 +1273,169 @@ if (ARMS.length) {
   result.arms = armRows;
 }
 
+
+// ══════════════════════ §19 5.4d — WHAT A KNOWN BIN CARRIES (`FACETRUTH=1`) ══
+//
+// ⭐⭐⭐ THE SINGLE-BOUNCE ARM PUT THE LOSS IN `J`, AND `J` IS ONE NUMBER: the
+// face cache's DIRECT word at the hit, `ρ/π·(Esun + Enee)`. Everything else in
+// the one-bounce field is transport of that number. So this block reads the
+// SHIPPING estimator at the voxel faces the camera can see (`shadeTerms`, via
+// `gi2FaceTermProbe` — not a transcription of it) and scores each face against
+// the reference's OWN next-event estimator at the same point:
+//
+//     truth(p, n) = neeE(p, n)   ← `makeSceneTracer(scene, 0).irradiance`: the
+//                                  emissive triangles, area-sampled and
+//                                  occlusion-tested against the real mesh.
+//
+// `Enee` and `truth` are the same physical quantity — irradiance at (p, n) from
+// the admitted emitters — computed by two independent programs, so their ratio
+// is the direct term's own gain with no transport, no probes and no cascades in
+// it. Grouped by DISTANCE TO THE LAMP, because the ladder the gate measures is
+// ordered by how far a surface's light has to travel.
+if (process.env.FACETRUTH) {
+  console.log("");
+  console.log("  ── §19 5.4d — THE FACE CACHE'S DIRECT TERM vs THE REFERENCE'S NEE ───");
+  const FJ = await page.evaluate(async ({ eye, aim }) => {
+    try {
+      const eng = globalThis.__giEngineForProbe;
+      const gi2 = globalThis.__gi2();
+      if (!gi2?.gather?.internals) return JSON.stringify({ error: "no gather internals" });
+      const ws = await import("/src/modules/gi/window/windowStore.js");
+      const { createGi2RayShooter } = await import("/scripts/lib/gi2RayProbe.js");
+      const { createGi2FaceTermProbe } = await import("/scripts/lib/gi2FaceTermProbe.js");
+      const shoot = createGi2RayShooter(gi2, eng.renderer);
+      const terms = createGi2FaceTermProbe(gi2, eng.renderer);
+      const v0 = gi2.win.voxel0;
+      const nz = (v) => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+      const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+      const fwd = nz([aim[0] - eye[0], aim[1] - eye[1], aim[2] - eye[2]]);
+      const right = nz(cross(fwd, [0, 1, 0]));
+      const up = nz(cross(right, fwd));
+      // A WIDE fan — the population is every surface in the box, not one wall:
+      // the whole point is to compare faces near the lamp against faces far from
+      // it, and a fan aimed at one brick cannot see both.
+      const rays = [];
+      const dirs = [];
+      for (let i = -12; i <= 12; i++) {
+        for (let j = -9; j <= 9; j++) {
+          const d = nz([fwd[0] + right[0] * i * 0.055 + up[0] * j * 0.055,
+            fwd[1] + right[1] * i * 0.055 + up[1] * j * 0.055,
+            fwd[2] + right[2] * i * 0.055 + up[2] * j * 0.055]);
+          dirs.push(d);
+          rays.push({ o: eye, d, tMax: 40 });
+        }
+      }
+      const hits = [];
+      for (let b = 0; b < rays.length; b += 63) hits.push(...await shoot(rays.slice(b, b + 63)));
+      const winW = new Uint32Array(await eng.renderer.getArrayBufferAsync(gi2.win.attribute));
+      const occAt = (x, y, z) => {
+        const i = (x & 63) | ((y & 63) << 6) | ((z & 63) << 12);
+        return (winW[ws.OCC_OFF + (i >> 5)] >>> (i & 31)) & 1;
+      };
+      const faceByte = (x, y, z) => {
+        const i = (x & 63) | ((y & 63) << 6) | ((z & 63) << 12);
+        return (winW[ws.FACE_OFF + (i >> 2)] >>> ((i & 3) * 8)) & 255;
+      };
+      const NRM = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+      // `gatherProbes.dominantFace`'s rule, transcribed — the VOXEL's dominant
+      // axis, not the ray's entry face (§19 3.9). Reading the entry face files a
+      // grazing hit under a side no ray ever fills and hands back a zero.
+      const domFace = (wc, hint) => {
+        const code = (faceByte(wc[0], wc[1], wc[2]) >>> 6) & 3;
+        if (!code) return -1;
+        const ax = code - 1;
+        const e = [0, 0, 0]; e[ax] = 1;
+        const occP = occAt(wc[0] + e[0], wc[1] + e[1], wc[2] + e[2]);
+        const occN = occAt(wc[0] - e[0], wc[1] - e[1], wc[2] - e[2]);
+        if (!occP && occN) return 2 * ax;
+        if (!occN && occP) return 2 * ax + 1;
+        return 2 * ax + (hint[ax] >= 0 ? 0 : 1);
+      };
+      const seen = new Map();
+      for (let k = 0; k < hits.length; k++) {
+        const h = hits[k];
+        // ⛔ 5.4d FIRST CUT RETURNED AN EMPTY POPULATION AND PRINTED A TABLE OF
+        // ZEROS. `h.level !== 0` is Bistro's filter, where the camera stands
+        // inside the level-0 window; on Cornel the eye is 6.8 m out and EVERY
+        // hit comes back on a coarser level, so the loop rejected all 475 of
+        // them and the receipt said "0 faces" as if that were a measurement.
+        // [[probe-blind-statistics]] — the count is printed above the table for
+        // exactly this reason. Accepting a coarse hit needs the level's own
+        // voxel size AND its own window words (`level * LEVEL_WORDS` into the
+        // attribute buffer); until that is written this block only measures a
+        // scene the camera stands inside.
+        if (!h || !h.hit || h.level !== 0) continue;
+        const d = dirs[k];
+        const t = h.t + 0.02;
+        const hp = [eye[0] + d[0] * t, eye[1] + d[1] * t, eye[2] + d[2] * t];
+        const cell = hp.map((c) => Math.floor(c / v0));
+        const vi = (cell[0] & 63) | ((cell[1] & 63) << 6) | ((cell[2] & 63) << 12);
+        if (vi !== h.voxelIdx) continue;
+        const face = domFace(cell, [-d[0], -d[1], -d[2]]);
+        if (face < 0) continue;
+        const key = `${cell}|${face}`;
+        if (seen.has(key)) continue;
+        const n = NRM[face];
+        seen.set(key, {
+          p: [(cell[0] + 0.5) * v0 + n[0] * v0 * 0.5,
+            (cell[1] + 0.5) * v0 + n[1] * v0 * 0.5,
+            (cell[2] + 0.5) * v0 + n[2] * v0 * 0.5],
+          n, level: 0, voxelIdx: vi, face,
+        });
+      }
+      const faces = [...seen.values()].slice(0, 600);
+      const res = await terms(faces);
+      return JSON.stringify({ faces, out: res.faces ?? res, diag: res.diag ?? null });
+    } catch (e) { return JSON.stringify({ error: `${e && e.message}` }); }
+  }, { eye, aim });
+  const F = JSON.parse(FJ ?? '{"error":"nothing"}');
+  if (F.error) console.log(`  SKIPPED — ${F.error}`);
+  else {
+    // ⚠ THE TRUTH IS THE REFERENCE'S OWN NEE, AT ZERO BOUNCES. `Lo` returns
+    // immediately at depth 0 when `bounces` is 0, so `irradiance` is exactly
+    // `neeE(p, n)`. Nothing about the cascades enters it.
+    const direct = makeSceneTracer(
+      { tris: R.scene.tri, triMat: R.scene.triMat, mats: R.scene.mats, sky: [0, 0, 0] }, 0,
+    );
+    const lamp = (R.slots.find((s) => s.radius > 1e-5) || {}).center || [0, 0, 0];
+    const rows = [];
+    for (let i = 0; i < F.faces.length; i++) {
+      const fc = F.faces[i];
+      const o = F.out[i];
+      if (!o) continue;
+      const nee = o.Enee || o.enee || null;
+      if (!nee) continue;
+      const truth = direct.irradiance(fc.p, fc.n, 1, 12345 + i, 256);
+      const d = Math.hypot(fc.p[0] - lamp[0], fc.p[1] - lamp[1], fc.p[2] - lamp[2]);
+      rows.push({
+        d, gpu: lum(nee), ref: lum(truth),
+        stored: lum(o.stored || [0, 0, 0]),
+      });
+    }
+    const lit = rows.filter((r) => r.ref > 1e-4);
+    console.log(`  ${lit.length} faces of ${rows.length} with a lit reference   `
+      + `(lamp at [${lamp.map((v) => v.toFixed(2))}])`);
+    const bands = [[0, 1.5], [1.5, 2.5], [2.5, 3.5], [3.5, 5], [5, 99]];
+    console.log(`  ${"distance to lamp".padEnd(20)}${"faces".padStart(7)}${"Enee(gpu)".padStart(12)}`
+      + `${"E_direct(ref)".padStart(15)}${"ratio".padStart(9)}${"cached word".padStart(13)}`);
+    for (const [lo, hi] of bands) {
+      const b = lit.filter((r) => r.d >= lo && r.d < hi);
+      if (!b.length) continue;
+      const mg = b.reduce((a, r) => a + r.gpu, 0) / b.length;
+      const mr = b.reduce((a, r) => a + r.ref, 0) / b.length;
+      const mc = b.reduce((a, r) => a + r.stored, 0) / b.length;
+      console.log(`  ${`${lo}-${hi} m`.padEnd(20)}${String(b.length).padStart(7)}`
+        + `${f(mg, 4).padStart(12)}${f(mr, 4).padStart(15)}`
+        + `${f(mg / Math.max(1e-9, mr), 3).padStart(9)}${f(mc, 4).padStart(13)}`);
+    }
+    const all = lit.reduce((a, r) => a + r.gpu, 0) / Math.max(1, lit.length);
+    const allr = lit.reduce((a, r) => a + r.ref, 0) / Math.max(1, lit.length);
+    console.log(`  ${"ALL".padEnd(20)}${String(lit.length).padStart(7)}${f(all, 4).padStart(12)}`
+      + `${f(allr, 4).padStart(15)}${f(all / Math.max(1e-9, allr), 3).padStart(9)}`);
+    result.faceTruth = { rows: rows.length, lit: lit.length, ratio: all / Math.max(1e-9, allr) };
+  }
+}
+
 if (OUT) { writeFileSync(OUT, JSON.stringify(result, null, 1)); console.log(`  wrote ${OUT}`); }
 if (REF && existsSync(REF)) {
   const before = JSON.parse(readFileSync(REF, "utf8"));
