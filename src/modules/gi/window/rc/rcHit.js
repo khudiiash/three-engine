@@ -88,7 +88,7 @@
 // `T` is exactly 1 in a scene with no cables, railings or foliage in it, where
 // this whole paragraph is a provable no-op.
 import {
-  If, bitAnd, dot, float, mix, select, shiftLeft, shiftRight, sqrt, uint, vec3,
+  If, bitAnd, bitXor, dot, float, mix, select, shiftLeft, shiftRight, sqrt, uint, vec3,
 } from "three/tsl";
 import { normalOfFace } from "../radianceCache.js";
 
@@ -130,13 +130,30 @@ export const unpackAddr = (a) => ({
  *   test compares a face's address against.
  * @param {object} [o.ercPeriodMask]  a uint node, `period − 1` (a power-of-two
  *   mask). Absent ⇒ every hit face refreshes every frame.
- * @param {boolean} [o.compact]  drop `P`/`N`/`Le` from the record (§19 5.3b).
+ * @param {boolean} [o.compact]  drop `P`/`N` from the record (§19 5.3b) — and
+ *   `Le` too unless the gather published `hitEmissionRay` (§19 5.3c).
  */
 export function createRcHitShading({
   cache, kit, counters = null, gatherAt = null,
   ercAlpha = 1, ercPhase = null, ercPeriodMask = null, compact = true,
 }) {
-  const { u, dominantFace, faceSamplePoint, shadeHit, hitPalette } = kit;
+  const { u, dominantFace, faceSamplePoint, shadeHit, hitPalette, hitEmissionRay } = kit;
+  /**
+   * ⭐⭐⭐ §19 STAGE 5.3c — THE EMISSION IS A PROPERTY OF THE RAY NOW, SO IT
+   * TRAVELS IN THE RECORD.
+   *
+   * `hitEmissionRay` is `L_e · cov · |d·n_dom| / (|dx|+|dy|+|dz|)` — a
+   * DIRECTIONAL quantity (see `gatherProbes`' `RC5_EMIT_PROJ`). The face cache
+   * holds ONE radiance for all directions, so a directional term cannot be
+   * stored there; it is computed in [E], where `dir` is known, written into
+   * `SEC_LE` and added in [J]. The six `P`/`N` words 5.3b dropped stay dropped
+   * — those really are functions of the address; this one is not.
+   *
+   * Absent (the isotropic arm, the world path, any pre-5.3c build) not one node
+   * of it is constructed and the record stays nine words lighter.
+   */
+  const rayEmission = typeof hitEmissionRay === "function" ? hitEmissionRay : null;
+  const writesLe = !compact || !!rayEmission;
   if (typeof hitPalette !== "function") {
     throw new Error(
       "createRcHitShading: the gather must publish `hitPalette` — [J] multiplies the cascade " +
@@ -179,7 +196,7 @@ export function createRcHitShading({
     const P = compact ? null : vec3(0).toVar();
     const N = compact ? null : vec3(0).toVar();
     const rho = vec3(0).toVar();
-    const Le = compact ? null : vec3(0).toVar();
+    const Le = writesLe ? vec3(0).toVar() : null;
     const addr = uint(0).toVar();
     // §AG's coverage, carried through ρ — see the header. Held as its own word
     // too, because [J]'s direct half needs it and ρ is already spoken for.
@@ -192,8 +209,13 @@ export function createRcHitShading({
       // `wantEmissive` false on the compact build: the emission the record used
       // to carry costs a coverage read and six occupancy bits under §19 5.3b's
       // energy conservation, once per RAY, for a word nobody reads.
-      const pal = hitPalette(levelF, voxF, !compact);
+      const pal = hitPalette(levelF, voxF, !compact && !rayEmission);
       rho.assign(pal.rho.mul(T));
+      // §19 5.3c — the ray's own share of this voxel's authored power. Inside
+      // the hit branch, so a miss pays nothing; `dir` is the ray's direction and
+      // `faceF` the voxel's DOMINANT face, which is the pair the projected-area
+      // law is written in.
+      if (rayEmission) Le.assign(rayEmission(levelF, voxF, faceF, dir));
       if (!compact) {
         const hn = normalOfFace(faceF).toVar();
         N.assign(hn);
@@ -201,7 +223,7 @@ export function createRcHitShading({
         // voxel's face plane, so every ray reaching this face shades the same
         // point and re-shading is idempotent.
         P.assign(faceSamplePoint(levelF, voxF, hn));
-        Le.assign(pal.Le);
+        if (!rayEmission) Le.assign(pal.Le);
       }
       addr.assign(packAddr(zi, faceF));
     });
@@ -301,8 +323,30 @@ export function createRcHitShading({
       // rotates deterministically over the whole cache. A never-gathered face
       // jumps the queue: "no data" must not be read as "no light" for a whole
       // period, which is the same rule the direct word's zero sentinel follows.
+      // ⭐⭐⭐ §19 STAGE 5.3c — THE PHASE IS A HASH OF THE ADDRESS, AND THAT IS
+      // A CORRECTNESS FIX RATHER THAN A BETTER SPREAD.
+      //
+      // `packAddr` puts the FACE in bits 0-2 and the level in 3-5, so 5.3b's
+      // `addr & (period−1)` was the FACE INDEX MOD 4 and nothing else. The set
+      // that refreshed on a frame was therefore not "one quarter of the cache"
+      // — it was ONE FACE ORIENTATION OF THE WHOLE SCENE: every +Y face in the
+      // world (the entire floor) on one frame, every −Y face (the entire
+      // ceiling) on the next, and faces 4/5 ALIASED onto phases 0/1, refreshing
+      // twice as often as 2/3. A whole surface stepping as one rigid block,
+      // four frames apart, inside a bounce loop whose gain on the user's ρ = 1.0
+      // walls is ≈ 1: a coloured Gauss-Seidel sweep with an aliased colouring,
+      // and 5.3b's at-rest Δ regression (p90 1.47 % → 3.9-9.6 %) is its
+      // amplitude.
+      //
+      // A multiplicative hash makes the phase a uniform 1/period sample of the
+      // ADDRESS SPACE, so neighbouring voxels and the six faces of one voxel
+      // land in different phases: every surface has ~1/period of its faces
+      // refreshed on every frame, the loop sees a spatial average instead of a
+      // coherent step, and every address refreshes at exactly the same rate.
+      const mixed = a.mul(uint(2654435761)).toVar();
+      const phaseOfAddr = bitXor(mixed, shiftRight(mixed, uint(16))).toVar();
       const due = ercPeriodMask
-        ? fresh.or(bitAnd(a, ercPeriodMask).equal(bitAnd(ercPhase, ercPeriodMask)))
+        ? fresh.or(bitAnd(phaseOfAddr, ercPeriodMask).equal(bitAnd(ercPhase, ercPeriodMask)))
         : fresh;
       If(due, () => {
         const g = vec3(gatherAt(hp, hn).irradiance).toVar();
@@ -313,10 +357,21 @@ export function createRcHitShading({
       // half is attenuated exactly once and by the same number as the other.
       Lb = rho.mul(E).mul(1 / Math.PI).toVar();
     }
+    // §19 5.3c — the emission the RECORD carries, added to the direct word the
+    // CACHE carries. `L.mul(T)` below attenuates both by this ray's coverage,
+    // which is the same `T` `rho` already carries — one number, both halves.
+    if (rayEmission) L.addAssign(vec3(Le));
     return { L: L.mul(T), Lb };
   };
 
-  return { attribute, shade };
+  /**
+   * §19 5.3c — which record words this build actually writes, published so the
+   * deposit's `hitFields` and [J]'s reads cannot disagree about the layout. A
+   * mismatch is not an error anywhere: it is `uintBitsToFloat` of a stale word.
+   */
+  const hitFields = { P: !compact, N: !compact, Le: writesLe };
+
+  return { attribute, shade, hitFields };
 }
 
 /**

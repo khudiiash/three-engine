@@ -21,6 +21,11 @@ let failed = 0;
 const results = {};
 for (const tier of tiers) {
   const page = await browser.newPage();
+  // §19 5.3c — the build hatches, so a cost A/B (e.g. `__gi2RcCadence`) is two arms
+  // of ONE session instead of two sessions whose GPU timestamps swing 2×.
+  await page.evaluateOnNewDocument((flags) => {
+    for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
+  }, JSON.parse(process.env.FLAGS ?? "{}"));
   const logs = [];
   page.on("console", (m) => logs.push(m.text()));
   page.on("pageerror", (e) => logs.push(`PAGEERROR ${e.stack ?? e.message}`));

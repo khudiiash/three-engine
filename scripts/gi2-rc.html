@@ -325,7 +325,18 @@
             rc.uniforms.rcKeep.value = f === 0 ? 0 : 1 - rd.alpha;
             gather.beginFrame(f, camera.position);
             gu.camPos.value.copy(camera.position);
-            rc.beginFrame(f);
+            // ⭐⭐ §19 5.3c — `f + 1`, SO THE CADENCE'S CYCLE CLOSES ON THE LAST
+            // FRAME. The cadence traces c0 every frame, c1 every 2, c2 every 4,
+            // c3 every 8 (`rcSystem`'s `cascadeDue`), so a single frame's bins
+            // are one PHASE of the schedule, not the schedule. Every read below
+            // — the leak sum, the positive control, the per-direction dump — is
+            // taken after the loop, and with `f` the last frame was index 7,
+            // due c0 only, reach 0.8 m: an open world's rays all miss inside it
+            // and the control reads Σ 0, i.e. THE INSTRUMENT MEASURING ITS OWN
+            // BLINDNESS, which is exactly what the control exists to catch.
+            // `f + 1` makes the last of 8 frames index 8 — due c3, full reach —
+            // so the pool the gate sums has seen a whole cycle.
+            rc.beginFrame(f + 1);
             rc.setCamera(w.eye);
             await renderGbuffer();
             // Timed per PHASE, and only from frame 1: the first dispatch of a

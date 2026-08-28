@@ -744,6 +744,9 @@ export function createGi2System({
           // §19 5.3 — the albedo/emission [J] deposits with, from the same two
           // tables and under the same two rules `shadeHit` reads them.
           hitPalette: gather.internals.hitPalette,
+          // §19 5.3c — the emitter's PROJECTED-AREA share for one ray. `null`
+          // on the isotropic arm, where the cache word is still the carrier.
+          hitEmissionRay: gather.internals.hitEmissionRay,
         },
         // ⭐⭐ §19 STAGE 5.2 — THE DESTINATION IS THE ENGINE'S OWN HALF-RES
         // TEXTURE, AND THAT IS THE WHOLE RESOLVE. `resolveUpsample` reads this,

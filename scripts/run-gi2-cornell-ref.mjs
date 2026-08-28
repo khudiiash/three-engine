@@ -95,6 +95,14 @@ const ARM_FRAMES = Number(process.env.ARM_FRAMES ?? 240);
 const ARM_MS = Number(process.env.ARM_MS ?? 20);
 /** Gather frames between the two at-rest dumps; 0 skips the stability read. */
 const REST = Number(process.env.REST ?? 180);
+/**
+ * §19 5.3c — HOW MANY BACK-TO-BACK DUMPS THE Δ MAP TAKES. `REST` answers "is
+ * the image still" with ONE number over ONE lag, which cannot say WHICH
+ * surfaces rattle nor whether the rattle has a PERIOD — and a period names its
+ * mechanism (4 = the E_rc phase refresh, `stride` = the ray budget's round
+ * robin, none = a field still climbing). 0 = off.
+ */
+const RESTMAP = Number(process.env.RESTMAP ?? 0);
 const ARMS = (process.env.ARMS ?? "").split("|").filter(Boolean).map((spec) => {
   const [name, body] = spec.includes("=") ? spec.split("=") : [spec, spec];
   const set = {};
@@ -947,6 +955,95 @@ if (REST > 0) {
     console.log(`  |ΔE|/E   p50 ${pct(quantile(rel, 0.5), 2)}   p90 ${pct(quantile(rel, 0.9), 2)}   ` +
       `max ${pct(Math.max(...rel), 1)}   over ${rel.length} px   [rule: 0 %]`);
     result.rest = { frames: REST, p50: quantile(rel, 0.5), p90: quantile(rel, 0.9), max: Math.max(...rel) };
+  }
+}
+
+// ═════════════════════════ §19 5.3c — THE Δ MAP: WHICH PIXELS, AND IS IT PERIODIC
+//
+// ⭐⭐ A RESIDUAL WITH A PERIOD IS A DIFFERENT BUG FROM ONE WITHOUT. This takes
+// `RESTMAP` dumps back to back, records the GATHER FRAME each landed on, and
+// scores every PAIR of dumps by its frame gap. A converged deterministic field
+// reads 0 at every gap; a phase-staggered refresh reads far lower at gaps that
+// are multiples of its period — which names the period, and the period names
+// the pass. The per-surface SWING then says where the residual lives.
+if (RESTMAP > 1) {
+  const dumpOnce = async () => {
+    const j = await page.evaluate(async ({ TARGET }) => {
+      try {
+        const eng = globalThis.__giEngineForProbe;
+        const sys = globalThis.__giSys();
+        const gi2 = globalThis.__gi2();
+        const { createGi2PixelDump, GI2_PIXEL_OUT_VEC } = await import("/scripts/lib/gi2PixelDump.js");
+        const stride = Math.max(1, Math.round(gi2.width / TARGET));
+        const dump = createGi2PixelDump({ renderer: eng.renderer, gi2, screen: sys.state?.screen, stride });
+        const awaitFrame = () => new Promise((r) => { const off = eng.onPostRender(() => { off(); r(); }); });
+        const d = await dump.read(awaitFrame);
+        const OV = GI2_PIXEL_OUT_VEC;
+        const out = [];
+        for (let y = 0; y < dump.dumpH; y++) {
+          for (let x = 0; x < dump.dumpW; x++) {
+            const b = (y * dump.dumpW + x) * OV * 4;
+            if (d[b + 3] < 0.5) continue;
+            out.push(d[b + 8], d[b + 9], d[b + 10]);
+          }
+        }
+        return JSON.stringify({ out, frame: gi2?.gather?.frame ?? 0 });
+      } catch (e) { return JSON.stringify({ error: String(e?.message) }); }
+    }, { TARGET });
+    return JSON.parse(j ?? '{"error":"nothing"}');
+  };
+  const series = [];
+  for (let k = 0; k < RESTMAP; k++) {
+    const d = await dumpOnce();
+    if (d.error || d.out.length / 3 !== rows.length) {
+      console.log(`  Δ map: dump ${k} failed (${d.error ?? d.out.length / 3})`);
+      break;
+    }
+    series.push(d);
+  }
+  if (series.length > 1) {
+    const lumOf = (sr, i) => lum([sr.out[i * 3], sr.out[i * 3 + 1], sr.out[i * 3 + 2]]);
+    const idx = rows.map((r, i) => i).filter((i) => lum(rows[i].E) > 0.02 && !rows[i].emitFace);
+    console.log("");
+    console.log(`  ── §19 5.3c THE Δ MAP (${series.length} dumps, gather frames ${series.map((x) => x.frame).join(",")}) ──`);
+    const byGap = new Map();
+    for (let a = 0; a < series.length; a++) {
+      for (let b = a + 1; b < series.length; b++) {
+        const gap = series[b].frame - series[a].frame;
+        if (gap <= 0) continue;
+        const rel2 = idx.map((i) => Math.abs(lumOf(series[b], i) - lumOf(series[a], i))
+          / Math.max(1e-6, lumOf(series[a], i)));
+        if (!byGap.has(gap)) byGap.set(gap, []);
+        byGap.get(gap).push(quantile(rel2, 0.9));
+      }
+    }
+    const gaps = [...byGap.keys()].sort((x, y) => x - y);
+    console.log("  frame gap   pairs   p90 |ΔE|/E");
+    for (const g of gaps.slice(0, 20)) {
+      console.log(`  ${String(g).padStart(9)} ${String(byGap.get(g).length).padStart(7)}   ${pct(mean(byGap.get(g)), 2)}`);
+    }
+    const swing = new Map();
+    for (const i of idx) {
+      const vs = series.map((x) => lumOf(x, i));
+      const m = mean(vs);
+      const sw = (Math.max(...vs) - Math.min(...vs)) / Math.max(1e-6, m);
+      const name = rows[i].surf;
+      if (!swing.has(name)) swing.set(name, []);
+      swing.get(name).push(sw);
+    }
+    console.log("  surface                px    swing p50    swing p90    swing max");
+    const swRows = [...swing.entries()].filter(([, v]) => v.length >= 16)
+      .sort((a, b) => quantile(b[1], 0.9) - quantile(a[1], 0.9));
+    for (const [name, v] of swRows) {
+      console.log(`  ${name.padEnd(20)} ${String(v.length).padStart(5)}   ${pct(quantile(v, 0.5), 2).padStart(9)}   ` +
+        `${pct(quantile(v, 0.9), 2).padStart(9)}   ${pct(Math.max(...v), 1).padStart(9)}`);
+    }
+    result.restMap = {
+      dumps: series.length,
+      frames: series.map((x) => x.frame),
+      byGap: gaps.map((g) => [g, mean(byGap.get(g))]),
+      surfaces: swRows.map(([name, v]) => ({ name, px: v.length, p50: quantile(v, 0.5), p90: quantile(v, 0.9) })),
+    };
   }
 }
 

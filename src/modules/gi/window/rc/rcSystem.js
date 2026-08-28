@@ -112,6 +112,32 @@ export function createRcCascades({
   const phaseU = uniform(0, "uint");
   const lmaxU = uniform(spec.lmax);
   /**
+   * ⭐⭐⭐ §19 STAGE 5.3c — THE CADENCE, AS ONE INTEGER PER FRAME.
+   *
+   * The plan's schedule row is "c0 every frame, c1 every 2, c2 every 4, c3
+   * every 8". On the SPLIT cascades a ray is not owned by a cascade — it is
+   * traced once to the full reach and deposits into every cascade up to the one
+   * that owns its hit distance — so the schedule is not a set of dispatches, it
+   * is the HIGHEST CASCADE this frame may write. `srcDeposit`'s `cascadeDue`
+   * spends it three ways at once (reach, scatter gate, decay freeze); its
+   * docstring carries the argument.
+   *
+   * DETERMINISTIC BY FRAME INDEX and by nothing else: `due(f)` is the largest
+   * `c` with `f mod 2^c == 0`, so the pattern is 3,0,1,0,2,0,1,0 and repeats —
+   * no counter, no state, nothing to get out of step after a resize or a pause.
+   *
+   * `__gi2RcCadence = 0` traces every cascade every frame (5.1-5.3b's arm, and
+   * the one every chain-ms figure before this was taken on).
+   */
+  const cadenceOn = (globalThis.__gi2RcCadence ?? 1) !== 0;
+  const cascadeDueU = uniform(CASCADE_COUNT - 1, "int");
+  /** The largest `c` with `f mod 2^c == 0`, capped at the top cascade. */
+  const cascadeDueAt = (f) => {
+    let c = 0;
+    while (c < CASCADE_COUNT - 1 && (f % (1 << (c + 1))) === 0) c++;
+    return c;
+  };
+  /**
    * The temporal blend. `keep = 1 − α` multiplies every accumulator before this
    * frame's rays land on it — `srcConfig.TEMPORAL_ALPHA` (0.1), the value the
    * old path shipped and the user liked the look of.
@@ -223,6 +249,13 @@ export function createRcCascades({
   // deposit calls while IT is being constructed, which is after the bins — so
   // the late binding is the construction order, not laziness.
   let shadeCounters = null;
+  /**
+   * §19 5.3c — `shadeHit` no longer adds `palEm` under the projected-area arm
+   * (`gatherProbes`' `RC5_EMIT_PROJ`), because the emission a ray carries away
+   * depends on the ray. The split arm puts it in the record; the INLINE arm has
+   * no record, so it adds it here — same closure, same face, same direction.
+   */
+  const rayEmission = typeof kit.hitEmissionRay === "function" ? kit.hitEmissionRay : null;
   const rcShade = (r, dir) => {
     const raw = r.raw;
     const rad = vec3(0).toVar();
@@ -247,6 +280,7 @@ export function createRcCascades({
         cache.cacheAccum(levelF, voxF, faceF, s, u.nCapU, u.cacheSmoothU).toVar();
         rad.assign(s);
       });
+      if (rayEmission) rad.addAssign(rayEmission(levelF, voxF, faceF, dir));
     }).Else(() => {
       rad.assign(u.skyColor);
     });
@@ -343,9 +377,11 @@ export function createRcCascades({
     secondary: hitCapacity > 0
       ? { base: bins.hitListBase, capacity: hitCapacity }
       : null,
-    // §19 5.3b — P, N and Le are functions of the address word the record
-    // already carries, so the append stops writing them. `rcHit`'s `compact`.
-    hitFields: hitShading ? { P: false, N: false, Le: false } : null,
+    // §19 5.3b/5.3c — P and N are functions of the address word the record
+    // already carries, so the append stops writing them; `Le` comes BACK under
+    // the projected-area arm because it is a function of the RAY. One source of
+    // truth (`rcHit`'s `hitFields`), read by the writer here and by [J] below.
+    hitFields: hitShading ? hitShading.hitFields : null,
     surprise: null,
     trace: rcTrace,
     shadeHit: hitShading ? null : ((r, dir) => rcShade(r, dir)),
@@ -359,6 +395,8 @@ export function createRcCascades({
     frameStamp: frameStampU,
     influxLift: influxLiftU,
     maxLods,
+    // §19 5.3c — the schedule. `null` on the off arm builds the pre-5.3c WGSL.
+    cascadeDue: cadenceOn ? cascadeDueU : null,
   });
 
   // ══ §19 STAGE 5.2 — [G] THE MERGE, [H] THE TILES, [I] THE PIXEL ═══════════
@@ -418,7 +456,7 @@ export function createRcCascades({
     ? createSrcSecondaryFrame(store, bins, {
       shade: hitShading.shade,
       bounce: "cached",
-      hitFields: { P: false, N: false, Le: false },
+      hitFields: hitShading.hitFields,
       spacing0,
       // The SAME camera and anchor the population, the merge and the pixel
       // gather use. A gather placed from a second anchor reads plausible light
@@ -482,6 +520,8 @@ export function createRcCascades({
     const stride = Math.max(1, Math.ceil(pixelCount / threads));
     strideU.value = stride;
     phaseU.value = stride > 1 ? frameStampU.value % stride : 0;
+    // §19 5.3c — the cadence, from the frame index and nothing else.
+    cascadeDueU.value = cadenceOn ? cascadeDueAt(frameIndex) : CASCADE_COUNT - 1;
     return frameIndex;
   };
   const setSize = (w, h) => {
@@ -514,6 +554,25 @@ export function createRcCascades({
       hitList: hitCapacity,
     },
     hitRadiance: hit ? "probes" : "cache",
+    /**
+     * §19 5.3c — the schedule, published so a cost reading names the frame it
+     * was taken on. `reach` is what a ray of each phase actually marches, which
+     * is the quantity the window DDA charges for.
+     */
+    cadence: cadenceOn
+      ? {
+        on: true,
+        period: Array.from({ length: CASCADE_COUNT }, (_, c) => 1 << c),
+        pattern: Array.from({ length: 8 }, (_, f) => cascadeDueAt(f)),
+        due: cascadeDueU.value,
+        reach: census.rows[0].bands.map((b) => +b.t1.toFixed(2)),
+        // Mean marched reach over one 8-frame cycle, against the un-cadenced
+        // constant — the DDA's own units.
+        meanReach: +(Array.from({ length: 8 }, (_, fr) =>
+          census.rows[0].bands[cascadeDueAt(fr)].t1).reduce((a, b) => a + b, 0) / 8).toFixed(2),
+        fullReach: +census.rows[0].bands[CASCADE_COUNT - 1].t1.toFixed(2),
+      }
+      : { on: false },
     // §19 5.3b — the secondary cache's budget, published so a cost reading and
     // a convergence reading can be attributed to the same number.
     erc: hit
@@ -550,6 +609,7 @@ export function createRcCascades({
       rcCamera: cameraU, rcAnchor: anchorU, rcWidth: widthU, rcFrameStamp: frameStampU,
       rcJitterX: jitterXU, rcJitterY: jitterYU, rcStride: strideU, rcPhase: phaseU,
       rcLmax: lmaxU, rcKeep: keepU, rcInfluxLift: influxLiftU, rcErcMask: ercMaskU,
+      rcCascadeDue: cascadeDueU,
       ...(resolve?.uniforms ?? {}),
     },
     passes: {

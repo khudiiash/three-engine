@@ -647,6 +647,75 @@ export function createGiGather({
    */
   const RC5_EMIT_CONSERVE = RC5_EMITTER_EMISSION && (globalThis.__gi2Rc5EmitRaw ?? 0) === 0;
   /**
+   * ⭐⭐⭐ §19 STAGE 5.3c — AND THE POWER IS SPREAD BY PROJECTED AREA, NOT BY A
+   * FACE COUNT. 5.3b's `L_vox = L_e · cov / n_exposed` fixed the emitter's TOTAL
+   * power and left its SILHOUETTE wrong: `n_exposed` is a direction-free count,
+   * so a voxelized panel radiated the same into a receiver looking at its FACE
+   * and into one looking along its EDGE. Measured on the user's Cornell box that
+   * is the tall box's side at **1.90×** — the surface that sees the ceiling
+   * panel most obliquely.
+   *
+   * The exact statement is a RATIO OF PROJECTED AREAS. From direction `d` the
+   * enclosed patch presents `cov · cell² · |d·n_dom|` (`n_dom` is the voxel's
+   * stored dominant surface axis, which is what `dominantFace` returns for
+   * EVERY ray whatever face it entered through) and the voxel presents the sum
+   * of its REACHABLE entry faces, `cell² · Σ_f |d·n_f|` over the three faces a
+   * ray travelling `d` can enter through that are not buried in a neighbour. So
+   * a ray must be handed
+   *
+   *     ⭐ L_ray = L_e · cov · |d·n_dom| / Σ_reachable |d·n_f| / n_domSides
+   *
+   * and the flux the receiver integrates — reachable area × radiance — is then
+   * `cell² · cov · L_e · |d·n_dom|`, the PATCH's, in every direction.
+   *
+   * ⚠ THE DENOMINATOR IS THE REACHABLE SUM, NOT `|dx|+|dy|+|dz|`, AND THAT IS
+   * WHAT MAKES THIS NON-REGRESSIVE. For a panel's INTERIOR voxel the lateral
+   * neighbours are occupied, so the sum is `|d·n_dom|` alone and the factor is
+   * exactly 1 — 5.3b's value, at every angle. `|dx|+|dy|+|dz|` would have
+   * halved the floor and the green wall (0.95 and 1.01 today) to pay for a
+   * silhouette that lives only on the panel's EDGE voxels, where the lateral
+   * faces ARE exposed and the sum is genuinely larger. Head on the factor is 1;
+   * at 45° on an edge voxel it is ½, which is exactly the 2× a slab's diagonal
+   * cross-section over-presents; along the edge it goes to zero, which IS the
+   * silhouette. `n_domSides` (1 or 2) is the one piece of 5.3b's `n_exposed`
+   * with a physical meaning: a one-sided patch seen from both sides splits.
+   *
+   * ⚠ IT IS PER RAY, SO THE EMISSION LEAVES THE CACHE WORD. A face's cache entry
+   * is one radiance for all directions and a directional term cannot live in it.
+   * 5.3c moves it into the hit RECORD (`SEC_LE`, three words — the six `P`/`N`
+   * words 5.3b dropped stay dropped) and `shadeHit` stops adding `palEm`, so
+   * there is exactly one carrier and no double count.
+   *
+   * ══ ⛔⛔ MEASURED, AND SHIPPED **OFF** — THE LAW DID NOT DO WHAT IT WAS
+   *    DERIVED TO DO ════════════════════════════════════════════════════════
+   *
+   * The user's Cornel.scene, 5.3c, both arms with the cadence on and the hashed
+   * E_rc phase, one boot each:
+   *
+   *     arm          gain  med|log|  p90    black  box·−X  ceiling  floor
+   *     isotropic    0.96   0.469   1.770    15     1.86    0.35     0.93
+   *     projected    1.28   0.564   1.306     0     2.49    0.62     1.43
+   *
+   * ⭐ THE ONE NUMBER THAT DECIDES IT: **Box·−X went 1.86 → 2.49.** That surface
+   * IS the silhouette this law was written to fix — the face that sees the
+   * ceiling panel most obliquely — and the correction made it 34 % WORSE, while
+   * adding a 1.28× global gain and half again as much blotch (σ̄ ~37 % → ~57 %).
+   * A derivation that predicts a direction and measures the opposite one has a
+   * false premise, and the candidate is named: the law assumes a voxel encloses
+   * ONE one-sided planar patch whose normal is the stored dominant axis. The
+   * user's lamp is a CLOSED 12-triangle box THINNER THAN A CELL, so one voxel
+   * holds its top face, its bottom face and (at the rim) a side face — three
+   * patches with two different dominant axes, of which the face byte stores
+   * one. Every term of the law (`cov`, `n_dom`, `n_domSides`) is then a
+   * statement about a patch that is not there.
+   *
+   * So the arm is BUILT AND KEPT — it is where the question gets asked again
+   * once a voxel can say how many patches it holds — and the DEFAULT is 5.3b's
+   * isotropic `cov / n_exposed`, which is what every shipped number was taken
+   * on. `__gi2Rc5EmitProj = 1` arms the projected law.
+   */
+  const RC5_EMIT_PROJ = RC5_EMIT_CONSERVE && (globalThis.__gi2Rc5EmitProj ?? 0) !== 0;
+  /**
    * §AL's SECOND arm, measured separately and shipped only if it earns it: a
    * ceiling on the albedo the BOUNCE term multiplies. The standard energy
    * safety rule for an iterative gather (`ρ < 1` or the Neumann series does not
@@ -2431,6 +2500,76 @@ export function createGiGather({
     ? emOf(palEmU.element(pi).xyz.mul(emitterVoxelScale(levelF, voxF)))
     : emOf(palEmU.element(pi).xyz));
   /**
+   * ⭐⭐⭐ §19 STAGE 5.3c — THE SAME POWER, SPREAD BY PROJECTED AREA. See
+   * `RC5_EMIT_PROJ`: `L_ray = L_e · cov · |d·n_dom| / (|dx|+|dy|+|dz|)`.
+   *
+   * `dir` is the RAY's direction (origin → hit), and `|d·n_dom|` does not care
+   * about its sign — a face is presented to the ray at the same angle from
+   * either side, and which side a ray may reach is the occupancy's business,
+   * not this expression's.
+   *
+   * ⚠ CHEAPER THAN THE ARM IT REPLACES, not dearer: one coverage word instead of
+   * one coverage word AND the six occupancy bits `exposedFaceCount` reads.
+   */
+  const emissionRayAt = (pi, levelF, voxF, faceF, dir) => {
+    const d = vec3(dir).toVar();
+    const nd = normalOfFace(faceF).toVar();
+    const vi = voxF.toUint().toVar();
+    const cx = bitAnd(vi, uint(63)).toInt().toVar();
+    const cy = bitAnd(shiftRight(vi, uint(6)), uint(63)).toInt().toVar();
+    const cz = bitAnd(shiftRight(vi, uint(12)), uint(63)).toInt().toVar();
+    const occBase = levelF.toUint().mul(uint(LEVEL_WORDS)).add(uint(OCC_OFF)).toVar();
+    /** 1 when the neighbour at this offset is EMPTY — `exposedFaceCount`'s test. */
+    const emptyAt = (ox, oy, oz) => {
+      const v = bitOr(bitOr(
+        bitAnd(cx.add(ox), int(N - 1)).toUint(),
+        shiftLeft(bitAnd(cy.add(oy), int(N - 1)).toUint(), uint(6))),
+      shiftLeft(bitAnd(cz.add(oz), int(N - 1)).toUint(), uint(12))).toVar();
+      const bit = bitAnd(
+        win.buffer.element(occBase.add(shiftRight(v, uint(5)))),
+        shiftLeft(uint(1), bitAnd(v, uint(31))),
+      ).toVar();
+      return select(bit.equal(uint(0)), float(1), float(0));
+    };
+    // THE VOXEL'S REACHABLE PROJECTED AREA, in units of cell². A ray travelling
+    // `d` can enter through at most three faces — the one opposing it on each
+    // axis — and only those whose neighbour is EMPTY are reachable at all.
+    const sx = select(d.x.lessThan(0), int(1), int(-1)).toVar();
+    const sy = select(d.y.lessThan(0), int(1), int(-1)).toVar();
+    const sz = select(d.z.lessThan(0), int(1), int(-1)).toVar();
+    const denom = d.x.abs().mul(emptyAt(sx, int(0), int(0)))
+      .add(d.y.abs().mul(emptyAt(int(0), sy, int(0))))
+      .add(d.z.abs().mul(emptyAt(int(0), int(0), sz)))
+      .max(1e-4).toVar();
+    // HOW MANY SIDES OF THE DOMINANT AXIS RADIATE. A one-sided patch whose
+    // voxel is open on both sides is seen from both, so its power splits — this
+    // is the only part of 5.3b's `n_exposed` that has a physical meaning, and
+    // keeping it is what makes this law EQUAL 5.3b's wherever nothing but the
+    // dominant axis is exposed (a panel's interior: every surface the Cornell
+    // gate reads at 0.95-1.01 today).
+    const ndx = nd.x.toInt().toVar();
+    const ndy = nd.y.toInt().toVar();
+    const ndz = nd.z.toInt().toVar();
+    const sides = emptyAt(ndx, ndy, ndz)
+      .add(emptyAt(int(0).sub(ndx), int(0).sub(ndy), int(0).sub(ndz)))
+      .max(1).toVar();
+    // `|d·n_dom| / Σ_reachable |d·n_f|` — the enclosed patch's projected area
+    // over the voxel's, so the flux the receiver integrates is the PATCH's in
+    // every direction. Clamped at 1: it cannot be right for a ray to carry more
+    // than the patch's own radiance.
+    const factor = dot(d, nd).abs().div(denom).min(1).div(sides).toVar();
+    return emOf(palEmU.element(pi).xyz.mul(coverageAt(levelF, voxF)).mul(factor));
+  };
+  /**
+   * §19 5.3c — what ONE RAY carries away from an emitter voxel's dominant face.
+   * Published so [E] can write it into the record; `null` on every arm where the
+   * cache word is still the carrier, which is how `rcHit` knows not to.
+   */
+  const hitEmissionRay = RC5_EMIT_PROJ
+    ? ((levelF, voxF, faceF, dir) =>
+      emissionRayAt(palIndexAt(levelF, voxF).toVar(), levelF, voxF, faceF, dir))
+    : null;
+  /**
    * ⭐⭐ §19 STAGE 4.5 — `shadeHit`, SPLIT INTO ITS TERMS SO A RECEIPT CAN WEIGH
    * THEM. One implementation, two consumers.
    *
@@ -2935,7 +3074,13 @@ export function createGiGather({
     // cannot measure this arm at all. See `BOUNCE_ALBEDO_MAX`.
     const alb = BOUNCE_ALBEDO_MAX < 1
       ? t.pal.xyz.min(vec3(BOUNCE_ALBEDO_MAX)) : t.pal.xyz;
-    return alb.mul(1 / Math.PI).mul(E).add(t.palEm);
+    // ⭐⭐ §19 5.3c — UNDER THE PROJECTED-AREA ARM THE EMISSION IS NOT HERE. It
+    // is a function of the RAY's direction (`hitEmissionRay`) and this word is
+    // read by every direction, so keeping it would be the isotropic slab again,
+    // added a second time. ONE carrier, and on this arm it is the record.
+    return RC5_EMIT_PROJ
+      ? alb.mul(1 / Math.PI).mul(E)
+      : alb.mul(1 / Math.PI).mul(E).add(t.palEm);
   };
 
   // ══════════════════════════ §19 STAGE 3.13 — WHAT A RAY BRINGS BACK ════════
@@ -5692,7 +5837,11 @@ export function createGiGather({
      * rule). Exporting them is what keeps the receipt measuring the SHIPPING
      * estimator instead of a transcription of it.
      */
-    internals: { shadeTerms, shadeHit, dominantFace, faceSamplePoint, cellOfWorld, palAt, hitPalette },
+    internals: {
+      shadeTerms, shadeHit, dominantFace, faceSamplePoint, cellOfWorld, palAt, hitPalette,
+      /** §19 5.3c — the projected-area emission of one ray, or `null`. */
+      hitEmissionRay,
+    },
     buffers: {
       probeMeta, probeOct, probeFiltered, probeSh, hzb, statsBuf, cropIn, cropOut, litBuf,
       shadeIn, shadeOut, exhaustOut, noiseBuf, dirtyBuf, reprojBuf, motionLum,

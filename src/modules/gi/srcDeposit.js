@@ -694,6 +694,33 @@ export function createSrcDepositFrame(store, bins, {
   stride = null,
   phase = null,
   threads = 0,
+  /**
+   * ⭐⭐⭐ §19 STAGE 5.3c — THE CADENCE, AS THE HIGHEST CASCADE DUE THIS FRAME.
+   *
+   * §19's contract (`docs/GI_SCALE_PLAN.md`, the schedule row) is "c0 every
+   * frame, c1 every 2, c2 every 4, c3 every 8". On the SPLIT cascades that is
+   * not a per-cascade dispatch: one ray per pixel is traced to the full reach
+   * and deposits into every cascade up to the one that owns its hit distance
+   * (measured 2.24 deposits/ray). So the cadence is ONE INTEGER — the highest
+   * cascade this frame may write — and it does three things at once:
+   *
+   *   · the trace's REACH becomes that cascade's interval boundary, so a frame
+   *     that owes only c0 marches 0.8 m instead of 51.2 m. That is the saving:
+   *     §AG measured the window DDA at ≈ 5 ns/ray, i.e. the cost is MARCHED
+   *     DISTANCE, and a truncated ray is a cheap ray, not a skipped one.
+   *   · the scatter is gated by it, so a MISS (`own == N`, which deposits
+   *     "unblocked" into every cascade) cannot write a false all-clear into a
+   *     cascade whose turn it is not. Truncating the reach without this would
+   *     erase the far field every frame.
+   *   · the DECAY is gated by it, so a cascade that missed its turn KEEPS its
+   *     value instead of fading by `keep` toward black with nothing refilling
+   *     it. This is exactly the freeze S1 already applies to a held block, for
+   *     exactly the same reason.
+   *
+   * A uniform int node, or `null` for "every cascade, every frame" — which is
+   * every pre-5.3c caller, byte-identically.
+   */
+  cascadeDue = null,
 } = {}) {
   const writesP = hitFields?.P !== false;
   const writesN = hitFields?.N !== false;
@@ -912,6 +939,14 @@ export function createSrcDepositFrame(store, bins, {
           // forbids. `srcProbes.blockHeldBase` carries the whole argument,
           // including why the test is visibility and not "did it get rays".
           //
+          // ⭐⭐ §19 5.3c — AND A CASCADE THAT IS NOT DUE THIS FRAME IS HELD THE
+          // SAME WAY. Its bins receive no rays (the scatter below is gated on
+          // the same integer), so decaying them would fade the far field toward
+          // black between its turns — the identical failure S1 exists to
+          // prevent, arriving from the schedule instead of from visibility.
+          if (cascadeDue) {
+            If(int(cascadeDue).lessThan(int(info.cascade)), () => { k.assign(float(1)); });
+          }
           // BEFORE the claim-stamp check below, which must still win: a block
           // handed to a NEW probe this frame is zeroed whatever any older
           // stamp says.
@@ -1024,7 +1059,17 @@ export function createSrcDepositFrame(store, bins, {
     const lod = floor(lodAtDistance(chebyshev(P, camera), spacing0, maxLods)).toVar();
     const bounds = [];
     for (let c = 0; c < N; c++) bounds.push(intervalBoundary(c, lod, spacing0).toVar());
-    const reach = bounds[N - 1];
+    // §19 5.3c — the reach is the DUE cascade's boundary. `bounds` is strictly
+    // increasing, so the last branch that fires wins and the result is
+    // `bounds[min(cascadeDue, N−1)]` with no loop and no divergence.
+    let reach = bounds[N - 1];
+    if (cascadeDue) {
+      const rd = float(bounds[0]).toVar();
+      for (let c = 1; c < N; c++) {
+        rd.assign(select(int(cascadeDue).greaterThanEqual(int(c)), bounds[c], rd));
+      }
+      reach = rd;
+    }
 
     // THE ANCESTOR CHAIN, walked once per pixel rather than once per ray. Every
     // ray from this pixel deposits into the same chain — it is a property of the
@@ -1198,11 +1243,18 @@ export function createSrcDepositFrame(store, bins, {
         // A probe that failed to claim a block has NOWHERE to put this, and
         // "nowhere" is dropped-and-counted rather than redirected: writing it
         // into block 0 would corrupt the bins of a probe that is working.
+        // §19 5.3c — `c <= cascadeDue` is the cadence. It is ANDed rather than
+        // wrapped around the block so a miss (`own == N`) cannot deposit its
+        // all-clear into a cascade whose turn it is not — see `cascadeDue`.
+        const dueC = cascadeDue
+          ? int(cascadeDue).greaterThanEqual(int(c))
+          : null;
+        const owns = dueC ? int(c).lessThanEqual(own).and(dueC) : int(c).lessThanEqual(own);
         If(blk.equal(uint(SLOT_EMPTY)).and(chain[c].notEqual(uint(SLOT_EMPTY)))
-          .and(int(c).lessThanEqual(own)), () => {
+          .and(owns), () => {
           atomicAdd(stats.element(uint(STAT_NOBLOCK)), uint(1));
         });
-        If(blk.notEqual(uint(SLOT_EMPTY)).and(int(c).lessThanEqual(own)), () => {
+        If(blk.notEqual(uint(SLOT_EMPTY)).and(owns), () => {
           const b = dirToBin(dir, info.width).toVar();
           const m = binMorton(b.x, b.y).toVar();
           const slot = uint(info.binBase)
