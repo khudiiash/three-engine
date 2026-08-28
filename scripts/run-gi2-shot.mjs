@@ -44,7 +44,7 @@ page.on("console", (m) => {
   const t = m.text();
   if (/\[gi2\] first light|\[gi\] field ready/.test(t)) firstLight = true;
   if (/\[gi/.test(t)) { giLines.push(t.slice(0, 140)); if (giLines.length > 12) giLines.shift(); }
-  if (/rc5|RC5|\[gi\].*(rror|ailed)/.test(t)) console.log(`  ${t.slice(0, 200)}`);
+  if (/rc5|RC5|bvh|BVH|rebuild|first light|\[gi\].*(rror|ailed)/i.test(t)) console.log(`  ${t.slice(0, 200)}`);
 });
 await page.goto(url, { waitUntil: "load", timeout: 60000 });
 await page.waitForSelector(".hub-recent-open-btn", { timeout: 60000 });
