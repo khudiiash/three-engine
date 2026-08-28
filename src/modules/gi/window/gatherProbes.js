@@ -2662,10 +2662,64 @@ export function createGiGather({
     /** (sun visibility 0/1, sky rays that MISSED, sky rays that hit a WARM face). */
     const census = vec3(0).toVar();
 
+    // ⭐⭐⭐ §19 STAGE 5.4d — THE SHADOW RAYS LEAVE THE FACE'S OWN LEVEL SLAB,
+    // AND THE GEOMETRY IS EVALUATED WHERE THEY START.
+    //
+    // ══ THE MEASUREMENT THIS EXISTS FOR ═════════════════════════════════════
+    //
+    // `FACETRUTH` scores this estimator's `Enee` against the reference's own NEE
+    // AT THE SAME POINT, so nothing about where a face sits can enter the ratio.
+    // It still split by CASCADE BAND and by nothing else:
+    //
+    //     c0 (0.16 m cells)   50 faces   Enee/ref 0.955
+    //     c1 (0.32 m cells)   38 faces   Enee/ref 0.586
+    //     five -X wall faces             Enee/ref 0.000, against a lit truth
+    //
+    // Same lamp, same expression, same admission gate: what changes with the
+    // level is the LATTICE THE SHADOW RAY MARCHES. `faceSamplePoint` puts the
+    // origin on the voxel's face PLANE, which is the boundary of a cell that is
+    // itself occupied and conservatively dilated — and at c1 that cell is twice
+    // as wide, so the ray spends its first steps inside its own surface's bulge
+    // and comes back BLOCKED. An exact zero on a lit face is that, not a dim
+    // lamp: no fraction of a solid angle is 0.000.
+    //
+    // ══ THE FIX, AND WHY IT IS THE LEVEL'S CELL AND NOT A CONSTANT ══════════
+    //
+    // The ray starts half of ITS OWN LEVEL'S cell beyond the face plane, and
+    // `wd`, `d` and `cosθ` are then measured from that origin so the estimator
+    // stays self-consistent — a solid angle computed at one point and a
+    // visibility traced from another is two different lamps.
+    //
+    // ⛔ NOT `v0 · k`. A constant in world units is the mistake [[gi-colour-
+    // probe-method]] retracts by name: it is a whole cell at c0 and a quarter of
+    // one at c2, so it would over-escape the fine faces (which measured 0.955
+    // and need nothing) to rescue the coarse ones. The escape is a fraction of
+    // the cell the ray is standing in, which is the only length this shader
+    // knows to be the right size at every level.
+    //
+    // ⚠ `traceWindow`'s own `biasCells · v_l` is NOT this. That bias is applied
+    // at the level the DDA STARTS on and is sized for a fine cell; it cannot
+    // know that this origin belongs to a c1 face whose slab is twice as thick.
+    //
+    // `rc5`-gated: on every shipped non-cascade path `pRay` IS `p`, so the WGSL
+    // and the pins are byte-identical to 5.4c.
+    const vLevel = (() => {
+      if (!rc5) return null;
+      // The level → cell-size select chain, exactly as `windowStore.originAt`
+      // builds its own: `win.levels` is a tier constant, so this is a compile-
+      // time ladder rather than a `pow` in the inner loop.
+      let node = float(v0 * (1 << (win.levels - 1)));
+      for (let l = win.levels - 2; l >= 0; l--) {
+        node = select(levelF.equal(float(l)), float(v0 * (1 << l)), node);
+      }
+      return node.toVar();
+    })();
+    const pRay = rc5 ? p.add(n.mul(vLevel.mul(0.5))).toVar() : p;
+
     const toSun = u.sunDir.negate().normalize().toVar();
     const ndl = dot(n, toSun).max(0).toVar();
     If(ndl.greaterThan(0.001), () => {
-      const sh = traceWindow(p, toSun, RAY_MAX, n).hit.toVar();
+      const sh = traceWindow(pRay, toSun, RAY_MAX, n).hit.toVar();
       Esun.addAssign(u.sunColor.mul(ndl).mul(float(1).sub(sh)));
       census.x.assign(float(1).sub(sh));
     });
@@ -2958,7 +3012,9 @@ export function createGiGather({
       const active = float(slot.radius).greaterThan(1e-5)
         .and(rgb.x.add(rgb.y).add(rgb.z).greaterThan(1e-6));
       If(active, () => {
-        const wv = centre.sub(p).toVar();
+        // §19 5.4d — FROM THE RAY'S OWN ORIGIN. `pRay` is `p` on every non-rc5
+        // path, so this line is the identity there.
+        const wv = centre.sub(pRay).toVar();
         const d2 = dot(wv, wv).max(1e-4).toVar();
         const d = sqrt(d2).toVar();
         const wd = wv.div(d).toVar();
@@ -2973,8 +3029,13 @@ export function createGiGather({
           // `max` keeps every spherical fit byte-identical, and the arm is
           // `rc5`-gated so the shipped chain's pins do not move under it.
           const excl = rc5 ? float(slot.radius).max(reff) : reff;
-          const reach = d.sub(excl).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
-          const vis = float(1).sub(traceWindow(p, wd, reach, n).hit).toVar();
+          // §19 5.4d — the END margin is the level's cell too. `v0 · 0.5` is
+          // half a cell at c0 and an eighth of one at c2, so a coarse face's
+          // ray ran into the lamp's own dilated voxel and reported it as
+          // occlusion — the same length error at the far end of the ray.
+          const endM = rc5 ? vLevel.mul(0.5) : float(v0 * 0.5);
+          const reach = d.sub(excl).sub(endM).max(endM).toVar();
+          const vis = float(1).sub(traceWindow(pRay, wd, reach, n).hit).toVar();
           Enee.addAssign(rgb.mul(omega).mul(cosX).mul(vis));
         });
       });
