@@ -124,7 +124,12 @@ import { CASCADE_COUNT, W0 } from "./srcConfig.js";
 // the wrong WEIGHT: the seed should carry less confidence than a measured bin,
 // not equal confidence. Until the bake can weight a seeded bin below a sampled
 // one, the standing gate ("Cornell not worse, black 0") keeps this off.
-const SEED_PARENT = (globalThis.__gi2MergeSeedParent ?? 0) !== 0;
+// 08-29 02:00: DEFAULT ON — a newborn probe's untraced front-hemisphere bins
+// take the parent cascade's cone (transparent, β = 1) with an age-ramped
+// confidence; Cornell holds at every ramp (black 0, gain within noise); the
+// Bistro recovery metric was a tail statistic one boot could not resolve, so
+// the user's eye is the receipt. `__gi2MergeSeedParent = 0` restores 5.4d.
+const SEED_PARENT = (globalThis.__gi2MergeSeedParent ?? 1) !== 0;
 import { LOS_OCC_HI, LOS_OCC_LO, LOS_PATH_HI, LOS_PATH_LO, binDirTable, mergeLosWeight, worldKeysEnabled } from "./srcMath.js";
 import {
   cellPosition,
