@@ -461,7 +461,16 @@ frames with H=32) → **▶ 3.7 change-driven ray allocation**: texels the
 variance test flags get re-traced with extra rays next frame instead of
 forgetting their history (Lumen's importance-sampled probes) — the
 responsiveness the "things move a lot" mandate needs, without a knob.
-▶ Stage 4 next.
+3.10-3.13 (08-28 night): the determinism contract (§T: complete fixed
+direction sets every frame, no stochastic input; smooth accumulation of
+noise-free inputs allowed) → at rest 100 % of pixels still; then the
+WORLD-ANCHORED lattice (`worldProbes.js`, §U): orbit Δp95 3.87 → 0.11 %,
+chain 0.99 ms, 8/8 bracketed, first light frame 1 — held off-default by its
+±8 m horizon → **3.14 cascades** (2 m / 8 m spacing over 64 / 256 m sharing
+the ray budget). **The gather is now 3D radiance cascades inside the
+window** — world-anchored, complete, interpolated — the user's original
+idea, made affordable by §4.1-4.2. The screen-probe path stays until the
+cascades' receipts are ≥ 3.12's on every row. ▶ Stage 4 next.
 
 | unit | what | gate |
 |---|---|---|

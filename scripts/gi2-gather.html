@@ -63,6 +63,10 @@
         // `__gi2NoiseDump` follows. Setting it afterwards would do nothing, and
         // silently.
         if (params.has("world")) globalThis.__gi2WorldProbes = params.get("world") !== "0";
+        // §19 3.14: `?casc=1` collapses the lattice to ONE cascade — 3.13, out
+        // of 3.14's binary, on this page's own shader cache. Read at build for
+        // the same reason `?world` is: it is the addressing, not a lever.
+        if (params.has("casc")) globalThis.__gi2Cascades = Number(params.get("casc"));
 
         const THREE = await import("three/webgpu");
         const TSL = await import("three/tsl");
@@ -856,15 +860,24 @@
           `${(100 * statsIn.matureTexels / Math.max(1, statsIn.texelsSeen)).toFixed(1)} % (H = ${gd.history})`);
         if (gd.worldProbes) {
           const w = gd.world;
-          say(`§19 3.13 LATTICE: ${w.cells}³ = ${w.cellCount} cells at ${w.spacing} m (${w.extent} m cube), ` +
-            `${w.traceSlots} probes updated per frame × ${w.oct} directions = ${w.raysPerFrame} rays/frame budget; ` +
+          const NC = w.cascades ?? 1;
+          const LW = 2 * w.cellCount + w.blocks + 8;
+          const SLOTS = w.slots ?? [w.traceSlots];
+          say(`§19 3.14 CASCADES: ${NC} × ${w.cells}³ = ${w.cellCount} cells each, spacing ` +
+            `${(w.spacings ?? [w.spacing]).join(" / ")} m → extent ${(w.extents ?? [w.extent]).join(" / ")} m ` +
+            `(liveness level ${(w.liveLevel ?? [0]).join(" / ")}, band ${(100 * (w.band ?? 0)).toFixed(0)} %); ` +
+            `${w.traceSlots} probes/frame (${SLOTS.join(" / ")}) × ${w.oct} directions = ` +
+            `${w.raysPerFrame} rays/frame budget; ` +
             `${w.totalMB} MB (oct ${(w.bytes.oct / 1048576).toFixed(2)} + sh ${(w.bytes.sh / 1048576).toFixed(2)} + ` +
             `info ${(w.bytes.info / 1048576).toFixed(2)} + list ${(w.bytes.list / 1048576).toFixed(2)})`);
           const lst = new Uint32Array(await renderer.getArrayBufferAsync(gather.buffers.wpList.value));
-          say(`  live probes ${lst[w.cellCount * 2 + w.blocks]} of ${w.cellCount} candidate cells ` +
-            `(${(100 * lst[w.cellCount * 2 + w.blocks] / w.cellCount).toFixed(1)} %); ` +
-            `round-robin period ${Math.ceil(lst[w.cellCount * 2 + w.blocks] / w.traceSlots)} frame(s)`);
-          results.lattice = { ...w, live: lst[w.cellCount * 2 + w.blocks] };
+          const live = Array.from({ length: NC }, (_, c) => lst[c * LW + 2 * w.cellCount + w.blocks]);
+          for (let c = 0; c < NC; c++) {
+            say(`  c${c}: live probes ${live[c]} of ${w.cellCount} candidate cells ` +
+              `(${(100 * live[c] / w.cellCount).toFixed(1)} %); ` +
+              `round-robin period ${Math.ceil(live[c] / SLOTS[c])} frame(s)`);
+          }
+          results.lattice = { ...w, live, liveTotal: live.reduce((a, b) => a + b, 0) };
         }
         // ⚠ THE REPROJECTION CENSUS IS A SCREEN-PROBE INSTRUMENT and reads
         // 0/0 — BLIND, correctly — on the world path, where nothing reprojects

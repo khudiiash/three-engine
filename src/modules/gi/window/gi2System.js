@@ -74,6 +74,7 @@ import { createWindowVoxelizer } from "./windowVoxelize.js";
 import { createWindowDynamic, moverBoxSoup } from "./windowDynamic.js";
 import { createTriangleSoupBuilder, SoupSupersededError, PAL_NONE } from "./triangleSoup.js";
 import { createGiGather, GATHER_TIERS, PAL_ENTRIES, STATS } from "./gatherProbes.js";
+import { detachCpuMirror } from "../releaseCompute.js";
 
 /** Real palette classes; entry `PAL_ENTRIES - 1` is reserved for "no surface". */
 export const GI2_PAL_CLASSES = PAL_ENTRIES - 1;
@@ -514,6 +515,31 @@ export function createGi2System({
   let frame = 0;
   let disposed = false;
   let coarseFrames = 0;
+  /**
+   * ⭐⭐ §19 STAGE 3.14 — THE LATTICE'S CPU MIRRORS, DRAINED (audits §I.2).
+   *
+   * `instancedArray(new Uint32Array(n))` keeps the full typed array alive for
+   * the life of the attribute: three uploads it once and then never reads it,
+   * but `Buffer._buffer` captured it at first bind and `info.memoryMap` pins
+   * the attribute forever (§I.1). One 32³ lattice was 22 MB of that and nobody
+   * noticed; THREE cascades are 70 MB, which is more than the whole rest of
+   * GI2's JS side, and the flip is gated on a heap number.
+   *
+   * `detachCpuMirror` transfers the ArrayBuffer to zero length — a real free,
+   * not a bookkeeping line — but only AFTER the buffer has been uploaded, so
+   * the queue is drained from `passes()` (see the note there for why NOT from
+   * `notePassesRan`) and an entry that is not ready yet stays in the list and
+   * is retried. The list empties and stops costing anything. Receipt, from the
+   * Bistro motion run's console census: `[gi2] detached 4 lattice CPU
+   * mirror(s) — 66.8 MB of JS heap the GPU buffers do not need`.
+   *
+   * ⚠ ONLY GPU-ONLY BUFFERS GO IN HERE. `worldProbes.cpuMirrors()` publishes
+   * exactly its four, every one of which is written by a kernel and read by a
+   * kernel; `readLive` reads a READBACK copy, never `attr.array`. Anything the
+   * CPU writes later (`addUpdateRange` + `needsUpdate`) would silently upload
+   * zero bytes — see `detachCpuMirror`'s own warning.
+   */
+  let mirrorQueue = [];
   let cacheCleared = false;
   const t0 = performance.now();
   const marks = { build: 0, soup: 0, voxelizer: 0, occupancy: new Map(), firstLight: 0 };
@@ -626,7 +652,20 @@ export function createGi2System({
       if (Array.isArray(node)) node.forEach(stamp);
       else stamp(node);
     }
-    emitterDirect = emitters?.length ? buildEmitterDirectPass() : null;
+    // ⭐⭐ §19 STAGE 3.14 — NOT ON THE WORLD PATH. `emitterDirectPass` is one
+    // thread per SCREEN PROBE, adding each emitter slot's analytic solid angle
+    // into `probeSh`; under world probes there are no screen probes, `probeSh`
+    // has no reader, and `worldProbes`' own `neePass` already does exactly this
+    // job at every lattice probe, off the SAME `emitterSh` expression — so the
+    // energy is identical and this dispatch was writing a buffer nothing reads.
+    // Harmless by construction (3.13 kept `probeSh` at full size precisely so
+    // it would be) and still a kernel to compile, a pass to record and a bind
+    // group to keep alive on every frame of every world-path boot.
+    emitterDirect = (emitters?.length && !gather.worldProbes) ? buildEmitterDirectPass() : null;
+    // The new gather's lattice buffers, queued for their mirror detach. Re-set
+    // (not appended) because a resize replaces the gather and the DEAD one's
+    // attributes go to the retire queue, which frees them outright.
+    mirrorQueue = gather.world?.cpuMirrors?.() ?? [];
     // AO is armed LAZILY (first `passes()`), never here: `#armGtaoPass` assigns
     // `ao.node` after the screen chain is built, and this system is constructed
     // before it so its two textures can be the ones the chain points at. A
@@ -1080,6 +1119,32 @@ export function createGi2System({
     // §19 Stage 4.1: whatever the renderer's last timestamp resolve landed for
     // the pre-gbuffer chain. Publishes into `snapshot()`; drives nothing.
     drainVoxTimings(renderer);
+    // §19 3.14 — the lattice's CPU mirrors, once its kernels have bound them.
+    //
+    // ⚠ HERE AND NOT IN `notePassesRan`, WHICH IS WHAT IT LOOKED LIKE IT WANTED.
+    // That call only fires when the PRE-GBUFFER batch lands, and on a boot where
+    // the voxelizer's pipelines keep the batch deferred it never fires at all —
+    // so a queue drained from there could stay full for the life of the session,
+    // silently, which is the shape of the shadow-freeze bug (a caller-position
+    // dependency). `passes()` runs unconditionally every frame, and the real
+    // precondition (has this buffer been uploaded?) is checked inside
+    // `detachCpuMirror`, where it is a fact rather than an assumption.
+    if (mirrorQueue.length) {
+      const before = mirrorQueue.length;
+      let freed = 0;
+      mirrorQueue = mirrorQueue.filter((attr) => {
+        const bytes = attr?.array?.byteLength ?? 0;
+        if (!detachCpuMirror(renderer, attr)) return true;
+        freed += bytes;
+        return false;
+      });
+      // ⚠ ONE LINE, ONCE, AND ONLY WHEN THE QUEUE EMPTIES. §19 4.1 measured a
+      // per-frame `console.log` on a CDP-attached page at 21 ms of frame time.
+      if (freed > 0 && mirrorQueue.length === 0) {
+        console.log(`[gi2] detached ${before} lattice CPU mirror(s) — ` +
+          `${(freed / 1048576).toFixed(1)} MB of JS heap the GPU buffers do not need`);
+      }
+    }
 
     const before = [];
     // The window's own bookkeeping. `statsResetPass` every frame (its receipts

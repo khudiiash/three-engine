@@ -898,52 +898,81 @@ if (pick?.darkest) {
     const at = (i, v, c) => D[(i * V + v) * 4 + c];
     const info = new Float32Array(await eng.renderer.getArrayBufferAsync(g.buffers.wpInfo.value));
     const list = new Uint32Array(await eng.renderer.getArrayBufferAsync(g.buffers.wpList.value));
-    const o = g.uniforms.wpOrigin.value;
-    const C = w.cells; const SP = w.spacing; const CB = Math.log2(C);
-    const bias = g.uniforms.wpBias.value * SP;
-    let n = 0; let noCorner = 0; let faceOnly = 0; let sumAlive = 0; let sumAdm = 0;
+    // ⭐ §19 3.14 — THE SAME QUESTION, ONCE PER CASCADE. "No live corner" is
+    // only a fault if NO cascade had one: the resolve composites finest-first,
+    // and a pixel c0 cannot reach is c1's or c2's — which is this stage's whole
+    // claim. So the walk reports per cascade AND the combined "reached by
+    // nothing", which is the number the thin-feature gate actually rests on.
+    const NC = w.cascades ?? 1;
+    const C = w.cells; const CB = Math.log2(C); const CELLS = w.cellCount;
+    const LW = 2 * CELLS + w.blocks + 8;
+    const SPS = w.spacings ?? [w.spacing];
+    const origins = Array.from({ length: NC }, (_, c) => (g.uniforms[`wpOrigin${c}`] ?? g.uniforms.wpOrigin).value);
+    const per = Array.from({ length: NC }, () => ({ noCorner: 0, faceOnly: 0, sumAlive: 0, sumAdm: 0 }));
+    let n = 0; let noneAnywhere = 0;
     const depths = [];
     for (const i of idx) {
       if (!(at(i, 0, 3) > 0.5)) continue;
       const P = [at(i, 0, 0), at(i, 0, 1), at(i, 0, 2)];
       const N = [at(i, 1, 0), at(i, 1, 1), at(i, 1, 2)];
-      const Pb = P.map((v, k) => v + N[k] * bias);
-      const base = Pb.map((v) => Math.floor(v / SP - 0.5));
-      let alive = 0; let adm = 0;
-      for (let c = 0; c < 8; c++) {
-        const wc = [base[0] + (c & 1), base[1] + ((c >> 1) & 1), base[2] + ((c >> 2) & 1)];
-        const rel = [wc[0] - o.x, wc[1] - o.y, wc[2] - o.z];
-        if (rel.some((v) => v < 0 || v >= C)) continue;
-        const cell = (wc[0] & (C - 1)) | ((wc[1] & (C - 1)) << CB) | ((wc[2] & (C - 1)) << (2 * CB));
-        const st = info[(cell * 3 + 0) * 4 + 3];
-        const rdy = info[(cell * 3 + 2) * 4 + 3];
-        if (!(st > 0.5) || !(rdy > 0.5)) continue;
-        alive++;
-        const fN = [info[(cell * 3 + 1) * 4], info[(cell * 3 + 1) * 4 + 1], info[(cell * 3 + 1) * 4 + 2]];
-        const wf = st > 1.5 ? Math.max(0, N[0] * fN[0] + N[1] * fN[1] + N[2] * fN[2]) : 1;
-        if (wf > 0) adm++;
+      let anyAlive = 0;
+      for (let cc = 0; cc < NC; cc++) {
+        const SP = SPS[cc];
+        const o = origins[cc];
+        const bias = g.uniforms.wpBias.value * SP;
+        const Pb = P.map((v, k) => v + N[k] * bias);
+        const base = Pb.map((v) => Math.floor(v / SP - 0.5));
+        let alive = 0; let adm = 0;
+        for (let c = 0; c < 8; c++) {
+          const wc = [base[0] + (c & 1), base[1] + ((c >> 1) & 1), base[2] + ((c >> 2) & 1)];
+          const rel = [wc[0] - o.x, wc[1] - o.y, wc[2] - o.z];
+          if (rel.some((v) => v < 0 || v >= C)) continue;
+          const cell = cc * CELLS
+            + ((wc[0] & (C - 1)) | ((wc[1] & (C - 1)) << CB) | ((wc[2] & (C - 1)) << (2 * CB)));
+          const st = info[(cell * 3 + 0) * 4 + 3];
+          const rdy = info[(cell * 3 + 2) * 4 + 3];
+          if (!(st > 0.5) || !(rdy > 0.5)) continue;
+          alive++;
+          const fN = [info[(cell * 3 + 1) * 4], info[(cell * 3 + 1) * 4 + 1], info[(cell * 3 + 1) * 4 + 2]];
+          const wf = st > 1.5 ? Math.max(0, N[0] * fN[0] + N[1] * fN[1] + N[2] * fN[2]) : 1;
+          if (wf > 0) adm++;
+        }
+        per[cc].sumAlive += alive; per[cc].sumAdm += adm;
+        if (alive === 0) per[cc].noCorner++; else if (adm === 0) per[cc].faceOnly++;
+        anyAlive += alive;
       }
-      n++; sumAlive += alive; sumAdm += adm;
-      if (alive === 0) noCorner++;
-      else if (adm === 0) faceOnly++;
+      n++;
+      if (anyAlive === 0) noneAnywhere++;
       depths.push(Math.hypot(P[0] - eng.camera.position.x, P[1] - eng.camera.position.y, P[2] - eng.camera.position.z));
     }
     depths.sort((a, b) => a - b);
+    const pct = (v) => +(100 * v / Math.max(1, n)).toFixed(1);
     return {
-      n, noCornerPct: +(100 * noCorner / Math.max(1, n)).toFixed(1),
-      faceRejectPct: +(100 * faceOnly / Math.max(1, n)).toFixed(1),
-      meanAlive: +(sumAlive / Math.max(1, n)).toFixed(2),
-      meanAdmissible: +(sumAdm / Math.max(1, n)).toFixed(2),
-      live: list[w.cellCount * 2 + w.blocks], cells: w.cellCount, traceSlots: w.traceSlots,
+      n, cascades: NC, extents: w.extents ?? [w.extent], slots: w.slots ?? [w.traceSlots],
+      live: Array.from({ length: NC }, (_, c) => list[c * LW + 2 * CELLS + w.blocks]),
+      cells: CELLS,
+      noneAnywherePct: pct(noneAnywhere),
+      arms: per.map((p) => ({
+        noCornerPct: pct(p.noCorner), faceRejectPct: pct(p.faceOnly),
+        meanAlive: +(p.sumAlive / Math.max(1, n)).toFixed(2),
+        meanAdmissible: +(p.sumAdm / Math.max(1, n)).toFixed(2),
+      })),
       depthP50: +(depths[Math.floor(depths.length / 2)] ?? 0).toFixed(2),
       depthP95: +(depths[Math.floor(depths.length * 0.95)] ?? 0).toFixed(2),
     };
   }, { idx: pick.darkest });
   if (lat?.skip) console.log(`  lattice diagnostic: ${lat.skip}`);
-  else if (lat) console.log(`  LATTICE at the darkest pixels (n ${lat.n}): live probes ${lat.live}/${lat.cells} ` +
-    `(budget ${lat.traceSlots}/frame); of the 8 corners, ${lat.meanAlive} alive and ${lat.meanAdmissible} admissible ` +
-    `on average; ${lat.noCornerPct} % have NO live corner, ${lat.faceRejectPct} % have live corners but all face-rejected; ` +
-    `pixel distance p50 ${lat.depthP50} m p95 ${lat.depthP95} m`);
+  else if (lat) {
+    console.log(`  LATTICE at the darkest pixels (n ${lat.n}): ${lat.cascades} cascade(s); ` +
+      `pixel distance p50 ${lat.depthP50} m p95 ${lat.depthP95} m; ` +
+      `NO live corner in ANY cascade: ${lat.noneAnywherePct} %`);
+    for (let c = 0; c < lat.cascades; c++) {
+      const a = lat.arms[c];
+      console.log(`    c${c} (${lat.extents[c]} m, ${lat.slots[c]} slots/frame): live ${lat.live[c]}/${lat.cells}; ` +
+        `of the 8 corners ${a.meanAlive} alive / ${a.meanAdmissible} admissible; ` +
+        `${a.noCornerPct} % no live corner, ${a.faceRejectPct} % all face-rejected`);
+    }
+  }
 }
 
 // ── ARM 2: flip `ao`. STRUCTURAL — it rebuilds the whole GI chain ───────────

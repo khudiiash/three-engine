@@ -1,8 +1,9 @@
-// GI2 — THE WORLD-ANCHORED PROBE LATTICE (audits §U, Stage 3.13)
+// GI2 — THE WORLD-ANCHORED PROBE CASCADES (audits §U, Stage 3.13 → 3.14)
 //
-// RC's cascade 0, inside the window. A toroidal lattice of probes that follows
-// the camera the way `windowStore` does, one probe per live cell, each tracing
-// its COMPLETE fixed 64-direction set on a deterministic round-robin.
+// RC's cascades, inside the window. `NC` toroidal lattices that follow the
+// camera the way `windowStore` does, each four times coarser and four times
+// wider than the one below it, one probe per live cell, each tracing its
+// COMPLETE fixed 64-direction set on a deterministic round-robin.
 //
 // ══ WHY THIS EXISTS, IN ONE PARAGRAPH (3.11/3.12's measurement) ══════════════
 //
@@ -17,24 +18,49 @@
 // interpolation WEIGHTS, which are smooth. The term is gone by construction,
 // which is the one thing an EMA can never do.
 //
-// ══ THE THREE THINGS THAT MAKE THIS SIMPLE, AND WHY EACH IS NOT AN ACCIDENT ══
+// ══ WHY THERE ARE THREE OF THEM (3.13's measurement) ═════════════════════════
 //
-// 1. **THE SLOT IS THE CELL.** There is no allocator, no free list and no
-//    atomic anywhere in this file. A cell's probe lives at the cell's own
-//    toroidal index, so a scroll re-keys a slab of cells and nothing has to be
-//    moved, freed or reference-counted; "this slot now holds a different world
-//    cell" is `stored_wc != wc`, exactly `windowStore`'s brick-table rule
-//    (§K.1). A free list would have bought ~40 % of the memory back and cost a
-//    lock-free ring queue in a kernel that runs 32 768 threads a frame — and a
-//    racy allocator is a bug that shows up as one wrong probe somewhere in the
-//    world, which is the hardest possible thing to see.
+// 3.13 shipped ONE lattice — 32³ cells at 0.5 m, a 16 m cube — and it won
+// almost every receipt it was gated on (orbit Δp95 3.87 → 0.11 %, chain
+// 3.48 → 0.99 ms, Cornell 8/8, first light frame 14 → 1). It was still held
+// off by default for one structural reason: **a 16 m cube has a horizon and a
+// 100 m street does not.** On Bistro's doors pose the picked dark pixels ran
+// to a p95 of 15 m and 6.3 % of them had NO live corner at all; a boundary
+// clamp took the thin-feature ratio from 55.8 % to 64.5 % and could not reach
+// the 70 % gate, because what it extrapolates is the ambient measured at the
+// lattice's EDGE and a far façade is not lit like the edge of the near room.
+//
+// The answer is RC's own and it is not a bigger cube. A cascade's job is to
+// carry the light whose ANGULAR frequency it can still resolve: near light
+// changes fast in space and needs 0.5 m probes, far light changes slowly and
+// an 8 m probe is not merely adequate but CORRECT — its 64 directions cover
+// the far field at exactly the resolution the far field has. Four times the
+// spacing over four times the extent is the same probe count for sixty-four
+// times the volume, and the ray budget splits 70/20/10 because a cascade that
+// resolves slow light does not need to be re-traced as often. Three of them
+// reach 256 m, which is the window's own outermost level.
+//
+// ══ THE FOUR THINGS THAT MAKE THIS SIMPLE, AND WHY EACH IS NOT AN ACCIDENT ══
+//
+// 1. **THE SLOT IS THE CELL, AND THE CASCADE IS THE HIGH BITS.** There is no
+//    allocator, no free list and no atomic anywhere in this file. A cell's
+//    probe lives at `cascade · CELLS + cell`, so a scroll re-keys a slab of
+//    cells and nothing has to be moved, freed or reference-counted; "this slot
+//    now holds a different world cell" is `stored_wc != wc`, exactly
+//    `windowStore`'s brick-table rule (§K.1). Each cascade carries its own
+//    origin, its own live list and its own round-robin phase, and shares every
+//    kernel — which is the whole reason a third cascade costs no compile time
+//    (see 4).
 //
 // 2. **THE OCT TEXEL IS TWO WORDS, NOT A `vec4`.** RGBE radiance + a packed
-//    (n, meanDist, rmsDist). Sixteen bytes per texel would be 33.5 MB at the
-//    desktop lattice; eight is 16.8. The second word is not padding — the two
+//    (n, meanDist, rmsDist). Sixteen bytes per texel would be 100 MB at the
+//    desktop cascades; eight is 50. The second word is not padding — the two
 //    distance MOMENTS are what the resolve's visibility test needs (DDGI's
 //    Chebyshev), and they were free in the half of the alpha the screen probes
-//    spend on σ (which has had no reader since §19 3.10).
+//    spend on σ (which has had no reader since §19 3.10). The moments are
+//    quantized against the CASCADE'S OWN spacing, so an 8 m probe stores
+//    distances out to 64 m at the same 12-bit precision a 0.5 m probe uses out
+//    to 4 m — one more quantity in units of what the lattice measures.
 //
 // 3. **THE ROUND-ROBIN IS OVER A COMPACTED LIST, AND THE COMPACTION IS A
 //    DETERMINISTIC PREFIX SUM.** A lattice is mostly empty — a sealed Cornell
@@ -42,55 +68,70 @@
 //    launch a million threads to do a hundred thousand rays' work, and this
 //    file's own history says a launch-bound kernel is 3.3 ns per thread whether
 //    it works or not. Three tiny kernels (count per 256-cell block, prefix-sum
-//    128 blocks in one thread, fill) turn the live set into a dense list whose
-//    ORDER is a pure function of the occupancy — no atomics, so two frames with
-//    the same world produce byte-identical lists and therefore byte-identical
-//    update schedules. That is what makes §T's "at rest, zero flips" hold.
+//    the blocks in ONE THREAD PER CASCADE, fill) turn each cascade's live set
+//    into a dense list whose ORDER is a pure function of the occupancy — no
+//    atomics, so two frames with the same world produce byte-identical lists
+//    and therefore byte-identical update schedules. That is what makes §T's
+//    "at rest, zero flips" hold.
 //
-// ══ WHERE §U BENDS ══════════════════════════════════════════════════════════
-//
-// §U.1 asks for "two probes for a thin wall's two faces". This ships ONE probe
-// per cell and gives the job to the two gates that already had to exist: the
-// probe's FACE (a cell whose centre is inside geometry is pushed out along its
-// dominant normal and remembers which way it went, so a pixel on the other side
-// weights it zero) and the resolve's VISIBILITY test (a probe on the far side
-// of a wall is occluded from the pixel by that wall). A second slot per cell
-// doubles the largest buffer in the system to defend a case the open-air cells
-// on either side of the wall already cover — 0.5 m apart, a 5 cm wall has a
-// free cell on each side. The thin-wall interior receipt is what says whether
-// that reading was right.
+// 4. **ONE SET OF KERNELS, `NC` LATTICES.** The obvious build — call this
+//    factory three times — would inline `shadeHit` three times, and `shadeHit`
+//    alone is ~25 kB of WGSL that measured 2.5 s of pipeline compile at Stage
+//    3.5. The cascade index is therefore a THREAD-INDEX BIT, not a JS loop:
+//    every kernel dispatches `NC ×` its old width and derives `(cascade, cell)`
+//    from `instanceIndex`. Spacings, origins, liveness levels and slot counts
+//    are compile-time constants selected by a `select` chain over that index —
+//    three constants and two compares, against three copies of the biggest
+//    shader in the system.
 import * as THREE from "three/webgpu";
 import {
   Break, Fn, If, Loop, Return, bitAnd, bitOr, ceil, dot, exp2, float, globalId, instanceIndex,
-  instancedArray, int, log2, max, min, mix, normalize, select, shiftLeft, shiftRight, sqrt, uint,
+  instancedArray, int, log2, max, min, mix, select, shiftLeft, shiftRight, sqrt, uint,
   uniform, vec3, vec4,
 } from "three/tsl";
 import { BMASK_OFF, LEVEL_WORDS, N, OCC_OFF } from "./windowStore.js";
 import { normalOfFace } from "./radianceCache.js";
 
 /**
- * Tier constants. `cells` and `spacing` are compiled into the WGSL (they are
- * the addressing); `traceSlots` is the frame's ray budget divided by 64.
+ * Tier constants. `cells`, `spacing`, `ratio` and `cascades` are compiled into
+ * the WGSL (they are the addressing); `traceSlots` is the frame's ray budget
+ * divided by 64, split across the cascades by `share`.
  *
  * `cells` must be a POWER OF TWO — the toroidal mask is `& (cells − 1)`, the
  * same identity `windowStore`'s `& 63` is.
  *
- * The extent is `cells · spacing`: 16 m on every tier, which is L0's own window
- * at the desktop voxel size. A lattice larger than the finest occupancy that
- * feeds it would be allocating probes for cells whose liveness test reads a
- * coarser level than the probe can represent.
+ * Cascade `c` spans `cells · spacing · ratio^c`: 16 / 64 / 256 m on desktop,
+ * 16 / 64 m on the phone tiers (three window levels, so a third cascade would
+ * have no occupancy to read past 128 m — see `LMIN`).
+ *
+ * ⭐ THE SHARE IS THE UPDATE CADENCE. A cascade with 10 % of the slots and a
+ * comparable live count is re-traced a seventh as often as one with 70 %, which
+ * is RC's own law expressed in the only currency this file has. Nothing else in
+ * the file knows that a cascade is "slow".
  */
 export const WORLD_TIERS = {
-  phone: { cells: 16, spacing: 1.0, traceSlots: 1024, block: 64 },
-  medium: { cells: 16, spacing: 1.0, traceSlots: 1024, block: 64 },
-  high: { cells: 32, spacing: 0.5, traceSlots: 6144, block: 256 },
-  ultra: { cells: 32, spacing: 0.5, traceSlots: 6144, block: 256 },
+  phone: { cells: 16, spacing: 1.0, traceSlots: 1024, block: 64, cascades: 2, ratio: 4, share: [0.75, 0.25] },
+  medium: { cells: 16, spacing: 1.0, traceSlots: 1024, block: 64, cascades: 2, ratio: 4, share: [0.75, 0.25] },
+  high: { cells: 32, spacing: 0.5, traceSlots: 6144, block: 256, cascades: 3, ratio: 4, share: [0.70, 0.20, 0.10] },
+  ultra: { cells: 32, spacing: 0.5, traceSlots: 6144, block: 256, cascades: 3, ratio: 4, share: [0.70, 0.20, 0.10] },
 };
 
-/** The distance moments' quantization range, in units of the lattice spacing. */
+/** The distance moments' quantization range, in units of the CASCADE's spacing. */
 export const DIST_CELLS = 8;
 /** 12 bits each for the two moments, 8 for the sample count. */
 export const DQ = 4095;
+/**
+ * The cascade hand-off band, as a fraction of a cascade's extent.
+ *
+ * ⭐ A HARD CASCADE BOUNDARY IS A VISIBLE EDGE THAT MOVES WITH THE CAMERA —
+ * the one failure mode a world-anchored design can still have, because the
+ * lattice bounds are the only thing in it that is camera-relative. The outer
+ * 10 % of each cascade fades its own confidence to zero, so a pixel's
+ * irradiance crosses from cascade to cascade over 1.6 m (c0) or 6.4 m (c1) —
+ * both wider than the hysteretic origin step (2 m / 8 m) that moves the
+ * boundary, so a scroll cannot uncover a hard edge.
+ */
+export const BAND = 0.10;
 
 /**
  * The hysteretic origin step for one lattice axis, in whole BLOCKS of cells.
@@ -120,7 +161,7 @@ export function stepLatticeOrigin(camCell, prev, cells, blk = 4) {
  * @param {object} opts.kit    the SHADING KIT — the closures `gatherProbes`
  *   already owns and this file must not duplicate: `u` (its uniform bag),
  *   `octU` (the direction table), `cellOfWorld`, `dominantFace`,
- *   `faceSamplePoint`, `shadeHit`, `emitterSh` … see `createGiGather`.
+ *   `hitRadiance`, `emitterSh` … see `createGiGather`.
  *
  *   ⚠ THE KIT IS PASSED, NOT REBUILT. `shadeHit` alone inlines a sun ray, four
  *   sky rays, every emitter slot's NEE and (on the rig) four panel strata; a
@@ -135,11 +176,24 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const C = spec.cells;
   const CB = Math.log2(C);
   const CELLS = C * C * C;
-  const SP = spec.spacing;
-  const TRACE_SLOTS = Math.min(spec.traceSlots, CELLS);
+  const CELLB = Math.log2(CELLS);
+  /**
+   * ⭐ `globalThis.__gi2Cascades = 1` IS 3.13, OUT OF 3.14'S BINARY.
+   *
+   * Every 3.14 receipt is a comparison against the single lattice, and an A/B
+   * against a previous COMMIT is an A/B across a different shader cache, a
+   * different driver state and a different night. One cascade with the boundary
+   * clamp on it (the clamp is the LAST cascade's, and with `NC = 1` the last is
+   * the only) is 3.13 exactly — same kernels, same WGSL text apart from the
+   * select chains folding to constants, same page. Read BEFORE the build,
+   * because it is the addressing.
+   */
+  const NC = Math.max(1, Math.min(spec.cascades, globalThis.__gi2Cascades ?? spec.cascades));
+  const RATIO = spec.ratio;
+  const SP0 = spec.spacing;
   const BLOCK = spec.block;
   const BLOCKS = CELLS / BLOCK;
-  const DMAXW = DIST_CELLS * SP;
+  const ALL_CELLS = CELLS * NC;
 
   const {
     u, octU, cellOfWorld, dominantFace, hitRadiance, emitterSh, bump, STATS, RAY_MAX, OCT,
@@ -147,27 +201,73 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const { traceWindow } = trace;
   const v0 = win.voxel0;
 
+  /** Cascade `c`'s spacing, extent and moment range — all compile-time. */
+  const SPC = Array.from({ length: NC }, (_, c) => SP0 * RATIO ** c);
+  const EXT = SPC.map((s) => C * s);
+  const DMAX = SPC.map((s) => DIST_CELLS * s);
+  /**
+   * The window level cascade `c` reads its LIVENESS from.
+   *
+   * ⭐ THE LIVENESS LEVEL IS THE ONE WHOSE VOXEL IS HALF THE PROBE SPACING, so
+   * every cascade's "±1 cell" dilation is the SAME 4³ voxel scan — the loop
+   * bound below is a compile-time 64 on every cascade of every tier, and the
+   * dilation means the same thing (one voxel out) at 0.5 m and at 8 m. Cascade
+   * 0 keeps 3.13's rule (the FINEST level containing the point) because at the
+   * desktop tier the lattice and L0 are both 16 m but snap differently, so an
+   * edge cell is legitimately L1's.
+   *
+   * ⚠ CLAMPED TO THE WINDOW'S LAST LEVEL. `high` has four levels (128 m) and
+   * `ultra` five (256 m); on `high`, cascade 2's outer cells sit past L3's
+   * window and `occAt` would read another cell's bits through the torus. They
+   * are DEAD instead — see `levelAtLeast`, the guard 3.13 never needed because
+   * one 16 m lattice is inside L0 by construction.
+   */
+  const LMIN = SPC.map((s, c) => (c === 0
+    ? 0
+    : Math.min(win.levels - 1, Math.max(0, Math.round(Math.log2(s / v0)) - 1))));
+
+  /**
+   * The ray budget, split by `share` and rounded to the trace kernel's 8-wide
+   * workgroup so every cascade's slots start on a workgroup boundary and no
+   * workgroup straddles two cascades.
+   */
+  const SLOTS = (() => {
+    // Renormalized over the cascades that EXIST, so `__gi2Cascades = 1` hands
+    // the whole 6144-slot budget to cascade 0 — 3.13's number exactly, not 70 %
+    // of it. An arm that quietly cuts the ray budget is not an arm.
+    const sh = spec.share.slice(0, NC);
+    const tot = sh.reduce((a, b) => a + b, 0);
+    const raw = sh.map((f) => Math.max(8, Math.round((spec.traceSlots * (f / tot)) / 8) * 8));
+    const drift = spec.traceSlots - raw.reduce((a, b) => a + b, 0);
+    raw[0] += drift; // the finest cascade absorbs the rounding, in its own favour
+    return raw.map((n) => Math.min(n, CELLS));
+  })();
+  const SLOT_BASE = SLOTS.map((_, i) => SLOTS.slice(0, i).reduce((a, b) => a + b, 0));
+  const TRACE_SLOTS = SLOTS.reduce((a, b) => a + b, 0);
+
   // ── buffers ───────────────────────────────────────────────────────────────
   //
-  // `wpOct` is the whole cost of this design and it is deliberately the only
-  // thing that scales with the lattice: two u32 per (cell, texel).
+  // Indexed by the GLOBAL cell `gc = cascade · CELLS + cell`. `wpOct` is the
+  // whole cost of this design and it is deliberately the only thing that scales
+  // with the lattice: two u32 per (cell, texel).
   //   word 0  RGBE radiance (0 = never written — the same sentinel the cache's
   //           own words use, so "no data" and "black" stay distinguishable)
   //   word 1  n<<24 | rmsQ<<12 | meanQ   — the two distance moments
-  const wpOct = instancedArray(new Uint32Array(CELLS * OCT * 2), "uint");
+  const wpOct = instancedArray(new Uint32Array(ALL_CELLS * OCT * 2), "uint");
   /** Nine SH2 coefficients per cell. What the resolve reads. */
-  const wpSh = instancedArray(new Float32Array(CELLS * 9 * 4), "vec4");
+  const wpSh = instancedArray(new Float32Array(ALL_CELLS * 9 * 4), "vec4");
   /**
    * Three vec4 per cell:
    *   0  (probe position, state)   state 0 dead · 1 open-air · 2 faced
    *   1  (face normal, 0)
    *   2  (world cell coord, ready) ready 0 = the map is not trustworthy yet
    */
-  const wpInfo = instancedArray(new Float32Array(CELLS * 3 * 4), "vec4");
+  const wpInfo = instancedArray(new Float32Array(ALL_CELLS * 3 * 4), "vec4");
   /**
    * ONE buffer for the compaction, because the trace stands at the portable
    * envelope's six storage bindings exactly (window, cache, oct, info, list,
    * stats) and a seventh for an integer would not compile on the phone tier.
+   * Each cascade owns a contiguous `LIST_WORDS` run:
    *   [0, CELLS)                 the per-cell live FLAG
    *   [CELLS, 2·CELLS)           the dense live LIST
    *   [2·CELLS, +BLOCKS)         per-block base (count, then prefix)
@@ -178,11 +278,10 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const BASE_OFF = 2 * CELLS;
   const CTL_OFF = BASE_OFF + BLOCKS;
   const LIST_WORDS = CTL_OFF + 8;
-  const wpList = instancedArray(new Uint32Array(LIST_WORDS), "uint");
+  const wpList = instancedArray(new Uint32Array(LIST_WORDS * NC), "uint");
 
   // ── uniforms owned here (merged into the gather's bag by the caller) ──────
   const wu = {
-    wpOrigin: uniform(new THREE.Vector3()),
     /**
      * §U.2's fixed α between complete updates. It cannot remove noise (there is
      * none: the probe does not move, so its 64 rays are the same rays every
@@ -195,9 +294,17 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     /** 0 removes the probe-face gate; the other half of the same control. */
     wpFaceOn: uniform(1),
     /**
-     * The surface bias, as a fraction of the lattice spacing. A pixel is
-     * sampled at `P + N·bias` so its own surface cannot occlude it from the
-     * probes above it. A FRACTION of what the lattice measures, never metres.
+     * The surface bias, as a fraction of the FINEST cascade's spacing — 15 cm
+     * on every cascade. A pixel is sampled at `P + N·bias·s_0` so its own
+     * surface cannot occlude it from the probes above it.
+     *
+     * ⭐⭐ AND IT IS `s_0`, NOT `s_c`, BECAUSE OF WHAT IT HAS TO CLEAR. Scaling
+     * it by the SAMPLED cascade made it 60 cm at c1 and 2.4 m at c2, and a
+     * façade sampled 2.4 m out into an open street is not the same surface:
+     * the far-field receipt measured every façade past 55 m composited BLACK
+     * (the displaced point's eight corners were all dead) and the 30-55 m band
+     * 1.67× too bright. A length that has to clear a SURFACE belongs in the
+     * surface's units, not in the sampler's. See audits §V.3.
      */
     wpBias: uniform(0.3),
     /**
@@ -207,6 +314,39 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
      * over-occludes every pixel a few centimetres past it.
      */
     wpVarFloor: uniform(0.5),
+    /**
+     * 1 = the cascades resolve; 0 = cascade 0 alone, which is 3.13 exactly.
+     *
+     * ⭐ THE RECEIPT THAT SAYS THE CASCADES FIXED THE HORIZON NEEDS THE VERSION
+     * WITHOUT THEM, and an A/B against a previous COMMIT is an A/B across a
+     * different shader cache and a different night's driver. Both arms out of
+     * one binary, like every other lever in this module.
+     */
+    wpCascadesOn: uniform(1),
+  };
+  /** One origin per cascade (i32 cell coords, in that cascade's own spacing). */
+  const originsU = Array.from({ length: NC }, () => uniform(new THREE.Vector3()));
+
+  // ── the cascade index, and the compile-time constants it selects ──────────
+  const pickF = (cascU, vals) => {
+    let node = float(vals[NC - 1]);
+    for (let c = NC - 2; c >= 0; c--) node = select(cascU.equal(uint(c)), float(vals[c]), node);
+    return node;
+  };
+  const pickI = (cascU, vals) => {
+    let node = int(vals[NC - 1]);
+    for (let c = NC - 2; c >= 0; c--) node = select(cascU.equal(uint(c)), int(vals[c]), node);
+    return node;
+  };
+  const pickU = (cascU, vals) => {
+    let node = uint(vals[NC - 1]);
+    for (let c = NC - 2; c >= 0; c--) node = select(cascU.equal(uint(c)), uint(vals[c]), node);
+    return node;
+  };
+  const pickV = (cascU, nodes) => {
+    let node = vec3(nodes[NC - 1]);
+    for (let c = NC - 2; c >= 0; c--) node = select(cascU.equal(uint(c)), vec3(nodes[c]), node);
+    return node;
   };
 
   // ── addressing ────────────────────────────────────────────────────────────
@@ -216,9 +356,11 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   shiftLeft(bitAnd(z, int(C - 1)).toUint(), uint(2 * CB)));
   /** Un-torus one axis: the origin says which window the low bits belong to. */
   const unTorus = (bits, o) => o.toInt().add(bitAnd(bits.toInt().sub(o.toInt()), int(C - 1)));
-  const infoIdx = (cell, k) => cell.mul(uint(3)).add(uint(k));
-  const shIdxW = (cell, k) => cell.mul(uint(9)).add(uint(k));
-  const octIdxW = (cell, texel) => cell.mul(uint(OCT * 2)).add(texel.mul(uint(2)));
+  const infoIdx = (gc, k) => gc.mul(uint(3)).add(uint(k));
+  const shIdxW = (gc, k) => gc.mul(uint(9)).add(uint(k));
+  const octIdxW = (gc, texel) => gc.mul(uint(OCT * 2)).add(texel.mul(uint(2)));
+  /** The list word `off` inside cascade `casc`'s own run. */
+  const listAt = (cascU, off) => wpList.element(cascU.mul(uint(LIST_WORDS)).add(off));
 
   // ── window reads ──────────────────────────────────────────────────────────
   const viOf = (x, y, z) => bitOr(bitOr(
@@ -238,6 +380,30 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       win.buffer.element(levelU.mul(uint(LEVEL_WORDS)).add(uint(BMASK_OFF)).add(shiftRight(b, uint(5)))),
       shiftLeft(uint(1), bitAnd(b, uint(31))),
     ).notEqual(uint(0));
+  };
+  /**
+   * The finest window level ≥ `lminI` whose 64-cell window contains `p`, and
+   * whether ANY level qualified.
+   *
+   * ⭐⭐ "NO LEVEL CONTAINS IT" IS A DIFFERENT ANSWER FROM "THE LAST LEVEL", and
+   * `cellOfWorld` cannot tell them apart — it falls back to `levels − 1` and
+   * the toroidal address then aliases onto a cell 128 m away. Cascade 0 lives
+   * inside L0 by construction so 3.13 never met the case; cascade 2 reaches
+   * 256 m and meets it on every `high` boot. A cell whose occupancy cannot be
+   * read holds NO probe, which is the only honest answer and also the cheap one.
+   */
+  const levelAtLeast = (p, lminI) => {
+    const level = int(win.levels - 1).toVar();
+    const found = float(0).toVar();
+    for (let l = win.levels - 1; l >= 0; l--) {
+      const rel = p.div(v0 * 2 ** l).floor().sub(win.originAt(int(l))).toVar();
+      const ok = rel.x.greaterThanEqual(0).and(rel.y.greaterThanEqual(0)).and(rel.z.greaterThanEqual(0))
+        .and(rel.x.lessThan(N)).and(rel.y.lessThan(N)).and(rel.z.lessThan(N))
+        .and(int(l).greaterThanEqual(lminI)).toVar();
+      level.assign(select(ok, int(l), level));
+      found.assign(select(ok, float(1), found));
+    }
+    return { level, found };
   };
 
   // ── the oct texel's two words ─────────────────────────────────────────────
@@ -260,57 +426,66 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       bitAnd(shiftRight(word, uint(16)), uint(255)).toFloat().mul(s),
     );
   };
-  const quantD = (d) => d.div(DMAXW).clamp(0, 1).mul(DQ).add(0.5).floor().toUint();
-  const packMoments = (nU, meanF, rmsF) => bitOr(
-    bitOr(shiftLeft(nU.min(uint(255)), uint(24)), shiftLeft(quantD(rmsF), uint(12))),
-    quantD(meanF),
+  // ⭐ THE MOMENTS ARE IN UNITS OF THE CASCADE'S OWN SPACING. `dmax` is
+  // `DIST_CELLS · s_c` — a compile-time float on the resolve's side (the
+  // cascade is a JS loop index there) and a three-way select on the trace's.
+  const quantD = (d, dmax) => d.div(dmax).clamp(0, 1).mul(DQ).add(0.5).floor().toUint();
+  const packMoments = (nU, meanF, rmsF, dmax) => bitOr(
+    bitOr(shiftLeft(nU.min(uint(255)), uint(24)), shiftLeft(quantD(rmsF, dmax), uint(12))),
+    quantD(meanF, dmax),
   );
-  const meanOf = (w) => bitAnd(w, uint(DQ)).toFloat().mul(DMAXW / DQ);
-  const rmsOf = (w) => bitAnd(shiftRight(w, uint(12)), uint(DQ)).toFloat().mul(DMAXW / DQ);
+  const meanOf = (w, dmax) => bitAnd(w, uint(DQ)).toFloat().mul(dmax).div(DQ);
+  const rmsOf = (w, dmax) => bitAnd(shiftRight(w, uint(12)), uint(DQ)).toFloat().mul(dmax).div(DQ);
   const nOf = (w) => shiftRight(w, uint(24));
 
   // ══════════════════════════════════════════ SHADER: probeAlloc (§U.1)
   //
-  // One thread per LATTICE CELL. Decides, from the window's own occupancy,
-  // whether this cell holds a live probe; where that probe stands; and which
-  // face (if any) it represents. Everything it writes is a pure function of
-  // (cell, origin, occupancy) — run it twice on one frame and it writes the
-  // same bytes, which is what lets it run every frame instead of maintaining
-  // state nobody can audit.
+  // One thread per (CASCADE, LATTICE CELL). Decides, from the window's own
+  // occupancy, whether this cell holds a live probe; where that probe stands;
+  // and which face (if any) it represents. Everything it writes is a pure
+  // function of (cascade, cell, origin, occupancy) — run it twice on one frame
+  // and it writes the same bytes, which is what lets it run every frame instead
+  // of maintaining state nobody can audit.
   const allocPass = Fn(() => {
-    const cell = instanceIndex.toVar();
+    const gc = instanceIndex.toVar();
+    const casc = shiftRight(gc, uint(CELLB)).toVar();
+    const cell = bitAnd(gc, uint(CELLS - 1)).toVar();
     const cx = bitAnd(cell, uint(C - 1)).toInt().toVar();
     const cy = bitAnd(shiftRight(cell, uint(CB)), uint(C - 1)).toInt().toVar();
     const cz = bitAnd(shiftRight(cell, uint(2 * CB)), uint(C - 1)).toInt().toVar();
-    const o = wu.wpOrigin;
+    const sp = pickF(casc, SPC).toVar();
+    const lmin = pickI(casc, LMIN).toVar();
+    const o = pickV(casc, originsU).toVar();
     const wc = vec3(
       unTorus(cx, o.x).toFloat(), unTorus(cy, o.y).toFloat(), unTorus(cz, o.z).toFloat(),
     ).toVar();
-    const p = wc.add(0.5).mul(SP).toVar();
+    const p = wc.add(0.5).mul(sp).toVar();
 
     // §U.4: a scroll re-keys the entering slab. The slot keeps its memory only
     // while it keeps its identity — `stored != wc` is the whole test, and a
     // fresh probe then takes α = 1 on its first update.
-    const prev2 = wpInfo.element(infoIdx(cell, 2)).toVar();
+    const prev2 = wpInfo.element(infoIdx(gc, 2)).toVar();
     const same = prev2.x.equal(wc.x).and(prev2.y.equal(wc.y)).and(prev2.z.equal(wc.z)).toVar();
     const ready = select(same, prev2.w, float(0)).toVar();
 
     const dead = () => {
-      wpList.element(uint(FLAG_OFF).add(cell)).assign(uint(0));
-      wpInfo.element(infoIdx(cell, 0)).assign(vec4(p, 0));
-      wpInfo.element(infoIdx(cell, 1)).assign(vec4(0, 1, 0, 0));
-      wpInfo.element(infoIdx(cell, 2)).assign(vec4(wc, 0));
+      listAt(casc, uint(FLAG_OFF).add(cell)).assign(uint(0));
+      wpInfo.element(infoIdx(gc, 0)).assign(vec4(p, 0));
+      wpInfo.element(infoIdx(gc, 1)).assign(vec4(0, 1, 0, 0));
+      wpInfo.element(infoIdx(gc, 2)).assign(vec4(wc, 0));
     };
 
-    // The finest level whose window holds this cell. §K's rule, and not
-    // optional: at the desktop tier the lattice and L0 are both 16 m but their
-    // origins snap differently, so a lattice cell near the edge is L1's.
-    const lc = cellOfWorld(p);
-    const lvl = lc.level.toVar();
+    // The level this cascade reads its occupancy from. A cell no level can
+    // answer for is DEAD, not aliased — see `levelAtLeast`.
+    const la = levelAtLeast(p, lmin);
+    If(la.found.lessThan(0.5), () => { dead(); Return(); });
+    const lvl = la.level.toVar();
     const lvlU = lvl.toUint().toVar();
     const vl = float(v0).mul(exp2(lvl.toFloat())).toVar();
     // The window cells the probe cell spans, dilated by one (§U.1's "±1 cell").
-    const c0 = p.sub(SP * 0.5).div(vl).floor().sub(1).toVar();
+    // `s_c / v_l = 2` on every cascade by `LMIN`'s construction, so the span is
+    // always 2 cells and the dilated scan is always 4³.
+    const c0 = p.sub(sp.mul(0.5)).div(vl).floor().sub(1).toVar();
 
     // ── the cheap rejection: the 2×2×2 BRICKS around the dilated span ───────
     //
@@ -376,67 +551,92 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       If(state.lessThan(0.5), () => { dead(); Return(); });
     });
 
-    wpList.element(uint(FLAG_OFF).add(cell)).assign(uint(1));
-    wpInfo.element(infoIdx(cell, 0)).assign(vec4(pos, state));
-    wpInfo.element(infoIdx(cell, 1)).assign(vec4(faceN, 0));
-    wpInfo.element(infoIdx(cell, 2)).assign(vec4(wc, ready));
-  })().compute(CELLS);
+    listAt(casc, uint(FLAG_OFF).add(cell)).assign(uint(1));
+    wpInfo.element(infoIdx(gc, 0)).assign(vec4(pos, state));
+    wpInfo.element(infoIdx(gc, 1)).assign(vec4(faceN, 0));
+    wpInfo.element(infoIdx(gc, 2)).assign(vec4(wc, ready));
+  })().compute(ALL_CELLS);
 
   // ══════════════════════════════════ SHADERS: the compaction (count/scan/fill)
   //
-  // A deterministic, atomic-free prefix sum. `countPass` is one thread per
-  // 256-cell block; `scanPass` is ONE thread over 128 block counts; `fillPass`
-  // is one thread per block again, writing its own contiguous run. Nothing
-  // races, so the list is a pure function of the flags — which is what makes
-  // "which probes update this frame" a pure function of the frame index and
-  // therefore makes a parked camera byte-identical (§T).
+  // A deterministic, atomic-free prefix sum, run once PER CASCADE inside the
+  // same three dispatches. `countPass` is one thread per 256-cell block of one
+  // cascade; `scanPass` is ONE THREAD PER CASCADE over its own block counts;
+  // `fillPass` is one thread per block again, writing its own contiguous run.
+  // Nothing races, so each list is a pure function of its flags — which is what
+  // makes "which probes update this frame" a pure function of the frame index
+  // and therefore makes a parked camera byte-identical (§T).
   const countPass = Fn(() => {
-    const b = instanceIndex.toVar();
+    const gb = instanceIndex.toVar();
+    const casc = gb.div(uint(BLOCKS)).toVar();
+    const b = gb.sub(casc.mul(uint(BLOCKS))).toVar();
     const base = b.mul(uint(BLOCK)).toVar();
     const n = uint(0).toVar();
     Loop({ start: 0, end: BLOCK, name: "wpCount" }, ({ wpCount }) => {
-      n.addAssign(wpList.element(uint(FLAG_OFF).add(base).add(uint(wpCount))));
+      n.addAssign(listAt(casc, uint(FLAG_OFF).add(base).add(uint(wpCount))));
     });
-    wpList.element(uint(BASE_OFF).add(b)).assign(n);
-  })().compute(BLOCKS);
+    listAt(casc, uint(BASE_OFF).add(b)).assign(n);
+  })().compute(BLOCKS * NC);
 
   const scanPass = Fn(() => {
+    const casc = instanceIndex.toVar();
     const run = uint(0).toVar();
     Loop({ start: 0, end: BLOCKS, name: "wpScan" }, ({ wpScan }) => {
       const i = uint(BASE_OFF).add(uint(wpScan)).toVar();
-      const c = wpList.element(i).toVar();
-      wpList.element(i).assign(run);
+      const c = listAt(casc, i).toVar();
+      listAt(casc, i).assign(run);
       run.addAssign(c);
     });
-    wpList.element(uint(CTL_OFF)).assign(run);
-  })().compute(1);
+    listAt(casc, uint(CTL_OFF)).assign(run);
+  })().compute(NC);
 
   const fillPass = Fn(() => {
-    const b = instanceIndex.toVar();
+    const gb = instanceIndex.toVar();
+    const casc = gb.div(uint(BLOCKS)).toVar();
+    const b = gb.sub(casc.mul(uint(BLOCKS))).toVar();
     const base = b.mul(uint(BLOCK)).toVar();
-    const w = wpList.element(uint(BASE_OFF).add(b)).toVar();
+    const w = listAt(casc, uint(BASE_OFF).add(b)).toVar();
     Loop({ start: 0, end: BLOCK, name: "wpFill" }, ({ wpFill }) => {
       const cell = base.add(uint(wpFill)).toVar();
-      If(wpList.element(uint(FLAG_OFF).add(cell)).greaterThan(uint(0)), () => {
-        wpList.element(uint(LIST_OFF).add(w)).assign(cell);
+      If(listAt(casc, uint(FLAG_OFF).add(cell)).greaterThan(uint(0)), () => {
+        listAt(casc, uint(LIST_OFF).add(w)).assign(cell);
         w.addAssign(uint(1));
       });
     });
-  })().compute(BLOCKS);
+  })().compute(BLOCKS * NC);
 
-  // ── the round-robin (§U.2) ────────────────────────────────────────────────
+  // ── the round-robin (§U.2), one phase per cascade ─────────────────────────
   //
-  // Frame `f` updates the `TRACE_SLOTS` list entries starting at
-  // `f·TRACE_SLOTS mod live`. Every live probe is therefore updated exactly
-  // once every `ceil(live / TRACE_SLOTS)` frames — 1 when the scene is small
-  // enough that the budget covers it, 2 on a Bistro-scale lattice — and WHICH
-  // probes update on which frame is a function of the frame index alone.
+  // Trace slot `k` belongs to the cascade whose `[SLOT_BASE, +SLOTS)` range
+  // holds it — a compile-time partition, and every `SLOTS[c]` is a multiple of
+  // the trace kernel's 8-wide x dimension, so no workgroup straddles two
+  // cascades.
+  //
+  // Frame `f` updates cascade `c`'s `SLOTS[c]` list entries starting at
+  // `f·SLOTS[c] mod live_c`. Every live probe of that cascade is therefore
+  // updated exactly once every `ceil(live_c / SLOTS[c])` frames, and WHICH
+  // probes update on which frame is a function of the frame index alone. The
+  // coarse cascades hold a tenth of the slots, so they cycle a seventh as
+  // often as the finest — the cadence RC's law asks for, expressed as a budget
+  // split rather than as a rule some kernel has to remember.
   const umod = (a, b) => a.sub(a.div(b).mul(b));
-  const roundRobin = (k) => {
-    const live = wpList.element(uint(CTL_OFF)).max(uint(1)).toVar();
-    const base = umod(u.frame.mul(uint(TRACE_SLOTS)), live).toVar();
-    return { live, idx: umod(base.add(k), live) };
+  const cascOfSlot = (k) => {
+    let node = uint(NC - 1);
+    for (let c = NC - 2; c >= 0; c--) {
+      node = select(k.lessThan(uint(SLOT_BASE[c] + SLOTS[c])), uint(c), node);
+    }
+    return node.toVar();
   };
+  const roundRobin = (k) => {
+    const casc = cascOfSlot(k);
+    const kLocal = k.sub(pickU(casc, SLOT_BASE)).toVar();
+    const live = listAt(casc, uint(CTL_OFF)).max(uint(1)).toVar();
+    const base = umod(u.frame.mul(pickU(casc, SLOTS)), live).toVar();
+    return { casc, kLocal, live, idx: umod(base.add(kLocal), live) };
+  };
+  /** The GLOBAL cell of the probe trace slot `k` is scheduled to update. */
+  const slotCell = (rr) => rr.casc.mul(uint(CELLS))
+    .add(listAt(rr.casc, uint(LIST_OFF).add(rr.idx)));
 
   // ══════════════════════════════════════════ SHADER: worldProbeTrace (§U.2)
   //
@@ -444,22 +644,31 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   // CENTRE — the same table the SH projection uses, the same 64 directions this
   // probe traced last time and will trace next time. Nothing here is a function
   // of the camera.
+  //
+  // ⭐ K.4's HAND-OFF IS WHY A COARSE PROBE NEEDS NO NEW TRACE CODE. A ray
+  // leaving an 8 m probe starts at the finest window level containing its
+  // origin and steps UP a level whenever it leaves that level's window, so it
+  // is already walking L3/L4's metre-scale voxels by the time it is forty
+  // metres out. The cascade decides where probes STAND; the window decides what
+  // a ray sees, at the resolution the distance deserves.
   const tracePass = Fn(() => {
     const k = globalId.x.toVar();
     const texel = globalId.y.toVar();
     If(texel.greaterThanEqual(uint(OCT)), () => { Return(); });
+    If(k.greaterThanEqual(uint(TRACE_SLOTS)), () => { Return(); });
     const rr = roundRobin(k);
-    If(k.greaterThanEqual(rr.live), () => { Return(); });
-    const cell = wpList.element(uint(LIST_OFF).add(rr.idx)).toVar();
-    const i0 = wpInfo.element(infoIdx(cell, 0)).toVar();
+    If(rr.kLocal.greaterThanEqual(rr.live), () => { Return(); });
+    const gc = slotCell(rr).toVar();
+    const dmax = pickF(rr.casc, DMAX).toVar();
+    const i0 = wpInfo.element(infoIdx(gc, 0)).toVar();
     If(i0.w.lessThan(0.5), () => { Return(); });
     const pos = i0.xyz.toVar();
     const faced = i0.w.greaterThan(1.5).toVar();
-    const faceN = wpInfo.element(infoIdx(cell, 1)).xyz.toVar();
-    const fresh = wpInfo.element(infoIdx(cell, 2)).w.lessThan(0.5).toVar();
+    const faceN = wpInfo.element(infoIdx(gc, 1)).xyz.toVar();
+    const fresh = wpInfo.element(infoIdx(gc, 2)).w.lessThan(0.5).toVar();
 
     const dir = octU.element(texel).xyz.toVar();
-    const addr = octIdxW(cell, texel).toVar();
+    const addr = octIdxW(gc, texel).toVar();
     // A FACED probe owns one hemisphere; the back half is a HOLE, not a black
     // sample, and it is written rather than skipped for the reason
     // `probeTracePass` gives: a slot this kernel returns from early would hold
@@ -483,14 +692,19 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     const had = nOf(prev1).greaterThan(uint(0)).and(fresh.not()).toVar();
     const a = select(had, wu.wpAlpha.clamp(0, 1), float(1)).toVar();
     const rgb = mix(decodeRgbe(prev0), rd.xyz, a).toVar();
-    const d = min(rd.w, float(DMAXW)).toVar();
-    const m1 = mix(meanOf(prev1), d, a).toVar();
-    const pr = rmsOf(prev1).toVar();
+    const d = min(rd.w, dmax).toVar();
+    const m1 = mix(meanOf(prev1, dmax), d, a).toVar();
+    const pr = rmsOf(prev1, dmax).toVar();
     const m2 = mix(pr.mul(pr), d.mul(d), a).toVar();
     wpOct.element(addr).assign(encodeRgbe(rgb));
     wpOct.element(addr.add(uint(1))).assign(
-      packMoments(nOf(prev1).add(uint(1)).min(uint(63)), m1, sqrt(m2.max(0))),
+      packMoments(nOf(prev1).add(uint(1)).min(uint(63)), m1, sqrt(m2.max(0)), dmax),
     );
+    // ⚠ AN ARRAY `count` IS A DISPATCH SIZE IN WORKGROUPS, NOT IN THREADS
+    // (`ComputeNode.compute`: a number sets `count`, an array sets
+    // `dispatchSize`). So this is `TRACE_SLOTS/8 × OCT/8` groups of 8×8 — and
+    // because it is `dispatchSize`, three generates NO bounds check, which is
+    // why the two guards at the top of this kernel are written by hand.
   })().compute([Math.ceil(TRACE_SLOTS / 8), Math.ceil(OCT / 8)], [8, 8, 1]);
 
   // ══════════════════════════════════════════ SHADER: worldProbeSh (§U.2)
@@ -510,19 +724,19 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const shPass = Fn(() => {
     const k = instanceIndex.toVar();
     const rr = roundRobin(k);
-    If(k.greaterThanEqual(rr.live), () => { Return(); });
-    const cell = wpList.element(uint(LIST_OFF).add(rr.idx)).toVar();
-    const i0 = wpInfo.element(infoIdx(cell, 0)).toVar();
+    If(rr.kLocal.greaterThanEqual(rr.live), () => { Return(); });
+    const gc = slotCell(rr).toVar();
+    const i0 = wpInfo.element(infoIdx(gc, 0)).toVar();
     If(i0.w.lessThan(0.5), () => { Return(); });
     const faced = i0.w.greaterThan(1.5).toVar();
-    const faceN = wpInfo.element(infoIdx(cell, 1)).xyz.toVar();
+    const faceN = wpInfo.element(infoIdx(gc, 1)).xyz.toVar();
 
     // Pass 1: the cosine-weighted mean over the directions this probe HAS.
     const acc = vec3(0).toVar();
     const wsum = float(0).toVar();
     Loop({ start: 0, end: OCT, name: "wpMean" }, ({ wpMean }) => {
       const t = uint(wpMean).toVar();
-      const addr = octIdxW(cell, t).toVar();
+      const addr = octIdxW(gc, t).toVar();
       const w1 = wpOct.element(addr.add(uint(1))).toVar();
       If(nOf(w1).greaterThan(uint(0)), () => {
         const e = octU.element(t).toVar();
@@ -541,7 +755,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     for (let i = 0; i < 9; i++) sh.push(vec3(0).toVar());
     Loop({ start: 0, end: OCT, name: "wpSh" }, ({ wpSh: t0 }) => {
       const t = uint(t0).toVar();
-      const addr = octIdxW(cell, t).toVar();
+      const addr = octIdxW(gc, t).toVar();
       const w1 = wpOct.element(addr.add(uint(1))).toVar();
       const e = octU.element(t).toVar();
       const d = e.xyz.toVar();
@@ -560,9 +774,9 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
       sh[7].addAssign(c.mul(d.x.mul(d.z).mul(1.092548)));
       sh[8].addAssign(c.mul(d.x.mul(d.x).sub(d.y.mul(d.y)).mul(0.546274)));
     });
-    for (let i = 0; i < 9; i++) wpSh.element(shIdxW(cell, i)).assign(vec4(sh[i], 0));
-    const i2 = wpInfo.element(infoIdx(cell, 2)).toVar();
-    wpInfo.element(infoIdx(cell, 2)).assign(vec4(i2.xyz, 1));
+    for (let i = 0; i < 9; i++) wpSh.element(shIdxW(gc, i)).assign(vec4(sh[i], 0));
+    const i2 = wpInfo.element(infoIdx(gc, 2)).toVar();
+    wpInfo.element(infoIdx(gc, 2)).assign(vec4(i2.xyz, 1));
     // The two counters every existing receipt prints as "probes" — reused so
     // `profile.gi2` and the boot probe keep meaning what they say, one bump per
     // probe UPDATED this frame rather than per probe placed on a screen tile.
@@ -586,20 +800,20 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const neePass = !emitterSh ? null : Fn(() => {
     const k = instanceIndex.toVar();
     const rr = roundRobin(k);
-    If(k.greaterThanEqual(rr.live), () => { Return(); });
-    const cell = wpList.element(uint(LIST_OFF).add(rr.idx)).toVar();
-    const i0 = wpInfo.element(infoIdx(cell, 0)).toVar();
+    If(rr.kLocal.greaterThanEqual(rr.live), () => { Return(); });
+    const gc = slotCell(rr).toVar();
+    const i0 = wpInfo.element(infoIdx(gc, 0)).toVar();
     If(i0.w.lessThan(0.5), () => { Return(); });
     const p = i0.xyz.toVar();
     const faced = i0.w.greaterThan(1.5).toVar();
-    const n = wpInfo.element(infoIdx(cell, 1)).xyz.toVar();
+    const n = wpInfo.element(infoIdx(gc, 1)).xyz.toVar();
     // ⚠ THE RECEIVER'S NORMAL IS THE FACE OR NOTHING. An open-air probe has no
     // normal, and `shEval`'s cosine convolution supplies the receiver's cosine
     // at the PIXEL anyway — so the cull a screen probe can afford (skip the
     // source if it is behind me) is only taken where a face actually exists.
     const sh = emitterSh(p, select(faced, n, vec3(0)), faced);
     for (let i = 0; i < 9; i++) {
-      const idx = shIdxW(cell, i);
+      const idx = shIdxW(gc, i);
       const cur = wpSh.element(idx).toVar();
       wpSh.element(idx).assign(vec4(cur.xyz.add(sh[i]), 0));
     }
@@ -609,65 +823,87 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   const clearPass = Fn(() => {
     const i = instanceIndex.toVar();
     wpOct.element(i).assign(uint(0));
-  })().compute(CELLS * OCT * 2);
+  })().compute(ALL_CELLS * OCT * 2);
   const clearInfoPass = Fn(() => {
     wpInfo.element(instanceIndex).assign(vec4(0));
-  })().compute(CELLS * 3);
+  })().compute(ALL_CELLS * 3);
 
   // ══════════════════════════════════════════ THE RESOLVE'S TAPS (§U.3)
   //
   // These are the only things `gatherProbes`' resolve needs from this file.
   // They are node closures rather than a second kernel because the resolve has
-  // to interpolate EIGHT of them per pixel and a function call per tap is what
-  // the octahedral plan/fetch split (see `octPlan`) exists to avoid.
-
+  // to interpolate EIGHT of them per cascade per pixel and a function call per
+  // tap is what the octahedral plan/fetch split (see `octPlan`) exists to avoid.
+  //
+  // ⭐⭐ THE CASCADE IS A RUNTIME NODE HERE, AND THAT IS A COMPILE-TIME DECISION.
+  //
+  // The obvious resolve is a JS loop over `NC` — every constant folded, no
+  // select chains. It also emits the eight-corner block THREE TIMES, and the
+  // eight-corner block is nine SH reads plus eight octahedral taps per corner:
+  // measured at 3.13 it is already the largest expression in `resolveHalf`, and
+  // Stage 4.3a's own receipt says a kernel's WGSL size is paid at BOOT, in
+  // pipeline compile, in front of first light — the number 3.14 is gated on.
+  // So the resolve runs ONE corner block inside a TSL `Loop` over the cascades
+  // and every per-cascade constant arrives through `cascConst`: five selects
+  // evaluated once per cascade, against two extra copies of the biggest
+  // expression in the resolve.
+  /**
+   * Cascade `ccU`'s constants, as nodes. `pref` is the fallback's finest-first
+   * preference (see the resolve's two-tier candidate) — a cascade four times
+   * coarser is 64 times less preferred, which is the ratio of the volumes its
+   * probes stand for.
+   */
+  const CASC_PREF = Array.from({ length: NC }, (_, c) => 64 ** (NC - 1 - c));
+  const cascConst = (ccU) => ({
+    sp: pickF(ccU, SPC).toVar(),
+    dmax: pickF(ccU, DMAX).toVar(),
+    org: pickV(ccU, originsU).toVar(),
+    base: ccU.mul(uint(CELLS)).toVar(),
+    pref: pickF(ccU, CASC_PREF).toVar(),
+  });
   /** The lattice cell coords a world point falls between, and the fractions. */
-  const cellFrame = (p) => {
-    const g = p.div(SP).sub(0.5).toVar();
-    return { base: g.floor().toVar(), frac: g.sub(g.floor()).toVar() };
+  const cellFrameAt = (p, sp) => {
+    const g = p.div(sp).sub(0.5).toVar();
+    return { base: g.floor().toVar(), frac: g.sub(g.floor()).toVar(), g };
   };
-  /** Is this world lattice cell inside the current window? */
-  const inLattice = (wcx, wcy, wcz) => {
-    const o = wu.wpOrigin;
-    const rx = wcx.sub(o.x).toVar();
-    const ry = wcy.sub(o.y).toVar();
-    const rz = wcz.sub(o.z).toVar();
+  /** Is this world lattice cell inside that cascade's current window? */
+  const inLatticeAt = (org, wcx, wcy, wcz) => {
+    const rx = wcx.sub(org.x).toVar();
+    const ry = wcy.sub(org.y).toVar();
+    const rz = wcz.sub(org.z).toVar();
     return rx.greaterThanEqual(0).and(ry.greaterThanEqual(0)).and(rz.greaterThanEqual(0))
       .and(rx.lessThan(C)).and(ry.lessThan(C)).and(rz.lessThan(C));
   };
   /**
-   * ⭐⭐ THE LATTICE ENDS AND THE SCENE DOES NOT — MEASURED, NOT ANTICIPATED.
+   * ⭐⭐ THE HAND-OFF BAND — 3.14's answer to the horizon 3.13 measured.
    *
-   * The lattice is `C · s_p` across and camera-centred, so it reaches ±8 m at
-   * the desktop tier. On Bistro's doors pose the picked dark pixels ran to a
-   * p95 of 15 m and 6.3 % of them had NO live corner at all: the resolve's
-   * weights all came out zero and the pixel composited BLACK. A screen probe
-   * has no such horizon — it is placed wherever the camera looks and the window
-   * hands its rays up to a 128 m level — so this is a regression the world path
-   * introduces and it has to be answered inside it.
-   *
-   * The answer here is a CLAMP, not a rejection: a pixel outside reads the
-   * nearest boundary cell's probe, which is a continuous extrapolation of the
-   * field rather than a hole in it. It is an approximation and it is stated as
-   * one — the far façade gets the ambient measured at the lattice's edge — and
-   * the honest fix is a second, coarser cascade (RC's own answer), which is a
-   * stage of its own. What this rules out is BLACK, which is not an
-   * approximation of anything.
+   * `1` where the point sits inside the inner 90 % of a cascade, ramping to `0`
+   * at its outer face, measured in CELLS to the nearest face so it is a
+   * continuous function of position and of nothing else. The resolve multiplies
+   * a cascade's confidence by it, so a pixel leaving c0's 16 m cube hands over
+   * to c1 across 1.6 m instead of falling off a cliff — and 3.13's boundary
+   * CLAMP survives only on the LAST cascade, where there is nothing coarser to
+   * hand to and an extrapolated ambient still beats the black this whole term
+   * exists to rule out.
    */
-  const clampToLattice = (wcx, wcy, wcz) => {
-    const o = wu.wpOrigin;
-    return [
-      wcx.clamp(o.x, o.x.add(C - 1)),
-      wcy.clamp(o.y, o.y.add(C - 1)),
-      wcz.clamp(o.z, o.z.add(C - 1)),
-    ];
+  const bandAt = (g, org) => {
+    const dx = min(g.x.sub(org.x), org.x.add(C - 1).sub(g.x)).toVar();
+    const dy = min(g.y.sub(org.y), org.y.add(C - 1).sub(g.y)).toVar();
+    const dz = min(g.z.sub(org.z), org.z.add(C - 1).sub(g.z)).toVar();
+    return min(min(dx, dy), dz).div(BAND * C).clamp(0, 1);
   };
-  const cellAt = (wcx, wcy, wcz) => slotOf(wcx.toInt(), wcy.toInt(), wcz.toInt());
-  const infoAt = (cell, k) => wpInfo.element(infoIdx(cell, k));
-  const shAt = (cell, i) => wpSh.element(shIdxW(cell, i));
+  const clampAt = (org, wcx, wcy, wcz) => [
+    wcx.clamp(org.x, org.x.add(C - 1)),
+    wcy.clamp(org.y, org.y.add(C - 1)),
+    wcz.clamp(org.z, org.z.add(C - 1)),
+  ];
+  /** The GLOBAL cell index of a cascade's cell at these world coords. */
+  const cellAtG = (base, wcx, wcy, wcz) => slotOf(wcx.toInt(), wcy.toInt(), wcz.toInt()).add(base);
+  const infoAt = (gc, k) => wpInfo.element(infoIdx(gc, k));
+  const shAt = (gc, i) => wpSh.element(shIdxW(gc, i));
   /** Bilinear radiance out of an `octPlan`'s four offsets. */
-  const octTapRad = (plan, cell) => {
-    const t = plan.offs.map((o) => decodeRgbe(wpOct.element(octIdxW(cell, o))));
+  const octTapRad = (plan, gc) => {
+    const t = plan.offs.map((o) => decodeRgbe(wpOct.element(octIdxW(gc, o))));
     return mix(mix(t[0], t[1], plan.au), mix(t[2], t[3], plan.au), plan.av);
   };
   /**
@@ -684,16 +920,16 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
    * the stored mean, and an 8×8 distance map has ~25° of angular resolution:
    * every pixel a few centimetres beyond where its own probe's nearest texel
    * happens to land would read as occluded. The floor is a FRACTION of the
-   * lattice spacing — the scene's own length — and it makes the transition a
-   * soft band of about half a cell, which is the resolution the map has.
+   * CASCADE'S spacing — the scene's own length at that scale — so the soft band
+   * is half a cell everywhere: 25 cm at c0, 4 m at c2.
    */
-  const octTapVis = (plan, cell, dist) => {
-    const w = plan.offs.map((o) => wpOct.element(octIdxW(cell, o).add(uint(1))));
-    const m1 = mix(mix(meanOf(w[0]), meanOf(w[1]), plan.au),
-      mix(meanOf(w[2]), meanOf(w[3]), plan.au), plan.av).toVar();
-    const rm = mix(mix(rmsOf(w[0]), rmsOf(w[1]), plan.au),
-      mix(rmsOf(w[2]), rmsOf(w[3]), plan.au), plan.av).toVar();
-    const fl = wu.wpVarFloor.mul(SP).toVar();
+  const octTapVisAt = (plan, gc, dist, dmax, sp) => {
+    const w = plan.offs.map((o) => wpOct.element(octIdxW(gc, o).add(uint(1))));
+    const m1 = mix(mix(meanOf(w[0], dmax), meanOf(w[1], dmax), plan.au),
+      mix(meanOf(w[2], dmax), meanOf(w[3], dmax), plan.au), plan.av).toVar();
+    const rm = mix(mix(rmsOf(w[0], dmax), rmsOf(w[1], dmax), plan.au),
+      mix(rmsOf(w[2], dmax), rmsOf(w[3], dmax), plan.au), plan.av).toVar();
+    const fl = wu.wpVarFloor.mul(sp).toVar();
     const varr = rm.mul(rm).sub(m1.mul(m1)).max(fl.mul(fl)).toVar();
     const dd = dist.sub(m1).toVar();
     const ch = varr.div(varr.add(dd.mul(dd))).toVar();
@@ -702,44 +938,69 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
   };
 
   const describe = () => ({
-    tier, cells: C, cellCount: CELLS, spacing: SP, extent: C * SP,
+    tier, cells: C, cellCount: CELLS, cascades: NC, ratio: RATIO,
+    spacing: SP0, extent: EXT[0], reach: EXT[NC - 1], band: BAND,
+    liveLevel: LMIN.slice(), spacings: SPC.slice(), extents: EXT.slice(),
+    slots: SLOTS.slice(), slotBase: SLOT_BASE.slice(),
     traceSlots: TRACE_SLOTS, block: BLOCK, blocks: BLOCKS, oct: OCT,
-    raysPerFrame: TRACE_SLOTS * OCT, distMax: DMAXW,
+    raysPerFrame: TRACE_SLOTS * OCT, distMax: DMAX.slice(),
+    // ⚠ NO FUNCTIONS IN HERE. `describe()` crosses `page.evaluate` in every
+    // receipt this module has; a method would be dropped by the structured
+    // clone and read as `undefined` at the far end.
     bytes: {
-      oct: CELLS * OCT * 2 * 4,
-      sh: CELLS * 9 * 16,
-      info: CELLS * 3 * 16,
-      list: LIST_WORDS * 4,
+      oct: ALL_CELLS * OCT * 2 * 4,
+      sh: ALL_CELLS * 9 * 16,
+      info: ALL_CELLS * 3 * 16,
+      list: LIST_WORDS * NC * 4,
     },
-    totalMB: +(((CELLS * OCT * 2 * 4) + (CELLS * 9 * 16) + (CELLS * 3 * 16) + LIST_WORDS * 4)
-      / 1048576).toFixed(2),
+    totalMB: +(((ALL_CELLS * OCT * 2 * 4) + (ALL_CELLS * 9 * 16) + (ALL_CELLS * 3 * 16)
+      + LIST_WORDS * NC * 4) / 1048576).toFixed(2),
   });
 
-  // ── the lattice's own placement ───────────────────────────────────────────
-  const origin = new Int32Array(3);
+  // ── the lattices' own placement ───────────────────────────────────────────
+  const origins = Array.from({ length: NC }, () => new Int32Array(3));
   let placed = false;
   const setCamera = (pos) => {
     const p = Array.isArray(pos) ? pos : [pos.x, pos.y, pos.z];
     let scrolled = false;
-    for (let a = 0; a < 3; a++) {
-      const camCell = Math.floor(p[a] / SP);
-      const next = stepLatticeOrigin(camCell, placed ? origin[a] : null, C);
-      if (!placed || next !== origin[a]) scrolled = true;
-      origin[a] = next;
+    for (let c = 0; c < NC; c++) {
+      for (let a = 0; a < 3; a++) {
+        const camCell = Math.floor(p[a] / SPC[c]);
+        const next = stepLatticeOrigin(camCell, placed ? origins[c][a] : null, C);
+        if (!placed || next !== origins[c][a]) scrolled = true;
+        origins[c][a] = next;
+      }
+      originsU[c].value.set(origins[c][0], origins[c][1], origins[c][2]);
     }
-    wu.wpOrigin.value.set(origin[0], origin[1], origin[2]);
     placed = true;
-    return { scrolled, origin: [...origin] };
+    return { scrolled, origins: origins.map((o) => [...o]) };
   };
   const reset = () => { placed = false; };
 
-  /** Live probe count, out of a readback of `wpList`. */
-  const readLive = (u32) => u32[CTL_OFF];
+  /** Live probe count PER CASCADE, out of a readback of `wpList`. */
+  const readLive = (u32) => Array.from({ length: NC }, (_, c) => u32[c * LIST_WORDS + CTL_OFF]);
+
+  /**
+   * §19 3.14 — the four GPU-ONLY buffers, for the caller's mirror detach.
+   *
+   * ⭐⭐ THE CASCADES TRIPLED THE LATTICE AND THE JS HEAP MUST NOT PAY IT TWICE.
+   * Every one of these is written by a kernel and read by a kernel; the only
+   * CPU reader is a READBACK (`readLive`), which copies out of the GPU buffer
+   * and never touches `attr.array`. So the full-size typed arrays three keeps
+   * alive after the first upload are dead weight — 70 MB of it at the desktop
+   * cascades — and `detachCpuMirror` can transfer them away the frame after
+   * they are bound. See `gi2System`'s drain, which is what actually calls this.
+   */
+  const cpuMirrors = () => [wpOct.value, wpSh.value, wpInfo.value, wpList.value]
+    .filter((a) => a?.isBufferAttribute === true);
 
   return {
-    tier, cells: C, cellCount: CELLS, spacing: SP, traceSlots: TRACE_SLOTS,
-    uniforms: wu, buffers: { wpOct, wpSh, wpInfo, wpList },
-    offsets: { FLAG_OFF, LIST_OFF, BASE_OFF, CTL_OFF },
+    tier, cells: C, cellCount: CELLS, cascades: NC, spacing: SP0, spacings: SPC,
+    extents: EXT, traceSlots: TRACE_SLOTS, slots: SLOTS, band: BAND,
+    uniforms: { ...wu, ...Object.fromEntries(originsU.map((o, c) => [`wpOrigin${c}`, o])) },
+    origins: originsU,
+    buffers: { wpOct, wpSh, wpInfo, wpList },
+    offsets: { FLAG_OFF, LIST_OFF, BASE_OFF, CTL_OFF, LIST_WORDS },
     passes: {
       alloc: allocPass, count: countPass, scan: scanPass, fill: fillPass,
       trace: tracePass, sh: shPass, nee: neePass,
@@ -748,8 +1009,12 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     /** §U's per-frame order. The caller splices it into `frameOrder`. */
     frameOrder: [allocPass, countPass, scanPass, fillPass, tracePass, shPass, neePass]
       .filter(Boolean),
-    taps: { cellFrame, inLattice, clampToLattice, cellAt, infoAt, shAt, octTapRad, octTapVis },
-    setCamera, reset, readLive, describe,
+    taps: {
+      cascades: NC, spacingOf: (c) => SPC[c], extentOf: (c) => EXT[c],
+      cascConst, cellFrameAt, inLatticeAt, bandAt, clampAt, cellAtG,
+      infoAt, shAt, octTapRad, octTapVisAt,
+    },
+    setCamera, reset, readLive, describe, cpuMirrors,
     dispose() {
       for (const b of [wpOct, wpSh, wpInfo, wpList]) {
         if (b?.value) { b.value.array = b.value.array.constructor.from([]); b.value.dispose?.(); }

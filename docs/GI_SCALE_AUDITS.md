@@ -1827,3 +1827,433 @@ WORLD-anchored: the interpolation weights change smoothly, the probes do not.
 This is the RC contract in full: world-anchored, complete, interpolated. It
 replaces the screen-probe diffuse path once its receipts beat 3.12's; the
 screen-probe code stays until then (one build constant).
+
+---
+
+## V. STAGE 3.14 — THE PROBE CASCADES (RC's answer to 3.13's horizon)
+
+**Why:** 3.13's world-anchored lattice won almost every receipt it was gated on
+and shipped OFF for one structural reason: it is ONE 16 m cube, and on a 100 m
+street most visible surfaces are beyond its ±8 m horizon. Its answer there was a
+boundary CLAMP, which is not black but is also not light — what it extrapolates
+is the ambient measured at the edge of the near room. The doors receipt named
+the cost: 6.3 % of the picked dark pixels had NO live corner, pixel distance p95
+15 m, thin-feature ratio 64.5 % against a 70 % gate.
+
+### V.1 What was built
+
+| | c0 | c1 | c2 |
+|---|---|---|---|
+| cells | 32³ | 32³ | 32³ |
+| spacing | 0.5 m | 2 m | 8 m |
+| extent | 16 m | 64 m | 256 m (128 m on `high` — see below) |
+| liveness level | finest containing (`cellOfWorld`) | L2 | L4 (`ultra`) / L3 (`high`) |
+| trace slots / frame | 4296 | 1232 | 616 |
+| share of the 6144-slot budget | 69.9 % | 20.1 % | 10.0 % |
+
+Phone/medium tiers get TWO cascades (16³ at 1 m and 4 m → 16 / 64 m), because a
+three-level window has no occupancy to read past 128 m.
+
+Five things carry the design, and each is a decision:
+
+1. **ONE set of kernels, `NC` lattices.** The cascade is a bit of
+   `instanceIndex`, not a JS loop: `allocPass` dispatches `NC × 32³`, the
+   compaction runs one prefix-sum thread per cascade, and `tracePass`'s slot
+   index falls into a compile-time `[SLOT_BASE, +SLOTS)` partition. Calling
+   `createWorldProbes` three times would have inlined `shadeHit` three times —
+   ~25 kB of WGSL each and, measured at Stage 3.5, 2.5 s of pipeline compile.
+2. **The resolve runs ONE eight-corner block inside a TSL `Loop` over the
+   cascades**, with every per-cascade constant arriving through `cascConst`
+   (five `select` chains, evaluated once per cascade). Receipt: `resolveHalf`
+   is **161.3 kB** of WGSL with three cascades against **160.0 kB** with one —
+   +0.8 %, against the +200 % an unrolled loop would have cost, in the one
+   currency (boot-time compile) 3.14 is gated on.
+3. **The hand-off is a composite, not a choice.** Each cascade answers with a
+   COVERAGE — `Σ tri·live`, exactly 1 when all eight corners exist, 0 past the
+   lattice edge — times a BAND (1 inside the inner 90 %, ramping to 0 at the
+   outer face). Finest first, alpha-composited: c0 spends what it has, c1 spends
+   the remainder, c2 (which clamps, so it always answers) takes the rest.
+   Nothing branches on a cascade index; the weights are continuous in the
+   pixel's position, so walking out of the 16 m cube produces no edge.
+4. **⭐⭐ COVERAGE IS NOT VISIBILITY, AND THE 5 cm PARTITION MEASURED IT.** The
+   first cut made the hand-off `Σ tri·live·vis`, reading "a cascade that cannot
+   SEE the point cannot answer for it". That is backwards: an occluded probe IS
+   the answer — *no light arrives from there* — and folding its refusal into the
+   hand-off invited the 2 m cascade, whose probes straddle a 5 cm wall, to
+   answer instead. **Thin-wall interior went 0.03 % → 0.56 % on that one term,
+   and back to 0.05 % (the control's own floor) when `vis` came out of `cov`.**
+   The corollary: a cascade that covers a point SPENDS its claim even when its
+   weights sum to zero, or the dark side of a wall is handed to the 8 m cascade.
+5. **The two-tier fallback needed a third key.** 3.13 triggered it on
+   `wsum < 1e-5`, which conflated "no probe represents this surface" (a 3 cm
+   cable in a pocket of face-rejecting probes — the thin-feature case the tier
+   exists for) with "every probe says dark". Under one lattice both left `wsum`
+   at zero and the trigger was right by accident; under cascades a covered pixel
+   always spends its claim, so the trigger is now `admAny` — the largest
+   face-admissible coverage any cascade found.
+
+`globalThis.__gi2Cascades = 1` collapses the lattice to one cascade with the
+clamp on it — 3.13 exactly, out of 3.14's binary, on one shader cache. Every
+comparison below is that arm, not a previous commit.
+
+### V.2 THE HEAP AND THE FIRST-LIGHT REGRESSIONS DID NOT REPRODUCE
+
+3.13 reported Bistro JS heap +297 MB and Level first light +585 ms against the
+screen path. Neither survives a same-session A/B, and the reason is that both
+statistics have a run-to-run spread wider than the effect they were reporting.
+Two boots of each arm, one machine, one afternoon, `NOISE=0 DIRTY=0`:
+
+| Bistro | 3.12 screen | 3.13 (`__gi2Cascades=1`) | 3.14 cascades |
+|---|---|---|---|
+| JS heap (MB) | 1975 / 1918 | 1647 | 1723 / 2115 |
+| first light from scene open (ms) | 11144 / 11686 | 11308 | 11799 / 10872 |
+| GI GPU total (ms) | 1.454 / 1.918 | 2.125 | 2.624 / 1.722 |
+
+| Level | 3.12 screen | 3.13 | 3.14 |
+|---|---|---|---|
+| JS heap (MB) | 374 / 410 | 421 | 460 / 356 |
+| first light from scene open (ms) | 4967 / 5478 | 5140 | 5022 / 4871 |
+| GI GPU total (ms) | 1.258 / 1.180 | 0.977 | 1.309 / 1.670 |
+
+⭐⭐ **`performance.memory.usedJSHeapSize` on Bistro moves ±200 MB between boots
+of the SAME binary, and Level first light ±500 ms.** 3.13's +297 and +585 are
+both inside that. This is [[probe-blind-statistics]] in its other direction: not
+"can the instrument see its subject" but "is the effect larger than the
+instrument's own spread". A single boot per arm cannot answer either question.
+
+**What IS nameable, and was fixed anyway:** `instancedArray` keeps the full CPU
+typed array alive for the life of the attribute (§I.1 — three uploads it once,
+`Buffer._buffer` captured it at first bind, `info.memoryMap` pins the attribute
+forever). One lattice was 22 MB of that; three cascades are **66 MB**. All four
+lattice buffers are GPU-only — every reader is a kernel, and `readLive` reads a
+readback copy, never `attr.array` — so `gi2System` now drains them through
+`detachCpuMirror` (an `ArrayBuffer.transfer(0)`, a real free) from `passes()`.
+
+⚠ **From `passes()`, not from `notePassesRan()`,** which is where it first went:
+that call only fires when the PRE-GBUFFER batch lands, so on a boot where the
+voxelizer's pipelines keep the batch deferred it never fires and the queue would
+stay full for the session — silently. Same shape as the shadow-freeze bug: a
+caller-position dependency. `passes()` runs every frame and the real precondition
+("has this buffer been uploaded?") is checked inside `detachCpuMirror`.
+
+Receipt, from the Bistro motion run's own console census:
+`[gi2] detached 4 lattice CPU mirror(s) — 66.8 MB of JS heap the GPU buffers do
+not need`. One line, once, when the queue empties — §19 4.1 measured a per-frame
+`console.log` on a CDP-attached page at 21 ms of frame time.
+
+**And the first-light suspect was refuted with its own receipt.** The boot's
+compile census: the world path sums **14.7 s over 39 pipelines** (Level) against
+the screen path's **15.8 s over 43** — the world path compiles LESS. Its two
+biggest are `gi2.worldTrace` 1.1 s (50 kB WGSL) and `gi2.resolveHalf` 0.8 s
+(162 kB); the screen path's biggest is `gi2.probeTrace` 1.0 s (62 kB). The
+cascades add **1.3 kB** to `resolveHalf` and no measurable compile time, because
+of the `Loop`.
+
+### V.3 THE FAR-FIELD RECEIPT — a new instrument, because nothing could see it
+
+3.13's horizon is a claim about surfaces forty metres away, and **not one
+existing instrument samples one.** The Cornell rig is a 5 m box entirely inside
+cascade 0. The doors pose stands 2 m from a wall. The motion probe measures
+FLIPS, and a stable wrong answer flips as little as a stable right one. §3.7's
+dirt receipt band-passes one pose at one spatial scale. So `probe:gi2-farfield`
+(`scripts/run-gi2-farfield-probe.mjs`) was written for it:
+
+* the **street-overview** pose — the third of the boot probe's three DERIVED
+  Bistro poses (22 m back along the open street, found by a 24-ray horizontal
+  ring through the live window, at 4 m up looking down it);
+* the **far façades**: dump samples ≥ 30 m from the camera with `|n.y| ≤ 0.5`.
+  Vertical surfaces, not the road — a road is a floor and a floor's irradiance
+  is dominated by the sky, which every path gets right. A wall forty metres out
+  is lit by the street's bounce, and that is precisely what a lattice with a
+  horizon cannot know;
+* ⭐⭐ the comparison is **per pixel, then summarised** — never two population
+  medians. A far façade lit by a boundary CLAMP is UNIFORM, and a uniform field
+  can have the right mean. The arms are two boots (the path is a build-time
+  constant), so `OUT=` writes this boot's pixel indices, world depths and
+  irradiances and `REF=` reads them back, pins the POSE from that file (a
+  derived pose landed 11 cm apart on two boots of the doors probe — at 22 m
+  that is a different wall), and reports the distribution of
+  `E_this / E_reference` at the same index and depth.
+
+**The result, Bistro street-overview, 3417 far-façade pixels, three arms, one
+pinned pose (eye [20.55, 4.36, −0.64] → [0.55, 3.36, −0.64]):**
+
+| irradiance luminance | 3.12 screen | 3.13 (one lattice + clamp) | 3.14 cascades |
+|---|---|---|---|
+| p05 / p50 / p95 | 0.047 / 1.173 / 5.082 | **0.000 / 0.000 / 0.000** | 0.452 / 2.671 / 7.723 |
+| 30–40 m (n 2617) p50 | 1.080 | 0.000 | 2.743 |
+| 40–55 m (n 770) p50 | 1.287 | 0.000 | 2.595 |
+| 55–75 m (n 30) p50 | 4.208 | 0.000 | 0.000 |
+| ratio to screen, p50 | — | **0.000** | 1.671 |
+| within ±15 % of screen | — | 0.0 % | 18.9 % |
+
+⛔⛔ **3.13's BOUNDARY CLAMP IS BLACK, NOT "THE AMBIENT AT THE EDGE" — and its
+own commit message says otherwise.** Every far façade on the street-overview
+pose reads exactly 0.0000 under one lattice. The clamp's premise was that a
+pixel outside reads its nearest boundary probe, "a continuous extrapolation of
+the field rather than a hole in it"; what it actually reads is a boundary cell
+that holds NO PROBE, because the cells at ±8 m in the direction of an open
+street are air, and an air cell is dead by the liveness rule. `live = 0` on all
+eight corners → `cov = 0` → nothing claimed → black. The doors receipt saw the
+edge of this (6.3 % of the picked dark pixels had no live corner) and read it as
+a fringe; on a wide shot it is the entire far field. **A clamp into a sparse
+lattice is not an extrapolation — it is the same hole, relocated.**
+
+▶ **The cascades light the far field: 0.000 → 2.671, from nothing to more than
+the screen path.** That is the structural blocker removed, and it is the one
+thing 3.14 was built to do.
+
+▶ **OPEN, AND THE FLIP'S BLOCKER: they light it 1.67× too bright.** The gate is
+±15 % of the screen path and the measurement is p50 1.671, 18.9 % of pixels
+within 15 %. Two mechanisms are named and neither is refuted yet:
+* **the surface bias is scaled by the SAMPLED cascade's spacing** — 0.3 × 2 m =
+  60 cm at c1 and 0.3 × 8 m = 2.4 m at c2, so the pixel is sampled that far off
+  its own wall, in the open, where far less of the sky is occluded. What the
+  bias has to clear is the SURFACE, which is the window's voxel — not the
+  cascade's spacing. It should be a fraction of the FINEST cascade's spacing on
+  every cascade (15 cm, which is 3.13's own value and what won 3.13's receipts).
+* **a coarse probe stands where its own escape put it** — up to 4 × its liveness
+  voxel out of geometry, which is 3.5 m at c1 and 14 m at c2 — and a probe 14 m
+  off a façade in an open street measures the street, not the façade.
+* ⚠ And the deeper one, which is a DESIGN statement rather than a bug: at 30-55 m
+  from the camera, cascade 0 cannot reach and c1 does ALL the work, including the
+  near-surface detail that needs 0.5 m probes. A "pick the finest cascade that
+  covers you" resolve is not RC's merge — RC has cascade N carry only its own
+  ray INTERVAL, with the near intervals coming from finer cascades. That is a
+  stage of its own, and this receipt is what would justify it.
+
+▶ **AND THE 55-75 m BAND IS STILL BLACK (30 px, p50 0.000).** Cascade 2 reads
+its liveness from L4 on `ultra`, and the world-path boots never print
+`[gi2] first occupancy L4` while the screen-path boot prints it at 4140 ms —
+so c2 is dead on Bistro and everything past c1's ±32 m has no cascade at all.
+Whether L4 is genuinely unvoxelized or merely late is the next thing to
+measure; either way c2 is not yet carrying the band it was built for.
+
+### V.4 THE DOORS RECEIPT — the horizon hole is closed
+
+Bistro doors pose, PINNED (eye [1.24, 2.07, −1.70] → [−0.57, 1.62, −0.84]), the
+screen arm's own darkest-1 % population (1124 px) measured on all three arms —
+a shared pick, so it is the same 1124 pixels every time.
+
+| | 3.12 screen | 3.13 one lattice | 3.14 cascades |
+|---|---|---|---|
+| darkest-1 % ÷ wall, irradiance | 10.4 % | 57.4 % | **70.3 %** (gate ≥ 70) |
+| darkest-1 % ÷ frame | 9.2 % | 55.4 % | 67.9 % |
+| this arm's OWN worst 1 % ÷ own wall | — | 4.5 % | 44.2 % |
+| its `irrP05` | 0.0139 | **0.0000** | 0.2011 |
+| **NO live corner in ANY cascade** | — | **8.8 %** | **0 %** |
+
+Live probes and round-robin period per cascade on Bistro (32768 candidate cells
+each): **c0 8776 live / 4296 slots → every 3 frames · c1 7590 / 1232 → every 7 ·
+c2 696 / 616 → every 2.** Of the eight corners at the picked pixels: c0 6.37
+alive / 4.87 admissible, c1 7.75 / 6.85, c2 8 / 7.94 — the cascade that cannot
+reach hands to one that can, per corner, exactly as designed.
+
+The 8.8 % of dark pixels with no live corner — 3.13's named blocker — is **0 %**,
+and 3.13's `irrP05 = 0.0000` (its darkest 5 % were literally black) becomes
+0.2011. The 70 % gate is met at 70.3 %.
+
+⛔⛔ **AND THE 70.3 % WAS THE BIAS BUG, NOT THE CASCADES — RE-MEASURED WITH THE
+SHIPPED BIAS IT IS 33.9 %.** The picked pixels sit at p50 6.11 m / p95 16.71 m,
+so most of them are past c0's ±8 m and read cascade 1, where the bias went
+60 cm → 15 cm. A sample point 60 cm out of a 14 cm recess is not in the recess.
+
+| doors, same 1124 pixels | 3.12 screen | 3.13 | 3.14 @ 0.3·s_c | 3.14 @ 0.3·s_0 (shipped) |
+|---|---|---|---|---|
+| darkest-1 % ÷ wall | 10.4 % | 57.4 % | 70.3 % | **33.9 %** |
+| `irrP05` of the picked set | 0.0139 | **0.0000** | 0.2011 | **0.0550** |
+
+⭐⭐ **THE TWO GATES ARE COUPLED THROUGH ONE CONSTANT AND IT CANNOT SATISFY
+BOTH.** At 0.3·s_c the doors gate passes (70.3 %) and the far field is 1.67× too
+bright with a black band past 55 m; at 0.3·s_0 the far field is honest and the
+doors gate fails at 33.9 %. The same 60 cm was inflating both receipts in the
+same direction — one of them called it a pass and the other called it a fault.
+That coupling is the clearest evidence this stage has that **"pick the finest
+cascade that covers you" is not RC's merge**: a single displacement constant
+should not be able to trade a recess against a façade, and in a real interval
+merge it could not, because the recess would be c0's ray interval and the façade
+c1's.
+
+⚠ AND THE 70 % GATE IS A MEAN, WHICH CANNOT SEE A BLACK TAIL. 3.13 reads 57.4 %
+with `irrP05 = 0.0000` — its darkest 5 % are literally black and its mean is
+lifted by the clamp. 3.14 at the shipped bias reads 33.9 % with `irrP05` 0.0550,
+four times the screen path's floor and the first arm with no black tail at all.
+When this gate is re-run it should be `irrP05 > 0` AND a mean, not a mean.
+
+⚠ `c2 live 0/32768` on this boot against 696 on the one an hour earlier — cascade
+2's liveness level (L4 on ultra) is populated late and intermittently, which is
+the same open question §V.3's 55-75 m band raised.
+
+**⭐⭐ AND THE BIAS WAS HALF OF IT — MEASURED, NOT ARGUED.** With the surface
+bias put back to a fraction of the FINEST cascade's spacing (15 cm on every
+cascade, which is 3.13's own value) rather than the sampled cascade's:
+
+| far-field, 3.14 | bias = 0.3·s_c (60 cm at c1, 2.4 m at c2) | bias = 0.3·s_0 (15 cm everywhere) |
+|---|---|---|
+| 30–40 m p50 ratio | 1.750 | 1.681 |
+| 40–55 m p50 ratio | 1.561 | 1.566 |
+| **55–75 m p50 ratio** | **0.000 (black)** | **0.926** |
+| p05 ratio | 0.190 | 0.532 |
+| overall p50 ratio | 1.671 | 1.609 |
+
+The black band at 55-75 m was the bias itself: at c2 it moved the sample point
+**2.4 m off its own wall**, past the live cells around that wall and into air
+whose eight corners are all dead. One term, one length in the wrong units, and
+a whole distance band composited black. ⭐ **A length that has to clear a
+SURFACE belongs in the surface's units, not in the sampler's** — the same
+mistake shape as [[gi-colour-probe-method]]'s retracted world-unit constants,
+inverted.
+
+What the bias does NOT explain is the residual **1.6× at 30-55 m**, which is
+cascade 1's own band. Two candidates remain unmeasured: a coarse probe's ESCAPE
+(up to 4 × its liveness voxel = 3.5 m at c1) standing it off the façade in the
+open street, and the plain fact that a 2 m probe lattice cannot resolve a
+façade's own occlusion. ⚠ And the screen path is not ground truth here — on the
+doors pose it is the arm that reads dark places at 10.4 % of the wall while the
+world path reads 70.3 %, so "1.6× brighter than the screen path" may be the same
+correction the thin-feature gate rewards. Neither reading is settled by this
+receipt; a CPU path-traced reference at the street-overview pose is what would
+settle it, and that is the instrument to build next.
+
+### V.5 THE RECEIPT TABLE (3.12 / 3.13 / 3.14)
+
+All three arms out of ONE binary and one shader cache: 3.12 is `WORLD_PROBES`
+off, 3.13 is `__gi2Cascades = 1`, 3.14 is the shipped cascade set.
+Cornell rig at 960×540 (`probe:gi2-gather`, high + ultra); Bistro at 1650×970.
+
+| receipt | 3.12 screen | 3.13 one lattice | 3.14 cascades |
+|---|---|---|---|
+| Cornell bracketed, high / ultra | 8/8 | 8/8 | **8/8 / 8/8** |
+| 5 cm-wall leak (control) | 0/10 000 (92.1 %) | 0/10 000 (92.1 %) | 0/10 000 (92.1 %) |
+| thin-wall interior, worst | — | 0.04 % | 0.05 % (control 0.05 %) |
+| at rest: still % / sign flips / temporal p95 | — | 100 / 0 / 0.001 % | 100 / 0 / 0.001 % |
+| orbit Δp50 / Δp95 / moved % | 0.17 / 3.87 / 63.4 (3.13's log) | 0.02 / 0.12 / 5.3 | **0.02 / 0.10 / 4.9** |
+| orbit sign-flip rate | — | 5.8 % | 6.3 % |
+| panel move re-converges | 12 fr | 18 fr | 18 fr |
+| chain @1650×970, high / ultra | — | 1.552 | **2.567 / 2.090** (budget 4) |
+| `resolveHalf` WGSL | — | 160.0 kB | 161.3 kB |
+| lattice bytes (GPU) | 0 (+21 MB screen probes) | 22.25 MB | **66.75 MB**, CPU mirrors detached |
+| **Bistro doors: darkest-1 % ÷ wall** | **10.4 %** | 57.4 % | **33.9 %** (gate ≥ 70) |
+| Bistro doors: `irrP05` of that set | 0.0139 | **0.0000** | **0.0550** |
+| Bistro doors: no live corner anywhere | — | 8.8 % | **0 %** |
+| **Bistro far field p50 ÷ screen** | 1.000 | **0.000 (black)** | **1.609** (gate ±15 %) |
+| Bistro GI GPU (2 boots) | 1.454 / 1.918 | 2.125 | 2.624 / 1.722 |
+| Bistro JS heap (2 boots) | 1975 / 1918 | 1647 | 1723 / 2115 |
+| Bistro first light (2 boots) | 11144 / 11686 | 11308 | 11799 / 10872 |
+| Level first light (2 boots) | 4967 / 5478 | 5140 | **5022 / 4871** |
+
+Per-kernel at the Cornell rig, ultra (ms / WGSL): `worldAlloc` 0.019 / 29.2 kB ·
+`worldCount` 0.005 · `worldScan` 0.006 · `worldFill` 0.030 · `worldTrace`
+0.125 / 49.3 kB · `worldSh` 0.015 · `worldNee` 0.014 / 34.0 kB · `resolveHalf`
+0.252 / 161.3 kB · `resolveUpsample` 0.072. The trace is ONE dispatch over all
+three cascades' slots, so it cannot be split per cascade by timing; the split is
+the slot budget (4296 / 1232 / 616) and the live counts.
+
+Two gates read FAIL on both world arms and are **structurally blind, not
+failing**: `reprojection at rest ≥ 99 %` reads 0/0 because nothing reprojects on
+a path where nothing moves (the harness prints "THE CENSUS IS BLIND" itself),
+and §3.9's `delta` gate fails identically on 3.13 (−23.28 %) and 3.14
+(−23.76 %) — a rotated-room attribution result that predates this stage.
+
+### V.6 BISTRO MOTION — the one place the cascades COST something
+
+`probe:gi2-motion`, Bistro, same session, `__gi2Cascades` as the arm:
+
+| reprojected sign flips | 3.12 (3.13's log) | 3.13 one lattice | 3.14 cascades |
+|---|---|---|---|
+| orbit | — | 25.2 % | **27.2 %** |
+| dolly | 41.3 % | 17.2 % | **22.7 %** |
+| whip | 47.6 % | 15.8 % | **18.8 %** |
+| orbit MAX frame ms | — | 118.0 | 107.5 |
+| voxelize chain GPU MAX, orbit / dolly | — | 4.09 / 3.65 | 4.35 / 4.70 |
+
+▶ **OPEN — 3.14 flips MORE than 3.13 on all three arms (+2.0 / +5.5 / +3.0
+points), and the mechanism is the scroll, not the estimator.** Two terms, both
+introduced by having three lattices instead of one:
+
+1. **The hand-off band is narrower than the origin step.** `stepLatticeOrigin`
+   moves an origin in blocks of 4 cells; the band is `BAND · C` = 3.2 cells. So
+   on the frame a lattice scrolls, a pixel inside the band can have its
+   cascade split jump by more than the band's whole width — a pop, by
+   construction. The band must be at least the step: `BAND ≥ blk/C = 0.125`, or
+   the step must be halved (`blk = 2`, which re-keys half as much per scroll and
+   twice as often). ⚠ Widening the band also imports more of c1's over-bright
+   far field into the near field, so it must be measured against §V.3's ratio,
+   not chosen.
+2. **A re-keyed slab is dark for a whole round-robin period, and c1's is 7
+   frames.** A scroll sets `ready = 0` on the entering cells; they contribute
+   nothing until `shPass` has run for them. Under one lattice that was 3 frames
+   (c0, 4296 slots against 8776 live); c1 holds 1232 slots against 7590 live.
+   A fresh-first round-robin would fix it and would still satisfy §T — "which
+   probes update this frame" would remain a pure function of the occupancy and
+   the frame index — but it is a schedule change, not a constant.
+
+The frame-time gates that FAIL (orbit MAX 107.5 ms, the voxelize chain over
+3 ms) fail on BOTH world arms and on §19 4.1's own record: they are the
+`binPairs` scroll burst, which this stage does not touch. 3.14's orbit MAX is
+in fact 10 ms below 3.13's.
+
+### V.7 THE FLIP VERDICT — `WORLD_PROBES` STAYS `false`
+
+Two of the gates fail, and both are gates 3.14 itself created the instrument for.
+
+**PASS** — Cornell 8/8 on high AND ultra · 5 cm leak 0/10 000 with its 92.1 %
+control · thin-wall interior 0.05 % at the control's own floor · §T at rest
+(100 % still, 0 sign flips, temporal p95 0.001 %) · orbit Δp50/Δp95/moved
+0.02 / 0.10 / 4.9 % (3.13: 0.02 / 0.12 / 5.3) · panel move 18 frames · chain
+2.567 / 2.090 ms against a 4 ms budget · JS heap indistinguishable from the
+screen path (2-boot means 1919 vs 1947 MB) · Level first light 4947 ms mean
+against the screen path's 5223 · **"no live corner anywhere" 0 % against 3.13's
+8.8 %, and the picked dark set's `irrP05` 0.0550 against 3.13's 0.0000 — the
+first arm on this pose with no black tail at all.**
+
+**FAIL** — **the far-field ratio, p50 1.609 against a ±15 % gate.** The cascades
+do what they were built to do: 3.13's far field is literally 0.000 and 3.14's is
+lit. But they light it 1.6× brighter than the screen path at 30-55 m, which is
+cascade 1's own band, and neither arm is a reference. ⚠ **This gate cannot be
+closed by tuning — it needs a CPU path-traced reference at the street-overview
+pose**, because "1.6× the screen path" is not the same claim as "1.6× the
+truth", and on the doors pose the screen path is the arm that reads dark places
+at 10.4 % of a wall while the world path reads 70.3 %.
+
+**FAIL** — **the doors thin-feature ratio, 33.9 % against a ≥ 70 % gate** — and
+the 70.3 % that looked like a pass was the bias bug (§V.4). The mean is BELOW
+3.13's 57.4 % while the floor is above it (0.0550 vs 0.0000): 3.14 trades a
+lifted mean for a lifted tail, which the gate as written cannot express.
+
+**FAIL** — **Bistro motion flips are above 3.13's on all three arms** (§V.6),
+from the scroll transient of three lattices rather than from the estimator.
+
+⭐⭐ **AND THE TWO CONTENT GATES ARE THE SAME GATE.** One constant — the surface
+bias — moves the doors ratio 33.9 ↔ 70.3 % and the far-field ratio 1.609 ↔ 1.671
+(with a black band) in the SAME direction. A "finest cascade that covers you"
+resolve gives one displacement constant authority over both a 14 cm recess and a
+40 m façade; RC's interval merge does not, because those are different cascades'
+ray intervals. That is the verdict's real content: not "the numbers missed",
+but "this resolve cannot hold both ends at once".
+
+▶ **NEXT, IN ORDER.** (1) A path-traced far-field reference — the gate above is
+unanswerable without it and every tuning decision downstream inherits the
+ambiguity. (2) The band/step relation and a fresh-first round-robin (§V.6),
+which are the two named motion terms. (3) RC's actual merge — cascade N carries
+only its own ray INTERVAL, with the near intervals coming from finer cascades —
+which is the structural answer to a 2 m probe lattice lighting a façade, and
+which this stage's "finest cascade that covers you" resolve is not.
+
+### V.8 THE ENGINE GATES (shipping path, `WORLD_PROBES = false`)
+
+`test:gi-sunleak` **PASS** — sealed interior worst leak 0.00000 against a 0.002
+threshold, GI on and off identical at all four probes.
+`test:gi-moved-lamp` **PASS** — the new spot gains 29.06 lum (gate > 12), the old
+loses 29.05, separation 58.11.
+`smoke:gi-gpu` **PASS** (exit 0) — gi2 transport 280 rays/frame over 35 probes,
+probesValid 35/35, first light 274 ms, cache 15.08 MB / window 2.815 MB.
+`run-gi-resize-probe` **ALL PASS** — **uncaptured device errors 0 / createBindGroup
+throws 0** across every hop (the 0/0 the flip is gated on); a fast round trip
+costs 0 pipelines and 0 shader modules; textures live and transport alive after
+the last hop.
+
+⚠ These four run the SHIPPING path, because the flip did not happen and none of
+them has a pre-boot arm hatch. They say the tree is green, not that the world
+path is: adding a `FLAGS` hatch to the three that lack one is a prerequisite for
+the flip receipt these are supposed to be.
