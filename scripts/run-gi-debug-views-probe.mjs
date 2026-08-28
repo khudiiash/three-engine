@@ -67,9 +67,11 @@ const page = await browser.newPage();
 await page.setViewport({ width: 1280, height: 860, deviceScaleFactor: 1 });
 const errors = [];
 page.on("pageerror", (error) => errors.push(error.message));
+let firstLightSeen = false;
 page.on("console", (message) => {
   const text = message.text();
-  if (/GI-DV|\[gi\].*(rror|ailed)/.test(text)) console.log(`  ${text}`);
+  if (/\[gi2?\] (first light|field ready)/.test(text)) firstLightSeen = true;
+  if (/GI-DV|\[gi\].*(rror|ailed)|\[gi\] debug view/.test(text)) console.log(`  ${text}`);
 });
 
 await page.goto(url, { waitUntil: "load", timeout: 30000 });
@@ -254,6 +256,16 @@ function diff(a, b, key = "px") {
 //   - `indirect`, `ao`, `reflections`: the new GI-term overlays, driven by
 //     `gi.setProp("debugView", mode)`. The global switch is OFF during these
 //     arms so the prop is the one source of truth being exercised.
+// §19 4.3e: the term views are only readable AFTER GI has lit the frame —
+// shot at scene-ready, "indirect" measured 8.3% coverage on this rig and that
+// number was the pre-light state, not the view. Wait for first light (GI2:
+// "[gi2] first light"; SRC: "[gi] field ready"), bounded, then settle.
+{
+  const t0 = Date.now();
+  while (!firstLightSeen && Date.now() - t0 < 90000) await new Promise((r) => setTimeout(r, 250));
+  console.log(`first light ${firstLightSeen ? `seen after ${((Date.now() - t0) / 1000).toFixed(1)} s` : "NOT seen in 90 s — shooting anyway"}`);
+  await new Promise((r) => setTimeout(r, 3000));
+}
 const off = await shoot("off");
 const off2 = await shoot("off");
 const occ = await shoot("occupancy");

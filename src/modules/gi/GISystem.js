@@ -14564,6 +14564,31 @@ export class GISystem {
         .catch((error) => console.warn(`[gi] debug view "ao" stats FAILED: ${error?.message ?? error}`));
       return;
     }
+    if (termMode === "indirect") {
+      // §19 4.3e: the indirect view had no receipt at all — "I picked indirect
+      // and it is black" could not be told from "GI is dark here". One line,
+      // the same shape as the reflection views': coverage from the COLOUR.
+      grab(targets?.irradiance, "indirect")
+        .then((v) => {
+          if (!v.px) {
+            console.log(`[gi] debug view "indirect": ${v.error ?? "not armed"}`);
+            return;
+          }
+          let n = 0, lit = 0, lum = 0;
+          for (let i = 0; i < v.px.length; i += 4) {
+            n++;
+            const l = (0.2126 * v.px[i] + 0.7152 * v.px[i + 1] + 0.0722 * v.px[i + 2]) / 255;
+            if (l > 0.004) lit++;
+            lum += l;
+          }
+          console.log(
+            `[gi] debug view "indirect" — the irradiance the materials sample (${this._gi2 ? "GI2 gather" : "SRC resolve"}): ` +
+              `mean luma ${(lum / Math.max(1, n)).toFixed(3)}, non-black on ${((100 * lit) / Math.max(1, n)).toFixed(1)}% of texels`,
+          );
+        })
+        .catch((error) => console.warn(`[gi] debug view "indirect" stats FAILED: ${error?.message ?? error}`));
+      return;
+    }
     if (termMode === "reflections" || termMode === "reflections-exact") {
       const bt = this._giBvhTarget;
       Promise.all([
@@ -14640,7 +14665,18 @@ export class GISystem {
         const gPosU = debugMesh.userData.__giDebugGPos;
         const gNormalU = debugMesh.userData.__giDebugGNormal;
         const modeU = debugMesh.userData.__giDebugMode;
-        const targets = this._giTargets;
+        // ⭐ §19 4.3e (user: "check our debug view for indirect only", 08-28):
+        // under GI2 the LIT path samples `_gi2.textures.irradiance` / `.glossy`
+        // (see the `_giIrradianceNode` swap where `_gi2` is built) and the SRC
+        // resolve that wrote `_giTargets.irradiance` never runs — so this view
+        // showed a target nothing writes: black, or the last SRC frame. The
+        // debug view must sample WHAT THE MATERIALS SAMPLE, on whichever path
+        // is lit; GI2's textures are re-created on resize, and the per-frame
+        // `texU.value !== sampled` swap below is what follows them.
+        const gi2Tex = this._gi2?.textures;
+        const targets = gi2Tex
+          ? { ...this._giTargets, irradiance: gi2Tex.irradiance ?? null, radiance: gi2Tex.glossy ?? null }
+          : this._giTargets;
         const aoPass = state.screen?.aoPass;
         let sampled = null;
         let second = null;
