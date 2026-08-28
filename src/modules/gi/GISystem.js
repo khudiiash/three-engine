@@ -163,6 +163,9 @@ const OCC_DYNAMIC_QUIET_FRAMES = 90;
  * (see `#gi2SkinnedMovers`), which is exactly what the old path's
  * `#buildOccupancyField` widened its own cap for.
  */
+// §19 Stage 6.7 — the GI2 boot pack's per-frame slice. 4 ms so the pack is
+// never the reason a frame misses; `__gi2PackBudgetMs` overrides for an A/B.
+const GI2_PACK_BUDGET_MS = 4;
 const GI2_MOVER_CAP = 64;
 /**
  * Frames a seated mover may sit still before it is eligible for eviction under
@@ -14388,6 +14391,10 @@ export class GISystem {
       this._gi2MoverMeshes = null;
       this._gi2AutoWatch = null;
       this._gi2Promoted = null;
+      // §19 Stage 6.7 — an in-flight boot pack belongs to the state that is
+      // going away; dropping the token is what stops its next slice.
+      this._gi2Pack = null;
+      this._gi2PackToken = null;
       this._gi2MoversDirty = false;
       this._gi2Stats = null;
     }
@@ -18157,22 +18164,95 @@ export class GISystem {
    * precisely what the soup is a function of.
    */
   #startGi2Build(meshes, gi2) {
-    // ⭐ UNCAPPED, and see `#occupancyContentOf`'s header for why the 768 was
-    // never GI2's number to obey.
-    const { geometries, placements } = this.#occupancyContentOf(meshes, { cap: Infinity });
-    const parts = [];
-    const enriched = this.#gi2PaletteSurfaces(placements);
-    for (const p of placements) {
-      const e = p.matrix.elements;
-      parts.push(p.geometryKey, e[12].toFixed(3), e[13].toFixed(3), e[14].toFixed(3), e[0].toFixed(3), e[5].toFixed(3), e[10].toFixed(3));
+    // ⭐⭐ §19 STAGE 6.7 — THE PACK IS SLICED ACROSS FRAMES.
+    //
+    // Everything below used to run in ONE synchronous frame at the end of
+    // `#rebuild`: Bistro's boot paid a **1339 ms frame** for it (6.6's
+    // boot-frames probe, frame @14269 ms) — the walk over 1531 placements plus
+    // the palette pass plus the soupKey join, and a 123 ms major GC on top of
+    // the garbage all three make. Nothing in that frame is waiting on the
+    // result: `gi2.build` is deliberately un-awaited, the window/trace/gather
+    // are live already, and the voxelizer only exists once the soup lands.
+    //
+    // So the walk yields. `GI2_PACK_BUDGET_MS` of work per rAF, a resumable
+    // cursor per phase, and the build dispatches when the last phase drains.
+    // The per-frame refresh is safe against a pack in flight because
+    // `#refreshGi2Movers` is null-guarded on both `_gi2Movers` and
+    // `_gi2AutoWatch`, and those are cleared here BEFORE the first slice.
+    //
+    // ⚠ A pack is superseded by the next build, not queued: `_gi2PackToken`
+    // is the identity every slice re-checks, so a rebuild landing mid-pack
+    // drops the old one instead of dispatching a stale soup over the new one.
+    this._gi2MoverMeshes = meshes;
+    this._gi2Movers = null;
+    this._gi2AutoWatch = null;
+    this._gi2Promoted = new Set();
+    this._loggedGi2SkinnedMovers = false;
+    const token = (this._gi2PackToken = Symbol("gi2-pack"));
+    const budget = Number(globalThis.__gi2PackBudgetMs) > 0
+      ? Number(globalThis.__gi2PackBudgetMs)
+      : GI2_PACK_BUDGET_MS;
+    const pack = {
+      token, gi2, meshes, budget,
+      // ⭐ UNCAPPED, and see `#occupancyContentOf`'s header for why the 768 was
+      // never GI2's number to obey.
+      job: this.#occupancyPackBegin(Infinity),
+      phase: 0, cursor: 0,
+      palette: null, enriched: [], parts: [],
+      frames: 0, workMs: 0, startedAt: performance.now(),
+    };
+    this._gi2Pack = pack;
+    this.#stepGi2Pack(pack);
+  }
+
+  /**
+   * One frame's slice of the GI2 boot pack, then a rAF for the next.
+   *
+   * The phases are ordered by what the next one needs: content → palette →
+   * soupKey. Each keeps its own cursor, and the budget is checked BETWEEN
+   * items, so one pathological mesh can overshoot by its own cost and no more.
+   */
+  #stepGi2Pack(pack) {
+    if (this._gi2Pack !== pack || this._gi2PackToken !== pack.token) return;
+    if (this.state?.screen?.gi2 !== pack.gi2) { this._gi2Pack = null; return; }
+    const t0 = performance.now();
+    const deadline = t0 + pack.budget;
+    pack.frames++;
+    const { job, meshes } = pack;
+    while (performance.now() < deadline) {
+      if (pack.phase === 0) {
+        if (pack.cursor >= meshes.length) { pack.phase = 1; pack.cursor = 0; pack.palette = this.#gi2PaletteBegin(); continue; }
+        if (!this.#occupancyPackMesh(job, meshes[pack.cursor++])) { pack.phase = 1; pack.cursor = 0; pack.palette = this.#gi2PaletteBegin(); }
+        continue;
+      }
+      if (pack.phase === 1) {
+        if (pack.cursor >= job.placements.length) { pack.phase = 2; pack.cursor = 0; continue; }
+        pack.enriched.push(this.#gi2PaletteOne(pack.palette, job.placements[pack.cursor++]));
+        continue;
+      }
+      if (pack.phase === 2) {
+        if (pack.cursor >= job.placements.length) { pack.phase = 3; break; }
+        const p = job.placements[pack.cursor++];
+        const e = p.matrix.elements;
+        pack.parts.push(p.geometryKey, e[12].toFixed(3), e[13].toFixed(3), e[14].toFixed(3), e[0].toFixed(3), e[5].toFixed(3), e[10].toFixed(3));
+        continue;
+      }
+      break;
     }
+    pack.workMs += performance.now() - t0;
+    if (pack.phase < 3) { requestAnimationFrame(() => this.#stepGi2Pack(pack)); return; }
+    this._gi2Pack = null;
+    this.#finishGi2Build(pack);
+  }
+
+  /** The pack has drained: movers, the watch, the log line and the dispatch. */
+  #finishGi2Build(pack) {
+    const { gi2, meshes, job, enriched, parts } = pack;
+    const geometries = job.geometries;
     // §19 Stage 4.0: the mesh list this build's movers are derived FROM, so a
     // promotion can re-derive without re-walking the scene. Cleared with the
     // build, like every other per-state field.
     this._gi2MoverMeshes = meshes;
-    this._gi2Movers = null;
-    this._gi2Promoted = new Set();
-    this._loggedGi2SkinnedMovers = false;
     const movers = this.#gi2Movers(meshes);
     this._gi2Movers = movers;
     // A mover is in the DYNAMIC layer, re-voxelized from its live matrix every
@@ -18215,6 +18295,11 @@ export class GISystem {
     // placements" alone does not say the cut is gone — 768 next to it does.
     const pastCap = Math.max(0, enriched.length - MAX_INSTANCE_SLOTS);
     const skippedTransparent = this._giTransparentEmissiveSkipped ?? 0;
+    // §19 Stage 6.7's receipt: what the 1339 ms frame became. `work` is the
+    // pack's own CPU; `spread` is the wall clock it was smeared over, i.e.
+    // exactly how much later than before the soup can start.
+    console.log(`[gi2] pack ${Math.round(pack.workMs)} ms of work over ${pack.frames} frames ` +
+      `(${Math.round(performance.now() - pack.startedAt)} ms spread, ${pack.budget} ms/frame budget)`);
     console.log(`[gi2] soup ${enriched.length} placements (${geometries.length} geometries), ` +
       `${pastCap} past the old ${MAX_INSTANCE_SLOTS} cap — ` +
       `${staticPlacements.length} static (${enriched.length - staticPlacements.length} held out as movers), ` +
@@ -18327,12 +18412,26 @@ export class GISystem {
    *                   `state.entries` and the handle a re-tint re-resolves by.
    */
   #gi2PaletteSurfaces(placements) {
+    const ctx = this.#gi2PaletteBegin();
+    return placements.map((p) => this.#gi2PaletteOne(ctx, p));
+  }
+
+  /** §19 Stage 6.7 — the palette pass's state, so it can also run in slices. */
+  #gi2PaletteBegin() {
     const entryOf = new Map();
     for (const e of this.state?.entries ?? []) entryOf.set(e.key, e);
-    const surfaceOf = new Map();
-    const box = (this._gi2PalBox ??= new THREE.Box3());
-    const size = (this._gi2PalSize ??= new THREE.Vector3());
-    return placements.map((p) => {
+    return {
+      entryOf,
+      surfaceOf: new Map(),
+      box: (this._gi2PalBox ??= new THREE.Box3()),
+      size: (this._gi2PalSize ??= new THREE.Vector3()),
+    };
+  }
+
+  /** One placement enriched with its palette surface. */
+  #gi2PaletteOne(ctx, p) {
+    const { entryOf, surfaceOf, box, size } = ctx;
+    {
       let s = surfaceOf.get(p.mesh);
       if (!s) {
         const raw = resolveMaterialSurface(p.mesh.material, p.mesh.name);
@@ -18366,7 +18465,7 @@ export class GISystem {
         emitter: s.emitter,
         matKey: s.matKey,
       };
-    });
+    }
   }
 
   /**
@@ -18793,28 +18892,47 @@ export class GISystem {
    * what makes the capped path actually stop.
    */
   #occupancyContentOf(meshes, { cap = MAX_INSTANCE_SLOTS } = {}) {
-    const geometries = [];
-    const seen = new Set();
-    const placements = [];
-    const scratch = new THREE.Matrix4();
-    // STABLE slot assignment: a mesh keeps its occupancy slot for the life of
-    // the field (map reset in #buildOccupancyField). This is what lets the
-    // field's incremental setGeometry treat a spawn as an append and a
-    // despawn as a disable — with index-order slots, removing one mesh
-    // renumbered every slot after it, which invalidated the static snapshot
-    // and the whole per-slot bookkeeping on every scene change.
-    const slotMap = (this._occSlotMap ??= new Map());
-    // Sub-voxel physics props (see #analyticOnlyMover): no placement, no slot
-    // ID, no voxels — they exist as analytic spheres in the mover-occluder
-    // bundle. Rebuilt every content scan so despawns fall out with the sweep;
-    // the surface is resolved here (scan cadence) because the per-frame
-    // bundle sync must not walk a shader-graph material 24 times a frame.
-    const analyticOnly = (this._analyticOnlyMovers = []);
-    for (const mesh of meshes) {
-      if (placements.length >= cap) break;
+    const job = this.#occupancyPackBegin(cap);
+    for (const mesh of meshes) if (!this.#occupancyPackMesh(job, mesh)) break;
+    return { geometries: job.geometries, placements: job.placements };
+  }
+
+  /**
+   * §19 Stage 6.7 — the pack's STATE, so the same walk can run synchronously
+   * (every caller with a real slot binding) or a few meshes at a time across
+   * frames (`#startGi2Build`, whose result nothing in the frame is waiting on).
+   */
+  #occupancyPackBegin(cap = MAX_INSTANCE_SLOTS) {
+    return {
+      cap,
+      geometries: [],
+      seen: new Set(),
+      placements: [],
+      scratch: new THREE.Matrix4(),
+      // STABLE slot assignment: a mesh keeps its occupancy slot for the life of
+      // the field (map reset in #buildOccupancyField). This is what lets the
+      // field's incremental setGeometry treat a spawn as an append and a
+      // despawn as a disable — with index-order slots, removing one mesh
+      // renumbered every slot after it, which invalidated the static snapshot
+      // and the whole per-slot bookkeeping on every scene change.
+      slotMap: (this._occSlotMap ??= new Map()),
+      // Sub-voxel physics props (see #analyticOnlyMover): no placement, no slot
+      // ID, no voxels — they exist as analytic spheres in the mover-occluder
+      // bundle. Rebuilt every content scan so despawns fall out with the sweep;
+      // the surface is resolved here (scan cadence) because the per-frame
+      // bundle sync must not walk a shader-graph material 24 times a frame.
+      analyticOnly: (this._analyticOnlyMovers = []),
+    };
+  }
+
+  /** One mesh into a pack. False when the cap is reached (stop the walk). */
+  #occupancyPackMesh(job, mesh) {
+    const { geometries, seen, placements, scratch, slotMap, analyticOnly, cap } = job;
+    {
+      if (placements.length >= cap) return false;
       if (this.#analyticOnlyMover(mesh)) {
         analyticOnly.push({ mesh, surface: resolveMaterialSurface(mesh.material, mesh.name) });
-        continue;
+        return true;
       }
       // ── SKINNED MESHES DO NOT VOXELIZE ───────────────────────────────────
       //
@@ -18831,9 +18949,12 @@ export class GISystem {
       // Bone capsules replace it (#refreshSkinnedProxies). Only skipped when a
       // fit actually succeeded, so a rig with no skeleton, or the kill switch,
       // still gets the old representation rather than nothing.
-      if (mesh.isSkinnedMesh && this.#skinnedGroupOf(mesh)) continue;
-      const record = serializeMeshForBake(mesh);
-      if (!record) continue;
+      if (mesh.isSkinnedMesh && this.#skinnedGroupOf(mesh)) return true;
+      // ⭐ §19 Stage 6.7: geometry only — the material walk and the matrix copy
+      // this record used to carry are read by nobody here (see the note in
+      // `serializeMeshForBake`).
+      const record = serializeMeshForBake(mesh, { geometryOnly: true });
+      if (!record) return true;
       if (!seen.has(record.geometryKey)) {
         seen.add(record.geometryKey);
         geometries.push({ key: record.geometryKey, positions: record.positions, index: record.index, uvs: record.uvs });
@@ -18860,7 +18981,7 @@ export class GISystem {
         placements.push({ slot, geometryKey: record.geometryKey, matrix, mesh, instanceId });
       }
     }
-    return { geometries, placements };
+    return true;
   }
 
   /**
@@ -19288,7 +19409,7 @@ export class GISystem {
     for (const p of field.placements) {
       if (p._giAnalytic) continue;
       if (this._dynAdoptedKeys?.has(slotKeyOf(p.mesh, p.instanceId))) continue;
-      const record = serializeMeshForBake(p.mesh);
+      const record = serializeMeshForBake(p.mesh, { geometryOnly: true });
       if (!record) continue;
       items.push({ positions: record.positions, index: record.index, uvs: record.uvs, matrix: p.matrix, slot: p.slot });
     }
