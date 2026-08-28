@@ -100,7 +100,7 @@ async function boot(n) {
   const lines = [];
   page.on("console", (m) => {
     const t = m.text();
-    if (/\[gi2\] first light|\[gi\] compile wave:|\[gi\] scene assets ready|\[gi2\] soup |transport never produced/.test(t)) {
+    if (/\[gi2\] first light|\[gi\] compile wave:|\[gi\] scene assets ready|\[gi2\] soup |transport never produced|6\.3: GI2 chain prewarmed|prewarm loop/.test(t)) {
       lines.push(t);
     }
   });

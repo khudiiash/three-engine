@@ -1962,7 +1962,7 @@ export function createGi2System({
       retired.length = 0;
       return out;
     },
-    build, setSize, setCamera, setMovers, passes, stats, snapshot, describe,
+    build, setSize, setCamera, setMovers, passes, warmList, stats, snapshot, describe,
     /**
      * How often the caller should pay for a `stats()` readback, in frames.
      *
@@ -2065,6 +2065,53 @@ export function createGi2System({
       dynamic = null;
     },
   };
+
+  /**
+   * ⭐⭐ §19 STAGE 6.3 — THE DISPATCH LIST, FOR PREWARMING ONLY.
+   *
+   * Stage 4.3a proved the two lists that already existed are both wrong for
+   * this job. `passesForRelease()` is the OWNERSHIP list: it carries the
+   * radiance cache's relight family and `gi2.crop` (526 kB of WGSL, 11.8 s of
+   * driver compile) which the boot never dispatches, and warming it cost 7 s
+   * and moved first light not at all. `passes()` is the right SET but it is
+   * also the frame's bookkeeping — it advances `frame`, consumes `coarseFrames`
+   * (the coarse-first boot budget), latches `cacheCleared` so the REAL list
+   * would then omit `cache.clearPass`, sets `scrollInLastList` under
+   * `notePassesRan`'s one-shot guard, drains `mirrorQueue` and calls
+   * `beginFrame` on both the gather and the cascades. Calling it for its return
+   * value would corrupt every one of those.
+   *
+   * So this reads the same authoritative COLLECTIONS `passes()` splices —
+   * `gather.frameOrder`, `rc.frameOrder`, the voxelizer's and dynamic's own
+   * lists — and touches no state. `voxelizer.passes(null, null)` is the
+   * enumeration form `passesForRelease` already uses for exactly this reason.
+   *
+   * ⚠ IT IS A SUPERSET AND ITS FAILURE MODE IS DELIBERATE. Order does not
+   * matter (nothing is dispatched) and neither do the frame-by-frame splices,
+   * so an entry that some frames omit is warmed anyway. A kernel this list
+   * MISSES is a kernel that mints on-frame — a perf miss with a visible
+   * receipt (the spike comes back), never a wrong picture. That is the one
+   * hand-maintained list in this file whose drift is survivable.
+   */
+  // ⚠ A DECLARATION, NOT A `const` ARROW. It is defined below the object
+  // literal that exports it (next to `passesForRelease`, which is a
+  // declaration for the same reason) — a `const` there is in the temporal dead
+  // zone when the literal is evaluated and the export would throw at build.
+  function warmList() {
+    const list = [];
+    if (win.scrollPass) list.push(win.scrollPass);
+    if (cache.clearPass) list.push(cache.clearPass);
+    if (voxelizer) list.push(...voxelizer.passes(null, null), cache.allocPass);
+    if (dynamic) list.push(...dynamic.passes());
+    if (gather) {
+      list.push(gather.passes.clearStats, ...gather.frameOrder);
+      if (emitterDirect) list.push(emitterDirect);
+      if (rc) list.push(...rc.frameOrder);
+      for (const p of env?.ao?.computes ?? []) list.push(p);
+      if (aoCompose) list.push(aoCompose);
+    }
+    return list.filter(Boolean);
+  }
 
   function passesForRelease() {
     const list = [win.scrollPass, win.statsResetPass, win.clearStaticPass, win.clearDynamicPass,

@@ -336,6 +336,8 @@ export function giProxySpheres(mesh, bounds, budget, shapeKind = null) {
 //     it breaks the sim) are replayed per node when their pipeline resolves.
 let giDispatchDepth = 0;
 const giSkippedComputes = new Set();
+/** §19 6.3 — the longest a prewarm may hold GI2's dispatch. See `#gi2WarmHolding`. */
+const GI2_WARM_HOLD_MS = 8000;
 const giPendingComputePipelines = new Set();
 /**
  * Pending pipeline count PER DISPATCHING NODE — how many compiles a specific
@@ -759,6 +761,78 @@ function giCompute(renderer, nodes, { deferrable = false } = {}) {
   } finally {
     giDispatchDepth--;
   }
+}
+
+/**
+ * ⭐⭐⭐ §19 STAGE 6.3 — MINT THE PIPELINES WITHOUT RUNNING THE KERNELS.
+ *
+ * THE PROBLEM, MEASURED (`run-gi2-stage-probe.mjs`, Bistro, 4070): the material
+ * compile wave ends at 15418 ms and first light lands at 19409, with the whole
+ * RC ladder latching on ONE stats sample at 267456 tiles ALREADY LIT. The 4 s
+ * between them is not RC work — it is three frames of 1459 ms and 2196 ms, and
+ * 20-24 frames over 50 ms across the boot. `[gi] prewarm loop 0 ms over 0
+ * kernels`: under GI2_PATH the wave's `early` list is EMPTY (no occupancy
+ * field, no SRC), so GI2's ~77 kernels are the only ones in the engine that are
+ * never prewarmed at all. They mint synchronously at their first dispatch,
+ * on-frame, which is exactly the spike.
+ *
+ * ⭐⭐ AND THE COST IS THE GRAPH BUILD, NOT THE DRIVER. `createComputePipeline`
+ * is already async here (`installAsyncComputePipelines`). What is synchronous is
+ * three's `nodes.updateForCompute` — the TSL analyze and WGSL generation — which
+ * the header above already measured at 2359 ms of a 3020 ms task. So a warm
+ * must run that work, and only that work.
+ *
+ * HOW: `Renderer.compute(node)` does exactly four things per node —
+ * `nodes.updateForCompute` (the graph), `bindings.getForCompute`,
+ * `pipelines.getForCompute` (the pipeline), then `backend.compute(...)` (the
+ * encode). Neutralising ONLY the last one yields the graph and the pipeline and
+ * writes nothing. `beginCompute`/`finishCompute` still bracket an empty pass,
+ * which costs an empty command encoder and no correctness.
+ *
+ * ⚠ WHY NOT JUST DISPATCH THEM, THE WAY THE OCCUPANCY PREWARM DOES. Because
+ * these are not idempotent one-shots. `cache.clearPass` and `deposit.decay`
+ * mutate the accumulators the ramp is measured on, and `win.scrollPass` is a
+ * ONE-SHOT re-key whose guard (`notePassesRan`) only clears when a batch really
+ * lands. A warm that dispatches is a warm that has to be reasoned about at
+ * every call site forever; a warm that cannot write is not.
+ *
+ * ⚠ ONE KERNEL PER MACROTASK, unconditionally — not "yield every 8 ms". The
+ * unit being spread here is a SINGLE kernel's graph build, and the largest of
+ * them is hundreds of ms on its own; a budget loop that checks the clock
+ * BETWEEN kernels still lets two land in one frame whenever the first was
+ * cheap. The clock cannot subdivide the thing that is too big.
+ */
+async function giWarmComputePipelines(renderer, nodes, { shouldStop = null, label = "gi2" } = {}) {
+  const backend = renderer?.backend;
+  if (!backend || typeof backend.compute !== "function") return { warmed: 0, ms: 0 };
+  const list = (Array.isArray(nodes) ? nodes : [nodes]).filter(Boolean);
+  const t0 = performance.now();
+  let warmed = 0;
+  for (const node of list) {
+    if (giBuiltNodes.has(node)) continue;
+    if (shouldStop?.()) break;
+    const realCompute = backend.compute;
+    giCurrentComputeNode = node;
+    try {
+      backend.compute = () => {};
+      renderer.compute(node);
+      // The graph IS built now, so this is the same fact the dispatch path
+      // records — and it is what lets the first real frame take the batched
+      // path instead of paying the per-node build it just skipped.
+      giBuiltNodes.add(node);
+      warmed++;
+    } catch (err) {
+      // A kernel that cannot warm still has to be able to run: leave it OUT of
+      // `giBuiltNodes` so the normal path rebuilds it, and never let one bad
+      // node abort the rest of the list.
+      console.warn(`[gi] ${label} warm skipped "${node?.__giPassName ?? "?"}": ${err?.message ?? err}`);
+    } finally {
+      giCurrentComputeNode = null;
+      backend.compute = realCompute;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  return { warmed, ms: performance.now() - t0 };
 }
 
 // Exported for `tests/gi-pipeline-watchdog.test.mjs`, which drives it with a
@@ -3510,7 +3584,7 @@ export class GISystem {
             `${this._gi2Passes.after.length} post-gbuffer dispatches` +
             `${this._gi2Passes.scrollInList ? " (+ the window scroll, on the frames it steps)" : ""}`);
         }
-        if (this._gi2Passes.before.length) {
+        if (this._gi2Passes.before.length && !this.#gi2WarmHolding()) {
           // §19 Stage 0.2's idiom: `giSkippedComputes` is cleared at the end of
           // every tick, so a size delta across THIS call means the batch was
           // deferred (its pipelines are still compiling). The window's scroll
@@ -3581,7 +3655,23 @@ export class GISystem {
       // that the AO pass writes a PERSISTENT target and is one frame's latency
       // either way, and that putting the multiply here is what keeps the lit
       // frame the composite feeds into the cache from being the AO-less one.
-      if (GI2_PATH && this._gi2Passes?.after?.length) {
+      if (GI2_PATH && this.#gi2WarmHolding()) {
+        // ⭐⭐⭐ §19 6.3 — THE WARM HAS TO WIN THE RACE, OR IT IS INERT.
+        //
+        // FIRST MEASUREMENT of the warm without this hold: `prewarmed — 2 of 56
+        // kernels`, then `1 of 71`. Everything else was already in
+        // `giBuiltNodes`, because the warm yields between kernels and the tick
+        // kept running and dispatched the chain itself — minting each kernel
+        // on-frame, which is the spike the warm exists to remove. A prewarm
+        // that races the thing it is prewarming loses, every time.
+        //
+        // So the chain does not dispatch while a warm is in flight. This is a
+        // frame of GI2 freshness on a boot frame that is ALREADY black, which
+        // is the same trade `deferrable` makes for the gather half all the way
+        // through the wave — and the work is not skipped, only moved off the
+        // frame it would otherwise have landed on.
+        mark("gi.gbufferPrepass");
+      } else if (GI2_PATH && this._gi2Passes?.after?.length) {
         // ⭐⭐ §19 STAGE 4.3a — DEFERRABLE, EXCEPT WHILE THE COMPILE WAVE OWNS
         // THE FRAMES.
         //
@@ -5959,6 +6049,10 @@ export class GISystem {
           if (this.state !== state) break;
           giCompute(renderer, node);
         }
+        // §19 6.3 — and GI2's own chain, which the two sources above cannot
+        // reach: under GI2_PATH both are null, so this loop warmed NOTHING and
+        // the log read `prewarm loop 0 ms over 0 kernels` on every boot.
+        if (GI2_PATH) await this.#warmGi2Chain("compile wave");
       }
       // Compile against the render path that will actually draw at resume.
       // With a postprocess override active, the scene renders through the
@@ -18144,8 +18238,67 @@ export class GISystem {
           "⚠ the MIRROR TIER (bvhHitShade / bvhReflect / the reflection-probe capture) is NOT dispatched on this " +
           "path and comes back as its own unit — glossy is the gather's oct cone until then.",
         );
+        // §19 6.3 — the voxelizer and the cascades exist only now, and their
+        // kernels are the ones whose first dispatch was the 1.4-2.2 s frames.
+        this.#warmGi2Chain("build complete");
       })
       .catch((err) => console.warn(`[gi2] build failed: ${err?.message ?? err}`));
+  }
+
+  /**
+   * §19 6.3 — the GI2 chain's prewarm, from wherever notices first.
+   *
+   * TWO CALLERS, ONE LOOP. The compile wave starts BEFORE the soup lands
+   * (Bistro: wave 13173 ms, voxelizer 14916 ms), so the wave can only ever warm
+   * the gather — the cascades and the voxelizer do not exist yet. The build's
+   * own completion is what can warm those, and it is also the last thing that
+   * happens before the frames that were spiking. Serialised on a single flag
+   * rather than deduped per node: two loops interleaving `backend.compute`
+   * swaps would restore each other's saved reference and leave the encode
+   * permanently stubbed.
+   */
+  /** True while a prewarm is in flight and its deadline has not passed. */
+  #gi2WarmHolding() {
+    return this._gi2WarmBusy === true && performance.now() < (this._gi2WarmUntil ?? 0);
+  }
+
+  async #warmGi2Chain(reason) {
+    const renderer = this.engine?.renderer;
+    const gi2 = this.state?.screen?.gi2;
+    // ⛔⛔ OPT-IN, AND THE MEASUREMENT IS WHY — see the header. Warming all 56
+    // kernels off-frame cost 5.3-8.4 s and pushed Level's first light from
+    // 6.6-6.8 s to 9.2-11.7 s while leaving frames > 50 ms at 15-20, i.e. it
+    // paid the whole bill and bought none of the receipt. The machinery is kept
+    // because it is correct and is the only way to mint a GI2 pipeline without
+    // dispatching it; the DEFAULT is off until something shows the spikes are
+    // actually these kernels. `__gi2WarmChain = true` re-arms it.
+    if (globalThis.__gi2WarmChain !== true) return;
+    if (!renderer || !gi2?.warmList || this._gi2WarmBusy) return;
+    this._gi2WarmBusy = true;
+    // ⚠ A DEADLINE, NOT A FLAG. The hold in `#tick` reads this, and a warm that
+    // wedged (a kernel that never resolves, a device loss mid-list) would
+    // otherwise stop GI2 dispatching for the life of the session. After this
+    // the chain runs and mints on-frame — the old behaviour, which is a spike
+    // and not a hang.
+    this._gi2WarmUntil = performance.now() + GI2_WARM_HOLD_MS;
+    try {
+      const list = gi2.warmList();
+      list.forEach((n, i) => { if (n && typeof n === "object") n.__giPassName ??= `gi2chain#${i}`; });
+      const { warmed, ms } = await giWarmComputePipelines(renderer, list, {
+        label: "gi2",
+        // The window can be rebuilt or disposed under a warm that yields
+        // between every kernel; a node from the retired generation must not be
+        // handed to the renderer.
+        shouldStop: () => this.state?.screen?.gi2 !== gi2,
+      });
+      if (warmed) {
+        console.log(`[gi] §19 6.3: GI2 chain prewarmed (${reason}) — ${warmed} of ${list.length} kernels ` +
+          `in ${ms.toFixed(0)}ms off-frame, one per macrotask`);
+      }
+    } finally {
+      this._gi2WarmBusy = false;
+      this._gi2WarmUntil = 0;
+    }
   }
 
   /**
