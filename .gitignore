@@ -62,3 +62,4 @@ PARALLEL_SESSION_PROMPT.md
 vite.energy.config.mjs
 .vite-cold/
 vite.cold.config.mjs
+.vite-bvh/

@@ -762,6 +762,28 @@ export function rc5PathEnabled(runtime = globalThis) {
 }
 
 /**
+ * §19 STAGE 5.5b — EXACT TRIANGLE SHADOW RAYS FOR THE DIRECT TERM.
+ *
+ * ON by default, and the reason is a CORRECTNESS one rather than a quality
+ * one: a direct shadow ray STARTS ON A SURFACE, and a ray traced against a
+ * voxelization of that surface begins inside its own occluder. The user's
+ * report — the Cornell tall box, an emitter mesh, rendered entirely black —
+ * is that failure at its cleanest, and no `v0` slab size fixes it (see
+ * `window/shadowBvh.js`'s header for why the failure is representational,
+ * not a tuning miss).
+ *
+ * `__gi2Rc5BvhShadow = 0` restores the voxel arm (`traceWindow`), which is
+ * also what serves automatically on any build where the BVH did not land — a
+ * tier that gates it off, a scene past the triangle cap, a worker failure, or
+ * simply the frames before the build finishes. So this flag turns off a
+ * REPLACEMENT, never a requirement.
+ */
+export function rc5BvhShadowEnabled(runtime = globalThis) {
+  if (!rc5PathEnabled(runtime)) return false;
+  return (runtime?.__gi2Rc5BvhShadow ?? 1) !== 0;
+}
+
+/**
  * GI quality tier → GI2 window tier. A 1:1 map, published rather than inlined
  * so `windowStore`/`gatherProbes`/`radianceCache`'s four tier tables and this
  * module's four quality levels can never drift apart silently: every GI2 tier
