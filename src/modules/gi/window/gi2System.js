@@ -614,6 +614,26 @@ export function createGi2System({
       // THE MATERIAL-FACING IRRADIANCE WHEN AO IS ON — see gi2TextureGeneration.
       aoOut.version = ++gi2TextureGeneration;
     }
+    // ⭐⭐ §19 4.3f — THE PALETTE SURVIVES THE REBUILD, AND IT DID NOT BEFORE.
+    //
+    // `setSize` replaces the gather, and the palette lives ON the gather as two
+    // `uniformArray`s. `setPalette` is called exactly twice in the tree — from
+    // `build` and from `#retintGi2Palette` — and NEITHER runs on a resize,
+    // which by design does not rebuild. So every viewport drag zeroed the
+    // albedo and emissive tables: from then on every ray hit shaded against
+    // albedo 0 and no palette class carried emission, until the next full GI
+    // build put them back.
+    //
+    // ⚠ FOUND BY THE OCCUPANCY DEBUG VIEW, not by a lighting receipt — its
+    // console line reports "N classes carry colour", and after a resize hop it
+    // printed 0. A term whose loss shows up as "the bounce got a bit darker"
+    // has no other tell; a view that names the number does.
+    //
+    // Copying the LIVE VECTORS (rather than re-running `setPalette` from a
+    // stored source) is what makes this correct for both writers: the re-tint
+    // path writes through the gather's own arrays too, so whatever the last
+    // word was, this carries it.
+    const prev = gather;
     gather = createGiGather({
       win, trace, cache,
       positionTexture: gbuffer.position,
@@ -637,6 +657,13 @@ export function createGi2System({
       // `emitterDirectPass` below reads, same solid-angle expression.
       emitters: emitters ?? null,
     });
+    if (prev?.palette?.length) {
+      const n = Math.min(prev.palette.length, gather.palette.length);
+      for (let i = 0; i < n; i++) {
+        gather.palette[i].copy(prev.palette[i]);
+        gather.paletteEmissive[i].copy(prev.paletteEmissive[i]);
+      }
+    }
     // ⭐⭐ THE REBIND STAMP (see `gi2TextureGeneration`). Only the two textures
     // MATERIALS sample need it — `irradiance` (when AO is off it is the one
     // `_giIrradianceNode` points at) and `glossy` (`_giRadianceNode`). `lit` and

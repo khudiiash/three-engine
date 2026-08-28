@@ -3630,3 +3630,166 @@ re-anchoring probe grid makes the rest of the frame do.
 ⚠ **NOT RE-RUN: the Cornell rows.** AA.2 records them as taken with world probes
 ON — the configuration this change RESTORES — so they are unchanged by
 construction rather than by measurement. Re-run them before the next flip.
+
+---
+
+## §AB — EVERY DEBUG VIEW, ON THE PATH THAT IS ACTUALLY LIT (08-28)
+
+**The report** (user, 08-28): *"check our debug view for indirect only"*, then
+*"not only indirect, all debug views"*. Two separate failures were behind it,
+and only the first had been found at `c11d9c9`.
+
+### AB.1 — Three views were a SILENT no-op under GI2
+
+`occupancy`, `sdf` and `src-probes` were built from the SRC bundle:
+`state.gizmos.occView` / `sdfView` come out of `srcDebugViews.js` and need
+`volume.occupancyField` + `volume.distance`; `src-probes` toggled
+`screen.srcProbes.gizmos`. GI2 builds **none of the three**, so all three were
+`null` and the mode did nothing — no overlay, no console line, no change to the
+frame. "I picked the view and nothing happened" was indistinguishable from "the
+view is broken", which is the failure class this module logs most often.
+
+**The replacement is one quad, `src/modules/gi/window/windowDebugView.js`**,
+tracing the WINDOW with the same `traceWindow` bit-DDA the gather's rays use:
+
+| mode | what it draws now |
+|---|---|
+| `occupancy` | palette albedo at the hit, shaded by the ENTRY FACE — the voxel world the rays see. Mid-grey = an occupied voxel with no STATIC palette byte (a mover the dynamic layer wrote). |
+| `sdf` | GI2 has no distance field. Brightness = hit distance (`1 − exp(−t / L0extent)`), hue = the window LEVEL that answered — the hand-off this design lives on. |
+| `src-probes` | with `__gi2WorldProbes` (the default): the WORLD lattice's cell frame drawn on the geometry, hue = the owning cascade, body = the resolve's E/π, **magenta = a surface inside no lattice at all**. With screen probes: the 16 px probe tile grid, each tile flat-filled with the resolve's E/π at its centre. |
+
+⭐ **A FRAGMENT SHADER, NOT A COMPUTE PASS.** `traceWindow` is a `sharedFn` over
+ONE storage buffer plus uniforms, and three's WGSL builder emits
+`var<storage, read>` for any storage buffer bound outside the compute stage
+(`WGSLNodeBuilder.getNodeAccess`). A compute pass would have needed its own
+viewport-sized storage texture — one more thing to re-create and rebind on every
+resize.
+
+⭐⭐ **NOTHING IN THAT MATERIAL BINDS A GATHER BUFFER, ON PURPOSE.** The obvious
+way to draw probe anchors is `gather.buffers.probeMeta`; `setSize` REPLACES the
+gather, a storage-buffer node cannot be repointed the way a `texture()` node
+can, and the repair would be a material rebuild — a pipeline compile — per
+resize hop. So the material binds `win.buffer` (created once per GI2 system,
+survives a resize), a repointable `texture()` for the irradiance, its own copy of
+the palette, and the lattice's SHAPE as build constants with only the per-cascade
+ORIGIN as a uniform. The stated price: the probe view shows the tile/cell, never
+the anchor inside it.
+
+⭐⭐ **THE ORIGIN HAS TO ESCAPE ALONG THE RAY.** First Bistro run at the
+eye-level street pose: `sdf` came back **one colour on 100 % of the frame**,
+`occupancy` two. The camera was standing inside the occupied set — the
+voxelization is conservative, so at 0.25 m cells any camera within a quarter of a
+metre of a wall, a kerb or the pavement is inside it, which is most eye-level
+poses in a street. Fixed by passing the ray direction as the trace's normal with
+`biasCells = 1`, which turns on `ORIGIN_ESCAPE` (up to 4 cells). Price: geometry
+within ~1 cell of the eye is not drawn and `t` reads up to a cell short.
+
+### AB.2 — `indirect` showed a BUFFER, not a TERM
+
+Second user screenshot, same session: the Bistro street in the `indirect` view is
+a solid **white sheet**, faint pink only under the awnings. Nothing was wrong
+with the buffer. The texture holds IRRADIANCE `E`; every lit material adds
+`irradiance.div(Math.PI)` to its radiance (`giLight.js` ~2265), so the brightest
+thing the frame can build from a texel is `E/π` at a white albedo. Daylight sky
+irradiance is several units, and the quad wrote it raw.
+
+`/π` is therefore **not an exposure knob — it is the factor the materials
+apply**, and it turns the view from "the contents of a buffer" into "the diffuse
+term at a white albedo". Tone mapping and the output transfer stay the frame's
+own: `material.toneMapped` is inert on the WebGPU node path, so the quad already
+gets exactly what the pixels beside it get. Glossy is NOT divided — that texture
+is a radiance `giLight` adds to `context.radiance` directly.
+
+⚠ **AND THE RECEIPT GREW A SECOND COLUMN.** "mean luma 0.98" and "the picture is
+a white sheet" are different claims, so the line prints RAW E (with the share of
+texels **at the rgba8 readback's 1.0 clamp**) and DISPLAYED `E/π` through the
+renderer's own tone mapping + exposure.
+
+### AB.3 — `ao` was already right; `reflections-exact` was not
+
+`ao` verified, no change: `gi2System.buildAoComposePass` multiplies the
+irradiance by `env.ao.node`, and `#armGtaoPass` sets `ao.node =
+texture(finalTarget)` — the very target the view samples. `reflections-exact` now
+says **"there is no exact/BVH mirror tier on the GI2 path yet"** once, instead of
+the generic "no source texture is armed", which reads as a transient that might
+clear. It is structural: `#syncBvhScene` is skipped and neither `bvhReflect` nor
+`bvhHitShade` is dispatched.
+
+### AB.4 — The inspector lists what this build can draw
+
+`GI_DEBUG_VIEW_MODES` in `giConfig.js` is the ONE place a mode is declared, with
+its one-line description and the paths it has a source on. The component's
+`options` is now a FUNCTION (`giDebugViewsFor()`), which the Inspector resolves
+when the panel opens — so the dropdown lists exactly the modes the live path can
+draw, and every volume view is on the prop instead of being console-only.
+Selecting any mode prints its description and the live path; a mode with no
+source prints why, once per selection.
+
+### AB.5 — The palette did not survive a resize (found BY the new view)
+
+The occupancy view's receipt prints "N classes carry colour". During the resize
+hops it printed **0**. `setSize` replaces the gather, the palette lives ON the
+gather as two `uniformArray`s, and `setPalette` is called from exactly two places
+— `build` and `#retintGi2Palette` — neither of which runs on a resize. **Every
+viewport drag zeroed GI2's albedo and emissive tables**, so every ray hit shaded
+against albedo 0 until the next full build. Fixed in `buildGather()` by copying
+the previous gather's live palette vectors (which catches both writers).
+
+⭐ A term whose loss reads as "the bounce got a bit darker" has no other tell. A
+view that prints the number does. [[probe-blind-statistics]]
+
+### AB.6 — Receipts: Bistro, `probe:gi-debug-views` with `SCENE=Bistro`
+
+The probe now opens a real scene (`SCENE=`, bare name or full path; the rig stays
+the default) and **chooses its pose by measurement**, because two hand-picked
+poses each produced a receipt that looked like a broken shader: the flood probe's
+eye-level banner pose put the camera inside geometry (one ray for the whole
+frame), and a three-quarter overview off `Box3.setFromObject(scene)` put it
+outside the window's reach (0 % non-black). Candidates are scored by the number
+of distinct colours the OCCUPANCY view puts up; eye level wins whenever it is
+usable, and the volume views' COVERAGE is re-measured from the overview — at eye
+level 61 % of a street frame is sky and a miss is black by construction, so
+">60 % non-black" is unreachable there no matter how correct the view is.
+
+Bistro, GI2, world probes, `ao`/`reflections` forced ON (the scene saves both
+`false`), eye-level pose `[0, −5, 0] → [0, −5, −48]`:
+
+| view | non-black | pinned white | mean | p50 | p95 | Δ(off) | drew |
+|---|---|---|---|---|---|---|---|
+| off (control) | — | — | — | — | — | noise 0.00 | — |
+| indirect | 99.8 % | 0.8 % | 0.525 | 0.552 | 0.702 | 35.5 | yes |
+| ao | 100 % | 7.5 % | 0.713 | 0.749 | 0.992 | 71.0 | yes |
+| reflections | 93.6 % | 0.0 % | 0.166 | 0.164 | 0.337 | 73.7 | yes |
+| reflections-exact | — | — | — | — | — | 0.01 | no (structural) |
+| occupancy | 38.7 % | 0.0 % | 0.107 | 0.000 | 0.420 | 95.5 | yes |
+| sdf | 38.7 % | 0.0 % | 0.235 | 0.000 | 0.679 | 106.9 | yes |
+| src-probes | 38.7 % | 0.0 % | 0.239 | 0.000 | 0.884 | 108.4 | yes |
+| occupancy (overview) | **93.2 %** | 0.0 % | 0.344 | 0.278 | 0.604 | 57.0 | yes |
+| sdf (overview) | **93.2 %** | 0.0 % | 0.569 | 0.635 | 0.678 | 49.3 | yes |
+| src-probes (overview) | 93.2 % | 0.0 % | 0.651 | 0.689 | 0.885 | 69.4 | yes |
+
+Console receipts at that pose:
+
+```
+indirect  RAW E (rgba8, clamped at 1.0): mean luma 0.534 p50 0.543 p95 0.958,
+          non-black 100.0 %, AT THE CLAMP 5.4 %
+          DISPLAYED E/pi @ tone mapping 1, exposure 1: mean 0.431 p50 0.453 p95 0.588
+ao        AO: mean 0.713 min 0.263 p05 0.361 p50 0.749 p95 0.992
+reflect.  glossy field: mean luma 0.090, non-black 97.2 %, AT THE CLAMP 0.1 %,
+          displayed (x0.04 Fresnel, tone-mapped) mean 0.046
+          exact BVH: not armed
+occupancy 62 palette classes carry colour; L0 0.25m/16m … L4 4.00m/256m, span 443 m
+sdf       same window; hue = the level that answered
+probes    WORLD lattice, 3 cascades of 32³, c0 0.50m/16m c1 2.00m/64m c2 8.00m/256m
+```
+
+**Gates, all PASS on Bistro and on the rig:** every view compiles and draws with
+0 page errors · `indirect` non-black > 60 % (99.8 %) · `indirect` displayed mean
+in [0.15, 0.7] (0.525), p95 < 0.95 (0.702), pinned-at-white < 5 % (0.8 %) ·
+`occupancy` and `sdf` non-black > 60 % at the overview (93.2 %) · `ao` factor p50
+in [0.5, 1.0] (0.749) · `reflections` reported · the `__giDebugView` global still
+drives a view · **5 resize hops × 3 views ON leave 0 destroyed-texture errors**.
+
+Standing gates re-run green on this tree: `smoke:gi-gpu` (0 FAIL),
+`test:gi-moved-lamp` (Δnew 29.06 > 12), `probe:gi-resize` (ALL PASS — 0
+uncaptured device errors, 0 destroyed textures, fast round trip 0 pipelines).

@@ -29,8 +29,9 @@
 import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionGeometry, positionWorld, renderGroup, sRGBTransferEOTF, screenCoordinate, screenUV, select, sin, smoothstep, step, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
-import { GI2_PATH, GI_QUALITY_LEVELS, GI_TERM_DEBUG_VIEWS, GI_TIER_GPU_BUDGET_BYTES, gi2TierOf, giDebugView, resolveGiConfig, sceneSkyRadiance, wgslPointerParametersSupported } from "./giConfig.js";
+import { GI2_PATH, GI_DEBUG_VIEW_DOC, GI_QUALITY_LEVELS, GI_TERM_DEBUG_VIEWS, GI_TIER_GPU_BUDGET_BYTES, GI_VOLUME_DEBUG_VIEWS, gi2TierOf, giDebugView, giDebugViewsFor, resolveGiConfig, sceneSkyRadiance, wgslPointerParametersSupported } from "./giConfig.js";
 import { createGi2System, createGi2Volume } from "./window/gi2System.js";
+import { createGi2DebugView, gi2ViewCode } from "./window/windowDebugView.js";
 import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
 import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGi2LightShadowPass, createGiAoFilterPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
 import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
@@ -12234,6 +12235,30 @@ export class GISystem {
     if (gizmos.occView) gizmos.all.push(gizmos.occView);
     gizmos.debugView = this.#buildDebugView();
     if (gizmos.debugView) gizmos.all.push(gizmos.debugView);
+    // ⭐ §19 4.3f — THE GI2 VOLUME VIEW. `sdfView`/`occView` above are built
+    // from the SRC `volume` bundle and are null under GI2 (no occupancy field,
+    // no distance oracle), which is why "occupancy" / "sdf" / "src-probes" were
+    // a silent no-op on the live path. This quad traces the WINDOW with the
+    // same bit-DDA the gather's rays use, so what it draws is what the rays
+    // see — the standing rule `srcDebugViews.js` states and this one inherits.
+    gizmos.gi2View = screen?.gi2
+      ? createGi2DebugView({
+        win: screen.gi2.win,
+        trace: screen.gi2.trace,
+        palEntries: screen.gi2.gather?.palette?.length ?? 64,
+        tile: screen.gi2.gather?.T ?? 16,
+        // The world lattice's SHAPE — cascade count, cells per axis, per-cascade
+        // spacing — all tier constants. Never its buffers; see the module header.
+        world: screen.gi2.gather?.world
+          ? {
+            cascades: screen.gi2.gather.world.cascades,
+            cells: screen.gi2.gather.world.cells,
+            spacings: screen.gi2.gather.world.spacings,
+          }
+          : null,
+      })
+      : null;
+    if (gizmos.gi2View) gizmos.all.push(gizmos.gi2View.mesh);
     for (const mesh of gizmos.all) engine.scene.add(mesh);
 
     this.state = {
@@ -14565,25 +14590,56 @@ export class GISystem {
       return;
     }
     if (termMode === "indirect") {
-      // §19 4.3e: the indirect view had no receipt at all — "I picked indirect
-      // and it is black" could not be told from "GI is dark here". One line,
-      // the same shape as the reflection views': coverage from the COLOUR.
+      // ⭐ §19 4.3f — TWO NUMBERS, RAW AND DISPLAYED, SO A READER CAN TELL
+      // EXPOSURE FROM CONTENT.
+      //
+      // 4.3e gave this view a receipt at all ("I picked indirect and it is
+      // black" could not be told from "GI is dark here"). 4.3f had to give it
+      // a SECOND one: the view now shows `E/pi` through the frame's own tone
+      // mapping, so "mean luma 0.98" from the buffer and "the picture is a
+      // white sheet" are different claims and both have to be printable. The
+      // first is the term's energy; the second is what the eye sees.
+      //
+      // ⚠ THE RAW COLUMN IS CLAMPED AT 1.0 AND SAYS SO. `readTexturePixelsGPU`
+      // blits into an rgba8 target, so every texel of a daylit street with
+      // E > 1 comes back as 255 — which is exactly the state that made the
+      // view unreadable, and is therefore worth reporting as a PERCENTAGE
+      // rather than being hidden inside a mean that cannot exceed 1.
       grab(targets?.irradiance, "indirect")
         .then((v) => {
           if (!v.px) {
             console.log(`[gi] debug view "indirect": ${v.error ?? "not armed"}`);
             return;
           }
-          let n = 0, lit = 0, lum = 0;
+          const raw = [];
+          const shown = [];
+          let n = 0, lit = 0, clipped = 0;
           for (let i = 0; i < v.px.length; i += 4) {
             n++;
-            const l = (0.2126 * v.px[i] + 0.7152 * v.px[i + 1] + 0.0722 * v.px[i + 2]) / 255;
+            const r = v.px[i] / 255, g = v.px[i + 1] / 255, b = v.px[i + 2] / 255;
+            const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
             if (l > 0.004) lit++;
-            lum += l;
+            if (v.px[i] === 255 || v.px[i + 1] === 255 || v.px[i + 2] === 255) clipped++;
+            raw.push(l);
+            shown.push(this.#displayedLuma(l / Math.PI));
           }
+          const q = (arr, p) => {
+            const s = [...arr].sort((a, b) => a - b);
+            return s[Math.min(s.length - 1, Math.max(0, Math.round(p * (s.length - 1))))];
+          };
+          const mean = (arr) => arr.reduce((a, b) => a + b, 0) / Math.max(1, arr.length);
+          const tm = this.engine?.renderer?.toneMapping ?? 0;
+          const ex = this.engine?.renderer?.toneMappingExposure ?? 1;
           console.log(
-            `[gi] debug view "indirect" — the irradiance the materials sample (${this._gi2 ? "GI2 gather" : "SRC resolve"}): ` +
-              `mean luma ${(lum / Math.max(1, n)).toFixed(3)}, non-black on ${((100 * lit) / Math.max(1, n)).toFixed(1)}% of texels`,
+            `[gi] debug view "indirect" — the irradiance the materials sample ` +
+            `(${this._gi2 ? "GI2 gather" : "SRC resolve"}), and what the quad puts on screen:\n` +
+            `    RAW E (rgba8 readback, so clamped at 1.0): mean luma ${mean(raw).toFixed(3)} ` +
+            `p50 ${q(raw, 0.5).toFixed(3)} p95 ${q(raw, 0.95).toFixed(3)}, ` +
+            `non-black on ${((100 * lit) / Math.max(1, n)).toFixed(1)}% of texels, ` +
+            `AT THE CLAMP on ${((100 * clipped) / Math.max(1, n)).toFixed(1)}%\n` +
+            `    DISPLAYED E/pi through tone mapping ${tm} @ exposure ${ex}: ` +
+            `mean ${mean(shown).toFixed(3)} p50 ${q(shown, 0.5).toFixed(3)} p95 ${q(shown, 0.95).toFixed(3)} ` +
+            "(a p95 near 1.0 is a blown view, not a bright scene)",
           );
         })
         .catch((error) => console.warn(`[gi] debug view "indirect" stats FAILED: ${error?.message ?? error}`));
@@ -14598,11 +14654,12 @@ export class GISystem {
         const lines = [];
         const summarise = (label, px) => {
           if (!px) return `${label}: not armed`;
-          let n = 0, lit = 0, lum = 0;
+          let n = 0, lit = 0, lum = 0, clip = 0;
           for (let i = 0; i < px.length; i += 4) {
             n++;
             const l = (0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]) / 255;
             if (l > 0.004) lit++;
+            if (px[i] === 255 || px[i + 1] === 255 || px[i + 2] === 255) clip++;
             lum += l;
           }
           // ⚠ NO VALIDITY COLUMN, and that is deliberate. The obvious one —
@@ -14611,8 +14668,16 @@ export class GISystem {
           // a texture that was provably black everywhere. Coverage is read
           // from the COLOUR instead, which is the channel the readback
           // actually carries.
+          // §19 4.3f: the DISPLAYED column, for the same reason the indirect
+          // view grew one. The glossy buffer is a RADIANCE the shader then
+          // multiplies by Fresnel (~0.04 head-on for a dielectric), so its raw
+          // mean and the brightness of the picture are two different claims —
+          // and the raw one is clamped at 1.0 by the rgba8 readback anyway.
           return `${label}: mean luma ${(lum / Math.max(1, n)).toFixed(3)}, ` +
-            `non-black on ${((100 * lit) / Math.max(1, n)).toFixed(1)}% of texels`;
+            `non-black on ${((100 * lit) / Math.max(1, n)).toFixed(1)}% of texels, ` +
+            `AT THE CLAMP on ${((100 * clip) / Math.max(1, n)).toFixed(1)}%, ` +
+            `displayed (x0.04 Fresnel, tone-mapped) mean ${
+              this.#displayedLuma((lum / Math.max(1, n)) * 0.04).toFixed(3)}`;
         };
         lines.push(summarise("glossy field", g.px));
         lines.push(summarise("exact BVH   ", b.px));
@@ -14621,6 +14686,70 @@ export class GISystem {
     }
   }
 
+  /**
+   * A linear value as the CANVAS shows it: the renderer's tone mapping and
+   * exposure, then the sRGB transfer.
+   *
+   * ⚠ WHY THE DEBUG QUAD NEEDS THIS AND THE QUAD ITSELF DOES NOT. On the
+   * WebGPU node path `material.toneMapped` is inert — three reads it only in
+   * the WebGL programs — and the renderer's output stage applies
+   * `renderOutput(toneMapping, colorSpace)` over the whole frame. So the quad
+   * gets the SAME treatment as the pixels beside it for free, which is exactly
+   * what makes "the diffuse term at a white albedo" a comparable picture. What
+   * has no equivalent is the RECEIPT: a readback of the source texture is
+   * linear, and a mean taken there cannot answer "is the picture blown". This
+   * mirrors the transform so it can.
+   *
+   * Neutral (three's default and this project's) is IDENTITY below ~0.76 —
+   * which is why the AO view's sRGB pre-decode reads back exactly as the factor
+   * it shows. Anything unrecognised falls through as identity and the receipt
+   * prints the mode number, so a reader can see that it was not modelled rather
+   * than trusting a wrong number.
+   */
+  #displayedLuma(linear) {
+    const renderer = this.engine?.renderer;
+    const exposure = renderer?.toneMappingExposure ?? 1;
+    let v = Math.max(0, linear) * exposure;
+    const mode = renderer?.toneMapping ?? THREE.NoToneMapping;
+    if (mode === THREE.NeutralToneMapping) {
+      // three's NeutralToneMapping, on a grey (r = g = b = v). Exact for grey
+      // and close for the LUMA of a colour, which is what this measures.
+      const start = 0.8 - 0.04;
+      const offset = v < 0.08 ? v - 6.25 * v * v : 0.04;
+      v = Math.max(0, v - offset);
+      if (v >= start) {
+        const d = 1 - start;
+        v = 1 - (d * d) / (v + d - start);
+      }
+    } else if (mode === THREE.ReinhardToneMapping) {
+      v = v / (1 + v);
+    } else if (mode === THREE.ACESFilmicToneMapping) {
+      const x = v * 0.6;
+      v = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+    }
+    v = Math.min(1, Math.max(0, v));
+    // sRGB OETF — the output transfer the canvas applies.
+    return v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055;
+  }
+
+  /**
+   * ⭐ §19 4.3f — ONE PLACE DECIDES WHAT IS ON SCREEN, AND IT SAYS WHY.
+   *
+   * Three families of overlay live behind the one `debugView` switch:
+   *
+   *   · the SRC volume boxes (`sdfView` / `occView`) and the SRC probe gizmo
+   *     cloud — built from the `createSrcVolume` bundle, so null under GI2;
+   *   · the GI2 volume quad (`gi2View`) — occupancy / distance+level / the
+   *     screen-probe tile lattice, all traced through the window;
+   *   · the fullscreen TERM quad (`debugView`) — indirect / ao / reflections,
+   *     which sample whatever texture the LIT path samples.
+   *
+   * ⛔ A MODE WITH NO SOURCE ON THE LIVE PATH MUST SAY SO. Before this stage
+   * `occupancy`, `sdf` and `src-probes` were a silent no-op under GI2: the
+   * switch moved, nothing was logged, the frame did not change, and "I picked
+   * the view and nothing happened" was indistinguishable from "the view is
+   * broken". Every branch below either draws or explains itself once.
+   */
   #applyDebugVisibility() {
     const state = this.state;
     if (!state) return;
@@ -14628,22 +14757,79 @@ export class GISystem {
     // through to the inspector-driven `props.debugView`; the global still
     // wins (a console switch has to beat a stale inspector value).
     const mode = giDebugView(this.component);
-    if (state.gizmos.sdfView) state.gizmos.sdfView.visible = mode === "sdf";
-    if (state.gizmos.occView) state.gizmos.occView.visible = mode === "occupancy";
-    // "src-probes" is selectable whether or not `__giSrcProbes` is on; with the
-    // population off there is simply nothing to show. Saying so beats a silent
-    // no-op, because "I picked the probe view and nothing happened" is
-    // otherwise indistinguishable from "the probe view is broken".
-    if (mode === "src-probes" && !state.screen?.srcProbes && !this._srcGizmoHintShown) {
-      this._srcGizmoHintShown = true;
-      console.log(
-        "[gi] Debug View \"src-probes\": the SRC probe population is off. " +
-        "It is ON by default since Phase 5 — this build was opted out " +
-        "(`__giSrcProbes = false`, or the build predates the flip). Remove the " +
-        "flag and rebuild GI to get probes back.",
-      );
+    // `_gi2` is the LIVE GI2 system, not the build constant: a state built
+    // before the GI2 chain existed has neither, and the SRC branches below are
+    // then the correct ones.
+    const gi2 = this._gi2 ?? null;
+    this.#announceDebugView(mode, gi2);
+
+    // ── THE SRC VOLUME OVERLAYS (GI2_PATH === false) ──────────────────────
+    if (state.gizmos.sdfView) state.gizmos.sdfView.visible = !gi2 && mode === "sdf";
+    if (state.gizmos.occView) state.gizmos.occView.visible = !gi2 && mode === "occupancy";
+    if (!gi2) {
+      if (mode === "sdf" && !state.gizmos.sdfView) {
+        this.#debugViewNoSource("sdf", "this SRC volume has no distance oracle (no occupancy field was built)");
+      }
+      if (mode === "occupancy" && !state.gizmos.occView) {
+        this.#debugViewNoSource("occupancy", "this SRC volume has no occupancy field");
+      }
+      // "src-probes" is selectable whether or not `__giSrcProbes` is on; with
+      // the population off there is simply nothing to show.
+      if (mode === "src-probes" && !state.screen?.srcProbes) {
+        this.#debugViewNoSource(
+          "src-probes",
+          "the SRC probe population is off. It is ON by default since Phase 5 — this build was " +
+          "opted out (`__giSrcProbes = false`, or the build predates the flip). Remove the flag and rebuild GI",
+        );
+      }
     }
-    state.screen?.srcProbes?.gizmos?.setVisible(mode === "src-probes");
+    state.screen?.srcProbes?.gizmos?.setVisible(!gi2 && mode === "src-probes");
+
+    // ── THE GI2 VOLUME QUAD ───────────────────────────────────────────────
+    const volume = state.gizmos?.gi2View ?? null;
+    const wantsVolume = GI_VOLUME_DEBUG_VIEWS.has(mode) ? mode : "off";
+    if (volume && gi2) {
+      // ⚠ WORLD PROBES REPLACE THE SCREEN POPULATION OUTRIGHT (§19 3.13), and
+      // they are the DEFAULT on this branch — so "src-probes" has two entirely
+      // different pictures behind it and the view has to be told which. With a
+      // lattice it draws that lattice's cell frame on the geometry; without one
+      // it draws the screen tile grid. The one state with no picture at all is
+      // "world probes on, but this material was built before the lattice
+      // existed", which only a mid-session flag flip can produce.
+      const world = gi2.gather?.world ?? null;
+      const worldBlind = wantsVolume === "src-probes" && !!gi2.gather?.worldProbes
+        && volume.worldCascades === 0;
+      const code = worldBlind ? 0 : gi2ViewCode(wantsVolume);
+      const on = code !== 0;
+      if (on) {
+        volume.setMode(code);
+        // Pushed every tick while visible, all four of them cheap compares: a
+        // re-tint rewrites the palette, a resize replaces the irradiance
+        // texture and moves the resolve's pixel grid, and a quality change
+        // moves the probe tile. A view that showed the palette it was BUILT
+        // with would be wrong the first time a material changed colour.
+        volume.setPalette(gi2.gather?.palette);
+        volume.setIrradiance(gi2.textures?.irradiance ?? null);
+        volume.setSize(gi2.width, gi2.height);
+        volume.setTile(gi2.gather?.T ?? 16);
+        // The lattice ORIGINS step with the camera (hysteretic, block-aligned),
+        // so they are pushed every visible tick like everything else here.
+        volume.setWorldOrigins(gi2.gather?.worldProbes ? (world?.origins ?? null) : null);
+        this.#debugVolumeReceipt(wantsVolume, gi2, volume);
+      }
+      if (volume.mesh.visible !== on) volume.mesh.visible = on;
+      if (worldBlind) {
+        this.#debugViewNoSource(
+          "src-probes",
+          "world probes are on (`__gi2WorldProbes`) but this overlay was built against a screen-probe " +
+          "gather — the lattice's shape is baked at build time. Rebuild GI to get the lattice view",
+        );
+      }
+    } else if (volume) {
+      if (volume.mesh.visible) volume.mesh.visible = false;
+    } else if (gi2 && wantsVolume !== "off") {
+      this.#debugViewNoSource(wantsVolume, "the GI2 volume view was not built with this GI state — rebuild GI");
+    }
 
     // The GI-term overlay (`indirect` / `ao` / `reflections`). Three of these
     // need a live texture sample; the resolve's `irradiance` and `radiance`
@@ -14673,7 +14859,7 @@ export class GISystem {
         // debug view must sample WHAT THE MATERIALS SAMPLE, on whichever path
         // is lit; GI2's textures are re-created on resize, and the per-frame
         // `texU.value !== sampled` swap below is what follows them.
-        const gi2Tex = this._gi2?.textures;
+        const gi2Tex = gi2?.textures;
         const targets = gi2Tex
           ? { ...this._giTargets, irradiance: gi2Tex.irradiance ?? null, radiance: gi2Tex.glossy ?? null }
           : this._giTargets;
@@ -14685,26 +14871,54 @@ export class GISystem {
         let modeCode = 0;
         if (termMode === "indirect" && targets?.irradiance) {
           sampled = targets.irradiance;
+          // ⭐⭐ MODE 1 IS `E / π`, NOT `E`, SINCE §19 4.3f — and that is not a
+          // cosmetic exposure choice, it is the difference between showing the
+          // TERM and showing the buffer. The texture holds IRRADIANCE; every
+          // material adds `irradiance / π` to its radiance (giLight.js), so the
+          // brightest thing the frame can build from a texel is E/π, at a white
+          // albedo. Displayed raw, a daylit street reads as a solid white
+          // frame — E outdoors is several units and the output transfer clips
+          // everything above 1 — which is unreadable rather than wrong.
           modeCode = 1;
         } else if (termMode === "ao") {
-          // ONE estimator (GTAO), so this IS the factor the resolve applies.
+          // ONE estimator (GTAO), so this IS the factor the resolve applies —
+          // and under GI2 it is literally the same texture: `gi2System`'s
+          // `aoCompose` kernel multiplies the irradiance by `env.ao.node`,
+          // which `#armGtaoPass` set to `texture(finalTarget)`, the very target
+          // this view samples. (Checked at §19 4.3f: the compose upsamples with
+          // position/normal weights but takes its factor from nowhere else.)
           sampled = aoPass?.target ?? null;
           if (sampled) modeCode = 2;
         } else if (termMode === "reflections" && targets?.radiance) {
           // The glossy field, Fresnel-weighted by the shader against the
           // gbuffer — see mode 4's note for why the raw buffer reads as a
-          // second copy of the scene.
+          // second copy of the scene. ⚠ NO `/π` here: the glossy texture is a
+          // RADIANCE that giLight adds to `context.radiance` directly, unlike
+          // the irradiance above. Mode 3 is the un-weighted fallback for a
+          // build with no gbuffer to weight against.
           sampled = targets.radiance;
           gPos = state.screen?.gbuffer?.position ?? null;
           gNormal = state.screen?.gbuffer?.normal ?? null;
-          modeCode = gPos && gNormal ? 4 : 1;
+          modeCode = gPos && gNormal ? 4 : 3;
         } else if (termMode === "reflections-exact") {
           // The traced arm has no view of its own before this: `bvhRadiance`
           // is what ultra's sharp reflections actually sample, and a wrong
           // one was only ever visible reflected in a surface.
-          second = this._giBvhTarget?.bvhRadiance ?? null;
+          second = gi2 ? null : (this._giBvhTarget?.bvhRadiance ?? null);
           sampled = second;
           modeCode = second ? 5 : 0;
+          if (gi2) {
+            // ⛔ NOT THE GENERIC HINT. There is no BVH mirror tier on GI2 at
+            // all (`#syncBvhScene` is skipped and neither `bvhReflect` nor
+            // `bvhHitShade` is dispatched — see the GI2 build), so "no source
+            // texture is armed" would read as a transient that might clear.
+            // It is structural, and it has a name.
+            this.#debugViewNoSource(
+              "reflections-exact",
+              "there is no exact/BVH mirror tier on the GI2 path yet — the sharp arm comes back as its " +
+              "own unit. Use \"reflections\" for the glossy field GI2 does produce",
+            );
+          }
         }
         if (sampled && modeCode) {
           if (texU.value !== sampled) texU.value = sampled;
@@ -14723,18 +14937,108 @@ export class GISystem {
           // is otherwise indistinguishable from "reflections is broken". A
           // disabled AO with the AO view selected is the obvious case.
           if (debugMesh.visible) debugMesh.visible = false;
-          if (!this._giDebugNoSourceHintShown?.has(termMode)) {
-            (this._giDebugNoSourceHintShown ??= new Set()).add(termMode);
-            console.log(
-              `[gi] Debug View "${termMode}": no source texture is armed ` +
-              "(an AO view with the Ambient Occlusion toggle off; a reflections view with " +
-              "Reflections off; the indirect view before the first resolve). " +
-              "The view is hidden until a source returns.",
-            );
-          }
+          this.#debugViewNoSource(
+            termMode,
+            "no source texture is armed (an AO view with the Ambient Occlusion toggle off; a " +
+            "reflections view with Reflections off; the indirect view before the first resolve). " +
+            "The view is hidden until a source returns",
+          );
         }
       }
     }
+  }
+
+  /**
+   * The one-line description a selection prints, once per selection.
+   *
+   * ⚠ AND IT NAMES THE PATH. The same mode id draws two different things on
+   * SRC and GI2 ("occupancy" is a pyramid march on one and a window DDA on the
+   * other), so a receipt that omitted the path would make two screenshots look
+   * like a regression in one of them.
+   */
+  #announceDebugView(mode, gi2) {
+    if (this._giDebugAnnounced === mode) return;
+    this._giDebugAnnounced = mode;
+    // Re-arm the per-mode "no source" memo: a re-selection is a fresh question
+    // and deserves a fresh answer.
+    this._giDebugNoSourceHintShown?.clear();
+    this._giDebugVolumeReceiptFor = null;
+    if (mode === "off" || !GI_DEBUG_VIEW_DOC[mode]) return;
+    const path = gi2 ? "GI2" : "SRC";
+    console.log(
+      `[gi] debug view "${mode}" (${path}): ${GI_DEBUG_VIEW_DOC[mode]}.\n` +
+      `    modes with a source on this path: ${giDebugViewsFor(!!gi2).join(", ")}`,
+    );
+  }
+
+  /** "This mode cannot draw here, and here is why" — once per selection. */
+  #debugViewNoSource(mode, why) {
+    if (!this._giDebugNoSourceHintShown) this._giDebugNoSourceHintShown = new Set();
+    if (this._giDebugNoSourceHintShown.has(mode)) return;
+    this._giDebugNoSourceHintShown.add(mode);
+    console.log(`[gi] debug view "${mode}": NO SOURCE — ${why}.`);
+  }
+
+  /**
+   * The volume views' receipt, once per selection.
+   *
+   * ⚠ THERE IS NOTHING TO READ BACK. These three write straight into the frame
+   * (no intermediate texture), so the distribution the term views print has no
+   * analogue here — what a reader needs instead is the CONFIGURATION the
+   * picture is of: which window they are looking at, how big its cells are, how
+   * far a ray may run, how many palette classes carry a colour. A screenshot of
+   * a voxel world means nothing without its cell size.
+   */
+  #debugVolumeReceipt(mode, gi2, volume) {
+    if (this._giDebugVolumeReceiptFor === mode) return;
+    this._giDebugVolumeReceiptFor = mode;
+    const win = gi2.win;
+    const cells = Array.from({ length: win.levels }, (_, l) =>
+      `L${l} ${win.levelVoxel(l).toFixed(2)}m/${win.levelExtent(l).toFixed(0)}m`).join(" ");
+    if (mode === "src-probes") {
+      const world = gi2.gather?.worldProbes ? gi2.gather.world : null;
+      if (world) {
+        const sp = world.spacings.map((v, c) => `c${c} ${v.toFixed(2)}m/${(v * world.cells).toFixed(0)}m`).join(" ");
+        console.log(
+          `[gi] debug view "src-probes" — the WORLD PROBE LATTICE (\`__gi2WorldProbes\`): ` +
+          `${world.cascades} cascade(s) of ${world.cells}³ cells, ${sp}. The cell FRAME is drawn on the ` +
+          "geometry the camera sees, hue = the cascade that owns the point (c0 blue, c1 green, c2 yellow), " +
+          "body = the resolve's E/π there with a checker so cells are countable. " +
+          "⚠ MAGENTA = a surface inside NO lattice: it has no world probe at all, which is the failure " +
+          "this view exists to make visible. ⚠ The body is the RESOLVED irradiance, not a readback of " +
+          "each probe's SH DC — `wpInfo` is a gather storage buffer this overlay must not bind (it dies " +
+          "on the next resize).",
+        );
+        return;
+      }
+      const tile = gi2.gather?.T ?? 16;
+      console.log(
+        `[gi] debug view "src-probes" — the SCREEN-PROBE TILE LATTICE at ${gi2.width}x${gi2.height}, ` +
+        `${tile}px tiles (${Math.ceil(gi2.width / tile)}x${Math.ceil(gi2.height / tile)} probes). Each tile is ` +
+        "flat-filled with the resolve's E/π at the tile CENTRE; the magenta dot marks that centre. " +
+        "⚠ NOT the probe's anchor inside the tile — that lives in `probeMeta`, a storage buffer the " +
+        "gather REPLACES on every resize, which this overlay deliberately does not bind.",
+      );
+      return;
+    }
+    const classes = (gi2.gather?.palette ?? []).filter((p) => p.x + p.y + p.z > 1e-4).length;
+    if (mode === "occupancy") {
+      console.log(
+        `[gi] debug view "occupancy" — THE VOXEL WORLD THE RAYS SEE: the window traced per pixel with the ` +
+        `same bit-DDA the gather uses, shaded by palette albedo (${classes} classes carry colour) and by the ` +
+        `hit's ENTRY FACE. ${cells}, ray span ${volume.span.toFixed(0)}m. ` +
+        "⚠ Mid-grey = an occupied voxel with no STATIC palette byte, i.e. a mover the dynamic layer wrote. " +
+        "⚠ The entry face is the BLOCKING answer, not the attribution one (§19 3.9) — a grazing ray on a " +
+        "façade legitimately enters through ±Y.",
+      );
+      return;
+    }
+    console.log(
+      `[gi] debug view "sdf" — GI2 HAS NO DISTANCE FIELD; this is the window trace's HIT DISTANCE ` +
+      `(brightness, ramped over ${volume.ramp.toFixed(0)}m) and the LEVEL that answered (hue: L0 blue, ` +
+      `L1 green, L2 yellow, L3 orange, L4 red). ${cells}, ray span ${volume.span.toFixed(0)}m. ` +
+      "A near surface answering on a coarse level is a window that failed to keep up with the camera.",
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -19492,9 +19796,10 @@ export class GISystem {
     const placeholder4 = new THREE.DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
     placeholder4.needsUpdate = true;
     const gNormalU = texture(placeholder4);
-    // 0 = off, 1 = indirect (rgb), 2 = one AO buffer (grey), 3 = composed AO
-    // min() (grey), 4 = glossy reflection field x Fresnel, 5 = traced BVH
-    // reflection layer (raw — the sharp arm is judged undimmed).
+    // 0 = off, 1 = indirect (E/pi — the diffuse the frame builds at white
+    // albedo), 2 = one AO buffer (grey, sRGB-decoded), 3 = a radiance buffer
+    // raw, 4 = glossy reflection field x Fresnel, 5 = traced BVH reflection
+    // layer (raw — the sharp arm is judged undimmed).
     const modeU = uniform(0);
     // Clip-space passthrough: PlaneGeometry(2,2) vertices have xy in [-1, 1]
     // and z = 0. `vertexNode` expects a vec4 (clip-space), so we build it
@@ -19531,7 +19836,28 @@ export class GISystem {
       // makes the displayed grey EQUAL the factor, so the view can be read as
       // a number rather than as a mood.
       const grey = (v) => vec4(sRGBTransferEOTF(vec3(v, v, v)), 1);
-      If(modeU.equal(2), () => {
+      If(modeU.equal(1), () => {
+        // ⭐⭐ §19 4.3f — AN IRRADIANCE IS NOT A COLOUR, AND SHOWING IT AS ONE
+        // MADE THE VIEW UNREADABLE.
+        //
+        // THE REPORT (user screenshot, Bistro street overview): "indirect" is a
+        // solid WHITE frame — façades, ground, everything — with only faint
+        // pink under the awnings. Nothing was wrong with the buffer. This
+        // texture holds IRRADIANCE E, and every lit material adds
+        // `irradiance.div(Math.PI)` to its radiance (giLight.js), so what the
+        // FRAME can build from a texel tops out at E/pi with a white albedo.
+        // Daylight sky irradiance is several units; displayed raw it clips
+        // against the output transfer everywhere the sky is visible, which is
+        // a frame with no information in it.
+        //
+        // Dividing by pi is therefore not an exposure knob — it is the FACTOR
+        // THE MATERIALS APPLY, and it makes this view "the diffuse term at a
+        // white albedo" rather than "the contents of a buffer". Tone mapping
+        // and the output transfer are then the frame's own: `material.
+        // toneMapped` is inert on the WebGPU node path, so whatever the
+        // renderer does to the pixel beside this one it also does to this one.
+        sampled.assign(vec4(sampled.rgb.div(Math.PI), 1));
+      }).ElseIf(modeU.equal(2), () => {
         sampled.assign(grey(sampled.r));
       }).ElseIf(modeU.equal(4), () => {
         // ── WHY THIS VIEW IS WEIGHTED AND THE OTHERS ARE NOT ──────────────

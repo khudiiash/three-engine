@@ -1,5 +1,5 @@
 import { Component } from "../../engine/components/Component.js";
-import { GI_DEBUG_VIEWS, GI_QUALITY_LEVELS } from "./giConfig.js";
+import { GI_DEBUG_VIEW_DOC, GI_QUALITY_LEVELS, giDebugViewsFor } from "./giConfig.js";
 
 /**
  * Global Illumination via Split Radiance Cascades.
@@ -33,12 +33,14 @@ import { GI_DEBUG_VIEWS, GI_QUALITY_LEVELS } from "./giConfig.js";
  *   keep image-based lighting. No environment means no sky, exactly as
  *   `skyIntensity: 0` did.
  * · THE DEBUG VIEW never touched the lit image — it draws an overlay. It is a
- *   developer instrument; the SDF / occupancy / SRC-probes overlays live at
- *   `globalThis.__giDebugView`, and the GI-term overlays (indirect / AO /
- *   reflections) are also reachable through `props.debugView` so an inspector
- *   user can flip them without typing a global. `debugView` is `advanced` and
- *   NOT part of the structural signature — flipping it is a live swap of the
- *   overlay's source texture, never a module rebuild.
+ *   developer instrument, and since §19 4.3f EVERY mode is on `props.debugView`
+ *   (the volume views — occupancy / sdf / src-probes — used to be console-only
+ *   because they read SRC structures the component knew nothing about; under
+ *   GI2 they are one quad tracing the window, and the inspector is where a
+ *   person looks for them). `globalThis.__giDebugView` still overrides the
+ *   prop, for harnesses and for the modes the live path cannot draw.
+ *   `debugView` is `advanced` and NOT part of the structural signature —
+ *   flipping it is a live swap of the overlay's source, never a rebuild.
  *
  * Saved scenes with the old properties load unchanged; undeclared keys are
  * ignored and drop on the next save. A scene that stored `intensity: 2` renders
@@ -88,7 +90,18 @@ export class GlobalIlluminationComponent extends Component {
       key: "debugView",
       label: "Debug View",
       type: "select",
-      options: [...GI_DEBUG_VIEWS],
+      // ⭐ A FUNCTION, NOT A FROZEN ARRAY (§19 4.3f). The Inspector resolves a
+      // `select`'s `options` when the panel renders, so this lists exactly the
+      // modes that have a source on the path THIS BUILD runs — GI2 or SRC —
+      // instead of offering a mode that can only print "no source". The full
+      // set stays reachable through `globalThis.__giDebugView`, which is what
+      // a harness uses and what a developer types when chasing the other path.
+      options: () => giDebugViewsFor(),
+      // Ignored by today's Inspector (it renders a bare <select>), carried so
+      // the descriptions have ONE home: GISystem prints the same string on the
+      // console line every selection emits, so a mode can never be documented
+      // in one place and not the other.
+      hint: Object.entries(GI_DEBUG_VIEW_DOC).map(([id, doc]) => `${id}: ${doc}`).join(" | "),
       advanced: true,
     },
   ];
@@ -126,8 +139,9 @@ export class GlobalIlluminationComponent extends Component {
       `[gi] ignoring ${retired.length} retired propert${retired.length === 1 ? "y" : "ies"}: ` +
       `${retired.join(", ")}. Global Illumination has FOUR properties — quality, ao, ` +
       "reflections, debugView — and everything else is derived (src/modules/gi/giConfig.js). Sky " +
-      "light comes from the scene's environment; the SDF/occupancy/SRC-probes debug view is " +
-      "globalThis.__giDebugView; a probe that must force a value uses " +
+      "light comes from the scene's environment; every debug view (including occupancy/sdf/" +
+      "src-probes) is on debugView, with globalThis.__giDebugView as the override; " +
+      "a probe that must force a value uses " +
       "globalThis.__giConfigOverride. Stored values drop on the next save.",
     );
   }

@@ -52,46 +52,99 @@ export const GI_QUALITY_LEVELS = ["low", "medium", "high", "ultra"];
 const TIERS = new Set(GI_QUALITY_LEVELS);
 
 /**
+ * ⭐ §19 4.3f — THE DEBUG VIEW MODES, AND WHICH PATH EACH ONE HAS A SOURCE ON.
+ *
+ * Every mode is listed here ONCE, with the description the inspector and the
+ * console both print, and with the paths it can actually draw on. A mode that
+ * has no source on the live path is not hidden from the list — it is offered,
+ * and selecting it prints the reason it cannot draw. The alternative (a shorter
+ * list) makes "the mode I remember is gone" indistinguishable from "the build
+ * is broken", and this module has shipped both.
+ *
+ * `paths`: "both" | "src" | "gi2". Nothing here is a knob — the whole set is a
+ * developer instrument, and `debugView` was already the one advanced property.
+ */
+export const GI_DEBUG_VIEW_MODES = [
+  { id: "off", paths: "both", doc: "no overlay — the lit frame" },
+  {
+    id: "indirect",
+    paths: "both",
+    doc: "the diffuse term the materials build, at white albedo (E/π) — GI2's gather output, or the SRC resolve's",
+  },
+  {
+    id: "ao",
+    paths: "both",
+    doc: "the obscurance factor the resolve applies (1 = open, 0 = closed), sRGB-decoded so the grey IS the number",
+  },
+  {
+    id: "reflections",
+    paths: "both",
+    doc: "the glossy radiance the frame adds, Fresnel-weighted against the g-buffer (a dielectric shows ~4% head-on)",
+  },
+  {
+    id: "reflections-exact",
+    paths: "src",
+    doc: "the traced BVH mirror layer, undimmed — ultra's sharp arm; there is no mirror tier on GI2 yet",
+  },
+  {
+    id: "occupancy",
+    paths: "both",
+    doc: "the voxel world the rays see — GI2 traces the window per pixel and shows palette albedo, face-shaded; SRC marches the occupancy pyramid",
+  },
+  {
+    id: "sdf",
+    paths: "both",
+    doc: "GI2: hit distance as brightness, the window LEVEL that answered as hue; SRC: the distance oracle, sphere-traced",
+  },
+  {
+    id: "src-probes",
+    paths: "both",
+    doc: "the probe population: GI2 draws the WORLD lattice cell frame on the geometry (or the screen-probe tile grid when `__gi2WorldProbes` is off); SRC draws the probe gizmo cloud",
+  },
+];
+
+/** Mode id → its one-line description. */
+export const GI_DEBUG_VIEW_DOC = Object.fromEntries(GI_DEBUG_VIEW_MODES.map((m) => [m.id, m.doc]));
+
+/**
  * The debug view modes exposed on the GI component, in inspector order.
  *
- * - "off" (default): no overlay.
- * - "indirect": the diffuse-irradiance term only — what the SRC gather
- *   computed, before AO darkens it. What "indirect light" actually IS in this
- *   build, with no contact shading mixed in.
- * - "ao": the obscurance factor (1 = no occlusion, 0 = fully occluded) as a
- *   greyscale. Wide+contact+VXAO combined into one screen-space factor by the
- *   AO pass. Lets you see what is darkening your corners.
- * - "reflections": the glossy radiance term only — what mirrors see, before
- *   it gets multiplied by a material's specular response.
- *
- * The legacy `sdf` / `occupancy` / `src-probes` modes stay on the global
- * (`globalThis.__giDebugView`) — those touch DIFFERENT data (the SDF distance
- * field, the voxel occupancy pyramid, the SRC probe gizmos) and have never
- * had a component prop.
+ * ⚠ THE WHOLE SET IS ON THE PROP NOW (§19 4.3f). "occupancy", "sdf" and
+ * "src-probes" used to be console-only (`globalThis.__giDebugView`) because
+ * they touched DIFFERENT data — the SDF distance field, the voxel occupancy
+ * pyramid, the SRC probe gizmos — and had never had a component prop. Under
+ * GI2 all three are rebuilt off the WINDOW (`window/windowDebugView.js`), the
+ * inspector is where a person actually looks for them, and `giDebugView` merges
+ * the two sources anyway. The global still wins; see `giDebugView`.
  */
-export const GI_DEBUG_VIEWS = [
-  "off",
-  "indirect",
-  // "ao" is the factor the RESOLVE APPLIES. Exactly ONE estimator sits behind
-  // it (GTAO — see #armGtaoPass), so this view is that estimator's buffer.
-  "ao",
-  // "reflections" is the glossy field WEIGHTED BY FRESNEL, which is what
-  // turns it from "a blurry copy of the scene" (the raw buffer holds a
-  // radiance at every pixel, including the ~96% of a dielectric surface that
-  // never shows it) into the layer the frame actually adds.
-  // "reflections-exact" is the traced BVH layer — the sharp arm ultra runs,
-  // which no view could show before.
-  "reflections",
-  "reflections-exact",
-];
+export const GI_DEBUG_VIEWS = GI_DEBUG_VIEW_MODES.map((m) => m.id);
 const DEBUG_VIEWS = new Set(GI_DEBUG_VIEWS);
+
+/**
+ * The modes that can DRAW on the path this build runs, in inspector order.
+ *
+ * Used for the component's `options` (the Inspector accepts a function, so the
+ * dropdown is resolved when the panel opens rather than when the class loads)
+ * and for the console receipt. A mode outside this list is still selectable
+ * through the global — it just says why it cannot draw.
+ */
+export function giDebugViewsFor(gi2 = GI2_PATH) {
+  return GI_DEBUG_VIEW_MODES
+    .filter((m) => m.paths === "both" || m.paths === (gi2 ? "gi2" : "src"))
+    .map((m) => m.id);
+}
+
+/** The VOLUME views — one quad under GI2, two boxes plus a gizmo cloud under SRC. */
+export const GI_VOLUME_DEBUG_VIEWS = new Set(["occupancy", "sdf", "src-probes"]);
+
 /**
  * The subset drawn by the fullscreen TERM overlay (`#buildDebugView`), as
- * opposed to the volume/gizmo views ("sdf", "occupancy", "src-probes")
- * that are console-only. Kept beside the list so adding a mode to one and
- * not the other is impossible.
+ * opposed to the volume views above. Kept beside the list so adding a mode to
+ * one and not the other is impossible.
  */
-export const GI_TERM_DEBUG_VIEWS = new Set(GI_DEBUG_VIEWS.filter((v) => v !== "off"));
+export const GI_TERM_DEBUG_VIEWS = new Set(
+  GI_DEBUG_VIEWS.filter((v) => v !== "off" && !GI_VOLUME_DEBUG_VIEWS.has(v)),
+);
 
 /**
  * The tier a stored value selects for.
@@ -515,18 +568,18 @@ export function sceneSkyRadiance(scene, out) {
 /**
  * The debug overlay, as a developer switch rather than an authored property.
  *
- * "off" | "sdf" | "occupancy" | "src-probes" | "indirect" | "ao" |
- * "reflections". Set `globalThis.__giDebugView` from the console or a
- * harness. Polled rather than pushed — every reader is already in a per-frame
- * path, and a string compare per frame is cheaper than the change notification
- * would be.
+ * Any id in `GI_DEBUG_VIEW_MODES` — "off", "indirect", "ao", "reflections",
+ * "reflections-exact", "occupancy", "sdf", "src-probes". Set
+ * `globalThis.__giDebugView` from the console or a harness. Polled rather than
+ * pushed — every reader is already in a per-frame path, and a string compare
+ * per frame is cheaper than the change notification would be.
  *
- * The "indirect" / "ao" / "reflections" modes are also reachable from the GI
- * component's `debugView` prop, which is what an inspector user actually wants
- * (a checkbox beats typing a global). The component prop is a SECOND-PRIORITY
- * source — `globalThis.__giDebugView` still wins, because a harness that
- * forces a mode has no component to read from and a console override has to
- * beat the inspector or nothing can ever step in front of it.
+ * EVERY mode is also reachable from the GI component's `debugView` prop, which
+ * is what an inspector user actually wants (a dropdown beats typing a global).
+ * The component prop is a SECOND-PRIORITY source — `globalThis.__giDebugView`
+ * still wins, because a harness that forces a mode has no component to read
+ * from and a console override has to beat the inspector or nothing can ever
+ * step in front of it.
  */
 export function giDebugView(component = null) {
   // The global is a CONSOLE SWITCH, not a persistent setting. Treating
