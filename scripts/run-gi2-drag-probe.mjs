@@ -1,0 +1,395 @@
+// GI2 DRAG PROBE — §19 Stage 6.5 ("dragging an emissive object freezes the
+// viewport to 0-1 fps").
+//
+// WHAT IT MEASURES AND WHY THE EXISTING PROBES CANNOT
+//
+// `run-gi2-motion-probe` moves the CAMERA. The camera never bumps the engine's
+// scene content key, so it exercises the window scroll and nothing on the
+// REBUILD chain. This probe moves an OBJECT — the same call the editor's own
+// gizmo makes (`entity.setTransform`) — which bumps `engine.content` on every
+// frame and is therefore the only arm that can see a per-drag-frame soup
+// rebuild, voxelizer rescan, shadow-BVH kick or merge rebuild.
+//
+// Per frame it records: wall-clock frame ms (hooked on `StatsSystem
+// .endPhaseFrame`, the one call made exactly once per tick), the GI system's
+// rebuild run/ask counters, the GI2 store's `soupBuilds`, the engine content
+// key's version and per-category counts, and the console lines the chain emits
+// (so a `[gi2] shadow bvh` kick is attributable to the frame that paid for it).
+//
+// Env: PROJECT (default C:/Users/Khudiiash/Documents/GAME), SCENE (Cornel),
+//      TARGET=<entity name substring> (default: the brightest emissive mesh),
+//      PARK=60 DRAG_MS=3000 TAIL=90, AMP=0.6 (metres of travel),
+//      HEADED=1, JSON=<path>, CHROME_PATH.
+import fs from "node:fs";
+import puppeteer from "puppeteer-core";
+import { installTauriShim } from "./lib/tauriShim.mjs";
+
+const url = (process.argv[2] ?? "http://127.0.0.1:5210/").replace(/\/$/, "");
+const PROJECT = (process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME").replaceAll("\\", "/");
+const SCENE = process.env.SCENE ?? "Cornel";
+const TARGET = process.env.TARGET ?? "";
+const PARK = Number(process.env.PARK ?? 60);
+const DRAG_MS = Number(process.env.DRAG_MS ?? 3000);
+const TAIL = Number(process.env.TAIL ?? 90);
+const AMP = Number(process.env.AMP ?? 0.6);
+const SETTLE = Number(process.env.SETTLE ?? 6);
+const BOOT_TIMEOUT = Number(process.env.BOOT_TIMEOUT ?? 300) * 1000;
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const median = (xs) => { if (!xs.length) return 0; const s = [...xs].sort((a, b) => a - b); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+const pct = (xs, p) => { if (!xs.length) return 0; const s = [...xs].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.max(0, Math.ceil((p / 100) * s.length) - 1))]; };
+const f2 = (n) => (Number.isFinite(n) ? n.toFixed(2) : "—");
+
+const browser = await puppeteer.launch({
+  executablePath: process.env.CHROME_PATH ?? "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  headless: process.env.HEADED ? false : "new",
+  args: ["--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage",
+    "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding", "--js-flags=--expose-gc"],
+});
+const page = await browser.newPage();
+await page.setViewport({ width: 1650, height: 970, deviceScaleFactor: 1 });
+await installTauriShim(page, {});
+await page.evaluateOnNewDocument((flags) => { for (const [k, v] of Object.entries(flags)) globalThis[k] = v; },
+  JSON.parse(process.env.FLAGS ?? "{}"));
+await page.evaluateOnNewDocument((project) => {
+  globalThis.__editorKeepRendering = true;
+  localStorage.setItem("engine.projectRoot.v1", project);
+  localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
+}, PROJECT);
+
+const marks = { firstLight: 0, assetsReady: 0 };
+page.on("console", (m) => {
+  const t = m.text();
+  if (/scene assets ready/.test(t) && !marks.assetsReady) marks.assetsReady = Date.now();
+  if (/\[gi2\] first light/.test(t) && !marks.firstLight) marks.firstLight = Date.now();
+});
+page.on("pageerror", (e) => { const s = e.stack ?? e.message ?? String(e); if (!/save_scene/.test(s)) console.log(`    pageerror: ${s.slice(0, 200)}`); });
+
+console.log(`gi2 drag probe → ${url}  project ${PROJECT}  scene ${SCENE}`);
+await page.goto(url, { waitUntil: "load", timeout: 60000 });
+await page.waitForSelector(".hub-recent-open-btn", { timeout: 60000 });
+await page.evaluate((project) => {
+  const rows = [...document.querySelectorAll(".hub-recent")];
+  const row = rows.find((r) => (r.getAttribute("title") ?? "").replaceAll("\\", "/") === project) ?? rows[0];
+  row?.querySelector(".hub-recent-open-btn")?.click();
+}, PROJECT);
+await page.waitForFunction(() => !!globalThis.__editorApi, { timeout: 180000 });
+await page.evaluate(async () => {
+  const mod = await import("/src/editor/engineInstance.js");
+  globalThis.__giEngineForProbe = mod.engine;
+  globalThis.__giSysForProbe = () => mod.engine?.modules?.get?.("gi")?.system ?? null;
+  globalThis.__gi2 = () => { const s = globalThis.__giSysForProbe(); return s?._gi2 ?? s?.state?.screen?.gi2 ?? null; };
+});
+const call = async (op, args = {}) => {
+  try {
+    return await page.evaluate(async ({ op, args }) => {
+      try { return { ok: true, value: await globalThis.__editorApi.call(op, args) }; }
+      catch (err) { return { ok: false, error: err?.message ?? String(err) }; }
+    }, { op, args });
+  } catch (err) { return { ok: false, error: err?.message ?? String(err) }; }
+};
+
+const opened = await call("scene.open", { path: `${PROJECT}/scenes/${SCENE}.scene` });
+if (!opened.ok) { console.log(`FATAL scene.open: ${opened.error}`); await browser.close(); process.exit(2); }
+{ const dl = Date.now() + BOOT_TIMEOUT; while (Date.now() < dl && !marks.firstLight) await wait(250); }
+console.log(marks.firstLight ? `  first light` : `  ⚠ NO FIRST LIGHT in ${BOOT_TIMEOUT / 1000}s`);
+{
+  const quietBy = Date.now() + Number(process.env.QUIESCE_MS ?? 90000);
+  await page.evaluate(async () => { const m = await import("/src/engine/textureAsset.js"); globalThis.__texInFlight = () => m.textureLoadsInFlight?.() ?? 0; }).catch(() => {});
+  while (Date.now() < quietBy) {
+    const s = await page.evaluate(() => ({ tex: globalThis.__texInFlight?.() ?? 0, merging: !!globalThis.__giEngineForProbe?.merging?.settling })).catch(() => null);
+    if (s && !s.tex && !s.merging) break;
+    await wait(500);
+  }
+}
+await wait(SETTLE * 1000);
+const settled = (await call("profile.frameStats", { settleMs: 1100 })).value ?? {};
+console.log(`  settled: ${settled.fps ?? "?"} fps, cpu ${f2(settled.cpuMs)} ms, gpu ${f2(settled.gpuMs)} ms`);
+
+// ── pick the target: the brightest emissive mesh with an entity id ──────────
+//
+// ⚠ The engine's entity registry is not walkable from the page in one shape
+// across scenes, so the search runs over `scene.traverse` and maps each object
+// back to its entity through `userData.entityId` — the same link the picker
+// uses. `TARGET` narrows by name when a scene has several emitters.
+const target = await page.evaluate((want) => {
+  // The emission does NOT live on `mesh.material.emissive` for an authored
+  // material — it is an `emissiveNode` on the material asset. The GI system has
+  // already resolved that for its own admission pass: `_emitterCands` is the
+  // list it built, each entry carrying the mesh and its power. Reading the
+  // engine's own answer beats re-deriving it, and it guarantees the probe drags
+  // a mesh the GI actually treats as an emitter.
+  const eng = globalThis.__giEngineForProbe;
+  const sys = globalThis.__giSysForProbe();
+  const cands = sys?._emitterCands ?? [];
+  let best = null;
+  for (const c of cands) {
+    const mesh = c?.mesh; if (!mesh) continue;
+    let n = mesh, id = null;
+    while (n && !id) { id = n.userData?.entityId ?? null; n = n.parent; }
+    if (!id) continue;
+    const ent = eng.getEntity?.(id);
+    const name = ent?.name ?? String(id);
+    if (want && !name.toLowerCase().includes(want.toLowerCase())) continue;
+    const lum = c.power ?? c.lum ?? c.luminance ?? 1;
+    if (!best || lum > best.lum) {
+      const o = ent?.object3D;
+      best = { id, name, lum, pos: o ? [o.position.x, o.position.y, o.position.z] : [0, 0, 0], cands: cands.length };
+    }
+  }
+  return best;
+}, TARGET);
+if (!target) { console.log("FATAL: no emissive mesh found"); await browser.close(); process.exit(2); }
+console.log(`  target: "${target.name}" (${target.id}) emissive luminance ${f2(target.lum)} at ${target.pos.map((v) => v.toFixed(2)).join(", ")}`);
+
+// ── the in-page recorder + drag driver ─────────────────────────────────────
+const installed = await page.evaluate(async ({ target, amp }) => {
+  const eng = globalThis.__giEngineForProbe;
+  if (!eng?.stats) return { ok: false, why: "no engine.stats" };
+  const R = { frames: [], seg: "park", logs: [], frameLogs: [], done: false, i: 0, longtasks: [] };
+  globalThis.__gi2Drag = R;
+  // §19 6.5c — MAIN-THREAD BLOCKS THAT HAPPEN BETWEEN TICKS. The phase marks
+  // summed to a quarter of the drag; whatever spent the other three quarters
+  // did it outside `beginPhase`/`endPhase`, which is exactly what a longtask
+  // entry sees. `attribution` names the container, not the function, so this
+  // bounds the search rather than ending it — the CDP sampling profile does
+  // the naming.
+  try {
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) R.longtasks.push({ seg: R.seg, t: +e.startTime.toFixed(1), ms: +e.duration.toFixed(1), name: e.name });
+    }).observe({ entryTypes: ["longtask"] });
+  } catch { /* no longtask support */ }
+  for (const k of ["log", "info", "warn", "error"]) {
+    const orig = console[k].bind(console);
+    console[k] = (...a) => { try { const s = String(a[0] ?? "").slice(0, 110); R.frameLogs.push(s); } catch {} return orig(...a); };
+  }
+  const stats = eng.stats;
+  // §19 6.5b — PER-FRAME CPU PHASE DELTAS. `beginPhaseCapture` accumulates
+  // `_phaseTotals` monotonically while armed, so arming once with an
+  // out-of-reach target and taking the delta at each `endPhaseFrame` turns the
+  // engine's own averaging profiler into a per-frame one. Copied from
+  // run-gi2-motion-probe, which established the re-arm trick.
+  const phaseNames = [];
+  stats.beginPhaseCapture(1);
+  for (const ph of stats.readPhaseCapture?.()?.phases ?? []) phaseNames.push(ph.name);
+  stats.beginPhaseCapture(1e9);
+  const totals = stats._phaseTotals ?? [];
+  const NP = totals.length;
+  const prevPhase = new Float64Array(NP);
+  const prevSub = new Map();
+  const origEnd = stats.endPhaseFrame.bind(stats);
+  let last = performance.now();
+  stats.endPhaseFrame = (...a) => {
+    const r = origEnd(...a);
+    const now = performance.now();
+    const sys = globalThis.__giSysForProbe();
+    const gi2 = globalThis.__gi2();
+    const store = gi2?.store ?? gi2?._store ?? null;
+    if (stats._phaseFramesTarget < 1e8) stats._phaseFramesTarget = 1e9;
+    stats._phaseArmed = true;
+    const phases = {};
+    for (let i = 0; i < NP; i++) {
+      const dd = totals[i] - prevPhase[i]; prevPhase[i] = totals[i];
+      if (dd > 0.3) phases[phaseNames[i] ?? `#${i}`] = +dd.toFixed(2);
+    }
+    const subs = {};
+    for (const [k, v] of stats._subTotals ?? []) {
+      const dd = v - (prevSub.get(k) ?? 0); prevSub.set(k, v);
+      if (dd > 0.3) subs[k] = +dd.toFixed(2);
+    }
+    // §19 6.5d — WHO INVALIDATED THE MERGE THIS FRAME. `_invalidateReason` is
+    // the last one named and `_invalidateTally` counts them by name, so a
+    // per-frame delta of the tally attributes each merge rebuild to its producer
+    // instead of leaving it to be argued about.
+    const mrg = eng.merging ?? null;
+    R.frames.push({
+      seg: R.seg, ms: now - last, phases, subs,
+      why: mrg?._invalidateReason ?? null,
+      tally: mrg?._invalidateTally ? { ...mrg._invalidateTally } : null,
+      mrebuilds: mrg?._rebuildCount ?? 0, urgent: !!mrg?._urgent, mdirty: !!mrg?._dirty,
+      rebuilds: sys?.rebuilds ?? 0, asks: sys?.rebuildAsks ?? 0,
+      soup: store?.soupBuilds ?? gi2?.snapshot?.()?.soupBuilds ?? 0,
+      cv: eng.content?.version ?? 0,
+      ct: eng.content?.counts ? { ...eng.content.counts } : null,
+      logs: R.frameLogs.splice(0),
+    });
+    last = now;
+    return r;
+  };
+  R.restore = () => { stats.endPhaseFrame = origEnd; };
+  R.target = target; R.amp = amp;
+  return { ok: true };
+}, { target, amp: AMP });
+if (!installed.ok) { console.log(`FATAL recorder: ${installed.why}`); await browser.close(); process.exit(2); }
+
+await wait((PARK / 60) * 1000 + 300);
+
+// The drag: `entity.setTransform` once per animation frame, exactly as the
+// editor's translate gizmo does while the pointer is held.
+console.log(`  dragging "${target.name}" for ${DRAG_MS} ms …`);
+// CDP SAMPLING PROFILE, armed for the drag only. 100 µs is fine enough that a
+// 300 ms frame carries ~3000 samples, so a self-time table over nine frames is
+// a census and not an anecdote.
+const cdp = await page.target().createCDPSession();
+try {
+  await cdp.send("Profiler.enable");
+  await cdp.send("Profiler.setSamplingInterval", { interval: 100 });
+  await cdp.send("Profiler.start");
+} catch (e) { console.log(`  (profiler unavailable: ${e.message})`); }
+await page.evaluate(async ({ ms, base, amp, gizmo }) => {
+  const R = globalThis.__gi2Drag;
+  R.seg = "drag";
+  // ── DRIVE=gizmo — WHAT THE TRANSLATE GIZMO ACTUALLY DOES ────────────────
+  //
+  // `entity.setTransform` is NOT the editor's live drag path, and the
+  // difference is the whole measurement. TransformControls writes the
+  // Object3D directly and, per frame, calls only
+  // `useSceneStore.updateTransform(id)` (a lazy one-key clone) plus
+  // `engine.emit("transform-changed")`; the undoable
+  // `commandBus.execute(SetTransformCommand)` fires ONCE, on pointer-UP
+  // (ViewportPanel.jsx:591 vs :615). Driving the op per frame instead routes
+  // every frame through `commandBus.#afterMutation` →
+  // `useSceneStore.refresh()`, which re-mirrors all 1532 entities and
+  // replaces the store map — a cost the user's drag never pays.
+  let store = null, eng = globalThis.__giEngineForProbe;
+  if (gizmo) {
+    const m = await import("/src/editor/store/sceneStore.js");
+    store = m.useSceneStore;
+  }
+  const ent = eng.getEntity(R.target.id);
+  const t0 = performance.now();
+  const step = () => {
+    const t = performance.now() - t0;
+    if (t >= ms) { R.seg = "tail"; R.dragEndedAt = performance.now(); R.dragDone = true; return; }
+    const u = Math.sin((t / ms) * Math.PI * 2) * amp;
+    // ⚠ VERIFY THE DRAG ACTUALLY MOVED SOMETHING. A silent `.catch` here let a
+    // whole Bistro run report "no freeze" from a drag that never happened —
+    // the op refused and the probe measured a parked scene twice.
+    if (gizmo) {
+      // The gizmo's own per-frame work, verbatim.
+      ent.object3D.position.set(base[0] + u, base[1], base[2]);
+      store.getState().updateTransform(R.target.id);
+      eng.emit("transform-changed", { entityId: R.target.id });
+      R.moved = (R.moved ?? 0) + 1;
+    } else {
+      globalThis.__editorApi.call("entity.setTransform", { id: R.target.id, position: [base[0] + u, base[1], base[2]] })
+        .then(() => { R.moved = (R.moved ?? 0) + 1; })
+        .catch((e) => { R.setErr ??= String(e?.message ?? e); });
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}, { ms: DRAG_MS, base: target.pos, amp: AMP, gizmo: process.env.DRIVE === "gizmo" });
+await page.waitForFunction(() => globalThis.__gi2Drag?.dragDone === true, { timeout: DRAG_MS + 120000, polling: 250 });
+const profile = await (async () => {
+  try { const r = await cdp.send("Profiler.stop"); return r.profile; } catch (e) { console.log(`  (profiler: ${e.message})`); return null; }
+})();
+await wait((TAIL / 60) * 1000 + 500);
+
+const R = await page.evaluate(() => {
+  const R = globalThis.__gi2Drag; R.restore?.();
+  return { frames: R.frames, moved: R.moved ?? 0, setErr: R.setErr ?? null, endPos: R.endPos ?? null };
+});
+console.log(`  setTransform: ${R.moved} accepted${R.setErr ? `, FIRST ERROR: ${R.setErr}` : ""}`);
+await browser.close();
+
+const segs = { park: [], drag: [], tail: [] };
+for (const f of R.frames) (segs[f.seg] ?? segs.park).push(f);
+const report = {};
+for (const [name, fs_] of Object.entries(segs)) {
+  if (!fs_.length) continue;
+  const ms = fs_.map((f) => f.ms);
+  const first = fs_[0], lastF = fs_[fs_.length - 1];
+  report[name] = {
+    n: fs_.length, medianMs: median(ms), p95: pct(ms, 95), max: Math.max(...ms),
+    fps: 1000 / median(ms), over50: ms.filter((m) => m > 50).length,
+    rebuildRuns: lastF.rebuilds - first.rebuilds, rebuildAsks: lastF.asks - first.asks,
+    soupBuilds: lastF.soup - first.soup,
+    contentBumps: lastF.cv - first.cv,
+    contentCounts: first.ct && lastF.ct ? Object.fromEntries(Object.keys(lastF.ct).map((k) => [k, lastF.ct[k] - first.ct[k]])) : null,
+  };
+  console.log(`\n  ${name.toUpperCase()}  n=${fs_.length}  median ${f2(median(ms))} ms (${f2(1000 / median(ms))} fps)  p95 ${f2(pct(ms, 95))}  max ${f2(Math.max(...ms))}  >50ms: ${ms.filter((m) => m > 50).length}`);
+  console.log(`    giRebuild runs +${report[name].rebuildRuns}, asks +${report[name].rebuildAsks}, soupBuilds +${report[name].soupBuilds}, contentKey +${report[name].contentBumps} ${JSON.stringify(report[name].contentCounts)}`);
+}
+// The chain, named: which console lines land on the slow frames.
+// The freeze frames, phase by phase. A drag frame that costs 800 ms and emits
+// no console line can only be named by the engine's own phase marks.
+{
+  const worst = [...R.frames].sort((x, y) => y.ms - x.ms).slice(0, 6);
+  console.log("\n  THE SIX WORST FRAMES, phase by phase:");
+  for (const f of worst) {
+    console.log(`    [${f.seg}] ${f2(f.ms)} ms  phases ${JSON.stringify(f.phases ?? {})}`);
+    if (f.subs && Object.keys(f.subs).length) console.log(`         subs ${JSON.stringify(f.subs)}`);
+  }
+  // And the same as a SUM over the drag, so a cost spread thin still shows.
+  const acc = {}, accS = {};
+  for (const f of R.frames) if (f.seg === "drag") {
+    for (const [k, v] of Object.entries(f.phases ?? {})) acc[k] = (acc[k] ?? 0) + v;
+    for (const [k, v] of Object.entries(f.subs ?? {})) accS[k] = (accS[k] ?? 0) + v;
+  }
+  const dragMs = R.frames.filter((f) => f.seg === "drag").reduce((s2, f) => s2 + f.ms, 0);
+  console.log(`\n  DRAG total ${f2(dragMs)} ms — phase sums:`);
+  for (const [k, v] of Object.entries(acc).sort((x, y) => y[1] - x[1]).slice(0, 12)) console.log(`    ${f2(v).padStart(9)} ms  ${k}`);
+  console.log("  sub-phase sums:");
+  for (const [k, v] of Object.entries(accS).sort((x, y) => y[1] - x[1]).slice(0, 12)) console.log(`    ${f2(v).padStart(9)} ms  ${k}`);
+}
+const slow = R.frames.filter((f) => f.ms > 40).slice(0, 400);
+const owners = new Map();
+for (const f of slow) for (const l of f.logs) owners.set(l, (owners.get(l) ?? 0) + 1);
+{
+  console.log();
+  console.log("  MERGE INVALIDATION, per frame (every frame where the tally moved or a rebuild ran):");
+  let prev = null, prevR = null;
+  for (const f of R.frames) {
+    const t = f.tally ?? {};
+    if (prev) {
+      const d = [];
+      for (const k of new Set([...Object.keys(t), ...Object.keys(prev)])) {
+        const dd = (t[k] ?? 0) - (prev[k] ?? 0);
+        if (dd) d.push(`${k} +${dd}`);
+      }
+      const rebuilt = (f.mrebuilds ?? 0) - (prevR ?? 0);
+      if (d.length || rebuilt) {
+        console.log(`    [${f.seg}] ${f2(f.ms)} ms  merging ${f2(f.phases?.merging ?? 0)} ms  rebuild+${rebuilt}  urgent=${f.urgent}  last="${f.why}"  ${d.join(", ") || "(no tally move)"}`);
+      }
+    }
+    prev = t; prevR = f.mrebuilds ?? 0;
+  }
+}
+console.log(`\n  slow frames (>40 ms): ${R.frames.filter((f) => f.ms > 40).length} of ${R.frames.length}`);
+console.log("  lines emitted on slow frames (top 14):");
+for (const [l, n] of [...owners.entries()].sort((a, b) => b[1] - a[1]).slice(0, 14)) console.log(`    ${String(n).padStart(4)}×  ${l}`);
+const allLogs = new Map();
+for (const f of R.frames) if (f.seg === "drag") for (const l of f.logs) allLogs.set(l, (allLogs.get(l) ?? 0) + 1);
+console.log("  every line during the DRAG (top 18):");
+for (const [l, n] of [...allLogs.entries()].sort((a, b) => b[1] - a[1]).slice(0, 18)) console.log(`    ${String(n).padStart(4)}×  ${l}`);
+
+// ── who spent the unmarked time ────────────────────────────────────────────
+{
+  const lts = R.longtasks ?? [];
+  const drag = lts.filter((l) => l.seg === "drag");
+  console.log(`
+  LONGTASKS: ${lts.length} total, ${drag.length} during the drag, ` +
+    `sum ${f2(drag.reduce((a, l) => a + l.ms, 0))} ms, max ${f2(Math.max(0, ...drag.map((l) => l.ms)))} ms`);
+  for (const l of drag.slice(0, 8)) console.log(`    ${f2(l.ms).padStart(9)} ms  ${l.name}`);
+}
+if (profile) {
+  // Self time per function: each sample charges the LEAF node it landed in.
+  const byId = new Map(profile.nodes.map((n) => [n.id, n]));
+  const self = new Map();
+  const dt = profile.timeDeltas ?? [];
+  profile.samples.forEach((id, i) => {
+    const n = byId.get(id); if (!n) return;
+    const cf = n.callFrame;
+    const key = `${cf.functionName || "(anonymous)"}  ${String(cf.url || "").split("/").slice(-1)[0]}:${cf.lineNumber + 1}`;
+    self.set(key, (self.get(key) ?? 0) + (dt[i] ?? 0) / 1000);
+  });
+  const total = [...self.values()].reduce((a, b) => a + b, 0);
+  console.log(`
+  SAMPLING PROFILE over the drag — ${f2(total)} ms of samples, top 20 by SELF time:`);
+  for (const [k, v] of [...self.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20)) {
+    console.log(`    ${f2(v).padStart(9)} ms  ${(100 * v / total).toFixed(1).padStart(5)}%  ${k}`);
+  }
+}
+if (process.env.JSON) { fs.writeFileSync(process.env.JSON, JSON.stringify({ target, settled, report, frames: R.frames }, null, 1)); console.log(`\n  frames → ${process.env.JSON}`); }

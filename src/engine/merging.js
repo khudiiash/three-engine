@@ -760,6 +760,9 @@ export class MergeSystem {
    * crime rather than inferred.
    */
   invalidate(reason = "unknown") {
+    // Anything that is not a released mover is stale on screen until the
+    // rebuild lands, so it gets MAX_DEFER's guarantee back.
+    if (reason !== "member-moved") this._moverReleased = false;
     this._dirty = true;
     this._invalidateReason = reason;
     this._invalidateTally[reason] = (this._invalidateTally[reason] ?? 0) + 1;
@@ -874,7 +877,22 @@ export class MergeSystem {
         this._lastPopulation = ready;
         if (this._dirtySince > 0) this._dirtySince = now;
       }
-      const starved = this._dirtySince > 0 && now - this._dirtySince >= MAX_DEFER_MS;
+      // ⭐ §19 6.5 — A RELEASED MOVER CANNOT STARVE, because nothing is stale.
+      //
+      // MAX_DEFER exists so a scene that never goes quiet still merges: without
+      // it a continuously animated transform would hold a WRONG proxy on screen
+      // forever. A member that `#releaseMovingMember` has already taken out of
+      // the proxy is the one case where that argument does not apply — it is
+      // drawing itself, correctly, and the only thing the re-bake reclaims is a
+      // run of collapsed indices. Letting starvation fire anyway put the 455 ms
+      // `mergeGeometries` frame back, two seconds into a three-second drag
+      // instead of at its first frame: the same hitch, moved.
+      //
+      // So a drag defers on `settling` alone (400 ms after the last motion),
+      // which a stopped drag satisfies immediately. Any OTHER invalidation
+      // reason clears the flag and MAX_DEFER applies again as before.
+      const starved =
+        this._dirtySince > 0 && !this._moverReleased && now - this._dirtySince >= MAX_DEFER_MS;
       if (settling && !starved && !this._urgent) return;
       const throttled =
         this._rebuildCount > 0 && now - this._lastRebuildAt < MIN_REBUILD_INTERVAL_MS;
@@ -893,6 +911,7 @@ export class MergeSystem {
       this._rebuildCount++;
       this._dirty = false;
       this._dirtySince = 0;
+      this._moverReleased = false;
       this.engine.scene.updateMatrixWorld();
       this.#rebuild();
       return;
@@ -997,19 +1016,49 @@ export class MergeSystem {
     for (let g = start; g < end; g++) {
       const group = this.groups[g];
       for (let i = 0; i < group.members.length; i++) {
+        // Already released: it is drawing itself, and its triangles are gone
+        // from the proxy. Re-testing it would re-fire on every drag frame.
+        if (group.released?.has(i)) continue;
         const elements = group.members[i].mesh.matrixWorld.elements;
         const cached = group.matrices[i];
         for (let e = 0; e < 16; e++) {
           if (cached[e] === elements[e]) continue;
           this._unstable.add(group.members[i].entityId);
+          this.#releaseMovingMember(group, i);
           moved = true;
           break;
         }
       }
     }
     if (moved) {
+      // ⭐ §19 6.5 — DIRTY, NOT URGENT, AND THAT IS THE WHOLE FIX.
+      //
+      // `_urgent` bypasses both SETTLE_MS and MIN_REBUILD_INTERVAL_MS, so a
+      // dragged member re-baked its entire group on the frame it moved: 455 ms
+      // of `mergeGeometries` inside one 506 ms frame on Bistro, and the drag's
+      // only frame over 50 ms once the driver was fixed (run-gi2-drag-probe,
+      // DRIVE=gizmo). It was urgent for a real reason — the proxy still showed
+      // the member in its old place, and holding that for half a second is a
+      // visible ghost, not a saved millisecond.
+      //
+      // `#releaseMovingMember` removes that reason instead of trading against
+      // it: the member's own triangles are collapsed in the proxy's index
+      // buffer and the mesh is made visible again, so the frame it moves it is
+      // ALREADY un-merged and correct on screen. Nothing is left stale for the
+      // rebuild to hurry for, and the group's re-bake — which only has to drop
+      // one member it will never merge again (`_unstable`) — waits for the
+      // drag to stop, once, on the ordinary settle path.
       this._dirty = true;
-      this._urgent = true;
+      this._moverReleased = true;
+      // ⚠ AND PUSH THE SETTLE CLOCK. `#watchForMotion` sets `_dirty` directly
+      // rather than going through `invalidate()`, so it never touched
+      // `_dirtiedAt` — which left `settling` reading an ancient timestamp and
+      // FALSE on the very next tick. Dropping `_urgent` alone therefore changed
+      // nothing: the rebuild still ran on the drag's first frame, just through
+      // the settle gate instead of past it. The motion IS the change this clock
+      // is meant to be timing.
+      this._dirtiedAt = performance.now();
+      if (this._dirtySince === 0) this._dirtySince = this._dirtiedAt;
       this._invalidateReason = "member-moved";
       this._invalidateTally["member-moved"] = (this._invalidateTally["member-moved"] ?? 0) + 1;
       // ⭐ A MEASURED PRODUCER, not an announced one. This watcher compares
@@ -1021,6 +1070,45 @@ export class MergeSystem {
       // WATCH_WINDOW_FRAMES, so a move can be reported a few frames late.
       this.engine?.content?.bump("transforms", "merging:member-moved");
     }
+  }
+
+  /**
+   * Take one moved member out of its proxy WITHOUT re-merging the group.
+   *
+   * The proxy's geometry is the members concatenated in world space, so a
+   * member's contribution is a contiguous run of the index buffer — recorded by
+   * `mergeGeometries` as `memberIndexRanges`. Pointing every index in that run
+   * at the same vertex collapses each of its triangles to a point, which
+   * rasterises nothing: the member is gone from the proxy for the cost of its
+   * OWN indices, not the group's vertices. Then the mesh is made visible again
+   * and draws itself.
+   *
+   * Costs one index-buffer upload, once per member — a released member is
+   * skipped by the watcher forever after, and `_unstable` keeps it out of every
+   * later merge, so a drag pays this on its FIRST frame and nothing after.
+   *
+   * ⚠ The visibility gate is `#teardown`'s, not a blanket `true`: a member whose
+   * component was disabled while it was merged has to stay hidden.
+   */
+  #releaseMovingMember(group, index) {
+    (group.released ??= new Set()).add(index);
+    const member = group.members[index];
+    const mesh = member?.mesh;
+    if (!mesh) return;
+    mesh.userData.mergedInto = null;
+    const component = this.engine?.entities?.get(mesh.userData.entityId)?.components?.get("mesh");
+    mesh.visible = component
+      ? component.enabled && component.materialRenderable !== false
+      : true;
+    const geometry = group.mesh?.geometry;
+    const range = geometry?.userData?.memberIndexRanges?.[index];
+    const indices = geometry?.index;
+    if (!range || !indices || range.start + range.count > indices.count) return;
+    const array = indices.array;
+    const collapse = array[range.start] ?? 0;
+    for (let k = 0; k < range.count; k++) array[range.start + k] = collapse;
+    indices.needsUpdate = true;
+    this.#invalidateBundle();
   }
 
   /* ---------------------------------------------------------------------- */
@@ -1987,6 +2075,16 @@ export function mergeGeometries(members, rowOf, wanted = MERGED_ATTRIBUTES) {
 
   const vector = new THREE.Vector3();
   const normalMatrix = new THREE.Matrix3();
+  // §19 6.5 — WHERE EACH MEMBER LANDED IN THE INDEX BUFFER.
+  //
+  // A merged proxy carries no transform, so a member that MOVES is baked into
+  // the wrong place until the group is re-merged — and re-merging mid-drag is a
+  // 455 ms frame on Bistro (measured; run-gi2-drag-probe, DRIVE=gizmo). With its
+  // range known, that member's triangles can instead be collapsed to a point in
+  // place: one index write, O(the member and not the group), paid ONCE as it
+  // starts moving, after which it draws itself as an ordinary mesh and the
+  // re-bake waits for the drag to settle. Parallel to `members`.
+  const memberIndexRanges = [];
   let vertexAt = 0;
   let indexAt = 0;
   for (const member of members) {
@@ -2032,6 +2130,8 @@ export function mergeGeometries(members, rowOf, wanted = MERGED_ATTRIBUTES) {
       for (let i = 0; i < position.count; i++) indices[indexAt + i] = vertexAt + i;
       indexAt += position.count;
     }
+    const drawn = geometry.index ? geometry.index.count : position.count;
+    memberIndexRanges.push({ start: indexAt - drawn, count: drawn, vertex: vertexAt });
     vertexAt += position.count;
   }
 
@@ -2040,5 +2140,6 @@ export function mergeGeometries(members, rowOf, wanted = MERGED_ATTRIBUTES) {
   }
   if (rows) merged.setAttribute("materialIndex", new THREE.BufferAttribute(rows, 1));
   merged.setIndex(new THREE.BufferAttribute(indices, 1));
+  merged.userData.memberIndexRanges = memberIndexRanges;
   return merged;
 }
