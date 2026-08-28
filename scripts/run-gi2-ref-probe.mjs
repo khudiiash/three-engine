@@ -121,6 +121,46 @@ const BOUNCE = Number(process.env.BOUNCE ?? 1);
 const TMAX = Number(process.env.TMAX ?? 200);
 const ONLY = (process.env.ONLY ?? "").toLowerCase();
 const OUT = process.env.OUT ?? "";
+/**
+ * §19 5.4c — THE TERM ARMS. `ARMS=field,direct,noSky` names presets; anything
+ * else is `name=uniform:value,uniform:value`, and a uniform whose value is a
+ * `Vector3` (`skyColor`, `sunColor`) is set to `(v, v, v)`.
+ *
+ * ⭐ PRESETS, not raw uniform names, because the question each arm answers is
+ * about a TERM and the term's uniform has moved twice already (`rcTermField`
+ * did not exist before 5.3e). A preset that fails to resolve prints SKIPPED
+ * with the missing uniform's name instead of silently measuring the baseline
+ * a second time — the blind-instrument failure this suite keeps meeting.
+ */
+const ARM_PRESETS = {
+  field: { rcTermField: 1, rcTermDirect: 0 },
+  direct: { rcTermField: 0, rcTermDirect: 1 },
+  // ⚠ `noSky`/`noSun` ARE NOT VIABLE AS UNIFORM ARMS ON A LIVE BOOT:
+  // `GISystem.#tick` republishes `skyColor` from `sceneSkyRadiance` and
+  // `sunColor` from the light every frame, so the write survives exactly one
+  // tick and the arm measures the baseline a second time. They are kept
+  // because the SKIPPED/equal reading is itself the receipt — an arm that
+  // reads `share ≈ 0 %` here means the write was reverted, not that the term
+  // is empty. The honest sky split is the reference's own `E_sky_p` /
+  // `E_hit_p` columns, which are printed per point above.
+  noSky: { skyColor: 0 },
+  noSun: { sunColor: 0 },
+};
+const ARMS = (process.env.ARMS ?? "").split(/[,|]/).map((s) => s.trim()).filter(Boolean)
+  .map((spec) => {
+    if (!spec.includes("=") && ARM_PRESETS[spec]) {
+      return { name: spec, sets: Object.entries(ARM_PRESETS[spec]).map(([k, v]) => ({ k, v })) };
+    }
+    const [name, body] = spec.includes("=") ? [spec.slice(0, spec.indexOf("=")), spec.slice(spec.indexOf("=") + 1)] : [spec, spec];
+    return {
+      name: name.trim(),
+      sets: body.split(";").map((kv) => {
+        const [k, v] = kv.split(":");
+        return { k: k?.trim(), v: Number(v) };
+      }).filter((s) => s.k),
+    };
+  });
+const ARM_FRAMES = Number(process.env.ARM_FRAMES ?? 60);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const lum = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
 const f = (v, n = 4) => (Number.isFinite(v) ? v.toFixed(n) : "—");
@@ -202,6 +242,28 @@ const settleFrames = async (n, capMs = 180000) => {
 };
 
 console.log(`\n══ ${SCENE} — the ground-truth receipt ═══════════════════════`);
+// ⭐⭐ §19 5.4c — THE CONTRACT, PRINTED. Every ratio below is a quotient of two
+// quantities, and a reader who does not know what the DENOMINATOR contains
+// cannot tell an energy bug from a definition mismatch. Both 5.2 gains were
+// argued without this line on screen.
+console.log("  CONTRACT — what E_gi2 must contain, in the reference's own convention:");
+console.log("    · SKY as seen from p, occluded by the geometry            ✔ IN");
+console.log("    · everything the sky and the sun BOUNCE off on the way     ✔ IN");
+console.log("      (emitter direct AT A BOUNCE SURFACE is part of this)");
+console.log("    · the emitter's direct term at p (seated lamps, NEE)       ✔ IN");
+console.log("      ⚠ BUT THE REFERENCE CANNOT SEE A *SEATED* ONE: it shades a");
+console.log("        hit from `gather.paletteEmissive`, and `#gi2SlotEmissive`");
+console.log("        zeroes a promoted emitter's palette emission, so a scene");
+console.log("        with slots needs the analytic seat term added to E_ref or");
+console.log("        every ratio near a lamp is a DEFINITION mismatch, not a bug.");
+console.log("        The palette-emission census is printed below — 0 emitters");
+console.log("        makes this paragraph a provable no-op for this scene.");
+console.log("    · the SUN's direct term at p                              ✘ OUT");
+console.log("      (`giLight` multiplies it in separately; a field that");
+console.log("       carried it would be measured against a different truth)");
+console.log("    · bounces beyond the reference's BOUNCE (default 1)        ✘ OUT");
+console.log("      → the reference is a LOWER BOUND; ratio > 1 needs a term,");
+console.log("        ratio < 1 may be the missing bounces alone.");
 const opened = await call("scene.open", { path: `${PROJECT}/scenes/${SCENE}.scene` });
 if (!opened.ok) { console.log(`FATAL scene.open: ${opened.error}`); await browser.close(); process.exit(1); }
 { const dl = Date.now() + 240000; while (Date.now() < dl && !firstLight) await wait(250); }
@@ -1090,6 +1152,85 @@ for (const [key, mk, label] of [["a", poseStreet, "STREET OVERVIEW"], ["b", pose
     `${f(med(sigErr), 3)}   outside [0.7, 1.4]: ` +
     `${sig.filter((r) => r.ratio < 0.7 || r.ratio > 1.4).length}   ` +
     `mean |log ratio| ${f(sigLog, 3)}`);
+
+  // ══ §19 5.4c — THE TERM ARMS, IN THE SAME BOOT, AGAINST THE SAME REFERENCE
+  //
+  // The 5.2/5.3d receipts say "GI2 is TOO BRIGHT on Bistro" and a scalar gain
+  // cannot name which term the excess is in. Three of them are live uniforms —
+  // `rcTermField` and `rcTermDirect` on `gi2.rc` (5.3e), `skyColor` on the
+  // gather — so the split is a WRITE, not a rebuild: the reference is already
+  // traced, the pins are already resolved, and every arm re-reads E_gi2 at the
+  // SAME pixels. `E_base − E_noSky` is the sky's share of the delivered field
+  // BY SUBTRACTION, which is the number that decides the double-count question.
+  if (ARMS.length) {
+    console.log("\n  ── TERM ARMS (live uniforms, same pose, same reference) ────────────");
+    console.log(`  ${"arm".padEnd(22)} ${"ΣE_gi2".padStart(9)} ${"Σratio".padStart(8)} ` +
+      `${"med|log|".padStart(9)} ${"share".padStart(7)}  (signal set, ${sig.length} pts)`);
+    const sigTags = new Set(sig.map((r) => r.tag));
+    const sumRef = sig.reduce((a, r) => a + lum(r.Eref), 0);
+    const scoreOf = (byTagE) => {
+      let sumG = 0; const logs = [];
+      for (const r of sig) {
+        const E = byTagE.get(r.tag);
+        if (!E) continue;
+        const Lg = lum(E); sumG += Lg;
+        logs.push(Math.abs(Math.log(Math.max(1e-6, Lg) / Math.max(1e-6, lum(r.Eref)))));
+      }
+      return { sumG, ratio: sumG / Math.max(1e-9, sumRef), med: med(logs) };
+    };
+    const baseScore = scoreOf(new Map(sig.map((r) => [r.tag, r.Egi2])));
+    const line = (name, s, share) => console.log(
+      `  ${name.padEnd(22)} ${f(s.sumG, 4).padStart(9)} ${f(s.ratio, 3).padStart(8)} ` +
+      `${f(s.med, 3).padStart(9)} ${(share == null ? "—" : `${(share * 100).toFixed(0)} %`).padStart(7)}`);
+    line("baseline (shipped)", baseScore, null);
+    const armScores = { base: baseScore };
+    for (const arm of ARMS) {
+      const set = await page.evaluate(({ sets }) => {
+        const gi2 = globalThis.__gi2();
+        // The RC resolve's own uniforms live on `gi2.rc`, the transport's on the
+        // gather. Merging them here is what makes an arm one name, not two.
+        const u = { ...(gi2.rc?.uniforms ?? {}), ...gi2.gather.uniforms };
+        const before = [];
+        for (const s of sets) {
+          const n = u[s.k];
+          if (!n) return { error: `no uniform ${s.k}` };
+          const v = n.value;
+          // ⚠ `skyColor`/`sunColor` are THREE.Color (r/g/b), NOT Vector3
+          // (x/y/z) — the first cut of this tested only `"x" in v`, fell to
+          // the scalar branch and REPLACED the Color object with a number, and
+          // the next `sceneSkyRadiance` tick threw `out.setRGB is not a
+          // function` on every frame for the rest of the boot.
+          if (v && typeof v === "object" && ("x" in v || "r" in v)) {
+            const c = "r" in v ? ["r", "g", "b"] : ["x", "y", "z"];
+            before.push({ k: s.k, vec: c.map((a) => v[a]), comp: c });
+            for (const a of c) v[a] = s.v;
+          } else { before.push({ k: s.k, num: v }); n.value = s.v; }
+        }
+        return { ok: true, before };
+      }, { sets: arm.sets });
+      if (set.error) { console.log(`  ${arm.name.padEnd(22)} SKIPPED — ${set.error}`); continue; }
+      await settleFrames(ARM_FRAMES);
+      const re = await pickPoints(PIN_ON ? (PINS[key]?.pts ?? null) : null);
+      const m = new Map(re.pts.filter((p) => !p.missing && sigTags.has(p.tag)).map((p) => [p.tag, p.E]));
+      const s = scoreOf(m);
+      armScores[arm.name] = s;
+      line(arm.name, s, (baseScore.sumG - s.sumG) / Math.max(1e-9, baseScore.sumG));
+      await page.evaluate(({ before }) => {
+        const gi2 = globalThis.__gi2();
+        const u = { ...(gi2.rc?.uniforms ?? {}), ...gi2.gather.uniforms };
+        for (const b of before) {
+          if (b.vec) b.comp.forEach((a, i) => { u[b.k].value[a] = b.vec[i]; });
+          else u[b.k].value = b.num;
+        }
+      }, { before: set.before });
+      await settleFrames(ARM_FRAMES);
+    }
+    console.log("  `share` = (baseline − arm) / baseline: the fraction of the DELIVERED");
+    console.log("  field this term carries. Σratio is against the SAME path-traced truth,");
+    console.log("  whose contract is printed above — sky YES, sun-direct-at-p NO.");
+    results[`arms_${key}`] = armScores;
+  }
+
   // ══ THE FAÇADE COLUMN, AS A NAMED PROFILE ══════════════════════════════
   //
   // FAC1..FAC6 are one wall, top to bottom, and they are the headline: a

@@ -57,3 +57,6 @@ scripts/*.gif
 .no-hmr
 docs/SplitRadianceCascadesPaper.pdf
 PARALLEL_SESSION_PROMPT.md
+
+.vite-energy/
+vite.energy.config.mjs
