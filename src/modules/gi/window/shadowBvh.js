@@ -134,7 +134,30 @@ const bvhAnyHitFn = wgslFn(/* wgsl */ `
 		var sp: i32 = 0;
 		stack[0] = 0u;
 
-		let invDir = vec3f( 1.0 ) / rd;
+		// ⭐⭐ FINITE PSEUDO-INFINITY, NOT 1/0 — AND THIS IS THE CORNELL BUG.
+		//
+		// A ray straight down a wall (dy = 0) gives invDir.y = Inf, and a node
+		// whose slab plane the origin lies EXACTLY on then computes 0 * Inf = NaN.
+		// Every comparison against NaN is false, so tmax < entry is false, the
+		// node is accepted, and its children are accepted, and the traversal
+		// returns whatever the first triangle says — or the node is dropped,
+		// depending on which side of the min/max the NaN lands. Either way the
+		// answer is data-dependent nonsense, and it happens ONLY on axis-aligned
+		// rays against axis-aligned geometry: a Cornell box, a corridor, a room.
+		// The generated random-ray test cannot see it; the 600 axis-aligned rays
+		// in scratchpad/bvh-check.mjs exist for exactly this.
+		//
+		// 1e-20 keeps every reciprocal finite in f32 (1e20 * a 100 m extent is
+		// 1e22, well inside f32's 3.4e38) so the products stay numbers and the
+		// slab test keeps its ordinary meaning.
+		let safeDir = vec3f(
+			// ⚠ NOT sign(rd.x) * 1e-20: WGSL's sign(0.0) IS 0.0, so a sign-based
+			// nudge is still exactly zero on the one input this guard exists for.
+			select( select( -1e-20, 1e-20, rd.x >= 0.0 ), rd.x, abs( rd.x ) > 1e-20 ),
+			select( select( -1e-20, 1e-20, rd.y >= 0.0 ), rd.y, abs( rd.y ) > 1e-20 ),
+			select( select( -1e-20, 1e-20, rd.z >= 0.0 ), rd.z, abs( rd.z ) > 1e-20 )
+		);
+		let invDir = vec3f( 1.0 ) / safeDir;
 
 		// The iteration guard is NOT defensive programming, it is a
 		// DEVICE-LOSS guard. A GPU loop whose exit condition depends on data

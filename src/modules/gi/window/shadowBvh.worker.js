@@ -73,10 +73,8 @@ const F32_EXACT_MAX = 16777216;
  *  of a triangle it reaches through a scattered permutation index, so parallel
  *  arrays cost three cache misses where one record costs one. That is the whole
  *  reason this stride exists; the layout has no other meaning and never leaves
- *  the builder. */
+ *  the builder. Offsets: 0..2 min, 3..5 max, 6..8 centroid. */
 const TB_STRIDE = 9;
-const TB_MIN = 0;
-const TB_MAX = 3;
 const TB_CENT = 6;
 
 const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Number(process.hrtime.bigint() / 1000n) / 1000);
@@ -207,13 +205,12 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
     // conservative. (Had they been computed — a midpoint, an average — they
     // would need rounding outward here or the box could exclude its own
     // triangle and the traversal would miss hits the brute force finds.)
-    const b6 = t * 6;
-    box[b6] = nx; box[b6 + 1] = ny; box[b6 + 2] = nz;
-    box[b6 + 3] = xx; box[b6 + 4] = xy; box[b6 + 5] = xz;
-    const c3 = t * 3;
-    cent[c3] = (ax + bx + cx) / 3;
-    cent[c3 + 1] = (ay + by + cy) / 3;
-    cent[c3 + 2] = (az + bz + cz) / 3;
+    const r = t * TB_STRIDE;
+    tb[r] = nx; tb[r + 1] = ny; tb[r + 2] = nz;
+    tb[r + 3] = xx; tb[r + 4] = xy; tb[r + 5] = xz;
+    tb[r + 6] = (ax + bx + cx) / 3;
+    tb[r + 7] = (ay + by + cy) / 3;
+    tb[r + 8] = (az + bz + cz) / 3;
     perm[t] = t;
     if (nx < rootMinX) rootMinX = nx; if (xx > rootMaxX) rootMaxX = xx;
     if (ny < rootMinY) rootMinY = ny; if (xy > rootMaxY) rootMaxY = xy;
@@ -312,13 +309,13 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
     let cMinX = Infinity, cMinY = Infinity, cMinZ = Infinity;
     let cMaxX = -Infinity, cMaxY = -Infinity, cMaxZ = -Infinity;
     for (let i = start; i < start + count; i++) {
-      const t = perm[i], b6 = t * 6, c3 = t * 3;
-      const x0 = box[b6], y0 = box[b6 + 1], z0 = box[b6 + 2];
-      const x1 = box[b6 + 3], y1 = box[b6 + 4], z1 = box[b6 + 5];
+      const r = perm[i] * TB_STRIDE;
+      const x0 = tb[r], y0 = tb[r + 1], z0 = tb[r + 2];
+      const x1 = tb[r + 3], y1 = tb[r + 4], z1 = tb[r + 5];
       if (x0 < bMinX) bMinX = x0; if (x1 > bMaxX) bMaxX = x1;
       if (y0 < bMinY) bMinY = y0; if (y1 > bMaxY) bMaxY = y1;
       if (z0 < bMinZ) bMinZ = z0; if (z1 > bMaxZ) bMaxZ = z1;
-      const cx = cent[c3], cy = cent[c3 + 1], cz = cent[c3 + 2];
+      const cx = tb[r + 6], cy = tb[r + 7], cz = tb[r + 8];
       if (cx < cMinX) cMinX = cx; if (cx > cMaxX) cMaxX = cx;
       if (cy < cMinY) cMinY = cy; if (cy > cMaxY) cMaxY = cy;
       if (cz < cMinZ) cMinZ = cz; if (cz > cMaxZ) cMaxZ = cz;
@@ -358,11 +355,11 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
       const sx = scale[0], sy = scale[1], sz = scale[2];
       const lx = cLo[0], ly = cLo[1], lz = cLo[2];
       for (let i = start; i < start + count; i++) {
-        const t = perm[i], b6 = t * 6, c3 = t * 3;
-        const x0 = box[b6], y0 = box[b6 + 1], z0 = box[b6 + 2];
-        const x1 = box[b6 + 3], y1 = box[b6 + 4], z1 = box[b6 + 5];
+        const r = perm[i] * TB_STRIDE;
+        const x0 = tb[r], y0 = tb[r + 1], z0 = tb[r + 2];
+        const x1 = tb[r + 3], y1 = tb[r + 4], z1 = tb[r + 5];
         if (sx !== 0) {
-          let k = ((cent[c3] - lx) * sx) | 0;
+          let k = ((tb[r + 6] - lx) * sx) | 0;
           if (k < 0) k = 0; else if (k >= BIN_COUNT) k = BIN_COUNT - 1;
           binCount[k]++;
           const m = k * 3;
@@ -371,7 +368,7 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
           if (z0 < binMin[m + 2]) binMin[m + 2] = z0; if (z1 > binMax[m + 2]) binMax[m + 2] = z1;
         }
         if (sy !== 0) {
-          let k = ((cent[c3 + 1] - ly) * sy) | 0;
+          let k = ((tb[r + 7] - ly) * sy) | 0;
           if (k < 0) k = 0; else if (k >= BIN_COUNT) k = BIN_COUNT - 1;
           const bi = BIN_COUNT + k;
           binCount[bi]++;
@@ -381,7 +378,7 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
           if (z0 < binMin[m + 2]) binMin[m + 2] = z0; if (z1 > binMax[m + 2]) binMax[m + 2] = z1;
         }
         if (sz !== 0) {
-          let k = ((cent[c3 + 2] - lz) * sz) | 0;
+          let k = ((tb[r + 8] - lz) * sz) | 0;
           if (k < 0) k = 0; else if (k >= BIN_COUNT) k = BIN_COUNT - 1;
           const bi = 2 * BIN_COUNT + k;
           binCount[bi]++;
@@ -452,7 +449,7 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
       let i = start, j = start + count - 1;
       while (i <= j) {
         const t = perm[i];
-        let k = ((cent[t * 3 + a] - lo) * sc) | 0;
+        let k = ((tb[t * TB_STRIDE + TB_CENT + a] - lo) * sc) | 0;
         if (k < 0) k = 0; else if (k >= BIN_COUNT) k = BIN_COUNT - 1;
         if (k < bestSplit) { i++; }
         else { perm[i] = perm[j]; perm[j] = t; j--; }
@@ -471,7 +468,7 @@ export function buildShadowBvh({ tris, triCount, maxLeafSize = 8, triCap = Infin
       if (ext[1] > ext[a]) a = 1;
       if (ext[2] > ext[a]) a = 2;
       mid = start + (count >> 1);
-      selectNth(perm, start, start + count - 1, mid, cent, a);
+      selectNth(perm, start, start + count - 1, mid, tb, a);
       medianSplits++;
       if (count > leafCap) leafCapForced++;
     }
