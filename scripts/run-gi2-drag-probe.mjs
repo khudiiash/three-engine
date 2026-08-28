@@ -154,6 +154,19 @@ const installed = await page.evaluate(async ({ target, amp }) => {
     console[k] = (...a) => { try { const s = String(a[0] ?? "").slice(0, 110); R.frameLogs.push(s); } catch {} return orig(...a); };
   }
   const stats = eng.stats;
+  // §19 6.5b — PER-FRAME CPU PHASE DELTAS. `beginPhaseCapture` accumulates
+  // `_phaseTotals` monotonically while armed, so arming once with an
+  // out-of-reach target and taking the delta at each `endPhaseFrame` turns the
+  // engine's own averaging profiler into a per-frame one. Copied from
+  // run-gi2-motion-probe, which established the re-arm trick.
+  const phaseNames = [];
+  stats.beginPhaseCapture(1);
+  for (const ph of stats.readPhaseCapture?.()?.phases ?? []) phaseNames.push(ph.name);
+  stats.beginPhaseCapture(1e9);
+  const totals = stats._phaseTotals ?? [];
+  const NP = totals.length;
+  const prevPhase = new Float64Array(NP);
+  const prevSub = new Map();
   const origEnd = stats.endPhaseFrame.bind(stats);
   let last = performance.now();
   stats.endPhaseFrame = (...a) => {
@@ -162,8 +175,20 @@ const installed = await page.evaluate(async ({ target, amp }) => {
     const sys = globalThis.__giSysForProbe();
     const gi2 = globalThis.__gi2();
     const store = gi2?.store ?? gi2?._store ?? null;
+    if (stats._phaseFramesTarget < 1e8) stats._phaseFramesTarget = 1e9;
+    stats._phaseArmed = true;
+    const phases = {};
+    for (let i = 0; i < NP; i++) {
+      const dd = totals[i] - prevPhase[i]; prevPhase[i] = totals[i];
+      if (dd > 0.3) phases[phaseNames[i] ?? `#${i}`] = +dd.toFixed(2);
+    }
+    const subs = {};
+    for (const [k, v] of stats._subTotals ?? []) {
+      const dd = v - (prevSub.get(k) ?? 0); prevSub.set(k, v);
+      if (dd > 0.3) subs[k] = +dd.toFixed(2);
+    }
     R.frames.push({
-      seg: R.seg, ms: now - last,
+      seg: R.seg, ms: now - last, phases, subs,
       rebuilds: sys?.rebuilds ?? 0, asks: sys?.rebuildAsks ?? 0,
       soup: store?.soupBuilds ?? gi2?.snapshot?.()?.soupBuilds ?? 0,
       cv: eng.content?.version ?? 0,
@@ -231,6 +256,27 @@ for (const [name, fs_] of Object.entries(segs)) {
   console.log(`    giRebuild runs +${report[name].rebuildRuns}, asks +${report[name].rebuildAsks}, soupBuilds +${report[name].soupBuilds}, contentKey +${report[name].contentBumps} ${JSON.stringify(report[name].contentCounts)}`);
 }
 // The chain, named: which console lines land on the slow frames.
+// The freeze frames, phase by phase. A drag frame that costs 800 ms and emits
+// no console line can only be named by the engine's own phase marks.
+{
+  const worst = [...R.frames].sort((x, y) => y.ms - x.ms).slice(0, 6);
+  console.log("\n  THE SIX WORST FRAMES, phase by phase:");
+  for (const f of worst) {
+    console.log(`    [${f.seg}] ${f2(f.ms)} ms  phases ${JSON.stringify(f.phases ?? {})}`);
+    if (f.subs && Object.keys(f.subs).length) console.log(`         subs ${JSON.stringify(f.subs)}`);
+  }
+  // And the same as a SUM over the drag, so a cost spread thin still shows.
+  const acc = {}, accS = {};
+  for (const f of R.frames) if (f.seg === "drag") {
+    for (const [k, v] of Object.entries(f.phases ?? {})) acc[k] = (acc[k] ?? 0) + v;
+    for (const [k, v] of Object.entries(f.subs ?? {})) accS[k] = (accS[k] ?? 0) + v;
+  }
+  const dragMs = R.frames.filter((f) => f.seg === "drag").reduce((s2, f) => s2 + f.ms, 0);
+  console.log(`\n  DRAG total ${f2(dragMs)} ms — phase sums:`);
+  for (const [k, v] of Object.entries(acc).sort((x, y) => y[1] - x[1]).slice(0, 12)) console.log(`    ${f2(v).padStart(9)} ms  ${k}`);
+  console.log("  sub-phase sums:");
+  for (const [k, v] of Object.entries(accS).sort((x, y) => y[1] - x[1]).slice(0, 12)) console.log(`    ${f2(v).padStart(9)} ms  ${k}`);
+}
 const slow = R.frames.filter((f) => f.ms > 40).slice(0, 400);
 const owners = new Map();
 for (const f of slow) for (const l of f.logs) owners.set(l, (owners.get(l) ?? 0) + 1);
