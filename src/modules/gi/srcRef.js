@@ -62,6 +62,7 @@ import {
   unpackProbeKey,
   worldKeysEnabled,
 } from "./srcMath.js";
+import { RAY_FLOOR } from "./srcRays.js";
 
 /**
  * Resolved run configuration. `anchor` is the LOD lattice origin — in the
@@ -79,6 +80,8 @@ export function makeSrcConfig(options = {}) {
     cascadeCount,
     maxLods: options.maxLods ?? MAX_LODS,
     raysPerPixel: options.raysPerPixel ?? 1,
+    /** SS19 6.1 -- the per-probe ray floor. Mirrors `srcRays`' RAY_FLOOR. */
+    rayFloor: options.rayFloor ?? RAY_FLOOR,
     camera: options.camera ?? [0, 0, 0],
     anchor: options.anchor ?? [0, 0, 0],
     // Uniform sky radiance a ray composites when it escapes the last cascade.
@@ -396,6 +399,21 @@ export function assignRays(cfg, built) {
   // nowhere else. Tracked capped or not — uncapped the two are equal and the
   // word comes out INFLUX_ONE, the same statement the kernel makes.
   for (const probe of cascades[0].probes) probe.naturalRays = probe.rayCount;
+  // SS19 STAGE 6.1 -- THE PER-PROBE RAY FLOOR, MIRRORED, AND IN THIS ORDER.
+  // The GPU's [D1a] sits between the natural snapshot and [D1']'s clamp, so
+  // this does too: `naturalRays` above is what the probe would have asked for
+  // UNAIDED (the alpha compensation's denominator), `rayCount` below is what it
+  // actually gets. Each of a probe's `k` pixels fires `ceil(F / k)` rays, so a
+  // 1-pixel probe stops firing one ray into 32 bins. `boost` is the mirror of
+  // `probeBoost` and the handout and the trace both read it.
+  for (const probe of cascades[0].probes) {
+    probe.boost = cfg.raysPerPixel;
+    if (!(cfg.rayFloor > 1) || probe.rayCount === 0) continue;
+    const k = Math.max(1, Math.round(probe.rayCount / cfg.raysPerPixel));
+    const per = Math.min(Math.ceil(cfg.rayFloor / k), Math.max(1, cfg.rayFloor));
+    probe.boost = per * cfg.raysPerPixel;
+    probe.rayCount = k * probe.boost;
+  }
   // The per-probe cap, exactly where the GPU's [D1'] clamps: at the source,
   // before anything propagates or partitions. `probeRayCap` arrives already
   // floored to a multiple of `raysPerPixel` (srcConfig.srcProbeRayCap), which
@@ -409,7 +427,15 @@ export function assignRays(cfg, built) {
   // whole-slice, and a non-multiple cap leaves an unclaimable tail.
   if (cfg.probeRayCap > 0) {
     for (const probe of cascades[0].probes) {
-      const cap = cfg.capOf ? cfg.capOf(probe) : cfg.probeRayCap;
+      let cap = cfg.capOf ? cfg.capOf(probe) : cfg.probeRayCap;
+      // SS19 6.1 -- a multiple of THIS probe's slice, not of `raysPerPixel`.
+      // The handout below is whole-slice and the slice is now per probe, so a
+      // cap that is not a multiple of it leaves an unclaimable tail (measured:
+      // 30 364 of 33 952 ray indices unclaimed, and the transport went dark).
+      if (cfg.rayFloor > 1) {
+        const rpp = Math.max(1, probe.boost ?? cfg.raysPerPixel);
+        cap = Math.max(rpp, Math.floor(cap / rpp) * rpp);
+      }
       probe.rayCount = Math.min(probe.rayCount, cap);
     }
   }
@@ -462,9 +488,11 @@ export function assignRays(cfg, built) {
     if (slot < 0 || strideSkips(cfg, p)) continue;
     const probe = cascades[0].probes[slot];
     const cursor = cursors.get(slot) ?? probe.rayOffset;
-    if (cursor + cfg.raysPerPixel > probe.rayOffset + probe.rayCount) continue;
+    // SS19 6.1 -- the slice width is the probe's, not the constant.
+    const rpp = Math.max(1, probe.boost ?? cfg.raysPerPixel);
+    if (cursor + rpp > probe.rayOffset + probe.rayCount) continue;
     pixelRayBase[p] = cursor;
-    cursors.set(slot, cursor + cfg.raysPerPixel);
+    cursors.set(slot, cursor + rpp);
   }
   return { totalRays, pixelRayBase };
 }
@@ -524,7 +552,10 @@ export function traceAndDeposit(cfg, built, pixels, rays, sceneTrace) {
     const lod = built.cascades[0].probes[c0Slot].lod;
     const bounds = intervalBoundaries(lod, cfg.spacing0, cfg.cascadeCount);
     const base = rays.pixelRayBase[p];
-    for (let r = 0; r < cfg.raysPerPixel; r++) {
+    // SS19 6.1 -- the same width [D5] claimed. Looping a different count either
+    // leaves rays unfired or walks into the next pixel's slice.
+    const rpp = Math.max(1, built.cascades[0].probes[c0Slot].boost ?? cfg.raysPerPixel);
+    for (let r = 0; r < rpp; r++) {
       const dir = rayDirection(
         base + r,
         px.normal[0], px.normal[1], px.normal[2],
