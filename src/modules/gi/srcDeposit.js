@@ -148,6 +148,7 @@ import {
 } from "./srcMathTsl.js";
 import {
   FLAG_BLOCKNEW,
+  FLAG_WARM_MASK,
   INFLUX_ONE,
   PROBE_BLOCK,
   PROBE_FLAGS,
@@ -1130,7 +1131,12 @@ export function createSrcDepositFrame(store, bins, {
           If(chain[c].notEqual(uint(SLOT_EMPTY)).and(blocks[c].notEqual(uint(SLOT_EMPTY))), () => {
             const fl = probeTable.element(chain[c].mul(PROBE_WORDS).add(uint(PROBE_FLAGS)))
               .toVar();
-            If(fl.bitAnd(uint(FLAG_BLOCKNEW)).notEqual(uint(0)), () => {
+            // §19 5.4a — `FLAG_BLOCKNEW` (claimed THIS frame) OR a non-zero
+            // WARM COUNTDOWN (claimed within the last `WARM_FRAMES`). One
+            // frame of rays cannot cover a probe's bin set, so the one-frame
+            // override left most bins UNKNOWN and their children orphaned —
+            // the cold-start checkerboard. See `FLAG_WARM_MASK` in srcProbes.
+            If(fl.bitAnd(uint(FLAG_BLOCKNEW | FLAG_WARM_MASK)).notEqual(uint(0)), () => {
               fresh.assign(true);
               dueEff.assign(dueEff.max(int(c)));
             });
