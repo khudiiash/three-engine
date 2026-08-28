@@ -100,14 +100,41 @@ import { normalOfFace } from "./radianceCache.js";
  * `cells` must be a POWER OF TWO — the toroidal mask is `& (cells − 1)`, the
  * same identity `windowStore`'s `& 63` is.
  *
- * Cascade `c` spans `cells · spacing · ratio^c`: 16 / 64 / 256 m on desktop,
- * 16 / 64 m on the phone tiers (three window levels, so a third cascade would
- * have no occupancy to read past 128 m — see `LMIN`).
+ * Cascade `c` spans `cells · spacing · ratio^c`.
  *
- * ⭐ THE SHARE IS THE UPDATE CADENCE. A cascade with 10 % of the slots and a
- * comparable live count is re-traced a seventh as often as one with 70 %, which
- * is RC's own law expressed in the only currency this file has. Nothing else in
- * the file knows that a cascade is "slow".
+ * ══ ⭐⭐⭐ §19 4.10 — THE SCHEDULE IS ×2 NOW, NOT ×4, AND THAT IS THE FAÇADE ══
+ *
+ * The 3.14 schedule was 0.5 / 2 / 8 m over 16 / 64 / 256 m — three lattices
+ * each four times the last. `probe:gi2-ref` priced what that costs where the
+ * picture is: the cascades are CAMERA-CENTRED, so a façade 40 m out is past
+ * c1's ±32 m half-extent and is answered by the **8 m** lattice, from a probe
+ * standing 3.5–7 m away in open air. Two probes over a sixteen-metre wall
+ * cannot carry a sky-visibility profile that falls 3× from roofline to
+ * pavement, and they did not: pose B's façade column measured a truth fall of
+ * 7.20× against GI2's 2.55×, with the answering probe a MEDIAN 6.18 m from the
+ * surface it was speaking for. That is resolution, not tuning.
+ *
+ * ⭐ ×2 IS FREE IN RAYS AND LINEAR IN MEMORY. Five cascades of 32³ at
+ * 0.5/1/2/4/8 m span 16/32/64/128/256 m — the SAME reach as three at ×4, never
+ * coarser anywhere, and up to 2× finer in the 10–50 m band that a street scene
+ * is mostly made of (40 m out is now the 4 m lattice, 12 m out the 1 m one).
+ * The ray budget is unchanged (`traceSlots` is a budget, split by `share`), so
+ * the trace's GPU cost is unchanged; what it costs is `wpOct`, which is linear
+ * in the cascade count — see `describe().bytes`.
+ *
+ * ⚠ AND β MOVES WITH IT. `BETA` is the INTERVAL growth, and the reason it was
+ * 4 is that the SPACING grew 4× — interval and spacing growing at the same rate
+ * is what keeps the angular demand per cascade CONSTANT at 64 directions
+ * (`BETA`'s own comment). A ×2 spacing schedule with a ×4 interval schedule
+ * would compound the angular deficit 4× per cascade instead of holding it flat.
+ * β is `ratio`, per tier, and the two can no longer drift apart.
+ *
+ * ⭐ THE SHARE IS THE UPDATE CADENCE, AND IT IS GENERATED, NOT TYPED. A cascade
+ * with a tenth of the slots and a comparable live count is re-traced a seventh
+ * as often as one with 70 %. Hand-typed arrays cannot follow a cascade count
+ * that changes per tier, so the split is `1/2^c` normalised — the finest
+ * cascade keeps half the budget at every schedule, and the tail cascades, whose
+ * live counts fall off with the scene's own extent, keep enough to cycle.
  */
 export const WORLD_TIERS = {
   phone: { cells: 16, spacing: 1.0, traceSlots: 1024, block: 64, cascades: 2, ratio: 4, share: [0.75, 0.25] },
@@ -115,6 +142,26 @@ export const WORLD_TIERS = {
   high: { cells: 32, spacing: 0.5, traceSlots: 6144, block: 256, cascades: 3, ratio: 4, share: [0.70, 0.20, 0.10] },
   ultra: { cells: 32, spacing: 0.5, traceSlots: 6144, block: 256, cascades: 3, ratio: 4, share: [0.70, 0.20, 0.10] },
 };
+
+/**
+ * How many cascades a tier will actually build, INCLUDING the `__gi2Cascades`
+ * override — the same arithmetic `createWorldProbes` does, exported because
+ * `gatherProbes` has to size `diagBuf`'s rows before it builds the lattice.
+ * A reader that scores the fallback row as a cascade reads `faceCov` as `cov`.
+ */
+export function worldCascadeCount(tier) {
+  const spec = WORLD_TIERS[tier] ?? WORLD_TIERS.high;
+  return Math.max(1, Math.min(8, globalThis.__gi2Cascades ?? spec.cascades));
+}
+
+/**
+ * The ray-budget split for `n` cascades: `1/2^c`, normalised. See WORLD_TIERS.
+ */
+export function cascadeShare(n) {
+  const raw = Array.from({ length: n }, (_, c) => 2 ** -c);
+  const tot = raw.reduce((a, b) => a + b, 0);
+  return raw.map((v) => v / tot);
+}
 
 /** The distance moments' quantization range, in units of the CASCADE's spacing. */
 export const DIST_CELLS = 8;
@@ -161,6 +208,12 @@ export const DQ = 4095;
  */
 export const BETA = 4;
 /**
+ * §19 4.10 — the interval growth for a tier whose SPACING grows by `ratio`.
+ * They must be the same number (see `WORLD_TIERS`); `BETA` survives as the
+ * default so a caller that passes nothing gets 3.14's schedule.
+ */
+export const betaOf = (ratio) => (ratio > 1 ? ratio : BETA);
+/**
  * r0, the finest cascade's interval length, in cells of the FINEST spacing.
  *
  * ⭐⭐ 8, AND THE RULE IT COMES FROM IS `t_{i+1} >= 2 * s_{i+1}` — THE PARENT'S
@@ -195,9 +248,9 @@ export const BETA = 4;
  */
 export const R0_CELLS = 8;
 /** `[t_0 … t_{NC−1}]` — cascade i's interval START. `t_0` is always 0. */
-export function intervalStarts(spacing0, cascades, r0Cells = R0_CELLS) {
+export function intervalStarts(spacing0, cascades, r0Cells = R0_CELLS, beta = BETA) {
   const r0 = r0Cells * spacing0;
-  return Array.from({ length: cascades }, (_, i) => r0 * ((BETA ** i - 1) / (BETA - 1)));
+  return Array.from({ length: cascades }, (_, i) => r0 * ((beta ** i - 1) / (beta - 1)));
 }
 /**
  * `[t_1 … t_NC]` — cascade i's interval END. The LAST cascade ends at the
@@ -205,8 +258,8 @@ export function intervalStarts(spacing0, cascades, r0Cells = R0_CELLS) {
  * and the only honest answer is the sky, which is why the last cascade is also
  * the ONLY one that credits sky on a miss.
  */
-export function intervalEnds(spacing0, cascades, rayMax, r0Cells = R0_CELLS) {
-  const s = intervalStarts(spacing0, cascades, r0Cells);
+export function intervalEnds(spacing0, cascades, rayMax, r0Cells = R0_CELLS, beta = BETA) {
+  const s = intervalStarts(spacing0, cascades, r0Cells, beta);
   return s.map((_, i) => (i === cascades - 1 ? rayMax : Math.min(rayMax, s[i + 1])));
 }
 
@@ -285,8 +338,15 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
    * select chains folding to constants, same page. Read BEFORE the build,
    * because it is the addressing.
    */
-  const NC = Math.max(1, Math.min(spec.cascades, globalThis.__gi2Cascades ?? spec.cascades));
-  const RATIO = spec.ratio;
+  // ⭐ `__gi2Cascades` MAY NOW RAISE AS WELL AS LOWER, and `__gi2Ratio` joins
+  // it — the two numbers that ARE the schedule, so "is ×2 over five lattices
+  // better than ×4 over three" is one page and one battery rather than two
+  // commits, two shader caches and two nights' drivers. The ceiling is 8
+  // because `CASC_PREF` is `ratio³ ^ (NC−1−c)` and a ninth cascade at ×4 would
+  // leave float range. `__gi2Cascades = 1` is still 3.13 exactly.
+  const NC = Math.max(1, Math.min(8, globalThis.__gi2Cascades ?? spec.cascades));
+  const RATIO = Math.max(2, globalThis.__gi2Ratio ?? spec.ratio);
+  const BETA_C = betaOf(RATIO);
   const SP0 = spec.spacing;
   const BLOCK = spec.block;
   const BLOCKS = CELLS / BLOCK;
@@ -406,9 +466,9 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
    * made it a LEAK (§W.5); at the lattice's own extent it is the answer.
    */
   const REACH_LAST = REACH_LATTICE ? EXT[NC - 1] : RAY_MAX;
-  const TSTART = INTERVALS ? intervalStarts(SP0, NC, R0C) : SPC.map(() => 0);
+  const TSTART = INTERVALS ? intervalStarts(SP0, NC, R0C, BETA_C) : SPC.map(() => 0);
   const TEND = INTERVALS
-    ? intervalEnds(SP0, NC, REACH_LAST, R0C)
+    ? intervalEnds(SP0, NC, REACH_LAST, R0C, BETA_C)
     : SPC.map(() => REACH_LAST);
   /**
    * The window level cascade `c` reads its LIVENESS from.
@@ -440,7 +500,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     // Renormalized over the cascades that EXIST, so `__gi2Cascades = 1` hands
     // the whole 6144-slot budget to cascade 0 — 3.13's number exactly, not 70 %
     // of it. An arm that quietly cuts the ray budget is not an arm.
-    const sh = spec.share.slice(0, NC);
+    const sh = (spec.share ?? cascadeShare(NC)).slice(0, NC);
     const tot = sh.reduce((a, b) => a + b, 0);
     const raw = sh.map((f) => Math.max(8, Math.round((spec.traceSlots * (f / tot)) / 8) * 8));
     const drift = spec.traceSlots - raw.reduce((a, b) => a + b, 0);
@@ -1926,7 +1986,11 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
    * coarser is 64 times less preferred, which is the ratio of the volumes its
    * probes stand for.
    */
-  const CASC_PREF = Array.from({ length: NC }, (_, c) => 64 ** (NC - 1 - c));
+  // ⚠ `ratio³`, NOT A LITERAL 64. This is "the ratio of the volumes its probes
+  // stand for" (below), which is `ratio³` — 64 at ×4 and 8 at ×2. A hard 64
+  // under a ×2 schedule would prefer the coarse cascades eight times too
+  // strongly in the tail, which is the one place the number is read.
+  const CASC_PREF = Array.from({ length: NC }, (_, c) => (RATIO ** 3) ** (NC - 1 - c));
   const cascConst = (ccU) => {
     const sp = pickF(ccU, SPC).toVar();
     return {
@@ -2021,7 +2085,7 @@ export function createWorldProbes({ win, trace, cache, tier = win.tier, kit }) {
     traceSlots: TRACE_SLOTS, block: BLOCK, blocks: BLOCKS, oct: OCT,
     raysPerFrame: TRACE_SLOTS * OCT, distMax: DMAX.slice(),
     // §19 3.15 — what every receipt has to print to be about this stage.
-    intervals: INTERVALS, beta: BETA, r0: R0C * SP0, r0Cells: R0C,
+    intervals: INTERVALS, beta: BETA_C, r0: R0C * SP0, r0Cells: R0C,
     tStart: TSTART.slice(), tEnd: TEND.slice(),
     mergePasses: mergePasses.length, seeded: !!seedPass,
     // §19 3.16 — the three arms, so a receipt cannot claim a stage it did not

@@ -82,7 +82,7 @@ import { FACE_OFF, LEVEL_WORDS, N, OCC_OFF, PAL_OFF } from "./windowStore.js";
 import { FACE_AX_SHIFT } from "./windowTrace.js";
 import { normalOfFace } from "./radianceCache.js";
 import { octahedralUV } from "../srcOctahedral.js";
-import { createWorldProbes } from "./worldProbes.js";
+import { createWorldProbes, worldCascadeCount } from "./worldProbes.js";
 
 /**
  * ⭐⭐⭐ §19 STAGE 3.13 — THE ONE BUILD CONSTANT (audits §U).
@@ -812,7 +812,11 @@ export function createGiGather({
    * shipped storage-buffer count (§Y.2's 6-binding envelope) on every boot the
    * probe did not ask for.
    */
-  const DIAG_VEC = 4;
+  // ⚠ ONE ROW PER CASCADE PLUS THE FALLBACK'S, DERIVED — not a literal 4.
+  // §19 4.10 made the cascade count a per-tier number (3 at ×4, 5 at ×2), and
+  // a hard 4 here silently truncates the rows so that the READER — which sizes
+  // itself from `buffers.diagCasc` — scores the fallback row as cascade 3.
+  const DIAG_VEC = 1 + worldCascadeCount(tier);
   const diagBuf = wantNoise
     ? instancedArray(new Float32Array(
       Math.ceil(width / 2) * Math.ceil(height / 2) * DIAG_VEC * 4), "vec4") : null;
@@ -3636,19 +3640,61 @@ export function createGiGather({
   // its trace kernel now evaluates the parent cascade's SH through this exact
   // formula. A `const` would be in its temporal dead zone there; moving the
   // definition up would put a resolve helper in the middle of the shading kit.
+  /**
+   * ⭐⭐⭐ §19 4.10 — THE CLIFF AT THE END OF `shEval`, AND WHAT REPLACED IT.
+   *
+   * This used to end `.max(vec3(0))`. A truncated SH2 reconstructed on a
+   * hemisphere with hard occluders RINGS — the band-1/2 terms overshoot
+   * negative — and `max(0)` turns a smoothly-varying small negative into a
+   * FLAT EXACT ZERO with a dead gradient, which neighbouring pixels straddle.
+   * `probe:gi2-ref` pose B measured it: `DARK3`, DC `+0.238`, raw `−0.026`,
+   * three channels clamped, `E_gi2` exactly 0.00000.
+   *
+   * ⭐ THE BAND-0 TERM IS THE ONE THAT CANNOT BE NEGATIVE. `L[0]` is a sum of
+   * radiances times non-negative weights, so `DC = 0.886·L0 >= 0` always, and
+   * the reconstruction expressed as a FRACTION of it — `w = 1 + AC/DC` — is the
+   * natural place to be non-negative. At or above `SH_FLOOR` the answer is the
+   * linear reconstruction BIT FOR BIT (the old arithmetic minus its clamp);
+   * below it the fraction decays exponentially to zero instead of stopping
+   * dead, matching value AND slope at the join. C¹, strictly positive wherever
+   * the probe holds any light at all, and it can add at most `SH_FLOOR · DC` —
+   * 5 % of the probe's own spherical mean — anywhere in the frame.
+   *
+   * ⚠⚠ AND IT IS NOT WHY `DARK3` WAS BLACK. Measured BEFORE it was written:
+   * the clamp bites 0 of 45 covered (cascade, point) pairs in pose A and 3 of
+   * 29 in pose B, and where it bites, the UNCLAMPED value is a small negative
+   * (−0.026 against a path-traced 0.563) — so removing the clamp recovers
+   * nothing. The magnitude fault is the cascade SCHEDULE (§AG.3); this is the
+   * per-pixel discontinuity, priced and removed on its own terms and no more.
+   * ⛔ `__gi2ShClamp = 1` restores the raw `max(0)`, for the A/B.
+   */
+  const SH_FLOOR = 0.05;
+  const SH_HARD_CLAMP = (globalThis.__gi2ShClamp ?? 0) !== 0;
   function shEval(L, n) {
     const c1 = 0.429043, c2 = 0.511664, c3 = 0.743125, c4 = 0.886227, c5 = 0.247708;
-    return L[8].mul(c1).mul(n.x.mul(n.x).sub(n.y.mul(n.y)))
+    const dc = L[0].mul(c4);
+    const ac = L[8].mul(c1).mul(n.x.mul(n.x).sub(n.y.mul(n.y)))
       .add(L[6].mul(c3).mul(n.z.mul(n.z)))
-      .add(L[0].mul(c4))
       .sub(L[6].mul(c5))
       .add(L[4].mul(2 * c1).mul(n.x).mul(n.y))
       .add(L[7].mul(2 * c1).mul(n.x).mul(n.z))
       .add(L[5].mul(2 * c1).mul(n.y).mul(n.z))
       .add(L[3].mul(2 * c2).mul(n.x))
       .add(L[1].mul(2 * c2).mul(n.y))
-      .add(L[2].mul(2 * c2).mul(n.z))
-      .max(vec3(0));
+      .add(L[2].mul(2 * c2).mul(n.z));
+    const lin = dc.add(ac);
+    if (SH_HARD_CLAMP) return lin.max(vec3(0));
+    // `dcs` only ever divides — above the join the returned value is `lin`
+    // itself, so the epsilon cannot brighten a probe that holds nothing.
+    const dcs = dc.max(1e-8);
+    const w = lin.div(dcs);
+    // ⚠ THE EXPONENT IS CAPPED AT 0. `w` is unbounded ABOVE (a bright probe on
+    // a facing normal) and `exp` of a large positive is `inf`; `mix` would then
+    // multiply that `inf` by a zero lane and produce NaN on exactly the
+    // brightest pixels in the frame. Above the join the cap makes `soft` a
+    // finite number nobody reads.
+    const soft = dcs.mul(SH_FLOOR).mul(exp(w.sub(SH_FLOOR).div(SH_FLOOR).min(0)));
+    return mix(soft, lin, step(float(SH_FLOOR), w));
   }
   /**
    * THE OCT TAP, SPLIT INTO A PLAN AND A FETCH.

@@ -107,7 +107,7 @@
 //      M=8 (sky rays at the bounce) · BOUNCE=1 · POSE_A · POSE_B · ONLY=a|b
 //      OUT · HEADED=1 · TMAX=200
 import puppeteer from "puppeteer-core";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { installTauriShim } from "./lib/tauriShim.mjs";
 
 const url = process.argv[2] ?? "http://127.0.0.1:5202/";
@@ -140,6 +140,15 @@ page.setDefaultTimeout(600000);
 await page.setViewport({ width: 1650, height: 970, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
 await page.evaluateOnNewDocument(() => { globalThis.__gi2NoiseDump = true; });
+// ⭐ BEFORE BOOT. The GI2 arms (`__gi2ShClamp`, `__gi2Ratio`, `__gi2Cascades`)
+// are read at BUILD time, so an A/B of any of them has to be set here and not
+// after the gather exists — and the whole point of having them is that two arms
+// can be measured in one tight window against ONE tree, rather than across two
+// commits and an hour of somebody else's edits. `probe:gi2-runner` has had
+// this hook since 4.7; this receipt needed it more.
+await page.evaluateOnNewDocument((flags) => {
+  for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
+}, JSON.parse(process.env.FLAGS ?? "{}"));
 await page.evaluateOnNewDocument((project) => {
   globalThis.__editorKeepRendering = true;
   localStorage.setItem("engine.projectRoot.v1", project);
@@ -477,6 +486,31 @@ console.log(`  estimator: N=${NSPP} primary, M=${MSPP} sky, ${BOUNCE} bounce(s),
 
 // ═════════════════════════════════════════════════════════════════ THE POSES
 //
+// ══════════════════════════════════════════════ THE PINS (§AG — the fix that
+// had to come before any other fix)
+//
+// ⭐⭐ A RECEIPT THAT RE-PICKS ITS OWN SAMPLE POINTS CANNOT ARBITRATE A CHANGE.
+// §AF.7 measured pose A at 0.733 / 0.863 / 0.905 / 1.000 across four runs of
+// the SAME tree, because `pickPoints` ranked pixels by their own `E_gi2`
+// luminance — so DARK1..3 and WDRK1..3 are, by construction, whatever this
+// boot's field happened to be worst at, and "the median moved" is then a
+// statement about the picker. Run-to-run scatter of the same order as the
+// effect is a blind instrument. [[probe-blind-statistics]]
+//
+// So the points are CHOSEN ONCE and written here: pose (eye/target) plus, per
+// point, the dump pixel index, the world position and the normal. At run time
+// each pin is resolved against the fresh dump by PIXEL FIRST and by NEAREST
+// WORLD POSITION as the fallback, and the drift is printed — a pin that cannot
+// be found is a loud row, never a silently different point.
+//
+// `PIN=0` restores the old self-picking behaviour (which is how a new pin set
+// is chosen); `PIN_EMIT=1` prints a paste-ready block for this run's picks.
+const PIN_ON = process.env.PIN !== "0";
+const PIN_EMIT = !!process.env.PIN_EMIT;
+/** Max world distance a pin may drift from its recorded position, in metres. */
+const PIN_TOL = 0.35;
+const PINS = JSON.parse(readFileSync(new URL("./gi2-ref-pins.json", import.meta.url), "utf8"));
+
 // Pose A is `probe:gi2-farfield`/`flood`'s street overview, derived from the
 // FrontBanner + Paris_Street bounds so it lands on the same street every run.
 // Pose B is `probe:gi2-puddle`'s terrace anchor with its 8-yaw sweep dropped:
@@ -512,6 +546,7 @@ const parsePose = (s) => {
 
 async function poseStreet() {
   if (process.env.POSE_A) return parsePose(process.env.POSE_A);
+  if (PIN_ON && PINS.a?.pose) return { ...PINS.a.pose, source: "PINNED street overview" };
   const banner = await boundsOf("FrontBanner");
   if (!banner) return null;
   const street = await boundsOf("Paris_Street_");
@@ -531,6 +566,7 @@ async function poseStreet() {
 }
 async function poseTerrace() {
   if (process.env.POSE_B) return parsePose(process.env.POSE_B);
+  if (PIN_ON && PINS.b?.pose) return { ...PINS.b.pose, source: "PINNED terrace close" };
   const slots = await page.evaluate(() => (globalThis.__giSys()?.state?.emitterSlots ?? [])
     .filter((s) => s.radius.value > 1e-5)
     .map((s) => ({ c: [s.center.value.x, s.center.value.y, s.center.value.z],
@@ -558,7 +594,7 @@ async function poseTerrace() {
 }
 
 // ══════════════════════════════════════ THE SAMPLE POINTS, OUT OF THE GBUFFER
-const pickPoints = () => page.evaluate(async () => {
+const pickPoints = (pins) => page.evaluate(async ({ pins }) => {
   const eng = globalThis.__giEngineForProbe;
   const gi2 = globalThis.__gi2();
   const { createGi2StageDump } = await import("/scripts/lib/gi2StageProbe.js");
@@ -633,6 +669,57 @@ const pickPoints = () => page.evaluate(async () => {
     const s = bestCol.keep.slice().sort((a, b) => b.P[1] - a.P[1]);
     for (let k = 0; k < 6; k++) facade.push(s[Math.min(s.length - 1, Math.round(k * (s.length - 1) / 5))]);
   }
+  // ══ THE ZERO CENSUS — over the WHOLE dump, not over the pins ═══════════
+  //
+  // The pinned points are a fixed 24. A fix that lifts those and blacks out a
+  // thousand others would read as a win, so the frame's own count of exact
+  // zeros travels with every run. `preZero` separates the two faults the §AF
+  // header names: a field that is zero (`E_pre` zero too) from AO having
+  // multiplied a healthy field away.
+  let zTot = 0; let zPre = 0;
+  for (const r of rows) {
+    if (L(r) >= 1e-4) continue;
+    zTot++;
+    if (0.2126 * r.Eb[0] + 0.7152 * r.Eb[1] + 0.0722 * r.Eb[2] < 1e-4) zPre++;
+  }
+  const census = { zeros: zTot, zerosPreAlso: zPre, valid: rows.length };
+
+  // ══ PINNED RESOLUTION ══════════════════════════════════════════════════
+  if (pins && pins.length) {
+    const out = [];
+    for (const p of pins) {
+      const dist = (r) => Math.hypot(r.P[0] - p.P[0], r.P[1] - p.P[1], r.P[2] - p.P[2]);
+      const agrees = (r) => r.N[0] * p.N[0] + r.N[1] * p.N[1] + r.N[2] * p.N[2] > 0.9;
+      let hit = null; let how = "";
+      const byIdx = rows.find((r) => r.i === p.i);
+      if (byIdx && dist(byIdx) <= 0.35 && agrees(byIdx)) { hit = byIdx; how = "px"; }
+      if (!hit) {
+        let best = null;
+        for (const r of rows) {
+          if (!agrees(r)) continue;
+          const d = dist(r);
+          if (d > 1.0) continue;
+          if (!best || d < dist(best)) best = r;
+        }
+        if (best) { hit = best; how = "near"; }
+      }
+      if (!hit) { out.push({ tag: p.tag, missing: true, i: p.i, P: p.P, N: p.N }); continue; }
+      out.push({
+        tag: p.tag, i: hit.i, P: hit.P, N: hit.N, E: hit.E, Eb: hit.Eb,
+        ao: hit.ao, aoRaw: hit.aoRaw, how, drift: +dist(hit).toFixed(3),
+        // ⭐ THE REFERENCE'S SEED IS THE PIN'S, NOT THE PIXEL'S. Same 128
+        // cosine directions every run, so `E_ref` is a constant of the pin and
+        // any move in the ratio is GI2's.
+        seed: p.i,
+      });
+    }
+    return {
+      pts: out, valid: rows.length, total: W * H, census, pinned: true,
+      counts: { wall: wall.length, soff: soff.length, pave: pave.length },
+      colSpan: 0, cam: [eng.camera.position.x, eng.camera.position.y, eng.camera.position.z],
+    };
+  }
+
   const tag = (list, pre) => list.map((r, k) => ({ ...r, tag: `${pre}${k + 1}` }));
   const pts = [
     ...tag(facade, "FAC"),
@@ -648,15 +735,15 @@ const pickPoints = () => page.evaluate(async () => {
   for (const p of pts) {
     if (seen.has(p.i)) continue;
     seen.add(p.i);
-    out.push({ tag: p.tag, i: p.i, P: p.P, N: p.N, E: p.E, Eb: p.Eb, ao: p.ao, aoRaw: p.aoRaw });
+    out.push({ tag: p.tag, i: p.i, P: p.P, N: p.N, E: p.E, Eb: p.Eb, ao: p.ao, aoRaw: p.aoRaw, seed: p.i, how: "auto", drift: 0 });
   }
   return {
-    pts: out, valid: rows.length, total: W * H,
+    pts: out, valid: rows.length, total: W * H, census, pinned: false,
     counts: { wall: wall.length, soff: soff.length, pave: pave.length },
     colSpan: bestCol ? +bestCol.span.toFixed(2) : 0,
     cam: [eng.camera.position.x, eng.camera.position.y, eng.camera.position.z],
   };
-});
+}, { pins });
 
 // ════════════════════════════════ THE WORLD PROBE THAT COVERS ONE SAMPLE POINT
 //
@@ -699,14 +786,22 @@ const probeAt = (pts) => page.evaluate(async ({ pts }) => {
   const slotOf = (x, y, z) => ((x & (C - 1)) >>> 0) | (((y & (C - 1)) >>> 0) << CB)
     | (((z & (C - 1)) >>> 0) << (2 * CB));
   const inLat = (o, x, y, z) => [x - o[0], y - o[1], z - o[2]].every((v) => v >= 0 && v < C);
-  const shEval = (L, n) => {
+  // ⭐⭐ §AF.6 — THE CLAMP IS A COLUMN NOW, NOT A SUSPICION.
+  // `shEvalRaw` is the shader's arithmetic WITHOUT its terminal `.max(vec3(0))`;
+  // `shDC` is the band-0 term alone (`L0 · 0.886227`), which is π-normalised
+  // irradiance from a uniform sphere and can only be negative if a coefficient
+  // is. Print all three and the diagnosis is arithmetic, not inference: DC > 0
+  // with raw < 0 IS the ringing, and `E = 0` beside `DC > 0` is the cliff.
+  const shEvalRaw = (L, n) => {
     const c1 = 0.429043, c2 = 0.511664, c3 = 0.743125, c4 = 0.886227, c5 = 0.247708;
-    return [0, 1, 2].map((k) => Math.max(0,
+    return [0, 1, 2].map((k) =>
       L[8][k] * c1 * (n[0] * n[0] - n[1] * n[1]) + L[6][k] * c3 * n[2] * n[2]
       + L[0][k] * c4 - L[6][k] * c5 + L[4][k] * 2 * c1 * n[0] * n[1]
       + L[7][k] * 2 * c1 * n[0] * n[2] + L[5][k] * 2 * c1 * n[1] * n[2]
-      + L[3][k] * 2 * c2 * n[0] + L[1][k] * 2 * c2 * n[1] + L[2][k] * 2 * c2 * n[2]));
+      + L[3][k] * 2 * c2 * n[0] + L[1][k] * 2 * c2 * n[1] + L[2][k] * 2 * c2 * n[2]);
   };
+  const shEval = (L, n) => shEvalRaw(L, n).map((v) => Math.max(0, v));
+  const shDC = (L) => [0, 1, 2].map((k) => L[0][k] * 0.886227);
   const liveOf = (cc) => list[cc * LW + 2 * CELLS + w.blocks];
 
   const out = [];
@@ -759,9 +854,17 @@ const probeAt = (pts) => page.evaluate(async ({ pts }) => {
           Lc[i][0] += info[o] * tri; Lc[i][1] += info[o + 1] * tri; Lc[i][2] += info[o + 2] * tri;
         }
       }
-      const Ecc = cov > 1e-5
-        ? shEval(Lc.map((v) => v.map((x) => x / cov)), N) : [0, 0, 0];
-      perCasc.push({ cov: +cov.toFixed(3), E: +(0.2126 * Ecc[0] + 0.7152 * Ecc[1] + 0.0722 * Ecc[2]).toFixed(3) });
+      const Ln = Lc.map((v) => v.map((x) => x / Math.max(1e-9, cov)));
+      const Ecc = cov > 1e-5 ? shEval(Ln, N) : [0, 0, 0];
+      const Erw = cov > 1e-5 ? shEvalRaw(Ln, N) : [0, 0, 0];
+      const Edc = cov > 1e-5 ? shDC(Ln) : [0, 0, 0];
+      const lu = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+      perCasc.push({
+        cov: +cov.toFixed(3), E: +lu(Ecc).toFixed(3),
+        Eraw: +lu(Erw).toFixed(3), Edc: +lu(Edc).toFixed(3),
+        // how many of the three channels the clamp actually bit
+        clamped: [0, 1, 2].filter((k) => Erw[k] < 0).length,
+      });
       if (best && !pick) pick = best;
     }
     if (!pick) { out.push({ tag: pt.tag, probe: null, perCasc, live: liveOf(0) }); continue; }
@@ -825,7 +928,7 @@ const probeAt = (pts) => page.evaluate(async ({ pts }) => {
         Vprobe: +(wSky / Math.PI).toFixed(4),
         Vcov: +(wAll / Math.PI).toFixed(4),
         Eoct, Esky, Ehit,
-        Esh: shEval(SH, N),
+        Esh: shEval(SH, N), EshRaw: shEvalRaw(SH, N), EshDc: shDC(SH),
         meanHitDist: dN ? +(dSum / dN).toFixed(2) : 0,
         maxRad: +maxRad.toFixed(4),
       },
@@ -890,10 +993,30 @@ for (const [key, mk, label] of [["a", poseStreet, "STREET OVERVIEW"], ["b", pose
   }
   console.log(`  field alive: ${health.shNz} non-zero SH samples, ${health.octNz} non-zero oct words`);
 
-  const sel = await pickPoints();
+  const sel = await pickPoints(PIN_ON ? (PINS[key]?.pts ?? null) : null);
   console.log(`  gbuffer ${sel.valid}/${sel.total} valid — wall ${sel.counts.wall}, ` +
-    `soffit ${sel.counts.soff}, pavement ${sel.counts.pave}; façade column span ${sel.colSpan} m`);
-  console.log(`  ${sel.pts.length} sample points`);
+    `soffit ${sel.counts.soff}, pavement ${sel.counts.pave}` +
+    (sel.pinned ? "" : `; façade column span ${sel.colSpan} m`));
+  const miss = sel.pts.filter((p) => p.missing);
+  const nearN = sel.pts.filter((p) => p.how === "near");
+  console.log(`  ${sel.pts.length} sample points ${sel.pinned ? "(PINNED)" : "(self-picked — NOT comparable across runs)"}` +
+    (sel.pinned ? ` — ${sel.pts.length - miss.length - nearN.length} by pixel, ${nearN.length} by nearest ` +
+      `(max drift ${f(Math.max(0, ...nearN.map((p) => p.drift)), 3)} m), ${miss.length} MISSING` +
+      (miss.length ? `: ${miss.map((p) => p.tag).join(" ")}` : "") : ""));
+  console.log(`  zero census: ${sel.census.zeros} of ${sel.census.valid} valid gbuffer pixels read ` +
+    `E_gi2 < 1e-4 (${f(100 * sel.census.zeros / Math.max(1, sel.census.valid), 2)} %), ` +
+    `${sel.census.zerosPreAlso} of them zero BEFORE ao`);
+  if (PIN_EMIT) {
+    console.log("  ── PIN_EMIT ──");
+    console.log(JSON.stringify({
+      pose: { position: pose.position, target: pose.target },
+      pts: sel.pts.filter((p) => !p.missing).map((p) => ({
+        tag: p.tag, i: p.i,
+        P: p.P.map((v) => +v.toFixed(3)), N: p.N.map((v) => +v.toFixed(4)),
+      })),
+    }));
+  }
+  sel.pts = sel.pts.filter((p) => !p.missing);
 
   const dec = await probeAt(sel.pts);
   if (dec) {
@@ -908,7 +1031,7 @@ for (const [key, mk, label] of [["a", poseStreet, "STREET OVERVIEW"], ["b", pose
   const t0 = Date.now();
   for (const p of sel.pts) {
     const r = await page.evaluate(({ P, N, n, m, b, s }) => globalThis.__gi2Ref(P, N, n, m, b, s),
-      { P: p.P, N: p.N, n: NSPP, m: MSPP, b: BOUNCE, s: (p.i * 2654435761) >>> 0 });
+      { P: p.P, N: p.N, n: NSPP, m: MSPP, b: BOUNCE, s: ((p.seed ?? p.i) * 2654435761) >>> 0 });
     refs.push(r);
   }
   console.log(`  reference traced in ${((Date.now() - t0) / 1000).toFixed(1)} s\n`);
@@ -931,6 +1054,7 @@ for (const [key, mk, label] of [["a", poseStreet, "STREET OVERVIEW"], ["b", pose
       Eskyp: pr ? lum(pr.Esky) : null, Ehitp: pr ? lum(pr.Ehit) : null,
       Eoct: pr ? lum(pr.Eoct) : null, Esh: pr ? lum(pr.Esh) : null,
       nHas: pr?.nHas ?? null, nT: pr?.nT ?? null, nSky: pr?.nSky ?? null,
+      EshRaw: pr ? lum(pr.EshRaw) : null, EshDc: pr ? lum(pr.EshDc) : null,
       state: pr?.state ?? null, ready: pr?.ready ?? null, faced: pr?.faced ?? null,
       probePos: pr?.pos ?? null, probeDist: pr?.dist ?? null, spacing: pr?.spacing ?? null,
     });
@@ -952,21 +1076,52 @@ for (const [key, mk, label] of [["a", poseStreet, "STREET OVERVIEW"], ["b", pose
   const errs = rows.map((r) => Math.abs(r.ratio - 1));
   console.log(`\n  median |ratio−1| over ${rows.length} points: ${f(med(errs), 3)}   ` +
     `outside [0.7, 1.4]: ${rows.filter((r) => r.ratio < 0.7 || r.ratio > 1.4).length}`);
+  // ⭐ THE SIGNAL SET. A ratio is a quotient, and pose A's FAC3 divides
+  // `E_gi2 = 0.058` by a path-traced `E_ref = 0.0005` to announce a 108×
+  // error over six hundredths of a nit. Points whose truth is below `SIG`
+  // cannot rank an estimator — they are printed and counted, and kept OUT of
+  // the headline so the headline is about the places the picture is made of.
+  const SIG = 0.02;
+  const sig = rows.filter((r) => lum(r.Eref) > SIG);
+  const sigErr = sig.map((r) => Math.abs(r.ratio - 1));
+  const sigLog = sig.reduce((a, r) => a + Math.abs(Math.log(Math.max(1e-6, r.ratio))), 0)
+    / Math.max(1, sig.length);
+  console.log(`  ⭐ SIGNAL SET (E_ref > ${SIG}): ${sig.length} points, median |ratio−1| ` +
+    `${f(med(sigErr), 3)}   outside [0.7, 1.4]: ` +
+    `${sig.filter((r) => r.ratio < 0.7 || r.ratio > 1.4).length}   ` +
+    `mean |log ratio| ${f(sigLog, 3)}`);
+  // ══ THE FAÇADE COLUMN, AS A NAMED PROFILE ══════════════════════════════
+  //
+  // FAC1..FAC6 are one wall, top to bottom, and they are the headline: a
+  // street of height/width ≈ 2 MUST darken toward its base. `fall` is the
+  // profile's single number — top ÷ bottom — and it is printed for the truth
+  // and for GI2 side by side, with the ratio between them (`flatness`, 1.0 =
+  // GI2 reproduces the fall, > 1 = GI2 is flatter than the world).
   if (fac.length >= 2) {
     const top = fac[0]; const bot = fac[fac.length - 1];
-    const fall = (v) => f(lum(v.Eref) / Math.max(1e-6, lum(bot.Eref)), 2);
-    console.log(`  ── the façade profile (${f(top.P[1], 1)} m → ${f(bot.P[1], 1)} m) ─────────────`);
-    console.log(`     E_ref  top/bottom  ${f(lum(top.Eref) / Math.max(1e-6, lum(bot.Eref)), 2)}×   ` +
-      `(V_ref ${f(top.Vref, 2)} → ${f(bot.Vref, 2)})`);
-    console.log(`     E_gi2  top/bottom  ${f(lum(top.Egi2) / Math.max(1e-6, lum(bot.Egi2)), 2)}×   ` +
-      `(V_probe ${top.Vprobe === null ? "—" : f(top.Vprobe, 2)} → ` +
-      `${bot.Vprobe === null ? "—" : f(bot.Vprobe, 2)})`);
+    const fallRef = lum(top.Eref) / Math.max(1e-6, lum(bot.Eref));
+    const fallGi2 = lum(top.Egi2) / Math.max(1e-6, lum(bot.Egi2));
+    console.log(`  ── PROFILE façade-column (${f(top.P[1], 1)} m → ${f(bot.P[1], 1)} m, ` +
+      `${fac.length} points) ────────`);
+    console.log("     step   world-Y   E_ref    E_gi2   ratio   V_ref V_prb   casc  d_probe");
+    for (const r of fac) {
+      console.log(`     ${r.tag.padEnd(5)} ${f(r.P[1], 2).padStart(7)} ${f(lum(r.Eref), 4).padStart(8)} ` +
+        `${f(lum(r.Egi2), 4).padStart(8)} ${f(r.ratio, 2).padStart(6)}  ` +
+        `${f(r.Vref, 2).padStart(6)} ${(r.Vprobe === null ? "—" : f(r.Vprobe, 2)).padStart(5)}   ` +
+        `${r.cc === null ? "—" : `c${r.cc}`}    ${r.probeDist === null ? "—" : f(r.probeDist, 2)}`);
+    }
     const sk = fac.filter((r) => r.Eskyp !== null);
     if (sk.length >= 2) {
       console.log(`     sky term  top/bottom ${f(sk[0].Eskyp / Math.max(1e-6, sk[sk.length - 1].Eskyp), 2)}×` +
         `   hit term  top/bottom ${f(sk[0].Ehitp / Math.max(1e-6, sk[sk.length - 1].Ehitp), 2)}×`);
     }
-    console.log(`     fall used ${fall(top)} — flat is 1.0×, physical is 2-3×`);
+    console.log(`     FAÇADE FALL  truth ${f(fallRef, 2)}×   GI2 ${f(fallGi2, 2)}×   ` +
+      `flatness ${f(fallRef / Math.max(1e-6, fallGi2), 2)}× (1.0 = matched)`);
+    const dp = fac.filter((r) => r.probeDist !== null).map((r) => r.probeDist);
+    if (dp.length) {
+      console.log(`     answering probe distance: median ${f(med(dp), 2)} m  max ${f(Math.max(...dp), 2)} m  ` +
+        `(cascades ${fac.map((r) => (r.cc === null ? "—" : r.cc)).join("")})`);
+    }
   }
   const withV = rows.filter((r) => r.Vprobe !== null);
   if (withV.length) {
@@ -978,6 +1133,40 @@ for (const [key, mk, label] of [["a", poseStreet, "STREET OVERVIEW"], ["b", pose
     const hi = withV.filter((r) => r.Vprobe > r.Vref + 0.15);
     console.log(`     points where the probe over-credits sky by > 0.15: ${hi.length}/${withV.length}` +
       (hi.length ? `  — ${hi.slice(0, 6).map((r) => r.tag).join(" ")}` : ""));
+  }
+  // ══ §AF.6 — THE CLAMP CENSUS ═══════════════════════════════════════════
+  //
+  // `shEval` ends in `.max(vec3(0))`. A truncated SH2 reconstructed on a
+  // hemisphere with hard occluders RINGS: the band-1/2 terms overshoot
+  // negative and the clamp turns a smoothly-varying small negative into a
+  // FLAT ZERO that neighbouring pixels straddle. The question is not whether
+  // the clamp fires — it is whether it fires where the DC term (the mean
+  // radiance over the whole sphere, which cannot be negative for a physical
+  // probe) is POSITIVE. That is a reconstruction fault, not a dark scene.
+  {
+    const cs = [];
+    for (const r of rows) {
+      for (const c of (r.perCasc ?? [])) {
+        if (!(c.cov > 1e-5)) continue;
+        cs.push({ tag: r.tag, ...c });
+      }
+    }
+    const bit = cs.filter((c) => c.clamped > 0);
+    const ring = bit.filter((c) => c.Edc > 1e-4);
+    console.log(`  ── the SH clamp (§AF.6) ─────────────────────────────────────`);
+    console.log(`     covered (cascade, point) pairs ${cs.length}; the clamp bites at least one ` +
+      `channel in ${bit.length} (${f(100 * bit.length / Math.max(1, cs.length), 1)} %)`);
+    console.log(`     of those, DC > 0 — i.e. RINGING, not darkness: ${ring.length}` +
+      (ring.length ? `  — ${ring.slice(0, 8).map((c) => c.tag).join(" ")}` : ""));
+    const zr = rows.filter((r) => lum(r.Egi2) < 1e-4 && lum(r.Eref) > 0.05);
+    console.log(`     ⛔ GATE — pixels at 0 where E_ref > 0.05: ${zr.length}` +
+      (zr.length ? `  — ${zr.map((r) => r.tag).join(" ")}` : "  (pass)"));
+    for (const r of zr) {
+      const fin = (r.perCasc ?? []).find((c) => c.cov > 1e-5);
+      console.log(`        ${r.tag}: E_ref ${f(lum(r.Eref), 4)}  E_pre ${f(lum(r.Epre), 5)}  ` +
+        `ao ${f(r.ao, 3)}  probe SH: E ${f(r.Esh, 4)} raw ${f(r.EshRaw, 4)} DC ${f(r.EshDc, 4)}` +
+        (fin ? `  | finest covered cascade: E ${f(fin.E, 4)} raw ${f(fin.Eraw, 4)} DC ${f(fin.Edc, 4)} (${fin.clamped} ch clamped)` : ""));
+    }
   }
   const dead = rows.filter((r) => r.nHas === null || r.nHas === 0 || lum(r.Egi2) < 1e-4);
   if (dead.length) {

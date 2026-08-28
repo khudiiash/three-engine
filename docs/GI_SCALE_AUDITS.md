@@ -4364,3 +4364,437 @@ files in `src/modules/gi/window/` (`windowStore` +108 lines, `windowFill`,
 HEAD arm of the perf comparison are therefore not guaranteed to differ only by
 4.9. Every number in this section that is a CROSS-ARM SUBTRACTION inside one
 battery still holds; the two perf baselines are the ones to re-take.
+
+## §AG — A THIN VOXEL IS NOT A WALL: THE COVERAGE CLASS (08-28)
+
+⭐⭐ **THE VERDICT: occupancy was one bit, so a 2 cm cable and a 20 cm wall were
+the same object to the DDA. Each voxel now also carries HOW MUCH OF ITS OWN
+CROSS-SECTION its surfaces fill, in 2 bits, and a ray entering a voxel below the
+opaque class is DIMMED rather than stopped.**
+
+### AG.1 The evidence
+
+User, Bistro terrace, 08-28 12:40, the `occupancy` and `sdf` debug views:
+
+* in `occupancy` the balcony ironwork, the railings and the string-light cables
+  are OPAQUE BLACK 0.25 m blocks;
+* in `sdf` **a continuous slab crosses the whole street at cable height** — the
+  string lights (cables + bulbs) have voxelized into a ceiling over the street.
+
+Everything below it loses most of its sky, so the indirect reads flat and dull
+and the bounce comes back black. `probe:gi2-faceterm` had already refuted the
+obvious alternative: not one of four sky rays was missing from the §AC canyon
+wall, so the sky term was not being dropped downstream — it was never collected,
+because the geometry above the street was opaque.
+
+⛔ **AND THE DUST CULL CANNOT REACH IT.** `dustLimits` drops triangles whose
+largest AABB extent is under a quarter cell. A cable's triangles are LONG and
+thin: 40 m of cable is metres of extent at every level, so every one of them
+takes the full SAT path and sets an occupancy bit that stops rays outright.
+
+### AG.2 The format
+
+The 2 B/voxel budget was occ bit + 6 face bits (+ bits 6-7 dominant axis, §Q.1)
++ palette byte. The palette carries 64 classes in 6 bits, so bits 6-7 of that
+byte were free — and were NOT used.
+
+⛔ **THE PALETTE'S SPARE BITS WERE REFUSED, AND THE REASON IS A READER, NOT A
+BIT.** `gatherProbes.palIndexAt` resolves a stale or unvoxelized byte with
+`min(p, PAL_ENTRIES - 1)`. A class-1 voxel of palette 5 arrives as
+`0b01_000101` = 69, clamps to 63, and reads as the RESERVED "no surface" class —
+**every thin voxel in the scene black at a stroke**. `bitAnd(p, 63)` fixes it and
+is one line; it is also one line in a file another agent was editing that hour,
+and a merge that drops it fails silently and globally. So the classes got a
+region of their own: `COV_OFF`, 2 bits per voxel, 16 voxels to a word, 64 KB per
+level slot. A level slot went 576.5 KB to 640.5 KB and the ultra window
+3.94 to 4.38 MB (+11 %), for a region nothing else reads and no coordination at
+all.
+
+    class 0  < 12 %   a cable, a wire, a thin railing bar        6 % blocked
+    class 1  < 35 %   ironwork, sparse foliage, trim            24 % blocked
+    class 2  < 70 %   dense foliage, a lattice                  50 % blocked
+    class 3  >= 70 %  A SURFACE. Opaque, and the DDA stops.    100 % blocked
+
+### AG.3 The estimator, and the form of it that was wrong
+
+Coverage is the sum, over the triangles reaching a voxel, of the area they
+present INSIDE it, projected on each triangle's dominant normal axis, over the
+voxel's cross-section. In VOXEL SPACE the divisor is 1 and the whole thing is a
+2D area in [0, 1].
+
+⛔ **THE FIRST FORM WAS "AABB OVERLAP × THE TRIANGLE'S FILL RATIO (A2/B2)", AND
+IT WOULD HAVE MADE EVERY PLAIN WALL IN THE SCENE 50 % TRANSPARENT.** A wall quad
+is two triangles, each filling HALF its own bounding box; a voxel in the middle
+of one of them — which that triangle covers 100 % of — scores 1 × 0.5 = class 2.
+**A fill RATIO is a global average and the question is LOCAL.** Caught by
+`test:gi2-coverage` before a single GPU dispatch, which is the argument for
+having a CPU mirror of a nine-float function at all.
+
+The estimator that ships SAMPLES: a fixed 4 × 4 grid over the voxel's
+cross-section, point-in-triangle at each (deterministic per §T — a fixed
+pattern, no jitter, no frame index), with the AABB × fill form kept as a FLOOR
+under it for the one case sampling cannot see: a sliver thinner than a sixteenth
+of a cell that misses every sample point but is really there. `max` of the two,
+because each is right where the other is blind — and a hundred leaves in one
+coarse voxel then still sum to opaque.
+
+`test:gi2-coverage` (CPU, no GPU, 27 checks) pins the cases:
+
+| case | coverage | class |
+|---|---|---|
+| wall quad interior, v = 0.25 … 4 m | 1.000 at every level | 3 |
+| one triangle of that quad, off the diagonal | 1.000 (a fill ratio says 0.5) | 3 |
+| 2 cm cable, v = 0.25 / 1 / 4 m | 0.080 / 0.020 / 0.005 | 0 |
+| 3 cm bar at 45° (its AABB fills the voxel) | 0.258 | 1 |
+| one 18 cm leaf in a 1 m cell | 0.125 | 0-1 |
+| forty of them | 1.000 | 3 |
+
+⚠ A DEGENERATE PROJECTION COVERS EVERYTHING unless it is guarded: three
+collinear points make all three edge functions identically 0, every sample tests
+`>= 0` and passes, and the naive estimator returns **1.0 for a zero-area
+triangle**. Guarded in both the kernel and the mirror.
+
+### AG.4 Three reductions, three words
+
+The pal scratch resolves by `atomicMax` over a tag, the §Q.1 axis vote by
+`atomicMax` over a weight, and coverage by **`atomicAdd`** — because coverage is
+a SUM (thirty leaves in a coarse cell are opaque together and transparent apart)
+and packing an addend into the free high bits of a max-resolved word would let a
+carry re-order the max. 1 MB of scratch at ultra, cleared by the frame's own
+reset.
+
+⚠ **AND THE SUM IS PER-FRAME, SO A RESUMED BRICK RECOVERS THROUGH `COV_REPR`.**
+A brick too big for one budget is built over several instalments; the pack folds
+this frame's sum onto what the stored class already means —
+`class(sum + COV_REPR[stored])` — using the class's MIDPOINT rather than its
+lower edge, so the recovery errs toward OPAQUE (the safe direction for the wall
+invariant) while class 0 stays a fixed point for anything genuinely thin. This is
+the one region that is deliberately NOT bit-identical across instalments;
+`probe:gi2-voxelize`'s carry-over receipt hashes occ, face and pal, and every
+cursor/cell sweep still reports **0 occ bits differ, 0 pal words differ**.
+
+⚠ The class word is ONE BYTE of a word FOUR BRICKS share along x. `vi` is a
+multiple of 4 at the start of every brick row, so brick `bx` owns bits
+`[(bx&3)*8, +8)` and an `atomicAnd` of the complement followed by an `atomicOr`
+of the new byte touches only bits that thread owns — no CAS, no race with the
+neighbouring brick's lane.
+
+Dust carries coverage too, and it is the cheapest term in the file: a dust
+triangle lies wholly inside its centroid's voxel, so there is nothing to clip,
+and `area * |n_a|` is `|(e1 x e2)_a| / 2` — the largest component of the raw
+cross product, halved. That is what makes a canopy occlude in AGGREGATE without
+making one leaf a wall.
+
+### AG.5 The DDA, and where the throughput rides
+
+One branch: a voxel of class < 3 that the entry-face test would have stopped the
+ray at instead multiplies the ray's throughput by `1 - COV_ATTEN[class]` and the
+DDA CONTINUES. The hit reported is the first class-3 voxel; `THROUGHPUT_MIN`
+(0.05) is a backstop so a ray travelling ALONG a cable, or through a hedge,
+eventually reports a hit rather than "nothing there".
+
+⚠ The coverage read sits beside the FACE read, one level shallower than the
+branch that needs it. `fStatic` is the existing proof that a buffer read at that
+nesting is safe; one level deeper is a conditional read, which is the idiom that
+rendered the BVH mirror pass black — and the saving would have been a fetch on
+the 5 % of Bistro's façade voxels whose face test fails.
+
+⚠ THE DYNAMIC LAYER IS NOT READ. A mover is solid by decree, so `occDyn` forces
+class 3 without a second fetch. `windowDynamic` writes class 3 anyway, so the
+debug view draws a mover as the solid it is.
+
+⭐ **THE THROUGHPUT RIDES IN `w`'s FRACTION.** `packed` has no spare bit (all 24
+are spoken for and the f32 round-trip depends on it), `hit` is compared against
+0.5 by every caller and `t` is a distance — so the one component with room is the
+STEP COUNT, whose integer part is all anyone ever wanted. `w = used +
+round(T*255)/256` keeps `floor(w)` exactly the old step count for the two
+receipts in `gatherProbes` that read `raw.w` directly, and hands the wrapper
+eight bits of throughput for free. **Every old call site of `traceWindow`
+compiles and behaves unchanged; `.throughput` is a new field, and it is 1
+wherever nothing thin was crossed.**
+
+▶ **OPEN, AND OWNED BY THE GATHER:** `gatherProbes` / `worldProbes` do not yet
+weight a hit's radiance by `T` and credit `1 - T` to the thin voxel. Until they
+do, §AG's benefit is the HIT ITSELF being right (a ray no longer stops at a
+cable) and not yet the soft transmission through it.
+
+### AG.6 The receipts (08-28, `gi19-stage0`)
+
+`probe:gi2-trace` — **the wall invariant is untouched**, and the throughput path
+is free on an all-opaque scene:
+
+| tier | rays/s (gpu) | leaks | control | steps/ray | trace kernel |
+|---|---|---|---|---|---|
+| phone | 926.5 M/s | **0/10 000** | 100 % | 11.01 | 17.9 kB |
+| high | 1001.3 M/s | **0/10 000** | 100 % | 8.10 | 19.0 kB |
+| ultra | 1190.0 M/s | **0/10 000** | 100 % | 8.11 | 20.2 kB |
+
+at or above §K's recorded ~1 G rays/s, 3 storage buffers (envelope 6), scene-free.
+
+`probe:gi2-voxelize` — PASS at all three tiers, including **0/10 000 leaks
+through the 5 cm wall the SAT actually voxelized** (control 100 %), the palette
+scratch at 0 illegal bytes against the naive `atomicMax`'s 11 137, every
+resumption and cell-cursor sweep bit-identical in occ AND pal, and the
+voxelizer's WGSL still scene-free.
+
+⚠ **BOTH SCENE-INDEPENDENCE GUARDS HAD TO BE TAUGHT, AND ONE OF THEM COLLIDED.**
+`COV_ATTEN`, `THROUGHPUT_MIN`, `COV_FIX` and the sample-grid offsets are
+algorithm constants, invariant across every scene, and satisfy the
+cache-stability claim exactly as `v0 * 2^l` does — they are now read FROM THE
+STORE into the allowlist rather than typed, so a change to the table cannot
+silently widen it. And `THROUGHPUT_MIN` is 0.05 while the analytic Cornell
+room's walls are 5 cm: the belt-and-braces scene-number grep fired on a number
+the tracer is entitled to carry. The allowlist is the authority; the grep now
+only catches what the allowlist has no account of, and says out loud which
+numbers it excused. **Nudging the constant to please the test would have been
+tuning an algorithm to a receipt.**
+
+`probe:gi2-sky` (NEW — Bistro, one boot, two arms, `setCoverage` + a fixed
+512-direction Fibonacci hemisphere from a DERIVED pavement point):
+
+    coverage census, ON : 88 739 occupied voxels — class 0 1.9 %, 1 3.5 %, 2 5.2 %, 3 89.4 %
+      L0 1.7/4.0/5.6/88.7   L1 1.6/3.2/5.2/90.0   L2 2.1/3.3/5.0/89.6
+      L3 2.6/3.6/5.0/88.8   L4 4.2/4.9/6.0/84.9
+    coverage census, OFF: 99.9 % class 3   (the arm check — see below)
+
+    arm            sky reach   mean T   rays dimmed
+    coverage OFF       12.7 %    1.000        0.0 %
+    coverage ON        13.3 %    0.871       29.9 %
+
+**10.6 % of Bistro's voxels are no longer walls**, at every level (the coarse
+levels most of all, which is where the far field is made). **30 % of the upward
+rays from the pavement now cross thin geometry instead of dying in it**, arriving
+with 87 % of themselves. Sky reach itself rises only 1.05x, and that is the
+honest number: most of those rays still end on a façade, and the remaining gain
+is in the RADIANCE the gather will collect once it weights by `T` (AG.5).
+
+⚠⚠ **TWO OBSERVABLES WERE BLIND BEFORE THE THIRD ONE WORKED, AND BOTH READ AS
+FAILURES OF THE THING UNDER TEST.**
+
+1. `createGi2RayShooter`'s first dispatch writes NOTHING — a fresh compute node
+   has no pipeline, `computeAsync` compiles it and returns having dispatched
+   nothing, and the output buffer reads back as the zeros it was allocated with.
+   This probe's first run reported **"no ground under the camera — the window is
+   empty here"** about a Bistro that logged 191 871 live window hits in the same
+   second. Probes that fire many batches never noticed, because only their first
+   batch was junk. The warm-up is now written against an OBSERVABLE (`steps > 0`
+   on a real ray) rather than against a belief about how many dispatches suffice.
+2. Whether `markAllDirty` landed was then asked of the voxelizer's per-frame
+   `dirty` counter (zeroed at the top of every frame) and of the BRICK TABLE
+   (back to all-BUILT once the rebuild finishes). A Bistro re-voxelize completes
+   between two 700 ms polls, so **"never landed" and "landed and finished" are
+   the same reading** on both. The COVERAGE FIELD is not per-frame and does not
+   settle back: with the classes off every occupied voxel is 3, and any voxel
+   below 3 is proof the flip did not take. That is the arm check now, and it is
+   also the census above. [[probe-blind-statistics]].
+
+### AG.7 What is on the debug view
+
+The occupancy view stipples thin geometry with a 4 x 4 ordered Bayer dither at
+density `1 - T`, tinted cyan.
+
+⭐⭐ **AND IT HAD TO BE DRAWN FROM THE THROUGHPUT, NOT FROM THE HIT.** Before
+§AG a cable STOPPED the camera ray, which is why the view drew it as a black
+wall — the picture the user reported. Now the ray walks through it, so the cable
+is not the hit any more, and a view that shaded only the hit voxel would show
+the wall BEHIND the cable and no cable at all: **the bug fixed and the geometry
+invisible, which is a worse instrument than the wrong one.** `1 - T` is exactly
+"how much of this pixel's ray the thin stuff took", so a cable reads as a thin
+cyan line over the façade behind it and a MISCLASSIFIED wall reads as a solid
+cyan wall — the two failures are one glance apart.
+
+## §AH — THE PINNED RECEIPT, THE CLAMP THAT WAS NOT THE CAUSE, AND THE ×2 SCHEDULE (08-28)
+
+**The brief** (three linked fixes): pin `probe:gi2-ref`'s sample points so it can
+arbitrate anything; run §AF.6's one-channel measurement and fix `shEval`'s
+`.max(0)` at the mechanism; and extend fine coverage so a façade 40 m out is not
+answered by the 8 m cascade from a probe standing in open air.
+
+### AH.1 — the instrument first, because §AF.7 said it could not be trusted
+
+`probe:gi2-ref` re-picked its 19–20 points from each boot's own frame — and two
+of its six populations (`DARK*`, `WDRK*`) are *ranked by `E_gi2` luminance*, so
+they were by construction whatever that boot's field happened to be worst at.
+Four runs of one tree read pose A at 0.733 / 0.863 / 0.905 / 1.000. ⭐⭐ **A
+receipt whose sample is drawn from the quantity under test cannot arbitrate a
+change to it.** [[probe-blind-statistics]]
+
+So the points are chosen ONCE and written to `scripts/gi2-ref-pins.json`: both
+poses (eye/target) plus, per point, the dump pixel index, the world position and
+the normal — 20 for pose A, 19 for pose B. At run time each pin resolves against
+the fresh dump **by pixel first, by nearest world position as the fallback**, and
+the drift is printed; a pin that cannot be found is a loud row. `PIN=0` restores
+self-picking (how a new set is chosen), `PIN_EMIT=1` prints a paste-ready block.
+⭐ The reference's 128 cosine directions are seeded from the PIN, not the pixel,
+so `E_ref` is a constant of the point and every move in the ratio is GI2's.
+
+Three columns joined it, all deterministic:
+
+- **the façade column as a named PROFILE.** FAC1..FAC6 top-to-bottom with each
+  step's `E_ref`, `E_gi2`, `V_ref`, `V_probe`, answering cascade and probe
+  distance, and one headline: `FAÇADE FALL truth X× / GI2 Y× / flatness X/Y`.
+- **the ZERO CENSUS over the whole dump**, not over the pins — how many of the
+  112 464 valid gbuffer pixels read `E_gi2 < 1e-4`, and how many were already
+  zero BEFORE the AO multiply. A fix that lifts 24 pins and blacks out a thousand
+  other pixels would otherwise read as a win.
+- **the SIGNAL SET.** A ratio is a quotient, and pose A's FAC3 divides
+  `E_gi2 = 0.058` by a path-traced `E_ref = 0.0005` to announce a **108× error
+  over six hundredths of a nit**. The headline median is now over the points with
+  `E_ref > 0.02`; the rest are printed and counted, never ranked.
+
+### AH.2 — §AF.6's suspect: CONFIRMED as a mechanism, REFUTED as the cause
+
+The one-channel measurement §AF.6 asked for is a column now: `shEvalRaw` (the
+shader's arithmetic without its terminal `max(0)`) and `shDC` (`L0 · 0.886227`,
+the band-0 term, which cannot be negative for a physical probe) beside `E`, for
+the picked probe AND for every cascade's own trilinear blend.
+
+| | pose A | pose B |
+|---|---|---|
+| covered (cascade, point) pairs | 45 | 29 |
+| …where the clamp bites ≥ 1 channel | **0 (0.0 %)** | **3 (10.3 %)** |
+| …of those, with `DC > 0` — i.e. RINGING | **0** | **3** (DARK1/2/3) |
+| pixels at 0 where `E_ref > 0.05` | **0** | **2** (DARK2, DARK3) |
+
+And the two rows that settle it:
+
+```
+DARK2  E_ref 0.6368  E_gi2 0.00000   probe SH: E 0.4457 raw 0.4457 DC 0.7672  (0 ch clamped)
+DARK3  E_ref 0.5628  E_gi2 0.00000   probe SH: E 0.0000 raw −0.0256 DC 0.2379 (3 ch clamped)
+```
+
+⛔⛔ **REMOVING THE CLAMP RECOVERS NOTHING.** At DARK3 the unclamped value is
+**−0.026 against a path-traced 0.563** — the reconstruction is not a positive
+number being clipped, it is a *nearly-zero estimate whose sign is wrong*. At
+DARK2 the clamp never fires at the probe at all (`raw = E = 0.4457`): that pixel
+is black because the cascade that OWNS it answers zero. §AF.6's "if DC is
+positive where E is zero, the fix is a non-negative reconstruction" is satisfied
+— and the fix it points to is worth ~0.01 of the 0.56 that is missing.
+
+⭐⭐ **WHAT THE SAME TABLE NAMES INSTEAD.** DARK2 sits 31 m from the camera:
+`c0 cov 0.00 · c1 cov 0.03 · c2 cov 1.00`, and c2's own map is the band
+`[20, 256] m` — a cascade DEFERS its near band to the finer cascade whose
+LATTICE contains it (§3.15's ownership rule, `coveredBelow`, which tests lattice
+containment and not liveness). c1's lattice contains the point; c1 has almost no
+live probe there; nobody pays `[0, 20)`. The pixel is answered, at full claim, by
+a map that begins twenty metres away. **That is a schedule fault wearing a
+clamp's clothes**, and it is what AH.3 exists for.
+
+### AH.3 — what shipped, and it is ONE of the three
+
+**`shEval` ends in a C¹ non-negative reconstruction, not `max(0)`.** `DC` is the
+one term that cannot go negative (`L[0]` is a sum of radiances times
+non-negative weights), so the reconstruction is expressed as a fraction of it,
+`w = 1 + AC/DC`. At or above `SH_FLOOR = 0.05` the answer is the linear form
+BIT FOR BIT — the old arithmetic minus its clamp; below it the fraction decays
+exponentially to zero instead of stopping dead, matching value AND slope at the
+join. It can add at most 5 % of the probe's own spherical mean, anywhere in the
+frame. ⚠ The exponent is capped at 0: `w` is unbounded ABOVE and `exp` of a
+large positive is `inf`, which `mix` would multiply by a zero lane to produce
+NaN on exactly the brightest pixels. `__gi2ShClamp = 1` restores the raw
+`max(0)`. Also shipped: **`DIAG_VEC` is `1 + worldCascadeCount(tier)`**, because
+a hard 4 truncates the diag rows the moment a tier's cascade count is not 3 and
+a reader sizing itself from `diagCasc` then scores the FALLBACK row as a
+cascade.
+
+⭐⭐ **AND IT IS AN A/B IN ONE WINDOW, NOT ACROSS TWO HOURS.** `probe:gi2-ref`
+learned `FLAGS` (the hook `probe:gi2-runner` has had since 4.7), so both arms are
+two consecutive boots of ONE tree with ONE pinned point set — which is the only
+comparison this worktree can honestly make while three agents edit it.
+
+| pinned, both poses, back-to-back | A: `max(0)` | B: C¹ (shipped) |
+|---|---|---|
+| **⛔ GATE — pixels at 0 where `E_ref` > 0.05 (pose B)** | **2** (DARK2, DARK3) | **0 — PASS** |
+| zero census, pose A | 334 (0.30 %) | **128 (0.11 %)** |
+| zero census, pose B | 11 | **0** |
+| pose B signal-set mean \|log ratio\| | 2.931 | **1.249** |
+| pose B signal-set median \|ratio−1\| | 0.535 | **0.516** |
+| pose B façade fall, GI2 | 2.64× | 2.55× |
+| pose A signal-set median \|ratio−1\| | 0.100 | **0.100** |
+| pose A façade fall, GI2 | 2.88× | **2.88×** |
+
+⭐ **POSE A IS IDENTICAL TO THREE DECIMALS AND THAT IS THE RECEIPT FOR "NO-OP
+ABOVE THE JOIN"** — a street overview whose points all sit far above 5 % of
+their DC cannot tell the two arms apart, while the pocket points pose B is made
+of move by a factor of two in log error. The change is exactly as narrow as it
+was designed to be.
+
+### AH.4 — ⛔⛔ THE ×2 SCHEDULE WAS BUILT, MEASURED AND RETRACTED THE SAME HOUR
+
+Five cascades of 32³ at 0.5/1/2/4/8 m spanning 16/32/64/128/256 m — same reach,
+never coarser anywhere, up to 2× finer through 10–50 m. It **did exactly what it
+was designed to do and that turned out not to be the fault.**
+
+| pose B, pinned | ×4 over 3 (shipped) | ×2 over 5 |
+|---|---|---|
+| answering cascade, FAC1..5 | c2 (8 m) | c3 (4 m) |
+| **probe distance, façade median** | **6.18 m** | **2.42 m** |
+| **FAÇADE FALL, GI2** | **2.53×** | **2.54×** |
+| flatness (truth ÷ GI2) | 2.87× | 2.84× |
+| signal-set median \|ratio−1\| | 0.250 | 0.579 |
+| ultra chain ms | (see AH.5) | **2.875** |
+
+⭐⭐⭐ **THE ANSWERING PROBE CAME 2.6× CLOSER AND THE FALL DID NOT MOVE — 2.53×
+against 2.54× on a truth of 7.2×.** The brief's diagnosis ("a façade 40 m out is
+answered by the 8 m cascade from a probe 3.5–7 m away, therefore the flatness is
+resolution") is REFUTED by its own remedy. Flatness is not the lattice's
+spacing.
+
+And the finer schedule made the field measurably WORSE and darker — pose A's
+signal median 0.076 → 0.250, `PAVE2` 0.83× → 0.07×, `SOFF3` 0.61× → 0.14× —
+while every individual cascade's own blended answer at those points read a
+healthy 0.3–0.6. ⭐ Two mechanisms scale with the spacing and were subdivided
+along with it: **the Chebyshev variance floor is `wpVarFloor · sp`** (halving
+the spacing halves the soft band, so the anti-leak over-occludes everywhere),
+and **`DMAX = DIST_CELLS · sp`** (a finer cascade cannot even STORE a far first
+hit, reads `dist > m1`, and occludes). A ×2 schedule is not a free refinement;
+it re-scales the two numbers the anti-leak is made of.
+
+⚠ **KEPT AS AN ARM, NOT DELETED.** `__gi2Cascades` may now RAISE as well as
+lower and `__gi2Ratio` joins it; β follows `ratio` per tier (`betaOf` — interval
+growth matching spacing growth is the whole reason 64 directions per probe is
+enough), `share` is generated (`1/2^c`) when a tier does not type one, and
+`CASC_PREF` is `ratio³` rather than a literal 64. The shipped tier table is
+byte-for-byte 3.14's. One page, one battery, no second commit.
+
+▶ **OPEN, and now specific: the fall is compressed from BOTH ends.** Pose B's
+façade reads 0.52× / 0.42× of truth at mid-height (`V_probe` 0.21 against
+`V_ref` 0.44 — the probe cannot SEE the sky it should) and 2.69× at the base
+(`FAC6`, truth 0.302, GI2 0.811). Too dark where the sky is, too bright where it
+is not. That is a sky-visibility and a leak, in one column, at one wall.
+
+### AH.5 — the receipts, and the one that could not be taken
+
+Shipped tree (`shEval` C¹ + `DIAG_VEC` + the arms; tier table unchanged):
+
+- `probe:gi2-gather`: **Cornell bracketed 8/8 on phone, high AND ultra**;
+  storage buffers **6** on all three (portable envelope holds); chain ms
+  **1.936 / 2.327 / 2.804** against a limit of 4.0. ⚠ The ×2 schedule measured
+  **2.875** — the schedule costs **+0.07 ms**, not the ~1 ms its extra lattices
+  suggested; the chain is not cascade-bound.
+- 5 cm-wall leak **0/10 000** with a **92.1 % control**, all four rotations.
+- `probe:gi2-corridor`: bracketed **4/8, walls 2/4, both arms** — identical to
+  §AF.7. Unmoved.
+- `probe:gi2-doors`: recess ÷ wall irrBefore **103.5 %** (target ≈ 101.8 %).
+- `test:gi-moved-lamp` **PASS, +29.06 lum** — the same number to two decimals as
+  §AF.7. `smoke:gi-gpu` **PASS 2/2** including the phone tier
+  (`gi2.worldTrace` 6 storage buffers, 88 kB).
+- `probe:gi2-motion`: **6 gates fail**, orbit MAX **151.50 ms**, `frames > 50 ms`
+  **1** — §AF.7's HEAD baseline exactly (6 failures, 151.2 ms), i.e. 4.9's two
+  extra failures are gone and the one-frame spike is still the pre-existing one.
+- `probe:gi2-puddle`: wall curvature p90 at the tile lag **13.77 %** against
+  13.03 % in §AF's session. Unmoved, still failing, still not this stage's.
+
+⛔⛔ **`probe:gi2-runner` COULD NOT BE ARBITRATED, AND SAYING SO IS THE RESULT.**
+Its shipped run and its `__gi2ShClamp=1` control are separated by **an hour of
+another agent's in-flight edits** to `windowVoxelize` / `windowStore` /
+`windowTrace` — visible in the same battery's own gather output, where the
+voxelizer's `3.9 bracketed` gate FAILS and two rotations read 6/8. The two runs'
+fields differ by far more than this stage can produce: `f3 out` `E p50` **0.679
+in the control against 0.265** in the shipped run, a field-wide halving that a
+5 %-of-DC floor cannot cause — and the pinned ref probe's own tight-window A/B
+proves it did not, reading pose A **identical to three decimals across both
+arms**. The runner numbers in that battery are a statement about a moving tree.
+⭐ **The re-measurement is one command on a still tree:**
+`npm run probe:gi2-runner` twice, `FLAGS='{"__gi2ShClamp":1}'` on one of them.
+[[probe-blind-statistics]]
