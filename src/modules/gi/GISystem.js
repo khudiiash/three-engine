@@ -30,7 +30,7 @@ import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionGeometry, positionWorld, renderGroup, sRGBTransferEOTF, screenCoordinate, screenUV, select, sin, smoothstep, step, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
 import { GI2_PATH, rc5EmitterEmissionEnabled, GI_DEBUG_VIEW_DOC, GI_QUALITY_LEVELS, GI_TERM_DEBUG_VIEWS, GI_TIER_GPU_BUDGET_BYTES, GI_VOLUME_DEBUG_VIEWS, gi2TierOf, giDebugView, giDebugViewsFor, resolveGiConfig, sceneSkyRadiance, wgslPointerParametersSupported } from "./giConfig.js";
-import { createGi2System, createGi2Volume } from "./window/gi2System.js";
+import { createGi2System, createGi2Volume, gi2Stage } from "./window/gi2System.js";
 import { createGi2DebugView, gi2ViewCode } from "./window/windowDebugView.js";
 import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
 import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGi2LightShadowPass, createGiAoFilterPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
@@ -2383,6 +2383,12 @@ export class GISystem {
     if (!component || !component.enabled) return;
     const renderer = this.engine.renderer;
     if (!renderer) return;
+    // §19 6.3: publish the scene-open anchor the stage ledger measures against.
+    // Here rather than at construction because the GI system OUTLIVES a scene
+    // swap — `sceneOpenAt` is re-stamped by `Engine#clear` and the ledger keys
+    // a fresh table off the new value.
+    globalThis.__gi2SceneOpenAt = this.engine?.sceneOpenAt ?? 0;
+    gi2Stage("giTick");
     // One frame's allowance for first-dispatch graph construction — see the
     // note above giCompute. Reset per GI tick, which is the unit the chains
     // are ordered by.
@@ -3601,9 +3607,16 @@ export class GISystem {
         // costs a frame nobody was going to see and buys the whole chain.
         // The wave is bounded and rare, so this cannot become the permanent
         // freeze the budget exists to prevent.
+        // §19 6.3: "the gather chain was SUBMITTED WHOLE", which is not the
+        // same event as "it was asked for". `giSkippedComputes` grows by one
+        // per node whose graph build blew the frame budget, so an unchanged
+        // size across the call is the only witness that the whole list landed.
+        const gatherSkippedBefore = giSkippedComputes.size;
         giCompute(renderer, this._gi2Passes.after, {
           deferrable: !this._compileWaveActive || globalThis.__giGatherDeferInWave === true,
         });
+        gi2Stage("gatherAsked");
+        if (giSkippedComputes.size === gatherSkippedBefore) gi2Stage("gatherRan");
         // The GI2 receipt (§K.8 + §L.7). ONE readback, on a slow cadence —
         // it is also what latches `_transportAlive`, so it must not wait for
         // the first user request. 30 frames ≈ half a second at 60.
@@ -4663,6 +4676,7 @@ export class GISystem {
       if (geometryGate && !this._gi2GeometryGateLogged
         && this._assetsReadySince != null && (pendingTextures || pendingMerge)) {
         this._gi2GeometryGateLogged = true;
+        gi2Stage("geometryReady");
         console.log(`[gi2] building on geometry-ready: ${pendingTextures} textures still loading, ` +
           `merging settling=${pendingMerge ? "yes" : "no"} — neither is a GI2 input ` +
           "(the palette re-tints when the texture averages arrive; the soup reads the SOURCE meshes)");
@@ -4688,6 +4702,7 @@ export class GISystem {
       // a slow measurement, it is a wrong one.
       if (this._deferredSince != null) {
         console.log(`[gi] scene assets ready after ${(now - this._deferredSince).toFixed(0)}ms — building`);
+        gi2Stage("assetsReady");
         this._deferredSince = null;
       }
       return true;
@@ -5904,6 +5919,7 @@ export class GISystem {
     let compileSucceeded = false;
     try {
       console.log("[gi] compile wave started");
+      gi2Stage("compileWaveStart");
       // Kick occupancy AND SRC graph-builds NOW, in yielded slices, so their
       // pipelines compile on the driver DURING the material walk instead of
       // AFTER it. Sequential "warm field, then materials" was a wash (the
@@ -6417,6 +6433,7 @@ export class GISystem {
       console.warn("[gi] async compile wave failed; GI was not committed:", error?.stack ?? error?.message ?? error);
     } finally {
       this._compileWaveActive = false;
+      gi2Stage("compileWaveEnd");
       if (originalYield) scheduler.yield = originalYield;
       if (originalGetForRender) pipelines.getForRender = originalGetForRender;
       // §19 STAGE 0.3: the coalesced ask. Anything that wanted a wave while

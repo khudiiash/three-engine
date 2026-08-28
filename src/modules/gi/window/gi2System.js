@@ -91,6 +91,33 @@ import { detachCpuMirror } from "../releaseCompute.js";
 export const GI2_PAL_CLASSES = PAL_ENTRIES - 1;
 
 /**
+ * ⭐⭐ §19 STAGE 6.3 — THE BOOT STAGE LEDGER, ANCHORED ON SCENE OPEN.
+ *
+ * `firstLightFromSceneOpenMs` says the boot took 17 s; it cannot say WHERE the
+ * 17 s went, and every earlier stage argued that from console-line ORDER (which
+ * has no clock) or from build-relative numbers (which hide the wait in front of
+ * the build). This is one flat map of `name -> ms since `engine.sceneOpenAt``,
+ * written once per stage per scene and read whole by `probe:gi2-boot`.
+ *
+ * ⚠ KEYED ON THE SCENE-OPEN STAMP, not on a boolean. The GI system outlives a
+ * scene swap, so a ledger gated on "already initialised" would carry the
+ * previous scene's marks into the next scene's table and report negative gaps.
+ * A new `openAt` is a new table.
+ *
+ * FIRST WRITER WINS per key: every entry is a FIRST ("the first deposit", "the
+ * first lit bake"), and a stage that fires every frame must not overwrite its
+ * own first occurrence.
+ */
+export function gi2Stage(name, openAt = globalThis.__gi2SceneOpenAt ?? 0) {
+  if (!openAt) return;
+  const g = globalThis;
+  if (!g.__gi2Stage || g.__gi2Stage.openAt !== openAt) g.__gi2Stage = { openAt, marks: {} };
+  if (g.__gi2Stage.marks[name] == null) {
+    g.__gi2Stage.marks[name] = Math.round(performance.now() - openAt);
+  }
+}
+
+/**
  * How many frames of coarse-first voxelizing a fresh window gets before the
  * budget flips to fine-first. §K.3's "coarse levels first at boot": L3 has 64×
  * fewer bricks per metre, so the whole window has occupancy within a handful of
@@ -990,6 +1017,7 @@ export function createGi2System({
   // an empty window and resolves black, exactly as a first frame should.
   const build = async ({ geometries, placements, movers = [], soupKey = null } = {}) => {
     marks.build = performance.now();
+    gi2Stage("gi2Build");
     voxelizer = null;
     dynamic = null;
     soup = null;
@@ -1080,6 +1108,7 @@ export function createGi2System({
     if (disposed) return false;
 
     marks.soup = performance.now();
+    gi2Stage("soupReady");
     counters.soupTris = built.triCount;
     counters.soupMB = +(built.bytes / 1048576).toFixed(1);
     counters.soupDropped = built.dropped ?? 0;
@@ -1115,6 +1144,7 @@ export function createGi2System({
     stampVoxNames();
     setMovers(movers);
     marks.voxelizer = performance.now();
+    gi2Stage("voxelizerLive");
     return true;
   };
 
@@ -1678,11 +1708,48 @@ export function createGi2System({
         // (see the field comment on `lastRc`) — "any ray came back with
         // radiance" is instead the deposit's own rays/hits, the same contract
         // the legacy SRC path already latches `_transportAlive` from.
+        // ⭐ §19 6.3 — THE FOUR RC STAGES, OFF THE RECEIPT FIRST LIGHT ALREADY
+        // READS. Each is a different failure: rays 0 = the deposit never
+        // dispatched; rays > 0 with hits 0 = it dispatched and hit nothing
+        // (an empty window, or a first dispatch that writes nothing); tiles 0 =
+        // the merge/bake never ran; tiles > 0 with lit 0 = they ran and baked
+        // dark. Before this the whole span read as one opaque "4-6 s".
+        if (rc) {
+          if ((lastRc?.rays ?? 0) > 0) gi2Stage("rcFirstDeposit");
+          if ((lastRc?.hits ?? 0) > 0) gi2Stage("rcFirstHit");
+          if (lastRcMerge?.tiles?.dispatched) gi2Stage("rcFirstBake");
+          // ⭐⭐ §19 6.3 — THE ARRIVAL RAMP, AS A SERIES RATHER THAN A CLAIM.
+          //
+          // The user rule is that light arrives in a natural gradient, "like
+          // Lumen" — no pop from black to lit. That is a statement about
+          // dE/dt, so it needs the sequence, not a before/after pair.
+          // `tiles.meanLum` is the bake's own mean irradiance over LIT texels,
+          // already computed on the GPU for the telemetry line, so the series
+          // costs one array push per stats sample.
+          //
+          // ⚠ ITS RESOLUTION IS `statsCadence()`, which backs off to 30 the
+          // instant first light latches — exactly when the ramp starts. So the
+          // flag below holds the tight cadence across the ramp window; without
+          // it this series is 2 points and would "prove" any ramp at all.
+          if (marks.firstLight && lastRcMerge?.tiles?.dispatched) {
+            const ramp = (globalThis.__gi2Ramp ??= []);
+            if (ramp.length < 400) {
+              ramp.push({
+                t: Math.round(performance.now() - marks.firstLight),
+                meanLum: +(lastRcMerge.tiles.meanLum ?? 0).toFixed(6),
+                lit: lastRcMerge.tiles.lit ?? 0,
+              });
+            }
+          }
+          if ((lastRcMerge?.merge?.corners ?? lastRcMerge?.merge?.merged ?? 0) > 0) gi2Stage("rcFirstMerge");
+          if ((lastRcMerge?.tiles?.lit ?? 0) > 0) gi2Stage("rcFirstLitTile");
+        }
         const rcLit = rc && (lastRc?.rays ?? 0) > 0
           && ((lastRc?.hits ?? 0) > 0 || (lastRcMerge?.tiles?.lit ?? 0) > 0);
         const oldLit = lastGather.windowHits > 0 || lastGather.screenHits > 0;
         if (!marks.firstLight && (rc ? rcLit : oldLit)) {
           marks.firstLight = performance.now();
+          gi2Stage("firstLight");
           out.msToFirstLight = Math.round(marks.firstLight - t0);
           out.firstLightFromSceneOpenMs = firstLightFromSceneOpen();
           console.log(
@@ -1761,6 +1828,7 @@ export function createGi2System({
           const occupied = (lvl.cumBuilt ?? 0) > 0 || lvl.built > 0 || lvl.pairs > 0;
           if (occupied && !marks.occupancy.has(lvl.level)) {
             marks.occupancy.set(lvl.level, Math.round(performance.now() - t0));
+            gi2Stage("firstOccupancy");
             console.log(`[gi2] first occupancy L${lvl.level} at ${marks.occupancy.get(lvl.level)} ms` +
               ((lvl.cumBuilt ?? 0) > 0 ? ` (${lvl.cumBuilt} bricks built so far)` : ""));
           }
@@ -1919,6 +1987,12 @@ export function createGi2System({
       //
       // ⭐ A CADENCE THAT BACKS OFF BEFORE THE LAST THING IT MEASURES HAS
       // HAPPENED IS AN INSTRUMENT MEASURING ITS OWN SAMPLING RATE.
+      // §19 6.3 — the ramp window keeps the per-frame cadence. See the ramp
+      // recorder in `stats()`: the back-off fires exactly when the ramp begins,
+      // so measuring the arrival gradient needs this hold. Opt-in, because it
+      // is one buffer readback per frame for the window's duration.
+      if (globalThis.__gi2RampProbe === true && marks.firstLight
+        && performance.now() - marks.firstLight < 2500) return 1;
       const filled = marks.occupancy.size >= win.levels && marks.firstLight > 0;
       const settled = filled || (marks.voxelizer && performance.now() - marks.voxelizer > 20_000);
       return settled ? 30 : 1;
