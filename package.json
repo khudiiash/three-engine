@@ -240,6 +240,7 @@
     "probe:gi2-farfield": "node scripts/run-gi2-farfield-probe.mjs",
     "probe:gi2-corridor": "node scripts/run-gi2-corridor-probe.mjs",
     "probe:gi2-flood": "node scripts/run-gi2-flood-probe.mjs",
+    "probe:gi2-puddle": "node scripts/run-gi2-puddle-probe.mjs",
     "probe:gi-texavg": "node scripts/run-gi-texavg-probe.mjs",
     "test:gi2-window": "node scripts/run-gi2-window-test.mjs",
     "test:gi2-soup": "node scripts/run-gi2-soup-test.mjs"

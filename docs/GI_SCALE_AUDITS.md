@@ -3443,3 +3443,190 @@ cannot re-key is the one that proves the ramp is inert where it should be.
 === true` after the Bistro red/green flood. Every receipt above was taken before
 that commit with world probes ON, and `wpSeedRamp` reaches nothing while they are
 off — re-read this section when the world path comes back.
+
+---
+
+## §AC — THE PUDDLES: WHAT MAKES ONE FLAT WALL DISAGREE WITH ITSELF (08-28)
+
+**The report** (user screenshot 08-28 10:13, Bistro, `indirect` view = the raw
+irradiance texture, `ao:false`): a terrace wall shows 30-60 px patches of
+irradiance that differ strongly between neighbouring 16 px probe tiles, smeared
+through the upsample. *"just look how bad this gi is."*
+
+### AC.1 — the instrument, and the two ways the first cuts of it were blind
+
+`probe:gi2-puddle` (`scripts/run-gi2-puddle-probe.mjs`). It reads the probe grid
+and the irradiance texture at one pose and reports the neighbour-ratio
+distribution on the largest flat LIT plane in the frame, at every stage of the
+chain. Two blindnesses had to be removed before any number it printed meant
+anything, and both are the same lesson from opposite sides:
+
+1. ⭐⭐ **A ONE-PIXEL LAG CANNOT SEE A TILE-SCALE PUDDLE.** Two adjacent half-res
+   pixels interpolate the SAME four probes with almost the same weights, so
+   their ratio measures the upsample's smoothness. Measured **0.19 % p50 on a
+   wall whose probes disagreed by 4.2 %** — an instrument reporting its own
+   filter. A "30-60 px patch" is a statement about a LENGTH, so the receipt is a
+   structure function over separations from 1 px to 32.
+2. ⭐⭐ **AND THE FIRST DIFFERENCE CANNOT SEE A PUDDLE EITHER.** Irradiance falls
+   off smoothly away from a light, so `|dE|/max` grows linearly with the lag
+   whether the field is smooth or patchy; the first structure function duly read
+   3 % → 26 % → 73 % across the lags and proved nothing. `|E(-L) + E(+L) -
+   2E(0)|` annihilates any linear trend exactly. A gradient reads ~0 at every
+   lag; a field that steps between probe tiles PEAKS at the tile lag. **A shape,
+   not a number, and a shape cannot be argued with.**
+
+⚠ **AND THE POSE HAD TO BE EARNED THREE TIMES.** `entity.list({nameContains})`
+cannot see Bistro's chairs — the scene has TWO entities and the model's 1697
+meshes never become ECS entities — and a scene-graph traverse for them finds
+nothing either, because the static merge has replaced them by the time GI is
+live. A gbuffer sweep from the model's centre then found a 15°-tilted plane
+owning 3 % of the frame and pronounced the wall healthy; the model's box is
+115 m across because it contains the Paris AERIAL backdrop cards, so its centre
+is not a place. The pose that works is anchored on the EMITTER SLOTS (the café
+fronts), scored by the receipt's own criterion — largest plane share — and
+**gated on the plane being LIT**: the sweep's first version maximized share
+alone and parked the camera 4.5 m from a courtyard wall whose irradiance was
+0.0005, where every ratio is one rounding error divided by another.
+
+### AC.2 — the receipt, one pose, both paths
+
+Bistro, ultra, window 1650x970 (viewport 1056x432), eye `[-13.83, 7.35, -9.49]`
+→ `[-9.75, 7.35, -13.90]`. The wall is `n [-0.679, -0.004, 0.734]`, **45 % of the
+frame's valid pixels**, mean E 0.53-0.61, 790 screen probes on it.
+
+**The image, SECOND difference, `p50 / p90`:**
+
+| lag (half-res px) | screen probes | world lattice |
+|---|---|---|
+| 1  | 0.06 / 0.45 % | 0.04 / 0.23 % |
+| 2  | 0.15 / 1.61 % | 0.08 / 0.82 % |
+| 4  | 0.94 / 4.58 % | 0.27 / 2.60 % |
+| **8 (= the 16 px tile)** | **3.74 / 12.10 %** | **0.94 / 7.38 %** |
+| 16 | 10.59 / 31.47 % | 2.65 / 14.48 % |
+| 32 | 21.04 / 56.50 % | 6.08 / 19.92 % |
+
+**The world path is 3.6-4x smoother at the puddle scale and is the only one that
+passes** the p90 < 10 % gate at the tile lag. Every lag agrees; it is not one
+number.
+
+**The screen probe grid itself** (4-adjacent pairs on the wall, n 1331):
+
+| stage | first difference p50 / p90 | second difference p50 / p90 |
+|---|---|---|
+| RAW `shRawIdx` | 7.34 / 42.16 % | 14.84 / **58.02 %** |
+| FILTERED 5x5 | 4.12 / 15.70 % | 3.71 / 11.82 % |
+| FINAL `shIdx` | 4.11 / 15.70 % | 3.71 / 11.82 % |
+
+### AC.3 — five candidates REFUTED by the same run
+
+Every one of these was a live hypothesis with a fix attached, and the instrument
+killed all five before any of them was written.
+
+- ⛔ **THE EMITTER NEE IS NOT THE PUDDLE.** `gi2System` splices
+  `emitterDirectPass` between the SH bilateral and `resolveHalf`, so its binary
+  shadow ray lands on `shIdx` UNPOOLED — the obvious suspect. `shIdx -
+  cpuFilter(shRaw)` isolates it exactly, and its share of the wall's irradiance
+  is **0.00 % p50, 0.05 % p90**. There is nothing here for it to pool.
+- ⛔ **NOT THE PROBE ANCHOR.** The anchor sits **0.032 m p50 / 0.048 m p90** from
+  the gbuffer point at its own tile centre. The resolve's bilinear assumes the
+  tile centre and is right to within 3 cm.
+- ⛔ **NOT TILE PURITY** (a probe anchored on a chair representing the wall
+  behind it): **100 % p50, 56 % p05**.
+- ⛔ **NOT THE PLANE WEIGHT COLLAPSING THE FILTER.** Live 5x5 taps: **24 of 25
+  p50**, 14 at p05. The filter is not reduced to one tap on a flat wall.
+- ⛔⛔ **NOT THE TRACE ORIGIN — and this was the best theory of the day.**
+  `windowTrace` biases the origin half a cell along the normal and then ESCAPES
+  it a WHOLE 0.25 m cell at a time while its voxel reads occupied, so a probe's
+  real origin is `p + (0.5 + k)*v0*n` for an integer `k` set by the conservative
+  voxelization's local thickness — a quarter-metre step in the origin of all 64
+  rays, decided by a lattice, which is exactly the shape of a 30-60 px patch on a
+  wall six metres away. Measured with a zero-normal trace ladder
+  (`scripts/lib/gi2OriginProbe.js`): **k = 0 for all 790 wall probes**, and the
+  same/different-k split of the pair population is empty. The escape never fires
+  here. ⭐ A mechanism whose geometry matches the symptom exactly can still be
+  absent; the ladder cost one run and saved a rewrite of the trace origin.
+
+### AC.4 — what the disagreement IS
+
+The worst-pair texel dump names it. Two probes **7 cm apart** on one flat wall,
+tracing the SAME 64 fixed directions from origins 7 cm apart:
+
+```
+texel 19 dir [-0.20,-0.59, 0.78]   L 0.152 vs 0.005   hit  9.41 vs 9.10 m
+texel 20 dir [ 0.20,-0.59, 0.78]   L 0.152 vs 0.005   hit  9.41 vs 9.10 m
+texel 26 dir [-0.59,-0.20, 0.78]   L 0.858 vs 0.007   hit 11.45 vs 5.02 m
+```
+
+Seven centimetres of parallax at a nine-metre surface is 0.4 degrees, and an oct
+texel is 14 degrees wide: these are the same ray. The hit DISTANCES agree to
+30 cm. What differs by **30x** is the RADIANCE the cache hands back at the hit —
+two neighbouring 0.25 m voxel faces of one distant wall holding unrelated values.
+Thirteen to seventeen texels carry more than 2 % of the gap each, and single
+texels carry 17-53 % of it.
+
+⭐⭐ **SO THE VARIANCE IS IN THE RADIANCE CACHE, NOT IN THE PROBES.** The probe
+layer is doing its job: 64 complete deterministic directions, a correct anchor,
+a 5x5 pool that cuts the raw p90 from 58 % to 11.8 % — a 4.9x reduction, which is
+what pooling ~12 effective independent probes should give. What it is pooling is
+a field that is already noisy IN WORLD SPACE, and `cacheAccumFn`'s own header
+says so in the units of this complaint: *"the sigma/mean ACROSS the 64 voxel
+faces of one 1 m brick had a median of 110 %, on a wall whose real radiance
+varies by a few percent across it."*
+
+⚠ **AND `nCap = 1` IS NOT THE BUG.** The running mean that header describes is
+switched off deliberately (§19 3.10): `shadeHit` is a fixed function of the face,
+so the 2nd shade computes the 1st's number and averaging them only brakes the
+Neumann iteration. The variance is not between successive samples of one face —
+it is **between faces**, frozen in world space, and it is what a 4-ray sky
+estimate (five quantization levels) plus a binary sun shadow ray per 0.25 m face
+produces. That is the next stage's subject, and it is a change to `shadeHit`, not
+to the probes.
+
+⚠ **AND THE "FILTER AFTER THE NEE" COUNTERFACTUAL IS NOT EVIDENCE.** The probe
+prints `cpuFilter(shIdx)` as the arm for moving the bilateral after the emitter
+add, and it reads better (p90 15.70 → 11.78 %). With the emitter term measured at
+zero here, that arm is `filter(filter(raw))` — a WIDER BLUR wearing a
+reordering's clothes. [[probe-blind-statistics]] again, inside the instrument
+that was built to avoid it.
+
+### AC.5 — what shipped
+
+`WORLD_PROBES` is **true by default again**. The 08-28 09:00 revert was for the
+red/green flood, and 4.3d fixed the flood at its cause (the emitter admission
+record never ran at boot); the flood receipt now measures the world path clean
+(pavement chroma 0.027 against the screen path's 0.023). Against the puddles the
+world path is worth 3.6-4x at every separation and is the only path that passes
+the gate. `__gi2WorldProbes = false` pre-boot is still the screen path exactly,
+and both arms of every receipt above come out of one binary.
+
+### AC.6 — the gates, both paths, 08-28
+
+Run one at a time against 127.0.0.1:5202, waiting for the machine's other
+batteries between each.
+
+| gate | screen (`__gi2WorldProbes=false`) | **world (shipped default)** |
+|---|---|---|
+| `probe:gi2-puddle` wall curvature p90 @ tile lag | 12.10 % FAIL | **7.38 % PASS** |
+| `probe:gi2-motion`, default arms | 7 gates failed · orbit MAX **156.00 ms** · 2 frames > 50 ms | **5 gates failed · orbit MAX 28.60 ms · 0 frames > 50 ms** |
+| `probe:gi2-motion` orbit MOVING sign flips | 44.4 – 48.4 % | **35.5 %, against a `reprojNull` FLOOR of 38.0 %** |
+| `probe:gi2-flood` pavement chroma (limit 0.15) | — | **0.0284** (façades 0.0080; seat NEE 0.5 % of the pavement) |
+| `smoke:gi-gpu` | — | **PASS**, worst kernel 6 storage buffers (`gi2.worldTrace`) |
+| `test:gi-moved-lamp` | — | **PASS**, Δnew 29.06 (AA.2 baseline 29.06) |
+| `probe:gi2-corridor` | — | 3/8 bracketed, walls 1/4 — **identical to the 3.15 and 3.16 arms in the same run** |
+| doors rig (`run-gi2-doors-probe`) | — | recess ÷ wall irrBefore **101.7 %**, frame ÷ wall 107.4 % — no dark recess, no leak |
+| gather chain GPU ms (Bistro, orbit) | 1.11 | **2.16** |
+
+⭐⭐ **THE FLIP CENSUS IS AT ITS OWN NULL FLOOR.** `reprojNull` makes the kernel
+dump the surface's ALBEDO — a field that cannot change between two frames by
+construction — so whatever flip rate the census reports for it is the
+INSTRUMENT. The world path reads 35.5 % against that floor's 38.0 %: the census
+cannot tell the moving GI field from a field that provably did not move. The
+screen path reads 44.4-48.4 % on the same rig. [[probe-blind-statistics]]
+
+⚠ **THE CHAIN COSTS ~1 ms MORE GPU AND THE FRAME IS FASTER ANYWAY** (orbit MAX
+156 → 28.6 ms). The screen path's cost is not in its kernels; it is in what a
+re-anchoring probe grid makes the rest of the frame do.
+
+⚠ **NOT RE-RUN: the Cornell rows.** AA.2 records them as taken with world probes
+ON — the configuration this change RESTORES — so they are unchanged by
+construction rather than by measurement. Re-run them before the next flip.

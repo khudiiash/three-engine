@@ -112,7 +112,28 @@ import { createWorldProbes } from "./worldProbes.js";
 // admitted emitters over-weighted by orders of magnitude in the world probes'
 // emitter path. Screen probes show normal colours. `__gi2WorldProbes = true`
 // pre-boot opts back in while the energy bug is fixed.
-export const WORLD_PROBES = globalThis.__gi2WorldProbes === true;
+//
+// ⭐⭐ 08-28 10:20: DEFAULT ON AGAIN, AND THE REVERT ABOVE IS SPENT. The flood
+// was never a property of the world path: 4.3d found it at its CAUSE — the
+// emitter ADMISSION record never ran at boot, so every candidate emissive mesh
+// was admitted at full power, and the lattice's own NEE (which the screen path
+// does not run — `emitterDirectPass` is skipped under world probes) delivered
+// all of it. With the admission fixed the flood receipt measures the world path
+// CLEAN at the same pose: pavement chroma 0.027 against the screen path's
+// 0.023, where the flood read orders of magnitude. Both reasons the constant
+// was ever false are closed, and the reason it should be true is the user's
+// standing complaint: under motion a SCREEN probe re-anchors to whatever world
+// point its tile happens to cover, and 3.18's flip census puts that path 15-29
+// points above its own null floor while the world path sits AT the floor. Light
+// that accumulates gradually needs an accumulator that stands still, which is
+// what a world lattice is.
+//
+// ⚠ `__gi2WorldProbes = false` PRE-BOOT IS STILL THE SCREEN PATH, EXACTLY. Both
+// arms stay expressible from one checkout and one shader cache — `probe:gi2-
+// puddle`, `probe:gi2-motion` and `probe:gi2-flood` are all run both ways off
+// this one binary, which is what makes "the world path is better HERE" a
+// reading rather than a belief.
+export const WORLD_PROBES = (globalThis.__gi2WorldProbes ?? true) !== false;
 
 /**
  * Tier constants. These, and only these, are compiled into the WGSL.
