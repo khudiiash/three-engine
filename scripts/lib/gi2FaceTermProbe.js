@@ -31,7 +31,7 @@ const MAX_FACES = 4096;
 /** vec4s in per face: (p, level) (n, voxelIdx) (face, 0, 0, 0). */
 const IN_VEC = 3;
 /** vec4s out per face — see `read()` below. */
-const OUT_VEC = 6;
+const OUT_VEC = 8;
 
 /**
  * @param {object} gi2      the live `createGi2System` object
@@ -45,6 +45,11 @@ export function createGi2FaceTermProbe(gi2, renderer) {
     const gather = gi2.gather;
     const inner = gather?.internals;
     if (!inner?.shadeTerms) throw new Error("gather.internals.shadeTerms missing — old build?");
+    // §19 5.4d — the RC resolve's own eight-probe read, when the cascades are
+    // built. Absent (the pre-5.1 chain, the world-probe arm) the two hop-(b)
+    // words come back zero with their validity flag clear, which is an ABSENCE
+    // and is reported as one rather than as a dark field.
+    const gatherAt = gi2.rc?.resolve?.gather?.gatherAt ?? null;
     const faceIn = instancedArray(new Float32Array(MAX_FACES * IN_VEC * 4), "vec4");
     const faceOut = instancedArray(new Float32Array(MAX_FACES * OUT_VEC * 4), "vec4");
     const pass = Fn(() => {
@@ -72,6 +77,21 @@ export function createGi2FaceTermProbe(gi2, renderer) {
       // `.w` is the thread index: a readback of zeros then says whether the kernel
       // ran at all, which no other channel can (every term may legally be 0).
       faceOut.element(o.add(uint(5))).assign(vec4(t.pal.xyz, i.toFloat().add(1)));
+      // ⭐⭐ §19 STAGE 5.4d/5.5 — HOP (b): THE LOOP'S OWN TWO WORDS AT ONE FACE.
+      //
+      // The single-bounce arm reads 0.988 global, so deposit → merge → tile →
+      // gather is exact and whatever is missing is the RETURN EDGE: `E_rc`, the
+      // per-face cached irradiance [J] adds as `ρ·E_rc/π`. Two numbers name it:
+      // the WORD the cache holds for this face, and what the merged field says
+      // AT THE SAME POINT AND NORMAL right now. They are the same quantity —
+      // `rcHit`'s refresh writes the second into the first — so a gap between
+      // them is the cadence, the α or the write, and no gap moves the question
+      // downstream to what the field itself carries.
+      const erc = gi2.cache.ercRead
+        ? gi2.cache.ercRead(levelF, voxF, faceF).toVar() : vec4(0, 0, 0, -1);
+      faceOut.element(o.add(uint(6))).assign(erc);
+      const g = gatherAt ? vec3(gatherAt(p, n).irradiance).toVar() : vec3(0);
+      faceOut.element(o.add(uint(7))).assign(vec4(g, gatherAt ? 1 : 0));
     })().compute(MAX_FACES);
     pass.__giPassName = "probe.gi2faceTerm";
     // ⭐ THE WITNESS PASS. Identical plumbing — same `instancedArray`, same
@@ -167,6 +187,7 @@ export function createGi2FaceTermProbe(gi2, renderer) {
     for (let i = 0; i < n; i++) {
       const sun = at(i, 0); const miss = at(i, 1); const bnc = at(i, 2);
       const nee = at(i, 3); const stored = at(i, 4); const pal = at(i, 5);
+      const erc = at(i, 6); const fld = at(i, 7);
       out.push({
         ...faces[i],
         Esun: sun.slice(0, 3), sunVis: sun[3],
@@ -175,6 +196,10 @@ export function createGi2FaceTermProbe(gi2, renderer) {
         Enee: nee.slice(0, 3), palEm: nee[3],
         stored: stored.slice(0, 3), storedValid: stored[3],
         albedo: pal.slice(0, 3), ran: pal[3],
+        // §19 5.4d hop (b): the cached E_rc word and the live field at the same
+        // point. `ercValid` < 0 means the build has no secondary region at all.
+        Erc: erc.slice(0, 3), ercValid: erc[3],
+        Efield: fld.slice(0, 3), fieldValid: fld[3],
       });
     }
     out.diag = diag;

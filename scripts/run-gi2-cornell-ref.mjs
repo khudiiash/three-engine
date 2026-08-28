@@ -1404,6 +1404,8 @@ if (process.env.FACETRUTH) {
       rows.push({
         d, gpu: lum(nee), ref: lum(truth), level: fc.level, face: fc.face,
         stored: lum(o.stored || [0, 0, 0]), storedValid: o.storedValid || 0,
+        erc: lum(o.Erc || [0, 0, 0]), ercValid: o.ercValid ?? -1,
+        field: lum(o.Efield || [0, 0, 0]), fieldValid: o.fieldValid ?? 0,
       });
     }
     const lit = rows.filter((r) => r.ref > 1e-4);
@@ -1454,6 +1456,31 @@ if (process.env.FACETRUTH) {
       console.log(`  ${FN[fi].padEnd(20)}${String(b.length).padStart(7)}`
         + `${f(mg / Math.max(1e-9, mr), 3).padStart(12)}`
         + `${f(mc / Math.max(1e-9, mr), 3).padStart(13)}`);
+    }
+    // ⭐⭐ HOP (b): the loop's return edge, at the faces themselves. `E_rc` is
+    // the word [J] multiplies by ρ/π; `field` is what the merged cascades say at
+    // the SAME point and normal. `rcHit`'s refresh writes the second into the
+    // first, so their ratio is the cadence and the write — and 1.00 moves the
+    // question to what the field carries, not to how it is stored.
+    const withF = lit.filter((r) => r.fieldValid > 0.5);
+    if (withF.length) {
+      const me = withF.reduce((a2, r) => a2 + r.erc, 0) / withF.length;
+      const mf = withF.reduce((a2, r) => a2 + r.field, 0) / withF.length;
+      console.log("");
+      console.log(`  hop (b)  E_rc word ${f(me, 4)} · field at the same face ${f(mf, 4)}`
+        + ` · E_rc/field ${f(me / Math.max(1e-9, mf), 3)}  over ${withF.length} faces`);
+      for (let l = 0; l < 4; l++) {
+        const b = withF.filter((r) => r.level === l);
+        if (!b.length) continue;
+        const e2 = b.reduce((a2, r) => a2 + r.erc, 0) / b.length;
+        const f2 = b.reduce((a2, r) => a2 + r.field, 0) / b.length;
+        console.log(`    c${l}  ${String(b.length).padStart(4)} faces  E_rc ${f(e2, 4)}`
+          + `  field ${f(f2, 4)}  ratio ${f(e2 / Math.max(1e-9, f2), 3)}`);
+      }
+    } else {
+      console.log("");
+      console.log("  hop (b) UNAVAILABLE — the probe rig published no field read"
+        + " (pre-5.1 chain or the world-probe arm); reporting nothing rather than a zero.");
     }
     console.log("");
     console.log(`  ${"cascade band".padEnd(20)}${"faces".padStart(7)}${"Enee/ref".padStart(12)}`
