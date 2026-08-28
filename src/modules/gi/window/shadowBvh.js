@@ -69,7 +69,8 @@
 // Indices are stored as float VALUES, not bit patterns: f32 is exact on
 // integers to 2^24 = 16.7 M, which bounds both the node count and the triangle
 // count. The worker refuses to build past that rather than folding silently.
-import { attributeArray, wgslFn } from "three/tsl";
+import * as THREE from "three/webgpu";
+import { attributeArray, float, select, uniform, wgslFn } from "three/tsl";
 
 /**
  * Peak triangles admitted into the shadow BVH, per tier. This is a GPU MEMORY
@@ -255,30 +256,69 @@ const bvhAnyHitFn = wgslFn(/* wgsl */ `
 ` );
 
 /**
- * Wraps a built BVH (the worker's plain arrays) in its two GPU storage buffers
- * and the TSL entry points that read them.
+ * ⭐⭐⭐ A PERSISTENT SLOT, NOT A BUFFER — AND THIS IS THE MEMORY LAW, NOT A
+ * STYLE CHOICE.
  *
- * ⚠ THE BUFFERS ARE IMMUTABLE ONCE BUILT. A new BVH means a new
- * `createShadowBvhGpu` and a rebuild of every pass that referenced the old
- * one — `attributeArray` bakes a binding, not a pointer. That is affordable
- * precisely because this happens ONCE per static scene, off the first-light
- * path (see the header), and never per frame.
+ * The first cut of 5.5b did the obvious thing: build the gather on the voxel
+ * arm, and REBUILD it when the worker's tree landed. The gather's own receipts
+ * say why that cannot work. A gather rebuild re-creates
+ * `textures.irradiance`/`glossy`, and every material in the scene is still
+ * bound to the destroyed ones — which is exactly what `retireGather`,
+ * `takeRetired` and `GISystem#rebindStaleGiTextures` exist to repair. That
+ * repair runs ONLY on the resize path. A rebuild fired from anywhere else
+ * hands the materials a corpse, and the measured symptom is precise and
+ * bizarre: the gate's API readback of `_gi2.textures.irradiance` is LIT while
+ * the frame renders nothing but the emitters, because the readback reads the
+ * live texture and the materials read the dead one.
  *
- * @param {{nodeCount: number, triCount: number, nodes: Float32Array, tris: Float32Array}} bvh
+ * So this stage does not rebuild anything. The buffers are created ONCE, at
+ * the size a placeholder needs, and the worker's tree is swapped into them
+ * later by replacing the BufferAttribute behind the SAME node:
+ *
+ *   · WGSL `array<f32>` in a storage binding is RUNTIME-SIZED. A bigger
+ *     attribute needs no new shader and no new pipeline — only a new bind
+ *     group, which three mints from the attribute's `version`.
+ *   · The kernel therefore never changes, so no texture is ever re-created,
+ *     so no material is ever stale. The failure mode above is not repaired,
+ *     it is made unreachable.
+ *   · Selecting the arm is a UNIFORM, and it gates a real runtime branch. It
+ *     is uniform across every invocation, so a warp takes one side or the
+ *     other and the untaken trace costs nothing — this is not the `mix` of
+ *     two traced results it might look like, which would pay for both forever.
+ *
+ * ⚠ THE PLACEHOLDER MUST BE A REJECTING NODE, NOT A ZERO ONE. An all-zero node
+ * is the box [0,0,0]..[0,0,0], which a ray through the origin HITS; it is a
+ * leaf with 0 triangles so it reports no occlusion, but it costs a traversal
+ * and, worse, it is a shape that answers "unoccluded" for a reason that would
+ * survive a real bug. min > max can never be entered by any ray at all.
  */
-export function createShadowBvhGpu(bvh) {
-  if (!bvh || !(bvh.nodeCount > 0) || !(bvh.triCount > 0)) return null;
+export function createShadowBvhSlot() {
+  const nodes = new Float32Array(8);
+  nodes[0] = 1; nodes[1] = 1; nodes[2] = 1;    // min
+  nodes[4] = -1; nodes[5] = -1; nodes[6] = -1; // max < min: unenterable
+  nodes[3] = 0; nodes[7] = 0;                  // a leaf holding nothing
+  const tris = new Float32Array(9);
 
   // `.toReadOnly()` so the emitted `var<storage, ...>` access mode matches the
   // `read` annotation on the WGSL ptr parameters — a mismatch is a pipeline
   // creation error, not a wrong picture.
   //
   // Flat "float", NEVER a vec3/vec4 element type: a `vec3<f32>` storage array
-  // has a 16-byte stride in WGSL and would read this tightly-packed
-  // 12-byte-stride Float32Array off by a growing offset. Same trap
-  // `bvhScene.js` documents for its own position buffer.
-  const nodesBuffer = attributeArray(bvh.nodes, "float").toReadOnly();
-  const trisBuffer = attributeArray(bvh.tris, "float").toReadOnly();
+  // has a 16-byte stride in WGSL and would read these tightly-packed
+  // 12-byte-stride arrays off by a growing offset. Same trap `bvhScene.js`
+  // documents for its own position buffer.
+  const nodesBuffer = attributeArray(nodes, "float").toReadOnly();
+  const trisBuffer = attributeArray(tris, "float").toReadOnly();
+
+  /**
+   * 0 until the worker's tree is in the buffers, 1 after. Read by `rcDirect`'s
+   * `If`/`Else`, so the frames before the swap trace the voxels exactly as
+   * 5.4d shipped and the frames after trace triangles — with no pass, kernel,
+   * texture or material touched at the moment it flips.
+   */
+  const readyU = uniform(0);
+
+  const state = { nodeCount: 0, triCount: 0, bytes: 0, stats: null };
 
   /**
    * `1.0` when ANYTHING lies in `(origin, origin + dir*maxT)`, else `0.0`.
@@ -290,23 +330,17 @@ export function createShadowBvhGpu(bvh) {
    * ⭐⭐ THE SELF-HIT EPSILON, AND WHY IT IS ALONG THE NORMAL.
    *
    * The shading point came out of the gbuffer, so it is ON a triangle of this
-   * very BVH — to floating-point accuracy, which at 30 m from the origin in
-   * f32 is ~2 µm, and after the gbuffer's own round trip rather more. Pushing
-   * along the RAY DIRECTION does not help: at a grazing angle the ray hugs its
-   * own plane and a `dir * eps` step is still within the triangle's numerical
-   * thickness for a long way. Pushing along the NORMAL leaves the plane at
-   * unit rate regardless of the ray's angle, so one small constant covers
-   * every direction. This is the offset the old `createGiEmitterShadowPass`
-   * used and the reason it never self-shadowed a wall.
+   * very BVH. Pushing along the RAY DIRECTION does not help: at a grazing
+   * angle the ray hugs its own plane and a `dir * eps` step is still within
+   * the triangle's numerical thickness for a long way. Pushing along the
+   * NORMAL leaves the plane at unit rate regardless of the ray's angle, so one
+   * small constant covers every direction. This is the offset the old
+   * `createGiEmitterShadowPass` used and the reason it never self-shadowed a
+   * wall.
    *
    * There is deliberately NO voxel slab to skip: that is the entire point of
    * this file. `SELF_EPS` is millimetres, so a contact shadow survives — the
    * voxel arm could not resolve anything under 0.25 m.
-   *
-   * ⚠ AND IT IS NOT SCALED BY DISTANCE. A distance-scaled epsilon would erase
-   * contact shadows in the far field, which is the artefact the user reads as
-   * "objects float". The far-field position error shows up as a fine shimmer
-   * on nearly-tangent rays instead — the cheaper failure.
    */
   const SELF_EPS = 2e-3;
   const anyHitFrom = (P, dir, maxT, normal) => (
@@ -318,12 +352,40 @@ export function createShadowBvhGpu(bvh) {
   return {
     anyHit,
     anyHitFrom,
+    readyU,
     selfEps: SELF_EPS,
-    nodeCount: bvh.nodeCount,
-    triCount: bvh.triCount,
-    bytes: bvh.nodes.byteLength + bvh.tris.byteLength,
-    mb: (bvh.nodes.byteLength + bvh.tris.byteLength) / (1024 * 1024),
-    stats: bvh.stats ?? null,
+    get ready() { return readyU.value !== 0; },
+    get nodeCount() { return state.nodeCount; },
+    get triCount() { return state.triCount; },
+    get bytes() { return state.bytes; },
+    get mb() { return state.bytes / (1024 * 1024); },
+    get stats() { return state.stats; },
+    /**
+     * Swaps the worker's tree in. REBIND ONLY — a new `StorageBufferAttribute`
+     * behind the same node, so three mints a new bind group and reuses the
+     * pipeline. Nothing above this call is rebuilt, which is the whole design.
+     *
+     * ⚠ `version++` IS LOAD-BEARING. Three's generation check is what tells the
+     * backend a cached bind group is stale; a fresh attribute whose version
+     * still reads 0 can be silently ignored and the placeholder kept forever —
+     * the same mechanism `gi2TextureGeneration` exists for on the texture side,
+     * where the gather measured 212 destroyed-texture errors without it.
+     */
+    fill(bvh) {
+      if (!bvh || !(bvh.nodeCount > 0) || !(bvh.triCount > 0)) return false;
+      const nodeAttr = new THREE.StorageBufferAttribute(bvh.nodes, 1);
+      const triAttr = new THREE.StorageBufferAttribute(bvh.tris, 1);
+      nodeAttr.version++;
+      triAttr.version++;
+      nodesBuffer.value = nodeAttr;
+      trisBuffer.value = triAttr;
+      state.nodeCount = bvh.nodeCount;
+      state.triCount = bvh.triCount;
+      state.bytes = bvh.nodes.byteLength + bvh.tris.byteLength;
+      state.stats = bvh.stats ?? null;
+      readyU.value = 1;
+      return true;
+    },
   };
 }
 

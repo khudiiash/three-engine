@@ -78,7 +78,7 @@ import { createRadianceCache } from "./radianceCache.js";
 import { createWindowVoxelizer } from "./windowVoxelize.js";
 import { createWindowDynamic, moverBoxSoup } from "./windowDynamic.js";
 import { createTriangleSoupBuilder, SoupSupersededError, PAL_NONE } from "./triangleSoup.js";
-import { createShadowBvhBuilder, createShadowBvhGpu, SHADOW_BVH_TRI_CAP } from "./shadowBvh.js";
+import { createShadowBvhBuilder, createShadowBvhSlot, SHADOW_BVH_TRI_CAP } from "./shadowBvh.js";
 import { createGiGather, GATHER_TIERS, PAL_ENTRIES, STATS } from "./gatherProbes.js";
 import { createRcCascades } from "./rc/rcSystem.js";
 import { rcHitPathEnabled } from "./rc/rcConfig.js";
@@ -526,13 +526,15 @@ export function createGi2System({
   let dynamic = null;
   let soup = null;
   /**
-   * §19 STAGE 5.5b — `createShadowBvhGpu`'s handle once the worker BVH lands,
-   * `null` until then. NOT awaited anywhere: first light is served by the voxel
-   * arm exactly as 5.4d shipped, and the exact arm arrives as a SWAP —
-   * `swapShadowBvh` rebuilds the gather the same way `setSize` does and nothing
-   * else in the system knows it happened.
+   * §19 STAGE 5.5b — the exact-shadow BVH's PERSISTENT slot. Created once and
+   * kept on `store`, so it outlives every gather rebuild and the kernels bind
+   * it from the first build whether or not a tree exists yet. NOT awaited: the
+   * slot starts empty, its `readyU` reads 0, and `rcDirect` traces the voxels
+   * exactly as 5.4d shipped until the worker lands — at which point `fill`
+   * swaps the storage attributes and flips the uniform, rebuilding NOTHING.
+   * See `shadowBvh.js`'s slot header for why a rebuild here is not an option.
    */
-  let shadowBvh = null;
+  const shadowBvh = rc5BvhShadowEnabled() ? (store.bvhSlot ??= createShadowBvhSlot()) : null;
   let emitterDirect = null;
   let aoCompose = null;
   let aoOut = null;
@@ -790,11 +792,10 @@ export function createGi2System({
         // removed `resolveHalf`, which was `glossyHalf`'s only writer; the
         // cascades take over BOTH stores or the frame has no specular term.
         glossyHalf: gather.textures.glossyHalf,
-        // §19 STAGE 5.5b — the exact triangle shadow arm, or `null` while the
-        // worker is still building it. Read HERE, at graph-build time, which is
-        // exactly why `swapShadowBvh` has to rebuild the gather rather than
-        // poke a uniform: the two arms are different kernels.
-        shadowBvh: rc5BvhShadowEnabled() ? shadowBvh : null,
+        // §19 STAGE 5.5b — the PERSISTENT exact-shadow slot (`null` only when
+        // the arm is off). Bound from the first build and never re-created, so
+        // the worker's tree arrives as a bind, not a rebuild.
+        shadowBvh,
       })
       : null;
     if (rc) {
@@ -1117,7 +1118,7 @@ export function createGi2System({
    * rather than a black frame.
    */
   const kickShadowBvh = (built) => {
-    if (!rc5BvhShadowEnabled() || !built?.triCount) return;
+    if (!shadowBvh || !built?.triCount || shadowBvh.ready) return;
     // ⛔ NOT ON PHONE. The tree is tens of MB of storage buffer on top of a
     // budget the phone tier is already at, and a 64-deep stack of `u32` per
     // thread is a register cost a tile GPU pays badly. The voxel arm is the
@@ -1139,8 +1140,18 @@ export function createGi2System({
           `off-thread (${Math.round(wall)} ms wall, depth ${bvh.stats?.maxDepth ?? "?"})` +
           (bvh.stats?.truncated ? ` — TRUNCATED at the ${SHADOW_BVH_TRI_CAP} triangle cap` : ""),
         );
-        const gpu = createShadowBvhGpu(bvh);
-        if (gpu) swapShadowBvh(gpu);
+        // ⭐ THE WHOLE SWAP: two storage attributes and a uniform. No pass is
+        // rebuilt, so no gather texture is re-created, so no material is left
+        // pointing at a destroyed one — the failure that rendered the frame
+        // black while the gate's readback of the very same irradiance texture
+        // came back lit.
+        if (shadowBvh?.fill(bvh)) {
+          console.log(
+            `[gi2] exact shadow rays LIVE — ${shadowBvh.triCount} tris / ` +
+            `${shadowBvh.nodeCount} nodes, ${shadowBvh.mb.toFixed(1)} MB bound in place ` +
+            `(no rebuild); the direct term is off the voxels`,
+          );
+        }
       })
       .catch((err) => {
         // A superseding build is routine (two scene opens in a row), a real
@@ -1560,48 +1571,6 @@ export function createGi2System({
         deadRc?.dispose();
       },
     });
-  };
-
-  /**
-   * ⭐⭐ §19 STAGE 5.5b — THE SWAP, AND IT IS A REBUILD ON PURPOSE.
-   *
-   * The exact arm binds two storage buffers the voxel arm does not, so the two
-   * are different WGSL and no uniform can choose between them at run time. That
-   * leaves exactly one honest way to serve first light on the voxel arm and
-   * still end up on the exact one: build the gather without the BVH, and
-   * REBUILD it — once, when the worker's tree lands — through the very path
-   * `setSize` already uses for the same reason.
-   *
-   * The cost is one pipeline compile of the direct pass, off the first-light
-   * path, once per scene open. The alternative (awaiting the BVH before the
-   * first frame) puts a multi-second worker build in front of first light,
-   * which is the exact cost §19 exists to have deleted; and the other
-   * alternative (a capacity-sized buffer filled in place) would allocate
-   * 72 MB on every scene whether or not it needed one.
-   *
-   * ⚠ RETIRE THE OLD GATHER, do not just drop it — `emitterDirect` and
-   * `aoCompose` bind textures and buffers that belong to the dead one, the same
-   * three-object dance `setSize` performs. Getting this wrong leaks a whole
-   * cascade set per swap.
-   */
-  const swapShadowBvh = (gpu) => {
-    if (!gpu || disposed) return false;
-    shadowBvh = gpu;
-    const old = gather;
-    const oldAo = aoOut;
-    const oldEmitterDirect = emitterDirect;
-    const oldAoCompose = aoCompose;
-    const oldRc = rc;
-    aoOut = null;
-    aoCompose = null;
-    buildGather();
-    stampVoxNames();
-    retireGather(old, oldAo, [oldEmitterDirect, oldAoCompose], oldRc);
-    console.log(
-      `[gi2] exact shadow rays LIVE — ${gpu.triCount} tris / ${gpu.nodeCount} nodes, ` +
-      `${gpu.mb.toFixed(1)} MB on the GPU; the direct term is off the voxels`,
-    );
-    return true;
   };
 
   const setSize = (w, h) => {
