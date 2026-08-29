@@ -153,9 +153,37 @@ import {
   PROBE_BLOCK,
   PROBE_FLAGS,
   PROBE_PARENT,
+  PROBE_RAYOFF,
   PROBE_WORDS,
   SLOT_EMPTY,
 } from "./srcProbes.js";
+
+/**
+ * ⭐⭐ §19 6.20 — THE DIRECTION IS A FUNCTION OF THE RAY'S RANK WITHIN ITS
+ * PROBE, NOT OF ITS PLACE IN THE GLOBAL SEQUENCE.
+ *
+ * [D5] hands pixel `p` the index `probeRayOff + rank`, and `rayDirection(n)`
+ * read that GLOBAL `n`. A contiguous R2 run of M indices is a torus-translated
+ * copy of the canonical first-M run, so a probe's direction SET has the same
+ * uniformity whatever its offset — but WHICH bins its M rays miss depends on
+ * the offset, and the offset is the scheduler-order sum of every probe claimed
+ * before it: fixed per boot, different per probe. Under the per-probe cap (32
+ * rays over c0's 32 bins) every probe therefore misses a DIFFERENT third of
+ * its bins for ever, `srcTiles` renormalises E over the bins it has, and the
+ * picture carries one brightness bias per probe — the Cornell blotch, whose
+ * autocorrelation measures 0.5-0.8 m (the c0/c1 footprint) and whose
+ * concave-corner band vanished under `__gi2RcJitter = 1` (the phase walks, so
+ * over the accumulator every bin is eventually known).
+ *
+ * The construction: the direction index is the RANK (`n − probeRayOff`), so
+ * every probe with M rays fires the SAME canonical M directions and the
+ * unknown bins are the same subset everywhere — a uniform directional
+ * truncation, never a per-probe bias. The global `n` still names the ray for
+ * NEE's stratified draw and the mirror's bit-exact diff. Composes with the
+ * jitter/cycle phases untouched. `__gi2RcStratify = 0` restores the global
+ * index.
+ */
+export const RC_STRATIFY_BY_RANK = (globalThis.__gi2RcStratify ?? 1) !== 0;
 
 /** Per-bin accumulator layout. Nine words, one atomic buffer. */
 export const BIN_R = 0;
@@ -1224,7 +1252,12 @@ export function createSrcDepositFrame(store, bins, {
       // implementation uses — a SYNTHETIC one does, and that is what makes the
       // gate's diff bit-exact (see `srcRef.js`'s `traceAndDeposit` header).
       const n = base.add(k).toVar();
-      const dir = rayDirection(n, Nrm, jitterX, jitterY).toVar();
+      // §19 6.20 — see `RC_STRATIFY_BY_RANK`: the direction's index is the
+      // rank within the probe's segment; `n` stays global for everything else.
+      const nDir = RC_STRATIFY_BY_RANK
+        ? n.sub(probeTable.element(probe0.mul(PROBE_WORDS).add(uint(PROBE_RAYOFF)))).toVar()
+        : n;
+      const dir = rayDirection(nDir, Nrm, jitterX, jitterY).toVar();
       // ⭐ §19 5.1 — `Nrm` IS A FIFTH ARGUMENT, AND EVERY OLDER CALLER IGNORES
       // IT. `createSrcSceneTrace`'s marcher takes four; GI2's `traceWindow`
       // takes an origin NORMAL and spends it on the half-cell bias and the

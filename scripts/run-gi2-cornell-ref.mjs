@@ -460,9 +460,18 @@ const RJSON = await page.evaluate(async ({ TARGET }) => {
       triSurf.push(`${label}·${AXIS[axis]}`);
       triEmit.push(emissive[0] + emissive[1] + emissive[2] > 1e-6 ? 1 : 0);
     }
+    // §19 6.20 — WHERE THE MESH ACTUALLY IS at reference time. Two boots read
+    // the lamp at 7.479 and 6.000 m² (a unit box): the world matrix, not the
+    // scene file, is what the reference traces, so it is printed beside it.
+    geo.computeBoundingBox?.();
+    const bb = geo.boundingBox;
+    const wsz = [0, 4, 8].map((c) => Math.hypot(me[c], me[c + 1], me[c + 2]));
     meshSummary.push({
       name: label, tris: tri.length / 9 - before, albedo, emissive,
       promoted: !!entry.promoted,
+      world: { pos: [me[12], me[13], me[14]], scale: wsz,
+        box: bb ? [bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z] : null },
+      entityScale: (() => { let o = mesh; const s = []; for (let k = 0; k < 4 && o; k++) { s.push([o.scale.x, o.scale.y, o.scale.z].map((v) => +v.toFixed(3))); o = o.parent; } return s; })(),
     });
   }
 
@@ -559,7 +568,8 @@ console.log(`  emitter slots ${R.slots.length}: ` + (R.slots.map((s) => {
 console.log(`  sky [${R.sky.map((v) => v.toFixed(3))}]  sun [${R.sunColor.map((v) => v.toFixed(3))}]  ` +
   `worldProbes ${R.gather.worldProbes}  cacheSmooth ${R.gather.cacheSmooth}  coldFill ${R.gather.coldFill}  skyRays ${R.gather.skyRays}`);
 for (const m of R.scene.meshes) {
-  console.log(`    ${String(m.name).padEnd(14)} ${String(m.tris).padStart(5)} tris  albedo [${m.albedo.map((v) => v.toFixed(2))}]  emissive [${m.emissive.map((v) => v.toFixed(2))}]`);
+  console.log(`    ${String(m.name).padEnd(14)} ${String(m.tris).padStart(5)} tris  albedo [${m.albedo.map((v) => v.toFixed(2))}]  emissive [${m.emissive.map((v) => v.toFixed(2))}]`
+    + (m.world ? `  @[${m.world.pos.map((v) => v.toFixed(2))}] worldScale [${m.world.scale.map((v) => v.toFixed(3))}] box [${(m.world.box ?? []).map((v) => v.toFixed(2))}] chainScale ${JSON.stringify(m.entityScale)}` : ""));
 }
 
 // ═══════════════════════════════════════════════════ THE REFERENCE, ON CPU
