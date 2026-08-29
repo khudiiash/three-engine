@@ -300,9 +300,12 @@ export const entryFaceBit = (axis, positive) => axis * 2 + (positive ? 1 : 0);
  * @param {boolean} [opts.dynamic]  OR the K.5 dynamic layer at L0/L1
  * @returns {{ traceWindow: Function, steps: number, dynamic: boolean }}
  */
-export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = win.dynLevels > 0 } = {}) {
+export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = win.dynLevels > 0, staticOff = false } = {}) {
   const { levels, dynLevels, voxel0, buffer, originsU, originAt } = win;
   const useDynamic = dynamic && dynLevels > 0;
+  // §19 6.21 — `staticOff`: read ONLY the K.5 dynamic mirror. The exact-shadow
+  // arm asks this trace "is a MOVER on the segment" after its static BVH said no.
+  const noStatic = !!staticOff;
   const VOXEL_STEPS = BRICK * 3 + 1;
   /**
    * ⛔⛔ §19 4.13 — BUILT, MEASURED, AND **DEFAULT-OFF**. `__gi2ExitFace = 1`
@@ -396,7 +399,7 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
         const word = shiftRight(vi, uint(5)).toVar();
         // Never an `If()` around a buffer read — the idiom that rendered the
         // BVH mirror pass black. The INDEX is in range, the VALUE is gated.
-        const st = bitAnd(buffer.element(slot0.add(word)), bit).toVar();
+        const st = noStatic ? uint(0) : bitAnd(buffer.element(slot0.add(word)), bit).toVar();
         const dy = useDynamic
           ? select(useDyn0, bitAnd(buffer.element(dyn0.add(word)), bit), uint(0)).toVar()
           : uint(0);
@@ -515,7 +518,7 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
 
           const bmWord = shiftRight(b, uint(5)).toVar();
           const bmBit = shiftLeft(uint(1), bitAnd(b, uint(31))).toVar();
-          const bmStatic = bitAnd(buffer.element(slotBase.add(uint(BMASK_OFF)).add(bmWord)), bmBit).toVar();
+          const bmStatic = noStatic ? uint(0) : bitAnd(buffer.element(slotBase.add(uint(BMASK_OFF)).add(bmWord)), bmBit).toVar();
           const bmDyn = useDynamic
             ? select(useDyn, bitAnd(buffer.element(dynBase.add(uint(BMASK_OFF)).add(bmWord)), bmBit), uint(0)).toVar()
             : uint(0);
@@ -535,7 +538,7 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
               const vi = bitOr(bitOr(cx, shiftLeft(cy, uint(6))), shiftLeft(cz, uint(12))).toVar();
               const occBit = shiftLeft(uint(1), bitAnd(vi, uint(31))).toVar();
               const occWord = shiftRight(vi, uint(5)).toVar();
-              const occStatic = bitAnd(buffer.element(slotBase.add(uint(OCC_OFF)).add(occWord)), occBit).toVar();
+              const occStatic = noStatic ? uint(0) : bitAnd(buffer.element(slotBase.add(uint(OCC_OFF)).add(occWord)), occBit).toVar();
               const occDyn = useDynamic
                 ? select(useDyn, bitAnd(buffer.element(dynBase.add(uint(OCC_OFF)).add(occWord)), occBit), uint(0)).toVar()
                 : uint(0);
@@ -564,7 +567,7 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
               If(bitOr(occStatic, occDyn).notEqual(uint(0)).and(tHit.lessThan(tMax)), () => {
                 const byteWord = shiftRight(vi, uint(2)).toVar();
                 const byteShift = bitAnd(vi, uint(3)).mul(uint(8)).toVar();
-                const fStatic = bitAnd(
+                const fStatic = noStatic ? uint(0) : bitAnd(
                   shiftRight(buffer.element(slotBase.add(uint(FACE_OFF)).add(byteWord)), byteShift), uint(255),
                 ).toVar();
                 const fDyn = useDynamic
@@ -738,7 +741,7 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
     };
   };
 
-  return { traceWindow, steps, dynamic: useDynamic };
+  return { traceWindow, steps, dynamic: useDynamic, staticOff: noStatic };
 }
 
 /** Unpack the vec4 a readback holds, on the CPU. Mirrors the wrapper exactly. */

@@ -122,7 +122,7 @@ export function buildTriangleSoup(input) {
     const geo = geometries.get(p?.geometryKey);
     const n = triCountOf(geo);
     if (!geo || n < 1) { missingGeometry++; continue; }
-    entries.push({ index: i, geo, n, take: 0, matrix: p.matrix, pal: (p.pal ?? PAL_NONE) & 255 });
+    entries.push({ index: i, geo, n, take: 0, matrix: p.matrix, pal: (p.pal ?? PAL_NONE) & 255, owner: (Number.isFinite(p.slot) ? p.slot : i) & 0xffff });
   }
   const order = entries.slice().sort((a, b) => (b.n - a.n) || (a.index - b.index));
   let budget = triCap;
@@ -142,6 +142,9 @@ export function buildTriangleSoup(input) {
   // ── 2. THE SOUP ────────────────────────────────────────────────────────────
   const tris = new Float32Array(taken * 9);
   const palWords = new Uint32Array((taken + 3) >> 2);
+  // §19 6.21 — the triangle's OWNER (its placement slot), 2 × u16 per word, so
+  // the shadow BVH can drop a placement's triangles the frame it becomes a mover.
+  const ownerWords = new Uint32Array((taken + 1) >> 1);
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
   let w = 0; // write cursor, in TRIANGLES
@@ -156,6 +159,7 @@ export function buildTriangleSoup(input) {
     const pos = e.geo.positions;
     const idx = e.geo.index;
     const pal = e.pal;
+    const owner = e.owner;
     for (let t = 0; t < e.take; t++) {
       const base = t * 3;
       const i0 = (idx ? idx[base] : base) * 3;
@@ -198,6 +202,7 @@ export function buildTriangleSoup(input) {
       tris[o + 3] = x1; tris[o + 4] = y1; tris[o + 5] = z1;
       tris[o + 6] = x2; tris[o + 7] = y2; tris[o + 8] = z2;
       palWords[w >> 2] |= pal << ((w & 3) * 8);
+      ownerWords[w >> 1] |= owner << ((w & 1) * 16);
       w++;
 
       if (x0 < minX) minX = x0; if (x0 > maxX) maxX = x0;
@@ -219,6 +224,9 @@ export function buildTriangleSoup(input) {
   let trisOut = triCount === taken ? tris : new Float32Array(tris.buffer, 0, triCount * 9);
   const palLen = (triCount + 3) >> 2;
   let palOut = palLen === palWords.length ? palWords : new Uint32Array(palWords.buffer, 0, palLen);
+  const ownerLen = Math.max(1, (triCount + 1) >> 1);
+  let ownerOut = ownerLen === ownerWords.length ? ownerWords : new Uint32Array(ownerWords.buffer, 0, ownerLen);
+  if (taken - triCount > 65536) ownerOut = ownerOut.slice();
   if (taken - triCount > 65536) {
     trisOut = trisOut.slice();
     palOut = palOut.slice();
@@ -308,6 +316,7 @@ export function buildTriangleSoup(input) {
     triCount,
     tris: trisOut,
     triPal: palOut,
+    triOwner: ownerOut,
     grid: { origin: [originX, originY, originZ], cell, dim: [nx, ny, nz] },
     cellRange,
     cellTris,
@@ -338,7 +347,7 @@ const clampi = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 
 /** Every distinct ArrayBuffer a built soup owns — the postMessage transfer list. */
 export function soupTransferables(soup) {
-  return [...new Set([soup.tris.buffer, soup.triPal.buffer, soup.cellRange.buffer, soup.cellTris.buffer])];
+  return [...new Set([soup.tris.buffer, soup.triPal.buffer, soup.triOwner?.buffer, soup.cellRange.buffer, soup.cellTris.buffer].filter(Boolean))];
 }
 
 // ── WORKER PLUMBING ──────────────────────────────────────────────────────────

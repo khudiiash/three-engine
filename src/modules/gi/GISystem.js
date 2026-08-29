@@ -18360,6 +18360,11 @@ export class GISystem {
     const staticPlacements = moverMeshes.size
       ? enriched.filter((p) => !moverMeshes.has(p.mesh))
       : enriched;
+    // §19 6.21 — mesh → its static placement slot(s), so a promotion can drop
+    // the mesh's triangles from the exact-shadow tree the frame it moves.
+    const slotOf = new Map();
+    for (const p of staticPlacements) { if (p.mesh && Number.isFinite(p.slot)) (slotOf.get(p.mesh) ?? slotOf.set(p.mesh, []).get(p.mesh)).push(p.slot); }
+    this._gi2StaticSlotOf = slotOf;
     const soupKey = `${geometries.length}:${staticPlacements.length}:${parts.join(",")}`;
     // §19 Stage 4.0b: the join a re-tint needs — key → the mesh whose material
     // it re-resolves and the AREA it was weighted with. Held here (not on the
@@ -18890,6 +18895,7 @@ export class GISystem {
    *     are free. `GI2_MOVER_REST_FRAMES` decides who loses when they are not.
    */
   #refreshGi2Movers(gi2) {
+    const GI2_MOVER_SETTLE_FRAMES = 90;
     if (!gi2?.dynamic) return;
     const movers = this._gi2Movers;
     const m4 = (this._gi2MoverMatrix ??= new THREE.Matrix4());
@@ -18911,6 +18917,17 @@ export class GISystem {
           moving++;
         }
         gi2.dynamic.setMatrix(m.slot, m.matrix);
+        // §19 6.21 — A PROMOTED MESH THAT SETTLED goes back to the static set at
+        // its NEW pose: one rebuild (soup + tree) returns it to the exact arm.
+        // Until that build lands it stays a mover, so no frame is without its
+        // shadow. Pinned-dynamic and skinned movers never settle this way.
+        // ⚠ OPT-IN (`__gi2MoverSettleRebuild = true`): measured 08-29, the rebuild re-fired 3× and the
+        // moved-lamp test read ~0 after it — the settle arm is built, not armed. See the 6.21 commit.
+        if (globalThis.__gi2MoverSettleRebuild === true && !m.skinned && m.mesh && m.restFrames === GI2_MOVER_SETTLE_FRAMES && this._gi2Promoted?.has(m.mesh)) {
+          this._gi2Promoted.delete(m.mesh);
+          console.log(`[gi2] mover settled: "${m.mesh.name}" returns to the static set — rebuild`);
+          this.requestRebuild("gi2-mover-settled");
+        }
       }
     }
     this._gi2MoversMoving = moving;
@@ -18928,6 +18945,8 @@ export class GISystem {
         watch.splice(i, 1);
         promoted.add(mesh);
         adopted++;
+        // §19 6.21 — out of the exact-shadow tree NOW: its old pose must not shadow.
+        for (const s of this._gi2StaticSlotOf?.get(mesh) ?? []) gi2.setStaticExcluded?.(s, true);
       }
       if (adopted) {
         console.log(

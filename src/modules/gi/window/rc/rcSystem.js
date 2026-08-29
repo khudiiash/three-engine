@@ -96,6 +96,7 @@ export function createRcCascades({
   // in this file reads it — the whole exact/voxel choice lives in one
   // expression inside `rcDirect`.
   shadowBvh = null,
+  traceDyn = null,
 }) {
   const spec = rcTierSpec(tier);
   const { u, dominantFace, faceSamplePoint, shadeHit } = kit;
@@ -557,6 +558,7 @@ export function createRcCascades({
         // reached for: `rcSystem` does not own the BVH's lifetime, `gi2System`
         // does, and a pass that captured a global would go stale on a rebuild.
         bvh: shadowBvh ?? null,
+        traceDyn: traceDyn ?? null,
       }),
     })
     : null;

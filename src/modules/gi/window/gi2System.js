@@ -540,6 +540,8 @@ export function createGi2System({
   // ── the scene-independent half: built once, never rebuilt by content ──────
   const win = createGiWindow(tier, { dynamic: true });
   const trace = createWindowTrace(win);
+  // §19 6.21 — the exact arm's mover supplement: the K.5 mirror alone.
+  const traceDyn = win.dynLevels > 0 ? createWindowTrace(win, { dynamic: true, staticOff: true }) : null;
   // ⭐ §19 STAGE 5.3b — the SECONDARY (irradiance) region is built only for the
   // cascades. On the shipped chain `erc` is false and the cache allocates
   // exactly the words 5.3 allocated, which is "RC5 off is byte-identical"
@@ -746,7 +748,7 @@ export function createGi2System({
     // word was, this carries it.
     const prev = gather;
     gather = createGiGather({
-      win, trace, cache,
+      win, trace, cache, traceDyn,
       // ⭐⭐ §19 STAGE 5.5b's OTHER HALF. `rcDirect` shadows the lamp with
       // TRIANGLES at the pixel; without this line the FACE cache still shadowed
       // the same lamp with the dilated voxel window, so the transport's whole
@@ -827,6 +829,7 @@ export function createGi2System({
       ? createRcCascades({
         win,
         trace,
+        traceDyn,
         cache,
         gbuffer,
         width,
@@ -1234,7 +1237,7 @@ export function createGi2System({
     // generation's `dispose()` leaves behind — "Binding size ... is zero" on
     // every frame). Same array (the soup key held) keeps the tree; a new soup
     // resets it, so `kickShadowBvh` below builds one for this order.
-    store.bvhSlot?.retarget(soup.tris?.value);
+    store.bvhSlot?.retarget(soup.tris?.value, soup.triOwner?.value);
     kickShadowBvh(built);
     voxelizer = createWindowVoxelizer(win, soup, tier);
     dynamic = createWindowDynamic(win, voxelizer, tier);
@@ -1303,7 +1306,7 @@ export function createGi2System({
         // pointing at a destroyed one — the failure that rendered the frame
         // black while the gate's readback of the very same irradiance texture
         // came back lit.
-        if (shadowBvh?.fill(bvh, soupAtKick?.tris?.value)) {
+        if (shadowBvh?.fill(bvh, soupAtKick?.tris?.value, soupAtKick?.triOwner?.value)) {
           console.log(
             `[gi2] exact shadow rays LIVE — ${shadowBvh.triCount} tris / ` +
             `${shadowBvh.nodeCount} nodes, ${shadowBvh.mb.toFixed(1)} MB bound in place ` +
@@ -1324,6 +1327,7 @@ export function createGi2System({
     return {
       tris: instancedArray(g.tris, "float"),
       triPal: instancedArray(g.triPal, "uint"),
+      triOwner: instancedArray(g.triOwner ?? new Uint32Array(1), "uint"),
       cellRange: instancedArray(g.cellRange, "uint"),
       cellTris: instancedArray(g.cellTris, "uint"),
       origin: g.grid.origin, cell: g.grid.cell, dim: g.grid.dim,
@@ -2046,7 +2050,7 @@ export function createGi2System({
         list.push(dynamic.scratchAttribute, dynamic.trisBuffer.value,
           dynamic.metaBuffer.value, dynamic.xformBuffer.value);
       }
-      if (soup) list.push(soup.tris.value, soup.triPal.value, soup.cellRange.value, soup.cellTris.value);
+      if (soup) list.push(soup.tris.value, soup.triPal.value, soup.triOwner?.value, soup.cellRange.value, soup.cellTris.value);
       // `b?.value`: a harness-only buffer (the crop pair) is null on the
       // engine path — see `crops: 0` above.
       if (gather) for (const b of Object.values(gather.buffers)) list.push(b?.value);
@@ -2074,6 +2078,9 @@ export function createGi2System({
       return out;
     },
     build, setSize, setCamera, setMovers, passes, warmList, stats, snapshot, describe,
+    /** §19 6.21 — drop/restore a static placement slot in the exact-shadow tree. */
+    setStaticExcluded: (slot, on) => shadowBvh?.setExcluded?.(slot, on) ?? false,
+    get bvhExcludedCount() { return shadowBvh?.excludedCount ?? 0; },
     /**
      * How often the caller should pay for a `stats()` readback, in frames.
      *
@@ -2163,7 +2170,7 @@ export function createGi2System({
       cache.dispose();
       win.dispose();
       if (soup) {
-        for (const key of ["tris", "triPal", "cellRange", "cellTris"]) {
+        for (const key of ["tris", "triPal", "triOwner", "cellRange", "cellTris"]) {
           const attr = soup[key]?.value;
           if (!attr) continue;
           attr.array = attr.array?.constructor ? new attr.array.constructor(0) : new Uint32Array(0);

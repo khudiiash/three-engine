@@ -132,7 +132,9 @@ const bvhAnyHitFn = wgslFn(/* wgsl */ `
 		maxT: f32,
 		nodes: ptr<storage, array<f32>, read>,
 		triIdx: ptr<storage, array<u32>, read>,
-		tris: ptr<storage, array<f32>, read>
+		tris: ptr<storage, array<f32>, read>,
+		owners: ptr<storage, array<u32>, read>,
+		excl: ptr<storage, array<u32>, read>
 	) -> f32 {
 
 		var stack: array<u32, 64>;
@@ -223,7 +225,12 @@ const bvhAnyHitFn = wgslFn(/* wgsl */ `
 					// addresses triIdx and THAT addresses the triangle. One
 					// extra u32 load per candidate buys back 32 B/tri of VRAM —
 					// and with it the 828 k triangles the 5.5b cap silently dropped.
-					let o = triIdx[ first + i ] * 9u;
+					let ti = triIdx[ first + i ];
+					// §19 6.21 — a triangle whose placement is a MOVER is not here any
+					// more: the dynamic layer answers for it at its live pose.
+					let ow = ( owners[ ti >> 1u ] >> ( ( ti & 1u ) * 16u ) ) & 0xffffu;
+					if ( ( excl[ ow >> 5u ] & ( 1u << ( ow & 31u ) ) ) != 0u ) { continue; }
+					let o = ti * 9u;
 					let a = vec3f( tris[ o ], tris[ o + 1u ], tris[ o + 2u ] );
 					let b = vec3f( tris[ o + 3u ], tris[ o + 4u ], tris[ o + 5u ] );
 					let c = vec3f( tris[ o + 6u ], tris[ o + 7u ], tris[ o + 8u ] );
@@ -281,7 +288,9 @@ const bvhNearestTFn = wgslFn(/* wgsl */ `
 		maxT: f32,
 		nodes: ptr<storage, array<f32>, read>,
 		triIdx: ptr<storage, array<u32>, read>,
-		tris: ptr<storage, array<f32>, read>
+		tris: ptr<storage, array<f32>, read>,
+		owners: ptr<storage, array<u32>, read>,
+		excl: ptr<storage, array<u32>, read>
 	) -> f32 {
 
 		var stack: array<u32, 64>;
@@ -339,7 +348,12 @@ const bvhNearestTFn = wgslFn(/* wgsl */ `
 				let n = u32( count );
 				for ( var i: u32 = 0u; i < n; i = i + 1u ) {
 
-					let o = triIdx[ first + i ] * 9u;
+					let ti = triIdx[ first + i ];
+					// §19 6.21 — a triangle whose placement is a MOVER is not here any
+					// more: the dynamic layer answers for it at its live pose.
+					let ow = ( owners[ ti >> 1u ] >> ( ( ti & 1u ) * 16u ) ) & 0xffffu;
+					if ( ( excl[ ow >> 5u ] & ( 1u << ( ow & 31u ) ) ) != 0u ) { continue; }
+					let o = ti * 9u;
 					let a = vec3f( tris[ o ], tris[ o + 1u ], tris[ o + 2u ] );
 					let b = vec3f( tris[ o + 3u ], tris[ o + 4u ], tris[ o + 5u ] );
 					let c = vec3f( tris[ o + 6u ], tris[ o + 7u ], tris[ o + 8u ] );
@@ -442,6 +456,15 @@ export function createShadowBvhSlot() {
   // This node is `.toReadOnly()` and the soup's is not; the ACCESS MODE lives on
   // the node, not the buffer, so the two declarations coexist.
   const trisBuffer = attributeArray(tris, "float").toReadOnly();
+  // §19 6.21 — the soup's per-triangle OWNER words (borrowed like `tris`) and
+  // the placement-slot EXCLUSION bitmask (1024 bits ≥ MAX_INSTANCE_SLOTS). A set
+  // bit drops that placement's triangles at every leaf, so a static mesh the
+  // engine just released to the dynamic layer stops shadowing from its old pose
+  // the frame it moves, before any tree is rebuilt.
+  const ownerPlaceholder = new Uint32Array(1);
+  const exclArr = new Uint32Array(32);
+  const ownersBuffer = attributeArray(ownerPlaceholder, "uint").toReadOnly();
+  const exclBuffer = attributeArray(exclArr, "uint").toReadOnly();
 
   /**
    * 0 until the worker's tree is in the buffers, 1 after. Read by `rcDirect`'s
@@ -502,6 +525,9 @@ export function createShadowBvhSlot() {
     nodesBuffer.value = mint(nodes);
     triIdxBuffer.value = mint(triIdx);
     trisBuffer.value = mint(tris);
+    ownersBuffer.value = mint(ownerPlaceholder);
+    exclArr.fill(0);
+    exclBuffer.value = mint(exclArr);
     readyU.value = 0;
     for (const k of kernels) k.needsUpdate = true;
     forTris = null; treeNodes = null; treeIdx = null;
@@ -511,9 +537,9 @@ export function createShadowBvhSlot() {
    * `1.0` when ANYTHING lies in `(origin, origin + dir*maxT)`, else `0.0`.
    * Raw: the caller owns the origin offset.
    */
-  const anyHit = (origin, dir, maxT) => bvhAnyHitFn(origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer);
+  const anyHit = (origin, dir, maxT) => bvhAnyHitFn(origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer, ownersBuffer, exclBuffer);
   /** §19 6.14 — the FIRST occluder's distance in `(origin, origin + dir*maxT)`, or −1. */
-  const nearestT = (origin, dir, maxT) => bvhNearestTFn(origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer);
+  const nearestT = (origin, dir, maxT) => bvhNearestTFn(origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer, ownersBuffer, exclBuffer);
 
   /**
    * ⭐⭐ THE SELF-HIT EPSILON, AND WHY IT IS ALONG THE NORMAL.
@@ -577,7 +603,7 @@ export function createShadowBvhSlot() {
      * the same mechanism `gi2TextureGeneration` exists for on the texture side,
      * where the gather measured 212 destroyed-texture errors without it.
      */
-    fill(bvh, soupTris) {
+    fill(bvh, soupTris, soupOwners = null) {
       if (!bvh || !(bvh.nodeCount > 0) || !(bvh.triCount > 0)) return false;
       // ⭐ 6.2 — WITHOUT THE SOUP THERE ARE NO TRIANGLES TO TEST. The tree is
       // now nothing but indices into the caller's buffer, so filling the nodes
@@ -592,6 +618,7 @@ export function createShadowBvhSlot() {
       nodesBuffer.value = mint(bvh.nodes);
       triIdxBuffer.value = mint(bvh.triIdx);
       trisBuffer.value = soupTris;
+      ownersBuffer.value = (soupOwners?.array?.length > 0) ? soupOwners : mint(ownerPlaceholder);
       forTris = soupTris.array;
       treeNodes = bvh.nodes;
       treeIdx = bvh.triIdx;
@@ -616,12 +643,14 @@ export function createShadowBvhSlot() {
      * the caller's `kickShadowBvh` builds a tree for THIS soup. Returns true
      * when the tree survived.
      */
-    retarget(soupTris) {
+    retarget(soupTris, soupOwners = null) {
       if (readyU.value !== 0 && treeNodes && treeIdx &&
         soupTris?.array && soupTris.array.length > 0 && soupTris.array === forTris) {
         nodesBuffer.value = mint(treeNodes);
         triIdxBuffer.value = mint(treeIdx);
         trisBuffer.value = soupTris;
+        ownersBuffer.value = (soupOwners?.array?.length > 0) ? soupOwners : mint(ownerPlaceholder);
+        exclBuffer.value = mint(exclArr);
         for (const k of kernels) k.needsUpdate = true;
         return true;
       }
@@ -629,6 +658,23 @@ export function createShadowBvhSlot() {
       return false;
     },
     reset,
+    /**
+     * §19 6.21 — drop (or restore) one placement slot's triangles at the leaf.
+     * A fresh attribute per toggle: three re-mints the bind group off the
+     * version, the same swap `fill` relies on. Toggles are rare (a mover
+     * promotion, a settle), so the cost is nothing.
+     */
+    setExcluded(slot, on) {
+      if (!(slot >= 0 && slot < 1024)) return false;
+      const w = slot >> 5, bit = 1 << (slot & 31);
+      const was = (exclArr[w] & bit) !== 0;
+      if (was === !!on) return false;
+      if (on) exclArr[w] |= bit; else exclArr[w] &= ~bit;
+      exclBuffer.value = mint(exclArr);
+      for (const k of kernels) k.needsUpdate = true;
+      return true;
+    },
+    get excludedCount() { let n = 0; for (let i = 0; i < 32; i++) { let v = exclArr[i] >>> 0; while (v) { v &= v - 1; n++; } } return n; },
     /** Register a compute node that binds this slot (see `kernels` above). */
     attach(node) { if (node) kernels.add(node); },
     detach(node) { kernels.delete(node); },
