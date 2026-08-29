@@ -104,12 +104,35 @@ export function createRcCascades({
   const maxLods = Math.max(1, Math.min(MAX_LODS, spec.lods));
   const pixelCount = Math.max(1, width * height);
 
-  // ── the pools, bounded by the tier and by nothing else ───────────────────
+  // ── the pools, bounded by the tier AND by the frame they are sized for ────
+  //
+  // ⭐⭐ §19 6.17 — THE BIN POOL IS SIZED FROM THE PIXEL COUNT, BECAUSE THE
+  // POPULATION IS. `setSize` below refuses a frame larger than `pixelCount`
+  // with the words "the pools are sized for this frame", but the bin budget
+  // was the tier's flat 700 000 — measured clean on a 960x640 harness and
+  // split four ways, i.e. 5 468 c0 bin blocks. On Bistro at 1526x562 the c0
+  // population sat at EXACTLY 5 468 at rest (a demand equal to a capacity is
+  // exhaustion, not coincidence); at the user's 1657x966 every cascade is
+  // full all the time, so every region a rotating camera uncovers claims a
+  // probe slot and NO BLOCK — a blockless probe bakes an UNKNOWN tile, the
+  // LOD walk finds the coarser cascades blockless too, and the resolve writes
+  // black: the screen-aligned checkerboard that "tries to resolve into
+  // colours but never succeeds", healing only as retention frees blocks.
+  // Receipt: `rcMerge.readStats().resolve.unknownFinalPct` 7 % mid-rotation
+  // with `merge.perCascade[c].probes == blockCapacity` for c0..c2.
+  //
+  // The demand is per SCREEN TILE (the population inserts from the g-buffer),
+  // so it grows with the pixel count and with nothing else the tier does not
+  // already fix; the floor stays the tier's, the ceiling is 4x (a 4 K editor
+  // pays ~100 MB of bins, not the old ladder's unbounded climb). 36 B per bin.
+  const REF_PIXELS = 960 * 640;
+  const binScale = Math.min(4, Math.max(1, pixelCount / REF_PIXELS));
+  const binBudget = Math.round(spec.binBudget * binScale);
   const store = createSrcProbeStore({
     c0Probes: spec.c0Probes,
     cascadeCount: CASCADE_COUNT,
     w0: W0,
-    binBudget: spec.binBudget,
+    binBudget,
   });
 
   // ── uniforms ──────────────────────────────────────────────────────────────
@@ -696,7 +719,8 @@ export function createRcCascades({
     /** §19 5.3d — which corner rule the population ran under. */
     cornerSpread,
     pools: {
-      c0Probes: spec.c0Probes, binBudget: spec.binBudget, binTotal: bins.binTotal,
+      c0Probes: spec.c0Probes, binBudget, binScale: +binScale.toFixed(2), binTotal: bins.binTotal,
+      blockCapacity: store.cascades.map((c) => c.blockCapacity),
       // §19 5.3 — 0 on the inline arm, which is how a receipt tells the two
       // builds apart without reading a flag.
       hitList: hitCapacity,
