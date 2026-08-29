@@ -146,7 +146,7 @@ import {
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
-import { BIN_SG, BIN_SR, BIN_WORDS, PAYLOAD_SEED_BASE, PAYLOAD_WORDS } from "./srcDeposit.js";
+import { BIN_COUNT, BIN_SG, BIN_SR, BIN_WORDS, DEPOSIT_SCALE, PAYLOAD_SEED_BASE, PAYLOAD_WORDS, PRIOR_SAMPLES } from "./srcDeposit.js";
 import {
   FLAG_ALIVE,
   PROBE_BLOCK,
@@ -297,6 +297,17 @@ export function createSrcMergeFrame(store, bins, {
    * caller, every gate fixture) builds the pre-6.19d WGSL byte for byte.
    */
   changeReset = null,
+  /**
+   * §19 6.32 — `{ scratch }` arms THE PARENT PRIOR: every bin with a parent
+   * is written `(1 − m)·parentCone + m·own`, m = min(count/PRIOR_SAMPLES, 1)
+   * read from the deposit's `BIN_COUNT` word, and is marked MEASURED. A bin
+   * with no samples IS the parent's cone at full weight (not age-ramped —
+   * c1/c2 are world-anchored and persist, so the prior is spatially smooth
+   * across every c0 tile born this frame), and its own rays fade the
+   * DIFFERENCE in as they land. A settled bin (count ≥ PRIOR_SAMPLES) writes
+   * bit-identically to the pre-6.32 merge. `null` keeps 5.4e's seed marks.
+   */
+  prior = null,
 } = {}) {
   if (worldKeysEnabled() && !camera) {
     // Loud, at build, rather than a merge that silently interpolates over the
@@ -696,15 +707,27 @@ export function createSrcMergeFrame(store, bins, {
         // §19 5.4d — `selfL`, which is ZERO for a promoted unknown: the merge
         // writes the parent's cone straight through (`0 + parentL·1`) and the
         // bin becomes KNOWN, so the tile's quadrature covers it from birth.
-        const outL = selfL.add(parentL.mul(selfT)).toVar();
-        const outT = selfT.mul(parentT).toVar();
+        const ownL = selfL.add(parentL.mul(selfT)).toVar();
+        const ownT = selfT.mul(parentT).toVar();
+        // §19 6.32 — the parent prior (see the `prior` option). `mat` is the
+        // bin's own maturity; an unknown self has none, so it takes the cone.
+        const mat = float(1).toVar();
+        if (prior) {
+          const cb = uint(info.binBase).add(block.mul(uint(nBins))).add(m)
+            .mul(uint(BIN_WORDS)).toVar();
+          const cnt = float(atomicLoad(prior.scratch.element(cb.add(uint(BIN_COUNT))))).toVar();
+          mat.assign(cnt.div(float(PRIOR_SAMPLES * DEPOSIT_SCALE)).clamp(0, 1));
+          If(unknownSelf, () => { mat.assign(0); });
+        }
+        const outL = (prior ? parentL.mul(mat.oneMinus()).add(ownL.mul(mat)) : ownL).toVar();
+        const outT = (prior ? parentT.mul(mat.oneMinus()).add(ownT.mul(mat)) : ownT).toVar();
         payload.element(o).assign(outL.x);
         payload.element(o.add(uint(1))).assign(outL.y);
         payload.element(o.add(uint(2))).assign(outL.z);
         // §19 5.4e — A SEEDED BIN IS MARKED, so the bake can trust it less than
         // a measured one. `T` rides the sign: `w = PAYLOAD_SEED_BASE − outT`.
         payload.element(o.add(uint(3)))
-          .assign(select(unknownSelf, float(PAYLOAD_SEED_BASE).sub(outT), outT));
+          .assign(prior ? outT : select(unknownSelf, float(PAYLOAD_SEED_BASE).sub(outT), outT));
         atomicAdd(stats.element(sw(c, MERGE_MERGED)), uint(1));
         If(outT.equal(0), () => { atomicAdd(stats.element(sw(c, MERGE_OPAQUE)), uint(1)); });
       }).Else(() => {

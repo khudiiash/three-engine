@@ -150,8 +150,13 @@ export function createRcMerge({
   const hashBlock = createSrcHashBlockFrame(store, 0);
 
   // ── [G] the merge ─────────────────────────────────────────────────────────
+  // §19 6.32 — the parent prior + maturity vote (`srcMerge` / `srcTiles`
+  // `prior`): light accumulates as gradients. `__gi2ParentPrior = false`
+  // restores the 6.1 newborn fade + 5.4e seeds.
+  const prior = globalThis.__gi2ParentPrior === false ? null : { scratch: bins.scratch };
+  if (prior) console.info("[gi2] parent prior ARMED (6.32)");
   const merge = createSrcMergeFrame(store, bins, {
-    spacing0, anchor, camera, sky, skyEnv, w0: W0, losOccupied, changeReset,
+    spacing0, anchor, camera, sky, skyEnv, w0: W0, losOccupied, changeReset, prior,
   });
 
   // ── [H] the c0 irradiance tiles ───────────────────────────────────────────
@@ -160,7 +165,7 @@ export function createRcMerge({
   // already holds the whole chain's answer at the finest spacing the hierarchy
   // has, so tiles for c1-c3 would bake the same light more coarsely and nothing
   // would read them.
-  const tiles = createSrcTileAtlas(store, bins, { w0: W0, sky, frameStamp, skyEnv });
+  const tiles = createSrcTileAtlas(store, bins, { w0: W0, sky, frameStamp, skyEnv, prior });
 
   // ── [I] the eight-probe interpolation, as a CLOSURE ───────────────────────
   //

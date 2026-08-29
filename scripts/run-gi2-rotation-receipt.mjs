@@ -82,7 +82,11 @@ function decodePng(buf) {
   return { w, h, bpp, d: out };
 }
 const lin = new Float32Array(256); for (let i = 0; i < 256; i++) { const c = i / 255; lin[i] = c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }
-const stats = (buf) => {
+// §19 6.32 — TILE-EDGE CONTRAST + PER-FRAME STEP. Per 16x16 block mean (linear luminance): edge = mean over
+// blocks of |mean(block) − mean(right/down neighbour)| / frameMean (mean + p90); step = |mean(block) − mean(same
+// block, previous shot)| / frameMean, p90 over blocks. Only blocks with a lit neighbour (both ≥ 0.02) count.
+let prevMeans = null;
+const stats = (buf, keepPrev = true) => {
   const img = decodePng(buf); const { d, bpp, w, h } = img; const B = 16; const means = [];
   for (let ty = 0; ty + B <= h; ty += B) for (let tx = 0; tx + B <= w; tx += B) {
     let s = 0; for (let y = ty; y < ty + B; y++) for (let x = tx; x < tx + B; x++) { const i = (y * w + x) * bpp; s += 0.2126 * lin[d[i]] + 0.7152 * lin[d[i + 1]] + 0.0722 * lin[d[i + 2]]; }
@@ -90,6 +94,7 @@ const stats = (buf) => {
   }
   const n = means.length; const black = means.filter((m) => m < 0.02).length;
   const nb = means.filter((m) => m >= 0.02).sort((a, b) => a - b); const med = nb.length ? nb[nb.length >> 1] : 0;
+  const fmean = nb.length ? nb.reduce((x, y) => x + y, 0) / nb.length : 1;
   const bright = means.filter((m) => m > 2 * med).length;
   const bw = Math.floor(w / B), bh = Math.floor(h / B); let iso = 0;
   for (let i = 0; i < n; i++) if (means[i] < 0.02) {
@@ -97,7 +102,23 @@ const stats = (buf) => {
     for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const xx = x + dx, yy = y + dy; if (xx < 0 || yy < 0 || xx >= bw || yy >= bh) continue; if (means[yy * bw + xx] >= 0.02) nk++; }
     if (nk >= 2) iso++;
   }
-  return `black ${(100 * black / n).toFixed(2)} %  isoBlack ${(100 * iso / n).toFixed(2)} %  bright(>2xmed ${med.toFixed(3)}) ${(100 * bright / n).toFixed(2)} %  [${w}x${h}]`;
+  const edges = [];
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+    const m0 = means[y * bw + x]; if (m0 < 0.02) continue;
+    if (x + 1 < bw) { const m1 = means[y * bw + x + 1]; if (m1 >= 0.02) edges.push(Math.abs(m0 - m1) / fmean); }
+    if (y + 1 < bh) { const m1 = means[(y + 1) * bw + x]; if (m1 >= 0.02) edges.push(Math.abs(m0 - m1) / fmean); }
+  }
+  edges.sort((a, b) => a - b);
+  const p90 = (arr) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(arr.length * 0.9))] : 0;
+  const eMean = edges.length ? edges.reduce((x, y) => x + y, 0) / edges.length : 0;
+  let stepTxt = "step n/a";
+  if (prevMeans && prevMeans.length === n) {
+    const steps = [];
+    for (let i = 0; i < n; i++) if (means[i] >= 0.02 && prevMeans[i] >= 0.02) steps.push(Math.abs(means[i] - prevMeans[i]) / fmean);
+    steps.sort((a, b) => a - b); stepTxt = `step p90 ${(100 * p90(steps)).toFixed(2)} %`;
+  }
+  if (keepPrev) prevMeans = means;
+  return `black ${(100 * black / n).toFixed(2)} %  isoBlack ${(100 * iso / n).toFixed(2)} %  bright(>2xmed ${med.toFixed(3)}) ${(100 * bright / n).toFixed(2)} %  edge mean ${(100 * eMean).toFixed(2)} % p90 ${(100 * p90(edges)).toFixed(2)} %  ${stepTxt}  [${w}x${h}]`;
 };
 const shot = async (name) => { const buf = await page.screenshot({ clip, type: "png" }); writeFileSync(`${OUTDIR}/${name}.png`, buf); return stats(buf); };
 const rcs = async () => { const g = await call("profile.gi2"); return g?.rcMerge ?? g?.gi2?.rcMerge ?? (g ? { keys: Object.keys(g) } : null); };

@@ -214,6 +214,22 @@ export const DEPOSIT_F = 16;
 export const DEPOSIT_SCALE = 1 << DEPOSIT_F;
 
 /**
+ * §19 6.32 — THE MATURITY OF A BIN, in samples. A bin holding `n` samples is
+ * `m = min(n / PRIOR_SAMPLES, 1)` mature; the merge writes
+ * `(1 − m)·parentCone + m·own` and the tile bake votes the texel at
+ * `Σ cw·m / Σ cw`. 16: at ~1 ray per bin per frame that is the same order as
+ * the newborn fade it replaces, and BELOW the change-reset's quarter window
+ * (16 of 64), so a reset bin never drops out of maturity. `__gi2PriorSamples`
+ * overrides.
+ */
+export const PRIOR_SAMPLES = (() => {
+  const raw = Number(globalThis.__gi2PriorSamples);
+  return Number.isFinite(raw) && raw > 0 ? raw : 16;
+})();
+/** The floor of a bin's maturity vote — a uniformly newborn neighbourhood renormalises to the prior instead of to black. */
+export const PRIOR_FLOOR = 1 / 64;
+
+/**
  * Accumulated weight below which a bin is UNKNOWN rather than dim — one
  * sixty-fourth of a single ray. Only reachable under temporal decay; the
  * resolve's header says what goes wrong without it.
