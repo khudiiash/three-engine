@@ -69,6 +69,24 @@ if (!firstLight) console.log("  last [gi lines:\n  " + giLines.join("\n  "));
 if (POSE) {
   await page.evaluate(async (p) => globalThis.__editorApi.call("viewport.setCamera", { position: p[0], target: p[1] }), POSE);
 }
+// §19 6.25b — `LAMP_SCALE=<k>`: scale the admitted lamp's entity (the gizmo's
+// path) before the settle, as `run-gi2-cornell-ref.mjs` does.
+const LAMP_SCALE = Number(process.env.LAMP_SCALE ?? 1);
+if (LAMP_SCALE !== 1) {
+  const sc = await page.evaluate(async ({ k }) => {
+    const mod = await import("/src/editor/engineInstance.js");
+    const sys = mod.engine?.modules?.get?.("gi")?.system ?? null;
+    const emEntry = (sys?.state?.entries ?? []).find((e) => (e.peak ?? 0) > 0.5 && e.mesh);
+    let id = null;
+    for (let o = emEntry?.mesh; o && !id; o = o.parent) if (o.userData?.entityId) id = o.userData.entityId;
+    if (!id) return { error: "no lamp entity" };
+    const ent = await globalThis.__editorApi.call("entity.get", { id }).catch(() => null);
+    const s0 = ent?.transform?.scale ?? [1, 1, 1];
+    const r = await globalThis.__editorApi.call("entity.setTransform", { id, scale: s0.map((v) => v * k) });
+    return { id, from: s0, to: r?.transform?.scale };
+  }, { k: LAMP_SCALE });
+  console.log(`lamp scaled x${LAMP_SCALE}: ${JSON.stringify(sc)}`);
+}
 await wait(SETTLE * 1000);
 const shot = await page.evaluate(async (w, h) => {
   const r = await globalThis.__editorApi.viewport.screenshot({ width: w, height: h, includeGizmos: false });

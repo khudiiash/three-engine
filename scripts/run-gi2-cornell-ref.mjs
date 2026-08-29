@@ -241,6 +241,26 @@ if (!firstLight) {
 }
 const [eye, aim] = POSE_ENV.split("|").map((s) => s.split(",").map(Number));
 await call("viewport.setCamera", { position: eye, target: aim });
+// §19 6.25 — `LAMP_SCALE=<k>`: scale the admitted lamp's ENTITY through the
+// editor (the gizmo's path, as `run-gi-scaled-lamp-test.mjs` does) BEFORE the
+// scene is extracted, so the path-traced truth AND ours both see the bigger
+// lamp. The penumbra-width gate: W = L·(d_r − d_b)/d_b follows the lamp's size.
+const LAMP_SCALE = Number(process.env.LAMP_SCALE ?? 1);
+if (LAMP_SCALE !== 1) {
+  const sc = await page.evaluate(async ({ k }) => {
+    const sys = globalThis.__giSys();
+    const emEntry = (sys?.state?.entries ?? []).find((e) => (e.peak ?? 0) > 0.5 && e.mesh);
+    let id = null;
+    for (let o = emEntry?.mesh; o && !id; o = o.parent) if (o.userData?.entityId) id = o.userData.entityId;
+    if (!id) return { error: "no lamp entity" };
+    const ent = await globalThis.__editorApi.call("entity.get", { id }).catch(() => null);
+    const s0 = ent?.transform?.scale ?? [1, 1, 1];
+    const r = await globalThis.__editorApi.call("entity.setTransform", { id, scale: s0.map((v) => v * k) });
+    return { id, from: s0, to: r?.transform?.scale };
+  }, { k: LAMP_SCALE });
+  console.log(`  lamp scaled x${LAMP_SCALE}: ${JSON.stringify(sc)}`);
+  await new Promise((r) => setTimeout(r, 2000));
+}
 console.log(`  first light yes · pose eye [${eye.map((v) => v.toFixed(2))}] → [${aim.map((v) => v.toFixed(2))}] · settling ${SETTLE}s`);
 
 // ═══════════════════════════════════════════════════ CONVERGENCE, FROM BOOT
@@ -645,7 +665,7 @@ const sceneHash = createHash("sha1").update(JSON.stringify({
   REF_VERSION,
   tri: R.scene.tri.map((v) => Math.round(v * 1e4)), triMat: R.scene.triMat,
   mats: R.scene.mats, sky: R.sky, BOUNCES, SPP,
-  pose: POSE_ENV, SIZE, stride: R.stride, dumpW: R.dumpW, dumpH: R.dumpH,
+  pose: POSE_ENV, SIZE, stride: R.stride, dumpW: R.dumpW, dumpH: R.dumpH, LAMP_SCALE,
 })).digest("hex").slice(0, 16);
 mkdirSync(CACHE_DIR, { recursive: true });
 const cachePath = path.join(CACHE_DIR, `${SCENE}-${sceneHash}.json`);

@@ -65,3 +65,4 @@ vite.cold.config.mjs
 .vite-bvh/
 .vite-console/
 .vite-tx/
+.vite-faces/

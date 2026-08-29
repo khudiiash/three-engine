@@ -425,6 +425,47 @@ const bvhNearestTFn = wgslFn(/* wgsl */ `
  * and, worse, it is a shape that answers "unoccluded" for a reason that would
  * survive a real bug. min > max can never be entered by any ray at all.
  */
+/**
+ * §19 6.25d — FOUR QUADRANT SHADOW RAYS + THE CENTRE'S NEAREST-T IN ONE CALL.
+ * `rcDirect` needs the visibility of four fixed points on the emitter's near
+ * face and the centre ray's first-hit distance; five separate wgslFn call
+ * sites in one kernel measured a lit wall at 0.31 (6.25c receipt) while the
+ * one-call 6.25 kernel read 0.925 — so the traversals happen HERE, over the
+ * one set of bound buffers. Returns (hits 0..4, centre t or −1). Each quadrant
+ * ray runs from `ro` to its point minus `margin` (a fraction of its length,
+ * floored at 2 mm) so the emitter's own face is never on the segment.
+ */
+const bvhQuadVisFn = wgslFn(/* wgsl */ `
+	fn gi2BvhQuadVis(
+		ro: vec3f,
+		rd: vec3f,
+		maxT: f32,
+		q0: vec3f,
+		q1: vec3f,
+		q2: vec3f,
+		q3: vec3f,
+		margin: f32,
+		nodes: ptr<storage, array<f32>, read>,
+		triIdx: ptr<storage, array<u32>, read>,
+		tris: ptr<storage, array<f32>, read>,
+		owners: ptr<storage, array<u32>, read>,
+		excl: ptr<storage, array<u32>, read>
+	) -> vec2f {
+		var hits: f32 = 0.0;
+		for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+			var q: vec3f = q0;
+			if (i == 1u) { q = q1; } else if (i == 2u) { q = q2; } else if (i == 3u) { q = q3; }
+			let w: vec3f = q - ro;
+			let dq: f32 = max(length(w), 1e-3);
+			let dir: vec3f = w / dq;
+			let mt: f32 = max(dq - max(dq * margin, 2e-3), 1e-3);
+			if (gi2BvhNearestT(ro, dir, mt, nodes, triIdx, tris, owners, excl) >= 0.0) { hits = hits + 1.0; }
+		}
+		let tc: f32 = gi2BvhNearestT(ro, rd, maxT, nodes, triIdx, tris, owners, excl);
+		return vec2f(hits, tc);
+	}
+`, [bvhNearestTFn]);
+
 export function createShadowBvhSlot() {
   const nodes = new Float32Array(8);
   nodes[0] = 1; nodes[1] = 1; nodes[2] = 1;    // min
@@ -540,6 +581,8 @@ export function createShadowBvhSlot() {
   const anyHit = (origin, dir, maxT) => bvhAnyHitFn(origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer, ownersBuffer, exclBuffer);
   /** §19 6.14 — the FIRST occluder's distance in `(origin, origin + dir*maxT)`, or −1. */
   const nearestT = (origin, dir, maxT) => bvhNearestTFn(origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer, ownersBuffer, exclBuffer);
+  /** §19 6.25d — the four quadrant rays + the centre's nearest-t, ONE call site. */
+  const quadVis = (origin, dir, maxT, q0, q1, q2, q3, margin) => bvhQuadVisFn(origin, dir, maxT, q0, q1, q2, q3, margin, nodesBuffer, triIdxBuffer, trisBuffer, ownersBuffer, exclBuffer);
 
   /**
    * ⭐⭐ THE SELF-HIT EPSILON, AND WHY IT IS ALONG THE NORMAL.
@@ -564,6 +607,12 @@ export function createShadowBvhSlot() {
       : anyHit(P, dir, maxT)
   );
 
+  const quadVisFrom = (P, dir, maxT, q0, q1, q2, q3, margin, normal) => (
+    normal
+      ? quadVis(P.add(normal.mul(SELF_EPS)), dir, maxT, q0, q1, q2, q3, margin)
+      : quadVis(P, dir, maxT, q0, q1, q2, q3, margin)
+  );
+
   const nearestTFrom = (P, dir, maxT, normal) => (
     normal
       ? nearestT(P.add(normal.mul(SELF_EPS)), dir, maxT)
@@ -571,6 +620,8 @@ export function createShadowBvhSlot() {
   );
 
   return {
+    quadVis,
+    quadVisFrom,
     anyHit,
     anyHitFrom,
     nearestTFrom,

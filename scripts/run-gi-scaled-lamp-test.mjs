@@ -51,6 +51,7 @@ const browser = await puppeteer.launch({
 const page = await browser.newPage();
 await page.setViewport({ width: 1650, height: 970, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
+await page.evaluateOnNewDocument((flags) => { for (const [k, v] of Object.entries(flags)) globalThis[k] = v; }, JSON.parse(process.env.FLAGS ?? "{}"));
 await installWebGpuErrorLog(page);
 await page.evaluateOnNewDocument((project) => {
   globalThis.__gi2Rc5 = true;
@@ -63,6 +64,8 @@ page.on("console", (m) => {
   const t = m.text();
   if (/\[gi2\] first light|\[gi\] field ready/.test(t)) firstLight = true;
   if (/emitter|admi|dynamic layer|seat|\[gi\].*(rror|ailed)/i.test(t)) console.log(`  ${t.slice(0, 200)}`);
+  if (process.env.ALLCONSOLE && /error|wgsl|compil|shader|pipeline|rcDirect|undeclared|unresolved|exact shadow|bvh/i.test(t)) console.log(`  [console] ${t.slice(0, 600)}`);
+  if (t.startsWith("[webgpu]") && (globalThis.__gpuErrN = (globalThis.__gpuErrN ?? 0) + 1) <= 4) console.log(`  ${t.slice(0, 1500)}`);
 });
 page.on("pageerror", (e) => console.log(`pageerror: ${e.message}`));
 await page.goto(url, { waitUntil: "load", timeout: 60000 });
@@ -96,6 +99,28 @@ await page.evaluate(async ({ p, t }) => {
   else vh.camera.lookAt(t[0], t[1], t[2]);
   vh.camera.updateMatrixWorld(true);
 }, { p: POSE[0], t: POSE[1] });
+// §19 6.25f — WAIT FOR THE DIRECT TERM'S FIRST OUTPUT, NOT A FIXED SETTLE. The
+// raw pass's pipeline can take tens of seconds to compile (6.25b: 4 slots x 14
+// trace call sites); until its first dispatch lands, visA/penA are the zeros
+// the textures were born with and the filter chain blurs them into a grey
+// ramp — the "lit wall 0.3" of 6.25b-d was a read BEFORE the kernel ran.
+{
+  const tA = Date.now();
+  let arrived = -1;
+  for (let k = 0; k < 60; k++) {
+    const nz = await page.evaluate(async () => {
+      const gi2 = globalThis.__gi2(); const pt = gi2?.rc?.resolve?.direct?.penumbra ?? null; if (!pt) return -1;
+      const { createGi2TexProbe } = await import("/scripts/lib/gi2TexProbe.js");
+      if (globalThis.__tpPenTex !== pt) { globalThis.__tpPen = createGi2TexProbe({ renderer: globalThis.__giEngineForProbe.renderer, tex: pt }); globalThis.__tpPenTex = pt; }
+      const w = pt.image?.width ?? 1, h = pt.image?.height ?? 1; const pts = [];
+      for (let i = 0; i < 24; i++) for (let j = 0; j < 24; j++) pts.push([Math.floor((i + 0.5) * w / 24), Math.floor((j + 0.5) * h / 24)]);
+      const o = await globalThis.__tpPen.read(pts); let n = 0; for (const v of o) if (v > 0) n++; return n;
+    });
+    if (nz > 0) { arrived = (Date.now() - tA) / 1000; break; }
+    await wait(1500);
+  }
+  console.log(`direct term first output ${arrived >= 0 ? `${arrived.toFixed(1)} s after the pose (penumbra texels > 0)` : "NOT seen in 90 s"}`);
+}
 await wait(SETTLE * 1000);
 
 const shoot = async (name) => {
@@ -256,6 +281,143 @@ const READ = async ({ WALL }) => {
   const o = await tp.read(all.map((p) => [Math.round(p.pix[0]) >> 1, Math.round(p.pix[1]) >> 1]));
   const vis = all.map((_, i) => (seen[i] ? o[i * 4] : NaN));
   const lineVis = vis.slice(0, line.length);
+  // §19 6.25c — the FACE RECEIPT: debug 2 dumps (axis+10·[sign>0], F) per texel;
+  // compare with the near face computed HERE from the seat's frame.
+  if (globalThis.__faceDebug) {
+    try {
+      const dU = gi2.rc?.resolve?.direct?.uniforms?.rcDirectDebug, dU2 = gi2.rc?.uniforms?.rcDirectDebug;
+      if (!dU && !dU2) throw new Error("no rcDirectDebug uniform");
+      out.faceSame = dU === dU2;
+      if (dU) dU.value = 2; if (dU2) dU2.value = 2;
+      // the GI idles at rest: nudge the camera so the direct passes re-dispatch
+      vh.camera.position.y += 0.003; vh.camera.updateMatrixWorld(true);
+      for (let f = 0; f < 12; f++) await new Promise((r) => requestAnimationFrame(r));
+      const dd = await tp.read(all.map((p) => [Math.round(p.pix[0]) >> 1, Math.round(p.pix[1]) >> 1]));
+      if (dU) dU.value = 0; if (dU2) dU2.value = 0;
+      vh.camera.position.y -= 0.003; vh.camera.updateMatrixWorld(true);
+      for (let f = 0; f < 12; f++) await new Promise((r) => requestAnimationFrame(r));
+      const s0 = sys.state.emitterSlots?.[0] ?? null;
+      const sl = slots[0];
+      const B = s0 ? [s0.bx.value.toArray(), s0.by.value.toArray(), s0.bz.value.toArray()] : null;
+      const C = sl.center, EX = sl.exHalf;
+      const rows = [];
+      for (let i = 0; i < all.length && rows.length < 6; i++) {
+        if (!seen[i] || !(vis[i] > 0.05)) continue;   // lit-ish texels
+        if (rows.length && i % 7) continue;
+        const P = all[i].P;
+        const code = dd[i * 4], F = [dd[i * 4 + 1], dd[i * 4 + 2], dd[i * 4 + 3]];
+        let hand = null;
+        if (B) {
+          const wv = [C[0] - P[0], C[1] - P[1], C[2] - P[2]]; const d = Math.hypot(...wv); const wd = wv.map((v) => v / d);
+          const lds = B.map((b) => b[0] * wd[0] + b[1] * wd[1] + b[2] * wd[2]);
+          const ratio = lds.map((l, k) => EX[k] / Math.max(1e-6, Math.abs(l)));
+          const ax = ratio.indexOf(Math.min(...ratio));
+          const sg = Math.sign(-lds[ax]);
+          hand = { ax, sg, F: B[ax].map((b, m) => +(C[m] + b * sg * EX[ax]).toFixed(3)) };
+        }
+        rows.push({ P: P.map((v) => +v.toFixed(2)), vis: +vis[i].toFixed(3), code: +code.toFixed(1), F: F.map((v) => +v.toFixed(3)), hand });
+      }
+      out.faceRows = rows; out.faceB = B;
+    } catch (e) { out.faceErr = String(e?.message ?? e); }
+  }
+  // §19 6.25b — the PCSS width W (metres, slot 0, dilated) at five wall texels
+  try {
+    const pt = gi2.rc?.resolve?.direct?.penumbra ?? null;
+    if (pt) {
+      const pp2 = createGi2TexProbe({ renderer: eng.renderer, tex: pt });
+      const w = await pp2.read(line.map((p) => [Math.round(p.pix[0]) >> 1, Math.round(p.pix[1]) >> 1]));
+      const ws = line.map((_, i) => (seen[i] ? +w[i * 4].toFixed(4) : NaN)).filter(Number.isFinite);
+      const st = Math.max(1, Math.floor(ws.length / 5));
+      out.penW = ws.filter((_, i) => i % st === 0).slice(0, 5);
+      out.penWmax = ws.length ? Math.max(...ws) : null;
+    } else out.penErr = "no penumbra texture";
+  } catch (e) { out.penErr = String(e?.message ?? e); }
+  // §19 6.25e — THE CPU INTERSECTION RECEIPT (FLAGS __cpuHit): the exact arm's
+  // centre segment and the four quadrant segments for 5 seen wall texels,
+  // brute-forced against the bound soup with the JS mirror of the GPU test.
+  if (globalThis.__cpuHit) {
+    try {
+      const { triHit, bvhAnyHit } = await import("/scripts/lib/shadowBvhMirror.mjs");
+      const bvh = gi2.shadowBvh ?? null;
+      const tris = bvh?.tris ?? null;
+      const s0 = sys.state.emitterSlots?.[0];
+      if (!tris || !s0) throw new Error(`no soup tris (${!!tris}) / seat (${!!s0})`);
+      const nT = tris.length / 9;
+      const C = s0.center.value.toArray(), B = [s0.bx.value.toArray(), s0.by.value.toArray(), s0.bz.value.toArray()];
+      const EX = s0.exHalf.value.toArray().map((v) => Math.max(Math.abs(v), 1e-4));
+      const clear = Math.max(s0.radius.value, Math.max(s0.reff.value, 1e-3));
+      const SP = globalThis.__giQuadSpread ?? 0.5;
+      // lamp triangles = every triangle whose centroid lies inside the seat's OBB (+2 cm)
+      const lampTris = [];
+      for (let t = 0; t < nT; t++) {
+        const o = t * 9; const cx = (tris[o] + tris[o + 3] + tris[o + 6]) / 3, cy = (tris[o + 1] + tris[o + 4] + tris[o + 7]) / 3, cz = (tris[o + 2] + tris[o + 5] + tris[o + 8]) / 3;
+        const r = [cx - C[0], cy - C[1], cz - C[2]];
+        const l = B.map((b) => Math.abs(b[0] * r[0] + b[1] * r[1] + b[2] * r[2]));
+        if (l.every((v, i) => v <= EX[i] + 0.02)) lampTris.push(t);
+      }
+      const rows = [];
+      const cand = line.map((p, i) => ({ p, i })).filter(({ i }) => seen[i]);
+      const step = Math.max(1, Math.floor(cand.length / 5));
+      for (let c = 0; c < cand.length && rows.length < 5; c += step) {
+        const { p, i } = cand[c]; const P = p.P;
+        const N = plane.axis === 2 ? [0, 0, 1] : plane.axis === 0 ? [WALL === "left" ? 1 : -1, 0, 0] : [0, 1, 0];
+        const ro = [P[0] + N[0] * 2e-3, P[1] + N[1] * 2e-3, P[2] + N[2] * 2e-3];
+        const wv = [C[0] - P[0], C[1] - P[1], C[2] - P[2]]; const d = Math.hypot(...wv); const wd = wv.map((v) => v / d);
+        const ld = B.map((b) => Math.max(Math.abs(b[0] * wd[0] + b[1] * wd[1] + b[2] * wd[2]), 1e-6));
+        const slab = Math.min(EX[0] / ld[0], EX[1] / ld[1], EX[2] / ld[2]);
+        const reach = Math.max(d - Math.min(slab, clear) - Math.max(d * 1e-3, 2e-3), 1e-3);
+        const hitsOf = (o, dir, maxT) => { const h = []; for (let t = 0; t < nT; t++) if (triHit(tris, t, o, dir, maxT)) h.push(t); return h; };
+        const centreHits = hitsOf(ro, wd, reach);
+        const treeHit = (bvh.nodes && bvh.triIdx) ? bvhAnyHit({ nodes: bvh.nodes, triIdx: bvh.triIdx }, tris, ro, wd, reach) : null;
+        // the quadrant points (as the kernel computes them)
+        const lds = B.map((b) => b[0] * wd[0] + b[1] * wd[1] + b[2] * wd[2]);
+        const axq = EX.map((e, k) => e / ld[k]); const ax = axq.indexOf(Math.min(...axq));
+        const sg = Math.sign(lds[ax]) || 1;
+        const F = C.map((v, m) => v - B[ax][m] * sg * EX[ax]);
+        const tU = B[ax === 0 ? 1 : 0], eU = EX[ax === 0 ? 1 : 0] * SP, tV = B[ax === 2 ? 1 : 2], eV = EX[ax === 2 ? 1 : 2] * SP;
+        const quads = [[-1, -1], [1, -1], [-1, 1], [1, 1]].map(([a, b]) => {
+          const Q = SP < 0 ? C.map((v, m) => v - wd[m] * Math.min(slab, clear)) : F.map((v, m) => v + tU[m] * eU * a + tV[m] * eV * b);
+          const w = [Q[0] - ro[0], Q[1] - ro[1], Q[2] - ro[2]]; const dq = Math.max(Math.hypot(...w), 1e-3); const dir = w.map((v) => v / dq);
+          const mt = Math.max(dq - Math.max(dq * 1e-3, 2e-3), 1e-3);
+          return { Q: Q.map((v) => +v.toFixed(3)), hits: hitsOf(ro, dir, mt) };
+        });
+        const tri = (t) => { const o = t * 9; return [...tris.slice(o, o + 9)].map((v) => +v.toFixed(2)); };
+        rows.push({ P: P.map((v) => +v.toFixed(2)), vis: Number.isFinite(vis[i]) ? +vis[i].toFixed(3) : null, yzw: [1, 2, 3].map((c) => +o[i * 4 + c].toFixed(3)), d: +d.toFixed(3), slab: +slab.toFixed(3), clear: +clear.toFixed(3), reach: +reach.toFixed(3), tree: treeHit ? `${treeHit.hit}/${treeHit.visited}/${treeHit.tested}` : null,
+          centreHits: centreHits.slice(0, 4).map((t) => ({ t, lamp: lampTris.includes(t), v: tri(t) })), quadHits: quads.map((q) => q.hits.length), Q0: quads[0].Q });
+      }
+      out.cpu = { nT, lampTris: lampTris.length, lampTriIds: lampTris.slice(0, 12), C: C.map((v) => +v.toFixed(3)), EX: EX.map((v) => +v.toFixed(3)), clear: +clear.toFixed(3), B, rows };
+    } catch (e) { out.cpuErr = String(e?.message ?? e); }
+  }
+  // §19 6.25e — the raw pass's GENERATED WGSL (FLAGS __dumpRaw, WGSL_OUT=<file>)
+  if (globalThis.__dumpRaw) {
+    try {
+      const rp = gi2.rc?.resolve?.direct?.passes?.[0];
+      const st = eng.renderer._nodes?.getForCompute?.(rp);
+      out.wgsl = st?.computeShader ?? null;
+    } catch (e) { out.wgslErr = String(e?.message ?? e); }
+  }
+  // §19 6.25f — identities: is the texture read the one the LAST-built rawPass writes, and is that kernel in the frame?
+  try {
+    const last = globalThis.__rcDirectLast ?? null;
+    const dir = gi2.rc?.resolve?.direct ?? null;
+    const fl0 = typeof gi2.passes === "function" ? gi2.passes() : null; const frameList = Array.isArray(fl0) ? fl0 : Array.isArray(fl0?.computeNodes) ? fl0.computeNodes : Object.values(fl0 ?? {}).flat().filter((x) => x && typeof x === "object");
+    out.ident = { builds: globalThis.__rcDirectBuilds ?? 0, lastBuild: last?.build ?? null, texIsLast: last ? last.visA === vt : null, texName: vt?.name, texUuid: vt?.uuid?.slice(0, 8), lastUuid: last?.visA?.uuid?.slice(0, 8),
+      dirPasses: dir?.passes?.length ?? null, rawInDir: dir?.passes?.includes(last?.rawPass) ?? null, frameN: frameList.length, rawInFrame: frameList.includes(last?.rawPass), rawOnly: !!globalThis.__giRawOnly, flShape: fl0 == null ? null : Array.isArray(fl0) ? "array" : Object.keys(fl0).slice(0, 6).join(","), frameNames: frameList.slice(0, 60).map((p) => p?.__giPassName ?? p?.name ?? "?").filter((n) => /direct|rcEmitter|raw|vis|pen/i.test(n)) };
+    // the pipeline's own state + a manual dispatch of the raw pass, then an immediate read
+    try {
+      const rp = last?.rawPass; const R = eng.renderer;
+      const b = R._bindings.getForCompute(rp); const p = R._pipelines.getForCompute(rp, b); const st = R.backend.get(p);
+      const mod = R.backend.get(p.computeProgram)?.module; const info = mod ? await mod.getCompilationInfo() : null;
+      out.ident.pipe = { error: !!st?.error, has: !!st?.pipeline, count: rp?.count ?? null, halfW: dir?.halfW, halfH: dir?.halfH, tex: [vt?.image?.width, vt?.image?.height], wU: dir?.uniforms?.rcDirectWidth?.value, hU: dir?.uniforms?.rcDirectHeight?.value,
+        msgs: (info?.messages ?? []).filter((m) => m.type !== "info").slice(0, 3).map((m) => `${m.type} L${m.lineNum}: ${m.message.slice(0, 160)}`) };
+      R.compute(rp);
+      const o2 = await tp.read(all.slice(0, 8).map((p) => [Math.round(p.pix[0]) >> 1, Math.round(p.pix[1]) >> 1]));
+      out.ident.manual = [...o2.slice(0, 8)].map((v) => +v.toFixed(3));
+      const gp = await globalThis.__editorApi.call("profile.giPasses", { samples: 4 });
+      out.ident.rcKeys = Object.keys(gp?.gi2Ms ?? {}).filter((k) => /rc|direct|emitter/i.test(k)).slice(0, 12);
+      out.ident.gi2Keys = Object.keys(gp?.gi2Ms ?? {}).length;
+    } catch (e) { out.ident.pipeErr = String(e?.message ?? e); }
+  } catch (e) { out.ident = String(e?.message ?? e); }
   const gridVis = vis.slice(line.length);
   const pxStep = line.length > 1 ? Math.hypot(line[1].pix[0] - line[0].pix[0], line[1].pix[1] - line[0].pix[1]) : 0;
   // THE RAMP: the transition between the darkest and the brightest visible
@@ -282,10 +444,16 @@ const readOnce = async (label) => {
   console.log(`  lamp: ${JSON.stringify(r.lamp)} admission: ${JSON.stringify(r.admitted)}`);
   if (s) console.log(`  seat0: kind ${s.kind} radius ${s.radius} reff ${s.reff} half ${JSON.stringify(s.half)} exHalf ${JSON.stringify(s.exHalf)} rgb ${JSON.stringify(s.rgb)} moved ${s.moved} center ${JSON.stringify(s.center)}`);
   console.log(`  gi2: movers ${r.gi2?.movers} moverTris ${r.gi2?.moverTris} voxelsSet ${r.gi2?.voxelsSet} | live movers ${JSON.stringify(r.moversLive)} promoted ${JSON.stringify(r.promoted)}`);
+  if (r.faceRows || r.faceErr) { console.log(`  face receipt B=${JSON.stringify(r.faceB)} sameUniform=${r.faceSame} ${r.faceErr ?? ""}`); for (const q of r.faceRows ?? []) console.log(`    ${JSON.stringify(q)}`); }
+  if (r.wgsl && process.env.WGSL_OUT) { writeFileSync(process.env.WGSL_OUT, r.wgsl); console.log(`  wrote ${process.env.WGSL_OUT} (${r.wgsl.length} chars)`); } else if (r.wgslErr) console.log(`  wgsl: ${r.wgslErr}`);
+  if (r.ident) console.log(`  ident: ${JSON.stringify(r.ident)}`);
+  if (r.cpu || r.cpuErr) { console.log(`  cpu receipt: ${r.cpuErr ?? ""} nT ${r.cpu?.nT} lampTris ${r.cpu?.lampTris} ids ${JSON.stringify(r.cpu?.lampTriIds)} C ${JSON.stringify(r.cpu?.C)} EX ${JSON.stringify(r.cpu?.EX)} clear ${r.cpu?.clear}`); for (const q of r.cpu?.rows ?? []) console.log(`    ${JSON.stringify(q)}`); }
+  if (r.penW || r.penErr) console.log(`  penumbra W (m) at 5 wall texels: ${JSON.stringify(r.penW)} max ${r.penWmax} ${r.penErr ?? ""}`);
   if (r.wall) console.log(`  wall(${r.wall.occ}): ramp ${r.wall.rampPx} px (${r.wall.rampSamples} of ${r.wall.nLineSeen}/${r.wall.nLine} seen samples @ ${r.wall.pxStep} px) vis min ${r.wall.minVis} max ${r.wall.maxVis} depth ${r.wall.depth} | medVis shadow ${r.wall.medVisShadow} lit ${r.wall.medVisLit} (n ${r.wall.nShadow}/${r.wall.nLit})${r.gbufFlip ? " [gbuf flipped]" : ""}${r.gbufCheck ? ` [${r.gbufCheck}]` : ""}`);
   if (r.wall && process.env.PROFILE) console.log(`  profile: ${r.wall.profile.join(" ")}`);
   return r;
 };
+
 
 const before = await readOnce("BEFORE");
 await shoot("before");
@@ -332,5 +500,12 @@ console.log("\n== GATES ==");
 let pass = true;
 for (const [name, ok, detail] of gates) { console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}: ${detail}`); if (!ok) pass = false; }
 console.log(`\n${pass ? "PASS" : "FAIL"} gi-scaled-lamp (scale x${SCALE})`);
+try {
+  const gp = await page.evaluate(async () => globalThis.__editorApi.call("profile.giPasses", { samples: 8 }));
+  const list = Array.isArray(gp) ? gp : (gp?.passes ?? gp?.entries ?? gp?.rows ?? []);
+  const hit = (Array.isArray(list) ? list : []).filter((e) => /direct|rc/i.test(JSON.stringify(e).slice(0, 80)));
+  console.log(`  profile.giPasses (direct/rc): ${JSON.stringify(hit).slice(0, 700)}`);
+  if (!hit.length) console.log(`  profile.giPasses raw: ${JSON.stringify(gp).slice(0, 500)}`);
+} catch (e) { console.log(`  profile.giPasses failed: ${e?.message ?? e}`); }
 await browser.close();
 process.exit(pass ? 0 : 1);
