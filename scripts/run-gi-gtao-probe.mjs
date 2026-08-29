@@ -103,8 +103,8 @@ const out = await page.evaluate(async ({ subjects }) => {
   const renderer = engine.renderer;
   const sys = engine.modules?.get?.("gi")?.system ?? null;
   const screen = sys?.state?.screen ?? null;
-  const pass = screen?.vxaoPass;
-  if (!pass?.target || !screen?.gbuffer?.position) return { error: "no AO pass on state.screen.vxaoPass" };
+  const pass = screen?.aoPass ?? screen?.vxaoPass;
+  if (!pass?.target || !screen?.gbuffer?.position) return { error: "no AO pass on state.screen.aoPass" };
 
   // 256-byte row padding is mandatory on every WebGPU readback, and the row
   // ORDER is the texture's own — pairing each AO texel with the gbuffer texel
