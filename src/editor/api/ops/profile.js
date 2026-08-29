@@ -701,6 +701,9 @@ defineOp({
           probes: s.probes,
           raysPerFrame: s.rays,
           movers: s.movers,
+          // §19 6.22: GI Mobility counts — static / dynamic / auto (still) /
+          // promoted (an "auto" mesh that moved and is in the dynamic layer).
+          mobility: s.mobility ?? null,
           scrolls: s.scrolls,
           firstOccupancyMs: s.occupancyMs ?? {},
           firstLightMs: s.msToFirstLight || null,

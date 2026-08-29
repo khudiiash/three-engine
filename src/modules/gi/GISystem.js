@@ -44,6 +44,7 @@ import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRAC
 import { srcBinStoreBoundBytes } from "./srcDeposit.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { SURFACE_POOL_CEILINGS, bitsBytesFor, createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
+import { createGi2Mobility } from "./window/mobility.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
 import { buildLightTree, collectEmitters, estimateLightTreeWords } from "./lightTree.js";
 import { createLightTreeStore } from "./lightTreeStore.js";
@@ -176,6 +177,8 @@ const GI2_MOVER_CAP = 64;
  * happens to be in an idle pose is still going to move).
  */
 const GI2_MOVER_REST_FRAMES = 120;
+/** §19 6.22: the "auto" watch is walked in this many per-frame windows (see `#refreshGi2Movers`). */
+const GI2_AUTO_WATCH_FRAMES = 8;
 /**
  * CONVERGED-IDLE SLEEP (run-gi-perf.mjs, 2026-08-03: the full pipeline at
  * rest is ~2.3ms GPU at ultra — feedback ~1.4, transport ~0.8 — recomputing
@@ -3356,7 +3359,12 @@ export class GISystem {
     // this stage removed (the g-buffer hold and ShadowFreeze) get a measured
     // transform signal for free. One cheap loop replaces two costly ones —
     // which is the unit's goal, arrived at from the other end.
-    const atlasMoved = state.atlas.refreshTransforms();
+    // §19 6.22: under GI2 the audit walks ONLY dynamic-now slots (explicit
+    // "dynamic" + promoted "auto") — static slots are never compared, so a
+    // scene with nothing dynamic bumps nothing at rest.
+    const atlasMoved = state.atlas.refreshTransforms(
+      GI2_PATH && this._gi2Mobility ? this._gi2Mobility.isDynamicNow : null,
+    );
     // Same contract for the exact-reflection BVH scene (GI Phase 3 v1): a
     // moving mesh is a per-mesh uniform update, never a buffer rebuild.
     state.bvhScene?.refreshTransforms();
@@ -3733,6 +3741,7 @@ export class GISystem {
           this._gi2StatsBusy = true;
           state.screen.gi2.stats(renderer)
             .then((s) => {
+              s.mobility = this._gi2Mobility?.counts() ?? null;
               this._gi2Stats = s;
               // §0.4's fail-open contract, GI2's terms: probes that FOUND a
               // surface, and rays that came back from the window. Until both
@@ -7409,7 +7418,9 @@ export class GISystem {
     const { width, height } = this.#screenResolveSize();
     const { width: shadowW, height: shadowH } = this.#lightShadowSize({ width, height });
     try {
-      const gbuffer = createGiGBuffer(width, height);
+      // §19 6.29 — the kept GI2 system's kernels bind its g-buffer textures.
+      const keptGi2 = this._gi2Keep && this._gi2 ? this._gi2 : null;
+      const gbuffer = keptGi2?.gbuffer ?? createGiGBuffer(width, height);
       const emitterScale = this.#emitterShadowScale();
       const emitterW = Math.max(64, Math.round(shadowW * emitterScale));
       const emitterH = Math.max(64, Math.round(shadowH * emitterScale));
@@ -7443,7 +7454,14 @@ export class GISystem {
       // material that samples it and buys a full compile wave on every
       // rebuild and every resize.
       let gi2 = null;
-      if (GI2_PATH) {
+      if (GI2_PATH && keptGi2) {
+        gi2 = keptGi2;
+        gi2.rearm();
+        this._gi2Keep = false;
+        console.log("[gi] gi2 state CARRIED — the window, the brick cache and the cascades survive this rebuild; only the transport refreshes");
+      } else if (GI2_PATH) {
+        this._gi2Keep = false;
+        this._gi2Sig = this.#gi2Signature();
         gi2 = createGi2System({
           renderer,
           engine: this.engine,
@@ -10770,6 +10788,13 @@ export class GISystem {
   }
 
   /** Resolve resolution: half the drawing buffer, clamped to a PIXEL budget. */
+  /** §19 6.29 — the describe-level parameters a kept GI2 system must still match. */
+  #gi2Signature() {
+    const { width, height } = this.#screenResolveSize();
+    const props = this.config ?? {};
+    return `${gi2TierOf(props)}:${width}x${height}:ao${props.ao !== false ? 1 : 0}:em${props.emissiveShadows !== false ? 1 : 0}`;
+  }
+
   #screenResolveSize() {
     const renderer = this.engine.renderer;
     const size = renderer.getDrawingBufferSize(new THREE.Vector2());
@@ -11567,9 +11592,25 @@ export class GISystem {
     // pipeline that fails to compile at a new size, first appears. Reset all
     // three: the latch, the deadline clock (#tick re-arms it on the next first
     // dispatch), and the once-per-build error.
-    this._transportAlive = false;
     this._transportWaveAt = 0;
     this._transportDeadLogged = false;
+    // ── §19 6.29 — A CONTENT REBUILD REFRESHES THE TRANSPORT, NEVER THE LIGHT ─
+    //
+    // The GI2 system (window, brick cache, RC probe store, bins, tiles) is KEPT
+    // across a rebuild whose describe-level parameters did not change; only
+    // the soup/voxel/BVH transport is refreshed by `gi2.build()`. Decided here,
+    // before `#dispose`, off the live system's own tier/size — a quality flip
+    // or a resize is a real re-allocation and still goes through the old path.
+    this._gi2Keep = GI2_PATH && !!this._gi2 && this.#gi2Signature() === this._gi2Sig
+      && globalThis.__gi2CarryState !== false;
+    // The IBL blackout latch is re-earned by a NEW system's rays; a kept system's
+    // rays never stopped, and dropping the latch here blacked the indirect term
+    // for the ~4 frames the readback took to re-latch it (measured: mean 0.557
+    // → 0.171, 83 % of pixels black, at both the promotion and the settle).
+    if (!this._gi2Keep) this._transportAlive = false;
+    if (GI2_PATH && this._gi2 && !this._gi2Keep) {
+      console.log(`[gi] gi2 NOT carried — describe-level change (${this._gi2Sig} → ${this.#gi2Signature()}); a real re-allocation`);
+    }
     this.#dispose();
     const component = this.component;
     const engine = this.engine;
@@ -12029,18 +12070,19 @@ export class GISystem {
     // update uniforms only, so no kernel gains a binding and nothing rebuilds.
     // Read by the screen resolve, the GI-traced light shadows and the mover
     // occluder set; the transport's own readers went with it.
-    const lightSlots = makeLightSlots();
+    // §19 6.29 — under GI2 the slot uniforms PERSIST across rebuilds: the kept
+    // system's kernels close over them. Same `??=` contract as `_giSunNodes`.
+    const lightSlots = GI2_PATH ? (this._gi2LightSlots ??= makeLightSlots()) : makeLightSlots();
     // §12.82: WHICH of those slots the sun split treats analytically, −1 for
     // none. A uniform and not a build-time index, for the same reason `kind` is
     // — adding, hiding or dimming a light reshuffles the slot list and must
     // never cost a GI rebuild (R11).
-    const sunSlot = uniform(-1);
+    const sunSlot = GI2_PATH ? (this._gi2SunSlot ??= uniform(-1)) : uniform(-1);
+    if (GI2_PATH) sunSlot.value = -1;
     // Emitter slots (promoted emissive meshes) are shared by the material light
     // node (receiver direct + shadows + mirror glow) and the screen-side emitter
     // shadow pass, and refreshed EVERY FRAME.
-    const emitterSlots =
-      props.emissiveShadows !== false
-        ? Array.from({ length: MAX_EMITTERS }, () => ({
+    const makeEmitterSlots = () => Array.from({ length: MAX_EMITTERS }, () => ({
             center: giUniform(new THREE.Vector3()),
             radius: giUniform(0),
             color: giUniform(new THREE.Color(0, 0, 0)),
@@ -12068,8 +12110,12 @@ export class GISystem {
             // ~20-frame EMA wake, while statically-lit cells keep full
             // smoothing (see createBounceFeedback's emitter-motion cut).
             moved: giUniform(0),
-          }))
+          }));
+    const emitterSlots =
+      props.emissiveShadows !== false
+        ? (GI2_PATH ? (this._gi2EmitterSlots ??= makeEmitterSlots()) : makeEmitterSlots())
         : null;
+    if (GI2_PATH && emitterSlots) for (const s of emitterSlots) s.radius.value = 0;
     // ══ THE DIFFUSE TRANSPORT USED TO BE BUILT HERE ═══════════════════════════
     //
     // createRadianceCascades → createCascadeMerge → createProbeIrradiance +
@@ -12097,7 +12143,7 @@ export class GISystem {
     // A parked uniform is inert, not lying: with the whole diffuse term absent
     // there is no reading of "Bounce Energy 0.5" that these could satisfy and
     // do not.
-    const skyRadiance = uniform(new THREE.Color(0, 0, 0));
+    const skyRadiance = GI2_PATH ? (this._gi2SkyRadiance ??= uniform(new THREE.Color(0, 0, 0))) : uniform(new THREE.Color(0, 0, 0));
     const probeSmoothing = uniform(clampProbeSmoothing(props.probeSmoothing));
     const bounceGain = uniform(Math.min(1, Math.max(0, props.bounce ?? 1)));
     const bleedSaturation = uniform(Math.min(1, Math.max(0, props.bleedSaturation ?? 1)));
@@ -12147,7 +12193,9 @@ export class GISystem {
     // screen textures and never capture cascade/SDF/BVH buffers directly.
     // A fresh light is still required for the first-build lights-hash commit;
     // subsequent in-place refits retain the existing instance.
-    const light = new GICascadeLight();
+    const light = (GI2_PATH && this._gi2Light) ? this._gi2Light : new GICascadeLight();
+    if (light === this._gi2Light) console.log("[gi] gi2 light RETAINED across the rebuild — same instance, same lights hash, stays in the scene");
+    this._gi2Light = null;
     light.gatherFn = gather;
     // World-scale light params are uniform-derived NODES (giLight composes
     // them into node math either way) so an in-place refit rescales them.
@@ -12218,13 +12266,24 @@ export class GISystem {
     // rebuild); the `ao` prop itself is structural — off compiles the
     // resolve's sample out entirely. `node` is attached by #buildScreenResolve
     // once the gbuffer exists.
-    const ao =
+    let ao =
       props.ao !== false
         ? {
             strength: uniform(Math.min(1, Math.max(0, props.aoStrength ?? 0.6))),
             radius: uniform(Math.min(3, Math.max(0.1, props.aoRadius ?? 0.6))),
           }
         : null;
+    // §19 6.29 — the AO bag persists too (the kept gather reads `env.ao`); its
+    // `.node`/`.computes` are re-armed per build by `#armGtaoPass`.
+    if (GI2_PATH && ao) {
+      if (this._gi2Ao) {
+        this._gi2Ao.strength.value = ao.strength.value;
+        this._gi2Ao.radius.value = ao.radius.value;
+        ao = this._gi2Ao;
+      } else {
+        this._gi2Ao = ao;
+      }
+    }
     // DEFERRED RESOLVE: evaluate the gather + emitter shadows once per screen
     // pixel instead of inside every material (see giScreen.js). This is what
     // keeps material shaders small — the driver compile of a 200kB+ GI
@@ -14464,6 +14523,12 @@ export class GISystem {
     // while it is alive — disposing first would hand them an empty list and
     // leak every kernel and every buffer it owns. Only the instance-level refs
     // are dropped at this point.
+    // §19 6.29 — the kept system is unhooked from the dying state BEFORE the
+    // release walks below read `state.screen.gi2.storageAttributes`, so
+    // nothing it owns is retired. Everything else (movers, promotion state,
+    // the pack) is per-build and resets as before; `build()` re-derives it.
+    const keptGi2 = this._gi2Keep && state.screen?.gi2 === this._gi2 ? this._gi2 : null;
+    if (keptGi2) state.screen.gi2 = null;
     if (state.screen?.gi2) {
       if (this._gi2 === state.screen.gi2) this._gi2 = null;
       this._gi2Passes = null;
@@ -14481,11 +14546,28 @@ export class GISystem {
       this._gi2MoversDirty = false;
       this._gi2Stats = null;
     }
+    if (keptGi2) {
+      this._gi2Passes = null;
+      this._gi2Movers = null;
+      this._gi2MoverMeshes = null;
+      this._gi2AutoWatch = null;
+      this._gi2Promoted = null;
+      this._gi2Pack = null;
+      this._gi2PackToken = null;
+      this._gi2MoversDirty = false;
+      this._gi2Stats = null;
+    } else if (this._gi2) {
+      // A system nothing kept and no state named (a rebuild that bailed out
+      // after keeping it) — retire it here rather than leak it.
+      this.#retireTargets(this._gi2);
+      this._gi2 = null;
+    }
     // The gbuffer is per-build; the resolve TARGETS are not (see
     // createGiTargets) — disposing them here would strand every material that
     // is still bound to them. Same rule for the BVH reflect target
     // (`_giBvhTarget`, see `#syncBvhScene`) — it is not touched here either.
-    state.screen?.gbuffer?.dispose?.();
+    // §19 6.29 — unless the kept GI2 system's kernels bind it.
+    if (!(keptGi2 && state.screen?.gbuffer === keptGi2.gbuffer)) state.screen?.gbuffer?.dispose?.();
     // Per-build like the gbuffer it reads (the AO texture is only ever bound
     // by the resolve, which dies with the build).
     state.screen?.aoPass?.dispose?.();
@@ -14493,7 +14575,19 @@ export class GISystem {
     // Per-build like the gbuffer it reads, and unlike the resolve targets: no
     // material is bound to a probe buffer, so nothing is stranded by this.
     state.screen?.srcProbes?.dispose?.();
-    state.light?.removeFromParent();
+    // §19 6.29b — THE LIGHT STAYS IN THE SCENE ON A CARRY. Removing it here and
+    // adding a NEW one after the compile wave was the 3-4 frame black gap
+    // (receipt: `run-gi2-carry-flash-probe` — on every black frame the light
+    // identity had changed and `light.parent !== scene`, while the irradiance
+    // texture, its node and the state were all present). The design note at
+    // the light's creation already said the instance should be retained; now
+    // it is, and materials keep their lights hash and their pipelines.
+    if (keptGi2 && state.light) {
+      this._gi2Light = state.light;
+    } else {
+      this._gi2Light = null;
+      state.light?.removeFromParent();
+    }
     for (const mesh of state.gizmos?.all ?? []) {
       mesh.removeFromParent();
       mesh.geometry?.dispose();
@@ -17718,6 +17812,9 @@ export class GISystem {
         const area = sx * sy + sy * sz + sz * sx;
         mix(Math.round(Math.log2(Math.max(area, 1e-9)) * 32));
       }
+      // §19 6.22: GI Mobility is read at BUILD (static soup vs dynamic layer),
+      // so a change of it is a change of content — the rebuild re-classifies.
+      mix(giMobilityOf(mesh) === "static" ? 1 : giMobilityOf(mesh) === "dynamic" ? 2 : 3);
       // Instance count and matrix version: adding, removing or re-scattering
       // instances changes which slots exist, and nothing else here would
       // notice (the mesh id, geometry and material are all unchanged).
@@ -18307,7 +18404,13 @@ export class GISystem {
     this._gi2MoverMeshes = meshes;
     this._gi2Movers = null;
     this._gi2AutoWatch = null;
-    this._gi2Promoted = new Set();
+    this._gi2StaticWatch = null;
+    // §19 6.22: ONE classification, kept ACROSS rebuilds — a promoted "auto"
+    // mesh stays dynamic through the soup re-kick its promotion asked for, and
+    // returns to static only when it has rested (`#refreshGi2Movers`).
+    this._gi2Mobility ??= createGi2Mobility();
+    this._gi2Promoted = this._gi2Mobility.promoted;
+    gi2.setMobility?.(this._gi2Mobility);
     this._loggedGi2SkinnedMovers = false;
     const token = (this._gi2PackToken = Symbol("gi2-pack"));
     const budget = Number(globalThis.__gi2PackBudgetMs) > 0
@@ -18388,12 +18491,25 @@ export class GISystem {
     // voxel-membership function. A skinned rig is never here: it is seated
     // unconditionally, because a rig always animates.
     const watch = [];
+    const staticWatch = [];
+    const mobility = this._gi2Mobility;
+    mobility.tally(meshes);
     for (const mesh of meshes) {
       if (moverMeshes.has(mesh) || mesh.isSkinnedMesh) continue;
-      if (giMobilityOf(mesh) !== "auto") continue;
+      const state = mobility.stateOf(mesh);
+      // §19 6.22: a "static" mesh is NEVER audited per frame. Its pose is
+      // recorded only so an ANNOUNCED transform change (the content key's
+      // `transforms` bump — the editor, `entity.setTransform`, a script
+      // setter) can say once that moving it is an authoring error.
+      if (state === "static") { staticWatch.push({ mesh, matrix: mesh.matrixWorld.clone() }); continue; }
+      if (state !== "auto") continue;
       watch.push({ mesh, matrix: mesh.matrixWorld.clone() });
     }
     this._gi2AutoWatch = watch;
+    this._gi2StaticWatch = staticWatch;
+    this._gi2StaticWatchKey = this.engine?.content?.transforms ?? 0;
+    this._gi2AutoWatchKey = this._gi2StaticWatchKey;
+    this._gi2AutoWatchCursor = 0;
     this._gi2MoversDirty = false;
     const staticPlacements = moverMeshes.size
       ? enriched.filter((p) => !moverMeshes.has(p.mesh))
@@ -18791,7 +18907,6 @@ export class GISystem {
   #gi2Movers(meshes) {
     const out = [];
     const box = new THREE.Box3();
-    const promoted = this._gi2Promoted;
     // ── SKINNED RIGS FIRST: they are the ones with a hard claim on a slot ──
     // A rig always animates, and if the cap is contended it must not lose to a
     // crate. `covered` is every mesh a fitted rig speaks for, so the box arm
@@ -18805,13 +18920,11 @@ export class GISystem {
     const rigid = [];
     for (const mesh of meshes) {
       if (covered.has(mesh)) continue;
-      const mobility = giMobilityOf(mesh);
       const skinned = mesh.isSkinnedMesh === true;
-      if (mobility === "static") continue;
-      // Explicit "dynamic", an unfitted skeleton (the fallback arm — better a
-      // root-following box than nothing), or an "auto" mesh the motion watch
-      // has already promoted.
-      if (mobility !== "dynamic" && !skinned && !promoted?.has(mesh)) continue;
+      // §19 6.22: the ONE classification. Explicit "dynamic", a skeleton (an
+      // unfitted one takes the fallback arm — better a root-following box than
+      // nothing), or an "auto" mesh the motion watch has promoted.
+      if (!this._gi2Mobility?.isDynamicNow(mesh)) continue;
       if (!mesh.geometry?.boundingBox) mesh.geometry?.computeBoundingBox?.();
       const bb = mesh.geometry?.boundingBox;
       if (!bb) continue;
@@ -18962,28 +19075,55 @@ export class GISystem {
         // 6.21b — ONCE per promotion: `_gi2SettleAsked` is cleared when the mesh is
         // promoted and set when the rebuild is asked, so a re-seat that re-seeds
         // `restFrames` cannot ask again. `__gi2MoverSettleRebuild = false` opts out.
-        if (globalThis.__gi2MoverSettleRebuild !== false && !m.skinned && m.mesh && m.restFrames >= GI2_MOVER_SETTLE_FRAMES && this._gi2Promoted?.has(m.mesh) && !(this._gi2SettleAsked ??= new Set()).has(m.mesh)) {
+        if (globalThis.__gi2MoverSettleRebuild !== false && !m.skinned && m.mesh && m.restFrames >= GI2_MOVER_SETTLE_FRAMES && this._gi2Mobility?.stateOf(m.mesh) === "promoted" && !(this._gi2SettleAsked ??= new Set()).has(m.mesh)) {
           this._gi2SettleAsked.add(m.mesh);
-          this._gi2Promoted.delete(m.mesh);
+          // §19 6.22: the resolver owns the classification — demote there.
+          this._gi2Mobility.demote(m.mesh);
           console.log(`[gi2] mover settled: "${m.mesh.name}" returns to the static set — rebuild`);
           this.requestRebuild("gi2-mover-settled");
         }
       }
     }
     this._gi2MoversMoving = moving;
+    const mobility = this._gi2Mobility;
+    const keyNow = this.engine?.content?.transforms ?? 0;
+    // ── §19 6.22 — THE STATIC WARN, only when a transform was ANNOUNCED ────
+    // (the content key bumped): static meshes are never walked per frame.
+    const staticWatch = this._gi2StaticWatch;
+    if (staticWatch?.length && keyNow !== this._gi2StaticWatchKey) {
+      this._gi2StaticWatchKey = keyNow;
+      for (const w of staticWatch) {
+        if (!w.mesh?.parent || w.matrix.equals(w.mesh.matrixWorld)) continue;
+        w.matrix.copy(w.mesh.matrixWorld);
+        mobility.warnStaticMoved(w.mesh);
+      }
+    }
     // ── PROMOTION: the "auto" motion watch ────────────────────────────────
+    // §19 6.22: AMORTISED. The whole watch is walked only on a content-key
+    // `transforms` bump (the announced routes); otherwise one window of
+    // 1/GI2_AUTO_WATCH_FRAMES of it per frame catches the un-announced ones
+    // (physics write-back, a script writing straight to Object3D).
     const watch = this._gi2AutoWatch;
     if (watch?.length && globalThis.__gi2AdoptMovingAuto !== false) {
-      const promoted = (this._gi2Promoted ??= new Set());
+      const promoted = mobility.promoted;
       let adopted = 0;
-      for (let i = watch.length - 1; i >= 0; i--) {
+      let lo = 0, hi = watch.length;
+      if (keyNow === this._gi2AutoWatchKey) {
+        const window = Math.max(1, Math.ceil(watch.length / GI2_AUTO_WATCH_FRAMES));
+        lo = Math.min(this._gi2AutoWatchCursor ?? 0, watch.length - 1);
+        hi = Math.min(watch.length, lo + window);
+        this._gi2AutoWatchCursor = hi >= watch.length ? 0 : hi;
+      } else {
+        this._gi2AutoWatchKey = keyNow;
+        this._gi2AutoWatchCursor = 0;
+      }
+      for (let i = hi - 1; i >= lo; i--) {
         const w = watch[i];
         const mesh = w.mesh;
         if (!mesh?.parent) { watch.splice(i, 1); continue; }
         if (w.matrix.equals(mesh.matrixWorld)) continue;
-        w.matrix.copy(mesh.matrixWorld);
         watch.splice(i, 1);
-        promoted.add(mesh);
+        mobility.promote(mesh);
         this._gi2SettleAsked?.delete(mesh);
         adopted++;
         // §19 6.21 — out of the exact-shadow tree NOW: its old pose must not shadow.
@@ -18991,11 +19131,11 @@ export class GISystem {
       }
       if (adopted) {
         console.log(
-          `[gi2] dynamic layer: adopted ${adopted} "auto" mesh(es) that moved. ` +
-            "Their static soup copy stays until the next GI rebuild (GI2 has no per-placement " +
-            "static exclusion yet) — pin them \"Dynamic\" in the Mesh component to hold them out at build.",
+          `[gi2] mobility: promoted ${adopted} "auto" mesh(es) that moved → dynamic layer; ` +
+            "the static soup re-kicks without them (they return to static once they settle — 6.21's rebuild).",
         );
         this._gi2MoversDirty = true;
+        this.requestRebuild("gi2:mobility-promoted");
       }
     }
     if (!this._gi2MoversDirty) return;

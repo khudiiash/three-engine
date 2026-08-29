@@ -457,9 +457,16 @@ export class MeshComponent extends Component {
       // sphere to capsule is visible on the next frame.
       if (this.mesh) this.mesh.userData.giProxy = this.props.giProxy;
     } else if (key === "giDynamic" || key === "giMobility" || key === "giTrace") {
-      // Live: the GI system re-reads the tags every frame for adopted movers
-      // and before every adoption, so no rebuild is needed here.
       this.#applyGiDynamic();
+      // §19 6.22: GI Mobility is the ONE classification GI2 reads at BUILD
+      // (static soup vs dynamic layer), so a change re-keys the content and
+      // the GI rebuild re-tallies and re-seats — one soup run per authoring
+      // action, never a per-frame re-read of the tags.
+      if (key !== "giTrace") {
+        const engine = this.entity?.engine;
+        engine?.content?.bump("hierarchy", "mesh:gi-mobility");
+        engine?.modules?.get?.("gi")?.system?.requestRebuild?.("mesh:gi-mobility");
+      }
     }
   }
 

@@ -2052,12 +2052,18 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
         // uniform skips the whole sampler on the main-view branch; nested
         // (planar-mirror) renders take exactly the value they took before.
         // The fallback is a THUNK so its graph is emitted inside the branch.
-        if (light.giNestedView && nestedFallback) {
-          If(float(light.giNestedView).greaterThan(0.5), () => {
-            v.assign(typeof nestedFallback === "function" ? nestedFallback() : nestedFallback);
-          });
-        }
-        return v;
+        // §19 6.24 — BACK TO PURE DATAFLOW. The 6.18 `If` above turned the
+        // moved-lamp gate RED (Δnew 28.9 → -0.7): with an `If` on this
+        // light node's stack the emitter glow never reaches the MAIN view
+        // (both crops flat at ~8.4, with or without the exact block, and
+        // identically when the stand-in is its own `Fn` — so it is the
+        // statement, not what it samples). `select` is the idiom
+        // reflectionProbes.js documents as safe; it keeps both operands live
+        // (6.18's ~4 ms inside Cornell come back) until the branch can be
+        // placed where the light node's flow honours it.
+        return light.giNestedView && nestedFallback
+          ? select(float(light.giNestedView).greaterThan(0.5), typeof nestedFallback === "function" ? nestedFallback() : nestedFallback, v)
+          : v;
       }
       : null;
     const bilateral = gi2Sample

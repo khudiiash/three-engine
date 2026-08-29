@@ -470,6 +470,8 @@ export class ShadowMergeSystem {
           this.invalidate("caster-geometry-swapped");
           return;
         }
+        // §19 6.22: a GI-static caster is never a mover (its move is an authoring error GI warns about once).
+        if (members[i].userData?.giMobility === "static") continue;
         const current = members[i].matrixWorld.elements;
         const cached = matrices[i];
         for (let e = 0; e < 16; e++) {
