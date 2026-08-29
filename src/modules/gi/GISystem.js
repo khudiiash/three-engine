@@ -3976,7 +3976,15 @@ export class GISystem {
           // it consumes the converging probe field, so it keeps its own
           // cadence (see the frame queue).
           // `__giReflectHold = false` restores the unconditional trace.
-          const reflectHeld = this._gbufHeld === true && globalThis.__giReflectHold !== false;
+          // §19 6.11: HELD ONLY AFTER IT HAS TRACED ONCE. The pass is created
+          // at #rebuild, inside the compile wave, and does not dispatch until
+          // the wave ends; the frame the mask turns on is the one unheld
+          // frame, and a deferred first build on THAT frame left a target of
+          // zeros held forever on a parked camera (probe:gi-reflect-black on
+          // Cornel: hitPct 100 at t = 0, albedo 0 % — the texture's clear
+          // value, never a trace). A hold is only valid over a real trace.
+          const reflectHeld = this._gbufHeld === true && globalThis.__giReflectHold !== false &&
+            state.screen.bvhReflect.tracedOnce === true;
           if (reflectHeld) {
             this._bvhReflectHeldFrames = (this._bvhReflectHeldFrames ?? 0) + 1;
           } else {
@@ -3987,7 +3995,9 @@ export class GISystem {
             // already costs it. Not during the compile wave — this is the
             // 51–132 s kernel; compiling it alongside materials is the 30 s init.
             if (!this._compileWaveActive) {
+              const skippedBefore = giSkippedComputes.size;
               giCompute(renderer, state.screen.bvhReflect.compute, { deferrable: true });
+              if (giSkippedComputes.size === skippedBefore) state.screen.bvhReflect.tracedOnce = true;
             }
           }
         } else {
