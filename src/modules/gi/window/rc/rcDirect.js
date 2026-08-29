@@ -118,7 +118,7 @@ const R_MAX = 12;
  * @param {number} o.height
  */
 export function createRcEmitterDirect({
-  trace, voxel0, emitters, gbuffer, camera, width, height, bvh = null,
+  trace, voxel0, emitters, gbuffer, camera, width, height, bvh = null, traceDyn = null,
 }) {
   if (!emitters?.length) return null;
   const { traceWindow } = trace;
@@ -353,6 +353,15 @@ export function createRcEmitterDirect({
                 h.assign(tr.hit); tOcc.assign(tr.t);
               }).Else(() => {
                 tOcc.assign(BVH.nearestTFrom(P, wd, reachBvh, Nf));
+                // §19 6.21 — MOVERS ARE NOT IN THE TREE (their placement bit is
+                // excluded the frame they move); the K.5 dynamic mirror answers
+                // for them at their live pose. visibility = static ∧ dynamic,
+                // and the PCSS `tOcc` is the NEARER blocker of the two.
+                if (traceDyn) {
+                  const td = traceDyn.traceWindow(P, wd, reachVox, Nf);
+                  const tdT = td.t.toVar();
+                  If(td.hit.greaterThan(0.5).and(tOcc.lessThan(0).or(tdT.lessThan(tOcc))), () => { tOcc.assign(tdT.max(0)); });
+                }
                 h.assign(step(0, tOcc));
               });
             } else {

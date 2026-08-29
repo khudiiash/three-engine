@@ -569,6 +569,7 @@ export function createGiGather({
    * estimator.
    */
   shadowBvh = null,
+  traceDyn = null,
   /**
    * ⭐⭐⭐ §19 STAGE 5.3 — THE FACE CACHE IS **DIRECT ONLY** WHEN THE CASCADES
    * OWN THE PICTURE, AND THAT IS WHAT MAKES THE LOOP HAVE ONE FIXED POINT.
@@ -3054,8 +3055,13 @@ export function createGiGather({
           // exact at the pixel, conservative through the whole transport.
           // `anyHitFrom` also needs no voxel slack, which is why `endM` folds
           // out of `reach` on this arm: dilation is what that margin paid for.
+          // §19 6.21 — plus the dynamic mirror: a mover's triangles are excluded
+          // from the tree the frame it moves, so the tree alone would let the lamp
+          // through a block that is merely being dragged.
           const vis = float(1).sub(BVH
-            ? BVH.anyHitFrom(pRay, wd, d.sub(excl).max(1e-3), n)
+            ? (traceDyn
+              ? BVH.anyHitFrom(pRay, wd, d.sub(excl).max(1e-3), n).max(traceDyn.traceWindow(pRay, wd, reach, n).hit)
+              : BVH.anyHitFrom(pRay, wd, d.sub(excl).max(1e-3), n))
             : traceWindow(pRay, wd, reach, n).hit).toVar();
           Enee.addAssign(rgb.mul(omega).mul(cosX).mul(vis));
         });
