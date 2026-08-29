@@ -871,6 +871,9 @@ defineOp({
       shadows: {
         managed: engine.shadowFreeze?.managedLights ?? 0,
         frozen: engine.shadowFreeze?.frozenLights ?? 0,
+        // §19 6.31: cascades whose static map is cached and whose dynamic casters are overlaid per frame.
+        overlay: engine.shadowFreeze?.overlayLights ?? 0,
+        dynamicCasters: engine.shadowFreeze?.dynamicCasters ?? 0,
         // `frozen: 0` has at least four different causes and used to look the
         // same for all of them. This names the one in force.
         freezeReason: engine.shadowFreeze?.reason ?? null,

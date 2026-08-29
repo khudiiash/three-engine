@@ -237,3 +237,16 @@ export const GI_SHARP_LAYER = 21;
  * still never sees it.
  */
 export const GI_DEPTH_LAYER = 20;
+
+/**
+ * Layer for shadow casters whose silhouette is NOT a function of the world
+ * matrices `shadowFreeze.js` fingerprints — skinned and morphing meshes,
+ * `giMobility: "dynamic"` meshes, and meshes shadowMerge caught moving.
+ *
+ * ADDITIVE (the mesh keeps layer 0). It exists so a shadow camera can be posed
+ * on THIS BIT ALONE for one render and draw only the dynamic casters over a
+ * restored copy of the cached static depth — the §19 6.31 static-cache +
+ * dynamic-overlay shadow map, which is what lets a street with one character
+ * in it stop redrawing 500 static casters per cascade per frame.
+ */
+export const SHADOW_DYNAMIC_LAYER = 19;
