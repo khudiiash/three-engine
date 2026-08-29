@@ -2,7 +2,8 @@
 //
 // This is the whole algorithm in plain JS: probe insertion, Alg. 3 ray
 // bookkeeping, split deposit, resolve, merge, irradiance bake, screen gather.
-// It exists for three jobs, in order of importance:
+// It exists for three jobs, in order of
+// importance:
 //
 //   1. GROUND TRUTH for the Phase-0 suite. Every structural property the paper
 //      claims (contiguous intervals, contiguous R2 segments, exact 4→1 parent
@@ -63,6 +64,7 @@ import {
   worldKeysEnabled,
 } from "./srcMath.js";
 import { RAY_FLOOR } from "./srcRays.js";
+import { RC_STRATIFY_BY_RANK } from "./srcDeposit.js";
 
 /**
  * Resolved run configuration. `anchor` is the LOD lattice origin — in the
@@ -556,8 +558,13 @@ export function traceAndDeposit(cfg, built, pixels, rays, sceneTrace) {
     // leaves rays unfired or walks into the next pixel's slice.
     const rpp = Math.max(1, built.cascades[0].probes[c0Slot].boost ?? cfg.raysPerPixel);
     for (let r = 0; r < rpp; r++) {
+      // §19 6.20 — the mirror of `srcDeposit`'s `RC_STRATIFY_BY_RANK`: the
+      // direction index is the ray's rank within its c0 probe's segment.
+      const nDir = RC_STRATIFY_BY_RANK
+        ? base + r - (built.cascades[0].probes[c0Slot].rayOffset ?? 0)
+        : base + r;
       const dir = rayDirection(
-        base + r,
+        nDir,
         px.normal[0], px.normal[1], px.normal[2],
         cfg.jitter[0], cfg.jitter[1],
       );

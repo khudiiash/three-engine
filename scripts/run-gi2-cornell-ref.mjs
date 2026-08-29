@@ -460,9 +460,18 @@ const RJSON = await page.evaluate(async ({ TARGET }) => {
       triSurf.push(`${label}·${AXIS[axis]}`);
       triEmit.push(emissive[0] + emissive[1] + emissive[2] > 1e-6 ? 1 : 0);
     }
+    // §19 6.20 — WHERE THE MESH ACTUALLY IS at reference time. Two boots read
+    // the lamp at 7.479 and 6.000 m² (a unit box): the world matrix, not the
+    // scene file, is what the reference traces, so it is printed beside it.
+    geo.computeBoundingBox?.();
+    const bb = geo.boundingBox;
+    const wsz = [0, 4, 8].map((c) => Math.hypot(me[c], me[c + 1], me[c + 2]));
     meshSummary.push({
       name: label, tris: tri.length / 9 - before, albedo, emissive,
       promoted: !!entry.promoted,
+      world: { pos: [me[12], me[13], me[14]], scale: wsz,
+        box: bb ? [bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z] : null },
+      entityScale: (() => { let o = mesh; const s = []; for (let k = 0; k < 4 && o; k++) { s.push([o.scale.x, o.scale.y, o.scale.z].map((v) => +v.toFixed(3))); o = o.parent; } return s; })(),
     });
   }
 
@@ -559,7 +568,8 @@ console.log(`  emitter slots ${R.slots.length}: ` + (R.slots.map((s) => {
 console.log(`  sky [${R.sky.map((v) => v.toFixed(3))}]  sun [${R.sunColor.map((v) => v.toFixed(3))}]  ` +
   `worldProbes ${R.gather.worldProbes}  cacheSmooth ${R.gather.cacheSmooth}  coldFill ${R.gather.coldFill}  skyRays ${R.gather.skyRays}`);
 for (const m of R.scene.meshes) {
-  console.log(`    ${String(m.name).padEnd(14)} ${String(m.tris).padStart(5)} tris  albedo [${m.albedo.map((v) => v.toFixed(2))}]  emissive [${m.emissive.map((v) => v.toFixed(2))}]`);
+  console.log(`    ${String(m.name).padEnd(14)} ${String(m.tris).padStart(5)} tris  albedo [${m.albedo.map((v) => v.toFixed(2))}]  emissive [${m.emissive.map((v) => v.toFixed(2))}]`
+    + (m.world ? `  @[${m.world.pos.map((v) => v.toFixed(2))}] worldScale [${m.world.scale.map((v) => v.toFixed(3))}] box [${(m.world.box ?? []).map((v) => v.toFixed(2))}] chainScale ${JSON.stringify(m.entityScale)}` : ""));
 }
 
 // ═══════════════════════════════════════════════════ THE REFERENCE, ON CPU
@@ -1566,6 +1576,12 @@ if (process.env.MAPS) {
     if (lum(q.ref) < 0.25 * irrP50 && lum(q.E) > 2 * lum(q.ref)) shadowish.push(row);
   }
   mkdirSync(process.env.MAPS, { recursive: true });
+  // §19 6.20 — the DENSE rows behind the picture, so a blotch's spatial SCALE
+  // can be measured (autocorrelation of the signed log error per surface, in
+  // pixels and in metres) rather than eyeballed off the PNG.
+  writeFileSync(path.join(process.env.MAPS, "rows.json"), JSON.stringify(rows
+    .filter((q) => q.ref && !q.emitFace && lum(q.ref) > 1e-6 && lum(q.E) > 0)
+    .map((q) => ({ x: q.x, y: q.y, s: q.surf, p: q.p.map((v) => +v.toFixed(4)), n: q.n?.map?.((v) => +v.toFixed(3)), lg: +Math.log(lum(q.E) / lum(q.ref)).toFixed(5), E: +lum(q.E).toFixed(5), ref: +lum(q.ref).toFixed(5), noise: q.noise }))));
   writeFileSync(path.join(process.env.MAPS, "err.png"), png(W, H, errImg));
   writeFileSync(path.join(process.env.MAPS, "green.png"), png(W, H, grnImg));
   const med = (a, k) => quantile(a.map((r) => r[k]), 0.5);
