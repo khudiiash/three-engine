@@ -15733,7 +15733,15 @@ export class GISystem {
       const radius =
         (geometry.boundingSphere?.radius ?? 0.1) *
         Math.max(Math.abs(scratch.x), Math.abs(scratch.y), Math.abs(scratch.z));
-      const power = cand.luminance * Math.max(radius * radius, 1e-4);
+      // §19 6.35 — score by the mesh's TRUE emitted power when the admission
+      // ledger has it (Φ = π·A·L, summed over admitted fits), not by
+      // `luminance × boundsRadius²`. The old score let a 21 m bounding sphere
+      // (fill 0.00006, seat rgb 0) out-rank every real lamp — the audit found
+      // TWO dead giants holding seats 2+3 — and priced Bistro's bulb strings
+      // (radius 3.87 m, fill 0.0017) at ~580× their real power.
+      const admitted = this._emitterAdmissionByMesh?.get(cand.mesh);
+      const power = admitted?.power
+        ?? cand.luminance * Math.max(radius * radius, 1e-4);
       if (!camPos) {
         score.set(cand, power);
         continue;
@@ -16607,6 +16615,26 @@ export class GISystem {
       slot.moved.value = moved;
       live[i] = true;
     };
+    // ── §19 6.35: SPARSE CONSOLIDATION — SUM POWER ON AN HONEST SHAPE ───────
+    // §18.15 damped the COLOUR of a seat fitted to a whole scattered mesh
+    // (fill 0.0017 on Bistro's bulb strings) and left the shape a 3.87 m
+    // sphere — energy right, DISTRIBUTION wrong: a dim glow the size of the
+    // street, painting light where no bulb is (the user's wrong-place bleed).
+    // The construction-correct one-seat answer: shrink the shape to the mesh's
+    // REAL emitting extent (reff·√fill — the sphere whose area × 1 equals the
+    // mesh's damped area) and boost the colour by 1/fill, so
+    // 4π·r'²·L' = 4π·r²·L·fill = the mesh's true Φ. One seat, the SUM power,
+    // a per-ball-sized body — never a giant sphere with one ball's colour.
+    const consolidateSparse = (slot, mesh) => {
+      const fill = this._emitterFillByMesh?.get(mesh) ?? 1;
+      if (!(fill < 0.999)) return;
+      const shrink = Math.sqrt(Math.max(fill, 1e-6));
+      slot.radius.value *= shrink;
+      slot.reff.value *= shrink;
+      slot.half.value.multiplyScalar(shrink);
+      slot.exHalf.value.multiplyScalar(shrink);
+      slot.color.value.multiplyScalar(Math.min(1 / Math.max(fill, 1e-6), 1e4));
+    };
     // ── §12.73: AND SO IS GOING OUT. ────────────────────────────────────────
     // All three "this slot has no emitter now" paths below used to publish
     // `moved = 0` — the one moment the field is MOST wrong is reported as a
@@ -16699,8 +16727,10 @@ export class GISystem {
       //
       // The chroma follows the energy: the sparsest emitters here are the
       // saturated ones, so the undamped seats over-weighted green specifically.
-      const seatFill = this._emitterFillByMesh?.get(info.mesh) ?? 1;
-      slot.color.value.setRGB(info.r * seatFill, info.g * seatFill, info.b * seatFill);
+      // §19 6.35 — the seat colour is the mesh's RAW emissive; the sparse
+      // consolidation below re-prices it ONCE, against the shape the seat
+      // actually carries, so power bookkeeping happens in one place.
+      slot.color.value.setRGB(info.r, info.g, info.b);
       // SHAPE. fitEmitterShape (emitterShapes.js) maps every default three
       // geometry to its analytic kind — sphere, capsule, cylinder, frustum/
       // cone, disc/ring, torus, equal-area spheres for the polyhedra — from
@@ -16719,6 +16749,7 @@ export class GISystem {
         slot.bz.value.copy(emitterFitScratch.bz);
         slot.reff.value = emitterFitScratch.reff;
         slot.exHalf.value.copy(emitterFitScratch.exHalf);
+        consolidateSparse(slot, info.mesh);
         publishMoved(i, slot, info.mesh, true);
         continue;
       }
@@ -16758,6 +16789,7 @@ export class GISystem {
       // disc-equivalent radius drives penumbra k and glow energy.
       const [hx, hy, hz] = halfWorld;
       slot.reff.value = Math.sqrt(((hx * hy + hy * hz + hz * hx) * 2) / Math.PI);
+      consolidateSparse(slot, info.mesh);
       publishMoved(i, slot, info.mesh, true);
     }
     // SRC's motion-adaptive α (§12.38) reads the emitter half of "is the
@@ -16774,15 +16806,48 @@ export class GISystem {
     // once per frame. Named because a corrected number is invisible otherwise
     // (the same reason §13.7g's own line exists) and because this is the
     // number that decides whether reflections are the right colour.
-    if (globalThis.__giLogEmitterSeatFill !== false && this._emitterFillByMesh?.size) {
+    {
       const damped = [];
       for (let i = 0; i < state.emitterSlots.length; i++) {
         const mesh = infos[i]?.mesh;
-        const fill = mesh ? this._emitterFillByMesh.get(mesh) : undefined;
+        const fill = mesh ? this._emitterFillByMesh?.get(mesh) : undefined;
         if (fill !== undefined && fill < 0.999) damped.push(`${i}:${fill.toExponential(1)}`);
       }
       const key = damped.join(",");
-      if (key && this._emitterSeatFillKey !== key) {
+      // §19 6.35 — THE SEAT AUDIT LEDGER. One record per SEATED slot naming the
+      // mesh it came from, where it is, how big the shape the seat was fitted
+      // to is, and what the MESH's own emissive is. `profile.giEmitterSeats`
+      // reads this: without it a suspicious seat (near-zero rgb, metres of
+      // radius) cannot be traced back to the mesh that minted it, and the
+      // giant-shape question ("is this one lamp or a whole string of them?")
+      // is unanswerable from the uniforms alone. Rebuilt on the same throttle
+      // as the log line — the seating is static between prints.
+      if (this._emitterSeatFillKey !== key || !this._emitterSeatMeta) {
+        const meta = [];
+        for (let i = 0; i < state.emitterSlots.length; i++) {
+          const info = infos[i];
+          const mesh = info?.mesh;
+          if (!mesh) { meta.push(null); continue; }
+          const geom = mesh.geometry;
+          if (!geom.boundingSphere) geom.computeBoundingSphere();
+          mesh.matrixWorld.decompose(scratchPos, scratchQuat, scratchScale);
+          const bs = geom.boundingSphere.radius
+            * Math.max(scratchScale.x, scratchScale.y, scratchScale.z, 1e-6);
+          const center = new THREE.Vector3()
+            .copy(geom.boundingSphere.center).applyMatrix4(mesh.matrixWorld);
+          meta.push({
+            slot: i,
+            name: mesh.name || mesh.type,
+            pos: [+center.x.toFixed(2), +center.y.toFixed(2), +center.z.toFixed(2)],
+            bsRadius: +bs.toFixed(2),
+            emissive: [+(info.r ?? 0).toFixed(3), +(info.g ?? 0).toFixed(3), +(info.b ?? 0).toFixed(3)],
+            tris: info.tris ?? null,
+            fill: +((this._emitterFillByMesh?.get(mesh) ?? 1).toPrecision(3)),
+          });
+        }
+        this._emitterSeatMeta = meta;
+      }
+      if (globalThis.__giLogEmitterSeatFill !== false && key && this._emitterSeatFillKey !== key) {
         this._emitterSeatFillKey = key;
         console.log(
           `[gi] emitter seats: ${damped.length} of ${state.emitterSlots.length} damped to their ` +

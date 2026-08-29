@@ -1,0 +1,190 @@
+{
+  "seats": [
+    {
+      "slot": 0,
+      "rgb": [
+        109.801,
+        0,
+        0
+      ],
+      "green": 0,
+      "radius": 0.354,
+      "reff": 0.211,
+      "name": "Mesh",
+      "pos": [
+        -1.45,
+        3.75,
+        -0.64
+      ],
+      "bsRadius": 1.17,
+      "emissive": [
+        10,
+        0,
+        0
+      ],
+      "fill": 0.0911
+    },
+    {
+      "slot": 1,
+      "rgb": [
+        14.53,
+        14.53,
+        14.53
+      ],
+      "green": 1,
+      "radius": 0.091,
+      "reff": 0.087,
+      "name": "Mesh",
+      "pos": [
+        0.95,
+        4.12,
+        -8.24
+      ],
+      "bsRadius": 0.11,
+      "emissive": [
+        10,
+        10,
+        10
+      ],
+      "fill": 0.688
+    },
+    {
+      "slot": 2,
+      "rgb": [
+        14.53,
+        14.53,
+        14.53
+      ],
+      "green": 1,
+      "radius": 0.091,
+      "reff": 0.087,
+      "name": "Mesh",
+      "pos": [
+        -0.07,
+        4.12,
+        -6.35
+      ],
+      "bsRadius": 0.11,
+      "emissive": [
+        10,
+        10,
+        10
+      ],
+      "fill": 0.688
+    },
+    {
+      "slot": 3,
+      "rgb": [
+        17.679,
+        17.679,
+        17.679
+      ],
+      "green": 1,
+      "radius": 0.082,
+      "reff": 0.068,
+      "name": "Mesh",
+      "pos": [
+        -1.8,
+        2.67,
+        -2.24
+      ],
+      "bsRadius": 0.11,
+      "emissive": [
+        10,
+        10,
+        10
+      ],
+      "fill": 0.566
+    }
+  ],
+  "sky": {
+    "rgb": [
+      0.2006,
+      0.268,
+      0.3891
+    ],
+    "envType": "DataTexture",
+    "envUuid": "73d890ac-69ba-4c75-a914-7f73de1980b2",
+    "envIntensity": 1
+  },
+  "gi2keys": {
+    "gi2": [
+      "tier",
+      "win",
+      "trace",
+      "cache",
+      "paletteAssign",
+      "gather",
+      "rc",
+      "shadowBvh",
+      "gbuffer",
+      "voxelizer",
+      "dynamic",
+      "width",
+      "height",
+      "textures",
+      "storageAttributes",
+      "computeNodes",
+      "takeRetired",
+      "build",
+      "setSize",
+      "setCamera",
+      "setMovers",
+      "passes",
+      "warmList",
+      "stats",
+      "snapshot",
+      "describe",
+      "rearm",
+      "carriedBuilds",
+      "rcHold",
+      "setStaticExcluded",
+      "dirtyBox",
+      "appendSettledSegment",
+      "staticExcludedCount",
+      "dirtyBoxes",
+      "bvhExcludedCount",
+      "setMobility",
+      "mobility",
+      "statsCadence",
+      "notePassesRan",
+      "transportAlive",
+      "dispose"
+    ],
+    "gather": [
+      "tier",
+      "T",
+      "R",
+      "O",
+      "H",
+      "SH_R",
+      "STRIDE",
+      "USE_SH",
+      "probeW",
+      "probeH",
+      "probeCount",
+      "width",
+      "height",
+      "worldProbes",
+      "world",
+      "uniforms",
+      "palette",
+      "paletteEmissive",
+      "setPalette",
+      "beginFrame",
+      "frame",
+      "internals",
+      "buffers",
+      "SHADE_SLOTS",
+      "EXHAUST_SLOTS",
+      "EXH_VEC",
+      "CONTACT_RAYS",
+      "textures",
+      "passes",
+      "frameOrder",
+      "readStats",
+      "describe",
+      "dispose"
+    ]
+  }
+}

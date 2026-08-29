@@ -819,22 +819,47 @@ defineOp({
       // other half: a seat fitted to a whole mesh of scattered bulbs is a
       // metres-wide sphere whose solid angle is orders of magnitude too large.
       giEmitterSeats: (() => {
-        const slots = engine.modules?.get?.("gi")?.system?.state?.emitterSlots;
+        const system = engine.modules?.get?.("gi")?.system;
+        const slots = system?.state?.emitterSlots;
         if (!Array.isArray(slots)) return null;
+        // §19 6.35 — each seat carries its SOURCE LEDGER record (GISystem
+        // #refreshEmitterSeats builds `_emitterSeatMeta`): the mesh's name,
+        // world position, bounding-sphere radius, raw emissive and fill. A
+        // suspicious seat (near-zero rgb, metres of radius) is only
+        // diagnosable when it names the mesh that minted it.
+        const meta = system?._emitterSeatMeta ?? [];
         return slots.map((s, i) => {
           const c = s.color?.value;
           const r = c?.r ?? 0, g = c?.g ?? 0, b = c?.b ?? 0;
+          const m = meta[i] ?? null;
           return {
             slot: i,
             rgb: [Number(r.toFixed(3)), Number(g.toFixed(3)), Number(b.toFixed(3))],
             green: Number((g / Math.max(1e-6, (r + b) / 2)).toFixed(2)),
             radius: Number((s.radius?.value ?? 0).toFixed(3)),
             reff: Number((s.reff?.value ?? 0).toFixed(3)),
+            name: m?.name ?? null,
+            pos: m?.pos ?? null,
+            bsRadius: m?.bsRadius ?? null,
+            emissive: m?.emissive ?? null,
+            fill: m?.fill ?? null,
           };
         });
       })(),
-      // Who asked for each GI rebuild and when — the answer to "gi reloads
-      // for no reason". `asks` counts requests (several can coalesce into one
+      // §19 6.35 — the SKY TERM the GI field actually shades with, next to the
+      // environment the raster IBL samples. A grey `rgb` beside a coloured
+      // environment is the grey-indirect bug; this pair is its receipt.
+      giSkyTerm: (() => {
+        const v = engine.modules?.get?.("gi")?.system?.state?.skyRadiance?.value;
+        const env = engine.scene?.environment ?? null;
+        if (!v && !env) return null;
+        return {
+          rgb: v ? [Number(v.r.toFixed(4)), Number(v.g.toFixed(4)), Number(v.b.toFixed(4))] : null,
+          envType: env?.constructor?.name ?? null,
+          envUuid: env?.uuid ?? null,
+          envIntensity: engine.scene?.environmentIntensity ?? null,
+        };
+      })(),
       // run), `runs` counts executions, and the log names the last twelve with
       // their age. A `resolve-resize` entry carries giCostScale, so a governor
       // rung change is distinguishable from a window resize at a glance.

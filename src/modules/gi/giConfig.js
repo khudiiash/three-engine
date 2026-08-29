@@ -548,12 +548,15 @@ export function resolveGiConfig(props, runtime = globalThis) {
  * because light from nothing is the failure signature this module has shipped
  * three times.
  *
- * OPEN, AND STATED RATHER THAN HIDDEN: the sky's CHROMA is not read. An
- * environment map's average colour needs a 1×1 downsample of the cube map (a
- * GPU readback, or an average computed when the image decodes), so a sunset
- * HDRI currently contributes NEUTRAL sky at the right brightness. Colour
- * belongs with Phase 5's hit shading, which is where the environment has to be
- * sampled per-direction anyway.
+ * §19 6.35 — THE SKY'S CHROMA IS READ NOW. The OPEN note above was the last
+ * leg of "indirect is grey": in a shadowed canyon (Bistro at a 26° sun) the
+ * field's sky term IS most of the indirect, and it was NEUTRAL by construction
+ * even under a blue-white HDRI. The mean colour is computed once per texture
+ * (cached on the texture itself, keyed by version) by downsampling each face
+ * through a tiny canvas — the 1×1 downsample this comment used to call a GPU
+ * readback — decoded to linear so the term matches the IBL the raster samples,
+ * not the PNG's sRGB bytes. Faces that cannot be drawn (a PMREM target, a
+ * tainted canvas) fall back to the old neutral answer at the same intensity.
  *
  * @param {THREE.Scene} scene
  * @param {THREE.Color} out  written in place — this runs per frame
@@ -562,7 +565,82 @@ export function sceneSkyRadiance(scene, out) {
   const environment = scene?.environment;
   if (!environment) return out.setRGB(0, 0, 0);
   const intensity = Math.max(0, scene.environmentIntensity ?? 1);
-  return out.setRGB(intensity, intensity, intensity);
+  const rgb = environmentMeanRadiance(environment);
+  if (!rgb) return out.setRGB(intensity, intensity, intensity);
+  return out.setRGB(rgb[0] * intensity, rgb[1] * intensity, rgb[2] * intensity);
+}
+
+// The cached mean radiance of an environment texture, or null when its pixels
+// cannot be read on the CPU. WeakMap so a swapped sky cannot leak.
+const skyMeanCache = new WeakMap();
+// IEEE-754 binary16 → float, inlined: HDRIs arrive as HalfFloatType DataTextures
+// and giConfig has no THREE import to reach DataUtils through.
+const halfToFloat = (h) => {
+  const s = (h & 0x8000) >> 15;
+  const e = (h & 0x7c00) >> 10;
+  const m = h & 0x03ff;
+  if (e === 0) return (s ? -1 : 1) * m * 6.103515625e-5;
+  if (e === 0x1f) return m ? NaN : (s ? -Infinity : Infinity);
+  return (s ? -1 : 1) * (1 + m / 1024) * Math.pow(2, e - 15);
+};
+function environmentMeanRadiance(texture) {
+  if (skyMeanCache.has(texture)) return skyMeanCache.get(texture);
+  let rgb = null;
+  try {
+    // DataTexture path FIRST (Bistro's HDRI is one): `image` is
+    // {data, width, height}, not a drawable — but the array is right there, so
+    // the mean needs no canvas at all. Half-float (Uint16) decodes per
+    // three's DataUtils.
+    const img = texture.image;
+    if (img && img.data && img.width > 0 && img.height > 0) {
+      const data = img.data;
+      const ch = data.length / (img.width * img.height);
+      const isHalf = data instanceof Uint16Array;
+      let r = 0, g = 0, b = 0, n = 0;
+      const step = Math.max(1, Math.floor((img.width * img.height) / 4096));
+      for (let p = 0; p < img.width * img.height; p += step) {
+        const i = p * ch;
+        if (isHalf) {
+          r += halfToFloat(data[i]); g += halfToFloat(data[i + 1]); b += halfToFloat(data[i + 2]);
+        } else {
+          r += data[i]; g += data[i + 1]; b += data[i + 2];
+        }
+        n++;
+      }
+      // An HDRI is already LINEAR — no sRGB decode here, unlike the LDR
+      // canvas path below.
+      if (n > 0) rgb = [r / n, g / n, b / n];
+      skyMeanCache.set(texture, rgb);
+      return rgb;
+    }
+    const faces = Array.isArray(texture.image) ? texture.image : [texture.image];
+    if (faces.length && faces.every((img) => img && img.width > 0)) {
+      const S = 8; // 8×8 per face — 384 samples; a MEAN needs no more.
+      const canvas = document.createElement("canvas");
+      canvas.width = S;
+      canvas.height = S;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      let r = 0, g = 0, b = 0, n = 0;
+      for (const img of faces) {
+        ctx.clearRect(0, 0, S, S);
+        ctx.drawImage(img, 0, 0, S, S);
+        const px = ctx.getImageData(0, 0, S, S).data;
+        for (let i = 0; i < px.length; i += 4) {
+          // sRGB decode: the IBL samples the texture with its sRGB flag set,
+          // so the light the raster sees is the LINEAR value — match it.
+          r += (px[i] / 255) ** 2.2;
+          g += (px[i + 1] / 255) ** 2.2;
+          b += (px[i + 2] / 255) ** 2.2;
+          n++;
+        }
+      }
+      if (n > 0) rgb = [r / n, g / n, b / n];
+    }
+  } catch {
+    // Undrawable (GPU-only target) or tainted — keep the neutral fallback.
+  }
+  skyMeanCache.set(texture, rgb);
+  return rgb;
 }
 
 /**
