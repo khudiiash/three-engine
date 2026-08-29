@@ -1673,7 +1673,10 @@ export function createGi2System({
         && (lastVox.built ?? 0) === 0;
       if (drained || frame - rcHoldStart > RC_HOLD_MAX_FRAMES) {
         rcHold = false;
-        console.log(`[gi] gi2 hold released after ${frame - rcHoldStart} frames` +
+        // `[gi2] first light` is the marker every relight gate waits for; the
+        // light never left under a carry, and this is the frame it is again
+        // traced against the CURRENT transport — the honest re-arrival.
+        console.log(`[gi2] first light — carried across the rebuild; [gi] gi2 hold released after ${frame - rcHoldStart} frames` +
           (drained ? " — the re-fill drained; the cascades trace the new transport" : " (cap)"));
       }
     }

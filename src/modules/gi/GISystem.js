@@ -11592,7 +11592,6 @@ export class GISystem {
     // pipeline that fails to compile at a new size, first appears. Reset all
     // three: the latch, the deadline clock (#tick re-arms it on the next first
     // dispatch), and the once-per-build error.
-    this._transportAlive = false;
     this._transportWaveAt = 0;
     this._transportDeadLogged = false;
     // ── §19 6.29 — A CONTENT REBUILD REFRESHES THE TRANSPORT, NEVER THE LIGHT ─
@@ -11604,6 +11603,11 @@ export class GISystem {
     // or a resize is a real re-allocation and still goes through the old path.
     this._gi2Keep = GI2_PATH && !!this._gi2 && this.#gi2Signature() === this._gi2Sig
       && globalThis.__gi2CarryState !== false;
+    // The IBL blackout latch is re-earned by a NEW system's rays; a kept system's
+    // rays never stopped, and dropping the latch here blacked the indirect term
+    // for the ~4 frames the readback took to re-latch it (measured: mean 0.557
+    // → 0.171, 83 % of pixels black, at both the promotion and the settle).
+    if (!this._gi2Keep) this._transportAlive = false;
     if (GI2_PATH && this._gi2 && !this._gi2Keep) {
       console.log(`[gi] gi2 NOT carried — describe-level change (${this._gi2Sig} → ${this.#gi2Signature()}); a real re-allocation`);
     }
