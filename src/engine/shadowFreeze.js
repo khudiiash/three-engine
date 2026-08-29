@@ -1,5 +1,8 @@
 // @ts-check
 
+import { DepthTexture, ShadowNode } from "three/webgpu";
+import { SHADOW_DYNAMIC_LAYER } from "./editorLayers.js";
+
 /**
  * Automatic shadow-map freezing — stop re-rendering a shadow map for a scene
  * that has not moved.
@@ -59,8 +62,119 @@
  * site in `update()`.
  */
 
+const DYNAMIC_MASK = (1 << SHADOW_DYNAMIC_LAYER) >>> 0;
+
 /**
- * Hash of everything that feeds a shadow map, or `null` for "never freeze".
+ * §19 6.31 — THE STATIC CACHE + DYNAMIC OVERLAY SHADOW MAP.
+ *
+ * The freeze's rule used to be "a skinned mesh anywhere → never freeze": one
+ * character in Bistro re-rendered every cascade's ~500 static casters per
+ * frame (LIVE 08-29: 645 draws, 9.19 M triangles for a 2.83 M scene, cpu
+ * 23 ms, `freezeReason: a skinned or morphing mesh is present`). A character is
+ * the NORMAL condition of a game, so that rule was a design bug under the
+ * 60 fps floor. The fix is by construction, not by tuning:
+ *
+ *   1. the STATIC casters (everything the fingerprint reads) render into the
+ *      cascade's map exactly as often as the freeze used to allow — once per
+ *      stable key — and the resulting depth is COPIED into a cache texture;
+ *   2. every frame the cached depth is copied back and only the DYNAMIC
+ *      casters (skinned, morphing, `giMobility: "dynamic"`, shadowMerge movers)
+ *      are drawn over it, depth-tested, with no clear — a shadow camera posed
+ *      on {@link SHADOW_DYNAMIC_LAYER} ALONE sees nothing else.
+ *
+ * A depth copy is one blit per cascade; the ~500 draws it replaces cost
+ * ~40 µs each on the CPU. The hook is three's own: `ShadowNode.renderShadow` is
+ * documented as the method to override for "a custom shadow map rendering",
+ * and CSM cascades are plain `ShadowNode`s (see `collectFreezableCasters`).
+ * Lights without a plan take the untouched original path.
+ */
+const baseRenderShadow = ShadowNode.prototype.renderShadow;
+function overlayRenderShadow(frame) {
+  const plan = this.light?.userData?.__shadowOverlay;
+  if (!plan || plan.mode === "full" || plan.failed || !plan.dynamic?.length) {
+    return baseRenderShadow.call(this, frame);
+  }
+  const { shadow, shadowMap, light } = this;
+  const { renderer, scene } = frame;
+  try {
+    const src = shadowMap.depthTexture;
+    let cache = plan.cache;
+    // Sized against the map's own depth texture, never `shadow.mapSize`: a map
+    // three has resized keeps its old texture size until it is rebuilt, and a
+    // cache checked against mapSize then never fits — re-rendered and
+    // re-allocated (64 MB) EVERY frame (Level, 08-29).
+    const cacheFits = !!cache && cache.image.width === src.image.width && cache.image.height === src.image.height
+      && cache.type === src.type && cache.format === src.format;
+    if (plan.mode === "static-cache" || !plan.cacheValid || !cacheFits) {
+      // The static half: three's own full render with the dynamic casters
+      // hidden, then the depth is banked. `visible` is the one switch that
+      // removes a mesh from the render list without touching any cache key.
+      const dyn = plan.dynamic;
+      const vis = new Array(dyn.length);
+      for (let i = 0; i < dyn.length; i++) { vis[i] = dyn[i].visible; dyn[i].visible = false; }
+      try { baseRenderShadow.call(this, frame); }
+      finally { for (let i = 0; i < dyn.length; i++) dyn[i].visible = vis[i]; }
+      if (!cacheFits) {
+        cache?.dispose();
+        cache = new DepthTexture(src.image.width, src.image.height, src.type);
+        cache.format = src.format;
+        cache.compareFunction = src.compareFunction;
+        cache.name = "ShadowStaticDepthCache";
+        plan.cache = cache;
+      }
+      renderer.copyTextureToTexture(src, cache);
+      plan.cacheValid = true;
+      plan.staticRenders++;
+    } else {
+      shadow.updateMatrices(light);
+      shadowMap.setSize(shadow.mapSize.width, shadow.mapSize.height, shadowMap.depth);
+      renderer.copyTextureToTexture(cache, src);
+      plan.restores++;
+    }
+    // The dynamic overlay: SHADOW_DYNAMIC_LAYER alone, no clear, on top of the
+    // static depth just restored. `autoClearDepth` is switched off as well as
+    // `autoClear` because an opaque Color background forces the clear branch
+    // (Background.update: `autoClear || forceClear`) and reads the per-buffer
+    // flags there — see gi-mask-forceclear-rootcause.
+    const mask = shadow.camera.layers.mask;
+    const ac = renderer.autoClear, acc = renderer.autoClearColor, acd = renderer.autoClearDepth, acs = renderer.autoClearStencil;
+    const name = scene.name;
+    shadow.camera.layers.mask = DYNAMIC_MASK;
+    renderer.autoClear = false; renderer.autoClearColor = false; renderer.autoClearDepth = false; renderer.autoClearStencil = false;
+    scene.name = `Shadow Overlay [ ${light.name || "ID: " + light.id} ]`;
+    try { renderer.render(scene, shadow.camera); }
+    finally {
+      scene.name = name;
+      shadow.camera.layers.mask = mask;
+      renderer.autoClear = ac; renderer.autoClearColor = acc; renderer.autoClearDepth = acd; renderer.autoClearStencil = acs;
+    }
+    plan.overlays++;
+  } catch (err) {
+    plan.failed = true;
+    console.warn("[shadowFreeze] static-cache overlay failed — this light renders the full map again:", err);
+    baseRenderShadow.call(this, frame);
+  }
+}
+if (!ShadowNode.prototype.__shadowOverlayPatched) {
+  ShadowNode.prototype.__shadowOverlayPatched = true;
+  ShadowNode.prototype.renderShadow = overlayRenderShadow;
+}
+
+function disposePlan(light) {
+  const plan = light?.userData?.__shadowOverlay;
+  if (!plan) return;
+  plan.cache?.dispose();
+  delete light.userData.__shadowOverlay;
+}
+
+/**
+ * Hash of everything that feeds a STATIC shadow caster.
+ *
+ * §19 6.31: a mesh whose silhouette is not a function of what this walk reads
+ * (skinned, morphing, `giMobility: "dynamic"`, or caught moving by shadowMerge)
+ * is no longer a reason to return `null` — it is pushed to `dynamic`, tagged
+ * with SHADOW_DYNAMIC_LAYER, and left OUT of the hash, so the static map can
+ * freeze around it while it is drawn live on top every frame.
  *
  * A rolling integer hash, not a joined string: this runs every frame over the
  * whole scene, and allocating hundreds of short-lived strings to save draw calls
@@ -72,18 +186,22 @@
  * A collision costs ONE stale frame until the next real change, which is why a
  * hash is acceptable here and would not be for a cache key.
  */
-function fingerprintCasters(scene) {
+function fingerprintCasters(scene, dynamic, movers) {
   let h = 0x811c9dc5;
-  let dynamic = false;
   const mix = (v) => {
     h = Math.imul(h ^ (v | 0), 0x01000193) >>> 0;
   };
   scene.traverse((object) => {
-    if (dynamic || !object.isMesh) return;
-    if (object.isSkinnedMesh || object.morphTargetInfluences?.length) {
-      dynamic = true;
+    if (!object.isMesh) return;
+    const deforms = object.isSkinnedMesh || (object.morphTargetInfluences?.length ?? 0) > 0;
+    if (deforms || object.userData?.giMobility === "dynamic" || (movers !== null && movers.has(object))) {
+      if (object.castShadow === true && object.visible !== false) {
+        if ((object.layers.mask & DYNAMIC_MASK) === 0) object.layers.enable(SHADOW_DYNAMIC_LAYER);
+        dynamic.push(object);
+      }
       return;
     }
+    if ((object.layers.mask & DYNAMIC_MASK) !== 0) object.layers.disable(SHADOW_DYNAMIC_LAYER);
     // Only CASTERS matter. A receiver moving changes what the shadow lands on,
     // which is resolved per-pixel at lookup time from a map that did not change.
     if (object.castShadow !== true) return;
@@ -105,34 +223,7 @@ function fingerprintCasters(scene) {
       mix(object.instanceMatrix?.version ?? -1);
     }
   });
-  return dynamic ? null : h;
-}
-
-/**
- * Does the scene contain anything whose SILHOUETTE moves without its matrix?
- *
- * ⭐ THIS IS THE SAME TEST `fingerprintCasters` MAKES, HOISTED OUT OF THE PER-
- * FRAME WALK. A single skinned mesh anywhere — one character in a 1600-mesh
- * street — makes the fingerprint return `null` forever, so the freeze can never
- * engage and the full traversal is pure loss. MEASURED on Bistro:
- * `shadowFreeze` 1.147 ms of a 35.6 ms CPU frame (3.2 %) with `frozen: 0`, every
- * frame, to re-derive an answer that cannot change without a hierarchy edit.
- *
- * Being skinned or carrying morph targets is STRUCTURAL — a mesh cannot acquire
- * either without being rebuilt and re-added — so `hierarchy-changed` is a
- * complete invalidation signal, which is what makes caching this safe when
- * caching the fingerprint itself would not be.
- */
-function sceneHasDeformingCaster(scene) {
-  let found = false;
-  scene.traverse((object) => {
-    if (found || !object.isMesh) return;
-    // ⚠ Deliberately NOT gated on `castShadow`, to match `fingerprintCasters`
-    // exactly. Diverging here would make the fast path answer a different
-    // question from the slow one, which is how a cache becomes a bug.
-    if (object.isSkinnedMesh || object.morphTargetInfluences?.length) found = true;
-  });
-  return found;
+  return h;
 }
 
 /**
@@ -231,10 +322,10 @@ export class ShadowFreezeSystem {
      * the whole system — three very different problems. Nothing said which.
      */
     this.reason = "not run yet";
-    /** Cached answer to `sceneHasDeformingCaster`, keyed on hierarchy edits. */
-    this._hasDeformingCaster = false;
-    this._deformDirty = true;
-    this._deformOff = null;
+    /** §19 6.31: lights whose static map is cached and whose dynamic casters are overlaid per frame. */
+    this.overlayLights = 0;
+    /** How many casters the fingerprint left out as dynamic this frame. */
+    this.dynamicCasters = 0;
     /** Renderer/device identity, so a rebuild or device loss un-freezes. */
     this._rendererSeen = false;
     this._renderer = null;
@@ -251,25 +342,6 @@ export class ShadowFreezeSystem {
     // rather than implementing one.
     if (this.enabled === false || engine.settings?.shadow?.autoUpdate === false) {
       this.reason = this.enabled === false ? "disabled" : "the project authored shadow.autoUpdate = false";
-      this.#releaseAll();
-      return;
-    }
-
-    // ⭐ THE CHEAP QUESTION FIRST. See sceneHasDeformingCaster: one skinned mesh
-    // makes every later step futile, and asking it per frame cost more than the
-    // freeze was ever going to save on a scene that has one.
-    if (!this._deformOff && typeof engine.on === "function") {
-      this._deformOff = engine.on("hierarchy-changed", () => {
-        this._deformDirty = true;
-      });
-    }
-    if (this._deformDirty) {
-      this._deformDirty = false;
-      this._hasDeformingCaster = sceneHasDeformingCaster(scene);
-    }
-    if (this._hasDeformingCaster) {
-      this.reason = "a skinned or morphing mesh is present — no matrix this walk can read moves when its shadow should";
-      this.managedLights = 0;
       this.#releaseAll();
       return;
     }
@@ -324,21 +396,11 @@ export class ShadowFreezeSystem {
 
     // ONE traversal for the whole scene, not one per light: the caster set is
     // shared, and only the shadow CAMERA differs between lights.
-    const content = fingerprintCasters(scene);
-    if (content === null) {
-      // Something in the scene deforms without moving. Hand every light back.
-      // ⭐ THE BACKSTOP TEACHES THE CACHE. Reaching here means a deforming mesh
-      // arrived by a route that is not `hierarchy-changed` — MEASURED on Bistro,
-      // where a ModelComponent swapping in a skinned GLB announces itself as
-      // `component-changed:mesh`, so this branch fired every single frame and
-      // the cheap path never did. Recording what the slow path just proved makes
-      // the next frame take the early exit; `hierarchy-changed` still clears it,
-      // so removing the character still restores the freeze.
-      this._hasDeformingCaster = true;
-      this.reason = "a deforming caster appeared without a hierarchy edit";
-      this.#releaseAll();
-      return;
-    }
+    // §19 6.31: the dynamic casters are collected, not bailed on. The array is
+    // shared by every light's plan this frame (the set is per scene).
+    const dynamic = [];
+    const content = fingerprintCasters(scene, dynamic, engine.shadowMerge?._movers ?? null);
+    this.dynamicCasters = dynamic.length;
 
     // ⭐⭐ PROOF THAT A RENDER HAPPENED BETWEEN THE TWO SIGHTINGS.
     //
@@ -362,6 +424,7 @@ export class ShadowFreezeSystem {
     const renderCalls = this.engine?.renderer?.info?.render?.calls ?? 0;
 
     let frozen = 0;
+    let overlay = 0;
     for (const light of lights) {
       const shadow = light.shadow;
       let key = content;
@@ -447,23 +510,45 @@ export class ShadowFreezeSystem {
       // three is guaranteed to have completed at least one real shadow render
       // before this system ever switches it off.
       const previous = this._keys.get(light);
-      if (previous?.key === key && renderCalls > previous.calls) {
+      const stable = previous?.key === key && renderCalls > previous.calls;
+      if (stable && dynamic.length === 0) {
         shadow.autoUpdate = false;
-        this._owned.add(light);
+        disposePlan(light);
         frozen++;
+      } else if (stable) {
+        // §19 6.31: the static half is stable but dynamic casters exist — keep
+        // three rendering and let `overlayRenderShadow` bank the static depth
+        // once (under THIS key) and draw only the dynamic layer over it.
+        let plan = light.userData.__shadowOverlay;
+        if (!plan) {
+          plan = { mode: "static-cache", key, cache: null, cacheValid: false, dynamic, failed: false, staticRenders: 0, restores: 0, overlays: 0 };
+          light.userData.__shadowOverlay = plan;
+        }
+        plan.dynamic = dynamic;
+        if (plan.key !== key) { plan.key = key; plan.cacheValid = false; }
+        plan.mode = plan.cacheValid ? "overlay" : "static-cache";
+        shadow.autoUpdate = true;
+        overlay++;
       } else {
         // A repeat key with no render in between leaves the record ALONE, so
         // the freeze still lands on the first sighting after the renderer
         // actually runs rather than restarting the count.
         if (previous?.key !== key) this._keys.set(light, { key, calls: renderCalls });
         shadow.autoUpdate = true;
-        this._owned.add(light);
+        const plan = light.userData.__shadowOverlay;
+        if (plan) { plan.mode = "full"; plan.cacheValid = false; plan.dynamic = dynamic; }
       }
+      this._owned.add(light);
     }
     this.frozenLights = frozen;
-    this.reason = frozen === lights.length
-      ? `frozen (${frozen}/${lights.length})`
-      : `redrawing — the scene key changed (${frozen}/${lights.length} frozen)`;
+    this.overlayLights = overlay;
+    const held = frozen + overlay;
+    const dyn = dynamic.length
+      ? ` — ${dynamic.length} skinned/morphing/dynamic caster${dynamic.length === 1 ? "" : "s"} drawn live over the cached static map`
+      : "";
+    this.reason = held === lights.length
+      ? `frozen (${frozen}/${lights.length}${overlay ? `, ${overlay} static-cached + overlay` : ""})${dyn}`
+      : `redrawing — the scene key changed (${frozen}/${lights.length} frozen${overlay ? `, ${overlay} overlay` : ""})${dyn}`;
   }
 
   /**
@@ -481,14 +566,14 @@ export class ShadowFreezeSystem {
       // or renderer change, so `_owned` can outlive the object it names.
       if (light.shadow) light.shadow.autoUpdate = true;
       this._keys.delete(light);
+      disposePlan(light);
     }
     this._owned.clear();
     this.frozenLights = 0;
+    this.overlayLights = 0;
   }
 
   dispose() {
-    this._deformOff?.();
-    this._deformOff = null;
     this.#releaseAll();
   }
 }
