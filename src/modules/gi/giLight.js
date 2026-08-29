@@ -1966,6 +1966,10 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       }
       return;
     }
+    // §19 6.18 A/B HATCHES (build-time, compile the term OUT): __giHookOff,
+    // __giHookFlatIrradiance, __giHookNoGlow, __giHookNoGlossy,
+    // __giHookNoExact, __giHookNoEnvMiss (+ the existing __giExactPrefilter).
+    if (globalThis.__giHookOff === true) return;
     // Face-forward toward the camera: a double-sided plane seen from its
     // back face would otherwise gather the wrong hemisphere and render
     // dark from inside a room whose wall normal points outward.
@@ -2037,14 +2041,30 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       ? (texNode, texel = null, nestedFallback = null) => {
         void texel;
         const v = vec4(texNode.sample(giUV)).toVar();
-        return light.giNestedView && nestedFallback
-          ? select(float(light.giNestedView).greaterThan(0.5), nestedFallback, v)
-          : v;
+        // §19 6.18 — THE NESTED STAND-IN IS A BRANCH, NOT A SELECT. `select()`
+        // keeps BOTH operands live: the irradiance stand-in is the reflection-
+        // probe atlas sampler unrolled over MAX_REFLECTION_PROBES slots — 80
+        // `textureSampleLevel`s per pixel, compiled into EVERY lit material
+        // (a rough Cornell wall included) and executed on every pixel of the
+        // main view, whose `giNestedView` uniform is 0. Measured: inside the
+        // Cornell box, 1.6 M wall pixels × that sampler = ~4 ms of the frame
+        // (gpu 19-20 → 16 ms with the term compiled out). `If()` on the
+        // uniform skips the whole sampler on the main-view branch; nested
+        // (planar-mirror) renders take exactly the value they took before.
+        // The fallback is a THUNK so its graph is emitted inside the branch.
+        if (light.giNestedView && nestedFallback) {
+          If(float(light.giNestedView).greaterThan(0.5), () => {
+            v.assign(typeof nestedFallback === "function" ? nestedFallback() : nestedFallback);
+          });
+        }
+        return v;
       }
       : null;
     const bilateral = gi2Sample
       ?? (light.giPositionNode && light.giScreenTexel
-        ? (texNode, texel = light.giScreenTexel, nestedFallback = null) => {
+        ? (texNode, texel = light.giScreenTexel, nestedFallbackIn = null) => {
+            // (§19 6.18: the stand-in may arrive as a thunk — see gi2Sample.)
+            const nestedFallback = typeof nestedFallbackIn === "function" ? nestedFallbackIn() : nestedFallbackIn;
             // FIXED-METRE HATCHES (2026-08-07, the ~0.196m block-size hunt).
             // Measured: block size on the floor is 0.196 + 0.14·probeSpacing
             // metres in x, and the voxelSize dial is inert (5× the dial moves
@@ -2178,12 +2198,14 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
     // floor). Compiled only when the scene has probes; without them the
     // nested fallback stays zero (dim mirror, never a ghost).
     const irrNestedFallback = light.giProbes
-      ? (() => {
+      ? () => {
           const p = sampleReflectionProbes(light.giProbes, positionWorld, N, float(1));
           return vec4(vec3(p.rgb).mul(Math.PI).mul(p.weight), 1);
-        })()
+        }
       : null;
-    const irradiance = deferred
+    const irradiance = globalThis.__giHookFlatIrradiance === true
+      ? vec3(0.5).toVar()
+      : deferred
       ? vec3(bilateral ? bilateral(light.giIrradianceNode, light.giScreenTexel, irrNestedFallback) : light.giIrradianceNode.sample(giUV)).toVar()
       : vec3(light.gatherFn(samplePoint, N, cameraPosition.sub(positionWorld).normalize())).mul(light.intensityUniform);
     builder.context.irradiance.addAssign(irradiance);
@@ -2221,7 +2243,9 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // emitter term is unaffected — it arrives through the irradiance texture,
       // which under GI2 carries `gi2System`'s probe-space emitter NEE (one
       // shadow ray per slot per probe per frame), shadows included.
-      if (GI2_PATH && light.emitterSlots?.length) {
+      if (globalThis.__giHookNoGlow === true) {
+        // hatch: no specular glow term
+      } else if (GI2_PATH && light.emitterSlots?.length) {
         for (const slot of light.emitterSlots) emitterData.push({ slot, shadow: float(1) });
       } else if (light.emitterSlots?.length && light.giEmitterShadowNode) {
         // Same bilateral as the irradiance above — packed per-emitter shadow
@@ -2283,7 +2307,7 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
         return;
       }
       const bucket = giRoughnessBucketOf(builder.material);
-      const fullyRough = bucket === 2;
+      const fullyRough = bucket === 2 || globalThis.__giHookNoGlossy === true;
       const canMirror = bucket === 0 || bucket === 3;
       if (fullyRough) {
         // Static high roughness: the roughness collapse below would discard
@@ -2362,7 +2386,7 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // over the deferred directional cascade result for mirror-ish pixels.
       // This replaces the old per-material hit reconstruction/SDF/shadow
       // graph (tens of seconds to compile) with two texture reads and a mix.
-      if (light.bvhReflectColorTexture && canMirror) {
+      if (light.bvhReflectColorTexture && canMirror && globalThis.__giHookNoExact !== true) {
         const exactHit = light.bvhReflectColorTexture.sample(giUV);
         // ── THE ROUGHNESS PREFILTER (2026-08-22) ────────────────────────────
         //
@@ -2767,7 +2791,7 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // `step(1e-4, intensity)` is kept: with no environment the kernel
       // leaves rgb at 0, and mixing toward black would DARKEN the miss
       // against today's field fallback rather than leaving it alone.
-      if (light.giEnvMiss && light.bvhReflectColorTexture) {
+      if (light.giEnvMiss && light.bvhReflectColorTexture && globalThis.__giHookNoEnvMiss !== true) {
         const envTexel = light.bvhReflectColorTexture.sample(giUV);
         const envW = envTexel.a.negate().clamp(0, 1)
           .mul(smoothstep(0.45, 0.15, roughness))
