@@ -23,9 +23,13 @@
  */
 import assert from "node:assert/strict";
 
-const { collectStateComputeNodes, releaseComputeNodes } = await import(
-  "../src/modules/gi/releaseCompute.js"
-);
+const {
+  collectStateComputeNodes,
+  collectStateStorageAttributes,
+  harvestStorageAttributes,
+  releaseComputeNodes,
+  releaseStorageAttributes,
+} = await import("../src/modules/gi/releaseCompute.js");
 
 let failures = 0;
 const check = (name, fn) => {
@@ -46,7 +50,16 @@ const spyRenderer = () => {
   const evicted = [];
   return {
     evicted,
-    _bindings: { deleteForCompute: (n) => evicted.push(`bind:${n.id}`) },
+    // `has`/`get` mirror three's real Bindings (a DataMap of per-node state):
+    // releaseComputeNodes probes them BEFORE evicting, because `deleteForCompute`
+    // on a node Bindings never initialized over-decrements the SHARED render
+    // bind group's `usedTimes` and destroys a uniform buffer the scene is still
+    // bound to (measured: 49 uncaptured device errors across four resize hops).
+    _bindings: {
+      has: (n) => n?.initialized === true,
+      get: (n) => (n?.initialized ? { bindings: [] } : undefined),
+      deleteForCompute: (n) => evicted.push(`bind:${n.id}`),
+    },
     _pipelines: { delete: (n) => evicted.push(`pipe:${n.id}`) },
     _nodes: { delete: (n) => evicted.push(`node:${n.id}`) },
   };
@@ -110,8 +123,19 @@ check("evicts all THREE caches, bindings first and the node builder state last",
   // make that lookup REBUILD the state we are discarding. And the bind groups
   // are what hold the buffers this whole fix exists to free.
   const renderer = spyRenderer();
-  releaseComputeNodes(renderer, [node(1)]);
+  releaseComputeNodes(renderer, [{ isComputeNode: true, id: 1, initialized: true }]);
   assert.deepEqual(renderer.evicted, ["bind:1", "pipe:1", "node:1"]);
+});
+
+check("skips Bindings for a node Bindings never initialized", () => {
+  // The crash guard: `deleteForCompute` on a never-dispatched node over-
+  // decrements the SHARED render bind group's `usedTimes` (one BindGroup
+  // instance shared by every render object and compute node) and destroys a
+  // uniform buffer the whole scene still binds. A node with no Bindings entry
+  // owns no bind group — skipping is the correct refcount, not a leak.
+  const renderer = spyRenderer();
+  releaseComputeNodes(renderer, [node(1)]);
+  assert.deepEqual(renderer.evicted, ["pipe:1", "node:1"], "no bind eviction");
 });
 
 check("clearing only bindings+pipelines is NOT enough — _nodes must be evicted", () => {
@@ -132,6 +156,8 @@ check("a node that was never dispatched does not abort the sweep", () => {
   const seen = [];
   const renderer = {
     _bindings: {
+      has: (n) => n.initialized === true,
+      get: (n) => (n.initialized ? { bindings: [] } : undefined),
       deleteForCompute: (n) => {
         if (n.id === 1) throw new Error("never dispatched");
         seen.push(n.id);
@@ -139,7 +165,11 @@ check("a node that was never dispatched does not abort the sweep", () => {
     },
     _pipelines: { delete: () => {} },
   };
-  const released = releaseComputeNodes(renderer, [node(1), node(2), node(3)]);
+  const released = releaseComputeNodes(renderer, [
+    { isComputeNode: true, id: 1, initialized: true },
+    { isComputeNode: true, id: 2, initialized: true },
+    { isComputeNode: true, id: 3, initialized: true },
+  ]);
   assert.deepEqual(seen, [2, 3], "nodes after the throwing one must still be evicted");
   assert.equal(released, 2, "the failed node must not be counted as released");
 });
@@ -154,8 +184,168 @@ check("degrades to a no-op if three renames its caches", () => {
 
 check("ignores non-nodes handed to it", () => {
   const renderer = spyRenderer();
-  releaseComputeNodes(renderer, [null, undefined, 42, "compute", node(5)]);
+  releaseComputeNodes(renderer, [null, undefined, 42, "compute", { isComputeNode: true, id: 5, initialized: true }]);
   assert.deepEqual(renderer.evicted, ["bind:5", "pipe:5", "node:5"]);
+});
+
+
+// ════════════════════════════════════════════════════════ — THE BUFFERS
+//
+// Everything above evicts NODES. Measured on Bistro (three ultra↔high
+// rebuilds): +1,853 MB of live GPU storage per rebuild with every storage
+// bucket reading `gone 0`, because `Bindings._destroyBindings` (three,
+// Bindings.js:245-289) has branches for uniform buffers and samplers and NONE
+// for storage buffers. The only path to `GPUBuffer.destroy()` is
+// `renderer._attributes.delete`, and these guard it.
+
+/** A `StorageInstancedBufferAttribute` stand-in. */
+const attr = (id, bytes = 4) => ({
+  isBufferAttribute: true, id, array: new Uint32Array(bytes / 4),
+});
+
+/**
+ * A renderer whose `_attributes`/`backend` behave like three's: `delete`
+ * destroys, `has` is honest, and `info.memoryMap` pins every attribute ever
+ * bound (Info.js:145 — a plain Map whose only `delete` is the one below).
+ */
+const bufferRenderer = (bound = []) => {
+  const live = new Set(bound);
+  const memoryMap = new Map(bound.map((a) => [a, { size: 1, type: "storageAttributes" }]));
+  const deletes = [];
+  return {
+    deletes, live, memoryMap,
+    _attributes: {
+      has: (a) => live.has(a),
+      delete: (a) => { deletes.push(a.id); live.delete(a); memoryMap.delete(a); },
+    },
+    backend: { has: (a) => live.has(a) },
+    info: { memoryMap },
+  };
+};
+
+check("destroys exactly once per bound attribute", () => {
+  const a = attr(1), b = attr(2);
+  const r = bufferRenderer([a, b]);
+  assert.equal(releaseStorageAttributes(r, [a, b]), 2);
+  assert.deepEqual(r.deletes, [1, 2]);
+  assert.equal(r.memoryMap.size, 0, "info.memoryMap must stop pinning them");
+});
+
+check("no-ops on an attribute the backend never bound, and still unpins it", () => {
+  // ⚠ THE CRASH THIS GUARDS: `WebGPUAttributeUtils.destroyAttribute` (:361-370)
+  // does `backend.get(attr).buffer.destroy()` with no null check, and
+  // `DataMap.get` CREATES the record — so one earlier `get` on an unbound
+  // attribute is enough to walk `Attributes.delete` into `undefined.destroy()`.
+  const ghost = attr(9);
+  const r = bufferRenderer([]);
+  r.memoryMap.set(ghost, { size: 1, type: "storageAttributes" });
+  assert.equal(releaseStorageAttributes(r, [ghost]), 0, "must not call delete");
+  assert.deepEqual(r.deletes, []);
+  assert.equal(r.memoryMap.has(ghost), false, "the Map entry must still go");
+});
+
+check("is idempotent — a second release destroys nothing", () => {
+  const a = attr(1);
+  const r = bufferRenderer([a]);
+  releaseStorageAttributes(r, [a]);
+  assert.equal(releaseStorageAttributes(r, [a]), 0);
+  assert.deepEqual(r.deletes, [1], "exactly one delete for one attribute");
+});
+
+check("storage release degrades to a no-op if three renames its caches", () => {
+  assert.equal(releaseStorageAttributes({}, [attr(1)]), 0);
+  assert.equal(releaseStorageAttributes(null, [attr(1)]), 0);
+  assert.equal(releaseStorageAttributes(bufferRenderer(), null), 0);
+});
+
+/** A node carrying a three-shaped `nodeBuilderState.bindings`. */
+const boundNode = (id, attributes) => {
+  const n = node(id);
+  n.__bindings = [{
+    bindings: attributes.map((a) => ({
+      isStorageBuffer: true, nodeUniform: { value: a }, _buffer: a.array,
+      _attribute: a, get attribute() { return this.nodeUniform.value; },
+    })),
+  }];
+  return n;
+};
+const nodeStateRenderer = () => {
+  const evicted = [];
+  const _nodes = {
+    getForComputeCalls: 0,
+    has: (n) => n.__bindings !== undefined,
+    get: (n) => ({ nodeBuilderState: { bindings: n.__bindings } }),
+    delete: () => {},
+    getForCompute() { _nodes.getForComputeCalls++; throw new Error("must never be called"); },
+  };
+  return {
+    evicted, _nodes,
+    _bindings: { deleteForCompute: (n) => evicted.push(`bind:${n.id}`) },
+    _pipelines: { delete: () => {} },
+  };
+};
+
+check("harvests what a node bound, and never calls getForCompute", () => {
+  // ⚠ `NodeManager.getForCompute` (:451-471) REBUILDS the state it cannot
+  // find — on this project's SRC kernels a 16-27 s recompile of exactly the
+  // generation being discarded. `has` before `get`, never getForCompute.
+  const a = attr(1), b = attr(2);
+  const r = nodeStateRenderer();
+  const harvest = new Set();
+  releaseComputeNodes(r, [boundNode(10, [a, b])], harvest);
+  assert.deepEqual([...harvest].map((x) => x.id).sort(), [1, 2]);
+  assert.equal(r._nodes.getForComputeCalls, 0);
+});
+
+check("nulls the bind group's captured CPU array on the way out", () => {
+  const a = attr(1, 64);
+  const n = boundNode(10, [a]);
+  const binding = n.__bindings[0].bindings[0];
+  releaseComputeNodes(nodeStateRenderer(), [n]);
+  assert.equal(binding._buffer, null, "Buffer._buffer holds the full CPU twin");
+  assert.equal(binding._attribute, null);
+});
+
+check("a survivor's attributes are the KEEP set, and harvest never evicts", () => {
+  // The set difference is the whole safety argument: two passes routinely bind
+  // the same buffer, and an in-place resize keeps NODES while swapping buffers
+  // under them.
+  const shared = attr(1), orphanOnly = attr(2);
+  const r = nodeStateRenderer();
+  const survivor = boundNode(20, [shared]);
+  const keep = harvestStorageAttributes(r, [survivor]);
+  assert.deepEqual([...keep].map((x) => x.id), [1]);
+  assert.deepEqual(r.evicted, [], "harvesting must not evict anything");
+
+  const harvest = new Set();
+  releaseComputeNodes(r, [boundNode(10, [shared, orphanOnly])], harvest);
+  const doomed = [...harvest].filter((x) => !keep.has(x)).map((x) => x.id);
+  assert.deepEqual(doomed, [2], "the shared buffer must survive its orphan");
+});
+
+check("collectStateStorageAttributes reads both published lists, at depth", () => {
+  const a = attr(1), b = attr(2), c = attr(3);
+  const found = collectStateStorageAttributes({
+    volume: { occupancyField: { get storageAttributes() { return [a]; } } },
+    screen: { srcProbes: { get cpuMirrors() { return [b]; } }, bvhReflect: { pass: { storageAttributes: [c] } } },
+  });
+  assert.deepEqual(found.map((x) => x.id).sort(), [1, 2, 3]);
+});
+
+check("collectStateStorageAttributes does not climb into the scene graph", () => {
+  // `state.light` is a real Object3D; following `parent` reaches every mesh.
+  const trap = attr(9);
+  const light = { isObject3D: true, parent: { storageAttributes: [trap] } };
+  assert.deepEqual(collectStateStorageAttributes({ light }), []);
+});
+
+check("collectStateStorageAttributes survives a getter that throws", () => {
+  const a = attr(1);
+  const found = collectStateStorageAttributes({
+    broken: { get storageAttributes() { throw new Error("not built yet"); } },
+    ok: { storageAttributes: [a] },
+  });
+  assert.deepEqual(found.map((x) => x.id), [1]);
 });
 
 console.log(failures ? `\n${failures} failing` : "\nall ok");

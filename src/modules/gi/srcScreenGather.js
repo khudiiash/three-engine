@@ -562,6 +562,10 @@ export function createSrcScreenGather(store, tiles, {
     compute,
     target,
     stats,
+    /** The GPU buffers that die with this bundle (releaseCompute's teardown walk). */
+    get storageAttributes() {
+      return [stats].map((n) => n?.value).filter(Boolean);
+    },
     /**
      * §13.9's C0↔C1 weight dial, live. GISystem pushes `__giGatherSmoothLive`
      * into it each frame when that global is set, so a probe can render both

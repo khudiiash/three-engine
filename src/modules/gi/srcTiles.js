@@ -614,6 +614,15 @@ export function createSrcTileAtlas(store, bins, {
     blocks,
     nBins,
     stats,
+    /**
+     * The GPU buffers that die with this bake. Lookup tables (`cosTable`,
+     * `skyDirTable`) are uploaded once and never rewritten, so they belong
+     * here exactly like `stats` does; nothing outside a rebuild ever binds
+     * them again. Walked by releaseCompute's `collectStateStorageAttributes`.
+     */
+    get storageAttributes() {
+      return [cosTable, stats, skyDirTable].map((n) => n?.value).filter(Boolean);
+    },
     // Half float is 8 bytes a texel at RGBA.
     bytes: layout.width * layout.height * 8 + table.length * 4 + TS_WORDS * 4,
 

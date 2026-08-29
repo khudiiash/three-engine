@@ -624,6 +624,13 @@ export function createSrcMergeFrame(store, bins, {
     cornerWeight,
     cornerCascades,
     stats,
+    /**
+     * GPU-only after the first bind; `detachCpuMirror` drops the JS twin three
+     * already copied into the GPU buffer. Nothing here is ever written CPU-side
+     * again (readbacks go through `getArrayBufferAsync`, which sizes itself
+     * from `bufferGPU.size`).
+     */
+    cpuMirrors: [cornerBlock, cornerWeight, stats].map((n) => n?.value).filter(Boolean),
     bytes: (cornerSize * 2 + statWords) * 4,
     w0,
     cascadeCount: N,

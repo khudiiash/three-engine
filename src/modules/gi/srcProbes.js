@@ -611,6 +611,14 @@ export function createSrcProbeStore({
     counters,
     freeStack,
     freeTop,
+    /**
+     * GPU-only after the first bind; `detachCpuMirror` drops the JS twin three
+     * already copied into the GPU buffer. Nothing here is ever written CPU-side
+     * again (readbacks go through `getArrayBufferAsync`, which sizes itself
+     * from `bufferGPU.size`).
+     */
+    cpuMirrors: [hashKeys, hashSlot, probeTable, counters, freeStack, freeTop]
+      .map((n) => n?.value).filter(Boolean),
     /** Bytes on the GPU, for the memory high-water telemetry (plan §8). */
     // `blockTotal * 5` — the block free stack plus the FOUR per-block regions
     // riding this buffer's tail (claim stamps, influx words, surprise words,
@@ -1496,6 +1504,13 @@ export function createSrcProbeFrame(store, {
   return {
     pixelProbe,
     pixelHash,
+    /**
+     * GPU-only after the first bind; `detachCpuMirror` drops the JS twin three
+     * already copied into the GPU buffer. Nothing here is ever written CPU-side
+     * again (readbacks go through `getArrayBufferAsync`, which sizes itself
+     * from `bufferGPU.size`).
+     */
+    cpuMirrors: [pixelHash, pixelProbe].map((n) => n?.value).filter(Boolean),
     passes,
     /** Non-null when S1 locality retention is armed — for the boot line. */
     retain,

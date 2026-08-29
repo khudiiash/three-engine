@@ -1368,6 +1368,44 @@ export function createSrcProbeSystem({
     store,
     frame,
     gizmos,
+    /**
+     * Every SRC storage buffer that is GPU-ONLY once uploaded, gathered from
+     * the stores that own them so no list here can go stale when a store gains
+     * a buffer. GISystem queues these for `detachCpuMirror` and drains the
+     * queue once an SRC frame has dispatched unskipped.
+     */
+    get cpuMirrors() {
+      return [
+        ...(store.cpuMirrors ?? []),
+        ...(frame.cpuMirrors ?? []),
+        ...(rayStore.cpuMirrors ?? []),
+        ...(binStore?.cpuMirrors ?? []),
+        ...(merge?.cpuMirrors ?? []),
+      ];
+    },
+    /**
+     * Every SRC storage buffer that dies with this system, a strict SUPERSET
+     * of `cpuMirrors`: the bundles below own buffers that are GPU-only but
+     * never CPU-written again (tile LUTs, the seed's and the gather's stat
+     * blocks), and a teardown has to destroy those too. Walked by
+     * releaseCompute's `collectStateStorageAttributes`.
+     */
+    get storageAttributes() {
+      const seen = new Set();
+      for (const list of [
+        this.cpuMirrors,
+        store.storageAttributes, frame.storageAttributes,
+        rayStore.storageAttributes, binStore?.storageAttributes,
+        merge?.storageAttributes, tiles?.storageAttributes,
+        seed?.storageAttributes, gather?.storageAttributes,
+        glossy?.storageAttributes, secondary?.storageAttributes,
+        deposit?.storageAttributes, hashBlockFrame?.storageAttributes,
+      ]) {
+        if (!Array.isArray(list)) continue;
+        for (const attr of list) if (attr) seen.add(attr);
+      }
+      return [...seen];
+    },
     rayStore,
     rayFrame,
     binStore,

@@ -409,6 +409,10 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
   return {
     passes,
     stats,
+    /** The GPU buffers that die with this bundle (releaseCompute's teardown walk). */
+    get storageAttributes() {
+      return [stats].map((n) => n?.value).filter(Boolean);
+    },
     bytes: SEED_WORDS * 4,
 
     /**

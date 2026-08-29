@@ -147,6 +147,15 @@ export function createSrcRayStore(store, { pixelCount }) {
     rayTotal,
     pixelRayBase,
     rayWork,
+    /**
+     * GPU-only after the first bind; `detachCpuMirror` drops the JS twin three
+     * already copied into the GPU buffer. A getter so a future resize that
+     * re-mints these buffers can never hand the detach queue a stale list.
+     */
+    get cpuMirrors() {
+      return [rayCount, rayCursor, rayTotal, pixelRayBase, rayWork]
+        .map((n) => n?.value).filter(Boolean);
+    },
     pixelCount,
     bytes: (probeTotal * 2 + 2 + pixelCount * 2) * 4,
     dispose() {

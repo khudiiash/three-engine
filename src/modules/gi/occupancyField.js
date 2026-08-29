@@ -5356,6 +5356,29 @@ export function createOccupancyField(bounds, res0, options = {}) {
      * never bind anything new — they read through this same buffer.
      */
     bitsBuffer: bits,
+    /**
+     * Storage ATTRIBUTES whose dead JS twin may be detached once the field has
+     * dispatched — all `const`, never re-minted, and none of them is ever
+     * written CPU-side after upload (the CPU-written KEEP set below is in
+     * `storageAttributes` instead, precisely so its twin is NOT detached).
+     * Walked by releaseCompute's `collectStateStorageAttributes`.
+     */
+    cpuMirrors: [bits, atomicBits, staticBits, attrScratch, surfScratch, surfAlloc]
+      .filter(Boolean)
+      .map((n) => n.value)
+      .filter(Boolean),
+    /**
+     * ALL storage buffers that die with this field, a strict superset of
+     * `cpuMirrors`. A GETTER, not a captured array: `vertexBuffer`,
+     * `indexBuffer` and `pairWork` are re-minted by the geometry re-fit and
+     * readers must see the live generation.
+     */
+    get storageAttributes() {
+      return [
+        bits, atomicBits, staticBits, attrScratch, surfScratch, surfAlloc,
+        vertexBuffer, indexBuffer, pairWork, localToWorld,
+      ].filter(Boolean).map((n) => n.value).filter(Boolean);
+    },
     dynamicObjectWordOffset,
     dynamicObjectWords,
     staticBvhWordOffset,

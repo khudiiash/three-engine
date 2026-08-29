@@ -647,14 +647,21 @@ export function buildBvhScene(meshes) {
     totalVerts += packed.vertexCount;
   }
 
-  const boundsData = new Float32Array(Math.max(1, totalNodes * 6));
-  const contentsData = new Uint32Array(Math.max(1, totalNodes * 2));
-  const indexData = new Uint32Array(Math.max(1, totalTris * 3));
-  const positionData = new Float32Array(Math.max(1, totalVerts * 3));
+  // ⚠ `let`, NOT `const`, AND `dispose()` NULLS THEM. Every closure in this
+  // function shares one scope, so `firstHit`/`refreshTransforms` pin these five
+  // arrays for as long as the scene object lives — and clearing `attr.array`
+  // (releaseStorageAttributes) frees nothing while they do. The typed-array
+  // census (run-gi-heap-retainer.mjs, ALLOC_CENSUS=1) measured it: 69 MB per
+  // BVH generation on Bistro, 25 of 25 allocations still live after three
+  // rebuilds and three gc()s, growing +5 arrays a rebuild forever.
+  let boundsData = new Float32Array(Math.max(1, totalNodes * 6));
+  let contentsData = new Uint32Array(Math.max(1, totalNodes * 2));
+  let indexData = new Uint32Array(Math.max(1, totalTris * 3));
+  let positionData = new Float32Array(Math.max(1, totalVerts * 3));
   // Concatenated with the SAME per-vertex numbering as positionData (both
   // indexed by `positionOffset`) — the hit-albedo lookup in `firstHit`
   // resolves a UV at exactly the global vertex id it resolves a position at.
-  const uvData = new Float32Array(Math.max(1, totalVerts * 2));
+  let uvData = new Float32Array(Math.max(1, totalVerts * 2));
   for (const entry of entries) {
     boundsData.set(entry.packed.bounds, entry.nodeOffset * 6);
     contentsData.set(entry.packed.contents, entry.nodeOffset * 2);
@@ -738,6 +745,19 @@ export function buildBvhScene(meshes) {
     vertexCount: totalVerts,
     texturedCount,
     boundsBuffer, contentsBuffer, indexBuffer, positionBuffer, uvBuffer,
+    /**
+     * The five BLAS buffers. On Bistro they are the largest single allocation
+     * any GI rebuild makes (positions + indices + UVs over every static
+     * triangle), and nothing destroyed them before this: the scene object is
+     * retired-then-`dispose()`d, and `dispose()` only touched the atlas
+     * texture. `GISystem#drainRetiredTargets` reads this list and routes it
+     * through `releaseStorageAttributes` on the same 3-frame delay the
+     * textures get, for the same "used in a submit" reason.
+     */
+    get storageAttributes() {
+      return [boundsBuffer, contentsBuffer, indexBuffer, positionBuffer, uvBuffer]
+        .map((n) => n?.value).filter(Boolean);
+    },
     worldToLocal, aabbMin, aabbMax, offsets, meshCountUniform,
     albedoTile, atlasTexture, atlasTextureNode,
     // Tiles blitBvhAtlasTiles (giScreen.js) still needs to GPU-render
@@ -1007,6 +1027,15 @@ export function buildBvhScene(meshes) {
 
     dispose() {
       entries.length = 0;
+      // See the `let` note above the five arrays. The GPU buffers themselves
+      // are destroyed by the caller's retire queue (`storageAttributes`
+      // above); this is the JS side, which no attribute release can reach
+      // because THIS SCOPE holds it.
+      boundsData = null;
+      contentsData = null;
+      indexData = null;
+      positionData = null;
+      uvData = null;
       atlasTexture?.dispose?.();
       this.blitTarget?.dispose?.();
     },

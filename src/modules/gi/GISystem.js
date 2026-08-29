@@ -47,7 +47,10 @@ import { fitEmitterShape } from "./emitterShapes.js";
 import { fitSkinnedCapsules, rigRootOf, skinnedBoneMatrix, skinnedBoxShape, skinnedCapsuleMatrix, skinnedCapsuleShape } from "./skinnedProxy.js";
 import { MeshBVH } from "three-mesh-bvh";
 import { DEBUG_LAYER, EDITOR_LAYER, GI_DYNAMIC_LAYER, GI_MIRROR_LAYER, GI_SHARP_LAYER, SHADOW_PROXY_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
-import { collectStateComputeNodes, purgeNodeBuilderCache, releaseComputeNodes } from "./releaseCompute.js";
+import {
+  collectStateComputeNodes, collectStateStorageAttributes, cpuMirrorBytes, detachCpuMirror,
+  nullStorageBindingArrays, purgeNodeBuilderCache, releaseComputeNodes, releaseStorageAttributes,
+} from "./releaseCompute.js";
 import { textureLoadsInFlight } from "../../engine/textureAsset.js";
 import { GICascadeLight, GI_REFLECT_TIER, MAX_EMITTERS, giReflectTierInfoOf, giReflectTierOf, giRoughnessBucketOf, giRoughnessFloorStats, giRoughnessSourceOf, registerGILight } from "./giLight.js";
 import { MAX_REFLECTION_PROBES, createReflectionProbeAtlas } from "./reflectionProbes.js";
@@ -1338,6 +1341,13 @@ export class GISystem {
     this._mirrorBucketMaterials = new Set();
     // Resolve targets replaced by a resize, awaiting a safe disposal frame.
     this._retiredTargets = [];
+    // Storage BUFFERS retired by a teardown, same contract: `GPUBuffer.destroy`
+    // under a bind group that is still in this frame's encode fails the submit,
+    // so they wait out the same TTL the targets do.
+    this._retiredAttributes = [];
+    // GPU-only buffers whose CPU mirror is queued for detachment once the
+    // owning chain has actually dispatched (see #queueCpuMirrorDetach).
+    this._giPendingDetach = [];
     this._unsubs = [
       engine.onPreRender(() => this.#tick()),
       engine.on?.("hierarchy-changed", () => this.#queueRebakeCheck()) ?? (() => {}),
@@ -2090,6 +2100,10 @@ export class GISystem {
     }
     this.#dispose();
     this.component = null;
+    // Public disposal removed the pre-render subscription, so no later tick
+    // exists to age the retirement queues. Wait for the submitted GPU work,
+    // then release everything #dispose just retired against that renderer.
+    this.#flushRetiredTargetsAfterGpu();
   }
 
   /** Explicit diagnostic readback; never called from the frame path. */
@@ -6251,6 +6265,9 @@ export class GISystem {
               : null,
           });
           console.log(describeSrcProbeSystem(srcProbes));
+          // SRC's GPU-only stores give up their dead JS twins once the chain
+          // has dispatched (see #drainCpuMirrors).
+          this.#queueCpuMirrorDetach(srcProbes.cpuMirrors, "src");
         } catch (error) {
           // Never take the shipping chain down for an experimental branch.
           console.warn("[gi] src probes unavailable:", error?.message ?? error);
@@ -9378,6 +9395,20 @@ export class GISystem {
   }
 
   #drainRetiredTargets() {
+    // Storage buffers ride the same TTL as the targets above them: their GPU
+    // destroy must not land under a bind group this frame's encode still
+    // names. `releaseStorageAttributes` is the only path to
+    // `GPUBuffer.destroy()` — see the header of releaseCompute.js.
+    if (this._retiredAttributes.length > 0) {
+      const renderer = this.engine?.renderer;
+      const keepAttrs = [];
+      for (const entry of this._retiredAttributes) {
+        if (--entry.ttl > 0 || globalThis.__giKeepRetiredTargets) { keepAttrs.push(entry); continue; }
+        this._giFreedBuffers = (this._giFreedBuffers ?? 0)
+          + releaseStorageAttributes(renderer, entry.attrs);
+      }
+      this._retiredAttributes = keepAttrs;
+    }
     if (this._retiredTargets.length === 0) return;
     const keep = [];
     for (const entry of this._retiredTargets) {
@@ -9385,6 +9416,131 @@ export class GISystem {
       else entry.targets.dispose();
     }
     this._retiredTargets = keep;
+  }
+
+  /** Queue a teardown's storage buffers for destruction a few frames from now. */
+  #retireStorageAttributes(attrs) {
+    if (!attrs) return 0;
+    const list = [...attrs].filter(Boolean);
+    if (list.length === 0) return 0;
+    this._retiredAttributes.push({ attrs: list, ttl: RETIRED_TARGET_FRAMES });
+    return list.length;
+  }
+
+  /** Final teardown has no future tick, so retire after the queue itself drains. */
+  #flushRetiredTargetsAfterGpu() {
+    if (this._retiredAttributes.length === 0 && this._retiredTargets.length === 0) return;
+    const renderer = this.engine?.renderer;
+    const attrs = this._retiredAttributes.splice(0);
+    const targets = this._retiredTargets.splice(0);
+    const release = () => {
+      for (const entry of attrs) {
+        this._giFreedBuffers = (this._giFreedBuffers ?? 0)
+          + releaseStorageAttributes(renderer, entry.attrs);
+      }
+      for (const entry of targets) {
+        try { entry.targets?.dispose?.(); } catch { /* already gone */ }
+      }
+    };
+    const queue = renderer?.backend?.device?.queue;
+    if (queue?.onSubmittedWorkDone) {
+      queue.onSubmittedWorkDone().catch(() => {}).then(release);
+    } else {
+      // WebGL resource deletion is driver-deferred. The timeout also keeps
+      // disposal outside a render callback on non-WebGPU test renderers.
+      setTimeout(release, 0);
+    }
+  }
+
+  /**
+   * QUEUE A GENERATION'S CPU MIRRORS FOR DETACH.
+   *
+   * `instancedArray(new Uint32Array(N))` hands three a
+   * `StorageInstancedBufferAttribute`; three copies `.array` into the GPU
+   * buffer ONCE, at first bind (`mappedAtCreation`), and never reads it again
+   * unless the owner writes it CPU-side. Every GPU-only GI buffer therefore
+   * keeps a dead JS twin for the process's life — on Bistro ~1.1 GB of it,
+   * `bits` alone 449 MB. See `detachCpuMirror` for the safety argument.
+   *
+   * The detach cannot happen at build time: the buffer does not exist until the
+   * owning chain has actually DISPATCHED, so this queues and `#drainCpuMirrors`
+   * polls. ONE live generation per gate — a rebuild, resize or pool grow
+   * replaces the buffers, so anything still pending from the previous
+   * generation describes a field that is already dead.
+   *
+   * @param {any[]} mirrors storage ATTRIBUTES (`node.value`), not nodes
+   * @param {"occupancy"|"src"} gate which chain must have run unskipped first
+   */
+  #queueCpuMirrorDetach(mirrors, gate) {
+    const list = (this._giPendingDetach ??= []);
+    for (let i = list.length - 1; i >= 0; i--) if (list[i].gate === gate) list.splice(i, 1);
+    if (!Array.isArray(mirrors) || mirrors.length === 0) return;
+    if (list.length === 0) {
+      // A fresh drain reports its own total rather than accumulating across
+      // rebuilds — a climbing "detached N" line would read as a leak.
+      this._giDetachCount = 0;
+      this._giDetachBytes = 0;
+      this._giDetachLogged = false;
+    }
+    for (const attr of mirrors) if (attr) list.push({ attr, gate });
+  }
+
+  /**
+   * Detach whatever is now uploadable. Cheap: the list is a few dozen entries
+   * and empties within a handful of frames of first light.
+   *
+   * The gate (`_fieldReadyOnce`) is only a "do not churn every frame" filter —
+   * the correctness gate is inside `detachCpuMirror`, which refuses any
+   * attribute the backend has no GPU buffer for and leaves it queued for the
+   * next tick. SRC has no separate latch here; it dispatches in the same ticks
+   * as the field, and its not-yet-uploaded buffers simply stay queued.
+   */
+  #drainCpuMirrors(renderer) {
+    const list = this._giPendingDetach;
+    if (!list?.length) return;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const entry = list[i];
+      const open = this._fieldReadyOnce === true;
+      if (!open) continue;
+      if (!detachCpuMirror(renderer, entry.attr)) continue; // not uploaded yet
+      this._giDetachCount = (this._giDetachCount ?? 0) + 1;
+      this._giDetachBytes = (this._giDetachBytes ?? 0) + cpuMirrorBytes(entry.attr);
+      (this._giDetached ??= new Set()).add(entry.attr);
+      list.splice(i, 1);
+    }
+    if (list.length === 0 && !this._giDetachLogged && (this._giDetachCount ?? 0) > 0) {
+      this._giDetachLogged = true;
+      // THE DETACH DID NOT PAY UNTIL THIS LINE. `detachCpuMirror`'s zero-length
+      // swap replaces `attr.array`, but the bind group captured the ORIGINAL
+      // array at first bind — `StorageBuffer` (three, StorageBuffer.js:19)
+      // passes `attribute.array` to `Buffer` (Buffer.js:44), which keeps it as
+      // `_buffer`, and that happens strictly BEFORE this drain can run, because
+      // the GPU buffer has to exist for the detach to be allowed at all. So
+      // "detached N CPU mirrors" is a bookkeeping line about the live
+      // generation, not by itself a free.
+      //
+      // `NodeStorageBuffer` overrides the `buffer` and `attribute` getters, so
+      // nothing ever reads `_buffer` back; this walks the live generation's
+      // compute nodes and drops the capture. (`detachCpuMirror` also detaches
+      // the ArrayBuffer itself, which reaches holders this cannot enumerate —
+      // a material's bind group lives in a WeakMap keyed by BindGroup.)
+      const dropped = nullStorageBindingArrays(
+        renderer, collectStateComputeNodes(this.state), this._giDetached,
+      );
+      this._giDetached = null;
+      console.log(
+        `[gi] detached ${this._giDetachCount} CPU mirrors ` +
+          `(${(this._giDetachBytes / 1048576).toFixed(1)} MB)` +
+          (dropped > 0 ? `, dropped ${dropped} bind-group captures` : ""),
+      );
+    } else if (globalThis.__giLogDetachStall === true && list.length > 0 && this._fieldReadyOnce === true) {
+      // Diagnostic hatch: which mirrors never detach, and why (never bound vs
+      // still queued). Off unless flagged; a healthy boot empties the queue
+      // and prints the "detached N CPU mirrors" receipt instead.
+      const stuck = list.filter((e) => e.attr.array?.length > 0)
+        .map((e) => `${e.gate}#${e.attr.array?.constructor?.name}x${e.attr.array?.length}${renderer?.backend?.has?.(e.attr) ? "" : " (never bound)"}`);
+      console.log(`[gi] detach pending ${list.length}: ${stuck.slice(0, 8).join(", ")}`);
+    }
   }
 
   /** Resolve resolution: half the drawing buffer, clamped to a PIXEL budget. */
@@ -12711,15 +12867,43 @@ export class GISystem {
     // evicts. User-visible as ~2 GB of heap per GI settings change (6 GB after
     // a few; 13.4 GB killed the device outright). See releaseCompute.js.
     const stale = collectStateComputeNodes(state);
-    const released = releaseComputeNodes(this.engine?.renderer, stale);
+    // ── ⭐⭐ AND THE BUFFERS, WHICH ARE THE WHOLE WEIGHT ──────────────────
+    //
+    // The eviction above returns bind groups and pipelines. It does NOT return
+    // one byte of storage: `Bindings._destroyBindings` (three,
+    // Bindings.js:245-289) destroys uniform buffers and samplers and has no
+    // `isStorageBuffer` branch, so the only path to `GPUBuffer.destroy()` is
+    // `renderer._attributes.delete` — which this module never called.
+    // `Info.memoryMap` (Info.js:145) is a plain Map that `set`s every storage
+    // attribute at first bind and only ever `delete`s it from that same call,
+    // so until now the attribute stayed strongly reachable from the renderer
+    // and the GPU buffer was not even GC-reclaimable.
+    //
+    // Measured on Bistro (three ultra↔high rebuilds): live GPU storage bytes
+    // +1,853 MB per rebuild, `memoryMap` +733/+790/+934 entries, and every
+    // storage bucket reading `gone 0`. Same number as the JS-heap climb,
+    // because the CPU twin the bind group captured and the GPU buffer it bound
+    // die together or not at all.
+    //
+    // NOTHING SURVIVES A TEARDOWN, so there is no diff to take here — the
+    // harvest (every storage binding of every stale node, read inside
+    // `releaseComputeNodes` before its builder state is dropped) and the
+    // owners' published lists are unioned and all of it is retired. Retired,
+    // not destroyed on the spot: this runs inside `#tick`, i.e. BEFORE this
+    // frame is encoded, and a material or pass whose bind group still names
+    // one of these would fail its submit.
+    const doomed = new Set(collectStateStorageAttributes(state));
+    const released = releaseComputeNodes(this.engine?.renderer, stale, doomed);
     // ⚠ AND THE MATERIAL SIDE, WHICH IS THE BIGGER HALF. The compute eviction
     // alone left the heap climbing ~2.2 GB per rebuild; the bulk is 116
     // materials' re-injected GI node graphs piling up in `nodeBuilderCache`
     // under fresh cache keys. See purgeNodeBuilderCache.
     const purged = purgeNodeBuilderCache(this.engine?.renderer);
+    const retiredBuffers = this.#retireStorageAttributes(doomed);
     if (globalThis.__giLogComputeRelease === true) {
       console.log(
-        `[gi] dispose: released ${released}/${stale.length} compute nodes` +
+        `[gi] dispose: released ${released}/${stale.length} compute nodes, ` +
+        `retired ${retiredBuffers} storage buffers` +
         `${purged ? ", purged the node-builder cache" : ""}`,
       );
     }
@@ -15392,6 +15576,9 @@ export class GISystem {
     for (const p of placements) field.setSlotMatrix(p.slot, p.matrix);
     field.setGeometry(geometries, placements);
     field.placements = placements;
+    // The field's GPU-only buffers give up their dead JS twins once it has
+    // dispatched (see #drainCpuMirrors) — `bits` alone is 449 MB on Bistro.
+    this.#queueCpuMirrorDetach(field.cpuMirrors, "occupancy");
     // §18.17: baked before the dynamic set below, because #oneBvhBundle reads
     // `_slotAtlas` while the reflect prepass is being built.
     this.#ensureSlotAlbedoAtlas(field, placements);
