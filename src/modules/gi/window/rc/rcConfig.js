@@ -73,6 +73,27 @@ export const RC_TIERS = {
  * OFF (`PROBE_RAY_CAP_OFF`, the pre-6.19 per-pixel arm — the A/B this shipped
  * against). Polled per frame by `beginFrame` (a uniform, never a rebuild).
  */
+/**
+ * §19 6.19b — the bin accumulator's age-aware window in samples (see
+ * `srcDeposit`'s `window`). 64: a settled bin at one ray per frame averages
+ * 64 frames (α_floor 1/65 ≈ 0.015), and a bin below 64 samples is a running
+ * mean. `__gi2BinWindow`: a positive number overrides; `0` restores the fixed
+ * `TEMPORAL_ALPHA` decay (the 6.19 arm this shipped against).
+ */
+//
+// ⛔ SHIPPED OFF (0). Measured 6.19b at 64 on Cornell: the inside shot blew
+// out to white and the gate read 13 black px / median 0.325 / at-rest p90
+// 11.8 % — a bin held at k = 1 below 64 samples is being NORMALISED by
+// something that assumes the EMA's steady-state count (the resolve or [J]'s
+// SR/SG/SB words), not by COUNT. Find that reader before re-defaulting;
+// `__gi2BinWindow = 64` arms the arm for the A/B.
+export const BIN_WINDOW = 0;
+export const rcBinWindow = (runtime = globalThis) => {
+  const forced = Number(runtime?.__gi2BinWindow);
+  if (Number.isFinite(forced)) return forced > 0 ? Math.round(forced) : null;
+  return BIN_WINDOW;
+};
+
 export const rcProbeRayCap = (spec, runtime = globalThis) => {
   const forced = Number(runtime?.__gi2ProbeRayCap);
   if (Number.isFinite(forced)) return forced > 0 ? Math.max(1, Math.round(forced)) : PROBE_RAY_CAP_OFF;

@@ -57,7 +57,7 @@ import { createRcMerge } from "./rcMerge.js";
 import { createRcHitShading } from "./rcHit.js";
 import { createRcEmitterDirect } from "./rcDirect.js";
 import {
-  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, TEMPORAL_ALPHA, W0, rcHitCapacity, rcHitPathEnabled, rcIntervalCensus, rcProbeRayCap,
+  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, TEMPORAL_ALPHA, W0, rcHitCapacity, rcHitPathEnabled, rcIntervalCensus, rcProbeRayCap, rcBinWindow,
   rcTierSpec,
 } from "./rcConfig.js";
 
@@ -464,6 +464,9 @@ export function createRcCascades({
     phase: phaseU,
     threads,
     lmax: lmaxU,
+    // §19 6.19b — the age-aware bin window (`srcDeposit`'s `window`), in
+    // samples; `__gi2BinWindow` overrides (0 restores the fixed α = 0.1).
+    window: rcBinWindow(),
     // ⭐⭐⭐ §19 STAGE 5.3 — WHICH KERNEL SHADES, AND IT IS EXACTLY ONE OF THEM.
     //
     // Split arm: this kernel TRACES, ATTRIBUTES and APPENDS; `rcHit`'s [J]
@@ -727,6 +730,7 @@ export function createRcCascades({
     threads,
     rays: threads,
     probeRayCap: capU.value >= PROBE_RAY_CAP_OFF ? "off" : capU.value,
+    binWindow: rcBinWindow() || "off",
     depositScale: DEPOSIT_SCALE,
     alpha: TEMPORAL_ALPHA,
     jitter: jitterOn,

@@ -722,6 +722,20 @@ export function createSrcDepositFrame(store, bins, {
   jitterX,
   jitterY,
   keep = null,
+  /**
+   * §19 6.19b — THE AGE-AWARE WINDOW, in samples. `null` keeps the fixed
+   * `keep` (the old SRC path). With it, a bin's decay is
+   * `max(keep, min(1, window·S / COUNT))`: a bin holding fewer than `window`
+   * rays' worth of weight is not decayed at all (a running MEAN from zero —
+   * which is also what a re-keyed/newborn block gets, since the hand-off
+   * zeroes it), and a settled bin is held at exactly `window` samples, so its
+   * per-frame α is `m/(window+m)` for `m` rays landing this frame. Under a
+   * per-probe ray cap (6.19: 1 ray per bin per frame) the fixed α = 0.1 was a
+   * 10-sample average; at rest the image shimmered (|ΔE|/E p90 1.68 → 7.80 %).
+   * `max(keep, ·)` means an uncapped bin (~30 rays/frame, 300-sample EMA)
+   * keeps its old, longer window.
+   */
+  window = null,
   frameStamp = null,
   influxLift = null,
   surprise = null,
@@ -994,6 +1008,14 @@ export function createSrcDepositFrame(store, bins, {
           If(stamp.equal(frameStamp), () => { k.assign(float(0)); });
         });
       }
+    }
+    if (keep && Number.isFinite(window) && window > 0) {
+      // §19 6.19b — see the `window` option. Only a bin that is being DECAYED
+      // (0 < k < 1) takes the window; a held (k = 1) or handed-off (k = 0) bin
+      // keeps the decision the stamps made above.
+      const cnt = float(atomicLoad(scratch.element(b.add(uint(BIN_COUNT))))).max(1).toVar();
+      const kWin = float(window * DEPOSIT_SCALE).div(cnt).min(1).toVar();
+      If(k.greaterThan(0).and(k.lessThan(1)), () => { k.assign(k.max(kWin)); });
     }
     for (let w = 0; w < BIN_WORDS; w++) {
       const e = scratch.element(b.add(uint(w)));
