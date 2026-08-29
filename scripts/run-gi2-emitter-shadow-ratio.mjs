@@ -12,6 +12,7 @@
 import puppeteer from "puppeteer-core";
 import { writeFileSync } from "node:fs";
 import { installTauriShim } from "./lib/tauriShim.mjs";
+import { bvhAnyHit, bruteAnyHit } from "./lib/shadowBvhMirror.mjs";
 
 const url = process.argv[2] ?? "http://127.0.0.1:5206/";
 const PROJECT = (process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME").replaceAll("\\", "/");
@@ -243,8 +244,56 @@ const res = await page.evaluate(async ({ WALL }) => {
     a.forEach((r, i) => { if (!r.valid || !b[i].valid || !(b[i][key] > 1e-6)) return; (pts[i].shadowed ? sh : lit).push(r[key] / b[i][key]); });
     return { nShadow: sh.length, nLit: lit.length, medVisShadow: med(sh), medVisLit: med(lit) };
   };
+  // rcDirect's FILTERED visibility texture (visA), slot 0, at the half-res texel
+  let visTex = null;
+  try {
+    const vt = gi2.rc?.resolve?.direct?.texture ?? null;
+    if (vt) {
+      const { createGi2TexProbe } = await import("/scripts/lib/gi2TexProbe.js");
+      const tp = createGi2TexProbe({ renderer: eng.renderer, tex: vt });
+      const o = await tp.read(pts.map((p) => [p.pix[0] >> 1, p.pix[1] >> 1]));
+      const sh = [], lit = [];
+      pts.forEach((p, i) => { if (!shipped[i].valid) return; (p.shadowed ? sh : lit).push(o[i * 4]); });
+      visTex = { medShadow: med(sh), medLit: med(lit), nShadow: sh.length, nLit: lit.length, minShadow: Math.min(...sh), maxShadow: Math.max(...sh) };
+    }
+  } catch (e) { visTex = String(e?.message ?? e); }
+  const sb = gi2.shadowBvh ?? null;
+  let gpuNodes = null, gpuIdx = null, gpuTris = null;
+  if (sb?.nodesAttr) {
+    try {
+      gpuNodes = Array.from(new Float32Array(await eng.renderer.getArrayBufferAsync(sb.nodesAttr))).slice(0, 16);
+      gpuIdx = Array.from(new Uint32Array(await eng.renderer.getArrayBufferAsync(sb.triIdxAttr))).slice(0, 8);
+      gpuTris = Array.from(new Float32Array(await eng.renderer.getArrayBufferAsync(sb.trisAttr))).slice(0, 9);
+    } catch (e) { gpuNodes = String(e?.message ?? e); }
+  }
+  // the GPU any-hit kernel on the very rays the CPU mirror scores
+  let gpuRays = null;
+  if (sb) {
+    try {
+      const { createGi2BvhRayProbe } = await import("/scripts/lib/gi2BvhRayProbe.js");
+      const rp = createGi2BvhRayProbe({ renderer: eng.renderer, bvh: sb });
+      const ex = slots[0].exHalf, rad = Math.max(slots[0].radius, slots[0].reff);
+      const rr = pts.map((p) => {
+        const ro = [p.P[0] + plane.n[0] * 2e-3, p.P[1] + plane.n[1] * 2e-3, p.P[2] + plane.n[2] * 2e-3];
+        const wv = [L[0] - ro[0], L[1] - ro[1], L[2] - ro[2]]; const d = Math.hypot(...wv); const rd = wv.map((v) => v / d);
+        const aw = rd.map((v) => Math.max(1e-6, Math.abs(v)));
+        const slab = Math.min(ex[0] / aw[0], ex[1] / aw[1], ex[2] / aw[2]);
+        return { ro, rd, maxT: Math.max(1e-3, d - Math.min(slab, rad)), shadowed: p.shadowed };
+      });
+      const o = await rp.run(rr);
+      const t = { shadowHit: 0, shadowN: 0, litHit: 0, litN: 0, ready: o[1] };
+      rr.forEach((r, k) => { if (r.shadowed) { t.shadowN++; t.shadowHit += o[k * 4]; } else { t.litN++; t.litHit += o[k * 4]; } });
+      gpuRays = t;
+    } catch (e) { gpuRays = String(e?.message ?? e); }
+  }
+  const bvhDump = sb ? { gpuRays, gpuNodes, gpuIdx, gpuTris,
+    ready: sb.ready, triCount: sb.triCount, nodeCount: sb.nodeCount,
+    nodes: Array.from(sb.nodes ?? []), triIdx: Array.from(sb.triIdx ?? []), tris: Array.from(sb.tris ?? []),
+  } : null;
+  const rays = pts.map((p) => ({ P: p.P, n: plane.n, shadowed: p.shadowed }));
   return {
-    rowOrder, slots, occ: occ.name, scene: scene.name, plane, nPts: pts.length, nValid,
+    bvhDump, rays, L, exHalf: slots[0].exHalf, radius: slots[0].radius, reff: slots[0].reff,
+    visTex, rowOrder, slots, occ: occ.name, scene: scene.name, plane, nPts: pts.length, nValid,
     nShadowPts: pts.filter((p) => p.shadowed).length, hasU, rcReady: gi2.rc ? true : false,
     bvh: (() => { try { return gi2.describe?.()?.shadowBvh ?? gi2.rc?.describe?.()?.shadowBvh ?? null; } catch { return null; } })(),
     perPixel: { direct: pix(directOnly, directNoShadow, "lumB"), finalBeforeAO: pix(shipped, shippedNoShadow, "lumB"), finalAfterAO: pix(shipped, shippedNoShadow, "lumA") },
@@ -252,5 +301,28 @@ const res = await page.evaluate(async ({ WALL }) => {
     directOnly: stat(directOnly, "lumB"), directNoShadow: stat(directNoShadow, "lumB"), fieldOnly: stat(fieldOnly, "lumB"),
   };
 }, { WALL });
+if (res.bvhDump) {
+  const { bvhDump: B, rays, L, exHalf, radius, reff } = res;
+  const nodes = new Float32Array(B.nodes), triIdx = new Uint32Array(B.triIdx), tris = new Float32Array(B.tris);
+  const tally = { shadow: { bvh: 0, brute: 0, n: 0 }, lit: { bvh: 0, brute: 0, n: 0 } };
+  let sample = null;
+  for (const r of rays) {
+    const ro = [r.P[0] + r.n[0] * 2e-3, r.P[1] + r.n[1] * 2e-3, r.P[2] + r.n[2] * 2e-3];
+    const wv = [L[0] - ro[0], L[1] - ro[1], L[2] - ro[2]];
+    const d = Math.hypot(...wv); const rd = wv.map((v) => v / d);
+    const aw = rd.map((v) => Math.max(1e-6, Math.abs(v)));
+    const slab = Math.min(exHalf[0] / aw[0], exHalf[1] / aw[1], exHalf[2] / aw[2]);
+    const maxT = Math.max(1e-3, d - Math.min(slab, Math.max(radius, reff)));
+    const k = r.shadowed ? tally.shadow : tally.lit;
+    k.n++;
+    const h = bvhAnyHit({ nodes, triIdx }, tris, ro, rd, maxT);
+    k.bvh += h.hit; k.brute += bruteAnyHit(tris, B.triCount, ro, rd, maxT);
+    if (!sample && r.shadowed) sample = { ro, rd, maxT, d, slab, h };
+  }
+  console.log("GPU RAYS", JSON.stringify(B.gpuRays));
+  console.log("GPU BUFFERS", JSON.stringify({ gpuNodes: B.gpuNodes, gpuIdx: B.gpuIdx, gpuTris: B.gpuTris }));
+  console.log("CPU MIRROR", JSON.stringify({ ready: B.ready, triCount: B.triCount, nodeCount: B.nodeCount, tally, sample, nodes0: B.nodes.slice(0, 16), tri0: B.tris.slice(0, 9), triIdx0: B.triIdx.slice(0, 8) }));
+  delete res.bvhDump; delete res.rays;
+}
 console.log(JSON.stringify(res, (k, v) => (typeof v === "number" ? Number(v.toFixed(4)) : v), 1).replace(/\n\s*(?=[\d\-"nfte])/g, " "));
 await browser.close();

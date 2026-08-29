@@ -383,6 +383,13 @@ export function createShadowBvhSlot() {
     get bytes() { return state.bytes; },
     get mb() { return state.bytes / (1024 * 1024); },
     get stats() { return state.stats; },
+    /** The CURRENT bound arrays (placeholder until `fill`) — for the CPU mirror probe. */
+    get nodes() { return nodesBuffer.value?.array ?? null; },
+    get nodesAttr() { return nodesBuffer.value; },
+    get triIdxAttr() { return triIdxBuffer.value; },
+    get trisAttr() { return trisBuffer.value; },
+    get triIdx() { return triIdxBuffer.value?.array ?? null; },
+    get tris() { return trisBuffer.value?.array ?? null; },
     /**
      * Swaps the worker's tree in. REBIND ONLY — a new `StorageBufferAttribute`
      * behind the same node, so three mints a new bind group and reuses the

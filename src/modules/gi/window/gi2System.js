@@ -1962,6 +1962,7 @@ export function createGi2System({
      * its entries — the two look identical in every image statistic.
      */
     get rc() { return rc; },
+    get shadowBvh() { return shadowBvh; },
     get voxelizer() { return voxelizer; },
     get dynamic() { return dynamic; },
     get width() { return width; },
