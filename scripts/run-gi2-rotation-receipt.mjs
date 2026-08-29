@@ -135,7 +135,8 @@ if (process.env.POSE) { const p = process.env.POSE.split("|").map((s) => s.split
 if (DEG_F > 0) {
   const setup = await page.evaluate(async () => {
     try {
-      const eng = globalThis.__giEngineForProbe, sys = globalThis.__giSys(), gi2 = globalThis.__gi2();
+      const mod = await import("/src/editor/engineInstance.js");
+      const eng = mod.engine, sys = eng?.modules?.get?.("gi")?.system ?? null, gi2 = sys?._gi2 ?? sys?.state?.screen?.gi2 ?? null;
       const { createGi2PixelDump, GI2_PIXEL_OUT_VEC } = await import("/scripts/lib/gi2PixelDump.js");
       const stride = 2;
       const dump = createGi2PixelDump({ renderer: eng.renderer, gi2, screen: sys.state?.screen, stride });
