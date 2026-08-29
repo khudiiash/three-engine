@@ -182,10 +182,18 @@ const out = await page.evaluate(async () => {
   if (!t) report.buffers = { error: "no _giBvhTarget" };
   else {
     const readHalf = async (tex, label) => {
+      // §19 6.11: the radiance target only exists when `bvhHitShade` is armed
+      // (never under GI2 — the hit shade reads the retired lattice), so an
+      // absent stage is a report line, not a crash of the whole instrument.
+      if (!tex) return { label, error: "absent (stage not armed)" };
       const w = tex.image?.width ?? tex.width, h = tex.image?.height ?? tex.height;
       if (!w || !h) return { label, error: "no size" };
-      const a = unpad(await renderer.backend.copyTextureToBuffer(tex, 0, 0, w, h, 0), w, h, 4, Uint16Array);
-      return { w, h, a };
+      // A target no pass has ever bound has no GPU texture behind it yet
+      // (`bvhRadiance` under GI2) — the backend throws on `.format`.
+      try {
+        const a = unpad(await renderer.backend.copyTextureToBuffer(tex, 0, 0, w, h, 0), w, h, 4, Uint16Array);
+        return { w, h, a };
+      } catch (e) { return { label, error: `readback failed (${String(e).slice(0, 80)})` }; }
     };
     const hit = await readHalf(t.bvhReflect, "hit");
     const col = await readHalf(t.bvhColor, "colour");

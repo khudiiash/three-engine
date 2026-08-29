@@ -9574,7 +9574,12 @@ export class GISystem {
     // `custom` intentionally follows the high tier via qualityTierOf().
     const quality = qualityTierOf(props);
     if (quality !== "high" && quality !== "ultra") return false;
-    if (props.exactReflections !== true) return false;
+    // §19 6.11: `exactReflections` is no longer a gate. The GI component has
+    // THREE properties (`quality`, `ao`, `reflections`) and no tuning knobs —
+    // `reflections` on at high/ultra IS the request for exact reflections. A
+    // scene that authored `exactReflections: false` explicitly still opts out
+    // (that is a stored preference, not a knob the UI exposes any more).
+    if (props.exactReflections === false) return false;
     // ── AND SOMETHING IN THE SCENE MUST ACTUALLY READ IT ────────────────────
     //
     // §13.14.6: the user's Sponza logs `bvh: exact reflections ON — DENSE
@@ -9939,7 +9944,16 @@ export class GISystem {
     // price the prepass against the window's own trace BEFORE a consumer is
     // worth wiring to it. Glossy stays the gather's oct cone until then,
     // which the boot log already says out loud.
-    if (GI2_PATH) return;
+    //
+    // §19 6.11 (2026-08-29, the user: "there are still no reflections: we had
+    // those in the previous version, those were quite good"): the return that
+    // lived here is gone. The BVH scene + `bvhReflect` prepass run under GI2
+    // again — the §17 one-BVH reflections are what the user is asking for.
+    // What stays OFF is `bvhHitShade` (it reads the old occupancy lattice,
+    // which RC5 never builds — see `inputs.bvhShade` in #buildScreenResolve),
+    // so the material consumes the prepass's raw texture-sampled albedo lit by
+    // its own irradiance (`bvhReflectShaded = false`). Cost is measured, not
+    // argued: see the §19 6.11 receipt in the plan doc.
     const light = state.light;
     // §14 R-B: reflection probes trace their captures through this same BVH,
     // and they run at EVERY tier — so probes keep the BVH built where the
@@ -12440,7 +12454,9 @@ export class GISystem {
     // dispatched under GI2 either — see the tick). Building it here would
     // upload the whole scene's triangles a second time for a consumer that
     // does not run.
-    if (!GI2_PATH) this.#syncBvhScene(entries);
+    // §19 6.11: built under GI2 as well — the reflection prepass is back (see
+    // #syncBvhScene's own note); it self-gates on `#bvhReflectionsEnabled()`.
+    this.#syncBvhScene(entries);
     this._lightObjects = this.#collectLightObjects();
     this.#updateLightUniforms();
     this._structuralSig = this.#structuralSignature(component);
@@ -18320,8 +18336,8 @@ export class GISystem {
           `[gi2] window ${gi2.win.levels}×64³ @ ${gi2.win.voxel0} m (${gi2.win.describe().totalMB} MB) + ` +
           `cache ${gi2.cache.describe().totalMB} MB, tier ${gi2.tier}, ` +
           `${movers.length} movers — voxelizer live ${Math.round(performance.now() - this._gi2BuildAt)} ms after the build. ` +
-          "⚠ the MIRROR TIER (bvhHitShade / bvhReflect / the reflection-probe capture) is NOT dispatched on this " +
-          "path and comes back as its own unit — glossy is the gather's oct cone until then.",
+          "§19 6.11: the exact-reflection prepass (bvhReflect, albedo-only) runs under GI2 when `reflections` is on " +
+          "at high/ultra and a mirror-bucket material reads it (see `[gi] bvh:` below); bvhHitShade stays retired.",
         );
         // §19 6.3 — the voxelizer and the cascades exist only now, and their
         // kernels are the ones whose first dispatch was the 1.4-2.2 s frames.
