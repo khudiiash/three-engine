@@ -342,7 +342,40 @@ export function createShadowBvhSlot() {
   const readyU = uniform(0);
 
   const state = { nodeCount: 0, triCount: 0, bytes: 0, stats: null };
-
+  // ⭐⭐ §19 6.8 — THE SLOT OUTLIVES EVERY GENERATION; ITS BUFFERS MUST NOT.
+  // The slot lives on the per-scene store (one kernel, forever — see the
+  // header), but a quality / ao / reflections flip tears the gi2System
+  // GENERATION down, and GISystem's teardown contract is "nothing survives":
+  // every attribute the old generation published or its orphaned kernels
+  // bound is retired — the borrowed soup `tris` (its owner's `dispose()`
+  // zeroes it), and the tree's own nodes/triIdx (harvested off the old
+  // `rcDirect` kernel). The next generation reused the slot with `ready`
+  // still 1, `kickShadowBvh` returned early, and the kernel bound attributes
+  // whose arrays were empty:
+  //   "Binding size for [Buffer (unlabeled)] is zero ... entries[7]
+  //    ReadOnlyStorage" — on every frame, until the device was unusable.
+  // Publishing the slot's buffers as survivors does not help — the old
+  // generation's getter is exactly what the teardown dooms ("used in submit
+  // while destroyed" instead). So the slot keeps the CPU ARRAYS (the
+  // placeholders and, once built, the tree) and MINTS FRESH ATTRIBUTES per
+  // generation: `retarget()` below is the per-generation re-seat, `fill` and
+  // `retarget` refuse an empty soup outright.
+  let forTris = null;
+  let treeNodes = null;
+  let treeIdx = null;
+  const mint = (array) => {
+    const attr = new THREE.StorageBufferAttribute(array, 1);
+    attr.version++;
+    return attr;
+  };
+  const reset = () => {
+    nodesBuffer.value = mint(nodes);
+    triIdxBuffer.value = mint(triIdx);
+    trisBuffer.value = mint(tris);
+    readyU.value = 0;
+    forTris = null; treeNodes = null; treeIdx = null;
+    state.nodeCount = 0; state.triCount = 0; state.bytes = 0; state.stats = null;
+  };
   /**
    * `1.0` when ANYTHING lies in `(origin, origin + dir*maxT)`, else `0.0`.
    * Raw: the caller owns the origin offset.
@@ -403,13 +436,15 @@ export function createShadowBvhSlot() {
       // `readyU` stays 0 and the voxel arm keeps serving a picture that is merely
       // soft rather than wrong.
       if (!soupTris) return false;
-      const nodeAttr = new THREE.StorageBufferAttribute(bvh.nodes, 1);
-      const idxAttr = new THREE.StorageBufferAttribute(bvh.triIdx, 1);
-      nodeAttr.version++;
-      idxAttr.version++;
-      nodesBuffer.value = nodeAttr;
-      triIdxBuffer.value = idxAttr;
+      // §19 6.8 — a soup whose generation has already been retired reads as an
+      // empty array; binding it is the zero-size bind group, not a soft frame.
+      if (!(soupTris.array?.length > 0)) return false;
+      nodesBuffer.value = mint(bvh.nodes);
+      triIdxBuffer.value = mint(bvh.triIdx);
       trisBuffer.value = soupTris;
+      forTris = soupTris.array;
+      treeNodes = bvh.nodes;
+      treeIdx = bvh.triIdx;
       state.nodeCount = bvh.nodeCount;
       state.triCount = bvh.triCount;
       // The soup is NOT counted: it was already resident before this stage
@@ -421,6 +456,27 @@ export function createShadowBvhSlot() {
       readyU.value = 1;
       return true;
     },
+    /**
+     * §19 6.8 — a NEW GENERATION's soup upload. Same triangle array as the
+     * resident tree permutes → fresh attributes for the tree (the old ones
+     * were retired with the generation that bound them) and `tris` re-seated
+     * on the new upload. A different array → the tree indexes triangles that
+     * no longer exist in that order: back to fresh placeholders, `ready` 0, so
+     * the caller's `kickShadowBvh` builds a tree for THIS soup. Returns true
+     * when the tree survived.
+     */
+    retarget(soupTris) {
+      if (readyU.value !== 0 && treeNodes && treeIdx &&
+        soupTris?.array && soupTris.array.length > 0 && soupTris.array === forTris) {
+        nodesBuffer.value = mint(treeNodes);
+        triIdxBuffer.value = mint(treeIdx);
+        trisBuffer.value = soupTris;
+        return true;
+      }
+      reset();
+      return false;
+    },
+    reset,
   };
 }
 

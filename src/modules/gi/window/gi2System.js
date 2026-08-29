@@ -1176,6 +1176,14 @@ export function createGi2System({
     // it survives a failed or skipped build — the binding decision depends on
     // the scene, never on whether a tree happened to land.
     store.lastSoupTris = built.triCount;
+    // ⭐⭐ §19 6.8 — RE-SEAT THE STORE'S SLOT ON THIS GENERATION'S SOUP. The slot
+    // is `store.bvhSlot`, NOT `shadowBvh` (a tier with no slot still leaves the
+    // resident one pointing at the soup this generation is replacing, and the
+    // NEXT tier to bind it would read the zero-length array the retired
+    // generation's `dispose()` leaves behind — "Binding size ... is zero" on
+    // every frame). Same array (the soup key held) keeps the tree; a new soup
+    // resets it, so `kickShadowBvh` below builds one for this order.
+    store.bvhSlot?.retarget(soup.tris?.value);
     kickShadowBvh(built);
     voxelizer = createWindowVoxelizer(win, soup, tier);
     dynamic = createWindowDynamic(win, voxelizer, tier);

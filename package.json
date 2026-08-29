@@ -257,7 +257,8 @@
     "probe:gi2-rc": "node scripts/run-gi2-rc-probe.mjs",
     "probe:gi2-cornell-black": "node scripts/run-gi2-cornell-black.mjs",
     "probe:gi2-cornell-resolve": "node scripts/run-gi2-cornell-resolve.mjs",
-    "probe:gi2-quadrature": "node scripts/run-gi2-quadrature.mjs"
+    "probe:gi2-quadrature": "node scripts/run-gi2-quadrature.mjs",
+    "probe:gi2-param-change": "node scripts/run-gi2-param-change-probe.mjs"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.3",
