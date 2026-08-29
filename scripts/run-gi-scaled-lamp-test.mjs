@@ -62,6 +62,7 @@ page.on("console", (m) => {
   const t = m.text();
   if (/\[gi2\] first light|\[gi\] field ready/.test(t)) firstLight = true;
   if (/emitter|admi|dynamic layer|seat|\[gi\].*(rror|ailed)/i.test(t)) console.log(`  ${t.slice(0, 200)}`);
+  if (process.env.ALLCONSOLE && /error|wgsl|compil|shader|pipeline|rcDirect|undeclared|unresolved/i.test(t)) console.log(`  [console] ${t.slice(0, 600)}`);
 });
 page.on("pageerror", (e) => console.log(`pageerror: ${e.message}`));
 await page.goto(url, { waitUntil: "load", timeout: 60000 });
@@ -255,6 +256,45 @@ const READ = async ({ WALL }) => {
   const o = await tp.read(all.map((p) => [Math.round(p.pix[0]) >> 1, Math.round(p.pix[1]) >> 1]));
   const vis = all.map((_, i) => (seen[i] ? o[i * 4] : NaN));
   const lineVis = vis.slice(0, line.length);
+  // §19 6.25c — the FACE RECEIPT: debug 2 dumps (axis+10·[sign>0], F) per texel;
+  // compare with the near face computed HERE from the seat's frame.
+  if (globalThis.__faceDebug) {
+    try {
+      const dU = gi2.rc?.resolve?.direct?.uniforms?.rcDirectDebug, dU2 = gi2.rc?.uniforms?.rcDirectDebug;
+      if (!dU && !dU2) throw new Error("no rcDirectDebug uniform");
+      out.faceSame = dU === dU2;
+      if (dU) dU.value = 2; if (dU2) dU2.value = 2;
+      // the GI idles at rest: nudge the camera so the direct passes re-dispatch
+      vh.camera.position.y += 0.003; vh.camera.updateMatrixWorld(true);
+      for (let f = 0; f < 12; f++) await new Promise((r) => requestAnimationFrame(r));
+      const dd = await tp.read(all.map((p) => [Math.round(p.pix[0]) >> 1, Math.round(p.pix[1]) >> 1]));
+      if (dU) dU.value = 0; if (dU2) dU2.value = 0;
+      vh.camera.position.y -= 0.003; vh.camera.updateMatrixWorld(true);
+      for (let f = 0; f < 12; f++) await new Promise((r) => requestAnimationFrame(r));
+      const s0 = sys.state.emitterSlots?.[0] ?? null;
+      const sl = slots[0];
+      const B = s0 ? [s0.bx.value.toArray(), s0.by.value.toArray(), s0.bz.value.toArray()] : null;
+      const C = sl.center, EX = sl.exHalf;
+      const rows = [];
+      for (let i = 0; i < all.length && rows.length < 6; i++) {
+        if (!seen[i] || !(vis[i] > 0.05)) continue;   // lit-ish texels
+        if (rows.length && i % 7) continue;
+        const P = all[i].P;
+        const code = dd[i * 4], F = [dd[i * 4 + 1], dd[i * 4 + 2], dd[i * 4 + 3]];
+        let hand = null;
+        if (B) {
+          const wv = [C[0] - P[0], C[1] - P[1], C[2] - P[2]]; const d = Math.hypot(...wv); const wd = wv.map((v) => v / d);
+          const lds = B.map((b) => b[0] * wd[0] + b[1] * wd[1] + b[2] * wd[2]);
+          const ratio = lds.map((l, k) => EX[k] / Math.max(1e-6, Math.abs(l)));
+          const ax = ratio.indexOf(Math.min(...ratio));
+          const sg = Math.sign(-lds[ax]);
+          hand = { ax, sg, F: B[ax].map((b, m) => +(C[m] + b * sg * EX[ax]).toFixed(3)) };
+        }
+        rows.push({ P: P.map((v) => +v.toFixed(2)), vis: +vis[i].toFixed(3), code: +code.toFixed(1), F: F.map((v) => +v.toFixed(3)), hand });
+      }
+      out.faceRows = rows; out.faceB = B;
+    } catch (e) { out.faceErr = String(e?.message ?? e); }
+  }
   // §19 6.25b — the PCSS width W (metres, slot 0, dilated) at five wall texels
   try {
     const pt = gi2.rc?.resolve?.direct?.penumbra ?? null;
@@ -293,11 +333,13 @@ const readOnce = async (label) => {
   console.log(`  lamp: ${JSON.stringify(r.lamp)} admission: ${JSON.stringify(r.admitted)}`);
   if (s) console.log(`  seat0: kind ${s.kind} radius ${s.radius} reff ${s.reff} half ${JSON.stringify(s.half)} exHalf ${JSON.stringify(s.exHalf)} rgb ${JSON.stringify(s.rgb)} moved ${s.moved} center ${JSON.stringify(s.center)}`);
   console.log(`  gi2: movers ${r.gi2?.movers} moverTris ${r.gi2?.moverTris} voxelsSet ${r.gi2?.voxelsSet} | live movers ${JSON.stringify(r.moversLive)} promoted ${JSON.stringify(r.promoted)}`);
+  if (r.faceRows || r.faceErr) { console.log(`  face receipt B=${JSON.stringify(r.faceB)} sameUniform=${r.faceSame} ${r.faceErr ?? ""}`); for (const q of r.faceRows ?? []) console.log(`    ${JSON.stringify(q)}`); }
   if (r.penW || r.penErr) console.log(`  penumbra W (m) at 5 wall texels: ${JSON.stringify(r.penW)} max ${r.penWmax} ${r.penErr ?? ""}`);
   if (r.wall) console.log(`  wall(${r.wall.occ}): ramp ${r.wall.rampPx} px (${r.wall.rampSamples} of ${r.wall.nLineSeen}/${r.wall.nLine} seen samples @ ${r.wall.pxStep} px) vis min ${r.wall.minVis} max ${r.wall.maxVis} depth ${r.wall.depth} | medVis shadow ${r.wall.medVisShadow} lit ${r.wall.medVisLit} (n ${r.wall.nShadow}/${r.wall.nLit})${r.gbufFlip ? " [gbuf flipped]" : ""}${r.gbufCheck ? ` [${r.gbufCheck}]` : ""}`);
   if (r.wall && process.env.PROFILE) console.log(`  profile: ${r.wall.profile.join(" ")}`);
   return r;
 };
+
 
 const before = await readOnce("BEFORE");
 await shoot("before");

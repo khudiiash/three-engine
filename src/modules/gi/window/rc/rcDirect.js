@@ -261,7 +261,7 @@ export function createRcEmitterDirect({
           const wv = centre.sub(P).toVar();
           const d = sqrt(dot(wv, wv).max(1e-4)).toVar();
           const wd = wv.div(d).toVar();
-          if (k === 0) dbg.y.assign(dot(Nf, wd));
+          if (k === 0) If(debugU.lessThan(1.5), () => { dbg.y.assign(dot(Nf, wd)); });
           // ⚠ THE COSINE GATE STORES 1, NOT 0 — see the header. A backfacing
           // texel has no visibility to report and its analytic factor is
           // already zero; a stored 0 would bleed across the terminator.
@@ -387,10 +387,19 @@ export function createRcEmitterDirect({
             const tV = select(isZ, byv, bzv).toVar();
             const eV = select(isZ, ex.y, ex.z).mul(QUAD_SPREAD).toVar();
             const F = centre.sub(faceN.mul(faceE)).toVar();
+            // §19 6.25c receipt: debug 2 → (axis + 10·[sign>0], F.xyz) for slot 0
+            if (k === 0) {
+              If(debugU.greaterThan(1.5), () => {
+                const code = select(isX, float(0), select(isY, float(1), float(2)))
+                  .add(select(isX, ldsS.x, select(isY, ldsS.y, ldsS.z)).greaterThan(0).select(float(10), float(0)));
+                dbg.assign(vec4(code, F.x, F.y, F.z));
+              });
+            }
             const quad = [[-1, -1], [1, -1], [-1, 1], [1, 1]].map(([a, b]) => {
               const Q = F.add(tU.mul(eU.mul(a))).add(tV.mul(eV.mul(b)));
               const wq = Q.sub(P).toVar();
               const dq = sqrt(dot(wq, wq).max(1e-6)).toVar();
+              if (QUAD_SPREAD < 0) return { dir: wd, bvh: reachBvh, vox: reachVox }; // isolation: the centre ray x4
               return { dir: wq.div(dq).toVar(), bvh: dq.sub(dq.mul(1e-3).max(2e-3)).max(1e-3).toVar(), vox: dq.sub(float(2 * v0)).max(v0 * 0.5).toVar() };
             });
             const hSum = float(0).toVar();
@@ -430,7 +439,7 @@ export function createRcEmitterDirect({
               });
             } else {
               voxQuad();
-              if (k === 0) dbg.y.assign(tOcc); // 6.12 receipt: WHERE the nearest voxel ray stopped
+              if (k === 0) If(debugU.lessThan(1.5), () => { dbg.y.assign(tOcc); }); // 6.12 receipt
             }
             // five levels; a fully blocked texel stays 0 — the umbra survives
             v[k].assign(float(1).sub(hSum.mul(0.25).clamp(0, 1)));
@@ -466,7 +475,7 @@ export function createRcEmitterDirect({
             // four hard edges are already spread across W by the geometry.
             const dBlk = dSurf.sub(tOcc.max(0)).max(dSurf.mul(0.05)).toVar();
             pen[k].assign(h.mul(lampL).mul(tOcc.max(0)).div(dBlk).mul(0.25));
-            if (k === 0) { dbg.z.assign(h); dbg.w.assign(BVH ? BVH.readyU.add(reachBvh.mul(10)) : reachVox); }
+            if (k === 0) { If(debugU.lessThan(1.5), () => { dbg.z.assign(h); dbg.w.assign(BVH ? BVH.readyU.add(reachBvh.mul(10)) : reachVox); }); }
           });
         });
       }
