@@ -58,7 +58,7 @@
 // point of `createSrcHashBlockFrame`) plus three textures. No kernel in this
 // file is anywhere near the limit and no kernel in 5.1 gains a binding.
 import {
-  Fn, If, Return, float, instanceIndex, ivec2, max, reflect, sqrt, step, texture,
+  Fn, If, Return, atomicAdd, float, instanceIndex, instancedArray, ivec2, max, reflect, sqrt, step, texture,
   textureStore, uint, uniform, vec3, vec4,
 } from "three/tsl";
 import { createSrcHashBlockFrame } from "../../srcProbes.js";
@@ -253,6 +253,14 @@ export function createRcMerge({
    */
   const glossyCapU = uniform(6);
 
+  /**
+   * §19 6.9 — the resolve's own receipt: shaded pixels, pixels whose OWN LOD
+   * shells had no coverage (the black squares before 6.9), and pixels still
+   * unknown after the coarser-shell walk. Monotone counters; `readStats`
+   * returns the delta since its last read.
+   */
+  const resolveStats = instancedArray(new Uint32Array(4), "uint").toAtomic();
+  let lastResolveStats = [0, 0, 0, 0];
   const resolvePass = Fn(() => {
     const i = instanceIndex.toVar();
     const gx = i.mod(halfWU).toVar();
@@ -309,7 +317,13 @@ export function createRcMerge({
       If(len2.greaterThan(0.25), () => {
         const facing = step(0, Nn.dot(vec3(camera).sub(g.xyz))).mul(2).sub(1).toVar();
         const Nf = Nn.mul(facing).toVar();
-        E.assign(gather.gatherAt(g.xyz, Nf).irradiance.mul(fieldTermU));
+        const gres = gather.gatherAt(g.xyz, Nf);
+        E.assign(vec3(gres.irradiance).mul(fieldTermU));
+        atomicAdd(resolveStats.element(uint(0)), uint(1));
+        if (gres.primaryKnown) {
+          If(gres.primaryKnown.not(), () => { atomicAdd(resolveStats.element(uint(1)), uint(1)); });
+          If(gres.known.not(), () => { atomicAdd(resolveStats.element(uint(2)), uint(1)); });
+        }
         // §19 5.3/5.3d — the seated emitters, analytically, at the shading
         // point, times this texel's FILTERED visibility. Against the FACED
         // normal, like the gather: the hemisphere a lamp lights is the
@@ -401,7 +415,20 @@ export function createRcMerge({
         merge.readStats(renderer).catch(() => null),
         tiles.readStats(renderer).catch(() => null),
       ]);
-      return { merge: m, tiles: t, line: [formatSrcMerge(m), formatSrcTiles(t)].filter(Boolean).join(" — ") };
+      let resolveStat = null;
+      try {
+        if (renderer?.backend?.get?.(resolveStats.value)?.buffer) {
+          const v = new Uint32Array(await renderer.getArrayBufferAsync(resolveStats.value));
+          const d = [0, 1, 2].map((i) => (v[i] >>> 0) - lastResolveStats[i]);
+          lastResolveStats = [v[0] >>> 0, v[1] >>> 0, v[2] >>> 0, 0];
+          resolveStat = {
+            shaded: d[0], unknownOwnLod: d[1], unknownFinal: d[2],
+            unknownOwnLodPct: d[0] > 0 ? +(100 * d[1] / d[0]).toFixed(3) : 0,
+            unknownFinalPct: d[0] > 0 ? +(100 * d[2] / d[0]).toFixed(3) : 0,
+          };
+        }
+      } catch { /* not yet dispatched */ }
+      return { merge: m, tiles: t, resolve: resolveStat, line: [formatSrcMerge(m), formatSrcTiles(t)].filter(Boolean).join(" — ") };
     },
     dispose() {
       merge.dispose?.();
