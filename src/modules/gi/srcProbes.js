@@ -262,7 +262,7 @@ export const FLAG_CLAIMED = FLAG_ALIVE | FLAG_FRESH | FLAG_BLOCKNEW
 export { INFLUX_ONE };
 
 /** Per-cascade counter block. A counter is one atomic. */
-export const COUNTER_WORDS = 10;
+export const COUNTER_WORDS = 11;
 export const COUNTER_LIVE = 0;      // probes currently in the indirection table
 export const COUNTER_FAILED = 1;    // inserts that exhausted MAX_PROBE_STEPS
 export const COUNTER_STEPS = 2;     // total linear-probe steps this frame
@@ -340,6 +340,8 @@ export const COUNTER_HELD = 7;
  */
 export const COUNTER_RETIRED = 8;
 export const COUNTER_AGESUM = 9;
+/** §19 6.16 — live probes whose key was re-expressed under a moved anchor this frame. */
+export const COUNTER_REKEYED = 10;
 
 // ═════════════════════════════════════════════════════════ THE WGSL ISLAND
 
@@ -758,6 +760,7 @@ export function createHashClearPass(store) {
       // Same rule again — both are written by the age pass. See COUNTER_RETIRED.
       atomicStore(counters.element(base.add(COUNTER_RETIRED)), uint(0));
       atomicStore(counters.element(base.add(COUNTER_AGESUM)), uint(0));
+      atomicStore(counters.element(base.add(COUNTER_REKEYED)), uint(0));
     });
   })().compute(hashTotal);
 }
@@ -846,6 +849,43 @@ export function createAgePass(store, cascade, {
     if (retain) {
       const lodI = keyLod(key).toVar();
       const s = probeSpacing(cascade, float(lodI), retain.spacing0).toVar();
+      // ══ ⭐⭐⭐ §19 6.16 — RE-KEY, NEVER REBIRTH, WHEN THE ANCHOR JUMPS ═══════
+      //
+      // Keys are cells relative to `latticeOrigin(anchor, s)`, and rcSystem
+      // snaps the anchor to the coarsest cascade cell so a walk re-keys
+      // nothing — until the camera crosses one coarse cell. On that frame
+      // every key changed meaning at once: the age pass re-inserted every
+      // live probe under a key no pixel would ever ask for again, the pixel
+      // insert bore a whole new population beside it, and the frame between
+      // read an empty field — the user's "flashes black every few frames while
+      // rotating" (an orbit crosses a coarse cell every few frames) and the
+      // checkerboard that "never resolves" (each jump restarts it). Measured
+      // by `run-gi2-orbit-probe FLASH=1`: a −15 % whole-frame step on the one
+      // frame the eye crossed x = 0, gone under world keys, present under
+      // every cadence/newborn hatch.
+      //
+      // The probe's WORLD position is the invariant: `originOld + cellOld·s =
+      // originNew + cellNew·s`, so `cellNew = cellOld + (originCellOld −
+      // originCellNew)` — an exact integer per LOD, zero on every frame the
+      // origin at THIS spacing did not move (a coarse-cell jump moves every
+      // finer lattice by a whole number of its cells, and a coarser lattice
+      // not at all). The key word is rewritten in place and the insert below
+      // files it under the new key; ages, flags, parents, blocks, bins and
+      // tiles are untouched — nothing else in the store is keyed. A probe
+      // pushed outside the ±256-cell key range packs `KEY_EMPTY` and is
+      // retired below, which is where a probe that far from the anchor was
+      // headed anyway.
+      if (retain.anchorPrev && !retain.worldKeys) {
+        const shift = ivec3(latticeOriginCell(retain.anchorPrev, s))
+          .sub(ivec3(latticeOriginCell(retain.anchor, s))).toVar();
+        If(shift.x.notEqual(int(0)).or(shift.y.notEqual(int(0))).or(shift.z.notEqual(int(0))), () => {
+          const nk = packProbeKey(lodI, keySecondary(key), ivec3(keyCell(key)).add(shift)).toVar();
+          key.assign(nk);
+          probeTable.element(w.add(PROBE_KEY)).assign(nk);
+          atomicAdd(counters.element(uint(cascade * COUNTER_WORDS + COUNTER_REKEYED)), uint(1));
+        });
+        If(key.equal(uint(KEY_EMPTY)), () => { effMaxAge.assign(uint(0)); });
+      }
       // Arm-aware position recovery: world keys resolve against the camera
       // (the ±256-cell representative); anchor-relative keys decode against
       // the SAME anchor that packed them.
@@ -1475,6 +1515,12 @@ export function createSrcProbeFrame(store, {
   // retention bundle below).
   retainKill = null,
   /**
+   * §19 6.16 — the anchor the live keys are currently expressed in (a vec3
+   * node). When it differs from `anchor` the age pass re-keys every live probe
+   * instead of letting the population be reborn. `null` = the pre-6.16 build.
+   */
+  anchorPrev = null,
+  /**
    * ⭐⭐⭐ §19 STAGE 5.3d — SEED (AND FEED) THE TRILINEAR CORNERS, BY
    * IMPORTANCE-SAMPLING THE WEIGHT THE GATHER IS ABOUT TO USE.
    *
@@ -1652,6 +1698,7 @@ export function createSrcProbeFrame(store, {
         // Base-arm position math for the out-of-reach bound (`keyWorldCell`
         // is only meaningful under world keys).
         anchor,
+        anchorPrev,
         worldKeys: worldKeysEnabled(),
         // The re-anchor kill uniform (anchor-relative arm only; the world
         // arm never re-keys and never sets it).
@@ -1862,6 +1909,7 @@ export async function readSrcProbeStats(renderer, store) {
        * cliff, which is visible BEFORE the collapse rather than after it.
        */
       retired: raw[base + COUNTER_RETIRED] >>> 0,
+      rekeyed: raw[base + COUNTER_REKEYED] >>> 0,
       meanAge: live > 0 ? (raw[base + COUNTER_AGESUM] >>> 0) / live : 0,
       probeCapacity: c.probeCapacity,
       hashCapacity: c.hashCapacity,

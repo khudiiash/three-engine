@@ -137,7 +137,17 @@ if (process.env.FLASH) {
       setCam(angAt(0));
       const tick = () => {
         const frame = globalThis.__giSys()?._gi2Frame ?? -1;
-        pending.push({ i, phase: phaseAt(i), frame, ang: +(angAt(i) * 180 / Math.PI).toFixed(2), p: grab() });
+        // §19 6.16 receipts on the same row: the window scroll counter, the
+        // rc anchor-jump counter, and the live probe population (one
+        // un-awaited readback per frame — the age pass's counters).
+        const g2 = globalThis.__gi2?.();
+        const scrolls = g2?.snapshot?.()?.scrolls ?? -1;
+        const jumps = g2?.rc?.anchorJumps?.() ?? -1;
+        const renderer = globalThis.__giEngineForProbe?.renderer;
+        const probes = (g2?.rc?.readProbeStats && renderer)
+          ? g2.rc.readProbeStats(renderer).then((rows) => ({ live: rows.reduce((a, r) => a + r.live, 0), rekeyed: rows.reduce((a, r) => a + (r.rekeyed ?? 0), 0), fresh: rows.reduce((a, r) => a + r.fresh, 0) })).catch(() => null)
+          : Promise.resolve(null);
+        pending.push({ i, phase: phaseAt(i), frame, scrolls, jumps, probes, ang: +(angAt(i) * 180 / Math.PI).toFixed(2), p: grab() });
         i++;
         if (i >= total) { done(); return; }
         setCam(angAt(i));
@@ -147,13 +157,14 @@ if (process.env.FLASH) {
     });
     const steps = []; let prevL = null;
     for (const st of pending) {
-      const d = await st.p;
-      const Lcur = new Float32Array(SW * SH); let nMove = 0, nBig = 0;
+      const d = await st.p; const pr = await st.probes;
+      const Lcur = new Float32Array(SW * SH); let nMove = 0, nBig = 0, nLamp = 0;
       let sAll = 0, nAll = 0, sRed = 0, nRed = 0, sCeil = 0, nCeil = 0, sFloor = 0, nFloor = 0, nBlack = 0;
       for (let y = 0; y < SH; y++) for (let x = 0; x < SW; x++) {
         const i0 = (y * SW + x) * 4; const R = LUT[d[i0]], G = LUT[d[i0 + 1]], B = LUT[d[i0 + 2]];
         const L = 0.2126 * R + 0.7152 * G + 0.0722 * B;
         sAll += L; nAll++; if (L < 0.002) nBlack++;
+        if (d[i0] >= 250 && d[i0 + 1] >= 250 && d[i0 + 2] >= 250) nLamp++;
         Lcur[y * SW + x] = L;
         if (prevL) { const Lp = prevL[y * SW + x]; const m = Math.max(L, Lp); if (m > 0.01) { const rr = Math.abs(L - Lp) / m; if (rr > 0.5) nBig++; if (rr > 0.2) nMove++; } }
         const red = R > 0.02 && R > 3 * G && R > 3 * B;
@@ -165,7 +176,7 @@ if (process.env.FLASH) {
         }
       }
       prevL = Lcur;
-      steps.push({ i: st.i, px50: nBig / nAll, px20: nMove / nAll, phase: st.phase, frame: st.frame, ang: st.ang, all: sAll / Math.max(1, nAll), red: nRed ? sRed / nRed : 0, ceil: nCeil ? sCeil / nCeil : 0, floor: nFloor ? sFloor / nFloor : 0, nRed, black: nBlack / nAll });
+      steps.push({ i: st.i, px50: nBig / nAll, px20: nMove / nAll, lamp: nLamp / nAll, scrolls: st.scrolls, jumps: st.jumps, live: pr?.live ?? -1, rekeyed: pr?.rekeyed ?? -1, fresh: pr?.fresh ?? -1, phase: st.phase, frame: st.frame, ang: st.ang, all: sAll / Math.max(1, nAll), red: nRed ? sRed / nRed : 0, ceil: nCeil ? sCeil / nCeil : 0, floor: nFloor ? sFloor / nFloor : 0, nRed, black: nBlack / nAll });
     }
     return steps;
   }, { REST, ORBIT, AFTER, DEG, POSE, CENTRE, SW, SH });
@@ -199,6 +210,16 @@ if (process.env.FLASH) {
   console.log("  orbit Δfloor % series  : " + orbit.map((x) => (100 * rel(x.floor, r[x.i - 1].floor)).toFixed(1)).join(" "));
   console.log("  orbit frame series     : " + orbit.map((x) => x.frame).join(" "));
   console.log("  orbit px>50% series    : " + orbit.map((x) => (100 * x.px50).toFixed(1)).join(" "));
+  console.log("  orbit lamp px % series : " + orbit.map((x) => (100 * x.lamp).toFixed(1)).join(" "));
+  console.log("  orbit scrolls series   : " + orbit.map((x) => x.scrolls).join(" "));
+  console.log("  orbit anchorJumps      : " + orbit.map((x) => x.jumps).join(" "));
+  console.log("  orbit live probes      : " + orbit.map((x) => x.live).join(" "));
+  console.log("  orbit rekeyed series   : " + orbit.map((x) => x.rekeyed).join(" "));
+  for (let k = 1; k < r.length; k++) {
+    const x = r[k], p = r[k - 1];
+    if (x.jumps > p.jumps) console.log(`  ANCHOR JUMP at step ${x.i} (frame ${x.frame}, ${x.phase}, ang ${x.ang}): Δmean ${(100 * rel(x.all, p.all)).toFixed(1)} %  px>50 % ${(100 * x.px50).toFixed(1)} %  live ${p.live} → ${x.live} → ${r[k + 1]?.live ?? "?"}  rekeyed ${x.rekeyed}  fresh ${x.fresh}`);
+    if (x.scrolls > p.scrolls) console.log(`  window scroll at step ${x.i} (frame ${x.frame}, ${x.phase}, ang ${x.ang}): Δmean ${(100 * rel(x.all, p.all)).toFixed(1)} %  px>50 % ${(100 * x.px50).toFixed(1)} %`);
+  }
   console.log("  orbit px>20% series    : " + orbit.map((x) => (100 * x.px20).toFixed(1)).join(" "));
   const px50 = orbit.map((x) => x.px50);
   console.log(`  orbit per-pixel |ΔL|>50 % fraction: median ${(100 * q(px50, 0.5)).toFixed(1)} % p90 ${(100 * q(px50, 0.9)).toFixed(1)} % max ${(100 * q(px50, 1)).toFixed(1)} %  (a full-frame flash reads ~100 %; a 1°/frame slide of smooth shading reads a few %)`);

@@ -48,7 +48,7 @@ import { If, bitAnd, ivec2, shiftRight, step, texture, uint, uniform, vec3 } fro
 import {
   DEPOSIT_SCALE, createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters,
 } from "../../srcDeposit.js";
-import { createSrcProbeFrame, createSrcProbeStore } from "../../srcProbes.js";
+import { createSrcProbeFrame, createSrcProbeStore, readSrcProbeStats } from "../../srcProbes.js";
 import { createSrcRayFrame, createSrcRayStore } from "../../srcRays.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX } from "../../srcMath.js";
 import { normalOfFace } from "../radianceCache.js";
@@ -115,6 +115,19 @@ export function createRcCascades({
   // ── uniforms ──────────────────────────────────────────────────────────────
   const cameraU = uniform(new THREE.Vector3());
   const anchorU = uniform(new THREE.Vector3());
+  /**
+   * §19 6.16 — the anchor the live probe keys are expressed in. `setCamera`
+   * moves `anchorU` the frame the eye crosses a coarse cell; `beginFrame`
+   * publishes the previous one here so the age pass re-keys every live probe
+   * by the exact cell shift instead of the population being reborn. Equal to
+   * `anchorU` on every other frame, where the re-key is a no-op by
+   * construction. `__gi2RcRekey = 0` restores the rebirth (the A/B arm).
+   */
+  const anchorPrevU = uniform(new THREE.Vector3());
+  const rekeyOn = (globalThis.__gi2RcRekey ?? 1) !== 0;
+  const keyAnchor = new THREE.Vector3();
+  let keyAnchorSet = false;
+  let anchorJumps = 0;
   const widthU = uniform(width, "uint");
   const frameStampU = uniform(1, "uint");
   const jitterXU = uniform(0, "uint");
@@ -354,6 +367,7 @@ export function createRcCascades({
     spacing0,
     camera: vec3(cameraU),
     anchor: vec3(anchorU),
+    anchorPrev: rekeyOn ? vec3(anchorPrevU) : null,
     pixelCount,
     maxLods,
     readPixel,
@@ -643,11 +657,20 @@ export function createRcCascades({
     anchorU.value.set(
       Math.floor(p[0] / top) * top, Math.floor(p[1] / top) * top, Math.floor(p[2] / top) * top,
     );
+    // §19 6.16 — before any probe exists the keys are expressed in whatever
+    // the first anchor is; from then on `beginFrame` owns the hand-over.
+    if (!keyAnchorSet) { keyAnchor.copy(anchorU.value); anchorPrevU.value.copy(anchorU.value); keyAnchorSet = true; }
     return { anchor: [anchorU.value.x, anchorU.value.y, anchorU.value.z] };
   };
   const beginFrame = (n = null) => {
     frameIndex = n == null ? frameIndex + 1 : n;
     frameStampU.value = (frameIndex + 1) >>> 0;
+    // §19 6.16 — hand the keys over to this frame's anchor. The age pass reads
+    // (prev, current) and shifts every live key by the exact cell difference;
+    // after this frame's dispatch the keys ARE in the current anchor.
+    if (!keyAnchor.equals(anchorU.value)) anchorJumps++;
+    anchorPrevU.value.copy(keyAnchor);
+    keyAnchor.copy(anchorU.value);
     if (jitterOn) {
       jitterXU.value = (jitterXU.value + R2_ALPHA1_FX) >>> 0;
       jitterYU.value = (jitterYU.value + R2_ALPHA2_FX) >>> 0;
@@ -798,6 +821,10 @@ export function createRcCascades({
     ],
     setCamera, beginFrame, setSize, describe,
     readStats: (renderer) => deposit.readStats(renderer),
+    /** §19 6.16 — the population per cascade (live/fresh/retired/rekeyed), one readback. */
+    readProbeStats: (renderer) => readSrcProbeStats(renderer, store),
+    /** §19 6.16 — how many coarse-cell anchor jumps the keys have been carried across. */
+    anchorJumps: () => anchorJumps,
     /** §19 5.3 — [J]'s own line: entries shaded, and whether the bound held. */
     readHitStats: (renderer) => (hit ? hit.readStats(renderer) : Promise.resolve(null)),
     formatHitStats: formatSrcSecondary,
