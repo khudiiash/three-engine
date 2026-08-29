@@ -49,9 +49,9 @@ export { CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, TEMPORAL_ALPHA, W0 };
  * c0 chain, and beyond it there is no probe and the sky answers.
  */
 export const RC_TIERS = {
-  ultra: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 1_100_000, lods: 5, lmax: 16, hitList: 600_000, probeRayCap: 16 },
-  high: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 900_000, lods: 5, lmax: 16, hitList: 500_000, probeRayCap: 16 },
-  medium: { spacing0: 0.5, c0Probes: 8192, binBudget: 350_000, rays: 450_000, lods: 4, lmax: 16, hitList: 250_000, probeRayCap: 16 },
+  ultra: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 1_100_000, lods: 5, lmax: 16, hitList: 600_000, probeRayCap: 32 },
+  high: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 900_000, lods: 5, lmax: 16, hitList: 500_000, probeRayCap: 32 },
+  medium: { spacing0: 0.5, c0Probes: 8192, binBudget: 350_000, rays: 450_000, lods: 4, lmax: 16, hitList: 250_000, probeRayCap: 32 },
   phone: { spacing0: 1.0, c0Probes: 4096, binBudget: 175_000, rays: 200_000, lods: 3, lmax: 16, hitList: 120_000, probeRayCap: 16 },
 };
 
