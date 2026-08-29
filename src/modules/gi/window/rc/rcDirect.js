@@ -75,7 +75,7 @@
 // zeroes those pixels analytically.
 import * as THREE from "three/webgpu";
 import {
-  Fn, If, Return, cross, dot, float, instanceIndex, ivec2, max, mix, normalize, select, sqrt, step, texture, textureStore,
+  Fn, If, Return, cross, dot, float, instanceIndex, ivec2, max, mix, normalize, select, sign, sqrt, step, texture, textureStore,
   uint, uniform, vec3, vec4,
 } from "three/tsl";
 import { emitterShapeGain } from "../emitterShapeGain.js";
@@ -116,6 +116,7 @@ const R_MAX = 12;
  */
 const R_MAX2 = 64;
 const DILATE_STRIDE = 6;
+const QUAD_SPREAD = globalThis.__giQuadSpread ?? 0.5;
 
 /**
  * @param {object} o
@@ -359,18 +360,67 @@ export function createRcEmitterDirect({
             // The ray now returns WHERE it stopped, not only whether. `tOcc`
             // is −1 for a clear ray on the exact arm; the voxel arm's `t` is
             // whatever the DDA reports, masked by `hit` below.
+            // ⭐⭐ §19 6.25b — THE PENUMBRA STRUCTURE COMES FROM GEOMETRY, THE
+            // FILTER ONLY FILLS THE LEVELS. 6.25 proved a blurred BINARY mask
+            // cannot keep an umbra once the physical width W is comparable to
+            // the shadow: the wall's dip was erased at both lamp sizes. So the
+            // texel now traces FOUR shadow rays, one to the centre of each 2×2
+            // quadrant of the emitter's face that faces the receiver (the face
+            // is the centre ray's slab-exit axis, in the emitter's frame; the
+            // four points are the same for every pixel — nothing stochastic).
+            // visibility = the mean: a fully blocked texel stays 0 by
+            // construction, a texel that sees two quadrants reads 0.5, and the
+            // truth's dip depth follows. Each ray ends ON its face point (minus
+            // the arm's margin), so the lamp's own body is never on the
+            // segment: the near face's plane separates the receiver from the
+            // box whenever the centre ray enters through it.
+            const axq = ex.div(ld).toVar();
+            const isX = axq.x.lessThanEqual(axq.y).and(axq.x.lessThanEqual(axq.z));
+            const isY = isX.not().and(axq.y.lessThanEqual(axq.z));
+            const isZ = isX.not().and(isY.not());
+            const ldsS = vec3(dot(wd, vec3(slot.bx)), dot(wd, vec3(slot.by)), dot(wd, vec3(slot.bz))).toVar();
+            const bxv = vec3(slot.bx).toVar(), byv = vec3(slot.by).toVar(), bzv = vec3(slot.bz).toVar();
+            const faceN = select(isX, bxv.mul(sign(ldsS.x)), select(isY, byv.mul(sign(ldsS.y)), bzv.mul(sign(ldsS.z)))).toVar();
+            const faceE = select(isX, ex.x, select(isY, ex.y, ex.z)).toVar();
+            const tU = select(isX, byv, bxv).toVar();
+            const eU = select(isX, ex.y, ex.x).mul(QUAD_SPREAD).toVar();
+            const tV = select(isZ, byv, bzv).toVar();
+            const eV = select(isZ, ex.y, ex.z).mul(QUAD_SPREAD).toVar();
+            const F = centre.sub(faceN.mul(faceE)).toVar();
+            const quad = [[-1, -1], [1, -1], [-1, 1], [1, 1]].map(([a, b]) => {
+              const Q = F.add(tU.mul(eU.mul(a))).add(tV.mul(eV.mul(b)));
+              const wq = Q.sub(P).toVar();
+              const dq = sqrt(dot(wq, wq).max(1e-6)).toVar();
+              return { dir: wq.div(dq).toVar(), bvh: dq.sub(dq.mul(1e-3).max(2e-3)).max(1e-3).toVar(), vox: dq.sub(float(2 * v0)).max(v0 * 0.5).toVar() };
+            });
+            const hSum = float(0).toVar();
             const h = float(0).toVar();
             const tOcc = float(-1).toVar();
+            // the voxel arm's four rays; the width's t is the NEAREST blocker
+            const voxQuad = () => {
+              for (const q of quad) {
+                const tr = traceWindow(P, q.dir, q.vox, Nf);
+                hSum.addAssign(tr.hit);
+                If(tr.hit.greaterThan(0.5).and(tOcc.lessThan(0).or(tr.t.lessThan(tOcc))), () => { tOcc.assign(tr.t.max(0)); });
+              }
+              h.assign(step(0, tOcc));
+            };
             if (BVH) {
-              If(BVH.readyU.equal(0), () => {
-                const tr = traceWindow(P, wd, reachVox, Nf);
-                h.assign(tr.hit); tOcc.assign(tr.t);
-              }).Else(() => {
-                tOcc.assign(BVH.nearestTFrom(P, wd, reachBvh, Nf));
+              If(BVH.readyU.equal(0), () => { voxQuad(); }).Else(() => {
                 // §19 6.21 — MOVERS ARE NOT IN THE TREE (their placement bit is
                 // excluded the frame they move); the K.5 dynamic mirror answers
-                // for them at their live pose. visibility = static ∧ dynamic,
-                // and the PCSS `tOcc` is the NEARER blocker of the two.
+                // for them at their live pose. visibility = static ∧ dynamic
+                // per quadrant ray, and the PCSS `tOcc` is the CENTRE ray's
+                // nearer blocker of the two.
+                for (const q of quad) {
+                  // ⚠ `nearestTFrom`, not `anyHitFrom`: gi2BvhAnyHit bounds only its
+                  // NODE walk by maxT, not the triangle test, so a ray ending 4 mm
+                  // before the lamp's face still "hit" the face (lit wall 0.32).
+                  const hq = step(0, BVH.nearestTFrom(P, q.dir, q.bvh, Nf)).toVar();
+                  if (traceDyn) hq.assign(hq.max(traceDyn.traceWindow(P, q.dir, q.vox, Nf).hit));
+                  hSum.addAssign(hq);
+                }
+                tOcc.assign(BVH.nearestTFrom(P, wd, reachBvh, Nf));
                 if (traceDyn) {
                   const td = traceDyn.traceWindow(P, wd, reachVox, Nf);
                   const tdT = td.t.toVar();
@@ -379,11 +429,11 @@ export function createRcEmitterDirect({
                 h.assign(step(0, tOcc));
               });
             } else {
-              const tr = traceWindow(P, wd, reachVox, Nf);
-              h.assign(tr.hit); tOcc.assign(tr.t);
-              if (k === 0) dbg.y.assign(tr.t); // 6.12 receipt: WHERE the voxel ray stopped
+              voxQuad();
+              if (k === 0) dbg.y.assign(tOcc); // 6.12 receipt: WHERE the nearest voxel ray stopped
             }
-            v[k].assign(float(1).sub(h));
+            // five levels; a fully blocked texel stays 0 — the umbra survives
+            v[k].assign(float(1).sub(hSum.mul(0.25).clamp(0, 1)));
             // §19 6.25 — THE PENUMBRA WIDTH BY CONSTRUCTION. Area light of
             // extent L seen from a planar blocker: full width at the receiver
             //   W = L · (d_r − d_b) / d_b = L · t_occ / d_b,
@@ -410,8 +460,12 @@ export function createRcEmitterDirect({
             const sv = dot(ex, pv.abs()).toVar();
             const lampL = sqrt(su.mul(sv)).mul(2).toVar();
             const dSurf = d.sub(slab.min(clear)).max(1e-3).toVar();
-            const dBlk = dSurf.sub(tOcc.max(0)).max(dSurf.mul(1e-3).max(2e-3)).toVar();
-            pen[k].assign(h.mul(lampL).mul(tOcc.max(0)).div(dBlk));
+            // §19 6.25b — guarded at 5 % of d_r: a mover's own voxels on the
+            // dynamic arm report t ≈ reach, and d_b → ε blew W up to the whole
+            // wall. And the blur's width is ONE QUADRANT's penumbra, W/4 — the
+            // four hard edges are already spread across W by the geometry.
+            const dBlk = dSurf.sub(tOcc.max(0)).max(dSurf.mul(0.05)).toVar();
+            pen[k].assign(h.mul(lampL).mul(tOcc.max(0)).div(dBlk).mul(0.25));
             if (k === 0) { dbg.z.assign(h); dbg.w.assign(BVH ? BVH.readyU.add(reachBvh.mul(10)) : reachVox); }
           });
         });

@@ -50,6 +50,7 @@ const browser = await puppeteer.launch({
 const page = await browser.newPage();
 await page.setViewport({ width: 1650, height: 970, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
+await page.evaluateOnNewDocument((flags) => { for (const [k, v] of Object.entries(flags)) globalThis[k] = v; }, JSON.parse(process.env.FLAGS ?? "{}"));
 await page.evaluateOnNewDocument((project) => {
   globalThis.__gi2Rc5 = true;
   globalThis.__editorKeepRendering = true;
@@ -254,6 +255,18 @@ const READ = async ({ WALL }) => {
   const o = await tp.read(all.map((p) => [Math.round(p.pix[0]) >> 1, Math.round(p.pix[1]) >> 1]));
   const vis = all.map((_, i) => (seen[i] ? o[i * 4] : NaN));
   const lineVis = vis.slice(0, line.length);
+  // §19 6.25b — the PCSS width W (metres, slot 0, dilated) at five wall texels
+  try {
+    const pt = gi2.rc?.resolve?.direct?.penumbra ?? null;
+    if (pt) {
+      const pp2 = createGi2TexProbe({ renderer: eng.renderer, tex: pt });
+      const w = await pp2.read(line.map((p) => [Math.round(p.pix[0]) >> 1, Math.round(p.pix[1]) >> 1]));
+      const ws = line.map((_, i) => (seen[i] ? +w[i * 4].toFixed(4) : NaN)).filter(Number.isFinite);
+      const st = Math.max(1, Math.floor(ws.length / 5));
+      out.penW = ws.filter((_, i) => i % st === 0).slice(0, 5);
+      out.penWmax = ws.length ? Math.max(...ws) : null;
+    } else out.penErr = "no penumbra texture";
+  } catch (e) { out.penErr = String(e?.message ?? e); }
   const gridVis = vis.slice(line.length);
   const pxStep = line.length > 1 ? Math.hypot(line[1].pix[0] - line[0].pix[0], line[1].pix[1] - line[0].pix[1]) : 0;
   // THE RAMP: the transition between the darkest and the brightest visible
@@ -280,6 +293,7 @@ const readOnce = async (label) => {
   console.log(`  lamp: ${JSON.stringify(r.lamp)} admission: ${JSON.stringify(r.admitted)}`);
   if (s) console.log(`  seat0: kind ${s.kind} radius ${s.radius} reff ${s.reff} half ${JSON.stringify(s.half)} exHalf ${JSON.stringify(s.exHalf)} rgb ${JSON.stringify(s.rgb)} moved ${s.moved} center ${JSON.stringify(s.center)}`);
   console.log(`  gi2: movers ${r.gi2?.movers} moverTris ${r.gi2?.moverTris} voxelsSet ${r.gi2?.voxelsSet} | live movers ${JSON.stringify(r.moversLive)} promoted ${JSON.stringify(r.promoted)}`);
+  if (r.penW || r.penErr) console.log(`  penumbra W (m) at 5 wall texels: ${JSON.stringify(r.penW)} max ${r.penWmax} ${r.penErr ?? ""}`);
   if (r.wall) console.log(`  wall(${r.wall.occ}): ramp ${r.wall.rampPx} px (${r.wall.rampSamples} of ${r.wall.nLineSeen}/${r.wall.nLine} seen samples @ ${r.wall.pxStep} px) vis min ${r.wall.minVis} max ${r.wall.maxVis} depth ${r.wall.depth} | medVis shadow ${r.wall.medVisShadow} lit ${r.wall.medVisLit} (n ${r.wall.nShadow}/${r.wall.nLit})${r.gbufFlip ? " [gbuf flipped]" : ""}${r.gbufCheck ? ` [${r.gbufCheck}]` : ""}`);
   if (r.wall && process.env.PROFILE) console.log(`  profile: ${r.wall.profile.join(" ")}`);
   return r;
@@ -330,5 +344,12 @@ console.log("\n== GATES ==");
 let pass = true;
 for (const [name, ok, detail] of gates) { console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}: ${detail}`); if (!ok) pass = false; }
 console.log(`\n${pass ? "PASS" : "FAIL"} gi-scaled-lamp (scale x${SCALE})`);
+try {
+  const gp = await page.evaluate(async () => globalThis.__editorApi.call("profile.giPasses", { frames: 8 }));
+  const list = Array.isArray(gp) ? gp : (gp?.passes ?? gp?.entries ?? gp?.rows ?? []);
+  const hit = (Array.isArray(list) ? list : []).filter((e) => /direct|rc/i.test(JSON.stringify(e).slice(0, 80)));
+  console.log(`  profile.giPasses (direct/rc): ${JSON.stringify(hit).slice(0, 700)}`);
+  if (!hit.length) console.log(`  profile.giPasses raw: ${JSON.stringify(gp).slice(0, 500)}`);
+} catch (e) { console.log(`  profile.giPasses failed: ${e?.message ?? e}`); }
 await browser.close();
 process.exit(pass ? 0 : 1);
