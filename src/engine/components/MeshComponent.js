@@ -462,7 +462,11 @@ export class MeshComponent extends Component {
       // (static soup vs dynamic layer), so a change re-keys the content and
       // the GI rebuild re-tallies and re-seats — one soup run per authoring
       // action, never a per-frame re-read of the tags.
-      if (key !== "giTrace") this.entity?.engine?.content?.bump("hierarchy", "mesh:gi-mobility");
+      if (key !== "giTrace") {
+        const engine = this.entity?.engine;
+        engine?.content?.bump("hierarchy", "mesh:gi-mobility");
+        engine?.modules?.get?.("gi")?.system?.requestRebuild?.("mesh:gi-mobility");
+      }
     }
   }
 

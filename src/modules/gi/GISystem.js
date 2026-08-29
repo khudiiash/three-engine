@@ -44,7 +44,7 @@ import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRAC
 import { srcBinStoreBoundBytes } from "./srcDeposit.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { SURFACE_POOL_CEILINGS, bitsBytesFor, createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
-import { GI2_MOBILITY_REST_FRAMES, createGi2Mobility } from "./window/mobility.js";
+import { createGi2Mobility } from "./window/mobility.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
 import { buildLightTree, collectEmitters, estimateLightTreeWords } from "./lightTree.js";
 import { createLightTreeStore } from "./lightTreeStore.js";
@@ -17689,6 +17689,9 @@ export class GISystem {
       mixFloat(surface.emissive.b * surface.emissiveIntensity);
       mix(mesh.geometry?.id ?? 0);
       mix(mesh.geometry?.attributes?.position?.version ?? 0);
+      // §19 6.22: GI Mobility is read at BUILD (static soup vs dynamic layer),
+      // so a change of it is a change of content — the rebuild re-classifies.
+      mix(giMobilityOf(mesh) === "static" ? 1 : giMobilityOf(mesh) === "dynamic" ? 2 : 3);
       // Instance count and matrix version: adding, removing or re-scattering
       // instances changes which slots exist, and nothing else here would
       // notice (the mesh id, geometry and material are all unchanged).
@@ -18949,9 +18952,10 @@ export class GISystem {
         // 6.21b — ONCE per promotion: `_gi2SettleAsked` is cleared when the mesh is
         // promoted and set when the rebuild is asked, so a re-seat that re-seeds
         // `restFrames` cannot ask again. `__gi2MoverSettleRebuild = false` opts out.
-        if (globalThis.__gi2MoverSettleRebuild !== false && !m.skinned && m.mesh && m.restFrames >= GI2_MOVER_SETTLE_FRAMES && this._gi2Promoted?.has(m.mesh) && !(this._gi2SettleAsked ??= new Set()).has(m.mesh)) {
+        if (globalThis.__gi2MoverSettleRebuild !== false && !m.skinned && m.mesh && m.restFrames >= GI2_MOVER_SETTLE_FRAMES && this._gi2Mobility?.stateOf(m.mesh) === "promoted" && !(this._gi2SettleAsked ??= new Set()).has(m.mesh)) {
           this._gi2SettleAsked.add(m.mesh);
-          this._gi2Promoted.delete(m.mesh);
+          // §19 6.22: the resolver owns the classification — demote there.
+          this._gi2Mobility.demote(m.mesh);
           console.log(`[gi2] mover settled: "${m.mesh.name}" returns to the static set — rebuild`);
           this.requestRebuild("gi2-mover-settled");
         }
@@ -18960,22 +18964,6 @@ export class GISystem {
     this._gi2MoversMoving = moving;
     const mobility = this._gi2Mobility;
     const keyNow = this.engine?.content?.transforms ?? 0;
-    // ── §19 6.22 — DEMOTION: a promoted "auto" mesh that has rested returns
-    // to the static side (one soup re-kick, at its new pose — not per frame).
-    if (mobility?.promoted.size && movers?.length) {
-      let demoted = 0;
-      for (const m of movers) {
-        if (m.skinned || !m.mesh || !mobility.promoted.has(m.mesh)) continue;
-        if ((m.restFrames ?? 0) < GI2_MOBILITY_REST_FRAMES) continue;
-        mobility.promoted.delete(m.mesh);
-        demoted++;
-      }
-      if (demoted) {
-        console.log(`[gi2] mobility: ${demoted} promoted "auto" mesh(es) rested ${GI2_MOBILITY_REST_FRAMES} frames → static again (soup re-kick at the new pose)`);
-        this._gi2MoversDirty = true;
-        this.requestRebuild("gi2:mobility-settled");
-      }
-    }
     // ── §19 6.22 — THE STATIC WARN, only when a transform was ANNOUNCED ────
     // (the content key bumped): static meshes are never walked per frame.
     const staticWatch = this._gi2StaticWatch;
@@ -19012,7 +19000,7 @@ export class GISystem {
         if (!mesh?.parent) { watch.splice(i, 1); continue; }
         if (w.matrix.equals(mesh.matrixWorld)) continue;
         watch.splice(i, 1);
-        promoted.add(mesh);
+        mobility.promote(mesh);
         this._gi2SettleAsked?.delete(mesh);
         adopted++;
         // §19 6.21 — out of the exact-shadow tree NOW: its old pose must not shadow.
@@ -19021,8 +19009,7 @@ export class GISystem {
       if (adopted) {
         console.log(
           `[gi2] mobility: promoted ${adopted} "auto" mesh(es) that moved → dynamic layer; ` +
-            "the static soup re-kicks without them (they return to static after " +
-            `${GI2_MOBILITY_REST_FRAMES} still frames).`,
+            "the static soup re-kicks without them (they return to static once they settle — 6.21's rebuild).",
         );
         this._gi2MoversDirty = true;
         this.requestRebuild("gi2:mobility-promoted");

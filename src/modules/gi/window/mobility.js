@@ -25,6 +25,9 @@ export const GI2_MOBILITY_REST_FRAMES = 120;
 export function createGi2Mobility() {
   /** "auto" meshes that moved after the build — dynamic until they settle. */
   const promoted = new Set();
+  // A rebuild may re-collect NEW mesh objects for the same entity (merge
+  // proxies, re-created meshes); the promotion survives by entity id too.
+  const promotedIds = new Set();
   const warned = new WeakSet();
   /** Counts fixed at the last build; `promoted` is live. */
   const built = { static: 0, dynamic: 0, auto: 0 };
@@ -33,11 +36,15 @@ export function createGi2Mobility() {
     const m = giMobilityOf(mesh);
     if (m === "static") return "static";
     if (m === "dynamic" || mesh?.isSkinnedMesh === true) return "dynamic";
-    return promoted.has(mesh) ? "promoted" : "auto";
+    return promoted.has(mesh) || (mesh?.userData?.entityId && promotedIds.has(mesh.userData.entityId)) ? "promoted" : "auto";
   };
+  const promote = (mesh) => { promoted.add(mesh); if (mesh?.userData?.entityId) promotedIds.add(mesh.userData.entityId); };
+  const demote = (mesh) => { promoted.delete(mesh); if (mesh?.userData?.entityId) promotedIds.delete(mesh.userData.entityId); };
 
   return {
     promoted,
+    promote,
+    demote,
     stateOf,
     isDynamicNow: (mesh) => { const s = stateOf(mesh); return s === "dynamic" || s === "promoted"; },
     isStaticNow: (mesh) => { const s = stateOf(mesh); return s === "static" || s === "auto"; },
@@ -50,9 +57,9 @@ export function createGi2Mobility() {
         else if (s === "dynamic") built.dynamic++;
         else built.auto++;
       }
-      for (const mesh of promoted) if (!mesh?.parent) promoted.delete(mesh);
+      for (const mesh of promoted) if (!mesh?.parent) demote(mesh);
     },
-    counts: () => ({ static: built.static, dynamic: built.dynamic, auto: built.auto - promoted.size, promoted: promoted.size }),
+    counts: () => ({ static: built.static, dynamic: built.dynamic, auto: built.auto - promotedIds.size, promoted: promotedIds.size }),
     /** ONE warn per mesh — the authoring error, not a per-frame log. */
     warnStaticMoved(mesh) {
       if (warned.has(mesh)) return false;
