@@ -1861,8 +1861,8 @@ export function createGiAoFilterPass({ gbuffer, source, target, width, height, r
       const tol = dist.div(float(projScale).max(1e-3)).mul(tolScaleU).max(1e-4).toVar();
       const sum = float(0).toVar();
       const wsum = float(0).toVar();
-      for (let k = -RADIUS; k <= RADIUS; k++) {
-        const w0 = WEIGHTS[k + RADIUS];
+      // acceptance ∈ [0,1] of the tap at offset k, and its value.
+      const tapAt = (k) => {
         const sc = ivec2(
           px.toInt().add(k * axisX).clamp(int(0), dims.maxX),
           py.toInt().add(k * axisY).clamp(int(0), dims.maxY),
@@ -1871,12 +1871,59 @@ export function createGiAoFilterPass({ gbuffer, source, target, width, height, r
         // Plane distance in this pixel's own footprint units: full weight
         // inside one tolerance, gone by six.
         const planar = N.dot(tapP.xyz.sub(P)).abs().toVar();
-        const w = tapP.w.greaterThan(0.5)
+        const a = tapP.w.greaterThan(0.5)
           .select(float(1).sub(smoothstep(tol, tol.mul(6), planar)), float(0))
-          .mul(w0)
           .toVar();
-        sum.addAssign(sourceNode.load(sc).x.mul(w));
-        wsum.addAssign(w);
+        return { a, v: sourceNode.load(sc).x.toVar() };
+      };
+      if (RADIUS === 2) {
+        // ── §19 6.13 THE PHASE-COMPLETE KERNEL ─────────────────────────────
+        //
+        // The GTAO pass rotates its slices on a 4x4 tile, so along either
+        // axis the rotation phase is `coord mod 4`. A Gaussian 5x5 does NOT
+        // average the 16 phases once each — its centre phase carries ~16 % of
+        // the weight — and wherever the plane test rejects a neighbour, that
+        // phase is simply MISSING and the tile prints itself as grain
+        // (measured on Bistro: edge-region residual p90 5.7 % of the mean
+        // before, raw 14 %). So the kernel is built per RESIDUE CLASS instead:
+        // class 0 = the centre, class ±1 = {+1, fallback −3} / {−1, fallback
+        // +3}, class 2 = {+2, −2}. Every class carries weight 1, a rejected
+        // primary hands its class to the same-phase tap four pixels the other
+        // way, and only a class with NO accepted member drops out. On a flat
+        // surface this is exactly [½ 1 1 1 ½]/4 — every phase once.
+        const c0 = tapAt(0);
+        const pairs = [[1, -3], [-1, 3]];
+        sum.addAssign(c0.v);
+        wsum.addAssign(1);
+        for (const [primary, fallback] of pairs) {
+          const t1 = tapAt(primary);
+          const t2 = tapAt(fallback);
+          // primary first; the fallback only fills what the primary rejected.
+          const w2 = t2.a.mul(float(1).sub(t1.a)).toVar();
+          const aw = t1.a.add(w2).toVar();
+          sum.addAssign(t1.v.mul(t1.a).add(t2.v.mul(w2)));
+          wsum.addAssign(aw);
+        }
+        {
+          const tA = tapAt(2);
+          const tB = tapAt(-2);
+          const aw = tA.a.add(tB.a).toVar();
+          // The class's mean over its accepted members, at class weight
+          // 1 − (1−a)(1−b): one accepted member gives the class its full
+          // share, two give the same share split between them.
+          const cw = float(1).sub(float(1).sub(tA.a).mul(float(1).sub(tB.a))).toVar();
+          const meanV = aw.greaterThan(1e-4).select(tA.v.mul(tA.a).add(tB.v.mul(tB.a)).div(aw.max(1e-4)), float(0));
+          sum.addAssign(meanV.mul(cw));
+          wsum.addAssign(cw);
+        }
+      } else {
+        for (let k = -RADIUS; k <= RADIUS; k++) {
+          const w0 = WEIGHTS[k + RADIUS];
+          const t = tapAt(k);
+          const w = t.a.mul(w0).toVar();
+          sum.addAssign(t.v.mul(w));
+          wsum.addAssign(w);
+        }
       }
       // The centre tap always passes its own plane test, so `wsum` is never
       // below its own weight and this can only ever be a renormalized average
