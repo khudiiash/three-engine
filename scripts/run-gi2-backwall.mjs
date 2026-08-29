@@ -83,9 +83,15 @@ const R = await page.evaluate(async () => {
   const f16 = (h) => { const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 0x1f, f = h & 0x3ff; if (e === 0) return s * Math.pow(2, -14) * (f / 1024); if (e === 31) return f ? NaN : s * Infinity; return s * Math.pow(2, e - 15) * (1 + f / 1024); };
   const read = async (tex) => { const w = tex.image.width, h = tex.image.height; return { w, h, a: unpad(await renderer.backend.copyTextureToBuffer(tex, 0, 0, w, h, 0), w, h) }; };
   const hit = await read(t.bvhReflect); const col = await read(t.bvhColor);
-  let never = 0, miss = 0, hitBlack = 0, hitLit = 0, total = 0; let sumA = 0;
-  for (let i = 0; i < hit.w * hit.h; i++) { const tv = f16(hit.a[i * 4]); if (tv < -1.5) miss++; else if (tv < 0) never++; else { total++; const r = f16(col.a[i * 4]), g = f16(col.a[i * 4 + 1]), b = f16(col.a[i * 4 + 2]); const ha = f16(col.a[i * 4 + 3]); sumA += ha; if (r + g + b < 0.01) hitBlack++; else hitLit++; } }
-  return { meshes, seated, meshCount: bvh?.meshCount, triCount: bvh?.triCount, texturedCount: bvh?.texturedCount, size: [hit.w, hit.h], never, miss, hits: total, hitBlack, hitLit, meanHasAlbedo: total ? sumA / total : null };
+  const texs = sys._gi2?.textures ?? sys.state?.screen?.gi2?.textures ?? sys.state?.screen?.gi2?.gather?.textures ?? null;
+  const gl = texs?.glossy ? await read(texs.glossy) : null;
+  const ir = texs?.irradiance ? await read(texs.irradiance) : null;
+  const lum = (buf, i) => f16(buf.a[i * 4]) * 0.2126 + f16(buf.a[i * 4 + 1]) * 0.7152 + f16(buf.a[i * 4 + 2]) * 0.0722;
+  let never = 0, miss = 0, hitBlack = 0, hitLit = 0, total = 0; let sumA = 0; let missA = 0, missGl = 0, hitGl = 0, missIr = 0, hitIr = 0, missGlNonBlack = 0;
+  const same = gl && gl.w === hit.w && gl.h === hit.h;
+  for (let i = 0; i < hit.w * hit.h; i++) { const tv = f16(hit.a[i * 4]); if (tv < -1.5) { miss++; missA += f16(col.a[i * 4 + 3]); if (same) { const L = lum(gl, i); missGl += L; if (L > 0.01) missGlNonBlack++; missIr += lum(ir, i); } } else if (tv < 0) never++; else { total++; const r = f16(col.a[i * 4]), g = f16(col.a[i * 4 + 1]), b = f16(col.a[i * 4 + 2]); const ha = f16(col.a[i * 4 + 3]); sumA += ha; if (r + g + b < 0.01) hitBlack++; else hitLit++; if (same) { hitGl += lum(gl, i); hitIr += lum(ir, i); } } }
+  return { meshes: meshes.length, seated, meshCount: bvh?.meshCount, triCount: bvh?.triCount, size: [hit.w, hit.h], glossySize: gl ? [gl.w, gl.h, texs.glossy.type] : null, never, miss, hits: total, hitBlack, hitLit, meanHasAlbedo: total ? sumA / total : null,
+    missMeanColA: miss ? missA / miss : null, missGlossyLum: miss ? missGl / miss : null, missGlossyNonBlackPct: miss ? 100 * missGlNonBlack / miss : null, hitGlossyLum: total ? hitGl / total : null, missIrrLum: miss ? missIr / miss : null, hitIrrLum: total ? hitIr / total : null };
 });
 console.log(JSON.stringify(R, null, 1));
 await browser.close();

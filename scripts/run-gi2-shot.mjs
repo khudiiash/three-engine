@@ -32,6 +32,9 @@ const browser = await puppeteer.launch({
 const page = await browser.newPage();
 await page.setViewport({ width: 1650, height: 970, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
+await page.evaluateOnNewDocument((flags) => {
+  for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
+}, JSON.parse(process.env.EXTRA ?? "{}"));
 await page.evaluateOnNewDocument((rc5, project) => {
   if (rc5) globalThis.__gi2Rc5 = true;
   globalThis.__editorKeepRendering = true;

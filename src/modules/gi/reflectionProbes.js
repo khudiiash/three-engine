@@ -215,8 +215,20 @@ export function sampleReflectionProbes(bundle, P, R, roughness) {
     // atlas has no mips anyway (roughness blur is the LEVELS axis).
     const sA = vec3(bundle.node.sample(uvA).level(0));
     const sB = vec3(bundle.node.sample(uvB).level(0));
-    sum.addAssign(mix(sA, sB, lt).mul(w));
-    wsum.addAssign(w);
+    // §19 6.11c — A TRACED MISS CARRIES NO WEIGHT. The capture stores the hit
+    // distance in .w (0 on a miss — createReflectionProbeCapture's `tOut`
+    // default) and paints a miss with the env or NOTHING, so a probe whose ray
+    // left the scene used to REPLACE the glossy field with black at full
+    // weight (the Cornel mirror's open-front region: pure 0,0,0 next to lit
+    // hits, a hard edge). The level-0 depth at the final direction gates the
+    // probe's weight instead, so a miss falls through to the glossy/sky term
+    // and the edge follows the tile's own bilinear filtering.
+    const uvD = vec2(u.div(atlasW), v.add(rowBase).div(atlasH));
+    const tD = float(bundle.node.sample(uvD).level(0).w);
+    const hitW = globalThis.__giProbeMissWeight === false ? float(1) : step(0.05, tD);
+    const wh = w.mul(hitW);
+    sum.addAssign(mix(sA, sB, lt).mul(wh));
+    wsum.addAssign(wh);
   }
   return {
     rgb: sum.div(wsum.max(1e-4)),

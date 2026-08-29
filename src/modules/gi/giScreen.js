@@ -405,6 +405,19 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
       }
       camera.layers.set(GI_SHARP_LAYER);
       scene.overrideMaterial = gbuffer.maskMaterial;
+      // §19 6.11c — TRANSPARENT CONSUMERS. The opaque-only rule above is an
+      // OCCLUDER rule (a fog box must not become the gbuffer surface for
+      // everything behind it), and it silently took window glass out of the
+      // reflection chain: no position/normal at the pane's pixels, so the
+      // prepass never traced a ray for it and the glass material blended a
+      // "never traced" texel at weight 0. This pass draws ONLY the sharp-tier
+      // set — glass with a roughness floor <= 0.45, tagged by #collectMeshes —
+      // and a volume material never earns that tag, so re-enabling the
+      // transparent queue here writes the pane's own P/N + mask and nothing
+      // else. The pixels BEHIND the pane now resolve diffuse GI at the pane's
+      // depth (the trade a single-layer gbuffer forces); a second consumer
+      // layer is the fix if that shows. `__giMaskTransparent = false` reverts.
+      if (globalThis.__giMaskTransparent !== false) renderer.transparent = true;
       renderer.setMRT(gbuffer.maskMrtNode);
       renderer.autoClear = false;
       // ⭐⭐ THE FOUR-REVERT MASK BUG, ROOT-CAUSED (2026-08-25). `autoClear =
