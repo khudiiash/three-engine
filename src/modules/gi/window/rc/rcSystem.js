@@ -336,7 +336,20 @@ export function createRcCascades({
    *
    * `__gi2RcCornerSpread = 1` arms it (the 1.487/0.291 row above).
    */
-  const cornerSpread = (globalThis.__gi2RcCornerSpread ?? 0) !== 0;
+  // ⭐⭐ §19 6.10 (08-29) — **ON BY DEFAULT**, and the concave-corner strip is
+  // the receipt. The Cornell gate's per-pixel error map at the user's framing
+  // (eye by the green wall, `MAPS=`) shows a 0.3-0.5 m band along every
+  // concave corner — the white floor/ceiling strips next to the red wall — at
+  // 0.65× truth and GREENER than truth (Δ G/(R+G+B) +0.035): the probes that
+  // sit in the corner cell are fed by no pixel's nearest-corner ray, their
+  // bins are seeded from the parent's wider cone, and the pixel interpolates
+  // a probe that never saw the adjacent wall's red bounce. Origin bias 0,
+  // origin escape 0 and halving `spacing0` (worse: −0.62) all left the band;
+  // the spread lifts it −0.435 → −0.305, Δgreen +0.035 → +0.018, gain 0.82 →
+  // 0.88, gate 2/5 → 4/5 (median 0.130 PASS). The 1.487× inflation 5.3d
+  // measured is gone on today's chain (0.879×). `__gi2RcCornerSpread = 0`
+  // restores the nearest-corner rule.
+  const cornerSpread = (globalThis.__gi2RcCornerSpread ?? 1) !== 0;
   const frame = createSrcProbeFrame(store, {
     spacing0,
     camera: vec3(cameraU),

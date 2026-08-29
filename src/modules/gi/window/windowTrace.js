@@ -232,6 +232,9 @@ export const THROUGHPUT_MIN = 0.05;
  * falls back on the exit-face rule.
  */
 export const ORIGIN_ESCAPE = 3;
+/** §19 6.10 arms — module-load hatches for the near-field census; defaults reproduce the shipped trace. */
+const ESCAPE_N = Number.isFinite(Number(globalThis.__gi2TraceEscape)) ? Math.max(0, Number(globalThis.__gi2TraceEscape)) : ORIGIN_ESCAPE;
+const BIAS_CELLS_DEFAULT = Number.isFinite(Number(globalThis.__gi2TraceBiasCells)) ? Number(globalThis.__gi2TraceBiasCells) : 0.5;
 
 /** The default origin bias, in cells of the level the origin sits on. */
 export const DEFAULT_BIAS_CELLS = 0.5;
@@ -378,7 +381,7 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
         ? uint(levels).add(lvl0.min(int(dynLevels - 1)).toUint()).mul(uint(LEVEL_WORDS)).add(uint(OCC_OFF)).toVar()
         : null;
       const useDyn0 = useDynamic ? lvl0.lessThan(int(dynLevels)) : null;
-      Loop({ start: 0, end: ORIGIN_ESCAPE, name: "gi2Escape" }, () => {
+      Loop({ start: 0, end: ESCAPE_N, name: "gi2Escape" }, () => {
         const c = o.div(vl0).floor().toVar();
         const rel = c.sub(org0).toVar();
         // A point outside the level's window reads as FREE: the escape must
@@ -705,7 +708,7 @@ export function createWindowTrace(win, { steps = win.spec.traceSteps, dynamic = 
    * @param {Node|number} [biasCells]  origin bias in cells of the ORIGIN's own
    *   level (`v_l`), default half a cell. The escape above may push further.
    */
-  const traceWindow = (origin, dir, tMax, normal = null, biasCells = DEFAULT_BIAS_CELLS) => {
+  const traceWindow = (origin, dir, tMax, normal = null, biasCells = BIAS_CELLS_DEFAULT) => {
     const r = traceFn(
       vec3(origin), vec3(dir), normal == null ? vec3(0, 0, 0) : vec3(normal), float(tMax),
       float(biasCells),

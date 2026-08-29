@@ -1520,5 +1520,69 @@ if (REF && existsSync(REF)) {
   }
 }
 
+
+// ══ §19 6.10 — THE ERROR MAPS (`MAPS=<dir>`) ═════════════════════════════════
+// Two PNGs from the SAME per-pixel rows the gate scored, so a picture of the
+// error can be put next to the user's photo: `err.png` = signed log(E/ref)
+// (red = ours brighter, blue = ours darker, ±0.7 saturates; black = unscored),
+// `green.png` = G/(R+G+B) ours − truth (green = ours greener, magenta = ours
+// redder, ±0.08 saturates). Plus the strip census the photo asks about.
+if (process.env.MAPS) {
+  const { deflateSync } = await import("node:zlib");
+  const crcTable = new Int32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; crcTable[n] = c; }
+  const crc32 = (buf) => { let c = -1; for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8); return (c ^ -1) >>> 0; };
+  const chunk = (type, data) => { const len = Buffer.alloc(4); len.writeUInt32BE(data.length); const td = Buffer.concat([Buffer.from(type), data]); const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td)); return Buffer.concat([len, td, crc]); };
+  const png = (w, h, rgb) => {
+    const raw = Buffer.alloc((w * 3 + 1) * h);
+    for (let y = 0; y < h; y++) { raw[y * (w * 3 + 1)] = 0; rgb.copy(raw, y * (w * 3 + 1) + 1, y * w * 3, (y + 1) * w * 3); }
+    const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+    return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
+  };
+  const xs = rows.map((q) => q.x), ys = rows.map((q) => q.y);
+  const st = R.stride || 1;
+  const x0 = Math.min(...xs), y0 = Math.min(...ys);
+  const gw = Math.floor((Math.max(...xs) - x0) / st) + 1, gh = Math.floor((Math.max(...ys) - y0) / st) + 1;
+  const UP = 4; const W = gw * UP, H = gh * UP;
+  const errImg = Buffer.alloc(W * H * 3), grnImg = Buffer.alloc(W * H * 3);
+  const put = (img, gx, gy, r, g, b) => { for (let dy = 0; dy < UP; dy++) for (let dx = 0; dx < UP; dx++) { const o = ((gy * UP + dy) * W + gx * UP + dx) * 3; img[o] = r; img[o + 1] = g; img[o + 2] = b; } };
+  const gf = (e) => { const s = e[0] + e[1] + e[2]; return s > 1e-9 ? e[1] / s : 0; };
+  const strip = [], stripNear = [], stripFar = [], ceilCentre = [], floorCentre = [], shadowish = [];
+  const REDX = -2.5 + 0.3816651532689147;
+  for (const q of rows) {
+    const gx = Math.round((q.x - x0) / st), gy = Math.round((q.y - y0) / st);
+    if (!q.ref || q.emitFace || !(lum(q.ref) > 1e-6) || !(lum(q.E) > 0)) { put(errImg, gx, gy, 0, 0, 0); put(grnImg, gx, gy, 0, 0, 0); continue; }
+    const lg = Math.log(lum(q.E) / lum(q.ref));
+    const t = Math.max(-1, Math.min(1, lg / 0.7));
+    put(errImg, gx, gy, Math.round(128 + 127 * Math.max(0, t) - 100 * Math.max(0, -t)), Math.round(128 - 100 * Math.abs(t)), Math.round(128 + 127 * Math.max(0, -t) - 100 * Math.max(0, t)));
+    const dg = gf(q.E) - gf(q.ref);
+    const u = Math.max(-1, Math.min(1, dg / 0.08));
+    put(grnImg, gx, gy, Math.round(128 + 127 * Math.max(0, -u) - 110 * Math.max(0, u)), Math.round(128 + 127 * Math.max(0, u) - 110 * Math.max(0, -u)), Math.round(128 - 110 * Math.abs(u) + 60 * Math.max(0, -u)));
+    const white = /floor|ceil/i.test(q.surf);
+    const row = { lg, dg, surf: q.surf, p: q.p };
+    if (white && q.p[0] < REDX + 0.5) { strip.push(row); (q.p[0] < REDX + 0.25 ? stripNear : stripFar).push(row); }
+    else if (/ceil/i.test(q.surf) && Math.abs(q.p[0] - 0.38) < 1 && Math.abs(q.p[2]) < 1) ceilCentre.push(row);
+    else if (/floor/i.test(q.surf) && Math.abs(q.p[0] - 0.38) < 1 && Math.abs(q.p[2]) < 1) floorCentre.push(row);
+    if (lum(q.ref) < 0.25 * irrP50 && lum(q.E) > 2 * lum(q.ref)) shadowish.push(row);
+  }
+  mkdirSync(process.env.MAPS, { recursive: true });
+  writeFileSync(path.join(process.env.MAPS, "err.png"), png(W, H, errImg));
+  writeFileSync(path.join(process.env.MAPS, "green.png"), png(W, H, grnImg));
+  const med = (a, k) => quantile(a.map((r) => r[k]), 0.5);
+  const medAbs = (a, k) => quantile(a.map((r) => Math.abs(r[k])), 0.5);
+  const line = (name, a) => console.log(`  ${name.padEnd(34)} n ${String(a.length).padStart(5)}  |log| med ${f(medAbs(a, "lg"))}  signed log med ${f(med(a, "lg"))}  Δgreen med ${f(med(a, "dg"), 4)}  Δgreen p90 ${f(quantile(a.map((r) => r.dg), 0.9), 4)}`);
+  console.log(`\n  ── §19 6.10 error maps → ${process.env.MAPS} (${W}x${H}, grid ${gw}x${gh}, stride ${st}) ──`);
+  line("white strip ≤0.5 m from red wall", strip);
+  line("  strip ≤0.25 m", stripNear);
+  line("  strip 0.25-0.5 m", stripFar);
+  line("ceiling centre", ceilCentre);
+  line("floor centre", floorCentre);
+  line("ref dark (<¼ p50) & ours >2× ref", shadowish);
+  const bySurfStrip = new Map(); for (const r of strip) bySurfStrip.set(r.surf, [...(bySurfStrip.get(r.surf) ?? []), r]);
+  for (const [s, a] of bySurfStrip) line(`  strip · ${s}`, a);
+  const worst = [...rows].filter((q) => q.ref && !q.emitFace && lum(q.ref) > 1e-6 && lum(q.E) > 0).map((q) => ({ surf: q.surf, p: q.p.map((v) => +v.toFixed(2)), lg: Math.log(lum(q.E) / lum(q.ref)) })).sort((a, b) => Math.abs(b.lg) - Math.abs(a.lg)).slice(0, 12);
+  console.log("  worst 12 pixels: " + worst.map((w) => `${w.surf}@[${w.p}] ${w.lg > 0 ? "+" : ""}${w.lg.toFixed(2)}`).join("; "));
+}
+
 await browser.close();
 process.exit(passed === checks.length ? 0 : 1);
