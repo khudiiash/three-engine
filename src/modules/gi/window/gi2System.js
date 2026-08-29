@@ -878,6 +878,15 @@ export function createGi2System({
         for (const n of gather.frameOrder ?? []) shadowBvh.attach?.(n);
         for (const n of rc.frameOrder) shadowBvh.attach?.(n);
       }
+      // §19 6.19 — name each RC kernel by the GROUP it belongs to before the
+      // positional fallback, so `profile.giPasses` reports `gi2.rc.rays#0`
+      // rather than `gi2.rc#29` and an owner can be read off the receipt.
+      for (const [group, list] of Object.entries(rc.passes)) {
+        list.forEach((n, i) => {
+          if (n && typeof n === "object") n.__giPassName ??= `gi2.rc.${group}#${i}`;
+        });
+      }
+      if (rc.resolve?.hashPass && typeof rc.resolve.hashPass === "object") rc.resolve.hashPass.__giPassName ??= "gi2.rc.hash";
       rc.frameOrder.forEach((n, i) => {
         if (n && typeof n === "object") n.__giPassName ??= `gi2.rc#${i}`;
       });
