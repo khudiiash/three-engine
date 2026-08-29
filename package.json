@@ -154,6 +154,7 @@
     "test:gi-lighttree-nee": "node scripts/run-gi-lighttree-nee.mjs",
     "test:gi-lighttree-mover": "node scripts/run-gi-lighttree-mover.mjs",
     "test:gi-moved-lamp": "node scripts/run-gi-moved-lamp-test.mjs",
+    "test:gi-scaled-lamp": "node scripts/run-gi-scaled-lamp-test.mjs",
     "test:gi-lighttree-sponza": "node scripts/run-gi-sponza-lighttree.mjs",
     "test:gi-boot-ambient": "node scripts/run-gi-boot-ambient-test.mjs",
     "test:gi-proxy-fit": "node scripts/run-gi-proxy-fit-test.mjs",
