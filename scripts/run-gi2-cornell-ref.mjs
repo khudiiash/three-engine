@@ -1280,6 +1280,15 @@ if (ARMS.length) {
       return (s ? pct(s.sigmaRel) : "—").padStart(15);
     }).join(""));
   }
+  // §19 6.28b — the per-surface ENERGY under each arm (E_arm / E_ref), beside σ:
+  // a term whose removal drops a face to 0.3× is named here, not by argument.
+  console.log("  per-surface E_arm / E_ref by arm  [black px]");
+  for (const n of names) {
+    console.log(`  ${n.padEnd(16)}` + armRows.map((a) => {
+      const s = a.surfaces.find((x) => x.name === n);
+      return (s ? `${f(s.ratio, 2)} [${s.black}]` : "—").padStart(15);
+    }).join(""));
+  }
   result.arms = armRows;
 }
 
