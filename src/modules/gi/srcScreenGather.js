@@ -173,6 +173,9 @@ const CORNERS = Array.from({ length: 8 }, (_, k) => [k & 1, (k >> 1) & 1, (k >> 
  */
 export function createSrcScreenGather(store, tiles, {
   lookup,
+  // §19 6.30c — the cascade whose probes the eight corners are (`tiles` must
+  // be that cascade's atlas). 0 is every pixel gather; 1 is [J]'s E_hit read.
+  cascade = 0,
   spacing0,
   camera,
   anchor,
@@ -328,7 +331,7 @@ export function createSrcScreenGather(store, tiles, {
 
     /** One LOD shell's sparse-trilinear, coverage-weighted gather. */
     const shell = (lod, shellWeight) => {
-      const s = probeSpacing(0, lod, spacing0).toVar();
+      const s = probeSpacing(cascade, lod, spacing0).toVar();
       const origin = latticeOrigin(anchor, s).toVar();
       const f = P.sub(origin).div(s).toVar();
       const cell0 = floor(f).toVar();
@@ -459,7 +462,7 @@ export function createSrcScreenGather(store, tiles, {
           // find answers "absent" for key 0 by its first line, so an
           // unrepresentable corner is a missing corner with no extra guard.
           const block = lookup(
-            packProbeKey(int(lod), uint(0), baseCell.add(ivec3(dx, dy, dz))),
+            packProbeKey(int(lod), uint(cascade), baseCell.add(ivec3(dx, dy, dz))),
           ).toVar();
           If(block.notEqual(uint(SLOT_EMPTY)), () => {
             // ONE hardware-bilinear tap. rgb is `Σ w_tap·E` over the covered

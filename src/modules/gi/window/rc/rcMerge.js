@@ -171,6 +171,28 @@ export function createRcMerge({
   const gather = createSrcScreenGather(store, tiles, {
     lookup: hashBlock.lookup, spacing0, camera, anchor, maxLods, w0: W0,
   });
+  // ── §19 6.30c — THE c1 ATLAS, FOR THE HIT'S IRRADIANCE ONLY ─────────────
+  //
+  // 6.30's mechanism: a c0 ray from the box/wall gap ends on the wall at
+  // t < t1 with T = 0, and that hit's radiance is ρ·E_hit/π where E_hit was
+  // gathered from the SAME c0 gap probes the ray feeds — a mutual dark fixed
+  // point the far field never enters. The paper's cure is that the hit reads a
+  // COARSER cascade: c1's merged bins start at t1 and carry c2/c3, so a tile
+  // baked from them is the far field seen from the c1 lattice, lit by the room.
+  // Pixels keep the c0 resolve; only [J]'s `E_rc` reads this (`rcHit`'s
+  // `gatherHit`), with the c0 gather as its fallback where c1 has no corner.
+  // ⛔ DEFAULT OFF (`__gi2RcHitC1 = 1` arms it), AND THE PAIRED GATE IS WHY:
+  // same build, same contention, c1 OFF → ON: Box·+Z 0.25× → 0.23×, black
+  // 9 → 12, gain 0.812 → 0.782, frames-to-90 % 340 → 659 — [J]'s WGSL grew
+  // 183 → 280 kB (a second full gather transcription) and its compile
+  // 2.5 → 10.1 s. The hit's E source is NOT the dark strip's mechanism as
+  // built, or c1 falls back to c0 at those hits — unmeasured (no fallback
+  // counter yet). See the plan's 6.30c.
+  const hitC1 = (globalThis.__gi2RcHitC1 ?? 0) !== 0;
+  const tilesHit = hitC1 ? createSrcTileAtlas(store, bins, { w0: W0, sky, frameStamp, skyEnv, cascade: 1 }) : null;
+  const gatherHit = hitC1 ? createSrcScreenGather(store, tilesHit, {
+    lookup: hashBlock.lookup, spacing0, camera, anchor, maxLods, w0: W0, cascade: 1,
+  }) : null;
 
   // ── the one kernel ────────────────────────────────────────────────────────
   const posN = texture(gbuffer.position);
@@ -371,6 +393,9 @@ export function createRcMerge({
     merge,
     tiles,
     gather,
+    /** §19 6.30c — the c1 atlas and its gather; `null` on the `__gi2RcHitC1 = 0` arm. */
+    tilesHit,
+    gatherHit,
     resolvePass,
     /**
      * [G] → [H] → [I]. `hashPass` is NOT here: it belongs above the rays.
@@ -381,7 +406,7 @@ export function createRcMerge({
      * consumer is what keeps "the visibility this pixel multiplies is the
      * visibility computed for this pixel this frame" readable at the call site.
      */
-    passes: [...merge.passes, ...tiles.passes, ...(direct?.passes ?? []), resolvePass],
+    passes: [...merge.passes, ...tiles.passes, ...(tilesHit?.passes ?? []), ...(direct?.passes ?? []), resolvePass],
     uniforms: {
       rcResolveWrite: writeU, rcResolveWidth: widthU, rcResolveHeight: heightU,
       rcTermField: fieldTermU, rcTermDirect: directTermU,
@@ -406,11 +431,13 @@ export function createRcMerge({
       if (direct && !direct.setSize(nw, nh)) return false;
       return true;
     },
-    bytes: (merge.bytes ?? 0) + (tiles.bytes ?? 0),
+    bytes: (merge.bytes ?? 0) + (tiles.bytes ?? 0) + (tilesHit?.bytes ?? 0),
     storageAttributes: () => [
       ...(merge.storageAttributes ?? []),
       ...(tiles.storageAttributes ?? []),
+      ...(tilesHit?.storageAttributes ?? []),
       ...(gather.storageAttributes ?? []),
+      ...(gatherHit?.storageAttributes ?? []),
     ].filter(Boolean),
     async readStats(renderer) {
       const [m, t] = await Promise.all([
@@ -435,7 +462,9 @@ export function createRcMerge({
     dispose() {
       merge.dispose?.();
       tiles.atlas?.dispose?.();
+      tilesHit?.atlas?.dispose?.();
       gather.dispose?.();
+      gatherHit?.dispose?.();
       direct?.dispose?.();
     },
   };

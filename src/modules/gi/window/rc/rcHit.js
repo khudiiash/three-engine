@@ -124,6 +124,9 @@ export const unpackAddr = (a) => ({
  * @param {Function} [o.gatherAt]  §19 5.3b — the merged field's eight-probe
  *   resolve. Present ⇒ [J] adds `ρ·E_rc/π` out of the cache's SECONDARY region;
  *   absent ⇒ [J] is direct-only and the caller must supply the bounce itself.
+ * @param {Function} [o.gatherHit]  §19 6.30c — the c1 lattice's eight-probe
+ *   resolve (`rcMerge`'s `gatherHit`). Present ⇒ E_hit is read from it, and
+ *   from `gatherAt` only where its corner set is unknown; `null` ⇒ `gatherAt`.
  * @param {number} [o.ercAlpha]  blend toward the new gather on a refresh. 1 (the
  *   shipped value) makes the write order-free; see `shade`.
  * @param {object} [o.ercPhase]  a uint node — the frame stamp the budget's phase
@@ -134,7 +137,7 @@ export const unpackAddr = (a) => ({
  *   `Le` too unless the gather published `hitEmissionRay` (§19 5.3c).
  */
 export function createRcHitShading({
-  cache, kit, counters = null, gatherAt = null,
+  cache, kit, counters = null, gatherAt = null, gatherHit = null,
   ercAlpha = 1, ercPhase = null, ercPeriodMask = null, compact = true,
 }) {
   const { u, dominantFace, faceSamplePoint, shadeHit, hitPalette, hitEmissionRay } = kit;
@@ -393,7 +396,24 @@ export function createRcHitShading({
         ? fresh.or(bitAnd(phaseOfAddr, ercPeriodMask).equal(bitAnd(ercPhase, ercPeriodMask)))
         : fresh.or(true);
       If(due, () => {
-        const g = vec3(gatherAt(hp, hn).irradiance).toVar();
+        // ⭐⭐ §19 6.30c — E_hit FROM THE c1 LATTICE, c0 ONLY AS THE FALLBACK.
+        //
+        // The c0 gather at a hit inside a gap reads the very probes the hit's
+        // own ray feeds (T = 0 at t < t1 → ρ·E_hit/π → the same bins): a
+        // closed loop whose only input is itself, and 6.30 measured it at
+        // 0.048× of truth at the convex corner. c1's merged bins start at t1
+        // and carry the parents, so a c1 tile is the far field the gap's own
+        // c0 bins never see. Where c1 has no known corner (a newborn shell,
+        // the lattice edge) the c0 read stands, so nothing is darker than
+        // before by construction.
+        const g = vec3(0).toVar();
+        const g1 = gatherHit ? gatherHit(hp, hn) : null;
+        if (g1) {
+          g.assign(g1.irradiance);
+          If(g1.known.not(), () => { g.assign(vec3(gatherAt(hp, hn).irradiance)); });
+        } else {
+          g.assign(gatherAt(hp, hn).irradiance);
+        }
         cache.ercWrite(lF, vF, fF, g, ercAlpha).toVar();
         E.assign(select(fresh, g, mix(e.xyz, g, float(ercAlpha))));
       });

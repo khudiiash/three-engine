@@ -250,8 +250,14 @@ export function createSrcTileAtlas(store, bins, {
   // bin's own direction instead of the flat mean. Absent (every gate
   // fixture) the flat path compiles bit-identically.
   skyEnv = null,
+  // §19 6.30c — WHICH cascade's merged bins this atlas bakes. 0 is the pixel
+  // resolve's atlas (unchanged). 1 bakes the c1 probes — whose merged bins
+  // carry c2/c3 and START at t1, so a tile holds the FAR field — for [J]'s
+  // E_hit: a hit's irradiance read from a lattice whose near band is not the
+  // hit's own cell (the 6.30 mutual dark fixed point in the box/wall gap).
+  cascade = 0,
 } = {}) {
-  const info = bins.cascades[0];
+  const info = bins.cascades[cascade];
   const nBins = info.bins;
   const blocks = info.blockCapacity;
   const tileSize = interior + 2 * border;
@@ -265,7 +271,7 @@ export function createSrcTileAtlas(store, bins, {
   // filterable everywhere and carries ~3 decimal digits, which is well inside
   // what an irradiance estimate built from 0.78 rays per bin means.
   atlas.type = THREE.HalfFloatType;
-  atlas.name = "giSrcIrradianceTiles";
+  atlas.name = cascade ? `giSrcIrradianceTilesC${cascade}` : "giSrcIrradianceTiles";
   atlas.minFilter = THREE.LinearFilter;
   atlas.magFilter = THREE.LinearFilter;
   atlas.wrapS = THREE.ClampToEdgeWrapping;
@@ -278,7 +284,7 @@ export function createSrcTileAtlas(store, bins, {
   atlas.version = (globalThis.__giSrcTargetVersion = (globalThis.__giSrcTargetVersion ?? 0) + 1);
   const atlasNode = texture(atlas);
 
-  const w = binGridWidth(0, w0);
+  const w = binGridWidth(cascade, w0);
   const table = tileCosineWeights(w, interior, sub, border);
   const cosTable = instancedArray(table, "float");
   /**
@@ -343,14 +349,14 @@ export function createSrcTileAtlas(store, bins, {
     && frameStamp != null
     && store?.freeStack != null
     && store?.blockStampBase != null
-    && store?.cascades?.[0]?.blockBase != null;
+    && store?.cascades?.[cascade]?.blockBase != null;
   const maturityRamp = Number(globalThis.__giSrcMaturityRamp) > 0
     ? Number(globalThis.__giSrcMaturityRamp)
     : 30;
   const maturityFloor = Number.isFinite(Number(globalThis.__giSrcMaturityFloor))
     ? Number(globalThis.__giSrcMaturityFloor)
     : 0.2;
-  const stampBase = maturityOn ? store.blockStampBase + store.cascades[0].blockBase : 0;
+  const stampBase = maturityOn ? store.blockStampBase + store.cascades[cascade].blockBase : 0;
   const stampStack = maturityOn ? store.freeStack : null;
 
   const passes = [];

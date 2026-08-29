@@ -452,6 +452,9 @@ export function createRcCascades({
       // The alternative was two `createRcHitShading` calls, which is two places
       // for the shade point and the face normal to drift apart.
       gatherAt: (P, n) => resolve.gather.gatherAt(P, n),
+      // §19 6.30c — the c1 read for E_hit (see `rcMerge`'s `tilesHit`). Resolved
+      // through the same thunk, for the same build-order reason.
+      gatherHit: (P, n) => (resolve.gatherHit ? resolve.gatherHit.gatherAt(P, n) : null),
       ercAlpha,
       ercPhase: frameStampU,
       // ⚠ PASSED EVEN AT PERIOD 1, where the mask is 0 and `addr & 0 == stamp & 0`
