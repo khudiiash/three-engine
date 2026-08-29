@@ -146,7 +146,7 @@ import {
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
-import { BIN_COUNT, BIN_SG, BIN_SR, BIN_WORDS, DEPOSIT_SCALE, PAYLOAD_SEED_BASE, PAYLOAD_WORDS, PRIOR_SAMPLES, PRIOR_W_BASE } from "./srcDeposit.js";
+import { BIN_COUNT, BIN_SG, BIN_SR, BIN_WORDS, DEPOSIT_SCALE, PAYLOAD_SEED_BASE, PAYLOAD_WORDS, PRIOR_AGE, PRIOR_SAMPLES, PRIOR_W_BASE } from "./srcDeposit.js";
 
 /** §19 6.32c — decode a prior-mode payload `w` (srcDeposit PRIOR_W_BASE) into { T, conf }. Caller has checked w >= 0. */
 export function decodePriorW(w) {
@@ -577,6 +577,13 @@ export function createSrcMergeFrame(store, bins, {
     const info = bins.cascades[c];
     const parentInfo = bins.cascades[c + 1];
     const nBins = info.bins;
+    // §19 6.32d — the claim stamp of THIS cascade's blocks (srcProbes: stamp
+    // region indexed blockStampBase + blockBase[c] + block). Without a
+    // frameStamp the prior is age-gated OFF (ageW = 0 → the old path).
+    const priorAge = prior && prior.frameStamp != null && store?.freeStack != null
+      && store?.blockStampBase != null && store?.cascades?.[c]?.blockBase != null
+      ? { stack: store.freeStack, base: store.blockStampBase + store.cascades[c].blockBase, frameStamp: prior.frameStamp }
+      : null;
     const recordBase = cornerCascades[c].base;
 
     passes.push(Fn(() => {
@@ -740,18 +747,30 @@ export function createSrcMergeFrame(store, bins, {
         // §19 6.32 — the parent prior (see the `prior` option). `mat` is the
         // bin's own maturity; an unknown self has none, so it takes the cone.
         const mat = float(1).toVar();
+        /** §19 6.32d — 1 for a newborn probe, 0 once it is PRIOR_AGE frames old (srcDeposit). */
+        const ageW = float(0).toVar();
         if (prior) {
           const cb = uint(info.binBase).add(block.mul(uint(nBins))).add(m)
             .mul(uint(BIN_WORDS)).toVar();
           const cnt = float(atomicLoad(prior.scratch.element(cb.add(uint(BIN_COUNT))))).toVar();
           mat.assign(cnt.div(float(PRIOR_SAMPLES * DEPOSIT_SCALE)).clamp(0, 1));
           If(unknownSelf, () => { mat.assign(0); });
+          if (priorAge) {
+            const st = priorAge.stack.element(uint(priorAge.base).add(block)).toVar();
+            const age = float(uint(priorAge.frameStamp).sub(st)).toVar();
+            ageW.assign(age.div(float(PRIOR_AGE)).oneMinus().clamp(0, 1));
+          }
+          // STRUCTURAL absence: no samples AND not young — excluded, as before 6.32.
+          If(unknownSelf.and(ageW.lessThanEqual(0)), () => { Return(); });
         }
         // §19 6.32c — E = (m·own + (1−m)·m_par·parent) / (m + (1−m)·m_par): an
         // immature parent cannot import its darkness, and the denominator is
         // this bin's effective confidence, written into `w` for ITS children.
-        const pw = prior ? mat.oneMinus().mul(mPar).toVar() : null;
-        const conf = prior ? mat.add(pw).toVar() : null;
+        // §19 6.32d — the parent weight is gated by AGE: p = ageW·(1−m)·m_par.
+        const pw = prior ? ageW.mul(mat.oneMinus()).mul(mPar).toVar() : null;
+        // Confidence: at ageW = 0 an own-known bin is fully confident (bit-identical
+        // alpha to the pre-6.32 sampled fraction); a young bin carries m + p.
+        const conf = prior ? float(1).sub(ageW.mul(float(1).sub(mat.add(pw).min(1)))).toVar() : null;
         const invConf = prior ? float(1).div(conf.max(1e-6)).toVar() : null;
         const outL = (prior ? ownL.mul(mat).add(parentL.mul(pw)).mul(invConf) : ownL).toVar();
         const outT = (prior ? ownT.mul(mat).add(parentT.mul(pw)).mul(invConf) : ownT).toVar();
@@ -782,7 +801,13 @@ export function createSrcMergeFrame(store, bins, {
               .mul(uint(BIN_WORDS)).toVar();
             const cnt = float(atomicLoad(prior.scratch.element(cb.add(uint(BIN_COUNT))))).toVar();
             const mo = cnt.div(float(PRIOR_SAMPLES * DEPOSIT_SCALE)).clamp(0, 1).toVar();
-            payload.element(o.add(uint(3))).assign(encodePriorW(selfT, mo));
+            // §19 6.32d — the same age mix: a settled orphan is fully confident.
+            const ageWo = float(0).toVar();
+            if (priorAge) {
+              const st = priorAge.stack.element(uint(priorAge.base).add(block)).toVar();
+              ageWo.assign(float(uint(priorAge.frameStamp).sub(st)).div(float(PRIOR_AGE)).oneMinus().clamp(0, 1));
+            }
+            payload.element(o.add(uint(3))).assign(encodePriorW(selfT, float(1).sub(ageWo.mul(mo.oneMinus()))));
           });
         }
         // ⭐⭐ AND SPLIT IT BY WHETHER IT COST A PHOTON (2026-08-23).

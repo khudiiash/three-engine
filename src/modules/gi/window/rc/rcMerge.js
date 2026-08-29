@@ -153,7 +153,7 @@ export function createRcMerge({
   // §19 6.32 — the parent prior + maturity vote (`srcMerge` / `srcTiles`
   // `prior`): light accumulates as gradients. `__gi2ParentPrior = false`
   // restores the 6.1 newborn fade + 5.4e seeds.
-  const prior = globalThis.__gi2ParentPrior === false ? null : { scratch: bins.scratch };
+  const prior = globalThis.__gi2ParentPrior === false ? null : { scratch: bins.scratch, frameStamp };
   if (prior) console.info("[gi2] parent prior ARMED (6.32)");
   const merge = createSrcMergeFrame(store, bins, {
     spacing0, anchor, camera, sky, skyEnv, w0: W0, losOccupied, changeReset, prior,

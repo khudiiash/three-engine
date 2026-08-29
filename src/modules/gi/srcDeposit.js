@@ -237,6 +237,21 @@ export const PRIOR_FLOOR = 1 / 64;
  * `T = w, conf = 1`; `w < 0` stays UNKNOWN. Decoded by `decodePriorW`.
  */
 export const PRIOR_W_BASE = 2;
+/**
+ * §19 6.32d — THE PRIOR IS TEMPORAL, NEVER STRUCTURAL. A bin takes the parent
+ * cone only while its probe is YOUNG: prior weight
+ * `p = (1 − min(age/PRIOR_AGE, 1)) · m_par`, own weight `m = samples/N`. A
+ * mature probe's unsampled (folded) bins stay EXCLUDED and the texel
+ * extrapolates from its sampled bins exactly as before 6.32 — so at rest every
+ * probe has `age ≥ PRIOR_AGE`, `p = 0`, and the merge and the bake are
+ * bit-identical to `__gi2ParentPrior = false` by construction. 24 frames
+ * (~0.4 s), between the newborn fade's 16 and the seed ramp's 30.
+ * `__gi2PriorAge` overrides.
+ */
+export const PRIOR_AGE = (() => {
+  const raw = Number(globalThis.__gi2PriorAge);
+  return Number.isFinite(raw) && raw > 0 ? raw : 24;
+})();
 
 /**
  * Accumulated weight below which a bin is UNKNOWN rather than dim — one
