@@ -1547,7 +1547,7 @@ if (process.env.MAPS) {
   const errImg = Buffer.alloc(W * H * 3), grnImg = Buffer.alloc(W * H * 3);
   const put = (img, gx, gy, r, g, b) => { for (let dy = 0; dy < UP; dy++) for (let dx = 0; dx < UP; dx++) { const o = ((gy * UP + dy) * W + gx * UP + dx) * 3; img[o] = r; img[o + 1] = g; img[o + 2] = b; } };
   const gf = (e) => { const s = e[0] + e[1] + e[2]; return s > 1e-9 ? e[1] / s : 0; };
-  const strip = [], ceilCentre = [], floorCentre = [], shadowish = [];
+  const strip = [], stripNear = [], stripFar = [], ceilCentre = [], floorCentre = [], shadowish = [];
   const REDX = -2.5 + 0.3816651532689147;
   for (const q of rows) {
     const gx = Math.round((q.x - x0) / st), gy = Math.round((q.y - y0) / st);
@@ -1560,7 +1560,7 @@ if (process.env.MAPS) {
     put(grnImg, gx, gy, Math.round(128 + 127 * Math.max(0, -u) - 110 * Math.max(0, u)), Math.round(128 + 127 * Math.max(0, u) - 110 * Math.max(0, -u)), Math.round(128 - 110 * Math.abs(u) + 60 * Math.max(0, -u)));
     const white = /floor|ceil/i.test(q.surf);
     const row = { lg, dg, surf: q.surf, p: q.p };
-    if (white && q.p[0] < REDX + 0.5) strip.push(row);
+    if (white && q.p[0] < REDX + 0.5) { strip.push(row); (q.p[0] < REDX + 0.25 ? stripNear : stripFar).push(row); }
     else if (/ceil/i.test(q.surf) && Math.abs(q.p[0] - 0.38) < 1 && Math.abs(q.p[2]) < 1) ceilCentre.push(row);
     else if (/floor/i.test(q.surf) && Math.abs(q.p[0] - 0.38) < 1 && Math.abs(q.p[2]) < 1) floorCentre.push(row);
     if (lum(q.ref) < 0.25 * irrP50 && lum(q.E) > 2 * lum(q.ref)) shadowish.push(row);
@@ -1573,6 +1573,8 @@ if (process.env.MAPS) {
   const line = (name, a) => console.log(`  ${name.padEnd(34)} n ${String(a.length).padStart(5)}  |log| med ${f(medAbs(a, "lg"))}  signed log med ${f(med(a, "lg"))}  Δgreen med ${f(med(a, "dg"), 4)}  Δgreen p90 ${f(quantile(a.map((r) => r.dg), 0.9), 4)}`);
   console.log(`\n  ── §19 6.10 error maps → ${process.env.MAPS} (${W}x${H}, grid ${gw}x${gh}, stride ${st}) ──`);
   line("white strip ≤0.5 m from red wall", strip);
+  line("  strip ≤0.25 m", stripNear);
+  line("  strip 0.25-0.5 m", stripFar);
   line("ceiling centre", ceilCentre);
   line("floor centre", floorCentre);
   line("ref dark (<¼ p50) & ours >2× ref", shadowish);
