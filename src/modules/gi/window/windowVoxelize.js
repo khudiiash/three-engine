@@ -177,7 +177,7 @@
 // `markAllDirty` (which writes STATE_DIRTY) zeroes the cursor itself.
 import * as THREE from "three/webgpu";
 import {
-  Break, Fn, If, Loop, Return, atomicAdd, atomicAnd, atomicLoad, atomicMax, atomicMin, atomicOr, atomicStore,
+  Break, Continue, Fn, If, Loop, Return, atomicAdd, atomicAnd, atomicLoad, atomicMax, atomicMin, atomicOr, atomicStore,
   bitAnd, bitNot, bitOr, exp2, float, instanceIndex, instancedArray, int, select, shiftLeft,
   shiftRight, storage, uint, uniform, vec3, vec4,
 } from "three/tsl";
@@ -721,6 +721,26 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     uniform(new THREE.Vector3(v?.[0] ?? 1, v?.[1] ?? 1, v?.[2] ?? 1)));
 
   const { tris, triPal, cellRange, cellTris } = soup;
+  // ── §19 6.34 — PER-PLACEMENT EXCLUSION, THE SAME 1024-BIT MASK THE SHADOW BVH
+  // HONOURS AT ITS LEAF. `triOwner` (6.21, 2×u16/word) names each triangle's
+  // placement slot; a set bit hides that placement from every brick built
+  // after it flips. A promotion is therefore "set the bit + dirty the bricks
+  // its build pose touches" and NOT a soup worker run. The array is OWNED by
+  // the caller (gi2System), so it survives this voxelizer's generation.
+  const triOwner = soup.triOwner ?? null;
+  const exclArr = opts.exclusion ?? new Uint32Array(32);
+  const exclBuf = instancedArray(exclArr, "uint");
+  const mintExcl = () => {
+    const attr = new THREE.StorageBufferAttribute(exclArr, 1);
+    attr.version++;
+    exclBuf.value = attr;
+  };
+  /** True when triangle `t`'s placement is masked out. Constant-false without owners. */
+  const triExcluded = (t) => {
+    if (!triOwner) return null;
+    const ow = bitAnd(shiftRight(triOwner.element(shiftRight(t, uint(1))), bitAnd(t, uint(1)).mul(uint(16))), uint(0xffff)).toVar();
+    return bitAnd(exclBuf.element(shiftRight(ow, uint(5))), shiftLeft(uint(1), bitAnd(ow, uint(31)))).notEqual(uint(0));
+  };
 
   // ── addressing helpers (JS-level; each emits ~3 ops, no function call) ─────
   const levelBaseOf = (level) => level.mul(uint(LEVEL_WORDS));
@@ -992,6 +1012,33 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
     // the call a NEW SOUP makes. A stale cell cursor would skip the brick's
     // first N cells against a grid that no longer has the same contents.
     atomicStore(wk.element(uint(CEL_OFF).add(instanceIndex)), uint(0));
+  })().compute(levels * BRICKS_PER_LEVEL);
+
+  // ══════════════════════════════════════════════════════ PASS: markBoxDirty
+  // §19 6.34 — the bricks a world AABB touches become DIRTY (cursors zeroed,
+  // exactly as `markAllDirty`); every other brick keeps its build. A promotion
+  // or a settle re-voxelizes ONE placement's footprint, not the window.
+  const boxMinU = uniform(new THREE.Vector3());
+  const boxMaxU = uniform(new THREE.Vector3());
+  const markBoxDirtyPass = Fn(() => {
+    const level = shiftRight(instanceIndex, uint(12)).toVar();
+    const b = bitAnd(instanceIndex, uint(BRICKS_PER_LEVEL - 1)).toVar();
+    const tab = tabBaseOf(level, b).toVar();
+    const stored = atomicLoad(winAtomics.element(tab)).toVar();
+    If(bitAnd(stored, uint(WB_VALID)).notEqual(uint(0)), () => {
+      const wb = unpackWb(stored).toVar();
+      const bl = float(voxel0 * BRICK).mul(exp2(level.toFloat())).toVar();
+      const bmin = wb.mul(bl).toVar();
+      const bmax = bmin.add(bl).toVar();
+      const hit = bmax.x.greaterThanEqual(boxMinU.x).and(bmin.x.lessThanEqual(boxMaxU.x))
+        .and(bmax.y.greaterThanEqual(boxMinU.y)).and(bmin.y.lessThanEqual(boxMaxU.y))
+        .and(bmax.z.greaterThanEqual(boxMinU.z)).and(bmin.z.lessThanEqual(boxMaxU.z));
+      If(hit, () => {
+        atomicStore(winAtomics.element(tab.add(uint(1))), uint(STATE_DIRTY));
+        atomicStore(wk.element(uint(CUR_OFF).add(instanceIndex)), uint(0));
+        atomicStore(wk.element(uint(CEL_OFF).add(instanceIndex)), uint(0));
+      });
+    });
   })().compute(levels * BRICKS_PER_LEVEL);
 
   // ═══════════════════════════════════════════════════ PASS: dirtyList (count)
@@ -1477,6 +1524,9 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
           const j = t0.add(uint(inner[triName])).toVar();
           If(j.greaterThanEqual(t1), () => { Break(); });
           const t = cellTris.element(start.add(j)).toVar();
+          // §19 6.34 — a masked placement is skipped in BOTH walk modes, so the
+          // count and the write enumerate the same pairs.
+          if (triOwner) { If(triExcluded(t), () => { Continue(); }); }
           const p = readTri(t);
           const tlo = p[0].min(p[1]).min(p[2]).toVar();
           const thi = p[0].max(p[1]).max(p[2]).toVar();
@@ -2089,6 +2139,18 @@ export function createWindowVoxelizer(win, soup, tier = win.tier, opts = {}) {
 
     /** Every brick of every static level becomes DIRTY. Scene load / edit. */
     markAllDirty: () => markAllDirtyPass,
+    /**
+     * §19 6.34 — the bricks touching world AABB [min, max] become DIRTY. One
+     * box per dispatch (the bounds are a uniform pair); the caller queues.
+     */
+    markBoxDirty: (min, max) => {
+      boxMinU.value.set(min[0], min[1], min[2]);
+      boxMaxU.value.set(max[0], max[1], max[2]);
+      return markBoxDirtyPass;
+    },
+    /** §19 6.34 — re-upload the caller-owned exclusion mask after it changed. */
+    refreshExclusion: () => mintExcl(),
+    get exclusionSupported() { return !!triOwner; },
 
     /**
      * The frame's compute nodes, in order. The caller dispatches them itself

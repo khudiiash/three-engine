@@ -664,6 +664,82 @@ export function createGi2System({
   let rcHold = false;
   let rcHoldStart = -1;
   let pendingMarkAll = false;
+  // ── §19 6.34 — THE PER-PLACEMENT EXCLUSION MASK, owned here so it outlives
+  // every voxelizer generation and every BVH fill. 1024 placement slots; a set
+  // bit hides the slot from the static voxelizer AND the exact-shadow tree.
+  const staticExcl = new Uint32Array(32);
+  /** World AABBs whose bricks must re-voxelize; one per frame, in order. */
+  const pendingBoxes = [];
+  let dirtyBoxes = 0;
+  const exclSet = (slot, on) => {
+    if (!(slot >= 0 && slot < 1024)) return false;
+    const w = slot >> 5, bit = 1 << (slot & 31);
+    const was = (staticExcl[w] & bit) !== 0;
+    if (was === !!on) return false;
+    if (on) staticExcl[w] |= bit; else staticExcl[w] &= ~bit;
+    return true;
+  };
+  /** Pushes the master mask into the tree (its own copy) and the live voxelizer. */
+  const syncExclusion = () => {
+    if (shadowBvh?.setExcluded) {
+      for (let slot = 0; slot < 1024; slot++) shadowBvh.setExcluded(slot, (staticExcl[slot >> 5] & (1 << (slot & 31))) !== 0);
+    }
+    voxelizer?.refreshExclusion?.();
+  };
+  // ── §19 6.34b — SETTLED-MOVER SEGMENTS ───────────────────────────────────
+  // A promoted mover that came to rest at a NEW pose needs its triangles back
+  // in the exact-shadow tree; the soup is never re-run for it. Its world-space
+  // triangles are appended to a small segment under a fresh owner slot (from
+  // 1023 down — the real placements count up from 0), the tree is rebuilt
+  // OFF-THREAD over soup + segments, and `fill` swaps it in. Until it lands,
+  // the mask keeps the old copy hidden and the dynamic layer carries the box.
+  const settled = { segs: [], tris: 0, base: null, gen: 0 };
+  let settledSlotNext = 1023;
+  const settledOwnerOf = (tri, base) => (base.triOwner[tri >> 1] >>> ((tri & 1) * 16)) & 0xffff;
+  const kickSettledBvh = () => {
+    const base = settled.base;
+    if (!shadowBvh || !base || !settled.segs.length || tier === "phone") return Promise.resolve(-1);
+    const total = base.triCount + settled.tris;
+    if (total > rc5BvhShadowMaxTris()) return Promise.resolve(-1);
+    const combined = new Float32Array(total * 9);
+    combined.set(base.tris.subarray(0, base.triCount * 9), 0);
+    const owners = new Uint32Array((total + 1) >> 1);
+    const putOwner = (t, ow) => { owners[t >> 1] |= (ow & 0xffff) << ((t & 1) * 16); };
+    if (base.triOwner) for (let t = 0; t < base.triCount; t++) putOwner(t, settledOwnerOf(t, base));
+    let at = base.triCount;
+    for (const seg of settled.segs) {
+      combined.set(seg.tris.subarray(0, seg.triCount * 9), at * 9);
+      for (let t = 0; t < seg.triCount; t++) putOwner(at + t, seg.slot);
+      at += seg.triCount;
+    }
+    const builder = (store.bvhBuilder ??= createShadowBvhBuilder());
+    const gen = ++settled.gen;
+    const t0 = performance.now();
+    const trisAttr = new THREE.StorageBufferAttribute(combined, 1); trisAttr.version++;
+    const ownersAttr = new THREE.StorageBufferAttribute(owners, 1); ownersAttr.version++;
+    const last = settled.segs[settled.segs.length - 1];
+    return builder.build({ tris: combined.slice(), triCount: total })
+      .then((bvh) => {
+        if (disposed || gen !== settled.gen || settled.base !== store.soup) return -1;
+        if (!shadowBvh.fill(bvh, trisAttr, ownersAttr)) return -1;
+        counters.settledSegments = settled.segs.length;
+        counters.settledTris = settled.tris;
+        console.log(`[gi2] settled mover: exact-shadow tree rebuilt off-thread over soup + ${settled.segs.length} segment(s) ` +
+          `(${total} tris, ${Math.round(performance.now() - t0)} ms wall; no soup run) — slot ${last.slot} live`);
+        return last.slot;
+      })
+      .catch((err) => { console.warn(`[gi2] settled segment tree: ${err?.message ?? err}`); return -1; });
+  };
+  /** Appends one settled placement (world-space tris) and re-kicks the tree. Resolves to its slot, or -1. */
+  const appendSettledSegment = (tris, triCount) => {
+    if (!store.soup || !shadowBvh || !(triCount > 0)) return Promise.resolve(-1);
+    if (settled.base !== store.soup) { settled.segs.length = 0; settled.tris = 0; settled.base = store.soup; }
+    if (settledSlotNext < 512) return Promise.resolve(-1);
+    const slot = settledSlotNext--;
+    settled.segs.push({ tris, triCount, slot });
+    settled.tris += triCount;
+    return kickSettledBvh();
+  };
   let lastVoxFrame = -1;
   let carriedBuilds = 0;
   const RC_HOLD_MAX_FRAMES = 600;
@@ -1129,8 +1205,14 @@ export function createGi2System({
   // built off-thread, and the voxelizer + dynamic layer are created when it
   // lands. Until then `passes()` returns the gather chain alone — which reads
   // an empty window and resolves black, exactly as a first frame should.
-  const build = async ({ geometries, placements, movers = [], soupKey = null } = {}) => {
+  const build = async ({ geometries, placements, movers = [], soupKey = null, excludedSlots = null } = {}) => {
     marks.build = performance.now();
+    // §19 6.34 — the caller names the placements this build must hide (the
+    // promoted "auto" movers, which STAY in the soup so the soup key holds).
+    if (excludedSlots) {
+      staticExcl.fill(0);
+      for (const slot of excludedSlots) exclSet(slot, true);
+    }
     gi2Stage("gi2Build");
     // §19 6.29 — a CARRY when a transport is already live: the old one keeps
     // serving the frames the soup build takes; nothing here goes black.
@@ -1275,8 +1357,16 @@ export function createGi2System({
     // every frame). Same array (the soup key held) keeps the tree; a new soup
     // resets it, so `kickShadowBvh` below builds one for this order.
     store.bvhSlot?.retarget(soup.tris?.value, soup.triOwner?.value);
-    kickShadowBvh(built);
-    voxelizer = createWindowVoxelizer(win, soup, tier);
+    if (settled.segs.length && settled.base === built) {
+      // §19 6.34b — the soup held; the settled segments are still the truth.
+      kickSettledBvh();
+    } else {
+      settled.segs.length = 0; settled.tris = 0; settled.base = null;
+      kickShadowBvh(built);
+    }
+    voxelizer = createWindowVoxelizer(win, soup, tier, { exclusion: staticExcl });
+    // A retarget onto a NEW soup zeroed the tree's own mask: re-push the master.
+    syncExclusion();
     dynamic = createWindowDynamic(win, voxelizer, tier);
     stampVoxNames();
     setMovers(movers);
@@ -1662,6 +1752,12 @@ export function createGi2System({
       if (pendingMarkAll) {
         before.push(voxelizer.markAllDirty());
         pendingMarkAll = false;
+        pendingBoxes.length = 0;
+      } else if (pendingBoxes.length) {
+        // §19 6.34 — one placement footprint per frame (the bounds are a uniform pair).
+        const bx = pendingBoxes.shift();
+        before.push(voxelizer.markBoxDirty(bx.min, bx.max));
+        dirtyBoxes++;
       }
       before.push(...voxelizer.passes(camPos, null));
       before.push(cache.allocPass);
@@ -2104,6 +2200,10 @@ export function createGi2System({
   const ext = { mobility: null };
   const snapshot = () => ({
     carriedBuilds,
+    settledSegments: settled.segs.length,
+    settledTris: settled.tris,
+    staticExcluded: (() => { let n = 0; for (let i = 0; i < 32; i++) { let v = staticExcl[i] >>> 0; while (v) { v &= v - 1; n++; } } return n; })(),
+    dirtyBoxes,
     rcHold,
     tier,
     mobility: ext.mobility?.counts() ?? null,
@@ -2223,8 +2323,25 @@ export function createGi2System({
     },
     get carriedBuilds() { return carriedBuilds; },
     get rcHold() { return rcHold; },
-    /** §19 6.21 — drop/restore a static placement slot in the exact-shadow tree. */
-    setStaticExcluded: (slot, on) => shadowBvh?.setExcluded?.(slot, on) ?? false,
+    /**
+     * §19 6.21/6.34 — drop/restore a static placement slot in the exact-shadow
+     * tree AND the static voxelizer (the bricks the placement touches must be
+     * re-voxelized to see it: `dirtyBox`). Returns true when the bit changed.
+     */
+    setStaticExcluded: (slot, on) => {
+      if (!exclSet(slot, on)) return false;
+      shadowBvh?.setExcluded?.(slot, on);
+      voxelizer?.refreshExclusion?.();
+      return true;
+    },
+    /** §19 6.34 — re-voxelize the static bricks a world AABB touches (queued, one per frame). */
+    dirtyBox: (min, max) => {
+      if (!voxelizer?.exclusionSupported) { pendingMarkAll = !!voxelizer; return; }
+      pendingBoxes.push({ min: [min[0], min[1], min[2]], max: [max[0], max[1], max[2]] });
+    },
+    appendSettledSegment,
+    get staticExcludedCount() { let n = 0; for (let i = 0; i < 32; i++) { let v = staticExcl[i] >>> 0; while (v) { v &= v - 1; n++; } } return n; },
+    get dirtyBoxes() { return dirtyBoxes; },
     get bvhExcludedCount() { return shadowBvh?.excludedCount ?? 0; },
     /** §19 6.22: `gi2.mobility.isDynamicNow(mesh)` / `.stateOf(mesh)` — the one classification every consumer reads. */
     setMobility(m) { ext.mobility = m; },
