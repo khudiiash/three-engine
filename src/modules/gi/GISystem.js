@@ -3976,7 +3976,15 @@ export class GISystem {
           // it consumes the converging probe field, so it keeps its own
           // cadence (see the frame queue).
           // `__giReflectHold = false` restores the unconditional trace.
-          const reflectHeld = this._gbufHeld === true && globalThis.__giReflectHold !== false;
+          // §19 6.11: HELD ONLY AFTER IT HAS TRACED ONCE. The pass is created
+          // at #rebuild, inside the compile wave, and does not dispatch until
+          // the wave ends; the frame the mask turns on is the one unheld
+          // frame, and a deferred first build on THAT frame left a target of
+          // zeros held forever on a parked camera (probe:gi-reflect-black on
+          // Cornel: hitPct 100 at t = 0, albedo 0 % — the texture's clear
+          // value, never a trace). A hold is only valid over a real trace.
+          const reflectHeld = this._gbufHeld === true && globalThis.__giReflectHold !== false &&
+            state.screen.bvhReflect.tracedOnce === true;
           if (reflectHeld) {
             this._bvhReflectHeldFrames = (this._bvhReflectHeldFrames ?? 0) + 1;
           } else {
@@ -3987,7 +3995,9 @@ export class GISystem {
             // already costs it. Not during the compile wave — this is the
             // 51–132 s kernel; compiling it alongside materials is the 30 s init.
             if (!this._compileWaveActive) {
+              const skippedBefore = giSkippedComputes.size;
               giCompute(renderer, state.screen.bvhReflect.compute, { deferrable: true });
+              if (giSkippedComputes.size === skippedBefore) state.screen.bvhReflect.tracedOnce = true;
             }
           }
         } else {
@@ -9579,7 +9589,12 @@ export class GISystem {
     // `custom` intentionally follows the high tier via qualityTierOf().
     const quality = qualityTierOf(props);
     if (quality !== "high" && quality !== "ultra") return false;
-    if (props.exactReflections !== true) return false;
+    // §19 6.11: `exactReflections` is no longer a gate. The GI component has
+    // THREE properties (`quality`, `ao`, `reflections`) and no tuning knobs —
+    // `reflections` on at high/ultra IS the request for exact reflections. A
+    // scene that authored `exactReflections: false` explicitly still opts out
+    // (that is a stored preference, not a knob the UI exposes any more).
+    if (props.exactReflections === false) return false;
     // ── AND SOMETHING IN THE SCENE MUST ACTUALLY READ IT ────────────────────
     //
     // §13.14.6: the user's Sponza logs `bvh: exact reflections ON — DENSE
@@ -9944,7 +9959,16 @@ export class GISystem {
     // price the prepass against the window's own trace BEFORE a consumer is
     // worth wiring to it. Glossy stays the gather's oct cone until then,
     // which the boot log already says out loud.
-    if (GI2_PATH) return;
+    //
+    // §19 6.11 (2026-08-29, the user: "there are still no reflections: we had
+    // those in the previous version, those were quite good"): the return that
+    // lived here is gone. The BVH scene + `bvhReflect` prepass run under GI2
+    // again — the §17 one-BVH reflections are what the user is asking for.
+    // What stays OFF is `bvhHitShade` (it reads the old occupancy lattice,
+    // which RC5 never builds — see `inputs.bvhShade` in #buildScreenResolve),
+    // so the material consumes the prepass's raw texture-sampled albedo lit by
+    // its own irradiance (`bvhReflectShaded = false`). Cost is measured, not
+    // argued: see the §19 6.11 receipt in the plan doc.
     const light = state.light;
     // §14 R-B: reflection probes trace their captures through this same BVH,
     // and they run at EVERY tier — so probes keep the BVH built where the
@@ -10973,7 +10997,14 @@ export class GISystem {
     const tried = (tries.get(tex) ?? 0) + 1;
     tries.set(tex, tried);
     inFlight.add(tex);
-    readTexturePixelsGPU(renderer, tex, 32)
+    // 32 → 128 px (§19 6.11b, measured on Bistro): the readback samples a
+    // MIP, and a 32 px read of a 2048 px map is mip 6 — a blur whose p5 is
+    // not the map's floor. One detailed roughness map read 0.176 at 32 px and
+    // 0.016 at 256 px; the flat 512 maps read 0.737 at both. A floor that
+    // reads high pushes a material past the 0.45 sharp gate and OUT of the
+    // mirror mask — no reflection at all on a surface that has a smooth
+    // region. 128 px is 64 kB per read, still bounded by the in-flight cap.
+    readTexturePixelsGPU(renderer, tex, 128)
       .then((px) => {
         if (!px?.length) {
           // Transient (mid-upload) — retried on later scans; after enough
@@ -12445,7 +12476,9 @@ export class GISystem {
     // dispatched under GI2 either — see the tick). Building it here would
     // upload the whole scene's triangles a second time for a consumer that
     // does not run.
-    if (!GI2_PATH) this.#syncBvhScene(entries);
+    // §19 6.11: built under GI2 as well — the reflection prepass is back (see
+    // #syncBvhScene's own note); it self-gates on `#bvhReflectionsEnabled()`.
+    this.#syncBvhScene(entries);
     this._lightObjects = this.#collectLightObjects();
     this.#updateLightUniforms();
     this._structuralSig = this.#structuralSignature(component);
@@ -18325,8 +18358,8 @@ export class GISystem {
           `[gi2] window ${gi2.win.levels}×64³ @ ${gi2.win.voxel0} m (${gi2.win.describe().totalMB} MB) + ` +
           `cache ${gi2.cache.describe().totalMB} MB, tier ${gi2.tier}, ` +
           `${movers.length} movers — voxelizer live ${Math.round(performance.now() - this._gi2BuildAt)} ms after the build. ` +
-          "⚠ the MIRROR TIER (bvhHitShade / bvhReflect / the reflection-probe capture) is NOT dispatched on this " +
-          "path and comes back as its own unit — glossy is the gather's oct cone until then.",
+          "§19 6.11: the exact-reflection prepass (bvhReflect, albedo-only) runs under GI2 when `reflections` is on " +
+          "at high/ultra and a mirror-bucket material reads it (see `[gi] bvh:` below); bvhHitShade stays retired.",
         );
         // §19 6.3 — the voxelizer and the cascades exist only now, and their
         // kernels are the ones whose first dispatch was the 1.4-2.2 s frames.

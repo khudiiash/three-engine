@@ -32,9 +32,6 @@ const browser = await puppeteer.launch({
 const page = await browser.newPage();
 await page.setViewport({ width: 1650, height: 970, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
-await page.evaluateOnNewDocument((flags) => {
-  for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
-}, JSON.parse(process.env.EXTRA ?? "{}"));
 await page.evaluateOnNewDocument((rc5, project) => {
   if (rc5) globalThis.__gi2Rc5 = true;
   globalThis.__editorKeepRendering = true;
@@ -70,13 +67,27 @@ if (POSE) {
   await page.evaluate(async (p) => globalThis.__editorApi.call("viewport.setCamera", { position: p[0], target: p[1] }), POSE);
 }
 await wait(SETTLE * 1000);
-const shot = await page.evaluate(async (w, h) => {
-  const r = await globalThis.__editorApi.viewport.screenshot({ width: w, height: h, includeGizmos: false });
-  return typeof r === "string" ? r : (r?.__image ?? r?.png ?? r?.dataUrl ?? r?.image ?? JSON.stringify(Object.keys(r ?? {})));
-}, W, H);
-const raw = typeof shot === "string" ? shot : (shot?.data ?? shot?.base64 ?? JSON.stringify(shot).slice(0, 200));
-const b64 = String(raw).replace(/^data:image\/png;base64,/, "");
-if (!/^[A-Za-z0-9+/=]+$/.test(b64) || b64.length < 1000) { console.log(`FATAL screenshot payload: ${String(shot).slice(0, 120)}`); await browser.close(); process.exit(1); }
-writeFileSync(OUT, Buffer.from(b64, "base64"));
-console.log(`wrote ${OUT} (${W}x${H})`);
+const R = await page.evaluate(async () => {
+  const { ensureEngine } = await import("/src/editor/engineInstance.js");
+  const { giRoughnessBucketOf, giRoughnessSourceOf, giRoughnessFloorStats, giReflectTierInfoOf } = await import("/src/modules/gi/giLight.js");
+  const engine = await ensureEngine();
+  const sys = engine.modules?.get?.("gi")?.system;
+  const census = sys.reflectTierCensus();
+  const tally = sys._bucketTally;
+  const rows = []; const seen = new Set(); const byBucket = {};
+  engine.scene.traverse((o) => {
+    if (!o.isMesh) return;
+    const list = Array.isArray(o.material) ? o.material : [o.material];
+    for (const m of list) {
+      if (!m || seen.has(m)) continue; seen.add(m);
+      const b = giRoughnessBucketOf(m);
+      byBucket[b] = (byBucket[b] ?? 0) + 1;
+      const src = giRoughnessSourceOf(m);
+      const st = src?.tex ? giRoughnessFloorStats.get(src.tex) : undefined;
+      if (rows.length < 40) rows.push({ name: (m.name||"").slice(0,28), proxy: !!o.userData?.mergeProxy, type: m.type, b, rough: m.roughness, metal: m.metalness, rMap: !!m.roughnessMap, rNode: !!m.roughnessNode, srcTex: !!src?.tex, ch: src?.channel, factor: src?.factor, stat: st === undefined ? null : (typeof st === "number" ? st : JSON.stringify(st)), tier: giReflectTierInfoOf(m).tier, floorClassify: globalThis.__giRoughnessFloorClassify });
+    }
+  });
+  return { census, tally, byBucket, uniqueMaterials: seen.size, rows };
+});
+console.log(JSON.stringify(R, null, 1));
 await browser.close();
