@@ -3323,9 +3323,33 @@ export class GISystem {
         // and a partially-dispatched chain is already what a boot with
         // uncompiled pipelines produces. Its 44 kernels are the largest single
         // block of first-build work in the tick.
-        giCompute(renderer, state.screen.srcProbes.passes, { deferrable: true });
+        //
+        // …EXCEPT WHILE THE COMPILE WAVE OWNS THE FRAMES (the one scheduling
+        // change gi §19 4.3a measured that survives the return to this path —
+        // the mechanism around it did not). `deferrable` trades a frame of
+        // this chain's freshness for a shorter frame: an unbuilt node whose
+        // graph build would blow the per-frame budget is registered in
+        // `giSkippedComputes` and retried NEXT FRAME. That is the right trade
+        // at 60 fps, where "next frame" is 16 ms. It is the wrong one during
+        // the material wave, where a frame is a macrotask handed back roughly
+        // once a SECOND — a chain that needs three frames' worth of budget
+        // takes three seconds, and every one of them is on the critical path
+        // to first light. The budget's unit is "a frame", and a frame is only
+        // cheap when somebody is rendering them: during the wave the main
+        // thread is already saturated by the material graph walks, so folding
+        // the gather's ~50 ms of TSL build into one of the wave's own
+        // macrotasks costs a frame nobody was going to see and buys the whole
+        // chain. The wave is bounded and rare, so this cannot become the
+        // permanent freeze the budget exists to prevent.
+        // `__giGatherDeferInWave` is the A/B hatch (R12: the hatch is a flag).
+        giCompute(renderer, state.screen.srcProbes.passes, {
+          deferrable: !this._compileWaveActive || globalThis.__giGatherDeferInWave === true,
+        });
         this.#maybeLogSrcProbeStats(renderer, state);
       }
+      // GPU-only buffers whose first dispatch has landed give up their dead JS
+      // twin here. Cheap and self-emptying — see #drainCpuMirrors.
+      this.#drainCpuMirrors(renderer);
       // BVH exact-reflection prepass: dispatched right after the gbuffer,
       // EVERY frame it's enabled — independent of the atlas-revision
       // composite gating above/below (that gating is about the SDF field
@@ -15746,7 +15770,11 @@ export class GISystem {
       // fit actually succeeded, so a rig with no skeleton, or the kill switch,
       // still gets the old representation rather than nothing.
       if (mesh.isSkinnedMesh && this.#skinnedGroupOf(mesh)) continue;
-      const record = serializeMeshForBake(mesh);
+      // Geometry only: this pack reads positions/index/uvs (the placement
+      // carries the matrix), and `#buildEntries` resolves every placed mesh's
+      // surface for the atlas + texture averages — walking it again here was
+      // 1,531 needless shader-graph walks on Bistro's boot frame.
+      const record = serializeMeshForBake(mesh, { geometryOnly: true });
       if (!record) continue;
       if (!seen.has(record.geometryKey)) {
         seen.add(record.geometryKey);
@@ -16511,7 +16539,9 @@ export class GISystem {
     for (const p of field.placements) {
       if (p._giAnalytic) continue;
       if (this._dynAdoptedKeys?.has(slotKeyOf(p.mesh, p.instanceId))) continue;
-      const record = serializeMeshForBake(p.mesh);
+      // Geometry only: the BVH pack reads positions/index/uvs and takes the
+      // matrix from the placement (`p.matrix`); it never reads a surface.
+      const record = serializeMeshForBake(p.mesh, { geometryOnly: true });
       if (!record) continue;
       items.push({ positions: record.positions, index: record.index, uvs: record.uvs, matrix: p.matrix, slot: p.slot });
     }
