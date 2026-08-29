@@ -571,7 +571,9 @@ export function sceneSkyRadiance(scene, out) {
 }
 
 // The cached mean radiance of an environment texture, or null when its pixels
-// cannot be read on the CPU. WeakMap so a swapped sky cannot leak.
+// cannot be read on the CPU. WeakMap so a swapped sky cannot leak; the entry
+// carries the texture `version` it was averaged at, so a re-uploaded HDRI
+// (`needsUpdate` bumps version) is re-averaged instead of served stale.
 const skyMeanCache = new WeakMap();
 // IEEE-754 binary16 → float, inlined: HDRIs arrive as HalfFloatType DataTextures
 // and giConfig has no THREE import to reach DataUtils through.
@@ -584,7 +586,8 @@ const halfToFloat = (h) => {
   return (s ? -1 : 1) * (1 + m / 1024) * Math.pow(2, e - 15);
 };
 function environmentMeanRadiance(texture) {
-  if (skyMeanCache.has(texture)) return skyMeanCache.get(texture);
+  const cached = skyMeanCache.get(texture);
+  if (cached && cached.version === texture.version) return cached.rgb;
   let rgb = null;
   try {
     // DataTexture path FIRST (Bistro's HDRI is one): `image` is
@@ -610,7 +613,7 @@ function environmentMeanRadiance(texture) {
       // An HDRI is already LINEAR — no sRGB decode here, unlike the LDR
       // canvas path below.
       if (n > 0) rgb = [r / n, g / n, b / n];
-      skyMeanCache.set(texture, rgb);
+      skyMeanCache.set(texture, { version: texture.version, rgb });
       return rgb;
     }
     const faces = Array.isArray(texture.image) ? texture.image : [texture.image];
@@ -639,7 +642,7 @@ function environmentMeanRadiance(texture) {
   } catch {
     // Undrawable (GPU-only target) or tainted — keep the neutral fallback.
   }
-  skyMeanCache.set(texture, rgb);
+  skyMeanCache.set(texture, { version: texture.version, rgb });
   return rgb;
 }
 
