@@ -63,8 +63,8 @@
 // resolve's own cosine convolution supplies the `cosθ`. No new constant.
 import * as THREE from "three/webgpu";
 import {
-  Fn, If, Return, dot, float, globalId, instancedArray, int, ivec2, normalize, select, smoothstep,
-  sqrt, texture, textureStore, uint, vec3, vec4,
+  Fn, If, Return, dot, exp, float, globalId, instancedArray, int, ivec2, normalize, select, smoothstep,
+  mix, sqrt, texture, textureStore, uint, vec3, vec4,
 } from "three/tsl";
 import { createSrcWorld } from "../srcVolume.js";
 import {
@@ -1015,26 +1015,57 @@ export function createGi2System({
       const baseY = lowY.floor().toVar();
       const fx = lowX.sub(baseX).toVar();
       const fy = lowY.sub(baseY).toVar();
+      // ── §19 6.13b — A 3x3 JOINT BILATERAL THAT NEVER FALLS BACK TO 1 ────
+      //
+      // The 2x2 bilinear-weighted upsample was the LARGEST grain source in
+      // foliage (oracle: |composed − nearest half-res texel| p90 10.6 % on
+      // Bistro's trees, against 3.3 % of estimator variance): leaf normals
+      // fail the `smoothstep(0.7, 0.95)` test against all four taps, the
+      // weight sum starves, and the kernel wrote `factor = 1` — a bright speck
+      // among dark leaves, one full-res pixel at a time. Now: nine taps around
+      // the nearest low-res texel, spatially Gaussian in low-res units, gated
+      // by the same normal/depth agreement; and when the JOINT weights starve,
+      // the fallback is the SPATIAL-ONLY mean of the same nine texels — a
+      // low-res AO value is always closer to the truth than "unoccluded".
       const value = float(0).toVar();
       const weight = float(0).toVar();
+      const valueS = float(0).toVar();
+      const weightS = float(0).toVar();
+      const nearX = lowX.add(0.5).floor().toVar();
+      const nearY = lowY.add(0.5).floor().toVar();
       const tap = (dx, dy) => {
-        const bl = (dx === 0 ? fx.oneMinus() : fx).mul(dy === 0 ? fy.oneMinus() : fy);
-        const lx = baseX.add(dx).toInt().clamp(int(0), int(aoW - 1)).toVar();
-        const ly = baseY.add(dy).toInt().clamp(int(0), int(aoH - 1)).toVar();
+        const lx = nearX.add(dx).toInt().clamp(int(0), int(aoW - 1)).toVar();
+        const ly = nearY.add(dy).toInt().clamp(int(0), int(aoH - 1)).toVar();
+        const ddx = lx.toFloat().sub(lowX);
+        const ddy = ly.toFloat().sub(lowY);
+        // σ = 0.6 low-res texels: the nearest texel dominates, its ring
+        // contributes, the corners barely — a bilinear-shaped footprint that
+        // stays continuous under camera motion (no 2x2 cell seams).
+        const spatial = exp(ddx.mul(ddx).add(ddy.mul(ddy)).mul(-1 / (2 * 0.6 * 0.6)));
         const gxi = lx.toFloat().add(0.5).mul(toFullX).toInt().clamp(int(0), int(width - 1));
         const gyi = ly.toFloat().add(0.5).mul(toFullY).toInt().clamp(int(0), int(height - 1));
         const tapP = posNode.load(ivec2(gxi, gyi)).toVar();
         const tapN = normalize(nrmNode.load(ivec2(gxi, gyi)).xyz).toVar();
         const sameNormal = smoothstep(0.7, 0.95, dot(tapN, N).abs());
         const sameDepth = float(1).sub(smoothstep(0.12, 0.75, dot(N, tapP.xyz.sub(P)).abs()));
-        const w = select(tapP.w.greaterThan(0.5), sameNormal.mul(sameDepth), float(0)).mul(bl).toVar();
-        value.addAssign(aoNode.load(ivec2(lx, ly)).x.mul(w));
+        const valid = select(tapP.w.greaterThan(0.5), float(1), float(0));
+        const a = aoNode.load(ivec2(lx, ly)).x.toVar();
+        const w = valid.mul(sameNormal).mul(sameDepth).mul(spatial).toVar();
+        const ws = valid.mul(spatial).toVar();
+        value.addAssign(a.mul(w));
         weight.addAssign(w);
+        valueS.addAssign(a.mul(ws));
+        weightS.addAssign(ws);
       };
-      tap(0, 0); tap(1, 0); tap(0, 1); tap(1, 1);
-      // A disocclusion has no trustworthy low-res neighbour; unoccluded beats
-      // importing a wall's dark factor across the silhouette for a frame.
-      const factor = select(weight.greaterThan(1e-4), value.div(weight.max(1e-4)), float(1)).toVar();
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) tap(dx, dy);
+      // Joint weights below ~5 % of a flat surface's sum = starved: blend
+      // toward the spatial-only mean rather than jumping to it, so the
+      // transition is continuous. Only nine sky texels leave 1.
+      const flatSum = float(1 + 4 * Math.exp(-1 / (2 * 0.36)) + 4 * Math.exp(-2 / (2 * 0.36)));
+      const trust = weight.div(flatSum.mul(0.05)).clamp(0, 1).toVar();
+      const joint = value.div(weight.max(1e-5));
+      const spatialMean = valueS.div(weightS.max(1e-5));
+      const factor = select(weightS.greaterThan(1e-4), mix(spatialMean, joint, trust), float(1)).toVar();
       const c = irrNode.load(coord).toVar();
       textureStore(aoOut, coord, vec4(c.xyz.mul(factor), c.w));
     })().compute([Math.ceil(width / 8), Math.ceil(height / 8)], [8, 8, 1]);
