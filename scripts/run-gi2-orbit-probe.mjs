@@ -29,7 +29,7 @@ const POSE = (process.env.POSE ?? "1.6,2.3,2.1|-0.6,2.0,-2.5").split("|").map((s
 // Cornel.scene: parent at (0.38, 0.24, 0); Red wall plane x = -2.5+0.38, thickness 0.1 → inner face x ≈ -2.07.
 const RED_X = -2.5 + 0.3816651532689147 + 0.05;
 const Y0 = 0.24055190797330517;
-const CENTRE = [0.38, Y0 + 2.5, 0];
+const CENTRE = process.env.CENTRE ? process.env.CENTRE.split(",").map(Number) : (SCENE === "Cornel" ? [0.38, Y0 + 2.5, 0] : POSE[1]);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const browser = await puppeteer.launch({
@@ -85,6 +85,148 @@ await page.evaluate(async ({ p, t }) => {
   if (vh.orbit) { vh.orbit.target.set(t[0], t[1], t[2]); vh.orbit.update(); } else vh.camera.lookAt(t[0], t[1], t[2]);
 }, { p: POSE[0], t: POSE[1] });
 await wait(SETTLE * 1000);
+
+// ── FLASH=1 — §19 6.16: the PERIODIC FLASH instrument. One composed frame per
+// orbit step (`viewport.screenshot`, sRGB-decoded), scored as the MEAN
+// LUMINANCE over the whole frame, the red wall, the ceiling band and the floor
+// band, each tagged with the GI2 frame index it was composed from (so a step's
+// cadence phase — `cascadeDue(frame)` — is on the row). A step whose mean moves
+// > 10 % against the previous step is FLAGGED and the flagged steps are binned
+// by cadence phase: a flash that lands on every 2nd/4th/8th frame names the
+// cadence; one with no phase names something else.
+if (process.env.FLASH) {
+  const SW = Number(process.env.SW ?? 480), SH = Number(process.env.SH ?? 280);
+  const r = await page.evaluate(async ({ REST, ORBIT, AFTER, DEG, POSE, CENTRE, SW, SH }) => {
+    const viewport = globalThis.__giViewport;
+    const eye0 = POSE[0]; const tgt = POSE[1];
+    const rx = eye0[0] - CENTRE[0]; const rz = eye0[2] - CENTRE[2];
+    const setCam = (ang) => {
+      const c = Math.cos(ang); const s = Math.sin(ang);
+      const x = CENTRE[0] + rx * c - rz * s; const z = CENTRE[2] + rx * s + rz * c;
+      const tx = CENTRE[0] + (tgt[0] - CENTRE[0]) * c - (tgt[2] - CENTRE[2]) * s;
+      const tz = CENTRE[2] + (tgt[0] - CENTRE[0]) * s + (tgt[2] - CENTRE[2]) * c;
+      viewport.camera.position.set(x, eye0[1], z);
+      if (viewport.orbit) { viewport.orbit.target.set(tx, tgt[1], tz); viewport.orbit.update(); } else viewport.camera.lookAt(tx, tgt[1], tz);
+    };
+    const raf = () => new Promise((res) => requestAnimationFrame(() => res()));
+    const cv = document.createElement("canvas"); cv.width = SW; cv.height = SH;
+    const ctx = cv.getContext("2d", { willReadFrequently: true });
+    const lin = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+    const LUT = new Float32Array(256); for (let i = 0; i < 256; i++) LUT[i] = lin(i);
+    const grab = async () => {
+      const r = await globalThis.__editorApi.viewport.screenshot({ width: SW, height: SH, includeGizmos: false });
+      const raw0 = typeof r === "string" ? r : (r?.__image ?? r?.png ?? r?.dataUrl ?? r?.image ?? r?.data ?? r?.base64);
+      const raw1 = typeof raw0 === "string" ? raw0 : (raw0?.data ?? raw0?.base64 ?? String(raw0));
+      const url = raw1.startsWith("data:") ? raw1 : "data:image/png;base64," + raw1;
+      const img = new Image(); img.src = url; await img.decode();
+      ctx.drawImage(img, 0, 0); return ctx.getImageData(0, 0, SW, SH).data;
+    };
+    const total = REST + ORBIT + AFTER;
+    const angAt = (i) => i < REST ? 0 : i < REST + ORBIT ? ((i - REST + 1) / ORBIT) * DEG * Math.PI / 180 : DEG * Math.PI / 180;
+    const phaseAt = (i) => i < REST ? "rest" : i < REST + ORBIT ? "orbit" : "after";
+    // ⚠ PER FRAME, NOT PER SETTLE. The camera moves on EVERY animation frame
+    // and the composed frame is captured on every animation frame, un-awaited
+    // (the render is synchronous; only the readback is deferred), so a step is
+    // one engine frame and the cadence phase on the row is the phase of the
+    // frame the user would have seen. The first instrument awaited each
+    // screenshot and let ~7 frames pass per step — a slow orbit that every
+    // cascade re-traces between steps, which is why it saw nothing.
+    const pending = [];
+    await new Promise((done) => {
+      let i = 0;
+      setCam(angAt(0));
+      const tick = () => {
+        const frame = globalThis.__giSys()?._gi2Frame ?? -1;
+        // §19 6.16 receipts on the same row: the window scroll counter, the
+        // rc anchor-jump counter, and the live probe population (one
+        // un-awaited readback per frame — the age pass's counters).
+        const g2 = globalThis.__gi2?.();
+        const scrolls = g2?.snapshot?.()?.scrolls ?? -1;
+        const jumps = g2?.rc?.anchorJumps?.() ?? -1;
+        const renderer = globalThis.__giEngineForProbe?.renderer;
+        const probes = (g2?.rc?.readProbeStats && renderer)
+          ? g2.rc.readProbeStats(renderer).then((rows) => ({ live: rows.reduce((a, r) => a + r.live, 0), rekeyed: rows.reduce((a, r) => a + (r.rekeyed ?? 0), 0), fresh: rows.reduce((a, r) => a + r.fresh, 0) })).catch(() => null)
+          : Promise.resolve(null);
+        pending.push({ i, phase: phaseAt(i), frame, scrolls, jumps, probes, ang: +(angAt(i) * 180 / Math.PI).toFixed(2), p: grab() });
+        i++;
+        if (i >= total) { done(); return; }
+        setCam(angAt(i));
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+    const steps = []; let prevL = null;
+    for (const st of pending) {
+      const d = await st.p; const pr = await st.probes;
+      const Lcur = new Float32Array(SW * SH); let nMove = 0, nBig = 0, nLamp = 0;
+      let sAll = 0, nAll = 0, sRed = 0, nRed = 0, sCeil = 0, nCeil = 0, sFloor = 0, nFloor = 0, nBlack = 0;
+      for (let y = 0; y < SH; y++) for (let x = 0; x < SW; x++) {
+        const i0 = (y * SW + x) * 4; const R = LUT[d[i0]], G = LUT[d[i0 + 1]], B = LUT[d[i0 + 2]];
+        const L = 0.2126 * R + 0.7152 * G + 0.0722 * B;
+        sAll += L; nAll++; if (L < 0.002) nBlack++;
+        if (d[i0] >= 250 && d[i0 + 1] >= 250 && d[i0 + 2] >= 250) nLamp++;
+        Lcur[y * SW + x] = L;
+        if (prevL) { const Lp = prevL[y * SW + x]; const m = Math.max(L, Lp); if (m > 0.01) { const rr = Math.abs(L - Lp) / m; if (rr > 0.5) nBig++; if (rr > 0.2) nMove++; } }
+        const red = R > 0.02 && R > 3 * G && R > 3 * B;
+        const grn = G > 0.02 && G > 3 * R && G > 3 * B;
+        if (red) { sRed += L; nRed++; }
+        else if (!grn && L > 0.005) {
+          if (y < SH * 0.2) { sCeil += L; nCeil++; }
+          else if (y > SH * 0.8) { sFloor += L; nFloor++; }
+        }
+      }
+      prevL = Lcur;
+      steps.push({ i: st.i, px50: nBig / nAll, px20: nMove / nAll, lamp: nLamp / nAll, scrolls: st.scrolls, jumps: st.jumps, live: pr?.live ?? -1, rekeyed: pr?.rekeyed ?? -1, fresh: pr?.fresh ?? -1, phase: st.phase, frame: st.frame, ang: st.ang, all: sAll / Math.max(1, nAll), red: nRed ? sRed / nRed : 0, ceil: nCeil ? sCeil / nCeil : 0, floor: nFloor ? sFloor / nFloor : 0, nRed, black: nBlack / nAll });
+    }
+    return steps;
+  }, { REST, ORBIT, AFTER, DEG, POSE, CENTRE, SW, SH });
+  await browser.close();
+  const due = (f) => { let c = 0; while (c < 3 && (f % (1 << (c + 1))) === 0) c++; return c; };
+  console.log(`\n══ FLASH arm — composed-frame mean luminance per step, ${DEG}° over ${ORBIT} steps (${SW}x${SH}) — FLAGS ${process.env.FLAGS ?? "{}"} ══`);
+  const rel = (a, b) => (b > 1e-6 ? (a - b) / b : 0);
+  const q = (arr, p) => { if (!arr.length) return 0; const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+  for (const ph of ["rest", "orbit", "after"]) {
+    const rows = r.filter((x) => x.phase === ph);
+    const flagged = []; const dAll = [], dRed = [], dCeil = [], dFloor = [];
+    for (let k = 0; k < rows.length; k++) {
+      const x = rows[k]; const p = r[x.i - 1]; if (!p) continue;
+      const da = rel(x.all, p.all), dr = rel(x.red, p.red), dc = rel(x.ceil, p.ceil), df = rel(x.floor, p.floor);
+      dAll.push(Math.abs(da)); dRed.push(Math.abs(dr)); dCeil.push(Math.abs(dc)); dFloor.push(Math.abs(df));
+      if (Math.max(Math.abs(da), Math.abs(dr), Math.abs(dc), Math.abs(df)) > 0.10) flagged.push({ ...x, da, dr, dc, df, dframe: x.frame - p.frame });
+    }
+    const frames = rows.map((x) => x.frame); const dfr = frames.slice(1).map((f, k) => f - frames[k]);
+    console.log(`  ${ph.padEnd(6)} steps ${String(rows.length).padStart(3)}  frames/step median ${q(dfr, 0.5)} max ${q(dfr, 1)}  |Δ| all: p90 ${(100 * q(dAll, 0.9)).toFixed(2)} % max ${(100 * q(dAll, 1)).toFixed(2)} %  red: p90 ${(100 * q(dRed, 0.9)).toFixed(2)} % max ${(100 * q(dRed, 1)).toFixed(2)} %  ceil: p90 ${(100 * q(dCeil, 0.9)).toFixed(2)} % max ${(100 * q(dCeil, 1)).toFixed(2)} %  floor: p90 ${(100 * q(dFloor, 0.9)).toFixed(2)} % max ${(100 * q(dFloor, 1)).toFixed(2)} %  FLAGGED ${flagged.length}`);
+    if (flagged.length) {
+      const byDue = [0, 0, 0, 0]; for (const f of flagged) byDue[due(f.frame)]++;
+      console.log(`    flagged by cadence phase due(frame) c0/c1/c2/c3: ${byDue.join("/")}   (unflagged phases: ${[0, 1, 2, 3].map((c) => rows.filter((x) => due(x.frame) === c).length - byDue[c]).join("/")})`);
+      for (const f of flagged.slice(0, 24)) console.log(`    step ${String(f.i).padStart(3)} frame ${f.frame} (+${f.dframe}, due c${due(f.frame)}) ang ${f.ang}  all ${(100 * f.da).toFixed(1)} %  red ${(100 * f.dr).toFixed(1)} %  ceil ${(100 * f.dc).toFixed(1)} %  floor ${(100 * f.df).toFixed(1)} %  black ${(100 * f.black).toFixed(1)} %`);
+    }
+  }
+  const orbit = r.filter((x) => x.phase === "orbit");
+  console.log("  orbit mean-all series  : " + orbit.map((x) => x.all.toFixed(4)).join(" "));
+  console.log("  orbit Δall % series    : " + orbit.map((x) => (100 * rel(x.all, r[x.i - 1].all)).toFixed(1)).join(" "));
+  console.log("  orbit Δred % series    : " + orbit.map((x) => (100 * rel(x.red, r[x.i - 1].red)).toFixed(1)).join(" "));
+  console.log("  orbit Δceil % series   : " + orbit.map((x) => (100 * rel(x.ceil, r[x.i - 1].ceil)).toFixed(1)).join(" "));
+  console.log("  orbit Δfloor % series  : " + orbit.map((x) => (100 * rel(x.floor, r[x.i - 1].floor)).toFixed(1)).join(" "));
+  console.log("  orbit frame series     : " + orbit.map((x) => x.frame).join(" "));
+  console.log("  orbit px>50% series    : " + orbit.map((x) => (100 * x.px50).toFixed(1)).join(" "));
+  console.log("  orbit lamp px % series : " + orbit.map((x) => (100 * x.lamp).toFixed(1)).join(" "));
+  console.log("  orbit scrolls series   : " + orbit.map((x) => x.scrolls).join(" "));
+  console.log("  orbit anchorJumps      : " + orbit.map((x) => x.jumps).join(" "));
+  console.log("  orbit live probes      : " + orbit.map((x) => x.live).join(" "));
+  console.log("  orbit rekeyed series   : " + orbit.map((x) => x.rekeyed).join(" "));
+  for (let k = 1; k < r.length; k++) {
+    const x = r[k], p = r[k - 1];
+    if (x.jumps > p.jumps) console.log(`  ANCHOR JUMP at step ${x.i} (frame ${x.frame}, ${x.phase}, ang ${x.ang}): Δmean ${(100 * rel(x.all, p.all)).toFixed(1)} %  px>50 % ${(100 * x.px50).toFixed(1)} %  live ${p.live} → ${x.live} → ${r[k + 1]?.live ?? "?"}  rekeyed ${x.rekeyed}  fresh ${x.fresh}`);
+    if (x.scrolls > p.scrolls) console.log(`  window scroll at step ${x.i} (frame ${x.frame}, ${x.phase}, ang ${x.ang}): Δmean ${(100 * rel(x.all, p.all)).toFixed(1)} %  px>50 % ${(100 * x.px50).toFixed(1)} %`);
+  }
+  console.log("  orbit px>20% series    : " + orbit.map((x) => (100 * x.px20).toFixed(1)).join(" "));
+  const px50 = orbit.map((x) => x.px50);
+  console.log(`  orbit per-pixel |ΔL|>50 % fraction: median ${(100 * q(px50, 0.5)).toFixed(1)} % p90 ${(100 * q(px50, 0.9)).toFixed(1)} % max ${(100 * q(px50, 1)).toFixed(1)} %  (a full-frame flash reads ~100 %; a 1°/frame slide of smooth shading reads a few %)`);
+  if (OUT) writeFileSync(OUT, JSON.stringify(r));
+  process.exit(0);
+}
+
 
 // ── SHOT=1 — the fallback instrument: the FINAL COMPOSED FRAME per orbit step
 // via `viewport.screenshot` (decoded in-page, sRGB → linear), scored on the
