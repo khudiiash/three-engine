@@ -57,7 +57,7 @@ import { createRcMerge } from "./rcMerge.js";
 import { createRcHitShading } from "./rcHit.js";
 import { createRcEmitterDirect } from "./rcDirect.js";
 import {
-  CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0, rcHitCapacity, rcHitPathEnabled, rcIntervalCensus,
+  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, TEMPORAL_ALPHA, W0, rcHitCapacity, rcHitPathEnabled, rcIntervalCensus, rcProbeRayCap,
   rcTierSpec,
 } from "./rcConfig.js";
 
@@ -389,12 +389,25 @@ export function createRcCascades({
   // TIER's ceiling and is resolution-INDEPENDENT: a viewport resize is a
   // uniform write to `stride`/`phase`, never a rebuild.
   const threads = Math.max(1, Math.min(pixelCount, spec.rays));
+  // §19 6.19 — the per-c0-probe ray cap (`rcConfig.rcProbeRayCap`): [D1']
+  // clamps each probe's demand to it and [D5] hands out only that many pixel
+  // slices, so rays, hits and [J]'s shade count are bounded by
+  // `c0Probes × cap` regardless of how many pixels the lit scene covers.
+  const capU = uniform(rcProbeRayCap(spec), "uint");
+  // ⚠ OFF IS DECIDED AT BUILD TIME, AS "NO CAP NODE". Measured 6.19: the cap
+  // machinery with the value lifted to `PROBE_RAY_CAP_OFF` did NOT reproduce
+  // the uncapped frame (hit#0 0.60 ms inside vs 3.08 ms with no node — [D5]'s
+  // deny path under the ray floor loses claims at OFF; not chased here). So
+  // `__gi2ProbeRayCap ≤ 0` at build drops the node (the pre-6.19 ray frame,
+  // the control this shipped against); a positive value is polled per frame.
+  const capNode = rcProbeRayCap(spec) >= PROBE_RAY_CAP_OFF ? null : capU;
   const rayFrame = createSrcRayFrame(store, rayStore, {
     pixelProbe: frame.pixelProbe,
     raysPerPixel: 1,
     stride: strideU,
     phase: phaseU,
     threads,
+    cap: capNode,
   });
 
   // ⭐⭐ §19 STAGE 5.3 — THE HIT LIST IS ALLOCATED WHENEVER [J] CAN BE BUILT.
@@ -687,6 +700,8 @@ export function createRcCascades({
     const stride = Math.max(1, Math.ceil(pixelCount / threads));
     strideU.value = stride;
     phaseU.value = stride > 1 ? frameStampU.value % stride : 0;
+    // §19 6.19 — the cap is a uniform polled per frame (`__gi2ProbeRayCap`).
+    capU.value = rcProbeRayCap(spec);
     // §19 5.3c — the cadence, from the frame index and nothing else.
     cascadeDueU.value = cadenceOn ? cascadeDueAt(frameIndex) : CASCADE_COUNT - 1;
     return frameIndex;
@@ -711,6 +726,7 @@ export function createRcCascades({
     pixelCount,
     threads,
     rays: threads,
+    probeRayCap: capU.value >= PROBE_RAY_CAP_OFF ? "off" : capU.value,
     depositScale: DEPOSIT_SCALE,
     alpha: TEMPORAL_ALPHA,
     jitter: jitterOn,

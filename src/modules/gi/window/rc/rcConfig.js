@@ -22,11 +22,11 @@
 // census helpers that read the contract out of `srcConfig` so a receipt and the
 // kernels cannot disagree about where a cascade's band starts.
 import {
-  CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0, cascadeReach, intervalBoundaries, intervalLength,
+  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, TEMPORAL_ALPHA, W0, cascadeReach, intervalBoundaries, intervalLength,
   probeSpacing,
 } from "../../srcConfig.js";
 
-export { CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0 };
+export { CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, TEMPORAL_ALPHA, W0 };
 
 /**
  * The per-tier envelope.
@@ -49,10 +49,35 @@ export { CASCADE_COUNT, MAX_LODS, TEMPORAL_ALPHA, W0 };
  * c0 chain, and beyond it there is no probe and the sky answers.
  */
 export const RC_TIERS = {
-  ultra: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 1_100_000, lods: 5, lmax: 16, hitList: 600_000 },
-  high: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 900_000, lods: 5, lmax: 16, hitList: 500_000 },
-  medium: { spacing0: 0.5, c0Probes: 8192, binBudget: 350_000, rays: 450_000, lods: 4, lmax: 16, hitList: 250_000 },
-  phone: { spacing0: 1.0, c0Probes: 4096, binBudget: 175_000, rays: 200_000, lods: 3, lmax: 16, hitList: 120_000 },
+  ultra: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 1_100_000, lods: 5, lmax: 16, hitList: 600_000, probeRayCap: 16 },
+  high: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 900_000, lods: 5, lmax: 16, hitList: 500_000, probeRayCap: 16 },
+  medium: { spacing0: 0.5, c0Probes: 8192, binBudget: 350_000, rays: 450_000, lods: 4, lmax: 16, hitList: 250_000, probeRayCap: 16 },
+  phone: { spacing0: 1.0, c0Probes: 4096, binBudget: 175_000, rays: 200_000, lods: 3, lmax: 16, hitList: 120_000, probeRayCap: 16 },
+};
+
+/**
+ * ⭐⭐ §19 6.19 — THE RAY BUDGET IS PER c0 PROBE, NOT PER PIXEL.
+ *
+ * `rays` above is a DISPATCH ceiling, and every thread under it whose pixel
+ * is lit fires one ray — so the number of rays traced, the number of hits
+ * appended and (the owner, measured) the number of hit records [J] shades
+ * all grew with LIT-PIXEL COVERAGE: Cornell inside the box at 452k px shaded
+ * 3.90 ms of [J] against 0.60 ms outside, on 74 triangles. The plan's
+ * contract is a fixed budget. Algorithm 3 already carries one — the per-probe
+ * cap [D1'] that `srcSystem` shipped at 16/32 — and GI2's RC path simply
+ * never passed it. With W0 = 4 a c0 probe owns 16 bins, so 16 rays per probe
+ * per frame is one ray per bin per frame; the deposit's α = 0.1 accumulator
+ * converges on the same mean from fewer samples per frame, only later.
+ *
+ * `__gi2ProbeRayCap`: a positive number overrides the tier's cap; `0` turns it
+ * OFF (`PROBE_RAY_CAP_OFF`, the pre-6.19 per-pixel arm — the A/B this shipped
+ * against). Polled per frame by `beginFrame` (a uniform, never a rebuild).
+ */
+export const rcProbeRayCap = (spec, runtime = globalThis) => {
+  const forced = Number(runtime?.__gi2ProbeRayCap);
+  if (Number.isFinite(forced)) return forced > 0 ? Math.max(1, Math.round(forced)) : PROBE_RAY_CAP_OFF;
+  const cap = spec?.probeRayCap;
+  return Number.isFinite(cap) && cap > 0 ? Math.round(cap) : PROBE_RAY_CAP_OFF;
 };
 
 /**
