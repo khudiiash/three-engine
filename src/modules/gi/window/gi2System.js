@@ -686,6 +686,60 @@ export function createGi2System({
     }
     voxelizer?.refreshExclusion?.();
   };
+  // ── §19 6.34b — SETTLED-MOVER SEGMENTS ───────────────────────────────────
+  // A promoted mover that came to rest at a NEW pose needs its triangles back
+  // in the exact-shadow tree; the soup is never re-run for it. Its world-space
+  // triangles are appended to a small segment under a fresh owner slot (from
+  // 1023 down — the real placements count up from 0), the tree is rebuilt
+  // OFF-THREAD over soup + segments, and `fill` swaps it in. Until it lands,
+  // the mask keeps the old copy hidden and the dynamic layer carries the box.
+  const settled = { segs: [], tris: 0, base: null, gen: 0 };
+  let settledSlotNext = 1023;
+  const settledOwnerOf = (tri, base) => (base.triOwner[tri >> 1] >>> ((tri & 1) * 16)) & 0xffff;
+  const kickSettledBvh = () => {
+    const base = settled.base;
+    if (!shadowBvh || !base || !settled.segs.length || tier === "phone") return Promise.resolve(-1);
+    const total = base.triCount + settled.tris;
+    if (total > rc5BvhShadowMaxTris()) return Promise.resolve(-1);
+    const combined = new Float32Array(total * 9);
+    combined.set(base.tris.subarray(0, base.triCount * 9), 0);
+    const owners = new Uint32Array((total + 1) >> 1);
+    const putOwner = (t, ow) => { owners[t >> 1] |= (ow & 0xffff) << ((t & 1) * 16); };
+    if (base.triOwner) for (let t = 0; t < base.triCount; t++) putOwner(t, settledOwnerOf(t, base));
+    let at = base.triCount;
+    for (const seg of settled.segs) {
+      combined.set(seg.tris.subarray(0, seg.triCount * 9), at * 9);
+      for (let t = 0; t < seg.triCount; t++) putOwner(at + t, seg.slot);
+      at += seg.triCount;
+    }
+    const builder = (store.bvhBuilder ??= createShadowBvhBuilder());
+    const gen = ++settled.gen;
+    const t0 = performance.now();
+    const trisAttr = new THREE.StorageBufferAttribute(combined, 1); trisAttr.version++;
+    const ownersAttr = new THREE.StorageBufferAttribute(owners, 1); ownersAttr.version++;
+    const last = settled.segs[settled.segs.length - 1];
+    return builder.build({ tris: combined.slice(), triCount: total })
+      .then((bvh) => {
+        if (disposed || gen !== settled.gen || settled.base !== store.soup) return -1;
+        if (!shadowBvh.fill(bvh, trisAttr, ownersAttr)) return -1;
+        counters.settledSegments = settled.segs.length;
+        counters.settledTris = settled.tris;
+        console.log(`[gi2] settled mover: exact-shadow tree rebuilt off-thread over soup + ${settled.segs.length} segment(s) ` +
+          `(${total} tris, ${Math.round(performance.now() - t0)} ms wall; no soup run) — slot ${last.slot} live`);
+        return last.slot;
+      })
+      .catch((err) => { console.warn(`[gi2] settled segment tree: ${err?.message ?? err}`); return -1; });
+  };
+  /** Appends one settled placement (world-space tris) and re-kicks the tree. Resolves to its slot, or -1. */
+  const appendSettledSegment = (tris, triCount) => {
+    if (!store.soup || !shadowBvh || !(triCount > 0)) return Promise.resolve(-1);
+    if (settled.base !== store.soup) { settled.segs.length = 0; settled.tris = 0; settled.base = store.soup; }
+    if (settledSlotNext < 512) return Promise.resolve(-1);
+    const slot = settledSlotNext--;
+    settled.segs.push({ tris, triCount, slot });
+    settled.tris += triCount;
+    return kickSettledBvh();
+  };
   let lastVoxFrame = -1;
   let carriedBuilds = 0;
   const RC_HOLD_MAX_FRAMES = 600;
@@ -1303,7 +1357,13 @@ export function createGi2System({
     // every frame). Same array (the soup key held) keeps the tree; a new soup
     // resets it, so `kickShadowBvh` below builds one for this order.
     store.bvhSlot?.retarget(soup.tris?.value, soup.triOwner?.value);
-    kickShadowBvh(built);
+    if (settled.segs.length && settled.base === built) {
+      // §19 6.34b — the soup held; the settled segments are still the truth.
+      kickSettledBvh();
+    } else {
+      settled.segs.length = 0; settled.tris = 0; settled.base = null;
+      kickShadowBvh(built);
+    }
     voxelizer = createWindowVoxelizer(win, soup, tier, { exclusion: staticExcl });
     // A retarget onto a NEW soup zeroed the tree's own mask: re-push the master.
     syncExclusion();
@@ -2140,6 +2200,8 @@ export function createGi2System({
   const ext = { mobility: null };
   const snapshot = () => ({
     carriedBuilds,
+    settledSegments: settled.segs.length,
+    settledTris: settled.tris,
     staticExcluded: (() => { let n = 0; for (let i = 0; i < 32; i++) { let v = staticExcl[i] >>> 0; while (v) { v &= v - 1; n++; } } return n; })(),
     dirtyBoxes,
     rcHold,
@@ -2277,6 +2339,7 @@ export function createGi2System({
       if (!voxelizer?.exclusionSupported) { pendingMarkAll = !!voxelizer; return; }
       pendingBoxes.push({ min: [min[0], min[1], min[2]], max: [max[0], max[1], max[2]] });
     },
+    appendSettledSegment,
     get staticExcludedCount() { let n = 0; for (let i = 0; i < 32; i++) { let v = staticExcl[i] >>> 0; while (v) { v &= v - 1; n++; } } return n; },
     get dirtyBoxes() { return dirtyBoxes; },
     get bvhExcludedCount() { return shadowBvh?.excludedCount ?? 0; },

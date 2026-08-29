@@ -18500,7 +18500,7 @@ export class GISystem {
     // voxelizer and the exact-shadow tree, served by the dynamic layer, and the
     // soup key holds. Pinned "dynamic" and skinned movers are held out as before.
     const heldOut = new Set();
-    for (const mesh of moverMeshes) if (this._gi2Mobility?.stateOf(mesh) !== "promoted") heldOut.add(mesh);
+    for (const mesh of moverMeshes) if (globalThis.__gi2PromoteRebuild === true || this._gi2Mobility?.stateOf(mesh) !== "promoted") heldOut.add(mesh);
     // ── THE "auto" MOTION WATCH (§19 Stage 4.0) ──────────────────────────────
     // Every mesh that is neither pinned nor already seated, recorded at its
     // build pose. `#refreshGi2Movers` compares against this and promotes the
@@ -18537,6 +18537,7 @@ export class GISystem {
     const slotOf = new Map();
     for (const p of staticPlacements) { if (p.mesh && Number.isFinite(p.slot)) (slotOf.get(p.mesh) ?? slotOf.set(p.mesh, []).get(p.mesh)).push(p.slot); }
     this._gi2StaticSlotOf = slotOf;
+    this._gi2SettledSlotOf = null; // 6.34b — a real build re-reads every placement at its pose
     const excludedSlots = [];
     for (const mesh of moverMeshes) if (!heldOut.has(mesh)) for (const slot of slotOf.get(mesh) ?? []) excludedSlots.push(slot);
     const soupKey = `${geometries.length}:${staticPlacements.length}:${parts.join(",")}`;
@@ -18924,6 +18925,28 @@ export class GISystem {
    * watch. A mesh promoted there lands in `_gi2Promoted` and this method seats
    * it on the next re-derive.
    */
+  /** §19 6.34b — a mesh's triangles in WORLD space (9 floats/tri), or null when too big/absent. */
+  #meshWorldTris(mesh, cap = 50000) {
+    const geo = mesh?.geometry;
+    const pos = geo?.attributes?.position;
+    if (!pos) return null;
+    const idx = geo.index;
+    const n = Math.floor((idx ? idx.count : pos.count) / 3);
+    if (!(n >= 1) || n > cap) return null;
+    const out = new Float32Array(n * 9);
+    const v = (this._gi2SegV ??= new THREE.Vector3());
+    const m = mesh.matrixWorld;
+    for (let t = 0; t < n; t++) {
+      for (let k = 0; k < 3; k++) {
+        const vi = idx ? idx.getX(t * 3 + k) : t * 3 + k;
+        v.fromBufferAttribute(pos, vi).applyMatrix4(m);
+        const o = t * 9 + k * 3;
+        out[o] = v.x; out[o + 1] = v.y; out[o + 2] = v.z;
+      }
+    }
+    return { tris: out, triCount: n };
+  }
+
   #gi2Movers(meshes) {
     const out = [];
     const box = new THREE.Box3();
@@ -19110,8 +19133,36 @@ export class GISystem {
             console.log(`[gi2] mover settled: "${m.mesh.name}" returns to the static set — rebuild`);
             this.requestRebuild("gi2-mover-settled");
           } else {
-            this._gi2MoversSettled = (this._gi2MoversSettled ?? 0) + 1;
-            console.log(`[gi2] mover settled: "${m.mesh.name}" rests in the dynamic layer (6.34: no rebuild, no soup re-kick)`);
+            // §19 6.34b — THE SETTLED SEGMENT: its world-space triangles go to
+            // the exact-shadow tree (off-thread, soup + segment; the mask keeps
+            // the old copy hidden), and only when that tree is LIVE does the
+            // mover leave the dynamic layer — never a frame without a shadow.
+            const mesh = m.mesh;
+            const seg = this.#meshWorldTris(mesh);
+            const atKick = mesh.matrixWorld.clone();
+            const landing = seg ? gi2.appendSettledSegment?.(seg.tris, seg.triCount) : null;
+            if (landing) {
+              landing.then((slot) => {
+                if (this.state?.screen?.gi2 !== gi2 || !(slot >= 0)) return;
+                if (this._gi2Mobility?.stateOf(mesh) !== "promoted") return;
+                (this._gi2SettledSlotOf ??= new Map()).set(mesh, slot);
+                if (!mesh.matrixWorld.equals(atKick)) {
+                  // Moved again while the tree built: the segment is stale — hide it.
+                  gi2.setStaticExcluded?.(slot, true);
+                  return;
+                }
+                this._gi2Mobility.demote(mesh);
+                // Back on the "auto" watch at its settled pose, so a later move promotes it again.
+                (this._gi2AutoWatch ??= []).push({ mesh, matrix: atKick });
+                this._gi2SettleAsked?.delete(mesh);
+                this._gi2MoversDirty = true;
+                this._gi2MoversSettled = (this._gi2MoversSettled ?? 0) + 1;
+                console.log(`[gi2] mover settled: "${mesh.name}" returned to the static set through the settled segment (slot ${slot}; no soup run, no rebuild)`);
+              });
+            } else {
+              this._gi2MoversSettled = (this._gi2MoversSettled ?? 0) + 1;
+              console.log(`[gi2] mover settled: "${mesh.name}" rests in the dynamic layer (6.34: no rebuild, no soup re-kick)`);
+            }
           }
         }
       }
@@ -19164,6 +19215,8 @@ export class GISystem {
         // worker run, no tree rebuild, no GI rebuild.
         let masked = 0;
         for (const s of this._gi2StaticSlotOf?.get(mesh) ?? []) if (gi2.setStaticExcluded?.(s, true)) masked++;
+        // 6.34b — and its settled-segment copy, if it settled once before.
+        { const ss = this._gi2SettledSlotOf?.get(mesh); if (ss != null && gi2.setStaticExcluded?.(ss, true)) masked++; }
         if (masked && mesh.geometry?.boundingBox && gi2.dirtyBox) {
           const bx = (this._gi2DirtyBox ??= new THREE.Box3()).copy(mesh.geometry.boundingBox).applyMatrix4(w.matrix);
           const pad = gi2.win?.voxel0 ?? 0;
@@ -19176,6 +19229,8 @@ export class GISystem {
             "their static copies are masked (6.34: no soup re-kick, no rebuild).",
         );
         this._gi2MoversDirty = true;
+        // A/B arm: the pre-6.34 promotion rebuild (soup re-kick without the mover).
+        if (globalThis.__gi2PromoteRebuild === true) this.requestRebuild("gi2:mobility-promoted");
       }
     }
     if (!this._gi2MoversDirty) return;
