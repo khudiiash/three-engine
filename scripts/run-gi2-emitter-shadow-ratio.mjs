@@ -143,6 +143,7 @@ const res = await page.evaluate(async ({ WALL }) => {
   else if (WALL === "front") plane = { axis: 2, v: S.mx[2] - 0.01, n: [0, 0, -1] };
   else if (WALL === "left") plane = { axis: 0, v: S.mn[0] + 0.01, n: [1, 0, 0] };
   else if (WALL === "right") plane = { axis: 0, v: S.mx[0] - 0.01, n: [-1, 0, 0] };
+  else if (WALL === "ceiling") plane = { axis: 1, v: S.mx[1] - 0.01, n: [0, -1, 0] };
   else plane = { axis: 1, v: S.mn[1] + 0.01, n: [0, 1, 0] };
   const segHitsBox = (a, b, box) => {
     let t0 = 0, t1 = 1;

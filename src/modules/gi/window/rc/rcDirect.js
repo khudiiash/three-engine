@@ -88,8 +88,20 @@ const SLOTS = 4;
  * separably twice (H then V). Wide enough to bury the voxel lamp's aliased
  * silhouette, narrow enough that the plane test still has neighbours to reject.
  */
-const TAPS = [-3, -2, -1, 0, 1, 2, 3];
-const TAP_W = [0.05, 0.12, 0.20, 0.26, 0.20, 0.12, 0.05];
+const TAPS = [-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6];
+const TAP_W = TAPS.map((t) => Math.exp(-(t * t) / (2 * 2.4 * 2.4)));
+/**
+ * §19 6.14 — THE PENUMBRA IS A FILTER WIDTH, NOT A SAMPLE COUNT. One ray per
+ * texel, as before; what changed is that the ray reports its FIRST-HIT
+ * distance and the filter's radius is the PCSS half-width that distance
+ * implies, `lampHalf · t_occ / (d − t_occ)`, in metres at the receiver and
+ * converted to texels through the gbuffer's own footprint along each filter
+ * axis. `R_MAX` is half-res texels (24 full-res px). The 13 taps are spread
+ * over the radius, so a wide penumbra is a 13-level ramp at half res filtered
+ * twice — a monotone gradient, no steps a user can see, and no noise because
+ * nothing here is stochastic.
+ */
+const R_MAX = 12;
 
 /**
  * @param {object} o
@@ -142,6 +154,11 @@ export function createRcEmitterDirect({
   };
   const visA = mk("rcEmitterVis");
   const visB = mk("rcEmitterVisTmp");
+  /** §19 6.14 — the PCSS half-width in METRES per slot, raw then dilated (A → B → A). */
+  const penA = mk("rcEmitterPen");
+  const penB = mk("rcEmitterPenTmp");
+  const penAN = texture(penA);
+  const penBN = texture(penB);
 
   const posN = texture(gbuffer.position);
   const nrmN = texture(gbuffer.normal);
@@ -212,6 +229,7 @@ export function createRcEmitterDirect({
     If(gy.greaterThanEqual(halfHU), () => { Return(); });
     const s = surfaceAt(gx, gy);
     const v = [float(1).toVar(), float(1).toVar(), float(1).toVar(), float(1).toVar()];
+    const pen = [float(0).toVar(), float(0).toVar(), float(0).toVar(), float(0).toVar()];
     const dbg = vec4(0, 0, 0, 0).toVar();
     If(s.valid, () => {
       dbg.x.assign(1);
@@ -304,45 +322,53 @@ export function createRcEmitterDirect({
             // bounding sphere, or a numerically tiny `wd` component would push
             // the stop point past the lamp and let the lamp shadow itself —
             // the failure this whole stage exists to delete.
+            // ⭐⭐⭐ §19 6.14 — THE SLAB IS TAKEN IN THE EMITTER'S OWN FRAME.
+            // `exHalf` is the exclusion box's half-extent along `bx/by/bz`
+            // (`shapeExclusionHalf`: a BOX kind stores its LOCAL half-extents,
+            // a capsule its axis length + cap radius), so a world-axis slab
+            // against a rotated cube measured the wrong box: from the ceiling
+            // straight above the lamp the ray stopped at the cube's local
+            // half-height while its rotated top face reached higher, the ray
+            // ended INSIDE the lamp, and the lamp shadowed the ceiling with its
+            // own silhouette. Here the ray direction is expressed in the OBB
+            // frame; the ray runs THROUGH the centre by construction, so its
+            // entry into the box is exactly `d − min_i(exHalf_i / |wd·b_i|)`
+            // and the emitter's own triangles/voxels are never on the segment.
             const ex = vec3(slot.exHalf).abs().max(1e-4).toVar();
-            const aw = vec3(wd).abs().max(1e-6).toVar();
-            const slab = ex.x.div(aw.x).min(ex.y.div(aw.y)).min(ex.z.div(aw.z)).toVar();
-            // ⭐⭐ §19 6.12 — AND A MARGIN BEFORE THE SLAB EXIT. The slab exit IS
-            // the lamp's face along this ray, so a ray stopped exactly there
-            // ends ON the face triangle: Möller-Trumbore returns t = maxT to
-            // the last ulp and the comparison lands on the "hit" side — brute
-            // force on the soup found EVERY back-wall ray (lit or not) hitting
-            // the lamp's own front face at t = maxT − 1e-4 (tri 72, z = 1.09).
-            // 0.1 % of the distance (4 mm at 4 m) is 10⁴ f32 ulps and still a
-            // contact shadow the voxel arm could never resolve.
+            const ld = vec3(dot(wd, vec3(slot.bx)), dot(wd, vec3(slot.by)), dot(wd, vec3(slot.bz))).abs().max(1e-6).toVar();
+            const slab = ex.x.div(ld.x).min(ex.y.div(ld.y)).min(ex.z.div(ld.z)).toVar();
+            // §19 6.12 — AND A MARGIN BEFORE THE SLAB EXIT: a ray stopped exactly
+            // on the face lands on the "hit" side of Möller-Trumbore's `t < maxT`.
+            // 0.1 % of the distance (4 mm at 4 m) is 10⁴ f32 ulps.
             const reachBvh = d.sub(slab.min(clear)).sub(d.mul(1e-3).max(2e-3)).max(1e-3).toVar();
             reachVox.assign(d.sub(slab.min(clear)).sub(float(2 * v0)).max(v0 * 0.5));
-            // ⭐⭐⭐ THE ONE LINE STAGE 5.5b EXISTS FOR. `traceWindow` asks the
-            // voxels whether anything is between here and the lamp; `anyHitFrom`
-            // asks the TRIANGLES. The difference only shows on a ray that starts
-            // ON geometry — which is every ray in this pass — and it is the
-            // difference between a lamp-mesh face that is lit and one that is
-            // black. See `window/shadowBvh.js`.
+            // The ray now returns WHERE it stopped, not only whether. `tOcc`
+            // is −1 for a clear ray on the exact arm; the voxel arm's `t` is
+            // whatever the DDA reports, masked by `hit` below.
             const h = float(0).toVar();
+            const tOcc = float(-1).toVar();
             if (BVH) {
-              // ⭐⭐ A RUNTIME BRANCH ON A UNIFORM, NOT A JS-TIME CHOICE — and
-              // that is what makes 5.5b free of a mid-session rebuild. Both
-              // arms are compiled into ONE kernel; `readyU` is uniform across
-              // every invocation, so a warp takes one side and the other costs
-              // nothing. When the worker's tree lands, `slot.fill` swaps the
-              // storage attributes and flips this uniform: no pass rebuilt, no
-              // texture re-created, no material left bound to a dead one.
               If(BVH.readyU.equal(0), () => {
-                h.assign(traceWindow(P, wd, reachVox, Nf).hit);
+                const tr = traceWindow(P, wd, reachVox, Nf);
+                h.assign(tr.hit); tOcc.assign(tr.t);
               }).Else(() => {
-                h.assign(BVH.anyHitFrom(P, wd, reachBvh, Nf));
+                tOcc.assign(BVH.nearestTFrom(P, wd, reachBvh, Nf));
+                h.assign(step(0, tOcc));
               });
             } else {
               const tr = traceWindow(P, wd, reachVox, Nf);
-              h.assign(tr.hit);
+              h.assign(tr.hit); tOcc.assign(tr.t);
               if (k === 0) dbg.y.assign(tr.t); // 6.12 receipt: WHERE the voxel ray stopped
             }
             v[k].assign(float(1).sub(h));
+            // PCSS at the receiver: penumbra HALF-width = lampHalf · t_occ / (d − t_occ),
+            // similar triangles from the lamp's largest half-extent through the
+            // blocker. t_occ → 0 (a blocker touching the receiver) gives a contact
+            // shadow with no blur; a blocker near the lamp gives the wide one.
+            // The blocker→lamp distance is floored at the lamp's own half-size.
+            const lampHalf = ex.x.max(ex.y).max(ex.z).toVar();
+            const dBlk = d.sub(tOcc.max(0)).max(lampHalf).toVar();
+            pen[k].assign(h.mul(lampHalf).mul(tOcc.max(0)).div(dBlk));
             if (k === 0) { dbg.z.assign(h); dbg.w.assign(BVH ? BVH.readyU.add(reachBvh.mul(10)) : reachVox); }
           });
         });
@@ -351,16 +377,57 @@ export function createRcEmitterDirect({
     const outV = vec4(v[0], v[1], v[2], v[3]).toVar();
     If(debugU.greaterThan(0.5), () => { outV.assign(dbg); });
     textureStore(visA, ivec2(gx.toInt(), gy.toInt()), outV);
+    textureStore(penA, ivec2(gx.toInt(), gy.toInt()), vec4(pen[0], pen[1], pen[2], pen[3]));
   })().compute(halfW * halfH);
   // §19 6.12 — the slot re-binds this kernel when the worker's tree lands.
   if (BVH) BVH.attach?.(rawPass);
 
-  // ── [F] THE SEPARABLE CROSS-BILATERAL, TWICE ─────────────────────────────
+  // ── [B] THE BLOCKER SEARCH: THE PENUMBRA GROWS OUTSIDE THE HARD EDGE ─────
+  //
+  // A clear ray carries no blocker distance, so an unoccluded texel next to a
+  // shadow would keep radius 0 and the ramp would live only INSIDE the
+  // geometric edge. The standard PCSS blocker search fixes that: a texel
+  // adopts a neighbour's radius when it lies within that radius of the
+  // neighbour — in WORLD metres, through the gbuffer, so a far surface behind
+  // a near edge is not reached and no depth test is needed. Separable, max.
+  const dilatePass = (srcNode, dstTex, dx, dy) => Fn(() => {
+    const i = instanceIndex.toVar();
+    const gx = i.mod(halfWU).toVar();
+    const gy = i.div(halfWU).toVar();
+    If(gy.greaterThanEqual(halfHU), () => { Return(); });
+    const c = surfaceAt(gx, gy);
+    const r = srcNode.load(ivec2(gx.toInt(), gy.toInt())).toVar();
+    If(c.valid, () => {
+      const P0 = vec3(c.P).toVar();
+      for (let o = -R_MAX; o <= R_MAX; o++) {
+        if (o === 0) continue;
+        const sx = gx.toInt().add(o * dx).max(0).min(halfWU.toInt().sub(1)).toUint().toVar();
+        const sy = gy.toInt().add(o * dy).max(0).min(halfHU.toInt().sub(1)).toUint().toVar();
+        const s = surfaceAt(sx, sy);
+        If(s.valid, () => {
+          const rn = srcNode.load(ivec2(sx.toInt(), sy.toInt())).toVar();
+          const dv = vec3(s.P).sub(P0).toVar();
+          const dist = sqrt(dot(dv, dv)).toVar();
+          r.assign(r.max(rn.mul(step(vec4(dist), rn))));
+        });
+      }
+    });
+    textureStore(dstTex, ivec2(gx.toInt(), gy.toInt()), r);
+  })().compute(halfW * halfH);
+  const dilH = dilatePass(penAN, penB, 1, 0);
+  const dilV = dilatePass(penBN, penA, 0, 1);
+
+  // ── [F] THE SEPARABLE CROSS-BILATERAL, TWICE, AT THE PCSS RADIUS ─────────
   //
   // Plane distance and normal agreement, the same two rejections
   // `createGiLightShadowFilterPass` and `resolveUpsample` both use. A tap on a
   // different surface contributes NOTHING, so a penumbra is softened along the
-  // wall it lies on and never across the corner it stops at.
+  // wall it lies on and never across the corner it stops at. §19 6.14: the 13
+  // taps are spread over `radius = clamp(penumbra / footprint, 1, R_MAX)`
+  // texels, where `footprint` is the world size of one half-res texel along
+  // this pass's axis, read off the gbuffer's neighbour on the same plane — a
+  // grazing wall is foreshortened and its blur shrinks with it. The radius is
+  // the largest of the four slots' (one loop, not four).
   const filterPass = (srcNode, dstTex, dx, dy) => Fn(() => {
     const i = instanceIndex.toVar();
     const gx = i.mod(halfWU).toVar();
@@ -372,9 +439,22 @@ export function createRcEmitterDirect({
     If(c.valid, () => {
       const P0 = vec3(c.P).toVar();
       const N0 = vec3(c.N).toVar();
+      const pw = penAN.load(ivec2(gx.toInt(), gy.toInt())).toVar();
+      const rW = pw.x.max(pw.y).max(pw.z).max(pw.w).toVar();
+      const fp = float(1e9).toVar();
+      for (const sgn of [1, -1]) {
+        const nx = gx.toInt().add(sgn * dx).max(0).min(halfWU.toInt().sub(1)).toUint().toVar();
+        const ny = gy.toInt().add(sgn * dy).max(0).min(halfHU.toInt().sub(1)).toUint().toVar();
+        const n = surfaceAt(nx, ny);
+        const dv = vec3(n.P).sub(P0).toVar();
+        const same = n.valid.and(N0.dot(dv).abs().lessThan(0.05)).and(N0.dot(vec3(n.N)).greaterThan(0.9));
+        If(same, () => { fp.assign(fp.min(sqrt(dot(dv, dv)).max(1e-5))); });
+      }
+      const rT = rW.div(fp).clamp(1, R_MAX).toVar();
       for (let t = 0; t < TAPS.length; t++) {
-        const sx = gx.toInt().add(TAPS[t] * dx).max(0).min(halfWU.toInt().sub(1)).toUint().toVar();
-        const sy = gy.toInt().add(TAPS[t] * dy).max(0).min(halfHU.toInt().sub(1)).toUint().toVar();
+        const off = rT.mul(TAPS[t] / 6).round().toInt().toVar();
+        const sx = gx.toInt().add(off.mul(dx)).max(0).min(halfWU.toInt().sub(1)).toUint().toVar();
+        const sy = gy.toInt().add(off.mul(dy)).max(0).min(halfHU.toInt().sub(1)).toUint().toVar();
         const s = surfaceAt(sx, sy);
         // ⚠ REJECTION WEIGHTS ARE EPSILONS, NEVER ZEROS is the gather's rule;
         // here a rejected tap really is absent, and the `wsum` division
@@ -444,10 +524,12 @@ export function createRcEmitterDirect({
 
   return {
     /** [S] → [F.h] → [F.v]. Spliced before the pixel resolve that reads them. */
-    passes: [rawPass, hPass, vPass],
+    passes: [rawPass, dilH, dilV, hPass, vPass],
     directAt,
     /** The FILTERED visibility (V writes back into A) — for a debug read. */
     texture: visA,
+    /** §19 6.14 — the DILATED PCSS half-width (metres) per slot — for a debug read. */
+    penumbra: penA,
     /** The gbuffer textures this pass CAPTURED at build — for the stale-binding receipt. */
     bound: { position: gbuffer.position, normal: gbuffer.normal },
     /** The BVH slot this kernel CAPTURED at build — identity receipt vs `gi2.shadowBvh`. */
@@ -468,6 +550,8 @@ export function createRcEmitterDirect({
     dispose() {
       visA.dispose?.();
       visB.dispose?.();
+      penA.dispose?.();
+      penB.dispose?.();
     },
   };
 }

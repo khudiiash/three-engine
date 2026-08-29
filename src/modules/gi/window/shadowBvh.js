@@ -265,6 +265,116 @@ const bvhAnyHitFn = wgslFn(/* wgsl */ `
 ` );
 
 /**
+ * §19 6.14 — THE NEAREST-t SIBLING, generated from the any-hit text above with
+ * three edits: a hit SHRINKS `best` instead of returning, nodes are culled
+ * against `best`, and the answer is the FIRST occluder's distance (−1 when
+ * nothing lies in `(1e-4, maxT)`). `rcDirect` needs that distance for one
+ * reason: a PCSS penumbra is `lampSize · t_occ / (d − t_occ)` and a binary
+ * any-hit cannot say where the blocker was. The whole tree is visited (no
+ * ordered descent), which is the closest-hit cost the arm's ≤ 250 k gate bounds.
+ */
+const bvhNearestTFn = wgslFn(/* wgsl */ `
+
+	fn gi2BvhNearestT(
+		ro: vec3f,
+		rd: vec3f,
+		maxT: f32,
+		nodes: ptr<storage, array<f32>, read>,
+		triIdx: ptr<storage, array<u32>, read>,
+		tris: ptr<storage, array<f32>, read>
+	) -> f32 {
+
+		var stack: array<u32, 64>;
+		var sp: i32 = 0;
+		stack[0] = 0u;
+		var best: f32 = maxT;
+		var found: f32 = -1.0;
+
+		let safeDir = vec3f(
+			select( select( -1e-20, 1e-20, rd.x >= 0.0 ), rd.x, abs( rd.x ) > 1e-20 ),
+			select( select( -1e-20, 1e-20, rd.y >= 0.0 ), rd.y, abs( rd.y ) > 1e-20 ),
+			select( select( -1e-20, 1e-20, rd.z >= 0.0 ), rd.z, abs( rd.z ) > 1e-20 )
+		);
+		let invDir = vec3f( 1.0 ) / safeDir;
+
+		var guard: u32 = 0u;
+
+		loop {
+
+			if ( sp < 0 || guard > 4096u ) { break; }
+			guard = guard + 1u;
+
+			let ni = stack[ sp ];
+			sp = sp - 1;
+
+			let nb = ni * 8u;
+			let bmin = vec3f( nodes[ nb ], nodes[ nb + 1u ], nodes[ nb + 2u ] );
+			let bmax = vec3f( nodes[ nb + 4u ], nodes[ nb + 5u ], nodes[ nb + 6u ] );
+
+			let t0 = ( bmin - ro ) * invDir;
+			let t1 = ( bmax - ro ) * invDir;
+			let tsmall = min( t0, t1 );
+			let tbig = max( t0, t1 );
+			let tmin = max( max( tsmall.x, tsmall.y ), tsmall.z );
+			let tmax = min( min( tbig.x, tbig.y ), tbig.z );
+			let entry = max( tmin, 0.0 );
+
+			if ( tmax < entry || entry > best ) { continue; }
+
+			let count = nodes[ nb + 7u ];
+
+			if ( count < 0.0 ) {
+
+				let right = u32( nodes[ nb + 3u ] );
+				if ( sp < 62 ) {
+					sp = sp + 1;
+					stack[ sp ] = ni + 1u;
+					sp = sp + 1;
+					stack[ sp ] = right;
+				}
+
+			} else {
+
+				let first = u32( nodes[ nb + 3u ] );
+				let n = u32( count );
+				for ( var i: u32 = 0u; i < n; i = i + 1u ) {
+
+					let o = triIdx[ first + i ] * 9u;
+					let a = vec3f( tris[ o ], tris[ o + 1u ], tris[ o + 2u ] );
+					let b = vec3f( tris[ o + 3u ], tris[ o + 4u ], tris[ o + 5u ] );
+					let c = vec3f( tris[ o + 6u ], tris[ o + 7u ], tris[ o + 8u ] );
+
+					let e1 = b - a;
+					let e2 = c - a;
+					let h = cross( rd, e2 );
+					let det = dot( e1, h );
+					if ( abs( det ) < 1e-9 ) { continue; }
+
+					let inv = 1.0 / det;
+					let s = ro - a;
+					let u = dot( s, h ) * inv;
+					if ( u < -1e-5 || u > 1.00001 ) { continue; }
+
+					let q = cross( s, e1 );
+					let v = dot( rd, q ) * inv;
+					if ( v < -1e-5 || u + v > 1.00001 ) { continue; }
+
+					let t = dot( e2, q ) * inv;
+					if ( t > 1e-4 && t < best ) { best = t; found = t; }
+
+				}
+
+			}
+
+		}
+
+		return found;
+
+	}
+
+` );
+
+/**
  * ⭐⭐⭐ A PERSISTENT SLOT, NOT A BUFFER — AND THIS IS THE MEMORY LAW, NOT A
  * STYLE CHOICE.
  *
@@ -402,6 +512,8 @@ export function createShadowBvhSlot() {
    * Raw: the caller owns the origin offset.
    */
   const anyHit = (origin, dir, maxT) => bvhAnyHitFn(origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer);
+  /** §19 6.14 — the FIRST occluder's distance in `(origin, origin + dir*maxT)`, or −1. */
+  const nearestT = (origin, dir, maxT) => bvhNearestTFn(origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer);
 
   /**
    * ⭐⭐ THE SELF-HIT EPSILON, AND WHY IT IS ALONG THE NORMAL.
@@ -426,9 +538,16 @@ export function createShadowBvhSlot() {
       : anyHit(P, dir, maxT)
   );
 
+  const nearestTFrom = (P, dir, maxT, normal) => (
+    normal
+      ? nearestT(P.add(normal.mul(SELF_EPS)), dir, maxT)
+      : nearestT(P, dir, maxT)
+  );
+
   return {
     anyHit,
     anyHitFrom,
+    nearestTFrom,
     readyU,
     selfEps: SELF_EPS,
     get ready() { return readyU.value !== 0; },
