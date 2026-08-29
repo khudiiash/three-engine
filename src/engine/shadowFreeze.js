@@ -99,7 +99,11 @@ function overlayRenderShadow(frame) {
   try {
     const src = shadowMap.depthTexture;
     let cache = plan.cache;
-    const cacheFits = !!cache && cache.image.width === shadow.mapSize.width && cache.image.height === shadow.mapSize.height
+    // Sized against the map's own depth texture, never `shadow.mapSize`: a map
+    // three has resized keeps its old texture size until it is rebuilt, and a
+    // cache checked against mapSize then never fits — re-rendered and
+    // re-allocated (64 MB) EVERY frame (Level, 08-29).
+    const cacheFits = !!cache && cache.image.width === src.image.width && cache.image.height === src.image.height
       && cache.type === src.type && cache.format === src.format;
     if (plan.mode === "static-cache" || !plan.cacheValid || !cacheFits) {
       // The static half: three's own full render with the dynamic casters

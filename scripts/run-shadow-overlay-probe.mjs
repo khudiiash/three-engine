@@ -37,6 +37,7 @@ let firstLight = false;
 page.on("console", (m) => {
   const t = m.text();
   if (/\[gi2\] first light|\[gi\] field ready/.test(t)) firstLight = true;
+  if (/transport never produced|IBL left on/.test(t)) console.log(`  GI-STATE ${t.slice(0, 120)}`);
   if (/shadowFreeze|overlay failed|Uncaught|DEVICE|device lost/i.test(t)) console.log(`  ${t.slice(0, 220)}`);
 });
 page.on("pageerror", (e) => console.log(`  PAGEERROR ${String(e).slice(0, 200)}`));
@@ -52,8 +53,18 @@ const call = (op, params = {}) => page.evaluate(async (op, params) => {
   try { return await globalThis.__editorApi.call(op, params); }
   catch (e) { return { __error: String(e?.message ?? e) }; }
 }, op, params);
+const setFreeze = (enabled) => page.evaluate(async (e) => {
+  // The editor keeps its engine in a module singleton, not on a global.
+  const m = await import("/src/editor/engineInstance.js");
+  if (!m.engine?.shadowFreeze) return "no engine.shadowFreeze";
+  m.engine.shadowFreeze.enabled = e;
+  return `shadowFreeze.enabled=${e}`;
+}, enabled);
 const opened = await call("scene.open", { path: SCENE_PATH });
 if (opened?.__error) { console.log(`FATAL scene.open: ${opened.__error}`); await browser.close(); process.exit(1); }
+// FREEZE=0 from the very first frame: the old behaviour with NO overlay ever
+// having run, the control for "does the overlay path leave a mark behind".
+if (process.env.FREEZE === "0") console.log(await setFreeze(false));
 const t0 = Date.now();
 while (!firstLight && Date.now() - t0 < 60000) await wait(250);
 console.log(`first light ${firstLight ? `after ${((Date.now() - t0) / 1000).toFixed(1)} s` : "NOT seen in 60 s"}`);
@@ -69,13 +80,6 @@ const created = await call("character.create", { name: "ProbeCharacter", positio
 console.log(`character.create → ${created?.__error ?? JSON.stringify(created).slice(0, 120)}`);
 await wait(SETTLE * 1000);
 
-const setFreeze = (enabled) => page.evaluate(async (e) => {
-  // The editor keeps its engine in a module singleton, not on a global.
-  const m = await import("/src/editor/engineInstance.js");
-  if (!m.engine?.shadowFreeze) return "no engine.shadowFreeze";
-  m.engine.shadowFreeze.enabled = e;
-  return `shadowFreeze.enabled=${e}`;
-}, enabled);
 
 const read = async (label) => {
   const fs = await call("profile.frameStats");
@@ -90,23 +94,52 @@ const read = async (label) => {
 console.log(await setFreeze(false));
 await wait(1500);
 await read("BEFORE (freeze off = the old skinned-mesh behaviour), parked");
-console.log(await setFreeze(true));
+// FREEZE=0 keeps the old behaviour for the whole run (an A/B image pair).
+console.log(await setFreeze(process.env.FREEZE !== "0"));
 await wait(2500);
 await read("AFTER (static cache + overlay), parked");
 
-// Move the camera 5 m sideways, read while it settles and after.
-const right = [-(dir[2] / len), 0, dir[0] / len];
-const p2 = [pos[0] + right[0] * 5, pos[1], pos[2] + right[2] * 5];
-const t2 = [target[0] + right[0] * 5, target[1], target[2] + right[2] * 5];
-await call("viewport.setCamera", { position: p2, target: t2 });
+// Frame the character (a pose that has it AND the street around it in view),
+// then dolly the camera 5 m back along the view axis — a move that stays
+// outside the buildings — wait 1 s, and read again. The shot is taken here.
+await call("viewport.focus", { id: created?.entityId, distance: Number(process.env.FOCUS ?? 1.5) });
+await wait(800);
+const fc = await call("viewport.getCamera");
+const fp = fc?.position ?? pos, ft = fc?.target ?? target;
+const back = [fp[0] - ft[0], fp[1] - ft[1], fp[2] - ft[2]];
+const bl = Math.hypot(...back) || 1;
+const p2 = [fp[0] + (back[0] / bl) * 5, fp[1] + (back[1] / bl) * 5, fp[2] + (back[2] / bl) * 5];
+await call("viewport.setCamera", { position: p2, target: ft });
 await wait(300);
 await read("AFTER, 300 ms after a 5 m move");
-await wait(2500);
-await read("AFTER, parked again after the move");
-if (OUT) {
-  const r = await call("viewport.screenshot", { width: 960, height: 640, includeGizmos: false });
-  const shot = typeof r === "string" ? r : (r?.__image ?? r?.png ?? r?.dataUrl ?? r?.image ?? r?.data ?? "");
-  const b64 = String(shot).replace(/^data:image\/png;base64,/, "");
-  if (b64.length > 1000) { writeFileSync(OUT, Buffer.from(b64, "base64")); console.log(`shot → ${OUT}`); }
+await wait(1000);
+await read("AFTER, 1.3 s after the move (the shot's frame)");
+const takeShot = async (out) => {
+  // Same unwrap as run-gi2-shot.mjs — the namespaced call returns the image
+  // under one of several keys.
+  const shot = await page.evaluate(async () => {
+    const r = await globalThis.__editorApi.viewport.screenshot({ width: 960, height: 640, includeGizmos: false });
+    return typeof r === "string" ? r : (r?.__image ?? r?.png ?? r?.dataUrl ?? r?.image ?? JSON.stringify(Object.keys(r ?? {})));
+  });
+  const raw = typeof shot === "string" ? shot : (shot?.data ?? shot?.base64 ?? JSON.stringify(shot).slice(0, 200));
+  const b64 = String(raw).replace(/^data:image\/png;base64,/, "");
+  if (/^[A-Za-z0-9+/=]+$/.test(b64) && b64.length > 1000) { writeFileSync(out, Buffer.from(b64, "base64")); console.log(`shot → ${out}`); }
+  else console.log(`screenshot payload not understood: ${String(shot).slice(0, 120)}`);
+};
+if (OUT) await takeShot(OUT);
+if (process.env.OUT2) {
+  // The in-session A/B: same pose, same GI state, the old full-render path.
+  console.log(await setFreeze(false));
+  await wait(1500);
+  await read("CONTROL, freeze toggled OFF at the same pose");
+  await takeShot(process.env.OUT2);
+  if (process.env.OUT3) {
+    // Back ON at the same pose: OUT3 vs OUT2 is the overlay's own difference;
+    // OUT vs OUT3 is whatever else drifted meanwhile (GI settling, probes).
+    console.log(await setFreeze(true));
+    await wait(2500);
+    await read("ON AGAIN at the same pose");
+    await takeShot(process.env.OUT3);
+  }
 }
 await browser.close();
