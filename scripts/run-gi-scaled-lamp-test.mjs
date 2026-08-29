@@ -25,6 +25,7 @@
 import puppeteer from "puppeteer-core";
 import { writeFileSync } from "node:fs";
 import { installTauriShim } from "./lib/tauriShim.mjs";
+import { installWebGpuErrorLog } from "./lib/webgpuErrorLog.mjs";
 
 const url = process.argv[2] ?? "http://127.0.0.1:5203/";
 const PROJECT = (process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME").replaceAll("\\", "/");
@@ -50,6 +51,7 @@ const browser = await puppeteer.launch({
 const page = await browser.newPage();
 await page.setViewport({ width: 1650, height: 970, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
+await installWebGpuErrorLog(page);
 await page.evaluateOnNewDocument((project) => {
   globalThis.__gi2Rc5 = true;
   globalThis.__editorKeepRendering = true;
