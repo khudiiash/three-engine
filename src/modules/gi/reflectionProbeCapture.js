@@ -201,7 +201,12 @@ export function createReflectionProbeCapture({
         // `.level(0)` is REQUIRED, not style: this is a compute kernel, and
         // implicit-derivative sampling is illegal there (same rule the BVH
         // atlas lookup in bvhScene.js follows).
-        out.assign(vec3(env.node.sample(equirectUV(rd)).level(0).xyz).mul(env.intensity).mul(intensity));
+        const tex = vec3(env.node.sample(equirectUV(rd)).level(0).xyz).mul(env.intensity);
+        // §19 6.15b — the flat `scene.background` Color when no texture is
+        // set (bundle.color / bundle.useTex; older callers pass neither and
+        // keep the texture-only behaviour).
+        const envRgb = env.color ? mix(vec3(env.color), tex, float(env.useTex).clamp(0, 1)) : tex;
+        out.assign(envRgb.mul(intensity));
       }
     });
     // EMA against the probe's own history row (read here, WRITTEN by the

@@ -3908,6 +3908,11 @@ export function createGiBvhReflect({
   // per-slot surface palette. Null (the degrade ladder dropped the static BVH
   // region) keeps the incumbent ≤128-mesh path compiled as the fallback.
   oneBvh = null,
+  // §19 6.15b — { node, intensity, rotY, color, useTex } | null: on a TRACED
+  // miss (t = -2) the colour target receives the environment along R —
+  // equirect (env, else background texture) or the flat background Color —
+  // with alpha -1, so giLight composites it at weight 1 exactly like a hit.
+  envMiss = null,
 }) {
   // ── ONE RAY PER stride×stride BLOCK ────────────────────────────────────────
   // A BVH traversal per pixel is what costs; the STORES are nearly free. Trace
@@ -4127,6 +4132,26 @@ export function createGiBvhReflect({
       }
       // `dynFlag` stays 0: the dyn union above RESOLVES those pixels instead of
       // flagging them, and the flag's only consumer is compiled out here.
+      //
+      // ── §19 6.15b — EMPTY SPACE IS THE ENVIRONMENT (user rule) ─────────
+      // A ray that ran the whole scene and left it has PROVEN the environment
+      // is visible along R; nothing else may paint that pixel — not the
+      // neighbouring hits, not the glossy field, not the probe. Same rotation
+      // convention as the probe capture and the retired hit-shade branch.
+      if (envMiss) {
+        If(t.lessThan(-1.5), () => {
+          const cr = cos(envMiss.rotY).toVar();
+          const sr = sin(envMiss.rotY).toVar();
+          const rd = vec3(
+            R.x.mul(cr).add(R.z.mul(sr)),
+            R.y,
+            R.z.mul(cr).sub(R.x.mul(sr)),
+          ).toVar();
+          const tex = vec3(envMiss.node.sample(equirectUV(rd)).level(0).xyz).mul(float(envMiss.intensity));
+          albedo.assign(mix(vec3(envMiss.color), tex, float(envMiss.useTex).clamp(0, 1)));
+          hasAlbedo.assign(-1);
+        });
+      }
     });
     const hitOut = vec4(t, dynFlag, octXY.x, octXY.y).toVar();
     const colorOut = vec4(albedo, hasAlbedo).toVar();

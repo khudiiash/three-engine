@@ -3463,6 +3463,18 @@ export class GISystem {
         this._giEnvMissRotU.value = (env
           ? scene?.environmentRotation?.y
           : scene?.backgroundRotation?.y) ?? 0;
+        // §19 6.15b — A FLAT BACKGROUND IS AN ENVIRONMENT TOO (user rule:
+        // "empty space must be sampling scene background color or sky HDRI
+        // if set"). No equirect source ⇒ the miss paints `scene.background`
+        // when it is a Color (linear, the same value the clear pass paints,
+        // so a mirror and the sky behind it agree through the output
+        // transform); `useTex` picks the texture path when one exists.
+        if (this._giEnvMissColorU) {
+          const flat = !source && scene?.background?.isColor ? scene.background : null;
+          if (flat) this._giEnvMissColorU.value.set(flat.r, flat.g, flat.b);
+          else this._giEnvMissColorU.value.set(0, 0, 0);
+          this._giEnvMissUseTexU.value = source ? 1 : 0;
+        }
         // §16 S1 — the directional SKY intensity is env-ONLY: the miss term
         // above falls back to the visible background at 1 (a mirror reflects
         // what is visible), but sky LIGHTING keeps sceneSkyRadiance's
@@ -8691,14 +8703,7 @@ export class GISystem {
         t.needsUpdate = true;
         return t;
       })();
-      this._giEnvMissNode ??= texture(this._giEnvPlaceholder);
-      this._giEnvMissIntensityU ??= giUniform(0);
-      this._giEnvMissRotU ??= giUniform(0);
-      light.giEnvMiss = {
-        node: this._giEnvMissNode,
-        intensity: this._giEnvMissIntensityU,
-        rotY: this._giEnvMissRotU,
-      };
+      light.giEnvMiss = this.#envMissBundle();
       // §14 R-B — the box-projected probe bundle. Armed only when probes
       // EXIST (that existence is in the structural signature, so this line is
       // re-evaluated by exactly the rebuilds that can change it); the node
@@ -9768,9 +9773,9 @@ export class GISystem {
     const srcProbes = screen.srcProbes ?? null;
     const emitter = screen.emitter ?? null;
     const gpu = this.#ensureReflProbeState();
-    const env = this._giEnvMissNode
-      ? { node: this._giEnvMissNode, intensity: this._giEnvMissIntensityU, rotY: this._giEnvMissRotU }
-      : null;
+    // §19 6.15b — the same bundle the exact prepass samples on a miss, so a
+    // probe-lit pixel and a traced pixel paint the same empty space.
+    const env = this.#envMissBundle();
     try {
       const capture = createReflectionProbeCapture({
         // CALLER-OWNED (see #ensureReflProbeState): a request made while the
@@ -10035,6 +10040,8 @@ export class GISystem {
         strideDefault: this.#bvhReflectStride(),
         // §17 R7a — whole-scene reflections through the static shadow BVH.
         oneBvh: this.#oneBvhBundle(),
+        // §19 6.15b — a traced miss IS the environment along R.
+        envMiss: this.#envMissBundle(),
       });
       // §19 0.3b: `pass` carries `setSize` — a viewport resize moves the block
       // grid uniform and the dispatch count instead of re-minting this kernel.
@@ -10102,6 +10109,33 @@ export class GISystem {
    * they cannot disagree: a mismatch shades every other row of the reflection
    * from a replicated texel, which is the ruled-lines bug of 2026-08-22.
    */
+  /**
+   * §19 6.15b — the ONE environment-on-miss bundle every traced-miss
+   * consumer samples (the exact prepass, the probe capture, the material
+   * term): an equirect texture (env, else the visible background) with its
+   * intensity/rotation, or the flat `scene.background` Color. System-lifetime
+   * uniforms; the per-frame poll writes the values.
+   */
+  #envMissBundle() {
+    this._giEnvPlaceholder ??= (() => {
+      const t = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
+      t.needsUpdate = true;
+      return t;
+    })();
+    this._giEnvMissNode ??= texture(this._giEnvPlaceholder);
+    this._giEnvMissIntensityU ??= giUniform(0);
+    this._giEnvMissRotU ??= giUniform(0);
+    this._giEnvMissColorU ??= uniform(new THREE.Vector3());
+    this._giEnvMissUseTexU ??= giUniform(0);
+    return {
+      node: this._giEnvMissNode,
+      intensity: this._giEnvMissIntensityU,
+      rotY: this._giEnvMissRotU,
+      color: this._giEnvMissColorU,
+      useTex: this._giEnvMissUseTexU,
+    };
+  }
+
   #bvhReflectStride() {
     // §19 6.15 — PER-TIER STRIDE. The mirror mask IS the sharp tier
     // (renderGiGBuffer draws GI_SHARP_LAYER only), so a sparse prepass traces

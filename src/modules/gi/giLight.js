@@ -2511,43 +2511,26 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
         // unclamped negative alpha here would EXTRAPOLATE the mix instead of
         // ignoring it. `nestedKill` — see the NESTED-RENDER ARBITRATION
         // note above: this texture is main-view data.
-        // ── §19 6.15: THE HIT/MISS EDGE IS A RAMP, NOT A STEP ──────────────
+        // ── §19 6.15b: A TRACED MISS IS THE ENVIRONMENT, AT WEIGHT 1 ────────
         //
-        // A mirror's traced-miss boundary (the open front of the Cornell box
-        // in the mirror block) used to flip from the exact colour to the
-        // fallback in ONE pixel. Four plus-shaped taps one texel out count
-        // how many TRACED neighbours resolved a hit; the weight is that
-        // coverage, so the edge ramps over ~3 px on both sides, and a miss
-        // pixel adjacent to hits borrows the mean of its HIT neighbours (its
-        // own colour is the miss zero — blending that in is the dark rim).
-        // NEVER-traced neighbours (t = -1: the mirror's own silhouette, a
-        // masked skip) are not counted, so the outline of the mirror stays
-        // pixel-exact. A hit pixel keeps its own (prefiltered) colour
-        // untouched: no blur enters the mirror interior.
+        // User rule (08-29): "empty space must be sampling scene background
+        // color or sky HDRI if set" — never a mean of the surrounding hits
+        // (6.15's borrow, retracted), never the glossy field, never the
+        // probe's painted miss. The prepass writes the environment along R
+        // into the colour target with alpha -1 on a traced miss (see
+        // createGiBvhReflect's envMiss), so the miss composites exactly like
+        // a hit: its own colour, weight 1. Radiance, not albedo — the
+        // receiver-irradiance lighting of the unshaded path applies to a hit
+        // SURFACE only. The hit/miss boundary is now the real silhouette of
+        // whatever the ray left the scene past (a geometric edge, sharp by
+        // right); the only texels that fall through to the field/probe are
+        // NEVER-traced ones (alpha 0: masked skip, no geometry).
         const centreHit = step(0.5, exactHit.a);
+        const centreMiss = step(0.5, exactHit.a.negate());
+        const rampRadiance = mix(exactRadiance, vec3(exactHit.rgb), centreMiss);
         let exactWeight;
-        if (prefilterOn && light.bvhReflectTexture) {
-          const hitN = float(centreHit).toVar();
-          const tracedN = float(exactTraced).toVar();
-          const nb = vec3(0).toVar();
-          const texel = vec2(light.giScreenTexel).toVar();
-          for (const [ox, oy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-            const uv = giUV.add(vec2(texel.x.mul(ox), texel.y.mul(oy)));
-            const c = light.bvhReflectColorTexture.sample(uv).level(0);
-            const tt = light.bvhReflectTexture.sample(uv).level(0).r;
-            const h = step(0.5, c.a);
-            const traced = h.max(step(0.5, float(tt.lessThan(-1.5))));
-            hitN.addAssign(h);
-            tracedN.addAssign(traced);
-            nb.addAssign(vec3(c.rgb).mul(h));
-          }
-          const coverage = hitN.div(tracedN.max(1));
-          const borrowed = nb.div(hitN.max(1));
-          const borrowedRadiance = light.bvhReflectShaded
-            ? borrowed
-            : borrowed.mul(irradiance.div(Math.PI).add(vec3(0.06)));
-          const rampRadiance = mix(borrowedRadiance, exactRadiance, centreHit);
-          exactWeight = coverage.clamp(0, 1).mul(smoothstep(0.45, 0.15, roughness)).mul(nestedKill);
+        if (light.bvhReflectTexture) {
+          exactWeight = centreHit.max(centreMiss).mul(smoothstep(0.45, 0.15, roughness)).mul(nestedKill);
           directional = mix(directional, rampRadiance, exactWeight);
         } else {
           exactWeight = exactHit.a.clamp(0, 1).mul(smoothstep(0.45, 0.15, roughness)).mul(nestedKill);
@@ -2831,7 +2814,9 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // `step(1e-4, intensity)` is kept: with no environment the kernel
       // leaves rgb at 0, and mixing toward black would DARKEN the miss
       // against today's field fallback rather than leaving it alone.
-      if (light.giEnvMiss && light.bvhReflectColorTexture) {
+      // §19 6.15b: shaded (resolve-written) path only — the albedo-only prepass
+      // composites its own environment miss in the mirror block above.
+      if (light.giEnvMiss && light.bvhReflectColorTexture && light.bvhReflectShaded) {
         const envTexel = light.bvhReflectColorTexture.sample(giUV);
         const envW = envTexel.a.negate().clamp(0, 1)
           .mul(smoothstep(0.45, 0.15, roughness))
