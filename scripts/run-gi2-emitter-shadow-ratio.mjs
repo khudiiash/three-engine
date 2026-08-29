@@ -83,10 +83,14 @@ await wait(SETTLE * 1000);
 if (OUT) {
   const shot = await page.evaluate(async () => {
     const r = await globalThis.__editorApi.viewport.screenshot({ width: 960, height: 640, includeGizmos: false });
-    return typeof r === "string" ? r : (r?.__image ?? r?.png ?? r?.dataUrl ?? r?.image ?? "");
+    if (typeof r === "string") return r;
+    const img = r?.__image ?? r?.png ?? r?.dataUrl ?? r?.image ?? r;
+    const v = typeof img === "string" ? img : (img?.data ?? img?.base64 ?? img?.png ?? img?.dataUrl);
+    return typeof v === "string" ? v : `SHAPE:${typeof img}:${Object.keys(img ?? {}).join(",")}`;
   });
   const b64 = String(shot).replace(/^data:image\/png;base64,/, "");
-  if (b64.length > 1000) { writeFileSync(OUT, Buffer.from(b64, "base64")); console.log(`wrote ${OUT}`); }
+  if (/^[A-Za-z0-9+/=]+$/.test(b64) && b64.length > 1000) { writeFileSync(OUT, Buffer.from(b64, "base64")); console.log(`wrote ${OUT}`); }
+  else console.log(`screenshot payload not a PNG: ${String(shot).slice(0, 160)}`);
 }
 
 const res = await page.evaluate(async ({ WALL }) => {
@@ -252,11 +256,61 @@ const res = await page.evaluate(async ({ WALL }) => {
       const { createGi2TexProbe } = await import("/scripts/lib/gi2TexProbe.js");
       const tp = createGi2TexProbe({ renderer: eng.renderer, tex: vt });
       const o = await tp.read(pts.map((p) => [p.pix[0] >> 1, p.pix[1] >> 1]));
+      var visRaw = Array.from(o);
       const sh = [], lit = [];
       pts.forEach((p, i) => { if (!shipped[i].valid) return; (p.shadowed ? sh : lit).push(o[i * 4]); });
       visTex = { medShadow: med(sh), medLit: med(lit), nShadow: sh.length, nLit: lit.length, minShadow: Math.min(...sh), maxShadow: Math.max(...sh) };
     }
   } catch (e) { visTex = String(e?.message ?? e); }
+  // which gbuffer does rcDirect read, and is it the one being rendered?
+  let gbufCheck = null;
+  try {
+    const d = gi2.rc?.resolve?.direct;
+    const cur = gi2.gbuffer?.position, scr = sys.state.screen?.gbuffer?.position, bp = d?.bound?.position;
+    const { createGi2TexProbe } = await import("/scripts/lib/gi2TexProbe.js");
+    const countValid = async (tex) => {
+      if (!tex) return null;
+      const tp = createGi2TexProbe({ renderer: eng.renderer, tex });
+      const o = await tp.read(pts.map((p) => p.pix));
+      let ok = 0, nz = 0;
+      pts.forEach((p, i) => { const b = i * 4; if (o[b + 3] > 0.5) nz++; if (o[b + 3] > 0.5 && Math.hypot(o[b] - p.P[0], o[b + 1] - p.P[1], o[b + 2] - p.P[2]) < 0.08) ok++; });
+      return { valid: ok, wNonZero: nz, w: tex.image?.width, h: tex.image?.height, id: tex.id };
+    };
+    gbufCheck = {
+      sameObj: { gi2VsScreen: cur === scr, boundVsGi2: bp === cur },
+      boundPos: await countValid(bp), gi2Pos: await countValid(cur), screenPos: await countValid(scr),
+      rcSize: [gi2.rc?.resolve?.direct?.halfW, gi2.rc?.resolve?.direct?.halfH], gi2Size: [gi2.width, gi2.height],
+    };
+  } catch (e) { gbufCheck = String(e?.message ?? e); }
+  // the raw pass's own gates, slot 0: (valid, cosθ, h, reach)
+  let rawDbg = null;
+  try {
+    const vt = gi2.rc?.resolve?.direct?.texture, du = gi2.rc?.uniforms?.rcDirectDebug;
+    if (vt && du) {
+      const { createGi2TexProbe } = await import("/scripts/lib/gi2TexProbe.js");
+      const tp = createGi2TexProbe({ renderer: eng.renderer, tex: vt });
+      du.value = 1;
+      for (let f = 0; f < 8; f++) await new Promise((r) => requestAnimationFrame(r));
+      const o = await tp.read(pts.map((p) => [p.pix[0] >> 1, p.pix[1] >> 1]));
+      du.value = 0;
+      const col = (c, sel) => { const a = []; pts.forEach((p, i) => { if (shipped[i].valid && sel(p)) a.push(o[i * 4 + c]); }); return a; };
+      const q = (a) => ({ med: med(a), min: Math.min(...a), max: Math.max(...a) });
+      rawDbg = {
+        shadow: { valid: q(col(0, (p) => p.shadowed)), cos: q(col(1, (p) => p.shadowed)), h: q(col(2, (p) => p.shadowed)), reach: q(col(3, (p) => p.shadowed)) },
+        lit: { valid: q(col(0, (p) => !p.shadowed)), cos: q(col(1, (p) => !p.shadowed)), h: q(col(2, (p) => !p.shadowed)), reach: q(col(3, (p) => !p.shadowed)) },
+      };
+    }
+  } catch (e) { rawDbg = String(e?.message ?? e); }
+  let slotIdent = null;
+  try {
+    const ks = gi2.rc?.resolve?.direct?.bvhSlot, cs = gi2.shadowBvh;
+    slotIdent = { sameSlot: ks === cs, kernelReady: ks?.ready, kernelTris: ks?.triCount, sameTrisAttr: ks?.trisAttr === cs?.trisAttr, sameNodesAttr: ks?.nodesAttr === cs?.nodesAttr,
+      kernelTrisLen: ks?.trisAttr?.array?.length, curTrisLen: cs?.trisAttr?.array?.length, soupTrisLen: gi2.describe?.()?.soupTris };
+    if (ks?.trisAttr && ks !== cs) {
+      try { slotIdent.kernelTrisGpu = Array.from(new Float32Array(await eng.renderer.getArrayBufferAsync(ks.trisAttr))).slice(0, 6); } catch (e) { slotIdent.kernelTrisGpu = String(e?.message ?? e); }
+      try { slotIdent.kernelNodesGpu = Array.from(new Float32Array(await eng.renderer.getArrayBufferAsync(ks.nodesAttr))).slice(0, 8); } catch (e) { slotIdent.kernelNodesGpu = String(e?.message ?? e); }
+    }
+  } catch (e) { slotIdent = String(e?.message ?? e); }
   const sb = gi2.shadowBvh ?? null;
   let gpuNodes = null, gpuIdx = null, gpuTris = null;
   if (sb?.nodesAttr) {
@@ -291,9 +345,10 @@ const res = await page.evaluate(async ({ WALL }) => {
     nodes: Array.from(sb.nodes ?? []), triIdx: Array.from(sb.triIdx ?? []), tris: Array.from(sb.tris ?? []),
   } : null;
   const rays = pts.map((p) => ({ P: p.P, n: plane.n, shadowed: p.shadowed }));
+  const rows = pts.map((p, i) => ({ valid: shipped[i].valid, sh: shipped[i].lumB, shn: shippedNoShadow?.[i]?.lumB, d: directOnly?.[i]?.lumB, dn: directNoShadow?.[i]?.lumB, vis: typeof visRaw !== "undefined" ? visRaw[i * 4] : null }));
   return {
-    bvhDump, rays, L, exHalf: slots[0].exHalf, radius: slots[0].radius, reff: slots[0].reff,
-    visTex, rowOrder, slots, occ: occ.name, scene: scene.name, plane, nPts: pts.length, nValid,
+    rows, bvhDump, rays, L, exHalf: slots[0].exHalf, radius: slots[0].radius, reff: slots[0].reff,
+    slotIdent, rawDbg, gbufCheck, visTex, rowOrder, slots, occ: occ.name, scene: scene.name, plane, nPts: pts.length, nValid,
     nShadowPts: pts.filter((p) => p.shadowed).length, hasU, rcReady: gi2.rc ? true : false,
     bvh: (() => { try { return gi2.describe?.()?.shadowBvh ?? gi2.rc?.describe?.()?.shadowBvh ?? null; } catch { return null; } })(),
     perPixel: { direct: pix(directOnly, directNoShadow, "lumB"), finalBeforeAO: pix(shipped, shippedNoShadow, "lumB"), finalAfterAO: pix(shipped, shippedNoShadow, "lumA") },
@@ -319,10 +374,50 @@ if (res.bvhDump) {
     k.bvh += h.hit; k.brute += bruteAnyHit(tris, B.triCount, ro, rd, maxT);
     if (!sample && r.shadowed) sample = { ro, rd, maxT, d, slab, h };
   }
+  // WHICH triangle does a lit ray hit, and at what t (brute force, with t)
+  const hitT = (o, ti, ro, rd) => {
+    const b = ti * 9; const ax = tris[b], ay = tris[b + 1], az = tris[b + 2];
+    const e1 = [tris[b + 3] - ax, tris[b + 4] - ay, tris[b + 5] - az], e2 = [tris[b + 6] - ax, tris[b + 7] - ay, tris[b + 8] - az];
+    const h = [rd[1] * e2[2] - rd[2] * e2[1], rd[2] * e2[0] - rd[0] * e2[2], rd[0] * e2[1] - rd[1] * e2[0]];
+    const det = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2]; if (Math.abs(det) < 1e-9) return null;
+    const inv = 1 / det; const sv = [ro[0] - ax, ro[1] - ay, ro[2] - az];
+    const u = inv * (sv[0] * h[0] + sv[1] * h[1] + sv[2] * h[2]); if (u < 0 || u > 1) return null;
+    const q = [sv[1] * e1[2] - sv[2] * e1[1], sv[2] * e1[0] - sv[0] * e1[2], sv[0] * e1[1] - sv[1] * e1[0]];
+    const v = inv * (rd[0] * q[0] + rd[1] * q[1] + rd[2] * q[2]); if (v < 0 || u + v > 1) return null;
+    const t = inv * (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]); return t > 1e-6 ? t : null;
+  };
+  const who = (r) => {
+    const ro = [r.P[0] + r.n[0] * 2e-3, r.P[1] + r.n[1] * 2e-3, r.P[2] + r.n[2] * 2e-3];
+    const wv = [L[0] - ro[0], L[1] - ro[1], L[2] - ro[2]]; const d = Math.hypot(...wv); const rd = wv.map((v) => v / d);
+    const aw = rd.map((v) => Math.max(1e-6, Math.abs(v))); const slab = Math.min(exHalf[0] / aw[0], exHalf[1] / aw[1], exHalf[2] / aw[2]);
+    const maxT = Math.max(1e-3, d - Math.min(slab, Math.max(radius, reff)));
+    const hits = []; for (let ti = 0; ti < B.triCount; ti++) { const t = hitT(null, ti, ro, rd); if (t != null && t < maxT) hits.push({ ti, t: +t.toFixed(4), tri: B.tris.slice(ti * 9, ti * 9 + 9).map((x) => +x.toFixed(2)) }); }
+    return { P: r.P, d: +d.toFixed(3), maxT: +maxT.toFixed(3), slab: +slab.toFixed(3), hits: hits.slice(0, 3) };
+  };
+  const litRay = rays.find((r) => !r.shadowed && r.P[1] > 3.5), shRay = rays.find((r) => r.shadowed);
+  // ── RECLASSIFY against the SOUP (the block is a rotated box; its AABB lies) ──
+  const emitterTri = (ti) => { for (let k = 0; k < 3; k++) { const x = tris[ti * 9 + k * 3], y = tris[ti * 9 + k * 3 + 1], z = tris[ti * 9 + k * 3 + 2]; if (Math.abs(x - L[0]) > exHalf[0] + 0.02 || Math.abs(y - L[1]) > exHalf[1] + 0.02 || Math.abs(z - L[2]) > exHalf[2] + 0.02) return false; } return true; };
+  const trueShadow = (r) => {
+    const ro = [r.P[0] + r.n[0] * 2e-3, r.P[1] + r.n[1] * 2e-3, r.P[2] + r.n[2] * 2e-3];
+    const wv = [L[0] - ro[0], L[1] - ro[1], L[2] - ro[2]]; const d = Math.hypot(...wv); const rd = wv.map((v) => v / d);
+    const aw = rd.map((v) => Math.max(1e-6, Math.abs(v))); const slab = Math.min(exHalf[0] / aw[0], exHalf[1] / aw[1], exHalf[2] / aw[2]);
+    const maxT = d - Math.min(slab, Math.max(radius, reff)) - 0.01;
+    for (let ti = 0; ti < B.triCount; ti++) { if (emitterTri(ti)) continue; const t = hitT(null, ti, ro, rd); if (t != null && t < maxT) return true; }
+    return false;
+  };
+  const cls = rays.map(trueShadow);
+  const medN = (a) => { const q = a.filter(Number.isFinite).sort((x, y) => x - y); return q.length ? q[q.length >> 1] : NaN; };
+  const pick = (key, sel) => res.rows.filter((r, i) => r.valid && sel(cls[i])).map((r) => r[key]);
+  const rat = (key) => { const a = pick(key, (c) => c), b = pick(key, (c) => !c); return { nShadow: a.length, nLit: b.length, medShadow: +medN(a).toFixed(4), medLit: +medN(b).toFixed(4), ratio: +(medN(a) / medN(b)).toFixed(4) }; };
+  console.log("TRUE-SHADOW CLASS", JSON.stringify({ nShadow: cls.filter(Boolean).length, nLit: cls.filter((c) => !c).length,
+    visA: rat("vis"), direct: rat("d"), directNoShadow: rat("dn"), final: rat("sh"), finalNoShadow: rat("shn") }));
+  console.log("WHO LIT", JSON.stringify(litRay ? who(litRay) : null));
+  console.log("WHO SHADOW", JSON.stringify(shRay ? who(shRay) : null));
   console.log("GPU RAYS", JSON.stringify(B.gpuRays));
   console.log("GPU BUFFERS", JSON.stringify({ gpuNodes: B.gpuNodes, gpuIdx: B.gpuIdx, gpuTris: B.gpuTris }));
   console.log("CPU MIRROR", JSON.stringify({ ready: B.ready, triCount: B.triCount, nodeCount: B.nodeCount, tally, sample, nodes0: B.nodes.slice(0, 16), tri0: B.tris.slice(0, 9), triIdx0: B.triIdx.slice(0, 8) }));
   delete res.bvhDump; delete res.rays;
 }
+if (process.env.JSON) writeFileSync(process.env.JSON, JSON.stringify(res));
 console.log(JSON.stringify(res, (k, v) => (typeof v === "number" ? Number(v.toFixed(4)) : v), 1).replace(/\n\s*(?=[\d\-"nfte])/g, " "));
 await browser.close();

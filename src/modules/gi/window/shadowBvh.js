@@ -342,6 +342,25 @@ export function createShadowBvhSlot() {
   const readyU = uniform(0);
 
   const state = { nodeCount: 0, triCount: 0, bytes: 0, stats: null };
+  /**
+   * ⭐⭐⭐ §19 6.12 — THE KERNELS THAT BIND THIS SLOT, AND WHY THEY ARE LISTED.
+   *
+   * `fill()` swaps `.value` on three storage nodes. Three's `Bindings._update`
+   * compares `binding.attribute` per dispatch and re-mints the bind group when
+   * it changes — on paper. MEASURED (Cornell, 08-29): a kernel compiled before
+   * `fill()` kept reading the PLACEHOLDER — `nodes[3]` read 0 in rcDirect's own
+   * raw pass while a kernel built after the fill, and a CPU readback of the very
+   * same attribute, both read 22 (node 0's right child). `readyU` had flipped, so
+   * the exact branch ran a traversal into an unenterable box and every shadow
+   * ray came back "clear": the "emissives still do not cast shadows" report.
+   *
+   * So every kernel that binds the slot registers here, and `fill()` bumps its
+   * `version` (`needsUpdate = true`). Three then re-derives that kernel's
+   * bindings from the CURRENT attributes on its next dispatch; the WGSL is
+   * byte-identical, so the pipeline cache serves the compiled pipeline and no
+   * pass, texture or material is rebuilt — the 5.5b design, made true.
+   */
+  const kernels = new Set();
 
   /**
    * `1.0` when ANYTHING lies in `(origin, origin + dir*maxT)`, else `0.0`.
@@ -386,6 +405,9 @@ export function createShadowBvhSlot() {
     /** The CURRENT bound arrays (placeholder until `fill`) — for the CPU mirror probe. */
     get nodes() { return nodesBuffer.value?.array ?? null; },
     get nodesAttr() { return nodesBuffer.value; },
+    /** The storage NODES themselves — a kernel-side content receipt (`nodesNode.element(3)`). */
+    get nodesNode() { return nodesBuffer; },
+    get trisNode() { return trisBuffer; },
     get triIdxAttr() { return triIdxBuffer.value; },
     get trisAttr() { return trisBuffer.value; },
     get triIdx() { return triIdxBuffer.value?.array ?? null; },
@@ -426,8 +448,13 @@ export function createShadowBvhSlot() {
       state.bytes = bvh.nodes.byteLength + bvh.triIdx.byteLength;
       state.stats = bvh.stats ?? null;
       readyU.value = 1;
+      for (const k of kernels) k.needsUpdate = true;
       return true;
     },
+    /** Register a compute node that binds this slot (see `kernels` above). */
+    attach(node) { if (node) kernels.add(node); },
+    detach(node) { kernels.delete(node); },
+    detachAll() { kernels.clear(); },
   };
 }
 

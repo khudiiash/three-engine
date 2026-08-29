@@ -867,6 +867,17 @@ export function createGi2System({
       })
       : null;
     if (rc) {
+      // §19 6.12 — every kernel of this build that may bind the shadow slot is
+      // re-bound by `fill()` (see `shadowBvh.js`, "THE KERNELS THAT BIND THIS
+      // SLOT"). The whole frame order rather than the two callers, because the
+      // NEE lives in a helper (`shadeTerms`) that several kernels inline; a
+      // version bump on a kernel that does not bind the slot re-derives its
+      // bindings once and changes nothing else.
+      if (shadowBvh) {
+        shadowBvh.detachAll?.();
+        for (const n of gather.frameOrder ?? []) shadowBvh.attach?.(n);
+        for (const n of rc.frameOrder) shadowBvh.attach?.(n);
+      }
       rc.frameOrder.forEach((n, i) => {
         if (n && typeof n === "object") n.__giPassName ??= `gi2.rc#${i}`;
       });
@@ -1963,6 +1974,7 @@ export function createGi2System({
      */
     get rc() { return rc; },
     get shadowBvh() { return shadowBvh; },
+    get gbuffer() { return gbuffer; },
     get voxelizer() { return voxelizer; },
     get dynamic() { return dynamic; },
     get width() { return width; },
