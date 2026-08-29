@@ -2375,9 +2375,33 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // directional term is killed in nested views for the same reason.
       const nested = light.giNestedView ? float(light.giNestedView).clamp(0, 1) : float(0);
       const nestedKill = float(1).sub(nested);
+      // §19 6.15 — THE EXACT ARM IS AUTHORITATIVE ON A TRACED PIXEL. The
+      // Cornell attribution (three shots at the gate pose: default /
+      // `__giNoBvhReflections` / `__giReflectionProbes=false`) put the
+      // "muddy, stair-stepped" mirror on the PROBE: the low-res cube capture
+      // painted every traced MISS (the mirror reflecting the open front of
+      // the box) with its serrated block edge, and the exact hit next to it
+      // could not out-vote a term that was mixed in first. A ray that ran the
+      // BVH knows more than a 16 k-texel cube ever will, hit OR miss: on a hit
+      // the exact colour wins below; on a traced miss the environment/glossy
+      // term is the honest answer, not the probe's picture of the room. The
+      // probe keeps every NEVER-traced texel (masked skip, lower tiers, nested
+      // views) exactly as before. Sampled here, before the probe mix, and
+      // re-used by the exact block below (same texel, one read).
+      const exactTracedT = light.bvhReflectTexture && light.bvhReflectColorTexture && canMirror
+        ? light.bvhReflectTexture.sample(giUV).r
+        : null;
+      const exactTraced = exactTracedT
+        ? float(exactTracedT.greaterThanEqual(0).or(exactTracedT.lessThan(-1.5)))
+        : null;
       if (light.giProbes) {
         const probe = sampleReflectionProbes(light.giProbes, positionWorld, reflected, roughness);
-        directional = mix(directional, probe.rgb, probe.weight.max(nested));
+        // traced (t >= 0 hit, or t = -2 proven miss) ⇒ the probe yields on
+        // mirror-ish pixels; the same roughness gate the exact blend uses.
+        const probeYield = exactTraced
+          ? float(1).sub(exactTraced.mul(smoothstep(0.45, 0.15, roughness)))
+          : float(1);
+        directional = mix(directional, probe.rgb, probe.weight.mul(probeYield).max(nested));
       } else {
         directional = vec3(directional).mul(nestedKill);
       }
@@ -2511,8 +2535,31 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
         // unclamped negative alpha here would EXTRAPOLATE the mix instead of
         // ignoring it. `nestedKill` — see the NESTED-RENDER ARBITRATION
         // note above: this texture is main-view data.
-        const exactWeight = exactHit.a.clamp(0, 1).mul(smoothstep(0.45, 0.15, roughness)).mul(nestedKill);
-        directional = mix(directional, exactRadiance, exactWeight);
+        // ── §19 6.15b: A TRACED MISS IS THE ENVIRONMENT, AT WEIGHT 1 ────────
+        //
+        // User rule (08-29): "empty space must be sampling scene background
+        // color or sky HDRI if set" — never a mean of the surrounding hits
+        // (6.15's borrow, retracted), never the glossy field, never the
+        // probe's painted miss. The prepass writes the environment along R
+        // into the colour target with alpha -1 on a traced miss (see
+        // createGiBvhReflect's envMiss), so the miss composites exactly like
+        // a hit: its own colour, weight 1. Radiance, not albedo — the
+        // receiver-irradiance lighting of the unshaded path applies to a hit
+        // SURFACE only. The hit/miss boundary is now the real silhouette of
+        // whatever the ray left the scene past (a geometric edge, sharp by
+        // right); the only texels that fall through to the field/probe are
+        // NEVER-traced ones (alpha 0: masked skip, no geometry).
+        const centreHit = step(0.5, exactHit.a);
+        const centreMiss = step(0.5, exactHit.a.negate());
+        const rampRadiance = mix(exactRadiance, vec3(exactHit.rgb), centreMiss);
+        let exactWeight;
+        if (light.bvhReflectTexture) {
+          exactWeight = centreHit.max(centreMiss).mul(smoothstep(0.45, 0.15, roughness)).mul(nestedKill);
+          directional = mix(directional, rampRadiance, exactWeight);
+        } else {
+          exactWeight = exactHit.a.clamp(0, 1).mul(smoothstep(0.45, 0.15, roughness)).mul(nestedKill);
+          directional = mix(directional, exactRadiance, exactWeight);
+        }
       }
       // TRUE mirror reflections for low-roughness materials: one SDF
       // sphere-traced ray through the composited global field (cascade bins
@@ -2791,7 +2838,9 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // `step(1e-4, intensity)` is kept: with no environment the kernel
       // leaves rgb at 0, and mixing toward black would DARKEN the miss
       // against today's field fallback rather than leaving it alone.
-      if (light.giEnvMiss && light.bvhReflectColorTexture && globalThis.__giHookNoEnvMiss !== true) {
+      // §19 6.15b: shaded (resolve-written) path only — the albedo-only prepass
+      // composites its own environment miss in the mirror block above.
+      if (light.giEnvMiss && light.bvhReflectColorTexture && light.bvhReflectShaded && globalThis.__giHookNoEnvMiss !== true) {
         const envTexel = light.bvhReflectColorTexture.sample(giUV);
         const envW = envTexel.a.negate().clamp(0, 1)
           .mul(smoothstep(0.45, 0.15, roughness))

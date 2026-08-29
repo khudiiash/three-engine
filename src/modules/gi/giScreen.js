@@ -251,6 +251,19 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
   const previousAutoClearColor = renderer.autoClearColor;
   const previousAutoClearDepth = renderer.autoClearDepth;
   const previousAutoClearStencil = renderer.autoClearStencil;
+  // ── §19 6.15c: THE CLEAR MUST NOT MINT GEOMETRY ─────────────────────────
+  // Both attachments carry their "this pixel is real" bit in .w (position.w =
+  // valid, giNormal.w = mirror mask). The base pass clears the MRT with the
+  // renderer's clear colour, whose ALPHA the editor keeps at 1 — so every
+  // pixel no mesh covered (the sky, the background around a small scene)
+  // read as VALID geometry at P = (0,0,0) with the MIRROR MASK SET. Receipt
+  // (`probe:gi2-tracecount`, Cornell from its saved camera, box in the
+  // middle of a dark background): masked 89.6 % of the frame, valid 100 %,
+  // the prepass firing 403 k rays from the clear colour — on Bistro that is
+  // the whole sky, the 60 fps floor gone for nothing. Alpha 0 for the span of
+  // this function; the value is restored with everything else below.
+  const previousClearAlpha = renderer.getClearAlpha?.() ?? 1;
+  renderer.setClearAlpha?.(0);
   const previousBackground = scene.background;
   const previousBackgroundNode = scene.backgroundNode;
   // ⚠ SHADOWS OFF OR THE OVERRIDE POISONS THE SHADOW PASS: a shadow update
@@ -366,6 +379,14 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
   scene.overrideMaterial = gbuffer.material;
   renderer.setRenderTarget(gbuffer.rt);
   renderer.setMRT(gbuffer.mrtNode);
+  // §19 6.15c (second half of the clear note above): a Color `scene.background`
+  // makes `Background.update` clear THIS pass with the background colour at
+  // alpha 1 whatever `setClearAlpha` says — measured: sky texels read P =
+  // (background, 1.13), N = (0,0,0,1). The base pass renders with the
+  // background nulled (the mask pass already did), so the clear is the
+  // renderer's own colour at the alpha 0 set above; restored in `finally`.
+  scene.background = null;
+  scene.backgroundNode = null;
   try {
     renderer.render(scene, camera);
     // Pass 2 — the mirror mask (see createGiGBuffer's maskMrtNode). Only the
@@ -470,6 +491,7 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
     for (const mesh of proxyHidden) mesh.visible = true;
     for (const proxy of proxyParked) proxy.visible = true;
     for (const bundle of bundlesHidden) bundle.visible = true;
+    renderer.setClearAlpha?.(previousClearAlpha);
     renderer.autoClear = previousAutoClear;
     renderer.autoClearColor = previousAutoClearColor;
     renderer.autoClearDepth = previousAutoClearDepth;
@@ -3908,6 +3930,11 @@ export function createGiBvhReflect({
   // per-slot surface palette. Null (the degrade ladder dropped the static BVH
   // region) keeps the incumbent ≤128-mesh path compiled as the fallback.
   oneBvh = null,
+  // §19 6.15b — { node, intensity, rotY, color, useTex } | null: on a TRACED
+  // miss (t = -2) the colour target receives the environment along R —
+  // equirect (env, else background texture) or the flat background Color —
+  // with alpha -1, so giLight composites it at weight 1 exactly like a hit.
+  envMiss = null,
 }) {
   // ── ONE RAY PER stride×stride BLOCK ────────────────────────────────────────
   // A BVH traversal per pixel is what costs; the STORES are nearly free. Trace
@@ -4127,6 +4154,26 @@ export function createGiBvhReflect({
       }
       // `dynFlag` stays 0: the dyn union above RESOLVES those pixels instead of
       // flagging them, and the flag's only consumer is compiled out here.
+      //
+      // ── §19 6.15b — EMPTY SPACE IS THE ENVIRONMENT (user rule) ─────────
+      // A ray that ran the whole scene and left it has PROVEN the environment
+      // is visible along R; nothing else may paint that pixel — not the
+      // neighbouring hits, not the glossy field, not the probe. Same rotation
+      // convention as the probe capture and the retired hit-shade branch.
+      if (envMiss) {
+        If(t.lessThan(-1.5), () => {
+          const cr = cos(envMiss.rotY).toVar();
+          const sr = sin(envMiss.rotY).toVar();
+          const rd = vec3(
+            R.x.mul(cr).add(R.z.mul(sr)),
+            R.y,
+            R.z.mul(cr).sub(R.x.mul(sr)),
+          ).toVar();
+          const tex = vec3(envMiss.node.sample(equirectUV(rd)).level(0).xyz).mul(float(envMiss.intensity));
+          albedo.assign(mix(vec3(envMiss.color), tex, float(envMiss.useTex).clamp(0, 1)));
+          hasAlbedo.assign(-1);
+        });
+      }
     });
     const hitOut = vec4(t, dynFlag, octXY.x, octXY.y).toVar();
     const colorOut = vec4(albedo, hasAlbedo).toVar();
