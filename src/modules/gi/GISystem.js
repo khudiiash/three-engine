@@ -15956,6 +15956,20 @@ export class GISystem {
     this._emitterCandidateMeshes = new Set(candidates ?? []);
     this._emitterAdmittedMeshes = new Set();
     for (const e of admitted ?? []) if (e?.mesh) this._emitterAdmittedMeshes.add(e.mesh);
+    // §19 6.23 receipt — WHEN the gate last ran and what area/power it saw per
+    // admitted mesh (`test:gi-scaled-lamp` reads it: a lamp scaled ×2 must
+    // re-run the gate with 4× the area; the seat alone following the scale is
+    // not that).
+    this._emitterAdmissionAt = performance.now();
+    this._emitterAdmissionByMesh = new Map();
+    for (const e of admitted ?? []) {
+      if (!e?.mesh) continue;
+      const prev = this._emitterAdmissionByMesh.get(e.mesh);
+      this._emitterAdmissionByMesh.set(e.mesh, {
+        area: (prev?.area ?? 0) + (e.area ?? 0),
+        power: (prev?.power ?? 0) + (e.power ?? 0),
+      });
+    }
     // §18.15 — the PER-MESH fill, for #refreshEmitterSlots (see its own note).
     // Keyed by mesh and taken from the PRE-split fit, because a seat is one
     // mesh-shaped emitter and cannot be the pieces the tree splits into.
@@ -17680,6 +17694,30 @@ export class GISystem {
       mixFloat(surface.emissive.b * surface.emissiveIntensity);
       mix(mesh.geometry?.id ?? 0);
       mix(mesh.geometry?.attributes?.position?.version ?? 0);
+      // ── §19 6.23 — AN EMITTER'S WORLD SCALE IS CONTENT, NOT A TRANSFORM ──
+      //
+      // Translation and rotation are the per-frame uniform path
+      // (`#refreshEmitterSlots` re-fits the seat from the live matrix every
+      // frame). SCALE is different in kind: the emitting AREA is a function of
+      // it, and so is everything `#buildEntries` derives from the area once —
+      // the admission gate Φ = π·A·L (`collectEmitters`), the fill, the ledger,
+      // the light-tree records, the GI2 palette's per-voxel emission. MEASURED
+      // (`test:gi-scaled-lamp`, Cornell, lamp ×2): the seat followed (reff
+      // 0.757 → 1.514) while the ledger still read the build-time 7.2 m², so a
+      // lamp scaled UNDER the gate kept lighting and one scaled OVER it never
+      // started. Mixing the scale here routes a scale change through the same
+      // content path a material edit takes. Quantised to ~2 % steps of the
+      // area so a gizmo drag re-derives at the scan cadence, not per ulp; only
+      // emitters pay, and only three column lengths each.
+      if (!mesh.isInstancedMesh
+          && (surface.emissive.r + surface.emissive.g + surface.emissive.b) * surface.emissiveIntensity > 0) {
+        const e = mesh.matrixWorld.elements;
+        const sx = Math.hypot(e[0], e[1], e[2]);
+        const sy = Math.hypot(e[4], e[5], e[6]);
+        const sz = Math.hypot(e[8], e[9], e[10]);
+        const area = sx * sy + sy * sz + sz * sx;
+        mix(Math.round(Math.log2(Math.max(area, 1e-9)) * 32));
+      }
       // Instance count and matrix version: adding, removing or re-scattering
       // instances changes which slots exist, and nothing else here would
       // notice (the mesh id, geometry and material are all unchanged).
