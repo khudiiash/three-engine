@@ -52,7 +52,7 @@ page.on("console", (m) => {
   const t = m.text();
   if (/\[gi2\] first light|\[gi\] field ready/.test(t) && !firstLight) firstLight = Date.now();
   if (/palette re-tint \(texture-averages\)/.test(t)) retintTex++;
-  if (/palette|retint|bounce albedo|Basis|KTX2|transcode/i.test(t)) lines.push(t.slice(0, 220));
+  if (/palette|retint|bounce albedo|Basis|KTX2|transcode|sun slot|light input|lights/i.test(t)) lines.push(t.slice(0, 220));
   if (m.type() === "error" && !/save_scene/.test(t)) lines.push(`ERROR ${t.slice(0, 220)}`);
 });
 page.on("pageerror", (e) => {
@@ -152,9 +152,30 @@ else {
   }
 }
 
+// ── the SUN the cache kernel is handed vs the scene's light ───────────────
+const S = await page.evaluate(() => {
+  const eng = globalThis.__giEngineForProbe; const sys = globalThis.__giSys();
+  const v3 = (v) => (v ? [v.x, v.y, v.z] : null);
+  const nodes = sys?._giSunNodes;
+  const st = sys?.state;
+  const slots = (st?.lightSlots ?? []).map((s) => ({ active: s.active?.value, kind: s.kind?.value, vec: v3(s.vector?.value), color: v3(s.color?.value) ?? [s.color?.value?.r, s.color?.value?.g, s.color?.value?.b] }));
+  const lights = [];
+  eng.scene.traverse((o) => { if (o.isDirectionalLight) { const d = o.getWorldDirection(new o.position.constructor()); const t = new o.position.constructor().setFromMatrixPosition(o.target.matrixWorld); const f = new o.position.constructor().setFromMatrixPosition(o.matrixWorld); const td = t.sub(f).normalize(); lights.push({ name: o.name, visible: o.visible, intensity: o.intensity, color: [o.color.r, o.color.g, o.color.b], worldDir: v3(d), toTarget: v3(td), targetParent: o.target.parent === o ? "light" : (o.target.parent?.name ?? "none"), giShadowMode: o.userData?.giShadowMode ?? null }); } });
+  return { handed: nodes ? { dir: v3(nodes.dir.value), color: v3(nodes.color.value) } : null, sunSlot: st?.sunSlot?.value ?? null, gi2SunSlot: sys?._gi2SunSlot?.value ?? null, lightObjects: sys?._lightObjects?.length ?? null, slots, lights };
+});
+console.log(`\n  SUN handed to the cache: ${S.handed ? `dir ${rgb(S.handed.dir)} color ${rgb(S.handed.color)}` : "no _giSunNodes"}   state.sunSlot ${S.sunSlot}  _gi2SunSlot ${S.gi2SunSlot}  _lightObjects ${S.lightObjects}`);
+for (const s of S.slots) console.log(`    slot active ${s.active} kind ${s.kind} vec ${rgb(s.vec)} color ${rgb(s.color)}`);
+for (const l of S.lights) console.log(`    DirectionalLight "${l.name}" visible ${l.visible} I ${l.intensity} color ${rgb(l.color)} worldDir ${rgb(l.worldDir)} toTarget ${rgb(l.toTarget)} target under ${l.targetParent} giShadowMode ${l.giShadowMode}`);
+const handedDir = S.handed?.dir ?? null;
+
+const POSES = [null, ...(process.env.POSES ?? "").split(";").filter(Boolean).map((p) => { const [e, a] = p.split("|"); return { eye: e.split(",").map(Number), aim: a.split(",").map(Number) }; })];
+for (let pi = 0; pi < POSES.length; pi++) {
+const pose = POSES[pi];
+console.log(`
+══ pose ${pi}: ${pose ? `${pose.eye} → ${pose.aim}` : "saved camera"} ══`);
 // ── (b)(c)(d) a fan of rays from the SAVED camera, every level-0 hit's face,
 // grouped by the palette chroma the voxel carries (brown = r/b > 2.5) ────────
-const B = await page.evaluate(async () => {
+const B = await page.evaluate(async ({ pose }) => {
   const eng = globalThis.__giEngineForProbe;
   const gi2 = globalThis.__gi2();
   const ws = await import("/src/modules/gi/window/windowStore.js");
@@ -162,6 +183,8 @@ const B = await page.evaluate(async () => {
   const { createGi2FaceTermProbe } = await import("/scripts/lib/gi2FaceTermProbe.js");
   const nz = (v) => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
   const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const gi2w = globalThis.__gi2();
+  if (pose) { await globalThis.__editorApi.call("viewport.setCamera", { position: pose.eye, target: pose.aim }); const f0 = gi2w.gather.frame; const dl = Date.now() + 40000; while (gi2w.gather.frame - f0 < 60 && Date.now() < dl) await new Promise((r) => setTimeout(r, 50)); }
   const cam = await globalThis.__editorApi.call("viewport.getCamera", {});
   const eye = cam.position; const aim = cam.target ?? [eye[0], eye[1], eye[2] - 1];
   const fwd = nz([aim[0] - eye[0], aim[1] - eye[1], aim[2] - eye[2]]);
@@ -199,12 +222,40 @@ const B = await page.evaluate(async () => {
   }
   if (!faces.length) return { error: "no level-0 faces", miss, notL0, badCell, hits: hits.length, eye, aim };
   const rows = await terms(faces.slice(0, 4096));
-  return { eye, aim, v0, miss, notL0, badCell, hits: hits.length, rows: rows.map((r) => ({ face: r.face, albedo: r.albedo, Esun: r.Esun, sunVis: r.sunVis, Enee: r.Enee, stored: r.stored, storedValid: r.storedValid, Erc: r.Erc, ercValid: r.ercValid, Efield: r.Efield })), diag: rows.diag };
-});
+  // ── the sun ray itself: where does it hit? (replicates pRay = p + n·v0/2, bias n·v0/2)
+  const sunNodes = globalThis.__giSys()?._giSunNodes; const sd = sunNodes?.dir?.value;
+  const toSun = sd ? nz([-sd.x, -sd.y, -sd.z]) : null;
+  let sunRays = null;
+  if (toSun) {
+    const facing = faces.filter((fc) => (fc.n[0] * toSun[0] + fc.n[1] * toSun[1] + fc.n[2] * toSun[2]) > 0.001).slice(0, 63 * 6);
+    const mk = (off) => facing.map((fc) => ({ o: [fc.p[0] + fc.n[0] * off, fc.p[1] + fc.n[1] * off, fc.p[2] + fc.n[2] * off], d: toSun, tMax: 40 }));
+    const run = async (rs) => { const out = []; for (let k = 0; k < rs.length; k += 63) out.push(...await shoot(rs.slice(k, k + 63))); return out; };
+    const hist = (hs) => { const h = { miss: 0, "t<0.3": 0, "t<1": 0, "t<3": 0, "t<10": 0, "t>=10": 0, lvl: {} }; for (const x of hs) { if (!x.hit) { h.miss++; continue; } h.lvl[x.level] = (h.lvl[x.level] ?? 0) + 1; if (x.t < 0.3) h["t<0.3"]++; else if (x.t < 1) h["t<1"]++; else if (x.t < 3) h["t<3"]++; else if (x.t < 10) h["t<10"]++; else h["t>=10"]++; } return h; };
+    const air = []; for (const dy of [0, 15, 30, 60]) { air.push({ o: [eye[0], eye[1] + dy, eye[2]], d: toSun, tMax: 200 }); air.push({ o: [eye[0], eye[1] + dy, eye[2]], d: [0, -1, 0], tMax: 200 }); air.push({ o: [eye[0], eye[1] + dy, eye[2]], d: [0, 1, 0], tMax: 200 }); }
+    const airHits = await shoot(air);
+    const airRows = air.map((r, i) => ({ y: r.o[1].toFixed(0), d: r.d === toSun ? "sun" : (r.d[1] < 0 ? "down" : "up"), hit: airHits[i].hit, t: +airHits[i].t.toFixed(2), level: airHits[i].level }));
+    sunRays = { airRows, n: facing.length, toSun, kernel: hist(await run(mk(v0 * 1.0))), out1m: hist(await run(mk(1.0))), out3m: hist(await run(mk(3.0))) };
+  }
+  return { sunRays, eye, aim, v0, miss, notL0, badCell, hits: hits.length, rows: rows.map((r) => ({ n: r.n, face: r.face, albedo: r.albedo, Esun: r.Esun, sunVis: r.sunVis, Enee: r.Enee, stored: r.stored, storedValid: r.storedValid, Erc: r.Erc, ercValid: r.ercValid, Efield: r.Efield })), diag: rows.diag };
+}, { pose });
 if (B.error) { console.log(`  (b-d) FAILED: ${JSON.stringify(B).slice(0, 300)}`); }
 else {
   const mean = (arr, pick) => { const s = [0, 0, 0]; let n = 0; for (const r of arr) { const v = pick(r); if (!v) continue; s[0] += v[0]; s[1] += v[1]; s[2] += v[2]; n++; } return n ? s.map((x) => x / n) : null; };
   console.log(`\n  saved camera eye ${B.eye.map((x) => x.toFixed(1))} → ${B.aim.map((x) => x.toFixed(1))}  v0 ${f(B.v0, 3)}  rays ${B.hits} miss ${B.miss} notL0 ${B.notL0} badCell ${B.badCell}  faces ${B.rows.length}  diag ${JSON.stringify(B.diag)}`);
+  if (B.sunRays) console.log(`  OPEN-AIR rays from the eye column: ${B.sunRays.airRows.map((r) => `y${r.y} ${r.d}:${r.hit ? `hit t${r.t} L${r.level}` : 'miss'}`).join('  ')}`);
+  if (B.sunRays) console.log(`  SUN RAYS from ${B.sunRays.n} sun-facing faces toward ${rgb(B.sunRays.toSun)}: kernel origin (p+n·v0) ${JSON.stringify(B.sunRays.kernel)}
+    1 m out ${JSON.stringify(B.sunRays.out1m)}
+    3 m out ${JSON.stringify(B.sunRays.out3m)}`);
+  {
+    const h = { vis0: 0, vis1: 0, other: 0 }; const byFace = {};
+    let facing = 0, facingLit = 0;
+    for (const r of B.rows) {
+      if (r.sunVis <= 0.001) h.vis0++; else if (r.sunVis >= 0.999) h.vis1++; else h.other++;
+      byFace[r.face] = (byFace[r.face] ?? 0) + 1;
+      if (handedDir) { const ndl = -(r.n[0] * handedDir[0] + r.n[1] * handedDir[1] + r.n[2] * handedDir[2]); if (ndl > 0.001) { facing++; if (r.sunVis > 0.5) facingLit++; } }
+    }
+    console.log(`  sunVis histogram ${JSON.stringify(h)}  faces by side ${JSON.stringify(byFace)}  sun-FACING (ndl>0 vs handed dir) ${facing}, of which lit ${facingLit}`);
+  }
   const groups = { "brown r/b>2.5": (r) => rb(r.albedo) > 2.5, "neutral r/b<1.3": (r) => rb(r.albedo) < 1.3 };
   for (const [name, sel] of Object.entries(groups)) {
     const g = B.rows.filter(sel); const lit = g.filter((r) => r.sunVis > 0.5); const pop = lit.length ? lit : g;
@@ -238,17 +289,18 @@ const meanOf = async (b64, y0, y1) => page.evaluate(async ({ b64, y0, y1 }) => {
   for (let i = 0; i < d.length; i += 4) { s[0] += Math.pow(d[i] / 255, 2.2); s[1] += Math.pow(d[i + 1] / 255, 2.2); s[2] += Math.pow(d[i + 2] / 255, 2.2); n++; }
   return s.map((x) => x / n);
 }, { b64, y0, y1 });
-const lit = await shotOf("lit");
+const lit = await shotOf(`lit-${pi}`);
 if (lit) {
   console.log(`\n  (e) lit frame — wall band (rows 30-60 %) ${rgb(await meanOf(lit, 0.3, 0.6))}   street band (rows 78-98 %) ${rgb(await meanOf(lit, 0.78, 0.98))}`);
 }
 await page.evaluate(() => { globalThis.__giDebugView = "indirect"; });
 await wait(2500);
-const ind = await shotOf("indirect");
+const ind = await shotOf(`indirect-${pi}`);
 if (ind) {
   const wall = await meanOf(ind, 0.3, 0.6); const street = await meanOf(ind, 0.78, 0.98);
   console.log(`  (e) INDIRECT view — wall band ${rgb(wall)} r/b ${f(rb(wall), 2)}   street band ${rgb(street)} r/b ${f(rb(street), 2)}`);
 }
 await page.evaluate(() => { globalThis.__giDebugView = "off"; });
+}
 if (lines.length) { console.log(`\n  console:`); for (const l of lines.slice(0, 12)) console.log(`    ${l}`); }
 await browser.close();

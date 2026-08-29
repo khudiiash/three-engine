@@ -659,6 +659,18 @@ user accepts GI2 by eye (`GI2_PATH = false` is the safety net).
    of CPU reference code in 0.1 is deliberate — those oracles test the code
    being retired.
 
+7. **HARNESS TICKET (6.33, not chased): the puppeteer Bistro renders as CLAY
+   while the GI palette is textured.** `probe:gi2-colour-chain` reads 408 KTX2
+   textures / 426 MB resident and per-material GPU averages that are plainly
+   the art (foliage `[0.015,0.033,0.012]`, façade `[0.227,0.099,0.045]`), and
+   the palette equals them class for class — yet the lit frame at any pose is
+   flat grey. The maps miss the RENDERED material, not the palette. The boot
+   console carries one 404 and `Failed to load module script … MIME type
+   "application/wasm"` (a transcoder/worker fetched as a module under the vite
+   shim). Every "the harness looks washed/flat" reading is suspect until this
+   is fixed; GI colour receipts must come from the palette/face-cache/indirect
+   readbacks, not from the lit frame.
+
 ---
 
 ## 7. SOURCES
