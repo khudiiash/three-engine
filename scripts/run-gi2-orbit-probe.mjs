@@ -86,6 +86,117 @@ await page.evaluate(async ({ p, t }) => {
 }, { p: POSE[0], t: POSE[1] });
 await wait(SETTLE * 1000);
 
+// ── SHOT=1 — the fallback instrument: the FINAL COMPOSED FRAME per orbit step
+// via `viewport.screenshot` (decoded in-page, sRGB → linear), scored on the
+// red-wall pixels. Coarser than the irradiance readback (a screenshot is not
+// one engine frame, and screen pixels slide over the wall as the camera moves)
+// but it sees exactly what the user sees.
+if (process.env.SHOT) {
+  const SW = Number(process.env.SW ?? 480), SH = Number(process.env.SH ?? 320);
+  const r = await page.evaluate(async ({ REST, ORBIT, AFTER, DEG, POSE, CENTRE, SW, SH }) => {
+    const viewport = globalThis.__giViewport;
+    const eye0 = POSE[0]; const tgt = POSE[1];
+    const rx = eye0[0] - CENTRE[0]; const rz = eye0[2] - CENTRE[2];
+    const setCam = (ang) => {
+      const c = Math.cos(ang); const s = Math.sin(ang);
+      const x = CENTRE[0] + rx * c - rz * s; const z = CENTRE[2] + rx * s + rz * c;
+      const tx = CENTRE[0] + (tgt[0] - CENTRE[0]) * c - (tgt[2] - CENTRE[2]) * s;
+      const tz = CENTRE[2] + (tgt[0] - CENTRE[0]) * s + (tgt[2] - CENTRE[2]) * c;
+      viewport.camera.position.set(x, eye0[1], z);
+      if (viewport.orbit) { viewport.orbit.target.set(tx, tgt[1], tz); viewport.orbit.update(); } else viewport.camera.lookAt(tx, tgt[1], tz);
+    };
+    const raf = () => new Promise((res) => requestAnimationFrame(() => res()));
+    const cv = document.createElement("canvas"); cv.width = SW; cv.height = SH;
+    const ctx = cv.getContext("2d", { willReadFrequently: true });
+    const lin = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+    const LUT = new Float32Array(256); for (let i = 0; i < 256; i++) LUT[i] = lin(i);
+    const grab = async () => {
+      const r = await globalThis.__editorApi.viewport.screenshot({ width: SW, height: SH, includeGizmos: false });
+      const raw0 = typeof r === "string" ? r : (r?.__image ?? r?.png ?? r?.dataUrl ?? r?.image ?? r?.data ?? r?.base64);
+      const raw1 = typeof raw0 === "string" ? raw0 : (raw0?.data ?? raw0?.base64 ?? String(raw0));
+      const url = raw1.startsWith("data:") ? raw1 : "data:image/png;base64," + raw1;
+      const img = new Image(); img.src = url; await img.decode();
+      ctx.drawImage(img, 0, 0); const d = ctx.getImageData(0, 0, SW, SH).data;
+      const R = new Float32Array(SW * SH), G = new Float32Array(SW * SH), B = new Float32Array(SW * SH);
+      for (let i = 0; i < SW * SH; i++) { R[i] = LUT[d[i * 4]]; G[i] = LUT[d[i * 4 + 1]]; B[i] = LUT[d[i * 4 + 2]]; }
+      return { R, G, B };
+    };
+    const isRed = (f, i) => f.R[i] > 0.02 && f.R[i] > 3 * f.G[i] && f.R[i] > 3 * f.B[i];
+    const q = (arr, p) => { if (!arr.length) return 0; const s = Float32Array.from(arr).sort(); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+    const steps = []; let prev = null; const total = REST + ORBIT + AFTER;
+    for (let i = 0; i < total; i++) {
+      const phase = i < REST ? "rest" : i < REST + ORBIT ? "orbit" : "after";
+      const ang = i < REST ? 0 : i < REST + ORBIT ? ((i - REST + 1) / ORBIT) * DEG * Math.PI / 180 : DEG * Math.PI / 180;
+      setCam(ang); await raf(); await raf();
+      const f = await grab();
+      // the red mask, eroded by one pixel so edge pixels never score
+      const mask = new Uint8Array(SW * SH);
+      for (let y = 1; y < SH - 1; y++) for (let x = 1; x < SW - 1; x++) {
+        const i0 = y * SW + x; if (!isRed(f, i0)) continue;
+        let ok = true; for (let dy = -1; dy <= 1 && ok; dy++) for (let dx = -1; dx <= 1; dx++) if (!isRed(f, i0 + dy * SW + dx)) { ok = false; break; }
+        mask[i0] = ok ? 1 : 0;
+      }
+      const rel = []; const gr = []; let ymin = SH, ymax = 0;
+      for (let i0 = 0; i0 < SW * SH; i0++) if (mask[i0]) { const y = (i0 / SW) | 0; if (y < ymin) ymin = y; if (y > ymax) ymax = y; }
+      const grTop = [], grMid = [], grBot = [];
+      for (let i0 = 0; i0 < SW * SH; i0++) {
+        if (!mask[i0]) continue;
+        const L = 0.2126 * f.R[i0] + 0.7152 * f.G[i0] + 0.0722 * f.B[i0];
+        if (prev && prev.mask[i0]) { const Lp = 0.2126 * prev.f.R[i0] + 0.7152 * prev.f.G[i0] + 0.0722 * prev.f.B[i0]; rel.push(Math.abs(L - Lp) / Math.max(Lp, 1e-3)); }
+        const g = f.G[i0] / f.R[i0]; gr.push(g);
+        const y = (i0 / SW) | 0; const t = (y - ymin) / Math.max(1, ymax - ymin);
+        (t < 0.15 ? grTop : t > 0.85 ? grBot : (t > 0.35 && t < 0.65 ? grMid : null))?.push(g);
+      }
+      const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+      const gm = mean(gr); const gs = Math.sqrt(mean(gr.map((v) => (v - gm) ** 2)));
+      steps.push({ i, phase, ang: +(ang * 180 / Math.PI).toFixed(1), n: rel.length, red: gr.length, p90: q(rel, 0.9), max: q(rel, 1), gmean: gm, gsig: gs, gmax: q(gr, 1), gTop: mean(grTop), gMid: mean(grMid), gBot: mean(grBot), gTopMax: q(grTop, 1), gBotMax: q(grBot, 1) });
+      prev = { f, mask };
+    }
+    return steps;
+  }, { REST, ORBIT, AFTER, DEG, POSE, CENTRE, SW, SH });
+  await browser.close();
+  const q = (arr, p) => { if (!arr.length) return 0; const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+  const by = (ph) => r.filter((x) => x.phase === ph && x.n > 0);
+  console.log(`\n══ SHOT arm — red-wall pixels of the composed frame, ${DEG}° over ${ORBIT} steps (${SW}x${SH}) — FLAGS ${process.env.FLAGS ?? "{}"} ══`);
+  for (const ph of ["rest", "orbit", "after"]) {
+    const rows = by(ph); const p90s = rows.map((x) => x.p90); const maxs = rows.map((x) => x.max);
+    console.log(`  ${ph.padEnd(6)} steps ${String(rows.length).padStart(3)}  red px ${rows[0]?.red ?? 0}  step p90: median ${(100 * q(p90s, 0.5)).toFixed(2)} %  p90 ${(100 * q(p90s, 0.9)).toFixed(2)} %  worst ${(100 * q(p90s, 1)).toFixed(2)} %   step max: median ${(100 * q(maxs, 0.5)).toFixed(2)} %  worst ${(100 * q(maxs, 1)).toFixed(2)} %`);
+  }
+  const stop = r.find((x) => x.phase === "after");
+  console.log(`  stop step (first after-frame): p90 ${(100 * (stop?.p90 ?? 0)).toFixed(2)} %  max ${(100 * (stop?.max ?? 0)).toFixed(2)} %`);
+  const g = (x) => `mean ${x.gmean.toFixed(3)} σ ${x.gsig.toFixed(3)} max ${x.gmax.toFixed(3)} | top(ceiling) ${x.gTop.toFixed(3)} (max ${x.gTopMax.toFixed(3)}) mid ${x.gMid.toFixed(3)} bottom(floor) ${x.gBot.toFixed(3)} (max ${x.gBotMax.toFixed(3)})`;
+  console.log(`  G/R on red pixels at rest before: ${g(r[REST - 1])}`);
+  console.log(`  G/R on red pixels at rest after : ${g(r[r.length - 1])}`);
+  console.log("  orbit p90 series: " + by("orbit").map((x) => (100 * x.p90).toFixed(1)).join(" "));
+  console.log("  orbit max series: " + by("orbit").map((x) => (100 * x.max).toFixed(1)).join(" "));
+  console.log("  after p90 series: " + by("after").map((x) => (100 * x.p90).toFixed(1)).join(" "));
+  if (OUT) writeFileSync(OUT, JSON.stringify(r));
+  process.exit(0);
+}
+if (process.env.GRID) {
+  const g = await page.evaluate(async () => {
+    const eng = globalThis.__giEngineForProbe; const sys = globalThis.__giSys(); const gi2 = globalThis.__gi2();
+    const viewport = globalThis.__giViewport;
+    const { createGi2PointSampler } = await import("/scripts/lib/gi2PointProbe.js");
+    const sampler = createGi2PointSampler({ renderer: eng.renderer, gi2, screen: sys.state.screen });
+    const px = []; const NX = 33, NY = 13;
+    for (let iy = 0; iy < NY; iy++) for (let ix = 0; ix < NX; ix++) px.push([Math.round((ix + 0.5) * sampler.width / NX), Math.round((iy + 0.5) * sampler.height / NY)]);
+    const out = await sampler.sample(px);
+    const rows = [];
+    for (let iy = 0; iy < NY; iy++) { let r = ""; for (let ix = 0; ix < NX; ix++) { const b = (iy * NX + ix) * sampler.OUT_VEC * 4; const w = out[b + 3]; const x = out[b]; r += w > 0.5 ? (x < -1.9 ? "R" : x > 2.7 ? "G" : "o") : "."; } rows.push(r); }
+    const cam = viewport.camera; cam.updateMatrixWorld(true);
+    const gb = sys.state.screen.gbuffer; let direct = null, direct2 = null;
+    try { const buf = new Float32Array(4); await eng.renderer.readRenderTargetPixelsAsync(gb.rt, (sampler.width / 2) | 0, (sampler.height / 2) | 0, 1, 1, buf, 0, 0); direct = Array.from(buf); } catch (e) { direct = String(e); }
+    try { const buf = new Float32Array(4); await eng.renderer.readRenderTargetPixelsAsync(gb.rt, 100, 100, 1, 1, buf, 0, 0); direct2 = Array.from(buf); } catch (e) { direct2 = String(e); }
+    const held = sys._gbufHeld; const heldFrames = sys._gbufferHeldFrames; const same = gb.rt.textures[0] === gb.position;
+    const engCam = eng.camera; const sameCam = engCam === cam; const ecp = engCam ? [engCam.position.x, engCam.position.y, engCam.position.z] : null;
+    return { direct, direct2, held, heldFrames, same, sameCam, ecp, rtSize: [gb.rt.width, gb.rt.height], rows, w: sampler.width, h: sampler.height, cam: [cam.position.x, cam.position.y, cam.position.z], q: cam.quaternion.toArray(), gi2cam: gi2?.uniforms?.rcCamera?.value ?? null };
+  });
+  console.log("  gbuffer validity grid (R = red-wall x, G = green-wall x, o = other, . = empty):"); for (const r of g.rows) console.log("   " + r);
+  console.log("  direct " + JSON.stringify(g.direct) + " direct2 " + JSON.stringify(g.direct2) + " held " + g.held + "/" + g.heldFrames + " sameTex " + g.same + " sameCam " + g.sameCam + " engCam " + JSON.stringify(g.ecp) + " rt " + JSON.stringify(g.rtSize));
+  console.log("  cam " + JSON.stringify(g.cam) + " q " + JSON.stringify(g.q.map((v) => +v.toFixed(3))));
+  await browser.close(); process.exit(0);
+}
 const res = await page.evaluate(async ({ REST, ORBIT, AFTER, DEG, POSE, RED_X, Y0, CENTRE }) => {
   const eng = globalThis.__giEngineForProbe;
   const sys = globalThis.__giSys();
