@@ -823,7 +823,11 @@ export function createRcCascades({
     },
   });
 
-  return {
+  // §19 6.30b — the instrument 6.30 named and never took: the live store,
+  // bins and `frame.pixelProbe` (a pixel → its c0 probe slot), on one handle,
+  // so a probe dump can read the gap corners' population and per-bin L against
+  // the lit end of the same face. Read-only; the last-built system wins.
+  const api = {
     tier, spacing0, store, bins, rayStore, frame, rayFrame, deposit, census,
     uniforms: {
       rcCamera: cameraU, rcAnchor: anchorU, rcWidth: widthU, rcFrameStamp: frameStampU,
@@ -900,6 +904,8 @@ export function createRcCascades({
       }
     },
   };
+  globalThis.__gi2Rc = api;
+  return api;
 }
 
 /** Every storage attribute hanging off a store object, without naming its keys. */
