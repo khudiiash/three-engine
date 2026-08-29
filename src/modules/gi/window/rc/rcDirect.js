@@ -160,6 +160,13 @@ export function createRcEmitterDirect({
    * turns on. Default 1; the shipped graph gains one `mix` against a uniform.
    */
   const shadowU = uniform(1);
+  /**
+   * §19 6.12 — THE RAW-PASS RECEIPT. At 1 the raw pass stores, for slot 0,
+   * `(valid, cosθ, h, readyU + 10·reach)` instead of visibility and both filters become a
+   * centre-tap copy, so a readback of `texture` says WHICH gate a texel took —
+   * "vis = 1.000 everywhere" is otherwise three different failures.
+   */
+  const debugU = uniform(0);
   const widthU = uniform(width, "uint");
   const heightU = uniform(height, "uint");
   const halfWU = uniform(halfW, "uint");
@@ -205,7 +212,9 @@ export function createRcEmitterDirect({
     If(gy.greaterThanEqual(halfHU), () => { Return(); });
     const s = surfaceAt(gx, gy);
     const v = [float(1).toVar(), float(1).toVar(), float(1).toVar(), float(1).toVar()];
+    const dbg = vec4(0, 0, 0, 0).toVar();
     If(s.valid, () => {
+      dbg.x.assign(1);
       const P = vec3(s.P).toVar();
       const Nf = vec3(s.N).toVar();
       for (let k = 0; k < slots.length; k++) {
@@ -219,6 +228,7 @@ export function createRcEmitterDirect({
           const wv = centre.sub(P).toVar();
           const d = sqrt(dot(wv, wv).max(1e-4)).toVar();
           const wd = wv.div(d).toVar();
+          if (k === 0) dbg.y.assign(dot(Nf, wd));
           // ⚠ THE COSINE GATE STORES 1, NOT 0 — see the header. A backfacing
           // texel has no visibility to report and its analytic factor is
           // already zero; a stored 0 would bleed across the terminator.
@@ -258,7 +268,16 @@ export function createRcEmitterDirect({
             // The voxel arm's reach and the exact arm's are DIFFERENT NUMBERS,
             // so both are computed and the branch picks one. Cheap: two
             // subtractions, no trace.
-            const reachVox = d.sub(clear).sub(float(v0 * 0.5)).max(v0 * 0.5).toVar();
+            // §19 6.12 — computed AFTER `slab` (below): the voxel arm's clearance
+            // is the OBB slab exit plus TWO level-0 cells, not `radius + v0/2`.
+            // Measured on Cornell (voxel arm, back wall): every lit ray stopped
+            // at t = reach − 0.09 m with `hit = 1` — inside the lamp's OWN bits.
+            // The lamp's bits are cell-snapped (≤ v0 past its surface) and then
+            // dilated by one cell (+ v0), so the conservative clearance past the
+            // slab exit is 2·v0; `radius + v0/2` was 0.87 m from the centre of a
+            // lamp whose bits reach 0.96 m along a diagonal. Direct read 0 at
+            // every wall pixel, lit or not.
+            const reachVox = float(0).toVar();
             // ⭐⭐⭐ AND THE EXACT ARM'S CLEARANCE IS THE OBB'S SLAB EXIT, NOT
             // THE BOUNDING SPHERE — this is the "no shadow on the wall behind
             // the tall box" report.
@@ -288,7 +307,16 @@ export function createRcEmitterDirect({
             const ex = vec3(slot.exHalf).abs().max(1e-4).toVar();
             const aw = vec3(wd).abs().max(1e-6).toVar();
             const slab = ex.x.div(aw.x).min(ex.y.div(aw.y)).min(ex.z.div(aw.z)).toVar();
-            const reachBvh = d.sub(slab.min(clear)).max(1e-3).toVar();
+            // ⭐⭐ §19 6.12 — AND A MARGIN BEFORE THE SLAB EXIT. The slab exit IS
+            // the lamp's face along this ray, so a ray stopped exactly there
+            // ends ON the face triangle: Möller-Trumbore returns t = maxT to
+            // the last ulp and the comparison lands on the "hit" side — brute
+            // force on the soup found EVERY back-wall ray (lit or not) hitting
+            // the lamp's own front face at t = maxT − 1e-4 (tri 72, z = 1.09).
+            // 0.1 % of the distance (4 mm at 4 m) is 10⁴ f32 ulps and still a
+            // contact shadow the voxel arm could never resolve.
+            const reachBvh = d.sub(slab.min(clear)).sub(d.mul(1e-3).max(2e-3)).max(1e-3).toVar();
+            reachVox.assign(d.sub(slab.min(clear)).sub(float(2 * v0)).max(v0 * 0.5));
             // ⭐⭐⭐ THE ONE LINE STAGE 5.5b EXISTS FOR. `traceWindow` asks the
             // voxels whether anything is between here and the lamp; `anyHitFrom`
             // asks the TRIANGLES. The difference only shows on a ray that starts
@@ -310,15 +338,22 @@ export function createRcEmitterDirect({
                 h.assign(BVH.anyHitFrom(P, wd, reachBvh, Nf));
               });
             } else {
-              h.assign(traceWindow(P, wd, reachVox, Nf).hit);
+              const tr = traceWindow(P, wd, reachVox, Nf);
+              h.assign(tr.hit);
+              if (k === 0) dbg.y.assign(tr.t); // 6.12 receipt: WHERE the voxel ray stopped
             }
             v[k].assign(float(1).sub(h));
+            if (k === 0) { dbg.z.assign(h); dbg.w.assign(BVH ? BVH.readyU.add(reachBvh.mul(10)) : reachVox); }
           });
         });
       }
     });
-    textureStore(visA, ivec2(gx.toInt(), gy.toInt()), vec4(v[0], v[1], v[2], v[3]));
+    const outV = vec4(v[0], v[1], v[2], v[3]).toVar();
+    If(debugU.greaterThan(0.5), () => { outV.assign(dbg); });
+    textureStore(visA, ivec2(gx.toInt(), gy.toInt()), outV);
   })().compute(halfW * halfH);
+  // §19 6.12 — the slot re-binds this kernel when the worker's tree lands.
+  if (BVH) BVH.attach?.(rawPass);
 
   // ── [F] THE SEPARABLE CROSS-BILATERAL, TWICE ─────────────────────────────
   //
@@ -356,6 +391,7 @@ export function createRcEmitterDirect({
     });
     const out = vec4(1, 1, 1, 1).toVar();
     If(wsum.greaterThan(0), () => { out.assign(acc.div(wsum)); });
+    If(debugU.greaterThan(0.5), () => { out.assign(srcNode.load(ivec2(gx.toInt(), gy.toInt()))); });
     textureStore(dstTex, ivec2(gx.toInt(), gy.toInt()), out);
   })().compute(halfW * halfH);
 
@@ -412,7 +448,11 @@ export function createRcEmitterDirect({
     directAt,
     /** The FILTERED visibility (V writes back into A) — for a debug read. */
     texture: visA,
-    uniforms: { rcDirectWidth: widthU, rcDirectHeight: heightU, rcDirectShadow: shadowU },
+    /** The gbuffer textures this pass CAPTURED at build — for the stale-binding receipt. */
+    bound: { position: gbuffer.position, normal: gbuffer.normal },
+    /** The BVH slot this kernel CAPTURED at build — identity receipt vs `gi2.shadowBvh`. */
+    bvhSlot: BVH,
+    uniforms: { rcDirectWidth: widthU, rcDirectHeight: heightU, rcDirectShadow: shadowU, rcDirectDebug: debugU },
     halfW,
     halfH,
     setSize(w, h) {
