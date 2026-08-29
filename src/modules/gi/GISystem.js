@@ -10790,9 +10790,12 @@ export class GISystem {
   /** Resolve resolution: half the drawing buffer, clamped to a PIXEL budget. */
   /** §19 6.29 — the describe-level parameters a kept GI2 system must still match. */
   #gi2Signature() {
-    const { width, height } = this.#screenResolveSize();
+    // §19 6.34 — NO W×H TERM. A resolve resize is handled in place by
+    // `gi2.setSize` (screen-sized targets only); carrying the size here made
+    // the NEXT rebuild after any governor step a full re-allocation (the light
+    // restarted from black on every rung).
     const props = this.config ?? {};
-    return `${gi2TierOf(props)}:${width}x${height}:ao${props.ao !== false ? 1 : 0}:em${props.emissiveShadows !== false ? 1 : 0}`;
+    return `${gi2TierOf(props)}:ao${props.ao !== false ? 1 : 0}:em${props.emissiveShadows !== false ? 1 : 0}`;
   }
 
   #screenResolveSize() {
@@ -18477,12 +18480,27 @@ export class GISystem {
     // promotion can re-derive without re-walking the scene. Cleared with the
     // build, like every other per-state field.
     this._gi2MoverMeshes = meshes;
+    // §19 6.34 — a promoted mover that SETTLED (see `#refreshGi2Movers`) goes
+    // back to static here, on the first real rebuild, where the soup is being
+    // re-read at its current pose anyway: the settle itself buys no rebuild.
+    if (this._gi2SettleAsked?.size) {
+      for (const mesh of this._gi2SettleAsked) if (this._gi2Mobility?.stateOf(mesh) === "promoted") this._gi2Mobility.demote(mesh);
+      this._gi2SettleAsked.clear();
+    }
     const movers = this.#gi2Movers(meshes);
     this._gi2Movers = movers;
     // A mover is in the DYNAMIC layer, re-voxelized from its live matrix every
     // frame — so it must not ALSO be baked into the static soup at its build
     // pose, or it leaves a permanent ghost of itself where it started.
     const moverMeshes = new Set(movers.map((m) => m.mesh));
+    // §19 6.34 — A PROMOTED "auto" MOVER STAYS IN THE SOUP, MASKED. Holding it
+    // out changed the placement list, so the soup key moved and the worker
+    // re-ran on every promotion and every settle (Bistro: `runs 20 / asks 24`
+    // in minutes). Now its slot is in `excludedSlots`: hidden from the static
+    // voxelizer and the exact-shadow tree, served by the dynamic layer, and the
+    // soup key holds. Pinned "dynamic" and skinned movers are held out as before.
+    const heldOut = new Set();
+    for (const mesh of moverMeshes) if (this._gi2Mobility?.stateOf(mesh) !== "promoted") heldOut.add(mesh);
     // ── THE "auto" MOTION WATCH (§19 Stage 4.0) ──────────────────────────────
     // Every mesh that is neither pinned nor already seated, recorded at its
     // build pose. `#refreshGi2Movers` compares against this and promotes the
@@ -18511,14 +18529,16 @@ export class GISystem {
     this._gi2AutoWatchKey = this._gi2StaticWatchKey;
     this._gi2AutoWatchCursor = 0;
     this._gi2MoversDirty = false;
-    const staticPlacements = moverMeshes.size
-      ? enriched.filter((p) => !moverMeshes.has(p.mesh))
+    const staticPlacements = heldOut.size
+      ? enriched.filter((p) => !heldOut.has(p.mesh))
       : enriched;
     // §19 6.21 — mesh → its static placement slot(s), so a promotion can drop
     // the mesh's triangles from the exact-shadow tree the frame it moves.
     const slotOf = new Map();
     for (const p of staticPlacements) { if (p.mesh && Number.isFinite(p.slot)) (slotOf.get(p.mesh) ?? slotOf.set(p.mesh, []).get(p.mesh)).push(p.slot); }
     this._gi2StaticSlotOf = slotOf;
+    const excludedSlots = [];
+    for (const mesh of moverMeshes) if (!heldOut.has(mesh)) for (const slot of slotOf.get(mesh) ?? []) excludedSlots.push(slot);
     const soupKey = `${geometries.length}:${staticPlacements.length}:${parts.join(",")}`;
     // §19 Stage 4.0b: the join a re-tint needs — key → the mesh whose material
     // it re-resolves and the AREA it was weighted with. Held here (not on the
@@ -18555,7 +18575,7 @@ export class GISystem {
         ? `; ⚠ ${skippedTransparent} TRANSPARENT EMISSIVE placement(s) skipped by the mesh filter — ` +
           "they occlude nothing and bounce nothing; split the glowing part into an opaque mesh to light the scene with it"
         : ""));
-    gi2.build({ geometries, placements: staticPlacements, movers, soupKey })
+    gi2.build({ geometries, placements: staticPlacements, movers, soupKey, excludedSlots })
       .then((ok) => {
         if (!ok || this.state?.screen?.gi2 !== gi2) return;
         console.log(
@@ -19075,12 +19095,24 @@ export class GISystem {
         // 6.21b — ONCE per promotion: `_gi2SettleAsked` is cleared when the mesh is
         // promoted and set when the rebuild is asked, so a re-seat that re-seeds
         // `restFrames` cannot ask again. `__gi2MoverSettleRebuild = false` opts out.
-        if (globalThis.__gi2MoverSettleRebuild !== false && !m.skinned && m.mesh && m.restFrames >= GI2_MOVER_SETTLE_FRAMES && this._gi2Mobility?.stateOf(m.mesh) === "promoted" && !(this._gi2SettleAsked ??= new Set()).has(m.mesh)) {
+        // §19 6.34 — A SETTLED MOVER DOES NOT REBUILD. Its static copy is at the
+        // build pose, so it stays in the dynamic layer at rest (one box of
+        // dynamic voxels — 6.22's rule 3 says that is cheap) instead of buying a
+        // soup worker run + tree rebuild + re-voxelize per settle. It returns to
+        // the static set on the next REAL rebuild (a scene edit), where
+        // `#finishGi2Build` re-derives the mask. `__gi2MoverSettleRebuild = true`
+        // restores the old settle rebuild for an A/B.
+        if (!m.skinned && m.mesh && m.restFrames >= GI2_MOVER_SETTLE_FRAMES && this._gi2Mobility?.stateOf(m.mesh) === "promoted" && !(this._gi2SettleAsked ??= new Set()).has(m.mesh)) {
           this._gi2SettleAsked.add(m.mesh);
-          // §19 6.22: the resolver owns the classification — demote there.
-          this._gi2Mobility.demote(m.mesh);
-          console.log(`[gi2] mover settled: "${m.mesh.name}" returns to the static set — rebuild`);
-          this.requestRebuild("gi2-mover-settled");
+          if (globalThis.__gi2MoverSettleRebuild === true) {
+            // §19 6.22: the resolver owns the classification — demote there.
+            this._gi2Mobility.demote(m.mesh);
+            console.log(`[gi2] mover settled: "${m.mesh.name}" returns to the static set — rebuild`);
+            this.requestRebuild("gi2-mover-settled");
+          } else {
+            this._gi2MoversSettled = (this._gi2MoversSettled ?? 0) + 1;
+            console.log(`[gi2] mover settled: "${m.mesh.name}" rests in the dynamic layer (6.34: no rebuild, no soup re-kick)`);
+          }
         }
       }
     }
@@ -19126,16 +19158,24 @@ export class GISystem {
         mobility.promote(mesh);
         this._gi2SettleAsked?.delete(mesh);
         adopted++;
-        // §19 6.21 — out of the exact-shadow tree NOW: its old pose must not shadow.
-        for (const s of this._gi2StaticSlotOf?.get(mesh) ?? []) gi2.setStaticExcluded?.(s, true);
+        // §19 6.21/6.34 — out of the exact-shadow tree AND the static voxels
+        // NOW, by the per-placement mask: its build pose must not shadow. The
+        // bricks that pose touches are re-voxelized (one box, queued); no soup
+        // worker run, no tree rebuild, no GI rebuild.
+        let masked = 0;
+        for (const s of this._gi2StaticSlotOf?.get(mesh) ?? []) if (gi2.setStaticExcluded?.(s, true)) masked++;
+        if (masked && mesh.geometry?.boundingBox && gi2.dirtyBox) {
+          const bx = (this._gi2DirtyBox ??= new THREE.Box3()).copy(mesh.geometry.boundingBox).applyMatrix4(w.matrix);
+          const pad = gi2.win?.voxel0 ?? 0;
+          gi2.dirtyBox([bx.min.x - pad, bx.min.y - pad, bx.min.z - pad], [bx.max.x + pad, bx.max.y + pad, bx.max.z + pad]);
+        }
       }
       if (adopted) {
         console.log(
           `[gi2] mobility: promoted ${adopted} "auto" mesh(es) that moved → dynamic layer; ` +
-            "the static soup re-kicks without them (they return to static once they settle — 6.21's rebuild).",
+            "their static copies are masked (6.34: no soup re-kick, no rebuild).",
         );
         this._gi2MoversDirty = true;
-        this.requestRebuild("gi2:mobility-promoted");
       }
     }
     if (!this._gi2MoversDirty) return;
