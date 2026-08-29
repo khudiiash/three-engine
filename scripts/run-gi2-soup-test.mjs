@@ -31,6 +31,8 @@ import {
 import {
   PAL_NONE as API_PAL_NONE, SOUP_CELL_SIZE as API_CELL, createTriangleSoupBuilder,
 } from "../src/modules/gi/window/triangleSoup.js";
+import * as THREE from "three";
+import { estimateMaterialAreaShares, serializeMeshForBake } from "../src/modules/gi/voxelizeOnce.js";
 
 let failures = 0;
 let checks = 0;
@@ -206,10 +208,109 @@ function checkGrid(G, soup) {
   ok(Gp, API_PAL_NONE === PAL_NONE && API_CELL === SOUP_CELL_SIZE, "API constants disagree with the worker's");
   ok(Gp, soup.bytes === soup.tris.byteLength + soup.triPal.byteLength + soup.cellRange.byteLength + soup.cellTris.byteLength,
     `bytes ${soup.bytes} is not the sum of the four arrays`);
-  ok(Gp, soupTransferables(soup).length === 4, "transfer list is not the four distinct buffers");
+  ok(Gp, soupTransferables(soup).length === 5, "transfer list is not the five distinct buffers (including triOwner)");
 }
 
 // ── 4. degenerate drops ──────────────────────────────────────────────────────
+{
+  const G = "groups";
+  const geo = boxIndexed(1, 1, 1); // 12 indexed triangles / 36 draw elements
+  geo.groups = [
+    { start: 0, count: 18, materialIndex: 0 },
+    { start: 18, count: 18, materialIndex: 1 },
+  ];
+  const grouped = buildTriangleSoup({
+    geometries: new Map([["grouped", geo]]),
+    placements: [{ geometryKey: "grouped", matrix: matrix(0, 0, 0), pal: 3, pals: [3, 17] }],
+  });
+  ok(G, grouped.triCount === 12, `grouped triCount ${grouped.triCount}`);
+  ok(G, Array.from({ length: 6 }, (_, t) => palOf(grouped, t)).every((p) => p === 3),
+    `material slot 0 did not own triangles 0..5: ${Array.from({ length: 6 }, (_, t) => palOf(grouped, t))}`);
+  ok(G, Array.from({ length: 6 }, (_, t) => palOf(grouped, t + 6)).every((p) => p === 17),
+    `material slot 1 did not own triangles 6..11: ${Array.from({ length: 6 }, (_, t) => palOf(grouped, t + 6))}`);
+
+  // Transparent/volume material ranges are absent from occupancy, but an
+  // opaque sibling range in the same mesh must remain. Inactive ranges also
+  // must not consume the tier's triangle cap before the opaque range arrives.
+  const onlyFirst = buildTriangleSoup({
+    geometries: new Map([["grouped", geo]]),
+    placements: [{ geometryKey: "grouped", matrix: matrix(0, 0, 0), pal: 3, pals: [3, 17], active: [true, false] }],
+  });
+  ok(G, onlyFirst.triCount === 6 && Array.from({ length: 6 }, (_, t) => palOf(onlyFirst, t)).every((p) => p === 3),
+    `inactive second range survived: count=${onlyFirst.triCount}`);
+  const onlySecond = buildTriangleSoup({
+    geometries: new Map([["grouped", geo]]),
+    placements: [{ geometryKey: "grouped", matrix: matrix(0, 0, 0), pal: 3, pals: [3, 17], active: [false, true] }],
+  });
+  ok(G, onlySecond.triCount === 6 && Array.from({ length: 6 }, (_, t) => palOf(onlySecond, t)).every((p) => p === 17),
+    `inactive first range survived or changed palette: count=${onlySecond.triCount}`);
+  const cappedSecond = buildTriangleSoup({
+    geometries: new Map([["grouped", geo]]), triCap: 4,
+    placements: [{ geometryKey: "grouped", matrix: matrix(0, 0, 0), pal: 3, pals: [3, 17], active: [false, true] }],
+  });
+  ok(G, cappedSecond.triCount === 4 && Array.from({ length: 4 }, (_, t) => palOf(cappedSecond, t)).every((p) => p === 17),
+    `inactive prefix consumed the cap: count=${cappedSecond.triCount}`);
+  const unusedOpaque = { ...geo, groups: [{ start: 0, count: 36, materialIndex: 0 }] };
+  const noDrawnOpaque = buildTriangleSoup({
+    geometries: new Map([["unused-opaque", unusedOpaque]]),
+    placements: [{ geometryKey: "unused-opaque", matrix: matrix(0, 0, 0), pal: 3,
+      pals: [3, 17], active: [false, true] }],
+  });
+  ok(G, noDrawnOpaque.triCount === 0,
+    `an unused opaque material slot made transparent drawn groups occupy ${noDrawnOpaque.triCount} triangles`);
+
+  // Old callers hand in one `pal`. Groups must be a strict no-op for them.
+  const scalar = buildTriangleSoup({
+    geometries: new Map([["grouped", geo]]),
+    placements: [{ geometryKey: "grouped", matrix: matrix(0, 0, 0), pal: 9 }],
+  });
+  ok(G, Array.from({ length: 12 }, (_, t) => palOf(scalar, t)).every((p) => p === 9),
+    "a grouped geometry changed legacy scalar-pal behaviour");
+  const missingSlot = buildTriangleSoup({
+    geometries: new Map([["grouped", geo]]),
+    placements: [{ geometryKey: "grouped", matrix: matrix(0, 0, 0), pal: 11, pals: [11] }],
+  });
+  ok(G, Array.from({ length: 6 }, (_, t) => palOf(missingSlot, t + 6)).every((p) => p === 11),
+    "a missing material-slot palette did not fall back to scalar pal");
+
+  // The real mesh serializer must carry the native draw ranges, and a group
+  // edit must change geometry identity even when position.version does not.
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(geo.positions, 3));
+  geometry.setIndex(new THREE.BufferAttribute(geo.index, 1));
+  geometry.addGroup(0, 18, 0);
+  geometry.addGroup(18, 18, 1);
+  const mesh = new THREE.Mesh(geometry, [new THREE.MeshBasicMaterial(), new THREE.MeshBasicMaterial()]);
+  const record = serializeMeshForBake(mesh, { geometryOnly: true });
+  ok(G, record.groups?.length === 2 && record.groups[1].materialIndex === 1,
+    `serializer lost groups: ${JSON.stringify(record.groups)}`);
+  const keyBefore = record.geometryKey;
+  geometry.clearGroups();
+  geometry.addGroup(0, 36, 1);
+  const changed = serializeMeshForBake(mesh, { geometryOnly: true });
+  ok(G, changed.geometryKey !== keyBefore, "a group edit reused the old geometry/soup key");
+  geometry.dispose();
+  for (const material of mesh.material) material.dispose();
+
+  // Palette clustering is weighted by physical triangle area, not topology.
+  // One large triangle and 100 small triangles below cover the same total
+  // area; a count-weighted implementation reports ~1/101 and reproduces the
+  // wrong-colour bias seen on heavily tessellated material ranges.
+  const areaPositions = [0, 0, 0, 2, 0, 0, 0, 1, 0]; // area = 1
+  for (let i = 0; i < 100; i++) {
+    const x = i * 0.25;
+    areaPositions.push(x, 0, 0, x + 0.2, 0, 0, x, 0.1, 0); // area = .01
+  }
+  const areaGeometry = new THREE.BufferGeometry();
+  areaGeometry.setAttribute("position", new THREE.Float32BufferAttribute(areaPositions, 3));
+  areaGeometry.addGroup(0, 3, 0);
+  areaGeometry.addGroup(3, 300, 1);
+  const shares = estimateMaterialAreaShares(areaGeometry, 2);
+  ok(G, Math.abs(shares[0] - 0.5) < 1e-5 && Math.abs(shares[1] - 0.5) < 1e-5,
+    `material palette weights follow tessellation instead of area: ${shares.join("/")}`);
+  areaGeometry.dispose();
+}
+
 {
   const G = "drops";
   // 5 triangles: good, repeated-vertex, collinear, NaN, good.
@@ -329,6 +430,17 @@ function checkGrid(G, soup) {
   ok(G, typeof soup.postStallMs === "number" && typeof soup.wallMs === "number", "builder did not report its timings");
   ok(G, palOf(soup, 0) === 5, "builder lost the palette");
   ok(G, soup.stats.placementsBuilt === 1, "builder shipped a geometry nothing places");
+  const groupedGeo = boxIndexed(1, 1, 1);
+  groupedGeo.groups = [
+    { start: 0, count: 18, materialIndex: 0 },
+    { start: 18, count: 18, materialIndex: 1 },
+  ];
+  const groupedSoup = await b1.build({
+    geometries: new Map([["grouped", groupedGeo]]),
+    placements: [{ geometryKey: "grouped", matrix: matrix(0, 0, 0), pal: 4, pals: [4, 23] }],
+  });
+  ok(G, palOf(groupedSoup, 0) === 4 && palOf(groupedSoup, 11) === 23,
+    "builder structured-clone path lost groups or per-slot palettes");
 
   // (b) copyInputs:false donates — the caller's array is detached, which is
   // what makes the "document it" warning in triangleSoup.js load-bearing.

@@ -350,6 +350,82 @@ export function resolveMaterialSurface(materialInput, meshName = "") {
  * copied — the live geometry stays untouched.
  */
 const geometryCopyCache = new WeakMap(); // geometry -> { version, positions, index }
+const materialAreaShareCache = new WeakMap();
+
+/**
+ * Bounded, area-weighted material-group shares for GI palette clustering.
+ * Triangle counts are not a surface measure: a finely tessellated decal could
+ * otherwise outweigh a large two-triangle wall and drag its voxel class to the
+ * decal colour. Up to 512 stratified triangles are sampled per geometry, then
+ * cached by buffer/group versions; small meshes are exact.
+ */
+export function estimateMaterialAreaShares(geometry, materialCount = 1) {
+  const position = geometry?.attributes?.position;
+  if (!position) return [1];
+  const index = geometry.index;
+  const triCount = Math.max(0, Math.floor((index?.count ?? position.count) / 3));
+  const slots = Math.max(1, Math.floor(materialCount || 1));
+  const groups = (geometry.groups ?? []).map((g) => ({
+    start: Math.min(triCount, Math.floor(Math.max(0, Number(g?.start) || 0) / 3)),
+    end: Math.min(triCount, Math.ceil((Math.max(0, Number(g?.start) || 0) + Math.max(0, Number(g?.count) || 0)) / 3)),
+    materialIndex: Math.max(0, Math.floor(Number(g?.materialIndex) || 0)),
+  })).filter((g) => g.end > g.start)
+    .sort((a, b) => (a.start - b.start) || (a.end - b.end) || (a.materialIndex - b.materialIndex));
+  const signature = `${position.version ?? 0}:${index?.version ?? 0}:${triCount}:${slots}:` +
+    groups.map((g) => `${g.start}-${g.end}@${g.materialIndex}`).join(";");
+  const cached = materialAreaShareCache.get(geometry);
+  if (cached?.signature === signature) return cached.shares;
+
+  const segments = [];
+  let cursor = 0;
+  for (const g of groups) {
+    if (g.start > cursor) segments.push({ start: cursor, end: g.start, slot: 0 });
+    const from = Math.max(cursor, g.start);
+    const to = Math.max(from, g.end);
+    if (to > from) segments.push({ start: from, end: to, slot: g.materialIndex < slots ? g.materialIndex : 0 });
+    cursor = Math.max(cursor, g.end);
+  }
+  if (cursor < triCount) segments.push({ start: cursor, end: triCount, slot: 0 });
+  if (segments.length === 0 && triCount > 0) segments.push({ start: 0, end: triCount, slot: 0 });
+
+  const weights = new Float64Array(slots);
+  const counts = new Float64Array(slots);
+  const vertex = (triangle, corner) => index ? index.getX(triangle * 3 + corner) : triangle * 3 + corner;
+  const areaAt = (triangle) => {
+    const i0 = vertex(triangle, 0), i1 = vertex(triangle, 1), i2 = vertex(triangle, 2);
+    const ax = position.getX(i1) - position.getX(i0);
+    const ay = position.getY(i1) - position.getY(i0);
+    const az = position.getZ(i1) - position.getZ(i0);
+    const bx = position.getX(i2) - position.getX(i0);
+    const by = position.getY(i2) - position.getY(i0);
+    const bz = position.getZ(i2) - position.getZ(i0);
+    const cx = ay * bz - az * by;
+    const cy = az * bx - ax * bz;
+    const cz = ax * by - ay * bx;
+    return 0.5 * Math.hypot(cx, cy, cz);
+  };
+  for (const segment of segments) {
+    const count = segment.end - segment.start;
+    counts[segment.slot] += count;
+    const samples = Math.min(count, Math.max(1, Math.ceil(512 * count / Math.max(1, triCount))));
+    let sampledArea = 0;
+    for (let s = 0; s < samples; s++) {
+      const triangle = segment.start + Math.min(count - 1, Math.floor((s + 0.5) * count / samples));
+      sampledArea += areaAt(triangle);
+    }
+    weights[segment.slot] += sampledArea * count / samples;
+  }
+  let total = 0;
+  for (const w of weights) total += w;
+  if (!(total > 1e-12)) {
+    total = 0;
+    for (const n of counts) total += n;
+    for (let i = 0; i < slots; i++) weights[i] = counts[i];
+  }
+  const shares = Array.from(weights, (w) => w / Math.max(total, 1));
+  materialAreaShareCache.set(geometry, { signature, shares });
+  return shares;
+}
 
 export function serializeMeshForBake(mesh, { geometryOnly = false } = {}) {
   const position = mesh.geometry?.attributes?.position;
@@ -420,14 +496,33 @@ export function serializeMeshForBake(mesh, { geometryOnly = false } = {}) {
     };
     geometryCopyCache.set(mesh.geometry, cached);
   }
+  // BufferGeometry groups are expressed in INDEX/VERTEX elements, not in
+  // triangles. Keep that native representation here: the soup worker already
+  // walks triangles in element order and can turn the ranges into palette-slot
+  // changes without expanding a per-triangle material array on the main thread.
+  // A copy is required because `geometry.groups` is live mutable editor state.
+  const groups = (mesh.geometry.groups ?? [])
+    .map((g) => ({
+      start: Math.max(0, Math.floor(Number(g?.start) || 0)),
+      count: Math.max(0, Math.floor(Number(g?.count) || 0)),
+      materialIndex: Math.max(0, Math.floor(Number(g?.materialIndex) || 0)),
+    }))
+    .filter((g) => g.count > 0);
+  // Group edits do not increment `position.version`, but they DO change the
+  // soup's per-triangle palette bytes. Put their compact signature in the
+  // geometry identity so a group edit cannot reuse a soup with stale colours.
+  const groupKey = groups.length
+    ? `:${groups.map((g) => `${g.start}+${g.count}@${g.materialIndex}`).join(";")}`
+    : "";
   const record = {
     // Identity for the worker's incremental diffing + geometry cache: the
     // key changes when geometry content does, so edits re-ship exactly once.
     id: mesh.id,
-    geometryKey: `${mesh.geometry.id}:${version}`,
+    geometryKey: `${mesh.geometry.id}:${version}${groupKey}`,
     positions: cached.positions,
     index: cached.index,
     uvs: cached.uvs,
+    groups,
   };
   if (surface) {
     record.matrix = [...mesh.matrixWorld.elements];

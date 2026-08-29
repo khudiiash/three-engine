@@ -80,6 +80,7 @@ import { createWindowDynamic, moverBoxSoup } from "./windowDynamic.js";
 import { createTriangleSoupBuilder, SoupSupersededError, PAL_NONE } from "./triangleSoup.js";
 import { createShadowBvhBuilder, createShadowBvhSlot } from "./shadowBvh.js";
 import { createGiGather, GATHER_TIERS, PAL_ENTRIES, STATS } from "./gatherProbes.js";
+import { createPaletteTransaction } from "./paletteTransaction.js";
 import { createRcCascades } from "./rc/rcSystem.js";
 import { rcHitPathEnabled } from "./rc/rcConfig.js";
 import { rc5PixelNeeEnabled } from "../giConfig.js";
@@ -604,6 +605,7 @@ export function createGi2System({
    * `shadeHit`, its uniform bag and its palette, so it cannot outlive one.
    */
   let rc = null;
+  let pendingRcTransport = null;
   const RC5 = rc5PathEnabled();
   /**
    * §19 5.4b — the old world path is not BUILT under RC5 (`worldProbes`' LEAN
@@ -767,6 +769,22 @@ export function createGi2System({
   // The class assignment this build baked into the soup and the voxel bytes —
   // the ONLY thing `#retintGi2Palette` may reuse (see `build`).
   let paletteAssign = null;
+  // A topology-changing carried build must not publish a newly clustered table
+  // while the old soup/class bytes still serve frames. The transaction holds
+  // RC first, stages table + assignment together, and publishes both only once
+  // the replacement field has drained its full refill.
+  const paletteTransaction = createPaletteTransaction({
+    publish(next) {
+      gather.setPalette(next.palette);
+      paletteAssign = next.assignment;
+    },
+    setHold(on, phase) {
+      rcHold = on;
+      // Worker time is deliberately outside the refill watchdog. A large soup
+      // may take seconds off-thread; only the installed voxelizer can drain.
+      if (on && phase === "refilling") rcHoldStart = frame;
+    },
+  });
   let lastVox = null;
   let lastDyn = null;
   let lastGather = null;
@@ -790,8 +808,17 @@ export function createGi2System({
   const camPos = new THREE.Vector3();
   const viewProj = new THREE.Matrix4();
   const prevViewProj = new THREE.Matrix4();
+  // Tick-to-tick camera pose, separate from `prevViewProj` (which follows the
+  // last COMMITTED image and may intentionally lag while a gather is deferred).
+  const lastTickViewProj = new THREE.Matrix4();
   let camera = null;
   let placed = false;
+  let cameraMotionBudget = false;
+  let externalMotionBudget = false;
+  // The RC cap is a scheduling hint only. Camera and scene motion share it,
+  // while the committed gather/history remains untouched and keeps lighting
+  // visible until the bounded update catches up.
+  const syncMotionBudget = () => rc?.setMotion?.(cameraMotionBudget || externalMotionBudget);
   let pendingScroll = true;
   let scrollInLastList = false;
 
@@ -937,6 +964,7 @@ export function createGi2System({
         width,
         height,
         tier,
+        transport: pendingRcTransport,
         // §19 5.3 — the seated emitters' direct term at the pixel. The same
         // four slots `emitterDirectPass` reads on the screen path and
         // `worldProbes.neePass` reads on the world one; the cascades had no
@@ -946,7 +974,11 @@ export function createGi2System({
           u: gather.uniforms,
           dominantFace: gather.internals.dominantFace,
           faceSamplePoint: gather.internals.faceSamplePoint,
-          shadeHit: gather.internals.shadeHit,
+          // [J] already owns five non-shadow storage bindings. The ordinary
+          // exact shade adds the BVH's five and produces an invalid 10-buffer
+          // compute layout on baseline WebGPU devices, so this one consumer
+          // keeps the window-shadow variant. Screen/pixel paths remain exact.
+          shadeHit: gather.internals.shadeHitPortable,
           // §19 5.3 — the albedo/emission [J] deposits with, from the same two
           // tables and under the same two rules `shadeHit` reads them.
           hitPalette: gather.internals.hitPalette,
@@ -971,6 +1003,7 @@ export function createGi2System({
         shadowBvh,
       })
       : null;
+    pendingRcTransport = null;
     if (rc) {
       // §19 6.12 — every kernel of this build that may bind the shadow slot is
       // re-bound by `fill()` (see `shadowBvh.js`, "THE KERNELS THAT BIND THIS
@@ -1230,13 +1263,28 @@ export function createGi2System({
       win.reset();
     }
 
-    const surfaces = placements.map((p) => ({
-      albedo: p.albedo ?? [0.5, 0.5, 0.5],
-      emissive: p.emissive ?? 0,
-      area: p.area ?? 1,
-      emitter: !!p.emitter,
-      matKey: p.matKey ?? "",
-    }));
+    // A placement normally contributes one surface. A grouped/multi-material
+    // mesh contributes one per USED material slot; the worker maps those class
+    // indices back onto triangles through the geometry's group ranges. This is
+    // CPU metadata only — `triPal` remains the same packed byte per triangle.
+    const surfaceSpans = [];
+    const surfaces = [];
+    for (const p of placements) {
+      const list = p.paletteSurfaces?.length ? p.paletteSurfaces : [p];
+      const start = surfaces.length;
+      for (const s of list) {
+        surfaces.push({
+          albedo: s.albedo ?? [0.5, 0.5, 0.5],
+          emissive: s.emissive ?? 0,
+          area: s.area ?? p.area ?? 1,
+          emitter: !!s.emitter,
+          matKey: s.matKey ?? "",
+          key: s.key ?? p.key ?? null,
+          materialIndex: Math.max(0, Math.floor(s.materialIndex ?? 0)),
+        });
+      }
+      surfaceSpans.push({ start, count: surfaces.length - start });
+    }
     const { palette, index, emitterClasses } = buildGi2Palette(surfaces);
     const emLum = (e) => (Array.isArray(e) ? (e[0] + e[1] + e[2]) / 3 : (e ?? 0));
     counters.palClasses = palette.filter((e, i) => i < GI2_PAL_CLASSES
@@ -1246,7 +1294,6 @@ export function createGi2System({
     // because nobody published the second one.
     counters.palEmissiveClasses = palette.filter((e, i) => i < GI2_PAL_CLASSES && emLum(e.emissive) > 0).length;
     counters.palEmitterBand = emitterClasses.length;
-    gather.setPalette(palette);
     // ⭐ §19 Stage 4.0b — WHAT A RE-TINT NEEDS, AND ONLY THAT (audits §O.5(c)).
     //
     // The class ASSIGNMENT (this `index`, keyed to the placement list that
@@ -1254,15 +1301,38 @@ export function createGi2System({
     // re-tint re-resolves the materials and recomputes each class's MEAN
     // against this same assignment — never re-clusters, because re-clustering
     // would renumber classes the world is already written with.
-    paletteAssign = {
+    const nextPaletteAssign = {
       classOf: index,
-      keys: placements.map((p) => p.key ?? null),
+      keys: surfaces.map((s) => s.key),
+      materialSlots: surfaces.map((s) => s.materialIndex),
+      weights: surfaces.map((s) => s.area),
       emitterClasses,
       classCount: PAL_ENTRIES,
     };
-    const soupPlacements = placements.map((p, i) => ({
-      geometryKey: p.geometryKey, matrix: p.matrix, pal: index[i], slot: p.slot,
-    }));
+    const soupCacheHit = !!(soupKey != null && store.soupKey === soupKey && store.soup);
+    const topologyChangingCarry = carry && !soupCacheHit;
+    // A topology-changing CARRY is a transaction: do not expose its assignment
+    // or table before its soup wins the async race and refills. Cold builds may
+    // publish immediately because no old class bytes exist to misinterpret;
+    // that also keeps late texture-average re-tints live during a long boot.
+    const paletteToken = paletteTransaction.stage(
+      { palette, assignment: nextPaletteAssign },
+      { defer: topologyChangingCarry, hold: topologyChangingCarry },
+    );
+    const soupPlacements = placements.map((p, i) => {
+      const span = surfaceSpans[i];
+      const palBySlot = [];
+      for (let k = 0; k < span.count; k++) {
+        const s = surfaces[span.start + k];
+        palBySlot[s.materialIndex] = index[span.start + k];
+      }
+      const pal = palBySlot[0] ?? index[span.start] ?? PAL_NONE;
+      for (let k = 0; k < palBySlot.length; k++) palBySlot[k] ??= pal;
+      return {
+        geometryKey: p.geometryKey, matrix: p.matrix, pal, pals: palBySlot,
+        active: p.materialActive, slot: p.slot,
+      };
+    });
 
     // The soup survives a rebuild whose geometry did not change — a GI rebuild
     // is triggered by a quality change, a resize, a refit and a light edit far
@@ -1282,7 +1352,7 @@ export function createGi2System({
       store.soupBuilds = 0;
     }
     let built = null;
-    if (soupKey != null && store.soupKey === soupKey && store.soup) {
+    if (soupCacheHit) {
       built = store.soup;
       counters.soupBuildMs = 0;
       counters.soupStallMs = 0;
@@ -1300,6 +1370,7 @@ export function createGi2System({
           triCap: tier === "phone" || tier === "medium" ? 1_000_000 : undefined,
         });
       } catch (err) {
+        paletteTransaction.cancel(paletteToken);
         if (err instanceof SoupSupersededError || err?.superseded) return false;
         console.warn(`[gi2] triangle soup failed: ${err?.message ?? err} — the window stays empty`);
         return false;
@@ -1309,10 +1380,16 @@ export function createGi2System({
       store.soup = built;
       store.soupKey = soupKey;
     }
-    if (disposed) return false;
+    if (disposed) {
+      paletteTransaction.cancel(paletteToken);
+      return false;
+    }
     // A build that lost the race to a later one: the transport it would have
     // replaced is still the live one, so nothing to retire.
-    if (carry && voxelizer !== oldVoxelizer) return false;
+    if (carry && voxelizer !== oldVoxelizer) {
+      paletteTransaction.cancel(paletteToken);
+      return false;
+    }
 
     marks.soup = performance.now();
     gi2Stage("soupReady");
@@ -1379,8 +1456,15 @@ export function createGi2System({
       // No coarse-first: that is a BOOT budget, and the window is already full.
       coarseFrames = COARSE_FIRST_FRAMES;
       pendingMarkAll = true;
-      rcHold = true;
-      rcHoldStart = frame;
+      if (topologyChangingCarry) {
+        // The staged table/assignment remain hidden until this refill drains.
+        // `beginRefill` restarts the watchdog at installation, excluding the
+        // worker's off-thread latency from the cap.
+        paletteTransaction.beginRefill(paletteToken);
+      } else {
+        rcHold = true;
+        rcHoldStart = frame;
+      }
       carriedBuilds++;
       console.log(`[gi] gi2 transport refreshed in place (carry #${carriedBuilds}) — the light is held ` +
         "on its accumulators until the re-fill drains, then blends the new geometry in");
@@ -1531,11 +1615,18 @@ export function createGi2System({
     if (!camera) return null;
     camera.updateMatrixWorld(true);
     camPos.setFromMatrixPosition(camera.matrixWorld);
-    prevViewProj.copy(viewProj);
     viewProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    cameraMotionBudget = placed && !viewProj.equals(lastTickViewProj);
+    lastTickViewProj.copy(viewProj);
+    // `prevViewProj` describes the camera that produced the LAST COMMITTED
+    // image history, not merely the previous engine tick. A deferred gather
+    // deliberately keeps older history alive; advancing this matrix anyway
+    // would reproject that history with the wrong camera and turn the intended
+    // continuity bridge into moving-camera rejection/checkerboard.
     if (!placed) prevViewProj.copy(viewProj);
     const receipt = win.setCamera([camPos.x, camPos.y, camPos.z]);
     rc?.setCamera([camPos.x, camPos.y, camPos.z]);
+    syncMotionBudget();
     // THE SCROLL IS NOT A PER-FRAME PASS. It re-keys every brick the camera's
     // move invalidated, and on a frame with no move it is a 4096-thread
     // dispatch that writes nothing. `win.setCamera` already answers "did the
@@ -1546,6 +1637,48 @@ export function createGi2System({
     }
     placed = true;
     return receipt;
+  };
+
+  /** Bound RC work while dynamic geometry or an emitter/light is moving. */
+  const setMotionBudget = (moving) => {
+    externalMotionBudget = !!moving;
+    syncMotionBudget();
+  };
+
+  /** Advance the history camera only after `imageHistory` actually dispatched. */
+  let presentedTextures = null;
+  let pendingPresentation = null;
+  const currentTextures = () => ({
+    irradiance: aoOut ?? gather.textures.irradiance,
+    glossy: gather.textures.glossy,
+    lit: gather.textures.lit,
+    raw: gather.textures.irradiance,
+  });
+  const commitHistoryCamera = () => {
+    prevViewProj.copy(viewProj);
+    if (!pendingPresentation || pendingPresentation.handed) return null;
+    const ticket = pendingPresentation;
+    ticket.handed = true;
+    const transition = {
+      oldTextures: presentedTextures,
+      // A resize can coalesce while GISystem waits on a foreign material slot.
+      // Resolve the candidate at each retry, never publish an intermediate.
+      newTextures: () => currentTextures(),
+      takeRetired() {
+        if (pendingPresentation !== ticket) return [];
+        const out = ticket.retired.splice(0);
+        ticket.visibleRetired = out;
+        return out;
+      },
+      accept() {
+        if (pendingPresentation !== ticket) return [];
+        ticket.visibleRetired = [];
+        presentedTextures = null;
+        pendingPresentation = null;
+        return [];
+      },
+    };
+    return transition;
   };
 
   const setMovers = (list) => {
@@ -1609,6 +1742,7 @@ export function createGi2System({
   // nothing ever clears, from growing for the life of the session.
   const voxPending = [];
   let lastBeforeList = null;
+  let lastBeforeCommit = null;
 
   /** The window has filled and first light has arrived — `statsCadence`'s test. */
   const windowSettled = () =>
@@ -1719,6 +1853,12 @@ export function createGi2System({
     }
 
     const before = [];
+    const beforeCommit = {
+      cacheClear: false,
+      coarse: false,
+      markAll: false,
+      box: null,
+    };
     // The window's own bookkeeping. `statsResetPass` every frame (its receipts
     // are per-frame); the scroll only when the origin actually stepped.
     before.push(win.statsResetPass);
@@ -1740,24 +1880,24 @@ export function createGi2System({
     }
     if (!cacheCleared && cache.clearPass) {
       before.push(cache.clearPass);
-      cacheCleared = true;
+      beforeCommit.cacheClear = true;
     }
     if (voxelizer) {
       if (coarseFrames < COARSE_FIRST_FRAMES) {
         voxelizer.setCoarseFirst(true);
-        coarseFrames++;
-        if (coarseFrames === COARSE_FIRST_FRAMES) voxelizer.setCoarseFirst(false);
+        beforeCommit.coarse = true;
+      } else {
+        voxelizer.setCoarseFirst(false);
       }
       // §19 6.29 — the carried window re-fills EVERY brick against the new soup.
       if (pendingMarkAll) {
         before.push(voxelizer.markAllDirty());
-        pendingMarkAll = false;
-        pendingBoxes.length = 0;
+        beforeCommit.markAll = true;
       } else if (pendingBoxes.length) {
         // §19 6.34 — one placement footprint per frame (the bounds are a uniform pair).
-        const bx = pendingBoxes.shift();
+        const bx = pendingBoxes[0];
         before.push(voxelizer.markBoxDirty(bx.min, bx.max));
-        dirtyBoxes++;
+        beforeCommit.box = bx;
       }
       before.push(...voxelizer.passes(camPos, null));
       before.push(cache.allocPass);
@@ -1767,8 +1907,15 @@ export function createGi2System({
     if (rcHold) {
       const drained = lastVox && lastVoxFrame >= rcHoldStart + 2 && (lastVox.dirty ?? 0) === 0
         && (lastVox.built ?? 0) === 0;
-      if (drained || frame - rcHoldStart > RC_HOLD_MAX_FRAMES) {
-        rcHold = false;
+      // A topology transaction starts its hold before awaiting the worker. It
+      // cannot release in that BUILDING phase merely because the old voxelizer
+      // is (correctly) drained; only the replacement's refill can satisfy it.
+      const refillStarted = paletteTransaction.phase !== "building";
+      if (refillStarted && (drained || frame - rcHoldStart > RC_HOLD_MAX_FRAMES)) {
+        // For a topology carry this publishes the staged table + assignment
+        // first, then drops the hold. Ordinary carried refreshes have no staged
+        // palette and retain their existing direct release.
+        if (!paletteTransaction.release()) rcHold = false;
         // `[gi2] first light` is the marker every relight gate waits for; the
         // light never left under a carry, and this is the frame it is again
         // traced against the CURRENT transport — the honest re-arrival.
@@ -1782,6 +1929,7 @@ export function createGi2System({
     // through a new argument: only the caller knows whether the batch actually
     // landed, and `notePassesRan` is already the place it says so.
     lastBeforeList = before;
+    lastBeforeCommit = beforeCommit;
 
     // ── after the g-buffer prepass ────────────────────────────────────────
     //
@@ -1867,11 +2015,23 @@ export function createGi2System({
       after.push(...rcFrameList());
     }
 
+    // History is a transaction commit. It must not run when an upstream
+    // producer was deferred, or it stamps a partial image with the current
+    // camera and turns black/checkerboard output into valid next-frame history.
+    const historyPass = gather.passes.imageHistory;
+    const producerAfter = historyPass ? after.filter((n) => n !== historyPass) : after;
+
     // `scrollInList` so the caller's chain-shape receipt can EXCLUDE the one
     // pass that is spliced in and out frame by frame under a moving camera —
     // otherwise "the shape changed" is true on every other frame and the log
     // that reports it becomes the stall (§19 Stage 4.1).
-    return { before, after, all: [...before, ...after], scrollInList: scrollInLastList };
+    return {
+      before,
+      after: producerAfter,
+      commit: historyPass ? [historyPass] : [],
+      all: [...before, ...after],
+      scrollInList: scrollInLastList,
+    };
   };
 
   // ══════════════════════════════════════════════ RESIZE HANDS THE OLD GATHER OVER
@@ -1942,20 +2102,54 @@ export function createGi2System({
       storageAttributes.push(...deadRc.storageAttributes());
       computeNodes.push(...deadRc.frameOrder);
     }
-    retired.push({
+    const materialTextures = [dead?.textures.irradiance, dead?.textures.glossy, deadAo].filter(Boolean);
+    return {
       storageAttributes,
       computeNodes: computeNodes.filter((n) => n?.isComputeNode === true),
       // ⭐⭐ THE TEXTURES MATERIALS ARE STILL BOUND TO. Repointing the persistent
       // nodes does NOT reach a material's bind group on the GI2 path — see
       // GISystem#rebindStaleGiTextures, which walks these to force the rebind
       // three would have done itself if the per-object refresh still existed.
-      materialTextures: [dead?.textures.irradiance, dead?.textures.glossy, deadAo].filter(Boolean),
+      materialTextures,
+      retainOnly(keepTextures) {
+        const keep = keepTextures instanceof Set ? keepTextures : new Set();
+        const retained = new Set();
+        for (const target of new Set([
+          ...Object.values(dead?.textures ?? {}),
+          deadAo,
+        ].filter(Boolean))) {
+          if (keep.has(target)) retained.add(target);
+          else target.dispose?.();
+        }
+        // Compute/storage owners were released by GISystem before this call.
+        // Drop the heavyweight shells without touching still-native textures.
+        deadRc?.dispose();
+        deadRc = null;
+        dead = null;
+        deadAo = null;
+        materialTextures.length = 0;
+        materialTextures.push(...retained);
+        return {
+          storageAttributes: [],
+          computeNodes: [],
+          materialTextures,
+          dispose() {
+            for (const target of retained) target.dispose?.();
+            retained.clear();
+            materialTextures.length = 0;
+          },
+        };
+      },
       dispose() {
         dead?.dispose();
         deadAo?.dispose();
         deadRc?.dispose();
+        dead = null;
+        deadAo = null;
+        deadRc = null;
+        materialTextures.length = 0;
       },
-    });
+    };
   };
 
   const setSize = (w, h) => {
@@ -1973,11 +2167,25 @@ export function createGi2System({
     const oldEmitterDirect = emitterDirect;
     const oldAoCompose = aoCompose;
     const oldRc = rc;
+    const displayedBefore = presentedTextures ?? currentTextures();
+    // RC's probe/bin field is world-space and resolution-independent. Move its
+    // ownership into the replacement shell before retiring the screen-sized
+    // passes, so a governor step does not restart every bounce from black.
+    pendingRcTransport = oldRc?.takeTransport?.() ?? null;
     aoOut = null;
     aoCompose = null;
     buildGather();
     stampVoxNames();
-    retireGather(old, oldAo, [oldEmitterDirect, oldAoCompose], oldRc);
+    const dead = retireGather(old, oldAo, [oldEmitterDirect, oldAoCompose], oldRc);
+    if (pendingPresentation) {
+      // A second resize arrived before the first candidate was presented. Its
+      // dead intermediate gather was never sampled by a material and may use
+      // the ordinary retirement path; keep the original displayed frame.
+      if (dead) retired.push(dead);
+    } else {
+      presentedTextures = displayedBefore;
+      pendingPresentation = { retired: dead ? [dead] : [], visibleRetired: [], handed: false };
+    }
     return true;
   };
 
@@ -2267,12 +2475,7 @@ export function createGi2System({
       // `aoOut` when AO is on (see `buildAoComposePass`), the gather's own
       // resolve output otherwise. Whichever it is, THIS is the texture the
       // persistent `giIrradianceNode` points at and every material samples.
-      return {
-        irradiance: aoOut ?? gather.textures.irradiance,
-        glossy: gather.textures.glossy,
-        lit: gather.textures.lit,
-        raw: gather.textures.irradiance,
-      };
+      return presentedTextures ?? currentTextures();
     },
     /** Everything `collectStateStorageAttributes` has to see (§0.2b). */
     get storageAttributes() {
@@ -2283,15 +2486,33 @@ export function createGi2System({
           dynamic.metaBuffer.value, dynamic.xformBuffer.value);
       }
       if (soup) list.push(soup.tris.value, soup.triPal.value, soup.triOwner?.value, soup.cellRange.value, soup.cellTris.value);
+      // The shadow slot survives a gather/RC resize, but its replacement
+      // kernels have no builder state until their first dispatch. Publish the
+      // slot explicitly so the orphan sweep cannot retire its live BVH nodes,
+      // triangle index and exclusion-mask buffers in that interregnum.
+      if (shadowBvh?.storageAttributes) list.push(...shadowBvh.storageAttributes);
       // `b?.value`: a harness-only buffer (the crop pair) is null on the
       // engine path — see `crops: 0` above.
       if (gather) for (const b of Object.values(gather.buffers)) list.push(b?.value);
       if (rc) list.push(...rc.storageAttributes());
+      for (const bundle of [
+        ...(pendingPresentation?.retired ?? []),
+        ...(pendingPresentation?.visibleRetired ?? []),
+      ]) {
+        list.push(...(bundle.storageAttributes ?? []));
+      }
       return list.filter((a) => a?.isBufferAttribute === true);
     },
     /** Everything `collectStateComputeNodes` has to see. */
     get computeNodes() {
-      return passesForRelease();
+      const list = passesForRelease();
+      for (const bundle of [
+        ...(pendingPresentation?.retired ?? []),
+        ...(pendingPresentation?.visibleRetired ?? []),
+      ]) {
+        list.push(...(bundle.computeNodes ?? []));
+      }
+      return list;
     },
     /**
      * The bundles a resize orphaned, handed over ONCE (the list is emptied).
@@ -2309,7 +2530,7 @@ export function createGi2System({
       retired.length = 0;
       return out;
     },
-    build, setSize, setCamera, setMovers, passes, warmList, stats, snapshot, describe,
+    build, setSize, setCamera, setMotionBudget, commitHistoryCamera, setMovers, passes, warmList, stats, snapshot, describe,
     /**
      * §19 6.29 — called by GISystem when it KEEPS this system across a
      * rebuild. The AO pass is re-armed per build (a new texture), so the
@@ -2390,6 +2611,20 @@ export function createGi2System({
      */
     notePassesRan() {
       if (scrollInLastList) pendingScroll = false;
+      const commit = lastBeforeCommit;
+      if (commit?.cacheClear) cacheCleared = true;
+      if (commit?.coarse) {
+        coarseFrames++;
+        if (coarseFrames >= COARSE_FIRST_FRAMES) voxelizer?.setCoarseFirst(false);
+      }
+      if (commit?.markAll) {
+        pendingMarkAll = false;
+        pendingBoxes.length = 0;
+      } else if (commit?.box && pendingBoxes[0] === commit.box) {
+        pendingBoxes.shift();
+        dirtyBoxes++;
+      }
+      lastBeforeCommit = null;
       // §19 Stage 4.1 — and it belongs HERE for the same reason `pendingScroll`
       // does: a deferred batch produced no GPU pass, so asking the backend for
       // its timestamp would attribute the PREVIOUS frame's uid to this frame's
@@ -2427,6 +2662,9 @@ export function createGi2System({
       // deferral has already been paid and destroying is safe.
       for (const bundle of retired) bundle.dispose();
       retired.length = 0;
+      for (const bundle of pendingPresentation?.retired ?? []) bundle.dispose();
+      pendingPresentation = null;
+      presentedTextures = null;
       aoOut?.dispose();
       aoOut = null;
       rc?.dispose();

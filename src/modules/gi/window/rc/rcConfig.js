@@ -22,7 +22,7 @@
 // census helpers that read the contract out of `srcConfig` so a receipt and the
 // kernels cannot disagree about where a cascade's band starts.
 import {
-  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, TEMPORAL_ALPHA, W0, cascadeReach, intervalBoundaries, intervalLength,
+  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, TEMPORAL_ALPHA, W0, binCount, cascadeReach, intervalBoundaries, intervalLength,
   probeSpacing,
 } from "../../srcConfig.js";
 
@@ -49,11 +49,45 @@ export { CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, TEMPORAL_ALPHA, W0 };
  * c0 chain, and beyond it there is no probe and the sky answers.
  */
 export const RC_TIERS = {
-  ultra: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 1_100_000, lods: 5, lmax: 16, hitList: 600_000, probeRayCap: 32 },
-  high: { spacing0: 0.5, c0Probes: 16384, binBudget: 700_000, rays: 900_000, lods: 5, lmax: 16, hitList: 500_000, probeRayCap: 32 },
-  medium: { spacing0: 0.5, c0Probes: 8192, binBudget: 350_000, rays: 450_000, lods: 4, lmax: 16, hitList: 250_000, probeRayCap: 32 },
-  phone: { spacing0: 1.0, c0Probes: 4096, binBudget: 175_000, rays: 200_000, lods: 3, lmax: 16, hitList: 120_000, probeRayCap: 16 },
+  // Sixteen rays is one complete c0 direction set (W0=4 => 16 bins). During
+  // camera motion eight keeps adding deterministic samples while bounding the
+  // dense-interior hit/shade wave; the next frame covers the other half.
+  ultra: { spacing0: 0.5, c0Probes: 16384, blockCapacity: [12288, 3072, 768, 192], binBudget: 700_000, rays: 1_100_000, lods: 5, lmax: 16, hitList: 600_000, probeRayCap: 16, motionProbeRayCap: 8 },
+  // Bistro reached 10,317 live c0 probes at 1706x817. 11,264 leaves measured
+  // churn headroom while the far pools retain their much smaller observed
+  // demand; unlike a strict /4 ladder it does not add three matching bin
+  // quarters merely to grow c0.
+  high: { spacing0: 0.5, c0Probes: 16384, blockCapacity: [11264, 2560, 640, 160], binBudget: 700_000, rays: 900_000, lods: 5, lmax: 16, hitList: 500_000, probeRayCap: 16, motionProbeRayCap: 8 },
+  medium: { spacing0: 0.5, c0Probes: 8192, blockCapacity: [4096, 1024, 256, 64], binBudget: 350_000, rays: 450_000, lods: 4, lmax: 16, hitList: 250_000, probeRayCap: 16, motionProbeRayCap: 8 },
+  phone: { spacing0: 1.0, c0Probes: 4096, blockCapacity: [1024, 256, 64, 16], binBudget: 175_000, rays: 200_000, lods: 3, lmax: 16, hitList: 120_000, probeRayCap: 16, motionProbeRayCap: 8 },
 };
+
+/**
+ * Bin blocks for the screen-seeded surface population.
+ *
+ * Demand falls by about four per cascade while a block grows by four. Sizing
+ * from the durable probe tier keeps cache coverage independent of dynamic
+ * render resolution and stops an unused far cascade from reserving a quarter
+ * of a starved pool. The retention valve starts shedding before this ceiling,
+ * leaving churn room for newly visible surfaces.
+ */
+export function rcBlockCapacities(spec, cascadeCount = CASCADE_COUNT) {
+  if (Array.isArray(spec?.blockCapacity) && spec.blockCapacity.length) {
+    return Array.from({ length: Math.max(1, cascadeCount) }, (_, c) =>
+      Math.max(1, Math.floor(spec.blockCapacity[c] ?? spec.blockCapacity.at(-1) ?? 1)));
+  }
+  const slots0 = Math.max(1, Math.round(spec?.c0Probes ?? 1));
+  const fill = Math.min(1, Math.max(0.05, Number(spec?.blockFill) || 0.75));
+  const backed0 = Math.max(1, Math.floor(slots0 * fill));
+  return Array.from({ length: Math.max(1, cascadeCount) }, (_, c) =>
+    Math.max(1, Math.floor(backed0 / (4 ** c))));
+}
+
+/** Actual bin count implied by `rcBlockCapacities`; published in receipts. */
+export function rcBinBudget(spec, cascadeCount = CASCADE_COUNT, w0 = W0) {
+  return rcBlockCapacities(spec, cascadeCount)
+    .reduce((sum, blocks, c) => sum + blocks * binCount(c, w0), 0);
+}
 
 /**
  * ⭐⭐ §19 6.19 — THE RAY BUDGET IS PER c0 PROBE, NOT PER PIXEL.
@@ -101,6 +135,20 @@ export const rcProbeRayCap = (spec, runtime = globalThis) => {
   if (Number.isFinite(forced)) return forced > 0 ? Math.max(1, Math.round(forced)) : PROBE_RAY_CAP_OFF;
   const cap = spec?.probeRayCap;
   return Number.isFinite(cap) && cap > 0 ? Math.round(cap) : PROBE_RAY_CAP_OFF;
+};
+
+/**
+ * Per-frame cap used by GI2. A diagnostic override remains exact; otherwise
+ * motion lowers the tier cap without rebuilding or reallocating anything.
+ */
+export const rcFrameProbeRayCap = (spec, moving = false, runtime = globalThis) => {
+  const forced = Number(runtime?.__gi2ProbeRayCap);
+  const base = rcProbeRayCap(spec, runtime);
+  if (Number.isFinite(forced) || !moving) return base;
+  const motion = Number(spec?.motionProbeRayCap);
+  return Number.isFinite(motion) && motion > 0
+    ? Math.min(base, Math.max(1, Math.round(motion)))
+    : base;
 };
 
 /**

@@ -57,8 +57,8 @@ import { createRcMerge } from "./rcMerge.js";
 import { createRcHitShading } from "./rcHit.js";
 import { createRcEmitterDirect } from "./rcDirect.js";
 import {
-  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, TEMPORAL_ALPHA, W0, rcHitCapacity, rcHitPathEnabled, rcIntervalCensus, rcProbeRayCap, rcBinWindow,
-  rcTierSpec,
+  CASCADE_COUNT, MAX_LODS, PROBE_RAY_CAP_OFF, TEMPORAL_ALPHA, W0, rcBinBudget, rcBinWindow, rcBlockCapacities,
+  rcFrameProbeRayCap, rcHitCapacity, rcHitPathEnabled, rcIntervalCensus, rcProbeRayCap, rcTierSpec,
 } from "./rcConfig.js";
 
 /**
@@ -78,6 +78,10 @@ import {
  */
 export function createRcCascades({
   win, trace, cache, gbuffer, width, height, tier = win.tier, kit,
+  // A resize rebuilds screen-sized passes but must not erase the world-space
+  // probe/bin field. `takeTransport()` transfers ownership of those persistent
+  // buffers plus their anchor/frame state from the previous RC generation.
+  transport = null,
   // §19 5.3 — GISystem's emitter SLOT uniforms, the same four `shadeTerms`
   // does NEE against at a hit. Absent, the seated-emitter term is not built.
   emitters = null,
@@ -105,40 +109,28 @@ export function createRcCascades({
   const maxLods = Math.max(1, Math.min(MAX_LODS, spec.lods));
   const pixelCount = Math.max(1, width * height);
 
-  // ── the pools, bounded by the tier AND by the frame they are sized for ────
+  // ── the pools, bounded by tier and independent of render resolution ───────
   //
-  // ⭐⭐ §19 6.17 — THE BIN POOL IS SIZED FROM THE PIXEL COUNT, BECAUSE THE
-  // POPULATION IS. `setSize` below refuses a frame larger than `pixelCount`
-  // with the words "the pools are sized for this frame", but the bin budget
-  // was the tier's flat 700 000 — measured clean on a 960x640 harness and
-  // split four ways, i.e. 5 468 c0 bin blocks. On Bistro at 1526x562 the c0
-  // population sat at EXACTLY 5 468 at rest (a demand equal to a capacity is
-  // exhaustion, not coincidence); at the user's 1657x966 every cascade is
-  // full all the time, so every region a rotating camera uncovers claims a
-  // probe slot and NO BLOCK — a blockless probe bakes an UNKNOWN tile, the
-  // LOD walk finds the coarser cascades blockless too, and the resolve writes
-  // black: the screen-aligned checkerboard that "tries to resolve into
-  // colours but never succeeds", healing only as retention frees blocks.
-  // Receipt: `rcMerge.readStats().resolve.unknownFinalPct` 7 % mid-rotation
-  // with `merge.perCascade[c].probes == blockCapacity` for c0..c2.
-  //
-  // The demand is per SCREEN TILE (the population inserts from the g-buffer),
-  // so it grows with the pixel count and with nothing else the tier does not
-  // already fix; the floor stays the tier's, the ceiling is 4x (a 4 K editor
-  // pays ~100 MB of bins, not the old ladder's unbounded climb). 36 B per bin.
-  const REF_PIXELS = 960 * 640;
-  const binScale = Math.min(4, Math.max(1, pixelCount / REF_PIXELS));
-  const binBudget = Math.round(spec.binBudget * binScale);
-  const store = createSrcProbeStore({
-    c0Probes: spec.c0Probes,
-    cascadeCount: CASCADE_COUNT,
-    w0: W0,
-    binBudget,
-  });
+  // §19 6.36 — §6.17's pixel scaling fixed a large full-resolution viewport,
+  // but dynamic resolution re-opened the same correctness failure: Bistro
+  // rebuilt at 1086×472, all useful pools pinned at 5468/1367/341, NOBLOCK hit
+  // 30k and unknownFinal reached 33.5% during one turn. World-space cache
+  // coverage may not shrink because the renderer lowered screen-space work.
+  const blockCapacity = rcBlockCapacities(spec, CASCADE_COUNT);
+  const binBudget = rcBinBudget(spec, CASCADE_COUNT, W0);
+  const binScale = binBudget / Math.max(1, spec.binBudget);
+  const carriedTransport = transport?.store && transport?.bins ? transport : null;
+  const store = carriedTransport?.store ?? createSrcProbeStore({
+      c0Probes: spec.c0Probes,
+      cascadeCount: CASCADE_COUNT,
+      w0: W0,
+      blockCapacity,
+    });
+  let ownsTransport = true;
 
   // ── uniforms ──────────────────────────────────────────────────────────────
-  const cameraU = uniform(new THREE.Vector3());
-  const anchorU = uniform(new THREE.Vector3());
+  const cameraU = uniform(carriedTransport?.camera?.clone?.() ?? new THREE.Vector3());
+  const anchorU = uniform(carriedTransport?.anchor?.clone?.() ?? new THREE.Vector3());
   /**
    * §19 6.16 — the anchor the live probe keys are expressed in. `setCamera`
    * moves `anchorU` the frame the eye crosses a coarse cell; `beginFrame`
@@ -147,11 +139,11 @@ export function createRcCascades({
    * `anchorU` on every other frame, where the re-key is a no-op by
    * construction. `__gi2RcRekey = 0` restores the rebirth (the A/B arm).
    */
-  const anchorPrevU = uniform(new THREE.Vector3());
+  const anchorPrevU = uniform(carriedTransport?.anchorPrev?.clone?.() ?? new THREE.Vector3());
   const rekeyOn = (globalThis.__gi2RcRekey ?? 1) !== 0;
-  const keyAnchor = new THREE.Vector3();
-  let keyAnchorSet = false;
-  let anchorJumps = 0;
+  const keyAnchor = carriedTransport?.keyAnchor?.clone?.() ?? new THREE.Vector3();
+  let keyAnchorSet = carriedTransport?.keyAnchorSet === true;
+  let anchorJumps = Math.max(0, carriedTransport?.anchorJumps ?? 0);
   const widthU = uniform(width, "uint");
   const frameStampU = uniform(1, "uint");
   const jitterXU = uniform(0, "uint");
@@ -430,8 +422,18 @@ export function createRcCascades({
   // texture, so it gets no merge, no tiles and therefore no field to gather at
   // a hit — that build keeps the INLINE arm and its tail is not allocated, so
   // every 5.1 byte figure stays comparable.
-  const hitCapacity = (irradianceHalf && rcHitPathEnabled()) ? rcHitCapacity(spec, threads) : 0;
-  const bins = createSrcBinStore(store, { w0: W0, secondaryCapacity: hitCapacity });
+  // This transport survives viewport resizes, so every owned allocation must
+  // be resolution-independent too. Sizing the tail to the FIRST viewport made
+  // later larger viewports overflow forever: carried scratch cannot grow
+  // without throwing away the accumulated bins it is meant to preserve.
+  const requestedHitCapacity = (irradianceHalf && rcHitPathEnabled())
+    ? rcHitCapacity(spec, spec.hitList ?? spec.rays)
+    : 0;
+  // The tail lives in the carried scratch buffer, so its original capacity is
+  // the bound after a resize. A larger viewport spends the same bounded hit
+  // budget instead of reallocating (and erasing) the accumulated bins.
+  const hitCapacity = carriedTransport?.bins?.hitCapacity ?? requestedHitCapacity;
+  const bins = carriedTransport?.bins ?? createSrcBinStore(store, { w0: W0, secondaryCapacity: hitCapacity });
   shadeCounters = createSrcShadeCounters(bins);
 
   /**
@@ -692,7 +694,8 @@ export function createRcCascades({
     const raw = Number(globalThis.__gi2RcCycle);
     return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 0;
   })();
-  let frameIndex = 0;
+  let frameIndex = Math.max(0, carriedTransport?.frameIndex ?? 0);
+  let cameraMoving = false;
   const setCamera = (pos) => {
     const p = Array.isArray(pos) ? pos : [pos.x, pos.y, pos.z];
     cameraU.value.set(p[0], p[1], p[2]);
@@ -735,7 +738,7 @@ export function createRcCascades({
     strideU.value = stride;
     phaseU.value = stride > 1 ? frameStampU.value % stride : 0;
     // §19 6.19 — the cap is a uniform polled per frame (`__gi2ProbeRayCap`).
-    capU.value = rcProbeRayCap(spec);
+    capU.value = rcFrameProbeRayCap(spec, cameraMoving);
     // §19 5.3c — the cadence, from the frame index and nothing else.
     cascadeDueU.value = cadenceOn ? cascadeDueAt(frameIndex) : CASCADE_COUNT - 1;
     return frameIndex;
@@ -760,6 +763,7 @@ export function createRcCascades({
     pixelCount,
     threads,
     rays: threads,
+    cameraMoving,
     probeRayCap: capU.value >= PROBE_RAY_CAP_OFF ? "off" : capU.value,
     binWindow: rcBinWindow() || "off",
     depositScale: DEPOSIT_SCALE,
@@ -875,7 +879,25 @@ export function createRcCascades({
         : deposit.passes),
       ...(resolve ? resolve.passes : []),
     ],
-    setCamera, beginFrame, setSize, describe,
+    setCamera,
+    /** Camera motion changes one existing uniform; no graph/pool rebuild. */
+    setMotion(moving) { cameraMoving = !!moving; },
+    beginFrame, setSize, describe,
+    /** Transfer the resolution-independent accumulated field to a new RC shell. */
+    takeTransport() {
+      if (!ownsTransport) return null;
+      ownsTransport = false;
+      return {
+        store, bins,
+        camera: cameraU.value.clone(),
+        anchor: anchorU.value.clone(),
+        anchorPrev: anchorPrevU.value.clone(),
+        keyAnchor: keyAnchor.clone(),
+        keyAnchorSet,
+        anchorJumps,
+        frameIndex,
+      };
+    },
     readStats: (renderer) => deposit.readStats(renderer),
     /** §19 6.16 — the population per cascade (live/fresh/retired/rekeyed), one readback. */
     readProbeStats: (renderer) => readSrcProbeStats(renderer, store),
@@ -888,7 +910,8 @@ export function createRcCascades({
     readMergeStats: (renderer) => (resolve ? resolve.readStats(renderer) : Promise.resolve(null)),
     /** Every GPU-only storage attribute, for the caller's retire queue. */
     storageAttributes: () => [
-      ...attrsOf(store), ...attrsOf(bins), ...attrsOf(rayStore), ...attrsOf(frame),
+      ...(ownsTransport ? [...attrsOf(store), ...attrsOf(bins)] : []),
+      ...attrsOf(rayStore), ...attrsOf(frame),
       ...(resolve?.storageAttributes() ?? []),
     ],
     /**
@@ -900,7 +923,8 @@ export function createRcCascades({
     dispose() {
       hit?.dispose();
       resolve?.dispose();
-      for (const a of [...attrsOf(store), ...attrsOf(bins), ...attrsOf(rayStore), ...attrsOf(frame),
+      for (const a of [...(ownsTransport ? [...attrsOf(store), ...attrsOf(bins)] : []),
+        ...attrsOf(rayStore), ...attrsOf(frame),
         ...(resolve?.storageAttributes() ?? [])]) {
         a.array = a.array?.constructor ? new a.array.constructor(0) : new Uint32Array(0);
         a.dispose?.();

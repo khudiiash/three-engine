@@ -87,12 +87,31 @@ const triCountOf = (geo) => {
 };
 
 /**
+ * BufferGeometry groups use draw-element ranges. Convert them once to sorted
+ * triangle ranges so the hot soup loop only advances a cursor. Gaps retain
+ * material slot 0, which is both three.js's ordinary fallback and the legacy
+ * one-palette-per-placement behaviour.
+ */
+const triangleGroupsOf = (geo, triCount) => (geo?.groups ?? [])
+  .map((g) => {
+    const start = Math.max(0, Math.floor(Number(g?.start) || 0));
+    const count = Math.max(0, Math.floor(Number(g?.count) || 0));
+    return {
+      start: Math.min(triCount, Math.floor(start / 3)),
+      end: Math.min(triCount, Math.ceil((start + count) / 3)),
+      materialIndex: Math.max(0, Math.floor(Number(g?.materialIndex) || 0)),
+    };
+  })
+  .filter((g) => g.end > g.start)
+  .sort((a, b) => (a.start - b.start) || (a.end - b.end) || (a.materialIndex - b.materialIndex));
+
+/**
  * Builds the packed soup + coarse grid. PURE: no DOM, no three.js, no worker
  * API — node calls this directly.
  *
  * @param {{
- *   geometries: Map<string, {positions: Float32Array, index: (Uint16Array|Uint32Array|null)}>|Array|Object,
- *   placements: Array<{geometryKey: string, matrix: ArrayLike<number>, pal?: number}>,
+ *   geometries: Map<string, {positions: Float32Array, index: (Uint16Array|Uint32Array|null), groups?: Array}>|Array|Object,
+ *   placements: Array<{geometryKey: string, matrix: ArrayLike<number>, pal?: number, pals?: ArrayLike<number>}>,
  *   cellSize?: number,
  *   triCap?: number,
  * }} input
@@ -120,9 +139,37 @@ export function buildTriangleSoup(input) {
   for (let i = 0; i < placements.length; i++) {
     const p = placements[i];
     const geo = geometries.get(p?.geometryKey);
-    const n = triCountOf(geo);
-    if (!geo || n < 1) { missingGeometry++; continue; }
-    entries.push({ index: i, geo, n, take: 0, matrix: p.matrix, pal: (p.pal ?? PAL_NONE) & 255, owner: (Number.isFinite(p.slot) ? p.slot : i) & 0xffff });
+    const sourceN = triCountOf(geo);
+    if (!geo || sourceN < 1) { missingGeometry++; continue; }
+    const groups = triangleGroupsOf(geo, sourceN);
+    const active = p.active == null ? null : Array.from(p.active, Boolean);
+    let n = sourceN;
+    if (active) {
+      n = 0;
+      let groupAt = 0;
+      for (let t = 0; t < sourceN; t++) {
+        while (groupAt < groups.length && t >= groups[groupAt].end) groupAt++;
+        const group = groupAt < groups.length && t >= groups[groupAt].start
+          ? groups[groupAt]
+          : null;
+        const materialIndex = group?.materialIndex ?? 0;
+        if (active[materialIndex] ?? active[0] ?? false) n++;
+      }
+      if (n < 1) continue;
+    }
+    entries.push({
+      index: i,
+      geo,
+      n,
+      sourceN,
+      take: 0,
+      matrix: p.matrix,
+      pal: (p.pal ?? PAL_NONE) & 255,
+      pals: p.pals == null ? null : Array.from(p.pals, (v) => (v == null ? null : v & 255)),
+      active,
+      groups,
+      owner: (Number.isFinite(p.slot) ? p.slot : i) & 0xffff,
+    });
   }
   const order = entries.slice().sort((a, b) => (b.n - a.n) || (a.index - b.index));
   let budget = triCap;
@@ -144,7 +191,10 @@ export function buildTriangleSoup(input) {
   const palWords = new Uint32Array((taken + 3) >> 2);
   // §19 6.21 — the triangle's OWNER (its placement slot), 2 × u16 per word, so
   // the shadow BVH can drop a placement's triangles the frame it becomes a mover.
-  const ownerWords = new Uint32Array((taken + 1) >> 1);
+  // Keep a one-word sentinel for an empty soup. The returned view below also
+  // promises at least one word, and constructing that view over a zero-byte
+  // allocation throws before a legal `triCap: 0` build can return.
+  const ownerWords = new Uint32Array(Math.max(1, (taken + 1) >> 1));
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
   let w = 0; // write cursor, in TRIANGLES
@@ -158,9 +208,25 @@ export function buildTriangleSoup(input) {
     const m12 = m[12], m13 = m[13], m14 = m[14], m15 = m[15];
     const pos = e.geo.positions;
     const idx = e.geo.index;
-    const pal = e.pal;
+    const pals = e.pals;
+    const groups = e.groups;
+    const active = e.active;
+    let groupAt = 0;
+    let activeWritten = 0;
     const owner = e.owner;
-    for (let t = 0; t < e.take; t++) {
+    for (let t = 0; t < e.sourceN && activeWritten < e.take; t++) {
+      while (groupAt < groups.length && t >= groups[groupAt].end) groupAt++;
+      const group = groupAt < groups.length && t >= groups[groupAt].start
+        ? groups[groupAt]
+        : null;
+      const materialIndex = group?.materialIndex ?? 0;
+      if (active && !(active[materialIndex] ?? active[0] ?? false)) continue;
+      // The cap has always counted source triangles before degenerate removal;
+      // keep that contract while making the source prefix an ACTIVE prefix.
+      activeWritten++;
+      const pal = group && pals?.[group.materialIndex] != null
+        ? pals[group.materialIndex]
+        : e.pal;
       const base = t * 3;
       const i0 = (idx ? idx[base] : base) * 3;
       const i1 = (idx ? idx[base + 1] : base + 1) * 3;

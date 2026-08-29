@@ -294,6 +294,8 @@ async function runArm(arm) {
       try {
         (occ?.prewarmComputes?.() ?? []).forEach((n, i) => push(n.__giPassName ?? `occupancy#${i}`, n));
       } catch (e) { census.push({ name: "occupancy chain", error: String(e?.message ?? e) }); }
+      (system.state?.screen?.gi2?.computeNodes ?? [])
+        .forEach((n, i) => push(n.__giPassName ?? `gi2#${i}`, n));
       (system.state?.queue ?? []).forEach((n, i) => push(n.__giPassName ?? `queue[${i}]`, n));
       (system.state?.screen?.srcProbes?.passes ?? []).forEach((n, i) => push(n.__giPassName ?? `src#${i}`, n));
       for (const [name, node] of nodes) {

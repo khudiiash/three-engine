@@ -407,15 +407,26 @@ export function createRcHitShading({
         // the lattice edge) the c0 read stands, so nothing is darker than
         // before by construction.
         const g = vec3(0).toVar();
+        const gKnown = float(0).toVar();
         const g1 = gatherHit ? gatherHit(hp, hn) : null;
         if (g1) {
           g.assign(g1.irradiance);
-          If(g1.known.not(), () => { g.assign(vec3(gatherAt(hp, hn).irradiance)); });
+          If(g1.known, () => { gKnown.assign(1); }).Else(() => {
+            const g0 = gatherAt(hp, hn);
+            g.assign(vec3(g0.irradiance));
+            If(g0.known, () => { gKnown.assign(1); });
+          });
         } else {
-          g.assign(gatherAt(hp, hn).irradiance);
+          const g0 = gatherAt(hp, hn);
+          g.assign(g0.irradiance);
+          If(g0.known, () => { gKnown.assign(1); });
         }
-        cache.ercWrite(lF, vF, fF, g, ercAlpha).toVar();
-        E.assign(select(fresh, g, mix(e.xyz, g, float(ercAlpha))));
+        // UNKNOWN is not a black bounce. Preserve the last valid face value;
+        // a fresh face stays absent until a gather has actual coverage.
+        If(gKnown.greaterThan(0.5), () => {
+          cache.ercWrite(lF, vF, fF, g, ercAlpha).toVar();
+          E.assign(select(fresh, g, mix(e.xyz, g, float(ercAlpha))));
+        });
       });
       // ρ ALREADY CARRIES `T` (`attribute` folds the coverage into it), so this
       // half is attenuated exactly once and by the same number as the other.

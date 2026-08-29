@@ -6,9 +6,10 @@
 // gets its imports rewritten like any other source file, which is the only way
 // a harness can reach TSL and the GI module in the same page.
 import * as THREE from "three/webgpu";
-import { Fn, instanceIndex, instancedArray, uint, vec3 } from "three/tsl";
+import { Fn, float, instanceIndex, instancedArray, uint, vec3 } from "three/tsl";
 import { boxLightFactor } from "../../src/modules/gi/giLight.js";
 import { refBoxFactor } from "../../src/modules/gi/emitterShapes.js";
+import { rcEmitterDirectFactor } from "../../src/modules/gi/window/rc/rcDirect.js";
 
 /**
  * Evaluate `boxLightFactor` on the GPU over `cases` and return each result
@@ -32,6 +33,7 @@ export async function runEmitterTslCases(cases) {
   });
   const input = instancedArray(src, "vec4");
   const output = instancedArray(new Float32Array(n), "float");
+  const rcOutput = instancedArray(new Float32Array(n), "float");
 
   const kernel = Fn(() => {
     const i = instanceIndex.mul(uint(4));
@@ -42,14 +44,24 @@ export async function runEmitterTslCases(cases) {
     output.element(instanceIndex).assign(
       boxLightFactor(P, N, c, h, vec3(1, 0, 0), vec3(0, 1, 0), vec3(0, 0, 1)),
     );
+    const meanArea = h.x.mul(h.y).add(h.y.mul(h.z)).add(h.z.mul(h.x)).mul(2);
+    rcOutput.element(instanceIndex).assign(rcEmitterDirectFactor({
+      center: c,
+      reff: meanArea.div(Math.PI).sqrt(),
+      radius: h.length(),
+      kind: float(1),
+      half: h,
+      bx: vec3(1, 0, 0), by: vec3(0, 1, 0), bz: vec3(0, 0, 1),
+    }, P, N));
   })().compute(n);
 
   await renderer.computeAsync(kernel);
   const got = new Float32Array(await renderer.getArrayBufferAsync(output.value));
+  const rcGot = new Float32Array(await renderer.getArrayBufferAsync(rcOutput.value));
 
   const rows = cases.map((k, i) => ({
     P: k.P, N: k.N, c: k.c, h: k.h,
-    gpu: got[i],
+    gpu: got[i], rcGpu: rcGot[i],
     cpu: refBoxFactor(k.P, k.N, k.c, k.h, [1, 0, 0], [0, 1, 0], [0, 0, 1]),
   }));
   renderer.dispose?.();

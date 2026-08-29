@@ -70,7 +70,7 @@
 // integers to 2^24 = 16.7 M, which bounds both the node count and the triangle
 // count. The worker refuses to build past that rather than folding silently.
 import * as THREE from "three/webgpu";
-import { attributeArray, float, select, uniform, wgslFn } from "three/tsl";
+import { attributeArray, float, select, uniform, uint, wgslFn } from "three/tsl";
 
 /**
  * ⛔ RETIRED IN §19 STAGE 6.2 — KEPT ONLY SO A STALE IMPORT FAILS LOUDLY
@@ -134,7 +134,8 @@ const bvhAnyHitFn = wgslFn(/* wgsl */ `
 		triIdx: ptr<storage, array<u32>, read>,
 		tris: ptr<storage, array<f32>, read>,
 		owners: ptr<storage, array<u32>, read>,
-		excl: ptr<storage, array<u32>, read>
+		excl: ptr<storage, array<u32>, read>,
+		skipOwner: u32
 	) -> f32 {
 
 		var stack: array<u32, 64>;
@@ -229,7 +230,12 @@ const bvhAnyHitFn = wgslFn(/* wgsl */ `
 					// §19 6.21 — a triangle whose placement is a MOVER is not here any
 					// more: the dynamic layer answers for it at its live pose.
 					let ow = ( owners[ ti >> 1u ] >> ( ( ti & 1u ) * 16u ) ) & 0xffffu;
-					if ( ( excl[ ow >> 5u ] & ( 1u << ( ow & 31u ) ) ) != 0u ) { continue; }
+					// A direct-emitter ray must never let the sampled emitter's
+					// own triangles answer as a blocker. Endpoint shortening only
+					// protects a convex fitted face; imported/concave emitters can
+					// cross the segment before that face. The per-ray owner reject
+					// is exact and leaves unrelated geometry/contact shadows live.
+					if ( ow == skipOwner || ( excl[ ow >> 5u ] & ( 1u << ( ow & 31u ) ) ) != 0u ) { continue; }
 					let o = ti * 9u;
 					let a = vec3f( tris[ o ], tris[ o + 1u ], tris[ o + 2u ] );
 					let b = vec3f( tris[ o + 3u ], tris[ o + 4u ], tris[ o + 5u ] );
@@ -290,7 +296,8 @@ const bvhNearestTFn = wgslFn(/* wgsl */ `
 		triIdx: ptr<storage, array<u32>, read>,
 		tris: ptr<storage, array<f32>, read>,
 		owners: ptr<storage, array<u32>, read>,
-		excl: ptr<storage, array<u32>, read>
+		excl: ptr<storage, array<u32>, read>,
+		skipOwner: u32
 	) -> f32 {
 
 		var stack: array<u32, 64>;
@@ -352,7 +359,7 @@ const bvhNearestTFn = wgslFn(/* wgsl */ `
 					// §19 6.21 — a triangle whose placement is a MOVER is not here any
 					// more: the dynamic layer answers for it at its live pose.
 					let ow = ( owners[ ti >> 1u ] >> ( ( ti & 1u ) * 16u ) ) & 0xffffu;
-					if ( ( excl[ ow >> 5u ] & ( 1u << ( ow & 31u ) ) ) != 0u ) { continue; }
+					if ( ow == skipOwner || ( excl[ ow >> 5u ] & ( 1u << ( ow & 31u ) ) ) != 0u ) { continue; }
 					let o = ti * 9u;
 					let a = vec3f( tris[ o ], tris[ o + 1u ], tris[ o + 2u ] );
 					let b = vec3f( tris[ o + 3u ], tris[ o + 4u ], tris[ o + 5u ] );
@@ -449,7 +456,8 @@ const bvhQuadVisFn = wgslFn(/* wgsl */ `
 		triIdx: ptr<storage, array<u32>, read>,
 		tris: ptr<storage, array<f32>, read>,
 		owners: ptr<storage, array<u32>, read>,
-		excl: ptr<storage, array<u32>, read>
+		excl: ptr<storage, array<u32>, read>,
+		skipOwner: u32
 	) -> vec2f {
 		var hits: f32 = 0.0;
 		for (var i: u32 = 0u; i < 4u; i = i + 1u) {
@@ -459,9 +467,9 @@ const bvhQuadVisFn = wgslFn(/* wgsl */ `
 			let dq: f32 = max(length(w), 1e-3);
 			let dir: vec3f = w / dq;
 			let mt: f32 = max(dq - max(dq * margin, 2e-3), 1e-3);
-			if (gi2BvhNearestT(ro, dir, mt, nodes, triIdx, tris, owners, excl) >= 0.0) { hits = hits + 1.0; }
+			if (gi2BvhNearestT(ro, dir, mt, nodes, triIdx, tris, owners, excl, skipOwner) >= 0.0) { hits = hits + 1.0; }
 		}
-		let tc: f32 = gi2BvhNearestT(ro, rd, maxT, nodes, triIdx, tris, owners, excl);
+		let tc: f32 = gi2BvhNearestT(ro, rd, maxT, nodes, triIdx, tris, owners, excl, skipOwner);
 		return vec2f(hits, tc);
 	}
 `, [bvhNearestTFn]);
@@ -578,11 +586,22 @@ export function createShadowBvhSlot() {
    * `1.0` when ANYTHING lies in `(origin, origin + dir*maxT)`, else `0.0`.
    * Raw: the caller owns the origin offset.
    */
-  const anyHit = (origin, dir, maxT) => bvhAnyHitFn(origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer, ownersBuffer, exclBuffer);
+  const noOwner = () => uint(0xffffffff);
+  const anyHit = (origin, dir, maxT, skipOwner = null) => bvhAnyHitFn(
+    origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer, ownersBuffer, exclBuffer,
+    skipOwner ?? noOwner(),
+  );
   /** §19 6.14 — the FIRST occluder's distance in `(origin, origin + dir*maxT)`, or −1. */
-  const nearestT = (origin, dir, maxT) => bvhNearestTFn(origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer, ownersBuffer, exclBuffer);
+  const nearestT = (origin, dir, maxT, skipOwner = null) => bvhNearestTFn(
+    origin, dir, maxT, nodesBuffer, triIdxBuffer, trisBuffer, ownersBuffer, exclBuffer,
+    skipOwner ?? noOwner(),
+  );
   /** §19 6.25d — the four quadrant rays + the centre's nearest-t, ONE call site. */
-  const quadVis = (origin, dir, maxT, q0, q1, q2, q3, margin) => bvhQuadVisFn(origin, dir, maxT, q0, q1, q2, q3, margin, nodesBuffer, triIdxBuffer, trisBuffer, ownersBuffer, exclBuffer);
+  const quadVis = (origin, dir, maxT, q0, q1, q2, q3, margin, skipOwner = null) => bvhQuadVisFn(
+    origin, dir, maxT, q0, q1, q2, q3, margin,
+    nodesBuffer, triIdxBuffer, trisBuffer, ownersBuffer, exclBuffer,
+    skipOwner ?? noOwner(),
+  );
 
   /**
    * ⭐⭐ THE SELF-HIT EPSILON, AND WHY IT IS ALONG THE NORMAL.
@@ -601,22 +620,22 @@ export function createShadowBvhSlot() {
    * voxel arm could not resolve anything under 0.25 m.
    */
   const SELF_EPS = 2e-3;
-  const anyHitFrom = (P, dir, maxT, normal) => (
+  const anyHitFrom = (P, dir, maxT, normal, skipOwner = null) => (
     normal
-      ? anyHit(P.add(normal.mul(SELF_EPS)), dir, maxT)
-      : anyHit(P, dir, maxT)
+      ? anyHit(P.add(normal.mul(SELF_EPS)), dir, maxT, skipOwner)
+      : anyHit(P, dir, maxT, skipOwner)
   );
 
-  const quadVisFrom = (P, dir, maxT, q0, q1, q2, q3, margin, normal) => (
+  const quadVisFrom = (P, dir, maxT, q0, q1, q2, q3, margin, normal, skipOwner = null) => (
     normal
-      ? quadVis(P.add(normal.mul(SELF_EPS)), dir, maxT, q0, q1, q2, q3, margin)
-      : quadVis(P, dir, maxT, q0, q1, q2, q3, margin)
+      ? quadVis(P.add(normal.mul(SELF_EPS)), dir, maxT, q0, q1, q2, q3, margin, skipOwner)
+      : quadVis(P, dir, maxT, q0, q1, q2, q3, margin, skipOwner)
   );
 
-  const nearestTFrom = (P, dir, maxT, normal) => (
+  const nearestTFrom = (P, dir, maxT, normal, skipOwner = null) => (
     normal
-      ? nearestT(P.add(normal.mul(SELF_EPS)), dir, maxT)
-      : nearestT(P, dir, maxT)
+      ? nearestT(P.add(normal.mul(SELF_EPS)), dir, maxT, skipOwner)
+      : nearestT(P, dir, maxT, skipOwner)
   );
 
   return {
@@ -643,6 +662,16 @@ export function createShadowBvhSlot() {
     get trisAttr() { return trisBuffer.value; },
     get triIdx() { return triIdxBuffer.value?.array ?? null; },
     get tris() { return trisBuffer.value?.array ?? null; },
+    /**
+     * The persistent slot's CURRENT attributes. A screen-resize replaces the
+     * kernels that bind them without replacing this slot; publishing them lets
+     * GISystem's orphan sweep put them in the survivor set before the new
+     * kernels have compiled and can be harvested themselves.
+     */
+    get storageAttributes() {
+      return [nodesBuffer.value, triIdxBuffer.value, trisBuffer.value, ownersBuffer.value, exclBuffer.value]
+        .filter((a) => a?.isBufferAttribute === true);
+    },
     /**
      * Swaps the worker's tree in. REBIND ONLY — a new `StorageBufferAttribute`
      * behind the same node, so three mints a new bind group and reuses the

@@ -326,14 +326,12 @@ export function createRcMerge({
       // improvement that differs only where that one produced NaN.)
       const len2 = nrm.dot(nrm).toVar();
       const Nn = nrm.div(sqrt(max(len2, float(1e-12)))).toVar();
-      a.assign(Nn.dot(g.xyz));
       // ⚠ AND THE GLOSSY TARGET'S ALPHA IS A DIFFERENT NUMBER ENTIRELY —
       // `resolveUpsample` reads the PAIR: `irradianceHalf.w` is the plane
       // offset and `glossyHalf.w` is the normal's y (its `okTap` test is
       // `> -8`, its `wn` is `1 − |gi.w − N.y|·0.5`). A ceiling and the floor
       // six metres under it share a plane offset; only the y separates them.
       // Same raw normal as the plane offset, for the same reason.
-      if (glossyHalf) ga.assign(Nn.y);
       // ⭐ THE GATHER TAKES THE CAMERA-FACED NORMAL, THE ALPHA DOES NOT.
       //
       // Two different jobs. The deposit filled these probes' bins along the
@@ -346,8 +344,21 @@ export function createRcMerge({
       If(len2.greaterThan(0.25), () => {
         const facing = step(0, Nn.dot(vec3(camera).sub(g.xyz))).mul(2).sub(1).toVar();
         const Nf = Nn.mul(facing).toVar();
+        // Geometry-plane metadata is independent from radiance availability;
+        // the packed glossy alpha below owns the two validity bits.
+        a.assign(Nn.dot(g.xyz));
         const gres = gather.gatherAt(g.xyz, Nf);
+        const diffuseKnown = float(0).toVar();
         E.assign(vec3(gres.irradiance).mul(fieldTermU));
+        // UNKNOWN is absence of information, never a valid black sample. Keep
+        // both edge-test carriers at their sentinels until this gather has an
+        // answer; resolveUpsample then rejects the tap and may bridge it from
+        // validated image history. Previously the geometry alpha was valid
+        // even when `gres.known` was false, so a starved probe block erased
+        // accumulated light as a screen-aligned black rectangle.
+        If(gres.known, () => {
+          diffuseKnown.assign(1);
+        });
         atomicAdd(resolveStats.element(uint(0)), uint(1));
         if (gres.primaryKnown) {
           If(gres.primaryKnown.not(), () => { atomicAdd(resolveStats.element(uint(1)), uint(1)); });
@@ -357,7 +368,19 @@ export function createRcMerge({
         // point, times this texel's FILTERED visibility. Against the FACED
         // normal, like the gather: the hemisphere a lamp lights is the
         // hemisphere the field was filled over.
-        if (direct) E.addAssign(direct.directAt(g.xyz, Nf, gx, gy).mul(directTermU));
+        if (direct) {
+          E.addAssign(direct.directAt(g.xyz, Nf, gx, gy).mul(directTermU));
+          // Direct is only one additive component. It may certify the result
+          // only in the field-disabled A/B; with the field enabled, a missing
+          // cascade answer remains UNKNOWN so temporal history bridges it.
+          If(fieldTermU.lessThanEqual(0.0001), () => { diffuseKnown.assign(1); });
+        }
+        if (glossyHalf) {
+          // Alpha carries normal-y plus two independent validity bits:
+          // +4 diffuse, +8 glossy. The upsampler must not make one term's
+          // availability certify or reject the other.
+          If(diffuseKnown.greaterThan(0.5), () => { ga.assign(Nn.y.add(4)); });
+        }
         // ── §19 5.5a: THE SAME PROBES, READ TOWARD `R` ────────────────────
         if (glossyHalf) {
           // The view vector is `P − camera`; `reflect` mirrors it about the
@@ -373,13 +396,20 @@ export function createRcMerge({
           // §12.71b's convention verbatim (`createSrcGlossyGather` divides by
           // exactly this) and it is the reason the new writer's output is
           // comparable to the old `glossyHalf` rather than π× brighter.
-          const Gr = vec3(gather.gatherAt(g.xyz, Nf, R, lobe).irradiance)
-            .mul(float(1 / Math.PI)).toVar();
+          const glossyResult = gather.gatherAt(g.xyz, Nf, R, lobe);
+          const Gr = vec3(glossyResult.irradiance).mul(float(1 / Math.PI)).toVar();
           // Hue-preserving soft cap. A narrow lobe onto one hot bin is a white
           // dot; the diffuse read never produces one because its cosine
           // integral averages the same probe over the hemisphere.
           const lum = Gr.x.mul(0.2126).add(Gr.y.mul(0.7152)).add(Gr.z.mul(0.0722)).toVar();
-          G.assign(Gr.mul(float(glossyCapU).div(lum.max(glossyCapU))).mul(glossyWriteU));
+          // Directional availability is independent from the diffuse
+          // hemisphere above. A diffuse answer must not certify an UNKNOWN
+          // reflection direction as valid black, or moving mirrors inherit
+          // the same rectangular dropout under a different alpha carrier.
+          If(glossyResult.known, () => {
+            G.assign(Gr.mul(float(glossyCapU).div(lum.max(glossyCapU))).mul(glossyWriteU));
+            ga.assign(Nn.y.add(8).add(diffuseKnown.mul(4)));
+          });
         }
       });
     });

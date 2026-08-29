@@ -29,7 +29,7 @@
 // have and does not want, and the full chain measured 10-20 ms — the §18
 // mandate's whole frame budget for one term. So this is the same SHAPE on the
 // window's own trace: one binary ray, then a separable cross-bilateral, at HALF
-// RESOLUTION, in 2 dispatches of 7 taps.
+// RESOLUTION, in 2 dispatches of 13 bounded taps.
 //
 // ══ NO DOUBLE COUNT, AND THE ARGUMENT IS THE REFERENCE'S OWN CONVENTION ═════
 //
@@ -79,44 +79,69 @@ import {
   uint, uniform, vec2, vec3, vec4,
 } from "three/tsl";
 import { emitterShapeGain } from "../emitterShapeGain.js";
+import { boxLightFactor } from "../../giLight.js";
+import {
+  RC_DIRECT_FILTER_RADIUS,
+  RC_DIRECT_FILTER_TAPS,
+  RC_DIRECT_FILTER_WEIGHTS,
+  RC_DIRECT_PASS_NAMES,
+} from "./rcDirectFilterPolicy.js";
 
 /** The four NEE slots are four channels. `MAX_EMITTERS` is 4 and always was. */
 const SLOTS = 4;
 
 /**
- * Gaussian-ish 7 taps, σ ≈ 1.5 texels at HALF res ≈ 3 px at full res, applied
+ * Gaussian-ish 13 taps, σ ≈ 2.4 texels at HALF res ≈ 5 px at full res, applied
  * separably twice (H then V). Wide enough to bury the voxel lamp's aliased
  * silhouette, narrow enough that the plane test still has neighbours to reject.
  */
-const TAPS = [-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6];
-const TAP_W = TAPS.map((t) => Math.exp(-(t * t) / (2 * 2.4 * 2.4)));
+const TAPS = RC_DIRECT_FILTER_TAPS;
+const TAP_W = RC_DIRECT_FILTER_WEIGHTS;
 /**
  * §19 6.14 — THE PENUMBRA IS A FILTER WIDTH, NOT A SAMPLE COUNT. One ray per
  * texel, as before; what changed is that the ray reports its FIRST-HIT
  * distance and the filter's radius is the PCSS half-width that distance
  * implies, `lampHalf · t_occ / (d − t_occ)`, in metres at the receiver and
  * converted to texels through the gbuffer's own footprint along each filter
- * axis. `R_MAX` is half-res texels (24 full-res px). The 13 taps are spread
- * over the radius, so a wide penumbra is a 13-level ramp at half res filtered
- * twice — a monotone gradient, no steps a user can see, and no noise because
- * nothing here is stochastic.
+ * axis. The geometric rays form the wide penumbra; the bounded filter below
+ * only joins their five visibility levels without expanding the silhouette.
  */
-const R_MAX = 12;
-/**
- * §19 6.25 — THE PENUMBRA FOLLOWS THE LAMP'S SIZE. The width is now the area
- * light's first-order law, W = L · (d_r − d_b) / d_b, with L the lamp's
- * projected extent perpendicular to the seat ray and d_b / d_r the lamp
- * SURFACE → blocker / receiver distances. It has no floor (a blocker near the
- * lamp legitimately makes the whole shadow penumbra), so the filter must reach
- * further than 24 px: a SECOND, coarse round of the same separable filter runs
- * at up to `R_MAX2` half-res texels over the fine round's output, and the
- * blocker search gets a strided second round of the same reach. 13 taps at
- * spacing ≤ R_MAX2/6 over a field already smoothed at σ ≈ 0.4·R_MAX stays a
- * gradient, not a staircase.
- */
-const R_MAX2 = 64;
-const DILATE_STRIDE = 6;
+// The four geometric visibility rays below already distribute the hard edges
+// over the emitter's projected surface. This filter only removes the remaining
+// five-level staircase; it must not synthesize a second, screen-space
+// penumbra. Six half-resolution texels are twelve displayed pixels, enough to
+// hide the steps while keeping contact shadows and blocker silhouettes local.
+const R_FILTER = RC_DIRECT_FILTER_RADIUS;
 const QUAD_SPREAD = globalThis.__giQuadSpread ?? 0.5;
+
+/**
+ * GI2 receiver-side geometric factor. Compact emitters retain the bounded
+ * projected-area approximation; thin box seats use the exact rectangle
+ * contour already used by the material path. A long sign therefore lights
+ * from its authored extent instead of from one centre/distance sample.
+ */
+export function rcEmitterDirectFactor(slot, P, N) {
+  const centre = vec3(slot.center).toVar();
+  const wv = centre.sub(P).toVar();
+  const d2 = dot(wv, wv).max(1e-4).toVar();
+  const d = sqrt(d2).toVar();
+  const wd = wv.div(d).toVar();
+  const reff = float(slot.reff).max(1e-3).toVar();
+  const gain = emitterShapeGain(slot)(wd);
+  const factor = float(Math.PI)
+    .min(float(Math.PI).mul(reff.mul(reff)).mul(gain).div(d2))
+    .mul(dot(N, wd).max(0))
+    .toVar();
+  const h = vec3(slot.half).abs().toVar();
+  const thinBox = float(slot.kind).equal(1)
+    .and(h.x.min(h.y).min(h.z).lessThanEqual(h.x.max(h.y).max(h.z).mul(0.2)));
+  If(thinBox, () => {
+    factor.assign(boxLightFactor(
+      P, N, centre, h, vec3(slot.bx), vec3(slot.by), vec3(slot.bz),
+    ));
+  });
+  return factor;
+}
 
 /**
  * @param {object} o
@@ -171,9 +196,7 @@ export function createRcEmitterDirect({
   const visB = mk("rcEmitterVisTmp");
   /** §19 6.14 — the PCSS half-width in METRES per slot, raw then dilated (A → B → A). */
   const penA = mk("rcEmitterPen");
-  const penB = mk("rcEmitterPenTmp");
   const penAN = texture(penA);
-  const penBN = texture(penB);
 
   const posN = texture(gbuffer.position);
   const nrmN = texture(gbuffer.normal);
@@ -352,11 +375,33 @@ export function createRcEmitterDirect({
             const ex = vec3(slot.exHalf).abs().max(1e-4).toVar();
             const ld = vec3(dot(wd, vec3(slot.bx)), dot(wd, vec3(slot.by)), dot(wd, vec3(slot.bz))).abs().max(1e-6).toVar();
             const slab = ex.x.div(ld.x).min(ex.y.div(ld.y)).min(ex.z.div(ld.z)).toVar();
+            // Voxel occupancy has no triangle owner, so the dynamic arm cannot
+            // reject the sampled emitter the way the exact BVH does. Stop at
+            // the entry of its DILATED OBB instead. A fixed `dq - 2*v0` only
+            // clears a face-normal ray; at a grazing angle those same two
+            // cells occupy `2*v0 / |dot(rd, faceN)|` metres and the old cap
+            // ended inside the emitter's own voxels while it was scaling.
+            const voxelEntry = (rayDir) => {
+              const rel = P.sub(centre).toVar();
+              const roL = vec3(dot(rel, vec3(slot.bx)), dot(rel, vec3(slot.by)), dot(rel, vec3(slot.bz))).toVar();
+              const rdL0 = vec3(dot(rayDir, vec3(slot.bx)), dot(rayDir, vec3(slot.by)), dot(rayDir, vec3(slot.bz))).toVar();
+              const safe = (c) => select(c.abs().greaterThan(1e-6), c, select(c.greaterThanEqual(0), float(1e-6), float(-1e-6)));
+              const rdL = vec3(safe(rdL0.x), safe(rdL0.y), safe(rdL0.z)).toVar();
+              const expanded = ex.add(vec3(2 * v0)).toVar();
+              const a = expanded.negate().sub(roL).div(rdL).toVar();
+              const b = expanded.sub(roL).div(rdL).toVar();
+              const lo = a.min(b).toVar();
+              const near = lo.x.max(lo.y).max(lo.z).toVar();
+              // traceWindow moves its origin by up to half a cell; retain the
+              // same half-cell as endpoint slack so that bias cannot step back
+              // into the expanded source volume.
+              return near.sub(v0 * 0.5).max(v0 * 0.5);
+            };
             // §19 6.12 — AND A MARGIN BEFORE THE SLAB EXIT: a ray stopped exactly
             // on the face lands on the "hit" side of Möller-Trumbore's `t < maxT`.
             // 0.1 % of the distance (4 mm at 4 m) is 10⁴ f32 ulps.
             const reachBvh = d.sub(slab.min(clear)).sub(d.mul(1e-3).max(2e-3)).max(1e-3).toVar();
-            reachVox.assign(d.sub(slab.min(clear)).sub(float(2 * v0)).max(v0 * 0.5));
+            reachVox.assign(voxelEntry(wd));
             // The ray now returns WHERE it stopped, not only whether. `tOcc`
             // is −1 for a clear ray on the exact arm; the voxel arm's `t` is
             // whatever the DDA reports, masked by `hit` below.
@@ -400,7 +445,12 @@ export function createRcEmitterDirect({
               const wq = Q.sub(P).toVar();
               const dq = sqrt(dot(wq, wq).max(1e-6)).toVar();
               if (QUAD_SPREAD < 0) return { pt: centre.sub(wd.mul(slab.min(clear))).toVar(), dir: wd, bvh: reachBvh, vox: reachVox }; // isolation: the centre ray x4
-              return { pt: Q.toVar(), dir: wq.div(dq).toVar(), bvh: dq.sub(dq.mul(1e-3).max(2e-3)).max(1e-3).toVar(), vox: dq.sub(float(2 * v0)).max(v0 * 0.5).toVar() };
+              const qdir = wq.div(dq).toVar();
+              return {
+                pt: Q.toVar(), dir: qdir,
+                bvh: dq.sub(dq.mul(1e-3).max(2e-3)).max(1e-3).toVar(),
+                vox: voxelEntry(qdir),
+              };
             });
             const hSum = float(0).toVar();
             const h = float(0).toVar();
@@ -433,8 +483,15 @@ export function createRcEmitterDirect({
                 // nearest-t traverse inside gi2BvhQuadVis over one binding set.
                 // §19 6.25e isolation B: the 6.25 call (one nearest-t, no wrapper)
                 const qv = (globalThis.__giNoQuadFn
-                  ? vec2(step(0, BVH.nearestTFrom(P, wd, reachBvh, Nf)).mul(4), BVH.nearestTFrom(P, wd, reachBvh, Nf))
-                  : BVH.quadVisFrom(P, wd, reachBvh, quad[0].pt, quad[1].pt, quad[2].pt, quad[3].pt, float(1e-3), Nf)).toVar();
+                  ? vec2(
+                      step(0, BVH.nearestTFrom(P, wd, reachBvh, Nf, uint(slot.owner))).mul(4),
+                      BVH.nearestTFrom(P, wd, reachBvh, Nf, uint(slot.owner)),
+                    )
+                  : BVH.quadVisFrom(
+                      P, wd, reachBvh,
+                      quad[0].pt, quad[1].pt, quad[2].pt, quad[3].pt,
+                      float(1e-3), Nf, uint(slot.owner),
+                    )).toVar();
                 hSum.assign(qv.x);
                 if (traceDyn && !globalThis.__giNoDynQuad) { // §19 6.25e isolation C
                   Loop(4, ({ i }) => { hSum.addAssign(traceDyn.traceWindow(P, pickQ(i, "dir"), pickQ(i, "vox"), Nf).hit); });
@@ -472,7 +529,7 @@ export function createRcEmitterDirect({
             // a lamp-half of the lamp — both Cornell lamps are — so the ×2 lamp
             // measured the same 9 px ramp as the ×1 (the user's report). A
             // blocker touching the lamp legitimately turns the whole shadow
-            // into penumbra; the filter's reach (R_MAX2) is the only cap.
+            // into penumbra; the bounded reconstruction radius is the cap.
             const lds = vec3(dot(wd, vec3(slot.bx)), dot(wd, vec3(slot.by)), dot(wd, vec3(slot.bz))).toVar();
             const pickX = ld.x.lessThanEqual(ld.y).and(ld.x.lessThanEqual(ld.z));
             const pickY = ld.y.lessThanEqual(ld.z);
@@ -502,70 +559,35 @@ export function createRcEmitterDirect({
   // §19 6.12 — the slot re-binds this kernel when the worker's tree lands.
   if (BVH) BVH.attach?.(rawPass);
 
-  // ── [B] THE BLOCKER SEARCH: THE PENUMBRA GROWS OUTSIDE THE HARD EDGE ─────
-  //
-  // A clear ray carries no blocker distance, so an unoccluded texel next to a
-  // shadow would keep radius 0 and the ramp would live only INSIDE the
-  // geometric edge. The standard PCSS blocker search fixes that: a texel
-  // adopts a neighbour's radius when it lies within that radius of the
-  // neighbour — in WORLD metres, through the gbuffer, so a far surface behind
-  // a near edge is not reached and no depth test is needed. Separable, max.
-  const dilatePass = (srcNode, dstTex, dx, dy, stride = 1) => Fn(() => {
-    const i = instanceIndex.toVar();
-    const gx = i.mod(halfWU).toVar();
-    const gy = i.div(halfWU).toVar();
-    If(gy.greaterThanEqual(halfHU), () => { Return(); });
-    const c = surfaceAt(gx, gy);
-    const r = srcNode.load(ivec2(gx.toInt(), gy.toInt())).toVar();
-    If(c.valid, () => {
-      const P0 = vec3(c.P).toVar();
-      for (let o = -R_MAX; o <= R_MAX; o++) {
-        if (o === 0) continue;
-        const sx = gx.toInt().add(o * dx * stride).max(0).min(halfWU.toInt().sub(1)).toUint().toVar();
-        const sy = gy.toInt().add(o * dy * stride).max(0).min(halfHU.toInt().sub(1)).toUint().toVar();
-        const s = surfaceAt(sx, sy);
-        If(s.valid, () => {
-          const rn = srcNode.load(ivec2(sx.toInt(), sy.toInt())).toVar();
-          const dv = vec3(s.P).sub(P0).toVar();
-          const dist = sqrt(dot(dv, dv)).toVar();
-          r.assign(r.max(rn.mul(step(vec4(dist), rn))));
-        });
-      }
-    });
-    textureStore(dstTex, ivec2(gx.toInt(), gy.toInt()), r);
-  })().compute(halfW * halfH);
-  const dilH = dilatePass(penAN, penB, 1, 0);
-  const dilV = dilatePass(penBN, penA, 0, 1);
-  // §19 6.25 — the coarse round: the fine round has already spread every
-  // blocker's radius ±R_MAX, so a stride-6 search reaches ±72 texels with no
-  // gap a stride can fall through. Same world-distance test, same W.
-  const dilH2 = dilatePass(penAN, penB, 1, 0, DILATE_STRIDE);
-  const dilV2 = dilatePass(penBN, penA, 0, 1, DILATE_STRIDE);
-
-  // ── [F] THE SEPARABLE CROSS-BILATERAL, TWICE, AT THE PCSS RADIUS ─────────
+  // ── [F] THE BOUNDED SEPARABLE CROSS-BILATERAL ──────────────────────────────
   //
   // Plane distance and normal agreement, the same two rejections
   // `createGiLightShadowFilterPass` and `resolveUpsample` both use. A tap on a
   // different surface contributes NOTHING, so a penumbra is softened along the
   // wall it lies on and never across the corner it stops at. §19 6.14: the 13
-  // taps are spread over `radius = clamp(penumbra / footprint, 1, R_MAX)`
+  // taps cover `radius = clamp(penumbra / footprint, 1, R_FILTER)`
   // texels, where `footprint` is the world size of one half-res texel along
   // this pass's axis, read off the gbuffer's neighbour on the same plane — a
-  // grazing wall is foreshortened and its blur shrinks with it. The radius is
-  // the largest of the four slots' (one loop, not four).
-  const filterPass = (srcNode, dstTex, dx, dy, coarse = false) => Fn(() => {
+  // grazing wall is foreshortened and its blur shrinks with it. Each channel
+  // gets its own support mask at the SAME fixed integer tap positions. That is
+  // important: deriving coordinates from the widest channel made a small
+  // emitter collapse to a centre-only sample whenever a broad emitter shared
+  // the RGBA texture.
+  const filterPass = (srcNode, dstTex, dx, dy) => Fn(() => {
     const i = instanceIndex.toVar();
     const gx = i.mod(halfWU).toVar();
     const gy = i.div(halfWU).toVar();
     If(gy.greaterThanEqual(halfHU), () => { Return(); });
     const c = surfaceAt(gx, gy);
     const acc = vec4(0).toVar();
-    const wsum = float(0).toVar();
+    // One denominator per emitter channel. Sharing the widest slot's scalar
+    // denominator blurred small lamps with a neighbouring sign's penumbra and
+    // produced the reported muddy cross-emitter shadow.
+    const wsum = vec4(0).toVar();
     If(c.valid, () => {
       const P0 = vec3(c.P).toVar();
       const N0 = vec3(c.N).toVar();
       const pw = penAN.load(ivec2(gx.toInt(), gy.toInt())).toVar();
-      const rW = pw.x.max(pw.y).max(pw.z).max(pw.w).toVar();
       const fp = float(1e9).toVar();
       for (const sgn of [1, -1]) {
         const nx = gx.toInt().add(sgn * dx).max(0).min(halfWU.toInt().sub(1)).toUint().toVar();
@@ -575,17 +597,11 @@ export function createRcEmitterDirect({
         const same = n.valid.and(N0.dot(dv).abs().lessThan(0.05)).and(N0.dot(vec3(n.N)).greaterThan(0.9));
         If(same, () => { fp.assign(fp.min(sqrt(dot(dv, dv)).max(1e-5))); });
       }
-      // §19 6.25 — fine round: the radius up to R_MAX. Coarse round: the SAME
-      // radius when it exceeds R_MAX (up to R_MAX2), else 0 — every tap then
-      // lands on the centre and the pass is the identity.
-      const rAll = rW.div(fp).toVar();
-      const rT = coarse
-        ? select(rAll.greaterThan(R_MAX), rAll.min(R_MAX2), float(0)).toVar()
-        : rAll.clamp(1, R_MAX).toVar();
+      const rC = pw.div(fp).clamp(1, R_FILTER).toVar();
       for (let t = 0; t < TAPS.length; t++) {
-        const off = rT.mul(TAPS[t] / 6).round().toInt().toVar();
-        const sx = gx.toInt().add(off.mul(dx)).max(0).min(halfWU.toInt().sub(1)).toUint().toVar();
-        const sy = gy.toInt().add(off.mul(dy)).max(0).min(halfHU.toInt().sub(1)).toUint().toVar();
+        const off = TAPS[t];
+        const sx = gx.toInt().add(off * dx).max(0).min(halfWU.toInt().sub(1)).toUint().toVar();
+        const sy = gy.toInt().add(off * dy).max(0).min(halfHU.toInt().sub(1)).toUint().toVar();
         const s = surfaceAt(sx, sy);
         // ⚠ REJECTION WEIGHTS ARE EPSILONS, NEVER ZEROS is the gather's rule;
         // here a rejected tap really is absent, and the `wsum` division
@@ -594,14 +610,16 @@ export function createRcEmitterDirect({
         const planar = N0.dot(vec3(s.P).sub(P0)).abs().lessThan(0.05).toVar();
         const aligned = N0.dot(vec3(s.N)).greaterThan(0.9).toVar();
         If(s.valid.and(planar).and(aligned), () => {
-          const w = float(TAP_W[t]).toVar();
-          acc.addAssign(srcNode.load(ivec2(sx.toInt(), sy.toInt())).mul(w));
-          wsum.addAssign(w);
+          const support = step(vec4(Math.abs(off) - 0.5), rC).mul(TAP_W[t]).toVar();
+          acc.addAssign(srcNode.load(ivec2(sx.toInt(), sy.toInt())).mul(support));
+          wsum.addAssign(support);
         });
       }
     });
     const out = vec4(1, 1, 1, 1).toVar();
-    If(wsum.greaterThan(0), () => { out.assign(acc.div(wsum)); });
+    If(wsum.x.max(wsum.y).max(wsum.z).max(wsum.w).greaterThan(0), () => {
+      out.assign(acc.div(wsum.max(1e-6)));
+    });
     If(debugU.greaterThan(0.5), () => { out.assign(srcNode.load(ivec2(gx.toInt(), gy.toInt()))); });
     textureStore(dstTex, ivec2(gx.toInt(), gy.toInt()), out);
   })().compute(halfW * halfH);
@@ -611,8 +629,7 @@ export function createRcEmitterDirect({
   globalThis.__rcDirectLast = { visA, visB, penA, rawPass, build: globalThis.__rcDirectBuilds };
   const hPass = filterPass(visAN, visB, 1, 0);
   const vPass = filterPass(visBN, visA, 0, 1);
-  const hPass2 = filterPass(visAN, visB, 1, 0, true);
-  const vPass2 = filterPass(visBN, visA, 0, 1, true);
+  const filteredPasses = [rawPass, hPass, vPass];
 
   /**
    * The direct irradiance from every ACTIVE slot at a shading point, with this
@@ -624,34 +641,24 @@ export function createRcEmitterDirect({
    * every path and a brightness difference between two of them is a bug rather
    * than a convention.
    */
-  const gainOf = slots.map((slot) => emitterShapeGain(slot));
   const directAt = (P, n, gx, gy) => {
     const vis = mix(vec4(1, 1, 1, 1), visAN.load(ivec2(gx.toInt(), gy.toInt())), shadowU).toVar();
     const E = vec3(0).toVar();
     for (let k = 0; k < slots.length; k++) {
       const slot = slots[k];
-      const centre = vec3(slot.center).toVar();
-      const reff = float(slot.reff).max(1e-3).toVar();
       const rgb = vec3(slot.color).toVar();
       const active = float(slot.radius).greaterThan(1e-5)
         .and(rgb.x.add(rgb.y).add(rgb.z).greaterThan(1e-6));
       If(active, () => {
-        const wv = centre.sub(P).toVar();
-        const d2 = dot(wv, wv).max(1e-4).toVar();
-        const d = sqrt(d2).toVar();
-        const wd = wv.div(d).toVar();
-        const cosX = dot(n, wd).toVar();
-        If(cosX.greaterThan(1e-3), () => {
+        const factor = rcEmitterDirectFactor(slot, P, n).toVar();
+        If(factor.greaterThan(1e-6), () => {
           // §19 5.3d — the seat's `Ω` is the emitter's MEAN projected solid
           // angle (`emitterShapes.shapeMeanProjRadius` is Cauchy's S/4); this
           // is the directional factor that makes it the one it subtends FROM
           // HERE. Mean 1 over the sphere, so the lamp's total power is
           // unchanged and only its silhouette moves. `emitterShapeGain`'s
           // header carries the derivation and the measurement.
-          const g = gainOf[k](wd);
-          const omega = float(Math.PI)
-            .min(float(Math.PI).mul(reff.mul(reff)).mul(g).div(d2)).toVar();
-          E.addAssign(rgb.mul(omega).mul(cosX).mul(comp(vis, k).clamp(0, 1)));
+          E.addAssign(rgb.mul(factor).mul(comp(vis, k).clamp(0, 1)));
         });
       });
     }
@@ -661,11 +668,12 @@ export function createRcEmitterDirect({
   return {
     /** [S] → [F.h] → [F.v]. Spliced before the pixel resolve that reads them. */
     // §19 6.25f hatch: the raw pass alone (visA = the unfiltered raw output)
-    passes: globalThis.__giRawOnly ? [rawPass] : [rawPass, dilH, dilV, dilH2, dilV2, hPass, vPass, hPass2, vPass2],
+    passes: globalThis.__giRawOnly ? [rawPass] : filteredPasses,
+    passNames: globalThis.__giRawOnly ? RC_DIRECT_PASS_NAMES.slice(0, 1) : RC_DIRECT_PASS_NAMES,
     directAt,
     /** The FILTERED visibility (V writes back into A) — for a debug read. */
     texture: visA,
-    /** §19 6.14 — the DILATED PCSS half-width (metres) per slot — for a debug read. */
+    /** §19 6.14 — the measured PCSS half-width (metres) per slot — for a debug read. */
     penumbra: penA,
     /** The gbuffer textures this pass CAPTURED at build — for the stale-binding receipt. */
     bound: { position: gbuffer.position, normal: gbuffer.normal },
@@ -688,7 +696,6 @@ export function createRcEmitterDirect({
       visA.dispose?.();
       visB.dispose?.();
       penA.dispose?.();
-      penB.dispose?.();
     },
   };
 }

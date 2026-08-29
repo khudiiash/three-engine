@@ -28,6 +28,7 @@ import {
 } from "../src/modules/gi/window/windowStore.js";
 import { ALL_FACES, CORNELL_SCENE, ROOM, analyticVoxel } from "../src/modules/gi/window/windowFill.js";
 import { entryFaceBit } from "../src/modules/gi/window/windowTrace.js";
+import { RC_TIERS, rcBinBudget, rcBlockCapacities } from "../src/modules/gi/window/rc/rcConfig.js";
 
 let failures = 0;
 let checks = 0;
@@ -42,6 +43,26 @@ const ok = (group, cond, msg) => {
   if (g.fail <= 4) console.error(`  FAIL [${group}] ${msg}`);
   return false;
 };
+
+{
+  const G = "rc-bin-pools";
+  const expected = {
+    ultra: [12288, 3072, 768, 192],
+    high: [11264, 2560, 640, 160],
+    medium: [4096, 1024, 256, 64],
+    phone: [1024, 256, 64, 16],
+  };
+  const budgets = { ultra: 1_572_864, high: 1_343_488, medium: 524_288, phone: 131_072 };
+  for (const [tier, spec] of Object.entries(RC_TIERS)) {
+    const caps = rcBlockCapacities(spec);
+    ok(G, JSON.stringify(caps) === JSON.stringify(expected[tier]),
+      `${tier} block hierarchy ${caps.join("/")} (want ${expected[tier].join("/")})`);
+    ok(G, rcBinBudget(spec) === budgets[tier],
+      `${tier} bin budget ${rcBinBudget(spec)} (want ${budgets[tier]})`);
+    for (let c = 1; c < caps.length; c++) ok(G, caps[c - 1] >= caps[c],
+      `${tier} c${c - 1} capacity ${caps[c - 1]} is below c${c} ${caps[c]}`);
+  }
+}
 
 // ─────────────────────────────────────────────── 1. toroidal addressing
 {

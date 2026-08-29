@@ -1,0 +1,477 @@
+{
+ "version": 1,
+ "name": "Main",
+ "settings": {
+  "background": "#000000",
+  "ambientColor": "#ffffff",
+  "ambientIntensity": 0,
+  "environment": {
+   "cubemap": "",
+   "background": false,
+   "lighting": false,
+   "intensity": 0,
+   "rotation": 0,
+   "blur": 0
+  },
+  "fog": {
+   "type": "none",
+   "color": "#f2f2f2",
+   "near": 10,
+   "far": 40,
+   "density": 0.02
+  },
+  "toneMapping": "agx",
+  "exposure": 1,
+  "shadows": true,
+  "renderer": {
+   "antialias": true,
+   "samples": 4,
+   "transparent": false
+  },
+  "shadow": {
+   "type": "PCFSoftShadowMap",
+   "autoUpdate": true,
+   "needsUpdate": false
+  },
+  "performance": {
+   "maxDevicePixelRatio": 1,
+   "renderScale": 1,
+   "dynamicResolution": false,
+   "targetFps": 120,
+   "volumeStepScale": 1,
+   "autoBatching": false,
+   "occlusionCulling": false
+  }
+ },
+ "entities": [
+  {
+   "id": "aogRoot",
+   "name": "AoGlossyRig",
+   "position": [
+    0,
+    0,
+    0
+   ],
+   "rotation": [
+    0,
+    0,
+    0
+   ],
+   "scale": [
+    1,
+    1,
+    1
+   ],
+   "viewOnly": false,
+   "enabledInEditor": true,
+   "enabledInGame": true,
+   "components": [
+    {
+     "type": "global-illumination",
+     "props": {
+      "enabled": true,
+      "quality": "high"
+     }
+    }
+   ],
+   "children": [
+    {
+     "id": "aog000",
+     "name": "Floor",
+     "position": [
+      0,
+      -0.05,
+      0
+     ],
+     "rotation": [
+      0,
+      0,
+      0
+     ],
+     "scale": [
+      6,
+      0.1,
+      6
+     ],
+     "viewOnly": false,
+     "enabledInEditor": true,
+     "enabledInGame": true,
+     "components": [
+      {
+       "type": "mesh",
+       "props": {
+        "enabled": true,
+        "geometry": "box",
+        "geometryAsset": "",
+        "material": "c:/Users/Khudiiash/Documents/JS/engine/scripts/.boot-diag/materials/Wall.mat",
+        "material2": "",
+        "material3": "",
+        "material4": "",
+        "material5": "",
+        "material6": "",
+        "material7": "",
+        "material8": "",
+        "castShadow": false,
+        "receiveShadow": true
+       }
+      }
+     ],
+     "children": []
+    },
+    {
+     "id": "aog001",
+     "name": "Ceiling",
+     "position": [
+      0,
+      3.05,
+      0
+     ],
+     "rotation": [
+      0,
+      0,
+      0
+     ],
+     "scale": [
+      6,
+      0.1,
+      6
+     ],
+     "viewOnly": false,
+     "enabledInEditor": true,
+     "enabledInGame": true,
+     "components": [
+      {
+       "type": "mesh",
+       "props": {
+        "enabled": true,
+        "geometry": "box",
+        "geometryAsset": "",
+        "material": "c:/Users/Khudiiash/Documents/JS/engine/scripts/.boot-diag/materials/Wall.mat",
+        "material2": "",
+        "material3": "",
+        "material4": "",
+        "material5": "",
+        "material6": "",
+        "material7": "",
+        "material8": "",
+        "castShadow": false,
+        "receiveShadow": true
+       }
+      }
+     ],
+     "children": []
+    },
+    {
+     "id": "aog002",
+     "name": "WallBack",
+     "position": [
+      0,
+      1.5,
+      -3.05
+     ],
+     "rotation": [
+      0,
+      0,
+      0
+     ],
+     "scale": [
+      6,
+      3,
+      0.1
+     ],
+     "viewOnly": false,
+     "enabledInEditor": true,
+     "enabledInGame": true,
+     "components": [
+      {
+       "type": "mesh",
+       "props": {
+        "enabled": true,
+        "geometry": "box",
+        "geometryAsset": "",
+        "material": "c:/Users/Khudiiash/Documents/JS/engine/scripts/.boot-diag/materials/Wall.mat",
+        "material2": "",
+        "material3": "",
+        "material4": "",
+        "material5": "",
+        "material6": "",
+        "material7": "",
+        "material8": "",
+        "castShadow": false,
+        "receiveShadow": true
+       }
+      }
+     ],
+     "children": []
+    },
+    {
+     "id": "aog003",
+     "name": "WallFront",
+     "position": [
+      0,
+      1.5,
+      3.05
+     ],
+     "rotation": [
+      0,
+      0,
+      0
+     ],
+     "scale": [
+      6,
+      3,
+      0.1
+     ],
+     "viewOnly": false,
+     "enabledInEditor": true,
+     "enabledInGame": true,
+     "components": [
+      {
+       "type": "mesh",
+       "props": {
+        "enabled": true,
+        "geometry": "box",
+        "geometryAsset": "",
+        "material": "c:/Users/Khudiiash/Documents/JS/engine/scripts/.boot-diag/materials/Wall.mat",
+        "material2": "",
+        "material3": "",
+        "material4": "",
+        "material5": "",
+        "material6": "",
+        "material7": "",
+        "material8": "",
+        "castShadow": false,
+        "receiveShadow": true
+       }
+      }
+     ],
+     "children": []
+    },
+    {
+     "id": "aog004",
+     "name": "WallLeft",
+     "position": [
+      -3.05,
+      1.5,
+      0
+     ],
+     "rotation": [
+      0,
+      0,
+      0
+     ],
+     "scale": [
+      0.1,
+      3,
+      6
+     ],
+     "viewOnly": false,
+     "enabledInEditor": true,
+     "enabledInGame": true,
+     "components": [
+      {
+       "type": "mesh",
+       "props": {
+        "enabled": true,
+        "geometry": "box",
+        "geometryAsset": "",
+        "material": "c:/Users/Khudiiash/Documents/JS/engine/scripts/.boot-diag/materials/Wall.mat",
+        "material2": "",
+        "material3": "",
+        "material4": "",
+        "material5": "",
+        "material6": "",
+        "material7": "",
+        "material8": "",
+        "castShadow": false,
+        "receiveShadow": true
+       }
+      }
+     ],
+     "children": []
+    },
+    {
+     "id": "aog005",
+     "name": "WallRight",
+     "position": [
+      3.05,
+      1.5,
+      0
+     ],
+     "rotation": [
+      0,
+      0,
+      0
+     ],
+     "scale": [
+      0.1,
+      3,
+      6
+     ],
+     "viewOnly": false,
+     "enabledInEditor": true,
+     "enabledInGame": true,
+     "components": [
+      {
+       "type": "mesh",
+       "props": {
+        "enabled": true,
+        "geometry": "box",
+        "geometryAsset": "",
+        "material": "c:/Users/Khudiiash/Documents/JS/engine/scripts/.boot-diag/materials/Wall.mat",
+        "material2": "",
+        "material3": "",
+        "material4": "",
+        "material5": "",
+        "material6": "",
+        "material7": "",
+        "material8": "",
+        "castShadow": false,
+        "receiveShadow": true
+       }
+      }
+     ],
+     "children": []
+    },
+    {
+     "id": "aog006",
+     "name": "Panel",
+     "position": [
+      0,
+      2.94,
+      -1
+     ],
+     "rotation": [
+      0,
+      0,
+      0
+     ],
+     "scale": [
+      2,
+      0.05,
+      2
+     ],
+     "viewOnly": false,
+     "enabledInEditor": true,
+     "enabledInGame": true,
+     "components": [
+      {
+       "type": "mesh",
+       "props": {
+        "enabled": true,
+        "geometry": "box",
+        "geometryAsset": "",
+        "material": "c:/Users/Khudiiash/Documents/JS/engine/scripts/.boot-diag/materials/Panel.mat",
+        "material2": "",
+        "material3": "",
+        "material4": "",
+        "material5": "",
+        "material6": "",
+        "material7": "",
+        "material8": "",
+        "castShadow": false,
+        "receiveShadow": true,
+        "giMobility": "static",
+        "giTrace": "auto",
+        "giDynamic": "auto"
+       }
+      }
+     ],
+     "children": []
+    },
+    {
+     "id": "aog007",
+     "name": "ContactBox",
+     "position": [
+      -0.9,
+      0.4,
+      -1
+     ],
+     "rotation": [
+      0,
+      0,
+      0
+     ],
+     "scale": [
+      0.8,
+      0.8,
+      0.8
+     ],
+     "viewOnly": false,
+     "enabledInEditor": true,
+     "enabledInGame": true,
+     "components": [
+      {
+       "type": "mesh",
+       "props": {
+        "enabled": true,
+        "geometry": "box",
+        "geometryAsset": "",
+        "material": "c:/Users/Khudiiash/Documents/JS/engine/scripts/.boot-diag/materials/Wall.mat",
+        "material2": "",
+        "material3": "",
+        "material4": "",
+        "material5": "",
+        "material6": "",
+        "material7": "",
+        "material8": "",
+        "castShadow": false,
+        "receiveShadow": true,
+        "giMobility": "static",
+        "giTrace": "auto",
+        "giDynamic": "auto"
+       }
+      }
+     ],
+     "children": []
+    },
+    {
+     "id": "aog008",
+     "name": "MetalSphere",
+     "position": [
+      0.9,
+      0.5,
+      -1
+     ],
+     "rotation": [
+      0,
+      0,
+      0
+     ],
+     "scale": [
+      0.9,
+      0.9,
+      0.9
+     ],
+     "viewOnly": false,
+     "enabledInEditor": true,
+     "enabledInGame": true,
+     "components": [
+      {
+       "type": "mesh",
+       "props": {
+        "enabled": true,
+        "geometry": "sphere",
+        "geometryAsset": "",
+        "material": "c:/Users/Khudiiash/Documents/JS/engine/scripts/.boot-diag/materials/Metal.mat",
+        "material2": "",
+        "material3": "",
+        "material4": "",
+        "material5": "",
+        "material6": "",
+        "material7": "",
+        "material8": "",
+        "castShadow": false,
+        "receiveShadow": true,
+        "giMobility": "static",
+        "giTrace": "auto",
+        "giDynamic": "auto"
+       }
+      }
+     ],
+     "children": []
+    }
+   ]
+  }
+ ]
+}

@@ -2643,7 +2643,7 @@ export function createGiGather({
    * for the Duff frame, the Hammersley azimuth and the `hem` subtraction to
    * drift, and a receipt that measures a drifted copy is worse than no receipt.
    */
-  const shadeTerms = (p, n, levelF, voxF, seedU = null) => {
+  const shadeTerms = (p, n, levelF, voxF, seedU = null, exactBvh = true) => {
     const pi = palIndexAt(levelF, voxF).toVar();
     const pal = palU.element(pi).toVar();
     // ⭐⭐ §19 STAGE 4.0b — THE EMITTER GATE'S DECISION, ALREADY MADE ON THE CPU.
@@ -3058,10 +3058,18 @@ export function createGiGather({
           // §19 6.21 — plus the dynamic mirror: a mover's triangles are excluded
           // from the tree the frame it moves, so the tree alone would let the lamp
           // through a block that is merely being dragged.
-          const vis = float(1).sub(BVH
+          // The RC secondary-hit kernel also binds its hit list, cache,
+          // counters and two cascade lookups. Adding the five-buffer exact BVH
+          // there makes a ten-storage-buffer graph, which cannot exist on the
+          // portable WebGPU limit of eight. Its direct face cache therefore
+          // uses the same conservative window shadow that served before the
+          // exact slot arrived; pixel-direct and the ordinary gather passes
+          // retain triangle-exact shadows.
+          const exact = exactBvh ? BVH : null;
+          const vis = float(1).sub(exact
             ? (traceDyn
-              ? BVH.anyHitFrom(pRay, wd, d.sub(excl).max(1e-3), n).max(traceDyn.traceWindow(pRay, wd, reach, n).hit)
-              : BVH.anyHitFrom(pRay, wd, d.sub(excl).max(1e-3), n))
+              ? exact.anyHitFrom(pRay, wd, d.sub(excl).max(1e-3), n).max(traceDyn.traceWindow(pRay, wd, reach, n).hit)
+              : exact.anyHitFrom(pRay, wd, d.sub(excl).max(1e-3), n))
             : traceWindow(pRay, wd, reach, n).hit).toVar();
           Enee.addAssign(rgb.mul(omega).mul(cosX).mul(vis));
         });
@@ -3203,7 +3211,7 @@ export function createGiGather({
     };
   };
 
-  const shadeHit = (p, n, levelF, voxF, seedU = null) => {
+  const shadeHitImpl = (p, n, levelF, voxF, seedU = null, exactBvh = true) => {
     // ⭐⭐ §19 5.3 — `seedU` IS DROPPED ON THE CASCADE BUILD, and that single
     // `null` is the whole "direct only" change: the four cosine sky rays are
     // the one block in `shadeTerms` it gates, so passing `null` removes them
@@ -3211,7 +3219,7 @@ export function createGiGather({
     // provably zero (nothing else writes them with `CACHE_FROM_PROBES` off),
     // so the sum below is `Esun + Enee` — the sun shadow ray and the emitter
     // slots under the power gate — and every other line here is untouched.
-    const t = shadeTerms(p, n, levelF, voxF, rc5 ? null : seedU);
+    const t = shadeTerms(p, n, levelF, voxF, rc5 ? null : seedU, exactBvh);
     const E = t.Esun.add(t.Emiss).add(t.Ebnc).add(t.Enee).toVar();
     // §19 4.14 (§AL) arm 2 — the bounce-albedo ceiling. `min`, not a scale: it
     // touches ONLY the surfaces authored at or above the ceiling and is the
@@ -3227,6 +3235,10 @@ export function createGiGather({
       ? alb.mul(1 / Math.PI).mul(E)
       : alb.mul(1 / Math.PI).mul(E).add(t.palEm);
   };
+  const shadeHit = (p, n, levelF, voxF, seedU = null) =>
+    shadeHitImpl(p, n, levelF, voxF, seedU, true);
+  const shadeHitPortable = (p, n, levelF, voxF, seedU = null) =>
+    shadeHitImpl(p, n, levelF, voxF, seedU, false);
 
   // ══════════════════════════ §19 STAGE 3.13 — WHAT A RAY BRINGS BACK ════════
   //
@@ -5036,6 +5048,10 @@ export function createGiGather({
     const g = loadPos(px.toInt(), py.toInt()).toVar();
     const E = vec3(0).toVar();
     const G = vec3(0).toVar();
+    // Full-resolution validity survives independently into image history.
+    // Geometry alone must never certify an UNKNOWN radiance term as black.
+    const outputKnownE = float(0).toVar();
+    const outputKnownG = float(0).toVar();
     If(g.w.greaterThan(0.5), () => {
       const P = g.xyz.toVar();
       const Nn = normalize(loadNrm(px.toInt(), py.toInt()).xyz).toVar();
@@ -5046,10 +5062,17 @@ export function createGiGather({
       const by = lowY.floor().toVar();
       const fx = lowX.sub(bx).toVar();
       const fy = lowY.sub(by).toVar();
-      const wsum = float(0).toVar();
-      const bestW = float(-1).toVar();
+      const wsumE = float(0).toVar();
+      const wsumG = float(0).toVar();
+      const bestWE = float(-1).toVar();
+      const bestWG = float(-1).toVar();
       const bestE = vec3(0).toVar();
       const bestG = vec3(0).toVar();
+      // Diffuse and glossy directions become known independently. Keeping one
+      // shared flag makes a valid diffuse sample disappear when the reflection
+      // lobe is unknown (or certifies that unknown lobe as black).
+      const currentKnownE = float(0).toVar();
+      const currentKnownG = float(0).toVar();
       // ⭐ THE ACCUMULATOR'S CLAMP BOX IS THE FOUR TAPS THIS LOOP ALREADY READS.
       //
       // §19 3.12 asked for "±50 % of the 3×3 neighbourhood". A 3×3 of the
@@ -5075,29 +5098,53 @@ export function createGiGather({
         // length, never a metric constant — and the normal's own sign, so
         // a ceiling can never pass for the floor 6 m below it that shares
         // its plane offset. Both come out of the sample's alpha.
-        const okTap = gi.w.greaterThan(-8).toVar();
+        const packed = gi.w.toVar();
+        const diffuseOnly = rc5 ? packed.greaterThan(2).and(packed.lessThan(6)).toVar() : null;
+        const glossyOnly = rc5 ? packed.greaterThan(6).and(packed.lessThan(10)).toVar() : null;
+        const bothKnown = rc5 ? packed.greaterThan(10).toVar() : null;
+        const legacyKnown = rc5 ? null : packed.greaterThan(-8).toVar();
+        const okE = rc5 ? diffuseOnly.or(bothKnown).toVar() : legacyKnown;
+        const okG = rc5 ? glossyOnly.or(bothKnown).toVar() : legacyKnown;
+        const sampleNy = rc5
+          ? select(bothKnown, packed.sub(12), select(glossyOnly, packed.sub(8), packed.sub(4))).toVar()
+          : packed;
         const wp = exp(ei.w.sub(myPlane).abs().div(v0).negate()).toVar();
-        const wn = float(1).sub(gi.w.sub(Nn.y).abs().mul(0.5)).max(0).toVar();
-        const w = bl.mul(wp).mul(wn.mul(wn)).mul(select(okTap, float(1), float(0))).toVar();
-        If(okTap.and(bl.greaterThan(bestW)), () => {
-          bestW.assign(bl);
+        const wn = float(1).sub(sampleNy.sub(Nn.y).abs().mul(0.5)).max(0).toVar();
+        const baseW = bl.mul(wp).mul(wn.mul(wn)).toVar();
+        const wE = baseW.mul(select(okE, float(1), float(0))).toVar();
+        const wG = baseW.mul(select(okG, float(1), float(0))).toVar();
+        If(okE.and(bl.greaterThan(bestWE)), () => {
+          bestWE.assign(bl);
           bestE.assign(ei.xyz);
+        });
+        If(okG.and(bl.greaterThan(bestWG)), () => {
+          bestWG.assign(bl);
           bestG.assign(gi.xyz);
         });
-        If(okTap, () => {
+        If(okE, () => {
           loE.assign(min(loE, ei.xyz));
           hiE.assign(max(hiE, ei.xyz));
+        });
+        If(okG, () => {
           loG.assign(min(loG, gi.xyz));
           hiG.assign(max(hiG, gi.xyz));
         });
-        E.addAssign(ei.xyz.mul(w));
-        G.addAssign(gi.xyz.mul(w));
-        wsum.addAssign(w);
+        E.addAssign(ei.xyz.mul(wE));
+        G.addAssign(gi.xyz.mul(wG));
+        wsumE.addAssign(wE);
+        wsumG.addAssign(wG);
       }
-      If(wsum.greaterThan(1e-4), () => {
-        E.assign(E.div(wsum));
-        G.assign(G.div(wsum));
-      }).Else(() => {
+      If(wsumE.greaterThan(1e-4), () => {
+        currentKnownE.assign(1);
+        outputKnownE.assign(1);
+        E.assign(E.div(wsumE));
+      });
+      If(wsumG.greaterThan(1e-4), () => {
+        currentKnownG.assign(1);
+        outputKnownG.assign(1);
+        G.assign(G.div(wsumG));
+      });
+      If(wsumE.lessThanEqual(1e-4).or(wsumG.lessThanEqual(1e-4)), () => {
         // ⭐ §19 6.30 — THE NEAREST SAME-SURFACE TEXEL, NOT THE NEAREST TEXEL.
         //
         // When all four bilinear taps fail the plane/normal test, this pixel
@@ -5110,7 +5157,8 @@ export function createGiGather({
         // test before giving up: any surface two full-res pixels wide has one
         // there, by construction. The nearest-tap fallback remains only for a
         // surface with no same-plane texel at all.
-        const w2 = float(0).toVar();
+        const w2E = float(0).toVar();
+        const w2G = float(0).toVar();
         const E2 = vec3(0).toVar();
         const G2 = vec3(0).toVar();
         for (let dy = -1; dy <= 2; dy++) {
@@ -5120,27 +5168,44 @@ export function createGiGather({
             const ly = by.add(dy).clamp(0, float(halfH - 1)).toInt().toVar();
             const ei = irrHalfNode.load(ivec2(lx, ly)).toVar();
             const gi = glossyHalfNode.load(ivec2(lx, ly)).toVar();
-            const okTap = gi.w.greaterThan(-8).toVar();
+            const packed = gi.w.toVar();
+            const diffuseOnly = rc5 ? packed.greaterThan(2).and(packed.lessThan(6)).toVar() : null;
+            const glossyOnly = rc5 ? packed.greaterThan(6).and(packed.lessThan(10)).toVar() : null;
+            const bothKnown = rc5 ? packed.greaterThan(10).toVar() : null;
+            const legacyKnown = rc5 ? null : packed.greaterThan(-8).toVar();
+            const okE = rc5 ? diffuseOnly.or(bothKnown).toVar() : legacyKnown;
+            const okG = rc5 ? glossyOnly.or(bothKnown).toVar() : legacyKnown;
+            const sampleNy = rc5
+              ? select(bothKnown, packed.sub(12), select(glossyOnly, packed.sub(8), packed.sub(4))).toVar()
+              : packed;
             const wp = exp(ei.w.sub(myPlane).abs().div(v0).negate()).toVar();
-            const wn = float(1).sub(gi.w.sub(Nn.y).abs().mul(0.5)).max(0).toVar();
+            const wn = float(1).sub(sampleNy.sub(Nn.y).abs().mul(0.5)).max(0).toVar();
             const ddx = lowX.sub(bx.add(dx)).toVar();
             const ddy = lowY.sub(by.add(dy)).toVar();
             const wd = float(1).div(ddx.mul(ddx).add(ddy.mul(ddy)).add(0.25)).toVar();
-            const w = wd.mul(wp).mul(wn.mul(wn)).mul(select(okTap, float(1), float(0))).toVar();
-            E2.addAssign(ei.xyz.mul(w));
-            G2.addAssign(gi.xyz.mul(w));
-            w2.addAssign(w);
+            const baseW = wd.mul(wp).mul(wn.mul(wn)).toVar();
+            const wE = baseW.mul(select(okE, float(1), float(0))).toVar();
+            const wG = baseW.mul(select(okG, float(1), float(0))).toVar();
+            E2.addAssign(ei.xyz.mul(wE));
+            G2.addAssign(gi.xyz.mul(wG));
+            w2E.addAssign(wE);
+            w2G.addAssign(wG);
           }
         }
-        If(w2.greaterThan(1e-4), () => {
-          E.assign(E2.div(w2));
-          G.assign(G2.div(w2));
+        If(wsumE.lessThanEqual(1e-4).and(w2E.greaterThan(1e-4)), () => {
+          currentKnownE.assign(1);
+          outputKnownE.assign(1);
+          E.assign(E2.div(w2E));
           loE.assign(min(loE, E)); hiE.assign(max(hiE, E));
-          loG.assign(min(loG, G)); hiG.assign(max(hiG, G));
-        }).Else(() => {
-          E.assign(bestE);
-          G.assign(bestG);
         });
+        If(wsumG.lessThanEqual(1e-4).and(w2G.greaterThan(1e-4)), () => {
+          currentKnownG.assign(1);
+          outputKnownG.assign(1);
+          G.assign(G2.div(w2G));
+          loG.assign(min(loG, G)); hiG.assign(max(hiG, G));
+        });
+        If(currentKnownE.lessThan(0.5), () => { E.assign(bestE); });
+        If(currentKnownG.lessThan(0.5), () => { G.assign(bestG); });
       });
 
       // ══ §19 STAGE 3.12 — LIGHT ARRIVES OVER FOUR FRAMES ══════════════════
@@ -5211,7 +5276,8 @@ export function createGiGather({
             const ay = fy.sub(y0).toVar();
             const hE = vec3(0).toVar();
             const hG = vec3(0).toVar();
-            const hW = float(0).toVar();
+            const hWE = float(0).toVar();
+            const hWG = float(0).toVar();
             for (let t = 0; t < 4; t++) {
               const dx = t & 1;
               const dy = (t >> 1) & 1;
@@ -5220,13 +5286,22 @@ export function createGiGather({
               const hy = y0.add(dy).clamp(0, float(height - 1)).toInt().toVar();
               const hi = irrHistNode.load(ivec2(hx, hy)).toVar();
               const hg = glossyHistNode.load(ivec2(hx, hy)).toVar();
-              const okDepth = hi.w.greaterThan(0).and(hi.w.sub(c.w).abs().lessThan(tol)).toVar();
-              const okNrm = dot(unpackNormal5(hg.w.max(0)), Nn).greaterThan(0.9).toVar();
-              const w = bl.mul(select(okDepth.and(okNrm).and(hg.w.greaterThanEqual(0)),
-                float(1), float(0))).toVar();
-              hE.addAssign(hi.xyz.mul(w));
-              hG.addAssign(hg.xyz.mul(w));
-              hW.addAssign(w);
+              // Sign carries term validity; magnitude retains the shared
+              // geometry key. This represents diffuse-known/glossy-unknown
+              // without duplicating the depth/normal history textures.
+              const histDepth = hi.w.abs().toVar();
+              const histNormal = hg.w.abs().sub(1).max(0).toVar();
+              const okDepth = histDepth.greaterThan(0)
+                .and(histDepth.sub(c.w).abs().lessThan(tol)).toVar();
+              const okNrm = hg.w.abs().greaterThan(0)
+                .and(dot(unpackNormal5(histNormal), Nn).greaterThan(0.9)).toVar();
+              const geomW = bl.mul(select(okDepth.and(okNrm), float(1), float(0))).toVar();
+              const wE = geomW.mul(select(hi.w.greaterThan(0), float(1), float(0))).toVar();
+              const wG = geomW.mul(select(hg.w.greaterThan(0), float(1), float(0))).toVar();
+              hE.addAssign(hi.xyz.mul(wE));
+              hG.addAssign(hg.xyz.mul(wG));
+              hWE.addAssign(wE);
+              hWG.addAssign(wG);
             }
             // ⚠ 0.999, NOT `> 0`. A partial set of surviving taps is a pixel
             // ON a disocclusion boundary — half its history belongs to the
@@ -5234,21 +5309,47 @@ export function createGiGather({
             // tap is how a silhouette acquires a one-frame trail. Either the
             // whole bilinear footprint is the same surface or this pixel takes
             // the current frame.
-            If(hW.greaterThan(0.999), () => {
-              const spanE = hiE.sub(loE).mul(u.accumClamp).toVar();
-              const spanG = hiG.sub(loG).mul(u.accumClamp).toVar();
-              const cE = hE.clamp(loE.sub(spanE), hiE.add(spanE)).toVar();
-              const cG = hG.clamp(loG.sub(spanG), hiG.add(spanG)).toVar();
-              const al = u.accumAlpha.clamp(0, 1).toVar();
-              E.assign(mix(cE, E, al));
-              G.assign(mix(cG, G, al));
+            If(currentKnownE.lessThan(0.5), () => {
+              // UNKNOWN has no current answer to prefer. Any surviving history
+              // tap has already passed this point's depth and normal tests, so
+              // renormalize the partial footprint instead of demanding the
+              // strict all-four condition used for ordinary temporal blending.
+              If(hWE.greaterThan(1e-4), () => {
+                // Retain 97% so a brief allocation miss is invisible while a
+                // genuinely unavailable field still decays instead of leaving
+                // a permanent temporal quilt (~2 s at 60 fps).
+                E.assign(mix(E, hE.div(hWE), 0.97));
+                outputKnownE.assign(1);
+              });
+            }).Else(() => {
+              If(hWE.greaterThan(0.999), () => {
+                const spanE = hiE.sub(loE).mul(u.accumClamp).toVar();
+                const cE = hE.clamp(loE.sub(spanE), hiE.add(spanE)).toVar();
+                const al = u.accumAlpha.clamp(0, 1).toVar();
+                E.assign(mix(cE, E, al));
+              });
+            });
+            If(currentKnownG.lessThan(0.5), () => {
+              If(hWG.greaterThan(1e-4), () => {
+                G.assign(mix(G, hG.div(hWG), 0.97));
+                outputKnownG.assign(1);
+              });
+            }).Else(() => {
+              If(hWG.greaterThan(0.999), () => {
+                const spanG = hiG.sub(loG).mul(u.accumClamp).toVar();
+                const cG = hG.clamp(loG.sub(spanG), hiG.add(spanG)).toVar();
+                const al = u.accumAlpha.clamp(0, 1).toVar();
+                G.assign(mix(cG, G, al));
+              });
             });
           });
         });
       });
     });
-    textureStore(irradiance, coord, vec4(E, g.w));
-    textureStore(glossy, coord, vec4(G, g.w));
+    textureStore(irradiance, coord, vec4(E,
+      select(g.w.greaterThan(0.5).and(outputKnownE.greaterThan(0.5)), g.w, float(-1))));
+    textureStore(glossy, coord, vec4(G,
+      select(g.w.greaterThan(0.5).and(outputKnownG.greaterThan(0.5)), g.w, float(-1))));
   })().compute(dispatch2d(width, height), WG);
 
   // ══════════════════════════════ SHADER: imageHistory (§19 Stage 3.12)
@@ -5273,16 +5374,22 @@ export function createGiGather({
     If(px.greaterThanEqual(u.widthU).or(py.greaterThanEqual(u.heightU)), () => { Return(); });
     const coord = ivec2(px.toInt(), py.toInt());
     const g = loadPos(px.toInt(), py.toInt()).toVar();
+    const irr = irrNode.load(coord).toVar();
+    const glo = glossyNode.load(coord).toVar();
     // −1 in BOTH keys is the sky/no-geometry sentinel, and it has to be written
     // rather than skipped: a texel left untouched holds whatever the last
     // frame's geometry put there, which is the same class of bug as a probe
     // returning early from a back-facing texel (see `probeTracePass`).
+    const depthMag = u.viewProj.mul(vec4(g.xyz, 1)).w.abs().max(1e-6).toVar();
     const depth = select(g.w.greaterThan(0.5),
-      u.viewProj.mul(vec4(g.xyz, 1)).w, float(-1)).toVar();
+      select(irr.w.greaterThan(0), depthMag, depthMag.negate()), float(0)).toVar();
+    // +1 reserves zero for sky; sign is glossy validity, magnitude is the
+    // packed normal shared by either term's geometry validation.
+    const keyMag = packNormal5(normalize(loadNrm(px.toInt(), py.toInt()).xyz)).add(1).toVar();
     const key = select(g.w.greaterThan(0.5),
-      packNormal5(normalize(loadNrm(px.toInt(), py.toInt()).xyz)), float(-1)).toVar();
-    textureStore(irradianceHist, coord, vec4(irrNode.load(coord).xyz, depth));
-    textureStore(glossyHist, coord, vec4(glossyNode.load(coord).xyz, key));
+      select(glo.w.greaterThan(0), keyMag, keyMag.negate()), float(0)).toVar();
+    textureStore(irradianceHist, coord, vec4(irr.xyz, depth));
+    textureStore(glossyHist, coord, vec4(glo.xyz, key));
   })().compute(dispatch2d(width, height), WG);
 
   // ══════════════════════════════════════════════ SHADER: composite
@@ -6024,7 +6131,7 @@ export function createGiGather({
      * estimator instead of a transcription of it.
      */
     internals: {
-      shadeTerms, shadeHit, dominantFace, faceSamplePoint, cellOfWorld, palAt, hitPalette,
+      shadeTerms, shadeHit, shadeHitPortable, dominantFace, faceSamplePoint, cellOfWorld, palAt, hitPalette,
       /** §19 5.3c — the projected-area emission of one ray, or `null`. */
       hitEmissionRay,
     },

@@ -1490,14 +1490,50 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint, penumbraOut =
   let rayDir = dirToEmitter;
   let rayDist = dist;
   if (jitterOn) {
-    const up = select(dirToEmitter.y.abs().greaterThan(0.9), vec3(1, 0, 0), vec3(0, 1, 0));
-    const t1 = cross(dirToEmitter, up).normalize().toVar();
-    const t2 = cross(dirToEmitter, t1).toVar();
-    const jr = targetJitter.x.sqrt().mul(0.8).mul(float(slot.radius));
-    const ja = targetJitter.y.mul(Math.PI * 2);
-    const toTarget = toEmitter
-      .add(t1.mul(ja.cos()).add(t2.mul(ja.sin())).mul(jr))
-      .toVar();
+    const target = center.toVar();
+    const assignDiscTarget = () => {
+      const up = select(dirToEmitter.y.abs().greaterThan(0.9), vec3(1, 0, 0), vec3(0, 1, 0));
+      const t1 = cross(dirToEmitter, up).normalize().toVar();
+      const t2 = cross(dirToEmitter, t1).toVar();
+      const jr = targetJitter.x.sqrt().mul(0.8).mul(float(slot.radius));
+      const ja = targetJitter.y.mul(Math.PI * 2);
+      target.assign(center.add(t1.mul(ja.cos()).add(t2.mul(ja.sin())).mul(jr)));
+    };
+    if (slot.kind) {
+      const kind = float(slot.kind);
+      const half = vec3(slot.half);
+      const minHalf = half.x.min(half.y).min(half.z);
+      const maxHalf = half.x.max(half.y).max(half.z);
+      const isThinBox = kind.greaterThan(0.5).and(kind.lessThan(1.5))
+        .and(minHalf.lessThanEqual(maxHalf.mul(0.2)));
+      If(isThinBox, () => {
+        // Sample the real receiver-facing rectangle. The former bounding-disc
+        // target put most rays outside an elongated sign and jumped with view.
+        const n = vec3(slot.bx).toVar();
+        const u = vec3(slot.by).toVar();
+        const v = vec3(slot.bz).toVar();
+        const hn = half.x.toVar();
+        const hu = half.y.toVar();
+        const hv = half.z.toVar();
+        If(half.y.lessThan(half.x).and(half.y.lessThanEqual(half.z)), () => {
+          n.assign(vec3(slot.by)); u.assign(vec3(slot.bz)); v.assign(vec3(slot.bx));
+          hn.assign(half.y); hu.assign(half.z); hv.assign(half.x);
+        }).ElseIf(half.z.lessThan(half.x).and(half.z.lessThan(half.y)), () => {
+          n.assign(vec3(slot.bz)); u.assign(vec3(slot.bx)); v.assign(vec3(slot.by));
+          hn.assign(half.z); hu.assign(half.x); hv.assign(half.y);
+        });
+        const face = select(P.sub(center).dot(n).greaterThanEqual(0), float(1), float(-1));
+        const su = targetJitter.x.mul(2).sub(1).mul(0.95);
+        const sv = targetJitter.y.mul(2).sub(1).mul(0.95);
+        target.assign(center
+          .add(n.mul(hn).mul(face))
+          .add(u.mul(hu).mul(su))
+          .add(v.mul(hv).mul(sv)));
+      }).Else(assignDiscTarget);
+    } else {
+      assignDiscTarget();
+    }
+    const toTarget = target.sub(P).toVar();
     rayDist = toTarget.length().max(1e-3).toVar();
     rayDir = toTarget.div(rayDist).toVar();
   }

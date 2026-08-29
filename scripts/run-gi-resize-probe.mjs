@@ -43,6 +43,11 @@ const PROJECT = (process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME").rep
 const SCENE = (process.env.SCENE ?? `${PROJECT}/scenes/Level.scene`).replaceAll("\\", "/");
 const SWEEPS = Number(process.env.SWEEPS ?? 2);
 const SETTLE = Number(process.env.SETTLE ?? 6);
+const FIELD_WAIT = Number(process.env.FIELD_WAIT ?? 240);
+// Opt-in arm for the exact failure reported by the user: reflection bindings
+// share the material group that a GI2 resize rebuilds. The arm forces the
+// consumer gate, toggles reflections off/on, then runs the normal size hops.
+const REFLECTION_RESIZE = process.env.REFLECTION_RESIZE === "1";
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const browser = await puppeteer.launch({
@@ -159,7 +164,7 @@ await page.evaluateOnNewDocument((PROJECT, disposeNow) => {
     // `bindGroup_<name>` — three's own name for the group — and the entry index
     // says WHICH binding is dead, so this NAMES the culprit instead of proving
     // one exists.
-    bindGroupThrows: 0, bindGroupMsgs: [],
+    bindGroupThrows: 0, bindGroupMsgs: [], zeroBufferBindings: [],
   };
   globalThis.__GPU_COUNTERS__ = c;
   const patch = (proto, name, fn) => {
@@ -180,12 +185,38 @@ await page.evaluateOnNewDocument((PROJECT, disposeNow) => {
     if (typeof GPUDevice.prototype.createBindGroup === "function") {
       const origCBG = GPUDevice.prototype.createBindGroup;
       GPUDevice.prototype.createBindGroup = function (...args) {
+        const d = args[0] ?? {};
+        const zero = [];
+        for (const e of d.entries ?? []) {
+          const r = e?.resource;
+          if (r && typeof r === "object" && "buffer" in r && r.buffer?.size === 0) zero.push(e.binding);
+        }
+        if (zero.length && c.zeroBufferBindings.length < 24) {
+          const activeNode = globalThis.__GI_ACTIVE_COMPUTE_NODE__ ?? null;
+          const renderer = globalThis.__GI_ACTIVE_RENDERER__ ?? null;
+          let slots = [];
+          try {
+            const groups = renderer?._nodes?.getForCompute?.(activeNode)?.bindings ?? [];
+            slots = groups.flatMap((group) => (group?.bindings ?? []).map((binding, index) => ({
+              index,
+              name: binding?.name ?? null,
+              storage: binding?.isStorageBuffer === true,
+              arrayLength: binding?.attribute?.array?.length ?? null,
+              arrayBytes: binding?.attribute?.array?.byteLength ?? null,
+            }))).filter((slot) => zero.includes(slot.index));
+          } catch { /* diagnostics must not alter the failure */ }
+          c.zeroBufferBindings.push({
+            group: d.label ?? "(no label)",
+            bindings: zero,
+            compute: globalThis.__GI_ACTIVE_COMPUTE__ ?? null,
+            slots,
+          });
+        }
         try {
           return origCBG.apply(this, args);
         } catch (err) {
           c.bindGroupThrows++;
           if (c.bindGroupMsgs.length < 24) {
-            const d = args[0] ?? {};
             const bad = [];
             for (const e of d.entries ?? []) {
               const r = e?.resource;
@@ -253,7 +284,7 @@ const call = async (op, args = {}) => {
 }
 {
   const t0 = Date.now();
-  while (!readySeen && Date.now() - t0 < 240000) await wait(2000);
+  while (!readySeen && Date.now() - t0 < FIELD_WAIT * 1000) await wait(2000);
   console.log(`  field ready seen: ${readySeen}`);
 }
 await wait(8000);
@@ -272,9 +303,25 @@ await wait(8000);
 // second overrides whatever editorFramePacing decided about an unfocused,
 // headless window.
 const ensureKeepAlive = () => page.evaluate(async () => {
-  if (globalThis.__giResizeProbeKeepAlive) return;
   const { ensureEngine } = await import("/src/editor/engineInstance.js");
   const engine = await ensureEngine();
+  if (!engine.renderer.__giResizeProbeComputeWrapped) {
+    const originalCompute = engine.renderer.compute.bind(engine.renderer);
+    engine.renderer.compute = (nodes) => {
+      const list = Array.isArray(nodes) ? nodes : [nodes];
+      globalThis.__GI_ACTIVE_COMPUTE__ = list.map((node) =>
+        node?.__giPassName ?? node?.name ?? `node#${node?.id ?? "?"}`).join(",");
+      globalThis.__GI_ACTIVE_COMPUTE_NODE__ = list.length === 1 ? list[0] : null;
+      globalThis.__GI_ACTIVE_RENDERER__ = engine.renderer;
+      try { return originalCompute(nodes); }
+      finally {
+        globalThis.__GI_ACTIVE_COMPUTE__ = null;
+        globalThis.__GI_ACTIVE_COMPUTE_NODE__ = null;
+      }
+    };
+    engine.renderer.__giResizeProbeComputeWrapped = true;
+  }
+  if (globalThis.__giResizeProbeKeepAlive) return;
   globalThis.__editorKeepRendering = true;
   globalThis.__giResizeProbeKeepAlive = setInterval(() => {
     engine.setFrameRateLimit?.(0);
@@ -375,6 +422,7 @@ const censusOnce = () => page.evaluate(async () => {
     // buffer whose backend record is gone. Never reaches `uncapturederror`.
     bindGroupThrows: c.bindGroupThrows ?? 0,
     bindGroupMsgs: c.bindGroupMsgs ?? [],
+    zeroBufferBindings: c.zeroBufferBindings ?? [],
     // "Did the hop leave the material-facing nodes pointing at the LIVE
     // gather?" Every material samples GI through these two persistent nodes; a
     // resize that repoints them at a texture the gather no longer owns — or
@@ -402,6 +450,8 @@ const censusOnce = () => page.evaluate(async () => {
         // ⛔ [[probe-blind-statistics]]: "0 uncaptured errors" next to "0 rebinds"
         // would mean the repair never ran, not that it worked.
         rebinds: system?._giRebindings ?? 0,
+        bvhTarget: !!system?._giBvhTarget,
+        rebindSkipped: system?._giRebindSkipped ?? 0,
       };
     })(),
     log,
@@ -439,6 +489,7 @@ const record = async (label) => {
     ` irr ${s.giTex.irrLive ? "live" : "STALE"} ${s.giTex.irrSize.padEnd(9)}` +
     ` glossy ${s.giTex.gloLive ? "live" : "STALE"} ${s.giTex.gloSize.padEnd(9)}` +
     ` transport ${String(s.giTransport).padEnd(7)} rebinds ${String(s.giTex.rebinds).padStart(4)} retiredPending ${s.giTex.pendingRetired}` +
+    ` bvh ${s.giTex.bvhTarget ? "armed" : "off"} skipped ${s.giTex.rebindSkipped}` +
     ` | uncaptured ${s.uncaptured} (destroyedTex ${s.destroyedTexture}, destroyedBuf ${s.destroyedBuffer})` +
     ` bindGroupThrows ${s.bindGroupThrows}`,
   );
@@ -469,6 +520,54 @@ const setBudget = (px) => page.evaluate((v) => { globalThis.__giResolveMaxPixels
 }
 
 await wait(4000);
+
+if (REFLECTION_RESIZE) {
+  console.log("\n--- reflection lifecycle arm: OFF -> ON -> durable resize ---");
+  const toggle = async (enabled) => page.evaluate(async (want) => {
+    const { ensureEngine } = await import("/src/editor/engineInstance.js");
+    const engine = await ensureEngine();
+    const system = engine?.modules?.get?.("gi")?.system;
+    const component = system?.component ?? globalThis.__giComponent?.();
+    if (!component) return { ok: false, reason: "no GI component" };
+    globalThis.__giReflectConsumerGate = false;
+    let changed = false;
+    if (want && !["high", "ultra"].includes(component.props?.quality)) {
+      component.setProp("quality", "high");
+      changed = true;
+    }
+    const before = system?.rebuilds ?? 0;
+    if ((component.props?.reflections !== false) !== want) {
+      component.setProp("reflections", want);
+      changed = true;
+    }
+    return { ok: true, before, changed };
+  }, enabled);
+  const waitToggle = async (enabled, before) => {
+    await page.waitForFunction(async (want, oldRuns) => {
+      const { ensureEngine } = await import("/src/editor/engineInstance.js");
+      const engine = await ensureEngine();
+      const system = engine?.modules?.get?.("gi")?.system;
+      if (!system || (system.rebuilds ?? 0) <= oldRuns || system._compileWaveActive) return false;
+      return !want || !!system._giBvhTarget;
+    }, { timeout: 240000, polling: 1000 }, enabled, before);
+    await wait(1000);
+  };
+  const off = await toggle(false);
+  if (!off.ok) {
+    console.log(`GI-RESIZE REFLECTION ARM FAILED: ${off.reason}`);
+    await browser.close();
+    process.exit(2);
+  }
+  if (off.changed) await waitToggle(false, off.before);
+  const on = await toggle(true);
+  if (on.changed) await waitToggle(true, on.before);
+  const armed = await record("reflect-on");
+  if (!armed.giTex.bvhTarget) {
+    console.log("GI-RESIZE REFLECTION ARM FAILED: exact-reflection target was not created");
+    await browser.close();
+    process.exit(2);
+  }
+}
 
 console.log("\n--- baseline ---");
 const base = await record("baseline");
@@ -549,6 +648,12 @@ for (const msg of afterFast.uncapturedMsgs.slice(0, 6)) console.log(`    · ${ms
 console.log(`  createBindGroup throws across ALL hops: ${afterFast.bindGroupThrows}` +
   " (a bind group built against a buffer whose backend record was already deleted)");
 for (const msg of afterFast.bindGroupMsgs.slice(0, 8)) console.log(`    · ${msg}`);
+for (const hit of afterFast.zeroBufferBindings.slice(0, 8)) {
+  console.log(`    zero buffer: ${hit.group} binding(s) [${hit.bindings.join(",")}] while ${hit.compute ?? "unknown pass"}`);
+  for (const slot of hit.slots ?? []) {
+    console.log(`      slot ${slot.index}: ${slot.name ?? "(unnamed)"} storage=${slot.storage} array=${slot.arrayLength}/${slot.arrayBytes}B`);
+  }
+}
 console.log(`  GI textures after the last hop: irradiance ${afterFast.giTex.irrLive ? "live" : "STALE"}` +
   ` ${afterFast.giTex.irrSize}, glossy ${afterFast.giTex.gloLive ? "live" : "STALE"} ${afterFast.giTex.gloSize},` +
   ` gather ${afterFast.giTex.gatherSize}, transport ${afterFast.giTransport}`);

@@ -203,7 +203,15 @@ function packRequest(request, copyInputs) {
     if (!geo?.positions || !wanted.has(key)) return; // never ship geometry nothing places
     const positions = copyInputs ? geo.positions.slice() : geo.positions;
     const index = geo.index ? (copyInputs ? geo.index.slice() : geo.index) : null;
-    geoms.push({ key, positions, index });
+    // Groups are tiny structured-clone data (index/vertex ranges), so copying
+    // them is cheaper than expanding a material byte for every triangle. The
+    // worker resolves these ranges against each placement's palette-slot list.
+    const groups = (geo.groups ?? []).map((g) => ({
+      start: Math.max(0, Math.floor(Number(g?.start) || 0)),
+      count: Math.max(0, Math.floor(Number(g?.count) || 0)),
+      materialIndex: Math.max(0, Math.floor(Number(g?.materialIndex) || 0)),
+    })).filter((g) => g.count > 0);
+    geoms.push({ key, positions, index, groups });
     transfer.push(positions.buffer);
     if (index) transfer.push(index.buffer);
   };
@@ -227,6 +235,12 @@ function packRequest(request, copyInputs) {
       geometryKey: p.geometryKey,
       matrix: Float32Array.from(e), // 64 B; cloned, never transferred (a transfer list of 2000 tiny buffers costs more than the clone)
       pal: (p.pal ?? PAL_NONE) & 255,
+      // One byte-sized class per material slot. A missing/out-of-range slot
+      // deliberately falls back to `pal`, preserving every old caller.
+      pals: p.pals == null ? null : Array.from(p.pals, (v) => (v == null ? null : v & 255)),
+      // Mixed transparent/volume meshes still contribute their opaque groups.
+      // The worker omits inactive ranges before applying the triangle budget.
+      active: p.active == null ? null : Array.from(p.active, Boolean),
       slot: p.slot,
     });
   }

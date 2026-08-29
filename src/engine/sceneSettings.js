@@ -431,17 +431,9 @@ export async function resolveRendererLimits() {
     if (bufferSize > 268435456) {
       requiredLimits.maxBufferSize = Math.min(1073741824, bufferSize);
     }
-    // STORAGE-BUFFER COUNT: baseline is 8 per compute stage, and the GI
-    // voxelizer reached 9 on 2026-08-16 when the per-slot local→world matrices
-    // moved from the object-group UBO (where 768 slots of mat4s overflowed the
-    // 64KB uniform binding — see occupancyField's localToWorld note) to a
-    // storage buffer. Same adapter-clamped ask as above; this NVIDIA adapter
-    // advertises 16. A baseline-8 device keeps today's behaviour, which also
-    // means the slot raise does not reach it — GISystem's slot ceiling is
-    // conservative either way, so the failure there is fewer seated
-    // placements, not an invalid pipeline.
-    const storageBufs = adapter?.limits?.maxStorageBuffersPerShaderStage ?? 0;
-    if (storageBufs > 8) requiredLimits.maxStorageBuffersPerShaderStage = Math.min(16, storageBufs);
+    // STORAGE-BUFFER COUNT deliberately stays at WebGPU's portable default 8.
+    // A composed GI graph above it is a graph regression; requesting a
+    // desktop-only limit here only hides that failure from development.
     // ── THE HARNESS CAP (`globalThis.__engineLimitsCap`) ────────────────────
     // A per-key CEILING on the ask, for harnesses that must prove the engine
     // still works inside the PORTABLE envelope on hardware that advertises

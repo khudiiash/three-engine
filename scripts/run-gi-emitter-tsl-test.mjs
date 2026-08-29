@@ -86,6 +86,19 @@ for (const r of result) {
       `TSL ${r.gpu.toExponential(3)} vs scalar ${r.cpu.toExponential(3)} (${(rel * 100).toFixed(1)}%)`,
     );
   }
+  const minH = Math.min(...r.h);
+  const maxH = Math.max(...r.h);
+  if (minH <= maxH * 0.2) {
+    const rcScale = Math.max(Math.abs(r.cpu), Math.abs(r.rcGpu), 1e-3);
+    const rcRel = Math.abs(r.rcGpu - r.cpu) / rcScale;
+    if (rcRel > TOL) {
+      failures++;
+      console.error(
+        `  FAIL rcDirect thin box P(${r.P}) h(${r.h}) — ` +
+        `TSL ${r.rcGpu.toExponential(3)} vs exact ${r.cpu.toExponential(3)} (${(rcRel * 100).toFixed(1)}%)`,
+      );
+    }
+  }
 }
 console.log(
   `worst |TSL − scalar| = ${(worst * 100).toFixed(2)}% ` +

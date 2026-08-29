@@ -18,8 +18,14 @@ export function triHit(tris, ti, ro, rd, maxT) {
   return tt > 1e-4 && tt < maxT;
 }
 
-export function bvhAnyHit(bvh, soupTris, ro, rd, maxT) {
+export function bvhAnyHit(bvh, soupTris, ro, rd, maxT, options = null) {
   const { nodes, triIdx } = bvh;
+  const owners = options?.owners ?? null;
+  const excluded = options?.excluded ?? null;
+  const skipOwner = options?.skipOwner ?? 0xffffffff;
+  const ownerOf = (ti) => owners
+    ? (owners[ti >> 1] >>> ((ti & 1) * 16)) & 0xffff
+    : 0xffff;
   const safe = (d) => (Math.abs(d) > 1e-20 ? d : (d >= 0 ? 1e-20 : -1e-20));
   const inv = [1 / safe(rd[0]), 1 / safe(rd[1]), 1 / safe(rd[2])];
   const stack = new Uint32Array(64);
@@ -43,9 +49,12 @@ export function bvhAnyHit(bvh, soupTris, ro, rd, maxT) {
     } else {
       const first = nodes[nb + 3], n = count;
       for (let i = 0; i < n; i++) {
+        const ti = triIdx[first + i];
+        const owner = ownerOf(ti);
+        if (owner === skipOwner || (excluded && (excluded[owner >> 5] & (1 << (owner & 31))) !== 0)) continue;
         tested++;
         // ⭐ THE LINE THIS GATE EXISTS FOR — the 6.2 indirection.
-        if (triHit(soupTris, triIdx[first + i], ro, rd, maxT)) return { hit: 1, visited, tested };
+        if (triHit(soupTris, ti, ro, rd, maxT)) return { hit: 1, visited, tested };
       }
     }
   }

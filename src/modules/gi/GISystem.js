@@ -31,11 +31,12 @@ import { Fn, If, cameraPosition, cos, float, fract, mix, normalWorld, positionGe
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
 import { GI2_PATH, rc5EmitterEmissionEnabled, GI_DEBUG_VIEW_DOC, GI_QUALITY_LEVELS, GI_TERM_DEBUG_VIEWS, GI_TIER_GPU_BUDGET_BYTES, GI_VOLUME_DEBUG_VIEWS, gi2TierOf, giDebugView, giDebugViewsFor, resolveGiConfig, sceneSkyRadiance, wgslPointerParametersSupported } from "./giConfig.js";
 import { createGi2System, createGi2Volume, gi2Stage } from "./window/gi2System.js";
+import { gi2SoupTopologyKey, gi2SoupUpdateKind } from "./window/soupTopology.js";
 import { createGi2DebugView, gi2ViewCode } from "./window/windowDebugView.js";
 import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
 import { blitBvhAtlasTiles, computeCompressedTextureAverage, createGi2LightShadowPass, createGiAoFilterPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiShadowClearPass, createGiTargets, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
 import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
-import { noteTextureAverage, pendingTextureAverages, resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
+import { estimateMaterialAreaShares, noteTextureAverage, pendingTextureAverages, resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
 import { SRC_POOL_FLOORS, createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcPoolCeilings, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
@@ -47,6 +48,7 @@ import { SURFACE_POOL_CEILINGS, bitsBytesFor, createOccupancyField, describeOccu
 import { createGi2Mobility } from "./window/mobility.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
 import { buildLightTree, collectEmitters, estimateLightTreeWords } from "./lightTree.js";
+import { allocateEmitterSurfaceSeats, emitterSurfaceSeatGroups, emitterSurfaceSeatSource } from "./emitterSeats.js";
 import { createLightTreeStore } from "./lightTreeStore.js";
 import { fitPrimitive } from "./primitiveFit.js";
 import { fitEmitterShape } from "./emitterShapes.js";
@@ -54,6 +56,9 @@ import { fitSkinnedCapsules, rigRootOf, skinnedBoneMatrix, skinnedBoxShape, skin
 
 import { DEBUG_LAYER, EDITOR_LAYER, GI_DYNAMIC_LAYER, GI_MIRROR_LAYER, GI_SHARP_LAYER, SHADOW_PROXY_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { collectStateComputeNodes, collectStateStorageAttributes, cpuMirrorBytes, detachCpuMirror, harvestStorageAttributes, nullStorageBindingArrays, purgeNodeBuilderCache, releaseComputeNodes, releaseStorageAttributes } from "./releaseCompute.js";
+import { createGiBindingMutationJournal } from "./giBindingTransaction.js";
+import { giFingerprintContentAxes, giFingerprintContentFresh } from "./fingerprintSchedule.js";
+import { EMITTER_POSE_STRIDE, refreshEmitterPoseSignature } from "./emitterRefresh.js";
 import { textureLoadsInFlight } from "../../engine/textureAsset.js";
 import { GICascadeLight, GI_REFLECT_TIER, MAX_EMITTERS, giReflectTierInfoOf, giReflectTierOf, giRoughnessBucketOf, giRoughnessFloorStats, giRoughnessSourceOf, registerGILight } from "./giLight.js";
 import { MAX_REFLECTION_PROBES, createReflectionProbeAtlas } from "./reflectionProbes.js";
@@ -145,6 +150,11 @@ const WARM_DRAIN_STUCK_MS = 30_000;
 // (see #retireTargets). Two would do — the third is slack for a frame that is
 // dropped or re-encoded.
 const RETIRED_TARGET_FRAMES = 3;
+// A foreign material slot can be temporarily unmaterialized while an asset is
+// loading. Rechecking every frame turns that harmless wait into a bind-group
+// walk over the whole scene; exponential retry caps the settled cost at one
+// check per second or so while still noticing recovery and detached groups.
+const GI_TEXTURE_REBIND_RETRY_MAX_FRAMES = 64;
 /**
  * Frames a mover's occupancy slot stays DYNAMIC after its last transform
  * change before demoting back to STATIC (see occupancyField's split note).
@@ -699,6 +709,7 @@ function giPipelineBucketOf(material) {
  * `__giBatchCompute = false` restores the per-node loop for an A/B.
  */
 function giCompute(renderer, nodes, { deferrable = false } = {}) {
+  const skippedBefore = giSkippedComputes.size;
   giDispatchDepth++;
   try {
     const list = Array.isArray(nodes) ? nodes : [nodes];
@@ -741,7 +752,7 @@ function giCompute(renderer, nodes, { deferrable = false } = {}) {
         } finally {
           giCurrentComputeNode = null;
         }
-        return;
+        return giSkippedComputes.size === skippedBefore;
       }
     }
     // One at a time, so the current-node tracker stays truthful for the
@@ -764,6 +775,7 @@ function giCompute(renderer, nodes, { deferrable = false } = {}) {
         if (unbuilt) giFrameBuildMs += performance.now() - t0;
       }
     }
+    return giSkippedComputes.size === skippedBefore;
   } finally {
     giDispatchDepth--;
   }
@@ -1568,6 +1580,13 @@ export class GISystem {
     this.component = null;
     this.state = null; // { volume, cascades, queue, light, gizmos, bounds, ... }
     this._frame = 0;
+    // Scene notifications request a fingerprint check without rewriting the
+    // transport frame clock. `_frame = -1` used to make the next modulo hit,
+    // but a transform event every frame kept it pinned at frame zero: every
+    // notification then looked like a fresh cadence boundary and the GI2
+    // scheduler never got a monotonically advancing frame index.
+    this._fingerprintDue = true;
+    this._scanContentAxes = null;
     this._fingerprint = "";
     this._rebuildQueued = false;
     // ── §19 STAGE 0.4 ─────────────────────────────────────────────────────
@@ -1596,6 +1615,11 @@ export class GISystem {
     this._mirrorBucketMaterials = new Set();
     // Resolve targets replaced by a resize, awaiting a safe disposal frame.
     this._retiredTargets = [];
+    // Invalidates every deferred texture-repair closure across a rebuild. Some
+    // closures live in retired-target ready callbacks, not in the single active
+    // presentation slot, so clearing that slot alone is insufficient.
+    this._giTextureRepairGeneration = 0;
+    this._giPresentationRepair = null;
     // ── §19 STAGE 0.2b ──────────────────────────────────────────────────
     // Storage ATTRIBUTES a swap or a teardown orphaned, awaiting the same
     // safe frame. Separate from `_retiredTargets` because the destroy is a
@@ -2428,6 +2452,10 @@ export class GISystem {
     }
     this.#dispose();
     this.component = null;
+    // Public disposal removes the pre-render subscription, so no later tick
+    // exists to age the retirement queues. Wait for the submitted GPU work,
+    // then release everything #dispose just retired against that renderer.
+    this.#flushRetiredTargetsAfterGpu();
   }
 
   /**
@@ -2459,10 +2487,14 @@ export class GISystem {
   // -------------------------------------------------------------------------
 
   #tick() {
-    const component = this.component;
-    if (!component || !component.enabled) return;
     const renderer = this.engine.renderer;
     if (!renderer) return;
+    // Retirement is system lifetime work, not component lifetime work. A
+    // detached/disabled GI component must still drain resources retired by its
+    // final teardown; placing this after the component guard leaked them.
+    this.#drainRetiredTargets();
+    const component = this.component;
+    if (!component || !component.enabled) return;
     // §19 6.3: publish the scene-open anchor the stage ledger measures against.
     // Here rather than at construction because the GI system OUTLIVES a scene
     // swap — `sceneOpenAt` is re-stamped by `Engine#clear` and the ledger keys
@@ -2477,9 +2509,8 @@ export class GISystem {
     // Must be live before the FIRST build's dispatches — the build happens
     // inside this tick, and its kernels are the big ones.
     installAsyncComputePipelines(renderer);
-    // Runs before every early-out below: a retired target must be freed even
-    // while a compile wave holds the rest of this tick.
-    this.#drainRetiredTargets();
+    // The retirement drain above runs before every early-out, including a
+    // detached or disabled component and compile-wave holds below.
     // §19 Stage 0.2b — the occupancy field's geometry re-mint replaces its
     // vertex/index/pair buffers under live kernels; it hands the old ones over
     // here rather than destroying them itself, because only this queue knows
@@ -3310,7 +3341,15 @@ export class GISystem {
     // temporal chain was actually constructed — `emissiveShadows` off, or the
     // hatch unset, and there is no chain at all.
     if (this._giEmitterHistWeightU) {
-      const motion = this._giShadowLastMotion ?? 0;
+      // Emitter visibility is independent of component-light visibility. A
+      // transformed emissive seat invalidates this channel even when the scene
+      // has no ordinary lights (the broad-sign case), so fold its normalized
+      // retain into the same velocity-shaped range instead of keeping 0.94
+      // history over a moving source.
+      const motion = Math.max(
+        this._giShadowLastMotion ?? 0,
+        (this._giEmitterLastMotion ?? 0) * ALPHA_MOTION_SAT,
+      );
       const temporalOn = globalThis.__giShadowTemporal !== false;
       const pin = Number(globalThis.__giEmitterHistWeight);
       this._giEmitterHistWeightU.value = !temporalOn
@@ -3535,8 +3574,18 @@ export class GISystem {
         // flagged `identity`, which was exactly the skinned ones, so a
         // character's dynamic footprint was frozen at its bind pose.
         this.#refreshGi2Movers(gi2);
+        // Dense interiors make RC hit shading the dominant GI cost. Camera,
+        // object and light/emitter motion all use the bounded ray cap until
+        // they settle; this changes sampling rate only and never resets the
+        // last committed irradiance/glossy presentation.
+        gi2.setMotionBudget?.(
+          (this._gi2MoversMoving ?? 0) > 0 ||
+          (this._giEmitterLastMotion ?? 0) > 0 ||
+          (this._giShadowLastMotion ?? 0) > 0
+        );
         this._gi2Frame = (this._gi2Frame ?? 0) + 1;
         this._gi2Passes = gi2.passes(this._gi2Frame);
+        this._gi2BeforeRan = false;
         // §19 Stage 3.5 — the light tree's own re-upload, when it has new
         // bytes. It rides the NON-deferrable half deliberately: `_dynSet`'s
         // uploader rode the field's dispatch, which is the same half, and a
@@ -3622,10 +3671,11 @@ export class GISystem {
           // first occupancy at 4.35 s when the soup had landed at 1.0 s.
           // The GATHER (below) stays deferrable: a partially-dispatched gather
           // is a black probe, which is what a first frame already is.
-          giCompute(renderer, this._gi2Passes.before);
-          if (giSkippedComputes.size === gi2SkippedBefore) {
+          const beforeRan = giCompute(renderer, this._gi2Passes.before);
+          if (beforeRan && giSkippedComputes.size === gi2SkippedBefore) {
             gi2.notePassesRan();
             this._lightTreeStore?.confirmUploads();
+            this._gi2BeforeRan = true;
           }
         }
       }
@@ -3694,7 +3744,7 @@ export class GISystem {
         // through the wave — and the work is not skipped, only moved off the
         // frame it would otherwise have landed on.
         mark("gi.gbufferPrepass");
-      } else if (GI2_PATH && this._gi2Passes?.after?.length) {
+      } else if (GI2_PATH && this._gi2BeforeRan && this._gi2Passes?.after?.length) {
         // ⭐⭐ §19 STAGE 4.3a — DEFERRABLE, EXCEPT WHILE THE COMPILE WAVE OWNS
         // THE FRAMES.
         //
@@ -3725,11 +3775,26 @@ export class GISystem {
         // per node whose graph build blew the frame budget, so an unchanged
         // size across the call is the only witness that the whole list landed.
         const gatherSkippedBefore = giSkippedComputes.size;
-        giCompute(renderer, this._gi2Passes.after, {
+        const gatherRan = giCompute(renderer, this._gi2Passes.after, {
           deferrable: !this._compileWaveActive || globalThis.__giGatherDeferInWave === true,
         });
+        // The image-history copy is a COMMIT, not an ordinary tail pass. If an
+        // upstream pipeline was deferred, snapshotting the partially-written
+        // irradiance under the current camera matrices makes the next frame
+        // accept stale/black tiles as valid history. Keep the previous complete
+        // history until the whole producer chain genuinely lands.
+        if (gatherRan && this._gi2Passes.commit?.length) {
+          const commitSkippedBefore = giSkippedComputes.size;
+          const commitRan = giCompute(renderer, this._gi2Passes.commit, {
+            deferrable: !this._compileWaveActive || globalThis.__giGatherDeferInWave === true,
+          });
+          if (commitRan && giSkippedComputes.size === commitSkippedBefore) {
+            const transition = state.screen.gi2.commitHistoryCamera?.();
+            if (transition) this.#publishGi2Presentation(transition);
+          }
+        }
         gi2Stage("gatherAsked");
-        if (giSkippedComputes.size === gatherSkippedBefore) gi2Stage("gatherRan");
+        if (gatherRan && giSkippedComputes.size === gatherSkippedBefore) gi2Stage("gatherRan");
         // The GI2 receipt (§K.8 + §L.7). ONE readback, on a slow cadence —
         // it is also what latches `_transportAlive`, so it must not wait for
         // the first user request. 30 frames ≈ half a second at 60.
@@ -4133,7 +4198,7 @@ export class GISystem {
           }
         }
       } else if (state.screen.reflProbes) {
-        state.screen.reflProbes = null;
+        this.#armReflectionProbeCapture(state);
       }
       // GPU atlas blit for tiles the CPU canvas path in bvhScene.js could
       // never draw (KTX2/Basis-compressed material maps — see
@@ -4718,7 +4783,7 @@ export class GISystem {
     // first build) into the field at all. Gating it made a freshly opened
     // scene render with almost no GI until a settings change forced a
     // rebuild.
-    if (this._frame % FINGERPRINT_INTERVAL_FRAMES === 0) {
+    if (this._fingerprintDue || this._frame % FINGERPRINT_INTERVAL_FRAMES === 0) {
       this.#checkFingerprint();
     }
     // Deliberately OUTSIDE both the modulo above and `#refreshDynamicObjects`
@@ -5745,6 +5810,8 @@ export class GISystem {
     } catch {
       // The field can be mid-rebuild; the next wave runs this again.
     }
+    (state.screen?.gi2?.computeNodes ?? [])
+      .forEach((n, i) => push(n?.__giPassName ?? `gi2#${i}`, n));
     (state.queue ?? []).forEach((n, i) => push(n?.__giPassName ?? `queue#${i}`, n));
     (state.screen?.srcProbes?.passes ?? []).forEach((n, i) => push(n?.__giPassName ?? `src#${i}`, n));
 
@@ -9218,6 +9285,56 @@ export class GISystem {
     // nodes reachable from `state` NOW; anything still reachable after the
     // rebuild is shared and must be left alone (see the sweep at the end).
     const staleBefore = this.#snapshotGeneration(state);
+    // StorageTexture/RenderTarget setSize() disposes the CURRENT GPU texture
+    // before recreating it. Three responds by clearing both halves of every
+    // cached texture binding (the texture view AND its sampler), so capture
+    // the exact GI-owned slots while they still name their old texture. The
+    // repair runs once, after every target and persistent node below has
+    // reached its final value; rebuilding a group between two setSize() calls
+    // is what produced a valid new GI2 view beside a missing BVH view.
+    const gi2TexturesBeforeResize = new Set([
+      this._gi2?.textures?.irradiance,
+      this._gi2?.textures?.glossy,
+    ].filter(Boolean));
+    const resizeMaterialTextures = [
+      this._giIrradianceNode?.value,
+      this._giRadianceNode?.value,
+      this._giEmitterShadowNode?.value,
+      this._giLightShadowNode?.value,
+      this._giLightShadowDistNode?.value,
+      this._giShadowPosNode?.value,
+      this._giBvhReflectNode?.value,
+      this._giBvhColorNode?.value,
+      this._giBvhRadianceNode?.value,
+    ].filter(Boolean);
+    // GI2 owns a brand-new-gather two-phase publish; its displayed textures
+    // remain old through this resize and must not be mistaken for in-place
+    // targets. Publication captures them after the candidate frame completes.
+    const resizedInPlaceTextures = resizeMaterialTextures
+      .filter((texture) => !gi2TexturesBeforeResize.has(texture));
+    const resizeBindingSnapshot = this.#captureGiTextureBindings(
+      // Only in-place targets participate. Mixed groups are still discovered
+      // through each target texture's own bindGroups set; GI2 remains old.
+      resizedInPlaceTextures,
+      resizedInPlaceTextures,
+    );
+    // In-place targets destroy their old GPU view inside setSize(). Validate the
+    // COMPLETE descriptors while that view is still alive; a bad foreign map
+    // defers the whole resize instead of leaving half the scene on dead views.
+    if (!this.#preflightCapturedGiTextureBindings(resizeBindingSnapshot)) {
+      this._resolveWant = want;
+      this._resolveWantAt = nowMs;
+      this._giResizeDeferredBindings = (this._giResizeDeferredBindings ?? 0) + 1;
+      return;
+    }
+    // All material-facing textures except GI2's gather retain JS identity.
+    // A direct compute binding to the retired GI2 gather also appears in the
+    // texture's bindGroups set; excluding those textures here prevents that
+    // dead compute group from being resurrected by the material repair.
+    const resizedInPlace = new Set(
+      resizeMaterialTextures.filter((texture) => !gi2TexturesBeforeResize.has(texture)),
+    );
+    const retiredResizeBundles = [];
     // ── ⭐⭐ §19 0.3b — RESIZE, DO NOT RE-MINT ────────────────────────────
     //
     // Everything below used to be ~25 `create*` calls: the whole screen chain,
@@ -9452,10 +9569,7 @@ export class GISystem {
         // ⭐⭐ AND NOW THE REBIND — THE ONLY THING THAT ACTUALLY REPAIRS A
         // MATERIAL. Order matters: the nodes above must already carry the new
         // textures, because the rebind reads them THROUGH the nodes.
-        for (const bundle of retiredGathers) {
-          this.#rebindStaleGiTextures(bundle.materialTextures);
-          this.#retireTargets(bundle);
-        }
+        retiredResizeBundles.push(...retiredGathers);
       }
     } else if (tileCutOk) {
       screen.resolve.setSize(width, height, screen.ao?.width ?? width, screen.ao?.height ?? height, tileScale);
@@ -9579,6 +9693,17 @@ export class GISystem {
     // splice. Its dispatch is one thread per stride x stride BLOCK and the
     // block grid is a uniform.
     screen.bvhReflect?.pass?.setSize?.(width, height);
+
+    // Rebuild each affected material bind group ONCE, now that the gbuffer,
+    // ordinary GI targets, exact-reflection targets and GI2 outputs all point
+    // at their final GPU resources. If a foreign slot is temporarily invalid,
+    // the preflight refuses createBindGroup and the old GI2 gather stays alive;
+    // the retire queue retries the same surgical repair on a later frame.
+    const resizeRepair = this.#createGiTextureRepair(resizeBindingSnapshot, resizedInPlace);
+    resizeRepair.attempt(true);
+    for (const bundle of retiredResizeBundles) {
+      this.#retireTargets(bundle, resizeRepair.attempt);
+    }
 
     // ⚠ THE DIFF IS THE SAFETY ARGUMENT, and releaseCompute.js prices getting it
     // wrong at a 16-27 s recompile: a node still reachable from `state` is still
@@ -9783,8 +9908,18 @@ export class GISystem {
   #armReflectionProbeCapture(state) {
     const screen = state?.screen;
     if (!screen) return;
+    const previous = screen.reflProbes ?? null;
+    const retirePrevious = () => {
+      if (!previous || previous === screen.reflProbes) return;
+      const computeNodes = [previous.capture?.compute, previous.blur?.compute]
+        .filter((node) => node?.isComputeNode === true);
+      if (computeNodes.length) {
+        this.#retireTargets({ storageAttributes: [], computeNodes, dispose() {} });
+      }
+    };
     if (!this.#reflectionProbesEnabled() || !state.bvhScene) {
       screen.reflProbes = null;
+      retirePrevious();
       return;
     }
     const light = state.light;
@@ -9857,6 +9992,8 @@ export class GISystem {
     } catch (error) {
       screen.reflProbes = null;
       console.warn("[gi] reflection probes unavailable:", error?.message ?? error);
+    } finally {
+      retirePrevious();
     }
   }
 
@@ -9950,6 +10087,8 @@ export class GISystem {
   #syncBvhScene(entries) {
     const state = this.state;
     if (!state?.screen) return;
+    const staleBefore = this.#snapshotGeneration(state);
+    try {
     // ⚠ §M.1's MIRROR-TIER SKIP BELONGS HERE, NOT AT ONE CALL SITE. `#rebuild`
     // is only one of FOUR routes into this function (the fingerprint scan, the
     // in-place refit and the seat re-rank are the others), and gating just the
@@ -10012,7 +10151,7 @@ export class GISystem {
       this.#retireTargets(state.bvhScene);
       state.bvhScene = null;
       state.screen.bvhReflect = null;
-      state.screen.reflProbes = null;
+      this.#armReflectionProbeCapture(state);
       if (light) {
         light.bvhReflectTexture = null;
         light.bvhReflectColorTexture = null;
@@ -10115,6 +10254,12 @@ export class GISystem {
     // probesOn; also called from the tick's staleness check for the rebuild
     // paths that bypass this function).
     this.#armReflectionProbeCapture(state);
+    } finally {
+      // Fingerprint sync replaces/nulls reflection kernels outside a full
+      // rebuild. Sweep the exact pre-mutation generation on every branch,
+      // including the disabled early return and build failures.
+      this.#sweepOrphanedComputes(state, staleBefore, "bvh-scene-sync");
+    }
   }
 
   /**
@@ -10368,7 +10513,7 @@ export class GISystem {
    * and GI blanks out. A few MB held for three frames is the cheap side of that
    * trade.
    */
-  #retireTargets(targets) {
+  #retireTargets(targets, ready = null) {
     if (!targets) return;
     // §19 0.3b's `swapStorageBuffer` hands this a raw BUFFER ATTRIBUTE, not a
     // target. `BufferAttribute.dispose()` exists (it dispatches an event) but
@@ -10379,7 +10524,14 @@ export class GISystem {
       this.#retireStorageAttributes([targets]);
       return;
     }
-    this._retiredTargets.push({ targets, ttl: RETIRED_TARGET_FRAMES });
+    this._retiredTargets.push({
+      targets,
+      ttl: RETIRED_TARGET_FRAMES,
+      ready: typeof ready === "function" ? ready : null,
+      blockedTtl: RETIRED_TARGET_FRAMES,
+      blocked: false,
+      trimmed: false,
+    });
   }
 
   /**
@@ -10400,6 +10552,369 @@ export class GISystem {
     if (list.length === 0) return 0;
     this._retiredAttributes.push({ attrs: list, ttl: RETIRED_TARGET_FRAMES });
     return list.length;
+  }
+
+  /**
+   * Snapshot the exact texture/sampler slots owned by these GI textures.
+   * Texture disposal clears `binding.texture`, so discovering them after even
+   * the first setSize() is already too late. The binding object is the useful
+   * unit here: a bind group can contain GI2, BVH and ordinary material maps,
+   * and only the captured slots are safe to refresh outside object rendering.
+   */
+  #captureGiTextureBindings(textures, slotTextures = textures) {
+    const renderer = this.engine?.renderer;
+    const store = renderer?._textures;
+    const backend = renderer?.backend;
+    const groups = new Map();
+    const ownedSlots = new Set(slotTextures?.filter(Boolean) ?? []);
+    if (typeof store?.has !== "function") return groups;
+    for (const texture of new Set(textures?.filter(Boolean) ?? [])) {
+      if (store.has(texture) !== true) continue;
+      for (const bindGroup of [...(store.get(texture)?.bindGroups ?? [])]) {
+        let slots = groups.get(bindGroup);
+        for (const binding of bindGroup?.bindings ?? []) {
+          // Sampled textures and their separate sampler are both Samplers in
+          // three, and Textures._destroyTexture releases both.
+          if (
+            binding?.isSampler === true &&
+            ownedSlots.has(binding.texture) &&
+            // Only render-material slots need this manual refresh. Compute
+            // groups are refreshed by updateForCompute immediately before
+            // dispatch; rebuilding them here can race their resized storage
+            // buffers and create a zero-sized GPUBufferBinding.
+            (Number(binding.visibility) & 2) !== 0
+          ) {
+            if (!slots) {
+              groups.set(bindGroup, (slots = new Map()));
+              // Remember the native object that still names the outgoing view.
+              try {
+                slots.__giNativeGroup = backend?.has?.(bindGroup) === true
+                  ? backend.get(bindGroup)?.group ?? null
+                  : null;
+              } catch { slots.__giNativeGroup = null; }
+            }
+            slots.set(binding, binding.texture);
+          }
+        }
+      }
+    }
+    return groups;
+  }
+
+  /** Non-mutating gate used before either an in-place resize or GI2 publish. */
+  #preflightCapturedGiTextureBindings(snapshot, ignoreCaptured = false) {
+    if (!(snapshot instanceof Map)) return true;
+    const backend = this.engine?.renderer?.backend;
+    if (!backend) return false;
+    for (const [bindGroup, slots] of [...snapshot]) {
+      const attachment = this.#giBindGroupAttachment(bindGroup);
+      if (!attachment) { snapshot.delete(bindGroup); continue; }
+      // A renderer refresh can replace the native group while we wait, but the
+      // persistent GI nodes still point at the displayed frame. Track that new
+      // native identity; it is not proof that the new GI frame was published.
+      slots.__giNativeGroup = attachment.nativeGroup;
+      try {
+        for (const binding of bindGroup?.bindings ?? []) {
+          if (ignoreCaptured && slots.has(binding)) continue;
+          if (binding?.isSampledTexture === true) {
+            const texture = binding.texture;
+            if (!texture || backend.has?.(texture) !== true) return false;
+            const data = backend.get(texture);
+            if (data?.texture === undefined && data?.externalTexture === undefined) return false;
+          } else if (binding?.isSampler === true) {
+            if (!binding.texture || backend.has?.(binding) !== true) return false;
+            if (backend.get(binding)?.sampler === undefined) return false;
+          }
+        }
+      } catch { return false; }
+    }
+    return true;
+  }
+
+  /** A throttled repair shared by every retired bundle in one presentation swap. */
+  #createGiTextureRepair(snapshot, resizedInPlace, replacements = null, beforeCommit = null, onComplete = null) {
+    const generation = this._giTextureRepairGeneration ?? 0;
+    let complete = false;
+    let completed = false;
+    let canceled = false;
+    let nextFrame = -Infinity;
+    let delay = 1;
+    let last = { complete: false, repaired: 0, retainedTextures: new Set() };
+    const cancel = () => {
+      if (canceled) return last;
+      canceled = true;
+      complete = true;
+      // Terminal-ready by design: retired-target callbacks can now drain, but
+      // onComplete is NOT called (it belongs to the disposed GI generation).
+      last = { complete: true, canceled: true, repaired: 0, retainedTextures: new Set() };
+      return last;
+    };
+    const repair = {
+      attempt: (force = false) => {
+        if (generation !== (this._giTextureRepairGeneration ?? 0)) return cancel();
+        if (complete) return last;
+        const frame = this._frame ?? 0;
+        if (!force && frame < nextFrame) return last;
+        const liveReplacements = typeof replacements === "function" ? replacements() : replacements;
+        last = this.#rebindCapturedGiTextures(snapshot, resizedInPlace, liveReplacements, beforeCommit);
+        complete = last.complete;
+        if (complete && !completed) {
+          completed = true;
+          onComplete?.();
+        }
+        if (!complete) {
+          nextFrame = frame + delay;
+          delay = Math.min(GI_TEXTURE_REBIND_RETRY_MAX_FRAMES, delay * 2);
+        }
+        return last;
+      },
+      cancel,
+    };
+    return repair;
+  }
+
+  /** Atomically switch materials from the last complete GI2 frame to its resized successor. */
+  #publishGi2Presentation(transition) {
+    if (!transition?.newTextures) return;
+    const oldTextures = Object.values(transition.oldTextures ?? {}).filter(Boolean);
+    const snapshot = this.#captureGiTextureBindings(oldTextures);
+    const latestTextures = () => typeof transition.newTextures === "function"
+      ? transition.newTextures()
+      : transition.newTextures;
+    const replacements = () => {
+      const latest = latestTextures();
+      const map = new Map();
+      for (const key of ["irradiance", "glossy", "lit", "raw"]) {
+        const oldTexture = transition.oldTextures?.[key];
+        const newTexture = latest?.[key];
+        if (oldTexture && newTexture) map.set(oldTexture, newTexture);
+      }
+      return map;
+    };
+    const repair = this.#createGiTextureRepair(
+      snapshot,
+      new Set(),
+      replacements,
+      () => {
+        const latest = latestTextures();
+        const previousIrradiance = this._giIrradianceNode?.value;
+        const previousRadiance = this._giRadianceNode?.value;
+        if (this._giIrradianceNode) this._giIrradianceNode.value = latest?.irradiance;
+        if (this._giRadianceNode) this._giRadianceNode.value = latest?.glossy;
+        return () => {
+          if (this._giIrradianceNode) this._giIrradianceNode.value = previousIrradiance;
+          if (this._giRadianceNode) this._giRadianceNode.value = previousRadiance;
+        };
+      },
+      () => {
+        transition.accept?.();
+        this._giPresentationRepair = null;
+      },
+    );
+    for (const bundle of transition.takeRetired?.() ?? transition.retired ?? []) {
+      this.#retireTargets(bundle, repair.attempt);
+    }
+    const result = repair.attempt(true);
+    if (!result.complete) this._giPresentationRepair = repair;
+  }
+
+  /**
+   * Restore a pre-resize snapshot after every target/node swap is complete.
+   * Returns incomplete instead of asking WebGPU to build a descriptor with a
+   * missing view/sampler; retirement uses that as a retry handshake.
+   */
+  #rebindCapturedGiTextures(snapshot, resizedInPlace, replacements = null, beforeCommit = null) {
+    if (!(snapshot instanceof Map) || snapshot.size === 0) {
+      beforeCommit?.();
+      return { complete: true, repaired: 0, retainedTextures: new Set() };
+    }
+    const renderer = this.engine?.renderer;
+    const bindings = renderer?._bindings;
+    const backend = renderer?.backend;
+    const store = renderer?._textures;
+    if (!bindings || !backend || typeof store?.updateTexture !== "function") {
+      return {
+        complete: false,
+        repaired: 0,
+        retainedTextures: new Set(
+          [...snapshot.values()].flatMap((slots) => [...slots.values()]),
+        ),
+      };
+    }
+    const retainAll = () => new Set(
+      [...snapshot.values()].flatMap((slots) => [...slots.values()]),
+    );
+    // Foreign resources are the only thing that can poison the shared
+    // descriptor. Gate them while persistent nodes, sampled bindings and native
+    // groups still all describe the old complete presentation.
+    if (!this.#preflightCapturedGiTextureBindings(snapshot, true)) {
+      return { complete: false, repaired: 0, retainedTextures: retainAll() };
+    }
+    // Upload the candidate textures without repointing a binding. Thus a failed
+    // upload also leaves the visible old frame completely untouched.
+    try {
+      for (const texture of new Set(replacements?.values?.() ?? [])) {
+        store.updateTexture(texture);
+        const data = backend.has?.(texture) === true ? backend.get(texture) : null;
+        if (data?.texture === undefined && data?.externalTexture === undefined) {
+          return { complete: false, repaired: 0, retainedTextures: retainAll() };
+        }
+      }
+    } catch {
+      return { complete: false, repaired: 0, retainedTextures: retainAll() };
+    }
+    const journal = createGiBindingMutationJournal(snapshot);
+    try {
+      journal.setExtraRollback(beforeCommit?.());
+    } catch (err) {
+      journal.rollback();
+      if (!this._warnedResizeRebindThrow) {
+        this._warnedResizeRebindThrow = true;
+        console.warn(`[gi] atomic texture publication failed before binding preparation: ${err?.message ?? err}`);
+      }
+      return { complete: false, repaired: 0, retainedTextures: retainAll() };
+    }
+
+    let repaired = 0;
+    let unresolved = 0;
+    const prepared = [];
+    const retainedTextures = new Set();
+    for (const [bindGroup, slots] of [...snapshot]) {
+      // Texture bind-group sets are append-only. A group torn down since the
+      // snapshot is not a retirement dependency and must not be resurrected.
+      const attachment = this.#giBindGroupAttachment(bindGroup);
+      if (!attachment) { snapshot.delete(bindGroup); continue; }
+      let touched = false;
+      let groupUnresolved = false;
+      try {
+        for (const [binding, previousTexture] of slots) {
+          let live = binding.textureNode?.value;
+          // Engine-owned fragment consumers (debug/volume terms) can point
+          // directly at a GI2 texture. Publication carries the exact mapping,
+          // so move those nodes during the same preflight as material nodes.
+          const replacement = replacements?.get(previousTexture);
+          if (replacement && live === previousTexture && binding.textureNode) {
+            binding.textureNode.value = replacement;
+            live = replacement;
+          }
+          if (replacement && !live) { groupUnresolved = true; continue; }
+          // A retired GI2 compute node still points at its own old gather.
+          // Material persistent nodes point at the replacement. Same-object
+          // targets are explicitly admitted through resizedInPlace.
+          if (!live || (live === previousTexture && !resizedInPlace.has(previousTexture))) {
+            groupUnresolved = true;
+            continue;
+          }
+          binding.update();
+          if (binding.texture !== live) { groupUnresolved = true; continue; }
+          if (binding.isSampledTexture === true) {
+            store.updateTexture(live);
+            const textureData = store.get(live);
+            binding.generation = textureData.generation;
+            journal.noteMembership(textureData.bindGroups, bindGroup);
+            textureData.bindGroups?.add(bindGroup);
+          } else {
+            const samplerKey = store.updateSampler(binding);
+            binding.samplerKey = samplerKey;
+          }
+          touched = true;
+        }
+        if (!touched) groupUnresolved = true;
+        // This check includes EVERY entry, not only GI: createBindGroup uses a
+        // shared descriptor which a single undefined resource can poison.
+        if (groupUnresolved || !this.#bindGroupIsBindable(bindGroup)) {
+          unresolved++;
+          continue;
+        }
+        prepared.push([bindGroup, slots]);
+      } catch (err) {
+        unresolved++;
+        if (!this._warnedResizeRebindThrow) {
+          this._warnedResizeRebindThrow = true;
+          console.warn(`[gi] atomic texture rebind failed pre-submit: ${err?.message ?? err}`);
+        }
+      }
+    }
+    // Presentation atomicity is GLOBAL, not merely descriptor-local. A single
+    // invalid foreign slot means every still-attached native group continues to
+    // name the outgoing GI frame; issuing even one update here would paint a
+    // checkerboard of old and new illumination. Preparation above may upload
+    // resources, but no GPU bind group is replaced until every affected live
+    // group has passed the complete-descriptor preflight.
+    if (unresolved > 0) {
+      journal.rollback();
+      for (const slots of snapshot.values()) {
+        for (const previousTexture of slots.values()) retainedTextures.add(previousTexture);
+      }
+      this._giRebindSkipped = (this._giRebindSkipped ?? 0) + unresolved;
+      return { complete: false, repaired: 0, retainedTextures };
+    }
+    const committed = [];
+    try {
+      for (const [bindGroup] of prepared) {
+        backend.updateBindings(bindGroup, [bindGroup], 0, 0);
+        committed.push(bindGroup);
+      }
+    } catch (err) {
+      // Restore JS first, then rebuild every descriptor already installed in
+      // this partial backend loop from the outgoing binding state. The global
+      // presentation therefore remains old even on an unexpected backend throw.
+      journal.rollback();
+      for (const bindGroup of committed) {
+        try { backend.updateBindings(bindGroup, [bindGroup], 0, 0); } catch {}
+      }
+      if (!this._warnedResizeRebindThrow) {
+        this._warnedResizeRebindThrow = true;
+        console.warn(`[gi] atomic texture backend commit rolled back: ${err?.message ?? err}`);
+      }
+      this._giRebindSkipped = (this._giRebindSkipped ?? 0) + 1;
+      return { complete: false, repaired: 0, retainedTextures: retainAll() };
+    }
+    repaired = committed.length;
+    for (const bindGroup of committed) {
+      snapshot.delete(bindGroup);
+    }
+    if (repaired > 0) this._giRebindings = (this._giRebindings ?? 0) + repaired;
+    return { complete: snapshot.size === 0, repaired, retainedTextures };
+  }
+
+  /** Returns the live native attachment, or null for an append-only dead-group record. */
+  #giBindGroupAttachment(bindGroup) {
+    const renderer = this.engine?.renderer;
+    const bindings = renderer?._bindings;
+    const backend = renderer?.backend;
+    if (!bindGroup || !bindings || !backend) return null;
+    try {
+      if (bindings.has?.(bindGroup) !== true) return null;
+      const groupData = bindings.get(bindGroup);
+      if (groupData?.bindGroup === undefined) return null;
+      if (Number.isFinite(groupData.usedTimes) && groupData.usedTimes <= 0) return null;
+      if (backend.has?.(bindGroup) !== true) return null;
+      const nativeGroup = backend.get(bindGroup)?.group;
+      return nativeGroup ? { nativeGroup } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Materialise existing texture objects without consulting shared foreign texture nodes. */
+  #materializeGiBindGroupResources(bindGroup) {
+    const renderer = this.engine?.renderer;
+    const backend = renderer?.backend;
+    const store = renderer?._textures;
+    if (!backend || !store) return;
+    for (const binding of bindGroup?.bindings ?? []) {
+      if (binding?.isSampledTexture === true && binding.texture) {
+        const data = backend.has?.(binding.texture) === true ? backend.get(binding.texture) : null;
+        if (data?.texture === undefined && data?.externalTexture === undefined) {
+          store.updateTexture(binding.texture);
+        }
+      } else if (binding?.isSampler === true && binding.texture) {
+        if (backend.has?.(binding) !== true || backend.get(binding)?.sampler === undefined) {
+          binding.samplerKey = store.updateSampler(binding);
+        }
+      }
+    }
   }
 
   /**
@@ -10573,10 +11088,9 @@ export class GISystem {
     const backend = renderer?.backend;
     const store = renderer?._textures;
     if (!backend || typeof store?.updateTexture !== "function") return false;
-    let needsBindingsUpdate = false;
     let touched = 0;
     for (const binding of bindGroup.bindings ?? []) {
-      if (binding?.isSampledTexture !== true) continue;
+      if (binding?.isSampler !== true) continue;
       // ⛔ THE WHOLE FIX IS THIS TEST. A binding that does not name a dying
       // texture is a binding whose node we do not own; reading it IS the bug.
       // Counted, so "the repair ran" and "the repair stayed in its lane" are
@@ -10593,19 +11107,26 @@ export class GISystem {
       if (binding.update() !== true) continue;
       touched++;
       const texture = binding.texture;
-      store.updateTexture(texture);
-      const data = store.get(texture);
-      if (binding.generation !== data.generation) {
+      if (binding.isSampledTexture === true) {
+        store.updateTexture(texture);
+        const data = store.get(texture);
         binding.generation = data.generation;
-        needsBindingsUpdate = true;
+        // Three tracks who binds a texture so `_destroyTexture` can find them;
+        // the new texture has to inherit this group or the NEXT resize is blind
+        // to it (the append-only set `#bindGroupIsBindable` documents).
+        data.bindGroups?.add(bindGroup);
+      } else {
+        // Texture sampling owns a separate NodeSampler slot. If it keeps the
+        // retiring texture, disposal releases the sampler under the new group.
+        binding.samplerKey = store.updateSampler(binding);
       }
-      // Three tracks who binds a texture so `_destroyTexture` can find them;
-      // the new texture has to inherit this group or the NEXT resize is blind
-      // to it (the append-only set `#bindGroupIsBindable` documents).
-      data.bindGroups?.add(bindGroup);
     }
-    if (needsBindingsUpdate) backend.updateBindings(bindGroup, [bindGroup], 0, 0);
-    return touched > 0;
+    let rebuilt = false;
+    if (touched > 0 && this.#bindGroupIsBindable(bindGroup)) {
+      backend.updateBindings(bindGroup, [bindGroup], 0, 0);
+      rebuilt = true;
+    }
+    return rebuilt;
   }
 
   /**
@@ -10669,6 +11190,14 @@ export class GISystem {
           const attribute = binding.attribute;
           if (!attribute || backend.has?.(attribute) !== true) return false;
           if (backend.get(attribute)?.buffer === undefined) return false;
+        } else if (binding?.isSampledTexture === true) {
+          const texture = binding.texture;
+          if (!texture || backend.has?.(texture) !== true) return false;
+          const textureData = backend.get(texture);
+          if (textureData?.texture === undefined && textureData?.externalTexture === undefined) return false;
+        } else if (binding?.isSampler === true) {
+          if (!binding.texture || backend.has?.(binding) !== true) return false;
+          if (backend.get(binding)?.sampler === undefined) return false;
         }
       }
       return true;
@@ -10677,7 +11206,23 @@ export class GISystem {
     }
   }
 
+  #releaseRetiredTargetOwners(targets, renderer) {
+    const ownedNodes = targets?.computeNodes;
+    if (Array.isArray(ownedNodes) && ownedNodes.length) {
+      releaseComputeNodes(renderer, ownedNodes);
+      ownedNodes.length = 0;
+    }
+    const owned = targets?.storageAttributes;
+    if (Array.isArray(owned) && owned.length) {
+      this._giFreedBuffers = (this._giFreedBuffers ?? 0) + releaseStorageAttributes(renderer, owned);
+      owned.length = 0;
+    }
+  }
+
   #drainRetiredTargets() {
+    if (this._giPresentationRepair) {
+      try { this._giPresentationRepair.attempt(); } catch {}
+    }
     if (this._retiredAttributes.length > 0) {
       const renderer = this.engine?.renderer;
       const keep = [];
@@ -10692,7 +11237,39 @@ export class GISystem {
     const renderer = this.engine?.renderer;
     const keep = [];
     for (const entry of this._retiredTargets) {
-      if (--entry.ttl > 0 || globalThis.__giKeepRetiredTargets) { keep.push(entry); continue; }
+      if (globalThis.__giKeepRetiredTargets) { keep.push(entry); continue; }
+      // A replacement texture cannot die until every surviving material group
+      // has a complete texture-view + sampler rebind. Preserve the full TTL
+      // while the atomic preflight is waiting; it is submission slack, not a
+      // timeout after which an unresolved corpse becomes safe to destroy.
+      if (entry.ready) {
+        let result = null;
+        try { result = entry.ready(); } catch { result = null; }
+        const ready = result === true || result?.complete === true;
+        if (!ready) {
+          entry.blocked = true;
+          // A permanently-invalid FOREIGN material slot must not pin an entire
+          // gather (its kernels, RC cascades and storage) forever. After the
+          // submission window, keep only outgoing textures that live native
+          // groups still genuinely reference; retrying remains throttled.
+          if (--entry.blockedTtl <= 0 && !entry.trimmed && typeof entry.targets?.retainOnly === "function") {
+            this.#releaseRetiredTargetOwners(entry.targets, renderer);
+            const retained = result?.retainedTextures instanceof Set
+              ? result.retainedTextures
+              : new Set(entry.targets?.materialTextures ?? []);
+            const light = entry.targets.retainOnly(retained);
+            if (light) entry.targets = light;
+            entry.trimmed = true;
+            this._giRetiredTrimmed = (this._giRetiredTrimmed ?? 0) + 1;
+          }
+          keep.push(entry);
+          continue;
+        }
+        entry.ready = null;
+        // A repair can settle arbitrarily late and still earns full GPU slack.
+        if (entry.blocked) entry.ttl = RETIRED_TARGET_FRAMES;
+      }
+      if (--entry.ttl > 0) { keep.push(entry); continue; }
       // §19 Stage 4.1 — a bundle may also OWN COMPUTE NODES, and they go FIRST.
       //
       // The GI2 gather is the case this was added for: a resize replaces it
@@ -10704,20 +11281,39 @@ export class GISystem {
       // the dead kernels also bound, which SURVIVE the resize. The bundle's own
       // `storageAttributes` is the owner-scoped list, and its author owns that
       // diff (the same contract `#retireStorageAttributes` states).
-      const ownedNodes = entry.targets?.computeNodes;
-      if (Array.isArray(ownedNodes) && ownedNodes.length) {
-        releaseComputeNodes(renderer, ownedNodes);
-      }
+      this.#releaseRetiredTargetOwners(entry.targets, renderer);
       // A retired bundle may OWN storage buffers as well as textures — the BVH
       // scene is five of them and the largest single allocation a rebuild
       // makes. `dispose()` only ever reached its atlas texture.
-      const owned = entry.targets?.storageAttributes;
-      if (Array.isArray(owned) && owned.length) {
-        this._giFreedBuffers = (this._giFreedBuffers ?? 0) + releaseStorageAttributes(renderer, owned);
-      }
       entry.targets.dispose();
     }
     this._retiredTargets = keep;
+  }
+
+  /** Final teardown has no future tick, so retire after the queue itself drains. */
+  #flushRetiredTargetsAfterGpu() {
+    if (this._retiredAttributes.length === 0 && this._retiredTargets.length === 0) return;
+    const renderer = this.engine?.renderer;
+    const attrs = this._retiredAttributes.splice(0);
+    const targets = this._retiredTargets.splice(0);
+    const release = () => {
+      for (const entry of attrs) {
+        this._giFreedBuffers = (this._giFreedBuffers ?? 0)
+          + releaseStorageAttributes(renderer, entry.attrs);
+      }
+      for (const entry of targets) {
+        this.#releaseRetiredTargetOwners(entry.targets, renderer);
+        try { entry.targets?.dispose?.(); } catch {}
+      }
+    };
+    const queue = renderer?.backend?.device?.queue;
+    if (queue?.onSubmittedWorkDone) {
+      queue.onSubmittedWorkDone().catch(() => {}).then(release);
+    } else {
+      // WebGL resource deletion is driver-deferred. The timeout also keeps
+      // disposal outside a render callback on non-WebGPU test renderers.
+      setTimeout(release, 0);
+    }
   }
 
   /**
@@ -12106,6 +12702,11 @@ export class GISystem {
             bz: giUniform(new THREE.Vector3(0, 0, 1)),
             reff: giUniform(0),
             exHalf: giUniform(new THREE.Vector3(0.1, 0.1, 0.1)),
+            // Static-soup placement owner. The exact direct-shadow traversal
+            // rejects this owner per ray, so an emitter's own triangles can
+            // never masquerade as an occluder. UINT_MAX means no static owner
+            // (providers and pinned dynamic-only emitters).
+            owner: uniform(0xffffffff, "uint"),
             // 1 while this emitter is MOVING (translating or turning), decaying
             // over a few frames at rest. The feedback pass cuts its history
             // retain per cell by the moving emitters' share of that cell's
@@ -14483,6 +15084,12 @@ export class GISystem {
   }
 
   #dispose() {
+    // FIRST: no old-generation ready callback may observe new state/nodes. The
+    // generation invalidates resize repairs held only by retirement entries;
+    // explicit cancel makes the active GI2 transition terminal-ready now.
+    this._giTextureRepairGeneration = (this._giTextureRepairGeneration ?? 0) + 1;
+    this._giPresentationRepair?.cancel?.();
+    this._giPresentationRepair = null;
     const state = this.state;
     if (!state) return;
     this.state = null;
@@ -14505,7 +15112,13 @@ export class GISystem {
     }
     this._lightShadowNodes?.clear();
     state.volume?.dispose?.();
-    state.bvhScene?.dispose?.();
+    if (state.bvhScene) {
+      const retiredBvhScene = state.bvhScene;
+      // Its storage attributes are retired by the `doomed` walk below. Defer
+      // only the scene's atlas/blit textures and CPU backing arrays here so an
+      // already-encoded reflection pass cannot submit a destroyed atlas.
+      this.#retireTargets({ dispose: () => retiredBvhScene.dispose() });
+    }
     // ── §19 STAGE 3.4: GI2 ────────────────────────────────────────────────
     //
     // The window, the cache, the voxelizer's work buffer, the dynamic layer's
@@ -15381,9 +15994,17 @@ export class GISystem {
       const g = surface.emissive.g * surface.emissiveIntensity;
       const b = surface.emissive.b * surface.emissiveIntensity;
       const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      // Analytic seats/light-tree records currently describe one radiance for
+      // one fitted mesh shape. Applying material[0] to a grouped mesh lights
+      // every other material range with the wrong colour, then GI2's new
+      // per-range field emission delivers those ranges a second time. Keep
+      // grouped meshes entirely in the material-attributed field until the
+      // analytic record format can carry triangle/material subsets.
+      const materialList = Array.isArray(mesh.material) ? mesh.material.filter(Boolean) : [mesh.material];
+      const groupedMaterials = materialList.length > 1;
       if (this.#analyticOnlyMover(mesh)) {
         const peak = Math.max(r, g, b);
-        if (peak >= 0.5) {
+        if (!groupedMaterials && peak >= 0.5) {
           analyticEmitterCands.push({ mesh, surface, r, g, b, luminance, peak, promoted: false });
         }
         continue;
@@ -15400,7 +16021,7 @@ export class GISystem {
       // reported "emissive shadows are still voxelized a lot" and "sometimes
       // dynamic objects don't even cast shadows from emissive objects at all",
       // on lamps whose only sin was being a saturated colour.
-      const peak = Math.max(r, g, b);
+      const peak = groupedMaterials ? 0 : Math.max(r, g, b);
       const geometry = mesh.geometry;
       const position = geometry.attributes.position;
       const tris = (geometry.index?.count ?? position.count) / 3;
@@ -15587,11 +16208,21 @@ export class GISystem {
       }
       const chosen = this.#chooseEmitterSeats(bright);
       this._promotedEmitterMeshes = chosen.map((cand) => cand?.mesh ?? null);
+      this._promotedEmitterSeatKeys = chosen.map((cand) => cand?.seatKey ?? cand?.mesh ?? null);
       for (const cand of chosen) {
-        if (cand) cand.promoted = true;
+        if (cand) (cand.sourceCand ?? cand).promoted = true;
       }
       this._emitterInfos = chosen.map((cand) =>
-        cand ? { mesh: cand.mesh, r: cand.r, g: cand.g, b: cand.b } : null,
+        cand ? {
+          mesh: cand.mesh,
+          r: cand.r,
+          g: cand.g,
+          b: cand.b,
+          tris: cand.tris,
+          surfaceSeat: cand.surfaceSeat ?? null,
+          seatKey: cand.seatKey ?? cand.mesh,
+          motionKey: cand.motionKey ?? cand.mesh,
+        } : null,
       );
       // DYNAMIC emitters (particle systems) claim whatever seats the emissive
       // meshes left — HOLES included, since the array is positional. They have
@@ -15811,6 +16442,77 @@ export class GISystem {
         taken.add(cand.mesh);
       }
     }
+    // EXTENDED SURFACE SEATS. `consolidateSparse` below is the right one-seat
+    // fallback for a run of tiny bulbs: preserve total power on one bulb-sized
+    // body. It is the wrong representation for a long, sheet-like emitter such
+    // as a cafe sign, because isotropic shrinking moves all of that power to the
+    // mesh centre. A surface source is cached in LOCAL triangle space and is
+    // admitted only when the mesh is elongated, has one dominant normal axis,
+    // and a spatial partition materially tightens its bounds. Bulb strings and
+    // tubes fail that normal/shape gate and stay on consolidation.
+    //
+    // Allocation never changes MAX_EMITTERS. Empty seats become extra spatial
+    // segments first; at a full budget, a strong second surface segment may
+    // replace the weakest distinct analytic bonus (the displaced emitter stays
+    // in the light-tree/palette fallback). Competing surfaces cap at two seats,
+    // while a lone surface may use all four. Every triangle's area belongs to
+    // exactly one group, so the slots conserve the mesh's total emitted power
+    // rather than copying it K times.
+    const selected = chosen.filter(Boolean);
+    const sourceByMesh = new Map();
+    for (const cand of selected) {
+      const source = emitterSurfaceSeatSource(cand.mesh?.geometry);
+      if (source) sourceByMesh.set(cand.mesh, source);
+    }
+    if (!sourceByMesh.size) return chosen;
+    const counts = allocateEmitterSurfaceSeats(selected, {
+      capacity: MAX_EMITTERS,
+      sourceOf: (mesh) => sourceByMesh.get(mesh) ?? null,
+      scoreOf: (cand) => score.get(cand) ?? 0,
+    });
+    const retained = new Set(counts.selectedCandidates ?? selected);
+    // A useful second surface segment may have displaced the weakest distinct
+    // analytic seat. Park that positional slot now; the mesh itself remains in
+    // `_emitterCands` and therefore in the light-tree/palette fallback.
+    for (let i = 0; i < chosen.length; i++) {
+      if (chosen[i] && !retained.has(chosen[i])) chosen[i] = null;
+    }
+    const extras = [];
+    for (const cand of counts.selectedCandidates ?? selected) {
+      const source = sourceByMesh.get(cand.mesh);
+      if (!source) continue;
+      const count = counts.get(cand.mesh) ?? 1;
+      const groups = emitterSurfaceSeatGroups(source, count);
+      if (!groups.length) continue;
+      const baseAt = chosen.indexOf(cand);
+      for (let part = 0; part < groups.length; part++) {
+        const seatKey = `${cand.mesh.uuid}:surface:${count}:${part}`;
+        let perMesh = this._emitterSurfaceMotionKeys?.get(cand.mesh);
+        if (!perMesh) {
+          perMesh = new Map();
+          (this._emitterSurfaceMotionKeys ??= new WeakMap()).set(cand.mesh, perMesh);
+        }
+        let motionKey = perMesh.get(seatKey);
+        if (!motionKey) {
+          motionKey = { mesh: cand.mesh, seatKey };
+          perMesh.set(seatKey, motionKey);
+        }
+        const surfaceCand = {
+          ...cand,
+          sourceCand: cand,
+          surfaceSeat: groups[part],
+          seatKey,
+          motionKey,
+        };
+        if (part === 0) chosen[baseAt] = surfaceCand;
+        else extras.push(surfaceCand);
+      }
+    }
+    for (const cand of extras) {
+      const hole = chosen.indexOf(null);
+      if (hole < 0) break;
+      chosen[hole] = cand;
+    }
     return chosen;
   }
 
@@ -15976,6 +16678,23 @@ export class GISystem {
     if (damp) {
       // Chroma first, then energy — identical to `#slotSurface`'s ramp, because
       // it is the same physical correction on the same quantity.
+      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      r = (lum + (r - lum) * damp.chroma) * damp.energy;
+      g = (lum + (g - lum) * damp.chroma) * damp.energy;
+      b = (lum + (b - lum) * damp.chroma) * damp.energy;
+    }
+    return [r, g, b];
+  }
+
+  /** Apply the mesh's admission and sub-cell policy to a non-zero material group. */
+  #gi2GroupedEmissive(entry, raw) {
+    if (!entry || !raw) return [0, 0, 0];
+    if ((entry.promoted || this._promotedEmitterMeshes?.includes(entry.mesh))
+      && !rc5EmitterEmissionEnabled()) return [0, 0, 0];
+    if (this.#belowEmitterPowerGate(entry)) return [0, 0, 0];
+    let r = raw[0] ?? 0, g = raw[1] ?? 0, b = raw[2] ?? 0;
+    const damp = this.#subCellEmissiveDamp({ ...entry, r, g, b });
+    if (damp) {
       const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
       r = (lum + (r - lum) * damp.chroma) * damp.energy;
       g = (lum + (g - lum) * damp.chroma) * damp.energy;
@@ -16366,36 +17085,26 @@ export class GISystem {
     // and rebuilds + re-uploads the whole tree every frame the camera turns —
     // found by the W5a gate, which saw two records jump 8.5 units on a 2.5
     // unit move (a permutation, not a motion).
-    const STRIDE = 20;
     const cache = (this._lightTreePoseCache ??= new WeakMap());
     let changed = this._lightTreePoseCount !== meshes.length;
     this._lightTreePoseCount = meshes.length;
     for (const mesh of meshes) {
       let row = cache.get(mesh);
       if (!row) {
-        row = new Float32Array(STRIDE);
+        row = new Float32Array(EMITTER_POSE_STRIDE);
         row[19] = NaN;
         cache.set(mesh, row);
         changed = true;
       }
       const e = mesh.matrixWorld.elements;
-      for (let k = 0; k < 16; k++) {
-        if (Math.abs(row[k] - e[k]) > 1e-5) changed = true;
-        row[k] = e[k];
-      }
       const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
       const emissive = material?.emissive;
       const gain = material?.emissiveIntensity ?? 1;
       const rgb = [(emissive?.r ?? 0) * gain, (emissive?.g ?? 0) * gain, (emissive?.b ?? 0) * gain];
-      for (let k = 0; k < 3; k++) {
-        if (Math.abs(row[16 + k] - rgb[k]) > 1e-6) changed = true;
-        row[16 + k] = rgb[k];
-      }
       const instances = mesh.isInstancedMesh
         ? mesh.count * 4096 + (mesh.instanceMatrix?.version ?? 0)
         : (mesh.visible === false ? -1 : 1);
-      if (row[19] !== instances) changed = true;
-      row[19] = instances;
+      if (refreshEmitterPoseSignature(row, e, rgb, instances)) changed = true;
     }
     if (!changed) return;
     try {
@@ -16625,8 +17334,9 @@ export class GISystem {
     // mesh's damped area) and boost the colour by 1/fill, so
     // 4π·r'²·L' = 4π·r²·L·fill = the mesh's true Φ. One seat, the SUM power,
     // a per-ball-sized body — never a giant sphere with one ball's colour.
-    const consolidateSparse = (slot, mesh) => {
+    const consolidateSparse = (slot, mesh, info = null) => {
       const fill = this._emitterFillByMesh?.get(mesh) ?? 1;
+      if (info) info._seatFill = fill;
       if (!(fill < 0.999)) return;
       const shrink = Math.sqrt(Math.max(fill, 1e-6));
       slot.radius.value *= shrink;
@@ -16653,6 +17363,7 @@ export class GISystem {
     const live = (this._emitterSlotLive ??= []);
     const publishGone = (i, slot, key) => {
       slot.radius.value = 0;
+      slot.owner.value = 0xffffffff;
       const wasLive = live[i] === true;
       slot.moved.value = wasLive ? 1 : 0;
       if (wasLive) logSpike(i, 1, "emitter gone");
@@ -16688,6 +17399,7 @@ export class GISystem {
         slot.kind.value = 0;
         slot.reff.value = shape.radius;
         slot.exHalf.value.setScalar(shape.radius);
+        slot.owner.value = 0xffffffff;
         publishMoved(i, slot, info.provider, false);
         continue;
       }
@@ -16698,6 +17410,13 @@ export class GISystem {
         publishGone(i, slot, info.mesh);
         continue;
       }
+      // The soup owner is stable for a placement. A mover promoted from the
+      // static set remains globally excluded there; once it settles into an
+      // appended exact-shadow segment, prefer that segment's fresh owner.
+      // Pinned/dynamic-only meshes have no soup owner and use UINT_MAX.
+      slot.owner.value = this._gi2SettledSlotOf?.get(info.mesh)
+        ?? this._gi2StaticOwnerOf?.get(slotKeyOf(info.mesh, info.instanceId))
+        ?? 0xffffffff;
       const geometry = info.mesh.geometry;
       // ── §18.15: THE SEATS TAKE THE LIGHT TREE'S FILL DAMPING ───────────────
       //
@@ -16731,6 +17450,55 @@ export class GISystem {
       // consolidation below re-prices it ONCE, against the shape the seat
       // actually carries, so power bookkeeping happens in one place.
       slot.color.value.setRGB(info.r, info.g, info.b);
+      info._seatFill = undefined;
+      // A LONG EMISSIVE SURFACE KEEPS ITS SPATIAL SUPPORT. Sparse consolidation
+      // intentionally shrinks a whole mesh isotropically to one equivalent
+      // bulb; doing that to a sign turns metres of authored light into a point
+      // at its centre. `surfaceSeat` is a cached local-space partition minted by
+      // #chooseEmitterSeats. Its groups cover every source triangle exactly
+      // once, and each group's radiance is reduced by true-area / fitted-area,
+      // so the sum of the four-slot model preserves Phi without copying energy.
+      if (info.surfaceSeat) {
+        const group = info.surfaceSeat;
+        const localCenter = scratchPos.set(
+          (group.localMin[0] + group.localMax[0]) * 0.5,
+          (group.localMin[1] + group.localMax[1]) * 0.5,
+          (group.localMin[2] + group.localMax[2]) * 0.5,
+        );
+        slot.center.value.copy(localCenter).applyMatrix4(info.mesh.matrixWorld);
+        const e = info.mesh.matrixWorld.elements;
+        const axes = [slot.bx.value, slot.by.value, slot.bz.value];
+        const localHalf = [
+          (group.localMax[0] - group.localMin[0]) * 0.5,
+          (group.localMax[1] - group.localMin[1]) * 0.5,
+          (group.localMax[2] - group.localMin[2]) * 0.5,
+        ];
+        const halfWorld = [0.005, 0.005, 0.005];
+        for (let a = 0; a < 3; a++) {
+          col.set(e[a * 4], e[a * 4 + 1], e[a * 4 + 2]);
+          const len = col.length();
+          if (len > 1e-8) axes[a].copy(col).divideScalar(len);
+          else axes[a].set(a === 0 ? 1 : 0, a === 1 ? 1 : 0, a === 2 ? 1 : 0);
+          halfWorld[a] = Math.max(localHalf[a] * len, 0.005);
+        }
+        const [hx, hy, hz] = halfWorld;
+        slot.kind.value = 1;
+        slot.half.value.set(hx, hy, hz);
+        slot.exHalf.value.set(hx, hy, hz);
+        slot.radius.value = Math.hypot(hx, hy, hz);
+        slot.reff.value = Math.sqrt(((hx * hy + hy * hz + hz * hx) * 2) / Math.PI);
+        const crossSection = 4 * Math.max(hx * hy, hy * hz, hz * hx);
+        const admittedArea = this._emitterAdmissionByMesh?.get(info.mesh)?.area;
+        // Admission runs before seating. The local-area scale fallback only
+        // protects a non-fatal failed scan; it deliberately fails toward light.
+        const approxArea = Math.max(1e-12,
+          (group.areaFraction ?? 1) * (admittedArea ?? crossSection));
+        const fill = Math.min(1, approxArea / Math.max(crossSection, 1e-12));
+        slot.color.value.multiplyScalar(fill);
+        info._seatFill = fill;
+        publishMoved(i, slot, info.motionKey ?? info.mesh, true);
+        continue;
+      }
       // SHAPE. fitEmitterShape (emitterShapes.js) maps every default three
       // geometry to its analytic kind — sphere, capsule, cylinder, frustum/
       // cone, disc/ring, torus, equal-area spheres for the polyhedra — from
@@ -16749,7 +17517,7 @@ export class GISystem {
         slot.bz.value.copy(emitterFitScratch.bz);
         slot.reff.value = emitterFitScratch.reff;
         slot.exHalf.value.copy(emitterFitScratch.exHalf);
-        consolidateSparse(slot, info.mesh);
+        consolidateSparse(slot, info.mesh, info);
         publishMoved(i, slot, info.mesh, true);
         continue;
       }
@@ -16789,7 +17557,7 @@ export class GISystem {
       // disc-equivalent radius drives penumbra k and glow energy.
       const [hx, hy, hz] = halfWorld;
       slot.reff.value = Math.sqrt(((hx * hy + hy * hz + hz * hx) * 2) / Math.PI);
-      consolidateSparse(slot, info.mesh);
+      consolidateSparse(slot, info.mesh, info);
       publishMoved(i, slot, info.mesh, true);
     }
     // SRC's motion-adaptive α (§12.38) reads the emitter half of "is the
@@ -16810,7 +17578,9 @@ export class GISystem {
       const damped = [];
       for (let i = 0; i < state.emitterSlots.length; i++) {
         const mesh = infos[i]?.mesh;
-        const fill = mesh ? this._emitterFillByMesh?.get(mesh) : undefined;
+        const fill = mesh
+          ? (infos[i]?._seatFill ?? this._emitterFillByMesh?.get(mesh))
+          : undefined;
         if (fill !== undefined && fill < 0.999) damped.push(`${i}:${fill.toExponential(1)}`);
       }
       const key = damped.join(",");
@@ -16828,21 +17598,17 @@ export class GISystem {
           const info = infos[i];
           const mesh = info?.mesh;
           if (!mesh) { meta.push(null); continue; }
-          const geom = mesh.geometry;
-          if (!geom.boundingSphere) geom.computeBoundingSphere();
-          mesh.matrixWorld.decompose(scratchPos, scratchQuat, scratchScale);
-          const bs = geom.boundingSphere.radius
-            * Math.max(scratchScale.x, scratchScale.y, scratchScale.z, 1e-6);
-          const center = new THREE.Vector3()
-            .copy(geom.boundingSphere.center).applyMatrix4(mesh.matrixWorld);
+          const slot = state.emitterSlots[i];
+          const center = slot.center.value;
           meta.push({
             slot: i,
             name: mesh.name || mesh.type,
             pos: [+center.x.toFixed(2), +center.y.toFixed(2), +center.z.toFixed(2)],
-            bsRadius: +bs.toFixed(2),
+            bsRadius: +(slot.radius.value ?? 0).toFixed(2),
             emissive: [+(info.r ?? 0).toFixed(3), +(info.g ?? 0).toFixed(3), +(info.b ?? 0).toFixed(3)],
             tris: info.tris ?? null,
-            fill: +((this._emitterFillByMesh?.get(mesh) ?? 1).toPrecision(3)),
+            fill: +((info._seatFill ?? this._emitterFillByMesh?.get(mesh) ?? 1).toPrecision(3)),
+            surfacePart: info.surfaceSeat?.id ?? null,
           });
         }
         this._emitterSeatMeta = meta;
@@ -16935,7 +17701,8 @@ export class GISystem {
       // cascades happily traced light through.
       if (object.isMesh && !object.userData.__giDebug) {
         const position = object.geometry?.attributes?.position;
-        const material = Array.isArray(object.material) ? object.material[0] : object.material;
+        const mats = Array.isArray(object.material) ? object.material : [object.material];
+        const material = mats[0];
         const triCount = (object.geometry?.index?.count ?? position?.count ?? 0) / 3;
         // Editor-only helpers live on layer 31 (mask compared unsigned —
         // 1<<31 is negative in JS int32). UI quads are excluded for the same
@@ -16956,7 +17723,6 @@ export class GISystem {
         // EVERY lit material must be visible to three's NodeMaterialObserver
         // as "node-driven" — see #markObservedMaterial. GI light receivers
         // include meshes the FIELD skips (transparent etc.), so mark all.
-        const mats = Array.isArray(object.material) ? object.material : [object.material];
         let readsReflection = false;
         // §18 R8a — the SHARP subset, bucket 0 only. `readsReflection` (0 or 3)
         // is nearly every material on an imported scene and is therefore
@@ -17069,7 +17835,9 @@ export class GISystem {
         // A volume's bounding box is a participating medium, not a surface —
         // baking it into the SDF field would make a fog box shadow the room
         // like a solid crate.
-        const isVolume = material?.isVolumeNodeMaterial || material?.userData?.isVolumeMaterial;
+        const participates = (m) => !!m && !m.transparent
+          && !m.isVolumeNodeMaterial && !m.userData?.isVolumeMaterial;
+        const hasParticipatingMaterial = mats.some(participates);
         // §19 Stage 4.0b — SAY WHAT THE TRANSPARENCY GUARD COSTS. The guard
         // below is KEPT (a transparent surface is not an occluder, and
         // voxelizing glass would seal every window in the scene), but a
@@ -17079,13 +17847,14 @@ export class GISystem {
         // can act on rather than as an emitter that mysteriously does nothing.
         // The node's PRESENCE only, no resolve: this runs per mesh on every
         // 250 ms scan and must not walk a shader graph.
-        if (position && material?.transparent && !isVolume && !editorOnly
-          && (material.emissiveNode
-            || (material.emissive && (material.emissiveIntensity ?? 1) > 0
-              && (material.emissive.r + material.emissive.g + material.emissive.b) > 1e-4))) {
+        if (position && !editorOnly && mats.some((m) => m?.transparent
+          && !m.isVolumeNodeMaterial && !m.userData?.isVolumeMaterial
+          && (m.emissiveNode
+            || (m.emissive && (m.emissiveIntensity ?? 1) > 0
+              && (m.emissive.r + m.emissive.g + m.emissive.b) > 1e-4)))) {
           transparentEmissive++;
         }
-        if (position && material && !material.transparent && !isVolume && !editorOnly && triCount <= MAX_TRIS_PER_MESH) {
+        if (position && hasParticipatingMaterial && !editorOnly && triCount <= MAX_TRIS_PER_MESH) {
           // §R.2. `meshes` = what is DRAWN (proxy in, member out) — unchanged.
           // `gi2Source` = what OWNS the triangles (member in, proxy out), and
           // that set does not move when merging commits or rebuilds.
@@ -17102,7 +17871,7 @@ export class GISystem {
             for (let i = 0; i < u.length; i += 4) h = (Math.imul(h, 31) + u.charCodeAt(i)) >>> 0;
             gi2SourceHash = h;
           }
-        } else if (triCount > MAX_TRIS_PER_MESH) {
+        } else if (hasParticipatingMaterial && triCount > MAX_TRIS_PER_MESH) {
           console.warn(`[gi] skipping "${object.name || "mesh"}" (${Math.round(triCount)} tris > cap)`);
         }
       }
@@ -17305,7 +18074,11 @@ export class GISystem {
   // light-list churn, and auto-fit drift.
 
   #queueRebakeCheck() {
-    this._frame = -1; // forces the next tick's modulo to hit
+    // Do not touch `_frame`: it is also GI2's temporal/RC phase clock. A
+    // dedicated latch coalesces an event burst while leaving that clock
+    // monotonic. `#checkFingerprint` clears the latch only after it has either
+    // scanned or proved that the content-key bump was transform-only.
+    this._fingerprintDue = true;
   }
 
   #checkFingerprint() {
@@ -17341,7 +18114,13 @@ export class GISystem {
     const contentKey = this.engine?.content;
     const auditMs = Number(globalThis.__giScanAuditMs ?? 2000);
     const auditDue = !(auditMs > 0) || nowMs - (this._lastScanAuditAt ?? 0) >= auditMs;
-    const scanFresh = !!contentKey && this._scanContentVersion === contentKey.version && !auditDue;
+    // Transform changes are consumed by `#refreshGi2Movers` (or the legacy
+    // slot-matrix path) every frame. They must not invalidate the expensive
+    // mesh/material walk. Compare only the axes that walk actually reads;
+    // hierarchy bumps move all three in SceneContentKey, while a pure
+    // `transforms` bump leaves them unchanged.
+    const contentAxes = giFingerprintContentAxes(contentKey);
+    const scanFresh = giFingerprintContentFresh(this._scanContentAxes, contentKey, auditDue);
 
     // A material became a mirror while reflections were gated off for want of
     // one (`#hasReflectionConsumer`). Rebuild so the prepass exists — this is
@@ -17451,7 +18230,14 @@ export class GISystem {
     // delivery model `#emitterSeatsFollowCamera()` is false, so the scan is
     // skipped outright; on the camera-ranked arm it still runs every 250 ms,
     // exactly as before.
-    if (scanFresh && !this.#emitterSeatsFollowCamera()) return;
+    if (scanFresh && !this.#emitterSeatsFollowCamera()) {
+      // A transform-only notification has now been acknowledged. Recording
+      // the aggregate version keeps the slow audit's disagreement test honest
+      // without pretending a mesh/material scan ran.
+      this._scanContentVersion = contentKey.version;
+      this._fingerprintDue = false;
+      return;
+    }
     // Snapshotted BEFORE the walk: `#syncSlots` / `#refreshOccupancyContent`
     // below can themselves bump the key, and recording the post-walk value
     // would mark this scan as having covered a change it never saw.
@@ -17459,6 +18245,9 @@ export class GISystem {
     this._lastScanAuditAt = nowMs;
 
     const meshes = this.#collectMeshes();
+    const gi2TopologyNext = GI2_PATH
+      ? gi2SoupTopologyKey(this._gi2SourceMeshes ?? meshes)
+      : null;
     // Refresh the light LIST here (cadence); uniforms read live per frame.
     this._lightObjects = this.#collectLightObjects();
     // Camera-cadence emitter seat re-rank. The seat score is apparent
@@ -17483,11 +18272,15 @@ export class GISystem {
       // nothing to do — seats are scene-anchored
     } else if ((this._emitterCands?.length ?? 0) > MAX_EMITTERS) {
       const seats = this.#chooseEmitterSeats(this._emitterCands);
-      const current = this._promotedEmitterMeshes ?? [];
-      seatsChanged = seats.some((cand, i) => (cand?.mesh ?? null) !== (current[i] ?? null));
+      const current = this._promotedEmitterSeatKeys ?? this._promotedEmitterMeshes ?? [];
+      seatsChanged = seats.some((cand, i) =>
+        (cand?.seatKey ?? cand?.mesh ?? null) !== (current[i] ?? null));
     }
     const fingerprint = this.#computeFingerprint(meshes);
     const contentChanged = fingerprint !== this._fingerprint;
+    const gi2Update = GI2_PATH
+      ? gi2SoupUpdateKind(this._gi2SoupTopologySig, gi2TopologyNext, contentChanged || seatsChanged)
+      : "none";
     // ── §19 STAGE 4.3b (§R.2) — THE RECEIPT THAT THE MERGE DID NOT MOVE GI2 ──
     //
     // A merge commit or rebuild swaps the DRAWN meshes (members hidden, one
@@ -17525,7 +18318,9 @@ export class GISystem {
       contentKey.auditDisagreed("gi.meshScan");
     }
     this._scanContentVersion = scannedVersion;
-    if (!contentChanged && !seatsChanged) return;
+    this._scanContentAxes = contentAxes;
+    this._fingerprintDue = false;
+    if (!contentChanged && !seatsChanged && gi2Update === "none") return;
     this._fingerprint = fingerprint;
     // Mesh set / material / geometry change: rebuild the entry list and
     // reconcile slots. Cheap (no geometry copies unless a bake is needed),
@@ -17537,7 +18332,18 @@ export class GISystem {
     // A live material edit, or a seat/admission flip, changes what
     // `#gi2SlotEmissive` answers for a placement whose CLASS BYTE is unchanged
     // — so the table moves and the world does not have to.
-    if (GI2_PATH) this.#retintGi2Palette("content-scan");
+    if (GI2_PATH && gi2Update === "rebuild") {
+      // Groups and active material slots are baked into triangleSoup.worker's
+      // per-triangle palette/visibility bytes. A uniform re-tint cannot change
+      // either, so rebuild the soup in place; the existing transport remains
+      // live while the sliced pack + worker run complete.
+      this._gi2SoupTopologySig = gi2TopologyNext;
+      this.#startGi2Build(this._gi2SourceMeshes ?? meshes, state.screen?.gi2);
+    } else if (GI2_PATH) {
+      // Plain colour/emissive changes keep the topology key and stay on the
+      // cheap class-table rewrite: no worker, no re-voxelize.
+      this.#retintGi2Palette("content-scan");
+    }
     // ⚠ A SEAT RE-RANK MUST NOT REBUILD THE BVH (2026-08-16).
     //
     // The seat flip used to be signalled by `this._fingerprint = null`, which
@@ -17847,39 +18653,46 @@ export class GISystem {
       mix(mesh.id);
       // Resolve through colorNode/emissiveNode (same path the slot surfaces
       // use) so shader-graph/material-asset color edits fingerprint.
-      const surface = resolveMaterialSurface(mesh.material);
-      mixFloat(surface.color.r);
-      mixFloat(surface.color.g);
-      mixFloat(surface.color.b);
-      mixFloat(surface.emissive.r * surface.emissiveIntensity);
-      mixFloat(surface.emissive.g * surface.emissiveIntensity);
-      mixFloat(surface.emissive.b * surface.emissiveIntensity);
+      const materials = Array.isArray(mesh.material) && mesh.material.length
+        ? mesh.material
+        : [mesh.material];
+      mix(materials.length);
+      for (const material of materials) {
+        const surface = resolveMaterialSurface(material, mesh.name);
+        mixFloat(surface.color.r);
+        mixFloat(surface.color.g);
+        mixFloat(surface.color.b);
+        mixFloat(surface.emissive.r * surface.emissiveIntensity);
+        mixFloat(surface.emissive.g * surface.emissiveIntensity);
+        mixFloat(surface.emissive.b * surface.emissiveIntensity);
+      }
       mix(mesh.geometry?.id ?? 0);
       mix(mesh.geometry?.attributes?.position?.version ?? 0);
-      // ── §19 6.23 — AN EMITTER'S WORLD SCALE IS CONTENT, NOT A TRANSFORM ──
-      //
-      // Translation and rotation are the per-frame uniform path
-      // (`#refreshEmitterSlots` re-fits the seat from the live matrix every
-      // frame). SCALE is different in kind: the emitting AREA is a function of
-      // it, and so is everything `#buildEntries` derives from the area once —
-      // the admission gate Φ = π·A·L (`collectEmitters`), the fill, the ledger,
-      // the light-tree records, the GI2 palette's per-voxel emission. MEASURED
-      // (`test:gi-scaled-lamp`, Cornell, lamp ×2): the seat followed (reff
-      // 0.757 → 1.514) while the ledger still read the build-time 7.2 m², so a
-      // lamp scaled UNDER the gate kept lighting and one scaled OVER it never
-      // started. Mixing the scale here routes a scale change through the same
-      // content path a material edit takes. Quantised to ~2 % steps of the
-      // area so a gizmo drag re-derives at the scan cadence, not per ulp; only
-      // emitters pay, and only three column lengths each.
-      if (!mesh.isInstancedMesh
-          && (surface.emissive.r + surface.emissive.g + surface.emissive.b) * surface.emissiveIntensity > 0) {
-        const e = mesh.matrixWorld.elements;
-        const sx = Math.hypot(e[0], e[1], e[2]);
-        const sy = Math.hypot(e[4], e[5], e[6]);
-        const sz = Math.hypot(e[8], e[9], e[10]);
-        const area = sx * sy + sy * sz + sz * sx;
-        mix(Math.round(Math.log2(Math.max(area, 1e-9)) * 32));
+      // Group edits change which palette byte each triangle receives without
+      // touching position.version. They are GI content and must wake the same
+      // rebuild/retint path as a material edit.
+      const groups = mesh.geometry?.groups ?? [];
+      mix(groups.length);
+      for (const group of groups) {
+        mix(Math.floor(group?.start ?? 0));
+        mix(Math.floor(group?.count ?? 0));
+        mix(Math.floor(group?.materialIndex ?? 0));
       }
+      // Transparent/volume slots are omitted from the soup. Toggling one is a
+      // triangle-topology edit even when the material array identity and every
+      // resolved colour remain unchanged.
+      for (const material of materials) {
+        mix(material && !material.transparent
+          && !material.isVolumeNodeMaterial
+          && !material.userData?.isVolumeMaterial ? 1 : 0);
+      }
+      // Emitter scale is deliberately NOT structural content. The four
+      // analytic slots read matrixWorld every frame, while #refreshLightTree's
+      // 20-float signature includes all matrix columns and re-runs the exact
+      // area/admission fit on a scale delta. Hashing scale here made a gizmo
+      // drag fall into #buildEntries + #refreshOccupancyContent on the slow
+      // audit cadence, producing a periodic main-thread freeze for an answer
+      // the live path had already computed.
       // §19 6.22: GI Mobility is read at BUILD (static soup vs dynamic layer),
       // so a change of it is a change of content — the rebuild re-classifies.
       mix(giMobilityOf(mesh) === "static" ? 1 : giMobilityOf(mesh) === "dynamic" ? 2 : 3);
@@ -18450,6 +19263,8 @@ export class GISystem {
    * precisely what the soup is a function of.
    */
   #startGi2Build(meshes, gi2) {
+    if (!gi2) return;
+    this._gi2SoupTopologySig = gi2SoupTopologyKey(meshes);
     // ⭐⭐ §19 STAGE 6.7 — THE PACK IS SLICED ACROSS FRAMES.
     //
     // Everything below used to run in ONE synchronous frame at the end of
@@ -18600,12 +19415,23 @@ export class GISystem {
     // §19 6.21 — mesh → its static placement slot(s), so a promotion can drop
     // the mesh's triangles from the exact-shadow tree the frame it moves.
     const slotOf = new Map();
-    for (const p of staticPlacements) { if (p.mesh && Number.isFinite(p.slot)) (slotOf.get(p.mesh) ?? slotOf.set(p.mesh, []).get(p.mesh)).push(p.slot); }
+    const ownerOf = new Map();
+    for (const p of staticPlacements) {
+      if (!p.mesh || !Number.isFinite(p.slot)) continue;
+      (slotOf.get(p.mesh) ?? slotOf.set(p.mesh, []).get(p.mesh)).push(p.slot);
+      ownerOf.set(slotKeyOf(p.mesh, p.instanceId), p.slot);
+    }
     this._gi2StaticSlotOf = slotOf;
+    this._gi2StaticOwnerOf = ownerOf;
     this._gi2SettledSlotOf = null; // 6.34b — a real build re-reads every placement at its pose
     const excludedSlots = [];
     for (const mesh of moverMeshes) if (!heldOut.has(mesh)) for (const slot of slotOf.get(mesh) ?? []) excludedSlots.push(slot);
-    const soupKey = `${geometries.length}:${staticPlacements.length}:${parts.join(",")}`;
+    // Group ranges and active material slots decide both which triangles enter
+    // the soup and which palette byte each retained triangle receives. They are
+    // therefore geometry-cache facts, unlike albedo/emissive values (uniform
+    // re-tint only), and must participate in the worker cache key.
+    const topologyKey = gi2SoupTopologyKey(staticPlacements);
+    const soupKey = `${geometries.length}:${staticPlacements.length}:${parts.join(",")}|${topologyKey}`;
     // §19 Stage 4.0b: the join a re-tint needs — key → the mesh whose material
     // it re-resolves and the AREA it was weighted with. Held here (not on the
     // occupancy field, which GI2 does not build) and replaced with the build.
@@ -18760,23 +19586,63 @@ export class GISystem {
   #gi2PaletteOne(ctx, p) {
     const { entryOf, surfaceOf, box, size } = ctx;
     {
-      let s = surfaceOf.get(p.mesh);
-      if (!s) {
-        const raw = resolveMaterialSurface(p.mesh.material, p.mesh.name);
-        const mat = Array.isArray(p.mesh.material) ? p.mesh.material[0] : p.mesh.material;
-        // "Is this an emitter class" — a fact about the MATERIAL's shape, not
-        // about how bright it currently resolves.
-        const authored = Math.max(raw.emissive.r ?? 0, raw.emissive.g ?? 0, raw.emissive.b ?? 0)
-          * (raw.emissiveIntensity ?? 1);
-        s = {
-          albedo: [raw.color.r, raw.color.g, raw.color.b],
-          emitter: authored > 1e-4 || !!raw.emissivePending,
-          matKey: mat?.uuid ?? p.mesh.uuid,
-        };
-        surfaceOf.set(p.mesh, s);
-      }
       const key = slotKeyOf(p.mesh, p.instanceId);
       const entry = entryOf.get(key);
+      let cached = surfaceOf.get(p.mesh);
+      if (!cached) {
+        const materials = Array.isArray(p.mesh.material) && p.mesh.material.length
+          ? p.mesh.material
+          : [p.mesh.material];
+        const materialActive = materials.map((mat) => !!mat && !mat.transparent
+          && !mat.isVolumeNodeMaterial && !mat.userData?.isVolumeMaterial);
+        const drawCount = p.mesh.geometry?.index?.count ?? p.mesh.geometry?.attributes?.position?.count ?? 0;
+        const triCount = Math.max(0, Math.floor(drawCount / 3));
+        const counts = new Array(materials.length).fill(0);
+        // Match triangleSoup.worker: sorted, non-overlapping ranges; gaps and
+        // invalid material slots use slot 0.
+        const ranges = (p.mesh.geometry?.groups ?? []).map((g) => ({
+          start: Math.min(triCount, Math.floor(Math.max(0, Number(g?.start) || 0) / 3)),
+          end: Math.min(triCount, Math.ceil((Math.max(0, Number(g?.start) || 0) + Math.max(0, Number(g?.count) || 0)) / 3)),
+          materialIndex: Math.max(0, Math.floor(Number(g?.materialIndex) || 0)),
+        })).filter((g) => g.end > g.start)
+          .sort((a, b) => (a.start - b.start) || (a.end - b.end) || (a.materialIndex - b.materialIndex));
+        let cursor = 0;
+        for (const g of ranges) {
+          if (g.start > cursor) counts[0] += g.start - cursor;
+          const from = Math.max(cursor, g.start);
+          const to = Math.max(from, g.end);
+          counts[g.materialIndex < materials.length ? g.materialIndex : 0] += to - from;
+          cursor = Math.max(cursor, g.end);
+        }
+        if (cursor < triCount) counts[0] += triCount - cursor;
+        if (!ranges.length || triCount === 0) counts[0] = Math.max(1, triCount);
+        const areaShares = estimateMaterialAreaShares(p.mesh.geometry, materials.length);
+        // Gaps/invalid slots were counted into slot 0, so it is present exactly
+        // when the worker can use its fallback. Fully covered unused slots cost
+        // no scarce palette class.
+        const slots = materials.map((mat, materialIndex) => {
+          if (counts[materialIndex] <= 0) return null;
+          const raw = resolveMaterialSurface(mat, p.mesh.name);
+          const authored = Math.max(raw.emissive.r ?? 0, raw.emissive.g ?? 0, raw.emissive.b ?? 0)
+            * (raw.emissiveIntensity ?? 1);
+          return {
+            materialIndex,
+            share: Math.max(1e-6, areaShares[materialIndex] ?? 0),
+            albedo: [raw.color.r, raw.color.g, raw.color.b],
+            rawEmissive: [
+              (raw.emissive.r ?? 0) * (raw.emissiveIntensity ?? 1),
+              (raw.emissive.g ?? 0) * (raw.emissiveIntensity ?? 1),
+              (raw.emissive.b ?? 0) * (raw.emissiveIntensity ?? 1),
+            ],
+            emitter: authored > 1e-4 || !!raw.emissivePending,
+            matKey: mat?.uuid ?? `${p.mesh.uuid}:${materialIndex}`,
+            participates: materialActive[materialIndex],
+          };
+        }).filter(Boolean);
+        cached = { slots, materialActive };
+        surfaceOf.set(p.mesh, cached);
+      }
+      const { slots, materialActive } = cached;
       const bb = p.mesh.geometry?.boundingBox
         ?? (p.mesh.geometry?.computeBoundingBox?.(), p.mesh.geometry?.boundingBox);
       let area = 1;
@@ -18785,13 +19651,45 @@ export class GISystem {
         box.getSize(size);
         area = 2 * (size.x * size.y + size.y * size.z + size.z * size.x);
       }
-      return {
-        ...p, key,
+      const paletteSurfaces = slots.filter((s) => s.participates).map((s) => ({
         albedo: s.albedo,
-        emissive: this.#gi2SlotEmissive(entry),
-        area,
+        // Every material range follows the mesh's admission and sub-cell
+        // policy; otherwise dim sub-materials bypass the power gate and return
+        // as isolated coloured speckles in the voxel field.
+        emissive: s.materialIndex === 0
+          ? this.#gi2SlotEmissive(entry)
+          : this.#gi2GroupedEmissive(entry, s.rawEmissive),
+        area: area * s.share,
         emitter: s.emitter,
         matKey: s.matKey,
+        key,
+        materialIndex: s.materialIndex,
+      }));
+      const primary = paletteSurfaces.find((s) => s.materialIndex === 0) ?? paletteSurfaces[0];
+      // A material array may contain an opaque UNUSED slot while every group
+      // the geometry actually draws is transparent/volume. Keep the placement
+      // structurally valid; `materialActive` makes the worker emit zero tris.
+      if (!primary) {
+        return {
+          ...p, key,
+          albedo: [0.5, 0.5, 0.5],
+          emissive: [0, 0, 0],
+          area,
+          emitter: false,
+          matKey: `${p.mesh.uuid}:inactive`,
+          paletteSurfaces: [],
+          materialActive,
+        };
+      }
+      return {
+        ...p, key,
+        albedo: primary.albedo,
+        emissive: primary.emissive,
+        area,
+        emitter: primary.emitter,
+        matKey: primary.matKey,
+        paletteSurfaces,
+        materialActive,
       };
     }
   }
@@ -18817,11 +19715,12 @@ export class GISystem {
    *      seat/admission flip, which changes what `#gi2SlotEmissive` answers for
    *      a placement whose class byte is unchanged.
    *
-   * ⚠ `soupKey` has NO material term, and that is CORRECT while the class
-   * assignment depends only on static facts (see `#gi2PaletteSurfaces`). If
-   * anyone ever makes the assignment depend on a value that can change, the
-   * soup key has to gain that term or the palette silently desynchronises from
-   * the voxels.
+   * ⚠ `soupKey` includes material TOPOLOGY (draw groups and participating-slot
+   * bits) because those facts choose each triangle's class/membership. It
+   * deliberately excludes palette VALUES, so colour/emissive edits stay on
+   * this uniform-only path. If assignment ever depends on another mutable
+   * value, that value must join the soup key or the palette silently
+   * desynchronises from the voxels.
    */
   #retintGi2Palette(reason) {
     const gi2 = this.state?.screen?.gi2;
@@ -18847,11 +19746,23 @@ export class GISystem {
       if (key == null || !(cls >= 0) || cls >= assign.classCount) continue;
       const rec = meshByKey.get(key);
       if (!rec?.mesh?.parent) continue;
-      let s = surfaceOf.get(rec.mesh);
+      const materialIndex = Math.max(0, Math.floor(assign.materialSlots?.[i] ?? 0));
+      const surfaceKey = `${rec.mesh.uuid}:${materialIndex}`;
+      let s = surfaceOf.get(surfaceKey);
       if (!s) {
-        const raw = resolveMaterialSurface(rec.mesh.material, rec.mesh.name);
-        s = { albedo: [raw.color.r, raw.color.g, raw.color.b] };
-        surfaceOf.set(rec.mesh, s);
+        const materials = Array.isArray(rec.mesh.material) && rec.mesh.material.length
+          ? rec.mesh.material
+          : [rec.mesh.material];
+        const raw = resolveMaterialSurface(materials[materialIndex] ?? materials[0], rec.mesh.name);
+        s = {
+          albedo: [raw.color.r, raw.color.g, raw.color.b],
+          rawEmissive: [
+            (raw.emissive.r ?? 0) * (raw.emissiveIntensity ?? 1),
+            (raw.emissive.g ?? 0) * (raw.emissiveIntensity ?? 1),
+            (raw.emissive.b ?? 0) * (raw.emissiveIntensity ?? 1),
+          ],
+        };
+        surfaceOf.set(surfaceKey, s);
       }
       // ⛔⛔ NO ENTRY MEANS **UNKNOWN**, AND UNKNOWN MUST NOT MEAN ZERO.
       //
@@ -18873,9 +19784,11 @@ export class GISystem {
       // emissive it already has.
       const entry = entryOf.get(key);
       const a = acc[cls];
-      const w = Math.max(1e-6, rec.area ?? 1);
+      const w = Math.max(1e-6, assign.weights?.[i] ?? rec.area ?? 1);
       if (entry) {
-        const em = this.#gi2SlotEmissive(entry);
+        const em = materialIndex === 0
+          ? this.#gi2SlotEmissive(entry)
+          : this.#gi2GroupedEmissive(entry, s.rawEmissive);
         a.we += w;
         a.er += w * em[0]; a.eg += w * em[1]; a.eb += w * em[2];
       } else {
@@ -19400,7 +20313,15 @@ export class GISystem {
       if (!record) return true;
       if (!seen.has(record.geometryKey)) {
         seen.add(record.geometryKey);
-        geometries.push({ key: record.geometryKey, positions: record.positions, index: record.index, uvs: record.uvs });
+        geometries.push({
+          key: record.geometryKey,
+          positions: record.positions,
+          index: record.index,
+          uvs: record.uvs,
+          // CPU-only draw ranges used by the GI2 soup worker to choose the
+          // existing per-triangle palette byte. No GPU geometry layout changes.
+          groups: record.groups,
+        });
       }
       for (const instanceId of this.#placementsOf(mesh)) {
         if (placements.length >= cap) break;
