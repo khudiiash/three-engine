@@ -146,7 +146,20 @@ import {
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
-import { BIN_SG, BIN_SR, BIN_WORDS, PAYLOAD_SEED_BASE, PAYLOAD_WORDS } from "./srcDeposit.js";
+import { BIN_COUNT, BIN_SG, BIN_SR, BIN_WORDS, DEPOSIT_SCALE, PAYLOAD_SEED_BASE, PAYLOAD_WORDS, PRIOR_AGE, PRIOR_SAMPLES, PRIOR_W_BASE } from "./srcDeposit.js";
+
+/** §19 6.32c — decode a prior-mode payload `w` (srcDeposit PRIOR_W_BASE) into { T, conf }. Caller has checked w >= 0. */
+export function decodePriorW(w) {
+  const legacy = w.lessThan(float(PRIOR_W_BASE)).toVar();
+  const q = floor(w.sub(float(PRIOR_W_BASE)).div(4)).max(0).toVar();
+  const conf = select(legacy, float(1), w.sub(float(PRIOR_W_BASE)).sub(q.mul(4)).clamp(0, 1)).toVar();
+  const T = select(legacy, w, q.div(255)).clamp(0, 1).toVar();
+  return { T, conf };
+}
+/** §19 6.32c — encode { T, conf } into the prior-mode payload `w`. */
+export function encodePriorW(T, conf) {
+  return float(PRIOR_W_BASE).add(conf.clamp(0, 1)).add(floor(T.clamp(0, 1).mul(255).add(0.5)).mul(4));
+}
 import {
   FLAG_ALIVE,
   PROBE_BLOCK,
@@ -297,6 +310,17 @@ export function createSrcMergeFrame(store, bins, {
    * caller, every gate fixture) builds the pre-6.19d WGSL byte for byte.
    */
   changeReset = null,
+  /**
+   * §19 6.32 — `{ scratch }` arms THE PARENT PRIOR: every bin with a parent
+   * is written `(1 − m)·parentCone + m·own`, m = min(count/PRIOR_SAMPLES, 1)
+   * read from the deposit's `BIN_COUNT` word, and is marked MEASURED. A bin
+   * with no samples IS the parent's cone at full weight (not age-ramped —
+   * c1/c2 are world-anchored and persist, so the prior is spatially smooth
+   * across every c0 tile born this frame), and its own rays fade the
+   * DIFFERENCE in as they land. A settled bin (count ≥ PRIOR_SAMPLES) writes
+   * bit-identically to the pre-6.32 merge. `null` keeps 5.4e's seed marks.
+   */
+  prior = null,
 } = {}) {
   if (worldKeysEnabled() && !camera) {
     // Loud, at build, rather than a merge that silently interpolates over the
@@ -553,6 +577,13 @@ export function createSrcMergeFrame(store, bins, {
     const info = bins.cascades[c];
     const parentInfo = bins.cascades[c + 1];
     const nBins = info.bins;
+    // §19 6.32d — the claim stamp of THIS cascade's blocks (srcProbes: stamp
+    // region indexed blockStampBase + blockBase[c] + block). Without a
+    // frameStamp the prior is age-gated OFF (ageW = 0 → the old path).
+    const priorAge = prior && prior.frameStamp != null && store?.freeStack != null
+      && store?.blockStampBase != null && store?.cascades?.[c]?.blockBase != null
+      ? { stack: store.freeStack, base: store.blockStampBase + store.cascades[c].blockBase, frameStamp: prior.frameStamp }
+      : null;
     const recordBase = cornerCascades[c].base;
 
     passes.push(Fn(() => {
@@ -618,6 +649,8 @@ export function createSrcMergeFrame(store, bins, {
       const acc = vec3(0).toVar();
       const accT = float(0).toVar();
       const wsum = float(0).toVar();
+      /** §19 6.32c — Σ weight·conf: the parent's own maturity, renormalised over the corners found. */
+      const accC = float(0).toVar();
 
       for (let k = 0; k < MERGE_CORNERS; k++) {
         const parentBlock = cornerBlock.element(record.add(uint(k))).toVar();
@@ -644,20 +677,28 @@ export function createSrcMergeFrame(store, bins, {
           const pL = vec3(0).toVar();
           const pT = float(0).toVar();
           const known = float(0).toVar();
+          /** §19 6.32c — Σ conf over the known children (1 each off the prior path). */
+          const pC = float(0).toVar();
           for (let j = 0; j < 4; j++) {
             const op = pBase.add(uint(j)).mul(uint(PAYLOAD_WORDS)).toVar();
-            const t = payload.element(op.add(uint(3))).toVar();
+            const tRaw = payload.element(op.add(uint(3))).toVar();
+            const dec = prior ? decodePriorW(tRaw) : null;
+            const t = prior ? select(tRaw.lessThan(0), tRaw, dec.T).toVar() : tRaw;
+            const cj = prior ? select(tRaw.lessThan(0), float(0), dec.conf).toVar() : float(1);
             // UNKNOWN CHILDREN ARE SKIPPED and the average renormalizes over
             // what was found — the same "rejection weights are epsilons, never
             // zeros" rule the sparse gather below runs under. All four unknown
             // makes the whole corner absent, not black.
-            If(t.greaterThanEqual(0), () => {
+            If(tRaw.greaterThanEqual(0), () => {
+              // Prior path: value × its confidence, so an immature child is a
+              // small vote and a confident one carries the corner.
               pL.addAssign(vec3(
                 payload.element(op),
                 payload.element(op.add(uint(1))),
                 payload.element(op.add(uint(2))),
-              ));
-              pT.addAssign(t);
+              ).mul(cj));
+              pT.addAssign(t.mul(cj));
+              pC.addAssign(cj);
               known.addAssign(1);
             });
           }
@@ -665,6 +706,7 @@ export function createSrcMergeFrame(store, bins, {
             const inv = float(1).div(known).toVar();
             acc.addAssign(pL.mul(inv).mul(weight));
             accT.addAssign(pT.mul(inv).mul(weight));
+            accC.addAssign(pC.mul(inv).mul(weight));
             wsum.addAssign(weight);
           });
         });
@@ -677,8 +719,12 @@ export function createSrcMergeFrame(store, bins, {
       // population, which is a cliff exactly where the population is thinnest.
       If(wsum.greaterThan(0), () => {
         const invW = float(1).div(wsum).toVar();
-        const parentL = acc.mul(invW).toVar();
-        const parentT = accT.mul(invW).toVar();
+        // §19 6.32c — on the prior path acc/accT carry conf, so the mean is
+        // over confidence; `mPar` is the parent's own effective maturity.
+        const invC = prior ? float(1).div(accC.max(1e-6)).toVar() : invW;
+        const parentL = acc.mul(invC).toVar();
+        const parentT = accT.mul(invC).toVar();
+        const mPar = prior ? accC.mul(invW).clamp(0, 1).toVar() : float(1);
         // §19 6.19d — the change-reset detector. See `CHANGE_RESET_FRACTION`.
         if (changeReset) {
           const sb = uint(info.binBase).add(block.mul(uint(nBins))).add(m)
@@ -696,15 +742,45 @@ export function createSrcMergeFrame(store, bins, {
         // §19 5.4d — `selfL`, which is ZERO for a promoted unknown: the merge
         // writes the parent's cone straight through (`0 + parentL·1`) and the
         // bin becomes KNOWN, so the tile's quadrature covers it from birth.
-        const outL = selfL.add(parentL.mul(selfT)).toVar();
-        const outT = selfT.mul(parentT).toVar();
+        const ownL = selfL.add(parentL.mul(selfT)).toVar();
+        const ownT = selfT.mul(parentT).toVar();
+        // §19 6.32 — the parent prior (see the `prior` option). `mat` is the
+        // bin's own maturity; an unknown self has none, so it takes the cone.
+        const mat = float(1).toVar();
+        /** §19 6.32d — 1 for a newborn probe, 0 once it is PRIOR_AGE frames old (srcDeposit). */
+        const ageW = float(0).toVar();
+        if (prior) {
+          const cb = uint(info.binBase).add(block.mul(uint(nBins))).add(m)
+            .mul(uint(BIN_WORDS)).toVar();
+          const cnt = float(atomicLoad(prior.scratch.element(cb.add(uint(BIN_COUNT))))).toVar();
+          mat.assign(cnt.div(float(PRIOR_SAMPLES * DEPOSIT_SCALE)).clamp(0, 1));
+          If(unknownSelf, () => { mat.assign(0); });
+          if (priorAge) {
+            const st = priorAge.stack.element(uint(priorAge.base).add(block)).toVar();
+            const age = float(uint(priorAge.frameStamp).sub(st)).toVar();
+            ageW.assign(age.div(float(PRIOR_AGE)).oneMinus().clamp(0, 1));
+          }
+          // STRUCTURAL absence: no samples AND not young — excluded, as before 6.32.
+          If(unknownSelf.and(ageW.lessThanEqual(0)), () => { Return(); });
+        }
+        // §19 6.32c — E = (m·own + (1−m)·m_par·parent) / (m + (1−m)·m_par): an
+        // immature parent cannot import its darkness, and the denominator is
+        // this bin's effective confidence, written into `w` for ITS children.
+        // §19 6.32d — the parent weight is gated by AGE: p = ageW·(1−m)·m_par.
+        const pw = prior ? ageW.mul(mat.oneMinus()).mul(mPar).toVar() : null;
+        // Confidence: at ageW = 0 an own-known bin is fully confident (bit-identical
+        // alpha to the pre-6.32 sampled fraction); a young bin carries m + p.
+        const conf = prior ? float(1).sub(ageW.mul(float(1).sub(mat.add(pw).min(1)))).toVar() : null;
+        const invConf = prior ? float(1).div(conf.max(1e-6)).toVar() : null;
+        const outL = (prior ? ownL.mul(mat).add(parentL.mul(pw)).mul(invConf) : ownL).toVar();
+        const outT = (prior ? ownT.mul(mat).add(parentT.mul(pw)).mul(invConf) : ownT).toVar();
         payload.element(o).assign(outL.x);
         payload.element(o.add(uint(1))).assign(outL.y);
         payload.element(o.add(uint(2))).assign(outL.z);
         // §19 5.4e — A SEEDED BIN IS MARKED, so the bake can trust it less than
         // a measured one. `T` rides the sign: `w = PAYLOAD_SEED_BASE − outT`.
         payload.element(o.add(uint(3)))
-          .assign(select(unknownSelf, float(PAYLOAD_SEED_BASE).sub(outT), outT));
+          .assign(prior ? encodePriorW(outT, conf) : select(unknownSelf, float(PAYLOAD_SEED_BASE).sub(outT), outT));
         atomicAdd(stats.element(sw(c, MERGE_MERGED)), uint(1));
         If(outT.equal(0), () => { atomicAdd(stats.element(sw(c, MERGE_OPAQUE)), uint(1)); });
       }).Else(() => {
@@ -717,6 +793,23 @@ export function createSrcMergeFrame(store, bins, {
         // gives it the c0-only answer meanwhile. A fixed-radius fallback here
         // is precisely the cliff R1 forbids.
         atomicAdd(stats.element(sw(c, MERGE_ORPHAN)), uint(1));
+        if (prior) {
+          // §19 6.32c — an orphan keeps its own value at its OWN maturity (a
+          // bin that was unknown stays unknown: w < 0 is left alone).
+          If(unknownSelf.not(), () => {
+            const cb = uint(info.binBase).add(block.mul(uint(nBins))).add(m)
+              .mul(uint(BIN_WORDS)).toVar();
+            const cnt = float(atomicLoad(prior.scratch.element(cb.add(uint(BIN_COUNT))))).toVar();
+            const mo = cnt.div(float(PRIOR_SAMPLES * DEPOSIT_SCALE)).clamp(0, 1).toVar();
+            // §19 6.32d — the same age mix: a settled orphan is fully confident.
+            const ageWo = float(0).toVar();
+            if (priorAge) {
+              const st = priorAge.stack.element(uint(priorAge.base).add(block)).toVar();
+              ageWo.assign(float(uint(priorAge.frameStamp).sub(st)).div(float(PRIOR_AGE)).oneMinus().clamp(0, 1));
+            }
+            payload.element(o.add(uint(3))).assign(encodePriorW(selfT, float(1).sub(ageWo.mul(mo.oneMinus()))));
+          });
+        }
         // ⭐⭐ AND SPLIT IT BY WHETHER IT COST A PHOTON (2026-08-23).
         //
         // The headline "26% orphaning" says nothing about lost light on its own,

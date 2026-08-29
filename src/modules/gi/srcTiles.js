@@ -82,6 +82,7 @@ import {
   If,
   Loop,
   atomicAdd,
+  atomicLoad,
   atomicMax,
   atomicMin,
   atomicStore,
@@ -108,7 +109,8 @@ import {
 } from "./srcConfig.js";
 import { binDirTable, tileCosineWeights } from "./srcMath.js";
 import { octahedralUV } from "./srcOctahedral.js";
-import { PAYLOAD_SEED_BASE, PAYLOAD_WORDS } from "./srcDeposit.js";
+import { PAYLOAD_SEED_BASE, PAYLOAD_WORDS, PRIOR_FLOOR } from "./srcDeposit.js";
+import { decodePriorW } from "./srcMerge.js";
 
 /**
  * §19 5.4e — what one PARENT-SEEDED bin is worth against one MEASURED bin in
@@ -256,6 +258,20 @@ export function createSrcTileAtlas(store, bins, {
   // E_hit: a hit's irradiance read from a lattice whose near band is not the
   // hit's own cell (the 6.30 mutual dark fixed point in the box/wall gap).
   cascade = 0,
+  /**
+   * §19 6.32 — `{ scratch }` arms THE MATURITY VOTE, the tile half of the
+   * parent prior (`srcMerge`'s `prior`). Every bin the merge wrote is
+   * admitted at its FULL cosine weight — its value is already
+   * `(1 − m)·parent + m·own` — and the texel's coverage becomes
+   * `Σ cw·max(m, PRIOR_FLOOR) / Σ cw`, so an immature probe beside a mature
+   * one is outvoted in the gather across the CELL (a gradient) instead of at
+   * the tile's edge (a step), and a uniformly newborn neighbourhood divides
+   * the floor back out to the prior. Replaces BOTH the D3 claim-age maturity
+   * and the 6.1 newborn fade, which were per TILE and therefore the
+   * checkerboard. At rest m ∈ {0, 1} and the coverage is exactly §12.87's
+   * sampled fraction. `null` keeps them.
+   */
+  prior = null,
 } = {}) {
   const info = bins.cascades[cascade];
   const nBins = info.bins;
@@ -419,7 +435,7 @@ export function createSrcTileAtlas(store, bins, {
       const st = stampStack.element(uint(stampBase).add(block)).toVar();
       const age = float(uint(frameStamp).sub(st)).toVar();
       seedW.assign(age.div(float(SEED_RAMP)).oneMinus().clamp(0, 1));
-      if (NEWBORN_FADE > 0) {
+      if (NEWBORN_FADE > 0 && !prior) {
         const s = age.div(float(NEWBORN_FADE)).clamp(0, 1).toVar();
         // ⚠ THE FLOOR IS NOT A TUNING CONSTANT, IT IS THE ONE PLACE THE RATIO
         // ARGUMENT BREAKS. `fade == 0` writes alpha 0, and if the pixel's whole
@@ -444,6 +460,8 @@ export function createSrcTileAtlas(store, bins, {
     /** Σ cosine weight over the WHOLE lobe — see `cover` below. */
     const wsumAll = float(0).toVar();
     const known = uint(0).toVar();
+    /** §19 6.32 — Σ cw·m over the admitted bins (see `prior`). */
+    const mat = float(0).toVar();
 
     // A dynamic loop rather than a JS unroll: `nBins` is 32 at the shipping w₀
     // and 128 on the ultra tier, and 128 unrolled call sites is a compile-time
@@ -482,7 +500,9 @@ export function createSrcTileAtlas(store, bins, {
         // estimator, no ramp to get out of step: one weight, two populations.
         const wRaw = payload.element(o.add(uint(3))).toVar();
         const seeded = wRaw.lessThanEqual(float(PAYLOAD_SEED_BASE)).toVar();
-        const T = select(seeded, float(PAYLOAD_SEED_BASE).sub(wRaw), wRaw).toVar();
+        // §19 6.32c — prior mode decodes { T, conf } out of w (srcDeposit PRIOR_W_BASE).
+        const dec = prior ? decodePriorW(wRaw) : null;
+        const T = (prior ? select(wRaw.lessThan(0), wRaw, dec.T) : select(seeded, float(PAYLOAD_SEED_BASE).sub(wRaw), wRaw)).toVar();
         const cwEff = select(seeded, cw.mul(seedW), cw).toVar();
         // A seed at `w_seed == 0` is not admitted AT ALL — not with weight
         // zero, which would still inflate `known` and therefore `cover`'s
@@ -524,6 +544,10 @@ export function createSrcTileAtlas(store, bins, {
           ).add(SB.mul(T)).mul(cwEff));
           wsum.addAssign(cwEff);
           known.addAssign(uint(1));
+          if (prior) {
+            // §19 6.32c — the bin's EFFECTIVE confidence (own + parent chain), floored.
+            mat.addAssign(cwEff.mul(dec.conf.max(PRIOR_FLOOR)));
+          }
         });
       });
     });
@@ -613,9 +637,11 @@ export function createSrcTileAtlas(store, bins, {
       //
       // `__giTileCoverFraction = false` restores the flag. Both twins read the
       // one hatch, so `test:gi-src-gather` compares like with like either way.
-      cover.assign(globalThis.__giTileCoverFraction === false
-        ? float(1)
-        : wsum.div(wsumAll.max(1e-6)).clamp(0, 1));
+      cover.assign(prior
+        ? mat.div(wsumAll.max(1e-6)).clamp(0, 1)
+        : globalThis.__giTileCoverFraction === false
+          ? float(1)
+          : wsum.div(wsumAll.max(1e-6)).clamp(0, 1));
       // §16 D3 — the maturity factor (header above). u32 subtraction is safe:
       // any live block's stamp is a past frame of this session's monotonic
       // counter, so `frame − stamp` never underflows.
@@ -633,7 +659,7 @@ export function createSrcTileAtlas(store, bins, {
       // renormalises to the same mean and only its RATIO against better-known
       // neighbours moves. The floor is what keeps a cell from having no vote at
       // all when every corner is new.
-      if (maturityOn) {
+      if (maturityOn && !prior) {
         const stamp = stampStack.element(uint(stampBase).add(block)).toVar();
         const m = float(uint(frameStamp).sub(stamp))
           .div(maturityRamp)
