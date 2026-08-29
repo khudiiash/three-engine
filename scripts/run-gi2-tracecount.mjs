@@ -94,19 +94,25 @@ const R = await page.evaluate(async () => {
   const n = hit.w * hit.h;
   for (let i = 0; i < n; i++) {
     const tv = f16(hit.a[i * 4]); const ha = f16(col.a[i * 4 + 3]);
-    const m = f16(nrm.a[i * 4 + 3]) > 0.5; const v = f16(pos.a[i * 4 + 3]) > 0.5;
+    // masked = a REAL pixel with the mirror bit: the giNormal attachment clears
+    // to alpha 1 (three clears MRT slot 1 with the default clear alpha), so its
+    // .w alone reads 1 on the sky; the prepass's own `live` gate ANDs both.
+    const v = f16(pos.a[i * 4 + 3]) > 0.5; const m = v && f16(nrm.a[i * 4 + 3]) > 0.5;
     if (m) masked++; if (v) valid++;
     if (Math.abs(ha) > 0.5) aNonZero++;
     const traced = tv >= 0 || tv < -1.5;
     if (tv >= 0) hits++; else if (tv < -1.5) miss++; else never++;
     if (traced) { if (m) maskedTraced++; else unmaskedTraced++; }
   }
+  const px = (x, y) => { const i = y * hit.w + x; return { P: [0,1,2,3].map((k) => +f16(pos.a[i * 4 + k]).toFixed(3)), N: [0,1,2,3].map((k) => +f16(nrm.a[i * 4 + k]).toFixed(3)), t: +f16(hit.a[i * 4]).toFixed(3) }; };
+  const samples = { corner: px(10, 10), cornerBR: px(hit.w - 10, hit.h - 10), centre: px(hit.w >> 1, hit.h >> 1) };
+  const bgInfo = { background: engine.scene.background?.isColor ? engine.scene.background.getHexString() : String(engine.scene.background?.constructor?.name), backgroundNode: !!engine.scene.backgroundNode, clearAlpha: renderer.getClearAlpha?.() };
   const gp = await globalThis.__editorApi.call("profile.giPasses");
   const { GI_SHARP_LAYER, GI_MIRROR_LAYER } = await import("/src/engine/editorLayers.js");
   const sharpMeshes = []; engine.scene.traverse((o) => { if (o.isMesh && (o.layers.mask & (1 << GI_SHARP_LAYER))) sharpMeshes.push({ name: o.name, mat: o.material?.name, rough: o.material?.roughness, metal: o.material?.metalness, transparent: !!o.material?.transparent, mirror: !!(o.layers.mask & (1 << GI_MIRROR_LAYER)), visible: o.visible, proxy: !!o.userData?.mergeProxy }); });
   const census = sys.reflectTierCensus?.() ?? null;
   return { size: [hit.w, hit.h], n, valid, masked, hits, tracedMiss: miss, never, alphaNonZero: aNonZero, traced: hits + miss, maskedTraced, unmaskedTraced,
-    bvhReflectMs: gp?.screenPassesMs?.bvhReflect ?? null, normalFormat: [gb.normal.format, gb.normal.type], maskOn: globalThis.__giBvhMask !== false, sharpMeshes, census };
+    bvhReflectMs: gp?.screenPassesMs?.bvhReflect ?? null, normalFormat: [gb.normal.format, gb.normal.type], maskOn: globalThis.__giBvhMask !== false, sharpMeshes, census, samples, bgInfo };
 });
 console.log(JSON.stringify(R, null, 1));
 await browser.close();
