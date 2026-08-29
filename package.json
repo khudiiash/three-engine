@@ -162,6 +162,7 @@
     "probe:gi-emitter-shadow": "node scripts/run-gi-emitter-shadow-probe.mjs",
     "probe:gi-shadow-viewdist": "node scripts/run-gi-shadow-viewdist-probe.mjs",
     "probe:gi-boot": "node scripts/run-gi-boot-probe.mjs",
+    "probe:gi-boot-frames": "node scripts/run-gi-boot-frames-probe.mjs",
     "probe:gi-green": "node scripts/run-gi-green-terms.mjs",
     "probe:gi-portable": "node scripts/run-gi-portable-envelope.mjs",
     "probe:gi-walk": "node scripts/run-gi-walk-patches.mjs",

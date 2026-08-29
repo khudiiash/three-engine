@@ -1,0 +1,43 @@
+{
+  "color": "#ffffff",
+  "roughness": 0.3,
+  "metalness": 1,
+  "map": "",
+  "shaderGraph": {
+    "nodes": [
+      {
+        "id": "bsdf",
+        "type": "principledBsdf",
+        "props": {
+          "color": "#ffffff",
+          "metalness": 1,
+          "roughness": 0.3,
+          "ior": 1.5
+        },
+        "position": {
+          "x": 200,
+          "y": 120
+        }
+      },
+      {
+        "id": "output",
+        "type": "output",
+        "props": {},
+        "position": {
+          "x": 560,
+          "y": 150
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e1",
+        "source": "bsdf",
+        "sourceHandle": "out",
+        "target": "output",
+        "targetHandle": "surface"
+      }
+    ]
+  },
+  "pipeline": null
+}
