@@ -10992,7 +10992,14 @@ export class GISystem {
     const tried = (tries.get(tex) ?? 0) + 1;
     tries.set(tex, tried);
     inFlight.add(tex);
-    readTexturePixelsGPU(renderer, tex, 32)
+    // 32 → 128 px (§19 6.11b, measured on Bistro): the readback samples a
+    // MIP, and a 32 px read of a 2048 px map is mip 6 — a blur whose p5 is
+    // not the map's floor. One detailed roughness map read 0.176 at 32 px and
+    // 0.016 at 256 px; the flat 512 maps read 0.737 at both. A floor that
+    // reads high pushes a material past the 0.45 sharp gate and OUT of the
+    // mirror mask — no reflection at all on a surface that has a smooth
+    // region. 128 px is 64 kB per read, still bounded by the in-flight cap.
+    readTexturePixelsGPU(renderer, tex, 128)
       .then((px) => {
         if (!px?.length) {
           // Transient (mid-upload) — retried on later scans; after enough
