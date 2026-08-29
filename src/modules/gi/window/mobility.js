@@ -13,14 +13,16 @@
 //             its live matrix read every frame (a 16-float compare when still).
 //   auto      static until its transform changes after the build, then
 //             PROMOTED — released from the static side and seated as a mover —
-//             and demoted back to static once it has rested `REST_FRAMES`.
+//             and demoted back to static once it has settled (6.21's rebuild).
 //
 // `stateOf` answers "static" | "dynamic" | "auto" | "promoted"; `isDynamicNow`
 // is the bit the static BVH's mover leaf and the dynamic-layer test read.
 import { giMobilityOf } from "../dynamicObjects.js";
 
-/** Frames a promoted "auto" mesh must rest before it returns to the static side. */
-export const GI2_MOBILITY_REST_FRAMES = 120;
+// A promoted mesh returns to static through 6.21's settle (GISystem
+// `#refreshGi2Movers`: `GI2_MOVER_SETTLE_FRAMES` still frames → one rebuild),
+// which calls `demote` here — the resolver owns the classification, the
+// mover loop owns the clock.
 
 export function createGi2Mobility() {
   /** "auto" meshes that moved after the build — dynamic until they settle. */

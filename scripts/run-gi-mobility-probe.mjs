@@ -154,9 +154,22 @@ await setMob("auto");
 await moveTo(pos0);
 await wait(4000);
 await readAt("auto at rest (post-rebuild)");
+// §19 6.21/6.22 receipt: the promoted mesh's static slot leaves the exact-shadow
+// tree the frame it moves — `bvhExcludedCount` > 0 within 2 frames of the move.
+await page.evaluate(() => {
+  const gi2 = globalThis.__sys()?._gi2; globalThis.__excl = []; let n = 0;
+  const tick = () => { globalThis.__excl.push(gi2?.bvhExcludedCount ?? -1); if (++n < 90) requestAnimationFrame(tick); };
+  requestAnimationFrame(tick);
+});
 await moveTo([pos0[0] + 0.8, pos0[1], pos0[2]]);
 await wait(300);
 await readAt("auto right after move");
+await wait(1500);
+{
+  const excl = await page.evaluate(() => globalThis.__excl);
+  const first = excl.findIndex((v) => v > 0);
+  console.log(`   bvhExcludedCount per frame after the move: first > 0 at frame ${first} (${first >= 0 && first <= 2 ? "PASS ≤ 2" : "FAIL"}); series ${excl.slice(0, 12).join(",")} … ${excl.slice(-4).join(",")}`);
+}
 for (let i = 0; i < 8; i++) { await wait(1000); await readAt(`auto +${i + 1}s`); }
 await restProbe("rest after (d)");
 await browser.close();
