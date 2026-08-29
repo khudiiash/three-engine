@@ -51,6 +51,19 @@ const page = await browser.newPage();
 await page.setViewport({ width: 1650, height: 970, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
 await page.evaluateOnNewDocument((flags) => { for (const [k, v] of Object.entries(flags)) globalThis[k] = v; }, JSON.parse(process.env.FLAGS ?? "{}"));
+// §19 6.25d — MAKE THE GPU'S OWN ERRORS VISIBLE: a pipeline that fails to
+// build is an UNCAPTURED error, not a console line; nothing downstream says so.
+await page.evaluateOnNewDocument(() => {
+  const proto = globalThis.GPUAdapter?.prototype;
+  if (!proto?.requestDevice) return;
+  const orig = proto.requestDevice;
+  proto.requestDevice = async function (...a) {
+    const dev = await orig.apply(this, a);
+    dev.addEventListener("uncapturederror", (e) => console.error("[webgpu] " + String(e?.error?.message ?? e).slice(0, 1500)));
+    dev.lost?.then?.((i) => console.error("[webgpu] device lost: " + i?.message));
+    return dev;
+  };
+});
 await page.evaluateOnNewDocument((project) => {
   globalThis.__gi2Rc5 = true;
   globalThis.__editorKeepRendering = true;
@@ -62,7 +75,8 @@ page.on("console", (m) => {
   const t = m.text();
   if (/\[gi2\] first light|\[gi\] field ready/.test(t)) firstLight = true;
   if (/emitter|admi|dynamic layer|seat|\[gi\].*(rror|ailed)/i.test(t)) console.log(`  ${t.slice(0, 200)}`);
-  if (process.env.ALLCONSOLE && /error|wgsl|compil|shader|pipeline|rcDirect|undeclared|unresolved/i.test(t)) console.log(`  [console] ${t.slice(0, 600)}`);
+  if (process.env.ALLCONSOLE && /error|wgsl|compil|shader|pipeline|rcDirect|undeclared|unresolved|exact shadow|bvh/i.test(t)) console.log(`  [console] ${t.slice(0, 600)}`);
+  if (t.startsWith("[webgpu]") && (globalThis.__gpuErrN = (globalThis.__gpuErrN ?? 0) + 1) <= 4) console.log(`  ${t.slice(0, 1500)}`);
 });
 page.on("pageerror", (e) => console.log(`pageerror: ${e.message}`));
 await page.goto(url, { waitUntil: "load", timeout: 60000 });

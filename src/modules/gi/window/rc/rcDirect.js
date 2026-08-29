@@ -399,8 +399,8 @@ export function createRcEmitterDirect({
               const Q = F.add(tU.mul(eU.mul(a))).add(tV.mul(eV.mul(b)));
               const wq = Q.sub(P).toVar();
               const dq = sqrt(dot(wq, wq).max(1e-6)).toVar();
-              if (QUAD_SPREAD < 0) return { dir: wd, bvh: reachBvh, vox: reachVox }; // isolation: the centre ray x4
-              return { dir: wq.div(dq).toVar(), bvh: dq.sub(dq.mul(1e-3).max(2e-3)).max(1e-3).toVar(), vox: dq.sub(float(2 * v0)).max(v0 * 0.5).toVar() };
+              if (QUAD_SPREAD < 0) return { pt: centre.sub(wd.mul(slab.min(clear))).toVar(), dir: wd, bvh: reachBvh, vox: reachVox }; // isolation: the centre ray x4
+              return { pt: Q.toVar(), dir: wq.div(dq).toVar(), bvh: dq.sub(dq.mul(1e-3).max(2e-3)).max(1e-3).toVar(), vox: dq.sub(float(2 * v0)).max(v0 * 0.5).toVar() };
             });
             const hSum = float(0).toVar();
             const h = float(0).toVar();
@@ -421,15 +421,15 @@ export function createRcEmitterDirect({
                 // for them at their live pose. visibility = static ∧ dynamic
                 // per quadrant ray, and the PCSS `tOcc` is the CENTRE ray's
                 // nearer blocker of the two.
-                for (const q of quad) {
-                  // ⚠ `nearestTFrom`, not `anyHitFrom`: gi2BvhAnyHit bounds only its
-                  // NODE walk by maxT, not the triangle test, so a ray ending 4 mm
-                  // before the lamp's face still "hit" the face (lit wall 0.32).
-                  const hq = step(0, BVH.nearestTFrom(P, q.dir, q.bvh, Nf)).toVar();
-                  if (traceDyn) hq.assign(hq.max(traceDyn.traceWindow(P, q.dir, q.vox, Nf).hit));
-                  hSum.addAssign(hq);
+                // §19 6.25d — ONE call: the four quadrant rays and the centre's
+                // nearest-t traverse inside gi2BvhQuadVis over one binding set.
+                const qv = BVH.quadVisFrom(P, wd, reachBvh, quad[0].pt, quad[1].pt, quad[2].pt, quad[3].pt, float(1e-3), Nf).toVar();
+                hSum.assign(qv.x);
+                if (traceDyn) {
+                  for (const q of quad) hSum.addAssign(traceDyn.traceWindow(P, q.dir, q.vox, Nf).hit);
+                  hSum.assign(hSum.min(4));
                 }
-                tOcc.assign(BVH.nearestTFrom(P, wd, reachBvh, Nf));
+                tOcc.assign(qv.y);
                 if (traceDyn) {
                   const td = traceDyn.traceWindow(P, wd, reachVox, Nf);
                   const tdT = td.t.toVar();
@@ -442,7 +442,8 @@ export function createRcEmitterDirect({
               if (k === 0) If(debugU.lessThan(1.5), () => { dbg.y.assign(tOcc); }); // 6.12 receipt
             }
             // five levels; a fully blocked texel stays 0 — the umbra survives
-            v[k].assign(float(1).sub(hSum.mul(0.25).clamp(0, 1)));
+            if (globalThis.__giVisFromH) v[k].assign(float(1).sub(h)); // isolation A: the 6.25 expression
+            else v[k].assign(float(1).sub(hSum.mul(0.25).clamp(0, 1)));
             // §19 6.25 — THE PENUMBRA WIDTH BY CONSTRUCTION. Area light of
             // extent L seen from a planar blocker: full width at the receiver
             //   W = L · (d_r − d_b) / d_b = L · t_occ / d_b,
