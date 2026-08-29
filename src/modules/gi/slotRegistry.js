@@ -262,7 +262,7 @@ export class SlotRegistry {
    * Per-frame: re-cache slots whose mesh moved. Returns true when anything
    * changed — the caller re-voxelizes the pyramid.
    */
-  refreshTransforms() {
+  refreshTransforms(isDynamicNow = null) {
     let changed = false;
     for (let i = 0; i < this.assignments.length; i++) {
       const assignment = this.assignments[i];
@@ -273,6 +273,9 @@ export class SlotRegistry {
         changed = true;
         continue;
       }
+      // §19 6.22: with a classifier, only dynamic-now meshes are compared —
+      // a static slot is never audited (GI Mobility is the rule, by design).
+      if (isDynamicNow && !isDynamicNow(mesh)) continue;
       if (this.#matrixChanged(assignment)) {
         this.refreshSlotTransform(i);
         changed = true;
