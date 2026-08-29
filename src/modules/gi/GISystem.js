@@ -18921,9 +18921,11 @@ export class GISystem {
         // its NEW pose: one rebuild (soup + tree) returns it to the exact arm.
         // Until that build lands it stays a mover, so no frame is without its
         // shadow. Pinned-dynamic and skinned movers never settle this way.
-        // ⚠ OPT-IN (`__gi2MoverSettleRebuild = true`): measured 08-29, the rebuild re-fired 3× and the
-        // moved-lamp test read ~0 after it — the settle arm is built, not armed. See the 6.21 commit.
-        if (globalThis.__gi2MoverSettleRebuild === true && !m.skinned && m.mesh && m.restFrames === GI2_MOVER_SETTLE_FRAMES && this._gi2Promoted?.has(m.mesh)) {
+        // 6.21b — ONCE per promotion: `_gi2SettleAsked` is cleared when the mesh is
+        // promoted and set when the rebuild is asked, so a re-seat that re-seeds
+        // `restFrames` cannot ask again. `__gi2MoverSettleRebuild = false` opts out.
+        if (globalThis.__gi2MoverSettleRebuild !== false && !m.skinned && m.mesh && m.restFrames >= GI2_MOVER_SETTLE_FRAMES && this._gi2Promoted?.has(m.mesh) && !(this._gi2SettleAsked ??= new Set()).has(m.mesh)) {
+          this._gi2SettleAsked.add(m.mesh);
           this._gi2Promoted.delete(m.mesh);
           console.log(`[gi2] mover settled: "${m.mesh.name}" returns to the static set — rebuild`);
           this.requestRebuild("gi2-mover-settled");
@@ -18944,6 +18946,7 @@ export class GISystem {
         w.matrix.copy(mesh.matrixWorld);
         watch.splice(i, 1);
         promoted.add(mesh);
+        this._gi2SettleAsked?.delete(mesh);
         adopted++;
         // §19 6.21 — out of the exact-shadow tree NOW: its old pose must not shadow.
         for (const s of this._gi2StaticSlotOf?.get(mesh) ?? []) gi2.setStaticExcluded?.(s, true);
