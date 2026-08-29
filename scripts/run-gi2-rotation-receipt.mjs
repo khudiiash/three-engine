@@ -11,6 +11,13 @@ const TAG = process.env.TAG ?? "a";
 const ROT_S = Number(process.env.ROT_S ?? 4), DEG_S = Number(process.env.DEG_S ?? 30);
 const VIEW = process.env.VIEW ?? "indirect";
 const WW = Number(process.env.WW ?? 2120), WH = Number(process.env.WH ?? 1240);
+// §19 6.32b — FRAME MODE: `DEG_F` degrees per RENDERED frame for `NFRAMES` frames, reading the LINEAR
+// `gi2.textures.irradiance` (createGi2PixelDump, stride 2) per frame instead of the sRGB composed view, so a
+// saturated debug view cannot blind the instrument. `SETTLE` s after the pose; a composed shot at `SHOT_AT`.
+// `FLAGS="__gi2ParentPrior=false"` sets build-time globals before boot.
+const DEG_F = Number(process.env.DEG_F ?? 0), NFRAMES = Number(process.env.NFRAMES ?? 30);
+const SETTLE = Number(process.env.SETTLE ?? 4), SHOT_AT = Number(process.env.SHOT_AT ?? 15);
+const FLAGS = (process.env.FLAGS ?? "").split(",").filter(Boolean);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const browser = await puppeteer.launch({
   executablePath: process.env.CHROME_PATH ?? "C:/Program Files/Google/Chrome/Application/chrome.exe",
@@ -22,6 +29,7 @@ const browser = await puppeteer.launch({
 const page = await browser.newPage();
 await page.setViewport({ width: WW, height: WH, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
+await page.evaluateOnNewDocument((flags) => { for (const kv of flags) { const [k, v] = kv.split("="); if (!k) continue; let val; try { val = JSON.parse(v); } catch { val = v; } globalThis[k.trim()] = val; } }, FLAGS);
 await page.evaluateOnNewDocument((project, view) => {
   globalThis.__gi2Rc5 = true;
   globalThis.__editorKeepRendering = true;
@@ -123,7 +131,65 @@ const stats = (buf, keepPrev = true) => {
 const shot = async (name) => { const buf = await page.screenshot({ clip, type: "png" }); writeFileSync(`${OUTDIR}/${name}.png`, buf); return stats(buf); };
 const rcs = async () => { const g = await call("profile.gi2"); return g?.rcMerge ?? g?.gi2?.rcMerge ?? (g ? { keys: Object.keys(g) } : null); };
 const cam = await call("viewport.getCamera"); console.log("camera", JSON.stringify(cam));
-if (process.env.POSE) { const p = process.env.POSE.split("|").map((s) => s.split(",").map(Number)); await call("viewport.setCamera", { position: p[0], target: p[1] }); await wait(4000); }
+if (process.env.POSE) { const p = process.env.POSE.split("|").map((s) => s.split(",").map(Number)); await call("viewport.setCamera", { position: p[0], target: p[1] }); await wait(SETTLE * 1000); }
+if (DEG_F > 0) {
+  const setup = await page.evaluate(async () => {
+    try {
+      const eng = globalThis.__giEngineForProbe, sys = globalThis.__giSys(), gi2 = globalThis.__gi2();
+      const { createGi2PixelDump, GI2_PIXEL_OUT_VEC } = await import("/scripts/lib/gi2PixelDump.js");
+      const stride = 2;
+      const dump = createGi2PixelDump({ renderer: eng.renderer, gi2, screen: sys.state?.screen, stride });
+      const awaitFrame = () => new Promise((r) => { const off = eng.onPostRender(() => { off(); r(); }); });
+      globalThis.__yawRead = async () => {
+        const d = await dump.read(awaitFrame, 6, 1);
+        const OV = GI2_PIXEL_OUT_VEC; const B = Math.max(1, Math.round(16 / stride));
+        const bw = Math.floor(dump.dumpW / B), bh = Math.floor(dump.dumpH / B);
+        const means = new Array(bw * bh).fill(-1);
+        for (let by = 0; by < bh; by++) for (let bx = 0; bx < bw; bx++) {
+          let s = 0, n = 0;
+          for (let y = by * B; y < by * B + B; y++) for (let x = bx * B; x < bx * B + B; x++) {
+            const b = (y * dump.dumpW + x) * OV * 4; if (d[b + 3] < 0.5) continue;
+            s += 0.2126 * d[b + 8] + 0.7152 * d[b + 9] + 0.0722 * d[b + 10]; n++;
+          }
+          means[by * bw + bx] = n >= (B * B) / 2 ? s / n : -1;
+        }
+        return { means, bw, bh, attempts: d.attempts, frame: gi2.gather?.frame ?? 0 };
+      };
+      return JSON.stringify({ ok: true, stride, dumpW: dump.dumpW, dumpH: dump.dumpH });
+    } catch (e) { return JSON.stringify({ error: String(e?.message ?? e) }); }
+  });
+  console.log("linear dump", setup);
+  const p90 = (arr) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(arr.length * 0.9))] : 0;
+  const blockStats = (cur, prev, bw, bh) => {
+    const valid = cur.filter((m) => m >= 0); const fmean = valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : 1;
+    const black = valid.filter((m) => m < 0.02 * fmean).length;
+    const edges = [], steps = [];
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+      const m0 = cur[y * bw + x]; if (m0 < 0) continue;
+      if (x + 1 < bw && cur[y * bw + x + 1] >= 0) edges.push(Math.abs(m0 - cur[y * bw + x + 1]) / fmean);
+      if (y + 1 < bh && cur[(y + 1) * bw + x] >= 0) edges.push(Math.abs(m0 - cur[(y + 1) * bw + x]) / fmean);
+      if (prev && prev[y * bw + x] >= 0) steps.push(Math.abs(m0 - prev[y * bw + x]) / fmean);
+    }
+    edges.sort((a, b) => a - b); steps.sort((a, b) => a - b);
+    return { fmean, valid: valid.length, black: black / Math.max(1, valid.length), edgeMean: edges.length ? edges.reduce((a, b) => a + b, 0) / edges.length : 0, edgeP90: p90(edges), stepP90: prev ? p90(steps) : NaN };
+  };
+  const cam1 = await call("viewport.getCamera");
+  const e = cam1.position, t = cam1.target; const dx = t[0] - e[0], dz = t[2] - e[2]; const R = Math.hypot(dx, dz) || 5; const a0 = Math.atan2(dz, dx);
+  let prev = null; const eP = [], sP = [];
+  for (let k = 0; k < NFRAMES; k++) {
+    const a = a0 + k * DEG_F * Math.PI / 180;
+    await call("viewport.setCamera", { position: e, target: [e[0] + Math.cos(a) * R, t[1], e[2] + Math.sin(a) * R] });
+    const r = await page.evaluate(() => globalThis.__yawRead());
+    const st = blockStats(r.means, prev, r.bw, r.bh);
+    console.log(`yaw f${String(k).padStart(2, "0")} +${(k * DEG_F).toFixed(0)}°  frame ${r.frame} att ${r.attempts}  mean ${st.fmean.toFixed(4)}  valid ${st.valid}  black ${(100 * st.black).toFixed(2)} %  edge mean ${(100 * st.edgeMean).toFixed(2)} % p90 ${(100 * st.edgeP90).toFixed(2)} %  step p90 ${Number.isFinite(st.stepP90) ? (100 * st.stepP90).toFixed(2) + " %" : "n/a"}`);
+    if (k > 0) { eP.push(st.edgeP90); sP.push(st.stepP90); }
+    prev = r.means;
+    if (k === SHOT_AT) { const buf = await page.screenshot({ clip, type: "png" }); writeFileSync(`${OUTDIR}/rot-${TAG}-yaw${k}.png`, buf); console.log(`  composed shot at f${k}: ${stats(buf, false)}`); }
+  }
+  eP.sort((a, b) => a - b); sP.sort((a, b) => a - b);
+  console.log(`YAW SUMMARY ${TAG}: frames ${NFRAMES} at ${DEG_F}°/frame — tile-edge p90 median ${(100 * eP[eP.length >> 1]).toFixed(2)} % max ${(100 * eP[eP.length - 1]).toFixed(2)} %  |  step p90 median ${(100 * sP[sP.length >> 1]).toFixed(2)} % max ${(100 * sP[sP.length - 1]).toFixed(2)} %`);
+  await browser.close(); process.exit(0);
+}
 const cam0 = await call("viewport.getCamera");
 console.log("settled-0:", await shot(`rot-${TAG}-settled0`));
 console.log("rcMerge settled:", JSON.stringify(await rcs())?.slice(0, 1200)); { const g = await call("profile.gi2"); console.log("gi2 keys", Object.keys(g??{}).join(",")); console.log("rc:", JSON.stringify(g?.rc ?? null)?.slice(0, 2500)); }

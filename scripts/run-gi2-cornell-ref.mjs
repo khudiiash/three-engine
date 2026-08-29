@@ -190,6 +190,8 @@ page.on("pageerror", (e) => {
   if (!/save_scene/.test(s)) console.log(`    pageerror: ${s.slice(0, 200)}`);
 });
 
+// §19 6.32b — `FLAGS="__gi2ParentPrior=false,__x=1"` sets build-time globals before boot (A/B arms that need a rebuild, unlike ARMS).
+await page.evaluateOnNewDocument((flags) => { for (const kv of flags) { const [k, v] = kv.split("="); if (!k) continue; let val; try { val = JSON.parse(v); } catch { val = v; } globalThis[k.trim()] = val; } }, (process.env.FLAGS ?? "").split(",").filter(Boolean));
 await page.goto(url, { waitUntil: "load", timeout: 60000 });
 await page.waitForSelector(".hub-recent-open-btn", { timeout: 60000 });
 await page.evaluate((project) => {
