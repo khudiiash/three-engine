@@ -91,7 +91,9 @@ import {
   Fn,
   If,
   Return,
+  abs,
   atomicAdd,
+  atomicLoad,
   atomicStore,
   cos,
   equirectUV,
@@ -105,6 +107,8 @@ import {
   ivec3,
   sin,
   uint,
+  uintBitsToFloat,
+  floatBitsToUint,
   vec3,
 } from "three/tsl";
 import { CASCADE_COUNT, W0 } from "./srcConfig.js";
@@ -142,7 +146,7 @@ import {
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
-import { PAYLOAD_SEED_BASE, PAYLOAD_WORDS } from "./srcDeposit.js";
+import { BIN_SG, BIN_SR, BIN_WORDS, PAYLOAD_SEED_BASE, PAYLOAD_WORDS } from "./srcDeposit.js";
 import {
   FLAG_ALIVE,
   PROBE_BLOCK,
@@ -208,8 +212,36 @@ export const MERGE_LOS = 7;      // §15 U3b: parent corners the cross-wall marc
  */
 export const MERGE_ORPHAN_OPAQUE = 8;
 export const MERGE_ORPHAN_LIVE = 9;
+/** §19 6.19d: bins whose PARENT cone moved past `CHANGE_RESET_FRACTION` this frame (the change-reset fired). */
+export const MERGE_RESET = 10;
 /** Words per cascade slice. */
-export const MERGE_STRIDE = 10;
+export const MERGE_STRIDE = 11;
+/**
+ * §19 6.19d — THE CHANGE-RESET'S THRESHOLD, a fraction of the parent cone.
+ *
+ * The age-aware bin window (`srcDeposit`'s `window`) holds a settled bin at
+ * `window` samples, so a settled bin TRACKS a moving light at α ≈ 1/window —
+ * 64 frames to move 63 % of the way. The window buys its at-rest stillness
+ * with exactly that sluggishness, and this is the valve: when the PARENT cone
+ * the merge is about to composite into a bin moves by more than this fraction
+ * between two merges, the bin is flagged (`BIN_SG`) and the next decay drops
+ * its weight to a quarter window (mean preserved — Σ and count scale
+ * together), so it re-tracks within ~window/4 frames.
+ *
+ * THE PARENT, NOT THE BIN. A bin's own mean moves by (x − mean)/n per ray,
+ * and one ray at the scene's measured per-ray maximum (`STAT_MAXL` ≈ 0.25·Lmax
+ * on Cornell) into a 64-sample bin at the mean shifts it ~25 % — a per-bin
+ * detector on one ray would fire on its own noise. The parent cone averages
+ * four parent bins of a coarser cascade, so the same ray moves it a quarter
+ * as far, and it is the value the merge already computes for every bin.
+ *
+ * `prev` is the previous merge's parent luma, held in the bin's otherwise
+ * unused `BIN_SR` word as f32 bits (not decayed; zeroed on hand-off with the
+ * normal). Cones dimmer than `Lmax/4096` are ignored: a relative test on a
+ * near-black cone is a test on its noise.
+ */
+export const CHANGE_RESET_FRACTION = 0.25;
+export const CHANGE_RESET_FLOOR = 1 / 4096;
 /**
  * ⚠ KEPT AS THE STRIDE, NOT THE BUFFER SIZE. Several call sites still read
  * `MERGE_WORDS` as "the offsets go 0..MERGE_WORDS-1"; the BUFFER is
@@ -258,6 +290,13 @@ export function createSrcMergeFrame(store, bins, {
   skyEnv = null,
   w0 = W0,
   losOccupied = null,
+  /**
+   * §19 6.19d — `{ scratch, lmax }` arms the change-reset (see
+   * `CHANGE_RESET_FRACTION`): `scratch` is the deposit's bin buffer, whose
+   * `BIN_SR`/`BIN_SG` words this pass then owns. `null` (every pre-6.19d
+   * caller, every gate fixture) builds the pre-6.19d WGSL byte for byte.
+   */
+  changeReset = null,
 } = {}) {
   if (worldKeysEnabled() && !camera) {
     // Loud, at build, rather than a merge that silently interpolates over the
@@ -640,6 +679,20 @@ export function createSrcMergeFrame(store, bins, {
         const invW = float(1).div(wsum).toVar();
         const parentL = acc.mul(invW).toVar();
         const parentT = accT.mul(invW).toVar();
+        // §19 6.19d — the change-reset detector. See `CHANGE_RESET_FRACTION`.
+        if (changeReset) {
+          const sb = uint(info.binBase).add(block.mul(uint(nBins))).add(m)
+            .mul(uint(BIN_WORDS)).toVar();
+          const Y = parentL.x.mul(0.2126).add(parentL.y.mul(0.7152)).add(parentL.z.mul(0.0722)).toVar();
+          const prev = uintBitsToFloat(atomicLoad(changeReset.scratch.element(sb.add(uint(BIN_SR))))).toVar();
+          const ref = Y.max(prev).toVar();
+          If(ref.greaterThan(float(changeReset.lmax).mul(CHANGE_RESET_FLOOR))
+            .and(abs(Y.sub(prev)).greaterThan(ref.mul(CHANGE_RESET_FRACTION))), () => {
+            atomicStore(changeReset.scratch.element(sb.add(uint(BIN_SG))), uint(1));
+            atomicAdd(stats.element(sw(c, MERGE_RESET)), uint(1));
+          });
+          atomicStore(changeReset.scratch.element(sb.add(uint(BIN_SR))), floatBitsToUint(Y));
+        }
         // §19 5.4d — `selfL`, which is ZERO for a promoted unknown: the merge
         // writes the parent's cone straight through (`0 + parentL·1`) and the
         // bin becomes KNOWN, so the tile's quadrature covers it from birth.
@@ -741,7 +794,7 @@ export function createSrcMergeFrame(store, bins, {
       const at = (c, w) => v[c * MERGE_STRIDE + w] >>> 0;
       const perCascade = [];
       let probes = 0, visited = 0, merged = 0, orphans = 0, opaque = 0, sky = 0, los = 0, found = 0;
-      let orphanLive = 0, orphanOpaque = 0;
+      let orphanLive = 0, orphanOpaque = 0, resets = 0;
       for (let c = 0; c < N; c++) {
         const p = at(c, MERGE_PROBES);
         const b = at(c, MERGE_BINS);
@@ -751,6 +804,7 @@ export function createSrcMergeFrame(store, bins, {
         probes += p; visited += b; merged += mg; orphans += or; found += fd;
         opaque += at(c, MERGE_OPAQUE); sky += at(c, MERGE_SKY); los += at(c, MERGE_LOS);
         orphanLive += at(c, MERGE_ORPHAN_LIVE); orphanOpaque += at(c, MERGE_ORPHAN_OPAQUE);
+        resets += at(c, MERGE_RESET);
         perCascade.push({
           cascade: c,
           probes: p,
@@ -772,6 +826,8 @@ export function createSrcMergeFrame(store, bins, {
           meanCorners: p > 0 ? fd / p : 0,
           sky: at(c, MERGE_SKY),
           losSuppressed: at(c, MERGE_LOS),
+          /** §19 6.19d: change-resets fired this frame (0 when the arm is off). */
+          resets: at(c, MERGE_RESET),
         });
       }
       return {
@@ -787,6 +843,7 @@ export function createSrcMergeFrame(store, bins, {
         orphans,
         opaque,
         sky,
+        resets,
         // §15 U3b: corners the cross-wall march suppressed. Nonzero says the
         // march is armed AND finding walls; the RATE (per resolved corner
         // set) is scene-shaped — a one-room rig reads ~0, the user's Level
