@@ -99,6 +99,28 @@ await page.evaluate(async ({ p, t }) => {
   else vh.camera.lookAt(t[0], t[1], t[2]);
   vh.camera.updateMatrixWorld(true);
 }, { p: POSE[0], t: POSE[1] });
+// §19 6.25f — WAIT FOR THE DIRECT TERM'S FIRST OUTPUT, NOT A FIXED SETTLE. The
+// raw pass's pipeline can take tens of seconds to compile (6.25b: 4 slots x 14
+// trace call sites); until its first dispatch lands, visA/penA are the zeros
+// the textures were born with and the filter chain blurs them into a grey
+// ramp — the "lit wall 0.3" of 6.25b-d was a read BEFORE the kernel ran.
+{
+  const tA = Date.now();
+  let arrived = -1;
+  for (let k = 0; k < 60; k++) {
+    const nz = await page.evaluate(async () => {
+      const gi2 = globalThis.__gi2(); const pt = gi2?.rc?.resolve?.direct?.penumbra ?? null; if (!pt) return -1;
+      const { createGi2TexProbe } = await import("/scripts/lib/gi2TexProbe.js");
+      if (globalThis.__tpPenTex !== pt) { globalThis.__tpPen = createGi2TexProbe({ renderer: globalThis.__giEngineForProbe.renderer, tex: pt }); globalThis.__tpPenTex = pt; }
+      const w = pt.image?.width ?? 1, h = pt.image?.height ?? 1; const pts = [];
+      for (let i = 0; i < 24; i++) for (let j = 0; j < 24; j++) pts.push([Math.floor((i + 0.5) * w / 24), Math.floor((j + 0.5) * h / 24)]);
+      const o = await globalThis.__tpPen.read(pts); let n = 0; for (const v of o) if (v > 0) n++; return n;
+    });
+    if (nz > 0) { arrived = (Date.now() - tA) / 1000; break; }
+    await wait(1500);
+  }
+  console.log(`direct term first output ${arrived >= 0 ? `${arrived.toFixed(1)} s after the pose (penumbra texels > 0)` : "NOT seen in 90 s"}`);
+}
 await wait(SETTLE * 1000);
 
 const shoot = async (name) => {
@@ -374,6 +396,28 @@ const READ = async ({ WALL }) => {
       out.wgsl = st?.computeShader ?? null;
     } catch (e) { out.wgslErr = String(e?.message ?? e); }
   }
+  // §19 6.25f — identities: is the texture read the one the LAST-built rawPass writes, and is that kernel in the frame?
+  try {
+    const last = globalThis.__rcDirectLast ?? null;
+    const dir = gi2.rc?.resolve?.direct ?? null;
+    const fl0 = typeof gi2.passes === "function" ? gi2.passes() : null; const frameList = Array.isArray(fl0) ? fl0 : Array.isArray(fl0?.computeNodes) ? fl0.computeNodes : Object.values(fl0 ?? {}).flat().filter((x) => x && typeof x === "object");
+    out.ident = { builds: globalThis.__rcDirectBuilds ?? 0, lastBuild: last?.build ?? null, texIsLast: last ? last.visA === vt : null, texName: vt?.name, texUuid: vt?.uuid?.slice(0, 8), lastUuid: last?.visA?.uuid?.slice(0, 8),
+      dirPasses: dir?.passes?.length ?? null, rawInDir: dir?.passes?.includes(last?.rawPass) ?? null, frameN: frameList.length, rawInFrame: frameList.includes(last?.rawPass), rawOnly: !!globalThis.__giRawOnly, flShape: fl0 == null ? null : Array.isArray(fl0) ? "array" : Object.keys(fl0).slice(0, 6).join(","), frameNames: frameList.slice(0, 60).map((p) => p?.__giPassName ?? p?.name ?? "?").filter((n) => /direct|rcEmitter|raw|vis|pen/i.test(n)) };
+    // the pipeline's own state + a manual dispatch of the raw pass, then an immediate read
+    try {
+      const rp = last?.rawPass; const R = eng.renderer;
+      const b = R._bindings.getForCompute(rp); const p = R._pipelines.getForCompute(rp, b); const st = R.backend.get(p);
+      const mod = R.backend.get(p.computeProgram)?.module; const info = mod ? await mod.getCompilationInfo() : null;
+      out.ident.pipe = { error: !!st?.error, has: !!st?.pipeline, count: rp?.count ?? null, halfW: dir?.halfW, halfH: dir?.halfH, tex: [vt?.image?.width, vt?.image?.height], wU: dir?.uniforms?.rcDirectWidth?.value, hU: dir?.uniforms?.rcDirectHeight?.value,
+        msgs: (info?.messages ?? []).filter((m) => m.type !== "info").slice(0, 3).map((m) => `${m.type} L${m.lineNum}: ${m.message.slice(0, 160)}`) };
+      R.compute(rp);
+      const o2 = await tp.read(all.slice(0, 8).map((p) => [Math.round(p.pix[0]) >> 1, Math.round(p.pix[1]) >> 1]));
+      out.ident.manual = [...o2.slice(0, 8)].map((v) => +v.toFixed(3));
+      const gp = await globalThis.__editorApi.call("profile.giPasses", { samples: 4 });
+      out.ident.rcKeys = Object.keys(gp?.gi2Ms ?? {}).filter((k) => /rc|direct|emitter/i.test(k)).slice(0, 12);
+      out.ident.gi2Keys = Object.keys(gp?.gi2Ms ?? {}).length;
+    } catch (e) { out.ident.pipeErr = String(e?.message ?? e); }
+  } catch (e) { out.ident = String(e?.message ?? e); }
   const gridVis = vis.slice(line.length);
   const pxStep = line.length > 1 ? Math.hypot(line[1].pix[0] - line[0].pix[0], line[1].pix[1] - line[0].pix[1]) : 0;
   // THE RAMP: the transition between the darkest and the brightest visible
@@ -402,6 +446,7 @@ const readOnce = async (label) => {
   console.log(`  gi2: movers ${r.gi2?.movers} moverTris ${r.gi2?.moverTris} voxelsSet ${r.gi2?.voxelsSet} | live movers ${JSON.stringify(r.moversLive)} promoted ${JSON.stringify(r.promoted)}`);
   if (r.faceRows || r.faceErr) { console.log(`  face receipt B=${JSON.stringify(r.faceB)} sameUniform=${r.faceSame} ${r.faceErr ?? ""}`); for (const q of r.faceRows ?? []) console.log(`    ${JSON.stringify(q)}`); }
   if (r.wgsl && process.env.WGSL_OUT) { writeFileSync(process.env.WGSL_OUT, r.wgsl); console.log(`  wrote ${process.env.WGSL_OUT} (${r.wgsl.length} chars)`); } else if (r.wgslErr) console.log(`  wgsl: ${r.wgslErr}`);
+  if (r.ident) console.log(`  ident: ${JSON.stringify(r.ident)}`);
   if (r.cpu || r.cpuErr) { console.log(`  cpu receipt: ${r.cpuErr ?? ""} nT ${r.cpu?.nT} lampTris ${r.cpu?.lampTris} ids ${JSON.stringify(r.cpu?.lampTriIds)} C ${JSON.stringify(r.cpu?.C)} EX ${JSON.stringify(r.cpu?.EX)} clear ${r.cpu?.clear}`); for (const q of r.cpu?.rows ?? []) console.log(`    ${JSON.stringify(q)}`); }
   if (r.penW || r.penErr) console.log(`  penumbra W (m) at 5 wall texels: ${JSON.stringify(r.penW)} max ${r.penWmax} ${r.penErr ?? ""}`);
   if (r.wall) console.log(`  wall(${r.wall.occ}): ramp ${r.wall.rampPx} px (${r.wall.rampSamples} of ${r.wall.nLineSeen}/${r.wall.nLine} seen samples @ ${r.wall.pxStep} px) vis min ${r.wall.minVis} max ${r.wall.maxVis} depth ${r.wall.depth} | medVis shadow ${r.wall.medVisShadow} lit ${r.wall.medVisLit} (n ${r.wall.nShadow}/${r.wall.nLit})${r.gbufFlip ? " [gbuf flipped]" : ""}${r.gbufCheck ? ` [${r.gbufCheck}]` : ""}`);
@@ -456,7 +501,7 @@ let pass = true;
 for (const [name, ok, detail] of gates) { console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}: ${detail}`); if (!ok) pass = false; }
 console.log(`\n${pass ? "PASS" : "FAIL"} gi-scaled-lamp (scale x${SCALE})`);
 try {
-  const gp = await page.evaluate(async () => globalThis.__editorApi.call("profile.giPasses", { frames: 8 }));
+  const gp = await page.evaluate(async () => globalThis.__editorApi.call("profile.giPasses", { samples: 8 }));
   const list = Array.isArray(gp) ? gp : (gp?.passes ?? gp?.entries ?? gp?.rows ?? []);
   const hit = (Array.isArray(list) ? list : []).filter((e) => /direct|rc/i.test(JSON.stringify(e).slice(0, 80)));
   console.log(`  profile.giPasses (direct/rc): ${JSON.stringify(hit).slice(0, 700)}`);

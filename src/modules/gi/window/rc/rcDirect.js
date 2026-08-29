@@ -75,7 +75,7 @@
 // zeroes those pixels analytically.
 import * as THREE from "three/webgpu";
 import {
-  Fn, If, Return, cross, dot, float, instanceIndex, ivec2, max, mix, normalize, select, sign, sqrt, step, texture, textureStore,
+  Fn, If, Loop, Return, cross, dot, float, instanceIndex, ivec2, max, mix, normalize, select, sign, sqrt, step, texture, textureStore,
   uint, uniform, vec2, vec3, vec4,
 } from "three/tsl";
 import { emitterShapeGain } from "../emitterShapeGain.js";
@@ -406,12 +406,20 @@ export function createRcEmitterDirect({
             const h = float(0).toVar();
             const tOcc = float(-1).toVar();
             // the voxel arm's four rays; the width's t is the NEAREST blocker
+            // §19 6.25f — ONE CALL SITE PER ARM, A WGSL LOOP PICKS THE RAY.
+            // The JS-unrolled form (4 static DDA + 4 dynamic DDA call sites per
+            // slot, 4 slots) compiled for 15-40 s on the D3D backend; until the
+            // pipeline landed the raw pass never ran, visA/penA stayed zero and
+            // the filter chain blurred them into the "lit wall 0.3" of 6.25b-d.
+            // Every kernel call site is inlined by the driver, so the compile
+            // cost is call sites, not rays: a loop keeps ONE per arm.
+            const pickQ = (i, field) => select(i.equal(0), quad[0][field], select(i.equal(1), quad[1][field], select(i.equal(2), quad[2][field], quad[3][field])));
             const voxQuad = () => {
-              for (const q of quad) {
-                const tr = traceWindow(P, q.dir, q.vox, Nf);
+              Loop(4, ({ i }) => {
+                const tr = traceWindow(P, pickQ(i, "dir"), pickQ(i, "vox"), Nf);
                 hSum.addAssign(tr.hit);
                 If(tr.hit.greaterThan(0.5).and(tOcc.lessThan(0).or(tr.t.lessThan(tOcc))), () => { tOcc.assign(tr.t.max(0)); });
-              }
+              });
               h.assign(step(0, tOcc));
             };
             if (BVH) {
@@ -429,7 +437,7 @@ export function createRcEmitterDirect({
                   : BVH.quadVisFrom(P, wd, reachBvh, quad[0].pt, quad[1].pt, quad[2].pt, quad[3].pt, float(1e-3), Nf)).toVar();
                 hSum.assign(qv.x);
                 if (traceDyn && !globalThis.__giNoDynQuad) { // §19 6.25e isolation C
-                  for (const q of quad) hSum.addAssign(traceDyn.traceWindow(P, q.dir, q.vox, Nf).hit);
+                  Loop(4, ({ i }) => { hSum.addAssign(traceDyn.traceWindow(P, pickQ(i, "dir"), pickQ(i, "vox"), Nf).hit); });
                   hSum.assign(hSum.min(4));
                 }
                 // §19 6.25e receipt (slot 0 only, inactive slots 1-3 carry it): y = static quad hits/4, z = static+dyn hits/4, w = centre tOcc
@@ -598,6 +606,9 @@ export function createRcEmitterDirect({
     textureStore(dstTex, ivec2(gx.toInt(), gy.toInt()), out);
   })().compute(halfW * halfH);
 
+  // §19 6.25f identity receipt: how many rcDirect instances this page built, and the last one's textures/kernel
+  globalThis.__rcDirectBuilds = (globalThis.__rcDirectBuilds ?? 0) + 1;
+  globalThis.__rcDirectLast = { visA, visB, penA, rawPass, build: globalThis.__rcDirectBuilds };
   const hPass = filterPass(visAN, visB, 1, 0);
   const vPass = filterPass(visBN, visA, 0, 1);
   const hPass2 = filterPass(visAN, visB, 1, 0, true);
@@ -649,7 +660,8 @@ export function createRcEmitterDirect({
 
   return {
     /** [S] → [F.h] → [F.v]. Spliced before the pixel resolve that reads them. */
-    passes: [rawPass, dilH, dilV, dilH2, dilV2, hPass, vPass, hPass2, vPass2],
+    // §19 6.25f hatch: the raw pass alone (visA = the unfiltered raw output)
+    passes: globalThis.__giRawOnly ? [rawPass] : [rawPass, dilH, dilV, dilH2, dilV2, hPass, vPass, hPass2, vPass2],
     directAt,
     /** The FILTERED visibility (V writes back into A) — for a debug read. */
     texture: visA,
