@@ -5098,8 +5098,49 @@ export function createGiGather({
         E.assign(E.div(wsum));
         G.assign(G.div(wsum));
       }).Else(() => {
-        E.assign(bestE);
-        G.assign(bestG);
+        // ⭐ §19 6.30 — THE NEAREST SAME-SURFACE TEXEL, NOT THE NEAREST TEXEL.
+        //
+        // When all four bilinear taps fail the plane/normal test, this pixel
+        // has no half-res sample of ITS OWN surface in the 2x2 footprint — a
+        // one-pixel-wide silhouette column (the Cornell tall box's edge, 0.4 m
+        // in front of the shadowed green wall: 27 px at 4 % of truth under
+        // every ray budget, because the strip was never the FIELD — it was
+        // this fallback handing the box's edge the green wall's texel).
+        // Walk the 4x4 footprint for a texel that passes the SAME plane/normal
+        // test before giving up: any surface two full-res pixels wide has one
+        // there, by construction. The nearest-tap fallback remains only for a
+        // surface with no same-plane texel at all.
+        const w2 = float(0).toVar();
+        const E2 = vec3(0).toVar();
+        const G2 = vec3(0).toVar();
+        for (let dy = -1; dy <= 2; dy++) {
+          for (let dx = -1; dx <= 2; dx++) {
+            if ((dx === 0 || dx === 1) && (dy === 0 || dy === 1)) continue;
+            const lx = bx.add(dx).clamp(0, float(halfW - 1)).toInt().toVar();
+            const ly = by.add(dy).clamp(0, float(halfH - 1)).toInt().toVar();
+            const ei = irrHalfNode.load(ivec2(lx, ly)).toVar();
+            const gi = glossyHalfNode.load(ivec2(lx, ly)).toVar();
+            const okTap = gi.w.greaterThan(-8).toVar();
+            const wp = exp(ei.w.sub(myPlane).abs().div(v0).negate()).toVar();
+            const wn = float(1).sub(gi.w.sub(Nn.y).abs().mul(0.5)).max(0).toVar();
+            const ddx = lowX.sub(bx.add(dx)).toVar();
+            const ddy = lowY.sub(by.add(dy)).toVar();
+            const wd = float(1).div(ddx.mul(ddx).add(ddy.mul(ddy)).add(0.25)).toVar();
+            const w = wd.mul(wp).mul(wn.mul(wn)).mul(select(okTap, float(1), float(0))).toVar();
+            E2.addAssign(ei.xyz.mul(w));
+            G2.addAssign(gi.xyz.mul(w));
+            w2.addAssign(w);
+          }
+        }
+        If(w2.greaterThan(1e-4), () => {
+          E.assign(E2.div(w2));
+          G.assign(G2.div(w2));
+          loE.assign(min(loE, E)); hiE.assign(max(hiE, E));
+          loG.assign(min(loG, G)); hiG.assign(max(hiG, G));
+        }).Else(() => {
+          E.assign(bestE);
+          G.assign(bestG);
+        });
       });
 
       // ══ §19 STAGE 3.12 — LIGHT ARRIVES OVER FOUR FRAMES ══════════════════
