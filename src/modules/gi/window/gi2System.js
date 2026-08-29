@@ -641,6 +641,32 @@ export function createGi2System({
    */
   let mirrorQueue = [];
   let cacheCleared = false;
+  /**
+   * ⭐⭐ §19 6.29 — A CONTENT REBUILD REFRESHES THE TRANSPORT, NEVER THE LIGHT.
+   *
+   * `build()` used to be the whole system's birth: GISystem re-created the
+   * system on every `#rebuild`, and the brick cache, the RC probe store, the
+   * bins and the tiles all restarted from black — on every mover promotion,
+   * every settle, every reclass, every emitter scale. A black flash at each,
+   * which the user's rule ("light arrives in natural gradients") forbids.
+   *
+   * Now GISystem KEEPS the system across a rebuild whose describe-level
+   * parameters held (`#gi2Signature`), and `build()` on a system that already
+   * has a transport is a CARRY: the old soup/voxelizer/dynamic keep serving
+   * until the new soup lands, then are retired through the same queue a
+   * resize uses; the window is not reset (its brick keys and the cache words
+   * it addresses stay), the new voxelizer is asked to re-fill every brick, and
+   * the cascades' trace + deposit are HELD (their resolve still runs, off the
+   * accumulators they already hold) until the voxelizer reports the re-fill
+   * drained. The 64-sample window with change-reset then blends the new
+   * geometry in over ~16 frames — that IS the natural gradient.
+   */
+  let rcHold = false;
+  let rcHoldStart = -1;
+  let pendingMarkAll = false;
+  let lastVoxFrame = -1;
+  let carriedBuilds = 0;
+  const RC_HOLD_MAX_FRAMES = 600;
   const t0 = performance.now();
   const marks = { build: 0, soup: 0, voxelizer: 0, occupancy: new Map(), firstLight: 0 };
   /**
@@ -1106,13 +1132,21 @@ export function createGi2System({
   const build = async ({ geometries, placements, movers = [], soupKey = null } = {}) => {
     marks.build = performance.now();
     gi2Stage("gi2Build");
-    voxelizer = null;
-    dynamic = null;
-    soup = null;
-    cacheCleared = false;
-    coarseFrames = 0;
-    placed = false;
-    win.reset();
+    // §19 6.29 — a CARRY when a transport is already live: the old one keeps
+    // serving the frames the soup build takes; nothing here goes black.
+    const carry = !!voxelizer && globalThis.__gi2CarryState !== false;
+    const oldSoup = soup;
+    const oldVoxelizer = voxelizer;
+    const oldDynamic = dynamic;
+    if (!carry) {
+      voxelizer = null;
+      dynamic = null;
+      soup = null;
+      cacheCleared = false;
+      coarseFrames = 0;
+      placed = false;
+      win.reset();
+    }
 
     const surfaces = placements.map((p) => ({
       albedo: p.albedo ?? [0.5, 0.5, 0.5],
@@ -1194,6 +1228,9 @@ export function createGi2System({
       store.soupKey = soupKey;
     }
     if (disposed) return false;
+    // A build that lost the race to a later one: the transport it would have
+    // replaced is still the live one, so nothing to retire.
+    if (carry && voxelizer !== oldVoxelizer) return false;
 
     marks.soup = performance.now();
     gi2Stage("soupReady");
@@ -1245,7 +1282,59 @@ export function createGi2System({
     setMovers(movers);
     marks.voxelizer = performance.now();
     gi2Stage("voxelizerLive");
+    if (carry) {
+      // The transport the new one replaces, retired a few frames late (the
+      // frame in flight may still name its buffers) — the resize queue's shape.
+      retireTransport(oldSoup, oldVoxelizer, oldDynamic);
+      // No coarse-first: that is a BOOT budget, and the window is already full.
+      coarseFrames = COARSE_FIRST_FRAMES;
+      pendingMarkAll = true;
+      rcHold = true;
+      rcHoldStart = frame;
+      carriedBuilds++;
+      console.log(`[gi] gi2 transport refreshed in place (carry #${carriedBuilds}) — the light is held ` +
+        "on its accumulators until the re-fill drains, then blends the new geometry in");
+    }
     return true;
+  };
+
+  /** §19 6.29 — the old soup/voxelizer/dynamic go through the retire queue. */
+  const retireTransport = (deadSoup, deadVox, deadDyn) => {
+    if (!deadSoup && !deadVox && !deadDyn) return;
+    const storageAttributes = [];
+    const computeNodes = [];
+    if (deadSoup) {
+      for (const key of ["tris", "triPal", "triOwner", "cellRange", "cellTris"]) {
+        const attr = deadSoup[key]?.value;
+        if (attr) storageAttributes.push(attr);
+      }
+    }
+    if (deadVox) {
+      storageAttributes.push(deadVox.workAttribute, deadVox.ctrAttribute);
+      computeNodes.push(...deadVox.passes(null, null), deadVox.markAllDirty());
+    }
+    if (deadDyn) {
+      storageAttributes.push(deadDyn.scratchAttribute, deadDyn.trisBuffer?.value,
+        deadDyn.metaBuffer?.value, deadDyn.xformBuffer?.value);
+      computeNodes.push(...deadDyn.passes());
+    }
+    retired.push({
+      storageAttributes: storageAttributes.filter((a) => a?.isBufferAttribute === true),
+      computeNodes: computeNodes.filter((n) => n?.isComputeNode === true),
+      materialTextures: [],
+      dispose() {
+        deadVox?.dispose();
+        deadDyn?.dispose();
+        if (deadSoup) {
+          for (const key of ["tris", "triPal", "triOwner", "cellRange", "cellTris"]) {
+            const attr = deadSoup[key]?.value;
+            if (!attr) continue;
+            attr.array = attr.array?.constructor ? new attr.array.constructor(0) : new Uint32Array(0);
+            attr.dispose?.();
+          }
+        }
+      },
+    });
   };
 
   /**
@@ -1482,6 +1571,24 @@ export function createGi2System({
    * between `passes(frame).before` and `passes(frame).after`. One list with a
    * split point rather than two calls, so the order stays readable in one place.
    */
+  /**
+   * §19 6.29 — the cascade chain for this frame. Under the hold the trace,
+   * the deposit and [J] are skipped: no new sample reaches the accumulators
+   * while the window is mid-refill, so a half-built transport cannot read as
+   * "the light changed". Population, the hash and the merge → bake → pixel
+   * still run, off the accumulators as they stand.
+   */
+  let rcHeld = null;
+  const rcFrameList = () => {
+    if (!rc) return [];
+    if (!rcHold) return rc.frameOrder;
+    if (!rcHeld || rcHeld.rc !== rc) {
+      const set = new Set([...(rc.passes.rays ?? []), ...(rc.passes.deposit ?? []), ...(rc.passes.hit ?? [])]);
+      rcHeld = { rc, set };
+    }
+    return rc.frameOrder.filter((n) => !rcHeld.set.has(n));
+  };
+
   const passes = (frameIndex = frame) => {
     frame = frameIndex >>> 0;
     if (!gather) return { before: [], after: [], all: [] };
@@ -1551,8 +1658,24 @@ export function createGi2System({
         coarseFrames++;
         if (coarseFrames === COARSE_FIRST_FRAMES) voxelizer.setCoarseFirst(false);
       }
+      // §19 6.29 — the carried window re-fills EVERY brick against the new soup.
+      if (pendingMarkAll) {
+        before.push(voxelizer.markAllDirty());
+        pendingMarkAll = false;
+      }
       before.push(...voxelizer.passes(camPos, null));
       before.push(cache.allocPass);
+    }
+    // §19 6.29 — the hold ends when a voxelizer sample taken AFTER the swap
+    // reports no dirty brick left (the re-fill drained), or at the cap.
+    if (rcHold) {
+      const drained = lastVox && lastVoxFrame >= rcHoldStart + 2 && (lastVox.dirty ?? 0) === 0
+        && (lastVox.built ?? 0) === 0;
+      if (drained || frame - rcHoldStart > RC_HOLD_MAX_FRAMES) {
+        rcHold = false;
+        console.log(`[gi] gi2 hold released after ${frame - rcHoldStart} frames` +
+          (drained ? " — the re-fill drained; the cascades trace the new transport" : " (cap)"));
+      }
     }
     if (dynamic) before.push(...dynamic.passes());
     // The array the caller will hand to `giCompute`, kept so `notePassesRan`
@@ -1614,9 +1737,9 @@ export function createGi2System({
       // ⚠ `glossyHalf` HAS NO OTHER WRITER YET — see the report's gatherProbes
       // patch. Until it lands, RC5 + this cut is an irradiance-only frame.
       if (rc && node === gather.passes.resolveHalf) {
-        if (RC5_CUT) { after.push(...rc.frameOrder); continue; }
+        if (RC5_CUT) { after.push(...rcFrameList()); continue; }
         after.push(node);
-        after.push(...rc.frameOrder);
+        after.push(...rcFrameList());
         continue;
       }
       after.push(node);
@@ -1640,9 +1763,9 @@ export function createGi2System({
     // ⚠ 5.1's tail push is GONE — the chain is spliced by identity above. A
     // build whose gather somehow published no `resolveHalf` would drop the
     // cascades silently, so it is asserted rather than assumed.
-    if (rc && !after.includes(rc.frameOrder[0])) {
+    if (rc && !after.includes(rcFrameList()[0])) {
       console.warn("[gi2] rc: no `resolveHalf` in the gather's frame order — cascades appended at the tail");
-      after.push(...rc.frameOrder);
+      after.push(...rcFrameList());
     }
 
     // `scrollInList` so the caller's chain-shape receipt can EXCLUDE the one
@@ -1924,6 +2047,7 @@ export function createGi2System({
       }
       if (voxelizer) {
         lastVox = await voxelizer.stats(r);
+        lastVoxFrame = frame;
         out.voxelizer = lastVox;
         // Per-level time-to-first-occupancy (§K.8).
         //
@@ -1976,6 +2100,8 @@ export function createGi2System({
   /** §19 6.22: the GI Mobility classifier (`window/mobility.js`), set by GISystem at build. */
   const ext = { mobility: null };
   const snapshot = () => ({
+    carriedBuilds,
+    rcHold,
     tier,
     mobility: ext.mobility?.counts() ?? null,
     built: !!voxelizer,
@@ -2081,6 +2207,19 @@ export function createGi2System({
       return out;
     },
     build, setSize, setCamera, setMovers, passes, warmList, stats, snapshot, describe,
+    /**
+     * §19 6.29 — called by GISystem when it KEEPS this system across a
+     * rebuild. The AO pass is re-armed per build (a new texture), so the
+     * compose that closed over the old one is dropped and re-minted lazily.
+     */
+    rearm() {
+      if (aoCompose) {
+        retired.push({ storageAttributes: [], computeNodes: [aoCompose], materialTextures: [], dispose() {} });
+        aoCompose = null;
+      }
+    },
+    get carriedBuilds() { return carriedBuilds; },
+    get rcHold() { return rcHold; },
     /** §19 6.21 — drop/restore a static placement slot in the exact-shadow tree. */
     setStaticExcluded: (slot, on) => shadowBvh?.setExcluded?.(slot, on) ?? false,
     get bvhExcludedCount() { return shadowBvh?.excludedCount ?? 0; },
@@ -2099,6 +2238,8 @@ export function createGi2System({
      */
     statsCadence() {
       if (!voxelizer) return 12;
+      // §19 6.29 — the hold's release reads the voxelizer's dirty count.
+      if (rcHold) return 1;
       // ⚠⚠ AND FIRST LIGHT IS ONE OF THE THINGS THE TIGHT CADENCE IS FOR
       // (§19 Stage 3.5). This used to back off the moment every level had
       // reported occupancy — which was safe only because the per-frame
