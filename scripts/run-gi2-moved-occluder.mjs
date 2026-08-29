@@ -125,9 +125,25 @@ const readVis = async () => page.evaluate(async () => {
     const k = (sel) => med(vis.map((x, i) => sel(x.p) ? o[i * 4] : NaN));
     return { old: k((p) => p.cls === "old"), new: k((p) => p.cls === "new"), lit: k((p) => p.cls === "lit"), oldFloor: k((p) => p.cls === "old" && p.plane === "floor"), newFloor: k((p) => p.cls === "new" && p.plane === "floor"), oldWall: k((p) => p.cls === "old" && p.plane !== "floor"), newWall: k((p) => p.cls === "new" && p.plane !== "floor"), n: vis.length };
   };
+  // §19 6.34c — the flip is a projection convention, decided ONCE at `before`
+  // (the arm where the old shadow is visible) and reused from the second pose;
+  // "pick the arm with the higher lit" flipped to an all-1 read after the move.
+  if (globalThis.__occFlip != null) { const r = await once(globalThis.__occFlip); return { ...r, flip: globalThis.__occFlip }; }
   const a = await once(false), b = await once(true);
-  return (b.lit > a.lit) ? { ...b, flip: true } : { ...a, flip: false };
+  const pick = (b.old < a.old) ? { ...b, flip: true } : { ...a, flip: false };
+  globalThis.__occFlip = pick.flip;
+  return pick;
 });
+// §19 6.34c — THE SECOND POSE. From the reference pose the "new" points sit
+// BEHIND the block (the probe read the block's own lit face → 1). Look at the
+// new shadow region from the red-wall side, aimed at the block's new centre.
+const lookAtNewPose = async () => page.evaluate(({ mn, mx, DX, EYE }) => {
+  const vh = globalThis.__giViewport; const cx = (mn[0] + mx[0]) / 2 + DX, cy = (mn[1] + mx[1]) / 2, cz = (mn[2] + mx[2]) / 2;
+  vh.camera.position.set(EYE[0], EYE[1], EYE[2]);
+  if (vh.orbit) { vh.orbit.target.set(cx, cy * 0.5, cz); vh.orbit.update(); } else vh.camera.lookAt(cx, cy * 0.5, cz);
+  vh.camera.updateMatrixWorld(true);
+  return { eye: EYE, target: [cx, cy * 0.5, cz] };
+}, { mn: setup.occBox.mn, mx: setup.occBox.mx, DX, EYE: (process.env.EYE ?? "-1.5,2.0,1.5").split(",").map(Number) });
 const before = await readVis();
 await shoot("before");
 const moved = await page.evaluate(async ({ eid, DX }) => {
@@ -138,6 +154,7 @@ const moved = await page.evaluate(async ({ eid, DX }) => {
 }, { eid: setup.eid, DX });
 const tMove = Date.now(); await page.evaluate(() => { globalThis.__occT0 = performance.now(); });
 console.log(`moved entity "${moved.name}" (${setup.eid}) from ${moved.from.map((v) => +v.toFixed(2))} by +${DX} x`);
+const pose2 = await lookAtNewPose(); console.log(`second pose: eye ${pose2.eye} → ${pose2.target.map((v) => +v.toFixed(2))}`);
 await wait(500); const at05 = await readVis();
 const st05 = await page.evaluate(() => { const g = globalThis.__gi2(); return { movers: g?.stats?.()?.movers ?? null, excluded: g?.bvhExcludedCount, bvhReady: g?.shadowBvh?.ready }; });
 await wait(Math.max(0, 3000 - (Date.now() - tMove))); const at3 = await readVis();
@@ -146,7 +163,12 @@ await wait(8000); const settled = await readVis();
 await shoot("settled");
 const stEnd = await page.evaluate(() => { const g = globalThis.__gi2(), sys = globalThis.__giSys(); return { movers: g?.stats?.()?.movers ?? null, excluded: g?.bvhExcludedCount, bvhReady: g?.shadowBvh?.ready, bvhTris: g?.shadowBvh?.triCount, rebuilds: (sys.rebuildLog ?? []).map((r) => `${r.reason}@${Math.round(r.at - globalThis.__occT0)}ms`) }; });
 console.log(JSON.stringify({ before, at05, st05, at3, settled, stEnd }));
-const ok = at3.old > 0.7 && at3.new < 0.3 && settled.old > 0.7 && settled.new < 0.3;
+// §19 6.34c — PARITY WITH THE REFERENCE SHADOW, not a fixed 0.3: the read is a
+// median over a region that includes the penumbra, and the reference old-pose
+// shadow itself reads ~0.56 before the move. The new pose must be at least as
+// deep as that (+0.05 slack) at 0.5 s (dynamic layer), 3 s and settled (tree).
+const deep = before.old + 0.05;
+const ok = at05.old > 0.9 && at05.new <= deep && at3.old > 0.9 && at3.new <= deep && settled.old > 0.9 && settled.new <= deep;
 console.log(ok ? `PASS: the shadow followed the block — old ${before.old}→${at05.old}/${at3.old}/${settled.old}, new ${before.new}→${at05.new}/${at3.new}/${settled.new}` : `FAIL: old ${before.old}→${at05.old}/${at3.old}/${settled.old}, new ${before.new}→${at05.new}/${at3.new}/${settled.new}`);
 await browser.close();
 process.exit(ok ? 0 : 1);
