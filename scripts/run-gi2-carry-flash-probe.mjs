@@ -109,7 +109,21 @@ const r = await page.evaluate(async ({ MOVE, TOTAL, DX, id, SW, SH }) => {
     const img = new Image(); img.src = url; await img.decode();
     ctx.drawImage(img, 0, 0); return ctx.getImageData(0, 0, SW, SH).data;
   };
-  const snap = () => { const s = globalThis.__gi2?.()?.snapshot?.() ?? {}; return { soupBuilds: s.soupBuilds ?? -1, carried: s.carriedBuilds ?? -1, hold: !!s.rcHold }; };
+  const snap = () => {
+    const g2 = globalThis.__gi2?.(); const s = g2?.snapshot?.() ?? {};
+    const sys = globalThis.__giSys(); const eng = globalThis.__giEngineForProbe;
+    const light = sys?.state?.light ?? null;
+    return {
+      soupBuilds: s.soupBuilds ?? -1, carried: s.carriedBuilds ?? -1, hold: !!s.rcHold,
+      // §19 6.29b receipts — WHICH of the candidate gates is true on a black frame.
+      skipped: eng?.stats?.skippedFps ?? eng?.statsSystem?.skippedFps ?? -1,
+      irr: g2?.textures?.irradiance?.uuid?.slice(0, 8) ?? "-",
+      irrNode: sys?._giIrradianceNode?.value?.uuid?.slice(0, 8) ?? "-",
+      light: light ? light.uuid.slice(0, 8) : "-",
+      lightIn: !!(light && light.parent === eng?.scene),
+      state: !!sys?.state, wave: !!sys?._compileWaveActive, gbufHeld: sys?._gbufHeld === true,
+    };
+  };
   const before = snap();
   const pending = [];
   let moved = null;
@@ -139,7 +153,7 @@ const r = await page.evaluate(async ({ MOVE, TOTAL, DX, id, SW, SH }) => {
       const L = 0.2126 * LUT[d[k]] + 0.7152 * LUT[d[k + 1]] + 0.0722 * LUT[d[k + 2]];
       sAll += L; nAll++; if (L < 0.002) nBlack++;
     }
-    steps.push({ i: st.i, frame: st.frame, all: sAll / nAll, black: nBlack / nAll, soup: st.s.soupBuilds, carried: st.s.carried, hold: st.s.hold });
+    steps.push({ i: st.i, frame: st.frame, all: sAll / nAll, black: nBlack / nAll, soup: st.s.soupBuilds, carried: st.s.carried, hold: st.s.hold, r: st.s });
   }
   return { steps, before, after: snap(), moved };
 }, { MOVE, TOTAL, DX, id: target.id, SW, SH });
@@ -157,8 +171,10 @@ for (let k = 1; k < r.steps.length; k++) {
   if (d < -0.03) over3++;
   if (d < -0.10) over10++;
   if (d < worst.d) worst = { d, i: x.i, frame: x.frame, from: p.all, to: x.all };
-  if (Math.abs(d) > 0.03 || x.carried !== p.carried || x.hold !== p.hold || x.soup !== p.soup) {
-    flagged.push(`  step ${String(x.i).padStart(3)} frame ${x.frame}: mean ${p.all.toFixed(4)} → ${x.all.toFixed(4)} (${(100 * d).toFixed(1)} %) black ${(100 * x.black).toFixed(1)} %  soup ${x.soup} carried ${x.carried} hold ${x.hold ? 1 : 0}`);
+  if (Math.abs(d) > 0.03 || x.carried !== p.carried || x.hold !== p.hold || x.soup !== p.soup || x.black > 0.5 || (x.r?.lightIn !== p.r?.lightIn) || (x.r?.wave !== p.r?.wave)) {
+    const q = x.r ?? {}; const pq = p.r ?? {};
+    flagged.push(`  step ${String(x.i).padStart(3)} frame ${x.frame}: mean ${p.all.toFixed(4)} → ${x.all.toFixed(4)} (${(100 * d).toFixed(1)} %) black ${(100 * x.black).toFixed(1)} %  soup ${x.soup} carried ${x.carried} hold ${x.hold ? 1 : 0}` +
+      ` | skippedFps ${q.skipped} irr ${q.irr}${q.irr !== pq.irr ? "*" : ""} node ${q.irrNode === q.irr ? "same" : "DIFF"} light ${q.light}${q.light !== pq.light ? "*" : ""} in-scene ${q.lightIn ? 1 : 0} state ${q.state ? 1 : 0} wave ${q.wave ? 1 : 0} gbufHeld ${q.gbufHeld ? 1 : 0}`);
   }
 }
 const first = r.steps[0]?.all ?? 0, last = r.steps[r.steps.length - 1]?.all ?? 0;

@@ -12193,7 +12193,9 @@ export class GISystem {
     // screen textures and never capture cascade/SDF/BVH buffers directly.
     // A fresh light is still required for the first-build lights-hash commit;
     // subsequent in-place refits retain the existing instance.
-    const light = new GICascadeLight();
+    const light = (GI2_PATH && this._gi2Light) ? this._gi2Light : new GICascadeLight();
+    if (light === this._gi2Light) console.log("[gi] gi2 light RETAINED across the rebuild — same instance, same lights hash, stays in the scene");
+    this._gi2Light = null;
     light.gatherFn = gather;
     // World-scale light params are uniform-derived NODES (giLight composes
     // them into node math either way) so an in-place refit rescales them.
@@ -14573,7 +14575,19 @@ export class GISystem {
     // Per-build like the gbuffer it reads, and unlike the resolve targets: no
     // material is bound to a probe buffer, so nothing is stranded by this.
     state.screen?.srcProbes?.dispose?.();
-    state.light?.removeFromParent();
+    // §19 6.29b — THE LIGHT STAYS IN THE SCENE ON A CARRY. Removing it here and
+    // adding a NEW one after the compile wave was the 3-4 frame black gap
+    // (receipt: `run-gi2-carry-flash-probe` — on every black frame the light
+    // identity had changed and `light.parent !== scene`, while the irradiance
+    // texture, its node and the state were all present). The design note at
+    // the light's creation already said the instance should be retained; now
+    // it is, and materials keep their lights hash and their pipelines.
+    if (keptGi2 && state.light) {
+      this._gi2Light = state.light;
+    } else {
+      this._gi2Light = null;
+      state.light?.removeFromParent();
+    }
     for (const mesh of state.gizmos?.all ?? []) {
       mesh.removeFromParent();
       mesh.geometry?.dispose();
