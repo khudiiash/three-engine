@@ -310,6 +310,70 @@ const READ = async ({ WALL }) => {
       out.penWmax = ws.length ? Math.max(...ws) : null;
     } else out.penErr = "no penumbra texture";
   } catch (e) { out.penErr = String(e?.message ?? e); }
+  // §19 6.25e — THE CPU INTERSECTION RECEIPT (FLAGS __cpuHit): the exact arm's
+  // centre segment and the four quadrant segments for 5 seen wall texels,
+  // brute-forced against the bound soup with the JS mirror of the GPU test.
+  if (globalThis.__cpuHit) {
+    try {
+      const { triHit, bvhAnyHit } = await import("/scripts/lib/shadowBvhMirror.mjs");
+      const bvh = gi2.shadowBvh ?? null;
+      const tris = bvh?.tris ?? null;
+      const s0 = sys.state.emitterSlots?.[0];
+      if (!tris || !s0) throw new Error(`no soup tris (${!!tris}) / seat (${!!s0})`);
+      const nT = tris.length / 9;
+      const C = s0.center.value.toArray(), B = [s0.bx.value.toArray(), s0.by.value.toArray(), s0.bz.value.toArray()];
+      const EX = s0.exHalf.value.toArray().map((v) => Math.max(Math.abs(v), 1e-4));
+      const clear = Math.max(s0.radius.value, Math.max(s0.reff.value, 1e-3));
+      const SP = globalThis.__giQuadSpread ?? 0.5;
+      // lamp triangles = every triangle whose centroid lies inside the seat's OBB (+2 cm)
+      const lampTris = [];
+      for (let t = 0; t < nT; t++) {
+        const o = t * 9; const cx = (tris[o] + tris[o + 3] + tris[o + 6]) / 3, cy = (tris[o + 1] + tris[o + 4] + tris[o + 7]) / 3, cz = (tris[o + 2] + tris[o + 5] + tris[o + 8]) / 3;
+        const r = [cx - C[0], cy - C[1], cz - C[2]];
+        const l = B.map((b) => Math.abs(b[0] * r[0] + b[1] * r[1] + b[2] * r[2]));
+        if (l.every((v, i) => v <= EX[i] + 0.02)) lampTris.push(t);
+      }
+      const rows = [];
+      const cand = line.map((p, i) => ({ p, i })).filter(({ i }) => seen[i]);
+      const step = Math.max(1, Math.floor(cand.length / 5));
+      for (let c = 0; c < cand.length && rows.length < 5; c += step) {
+        const { p, i } = cand[c]; const P = p.P;
+        const N = plane.axis === 2 ? [0, 0, 1] : plane.axis === 0 ? [WALL === "left" ? 1 : -1, 0, 0] : [0, 1, 0];
+        const ro = [P[0] + N[0] * 2e-3, P[1] + N[1] * 2e-3, P[2] + N[2] * 2e-3];
+        const wv = [C[0] - P[0], C[1] - P[1], C[2] - P[2]]; const d = Math.hypot(...wv); const wd = wv.map((v) => v / d);
+        const ld = B.map((b) => Math.max(Math.abs(b[0] * wd[0] + b[1] * wd[1] + b[2] * wd[2]), 1e-6));
+        const slab = Math.min(EX[0] / ld[0], EX[1] / ld[1], EX[2] / ld[2]);
+        const reach = Math.max(d - Math.min(slab, clear) - Math.max(d * 1e-3, 2e-3), 1e-3);
+        const hitsOf = (o, dir, maxT) => { const h = []; for (let t = 0; t < nT; t++) if (triHit(tris, t, o, dir, maxT)) h.push(t); return h; };
+        const centreHits = hitsOf(ro, wd, reach);
+        const treeHit = (bvh.nodes && bvh.triIdx) ? bvhAnyHit({ nodes: bvh.nodes, triIdx: bvh.triIdx }, tris, ro, wd, reach) : null;
+        // the quadrant points (as the kernel computes them)
+        const lds = B.map((b) => b[0] * wd[0] + b[1] * wd[1] + b[2] * wd[2]);
+        const axq = EX.map((e, k) => e / ld[k]); const ax = axq.indexOf(Math.min(...axq));
+        const sg = Math.sign(lds[ax]) || 1;
+        const F = C.map((v, m) => v - B[ax][m] * sg * EX[ax]);
+        const tU = B[ax === 0 ? 1 : 0], eU = EX[ax === 0 ? 1 : 0] * SP, tV = B[ax === 2 ? 1 : 2], eV = EX[ax === 2 ? 1 : 2] * SP;
+        const quads = [[-1, -1], [1, -1], [-1, 1], [1, 1]].map(([a, b]) => {
+          const Q = SP < 0 ? C.map((v, m) => v - wd[m] * Math.min(slab, clear)) : F.map((v, m) => v + tU[m] * eU * a + tV[m] * eV * b);
+          const w = [Q[0] - ro[0], Q[1] - ro[1], Q[2] - ro[2]]; const dq = Math.max(Math.hypot(...w), 1e-3); const dir = w.map((v) => v / dq);
+          const mt = Math.max(dq - Math.max(dq * 1e-3, 2e-3), 1e-3);
+          return { Q: Q.map((v) => +v.toFixed(3)), hits: hitsOf(ro, dir, mt) };
+        });
+        const tri = (t) => { const o = t * 9; return [...tris.slice(o, o + 9)].map((v) => +v.toFixed(2)); };
+        rows.push({ P: P.map((v) => +v.toFixed(2)), vis: Number.isFinite(vis[i]) ? +vis[i].toFixed(3) : null, yzw: [1, 2, 3].map((c) => +o[i * 4 + c].toFixed(3)), d: +d.toFixed(3), slab: +slab.toFixed(3), clear: +clear.toFixed(3), reach: +reach.toFixed(3), tree: treeHit ? `${treeHit.hit}/${treeHit.visited}/${treeHit.tested}` : null,
+          centreHits: centreHits.slice(0, 4).map((t) => ({ t, lamp: lampTris.includes(t), v: tri(t) })), quadHits: quads.map((q) => q.hits.length), Q0: quads[0].Q });
+      }
+      out.cpu = { nT, lampTris: lampTris.length, lampTriIds: lampTris.slice(0, 12), C: C.map((v) => +v.toFixed(3)), EX: EX.map((v) => +v.toFixed(3)), clear: +clear.toFixed(3), B, rows };
+    } catch (e) { out.cpuErr = String(e?.message ?? e); }
+  }
+  // §19 6.25e — the raw pass's GENERATED WGSL (FLAGS __dumpRaw, WGSL_OUT=<file>)
+  if (globalThis.__dumpRaw) {
+    try {
+      const rp = gi2.rc?.resolve?.direct?.passes?.[0];
+      const st = eng.renderer._nodes?.getForCompute?.(rp);
+      out.wgsl = st?.computeShader ?? null;
+    } catch (e) { out.wgslErr = String(e?.message ?? e); }
+  }
   const gridVis = vis.slice(line.length);
   const pxStep = line.length > 1 ? Math.hypot(line[1].pix[0] - line[0].pix[0], line[1].pix[1] - line[0].pix[1]) : 0;
   // THE RAMP: the transition between the darkest and the brightest visible
@@ -337,6 +401,8 @@ const readOnce = async (label) => {
   if (s) console.log(`  seat0: kind ${s.kind} radius ${s.radius} reff ${s.reff} half ${JSON.stringify(s.half)} exHalf ${JSON.stringify(s.exHalf)} rgb ${JSON.stringify(s.rgb)} moved ${s.moved} center ${JSON.stringify(s.center)}`);
   console.log(`  gi2: movers ${r.gi2?.movers} moverTris ${r.gi2?.moverTris} voxelsSet ${r.gi2?.voxelsSet} | live movers ${JSON.stringify(r.moversLive)} promoted ${JSON.stringify(r.promoted)}`);
   if (r.faceRows || r.faceErr) { console.log(`  face receipt B=${JSON.stringify(r.faceB)} sameUniform=${r.faceSame} ${r.faceErr ?? ""}`); for (const q of r.faceRows ?? []) console.log(`    ${JSON.stringify(q)}`); }
+  if (r.wgsl && process.env.WGSL_OUT) { writeFileSync(process.env.WGSL_OUT, r.wgsl); console.log(`  wrote ${process.env.WGSL_OUT} (${r.wgsl.length} chars)`); } else if (r.wgslErr) console.log(`  wgsl: ${r.wgslErr}`);
+  if (r.cpu || r.cpuErr) { console.log(`  cpu receipt: ${r.cpuErr ?? ""} nT ${r.cpu?.nT} lampTris ${r.cpu?.lampTris} ids ${JSON.stringify(r.cpu?.lampTriIds)} C ${JSON.stringify(r.cpu?.C)} EX ${JSON.stringify(r.cpu?.EX)} clear ${r.cpu?.clear}`); for (const q of r.cpu?.rows ?? []) console.log(`    ${JSON.stringify(q)}`); }
   if (r.penW || r.penErr) console.log(`  penumbra W (m) at 5 wall texels: ${JSON.stringify(r.penW)} max ${r.penWmax} ${r.penErr ?? ""}`);
   if (r.wall) console.log(`  wall(${r.wall.occ}): ramp ${r.wall.rampPx} px (${r.wall.rampSamples} of ${r.wall.nLineSeen}/${r.wall.nLine} seen samples @ ${r.wall.pxStep} px) vis min ${r.wall.minVis} max ${r.wall.maxVis} depth ${r.wall.depth} | medVis shadow ${r.wall.medVisShadow} lit ${r.wall.medVisLit} (n ${r.wall.nShadow}/${r.wall.nLit})${r.gbufFlip ? " [gbuf flipped]" : ""}${r.gbufCheck ? ` [${r.gbufCheck}]` : ""}`);
   if (r.wall && process.env.PROFILE) console.log(`  profile: ${r.wall.profile.join(" ")}`);

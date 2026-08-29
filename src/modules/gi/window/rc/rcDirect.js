@@ -76,7 +76,7 @@
 import * as THREE from "three/webgpu";
 import {
   Fn, If, Return, cross, dot, float, instanceIndex, ivec2, max, mix, normalize, select, sign, sqrt, step, texture, textureStore,
-  uint, uniform, vec3, vec4,
+  uint, uniform, vec2, vec3, vec4,
 } from "three/tsl";
 import { emitterShapeGain } from "../emitterShapeGain.js";
 
@@ -423,12 +423,17 @@ export function createRcEmitterDirect({
                 // nearer blocker of the two.
                 // §19 6.25d — ONE call: the four quadrant rays and the centre's
                 // nearest-t traverse inside gi2BvhQuadVis over one binding set.
-                const qv = BVH.quadVisFrom(P, wd, reachBvh, quad[0].pt, quad[1].pt, quad[2].pt, quad[3].pt, float(1e-3), Nf).toVar();
+                // §19 6.25e isolation B: the 6.25 call (one nearest-t, no wrapper)
+                const qv = (globalThis.__giNoQuadFn
+                  ? vec2(step(0, BVH.nearestTFrom(P, wd, reachBvh, Nf)).mul(4), BVH.nearestTFrom(P, wd, reachBvh, Nf))
+                  : BVH.quadVisFrom(P, wd, reachBvh, quad[0].pt, quad[1].pt, quad[2].pt, quad[3].pt, float(1e-3), Nf)).toVar();
                 hSum.assign(qv.x);
-                if (traceDyn) {
+                if (traceDyn && !globalThis.__giNoDynQuad) { // §19 6.25e isolation C
                   for (const q of quad) hSum.addAssign(traceDyn.traceWindow(P, q.dir, q.vox, Nf).hit);
                   hSum.assign(hSum.min(4));
                 }
+                // §19 6.25e receipt (slot 0 only, inactive slots 1-3 carry it): y = static quad hits/4, z = static+dyn hits/4, w = centre tOcc
+                if (k === 0 && globalThis.__giHitReceipt) { v[1].assign(qv.x.mul(0.25)); v[2].assign(hSum.mul(0.25)); v[3].assign(qv.y); }
                 tOcc.assign(qv.y);
                 if (traceDyn) {
                   const td = traceDyn.traceWindow(P, wd, reachVox, Nf);
