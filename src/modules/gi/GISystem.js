@@ -8936,12 +8936,17 @@ export class GISystem {
     // Taps per pixel = slices x steps x 2. The ladder is a variance ladder,
     // not a brightness one (see 2. above).
     const tier = qualityTierOf(this.config);
+    // §19 6.13b: 4 slices on ultra/high — the grain oracle (filtered default
+    // vs a filtered 8-slice reference, same pixels) read foliage p90 3.3 % and
+    // a contact-shadowed floor 3.1 % at 3 slices; a slice is the variance
+    // dial and costs ~0.1 ms at half res, so it is bought here rather than
+    // in a wider filter that would eat contact detail.
     const preset = tier === "ultra"
-      ? { slices: 3, steps: 4 }
+      ? { slices: 4, steps: 4 }
       : tier === "high"
-        ? { slices: 3, steps: 3 }
+        ? { slices: 4, steps: 3 }
         : tier === "medium"
-          ? { slices: 2, steps: 3 }
+          ? { slices: 3, steps: 3 }
           : { slices: 2, steps: 2 };
     const slices = Math.max(1, Math.min(8, Math.round(Number(globalThis.__giGtaoSlices) || preset.slices)));
     const steps = Math.max(1, Math.min(8, Math.round(Number(globalThis.__giGtaoSteps) || preset.steps)));
