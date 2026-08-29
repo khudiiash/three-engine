@@ -336,11 +336,22 @@ export function resolveMaterialSurface(materialInput, meshName = "") {
  */
 const geometryCopyCache = new WeakMap(); // geometry -> { version, positions, index }
 
-export function serializeMeshForBake(mesh) {
+export function serializeMeshForBake(mesh, { geometryOnly = false } = {}) {
   const position = mesh.geometry?.attributes?.position;
   if (!position) return null;
   mesh.updateWorldMatrix(true, false);
-  const surface = resolveMaterialSurface(mesh.material, mesh.name);
+  // THE SURFACE WALK IS NOT THE GEOMETRY'S, AND IT WAS THE BOOT FRAME'S
+  // BIGGEST SINGLE LINE (ported from the gi §19 stage-6 measurement:
+  // `serializeMeshForBake` 179 ms of a 1,339 ms boot frame, 1,531 needless
+  // walks on Bistro). `resolveMaterialSurface` walks a shader-graph material
+  // (depth 8, plus a texture-average lookup) and the record builder allocates
+  // a fresh 16-element matrix. Callers that read ONLY
+  // `positions`/`index`/`uvs` — this module's remaining consumers, whose
+  // matrices arrive from the placement — pass `geometryOnly: true` and skip
+  // both. The build's own `#buildEntries` walk still resolves every placed
+  // mesh's surface (emitter qualification + texture-average registration), so
+  // skipping it here removes no side effect the pipeline depends on.
+  const surface = geometryOnly ? null : resolveMaterialSurface(mesh.material, mesh.name);
   // Vertex/index copies cached per geometry (big character models cost real
   // milliseconds to slice per request; a drag only changes the matrix).
   let cached = geometryCopyCache.get(mesh.geometry);
@@ -353,10 +364,37 @@ export function serializeMeshForBake(mesh) {
     // every consumer falls back to the per-slot mean albedo, which is exactly
     // the pre-R7b picture for that mesh alone.
     const uvAttr = mesh.geometry.attributes.uv;
+    // ── REFERENCE WHAT IS ALREADY THE RIGHT SHAPE ──────────────────────────
+    //
+    // These slices duplicated EVERY static geometry in the scene — ~86 MB on
+    // Bistro, held for the session by this cache, on top of three's own copy
+    // and the voxelizer's packed arrays. The slice bought nothing for the
+    // common case: a plain non-interleaved `Float32Array` position whose
+    // length is exactly `count * 3` is byte-for-byte what every consumer
+    // wants, and every consumer of these records is READ-ONLY
+    // (`buildStaticSceneBvhWords`, `occupancyField.setGeometry`,
+    // `dynamicObjects`' packer). The copy STAYS wherever the shape is wrong —
+    // interleaved data, a normalized or non-Float32 array, or a buffer longer
+    // than `count * 3` (`positions.length / 3` is how consumers count
+    // vertices, so a padded tail would invent triangles).
+    //
+    // ⚠ The record is therefore NOT safe to TRANSFER (postMessage with a
+    // transfer list would detach the live geometry). A future worker must
+    // copy, not transfer.
+    const refPositions = position.array instanceof Float32Array &&
+      position.isInterleavedBufferAttribute !== true &&
+      position.normalized !== true &&
+      position.itemSize === 3 &&
+      position.array.length === position.count * 3;
+    const indexAttr = mesh.geometry.index;
+    const refIndex = !!indexAttr &&
+      (indexAttr.array instanceof Uint32Array || indexAttr.array instanceof Uint16Array) &&
+      indexAttr.isInterleavedBufferAttribute !== true &&
+      indexAttr.array.length === indexAttr.count;
     cached = {
       version,
-      positions: position.array.slice(0, position.count * 3),
-      index: mesh.geometry.index ? mesh.geometry.index.array.slice() : null,
+      positions: refPositions ? position.array : position.array.slice(0, position.count * 3),
+      index: indexAttr ? (refIndex ? indexAttr.array : indexAttr.array.slice()) : null,
       uvs: uvAttr && uvAttr.itemSize >= 2 && uvAttr.count >= position.count
         ? Float32Array.from({ length: position.count * 2 }, (_, i) =>
             (i & 1) ? uvAttr.getY(i >> 1) : uvAttr.getX(i >> 1))
@@ -364,7 +402,7 @@ export function serializeMeshForBake(mesh) {
     };
     geometryCopyCache.set(mesh.geometry, cached);
   }
-  return {
+  const record = {
     // Identity for the worker's incremental diffing + geometry cache: the
     // key changes when geometry content does, so edits re-ship exactly once.
     id: mesh.id,
@@ -372,11 +410,14 @@ export function serializeMeshForBake(mesh) {
     positions: cached.positions,
     index: cached.index,
     uvs: cached.uvs,
-    matrix: [...mesh.matrixWorld.elements],
-    color: { r: surface.color.r, g: surface.color.g, b: surface.color.b },
-    emissive: { r: surface.emissive.r, g: surface.emissive.g, b: surface.emissive.b },
-    emissiveIntensity: surface.emissiveIntensity,
   };
+  if (surface) {
+    record.matrix = [...mesh.matrixWorld.elements];
+    record.color = { r: surface.color.r, g: surface.color.g, b: surface.color.b };
+    record.emissive = { r: surface.emissive.r, g: surface.emissive.g, b: surface.emissive.b };
+    record.emissiveIntensity = surface.emissiveIntensity;
+  }
+  return record;
 }
 
 const toRecords = (meshesOrRecords) =>
