@@ -1973,8 +1973,11 @@ export function createGi2System({
   };
 
   /** The cheap synchronous view — no readback, for `profile.frameStats`. */
+  /** §19 6.22: the GI Mobility classifier (`window/mobility.js`), set by GISystem at build. */
+  const ext = { mobility: null };
   const snapshot = () => ({
     tier,
+    mobility: ext.mobility?.counts() ?? null,
     built: !!voxelizer,
     frame,
     windowMB: win.describe().totalMB,
@@ -2081,6 +2084,9 @@ export function createGi2System({
     /** §19 6.21 — drop/restore a static placement slot in the exact-shadow tree. */
     setStaticExcluded: (slot, on) => shadowBvh?.setExcluded?.(slot, on) ?? false,
     get bvhExcludedCount() { return shadowBvh?.excludedCount ?? 0; },
+    /** §19 6.22: `gi2.mobility.isDynamicNow(mesh)` / `.stateOf(mesh)` — the one classification every consumer reads. */
+    setMobility(m) { ext.mobility = m; },
+    get mobility() { return ext.mobility; },
     /**
      * How often the caller should pay for a `stats()` readback, in frames.
      *

@@ -44,6 +44,7 @@ import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRAC
 import { srcBinStoreBoundBytes } from "./srcDeposit.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { SURFACE_POOL_CEILINGS, bitsBytesFor, createOccupancyField, describeOccupancyField, quantizeOccupancyRes } from "./occupancyField.js";
+import { createGi2Mobility } from "./window/mobility.js";
 import { BVH_STRATEGY, buildStaticSceneBvhWords, classifyDynamicShape, composeFieldDynamics, createDynamicObjectSet, dynHeaderWords, giMobilityOf, giTraceOf } from "./dynamicObjects.js";
 import { buildLightTree, collectEmitters, estimateLightTreeWords } from "./lightTree.js";
 import { createLightTreeStore } from "./lightTreeStore.js";
@@ -176,6 +177,8 @@ const GI2_MOVER_CAP = 64;
  * happens to be in an idle pose is still going to move).
  */
 const GI2_MOVER_REST_FRAMES = 120;
+/** §19 6.22: the "auto" watch is walked in this many per-frame windows (see `#refreshGi2Movers`). */
+const GI2_AUTO_WATCH_FRAMES = 8;
 /**
  * CONVERGED-IDLE SLEEP (run-gi-perf.mjs, 2026-08-03: the full pipeline at
  * rest is ~2.3ms GPU at ultra — feedback ~1.4, transport ~0.8 — recomputing
@@ -3356,7 +3359,12 @@ export class GISystem {
     // this stage removed (the g-buffer hold and ShadowFreeze) get a measured
     // transform signal for free. One cheap loop replaces two costly ones —
     // which is the unit's goal, arrived at from the other end.
-    const atlasMoved = state.atlas.refreshTransforms();
+    // §19 6.22: under GI2 the audit walks ONLY dynamic-now slots (explicit
+    // "dynamic" + promoted "auto") — static slots are never compared, so a
+    // scene with nothing dynamic bumps nothing at rest.
+    const atlasMoved = state.atlas.refreshTransforms(
+      GI2_PATH && this._gi2Mobility ? this._gi2Mobility.isDynamicNow : null,
+    );
     // Same contract for the exact-reflection BVH scene (GI Phase 3 v1): a
     // moving mesh is a per-mesh uniform update, never a buffer rebuild.
     state.bvhScene?.refreshTransforms();
@@ -3733,6 +3741,7 @@ export class GISystem {
           this._gi2StatsBusy = true;
           state.screen.gi2.stats(renderer)
             .then((s) => {
+              s.mobility = this._gi2Mobility?.counts() ?? null;
               this._gi2Stats = s;
               // §0.4's fail-open contract, GI2's terms: probes that FOUND a
               // surface, and rays that came back from the window. Until both
@@ -17718,6 +17727,9 @@ export class GISystem {
         const area = sx * sy + sy * sz + sz * sx;
         mix(Math.round(Math.log2(Math.max(area, 1e-9)) * 32));
       }
+      // §19 6.22: GI Mobility is read at BUILD (static soup vs dynamic layer),
+      // so a change of it is a change of content — the rebuild re-classifies.
+      mix(giMobilityOf(mesh) === "static" ? 1 : giMobilityOf(mesh) === "dynamic" ? 2 : 3);
       // Instance count and matrix version: adding, removing or re-scattering
       // instances changes which slots exist, and nothing else here would
       // notice (the mesh id, geometry and material are all unchanged).
@@ -18307,7 +18319,13 @@ export class GISystem {
     this._gi2MoverMeshes = meshes;
     this._gi2Movers = null;
     this._gi2AutoWatch = null;
-    this._gi2Promoted = new Set();
+    this._gi2StaticWatch = null;
+    // §19 6.22: ONE classification, kept ACROSS rebuilds — a promoted "auto"
+    // mesh stays dynamic through the soup re-kick its promotion asked for, and
+    // returns to static only when it has rested (`#refreshGi2Movers`).
+    this._gi2Mobility ??= createGi2Mobility();
+    this._gi2Promoted = this._gi2Mobility.promoted;
+    gi2.setMobility?.(this._gi2Mobility);
     this._loggedGi2SkinnedMovers = false;
     const token = (this._gi2PackToken = Symbol("gi2-pack"));
     const budget = Number(globalThis.__gi2PackBudgetMs) > 0
@@ -18388,12 +18406,25 @@ export class GISystem {
     // voxel-membership function. A skinned rig is never here: it is seated
     // unconditionally, because a rig always animates.
     const watch = [];
+    const staticWatch = [];
+    const mobility = this._gi2Mobility;
+    mobility.tally(meshes);
     for (const mesh of meshes) {
       if (moverMeshes.has(mesh) || mesh.isSkinnedMesh) continue;
-      if (giMobilityOf(mesh) !== "auto") continue;
+      const state = mobility.stateOf(mesh);
+      // §19 6.22: a "static" mesh is NEVER audited per frame. Its pose is
+      // recorded only so an ANNOUNCED transform change (the content key's
+      // `transforms` bump — the editor, `entity.setTransform`, a script
+      // setter) can say once that moving it is an authoring error.
+      if (state === "static") { staticWatch.push({ mesh, matrix: mesh.matrixWorld.clone() }); continue; }
+      if (state !== "auto") continue;
       watch.push({ mesh, matrix: mesh.matrixWorld.clone() });
     }
     this._gi2AutoWatch = watch;
+    this._gi2StaticWatch = staticWatch;
+    this._gi2StaticWatchKey = this.engine?.content?.transforms ?? 0;
+    this._gi2AutoWatchKey = this._gi2StaticWatchKey;
+    this._gi2AutoWatchCursor = 0;
     this._gi2MoversDirty = false;
     const staticPlacements = moverMeshes.size
       ? enriched.filter((p) => !moverMeshes.has(p.mesh))
@@ -18791,7 +18822,6 @@ export class GISystem {
   #gi2Movers(meshes) {
     const out = [];
     const box = new THREE.Box3();
-    const promoted = this._gi2Promoted;
     // ── SKINNED RIGS FIRST: they are the ones with a hard claim on a slot ──
     // A rig always animates, and if the cap is contended it must not lose to a
     // crate. `covered` is every mesh a fitted rig speaks for, so the box arm
@@ -18805,13 +18835,11 @@ export class GISystem {
     const rigid = [];
     for (const mesh of meshes) {
       if (covered.has(mesh)) continue;
-      const mobility = giMobilityOf(mesh);
       const skinned = mesh.isSkinnedMesh === true;
-      if (mobility === "static") continue;
-      // Explicit "dynamic", an unfitted skeleton (the fallback arm — better a
-      // root-following box than nothing), or an "auto" mesh the motion watch
-      // has already promoted.
-      if (mobility !== "dynamic" && !skinned && !promoted?.has(mesh)) continue;
+      // §19 6.22: the ONE classification. Explicit "dynamic", a skeleton (an
+      // unfitted one takes the fallback arm — better a root-following box than
+      // nothing), or an "auto" mesh the motion watch has promoted.
+      if (!this._gi2Mobility?.isDynamicNow(mesh)) continue;
       if (!mesh.geometry?.boundingBox) mesh.geometry?.computeBoundingBox?.();
       const bb = mesh.geometry?.boundingBox;
       if (!bb) continue;
@@ -18962,28 +18990,55 @@ export class GISystem {
         // 6.21b — ONCE per promotion: `_gi2SettleAsked` is cleared when the mesh is
         // promoted and set when the rebuild is asked, so a re-seat that re-seeds
         // `restFrames` cannot ask again. `__gi2MoverSettleRebuild = false` opts out.
-        if (globalThis.__gi2MoverSettleRebuild !== false && !m.skinned && m.mesh && m.restFrames >= GI2_MOVER_SETTLE_FRAMES && this._gi2Promoted?.has(m.mesh) && !(this._gi2SettleAsked ??= new Set()).has(m.mesh)) {
+        if (globalThis.__gi2MoverSettleRebuild !== false && !m.skinned && m.mesh && m.restFrames >= GI2_MOVER_SETTLE_FRAMES && this._gi2Mobility?.stateOf(m.mesh) === "promoted" && !(this._gi2SettleAsked ??= new Set()).has(m.mesh)) {
           this._gi2SettleAsked.add(m.mesh);
-          this._gi2Promoted.delete(m.mesh);
+          // §19 6.22: the resolver owns the classification — demote there.
+          this._gi2Mobility.demote(m.mesh);
           console.log(`[gi2] mover settled: "${m.mesh.name}" returns to the static set — rebuild`);
           this.requestRebuild("gi2-mover-settled");
         }
       }
     }
     this._gi2MoversMoving = moving;
+    const mobility = this._gi2Mobility;
+    const keyNow = this.engine?.content?.transforms ?? 0;
+    // ── §19 6.22 — THE STATIC WARN, only when a transform was ANNOUNCED ────
+    // (the content key bumped): static meshes are never walked per frame.
+    const staticWatch = this._gi2StaticWatch;
+    if (staticWatch?.length && keyNow !== this._gi2StaticWatchKey) {
+      this._gi2StaticWatchKey = keyNow;
+      for (const w of staticWatch) {
+        if (!w.mesh?.parent || w.matrix.equals(w.mesh.matrixWorld)) continue;
+        w.matrix.copy(w.mesh.matrixWorld);
+        mobility.warnStaticMoved(w.mesh);
+      }
+    }
     // ── PROMOTION: the "auto" motion watch ────────────────────────────────
+    // §19 6.22: AMORTISED. The whole watch is walked only on a content-key
+    // `transforms` bump (the announced routes); otherwise one window of
+    // 1/GI2_AUTO_WATCH_FRAMES of it per frame catches the un-announced ones
+    // (physics write-back, a script writing straight to Object3D).
     const watch = this._gi2AutoWatch;
     if (watch?.length && globalThis.__gi2AdoptMovingAuto !== false) {
-      const promoted = (this._gi2Promoted ??= new Set());
+      const promoted = mobility.promoted;
       let adopted = 0;
-      for (let i = watch.length - 1; i >= 0; i--) {
+      let lo = 0, hi = watch.length;
+      if (keyNow === this._gi2AutoWatchKey) {
+        const window = Math.max(1, Math.ceil(watch.length / GI2_AUTO_WATCH_FRAMES));
+        lo = Math.min(this._gi2AutoWatchCursor ?? 0, watch.length - 1);
+        hi = Math.min(watch.length, lo + window);
+        this._gi2AutoWatchCursor = hi >= watch.length ? 0 : hi;
+      } else {
+        this._gi2AutoWatchKey = keyNow;
+        this._gi2AutoWatchCursor = 0;
+      }
+      for (let i = hi - 1; i >= lo; i--) {
         const w = watch[i];
         const mesh = w.mesh;
         if (!mesh?.parent) { watch.splice(i, 1); continue; }
         if (w.matrix.equals(mesh.matrixWorld)) continue;
-        w.matrix.copy(mesh.matrixWorld);
         watch.splice(i, 1);
-        promoted.add(mesh);
+        mobility.promote(mesh);
         this._gi2SettleAsked?.delete(mesh);
         adopted++;
         // §19 6.21 — out of the exact-shadow tree NOW: its old pose must not shadow.
@@ -18991,11 +19046,11 @@ export class GISystem {
       }
       if (adopted) {
         console.log(
-          `[gi2] dynamic layer: adopted ${adopted} "auto" mesh(es) that moved. ` +
-            "Their static soup copy stays until the next GI rebuild (GI2 has no per-placement " +
-            "static exclusion yet) — pin them \"Dynamic\" in the Mesh component to hold them out at build.",
+          `[gi2] mobility: promoted ${adopted} "auto" mesh(es) that moved → dynamic layer; ` +
+            "the static soup re-kicks without them (they return to static once they settle — 6.21's rebuild).",
         );
         this._gi2MoversDirty = true;
+        this.requestRebuild("gi2:mobility-promoted");
       }
     }
     if (!this._gi2MoversDirty) return;

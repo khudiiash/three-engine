@@ -1019,6 +1019,9 @@ export class MergeSystem {
         // Already released: it is drawing itself, and its triangles are gone
         // from the proxy. Re-testing it would re-fire on every drag frame.
         if (group.released?.has(i)) continue;
+        // §19 6.22: GI Mobility "static" is never released as a mover — its
+        // transform is ignored by design (GI warns once; see gi/window/mobility.js).
+        if (group.members[i].mesh.userData?.giMobility === "static") continue;
         const elements = group.members[i].mesh.matrixWorld.elements;
         const cached = group.matrices[i];
         for (let e = 0; e < 16; e++) {
