@@ -228,6 +228,15 @@ export const PRIOR_SAMPLES = (() => {
 })();
 /** The floor of a bin's maturity vote — a uniformly newborn neighbourhood renormalises to the prior instead of to black. */
 export const PRIOR_FLOOR = 1 / 64;
+/**
+ * §19 6.32c — THE PRIOR-MODE PAYLOAD `w` CARRIES THE BIN'S EFFECTIVE CONFIDENCE.
+ * `w = PRIOR_W_BASE + conf + 4·round(T·255)` for every bin the merge writes:
+ * `conf = m + (1 − m)·conf_parent` (recursive up the chain; the top cascade
+ * decodes as 1 — its sky/seed is always confident), T at 8 bits (only the
+ * orphan `L + T·sky` term reads it). `0 ≤ w < 2` stays the legacy
+ * `T = w, conf = 1`; `w < 0` stays UNKNOWN. Decoded by `decodePriorW`.
+ */
+export const PRIOR_W_BASE = 2;
 
 /**
  * Accumulated weight below which a bin is UNKNOWN rather than dim — one

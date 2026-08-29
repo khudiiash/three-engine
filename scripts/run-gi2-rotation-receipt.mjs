@@ -141,38 +141,50 @@ if (DEG_F > 0) {
       const stride = 2;
       const dump = createGi2PixelDump({ renderer: eng.renderer, gi2, screen: sys.state?.screen, stride });
       const awaitFrame = () => new Promise((r) => { const off = eng.onPostRender(() => { off(); r(); }); });
-      globalThis.__yawRead = async () => {
+      globalThis.__yawRead = async (eye) => {
         const d = await dump.read(awaitFrame, 6, 1);
         const OV = GI2_PIXEL_OUT_VEC; const B = Math.max(1, Math.round(16 / stride));
         const bw = Math.floor(dump.dumpW / B), bh = Math.floor(dump.dumpH / B);
-        const means = new Array(bw * bh).fill(-1);
+        const means = new Array(bw * bh).fill(-1), geo = new Array(bw * bh).fill(null);
         for (let by = 0; by < bh; by++) for (let bx = 0; bx < bw; bx++) {
-          let s = 0, n = 0;
+          let s = 0, n = 0, nx = 0, ny = 0, nz = 0, dist = 0;
           for (let y = by * B; y < by * B + B; y++) for (let x = bx * B; x < bx * B + B; x++) {
             const b = (y * dump.dumpW + x) * OV * 4; if (d[b + 3] < 0.5) continue;
             s += 0.2126 * d[b + 8] + 0.7152 * d[b + 9] + 0.0722 * d[b + 10]; n++;
+            nx += d[b + 4]; ny += d[b + 5]; nz += d[b + 6];
+            dist += Math.hypot(d[b] - eye[0], d[b + 1] - eye[1], d[b + 2] - eye[2]);
           }
-          means[by * bw + bx] = n >= (B * B) / 2 ? s / n : -1;
+          if (n >= (B * B) / 2) {
+            means[by * bw + bx] = s / n;
+            const nl = Math.hypot(nx, ny, nz) || 1;
+            // a block whose normals disagree (|mean n| < cos 5°) is not one plane — it takes no part in the edge/step census
+            geo[by * bw + bx] = (nl / n) >= Math.cos(5 * Math.PI / 180) ? [nx / nl, ny / nl, nz / nl, dist / n] : null;
+          }
         }
-        return { means, bw, bh, attempts: d.attempts, frame: gi2.gather?.frame ?? 0 };
+        return { means, geo, bw, bh, attempts: d.attempts, frame: gi2.gather?.frame ?? 0 };
       };
       return JSON.stringify({ ok: true, stride, dumpW: dump.dumpW, dumpH: dump.dumpH });
     } catch (e) { return JSON.stringify({ error: String(e?.message ?? e) }); }
   });
   console.log("linear dump", setup);
   const p90 = (arr) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(arr.length * 0.9))] : 0;
+  // §19 6.32c — GEOMETRY-BLIND: an edge counts only between blocks on ONE gbuffer plane (normals within 5°, distance
+  // within 2 %) — a brightness difference there is a TILE edge by construction, never a shading edge. A step counts
+  // only for a block that shows the same plane in both frames.
+  const COS5 = Math.cos(5 * Math.PI / 180);
+  const samePlane = (g0, g1) => !!g0 && !!g1 && (g0[0] * g1[0] + g0[1] * g1[1] + g0[2] * g1[2]) >= COS5 && Math.abs(g0[3] - g1[3]) <= 0.02 * Math.max(g0[3], g1[3]);
   const blockStats = (cur, prev, bw, bh) => {
-    const valid = cur.filter((m) => m >= 0); const fmean = valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : 1;
+    const valid = cur.means.filter((m) => m >= 0); const fmean = valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : 1;
     const black = valid.filter((m) => m < 0.02 * fmean).length;
     const edges = [], steps = [];
     for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
-      const m0 = cur[y * bw + x]; if (m0 < 0) continue;
-      if (x + 1 < bw && cur[y * bw + x + 1] >= 0) edges.push(Math.abs(m0 - cur[y * bw + x + 1]) / fmean);
-      if (y + 1 < bh && cur[(y + 1) * bw + x] >= 0) edges.push(Math.abs(m0 - cur[(y + 1) * bw + x]) / fmean);
-      if (prev && prev[y * bw + x] >= 0) steps.push(Math.abs(m0 - prev[y * bw + x]) / fmean);
+      const i = y * bw + x; const m0 = cur.means[i]; if (m0 < 0) continue;
+      if (x + 1 < bw && cur.means[i + 1] >= 0 && samePlane(cur.geo[i], cur.geo[i + 1])) edges.push(Math.abs(m0 - cur.means[i + 1]) / fmean);
+      if (y + 1 < bh && cur.means[i + bw] >= 0 && samePlane(cur.geo[i], cur.geo[i + bw])) edges.push(Math.abs(m0 - cur.means[i + bw]) / fmean);
+      if (prev && prev.means[i] >= 0 && samePlane(cur.geo[i], prev.geo[i])) steps.push(Math.abs(m0 - prev.means[i]) / fmean);
     }
     edges.sort((a, b) => a - b); steps.sort((a, b) => a - b);
-    return { fmean, valid: valid.length, black: black / Math.max(1, valid.length), edgeMean: edges.length ? edges.reduce((a, b) => a + b, 0) / edges.length : 0, edgeP90: p90(edges), stepP90: prev ? p90(steps) : NaN };
+    return { fmean, valid: valid.length, black: black / Math.max(1, valid.length), nEdges: edges.length, nSteps: steps.length, edgeMean: edges.length ? edges.reduce((a, b) => a + b, 0) / edges.length : 0, edgeP90: p90(edges), stepP90: prev ? p90(steps) : NaN };
   };
   const cam1 = await call("viewport.getCamera");
   const e = cam1.position, t = cam1.target; const dx = t[0] - e[0], dz = t[2] - e[2]; const R = Math.hypot(dx, dz) || 5; const a0 = Math.atan2(dz, dx);
@@ -180,15 +192,15 @@ if (DEG_F > 0) {
   for (let k = 0; k < NFRAMES; k++) {
     const a = a0 + k * DEG_F * Math.PI / 180;
     await call("viewport.setCamera", { position: e, target: [e[0] + Math.cos(a) * R, t[1], e[2] + Math.sin(a) * R] });
-    const r = await page.evaluate(() => globalThis.__yawRead());
-    const st = blockStats(r.means, prev, r.bw, r.bh);
-    console.log(`yaw f${String(k).padStart(2, "0")} +${(k * DEG_F).toFixed(0)}°  frame ${r.frame} att ${r.attempts}  mean ${st.fmean.toFixed(4)}  valid ${st.valid}  black ${(100 * st.black).toFixed(2)} %  edge mean ${(100 * st.edgeMean).toFixed(2)} % p90 ${(100 * st.edgeP90).toFixed(2)} %  step p90 ${Number.isFinite(st.stepP90) ? (100 * st.stepP90).toFixed(2) + " %" : "n/a"}`);
-    if (k > 0) { eP.push(st.edgeP90); sP.push(st.stepP90); }
-    prev = r.means;
+    const r = await page.evaluate((eye) => globalThis.__yawRead(eye), e);
+    const st = blockStats(r, prev, r.bw, r.bh);
+    console.log(`yaw f${String(k).padStart(2, "0")} +${(k * DEG_F).toFixed(0)}°  frame ${r.frame} att ${r.attempts}  mean ${st.fmean.toFixed(4)}  valid ${st.valid}  black ${(100 * st.black).toFixed(2)} %  planeEdges ${st.nEdges} planeSteps ${st.nSteps}  edge mean ${(100 * st.edgeMean).toFixed(2)} % p90 ${(100 * st.edgeP90).toFixed(2)} %  step p90 ${Number.isFinite(st.stepP90) ? (100 * st.stepP90).toFixed(2) + " %" : "n/a"}`);
+    if (k >= 15) { eP.push(st.edgeP90); sP.push(st.stepP90); }
+    prev = r;
     if (k === SHOT_AT) { const buf = await page.screenshot({ clip, type: "png" }); writeFileSync(`${OUTDIR}/rot-${TAG}-yaw${k}.png`, buf); console.log(`  composed shot at f${k}: ${stats(buf, false)}`); }
   }
   eP.sort((a, b) => a - b); sP.sort((a, b) => a - b);
-  console.log(`YAW SUMMARY ${TAG}: frames ${NFRAMES} at ${DEG_F}°/frame — tile-edge p90 median ${(100 * eP[eP.length >> 1]).toFixed(2)} % max ${(100 * eP[eP.length - 1]).toFixed(2)} %  |  step p90 median ${(100 * sP[sP.length >> 1]).toFixed(2)} % max ${(100 * sP[sP.length - 1]).toFixed(2)} %`);
+  console.log(`YAW SUMMARY ${TAG}: frames ${NFRAMES} at ${DEG_F}°/frame, f15-f29 same-plane only — tile-edge p90 median ${(100 * eP[eP.length >> 1]).toFixed(2)} % max ${(100 * eP[eP.length - 1]).toFixed(2)} %  |  step p90 median ${(100 * sP[sP.length >> 1]).toFixed(2)} % max ${(100 * sP[sP.length - 1]).toFixed(2)} %`);
   await browser.close(); process.exit(0);
 }
 const cam0 = await call("viewport.getCamera");

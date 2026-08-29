@@ -109,7 +109,8 @@ import {
 } from "./srcConfig.js";
 import { binDirTable, tileCosineWeights } from "./srcMath.js";
 import { octahedralUV } from "./srcOctahedral.js";
-import { BIN_COUNT, BIN_WORDS, DEPOSIT_SCALE, PAYLOAD_SEED_BASE, PAYLOAD_WORDS, PRIOR_FLOOR, PRIOR_SAMPLES } from "./srcDeposit.js";
+import { PAYLOAD_SEED_BASE, PAYLOAD_WORDS, PRIOR_FLOOR } from "./srcDeposit.js";
+import { decodePriorW } from "./srcMerge.js";
 
 /**
  * §19 5.4e — what one PARENT-SEEDED bin is worth against one MEASURED bin in
@@ -493,7 +494,9 @@ export function createSrcTileAtlas(store, bins, {
         // estimator, no ramp to get out of step: one weight, two populations.
         const wRaw = payload.element(o.add(uint(3))).toVar();
         const seeded = wRaw.lessThanEqual(float(PAYLOAD_SEED_BASE)).toVar();
-        const T = select(seeded, float(PAYLOAD_SEED_BASE).sub(wRaw), wRaw).toVar();
+        // §19 6.32c — prior mode decodes { T, conf } out of w (srcDeposit PRIOR_W_BASE).
+        const dec = prior ? decodePriorW(wRaw) : null;
+        const T = (prior ? select(wRaw.lessThan(0), wRaw, dec.T) : select(seeded, float(PAYLOAD_SEED_BASE).sub(wRaw), wRaw)).toVar();
         const cwEff = select(seeded, cw.mul(seedW), cw).toVar();
         // A seed at `w_seed == 0` is not admitted AT ALL — not with weight
         // zero, which would still inflate `known` and therefore `cover`'s
@@ -536,11 +539,8 @@ export function createSrcTileAtlas(store, bins, {
           wsum.addAssign(cwEff);
           known.addAssign(uint(1));
           if (prior) {
-            const cb = uint(info.binBase).add(block.mul(uint(nBins))).add(m)
-              .mul(uint(BIN_WORDS)).toVar();
-            const cnt = float(atomicLoad(prior.scratch.element(cb.add(uint(BIN_COUNT))))).toVar();
-            const mb = cnt.div(float(PRIOR_SAMPLES * DEPOSIT_SCALE)).clamp(0, 1).max(PRIOR_FLOOR).toVar();
-            mat.addAssign(cwEff.mul(mb));
+            // §19 6.32c — the bin's EFFECTIVE confidence (own + parent chain), floored.
+            mat.addAssign(cwEff.mul(dec.conf.max(PRIOR_FLOOR)));
           }
         });
       });
