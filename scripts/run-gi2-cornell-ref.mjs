@@ -1566,6 +1566,12 @@ if (process.env.MAPS) {
     if (lum(q.ref) < 0.25 * irrP50 && lum(q.E) > 2 * lum(q.ref)) shadowish.push(row);
   }
   mkdirSync(process.env.MAPS, { recursive: true });
+  // §19 6.20 — the DENSE rows behind the picture, so a blotch's spatial SCALE
+  // can be measured (autocorrelation of the signed log error per surface, in
+  // pixels and in metres) rather than eyeballed off the PNG.
+  writeFileSync(path.join(process.env.MAPS, "rows.json"), JSON.stringify(rows
+    .filter((q) => q.ref && !q.emitFace && lum(q.ref) > 1e-6 && lum(q.E) > 0)
+    .map((q) => ({ x: q.x, y: q.y, s: q.surf, p: q.p.map((v) => +v.toFixed(4)), n: q.n?.map?.((v) => +v.toFixed(3)), lg: +Math.log(lum(q.E) / lum(q.ref)).toFixed(5), E: +lum(q.E).toFixed(5), ref: +lum(q.ref).toFixed(5), noise: q.noise }))));
   writeFileSync(path.join(process.env.MAPS, "err.png"), png(W, H, errImg));
   writeFileSync(path.join(process.env.MAPS, "green.png"), png(W, H, grnImg));
   const med = (a, k) => quantile(a.map((r) => r[k]), 0.5);
