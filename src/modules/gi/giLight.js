@@ -2351,9 +2351,33 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // directional term is killed in nested views for the same reason.
       const nested = light.giNestedView ? float(light.giNestedView).clamp(0, 1) : float(0);
       const nestedKill = float(1).sub(nested);
+      // §19 6.15 — THE EXACT ARM IS AUTHORITATIVE ON A TRACED PIXEL. The
+      // Cornell attribution (three shots at the gate pose: default /
+      // `__giNoBvhReflections` / `__giReflectionProbes=false`) put the
+      // "muddy, stair-stepped" mirror on the PROBE: the low-res cube capture
+      // painted every traced MISS (the mirror reflecting the open front of
+      // the box) with its serrated block edge, and the exact hit next to it
+      // could not out-vote a term that was mixed in first. A ray that ran the
+      // BVH knows more than a 16 k-texel cube ever will, hit OR miss: on a hit
+      // the exact colour wins below; on a traced miss the environment/glossy
+      // term is the honest answer, not the probe's picture of the room. The
+      // probe keeps every NEVER-traced texel (masked skip, lower tiers, nested
+      // views) exactly as before. Sampled here, before the probe mix, and
+      // re-used by the exact block below (same texel, one read).
+      const exactTracedT = light.bvhReflectTexture && light.bvhReflectColorTexture && canMirror
+        ? light.bvhReflectTexture.sample(giUV).r
+        : null;
+      const exactTraced = exactTracedT
+        ? float(exactTracedT.greaterThanEqual(0).or(exactTracedT.lessThan(-1.5)))
+        : null;
       if (light.giProbes) {
         const probe = sampleReflectionProbes(light.giProbes, positionWorld, reflected, roughness);
-        directional = mix(directional, probe.rgb, probe.weight.max(nested));
+        // traced (t >= 0 hit, or t = -2 proven miss) ⇒ the probe yields on
+        // mirror-ish pixels; the same roughness gate the exact blend uses.
+        const probeYield = exactTraced
+          ? float(1).sub(exactTraced.mul(smoothstep(0.45, 0.15, roughness)))
+          : float(1);
+        directional = mix(directional, probe.rgb, probe.weight.mul(probeYield).max(nested));
       } else {
         directional = vec3(directional).mul(nestedKill);
       }
@@ -2487,8 +2511,48 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
         // unclamped negative alpha here would EXTRAPOLATE the mix instead of
         // ignoring it. `nestedKill` — see the NESTED-RENDER ARBITRATION
         // note above: this texture is main-view data.
-        const exactWeight = exactHit.a.clamp(0, 1).mul(smoothstep(0.45, 0.15, roughness)).mul(nestedKill);
-        directional = mix(directional, exactRadiance, exactWeight);
+        // ── §19 6.15: THE HIT/MISS EDGE IS A RAMP, NOT A STEP ──────────────
+        //
+        // A mirror's traced-miss boundary (the open front of the Cornell box
+        // in the mirror block) used to flip from the exact colour to the
+        // fallback in ONE pixel. Four plus-shaped taps one texel out count
+        // how many TRACED neighbours resolved a hit; the weight is that
+        // coverage, so the edge ramps over ~3 px on both sides, and a miss
+        // pixel adjacent to hits borrows the mean of its HIT neighbours (its
+        // own colour is the miss zero — blending that in is the dark rim).
+        // NEVER-traced neighbours (t = -1: the mirror's own silhouette, a
+        // masked skip) are not counted, so the outline of the mirror stays
+        // pixel-exact. A hit pixel keeps its own (prefiltered) colour
+        // untouched: no blur enters the mirror interior.
+        const centreHit = step(0.5, exactHit.a);
+        let exactWeight;
+        if (prefilterOn && light.bvhReflectTexture) {
+          const hitN = float(centreHit).toVar();
+          const tracedN = float(exactTraced).toVar();
+          const nb = vec3(0).toVar();
+          const texel = vec2(light.giScreenTexel).toVar();
+          for (const [ox, oy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const uv = giUV.add(vec2(texel.x.mul(ox), texel.y.mul(oy)));
+            const c = light.bvhReflectColorTexture.sample(uv).level(0);
+            const tt = light.bvhReflectTexture.sample(uv).level(0).r;
+            const h = step(0.5, c.a);
+            const traced = h.max(step(0.5, float(tt.lessThan(-1.5))));
+            hitN.addAssign(h);
+            tracedN.addAssign(traced);
+            nb.addAssign(vec3(c.rgb).mul(h));
+          }
+          const coverage = hitN.div(tracedN.max(1));
+          const borrowed = nb.div(hitN.max(1));
+          const borrowedRadiance = light.bvhReflectShaded
+            ? borrowed
+            : borrowed.mul(irradiance.div(Math.PI).add(vec3(0.06)));
+          const rampRadiance = mix(borrowedRadiance, exactRadiance, centreHit);
+          exactWeight = coverage.clamp(0, 1).mul(smoothstep(0.45, 0.15, roughness)).mul(nestedKill);
+          directional = mix(directional, rampRadiance, exactWeight);
+        } else {
+          exactWeight = exactHit.a.clamp(0, 1).mul(smoothstep(0.45, 0.15, roughness)).mul(nestedKill);
+          directional = mix(directional, exactRadiance, exactWeight);
+        }
       }
       // TRUE mirror reflections for low-roughness materials: one SDF
       // sphere-traced ray through the composited global field (cascade bins

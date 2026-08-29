@@ -10103,6 +10103,17 @@ export class GISystem {
    * from a replicated texel, which is the ruled-lines bug of 2026-08-22.
    */
   #bvhReflectStride() {
+    // §19 6.15 — PER-TIER STRIDE. The mirror mask IS the sharp tier
+    // (renderGiGBuffer draws GI_SHARP_LAYER only), so a sparse prepass traces
+    // nothing but sharp pixels and every one of them deserves its own ray: a
+    // mirror reflects at pixel resolution by construction, and the 2x2
+    // replication (whose silhouette rejections were the "never traced"
+    // texels the probe then painted) never enters a mirror. The dense arm
+    // (`mask: false`, every gbuffer pixel) keeps the block stride below
+    // ultra — that is the glossy tier's cost envelope. Cost is bounded by
+    // the mask's pixel count, not the screen: Cornell's mirror is 0.23 % of
+    // the frame. `__giBvhReflectStride` stays the A/B hatch.
+    if (this.#bvhMaskEnabled()) return giBvhReflectStride(1);
     return giBvhReflectStride(qualityTierOf(this.config) === "ultra" ? 1 : 2);
   }
 
