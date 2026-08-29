@@ -25,6 +25,7 @@
 import puppeteer from "puppeteer-core";
 import { writeFileSync } from "node:fs";
 import { installTauriShim } from "./lib/tauriShim.mjs";
+import { installWebGpuErrorLog } from "./lib/webgpuErrorLog.mjs";
 
 const url = process.argv[2] ?? "http://127.0.0.1:5203/";
 const PROJECT = (process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME").replaceAll("\\", "/");
@@ -51,19 +52,7 @@ const page = await browser.newPage();
 await page.setViewport({ width: 1650, height: 970, deviceScaleFactor: 1 });
 await installTauriShim(page, {});
 await page.evaluateOnNewDocument((flags) => { for (const [k, v] of Object.entries(flags)) globalThis[k] = v; }, JSON.parse(process.env.FLAGS ?? "{}"));
-// §19 6.25d — MAKE THE GPU'S OWN ERRORS VISIBLE: a pipeline that fails to
-// build is an UNCAPTURED error, not a console line; nothing downstream says so.
-await page.evaluateOnNewDocument(() => {
-  const proto = globalThis.GPUAdapter?.prototype;
-  if (!proto?.requestDevice) return;
-  const orig = proto.requestDevice;
-  proto.requestDevice = async function (...a) {
-    const dev = await orig.apply(this, a);
-    dev.addEventListener("uncapturederror", (e) => console.error("[webgpu] " + String(e?.error?.message ?? e).slice(0, 1500)));
-    dev.lost?.then?.((i) => console.error("[webgpu] device lost: " + i?.message));
-    return dev;
-  };
-});
+await installWebGpuErrorLog(page);
 await page.evaluateOnNewDocument((project) => {
   globalThis.__gi2Rc5 = true;
   globalThis.__editorKeepRendering = true;
