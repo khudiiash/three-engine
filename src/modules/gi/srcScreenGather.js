@@ -76,8 +76,10 @@
 
 import * as THREE from "three/webgpu";
 import {
+  Break,
   Fn,
   If,
+  Loop,
   atomicAdd,
   atomicMax,
   atomicMin,
@@ -263,6 +265,8 @@ export function createSrcScreenGather(store, tiles, {
    * IS the normal and the graph is byte-identical to what every gather gate
    * measured.
    */
+  /** §19 6.9 — `__gi2GatherUnknownFallback = 0` restores the black-on-unknown resolve. */
+  const UNKNOWN_FALLBACK = (globalThis.__gi2GatherUnknownFallback ?? 1) !== 0;
   const gatherAt = (position, normal, sampleDir = null, lodOffset = null) => {
     const N = vec3(normal).normalize().toVar();
     // ── §12.88: SAMPLE THE LATTICE FROM IN FRONT OF THE SURFACE ────────────
@@ -495,13 +499,42 @@ export function createSrcScreenGather(store, tiles, {
     // A SHELL WITH NO PROBES MUST NOT DARKEN THE POINT — the shell that did
     // find some carries full weight. Same renormalize-don't-zero rule, one
     // level up from the corners.
+    // ── §19 6.9: A PIXEL WITH NO INFORMATION AT ITS OWN LOD READS THE NEXT
+    // COARSER SHELL THAT HAS ANY, INSTEAD OF RESOLVING BLACK ──────────────────
+    //
+    // `known == false` above meant every corner of both shells was either
+    // unclaimed or a tile whose every bin is UNKNOWN (a probe born this frame
+    // whose cascade parents are newborn too — the cadence gives c1/c2/c3 no
+    // rays on most frames). `rcMerge` wrote that pixel `E = 0`, and on Bistro a
+    // walk frontier is a whole neighbourhood of such probes: one black square
+    // per c0 footprint, the user's "checkerboard, flashes, super unstable".
+    //
+    // The coarser LOD shells at the same point are the probes that served this
+    // surface BEFORE the camera came close (locality retirement keeps them),
+    // so the nearest information in space is one shell up, not last frame's
+    // texel. Same corners, same weights, same coverage renormalisation; the
+    // walk stops at the first shell that has any coverage, and a pixel whose
+    // own shells are covered emits exactly the pre-6.9 graph (the loop is
+    // never entered). No history, no knob: `known` stays honest and
+    // `primaryKnown` carries the receipt for `rcMerge.readStats`.
+    const primaryKnown = shellTotal.greaterThan(0).toVar();
+    if (UNKNOWN_FALLBACK && maxLods > 1) {
+      If(primaryKnown.not(), () => {
+        Loop({ start: 1, end: maxLods, type: "int", name: "fl" }, ({ fl }) => {
+          const l = base.add(float(fl)).toVar();
+          If(l.lessThan(float(maxLods)), () => { shell(l, float(1)); });
+          If(shellTotal.greaterThan(0), () => { Break(); });
+        });
+      });
+    }
+
     If(shellTotal.greaterThan(0), () => { out.assign(out.div(shellTotal)); });
     // `known` (2026-08-22, the black-rectangle fix): whether ANY coverage was
     // found. A point with none returns irradiance 0 — which is an ABSENCE,
     // not a measurement of darkness — and every consumer that renders it as
     // black is violating R1 at the display. The screen pass carries this in
     // the target's alpha so the temporal filter can hold history instead.
-    return { irradiance: out, corners: cornersHit, covered: cornersCovered, known: shellTotal.greaterThan(0) };
+    return { irradiance: out, corners: cornersHit, covered: cornersCovered, known: shellTotal.greaterThan(0), primaryKnown };
   };
 
   // CLOSURE-ONLY, and the header's first section is the whole argument for it:
