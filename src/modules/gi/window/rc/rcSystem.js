@@ -547,6 +547,9 @@ export function createRcCascades({
       width,
       height,
       maxLods,
+      // §19 6.19d — the window's change-reset rides the merge (it owns the
+      // parent cone); off with the window, so the 6.19b arm stays exact.
+      changeReset: rcBinWindow() ? { scratch: bins.scratch, lmax: lmaxU } : null,
       // §19 5.3d — the seated emitter's analytic direct term with its own
       // traced-and-filtered visibility. See `rcDirect.js`; `null` when the
       // build has no slots or the arm is off.

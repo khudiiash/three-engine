@@ -140,6 +140,8 @@ export function createRcMerge({
    * the field does carry, and which this add does not touch.
    */
   direct = null,
+  /** §19 6.19d — `srcMerge`'s change-reset bundle (`{ scratch, lmax }`), or null. */
+  changeReset = null,
 }) {
   const halfW = Math.max(1, Math.ceil(width / 2));
   const halfH = Math.max(1, Math.ceil(height / 2));
@@ -149,7 +151,7 @@ export function createRcMerge({
 
   // ── [G] the merge ─────────────────────────────────────────────────────────
   const merge = createSrcMergeFrame(store, bins, {
-    spacing0, anchor, camera, sky, skyEnv, w0: W0, losOccupied,
+    spacing0, anchor, camera, sky, skyEnv, w0: W0, losOccupied, changeReset,
   });
 
   // ── [H] the c0 irradiance tiles ───────────────────────────────────────────

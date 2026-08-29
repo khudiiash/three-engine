@@ -81,13 +81,15 @@ export const RC_TIERS = {
  * `TEMPORAL_ALPHA` decay (the 6.19 arm this shipped against).
  */
 //
-// ⛔ SHIPPED OFF (0). Measured 6.19b at 64 on Cornell: the inside shot blew
-// out to white and the gate read 13 black px / median 0.325 / at-rest p90
-// 11.8 % — a bin held at k = 1 below 64 samples is being NORMALISED by
-// something that assumes the EMA's steady-state count (the resolve or [J]'s
-// SR/SG/SB words), not by COUNT. Find that reader before re-defaulting;
-// `__gi2BinWindow = 64` arms the arm for the A/B.
-export const BIN_WINDOW = 0;
+// §19 6.19d — ON (64), with the change-reset (`srcMerge.CHANGE_RESET_FRACTION`).
+// 6.19b's "blow-out" was never a normaliser: the bin receipt (Σ, count, Σ/count
+// per bin over 400 frames at rest, window 0 vs 64) shows every sum word and
+// the count decaying by the same k and the resolve dividing by COUNT —
+// c0 settles at exactly 64-68 samples and reads DIMMER, not brighter
+// (mean bin E 0.032 vs 0.043). What the window did change is that a bin
+// never retires (one sample lasts forever) and a settled bin tracks at
+// α ≈ 1/64, which is what the change-reset is for.
+export const BIN_WINDOW = 64;
 export const rcBinWindow = (runtime = globalThis) => {
   const forced = Number(runtime?.__gi2BinWindow);
   if (Number.isFinite(forced)) return forced > 0 ? Math.round(forced) : null;

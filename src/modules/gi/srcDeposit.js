@@ -1044,10 +1044,31 @@ export function createSrcDepositFrame(store, bins, {
       const cnt = float(atomicLoad(scratch.element(b.add(uint(BIN_COUNT))))).max(1).toVar();
       const kWin = float(window * DEPOSIT_SCALE).div(cnt).min(1).toVar();
       If(k.greaterThan(0).and(k.lessThan(1)), () => { k.assign(k.max(kWin)); });
+      // §19 6.19d — THE CHANGE-RESET. The merge raised `BIN_SG` last frame
+      // because this bin's parent cone moved (`srcMerge.CHANGE_RESET_FRACTION`);
+      // the weight drops to a quarter window, the mean is untouched (every sum
+      // word takes the same k), and the bin re-tracks at α ≈ 4/window. A
+      // handed-off bin (k = 0) is zeroed anyway; a held one (k = 1, off-screen
+      // or not due) takes the drop too — it has no rays to lose and the mean
+      // survives. The flag is consumed below, whichever way it went.
+      const reset = atomicLoad(scratch.element(b.add(uint(BIN_SG)))).toVar();
+      If(reset.notEqual(uint(0)).and(k.greaterThan(0)), () => {
+        const kReset = float(Math.max(1, Math.floor(window / 4)) * DEPOSIT_SCALE).div(cnt).min(1).toVar();
+        k.assign(k.min(kReset));
+      });
     }
+    const windowed = !!(keep && Number.isFinite(window) && window > 0);
     for (let w = 0; w < BIN_WORDS; w++) {
       const e = scratch.element(b.add(uint(w)));
-      if (w === BIN_SN) {
+      if (windowed && w === BIN_SG) {
+        // The change-reset request: one frame's message from the merge to
+        // this pass, consumed above. Cleared unconditionally.
+        atomicStore(e, uint(0));
+      } else if (windowed && w === BIN_SR) {
+        // The previous parent luma (f32 bits) the merge compares against —
+        // not a sum, so held like the normal and zeroed only on hand-off.
+        If(k.lessThanEqual(0), () => { atomicStore(e, uint(0)); });
+      } else if (w === BIN_SN) {
         // The normal is not a sum, so it must not be decayed — `floor(x·keep)`
         // on a packed direction produces a different direction, not a dimmer
         // one. Held exactly, and zeroed only on the one event that invalidates
