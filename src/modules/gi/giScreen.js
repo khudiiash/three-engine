@@ -943,9 +943,8 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
   // where a neighbour's `t` reconstructs a hit metres away. Quantising the
   // mapping DOWN to the stride makes every shade texel read a real anchor —
   // the sample spacing goes slightly non-uniform (2,4,2,4 at scale 3) and the
-  // material's bilinear upsample never sees it. Ultra (stride 1) is
-  // unaffected by construction, which is why the artifact only ever showed at
-  // high and below.
+  // material's bilinear upsample never sees it. The receiver-matched search
+  // below supersedes the one-anchor snap at every tier, including Ultra.
   const sx = resolveWidth / width;
   const sy = resolveHeight / height;
   const stride = Math.max(1, Math.round(sourceStride) || 1);
@@ -954,15 +953,58 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
   // whole expression to float — which would make the snap a silent no-op and
   // leave the bug it exists to prevent looking fixed.
   const snap = (v) => (stride > 1 ? int(v).div(int(stride)).mul(int(stride)) : int(v));
-  const gAt = (sx !== 1 || sy !== 1 || stride > 1)
-    ? (c) => ivec2(snap(c.x.toFloat().mul(sx)), snap(c.y.toFloat().mul(sy)))
+  // Stride reconstruction starts from the UNSNAPPED receiver pixel. Snapping
+  // first loses the identity needed to reject an anchor from the other side
+  // of a silhouette and was the source of the old checker pattern.
+  const desiredAt = (sx !== 1 || sy !== 1)
+    ? (c) => ivec2(int(c.x.toFloat().mul(sx)), int(c.y.toFloat().mul(sy)))
     : (c) => c;
+  const anchorOffsets = giBvhReflectAnchorOffsets(stride);
 
   const compute = Fn(() => {
     const px = instanceIndex.mod(widthU);
     const py = instanceIndex.div(widthU);
     const coord = ivec2(px.toInt(), py.toInt());
-    const srcCoord = gAt(coord);
+    const desiredCoord = desiredAt(coord);
+    const srcCoord = ivec2(snap(desiredCoord.x), snap(desiredCoord.y)).toVar();
+    if (stride > 1) {
+      const receiver0 = positionNode.load(desiredCoord).toVar();
+      const receiver1 = normalNode.load(desiredCoord).toVar();
+      const receiverN = receiver1.xyz.normalize().toVar();
+      const receiverLive = bvhShade.masked
+        ? receiver0.w.greaterThan(0.5).and(receiver1.w.greaterThan(0.5))
+        : receiver0.w.greaterThan(0.5);
+      const posTol = receiver0.xyz.sub(vec3(cameraPosition)).length().mul(0.02).max(0.01).toVar();
+      const baseX = snap(desiredCoord.x);
+      const baseY = snap(desiredCoord.y);
+      const bestScore = float(1e20).toVar();
+      // Four neighbouring REAL trace anchors, never replicated texels. A
+      // candidate must belong to the same receiver plane and must have run a
+      // ray (-2 is a proven environment miss; -1 means no ray ran).
+      for (const [dx, dy] of anchorOffsets) {
+        const cx = baseX.add(int(dx));
+        const cy = baseY.add(int(dy));
+        If(cx.lessThan(int(resolveWidth)).and(cy.lessThan(int(resolveHeight))), () => {
+          const candidate = ivec2(cx, cy);
+          const candidate0 = positionNode.load(candidate).toVar();
+          const candidate1 = normalNode.load(candidate).toVar();
+          const candidateHit = bvhTNode.load(candidate).toVar();
+          const traced = candidateHit.x.greaterThanEqual(0).or(candidateHit.x.lessThan(-1.5));
+          const sameReceiver = receiverLive
+            .and(candidate0.w.greaterThan(0.5))
+            .and(traced)
+            .and(candidate0.xyz.sub(receiver0.xyz).length().lessThan(posTol))
+            .and(candidate1.xyz.normalize().dot(receiverN).greaterThan(0.965));
+          const dxPx = cx.sub(desiredCoord.x).toFloat();
+          const dyPx = cy.sub(desiredCoord.y).toFloat();
+          const score = dxPx.mul(dxPx).add(dyPx.mul(dyPx));
+          If(sameReceiver.and(score.lessThan(bestScore)), () => {
+            srcCoord.assign(candidate);
+            bestScore.assign(score);
+          });
+        });
+      }
+    }
     const g0 = positionNode.load(srcCoord).toVar();
     const g1 = normalNode.load(srcCoord).toVar();
     const bvhOut = vec3(0).toVar();
@@ -4163,6 +4205,16 @@ export function giBvhReflectStride(strideDefault = 2) {
   return Math.max(1, Math.min(4, Number.isFinite(raw) ? Math.round(raw) : strideDefault));
 }
 
+/**
+ * The traced anchors that bracket a pixel inside a stride-sized block.
+ * Shared by the hit-shade reconstruction and its focused policy gate so the
+ * two cannot quietly disagree about which neighbouring blocks are eligible.
+ */
+export function giBvhReflectAnchorOffsets(stride = 2) {
+  const s = Math.max(1, Math.min(4, Math.round(Number(stride)) || 1));
+  return s === 1 ? [[0, 0]] : [[0, 0], [s, 0], [0, s], [s, s]];
+}
+
 export function createGiBvhReflect({
   gbuffer, target, colorTarget, width, height, bvhScene,
   cameraPosition, normalOffset, maxDistance, mask = true, dyn = null,
@@ -4216,15 +4268,12 @@ export function createGiBvhReflect({
   // buys the quality back for +0.4 ms there, and small scenes barely notice
   // (the user's Level: 0.45 ms at 3, ~0.9 at 2).
   //
-  // `strideDefault` (2026-08-22): ULTRA passes 1. On complex reflected
-  // content (railings, stairs) half of every 2×2 block straddles a
-  // silhouette and its texels are validated-out to −1 — giLight then falls
-  // to the PROBE reflection on exactly those texels, and interleaving two
-  // different images per-texel is the salt-and-pepper stipple the user's
-  // mirror walls showed ("a lot of artifacts"). Per-pixel tracing removes
-  // the replication class entirely; ultra is the tier defined as "spend
-  // whatever it costs" (banner Sponza pays the full 13 ms there — lower
-  // quality if that hurts). High keeps 2 on its half-res grid.
+  // `strideDefault` (2026-08-31): every exact tier uses 2. The former Ultra
+  // stride 1 existed because a block whose anchor lay across a silhouette
+  // became an invalid checker square. createGiBvhHitShade now searches the
+  // four neighbouring REAL anchors and admits only one whose receiver plane
+  // matches, preserving the edge without restoring four BVH traversals.
+  // `__giBvhReflectStride = 1` remains the exact reference arm.
   const stride = giBvhReflectStride(strideDefault);
   const blocksW = Math.ceil(width / stride);
   const blocksH = Math.ceil(height / stride);

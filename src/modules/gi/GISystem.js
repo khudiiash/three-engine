@@ -9071,9 +9071,8 @@ export class GISystem {
         // §14 R-D: the prepass unions the dynamic-object proxies (skinned
         // characters) into exact reflections — see createGiBvhReflect.
         dyn: this._dynSet ?? null,
-        // Ultra traces per-pixel — the stride-2 replication rejections
-        // interleaved exact and probe images per texel (the mirror-wall
-        // stipple); see createGiBvhReflect's strideDefault note.
+        // Stride 2 at every exact tier; hit shading reconstructs receiver-
+        // matched anchors at silhouettes instead of exposing invalid blocks.
         strideDefault: this.#bvhReflectStride(),
         // §17 R7a — whole-scene reflections through the static shadow BVH.
         oneBvh: this.#oneBvhBundle(),
@@ -9151,15 +9150,16 @@ export class GISystem {
   /**
    * The exact-reflection prepass's block stride for the CURRENT tier.
    *
-   * Ultra traces per-pixel (1); every tier below traces one ray per 2×2 block
-   * and replicates. Both the prepass (which anchors its rays on multiples of
-   * this) and the hit-shade pass (which must SNAP its source reads to those
-   * anchors — see createGiBvhHitShade's anchor note) read it from here, so
-   * they cannot disagree: a mismatch shades every other row of the reflection
-   * from a replicated texel, which is the ruled-lines bug of 2026-08-22.
+   * Every exact tier traces one ray per 2×2 block. The hit-shade pass searches
+   * the four neighbouring anchors for the same receiver plane, eliminating
+   * the invalid silhouette checker that previously forced Ultra to stride 1.
    */
   #bvhReflectStride() {
-    return giBvhReflectStride(qualityTierOf(this.config) === "ultra" ? 1 : 2);
+    // Receiver-matched four-anchor reconstruction in createGiBvhHitShade
+    // removes the invalid silhouette checker that previously forced Ultra to
+    // trace every pixel. Keep stride 1 available through the existing hatch
+    // as the exact reference arm.
+    return giBvhReflectStride(2);
   }
 
   /**
