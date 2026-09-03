@@ -816,7 +816,12 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
           .min(rel.y.min(size.y.sub(rel.y)))
           .min(rel.z.min(size.z.sub(rel.z)))
           .toVar();
-        const wBox = float(1).sub(inside.div(float(farField.feather).max(1e-3)).clamp(0, 1)).toVar();
+        // §11.20: only a real DETAIL box has an outside — see GISystem's
+        // `boxFeather` note. Absent one, the volume covers the whole scene and
+        // this term is a scene-average wash over every surface near the edge.
+        const wBox = farField.boxFeather === false
+          ? float(0).toVar()
+          : float(1).sub(inside.div(float(farField.feather).max(1e-3)).clamp(0, 1)).toVar();
         // -- NEVER BLACK (2026-09-02): the second reason for the constant --
         // A pixel whose gather found NO coverage (a probe born this frame, a
         // column the camera just revealed, an orphan bin with no parent)
@@ -827,9 +832,51 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
         // BELOW the filter's 0.5 adoption threshold so a real neighbour still
         // wins over the constant when one exists. `farField.coverage === false`
         // keeps the box-only behaviour.
+        //
+        // ⭐⭐ §11.20 — AND `1 − knownF` IS THE WRONG COVERAGE (2026-09-03,
+        // the user's "almost no colour bleed", twice).
+        //
+        // Two different things are called coverage here. SPATIAL: did any
+        // probe answer for this point — the case this fallback exists for (a
+        // probe born this frame, a revealed column, an orphan bin). ANGULAR:
+        // how much of this texel's cosine lobe has ever been sampled, which
+        // since §12.87 is an honest FRACTION carried in the tile's alpha and
+        // therefore in `knownF`. A fully-covered room converges to angular
+        // coverage around 0.55 (measured on their Cornell: meanKnownBins 11.4
+        // of a 20.1-bin lobe) — so a LINEAR `1 − knownF` mixed **45 % of a
+        // flat, scene-average, warm-white constant into every pixel of a
+        // perfectly well-covered room**, permanently. That is the missing
+        // colour bleed, and it is also why the field read bright-but-pale:
+        // the constant carries the room's MEAN, which is exactly the thing a
+        // Cornell box's red and green walls are not.
+        //
+        // Measured, their Cornell, one pose, 30 s settle, against the path
+        // tracer: whites' saturation 0.159 with the fill, 0.423 with
+        // `__giFarField = false` (tracer 0.573), and the luminance ratio
+        // 0.81× → 1.20×. The fix keeps the never-black guarantee and drops
+        // the tax: the fill ramps in only where coverage is genuinely LOW,
+        // reaching full strength at zero coverage — where the 2026-09-02
+        // cases all sit — and contributing nothing at the 0.5-ish coverage a
+        // healthy room runs at. Smooth, because a step here would be an edge
+        // in the image (the standing no-edges rule).
+        //
+        // `__giFarFieldCoverageLow` moves the knee (0 restores box-only);
+        // `__giFarFieldLinearCoverage = true` restores the old linear ramp
+        // for an A/B.
+        // ⚠ OPT-IN AND UNPROVEN. On their Cornell this ramp measured NO
+        // difference either way (whites' saturation 0.160 vs 0.159) because
+        // the box term above was carrying the whole wash — so it has no
+        // evidence behind it, and the linear form is what every "never black"
+        // case was built and tested against. `__giFarFieldCoverageRamp = true`
+        // arms it; `__giFarFieldCoverageLow` moves its knee.
+        const covLow = Number.isFinite(Number(globalThis.__giFarFieldCoverageLow))
+          ? Math.max(0, Number(globalThis.__giFarFieldCoverageLow))
+          : 0.25;
         const wCov = farField.coverage === false
           ? float(0).toVar()
-          : float(1).sub(knownF).clamp(0, 1).toVar();
+          : globalThis.__giFarFieldCoverageRamp === true && covLow > 0
+            ? smoothstep(float(0), float(1), float(1).sub(knownF.div(float(covLow)).clamp(0, 1))).toVar()
+            : float(1).sub(knownF).clamp(0, 1).toVar();
         const w = wBox.max(wCov).toVar();
         If(w.greaterThan(0), () => {
           // Sky-down hemisphere with a ground-bounce floor: up-facing 1.0,

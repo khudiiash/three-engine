@@ -125,6 +125,10 @@ page.on("pageerror", (e) => {
   console.log(`  pageerror: ${msg.slice(0, 200)} @ ${where}`);
 });
 await page.evaluateOnNewDocument((P, flags, quality) => {
+  // The editor persists GI dev hatches (including __giDebugView) here and
+  // re-applies them when the module loads: a stale "path-tracer" would make
+  // every capture the tracer's image. Every arm starts from a clean slate.
+  localStorage.removeItem("gi.devFlags.v1");
   localStorage.setItem("engine.projectRoot.v1", P);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([P]));
   for (const [k, v] of Object.entries(flags)) globalThis[k] = v;
@@ -218,6 +222,20 @@ if (process.env.DRAG) {
   console.log(`  [gi] lines during the drag: ${gi.length - giBefore}, of which rebuild/hold/compile: ${provoked.length}`);
   for (const l of provoked.slice(0, 12)) console.log(`    ${l}`);
 }
+// ⛔ THE CAPTURE MUST BE OUR GI, NOT THE TRACER. A dev flag persisted in
+// localStorage (`gi.devFlags.v1`) booted one arm straight into the
+// path-tracer view, and its "gi" shot was the tracer's own noisy image —
+// which then "proved" that a bigger ray budget restores the colour bleed.
+// Assert the view is off and the tracer is inactive before shooting.
+const viewBefore = await page.evaluate(() => {
+  const v = globalThis.__giDebugView ?? "off";
+  if (v !== "off") globalThis.__giDebugView = "off";
+  return { view: v, tracer: !!globalThis.__giPathTracer };
+});
+if (viewBefore.view !== "off") {
+  console.log(`  ⚠ debug view was "${viewBefore.view}" at capture time — forced off, re-settling 5 s`);
+  await wait(5000);
+}
 const giImg = await shot("gi");
 const profile = await call("profile.giPasses", { samples: 3 });
 // PALETTE=1: the live slot palette — the albedo/emissive every attributed hit
@@ -234,10 +252,11 @@ if (process.env.PALETTE) {
   for (const e of live?.live ?? []) console.log(`  slot ${e.slot}: albedo ${e.albedo.map((v) => v.toFixed(2)).join("/")} emissive ${e.emissive.map((v) => v.toFixed(1)).join("/")} emitter ${e.emitter}`);
 }
 // DEBUG_VIEW=indirect,occupancy: extra captures of the GI debug views (no numbers).
+const debugImgs = new Map();
 for (const view of (process.env.DEBUG_VIEW ?? "").split(",").filter(Boolean)) {
   await page.evaluate((v) => { globalThis.__giDebugView = v; }, view);
   await wait(4000);
-  await shot(view);
+  debugImgs.set(view, await shot(view));
   console.log(`[cornell-ref] ${TAG}: captured debug view "${view}"`);
 }
 await page.evaluate(() => { globalThis.__giDebugView = "off"; });
@@ -332,12 +351,47 @@ for (const [name, p0] of REGIONS) {
   rows.push({ name, fx, fy, gi: a, pt: b, lumRatio: a.lum / Math.max(1e-4, b.lum) });
   console.log(`  ${name.padEnd(22)} ours ${f(a.R)}/${f(a.G)}/${f(a.B)} sat ${f(a.sat)} | tracer ${f(b.R)}/${f(b.G)}/${f(b.B)} sat ${f(b.sat)} | lum ours/tracer ${(a.lum / Math.max(1e-4, b.lum)).toFixed(2)}`);
 }
+// Each debug view measured over the SAME regions: "is the field pale, or is
+// the resolve diluting it" is a comparison, not a look.
+for (const [view, img] of debugImgs) {
+  const out = [];
+  for (const [name, p0] of REGIONS) {
+    const p = shifted(p0);
+    const { fx, fy } = project(p);
+    if (fx < 0 || fx > 1 || fy < 0 || fy > 1) continue;
+    const a2 = sample(img, fx, fy);
+    out.push({ name, ...a2 });
+  }
+  const w = out.filter((r) => /ceiling|back wall|floor/.test(r.name));
+  const mean2 = (arr) => arr.reduce((p2, q) => p2 + q, 0) / Math.max(1, arr.length);
+  console.log(`  view "${view}": WHITES sat ${f(mean2(w.map((r) => r.sat)))} lum ${f(mean2(w.map((r) => r.lum)))}`);
+  for (const r of out.filter((r) => /ceiling near|floor near|wall$/.test(r.name))) {
+    console.log(`    ${r.name.padEnd(20)} ${f(r.R)}/${f(r.G)}/${f(r.B)} sat ${f(r.sat)}`);
+  }
+}
 const whites = rows.filter((r) => /ceiling|back wall|floor/.test(r.name));
 const mean = (a) => a.reduce((p, q) => p + q, 0) / Math.max(1, a.length);
 console.log(`  WHITES: sat ours ${f(mean(whites.map((r) => r.gi.sat)))} vs tracer ${f(mean(whites.map((r) => r.pt.sat)))}; lum ratio min/mean/max ${f(Math.min(...whites.map((r) => r.lumRatio)))}/${f(mean(whites.map((r) => r.lumRatio)))}/${f(Math.max(...whites.map((r) => r.lumRatio)))}`);
 const sp = profile.ok ? profile.value?.srcProbes : null;
 if (sp) {
   const b0 = sp.secondary?.byLod?.[0];
+  // RECEIPTS=1: the whole secondary + tiles + merge block, verbatim — the
+  // bounce/direct ratio alone cannot say WHERE the loop lost its gain.
+  if (process.env.RECEIPTS) {
+    const fs2 = await call("profile.frameStats", { settleMs: 1200 });
+    const transport = await page.evaluate(() => globalThis.__giSrcTransport ?? null);
+    console.log(`  frame: ${fs2.ok ? `fps ${fs2.value.fps} cpu ${fs2.value.cpuMs} gpu ${fs2.value.gpuMs} (real ${fs2.value.gpuMsIsReal})` : fs2.error}`);
+    console.log(`  transport: ${JSON.stringify(transport)}`);
+    console.log(`  secondary: ${JSON.stringify(sp.secondary)}`);
+    console.log(`  tiles: ${JSON.stringify(sp.tiles)}`);
+    console.log(`  gather: ${JSON.stringify(sp.gather ?? null)}`);
+    for (const c of sp.merge?.perCascade ?? []) {
+      console.log(`  merge c${c.cascade}: probes ${c.probes} bins ${c.bins} merged ${c.merged} orphanRate ${(c.orphanRate * 100).toFixed(1)}% orphanLive ${c.orphanLive} meanCorners ${c.meanCorners?.toFixed(2)} losSuppressed ${c.losSuppressed}`);
+    }
+    for (const l of sp.probeRays ?? []) console.log(`  probeRays: ${JSON.stringify(l)}`);
+    for (const c of sp.cascades ?? []) console.log(`  cascade: ${JSON.stringify(c)}`);
+    console.log(`  totals: rays ${sp.raysPerFrame} cap ${sp.probeRayCap} unattributed ${sp.unattributedRate} palette ${JSON.stringify(sp.paletteMeanAlbedo)}`);
+  }
   console.log(`  receipts: tiles meanLum ${sp.tiles?.meanLum?.toFixed(3)} knownFrac ${sp.tiles?.knownFrac?.toFixed(2)} | bounce/direct ${b0?.bounceOverDirect} E ${b0?.meanIrradianceLuma} ρloop ${b0?.meanLoopAlbedoLuma} | unattributed ${sp.unattributedRate} | merge losRate ${sp.merge?.losRate?.toFixed(3)} orphanRate ${sp.merge?.orphanRate?.toFixed(3)} | farField raw ${JSON.stringify(sp.farField?.rawRgb8)}`);
 }
 writeFileSync(path.join(OUT, `${TAG}.json`), JSON.stringify({ tag: TAG, flags: FLAGS, envLight: ENVLIGHT, eye: EYE, target: TARGET, rect, ptSamples, rows, profile: sp ?? null }, null, 2));

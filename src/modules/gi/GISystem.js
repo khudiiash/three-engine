@@ -7337,7 +7337,22 @@ export class GISystem {
           // `#detailFollowTick` keeps the camera out of. `state` can still be
           // the OUTGOING build's here; spacings land 1.0-2.5 m, so the feather
           // is 4-10 m either way.
+          // ⭐⭐ §11.20: THE BOX FEATHER ONLY MEANS SOMETHING INSIDE A DETAIL
+          // BOX. `wBox` exists because a DETAIL box is a small high-resolution
+          // volume inside a larger world, and a pixel near its boundary has no
+          // field beyond it. In the BVH-only build the volume is auto-fitted
+          // around the WHOLE scene and the BVH answers everywhere — there is no
+          // "outside" — yet the same feather applied: 4 probe spacings (~1.4 m
+          // on their 5 m Cornell) measured inward from a box that hugs the room
+          // by ~0.5 m, so the walls, floor and ceiling all sat inside the band
+          // and up to ~70 % of their diffuse term was the flat, warm-white,
+          // scene-average constant. That is the user's "almost no colour
+          // bleed": the constant carries the room's MEAN, which is the one
+          // thing a red and green room is not. `boxFeather` is false unless a
+          // detail box is actually armed; `__giFarFieldBoxFeather = true`
+          // forces the old behaviour for an A/B.
           feather: this.#farFieldFeatherM(),
+          boxFeather: !!(this._detailExtent && this._detailAnchor) || globalThis.__giFarFieldBoxFeather === true,
         };
         console.log(
           `[gi] far-field fallback armed (§13 F3): screen-gather EMA constant, ` +
@@ -9265,7 +9280,22 @@ export class GISystem {
         node: this._giFarFieldNode,
         worldMin: state.volume.world.min,
         worldSize: state.volume.world.size,
+        // ⭐⭐ §11.20: THE BOX FEATHER ONLY MEANS SOMETHING INSIDE A DETAIL
+        // BOX. `wBox` exists because a DETAIL box is a small high-resolution
+        // volume inside a larger world, and a pixel near its boundary has no
+        // field beyond it. In the BVH-only build the volume is auto-fitted
+        // around the WHOLE scene and the BVH answers everywhere — there is no
+        // "outside" — yet the same feather applied: 4 probe spacings (~1.4 m
+        // on their 5 m Cornell) measured inward from a box that hugs the room
+        // by ~0.5 m, so the walls, floor and ceiling all sat inside the band
+        // and up to ~70 % of their diffuse term was the flat, warm-white,
+        // scene-average constant. That is the user's "almost no colour
+        // bleed": the constant carries the room's MEAN, which is the one
+        // thing a red and green room is not. `boxFeather` is false unless a
+        // detail box is actually armed; `__giFarFieldBoxFeather = true`
+        // forces the old behaviour for an A/B.
         feather: this.#farFieldFeatherM(state),
+        boxFeather: !!(this._detailExtent && this._detailAnchor) || globalThis.__giFarFieldBoxFeather === true,
       };
     }
     // The glossy temporal pair and the AO pass follow the same recreate
@@ -14046,7 +14076,22 @@ export class GISystem {
         node: this._giFarFieldNode,
         worldMin: state.volume.world.min,
         worldSize: state.volume.world.size,
+        // ⭐⭐ §11.20: THE BOX FEATHER ONLY MEANS SOMETHING INSIDE A DETAIL
+        // BOX. `wBox` exists because a DETAIL box is a small high-resolution
+        // volume inside a larger world, and a pixel near its boundary has no
+        // field beyond it. In the BVH-only build the volume is auto-fitted
+        // around the WHOLE scene and the BVH answers everywhere — there is no
+        // "outside" — yet the same feather applied: 4 probe spacings (~1.4 m
+        // on their 5 m Cornell) measured inward from a box that hugs the room
+        // by ~0.5 m, so the walls, floor and ceiling all sat inside the band
+        // and up to ~70 % of their diffuse term was the flat, warm-white,
+        // scene-average constant. That is the user's "almost no colour
+        // bleed": the constant carries the room's MEAN, which is the one
+        // thing a red and green room is not. `boxFeather` is false unless a
+        // detail box is actually armed; `__giFarFieldBoxFeather = true`
+        // forces the old behaviour for an A/B.
         feather: this.#farFieldFeatherM(state),
+        boxFeather: !!(this._detailExtent && this._detailAnchor) || globalThis.__giFarFieldBoxFeather === true,
       };
     }
     // Glossy temporal + AO re-arm — the fresh srcProbes has a fresh dispatch

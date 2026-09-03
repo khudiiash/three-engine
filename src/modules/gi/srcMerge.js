@@ -546,9 +546,49 @@ export function createSrcMergeFrame(store, bins, {
       // through. Merging a parent into it would invent an interval estimate
       // this probe never made, and at 0.78 rays per bin (§12.13.4) that
       // invention would be most of the buffer.
+      //
+      // ⭐⭐ §11.20 — AND REFUSING TO MERGE IS ALSO AN INVENTION, A WORSE ONE
+      // (2026-09-03, "almost no colour bleed" on their Cornell).
+      //
+      // The paragraph above is right that a parent merged into an unsampled
+      // bin invents `T_self = 1`. What it misses is that the bin does not then
+      // stay out of the answer: `srcTiles`' bake EXCLUDES unknown bins and
+      // renormalizes over the known ones (`E = π·ΣL·W/ΣW`), which hands the
+      // unsampled direction the MEAN OF THE SAMPLED ONES. So the choice was
+      // never "invent vs abstain", it was "the parent's own radiance in this
+      // direction" vs "the average of the other directions".
+      //
+      // And the unknown bins are NOT missing at random. Rays are born at
+      // gbuffer pixels and distributed by cosine, so a texel's grazing
+      // directions are the least visited — and a grazing direction from a
+      // ceiling or floor texel is exactly where the coloured WALLS are. The
+      // measured consequence on their Cornell (probe:gi-cornell-ref, one pose,
+      // 30 s settle): meanKnownBins 11.2 of a 20.1-bin lobe (55 %), whites at
+      // 0.17 saturation against the path tracer's 0.60 — the room's red/green
+      // equilibrium tint replaced by the near field's white average. It is a
+      // BIAS, not a budget: a three-minute settle reads 0.170, and stride 1
+      // with the per-probe cap off (153 k rays a frame, 10× the default) reads
+      // 0.173.
+      //
+      // `__giMergeFillUnknown = true` fills an unsampled bin from the parent
+      // as if its own near interval were empty — `L_self = 0, T_self = 1` —
+      // which is the honest reading of "no evidence of a near occluder here".
+      // OPT-IN while it is measured: the risk is the mirror image of the
+      // paragraph above (light leaking through near geometry no ray probed),
+      // and this file's own rule is that a fill of last resort must earn its
+      // default against a fixture.
       const selfT = readPayloadT(payload, selfBin);
-      If(selfT.lessThan(0), () => { Return(); });
-      atomicAdd(stats.element(sw(c, MERGE_BINS)), uint(1));
+      const fillUnknown = globalThis.__giMergeFillUnknown === true;
+      const unknown = selfT.lessThan(0).toVar();
+      if (fillUnknown) {
+        atomicAdd(stats.element(sw(c, MERGE_BINS)), uint(1));
+      } else {
+        If(unknown, () => { Return(); });
+        atomicAdd(stats.element(sw(c, MERGE_BINS)), uint(1));
+      }
+      // The interval this bin contributes of its own: its measurement, or the
+      // empty-near-segment stand-in when the fill is armed.
+      const ownT = fillUnknown ? select(unknown, float(1), selfT).toVar() : selfT;
 
       const record = uint(recordBase).add(block.mul(uint(MERGE_CORNERS))).toVar();
       const acc = vec3(0).toVar();
@@ -610,8 +650,11 @@ export function createSrcMergeFrame(store, bins, {
         const invW = float(1).div(wsum).toVar();
         const parentL = acc.mul(invW).toVar();
         const parentT = accT.mul(invW).toVar();
-        const outL = readPayload(payload, selfBin).L.add(parentL.mul(selfT)).toVar();
-        const outT = selfT.mul(parentT).toVar();
+        const ownL = fillUnknown
+          ? select(unknown, vec3(0), readPayload(payload, selfBin).L).toVar()
+          : readPayload(payload, selfBin).L;
+        const outL = vec3(ownL).add(parentL.mul(ownT)).toVar();
+        const outT = ownT.mul(parentT).toVar();
         writePayload(payload, selfBin, outL, outT);
         atomicAdd(stats.element(sw(c, MERGE_MERGED)), uint(1));
         If(outT.equal(0), () => { atomicAdd(stats.element(sw(c, MERGE_OPAQUE)), uint(1)); });
