@@ -4122,6 +4122,86 @@ in attribution. Next: a harness Cornell rig that screenshots the tracer
 through puppeteer (`page.screenshot` sees the tracer's canvas; the MCP
 screenshot does not) and A/Bs the loop gain and the emitter shape.
 
+### 11.19 THE CORNELL RIG: the phantom plane was our own debug quad; the tracer stalls unfocused; ours is the tracer's two-bounce picture at half the chroma (2026-09-03, night)
+
+**The rig (`probe:gi-cornell-ref`, scripts/run-gi-cornell-ref.mjs).** A
+READ-ONLY copy of the user's own Cornell (project GAME, scenes/Cornel.scene —
+the tauri shim refuses writes outside the scratch root), one pose on the
+room's axis, our GI settled 30 s, then the debug view flipped to
+`path-tracer` and the tracer polled through `getSampleCountsAsync` (the
+WebGPU tracer has NO `samples` property) until 64 per pixel. Regions are
+WORLD points projected through the pose, so both captures share them
+whatever the harness aspect. Env: FLAGS (page globals), SETTLE, PT_SAMPLES,
+PT=0, DEBUG_VIEW=indirect,occupancy, PALETTE=1, WALLS=<m>, LIGHT_MOBILITY,
+HIDE_LIGHT, ROOT_SHIFT=x,y,z, GI_PROPS=json, DRAG=<entity>,<s>, ENVLIGHT=0.
+
+**Three instrument lessons before any number was real:**
+1. `viewport.setFreezeWhenUnfocused(false)` or the tracer never converges:
+   headless is never focused, GI's queue pins the loop, and the moment the
+   tracer takes over (GI skips its work while the tracer is active) nothing
+   pins it — the loop suspended at ~3 frames and every "25 s wait" read 1.3
+   samples of dots. With the freeze off: 109 samples in 7 s.
+2. The debug-view overlay is a REAL `PlaneGeometry(2, 2)` mesh at the world
+   origin (clip-space vertex shader, in the scene graph so `renderer.render`
+   draws it). While a debug view is on it is `visible`, and the g-buffer, the
+   voxelizer and the material tiers adopted it as world geometry — the user's
+   **"phantom plane that always appears in occupancy at the world origin"**,
+   and the lighter rectangle on their Cornell floor in the indirect view (the
+   quad's top 0.76 m stood above their floor at y 0.24; the g-buffer drew it
+   with depthTest off, the resolve shaded it). Proven by `ROOT_SHIFT=5,0,0`:
+   the grey square stayed at the origin while the room moved. FIXED: the
+   three debug meshes sit on `DEBUG_LAYER` (the g-buffer camera disables it,
+   the editor camera sees it, the MCP screenshot keeps it) and the voxelizer's
+   `editorOnly` test skips `userData.__giDebug`. Verified: no square in the
+   shifted room's indirect view.
+3. The pipeline-landed REPLAY re-dispatched skipped compute nodes as
+   `renderer.compute(node)` — a node dispatched with an explicit
+   `[x, y, z]` has no `count`, so three's backend read `dispatchSize[0]` of
+   null the moment the tracer's kernels came through the interception.
+   FIXED: `giReplayNodes` is a Map node → size and both replay loops carry it.
+
+**The numbers (linear means, our GI at 30 s vs three-gpu-pathtracer; the
+user's scene: whites #ffffff, red (1,0,0), green (0.22,1,0), a 0.74×1.92×0.51
+box emitter at strength 10, a mirror Box):**
+
+| region | ours | tracer (10 bounces) | lum ratio |
+|---|---|---|---|
+| ceiling near red | 0.331/0.289/0.283 sat 0.15 | 0.711/0.290/0.254 sat 0.64 | 0.79 |
+| ceiling near green | 0.153/0.145/0.132 sat 0.14 | 0.410/0.402/0.193 sat 0.53 | 0.38 |
+| floor centre | 0.473/0.426/0.406 sat 0.14 | 0.647/0.420/0.325 sat 0.50 | 0.94 |
+| floor near green | 0.301/0.275/0.248 sat 0.18 | 0.326/0.449/0.139 sat 0.69 | 0.70 |
+| red wall | 0.643/0.064/0.064 | 0.777/0.096/0.096 | 0.78 |
+| green wall | 0.010/0.233/0.000 | 0.024/0.492/0.004 | 0.47 |
+| WHITES mean sat | **0.174** | **0.602** | 0.77 (0.38–1.09) |
+
+**Arms (WHITES sat / lum mean):** base 0.174/0.77 · WALLS=0.5 0.197/0.76 ·
+LIGHT_MOBILITY=static 0.175/0.77 · `__giMergeLos=false` 0.175/0.78 ·
+`__giSrcSecondary=false` (loop off) 0.080/0.63. The thin-wall shared record,
+the mover emitter path and the merge LOS are NOT the cause; the loop is worth
++23 % brightness and doubles the chroma but reaches nowhere near the room.
+
+**The tracer ladder (`__giPathTracerBounces` 1/2/3/10 vs the same ours):**
+ceiling near red lum ratio 1.86 / 1.05 / 0.91 / 0.79; floor near green 5.38 /
+1.93 / 1.24 / 0.70; WHITES sat tracer 0.004 / 0.320 / 0.390 / 0.602 vs ours
+0.174. **Ours is the tracer's TWO-BOUNCE picture in brightness at HALF its
+chroma.** At equal brightness (pt2) the ceiling near the red wall reads ours
+0.332/0.289/0.283 vs 0.372/0.260/0.255 — less red, more green/blue: the light
+is the right amount and the wrong colour. The palette is right (PALETTE=1:
+red 1/0/0, green 0.04/1/0, whites 1, fallback 0.84/0.83/0.67), the walls are
+lit (red wall 0.78–1.07 of the tracer), and the loop albedo mean is 0.73
+(whites clamped at MAX_LOOP_ALBEDO 0.9 — the tracer's whites are albedo 1
+with 10 bounces, part of the far-side gap by construction). Open: where the
+coloured walls' bounce loses its chroma between the hit shade and the
+ceiling's irradiance — the next arm is a per-channel receipt on the bins of
+a ceiling probe (R/G/B of the deposits by hit slot), not another whole-image
+number.
+
+**Also reported tonight (open, harness arms queued):** dragging the emitter
+or the mirror Box "freezes a lot" (DRAG arm: frameStats before/during/after
++ the [gi] lines the drag provokes); the mirror Box's reflection shows a
+doubled image of the emitter, a black band where the back wall should
+reflect, and bright fringes along the Box's silhouette.
+
 ## 8. SOURCES
 
 Lumen SIGGRAPH 2022 (Wright et al.) · Lumen technical details / performance

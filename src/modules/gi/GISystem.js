@@ -839,7 +839,7 @@ export function installAsyncComputePipelines(renderer) {
           const replay = data.giReplayNodes;
           if (replay?.size) {
             data.giReplayNodes = null;
-            for (const node of replay) renderer.compute(node);
+            for (const [node, size] of replay) renderer.compute(node, size);
           }
           // ⚠ DROP THE OWNER ONCE THE PIPELINE SETTLES (retention audit,
           // 2026-08-24). three keeps every ComputePipeline in the
@@ -993,7 +993,7 @@ export function installAsyncComputePipelines(renderer) {
         const replay = data.giReplayNodes;
         if (replay?.size) {
           data.giReplayNodes = null;
-          for (const node of replay) renderer.compute(node);
+          for (const [node, size] of replay) renderer.compute(node, size);
         }
       },
       (error) => {
@@ -1020,7 +1020,14 @@ export function installAsyncComputePipelines(renderer) {
       data.giSkips = (data.giSkips ?? 0) + 1;
       giMaybeRerollPipeline(data);
       if (giDispatchDepth > 0) giSkippedComputes.add(computeNode);
-      else (data.giReplayNodes ??= new Set()).add(computeNode);
+      // §11.19 (2026-09-03): THE REPLAY MUST CARRY THE DISPATCH SIZE. A node
+      // dispatched as `renderer.compute(node, [x, y, z])` has no `count`, so
+      // replaying it as `renderer.compute(node)` reaches three's backend with
+      // `dispatchSize` null — "Cannot read properties of null (reading '0')"
+      // from the pipeline-landed callback, seen the moment the path tracer's
+      // own kernels came through this interception. Keyed by node so a node
+      // skipped twice replays once, at its last size.
+      else (data.giReplayNodes ??= new Map()).set(computeNode, dispatchSize ?? null);
       return;
     }
     return rawCompute.call(this, computeGroup, computeNode, bindings, pipeline, dispatchSize);
@@ -16667,6 +16674,9 @@ export class GISystem {
         const editorOnly =
           (((object.layers.mask >>> 0) & 0x80000000) !== 0 && (object.layers.mask >>> 0) === 0x80000000) ||
           object.layers.isEnabled(UI_LAYER) ||
+          // GI's own debug-view quads (§11.19): a 2×2 plane at the origin that
+          // is `visible` exactly while a debug view is on — never geometry.
+          object.userData?.__giDebug === true ||
           // A SHADOW-MERGE PROXY IS NOT WORLD GEOMETRY. It is a depth-only
           // duplicate of casters GI has already collected in their own right,
           // so adopting it would voxelize every one of them TWICE, claim a
@@ -19677,6 +19687,16 @@ export class GISystem {
     mesh.frustumCulled = false;
     mesh.visible = false;
     mesh.renderOrder = 10000; // one above sdf/occ, which sit at 9999
+    // §11.19 (2026-09-03): THE DEBUG QUAD IS A REAL 2×2 PLANE AT THE WORLD
+    // ORIGIN. While a debug view is on it is `visible`, and every walk that
+    // keys on `visible` — the g-buffer, the voxelizer, the material tiers —
+    // adopted it as world geometry: the user's "phantom plane that always
+    // appears in occupancy at the world origin", and the lighter rectangle
+    // on their Cornell floor in the indirect view (the g-buffer drew the
+    // quad, the resolve shaded it). Proven by shifting the room 5 m in the
+    // harness: the square stayed at the origin. DEBUG_LAYER is the layer the
+    // g-buffer camera disables (giScreen) and the editor camera still sees.
+    mesh.layers.set(DEBUG_LAYER);
     mesh.userData.__giDebug = true;
     mesh.userData.__giDebugTerm = true;
     mesh.userData.__giDebugTex = texU;
@@ -19703,6 +19723,16 @@ export class GISystem {
     mesh.frustumCulled = false;
     mesh.visible = false;
     mesh.renderOrder = 9999;
+    // §11.19 (2026-09-03): THE DEBUG QUAD IS A REAL 2×2 PLANE AT THE WORLD
+    // ORIGIN. While a debug view is on it is `visible`, and every walk that
+    // keys on `visible` — the g-buffer, the voxelizer, the material tiers —
+    // adopted it as world geometry: the user's "phantom plane that always
+    // appears in occupancy at the world origin", and the lighter rectangle
+    // on their Cornell floor in the indirect view (the g-buffer drew the
+    // quad, the resolve shaded it). Proven by shifting the room 5 m in the
+    // harness: the square stayed at the origin. DEBUG_LAYER is the layer the
+    // g-buffer camera disables (giScreen) and the editor camera still sees.
+    mesh.layers.set(DEBUG_LAYER);
     mesh.userData.__giDebug = true;
     return mesh;
   }
@@ -19724,6 +19754,16 @@ export class GISystem {
     mesh.frustumCulled = false;
     mesh.visible = false;
     mesh.renderOrder = 9999;
+    // §11.19 (2026-09-03): THE DEBUG QUAD IS A REAL 2×2 PLANE AT THE WORLD
+    // ORIGIN. While a debug view is on it is `visible`, and every walk that
+    // keys on `visible` — the g-buffer, the voxelizer, the material tiers —
+    // adopted it as world geometry: the user's "phantom plane that always
+    // appears in occupancy at the world origin", and the lighter rectangle
+    // on their Cornell floor in the indirect view (the g-buffer drew the
+    // quad, the resolve shaded it). Proven by shifting the room 5 m in the
+    // harness: the square stayed at the origin. DEBUG_LAYER is the layer the
+    // g-buffer camera disables (giScreen) and the editor camera still sees.
+    mesh.layers.set(DEBUG_LAYER);
     mesh.userData.__giDebug = true;
     return mesh;
   }

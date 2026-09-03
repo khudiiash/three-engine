@@ -209,6 +209,7 @@
     "test:gi-src-volume": "node scripts/run-gi-src-volume-test.mjs",
     "probe:gi-debug-views": "node scripts/run-gi-debug-views-probe.mjs",
     "probe:gi-pathtracer": "node scripts/run-gi-pathtracer-probe.mjs",
+    "probe:gi-cornell-ref": "node scripts/run-gi-cornell-ref.mjs",
     "probe:boot": "node scripts/run-boot-diag.mjs",
     "test:gi-shadowed-bulb": "node scripts/run-gi-shadowed-bulb.mjs",
     "test:gi-src-worldkeys": "node scripts/run-gi-src-worldkeys-test.mjs",
