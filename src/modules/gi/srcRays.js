@@ -54,6 +54,7 @@
 import {
   Fn,
   If,
+  Loop,
   Return,
   atomicAdd,
   atomicLoad,
@@ -102,7 +103,9 @@ import {
   PROBE_RAYOFF,
   PROBE_RAYS,
   PROBE_WORDS,
+  PRIORITY_REP_PIXEL_BITS,
   PRIORITY_REP_PIXEL_MASK,
+  COUNTER_STARVED,
   SLOT_EMPTY,
 } from "./srcProbes.js";
 
@@ -416,11 +419,46 @@ export function createSrcRayFrame(
         ).toVar();
         cold.assign(cold.or(age.lessThan(uint(COLD_FILL_FRAMES))));
       });
-      If(cold, () => {
-        const ticket = atomicAdd(rayTotal.element(uint(0)), uint(raysPerPixel)).toVar();
-        If(ticket.add(uint(raysPerPixel)).lessThanEqual(priority.ceiling), () => {
-          atomicAdd(rayCount.element(p), uint(raysPerPixel));
-          probeTable.element(w.add(PROBE_HASH)).assign(rep);
+      // §11.17: STARVED — the block's decayed deposit weight is under the
+      // floor (srcConfig's STARVE block). Reads the surprise bundle's
+      // per-block evidence word; without the bundle the branch is not built.
+      // The evidence is the block's DECAYED bin counts summed over its bins —
+      // the accumulator the deposit's decay keeps (one c0 deposit per ray
+      // into this probe, so the sum is "rays this probe has seen", forgetting
+      // at the keep). ⚠ NOT the surprise bundle's BSTAT_SUM_W: that word is
+      // a per-frame sum the detector reads and clears, and the first cut that
+      // tested it lifted EVERY visible probe (2026-09-03, strided A/B).
+      const starve = priority.starve && surprise ? priority.starve : null;
+      const starved = starve ? uint(0).toVar() : null;
+      if (starve) {
+        If(block.notEqual(uint(SLOT_EMPTY)).and(uint(starve.packets).greaterThan(uint(0))), () => {
+          const first = uint(starve.binBase).add(block.mul(uint(starve.bins))).mul(uint(starve.binWords)).toVar();
+          const seen = uint(0).toVar();
+          Loop({ start: uint(0), end: uint(starve.bins), type: "uint", condition: "<" }, ({ i: m }) => {
+            seen.addAssign(atomicLoad(surprise.scratch.element(first.add(m.mul(uint(starve.binWords))).add(uint(starve.binCount)))));
+          });
+          If(seen.lessThan(uint(starve.threshold)), () => {
+            starved.assign(uint(1));
+          });
+        });
+      }
+      const wantPackets = starve
+        ? select(starved.equal(uint(1)), uint(starve.packets), uint(1)).toVar()
+        : uint(1).toVar();
+      const admit = starve ? cold.or(starved.equal(uint(1))) : cold;
+      If(admit, () => {
+        const want = wantPackets.mul(uint(raysPerPixel)).toVar();
+        const ticket = atomicAdd(rayTotal.element(uint(0)), want).toVar();
+        If(ticket.add(want).lessThanEqual(priority.ceiling), () => {
+          atomicAdd(rayCount.element(p), want);
+          // The packet count rides the free upper bits of the representative
+          // word (pixel index < 2^22); [D1] masks it, the rep pass reads it.
+          probeTable.element(w.add(PROBE_HASH)).assign(rep.bitOr(wantPackets.shiftLeft(uint(PRIORITY_REP_PIXEL_BITS))));
+          if (starve) {
+            If(starved.equal(uint(1)), () => {
+              atomicAdd(starve.counters.element(uint(c0.cascade * COUNTER_WORDS + COUNTER_STARVED)), uint(1));
+            });
+          }
         });
       });
     })().compute(c0.probeCapacity));
@@ -442,7 +480,7 @@ export function createSrcRayFrame(
       // this frame's residue, do not count the same pixel twice.
       const reserved = probeTable.element(
         probe.mul(PROBE_WORDS).add(PROBE_HASH),
-      ).equal(i);
+      ).bitAnd(uint(PRIORITY_REP_PIXEL_MASK)).equal(i);
       If(reserved, () => { Return(); });
       const ticket = atomicAdd(rayTotal.element(uint(0)), uint(raysPerPixel)).toVar();
       If(ticket.add(uint(raysPerPixel)).greaterThan(priority.ceiling), () => { Return(); });
@@ -757,9 +795,15 @@ export function createSrcRayFrame(
     const c0 = cascades[0];
     passes.push(Fn(() => {
       const probe = instanceIndex.add(uint(c0.probeBase)).toVar();
-      const rep = probeTable.element(probe.mul(PROBE_WORDS).add(PROBE_HASH)).toVar();
-      If(rep.equal(uint(SLOT_EMPTY)), () => { Return(); });
-      claimPixel(rep, probe);
+      const repWord = probeTable.element(probe.mul(PROBE_WORDS).add(PROBE_HASH)).toVar();
+      If(repWord.equal(uint(SLOT_EMPTY)), () => { Return(); });
+      const rep = repWord.bitAnd(uint(PRIORITY_REP_PIXEL_MASK)).toVar();
+      // §11.17: one claim per reserved packet — each claim takes the next
+      // raysPerPixel ray slots (distinct directions) from the same pixel.
+      const packets = repWord.shiftRight(uint(PRIORITY_REP_PIXEL_BITS)).max(uint(1)).toVar();
+      Loop({ start: uint(0), end: packets, type: "uint", condition: "<" }, () => {
+        claimPixel(rep, probe);
+      });
     })().compute(c0.probeCapacity));
   }
   // ⚠ `pixelRayBase` IS NO LONGER FULLY REWRITTEN EACH FRAME. With a strided

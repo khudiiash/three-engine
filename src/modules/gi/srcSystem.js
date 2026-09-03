@@ -54,11 +54,11 @@ import {
   LIGHT_SETTLE_FADE_MS, LIGHT_SETTLE_HOLD_MS,
   PROBE_RAY_CAP_OFF, REST_BOOT_HOLD_MS, REST_CAM_FADE_MS, REST_CAM_HOLD_MS,
   REST_TRANSPORT_FRACTION,
-  SEED_RAYS, SRC_QUALITY, SUM_SHIFT, SURPRISE_ONE, TEMPORAL_ALPHA,
+  SEED_RAYS, SEED_RAYS_FAR, SRC_QUALITY, STARVE_PACKETS, STARVE_RAYS, SUM_SHIFT, SURPRISE_ONE, TEMPORAL_ALPHA,
   TEMPORAL_ALPHA_STILL, W0, binCount, lod0Reach, srcBinCeiling, srcProbeRayCap, srcQualityTier, srcTransportRays,
 } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
-import { R2_ALPHA1_FX, R2_ALPHA2_FX, worldKeysEnabled } from "./srcMath.js";
+import { R2_ALPHA1_FX, R2_ALPHA2_FX, unpackProbeKey, worldKeysEnabled } from "./srcMath.js";
 import {
   createSrcBlockLookupDirect,
   createSrcHashBlockFrame,
@@ -262,6 +262,9 @@ export function createSrcProbeSystem({
   // to the merge's top-cascade close and the tiles' residual composite. Null
   // (every fixture) keeps the flat `sky` path bit-identical.
   skyEnv = null,
+  // §11.16: `{ node }` — GISystem's far-field texture, the fresh-probe seed's
+  // prior of last resort (srcSeed's header). Null in every fixture.
+  farField = null,
   lighting = null, surfaces = null, sceneMotion = null, trackMotion = null,
   // §10: `{ dyn }` — the dynamic-object set that owns the static BVH8. When
   // given, the transport traces the BVH (srcBvhTrace.js) instead of the
@@ -310,12 +313,25 @@ export function createSrcProbeSystem({
   // §11.7 — THE FLOOR FOLLOWS THE DEVICE TOO. Every pool grow is a probe-
   // store rebuild: a cold field and a recompile of the 68 SRC kernels, which
   // the user reads as "GI drops to ambient for a minute, then a freeze". On
-  // a desktop-class ceiling (≥ 8 M bins) the boot floor is 2.8 M bins /
+  // a desktop-class ceiling (≥ 8 M bins) the boot floor was 2.8 M bins /
   // 32 768 c0 slots — 78 MB, an amount this adapter does not notice — so a
   // Bistro-class scene boots without a rung and a full walk costs at most
   // one; the portable floor stays the measured-clean 700 k.
+  //
+  // §11.16 (2026-09-03 evening): 2.8 M was one rung too low for a SPONZA
+  // walk. The user's editor logged `src pool grow: c0Probes 32768→65536,
+  // blocks 21875/5468/1367/341 → 31744/6656/1536/384 (2.80M→3.44M bins;
+  // peaks 15447/4390/1074/263)` — the c1–c3 peaks sat at 77–80 % of their
+  // blocks, the ladder's early-warning line — and the grown store's kernels
+  // compiled BEHIND the live one for 73 s with the picture held, after which
+  // the cold store took over and the whole field re-converged in view: the
+  // largest "patches converging when I enter a new room" event there is,
+  // and the pinned-pool harness could never show it. 4.2 M bins / 65 536 c0
+  // slots (~115 MB) covers a Sponza-class walk without a rung; Bistro still
+  // takes one. The deeper fix — capacities as uniforms so a grow is an
+  // allocate-and-copy instead of a 68-kernel recompile — is §11.17's.
   const deviceFloors = srcBinCeiling({ deviceLimitBytes: deviceLimit }) >= 8_000_000
-    ? { c0Probes: 32_768, binBudget: 2_800_000 }
+    ? { c0Probes: 65_536, binBudget: 4_200_000 }
     : SRC_POOL_FLOORS;
   const poolConfig = {
     c0Probes: Number(globalThis.__giSrcC0Probes)
@@ -893,6 +909,11 @@ export function createSrcProbeSystem({
         rayWeight: DEPOSIT_SCALE >> SUM_SHIFT,
       }
     : null;
+  // §11.17: the starvation floor's dials (srcConfig's STARVE block). The
+  // threshold is in BSTAT_SUM_W units: deposits × the per-deposit weight.
+  const starvePacketsU = uniform(STARVE_PACKETS);
+  // The threshold is in BIN_COUNT units: rays × DEPOSIT_SCALE.
+  const starveThresholdU = uniform(STARVE_RAYS * DEPOSIT_SCALE);
   const rayFrame = createSrcRayFrame(store, rayStore, {
     pixelProbe: frame.pixelProbe,
     raysPerPixel: tier.raysPerPixel,
@@ -904,7 +925,28 @@ export function createSrcProbeSystem({
       ? { frameStamp: frameStampU, boostEnable: boostEnableU, counters: store.counters }
       : null,
     surprise: surpriseBundle,
-    priority: coldPriority ? { frameStamp: frameStampU, ceiling: rayCeilingU } : null,
+    priority: coldPriority
+      ? {
+          frameStamp: frameStampU,
+          ceiling: rayCeilingU,
+          // §11.17: the starvation floor rides the cold-frontier priority and
+          // reads the surprise bundle's per-block evidence (srcRays derives
+          // the c0 stat base from `surprise`). Off without the bundle or at
+          // build with `__giSrcStarve = false`.
+          starve: surpriseBundle && binStore && globalThis.__giSrcStarve !== false
+            ? {
+                packets: starvePacketsU,
+                threshold: starveThresholdU,
+                counters: store.counters,
+                // The c0 bin block layout, for the evidence sum (srcRays).
+                binBase: binStore.cascades[0].binBase,
+                bins: binStore.cascades[0].bins,
+                binWords: SrcDepositNS.BIN_WORDS,
+                binCount: SrcDepositNS.BIN_COUNT,
+              }
+            : null,
+        }
+      : null,
     activePixels: pixelCountU,
   });
 
@@ -1526,11 +1568,14 @@ export function createSrcProbeSystem({
   // instead of the whole store. Nothing to guard; worth writing down, because
   // the shape invites the wrong conclusion and a "fix" would break the blend.
   const seedRaysU = uniform(SEED_RAYS);
+  const seedFarRaysU = uniform(SEED_RAYS_FAR);
   const seed = seedOn && deposit
     ? createSrcSeedFrame(store, binStore, {
         losSegment,
         lmax: lmaxU,
         seedRays: seedRaysU,
+        farField,
+        seedFarRays: seedFarRaysU,
         // §12.59.2's spatial fallback (cold-column rescue) — §16 D2b: armed
         // on both key arms; the anchor is what the default arm re-keys by.
         camera: vec3(cameraU),
@@ -2388,6 +2433,16 @@ export function createSrcProbeSystem({
         const forcedSeed = Number(globalThis.__giSrcSeedRays);
         const nextSeed = Number.isFinite(forcedSeed) ? Math.max(0, forcedSeed) : SEED_RAYS;
         if (seedRaysU.value !== nextSeed) seedRaysU.value = nextSeed;
+        // §11.16: the far-field prior's dial, same rule (0 = the off arm).
+        const forcedStarve = Number(globalThis.__giSrcStarvePackets);
+        const nextStarve = Number.isFinite(forcedStarve) ? Math.max(0, Math.floor(forcedStarve)) : STARVE_PACKETS;
+        if (starvePacketsU.value !== nextStarve) starvePacketsU.value = nextStarve;
+        const forcedRays = Number(globalThis.__giSrcStarveRays);
+        const nextThreshold = (Number.isFinite(forcedRays) ? Math.max(0, forcedRays) : STARVE_RAYS) * DEPOSIT_SCALE;
+        if (starveThresholdU.value !== nextThreshold) starveThresholdU.value = nextThreshold;
+        const forcedFar = Number(globalThis.__giSrcSeedFarRays);
+        const nextFar = Number.isFinite(forcedFar) ? Math.max(0, forcedFar) : SEED_RAYS_FAR;
+        if (seedFarRaysU.value !== nextFar) seedFarRaysU.value = nextFar;
       }
       phaseU.value = rayStride > 1 ? frameStampU.value % rayStride : 0;
       const a = anchorU.value;
@@ -2508,7 +2563,67 @@ export function createSrcProbeSystem({
         }
         return out;
       };
-      const stats = await readSrcProbeStats(renderer, store);
+      // ⚠ ONE FRAME FOR EVERY COUNTER (2026-09-03). These readbacks used to be
+      // awaited one after another, and each await spans frames — so a walk
+      // probe that stops moving while it waits read the population counters
+      // from a moving frame ("fresh 51") and the seed's tally from a parked
+      // one three awaits later ("seed 0 probes"): the seed looked inert on
+      // Sponza when only the instrument was. Every buffer copy is now
+      // SUBMITTED in this tick (each readStats issues its getArrayBufferAsync
+      // before its first await) and awaited together, so the whole receipt
+      // describes one frame.
+      const pending = {
+        stats: readSrcProbeStats(renderer, store),
+        totalRays: rayFrame.readTotal(renderer),
+        rays: deposit ? deposit.readStats(renderer) : null,
+        seed: seed ? seed.readStats(renderer) : null,
+        secondary: secondary ? secondary.readStats(renderer) : null,
+        merge: merge ? merge.readStats(renderer) : null,
+        tiles: tiles ? tiles.readStats(renderer) : null,
+        gather: gather ? gather.readStats(renderer) : null,
+      };
+      const stats = await pending.stats;
+      // ── §11.17 THE STARVATION LEDGER (opt-in: `__giProfileProbeRays = true`) ──
+      // Rays are born per PIXEL, so a probe's ray rate follows its screen
+      // footprint: a far, dark corridor feeds its probes almost nothing and
+      // their 32 bins take minutes — the user's "patches that don't resolve
+      // until I walk closer". This reads the c0 probe table back (a few MB,
+      // profile-time only) and histograms THIS frame's allotment
+      // (PROBE_RAYS, after the cap) by the probe's LOD: how many live probes
+      // per LOD, their mean rays/frame, and the share that got 0 or < 2.
+      const probeRays = globalThis.__giProfileProbeRays === true
+        ? await (async () => {
+            const c0 = store.cascades[0];
+            const words = new Uint32Array(await renderer.getArrayBufferAsync(store.probeTable.value));
+            const rows = new Map();
+            for (let p = 0; p < c0.probeCapacity; p++) {
+              const w = (c0.probeBase + p) * SrcProbesNS.PROBE_WORDS;
+              if ((words[w + SrcProbesNS.PROBE_FLAGS] & SrcProbesNS.FLAG_ALIVE) === 0) continue;
+              const key = unpackProbeKey(words[w + SrcProbesNS.PROBE_KEY]);
+              const lod = key ? key.lod : -1;
+              const rays = words[w + SrcProbesNS.PROBE_RAYS] >>> 0;
+              const row = rows.get(lod) ?? { lod, probes: 0, visible: 0, rays: 0, zero: 0, under2: 0, fresh: 0 };
+              row.probes++;
+              // VISIBLE = seen this frame (age 0). Held probes (retention,
+              // behind the camera) get no rays by design and must not count
+              // as starved.
+              if ((words[w + SrcProbesNS.PROBE_AGE] >>> 0) !== 0) { rows.set(lod, row); continue; }
+              row.visible++;
+              row.rays += rays;
+              if (rays === 0) row.zero++;
+              if (rays < 2) row.under2++;
+              if (words[w + SrcProbesNS.PROBE_FLAGS] & SrcProbesNS.FLAG_FRESH) row.fresh++;
+              rows.set(lod, row);
+            }
+            return [...rows.values()].sort((a, b) => a.lod - b.lod).map((r) => ({
+              lod: r.lod, probes: r.probes, visible: r.visible, fresh: r.fresh,
+              // Over VISIBLE probes only.
+              meanRays: +(r.rays / Math.max(1, r.visible)).toFixed(3),
+              zeroRayShare: +(r.zero / Math.max(1, r.visible)).toFixed(3),
+              under2RayShare: +(r.under2 / Math.max(1, r.visible)).toFixed(3),
+            }));
+          })()
+        : null;
       // ── SURPRISE'S TWO INSTRUMENTS, PUBLISHED HERE AND NOT PER FRAME ─────
       //
       // Both are GPU readbacks, and §13's startup work priced what a readback
@@ -2538,13 +2653,14 @@ export function createSrcProbeSystem({
         spacing0,
         pixelCount: activePixelCount,
         raysPerPixel: tier.raysPerPixel,
-        totalRays: await rayFrame.readTotal(renderer),
-        rays: deposit ? await deposit.readStats(renderer) : null,
-        seed: seed ? await seed.readStats(renderer) : null,
-        secondary: secondary ? await secondary.readStats(renderer) : null,
-        merge: merge ? await merge.readStats(renderer) : null,
-        tiles: tiles ? await tiles.readStats(renderer) : null,
-        gather: gather ? await gather.readStats(renderer) : null,
+        totalRays: await pending.totalRays,
+        rays: await pending.rays,
+        seed: await pending.seed,
+        probeRays,
+        secondary: await pending.secondary,
+        merge: await pending.merge,
+        tiles: await pending.tiles,
+        gather: await pending.gather,
         // §11.13: per-cascade histogram of the bins' COUNT words (in rays),
         // over live blocks. Opt-in (`__giProfileBinHistogram = true`) — it
         // reads the whole scratch buffer back (~200 MB on Bistro).

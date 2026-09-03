@@ -284,11 +284,14 @@ defineOp({
         try {
           const tex = engine.modules?.get?.("gi")?.system?._giFarFieldTex ?? null;
           if (tex) {
-            // 2x1 texture read as 2x2: texel (1,0) is px[4..7], x = dark share.
-            const px = await readTexturePixelsGPU(renderer, tex, 2);
-            if (px?.length >= 8) {
+            // 4x1 texture read as 4x4: texel (1,0) is px[4..7], x = dark share;
+            // texel (2,0) is px[8..11], the RAW mean the seed reads (§11.16).
+            const px = await readTexturePixelsGPU(renderer, tex, 4);
+            if (px?.length >= 12) {
               farField = {
                 rgb8: [px[0], px[1], px[2]],
+                rawRgb8: [px[8], px[9], px[10]],
+                primed: px[11] > 127,
                 darkFrac: +(px[4] / 255).toFixed(3),
                 coveredK: Math.round(px[5] / 255 * 1000),
                 // Share of geometry pixels whose gather had no coverage and took
@@ -320,6 +323,8 @@ defineOp({
             loadFactor: +c.loadFactor.toFixed(3),
             meanProbeSteps: +c.meanProbeSteps.toFixed(2),
             failedInserts: c.failed,
+            // §11.17: c0 probes lifted by the starvation floor this frame.
+            starved: c.starved ?? null,
           })),
           // Read from the RUN, not from the phase plan. This note said
           // "Produces no light yet" for as long as that was true and then for a
@@ -372,6 +377,8 @@ defineOp({
           // §11.15: rays that started inside a mover and were dropped.
           insideMoverRays: stats.rays?.insideMoverRays ?? null,
           moverHits: stats.rays?.moverHits ?? null,
+          // §11.17: rays per c0 probe by LOD (opt-in `__giProfileProbeRays`).
+          probeRays: stats.probeRays ?? null,
           moverRecords: stats.rays?.moverRecords ?? null,
           // §11.13: opt-in bin-count histogram (`__giProfileBinHistogram = true`).
           ...(stats.binHistogram ? { binHistogram: stats.binHistogram } : {}),

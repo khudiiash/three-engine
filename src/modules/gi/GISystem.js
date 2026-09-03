@@ -41,7 +41,7 @@ import {
 } from "./giMaterialLightLifecycle.js";
 import { GiPathTracerView } from "./giPathTracer.js";
 import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
-import { GI_WORLD_AO_VISIBILITY_POWER, blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiAoPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiRtaoPass, createGiShadowClearPass, createGiTargets, createGiVxaoPass, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
+import { GI_WORLD_AO_VISIBILITY_POWER, blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiAoPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiFarFieldTexture, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiRtaoPass, createGiShadowClearPass, createGiTargets, createGiVxaoPass, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
 import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
 import { noteTextureAverage, pendingTextureAverages, resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
@@ -7000,7 +7000,15 @@ export class GISystem {
           this._giEnvMissIntensityU ??= uniform(0);
           this._giEnvMissRotU ??= uniform(0);
           this._giSkyEnvIntensityU ??= uniform(0);
+          // §11.16: the far-field texture exists BEFORE the SRC system so the
+          // fresh-probe seed can bind it as its prior of last resort. The
+          // passes that fill it are created further down, once the gather
+          // target exists; until they run its texels read 0 (alpha 0 =
+          // unprimed) and the seed declines it.
+          this._giFarFieldTex ??= createGiFarFieldTexture();
+          this._giFarFieldNode ??= texture(this._giFarFieldTex);
           srcProbes = createSrcProbeSystem({
+            farField: { node: this._giFarFieldNode },
             // Build the glossy gather as a stable capability even when the
             // authored switch starts off. It remains dispatch-cold until
             // enabled, so the first ON edit compiles only this related chain
@@ -7265,14 +7273,11 @@ export class GISystem {
       // build (no detail box): the resolve's "never black" fallback reads it.
       if (srcProbes?.gather?.target && (this._fieldless || (this._detailExtent && this._detailAnchor)) &&
           volume?.world?.min && globalThis.__giFarField !== false) {
-        this._giFarFieldTex ??= (() => {
-          // 2x1: (0,0) = the far-field mean the resolve reads, (1,0) = stats
-          // (x = dark share of gather-covered geometry, y = covered / 1e6).
-          const t = new THREE.StorageTexture(2, 1);
-          t.type = THREE.HalfFloatType;
-          t.name = "giFarFieldAvg";
-          return t;
-        })();
+        // 4x1: (0,0) = the far-field mean the resolve reads, (1,0) = stats
+        // (x = dark share of gather-covered geometry, y = covered / 1e6),
+        // (2,0) = the RAW mean the fresh-probe seed reads (§11.16). Normally
+        // created before the SRC system above; this is the fallback.
+        this._giFarFieldTex ??= createGiFarFieldTexture();
         this._giFarFieldNode ??= texture(this._giFarFieldTex);
         const farAvg = createGiFarFieldAvgPass({
           source: srcProbes.gather.target,

@@ -114,7 +114,7 @@ import {
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
-import { floor, int, ivec3 } from "three/tsl";
+import { floor, int, ivec2, ivec3 } from "three/tsl";
 
 /** Seed telemetry. One atomic buffer, six words. */
 export const SEED_PROBES = 0;  // fresh probes seeded (parent had history)
@@ -129,7 +129,11 @@ export const SEED_SPATIAL = 4; // cold-column probes rescued by the LOD+1 spatia
 export const SEED_NOBLOCK = 5;
 /** fresh probes whose parent (or spatial candidate) sits behind a wall — no prior taken (BVH segment test) */
 export const SEED_LOS = 6;
-export const SEED_WORDS = 7;
+/** §11.16: bins that took the FAR-FIELD prior (no parent / spatial source) */
+export const SEED_FAR = 7;
+/** §11.16: fresh probes that were seeded ONLY from the far field */
+export const SEED_FAR_PROBES = 8;
+export const SEED_WORDS = 9;
 
 /**
  * Bins per thread. Bin counts quadruple up the ladder (32 at c0, 512 at c2
@@ -166,7 +170,18 @@ const SEED_MAX_UNIT = 8;
  * @param {Node} options.seedRays  uniform: the prior's effective sample count,
  *   in rays. 0 zeroes every write (the in-page off arm).
  */
-export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null, spacing0 = null, maxLods = null, anchor = null, losSegment = null } = {}) {
+export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null, spacing0 = null, maxLods = null, anchor = null, losSegment = null, farField = null, seedFarRays = null } = {}) {
+  // §11.16 — THE FAR-FIELD PRIOR (srcConfig's SEED_RAYS_FAR doc). `farField`
+  // is the 4×1 far-field texture GISystem owns: texel (2,0) holds the RAW
+  // screen-gather mean irradiance with alpha 1 once primed (giScreen's
+  // createGiFarFieldAvgPass). A bin that finds no parent and no spatial
+  // source starts there, as radiance E/π at `seedFarRays` rays' weight; and
+  // the TOP cascade, which has no parent at all, is seeded for the first time.
+  // Without the texture (every fixture) the kernels are byte-identical.
+  // ⛔ OPT-IN (2026-09-03 evening, measured and REFUTED as a default — srcConfig's
+  // SEED_RAYS_FAR doc): `__giSrcSeedFar = true` arms it; the default build is
+  // byte-identical to the pre-§11.16 seed.
+  const farOn = !!farField?.node && seedFarRays != null && globalThis.__giSrcSeedFar === true;
   const { probeTable } = store;
   const { payload, scratch } = bins;
   const N = store.cascadeCount ?? CASCADE_COUNT;
@@ -197,7 +212,7 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
   // One flag-checked probe lookup per seeded cascade (the fallback finds the
   // LOD+1 probe by key in the SAME cascade's hash).
   const lookups = spatial
-    ? Array.from({ length: N - 1 }, (_, c) => createProbeLookup(store, c))
+    ? Array.from({ length: farOn ? N : N - 1 }, (_, c) => createProbeLookup(store, c))
     : null;
 
   // `atomicStore`, not `.assign` — srcMerge's telemetry clear carries the trap.
@@ -208,9 +223,11 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
     });
   })().compute(SEED_WORDS));
 
-  for (let c = 0; c < N - 1; c++) {
+  for (let c = 0; c < (farOn ? N : N - 1); c++) {
     const info = bins.cascades[c];
-    const parentInfo = bins.cascades[c + 1];
+    // The top cascade (far arm only) has no parent: its bins take the far
+    // field or nothing.
+    const parentInfo = c + 1 < N ? bins.cascades[c + 1] : null;
     const nBins = info.bins;
     const groupBins = Math.min(nBins, SEED_GROUP_BINS);
     const groups = Math.max(1, Math.floor(nBins / groupBins));
@@ -356,28 +373,48 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
 
       // Nothing to seed from: tally as before (orphan = no parent cell at
       // all; cold = a fresh/blockless column) and keep today's from-zero.
-      If(parentUsable.equal(uint(0)).and(spBlock.equal(uint(SLOT_EMPTY))), () => {
+      const noSource = parentUsable.equal(uint(0)).and(spBlock.equal(uint(SLOT_EMPTY))).toVar();
+      If(noSource, () => {
         If(first, () => {
           If(parent.equal(uint(SLOT_EMPTY)), () => {
             atomicAdd(stats.element(uint(SEED_ORPHAN)), uint(1));
           }).Else(() => {
             atomicAdd(stats.element(uint(SEED_COLD)), uint(1));
           });
+          // §11.16: counted as a far-only probe; the bins below take the
+          // far-field prior where it is primed.
+          if (farOn) atomicAdd(stats.element(uint(SEED_FAR_PROBES)), uint(1));
         });
-        Return();
+        // Without the far field there is nothing to write: today's from-zero.
+        if (!farOn) Return();
       });
-
-      If(first, () => {
-        atomicAdd(stats.element(uint(SEED_PROBES)), uint(1));
-        If(spBlock.notEqual(uint(SLOT_EMPTY)), () => {
-          atomicAdd(stats.element(uint(SEED_SPATIAL)), uint(1));
+      If(noSource.not(), () => {
+        If(first, () => {
+          atomicAdd(stats.element(uint(SEED_PROBES)), uint(1));
+          If(spBlock.notEqual(uint(SLOT_EMPTY)), () => {
+            atomicAdd(stats.element(uint(SEED_SPATIAL)), uint(1));
+          });
         });
       });
 
       // The prior's weight in fixed-point count units. Everything below is
       // proportional to it, which is what makes 0 the in-page off arm.
       const W = float(seedRays).mul(float(DEPOSIT_SCALE)).max(0).toVar();
-      If(W.lessThan(1), () => { Return(); });
+      // §11.16: the far prior's own weight and value. Unprimed (alpha 0 — the
+      // first frames, or a build whose far-field passes never ran) seeds
+      // nothing, exactly like a missing parent.
+      const Wf = farOn ? float(seedFarRays).mul(float(DEPOSIT_SCALE)).max(0).toVar() : null;
+      const farTexel = farOn ? farField.node.load(ivec2(2, 0)).toVar() : null;
+      const farReady = farOn ? farTexel.w.greaterThan(0.5).and(Wf.greaterThanEqual(1)).toVar() : null;
+      const farUnit = farOn
+        ? farTexel.xyz.div(Math.PI).div(float(lmax).max(1e-6)).clamp(0, SEED_MAX_UNIT).toVar()
+        : null;
+      const Wfu = farOn ? Wf.add(0.5).floor().toUint().toVar() : null;
+      if (farOn) {
+        If(W.lessThan(1).and(farReady.not()), () => { Return(); });
+      } else {
+        If(W.lessThan(1), () => { Return(); });
+      }
       const Wu = W.add(0.5).floor().toUint().toVar();
 
       const mBase = group.mul(uint(groupBins)).toVar();
@@ -400,16 +437,22 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
           // parent's four finer bins for child bin m are `4m…4m+3`, one aligned
           // Morton run. Getting it backwards reads another DIRECTION's radiance
           // — a hue rotation no energy check can see (the merge's own warning).
-          const pBase = uint(parentInfo.binBase)
-            .add(pblock.mul(uint(parentInfo.bins)))
-            .add(m.mul(uint(4)))
-            .toVar();
-          for (let k = 0; k < 4; k++) {
-            const parent = readPayload(payload, pBase.add(uint(k)));
-            If(parent.T.greaterThanEqual(0), () => {
-              pL.addAssign(parent.L);
-              pT.addAssign(parent.T);
-              known.addAssign(1);
+          // The top cascade (far arm) has no parent block to read: `known`
+          // stays 0 and the bin takes the far field below.
+          if (parentInfo) {
+            If(parentUsable.equal(uint(1)), () => {
+              const pBase = uint(parentInfo.binBase)
+                .add(pblock.mul(uint(parentInfo.bins)))
+                .add(m.mul(uint(4)))
+                .toVar();
+              for (let k = 0; k < 4; k++) {
+                const parent = readPayload(payload, pBase.add(uint(k)));
+                If(parent.T.greaterThanEqual(0), () => {
+                  pL.addAssign(parent.L);
+                  pT.addAssign(parent.T);
+                  known.addAssign(1);
+                });
+              }
             });
           }
         });
@@ -436,6 +479,23 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
           atomicAdd(scratch.element(slot.add(uint(BIN_COUNT))), Wu);
           atomicAdd(stats.element(uint(SEED_BINS)), uint(1));
         });
+        // ── §11.16: NO PARENT ANSWER FOR THIS BIN → THE FAR-FIELD PRIOR ────
+        // Radiance E_far/π so the seeded tile reads E_far; T = 0, the merged
+        // domain, same hand-over algebra as the parent seed (header).
+        if (farOn) {
+          If(known.equal(0).and(farReady), () => {
+            const slot = uint(info.binBase)
+              .add(block.mul(uint(nBins)))
+              .add(m)
+              .mul(uint(BIN_WORDS))
+              .toVar();
+            atomicAdd(scratch.element(slot.add(uint(BIN_R))), farUnit.x.mul(Wf).add(0.5).floor().toUint());
+            atomicAdd(scratch.element(slot.add(uint(BIN_G))), farUnit.y.mul(Wf).add(0.5).floor().toUint());
+            atomicAdd(scratch.element(slot.add(uint(BIN_B))), farUnit.z.mul(Wf).add(0.5).floor().toUint());
+            atomicAdd(scratch.element(slot.add(uint(BIN_COUNT))), Wfu);
+            atomicAdd(stats.element(uint(SEED_FAR)), uint(1));
+          });
+        }
       });
     })().compute(info.probeCapacity * groups));
   }
@@ -468,6 +528,8 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
         spatial: v[SEED_SPATIAL] >>> 0,
         noBlock: v[SEED_NOBLOCK] >>> 0,
         los: v[SEED_LOS] >>> 0,
+        far: v[SEED_FAR] >>> 0,
+        farProbes: v[SEED_FAR_PROBES] >>> 0,
       };
     },
 
@@ -484,5 +546,6 @@ export function formatSrcSeed(s) {
     (s.spatial ? ` (${s.spatial} via LOD+1 spatial)` : "") +
     (s.cold ? ` (${s.cold} cold)` : "") +
     (s.orphans ? ` (${s.orphans} orphan)` : "") +
-    (s.noBlock ? ` (${s.noBlock} noblock)` : "");
+    (s.noBlock ? ` (${s.noBlock} noblock)` : "") +
+    (s.far ? ` (${s.farProbes} far-only probes, ${s.far} far bins)` : "");
 }

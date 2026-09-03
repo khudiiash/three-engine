@@ -357,6 +357,44 @@ export const LIGHT_SETTLE_FADE_MS = 800;
 // 12 is ~100 frames: the user's soft blobs on every surface the camera turned
 // onto. At 1 the first own hit already weighs as much as the prior.
 export const SEED_RAYS = 1;
+/**
+ * §11.16 — THE FAR-FIELD PRIOR (2026-09-03). A fresh bin with NO parent or
+ * spatial prior (no parent cell, a cold column, a parent behind a wall, an
+ * unknown parent bin, the top cascade) used to start from ZERO and converge
+ * in view from its first own ray: the running mean of a handful of samples
+ * in random order, which is what "patches flickering while they converge"
+ * looks like on every surface a walk or a pan reveals (Sponza walk-in leg:
+ * one tile stepped 0.33 luma in one frame 0.8 s after arrival, twice the
+ * frame's mean; the error curve ROSE 6× after arrival before settling).
+ * Such a bin now starts at the scene's far-field mean — the same constant the
+ * resolve already shows for a pixel with no coverage, so the hand-over from
+ * "uncovered" to "covered" is continuous — at THIS many rays' weight. With
+ * ≈0.78 own rays per bin per frame the first own sample moves the estimate by
+ * 1/7 of the gap and each next one by less: a monotone ramp of ≤ ~3 %/frame
+ * over ~0.5 s, never a pop. The parent prior stays at SEED_RAYS (its content
+ * can be wrong — the sky-composite blobs — so it is a hint, not evidence);
+ * the far-field mean cannot be absurd, only flat. `__giSrcSeedFarRays` is the
+ * live dial (0 = off arm, in-page).
+ *
+ * ⛔ MEASURED THE SAME EVENING AND LEFT OPT-IN (`__giSrcSeedFar = true` arms
+ * it at build). Sponza walk-in leg, probe:gi-walk, pinned pools, two runs per
+ * arm: LIVE scene (the Y Bot animating in the corridor) prior off / on —
+ * maxStep 0.163, 0.232 / 0.164, 0.166, err0 0.0076, 0.0015 / 0.0074, 0.0068,
+ * and the same non-monotone error curve (a ~1.7 s period — the walk cycle):
+ * no effect, because the live-scene transient is the MOVER's, not the
+ * newborn probes'. FROZEN scene (character pinned; note FREEZE also parks the
+ * day cycle at the boot's phase, a low sun): prior off err0 0.00033, maxStep
+ * 0.0019, monotone — the static arrival is already clean — and prior ON made
+ * it a slow drift (err0 0.0108, settle > 4 s) with the SETTLED picture 3.5×
+ * brighter (0.010 → 0.034 mean luma): a flat scene-mean constant seeded into
+ * far bins that get a ray every few frames is not handed over for a minute,
+ * and it stands in for unknown far intervals the tiles used to renormalise
+ * away. The instrument that made this measurable: srcSystem's readStats now
+ * submits every counter readback in ONE tick (the seed's tally used to be
+ * read three awaits after the population counters, on a parked frame — "seed
+ * 0 probes" while 50 fresh probes were being minted).
+ */
+export const SEED_RAYS_FAR = 6;
 
 /**
  * ══ THE TRACKING WINDOW — WHY A SEEN CHANGE HOLDS α UP (§12.43) ═════════════
@@ -740,6 +778,38 @@ export const SURPRISE_CAP_SHIFT = 1;
  * paid once per block rather than per frame.
  */
 export const COLD_FILL_FRAMES = 4;
+/**
+ * ══ §11.17 THE STARVED PROBE — a ray floor that follows EVIDENCE, not age ══
+ *
+ * Rays are born per PIXEL ([D1]), so a probe's ray rate follows its screen
+ * footprint. That is right for cost and wrong for convergence: a far, dark
+ * corridor covers a few pixels, its probes see a ray every few frames, and
+ * with 32 direction bins each such probe needs MINUTES — the user's "patches
+ * of wrong lighting all over the dark corridors that take too long to
+ * resolve, or don't resolve until the camera moves closer" (2026-09-03,
+ * Sponza aisle capture). The cold-frontier priority above already reserves a
+ * packet for a probe born within COLD_FILL_FRAMES; this extends the same
+ * reservation to any VISIBLE c0 probe whose block carries less than
+ * STARVE_DEPOSITS of decayed deposit weight — starvation measured by the
+ * probe's own accumulator, so a young probe that happened to get rays drops
+ * out at once and an old, retained probe that never had any stays in. A
+ * starved probe takes STARVE_PACKETS packets (× raysPerPixel rays) a frame
+ * from the same ceiling tickets, fired from its representative pixel in
+ * successive ray slots (distinct directions); the cap boost still applies.
+ * The evidence is the c0 block's decayed BIN_COUNT summed over its bins —
+ * "rays this probe has seen", forgetting at the keep — so at the still keep
+ * (0.9977) a probe fed r rays a frame settles near 435·r. STARVE_RAYS 2000
+ * therefore means: a probe whose own pixels bring under ~4.6 rays a frame
+ * is topped up (2 packets = 4 rays at 2/px) — permanently below ~0.6, on a
+ * duty cycle between — and a probe the camera already feeds is never
+ * touched. ⚠ The first cut tested the surprise bundle's BSTAT_SUM_W, which
+ * is a PER-FRAME sum, and lifted every visible probe (strided A/B: zero-ray
+ * share 22 → 0 %, but "lifted" = all 1292 visible). `__giSrcStarvePackets`
+ * (0 = off arm) and `__giSrcStarveRays` are the live dials;
+ * `__giSrcStarve = false` removes the branch at build.
+ */
+export const STARVE_PACKETS = 2;
+export const STARVE_RAYS = 2000;
 export const COLD_CAP_SHIFT = 2;
 /**
  * Frames after a re-anchor (or a system build) during which NOTHING boosts.

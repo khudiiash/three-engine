@@ -429,6 +429,20 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
  * clamp at 32 — headroom for an average E of ~10 over 1.6 M texels before
  * a u32 could wrap.
  */
+/**
+ * The far-field texture the pass above writes and three consumers read: the
+ * resolve (texel 0: the shaped constant), profile.giPasses (texel 1: the
+ * gauges) and, since §11.16, the fresh-probe seed (texel 2: the raw mean).
+ * Owned by GISystem and persistent across rebuilds/resizes; created up front
+ * so the seed can bind it before the passes that fill it exist.
+ */
+export function createGiFarFieldTexture() {
+  const t = new THREE.StorageTexture(4, 1);
+  t.type = THREE.HalfFloatType;
+  t.name = "giFarFieldAvg";
+  return t;
+}
+
 export function createGiFarFieldAvgPass({ source, width, height, out }) {
   const srcNode = texture(source);
   const FX = 256;
@@ -498,6 +512,10 @@ export function createGiFarFieldAvgPass({ source, width, height, out }) {
       // The readback blit forces alpha to 1, so the gauge lives in a second
       // texel's colour channels (the texture is 2x1; the resolve reads (0,0)).
       textureStore(out, ivec2(1, 0), vec4(darkFrac, covered.div(1e6), fillFrac, 1));
+      // §11.16: the RAW mean irradiance (unshaped — the fresh-probe seed wants
+      // the scene's irradiance, not the display-tinted constant), alpha 1 =
+      // primed. The texture is 4×1 for this texel; (3,0) is spare.
+      textureStore(out, ivec2(2, 0), vec4(next, 1));
     });
     atomicStore(accum.element(uint(0)), uint(0));
     atomicStore(accum.element(uint(1)), uint(0));

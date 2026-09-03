@@ -3872,6 +3872,202 @@ is matte so nothing shows today, but a chrome character would mirror a white
 wall at t = 0. Same one-line fix when it matters. The far duty's ~10 % bias
 (§11.14) is now measurable without the wall.
 
+### 11.16 "Patches flickering while they converge" on a walk-in / pan — the newborn-probe prior was NOT it; the transient is periodic in a STATIC scene (2026-09-03, evening)
+
+**The user (after §11.15 landed): "whenever we rotate the camera, or enter a
+new room, I see patches gradually flickering trying to converge to correct
+lighting… too distracting to be used in an actual game."**
+
+**Instrument repairs first (three, each of which had been feeding a wrong
+number):**
+
+1. `probe:gi-walk`'s no-blockout fallback path took the SCENE box's minimum
+   y + 1.6 m as eye height: on Sponza a stray mesh 3.6 m below the floor put
+   the walk at y = −2, under the floor — a null run that read err0 0 /
+   maxStep 0.00008 with nothing fresh ever minted. Now the 10th-percentile
+   mesh-box floor + 1.6 (`WALKY=` overrides). New arms: `ROTATE=<deg>`
+   (a pan in place, `PIVOT=` the path point), `HIDE=<names>` (hide entities
+   by name), and a per-pinned-frame SIGNALS trace (α, motion root, far duty,
+   the light-track window, the shadow-motion term, the slide hold, the
+   irradiance history weight) printed beside a per-frame tile-step trace.
+2. srcSystem's `readStats` awaited its GPU readbacks one after another, and
+   each await spans frames. The walk probe stops moving while it waits, so
+   the population counters came from a moving frame ("fresh 51") and the
+   seed's tally, three awaits later, from a parked one ("seed 0 probes"):
+   the seed prior looked inert on Sponza for an hour. Every counter copy is
+   now submitted in one tick and awaited together.
+3. `FREEZE=1` also stops game time, which parks the day cycle at the boot's
+   phase — on Sponza a low sun (mean luma 0.010 against 0.17–0.27 live).
+   A frozen arm is a different lighting regime, not a control.
+
+**What the seed really does at a walk frontier (one-frame readback, mid-walk):**
+c0 fresh 52 / c1 17 / c2 7 / c3 5; seeded 24 probes, **52 cold** (the parent
+born the same frame), 6 declined by the wall test, **0 spatial** — the LOD+1
+spatial fallback can never fire inside LOD 0's reach (64 cells = 22 m at
+s0 0.35: no LOD+1 probe exists there). Two thirds of the frontier converges
+from zero in view.
+
+**The far-field prior (built, measured, left OPT-IN — `__giSrcSeedFar = true`):**
+a fresh bin with no parent/spatial source starts at the far-field mean
+(raw texel (2,0) of the now 4×1 `giFarFieldAvg` texture) at 6 rays' weight;
+the top cascade seeded for the first time. srcConfig's SEED_RAYS_FAR doc
+carries the numbers: LIVE scene prior off / on maxStep 0.163, 0.232 / 0.164,
+0.166 — no effect; FROZEN scene prior off err0 0.00033, maxStep 0.0019,
+monotone / prior on err0 0.0108, a slow drift, settled picture 3.5× brighter
+(a flat constant in far bins that see a ray every few frames is not handed
+over for a minute, and it stands in for unknown far intervals the tiles used
+to renormalise away). A same-LOD NEIGHBOUR prior is drafted (six axis
+neighbours, alive/not-fresh/blocked/LOS, 1:1 bins) but NOT applied: the
+measurements below say the newborn probes are not what the user sees.
+
+**The transient, arm by arm (Sponza corridor walk-in, ultra, pinned pools,
+leg 0, two runs each; err0 = mean |arrival − settled|, maxStep = the largest
+one-frame tile step, curve = error every ~0.35 s):**
+
+| arm | err0 | maxStep @ ms | curve shape | tail luma |
+|---|---|---|---|---|
+| live, character animating | 0.0076 / 0.0015 | 0.163 / 0.232 @ 186 / 437 | rises to ~0.024 at 1–1.5 s, dips, second peak at ~3 s | 0.256 / 0.211 |
+| live + far prior | 0.0074 / 0.0068 | 0.164 / 0.166 @ 239 / 442 | same | 0.267 / 0.253 |
+| **HIDE=Player** (no mover at all) | 0.0024 / 0.0016 | **0.192 / 0.218 @ 199 / 209** | **same ~2 s oscillation** | 0.212 / 0.212 |
+| FREEZE (low sun, character pinned) | 0.00033 / 0.00034 | 0.0019 / 0.0018 | monotone | 0.010 |
+
+So: the animated character is NOT the source (hiding it changes nothing);
+the newborn probes are NOT the source (the prior changes nothing); the
+transient is a **~2 s oscillation of the whole field after the camera stops,
+with a ~90 %-of-mean tile pop ~200 ms after arrival, in a static scene with a
+live sun** — and it is absent under a low sun. Two GI timers add to exactly
+2.0 s: `ALPHA_TRACK_HOLD_MS` 1200 + `ALPHA_TRACK_REARM_MS` 800 (the §12.43
+light-track window), and the light-settle envelope 1500 + 800 sits beside
+them; the detail-box slide arms the same 1200 ms hold. SIGNALS trace: (see
+the run ledger below).
+
+**The first HIDE arm had hidden nothing** (`object3D.visible` is recomputed
+every frame from the enabled flags; the heatmap still showed the figure). With
+`setEnabledInEditor(false)` the same walk reads **err0 0.00074, maxStep
+0.0018, monotone, per-frame tile steps 0** and the field's own signals over
+the pinned burst are quiet: light-track window 0, shadow-motion 0, slide 0,
+α at the camera-settle floor 0.05 for 0.6 s then 0.020, the irradiance
+history weight back at 0.90 within 0.8 s. The pop map (per-tile max
+one-frame step, `-steps.png`) with the character present puts every popping
+tile — ~50 of 540, in every arm — on the figure at the left edge of the
+frame: the statistic was measuring the walk cycle moving bright limbs across
+dark background inside a tile, not GI. Arms that could not move it, two runs
+each: `__giIrrTemporalClip` 100 (clip off) 0.201 / 0.217, no camera-settle
+floor + no motion root 0.141 / 0.207, surprise gain 0 0.212 / 0.181. So on a
+static Sponza at ultra with pinned pools, a walk into new surfaces converges
+cleanly at arrival — **the harness does not contain the user's complaint**.
+
+**Editor-side, same hour (the user's session, shared with another assistant
+session, play mode ON, GI quality "high", sky light 0):** three full GI
+rebuilds in five minutes — reasons `component-attached` ×2 and
+`structural-props-changed` — each a cold field behind a 27 s compile wave
+(`first diffuse gather dispatched 27658 ms after build`). A rebuild is the
+biggest "patches converging" event there is, and none of those three was a
+camera move. Then, at 15:41, the thing the harness cannot contain: **walking
+Sponza grew the probe pools** (`c0Probes 32768→65536, blocks
+21875/5468/1367/341 → 31744/6656/1536/384, 2.80M→3.44M bins; peaks
+15447/4390/1074/263` — c1–c3 at 77–80 % of their blocks), the grown store's
+68 kernels compiled behind the live one for **73 s** with the picture held
+(`swapped to the prepared store after 73231 ms — every kernel landed`), and
+the cold store took over (`picture released after 12 gathers`) — the whole
+field re-converging in view. The content pipeline cache
+(giComputePipelineCache) dedupes by WGSL text, so those 68 kernels are
+byte-DIFFERENT after a grow: ~31 capacity/base literals (`uint(info.
+probeCapacity)`, `binBase`, `hashCapacity`, …) are baked into the code.
+
+**Shipped from this:** the desktop boot floor 2.8 M → 4.2 M bins / c0
+65 536 (~115 MB): a Sponza-class walk no longer takes a rung. Bistro still
+does. **§11.17 (proposed):** store capacities as uniforms (one geometry
+block) so a grow is allocate + copy + rebind with NO recompile, and the live
+content migrates instead of restarting cold.
+
+### 11.17 THE STARVED PROBE — "patches of wrong lighting all over the dark corridors that don't resolve until I walk closer" (2026-09-03, late evening)
+
+**The user's second capture (the end of a Sponza aisle, 15–20 m away):**
+cell-sized patches of wrong brightness on the vault and the walls that take
+too long to resolve, or never do until the camera approaches. Not the
+walk-in transient (§11.16, clean), not the character (hidden), not a
+rebuild: a probe that the camera sees but barely covers.
+
+**Why, from the design:** rays are born per PIXEL ([D1]: `raysPerPixel`
+rays at every pixel of the frame's stride residue, summed into the pixel's
+c0 probe), so a probe's ray rate follows its screen footprint. In the
+user's editor (878 k pixels, 125 k rays a frame, stride 14) a near probe
+covering 400 pixels is capped at 16–25 rays a frame; a far-corridor probe
+covering 20 pixels gets ~3 rays a frame across 32 direction bins — a bin
+every 11 frames, a running mean of a handful of samples for the first ten
+seconds, and at the still keep (0.9977) a steady state it reaches in ~1/α ≈
+435 frames. Five times farther is twenty-five times slower. The
+cold-frontier priority (§12.52) reserves one packet per frame for a probe
+born within COLD_FILL_FRAMES = 4 — four frames — and nothing after that.
+
+**The instrument (shipped, opt-in `__giProfileProbeRays = true`):**
+`profile.giPasses` → `srcProbes.probeRays[]`: live c0 probes by LOD with
+this frame's mean ray allotment and the share getting 0 / < 2 rays; the
+walk probe prints it at MID-WALK / arrival / rest. First editor read (a
+near courtyard view, fresh field): LOD 0, 1420 probes, mean 13.7 rays,
+3.5 % with none.
+
+**The floor (shipped, default on):** the priority pass now also admits any
+VISIBLE c0 probe whose block has SEEN fewer than `STARVE_RAYS` (2000) rays —
+the block's decayed `BIN_COUNT` summed over its 32 bins, i.e. the deposit's
+own accumulator (≈ 435·r at the still keep for r rays a frame), not its
+age — and gives it `STARVE_PACKETS` (2) packets a frame from the same
+ceiling tickets: a probe under ~4.6 rays a frame is topped up toward it,
+one under ~0.6 permanently, one the camera feeds never. The packet count rides the free upper bits of the
+representative word (`PROBE_HASH = rep | packets << 22`; [D1] masks it) and
+the representative pass claims one `raysPerPixel` slice per packet, so the
+extra rays fire from the same pixel in successive ray slots (distinct
+directions). At the still keep the accumulator's steady state is ≈ 1500·r
+for r rays a frame, so 800 means "under half a ray a frame": every visible
+probe is lifted to ≥ 4 rays a frame until it holds ~256 rays of evidence
+(8 per bin), then hands its tickets back. `COUNTER_STARVED` (a new eleventh
+counter word) counts the lifted probes; `profile.giPasses`
+`cascades[0].starved`. Dials: `__giSrcStarvePackets` (0 = off arm),
+`__giSrcStarveDeposits`; `__giSrcStarve = false` at build.
+
+**First A/B (harness, Sponza corridor pose after a 30 s settle, Player
+hidden, pinned pools, `STARVE_DEPOSITS` 800):** the ledger over LIVE c0
+probes read mean 3.35 rays / 75.0 % zero with the floor off and 3.58 / 74.7 %
+with it on, while the (then cumulative) starvation counter said ~700 probes
+were lifted every frame. Two lessons: (1) the ledger must count VISIBLE
+probes only — at rest most live probes are held off-screen by retention and
+get no rays by design; (2) at 800 a lifted probe crosses the line in about
+a second and drops out, so its sustained rate stayed ~0.5 rays a frame.
+Shipped: visible-only ledger (`visible` beside `probes`), a per-frame
+counter, and `STARVE_DEPOSITS` 3000 — a probe whose own pixels bring under
+~2 rays a frame stays lifted at 4 (~700 probes × 4 ≈ 2 % of the ceiling at
+that pose). Its A/B:
+
+**The visible-only ledger then said the HARNESS is not starved at all**
+(686×342, stride 2): 1292 of 4999 live c0 probes visible at rest, mean 13.2
+rays a frame, 1.1 % with none. The editor is a different regime by the
+STRIDE: the ray ceiling is fixed (131 k a frame) and 878 k pixels put the
+stride at 14, so each pixel fires one frame in fourteen and a two-pixel
+far-corridor probe goes dark 86 % of frames. `__giSrcTransportRays = 33500`
+forces the harness to the same stride; that A/B is the one that counts:
+
+| arm (stride 21 mid-walk / 8 at rest, Player hidden, pinned pools) | visible c0 probes with 0 rays: mid-walk / arrival / rest | mean rays a frame | lifted |
+|---|---|---|---|
+| floor OFF | **23.8 % / 15.5 % / 9.1 %** | 5.2 / 8.3 / 11.9 | 0 |
+| floor ON, run 1 | 0.0 % / 0.1 % / 0.1 % | 7.9 / 10.8 / 13.5 | 1765 / 1284 / 536 |
+| floor ON, run 2 | 0.3 % / 0.2 % / 0.0 % | 7.9 / 10.6 / 13.5 | 1777 / 1285 / 525 |
+
+At rest the floor lifts 41 % of the visible probes (the under-fed ones; the
+first, per-frame-sum cut lifted all 1292) for ~2.1 k rays ≈ 6 % of that
+ceiling, and no visible probe is left without rays. The arrival statistics
+(err0 ~0.001, maxStep ~0.003) do not move — the walk-in was never the
+problem — and the cost at the harness's own stride is zero (nothing is
+starved there). What this buys in the user's corridor is the far probes'
+convergence time: a bin every ~8 frames instead of every ~100. The
+remaining un-lifted starvation is spatial, not temporal: a probe the camera
+never sees at all cannot be fed by any pixel — that is the retention hold,
+by design.
+
+**Receipt to watch in the editor:** `profile.giPasses` with
+`__giProfileProbeRays = true` → `srcProbes.probeRays[0].zeroRayShare` over
+VISIBLE probes (expect ≈ 0) and `cascades[0].starved` (the lifted count).
+
 ## 8. SOURCES
 
 Lumen SIGGRAPH 2022 (Wright et al.) · Lumen technical details / performance

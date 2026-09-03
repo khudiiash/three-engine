@@ -220,7 +220,7 @@ export const FLAG_FRESH = 2;
 export { INFLUX_ONE };
 
 /** Per-cascade counter block. A counter is one atomic. */
-export const COUNTER_WORDS = 10;
+export const COUNTER_WORDS = 11;
 export const COUNTER_LIVE = 0;      // probes currently in the indirection table
 export const COUNTER_FAILED = 1;    // inserts that exhausted MAX_PROBE_STEPS
 export const COUNTER_STEPS = 2;     // total linear-probe steps this frame
@@ -298,6 +298,8 @@ export const COUNTER_HELD = 7;
  */
 export const COUNTER_RETIRED = 8;
 export const COUNTER_AGESUM = 9;
+/** §11.17: c0 probes that took a STARVATION packet this frame (srcConfig's STARVE block). */
+export const COUNTER_STARVED = 10;
 
 // ═════════════════════════════════════════════════════════ THE WGSL ISLAND
 
@@ -722,6 +724,8 @@ export function createHashClearPass(store) {
       atomicStore(counters.element(base.add(COUNTER_FRESH)), uint(0));
       atomicStore(counters.element(base.add(COUNTER_ATTEMPTS)), uint(0));
       atomicStore(counters.element(base.add(COUNTER_NOBLOCK)), uint(0));
+      // §11.17: per-frame, like the others (the first cut left it cumulative).
+      atomicStore(counters.element(base.add(COUNTER_STARVED)), uint(0));
       // Cleared HERE and not in [D1'] that writes it: [D1'] is one dispatch
       // whose threads all add into this word, so a thread clearing it would
       // race the ones already counting. This pass runs frames earlier.
@@ -1714,6 +1718,8 @@ export async function readSrcProbeStats(renderer, store) {
        * cliff, which is visible BEFORE the collapse rather than after it.
        */
       retired: raw[base + COUNTER_RETIRED] >>> 0,
+      /** §11.17: probes lifted by the starvation floor this frame (c0 only). */
+      starved: raw[base + COUNTER_STARVED] >>> 0,
       meanAge: live > 0 ? (raw[base + COUNTER_AGESUM] >>> 0) / live : 0,
       probeCapacity: c.probeCapacity,
       hashCapacity: c.hashCapacity,

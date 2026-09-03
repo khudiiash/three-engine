@@ -43,6 +43,23 @@
 //   WALKMS=1600    how long a leg takes   BURST=4000   pinned measuring window
 //   TAIL=6000      extra settle before the reference frame is taken
 //   LEGS=2         how many room-to-room legs to walk
+//   HIDE=Player    hide entities by NAME (comma list) before the settle — the
+//                  isolation arm for "is the transient the animated character?":
+//                  the live sun stays, the mover goes. (FREEZE=1 also stops
+//                  game time, which parks the day cycle at the BOOT's phase —
+//                  a low sun on Sponza, 0.010 mean luma against 0.17 live —
+//                  so a frozen arm is a different lighting regime, not a
+//                  control.)
+//   WALKY=1.6      eye height (metres, WORLD y) for the no-blockout fallback
+//                  path. Default: the 10th-percentile mesh-box floor + 1.6 —
+//                  the scene-box minimum walked Sponza at y = −2, UNDER the
+//                  floor (a stray mesh 3.6 m down), a null run that read
+//                  err0 0 / maxStep 0.00008 with nothing fresh ever minted.
+//   ROTATE=90      a PAN IN PLACE instead of a walk (the user's "rotate the
+//                  camera"): the camera stays at the path's first point and
+//                  every leg swings the aim by ROTATE degrees about +Y over
+//                  WALKMS, continuing from the previous leg's heading. Same
+//                  pinned measurement afterwards; `dist` reads 0.
 //   PNG=1          arrival / settled / error-heatmap per leg
 //   FLAGS='{...}'  extra page globals merged over the arm's (e.g. pinned pools:
 //                  {"__giSrcC0Probes":21875,"__giSrcBinBudget":2800000} skips the
@@ -63,6 +80,13 @@ const CFG = {
   burstMs: Number(process.env.BURST ?? 4000),
   tailMs: Number(process.env.TAIL ?? 6000),
   legs: Number(process.env.LEGS ?? 2),
+  rotateDeg: Number(process.env.ROTATE ?? 0),
+  // PIVOT=<index>: which path point a ROTATE run turns on. Default 1, the
+  // MIDDLE of a three-point path — the ends of a long-axis fallback path face
+  // the scene's end walls (Sponza: a black wall a metre away, luma 0.005).
+  rotatePivot: Number(process.env.PIVOT ?? 1),
+  walkY: process.env.WALKY != null ? Number(process.env.WALKY) : null,
+  hide: (process.env.HIDE ?? "").split(",").map((s) => s.trim()).filter(Boolean),
   telem: process.env.TELEM === "1",
   freeze: process.env.FREEZE === "1",
   // PINSUN=0 freezes the character but LEAVES THE SUN TURNING — the isolation
@@ -556,7 +580,16 @@ async function runArm(arm) {
       const box = new THREE.Box3();
       boxes.forEach((b, i) => { if (centres[i].distanceTo(mc) <= 150) box.union(b); });
       if (box.isEmpty()) return { fail: "no rooms and no geometry" };
-      const lo = box.min, hi = box.max, y = Math.min(hi.y - 0.4, lo.y + 1.6);
+      const lo = box.min, hi = box.max;
+      // The FLOOR is where most meshes' boxes bottom out, not where the
+      // lowest one does: the 10th percentile of the kept boxes' min y. The
+      // scene-box minimum put the walk under Sponza's floor (see WALKY).
+      const minYs = [];
+      boxes.forEach((b, i) => { if (centres[i].distanceTo(mc) <= 150) minYs.push(b.min.y); });
+      minYs.sort((a, b) => a - b);
+      const floorY = minYs[Math.floor(minYs.length * 0.1)] ?? lo.y;
+      const y = Number.isFinite(cfg.walkY) ? cfg.walkY : Math.min(hi.y - 0.4, floorY + 1.6);
+      console.log(`[probe] fallback path: floor ${floorY.toFixed(2)} (p10 of ${minYs.length} boxes; scene box min ${lo.y.toFixed(2)}) → eye y ${y.toFixed(2)}`);
       const longX = hi.x - lo.x >= hi.z - lo.z;
       const at = (t) => (longX
         ? [lo.x + (hi.x - lo.x) * t, y, (lo.z + hi.z) / 2]
@@ -764,6 +797,25 @@ async function runArm(arm) {
     const std = (a) => { const m = mean(a); let s = 0; for (const v of a) s += (v - m) ** 2; return Math.sqrt(s / a.length); };
 
     /** False-colour |L − settled|, drawn in page so node needs no encoder. */
+    // Per-TILE map (TX×TY values) blown up to the capture size — where the
+    // one-frame pops happen, as opposed to `heatmap`'s per-pixel arrival error.
+    const tileHeatmap = (tiles, scale) => {
+      const c = document.createElement("canvas");
+      c.width = CW; c.height = CH;
+      const cx = c.getContext("2d");
+      const img = cx.createImageData(CW, CH);
+      for (let i = 0; i < CW * CH; i++) {
+        const tx = Math.min(TX - 1, Math.floor((i % CW) / TILE));
+        const ty = Math.min(TY - 1, Math.floor(Math.floor(i / CW) / TILE));
+        const v = Math.min(1, (tiles[ty * TX + tx] ?? 0) / scale);
+        img.data[i * 4] = Math.round(255 * Math.min(1, Math.max(0, v * 2 - 0.5)));
+        img.data[i * 4 + 1] = Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(v - 0.5) * 3)));
+        img.data[i * 4 + 2] = Math.round(255 * Math.min(1, Math.max(0, 1 - v * 2)));
+        img.data[i * 4 + 3] = 255;
+      }
+      cx.putImageData(img, 0, 0);
+      return c.toDataURL("image/png");
+    };
     const heatmap = (a, b, scale) => {
       const c = document.createElement("canvas");
       c.width = CW; c.height = CH;
@@ -842,7 +894,10 @@ async function runArm(arm) {
           attempts: c.attempts,
           held: c.held, cap: c.probeCapacity, blocks: c.blockCapacity,
         })),
-        seed: s.seed ? { probes: s.seed.probes, cold: s.seed.cold, orphans: s.seed.orphans } : null,
+        seed: s.seed ? { probes: s.seed.probes, cold: s.seed.cold, orphans: s.seed.orphans, bins: s.seed.bins, spatial: s.seed.spatial, noBlock: s.seed.noBlock, los: s.seed.los, dispatched: s.seed.dispatched } : null,
+        // §11.17: rays per c0 probe by LOD (needs FLAGS {"__giProfileProbeRays": true}).
+        probeRays: s.probeRays ?? null,
+        starved: s.cascades?.[0]?.starved ?? null,
         // §12.82: of the resolved bins that carry RADIANCE, how many could
         // close the sun. Anything below ~100% is sun being dropped for want of
         // a cached normal — on screen that is indistinguishable from a transfer
@@ -920,6 +975,25 @@ async function runArm(arm) {
     // So: freeze every AnimationMixer, then VERIFY the fingerprint actually
     // stops moving. A freeze that silently fails would restore the exact bug
     // it exists to remove, so this reports rather than assumes.
+    // ── HIDE=<names>: the no-mover isolation arm (env doc) ──────────────
+    if (cfg.hide?.length) {
+      const hidden = [];
+      for (const root of engine.rootEntities ?? []) {
+        root.traverse?.((entity) => {
+          if (cfg.hide.includes(entity.name)) {
+            // The engine recomputes object3D.visible every frame from the
+            // enabled flags (Entity.setEnabledInEditor's doc), so a bare
+            // `visible = false` is undone on the next tick — the first HIDE
+            // arm hid nothing and the heatmap still showed the figure.
+            if (typeof entity.setEnabledInEditor === "function") entity.setEnabledInEditor(false);
+            else if (entity.object3D) entity.object3D.visible = false;
+            hidden.push(entity.name);
+          }
+        });
+      }
+      // "[gi]"-tagged so the relay keeps it.
+      console.log(`[gi] [probe] HIDE: ${hidden.length ? hidden.join(", ") : "NOTHING MATCHED " + cfg.hide.join(",")}`);
+    }
     let frozen = null;
     if (cfg.freeze) {
       const mixers = new Set();
@@ -1126,8 +1200,10 @@ async function runArm(arm) {
       }
     };
 
+    const pivot = cfg.rotateDeg ? Math.min(path.length - 1, Math.max(0, Number(cfg.rotatePivot ?? 1))) : 0;
     for (let leg = 0; leg < nLegs; leg++) {
-      const from = path[leg].p, to = path[leg + 1].p;
+      const from = cfg.rotateDeg ? path[pivot].p : path[leg].p;
+      const to = cfg.rotateDeg ? path[pivot].p : path[leg + 1].p;
       // EVERY LEG STARTS AT THE SAME POINT IN THE DAY. See `alignSun`.
       const sunAt = await alignSun();
       // WALK. Small steps at frame cadence — a single setCamera jump pays the
@@ -1143,11 +1219,26 @@ async function runArm(arm) {
       // ONE aim direction for the whole leg — see `legAim`'s header for the
       // degenerate `target === position` bug this replaces. Computed from the
       // LEG, so it is defined at t = 1 and constant across the measurement.
-      const aim = legAim(from, to);
+      // ROTATE: a pan in place. The heading starts where the walk's first leg
+      // would have aimed and each leg adds ROTATE degrees; `t` is the leg's
+      // progress so the pan is continuous at frame cadence. `legAim` ignores
+      // the extra argument.
+      const aim = cfg.rotateDeg
+        ? (() => {
+            const next = path[pivot + 1]?.p ?? path[pivot - 1].p;
+            const d0 = legAim(path[pivot].p, next)(path[pivot].p);
+            const ux = d0[0] - path[pivot].p[0], uz = d0[2] - path[pivot].p[2];
+            return (q, t = 1) => {
+              const a = (cfg.rotateDeg * (leg + t) * Math.PI) / 180;
+              const c = Math.cos(a), s = Math.sin(a);
+              return [q[0] + ux * c - uz * s, q[1], q[2] + ux * s + uz * c];
+            };
+          })()
+        : legAim(from, to);
       for (let i = 1; i <= steps; i++) {
         const t = i / steps;
         const p = [from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t, from[2] + (to[2] - from[2]) * t];
-        await setPose(p, aim(p));
+        await setPose(p, aim(p, t));
         await nextFrame();
         if (i === Math.round(steps * 0.6)) walkSample = await snapshot();
       }
@@ -1202,9 +1293,32 @@ async function runArm(arm) {
       // frames, so it goes AFTER a short burst head — the numbers still
       // describe the arrival, and the head is where `maxStep` usually lands.
       let arrival = null;
+      // ── THE FIELD'S OWN SIGNALS, PER PINNED FRAME (2026-09-03) ──────────
+      // A static scene with a live sun still showed a ~2 s oscillation and a
+      // 0.19 tile pop after the camera stopped (HIDE=Player arm). Everything
+      // here is a plain property read — no readback, no stall — so the trace
+      // lines up with `maxStep` frame for frame: which timer (α ramp, the
+      // light-track window, the detail-box slide hold, the shadow-motion term,
+      // the irradiance history weight) moved when the picture did.
+      const giSys = engine.modules?.get?.("gi")?.system ?? null;
+      const signals = [];
+      const signalAt = () => {
+        const nowMs = performance.now();
+        return {
+          alpha: Number(globalThis.__giSrcAlphaLive) || 0,
+          root: Number(globalThis.__giSrcMotionRootLive) || 0,
+          duty: Number(globalThis.__giSrcFarDutyLive) || 0,
+          track: Number(giSys?._giTrackMotion) || 0,
+          shadow: Number(giSys?._giShadowLastMotion) || 0,
+          slide: giSys?._giSlideHoldUntil > nowMs ? 1 : 0,
+          hist: Number(giSys?._giIrrHistWeightU?.value ?? -1),
+          cam: Number(giSys?._giIrrHistSettled ?? -1),
+        };
+      };
       while (performance.now() - tArrive < cfg.burstMs) {
         await nextFrame();
         frames.push(grab());
+        signals.push(signalAt());
         checkers.push(checkerOf());
         // Every 4th frame: the sort inside `creaseOf` is ~100k elements and
         // must not become the thing that stalls the frame `maxStep` compares.
@@ -1225,13 +1339,48 @@ async function runArm(arm) {
       // The step statistic: biggest single-tile jump between consecutive pinned
       // frames, and when it happened. A 40 ms pop is what the eye reports as
       // "a block updated"; the mean curve hides it completely.
-      let maxStep = 0, maxStepAt = 0;
+      let maxStep = 0, maxStepAt = 0, maxStepFrame = 0;
+      // Per-tile MAX one-frame step over the burst, and how many frames each
+      // tile stepped by more than 10 % of the settled mean — the pop map.
+      const settledMean = Math.max(1e-4, mean(settled));
+      const stepMaxTile = new Float32Array(TX * TY);
+      const stepCountTile = new Uint16Array(TX * TY);
+      for (let i = 1; i < frames.length; i++) {
+        const t = tileDiff(frames[i], frames[i - 1]);
+        let m = 0;
+        for (let k = 0; k < t.length; k++) {
+          const v = t[k];
+          if (v > m) m = v;
+          if (v > stepMaxTile[k]) stepMaxTile[k] = v;
+          if (v > 0.1 * settledMean) stepCountTile[k]++;
+        }
+        if (m > maxStep) { maxStep = m; maxStepAt = times[i]; maxStepFrame = i; }
+      }
+      let poppingTiles = 0;
+      for (let k = 0; k < stepCountTile.length; k++) if (stepCountTile[k] >= 3) poppingTiles++;
+      const stepHeat = cfg.png ? tileHeatmap(stepMaxTile, Math.max(1e-4, settledMean)) : null;
+      // The signal trace: one line per ~12 frames plus the maxStep frame, so
+      // a 2 s oscillation and a one-frame pop can both be read against the
+      // field's timers.
+      const fmtSig = (i) => {
+        const g = signals[i];
+        return g ? `t${Math.round(times[i])}ms α${g.alpha.toFixed(3)} root${g.root.toFixed(2)} duty${g.duty.toFixed(2)} track${g.track.toFixed(2)} shadow${g.shadow.toFixed(3)} slide${g.slide} hist${g.hist.toFixed(2)}` : "";
+      };
+      const sigLines = [];
+      for (let i = 0; i < signals.length; i += 12) sigLines.push(fmtSig(i));
+      const stepSig = fmtSig(maxStepFrame) + " ← maxStep frame";
+      // Per-frame tile steps on a coarse timeline: the 95th percentile tile
+      // step per frame, every frame, so the oscillation's period is readable.
+      const stepTrace = [];
       for (let i = 1; i < frames.length; i++) {
         const t = tileDiff(frames[i], frames[i - 1]);
         let m = 0;
         for (const v of t) if (v > m) m = v;
-        if (m > maxStep) { maxStep = m; maxStepAt = times[i]; }
+        stepTrace.push(+m.toFixed(3));
       }
+      // Carried in the leg record: the page console relay keeps only "[gi]"
+      // lines (and truncates them), so a page-side print never reaches the log.
+      const signalTrace = { lines: sigLines, step: stepSig, trace: stepTrace };
       // ── RIPPLE: does it ever actually STOP? ──────────────────────────────
       // Over the SECOND HALF of the pinned window, long after any arrival
       // transient, the coefficient of variation of whole-frame brightness. A
@@ -1253,6 +1402,10 @@ async function runArm(arm) {
       legs.push({
         from, to,
         dist: +Math.hypot(to[0] - from[0], to[2] - from[2]).toFixed(2),
+        signalTrace,
+        stepHeat,
+        poppingTiles,
+        tiles: TX * TY,
         err0: +err0.toFixed(5),
         errMid: +err[Math.floor(frames.length / 2)].toFixed(5),
         settle95: Math.round(settle95),
@@ -1342,6 +1495,7 @@ async function runArm(arm) {
     (out.legs ?? []).forEach((l, i) => {
       if (!l.heat) return;
       writeFileSync(`${OUT}/${arm}-leg${i}-error.png`, Buffer.from(l.heat.split(",")[1], "base64"));
+      if (l.stepHeat) writeFileSync(`${OUT}/${arm}-leg${i}-steps.png`, Buffer.from(l.stepHeat.split(",")[1], "base64"));
       delete l.heat;
     });
   }
@@ -1430,6 +1584,11 @@ for (const arm of ARMS) {
       console.log(`       ${l.checkerCurve.join(" ")}`);
       console.log(`    ⭐ ripple ${l.ripple} (tail mean luma ${l.tailMean}) — 0 = the picture finally stops moving   |   ${l.fps} fps`);
       console.log(`    curve ${l.curve.join(" ")}`);
+      if (l.poppingTiles != null) console.log(`    popping tiles (≥3 frames with a step > 10 % of the settled mean): ${l.poppingTiles} of ${l.tiles}`);
+      if (l.signalTrace) {
+        console.log(`    signals (every 12th pinned frame):\n      ${l.signalTrace.lines.join("\n      ")}\n      ${l.signalTrace.step}`);
+        console.log(`    tile-step per frame: ${l.signalTrace.trace.join(" ")}`);
+      }
       const tr = (t) => `stride ${t?.stride} rest×${t?.restFactor?.toFixed?.(2)} ceiling ${t?.ceiling} traced ${t?.tracedRays}`;
       console.log(`    transport at arrival: ${tr(l.transportArrive)}`);
       console.log(`    transport at rest:    ${tr(l.transport)}`);
@@ -1443,7 +1602,8 @@ for (const arm of ARMS) {
           (c.failed ? ` FAILED ${c.failed}` : "") +
           (c.noBlock ? ` NOBLOCK ${c.noBlock}/${c.blocks}` : "") +
           (c.held ? ` held ${c.held}` : "")).join(" | ")}`);
-        console.log(`      seed ${s.seed ? `${s.seed.probes} probes, ${s.seed.cold} cold, ${s.seed.orphans} orphan` : "n/a"}` +
+        if (s.probeRays) console.log(`      rays/probe by LOD: ${s.probeRays.map((r) => `L${r.lod} ${r.visible ?? r.probes}/${r.probes} visible, mean ${r.meanRays} rays, zero ${(r.zeroRayShare * 100).toFixed(1)}%`).join(" | ")}${s.starved != null ? ` | starved lifted ${s.starved}` : ""}`);
+      console.log(`      seed ${s.seed ? `${s.seed.probes} probes, ${s.seed.cold} cold, ${s.seed.orphans} orphan, ${s.seed.noBlock} noblock, ${s.seed.los} los, ${s.seed.spatial} spatial, ${s.seed.bins} bins${s.seed.dispatched === false ? " (NOT DISPATCHED)" : ""}` : "n/a"}` +
           `  merge orphan ${((s.merge?.orphanRate ?? 0) * 100).toFixed(1)}% corners ${s.merge?.meanCorners?.toFixed?.(2)}/8` +
           // ⭐ THE LEVEL THAT IS STARVING. orphan%/corners per cascade — the
           // aggregate above is bin-weighted and cannot say which one.
@@ -1481,6 +1641,7 @@ for (const arm of ARMS) {
     // wherever it landed in the log.
     const receipts = r.gi.filter((l) => /§\d|sun slot|ARMED|: OFF \(/.test(l));
     for (const l of [...new Set([...receipts, ...r.gi.slice(process.env.GI_LOG ? -80 : -6)])]) console.log(`  ${l}`);
+    if (r.errors?.length) { const uniq = [...new Set(r.errors)].slice(0, 8); console.log("  page errors (" + r.errors.length + "): " + uniq.join(" || ")); }
   } catch (e) {
     console.log(`  ARM THREW ${String(e.message ?? e).slice(0, 300)}`);
   }
