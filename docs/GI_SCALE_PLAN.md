@@ -4068,6 +4068,60 @@ by design.
 `__giProfileProbeRays = true` → `srcProbes.probeRays[0].zeroRayShare` over
 VISIBLE probes (expect ≈ 0) and `cascades[0].starved` (the lifted count).
 
+### 11.18 THE FROZEN GI IS THE BOOT, AND THE BOOT IS THE MATERIAL COMPILE QUEUE; the Cornell fidelity gap, measured (2026-09-03, night)
+
+**"Quite often the frozen GI stuck on the screen" + "on the simplest scene,
+Cornell, GI takes more than a minute to boot" — one event.** The Cornell
+boot's console: `compile wave: materials warmed safely in 93780 ms` for SIX
+material variants, then `first diffuse gather dispatched 94031 ms after
+build`, and every compute pipeline landed at the same 93 s — `SLOWEST
+PIPELINE #71 [aoFilterX] 93.0 s (13 kB, 0 loops)`, `emitterShadowHistoryPass
+92.9 s (2 kB)`. A 2 kB kernel does not take 93 s to compile: it was QUEUED
+behind a render pipeline that held the driver's compile queue for ~90 s.
+Until the SRC kernels land the field cannot advance and the screen keeps the
+last picture, reprojected — the ghost silhouettes of the capture. The wave
+issues its pipelines concurrently (the `getForRender` interception collects
+the promises), so the serialisation is the driver's. No dev pin was set
+(`__giIrrHistWeight` null); the pool-swap hold is bounded to 5 s.
+
+**Shipped: per-render-pipeline compile timing in the wave** — the summary
+line `[gi] render pipelines: N compiled, slowest <material> <kB frag> <s>`
+and `__giWaveRenderTimings`. The next boot names the 90 s shader; the fix
+is its size (the reflection-probe sampler unroll was the last such giant:
+327 → 91 kB) or splitting its variants, and capacities-as-uniforms (§11.17's
+proposal) so the WGSL is cache-stable across scenes.
+
+**The Cornell fidelity gap (the user's two captures, our GI vs the path
+tracer, linear RGB means over 31×31 windows):**
+
+| region | ours rgb / sat | tracer rgb / sat | lum ours/tracer |
+|---|---|---|---|
+| ceiling near red wall | 0.83/0.77/0.76 · 0.08 | 0.85/0.48/0.44 · 0.48 | 1.41 |
+| ceiling near green wall | 0.24/0.22/0.21 · 0.12 | 0.53/0.49/0.27 · 0.50 | 0.46 |
+| back wall left of box | 0.99/0.99/0.99 · 0.00 | 0.83/0.47/0.43 · 0.49 | 1.83 |
+| back wall right of box | 0.02/0.07/0.01 · 0.90 | 0.05/0.38/0.01 · 0.98 | 0.20 |
+| floor near red wall | 0.48/0.42/0.40 · 0.17 | 0.78/0.37/0.31 · 0.61 | 0.95 |
+| floor centre | 0.46/0.41/0.39 · 0.15 | 0.69/0.46/0.35 · 0.49 | 0.83 |
+
+Two defects, not one: (a) the whites carry a tenth of the tracer's chroma —
+the red wall's bounce, which in a closed room is the room's equilibrium
+tint, arrives at 0.07–0.17 saturation against 0.4–0.6; (b) the brightness is
+wrong in opposite directions: 1.4–1.8× next to the emitter panel (the
+panel's direct term on grazing surfaces) and 0.2–0.5× on the far, green
+side (the multibounce that should light it). The indirect debug view shows
+the box faces tinted pink/green, so the field does carry colour; the loop's
+gain is what is short (`bounceOverDirect` 1.19 at hits where a 0.75-albedo
+room converges to ~3×). The emitter is a 0.74×1.92×0.51 m BOX mover
+(`Light`, Mirror.mat, giMobility dynamic); a sharp-edged bright rectangle on
+the floor in the indirect view (the user's "phantom plane") sits under it —
+the resolve's irradiance INCLUDES the emitters' direct term, so that is the
+analytic box emitter's footprint, and its hard edge is the shape model's.
+The colour-bleed chain gate on its own fixture passes (tile-atlas red blocks
+sat 0.51), so the loss is in the loop's gain and the direct term's share, not
+in attribution. Next: a harness Cornell rig that screenshots the tracer
+through puppeteer (`page.screenshot` sees the tracer's canvas; the MCP
+screenshot does not) and A/Bs the loop gain and the emitter shape.
+
 ## 8. SOURCES
 
 Lumen SIGGRAPH 2022 (Wright et al.) · Lumen technical details / performance

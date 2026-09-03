@@ -5215,6 +5215,14 @@ export class GISystem {
     const pipelines = renderer._pipelines;
     const originalGetForRender = pipelines?.getForRender;
     const inflight = [];
+    // §11.18 (2026-09-03): TIME EACH RENDER PIPELINE'S COMPILE. A Cornell boot
+    // read "materials warmed safely in 93780 ms" for SIX material variants,
+    // and every compute pipeline queued behind them landed at the same 93 s
+    // (a 2 kB kernel "took" 92.9 s): one render pipeline holds the driver's
+    // compile queue for a minute and nothing else lands until it does. This
+    // names it — material, fragment WGSL size, wall time — in the wave's
+    // summary and in `__giWaveRenderTimings` (slowest first).
+    const renderTimings = [];
     // BACKGROUND MODE TOO (2026-08-02, was suspended-only). Without the
     // interception, background mode awaited each object's pipeline promise
     // PER OBJECT — and those promises can only resolve when the GPU
@@ -5232,7 +5240,17 @@ export class GISystem {
         if (promises == null) return originalGetForRender.call(this, renderObject, promises);
         const collected = [];
         const result = originalGetForRender.call(this, renderObject, collected);
-        inflight.push(...collected);
+        const tStart = performance.now();
+        const material = renderObject?.material;
+        const name = material?.name || material?.type || renderObject?.object?.name || "?";
+        const fragmentBytes = result?.fragmentProgram?.code?.length ?? 0;
+        const vertexBytes = result?.vertexProgram?.code?.length ?? 0;
+        for (const p of collected) {
+          inflight.push(Promise.resolve(p).then(
+            () => { renderTimings.push({ name, fragmentBytes, vertexBytes, ms: performance.now() - tStart }); },
+            (error) => { renderTimings.push({ name, fragmentBytes, vertexBytes, ms: performance.now() - tStart, error: String(error?.message ?? error) }); },
+          ));
+        }
         return result;
       };
     }
@@ -5355,6 +5373,16 @@ export class GISystem {
       const queued = inflight.length;
       if (queued > 0) await Promise.all(inflight);
       t1 = performance.now();
+      if (renderTimings.length) {
+        renderTimings.sort((a, b) => b.ms - a.ms);
+        globalThis.__giWaveRenderTimings = renderTimings.map((r) => ({ ...r, ms: Math.round(r.ms) }));
+        const top = renderTimings.slice(0, 4).map((r) =>
+          `${r.name} ${(r.fragmentBytes / 1024).toFixed(0)}kB frag/${(r.vertexBytes / 1024).toFixed(0)}kB vert ${(r.ms / 1000).toFixed(1)}s${r.error ? " FAILED" : ""}`).join(", ");
+        console.log(
+          `[gi] render pipelines: ${renderTimings.length} compiled, slowest ${top} — wall time from creation to ready; ` +
+          "a pipeline that lands at the same second as many others was QUEUED behind the slowest, not slow itself.",
+        );
+      }
       console.log(
         backgroundCompile
           ? `[gi] compile wave: materials warmed safely in ${(t1 - t0).toFixed(0)}ms while viewport remained live`
