@@ -322,6 +322,99 @@ export class StatsSystem {
     this._phaseLast = 0;
     this._phaseIndex = -1;
     this._phaseArmed = true;
+    // A plain phase capture is not a spike watch: clear any previous window so
+    // `endPhaseFrame` does not keep folding frames into a stale one. The spike
+    // watch calls this first and then arms its own window.
+    this._spikeUntil = 0;
+  }
+
+  /**
+   * Arm the SPIKE WATCH: run the phase profiler for `seconds`, and keep the
+   * breakdown of every frame that took longer than `thresholdMs` — not the
+   * mean.
+   *
+   * ⚠ A MEAN CANNOT SEE A FREEZE, and that is the whole reason this exists.
+   * `profile.cpuFrame` averages a capture, so a drag that runs at 90 fps with
+   * one 300 ms hitch a second reports ~14 ms and looks healthy — while the
+   * user's hand feels only the hitch. Same standing rule as the frame
+   * governor's: a spike is a regression regardless of average cost. The
+   * watch keeps the worst frames whole (phases AND sub-phases for that one
+   * frame), so the answer to "what froze" is a name rather than a residual.
+   *
+   * Costs what a phase capture costs while it runs, and disarms itself.
+   */
+  beginSpikeWatch({ seconds = 8, thresholdMs = 40, keep = 12 } = {}) {
+    this.beginPhaseCapture(Math.max(1, Math.round(seconds * 1000)));
+    this._spikeUntil = performance.now() + seconds * 1000;
+    this._spikeThresholdMs = thresholdMs;
+    this._spikeKeep = Math.max(1, Math.round(keep));
+    this._spikes = [];
+    this._spikeFrames = 0;
+    this._spikeWorstMs = 0;
+    // Per-frame accumulators, the same shape as the cumulative ones so a
+    // frame's breakdown is a subtraction of two snapshots rather than a
+    // second set of marks on the hot path.
+    this._spikeBase = new Float64Array(this._phaseTotals.length);
+    this._spikeSubBase = new Map();
+    this._spikeFrameStart = performance.now();
+    this._spikeStart = this._spikeFrameStart;
+  }
+
+  /** True once the armed spike watch has run its full window. */
+  spikeWatchComplete() {
+    return !this._spikeUntil || performance.now() >= this._spikeUntil;
+  }
+
+  /**
+   * The spike watch's result: how many frames it saw, how many crossed the
+   * threshold, and the worst of them with that frame's own phase breakdown.
+   */
+  readSpikeWatch() {
+    const spikes = (this._spikes ?? [])
+      .slice()
+      .sort((a, b) => b.ms - a.ms)
+      .slice(0, this._spikeKeep ?? 12);
+    return {
+      frames: this._spikeFrames ?? 0,
+      thresholdMs: this._spikeThresholdMs ?? 0,
+      spikeCount: this._spikes?.length ?? 0,
+      worstMs: +(this._spikeWorstMs ?? 0).toFixed(1),
+      spikes,
+    };
+  }
+
+  /** One frame's phase deltas, for the spike watch. Called by endPhaseFrame. */
+  #closeSpikeFrame() {
+    if (!this._spikeUntil) return;
+    const now = performance.now();
+    const ms = now - this._spikeFrameStart;
+    this._spikeFrameStart = now;
+    this._spikeFrames = (this._spikeFrames ?? 0) + 1;
+    if (ms > (this._spikeWorstMs ?? 0)) this._spikeWorstMs = ms;
+    if (ms >= (this._spikeThresholdMs ?? 40)) {
+      const phases = [];
+      for (let i = 0; i < this._phaseTotals.length; i++) {
+        const delta = this._phaseTotals[i] - this._spikeBase[i];
+        if (delta >= 0.5) phases.push({ name: PHASES[i], ms: +delta.toFixed(1) });
+      }
+      const subs = [];
+      for (const [name, total] of this._subTotals ?? []) {
+        const delta = total - (this._spikeSubBase.get(name) ?? 0);
+        if (delta >= 0.5) subs.push({ name, ms: +delta.toFixed(1) });
+      }
+      phases.sort((a, b) => b.ms - a.ms);
+      subs.sort((a, b) => b.ms - a.ms);
+      this._spikes.push({ ms: +ms.toFixed(1), atSeconds: +((now - this._spikeStart) / 1000).toFixed(2), phases, subPhases: subs.slice(0, 6) });
+      // Bound the list: a pathological window must not grow without limit.
+      if (this._spikes.length > 400) this._spikes.splice(0, 200);
+    }
+    this._spikeBase.set(this._phaseTotals);
+    this._spikeSubBase.clear();
+    for (const [name, total] of this._subTotals ?? []) this._spikeSubBase.set(name, total);
+    if (now >= this._spikeUntil) {
+      this._spikeUntil = 0;
+      this._phaseArmed = false;
+    }
   }
 
   /**
@@ -398,6 +491,7 @@ export class StatsSystem {
     }
     this._phaseIndex = -1;
     this._phaseFramesDone++;
+    this.#closeSpikeFrame();
     if (this._phaseFramesDone >= this._phaseFramesTarget) this._phaseArmed = false;
   }
 

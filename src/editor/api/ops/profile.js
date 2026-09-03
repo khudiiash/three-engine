@@ -1106,3 +1106,59 @@ defineOp({
     };
   },
 });
+
+defineOp({
+  name: "profile.spikeWatch",
+  readOnly: true,
+  description:
+    "Watch for FRAME SPIKES for a few seconds and report the worst frames with their own phase breakdown — the instrument for 'it freezes / stutters while I do X', where a mean cannot help. Run it, then do the thing (drag an object, orbit, enter a room) while it watches: it returns the frames that crossed `thresholdMs`, each with the engine-tick phases and module sub-phases THAT frame spent its time in, plus how many frames it saw in total. profile.cpuFrame averages a capture, so a drag at 90 fps with one 300 ms hitch a second reports a healthy ~14 ms; this reports the hitch. `atSeconds` is the offset into the watch, so a spike can be matched to what you were doing when it happened.",
+  params: {
+    seconds: {
+      type: "number",
+      default: 8,
+      description: "How long to watch, in seconds (max 30). The call returns when the window closes.",
+    },
+    thresholdMs: {
+      type: "number",
+      default: 40,
+      description:
+        "A frame at or above this many ms is kept whole. 40 ms = below 25 fps, the point a drag stops feeling continuous; lower it to ~25 to catch a scene that should be at 60.",
+    },
+    keep: {
+      type: "number",
+      default: 12,
+      description: "How many of the worst frames to return (max 40).",
+    },
+  },
+  async run({ seconds = 8, thresholdMs = 40, keep = 12 }) {
+    const stats = engine?.stats;
+    if (!stats?.beginSpikeWatch) throw new Error("No engine, or this build predates the spike watch.");
+    const secs = Math.max(0.5, Math.min(30, Number(seconds) || 8));
+    stats.beginSpikeWatch({
+      seconds: secs,
+      thresholdMs: Math.max(5, Number(thresholdMs) || 40),
+      keep: Math.max(1, Math.min(40, Math.round(keep))),
+    });
+    const deadline = Date.now() + secs * 1000 + 2000;
+    while (!stats.spikeWatchComplete() && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const watch = stats.readSpikeWatch();
+    const r = stats.sample();
+    const worst = watch.spikes[0];
+    return {
+      ...watch,
+      seconds: secs,
+      fpsNow: Math.round(r.fps),
+      note:
+        (watch.frames === 0
+          ? "NO FRAMES SEEN — the viewport was suspended for the whole window (unfocused with 'Freeze unfocused viewport' on, or a compile wave). Nothing here is a measurement. "
+          : `${watch.spikeCount} of ${watch.frames} frames were at or above ${watch.thresholdMs} ms; the worst was ${watch.worstMs} ms. `) +
+        (worst
+          ? `Worst frame: ${worst.phases.map((p) => `${p.name} ${p.ms}ms`).slice(0, 3).join(", ")}` +
+            (worst.subPhases?.length ? ` (inside it: ${worst.subPhases.slice(0, 3).map((p) => `${p.name} ${p.ms}ms`).join(", ")})` : "") + ". "
+          : "No frame crossed the threshold — whatever the stutter is, it did not happen during this window, or it is not CPU-side. ") +
+        "Phases that cost under 0.5 ms in a frame are omitted from that frame; sub-phases sum to LESS than their parent phase and the shortfall is unmarked time, not zero.",
+    };
+  },
+});

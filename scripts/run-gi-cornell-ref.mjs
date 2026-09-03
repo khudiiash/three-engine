@@ -177,6 +177,7 @@ const shot = async (name) => {
 // and keep every [gi] rebuild/hold line the drag provoked.
 if (process.env.DRAG) {
   const [dragName, dragSecs = "4"] = process.env.DRAG.split(",");
+  const DRAG_STEP = Number(process.env.DRAG_STEP ?? 0.01);
   const list = await must("entity.list", { nameContains: dragName });
   const ent = list.find((e) => e.name === dragName) ?? list[0];
   if (!ent) throw new Error(`DRAG: no entity named ${dragName}`);
@@ -186,7 +187,11 @@ if (process.env.DRAG) {
   const t0 = Date.now();
   let steps = 0;
   while (Date.now() - t0 < Number(dragSecs) * 1000) {
-    pos[0] += steps % 40 < 20 ? 0.01 : -0.01;
+    // DRAG_STEP: the per-event displacement. The emitter motion metric is
+    // dCenter/(0.1·reff) (reff 0.665 here), so a 1 cm nudge reads 0.15 and
+    // never crosses ALPHA_TRACK_THRESHOLD 0.5 — a real gizmo drag moves
+    // 5-10 cm per event and arms the light-track window every time.
+    pos[0] += (steps % 40 < 20 ? 1 : -1) * DRAG_STEP;
     await call("entity.setTransform", { id: ent.id, position: pos });
     steps++;
     await wait(33);
@@ -204,12 +209,12 @@ if (process.env.DRAG) {
     const rest = JSON.stringify(v);
     return `${JSON.stringify(out)} | raw ${rest.slice(0, 500)}`;
   };
-  console.log(`[cornell-ref] ${TAG}: DRAG ${dragName} ${steps} steps in ${dragSecs} s (${(steps / Number(dragSecs)).toFixed(1)} Hz achieved)`);
+  console.log(`[cornell-ref] ${TAG}: DRAG ${dragName} ${steps} steps of ${DRAG_STEP} m in ${dragSecs} s (${(steps / Number(dragSecs)).toFixed(1)} Hz achieved)`);
   console.log(`  before: ${pick(before)}`);
   console.log(`  during: ${pick(during)}`);
   console.log(`  after:  ${pick(after)}`);
   console.log(`  cpuFrame (30 frames right after the drag): ${cpu.ok ? JSON.stringify(cpu.value).slice(0, 700) : cpu.error}`);
-  const provoked = gi.slice(giBefore).filter((l) => /rebuild|hold|invalidate|wave|compile|grow|storm|bake|capture/i.test(l));
+  const provoked = gi.slice(giBefore).filter((l) => /rebuild|hold|invalidate|wave|compile|grow|storm|bake|capture|light-track|motion|cap/i.test(l));
   console.log(`  [gi] lines during the drag: ${gi.length - giBefore}, of which rebuild/hold/compile: ${provoked.length}`);
   for (const l of provoked.slice(0, 12)) console.log(`    ${l}`);
 }
