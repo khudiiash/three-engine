@@ -4196,11 +4196,37 @@ ceiling's irradiance — the next arm is a per-channel receipt on the bins of
 a ceiling probe (R/G/B of the deposits by hit slot), not another whole-image
 number.
 
-**Also reported tonight (open, harness arms queued):** dragging the emitter
-or the mirror Box "freezes a lot" (DRAG arm: frameStats before/during/after
-+ the [gi] lines the drag provokes); the mirror Box's reflection shows a
-doubled image of the emitter, a black band where the back wall should
-reflect, and bright fringes along the Box's silhouette.
+**THE DRAG FREEZE DID NOT REPRODUCE, AND THE INSTRUMENT WAS THE PROBLEM.**
+The DRAG arm (frameStats before/during/after plus every [gi] line the drag
+provokes) held 96-97 fps before, 84-85 during, 96-97 after at 1406x567 with
+the emitter moved 22 times a second; the live editor held 84 fps under two
+nudges and idles at 120. Two lessons: (1) the first drag arm moved 1 cm a
+step, which reads 0.15 on the emitter motion metric (dCenter/(0.1 reff),
+reff 0.665) and never crossed ALPHA_TRACK_THRESHOLD 0.5 - it measured a drag
+that never armed the light-track window (DRAG_STEP=0.07 does); (2) with the
+window armed, `__giSrcMotionTrack = false` gave the SAME 84 fps, so the
+window's cap lift - already bounded to 2x by 11.9, though its log line still
+says "to OFF" - is not the cost. The user's own console during their drags
+shows the window arming at 0.5/s and open 26-58% of frames, and one
+`auto-fit: refit in place (stretch, no recompile)` - no rebuild, no wave.
+
+**Shipped instead: `profile.spikeWatch` (StatsSystem.beginSpikeWatch).** A
+mean cannot see a freeze - profile.cpuFrame would report ~14 ms for a drag
+that hitches 300 ms once a second - so the phase profiler now runs for a
+window and keeps every frame over a threshold WHOLE, with that frame's
+phases and module sub-phases, plus `atSeconds` to line a spike up against
+what was being done. A frame's breakdown is the subtraction of two snapshots
+of the existing accumulators; the hot path is unchanged. First live read
+(idle, their Cornell): 720 frames in 6 s, worst 20.7 ms, zero spikes over
+25 ms. The next measurement that means anything is that call running WHILE
+the user drags.
+
+**Still open: the mirror Box's reflection** - a doubled image of the
+emitter, a black band across the face, and bright fringes along the Box's
+silhouette. The black is a reflection ray finding nothing (the room's open
+front, sky intensity 0) and is arguably right; the hard seam and the
+silhouette fringes are not, and they survive `exactReflections: true`, so
+they are not the glossy field alone.
 
 ## 8. SOURCES
 
