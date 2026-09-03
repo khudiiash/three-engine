@@ -11,6 +11,11 @@ export const RayHitMode = Object.freeze({
   HybridPlane: 2,
   HybridPlaneCoverage: 3,
   HybridExactComplex: 4,
+  // §10 (2026-09-02): the transport traces the static BVH8 + movers; the
+  // occupancy tracer is not built for the transport at all. The occupancy
+  // consumers that remain (the resolve's record march, the emitter shadow
+  // pass) keep HybridExactComplex as their `activeMode` until they move.
+  Bvh: 5,
 });
 
 export const RAY_HIT_MODE_OPTIONS = Object.freeze([
@@ -19,6 +24,7 @@ export const RAY_HIT_MODE_OPTIONS = Object.freeze([
   "hybrid-plane",
   "hybrid-plane-coverage",
   "hybrid-exact-complex",
+  "bvh",
 ]);
 
 const MODE_BY_NAME = Object.freeze({
@@ -27,10 +33,11 @@ const MODE_BY_NAME = Object.freeze({
   "hybrid-plane": RayHitMode.HybridPlane,
   "hybrid-plane-coverage": RayHitMode.HybridPlaneCoverage,
   "hybrid-exact-complex": RayHitMode.HybridExactComplex,
+  "bvh": RayHitMode.Bvh,
 });
 
 export function normalizeRayHitMode(value) {
-  if (Number.isInteger(value) && value >= RayHitMode.OccupancyLegacy && value <= RayHitMode.HybridExactComplex) {
+  if (Number.isInteger(value) && value >= RayHitMode.OccupancyLegacy && value <= RayHitMode.Bvh) {
     return value;
   }
   return MODE_BY_NAME[String(value ?? "").toLowerCase()] ?? RayHitMode.OccupancyLegacy;
@@ -87,14 +94,29 @@ const AUTO_MODE_BY_QUALITY = Object.freeze({
   // trading rays, probe density and resolution only. Measured cost at medium
   // on Sponza: +35 MB triangle pool, GPU 5.6 → 6.4 ms on the capped 4070.
   // `__giRayHitMode = "hybrid-plane"` remains the A/B hatch.
-  low: RayHitMode.HybridExactComplex,
-  medium: RayHitMode.HybridExactComplex,
-  high: RayHitMode.HybridExactComplex,
-  ultra: RayHitMode.HybridExactComplex,
+  //
+  // ══ §10 (2026-09-02): "auto" IS THE FIELD-LESS BVH BUILD ══════════════════
+  //
+  // Every tier now sends the SRC transport to the static BVH8 + movers
+  // (srcBvhTrace.js) and allocates NO occupancy pyramid (GISystem
+  // `#makeSceneHost`). The pyramid was the largest allocation (274 MB on
+  // Bistro + 628 MB of CPU mirrors), the only structure re-minted by camera
+  // motion (every slide of its 40 m box re-voxelized the world and held the
+  // screen — the user's frozen GI image under motion), and the reason the
+  // field had a box at all (outside it: a constant far field, photographed
+  // as black patches). Level receipt: host 7.3 MB vs 82 MB, same probe/tile
+  // counts, diffuse at 4.1 s after build, walk clean. The exact-complex
+  // occupancy build stays reachable — `rayHitMode: "hybrid-exact-complex"`
+  // on the component or `__giRayHitMode` from a harness — and the voxel-
+  // native rigs (gi-occupancy, gi-spawn, gi-gather-los) pin it.
+  low: RayHitMode.Bvh,
+  medium: RayHitMode.Bvh,
+  high: RayHitMode.Bvh,
+  ultra: RayHitMode.Bvh,
 });
 
 export function resolveAutoRayHitMode(quality) {
-  return AUTO_MODE_BY_QUALITY[String(quality ?? "").toLowerCase()] ?? RayHitMode.HybridExactComplex;
+  return AUTO_MODE_BY_QUALITY[String(quality ?? "").toLowerCase()] ?? RayHitMode.Bvh;
 }
 
 /**
@@ -124,13 +146,19 @@ export function resolveRayHitConfig(props = {}, runtime = globalThis) {
   const requestedMode = autoMode
     ? resolveAutoRayHitMode(props.quality)
     : normalizeRayHitMode(rawMode);
-  const activeMode = requestedMode >= RayHitMode.HybridBrickBox &&
-    requestedMode <= RayHitMode.HybridExactComplex
-    ? requestedMode
+  // "bvh" (or the `__giSrcBvhTrace = true` hatch on any mode) sends the
+  // TRANSPORT to the BVH; the occupancy consumers that remain run at
+  // exact-complex, the mode the BVH path replaced for the transport.
+  const bvhTransport = requestedMode === RayHitMode.Bvh || runtime.__giSrcBvhTrace === true;
+  const occupancyMode = requestedMode === RayHitMode.Bvh ? RayHitMode.HybridExactComplex : requestedMode;
+  const activeMode = occupancyMode >= RayHitMode.HybridBrickBox &&
+    occupancyMode <= RayHitMode.HybridExactComplex
+    ? occupancyMode
     : RayHitMode.OccupancyLegacy;
   return Object.freeze({
     requestedMode,
     activeMode,
+    bvhTransport,
     autoMode,
     fallbackToLegacy: requestedMode !== activeMode,
     enableProfiling: runtime.__giRayHitProfiling === true || props.rayHitProfiling === true,

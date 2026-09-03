@@ -188,6 +188,17 @@ export function installEditorFramePacing() {
     return false;
   };
 
+  // A state clicked in the Animator is an explicit request to watch it play.
+  // The Animator usually owns dock focus at that moment, so the ordinary
+  // unfocused-viewport policy must not put its AnimationComponent to sleep.
+  const animationAuditionActive = () => {
+    for (const entity of engine.entities?.values?.() ?? []) {
+      const animation = entity.getComponent?.("animation");
+      if (animation?.enabled && animation.editorAudition) return true;
+    }
+    return false;
+  };
+
   /** The canvas a direct gesture is live on right now, or null. */
   const activeGesture = () => {
     if (gestureHeld) return gestureHeld;
@@ -236,6 +247,7 @@ export function installEditorFramePacing() {
 
     const idle =
       !pinned &&
+      !animationAuditionActive() &&
       shouldSuspendViewport({
         playing: engine.playing,
         visible: viewportVisible(),
@@ -359,6 +371,10 @@ export function installEditorFramePacing() {
   window.addEventListener("pointerdown", apply, true);
   document.addEventListener("visibilitychange", apply);
   engine.on("play-changed", apply);
+  engine.on("animation-audition-changed", () => {
+    wake();
+    apply();
+  });
   // Turning the toggle off has to restart the loop now, not at the next sample
   // — the user clicked it because they want to see the viewport moving.
   onViewportFreezeChanged(apply);

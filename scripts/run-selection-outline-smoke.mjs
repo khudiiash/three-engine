@@ -18,6 +18,12 @@
  *   - it closes over the top edge as well as the sides (a separable dilation
  *     that only ran on one axis passes every other check here),
  *   - deselecting removes it, and the Gizmos layer toggle owns it,
+ *   - Play starts with a separate, all-off Layers state; Colliders can then be
+ *     enabled without exposing the other editor layers, including every
+ *     primitive and geometry-derived collider overlay in the scene,
+ *   - a clean screenshot still excludes physics-debug overlays, while
+ *     `includeGizmos` captures them and neither capture changes the live mask,
+ *   - Stop restores the exact edit-mode Layers state that preceded Play,
  *   - the active object is drawn in a lighter orange than the rest of the
  *     selection (Blender's distinction),
  *   - the mask pass leaves no trace: every layer mask and visibility flag it
@@ -467,6 +473,342 @@ try {
     shot.error ?? `${shot.with} orange px`,
   );
   check("…and the default screenshot still doesn't", !shot.error && shot.without === 0, `${shot.without} orange px`);
+
+  // --- Edit and Play own separate layer-toggle states -----------------------
+  //
+  // This belongs in the visual smoke rather than the headless physics test:
+  // collider overlays have to survive both halves of the viewport routing.
+  // Their Object3Ds must be visible AND the active Play camera must opt into
+  // PHYSICS_DEBUG_LAYER. Checking only one side passes while drawing nothing.
+  const layerSetup = await run(async () => {
+    const engine = globalThis.__engine;
+    const { enableEngineModule } = await globalThis.__importLive("/src/engine/modules.js");
+    const { setLayerVisible } = await globalThis.__importLive("/src/editor/panels/ViewportPanel.jsx");
+    const { useSelectionStore } = await globalThis.__importLive("/src/editor/store/selectionStore.js");
+
+    await enableEngineModule(engine, "physics-rapier");
+    await engine.modules.get("physics-rapier")?.ready;
+
+    const primitive = (name, shape, x) => {
+      const entity = engine.createEntity({ name });
+      entity.object3D.position.set(x, 0, 0);
+      entity.addComponent("collider", {
+        shape,
+        autoFit: false,
+        autoCenter: false,
+        size: [1, 1, 1],
+        radius: 0.5,
+      });
+      return entity;
+    };
+    const derived = (name, shape, x) => {
+      const entity = engine.createEntity({ name });
+      entity.object3D.position.set(x, 0, 0);
+      // Add the explicit Collider in the same task as the Mesh. Automatic
+      // defaults flush in a microtask, so authored collision wins cleanly.
+      entity.addComponent("mesh", { geometry: "box" });
+      entity.addComponent("collider", { shape });
+      return entity;
+    };
+
+    // Kept in the Play camera's frame so the screenshot assertions below can
+    // distinguish a clean capture from one that intentionally includes aids.
+    const box = primitive("PlayLayerBox", "box", -3);
+    const sphere = primitive("PlayLayerSphere", "sphere", -1);
+    const convex = derived("PlayLayerConvex", "convex", 1);
+    const concave = derived("PlayLayerConcave", "concave", 3);
+    globalThis.__layerColliderIds = [box.id, sphere.id, convex.id, concave.id];
+
+    // A real scene camera catches the layer-routing half of the feature. With
+    // no Camera entity Play keeps using the editor camera, which already sees
+    // physics overlays and would hide a missing game-camera layer enable.
+    const cameraEntity = engine.createEntity({ name: "PlayLayerCamera" });
+    cameraEntity.object3D.position.set(0, 0, 12);
+    cameraEntity.addComponent("camera", {});
+
+    useSelectionStore.getState().clear();
+    engine.physics.prewarmAutoColliders(convex);
+    const started = performance.now();
+    while (!engine.physics.getCookedColliderGeometry(convex)?.convexParts?.length) {
+      if (performance.now() - started > 8000) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    // In Edit, cheap primitive gizmos are global but cooked surface outlines
+    // stay selection-scoped. Select Convex and prove Concave is not allocated.
+    useSelectionStore.getState().select(convex.id);
+    setLayerVisible("colliders", true);
+    const editOverlays = globalThis.__layerColliderIds.map((id) => {
+      const component = engine.getEntity(id)?.getComponent("collider");
+      const overlay = component?.gizmo ?? component?.outline ?? null;
+      return {
+        shape: component?.props?.shape ?? null,
+        kind: component?.gizmo ? "gizmo" : component?.outline ? "outline" : null,
+        visible: overlay?.visible === true,
+      };
+    });
+
+    // Deliberately non-default and mixed: an implementation that resets edit
+    // state to defaults on Stop cannot accidentally pass this comparison.
+    const editLayers = {
+      gizmos: true,
+      cursor3D: false,
+      colliders: false,
+      grid: true,
+      stats: false,
+      debugDraw: true,
+      uiOverlay: false,
+      virtualGeometry: true,
+    };
+    for (const [key, visible] of Object.entries(editLayers)) setLayerVisible(key, visible);
+    useSelectionStore.getState().clear();
+    globalThis.__expectedEditLayers = editLayers;
+    return {
+      colliders: globalThis.__layerColliderIds.length,
+      convexCooked: !!engine.physics.getCookedColliderGeometry(convex)?.convexParts?.length,
+      editOverlays,
+      layers: { ...globalThis.__viewport.layers },
+    };
+  });
+  check("four collider-overlay fixtures were built", layerSetup.colliders === 4, `${layerSetup.colliders}`);
+  check("the convex preview fixture cooked before Play", layerSetup.convexCooked);
+  check(
+    "Edit shows primitive gizmos globally but only the selected cooked outline",
+    layerSetup.editOverlays.filter((entry) => entry.kind === "gizmo" && entry.visible).length === 2
+      && layerSetup.editOverlays.find((entry) => entry.shape === "convex")?.visible === true
+      && layerSetup.editOverlays.find((entry) => entry.shape === "concave")?.visible === false,
+    JSON.stringify(layerSetup.editOverlays),
+  );
+  check(
+    "the edit-mode Layers state is deliberately non-default",
+    JSON.stringify(layerSetup.layers) === JSON.stringify(await run(() => globalThis.__expectedEditLayers)),
+    JSON.stringify(layerSetup.layers),
+  );
+
+  const readLayerDots = async () => {
+    await page.click('.layers-dropdown button[title="Layers"]');
+    await page.waitForSelector(".layers-dropdown .layers-menu");
+    const state = await page.$$eval(".layers-dropdown .layers-item", (items) =>
+      Object.fromEntries(items.map((item) => [
+        item.querySelector(".layers-item-label")?.textContent?.trim(),
+        item.querySelector(".layers-dot")?.classList.contains("on") === true,
+      ])),
+    );
+    await page.click(".layers-dropdown .dropdown-overlay");
+    return state;
+  };
+
+  const duringPlay = await run(async () => {
+    const { play } = await globalThis.__importLive("/src/editor/playMode.js");
+    await play();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return { playing: globalThis.__engine.playing, layers: { ...globalThis.__viewport.layers } };
+  });
+  const playDots = await readLayerDots();
+  check("Play mode started", duringPlay.playing === true);
+  check(
+    "Play starts with every editor layer off",
+    Object.keys(duringPlay.layers).length === 8 && Object.values(duringPlay.layers).every((value) => value === false),
+    JSON.stringify(duringPlay.layers),
+  );
+  check(
+    "the Layers menu mirrors the all-off Play state",
+    Object.keys(playDots).length === 8 && Object.values(playDots).every((value) => value === false),
+    JSON.stringify(playDots),
+  );
+
+  const collidersInPlay = await run(async () => {
+    const engine = globalThis.__engine;
+    const { PHYSICS_DEBUG_LAYER } = await globalThis.__importLive("/src/engine/editorLayers.js");
+    const { setLayerVisible } = await globalThis.__importLive("/src/editor/panels/ViewportPanel.jsx");
+    setLayerVisible("colliders", true);
+
+    const snapshot = () => globalThis.__layerColliderIds.map((id) => {
+      const component = engine.getEntity(id)?.getComponent("collider");
+      const overlay = component?.gizmo ?? component?.outline ?? null;
+      return {
+        id,
+        shape: component?.props?.shape ?? null,
+        kind: component?.gizmo ? "gizmo" : component?.outline ? "outline" : null,
+        visible: overlay?.visible === true,
+        parented: overlay?.parent === component?.entity?.object3D,
+        routed: !!overlay && (overlay.layers.mask & engine.camera.layers.mask) !== 0,
+      };
+    });
+
+    // Convex cooking can complete on the idle callback after the toggle. Its
+    // cooked event builds the requested outline; wait for that actual result.
+    const started = performance.now();
+    let overlays = snapshot();
+    while (overlays.some((entry) => !entry.visible || !entry.parented || !entry.routed)) {
+      if (performance.now() - started > 8000) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      overlays = snapshot();
+    }
+    return {
+      layers: { ...globalThis.__viewport.layers },
+      cameraSeesPhysics: engine.camera.layers.isEnabled(PHYSICS_DEBUG_LAYER),
+      selectionCount: globalThis.__selection.getState().ids.length,
+      overlays,
+    };
+  });
+  const colliderDots = await readLayerDots();
+  check(
+    "enabling Colliders in Play leaves every other editor layer off",
+    collidersInPlay.layers.colliders === true
+      && Object.entries(collidersInPlay.layers).every(([key, value]) => key === "colliders" || value === false),
+    JSON.stringify(collidersInPlay.layers),
+  );
+  check("the Play camera opts into the physics-overlay layer", collidersInPlay.cameraSeesPhysics);
+  check("the global collider preview does not depend on selection", collidersInPlay.selectionCount === 0);
+  check(
+    "Colliders in Play shows every primitive, convex, and concave overlay",
+    collidersInPlay.overlays.length === 4
+      && collidersInPlay.overlays.every((entry) => entry.visible && entry.parented && entry.routed)
+      && collidersInPlay.overlays.filter((entry) => entry.kind === "gizmo").length === 2
+      && collidersInPlay.overlays.filter((entry) => entry.kind === "outline").length === 2,
+    JSON.stringify(collidersInPlay.overlays),
+  );
+  check(
+    "the Layers menu shows only Colliders enabled during Play",
+    colliderDots.Colliders === true
+      && Object.entries(colliderDots).every(([label, value]) => label === "Colliders" || value === false),
+    JSON.stringify(colliderDots),
+  );
+
+  const colliderScreenshots = await run(async () => {
+    const Editor = globalThis.__editorApi;
+    const engine = globalThis.__engine;
+    const decodeGreen = async (result) => {
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = `data:image/png;base64,${result.__image.base64}`;
+      });
+      const canvas = document.createElement("canvas");
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const context = canvas.getContext("2d");
+      context.drawImage(img, 0, 0);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      let green = 0;
+      for (let i = 0; i < pixels.length; i += 4) {
+        const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
+        // Collider aids are authored #2df098. Leave plenty of room for the
+        // renderer's output transform and antialiasing, while excluding the
+        // neutral scene and blue selection-outline fixtures behind them.
+        if (g > 100 && g - r > 55 && g - b > 15) green++;
+      }
+      return green;
+    };
+
+    const beforeMask = engine.camera.layers.mask;
+    const clean = await decodeGreen(await Editor.call("viewport.screenshot", {
+      width: 480,
+      height: 320,
+      camera: "game",
+    }));
+    const afterCleanMask = engine.camera.layers.mask;
+    const withHelpers = await decodeGreen(await Editor.call("viewport.screenshot", {
+      width: 480,
+      height: 320,
+      camera: "game",
+      includeGizmos: true,
+    }));
+    return {
+      clean,
+      withHelpers,
+      beforeMask,
+      afterCleanMask,
+      afterMask: engine.camera.layers.mask,
+      visibleOverlays: globalThis.__layerColliderIds.filter((id) => {
+        const collider = engine.getEntity(id)?.getComponent("collider");
+        return (collider?.gizmo ?? collider?.outline)?.visible === true;
+      }).length,
+    };
+  });
+  check(
+    "a clean Play screenshot excludes physics-debug overlays",
+    colliderScreenshots.clean === 0,
+    `${colliderScreenshots.clean} collider-green px`,
+  );
+  check(
+    "includeGizmos captures the enabled collider overlays",
+    colliderScreenshots.withHelpers > 20,
+    `${colliderScreenshots.withHelpers} collider-green px`,
+  );
+  check(
+    "screenshot capture restores the Play camera mask and live overlays",
+    colliderScreenshots.beforeMask === colliderScreenshots.afterCleanMask
+      && colliderScreenshots.beforeMask === colliderScreenshots.afterMask
+      && colliderScreenshots.visibleOverlays === 4,
+    JSON.stringify(colliderScreenshots),
+  );
+
+  const afterPlay = await run(async () => {
+    const { stop } = await globalThis.__importLive("/src/editor/playMode.js");
+    await stop();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const overlays = globalThis.__layerColliderIds.map((id) => {
+      const component = globalThis.__engine.getEntity(id)?.getComponent("collider");
+      return component?.gizmo ?? component?.outline ?? null;
+    });
+    return {
+      playing: globalThis.__engine.playing,
+      layers: { ...globalThis.__viewport.layers },
+      expected: globalThis.__expectedEditLayers,
+      visibleOverlays: overlays.filter((overlay) => overlay?.visible).length,
+    };
+  });
+  const editDots = await readLayerDots();
+  const expectedEditDots = {
+    Gizmos: true,
+    "3D Cursor": false,
+    Colliders: false,
+    Grid: true,
+    Stats: false,
+    "Debug Draw": true,
+    "UI Overlay": false,
+    "Virtual Geometry": true,
+  };
+  check("Stop leaves Play mode", afterPlay.playing === false);
+  check(
+    "Stop restores the exact edit-mode Layers state",
+    JSON.stringify(afterPlay.layers) === JSON.stringify(afterPlay.expected),
+    JSON.stringify(afterPlay.layers),
+  );
+  check(
+    "the restored edit-mode Colliders-off state hides every collider overlay",
+    afterPlay.visibleOverlays === 0,
+    `${afterPlay.visibleOverlays} still visible`,
+  );
+  check(
+    "the Layers menu mirrors the restored edit-mode state",
+    JSON.stringify(editDots) === JSON.stringify(expectedEditDots),
+    JSON.stringify(editDots),
+  );
+
+  await run(async () => {
+    const { openPanel } = await globalThis.__importLive("/src/editor/EditorShell.jsx");
+    openPanel("inspector");
+    globalThis.__selection.getState().select(globalThis.__layerColliderIds[2]);
+  });
+  await wait(400);
+  const colliderShapeOptions = await page.evaluate(() => {
+    const row = [...document.querySelectorAll(".inspector-panel .field-row")].find(
+      (candidate) => candidate.querySelector(".field-label")?.textContent?.trim() === "Shape",
+    );
+    return [...(row?.querySelector("select")?.options ?? [])].map((option) => option.value);
+  });
+  check(
+    "the Collider Inspector keeps Mesh and Concave as distinct shape options",
+    colliderShapeOptions.includes("mesh")
+      && colliderShapeOptions.includes("concave")
+      && colliderShapeOptions.indexOf("mesh") !== colliderShapeOptions.indexOf("concave"),
+    JSON.stringify(colliderShapeOptions),
+  );
+  await run(() => globalThis.__selection.getState().clear());
 
   // --- No errors -------------------------------------------------------------
   //

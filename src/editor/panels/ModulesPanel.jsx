@@ -37,7 +37,7 @@ const COLLAPSED_KEY = "engine.modules.collapsedCategories";
 // list was long enough that finding a browser meant reading past the tools.
 // They are also the only modules that carry per-account API keys, so grouping
 // them puts every credential in the project in one place.
-const CATEGORY_ORDER = ["Physics", "Rendering", "Optimization", "World", "Assets", "Editor", "Other"];
+const CATEGORY_ORDER = ["Physics", "Rendering", "Optimization", "World", "Assets", "AI", "Editor", "Other"];
 
 /** Lowercase + collapse whitespace so the search predicate stays simple. */
 function norm(s) {

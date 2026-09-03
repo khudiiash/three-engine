@@ -148,8 +148,8 @@ export async function makeEmissiveStormProject(root, opts = {}) {
     // way a large one is not — the difference between "apply a calibration
     // factor" and "the cheap path cannot represent small emitters at all".
     lampRadius = STORM_RIG.lampRadius,
-    // Mirror floor (2026-08-13): roughness 0.3 puts the floor in bucket 0
-    // (GI_MIRROR_ROUGHNESS_MAX 0.45) — the scene gains a reflection CONSUMER,
+    // Mirror floor (2026-08-13): roughness 0.2 puts the floor in bucket 0
+    // (below GI_EXACT_TAIL_ZERO 0.28) — the scene gains a reflection CONSUMER,
     // which at ultra turns on the exact-reflection prepass + the resolve's
     // hit-shading. That is the arm that prices the emitters × reflections
     // interaction (each hit pixel runs emitterSlotShadow inline per slot);
@@ -167,7 +167,7 @@ export async function makeEmissiveStormProject(root, opts = {}) {
   await mkdir(path.join(root, "scenes"), { recursive: true });
   await mkdir(path.join(root, "materials"), { recursive: true });
 
-  const mats = { Floor: bsdf("#d8d8d8", mirrorFloor ? 0.3 : 1), Crate: bsdf("#b0b4bc") };
+  const mats = { Floor: bsdf("#d8d8d8", mirrorFloor ? 0.2 : 1), Crate: bsdf("#b0b4bc") };
   // All lamps share ONE colour when there are more than four: the measurement
   // compares lamp-to-lamp delivery, and per-lamp hue would confound it with
   // the promotion gate's own colour sensitivity.

@@ -16,9 +16,11 @@
 import * as THREE from "three/webgpu";
 import {
   If,
+  Loop,
   abs,
   acos,
   cameraPosition,
+  cameraProjectionMatrix,
   cos,
   equirectUV,
   float,
@@ -53,9 +55,10 @@ export const MAX_EMITTERS = 4;
 // COMPILE-TIME roughness gates (per material): the mirror trace + hit
 // lighting block is ~70% of a material's GI shader compile cost
 // (harness-measured: a 26-material rebuild wave dropped 24s → 7.6s without
-// it), yet its runtime gate `smoothstep(0.45, 0.15, roughness)` is zero for
-// every material whose STATIC roughness exceeds MIRROR_MAX — so those
-// materials simply don't compile the block. Likewise, above SPECULAR_MAX
+// it). Authored scalar materials leave that block at GI_EXACT_TAIL_ZERO,
+// where every exact-reflection consumer has zero weight; mapped/dynamic
+// materials stay conservative because a scalar cannot describe every texel.
+// Likewise, above SPECULAR_MAX
 // the roughness collapse discards the whole directional path, so fully
 // rough materials (walls, floors) compile only the diffuse limit.
 // Materials with a roughness map/node stay on the full path, and GISystem
@@ -140,7 +143,13 @@ export function giRoughnessBucketOf(material) {
   if (material.roughnessMap) return 3;
   const r = staticRoughnessOf(material);
   if (r === null) return 3;
-  return r <= GI_MIRROR_ROUGHNESS_MAX ? 0 : r < GI_SPECULAR_ROUGHNESS_MAX ? 1 : 2;
+  // Every sharp-image consumer is exactly zero at GI_EXACT_TAIL_ZERO. For an
+  // authored scalar that makes the exact trace + hit-shade path dead code, so
+  // do not keep the material in bucket 0 merely because the older broad
+  // reflection ramp extends to GI_MIRROR_ROUGHNESS_MAX. Maps and unrecognised
+  // nodes returned above remain conservative: their scalar is not a per-pixel
+  // bound and therefore cannot safely make this cut.
+  return r < GI_EXACT_TAIL_ZERO ? 0 : r < GI_SPECULAR_ROUGHNESS_MAX ? 1 : 2;
 }
 
 /**
@@ -212,6 +221,59 @@ export const GI_REFLECT_TIER = { SHARP: 0, MEDIUM: 1, COARSE: 2 };
 export const GI_TIER_SHARP_MAX = 0.15;
 export const GI_TIER_MEDIUM_MAX = 0.45;
 
+// A single traced direction is an honest representation only for the sharp
+// end of the GGX lobe. Keep true mirrors byte-for-byte at full weight, then
+// hand the rough-metal tail to the already-live broad radiance field before
+// one coherent hit can become a bright metallic flash. These bounds are
+// deliberately narrower than the trace-resolution tier above: the tier says
+// what to SAMPLE, while this confidence says whether one sample can represent
+// the material lobe. Scalar-material bucket classification also uses the zero
+// endpoint so a provably dead exact path does not arm its passes; mapped and
+// otherwise dynamic roughness remain conservative.
+export const GI_EXACT_TAIL_FULL = GI_TIER_SHARP_MAX;
+export const GI_EXACT_TAIL_ZERO = 0.28;
+
+/** CPU mirror of the shader confidence, used by the focused policy gate. */
+export function giExactTailWeight(roughness) {
+  const r = Number.isFinite(Number(roughness)) ? Number(roughness) : 1;
+  const x = Math.min(1, Math.max(0,
+    (r - GI_EXACT_TAIL_FULL) / (GI_EXACT_TAIL_ZERO - GI_EXACT_TAIL_FULL),
+  ));
+  return 1 - x * x * (3 - 2 * x);
+}
+
+/**
+ * Number of exact-reflection texture taps the material path needs.
+ *
+ * A true mirror has a zero-radius footprint, so all twelve ring taps read the
+ * centre texel again. At the other end, once the sharp tail has zero weight,
+ * the filtered value cannot reach the output. Both cases are exactly one-tap
+ * evaluations; only the transition between them needs the 13-tap footprint.
+ * Kept as a CPU mirror so the policy is testable without compiling WGSL.
+ */
+export function giExactPrefilterTapCount(roughness) {
+  const r = Number.isFinite(Number(roughness)) ? Number(roughness) : 1;
+  return r > 0.02 && giExactTailWeight(r) > 0 ? 13 : 1;
+}
+
+/** CPU mirror of the fixed-denominator exact-prefilter policy. */
+export function giExactPrefilterMean(samples, broadFallback = 0) {
+  if (!Array.isArray(samples) || samples.length === 0) return Number(broadFallback) || 0;
+  const fallback = Number.isFinite(Number(broadFallback)) ? Number(broadFallback) : 0;
+  const first = Number(samples[0]?.value);
+  const center = samples[0]?.valid && Number.isFinite(first) ? first : fallback;
+  let sum = 0;
+  for (const sample of samples) {
+    const value = Number(sample?.value);
+    sum += sample?.valid && Number.isFinite(value)
+      ? value
+      : sample?.miss
+        ? fallback
+        : center;
+  }
+  return sum / samples.length;
+}
+
 function tierFromRoughness(r) {
   if (!(r >= 0)) return GI_REFLECT_TIER.MEDIUM;
   if (r <= GI_TIER_SHARP_MAX) return GI_REFLECT_TIER.SHARP;
@@ -272,6 +334,16 @@ export function giReflectTierInfoOf(material) {
  */
 export function giReflectTierOf(material) {
   return giReflectTierInfoOf(material).tier;
+}
+
+/** Whether this material can receive a non-zero exact-reflection tail. */
+export function giNeedsExactTrace(material) {
+  const bucket = giRoughnessBucketOf(material);
+  // Scalar materials are exact consumers only below GI_EXACT_TAIL_ZERO.
+  // Mapped/dynamic materials remain conservative until their floor resolves.
+  return bucket === 0 || (
+    bucket === 3 && giReflectTierOf(material) <= GI_REFLECT_TIER.MEDIUM
+  );
 }
 
 /**
@@ -361,7 +433,7 @@ export function giRoughnessSourceOf(material) {
  * a fraction of the real editor's startup. A constant node carries a constant
  * value, so read through it.
  */
-function staticRoughnessOf(material) {
+export function staticRoughnessOf(material) {
   const node = material.roughnessNode;
   if (node == null) return material.roughness ?? 1;
   // `float(0.7)` is NOT a bare ConstNode: TSL returns nodeObjectIntent(...) =
@@ -1262,7 +1334,19 @@ export function emitterCutoff(params = null) {
   return Number.isFinite(preset) && preset > 0 ? preset : 0.0015;
 }
 
-export function emitterDirectAt(params, P, N, samplePoint) {
+export function emitterDirectAt(params, P, N, samplePoint, options = null) {
+  // `{ rolled: true }` — one traced march per program instead of one per
+  // seat; only for the traced path (a caller-supplied `shadowSample(index)`
+  // indexes a texture per slot and stays unrolled). See emitterDirectAtRolled.
+  // (2026-09-02, late) The roll was blamed for a black mirror on
+  // `test:gi-hit-shade` and made opt-in for an evening; the black was the
+  // exact-reflection prepass HELD before it had ever traced (GISystem's
+  // reflect hold), and every "lit" arm was the glossy fallback read before
+  // the hit shade's pipeline landed — the roll only moved that landing
+  // (11.5 s → 3.9 s on the rig). `__giRolledEmitter = false` unrolls.
+  if (options?.rolled && globalThis.__giRolledEmitter !== false && !params.shadowSample && params.emitterSlots.length > 1) {
+    return emitterDirectAtRolled(params, P, N, samplePoint);
+  }
   const total = vec3(0).toVar();
   const shadows = [];
   const perSlot = [];
@@ -1559,7 +1643,12 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint, penumbraOut =
  * appearing too bright", and at roughness 0.2 `exactWeight ~ 0.93`, so that
  * image replaces the surface response almost wholesale.
  */
-export function analyticDirectAt(lightSlots, P, N, shadowFn = null, oneSided = false) {
+export function analyticDirectAt(lightSlots, P, N, shadowFn = null, oneSided = false, options = null) {
+  // `{ rolled: true }` — one traced descent per program instead of one per
+  // slot; see analyticDirectAtRolled at the end of this file.
+  if (options?.rolled && globalThis.__giRolledAnalytic !== false && shadowFn && lightSlots.length > 1) {
+    return analyticDirectAtRolled(lightSlots, P, N, shadowFn, oneSided);
+  }
   const total = vec3(0).toVar();
   for (const slot of lightSlots) {
     If(slot.active.greaterThan(0.5), () => {
@@ -1957,6 +2046,12 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
     // Runs BEFORE the reflections block: the specular path reuses each
     // slot's shadow/direction as sphere-light occlusion.
     const emitterData = [];
+    // ROLLED GLOW (2026-09-02): the specular glow below runs its per-slot
+    // body ONCE inside a GPU loop over the slot table instead of four
+    // JS-unrolled copies (see emitterGlowRolled). The rolled body derives
+    // each slot's geometry from the picked centre, so the per-slot vars this
+    // block used to hoist are not emitted on that arm.
+    const rolledGlow = globalThis.__giRolledGlow !== false && (light.emitterSlots?.length ?? 0) > 1;
     if (deferred) {
       // Emitter direct + its shadow are already in the irradiance texture.
       // The specular glow below still needs each slot's geometry and its
@@ -1971,17 +2066,22 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
           : light.giEmitterShadowNode.sample(giUV)).toVar();
         const channels = [packed.x, packed.y, packed.z, packed.w];
         light.emitterSlots.forEach((slot, index) => {
+          // §12.70 W4b: under the tile cut the packed channels are keyed to
+          // each pixel's TILE list, not to these global seats — sampling
+          // them here would occlude one lamp's glow with another lamp's
+          // shadow. The glow goes UNSHADOWED on that arm (a near-emitter
+          // effect the seats still cover); re-keying the material path is
+          // W5's business if it ever shows.
+          const shadow = light.emitterTileKeyed ? float(1) : (channels[index] ?? float(1));
+          if (rolledGlow) {
+            emitterData.push({ slot, shadow });
+            return;
+          }
           const toEmitter = vec3(slot.center).sub(positionWorld).toVar();
           const dist = toEmitter.length().max(1e-3).toVar();
           emitterData.push({
             slot,
-            // §12.70 W4b: under the tile cut the packed channels are keyed to
-            // each pixel's TILE list, not to these global seats — sampling
-            // them here would occlude one lamp's glow with another lamp's
-            // shadow. The glow goes UNSHADOWED on that arm (a near-emitter
-            // effect the seats still cover); re-keying the material path is
-            // W5's business if it ever shows.
-            shadow: light.emitterTileKeyed ? float(1) : (channels[index] ?? float(1)),
+            shadow,
             dist,
             dirToEmitter: toEmitter.div(dist).toVar(),
             active: step(0.001, slot.radius),
@@ -2099,7 +2199,20 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // over the deferred directional cascade result for mirror-ish pixels.
       // This replaces the old per-material hit reconstruction/SDF/shadow
       // graph (tens of seconds to compile) with two texture reads and a mix.
+      // Shared confidence for every delta-like reflection consumer. A true
+      // mirror stays at 1; the moderately rough tail hands off to the broad
+      // field, and the finite prefilter may reduce it further below.
+      const exactFidelity = float(1).sub(smoothstep(
+        GI_EXACT_TAIL_FULL,
+        GI_EXACT_TAIL_ZERO,
+        roughness,
+      )).toVar();
       if (light.bvhReflectColorTexture && canMirror) {
+        // Materialise the broad answer once. Invalid exact-filter taps use this
+        // already-bound, already-sampled field value; keeping it as a local var
+        // prevents the 13-tap loop from cloning the gather graph or its reads.
+        const broadDirectional = vec3(directional).toVar();
+        directional = broadDirectional;
         const exactHit = light.bvhReflectColorTexture.sample(giUV);
         // ── THE ROUGHNESS PREFILTER (2026-08-22) ────────────────────────────
         //
@@ -2134,28 +2247,115 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
         // that edit. The taps are always compiled; at roughness ≤0.02 the
         // radius is zero, every tap reads the centre texel and the mean is the
         // centre value, so a true mirror is unchanged pixel-for-pixel.
-        // `__giExactPrefilter = false` disables it; `__giExactPrefilterTexels`
-        // retunes the reach.
+        // `__giExactPrefilter = false` disables the taps and their coverage
+        // ramp; the roughness-only sharp-tail confidence above stays active.
+        // `__giExactPrefilterTexels` is the tap disc's CEILING — see the radius
+        // derivation below, which took the reach off it.
         const prefilterOn = globalThis.__giExactPrefilter !== false && !!light.giScreenTexel;
         const exactRgb = vec3(exactHit.rgb).toVar();
         if (prefilterOn) {
-          // Radius rides the hit DISTANCE as well as roughness: the same lobe
-          // covers more of the screen the further away the reflected surface
-          // is, which is why a rough floor smears its far reflection and keeps
-          // the contact one crisp. Clamped low so a near hit still softens.
-          const dist = positionWorld.sub(cameraPosition).length().max(1e-3);
-          const distFactor = light.bvhReflectTexture
-            ? (() => {
-                const t = light.bvhReflectTexture.sample(giUV).r.max(0);
-                return t.div(t.add(dist)).clamp(0.25, 1);
-              })()
-            : float(1);
+          // ── THE RADIUS IS THE LOBE'S, NOT A TUNED TEXEL COUNT (2026-08-30) ──
+          //
+          // USER REPORT, against a reference render for the first time: "could
+          // you check our reflections against the path tracer? ours look too
+          // flashy and unnatural."
+          //
+          // The first version of this filter spread the taps over
+          // `smoothstep(0.02, 0.45, roughness) * 12` texels — a hand-picked
+          // reach, chosen when the only available judge was "does it still look
+          // messy". That is the right SHAPE at roughly a TENTH of the right
+          // SIZE, and an order of magnitude too narrow is exactly what "flashy"
+          // looks like: a glossy wall showing a near-mirror image of the room
+          // where a broad, dim sheen belongs. (It also explains the speckle on
+          // alpha-tested foliage with no noise term in sight — leaf cards have
+          // near-random normals, so the reflected direction and its hit change
+          // wildly pixel to pixel, and a delta lobe reports that faithfully
+          // where an integrated one would not.)
+          //
+          // So derive it. A GGX lobe of slope `alpha = roughness^2` covers a
+          // world radius of about `alpha * t` at a hit `t` metres along the
+          // reflected ray, and a world length at view depth `D` projects to
+          // `L * P / (2 * D)` in UV. Taking the hit as roughly as far again as
+          // the receiver (`t ~ dist`, and see the STABILITY note below for why
+          // NOT the real one) collapses that to `alpha * P / 4`:
+          //
+          //   roughness 0.15  ->  0.010 UV, inside the cap: a mirror is a mirror
+          //   roughness 0.30  ->  0.039 UV  (the old reach gave ~0.018)
+          //   roughness 0.45  ->  0.088 UV  (the old reach gave ~0.022)
+          //
+          // Per axis, and `(P00, P11)` is exactly right for that: P00 = P11 /
+          // aspect, so equal UV-scaled offsets land on a circle in PIXELS.
+          const projScale = vec2(
+            cameraProjectionMatrix.element(0).x,
+            cameraProjectionMatrix.element(1).y,
+          ).abs();
+          const alpha = roughness.mul(roughness);
+          const lobeUv = projScale.mul(alpha).mul(0.25).toVar();
+          // ⚠ THE CAP IS NOT A QUALITY KNOB, IT IS WHAT 12 TAPS CAN CARRY.
+          // Twelve samples on two hex rings resolve a disc only while it stays
+          // small; stretched far past that they stop being a blur and become
+          // twelve copies of the room — a worse artifact than the sharpness it
+          // set out to fix, and a direct breach of the standing "no noise, no
+          // edges, no steps" rule. The old hand-tuned reach was measured
+          // against exactly that ringing, so it keeps its name and its default
+          // and becomes the ceiling rather than the value.
           const reach = Number(globalThis.__giExactPrefilterTexels);
           const texels = float(Number.isFinite(reach) ? reach : 12);
-          const spread = smoothstep(0.02, 0.45, roughness).mul(texels).mul(distFactor);
-          const step2 = vec2(light.giScreenTexel).mul(spread).toVar();
-          const sum = vec3(exactHit.rgb).toVar();
-          const wsum = float(1).toVar();
+          const capUv = vec2(light.giScreenTexel).mul(texels);
+          const step2 = lobeUv.min(capUv).toVar();
+          // ── AND NEVER SHOW AN IMAGE SHARPER THAN THE LOBE IT STANDS FOR ────
+          //
+          // Where the cap binds, the taps cannot represent this material's
+          // lobe, and the honest answer is not to show the sharp trace anyway —
+          // that IS the flashiness. It is to hand those pixels back to the term
+          // that is broad BY CONSTRUCTION: the cascade radiance lookup this
+          // blend already mixes against.
+          //
+          // ⚠ This is NOT §16 R4 again, and the difference is why it is safe
+          // where R4 was reverted on sight (see the ladder banner above): R4
+          // compiled the directional chain OUT of rough materials, so the light
+          // it carried simply vanished and shadowed walls went near-black.
+          // Nothing is compiled out here. Both terms stay live and weight only
+          // moves BETWEEN two pictures of the same room, one sharp and one
+          // blurry.
+          //
+          // ⛔⛔ EVERY INPUT TO THIS RAMP IS SMOOTH PER PIXEL AND CONSTANT IN
+          // TIME, AND THAT IS A HARD REQUIREMENT, NOT AN ACCIDENT. The first
+          // cut drove it off `bvhReflectTexture`'s traced hit distance, and the
+          // user's first look was "nope, now light flickers, its terrible"
+          // (reverted the same hour; plan §2.7d). That texture is NearestFilter
+          // BY DESIGN (blending two t's across a silhouette lands on no real
+          // surface — see createGiBvhTarget), is written at the prepass STRIDE
+          // with block replication, and reads 0 on a miss or a masked pixel —
+          // where 0 ramps to FULL fidelity. A steep smoothstep on it switched a
+          // large share of the specular on and off per pixel per frame.
+          //
+          // ⭐⭐ The OLD code read the same `t` and was fine, and the contrast
+          // is the whole lesson: it spent it inside `t/(t+dist)` CLAMPED to
+          // [0.25, 1] — a bounded multiplier on a BLUR RADIUS, where noise only
+          // moves a blur slightly. WHERE A NOISY INPUT IS SPENT DECIDES WHETHER
+          // ITS NOISE IS VISIBLE: a radius forgives it, a WEIGHT does not.
+          //
+          // So this ramp is a function of `roughness` and the projection alone.
+          // Both are constant for a given surface point across frames, which
+          // makes flicker impossible here by construction rather than by
+          // testing. The cost is only that a far reflection no longer smears
+          // more than a near one — a second-order refinement, and not one worth
+          // buying with a temporal artifact.
+          exactFidelity.mulAssign(smoothstep(0.25, 1, capUv.y.div(lobeUv.y.max(1e-6))));
+          // Fixed 13-way convolution. Renormalising over valid hits only made a
+          // lone bright hit surrounded by real misses stay fully bright — the
+          // coherent metallic flash this filter exists to remove. Keep the
+          // alpha states distinct, though: -1 is a PROVEN traced miss and gets
+          // the broad field; 0 is merely mirror-mask/untraced and must hold the
+          // centre sample. Treating mask holes as broad GI made the entire
+          // rough reflector look blurry even though no ray had missed.
+          const exactCenter = mix(
+            broadDirectional,
+            vec3(exactHit.rgb),
+            step(0.5, exactHit.a),
+          ).toVar();
+          const sum = vec3(exactCenter).toVar();
           // Two hexagonal rings, the inner one rotated 30° — 12 taps that
           // cover the disc evenly enough that no rotation hash is needed (a
           // per-pixel rotation would need a temporal filter to stop crawling;
@@ -2164,20 +2364,30 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
             [1, [[1, 0], [0.5, 0.866], [-0.5, 0.866], [-1, 0], [-0.5, -0.866], [0.5, -0.866]]],
             [0.5, [[0.866, 0.5], [0, 1], [-0.866, 0.5], [-0.866, -0.5], [0, -1], [0.866, -0.5]]],
           ];
-          for (const [scale, ring] of RINGS) {
-            for (const [ox, oy] of ring) {
-              const uv = giUV.add(vec2(step2.x.mul(ox * scale), step2.y.mul(oy * scale)));
-              const tap = light.bvhReflectColorTexture.sample(uv);
-              // Only real shaded hits average in. A neighbour that is a traced
-              // MISS (alpha −1, the env term's marker) or was never traced
-              // (alpha 0) carries no radiance, and letting its zero into the
-              // mean is how a blur turns a glossy edge into a dark rim.
-              const w = step(0.5, tap.a);
-              sum.addAssign(vec3(tap.rgb).mul(w));
-              wsum.addAssign(w);
+          // Do not pay twelve redundant texture reads at either endpoint.
+          // For r <= .02 the footprint radius is zero, so every ring tap is
+          // byte-for-byte the centre sample already in `sum`. For r >= the
+          // exact-tail cutoff (or where the footprint cap reduced fidelity to
+          // zero), `exactWeight` below is zero and this filtered value cannot
+          // affect the image. This is a dynamic branch because roughness is
+          // commonly texture-driven; making it a material bucket would go
+          // stale after an edit and would miss mixed roughness maps.
+          If(roughness.greaterThan(0.02).and(exactFidelity.greaterThan(0)), () => {
+            for (const [scale, ring] of RINGS) {
+              for (const [ox, oy] of ring) {
+                const uv = giUV.add(vec2(step2.x.mul(ox * scale), step2.y.mul(oy * scale)));
+                const tap = light.bvhReflectColorTexture.sample(uv);
+                // hit (> .5) -> this exact tap; traced miss (-1) -> broad field;
+                // masked/untraced (0) -> centre hold. The denominator stays fixed
+                // in all three cases, so this remains energy-preserving.
+                const hit = step(0.5, tap.a);
+                const miss = step(tap.a, -0.5);
+                const absent = mix(exactCenter, broadDirectional, miss);
+                sum.addAssign(mix(absent, vec3(tap.rgb), hit));
+              }
             }
-          }
-          exactRgb.assign(sum.div(wsum));
+            exactRgb.assign(sum.mul(1 / 13));
+          });
         }
         // THE HIT IS SHADED WHERE IT IS TRACED (see giScreen.js
         // createGiBvhReflect's SHADING note): the texture already holds the
@@ -2201,7 +2411,11 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
         // unclamped negative alpha here would EXTRAPOLATE the mix instead of
         // ignoring it. `nestedKill` — see the NESTED-RENDER ARBITRATION
         // note above: this texture is main-view data.
-        const exactWeight = exactHit.a.clamp(0, 1).mul(smoothstep(0.45, 0.15, roughness)).mul(nestedKill);
+        // ×exactFidelity — see its assignment above. At roughness 0 both this
+        // confidence and the prefilter coverage are exactly 1, so a true
+        // mirror is unchanged pixel-for-pixel.
+        const exactWeight = exactHit.a.clamp(0, 1)
+          .mul(smoothstep(0.45, 0.15, roughness)).mul(nestedKill).mul(exactFidelity);
         directional = mix(directional, exactRadiance, exactWeight);
       }
       // TRUE mirror reflections for low-roughness materials: one SDF
@@ -2222,7 +2436,14 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
         // boxes). The traced result reads slightly too sharp for rough
         // metal, but sharp-and-stable beats banded. ×nestedKill: the trace
         // textures are main-view data (NESTED-RENDER ARBITRATION above).
-        const mirrorGate = smoothstep(0.45, 0.15, roughness).mul(nestedKill).toVar();
+        // ×exactFidelity, and it has to be BOTH this and the exact blend or
+        // neither: this trace composites OVER that one (`light._mirrorOut`, at
+        // the end of the specular chain), so damping only the blend would leave
+        // the sharper of the two images painting the pixel. This arm has no
+        // prefilter of its own at all, so the ramp is if anything more owed
+        // here — a rough surface cannot honestly show a single mirror ray.
+        const mirrorGate = smoothstep(0.45, 0.15, roughness)
+          .mul(nestedKill).mul(exactFidelity).toVar();
         const mirrorOut = vec3(0).toVar();
         const mirrorWeight = float(0).toVar();
         If(mirrorGate.greaterThan(0.001), () => {
@@ -2422,7 +2643,12 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // shadows entirely) AND to the mirror path (mirror pixels are
       // low-roughness, where the glow is sharp and correct).
       let glow = vec3(0);
-      for (const { slot, shadow, dist, dirToEmitter, active } of emitterData) {
+      if (rolledGlow && emitterData.length > 1) {
+        // One loop body over the slot table (emitterGlowRolled): the
+        // per-slot silhouette tests compile once. `__giRolledGlow = false`
+        // keeps the unrolled form below for an A/B.
+        glow = emitterGlowRolled(emitterData, positionWorld, reflected, roughness);
+      } else for (const { slot, shadow, dist, dirToEmitter, active } of emitterData) {
         const cosAng = dirToEmitter.dot(reflected);
         // Angular size from the slot's effective radius (exact for spheres,
         // mean-projected-area for boxes) — drives softness and energy.
@@ -2489,8 +2715,16 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
       // the miss against today's field fallback.
       if (light.giEnvMiss && light.bvhReflectColorTexture) {
         const missA = light.bvhReflectColorTexture.sample(giUV).a;
+        // ×exactFidelity, the third and worst-offending sharp-image consumer.
+        // This term has no prefilter of ANY kind — one equirect tap of the HDRI
+        // along the mirror direction — and an outdoor environment map's
+        // brightest feature is a sun disc thousands of times the sky around it.
+        // At full weight on a roughness-0.3 floor that is a single blown pixel
+        // where a wide dim smear belongs, and on a scene like Sponza (open
+        // roof, sunset HDRI) it lands on every glossy patch the sky can reach.
         const envW = missA.negate().clamp(0, 1)
           .mul(smoothstep(0.45, 0.15, roughness))
+          .mul(exactFidelity)
           .mul(step(1e-4, float(light.giEnvMiss.intensity)));
         // Match three's own environment orientation: the lookup vector is
         // rotated by the scene's environmentRotation (Y), then equirectUV
@@ -2529,4 +2763,194 @@ export function registerGILight(renderer) {
   if (!renderer?.library || registeredRenderers.has(renderer)) return;
   renderer.library.addLight(GICascadeLightNode, GICascadeLight);
   registeredRenderers.add(renderer);
+}
+
+// ── ROLLED DIRECT-LIGHT LOOPS (2026-09-02, the reflection kernels' compile) ──
+//
+// `analyticDirectAt` / `emitterDirectAt` iterate their slot tables in JS, so
+// every slot's shadow trace is INLINED at graph-build time: the exact-
+// reflection hit shade and the reflection-probe capture each carried FOUR
+// static-BVH8 descents, FOUR dynamic-BVH descents and FOUR emitter record
+// marches in one 97 kB `main` (the kernel census in plan §9.5:
+// `giStaticPlacementBvh8 ×8, giDynTrace ×8, giEmitterFactor ×8`), and the
+// driver took 17–25 s to compile each of them on the user's Level (110 s on
+// Bistro) — the two pipelines the boot's "first field" milestone was waiting
+// on while the diffuse field had been on screen for 22 s. srcShade.js measured
+// the same shape at ~1.2 s of compile PER INLINED DESCENT (§13.14.5) and rolled
+// its loop; these are the same roll for the two hit-shading consumers. The
+// slot's FIELDS are picked by index inside a GPU `Loop` (a `select` chain over
+// the table — the slots are uniforms, and a select over four uniforms is
+// nothing next to a descent), the per-slot maths runs once on the picked
+// slot, and the trace is called ONCE per iteration: one descent in the
+// program no matter how many slots the table has. Math-identical to the
+// unrolled form (same terms, same gates, summed in slot order). The only
+// change is cost: the unrolled form traced a slot whose term was zero; the
+// rolled form skips that trace. `__giRolledDirect = false` (build-time)
+// rebuilds the unrolled kernels for an A/B.
+function pickSlotField(slots, field, i, kind) {
+  const wrap = kind === "vec3" ? (v) => vec3(v) : (v) => float(v);
+  const v = wrap(slots[0][field]).toVar();
+  for (let k = 1; k < slots.length; k++) {
+    // `.uniformFlow()`: three's ConditionalNode emits a `select()` ternary
+    // only under that context — otherwise every pick is an if/else BLOCK
+    // (~30 lines of WGSL per field per table, measured 2026-09-02 on the
+    // rolled glow: eleven picks outweighed the four bodies they replaced).
+    // Both operands are plain reads, so the ternary is the same math.
+    v.assign(select(i.equal(int(k)), wrap(slots[k][field]), v).uniformFlow());
+  }
+  return v;
+}
+
+export function analyticDirectAtRolled(lightSlots, P, N, shadowFn, oneSided = false) {
+  const total = vec3(0).toVar();
+  const hasRange = lightSlots[0]?.range != null;
+  Loop({ start: int(0), end: int(lightSlots.length), type: "int", condition: "<" }, ({ i }) => {
+    const active = pickSlotField(lightSlots, "active", i, "float");
+    const kind = pickSlotField(lightSlots, "kind", i, "float");
+    const vector = pickSlotField(lightSlots, "vector", i, "vec3");
+    const color = pickSlotField(lightSlots, "color", i, "vec3");
+    const range = hasRange ? pickSlotField(lightSlots, "range", i, "float") : null;
+    If(active.greaterThan(0.5), () => {
+      const isDir = float(kind).toVar();
+      const rel = vector.sub(P).toVar();
+      const pointDist = rel.length().max(1e-4).toVar();
+      const dirTo = mix(rel.div(pointDist), vector, isDir).toVar();
+      let atten = mix(float(1).div(pointDist.mul(pointDist).max(1)), float(1), isDir);
+      if (range) {
+        const ratio = pointDist.div(range.max(1e-4)).clamp(0, 1);
+        const r2 = ratio.mul(ratio);
+        const win = r2.mul(r2).oneMinus().clamp(0, 1);
+        atten = atten.mul(mix(float(1), win.mul(win), step(1e-3, range).mul(isDir.oneMinus())));
+      }
+      const cosH = (oneSided ? dirTo.dot(N).max(0) : dirTo.dot(N).abs()).toVar();
+      const lit = vec3(color).mul(atten).mul(cosH).toVar();
+      If(lit.x.max(lit.y).max(lit.z).greaterThan(0), () => {
+        total.addAssign(lit.mul(float(shadowFn(dirTo, isDir, pointDist, cosH)).clamp(0, 1)));
+      });
+    });
+  });
+  return total;
+}
+
+// Every field the emitter helpers read off a slot (emitterSlotFactor,
+// emitterSurfaceT, emitterExclusion, emitterAngularRadius, emitterSlotShadow).
+const EMITTER_SLOT_VEC3_FIELDS = ["center", "color", "half", "bx", "by", "bz", "exHalf"];
+const EMITTER_SLOT_FLOAT_FIELDS = ["radius", "kind", "reff"];
+
+export function emitterDirectAtRolled(params, P, N, samplePoint) {
+  const slots = params.emitterSlots;
+  const total = vec3(0).toVar();
+  Loop({ start: int(0), end: int(slots.length), type: "int", condition: "<" }, ({ i }) => {
+    const slot = {};
+    for (const f of EMITTER_SLOT_VEC3_FIELDS) {
+      if (slots[0][f] != null) slot[f] = pickSlotField(slots, f, i, "vec3");
+    }
+    for (const f of EMITTER_SLOT_FLOAT_FIELDS) {
+      if (slots[0][f] != null) slot[f] = pickSlotField(slots, f, i, "float");
+    }
+    const center = vec3(slot.center);
+    const toEmitter = center.sub(P).toVar();
+    const dist = toEmitter.length().max(1e-3).toVar();
+    const dirToEmitter = toEmitter.div(dist).toVar();
+    const cosTheta = dirToEmitter.dot(N).toVar();
+    const sinR = float(slot.radius).div(dist).clamp(0, 1).toVar();
+    const emitterDirect = vec3(slot.color)
+      .mul(emitterSlotFactor(slot, P, N, cosTheta, sinR))
+      .toVar();
+    const emitterLum = emitterDirect.dot(vec3(0.2126, 0.7152, 0.0722)).toVar();
+    const cutD = emitterCutoff(params);
+    const fadeT = emitterLum.sub(cutD).div(cutD * 2).clamp(0, 1).toVar();
+    emitterDirect.mulAssign(
+      fadeT.mul(fadeT).mul(fadeT).mul(fadeT.mul(fadeT.mul(6).sub(15)).add(10)),
+    );
+    const active = step(0.001, slot.radius);
+    If(active.greaterThan(0.5).and(emitterLum.greaterThan(cutD)), () => {
+      const shadow = float(emitterSlotShadow(params, slot, P, N, samplePoint)).toVar();
+      total.addAssign(emitterDirect.mul(shadow));
+    });
+  });
+  return { irradiance: total, shadows: [], perSlot: [] };
+}
+
+// ── ROLLED EMITTER GLOW (2026-09-02, the material fragment's compile) ───────
+//
+// The material path's emitter SPECULAR glow (GICascadeLightNode.setup above)
+// iterated `emitterData` in JS, so every material that reflects carried FOUR
+// copies of the per-slot body — cone test, the box/shape silhouette `If`
+// chain with its `giBoxGlowMiss` / `giShapeGlowMiss` calls, the energy/
+// shadow/active products — in one `main`: 17.2 kB of the 91 kB GI-injected
+// fragment program (the size attribution of 2026-09-02). Same roll as
+// emitterDirectAtRolled: the slot's uniforms are picked by index inside a
+// GPU `Loop` (a `select` chain over the table), the per-slot SHADOW — a
+// packed-texture channel on the deferred arm, a traced main-scope var on the
+// legacy in-material arm — is picked the same way, and the body runs once.
+// Math-identical to the unrolled form: same terms, same gates, summed in
+// slot order 0..N-1. `__giRolledGlow = false` (build-time) keeps the
+// unrolled form.
+//
+// `emitterData`: [{ slot, shadow }] — the slot uniform object and a float
+// node readable at the caller's scope. `P`/`R`: receiver position and the
+// reflection direction. `roughness`: the roughness the BSDF shades with.
+//
+// The fields the glow reads (emitterAngularRadius, the cone test, the box/
+// shape silhouette tests, the active gate) — the direct lists minus `exHalf`,
+// which only emitterExclusion consumes.
+const GLOW_SLOT_VEC3_FIELDS = ["center", "color", "half", "bx", "by", "bz"];
+const GLOW_SLOT_FLOAT_FIELDS = ["radius", "kind", "reff"];
+
+export function emitterGlowRolled(emitterData, P, R, roughness) {
+  const slots = emitterData.map((d) => d.slot);
+  const glow = vec3(0).toVar();
+  // Slot-independent inputs, hoisted so the loop body references main-scope
+  // vars (the first use of a lazy node inside a loop would declare its temp
+  // there — out of scope for every later consumer).
+  const Pv = vec3(P).toVar();
+  const Rv = vec3(R).toVar();
+  const rough = float(roughness).toVar();
+  // GGX-ish lobe widening: alpha = roughness², small floor for AA.
+  const spread = rough.mul(rough).add(0.015).toVar();
+  const hasKind = slots[0]?.kind != null;
+  Loop({ start: int(0), end: int(slots.length), type: "int", condition: "<" }, ({ i }) => {
+    const slot = {};
+    for (const f of GLOW_SLOT_VEC3_FIELDS) {
+      if (slots[0][f] != null) slot[f] = pickSlotField(slots, f, i, "vec3");
+    }
+    for (const f of GLOW_SLOT_FLOAT_FIELDS) {
+      if (slots[0][f] != null) slot[f] = pickSlotField(slots, f, i, "float");
+    }
+    const shadow = pickSlotField(emitterData, "shadow", i, "float");
+    const toEmitter = vec3(slot.center).sub(Pv).toVar();
+    const dist = toEmitter.length().max(1e-3).toVar();
+    const dirToEmitter = toEmitter.div(dist).toVar();
+    const active = step(0.001, slot.radius);
+    const cosAng = dirToEmitter.dot(Rv);
+    // Angular size from the slot's effective radius (exact for spheres,
+    // mean-projected-area for boxes) — drives softness and energy.
+    const sinR = float(emitterAngularRadius(slot)).div(dist).clamp(0, 1).toVar();
+    const effSin = sinR.add(spread).min(1).toVar();
+    const cosEff = effSin.mul(effSin).oneMinus().max(0).sqrt().toVar();
+    // Sphere slots: cone test around the direction to centre. Box slots:
+    // angular distance from the reflected ray to the box's actual
+    // silhouette. Shaped slots: the same silhouette contract via their SDF.
+    const inCone = float(smoothstep(cosEff, mix(cosEff, 1, 0.35), cosAng)).toVar();
+    if (hasKind) {
+      const kindG = float(slot.kind);
+      If(kindG.greaterThan(0.5).and(kindG.lessThan(1.5)), () => {
+        const miss = boxGlowMiss(
+          Pv, Rv,
+          vec3(slot.center), vec3(slot.half), vec3(slot.bx), vec3(slot.by), vec3(slot.bz),
+        );
+        inCone.assign(smoothstep(0.0, spread, miss).oneMinus());
+      }).ElseIf(kindG.greaterThan(1.5), () => {
+        const miss = shapeGlowMiss(
+          Pv, Rv, kindG,
+          vec3(slot.center), vec3(slot.half), vec3(slot.bx), vec3(slot.by), vec3(slot.bz),
+        );
+        inCone.assign(smoothstep(0.0, spread, miss).oneMinus());
+      });
+    }
+    const energy = sinR.mul(sinR).div(effSin.mul(effSin).max(1e-6));
+    glow.addAssign(vec3(slot.color).mul(inCone).mul(energy).mul(shadow).mul(active));
+  });
+  return glow;
 }

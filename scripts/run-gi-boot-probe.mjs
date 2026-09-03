@@ -282,6 +282,7 @@ async function runArm(arm) {
   page.on("console", (m) => {
     const t = m.text();
     if (!/\[gi\]/.test(t)) return;
+    if (process.env.VERBOSE) console.log(`  ${t.slice(0, 500)}`);
     const at = rendererAt.get(t) ?? Date.now();
     lines.push({ at, t });
     // Echo the engine's own attribution lines verbatim — the [pass] tag in
@@ -310,6 +311,7 @@ async function runArm(arm) {
     const msg = e.message ?? String(e);
     if (!/save_scene/.test(msg)) lines.push({ at: Date.now(), t: `pageerror: ${msg.slice(0, 160)}` });
   });
+  page.on("error", (e) => console.log(`  page crashed: ${e?.message ?? e}`));
 
   await page.evaluateOnNewDocument(pageHook);
   // SRC must be set before the GI module builds, and it changes what this probe

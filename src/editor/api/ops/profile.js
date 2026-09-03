@@ -15,8 +15,10 @@
  * measurement window) and restores it afterwards.
  */
 import { defineOp } from "../registry.js";
+import { readTexturePixelsGPU } from "../../../modules/gi/giScreen.js";
 import { engine } from "../../engineInstance.js";
 import { auditDrawCalls } from "../../../engine/drawCallAudit.js";
+import { collectViewCullingStats } from "../../../engine/culling/viewCullingStats.js";
 
 /**
  * Named screen-chain passes, in the order they run.
@@ -42,6 +44,43 @@ const SCREEN_PASSES = [
   "emitterShadowFilterPass",
   "bvhReflect",
 ];
+
+defineOp({
+  name: "profile.giFlag",
+  description:
+    "DEV: set one GI build-time hatch (a `__gi…` global), persist it in localStorage (`gi.devFlags.v1`, applied when the GI module loads) and queue a GI rebuild. Hatches read at SCREEN-CHAIN creation (e.g. `__giIrrTemporal`) need an editor.reload to take effect; the flag survives it. Drive an A/B from an agent session — e.g. `__giIrrTemporal` false to bypass the irradiance temporal filter, `__giMergeLos` false, `__giGatherNormalWeight` false, `__giBvhSimplify` false. Read-back: the value now set and whether a rebuild was queued. Only names starting with `__gi` are accepted; pass value null to delete the flag (restores the default).",
+  params: {
+    name: { type: "string", description: "The global's name, must start with `__gi`." },
+    value: { description: "true / false / number / string, or null to delete." },
+    rebuild: { type: "boolean", default: true, description: "Queue a GI rebuild so build-time hatches take effect (default true)." },
+  },
+  async run({ name, value = null, rebuild = true }) {
+    if (typeof name !== "string" || !/^__gi[A-Za-z0-9_]*$/.test(name)) {
+      throw new Error("profile.giFlag: `name` must be a `__gi…` global");
+    }
+    const before = globalThis[name];
+    if (value === null || value === undefined) delete globalThis[name];
+    else globalThis[name] = value;
+    // Persist across reloads (build-time hatches are read once, and a
+    // rebuild keeps the screen chain): GISystem applies `gi.devFlags.v1` at
+    // import. Deleting a flag removes it from the store too.
+    try {
+      const key = "gi.devFlags.v1";
+      const store = JSON.parse(localStorage.getItem(key) || "{}");
+      if (value === null || value === undefined) delete store[name];
+      else store[name] = value;
+      if (Object.keys(store).length) localStorage.setItem(key, JSON.stringify(store));
+      else localStorage.removeItem(key);
+    } catch { /* storage unavailable: the in-page value still applies */ }
+    const system = engine.modules?.get?.("gi")?.system ?? null;
+    let queued = false;
+    if (rebuild && system?.requestRebuild) {
+      system.requestRebuild(`dev-flag:${name}`);
+      queued = true;
+    }
+    return { name, before: before === undefined ? null : before, now: globalThis[name] === undefined ? null : globalThis[name], rebuildQueued: queued };
+  },
+});
 
 defineOp({
   name: "profile.giPasses",
@@ -238,7 +277,31 @@ defineOp({
             `module. Object has ${perPass.length} passes totalling ${srcMs.toFixed(3)}ms.`;
         }
         const stats = await screen.srcProbes.readStats(renderer);
+        // The far-field mean's alpha carries the dark share of gather-covered
+        // geometry (giScreen createGiFarFieldAvgPass): the "black patches"
+        // gauge. 8-bit through the readback: 1/255 resolution.
+        let farField = null;
+        try {
+          const tex = engine.modules?.get?.("gi")?.system?._giFarFieldTex ?? null;
+          if (tex) {
+            // 2x1 texture read as 2x2: texel (1,0) is px[4..7], x = dark share.
+            const px = await readTexturePixelsGPU(renderer, tex, 2);
+            if (px?.length >= 8) {
+              farField = {
+                rgb8: [px[0], px[1], px[2]],
+                darkFrac: +(px[4] / 255).toFixed(3),
+                coveredK: Math.round(px[5] / 255 * 1000),
+                // Share of geometry pixels whose gather had no coverage and took
+                // the fallback fill — the "patches with no data" gauge.
+                fillFrac: +(px[6] / 255).toFixed(3),
+              };
+            }
+          }
+        } catch (error) {
+          farField = { error: error?.message ?? String(error) };
+        }
         srcProbes = {
+          farField,
           totalMs: +srcMs.toFixed(3),
           dispatches: screen.srcProbes.passes.length,
           // Sorted most-expensive-first, same discipline as `queueMs`: the
@@ -279,9 +342,42 @@ defineOp({
           // overstate the kernel by exactly the cap's savings.
           raysPerFrame: stats.rays?.rays ?? 0,
           probeRayCap: screen.srcProbes.probeRayCap ?? null,
+          // The bounce albedo the transport actually uses: the slot palette's
+          // live mean (what an unattributed hit shades at, and the scale of
+          // every attributed one), and the reflection atlas census — a
+          // textured scene reading 0 textured is shading its bounces at
+          // the flat tint, which is the whole-frame brightness bug class.
+          paletteMeanAlbedo: globalThis.__giSurfacePaletteDebug?.fallbackAlbedo
+            ? globalThis.__giSurfacePaletteDebug.fallbackAlbedo.map((v) => +Number(v).toFixed(3))
+            : null,
+          slotAtlas: engine.modules?.get?.("gi")?.system?._slotAtlas
+            ? { materials: engine.modules.get("gi").system._slotAtlas.materialCount ?? null, textured: engine.modules.get("gi").system._slotAtlas.texturedCount ?? null }
+            : null,
+          // §11.14: the second-bounce pass's own tallies — `clamped` is the loop's
+          // saturation counter (bounce term alone at the Lmax ceiling).
+          secondary: stats.secondary ?? null,
           unattributedRate: stats.rays?.unattributedRate != null
             ? +(stats.rays.unattributedRate * 100).toFixed(2) + "%"
             : null,
+          // §11.13: the share of rays that traced their far intervals this
+          // frame (100% = no far duty).
+          farRayRate: stats.rays?.farRate != null
+            ? +(stats.rays.farRate * 100).toFixed(1) + "%"
+            : null,
+          // ...of which the NEED FLOOR forced beyond the duty's stratum.
+          farNeedRate: stats.rays?.farNeedRate != null
+            ? +(stats.rays.farNeedRate * 100).toFixed(1) + "%"
+            : null,
+          farDutyLive: globalThis.__giSrcFarDutyLive ?? null,
+          // §11.15: rays that started inside a mover and were dropped.
+          insideMoverRays: stats.rays?.insideMoverRays ?? null,
+          moverHits: stats.rays?.moverHits ?? null,
+          moverRecords: stats.rays?.moverRecords ?? null,
+          // §11.13: opt-in bin-count histogram (`__giProfileBinHistogram = true`).
+          ...(stats.binHistogram ? { binHistogram: stats.binHistogram } : {}),
+          // The transport's live temporal dials (the decay's keep and the α it came from).
+          keepLive: globalThis.__giSrcKeepLive ?? null,
+          alphaLive: globalThis.__giSrcAlphaLive ?? null,
           // §15 front 5 ("smooth light no matter where we go"): the ladder's
           // health decides whether bins carry the full-range answer or a
           // patchy partial one. orphanRate is the number to watch — healthy
@@ -537,7 +633,7 @@ defineOp({
   name: "profile.frameStats",
   readOnly: true,
   description:
-    "Live frame-rate and renderer counters — the same numbers the viewport's Stats overlay shows. `fps` counts frames the renderer actually PRESENTED over a one-second window; ticks that ran but skipped the draw (a GI compile wave, a renderer resize) are reported separately as `skippedFps`, and an idle viewport the editor has suspended reports 0 for both. Use this to check whether a change actually made the editor faster. `culling` reports what the occlusion and LOD systems are doing: `occlusion.occluders` is 0 when no object in the scene is large enough to be worth rendering into the occluder depth pass, in which case nothing can ever be culled.",
+    "Live frame-rate and renderer counters — the same numbers the viewport's Stats overlay shows. `fps` counts frames the renderer actually PRESENTED over a one-second window; ticks that ran but skipped the draw (a GI compile wave, a renderer resize) are reported separately as `skippedFps`, and an idle viewport the editor has suspended reports 0 for both. Use this to check whether a change actually made the editor faster. `culling.view` is the overlay's de-duplicated frustum + occlusion total and retains both breakdowns; `culling.occlusion.occluders` is 0 when no object in the scene is large enough to be an occluder.",
   params: {
     settleMs: {
       type: "number",
@@ -556,6 +652,7 @@ defineOp({
     // viewport is a stale frame rate for a canvas that is not drawing.
     const r = stats.sample();
     const drawing = r.fps > 0;
+    const viewCulling = collectViewCullingStats(engine);
     return {
       fps: Math.round(r.fps),
       skippedFps: Math.round(r.skippedFps),
@@ -574,6 +671,10 @@ defineOp({
       // it: a scene with occlusion on and ZERO occluders never even runs the
       // depth pass, so nothing downstream can cull anything.
       culling: {
+        // The overlay's "Occluded" value: an identity union of frustum and
+        // occlusion decisions. Keep the breakdown and overlap so the union is
+        // auditable instead of hiding double counting in one aggregate.
+        view: viewCulling,
         occlusion: engine.occlusion?.stats ?? null,
         lodHidden: [...engine.entities.values()].filter((e) => e._lodHidden === true).length,
       },
@@ -606,6 +707,17 @@ defineOp({
         hitHistWeight: engine.modules?.get?.("gi")?.system?._giBvhHitHistWeightU?.value ?? null,
         hitHistWeightAtMotion: engine.modules?.get?.("gi")?.system?._giHitWeightAtMotion ?? null,
         camMotionEma: engine.modules?.get?.("gi")?.system?._giCamMotionEma ?? null,
+        // Which field-hash section changed, counted over the last 120 frames:
+        // a non-zero `fieldQuietFrames` needs none of these to be ticking.
+        quietBreakers: engine.modules?.get?.("gi")?.system?._quietBreakers ?? null,
+        gbufferHeldFrames: engine.modules?.get?.("gi")?.system?._gbufferHeldFrames ?? null,
+        staticHeldFrames: engine.modules?.get?.("gi")?.system?._gbufStaticHeldFrames ?? null,
+        moverOnlyFrames: engine.modules?.get?.("gi")?.system?._moverOnlyFrames ?? null,
+        worldHz: engine.modules?.get?.("gi")?.system?._srcWorldHzLive ?? null,
+        worldRested: engine.modules?.get?.("gi")?.system?._srcWorldRested ?? null,
+        // 1 = the emitter shadow pass marches a checkerboard this frame (half
+        // the pixels), 0 = full-pixel (movers-only frames), null = no chain.
+        emitterChecker: engine.modules?.get?.("gi")?.system?._giEmitterCheckerU?.value ?? null,
         // ⚠ THE TWO ABOVE DESCRIBE DECISIONS; THESE DESCRIBE DISPATCHES.
         // `hitShadeHeldFrames` counts only the frames the HELD-VIEW cadence
         // chose to skip — it reported 0 ("healthy") on every frame the idle

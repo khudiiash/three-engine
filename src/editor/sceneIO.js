@@ -204,9 +204,16 @@ export async function restoreLastScene() {
       continue;
     }
     try {
-      const { deserializeScene } = await import("../engine/index.js");
+      const [{ deserializeScene, collectSceneAssets, expandMaterialAssets }, { preloadAssetBinaries }] = await Promise.all([
+        import("../engine/index.js"),
+        import("./assetLoader.js"),
+      ]);
       const contents = await invoke("load_scene", { path });
-      await deserializeScene(engine, JSON.parse(contents));
+      const json = JSON.parse(contents);
+      const assets = collectSceneAssets(json);
+      await preloadAssetBinaries(assets);
+      await preloadAssetBinaries(await expandMaterialAssets(assets));
+      await deserializeScene(engine, json);
       engine.sceneName = sceneNameFromPath(path);
       if (path === candidates[0]) open.path = path;
       // Fell back past a `lastScene` that no longer exists — repair it, or
@@ -227,7 +234,10 @@ export async function restoreLastScene() {
 function afterSceneSwap(engine = null) {
   commandBus.clearHistory();
   useSelectionStore.getState().clear();
-  useSceneStore.getState().refresh(open.path);
+  // deserialize/clear/create already emits one coalesced hierarchy event,
+  // which rebuilds the O(N) entity mirror. Only the filename-derived chrome
+  // changes here; refreshing again doubled Bistro's hierarchy publication.
+  useSceneStore.getState().setSceneMeta(engine?.sceneName ?? "Untitled", open.path);
   useSceneStore.getState().markDirty(false);
   // Keep the runtime scene manager's idea of "the scene you are in" aligned
   // with the editor's, so `engine.scenes.active` is meaningful while stopped
@@ -345,9 +355,16 @@ export async function openScenePath(path) {
   await leavePrefabMode();
   const engine = await ensureEngine();
   const { invoke } = await import("@tauri-apps/api/core");
-  const { deserializeScene } = await import("../engine/index.js");
+  const [{ deserializeScene, collectSceneAssets, expandMaterialAssets }, { preloadAssetBinaries }] = await Promise.all([
+    import("../engine/index.js"),
+    import("./assetLoader.js"),
+  ]);
   const contents = await invoke("load_scene", { path });
-  await deserializeScene(engine, JSON.parse(contents));
+  const json = JSON.parse(contents);
+  const assets = collectSceneAssets(json);
+  await preloadAssetBinaries(assets);
+  await preloadAssetBinaries(await expandMaterialAssets(assets));
+  await deserializeScene(engine, json);
   engine.sceneName = sceneNameFromPath(path);
   rememberScene(path);
   afterSceneSwap(engine);

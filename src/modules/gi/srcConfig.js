@@ -44,6 +44,40 @@ export const GAMMA = 4;
 export const CASCADE_COUNT = 4;
 
 /**
+ * Conservative compensation for analytic directional light deposited above
+ * cascade 0. The cascade merge is energy-exact for uniform radiance but the
+ * measured directional lobe retains about 83% per hand-off; recovering the
+ * full inverse would overshoot already-hot directions, so each hand-off gets
+ * only 8% and the total is capped at 20%. Sky, emissive and recursive radiance
+ * never take this path.
+ */
+export const SUN_BOUNCE_GAIN_PER_MERGE = 1.08;
+export const SUN_BOUNCE_GAIN_MAX = 1.2;
+export function sunBounceGainForCascade(cascade) {
+  return Math.min(SUN_BOUNCE_GAIN_MAX, SUN_BOUNCE_GAIN_PER_MERGE ** Math.max(0, cascade));
+}
+
+/**
+ * The same bounded angular-reconstruction correction for the chromatic
+ * remainder of an analytic directional first bounce. Every source crosses the
+ * c0 bin -> cosine-tile reconstruction once, then crosses `cascade` merge
+ * hand-offs. Counting only the latter silently gave c0 chroma a gain of 1 even
+ * though it pays the former. A mixed neutral+red lobe keeps the neutral furnace
+ * exactly; counting that universal stage restores 1.061x mean R-G on the CPU
+ * twin (range 0.995x..1.204x, 14.3% worst off-centre) under the existing 1.5
+ * ceiling. Environment, emissive, punctual and recursive radiance never take
+ * this path.
+ */
+export const SUN_BOUNCE_CHROMA_GAIN_PER_MERGE = 1.18;
+export const SUN_BOUNCE_CHROMA_GAIN_MAX = 1.5;
+export function sunBounceChromaGainForCascade(cascade) {
+  return Math.min(
+    SUN_BOUNCE_CHROMA_GAIN_MAX,
+    SUN_BOUNCE_CHROMA_GAIN_PER_MERGE ** (Math.max(0, cascade) + 1),
+  );
+}
+
+/**
  * c0 direction-bin grid width. Bins live on a 2w×w equal-area cylindrical
  * grid, so |D_i| = 2·w_i². w₀=4 → |D₀| = 32, the paper's reference config.
  */
@@ -317,7 +351,12 @@ export const LIGHT_SETTLE_FADE_MS = 800;
  * instrument quotes. `__giSrcSeed = false` (read once, at build) removes the
  * passes entirely — the only form of "off" that can back a bit-exactness claim.
  */
-export const SEED_RAYS = 6;
+// 6 → 1 (2026-09-03): the prior is a HINT, not evidence. At weight 6 a fresh
+// probe carried its parent's answer (the sky composite — blue with the sky on,
+// black with it off) until ~6 of its own deposits had landed, which at stride
+// 12 is ~100 frames: the user's soft blobs on every surface the camera turned
+// onto. At 1 the first own hit already weighs as much as the prior.
+export const SEED_RAYS = 1;
 
 /**
  * ══ THE TRACKING WINDOW — WHY A SEEN CHANGE HOLDS α UP (§12.43) ═════════════
@@ -486,32 +525,28 @@ export const PROBE_MAX_AGE = 60;
 export const MAX_LOOP_ALBEDO = 0.9;
 
 /**
- * Quality tiers. Unlike the dense backend's tiers these scale s₀, rays/pixel
- * and w₀ — NOT a world volume, because SRC has no volume to scale. Memory is
- * screen-proportional by construction (plan §4.2).
+ * Quality tiers. Unlike the dense backend's tiers these scale s₀, rays/pixel,
+ * secondary bounce and ray ceilings — NOT a world volume, because SRC has no
+ * volume to scale. Memory is screen-proportional by construction (plan §4.2).
  *
  * `spacing0` is metres at LOD 0. `raysPerPixel` counts full-length rays per
- * half-res gbuffer pixel. `w0` raises c0 angular resolution on the top tiers.
+ * half-res gbuffer pixel. `w0` stays at the proven width 4 on every tier.
  *
- * ⚠ ULTRA'S RAY BUDGET MUST SCALE WITH ITS BIN COUNT (2026-08-22, the
- * user's "black patches appear on Ultra preset"). w0 8 gives every ultra
- * probe 4× the bins of high (2·w0²: 128 vs 32) — but transportRays was only
- * 2× high's and probeRayCap was the SAME 16, so an ultra probe filled ~4×
- * slower than a high probe and, under play movement (60-frame visibility
- * retirement churning the population), never reached knownness equilibrium:
- * unfilled bins render as the ceiling-hugging black exactly where the
- * long-range answer matters, at ultra only. transportRays 262_144 → 393_216
- * (frame cost is bounded by this ceiling; the deposit trace measured
- * ~0.4-0.55 ms at 245k — expect ~+0.3 ms) and probeRayCap 16 → 32 at ultra
- * (redistribution within the ceiling toward probes that still have unknown
- * bins; the cap's fat-probe protection loosens by exactly the factor the
- * bin count grew).
+ * ⚠ DO NOT WIDEN ULTRA TO w0=8 WITHOUT REDESIGNING THE BLOCK POOL. The fixed
+ * budget is measured in raw bins, so doubling w0 makes a block 4× larger and
+ * cuts Bistro's c0 capacity at the 2.8M ceiling from 21,875 to 5,468 — below
+ * its measured 14,273 live probes. That guarantees permanent `noBlock` holes
+ * plus extra work. Ultra instead buys finer spatial probes, more transport
+ * rays, and a looser per-probe cap without starving the proven pool.
  */
 export const SRC_QUALITY = {
   low: { spacing0: 0.8, raysPerPixel: 1, w0: 4, secondary: false, transportRays: 32_768, probeRayCap: 16 },
   medium: { spacing0: 0.6, raysPerPixel: 1, w0: 4, secondary: true, transportRays: 65_536, probeRayCap: 16 },
   high: { spacing0: 0.45, raysPerPixel: 2, w0: 4, secondary: true, transportRays: 131_072, probeRayCap: 16 },
-  ultra: { spacing0: 0.35, raysPerPixel: 2, w0: 8, secondary: true, transportRays: 393_216, probeRayCap: 32 },
+  // Keep the proven directional width. With the fixed raw-bin budget, w0=8
+  // cuts Bistro's c0 block capacity from 21,875 to 5,468 (below its measured
+  // 14,273 live probes), causing permanent noBlock checker/rectangle holes.
+  ultra: { spacing0: 0.35, raysPerPixel: 2, w0: 4, secondary: true, transportRays: 393_216, probeRayCap: 32 },
 };
 
 /**
@@ -858,9 +893,202 @@ export function binCount(cascade, w0 = W0) {
  * pools remain FLOORS-first (`SRC_POOL_FLOORS.binBudget` is still 700 k), so
  * a scene that does not ask pays nothing; this is only where growth stops.
  */
-export const BIN_BUDGET = 2_800_000;
+/**
+ * §10.8 (2026-09-03) — IS THE SUN SPLIT ARMED? IT SIZES EVERY BIN.
+ *
+ * `__giSrcSunSplit` is OPT-IN and has been since §12.82 shipped it ("OFF
+ * (default - arm with __giSrcSunSplit = true)" on every boot). Read here, not
+ * in srcDeposit, because it decides `BIN_WORDS` and `BIN_WORDS` decides
+ * `BIN_BUDGET`, and a budget computed from a layout it does not know about is
+ * the leak this file's header warns about.
+ *
+ * A BUILD-TIME read, evaluated once at module load like every other `__gi`
+ * layout hatch: flipping it needs a page reload, which is what `profile.giFlag`
+ * persists flags for.
+ */
+export function sunSplitArmed() {
+  return globalThis.__giSrcSunSplit === true;
+}
+
+/** rgb + clear-weight + total-weight: the words EVERY build writes. */
+export const BIN_WORDS_BASE = 5;
+/** ...plus §12.82's sun transfer (3) and packed hit normal (1). */
+export const BIN_WORDS_SPLIT = 9;
+
+/**
+ * ⭐⭐ §10.8 — THE BIN LAYOUT FOLLOWS THE BUILD, AND THAT IS 44 % OF THE
+ * LARGEST ALLOCATION IN THE MODULE.
+ *
+ * `BIN_SR/SG/SB/SN` (words 5..8) exist for the sun split. Both their writes
+ * (`srcSecondary`'s `if (sunTransfer)`) and their reads (`srcDeposit`'s
+ * resolve, `if (sunClose)`) are JS build-time guards on the same opt-in flag —
+ * so on the DEFAULT path every scene allocated four words per bin that nothing
+ * ever touched. On the user's Bistro that is 44.8 MB of a 100.8 MB `scratch`
+ * buffer, in the one allocation that is up against the 128 MiB storage-buffer
+ * binding limit, while cascade 0 was refusing 10 774 probe inserts a frame for
+ * want of bin blocks (plan §10.7 — the black patches).
+ *
+ * `createSrcBinStore` throws if a build asks for the sun words without them,
+ * so the layout and its two guards cannot drift apart silently.
+ */
+export const BIN_WORDS = sunSplitArmed() ? BIN_WORDS_SPLIT : BIN_WORDS_BASE;
+
+/**
+ * ⭐ AND THE FREED BYTES ARE SPENT ON PROBES, not returned.
+ *
+ * The ceiling was never a bin count, it was ~101 MB of `scratch` (2.8 M x 9
+ * words x 4 B) against the 128 MiB binding limit, with [J]'s hit list and the
+ * per-block statistics riding the same buffer. At five words the same class of
+ * footprint holds far more bins; 4.5 M is that, kept deliberately short of the
+ * arithmetic maximum so the hit list (~25 MB at the shipping ray budget) keeps
+ * its headroom and `createSrcBinStore`'s throw stays a backstop rather than a
+ * tripwire.
+ *
+ * What it buys, which is the whole point: `blockCapacities` splits the budget
+ * four ways, so cascade 0's blocks go 2.8M/4/32 = 21 875 -> 4.5M/4/32 = 35 156,
+ * a 61 % larger backed lattice against a walk demand of ~43 500. With the
+ * §10.7 coarse fallback catching what is still short, the starvation that
+ * painted the patches is covered from both ends.
+ *
+ * ARMED, this is 2 800 000 exactly — the split arm is byte-for-byte the build
+ * every §12.82 measurement was taken on.
+ */
+export const BIN_BUDGET = sunSplitArmed() ? 2_800_000 : 4_500_000;
 /** Floor per cascade, so a one-cascade or tiny-w₀ configuration is not degenerate. */
 export const MIN_BLOCKS = 64;
+
+/**
+ * Words per bin in the RESOLVED payload — two u32 of packed binary16 halves
+ * (rgb + T), plan §11.4 A1. Owned here beside `BIN_WORDS` for the same reason
+ * that one is: it sizes a budget (`srcBinCeiling`), and a budget computed from
+ * a layout it does not know about is the leak this file's header warns about.
+ * `srcDeposit.js` re-exports it and owns the accessors.
+ */
+export const PAYLOAD_WORDS = 2;
+
+/**
+ * ══ §11.4 A2 — THE CEILING FOLLOWS THE DEVICE, AND BIN_BUDGET IS THE PORTABLE
+ * CASE OF IT (2026-09-03) ═══════════════════════════════════════════════════
+ *
+ * `BIN_BUDGET` above fits ONE storage binding under WebGPU's portable default
+ * of 128 MiB. That default is what a phone offers; the user's desktop adapter
+ * advertises 2047 MB, `sceneSettings.resolveRendererLimits` already asks it
+ * for 1 GiB, and `GISystem` already reads `device.limits` to degrade the field
+ * buffer — but the SRC store never looked, so on Bistro cascade 0 rationed
+ * 35 156 blocks against ~43 500 wanted on a street sweep while the device had
+ * 1.8 GB unasked-for. The retention valve then retired the probes behind the
+ * camera to make room, and turning back re-minted them cold: the "dead probes
+ * appear black as we rotate" report, plan §11.2.
+ *
+ * So the ceiling is a FUNCTION of the device limit: the most bins whose
+ * `scratch` (BIN_WORDS per bin, plus [J]'s hit list and the per-block
+ * statistics, which ride the same buffer — `reserveBytes`) fits one binding,
+ * and whose payload fits its own. The grow ladder climbs toward it ON DEMAND
+ * only, so a small scene on a big GPU allocates exactly what it did before.
+ * `BIN_CEILING_MAX` bounds a runaway: 16 M bins is ~320 MB of scratch and
+ * ~128 MB of payload, a 200 k-probe cascade 0 — past that the answer is a
+ * coarser lattice, not more memory.
+ */
+export const BIN_CEILING_MAX = 16_000_000;
+/** Headroom left unspent inside a binding, so the constructor's throw stays a backstop. */
+const BIN_CEILING_SLACK = 4 * 1024 * 1024;
+export function srcBinCeiling({ deviceLimitBytes = 128 * 1024 * 1024, reserveBytes = 0 } = {}) {
+  const limit = Number.isFinite(deviceLimitBytes) && deviceLimitBytes > 0
+    ? deviceLimitBytes
+    : 128 * 1024 * 1024;
+  const scratchRoom = Math.max(0, limit - BIN_CEILING_SLACK - Math.max(0, reserveBytes));
+  const byScratch = Math.floor(scratchRoom / (BIN_WORDS * 4));
+  const byPayload = Math.floor(Math.max(0, limit - BIN_CEILING_SLACK) / (PAYLOAD_WORDS * 4));
+  return Math.max(MIN_BLOCKS * CASCADE_COUNT, Math.min(BIN_CEILING_MAX, byScratch, byPayload));
+}
+
+/**
+ * §11.4 A3 — the per-cascade block vector from measured PEAK demand.
+ *
+ * `peaks[c]` is the most `(live + noBlock)` probes cascade `c` has wanted at
+ * once; `current[c]` is what it holds now (never shrunk — §12.52.2's record-
+ * pool starvation is what an unguarded shrink looks like). Each cascade is
+ * sized to its OWN peak times `headroom`, rounded up to a growth quantum so a
+ * +3 % change never costs a rebuild, floored at the equal split of `floorBudget`
+ * (the boot floor, so a cascade nothing has measured yet is not degenerate),
+ * capped by its slot count, and the whole vector is scaled down proportionally
+ * if the sum would cross `binCeiling`.
+ *
+ * ⛔ THIS IS NOT §10.8's DEAD END. That proposal re-split a FIXED total by a
+ * parked SNAPSHOT of demand — which moves budget away from cascade 0, whose
+ * bin demand at rest is the smallest of the four. This sizes every cascade from
+ * its own running PEAK and lets the total be their SUM: on a walk cascade 0's
+ * 43 500 probes no longer force `max × 4` = 5.6 M bins when c1..c3 want 2.4 M
+ * between them. Under equal demand it IS the equal split.
+ */
+/**
+ * Headroom over the measured peak, PER CASCADE — because the cascades cost
+ * 32 / 128 / 512 / 2048 bins per probe. Cascade 0 is the visible lattice and
+ * cheap per probe, so it doubles (a valve-capped `live` under-reads demand,
+ * and a rebuild is the expensive event); cascade 3 is 40 KB per probe and
+ * its demand is bounded by the cascade below, so it gets a quarter. The
+ * user's walked Bistro under a uniform 2× read 65536/28672/6144/2048 blocks
+ * — 13 M bins, 4.2 M of them in 2048 c3 blocks for 802 probes.
+ */
+export const BLOCK_HEADROOM = [2.0, 1.5, 1.25, 1.25];
+
+export function blockVectorFromPeaks({
+  peaks,
+  current = null,
+  slots,
+  floorBudget = 0,
+  binCeiling = BIN_BUDGET,
+  // A scalar applies to every cascade (the gates' arm); the shipped policy is
+  // `BLOCK_HEADROOM` per cascade.
+  headroom = null,
+  // Per cascade: is the retention valve holding this cascade's population
+  // down right now (live ≥ 75 % of its blocks)? A valve-capped `live` UNDER-
+  // reads demand — the shed keeps it pinned just under the pool — so a
+  // pressed CASCADE 0 asks for at least double the current pool; the coarse
+  // cascades take their headroom over the peak only (they are bounded by the
+  // level below and cost 4–64× more per probe).
+  pressed = null,
+  w0 = W0,
+}) {
+  const n = slots.length;
+  const floor = floorBudget > 0 ? blockCapacities(slots, w0, floorBudget) : slots.map(() => MIN_BLOCKS);
+  const want = new Array(n);
+  let above = Infinity;
+  for (let c = 0; c < n; c++) {
+    const quantum = Math.max(16, 1024 >> c);
+    const h = Number.isFinite(headroom) && headroom > 0 ? headroom : (BLOCK_HEADROOM[c] ?? 1.25);
+    // ⛔ THE LADDER IS MONOTONE: every cascade-k probe is some cascade-(k−1)
+    // probe's parent, so a cascade can never want more probes than the one
+    // below it. Bistro's first ladder read said c3 wanted 2147 against c2's
+    // 507 (a `noBlock` transient on the 85-block floor) and allocated 2816
+    // c3 blocks = 5.8 M of a 6.7 M-bin store for 113 live probes. Bounded
+    // here, by the demand ONE level down, before headroom.
+    const peak = Math.min(above, Math.max(0, Number(peaks?.[c]) || 0));
+    above = peak;
+    const cur = Number(current?.[c]) || 0;
+    // A pressed cascade 0 (§11.7) used to ask for 2× its CURRENT pool on top
+    // of the 2× headroom over its peak — 38 k live became 88 064 blocks on the
+    // user's Bistro (10:14), a 2.3× overshoot on the cheap-but-numerous
+    // cascade. The 75 % early warning reads `live` before the valve caps it,
+    // so the peak IS the demand and the headroom alone is the ask; `pressed`
+    // now only marks the cascade as one that must not fall below its peak.
+    const floorAsk = pressed?.[c] && peak > 0 ? Math.ceil(peak / quantum) * quantum : 0;
+    const grown = peak > 0 ? Math.max(Math.ceil((peak * h) / quantum) * quantum, floorAsk) : 0;
+    want[c] = Math.min(slots[c], Math.max(MIN_BLOCKS, floor[c], cur, grown));
+  }
+  const bins = (v) => v.reduce((s, b, c) => s + b * binCount(c, w0), 0);
+  const total = bins(want);
+  if (total > binCeiling) {
+    // Over the device: scale every cascade by the same factor rather than
+    // starving one of them — the equal-bins-per-cascade shape (§12.13.4) is
+    // the one measurement about this hierarchy that holds at every pose.
+    const k = binCeiling / total;
+    for (let c = 0; c < n; c++) {
+      want[c] = Math.max(MIN_BLOCKS, Math.min(slots[c], Math.floor(want[c] * k)));
+    }
+  }
+  return { blocks: want, bins: bins(want), clamped: total > binCeiling };
+}
 
 /**
  * How many bin blocks each cascade's pool holds, given the probe slot counts.

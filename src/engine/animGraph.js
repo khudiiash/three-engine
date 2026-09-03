@@ -474,6 +474,7 @@ class LayerRuntime {
     this.prevId = null;
     this.fade = { elapsed: 0, duration: 0 };
     this.transitionLock = 0;
+    this.previewLocked = false;
     this.timeInState = 0;
     this._leftId = null;
   }
@@ -507,6 +508,7 @@ class LayerRuntime {
   enter(stateId, fade = 0, offset = 0) {
     const next = this.states.get(stateId);
     if (!next) return;
+    this.previewLocked = false;
     const from = this.currentId;
     // A third transition arriving mid-crossfade: the state that was already
     // fading out is dropped outright rather than kept as a third contributor.
@@ -544,6 +546,23 @@ class LayerRuntime {
       }
     }
     return false;
+  }
+
+  /** Editor audition: play one state without graph transitions replacing it. */
+  preview(nameOrId, fade = 0.15) {
+    for (const [id, runtime] of this.states) {
+      if (id !== nameOrId && runtime.state.name !== nameOrId) continue;
+      if (!runtime.valid) return false;
+      this.enter(id, fade);
+      this.previewLocked = true;
+      return true;
+    }
+    return false;
+  }
+
+  cancelPreview() {
+    this.previewLocked = false;
+    this.transitionLock = 0;
   }
 
   #conditionsPass(transition, { ignoreExitTime = false } = {}) {
@@ -585,6 +604,7 @@ class LayerRuntime {
       }
     }
     if (!this.currentId) return;
+    if (this.previewLocked) return;
 
     for (const t of this.layer.transitions ?? []) {
       if (t.to === this.currentId) continue; // self-loops would reset to frame 0 forever
@@ -731,8 +751,24 @@ export class AnimatorRuntime {
 
   /** Force-play a state (editor preview / scripted override). */
   play(stateName, fade = 0.2, layerRef = 0) {
+    this.cancelPreview();
     const layer = this.layer(layerRef);
     if (!layer?.play(stateName, fade)) console.warn(`Animator: no state "${stateName}"`);
+  }
+
+  /** Audition a state in the editor until another preview/graph rebuild. */
+  preview(stateName, fade = 0.15, layerRef = 0) {
+    const layer = this.layer(layerRef);
+    if (!layer?.preview(stateName, fade)) {
+      console.warn(`Animator: state "${stateName}" has no playable clip`);
+      return false;
+    }
+    return true;
+  }
+
+  /** Return every layer to authored transition control after editor audition. */
+  cancelPreview() {
+    for (const layer of this.layers) layer.cancelPreview();
   }
 
   update(dt) {

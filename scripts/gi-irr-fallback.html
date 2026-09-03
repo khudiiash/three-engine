@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>GI irradiance unknown-frontier fallback gate</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="8" height="1"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      const out = document.querySelector("#log");
+      const say = (s) => { out.textContent += `${s}\n`; };
+      const fail = (error) => {
+        console.error("GI-IRR-FALLBACK FAIL", error?.stack ?? error);
+        globalThis.__GI_IRR_FALLBACK_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (e) => fail(e.error ?? e.message));
+      globalThis.addEventListener("unhandledrejection", (e) => fail(e.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const {
+          createGiIrradianceTemporalPass,
+          GI_IRR_SPATIAL_FALLBACK_CONFIDENCE,
+        } = await import("/src/modules/gi/giScreen.js");
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const errors = [];
+        renderer.backend.device.addEventListener?.("uncapturederror", (e) => {
+          errors.push(e.error?.message ?? String(e.error));
+        });
+
+        // Pixel 1 is an unknown between current-frame samples on one flat
+        // receiver. Pixel 3 has the same geometry distance/plane relationship,
+        // but its only known neighbour (4) is a perpendicular face. The first
+        // must fill; the second must not leak across the normal discontinuity.
+        const W = 5;
+        const makeStorage = (name) => {
+          const t = new THREE.StorageTexture(W, 1);
+          t.type = THREE.FloatType;
+          t.format = THREE.RGBAFormat;
+          t.name = name;
+          return t;
+        };
+        const position = makeStorage("irrFallbackPosition");
+        const normal = makeStorage("irrFallbackNormal");
+        const source = makeStorage("irrFallbackSource");
+        const histIrr = makeStorage("irrFallbackHistIrr");
+        const histPos = makeStorage("irrFallbackHistPos");
+        const target = makeStorage("irrFallbackTarget");
+        const posData = TSL.instancedArray(new Float32Array([
+          0.00, 0, 0, 1,  0.01, 0, 0, 1,  0, 0, 0, 0,
+          1.00, 0, 0, 1,  1.01, 0, 0, 1,
+        ]), "vec4");
+        const normalData = TSL.instancedArray(new Float32Array([
+          0, 1, 0, 0,  0, 1, 0, 0,  0, 0, 0, 0,
+          0, 1, 0, 0,  1, 0, 0, 0,
+        ]), "vec4");
+        const sourceData = TSL.instancedArray(new Float32Array([
+          0.8, 0.4, 0.2, 1,  0, 0, 0, 0,  0, 0, 0, 0,
+          0, 0, 0, 0,  0.2, 0.8, 0.4, 1,
+        ]), "vec4");
+        const fillCurrent = TSL.Fn(() => {
+          const i = TSL.instanceIndex.toVar();
+          const c = TSL.ivec2(i.toInt(), 0);
+          TSL.textureStore(position, c, posData.element(i));
+          TSL.textureStore(normal, c, normalData.element(i));
+          TSL.textureStore(source, c, sourceData.element(i));
+        })().compute(W);
+        const fillHistory = TSL.Fn(() => {
+          const i = TSL.instanceIndex.toVar();
+          const c = TSL.ivec2(i.toInt(), 0);
+          TSL.textureStore(histIrr, c, TSL.vec4(0));
+          TSL.textureStore(histPos, c, TSL.vec4(0));
+        })().compute(W);
+        const temporal = createGiIrradianceTemporalPass({
+          gbuffer: { position, normal }, source, target, histIrr, histPos,
+          width: W, height: 1,
+          history: {
+            prevViewProj: TSL.uniform(new THREE.Matrix4()),
+            weight: TSL.uniform(0.9),
+            validEps: 0.1,
+          },
+          validityAlpha: true,
+        });
+        const dump = TSL.instancedArray(new Float32Array(W * 4), "float");
+        const targetNode = TSL.texture(target);
+        const read = TSL.Fn(() => {
+          const i = TSL.instanceIndex.toVar();
+          const v = targetNode.load(TSL.ivec2(i.toInt(), 0)).toVar();
+          const o = i.mul(4).toVar();
+          dump.element(o).assign(v.x);
+          dump.element(o.add(TSL.uint(1))).assign(v.y);
+          dump.element(o.add(TSL.uint(2))).assign(v.z);
+          dump.element(o.add(TSL.uint(3))).assign(v.w);
+        })().compute(W);
+        await renderer.computeAsync(fillCurrent);
+        await renderer.computeAsync(fillHistory);
+        await renderer.computeAsync(temporal.compute);
+        await renderer.computeAsync(read);
+        const got = new Float32Array(await renderer.getArrayBufferAsync(dump.value));
+        const near = (a, b, eps = 2e-3) => Math.abs(a - b) <= eps;
+        const filled = near(got[4], 0.8) && near(got[5], 0.4) && near(got[6], 0.2)
+          && near(got[7], GI_IRR_SPATIAL_FALLBACK_CONFIDENCE);
+        const guarded = near(got[12], 0) && near(got[13], 0)
+          && near(got[14], 0) && near(got[15], 0);
+        say(`${filled ? "PASS" : "FAIL"} coplanar unknown filled: [${[...got.slice(4, 8)]}]`);
+        say(`${guarded ? "PASS" : "FAIL"} perpendicular neighbour rejected: [${[...got.slice(12, 16)]}]`);
+        if (errors.length) say(`FAIL WebGPU validation: ${errors[0]}`);
+        globalThis.__GI_IRR_FALLBACK_RESULT__ = {
+          pass: filled && guarded && errors.length === 0,
+          filled, guarded, errors, text: out.textContent,
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

@@ -3,6 +3,7 @@ import { prefabRegistry } from "./prefab/registry.js";
 import { instantiatePrefabNode } from "./prefab/expand.js";
 import { instanceNodeOf } from "./prefab/sync.js";
 import { SCENE_SETTINGS_DEFAULTS } from "./sceneSettings.js";
+import { waitForTextureAssets } from "./textureAsset.js";
 
 export const SCENE_VERSION = 1;
 
@@ -270,25 +271,48 @@ export async function deserializeScene(engine, json) {
   if (json.version !== SCENE_VERSION) {
     throw new Error(`Unsupported scene version ${json.version}`);
   }
-  // Do not reset renderer settings to defaults only to restore the scene's
-  // settings immediately afterwards. Besides doing two expensive rebuilds,
-  // that allowed components to attach to the temporary renderer between the
-  // two async initializations. Renderer-owned objects (notably post-process
-  // pipelines) then retained a disposed backend and rendered black on the
-  // next Play. Apply and await the final settings before attaching anything.
-  engine.clear({ resetSettings: false });
-  engine.sceneName = json.name ?? "Untitled";
-  await engine.applySettings(json.settings ?? structuredClone(SCENE_SETTINGS_DEFAULTS));
-  // Prefabs must be in the registry before any instance node is expanded.
-  for (const def of json.prefabs ?? []) {
-    if (def?.guid) prefabRegistry.register(def, def.path ?? null);
-  }
-  // One "hierarchy-changed" for the whole load: each listener is O(scene), so
-  // the per-entity event this used to fire made loading quadratic.
-  await engine.batchHierarchy(() => {
-    for (const entityData of json.entities ?? []) {
-      instantiateEntity(engine, entityData, null);
+  // Hold the complete clear -> settings -> instantiate -> authored asset wave
+  // in one transaction. Previously `clear()` published an empty hierarchy,
+  // then each async MeshComponent swapped its box/white placeholders while the
+  // editor was already rendering. On Bistro that looked like 1,500 entities
+  // spawning one by one and repeatedly woke every scene-wide listener.
+  await engine.batchHierarchy(async () => {
+    const wasVisible = engine.scene.visible;
+    engine.scene.visible = false;
+    try {
+      // Do not reset renderer settings to defaults only to restore the scene's
+      // settings immediately afterwards. Besides doing two expensive rebuilds,
+      // that allowed components to attach to the temporary renderer between the
+      // two async initializations. Renderer-owned objects (notably post-process
+      // pipelines) then retained a disposed backend and rendered black on Play.
+      engine.clear({ resetSettings: false });
+      engine.sceneName = json.name ?? "Untitled";
+      await engine.applySettings(json.settings ?? structuredClone(SCENE_SETTINGS_DEFAULTS));
+      // Prefabs must be in the registry before any instance node is expanded.
+      for (const def of json.prefabs ?? []) {
+        if (def?.guid) prefabRegistry.register(def, def.path ?? null);
+      }
+
+      for (const entityData of json.entities ?? []) {
+        instantiateEntity(engine, entityData, null);
+      }
+
+      // Packed bytes make these resolve without further native IPC, but the
+      // BufferGeometry/material adoption still happens asynchronously. Keep
+      // the stage atomic until all authored mesh/model assets are in place.
+      const pending = [];
+      for (const entity of engine.entities.values()) {
+        for (const component of entity.components.values()) {
+          if ((component.type === "mesh" || component.type === "model") && typeof component.whenReady === "function") {
+            pending.push(component.whenReady());
+          }
+        }
+      }
+      await Promise.allSettled(pending);
+      await waitForTextureAssets();
+      engine.emit("hierarchy-changed");
+    } finally {
+      engine.scene.visible = wasVisible;
     }
-    engine.emit("hierarchy-changed");
   });
 }

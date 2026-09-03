@@ -1,9 +1,9 @@
 // GLOBAL ILLUMINATION — THE WHOLE CONFIGURATION, IN ONE TABLE.
 //
-// The GI component declares THREE authored properties: `quality`, plus the
-// `ao`/`reflections` feature toggles (2026-08-21 — see resolveGiConfig).
-// Every other number the module runs on is here, and this file is the only
-// place any of them is written down.
+// The GI component exposes THREE authored lighting controls: the five-point
+// `bounce`, `ao`, and `reflections` quality tiers. `quality` remains a hidden
+// compatibility alias mirrored from Bounce. Every other number the module runs
+// on is here, and this file is the only place any of them is written down.
 //
 // ══ WHY THERE IS ONLY ONE KNOB ═════════════════════════════════════════════
 //
@@ -18,9 +18,9 @@
 //
 // That is the wrong shape for this feature. GI is not a look to be dialled in;
 // it is either CORRECT or it is BROKEN, and a knob that can make it wrong is a
-// bug generator with a label on it. A quality preset is a different kind of
-// thing: it trades COST against ACCURACY, and every level of it is supposed to
-// be correct. So `quality` survives and nothing else does.
+// bug generator with a label on it. Resource budgets are a different kind of
+// thing: they trade COST against ACCURACY, and every level is supposed to be
+// correct. Their legacy tier survives internally rather than in the UI.
 //
 // ══ WHAT MOVED RATHER THAN DIED ════════════════════════════════════════════
 //
@@ -59,10 +59,14 @@ const TIERS = new Set(GI_QUALITY_LEVELS);
  *   computed, before AO darkens it. What "indirect light" actually IS in this
  *   build, with no contact shading mixed in.
  * - "ao": the obscurance factor (1 = no occlusion, 0 = fully occluded) as a
- *   greyscale. Wide+contact+VXAO combined into one screen-space factor by the
- *   AO pass. Lets you see what is darkening your corners.
+ *   greyscale. Shipping GTAO provides contact visibility; the optional world
+ *   occupancy channel is combined into the same factor. Lets you see what is
+ *   darkening your corners.
  * - "reflections": the glossy radiance term only — what mirrors see, before
  *   it gets multiplied by a material's specular response.
+ * - "path-tracer": three-gpu-pathtracer's WebGPU backend over the same scene.
+ *   Ground truth for "is GI the right energy?", not a GI term. It replaces
+ *   the rasterized frame rather than overlaying a buffer.
  *
  * The legacy `sdf` / `occupancy` / `src-probes` modes stay on the global
  * (`globalThis.__giDebugView`) — those touch DIFFERENT data (the SDF distance
@@ -72,13 +76,9 @@ const TIERS = new Set(GI_QUALITY_LEVELS);
 export const GI_DEBUG_VIEWS = [
   "off",
   "indirect",
-  // "ao" is the factor the RESOLVE APPLIES. Since 2026-08-26 there is exactly
-  // ONE estimator behind it (per-pixel ray-traced, #armRtaoPass) — the
-  // screen-spiral and voxel-cone pair it replaced needed a mode each, because
-  // the resolve composed them with `min` and that made an isolated read of
-  // either impossible. One estimator, one view. The single-source modes come
-  // back automatically if `__giAoLegacy = true` ever re-arms the pair: this
-  // view then shows their `min`, which is still what the frame applies.
+  // "ao" is the factor the RESOLVE APPLIES. Shipping uses GTAO alone;
+  // `__giWorldAo = true` opts into the experimental occupancy diagnostic,
+  // and `__giAoRaytraced = true` replaces GTAO with RTAO.
   "ao",
   // "reflections" is the glossy field WEIGHTED BY FRESNEL, which is what
   // turns it from "a blurry copy of the scene" (the raw buffer holds a
@@ -88,15 +88,19 @@ export const GI_DEBUG_VIEWS = [
   // which no view could show before.
   "reflections",
   "reflections-exact",
+  "path-tracer",
 ];
 const DEBUG_VIEWS = new Set(GI_DEBUG_VIEWS);
 /**
  * The subset drawn by the fullscreen TERM overlay (`#buildDebugView`), as
  * opposed to the volume/gizmo views ("sdf", "occupancy", "src-probes")
- * that are console-only. Kept beside the list so adding a mode to one and
+ * that are console-only, and "path-tracer" which is a live renderer rather
+ * than a buffer sample. Kept beside the list so adding a mode to one and
  * not the other is impossible.
  */
-export const GI_TERM_DEBUG_VIEWS = new Set(GI_DEBUG_VIEWS.filter((v) => v !== "off"));
+export const GI_TERM_DEBUG_VIEWS = new Set(
+  GI_DEBUG_VIEWS.filter((v) => v !== "off" && v !== "path-tracer"),
+);
 
 /**
  * The tier a stored value selects for.
@@ -109,6 +113,68 @@ export const GI_TERM_DEBUG_VIEWS = new Set(GI_DEBUG_VIEWS.filter((v) => v !== "o
  */
 export function giQualityTier(quality) {
   return TIERS.has(quality) ? quality : "medium";
+}
+
+/** Persisted GI term controls are five exact radio levels. Booleans remain
+ * accepted so scenes authored with the previous on/off UI migrate losslessly. */
+export function giTermLevel(value, fallback = 1) {
+  if (value === false) return 0;
+  if (value === true) return 1;
+  const numeric = Number(value);
+  const clamped = Number.isFinite(numeric) ? Math.min(1, Math.max(0, numeric)) : fallback;
+  return Math.round(clamped * 4) / 4;
+}
+
+/** Map a persisted five-point rail value to Off/null or a real quality tier. */
+export function giTermTier(value, fallback = 1) {
+  const level = giTermLevel(value, fallback);
+  return level <= 0 ? null : GI_QUALITY_LEVELS[Math.round(level * 4) - 1];
+}
+
+function maxTier(...tiers) {
+  let best = "low";
+  for (const tier of tiers) {
+    if (tier && GI_QUALITY_LEVELS.indexOf(tier) > GI_QUALITY_LEVELS.indexOf(best)) best = tier;
+  }
+  return best;
+}
+
+/**
+ * Screen-space AO resolution is a quality property, not a fixed performance
+ * shortcut. Ultra and High keep one AO estimate per resolve pixel because AO
+ * is cheap relative to the rest of GI and magnifying its spatial pattern is a
+ * disproportionate visual loss. Medium keeps most of that detail at 0.8;
+ * only Low takes the half-resolution path. The global override is
+ * intentionally accepted by the caller and routed through here so probes can
+ * still sweep the whole 0.25..1 range without changing presets.
+ */
+export function giGtaoResolutionScale(quality, requested = Number.NaN) {
+  const override = Number(requested);
+  if (Number.isFinite(override)) return Math.min(1, Math.max(0.25, override));
+  return { low: 0.5, medium: 0.8, high: 1, ultra: 1 }[giQualityTier(quality)];
+}
+
+/**
+ * GTAO coverage by quality tier. Ultra evaluates five fixed angular slices at
+ * every full-resolution pixel while retaining stable radial strata
+ * across neighbours; this avoids both angular stipple and repeated edge bands
+ * without temporal reuse. Quarter-rate tiers distribute both dimensions.
+ */
+export function giGtaoSamplingPreset(quality) {
+  switch (giQualityTier(quality)) {
+    case "ultra": return { slices: 5, steps: 4, spatialJitter: false, filterRadius: 3 };
+    case "high": return { slices: 3, steps: 3, spatialJitter: true, filterRadius: 2 };
+    case "medium": return { slices: 2, steps: 3, spatialJitter: true, filterRadius: 2 };
+    default: return { slices: 2, steps: 2, spatialJitter: true, filterRadius: 2 };
+  }
+}
+
+/** Contact-band reach in cascade-0 intervals. Longer-range visibility already
+ * lives in SRC; the old default of two intervals measured 1.12 m and produced
+ * a visibly detached duplicate silhouette around ordinary props. */
+export function giGtaoRadiusIntervals(requested = Number.NaN) {
+  const value = Number(requested);
+  return Math.max(0.5, Math.min(8, Number.isFinite(value) && value > 0 ? value : 1));
 }
 
 /**
@@ -217,10 +283,12 @@ const CONSTANT = {
   reflections: true,
 
   // "auto" follows the preset through RayHitConfig's AUTO_MODE_BY_QUALITY —
-  // low/medium → hybrid-plane, high/ultra → hybrid-exact-complex. The named
-  // modes are still implemented and still reachable from a harness; they are
-  // simply not an authored choice, because "which intersection test does my
-  // lighting use" is not a question a scene should have an opinion about.
+  // since §10 (2026-09-02) every tier resolves to "bvh": the field-less build
+  // that traces the static BVH8 + movers and allocates no occupancy pyramid.
+  // The named occupancy modes are still implemented and still reachable from
+  // a harness or the component prop; they are simply not an authored choice,
+  // because "which intersection test does my lighting use" is not a question
+  // a scene should have an opinion about.
   rayHitMode: "auto",
   rayHitProfiling: false,
   rayHitSkipDistance: true,
@@ -247,15 +315,16 @@ const CONSTANT = {
   // `__giConfigOverride = { emissiveShadows: false }` remains the hatch.
   emissiveShadows: true,
 
-  // Indirect-only ambient occlusion. ON since 2026-08-21, when the mechanism
-  // changed: the old occupancy-oracle ladder inlined ~200 fetches into the
-  // resolve kernel (§13.7f priced a build that never finished compiling with
-  // it on) and could not darken inside its own 2-voxel self-surface
-  // allowance (§13.7d). `createGiAoPass` is a screen-space pass over the GI
-  // gbuffer instead — a tiny kernel, one texture sample in the resolve, and
-  // contact-scale darkening from exact world positions. It still only ever
-  // modulates the INDIRECT term (direct light keeps its traced shadows), so
-  // the §14 "priced-but-parked contrast lever" finally engages.
+  // Indirect-only ambient occlusion. The shipping `createGiGtaoPass` solves
+  // CONTACT visibility from the full-resolution gbuffer. SRC already carries
+  // long-range blocker visibility, so the occupancy-world experiment is OFF
+  // by default: it removed bounce energy, printed a broad low-frequency mask,
+  // and paid another trace for visibility transport already owns.
+  // `__giWorldAo = true` is the explicit diagnostic opt-in. It remains outside
+  // resolve, binding the existing occupancy buffer only in the AO kernel and
+  // staying inside the portable storage-buffer budget.
+  // AO still only modulates INDIRECT diffuse lighting; direct light and exact
+  // reflection rays retain their traced visibility.
   // `__giConfigOverride = { ao: false }` is the measurement hatch, and the
   // component declares an `ao` toggle (same argument as `reflections`).
   ao: true,
@@ -264,13 +333,11 @@ const CONSTANT = {
   // share leaves the indirect term — the only thing AO modulates — carrying
   // less of the image, so the ceiling has to work harder to read at all.
   //
-  // Radius 0.8 → 0.5 (2026-08-24, "can't see any NOTABLE effect"): 0.8 m is
-  // ABOVE typical probe spacing, so the wide ring reproduced the lattice-
-  // scale shading the field already carries — a broad wash, no contact
-  // definition. 0.5 pulls the wide ring under lattice scale (contact ring
-  // 0.125 m) and pairs with the ring-union + ×3 renormalization fix in
-  // createGiAoPass, which is what actually lets a crevice read DARK.
-  // Both are live uniforms — `__giAoOverride = {strength, radius}` to tune.
+  // `aoRadius` is retained as the component/config mirror, but the shipping
+  // GTAO radius is derived from cascade-0 spacing in #armGtaoPass; metre-scale
+  // constants cannot track scenes with different lattice scales. Strength is
+  // live; `__giVxaoOverride = {strength}` is the shipping-pass measurement
+  // hatch (the slot name is historical).
   // 0.85 → 0.75 same night: with the union actually engaging both rings,
   // 0.85 over-darkened the shadowed side ("started to look bad") — the
   // ceiling now works against a term that finally reaches it.
@@ -318,10 +385,15 @@ const BY_TIER = {
   // it gets mush. Low/medium stay probes-only: that is still the
   // 100-200ms-workload protection for the tiers defined as cheap.
   high: { resolveScale: 0.5, exactReflections: true },
-  // Per-triangle BVH reflections at FULL resolve resolution. As a tier
-  // property it is reachable by choosing the tier, not by a stale checkbox
-  // (the failure mode the old opt-in had).
-  ultra: { resolveScale: 1, exactReflections: true },
+  // Ultra keeps twice HIGH's screen-sample budget (0.7071² / 0.5² = 2), but
+  // no longer traces every physical display pixel. Bistro's 1.6M-pixel full
+  // resolve spent 25–40 ms in screen-sized GI work alone; the position/normal
+  // validated reconstruction already used by every cheaper tier preserves
+  // silhouettes while this scale nearly halves resolve, AO, shadow and exact-
+  // reflection pixels. This is the tier's bounded performance contract: more
+  // samples than HIGH, full world/probe/ray quality, never an unbounded 1:1
+  // screen-space bill.
+  ultra: { resolveScale: Math.SQRT1_2, exactReflections: true },
 };
 
 /**
@@ -337,37 +409,53 @@ const BY_TIER = {
  * where everyone can see it.
  */
 export function resolveGiConfig(props, runtime = globalThis) {
-  const authored = giQualityTier(props?.quality);
-  // Clamped BEFORE anything reads the tier, so every tier-keyed ladder
-  // downstream sees the tier this device can actually run — see
-  // giDeviceTierCeiling. A desktop resolves to `authored` unchanged.
   const ceiling = giDeviceTierCeiling(runtime);
-  const quality = clampTier(authored, ceiling);
-  const settled = { quality, ...CONSTANT, ...BY_TIER[quality] };
-  if (quality !== authored) {
-    settled.qualityClampedFrom = authored;
+  const bounceLevel = giTermLevel(props?.bounce, 1);
+  const aoLevel = giTermLevel(props?.ao, 1);
+  const reflectionsLevel = giTermLevel(props?.reflections, 1);
+  const authoredBounce = giTermTier(bounceLevel) ?? "low";
+  const authoredAo = giTermTier(aoLevel) ?? "low";
+  const authoredReflections = giTermTier(reflectionsLevel) ?? "low";
+  const bounceQuality = clampTier(authoredBounce, ceiling);
+  const aoQuality = clampTier(authoredAo, ceiling);
+  const reflectionsQuality = clampTier(authoredReflections, ceiling);
+  const screenQuality = maxTier(
+    bounceLevel > 0 ? bounceQuality : null,
+    aoLevel > 0 ? aoQuality : null,
+    reflectionsLevel > 0 ? reflectionsQuality : null,
+  );
+  const settled = {
+    quality: bounceQuality,
+    ...CONSTANT,
+    ...BY_TIER[bounceQuality],
+    resolveScale: BY_TIER[screenQuality].resolveScale,
+    exactReflections: reflectionsLevel > 0 && BY_TIER[reflectionsQuality].exactReflections,
+    bounceLevel,
+    aoLevel,
+    reflectionsLevel,
+    bounceQuality,
+    aoQuality,
+    reflectionsQuality,
+    bounce: bounceLevel > 0,
+    ao: aoLevel > 0,
+    reflections: reflectionsLevel > 0,
+  };
+  if (bounceQuality !== authoredBounce || aoQuality !== authoredAo || reflectionsQuality !== authoredReflections) {
+    settled.qualityClampedFrom = maxTier(authoredBounce, authoredAo, authoredReflections);
     // Once per session, not per rebuild: a scene looking different on a phone
     // than on the desktop it was authored on has to be explainable from the
     // console, or it reads as GI being broken on that device.
     if (!warnedClamp) {
       warnedClamp = true;
       console.info(
-        `[gi] quality clamped ${authored} → ${quality} for this device ` +
+        `[gi] one or more GI term qualities were clamped to ${ceiling} for this device ` +
         `(mobile/Apple WebKit tier ceiling — __giDeviceTier = null removes it)`,
       );
     }
   }
-  // ── THE TWO AUTHORED FEATURE TOGGLES (2026-08-21, user request) ──────────
-  //
-  // `ao` and `reflections` join `quality` as component properties, and the
-  // one-knob doctrine survives the addition because they are the same KIND
-  // of thing quality is: each removes a whole term at a whole cost, and
-  // neither can mis-tune anything — the failure the 27-property collapse
-  // exists to prevent. Only an explicit `false` acts; any other stored value
-  // (old scenes, typos) keeps the default ON.
-  if (props?.ao === false) settled.ao = false;
-  if (props?.reflections === false) {
-    settled.reflections = false;
+  // Zero gates the corresponding term. Nonzero positions select real sampling
+  // tiers; they are never interpreted as brightness/strength multipliers.
+  if (!settled.reflections) {
     // No reflections means ALL of them — the ultra tier's exact-BVH mirrors
     // are a reflection before they are a tier feature.
     settled.exactReflections = false;
@@ -395,53 +483,61 @@ export function resolveGiConfig(props, runtime = globalThis) {
 }
 
 /**
- * SKY RADIANCE FROM THE SCENE'S OWN ENVIRONMENT — what a GI ray brings back
- * when it escapes without hitting anything.
+ * SKY RADIANCE FROM THE SCENE — what a GI ray brings back when it escapes
+ * without hitting anything.
  *
- * `scene.environment` is three.js's image-based light and `environmentIntensity`
- * scales it; the Scene Settings panel writes both, and so does the HDRI
- * Environment component. Reading them is what lets GI drop its own sky
- * properties without dropping the sky.
+ * Two sources, in priority order, both written by Scene Settings (and the
+ * legacy HDRI Environment component):
  *
- * NO ENVIRONMENT MEANS NO SKY, exactly. That is not a fallback chosen for
- * tidiness — it is what keeps this change behaviour-identical: `skyIntensity`
- * defaulted to 0, so every existing scene had no sky term, and every existing
- * scene still has none until someone gives it an environment.
+ * 1. `scene.environment` — three.js's image-based light, scaled by
+ *    `environmentIntensity`. The texture's CHROMA is still not read (an
+ *    environment map's average colour needs a 1×1 downsample of the cube map),
+ *    so an HDRI contributes NEUTRAL sky at the right brightness. Per-direction
+ *    colour belongs to the directional-sky bundle (`_giSkyEnvIntensityU`).
  *
- * `scene.background` is deliberately NOT consulted. A background is a backdrop
- * and three itself distinguishes the two — treating the editor's default dark
- * grey as a light source would put a dim ambient into every scene ever made and
- * would break the "sky = 0 asserts exactly 0 lit pixels" gate, which exists
- * because light from nothing is the failure signature this module has shipped
- * three times.
+ * 2. NO ENVIRONMENT TEXTURE — the scene's flat BACKGROUND COLOUR is the sky.
+ *    A colour needs no downsampling, so its chroma IS read here. This is the
+ *    user's "no hdri sky → use the background colour as sky" rule (2026-08-30):
+ *    every scene already shows the colour behind its geometry, and GI lighting
+ *    the escapes with what the camera can plainly see is the honest default.
+ *    The colour is multiplied by `environmentIntensity` too — the same one
+ *    intensity knob both shapes share (sceneSettings writes it even on the
+ *    colour path, where three itself ignores it because there is no IBL).
  *
- * OPEN, AND STATED RATHER THAN HIDDEN: the sky's CHROMA is not read. An
- * environment map's average colour needs a 1×1 downsample of the cube map (a
- * GPU readback, or an average computed when the image decodes), so a sunset
- * HDRI currently contributes NEUTRAL sky at the right brightness. Colour
- * belongs with Phase 5's hit shading, which is where the environment has to be
- * sampled per-direction anyway.
+ * The one gate: `environment.lighting` must be ON (Scene Settings' "Use for
+ * lighting"). It is threaded in by GISystem from `engine.settings` because a
+ * scene with the toggle off must read exactly 0 — the "sky = 0 asserts exactly
+ * 0 lit pixels" gates (gi-gpu-smoke) exist because light from nothing is the
+ * failure signature this module has shipped three times, and every GI fixture
+ * sets `lighting: false` to keep them honest. A caller that passes no settings
+ * (a raw three scene) gets the default-on, matching SCENE_SETTINGS_DEFAULTS.
  *
  * @param {THREE.Scene} scene
  * @param {THREE.Color} out  written in place — this runs per frame
+ * @param {{lighting?: boolean}|null} [envSettings]  scene settings `.environment`
  */
-export function sceneSkyRadiance(scene, out) {
+export function sceneSkyRadiance(scene, out, envSettings = null) {
   const environment = scene?.environment;
-  if (!environment) return out.setRGB(0, 0, 0);
   const intensity = Math.max(0, scene.environmentIntensity ?? 1);
-  return out.setRGB(intensity, intensity, intensity);
+  if (environment) return out.setRGB(intensity, intensity, intensity);
+  const lighting = envSettings ? envSettings.lighting !== false : true;
+  const background = scene?.background;
+  if (lighting && background?.isColor === true) {
+    return out.setRGB(background.r * intensity, background.g * intensity, background.b * intensity);
+  }
+  return out.setRGB(0, 0, 0);
 }
 
 /**
  * The debug overlay, as a developer switch rather than an authored property.
  *
  * "off" | "sdf" | "occupancy" | "src-probes" | "indirect" | "ao" |
- * "reflections". Set `globalThis.__giDebugView` from the console or a
+ * "reflections" | "path-tracer". Set `globalThis.__giDebugView` from the console or a
  * harness. Polled rather than pushed — every reader is already in a per-frame
  * path, and a string compare per frame is cheaper than the change notification
  * would be.
  *
- * The "indirect" / "ao" / "reflections" modes are also reachable from the GI
+ * The "indirect" / "ao" / "reflections" / "path-tracer" modes are also reachable from the GI
  * component's `debugView` prop, which is what an inspector user actually wants
  * (a checkbox beats typing a global). The component prop is a SECOND-PRIORITY
  * source — `globalThis.__giDebugView` still wins, because a harness that

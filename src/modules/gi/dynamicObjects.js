@@ -121,6 +121,11 @@ import {
 import { sharedFn } from "./giFn.js";
 import { resolveMaterialSurface } from "./voxelizeOnce.js";
 import { octDecodeTSL, octEncodeTSL } from "./rayHit/rayHitTSL.js";
+import {
+  STATIC_BVH_FORMAT_PLACEMENT,
+  STATIC_BVH_FORMAT_WORLD,
+  normalizeStaticBvhFormat,
+} from "./staticBvhFormats.js";
 
 export const OBJ_WORDS = 40;
 // Header words 0..15: count + reserved. Words 16..31: the STATIC-BVH
@@ -829,6 +834,368 @@ const bvh8TraceWgsl = wgslFn(/* wgsl */ `
 export function dynBvhArity() {
   return Number(globalThis.__giDynBvhArity) === 4 ? 4 : 8;
 }
+
+// STATIC PLACEMENT BVH (SBV2): a balanced binary TLAS over placement records,
+// each of which points at a shared object-local compressed BVH8. The whole
+// artifact lives in the same occupancy `bits` buffer as the legacy world-space
+// BVH, so this adds no storage binding. All offsets in the SBV2 block are
+// relative to `packedBase`; the mask remains in the dynamic header.
+//
+// One entry point serves both production result shapes. `detail == 0` returns
+// the legacy shadow vec4 (t + world normal); `detail != 0` returns the exact-
+// reflection packing (t, oct normal, UV, slot). Keeping one traversal body is
+// important: shadow, RTAO, reflection-hit shadowing and exact reflections must
+// not acquire subtly different TLAS decoders.
+//
+// The decoder fails closed on a malformed header/region and bounds every stack,
+// loop and indirect word address. Valid production trees are balanced (TLAS
+// depth <= 10 at the 512-slot occupancy cap); the 32-entry TLAS stack therefore
+// retains ample headroom without making corrupt topology unbounded.
+const staticPlacementTraceWgsl = wgslFn(/* wgsl */ `
+	fn giStaticPlacementBvh8(
+		roW: vec3f, rdW: vec3f, tMin: f32, tMax: f32,
+		packedBase: u32, maskBase: u32, detail: u32,
+		bits: ptr<storage, array<u32>, read_write>
+	) -> vec4f {
+		let capacity = arrayLength(bits);
+		if (packedBase > capacity || capacity - packedBase < 16u) {
+			return vec4f(-1.0, 0.0, 0.0, select(1.0, -1.0, detail != 0u));
+		}
+		// "SBV2", version 1. The CPU/disk verifier is the primary integrity
+		// gate; these checks make a stale or torn upload a bounded miss too.
+		if (bits[packedBase] != 0x32564253u || bits[packedBase + 1u] != 1u) {
+			return vec4f(-1.0, 0.0, 0.0, select(1.0, -1.0, detail != 0u));
+		}
+		let total = bits[packedBase + 3u];
+		if (total < 16u || total > capacity - packedBase) {
+			return vec4f(-1.0, 0.0, 0.0, select(1.0, -1.0, detail != 0u));
+		}
+
+		let tlasOffset = bits[packedBase + 4u];
+		let tlasWords = bits[packedBase + 5u];
+		let placementOffset = bits[packedBase + 6u];
+		let placementWords = bits[packedBase + 7u];
+		let blasOffset = bits[packedBase + 8u];
+		let blasWords = bits[packedBase + 9u];
+		let triOffset = bits[packedBase + 10u];
+		let triWords = bits[packedBase + 11u];
+		let uvOffset = bits[packedBase + 12u];
+		let uvWords = bits[packedBase + 13u];
+		let placementCount = bits[packedBase + 15u];
+		if (!giSbSpan(tlasOffset, tlasWords, total) ||
+			!giSbSpan(placementOffset, placementWords, total) ||
+			!giSbSpan(blasOffset, blasWords, total) ||
+			!giSbSpan(triOffset, triWords, total) ||
+			(uvWords != 0u && !giSbSpan(uvOffset, uvWords, total)) ||
+			tlasWords < 8u || tlasWords % 8u != 0u ||
+			placementWords % 24u != 0u || placementCount == 0u ||
+			placementCount > placementWords / 24u ||
+			blasWords < 28u || triWords < 9u) {
+			return vec4f(-1.0, 0.0, 0.0, select(1.0, -1.0, detail != 0u));
+		}
+		if (maskBase > capacity || capacity - maskBase < 16u) {
+			return vec4f(-1.0, 0.0, 0.0, select(1.0, -1.0, detail != 0u));
+		}
+
+		let tlasBase = packedBase + tlasOffset;
+		let placementsBase = packedBase + placementOffset;
+		let blasEnd = packedBase + blasOffset + blasWords;
+		let triEnd = packedBase + triOffset + triWords;
+		let uvEnd = select(0u, packedBase + uvOffset + uvWords, uvWords != 0u);
+		let nodeCount = tlasWords / 8u;
+		let invW = vec3f(1.0 / giSbNz(rdW.x), 1.0 / giSbNz(rdW.y), 1.0 / giSbNz(rdW.z));
+
+		var stack: array<u32, 32>;
+		var stackNear: array<f32, 32>;
+		var sp: i32 = 0;
+		stack[0] = 0u;
+		stackNear[0] = giSbNodeNear(roW, invW, tMin, tMax, tlasBase, bits);
+		var bestT = tMax;
+		var bestN = vec3f(0.0, 0.0, 1.0);
+		var bestSlot = 0xffffffffu;
+		var bestTri = 0u;
+		var bestU = 0.0;
+		var bestV = 0.0;
+		var bestUvBase = 0u;
+		var found = false;
+		var guard = 0u;
+
+		loop {
+			if (sp < 0 || guard >= 2048u) { break; }
+			guard = guard + 1u;
+			let node = stack[sp];
+			let nodeNear = stackNear[sp];
+			sp = sp - 1;
+			if (node >= nodeCount || nodeNear < tMin || nodeNear > bestT) { continue; }
+			let nb = tlasBase + node * 8u;
+			let leftRef = bits[nb + 6u];
+			let rightRef = bits[nb + 7u];
+
+			if ((leftRef & 0x80000000u) != 0u) {
+				// A valid leaf has exactly one placement reference.
+				if (rightRef != 0u) { continue; }
+				let placementIndex = leftRef & 0x7fffffffu;
+				if (placementIndex >= placementCount) { continue; }
+				let pb = placementsBase + placementIndex * 24u;
+				let flags = bits[pb + 21u];
+				if ((flags & 1u) == 0u) { continue; }
+				let slot = bits[pb + 20u];
+				// Production occupancy slots are 0..511. A future wider registry is
+				// conservatively unmasked rather than indexing outside today's mask.
+				if (slot < 512u &&
+					(bits[maskBase + (slot >> 5u)] & (1u << (slot & 31u))) != 0u) {
+					continue;
+				}
+
+				let nodeRel = bits[pb + 16u];
+				let triRel = bits[pb + 17u];
+				let uvRel = bits[pb + 19u];
+				if (nodeRel < blasOffset || nodeRel >= blasOffset + blasWords ||
+					triRel < triOffset || triRel >= triOffset + triWords ||
+					(uvRel != 0u && (uvWords == 0u || uvRel < uvOffset || uvRel >= uvOffset + uvWords))) {
+					continue;
+				}
+
+				let c0 = vec3f(bitcast<f32>(bits[pb]), bitcast<f32>(bits[pb + 1u]), bitcast<f32>(bits[pb + 2u]));
+				let c1 = vec3f(bitcast<f32>(bits[pb + 4u]), bitcast<f32>(bits[pb + 5u]), bitcast<f32>(bits[pb + 6u]));
+				let c2 = vec3f(bitcast<f32>(bits[pb + 8u]), bitcast<f32>(bits[pb + 9u]), bitcast<f32>(bits[pb + 10u]));
+				let c3 = vec3f(bitcast<f32>(bits[pb + 12u]), bitcast<f32>(bits[pb + 13u]), bitcast<f32>(bits[pb + 14u]));
+				let roL = c0 * roW.x + c1 * roW.y + c2 * roW.z + c3;
+				// Deliberately unnormalised: local and world rays retain one t.
+				let rdL = c0 * rdW.x + c1 * rdW.y + c2 * rdW.z;
+				let hit = giSbBlasTrace(
+					roL, rdL, tMin, bestT,
+					packedBase + nodeRel, blasEnd,
+					packedBase + triRel, triEnd, bits
+				);
+				if (hit.t >= tMin &&
+					(hit.t < bestT || (hit.t == bestT && slot < bestSlot))) {
+					bestT = hit.t;
+					let nRaw = normalize(vec3f(dot(c0, hit.n), dot(c1, hit.n), dot(c2, hit.n)));
+					bestN = select(nRaw, -nRaw, dot(nRaw, rdW) > 0.0);
+					bestSlot = slot;
+					bestTri = hit.tri;
+					bestU = hit.u;
+					bestV = hit.v;
+					bestUvBase = select(0u, packedBase + uvRel, uvRel != 0u);
+					found = true;
+				}
+				continue;
+			}
+
+			// Internal refs are nodeIndex+1, preserving zero as empty/invalid.
+			if (leftRef == 0u || rightRef == 0u ||
+				(leftRef & 0x80000000u) != 0u || (rightRef & 0x80000000u) != 0u) {
+				continue;
+			}
+			let left = leftRef - 1u;
+			let right = rightRef - 1u;
+			var leftNear = -1.0;
+			var rightNear = -1.0;
+			if (left < nodeCount) {
+				leftNear = giSbNodeNear(roW, invW, tMin, bestT, tlasBase + left * 8u, bits);
+			}
+			if (right < nodeCount) {
+				rightNear = giSbNodeNear(roW, invW, tMin, bestT, tlasBase + right * 8u, bits);
+			}
+			let leftHit = leftNear >= tMin;
+			let rightHit = rightNear >= tMin;
+			if (leftHit && rightHit) {
+				if (sp <= 29) {
+					let nearNode = select(right, left, leftNear <= rightNear);
+					let farNode = select(left, right, leftNear <= rightNear);
+					let nearT = min(leftNear, rightNear);
+					let farT = max(leftNear, rightNear);
+					sp = sp + 1;
+					stack[sp] = farNode;
+					stackNear[sp] = farT;
+					sp = sp + 1;
+					stack[sp] = nearNode;
+					stackNear[sp] = nearT;
+				}
+			} else if ((leftHit || rightHit) && sp < 31) {
+				sp = sp + 1;
+				stack[sp] = select(right, left, leftHit);
+				stackNear[sp] = select(rightNear, leftNear, leftHit);
+			}
+		}
+
+		if (!found) {
+			return vec4f(-1.0, 0.0, 0.0, select(1.0, -1.0, detail != 0u));
+		}
+		if (detail == 0u) { return vec4f(bestT, bestN); }
+
+		let oe = giSbOctEnc(bestN) * 0.5 + vec2f(0.5);
+		let nq = vec2u(clamp(oe, vec2f(0.0), vec2f(0.99999)) * 4095.0);
+		var uv = vec2f(0.5);
+		if (bestUvBase != 0u && bestUvBase <= uvEnd && bestTri <= (uvEnd - bestUvBase) / 3u &&
+			uvEnd - bestUvBase >= 3u && bestTri < (uvEnd - bestUvBase) / 3u) {
+			let uw = bestUvBase + bestTri * 3u;
+			let uv0 = unpack2x16float(bits[uw]);
+			let uv1 = unpack2x16float(bits[uw + 1u]);
+			let uv2 = unpack2x16float(bits[uw + 2u]);
+			uv = uv0 * (1.0 - bestU - bestV) + uv1 * bestU + uv2 * bestV;
+		}
+		let fuv = fract(uv);
+		let uq = vec2u(clamp(fuv, vec2f(0.0), vec2f(0.99999)) * 4095.0);
+		return vec4f(bestT, f32(nq.x * 4096u + nq.y), f32(uq.x * 4096u + uq.y), f32(bestSlot));
+	}
+
+	struct GiSbBlasHit {
+		t: f32,
+		n: vec3f,
+		tri: u32,
+		u: f32,
+		v: f32,
+	}
+
+	fn giSbSpan(offset: u32, count: u32, total: u32) -> bool {
+		return offset <= total && count <= total - offset;
+	}
+
+	fn giSbNz(x: f32) -> f32 {
+		if (abs(x) < 1e-9) { return select(-1e-9, 1e-9, x >= 0.0); }
+		return x;
+	}
+
+	fn giSbNodeNear(
+		ro: vec3f, inv: vec3f, tMin: f32, tMax: f32, nb: u32,
+		bits: ptr<storage, array<u32>, read_write>
+	) -> f32 {
+		let bmin = vec3f(bitcast<f32>(bits[nb]), bitcast<f32>(bits[nb + 1u]), bitcast<f32>(bits[nb + 2u]));
+		let bmax = vec3f(bitcast<f32>(bits[nb + 3u]), bitcast<f32>(bits[nb + 4u]), bitcast<f32>(bits[nb + 5u]));
+		let a = (bmin - ro) * inv;
+		let b = (bmax - ro) * inv;
+		let near = min(a, b);
+		let far = max(a, b);
+		let enter = max(max(near.x, near.y), max(near.z, tMin));
+		let exit = min(min(far.x, far.y), min(far.z, tMax));
+		return select(-1.0, enter, exit >= enter);
+	}
+
+	fn giSbBlasTrace(
+		roL: vec3f, rdL: vec3f, tMin: f32, tMax: f32,
+		nodeBase: u32, nodeEnd: u32, triBase: u32, triEnd: u32,
+		bits: ptr<storage, array<u32>, read_write>
+	) -> GiSbBlasHit {
+		var stack: array<u32, 44>;
+		var sp: i32 = 0;
+		stack[0] = 1u;
+		var bestT = tMax;
+		var bestN = vec3f(0.0, 0.0, 1.0);
+		var bestTri = 0u;
+		var bestU = 0.0;
+		var bestV = 0.0;
+		var found = false;
+		let inv = vec3f(1.0 / giSbNz(rdL.x), 1.0 / giSbNz(rdL.y), 1.0 / giSbNz(rdL.z));
+		var guard = 0u;
+		loop {
+			if (sp < 0 || guard >= 768u) { break; }
+			guard = guard + 1u;
+			let nref = stack[sp];
+			sp = sp - 1;
+			if (nref == 0u) { continue; }
+			if ((nref & 0x80000000u) != 0u) {
+				let triStart = nref & 0x00ffffffu;
+				let triCount = (nref >> 24u) & 0x7fu;
+				let triCapacity = select(0u, (triEnd - triBase) / 9u, triBase <= triEnd);
+				for (var j = 0u; j < triCount; j = j + 1u) {
+					let tri = triStart + j;
+					if (tri >= triCapacity) { continue; }
+					let tw = triBase + tri * 9u;
+					let a = vec3f(bitcast<f32>(bits[tw]), bitcast<f32>(bits[tw + 1u]), bitcast<f32>(bits[tw + 2u]));
+					let b = vec3f(bitcast<f32>(bits[tw + 3u]), bitcast<f32>(bits[tw + 4u]), bitcast<f32>(bits[tw + 5u]));
+					let c = vec3f(bitcast<f32>(bits[tw + 6u]), bitcast<f32>(bits[tw + 7u]), bitcast<f32>(bits[tw + 8u]));
+					let e1 = b - a;
+					let e2 = c - a;
+					let h = cross(rdL, e2);
+					let det = dot(e1, h);
+					if (abs(det) < 1e-10) { continue; }
+					let invDet = 1.0 / det;
+					let s = roL - a;
+					let u = dot(s, h) * invDet;
+					let q = cross(s, e1);
+					let v = dot(rdL, q) * invDet;
+					let t = dot(e2, q) * invDet;
+					if (u >= -1e-4 && v >= -1e-4 && u + v <= 1.0001 && t > tMin && t < bestT) {
+						bestT = t;
+						bestN = cross(e1, e2);
+						bestTri = tri;
+						bestU = u;
+						bestV = v;
+						found = true;
+					}
+				}
+				continue;
+			}
+
+			let nodeIndex = nref - 1u;
+			if (nodeBase > nodeEnd || nodeIndex >= (nodeEnd - nodeBase) / 28u) { continue; }
+			let nb = nodeBase + nodeIndex * 28u;
+			let org = vec3f(bitcast<f32>(bits[nb]), bitcast<f32>(bits[nb + 1u]), bitcast<f32>(bits[nb + 2u]));
+			let ep = bits[nb + 3u];
+			let step = vec3f(
+				exp2(f32(i32(ep & 0xffu) - 128)),
+				exp2(f32(i32((ep >> 8u) & 0xffu) - 128)),
+				exp2(f32(i32((ep >> 16u) & 0xffu) - 128))
+			);
+			var childNear: array<f32, 8>;
+			var childRef: array<u32, 8>;
+			var childCount: i32 = 0;
+			for (var child = 0u; child < 8u; child = child + 1u) {
+				let cref = bits[nb + 4u + child];
+				if (cref == 0u) { continue; }
+				let qa = bits[nb + 12u + child * 2u];
+				let qb = bits[nb + 13u + child * 2u];
+				let bmin = org + vec3f(f32(qa & 0xffu), f32((qa >> 8u) & 0xffu), f32((qa >> 16u) & 0xffu)) * step;
+				let bmax = org + vec3f(f32((qa >> 24u) & 0xffu), f32(qb & 0xffu), f32((qb >> 8u) & 0xffu)) * step;
+				let a = (bmin - roL) * inv;
+				let b = (bmax - roL) * inv;
+				let near = min(a, b);
+				let far = max(a, b);
+				let enter = max(max(near.x, near.y), max(near.z, tMin));
+				let exit = min(min(far.x, far.y), min(far.z, bestT));
+				if (exit < enter) { continue; }
+				childNear[childCount] = enter;
+				childRef[childCount] = cref;
+				childCount = childCount + 1;
+			}
+			for (var i: i32 = 1; i < childCount; i = i + 1) {
+				let keyNear = childNear[i];
+				let keyRef = childRef[i];
+				var j = i - 1;
+				loop {
+					if (j < 0 || childNear[j] <= keyNear) { break; }
+					childNear[j + 1] = childNear[j];
+					childRef[j + 1] = childRef[j];
+					j = j - 1;
+				}
+				childNear[j + 1] = keyNear;
+				childRef[j + 1] = keyRef;
+			}
+			for (var i = childCount - 1; i >= 0; i = i - 1) {
+				if (sp >= 43) { break; }
+				sp = sp + 1;
+				stack[sp] = childRef[i];
+			}
+		}
+		return GiSbBlasHit(select(-1.0, bestT, found), bestN, bestTri, bestU, bestV);
+	}
+
+	fn giSbOctEnc(n: vec3f) -> vec2f {
+		let l1 = 1.0 / max(abs(n.x) + abs(n.y) + abs(n.z), 1e-12);
+		let x = n.x * l1;
+		let y = n.y * l1;
+		if (n.z < 0.0) {
+			return vec2f(
+				(1.0 - abs(y)) * select(-1.0, 1.0, x >= 0.0),
+				(1.0 - abs(x)) * select(-1.0, 1.0, y >= 0.0)
+			);
+		}
+		return vec2f(x, y);
+	}
+
+`);
 
 // STATIC-SCENE traversal: identical to giDynBvh8 except stride-10 triangles
 // whose 10th word is an occupancy-slot id checked against a 512-bit disable
@@ -1676,7 +2043,10 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
             const nW = vec3(comp(c0), comp(c1), comp(c2)).mul(s).normalize().toVar();
             const oct = octEncodeTSL(nW).mul(0.5).add(0.5).toVar();
             bestT.assign(enter);
-            bestHit.assign(1);
+            // §11.15: a ray born INSIDE the box (its entry is behind the
+            // origin) is a hit at tMin whose normal faces the ray — flag it 2
+            // so a consumer can tell it from a real front face. See srcBvhTrace.
+            bestHit.assign(select(tEnter.lessThan(t0), float(2), float(1)));
             bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
             // The OBB branch already HAS the card slot: `axis` is the entry
             // face's axis and `s` its outward local sign, which is exactly
@@ -1706,7 +2076,10 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
                 const nW = select(nRaw.dot(d).greaterThan(0), nRaw.negate(), nRaw).toVar();
                 const oct = octEncodeTSL(nW).mul(0.5).add(0.5).toVar();
                 bestT.assign(r.x);
-                bestHit.assign(1);
+                // §11.15: the hit flag carries the RAW side — 1 reached from
+                // outside, 2 from inside (the normal above is flipped to face
+                // the ray, so this is the only place the sign survives).
+                bestHit.assign(select(nRaw.dot(d).greaterThan(0), float(2), float(1)));
                 bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
                 // `nL`, NOT `nRaw`/`nW`: object space, and before the
                 // double-sided flip. The cards face outward.
@@ -1724,7 +2097,10 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
               const nW = select(nRaw.dot(d).greaterThan(0), nRaw.negate(), nRaw).toVar();
               const oct = octEncodeTSL(nW).mul(0.5).add(0.5).toVar();
               bestT.assign(rs.x);
-              bestHit.assign(1);
+              // §11.15: 1 outside, 2 inside — see the mesh branch. The sphere
+              // intersector's inside case reports the hit AT tMin with the
+              // normal facing the ray, so that case is read off the distance.
+              bestHit.assign(select(nRaw.dot(d).greaterThan(0).or(rs.x.lessThanEqual(t0)), float(2), float(1)));
               bestCode.assign(oct.x.mul(4095).floor().mul(4096).add(oct.y.mul(4095).floor()));
               // Same rule as the BVH branch: the UNFLIPPED object-space normal.
               if (objId) bestObj.assign(i.toFloat().mul(OBJ_SLOT_STRIDE).add(cardSlotFromLocalNormal(nL)));
@@ -1771,9 +2147,15 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
      * region that still holds the previous build is the same garbage-read as
      * the stale-literal bug this replaced.
      */
-    attachStaticBvh({ nodeBase, triBase, uvBase = 0 }) {
-      set.staticBvh = { nodeBase, triBase, uvBase };
-      staticNodeBaseUniform.value = nodeBase >>> 0;
+    attachStaticBvh({ nodeBase, triBase = 0, uvBase = 0, format = STATIC_BVH_FORMAT_WORLD, base = null }) {
+      const selectedFormat = normalizeStaticBvhFormat(format);
+      // SBV2 points this uniform at its 16-word header. Legacy retains the
+      // historical meaning: the first compressed world-space BVH8 node.
+      const rootBase = selectedFormat === STATIC_BVH_FORMAT_PLACEMENT
+        ? Number(base ?? nodeBase) >>> 0
+        : Number(nodeBase) >>> 0;
+      set.staticBvh = { nodeBase: rootBase, triBase, uvBase, format: selectedFormat, base: rootBase };
+      staticNodeBaseUniform.value = rootBase;
       staticTriBaseUniform.value = triBase >>> 0;
       staticUvBaseUniform.value = uvBase >>> 0;
     },
@@ -1914,6 +2296,16 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     traceStaticBvh(origin, dir, tMin, tMax, { anyHit = globalThis.__giShadowAnyHit !== false } = {}) {
       const info = set.staticBvh;
       if (!info) return null;
+      if (info.format === STATIC_BVH_FORMAT_PLACEMENT) {
+        // detail=0 preserves the legacy shadow result (t + world normal).
+        // The shipped legacy traversal computes the closest blocker even when
+        // anyHit is requested; SBV2 deliberately preserves that visible
+        // blocker-distance contract.
+        return staticPlacementTraceWgsl(
+          vec3(origin), vec3(dir), float(tMin), float(tMax),
+          staticNodeBaseUniform, uint(baseWord + STATIC_MASK_WORD_BASE), uint(0), bits,
+        ).toVar();
+      }
       // `info` gates COMPILATION (no BVH ⇒ the arm is not emitted at all); the
       // bases themselves come from the uniforms, so a later rebuild moves them
       // without a recompile.
@@ -1937,6 +2329,12 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
     traceStaticBvhSlot(origin, dir, tMin, tMax) {
       const info = set.staticBvh;
       if (!info) return null;
+      if (info.format === STATIC_BVH_FORMAT_PLACEMENT) {
+        return staticPlacementTraceWgsl(
+          vec3(origin), vec3(dir), float(tMin), float(tMax),
+          staticNodeBaseUniform, uint(baseWord + STATIC_MASK_WORD_BASE), uint(1), bits,
+        ).toVar();
+      }
       return bvh8ClosestSlotTraceWgsl(
         vec3(origin), vec3(dir), float(tMin), float(tMax),
         staticNodeBaseUniform, staticTriBaseUniform, staticUvBaseUniform,
@@ -2275,7 +2673,12 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       if (pw) args.push(float(opts.penWidth));
       if (excl) args.push(vec3(opts.excludePoint));
       const packed = fn(...args).toVar();
-      const hit = packed.x.toVar();
+      // §11.15: x is 0 miss / 1 hit from outside / 2 hit from INSIDE the
+      // mover. `hit` stays the 0/1 every consumer tests; `inside` is the
+      // new bit (a ray born inside a skinned capsule — the deposit drops it).
+      const hitRaw = packed.x.toVar();
+      const hit = select(hitRaw.greaterThan(0.5), float(1), float(0)).toVar();
+      const inside = hitRaw.greaterThan(1.5).toVar();
       const t = packed.y.toVar();
       // Shared slot: the pen accumulator, or the PACKED winner
       // (`objIndex*OBJ_SLOT_STRIDE + cardSlot`, < 0 on a miss) when the caller
@@ -2291,7 +2694,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         vec3(dir).negate(),
         octDecodeTSL(vec2(ox, oy)),
       ).toVar();
-      return { hit, t, pen: penOut, normal, obj };
+      return { hit, t, pen: penOut, normal, obj, inside };
     },
 
     /**

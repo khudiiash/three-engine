@@ -233,7 +233,7 @@ export function SceneSettingsPanel() {
       </div>
 
       <Section id="scene.environment" title="Environment">
-        <Row label="Background" hint="Shows wherever the sky is off.">
+        <Row label="Background" hint="Shows wherever the sky is off. With no sky asset set, it is also the color GI lights the scene with.">
           <Color
             value={settings.background}
             onChange={(v) => commit({ background: v }, "Change background")}
@@ -255,7 +255,7 @@ export function SceneSettingsPanel() {
         </Row>
         <Row
           label="Sky"
-          hint="A .cubemap or an HDRI (.hdr/.exr). Drives both the skybox and image-based lighting."
+          hint="A .cubemap or an HDRI (.hdr/.exr). Empty = the background color is the sky."
         >
           <AssetField
             descriptor={{ exts: ENVIRONMENT_EXTENSIONS, emptyLabel: "None" }}
@@ -265,27 +265,42 @@ export function SceneSettingsPanel() {
         </Row>
         {legacyEnv && <LegacyEnvironmentNote entity={legacyEnv} />}
         {env.cubemap && (
+          <Row label="Show as sky" sub>
+            <Toggle
+              checked={env.background !== false}
+              onChange={(v) => commitEnv({ background: v }, "Toggle skybox")}
+            />
+          </Row>
+        )}
+        {/* Not cubemap-gated on purpose: with no sky asset the background
+            color IS the sky, and this toggle is what turns that into GI
+            light — off leaves the scene lit by lamps alone. */}
+        <Row
+          label="Use for lighting"
+          sub
+          hint={
+            env.cubemap
+              ? "Light the scene with the sky (through GI when the GI component is on)."
+              : "No sky asset — the background color lights the scene through GI instead."
+          }
+        >
+          <Toggle
+            checked={env.lighting !== false}
+            onChange={(v) => commitEnv({ lighting: v }, "Toggle environment lighting")}
+          />
+        </Row>
+        {(env.cubemap || env.lighting !== false) && (
+          <Row label="Intensity" sub>
+            <NumberInput
+              value={env.intensity ?? 1}
+              min={0}
+              step={0.05}
+              onCommit={(v) => commitEnv({ intensity: v }, "Change environment intensity")}
+            />
+          </Row>
+        )}
+        {env.cubemap && (
           <>
-            <Row label="Show as sky" sub>
-              <Toggle
-                checked={env.background !== false}
-                onChange={(v) => commitEnv({ background: v }, "Toggle skybox")}
-              />
-            </Row>
-            <Row label="Use for lighting" sub>
-              <Toggle
-                checked={env.lighting !== false}
-                onChange={(v) => commitEnv({ lighting: v }, "Toggle environment lighting")}
-              />
-            </Row>
-            <Row label="Intensity" sub>
-              <NumberInput
-                value={env.intensity ?? 1}
-                min={0}
-                step={0.05}
-                onCommit={(v) => commitEnv({ intensity: v }, "Change environment intensity")}
-              />
-            </Row>
             <Row label="Rotation" sub>
               <NumberInput
                 value={env.rotation ?? 0}

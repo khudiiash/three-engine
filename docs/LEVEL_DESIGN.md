@@ -211,7 +211,7 @@ clean either way.
 
 ## Making it walkable
 
-Each piece gets a sibling `Collider` with `shape: "mesh"` — a trimesh built
+Each piece gets a sibling `Collider` with `shape: "concave"` — a trimesh built
 from the rendered geometry at play start. Not a box, because a staircase and a
 wall with a door are not boxes, and because a trimesh re-derives itself when the
 piece is resized, so collision can never drift from the picture.

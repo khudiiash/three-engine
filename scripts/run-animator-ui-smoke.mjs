@@ -26,7 +26,9 @@ import { installTauriShim } from "./lib/tauriShim.mjs";
 
 const url = process.argv[2] ?? "http://localhost:5202/";
 const ROOT = path.join(os.tmpdir(), "animator-ui-smoke").replaceAll("\\", "/");
+const BROWSER_PROFILE = path.join(os.tmpdir(), "animator-ui-smoke-browser").replaceAll("\\", "/");
 const ANIM = `${ROOT}/anim/Locomotion.anim`;
+const MODEL = `${ROOT}/models/CharacterModel.glb`;
 
 let passed = 0;
 let failed = 0;
@@ -48,8 +50,14 @@ const readAnim = () => JSON.parse(fs.readFileSync(ANIM, "utf8"));
 /* -------------------------------------------------------------------------- */
 
 fs.rmSync(ROOT, { recursive: true, force: true });
+fs.rmSync(BROWSER_PROFILE, { recursive: true, force: true });
 fs.mkdirSync(path.join(ROOT, "scenes"), { recursive: true });
 fs.mkdirSync(path.join(ROOT, "anim"), { recursive: true });
+fs.mkdirSync(path.join(ROOT, "models"), { recursive: true });
+fs.copyFileSync(
+  path.resolve("src/modules/character-controller/assets/CharacterModel.glb"),
+  MODEL,
+);
 fs.writeFileSync(
   path.join(ROOT, "project.json"),
   JSON.stringify({ name: "AnimUiSmoke", version: 1, lastScene: "scenes/Anim.scene", modules: [] }, null, 2),
@@ -65,7 +73,7 @@ fs.writeFileSync(
       ],
       states: [
         { id: "idle", name: "Idle", clip: "Idle", speed: 1, loop: true, x: 240, y: 120 },
-        { id: "move", name: "Move", clip: "Walk", speed: 1, loop: true, x: 460, y: 120 },
+        { id: "move", name: "Move", clip: "Running", speed: 1, loop: true, x: 460, y: 120 },
       ],
       startTransitions: [{ id: "st1", to: "idle", conditions: [] }],
       transitions: [
@@ -83,7 +91,18 @@ fs.writeFileSync(
       version: 1,
       name: "Anim",
       settings: { background: "#202329", ambientColor: "#ffffff", ambientIntensity: 0.6, shadows: false },
-      entities: [],
+      entities: [{
+        id: "character",
+        name: "Character",
+        position: [0, 0, 0],
+        rotation: [0, 0, 0],
+        scale: [1, 1, 1],
+        components: [
+          { type: "model", props: { path: MODEL } },
+          { type: "animation", props: { controller: ANIM, playInEditor: true } },
+        ],
+        children: [],
+      }],
     },
     null,
     2,
@@ -94,12 +113,16 @@ fs.writeFileSync(
 
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  userDataDir: BROWSER_PROFILE,
   headless: process.env.HEADED ? false : "new",
   args: ["--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage"],
 });
 const page = await browser.newPage();
 await page.setViewport({ width: 1600, height: 1000, deviceScaleFactor: 1 });
-await installTauriShim(page, { writableRoot: ROOT });
+await installTauriShim(page, {
+  writableRoot: ROOT,
+  extraCommands: { probe_kimodo_tool: async () => "C:/auto-discovered/kimodo.cpp" },
+});
 
 const pageErrors = [];
 // Stack, not just message: "Cannot read properties of null" names no file, and
@@ -171,6 +194,29 @@ const save = async () => {
   await settle(600);
 };
 
+console.log("\nmotion generation surface");
+const generateButton = await page.$(".animator-panel .panel-toolbar .toolbar-btn:nth-child(2)");
+check("Generate is available when an asset-selected controller has a bound character", !!generateButton && !(await generateButton.evaluate((button) => button.disabled)));
+await clickText(".animator-panel .panel-toolbar .toolbar-btn", "Generate");
+await page.waitForSelector(".motion-dialog", { timeout: 5000 });
+await settle(300);
+const motionDialog = await page.evaluate(() => ({
+  title: document.querySelector(".motion-dialog h3")?.textContent.trim(),
+  prompt: !!document.querySelector('.motion-dialog textarea[aria-label="Motion prompt"]'),
+  pathField: [...document.querySelectorAll(".motion-dialog input")].some((input) => /kimodo|folder|path/i.test(`${input.placeholder} ${input.getAttribute("aria-label")}`)),
+  advancedVisible: !!document.querySelector(".motion-advanced"),
+  runtime: document.querySelector(".motion-runtime")?.textContent.trim(),
+  height: Math.round(document.querySelector(".motion-dialog")?.getBoundingClientRect().height ?? 0),
+}));
+check("dialog is prompt-first and compact", motionDialog.title === "Generate animation" && motionDialog.prompt && motionDialog.height < 390, JSON.stringify(motionDialog));
+check("no Kimodo path field is exposed", !motionDialog.pathField);
+check("advanced controls stay out of the initial layout", !motionDialog.advancedVisible);
+check("the local runtime is discovered without input", motionDialog.runtime === "Local model ready", motionDialog.runtime);
+await page.screenshot({ path: path.join(ROOT, "motion-dialog.png") });
+await page.click(".motion-dialog-close");
+await settle(250);
+check("dialog closes cleanly", !(await page.$(".motion-dialog")));
+
 console.log("\nv1 → v2 migration");
 
 const layerNames = await page.$$eval(".anim-layer-row .text-field", (els) => els.map((e) => e.value));
@@ -190,6 +236,12 @@ check("merely opening a v1 controller does not rewrite it", readAnim().version =
 console.log("\nblend trees");
 
 // Select the Move state and turn it into a 1D blend tree.
+// Explicit state audition must work even if continuous editor playback is
+// disabled on the component: a click is an instruction to play, not a passive
+// selection highlight.
+await page.evaluate(() => {
+  globalThis.__engine.entities.get("character").getComponent("animation").setProp("playInEditor", false);
+});
 //
 // A REAL mouse click, not a synthesized MouseEvent: React Flow selects through
 // d3-drag, which reads `event.view.document` off the event it is handed and
@@ -204,6 +256,13 @@ const moveBox = await page.evaluate(() => {
 if (!moveBox) throw new Error("the Move node never rendered");
 await page.mouse.click(moveBox.x, moveBox.y);
 await settle(500);
+const clickedPreview = await page.evaluate(() => {
+  const animation = globalThis.__engine.entities.get("character").getComponent("animation");
+  const layer = animation.runtime?.layers?.[0];
+  const state = layer?.states?.get("move");
+  return { current: animation.currentState, time: state?.entries?.[0]?.action?.time ?? 0 };
+});
+check("clicking a state plays it in the editor", clickedPreview.current === "Move" && clickedPreview.time > 0, JSON.stringify(clickedPreview));
 const stateSectionOpen = await page.$(".animator-sidebar .inspector-section");
 check("selecting a state opens its section", !!stateSectionOpen);
 
@@ -271,6 +330,57 @@ await clickText(".animator-panel .panel-toolbar .toolbar-btn", "State");
 await settle(500);
 const upperStates = await text(".animator-panel .shader-node.cat-anim .shader-node-label");
 check("a state can be added to the upper layer", upperStates.length === 1, upperStates.join(", "));
+const upperBox = await page.evaluate(() => {
+  const node = [...document.querySelectorAll(".react-flow__node")].find((n) => n.textContent.includes("State 1"));
+  if (!node) return null;
+  const r = node.getBoundingClientRect();
+  return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+});
+if (!upperBox) throw new Error("the upper-layer state never rendered");
+await page.mouse.click(upperBox.x, upperBox.y);
+await settle(400);
+const upperPreview = await page.evaluate(() => {
+  const animation = globalThis.__engine.entities.get("character").getComponent("animation");
+  const layer = animation.runtime?.layers?.[1];
+  const state = layer?.currentId ? layer.states.get(layer.currentId) : null;
+  const action = state?.entries?.[0]?.action;
+  return {
+    current: animation.getLayerStates()[1],
+    weight: layer?.weight ?? 0,
+    clip: state?.state?.clip ?? "",
+    entries: state?.entries?.length ?? 0,
+    time: action?.time ?? 0,
+    timeScale: action?.timeScale ?? 0,
+    enabled: action?.enabled ?? false,
+    paused: action?.paused ?? false,
+    mixerTime: animation.mixer?.time ?? 0,
+    audition: animation.editorAudition,
+  };
+});
+check("clicking a state on any layer auditions that layer", upperPreview.current === "State 1" && upperPreview.weight === 1 && upperPreview.time > 0, JSON.stringify(upperPreview));
+
+await save();
+const upperAfterSave = await page.evaluate(() => {
+  const animation = globalThis.__engine.entities.get("character").getComponent("animation");
+  const layer = animation.runtime?.layers?.[1];
+  const state = layer?.currentId ? layer.states.get(layer.currentId) : null;
+  return { current: animation.getLayerStates()[1], time: state?.entries?.[0]?.action?.time ?? 0, audition: animation.editorAudition };
+});
+check(
+  "saving or autosaving the graph keeps its state audition alive",
+  upperAfterSave.current === "State 1" && upperAfterSave.audition && upperAfterSave.time > upperPreview.time,
+  JSON.stringify(upperAfterSave),
+);
+const restoredUpperWeight = await page.evaluate(() => {
+  const animation = globalThis.__engine.entities.get("character").getComponent("animation");
+  animation.cancelEditorPreview();
+  return { weight: animation.runtime?.layers?.[1]?.weight, audition: animation.editorAudition };
+});
+check(
+  "ending the audition restores the layer's authored weight",
+  restoredUpperWeight.weight === 0 && !restoredUpperWeight.audition,
+  JSON.stringify(restoredUpperWeight),
+);
 
 await page.evaluate(() => document.querySelectorAll(".anim-layer-row")[0]?.click());
 await settle(600);
@@ -297,9 +407,8 @@ check(
     (await page.$$eval(".anim-layer-row", (rows) => !rows[0].querySelector(".anim-layer-controls"))),
 );
 
-// The mask editor opens off the layer row. With no rigged model in the scene
-// it must say so rather than render an empty checklist that looks like a rig
-// with no bones.
+// The mask editor resolves the skeleton from the controller's bound model even
+// though the controller asset, rather than the character, is selected.
 await page.evaluate(() => {
   const row = document.querySelectorAll(".anim-layer-row")[1];
   [...row.querySelectorAll(".anim-layer-controls .toolbar-btn")]
@@ -311,8 +420,8 @@ const maskOpen = await page.$(".anim-mask-editor");
 check("the Mask button opens the avatar-mask editor", !!maskOpen);
 const maskBody = await page.$eval(".anim-mask-editor", (el) => el.textContent);
 check(
-  "...and explains itself when there's no skeleton to list",
-  /No skeleton in the scene/.test(maskBody),
+  "...and resolves the bound character's skeleton",
+  /mixamorigHips/.test(maskBody) && !/No skeleton in the scene/.test(maskBody),
   maskBody.slice(0, 60),
 );
 await page.evaluate(() => document.querySelector(".anim-mask-editor .section-header button")?.click());
@@ -382,4 +491,5 @@ check("no uncaught errors while driving the panel", realErrors.length === 0, rea
 console.log(`\n${passed} passed, ${failed} failed`);
 await browser.close();
 if (!process.env.KEEP) fs.rmSync(ROOT, { recursive: true, force: true });
+fs.rmSync(BROWSER_PROFILE, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

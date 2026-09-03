@@ -377,6 +377,20 @@ export class LightComponent extends Component {
     // Point/spot sources have a world-space radius instead of an angular size,
     // and shadowRadius is the row the inspector already keeps visible for them.
     d.giSourceRadius = Math.max(0, this.props.shadowRadius ?? 0);
+    // §11.10 — THE SHADOW MAPS THIS LIGHT RENDERS, for the GI transport's sun
+    // visibility at hits (plan §11.10: a depth-texture read replaces one of
+    // the three BVH descents every probe ray paid). A function, evaluated per
+    // frame: under CSM the map-owning shadows are the cascades' (the parent
+    // light's own map is never rendered — shadowFreeze.js's header), and the
+    // CSM node is created after this contract is first published. Near cascade
+    // first, so a consumer that takes the first containing frustum gets the
+    // tightest map. Empty for lights whose shadows the GI module traces itself.
+    d.giShadowMaps = () => {
+      if (!this.light?.isDirectionalLight || !this.light.shadow || !this.props.castShadow) return [];
+      if (d.giShadowMode === "gi") return [];
+      const cascades = this.#csm?.lights?.map((cascadeLight) => cascadeLight.shadow) ?? null;
+      return cascades && cascades.length ? cascades : [this.light.shadow];
+    };
   }
 
   /**

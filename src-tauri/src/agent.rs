@@ -38,7 +38,7 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-fn no_window_command(program: &str) -> Command {
+pub(crate) fn no_window_command(program: &str) -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(program);
     #[cfg(windows)]
@@ -76,7 +76,12 @@ fn kill_pid(pid: u32) {
     #[cfg(windows)]
     let (bin, args) = (
         "taskkill",
-        vec!["/PID".to_string(), pid.to_string(), "/T".to_string(), "/F".to_string()],
+        vec![
+            "/PID".to_string(),
+            pid.to_string(),
+            "/T".to_string(),
+            "/F".to_string(),
+        ],
     );
     #[cfg(not(windows))]
     let (bin, args) = ("kill", vec!["-KILL".to_string(), pid.to_string()]);
@@ -91,7 +96,12 @@ fn kill_pid(pid: u32) {
 
 /// Reads `pipe` line by line, emitting one `agent://line` event per line.
 /// Stops silently on EOF, a read error, or a failed emit (the window is gone).
-fn spawn_reader(app: AppHandle, id: String, stream: &'static str, pipe: impl std::io::Read + Send + 'static) {
+fn spawn_reader(
+    app: AppHandle,
+    id: String,
+    stream: &'static str,
+    pipe: impl std::io::Read + Send + 'static,
+) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(pipe);
         let mut line = String::new();
@@ -100,11 +110,17 @@ fn spawn_reader(app: AppHandle, id: String, stream: &'static str, pipe: impl std
             match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    let text = line.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
+                    let text = line
+                        .trim_end_matches(|c| c == '\r' || c == '\n')
+                        .to_string();
                     if app
                         .emit(
                             "agent://line",
-                            AgentLine { id: id.clone(), stream, line: text },
+                            AgentLine {
+                                id: id.clone(),
+                                stream,
+                                line: text,
+                            },
                         )
                         .is_err()
                     {
@@ -176,7 +192,10 @@ pub fn agent_run(
         }
         let _ = wait_app.emit(
             "agent://exit",
-            AgentExit { id, code: status.ok().and_then(|s| s.code()) },
+            AgentExit {
+                id,
+                code: status.ok().and_then(|s| s.code()),
+            },
         );
     });
 
@@ -234,7 +253,10 @@ mod tests {
         );
 
         let status = child.wait().expect("wait");
-        assert!(status.success(), "expected a zero exit code, got {status:?}");
+        assert!(
+            status.success(),
+            "expected a zero exit code, got {status:?}"
+        );
         assert_eq!(status.code(), Some(0));
     }
 
@@ -253,9 +275,15 @@ mod tests {
         // before `kill_pid` ever ran, and a dead process still satisfies
         // `try_wait() == Ok(Some(_))`. `ping` is unambiguous on both sides.
         let mut child = if cfg!(windows) {
-            no_window_command("ping").args(["-n", "31", "127.0.0.1"]).stdout(Stdio::null()).spawn()
+            no_window_command("ping")
+                .args(["-n", "31", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .spawn()
         } else {
-            no_window_command("sh").args(["-c", "sleep 30"]).stdout(Stdio::null()).spawn()
+            no_window_command("sh")
+                .args(["-c", "sleep 30"])
+                .stdout(Stdio::null())
+                .spawn()
         }
         .expect("spawn");
 
@@ -275,7 +303,10 @@ mod tests {
             if let Ok(Some(_status)) = child.try_wait() {
                 break;
             }
-            assert!(Instant::now() < deadline, "kill_pid did not terminate the process within 10s");
+            assert!(
+                Instant::now() < deadline,
+                "kill_pid did not terminate the process within 10s"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }

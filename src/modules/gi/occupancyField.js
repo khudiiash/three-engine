@@ -834,6 +834,9 @@ export function createOccupancyField(bounds, res0, options = {}) {
   let vertexUsed = 0, triUsed = 0, vertexCap = 0, triCap = 0, pairCap = 0;
   let vdataArr = null, idataArr = null, pairWorkArr = null;
   let pairComputes = []; // every compute dispatched over the pair list
+  // The individual chain nodes `chunkedPasses()` windows — set by ensureComputes.
+  let clearComputeNode = null, voxStaticNode = null, voxDynamicNode = null, surfAccumStaticNode = null, complexStaticNode = null;
+  let dynamicSurfaceChainNodes = [];
 
   /**
    * The work item this thread owns, read LAZILY.
@@ -843,7 +846,28 @@ export function createOccupancyField(bounds, res0, options = {}) {
    * an exiting thread still pays exactly the two reads the split's header
    * prices it at, interleave or not.
    */
-  const pairBaseAt = (index) => uint(index).mul(uint(PAIR_WORDS)).toVar();
+  // ── PAIR-LIST SLICING (2026-09-02, the first-lit freeze) ──────────────────
+  //
+  // The three kernels that walk the (slot, triangle, chunk) work list are the
+  // field's whole GPU bill: on the user's Level (1.77 M items, 512-voxel SAT
+  // chunks) the boot ledger read `GPU done 4155 ms after rAF` on the frame
+  // that dispatched them, and the page blocked on the swap chain for all of
+  // it — a 3.7 s freeze at the moment the scene lit, on EVERY build (scene
+  // open, every geometry-revision rebuild while editing). The work composes
+  // by construction (atomic ORs into the bit grid, rank-addressed record
+  // appends), so a kernel may run over any [offset, offset+count) window of
+  // the list across as many frames as the budget wants. `pairBaseAt` adds the
+  // window's offset; the kernels guard `instanceIndex < count` so the last
+  // window can be short. The unsliced chains dispatch (0, pairCount) and are
+  // bit-identical to before.
+  const pairSliceOffsetU = uniform(0, "uint");
+  const pairSliceCountU = uniform(0xffffffff, "uint");
+  const setPairSlice = (offset, count) => {
+    pairSliceOffsetU.value = offset >>> 0;
+    pairSliceCountU.value = count >>> 0;
+    for (const c of pairComputes) c.count = Math.max(1, count);
+  };
+  const pairBaseAt = (index) => uint(index).add(pairSliceOffsetU).mul(uint(PAIR_WORDS)).toVar();
   const pairSlotAt = (base) => pairWork.element(base);
   const pairTriAt = (base) => pairWork.element(base.add(uint(1)));
   const pairChunkAt = (base) => pairWork.element(base.add(uint(2)));
@@ -1075,6 +1099,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
    * and the set membership is a uniform write.
    */
   const buildVoxelizeCompute = (filter = null) => Fn(() => {
+    If(instanceIndex.greaterThanEqual(pairSliceCountU), () => { Return(); });
     const pair = pairBaseAt(instanceIndex);
     const slot = pairSlotAt(pair).toVar();
     if (filter) {
@@ -1507,6 +1532,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
    */
   const buildSurfAccumCompute = surfaceEnabled
     ? (filter = "static") => Fn(() => {
+        If(instanceIndex.greaterThanEqual(pairSliceCountU), () => { Return(); });
         const pair = pairBaseAt(instanceIndex);
         const slot = pairSlotAt(pair).toVar();
         const want = filter === "dynamic" ? 1 : 0;
@@ -1852,6 +1878,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
    */
   const buildComplexWriteCompute = complexEnabled
     ? (filter = "static") => Fn(() => {
+        If(instanceIndex.greaterThanEqual(pairSliceCountU), () => { Return(); });
         const pair = pairBaseAt(instanceIndex);
         const slot = pairSlotAt(pair).toVar();
         const want = filter === "dynamic" ? 1 : 0;
@@ -3223,6 +3250,15 @@ export function createOccupancyField(bounds, res0, options = {}) {
         // cube's own other face) still block. Sound at any t: a ray leaving a
         // point on plane P can only re-cross P at t≈0, so far cells of the
         // same plane never produced legitimate accepts anyway.
+        // ⚠ 2026-08-30, REVERTED EXPERIMENT: arming this exclusion for the
+        // plain visibility path (sun-slot shadow rays) made the corridor
+        // rig DARKER, not brighter (tiles mean 0.091 → 0.032). The premise was
+        // that false occlusion was killing the sun's transfer, and ⛔ THERE IS
+        // NO FALSE OCCLUSION TO FIX: `npm run probe:gi-sun-bounce` scores the
+        // shipping verdicts against a closed form on the traced hit population
+        // at **99.3% agreement, zero false-lit**. The bounce deficit is
+        // downstream of the marcher entirely — plan §2.7. Do not re-arm this
+        // for the plain path chasing the sun.
         const exclude = penumbra && opts.excludePoint != null;
         // Band-limit width (world units) — see traceBody's rPen note. A
         // variant + trailing input so every existing caller keeps its exact
@@ -4892,7 +4928,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
     }
     if (pairsDirty) {
       pairWork.value.needsUpdate = true;
-      for (const c of pairComputes) c.count = Math.max(1, pairCount);
+      setPairSlice(0, pairCount);
     }
 
     // Presence diff: despawned slots disable, returning slots re-enable.
@@ -5006,12 +5042,47 @@ export function createOccupancyField(bounds, res0, options = {}) {
           ...(complexDynamic ? [complexDynamic] : []),
         ]
       : [];
+    // One clear belongs to this geometry revision, not to one dispatch-chain
+    // variant.  Keeping separate clears made the static-only boot warm one
+    // clear while the first static -> dynamic promotion selected a different,
+    // still-cold clear.  The async compute shim then skipped that clear but
+    // allowed already-warm static kernels later in the FULL chain to run,
+    // temporarily OR-ing the rebuilt field into stale atomic bits.  Sharing
+    // the node also makes the readiness/prewarm census describe the exact
+    // destructive head used by either full chain.
+    const clearCompute = buildClearCompute();
+    clearComputeNode = clearCompute;
+    voxStaticNode = voxStatic;
+    voxDynamicNode = voxDynamic;
+    surfAccumStaticNode = surfAccumStatic;
+    complexStaticNode = complexStatic;
+    dynamicSurfaceChainNodes = dynamicSurfaceChain;
     computes = {
+      // Static-only first fill. When there are no dynamic slots, running the
+      // dynamic voxelizer and record tail scans the complete pair list only
+      // to reject every item. The old full chain also copied/rebuilt the
+      // static pyramid twice: once so surface attribution could inspect it,
+      // then again after the empty dynamic pass. Build the final pyramid once
+      // and fit static records after it instead. If a mover appears later the
+      // normal FAST chain restores this snapshot and builds the dynamic tail.
+      fullStatic: [
+        clearCompute,
+        voxStatic, snapStaticBitsCompute,
+        copyCompute, ...downsampleComputes, ...densityComputes,
+        ...(hybridBuildCompute ? [hybridBuildCompute] : []),
+        ...(surfaceEnabled
+          ? [
+              surfClearCompute, surfAllocCompute,
+              surfAccumStatic, surfFinalizeCompute,
+              ...(complexStatic ? [complexStatic] : []),
+            ]
+          : []),
+      ],
       full: [
         // Fresh clear per geometry change — see buildClearCompute's note:
         // a stale compiled clear executing ahead of skipped fresh
         // voxelize nodes is the spawn-blink's empty-pyramid window.
-        buildClearCompute(),
+        clearCompute,
         voxStatic, snapStaticBitsCompute,
         ...surfaceChain,
         voxDynamic, copyCompute, ...downsampleComputes, ...densityComputes,
@@ -5304,6 +5375,7 @@ export function createOccupancyField(bounds, res0, options = {}) {
       }
       ensureComputes();
       stats.dispatches++;
+      setPairSlice(0, pairCount);
       const canFast =
         !staticDirty && dynamicCount > 0 && globalThis.__giNoStaticSplit !== true;
       if (canFast) {
@@ -5311,7 +5383,70 @@ export function createOccupancyField(bounds, res0, options = {}) {
         return computes.fast;
       }
       staticDirty = false;
-      return computes.full;
+      return dynamicCount === 0 ? computes.fullStatic : computes.full;
+    },
+
+    /**
+     * `passes()` as a list of STEPS, one step per frame, with the pair-list
+     * kernels split into windows of `itemsPerFrame` work items — see the
+     * slicing note beside `pairBaseAt`. Each step is `{ nodes, prepare,
+     * slice }`: dispatch `nodes` after calling `prepare()` (it sets the
+     * window the kernels read that frame); `slice` is set on the windowed
+     * steps so the caller can price them. The fast chain (movers only) is a
+     * single step exactly as `passes()` returns it. Same side effects as
+     * `passes()` — this IS a dispatch of the chain, spread over frames.
+     */
+    chunkedPasses({ itemsPerFrame = 262144 } = {}) {
+      dirty = false;
+      if (pairCount === 0) return null;
+      ensureComputes();
+      stats.dispatches++;
+      const whole = { prepare: () => setPairSlice(0, pairCount) };
+      const canFast =
+        !staticDirty && dynamicCount > 0 && globalThis.__giNoStaticSplit !== true;
+      if (canFast) {
+        stats.fastDispatches = (stats.fastDispatches ?? 0) + 1;
+        return [{ nodes: computes.fast, ...whole }];
+      }
+      staticDirty = false;
+      const per = Math.max(1024, Math.floor(itemsPerFrame) || 262144);
+      const sliced = (node) => {
+        const out = [];
+        for (let off = 0; off < pairCount; off += per) {
+          const count = Math.min(per, pairCount - off);
+          out.push({ nodes: [node], slice: { offset: off, count }, prepare: () => setPairSlice(off, count) });
+        }
+        return out;
+      };
+      const step = (nodes) => ({ nodes: nodes.filter(Boolean), ...whole });
+      const staticSurface = surfaceEnabled
+        ? [
+            step([surfClearCompute, surfAllocCompute]),
+            ...sliced(surfAccumStaticNode),
+            step([surfFinalizeCompute]),
+            ...(complexStaticNode ? sliced(complexStaticNode) : []),
+          ]
+        : [];
+      if (dynamicCount === 0) {
+        return [
+          step([clearComputeNode]),
+          ...sliced(voxStaticNode),
+          step([snapStaticBitsCompute, copyCompute, ...downsampleComputes, ...densityComputes, hybridBuildCompute]),
+          ...staticSurface,
+        ].filter((st) => st.nodes.length);
+      }
+      return [
+        step([clearComputeNode]),
+        ...sliced(voxStaticNode),
+        step([snapStaticBitsCompute]),
+        // the static surface chain of `full` (copy + hybridBuild first, so
+        // attribution ranks against the static pyramid it inspects)
+        ...(surfaceEnabled ? [step([copyCompute, hybridBuildCompute])] : []),
+        ...staticSurface,
+        // the dynamic side walks every item too, but exits on the split in
+        // two reads — one frame, as `full` always dispatched it
+        step([voxDynamicNode, copyCompute, ...downsampleComputes, ...densityComputes, hybridBuildCompute, ...dynamicSurfaceChainNodes]),
+      ].filter((st) => st.nodes.length);
     },
 
     /**
@@ -5336,7 +5471,16 @@ export function createOccupancyField(bounds, res0, options = {}) {
       ensureComputes();
       const out = [];
       const seen = new Set();
-      for (const node of [...computes.full, ...computes.fast]) {
+      // Warm every chain the field can select during this geometry revision.
+      // `giNodesPending()` can gate a node only AFTER its first dispatch has
+      // registered an async pipeline.  Leaving dynamic-only nodes unattempted
+      // on a static boot therefore let the first mover promotion enter FULL
+      // with a mixture of warm and never-seen nodes: the warm subset mutated
+      // occupancy, the cold subset skipped, and consumers observed the partial
+      // field for that frame.  The union restores the all-or-nothing contract;
+      // deduplication means shared static kernels still compile once.
+      const chains = [computes.fullStatic, computes.full, computes.fast];
+      for (const node of chains.flat()) {
         if (!node || typeof node !== "object" || seen.has(node)) continue;
         seen.add(node);
         out.push(node);

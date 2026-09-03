@@ -323,6 +323,7 @@ export class Entity extends EventEmitter {
     component.entity = this;
     this.components.set(type, component);
     component.onAttach();
+    this.engine?.emit?.("component-added", { entityId: this.id, componentType: type });
     return component;
   }
 
@@ -388,6 +389,10 @@ export class Entity extends EventEmitter {
     // Internal-only bookkeeping, deliberately absent from the public Engine
     // surface in engine.d.ts.
     /** @type {any} */ (this.engine).viewOnlyComponents?.delete(component);
+    // Include the detached instance: systems reacting to a permanent removal
+    // may need provenance that is no longer reachable through getComponent().
+    // This remains an additive event field for existing listeners.
+    this.engine?.emit?.("component-removed", { entityId: this.id, componentType: type, component });
     // The ONE place a component is permanently gone (not the internal
     // detach/attach a default onPropChanged rebuild does) — see Component.js.
     component.emit("destroyed");

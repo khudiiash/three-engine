@@ -44,6 +44,10 @@
 //   TAIL=6000      extra settle before the reference frame is taken
 //   LEGS=2         how many room-to-room legs to walk
 //   PNG=1          arrival / settled / error-heatmap per leg
+//   FLAGS='{...}'  extra page globals merged over the arm's (e.g. pinned pools:
+//                  {"__giSrcC0Probes":21875,"__giSrcBinBudget":2800000} skips the
+//                  grow-ladder REBUILD the read-only harness project otherwise pays
+//                  ~30 s in, mid-measurement)
 import puppeteer from "puppeteer-core";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { installTauriShim } from "./lib/tauriShim.mjs";
@@ -393,7 +397,16 @@ async function runArm(arm) {
   // canvas size then becomes a hidden variable ([[gi-harness-viewport-traps]]).
   const context = await browser.createBrowserContext();
   const page = await context.newPage();
-  await page.setViewport({ width: 1280, height: 800, deviceScaleFactor: 1 });
+  // VIEW=WxH (2026-09-02): the user's editor canvas is ~1550×930, where the
+  // ray ceiling strides 4 and the rest cadence halves it again — a regime the
+  // 686×342 canvas this page yields at 1280×800 never enters. ~2600×1600 gives
+  // a canvas of the user's size.
+  const view = /^(\d+)x(\d+)$/.exec(process.env.VIEW ?? "");
+  await page.setViewport({
+    width: view ? Number(view[1]) : 1280,
+    height: view ? Number(view[2]) : 800,
+    deviceScaleFactor: 1,
+  });
   const gi = [];
   const errors = [];
   // ⚠⚠ THE TRANSIENT TRAP, PAID FOR TWICE ALREADY: this Level's GI takes ~30 s
@@ -429,7 +442,7 @@ async function runArm(arm) {
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
     for (const [k, v] of Object.entries(globals)) globalThis[k] = v;
-  }, PROJECT, armGlobals(arm));
+  }, PROJECT, { ...armGlobals(arm), ...JSON.parse(process.env.FLAGS ?? "{}") });
 
   await page.goto(url, { waitUntil: "load", timeout: 90000 });
   await page.waitForSelector(".hub-recent-open-btn", { timeout: 90000 });
@@ -523,8 +536,25 @@ async function runArm(arm) {
       // Fallback for a scene with no blockout: the long axis of everything
       // renderable, at 1.6 m. Worse (it may walk through walls) but it still
       // exercises the "new geometry enters the view" path.
+      // ⚠ OUTLIERS (2026-09-02): on Sponza one stray mesh sat 45 km away and
+      // the union box sent the walk 36 km out of the scene ("c0 live 0",
+      // a null run). Take the box of the meshes that live where MOST meshes
+      // live: per-mesh boxes, the median centre, keep the ones within 150 m
+      // of it and under 400 m across.
+      const boxes = [];
+      engine.scene.traverse((o) => {
+        if (!o.isMesh || !o.visible) return;
+        const b = new THREE.Box3().setFromObject(o);
+        if (b.isEmpty()) return;
+        const size = new THREE.Vector3(); b.getSize(size);
+        if (!Number.isFinite(size.length()) || Math.max(size.x, size.y, size.z) > 400) return;
+        boxes.push(b);
+      });
+      const med = (arr) => { const a = [...arr].sort((x, y) => x - y); return a[Math.floor(a.length / 2)] ?? 0; };
+      const centres = boxes.map((b) => { const c = new THREE.Vector3(); b.getCenter(c); return c; });
+      const mc = new THREE.Vector3(med(centres.map((c) => c.x)), med(centres.map((c) => c.y)), med(centres.map((c) => c.z)));
       const box = new THREE.Box3();
-      engine.scene.traverse((o) => { if (o.isMesh && o.visible) box.expandByObject(o); });
+      boxes.forEach((b, i) => { if (centres[i].distanceTo(mc) <= 150) box.union(b); });
       if (box.isEmpty()) return { fail: "no rooms and no geometry" };
       const lo = box.min, hi = box.max, y = Math.min(hi.y - 0.4, lo.y + 1.6);
       const longX = hi.x - lo.x >= hi.z - lo.z;
@@ -1450,7 +1480,7 @@ for (const arm of ARMS) {
     // had not performed. Anything naming a unit or a picked slot is kept
     // wherever it landed in the log.
     const receipts = r.gi.filter((l) => /§\d|sun slot|ARMED|: OFF \(/.test(l));
-    for (const l of [...new Set([...receipts, ...r.gi.slice(-6)])]) console.log(`  ${l}`);
+    for (const l of [...new Set([...receipts, ...r.gi.slice(process.env.GI_LOG ? -80 : -6)])]) console.log(`  ${l}`);
   } catch (e) {
     console.log(`  ARM THREW ${String(e.message ?? e).slice(0, 300)}`);
   }

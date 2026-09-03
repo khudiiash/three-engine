@@ -53,6 +53,9 @@ const result = await page.evaluate(async () => {
   // this the GI system never ticks and the suite reports "GI never built"
   // with no error anywhere.
   globalThis.__editorKeepRendering = true;
+  // §10 (2026-09-02): "auto" is the field-less BVH build now; this suite
+  // measures the VOXEL occupancy machinery, so it pins the occupancy mode.
+  globalThis.__giRayHitMode = "hybrid-exact-complex";
   const { THREE } = await import("/src/engine/index.js");
   await import("/src/modules/index.js");
   const { enableEngineModule } = await import("/src/engine/modules.js");

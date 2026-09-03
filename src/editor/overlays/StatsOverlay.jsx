@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { subscribeLayers } from "../panels/ViewportPanel.jsx";
 import { ensureEngine } from "../engineInstance.js";
+import { collectViewCullingStats } from "../../engine/culling/viewCullingStats.js";
 
 /**
  * Editor-only viewport overlay showing live engine telemetry:
@@ -56,8 +57,11 @@ const EMPTY_READOUT = {
   drawCalls: 0,
   triangles: 0,
   textureMem: 0,
+  viewCulled: 0,
+  viewTested: 0,
+  frustumCulled: 0,
   occlusionCulled: 0,
-  occlusionTested: 0,
+  cullingOverlap: 0,
   impostors: 0,
   pooled: 0,
   spawnQueue: 0,
@@ -78,14 +82,18 @@ function readStats(liveEngine) {
   // useState bails out on identical references, so we shallow-clone to
   // guarantee every 10 Hz poll triggers a render.
   //
-  // Culling counters are read straight off their systems rather than routed
-  // through the StatsSystem: they are per-frame decisions those systems already
-  // hold, and copying them into a second place every frame would be work whose
-  // only purpose is to be read ten times a second.
+  // Culling is sampled here at 10 Hz instead of adding a full scene walk to
+  // every render frame. The displayed value is the union of three's frustum
+  // decisions and the engine's occlusion decisions; the helper also retains
+  // the separate counts (and their overlap) for diagnostics.
+  const culling = collectViewCullingStats(liveEngine);
   return {
     ...stats.readout,
-    occlusionCulled: liveEngine.occlusion?.culledLastFrame ?? 0,
-    occlusionTested: liveEngine.occlusion?.testedLastFrame ?? 0,
+    viewCulled: culling.culled,
+    viewTested: culling.tested,
+    frustumCulled: culling.frustum.culled,
+    occlusionCulled: culling.occlusion.culled,
+    cullingOverlap: culling.overlap,
     impostors: liveEngine.impostors?.visibleCount ?? 0,
     pooled: liveEngine.pool?.size ?? 0,
     spawnQueue: liveEngine.pool?.pending ?? 0,
@@ -110,10 +118,9 @@ function writeCollapsed(v) {
 }
 
 /**
- * `forceVisible` opts out of the viewport's Layers toggle. The Game panel uses
- * it: telemetry is the point of that view, and its overlay must not be
- * switched off by a dropdown that lives in a different panel and doesn't
- * mention it.
+ * `forceVisible` is available to isolated diagnostics that deliberately opt
+ * out of the active Layers profile. Normal Viewport and Game panels both
+ * follow the Stats toggle; Play starts with it off like every other aid.
  */
 export function StatsOverlay({ forceVisible = false }) {
   const [r, setR] = useState(EMPTY_READOUT);
@@ -235,12 +242,13 @@ export function StatsOverlay({ forceVisible = false }) {
           <Row label="Textures" value={formatBytes(r.textureMem)} tone={memTone(r.textureMem)} />
           <Row label="Draw calls" value={formatCount(r.drawCalls)} />
           <Row label="Triangles" value={formatCount(r.triangles)} />
-          {/* Both are zero on a scene that uses neither, and a row that reads
-              zero forever is a row that trains people to stop looking. */}
-          {r.occlusionTested > 0 && (
+          {/* The numerator is the de-duplicated union of frustum + occlusion
+              decisions; the denominator is every independently cullable
+              scene object (proxy members do not count twice). */}
+          {r.viewTested > 0 && (
             <Row
               label="Occluded"
-              value={`${formatCount(r.occlusionCulled)} / ${formatCount(r.occlusionTested)}`}
+              value={`${formatCount(r.viewCulled)} / ${formatCount(r.viewTested)}`}
             />
           )}
           {r.impostors > 0 && <Row label="Impostors" value={formatCount(r.impostors)} />}

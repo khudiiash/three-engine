@@ -1,6 +1,6 @@
 // @ts-check
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Save, Play, Trash2, Zap, ChevronUp, ChevronDown, Layers, X } from "lucide-react";
+import { Plus, Save, Play, Trash2, Zap, ChevronUp, ChevronDown, Layers, Sparkles, X } from "lucide-react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -31,6 +31,10 @@ import { ANY_STATE, START_STATE, createLayer, normalizeGraph } from "../../engin
 import { collectBoneNames } from "../../engine/anim/mask.js";
 import { setGraphHovered } from "../nodegraph/graphContext.js";
 import { ContextMenu } from "../ContextMenu.jsx";
+import { GenerateMotionDialog } from "../components/GenerateMotionDialog.jsx";
+import { generateAnimationOnModel } from "../kimodoGenerate.js";
+import { addGeneratedAnimatorState } from "../kimodoIntegration.js";
+import { pushToast } from "../toasts.js";
 
 /**
  * Node-graph editor for .anim animation-controller assets (Unity-style):
@@ -1281,8 +1285,7 @@ function collectSkeletonBones(animPath) {
   return [];
 }
 
-function AnimatorEditor({ animPath }) {
-  const [nodes, setNodes, onNodesChange] = useNodesState([]);
+function AnimatorEditor({ animPath }) {  const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [parameters, setParameters] = useState([]);
   // Every layer's data. The ACTIVE layer's states/transitions live in
@@ -1297,6 +1300,11 @@ function AnimatorEditor({ animPath }) {
   const updateNodeInternals = useUpdateNodeInternals();
   const [canvasMenu, setCanvasMenu] = useState(null);
   const [pickedEntityId, setPickedEntityId] = useState(null);
+  // "Generate Animation…" stays panel-local. Completion adds a selected
+  // state, so the graph and clip picker refresh in the same render.
+  const [generate, setGenerate] = useState(null); // null | {busy, error}
+  const selectedId = useSelectionStore((s) => s.ids[0] ?? null);
+  const entity = useSceneStore((s) => (selectedId ? s.entities[selectedId] : null));
   const [autosave, setAutosave] = useState(() => {
     try {
       return localStorage.getItem("engine.autosave.animator") === "1";
@@ -1341,6 +1349,16 @@ function AnimatorEditor({ animPath }) {
     })();
     return () => (live = false);
   }, [animPath]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A looping state audition should live exactly as long as this Animator
+  // surface. Otherwise closing the panel would leave the editor viewport awake
+  // and animating forever with no visible control that can stop it.
+  useEffect(
+    () => () => {
+      for (const comp of componentsUsing(animPath)) comp.cancelEditorPreview?.();
+    },
+    [animPath],
+  );
 
   const paramTypes = useMemo(() => Object.fromEntries(parameters.map((p) => [p.name, p.type])), [parameters]);
   const stateNames = useMemo(
@@ -1439,6 +1457,11 @@ function AnimatorEditor({ animPath }) {
     const picked = boundComponents.find((c) => c.entity.id === pickedEntityId);
     return picked ?? boundComponents[0];
   }, [boundComponents, pickedEntityId]);
+  const generationEntity = entity?.components?.model && entity?.components?.animation?.controller === animPath
+    ? entity
+    : drivenComponent
+      ? useSceneStore.getState().entities[drivenComponent.entity.id]
+      : null;
 
   // Guard against a stale graph-hovered flag if the panel unmounts while
   // the pointer is still over it (dockview close, tab switch, …).
@@ -1586,8 +1609,8 @@ function AnimatorEditor({ animPath }) {
 
   // --- layers ---------------------------------------------------------------
   /** Folds the canvas back into the layer array — the single merge point. */
-  const withCanvas = (list = layers, index = active) =>
-    list.map((layer, i) => (i === index ? { ...layer, ...flowToLayer(nodes, edges) } : layer));
+  const withCanvas = (list = layers, index = active, canvasNodes = nodes, canvasEdges = edges) =>
+    list.map((layer, i) => (i === index ? { ...layer, ...flowToLayer(canvasNodes, canvasEdges) } : layer));
 
   const selectLayer = (index) => {
     if (index === active) return;
@@ -1647,7 +1670,35 @@ function AnimatorEditor({ animPath }) {
     setActive(active === index ? target : active === target ? index : active);
   };
 
-  const buildGraph = () => ({ version: 2, parameters, layers: withCanvas() });
+  const buildGraph = (canvasNodes = nodes, canvasEdges = edges) => ({
+    version: 2,
+    parameters,
+    layers: withCanvas(layers, active, canvasNodes, canvasEdges),
+  });
+
+  const runGenerate = async (opts) => {
+    setGenerate({ busy: true, error: "" });
+    try {
+      const result = await generateAnimationOnModel({ entity: generationEntity, ...opts });
+      const generated = addGeneratedAnimatorState({ nodes, edges, clipName: result.clipName, makeId: uid });
+      const graph = buildGraph(generated.nodes, generated.edges);
+      setNodes(generated.nodes);
+      setEdges(generated.edges);
+      setDirty(true);
+      for (const comp of componentsUsing(animPath)) {
+        comp.applyGraph(structuredClone(graph));
+        if (comp.entity.id === generationEntity.id) comp.previewState(generated.stateName, 0, active);
+      }
+      pushToast({
+        level: "info",
+        title: `"${result.clipName}" is ready`,
+        detail: `${result.frames} frames · state created and previewing`,
+      });
+      setGenerate(null);
+    } catch (err) {
+      setGenerate({ busy: false, error: String(err?.message ?? err) });
+    }
+  };
 
   const save = async () => {
     const graph = buildGraph();
@@ -1680,7 +1731,7 @@ function AnimatorEditor({ animPath }) {
     const graph = buildGraph();
     for (const comp of bound) {
       comp.applyGraph(structuredClone(graph));
-      comp.play(stateName, 0.15);
+      comp.previewState(stateName, 0.15, active);
     }
   };
 
@@ -1690,6 +1741,17 @@ function AnimatorEditor({ animPath }) {
         <button className="toolbar-btn" onClick={() => addState()}>
           <Plus size={14} />
           State
+        </button>
+        <button
+          className="toolbar-btn"
+          title={generationEntity
+            ? `Generate a clip for ${generationEntity.name ?? "this character"}`
+            : "Bind this controller to a model before generating animation"}
+          disabled={!generationEntity || !!generate}
+          onClick={() => setGenerate({ busy: false, error: "" })}
+        >
+          <Sparkles size={14} />
+          Generate…
         </button>
         <span className="asset-path" title={animPath}>
           {animPath.split(/[\\/]/).pop()}
@@ -1788,6 +1850,9 @@ function AnimatorEditor({ animPath }) {
               dragPointRef.current.start = null;
               dragPointRef.current.end = null;
             }}
+            onNodeClick={(_event, node) => {
+              if (node.type === "animState") preview(node.data.state.name);
+            }}
             onEdgeDoubleClick={(_event, edge) => {
               // Double-click a transition to remove it.
               setEdges((eds) => eds.filter((e) => e.id !== edge.id));
@@ -1818,8 +1883,16 @@ function AnimatorEditor({ animPath }) {
         </div>
       </div>
       <div className="shader-graph-hint">
-        Drag between states to add a transition · select an edge to edit conditions · Save applies to the scene
+        Click a state to preview · drag between states to add a transition · Save applies to the scene
       </div>
+      {generate && (
+        <GenerateMotionDialog
+          busy={generate.busy}
+          error={generate.error}
+          onApply={runGenerate}
+          onCancel={() => setGenerate(null)}
+        />
+      )}
     </div>
   );
 }

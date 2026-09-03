@@ -52,7 +52,7 @@ function makeLayers(mask = 1) {
 
 function makeRig({ background = { isColor: true } } = {}) {
   const renders = [];
-  const scene = { overrideMaterial: null, background, backgroundNode: null };
+  const scene = { overrideMaterial: null, background, backgroundNode: null, children: [] };
   const camera = { layers: makeLayers(0b1011) };
   const gbuffer = {
     rt: { id: "gbufferRT" },
@@ -69,12 +69,20 @@ function makeRig({ background = { isColor: true } } = {}) {
     autoClearStencil: true,
     transparent: true,
     shadowMap: { enabled: true },
+    _clearColor: { value: 0x123456 },
+    _clearAlpha: 1,
     _target: { id: "mainRT" },
     _mrt: { id: "mainMRT" },
     getRenderTarget() { return this._target; },
     setRenderTarget(t) { this._target = t; },
     getMRT() { return this._mrt; },
     setMRT(m) { this._mrt = m; },
+    getClearColor(out) { out.setHex(this._clearColor.value); return out; },
+    getClearAlpha() { return this._clearAlpha; },
+    setClearColor(color, alpha = 1) {
+      this._clearColor.value = color?.isColor ? color.getHex() : color;
+      this._clearAlpha = alpha;
+    },
     render() {
       // Snapshot everything three would consult AT DRAW TIME. Reading these
       // after the call returns proves nothing — the `finally` restores them.
@@ -82,6 +90,8 @@ function makeRig({ background = { isColor: true } } = {}) {
         overrideMaterial: scene.overrideMaterial,
         background: scene.background,
         backgroundNode: scene.backgroundNode,
+        clearColor: renderer._clearColor.value,
+        clearAlpha: renderer._clearAlpha,
         autoClear: renderer.autoClear,
         autoClearColor: renderer.autoClearColor,
         autoClearDepth: renderer.autoClearDepth,
@@ -127,8 +137,17 @@ check("⭐ an opaque Color background is REMOVED for the mask pass", () => {
   // a skybox INTO the gbuffer as world geometry sitting on the camera.
   const rig = makeRig({ background: { isColor: true } });
   renderGiGBuffer(rig.renderer, rig.scene, rig.camera, rig.gbuffer, { mirrorMask: true });
+  assert.equal(rig.renders[0].background, null);
+  assert.equal(rig.renders[0].backgroundNode, null);
   assert.equal(rig.renders[1].background, null);
   assert.equal(rig.renders[1].backgroundNode, null);
+});
+
+check("pass 1 clears sky to an invalid transparent position", () => {
+  const rig = makeRig();
+  renderGiGBuffer(rig.renderer, rig.scene, rig.camera, rig.gbuffer, { mirrorMask: true });
+  assert.equal(rig.renders[0].clearColor, 0x000000);
+  assert.equal(rig.renders[0].clearAlpha, 0);
 });
 
 check("autoClear itself is still false during the mask pass", () => {
@@ -174,6 +193,8 @@ check("⭐⭐ every stomped renderer flag is restored", () => {
     autoClearStencil: rig.renderer.autoClearStencil,
     transparent: rig.renderer.transparent,
     shadows: rig.renderer.shadowMap.enabled,
+    clearColor: rig.renderer._clearColor.value,
+    clearAlpha: rig.renderer._clearAlpha,
   };
   renderGiGBuffer(rig.renderer, rig.scene, rig.camera, rig.gbuffer, { mirrorMask: true });
   assert.deepEqual({
@@ -183,6 +204,8 @@ check("⭐⭐ every stomped renderer flag is restored", () => {
     autoClearStencil: rig.renderer.autoClearStencil,
     transparent: rig.renderer.transparent,
     shadows: rig.renderer.shadowMap.enabled,
+    clearColor: rig.renderer._clearColor.value,
+    clearAlpha: rig.renderer._clearAlpha,
   }, before);
 });
 
@@ -217,14 +240,15 @@ check("restoration survives a THROWING render (the finally is real)", () => {
   assert.equal(rig.renderer.shadowMap.enabled, true);
 });
 
-// ---- the unmasked path is untouched -----------------------------------------
+// ---- the unmasked path has the same sky exclusion ---------------------------
 
-check("without the mask there is exactly ONE pass and nothing is stomped", () => {
+check("without the mask there is one pass with an invalid sky clear", () => {
   const rig = makeRig();
   renderGiGBuffer(rig.renderer, rig.scene, rig.camera, rig.gbuffer, { mirrorMask: false });
   assert.equal(rig.renders.length, 1);
   assert.equal(rig.renders[0].autoClearColor, true);
-  assert.ok(rig.renders[0].background, "the unmasked path must not touch the background");
+  assert.equal(rig.renders[0].background, null);
+  assert.equal(rig.renders[0].clearAlpha, 0);
 });
 
 console.log(failures ? `\n${failures} failing` : "\nall ok");

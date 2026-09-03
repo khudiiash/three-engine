@@ -595,15 +595,25 @@ export function matchStockPbr(graph) {
   const edges = graph?.edges ?? [];
   if (!nodes.length) return null;
   const byId = new Map(nodes.map((n) => [n.id, n]));
-  const counts = { texture: 0, normalMap: 0, principledBsdf: 0, output: 0 };
+  // `color` + `multiply` are here for THE BASE-COLOUR FACTOR — see the branch
+  // in the edge loop below for why admitting them matters far more than it
+  // looks, and why it is exact rather than an approximation.
+  const counts = { texture: 0, normalMap: 0, principledBsdf: 0, output: 0, color: 0, multiply: 0 };
   for (const n of nodes) {
     if (!(n.type in counts)) return null;
     counts[n.type]++;
   }
   if (counts.principledBsdf !== 1 || counts.output !== 1 || counts.normalMap > 1) return null;
+  if (counts.multiply > 1 || counts.color > 1) return null;
   const bsdf = nodes.find((n) => n.type === "principledBsdf");
   const output = nodes.find((n) => n.type === "output");
   const nm = nodes.find((n) => n.type === "normalMap") ?? null;
+  const mul = nodes.find((n) => n.type === "multiply") ?? null;
+  const colorConst = nodes.find((n) => n.type === "color") ?? null;
+  // Neither is expressible alone: a constant colour reaches `material.color`
+  // ONLY as the multiply's other operand, and the multiply is expressible ONLY
+  // as `map x color`. One without the other is a graph this cannot spell.
+  if ((mul === null) !== (colorConst === null)) return null;
 
   // Classify every edge; anything unrecognized disqualifies the graph.
   let surfaceWired = false;
@@ -613,6 +623,9 @@ export function matchStockPbr(graph) {
   let roughnessTex = null; // texture node whose .g feeds roughness
   let metalnessTex = null; // texture node whose .b feeds metalness
   let alphaTex = null; // texture node whose .a feeds opacity
+  let mulTex = null; // colour texture feeding the multiply
+  let mulColorWired = false; // the constant colour feeding the multiply
+  let mulToColor = false; // multiply -> bsdf.color
   const texUses = new Map(); // texture node -> use count
   for (const e of edges) {
     const src = byId.get(e.source);
@@ -667,7 +680,7 @@ export function matchStockPbr(graph) {
       continue;
     }
     if (src.type === "texture" && e.sourceHandle === "out" && dst === bsdf && e.targetHandle === "color") {
-      if (colorTex) return null;
+      if (colorTex || mulToColor) return null;
       colorTex = src;
       texUses.set(src, (texUses.get(src) ?? 0) + 1);
       continue;
@@ -683,8 +696,65 @@ export function matchStockPbr(graph) {
       normalWired = true;
       continue;
     }
+    // ── ⭐⭐ THE BASE-COLOUR FACTOR: `texture x constant -> color` (2026-08-30) ──
+    //
+    // Exact, not an approximation, and by the same argument the ORM branch
+    // above makes: three composes `diffuseColor = material.color * texture(map)`
+    // (a vec4 multiply), which is precisely what `tex.out -> multiply` and
+    // `color.out -> multiply -> bsdf.color` emit here. The stock path just
+    // spells it with `material.color` instead of a uniform node.
+    //
+    // ⭐⭐ WHY THIS TINY GAP MATTERED SO MUCH. Every glTF import writes this
+    // shape — the importer multiplies the baseColorTexture by the material's
+    // baseColorFactor — so a two-node factor chain kept EVERY imported PBR
+    // material off the stock path. On the user's Sponza that is all 25 of them,
+    // and the consequences were nowhere near the compile wave this function was
+    // written to collapse:
+    //
+    //   `applyStockPbr` is what sets `material.roughnessMap` / `.metalnessMap`.
+    //   The graph path never sets them (it drives `roughnessNode` /
+    //   `metalnessNode` instead), leaving the STOCK SLOTS NULL and the stock
+    //   SCALARS at whatever the .mat stored — `roughness: 1, metalness: 1` on
+    //   every glTF import, because those are the factors the maps modulate.
+    //
+    // Anything reading a material through three's standard properties
+    // therefore saw a fully-rough, fully-metallic surface. `three-gpu-pathtracer`
+    // does exactly that (`getTexture(m, 'metalnessMap')`, falling back to
+    // `material.metalness`), so the path-tracer reference view was rendering a
+    // DIFFERENT MATERIAL SET than the raster frame it was being compared
+    // against — silently, and for every comparison made against it
+    // (docs/GI_SCALE_PLAN.md §2.7g).
+    //
+    // ⚠ Kept as narrow as the ORM branch: ONE multiply, ONE constant colour,
+    // the multiply's two operands being exactly that texture and that constant,
+    // and its output going only to `bsdf.color`. Anything else falls through to
+    // the compile path, where it still renders correctly — just not stock.
+    if (mul && dst === mul && (e.targetHandle === "a" || e.targetHandle === "b")) {
+      if (src.type === "texture" && e.sourceHandle === "out") {
+        if (mulTex) return null;
+        mulTex = src;
+        texUses.set(src, (texUses.get(src) ?? 0) + 1);
+        continue;
+      }
+      if (src === colorConst && e.sourceHandle === "out") {
+        if (mulColorWired) return null;
+        mulColorWired = true;
+        continue;
+      }
+      return null;
+    }
+    if (mul && src === mul && dst === bsdf && e.targetHandle === "color") {
+      // A direct `texture -> color` wire and this chain are two spellings of
+      // the same slot; both would mean two sources for one input.
+      if (mulToColor || colorTex) return null;
+      mulToColor = true;
+      continue;
+    }
     return null;
   }
+  // Half a chain is not expressible: the multiply must have BOTH operands and
+  // must be what feeds the colour, or the constant has nowhere to go.
+  if (mul && !(mulTex && mulColorWired && mulToColor)) return null;
   if (!surfaceWired) return null;
   // A normalMap node must be a complete texture → normal chain, every texture
   // must be consumed by at least one recognized role, and none may have a
@@ -696,8 +766,11 @@ export function matchStockPbr(graph) {
   // already been classified, so a second use can only be a second role.
   if (nm && (!normalFeed || !normalWired)) return null;
   // See the opacity branch: only the COLOUR texture's alpha is expressible,
-  // because the stock path gets it through `map` and nothing else.
-  if (alphaTex && alphaTex !== colorTex) return null;
+  // because the stock path gets it through `map` and nothing else. With the
+  // factor chain the colour texture is the multiply's operand — same texture,
+  // one node further from the bsdf, and it still lands in `map` below.
+  const baseTex = colorTex ?? mulTex;
+  if (alphaTex && alphaTex !== baseTex) return null;
   for (const n of nodes) {
     if (n.type !== "texture") continue;
     if ((texUses.get(n) ?? 0) < 1) return null;
@@ -726,9 +799,12 @@ export function matchStockPbr(graph) {
   if ((emissive.r > 0 || emissive.g > 0 || emissive.b > 0) && emissiveStrength !== 0) return null;
 
   return {
-    // A wired color input is the texture ALONE on the graph path (no factor
-    // multiply), so the stock expression must pin the factor to white.
-    color: colorTex ? "#ffffff" : valueOf("color"),
+    // A DIRECT wired color input is the texture ALONE on the graph path (no
+    // factor multiply), so the stock expression must pin the factor to white.
+    // Through the factor chain the graph computes `texture x constant`, and
+    // `material.color` IS that constant — the one case where the factor is not
+    // pinned, and the reason the chain is expressible at all.
+    color: mulToColor ? (colorConst.props?.value ?? "#ffffff") : (colorTex ? "#ffffff" : valueOf("color")),
     // Same rule as colour, for the same reason: a wired channel REPLACES the
     // scalar on the graph path, while three MULTIPLIES the map by it. Pinning
     // to 1 is what makes the two paths the same number rather than nearly.
@@ -737,7 +813,7 @@ export function matchStockPbr(graph) {
     ior: valueOf("ior"),
     specularIntensity: valueOf("specularIntensity"),
     specularColor: valueOf("specularColor"),
-    map: colorTex?.props?.path ?? null,
+    map: baseTex?.props?.path ?? null,
     normalMap: normalFeed?.props?.path ?? null,
     roughnessMap: roughnessTex?.props?.path ?? null,
     metalnessMap: metalnessTex?.props?.path ?? null,

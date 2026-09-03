@@ -1,0 +1,158 @@
+<!doctype html>
+<!-- Standalone visual harness for the kimodo retarget: loads a retargeted
+     model GLB, plays one clip through three's AnimationMixer (the engine's
+     own playback path), and renders sampled frames for a human/agent to
+     judge. Driven by scripts/run-kimodo-preview.mjs over vite + puppeteer,
+     same shape as the other scripts/*.html harnesses. -->
+<html>
+<head><meta charset="utf-8"><base href="/"><title>kimodo preview</title>
+<style>html,body{margin:0;background:#202028}canvas{display:block}</style></head>
+<body>
+<script type="module">
+import * as THREE from "three/webgpu";
+import { getGltfLoader } from "/src/engine/gltfLoader.js";
+
+let renderer, scene, camera, mixer, animations = [], clipNames = [];
+
+async function boot(url) {
+  renderer = new THREE.WebGPURenderer({ antialias: true });
+  await renderer.init();
+  renderer.setSize(800, 1000);
+  document.body.appendChild(renderer.domElement);
+
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color("#202028");
+  camera = new THREE.PerspectiveCamera(40, 0.8, 0.1, 50);
+  camera.position.set(0, 1.05, 3.1);
+  camera.lookAt(0, 0.95, 0);
+
+  scene.add(new THREE.HemisphereLight("#cfd8ff", "#3a3530", 2.2));
+  const sun = new THREE.DirectionalLight("#ffffff", 2.4);
+  sun.position.set(2, 3, 2);
+  scene.add(sun);
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`glb fetch failed: ${res.status}`);
+  const buf = await res.arrayBuffer();
+  const gltf = await getGltfLoader().parseAsync(buf, "");
+  scene.add(gltf.scene);
+  // Skinned bounds are the bind pose's; the animated pose walks out of them
+  // and gets culled mid-stride unless culling is off.
+  gltf.scene.traverse((o) => { o.frustumCulled = false; });
+  clipNames = gltf.animations.map((c) => c.name);
+  animations = gltf.animations;
+
+  mixer = new THREE.AnimationMixer(gltf.scene);
+  // Only primitives cross the CDP boundary — hand back clip names, nothing
+  // live.
+  return { clips: clipNames };
+}
+
+function show(clipName, time) {
+  const action = mixer.clipAction(animations.find((c) => c.name === clipName));
+  // Snap: reset the action and let setTime advance the mixer to the sampled
+  // time — the pose is purely the clip's, no accumulated playback state.
+  mixer.stopAllAction();
+  action.reset().play();
+  mixer.setTime(time);
+  return renderer.renderAsync(scene, camera);
+}
+
+// --- SOMA stick figure: the RAW source motion, drawn from its own f32
+// streams. This is the ground truth the Y Bot frames are judged against — if
+// the source figure holds its arms out too, the retarget is faithful and the
+// ARTIFACT is in the generated motion, not the transfer.
+import { SOMA_NAMES as SOMA_N, SOMA_PARENTS as SOMA_P, SOMA_OFFSETS as SOMA_O } from "/scripts/lib/somaSkeleton.mjs";
+const SOMA = { names: SOMA_N, parents: SOMA_P, offsets: SOMA_O.map(([x, y, z]) => new THREE.Vector3(x, y, z)) };
+
+let somaMesh, somaFrames = [];
+
+async function bootSoma(dirUrl) {
+  // Runs standalone (the runner reloads the page to drop the GLB scene), so
+  // it owns its renderer/scene setup.
+  if (!renderer) {
+    renderer = new THREE.WebGPURenderer({ antialias: true });
+    await renderer.init();
+    renderer.setSize(800, 1000);
+    document.body.appendChild(renderer.domElement);
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color("#202028");
+    camera = new THREE.PerspectiveCamera(40, 0.8, 0.1, 50);
+    camera.position.set(0, 1.05, 3.1);
+    camera.lookAt(0, 0.95, 0);
+    scene.add(new THREE.HemisphereLight("#cfd8ff", "#3a3530", 2.2));
+  }
+  const fetchF32 = async (name) => {
+    const res = await fetch(`${dirUrl}/${name}`);
+    if (!res.ok) throw new Error(`${name}: ${res.status}`);
+    return new Float32Array(await res.arrayBuffer());
+  };
+  const roots = await fetchF32("root_positions.f32");
+  const rots = await fetchF32("local_rotations_xyzw.f32");
+  const frames = roots.length / 3;
+  const joints = SOMA.names.length;
+  if (rots.length !== frames * joints * 4) throw new Error("f32 size mismatch");
+
+  for (let f = 0; f < frames; f++) {
+    const pos = new Array(joints);
+    const globals = new Array(joints);
+    for (let j = 0; j < joints; j++) {
+      const parent = SOMA.parents[j];
+      const base = (f * joints + j) * 4;
+      const local = new THREE.Quaternion(rots[base], rots[base + 1], rots[base + 2], rots[base + 3]).normalize();
+      if (parent < 0) {
+        pos[j] = new THREE.Vector3(roots[f * 3], roots[f * 3 + 1], roots[f * 3 + 2]);
+        globals[j] = local;
+      } else {
+        // offsets are parent-local: the parent's world rotation turns them.
+        pos[j] = SOMA.offsets[j].clone().applyQuaternion(globals[parent]).add(pos[parent]);
+        globals[j] = globals[parent].clone().multiply(local);
+      }
+    }
+    somaFrames.push(pos);
+  }
+
+  // One box per parent->child bone, positioned/oriented per frame.
+  const pairs = [];
+  for (let j = 0; j < joints; j++) if (SOMA.parents[j] >= 0) pairs.push([SOMA.parents[j], j]);
+  const box = new THREE.BoxGeometry(1, 1, 1);
+  somaMesh = new THREE.InstancedMesh(
+    box,
+    new THREE.MeshNormalMaterial(),
+    pairs.length + joints, // bones + joint dots
+  );
+  scene.add(somaMesh);
+  somaPairs = pairs;
+  return { frames, joints };
+}
+
+let somaPairs = [];
+
+function showSoma(frame) {
+  const pos = somaFrames[Math.max(0, Math.min(frame, somaFrames.length - 1))];
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), up = new THREE.Vector3(0, 1, 0);
+  const dir = new THREE.Vector3(), mid = new THREE.Vector3(), scale = new THREE.Vector3();
+  let i = 0;
+  const BONE_R = 0.022, JOINT_R = 0.03;
+  for (const [p, j] of somaPairs) {
+    dir.subVectors(pos[j], pos[p]);
+    const len = dir.length();
+    q.setFromUnitVectors(up, dir.clone().normalize());
+    mid.addVectors(pos[j], pos[p]).multiplyScalar(0.5);
+    scale.set(BONE_R, len, BONE_R);
+    m.compose(mid, q, scale);
+    somaMesh.setMatrixAt(i++, m);
+  }
+  q.identity();
+  scale.setScalar(JOINT_R);
+  for (let j = 0; j < SOMA.names.length; j++) {
+    m.compose(pos[j], q, scale);
+    somaMesh.setMatrixAt(i++, m);
+  }
+  somaMesh.instanceMatrix.needsUpdate = true;
+  return renderer.renderAsync(scene, camera);
+}
+
+window.__kimodoPreview = { boot, show, bootSoma, showSoma };</script>
+</body>
+</html>

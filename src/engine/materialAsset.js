@@ -3,7 +3,7 @@ import * as THREE from "three/webgpu";
 
 import { fract, interleavedGradientNoise, screenCoordinate, viewportDepthTexture } from "three/tsl";
 
-import { resolveAssetUrl } from "./assetResolver.js";
+import { loadAssetBinary } from "./assetResolver.js";
 import { migrateLegacyGraph } from "./shaderGraph.js";
 
 import { compileShaderGraph, invalidateShaderTextureCache, loadShaderTexture, matchStockPbr, migrateGraph } from "./tslGraph.js";
@@ -689,23 +689,25 @@ export async function loadMaterialAsset(path) {
 
     // material once the file is fetched and parsed.
 
-    entry = { path: key, material: new THREE.MeshPhysicalNodeMaterial(), def: { ...MATERIAL_DEFAULTS }, isVolume: false, renderable: true, migrated: false };
+    entry = { path: key, material: new THREE.MeshPhysicalNodeMaterial(), def: { ...MATERIAL_DEFAULTS }, isVolume: false, renderable: true, migrated: false, promise: null };
     cache.set(key, entry);
-    try {
-
-      const url = await resolveAssetUrl(path);
-
-      const def = await (await fetch(url)).json();
-
-      applyMaterialDef(entry, { ...MATERIAL_DEFAULTS, ...def });
-
-    } catch (err) {
-
-      console.error(`Failed to load material "${path}": ${err.message}`);
-
-    }
+    entry.promise = (async () => {
+      try {
+        const bytes = await loadAssetBinary(path);
+        if (!(bytes instanceof ArrayBuffer) && !ArrayBuffer.isView(bytes)) throw new Error("asset bytes unavailable");
+        const def = JSON.parse(new TextDecoder().decode(bytes));
+        applyMaterialDef(entry, { ...MATERIAL_DEFAULTS, ...def });
+      } catch (err) {
+        console.error(`Failed to load material "${path}": ${err.message}`);
+      }
+    })();
 
   }
+
+  // Every caller waits for the same first read. Returning the provisional
+  // material immediately made most MeshComponents report ready while the one
+  // cache owner was still applying the real definition and textures.
+  await entry.promise;
 
   return entry.material;
 
@@ -876,8 +878,9 @@ function readConstantColor(node) {
 export async function reloadMaterialAsset(path) {
   const entry = cache.get(assetKey(path));
   if (!entry) return false;
-  const url = await resolveAssetUrl(path);
-  const def = await (await fetch(url)).json();
+  const bytes = await loadAssetBinary(path);
+  if (!(bytes instanceof ArrayBuffer) && !ArrayBuffer.isView(bytes)) throw new Error(`Material request failed: "${path}"`);
+  const def = JSON.parse(new TextDecoder().decode(bytes));
   applyMaterialDef(entry, { ...MATERIAL_DEFAULTS, ...def });
   return true;
 }

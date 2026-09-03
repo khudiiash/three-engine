@@ -168,6 +168,26 @@ function handle(cmd, args = {}, writableRoot = null) {
     // engine again.
     case "read_binary_file":
       return { __b64: fs.readFileSync(args.path).toString("base64") };
+    case "read_binary_files": {
+      const paths = args.paths ?? [];
+      const headerLength = 8 + paths.length * 8;
+      const files = paths.map((path) => {
+        try { return fs.readFileSync(path); } catch { return null; }
+      });
+      const total = files.reduce((sum, file) => sum + (file ? (file.length + 3) & ~3 : 0), headerLength);
+      const packageBytes = Buffer.alloc(total);
+      packageBytes.write("BPK1", 0, "ascii");
+      packageBytes.writeUInt32LE(paths.length, 4);
+      let payload = headerLength;
+      files.forEach((file, index) => {
+        if (!file) return;
+        packageBytes.writeUInt32LE(1, 8 + index * 8);
+        packageBytes.writeUInt32LE(file.length, 12 + index * 8);
+        file.copy(packageBytes, payload);
+        payload += (file.length + 3) & ~3;
+      });
+      return { __b64: packageBytes.toString("base64") };
+    }
     case "read_binary_file_head": {
       const fd = fs.openSync(args.path, "r");
       const max = Number(args.maxBytes ?? args.max_bytes ?? 65536);

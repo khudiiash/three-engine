@@ -48,18 +48,19 @@
 // docs/GI_SRC_REBUILD_PLAN.md §4.1, §4.2, §7 Phase 1.
 
 import * as THREE from "three/webgpu";
-import { float, ivec2, step, texture, uint, uniform, vec3 } from "three/tsl";
+import { float, If, ivec2, step, texture, uint, uniform, vec3 } from "three/tsl";
 import {
   ALPHA_TRACK_HOLD_MS, BIN_BUDGET, CAM_SETTLE_ALPHA, CASCADE_COUNT, COLD_GUARD_FRAMES, GOV_HI, GOV_LO, MAX_LODS,
   LIGHT_SETTLE_FADE_MS, LIGHT_SETTLE_HOLD_MS,
   PROBE_RAY_CAP_OFF, REST_BOOT_HOLD_MS, REST_CAM_FADE_MS, REST_CAM_HOLD_MS,
   REST_TRANSPORT_FRACTION,
   SEED_RAYS, SRC_QUALITY, SUM_SHIFT, SURPRISE_ONE, TEMPORAL_ALPHA,
-  TEMPORAL_ALPHA_STILL, W0, lod0Reach, srcProbeRayCap, srcQualityTier, srcTransportRays,
+  TEMPORAL_ALPHA_STILL, W0, binCount, lod0Reach, srcBinCeiling, srcProbeRayCap, srcQualityTier, srcTransportRays,
 } from "./srcConfig.js";
 import { createSrcProbeGizmos } from "./srcGizmos.js";
 import { R2_ALPHA1_FX, R2_ALPHA2_FX, worldKeysEnabled } from "./srcMath.js";
 import {
+  createSrcBlockLookupDirect,
   createSrcHashBlockFrame,
   createSrcProbeFrame,
   createSrcProbeStore,
@@ -67,8 +68,12 @@ import {
   readSrcProbeStats,
 } from "./srcProbes.js";
 import {
-  DEPOSIT_SCALE, createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters,
+  DEPOSIT_SCALE, SEC_HIT_WORDS, createSrcBinStore, createSrcDepositFrame, createSrcShadeCounters,
 } from "./srcDeposit.js";
+// §11.13's instrument: the bin-count histogram behind `__giProfileBinHistogram`
+// reads the probe table and the bin words by their layout constants.
+import * as SrcProbesNS from "./srcProbes.js";
+import * as SrcDepositNS from "./srcDeposit.js";
 import { createSrcHitAttribution, createSrcHitLighting, createSrcHitShader, sunTerm } from "./srcShade.js";
 import { createLightTreeEmitterEval, createLightTreeSampler } from "./lightTreeGpu.js";
 import { createSrcMergeFrame, formatSrcMerge } from "./srcMerge.js";
@@ -78,6 +83,7 @@ import { createSrcGlossyGather, createSrcScreenGather, formatSrcGather } from ".
 import { createSrcTileAtlas, formatSrcTiles } from "./srcTiles.js";
 import { createSrcRayFrame, createSrcRayStore } from "./srcRays.js";
 import { createSrcSceneTrace, createSrcVisibility, ifMoverHit, moverSurfaceAt } from "./srcTrace.js";
+import { createSrcBvhSceneTrace, createSrcBvhVisibility } from "./srcBvhTrace.js";
 
 /**
  * Camera drift, in units of s₀, that triggers a re-anchor — DERIVED from the
@@ -206,9 +212,19 @@ function expectedC0Probes(pixelCount) {
  */
 export const SRC_POOL_FLOORS = { c0Probes: 16384, binBudget: 700_000 };
 
-/** Where growth stops: the old up-front allocations, now the worst case. */
-export function srcPoolCeilings(pixelCount) {
-  return { c0Probes: expectedC0Probes(pixelCount), binBudget: BIN_BUDGET };
+/**
+ * Where growth stops: the slot ceiling is the old up-front allocation (now
+ * the worst case); the bin ceiling FOLLOWS THE DEVICE (§11.4 A2 — see
+ * `srcBinCeiling`), with `BIN_BUDGET` as what a portable 128 MiB binding
+ * gets. `reserveBytes` is what else rides the scratch binding ([J]'s hit list
+ * and the per-block statistics); a built system passes its own through
+ * `poolCeilings()`, which is the form GISystem's ladder should read.
+ */
+export function srcPoolCeilings(pixelCount, { deviceLimit = 0, reserveBytes = 0 } = {}) {
+  return {
+    c0Probes: expectedC0Probes(pixelCount),
+    binBudget: deviceLimit > 0 ? srcBinCeiling({ deviceLimitBytes: deviceLimit, reserveBytes }) : BIN_BUDGET,
+  };
 }
 
 /**
@@ -247,7 +263,16 @@ export function createSrcProbeSystem({
   // (every fixture) keeps the flat `sky` path bit-identical.
   skyEnv = null,
   lighting = null, surfaces = null, sceneMotion = null, trackMotion = null,
+  // §10: `{ dyn }` — the dynamic-object set that owns the static BVH8. When
+  // given, the transport traces the BVH (srcBvhTrace.js) instead of the
+  // occupancy pyramid, and hits are attributed by slot (`surfaces.surfaceAtHit`).
+  bvhTrace = null,
   pools = null,
+  // §11.4 A2 — the device's storage limit in BYTES (`min(maxStorageBuffer-
+  // BindingSize, maxBufferSize)`), which bounds the bin store's single scratch
+  // binding and therefore the pool ceiling. The portable default is what every
+  // fixture gets; GISystem passes the real device's.
+  deviceLimit = 128 * 1024 * 1024,
   // §12.90 — the SCENE-DERIVED gather lattice, or undefined to keep the tier's.
   // GISystem's separator census picks it; see its ledger for why a tier
   // constant was the wrong shape (it made the gather's stencil reach 1.8× the
@@ -262,6 +287,18 @@ export function createSrcProbeSystem({
     || (Number.isFinite(spacing0Override) && spacing0Override > 0 ? spacing0Override : 0)
     || tier.spacing0;
   const pixelCount = width * height;
+  let activePixelCount = pixelCount;
+  // Screen-local lookup/ray buffers are capacity-sized once. A viewport
+  // resize then changes active dispatch counts and uniforms, while the world
+  // probe/bin store (and its converged lighting) stays alive. The default
+  // matches GISystem's portable resolve-pixel ceiling; an explicit larger
+  // first build still wins.
+  const pixelCapacity = Math.max(
+    pixelCount,
+    Math.ceil(Number(globalThis.__giSrcPixelCapacity)
+      || Number(props?.resolveMaxPixels)
+      || pixelCount),
+  );
 
   // Resolved pool sizes, floors-first (§12.77 Unit A). Precedence: the FIXED
   // hatches (`__giSrcC0Probes`/`__giSrcBinBudget` — freeze the pool for a
@@ -270,16 +307,60 @@ export function createSrcProbeSystem({
   // `__giSrcPoolInit` (growth-PERMITTED initial sizes, for exercising the
   // grow path in a harness) > the floors.
   const initHatch = globalThis.__giSrcPoolInit ?? null;
+  // §11.7 — THE FLOOR FOLLOWS THE DEVICE TOO. Every pool grow is a probe-
+  // store rebuild: a cold field and a recompile of the 68 SRC kernels, which
+  // the user reads as "GI drops to ambient for a minute, then a freeze". On
+  // a desktop-class ceiling (≥ 8 M bins) the boot floor is 2.8 M bins /
+  // 32 768 c0 slots — 78 MB, an amount this adapter does not notice — so a
+  // Bistro-class scene boots without a rung and a full walk costs at most
+  // one; the portable floor stays the measured-clean 700 k.
+  const deviceFloors = srcBinCeiling({ deviceLimitBytes: deviceLimit }) >= 8_000_000
+    ? { c0Probes: 32_768, binBudget: 2_800_000 }
+    : SRC_POOL_FLOORS;
   const poolConfig = {
     c0Probes: Number(globalThis.__giSrcC0Probes)
       || Number(pools?.c0Probes)
       || Number(initHatch?.c0Probes)
-      || SRC_POOL_FLOORS.c0Probes,
+      || deviceFloors.c0Probes,
     binBudget: Number(globalThis.__giSrcBinBudget)
       || Number(pools?.binBudget)
       || Number(initHatch?.binBudget)
-      || SRC_POOL_FLOORS.binBudget,
+      || deviceFloors.binBudget,
+    /** The floor the ladder never sizes a cascade below (its equal split). */
+    floorBudget: deviceFloors.binBudget,
+    // §11.4 A3 — an explicit per-cascade BLOCK vector (from GISystem's
+    // peak-demand ladder, or a scene's persisted pools), or null for the
+    // equal split of `binBudget`. A FIXED bin-budget hatch overrides it, so a
+    // pinned A/B arm still means what the arm that set it meant.
+    blocks: !Number(globalThis.__giSrcBinBudget)
+      && Array.isArray(pools?.blocks) && pools.blocks.length === CASCADE_COUNT
+      && pools.blocks.every((b) => Number.isFinite(b) && b > 0)
+      ? pools.blocks.map((b) => Math.floor(b))
+      : null,
   };
+  // The scratch binding also carries [J]'s hit list and the per-block
+  // statistics; reserve them (the hit list at the tier's ray ceiling, the
+  // statistics at 8 MiB — generous for any pool this ceiling admits) so the
+  // ceiling is what `createSrcBinStore` can actually allocate.
+  const scratchReserveBytes = (1 + srcTransportRays(srcQualityTier(props)) * SEC_HIT_WORDS) * 4
+    + 8 * 1024 * 1024;
+  const binCeiling = srcBinCeiling({ deviceLimitBytes: deviceLimit, reserveBytes: scratchReserveBytes });
+  if (poolConfig.blocks) {
+    // A persisted vector may come from a bigger device (or a bigger window);
+    // scale it under THIS device's ceiling rather than let the constructor
+    // throw — the equal-bins-per-cascade shape is preserved by a uniform scale.
+    const total = poolConfig.blocks.reduce((n, b, c) => n + b * binCount(c, W0), 0);
+    if (total > binCeiling) {
+      const k = binCeiling / total;
+      poolConfig.blocks = poolConfig.blocks.map((b) => Math.max(1, Math.floor(b * k)));
+      console.warn(
+        `[gi] src pools: the requested block vector (${(total / 1e6).toFixed(2)}M bins) exceeds this ` +
+        `device's ${(binCeiling / 1e6).toFixed(2)}M-bin ceiling — scaled to ${poolConfig.blocks.join("/")}`,
+      );
+    }
+  } else if (poolConfig.binBudget > binCeiling) {
+    poolConfig.binBudget = binCeiling;
+  }
 
   const store = createSrcProbeStore({
     // ── SIZED FROM THE FLOORS, GROWN ON PRESSURE (§12.77 Unit A) ────────────
@@ -299,7 +380,13 @@ export function createSrcProbeSystem({
     // allocation lives next to the other two (`__giSrcSpacing0`, `__giSrcLmax`).
     // In bins, not bytes — the byte count is srcDeposit's layout to know.
     binBudget: poolConfig.binBudget,
+    // §11.4 A3 — explicit blocks win over the equal split when present.
+    blockCapacity: poolConfig.blocks,
   });
+  // What was ACTUALLY built, so the ladder and `setSize` compare against the
+  // real vector whichever path sized it (equal split or explicit).
+  poolConfig.blocks = store.cascades.map((c) => c.blockCapacity);
+  poolConfig.binBudget = poolConfig.blocks.reduce((n, b, c) => n + b * binCount(c, W0), 0);
 
   const cameraU = uniform(new THREE.Vector3());
   const anchorU = uniform(new THREE.Vector3());
@@ -307,6 +394,8 @@ export function createSrcProbeSystem({
   // DISPATCH counts are baked into the compute nodes, so a resize still rebuilds
   // the frame — see `setSize` on the returned object.
   const widthU = uniform(width, "uint");
+  const heightU = uniform(height, "uint");
+  const pixelCountU = uniform(pixelCount, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
 
@@ -352,23 +441,35 @@ export function createSrcProbeSystem({
   const SRC_GATHER_SCALE = 1;
   const gatherWidth = Math.max(1, Math.ceil(width / SRC_GATHER_SCALE));
   const gatherHeight = Math.max(1, Math.ceil(height / SRC_GATHER_SCALE));
-  const gatherReadPixel = (i) => readPixel(
-    i.div(uint(gatherWidth)).mul(uint(SRC_GATHER_SCALE * width))
-      .add(i.mod(uint(gatherWidth)).mul(uint(SRC_GATHER_SCALE))),
-  );
-  // The GLOSSY gather's grid (§12.71b v2) — half the resolve, its own map
-  // into the full-res gbuffer for exactly the shear reason above. 2 is safe
+  const gatherReadPixel = (i) => {
+    const gx = i.mod(uint(gatherWidth)).toVar();
+    const gy = i.div(uint(gatherWidth)).toVar();
+    const sx = gx.mul(widthU).div(uint(gatherWidth)).toVar();
+    const sy = gy.mul(heightU).div(uint(gatherHeight)).toVar();
+    return readPixel(sy.mul(widthU).add(sx));
+  };
+  // The GLOSSY gather's grid (§12.71b v2) — its own quality-scaled map into
+  // the full-res gbuffer for exactly the shear reason above. Downsampling is safe
   // where the diffuse gather's backed-out 2 was not: giLight blends the
   // exact-BVH hit over this term on mirror pixels, and a glossy lobe is an
   // angular blur before it is a spatial one (the pass header has the full
   // argument).
-  const GLOSSY_SCALE = 2;
+  const GLOSSY_SCALE_BY_QUALITY = {
+    low: 4,
+    medium: 3,
+    high: 2,
+    ultra: 1.5,
+  };
+  const GLOSSY_SCALE = GLOSSY_SCALE_BY_QUALITY[props?.reflectionsQuality] ?? 2;
   const glossyWidth = Math.max(1, Math.ceil(width / GLOSSY_SCALE));
   const glossyHeight = Math.max(1, Math.ceil(height / GLOSSY_SCALE));
-  const glossyReadPixel = (i) => readPixel(
-    i.div(uint(glossyWidth)).mul(uint(GLOSSY_SCALE * width))
-      .add(i.mod(uint(glossyWidth)).mul(uint(GLOSSY_SCALE))),
-  );
+  const glossyReadPixel = (i) => {
+    const gx = i.mod(uint(glossyWidth)).toVar();
+    const gy = i.div(uint(glossyWidth)).toVar();
+    const sx = gx.mul(widthU).div(uint(glossyWidth)).toVar();
+    const sy = gy.mul(heightU).div(uint(glossyHeight)).toVar();
+    return readPixel(sy.mul(widthU).add(sx));
+  };
   const readPixel = (i) => {
     const t = texelOf(i);
     const g0 = positionNode.load(t).toVar();
@@ -517,17 +618,6 @@ export function createSrcProbeSystem({
   const retainKillU = uniform(0, "uint");
   let retainKillFrames = 0;
 
-  const frame = createSrcProbeFrame(store, {
-    spacing0,
-    camera: vec3(cameraU),
-    anchor: vec3(anchorU),
-    pixelCount,
-    maxLods: MAX_LODS,
-    readPixel,
-    frameStamp: frameStampU,
-    retainKill: retainKillU,
-  });
-
   // The gizmos share the SAME anchor uniform, not a copy. A gizmo lattice
   // drawn from a second anchor would look perfectly plausible and be in the
   // wrong place, which is the most misleading failure a debug view can have.
@@ -540,7 +630,6 @@ export function createSrcProbeSystem({
   // addressed by, and unit 3 needs it whether or not a scaffold exists. It also
   // costs nothing to look at: `srcRays.js`'s passes are eight tiny dispatches
   // over the probe table, no marching.
-  const rayStore = createSrcRayStore(store, { pixelCount });
   // ── THE RAY CEILING (srcConfig's `transportRays`) ─────────────────────────
   //
   // Uniforms, not build-time constants, so the ceiling is an A/B and a resize
@@ -549,7 +638,7 @@ export function createSrcProbeSystem({
   // user's editor and 94% of a 260 ms SRC chain.
   const strideU = uniform(1, "uint");
   const phaseU = uniform(0, "uint");
-  const naturalRays = pixelCount * tier.raysPerPixel;
+  let naturalRays = activePixelCount * tier.raysPerPixel;
   // ── THE CEILING IS POLLED PER FRAME, NOT READ AT BUILD ────────────────────
   //
   // Same rule `__giSrcAlpha` follows two dozen lines up, and for the reason
@@ -582,6 +671,22 @@ export function createSrcProbeSystem({
     1,
     Math.ceil(SRC_QUALITY[srcQualityTier(props)].transportRays / Math.max(1, tier.raysPerPixel)),
   );
+  const rayStore = createSrcRayStore(store, { pixelCount: pixelCapacity });
+  const coldPriority = globalThis.__giSrcColdPriority !== false && (
+    transportThreads < pixelCapacity || globalThis.__giSrcColdPriorityForce === true
+  );
+  const frame = createSrcProbeFrame(store, {
+    spacing0,
+    camera: vec3(cameraU),
+    anchor: vec3(anchorU),
+    pixelCount,
+    pixelCapacity,
+    maxLods: MAX_LODS,
+    readPixel,
+    frameStamp: frameStampU,
+    retainKill: retainKillU,
+    representative: coldPriority ? rayStore.rayCursor : null,
+  });
   // Two terms, and the `max` is what makes both directions of the hatch work.
   //
   //  `fill`  = floor(pixelCount / threads) — the stride that spreads the baked
@@ -598,10 +703,11 @@ export function createSrcProbeSystem({
   // strip lit, the rest dark, which reads as a GI bug rather than as a budget.
   const strideFor = (ceiling) => Math.max(
     1,
-    Math.floor(pixelCount / transportThreads),
+    Math.floor(activePixelCount / transportThreads),
     Math.ceil(naturalRays / Math.max(1, ceiling)),
   );
   let rayCeiling = readCeiling();
+  const rayCeilingU = uniform(rayCeiling, "uint");
   let rayStride = strideFor(rayCeiling);
   strideU.value = rayStride;
   // The §12.61 rest cadence's current scale on the tier ceiling, captured for
@@ -611,11 +717,30 @@ export function createSrcProbeSystem({
   // and the TDZ ReferenceError silently cost the whole SRC build (the cost
   // probe read "1 kernels", 4.7% lit — a black scene wearing a probe failure).
   let restFactor = 1;
+  // ── §11.9 THE MOTION SCALE — FRAME TIME OUTRANKS CONVERGENCE WHILE THE
+  //    CAMERA MOVES (2026-09-03) ──────────────────────────────────────────
+  //
+  // The rest cadence above LIFTS the budget under camera motion (`camTerm`
+  // holds the full ceiling for 600 ms after every move) so that revealed
+  // probes fill fast. On the user's Bistro that is 82 k rays × ~420 ns =
+  // 35 ms of world dispatch EVERY frame while walking, beside a 17 ms
+  // emitter-shadow pass — 87 ms frames, 11 fps. The project's standing rule
+  // is a 60 fps floor above everything, and a moving image masks the noise
+  // this budget exists to average (the temporal filters already make that
+  // argument for themselves), so GISystem hands in a scale from its camera
+  // EMA: 1 at rest, `__giSrcMotionRayScale` (0.35) at full motion, applied to
+  // the ceiling (stride) AND the per-probe cap. Uniform writes, no rebuild;
+  // the rest cadence's own hold restores the full budget within ~20 frames of
+  // the camera stopping, which is when convergence can be seen again.
+  let motionScale = 1;
   /** §12.74: when the α-ramp motion signal last STARTED being continuously
    *  significant. 0 = not currently sustained. See the root-relax block. */
   let motionSustainSince = 0;
   /** When this system was built — the rest cadence's boot hold reads it. */
   const buildAt = performance.now();
+  // Frames since this system was built — the boot ramp's clock (syncCamera).
+  let framesSinceBuild = 0;
+  const BOOT_RAMP_FRAMES = 8;
   // ── THE PER-PROBE RAY CAP (srcConfig's `probeRayCap`, §12.32.1 option 1) ──
   //
   // The ceiling bounds the FRAME and prices rays by screen coverage; the cap
@@ -636,7 +761,7 @@ export function createSrcProbeSystem({
   // and the runtime hatch moves the stride silently afterwards. So publish it.
   const publishTransport = () => {
     globalThis.__giSrcTransport = {
-      pixelCount,
+      pixelCount: activePixelCount,
       threads: transportThreads,
       naturalRays,
       ceiling: rayCeiling,
@@ -697,7 +822,9 @@ export function createSrcProbeSystem({
   // the store's `scratch` buffer (R7) and the store therefore has to be built
   // knowing whether anything will shade.
   const staticSurfaceAt = surfaces?.surfaceAt ?? null;
-  const shadeEnabled = srcShadeEnabled() && !!lighting && !!staticSurfaceAt;
+  // §10: the field-less bundle attributes by SLOT (`surfaceAtHit`) and has no
+  // cell-keyed `surfaceAt`; either one is an attribution source.
+  const shadeEnabled = srcShadeEnabled() && !!lighting && !!(staticSurfaceAt || surfaces?.surfaceAtHit);
   // ── [J] IS THE SHADING PASS NOW, AND THE HIT LIST IS ITS INPUT (§12.53) ───
   //
   // The list used to exist only for the SECOND BOUNCE, so it was gated on the
@@ -743,7 +870,7 @@ export function createSrcProbeSystem({
   // wrong rather than trusting it.
   const secondaryCapacity = shadingPass ? transportThreads * tier.raysPerPixel : 0;
   const binStore = volume?.occupancyField
-    ? createSrcBinStore(store, { w0: W0, secondaryCapacity })
+    ? createSrcBinStore(store, { w0: W0, secondaryCapacity, maxBytes: deviceLimit })
     : null;
 
   // ── ALGORITHM 3'S FRAME, now that the statistics have somewhere to live ───
@@ -777,6 +904,8 @@ export function createSrcProbeSystem({
       ? { frameStamp: frameStampU, boostEnable: boostEnableU, counters: store.counters }
       : null,
     surprise: surpriseBundle,
+    priority: coldPriority ? { frameStamp: frameStampU, ceiling: rayCeilingU } : null,
+    activePixels: pixelCountU,
   });
 
   // ── [H]: THE IRRADIANCE TILES (plan §12.18.7 unit 4) ─────────────────────
@@ -845,7 +974,57 @@ export function createSrcProbeSystem({
     ? volume?.occupancyField?.occupiedAtWorld
     : volume?.occupancyField?.occupancyAtWorld ?? volume?.occupancyField?.occupiedAtWorld) ?? null;
   const losWorld = volume?.world ?? null;
+  // Section 10: the BVH-only build answers the merge's cross-wall test with one
+  // any-hit segment between two lattice points (static geometry; movers do
+  // not carry walls). Null in the field build, where the point-in-solid march
+  // stays the opt-in arm.
+  const losSegment = bvhTrace?.dyn?.traceStaticBvh && globalThis.__giMergeLos !== false
+    ? (from, to) => {
+        const a = vec3(from).toVar();
+        const d = vec3(to).sub(a).toVar();
+        const len = d.length().max(1e-4).toVar();
+        const dir = d.div(len).toVar();
+        const v = float(1).toVar();
+        // The MIDDLE 80 % of the segment, as U3b's march sampled it: a parent
+        // corner whose lattice point sits inside a wall's slab is still a
+        // parent (its bins are the room's), and the child's own vicinity is
+        // its own business. Only a wall CROSSING the path cuts the corner.
+        // Measured: 2 cm margins cut in-room corners on the convergence rig
+        // and doubled the rest noise (3.5 → 6.3 %).
+        const st = bvhTrace.dyn.traceStaticBvh(a, dir, len.mul(0.1).max(0.02), len.mul(0.9).max(0.04), { anyHit: true });
+        If(st.x.greaterThanEqual(0), () => { v.assign(0); });
+        return v;
+      }
+    : null;
+  // ── §10.7: THE COARSE FALLBACK LATTICE (2026-09-03) ─────────────────────
+  //
+  // A c1 tile atlas and its hash lookup, for the screen gather to fall back
+  // to where the c0 lattice is STARVED. The header above says c1-3 tiles
+  // would "bake the same light more coarsely and nothing would read them" —
+  // true until this: on the user's Bistro c0 drops thousands of inserts
+  // during a walk (`dropped 10774 inserts (32768/32768)`), and a refused
+  // insert is a probe that does not exist, so its pixels had NOTHING to
+  // gather and fell to the far-field constant. c1 holds the same merged
+  // answer at 2x spacing with an eighth of the probes and is nowhere near
+  // its pool, so it is exactly the lattice to fall to.
+  //
+  // Cost: 5468 more tiles (~2.8 MB) and one more bake dispatch (~0.18 ms by
+  // proportion to c0's 0.71 ms at 21875 tiles). `__giGatherCoarseFallback
+  // = false` builds without it and restores the c0-only gather.
+  const coarseFallbackOn = !!binStore && globalThis.__giGatherCoarseFallback !== false;
+  const tilesCoarse = coarseFallbackOn
+    ? createSrcTileAtlas(store, binStore, {
+        w0: W0,
+        cascade: 1,
+        sky: sky ? vec3(sky) : vec3(0),
+        frameStamp: frameStampU,
+        skyEnv,
+      })
+    : null;
   const hashBlockFrame = tiles ? createSrcHashBlockFrame(store, 0) : null;
+  // Not `createSrcHashBlockFrame`: its one-buffer tail is sized for c0 alone
+  // and throws for any other cascade. The gather has bindings to spare.
+  const coarseLookup = tilesCoarse ? createSrcBlockLookupDirect(store, 1) : null;
   const gather = tiles
     ? createSrcScreenGather(store, tiles, {
         lookup: hashBlockFrame.lookup,
@@ -876,6 +1055,14 @@ export function createSrcProbeSystem({
         height: gatherHeight,
         maxLods: MAX_LODS,
         w0: W0,
+        // §10.7 — the coarse lattice this gather falls back to on starved
+        // pixels. SCREEN INSTANCE ONLY: [J] and the glossy gather shade a hit
+        // list rather than the image, and doubling an INLINED gather body at
+        // those call sites is the compile-time law this module has already
+        // learned twice (§12.39, §10.2).
+        coarse: coarseLookup
+          ? { lookup: coarseLookup, tiles: tilesCoarse, cascade: 1 }
+          : null,
         // §15 U3 — inert until `__giGatherLosWeight` arms it (the reader in
         // srcMath); see the closure's construction above.
         losOccupied,
@@ -885,7 +1072,8 @@ export function createSrcProbeSystem({
 
   // ── [I']: THE GLOSSY GATHER (§12.71b v2) ─────────────────────────────────
   //
-  // The same integral as [I], fed the reflection vector, at half res — the
+  // The same integral as [I], fed the reflection vector, at the reflection
+  // rail's selected resolution — the
   // resolve samples it into the radiance target that giLight's specular slot
   // reads. Default ON; `__giGlossyRadiance = false` is the kill switch (the
   // OFF arm must reproduce the dark-but-stable metals the opt-in era shipped).
@@ -944,6 +1132,9 @@ export function createSrcProbeSystem({
           // of the GEOMETRY — a normal flipped to oppose the ray would step the
           // wrong way on every back-face hit and silently attribute the cell
           // behind the wall.
+          // §10: a BVH hit carries its SLOT; the attribution is by slot, and
+          // the cell-keyed path below never runs for it.
+          if (surfaces?.surfaceAtHit && hit.slot != null) return surfaces.surfaceAtHit(hit, dir);
           if (hit.voxel == null) {
             throw new Error(
               "srcSystem: the scene trace produced no `voxel`, so static hits have no " +
@@ -987,6 +1178,8 @@ export function createSrcProbeSystem({
         lights: lighting.lights ?? [],
         emitters: lighting.emitters ?? [],
         maxRay: lighting.maxRay ?? null,
+        // §11.10: the sun's shadow map at hits — one BVH descent fewer per ray.
+        sunShadow: lighting.sunShadow ?? null,
         // ── THE ISOLATION HATCH (R12/R14) ────────────────────────────────
         //
         // `__giSrcNoShadow` drops the visibility ray entirely, which separates
@@ -994,7 +1187,11 @@ export function createSrcProbeSystem({
         // "no light reaches the hit" (the lighting term is zero) from "every
         // hit is occluded" (the ray says so). With it on, `maxL` still zero
         // means the lighting; `maxL` nonzero means the visibility.
-        visibility: globalThis.__giSrcNoShadow === true ? null : createSrcVisibility(volume.occupancyField, volume.world, {
+        visibility: globalThis.__giSrcNoShadow === true
+          ? null
+          : bvhTrace
+            ? createSrcBvhVisibility(bvhTrace.dyn, volume.world, { movers: globalThis.__giSrcBvhShadowMovers === true })
+            : createSrcVisibility(volume.occupancyField, volume.world, {
           rayHitMode: volume.rayHitMode,
           // A shadow ray is SHORTER than a diffuse one by construction — it
           // stops at its source — so it does not inherit the 192 the primary
@@ -1100,6 +1297,13 @@ export function createSrcProbeSystem({
           // `createSrcHitLighting`'s `splitKeep`. It is the only way to weigh
           // the removed half against the delivered half; never a shipping arm.
           : { slot: lighting.sunSlot, keep: globalThis.__giSrcSunSplitKeep === true },
+        // A bounded first-bounce correction, independent of the cached-normal
+        // sun split above (which remains opt-in and known-lossy). The owning
+        // cascade supplies the gain transiently in [J]; only this runtime-named
+        // directional slot receives it.
+        sunCompensation: globalThis.__giSrcSunSplit === true || lighting?.sunSlot == null
+          ? null
+          : { slot: lighting.sunSlot },
         count: shadeCounters,
       }
     : null;
@@ -1174,12 +1378,39 @@ export function createSrcProbeSystem({
         // §12.52's LUMA half, at the address [E] put in the record. Null with
         // the bundle off, and then not one node of it is built.
         surprise: surpriseBundle ? { statBase: binStore.blockStatBase } : null,
+        sunBounceCompensation: globalThis.__giSrcSunSplit !== true && lighting?.sunSlot != null,
         capacity: secondaryCapacity,
       })
     : null;
+  // §11.13 THE FAR DUTY — the fraction of rays that trace beyond cascade
+  // `farFrom − 1` (see createSrcDepositFrame's note). A live uniform: at rest
+  // the far field is static and its blocks' windows lengthen to hold their
+  // sample counts; in motion it rises so the far field follows. Numbers are
+  // dev hatches until the flicker probe and the user's walk have judged them.
+  // `__giSrcFarDuty = false` removes the arm (build-time, kernel byte-identical).
+  const farDutyOn = globalThis.__giSrcFarDuty !== false;
+  const farDutyU = uniform(1);
+  const farDutyRest = () => {
+    const v = Number(globalThis.__giSrcFarDuty);
+    return Number.isFinite(v) && v > 0 && v <= 1 ? v : 0.25;
+  };
+  const farDutyMotion = () => {
+    const v = Number(globalThis.__giSrcFarDutyMotion);
+    return Number.isFinite(v) && v > 0 && v <= 1 ? v : 0.5;
+  };
+  const farFrom = Number.isInteger(Number(globalThis.__giSrcFarFrom))
+    ? Math.min(CASCADE_COUNT - 1, Math.max(1, Number(globalThis.__giSrcFarFrom)))
+    : 2;
+  if (farDutyOn && binStore) {
+    console.info(`[gi] src far duty: ${Math.round(farDutyRest() * 100)} % of rays trace beyond cascade ${farFrom - 1} at rest (${Math.round(farDutyMotion() * 100)} % in motion); the far bins hold their sample counts through the influx compensation — __giSrcFarDuty = false restores full reach`);
+  }
   const deposit = binStore
     ? createSrcDepositFrame(store, binStore, {
         pixelProbe: frame.pixelProbe,
+        farDuty: farDutyOn ? farDutyU : null,
+        farFrom,
+        // `__giSrcFarNeed` (rays, build-time): the need floor; 0 disables it.
+        farNeed: Number.isFinite(Number(globalThis.__giSrcFarNeed)) ? Math.max(0, Number(globalThis.__giSrcFarNeed)) : 1 / 32,
         pixelRayBase: rayStore.pixelRayBase,
         // [D5]'s winner worklist — [E] traces densely from it (§12.44); the
         // stride/phase uniforms below stay because the dispatch SIZE is still
@@ -1204,13 +1435,16 @@ export function createSrcProbeSystem({
         shadeHit,
         // §12.82: what `[F]` re-evaluates the cached sun transfer against.
         sunClose,
+        sunBounceCompensation: globalThis.__giSrcSunSplit !== true && lighting?.sunSlot != null,
         // [J]'s hit list. Passed ONLY when [J] exists, and that is what keeps
         // the un-split kernel byte-identical to the pre-[J] one: with this
         // null, not a node of the record or the append is built.
         secondary: secondary
           ? { base: binStore.hitListBase, capacity: secondaryCapacity }
           : null,
-        trace: createSrcSceneTrace(volume.occupancyField, volume.world, {
+        trace: bvhTrace
+          ? createSrcBvhSceneTrace(bvhTrace.dyn, volume.world)
+          : createSrcSceneTrace(volume.occupancyField, volume.world, {
           rayHitMode: volume.rayHitMode,
           // ── THE STEP BUDGET, MEASURED RATHER THAN INHERITED ──────────────
           //
@@ -1294,6 +1528,7 @@ export function createSrcProbeSystem({
   const seedRaysU = uniform(SEED_RAYS);
   const seed = seedOn && deposit
     ? createSrcSeedFrame(store, binStore, {
+        losSegment,
         lmax: lmaxU,
         seedRays: seedRaysU,
         // §12.59.2's spatial fallback (cold-column rescue) — §16 D2b: armed
@@ -1329,6 +1564,7 @@ export function createSrcProbeSystem({
         // direction when this is armed.
         skyEnv,
         w0: W0,
+        losSegment,
         // §15 U3b — the same one-bit closure the gather instances take; the
         // merge marches child probe → parent corner with it so cross-wall
         // parents stop poisoning this room's own tiles (the leak the
@@ -1478,7 +1714,7 @@ export function createSrcProbeSystem({
             : seed
               ? [deposit.decay, ...seed.passes, deposit.scatter, deposit.resolve]
               : deposit.passes),
-          ...merge.passes, ...tiles.passes,
+          ...merge.passes, ...tiles.passes, ...(tilesCoarse?.passes ?? []),
           gather.reset, gather.compute,
           // The glossy gather reads the SAME atlas bake the diffuse gather
           // does, so anywhere after `tiles.passes` is correct; after the
@@ -1532,7 +1768,7 @@ export function createSrcProbeSystem({
                 ]
               : [{ label: "deposit (trace + shade)", count: deposit.passes.length }]),
           { label: "merge", count: merge.passes.length },
-          { label: "tiles", count: tiles.passes.length },
+          { label: "tiles", count: tiles.passes.length + (tilesCoarse?.passes.length ?? 0) },
           { label: "gather", count: 2 },
           { label: "glossy gather", count: glossy ? 1 : 0 },
         ].filter((g) => g.count > 0)
@@ -1540,6 +1776,21 @@ export function createSrcProbeSystem({
           { label: "populate", count: frame.passes.length },
           { label: "rays", count: rayFrame.passes.length },
         ],
+    /**
+     * First view-dependent pass. Everything before this index advances the
+     * world-keyed transport (population through tile bake); gather and every
+     * pass appended after it consume that persistent world result for the
+     * current camera. GISystem may therefore cadence the expensive world half
+     * without ever presenting a stale screen-space AO/gather coordinate.
+     */
+    get screenPassStart() {
+      let at = 0;
+      for (const group of this.passGroups ?? []) {
+        if (group.label === "gather") return at;
+        at += group.count;
+      }
+      return this.passes?.length ?? 0;
+    },
     pixelProbe: frame.pixelProbe,
     /** Non-null only when the hit shading was actually built — see `describeSrcProbeSystem`. */
     shading: (attribute && secondary) || shadeHit
@@ -1565,6 +1816,16 @@ export function createSrcProbeSystem({
     // pressure check can compare its grown target against reality and setSize
     // can tell a pool grow from a no-op.
     poolConfig,
+    /** §11.4 A2: the device storage limit this store was sized under (bytes). */
+    deviceLimit,
+    /** §11.9: GISystem's camera-motion scale on the ray ceiling and cap, [0.1, 1]. */
+    setMotionRayScale(k) {
+      const v = Number.isFinite(k) ? Math.min(1, Math.max(0.1, k)) : 1;
+      motionScale = v;
+    },
+    get motionRayScale() { return motionScale; },
+    /** §11.4 A2: where the ladder stops on THIS device — slots and bins. */
+    poolCeilings: () => srcPoolCeilings(pixelCount, { deviceLimit, reserveBytes: scratchReserveBytes }),
     /**
      * The pressure probe — TWO small readbacks. The per-cascade counter block
      * (live, failed, noBlock at PROBE BIRTH) alone is NOT the bin signal:
@@ -1589,7 +1850,7 @@ export function createSrcProbeSystem({
     // paying for in a different costume.
     get rayStride() { return rayStride; },
     get rayCeiling() { return rayCeiling; },
-    naturalRays,
+    get naturalRays() { return naturalRays; },
     get tracedRays() { return Math.ceil(naturalRays / rayStride); },
     get probeRayCap() { return probeRayCap; },
     get reanchorCount() { return reanchors; },
@@ -1618,7 +1879,13 @@ export function createSrcProbeSystem({
      * `passes` — the whole frame's geometry is derived from these two uniforms,
      * so a stale camera puts every probe one frame behind its own gbuffer.
      */
-    syncCamera(camera) {
+    /**
+     * @param {object} [opts]
+     * @param {boolean} [opts.holdAnchor]  do not re-anchor on drift this frame
+     *   (the occupancy chain is mid-rebuild and the world passes are held: a
+     *   re-anchor would retire every probe with nothing able to refill them).
+     */
+    syncCamera(camera, { holdAnchor = false } = {}) {
       camera.getWorldPosition(cameraU.value);
       // ── THE CAMERA-PAN LIFT WINDOW — NOW OPT-IN (§12.47) ─────────────────
       // The camera is DELIBERATELY absent from the α signal (§12.38) and from
@@ -1796,6 +2063,14 @@ export function createSrcProbeSystem({
           if (gather.losStrength.value !== v) gather.losStrength.value = v;
         }
       }
+      // §10.6's behind-plane depth cap, live, so one boot can A/B the blobs
+      // at one pose: `__giGatherPlaneDepthLive` in metres (1e6 = uncapped).
+      if (gather?.planeDepth) {
+        const pin = Number(globalThis.__giGatherPlaneDepthLive);
+        if (Number.isFinite(pin) && pin > 0) {
+          if (gather.planeDepth.value !== pin) gather.planeDepth.value = pin;
+        }
+      }
       // ── THE ROOT RELAXES WITH MOTION (§12.43) ────────────────────────────
       // At m = 0 this is §12.32's root exactly — preserve evidence across
       // sparse refreshes, the still scene's variance shield. At m = 1 it is
@@ -1848,15 +2123,35 @@ export function createSrcProbeSystem({
       // the departed light's ghost needs evidence to drain without blotches.
       const restDrive = Math.max(mLight, tr, camTerm, bootTerm, lightTerm);
       restFactor = restOn ? restFraction + (1 - restFraction) * restDrive : 1;
+      // ── THE BOOT RAMP (2026-09-02, the lit-frame stall) ─────────────────
+      // The transport's FIRST trace is ~2 s of GPU on the user's Level
+      // (`probe:gi-boot-frames`, per-submit clock: `src:deposit (trace +
+      // attribute)` the first slow submit, 393 k rays; 32 k rays → 0.8 s, a
+      // 4× smaller pool → 1.0 s — half the frame is ray work on a cold
+      // field, half is pool-sized sweeps). The boot hold above spends the
+      // FULL budget from frame one, which is the one frame that cannot
+      // afford it: the page blocks on the swap chain behind that submit.
+      // Ramp the ceiling over the first BOOT_RAMP_FRAMES frames instead
+      // (1/8 → 1); the hold still lasts its 3 s, so convergence loses ~4
+      // frames' worth of rays out of ~180. `__giSrcBootRampFrames` pins the
+      // length (0 = off).
+      const rampPin = Number(globalThis.__giSrcBootRampFrames);
+      const rampFrames = Number.isFinite(rampPin) ? Math.max(0, rampPin) : BOOT_RAMP_FRAMES;
+      framesSinceBuild += 1;
+      const bootRamp = rampFrames > 0 && !ceilingPinned
+        ? Math.min(1, framesSinceBuild / rampFrames)
+        : 1;
+      restFactor *= bootRamp;
       globalThis.__giSrcRestFactorLive = restFactor;
       // The ceiling is live (see `readCeiling`) and the rest factor rides it.
       // Re-derived HERE, before the stride root, so `rootS` reads the stride
       // this frame actually refreshes at — the old order computed the root
       // from last frame's stride, harmless when the ceiling moved once per
       // probe run and wrong every frame near a rest transition.
-      const nextCeiling = Math.max(1, Math.round(readCeiling() * restFactor));
+      const nextCeiling = Math.max(1, Math.round(readCeiling() * restFactor * motionScale));
       if (nextCeiling !== rayCeiling) {
         rayCeiling = nextCeiling;
+        rayCeilingU.value = rayCeiling;
         rayStride = strideFor(rayCeiling);
         strideU.value = rayStride;
         publishTransport();
@@ -1912,9 +2207,48 @@ export function createSrcProbeSystem({
           ? Math.min(1, Math.max(0, rootPin))
           : Math.min(MOTION_ROOT_MAX, mLight));
       globalThis.__giSrcMotionRootLive = sustained;
-      const rootS = 1 + (Math.max(1, rayStride) - 1) * (1 - Math.max(tr, sustained));
+      // ── THE LIGHT-SETTLE HOLD LIFTS THE STRIDE ROOT TOO (2026-09-02) ────
+      //
+      // `probe:gi-src-converge`, strided arm (stride 12 = the user's ultra
+      // regime), with the transport's dials traced through a 3× light step:
+      // α ran 0.1 → 0.05 → 0.02 inside 3 s, exactly as the settle hold
+      // intends, but the ROOT went 0.70 → 0.38 → 0 with `sustained` — the
+      // motion signal, which a light step only brushes — so the settle
+      // alpha was being paid at the 4th…8th root per frame and the still
+      // alpha at the 12th: 0.22 of the old field left at 2.5 s, then a
+      // 470-frame crawl to 90 % (t90 10.8 s; every frame of it at the
+      // shipped 2 %-per-visit blend). The surprise detector cannot carry
+      // this case either — its shot-noise floor is blind below ~2 deposits
+      // per frame per block (`scratchpad/surprise-sim.mjs` on the CPU twin:
+      // a 3× step at 1 deposit/frame peaks at u 0.41, never trips), and at
+      // stride 12 that is most of the pool.
+      //
+      // The hold already KNOWS a light changed (`lightTerm`). While it is
+      // open the root is lifted with it: keep = (1−α) per frame, so the
+      // settle alpha converges in 2.3/α = 46 frames — inside the 1.5 s hold
+      // — and the fade hands the root back as the alpha falls. Energy is
+      // unaffected (the bins are count-weighted means; the decay scales sum
+      // and count alike). `__giSrcLightRootRelax = false` restores the
+      // motion-only root for an A/B.
+      const lightRootRelax = globalThis.__giSrcLightRootRelax !== false ? lightTerm : 0;
+      const rootS = 1 + (Math.max(1, rayStride) - 1) * (1 - Math.max(tr, sustained, lightRootRelax));
       const keep = (1 - alpha) ** (1 / rootS);
       if (keepU.value !== keep) keepU.value = keep;
+      // §11.13: the far duty follows motion — the camera's sustained motion
+      // or an open light window — between its rest and motion values.
+      if (farDutyOn) {
+        const m = Math.min(1, Math.max(0, Math.max(sustained, mLight)));
+        const rest = farDutyRest();
+        const duty = rest + (farDutyMotion() - rest) * m;
+        if (farDutyU.value !== duty) farDutyU.value = duty;
+        globalThis.__giSrcFarDutyLive = duty;
+      }
+      // Live dials for the convergence probe (read-only receipts, same reason
+      // `__giSrcAlphaLive` exists): the effective per-frame keep, the root it
+      // came through, and the light-settle term that may have lifted it.
+      globalThis.__giSrcKeepLive = keep;
+      globalThis.__giSrcRootSLive = rootS;
+      globalThis.__giSrcLightTermLive = lightTerm;
       // The compensation lift rides the same α, published for the same
       // reason α is: the rig's CAP arms need to SEE that compensation was
       // active, not assume it. Compare-then-assign, still scene uploads
@@ -1993,7 +2327,35 @@ export function createSrcProbeSystem({
         (tr > 0 && globalThis.__giSrcCapWindowLift !== false)
         || performance.now() < camHoldUntil
       );
-      const nextCap = capLifted ? PROBE_RAY_CAP_OFF : readCap();
+      // REST CAP (2026-09-02): at rest (the same drive the rest cadence reads:
+      // no light motion, no tracking, camera parked, no light surprise) the
+      // per-probe cap halves. Measured on the user's Bistro: the cap is what
+      // bounds the fired count NEAR the camera (41 592 rays of a 180 k stride
+      // want, 27 ms per world dispatch at ~650 ns per ray against a 2.8 M-tri
+      // BVH8), so halving it halves the dispatch while the far, stride-bound
+      // probes keep every ray they had. Surprised blocks still get their
+      // `cap << shift` lift, and tracking/camera motion lifts the cap entirely
+      // as before. `__giSrcRestCap = false` keeps the tier cap at rest.
+      const restDriveNow = (restFactor - REST_TRANSPORT_FRACTION) / Math.max(1e-6, 1 - REST_TRANSPORT_FRACTION);
+      const restCapOn = !capPinned && globalThis.__giSrcRestCap !== false && restDriveNow < 0.05;
+      // BOUNDED LIFT (2026-09-02): the tracking / light-window lift used to
+      // set the cap to OFF (0x3fffffff = unbounded per probe). Measured on the
+      // user's Bistro under camera motion: 61 184 rays per dispatch against
+      // 33 k at rest, the world chain at 33 ms EVERY frame, 15 fps. The near
+      // probes were taking hundreds of rays a frame while the far ones stayed
+      // stride-bound. Two times the tier cap (64 at ultra = 2 rays per bin per
+      // frame) is the lift now; `__giSrcCapLiftFactor` sets it (Infinity =
+      // the old unbounded lift).
+      const liftFactor = Number(globalThis.__giSrcCapLiftFactor);
+      const liftedCap = Number.isFinite(liftFactor) && liftFactor > 0
+        ? Math.min(PROBE_RAY_CAP_OFF, Math.max(1, Math.round(readCap() * liftFactor)))
+        : (liftFactor === Infinity ? PROBE_RAY_CAP_OFF : Math.min(PROBE_RAY_CAP_OFF, readCap() * 2));
+      const unscaledCap = capLifted ? liftedCap : (restCapOn ? Math.max(8, readCap() >> 1) : readCap());
+      // §11.9: the motion scale rides the cap too — the near probes are where
+      // the rays concentrate under motion (the bounded-lift note above).
+      const nextCap = unscaledCap >= PROBE_RAY_CAP_OFF
+        ? unscaledCap
+        : Math.max(4, Math.round(unscaledCap * motionScale));
       if (nextCap !== probeRayCap) {
         probeRayCap = nextCap;
         capU.value = nextCap;
@@ -2077,6 +2439,7 @@ export function createSrcProbeSystem({
       // every tier, so there is nothing left to protect against.
       const reanchorMetres = reanchorChebyshev() * spacing0;
       if (anchored && drift <= reanchorMetres) return false;
+      if (anchored && holdAnchor) return false;
       // Snap to a whole number of quanta rather than to the camera itself, so a
       // player pacing back and forth across the threshold does not re-anchor on
       // alternate frames. The quantum is the hysteresis.
@@ -2099,6 +2462,52 @@ export function createSrcProbeSystem({
 
     /** Telemetry for `profile.giPasses` and the boot log. Async — off the hot path. */
     async readStats(renderer) {
+      const readBinHistogram = async (r) => {
+        const P = SrcProbesNS;
+        const D = SrcDepositNS;
+        const table = new Uint32Array(await r.getArrayBufferAsync(store.probeTable.value));
+        const scratch = new Uint32Array(await r.getArrayBufferAsync(binStore.scratch.value));
+        const out = [];
+        for (let c = 0; c < store.cascades.length; c++) {
+          const pc = store.cascades[c];
+          const info = binStore.cascades.find((b) => b.cascade === c);
+          if (!info) continue;
+          const h = { zero: 0, below1: 0, one4: 0, four16: 0, above16: 0, total: 0, probes: 0 };
+          let sumAll = 0;
+          let sumSampled = 0;
+          for (let k = 0; k < pc.probeCapacity; k++) {
+            const w = (pc.probeBase + k) * P.PROBE_WORDS;
+            if ((table[w + P.PROBE_FLAGS] & P.FLAG_ALIVE) === 0) continue;
+            const block = table[w + P.PROBE_BLOCK] >>> 0;
+            if (block === P.SLOT_EMPTY) continue;
+            h.probes++;
+            const base = (info.binBase + block * info.bins) * D.BIN_WORDS;
+            for (let m = 0; m < info.bins; m++) {
+              const cnt = scratch[base + m * D.BIN_WORDS + D.BIN_COUNT] >>> 0;
+              const rays = cnt / D.DEPOSIT_SCALE;
+              h.total++;
+              sumAll += rays;
+              if (cnt === 0) h.zero++;
+              else {
+                sumSampled += rays;
+                if (rays < 1) h.below1++;
+                else if (rays < 4) h.one4++;
+                else if (rays < 16) h.four16++;
+                else h.above16++;
+              }
+            }
+          }
+          const pct = (n) => +(100 * n / Math.max(1, h.total)).toFixed(1);
+          out.push({
+            cascade: c, probes: h.probes, bins: h.total,
+            zeroPct: pct(h.zero), below1Pct: pct(h.below1), one4Pct: pct(h.one4),
+            four16Pct: pct(h.four16), above16Pct: pct(h.above16),
+            meanRaysAll: +(sumAll / Math.max(1, h.total)).toFixed(3),
+            meanRaysSampled: +(sumSampled / Math.max(1, h.total - h.zero)).toFixed(3),
+          });
+        }
+        return out;
+      };
       const stats = await readSrcProbeStats(renderer, store);
       // ── SURPRISE'S TWO INSTRUMENTS, PUBLISHED HERE AND NOT PER FRAME ─────
       //
@@ -2127,7 +2536,7 @@ export function createSrcProbeSystem({
         bytes: store.bytes + rayStore.bytes + (binStore?.bytes ?? 0)
           + (merge?.bytes ?? 0) + (tiles?.bytes ?? 0) + (hashBlockFrame?.bytes ?? 0),
         spacing0,
-        pixelCount,
+        pixelCount: activePixelCount,
         raysPerPixel: tier.raysPerPixel,
         totalRays: await rayFrame.readTotal(renderer),
         rays: deposit ? await deposit.readStats(renderer) : null,
@@ -2136,17 +2545,26 @@ export function createSrcProbeSystem({
         merge: merge ? await merge.readStats(renderer) : null,
         tiles: tiles ? await tiles.readStats(renderer) : null,
         gather: gather ? await gather.readStats(renderer) : null,
+        // §11.13: per-cascade histogram of the bins' COUNT words (in rays),
+        // over live blocks. Opt-in (`__giProfileBinHistogram = true`) — it
+        // reads the whole scratch buffer back (~200 MB on Bistro).
+        binHistogram: globalThis.__giProfileBinHistogram === true && binStore
+          ? await readBinHistogram(renderer)
+          : null,
       };
     },
 
     /**
-     * A resize rebuilds the frame. The dispatch counts are compile-time
-     * constants on the compute nodes (three bakes `.compute(n)`), and the
-     * `pixelProbe` buffer is one entry per pixel — neither survives a resolution
-     * change, and pretending otherwise would run the population over a stale
-     * pixel count and silently drop the new edge of the screen.
+     * A viewport resize normally updates this system in place. The pixel
+     * buffers are capacity-sized, Three r185 reads ComputeNode.count through a
+     * dispatch uniform, and the gather carriers resample the live gbuffer by
+     * normalized coordinates. Only capacity/pool growth creates a new system.
      */
-    setSize(nextWidth, nextHeight, nextPools = null) {
+    // §11.8: `deferDispose` returns the NEXT system without disposing this
+    // one or moving the gizmos — GISystem compiles the new store's kernels
+    // behind the live one and commits the swap (dispose + reparent) itself
+    // once they have landed. Without it a pool grow is a 20–30 s hole.
+    setSize(nextWidth, nextHeight, nextPools = null, { deferDispose = false } = {}) {
       // A pool grow rides THIS path (§12.77 Unit A): same dims + changed pools
       // is a real rebuild, not a no-op — the dispatch counts baked from the
       // capacities are exactly as compile-time as the ones baked from the
@@ -2154,9 +2572,31 @@ export function createSrcProbeSystem({
       // precedence land in `poolConfig`, so comparing against it is exact.
       const poolsChanged = nextPools && (
         (Number(nextPools.c0Probes) || 0) > system.poolConfig.c0Probes ||
-        (Number(nextPools.binBudget) || 0) > system.poolConfig.binBudget
+        (Number(nextPools.binBudget) || 0) > system.poolConfig.binBudget ||
+        // §11.4 A3: a per-cascade block grow is a rebuild for the same reason
+        // a budget grow is — the capacities are baked into the kernels.
+        (Array.isArray(nextPools.blocks) && nextPools.blocks.some(
+          (b, c) => (Number(b) || 0) > (system.poolConfig.blocks?.[c] ?? 0),
+        ))
       );
       if (nextWidth === system.width && nextHeight === system.height && !poolsChanged) return system;
+      const nextPixelCount = nextWidth * nextHeight;
+      if (!poolsChanged && nextPixelCount <= pixelCapacity) {
+        activePixelCount = nextPixelCount;
+        widthU.value = nextWidth;
+        heightU.value = nextHeight;
+        pixelCountU.value = nextPixelCount;
+        frame.setPixelCount(nextPixelCount);
+        naturalRays = nextPixelCount * tier.raysPerPixel;
+        rayStride = strideFor(rayCeiling);
+        strideU.value = rayStride;
+        phaseU.value = rayStride > 1 ? frameStampU.value % rayStride : 0;
+        system.width = nextWidth;
+        system.height = nextHeight;
+        system.pixelCount = nextPixelCount;
+        publishTransport();
+        return system;
+      }
       // EVERY create arg forwards. The first version passed only the six it
       // could see, so `lighting`/`surfaces`/`sceneMotion`/`trackMotion`
       // defaulted to null and the FIRST viewport resize silently rebuilt the
@@ -2172,15 +2612,35 @@ export function createSrcProbeSystem({
         spacing0: spacing0Override,
         lighting, surfaces, sceneMotion, trackMotion,
         pools: nextPools ?? pools,
+        // §11.4 A2 — the device limit is a construction arg like the rest;
+        // dropping it here would rebuild every grown pool under the portable
+        // ceiling and throw at the first grow past it.
+        deviceLimit,
+        // ⭐ §11.4 (2026-09-03): THE BVH TRANSPORT WAS NOT FORWARDED. The §10
+        // field-less build hands the trace in through `bvhTrace`, and this
+        // re-create silently dropped it — so every pool-grow rebuild on a
+        // field-less scene rebuilt the deposit over `volume.occupancyField`
+        // (null there) and the kernel died at build with `trace is not a
+        // function`. It hid because the persisted pools skipped the grow on
+        // every scene that had ever grown; the Level walk (`probe:gi-walk`)
+        // caught it the first time the ladder fired on a fresh harness.
+        bvhTrace,
       });
       // Carry the debug view's on/off state across the rebuild. Losing it means
       // a viewport resize silently turns the gizmos off mid-inspection, which
       // reads as "the probes vanished when I dragged the panel".
       next.gizmos.setVisible(gizmos.group.visible);
+      if (deferDispose) return next;
       const parent = gizmos.group.parent;
       system.dispose();
       parent?.add(next.gizmos.group);
       return next;
+    },
+    /** §11.8: the commit half of a deferred `setSize` — reparent the gizmos and dispose this system. */
+    retireFor(next) {
+      const parent = gizmos.group.parent;
+      system.dispose();
+      parent?.add(next.gizmos.group);
     },
 
     dispose() {
@@ -2191,6 +2651,7 @@ export function createSrcProbeSystem({
       gather?.dispose();
       hashBlockFrame?.dispose();
       tiles?.dispose();
+      tilesCoarse?.dispose();
       merge?.dispose();
       binStore?.dispose();
       rayStore.dispose();
@@ -2251,7 +2712,11 @@ export function describeSrcProbeSystem(system) {
     // builds with identical probe telemetry, so the log says which one this is.
     (system.binStore
       ? `, ${(system.binStore.binTotal / 1e6).toFixed(2)}M bins in ` +
-        `${system.store.cascades.map((x) => x.blockCapacity).join("/")} blocks, ` +
+        `${system.store.cascades.map((x) => x.blockCapacity).join("/")} blocks ` +
+        // §11.4 A2: the ceiling this device allows, so a starved scene and a
+        // capped scene read differently in the log that is already being read.
+        `(device ceiling ${(system.poolCeilings?.().binBudget / 1e6).toFixed(1)}M bins at ` +
+        `${(system.deviceLimit / 1048576).toFixed(0)}MB per binding), ` +
         // "depositing" and "depositing + merging" are two builds with identical
         // probe telemetry and a range difference of four cascades, so the boot
         // line names which one this is.

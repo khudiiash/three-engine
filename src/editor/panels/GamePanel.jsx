@@ -22,9 +22,8 @@ import {
  *
  *   - "does my HUD survive 21:9 / portrait?" → aspect + fixed-resolution
  *     presets, letterboxed with a real black surround instead of stretching
- *   - "what is this costing?" → the stats overlay, on by default here because
- *     the number that matters is the one the game produces, not the one the
- *     editor viewport produces with gizmos and helpers in the frame
+ *   - "what is this costing?" → the stats overlay, enabled from the same
+ *     transient Play-mode Layers profile as the other runtime diagnostics
  *
  * Aspect presets constrain the *rendered* size, not just the CSS box: the
  * renderer is resized to the letterboxed rectangle, so a 9:16 preset really
@@ -291,7 +290,7 @@ export function GamePanel() {
             </div>
           )}
         </div>
-        {playing && <StatsOverlay forceVisible />}
+        {playing && <StatsOverlay />}
       </div>
     </div>
   );

@@ -50,6 +50,7 @@ import {
   nearestCell,
   octahedralBorderMap,
   gatherNormalWeightExp,
+  gatherPlaneDepth,
   gatherNormalBias,
   gatherSmoothWeights,
   packProbeKey,
@@ -87,7 +88,26 @@ export function makeSrcConfig(options = {}) {
     // Fixed LOD override — the Phase-0 arms that are not about LODs pin this
     // to 0 so an unrelated LOD boundary cannot explain a failure.
     forceLod: options.forceLod ?? null,
+    // §11.13 THE FAR DUTY — the fraction of rays that trace beyond cascade
+    // `farFrom − 1`'s far bound (null/0 = every ray, the pre-§11.13 kernel).
+    // `frameStamp` is the per-frame salt the GPU hashes with the ray index.
+    farDuty: options.farDuty ?? null,
+    farFrom: options.farFrom ?? 2,
+    frameStamp: options.frameStamp ?? 0,
   };
+}
+
+/**
+ * §11.13 — the far-duty draw, bit-identical to the kernel's: lowbias32 over
+ * (ray index ⊕ stamp·φ⁻¹), the top 24 bits scaled by an exact 2⁻²⁴. Below
+ * `duty` the ray traces its far intervals.
+ */
+export function farDutyHash(n, stamp) {
+  let x = ((n >>> 0) ^ (Math.imul(stamp >>> 0, 0x9E3779B9) >>> 0)) >>> 0;
+  x = Math.imul(x ^ (x >>> 16), 0x7feb352d) >>> 0;
+  x = Math.imul(x ^ (x >>> 15), 0x846ca68b) >>> 0;
+  x = (x ^ (x >>> 16)) >>> 0;
+  return Math.fround((x >>> 8) * (1 / 16777216));
 }
 
 /** Lattice origin for (cascade, lod) — the anchor snapped onto that lattice. */
@@ -515,7 +535,11 @@ export function ancestorChain(built, c0Slot, cascadeCount) {
  * deposit sibling diff the scatter EXACTLY instead of within a tolerance.
  */
 export function traceAndDeposit(cfg, built, pixels, rays, sceneTrace) {
-  const stats = { traced: 0, hits: 0, escapes: 0, deposits: 0 };
+  const stats = { traced: 0, hits: 0, escapes: 0, deposits: 0, far: 0, cappedMiss: 0, nearMiss: 0 };
+  const farDuty = Number(cfg.farDuty);
+  const farFrom = cfg.farFrom ?? 2;
+  const farOn = Number.isFinite(farDuty) && farDuty > 0 && farDuty <= 1
+    && farFrom > 0 && farFrom < cfg.cascadeCount;
   for (let p = 0; p < pixels.length; p++) {
     const c0Slot = built.pixelProbe[p];
     if (c0Slot < 0) continue;
@@ -531,10 +555,30 @@ export function traceAndDeposit(cfg, built, pixels, rays, sceneTrace) {
         cfg.jitter[0], cfg.jitter[1],
       );
       const hit = sceneTrace(px.position, dir, base + r);
+      // §11.13: a capped ray never looked past cascade farFrom−1's far bound
+      // — a hit beyond it is a miss, and its deposits stop at that cascade.
+      let t = hit.t;
+      let depositBounds = bounds;
+      if (farOn) {
+        // Near first: a ray blocked inside cascades 0..farFrom−1 is a plain
+        // hit. Only a ray that cleared them draws the duty (the need floor
+        // reads live counts and is not modelled here — pinned 0 by the gate).
+        const nearHit = t >= 0 && t <= bounds[farFrom - 1];
+        if (!nearHit) {
+          stats.nearMiss++;
+          const goFar = farDutyHash(base + r, cfg.frameStamp) < farDuty;
+          if (goFar) stats.far++;
+          else {
+            depositBounds = bounds.slice(0, farFrom);
+            t = -1;
+            stats.cappedMiss++;
+          }
+        }
+      }
       stats.traced++;
-      if (hit.t >= 0) stats.hits++;
+      if (t >= 0) stats.hits++;
       else stats.escapes++;
-      const deposits = splitDeposits(hit.t >= 0 ? hit.t : -1, hit.radiance ?? [0, 0, 0], bounds);
+      const deposits = splitDeposits(t >= 0 ? t : -1, hit.radiance ?? [0, 0, 0], depositBounds);
       for (const dep of deposits) {
         const slot = chain[dep.cascade];
         if (slot < 0) continue;
@@ -1061,7 +1105,7 @@ export function gatherPixel(cfg, built, tiles, position, normal, interior = IRRA
         // walls). In-plane motion leaves this invariant, so a flat wall's
         // corner weights are constants.
         const pd = dx * normal[0] + dy * normal[1] + dz * normal[2];
-        const t = Math.min(1, Math.max(0, pd / (0.35 * s) + 1));
+        const t = Math.min(1, Math.max(0, pd / Math.min(0.35 * s, gatherPlaneDepth()) + 1));
         const oneSided = t * t * (3 - 2 * t);
         c.weight *= Math.max(1e-3, nwExp === 1 ? oneSided : oneSided ** nwExp);
       }
@@ -1138,9 +1182,9 @@ export function gatherPixel(cfg, built, tiles, position, normal, interior = IRRA
 //              arithmetic that can recover from getting it wrong.
 //   SECONDARY  E from the secondary probe cache, 0 where no probe exists.
 //              Never a fixed-radius fallback (R1).
-//   ALBEDO     clamped to `MAX_LOOP_ALBEDO` INSIDE the loop (R4). This is what
-//              makes the multibounce iteration a contraction; artistic gain
-//              belongs outside it, on `intensity`.
+//   ALBEDO     physical 0..1 for direct light, clamped to `MAX_LOOP_ALBEDO`
+//              only around the secondary term (R4). This keeps the iteration
+//              contractive without attenuating the first sun/lamp bounce.
 //
 // Movers are not a branch. §4.4 calls for "header mean albedo/emissive Lambert
 // shading" and that is the SAME expression with the surface read from a mover
@@ -1530,6 +1574,8 @@ export function makeHitShader({
   neeSamples = 1,
   importance = null,
   maxLoopAlbedo = MAX_LOOP_ALBEDO,
+  sunGain = 1,
+  sunChromaGain = sunGain,
 } = {}) {
   if (typeof surfaceAt !== "function") {
     throw new Error("makeHitShader: surfaceAt is required — it is where mover/static provenance lives");
@@ -1560,25 +1606,41 @@ export function makeHitShader({
     const n = faceForward(s.normal, dir);
 
     // ── E: irradiance arriving at the hit ────────────────────────────────────
-    const E = sunIrradiance(sun, P, n, vis);
+    const sunRaw = sunIrradiance(sun, P, n, vis);
+    const Ed = [...sunRaw];
+    // CPU twin of `createSrcHitLighting`'s analytic-sun-only compensation.
+    // The default is the physical unmodified shader; focused gates pass the
+    // owning cascade's bounded gain explicitly.
+    if (sun && sunGain !== 1) {
+      Ed[0] *= sunGain; Ed[1] *= sunGain; Ed[2] *= sunGain;
+    }
     if (emitters.length) {
       const Ee = neeEmitters
         ? emitterIrradianceNee(emitters, P, n, vis, rayIndex, { samples: neeSamples, importance, stats })
         : [0, 0, 0];
-      E[0] += Ee[0]; E[1] += Ee[1]; E[2] += Ee[2];
+      Ed[0] += Ee[0]; Ed[1] += Ee[1]; Ed[2] += Ee[2];
     }
+    let Es = null;
     if (secondary) {
-      const Es = secondary(P, n);
+      Es = secondary(P, n);
       if (Es && (Es[0] !== 0 || Es[1] !== 0 || Es[2] !== 0)) stats.secondaryHits++;
       else stats.secondaryMisses++;
-      if (Es) { E[0] += Es[0]; E[1] += Es[1]; E[2] += Es[2]; }
     }
 
-    // ── ρ/π · E, with R4's ceiling ───────────────────────────────────────────
-    const rho = clampLoopAlbedo(s.albedo ?? [0, 0, 0], maxLoopAlbedo);
-    if (Math.max(...(s.albedo ?? [0, 0, 0])) > maxLoopAlbedo) stats.albedoClamped++;
+    // ── ρ/π · E: physical direct + loop-limited secondary ──────────────────
+    const authored = s.albedo ?? [0, 0, 0];
+    const rho = authored.map((v) => Math.min(1, Math.max(0, v)));
+    const rhoLoop = clampLoopAlbedo(rho, maxLoopAlbedo);
+    if (Math.max(...rho) > maxLoopAlbedo) stats.albedoClamped++;
+    const neutral = Math.min(...rho);
+    const chroma = rho.map((v) => v - neutral);
+    const chromaDelta = sunChromaGain - sunGain;
     const k = 1 / Math.PI;
-    const out = [rho[0] * E[0] * k, rho[1] * E[1] * k, rho[2] * E[2] * k];
+    const out = [
+      (rho[0] * Ed[0] + chroma[0] * sunRaw[0] * chromaDelta + rhoLoop[0] * (Es?.[0] ?? 0)) * k,
+      (rho[1] * Ed[1] + chroma[1] * sunRaw[1] * chromaDelta + rhoLoop[1] * (Es?.[1] ?? 0)) * k,
+      (rho[2] * Ed[2] + chroma[2] * sunRaw[2] * chromaDelta + rhoLoop[2] * (Es?.[2] ?? 0)) * k,
+    ];
 
     // ── emission, and R5's zeroing ───────────────────────────────────────────
     const Le = s.emissive;

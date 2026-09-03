@@ -73,6 +73,29 @@ page.on("console", (m) => {
 });
 page.on("pageerror", (e) => console.log(`  pageerror: ${String(e.message ?? e).slice(0, 200)}`));
 
+// ── PIPELINE LEDGER (2026-09-02): a 1.4 s frame mid-drag is either JS or a
+// driver compile, and the JS profile cannot see the second. Count (and label)
+// every render pipeline / shader module created per rAF frame so the worst
+// frame of an arm can say "N pipelines compiled here" instead of "unknown".
+await page.evaluateOnNewDocument(() => {
+  const g = globalThis;
+  g.__pl = { rp: 0, rpa: 0, sm: 0, cp: 0, labels: [] };
+  const D = g.GPUDevice?.prototype;
+  if (!D) return;
+  const wrap = (name, key, label) => {
+    if (typeof D[name] !== "function") return;
+    const o = D[name];
+    D[name] = function (...a) {
+      g.__pl[key] += 1;
+      if (label) g.__pl.labels.push((key === "rp" ? "S:" : "A:") + (a[0]?.label ?? "?"));
+      return o.apply(this, a);
+    };
+  };
+  wrap("createRenderPipeline", "rp", true);
+  wrap("createRenderPipelineAsync", "rpa", true);
+  wrap("createShaderModule", "sm", false);
+  wrap("createComputePipelineAsync", "cp", false);
+});
 await page.evaluateOnNewDocument((project, tier) => {
   localStorage.setItem("engine.projectRoot.v1", project);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
@@ -162,14 +185,57 @@ if (TREAT !== "none") {
 // engine skipped, or a GC pause landing between ticks, still blocks rAF and so
 // still shows up as a long interval. Recording only presented frames would
 // report exactly the frames that were cheap enough to present.
+// Name the OBJECT behind every new render pipeline (three's label carries only
+// the material type + id): wrap Pipelines._getRenderPipeline after boot, under
+// whatever the engine already installed there, and push a "R:" entry with the
+// object, material, skin flag and fragment size into the same per-frame list.
 await page.evaluate(() => {
-  globalThis.__mo = { on: false, dt: [], draws: [], tris: [], heap: [] };
+  const pl = globalThis.__eng?.renderer?._pipelines;
+  if (!pl || pl.__probeNamed) return;
+  const o = pl._getRenderPipeline;
+  pl._getRenderPipeline = function (ro, sv, sf, key, promises) {
+    try {
+      const obj = ro?.object, mat = ro?.material;
+      globalThis.__pl?.labels.push(`R:${obj?.name || obj?.type || "?"}|${mat?.name || mat?.type || "?"}` +
+        `${obj?.isSkinnedMesh ? "|skin" : ""}${obj?.isInstancedMesh ? "|inst" : ""}|${Math.round((sf?.code?.length ?? 0) / 1024)}kB` +
+        `|vis=${obj?.visible}|fc=${obj?.frustumCulled}|layers=${obj?.layers?.mask}`);
+    } catch {}
+    return o.call(this, ro, sv, sf, key, promises);
+  };
+  pl.__probeNamed = true;
+  // And time the JS side: a node-graph BUILD (TSL codegen) happens in
+  // Nodes.getForRender when the render object's cache key misses
+  // `nodeBuilderCache`; a 300 kB material costs ~100 ms of main thread there
+  // whether or not the driver already has the program.
+  const nodes = globalThis.__eng.renderer._nodes;
+  if (nodes && !nodes.__probeTimed) {
+    const og = nodes.getForRender;
+    nodes.getForRender = function (ro) {
+      const had = this.get(ro)?.nodeBuilderState !== undefined;
+      const t0 = performance.now();
+      const r = og.call(this, ro);
+      const ms = performance.now() - t0;
+      if (!had && ms >= 4) {
+        globalThis.__pl?.labels.push(`B:${ro?.object?.name || "?"}|${ro?.material?.type || "?"}|${ms.toFixed(0)}ms build`);
+      }
+      return r;
+    };
+    nodes.__probeTimed = true;
+  }
+});
+await page.evaluate(() => {
+  globalThis.__mo = { on: false, dt: [], draws: [], tris: [], heap: [], pl: [] };
   let prev = performance.now();
   const loop = () => {
     const now = performance.now();
     const m = globalThis.__mo;
     if (m.on) {
       m.dt.push(now - prev);
+      const pl = globalThis.__pl;
+      if (pl) {
+        m.pl.push({ rp: pl.rp, rpa: pl.rpa, sm: pl.sm, cp: pl.cp, labels: pl.labels });
+        pl.rp = 0; pl.rpa = 0; pl.sm = 0; pl.cp = 0; pl.labels = [];
+      }
       const r = globalThis.__eng?.stats?.readout;
       if (r) { m.draws.push(r.drawCalls ?? 0); m.tris.push(r.triangles ?? 0); }
       if (performance.memory) m.heap.push(performance.memory.usedJSHeapSize / 1048576);
@@ -194,7 +260,8 @@ const cy = canvasRect.y + canvasRect.h / 2;
 async function record(label, driveDrag) {
   await page.evaluate(() => {
     const m = globalThis.__mo;
-    m.dt = []; m.draws = []; m.tris = []; m.heap = []; m.on = true;
+    m.dt = []; m.draws = []; m.tris = []; m.heap = []; m.pl = []; m.on = true;
+    if (globalThis.__pl) { globalThis.__pl.rp = 0; globalThis.__pl.rpa = 0; globalThis.__pl.sm = 0; globalThis.__pl.cp = 0; globalThis.__pl.labels = []; }
     globalThis.__eng.stats.beginPhaseCapture(1e9); // long capture; read the accumulated mean
   });
   if (driveDrag) {
@@ -229,6 +296,16 @@ async function record(label, driveDrag) {
     m.on = false;
     const cap = globalThis.__eng.stats.readPhaseCapture();
     const dt = [...m.dt].sort((a, b) => a - b);
+    // the five worst frames, with what the driver was asked to build in each
+    const worst = m.dt.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).slice(0, 5)
+      .map(([v, i]) => {
+        const p = m.pl[i] ?? {};
+        const tally = new Map();
+        for (const l of p.labels ?? []) tally.set(l, (tally.get(l) ?? 0) + 1);
+        return { dt: +v.toFixed(1), rp: p.rp ?? 0, rpa: p.rpa ?? 0, sm: p.sm ?? 0, cp: p.cp ?? 0,
+          labels: [...tally.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([l, n]) => `${n}× ${l}`) };
+      });
+    const plSum = m.pl.reduce((a, p) => ({ rp: a.rp + (p.rp ?? 0), rpa: a.rpa + (p.rpa ?? 0), sm: a.sm + (p.sm ?? 0), cp: a.cp + (p.cp ?? 0) }), { rp: 0, rpa: 0, sm: 0, cp: 0 });
     const pct = (p) => +(dt[Math.min(dt.length - 1, Math.floor(p * dt.length))] ?? 0).toFixed(2);
     const mean = (a) => (a.length ? a.reduce((s, v) => s + v, 0) / a.length : 0);
     return {
@@ -242,6 +319,7 @@ async function record(label, driveDrag) {
       phases: cap.phases.filter((p) => p.ms >= 0.05),
       subPhases: cap.subPhases.filter((p) => p.ms >= 0.05).slice(0, 8),
       capturedFrames: cap.frames, capturedTotalMs: cap.totalMs,
+      worst, plSum,
     };
   }, label);
   out.passes = passes;
@@ -342,6 +420,10 @@ const say = (r) => {
   console.log(`   ${r.phases.map((p) => `${p.name} ${p.ms}`).join("  ")}`);
   if (r.subPhases.length) console.log(`   sub: ${r.subPhases.map((p) => `${p.name} ${p.ms}`).join("  ")}`);
   for (const p of r.passes ?? []) console.log(`   pass ${p.pass} — ${p.draws} draws, ${p.tris} tris, floorIfMerged ${p.floor}`);
+  if (r.plSum) console.log(`   driver asks over the arm: renderPipeline ${r.plSum.rp} sync + ${r.plSum.rpa} async, shaderModule ${r.plSum.sm}, computePipelineAsync ${r.plSum.cp}`);
+  for (const w of r.worst ?? []) {
+    console.log(`   worst frame ${w.dt} ms: rp ${w.rp} sync / ${w.rpa} async, sm ${w.sm}, cp ${w.cp}` + (w.labels.length ? `\n      ${w.labels.join("\n      ")}` : ""));
+  }
   results.push(r);
 };
 

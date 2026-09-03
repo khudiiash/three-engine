@@ -1,6 +1,6 @@
 import { vmState } from "./vmState.js";
 import * as THREE from "three/webgpu";
-import { loadAssetMeta, resolveAssetUrl } from "./assetResolver.js";
+import { loadAssetBinary, loadAssetMeta } from "./assetResolver.js";
 
 export const GEOMETRY_ASSET_VERSION = 1;
 /**
@@ -364,7 +364,9 @@ export function encodeGeometryAsset(definition) {
 /** True when `buffer` starts with the v2 container magic. */
 function isBinaryGeometry(buffer) {
   if (buffer.byteLength < 12) return false;
-  return new DataView(buffer).getUint32(0, true) === MAGIC;
+  const backing = ArrayBuffer.isView(buffer) ? buffer.buffer : buffer;
+  const byteOffset = ArrayBuffer.isView(buffer) ? buffer.byteOffset : 0;
+  return new DataView(backing, byteOffset, buffer.byteLength).getUint32(0, true) === MAGIC;
 }
 
 /**
@@ -373,18 +375,20 @@ function isBinaryGeometry(buffer) {
  * copying, no parsing, no validation loop.
  */
 export function decodeGeometryAsset(buffer) {
-  const view = new DataView(buffer);
+  const backing = ArrayBuffer.isView(buffer) ? buffer.buffer : buffer;
+  const byteOffset = ArrayBuffer.isView(buffer) ? buffer.byteOffset : 0;
+  const view = new DataView(backing, byteOffset, buffer.byteLength);
   const version = view.getUint32(4, true);
   if (version !== GEOMETRY_BINARY_VERSION) {
     throw new Error(`Unsupported geometry container version ${version}`);
   }
   const headerLength = view.getUint32(8, true);
-  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 12, headerLength)));
+  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(backing, byteOffset + 12, headerLength)));
   const payloadStart = 12 + headerLength;
 
   const read = (descriptor) => {
     const ArrayType = ARRAY_TYPES[descriptor.type] ?? Float32Array;
-    return new ArrayType(buffer, payloadStart + descriptor.offset, descriptor.length);
+    return new ArrayType(backing, byteOffset + payloadStart + descriptor.offset, descriptor.length);
   };
 
   const definition = {
@@ -427,13 +431,11 @@ async function fetchGeometryAsset(path) {
   if (ext !== "geom") {
     throw new Error(`Geometry asset must be a .geom file (got .${ext || "<none>"}): "${path}"`);
   }
-  const [url, meta] = await Promise.all([
-    resolveAssetUrl(path),
+  const [buffer, meta] = await Promise.all([
+    loadAssetBinary(path),
     loadAssetMeta(`${path}.meta`),
   ]);
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Geometry request failed (${response.status})`);
-  const buffer = await response.arrayBuffer();
+  if (!(buffer instanceof ArrayBuffer) && !ArrayBuffer.isView(buffer)) throw new Error(`Geometry request failed: "${path}"`);
   const definition = isBinaryGeometry(buffer)
     ? decodeGeometryAsset(buffer)
     : JSON.parse(new TextDecoder().decode(buffer));

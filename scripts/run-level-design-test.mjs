@@ -1143,7 +1143,7 @@ await asyncCheck("a character stands on a blockout floor instead of falling thro
   // The level: one 8×8 slab whose walkable surface is y = 0.
   const slab = engine.createEntity({ name: "Floor" });
   slab.addComponent("blockout", { shape: "floor", size: [8, 0.4, 8] });
-  slab.addComponent("collider", { shape: "mesh", friction: 0.6 });
+  slab.addComponent("collider", { shape: "concave", friction: 0.6 });
 
   // The character, dropped from 2 m with its feet at the origin (the rig's
   // convention — see characterRigSpec).
@@ -1179,13 +1179,13 @@ await asyncCheck("a character climbs a blockout staircase", async () => {
 
   const slab = engine.createEntity({ name: "Floor" });
   slab.addComponent("blockout", { shape: "floor", size: [12, 0.4, 12] });
-  slab.addComponent("collider", { shape: "mesh" });
+  slab.addComponent("collider", { shape: "concave" });
 
   // A 1.2 m rise over 3 m of run, climbing along +Z from z = 0.5.
   const stair = engine.createEntity({ name: "Stair" });
   stair.object3D.position.set(0, 0, 2);
   stair.addComponent("blockout", { shape: "stair", size: [2, 1.2, 3], steps: 8 });
-  stair.addComponent("collider", { shape: "mesh" });
+  stair.addComponent("collider", { shape: "concave" });
 
   const player = engine.createEntity({ name: "Player" });
   player.object3D.position.set(0, 0.1, -0.5);
@@ -1222,7 +1222,7 @@ await asyncCheck("a wall's doorway is a hole you can walk through", async () => 
 
   const slab = engine.createEntity({ name: "Floor" });
   slab.addComponent("blockout", { shape: "floor", size: [12, 0.4, 12] });
-  slab.addComponent("collider", { shape: "mesh" });
+  slab.addComponent("collider", { shape: "concave" });
 
   const wall = engine.createEntity({ name: "Wall" });
   wall.object3D.position.set(0, 0, 1.5);
@@ -1231,7 +1231,7 @@ await asyncCheck("a wall's doorway is a hole you can walk through", async () => 
     size: [8, 3, 0.3],
     openings: [{ offset: 0, width: 1.4, height: 2.2, sill: 0 }],
   });
-  wall.addComponent("collider", { shape: "mesh" });
+  wall.addComponent("collider", { shape: "concave" });
 
   const player = engine.createEntity({ name: "Player" });
   player.object3D.position.set(0, 0.1, -1);

@@ -1,7 +1,16 @@
 // @ts-check
 import * as THREE from "three/webgpu";
-import { EDITOR_LAYER } from "../../engine/editorLayers.js";
 import { PhysicsLayers } from "./layers.js";
+import {
+  collectCollisionMesh,
+  collectCollisionMeshParts,
+  collisionGeometryBounds,
+  hasOwnedDeformingCollisionGeometry,
+  hasOwnedStaticCollisionGeometry,
+  mergeCollisionMeshes,
+  scaleCollisionMesh,
+  simplifyCollisionMesh,
+} from "./collisionGeometry.js";
 
 const FIXED_DT = 1 / 60;
 const MAX_SUBSTEPS = 4;
@@ -12,6 +21,16 @@ const _quat = new THREE.Quaternion();
 const _scale = new THREE.Vector3();
 const _parentQuat = new THREE.Quaternion();
 const _mat = new THREE.Matrix4();
+const _colliderRotation = new THREE.Quaternion();
+const _colliderEuler = new THREE.Euler();
+
+const AUTO_COLLIDER_SOURCE_TYPES = ["mesh", "model", "objModel", "splineMesh"];
+const AUTO_COLLIDER_DEFAULTS = {
+  friction: 0.5,
+  restitution: 0,
+  isSensor: false,
+  layer: "Default",
+};
 
 /**
  * Owns the Rapier world. Lifecycle mirrors play mode: the world is built
@@ -38,6 +57,26 @@ export class PhysicsSystem {
     // Layer index per collider handle. Queries filter on this rather than on
     // Rapier's interaction groups — see layers.js for why.
     this.colliderLayer = new Map(); // collider handle -> layer index
+    // Cooked vertices stay runtime-derived, while the editable Collider that
+    // selects their shape is a normal scene component.
+    this.implicitColliderByEntity = new Map(); // entity -> collider[]
+    // A visible Collider may own several native hulls. Rapier reports contacts
+    // per native handle pair, while scripts expect one logical entity pair.
+    this.nativeContactPairs = new Map();
+    this.entityContactCounts = new Map();
+    this.autoCollisionGeometry = new Map();
+    this.autoCookQueue = new Set();
+    this.autoCookHandle = null;
+    this.autoCookUsesIdleCallback = false;
+    this.autoCookWorld = null;
+    this.autoCookBody = null;
+    this.defaultColliderQueue = new Set();
+    this.defaultColliderFlushPending = false;
+    // Suppression (collision=none, CharacterController, source removal) also
+    // removes generated components. Only an unguarded removal is a user's
+    // explicit deletion and should persist a source-level opt-out.
+    this.defaultColliderRemovalGuard = new WeakSet();
+    this.disposed = false;
     this.dynamicBodies = []; // { entity, body }
     this.kinematicBodies = []; // { entity, body, prev, delta }
     this.characters = []; // { entity, cc } — kinematic character controllers
@@ -73,14 +112,65 @@ export class PhysicsSystem {
       // so nothing else here would ever hear about it. Its body has to go all
       // the same, or the corridor fills with invisible walls where enemies died.
       engine.on("entity-despawned", (entity) => this.removeEntity(entity)),
+      engine.on("component-added", (info) => this.#componentStructureChanged(info)),
+      engine.on("component-removed", (info) => this.#componentStructureChanged(info)),
+      // Mesh assets and legacy OBJ/GLB components attach asynchronously. Cook
+      // their collision after the real geometry arrives, not from a placeholder.
+      engine.on("model-loaded", (entity) => {
+        // Loading reveals whether a GLB is static or skeletal/morphing. Re-run
+        // visible default attachment as well as the geometry cook.
+        this.#refreshAutoColliderSource(entity);
+      }),
+      engine.on("component-changed", (info) => {
+        if (!info?.entityId) return;
+        if (info.componentType === "rigidbody" || info.componentType === "charactercontroller") {
+          this.#queueDefaultColliders();
+          return;
+        }
+        if (info.componentType === "collider") {
+          this.invalidateAutoCollider(engine.getEntity(info.entityId));
+          return;
+        }
+        if (!["mesh", "model", "objModel", "splineMesh", "geometryModifiers"].includes(info.componentType)) return;
+        if (info.componentType === "mesh" && !["geometry", "geometryAsset", "collision"].includes(info.key)) return;
+        const entity = engine.getEntity(info.entityId);
+        this.#refreshAutoColliderSource(entity);
+      }),
+      engine.on("hierarchy-changed", () => {
+        // Component/source events queue their affected entity directly. A
+        // generic hierarchy notification is also used as an editor refresh;
+        // treating every one as collision invalidation recooked the whole
+        // scene and rebuilt live Rapier handles in periodic timer batches.
+        this.prewarmAutoColliders();
+      }),
+      engine.on("spline-changed", () => {
+        for (const entity of engine.entities.values()) {
+          if (entity.getComponent?.("splineMesh")) this.invalidateAutoCollider(entity);
+        }
+      }),
     ];
     engine.physics = this;
+    this.#queueDefaultColliders();
+    this.prewarmAutoColliders();
     if (engine.playing) this.#build();
   }
 
   dispose() {
+    this.disposed = true;
     for (const unsub of this.unsubs) unsub();
+    if (this.autoCookHandle != null) {
+      if (this.autoCookUsesIdleCallback) globalThis.cancelIdleCallback?.(this.autoCookHandle);
+      else clearTimeout(this.autoCookHandle);
+    }
+    this.autoCookHandle = null;
+    this.autoCookQueue.clear();
+    this.defaultColliderQueue.clear();
+    this.defaultColliderFlushPending = false;
+    this.autoCollisionGeometry.clear();
     this.#teardown();
+    this.autoCookWorld?.free();
+    this.autoCookWorld = null;
+    this.autoCookBody = null;
     if (this.engine.physics === this) delete this.engine.physics;
   }
 
@@ -110,6 +200,331 @@ export class PhysicsSystem {
     for (const [handle, layerIndex] of this.colliderLayer) {
       this.world.getCollider(handle)?.setCollisionGroups(this.layers.groupsFor(layerIndex));
     }
+  }
+
+  #componentStructureChanged(info) {
+    if (!info?.entityId) return;
+    if (![...AUTO_COLLIDER_SOURCE_TYPES, "skinnedmesh", "rigidbody", "charactercontroller", "collider"].includes(info.componentType)) return;
+    let entity = this.engine.getEntity(info.entityId);
+    if (!entity) return;
+    // Imported rig render handles can live below their owning Model entity.
+    // Re-evaluate that owner when a marker is attached or removed.
+    if (info.componentType === "skinnedmesh") {
+      for (let candidate = entity; candidate; candidate = candidate.parent) {
+        if (candidate.getComponent?.("model")) {
+          entity = candidate;
+          break;
+        }
+      }
+    }
+    if (info.componentType === "collider"
+      && info.component?.props?.autoGenerated
+      && !this.defaultColliderRemovalGuard.has(entity)) {
+      this.#setAutoCollisionMode(entity, "none");
+    }
+    this.#queueDefaultColliders(entity);
+    this.invalidateAutoCollider(entity);
+  }
+
+  #queueDefaultColliders(entity = null) {
+    if (this.disposed) return;
+    if (entity) this.defaultColliderQueue.add(entity);
+    else for (const candidate of this.engine.entities.values()) this.defaultColliderQueue.add(candidate);
+    if (this.defaultColliderFlushPending) return;
+    this.defaultColliderFlushPending = true;
+    queueMicrotask(() => this.#flushDefaultColliders());
+  }
+
+  #refreshAutoColliderSource(entity) {
+    if (!entity || this.disposed) return;
+    this.#queueDefaultColliders(entity);
+    this.invalidateAutoCollider(entity);
+
+    // Model/Mesh announce their geometry swap just before their ready promise's
+    // finally-handler clears assetLoadsPending. Re-run after that promise too;
+    // otherwise the queued pass sees "pending", removes the placeholder, and
+    // a static asynchronously-loaded asset never gets its collider back.
+    const pending = [entity.getComponent?.("mesh"), entity.getComponent?.("model")]
+      .filter((source) => source?.assetLoadsPending && typeof source.whenReady === "function");
+    if (!pending.length) return;
+    Promise.allSettled(pending.map((source) => source.whenReady())).then(() => {
+      if (this.disposed || !this.engine.entities.has(entity.id)) return;
+      this.#queueDefaultColliders(entity);
+      this.invalidateAutoCollider(entity);
+    });
+  }
+
+  #flushDefaultColliders() {
+    this.defaultColliderFlushPending = false;
+    if (this.disposed) return;
+    const queued = [...this.defaultColliderQueue];
+    this.defaultColliderQueue.clear();
+    let changed = false;
+    for (const entity of queued) {
+      if (!this.engine.entities.has(entity.id)) continue;
+      const hasSource = AUTO_COLLIDER_SOURCE_TYPES.some((type) => entity.getComponent?.(type));
+      const collider = entity.getComponent?.("collider");
+      const sourcePending = this.#autoColliderSourcePending(entity);
+      const deformingOnly = hasSource && this.#hasOnlyDeformingGeometry(entity);
+      const suppressed = !hasSource
+        || this.#autoCollisionMode(entity) === "none"
+        || !!entity.getComponent?.("charactercontroller")
+        || sourcePending
+        || deformingOnly;
+      if (suppressed) {
+        // Editing a generated default makes it authored state. Async loading
+        // or skin detection may remove only an untouched automatic component.
+        if (collider?.props?.autoGenerated && !collider.props.autoCustomized) {
+          this.defaultColliderRemovalGuard.add(entity);
+          try {
+            entity.removeComponent("collider");
+          } finally {
+            this.defaultColliderRemovalGuard.delete(entity);
+          }
+          changed = true;
+        }
+        continue;
+      }
+      // Authored collision is authoritative. Automatic collision is a real,
+      // visible component, but it is attached after the current component
+      // wave so a Collider later in serialized data can win without a race.
+      if (collider) continue;
+      const requested = this.#autoCollisionMode(entity);
+      // ── ATTACHED DISABLED BY DEFAULT (2026-09-02) ──────────────────────
+      // Enabling physics used to cook and build a native shape for EVERY
+      // mesh in the scene; on Bistro that is 2.8 M triangles of hull and
+      // trimesh cooking at scene load — the editor ran at 1 fps and the
+      // harness tab died. The generated component still appears on every
+      // entity (so it can be found and switched on in the Inspector, or by
+      // `component_setProp enabled`), but it starts disabled: no cooking, no
+      // native shape, no per-frame cost until the user turns it on. Project
+      // Settings → Physics → "Auto colliders start enabled" restores the old
+      // behaviour project-wide (`engine.config.physicsAutoColliders`).
+      entity.addComponent("collider", {
+        shape: requested === "concave" ? "concave" : "convex",
+        autoGenerated: true,
+        enabled: this.#autoCollidersStartEnabled(),
+      });
+      changed = true;
+      this.invalidateAutoCollider(entity);
+    }
+    if (changed) this.engine.emit("hierarchy-changed");
+    this.#scheduleAutoCook();
+  }
+
+  /**
+   * Queues geometry extraction + convex cooking outside the foreground frame.
+   * The first Play still cooks a cache miss synchronously for correctness, but
+   * ordinary editor use reaches Play with these derived shapes already warm.
+   */
+  prewarmAutoColliders(entity = null) {
+    if (this.disposed) return;
+    if (entity) {
+      if (!this.autoCollisionGeometry.has(entity) && this.#needsCollisionGeometry(entity)) {
+        this.autoCookQueue.add(entity);
+      }
+    }
+    else {
+      for (const candidate of this.engine.entities.values()) {
+        if (!this.autoCollisionGeometry.has(candidate) && this.#needsCollisionGeometry(candidate)) {
+          this.autoCookQueue.add(candidate);
+        }
+      }
+    }
+    this.#scheduleAutoCook();
+  }
+
+  /** Invalidates one derived collider after an asset/component geometry swap. */
+  invalidateAutoCollider(entity) {
+    if (!entity || this.disposed) return;
+    this.autoCollisionGeometry.delete(entity);
+    this.autoCookQueue.add(entity);
+    this.#scheduleAutoCook();
+  }
+
+  #scheduleAutoCook() {
+    if (this.autoCookHandle != null || !this.autoCookQueue.size || this.disposed) return;
+    if (typeof globalThis.requestIdleCallback === "function") {
+      this.autoCookUsesIdleCallback = true;
+      this.autoCookHandle = globalThis.requestIdleCallback(
+        (deadline) => this.#drainAutoCook(deadline),
+        { timeout: 500 },
+      );
+    } else {
+      this.autoCookUsesIdleCallback = false;
+      this.autoCookHandle = setTimeout(() => this.#drainAutoCook(null), 0);
+    }
+  }
+
+  #drainAutoCook(deadline) {
+    this.autoCookHandle = null;
+    if (this.disposed) return;
+    const started = performance.now();
+    const rebuilt = [];
+    let first = true;
+    while (this.autoCookQueue.size) {
+      // `didTimeout` means the browser owed us a callback; it does NOT grant
+      // an unlimited main-thread slice. Treating it that way drained every
+      // queued hull after 500 ms and turned a legitimate bulk invalidation
+      // into one large Play-mode freeze. Always retain the wall-clock ceiling;
+      // `first` below still guarantees forward progress on a busy frame.
+      const withinWallBudget = performance.now() - started < 4;
+      const hasBudget = withinWallBudget
+        && (!deadline || deadline.didTimeout || deadline.timeRemaining() > 1);
+      if (!first && !hasBudget) break;
+      first = false;
+      const entity = this.autoCookQueue.values().next().value;
+      this.autoCookQueue.delete(entity);
+      if (!this.engine.entities.has(entity.id)) {
+        this.autoCollisionGeometry.delete(entity);
+        continue;
+      }
+      this.#cookAutoGeometry(entity);
+      if (this.world) rebuilt.push(entity);
+    }
+    if (rebuilt.length) {
+      for (const entity of rebuilt) this.markDirty(entity, { subtree: false });
+      this.sync();
+    }
+    this.#scheduleAutoCook();
+  }
+
+  /**
+   * Whether a generated default Collider is attached ENABLED. Project-wide,
+   * read from the same config blob the layer matrix rides on: the editor sets
+   * `engine.config.physicsAutoColliders` from Project Settings → Physics, and
+   * an exported build ships the flag inside `config.physics` (→
+   * `engine.config.physicsLayers`). Default off — see #flushDefaultColliders.
+   */
+  #autoCollidersStartEnabled() {
+    const config = this.engine?.config;
+    return config?.physicsAutoColliders?.startEnabled === true
+      || config?.physicsLayers?.autoCollidersEnabled === true;
+  }
+
+  #autoCollisionMode(entity) {
+    for (const type of AUTO_COLLIDER_SOURCE_TYPES) {
+      const source = entity.getComponent?.(type);
+      if (source) return source.props?.collision ?? "auto";
+    }
+    return "auto";
+  }
+
+  #setAutoCollisionMode(entity, mode) {
+    for (const type of AUTO_COLLIDER_SOURCE_TYPES) {
+      const source = entity.getComponent?.(type);
+      if (source && source.props?.collision !== mode) source.setProp("collision", mode);
+    }
+  }
+
+  #autoColliderSourcePending(entity) {
+    return !!(entity.getComponent?.("mesh")?.assetLoadsPending
+      || entity.getComponent?.("model")?.assetLoadsPending);
+  }
+
+  #hasOnlyDeformingGeometry(entity) {
+    const deforming = !!entity.getComponent?.("skinnedmesh")
+      || hasOwnedDeformingCollisionGeometry(entity.object3D, entity.id);
+    return deforming && !hasOwnedStaticCollisionGeometry(entity.object3D, entity.id);
+  }
+
+  #hasCollisionGeometrySource(entity) {
+    if (!entity || !AUTO_COLLIDER_SOURCE_TYPES.some((type) => entity.getComponent?.(type))) return false;
+    const collider = entity.getComponent?.("collider");
+    if (collider && (!collider.props.autoGenerated || collider.props.autoCustomized)) return true;
+    // No component yet and defaults start disabled: the one that will be
+    // attached is disabled, so there is nothing to cook and no implicit
+    // native shape to build in the window before it lands.
+    if (!collider && !this.#autoCollidersStartEnabled()) return false;
+    const deformingOnly = this.#hasOnlyDeformingGeometry(entity);
+    if (this.#autoColliderSourcePending(entity) || deformingOnly) return false;
+    return this.#autoCollisionMode(entity) !== "none";
+  }
+
+  #needsCollisionGeometry(entity) {
+    if (!this.#hasCollisionGeometrySource(entity) || entity.getComponent?.("charactercontroller")) return false;
+    const collider = entity.getComponent?.("collider");
+    if (collider && !collider.enabled) return false;
+    const shape = collider?.props?.shape;
+    return !shape || shape === "convex" || shape === "concave" || shape === "mesh";
+  }
+
+  #hasAutoColliderSource(entity) {
+    return this.#hasCollisionGeometrySource(entity)
+      && !entity.getComponent?.("collider")
+      && !entity.getComponent?.("charactercontroller");
+  }
+
+  #cookAutoGeometry(entity) {
+    if (!this.#needsCollisionGeometry(entity)) {
+      this.autoCollisionGeometry.set(entity, null);
+      return null;
+    }
+    const mesh = entity.getComponent?.("mesh");
+    const model = entity.getComponent?.("model");
+    if (mesh?.assetLoadsPending || model?.assetLoadsPending) {
+      this.autoCollisionGeometry.set(entity, null);
+      return null;
+    }
+    const options = {
+      ownerEntityId: entity.getComponent?.("collider")?.props?.autoGenerated ? entity.id : null,
+      bakeRootScale: false,
+      includeSkinned: false,
+    };
+    const sourceParts = collectCollisionMeshParts(entity.object3D, options);
+    const triangles = mergeCollisionMeshes(sourceParts);
+    if (!triangles) {
+      this.autoCollisionGeometry.set(entity, null);
+      return null;
+    }
+    const convexParts = sourceParts
+      .map((part) => this.#cookConvexMesh(part.vertices))
+      .filter(Boolean);
+    const concave = mergeCollisionMeshes(sourceParts.map((part) => simplifyCollisionMesh(part)));
+    const cooked = {
+      ...triangles,
+      convexParts,
+      concave,
+      // Kept as a compatibility/fallback view for callers that require one
+      // envelope. Runtime and preview prefer the separate island hulls.
+      convex: convexParts.length === 1 ? convexParts[0] : this.#cookConvexMesh(triangles.vertices),
+    };
+    this.autoCollisionGeometry.set(entity, cooked);
+    this.engine.emit("physics-collider-cooked", entity);
+    return cooked;
+  }
+
+  #cookConvexMesh(vertices) {
+    if (!vertices || vertices.length < 12) return null;
+    let collider = null;
+    try {
+      if (!this.autoCookWorld) {
+        this.autoCookWorld = new this.RAPIER.World({ x: 0, y: 0, z: 0 });
+        this.autoCookBody = this.autoCookWorld.createRigidBody(this.RAPIER.RigidBodyDesc.fixed());
+      }
+      const desc = this.RAPIER.ColliderDesc.convexHull(vertices);
+      if (!desc) return null;
+      collider = this.autoCookWorld.createCollider(desc, this.autoCookBody);
+      const hullVertices = new Float32Array(collider.vertices());
+      const rawIndices = collider.indices();
+      const hullIndices = rawIndices ? new Uint32Array(rawIndices) : null;
+      if (!hullIndices?.length) return null;
+      return { vertices: hullVertices, indices: hullIndices };
+    } catch {
+      return null;
+    } finally {
+      if (collider) this.autoCookWorld?.removeCollider(collider, false);
+    }
+  }
+
+  #getAutoGeometry(entity) {
+    if (!this.autoCollisionGeometry.has(entity)) return this.#cookAutoGeometry(entity);
+    return this.autoCollisionGeometry.get(entity);
+  }
+
+  /** Cached local-space triangles and convex hull used by the editor preview. */
+  getCookedColliderGeometry(entity) {
+    return this.autoCollisionGeometry.get(entity) ?? null;
   }
 
   // ---- queries ------------------------------------------------------------
@@ -304,6 +719,7 @@ export class PhysicsSystem {
 
   #build() {
     this.#teardown();
+    this.#flushDefaultColliders();
     const { RAPIER } = this;
     this.world = new RAPIER.World({ x: this.gravity[0], y: this.gravity[1], z: this.gravity[2] });
     this.eventQueue = new RAPIER.EventQueue(true);
@@ -354,7 +770,8 @@ export class PhysicsSystem {
     }
     const rb = entity.getComponent("rigidbody");
     const col = entity.getComponent("collider");
-    if (!rb && !col) return;
+    const implicit = this.#hasAutoColliderSource(entity);
+    if (!rb && (!col || !col.enabled) && !implicit) return;
     if (!rb && this.#ancestorBodyEntity(entity)) return;
 
     entity.object3D.getWorldPosition(_pos);
@@ -401,16 +818,34 @@ export class PhysicsSystem {
   #createColliders(entity) {
     if (entity.getComponent("charactercontroller")) return; // owns its own capsule
     const col = entity.getComponent("collider");
-    if (!col) return;
+    if (col && !col.enabled) return;
+    if (!col && !this.#hasAutoColliderSource(entity)) return;
     const bodyEntity = this.bodyByEntity.has(entity) ? entity : this.#ancestorBodyEntity(entity);
     const body = bodyEntity ? this.bodyByEntity.get(bodyEntity) : null;
     if (!body) return;
-    const desc = this.#colliderDesc(col, entity, bodyEntity);
-    if (!desc) return;
-    const collider = this.world.createCollider(desc, body);
-    col.collider = collider;
-    this.colliderEntity.set(collider.handle, entity);
-    this.colliderLayer.set(collider.handle, this.layers.indexOf(col.props.layer));
+    const result = col
+      ? this.#colliderDesc(col, entity, bodyEntity)
+      : this.#implicitColliderDesc(entity, bodyEntity);
+    if (!result) return;
+    const descs = Array.isArray(result) ? result : [result];
+    const colliders = [];
+    try {
+      for (const desc of descs) colliders.push(this.world.createCollider(desc, body));
+    } catch (error) {
+      for (const collider of colliders) this.world.removeCollider(collider, true);
+      throw new Error(`Failed to create collider for "${entity.name}": ${error?.message ?? error}`, { cause: error });
+    }
+    if (col) {
+      col.colliders = colliders;
+      col.collider = colliders[0] ?? null;
+    } else if (colliders.length) {
+      this.implicitColliderByEntity.set(entity, colliders);
+    }
+    const layer = this.layers.indexOf(col?.props.layer ?? AUTO_COLLIDER_DEFAULTS.layer);
+    for (const collider of colliders) {
+      this.colliderEntity.set(collider.handle, entity);
+      this.colliderLayer.set(collider.handle, layer);
+    }
   }
 
   /**
@@ -572,12 +1007,30 @@ export class PhysicsSystem {
       if (cc) this.unregisterCharacter(cc);
 
       const col = entity.getComponent?.("collider");
-      if (col?.collider) {
-        const handle = col.collider.handle;
+      const explicitColliders = col?.colliders?.length
+        ? [...col.colliders]
+        : col?.collider ? [col.collider] : [];
+      for (const collider of explicitColliders) {
+        const handle = collider.handle;
+        this.#forgetColliderContacts(handle);
         this.colliderEntity.delete(handle);
         this.colliderLayer.delete(handle);
-        if (!doomed.has(col.collider.parent()?.handle)) this.world.removeCollider(col.collider, true);
+        if (!doomed.has(collider.parent()?.handle)) this.world.removeCollider(collider, true);
+      }
+      if (col) {
         col.collider = null;
+        col.colliders = [];
+      }
+
+      const implicitColliders = this.implicitColliderByEntity.get(entity) ?? [];
+      if (implicitColliders.length) {
+        this.implicitColliderByEntity.delete(entity);
+        for (const implicit of implicitColliders) {
+          this.#forgetColliderContacts(implicit.handle);
+          this.colliderEntity.delete(implicit.handle);
+          this.colliderLayer.delete(implicit.handle);
+          if (!doomed.has(implicit.parent()?.handle)) this.world.removeCollider(implicit, true);
+        }
       }
 
       const body = this.bodyByEntity.get(entity);
@@ -588,10 +1041,20 @@ export class PhysicsSystem {
       for (const [handle, owner] of [...this.colliderEntity]) {
         const collider = this.world.getCollider(handle);
         if (collider && collider.parent()?.handle !== body.handle) continue;
+        this.#forgetColliderContacts(handle);
         this.colliderEntity.delete(handle);
         this.colliderLayer.delete(handle);
         const comp = owner.getComponent?.("collider");
-        if (comp?.collider?.handle === handle) comp.collider = null;
+        if (comp) {
+          comp.colliders = (comp.colliders ?? []).filter((collider) => collider.handle !== handle);
+          comp.collider = comp.colliders[0] ?? null;
+        }
+        const implicit = this.implicitColliderByEntity.get(owner);
+        if (implicit?.some((entry) => entry.handle === handle)) {
+          const remaining = implicit.filter((entry) => entry.handle !== handle);
+          if (remaining.length) this.implicitColliderByEntity.set(owner, remaining);
+          else this.implicitColliderByEntity.delete(owner);
+        }
       }
       this.dynamicBodies = this.dynamicBodies.filter((e) => e.body !== body);
       this.kinematicBodies = this.kinematicBodies.filter((e) => e.body !== body);
@@ -714,36 +1177,156 @@ export class PhysicsSystem {
     return true;
   }
 
+  #implicitColliderDesc(entity, bodyEntity) {
+    const cooked = this.#getAutoGeometry(entity);
+    if (!cooked) return null;
+
+    const bodyType = bodyEntity.getComponent?.("rigidbody")?.props?.bodyType ?? "fixed";
+    const mode = this.#autoCollisionMode(entity);
+    // A standalone fixed surface keeps exact holes/doorways. Anything moving,
+    // or acting as a child shape on a compound body, must be a solid convex
+    // shape; Rapier trimeshes are hollow and unsuitable for moving bodies.
+    const convex = (mode !== "concave" && mode !== "mesh") || entity !== bodyEntity || bodyType !== "fixed";
+
+    entity.object3D.getWorldScale(_scale);
+    const scaledParts = convex
+      ? (cooked.convexParts?.length ? cooked.convexParts : cooked.convex ? [cooked.convex] : [])
+          .map((part) => scaleCollisionMesh(part, _scale))
+      : [scaleCollisionMesh(mode === "concave" ? cooked.concave ?? cooked : cooked, _scale)];
+    if (!scaledParts.length || scaledParts.some((part) => !part?.vertices.every(Number.isFinite))) {
+      console.warn(`Automatic collider on "${entity.name}": geometry has no valid ${convex ? "convex hull" : "triangles"}`);
+      return null;
+    }
+
+    const shapes = scaledParts
+      .map((part) => ({
+        part,
+        desc: convex
+          ? this.RAPIER.ColliderDesc.convexHull(part.vertices)
+          : this.RAPIER.ColliderDesc.trimesh(part.vertices, part.indices),
+      }))
+      .filter(({ desc }) => !!desc);
+    if (!shapes.length) {
+      console.warn(`Automatic collider on "${entity.name}": geometry has no three-dimensional convex hull`);
+      return null;
+    }
+
+    for (const { desc } of shapes) {
+      desc
+        .setFriction(AUTO_COLLIDER_DEFAULTS.friction)
+        .setRestitution(AUTO_COLLIDER_DEFAULTS.restitution)
+        .setSensor(false)
+        .setCollisionGroups(this.layers.groupsFor(AUTO_COLLIDER_DEFAULTS.layer))
+        .setActiveEvents(this.RAPIER.ActiveEvents.COLLISION_EVENTS);
+    }
+
+    const rb = bodyEntity.getComponent?.("rigidbody");
+    if (rb?.props.bodyType === "dynamic" && entity === bodyEntity && rb.props.mass > 0) {
+      const volumes = shapes.map(({ part }) => collisionMeshVolume(part));
+      const total = volumes.reduce((sum, volume) => sum + volume, 0);
+      for (let i = 0; i < shapes.length; i++) {
+        shapes[i].desc.setMass(rb.props.mass * (total > 0 ? volumes[i] / total : 1 / shapes.length));
+      }
+    }
+
+    _pos.set(0, 0, 0);
+    _quat.identity();
+    if (entity !== bodyEntity) {
+      _mat.copy(bodyEntity.object3D.matrixWorld).invert().multiply(entity.object3D.matrixWorld);
+      const rel = new THREE.Vector3(), relQ = new THREE.Quaternion(), relS = new THREE.Vector3();
+      _mat.decompose(rel, relQ, relS);
+      _pos.copy(rel);
+      _quat.copy(relQ);
+    }
+    if (![_pos.x, _pos.y, _pos.z, _quat.x, _quat.y, _quat.z, _quat.w].every(Number.isFinite)) {
+      console.warn(`Automatic collider on "${entity.name}": collider pose is not finite`);
+      return null;
+    }
+    return shapes.map(({ desc }) => desc
+      .setTranslation(_pos.x, _pos.y, _pos.z)
+      .setRotation({ x: _quat.x, y: _quat.y, z: _quat.z, w: _quat.w }));
+  }
+
   #colliderDesc(col, entity, bodyEntity) {
     const { RAPIER } = this;
-    const { shape, size, radius, height, offset, friction, restitution, isSensor } = col.props;
+    const {
+      shape, size, radius, height, offset, rotation, autoCenter, autoFit,
+      friction, restitution, isSensor,
+    } = col.props;
     entity.object3D.getWorldScale(_scale);
     const sx = Math.abs(_scale.x), sy = Math.abs(_scale.y), sz = Math.abs(_scale.z);
     const maxS = Math.max(sx, sy, sz);
+    const primitive = shape === "box" || shape === "sphere" || shape === "capsule";
+    const fitBounds = primitive && (autoCenter || autoFit)
+      ? collisionGeometryBounds(entity.object3D)
+      : null;
+    const fitSize = autoFit && fitBounds ? fitBounds.getSize(new THREE.Vector3()) : null;
+    const bodyType = bodyEntity.getComponent?.("rigidbody")?.props?.bodyType ?? "fixed";
+    const dynamicTriangleMesh = bodyType === "dynamic" && (shape === "concave" || shape === "mesh");
+    const runtimeShape = dynamicTriangleMesh ? "convex" : shape;
+    if (dynamicTriangleMesh) {
+      console.warn(
+        `Collider on "${entity.name}": ${shape} collision is unsupported on dynamic bodies; using convex collision.`,
+      );
+    }
 
     let desc = null;
-    if (shape === "box") {
-      const hx = (size?.[0] / 2) * sx, hy = (size?.[1] / 2) * sy, hz = (size?.[2] / 2) * sz;
+    let descs = null;
+    let massWeights = null;
+    if (runtimeShape === "box") {
+      const fitted = fitSize
+        ? [Math.max(fitSize.x, 0.001), Math.max(fitSize.y, 0.001), Math.max(fitSize.z, 0.001)]
+        : size;
+      const hx = (fitted?.[0] / 2) * sx, hy = (fitted?.[1] / 2) * sy, hz = (fitted?.[2] / 2) * sz;
       if (!this.#finiteDims(entity, "box", { "half-extent x": hx, "half-extent y": hy, "half-extent z": hz })) {
         return null;
       }
       desc = RAPIER.ColliderDesc.cuboid(hx, hy, hz);
-    } else if (shape === "sphere") {
-      const r = radius * maxS;
+    } else if (runtimeShape === "sphere") {
+      const r = fitSize
+        ? Math.hypot(fitSize.x * sx, fitSize.y * sy, fitSize.z * sz) / 2
+        : radius * maxS;
       if (!this.#finiteDims(entity, "sphere", { radius: r })) return null;
       desc = RAPIER.ColliderDesc.ball(r);
-    } else if (shape === "capsule") {
-      const halfHeight = (height / 2) * sy, r = radius * Math.max(sx, sz);
+    } else if (runtimeShape === "capsule") {
+      const r = fitSize
+        ? Math.max(fitSize.x * sx, fitSize.z * sz) / 2
+        : radius * Math.max(sx, sz);
+      const halfHeight = fitSize
+        ? Math.max((fitSize.y * sy - r * 2) / 2, 0.0001)
+        : (height / 2) * sy;
       if (!this.#finiteDims(entity, "capsule", { "half-height": halfHeight, radius: r })) return null;
       desc = RAPIER.ColliderDesc.capsule(halfHeight, r);
-    } else if (shape === "mesh") {
-      const tri = collectTrimesh(entity.object3D);
+    } else if (runtimeShape === "convex") {
+      const cooked = this.#getAutoGeometry(entity);
+      const hulls = cooked?.convexParts?.length
+        ? cooked.convexParts.map((part) => scaleCollisionMesh(part, _scale))
+        : cooked?.convex
+          ? [scaleCollisionMesh(cooked.convex, _scale)]
+          : [collectCollisionMesh(entity.object3D, { includeSkinned: false })].filter(Boolean);
+      const shapes = hulls
+        .map((hull) => ({
+          hull,
+          desc: RAPIER.ColliderDesc.convexHull(hull.vertices),
+        }))
+        .filter(({ desc }) => !!desc);
+      descs = shapes.map(({ desc }) => desc);
+      massWeights = shapes.map(({ hull }) => collisionMeshVolume(hull));
+      if (!descs.length) {
+        console.warn(`Collider on "${entity.name}": convex shape found no geometry`);
+        return null;
+      }
+    } else if (runtimeShape === "concave" || runtimeShape === "mesh") {
+      const cooked = this.#getAutoGeometry(entity);
+      const tri = cooked
+        ? scaleCollisionMesh(runtimeShape === "concave" ? cooked.concave ?? cooked : cooked, _scale)
+        : collectCollisionMesh(entity.object3D, { includeSkinned: false });
       if (!tri) {
-        console.warn(`Collider on "${entity.name}": mesh shape found no geometry`);
+        console.warn(`Collider on "${entity.name}": ${shape} shape found no geometry`);
         return null;
       }
       desc = RAPIER.ColliderDesc.trimesh(tri.vertices, tri.indices);
-    } else if (shape === "heightfield") {
+    } else if (runtimeShape === "heightfield") {
       const terrain = entity.getComponent("terrain");
       if (!terrain?.heightsArray) {
         console.warn(`Collider on "${entity.name}": heightfield shape requires a Terrain component`);
@@ -756,33 +1339,49 @@ export class PhysicsSystem {
         { x: (terrain.props.size ?? 50) * sx, y: sy, z: (terrain.props.size ?? 50) * sz },
       );
     }
-    if (!desc) return null;
+    const built = descs ?? (desc ? [desc] : []);
+    if (!built.length) return null;
 
-    desc
-      .setFriction(friction)
-      .setRestitution(restitution)
-      .setSensor(!!isSensor)
-      .setCollisionGroups(this.layers.groupsFor(col.props.layer))
-      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+    for (const builtDesc of built) {
+      builtDesc
+        .setFriction(friction)
+        .setRestitution(restitution)
+        .setSensor(!!isSensor)
+        .setCollisionGroups(this.layers.groupsFor(col.props.layer))
+        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+    }
 
     // A dynamic body's mass comes from its Rigidbody, not shape density.
     const rb = bodyEntity.getComponent("rigidbody");
     if (rb?.props.bodyType === "dynamic" && entity === bodyEntity && rb.props.mass > 0) {
-      desc.setMass(rb.props.mass);
+      const total = massWeights?.reduce((sum, weight) => sum + weight, 0) ?? 0;
+      for (let i = 0; i < built.length; i++) {
+        built[i].setMass(rb.props.mass * (total > 0 ? massWeights[i] / total : 1 / built.length));
+      }
     }
 
     // Collider pose relative to its body (child colliders + local offset).
-    // mesh/heightfield shapes are built already positioned (mesh bakes world
-    // scale into its vertices; heightfield is centered on the entity origin
-    // by construction), so they ignore the `offset` prop.
-    _pos.fromArray(shape === "mesh" || shape === "heightfield" ? [0, 0, 0] : offset).multiply(_scale);
-    _quat.identity();
+    // Geometry-derived shapes already carry mesh offsets in their vertices;
+    // primitive shapes can instead follow the rendered bounds automatically.
+    _pos.fromArray(offset ?? [0, 0, 0]);
+    if (autoCenter && (shape === "box" || shape === "sphere" || shape === "capsule")) {
+      const center = fitBounds?.getCenter(new THREE.Vector3());
+      if (center) _pos.add(center);
+    }
+    _pos.multiply(_scale);
+    _colliderEuler.set(
+      (rotation?.[0] ?? 0) * DEG2RAD,
+      (rotation?.[1] ?? 0) * DEG2RAD,
+      (rotation?.[2] ?? 0) * DEG2RAD,
+    );
+    _colliderRotation.setFromEuler(_colliderEuler);
+    _quat.copy(_colliderRotation);
     if (entity !== bodyEntity) {
       _mat.copy(bodyEntity.object3D.matrixWorld).invert().multiply(entity.object3D.matrixWorld);
       const rel = new THREE.Vector3(), relQ = new THREE.Quaternion(), relS = new THREE.Vector3();
       _mat.decompose(rel, relQ, relS);
       _pos.applyQuaternion(relQ).add(rel);
-      _quat.copy(relQ);
+      _quat.copy(relQ).multiply(_colliderRotation);
     }
     // Same reasoning as #finiteDims: a NaN pose panics the world just as surely
     // as a NaN extent, and `offset` is a vec3 prop like any other. Zero is a
@@ -794,8 +1393,12 @@ export class PhysicsSystem {
       );
       return null;
     }
-    desc.setTranslation(_pos.x, _pos.y, _pos.z).setRotation({ x: _quat.x, y: _quat.y, z: _quat.z, w: _quat.w });
-    return desc;
+    for (const builtDesc of built) {
+      builtDesc
+        .setTranslation(_pos.x, _pos.y, _pos.z)
+        .setRotation({ x: _quat.x, y: _quat.y, z: _quat.z, w: _quat.w });
+    }
+    return built;
   }
 
   /** Builds a kinematic body + capsule + KinematicCharacterController for a
@@ -860,6 +1463,7 @@ export class PhysicsSystem {
 
   #removeCharacterEntry({ cc, body, collider, controller }) {
     if (collider) {
+      this.#forgetColliderContacts(collider.handle);
       this.colliderEntity.delete(collider.handle);
       this.colliderLayer.delete(collider.handle);
     }
@@ -888,7 +1492,10 @@ export class PhysicsSystem {
     this.characters = [];
     for (const entity of this.colliderEntity.values()) {
       const col = entity.getComponent("collider");
-      if (col) col.collider = null;
+      if (col) {
+        col.collider = null;
+        col.colliders = [];
+      }
     }
     for (const { entity } of this.joints) {
       const comp = entity.getComponent("joint");
@@ -901,6 +1508,10 @@ export class PhysicsSystem {
     this.dirty.clear();
     this.colliderEntity.clear();
     this.colliderLayer.clear();
+    this.implicitColliderByEntity.clear();
+    this.nativeContactPairs.clear();
+    this.entityContactCounts.clear();
+    this._deferredEvents = [];
     this.accumulator = 0;
     this.eventQueue?.free();
     this.eventQueue = null;
@@ -1072,6 +1683,29 @@ export class PhysicsSystem {
     this.eventQueue.drainCollisionEvents((h1, h2, started) => into.push([h1, h2, started]));
   }
 
+  #forgetColliderContacts(handle) {
+    for (const [key, contact] of [...this.nativeContactPairs]) {
+      if (contact.h1 !== handle && contact.h2 !== handle) continue;
+      this.nativeContactPairs.delete(key);
+      const count = this.entityContactCounts.get(contact.entityKey) ?? 0;
+      if (count > 1) this.entityContactCounts.set(contact.entityKey, count - 1);
+      else this.entityContactCounts.delete(contact.entityKey);
+    }
+    if (this._deferredEvents?.length) {
+      this._deferredEvents = this._deferredEvents.filter(([h1, h2]) => h1 !== handle && h2 !== handle);
+    }
+  }
+
+  #emitContact(a, b, sensor, started) {
+    const hook = sensor
+      ? (started ? "onTriggerEnter" : "onTriggerExit")
+      : (started ? "onCollisionEnter" : "onCollisionExit");
+    // `dispatch` reaches EVERY script on the entity, not just the first one.
+    a.getComponent("script")?.dispatch(hook, b);
+    b.getComponent("script")?.dispatch(hook, a);
+    this.engine.emit(sensor ? "trigger" : "collision", { a, b, started });
+  }
+
   #dispatchEvents() {
     const events = [];
     if (this._deferredEvents?.length) {
@@ -1080,21 +1714,50 @@ export class PhysicsSystem {
     }
     this.#drainEvents(events);
     for (const [h1, h2, started] of events) {
-      const e1 = this.colliderEntity.get(h1);
-      const e2 = this.colliderEntity.get(h2);
-      if (!e1 || !e2) continue;
-      const sensor = this.world.getCollider(h1)?.isSensor() || this.world.getCollider(h2)?.isSensor();
-      const hook = sensor
-        ? (started ? "onTriggerEnter" : "onTriggerExit")
-        : (started ? "onCollisionEnter" : "onCollisionExit");
-      // `dispatch` reaches EVERY script on the entity, not just the first one.
-      // This used to read `.instance?.[hook]`, which silently delivered
-      // collisions to whichever script happened to be listed first.
-      e1.getComponent("script")?.dispatch(hook, e2);
-      e2.getComponent("script")?.dispatch(hook, e1);
-      this.engine.emit(sensor ? "trigger" : "collision", { a: e1, b: e2, started });
+      const nativeKey = h1 < h2 ? `${h1}:${h2}` : `${h2}:${h1}`;
+      if (started) {
+        if (this.nativeContactPairs.has(nativeKey)) continue;
+        const a = this.colliderEntity.get(h1);
+        const b = this.colliderEntity.get(h2);
+        if (!a || !b || a === b) continue;
+        const sensor = !!(this.world.getCollider(h1)?.isSensor() || this.world.getCollider(h2)?.isSensor());
+        const entityKey = a.id < b.id
+          ? `${sensor ? "trigger" : "collision"}:${a.id}:${b.id}`
+          : `${sensor ? "trigger" : "collision"}:${b.id}:${a.id}`;
+        this.nativeContactPairs.set(nativeKey, { h1, h2, a, b, sensor, entityKey });
+        const count = this.entityContactCounts.get(entityKey) ?? 0;
+        this.entityContactCounts.set(entityKey, count + 1);
+        if (count === 0) this.#emitContact(a, b, sensor, true);
+        continue;
+      }
+
+      const contact = this.nativeContactPairs.get(nativeKey);
+      if (!contact) continue;
+      this.nativeContactPairs.delete(nativeKey);
+      const count = this.entityContactCounts.get(contact.entityKey) ?? 0;
+      if (count > 1) {
+        this.entityContactCounts.set(contact.entityKey, count - 1);
+        continue;
+      }
+      this.entityContactCounts.delete(contact.entityKey);
+      this.#emitContact(contact.a, contact.b, contact.sensor, false);
     }
   }
+}
+
+function collisionMeshVolume({ vertices, indices }) {
+  let sixVolume = 0;
+  for (let i = 0; i + 2 < indices.length; i += 3) {
+    const ai = indices[i] * 3, bi = indices[i + 1] * 3, ci = indices[i + 2] * 3;
+    const ax = vertices[ai], ay = vertices[ai + 1], az = vertices[ai + 2];
+    const bx = vertices[bi], by = vertices[bi + 1], bz = vertices[bi + 2];
+    const cx = vertices[ci], cy = vertices[ci + 1], cz = vertices[ci + 2];
+    sixVolume += ax * (by * cz - bz * cy)
+      + ay * (bz * cx - bx * cz)
+      + az * (bx * cy - by * cx);
+  }
+  const volume = Math.abs(sixVolume) / 6;
+  return Number.isFinite(volume) ? volume : 0;
 }
 
 /**
@@ -1113,43 +1776,4 @@ function toColumnMajor(heights, resolution) {
     }
   }
   return out;
-}
-
-/**
- * Merges every rendered mesh under the entity's Object3D (skipping
- * editor-only helpers) into one trimesh, in the entity's world frame
- * relative to itself — i.e. vertices carry the world scale and child
- * offsets, since Rapier shapes can't scale.
- */
-function collectTrimesh(root) {
-  const verts = [];
-  const indices = [];
-  root.updateWorldMatrix(true, false);
-  const invRoot = new THREE.Matrix4().copy(root.matrixWorld).invert();
-  const rootScale = new THREE.Vector3();
-  root.getWorldScale(rootScale);
-  const local = new THREE.Matrix4();
-  const v = new THREE.Vector3();
-
-  root.traverse((child) => {
-    if (!child.isMesh || !child.geometry?.attributes?.position) return;
-    if (child.layers.mask === 1 << EDITOR_LAYER) return; // editor-only helper
-    child.updateWorldMatrix(true, false);
-    local.copy(invRoot).multiply(child.matrixWorld);
-    const pos = child.geometry.attributes.position;
-    const base = verts.length / 3;
-    for (let i = 0; i < pos.count; i++) {
-      v.fromBufferAttribute(pos, i).applyMatrix4(local).multiply(rootScale);
-      verts.push(v.x, v.y, v.z);
-    }
-    const index = child.geometry.index;
-    if (index) {
-      for (let i = 0; i < index.count; i++) indices.push(base + index.getX(i));
-    } else {
-      for (let i = 0; i < pos.count; i++) indices.push(base + i);
-    }
-  });
-
-  if (!verts.length) return null;
-  return { vertices: new Float32Array(verts), indices: new Uint32Array(indices) };
 }

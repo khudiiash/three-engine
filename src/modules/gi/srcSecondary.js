@@ -4,7 +4,8 @@
 // hit against every light, gather the tile atlas at it for the bounce, and
 // atomically add the whole radiance into the bin [E] reserved for it.
 //
-//     L(H) = Le'(H) + ρ_clamped(H)/π · [ Σ_lights direct(H) + E_atlas(H, n̂) ]
+//     L(H) = Le'(H) + ρ(H)/π · Σ_lights direct(H)
+//                      + ρ_loop(H)/π · E_atlas(H, n̂)
 //
 // docs/GI_SRC_REBUILD_PLAN.md §4.1 [J], §4.4, §12.39, §12.26.9, §12.53.
 //
@@ -127,6 +128,8 @@ import {
   atomicMax,
   atomicStore,
   float,
+  floor,
+  int,
   instanceIndex,
   select,
   uint,
@@ -134,11 +137,19 @@ import {
   uniform,
   vec3,
 } from "three/tsl";
-import { MAX_LODS, SECONDARY_LOD_OFFSET, SUM_SHIFT, W0 } from "./srcConfig.js";
+import {
+  MAX_LODS,
+  SECONDARY_LOD_OFFSET,
+  SUM_SHIFT,
+  W0,
+  sunBounceChromaGainForCascade,
+  sunBounceGainForCascade,
+} from "./srcConfig.js";
 import {
   BIN_B,
   BIN_G,
   BIN_R,
+  BIN_WORDS,
   BIN_SB,
   BIN_SG,
   BIN_SN,
@@ -161,9 +172,11 @@ import {
   STAT_SUN_FACING,
   STAT_SUN_SHADED,
 } from "./srcDeposit.js";
-import { packNormal } from "./srcMathTsl.js";
+import { chebyshev, lodAtDistance, packNormal } from "./srcMathTsl.js";
 import { SLOT_EMPTY } from "./srcProbes.js";
 import { createSrcScreenGather } from "./srcScreenGather.js";
+import { clampLoopAlbedo } from "./srcShade.js";
+import { STAT_SEC_LOD_BASE, STAT_SEC_LOD_LEVELS, STAT_SEC_LOD_MOVER_ROW, STAT_SEC_LOD_WORDS } from "./srcDeposit.js";
 
 /**
  * [J] as a single dispatch.
@@ -225,6 +238,7 @@ export function createSrcSecondaryFrame(store, bins, {
   losOccupied = null,
   losWorld = null,
   surprise = null,
+  sunBounceCompensation = false,
   capacity = 0,
 } = {}) {
   const { scratch, stats, hitListBase, hitCapacity } = bins;
@@ -299,6 +313,9 @@ export function createSrcSecondaryFrame(store, bins, {
     const P = vec3(word(SEC_P + 0), word(SEC_P + 1), word(SEC_P + 2)).toVar();
     const n = vec3(word(SEC_N + 0), word(SEC_N + 1), word(SEC_N + 2)).toVar();
     const rho = vec3(word(SEC_RHO + 0), word(SEC_RHO + 1), word(SEC_RHO + 2)).toVar();
+    // SEC_RHO keeps physical direct reflectance. Only feedback needs R4's
+    // strict <1 spectral-radius bound.
+    const rhoLoop = clampLoopAlbedo(rho).albedo;
     const slot = raw(SEC_SLOT).toVar();
     const Le = vec3(word(SEC_LE + 0), word(SEC_LE + 1), word(SEC_LE + 2)).toVar();
     const emitter = word(SEC_EMITTER).toVar();
@@ -314,20 +331,68 @@ export function createSrcSecondaryFrame(store, bins, {
     // §12.82 split the return in two: `L` is everything EXCEPT the sun, and
     // `sunTransfer` is the sun's `ρ/π · V` with the cosine and the irradiance
     // deliberately left out for `[F]` to supply from the CURRENT angle.
-    const shaded = shade(P, n, rho, Le, emitter, rayIndex);
+    // The measured directional loss enters only when radiance crosses cascade
+    // hand-offs. Recover a conservative 8% per hand-off for the neutral part
+    // and the separately measured 18% for albedo chroma; both are capped and
+    // only the named analytic sun slot sees them. `slot` is already the
+    // destination bin's WORD address, so this needs no record word or binding.
+    const sunGain = sunBounceCompensation ? float(1).toVar() : null;
+    const sunChromaGain = sunBounceCompensation ? float(1).toVar() : null;
+    if (sunGain) {
+      for (let c = 1; c < bins.cascades.length; c++) {
+        const startWord = bins.cascades[c].binBase * BIN_WORDS;
+        const ownsCascade = slot.greaterThanEqual(uint(startWord));
+        sunGain.assign(select(
+          ownsCascade,
+          float(sunBounceGainForCascade(c)),
+          sunGain,
+        ));
+        sunChromaGain.assign(select(
+          ownsCascade,
+          float(sunBounceChromaGainForCascade(c)),
+          sunChromaGain,
+        ));
+      }
+    }
+    const shaded = shade(P, n, rho, Le, emitter, rayIndex, sunGain, sunChromaGain);
     const Ld = vec3(shaded.L).toVar();
     const sunTransfer = shaded.sunTransfer;
     const sunFacing = shaded.sunFacing;
 
     // ── THE BOUNCE ─────────────────────────────────────────────────────────
     //
-    // ρ/π · E_atlas, against LAST frame's bake ([H] runs after the deposit), the
+    // ρ_loop/π · E_atlas, against LAST frame's bake ([H] runs after the deposit), the
     // temporal fixed point R4 models. Held separately from `Ld` so that
     // `SEC_CLAMPED` can report the loop's own saturation.
-    const Lb = gather
-      ? rho.mul(gather.gatherAt(P, n).irradiance).mul(1 / Math.PI).toVar()
+    const gatheredE = gather ? vec3(gather.gatherAt(P, n).irradiance).toVar() : null;
+    const Lb = gatheredE
+      ? rhoLoop.mul(gatheredE).mul(1 / Math.PI).toVar()
       : null;
     const L = (Lb ? Ld.add(Lb) : Ld).toVar();
+    // ── §11.14 THE PER-LOD ENERGY LEDGER (see STAT_SEC_LOD_BASE) ───────────
+    if (Lb) {
+      const luma = (c) => c.x.mul(0.2126).add(c.y.mul(0.7152)).add(c.z.mul(0.0722));
+      // Mover hits (emitter flag -2, see the deposit) take the last row.
+      const lod = select(
+        emitter.lessThan(-1.5),
+        int(STAT_SEC_LOD_MOVER_ROW),
+        floor(lodAtDistance(chebyshev(P, camera), spacing0, maxLods)).toInt().clamp(0, STAT_SEC_LOD_MOVER_ROW - 1),
+      ).toVar();
+      const dFx = luma(Ld).max(0).mul(1024).toUint().toVar();
+      const bFx = luma(Lb).max(0).mul(1024).toUint().toVar();
+      const eFx = luma(gatheredE).max(0).mul(1024).toUint().toVar();
+      const rFx = luma(rhoLoop).max(0).mul(1024).toUint().toVar();
+      for (let j = 0; j < STAT_SEC_LOD_LEVELS; j++) {
+        const base = STAT_SEC_LOD_BASE + j * STAT_SEC_LOD_WORDS;
+        If(lod.equal(int(j)), () => {
+          atomicAdd(stats.element(uint(base)), dFx);
+          atomicAdd(stats.element(uint(base + 1)), bFx);
+          atomicAdd(stats.element(uint(base + 2)), eFx);
+          atomicAdd(stats.element(uint(base + 3)), uint(1));
+          atomicAdd(stats.element(uint(base + 4)), rFx);
+        });
+      }
+    }
 
     // The fixed point conversion, IDENTICAL to the one [E] used to do — same
     // `lmax`, same rounding, same clamp — because [F] resolves `ΣR/Σcount` and
@@ -478,6 +543,26 @@ export function createSrcSecondaryFrame(store, bins, {
         return { dispatched: false, bounce: !!gather, hits: 0, clamped: 0, overflow: 0, capacity };
       }
       const v = new Uint32Array(await renderer.getArrayBufferAsync(stats.value));
+      // §11.14: per hit-LOD energy — mean luma of the direct term, the bounce
+      // term and the gathered irradiance, and the bounce/direct ratio.
+      const byLod = [];
+      for (let j = 0; j < STAT_SEC_LOD_LEVELS; j++) {
+        const base = STAT_SEC_LOD_BASE + j * STAT_SEC_LOD_WORDS;
+        const hits = v[base + 3] >>> 0;
+        if (!hits) continue;
+        const direct = (v[base] >>> 0) / 1024 / hits;
+        const bounce = (v[base + 1] >>> 0) / 1024 / hits;
+        const irradiance = (v[base + 2] >>> 0) / 1024 / hits;
+        const albedo = (v[base + 4] >>> 0) / 1024 / hits;
+        byLod.push({
+          lod: j === STAT_SEC_LOD_MOVER_ROW ? "mover" : j, hits,
+          meanDirectLuma: +direct.toFixed(4),
+          meanBounceLuma: +bounce.toFixed(4),
+          meanIrradianceLuma: +irradiance.toFixed(4),
+          meanLoopAlbedoLuma: +albedo.toFixed(4),
+          bounceOverDirect: direct > 0 ? +(bounce / direct).toFixed(3) : null,
+        });
+      }
       return {
         dispatched: true,
         bounce: !!gather,
@@ -485,6 +570,7 @@ export function createSrcSecondaryFrame(store, bins, {
         clamped: v[STAT_SEC_CLAMPED] >>> 0,
         overflow: v[STAT_SEC_OVERFLOW] >>> 0,
         capacity,
+        byLod,
       };
     },
 

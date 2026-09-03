@@ -3,6 +3,7 @@ import { ColliderComponent } from "./ColliderComponent.js";
 import { CharacterControllerComponent } from "./CharacterControllerComponent.js";
 import { JointComponent } from "./JointComponent.js";
 import { PhysicsSystem } from "./PhysicsSystem.js";
+import { collisionSimplifierReady } from "./collisionGeometry.js";
 import { setPhysicsLayerConfig } from "./layerConfig.js";
 
 /** Filters the one-shot deprecation warning from `@dimforge/rapier3d-compat`
@@ -42,14 +43,15 @@ export const physicsRapierModule = {
   description:
     "Rigid-body physics powered by Rapier: Rigidbody, Collider, Character " +
     "Controller and Joint components, collision layers with a project-wide " +
-    "matrix, fixed-step simulation in play mode, collision/trigger script " +
-    "hooks, and ray/shape/overlap queries.",
+    "matrix, background-cooked automatic mesh collision, fixed-step simulation " +
+    "in play mode, collision/trigger script hooks, and ray/shape/overlap queries.",
   components: [RigidbodyComponent, ColliderComponent, CharacterControllerComponent, JointComponent],
 
   setup(engine) {
     // Layer names have to be readable by component schemas (the Inspector's
     // Layer dropdown) before — and independently of — the Rapier world.
     setPhysicsLayerConfig(engine.config?.physicsLayers);
+    let placeholder;
     const ready = (async () => {
       const mod = await import("@dimforge/rapier3d-compat");
       const RAPIER = mod.default ?? mod;
@@ -67,23 +69,24 @@ export const physicsRapierModule = {
       // init() calls).
       const originalInit = RAPIER.init;
       suppressRapierInitWarning();
-      await originalInit.call(RAPIER);
+      await Promise.all([originalInit.call(RAPIER), collisionSimplifierReady]);
       const system = new PhysicsSystem(engine, RAPIER);
       // Swap the placeholder handle for the live one once Rapier is up. If
       // the user disabled the module in the meantime, dispose immediately.
       const prev = engine.modules.get("physics-rapier");
-      if (prev && prev.placeholder) {
+      if (prev === placeholder) {
         engine.modules.set("physics-rapier", { system, dispose: () => system.dispose() });
-      }
+      } else system.dispose();
     })();
-    return {
+    placeholder = {
       system: null,
       ready,
       placeholder: true,
       dispose: () => {
-        // No-op until the real handle is installed — ready's `.then` cleans
-        // up via the swap above.
+        // No-op until the real handle is installed. The ready task checks that
+        // this exact placeholder still owns the slot and otherwise disposes.
       },
     };
+    return placeholder;
   },
 };

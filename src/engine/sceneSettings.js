@@ -12,7 +12,9 @@ export const SCENE_SETTINGS_DEFAULTS = {
   ambientColor: "#ffffff",
   ambientIntensity: 0.3,
   // Scene-wide image-based environment — THE scene's sky. It drives the skybox
-  // and/or the IBL that lights every material. Empty = flat `background` color.
+  // and/or the IBL that lights every material. Empty = flat `background` color,
+  // and — while `lighting` stays on — that colour is also the sky GI lights
+  // with (see giConfig's sceneSkyRadiance): "Use for lighting" governs both.
   //
   // `cubemap` accepts either a `.cubemap` asset (six face images) or an
   // equirectangular `.hdr`/`.exr` panorama — the shape Poly Haven and every
@@ -486,13 +488,19 @@ const isForeignTexture = (value) => value?.isTexture === true && !isSceneEnvText
 let environmentSeq = 0;
 
 /** Flat background color + no scene-owned IBL. Leaves component-owned textures
- *  (the HDRI EnvironmentComponent) alone — those have their own lifecycle. */
-function clearSceneEnvironment(settings, scene) {
+ *  (the HDRI EnvironmentComponent) alone — those have their own lifecycle.
+ *
+ *  `environmentIntensity` is written even though three itself ignores it while
+ *  `scene.environment` is null (every IBL reader is gated on an env map): it is
+ *  the intensity scalar GI's solid-color sky reads, so the panel's one
+ *  Intensity knob scales the HDRI path and the background-colour path alike. */
+function clearSceneEnvironment(settings, scene, env) {
   if (isSceneEnvTexture(scene.environment)) scene.environment = null;
   if (!isForeignTexture(scene.background)) {
     scene.background = new THREE.Color(settings.background);
     scene.backgroundBlurriness = 0;
   }
+  scene.environmentIntensity = env.intensity ?? 1;
 }
 
 function pushSceneEnvironment(settings, scene, texture, env) {
@@ -532,7 +540,7 @@ function applySceneEnvironment(settings, scene) {
     pushSceneEnvironment(settings, scene, cached, env);
     return;
   }
-  clearSceneEnvironment(settings, scene);
+  clearSceneEnvironment(settings, scene, env);
   if (!path) return;
   loadEnvironmentAsset(path).then((texture) => {
     // A newer apply already decided what the environment should be.
@@ -590,7 +598,8 @@ export function applySettingsToScene(settings, scene, ambientLight, renderer) {
     // how that survived; `collectFreezableCasters` is now the single answer to
     // "whose `autoUpdate` does a plain ShadowNode actually read".
     for (const obj of collectFreezableCasters(scene)) {
-      obj.shadow.autoUpdate = shadow.autoUpdate !== false;
+      const authoredAutoUpdate = shadow.autoUpdate !== false;
+      obj.shadow.autoUpdate = authoredAutoUpdate;
       // ⚠ `!obj.shadow.map` WAS TESTING THE WRONG FIELD. `LightShadow.map` is the
       // WebGL render target and is ALWAYS null on the WebGPU path — the map lives
       // on the ShadowNode's own `shadowMap`, which nothing here can see. So the
@@ -616,7 +625,12 @@ export function applySettingsToScene(settings, scene, ambientLight, renderer) {
       // ⚠ `shadow.needsUpdate` PERSISTS in the .scene, so once saved true it is
       // re-applied on every settings apply for the life of the project rather
       // than acting as the one-shot it reads as.
-      if (shadow.needsUpdate === true) {
+      // "Auto update off" means render this map once and retain it, not
+      // "never allocate a map". WebGPU's ShadowNode only enters its render
+      // path when one of these per-light flags is true, so a virgin/imported
+      // light needs this one-shot pulse. Three clears `needsUpdate` after the
+      // render; the installed ShadowNode guard makes the first build safe.
+      if (!authoredAutoUpdate || shadow.needsUpdate === true) {
         obj.shadow.needsUpdate = true;
       }
     }

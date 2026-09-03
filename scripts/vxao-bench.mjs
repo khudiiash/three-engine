@@ -16,6 +16,7 @@
 // contact box, invisible to any camera) otherwise dominates max|error|.
 import { loadDump, coneVisibility, referenceVisibility, smooth } from "./lib/vxaoOffline.mjs";
 import { VXAO_SUBJECTS } from "./lib/makeVxaoProject.mjs";
+import { giWorldAoResponse } from "../src/modules/gi/giScreen.js";
 
 const D = loadDump();
 const N = { x: 0, y: 1, z: 0 };
@@ -96,3 +97,16 @@ console.log(
   `  off-screen occluder darkening: cone ${(open.cone - hidden.cone).toFixed(4)}, ` +
   `truth ${(open.ref - hidden.ref).toFixed(4)}`,
 );
+const shapedHidden = giWorldAoResponse(hidden.cone);
+const shapedOpen = giWorldAoResponse(open.cone);
+const rawGap = open.cone - hidden.cone;
+const shapedGap = shapedOpen - shapedHidden;
+const responsePass = giWorldAoResponse(1) === 1
+  && Math.abs(shapedHidden - hidden.ref) <= 0.015
+  && Math.abs(shapedOpen - open.ref) <= 0.025
+  && shapedGap >= rawGap * 1.8;
+console.log(
+  `  shipping V^2 response: hidden ${shapedHidden.toFixed(4)}, open ${shapedOpen.toFixed(4)}, ` +
+  `darkening ${shapedGap.toFixed(4)}  ${responsePass ? "PASS" : "FAIL"}`,
+);
+if (!responsePass) process.exitCode = 1;

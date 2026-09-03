@@ -149,6 +149,15 @@ check("decodes flat arrays as typed-array views", () => {
   assert.deepEqual([...decoded.normals], source.normals);
 });
 
+check("decodes a packed Uint8Array view without copying or losing its offset", () => {
+  const packageBytes = new Uint8Array(encoded.byteLength + 24);
+  packageBytes.set(encoded, 12);
+  const packedView = packageBytes.subarray(12, 12 + encoded.byteLength);
+  const fromPackedView = decodeGeometryAsset(packedView);
+  assert.deepEqual([...fromPackedView.positions], source.positions);
+  assert.equal(fromPackedView.positions.buffer, packageBytes.buffer);
+});
+
 check("preserves custom attributes and morph targets", () => {
   assert.equal(decoded.attributes.tangent.itemSize, 4);
   assert.deepEqual([...decoded.attributes.tangent.array], source.attributes.tangent.array);

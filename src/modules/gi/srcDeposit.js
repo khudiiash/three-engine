@@ -104,6 +104,7 @@
 
 import {
   Fn,
+  Break,
   If,
   Loop,
   Return,
@@ -117,22 +118,32 @@ import {
   instanceIndex,
   instancedArray,
   int,
+  packHalf2x16,
   select,
   uint,
+  unpackHalf2x16,
+  vec2,
   vec3,
 } from "three/tsl";
+import { halfRound, halfUlp, packHalf2, unpackHalf2 } from "./srcMath.js";
 import {
   BSTAT_SUM_L,
   BSTAT_SUM_W,
   BSTAT_WORDS,
   CASCADE_COUNT,
   MAX_LODS,
+  PAYLOAD_WORDS,
   SECONDARY_HIT_WORDS,
+  BIN_WORDS,
+  BIN_WORDS_SPLIT,
   SUM_SHIFT,
   SURPRISE_ONE,
   W0,
+  sunSplitArmed,
   binCount,
   binGridWidth,
+  sunBounceChromaGainForCascade,
+  sunBounceGainForCascade,
 } from "./srcConfig.js";
 import {
   binMorton,
@@ -226,7 +237,13 @@ export const BIN_SB = 7;
  * sentinel cannot be confused with a legitimately-encoded axis.
  */
 export const BIN_SN = 8;
-export const BIN_WORDS = 9;
+/**
+ * §10.8: 9 when the sun split is armed, 5 when it is not — srcConfig owns the
+ * value because it also owns `BIN_BUDGET`, which is derived from it. Re-exported
+ * here so every consumer keeps importing the layout from the file that defines
+ * the words.
+ */
+export { BIN_WORDS };
 
 /** Fractional bits in the radiance accumulator. §12.13.4 measured this. */
 export const DEPOSIT_F = 16;
@@ -238,10 +255,108 @@ export const DEPOSIT_SCALE = 1 << DEPOSIT_F;
  * resolve's header says what goes wrong without it.
  */
 export const MIN_WEIGHT = DEPOSIT_SCALE >> 6;
+// §11.13: the near segment's tMin. −1 tells the trace closure "your own
+// self-intersection epsilon" (both closures treat a null/negative tMin as
+// theirs); the far segment passes the near bound instead.
+const BVH_SELF_BIAS_M_FALLBACK = -1;
 
-/** Resolved payload: rgb + transmittance, with T < 0 meaning UNKNOWN. */
-export const PAYLOAD_WORDS = 4;
+/**
+ * Resolved payload: rgb + transmittance, with T < 0 meaning UNKNOWN.
+ *
+ * ══ TWO WORDS OF PACKED HALVES, NOT FOUR FLOATS (plan §11.4 A1, 2026-09-03) ═
+ *
+ * Word 0 is `pack2x16float(r, g)`, word 1 is `pack2x16float(b, T)`. The
+ * payload was the second-largest allocation in the module — 4.5 M bins × 16 B
+ * = 72 MB of a 220 MB store on Bistro — and every consumer on the image path
+ * already reads it through an rgba16f tile atlas, so f32 storage bought
+ * nothing the screen could see. Half precision carries ~3 decimal digits;
+ * the merge's product of four transmittances and the bake's 32-bin average
+ * round unbiased at ~0.05 % relative, two orders under the 3 %/pixel/frame
+ * flicker gate. `PAYLOAD_UNKNOWN` (−1) and 0 are exact halves, so every
+ * `T < 0` / `T == 0` test in the kernels reads as it always did.
+ *
+ * THE KERNELS NEVER TOUCH THE WORDS DIRECTLY. `readPayload` / `readPayloadT` /
+ * `writePayload` / `writePayloadUnknown` below are the only four ways in, and
+ * `decodePayload` / `encodePayload` are their CPU twins for the mirror gates
+ * and the probes (`srcMath.js` owns the binary16 conversion). A fifth path
+ * would be a second definition of the layout.
+ *
+ * `PAYLOAD_CHANNELS` is the DECODED stride — what `decodePayload` hands back
+ * and what every CPU reader indexes by — kept distinct from `PAYLOAD_WORDS`
+ * so a reader that still multiplies by the word count on a decoded array
+ * fails loudly on the first bin rather than reading every other one.
+ */
+export { PAYLOAD_WORDS };
+export const PAYLOAD_CHANNELS = 4;
 export const PAYLOAD_UNKNOWN = -1;
+
+/** Word offset of bin `bin` in `payload`. */
+const payloadWord = (bin) => uint(bin).mul(uint(PAYLOAD_WORDS));
+
+/** `{ L: vec3, T: float }` of bin `bin` — two loads, both unpacked. */
+export function readPayload(payload, bin) {
+  const o = payloadWord(bin).toVar();
+  const rg = unpackHalf2x16(payload.element(o)).toVar();
+  const bt = unpackHalf2x16(payload.element(o.add(uint(1)))).toVar();
+  return { L: vec3(rg.x, rg.y, bt.x).toVar(), T: bt.y.toVar() };
+}
+
+/** Transmittance alone — one load, for the early-outs that never need L. */
+export function readPayloadT(payload, bin) {
+  return unpackHalf2x16(payload.element(payloadWord(bin).add(uint(1)))).y.toVar();
+}
+
+/** Store `L` (vec3) and `T` (float) into bin `bin`. */
+export function writePayload(payload, bin, L, T) {
+  const o = payloadWord(bin).toVar();
+  payload.element(o).assign(packHalf2x16(vec2(L.x, L.y)));
+  payload.element(o.add(uint(1))).assign(packHalf2x16(vec2(L.z, T)));
+}
+
+/** Mark bin `bin` UNKNOWN (T = −1; the blue channel is meaningless with it). */
+export function writePayloadUnknown(payload, bin) {
+  payload.element(payloadWord(bin).add(uint(1)))
+    .assign(packHalf2x16(vec2(float(0), float(PAYLOAD_UNKNOWN))));
+}
+
+/**
+ * CPU twin of the unpack: a `Uint32Array` of packed words (a readback of
+ * `bins.payload`, or its CPU mirror) → `Float32Array` of `PAYLOAD_CHANNELS`
+ * per bin, `[r, g, b, T]`, indexed exactly the way the f32 payload was.
+ */
+export function decodePayload(words) {
+  const src = words instanceof Uint32Array ? words : new Uint32Array(words);
+  const bins = Math.floor(src.length / PAYLOAD_WORDS);
+  const out = new Float32Array(bins * PAYLOAD_CHANNELS);
+  for (let i = 0; i < bins; i++) {
+    const [r, g] = unpackHalf2(src[i * PAYLOAD_WORDS]);
+    const [b, t] = unpackHalf2(src[i * PAYLOAD_WORDS + 1]);
+    const o = i * PAYLOAD_CHANNELS;
+    out[o] = r; out[o + 1] = g; out[o + 2] = b; out[o + 3] = t;
+  }
+  return out;
+}
+
+/**
+ * CPU twin of the pack: a `[r, g, b, T]`-per-bin field → packed words, into
+ * `out` (a `Uint32Array` of `PAYLOAD_WORDS` per bin — `bins.payload.value.array`
+ * for a gate that synthesizes its own field) or a fresh array.
+ */
+export function encodePayload(field, out = null) {
+  const bins = Math.floor(field.length / PAYLOAD_CHANNELS);
+  const dst = out ?? new Uint32Array(bins * PAYLOAD_WORDS);
+  for (let i = 0; i < bins; i++) {
+    const o = i * PAYLOAD_CHANNELS;
+    dst[i * PAYLOAD_WORDS] = packHalf2(field[o], field[o + 1]);
+    dst[i * PAYLOAD_WORDS + 1] = packHalf2(field[o + 2], field[o + 3]);
+  }
+  return dst;
+}
+
+/** What a value becomes after one trip through the packed payload. */
+export const payloadQuantize = halfRound;
+/** One binary16 ulp at `x` — the gate allowance for a value that crossed the payload. */
+export const payloadUlp = halfUlp;
 
 /**
  * ══ [J]'s HIT LIST — A REGION OF `scratch`, NOT A BUFFER OF ITS OWN ═════════
@@ -271,7 +386,7 @@ export const PAYLOAD_UNKNOWN = -1;
  */
 export const SEC_P = 0;     // world position of the hit
 export const SEC_N = 3;     // face-forwarded normal (srcShade's `faceForward`)
-export const SEC_RHO = 6;   // albedo AFTER `clampLoopAlbedo` — R4's in-loop ρ
+export const SEC_RHO = 6;   // physical 0..1 albedo; [J] applies R4 only to feedback
 export const SEC_SLOT = 9;  // destination bin's WORD base, already ×BIN_WORDS
 export const SEC_LE = 10;   // raw emissive — R5's zeroing is [J]'s (it owns the NEE set)
 export const SEC_EMITTER = 13; // R5 flag as float bits; < 0 = not an NEE light
@@ -425,7 +540,35 @@ export const STAT_SUN_NORMAL = 19;  // ...of which had a cached normal to close
  */
 export const STAT_SUN_FACING = 20;
 export const STAT_SUN_SHADED = 21;
-export const STAT_WORDS = 22;
+// §11.13: rays that traced their FAR intervals this frame (the far duty).
+export const STAT_FAR = 22;
+// §11.13: capped rays that hit nothing INSIDE their shortened reach. They are
+// not misses of the scene — the ray never looked further — so the attribution
+// tally excludes them (see readStats' `unattributedRate`).
+export const STAT_CAPPED_MISS = 23;
+// §11.13: rays the NEED FLOOR forced far that the duty's stratum had not drawn.
+export const STAT_FAR_NEED = 24;
+// §11.14's instrument: [J]'s energy ledger PER HIT LOD — for each of the
+// MAX_LODS camera-distance LODs a hit can sit at, four words: Σ luma of the
+// direct term, Σ luma of the bounce term, Σ luma of the gathered irradiance
+// E_atlas, and the hit count. Luma in 1/1024 fixed point. The ratio
+// bounce/direct per LOD is what separates "the loop over-gains everywhere"
+// from "the coarse far lattice leaks the sunlit strip into the shadows".
+export const STAT_SEC_LOD_BASE = 25;
+export const STAT_SEC_LOD_WORDS = 5;  // +Σ luma of the hit albedo the loop multiplies
+// Row STAT_SEC_LOD_LEVELS-1 is not a LOD: it is every hit on a MOVER (a
+// skinned capsule / dynamic body), whatever its distance — the character
+// brightness ledger (§11.15) needs the mover hits' Ld / Lb / E on their own.
+export const STAT_SEC_LOD_LEVELS = 5;
+export const STAT_SEC_LOD_MOVER_ROW = STAT_SEC_LOD_LEVELS - 1;
+// §11.15: rays born INSIDE a mover (a skinned capsule around a lattice probe) —
+// dropped without a deposit; see the deposit's `insideMover` note.
+export const STAT_INSIDE_MOVER = STAT_SEC_LOD_BASE + STAT_SEC_LOD_WORDS * STAT_SEC_LOD_LEVELS;
+// §11.15 instrument: hits the transport landed ON a mover, and how many of
+// them reached the second-bounce list with the mover flag intact.
+export const STAT_MOVER_HITS = STAT_INSIDE_MOVER + 1;
+export const STAT_MOVER_RECORDS = STAT_INSIDE_MOVER + 2;
+export const STAT_WORDS = STAT_INSIDE_MOVER + 3;
 const T_FIXED = 1024;
 
 /**
@@ -485,6 +628,8 @@ export function createSrcBinStore(store, {
   w0 = W0,
   maxBytes = 128 * 1024 * 1024,
   secondaryCapacity = 0,
+  /** §10.8 — does this build read/write BIN_SR..BIN_SN? Asserted, not assumed. */
+  sunWords = sunSplitArmed(),
 } = {}) {
   const cascades = [];
   let binTotal = 0;
@@ -521,6 +666,16 @@ export function createSrcBinStore(store, {
   // against a full worklist for exactly as long as anyone waited). So the
   // record rides `scratch`, which [E] already binds, exactly as [J]'s hit list
   // does and for the same measured reason.
+  // §10.8: the sun words exist only in the armed layout. A build that asks to
+  // CLOSE the sun against a 5-word bin would read words 5..8 of bin N, which
+  // are words 0..3 of bin N+1 — a silent cross-bin read, so it is a throw.
+  if (sunWords && BIN_WORDS < BIN_WORDS_SPLIT) {
+    throw new Error(
+      "createSrcBinStore: this build uses the sun-split bin words (BIN_SR..BIN_SN) " +
+      `but the layout is ${BIN_WORDS} words — arm __giSrcSunSplit before the ` +
+      "page loads (srcConfig's BIN_WORDS is read once at module load)",
+    );
+  }
   const binWords = binTotal * BIN_WORDS;
   const hitCapacity = Math.max(0, Math.floor(secondaryCapacity));
   const hitListBase = binWords;
@@ -542,7 +697,17 @@ export function createSrcBinStore(store, {
   }
 
   const scratch = instancedArray(new Uint32Array(binWords + hitWords + statWords), "uint").toAtomic();
-  const payload = instancedArray(new Float32Array(binTotal * PAYLOAD_WORDS), "float");
+  // Packed halves (see PAYLOAD_WORDS) — a u32 buffer, read and written only
+  // through the four accessors above it. Initialized UNKNOWN (T = −1), not
+  // zero: a zero word unpacks to T = 0, i.e. a KNOWN black bin, and since the
+  // resolve skips dead blocks (the live word) a never-claimed block would
+  // otherwise read as known black to anything that reached it — the top
+  // cascade's sky composite counted 5.6 M such bins on Bistro. The f32 layout
+  // had the same hole; the packed one closes it for the price of one fill.
+  const payloadInit = new Uint32Array(binTotal * PAYLOAD_WORDS);
+  const unknownWord = packHalf2(0, PAYLOAD_UNKNOWN);
+  for (let i = 1; i < payloadInit.length; i += PAYLOAD_WORDS) payloadInit[i] = unknownWord;
+  const payload = instancedArray(payloadInit, "uint");
   const stats = instancedArray(new Uint32Array(STAT_WORDS), "uint").toAtomic();
 
   return {
@@ -569,6 +734,15 @@ export function createSrcBinStore(store, {
      */
     blockStatBase,
     bytes: scratchBytes + payloadBytes + STAT_WORDS * 4,
+    /**
+     * The payload's CPU decoder, on the object every probe already holds —
+     * `decodePayload(await renderer.getArrayBufferAsync(bins.payload.value))`
+     * gives `[r, g, b, T]` per bin at `payloadChannels` stride. Scripts that
+     * reach the live store through the editor have no module import to call
+     * the free function by.
+     */
+    payloadChannels: PAYLOAD_CHANNELS,
+    decodePayload,
     dispose() {
       for (const b of [scratch, payload, stats]) b?.value?.dispose?.();
     },
@@ -675,10 +849,56 @@ export function createSrcDepositFrame(store, bins, {
   influxLift = null,
   surprise = null,
   rayWork = null,
+  sunBounceCompensation = false,
   maxLods = MAX_LODS,
   stride = null,
   phase = null,
   threads = 0,
+  /**
+   * §11.13 THE FAR DUTY (2026-09-03). A uniform in (0, 1]: the fraction of
+   * each frame's rays that trace BEYOND cascade `farFrom − 1`'s far bound. The
+   * rest stop there and deposit into cascades 0..farFrom−1 only — the far
+   * bins they would have sampled receive neither a count nor a T, so the
+   * §12.40.4 influx compensation lengthens those blocks' windows and their
+   * effective sample counts hold (variance-neutral at rest by construction;
+   * a surprised block still relaxes its own decay). Stratified per ray by an
+   * integer hash of the ray's R2 index and the frame stamp, so the far
+   * samples rotate through directions rather than pinning to a subset.
+   *
+   * Measured need (Bistro ultra, the street overview, pose-locked): rays
+   * capped at cascade 1's far bound (2.8 m at LOD 0) took the deposit trace
+   * 12.2 → 5.9 ms and [J] 12.85 → 4.9 ms — the far intervals are 14 of the
+   * transport's 25 ms, and 60 % of the shaded hits.
+   *
+   * Null (the default, and every gate) leaves the kernel byte-identical.
+   */
+  farDuty = null,
+  farFrom = 2,
+  /**
+   * §11.13 THE NEED FLOOR, in rays: a far bin holding fewer than this many
+   * (decayed) samples in the ray's direction forces the ray's far intervals
+   * regardless of the duty — a fresh far block fills at the full rate, and a
+   * bin whose count sags refills before the resolve's MIN_WEIGHT floor can
+   * turn it UNKNOWN. Two atomic loads per ray, hoisted nowhere: the bin is a
+   * function of the direction.
+   *
+   * ONE ray, not four (11:45): the far cascades hold ~1.2 M bins against
+   * ~70 k rays a frame on Bistro, so most far bins never accumulate four
+   * decayed samples — at 4 the floor forced 60 % of the rays far, for good.
+   * At 1 a bin is released the moment it is KNOWN, which is the floor's job.
+   *
+   * 1/32 RAY, not 1 (12:20, the bin-count histogram): even cascade 1, which
+   * the duty never touches, holds 41 % empty bins and 25 % below one ray —
+   * a far probe fed by a few distant pixels spreads them over 512–2048
+   * directions and cannot lift every bin past one decayed ray, so a one-ray
+   * floor forced 35 % of ALL rays for good. The resolve calls a bin known
+   * down to MIN_WEIGHT = 1/64 ray; the floor's job is to fill UNKNOWN bins
+   * and keep known ones above that line, and 1/32 (a 2× margin) is exactly
+   * that. At the compensated far keep a single sample stays above it for
+   * thousands of frames, so at rest the floor releases a bin at its FIRST
+   * sample.
+   */
+  farNeed = 1 / 32,
   /**
    * §12.82. `srcShade.js`'s `sunTerm(lighting)` — a THUNK returning the split
    * source's `{direction, irradiance}` as of THIS frame. Null leaves `[F]`
@@ -804,6 +1024,11 @@ export function createSrcDepositFrame(store, bins, {
     const i = instanceIndex.toVar();
     const b = i.mul(BIN_WORDS).toVar();
     const k = float(keep ?? 0).toVar();
+    // 1 while a probe holds this bin's block, else 0 (srcProbes' live word).
+    // A dead block is skipped below unless it was released THIS frame (its
+    // stamp says so) — that frame it must still be zeroed, so the phantoms
+    // §12.21 named never come back.
+    const live = uint(1).toVar();
     if (keep && frameStamp) {
       // Which block owns this bin. The cascades partition `binTotal` at bases
       // known when the graph is built, so this is a chain of at most four
@@ -812,6 +1037,15 @@ export function createSrcDepositFrame(store, bins, {
         const lo = info.binBase;
         const hi = lo + info.bins * info.blockCapacity;
         const base = stampBase + info.blockBase;
+        // §11.13: a far cascade's inflow is `farDuty` of what the ray count
+        // says (the influx word is written on the RAY side and cannot see the
+        // cut), so its base keep is compensated the same way §12.40.4
+        // compensates the cap: `1 − (1−keep)·duty` holds the effective sample
+        // count. Applied to the BASE so the surprise relax composes on it.
+        const farCascade = !!farDuty && farFrom > 0 && farFrom < bins.cascades.length && info.cascade >= farFrom;
+        const keepBase = farCascade
+          ? float(1.0).sub(float(1.0).sub(float(keep)).mul(float(farDuty)))
+          : float(keep);
         // A NaN here compiles, runs, and reads the probe free stack — see
         // `blockBase`'s note in `createSrcBinStore`. Cheap to make impossible.
         if (!Number.isInteger(base)) {
@@ -827,6 +1061,9 @@ export function createSrcDepositFrame(store, bins, {
         }
         If(i.greaterThanEqual(uint(lo)).and(i.lessThan(uint(hi))), () => {
           const block = i.sub(uint(lo)).div(uint(info.bins)).toVar();
+          if (farCascade) k.assign(keepBase);
+          const liveB = Number.isInteger(store.blockLiveBase) ? store.blockLiveBase + info.blockBase : null;
+          if (liveB != null) live.assign(freeStack.element(uint(liveB).add(block)));
           // The ratio the compensation multiplied `1−keep` by, 1 when the
           // branch below is skipped. Hoisted only when the surprise mix needs
           // something to interpolate FROM; without the bundle this var does
@@ -878,7 +1115,7 @@ export function createSrcDepositFrame(store, bins, {
               // must reproduce this rounding, and `a + (b−a)·t` does not.
               const f = lifted.mul(float(1.0).sub(t))
                 .add(float(surprise.surpriseF).mul(t)).toVar();
-              k.assign(float(1.0).sub(float(1.0).sub(float(keep)).mul(f)));
+              k.assign(float(1.0).sub(float(1.0).sub(keepBase).mul(f)));
             });
           }
           // ── S1: FREEZE A HELD BLOCK (locality retention) ────────────────
@@ -903,60 +1140,102 @@ export function createSrcDepositFrame(store, bins, {
             k.assign(float(1));
           });
           const stamp = freeStack.element(uint(base).add(block)).toVar();
-          If(stamp.equal(frameStamp), () => { k.assign(float(0)); });
+          If(stamp.equal(frameStamp), () => { k.assign(float(0)); live.assign(uint(1)); });
         });
       }
     }
-    for (let w = 0; w < BIN_WORDS; w++) {
-      const e = scratch.element(b.add(uint(w)));
-      if (w === BIN_SN && globalThis.__giSunSplitHoldNormal === true) {
-        // ⚠ DIAGNOSTIC. Emits NO store for the normal at all, so the decay
-        // cannot touch it — a reclaimed block then inherits a dead probe's
-        // direction, which is wrong on purpose. It is what separated the two
-        // ways the cached normal can go missing, and it is kept because it is
-        // the control for the trap below.
-      } else if (w === BIN_SN) {
-        // §12.82: THE NORMAL IS NOT A SUM, SO IT MUST NOT BE DECAYED. It is a
-        // packed pair of 15-bit fields plus a flag; `floor(x·keep)` on that is
-        // not a dimmer normal, it is a DIFFERENT direction, and at keep 0.98 it
-        // would walk across the octahedral map a few thousand texels per second
-        // while every counter read healthy. Held exactly, and zeroed on the one
-        // event that invalidates it — the block being handed to another probe,
-        // which is the `keep == 0` the stamp check above produces.
-        //
-        // ══ ⛔⛔ AND IT IS AN `If`, NOT A `select`. THIS COST A SESSION. ══════
-        //
-        // The obvious form is `atomicStore(e, select(k > 0, atomicLoad(e), 0))`
-        // — read it back and write it unchanged when the block survives. **That
-        // zeroes the word EVERY FRAME.** `ConditionalNode` does not emit a
-        // ternary here: it `isolate()`s each branch and emits a real `if`
-        // statement assigning into a hoisted property, and an `atomicLoad` of
-        // the very word being `atomicStore`d does not survive that round trip.
-        //
-        // Nothing said so. Every counter stayed healthy — merge orphan rate,
-        // corners, `noBlock`, the shade tallies, all unchanged — and the SHADE
-        // gate passed at 0.0000% because the defect is not in the expression,
-        // it is in the store. What it cost on the user's Level, with the sun
-        // PINNED (where a re-aiming split must be a no-op): only **9% of bins
-        // carrying radiance still had a normal** against the 48-53% of hits that
-        // face the sun, so **the picture lost a quarter to a half of its light**.
-        // The tell was arithmetic, not visual: the normal count tracked THIS
-        // FRAME's facing hits at a flat 0.73 while radiance plainly survived
-        // across frames (47,540 lit bins against 13,045 hits).
-        //
-        // ⭐ THE RULE, which generalizes past this file: **never round-trip an
-        // atomic through a conditional to "keep" it. Write only when you mean to
-        // change it.** The `If` below touches the word on the one frame it is
-        // reclaimed and leaves it alone otherwise — which is also one fewer
-        // read-modify-write per bin per frame on the hottest buffer in the
-        // module. `__giSunSplitHoldNormal` is the control that proved it: with
-        // the store removed entirely the ratio went 9% → 52-63% and the luma
-        // came back (leg0 0.00154 → 0.00283 against a 0.00259-0.00294 baseline).
-        If(k.lessThanEqual(0), () => { atomicStore(e, uint(0)); });
-      } else {
-        atomicStore(e, uint(floor(float(atomicLoad(e)).mul(k).add(0.5))));
+    // ══ ⭐⭐ AN EMPTY BIN'S DECAY IS A NO-OP, AND THE POOL IS MOSTLY EMPTY ════
+    //
+    // This dispatch is sized by the BIN POOL, not by the live set: `BIN_BUDGET`
+    // is a tier constant, so a scene that fills 43% of its probe capacity still
+    // pays 100% of the decay every frame. Measured on the user's Bistro
+    // (2026-08-30): 26,431 live probes of 61,440 capacity — c0 19853/32768,
+    // c1 5211/16384, c2 1447/8192, c3 404/4096 — so **56% of all bins belong to
+    // blocks no probe has ever claimed**, and the pass was the single most
+    // expensive GI dispatch in the frame at 13.3 ms isolated.
+    //
+    // ══ WHY SKIPPING IS BIT-EXACT AND NOT AN APPROXIMATION ══════════════════
+    //
+    // `count == 0` implies every DECAYED word is already 0:
+    //   · R/G/B, T and SR/SG/SB are each incremented only alongside `count`,
+    //     and by at most `DEPOSIT_SCALE` per deposit while `count` gets exactly
+    //     `DEPOSIT_SCALE` — so each is <= `count` on arrival;
+    //   · the decay `floor(x·k + 0.5)` is MONOTONIC in x, so `x <= count` is
+    //     preserved through any number of frames of decay.
+    // Therefore count 0 ⇒ all seven are 0, and `floor(0·k + 0.5) = 0` — the
+    // stores this loop would emit write 0 over 0. Nothing downstream can see
+    // the difference; the resolve retires the bin on `count < MIN_WEIGHT`
+    // regardless of what the radiance words hold.
+    //
+    // ⚠ `k <= 0` MUST STILL RUN THE LOOP, AND THAT IS NOT A DETAIL. `BIN_SN`
+    // is never decayed, so a long-dead block can hold a stale normal after its
+    // count has faded to zero — and the ONE event that must clear it is the
+    // reclaim, which arrives as `k = 0` from the claim-stamp check above. Skip
+    // that frame and a new probe inherits a dead one's direction, which is
+    // exactly the §12.82 defect whose comment below records it costing "a
+    // quarter to a half of the picture's light". So the guard is "has content
+    // OR is being zeroed", never "has content".
+    // Dead block (no probe holds it, not released this frame): its words are
+    // already what a decay would leave them — skip the count read too.
+    const binCount = uint(0).toVar();
+    If(live.notEqual(uint(0)), () => {
+      binCount.assign(atomicLoad(scratch.element(b.add(uint(BIN_COUNT)))));
+    });
+    If(live.notEqual(uint(0)).and(binCount.greaterThan(uint(0)).or(k.lessThanEqual(0))), () => {
+      for (let w = 0; w < BIN_WORDS; w++) {
+        const e = scratch.element(b.add(uint(w)));
+        if (w === BIN_SN && globalThis.__giSunSplitHoldNormal === true) {
+          // ⚠ DIAGNOSTIC. Emits NO store for the normal at all, so the decay
+          // cannot touch it — a reclaimed block then inherits a dead probe's
+          // direction, which is wrong on purpose. It is what separated the two
+          // ways the cached normal can go missing, and it is kept because it is
+          // the control for the trap below.
+        } else if (w === BIN_SN) {
+          // §12.82: THE NORMAL IS NOT A SUM, SO IT MUST NOT BE DECAYED. It is a
+          // packed pair of 15-bit fields plus a flag; `floor(x·keep)` on that is
+          // not a dimmer normal, it is a DIFFERENT direction, and at keep 0.98 it
+          // would walk across the octahedral map a few thousand texels per second
+          // while every counter read healthy. Held exactly, and zeroed on the one
+          // event that invalidates it — the block being handed to another probe,
+          // which is the `keep == 0` the stamp check above produces.
+          //
+          // ══ ⛔⛔ AND IT IS AN `If`, NOT A `select`. THIS COST A SESSION. ══════
+          //
+          // The obvious form is `atomicStore(e, select(k > 0, atomicLoad(e), 0))`
+          // — read it back and write it unchanged when the block survives. **That
+          // zeroes the word EVERY FRAME.** `ConditionalNode` does not emit a
+          // ternary here: it `isolate()`s each branch and emits a real `if`
+          // statement assigning into a hoisted property, and an `atomicLoad` of
+          // the very word being `atomicStore`d does not survive that round trip.
+          //
+          // Nothing said so. Every counter stayed healthy — merge orphan rate,
+          // corners, `noBlock`, the shade tallies, all unchanged — and the SHADE
+          // gate passed at 0.0000% because the defect is not in the expression,
+          // it is in the store. What it cost on the user's Level, with the sun
+          // PINNED (where a re-aiming split must be a no-op): only **9% of bins
+          // carrying radiance still had a normal** against the 48-53% of hits that
+          // face the sun, so **the picture lost a quarter to a half of its light**.
+          // The tell was arithmetic, not visual: the normal count tracked THIS
+          // FRAME's facing hits at a flat 0.73 while radiance plainly survived
+          // across frames (47,540 lit bins against 13,045 hits).
+          //
+          // ⭐ THE RULE, which generalizes past this file: **never round-trip an
+          // atomic through a conditional to "keep" it. Write only when you mean to
+          // change it.** The `If` below touches the word on the one frame it is
+          // reclaimed and leaves it alone otherwise — which is also one fewer
+          // read-modify-write per bin per frame on the hottest buffer in the
+          // module. `__giSunSplitHoldNormal` is the control that proved it: with
+          // the store removed entirely the ratio went 9% → 52-63% and the luma
+          // came back (leg0 0.00154 → 0.00283 against a 0.00259-0.00294 baseline).
+          If(k.lessThanEqual(0), () => { atomicStore(e, uint(0)); });
+        } else {
+          atomicStore(e, uint(floor(float(atomicLoad(e)).mul(k).add(0.5))));
+        }
       }
-    }
+    });
+    // ⚠ OUTSIDE the empty-bin guard: these are indexed by the DISPATCH index,
+    // not by the bin, and clearing the stats and the per-block sums has nothing
+    // to do with whether bin `i` happens to hold anything.
     If(i.lessThan(uint(STAT_WORDS)), () => { atomicStore(stats.element(i), uint(0)); });
     // ── the per-block SUM words, cleared beside the stats ───────────────────
     //
@@ -1042,7 +1321,14 @@ export function createSrcDepositFrame(store, bins, {
     const lod = floor(lodAtDistance(chebyshev(P, camera), spacing0, maxLods)).toVar();
     const bounds = [];
     for (let c = 0; c < N; c++) bounds.push(intervalBoundary(c, lod, spacing0).toVar());
-    const reach = bounds[N - 1];
+    // §11.13 INSTRUMENT (build-time, dev only): `__giSrcReachCascade = k` caps every
+    // ray at cascade k's far bound, so the trace cost of the intervals beyond it
+    // can be read off the deposit's own timing at one pose. The capped intervals
+    // read as misses (T = 1, sky) — a measurement, never a look.
+    const reachCapC = Number(globalThis.__giSrcReachCascade);
+    const reach = Number.isInteger(reachCapC) && reachCapC >= 0 && reachCapC < N - 1
+      ? bounds[reachCapC]
+      : bounds[N - 1];
 
     // THE ANCESTOR CHAIN, walked once per pixel rather than once per ray. Every
     // ray from this pixel deposits into the same chain — it is a property of the
@@ -1102,9 +1388,123 @@ export function createSrcDepositFrame(store, bins, {
       // gate's diff bit-exact (see `srcRef.js`'s `traceAndDeposit` header).
       const n = base.add(k).toVar();
       const dir = rayDirection(n, Nrm, jitterX, jitterY).toVar();
-      const r = trace(P, dir, reach, n);
+      // ── §11.13 THE FAR DUTY — see the option's note ─────────────────────
+      //
+      // NEAR FIRST, THEN FAR (12:40). The first form drew the duty BEFORE the
+      // trace and let the need floor force a ray whose far bin was unknown —
+      // but a far bin in a direction the near geometry blocks can never
+      // receive a sample (the ray hits at 1 m and deposits nothing far), so
+      // it stayed unknown and forced its rays for good: 29 % of all rays at
+      // rest, at any floor. Now the ray traces cascades 0..farFrom−1 first;
+      // only a ray that CLEARED them consults the stratum and the floor, and
+      // traces the far intervals as a second segment [nearBound, reach] of
+      // the same ray. ONE call site of the descent, inside a two-iteration
+      // GPU loop (§13.14.5's law), and a near trace bounded by its own tMax
+      // for every ray. With `farDuty` null the plain single call is emitted
+      // — the gates' byte-identity.
+      const farOn = !!farDuty && farFrom > 0 && farFrom < N;
+      let r = null;
+      let reachC = null;
+      if (!farOn) {
+        r = trace(P, dir, reach, n);
+      } else {
+        const nearBound = bounds[farFrom - 1];
+        // lowbias32 over (ray index ⊕ frame stamp · φ⁻¹): 24 bits → [0, 1).
+        const salt = frameStamp ? uint(frameStamp) : uint(0);
+        const x = n.bitXor(salt.mul(uint(0x9E3779B9))).toVar();
+        x.assign(x.bitXor(x.shiftRight(uint(16))).mul(uint(0x7feb352d)));
+        x.assign(x.bitXor(x.shiftRight(uint(15))).mul(uint(0x846ca68b)));
+        x.assign(x.bitXor(x.shiftRight(uint(16))));
+        const h = x.shiftRight(uint(8)).toFloat().mul(1 / 16777216);
+        const stratum = h.lessThan(float(farDuty)).toVar();
+        const goFar = float(0).toVar();     // 1 = the far segment was traced
+        const needWeight = Math.max(0, Math.round(Number(farNeed) * DEPOSIT_SCALE));
+        // The result vars are declared BEFORE the loop (a var declared inside
+        // a Loop body is scoped to it in WGSL); a superset of both closures'
+        // fields, the absent ones dropped after the build.
+        const rOut = {
+          hit: float(0).toVar(), t: float(-1).toVar(),
+          position: vec3(0).toVar(), exactPosition: vec3(0).toVar(), normal: vec3(0, 1, 0).toVar(),
+          slot: float(-1).toVar(), uvPacked: float(0).toVar(), dynObj: float(-1).toVar(), insideMover: float(0).toVar(), voxel: vec3(0).toVar(),
+        };
+        // The closure DECLARES its result fields (`trace.fields`): the loop body
+        // below is built at shader-build time, after this JS has run, so the
+        // shape cannot be read off a call. A closure without the declaration
+        // (the gate's synthetic trace) gets the five every arm returns.
+        const present = (trace.fields ?? ["hit", "t", "position", "exactPosition", "normal"])
+          .filter((key) => rOut[key] != null);
+        Loop({ start: int(0), end: int(2), type: "int", condition: "<" }, ({ i: seg }) => {
+          const isFar = seg.equal(int(1));
+          const segMax = select(isFar, reach, nearBound);
+          const rs = trace(P, dir, segMax, n, select(isFar, nearBound, float(BVH_SELF_BIAS_M_FALLBACK)));
+          for (const key of present) {
+            if (rs[key] == null) throw new Error(`createSrcDepositFrame: the trace declared "${key}" but returned null`);
+            rOut[key].assign(rs[key]);
+          }
+          // A hit ends the ray, near or far.
+          If(rOut.hit.greaterThan(0.5), () => { Break(); });
+          // The near segment cleared: draw the duty, then the floor — any far
+          // bin in this direction below `farNeed` rays of evidence forces the
+          // far segment (a blockless far probe cannot receive the sample and
+          // does not vote). Both only for rays that can actually reach it.
+          If(isFar.not(), () => {
+            const need = float(0).toVar();
+            if (needWeight > 0) {
+              for (let c = farFrom; c < N; c++) {
+                const infoC = bins.cascades[c];
+                If(blocks[c].notEqual(uint(SLOT_EMPTY)), () => {
+                  const bC = dirToBin(dir, infoC.width).toVar();
+                  const slotC = uint(infoC.binBase)
+                    .add(blocks[c].mul(uint(infoC.bins)))
+                    .add(binMorton(bC.x, bC.y))
+                    .mul(BIN_WORDS)
+                    .toVar();
+                  const cnt = atomicLoad(scratch.element(slotC.add(uint(BIN_COUNT))));
+                  If(cnt.lessThan(uint(needWeight)), () => { need.assign(1); });
+                });
+              }
+            }
+            const far = stratum.or(need.greaterThan(0.5));
+            goFar.assign(select(far, float(1), float(0)));
+            atomicAdd(stats.element(uint(STAT_FAR)), select(far, uint(1), uint(0)));
+            atomicAdd(stats.element(uint(STAT_FAR_NEED)), select(far.and(stratum.not()), uint(1), uint(0)));
+            atomicAdd(stats.element(uint(STAT_CAPPED_MISS)), select(far, uint(0), uint(1)));
+            If(far.not(), () => { Break(); });
+          });
+        });
+        r = Object.fromEntries(Object.keys(rOut).map((key) => [key, present.includes(key) ? rOut[key] : null]));
+        reachC = select(goFar.greaterThan(0.5), int(N - 1), int(farFrom - 1)).toVar();
+      }
       const hit = r.hit.greaterThan(0.5).toVar();
       const d = select(hit, r.t, float(-1)).toVar();
+      // ── §11.15 A RAY BORN INSIDE A MOVER IS NOT A SAMPLE (2026-09-03) ────
+      //
+      // The lattice does not avoid the inside of things: at s0 = 0.35 m a
+      // probe lands inside a character's torso, and a skinned rig's capsule
+      // proxies then enclose it in a nearly closed cavity of the body's own
+      // albedo (the Y Bot: #ffffff, R4-clamped to 0.9). Its rays hit the
+      // capsule INTERIORS at once; those hits pass the sun's shadow test (an
+      // interior point sits at the body surface's depth from the light) and
+      // the any-hit ray ignores movers, so the cavity is lit from inside at
+      // ρ = 0.9 — and the R4 loop amplifies that by 1/(1−0.9). Measured on
+      // the user's Sponza: tile texels at 13.7 where the sunlit floor peaks
+      // at 0.9, the bounce term 12× its physical share, the character
+      // clipped white, every shadow 2× the path tracer (plan §11.14).
+      //
+      // The mover trace flips every hit normal to face the ray, so the side
+      // is carried as a bit instead (`inside` — the raw normal pointed ALONG
+      // the ray, i.e. the hit was reached from inside). Such a ray
+      // deposits nothing — not T = 1 below the hit, not a count, not a hit-list
+      // entry: the probe's bins stay UNKNOWN there, which the gather's
+      // coverage renormalization treats as an absence (R1), never as dark.
+      // Static geometry keeps its face-forward rule (§12.26.4: record normals
+      // carry no reliable sign); only movers are judged here.
+      const insideMover = r.insideMover != null
+        ? hit.and(float(r.insideMover).greaterThan(0.5)).toVar()
+        : null;
+      if (insideMover) {
+        atomicAdd(stats.element(uint(STAT_INSIDE_MOVER)), select(insideMover, uint(1), uint(0)));
+      }
 
       // WHICH CASCADE OWNS THIS HIT. `splitCascade`'s running-sum form: no loop,
       // no break, no divergence. A miss lands on N, which is past every cascade
@@ -1116,6 +1516,11 @@ export function createSrcDepositFrame(store, bins, {
         for (const b of bounds) k2.addAssign(int(select(d.greaterThan(b), 1, 0)));
         own.assign(k2);
       });
+      // §11.13: the cascades this ray may DEPOSIT into. A capped ray's miss
+      // is a miss through cascades 0..farFrom−1 only — it never looked
+      // further, so the far bins get neither a count nor an all-clear.
+      const ownReach = (reachC ? own.min(reachC) : own).toVar();
+      if (insideMover) If(insideMover, () => { ownReach.assign(int(-1)); });
 
       // ── [J]'s RECORD (§12.39 as a capture, §12.53 as the whole interface) ──
       //
@@ -1150,6 +1555,15 @@ export function createSrcDepositFrame(store, bins, {
         sec.rho.assign(vec3(a.rho));
         sec.Le.assign(vec3(a.emissive));
         if (a.emitter != null) sec.emitter.assign(float(a.emitter));
+        // §11.15: a hit on a MOVER travels as emitter flag -2. The shade only
+        // ever tests `0 <= emitter < emitters.length`, so any negative is
+        // "not an NEE light"; [J]'s ledger reads -2 as "mover row".
+        if (r.dynObj != null) {
+          If(hit.and(float(r.dynObj).greaterThanEqual(0)), () => {
+            sec.emitter.assign(float(-2));
+            atomicAdd(stats.element(uint(STAT_MOVER_HITS)), uint(1));
+          });
+        }
       }
 
       // Radiance at the hit, in fixed point — the INLINE form ONLY. With
@@ -1163,7 +1577,26 @@ export function createSrcDepositFrame(store, bins, {
       let fx = null;
       let lumaFx = null;
       if (!deferred) {
-        const L = shadeHit ? vec3(shadeHit(r, dir, n)).toVar() : vec3(0).toVar();
+        const sunGain = sunBounceCompensation ? float(1).toVar() : null;
+        const sunChromaGain = sunBounceCompensation ? float(1).toVar() : null;
+        if (sunGain) {
+          for (let c = 1; c < N; c++) {
+            const ownsCascade = own.greaterThanEqual(int(c));
+            sunGain.assign(select(
+              ownsCascade,
+              float(sunBounceGainForCascade(c)),
+              sunGain,
+            ));
+            sunChromaGain.assign(select(
+              ownsCascade,
+              float(sunBounceChromaGainForCascade(c)),
+              sunChromaGain,
+            ));
+          }
+        }
+        const L = shadeHit
+          ? vec3(shadeHit(r, dir, n, sunGain, sunChromaGain)).toVar()
+          : vec3(0).toVar();
         const unit = L.div(float(lmax).max(1e-6)).toVar();
         const clamped = unit.x.max(unit.y).max(unit.z).greaterThan(1).toVar();
         fx = [
@@ -1205,10 +1638,10 @@ export function createSrcDepositFrame(store, bins, {
         // "nowhere" is dropped-and-counted rather than redirected: writing it
         // into block 0 would corrupt the bins of a probe that is working.
         If(blk.equal(uint(SLOT_EMPTY)).and(chain[c].notEqual(uint(SLOT_EMPTY)))
-          .and(int(c).lessThanEqual(own)), () => {
+          .and(int(c).lessThanEqual(ownReach)), () => {
           atomicAdd(stats.element(uint(STAT_NOBLOCK)), uint(1));
         });
-        If(blk.notEqual(uint(SLOT_EMPTY)).and(int(c).lessThanEqual(own)), () => {
+        If(blk.notEqual(uint(SLOT_EMPTY)).and(int(c).lessThanEqual(ownReach)), () => {
           const b = dirToBin(dir, info.width).toVar();
           const m = binMorton(b.x, b.y).toVar();
           const slot = uint(info.binBase)
@@ -1341,6 +1774,7 @@ export function createSrcDepositFrame(store, bins, {
             // from, so a float round-trip here would move the pick.
             put(SEC_RAY, n);
             put(SEC_SUML, sec.sumL);
+            If(sec.emitter.lessThan(-1.5), () => { atomicAdd(stats.element(uint(STAT_MOVER_RECORDS)), uint(1)); });
           }).Else(() => {
             atomicAdd(stats.element(uint(STAT_SEC_OVERFLOW)), uint(1));
           });
@@ -1379,15 +1813,33 @@ export function createSrcDepositFrame(store, bins, {
   passes.push(Fn(() => {
     const i = instanceIndex.toVar();
     const b = i.mul(BIN_WORDS).toVar();
-    const o = i.mul(PAYLOAD_WORDS).toVar();
     // `atomicLoad`, not a plain read: `scratch` is declared atomic and WGSL will
     // not implicitly convert `atomic<u32>` to `u32` — it fails at
     // CreateShaderModule, which surfaces as a validation error rather than a
     // wrong picture. Free on every target we ship to (srcProbes.js says the
     // same about its own counters).
+    // Dead blocks (see the decay's live word) keep their last payload and are
+    // unreachable — every reader goes through a live probe or checks the word
+    // itself (tiles, merge). A block released this frame still resolves, to
+    // UNKNOWN, exactly as before.
+    if (frameStamp && Number.isInteger(store.blockLiveBase)) {
+      const live = uint(1).toVar();
+      for (const info of bins.cascades) {
+        const lo = info.binBase;
+        const hi = lo + info.bins * info.blockCapacity;
+        If(i.greaterThanEqual(uint(lo)).and(i.lessThan(uint(hi))), () => {
+          const block = i.sub(uint(lo)).div(uint(info.bins)).toVar();
+          live.assign(freeStack.element(uint(store.blockLiveBase + info.blockBase).add(block)));
+          If(freeStack.element(uint(stampBase + info.blockBase).add(block)).equal(frameStamp), () => {
+            live.assign(uint(1));
+          });
+        });
+      }
+      If(live.equal(uint(0)), () => { Return(); });
+    }
     const count = atomicLoad(scratch.element(b.add(uint(BIN_COUNT)))).toVar();
     If(count.lessThan(uint(MIN_WEIGHT)), () => {
-      payload.element(o.add(uint(3))).assign(float(PAYLOAD_UNKNOWN));
+      writePayloadUnknown(payload, i);
       Return();
     });
     const inv = float(1).div(float(count)).toVar();
@@ -1473,11 +1925,7 @@ export function createSrcDepositFrame(store, bins, {
       L.assign(L.min(vec3(float(lmax))));
     }
 
-    payload.element(o).assign(L.x);
-    payload.element(o.add(uint(1))).assign(L.y);
-    payload.element(o.add(uint(2))).assign(L.z);
-    payload.element(o.add(uint(3)))
-      .assign(float(atomicLoad(scratch.element(b.add(uint(BIN_T))))).mul(inv));
+    writePayload(payload, i, L, float(atomicLoad(scratch.element(b.add(uint(BIN_T))))).mul(inv));
   })().compute(binTotal));
 
   return {
@@ -1513,6 +1961,7 @@ export function createSrcDepositFrame(store, bins, {
       const rays = v[STAT_RAYS] >>> 0;
       const hits = v[STAT_HITS] >>> 0;
       const shaded = v[STAT_SHADED] >>> 0;
+      const cappedMiss = v[STAT_CAPPED_MISS] >>> 0;
       return {
         dispatched: true,
         rays,
@@ -1534,6 +1983,16 @@ export function createSrcDepositFrame(store, bins, {
         shaded,
         unattributed: v[STAT_UNATTRIBUTED] >>> 0,
         shadowRays: v[STAT_SHADOWRAYS] >>> 0,
+        // §11.13: rays that traced their far intervals, and the share of all
+        // rays they were. `farRate` 1 = no far duty in effect.
+        farRays: v[STAT_FAR] >>> 0,
+        farRate: rays > 0 ? (v[STAT_FAR] >>> 0) / rays : 0,
+        farNeedRays: v[STAT_FAR_NEED] >>> 0,
+        // §11.15: rays born inside a mover, dropped without a deposit.
+        insideMoverRays: v[STAT_INSIDE_MOVER] >>> 0,
+        moverHits: v[STAT_MOVER_HITS] >>> 0,
+        moverRecords: v[STAT_MOVER_RECORDS] >>> 0,
+        farNeedRate: rays > 0 ? (v[STAT_FAR_NEED] >>> 0) / rays : 0,
         emissiveHits: v[STAT_EMISSIVE] >>> 0,
         emitZeroed: v[STAT_EMIT_ZEROED] >>> 0,
         albedoClamped: v[STAT_ALBEDO_CLAMPED] >>> 0,
@@ -1558,7 +2017,14 @@ export function createSrcDepositFrame(store, bins, {
         // The HIT-side rate, which has the denominator the bin ratio lacks.
         sunFacing: v[STAT_SUN_FACING] >>> 0,
         sunShaded: v[STAT_SUN_SHADED] >>> 0,
-        unattributedRate: shaded > 0 ? (v[STAT_UNATTRIBUTED] >>> 0) / shaded : 0,
+        // §11.13: a capped ray that hit nothing inside its shortened reach is
+        // counted by the attribution as a miss (it has no surface), but it is
+        // not a miss of the SCENE. Both terms drop it so the rate keeps the
+        // meaning every reading before the far duty had.
+        unattributedRate: shaded - cappedMiss > 0
+          ? Math.max(0, (v[STAT_UNATTRIBUTED] >>> 0) - cappedMiss) / (shaded - cappedMiss)
+          : 0,
+        cappedMisses: cappedMiss,
         deposits: v[STAT_DEPOSITS] >>> 0,
         clamped: v[STAT_CLAMPED] >>> 0,
         // Deposits the block pool refused. Zero unless BIN_BUDGET is short for

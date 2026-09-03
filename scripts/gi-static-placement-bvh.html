@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>GI static placement BVH GPU smoke</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // Compiles the production dynamicObjects.js SBV2 arm directly. The full
+      // GI smoke remains on the legacy format until GISystem's format switch is
+      // enabled, so it cannot by itself catch syntax/binding regressions here.
+      // Run: node scripts/run-gpu-page.mjs http://127.0.0.1:5219/scripts/gi-static-placement-bvh.html 70000
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; console.log(line); };
+      const fail = (error) => {
+        const message = error?.stack ?? error?.message ?? String(error);
+        console.error("GI-SBV2 FAIL", message);
+        globalThis.__GI_SMOKE_RESULT__ = { pass: false, error: message, text: out.textContent };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const {
+          STATIC_MASK_WORD_BASE,
+          createDynamicObjectSet,
+          dynHeaderWords,
+        } = await import("/src/modules/gi/dynamicObjects.js");
+        const { buildStaticPlacementBvhWords } = await import("/src/modules/gi/staticPlacementBvh.js");
+        const { STATIC_BVH_FORMAT_PLACEMENT } = await import("/src/modules/gi/staticBvhFormats.js");
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const validationErrors = [];
+        renderer.backend.device.addEventListener?.("uncapturederror", (event) => {
+          const message = event.error?.message ?? String(event.error);
+          validationErrors.push(message);
+          console.error("WebGPU validation error:", message);
+        });
+
+        // Two placements share one local triangle/BLAS. Slot 7 is masked;
+        // slot 8 must remain visible to both exact-reflection and shadow shapes.
+        const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+        const uvs = new Float32Array([0, 0, 1, 0, 0, 1]);
+        const place = (x, slot) => ({
+          geometryKey: "shared-triangle",
+          positions,
+          uvs,
+          slot,
+          matrix: new THREE.Matrix4().makeTranslation(x, 0, 5),
+        });
+        const packed = buildStaticPlacementBvhWords([place(0, 7), place(2, 8)], null, { uvs: true });
+        if (!packed || packed.format !== STATIC_BVH_FORMAT_PLACEMENT) {
+          throw new Error("fixture did not build an SBV2 placement artifact");
+        }
+
+        const headerWords = dynHeaderWords(4);
+        const packedBase = headerWords;
+        const words = new Uint32Array(headerWords + packed.words.length);
+        words.set(packed.words, packedBase);
+        words[STATIC_MASK_WORD_BASE] = 1 << 7;
+        const bits = TSL.instancedArray(words, "uint");
+        const dyn = createDynamicObjectSet({
+          bits,
+          baseWord: 0,
+          capacityWords: words.length,
+          maxObjects: 4,
+        });
+        dyn.attachStaticBvh({
+          nodeBase: packedBase,
+          base: packedBase,
+          format: packed.format,
+          uvBase: packed.layout.uvWordCount
+            ? packedBase + packed.layout.uvWordOffset
+            : 0,
+        });
+
+        const origins = TSL.instancedArray(new Float32Array([
+          0.2, 0.2, 0, 0,
+          2.2, 0.2, 0, 0,
+          4.2, 0.2, 0, 0,
+        ]), "vec4");
+        const dirs = TSL.instancedArray(new Float32Array([
+          0, 0, 1, 0,
+          0, 0, 1, 0,
+          0, 0, 1, 0,
+        ]), "vec4");
+        const exactOut = TSL.instancedArray(new Float32Array(12), "vec4");
+        const shadowOut = TSL.instancedArray(new Float32Array(12), "vec4");
+        const exactKernel = TSL.Fn(() => {
+          const i = TSL.instanceIndex.toVar();
+          exactOut.element(i).assign(dyn.traceStaticBvhSlot(
+            origins.element(i).xyz,
+            dirs.element(i).xyz,
+            TSL.float(0.001),
+            TSL.float(100),
+          ));
+        })().compute(3);
+        const shadowKernel = TSL.Fn(() => {
+          const i = TSL.instanceIndex.toVar();
+          shadowOut.element(i).assign(dyn.traceStaticBvh(
+            origins.element(i).xyz,
+            dirs.element(i).xyz,
+            TSL.float(0.001),
+            TSL.float(100),
+          ));
+        })().compute(3);
+
+        await renderer.computeAsync(exactKernel);
+        await renderer.computeAsync(shadowKernel);
+        const exact = new Float32Array((await renderer.getArrayBufferAsync(exactOut.value)).slice(0, 48));
+        const shadow = new Float32Array((await renderer.getArrayBufferAsync(shadowOut.value)).slice(0, 48));
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        const near = (a, b, epsilon = 2e-3) => Math.abs(a - b) <= epsilon;
+        const maskedMiss = exact[0] < 0 && shadow[0] < 0;
+        const sharedHit = near(exact[4], 5) && near(exact[7], 8)
+          && near(shadow[4], 5) && shadow[7] < -0.99;
+        const openMiss = exact[8] < 0 && shadow[8] < 0;
+        const pass = maskedMiss && sharedHit && openMiss && validationErrors.length === 0;
+        say(`${maskedMiss ? "PASS" : "FAIL"} masked placement misses`);
+        say(`${sharedHit ? "PASS" : "FAIL"} shared BLAS hit exact=${[...exact.slice(4, 8)]} shadow=${[...shadow.slice(4, 8)]}`);
+        say(`${openMiss ? "PASS" : "FAIL"} empty ray misses`);
+        if (pass) say("GI-SMOKE PASS format=placement-v1 storage-delta=0");
+        globalThis.__GI_SMOKE_RESULT__ = {
+          pass,
+          maskedMiss,
+          sharedHit,
+          openMiss,
+          validationErrors,
+          exact: [...exact],
+          shadow: [...shadow],
+          text: out.textContent,
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

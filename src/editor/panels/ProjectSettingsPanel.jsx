@@ -547,7 +547,16 @@ export function ProjectSettingsPanel() {
         />
       </Section>
 
-      <Section id="project.physics" title="Physics Layers" defaultOpen={false}>
+      <Section id="project.physics" title="Physics" defaultOpen={false}>
+        <Row
+          label="Auto colliders start enabled"
+          hint="With physics on, every mesh and model gets a generated Collider. Off (default): it is attached disabled — no cooking, no native shape — until you enable it on the entities that need it. On: every generated collider is live at load, which cooks every mesh in the scene."
+        >
+          <Toggle
+            checked={physics.autoCollidersEnabled === true}
+            onChange={(v) => patch("physics", { autoCollidersEnabled: v })}
+          />
+        </Row>
         <CollisionMatrix
           layers={physics.layers}
           matrix={physics.matrix}

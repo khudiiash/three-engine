@@ -25,7 +25,11 @@ fn npx_wrangler(args: &[&str]) -> Command {
     #[cfg(windows)]
     {
         let mut cmd = command("cmd");
-        cmd.arg("/C").arg("npx").arg("--yes").arg("wrangler").args(args);
+        cmd.arg("/C")
+            .arg("npx")
+            .arg("--yes")
+            .arg("wrangler")
+            .args(args);
         cmd
     }
     #[cfg(not(windows))]

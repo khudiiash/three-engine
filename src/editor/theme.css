@@ -3679,6 +3679,87 @@ input[type="checkbox"]:checked::after {
   flex: 0 0 56px;
 }
 
+/* Five discrete levels on one continuous rail. The control is deliberately
+   radio-like rather than a range input: every persisted value is one of the
+   five visible choices, and keyboard/screen-reader users get exact labels. */
+.level-field {
+  --level-progress: 0%;
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(24px, 1fr));
+  flex: 1;
+  min-width: 150px;
+  height: 18px;
+  align-items: center;
+}
+
+.level-field-track {
+  position: absolute;
+  top: 8px;
+  left: 10%;
+  right: 10%;
+  height: 2px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--accent) 0%,
+    var(--accent) var(--level-progress),
+    var(--fill-2) var(--level-progress),
+    var(--fill-2) 100%
+  );
+}
+
+.level-field-step {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font: inherit;
+}
+
+.level-field-dot {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--fill-2);
+  border-radius: 50%;
+  background: var(--bg-1);
+  transition: border-color 0.12s var(--ease), background-color 0.12s var(--ease), transform 0.12s var(--ease);
+}
+
+.level-field-step.filled .level-field-dot {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.level-field-step.selected .level-field-dot {
+  transform: scale(1.08);
+}
+
+.level-field-step.off.selected .level-field-dot {
+  border-color: var(--fill-2);
+  background: var(--fill-2);
+  opacity: 1;
+}
+
+.level-field-step:focus-visible {
+  outline: none;
+}
+
+.level-field-step:focus-visible .level-field-dot {
+  box-shadow: 0 0 0 2px var(--bg-1), 0 0 0 4px var(--accent-ring);
+}
+
+.level-field.mixed {
+  opacity: 0.65;
+}
+
 /* ---------- Assets ---------- */
 
 .assets-panel {
@@ -10790,6 +10871,206 @@ body.terrain-brush-radial .viewport-canvas { cursor: none !important; }
 }
 
 .texture-dialog.wide { width: 400px; }
+
+/* Prompt-first text-to-motion dialog. It deliberately does not inherit the
+   texture dialog's label grid: the prompt is the product, not one field in a
+   property sheet. */
+.motion-dialog {
+  width: min(460px, 100%);
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--menu-bg) 96%, transparent);
+  box-shadow: var(--shadow-menu), 0 24px 70px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(24px);
+  animation: tx-pop 0.14s var(--ease);
+}
+
+.motion-dialog-header {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 10px;
+}
+
+.motion-dialog-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  color: #fff;
+  background: linear-gradient(145deg, #168cff, #735cff);
+  box-shadow: 0 7px 18px rgba(53, 110, 255, 0.3);
+}
+
+.motion-dialog h3 { margin: 0; font-size: 14px; font-weight: 650; color: var(--text); }
+.motion-dialog-header p { margin: 3px 0 0; font-size: 10.5px; color: var(--text-dim); }
+
+.motion-dialog-close {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.motion-dialog-close:hover:not(:disabled) { color: var(--text); background: var(--fill-1); }
+
+.motion-prompt {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 94px;
+  padding: 11px 12px;
+  resize: vertical;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  outline: none;
+  background: var(--bg-2);
+  color: var(--text);
+  font: 12.5px/1.5 inherit;
+  transition: border-color 120ms var(--ease), background 120ms var(--ease), box-shadow 120ms var(--ease);
+}
+.motion-prompt:hover { background: var(--bg-3); }
+.motion-prompt:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.motion-prompt::placeholder { color: var(--text-dim); }
+
+.motion-essentials {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.motion-essentials > label,
+.motion-advanced > label {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 10px;
+  border-radius: 8px;
+  background: var(--fill-1);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.motion-number { display: flex; align-items: center; gap: 3px; color: var(--text-dim); }
+.motion-number em { font-style: normal; }
+.motion-essentials input[type="number"],
+.motion-advanced input[type="number"] {
+  width: 50px;
+  height: 24px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  outline: none;
+  background: var(--bg-2);
+  color: var(--text);
+  text-align: right;
+  font: 11.5px inherit;
+  appearance: textfield;
+}
+.motion-essentials input[type="number"]::-webkit-inner-spin-button,
+.motion-advanced input[type="number"]::-webkit-inner-spin-button { display: none; }
+
+.motion-switch-row input {
+  width: 30px;
+  height: 17px;
+  appearance: none;
+  position: relative;
+  border-radius: 999px;
+  background: var(--bg-3);
+  cursor: pointer;
+  transition: background 120ms var(--ease);
+}
+.motion-switch-row input::after {
+  content: "";
+  position: absolute;
+  width: 13px;
+  height: 13px;
+  top: 2px;
+  left: 2px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: transform 120ms var(--ease), background 120ms var(--ease);
+}
+.motion-switch-row input:checked { background: var(--accent); }
+.motion-switch-row input:checked::after { transform: translateX(13px); background: #fff; }
+
+.motion-advanced-toggle {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 1px;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font: 10.5px inherit;
+  cursor: pointer;
+}
+.motion-advanced-toggle:hover { color: var(--text); }
+.motion-advanced-toggle svg { transition: transform 120ms var(--ease); }
+.motion-advanced-toggle.open svg { transform: rotate(180deg); }
+.motion-advanced { display: grid; grid-template-columns: 1.35fr 1fr 1fr; gap: 8px; }
+.motion-advanced select {
+  min-width: 82px;
+  height: 24px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--bg-2);
+  color: var(--text);
+  font: 11px inherit;
+}
+
+.motion-error {
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 42%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: color-mix(in srgb, var(--danger) 78%, white);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.motion-dialog-footer {
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 2px;
+}
+.motion-runtime { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: 10.5px; }
+.motion-runtime::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.motion-runtime.ready { color: var(--ok, #6fcf86); }
+.motion-runtime.missing { color: var(--warn, #e5aa56); }
+.motion-generate {
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font: 600 11.5px inherit;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(10, 132, 255, 0.24);
+}
+.motion-generate:hover:not(:disabled) { filter: brightness(1.08); }
+.motion-generate:disabled { opacity: 0.38; cursor: default; box-shadow: none; }
+.motion-spinner { animation: motion-spin 0.8s linear infinite; }
+@keyframes motion-spin { to { transform: rotate(360deg); } }
 
 /* Destructive confirmation (components/ConfirmDialog.jsx). Sits above every
    other overlay — including the portalled context menu that usually opens it —

@@ -50,6 +50,9 @@ await new Promise((r) => setTimeout(r, 5000));
 const result = await page.evaluate(async () => {
   // editorFramePacing stops the engine loop headless — see run-gi-occupancy.
   globalThis.__editorKeepRendering = true;
+  // §10 (2026-09-02): "auto" is the field-less BVH build now; this suite
+  // measures the VOXEL occupancy machinery, so it pins the occupancy mode.
+  globalThis.__giRayHitMode = "hybrid-exact-complex";
   // This suite regression-tests the VOXEL spawn/despawn machinery (stable
   // slots, pair reuse, fast chains) — the path non-adoptable movers still
   // take. Exact-dynamic adoption would park the mover's slot on first motion

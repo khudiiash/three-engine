@@ -27,7 +27,13 @@ const BASIS_LOAD_TIMEOUT_MS = 12000;
 // REQUESTED, the queued ones blow the deadline before a worker ever reaches
 // them, misreporting a healthy transcoder as broken. Gate submissions to the
 // pool size so every started transcode is measured, not its wait in line.
-const BASIS_MAX_CONCURRENT = 4;
+// Desktop startup is dominated by hundreds of independent Bistro texture
+// transcodes. Spend the memory the machine offers: up to eight workers, while
+// retaining the four-worker floor/portable behaviour on small devices.
+const BASIS_MAX_CONCURRENT = Math.max(
+  4,
+  Math.min(8, Math.floor((globalThis.navigator?.hardwareConcurrency ?? 6) * 0.75)),
+);
 
 // Distinguish a transient overload (some timeouts, but the transcoder works)
 // from a genuinely dead transcoder. A single timeout falls back for that one
@@ -153,9 +159,32 @@ async function getBasisLoader() {
  * one handing GI a different mesh set to storm-rebuild against at 2 fps.
  */
 let textureLoadsInFlightCount = 0;
+let textureLoadProgress = 0;
 
 export function textureLoadsInFlight() {
   return textureLoadsInFlightCount;
+}
+
+/** Monotonic loader activity signal. Counts can stay flat while queued work
+ * hands a slot to the next texture; systems timing a *stall* need to see that
+ * forward progress without inspecting loader internals. */
+export function textureLoadProgressVersion() {
+  return textureLoadProgress;
+}
+
+/** Waits for the currently scheduled texture wave to settle. Used by atomic
+ * scene publication so geometry and its real material become visible together.
+ * A timeout is fail-open: a bad asset may remain a placeholder, never a load
+ * screen that cannot finish. */
+export async function waitForTextureAssets(timeoutMs = 15_000) {
+  const deadline = performance.now() + Math.max(0, timeoutMs);
+  let quietTurns = 0;
+  while (performance.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 16));
+    quietTurns = textureLoadsInFlightCount === 0 ? quietTurns + 1 : 0;
+    if (quietTurns >= 2) return true;
+  }
+  return textureLoadsInFlightCount === 0;
 }
 
 /**
@@ -165,10 +194,12 @@ export function textureLoadsInFlight() {
  */
 export async function loadTextureAsset(path, options) {
   textureLoadsInFlightCount++;
+  textureLoadProgress++;
   try {
     return await loadTextureAssetInner(path, options);
   } finally {
     textureLoadsInFlightCount--;
+    textureLoadProgress++;
   }
 }
 

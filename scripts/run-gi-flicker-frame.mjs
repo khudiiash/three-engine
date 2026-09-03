@@ -328,9 +328,10 @@ await wait(1500);
 
 // ── THE SKY, WHICH SRC CANNOT BE MEASURED WITHOUT ───────────────────────────
 // `sceneSkyRadiance` (giConfig.js) is `scene.environment ? environmentIntensity
-// : 0`, and it does NOT sample the texture — the sky's chroma is deliberately
-// unread until Phase 5. So any truthy environment gives the right radiometry
-// here, and a 1x1 equirect costs nothing and needs no HDRI in the project.
+// : background-colour-when-lighting-is-on`, and it does NOT sample the texture
+// — an environment's chroma is deliberately unread. So any truthy environment
+// gives the right radiometry here, and a 1x1 equirect costs nothing and needs
+// no HDRI in the project.
 //
 // It has to exist at all, though: with hit shading still Phase 5 every
 // deposited radiance is zero, so the sky is the only light SRC transports. A

@@ -61,7 +61,7 @@ const EMIT = Number(process.env.EMIT ?? 8);
 const CLUTTER = Number(process.env.CLUTTER ?? 0);
 const MOVERS = Number(process.env.MOVERS ?? 0);
 const SEGS = Number(process.env.SEGS ?? 24);
-// MIRROR=1 (2026-08-13): floor drops to roughness 0.3 = bucket 0, the scene
+// MIRROR=1 (2026-08-13): floor drops to roughness 0.2 = bucket 0, the scene
 // gains a reflection consumer, and QUALITY defaults to ultra because
 // exactReflections exists only there (giConfig BY_TIER) — this is the arm
 // that prices emitters × exact reflections (the resolve's hit-path

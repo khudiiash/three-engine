@@ -36,6 +36,8 @@
 //      one), SCENE (default Main), URL, WAIT_MS, BOOTS, SLOW_MS, TOPN, FLAGS
 //      (JSON of page globals), NO_PROFILE, CHROME_PATH
 import puppeteer from "puppeteer-core";
+import os from "node:os";
+import path from "node:path";
 import { installTauriShim } from "./lib/tauriShim.mjs";
 
 const url = process.argv[2] ?? process.env.URL ?? "http://127.0.0.1:5201/";
@@ -44,6 +46,7 @@ const SCENE = process.env.SCENE ?? "Main";
 const WAIT_MS = Number(process.env.WAIT_MS ?? 120000);
 const BOOTS = Number(process.env.BOOTS ?? 1);
 const SLOW_MS = Number(process.env.SLOW_MS ?? 50);
+const AUTO = process.env.AUTO === "1";
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const fmt = (x, n = 0) => (x == null ? "—" : x.toFixed(n));
 const mb = (bytes) => (bytes / 1048576).toFixed(1);
@@ -69,6 +72,10 @@ function installLedger() {
     mapN: 0, mapMs: 0,      // buffer.mapAsync (awaited resolve, informational)
     bgN: 0, bgMs: 0,        // createBindGroup
     ibN: 0, ibMs: 0,        // createImageBitmap (main-thread image decode)
+    rpL: [],                // render-pipeline labels created this frame (sync + async)
+    gctN: 0, gctMs: 0,      // GPUCanvasContext.getCurrentTexture — blocks when the swap chain is starved
+    gpuDoneMs: -1,          // queue.onSubmittedWorkDone latency measured from this frame's rAF
+    subTop: [],             // the slowest submits of this frame: [ms, name] (GPU completion latency per submit)
   });
   let cur = C();
   g.__ledgerCur = () => cur;
@@ -91,6 +98,25 @@ function installLedger() {
   const D = g.GPUDevice?.prototype, Q = g.GPUQueue?.prototype;
   timed(D, "createComputePipeline", "cp");
   timed(D, "createRenderPipeline", "rp");
+  if (D && typeof D.createRenderPipeline === "function") {
+    const o = D.createRenderPipeline;
+    D.createRenderPipeline = function (...a) {
+      let label = "S:" + (a[0]?.label ?? "?");
+      // GISystem records module → WGSL in `device.__giShaderSource`; a plain
+      // "NodeMaterial_N" label says nothing, so carry the fragment source's
+      // size and a recognisable head (its first binding names) with it.
+      try {
+        const code = this.__giShaderSource?.get(a[0]?.fragment?.module);
+        if (typeof code === "string") {
+          const heads = [...code.matchAll(/var<[^>]*>\s*([A-Za-z_][A-Za-z0-9_]*)|@binding\(\d+\)\s*var\s+([A-Za-z_][A-Za-z0-9_]*)/g)]
+            .map((m) => m[1] || m[2]).filter(Boolean).slice(0, 6).join(",");
+          label += ` [${code.length}B ${heads}]`;
+        }
+      } catch {}
+      cur.rpL.push(label);
+      return o.apply(this, a);
+    };
+  }
   timed(D, "createShaderModule", "sm");
   timed(D, "createTexture", "ct");
   timed(D, "createBuffer", "cb", (a) => a[0]?.size);
@@ -99,10 +125,45 @@ function installLedger() {
   timed(Q, "writeTexture", "wt", (a) => a[1]?.byteLength ?? a[1]?.length ?? 0);
   timed(Q, "copyExternalImageToTexture", "ce");
   timed(Q, "submit", "sub");
+  // Per-submit GPU completion latency, labelled by the GI pass being dispatched
+  // (GISystem publishes `__giCurrentComputeName` around `renderer.compute`).
+  if (Q && typeof Q.submit === "function") {
+    const o = Q.submit;
+    Q.submit = function (...a) {
+      const r = o.apply(this, a);
+      const c = cur;
+      const name = g.__giCurrentComputeName ?? "render/other";
+      const t0 = performance.now();
+      const idx = (c.subN ?? 0);
+      try {
+        this.onSubmittedWorkDone().then(() => {
+          const ms = performance.now() - t0;
+          // Keep the EARLIEST slow submits of the frame in submission order:
+          // every submit queued behind a multi-second one reports the same
+          // latency, so the first one over the bar is the owner.
+          if (ms > 150) {
+            c.subTop.push([+ms.toFixed(1), name, idx]);
+            c.subTop.sort((x, y) => x[2] - y[2]);
+            if (c.subTop.length > 8) c.subTop.length = 8;
+          }
+        }).catch(() => {});
+      } catch {}
+      return r;
+    };
+  }
+  timed(g.GPUCanvasContext?.prototype, "getCurrentTexture", "gct");
+  // The GPU's own clock: how long after this frame's rAF does everything
+  // submitted so far finish? A multi-second compute chain shows up HERE and
+  // nowhere in the wrapped calls — the main thread then blocks on the swap.
+  g.__gpuDevice = null;
+  if (D && typeof D.createBuffer === "function") {
+    const o = D.createBuffer;
+    D.createBuffer = function (...a) { g.__gpuDevice = this; return o.apply(this, a); };
+  }
 
   if (D && typeof D.createRenderPipelineAsync === "function") {
     const o = D.createRenderPipelineAsync;
-    D.createRenderPipelineAsync = function (...a) { cur.rpaN += 1; return o.apply(this, a); };
+    D.createRenderPipelineAsync = function (...a) { cur.rpaN += 1; cur.rpL.push("A:" + (a[0]?.label ?? "?")); return o.apply(this, a); };
   }
   // GISystem already redirects three's SYNC createComputePipeline to this one,
   // so the sync half of THIS call is what a kernel can still cost the frame:
@@ -142,6 +203,14 @@ function installLedger() {
   const tick = () => {
     const now = performance.now();
     if (g.__frames.length < 40000) {
+      {
+        const dev = g.__gpuDevice;
+        const c = cur;
+        if (dev?.queue?.onSubmittedWorkDone) {
+          const t0 = performance.now();
+          dev.queue.onSubmittedWorkDone().then(() => { c.gpuDoneMs = +(performance.now() - t0).toFixed(1); }).catch(() => {});
+        }
+      }
       g.__frames.push([Math.round(now), +(now - last).toFixed(1), cur,
         performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : 0]);
     }
@@ -188,6 +257,7 @@ async function boot(n) {
   const browser = await puppeteer.launch({
     executablePath: process.env.CHROME_PATH ?? "C:/Program Files/Google/Chrome/Application/chrome.exe",
     headless: process.env.HEADED ? false : "new",
+    userDataDir: path.join(os.tmpdir(), "gi-boot-frames-profile"),
     args: [
       "--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage",
       "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
@@ -222,6 +292,14 @@ async function boot(n) {
 
   await page.goto(url, { waitUntil: "load", timeout: 60000 });
   await page.waitForSelector(".hub-recent-open-btn", { timeout: 60000 });
+
+  // AUTO profiles the project's remembered scene from the project-open click.
+  // This matters for giant scenes: opening the project and then explicitly
+  // opening Bistro again overlaps two 1500-mesh loads and can crash the page.
+  if (!process.env.NO_PROFILE) await cdp.send("Profiler.start");
+  const alignNow = await page.evaluate(() => performance.now());
+  if (AUTO) await page.evaluate(() => { globalThis.__bootT0 = performance.now(); });
+  let tOpenNode = AUTO ? Date.now() : 0;
   await page.evaluate((project) => {
     const rows = [...document.querySelectorAll(".hub-recent")];
     const row = rows.find((r) => (r.getAttribute("title") ?? "").replaceAll("\\", "/") === project) ?? rows[0];
@@ -234,33 +312,41 @@ async function boot(n) {
     catch (err) { return { ok: false, error: err?.message ?? String(err) }; }
   }, { op, args }).catch((err) => ({ ok: false, error: err?.message ?? String(err) }));
 
-  // Start the profiler and stamp the page clock in the same breath, so profile
-  // microseconds and performance.now() milliseconds can be put on one axis.
-  if (!process.env.NO_PROFILE) await cdp.send("Profiler.start");
-  const alignNow = await page.evaluate(() => performance.now());
-
   // __bootT0 is stamped INSIDE the page, immediately before the open call: the
   // frames ledger and every `@ms` below are page-clock, and a node-side stamp
   // would carry the CDP crossing.
-  const open = await page.evaluate(async (project, scene) => {
-    globalThis.__bootT0 = performance.now();
-    try { return { ok: true, value: await globalThis.__editorApi.call("scene.open", { path: `${project}/scenes/${scene}.scene` }) }; }
-    catch (err) { return { ok: false, error: err?.message ?? String(err) }; }
-  }, PROJECT, SCENE);
+  let open = { ok: true };
+  if (!AUTO) {
+    tOpenNode = Date.now();
+    open = await page.evaluate(async (project, scene) => {
+      globalThis.__bootT0 = performance.now();
+      try { return { ok: true, value: await globalThis.__editorApi.call("scene.open", { path: `${project}/scenes/${scene}.scene` }) }; }
+      catch (err) { return { ok: false, error: err?.message ?? String(err) }; }
+    }, PROJECT, SCENE);
+  }
   if (!open?.ok) console.log(`    scene.open failed: ${open?.error}`);
 
   // "Scene is lit" is read from the `lines` buffer the console listener has
   // filled since before the open call — no second listener, no race with a
   // marker that can print the moment scene.open resolves.
+  // TWO markers (2026-09-02). `first diffuse gather dispatched` is the scene
+  // being LIT — the SRC gather ran unskipped. `field first pass dispatched`
+  // is the FULL consumer set landing, and the last of it is the exact-
+  // reflection kernels' driver compile (17–25 s on the Level); every boot
+  // number before this date used the full marker and so measured that
+  // compile, not the light. The wall clock stops at the full marker so both
+  // are read from one boot.
+  const litDiffuse = () => lines.some((t) => /first diffuse gather dispatched/.test(t));
   const lit = () => lines.some((t) => /field first pass dispatched|field ready:/.test(t));
 
   // Node-clock wall time from open to the lit marker. ±1 poll interval coarse
   // and skewed by CDP delivery, but the SAME bias applies before and after a
   // change, so deltas are honest.
-  const tOpenNode = Date.now();
   const deadline = Date.now() + WAIT_MS;
   let done = false;
+  let litDiffuseWallMs = null;
   while (Date.now() < deadline) {
+    if (litDiffuseWallMs == null && litDiffuse()) litDiffuseWallMs = Date.now() - tOpenNode;
     done = lit();
     if (done) break;
     await wait(250);
@@ -282,8 +368,34 @@ async function boot(n) {
     longtasks: globalThis.__longtasks ?? [],
     bootT0: globalThis.__bootT0 ?? 0,
   }));
+  // The material wave's driver bill is the SIZE of the programs it asked for,
+  // so census three's program cache before the page goes away.
+  let programs = null;
+  try {
+    programs = await page.evaluate(async () => {
+      const api = globalThis.__editorApi;
+      let eng = globalThis.__eng;
+      if (!eng && api?.entities?.live) {
+        try {
+          const scene = await api.call("scene.get");
+          eng = api.entities.live(scene.rootIds?.[0])?.engine;
+        } catch {}
+      }
+      const pl = eng?.renderer?._pipelines;
+      if (!pl) return null;
+      const frag = [...pl.programs.fragment.keys()].map((c) => c.length).sort((a, b) => b - a);
+      const vert = [...pl.programs.vertex.keys()].map((c) => c.length);
+      const total = frag.reduce((a, b) => a + b, 0);
+      return {
+        fragCount: frag.length, fragTotalKB: Math.round(total / 1024),
+        fragTop: frag.slice(0, 8).map((n) => Math.round(n / 1024)),
+        vertCount: vert.length, vertKB: Math.round(vert.reduce((a, b) => a + b, 0) / 1024),
+        pipelines: pl.caches.size,
+      };
+    });
+  } catch {}
   await browser.close();
-  return { ...out, profile, alignUs, lines, lit: done, litWallMs, boot: n };
+  return { ...out, profile, alignUs, lines, lit: done, litWallMs, litDiffuseWallMs, boot: n, programs };
 }
 
 const summary = [];
@@ -302,7 +414,7 @@ for (let i = 1; i <= BOOTS; i++) {
   const total = r.frames.filter(([t]) => t >= t0).length;
   const spent = slowFrames.reduce((a, [, dt]) => a + dt, 0);
   const firstLitAt = r.lit ? "marker seen" : "TIMEOUT";
-  console.log(`\n  lit marker: ${firstLitAt} at ~${r.litWallMs ?? "?"} ms after scene.open · scene open at page t+${Math.round(t0)} · ${total} frames logged after open`);
+  console.log(`\n  DIFFUSE LIT (gather ran) at ~${r.litDiffuseWallMs ?? "?"} ms after scene.open · full marker (every consumer kernel landed): ${firstLitAt} at ~${r.litWallMs ?? "?"} ms after scene.open · scene open at page t+${Math.round(t0)} · ${total} frames logged after open`);
   console.log(`  frames > ${SLOW_MS} ms after open: ${slowFrames.length}  (${Math.round(spent)} ms of stall)`);
 
   const top = [...slowFrames].sort((a, b) => b[1] - a[1]).slice(0, Number(process.env.TOPN ?? 6));
@@ -322,17 +434,40 @@ for (let i = 1; i <= BOOTS; i++) {
     const acc = c.cpMs + c.cpaMs + c.rpMs + c.smMs + alloc + upMs + c.subMs + c.bgMs;
     const hot = r.profile ? hottestIn(r.profile, r.alignUs, tAbs - dt, tAbs) : null;
     const lt = r.longtasks.find(([s, d]) => s >= tAbs - dt - 5 && s <= tAbs + 5 && d > dt * 0.5);
-    console.log(`          webgpu accounts for ${fmt(acc)} of ${fmt(dt)} ms (${fmt(100 * acc / dt)}%)` +
+    console.log(`          webgpu accounts for ${fmt(acc)} of ${fmt(dt)} ms (${fmt(100 * acc / dt)}%) · getCurrentTexture ${c.gctN ?? 0}×${fmt(c.gctMs ?? 0)} ms · GPU done ${c.gpuDoneMs >= 0 ? fmt(c.gpuDoneMs) + ' ms after rAF' : 'n/a'}` +
       (lt ? ` · longtask ${lt[1]} ms ${lt[2]}` : ""));
     if (hot) for (const h of hot) console.log(`            ${fmt(h.ms, 1).padStart(7)} ms  ${h.label}  ${h.url}`);
+    if (Array.isArray(c.subTop) && c.subTop.length) {
+      console.log(`            first slow submits, in submission order (GPU completion after submit): ${c.subTop.map(([ms, n, i]) => `#${i} ${n || "(unnamed gi)"} ${ms} ms`).join(" · ")}`);
+    }
+    // `onSubmittedWorkDone` covers everything queued BEFORE the submit too, so
+    // the owner of a stall is usually the last heavy submit of the PREVIOUS
+    // frame (whose own rAF gap stayed short: the stall lands on the next one).
+    if (idx > 0) {
+      const pc = r.frames[idx - 1][2];
+      if (Array.isArray(pc?.subTop) && pc.subTop.length) {
+        console.log(`            previous frame's slow submits: ${pc.subTop.map(([ms, n, i]) => `#${i} ${n || "(unnamed gi)"} ${ms} ms`).join(" · ")} (of ${pc.subN} submits)`);
+      }
+    }
+    if (process.env.RP_LABELS === "1" && Array.isArray(c.rpL) && c.rpL.length) {
+      const tally = new Map();
+      for (const l of c.rpL) tally.set(l, (tally.get(l) ?? 0) + 1);
+      const rows = [...tally.entries()].sort((a, b) => b[1] - a[1]).slice(0, 40);
+      console.log(`            render pipelines created in this frame (${c.rpL.length}; S=sync A=async):`);
+      for (const [l, n] of rows) console.log(`              ${String(n).padStart(3)}× ${l}`);
+    }
   }
 
   // Roll the whole boot up, so a cost paid in 200 small frames is not invisible.
   const sum = r.frames.reduce((a, [, , c]) => {
-    for (const k of Object.keys(c)) a[k] = (a[k] ?? 0) + c[k];
+    for (const k of Object.keys(c)) { if (k === "rpL" || k === "gpuDoneMs" || k === "subTop") continue; a[k] = (a[k] ?? 0) + c[k]; }
     return a;
   }, {});
   console.log(`\n  WHOLE BOOT (page open → now, not just the lit window)`);
+  if (r.programs) {
+    const p = r.programs;
+    console.log(`    fragment programs      ${String(p.fragCount).padStart(5)}  ${String(p.fragTotalKB).padStart(7)} kB WGSL (largest ${p.fragTop.join("/")} kB) · vertex ${p.vertCount} / ${p.vertKB} kB · render pipelines cached ${p.pipelines}`);
+  }
   console.log(`    createComputePipeline   ${String(sum.cpN).padStart(5)} calls  ${fmt(sum.cpMs).padStart(7)} ms  ← three has NO async variant`);
   console.log(`    createComputePipelineAsync ${String(sum.cpaN).padStart(2)} calls  ${fmt(sum.cpaMs).padStart(7)} ms SYNC (Tint parse), ${sum.cpaDoneN} resolved`);
   console.log(`    createRenderPipeline    ${String(sum.rpN).padStart(5)} calls  ${fmt(sum.rpMs).padStart(7)} ms  (+${sum.rpaN} async)`);
@@ -351,7 +486,7 @@ for (let i = 1; i <= BOOTS; i++) {
     for (const h of hot) console.log(`    ${fmt(h.ms).padStart(7)} ms  ${h.label}  ${h.url}`);
   }
   for (const l of r.lines.slice(0, Number(process.env.MAX_LINES ?? 30))) console.log(`    · ${l.slice(0, 150)}`);
-  summary.push({ boot: i, lit: r.lit, litWall: r.litWallMs, slow: slowFrames.length, worst: top[0]?.[1], stall: spent });
+  summary.push({ boot: i, lit: r.lit, litWall: r.litWallMs, litDiffuse: r.litDiffuseWallMs, slow: slowFrames.length, worst: top[0]?.[1], stall: spent });
 }
 
 console.log(`\n${"═".repeat(96)}`);

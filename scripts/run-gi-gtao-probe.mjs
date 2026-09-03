@@ -19,17 +19,21 @@
 //             same material and orientation, by ≥ 8% of the open value. This
 //             is the whole point of a sub-lattice AO term; the cascade's own
 //             BIN_T visibility cannot resolve it at 0.70 m spacing.
-//   RANGE     the distribution is neither crushed (p95 < 0.9 ⇒ everything is
+//   RANGE     rawTarget.x (GTAO alone) is neither crushed (p95 < 0.9 ⇒ everything is
 //             occluded, i.e. a sign error in the arc integral) nor inert
 //             (p05 > 0.95 ⇒ nothing is).
+//             The final composite is intentionally excluded: every point in
+//             this closed 6m room lies within the world cone's 2.88m reach.
+//             Exact-open world response is gated by test:gi-ao-phase instead.
 //   FINITE    no NaN/Inf texels. A NaN here multiplies into every indirect
 //             pixel of the frame.
 //   COST      the `gtao` pass group's GPU ms, reported.
 //
 //   node scripts/run-gi-gtao-probe.mjs         (vite on :5201)
 //   QUALITY=ultra SETTLE=20000 ARM=raytraced   (A/B against the RTAO arm)
+//   WORLD=1                                    (opt-in occupancy diagnostic)
 import path from "node:path";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import puppeteer from "puppeteer-core";
 import { installTauriShim } from "./lib/tauriShim.mjs";
 import { makeAoGlossyProject, POSE, SUBJECTS } from "./lib/makeAoGlossyProject.mjs";
@@ -40,6 +44,8 @@ const SETTLE = Number(process.env.SETTLE ?? 18000);
 const VIEW = (process.env.VIEW ?? "1200x800").split("x").map(Number);
 // "gtao" (default) | "raytraced" | "legacy" — the three arms #armAoTerm can take.
 const ARM = process.env.ARM ?? "gtao";
+const WORLD = process.env.WORLD ?? "0";
+const HOT_REARM = process.env.HOT_REARM === "1";
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const root = path.resolve("scripts/.gi-gtao").replaceAll("\\", "/");
@@ -50,6 +56,7 @@ console.log(`rig: 6x3x6 room, ceiling panel only light, contact box + metal sphe
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
   headless: process.env.HEADED ? false : "new",
+  userDataDir: `${root}/chrome-profile`,
   args: [
     "--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage",
     "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
@@ -71,15 +78,19 @@ page.on("pageerror", (e) => {
   const msg = e.message ?? String(e);
   if (!/save_scene/.test(msg)) { errors++; console.log(`  pageerror: ${msg.slice(0, 300)}`); }
 });
-await page.evaluateOnNewDocument((project, arm) => {
+await page.evaluateOnNewDocument((project, arm, world, profileFull, intervals, filterRadius) => {
   localStorage.setItem("engine.projectRoot.v1", project);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
   globalThis.__editorKeepRendering = true;
   globalThis.__giConfigOverride = { exactReflections: false };
   if (arm === "raytraced") globalThis.__giAoRaytraced = true;
   if (arm === "legacy") globalThis.__giAoLegacy = true;
+  if (world === "1") globalThis.__giWorldAo = true;
+  if (profileFull) globalThis.__GI_PROFILE_FULL = true;
+  if (Number.isFinite(intervals)) globalThis.__giGtaoIntervals = intervals;
+  if (Number.isFinite(filterRadius)) globalThis.__giAoFilterRadius = filterRadius;
   if (globalThis.__GTAO_DEBUG) globalThis.__giGtaoDebug = true;
-}, root, ARM);
+}, root, ARM, WORLD, process.env.PROFILE_FULL === "1", Number(process.env.GTAO_INTERVALS), Number(process.env.AO_FILTER_RADIUS));
 if (process.env.THIN !== undefined) {
   await page.evaluateOnNewDocument((t) => { globalThis.__giGtaoThin = t; }, Number(process.env.THIN));
 }
@@ -100,6 +111,69 @@ if (!built) { console.log("FAIL — never built"); await browser.close(); proces
 await page.waitForFunction(() => !!globalThis.__editorApi, { timeout: 60000 });
 await page.evaluate(async (pose) => globalThis.__editorApi.call("viewport.setCamera", pose), POSE);
 await wait(SETTLE);
+
+let hotRearm = null;
+if (HOT_REARM) {
+  hotRearm = await page.evaluate(async () => {
+    const { ensureEngine } = await import("/src/editor/engineInstance.js");
+    const engine = await ensureEngine();
+    const sys = engine.modules?.get?.("gi")?.system ?? null;
+    const before = {
+      sys,
+      state: sys?.state,
+      field: sys?.state?.volume?.occupancyField,
+      bvh: sys?.state?.bvhScene,
+      light: sys?.state?.light,
+      screen: sys?.state?.screen,
+      srcProbes: sys?.state?.screen?.srcProbes,
+      aoPass: sys?.state?.screen?.vxaoPass,
+      runs: sys?.rebuilds ?? 0,
+      asks: sys?.rebuildAsks ?? 0,
+      size: [sys?.state?.screen?.vxaoPass?.width, sys?.state?.screen?.vxaoPass?.height],
+    };
+    if (!before.state || !before.aoPass) return { error: "GI/AO state missing before hot rearm" };
+
+    const entities = await globalThis.__editorApi.call("entity.list", {});
+    const gi = entities.find((entity) =>
+      (entity.components ?? []).some((component) => component.type === "global-illumination"));
+    if (!gi) return { error: "global-illumination entity missing" };
+
+    const t0 = performance.now();
+    await globalThis.__editorApi.call("component.setProp", {
+      id: gi.id,
+      type: "global-illumination",
+      key: "ao",
+      value: 0.25,
+    });
+    const setPropMs = performance.now() - t0;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const after = sys.state;
+    return {
+      setPropMs,
+      sameSystem: sys === before.sys,
+      sameState: after === before.state,
+      sameField: after?.volume?.occupancyField === before.field,
+      sameBvh: after?.bvhScene === before.bvh,
+      sameLight: after?.light === before.light,
+      sameScreen: after?.screen === before.screen,
+      sameSrcProbes: after?.screen?.srcProbes === before.srcProbes,
+      changedAoPass: after?.screen?.vxaoPass !== before.aoPass,
+      runsDelta: (sys.rebuilds ?? 0) - before.runs,
+      asksDelta: (sys.rebuildAsks ?? 0) - before.asks,
+      beforeSize: before.size,
+      afterSize: [after?.screen?.vxaoPass?.width, after?.screen?.vxaoPass?.height],
+    };
+  });
+  const hotOk = !hotRearm?.error
+    && hotRearm.sameSystem && hotRearm.sameState && hotRearm.sameField
+    && hotRearm.sameBvh && hotRearm.sameLight && hotRearm.sameScreen
+    && hotRearm.sameSrcProbes && hotRearm.changedAoPass
+    && hotRearm.runsDelta === 0 && hotRearm.asksDelta === 0
+    && hotRearm.setPropMs < 1500;
+  console.log(`HOT REARM: ${JSON.stringify(hotRearm)}  ${hotOk ? "PASS" : "FAIL"}`);
+  if (!hotOk) errors++;
+}
 
 const out = await page.evaluate(async ({ subjects }) => {
   const { ensureEngine } = await import("/src/editor/engineInstance.js");
@@ -136,7 +210,10 @@ const out = await page.evaluate(async ({ subjects }) => {
   };
 
   const vw = pass.width, vh = pass.height;
-  const rawAo = unpad(await renderer.backend.copyTextureToBuffer(pass.target, 0, 0, vw, vh, 0), vw, vh, 4, Uint16Array);
+  const finalAo = unpad(await renderer.backend.copyTextureToBuffer(pass.target, 0, 0, vw, vh, 0), vw, vh, 4, Uint16Array);
+  const rawGtao = pass.rawTarget && pass.rawTarget !== pass.target
+    ? unpad(await renderer.backend.copyTextureToBuffer(pass.rawTarget, 0, 0, vw, vh, 0), vw, vh, 4, Uint16Array)
+    : finalAo;
   const posTex = screen.gbuffer.position;
   const gw = posTex.image?.width ?? screen.width;
   const gh = posTex.image?.height ?? screen.height;
@@ -144,6 +221,7 @@ const out = await page.evaluate(async ({ subjects }) => {
   const sx = gw / vw, sy = gh / vh;
 
   const values = [];
+  const gtaoValues = [];
   let nonFinite = 0;
   const nearest = Object.fromEntries(Object.keys(subjects).map((k) => [k, { d: Infinity, v: null, dbg: null }]));
   for (let py = 0; py < vh; py++) {
@@ -152,28 +230,34 @@ const out = await page.evaluate(async ({ subjects }) => {
       const gy = Math.min(gh - 1, Math.floor((py + 0.5) * sy));
       const gi2 = (gy * gw + gx) * 4;
       if (pos[gi2 + 3] < 0.5) continue;               // sky: never written
-      const v = f16(rawAo[(py * vw + px) * 4]);
+      const o = (py * vw + px) * 4;
+      const v = f16(finalAo[o]);
       if (!Number.isFinite(v)) { nonFinite++; continue; }
       values.push(v);
+      const gv = f16(rawGtao[o]);
+      if (Number.isFinite(gv)) gtaoValues.push(gv);
       for (const [k, p] of Object.entries(subjects)) {
         const d = (pos[gi2] - p[0]) ** 2 + (pos[gi2 + 1] - p[1]) ** 2 + (pos[gi2 + 2] - p[2]) ** 2;
         if (d < nearest[k].d) {
-          const o = (py * vw + px) * 4;
-          nearest[k] = { d, v, dbg: [f16(rawAo[o + 1]), f16(rawAo[o + 2]), f16(rawAo[o + 3])] };
+          nearest[k] = { d, v, dbg: [f16(finalAo[o + 1]), f16(finalAo[o + 2]), f16(finalAo[o + 3])] };
         }
       }
     }
   }
-  values.sort((a, b) => a - b);
-  const q = (f) => (values.length ? values[Math.min(values.length - 1, Math.floor(f * values.length))] : NaN);
-  const stats = {
-    count: values.length,
-    mean: values.reduce((a, b) => a + b, 0) / Math.max(1, values.length),
-    min: values[0], p05: q(0.05), p50: q(0.5), p95: q(0.95), max: values[values.length - 1],
-    nonFinite,
+  const summarize = (xs, extra = {}) => {
+    xs.sort((a, b) => a - b);
+    const q = (f) => (xs.length ? xs[Math.min(xs.length - 1, Math.floor(f * xs.length))] : NaN);
+    return {
+      count: xs.length,
+      mean: xs.reduce((a, b) => a + b, 0) / Math.max(1, xs.length),
+      min: xs[0], p05: q(0.05), p50: q(0.5), p95: q(0.95), max: xs[xs.length - 1],
+      ...extra,
+    };
   };
+  const stats = summarize(values, { nonFinite });
+  const gtaoStats = summarize(gtaoValues);
   const points = Object.fromEntries(Object.entries(nearest).map(([k, n]) => [k, { ao: n.v, dist: Math.sqrt(n.d), dbg: n.dbg }]));
-  return { stats, points, size: [vw, vh], gsize: [gw, gh] };
+  return { stats, gtaoStats, points, size: [vw, vh], gsize: [gw, gh] };
 }, { subjects: SUBJECTS });
 
 if (out.error) { console.log(`FAIL — ${out.error}`); await browser.close(); process.exit(1); }
@@ -192,12 +276,13 @@ try {
       }
     };
     walk(r, "");
-    return hits;
+    return globalThis.__GI_PROFILE_FULL ? { hits, full: r } : hits;
   });
 } catch { /* profiling is optional here */ }
 
 const f = (n) => (Number.isFinite(n) ? n.toFixed(3) : String(n));
 const s = out.stats;
+const gs = out.gtaoStats;
 console.log(`\nAO buffer ${out.size.join("x")} over gbuffer ${out.gsize.join("x")} — ${s.count} surface texels`);
 console.log(`  mean ${f(s.mean)}  min ${f(s.min)}  p05 ${f(s.p05)}  p50 ${f(s.p50)}  p95 ${f(s.p95)}  max ${f(s.max)}`);
 for (const [k, v] of Object.entries(out.points)) {
@@ -211,12 +296,27 @@ const contact = out.points.contact?.ao;
 const open = out.points.open?.ao;
 const drop = Number.isFinite(contact) && Number.isFinite(open) && open > 0 ? 1 - contact / open : NaN;
 const okContact = Number.isFinite(drop) && drop >= 0.08;
-const okRange = s.p95 >= 0.9 && s.p05 <= 0.95;
+const okRange = gs.p95 >= 0.9 && gs.p05 <= 0.95;
 const okFinite = s.nonFinite === 0 && errors === 0;
 console.log(`\nCONTACT: ${f(contact)} vs open ${f(open)} — ${(drop * 100).toFixed(1)}% darker  ${okContact ? "PASS" : "FAIL"}`);
-console.log(`RANGE:   p05 ${f(s.p05)} p95 ${f(s.p95)}  ${okRange ? "PASS" : "FAIL"}`);
+console.log(`RANGE:   raw GTAO p05 ${f(gs.p05)} p95 ${f(gs.p95)}  ${okRange ? "PASS" : "FAIL"}`);
 console.log(`FINITE:  ${s.nonFinite} non-finite texels, ${errors} page errors  ${okFinite ? "PASS" : "FAIL"}`);
-if (cost && Object.keys(cost).length) console.log(`COST:    ${JSON.stringify(cost)}`);
+if (cost && Object.keys(cost).length) {
+  const hits = cost.hits ?? cost;
+  console.log(`COST:    ${JSON.stringify(hits)}`);
+  if (cost.full) console.log(`PROFILE: ${JSON.stringify(cost.full)}`);
+}
+
+if (process.env.CAPTURE === "1") {
+  await page.evaluate(() => { globalThis.__giDebugView = "ao"; });
+  await wait(1000);
+  const shot = await page.evaluate(async () => (
+    globalThis.__editorApi.call("viewport.screenshot", { width: 960, height: 640, includeGizmos: true })
+  ));
+  const name = `${root}/gtao-${QUALITY}-world${WORLD}-r${process.env.GTAO_INTERVALS ?? "default"}.png`;
+  writeFileSync(name, Buffer.from(shot.__image.base64, "base64"));
+  console.log(`CAPTURE: ${name}`);
+}
 
 await browser.close();
 const pass = okContact && okRange && okFinite;

@@ -59,6 +59,13 @@
         globalThis.__giRayHitProfiling = true;
         globalThis.__giRayHitMode = rayHitMode;
         globalThis.__giRayHitSkipDistance = coarseSkip;
+        // World occupancy AO ships on. `?worldao=0` is its clean cross-boot A/B
+        // opt-out; `?worldao=1` remains accepted explicitly for old commands.
+        // The cone reads the existing occupancy allocation in the small GTAO
+        // pass and must still fit the portable eight-storage-buffer cap.
+        const worldAoArm = new URLSearchParams(location.search).get("worldao");
+        if (worldAoArm === "0") globalThis.__giWorldAo = false;
+        else if (worldAoArm === "1") globalThis.__giWorldAo = true;
         // Compiles the shadow filter's temporal-validity counter (see the
         // lightshadow arm's reprojection gate below). Build-time flag; the
         // second global opts the runtime INTO temporal accumulation (still
@@ -110,11 +117,24 @@
         // walks them, and anything over the line fails pipeline creation, which
         // surfaces as a validation error rather than as a wrong picture.
         const srcArm = new URLSearchParams(location.search).get("src") === "1";
+        // `?irrfallback=1` runs a synthetic five-pixel temporal resolve before
+        // the scene arm: an UNKNOWN pixel beside a known coplanar/same-normal
+        // receiver must borrow it, while an equally close perpendicular face
+        // must remain unknown. This is the detail-slide checkerboard fallback
+        // in isolation, without waiting for a real probe frontier to align.
+        const irrFallbackArm = new URLSearchParams(location.search).get("irrfallback") === "1";
         // Set BOTH ways: SRC is on by default since Phase 5, so the non-src
         // arms must PIN it off or they stop meaning "the legacy screen chain
         // in isolation" — which is the state all their assertions were
         // written against.
         globalThis.__giSrcProbes = srcArm;
+        // `?coldpriority=1` forces the cold-frontier allocator into this tiny
+        // viewport and lowers its live ceiling, so the portable binding audit
+        // compiles the production-only large-screen branch too.
+        if (new URLSearchParams(location.search).get("coldpriority") === "1") {
+          globalThis.__giSrcColdPriorityForce = true;
+          globalThis.__giSrcTransportRays = 1024;
+        }
         // `?raysteps=N` — the scaffold ray pass's per-ray step budget. An A/B
         // rather than a constant because SRC's rays are LONGER than the interval
         // rays every existing budget was tuned against (srcTrace.js's header
@@ -173,6 +193,85 @@
           throw new Error(`smoke device was not created at portable storage-buffer limit 8 (got ${device.limits.maxStorageBuffersPerShaderStage})`);
         }
 
+        if (irrFallbackArm) {
+          const TSL = await import("three/tsl");
+          const { createGiIrradianceTemporalPass, GI_IRR_SPATIAL_FALLBACK_CONFIDENCE } =
+            await import("/src/modules/gi/giScreen.js");
+          const W = 5;
+          const makeStorage = (name) => {
+            const t = new THREE.StorageTexture(W, 1);
+            t.type = THREE.FloatType;
+            t.format = THREE.RGBAFormat;
+            t.name = name;
+            return t;
+          };
+          const position = makeStorage("irrFallbackPosition");
+          const normal = makeStorage("irrFallbackNormal");
+          const source = makeStorage("irrFallbackSource");
+          const histIrr = makeStorage("irrFallbackHistIrr");
+          const histPos = makeStorage("irrFallbackHistPos");
+          const target = makeStorage("irrFallbackTarget");
+          const posData = TSL.instancedArray(new Float32Array([
+            0.00, 0, 0, 1,  0.01, 0, 0, 1,  0, 0, 0, 0,
+            1.00, 0, 0, 1,  1.01, 0, 0, 1,
+          ]), "vec4");
+          const normalData = TSL.instancedArray(new Float32Array([
+            0, 1, 0, 0,  0, 1, 0, 0,  0, 0, 0, 0,
+            0, 1, 0, 0,  1, 0, 0, 0,
+          ]), "vec4");
+          const sourceData = TSL.instancedArray(new Float32Array([
+            0.8, 0.4, 0.2, 1,  0, 0, 0, 0,  0, 0, 0, 0,
+            0, 0, 0, 0,  0.2, 0.8, 0.4, 1,
+          ]), "vec4");
+          const fillCurrent = TSL.Fn(() => {
+            const i = TSL.instanceIndex.toVar();
+            const c = TSL.ivec2(i.toInt(), 0);
+            TSL.textureStore(position, c, posData.element(i));
+            TSL.textureStore(normal, c, normalData.element(i));
+            TSL.textureStore(source, c, sourceData.element(i));
+          })().compute(W);
+          const fillHistory = TSL.Fn(() => {
+            const i = TSL.instanceIndex.toVar();
+            const c = TSL.ivec2(i.toInt(), 0);
+            TSL.textureStore(histIrr, c, TSL.vec4(0));
+            TSL.textureStore(histPos, c, TSL.vec4(0));
+          })().compute(W);
+          const temporal = createGiIrradianceTemporalPass({
+            gbuffer: { position, normal }, source, target, histIrr, histPos,
+            width: W, height: 1,
+            history: {
+              prevViewProj: TSL.uniform(new THREE.Matrix4()),
+              weight: TSL.uniform(0.9),
+              validEps: 0.1,
+            },
+            validityAlpha: true,
+          });
+          const dump = TSL.instancedArray(new Float32Array(W * 4), "float");
+          const targetNode = TSL.texture(target);
+          const read = TSL.Fn(() => {
+            const i = TSL.instanceIndex.toVar();
+            const v = targetNode.load(TSL.ivec2(i.toInt(), 0)).toVar();
+            const o = i.mul(4).toVar();
+            dump.element(o).assign(v.x);
+            dump.element(o.add(TSL.uint(1))).assign(v.y);
+            dump.element(o.add(TSL.uint(2))).assign(v.z);
+            dump.element(o.add(TSL.uint(3))).assign(v.w);
+          })().compute(W);
+          await engine.renderer.computeAsync(fillCurrent);
+          await engine.renderer.computeAsync(fillHistory);
+          await engine.renderer.computeAsync(temporal.compute);
+          await engine.renderer.computeAsync(read);
+          const got = new Float32Array(await engine.renderer.getArrayBufferAsync(dump.value));
+          const near = (a, b, eps = 2e-3) => Math.abs(a - b) <= eps;
+          if (!(near(got[4], 0.8) && near(got[5], 0.4) && near(got[6], 0.2)
+            && near(got[7], GI_IRR_SPATIAL_FALLBACK_CONFIDENCE))) {
+            throw new Error(`irr fallback did not fill the coplanar unknown: [${[...got.slice(4, 8)]}]`);
+          }
+          if (!(near(got[12], 0) && near(got[13], 0) && near(got[14], 0) && near(got[15], 0))) {
+            throw new Error(`irr fallback crossed a perpendicular normal: [${[...got.slice(12, 16)]}]`);
+          }
+        }
+
         await enableEngineModule(engine, "gi");
         const material = new THREE.MeshStandardNodeMaterial({ color: 0x888888, roughness: 0.9 });
         const floor = new THREE.Mesh(new THREE.BoxGeometry(8, 0.2, 8).toNonIndexed(), material);
@@ -224,6 +323,12 @@
             engine.scene.environment = tex;
           }
           engine.scene.environmentIntensity = intensity;
+          // THE BACKGROUND IS SKY NOW (2026-08-30): with no environment
+          // texture, GI's sky falls back to the scene's flat background
+          // colour — and the engine default #202329 is not black, so the
+          // sky=0 arms would light up through it. "sky=0" here means NO sky
+          // at all, so pin the colour to black on this arm.
+          if (intensity === 0) engine.scene.background?.isColor && engine.scene.background.setRGB(0, 0, 0);
         };
         // `?sky=N` — zero keeps every pre-existing baseline byte-identical,
         // which is why it is the shipping default.

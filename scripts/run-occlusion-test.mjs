@@ -438,6 +438,149 @@ await check("the test uses the camera the depth was CAPTURED with, not the one t
 
 // ---------------------------------------------------------------------------
 
+section("native WebGPU queries");
+
+const nativeScene = () => {
+  const engine = new Engine();
+  const entity = engine.createEntity({ name: "Native query target" });
+  const mesh = entity.addComponent("mesh", {}).mesh;
+  mesh.geometry = new THREE.BoxGeometry(1, 1, 1);
+  entity.object3D.position.set(0, 0, -20);
+  const view = camera();
+  engine.camera = view;
+  engine.scene.updateMatrixWorld(true);
+
+  const context = {};
+  const data = { occluded: undefined };
+  let isOccludedCalls = 0;
+  const renderer = {
+    _currentRenderContext: context,
+    backend: {
+      isWebGPUBackend: true,
+      get(value) {
+        assert.equal(value, context);
+        return data;
+      },
+    },
+    isOccluded(object) {
+      isOccludedCalls++;
+      return data.occluded?.has(object) === true;
+    },
+  };
+  engine.renderer = renderer;
+  engine.rendererReady = true;
+  engine.occlusion.setEnabled(true);
+  return { engine, entity, mesh, view, renderer, data, isOccludedCalls: () => isOccludedCalls };
+};
+
+const armNative = ({ engine }) => {
+  engine.occlusion.apply(); // records the initial view and deliberately fails open
+  engine.occlusion.render();
+  engine.occlusion.apply(); // one complete stable update
+  engine.occlusion.render();
+  engine.occlusion.prepareMainRender();
+};
+
+const nativeWave = (state, occluded) => {
+  const sentinel = state.engine.occlusion._nativeSentinel;
+  state.data.occluded = new WeakSet([sentinel, ...occluded]);
+  sentinel.onBeforeRender(state.renderer);
+  state.engine.occlusion.finishMainRender();
+  state.engine.occlusion.apply();
+};
+
+const nativeOccludedTwice = (state, occluded) => {
+  nativeWave(state, occluded);
+  state.engine.occlusion.prepareMainRender();
+  nativeWave(state, occluded);
+};
+
+await check("native queries arm only at the final main-render boundary", () => {
+  const state = nativeScene();
+  state.engine.occlusion.apply();
+  state.engine.occlusion.render();
+  state.engine.occlusion.apply();
+  state.engine.occlusion.render();
+  assert.notEqual(state.mesh.occlusionTest, true, "pre-render phase armed the mesh");
+  assert.equal(state.engine.occlusion._nativeSentinel, null, "pre-render phase added the sentinel");
+  state.engine.occlusion.prepareMainRender();
+  assert.equal(state.mesh.occlusionTest, true, "main-render boundary did not arm the mesh");
+  state.engine.occlusion.finishMainRender();
+  assert.notEqual(state.mesh.occlusionTest, true, "query flag leaked into post-render work");
+  assert.equal(state.engine.occlusion._nativeQueryGroup.parent, null, "sentinel leaked into post-render work");
+});
+
+await check("WebGPU arms Three's native query on the MAIN draw and does no Hi-Z pass", () => {
+  const state = nativeScene();
+  // These are the methods the legacy branch would call. Reaching either is a
+  // regression to the extra 176-draw pass visible in the performance overlay.
+  state.renderer.getRenderTarget = () => assert.fail("native path rendered a depth target");
+  state.renderer.readRenderTargetPixelsAsync = () => assert.fail("native path read pixels");
+  armNative(state);
+  assert.equal(state.mesh.occlusionTest, true, "the real drawable was not queried");
+  assert.equal(state.engine.occlusion._nativeSentinel.occlusionTest, true);
+  assert.equal(
+    state.engine.occlusion._nativeQueryGroup.children.length,
+    1,
+    "detached bounds proxies can self-occlude against the source mesh",
+  );
+});
+
+await check("only a fresh settled native result hides the entity", () => {
+  const state = nativeScene();
+  armNative(state);
+  const sentinel = state.engine.occlusion._nativeSentinel;
+
+  // A stale result cannot contain this generation's unique sentinel.
+  state.data.occluded = new WeakSet([state.mesh]);
+  sentinel.onBeforeRender(state.renderer);
+  state.engine.occlusion.finishMainRender();
+  state.engine.occlusion.apply();
+  assert.notEqual(state.entity._occluded, true, "one stale result hid the mesh");
+
+  state.engine.occlusion.prepareMainRender();
+  nativeWave(state, [state.mesh]);
+  assert.notEqual(state.entity._occluded, true, "one noisy zero-sample result hid the mesh");
+  state.engine.occlusion.prepareMainRender();
+  nativeWave(state, [state.mesh]);
+  assert.equal(state.entity._occluded, true);
+  assert.equal(state.engine.occlusion._nativeQueryGroup, null, "query geometry stayed in the scene");
+});
+
+await check("moving the camera immediately fails open instead of retaining stale hidden geometry", () => {
+  const state = nativeScene();
+  armNative(state);
+  nativeOccludedTwice(state, [state.mesh]);
+  assert.equal(state.entity._occluded, true);
+
+  state.view.position.x = 5;
+  state.view.updateMatrixWorld(true);
+  state.engine.occlusion.apply();
+  assert.equal(state.entity._occluded, false, "old-view query survived a camera move");
+  assert.notEqual(state.mesh.occlusionTest, true, "queries should wait until the camera settles");
+});
+
+await check("a merged member is skipped and its real proxy is what gets hidden", () => {
+  const state = nativeScene();
+  const proxy = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), new THREE.MeshBasicNodeMaterial());
+  proxy.position.set(0, 0, -20);
+  state.engine.scene.add(proxy);
+  state.mesh.userData.mergedInto = proxy;
+  state.mesh.visible = false;
+  state.engine.merging.groups.push({ mesh: proxy, members: [{ mesh: state.mesh }] });
+  state.engine.scene.updateMatrixWorld(true);
+
+  armNative(state);
+  assert.equal(proxy.occlusionTest, true);
+  assert.notEqual(state.mesh.occlusionTest, true, "hidden merge member was queried");
+  nativeOccludedTwice(state, [proxy]);
+  assert.equal(proxy.visible, false);
+  assert.notEqual(state.entity._occluded, true, "fake member cull polluted the count");
+  assert.equal(state.engine.occlusion.stats.culled, 1);
+});
+
+// ---------------------------------------------------------------------------
+
 section("culling is configured on the camera, not the scene");
 
 // The knobs moved onto CameraComponent because culling is a property of a VIEW.

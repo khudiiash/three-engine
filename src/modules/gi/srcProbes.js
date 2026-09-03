@@ -73,13 +73,17 @@ import {
   Return,
   atomicAdd,
   atomicLoad,
+  atomicMin,
   atomicStore,
   atomicSub,
+  bitAnd,
+  bitOr,
   float,
   floor,
   instanceIndex,
   instancedArray,
   int,
+  shiftLeft,
   uint,
   vec3,
   wgslFn,
@@ -115,6 +119,41 @@ import {
  */
 export const SLOT_EMPTY = 0xffffffff;
 
+// Cold-frontier representatives share `rayCursor`, so their word must carry
+// both an atomic selection rank and the pixel the ray pass ultimately needs.
+// GI's resolve is capped at 1.6 M pixels; 22 pixel bits leave room through
+// 2048x2048 while nine rank bits spread even a short contiguous raster run.
+// Bit 31 deliberately stays zero, so no encoded representative can alias the
+// all-ones SLOT_EMPTY sentinel used to initialize atomicMin.
+export const PRIORITY_REP_PIXEL_BITS = 22;
+export const PRIORITY_REP_PIXEL_LIMIT = 1 << PRIORITY_REP_PIXEL_BITS;
+export const PRIORITY_REP_PIXEL_MASK = PRIORITY_REP_PIXEL_LIMIT - 1;
+const PRIORITY_REP_RANK_MASK = 0x1ff;
+
+/**
+ * Rank one visible pixel for a probe's cold-frontier packet.
+ *
+ * The first implementation stored the minimum linear pixel index. That chose
+ * the same topmost/leftmost raster sample on every one of COLD_FILL_FRAMES.
+ * A position-only probe covering a wall edge, foliage, or two sub-cell faces
+ * therefore spent its whole priority window tracing one normal lobe; the other
+ * face remained UNKNOWN until ordinary strided transport happened to visit it
+ * (or the camera approached and enlarged its footprint).
+ *
+ * The upper bits are a frame-varying hash, while the lower bits preserve the
+ * exact pixel index. atomicMin still needs one existing word and no extra
+ * buffer, but now selects a different member of the probe's visible set each
+ * frame. The probe term decorrelates probes sharing the same pixel run.
+ */
+function priorityRepresentativeWord(pixel, probe, frameStamp) {
+  const p = uint(pixel).toVar();
+  const rank = bitAnd(hashKey(
+    p.add(uint(probe).mul(uint(0x85ebca6b)))
+      .add(uint(frameStamp).mul(uint(0x9e3779b9))),
+  ), uint(PRIORITY_REP_RANK_MASK)).toVar();
+  return bitOr(shiftLeft(rank, uint(PRIORITY_REP_PIXEL_BITS)), p);
+}
+
 /**
  * Linear-probe budget per insert.
  *
@@ -143,7 +182,9 @@ export const PROBE_FLAGS = 2;    // bit0 alive, bit1 fresh (see below)
  * rather than a rule about when this one is trustworthy.
  */
 export const PROBE_PARENT = 3;
-export const PROBE_HASH = 4;     // the hash slot holding this key, for [K]
+// Hash slot during population/[K]; after [K], srcRays may reuse c0's word for
+// its cold-frontier representative. No later lookup reads this word.
+export const PROBE_HASH = 4;
 export const PROBE_RAYS = 5;     // Alg. 3 ray count   (Phase 2)
 export const PROBE_RAYOFF = 6;   // Alg. 3 ray offset  (Phase 2)
 /**
@@ -567,7 +608,21 @@ export function createSrcProbeStore({
   // real frame number, so a build that never arms retention decays bit-for-bit
   // as before. Same compatibility argument the influx and surprise regions make.
   const heldBase = surpriseBase + blockTotal;
-  const freeInit = new Uint32Array(heldBase + blockTotal);
+  // ── THE LIVE WORD (2026-09-02, the pool sweeps) ─────────────────────────
+  // One u32 per block: 1 while a probe holds the block, 0 after release.
+  // `BIN_BUDGET` is a tier constant and every pool sweep — decay, resolve,
+  // tile bake, merge [G.3] — dispatched over the WHOLE pool: on the user's
+  // Level 2105 live probes of 65 536 (`profile.giPasses`: decay 1.78 +
+  // resolve 2.56 + tiles 0.93 ms isolated for 2.3 % load), on Bistro 56 % of
+  // bins belonged to blocks nobody had ever claimed. The count==0 early-out
+  // still paid one distinct word per BIN plus the stamp/influx/surprise/held
+  // words; this is one word per BLOCK, shared by the block's 32 threads, read
+  // before anything else. A block released THIS frame still carries the
+  // release stamp, and the readers treat `stamp == frameStamp` as live for
+  // exactly that frame so the decay zeroes it and the resolve writes UNKNOWN
+  // — the §12.21 phantom fix keeps working.
+  const liveBase = heldBase + blockTotal;
+  const freeInit = new Uint32Array(liveBase + blockTotal);
   freeInit.fill(INFLUX_ONE, influxBase, surpriseBase);
   for (const c of cascades) {
     for (let i = 0; i < c.probeCapacity; i++) {
@@ -603,6 +658,8 @@ export function createSrcProbeStore({
     blockSurpriseBase: surpriseBase,
     /** Where the per-block HOLD stamps start inside `freeStack` (S1 retention). */
     blockHeldBase: heldBase,
+    /** Where the per-block LIVE words start inside `freeStack` (1 = held by a probe). */
+    blockLiveBase: liveBase,
     /** Where the c0 hash→block words start inside `hashKeys` (§12.39). */
     hashBlockBase,
     hashKeys,
@@ -624,7 +681,7 @@ export function createSrcProbeStore({
     // riding this buffer's tail (claim stamps, influx words, surprise words,
     // hold stamps).
     bytes: (hashTotal * 2 + cascades[0].hashCapacity + probeTotal * PROBE_WORDS + probeTotal
-      + blockTotal * 5 + cascadeCount * (COUNTER_WORDS + 2)) * 4,
+      + blockTotal * 6 + cascadeCount * (COUNTER_WORDS + 2)) * 4,
     dispose() {
       for (const b of [hashKeys, hashSlot, probeTable, counters, freeStack, freeTop]) {
         b?.value?.dispose?.();
@@ -709,6 +766,7 @@ export function createAgePass(store, cascade, {
   // The same stamp region `createCompactPass` writes on CLAIM — see the release
   // branch below for why a RELEASE has to write it too.
   const blockStamp = store.blockStampBase + c.blockBase;
+  const blockLive = store.blockLiveBase + c.blockBase;
   return Fn(() => {
     const p = instanceIndex.add(uint(c.probeBase)).toVar();
     const w = p.mul(PROBE_WORDS).toVar();
@@ -906,6 +964,7 @@ export function createAgePass(store, cascade, {
         if (frameStamp) {
           freeStack.element(uint(blockStamp).add(block)).assign(frameStamp);
         }
+        freeStack.element(uint(blockLive).add(block)).assign(uint(0));
         probeTable.element(w.add(PROBE_BLOCK)).assign(uint(SLOT_EMPTY));
       });
       // Push. `atomicAdd` returns the OLD top, which is the index to write.
@@ -997,6 +1056,7 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
   const { hashKeys, hashSlot, probeTable, counters, freeStack, freeTop, cascadeCount } = store;
   const blockStack = store.blockStackBase + c.blockBase;
   const blockStamp = store.blockStampBase + c.blockBase;
+  const blockLive = store.blockLiveBase + c.blockBase;
   const blockTopWord = cascadeCount + cascade;
   return Fn(() => {
     const h = instanceIndex.add(uint(c.hashBase)).toVar();
@@ -1035,6 +1095,7 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
           if (frameStamp) {
             freeStack.element(uint(blockStamp).add(rblock)).assign(frameStamp);
           }
+          freeStack.element(uint(blockLive).add(rblock)).assign(uint(1));
           probeTable.element(sw.add(PROBE_BLOCK)).assign(rblock);
         });
       });
@@ -1086,6 +1147,7 @@ export function createCompactPass(store, cascade, { frameStamp = null } = {}) {
       if (frameStamp) {
         freeStack.element(uint(blockStamp).add(block)).assign(frameStamp);
       }
+      freeStack.element(uint(blockLive).add(block)).assign(uint(1));
     });
 
     probeTable.element(w.add(PROBE_KEY)).assign(key);
@@ -1169,6 +1231,42 @@ export function createProbeLookup(store, cascade) {
     const out = uint(SLOT_EMPTY).toVar();
     If(r.x.greaterThanEqual(0), () => {
       out.assign(hashSlot.element(uint(c.hashBase).add(uint(r.x))));
+    });
+    return out;
+  };
+}
+
+/**
+ * §10.7 — key → BIN BLOCK for ANY cascade, at THREE storage buffers and no
+ * dispatch of its own.
+ *
+ * The tail-backed `createSrcHashBlockFrame` below is the one-buffer form and
+ * it is c0-only by construction (the tail is sized for one cascade). The
+ * screen gather's coarse fallback needs c1 and is nowhere near the binding
+ * limit — it carries `hashKeys` and its own stats and nothing else — so it
+ * takes the natural three-fetch walk instead of growing the shared tail: hash
+ * slot → probe index → the probe's block word. Same SLOT_EMPTY collapse, so
+ * consumers test one condition either way.
+ *
+ * ORDER: reads live state, so it must be INLINED in a pass that runs after
+ * its cascade's compaction and resolve. The gather is the last dispatch in
+ * the SRC chain, which satisfies that by position.
+ */
+export function createSrcBlockLookupDirect(store, cascade) {
+  const c = store.cascades[cascade];
+  const { hashKeys, hashSlot, probeTable } = store;
+  return (key) => {
+    const k = uint(key).toVar();
+    const r = hashFindWgsl(
+      k, hashKey(k), uint(c.hashBase), uint(c.hashCapacity),
+      uint(MAX_PROBE_STEPS), hashKeys,
+    ).toVar();
+    const out = uint(SLOT_EMPTY).toVar();
+    If(r.x.greaterThanEqual(0), () => {
+      const p = hashSlot.element(uint(c.hashBase).add(uint(r.x))).toVar();
+      If(p.notEqual(uint(SLOT_EMPTY)), () => {
+        out.assign(probeTable.element(p.mul(uint(PROBE_WORDS)).add(uint(PROBE_BLOCK))));
+      });
     });
     return out;
   };
@@ -1295,6 +1393,7 @@ export function createSrcProbeFrame(store, {
   camera,
   anchor,
   pixelCount,
+  pixelCapacity = pixelCount,
   readPixel,
   maxLods = MAX_LODS,
   maxAge = PROBE_MAX_AGE,
@@ -1303,15 +1402,28 @@ export function createSrcProbeFrame(store, {
   // probe this frame (anchor-relative retention's jump guard — see the
   // retention bundle below).
   retainKill = null,
+  // Optional atomic per-probe scratch used by srcRays' cold-frontier
+  // allocator. Population already visits every visible pixel; retaining one
+  // representative here avoids a second full-screen scan later in the frame.
+  representative = null,
 } = {}) {
+  if (representative && pixelCapacity > PRIORITY_REP_PIXEL_LIMIT) {
+    throw new Error(
+      `SRC cold-priority pixel capacity ${pixelCapacity} exceeds packed representative limit ` +
+      `${PRIORITY_REP_PIXEL_LIMIT}`,
+    );
+  }
+  if (representative && !frameStamp) {
+    throw new Error("SRC cold-priority representatives require frameStamp");
+  }
   const { probeTable } = store;
   const N = store.cascadeCount;
 
   // Where each pixel's key landed in the hash, remembered across the [B]→[C]
   // barrier. `SLOT_EMPTY`, not −1, for a pixel with no key.
-  const pixelHash = instancedArray(new Uint32Array(pixelCount).fill(SLOT_EMPTY), "uint");
+  const pixelHash = instancedArray(new Uint32Array(pixelCapacity).fill(SLOT_EMPTY), "uint");
   /** Per-pixel c0 probe index, or SLOT_EMPTY. The output every later phase reads. */
-  const pixelProbe = instancedArray(new Uint32Array(pixelCount).fill(SLOT_EMPTY), "uint");
+  const pixelProbe = instancedArray(new Uint32Array(pixelCapacity).fill(SLOT_EMPTY), "uint");
 
   /** LOD, spacing and lattice origin for a world point — [B]'s whole geometry. */
   const latticeAt = (position, cascade) => {
@@ -1412,7 +1524,7 @@ export function createSrcProbeFrame(store, {
   for (let c = 0; c < N; c++) passes.push(createAgePass(store, c, { maxAge, retain, frameStamp }));
 
   // ── [B] cascade 0, from the gbuffer ───────────────────────────────────────
-  passes.push(createInsertPass(
+  const pixelInsertPass = createInsertPass(
     store, 0, pixelCount,
     (i) => {
       const px = readPixel(i);
@@ -1428,13 +1540,34 @@ export function createSrcProbeFrame(store, {
       return key;
     },
     (i, slot) => { pixelHash.element(i).assign(uint(slot)); },
-  ));
+  );
+  passes.push(pixelInsertPass);
   passes.push(createCompactPass(store, 0, { frameStamp }));
-  passes.push(createResolvePass(
+  if (representative) {
+    const c0 = store.cascades[0];
+    passes.push(Fn(() => {
+      atomicStore(
+        representative.element(instanceIndex.add(uint(c0.probeBase))),
+        uint(SLOT_EMPTY),
+      );
+    })().compute(c0.probeCapacity));
+  }
+  const pixelResolvePass = createResolvePass(
     store, pixelCount,
     (i) => pixelHash.element(i),
-    (i, probe) => { pixelProbe.element(i).assign(uint(probe)); },
-  ));
+    (i, probe) => {
+      pixelProbe.element(i).assign(uint(probe));
+      if (representative) {
+        If(uint(probe).notEqual(uint(SLOT_EMPTY)), () => {
+          atomicMin(
+            representative.element(uint(probe)),
+            priorityRepresentativeWord(i, probe, frameStamp),
+          );
+        });
+      }
+    },
+  );
+  passes.push(pixelResolvePass);
 
   // ── the ladder ────────────────────────────────────────────────────────────
   for (let c = 1; c < N; c++) {
@@ -1512,6 +1645,16 @@ export function createSrcProbeFrame(store, {
      */
     cpuMirrors: [pixelHash, pixelProbe].map((n) => n?.value).filter(Boolean),
     passes,
+    pixelCapacity,
+    setPixelCount(count) {
+      if (!(count >= 0 && count <= pixelCapacity)) {
+        throw new Error(`SRC pixel count ${count} exceeds capacity ${pixelCapacity}`);
+      }
+      // Three r185 drives ComputeNode.count through a dispatch uniform, so
+      // changing it neither rebuilds WGSL nor creates a new pipeline.
+      pixelInsertPass.count = count;
+      pixelResolvePass.count = count;
+    },
     /** Non-null when S1 locality retention is armed — for the boot line. */
     retain,
     /**

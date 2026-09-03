@@ -237,3 +237,13 @@ export const GI_SHARP_LAYER = 21;
  * still never sees it.
  */
 export const GI_DEPTH_LAYER = 20;
+
+/**
+ * Physics-shape overlays shown by the viewport's Colliders toggle.
+ *
+ * This is separate from EDITOR_LAYER because Play cameras normally reject the
+ * whole editor layer. The editor may opt the active Play camera into this one
+ * bit without also exposing grids, transform gizmos, camera models, and other
+ * authoring helpers. Exported games never enable it.
+ */
+export const PHYSICS_DEBUG_LAYER = 19;

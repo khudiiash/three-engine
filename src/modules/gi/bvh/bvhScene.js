@@ -48,6 +48,7 @@
 import * as THREE from "three/webgpu";
 import { If, Loop, attributeArray, cross, float, fract, mat3, max, min, select, texture, uniform, uniformArray, vec2, vec3, vec4, wgslFn } from "three/tsl";
 import { MeshBVH } from "three-mesh-bvh";
+import { resolveMaterialAlbedo } from "../materialNodeBindings.js";
 
 /**
  * Hard cap on meshes seated into one BVH scene — bounds per-frame loop cost.
@@ -398,7 +399,7 @@ function makeAtlasCanvas(size = ALBEDO_ATLAS_SIZE) {
 function drawAlbedoTile(ctx, material, i, pendingGpuTiles, tilePx = ALBEDO_ATLAS_TILE, grid = ALBEDO_ATLAS_GRID) {
   const tileX = (i % grid) * tilePx;
   const tileY = Math.floor(i / grid) * tilePx;
-  const map = material?.map;
+  const { map, tint } = resolveMaterialAlbedo(material);
   let drew = false;
   if (map) {
     const image = map.image ?? map.source?.data;
@@ -420,7 +421,8 @@ function drawAlbedoTile(ctx, material, i, pendingGpuTiles, tilePx = ALBEDO_ATLAS
     }
   }
   if (!drew) {
-    ctx.fillStyle = material?.color ? `#${material.color.getHexString()}` : "#808080";
+    const channel = (value) => Math.round(Math.min(1, Math.max(0, Number(value) || 0)) * 255);
+    ctx.fillStyle = `rgb(${channel(tint.r)}, ${channel(tint.g)}, ${channel(tint.b)})`;
     ctx.fillRect(tileX, tileY, tilePx, tilePx);
   }
   // GPU-blit candidate: the canvas draw failed for any reason (no
@@ -431,8 +433,11 @@ function drawAlbedoTile(ctx, material, i, pendingGpuTiles, tilePx = ALBEDO_ATLAS
   // if some future/other path lets a compressed map through the canvas
   // silently — the GPU sample is the authoritative one either way, so it
   // still gets queued to overwrite whatever the canvas produced.
-  if (map && (!drew || map.isCompressedTexture)) {
-    pendingGpuTiles.push({ map, tileIndex: i });
+  const tinted = Math.abs((tint.r ?? 1) - 1) > 1e-5
+    || Math.abs((tint.g ?? 1) - 1) > 1e-5
+    || Math.abs((tint.b ?? 1) - 1) > 1e-5;
+  if (map && (!drew || map.isCompressedTexture || tinted)) {
+    pendingGpuTiles.push({ map, tileIndex: i, tint: { r: tint.r, g: tint.g, b: tint.b } });
   }
   return drew;
 }
@@ -522,7 +527,7 @@ export function buildSlotAlbedoAtlas(placements) {
     // average, an emissive promotion). Taking the tile there would REPLACE a
     // better number with a worse one, and it would spend a scarce tile doing
     // it. Only a real texture beats the mean.
-    if (!material?.map) continue;
+    if (!resolveMaterialAlbedo(material).map) continue;
     let tile = tileOfMaterial.get(material);
     if (tile == null) {
       if (tileOfMaterial.size >= SLOT_ATLAS_TILES) { overflow++; continue; }

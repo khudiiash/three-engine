@@ -28,6 +28,11 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# kimodo.cpp text-to-motion loaded in-process: dlopen of the project's built
+# kimodo shared library through its stable C API (src/kimodo_ffi.rs). A
+# runtime load, not a link-time dependency — without the DLL the editor is
+# untouched and motion generation falls back to the kmd-generate CLI.
+libloading = "0.8"
 ureq = { version = "2", features = ["tls"] }
 url = "2"
 # Real pseudo-terminals for the in-editor terminal panel: claude and codex are
@@ -52,6 +57,12 @@ notify = { version = "7", default-features = false, features = ["macos_fsevent"]
 # an ephemeral certificate and terminates TLS itself; localhost stays HTTP.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+
+# std::fs::rename cannot replace an existing file atomically on Windows.
+# Derived caches use ReplaceFileW so a warm reader sees either the complete old
+# artifact or the complete new one, with the old file retained as rollback.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 # `tauri dev` rebuilds on every restart even when nothing changed. Keep the
 # debug profile lean so the per-restart link cost stays small.

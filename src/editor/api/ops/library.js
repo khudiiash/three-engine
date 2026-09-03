@@ -1,8 +1,8 @@
 /**
- * The asset libraries: Poly Haven, ambientCG, Sketchfab, Poly Pizza, Fab and
- * itch.io.
+ * The asset libraries: Poly Haven, ambientCG, Sketchfab, Poly Pizza, KayKit,
+ * Fab and itch.io.
  *
- * Six browser panels with six different APIs, presented here as one
+ * Seven browser panels with seven different APIs, presented here as one
  * search-then-import pair. The panels each speak their provider's own dialect —
  * ambientCG calls a PBR set a "Material" and Poly Haven calls it a "texture",
  * resolutions are `2k` in one and `2K-JPG` in the other — and an agent should
@@ -33,6 +33,9 @@ const PROVIDERS = {
   ambientcg: { module: "ambientcg", label: "ambientCG", types: ["texture", "model", "hdri"], needsKey: false },
   sketchfab: { module: "sketchfab", label: "Sketchfab", types: ["model"], needsKey: true },
   polypizza: { module: "polypizza", label: "Poly Pizza", types: ["model"], needsKey: true },
+  // Like Fab: no credential at all — the source is a public GitHub account,
+  // and both the file-list API and the raw file host serve CORS-open.
+  kaykit: { module: "kaykit", label: "KayKit", types: ["model"], needsKey: false },
   // The only provider here with no credential at all: Fab's read API and its
   // download URLs for free CC-BY assets are both served anonymously.
   fab: { module: "fab", label: "Fab", types: ["model"], needsKey: false },
@@ -183,7 +186,7 @@ defineOp({
       type: "string",
       default: "texture",
       enum: ["texture", "model", "hdri", "pack"],
-      description: "What kind of asset. Poly Haven and ambientCG have all three; Sketchfab, Poly Pizza and Fab are models only; itch.io is asset packs.",
+      description: "What kind of asset. Poly Haven and ambientCG have all three; Sketchfab, Poly Pizza, KayKit and Fab are models only; itch.io is asset packs.",
     },
     category: {
       type: "string",
@@ -323,6 +326,27 @@ defineOp({
         // here is the machine-readable version of a grid full of placeholders.
         thumbnail: model.thumbnailUrl,
         total,
+      }));
+    }
+
+    if (provider === "kaykit") {
+      const { searchPackItems } = await import("../../kaykit.js");
+      // No server-side anything: a cross-pack search is a LOCAL filter over
+      // every pack's file tree. Trees are cached per session, so this costs
+      // one GitHub request per pack once, then nothing.
+      const items = await searchPackItems(query);
+      return items.slice(0, max).map((item) => ({
+        // `<repo>:<path>` — the trees API has no get-one-file endpoint, so the
+        // id must re-find the file on its own at import time.
+        id: item.id,
+        name: item.name,
+        provider,
+        type: "model",
+        tags: [item.pack.title, item.pack.kind],
+        authors: ["Kay Lousberg"],
+        license: "CC0 1.0 Universal",
+        animated: item.animated,
+        thumbnail: null,
       }));
     }
 
@@ -470,6 +494,12 @@ defineOp({
       const model = await fetchModel(String(id));
       if (!model?.downloadUrl) throw new Error(`Poly Pizza model "${id}" has no downloadable file.`);
       return finish(await downloadModel(model), { license: model.license, attribution: model.attribution });
+    }
+
+    if (provider === "kaykit") {
+      const { resolveItem, downloadModel } = await import("../../kaykit.js");
+      const item = await resolveItem(String(id));
+      return finish(await downloadModel(item), { license: "CC0 1.0 Universal" });
     }
 
     const itch = await import("../../itchio.js");

@@ -290,10 +290,14 @@
         }
 
         const info = bins.cascades[0];
-        const payloadArray = bins.payload.value.array;
+        // The payload is PACKED HALVES (plan §11.4 A1): the field is authored
+        // decoded, 4 channels per bin, and encoded into the buffer's words once.
+        // Values here are k/256 — exact halves — so the mirror reads the same
+        // field the GPU does without a quantize step.
+        const payloadArray = new Float32Array(bins.binTotal * D.PAYLOAD_CHANNELS);
         const writeField = (fill) => {
           for (let i = 0; i < bins.binTotal; i++) {
-            const o = i * D.PAYLOAD_WORDS;
+            const o = i * D.PAYLOAD_CHANNELS;
             payloadArray[o] = 0;
             payloadArray[o + 1] = 0;
             payloadArray[o + 2] = 0;
@@ -303,13 +307,14 @@
             for (let m = 0; m < NBINS; m++) {
               const v = fill(key, m);
               if (!v) continue;
-              const o = (info.binBase + block * NBINS + m) * D.PAYLOAD_WORDS;
+              const o = (info.binBase + block * NBINS + m) * D.PAYLOAD_CHANNELS;
               payloadArray[o] = v.radiance[0];
               payloadArray[o + 1] = v.radiance[1];
               payloadArray[o + 2] = v.radiance[2];
               payloadArray[o + 3] = v.transmittance;
             }
           }
+          D.encodePayload(payloadArray, bins.payload.value.array);
           bins.payload.value.needsUpdate = true;
         };
         const run = async () => {

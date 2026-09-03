@@ -123,25 +123,69 @@ await page.evaluate(async (anchorId) => {
   const { width, height } = size;
   const w4 = Math.floor(width / 4);
   const h4 = Math.floor(height / 4);
-  const sumBuf = instancedArray(new Uint32Array(2), "uint").toAtomic();
-  const irrNode = texture(targets.irradiance);
-  const w4U = uniform(w4, "uint");
+  const sp = system?.state?.screen?.srcProbes ?? null;
+  const stages = [
+    { name: "irr", tex: targets.irradiance, w: width, h: height },
+    { name: "raw", tex: targets.irradianceRaw, w: width, h: height },
+    { name: "gather", tex: sp?.gather?.target ?? null, w: sp?.gather?.width ?? 0, h: sp?.gather?.height ?? 0 },
+  ].filter((st) => st.tex && st.w > 0 && st.h > 0);
+  const sumBuf = instancedArray(new Uint32Array(2 * stages.length), "uint").toAtomic();
   const clearPass = Fn(() => {
     atomicStore(sumBuf.element(instanceIndex), uint(0));
-  })().compute(2);
-  const reduce = Fn(() => {
-    const px = instanceIndex.mod(w4U).mul(uint(4));
-    const py = instanceIndex.div(w4U).mul(uint(4));
-    const texel = irrNode.load(ivec2(px.toInt(), py.toInt()));
-    const lum = texel.xyz.dot(vec3(0.2126, 0.7152, 0.0722));
-    atomicAdd(sumBuf.element(uint(0)), uint(lum.mul(1024).add(0.5)));
-    atomicAdd(sumBuf.element(uint(1)), uint(1));
-  })().compute(w4 * h4);
+  })().compute(2 * stages.length);
+  const reduces = stages.map((st, k) => {
+    const sw4 = Math.max(1, Math.floor(st.w / 4));
+    const sh4 = Math.max(1, Math.floor(st.h / 4));
+    const node = texture(st.tex);
+    const wU = uniform(sw4, "uint");
+    return Fn(() => {
+      const px = instanceIndex.mod(wU).mul(uint(4));
+      const py = instanceIndex.div(wU).mul(uint(4));
+      const texel = node.load(ivec2(px.toInt(), py.toInt()));
+      const lum = texel.xyz.dot(vec3(0.2126, 0.7152, 0.0722));
+      atomicAdd(sumBuf.element(uint(2 * k)), uint(lum.mul(1024).add(0.5)));
+      atomicAdd(sumBuf.element(uint(2 * k + 1)), uint(1));
+    })().compute(sw4 * sh4);
+  });
+  // The bin store: whichever srcProbes member carries the BSTAT words.
+  const binStore = sp ? Object.values(sp).find((v) => v && typeof v === "object" && Number.isInteger(v.blockStatBase) && v.scratch?.value) ?? null : null;
+  const probeStore = sp?.store ?? null;
+  const BSTAT_WORDS = 5, BSTAT_ACC_L = 2, BSTAT_ACC_W = 3;
+  let sampleIx = 0;
+  globalThis.__convergeStages = stages.map((st) => st.name).concat(binStore ? ["bins", ...(probeStore?.cascades ?? []).map((_, k) => `c${k}`)] : []);
   globalThis.__convergeSample = async () => {
     engine.renderer.compute(clearPass);
-    engine.renderer.compute(reduce);
+    for (const r of reduces) engine.renderer.compute(r);
     const words = new Uint32Array(await engine.renderer.getArrayBufferAsync(sumBuf.value));
-    return { t: performance.now(), mean: words[1] ? words[0] / 1024 / words[1] : 0 };
+    const out = { t: performance.now(), mean: 0 };
+    stages.forEach((st, k) => {
+      out[st.name] = words[2 * k + 1] ? words[2 * k] / 1024 / words[2 * k + 1] : 0;
+    });
+    out.mean = out.irr ?? 0;
+    if (binStore && probeStore && (sampleIx++ % 8) === 0) {
+      try {
+        const scratch = new Uint32Array(await engine.renderer.getArrayBufferAsync(binStore.scratch.value));
+        const f32 = new Float32Array(scratch.buffer);
+        let sumM = 0, n = 0;
+        const total = probeStore.blockTotal ?? 0;
+        // Per cascade too: the far cascades see few rays, and a whole-pool mean
+        // (or a screen mean) is dominated by whichever converges slowest.
+        const casc = (probeStore.cascades ?? []).map((c) => ({ base: c.blockBase, cap: c.blockCapacity, sum: 0, n: 0 }));
+        for (let b = 0; b < total; b++) {
+          const sb = binStore.blockStatBase + b * BSTAT_WORDS;
+          const accW = f32[sb + BSTAT_ACC_W];
+          if (!(accW > 0)) continue;
+          const m = f32[sb + BSTAT_ACC_L] / accW;
+          sumM += m; n++;
+          const c = casc.find((cc) => b >= cc.base && b < cc.base + cc.cap);
+          if (c) { c.sum += m; c.n++; }
+        }
+        out.bins = n ? sumM / n : 0;
+        out.binsN = n;
+        casc.forEach((c, k) => { out[`c${k}`] = c.n ? c.sum / c.n : null; out[`c${k}n`] = c.n; });
+      } catch (e) { out.binsErr = String(e?.message ?? e).slice(0, 60); }
+    }
+    return out;
   };
 }, lid);
 
@@ -155,7 +199,17 @@ const record = (ms) =>
     const t0 = performance.now();
     while (performance.now() - t0 < dur) {
       await new Promise((r) => requestAnimationFrame(r));
-      out.push(await globalThis.__convergeSample());
+      const s = await globalThis.__convergeSample();
+      s.alpha = globalThis.__giSrcAlphaLive ?? null;
+      s.root = globalThis.__giSrcMotionRootLive ?? null;
+      s.lift = globalThis.__giSrcCompLiftLive ?? null;
+      s.surprise = globalThis.__giSrcSurpriseLive ?? null;
+      s.boosted = globalThis.__giSrcBoostedLive ?? null;
+      s.rest = globalThis.__giSrcRestFactorLive ?? null;
+      s.keep = globalThis.__giSrcKeepLive ?? null;
+      s.rootS = globalThis.__giSrcRootSLive ?? null;
+      s.lightTerm = globalThis.__giSrcLightTermLive ?? null;
+      out.push(s);
     }
     return out;
   }, ms);
@@ -177,6 +231,7 @@ const t90Of = (pre, post) => {
   return { B, F, t90, samples: post.length };
 };
 
+const ARMS = (process.env.ARMS ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 const arms = [
   { name: "default (cap 16 + comp, stride 1)", globals: { __giSrcAlphaComp: undefined, __giSrcProbeRayCap: undefined, __giSrcTransportRays: undefined } },
   { name: "comp-off", globals: { __giSrcAlphaComp: false, __giSrcProbeRayCap: undefined, __giSrcTransportRays: undefined } },
@@ -188,12 +243,14 @@ const arms = [
 
 console.log(`\n  step: intensity 2 -> ${STEP_TO}; t90 = seconds to 90% of the step, field mean\n`);
 const results = [];
+const EXTRA = JSON.parse(process.env.EXTRA_GLOBALS ?? "{}");
 for (const arm of arms) {
-  await setGlobals(arm.globals);
+  if (ARMS.length && !ARMS.some((a) => arm.name.includes(a))) continue;
+  await setGlobals({ ...arm.globals, ...EXTRA });
   if (arm.stride12) {
     const nat = await page.evaluate(() => globalThis.__giSrcTransport?.naturalRays ?? 0);
     if (!nat) { console.log("  FAIL no published transport for the strided arm"); continue; }
-    await setGlobals({ __giSrcTransportRays: Math.ceil(nat / 12) });
+    await setGlobals({ __giSrcTransportRays: Math.ceil(nat / (Number(process.env.STRIDE) || 12)) });
   }
   await setIntensity(2);
   await wait(20000);                       // full re-settle at this config
@@ -203,9 +260,54 @@ for (const arm of arms) {
   ]);
   const post = await record(16000);
   const r = t90Of(pre, post);
+  {
+    const names = await page.evaluate(() => globalThis.__convergeStages ?? []);
+    const parts = [];
+    for (const nm of names) {
+      const preS = pre.filter((x) => x[nm] != null).map((x) => ({ t: x.t, mean: x[nm] }));
+      const postS = post.filter((x) => x[nm] != null).map((x) => ({ t: x.t, mean: x[nm] }));
+      if (preS.length < 3 || postS.length < 6) { parts.push(`${nm}: n/a`); continue; }
+      const rr = t90Of(preS, postS);
+      parts.push(`${nm}: ${rr.B.toFixed(4)}→${rr.F.toFixed(4)} t90 ${rr.t90 == null ? ">16s" : rr.t90.toFixed(2) + "s"}`);
+    }
+    console.log(`    per stage: ${parts.join("  ·  ")}`);
+  }
   const stride = await page.evaluate(() => globalThis.__giSrcTransport?.stride ?? 1);
   const lift = await page.evaluate(() => globalThis.__giSrcCompLiftLive ?? null);
   results.push({ arm: arm.name, ...r, stride });
+  {
+    // NOISE RECEIPT: sign reversals of consecutive Δmean and mean |Δ|/mean, in
+    // the pre-step window (baseline) and in 0.5–2.5 s after the step (where a
+    // tracking window would be open). A monotone ramp reverses rarely; noise
+    // reverses every other sample.
+    const stat = (xs) => {
+      let rev = 0, sum = 0, m = 0, prev = 0;
+      for (let i = 1; i < xs.length; i++) {
+        const d = xs[i].mean - xs[i - 1].mean;
+        if (i > 1 && Math.sign(d) !== 0 && Math.sign(prev) !== 0 && Math.sign(d) !== Math.sign(prev)) rev++;
+        if (d !== 0) prev = d;
+        sum += Math.abs(d); m += xs[i].mean;
+      }
+      const n = Math.max(1, xs.length - 1);
+      return { rev: rev / n, rel: (sum / n) / Math.max(1e-6, m / n) };
+    };
+    const t0 = post[0]?.t ?? 0;
+    const win = post.filter((x) => x.t - t0 >= 500 && x.t - t0 <= 2500);
+    const a = stat(pre), b = stat(win);
+    console.log(`    noise: pre-step reversals ${(a.rev * 100).toFixed(0)}% of samples, |Δ|/mean ${(a.rel * 100).toFixed(2)}%  ·  0.5–2.5 s post-step reversals ${(b.rev * 100).toFixed(0)}%, |Δ|/mean ${(b.rel * 100).toFixed(2)}%`);
+  }
+  if (process.env.TRACE !== "0") {
+    const t0 = post[0]?.t ?? 0;
+    let next = 0;
+    const rows = [];
+    for (const x of post) {
+      const dt = (x.t - t0) / 1000;
+      if (dt < next) continue;
+      next += 0.5;
+      rows.push(`${dt.toFixed(1).padStart(5)}s mean ${x.mean.toFixed(4)} a ${x.alpha?.toFixed?.(3) ?? "-"} root ${x.root?.toFixed?.(2) ?? "-"} lift ${x.lift?.toFixed?.(2) ?? "-"} surprise ${x.surprise?.toFixed?.(4) ?? "-"} boosted ${x.boosted ?? "-"} rest ${x.rest?.toFixed?.(2) ?? "-"} keep ${x.keep?.toFixed?.(4) ?? "-"} rootS ${x.rootS?.toFixed?.(1) ?? "-"} lightTerm ${x.lightTerm?.toFixed?.(2) ?? "-"}`);
+    }
+    console.log("    dials after the step (t, field mean, alpha, motion root, lift, surprise mean u, boosted, rest):\n      " + rows.join("\n      "));
+  }
   console.log(`  ${arm.name.padEnd(40)} B ${r.B.toFixed(4)} -> F ${r.F.toFixed(4)}  ` +
     `t90 ${r.t90 == null ? ">16s (NEVER within window)" : r.t90.toFixed(2) + "s"}  ` +
     `(stride ${stride}, ${r.samples} samples, lift now ${lift?.toFixed?.(2) ?? lift})`);

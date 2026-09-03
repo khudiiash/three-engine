@@ -13,11 +13,17 @@ import { installTauriShim } from "./lib/tauriShim.mjs";
 
 const url = process.argv[2] ?? "http://localhost:5201/";
 const PROJECT = (process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME").replaceAll("\\", "/");
+const SCENE = process.env.SCENE
+  ? `${PROJECT}/${process.env.SCENE.replace(/^[/\\]+/, "")}`.replaceAll("\\", "/")
+  : null;
 const K = Number(process.env.K) || 40;
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  // Puppeteer's implicit profile is shared with every engine harness and a
+  // running Chrome can lock it with an empty-stderr launch failure.
+  userDataDir: `${process.env.TEMP ?? "C:/Windows/Temp"}/engine-gi-pass-${process.pid}`,
   headless: process.env.HEADED ? false : "new",
   args: [
     "--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage",
@@ -51,13 +57,22 @@ await page.evaluateOnNewDocument((PROJECT, G) => {
   globalThis.__editorKeepRendering = true;
 }, PROJECT, JSON.parse(process.env.PRESET_GLOBALS ?? "{}"));
 await page.goto(url, { waitUntil: "load", timeout: 60000 });
-await page.waitForSelector(".hub-recent-open-btn", { timeout: 30000 });
-await page.evaluate((project) => {
-  const rows = [...document.querySelectorAll(".hub-recent")];
-  const row = rows.find((r) => (r.getAttribute("title") ?? "").replaceAll("\\", "/") === project) ?? rows[0];
-  row?.querySelector(".hub-recent-open-btn")?.click();
-}, PROJECT);
+// Startup may reopen the remembered project directly. Waiting only for the
+// hub button then stalls for 30 s on exactly the large-scene path this probe
+// exists to measure.
+await page.waitForFunction(
+  () => !!globalThis.__editorApi || !!document.querySelector(".hub-recent-open-btn"),
+  { timeout: 60000 },
+);
+if (!(await page.evaluate(() => !!globalThis.__editorApi))) {
+  await page.evaluate((project) => {
+    const rows = [...document.querySelectorAll(".hub-recent")];
+    const row = rows.find((r) => (r.getAttribute("title") ?? "").replaceAll("\\", "/") === project) ?? rows[0];
+    row?.querySelector(".hub-recent-open-btn")?.click();
+  }, PROJECT);
+}
 await page.waitForFunction(() => !!globalThis.__editorApi, { timeout: 180000 });
+if (SCENE) await page.evaluate((path) => globalThis.__editorApi.call("scene.open", { path }), SCENE);
 for (let i = 0; i < 120 && !built; i++) await wait(1000);
 for (let i = 0; i < 220 && !waveDone; i++) await wait(1000);
 await wait(10000);

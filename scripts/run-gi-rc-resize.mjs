@@ -227,6 +227,14 @@ if (process.env.STACKS) {
 
 const before = await sampleWalls("before");
 const errorsBefore = validationErrors.length;
+const srcBefore = await page.evaluate(() => {
+  const src = globalThis.__engine?.modules?.get("gi")?.system?.state?.screen?.srcProbes ?? null;
+  globalThis.__resizeSrcProbeRef = src;
+  globalThis.__resizeSrcStoreRef = src?.store ?? null;
+  globalThis.__resizeSrcBinStoreRef = src?.binStore ?? null;
+  globalThis.__resizeSrcPassesRef = src?.passes ?? null;
+  return { exists: !!src, pixels: src?.pixelCount ?? 0, passes: src?.passes?.length ?? 0 };
+});
 
 // Several resizes, including a shrink and a grow, each given a few frames to
 // settle — the failure mode only needs ONE size change to latch.
@@ -267,14 +275,33 @@ if (process.env.STACKS) {
 
 const after = await sampleWalls("after");
 const errorsAfter = validationErrors.length - errorsBefore;
+const srcAfter = await page.evaluate(() => {
+  const src = globalThis.__engine?.modules?.get("gi")?.system?.state?.screen?.srcProbes ?? null;
+  return {
+    system: src === globalThis.__resizeSrcProbeRef,
+    store: src?.store === globalThis.__resizeSrcStoreRef,
+    bins: src?.binStore === globalThis.__resizeSrcBinStoreRef,
+    passes: src?.passes === globalThis.__resizeSrcPassesRef,
+    pixels: src?.pixelCount ?? 0,
+    passCount: src?.passes?.length ?? 0,
+  };
+});
 
 console.log(`validation errors before resizes: ${errorsBefore}, after: ${errorsAfter}`);
+console.log(
+  `SRC resize preservation: system=${srcAfter.system} store=${srcAfter.store} bins=${srcAfter.bins} ` +
+    `passes=${srcAfter.passes} pixels=${srcBefore.pixels}->${srcAfter.pixels} passCount=${srcBefore.passes}->${srcAfter.passCount}`,
+);
 for (const text of validationErrors.slice(0, 3)) console.log(`  ! ${text}`);
 
 const luminance = (rgb) => 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
 let failures = 0;
 if (errorsAfter > 0) {
   console.log(`FAIL: ${errorsAfter} WebGPU validation errors after resizing`);
+  failures++;
+}
+if (!srcBefore.exists || !srcAfter.system || !srcAfter.store || !srcAfter.bins || !srcAfter.passes) {
+  console.log("FAIL: ordinary viewport resize rebuilt the persistent SRC probe system");
   failures++;
 }
 for (const name of Object.keys(before)) {

@@ -334,7 +334,41 @@ export function resolveMaterialSurface(materialInput, meshName = "") {
  * bakeCore consumes (safe to postMessage to the bake worker). Arrays are
  * copied — the live geometry stays untouched.
  */
-const geometryCopyCache = new WeakMap(); // geometry -> { version, positions, index }
+const geometryCopyCache = new WeakMap();
+
+// `BufferAttribute.version` is per attribute, not per geometry. In particular,
+// editing an index or UV (or replacing an attribute with a fresh version-0
+// instance) leaves position.version untouched. Keep the complete source shape
+// beside each cached copy so every input consumed below participates in
+// invalidation. Interleaved attributes put their mutable version on `data`.
+const captureAttributeCopyState = (attribute) => attribute ? {
+  attribute,
+  array: attribute.array,
+  data: attribute.data ?? null,
+  version: attribute.version ?? attribute.data?.version ?? 0,
+  dataVersion: attribute.data?.version ?? 0,
+  count: attribute.count ?? 0,
+  itemSize: attribute.itemSize ?? 0,
+  normalized: attribute.normalized === true,
+  interleaved: attribute.isInterleavedBufferAttribute === true,
+  offset: attribute.offset ?? 0,
+  stride: attribute.data?.stride ?? 0,
+} : null;
+
+const attributeCopyStateMatches = (state, attribute) => {
+  if (!state || !attribute) return state === null && attribute == null;
+  return state.attribute === attribute &&
+    state.array === attribute.array &&
+    state.data === (attribute.data ?? null) &&
+    state.version === (attribute.version ?? attribute.data?.version ?? 0) &&
+    state.dataVersion === (attribute.data?.version ?? 0) &&
+    state.count === (attribute.count ?? 0) &&
+    state.itemSize === (attribute.itemSize ?? 0) &&
+    state.normalized === (attribute.normalized === true) &&
+    state.interleaved === (attribute.isInterleavedBufferAttribute === true) &&
+    state.offset === (attribute.offset ?? 0) &&
+    state.stride === (attribute.data?.stride ?? 0);
+};
 
 export function serializeMeshForBake(mesh, { geometryOnly = false } = {}) {
   const position = mesh.geometry?.attributes?.position;
@@ -355,15 +389,19 @@ export function serializeMeshForBake(mesh, { geometryOnly = false } = {}) {
   // Vertex/index copies cached per geometry (big character models cost real
   // milliseconds to slice per request; a drag only changes the matrix).
   let cached = geometryCopyCache.get(mesh.geometry);
-  const version = position.version ?? 0;
-  if (!cached || cached.version !== version) {
+  const indexAttr = mesh.geometry.index;
+  const uvAttr = mesh.geometry.attributes.uv;
+  const copyIsCurrent = cached &&
+    attributeCopyStateMatches(cached.positionState, position) &&
+    attributeCopyStateMatches(cached.indexState, indexAttr) &&
+    attributeCopyStateMatches(cached.uvState, uvAttr);
+  if (!copyIsCurrent) {
     // §18.17 — UVs ride along for the static BVH's textured-reflection
     // region. Sliced HERE rather than at the BVH build because this cache is
     // keyed per geometry: 200 crates pay for one copy, and a drag (matrix
     // only) pays for none. A geometry with no `uv` attribute yields null and
     // every consumer falls back to the per-slot mean albedo, which is exactly
     // the pre-R7b picture for that mesh alone.
-    const uvAttr = mesh.geometry.attributes.uv;
     // ── REFERENCE WHAT IS ALREADY THE RIGHT SHAPE ──────────────────────────
     //
     // These slices duplicated EVERY static geometry in the scene — ~86 MB on
@@ -386,13 +424,19 @@ export function serializeMeshForBake(mesh, { geometryOnly = false } = {}) {
       position.normalized !== true &&
       position.itemSize === 3 &&
       position.array.length === position.count * 3;
-    const indexAttr = mesh.geometry.index;
     const refIndex = !!indexAttr &&
       (indexAttr.array instanceof Uint32Array || indexAttr.array instanceof Uint16Array) &&
       indexAttr.isInterleavedBufferAttribute !== true &&
       indexAttr.array.length === indexAttr.count;
     cached = {
-      version,
+      // The revision is deliberately local to this geometry/cache entry. It
+      // stays stable for matrix/material-only calls, but advances for index-
+      // only and UV-only edits as well as same-version attribute replacement.
+      // Downstream geometry caches therefore cannot alias the stale record.
+      revision: (cached?.revision ?? 0) + 1,
+      positionState: captureAttributeCopyState(position),
+      indexState: captureAttributeCopyState(indexAttr),
+      uvState: captureAttributeCopyState(uvAttr),
       positions: refPositions ? position.array : position.array.slice(0, position.count * 3),
       index: indexAttr ? (refIndex ? indexAttr.array : indexAttr.array.slice()) : null,
       uvs: uvAttr && uvAttr.itemSize >= 2 && uvAttr.count >= position.count
@@ -406,7 +450,7 @@ export function serializeMeshForBake(mesh, { geometryOnly = false } = {}) {
     // Identity for the worker's incremental diffing + geometry cache: the
     // key changes when geometry content does, so edits re-ship exactly once.
     id: mesh.id,
-    geometryKey: `${mesh.geometry.id}:${version}`,
+    geometryKey: `${mesh.geometry.id}:${cached.revision}`,
     positions: cached.positions,
     index: cached.index,
     uvs: cached.uvs,

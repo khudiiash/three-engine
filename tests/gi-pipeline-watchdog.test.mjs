@@ -43,7 +43,14 @@ function makeHarness() {
 
   const device = {
     createShaderModule: (desc) => ({ __module: desc?.label ?? "" }),
-    createComputePipeline: () => ({ __sync: true }),
+    createComputePipeline: function createComputePipeline() {
+      if (this !== device) {
+        const err = new TypeError("Illegal invocation");
+        err.message = "Illegal invocation";
+        throw err;
+      }
+      return { __sync: true };
+    },
     createComputePipelineAsync(descriptor) {
       // Snapshot what the driver would actually have READ, synchronously —
       // exactly as WebGPU does — so a descriptor mutated afterwards cannot
@@ -211,4 +218,16 @@ test("a re-roll that never settles does not disable the watchdog forever", async
     2,
     "THE REGRESSION: the lease expired but no second re-roll fired — the watchdog is locked out",
   );
+});
+
+// Path-tracer (and any other `__giSyncCompute` client) needs a real pipeline on
+// the same stack as `renderer.compute(node, dispatchSize)`. GPUDevice methods
+// throw "Illegal invocation" if called unbound — the bypass must `.call(device)`.
+test("the sync-compute bypass invokes createComputePipeline with the device as this", () => {
+  const { renderer, backend, device } = makeHarness();
+  installAsyncComputePipelines(renderer);
+  backend.__giSyncCompute = true;
+  const pipeline = { id: 900 };
+  backend.createComputePipeline(pipeline, []);
+  assert.equal(backend.get(pipeline).pipeline?.__sync, true, "sync create must land a pipeline on the same stack");
 });

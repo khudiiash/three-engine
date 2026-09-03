@@ -46,6 +46,45 @@ export async function saveAssetBinary(path, bytes) {
   }
 }
 
+// Binary READER for derived artifacts. The player default is an ordinary
+// fetch; the editor replaces it with Tauri's raw IPC reader so a 100+ MB GI
+// bake never becomes a JSON array of numbers on either side of the bridge.
+let loadBinary = async (path) => {
+  const response = await fetch(path);
+  if (!response.ok) return null;
+  return response.arrayBuffer();
+};
+
+export function setAssetBinaryLoader(fn) {
+  loadBinary = fn;
+}
+
+export async function loadAssetBinary(path) {
+  try {
+    return await loadBinary(path);
+  } catch {
+    return null;
+  }
+}
+
+// Vectored/atomic binary WRITER for very large derived artifacts. Keeping the
+// small header and giant payload as separate views avoids allocating another
+// full-sized ArrayBuffer merely to concatenate them in JavaScript.
+let saveBinaryAtomic = async () => false;
+
+export function setAssetBinaryAtomicSaver(fn) {
+  saveBinaryAtomic = fn;
+}
+
+export async function saveAssetBinaryAtomic(path, header, payload) {
+  try {
+    return (await saveBinaryAtomic(path, header, payload)) !== false;
+  } catch (error) {
+    console.warn(`[assets] atomic binary save failed (${path}):`, error?.message ?? error);
+    return false;
+  }
+}
+
 // Project-level DERIVED DATA directory (e.g. `<project>/Library`). Content-
 // hash-keyed artifacts that belong to no authored asset file — baked mesh
 // SDFs for GI — live under it. The editor wires a synchronous provider

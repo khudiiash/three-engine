@@ -93,13 +93,16 @@ import {
   COUNTER_BOOSTED,
   COUNTER_WORDS,
   FLAG_ALIVE,
+  FLAG_FRESH,
   INFLUX_ONE,
   PROBE_BLOCK,
   PROBE_FLAGS,
+  PROBE_HASH,
   PROBE_PARENT,
   PROBE_RAYOFF,
   PROBE_RAYS,
   PROBE_WORDS,
+  PRIORITY_REP_PIXEL_MASK,
   SLOT_EMPTY,
 } from "./srcProbes.js";
 
@@ -295,7 +298,7 @@ function probeAlive(probeTable, probe) {
 export function createSrcRayFrame(
   store, rays, {
     pixelProbe, raysPerPixel = 1, stride = null, phase = null, threads = 0, cap = null,
-    capBoost = null, surprise = null,
+    capBoost = null, surprise = null, priority = null, activePixels = null,
   } = {},
 ) {
   const { probeTable, probeTotal, cascades, freeStack } = store;
@@ -349,8 +352,8 @@ export function createSrcRayFrame(
   // `t·stride + phase` runs past the end. Skip, never wrap — see
   // `transportPixel`'s header for why a wrap is a double deposit rather than a
   // wasted thread.
-  const outOfRange = strided
-    ? (p) => p.greaterThanEqual(uint(pixelCount))
+  const outOfRange = strided || activePixels
+    ? (p) => p.greaterThanEqual(activePixels ?? uint(pixelCount))
     : null;
   const dispatchCount = strided ? threads : pixelCount;
 
@@ -376,7 +379,10 @@ export function createSrcRayFrame(
     // NATURAL-count accumulator — see [D1'']. Parent slots must start at zero
     // for the natural propagate's adds; without a cap the cursor stays
     // uncleared for the reason the header below gives.
-    if (cap) atomicStore(rayCursor.element(i), uint(0));
+    // With cold-frontier priority the c0 cursor still carries the visible
+    // representative written by population. A later pass consumes it and
+    // resets every cursor before [D1''] uses the buffer as an accumulator.
+    if (cap && !priority) atomicStore(rayCursor.element(i), uint(0));
     const w = i.mul(PROBE_WORDS).toVar();
     probeTable.element(w.add(PROBE_RAYS)).assign(uint(0));
     probeTable.element(w.add(PROBE_RAYOFF)).assign(uint(SLOT_EMPTY));
@@ -386,6 +392,40 @@ export function createSrcRayFrame(
     });
   })().compute(probeTotal));
 
+  // Cold-frontier priority reserves one same-budget packet for every visible
+  // fresh/cold c0 probe before normal screen coverage. This closes the n=0
+  // hole in the old cap boost: a higher cap cannot help a probe whose pixels
+  // all fall outside this frame's stride residue. PROBE_HASH is dead after
+  // population, so it carries the representative without a new buffer.
+  if (priority) {
+    const c0 = cascades[0];
+    const stampBase0 = store.blockStampBase + c0.blockBase;
+    passes.push(Fn(() => {
+      const p = instanceIndex.add(uint(c0.probeBase)).toVar();
+      const w = p.mul(PROBE_WORDS).toVar();
+      const rankedRep = atomicLoad(rayCursor.element(p)).toVar();
+      probeTable.element(w.add(PROBE_HASH)).assign(uint(SLOT_EMPTY));
+      If(rankedRep.equal(uint(SLOT_EMPTY)), () => { Return(); });
+      const rep = rankedRep.bitAnd(uint(PRIORITY_REP_PIXEL_MASK)).toVar();
+      const flags = probeTable.element(w.add(PROBE_FLAGS)).toVar();
+      const block = probeTable.element(w.add(PROBE_BLOCK)).toVar();
+      const cold = flags.bitAnd(uint(FLAG_FRESH)).notEqual(uint(0)).toVar();
+      If(block.notEqual(uint(SLOT_EMPTY)), () => {
+        const age = priority.frameStamp.sub(
+          freeStack.element(uint(stampBase0).add(block)),
+        ).toVar();
+        cold.assign(cold.or(age.lessThan(uint(COLD_FILL_FRAMES))));
+      });
+      If(cold, () => {
+        const ticket = atomicAdd(rayTotal.element(uint(0)), uint(raysPerPixel)).toVar();
+        If(ticket.add(uint(raysPerPixel)).lessThanEqual(priority.ceiling), () => {
+          atomicAdd(rayCount.element(p), uint(raysPerPixel));
+          probeTable.element(w.add(PROBE_HASH)).assign(rep);
+        });
+      });
+    })().compute(c0.probeCapacity));
+  }
+
   // ── [D1] c0 counts, from the pixels ───────────────────────────────────────
   // The count is per PIXEL, not per probe: `raysPerPixel` rays are born at each
   // pixel and the probe's budget is their sum. A probe covering forty pixels
@@ -394,10 +434,37 @@ export function createSrcRayFrame(
   passes.push(Fn(() => {
     const i = pixelOf(instanceIndex.toVar());
     if (outOfRange) If(outOfRange(i), () => { Return(); });
+    if (priority) pixelRayBase.element(i).assign(uint(SLOT_EMPTY));
     const probe = pixelProbe.element(i).toVar();
     If(probe.equal(uint(SLOT_EMPTY)), () => { Return(); });
+    if (priority) {
+      // The representative already owns one budget ticket. If it also lies in
+      // this frame's residue, do not count the same pixel twice.
+      const reserved = probeTable.element(
+        probe.mul(PROBE_WORDS).add(PROBE_HASH),
+      ).equal(i);
+      If(reserved, () => { Return(); });
+      const ticket = atomicAdd(rayTotal.element(uint(0)), uint(raysPerPixel)).toVar();
+      If(ticket.add(uint(raysPerPixel)).greaterThan(priority.ceiling), () => { Return(); });
+      // Temporary admission marker, replaced by the real offset in [D5]. Only
+      // this frame's residue is read, so stale entries remain irrelevant.
+      pixelRayBase.element(i).assign(uint(0));
+    }
     atomicAdd(rayCount.element(probe), uint(raysPerPixel));
   })().compute(dispatchCount));
+
+  if (priority) {
+    // `rayTotal` was the strict ceiling ticket dispenser above; [D3] needs the
+    // same word reset as its offset allocator. `rayCursor` likewise leaves its
+    // representative role and becomes [D1'']'s natural-count accumulator.
+    passes.push(Fn(() => {
+      const i = instanceIndex.toVar();
+      if (cap) atomicStore(rayCursor.element(i), uint(0));
+      If(i.equal(uint(0)), () => {
+        atomicStore(rayTotal.element(uint(0)), uint(0));
+      });
+    })().compute(probeTotal));
+  }
 
   // ── [D1'] the per-probe cap (srcConfig's `probeRayCap`) ───────────────────
   // Clamped AT THE SOURCE, before anything reads a count: [D2] then propagates
@@ -636,10 +703,9 @@ export function createSrcRayFrame(
   // reads: ray r of pixel p is global index `pixelRayBase[p] + r`. A pixel
   // whose probe is SLOT_EMPTY keeps SLOT_EMPTY here, which is how the trace
   // knows not to fire.
-  passes.push(Fn(() => {
-    const i = pixelOf(instanceIndex.toVar());
-    if (outOfRange) If(outOfRange(i), () => { Return(); });
-    const probe = pixelProbe.element(i).toVar();
+  const claimPixel = (pixel, knownProbe = null) => {
+    const i = uint(pixel).toVar();
+    const probe = knownProbe ? uint(knownProbe).toVar() : pixelProbe.element(i).toVar();
     If(probe.equal(uint(SLOT_EMPTY)), () => {
       pixelRayBase.element(i).assign(uint(SLOT_EMPTY));
       Return();
@@ -678,7 +744,24 @@ export function createSrcRayFrame(
     If(denied.not(), () => {
       atomicStore(rayWork.element(atomicAdd(rayWork.element(uint(0)), uint(1)).add(uint(1))), i);
     });
+  };
+  passes.push(Fn(() => {
+    const i = pixelOf(instanceIndex.toVar());
+    if (outOfRange) If(outOfRange(i), () => { Return(); });
+    if (priority) {
+      If(pixelRayBase.element(i).equal(uint(SLOT_EMPTY)), () => { Return(); });
+    }
+    claimPixel(i);
   })().compute(dispatchCount));
+  if (priority) {
+    const c0 = cascades[0];
+    passes.push(Fn(() => {
+      const probe = instanceIndex.add(uint(c0.probeBase)).toVar();
+      const rep = probeTable.element(probe.mul(PROBE_WORDS).add(PROBE_HASH)).toVar();
+      If(rep.equal(uint(SLOT_EMPTY)), () => { Return(); });
+      claimPixel(rep, probe);
+    })().compute(c0.probeCapacity));
+  }
   // ⚠ `pixelRayBase` IS NO LONGER FULLY REWRITTEN EACH FRAME. With a strided
   // dispatch only this frame's residue class is touched, so every other entry
   // holds a base from whichever frame last owned it. That is safe for exactly

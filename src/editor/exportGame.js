@@ -122,6 +122,14 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
   const { useModulesStore } = await import("./modules.js");
   const { listProjectAssets, transpileScript } = await import("./assetLoader.js");
   const { currentScenePath } = await import("./sceneIO.js");
+  const {
+    staticBvhArtifactRelativePath,
+    staticBvhSceneManifestRelativePath,
+  } = await import("../modules/gi/staticBvhDiskCache.js");
+  const {
+    STATIC_BVH_FORMAT_PLACEMENT,
+    STATIC_BVH_FORMAT_WORLD,
+  } = await import("../modules/gi/staticBvhFormats.js");
 
   const projectSettings = getProjectSettings();
   const build = { ...BUILD_DEFAULTS, ...(projectSettings.build ?? {}), ...buildOverride };
@@ -342,6 +350,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     scene.physics = {
       names: projectSettings.physics.layers,
       matrix: projectSettings.physics.matrix,
+      autoCollidersEnabled: projectSettings.physics.autoCollidersEnabled === true,
     };
     rewriteScene(scene);
     // Only the start scene's assets feed the boot preload list below. Levels
@@ -574,7 +583,51 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     // pipeline was deleted 2026-08-02 — the occupancy backend voxelizes from
     // triangles on the GPU at load, so a build ships nothing and bakes
     // nothing.)
-    const derivedCopies = [];
+    // Ship only the exact static-BVH artifacts selected by each scene's tiny
+    // manifest. Copying the whole content-addressed cache made every geometry
+    // edit permanently add another ~158 MiB to Bistro builds. Missing pointers
+    // are safe (the player builds in memory), but explicit so an author knows
+    // which scene still needs one editor bake before release.
+    const derivedByDestination = new Map();
+    if (root) {
+      for (const rel of plan.scenes) {
+        const sceneKey = samePath(rel, openRel) ? openScenePath : joinPath(root, rel);
+        try {
+          const candidates = [];
+          for (const format of [STATIC_BVH_FORMAT_PLACEMENT, STATIC_BVH_FORMAT_WORLD]) {
+            const manifestPath = joinPath(
+              root,
+              `Library/${staticBvhSceneManifestRelativePath(sceneKey, { format })}`,
+            );
+            try {
+              const manifest = JSON.parse(await invoke("read_text_file", { path: manifestPath }));
+              const signature = String(manifest?.signature ?? "").toLowerCase();
+              const manifestFormat = manifest?.format ?? STATIC_BVH_FORMAT_WORLD;
+              const artifact = staticBvhArtifactRelativePath(signature, { format: manifestFormat });
+              if (
+                manifest?.version !== 1 || manifestFormat !== format ||
+                manifest?.artifact !== artifact
+              ) continue;
+              candidates.push({ manifest, artifact });
+            } catch {
+              // A scene normally owns only one live format pointer.
+            }
+          }
+          candidates.sort((a, b) => Number(b.manifest.updatedAt ?? 0) - Number(a.manifest.updatedAt ?? 0));
+          const selected = candidates[0];
+          if (!selected) throw new Error("stale, malformed, or missing pointer");
+          const { artifact } = selected;
+          const destination = `Library/${artifact}`;
+          derivedByDestination.set(destination, [joinPath(root, destination), destination]);
+        } catch (error) {
+          warnings.push(
+            `GI acceleration cache not baked for ${rel}; open the scene once before the final build ` +
+              `(${error?.message ?? error}).`,
+          );
+        }
+      }
+    }
+    const derivedCopies = [...derivedByDestination.values()];
 
     // --- The player template, themed for this game --------------------------
     onProgress({ phase: "write", message: "Writing build…" });

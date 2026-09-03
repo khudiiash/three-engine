@@ -1,7 +1,7 @@
 // AO + GLOSSY GATE (2026-08-21) — prices and verifies the two indirect
-// completions shipped together: screen-space AO (createGiAoPass, `ao: true`
-// in giConfig) and the half-res glossy radiance chain (createSrcGlossyGather
-// + the radiance temporal filter, §12.71b v2 default-on).
+// completions shipped together: GTAO contact AO plus a V²-shaped occupancy-world
+// channel (`ao: true` in giConfig), and the half-res glossy radiance chain
+// (createSrcGlossyGather + the radiance temporal filter, §12.71b v2 default-on).
 //
 // TWO ARMS, CROSS-BOOT (both hatches are build-time):
 //   on    the shipping defaults
@@ -10,10 +10,14 @@
 //
 // STATISTICS (linear luminance, crops projected from SUBJECTS' world points
 // through the live camera — never hand-coded rectangles):
-//   AO      same-page A/B on the `on` arm: `__giAoOverride={strength:0}` is a
+//   AO      same-page A/B on the `on` arm: `__giVxaoOverride={strength:0}` is a
 //           live uniform, so contact-vs-open floor is measured twice in ONE
 //           page. PASS = zeroing AO brightens the contact strip by ≥3% while
 //           moving the open-floor control by materially less.
+//   SPEC AO the same A/B must leave the metal sphere stable (≤10%). The AO
+//           texture is a cosine-hemisphere estimate for diffuse indirect, not
+//           visibility along the sphere's reflected ray; feeding it to glossy
+//           radiance is the black-metal regression this control pins.
 //   GLOSSY  sphere crop, on-arm vs off-arm. PASS = the metal sphere is
 //           brighter with the chain on (off is the §12.71b black-metal state).
 //   NOISE   two sphere samples 700ms apart at a held pose (the S2 lesson:
@@ -152,27 +156,22 @@ async function runArm(arm) {
     // contact strip is mostly emitter-DIRECT light, which AO deliberately
     // leaves alone; the modulated indirect is the minor share here).
     //
-    // VXAO IS HELD AT ZERO ACROSS IT. The resolve composes the two obscurance
-    // estimators with `min`, so wherever the world-space one is the darker the
-    // screen-space dial moves nothing and this A/B measures the composition
-    // instead of the term it names. That is not hypothetical: it clipped the
-    // swing from 2.7% to 1.3% here. Zeroing VXAO's live strength makes it
-    // return 1 and hands the `min` back to the estimator under test — the same
-    // isolation run-gi-vxao-probe.mjs applies in the mirror direction.
+    // GTAO and the V²-shaped occupancy channel share the `vxao` half-res slot and
+    // one strength uniform. Sweep the actual shipping composite; the old
+    // `ao` slot is intentionally null and changing __giAoOverride would be a
+    // vacuous test.
     let aoFull = null, aoZero = null;
     if (on) {
       // Restored explicitly, not by deleting the hatch: the override is a live
       // uniform write, so dropping the global leaves the last value latched and
-      // the RESIZE measurement below would run with VXAO still off.
+      // the RESIZE measurement below would run with AO still off.
       const vxaoStrength = engine.modules.get("gi")?.system?.state?.screen?.vxao?.strength?.value ?? null;
-      globalThis.__giVxaoOverride = { strength: 0 };
-      globalThis.__giAoOverride = { strength: 1, radius: 0.8 };
+      globalThis.__giVxaoOverride = { strength: 1 };
       await sleep(1200);
       aoFull = await sample();
-      globalThis.__giAoOverride = { strength: 0, radius: 0.8 };
+      globalThis.__giVxaoOverride = { strength: 0 };
       await sleep(1200);
       aoZero = await sample();
-      delete globalThis.__giAoOverride;
       if (vxaoStrength !== null) globalThis.__giVxaoOverride = { strength: vxaoStrength };
       await sleep(300);
       delete globalThis.__giVxaoOverride;
@@ -242,8 +241,8 @@ for (const [arm, r] of Object.entries(results)) {
   console.log(`\nARM=${arm}${r.glossyLine ? `\n  ${r.glossyLine.slice(0, 160)}` : ""}`);
   console.log(`  crops      contact ${fmt(r.base.contact)}  open ${fmt(r.base.open)}  sphere ${fmt(r.base.sphere)}`);
   console.log(`  held-pose  contact ${fmt(r.again.contact)}  open ${fmt(r.again.open)}  sphere ${fmt(r.again.sphere)}`);
-  if (r.aoFull) console.log(`  ao=1       contact ${fmt(r.aoFull.contact)}  open ${fmt(r.aoFull.open)}`);
-  if (r.aoZero) console.log(`  ao=0       contact ${fmt(r.aoZero.contact)}  open ${fmt(r.aoZero.open)}`);
+  if (r.aoFull) console.log(`  ao=1       contact ${fmt(r.aoFull.contact)}  open ${fmt(r.aoFull.open)}  sphere ${fmt(r.aoFull.sphere)}`);
+  if (r.aoZero) console.log(`  ao=0       contact ${fmt(r.aoZero.contact)}  open ${fmt(r.aoZero.open)}  sphere ${fmt(r.aoZero.sphere)}`);
   if (r.passMs?.pick && Object.keys(r.passMs.pick).length) {
     console.log(`  pass ms    total ${r.passMs.total}  ${JSON.stringify(r.passMs.pick)}`);
   } else if (r.passMs?.error) console.log(`  pass ms    ERROR: ${r.passMs.error}`);
@@ -263,6 +262,16 @@ if (on) {
     const ok = contactLift >= 1.02 && (contactLift - 1) >= 3 * Math.max(0, openLift - 1);
     console.log(`\nAO: full-strength vs zero lifts contact x${contactLift.toFixed(3)} vs open x${openLift.toFixed(3)}  ${ok ? "PASS" : "FAIL"}`);
     pass &&= ok;
+    // A metal has no diffuse lobe. This scalar AO estimates visibility over a
+    // cosine hemisphere and therefore cannot be multiplied into the sphere's
+    // directional glossy lookup. The held-pose threshold matches the probe's
+    // existing temporal-noise allowance; the regressed raw multiply moves the
+    // crop far more than that when the sphere is occluded.
+    const specDelta = Math.abs(on.aoZero.sphere - on.aoFull.sphere)
+      / Math.max(1e-6, on.aoFull.sphere);
+    const specOk = specDelta <= 0.10;
+    console.log(`SPEC AO: metal sphere AO-sweep delta ${(specDelta * 100).toFixed(1)}%  ${specOk ? "PASS" : "FAIL"}`);
+    pass &&= specOk;
   }
   const aoMs = on.passMs?.pick?.ao ?? null;
   const glossyMs = (on.passMs?.pick?.["glossy gather"] ?? 0) + (on.passMs?.pick?.["glossy temporal"] ?? 0);

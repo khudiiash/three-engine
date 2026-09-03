@@ -23,7 +23,7 @@ import * as THREE from "three/webgpu";
 import { defineOp } from "../registry.js";
 import { engine } from "../../engineInstance.js";
 import { getViewportHandle } from "../../viewportHandle.js";
-import { EDITOR_LAYER } from "../../../engine/editorLayers.js";
+import { EDITOR_LAYER, PHYSICS_DEBUG_LAYER } from "../../../engine/editorLayers.js";
 import { renderTargetToDataUrl } from "../../../engine/renderTargetImage.js";
 import { useConsoleStore } from "../../store/consoleStore.js";
 import { isViewportFreezeEnabled, setViewportFreezeEnabled } from "../../viewportFreeze.js";
@@ -71,8 +71,12 @@ async function capture({ width, height, camera, includeGizmos }) {
   const prevAspect = camera.aspect;
   const prevTarget = renderer.getRenderTarget();
   const gizmosWereVisible = camera.layers.isEnabled(EDITOR_LAYER);
+  const physicsDebugWasVisible = camera.layers.isEnabled(PHYSICS_DEBUG_LAYER);
   try {
-    if (!includeGizmos) camera.layers.disable(EDITOR_LAYER);
+    if (!includeGizmos) {
+      camera.layers.disable(EDITOR_LAYER);
+      camera.layers.disable(PHYSICS_DEBUG_LAYER);
+    }
     if (camera.isPerspectiveCamera) {
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
@@ -110,6 +114,7 @@ async function capture({ width, height, camera, includeGizmos }) {
       camera.updateProjectionMatrix();
     }
     if (gizmosWereVisible) camera.layers.enable(EDITOR_LAYER);
+    if (physicsDebugWasVisible) camera.layers.enable(PHYSICS_DEBUG_LAYER);
     renderer.setRenderTarget(prevTarget);
     target.dispose();
   }

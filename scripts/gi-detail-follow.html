@@ -1,0 +1,136 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>html,body,canvas{margin:0;width:100%;height:100%;display:block;background:#111}</style>
+</head>
+<body>
+  <canvas id="view"></canvas>
+  <script type="module">
+    // ══ THE DETAIL BOX MUST CONTAIN THE VIEWER ═══════════════════════════════
+    //
+    // Driven by scripts/run-gi-detail-follow-test.mjs.
+    //
+    // §13's detail box follows the ORBIT PIVOT in edit mode (`cameraFocus`, the
+    // §16 anti-metronome change) rather than the camera. On its own that puts a
+    // camera orbiting a distant pivot at the box EDGE — and the §13 F3 feather
+    // then replaces the indirect at the viewer's own position with the
+    // far-field constant, which is desaturated to 35% chroma and carries no
+    // occlusion at all. Measured on the user's Bistro 2026-08-30: box centre
+    // (10.5, 11.5, 8.5) size 47 against a camera at x = -10.17 whose pivot was
+    // at x = 10.98 — the camera sat 2.83 m inside a 4 m feather, so 29% of its
+    // own indirect was already the constant. It reads as a flat grey wash with
+    // bright fill on surfaces the geometry says are dark.
+    //
+    // The scene is the smallest one that ARMS the box: `DETAIL_TRIGGER` is 60 m,
+    // so the content has to span more than that horizontally, and the box only
+    // arms when the content is bigger than the tier extent (36 m at high).
+    //
+    //   ?clamp=0   the NEGATIVE CONTROL (`__giDetailViewerClamp = false`) —
+    //              the pre-fix behaviour, which must FAIL the assertion. A gate
+    //              whose negative control passes is not testing anything.
+    const params = new URLSearchParams(location.search);
+    const clampOff = params.get("clamp") === "0";
+    if (clampOff) globalThis.__giDetailViewerClamp = false;
+
+    // How far the orbit pivot sits from the camera. Must exceed
+    // `extent/2 - feather - spacing` or the clamp has nothing to do.
+    const PIVOT_DIST = Number(params.get("pivot") ?? 30);
+
+    const W = 640, H = 480;
+    globalThis.__editorKeepRendering = true;
+    const { Engine, THREE, registerBuiltInComponents } = await import("/src/engine/index.js");
+    await import("/src/modules/index.js");
+    const { enableEngineModule } = await import("/src/engine/modules.js");
+
+    registerBuiltInComponents();
+    const engine = new Engine();
+    globalThis.__RIG_ENGINE__ = engine;
+    engine.setSize(W, H);
+    await engine.init(document.querySelector("#view"));
+    await engine.applySettings({
+      background: "#202020", ambientColor: "#ffffff", ambientIntensity: 0,
+      environment: { cubemap: "", background: true, lighting: false, intensity: 0, rotation: 0, blur: 0 },
+      toneMapping: "linear", exposure: 1, shadows: true,
+    });
+
+    // A 160 m street of blocks: over DETAIL_TRIGGER (60 m) so the box arms, and
+    // over the tier extent so the clamp in #detailFitAabb actually shrinks it.
+    const grey = new THREE.MeshStandardNodeMaterial({ color: 0x808080, roughness: 1 });
+    const box = (w, h, d, x, y, z) => {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d).toNonIndexed(), grey);
+      m.position.set(x, y, z);
+      m.updateMatrixWorld(true);
+      engine.scene.add(m);
+    };
+    for (let x = -80; x <= 80; x += 10) {
+      box(8, 10, 4, x, 5, 6);
+      box(8, 10, 4, x, 5, -6);
+    }
+    box(180, 0.4, 20, 0, -0.2, 0);
+
+    await enableEngineModule(engine, "gi");
+    const gi = engine.createEntity({ name: "GI" });
+    gi.addComponent("global-illumination", { quality: "high", ao: false, reflections: false });
+
+    const camera = new THREE.PerspectiveCamera(60, W / H, 0.1, 400);
+    const CAM = new THREE.Vector3(-60, 3, 0);
+    camera.position.copy(CAM);
+    camera.lookAt(CAM.x + PIVOT_DIST, 3, 0);
+    camera.updateMatrixWorld(true);
+    engine.scene.add(camera);
+    engine.camera = camera;
+
+    // THE ORBIT PIVOT, exactly as the editor's ViewportPanel publishes it
+    // (`engine.cameraFocus = viewport.orbit.target`). Edit mode only, which is
+    // the mode this bug lives in — in play the camera IS the focus.
+    engine.cameraFocus = new THREE.Vector3(CAM.x + PIVOT_DIST, 3, 0);
+
+    engine.start();
+
+    const system = () => engine.modules.get("gi")?.system;
+    const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+    const deadline = performance.now() + 180000;
+    while (performance.now() < deadline) {
+      await settle(300);
+      if (system()?._fieldReadyOnce && system()?.state?.bounds) break;
+    }
+    // The follow is throttled to DETAIL_SLIDE_MIN_INTERVAL_MS (500 ms) and the
+    // followed point is an ~0.8 s EMA, so give it several intervals to arrive.
+    await settle(6000);
+
+    const out = { clampArmed: !clampOff, pivotDist: PIVOT_DIST };
+    try {
+      const sys = system();
+      const st = sys.state;
+      const b = st.bounds;
+      const cam = camera.getWorldPosition(new THREE.Vector3());
+      out.armed = !!(sys._detailExtent && sys._detailAnchor);
+      out.extent = sys._detailExtent ?? null;
+      out.probeSpacing = st.probeSpacing ?? null;
+      out.feather = 4 * (st.probeSpacing || 1);
+      out.bounds = {
+        min: [+b.min.x.toFixed(2), +b.min.y.toFixed(2), +b.min.z.toFixed(2)],
+        max: [+b.max.x.toFixed(2), +b.max.y.toFixed(2), +b.max.z.toFixed(2)],
+      };
+      out.camera = [+cam.x.toFixed(2), +cam.y.toFixed(2), +cam.z.toFixed(2)];
+      out.anchor = [+sys._detailAnchor.x.toFixed(2), +sys._detailAnchor.z.toFixed(2)];
+      // Horizontal only — the follow slides in x/z and cannot fix a camera near
+      // the top or bottom face, so y is not part of the contract.
+      out.camInside = +Math.min(
+        cam.x - b.min.x, b.max.x - cam.x,
+        cam.z - b.min.z, b.max.z - cam.z,
+      ).toFixed(2);
+      // The whole contract, in one number: the viewer must be at least one
+      // feather inside the box, or its own pixels render on the F3 constant.
+      out.pass = out.armed && out.camInside >= out.feather;
+    } catch (e) {
+      out.error = String((e && e.stack) || e);
+    }
+
+    globalThis.__RIG_RESULT__ = out;
+    console.log("RIG " + JSON.stringify(out));
+    globalThis.__RIG_DONE__ = true;
+  </script>
+</body>
+</html>

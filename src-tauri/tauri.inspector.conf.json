@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Three Engine — WebGPU Inspector",
+        "width": 1600,
+        "height": 950,
+        "minWidth": 1100,
+        "minHeight": 650,
+        "center": true,
+        "create": false,
+        "devtools": true,
+        "browserExtensionsEnabled": true,
+        "dataDirectory": "webgpu-inspector-dev",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required --enable-unsafe-webgpu --force-high-performance-gpu --force_high_performance_gpu"
+      }
+    ]
+  }
+}

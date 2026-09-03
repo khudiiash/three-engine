@@ -249,9 +249,18 @@ export class ShadowFreezeSystem {
     // The author's own freeze wins outright: re-enabling autoUpdate under a
     // project that switched it off would be this system overriding a setting
     // rather than implementing one.
-    if (this.enabled === false || engine.settings?.shadow?.autoUpdate === false) {
-      this.reason = this.enabled === false ? "disabled" : "the project authored shadow.autoUpdate = false";
-      this.#releaseAll();
+    if (this.enabled === false) {
+      this.reason = "disabled";
+      this.#releaseAll(true);
+      return;
+    }
+    if (engine.settings?.shadow?.autoUpdate === false) {
+      this.reason = "the project authored shadow.autoUpdate = false";
+      // Do not restore a flag the author explicitly switched off. In
+      // particular, a light can still be in `_owned` when Scene Settings is
+      // changed from automatic to one-shot shadows; the old release path
+      // immediately wrote `true` back and made that setting render forever.
+      this.#releaseAll(false);
       return;
     }
 
@@ -474,12 +483,12 @@ export class ShadowFreezeSystem {
    * very next frame. Raising `needsUpdate` as well would add nothing and can
    * throw — see the note in `update()`.
    */
-  #releaseAll() {
+  #releaseAll(restoreAutoUpdate = true) {
     if (!this._owned.size) return;
     for (const light of this._owned) {
       // CSM disposes and rebuilds its cascade placeholders on any cascade-count
       // or renderer change, so `_owned` can outlive the object it names.
-      if (light.shadow) light.shadow.autoUpdate = true;
+      if (restoreAutoUpdate && light.shadow) light.shadow.autoUpdate = true;
       this._keys.delete(light);
     }
     this._owned.clear();

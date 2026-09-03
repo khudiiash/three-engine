@@ -45,6 +45,7 @@ export default defineConfig(async () => ({
     alias: {
       "three/addons": "three/examples/jsm",
     },
+    dedupe: ["three"],
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
@@ -107,6 +108,8 @@ export default defineConfig(async () => ({
       "@xyflow/react",
       "three",
       "three/webgpu",
+      "three/tsl",
+      "three/examples/jsm/postprocessing/Pass.js",
       // External controls / studios' interactive controls
       "three/examples/jsm/controls/OrbitControls.js",
       "three/examples/jsm/controls/TransformControls.js",
@@ -157,5 +160,9 @@ export default defineConfig(async () => ({
       "nanoid",
       "@tauri-apps/plugin-dialog",
     ],
+    // TSL/WebGPU source — esbuild's dep prebundle mints a `?v=` chunk that
+    // 404s the moment the optimizer re-runs (quiet HMR does not reload, so
+    // the open page keeps the dead hash). Serve it as linked ESM instead.
+    exclude: ["three-gpu-pathtracer", "three-mesh-bvh/webgpu"],
   },
 }));

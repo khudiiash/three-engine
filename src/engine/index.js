@@ -186,6 +186,10 @@ export {
   loadSceneJson,
   setAssetBinarySaver,
   saveAssetBinary,
+  setAssetBinaryLoader,
+  loadAssetBinary,
+  setAssetBinaryAtomicSaver,
+  saveAssetBinaryAtomic,
   setDerivedDataRootProvider,
   getDerivedDataPath,
 } from "./assetResolver.js";

@@ -9,7 +9,7 @@
 // TWO ARMS, CROSS-BOOT (the hatch is read at kernel build time; one BROWSER
 // per arm — arms sharing a browser inherit each other's UI layout and the
 // canvases stop being comparable, the U1 flip gate's burned lesson):
-//   off   the shipping default (validity-blind gather)
+//   off   the shipping default (both validity terms off)
 //   on    __giGatherLosWeight = true
 //
 // STATISTICS (linear, crops projected from SUBJECTS through the live camera):
@@ -32,11 +32,12 @@ const url = process.argv[2] ?? "http://localhost:5201/";
 const SETTLE = Number(process.env.SETTLE ?? 18000);
 const VIEW = (process.env.VIEW ?? "1200x800").split("x").map(Number);
 // §15 U3b arms: each arm names a (gather, merge) flag PAIR — every flag
-// explicit on every arm (the module's standing rule; merge-LOS is default-ON
-// since U3b shipped, so the off arm must SAY false for both).
+// explicit on every arm (the module's standing rule). Both guards are opt-in:
+// later healthy-ladder/collateral runs overturned the transient default-on
+// claim recorded in the older ledger entry.
 //   off    both validity terms off — the leak baseline
 //   on     gather march only (U3's historical arm; opt-in in the product)
-//   merge  ladder cross-wall validity only — the U3b shipping default
+//   merge  ladder cross-wall validity only — diagnostic, not shipping
 //   both   the two together
 //   binary the gather march reading the ONE-BIT occupancy instead of the
 //          filtered one — the arm that separates "the LOS test suppresses too
@@ -120,6 +121,10 @@ async function runArm(arm, expectCanvas) {
     localStorage.setItem("engine.projectRoot.v1", project);
     localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
     globalThis.__editorKeepRendering = true;
+    // §10 (2026-09-02): the gather LOS is point-in-solid over the occupancy
+    // pyramid; "auto" is the field-less BVH build now, so this rig pins the
+    // occupancy mode it measures.
+    globalThis.__giRayHitMode = "hybrid-exact-complex";
     // EVERY flag explicit on EVERY arm (the module's standing rule).
     globalThis.__giGatherLosWeight = flags.gather;
     globalThis.__giMergeLosWeight = flags.merge;

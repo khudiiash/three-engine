@@ -1,12 +1,16 @@
 import { Component } from "../../engine/components/Component.js";
-import { GI_DEBUG_VIEWS, GI_QUALITY_LEVELS } from "./giConfig.js";
+import { GI_DEBUG_VIEWS } from "./giConfig.js";
+
+const GI_TERM_LEVELS = [0, 0.25, 0.5, 0.75, 1];
+const GI_TERM_LEVEL_LABELS = ["Off", "Low", "Medium", "High", "Ultra"];
 
 /**
  * Global Illumination via Split Radiance Cascades.
  *
- * THREE PROPERTIES: `quality`, and the `ao`/`reflections` feature toggles
- * (2026-08-21). The toggles are quality's kin, not the 27's return — see the
- * note on `defaults`.
+ * THREE VISIBLE LIGHTING CONTROLS: `bounce`, `ao`, and `reflections`. Each is
+ * one five-point quality rail (Off / Low / Medium / High / Ultra). The old
+ * global quality tier remains hidden only as a compatibility field for scenes
+ * authored before quality became independent per lighting term.
  *
  * ══ WHY, BECAUSE THIS COMPONENT USED TO HAVE 27 ════════════════════════════
  *
@@ -21,22 +25,24 @@ import { GI_DEBUG_VIEWS, GI_QUALITY_LEVELS } from "./giConfig.js";
  *
  * GI is not a look to be dialled in. It is either CORRECT or it is BROKEN, and
  * a property that can make it wrong is a bug generator with a label on it. A
- * quality preset is a different kind of thing — it trades COST against
- * ACCURACY, and every level of it is meant to be right. So the preset stays and
- * the rest is derived, in one table, in `giConfig.js`.
+ * Resource budgets are a different kind of thing — they trade COST against
+ * ACCURACY, and every level is meant to be right. They stay derived in one
+ * table in `giConfig.js`, selected independently by the visible term rails.
  *
  * ══ THE TWO THINGS THAT MOVED INSTEAD OF DYING ═════════════════════════════
  *
  * · SKY LIGHT is a light source, not a dial. It comes from the scene's own
- *   environment now (`scene.environment` + `environmentIntensity`), which is
- *   where three.js, Scene Settings and the HDRI Environment component already
- *   keep image-based lighting. No environment means no sky, exactly as
- *   `skyIntensity: 0` did.
+ *   sky now (`scene.environment` + `environmentIntensity`, which is where
+ *   three.js, Scene Settings and the HDRI Environment component already keep
+ *   image-based lighting) — and with no environment set, from the scene's flat
+ *   background colour while Scene Settings' "Use for lighting" is on. The
+ *   toggle off means no sky, exactly as `skyIntensity: 0` did.
  * · THE DEBUG VIEW never touched the lit image — it draws an overlay. It is a
  *   developer instrument; the SDF / occupancy / SRC-probes overlays live at
  *   `globalThis.__giDebugView`, and the GI-term overlays (indirect / AO /
- *   reflections) are also reachable through `props.debugView` so an inspector
- *   user can flip them without typing a global. `debugView` is `advanced` and
+ *   reflections) plus the path-tracer comparison are also reachable through
+ *   `props.debugView` so an inspector user can flip them without typing a
+ *   global. `debugView` is `advanced` and
  *   NOT part of the structural signature — flipping it is a live swap of the
  *   overlay's source texture, never a module rebuild.
  *
@@ -60,14 +66,11 @@ export class GlobalIlluminationComponent extends Component {
     // everywhere, and the tier ladder is only meaningful if the middle of it is
     // where people start.
     quality: "medium",
-    // The two feature toggles (2026-08-21). They survive the one-knob
-    // doctrine because they are the same KIND of property quality is: each
-    // removes a whole term at a whole cost — Ambient Occlusion is the
-    // contact-darkening pass on the indirect term, Reflections is the glossy
-    // radiance chain plus ultra's exact mirrors — and neither can mis-TUNE
-    // anything, which is the failure the 27-property collapse was aimed at.
-    ao: true,
-    reflections: true,
+    // Five-point per-term quality selectors. Numeric storage keeps the compact
+    // radio-rail document format while giConfig maps each point to a tier.
+    bounce: 1,
+    ao: 1,
+    reflections: 1,
     // Debug view: an overlay-source switch, NOT a lighting parameter. Default
     // "off" so an authoring scene never ships with a debug view on; the field
     // is also `advanced` (collapsed by default) because it is a developer
@@ -81,9 +84,9 @@ export class GlobalIlluminationComponent extends Component {
     // way of saying "an advanced field was hand-edited so the preset name no
     // longer implies its values", and the only advanced field (debugView) is
     // not a value the quality tier controls, so it cannot make a preset lie.
-    { key: "quality", label: "Quality", type: "select", options: [...GI_QUALITY_LEVELS] },
-    { key: "ao", label: "Ambient Occlusion", type: "boolean" },
-    { key: "reflections", label: "Reflections", type: "boolean" },
+    { key: "bounce", label: "Bounce", type: "level", options: GI_TERM_LEVELS, optionLabels: GI_TERM_LEVEL_LABELS },
+    { key: "ao", label: "AO", type: "level", options: GI_TERM_LEVELS, optionLabels: GI_TERM_LEVEL_LABELS },
+    { key: "reflections", label: "Reflections", type: "level", options: GI_TERM_LEVELS, optionLabels: GI_TERM_LEVEL_LABELS },
     {
       key: "debugView",
       label: "Debug View",
@@ -115,6 +118,9 @@ export class GlobalIlluminationComponent extends Component {
    */
   #warnRetiredProps() {
     const declared = new Set(GlobalIlluminationComponent.schema.map((f) => f.key));
+    // Runtime compatibility policy for old scenes; intentionally hidden from
+    // the Inspector now that the three lighting terms have direct controls.
+    declared.add("quality");
     const retired = Object.keys(this.props ?? {})
       .filter((k) => k !== "enabled" && !declared.has(k));
     if (!retired.length) return;
@@ -124,8 +130,8 @@ export class GlobalIlluminationComponent extends Component {
     seen.add(signature);
     console.warn(
       `[gi] ignoring ${retired.length} retired propert${retired.length === 1 ? "y" : "ies"}: ` +
-      `${retired.join(", ")}. Global Illumination has FOUR properties — quality, ao, ` +
-      "reflections, debugView — and everything else is derived (src/modules/gi/giConfig.js). Sky " +
+      `${retired.join(", ")}. Global Illumination exposes Bounce, AO, Reflections, ` +
+      "and Debug View; everything else is derived (src/modules/gi/giConfig.js). Sky " +
       "light comes from the scene's environment; the SDF/occupancy/SRC-probes debug view is " +
       "globalThis.__giDebugView; a probe that must force a value uses " +
       "globalThis.__giConfigOverride. Stored values drop on the next save.",

@@ -166,7 +166,8 @@ const probes = await page.evaluate(async () => {
   const store = src.store;
   const binStore = src.binStore;
   const table = new Uint32Array(await engine.renderer.getArrayBufferAsync(store.probeTable.value));
-  const payload = new Float32Array(await engine.renderer.getArrayBufferAsync(binStore.payload.value));
+  // Packed halves (plan §11.4 A1) — the store decodes to 4 channels per bin.
+  const payload = binStore.decodePayload(await engine.renderer.getArrayBufferAsync(binStore.payload.value));
 
   const PROBE_WORDS = 8, PROBE_KEY = 0, PROBE_FLAGS = 2, PROBE_BLOCK = 7;
   const FLAG_ALIVE = 1;

@@ -385,6 +385,25 @@ await check("a condition transitions the state machine", () => {
   assert.equal(runtime.currentState.name, "Move");
 });
 
+await check("an editor audition is not replaced by graph transitions", () => {
+  const { runtime } = makeAnimator(locomotionGraph());
+  // At speed 0 the authored Move -> Idle condition is immediately true. A
+  // canvas click still means "show Move" until another audition/rebuild.
+  runtime.preview("Move", 0);
+  for (let i = 0; i < 10; i++) runtime.update(1 / 60);
+  assert.equal(runtime.currentState.name, "Move");
+  assert.ok(runtime.layers[0].states.get("move").entries[0].action.time > 0, "preview playhead advances");
+});
+
+await check("ending an editor audition restores graph transitions", () => {
+  const { runtime } = makeAnimator(locomotionGraph());
+  runtime.preview("Move", 0);
+  runtime.update(1 / 60);
+  runtime.cancelPreview();
+  runtime.update(1 / 60);
+  assert.equal(runtime.currentState.name, "Idle");
+});
+
 await check("crossfading state weights sum to the layer weight throughout", () => {
   const { runtime } = makeAnimator(locomotionGraph());
   runtime.setParam("speed", 3);

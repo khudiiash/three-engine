@@ -40,6 +40,7 @@ export class SplineMeshComponent extends Component {
     material: "",
     castShadow: false,
     receiveShadow: true,
+    collision: "auto",
   };
   static schema = [
     { key: "path", label: "Path", type: "entity" },
@@ -54,6 +55,7 @@ export class SplineMeshComponent extends Component {
     { key: "material", label: "Material", type: "asset", exts: ["mat"], emptyLabel: "Default" },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
+    { key: "collision", label: "Default Collider", type: "select", options: ["auto", "none"] },
   ];
 
   onAttach() {
@@ -102,6 +104,7 @@ export class SplineMeshComponent extends Component {
   }
 
   onPropChanged(key) {
+    if (key === "collision") return;
     if (!this.mesh) {
       super.onPropChanged(key);
       return;

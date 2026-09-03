@@ -23,11 +23,15 @@ export class ModelComponent extends Component {
     materials: {}, // GLTF material name -> .mat asset path override
     castShadow: true,
     receiveShadow: true,
+    // Read by the optional physics module. Deleting its generated Collider
+    // persists as `none` here, so reopening the scene does not recreate it.
+    collision: "auto",
   };
   static schema = [
     { key: "path", label: "File", type: "asset", exts: ["glb"] },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
+    { key: "collision", label: "Default Collider", type: "select", options: ["auto", "none"] },
   ];
 
   onAttach() {
@@ -37,8 +41,12 @@ export class ModelComponent extends Component {
     this.unsubSkeletonSync = null;
     this.sharedMaterials = new Set(); // .mat-backed materials we must not dispose
     this.generation = (this.generation ?? 0) + 1;
+    const generation = this.generation;
+    this.assetLoadsPending = !!this.props.path;
     this._readyPromise = this.props.path
-      ? this.#load(this.props.path, this.generation)
+      ? this.#load(this.props.path, generation).finally(() => {
+          if (generation === this.generation) this.assetLoadsPending = false;
+        })
       : Promise.resolve();
   }
 
@@ -53,6 +61,10 @@ export class ModelComponent extends Component {
       const gltf = await loader.loadAsync(url);
       if (generation !== this.generation) return; // detached/reloaded meanwhile
       this.root = gltf.scene;
+      // Commit the model atomically after overrides. Large GLBs otherwise show
+      // bare geometry first and repaint one material at a time while GI sees a
+      // half-authored scene.
+      this.root.visible = false;
       // Rebase clips exported from a shared master timeline (keyframes not
       // starting at t=0) so they actually play instead of holding one pose.
       this.clips = (gltf.animations ?? []).map(rebaseClipToZero);
@@ -143,27 +155,42 @@ export class ModelComponent extends Component {
   async #applyMaterialOverrides(generation) {
     const overrides = this.props.materials ?? {};
     if (!this.root || !Object.keys(overrides).length) return;
-    const meshes = [];
-    this.root.traverse((obj) => obj.isMesh && meshes.push(obj));
-    for (const mesh of meshes) {
-      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      const replaced = await Promise.all(
-        mats.map(async (mat) => {
-          const matPath = mat?.name != null ? overrides[mat.name] : null;
-          if (!matPath) return mat;
-          const shared = await loadMaterialAsset(matPath);
-          this.sharedMaterials.add(shared);
-          if (mat && !this.sharedMaterials.has(mat)) mat.dispose();
-          return shared;
-        }),
+    const plans = [];
+    const loads = new Map();
+    this.root.traverse((mesh) => {
+      if (!mesh.isMesh) return;
+      const array = Array.isArray(mesh.material);
+      const materials = array ? [...mesh.material] : [mesh.material];
+      const paths = materials.map((material) =>
+        material?.name != null ? overrides[material.name] : null,
       );
-      if (generation !== this.generation) return;
-      mesh.material = Array.isArray(mesh.material) ? replaced : replaced[0];
+      for (const path of paths) {
+        if (path && !loads.has(path)) loads.set(path, loadMaterialAsset(path));
+      }
+      plans.push({ mesh, array, materials, paths });
+    });
+
+    const resolved = new Map();
+    await Promise.all([...loads].map(async ([path, promise]) => {
+      resolved.set(path, await promise);
+    }));
+    if (generation !== this.generation) return;
+
+    for (const { mesh, array, materials, paths } of plans) {
+      const replaced = materials.map((material, index) => {
+        const shared = paths[index] ? resolved.get(paths[index]) : null;
+        if (!shared) return material;
+        this.sharedMaterials.add(shared);
+        if (material && material !== shared && !this.sharedMaterials.has(material)) material.dispose();
+        return shared;
+      });
+      mesh.material = array ? replaced : replaced[0];
     }
   }
 
   onDetach() {
     this.generation = (this.generation ?? 0) + 1;
+    this.assetLoadsPending = false;
     this.unsubSkeletonSync?.();
     this.unsubSkeletonSync = null;
     this.skeletonBindings = [];
@@ -190,6 +217,7 @@ export class ModelComponent extends Component {
   }
 
   onPropChanged(key) {
+    if (key === "collision") return;
     if ((key === "castShadow" || key === "receiveShadow") && this.root) {
       this.root.traverse((obj) => {
         if (!obj.isMesh) return;

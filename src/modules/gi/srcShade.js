@@ -1,7 +1,8 @@
 // SPLIT RADIANCE CASCADES — [E'] hit shading. The GPU twin of `srcRef.js`'s
 // `makeHitShader`, line for line.
 //
-//     L_hit = emissive(H) + ρ(H)/π · [ Σ_lights direct(H) + E_secondary(H) ]
+//     L_hit = emissive(H) + ρ(H)/π · Σ_lights direct(H)
+//                         + ρ_loop(H)/π · E_secondary(H)
 //
 // Plan §4.4, and the executable spec is §12.26 — a CPU mirror whose 124 checks
 // ran the whole of this before a line of it existed on the GPU. Every constant,
@@ -65,8 +66,9 @@
 // thing `test:gi-src-shade` gates against `srcRef.js` — but it is now a
 // COMPOSITION of two factories that the engine builds separately:
 //
-//   · `createSrcHitAttribution` — surfaceAt, the face-forward flip, R4's albedo
-//     ceiling. Cheap, and it needs the trace's hit record, so it stays in [E].
+//   · `createSrcHitAttribution` — surfaceAt, the face-forward flip and physical
+//     first-bounce albedo. Cheap, and it needs the trace's hit record, so it
+//     stays in [E]. R4's loop-only ceiling is applied in [J].
 //   · `createSrcHitLighting` — the visibility marcher, the four rolled light
 //     slots, the NEE emitter set and the analytic shapes. Expensive to COMPILE
 //     (the marcher is ~1.2 s of shader compile per call site and this half has
@@ -76,8 +78,8 @@
 // That is the whole of §12.49's named follow-on: the deposit was 179 kB and one
 // pipeline of it measured 49-56 s of a cold boot, and §13.17 says two ~75 kB
 // kernels compiling in parallel beat one monster by MORE than the byte ratio.
-// The estimator is untouched — the same nodes are emitted, in two kernels
-// instead of one, and the ρ [J] multiplies by is still the one clamped here.
+// The estimator is untouched — the same nodes are emitted in two kernels;
+// [J] uses physical ρ for direct light and derives ρ_loop for feedback there.
 // · `importance` defaults to the exact contribution. `lightTree.js` is unwired;
 //   when it lands it supplies a bounds-based ranking, and §12.26.5 prices what
 //   that can cost at **3.00× the standard error** — 9× the samples for equal
@@ -85,7 +87,7 @@
 //
 // docs/GI_SRC_REBUILD_PLAN.md §4.4, §7 Phase 5, §12.26.
 
-import { If, Loop, float, int, mix, select, step, uint, vec3 } from "three/tsl";
+import { If, Loop, float, int, ivec2, mix, select, step, uint, vec3, vec4 } from "three/tsl";
 import { MAX_LOOP_ALBEDO } from "./srcConfig.js";
 import { hashKey } from "./srcMathTsl.js";
 import { emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
@@ -405,10 +407,9 @@ function neeIrradiance(slots, P, n, rayIndex, {
  *   · `P`        the shading point (the EXACT, unlifted hit)
  *   · `n`        the face-forwarded normal (see the header — the flip is here,
  *                on purpose, and §12.26.4 gates it two ways)
- *   · `rho`      the albedo AFTER R4's in-loop ceiling. **This is the value the
- *                whole fixed point rests on**: [J] multiplies its gathered
- *                irradiance by exactly this, so the loop's gain is the bounded
- *                one and the contraction is proven rather than hoped for.
+ *   · `rho`      physical 0..1 first-bounce albedo. [J] derives a 0.9-limited
+ *                copy only for gathered feedback, so direct sun is not
+ *                attenuated while the fixed point remains contractive.
  *   · `emissive` the raw emission. R5's zeroing is NOT applied here — it is a
  *                function of the NEE set, which is the lighting half's business
  *                (`createSrcHitLighting` takes the flag and does it there).
@@ -452,12 +453,16 @@ export function createSrcHitAttribution({
       count.shaded(1);
       if (s.valid != null) count.unattributed(select(float(s.valid).greaterThan(0.5), 0, 1));
     }
-    const rho = clampLoopAlbedo(s.albedo, maxLoopAlbedo);
-    if (count) count.albedoClamped(select(rho.clamped, 1, 0));
+    // Physical first-bounce reflectance is [0,1]. R4's stricter 0.9 ceiling
+    // exists only to make temporal feedback contract; applying it here also
+    // attenuated direct sun/lamp light before it entered that loop.
+    const rho = vec3(s.albedo).clamp(0, 1).toVar();
+    const rhoLoop = clampLoopAlbedo(rho, maxLoopAlbedo);
+    if (count) count.albedoClamped(select(rhoLoop.clamped, 1, 0));
     return {
       P,
       n,
-      rho: rho.albedo,
+      rho,
       emissive: vec3(s.emissive).toVar(),
       emitter: s.emitter != null ? float(s.emitter).toVar() : null,
     };
@@ -530,6 +535,14 @@ export function createSrcHitLighting({
   lightTree = null,
   count = null,
   sunSplit = null,
+  sunCompensation = null,
+  // §11.10 — the sun's SHADOW MAP at hits, GISystem's bundle: `{ slot, count,
+  // reversed, matrices[4], biases, normalBiases, sizes, bind(c, texel) }`.
+  // The directional slot named by `slot` takes its visibility from a depth
+  // texel instead of a BVH any-hit ray (one of the three descents every hit
+  // paid); every other slot, and that slot on a hit outside every cascade,
+  // still traces. Null keeps the kernel byte-identical to before.
+  sunShadow = null,
 } = {}) {
   if (voxelSize == null) {
     throw new Error(
@@ -560,6 +573,12 @@ export function createSrcHitLighting({
   // nothing and leave the sun accumulating exactly as before.
   const splitSlot = sunSplit && sunSplit !== true ? sunSplit.slot : null;
   const splitBundle = sunSplit === true;
+  // Independent of the lossy cached-normal sun split: this only names which
+  // already-shaded analytic term may receive the owning-cascade compensation.
+  const compensationSlot = sunCompensation && sunCompensation !== true
+    ? sunCompensation.slot
+    : null;
+  const compensationBundle = sunCompensation === true;
   /**
    * ⚠ DIAGNOSTIC ONLY — DOUBLE-DELIVERS THE SUN ON PURPOSE.
    *
@@ -586,12 +605,29 @@ export function createSrcHitLighting({
   }
   const splitting = splitBundle || splitSlot != null;
 
-  return (Pin, nIn, rhoIn, emissiveIn, emitterIn, rayIndex) => {
+  return (
+    Pin,
+    nIn,
+    rhoIn,
+    emissiveIn,
+    emitterIn,
+    rayIndex,
+    sunGainIn = null,
+    sunChromaGainIn = null,
+  ) => {
     const P = vec3(Pin).toVar();
     const n = vec3(nIn).toVar();
+    const sunGain = sunGainIn == null ? float(1) : float(sunGainIn);
+    const sunChromaGain = sunChromaGainIn == null ? sunGain : float(sunChromaGainIn);
 
     // ── E: irradiance arriving at the hit ───────────────────────────────────
     const E = vec3(0).toVar();
+    // Raw irradiance from the one compensated analytic directional source.
+    // Keeping it beside E lets the final Lambert product recover only the
+    // albedo chroma that the cascade low-pass loses; no source separation is
+    // stored in a bin and no new ray, pass or binding is introduced.
+    const compensating = compensationBundle || compensationSlot != null;
+    const sunRawE = compensating ? vec3(0).toVar() : null;
     /**
      * §12.82: the split source's VISIBILITY, and nothing else — no cosine and
      * no irradiance, because those are the two things `[F]` re-evaluates. It
@@ -638,7 +674,11 @@ export function createSrcHitLighting({
         // Split: the ray still fires (visibility is the one term that cannot be
         // made analytic) but its product is not folded into E.
         if (splitBundle) { sunVis.assign(v); sunFacing.assign(1); }
-        if (!splitBundle || splitKeep) E.addAssign(vec3(sun.irradiance).mul(cos).mul(v));
+        if (!splitBundle || splitKeep) {
+          const raw = vec3(sun.irradiance).mul(cos).mul(v).toVar();
+          E.addAssign(raw.mul(compensationBundle ? sunGain : float(1)));
+          if (compensationBundle) sunRawE.addAssign(raw);
+        }
       });
     }
 
@@ -686,26 +726,109 @@ export function createSrcHitLighting({
     //    byte-identically to before.
     if (lights.length) {
       const terms = lights.map((slot) => lightTermsAt(slot, P, n, margin, maxRay));
+      // ── §11.10: THE MAPPED SUN'S VISIBILITY IS A TEXEL, NOT A RAY ────────
+      //
+      // three's own shadow coordinate, replicated exactly (ShadowNode
+      // `setupShadowCoord`): `pos = M × (P + n·normalBias)`, `/w`, y flipped,
+      // z ± bias by the depth convention, in-frustum when uv ∈ [0,1] and
+      // z ∈ [0,1]. The map is read with `textureLoad` — a comparison sampler
+      // is fragment-only — and compared here with the same sense the
+      // material's sampler uses (LessEqual, or GreaterEqual under reversed
+      // depth). Cascades near → far, first containing frustum wins; a hit no
+      // cascade covers returns −1 and the caller traces as before.
+      const sunMapVisibility = sunShadow
+        ? () => {
+            const v = float(-1).toVar();
+            const comp = ["x", "y", "z", "w"];
+            for (let c = 0; c < sunShadow.matrices.length; c++) {
+              If(v.lessThan(0).and(int(c).lessThan(sunShadow.count)), () => {
+                const nb = sunShadow.normalBiases[comp[c]];
+                const bias = sunShadow.biases[comp[c]];
+                const size = sunShadow.sizes[comp[c]];
+                const pos = sunShadow.matrices[c].mul(vec4(P.add(n.mul(nb)), 1)).toVar();
+                const coord = pos.xyz.div(pos.w).toVar();
+                const u = coord.x.toVar();
+                const w = float(1).sub(coord.y).toVar();
+                const z = (sunShadow.reversed ? coord.z.sub(bias) : coord.z.add(bias)).toVar();
+                const inside = u.greaterThanEqual(0).and(u.lessThanEqual(1))
+                  .and(w.greaterThanEqual(0)).and(w.lessThanEqual(1))
+                  .and(z.greaterThanEqual(0)).and(z.lessThanEqual(1));
+                If(inside, () => {
+                  const texel = ivec2(
+                    u.mul(size).clamp(0, size.sub(1)),
+                    w.mul(size).clamp(0, size.sub(1)),
+                  );
+                  const d = float(sunShadow.bind(c, texel)).toVar();
+                  v.assign(sunShadow.reversed
+                    ? select(z.greaterThanEqual(d), float(1), float(0))
+                    : select(z.lessThanEqual(d), float(1), float(0)));
+                });
+              });
+            }
+            return v;
+          }
+        : null;
+      /** Is slot `idx` the mapped sun this frame? (null when no bundle) */
+      const isMapped = (idx) => (sunShadow
+        ? int(idx).equal(sunShadow.slot).and(sunShadow.count.greaterThan(0))
+        : null);
+      /**
+       * The visibility of slot `idx` toward `dirTo`: the shadow map when the
+       * slot is the mapped sun and the hit sits in a cascade, the any-hit ray
+       * otherwise. Counts a shadow ray only when one fired.
+       */
+      const slotVisibility = (idx, dirTo, maxT) => {
+        const mapped = isMapped(idx);
+        if (!mapped || !sunMapVisibility) {
+          const v = float(visibility(P, n, dirTo, maxT)).toVar();
+          if (count) count.shadowRays(1);
+          return v;
+        }
+        const v = float(1).toVar();
+        const traced = float(1).toVar();
+        If(mapped, () => {
+          const m = sunMapVisibility();
+          If(m.greaterThanEqual(0), () => { v.assign(m); traced.assign(0); });
+        });
+        If(traced.greaterThan(0), () => {
+          v.assign(float(visibility(P, n, dirTo, maxT)));
+          if (count) count.shadowRays(1);
+        });
+        return v;
+      };
       /** Is slot `idx` (a node or a JS constant) the split sun? */
       const isSplit = (idx) => (splitSlot == null ? null : float(idx).equal(float(splitSlot)));
+      /** Gain only the named analytic directional slot; every other source is 1. */
+      const compensationFor = (idx) => (compensationSlot == null
+        ? float(1)
+        : select(float(idx).equal(float(compensationSlot)), sunGain, float(1)));
+      /** Is slot `idx` the compensated directional source? */
+      const isCompensation = (idx) => (compensationSlot == null
+        ? null
+        : float(idx).equal(float(compensationSlot)));
       if (!visibility || terms.length === 1) {
         // Nothing to win: with no ray there is no expensive call to share, and
         // with one light there is already exactly one call site. Kept as the
         // straight-line form so those two cases stay byte-identical to before.
         for (const [k, t] of terms.entries()) {
           If(t.E.x.max(t.E.y).max(t.E.z).greaterThan(0), () => {
-            const v = visibility ? float(visibility(P, n, t.dirTo, t.maxT)).toVar() : float(1).toVar();
-            if (count && visibility) count.shadowRays(1);
+            const v = visibility ? slotVisibility(k, t.dirTo, t.maxT) : float(1).toVar();
             const mine = isSplit(k);
+            const raw = t.E.mul(v).toVar();
+            const included = mine && !splitKeep ? select(mine, float(0), float(1)) : float(1);
             if (mine) {
               sunVis.assign(select(mine, v, sunVis));
               // `t.E > 0` is the gate this sits under and it ALREADY carries the
               // cosine and `active` (see `lightTermsAt`), so reaching here IS
               // the cosine test — no second dot product.
               sunFacing.assign(select(mine, float(1), sunFacing));
-              E.addAssign(t.E.mul(v).mul(splitKeep ? float(1) : select(mine, float(0), float(1))));
+              E.addAssign(raw.mul(compensationFor(k)).mul(included));
             } else {
-              E.addAssign(t.E.mul(v));
+              E.addAssign(raw.mul(compensationFor(k)));
+            }
+            const compensated = isCompensation(k);
+            if (compensated) {
+              sunRawE.addAssign(select(compensated, raw.mul(included), vec3(0)));
             }
           });
         }
@@ -727,15 +850,20 @@ export function createSrcHitLighting({
             maxT.assign(select(take, terms[k].maxT, maxT));
           }
           If(Ei.x.max(Ei.y).max(Ei.z).greaterThan(0), () => {
-            const v = float(visibility(P, n, dirTo, maxT)).toVar();
-            if (count) count.shadowRays(1);
+            const v = slotVisibility(i, dirTo, maxT);
             const mine = isSplit(i);
+            const raw = Ei.mul(v).toVar();
+            const included = mine && !splitKeep ? select(mine, float(0), float(1)) : float(1);
             if (mine) {
               sunVis.assign(select(mine, v, sunVis));
               sunFacing.assign(select(mine, float(1), sunFacing));
-              E.addAssign(Ei.mul(v).mul(splitKeep ? float(1) : select(mine, float(0), float(1))));
+              E.addAssign(raw.mul(compensationFor(i)).mul(included));
             } else {
-              E.addAssign(Ei.mul(v));
+              E.addAssign(raw.mul(compensationFor(i)));
+            }
+            const compensated = isCompensation(i);
+            if (compensated) {
+              sunRawE.addAssign(select(compensated, raw.mul(included), vec3(0)));
             }
           });
         });
@@ -813,11 +941,15 @@ export function createSrcHitLighting({
       });
     }
 
-    // ── ρ/π · E, with R4's ceiling — applied AT THE HIT (in [E], by
-    //    `createSrcHitAttribution`) and never at an `intensity` prop where an
-    //    artistic gain belongs. The ρ arriving here is ALREADY bounded. ──────
+    // ── ρ/π · E with physical 0..1 first-bounce reflectance. R4's stricter
+    //    0.9 ceiling belongs only to [J]'s recursive atlas term. ─────────────
     const rho = vec3(rhoIn).toVar();
     const out = rho.mul(E).mul(1 / Math.PI).toVar();
+    if (sunRawE) {
+      const neutral = rho.x.min(rho.y).min(rho.z).toVar();
+      const chroma = rho.sub(vec3(neutral)).max(0).toVar();
+      out.addAssign(chroma.mul(sunRawE).mul(sunChromaGain.sub(sunGain)).mul(1 / Math.PI));
+    }
 
     // ── emission, and R5's zeroing ──────────────────────────────────────────
     const Le = vec3(emissiveIn).toVar();
@@ -851,7 +983,7 @@ export function createSrcHitLighting({
     // §12.82: the TRANSFER, not the radiance — `ρ/π · V`, with no cosine and no
     // irradiance in it, because those are exactly the two factors that go stale
     // when the sun turns and exactly the two `[F]` re-evaluates. The `ρ` is the
-    // SAME clamped one the rest of the expression uses, so recombining the two
+    // SAME physical one the rest of the direct expression uses, so recombining the two
     // halves at the deposit's own sun angle is an algebraic identity — which is
     // what `createSrcHitShader` below does and what the gate asserts.
     return {
@@ -895,9 +1027,18 @@ export function createSrcHitShader({
   // What `[F]` will multiply the cached transfer by. The composer needs the
   // same pair, or "recombined" would mean "recombined against something else".
   const closeSun = sunTerm(lighting);
-  return (hit, dir, rayIndex) => {
+  return (hit, dir, rayIndex, sunGain = null, sunChromaGain = null) => {
     const a = attribute(hit, dir);
-    const r = light(a.P, a.n, a.rho, a.emissive, a.emitter, rayIndex);
+    const r = light(
+      a.P,
+      a.n,
+      a.rho,
+      a.emissive,
+      a.emitter,
+      rayIndex,
+      sunGain,
+      sunChromaGain,
+    );
     if (!r.sunTransfer) return r.L;
     const { direction, irradiance } = closeSun();
     return r.L.add(r.sunTransfer.mul(irradiance).mul(vec3(a.n).dot(direction).max(0)));

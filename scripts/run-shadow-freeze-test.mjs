@@ -37,6 +37,7 @@ globalThis.cancelAnimationFrame ??= (id) => clearTimeout(id);
 
 const THREE = await import("three/webgpu");
 const { Engine, registerBuiltInComponents } = await import("../src/engine/index.js");
+const { applySettingsToScene } = await import("../src/engine/sceneSettings.js");
 const { PHASE } = await import("../src/engine/StatsSystem.js");
 
 registerBuiltInComponents();
@@ -378,10 +379,44 @@ check("a project that froze shadows itself is left alone", () => {
   // implementing one.
   const { engine, light } = makeScene();
   engine.settings.shadow = { ...(engine.settings.shadow ?? {}), autoUpdate: false };
+  light.shadow.autoUpdate = false;
   step(engine);
   assert.equal(
     engine.shadowFreeze.frozenLights, 0,
     "the system must take no lights when the project already froze them",
+  );
+  assert.equal(light.shadow.autoUpdate, false, "the authored freeze must remain off");
+});
+
+check("authored one-shot shadows arm a virgin WebGPU light exactly once", () => {
+  const { engine, light } = makeScene();
+  engine.renderer.shadowMap = {};
+  engine.settings.shadow = {
+    ...(engine.settings.shadow ?? {}),
+    autoUpdate: false,
+    needsUpdate: false,
+  };
+  light.shadow.autoUpdate = true;
+  light.shadow.needsUpdate = false;
+  applySettingsToScene(engine.settings, engine.scene, engine.ambientLight, engine.renderer);
+  assert.equal(light.shadow.autoUpdate, false, "one-shot mode must remain non-continuous");
+  assert.equal(light.shadow.needsUpdate, true, "a virgin map needs one render pulse");
+  // Three consumes the pulse after rendering and leaves the map resident.
+  light.shadow.needsUpdate = false;
+  assert.equal(light.shadow.autoUpdate, false, "after the pulse the shadow remains frozen");
+});
+
+check("switching an automatically frozen light to authored one-shot stays frozen", () => {
+  const { engine, light } = makeScene();
+  step(engine);
+  step(engine);
+  assert.equal(light.shadow.autoUpdate, false, "precondition: optimizer owns the light");
+  engine.settings.shadow = { ...(engine.settings.shadow ?? {}), autoUpdate: false };
+  step(engine);
+  assert.equal(
+    light.shadow.autoUpdate,
+    false,
+    "releasing optimizer ownership must not overwrite authored autoUpdate=false",
   );
 });
 

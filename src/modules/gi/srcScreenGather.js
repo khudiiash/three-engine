@@ -109,7 +109,7 @@ import {
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
-import { LOS_OCC_HI, LOS_OCC_LO, LOS_PATH_HI, LOS_PATH_LO, gatherLosWeight, gatherNormalBias, gatherNormalWeightExp, gatherSmoothWeights, worldKeysEnabled } from "./srcMath.js";
+import { LOS_OCC_HI, LOS_OCC_LO, LOS_PATH_HI, LOS_PATH_LO, gatherLosWeight, gatherNormalBias, gatherNormalWeightExp, gatherPlaneDepth, gatherSmoothWeights, worldKeysEnabled } from "./srcMath.js";
 import { SLOT_EMPTY } from "./srcProbes.js";
 
 /** Gather telemetry — the same five failures `srcGather.js` learned to separate. */
@@ -187,6 +187,31 @@ export function createSrcScreenGather(store, tiles, {
   // the distance oracle: the oracle's 27-voxel near field at the march's
   // call count priced the gather ×18 (los-gate run 9); the march only ever
   // asks "is this sample inside geometry", which is one word fetch.
+  // ── §10.7: THE COARSE LATTICE THE GATHER FALLS BACK TO ─────────────────
+  //
+  // `{ lookup, tiles, cascade }` for the NEXT cascade up (c1). Absent, this
+  // file compiles byte-identically to the c0-only gather every gate has ever
+  // measured — which is what keeps `test:gi-src-gather`'s CPU mirror honest
+  // (the harness builds no coarse arm, so the twin cannot diverge).
+  //
+  // WHY. A c0 probe needs a hash SLOT and a bin BLOCK, and on the user's
+  // Bistro the scene wants more of both than the bin budget can back: the
+  // engine's own warning reads `cascade 0 dropped 10774 inserts
+  // (32768/32768)`, and GISystem's grow ladder already concluded that "it
+  // wants more probes than the architecture can back... growing pools can
+  // only ever chase this scene, never catch it". A refused insert is a probe
+  // that DOES NOT EXIST, so every one of its pixels found no corner, returned
+  // `known = false`, and fell to the resolve's far-field constant — black
+  // with the sky off, sky-blue with it on, at probe-cell scale, anchored to
+  // whatever surface the camera had just turned toward. That is the artifact,
+  // and it lands on walls, roofs and street alike because it is a capacity
+  // failure, not a geometric one.
+  //
+  // c1 covers the same volume with an EIGHTH of the probes (6194 live of
+  // 16384 slots on the same frame), so it is never starved, and the merge has
+  // already pushed the whole cascade chain's answer into it. Falling back to
+  // it costs one 8-corner lookup on starved pixels only, and 2.8 MB of atlas.
+  coarse = null,
   losOccupied = null,
   losWorld = null,
 } = {}) {
@@ -209,6 +234,9 @@ export function createSrcScreenGather(store, tiles, {
   // point could actually see). Armed only when the caller supplied the
   // distance closure; a closure-less instance keeps the pre-U3 graph.
   const losArmed = gatherLosWeight() && !!losOccupied && !!losWorld;
+  /** §10.7 — is the coarse-cascade fallback compiled in? A BUILD decision. */
+  const coarseArmed = !!coarse?.lookup && !!coarse?.tiles
+    && globalThis.__giGatherCoarseFallback !== false;
   // The boot receipt the gate asserts (the §12.70 rule: identical-across-arms
   // readings mean "same code path" until an armed line proves otherwise).
   // SCREEN instances only (readPixel present): the closure-only secondary
@@ -240,6 +268,8 @@ export function createSrcScreenGather(store, tiles, {
   const smoothU = uniform(smoothWeights ? 1 : 0);
   /** §12.88's normal bias in metres — see `gatherAt`. Live, defaults to 0. */
   const biasU = uniform(gatherNormalBias());
+  /** §10.6's behind-plane depth cap in metres — see `gatherPlaneDepth`. Live. */
+  const planeDepthU = uniform(gatherPlaneDepth());
   /**
    * §12.89 — how much of the §15 U3 LOS suppression to apply, 0..1. Only
    * meaningful when `losArmed` compiled the march in; 1 is the shipped armed
@@ -300,6 +330,12 @@ export function createSrcScreenGather(store, tiles, {
 
     const out = vec3(0).toVar();
     const shellTotal = float(0).toVar();
+    // §10.7 — COVERAGE, not "a shell answered": Σ over shells of the shell's
+    // own corner coverage (0..1) times its weight. `shellTotal` is the sum of
+    // shell WEIGHTS and is therefore ~1 the moment any corner votes, so it
+    // cannot say HOW WELL the fine lattice answered. This can, and it is the
+    // blend against the coarse arm below.
+    const covTotal = float(0).toVar();
     const cornersHit = uint(0).toVar();
     const cornersCovered = uint(0).toVar();
 
@@ -313,9 +349,15 @@ export function createSrcScreenGather(store, tiles, {
     const losMinCell = losArmed ? float(losWorld.minCell).toVar() : null;
     const losStart = losArmed ? P.add(N.mul(losMinCell)).toVar() : null;
 
-    /** One LOD shell's sparse-trilinear, coverage-weighted gather. */
-    const shell = (lod, shellWeight) => {
-      const s = probeSpacing(0, lod, spacing0).toVar();
+    /**
+     * One LOD shell's sparse-trilinear, coverage-weighted gather, on ONE
+     * cascade's lattice. §10.7 made the cascade a parameter so the coarse
+     * fallback reuses this body verbatim — same weights, same plane test,
+     * same LOS march, same coverage renormalization — rather than growing a
+     * second, subtly different integral.
+     */
+    const makeShell = (cascade, lookupFn, tilesObj, outAcc, totalAcc, covAcc) => (lod, shellWeight) => {
+      const s = probeSpacing(cascade, lod, spacing0).toVar();
       const origin = latticeOrigin(anchor, s).toVar();
       const f = P.sub(origin).div(s).toVar();
       const cell0 = floor(f).toVar();
@@ -391,7 +433,9 @@ export function createSrcScreenGather(store, tiles, {
           // tangent plane fade to the 1e-3 floor (wsum stays alive; a
           // surface with every probe behind it goes DARK, not black).
           const pd = origin.add(cell0.add(vec3(dx, dy, dz)).mul(s)).sub(P).dot(N).toVar();
-          const t = pd.div(s.mul(0.35)).add(1).clamp(0, 1).toVar();
+          // §10.6: the fade depth is capped in METRES — at the coarse shells
+          // 0.35·s is a room, not a wall (see `gatherPlaneDepth`).
+          const t = pd.div(s.mul(0.35).min(planeDepthU)).add(1).clamp(0, 1).toVar();
           const oneSided = t.mul(t).mul(float(3).sub(t.mul(2))).toVar();
           const shaped = nwExp === 1 ? oneSided : oneSided.pow(float(nwExp));
           weight.mulAssign(shaped.max(1e-3));
@@ -445,14 +489,14 @@ export function createSrcScreenGather(store, tiles, {
           // parameter here. Out-of-window cells pack to KEY_EMPTY and the WGSL
           // find answers "absent" for key 0 by its first line, so an
           // unrepresentable corner is a missing corner with no extra guard.
-          const block = lookup(
+          const block = lookupFn(
             packProbeKey(int(lod), uint(0), baseCell.add(ivec3(dx, dy, dz))),
           ).toVar();
           If(block.notEqual(uint(SLOT_EMPTY)), () => {
             // ONE hardware-bilinear tap. rgb is `Σ w_tap·E` over the covered
             // taps and a is `Σ w_tap` over the same ones — see the header on
             // why both ride the accumulation instead of dividing here.
-            const tap = tiles.sampleTileRGBA(block, S).toVar();
+            const tap = tilesObj.sampleTileRGBA(block, S).toVar();
             acc.addAssign(tap.xyz.mul(weight));
             wsum.addAssign(tap.w.mul(weight));
             cornersHit.addAssign(uint(1));
@@ -469,11 +513,16 @@ export function createSrcScreenGather(store, tiles, {
       // probe that never claimed to know (the mirror makes the same
       // distinction, and it is the whole of R1).
       If(wsum.greaterThan(0), () => {
-        out.addAssign(acc.div(wsum).mul(shellWeight));
-        shellTotal.addAssign(shellWeight);
+        outAcc.addAssign(acc.div(wsum).mul(shellWeight));
+        totalAcc.addAssign(shellWeight);
       });
+      // The coverage this shell actually found, weighted like its radiance.
+      // Outside the `If` on purpose: a shell with zero coverage must lower the
+      // fine lattice's confidence, which is the whole signal the fallback runs on.
+      if (covAcc) covAcc.addAssign(wsum.clamp(0, 1).mul(shellWeight));
     };
 
+    const shell = makeShell(0, lookup, tiles, out, shellTotal, covTotal);
     shell(base, float(1).sub(blend));
     // The overlap band is the top 10% of each LOD's span, so most points take
     // this branch uniformly false and pay nothing. Guarded on the WEIGHT rather
@@ -487,6 +536,40 @@ export function createSrcScreenGather(store, tiles, {
     // find some carries full weight. Same renormalize-don't-zero rule, one
     // level up from the corners.
     If(shellTotal.greaterThan(0), () => { out.assign(out.div(shellTotal)); });
+
+    // ── §10.7: WHAT THE FINE LATTICE COULD NOT ANSWER, THE COARSE ONE DOES ──
+    //
+    // `need` is 1 where c0 found no coverage at all and 0 where it answered
+    // fully, so the mix below is the IDENTITY on a healthy pixel — this arm
+    // cannot change a frame the fine lattice already covers, which is why it
+    // ships on rather than behind a quality knob. Guarded on `need` for cost
+    // the same way the second LOD shell is guarded on `blend`: a starved
+    // region is coherent across a warp, so the branch is nearly free where it
+    // is not taken.
+    if (coarseArmed) {
+      const need = float(1).sub(covTotal).clamp(0, 1).toVar();
+      const outC = vec3(0).toVar();
+      const shellTotalC = float(0).toVar();
+      If(need.greaterThan(0.01), () => {
+        const shellC = makeShell(
+          coarse.cascade ?? 1, coarse.lookup, coarse.tiles, outC, shellTotalC, null,
+        );
+        shellC(base, float(1).sub(blend));
+        If(blend.greaterThan(0).and(base.add(1).lessThan(float(maxLods))), () => {
+          shellC(base.add(1), blend);
+        });
+        If(shellTotalC.greaterThan(0), () => {
+          outC.assign(outC.div(shellTotalC));
+          // `covTotal` is the blend, NOT a select: at full fine coverage this
+          // returns `out` unchanged, at zero it returns the coarse answer, and
+          // in between it crossfades — so a pixel walking out of a starved
+          // patch has no edge to show. R1's "no binary anything", applied to a
+          // fallback.
+          out.assign(mix(outC, out, covTotal.clamp(0, 1)));
+          shellTotal.assign(shellTotal.max(shellTotalC));
+        });
+      });
+    }
     // `known` (2026-08-22, the black-rectangle fix): whether ANY coverage was
     // found. A point with none returns irradiance 0 — which is an ABSENCE,
     // not a measurement of darkness — and every consumer that renders it as
@@ -540,7 +623,7 @@ export function createSrcScreenGather(store, tiles, {
       known.assign(select(g.known, float(1), float(0)));
       atomicAdd(stats.element(uint(GG_CORNERS)), g.corners);
       atomicAdd(stats.element(uint(GG_COVERED)), g.covered);
-      If(g.corners.equal(uint(0)), () => {
+      If(g.known.not(), () => {
         atomicAdd(stats.element(uint(GG_EMPTY)), uint(1));
       });
       const lum = E.x.mul(0.2126).add(E.y.mul(0.7152)).add(E.z.mul(0.0722)).toVar();
@@ -577,6 +660,8 @@ export function createSrcScreenGather(store, tiles, {
     normalBias: biasU,
     /** §12.89's LOS suppression strength, live — `__giGatherLosLive` pins it. */
     losStrength: losStrengthU,
+    /** §10.6's behind-plane depth cap (m), live — `__giGatherPlaneDepthLive` pins it. */
+    planeDepth: planeDepthU,
     /** Whether the LOS march was compiled in at all (a BUILD decision). */
     losArmed,
     /** The resolve's primary-diffuse input: one texture load, no storage bindings. */

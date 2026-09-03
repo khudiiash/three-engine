@@ -62,6 +62,7 @@ import {
   vec2,
   vec3,
   vec4,
+  Return,
 } from "three/tsl";
 import { MAX_EMITTERS, analyticDirectAt, decodeOctNormal, emitterDirectAt, emitterSlotShadow } from "./giLight.js";
 import { octDecodeTSL } from "./rayHit/rayHitTSL.js";
@@ -180,6 +181,17 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
   const previousAutoClearStencil = renderer.autoClearStencil;
   const previousBackground = scene.background;
   const previousBackgroundNode = scene.backgroundNode;
+  // The position target uses alpha as its VALID bit, so the prepass clear is
+  // data rather than presentation state: it must be transparent black no
+  // matter which clear colour the main viewport owns. In particular, an
+  // opaque scene background clears alpha to one, making every sky pixel look
+  // like a surface at RGB-as-world-position (normally very near world origin).
+  // The resolve/AO then shades that invented wall. A texture/node background
+  // is worse: three inserts `Background.mesh` into the render list; its
+  // material has `allowOverride = false`, so it survives `overrideMaterial`
+  // and writes its colour + alpha directly into attachment zero.
+  const previousClearColor = renderer.getClearColor(new THREE.Color()).clone();
+  const previousClearAlpha = renderer.getClearAlpha();
   // ⚠ SHADOWS OFF OR THE OVERRIDE POISONS THE SHADOW PASS: a shadow update
   // landing inside a nested override render compiles the override material
   // into the depth-only shadow context — an empty-fragment-struct INVALID
@@ -280,6 +292,12 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
     // GI_DEPTH_LAYER is the bit that says "and this one is safe here".
     if (anyDrawn) camera.layers.enable(GI_DEPTH_LAYER);
   }
+  // A background is presentation, never gbuffer geometry. Remove it for BOTH
+  // passes (not just the mirror-mask redraw), and establish an invalid-sky
+  // clear explicitly instead of inheriting the viewport's opaque clear.
+  scene.background = null;
+  scene.backgroundNode = null;
+  renderer.setClearColor(0x000000, 0);
   scene.overrideMaterial = gbuffer.material;
   renderer.setRenderTarget(gbuffer.rt);
   renderer.setMRT(gbuffer.mrtNode);
@@ -356,8 +374,6 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
       renderer.autoClearColor = false;
       renderer.autoClearDepth = false;
       renderer.autoClearStencil = false;
-      scene.background = null;
-      scene.backgroundNode = null;
       renderer.render(scene, camera);
     }
   } finally {
@@ -375,6 +391,7 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
     renderer.autoClearStencil = previousAutoClearStencil;
     scene.background = previousBackground;
     scene.backgroundNode = previousBackgroundNode;
+    renderer.setClearColor(previousClearColor, previousClearAlpha);
     renderer.setMRT(previousMRT);
     renderer.setRenderTarget(previousTarget);
     renderer.transparent = previousTransparent;
@@ -415,7 +432,14 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
 export function createGiFarFieldAvgPass({ source, width, height, out }) {
   const srcNode = texture(source);
   const FX = 256;
-  const accum = instancedArray(new Uint32Array(4), "uint").toAtomic();
+  // [0..2] sum rgb (fixed point), [3] lit count, [4] DARK count (geometry the
+  // gather covered but read <= 0.001 luminance), [5] covered count. The dark
+  // share is the "black patches" gauge: it rides in the far-field texture's
+  // alpha and `profile.giPasses` reports it as `srcProbes.farField.darkFrac`.
+  // [6] FILL count: covered geometry whose resolve validity (alpha) is below
+  // 0.5, i.e. pixels the gather could not answer and the far-field constant
+  // (or a neighbour) filled — the honest gauge for "patches with no data".
+  const accum = instancedArray(new Uint32Array(7), "uint").toAtomic();
   const ema = instancedArray(new Float32Array(4), "float");
   const widthU = uint(width);
   const computeAccum = Fn(() => {
@@ -423,11 +447,19 @@ export function createGiFarFieldAvgPass({ source, width, height, out }) {
     const coord = ivec2(i.mod(widthU).toInt(), i.div(widthU).toInt());
     const t = srcNode.load(coord).toVar();
     const lum = t.x.mul(0.2126).add(t.y.mul(0.7152)).add(t.z.mul(0.0722));
-    If(t.w.greaterThan(0.5).and(lum.greaterThan(0.001)), () => {
-      atomicAdd(accum.element(uint(0)), t.x.min(32).mul(FX).toUint());
-      atomicAdd(accum.element(uint(1)), t.y.min(32).mul(FX).toUint());
-      atomicAdd(accum.element(uint(2)), t.z.min(32).mul(FX).toUint());
-      atomicAdd(accum.element(uint(3)), uint(1));
+    If(t.w.lessThan(0.5).and(t.w.greaterThan(0.001)), () => {
+      atomicAdd(accum.element(uint(6)), uint(1));
+    });
+    If(t.w.greaterThan(0.5), () => {
+      atomicAdd(accum.element(uint(5)), uint(1));
+      If(lum.greaterThan(0.001), () => {
+        atomicAdd(accum.element(uint(0)), t.x.min(32).mul(FX).toUint());
+        atomicAdd(accum.element(uint(1)), t.y.min(32).mul(FX).toUint());
+        atomicAdd(accum.element(uint(2)), t.z.min(32).mul(FX).toUint());
+        atomicAdd(accum.element(uint(3)), uint(1));
+      }).Else(() => {
+        atomicAdd(accum.element(uint(4)), uint(1));
+      });
     });
   })().compute(width * height);
   const computeEma = Fn(() => {
@@ -458,12 +490,22 @@ export function createGiFarFieldAvgPass({ source, width, height, out }) {
       // the full-strength energy: keep 35% of the chroma, damp to 60%.
       const pubLum = next.x.mul(0.2126).add(next.y.mul(0.7152)).add(next.z.mul(0.0722));
       const shaped = mix(vec3(pubLum), next, 0.35).mul(0.6);
+      const covered = atomicLoad(accum.element(uint(5))).toFloat().max(1);
+      const darkFrac = atomicLoad(accum.element(uint(4))).toFloat().div(covered);
+      const filled = atomicLoad(accum.element(uint(6))).toFloat();
+      const fillFrac = filled.div(covered.add(filled));
       textureStore(out, ivec2(0, 0), vec4(shaped, 1));
+      // The readback blit forces alpha to 1, so the gauge lives in a second
+      // texel's colour channels (the texture is 2x1; the resolve reads (0,0)).
+      textureStore(out, ivec2(1, 0), vec4(darkFrac, covered.div(1e6), fillFrac, 1));
     });
     atomicStore(accum.element(uint(0)), uint(0));
     atomicStore(accum.element(uint(1)), uint(0));
     atomicStore(accum.element(uint(2)), uint(0));
     atomicStore(accum.element(uint(3)), uint(0));
+    atomicStore(accum.element(uint(4)), uint(0));
+    atomicStore(accum.element(uint(5)), uint(0));
+    atomicStore(accum.element(uint(6)), uint(0));
   })().compute(1);
   return { computeAccum, computeEma };
 }
@@ -539,7 +581,7 @@ export function createGiFarFieldAvgPass({ source, width, height, out }) {
  * volume's LIVE world uniforms, so every F2 slide moves the feather with the
  * box for free.
  */
-export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, screenRadiance = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, ao = null, vxao = null, rawCopy = null, emitterTileCut = null, farField = null }) {
+export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, screenRadiance = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, ao = null, vxao = null, rawCopy = null, emitterTileCut = null, farField = null, bounceWeight = null, reflectionsEnabled = null }) {
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
@@ -577,7 +619,13 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
     // every arm without an explicit validity source (the legacy closure
     // gather, background pixels) behaves exactly as before.
     const knownF = float(1).toVar();
-    If(g0.w.greaterThan(0.5), () => {
+    // Position alpha and a real normal are one validity contract. The normal
+    // half is deliberately repeated here even though the gbuffer producer
+    // writes both together: a background material can write attachment zero
+    // while leaving the normal attachment clear. Treating that split write as
+    // geometry normalizes zero and turns a sky pixel into NaN AO at the world
+    // origin.
+    If(g0.w.greaterThan(0.5).and(g1.xyz.dot(g1.xyz).greaterThan(0.25)), () => {
       const P = g0.xyz.toVar();
       const rawN = g1.xyz.normalize().toVar();
       const facing = step(0, rawN.dot(cameraPosition ? vec3(cameraPosition).sub(P) : rawN)).mul(2).sub(1);
@@ -648,9 +696,15 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       //
       // Applied to the GATHER term only: emitter/analytic direct have real
       // traced shadows (penumbra estimator) — obscuring them twice reads as
-      // dirt. Reflections keep their own visibility. The block compiles out
-      // when the component's `ao` prop is off (structural), and is gated on
-      // having a diffuse term at all — with none, `out` is zero here.
+      // dirt. Reflections keep their own visibility. In particular, this AO is
+      // a scalar HEMISPHERE estimate: applying it to the directional glossy
+      // lookup makes a smooth metal go black on tiers where the exact trace is
+      // absent or on pixels where it misses. A mirror ray and a cosine
+      // hemisphere do not share an occlusion factor.
+      //
+      // The block compiles out when the component's `ao` prop is off
+      // (structural), and is gated on having a diffuse term at all — with none,
+      // `out` is zero here.
       if ((gather || screenGather) && (ao?.node || vxao?.node)) {
         const aoUv = vec2(px.toFloat().add(0.5).div(width), py.toFloat().add(0.5).div(height));
         let factor = ao?.node ? ao.node.sample(aoUv).level(0).x : float(1);
@@ -723,7 +777,11 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
           factor = factor.min(weight.greaterThan(1e-4).select(vxFactor, float(1)));
           }
         }
-        out.mulAssign(factor);
+        // AO is a live feature switch. Its capability and sample stay in this
+        // graph so an Inspector toggle cannot invalidate world data or force a
+        // new resolve pipeline; disabled resolves exactly to factor 1.
+        const aoActive = ao?.enabled ?? vxao?.enabled ?? float(1);
+        out.mulAssign(mix(float(1), factor, float(aoActive).clamp(0, 1)));
       }
       // ── §13 F3: THE FAR FIELD IS DELIBERATE, NOT AN ACCIDENT ────────────
       // Runs AFTER the AO block on purpose: the AO oracle's occupancy taps
@@ -740,7 +798,21 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
           .min(rel.y.min(size.y.sub(rel.y)))
           .min(rel.z.min(size.z.sub(rel.z)))
           .toVar();
-        const w = float(1).sub(inside.div(float(farField.feather).max(1e-3)).clamp(0, 1)).toVar();
+        const wBox = float(1).sub(inside.div(float(farField.feather).max(1e-3)).clamp(0, 1)).toVar();
+        // -- NEVER BLACK (2026-09-02): the second reason for the constant --
+        // A pixel whose gather found NO coverage (a probe born this frame, a
+        // column the camera just revealed, an orphan bin with no parent)
+        // used to leave the resolve at zero and rely on the temporal filter
+        // finding a valid neighbour; with none, the pixel stayed black: the
+        // "black patches as I move" report. Now the scene's far-field mean
+        // fills it, weighted by the missing coverage, and the validity stays
+        // BELOW the filter's 0.5 adoption threshold so a real neighbour still
+        // wins over the constant when one exists. `farField.coverage === false`
+        // keeps the box-only behaviour.
+        const wCov = farField.coverage === false
+          ? float(0).toVar()
+          : float(1).sub(knownF).clamp(0, 1).toVar();
+        const w = wBox.max(wCov).toVar();
         If(w.greaterThan(0), () => {
           // Sky-down hemisphere with a ground-bounce floor: up-facing 1.0,
           // walls 0.6, down-facing 0.2 — the average already contains the
@@ -751,8 +823,9 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
           out.assign(mix(out, constant, w));
           // A pixel the far-field constant covers is ANSWERED, whatever the
           // gather knew — the deliberate F3 constant is a value, not an
-          // absence.
-          knownF.assign(knownF.max(w));
+          // absence. The coverage fill is NOT: it stays below 0.5 so the
+          // temporal filter still adopts a real neighbour over it.
+          knownF.assign(knownF.max(wBox).max(wCov.mul(0.49)));
         });
       }
       // ── GLOSSY RADIANCE, FROM THE HALF-RES GATHER PASS (§12.71b v2) ─────
@@ -765,14 +838,24 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       // radiance temporal filter tames the single-bin noise that made v1
       // opt-in, and this kernel pays one bilinear sample. Written to the
       // radiance target pre-multiplied by intensity — the same convention as
-      // the closure path, so giLight's specular blend is unchanged.
+      // the closure path, so giLight's specular blend is unchanged. This is a
+      // DIRECTIONAL radiance estimate and deliberately does not inherit the
+      // diffuse hemisphere-AO scalar above.
       if (screenRadiance) {
         const ruv = vec2(px.toFloat().add(0.5).div(width), py.toFloat().add(0.5).div(height));
-        reflectedOut.assign(screenRadiance.sample(ruv).level(0).xyz.mul(intensity));
+        reflectedOut.assign(
+          screenRadiance.sample(ruv).level(0).xyz
+            .mul(intensity)
+            .mul(reflectionsEnabled ? float(reflectionsEnabled).clamp(0, 1) : 1),
+        );
       } else if (radiance?.lookup && cameraPosition) {
         const incident = P.sub(cameraPosition).normalize().toVar();
         const reflected = reflect(incident, N).toVar();
-        reflectedOut.assign(vec3(radiance.lookup(samplePoint, reflected)).mul(intensity));
+        reflectedOut.assign(
+          vec3(radiance.lookup(samplePoint, reflected))
+            .mul(intensity)
+            .mul(reflectionsEnabled ? float(reflectionsEnabled).clamp(0, 1) : 1),
+        );
       }
       if (emitter) {
         // The per-slot shadows come pre-traced and pre-filtered from the
@@ -849,6 +932,11 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
       // reflection hit shading moved out for the same reason (§14 R-A) —
       // see createGiBvhHitShade below.
     });
+    // Bounce is the live weight of the complete diffuse GI contribution, not
+    // merely the feedback-loop gain. Keeping this multiply at the final store
+    // makes Off immediately and visibly zero the term while leaving glossy
+    // reflections independent and preserving one stable compute graph.
+    out.mulAssign(bounceWeight ? float(bounceWeight).clamp(0, 1) : 1);
     textureStore(irradiance, coord, vec4(out, knownF));
     if (rawCopy) textureStore(rawCopy, coord, vec4(out, knownF));
     textureStore(radianceTarget, coord, vec4(reflectedOut, 1));
@@ -912,12 +1000,23 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
  * shipping graph is byte-identical to the pre-instrument one and this cannot
  * become a silent 4-multiply tax on every reflected pixel.
  */
-export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveWidth = width, resolveHeight = height, gather = null, cameraPosition = null, normalOffset, intensity, emitter = null, rawCopy = null, probes = null, sourceStride = 1, termMask = null, staticOcclude = null, dynOcclude = null, shadowReach = null }) {
+/**
+ * The sampled-target replication is a startup fail-safe, not a redundant
+ * steady-state contract: until the temporal pipeline is alive the target must
+ * still contain the unfiltered hit shade. Keep it on by default; the hatch is
+ * only for measuring the storage-write cost after the temporal chain settles.
+ */
+export function giBvhHitShadeReplicatesTarget(rawCopy, hatch = globalThis.__giBvhReplicateRaw) {
+  return !!rawCopy && hatch !== false;
+}
+
+export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveWidth = width, resolveHeight = height, gather = null, cameraPosition = null, normalOffset, intensity, emitter = null, rawCopy = null, probes = null, sourceStride = 1, termMask = null, staticOcclude = null, dynOcclude = null, shadowReach = null, bounceWeight = null }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
   const bvhTNode = texture(bvhShade.hit);
   const bvhAlbedoNode = texture(bvhShade.albedo);
+  const replicateTarget = giBvhHitShadeReplicatesTarget(rawCopy);
   // width/height is the SHADE grid (half the resolve by default — see
   // createGiBvhTarget's bvhRadiance note); the gbuffer and the prepass's
   // hit/albedo textures live on the resolve grid. The mapping FLOORS
@@ -1043,7 +1142,12 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
           // Direct terms only when there is no gather — a reflected surface then
           // shows its emitter/analytic lighting and no bounce, which is dim but
           // correct, where a missing base would have been black.
-          const hitE = (gather ? vec3(gather(shadePoint, nFace, vec3(0))) : vec3(0)).toVar();
+          // Bounce is a live contribution weight at reflected hits too. Its
+          // zero arm skips SRC/probe sampling while direct lighting below
+          // remains alive, matching the primary resolve's Bounce=Off meaning.
+          const hitE = vec3(0).toVar();
+          const addIndirect = () => {
+            hitE.assign(gather ? vec3(gather(shadePoint, nFace, vec3(0))) : vec3(0));
           // Term 1 of 4 — see the termMask note on this function.
           if (termMask) hitE.mulAssign(termMask.x);
           // R-C STOPGAP (2026-08-22, "many artifacts" on the chrome box):
@@ -1123,6 +1227,13 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
             // Term 2 of 4. This one REPLACES rather than adds, so the mask
             // fades between "no probe influence at all" and the shipped blend.
             hitE.assign(termMask ? mix(hitE, probeBlend, termMask.y) : probeBlend);
+          }
+            if (bounceWeight) hitE.mulAssign(float(bounceWeight).clamp(0, 1));
+          };
+          if (bounceWeight) {
+            If(float(bounceWeight).greaterThan(1e-4), addIndirect);
+          } else {
+            addIndirect();
           }
           // ── HIT SHADOWS DEFAULT ON AT EVERY DENSITY (§14 R-A) ────────────
           //
@@ -1212,7 +1323,7 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
                 }
               : { ...emitter, shadowSample: () => float(1) };
             // Term 3 of 4.
-            const emitterTerm = vec3(emitterDirectAt(hitParams, hitP, nFace, shadePoint).irradiance).toVar();
+            const emitterTerm = vec3(emitterDirectAt(hitParams, hitP, nFace, shadePoint, { rolled: globalThis.__giRolledDirect !== false }).irradiance).toVar();
             hitE.addAssign(termMask ? emitterTerm.mul(termMask.z) : emitterTerm);
           }
           if (bvhShade.lightSlots?.length) {
@@ -1310,7 +1421,7 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
             // rendered directly took zero: the user's "very reflective
             // materials ignore lighting, appearing too bright".
             // Term 4 of 4.
-            const analyticTerm = vec3(analyticDirectAt(bvhShade.lightSlots, hitP, nFace, lightShadowFn, true)).toVar();
+            const analyticTerm = vec3(analyticDirectAt(bvhShade.lightSlots, hitP, nFace, lightShadowFn, true, { rolled: globalThis.__giRolledDirect !== false })).toVar();
             hitE.addAssign(termMask ? analyticTerm.mul(termMask.w) : analyticTerm);
           }
           // ×intensity to match the convention of the term this is mixed WITH
@@ -1343,12 +1454,11 @@ export function createGiBvhHitShade({ gbuffer, bvhShade, width, height, resolveW
         });
       }
     });
-    // §12.65 fail-safe contract, same as the resolve's: this pass writes the
-    // sampled target itself, and the hit-radiance temporal filter (when
-    // alive) overwrites it later in the same frame — a filter whose pipeline
-    // never lands degrades to the unfiltered image, never to black.
-    textureStore(bvhShade.target, coord, vec4(bvhOut, bvhValid));
+    // The RAW texture feeds the temporal filter. Replicate to the sampled
+    // target until explicitly disabled for an A/B: that is the fail-open image
+    // while the async filter pipeline is compiling (or if it never lands).
     if (rawCopy) textureStore(rawCopy, coord, vec4(bvhOut, bvhValid));
+    if (!rawCopy || replicateTarget) textureStore(bvhShade.target, coord, vec4(bvhOut, bvhValid));
   })().compute(width * height);
 
   return { compute, widthU };
@@ -1866,11 +1976,12 @@ export function createGiRtaoPass({
  *
  * ⛔ NO TEMPORAL. Standing user directive, and GTAO normally ships WITH a
  * 6-frame temporal rotation — that half is deliberately not taken. The
- * pattern is Jimenez's 4×4 SPATIAL one (16 slice rotations × 4 step offsets
- * over a 4×4 pixel tile), jittered inside each cell so the tile has no phase
- * to print, and the existing separable bilateral reconstructs across it. A
- * frozen pattern's error is spatial noise, which a filter removes; an
- * animated one's error is ghosting, which nothing downstream can.
+ * cheaper tiers use Jimenez's 4×4 SPATIAL idea (16 slice rotations × 4 step
+ * offsets over a 4×4 pixel tile), jittered inside each cell and reconstructed
+ * by the existing separable bilateral. Ultra instead evaluates five centred
+ * slices at every full-resolution pixel and keeps only the four stable
+ * radial strata across neighbours. Its angular error is smooth quadrature
+ * error, while the filter resolves the radial phases without temporal history.
  *
  * ⚠ EVERY CONSTANT HERE IS A FRACTION OR A PIXEL COUNT — never a metre.
  * `radius` arrives derived from the cascade (see #armGtaoPass), the falloff
@@ -1878,6 +1989,20 @@ export function createGiRtaoPass({
  * a fraction of the frame height. Metre constants are the class this module
  * has now retracted three times.
  */
+// The one-cone world-AO estimator distributes the retired six-cone quadrature
+// over screen pixels. Two phases carry the axial cone and five carry its side
+// cones, hence the 2:1 weights after a complete seven-phase resolve.
+export const GI_WORLD_AO_PHASE_PERIOD = 7;
+export const GI_WORLD_AO_PHASE_STRIDE_Y = 3;
+// The density-cone estimator is biased open on the measured hidden-floor
+// fixture (0.9555 versus exact ray truth 0.9078). Squaring maps it to 0.9130,
+// while preserving the only invariant that may not move: response(1) == 1.
+export const GI_WORLD_AO_VISIBILITY_POWER = 2;
+export function giWorldAoResponse(visibility) {
+  const v = Math.max(0, Math.min(1, Number(visibility) || 0));
+  return v ** GI_WORLD_AO_VISIBILITY_POWER;
+}
+
 export function createGiGtaoPass({
   gbuffer,
   width,
@@ -1890,8 +2015,16 @@ export function createGiGtaoPass({
   projScale,
   strength,
   radius,
+  // Optional large-scale visibility from the GI occupancy pyramid. GTAO owns
+  // contacts; this closes the off-screen/hidden-occluder half without binding
+  // the occupancy buffer in the already budget-tight resolve.
+  traceConeAO = null,
+  voxel = null,
+  worldRadius = null,
+  worldSteps = 6,
   slices = 3,
   steps = 3,
+  spatialJitter = true,
   target = null,
 }) {
   if (!target) {
@@ -1967,10 +2100,10 @@ export function createGiGtaoPass({
    * same point (2026-08-26, `probe:gi-gtao` ARM=raytraced).
    *
    * A diagonal ω needs |offset| ≥ √2 before BOTH axes are guaranteed to
-   * cross a texel boundary; the pass also runs at half the gbuffer
-   * resolution, so one AO pixel is `sx` gbuffer texels and stepping less
-   * than that re-reads the same neighbourhood at a higher cost per unit of
-   * new information. The larger of the two is the floor, and the reach
+   * cross a texel boundary; on cheaper tiers the pass also runs at half the
+   * gbuffer resolution, so one AO pixel is `sx` gbuffer texels and stepping
+   * less than that re-reads the same neighbourhood at a higher cost per unit
+   * of new information. The larger of the two is the floor, and the reach
    * clamp below is raised to match so the quadratic distribution is not
    * entirely swallowed by it.
    */
@@ -1985,14 +2118,17 @@ export function createGiGtaoPass({
    * floor), w = the screen reach in gbuffer texels. Read by `probe:gi-gtao`.
    */
   const DEBUG = globalThis.__giGtaoDebug === true;
+  const SPATIAL_JITTER = spatialJitter !== false;
+  const WORLD_STEPS = Math.max(4, Math.min(12, Math.round(worldSteps)));
+  const WORLD_CONE_TAN_HALF = Math.tan(Math.PI / 6);
 
   const compute = Fn(() => {
     const px = instanceIndex.mod(widthU);
     const py = instanceIndex.div(widthU);
-    // The gbuffer is FULL resolve resolution while this pass runs at half —
-    // deliberately, and it is a large part of why GTAO is cheap here: the
-    // horizon march reads full-resolution positions (so contacts stay sharp)
-    // while only a quarter of the pixels pay for a march at all.
+    // The gbuffer is always FULL resolve resolution. Cheaper tiers run this
+    // pass at half, so horizon taps still read full-resolution positions while
+    // only a quarter of the pixels pay for a march; Ultra runs it one-to-one
+    // to preserve silhouettes and the structured sampling pattern.
     const baseX = px.toFloat().add(0.5).mul(sx).toVar();
     const baseY = py.toFloat().add(0.5).mul(sy).toVar();
     const sourceCoord = ivec2(
@@ -2005,6 +2141,10 @@ export function createGiGtaoPass({
     const refVis = DEBUG ? float(0).toVar() : null;
     const raised = DEBUG ? float(0).toVar() : null;
     const dbgReach = DEBUG ? float(0).toVar() : null;
+    // Kept separate from GTAO until AFTER both estimators have been spatially
+    // integrated. E[min(G, V_i)] is biased dark; min(G, E[V_i]) is the
+    // intended union of the screen and world visibility estimates.
+    const worldAo = float(1).toVar();
 
     // Both channels, not just `position.w`: a sky texel's normal is ZERO and
     // `normalize(0)` would write NaN into a texture the resolve multiplies
@@ -2044,26 +2184,39 @@ export function createGiGtaoPass({
 
       if (DEBUG) dbgReach.assign(rPix);
 
-      // ── THE PATTERN: JIMENEZ 4×4, SPATIAL ONLY ──────────────────────────
+      // ── THE PATTERN: SPATIAL STRATA OR FULL PER-PIXEL QUADRATURE ────────
       //
-      // 16 slice rotations and 4 step offsets tile a 4×4 pixel block, so a
-      // filter whose support spans that block sees every rotation exactly
-      // once — the same bargain the ray-traced arm struck with its 2×2 quad
-      // strata, one order wider. The IGN jitter is added INSIDE each cell:
-      // without it the fixed tile prints itself as a 4×4 grid wherever the
-      // bilateral cannot average (silhouettes, thin geometry), and with it
-      // the residual is noise the filter is built to eat.
+      // On cheaper tiers, 16 slice rotations and 4 step offsets tile a 4×4
+      // pixel block, so a filter spanning that block sees the full set while
+      // only one quarter of the pixels pay for it. Ultra has enough samples
+      // per pixel to skip that bargain and uses one fixed centred pattern.
+      // The IGN jitter is therefore only consumed by the stratified tiers.
       const ix = px.bitAnd(uint(3)).toFloat().toVar();
       const rotIdx = px.add(py).bitAnd(uint(3)).toFloat().mul(4).add(ix).toVar();
       const offIdx = py.sub(px).bitAnd(uint(3)).toFloat().toVar();
-      const ign = fract(
-        fract(px.toFloat().mul(0.06711056).add(py.toFloat().mul(0.00583715))).mul(52.9829189),
-      ).toVar();
+      // Half-res tiers jitter within each stratum to trade an enlarged 4x4
+      // grid for filterable noise. Ultra supplies enough angular/radial
+      // samples at every full-resolution pixel to use one centred pattern
+      // everywhere. Keeping the 4x4 phase there merely prints quadrature
+      // error as the stipple the user sees on otherwise smooth walls.
+      const ign = SPATIAL_JITTER
+        ? fract(fract(px.toFloat().mul(0.06711056).add(py.toFloat().mul(0.00583715))).mul(52.9829189)).toVar()
+        : float(0.5).toVar();
+      // Radial phase is always spatial. A fixed phase copies depth edges at
+      // each marched radius; stable interleaved-gradient noise turns those
+      // coherent echoes into sub-pixel error for the bilateral to remove.
       const ign2 = fract(
         fract(px.toFloat().add(37).mul(0.06711056).add(py.toFloat().add(17).mul(0.00583715)))
           .mul(52.9829189),
       ).toVar();
-      const rot = rotIdx.add(ign).div(16).toVar();
+      const rot = SPATIAL_JITTER
+        ? rotIdx.add(ign).div(16).toVar()
+        : float(0.5).toVar();
+      // Radial samples MUST retain a spatial phase even on Ultra. Fixing this
+      // to 0.5 made every pixel test the same four radii, so a depth edge was
+      // copied into four detached, concentric bands. The stable four-stratum
+      // pattern is filterable and never changes over time. Only the angular
+      // pattern is fixed per Ultra pixel.
       const stepNoise = offIdx.add(ign2).div(4).toVar();
 
       const visibility = float(0).toVar();
@@ -2187,12 +2340,86 @@ export function createGiGtaoPass({
       // no magic scale, which is the point of the closed form.
       const vis = visibility.div(SLICES).clamp(0, 1).toVar();
       ao.assign(mix(float(1), vis, float(strength).clamp(0, 1)));
+
+      // ── WORLD VISIBILITY: ONE STRATIFIED OCCUPANCY CONE PER PIXEL ───────
+      //
+      // GTAO can only see the depth image. A wall just outside the frame, the
+      // roof above an arcade, or geometry hidden behind the receiver therefore
+      // contributes no occlusion at all — exactly the large-scale indirect
+      // shadow the radiance field is supposed to carry. The occupancy pyramid
+      // already contains those blockers, so sample it here rather than asking
+      // GTAO to grow beyond the screen.
+      //
+      // The retired VXAO pass fired SIX cones per half-res pixel and cost
+      // 10.94 ms on Sponza. This fires ONE. A 7-state spatial pattern encodes
+      // the same cosine weights as its six-cone quadrature: two states choose
+      // the normal cone, and one state chooses each of five 60° side cones.
+      // The X filter resolves exactly one complete seven-state cycle; the
+      // ordinary Y filter then smooths that result with no temporal history.
+      // Stable scene + stable camera = stable answer; motion never reuses an
+      // old frame.
+      //
+      // Composition is min(), not multiplication. The two estimators overlap
+      // around contacts, and min lets either reveal a blocker without charging
+      // it twice. The factor is consumed only by indirect diffuse; direct and
+      // directional/exact reflection paths keep their own visibility.
+      if (traceConeAO && voxel != null && worldRadius != null) {
+        // Same continuous Duff/Frisvad frame as the full VXAO arm. No up-vector
+        // branch means no seam as a normal crosses an axis.
+        const sgn = select(N.z.greaterThanEqual(0), float(1), float(-1)).toVar();
+        const oa = float(-1).div(sgn.add(N.z)).toVar();
+        const ob = N.x.mul(N.y).mul(oa).toVar();
+        const T = vec3(
+          N.x.mul(N.x).mul(oa).mul(sgn).add(1),
+          ob.mul(sgn),
+          N.x.mul(sgn).negate(),
+        ).toVar();
+        const B = vec3(ob, N.y.mul(N.y).mul(oa).add(sgn), N.y.negate()).toVar();
+
+        // 2/7 axial + 1/7 for each side cone is exactly
+        // 1 : 5×cos(60°), normalized — the old six-cone quadrature's weights.
+        const state = px.add(py.mul(uint(GI_WORLD_AO_PHASE_STRIDE_Y)))
+          .mod(uint(GI_WORLD_AO_PHASE_PERIOD)).toVar();
+        // Convert before subtracting: u32 state 0/1 would otherwise underflow
+        // to ~4.29e9 and feed huge, needless angles to sin/cos in axial lanes.
+        const side = state.toFloat().sub(2).max(0).toVar();
+        const angle = side.mul((2 * Math.PI) / 5).toVar();
+        const sideDir = N.mul(0.5)
+          .add(T.mul(cos(angle).mul(Math.sqrt(0.75))))
+          .add(B.mul(sin(angle).mul(Math.sqrt(0.75))))
+          .normalize()
+          .toVar();
+        const coneDir = select(state.lessThan(uint(2)), N, sideDir).toVar();
+
+        const vox = vec3(voxel).toVar();
+        const finest = vox.x.min(vox.y).min(vox.z).mul(2).toVar();
+        const origin = P.add(N.mul(finest.mul(1.5))).toVar();
+        const worldVis = float(traceConeAO(
+          origin,
+          coneDir,
+          finest.mul(0.5),
+          float(worldRadius).max(finest.mul(6)),
+          {
+            tanHalf: WORLD_CONE_TAN_HALF,
+            steps: WORLD_STEPS,
+            receiverP: P,
+            receiverN: N,
+          },
+        )).clamp(0, 1).toVar();
+        // Store RAW visibility. The seven spatial phases are samples of one
+        // hemisphere integral, so the response curve belongs after their
+        // bilateral mean: E[V²] would be a different, darker estimator than
+        // E[V]² and would put the phase variance back into the image.
+        worldAo.assign(worldVis);
+      }
     });
 
     textureStore(
       target,
       ivec2(px.toInt(), py.toInt()),
-      DEBUG ? vec4(ao, refVis.div(SLICES), raised.div(SLICES), dbgReach) : vec4(ao, 0, 0, 1),
+      DEBUG
+        ? vec4(ao, refVis.div(SLICES), raised.div(SLICES), dbgReach)
+        : vec4(ao, worldAo, 0, 1),
     );
   })().compute(width * height);
 
@@ -2237,7 +2464,30 @@ export function createGiGtaoPass({
  * "about as far as a 2-tap-radius neighbour can legitimately be", at every
  * distance and every field of view.
  */
-export function createGiAoFilterPass({ gbuffer, source, target, width, height, resolveWidth = width, resolveHeight = height, cameraPosition, projScale, axisX = 0, axisY = 0, radius = 2 }) {
+/**
+ * Build the two one-dimensional AO filter kernels. Exported because the
+ * seven-phase world estimator's energy is a testable CPU-side invariant, not
+ * a visual tuning claim.
+ */
+export function giAoFilterWeights(radius = 2, worldPhaseResolve = false) {
+  const gtaoRadius = Math.max(1, Math.min(6, Math.round(radius)));
+  const supportRadius = worldPhaseResolve
+    ? Math.max(gtaoRadius, (GI_WORLD_AO_PHASE_PERIOD - 1) / 2)
+    : gtaoRadius;
+  const sigma = Math.max(0.6, gtaoRadius / 2);
+  const gtao = [];
+  for (let k = -supportRadius; k <= supportRadius; k++) {
+    gtao.push(Math.abs(k) <= gtaoRadius ? Math.exp(-(k * k) / (2 * sigma * sigma)) : 0);
+  }
+  const total = gtao.reduce((a, b) => a + b, 0);
+  for (let i = 0; i < gtao.length; i++) gtao[i] /= total;
+  const world = worldPhaseResolve
+    ? gtao.map(() => 1 / GI_WORLD_AO_PHASE_PERIOD)
+    : [...gtao];
+  return { supportRadius, gtao, world };
+}
+
+export function createGiAoFilterPass({ gbuffer, source, target, width, height, resolveWidth = width, resolveHeight = height, cameraPosition, projScale, axisX = 0, axisY = 0, radius = 2, combineChannels = false, worldPhaseResolve = false, worldStrength = null }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
@@ -2269,35 +2519,32 @@ export function createGiAoFilterPass({ gbuffer, source, target, width, height, r
   // full-resolution pixels. Past that the plane test starts being the only
   // thing holding a crease together, and a crease narrower than the support
   // is what AO exists to draw.
-  const RADIUS = Math.max(1, Math.min(6, Math.round(radius)));
-  const SIGMA = Math.max(0.6, RADIUS / 2);
-  const WEIGHTS = [];
-  for (let k = -RADIUS; k <= RADIUS; k++) WEIGHTS.push(Math.exp(-(k * k) / (2 * SIGMA * SIGMA)));
-  {
-    const total = WEIGHTS.reduce((a, b) => a + b, 0);
-    for (let i = 0; i < WEIGHTS.length; i++) WEIGHTS[i] /= total;
-  }
+  const FILTER = giAoFilterWeights(radius, worldPhaseResolve);
+  const RADIUS = FILTER.supportRadius;
   const compute = Fn(() => {
     const px = instanceIndex.mod(widthU);
     const py = instanceIndex.div(widthU);
     const coord = ivec2(px.toInt(), py.toInt());
     const gCoord = gbufferCoord(px, py).toVar();
     const g0 = positionNode.load(gCoord).toVar();
-    const centre = sourceNode.load(coord).x.toVar();
+    // x = screen-space estimate; y = optional stratified world estimate. The
+    // latter must stay independent through both separable passes so a single
+    // binary-ish cone cannot dark-bias GTAO before its neighbourhood integral.
+    const centre = sourceNode.load(coord).xy.toVar();
     const out = centre.toVar();
-    If(g0.w.greaterThan(0.5), () => {
+    const nRaw = normalNode.load(gCoord).xyz.toVar();
+    If(g0.w.greaterThan(0.5).and(nRaw.dot(nRaw).greaterThan(0.25)), () => {
       const P = g0.xyz.toVar();
-      const N = normalNode.load(gCoord).xyz.normalize().toVar();
+      const N = nRaw.normalize().toVar();
       const dist = vec3(cameraPosition).sub(P).length().max(1e-3).toVar();
       // 4 AO-buffer pixels. `projScale` is written for the RESOLVE grid, so a
       // coarser AO buffer has proportionally larger pixels and the tolerance
       // has to grow with them — otherwise a half-res AO rejects its own
       // legitimate neighbours and the filter degrades to a no-op.
       const tol = dist.div(float(projScale).max(1e-3)).mul(4 * gx).max(1e-4).toVar();
-      const sum = float(0).toVar();
-      const wsum = float(0).toVar();
+      const sum = vec2(0).toVar();
+      const wsum = vec2(0).toVar();
       for (let k = -RADIUS; k <= RADIUS; k++) {
-        const w0 = WEIGHTS[k + RADIUS];
         const sc = ivec2(
           px.toInt().add(k * axisX).clamp(0, width - 1),
           py.toInt().add(k * axisY).clamp(0, height - 1),
@@ -2306,19 +2553,43 @@ export function createGiAoFilterPass({ gbuffer, source, target, width, height, r
         // Plane distance in this pixel's own footprint units: full weight
         // inside one tolerance, gone by six.
         const planar = N.dot(tapP.xyz.sub(P)).abs().toVar();
-        const w = tapP.w.greaterThan(0.5)
+        const planeW = tapP.w.greaterThan(0.5)
           .select(float(1).sub(smoothstep(tol, tol.mul(6), planar)), float(0))
-          .mul(w0)
           .toVar();
-        sum.addAssign(sourceNode.load(sc).x.mul(w));
-        wsum.addAssign(w);
+        // GTAO keeps its narrow Gaussian. On the first/X pass only, world AO
+        // uses a uniform seven-tap kernel: state=(x+3y)%7 means those taps are
+        // exactly one complete quadrature cycle. This removes the 0.245..0.325
+        // axial-weight phase error left by a 5x5 Gaussian on a flat surface.
+        const weights = vec2(
+          planeW.mul(FILTER.gtao[k + RADIUS]),
+          planeW.mul(FILTER.world[k + RADIUS]),
+        ).toVar();
+        sum.addAssign(sourceNode.load(sc).xy.mul(weights));
+        wsum.addAssign(weights);
       }
       // The centre tap always passes its own plane test, so `wsum` is never
       // below its own weight and this can only ever be a renormalized average
       // of real neighbours — never a divide by zero, never a jump to 1.
-      out.assign(wsum.greaterThan(1e-4).select(sum.div(wsum), centre));
+      out.assign(vec2(
+        wsum.x.greaterThan(1e-4).select(sum.x.div(wsum.x), centre.x),
+        wsum.y.greaterThan(1e-4).select(sum.y.div(wsum.y), centre.y),
+      ));
     });
-    textureStore(target, coord, vec4(out, 0, 0, 1));
+    // RESPONSE AFTER INTEGRATION. The square is the measured correction from
+    // the cached voxel fixture (hidden 0.9555 -> 0.9130 vs truth 0.9078;
+    // open 0.9907 -> 0.9815), and exact open visibility remains exactly 1.
+    // The normal authored strength controls both GTAO and world AO; there is
+    // no second taste multiplier hiding the calibrated spatial response.
+    const worldFactor = combineChannels
+      ? mix(
+        float(1),
+        out.y.clamp(0, 1).pow(GI_WORLD_AO_VISIBILITY_POWER),
+        float(worldStrength ?? 1).clamp(0, 1),
+      ).toVar()
+      : out.y;
+    textureStore(target, coord, combineChannels
+      ? vec4(out.x.min(worldFactor), worldFactor, 0, 1)
+      : vec4(out, 0, 1));
   })().compute(width * height);
 
   compute.__giPassName = axisX ? "aoFilterX" : "aoFilterY";
@@ -2843,7 +3114,23 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
  */
 export function createGiEmitterShadowPass({
   gbuffer, emitter, normalOffset, target, width, height, resolveWidth, resolveHeight,
-  cameraPosition = null, distTarget = null, tileCut = null, frame = null,
+  cameraPosition = null, distTarget = null, tileCut = null, frame = null, checker = null,
+  // §11.11 (2026-09-03) ONE SEAT PER PIXEL PER FRAME. With a `seatPhase`
+  // uniform (advanced by GISystem once per DISPATCH of this pass — not per
+  // frame, or the movers-only stride-2 cadence would visit only two of the
+  // four seats at every pixel) each pixel marches a single seat,
+  //   k = (x + 2·y + phase) mod seatCount,
+  // so every 2×2 block of the grid holds every live seat every frame and
+  // every 3×3 window holds each of them at least once. The other live seats
+  // are written as −1 (NOT SAMPLED); createGiLightShadowFilterPass in its
+  // `sparse` mode reconstructs them from the same-frame neighbours that did
+  // march them, and the temporal chain integrates across frames exactly as
+  // it integrates the checkerboard. The march count per pixel goes 4 → 1
+  // (the pass was ~640 k any-hit rays a frame on the user's Bistro — as
+  // many as the whole transport). Empty seats (beyond the tile's count)
+  // are written as 1 / width 0, the pass's load-bearing "unshadowed"
+  // default, exactly as the dense arm leaves them.
+  seatPhase = null,
 }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
@@ -2855,6 +3142,21 @@ export function createGiEmitterShadowPass({
     const px = instanceIndex.mod(widthU);
     const py = instanceIndex.div(widthU);
     const coord = ivec2(px.toInt(), py.toInt());
+    // ── CHECKERBOARD (2026-09-02) ──────────────────────────────────────────
+    // Half the pixels march each dispatch, alternating with the frame; the
+    // skipped half keeps last frame's raw in `target` and the temporal chain
+    // that already integrates the per-frame area jitter integrates this too.
+    // Only with a `frame` (= the chain exists) and while `checker` is 1 —
+    // GISystem zeroes it on movers-only frames, where the pass already runs
+    // every other frame, so no pixel is ever refreshed slower than every
+    // second dispatch. Measured need: 11.7 ms per dispatch on the user's
+    // Bistro (466×280, ≤ 4 seats per tile, 116 emitters).
+    if (frame && checker) {
+      const parity = px.add(py).add(uint(frame)).bitAnd(uint(1));
+      If(uint(checker).equal(uint(1)).and(parity.equal(uint(1))), () => {
+        Return();
+      });
+    }
     const gCoord = ivec2(
       px.toFloat().add(0.5).mul(sx).toInt(),
       py.toFloat().add(0.5).mul(sy).toInt(),
@@ -2895,16 +3197,29 @@ export function createGiEmitterShadowPass({
       // uniform. Channel i ≡ the tile's i-th emitter BY ID (giScreen's
       // createGiEmitterTileCutPass sorted them), consistent with what the
       // resolve reconstructs at every pixel of the same tile.
+      const tile = tileCut
+        ? py.div(uint(tileCut.tileSize)).min(uint(tileCut.tilesY - 1))
+            .mul(uint(tileCut.tilesX))
+            .add(px.div(uint(tileCut.tileSize)).min(uint(tileCut.tilesX - 1)))
+            .toVar()
+        : null;
+      const tileIds = tileCut
+        ? [0, 1, 2, 3].map((k) => tileCut.idBuf.element(tile.mul(4).add(uint(k))).toVar())
+        : null;
       const slots = tileCut
-        ? (() => {
-            const tile = py.div(uint(tileCut.tileSize)).min(uint(tileCut.tilesY - 1))
-              .mul(uint(tileCut.tilesX))
-              .add(px.div(uint(tileCut.tileSize)).min(uint(tileCut.tilesX - 1)))
-              .toVar();
-            return [0, 1, 2, 3].map((k) =>
-              tileCut.recordSlot(tileCut.idBuf.element(tile.mul(4).add(uint(k)))));
-          })()
+        ? tileIds.map((id) => tileCut.recordSlot(id))
         : emitter.emitterSlots.slice(0, MAX_EMITTERS);
+      // §11.11: the tile's LIVE seat count — the cut sorts by id, so empties
+      // (0xffffffff) sink to the end and the live seats are 0..count−1. The
+      // global-seat arm has no per-pixel count and rotates over all four.
+      const seatCount = seatPhase
+        ? (tileIds
+            ? tileIds.reduce(
+                (acc, id) => acc.add(select(id.notEqual(uint(0xffffffff)), int(1), int(0))),
+                int(0),
+              ).toVar()
+            : int(slots.length))
+        : null;
       // §14 Q7: per-pixel, per-frame IGN pair for the area sample — the same
       // decorrelated lattice + golden-ratio walk the light pass uses. Only
       // built when a `frame` uniform arrives, which GISystem sends exactly
@@ -2958,23 +3273,48 @@ export function createGiEmitterShadowPass({
       // of what a slot is going stale here.
       const slotKeys = Object.keys(slots[0] ?? {})
         .filter((k) => slots.every((s) => s?.[k] != null));
-      Loop({ start: int(0), end: int(slots.length), type: "int", condition: "<" }, ({ i }) => {
+      const virtualSlot = (i) => {
         const virt = {};
         for (const key of slotKeys) {
           let acc = slots[0][key];
           for (let k = 1; k < slots.length; k++) acc = select(i.equal(int(k)), slots[k][key], acc);
           virt[key] = acc;
         }
+        return virt;
+      };
+      if (seatPhase) {
+        // §11.11: ONE march. The lattice lane is a 2×2-complete pattern
+        // (x + 2y covers 0..3 in every block); reduced mod the live count so
+        // a one-lamp tile marches its lamp every frame and never wastes a
+        // sample on an empty seat. Integer mod spelled out (a − (a/n)·n) so
+        // it compiles the same on every backend.
+        const n = seatCount.max(int(1)).toVar();
+        const lane = px.add(py.mul(uint(2))).add(uint(seatPhase)).bitAnd(uint(3)).toInt().toVar();
+        const k = lane.sub(lane.div(n).mul(n)).toVar();
         const pen = distVars ? float(0).toVar() : null;
         const s = float(
-          emitterSlotShadow(emitter, virt, P, N, samplePoint, pen, targetJitter),
+          emitterSlotShadow(emitter, virtualSlot(k), P, N, samplePoint, pen, targetJitter),
         ).toVar();
-        for (let k = 0; k < slots.length; k++) {
-          const take = i.equal(int(k));
-          shadowVars[k].assign(select(take, s, shadowVars[k]));
-          if (distVars) distVars[k].assign(select(take, pen, distVars[k]));
+        for (let j = 0; j < slots.length; j++) {
+          const take = k.equal(int(j));
+          const live = int(j).lessThan(seatCount);
+          shadowVars[j].assign(select(take, s, select(live, float(-1), float(1))));
+          if (distVars) distVars[j].assign(select(take, pen, select(live, float(-1), float(0))));
         }
-      });
+      } else {
+        Loop({ start: int(0), end: int(slots.length), type: "int", condition: "<" }, ({ i }) => {
+          const virt = virtualSlot(i);
+          const pen = distVars ? float(0).toVar() : null;
+          const s = float(
+            emitterSlotShadow(emitter, virt, P, N, samplePoint, pen, targetJitter),
+          ).toVar();
+          for (let k = 0; k < slots.length; k++) {
+            const take = i.equal(int(k));
+            shadowVars[k].assign(select(take, s, shadowVars[k]));
+            if (distVars) distVars[k].assign(select(take, pen, distVars[k]));
+          }
+        });
+      }
     });
     const paint = widthPaint
       ? distVars.map((v) => v.div(widthPaint).clamp(0, 1))
@@ -3290,11 +3630,26 @@ export function createGiEmitterTileCutPass({
 export function createGiLightShadowFilterPass({
   gbuffer, source, target, width, height, resolveWidth, resolveHeight, planeEps,
   history = null, softness = null, cameraPos = null, projScale = null,
+  // §11.11 SPARSE RECONSTRUCTION (2026-09-03). The emitter raw under seat
+  // rotation carries a −1 sentinel in every channel the pixel did not march
+  // this frame. In `sparse` mode the bilateral weights are PER CHANNEL: a
+  // tap contributes to a channel only when it carries a sample there, so
+  // each seat's value is the plane-weighted mean of the same-frame
+  // neighbours that marched it (≥ 3 of the 21 taps for every seat, by the
+  // pass's 2×2 lattice). The variance clip uses the same per-channel
+  // moments. A channel with NO evidence in the window (an isolated pixel
+  // whose same-plane neighbours are all sky/other planes) holds its
+  // validated history, else 1 — the chain's load-bearing "unshadowed".
+  // `distSource`/`distTarget` carry the analytic width the same way, by
+  // NEAREST valid tap instead of mean (see the emitterShadowDistFill note).
+  sparse = false, distSource = null, distTarget = null,
 }) {
   const widthU = uniform(width, "uint");
   const positionNode = texture(gbuffer.position);
   const normalNode = texture(gbuffer.normal);
   const shadowNode = texture(source);
+  const distFill = sparse && distSource && distTarget;
+  const distNode = distFill ? texture(distSource) : null;
   const histShadowNode = history ? texture(history.histShadow) : null;
   const histPosNode = history ? texture(history.histPos) : null;
   // Reprojection-validity counter, compiled ONLY under the debug global (an
@@ -3323,6 +3678,7 @@ export function createGiLightShadowFilterPass({
     );
     const g0 = positionNode.load(gCoord).toVar();
     const out = center.toVar();
+    const distOut = distFill ? vec4(0).toVar() : null;
     // Funnel counter [1] counts EXECUTED THREADS (not geometry) — it
     // separates "pass never dispatches" from "gbuffer is empty" when the
     // valid count reads zero.
@@ -3348,9 +3704,11 @@ export function createGiLightShadowFilterPass({
         ? float(planeEps).max(1e-3).max(texelW.mul(2)).toVar()
         : float(planeEps).max(1e-3).toVar();
       const acc = vec4(0).toVar();
-      const wSum = float(0).toVar();
+      const wSum = (sparse ? vec4(0) : float(0)).toVar();
       const clipM1 = history ? vec4(0).toVar() : null;
       const clipM2 = history ? vec4(0).toVar() : null;
+      const bestW = distFill ? vec4(0).toVar() : null;
+      const bestD = distFill ? vec4(0).toVar() : null;
       // ANGLE-ADAPTIVE SPATIAL SUPPORT (2026-08-06). σ1.6 was tuned to
       // average the STOCHASTIC arm's per-pixel sun-disc dither; the analytic
       // arm is deterministic, and for a razor-authored sun (sourceAngle 0)
@@ -3386,13 +3744,33 @@ export function createGiLightShadowFilterPass({
           const wNormal = q1.xyz.normalize().dot(N).sub(0.7).mul(1 / 0.3).clamp(0, 1);
           const w = wPlane.mul(wNormal).mul(q0.w).mul(gauss).toVar();
           const tapS = vec4(shadowNode.load(tap)).toVar();
-          acc.addAssign(tapS.mul(w));
-          wSum.addAssign(w);
-          if (history) {
-            // §14 Q7b: raw moments for the history clip below — same
-            // validity weights, so σ describes THIS surface's raw shadow.
-            clipM1.addAssign(tapS.mul(w));
-            clipM2.addAssign(tapS.mul(tapS).mul(w));
+          if (sparse) {
+            // Per-channel validity: −1 = not marched this frame. `step` at
+            // −0.5 keeps a genuine 0 (fully shadowed) a valid sample.
+            const wv = step(vec4(-0.5), tapS).mul(w).toVar();
+            const tapV = tapS.max(0).toVar();
+            acc.addAssign(tapV.mul(wv));
+            wSum.addAssign(wv);
+            if (history) {
+              clipM1.addAssign(tapV.mul(wv));
+              clipM2.addAssign(tapV.mul(tapV).mul(wv));
+            }
+            if (distFill) {
+              const tapD = vec4(distNode.load(tap)).toVar();
+              const cand = step(vec4(-0.5), tapD).mul(w).toVar();
+              const better = step(bestW.add(1e-9), cand).toVar();
+              bestD.assign(mix(bestD, tapD.max(0), better));
+              bestW.assign(mix(bestW, cand, better));
+            }
+          } else {
+            acc.addAssign(tapS.mul(w));
+            wSum.addAssign(w);
+            if (history) {
+              // §14 Q7b: raw moments for the history clip below — same
+              // validity weights, so σ describes THIS surface's raw shadow.
+              clipM1.addAssign(tapS.mul(w));
+              clipM2.addAssign(tapS.mul(tapS).mul(w));
+            }
           }
         }
       }
@@ -3409,10 +3787,14 @@ export function createGiLightShadowFilterPass({
       // uniform the system zeroes while a LIGHT is moving: a rotating sun
       // invalidates every pixel's history semantically (same surface, stale
       // shadow), which position validation cannot see.
+      let histSampleRef = null;
+      let validRef = null;
       if (history) {
         const clip = history.prevViewProj.mul(vec4(P, 1)).toVar();
         const histSample = vec4(0).toVar();
         const valid = float(0).toVar();
+        histSampleRef = histSample;
+        validRef = valid;
         If(clip.w.greaterThan(1e-3), () => {
           const ndc = clip.xyz.div(clip.w).toVar();
           const hx = ndc.x.mul(0.5).add(0.5).mul(width).toVar();
@@ -3495,7 +3877,12 @@ export function createGiLightShadowFilterPass({
           const cw = wSum.max(1e-4);
           const cMean = clipM1.div(cw).toVar();
           const cSigma = clipM2.div(cw).sub(cMean.mul(cMean)).max(0).sqrt().mul(shGamma).toVar();
-          histSample.assign(histSample.clamp(cMean.sub(cSigma), cMean.add(cSigma)));
+          const clamped = histSample.clamp(cMean.sub(cSigma), cMean.add(cSigma));
+          // §11.11: a channel with NO same-frame evidence has mean 0, σ 0 —
+          // the clip would crush its valid history to exactly 0 (the
+          // irradiance filter's validityAlpha rule (b), same hazard). The
+          // clip applies only where the neighbourhood actually spoke.
+          histSample.assign(sparse ? mix(histSample, clamped, step(vec4(1e-4), wSum)) : clamped);
         }
         out.assign(mix(out, histSample, valid.mul(float(history.weight))));
         if (temporalCounter) {
@@ -3504,8 +3891,17 @@ export function createGiLightShadowFilterPass({
           });
         }
       }
+      if (sparse) {
+        // A channel with no same-frame evidence in the window: validated
+        // history if there is one, else the unshadowed default.
+        const has = step(vec4(1e-4), wSum);
+        const fallback = histSampleRef ? mix(vec4(1), histSampleRef, validRef) : vec4(1);
+        out.assign(mix(fallback, out, has));
+      }
+      if (distFill) distOut.assign(bestD);
     });
     textureStore(target, coord, out);
+    if (distFill) textureStore(distTarget, coord, distOut);
   })().compute(width * height);
 
   return { compute, widthU, temporalCounter };
@@ -3851,6 +4247,11 @@ export function createGiLightShadowHistoryPass({
  * away instead of playing on screen. Validation failure falls back to the
  * raw resolve — the failure mode is the pre-§12.65 noise, never a ghost.
  */
+// A current-frame neighbour is a bridge, not field evidence. Keeping its
+// confidence below one makes a real gather answer replace it immediately and
+// prevents spatial rescue from becoming permanent screen-space GI.
+export const GI_IRR_SPATIAL_FALLBACK_CONFIDENCE = 0.25;
+
 export function createGiIrradianceTemporalPass({
   gbuffer, source, target, histIrr, histPos, width, height, history,
   // The filter's grid may be SMALLER than the gbuffer's (the glossy radiance
@@ -3939,6 +4340,14 @@ export function createGiIrradianceTemporalPass({
       // in-scan-order is a bias toward −x,−y, which is how a rescue turns into
       // a one-sided fringe along every silhouette.
       const bestD = float(1e9).toVar();
+      // A newly revealed point has no reprojectable history. If its raw gather
+      // is UNKNOWN while an adjacent pixel on the same receiver is known, keep
+      // that value as a low-confidence bridge instead of presenting the
+      // absence as a black checker square. This is separate from histSample:
+      // strong world-validated history remains the first choice.
+      const spatialSample = validityAlpha ? vec4(0).toVar() : null;
+      const spatialValid = validityAlpha ? float(0).toVar() : null;
+      const spatialBestD = validityAlpha ? float(1e9).toVar() : null;
       // ── §14 Q6's MISSING HALF, and the 2026-08-24 "mud" instrument ────────
       //
       // `createGiLightShadowFilterPass` floors this eps with the texel
@@ -4089,6 +4498,48 @@ export function createGiIrradianceTemporalPass({
           ? select(raw.w.greaterThan(0.5), clamped, histSample)
           : clamped);
       }
+      // Detail-box slides and fast turns can expose a frontier whose probe
+      // tiles are not ready on this frame. Reprojection cannot help a surface
+      // never seen by the previous camera, but those holes are usually
+      // interleaved with answered pixels on the SAME surface. Rescue only raw
+      // UNKNOWN lanes, only from the nearest current-frame 3x3 neighbour, and
+      // require both plane and normal agreement. The normal test is essential
+      // at floor/wall joints: positions can be arbitrarily close and the
+      // floor-plane delta can be zero although their irradiance is unrelated.
+      //
+      // This adds no buffer or ray work. All three textures are already bound,
+      // and these extra taps sit under an unknown-only branch.
+      if (validityAlpha && globalThis.__giIrrSpatialFallback !== false) {
+        If(raw.w.lessThan(0.5), () => {
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              const nc = ivec2(
+                coord.x.add(dx).clamp(0, width - 1),
+                coord.y.add(dy).clamp(0, height - 1),
+              ).toVar();
+              const ngp = vec4(positionNode.load(gAt(nc))).toVar();
+              const ns = vec4(rawNode.load(nc)).toVar();
+              const ndelta = ngp.xyz.sub(P).toVar();
+              const nd = ndelta.length().toVar();
+              const nN = vec4(irrNormalNode.load(gAt(nc))).xyz.normalize().toVar();
+              If(
+                ngp.w.greaterThan(0.5)
+                  .and(ns.w.greaterThan(0.5))
+                  .and(nd.lessThan(eps))
+                  .and(nd.lessThan(spatialBestD))
+                  .and(ndelta.dot(Nn).abs().lessThan(eps.mul(0.5)))
+                  .and(nN.dot(Nn).greaterThan(0.75)),
+                () => {
+                  spatialSample.assign(ns);
+                  spatialValid.assign(1);
+                  spatialBestD.assign(nd);
+                },
+              );
+            }
+          }
+        });
+      }
       // Applied to the BLEND rather than around the lookup so the whole
       // reprojection stays one straight-line dataflow — `valid` is already the
       // gate every other rejection writes to.
@@ -4117,10 +4568,22 @@ export function createGiIrradianceTemporalPass({
           .and(valid.greaterThan(0.5))
           .and(heldA.greaterThan(0.05))
           .toVar();
-        out.assign(select(hold,
+        const spatialA = spatialValid.mul(GI_IRR_SPATIAL_FALLBACK_CONFIDENCE).toVar();
+        // Strong reprojected history is world-validated and wins. A previous
+        // low-confidence spatial bridge does not suppress a fresh current-
+        // frame neighbour with higher confidence, avoiding a fade toward
+        // black on the bridge's second frame.
+        const holdHistory = hold.and(heldA.greaterThanEqual(spatialA)).toVar();
+        const useSpatial = rawKnown.not()
+          .and(spatialValid.greaterThan(0.5))
+          .and(holdHistory.not())
+          .toVar();
+        const temporalOut = select(hold,
           mix(raw, histSample, heldA),
-          mix(raw, histSample, valid.mul(float(history.weight)))));
-        outKnown.assign(select(rawKnown, float(1), select(hold, heldA, float(0))));
+          mix(raw, histSample, valid.mul(float(history.weight))));
+        out.assign(select(useSpatial, vec4(spatialSample.xyz, spatialA), temporalOut));
+        outKnown.assign(select(rawKnown, float(1),
+          select(useSpatial, spatialA, select(hold, heldA, float(0)))));
       } else {
         out.assign(mix(raw, histSample, valid.mul(float(history.weight))));
       }
@@ -4218,7 +4681,7 @@ export function giBvhReflectAnchorOffsets(stride = 2) {
 export function createGiBvhReflect({
   gbuffer, target, colorTarget, width, height, bvhScene,
   cameraPosition, normalOffset, maxDistance, mask = true, dyn = null,
-  strideDefault = 2,
+  strideDefault = 2, replicate = true,
   // §17 R7a — the ONE-BVH bundle: { trace(origin,dir,tMin,tMax) →
   // vec4(t, octN.xy, bitcast slot), palette: { bits, wordOffset, words,
   // slots } | null }. When present (and its trace compiles — the static
@@ -4492,6 +4955,11 @@ export function createGiBvhReflect({
     const colorOut = vec4(albedo, hasAlbedo).toVar();
     textureStore(target, coord, hitOut);
     if (colorTarget) textureStore(colorTarget, coord, colorOut);
+    // The production hit-shade reconstructs from REAL anchors and writes a
+    // full radiance texture, so its raw non-anchor stores are dead bandwidth.
+    // `replicate` remains for standalone diagnostics and the dormant unshaded
+    // fallback, whose direct raw-texture consumer still needs dense texels.
+    if (replicate) {
     // The rest of the block. Unrolled in JS because `stride` is a build-time
     // constant — at the default 2 that is three extra texels, each costing two
     // gbuffer loads and a compare against a BVH traversal we did not do.
@@ -4537,6 +5005,7 @@ export function createGiBvhReflect({
           if (colorTarget) textureStore(colorTarget, nCoord, select(sameSurface, colorOut, missColor));
         });
       }
+    }
     }
   })().compute(blocksW * blocksH);
 
@@ -4585,6 +5054,11 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
   emitterShadow.name = "giEmitterShadow";
   emitterShadow.version = version;
   const emitterShadowRaw = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  // HALF FLOAT (§11.11, 2026-09-03): the seat-rotating shadow pass marks the
+  // seats it did NOT march this frame with a −1 sentinel, which rgba8unorm
+  // cannot hold. The dense arm (`__giEmitterSeatRotate = false`) keeps
+  // writing [0, 1] and never notices.
+  emitterShadowRaw.type = THREE.HalfFloatType;
   emitterShadowRaw.name = "giEmitterShadowRaw";
   emitterShadowRaw.version = version;
   // ANALYTIC-PENUMBRA CHAIN (2026-08-13, plan §12.52.1 unit 2) — the emitter
@@ -4607,6 +5081,16 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
   emitterShadowDist.type = THREE.HalfFloatType;
   emitterShadowDist.name = "giEmitterShadowDist";
   emitterShadowDist.version = version;
+  // §11.11: the DENSE width. Under seat rotation the marcher writes each
+  // pixel's width for ONE seat and a −1 sentinel for the rest; the filter
+  // pass fills every channel from the nearest same-plane neighbour that
+  // marched that seat this frame (nearest, not mean — the channel doubles
+  // as the occupancy mask, and a mean would dilute "lit, 0" with widths).
+  // The wide passes read THIS texture on that arm.
+  const emitterShadowDistFill = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  emitterShadowDistFill.type = THREE.HalfFloatType;
+  emitterShadowDistFill.name = "giEmitterShadowDistFill";
+  emitterShadowDistFill.version = version;
   const emitterShadowMid = new THREE.StorageTexture(emitterWidth, emitterHeight);
   emitterShadowMid.name = "giEmitterShadowMid";
   emitterShadowMid.version = version;
@@ -4670,6 +5154,7 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
     emitterShadow,
     emitterShadowRaw,
     emitterShadowDist,
+    emitterShadowDistFill,
     emitterShadowMid,
     emitterShadowWide,
     radiance,
@@ -4807,6 +5292,7 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
       emitterShadow.dispose();
       emitterShadowRaw.dispose();
       emitterShadowDist.dispose();
+      emitterShadowDistFill.dispose();
       emitterShadowMid.dispose();
       emitterShadowWide.dispose();
       radiance.dispose();
@@ -5071,6 +5557,43 @@ export function createGiBvhTarget(width, height, { radianceDiv = null } = {}) {
  * @param {ReturnType<typeof import("./bvh/bvhScene.js").buildBvhScene>} bvhScene
  * @return {number} Tiles actually blitted this call (0 = no-op).
  */
+// ── THE ONE-SHOT BLIT MATERIALS ARE SHARED, NOT MINTED PER CALL ─────────────
+//
+// (2026-09-02, the first-lit freeze.) Every texture average, every GPU pixel
+// readback and every atlas tile used to build a fresh `NodeMaterial` with a
+// fresh `texture(tex)` node. three names a node's binding after the node's ID
+// (`nodeTexture_<id>`), so each of those materials generated DIFFERENT WGSL
+// for the same one-line shader, three's program cache (keyed by source) saw
+// a new program every time, and every call paid a SYNC `createRenderPipeline`
+// on the GPU process's command thread — `probe:gi-boot-frames` caught twelve
+// of them, 1.1–1.2 kB each, in the 2.4 s frame at the moment the field lit.
+// One material per (colour space, format, type, tinted?) keeps the source —
+// and therefore the pipeline — identical across calls; the texture is a
+// BINDING, repointed through the node's `.value`, and every caller renders
+// through a NEW QuadMesh so the repointed value reaches a fresh bind group
+// (a reused mesh would keep the first texture: `Bindings.updateForRender`
+// only runs on a refresh, the 740c6ce law).
+const _blitMaterials = new Map();
+function blitMaterialFor(tex, { tint = false } = {}) {
+  const key = `${tint ? "t" : "c"}|${tex.colorSpace}|${tex.isCompressedTexture ? 1 : 0}|${tex.format}|${tex.type}`;
+  let entry = _blitMaterials.get(key);
+  if (!entry) {
+    const node = texture(tex);
+    const tintU = tint ? uniform(new THREE.Vector4(1, 1, 1, 1)) : null;
+    const material = new THREE.NodeMaterial();
+    material.name = tint ? "GI blit (tinted)" : "GI blit";
+    material.colorNode = tint ? node.mul(tintU) : node;
+    material.transparent = false;
+    material.depthTest = false;
+    material.depthWrite = false;
+    material.fog = false;
+    entry = { node, tintU, material };
+    _blitMaterials.set(key, entry);
+  }
+  entry.node.value = tex;
+  return entry;
+}
+
 /**
  * Mean LINEAR color of a texture the CPU cannot draw (KTX2/basis), on the GPU.
  *
@@ -5090,16 +5613,50 @@ export function createGiBvhTarget(width, height, { radianceDiv = null } = {}) {
  * @param {THREE.Texture} tex  a compressed texture
  * @return {Promise<{r:number,g:number,b:number}|null>}
  */
+// ── ONE-SHOT READBACK TARGETS ARE POOLED, NEVER DISPOSED (2026-09-02) ──────
+//
+// three keys a RenderContext by ATTACHMENT SHAPE (`RenderContexts.get`:
+// `count:format:type:samples:depth:stencil` + mrt), not by target — so every
+// RGBA8/no-depth target in the process shares ONE context object, and the
+// context's `textures` is whatever rendered through it last. `compileAsync`
+// holds its context across an await per object. The editor's selection-
+// outline prewarm compiled its (RGBA8/no-depth) mask target while the GI
+// build ran these readbacks through the same context and then DISPOSED the
+// target: the compile resumed with `context.textures[0]` = a dead texture,
+// the backend had no format for it, and every scene switch could log
+// "Async render pipeline creation failed (selectionOutlineMask:…): …
+// 'format' … Required member is undefined" (`scripts/.tmp-scene-switch.mjs`
+// reproduces it ~1 run in 2). A pooled target stays valid for as long as any
+// shared context can point at it; the per-use `texture.version` bump keeps
+// the bind-group cache honest exactly as before.
+const oneShotTargets = new Map();
+function oneShotTargetFor(size, name) {
+  const key = `${size}:${name}`;
+  let rt = oneShotTargets.get(key);
+  if (!rt) {
+    rt = new THREE.RenderTarget(size, size, {
+      depthBuffer: false,
+      stencilBuffer: false,
+      generateMipmaps: false,
+    });
+    rt.texture.name = name;
+    rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
+    // Versioned ONCE. The per-call bump the disposable targets carried made
+    // three destroy and re-create the pooled GPU texture on every use, while
+    // the previous readback's copy was still in flight — "Destroyed texture
+    // [giTexPixels] used in a submit", raised inside whatever async pipeline
+    // error scope happened to be open, which marked an unrelated MATERIAL
+    // pipeline as failed. A persistent texture has a stable identity; nothing
+    // binds it as a sampler, so no bind-group cache needs the bump.
+    rt.texture.version = ++targetGeneration;
+    oneShotTargets.set(key, rt);
+  }
+  return rt;
+}
+
 export async function computeCompressedTextureAverage(renderer, tex) {
   const size = 32;
-  const rt = new THREE.RenderTarget(size, size, {
-    depthBuffer: false,
-    stencilBuffer: false,
-    generateMipmaps: false,
-  });
-  rt.texture.name = "giTexAverage";
-  rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
-  rt.texture.version = ++targetGeneration;
+  const rt = oneShotTargetFor(size, "giTexAverage");
   const rendererState = THREE.RendererUtils.resetRendererState(renderer);
   const quad = new THREE.QuadMesh();
   try {
@@ -5107,15 +5664,8 @@ export async function computeCompressedTextureAverage(renderer, tex) {
     renderer.setScissorTest(false);
     rt.viewport.set(0, 0, size, size);
     rt.scissor.set(0, 0, size, size);
-    const mat = new THREE.NodeMaterial();
-    mat.colorNode = texture(tex);
-    mat.transparent = false;
-    mat.depthTest = false;
-    mat.depthWrite = false;
-    mat.fog = false;
-    quad.material = mat;
+    quad.material = blitMaterialFor(tex).material;
     quad.render(renderer);
-    mat.dispose();
   } finally {
     THREE.RendererUtils.restoreRendererState(renderer, rendererState);
   }
@@ -5131,7 +5681,7 @@ export async function computeCompressedTextureAverage(renderer, tex) {
     }
     return w > 1e-3 ? { r: r / w, g: g / w, b: b / w } : null;
   } finally {
-    rt.dispose();
+    // pooled — see oneShotTargetFor
   }
 }
 
@@ -5148,14 +5698,7 @@ export async function computeCompressedTextureAverage(renderer, tex) {
  * `y = floor((1 − v) · size)`. Null when the readback yields nothing.
  */
 export async function readTexturePixelsGPU(renderer, tex, size = 64) {
-  const rt = new THREE.RenderTarget(size, size, {
-    depthBuffer: false,
-    stencilBuffer: false,
-    generateMipmaps: false,
-  });
-  rt.texture.name = "giTexPixels";
-  rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
-  rt.texture.version = ++targetGeneration;
+  const rt = oneShotTargetFor(size, "giTexPixels");
   const rendererState = THREE.RendererUtils.resetRendererState(renderer);
   const quad = new THREE.QuadMesh();
   try {
@@ -5163,15 +5706,8 @@ export async function readTexturePixelsGPU(renderer, tex, size = 64) {
     renderer.setScissorTest(false);
     rt.viewport.set(0, 0, size, size);
     rt.scissor.set(0, 0, size, size);
-    const mat = new THREE.NodeMaterial();
-    mat.colorNode = texture(tex);
-    mat.transparent = false;
-    mat.depthTest = false;
-    mat.depthWrite = false;
-    mat.fog = false;
-    quad.material = mat;
+    quad.material = blitMaterialFor(tex).material;
     quad.render(renderer);
-    mat.dispose();
   } finally {
     THREE.RendererUtils.restoreRendererState(renderer, rendererState);
   }
@@ -5179,7 +5715,7 @@ export async function readTexturePixelsGPU(renderer, tex, size = 64) {
     const px = await readRenderTargetImage(renderer, rt, size, size);
     return px?.length ? px : null;
   } finally {
-    rt.dispose();
+    // pooled — see oneShotTargetFor
   }
 }
 
@@ -5259,34 +5795,37 @@ export function blitBvhAtlasTiles(renderer, bvhScene) {
 
     // Pass 1: relay the existing canvas atlas forward whole, so every tile
     // the CPU path already drew or solid-filled survives unchanged.
-    const copyMaterial = new THREE.NodeMaterial();
-    copyMaterial.colorNode = texture(bvhScene.atlasTexture);
-    copyMaterial.transparent = false;
-    copyMaterial.depthTest = false;
-    copyMaterial.depthWrite = false;
-    copyMaterial.fog = false;
-    quad.material = copyMaterial;
+    quad.material = blitMaterialFor(bvhScene.atlasTexture).material;
     quad.render(renderer);
-    copyMaterial.dispose();
 
     // Pass 2+: one quad per pending tile, viewport+scissor restricted to
     // that tile's rect, sampling the compressed map directly — the GPU can
     // decode it even though the canvas never could.
+    //
+    // ⭐ ONE MATERIAL, ONE PIPELINE, N RENDERS (2026-09-02, the first-lit
+    // freeze). The tint used to be a per-tile LITERAL (`vec4(tint.r, …)`)
+    // baked into the fragment source, so every tile was a distinct WGSL
+    // program and a distinct SYNC `createRenderPipeline` — 15 of the 29
+    // pipelines the boot ledger caught inside one 2.4 s frame at the moment
+    // the field lit (8 + 7 tiles across the two atlases), each compiled
+    // serially on the GPU process's wire thread. The map and the tint are
+    // now the two things that vary, and both vary as BINDINGS: one texture
+    // node whose `.value` is repointed per tile and one vec4 uniform, so
+    // the shader text is identical for every tile and the second tile
+    // onward finds the pipeline already in three's cache.
     renderer.setScissorTest(true);
-    for (const { map, tileIndex } of pending) {
+    for (const { map, tileIndex, tint } of pending) {
       const tileX = (tileIndex % atlasGrid) * atlasTile;
       const tileY = Math.floor(tileIndex / atlasGrid) * atlasTile;
       rt.viewport.set(tileX, tileY, atlasTile, atlasTile);
       rt.scissor.set(tileX, tileY, atlasTile, atlasTile);
-      const tileMaterial = new THREE.NodeMaterial();
-      tileMaterial.colorNode = texture(map);
-      tileMaterial.transparent = false;
-      tileMaterial.depthTest = false;
-      tileMaterial.depthWrite = false;
-      tileMaterial.fog = false;
-      quad.material = tileMaterial;
-      quad.render(renderer);
-      tileMaterial.dispose();
+      const entry = blitMaterialFor(map, { tint: true });
+      entry.tintU.value.set(tint?.r ?? 1, tint?.g ?? 1, tint?.b ?? 1, 1);
+      // A quad PER TILE: the shared material's texture node was just
+      // repointed, and only a new mesh (a new RenderObject) is guaranteed to
+      // bind the new texture — see blitMaterialFor.
+      const tileQuad = new THREE.QuadMesh(entry.material);
+      tileQuad.render(renderer);
       blitted++;
     }
   } finally {

@@ -27,7 +27,7 @@ const PANELS = [
   ["projectSettings", "Project Settings"], ["build", "Build"], ["modules", "Modules"],
   ["input", "Input"], ["events", "Events"], ["eventGraph", "Event Graph"], ["geometryEditor", "Geometry Editor"], ["postprocess", "Post Process"],
   ["polyhaven", "Poly Haven"], ["ambientcg", "AmbientCG"], ["sketchfab", "Sketchfab"],
-  ["polypizza", "Poly Pizza"], ["fab", "Fab"],
+  ["polypizza", "Poly Pizza"], ["kaykit", "KayKit"], ["fab", "Fab"],
   ["itchio", "itch.io"], ["audioLibrary", "Audio Library"], ["audioEditor", "Audio Editor"],
   ["terminal", "Terminal"], ["mcp", "Assistant (MCP)"],
   // The panel id doubles as a search keyword (see `panelItems`), so "git"

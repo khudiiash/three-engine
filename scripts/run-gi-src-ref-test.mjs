@@ -2044,9 +2044,63 @@ console.log("── HIT SHADING: THE SUN ─────────────
   // ALBEDO 1 DOES NOT SURVIVE THE LOOP — the expected value carries R4's
   // ceiling, and that is the cross-check: an implementation that forgot the
   // clamp lands on 2/pi = 0.6366 here, which is 11% brighter and looks fine.
-  const expect = MAX_LOOP_ALBEDO * 2 / Math.PI;
-  check("a sunlit hit returns clamp(albedo)/pi x E", Math.abs(r.radiance[0] - expect) < 1e-12,
-    `${r.radiance[0].toFixed(9)} vs ${expect.toFixed(9)} (unclamped would be ${(2 / Math.PI).toFixed(4)})`);
+  const expect = 2 / Math.PI;
+  check("a sunlit hit returns physical albedo/pi x E", Math.abs(r.radiance[0] - expect) < 1e-12,
+    `${r.radiance[0].toFixed(9)} vs ${expect.toFixed(9)}`);
+  const sunGain = 1.1664;
+  const gained = shadeTrace(geometry, makeHitShader({
+    surfaceAt: fixtureSurfaceAt, sun, visibility: makeVisibility(geometry, 0.1), sunGain,
+  }))([0, 3, 0], [0, -1, 0], 1);
+  check("the bounded first-bounce gain scales the analytic sun term exactly",
+    Math.abs(gained.radiance[0] - expect * sunGain) < 1e-12,
+    `${gained.radiance[0].toFixed(9)} vs ${(expect * sunGain).toFixed(9)}`);
+  const sunChromaGain = 1.5;
+  const mixedRho = [0.8, 0.3, 0.3];
+  const mixedSurfaceAt = (hit) => ({ ...fixtureSurfaceAt(hit), albedo: mixedRho });
+  const chromaGained = shadeTrace(geometry, makeHitShader({
+    surfaceAt: mixedSurfaceAt,
+    sun,
+    visibility: makeVisibility(geometry, 0.1),
+    sunGain,
+    sunChromaGain,
+  }))([0, 3, 0], [0, -1, 0], 1);
+  const mixedExpected = [
+    2 * (0.3 * sunGain + 0.5 * sunChromaGain) / Math.PI,
+    2 * 0.3 * sunGain / Math.PI,
+    2 * 0.3 * sunGain / Math.PI,
+  ];
+  check("the stronger chroma correction touches only analytic-sun albedo chroma",
+    chromaGained.radiance.every((v, i) => Math.abs(v - mixedExpected[i]) < 1e-12),
+    `[${chromaGained.radiance.map((v) => v.toFixed(9))}] vs ` +
+      `[${mixedExpected.map((v) => v.toFixed(9))}]`);
+  const secondaryOnly = makeHitShader({
+    surfaceAt: fixtureSurfaceAt,
+    secondary: () => [2, 2, 2],
+  });
+  const rb = shadeTrace(geometry, secondaryOnly)([0, 3, 0], [0, -1, 0], 1);
+  const expectLoop = MAX_LOOP_ALBEDO * 2 / Math.PI;
+  check("the recursive term alone keeps R4's albedo ceiling",
+    Math.abs(rb.radiance[0] - expectLoop) < 1e-12,
+    `${rb.radiance[0].toFixed(9)} vs ${expectLoop.toFixed(9)}`);
+  const rbGained = shadeTrace(geometry, makeHitShader({
+    surfaceAt: fixtureSurfaceAt, secondary: () => [2, 2, 2], sunGain,
+  }))([0, 3, 0], [0, -1, 0], 1);
+  check("and the directional gain does not scale recursive radiance",
+    Math.abs(rbGained.radiance[0] - rb.radiance[0]) < 1e-12,
+    `${rbGained.radiance[0].toFixed(9)} vs ${rb.radiance[0].toFixed(9)}`);
+  const mixedRecursive = shadeTrace(geometry, makeHitShader({
+    surfaceAt: mixedSurfaceAt, secondary: () => [2, 2, 2],
+  }))([0, 3, 0], [0, -1, 0], 1);
+  const mixedRecursiveGained = shadeTrace(geometry, makeHitShader({
+    surfaceAt: mixedSurfaceAt,
+    secondary: () => [2, 2, 2],
+    sunGain,
+    sunChromaGain,
+  }))([0, 3, 0], [0, -1, 0], 1);
+  check("and neither base nor chroma directional gain scales coloured recursive radiance",
+    mixedRecursiveGained.radiance.every((v, i) => Math.abs(v - mixedRecursive.radiance[i]) < 1e-12),
+    `[${mixedRecursiveGained.radiance.map((v) => v.toFixed(9))}] vs ` +
+      `[${mixedRecursive.radiance.map((v) => v.toFixed(9))}]`);
   check("CONTROL: the same hit with no sun is black",
     shadeTrace(geometry, makeHitShader({ surfaceAt: fixtureSurfaceAt }))([0, 3, 0], [0, -1, 0], 1)
       .radiance.every((v) => v === 0), "sun on/off differ");

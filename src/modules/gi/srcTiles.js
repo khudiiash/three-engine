@@ -81,6 +81,7 @@ import {
   Fn,
   If,
   Loop,
+  Return,
   atomicAdd,
   atomicMax,
   atomicMin,
@@ -107,7 +108,7 @@ import {
 } from "./srcConfig.js";
 import { binDirTable, tileCosineWeights } from "./srcMath.js";
 import { octahedralUV } from "./srcOctahedral.js";
-import { PAYLOAD_WORDS } from "./srcDeposit.js";
+import { readPayload } from "./srcDeposit.js";
 
 /** Sub-samples per bin axis in the cosine quadrature. §12.2's bias fix. */
 export const COSINE_SUB = 4;
@@ -164,6 +165,11 @@ export function tileAtlasLayout(blocks, tileSize, maxDimension = 8192) {
  */
 export function createSrcTileAtlas(store, bins, {
   w0 = W0,
+  // §10.7 (2026-09-03): WHICH CASCADE THIS ATLAS BAKES. c0 is the shipped
+  // one and the only one the resolve reads directly; a c1 atlas exists so
+  // the screen gather has somewhere to fall when the c0 lattice is STARVED
+  // (dropped inserts / blockless probes — see srcScreenGather's `coarse`).
+  cascade = 0,
   interior = IRRADIANCE_TILE_INTERIOR,
   border = IRRADIANCE_TILE_BORDER,
   sub = COSINE_SUB,
@@ -176,7 +182,7 @@ export function createSrcTileAtlas(store, bins, {
   // fixture) the flat path compiles bit-identically.
   skyEnv = null,
 } = {}) {
-  const info = bins.cascades[0];
+  const info = bins.cascades[cascade];
   const nBins = info.bins;
   const blocks = info.blockCapacity;
   const tileSize = interior + 2 * border;
@@ -203,7 +209,7 @@ export function createSrcTileAtlas(store, bins, {
   atlas.version = (globalThis.__giSrcTargetVersion = (globalThis.__giSrcTargetVersion ?? 0) + 1);
   const atlasNode = texture(atlas);
 
-  const w = binGridWidth(0, w0);
+  const w = binGridWidth(cascade, w0);
   const table = tileCosineWeights(w, interior, sub, border);
   const cosTable = instancedArray(table, "float");
   /**
@@ -268,15 +274,22 @@ export function createSrcTileAtlas(store, bins, {
     && frameStamp != null
     && store?.freeStack != null
     && store?.blockStampBase != null
-    && store?.cascades?.[0]?.blockBase != null;
+    && store?.cascades?.[cascade]?.blockBase != null;
   const maturityRamp = Number(globalThis.__giSrcMaturityRamp) > 0
     ? Number(globalThis.__giSrcMaturityRamp)
     : 30;
   const maturityFloor = Number.isFinite(Number(globalThis.__giSrcMaturityFloor))
     ? Number(globalThis.__giSrcMaturityFloor)
     : 0.2;
-  const stampBase = maturityOn ? store.blockStampBase + store.cascades[0].blockBase : 0;
+  const stampBase = maturityOn ? store.blockStampBase + store.cascades[cascade].blockBase : 0;
   const stampStack = maturityOn ? store.freeStack : null;
+  // The live-block guard needs the same stamp array plus the live words.
+  const liveOn = frameStamp != null && store?.freeStack != null
+    && Number.isInteger(store?.blockLiveBase) && Number.isInteger(store?.blockStampBase)
+    && store?.cascades?.[cascade]?.blockBase != null;
+  const liveBase = liveOn ? store.blockLiveBase + store.cascades[cascade].blockBase : 0;
+  const liveStampBase = liveOn ? store.blockStampBase + store.cascades[cascade].blockBase : 0;
+  const liveStack = liveOn ? store.freeStack : null;
 
   const passes = [];
 
@@ -303,6 +316,13 @@ export function createSrcTileAtlas(store, bins, {
     const i = instanceIndex.toVar();
     const block = i.div(uint(texels)).toVar();
     const t = i.mod(uint(texels)).toVar();
+    // Dead block (srcProbes' live word): nobody reads its tile — skip the
+    // 32-bin walk. A block released this frame still bakes (to black).
+    if (liveOn) {
+      const live = liveStack.element(uint(liveBase).add(block)).toVar();
+      If(liveStack.element(uint(liveStampBase).add(block)).equal(frameStamp), () => { live.assign(uint(1)); });
+      If(live.equal(uint(0)), () => { Return(); });
+    }
 
     const base = uint(info.binBase).add(block.mul(uint(nBins))).toVar();
     const row = t.mul(uint(nBins)).toVar();
@@ -325,12 +345,12 @@ export function createSrcTileAtlas(store, bins, {
       // much of it we have actually sampled".
       wsumAll.addAssign(cw);
       If(cw.greaterThan(0), () => {
-        const o = base.add(m).mul(uint(PAYLOAD_WORDS)).toVar();
         // ZERO-COUNT BINS ARE UNKNOWN, NOT ZERO. Excluded from the average, and
         // the rest renormalize over what was found — feeding one in as black is
         // a hard cliff at the edge of every sparsely-sampled region, and at 0.78
         // rays per bin (§12.13.4) that edge is everywhere rather than exotic.
-        const T = payload.element(o.add(uint(3))).toVar();
+        const bin = readPayload(payload, base.add(m));
+        const T = bin.T;
         If(T.greaterThanEqual(0), () => {
           // ── L + T·sky, CORRECT IN BOTH CASES IT CAN MEET ────────────────
           //
@@ -361,11 +381,7 @@ export function createSrcTileAtlas(store, bins, {
             ).toVar();
             SB.assign(vec3(skyEnv.node.sample(equirectUV(rdS)).level(0).xyz).mul(skyEnv.intensity));
           }
-          acc.addAssign(vec3(
-            payload.element(o),
-            payload.element(o.add(uint(1))),
-            payload.element(o.add(uint(2))),
-          ).add(SB.mul(T)).mul(cw));
+          acc.addAssign(bin.L.add(SB.mul(T)).mul(cw));
           wsum.addAssign(cw);
           known.addAssign(uint(1));
         });

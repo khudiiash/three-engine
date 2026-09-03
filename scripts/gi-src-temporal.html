@@ -219,6 +219,17 @@
         const jitterXU = uniform(0, "uint");
         const jitterYU = uniform(0, "uint");
 
+        // RETENTION OFF FOR THIS GATE (2026-09-02). Since §16 D1 armed locality
+        // retention on the anchor-relative arm, an invisible probe is HELD (its
+        // block frozen at keep = 1) for up to 1800 frames instead of retiring.
+        // Arm 7 below ages every probe out with `maxAge: 1` and then reads back
+        // the LIVE probes' blocks — under retention those are the old, held
+        // probes carrying their decayed history, not reclaimed blocks, and the
+        // arm reported `2994 bins hold a decayed weight` against a transport that
+        // zeroes every claim exactly (0 bins with retention off). This page
+        // gates the decay arithmetic and the claim stamp; retention has its own
+        // gates (`test:gi-spin-retention`, `test:gi-worldkeys-flip`).
+        globalThis.__giSrcProbeRetain = false;
         const frame = P.createSrcProbeFrame(store, {
           spacing0: S0, camera: vec3(cameraU), anchor: vec3(anchorU),
           pixelCount: PIXELS, readPixel, frameStamp: frameStampU,
@@ -296,8 +307,9 @@
         };
         const readScratch = async () =>
           new Uint32Array(await renderer.getArrayBufferAsync(bins.scratch.value));
+        // Packed halves (plan §11.4 A1) — decoded to 4 channels per bin.
         const readPayload = async () =>
-          new Float32Array(await renderer.getArrayBufferAsync(bins.payload.value));
+          D.decodePayload(new Uint32Array(await renderer.getArrayBufferAsync(bins.payload.value)));
 
         say(`pixels ${PIXELS}  raysPerPixel ${RAYS_PER_PIXEL}  Lmax ${LMAX}  ` +
           `F ${D.DEPOSIT_F}  alpha ${ALPHA} (keep ${KEEP})`);
@@ -345,6 +357,11 @@
         let boundedViolations = 0;
         let maxAccum = 0;
         let maxCount = 0;
+        // The packed payload's own error, in binary16 ulps of the resolved
+        // value — measured beside the accumulator's rounding interval rather
+        // than folded into it, because the two are different quantizations
+        // with different bounds (plan §11.4 A1).
+        let packWorstUlps = 0;
         const CHECKPOINTS = new Set([1, 2, 3, 8, 16, K_STEADY]);
         for (let f = 1; f <= K_STEADY; f++) {
           await runFrame();
@@ -367,19 +384,27 @@
               if (scratch[b + D.BIN_T] > count) boundedViolations++;
               if (count < D.MIN_WEIGHT) continue;
               steadyBins++;
-              const o = i * D.PAYLOAD_WORDS;
+              const o = i * D.PAYLOAD_CHANNELS;
+              // The RESOLVED radiance, recomputed from the accumulator exactly as
+              // [F] does (`R · Lmax / count`) — this arm's subject is the
+              // accumulator's rounding interval, and reading it through the
+              // half-precision payload would fold in a second, larger
+              // quantization. The payload is checked against it one line down.
+              const resolvedL = (scratch[b + D.BIN_R] >>> 0) * (LMAX / count);
+              packWorstUlps = Math.max(packWorstUlps,
+                Math.abs(payload[o] - resolvedL) / D.payloadUlp(resolvedL));
               // c2 blocks: the hit's own cascade — full radiance, T = 0.
               // c0/c1:     pass-through only — no radiance, T = 1.
               const isOwn = info.cascade === OWN;
               const wantL = isOwn ? expectedL : 0;
               const wantT = isOwn ? 0 : 1;
-              steadyWorst = Math.max(steadyWorst, Math.abs(payload[o] - wantL));
+              steadyWorst = Math.max(steadyWorst, Math.abs(resolvedL - wantL));
               steadyTWorst = Math.max(steadyTWorst, Math.abs(payload[o + 3] - wantT));
               if (isOwn) {
                 // Signed: POSITIVE is the darkening the model predicts, and a
                 // negative value would mean the decay had brightened a bin,
                 // which no mechanism in this pass can do.
-                const rel = (wantL - payload[o]) / wantL;
+                const rel = (wantL - resolvedL) / wantL;
                 worstRel = Math.max(worstRel, rel);
                 bestRel = Math.min(bestRel, rel);
                 relSum += rel;
@@ -424,8 +449,14 @@
         check("the darkening is small in absolute terms at this exposure",
           Math.max(worstRel, -bestRel) < 0.01,
           `${(100 * Math.max(worstRel, -bestRel)).toFixed(3)}% of Lmax·${Q}/65536`);
-        check("transmittance is exactly 0 in the hit's cascade and 1 below it",
-          steadyTWorst <= 1e-5, `worst ${steadyTWorst.toExponential(2)}`);
+        // T = 1 crosses the packed payload as `ΣT/Σcount`, a hair under 1 from
+        // the accumulator's rounding deficit, and this driver's pack2x16float
+        // rounds TOWARD ZERO (measured: 1 − 2^-11 exactly, where round-to-
+        // nearest-even would give 1) — so "exactly 1" is one binary16 ulp.
+        check("transmittance is 0 in the hit's cascade and 1 (to a payload ulp) below it",
+          steadyTWorst <= D.payloadUlp(1), `worst ${steadyTWorst.toExponential(2)}`);
+        check("the packed payload is within one binary16 ulp of the resolved radiance",
+          packWorstUlps <= 1, `worst ${packWorstUlps.toFixed(3)} ulp`);
         check("the arm saw bins at all", steadyBins > 1000, `${steadyBins}`);
 
         // ══ ARM 2: BOUNDED ══════════════════════════════════════════════
@@ -749,7 +780,7 @@
               const first = info.binBase;
               const last = first + info.bins * info.blockCapacity;
               for (let i = first; i < last; i++) {
-                const o = i * D.PAYLOAD_WORDS;
+                const o = i * D.PAYLOAD_CHANNELS;
                 // Known in BOTH frames — a bin appearing or vanishing is a
                 // membership change, and R6 is explicit that this is measuring
                 // values and not membership.
@@ -818,6 +849,11 @@
             b.mul(uint(40503)).mod(uint(65535)).add(uint(1)),
           );
           store.freeStack.element(uint(store.blockInfluxBase).add(b)).assign(word);
+          // Every block LIVE for the arithmetic arms (2026-09-02): the decay
+          // now skips blocks no probe holds (srcProbes' live word), and these
+          // arms seed words on the WHOLE pool and diff every bin against the
+          // mirror — so mark the pool held, as a probe claim would.
+          store.freeStack.element(uint(store.blockLiveBase).add(b)).assign(uint(1));
         })().compute(store.blockTotal);
         // The per-word expected keep′, laid out bin-block by bin-block.
         // `uWord`/`sF` are ARM 10's surprise leg: at the default 0/1 this is the
@@ -1370,6 +1406,8 @@
         const setSurpriseWord = (word) => TSL.Fn(() => {
           store.freeStack.element(uint(store.blockSurpriseBase).add(instanceIndex))
             .assign(uint(word));
+          // Same reason as seedInflux: the whole pool must read as held.
+          store.freeStack.element(uint(store.blockLiveBase).add(instanceIndex)).assign(uint(1));
         })().compute(store.blockTotal);
         const zeroSurprise = setSurpriseWord(0);
         const oneSurprise = setSurpriseWord(cfgMod.SURPRISE_ONE);

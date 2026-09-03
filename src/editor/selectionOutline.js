@@ -351,7 +351,7 @@ function buildFullscreenMaterials(radius) {
  */
 export function updateSelectionOutlineMask({ renderer, scene, camera, width, height, pixelRatio, playing = false }) {
   if (!renderer || !scene || !camera) return false;
-  const wants = !playing && state.enabled && state.roots.length > 0;
+  const wants = state.enabled && state.roots.length > 0;
   if (wants) refreshEntries();
   if (!wants || state.entries.length === 0) {
     clearRing(renderer);
@@ -663,6 +663,27 @@ export async function precompileSelectionOutlineMasks({ renderer, scene, camera 
     try {
       for (const light of lights) light.visible = false;
       scene.overrideMaterial = material;
+      // (4) The target's GPU texture must EXIST before a compile against it
+      // (2026-09-02): a pipeline's colour target format is read off the
+      // backend's texture data, which is stamped when the target is first
+      // rendered to — and a fresh target (first use, a resize, or the
+      // renderer rebuild every scene switch triggers) has never been. The
+      // compile then asked for `targets: [{ format: undefined }]`:
+      // "Async render pipeline creation failed (selectionOutlineMask:
+      // selected_…): … 'format' … Required member is undefined", and the
+      // mask pass drew nothing until something else initialised the target.
+      // initRenderTarget creates the textures without a draw.
+      if (renderer._initialized === false) return;
+      renderer.initRenderTarget?.(state.maskTarget);
+      // (5) And it must be STAMPED on THIS renderer's backend. The two
+      // materials' compiles are awaited in turn, and a renderer rebuild (the
+      // device is destroyed on every scene switch whose antialias differs)
+      // can land between them: the captured `renderer` is then the disposed
+      // one, its backend hands back empty texture data, and the compile
+      // would ask for `format: undefined` — the same error, from a race the
+      // init above cannot see. No format, no compile; the next warm (the
+      // tree change that follows any rebuild) runs on the live renderer.
+      if (!renderer.backend?.get?.(state.maskTarget.texture)?.format) return;
       renderer.setRenderTarget(state.maskTarget);
       renderer.setMRT(null);
       pending = renderer.compileAsync(scene, camera);

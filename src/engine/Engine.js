@@ -1,4 +1,11 @@
 import * as THREE from "three/webgpu";
+import { installAsyncRenderPipelines } from "./asyncRenderPipelines.js";
+
+// Keep Three's URL-level FileLoader results for the lifetime of the engine.
+// Large scenes reuse texture/model URLs across components and scene reloads;
+// the default-disabled cache otherwise repeats the same fetch/decode inputs.
+// Asset edits resolve to a fresh blob URL, so editor invalidation stays exact.
+THREE.Cache.enabled = true;
 import { EventEmitter } from "./EventEmitter.js";
 import { Entity } from "./Entity.js";
 import {
@@ -503,6 +510,19 @@ export class Engine extends EventEmitter {
     const changed = !built
       || Object.keys(wanted).some((key) => wanted[key] !== built[key]);
     if (!changed) return;
+    // NAME THE DIFF (2026-09-02). A renderer rebuild DESTROYS THE DEVICE, and
+    // every GPU resource with it — GI rebuilds from scratch and pays its whole
+    // material wave again (~40 s on the user's machine). Their editor console
+    // read three `[gpu] DEVICE LOST (destroyed)` in four minutes while playing
+    // Sponza and nothing said why; a rebuild must always say which option
+    // moved, or it is indistinguishable from a driver fault.
+    if (built) {
+      const diff = Object.keys(wanted)
+        .filter((key) => wanted[key] !== built[key])
+        .map((key) => `${key} ${String(built[key])}→${String(wanted[key])}`)
+        .join(", ");
+      console.warn(`[gpu] renderer REBUILD (device destroyed, GI rebuilds and recompiles every material): ${diff}`);
+    }
     const canvas = this.renderer.domElement;
     // Wait for any in-flight rebuild before tearing down the renderer it
     // created — otherwise we'd dispose() a renderer that's mid-init() and
@@ -1180,17 +1200,34 @@ export class Engine extends EventEmitter {
       this.stats.markPhase(PHASE.renderEncode);
       const t0 = performance.now();
       const override = this.#activeRenderOverride();
-      if (override) {
-        // The override (typically a PostprocessComponent) runs the scene
-        // render to its own offscreen target and the post-graph blit to
+      // Native occlusion flags must span only the final scene render. Arming
+      // them in the earlier occlusion phase lets GI/editor nested renders
+      // produce results for a different render context and camera.
+      this.occlusion.prepareMainRender();
+      // The ONE render that presents the frame compiles its large material
+      // pipelines asynchronously and skips the draw until they land — see
+      // asyncRenderPipelines.js for the freeze it removes and why the scope
+      // is exactly this call (nested one-shot renders must stay sync).
+      const asyncPipelines = installAsyncRenderPipelines(this.renderer);
+      if (asyncPipelines) asyncPipelines.active = true;
+      try {
+        if (override) {
+          // The override (typically a PostprocessComponent) runs the scene
+          // render to its own offscreen target and the post-graph blit to
         // the canvas — via three's RenderPipeline + PassNode, which
-        // handles all render-target bookkeeping internally. Skipping
-        // the default renderer.render() avoids a redundant scene draw
+          // handles all render-target bookkeeping internally. Skipping
+          // the default renderer.render() avoids a redundant scene draw
         // (and the WebGPU validation errors that follow from manual
         // setRenderTarget calls).
-        override.render(this);
-      } else {
-        this.renderer.render(this.scene, this.camera);
+          override.render(this);
+        } else {
+          this.renderer.render(this.scene, this.camera);
+        }
+      } finally {
+        if (asyncPipelines) asyncPipelines.active = false;
+        // Query flags are render-context state. Do not let a post-render
+        // screenshot/debug/GI render consume them with another camera.
+        this.occlusion.finishMainRender();
       }
       const t1 = performance.now();
       this.stats.recordRenderMs(t1 - t0);

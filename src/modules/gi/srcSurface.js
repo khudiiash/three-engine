@@ -160,15 +160,22 @@
 // residual unattributed fraction on that scene is NOT the face hazard. Whatever
 // owns it is still open; do not re-derive this step looking for it.
 //
-// docs/GI_SRC_REBUILD_PLAN.md §4.4, §12.9, §12.26.10, §12.29.
+// ══ WHERE THE PALETTE WENT (§10) ════════════════════════════════════════════
+//
+// Decision 3's palette — the CPU walk that fills it, the pass that copies it
+// into `bits`, the reader that decodes it, the `emissiveOrphans` audit and the
+// mean-albedo fallback — now lives in `srcSlotPalette.js`, keyed on nothing
+// but a buffer, a word offset and a slot count, so the BVH transport can own
+// one without an occupancy field. This file keeps what is CELL-KEYED: the
+// record → stamp → slot lookup and the face retry. The field's own
+// `paletteUniform`/`palettePass` are handed to the factory rather than
+// rebuilt, so the words written to `bits` are the field's words and the one
+// pass in `passes` is the field's pass — nothing is dispatched twice.
+//
+// docs/GI_SRC_REBUILD_PLAN.md §4.4, §12.9, §12.26.10, §12.29; GI_SCALE_PLAN §10.
 
-import * as THREE from "three/webgpu";
-import { If, float, select, uint, uintBitsToFloat, uniform, vec3 } from "three/tsl";
-import { slotKeyOf } from "./slotRegistry.js";
-import { resolveMaterialSurface } from "./voxelizeOnce.js";
-
-/** Below this a resolved emissive counts as "this material does not emit". */
-const EMISSIVE_EPSILON = 1e-4;
+import { If, float, select, uint, vec3 } from "three/tsl";
+import { createSrcSlotPalette } from "./srcSlotPalette.js";
 
 /**
  * Static surface attribution for SRC's hit shading.
@@ -213,192 +220,30 @@ export function createSrcSurfaceAttribution(occField, world, slots, options = {}
   const { emitterMeshes = () => [], count = null, crossNumbering = false } = options;
   const {
     bits, recordIndexAt, palettePass, paletteUniform, paletteSlots,
-    paletteWordOffset, paletteWords, attrWordOffset, gridOrigin, voxelInv,
+    paletteWordOffset, attrWordOffset, gridOrigin, voxelInv,
   } = attr;
 
-  // The colour an unattributed hit shades at: the mean albedo over live slots,
-  // refreshed by `sync`. A UNIFORM and not a baked constant, for both of R11's
-  // reasons — the right grey is a property of the scene (a dark scene's
-  // fallback must be dark, or the unattributed fraction reads as bright
-  // patches), and it must be able to move without recompiling the graph.
-  const fallbackAlbedo = uniform(new THREE.Vector3(0.5, 0.5, 0.5));
-
-  const stats = {
-    /** Palette entries with a resolved surface. */
-    live: 0,
-    /** Occupancy placements with no atlas assignment — they shade at the mean. */
-    unassigned: 0,
-    /** Placements whose occupancy slot is past the palette (see below). */
-    slotOverflow: 0,
-    /**
-     * Surfaces whose material emits, whose published emissive is zero, and
-     * which are NOT in the NEE set: light deleted from both paths. Zero is the
-     * healthy reading; nonzero is a promotion-bookkeeping bug, caught before it
-     * reaches the image. See the header — a GPU counter structurally cannot see
-     * this one, because nothing carries emission to notice.
-     */
-    emissiveOrphans: 0,
-    /** NEE-flagged palette entries. Should equal the live emitter seat count. */
-    emitters: 0,
-    syncs: 0,
-  };
-
-  // Change detection. `revision` moves on a seat/clear/drag, `surfaceRevision`
-  // on a recolour, the placements array identity on a content rebuild, and the
-  // emitter stamp when a seat turns over — a recolour therefore costs one
-  // palette upload and touches nothing else, which is decision 3 in the header.
-  let seenRevision = -1;
-  let seenSurfaceRevision = -1;
-  let seenPlacements = null;
-  let seenPlacementCount = -1;
-  let seenEmitterStamp = "";
-  // Material → resolved surface, keyed the way `dynamicObjects.writeSurface`
-  // keys its own: a shader-graph walk per slot per sync would be paid on every
-  // seat change for an answer that only moves when the material does.
-  const materialCache = new Map(); // "id:version" -> resolveMaterialSurface result
-
-  const resolveCached = (mesh) => {
-    const material = Array.isArray(mesh?.material) ? mesh.material[0] : mesh?.material;
-    const key = `${material?.id ?? -1}:${material?.version ?? 0}`;
-    let hit = materialCache.get(key);
-    if (!hit) {
-      hit = resolveMaterialSurface(mesh?.material, mesh?.name);
-      materialCache.set(key, hit);
-    }
-    return hit;
-  };
-
-  /**
-   * @param {boolean} [force] rewrite even when nothing changed. Only a gate
-   *   needs this — it is how an arm that deliberately corrupted the palette
-   *   puts the real one back, and without it the early-out below would leave
-   *   the corruption in place for every arm after it.
-   */
-  function sync(force = false) {
-    const placements = occField.placements ?? [];
-    const emitters = emitterMeshes() ?? [];
-    let emitterStamp = "";
-    for (let i = 0; i < emitters.length; i++) emitterStamp += `${emitters[i]?.uuid ?? "-"},`;
-    if (
-      !force &&
-      slots.revision === seenRevision &&
-      slots.surfaceRevision === seenSurfaceRevision &&
-      placements === seenPlacements &&
-      placements.length === seenPlacementCount &&
-      emitterStamp === seenEmitterStamp
-    ) {
-      return;
-    }
-    seenRevision = slots.revision;
-    seenSurfaceRevision = slots.surfaceRevision;
-    seenPlacements = placements;
-    seenPlacementCount = placements.length;
-    seenEmitterStamp = emitterStamp;
-    stats.syncs++;
-
-    // THE BRIDGE, AND IT IS BY KEY. `assignments[j]` is the registry's own
-    // numbering and has nothing to do with `placement.slot`; the only thing the
-    // two share is the placement identity. Matching on that identity is what
-    // makes a remap unnecessary rather than merely correct.
-    const byKey = new Map();
-    for (const assignment of slots.assignments) {
-      if (assignment) byKey.set(assignment.key, assignment);
-    }
-    const emitterOf = new Map();
-    for (let i = 0; i < emitters.length; i++) {
-      if (emitters[i]) emitterOf.set(emitters[i], i);
-    }
-
-    const array = paletteUniform.array;
-    for (let i = 0; i < array.length; i++) array[i].set(0, 0, 0, 0);
-    stats.live = 0;
-    stats.unassigned = 0;
-    stats.slotOverflow = 0;
-    stats.emissiveOrphans = 0;
-    stats.emitters = 0;
-    let sumR = 0, sumG = 0, sumB = 0;
-
-    for (const placement of placements) {
-      // `_occSlotNext` is monotonic and never reused, so a long session of
-      // spawns and despawns can hand out a slot past the palette. It lands as
-      // UNATTRIBUTED (counted) rather than as another mesh's colour, which is
-      // the correct direction for an aliasing failure. Logged in §12.29.
-      if (!(placement.slot >= 0 && placement.slot < paletteSlots)) {
-        stats.slotOverflow++;
-        continue;
-      }
-      const assignment = byKey.get(slotKeyOf(placement.mesh, placement.instanceId));
-      if (!assignment?.surface) {
-        stats.unassigned++;
-        continue;
-      }
-      // THE DELIBERATE-FAILURE ARM. Writing the entry under the REGISTRY's
-      // index instead of the occupancy slot is §12.9's crossed-numbering bug,
-      // reproduced exactly: both numbers exist, both look like slot ids, and
-      // the picture is simply somebody else's colour.
-      const index = crossNumbering ? slots.assignments.indexOf(assignment) : placement.slot;
-      if (!(index >= 0 && index < paletteSlots)) continue;
-      const { color, emissive } = assignment.surface;
-      const emitterIndex = emitterOf.has(placement.mesh) ? emitterOf.get(placement.mesh) : -1;
-      if (emitterIndex >= 0) stats.emitters++;
-
-      // The both-zero check. `assignment.surface.emissive` is `#slotSurface`'s
-      // output, already zeroed for a promoted entry; if it is zero, the mesh's
-      // material emits, and no NEE seat claims it, then this surface's light
-      // exists on neither path.
-      const publishedDark =
-        Math.abs(emissive.r) < EMISSIVE_EPSILON &&
-        Math.abs(emissive.g) < EMISSIVE_EPSILON &&
-        Math.abs(emissive.b) < EMISSIVE_EPSILON;
-      if (publishedDark && emitterIndex < 0) {
-        const raw = resolveCached(placement.mesh);
-        const k = raw.emissiveIntensity ?? 1;
-        const emits =
-          (raw.emissive?.r ?? 0) * k > EMISSIVE_EPSILON ||
-          (raw.emissive?.g ?? 0) * k > EMISSIVE_EPSILON ||
-          (raw.emissive?.b ?? 0) * k > EMISSIVE_EPSILON;
-        if (emits) stats.emissiveOrphans++;
-      }
-
-      array[index * 2].set(color.r, color.g, color.b, emitterIndex + 1);
-      array[index * 2 + 1].set(emissive.r, emissive.g, emissive.b, 1);
-      stats.live++;
-      sumR += color.r;
-      sumG += color.g;
-      sumB += color.b;
-    }
-
-    // The fallback is the scene's own mean, not a constant grey. With no live
-    // slot at all the palette is empty and nothing can read it, so the 0.5 is
-    // unreachable rather than a tuned default.
-    if (stats.live > 0) {
-      fallbackAlbedo.value.set(sumR / stats.live, sumG / stats.live, sumB / stats.live);
-    }
-  }
+  // THE PALETTE, ADOPTED. The field already built the staging uniform and the
+  // copy pass (its tail region is sized for them), so the factory is handed
+  // both and builds neither: `sync` fills the field's uniform, `passes` is the
+  // field's pass, and the words in `bits` are the ones the field always wrote.
+  // `placements` is a getter because the array's IDENTITY is part of the
+  // change detection — a content rebuild replaces it.
+  const palette = createSrcSlotPalette({
+    bits,
+    wordOffset: paletteWordOffset,
+    slots: paletteSlots,
+    placements: () => occField.placements ?? [],
+    assignments: slots,
+    emitterMeshes,
+    count,
+    crossNumbering,
+    paletteUniform,
+    palettePass,
+  });
+  const { paletteAt, fallbackAlbedo, stats, sync } = palette;
 
   // ── the read ──────────────────────────────────────────────────────────────
-
-  /** Palette words for slot index `s` (a u32 node), unpacked. */
-  const paletteAt = (s) => {
-    const base = uint(paletteWordOffset).add(s.mul(uint(paletteWords))).toVar();
-    return {
-      albedo: vec3(
-        uintBitsToFloat(bits.element(base)),
-        uintBitsToFloat(bits.element(base.add(uint(1)))),
-        uintBitsToFloat(bits.element(base.add(uint(2)))),
-      ).toVar(),
-      emitter: float(bits.element(base.add(uint(3)))).sub(1).toVar(),
-      /** Diagnostic only: the raw word 0, numerically. See `debugProbe`. */
-      rawWord0: float(bits.element(base)).toVar(),
-      base,
-      emissive: vec3(
-        uintBitsToFloat(bits.element(base.add(uint(4)))),
-        uintBitsToFloat(bits.element(base.add(uint(5)))),
-        uintBitsToFloat(bits.element(base.add(uint(6)))),
-      ).toVar(),
-      live: float(bits.element(base.add(uint(7)))).toVar(),
-    };
-  };
 
   /** The stamp at level-0 voxel `v`, or 0 when the voxel carries no record. */
   const stampAt = (v) => {
@@ -485,11 +330,11 @@ export function createSrcSurfaceAttribution(occField, world, slots, options = {}
     };
   };
 
-  sync();
+  // (The factory synced once on construction; the palette is filled here.)
 
   return {
-    // One pass, 512 threads, and it is the whole cost of a recolour.
-    passes: palettePass ? [palettePass] : [],
+    // One pass — the FIELD's, adopted — and it is the whole cost of a recolour.
+    passes: palette.passes,
     bytes: attr.bytes,
     surfaceAt,
     sync,
@@ -500,22 +345,12 @@ export function createSrcSurfaceAttribution(occField, world, slots, options = {}
       recordCapacity: attr.recordCapacity,
       staticRecordCapacity: attr.staticRecordCapacity,
       get fallbackAlbedo() {
-        return [fallbackAlbedo.value.x, fallbackAlbedo.value.y, fallbackAlbedo.value.z];
+        return palette.debug.fallbackAlbedo;
       },
-      paletteEntry(slot) {
-        const a = paletteUniform.array[slot * 2];
-        const e = paletteUniform.array[slot * 2 + 1];
-        return {
-          albedo: [a.x, a.y, a.z],
-          emitter: a.w - 1,
-          emissive: [e.x, e.y, e.z],
-          live: e.w,
-        };
-      },
+      paletteEntry: palette.debug.paletteEntry,
     },
     dispose() {
-      materialCache.clear();
-      seenPlacements = null;
+      palette.dispose();
     },
   };
 }

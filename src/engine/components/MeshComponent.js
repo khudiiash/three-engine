@@ -46,6 +46,10 @@ export class MeshComponent extends Component {
     material8: "",
     castShadow: true,
     receiveShadow: true,
+    // Used only while the optional physics module is enabled. `auto` adds a
+    // visible Convex Collider; choose another shape on that component. `none`
+    // suppresses only the generated default.
+    collision: "auto",
     // ── GI: TWO INDEPENDENT AXES (src/modules/gi/dynamicObjects.js) ──────
     // Does it move, and what do rays intersect? Unrelated questions that used
     // to share one dropdown — which meant "I want exact triangles" could only
@@ -119,6 +123,7 @@ export class MeshComponent extends Component {
     { key: "material8", label: "Material 8", type: "asset", exts: ["mat"], hidden: true },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
+    { key: "collision", label: "Default Collider", type: "select", options: ["auto", "none"] },
     { key: "giMobility", label: "GI Mobility", type: "select", options: ["auto", "static", "dynamic"] },
     // Only meaningful for movers — a static mesh is traced exactly by the
     // world shadow BVH no matter what this says.
@@ -154,6 +159,7 @@ export class MeshComponent extends Component {
     this._geometryAssetLoading = false;
     this._materialAssetLoading = false;
     this._extraMaterialAssetsLoading = false;
+    this._assetLoadWaiters = new Set();
   }
 
   /** True while this mesh still renders any async asset placeholder state. */
@@ -161,6 +167,18 @@ export class MeshComponent extends Component {
     return this._geometryAssetLoading ||
       this._materialAssetLoading ||
       this._extraMaterialAssetsLoading;
+  }
+
+  /** Resolves once the geometry and every material requested by this attach settle. */
+  whenReady() {
+    if (!this.assetLoadsPending) return Promise.resolve();
+    return new Promise((resolve) => this._assetLoadWaiters.add(resolve));
+  }
+
+  #settleAssetWaiters() {
+    if (this.assetLoadsPending) return;
+    for (const resolve of this._assetLoadWaiters) resolve();
+    this._assetLoadWaiters.clear();
   }
 
   onAttach() {
@@ -176,6 +194,7 @@ export class MeshComponent extends Component {
     this.#loadExtraMaterials();
     // Honour the enabled flag at attach time.
     this.#applyVisibility();
+    this.entity.engine?.physics?.invalidateAutoCollider?.(this.entity);
   }
 
   onDetach() {
@@ -186,6 +205,7 @@ export class MeshComponent extends Component {
     this._geometryAssetLoading = false;
     this._materialAssetLoading = false;
     this._extraMaterialAssetsLoading = false;
+    this.#settleAssetWaiters();
     this.materialUnsub?.();
     this.materialUnsub = null;
     this.extraMaterialUnsubs?.forEach((unsubscribe) => unsubscribe());
@@ -193,6 +213,7 @@ export class MeshComponent extends Component {
     this.entity.object3D.remove(this.mesh);
     this.#releaseGeometry(this.mesh.geometry);
     this.mesh = null;
+    this.entity.engine?.physics?.invalidateAutoCollider?.(this.entity);
   }
 
   /**
@@ -262,6 +283,7 @@ export class MeshComponent extends Component {
       this.#applySharedMaterial(path);
     } finally {
       if (generation === this.sharedGeneration) this._materialAssetLoading = false;
+      this.#settleAssetWaiters();
     }
   }
 
@@ -277,6 +299,7 @@ export class MeshComponent extends Component {
       this.#applyMaterialSlots();
     } finally {
       if (generation === this.extraMaterialGeneration) this._extraMaterialAssetsLoading = false;
+      this.#settleAssetWaiters();
     }
   }
 
@@ -337,6 +360,7 @@ export class MeshComponent extends Component {
       console.warn(`Couldn't load geometry asset "${path}": ${err}`);
     } finally {
       if (generation === this.geometryGeneration) this._geometryAssetLoading = false;
+      this.#settleAssetWaiters();
     }
   }
 
@@ -350,6 +374,7 @@ export class MeshComponent extends Component {
     // `unitBoxMask` clips against. Snap non-box geometry to one.
     if (!terrainManaged && isVolumeMaterial(path) && (this.props.geometry !== "box" || this.props.geometryAsset)) {
       this.geometryGeneration = (this.geometryGeneration ?? 0) + 1;
+      this._geometryAssetLoading = false;
       console.warn(`Mesh "${this.entity?.name ?? this.entity?.id}" uses a volume .mat — snapping geometry to box for correct raymarch bounds.`);
       this.#releaseGeometry(this.mesh.geometry);
       this.mesh.geometry = new THREE.BoxGeometry(1, 1, 1);
@@ -405,6 +430,7 @@ export class MeshComponent extends Component {
         this.#loadGeometry(this.props.geometryAsset);
       } else {
         this._geometryAssetLoading = false;
+        this.#settleAssetWaiters();
         this.#releaseGeometry(this.mesh.geometry);
         const makeGeometry = geometryFactories[this.props.geometry] ?? geometryFactories.box;
         this.mesh.geometry = makeGeometry();
@@ -433,6 +459,7 @@ export class MeshComponent extends Component {
         this.#loadSharedMaterial(this.props.material);
       } else {
         this._materialAssetLoading = false;
+        this.#settleAssetWaiters();
         this.#applyMaterialSlots();
         this.materialRenderable = true;
         this.#applyVisibility();

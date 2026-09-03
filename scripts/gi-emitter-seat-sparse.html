@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Emitter seat-sparse gate — createGiLightShadowFilterPass sparse vs dense</title>
+    <style>html,body{margin:0;background:#111;color:#ddd;font:13px monospace}canvas{display:none}</style>
+  </head>
+  <body>
+    <canvas id="view" width="16" height="16"></canvas>
+    <pre id="log"></pre>
+    <script type="module">
+      // ══ §11.11 GATE: THE SPARSE SEAT RECONSTRUCTION ═══════════════════════
+      //
+      // Own renderer, synthetic gbuffer, no engine — the shipping
+      // `createGiLightShadowFilterPass` is imported and run in both of its
+      // modes on the same field. The raw the sparse arm sees is what the
+      // seat-rotating emitter-shadow pass writes: at pixel (x, y) only seat
+      // k = ((x + 2y + phase) & 3) mod n carries a sample, the other LIVE
+      // seats read −1, empty seats read 1 (width 0).
+      //
+      // The StorageTexture readback is the tile gate's compute-dump (no
+      // padded rows — [[webgpu-readback-padding]]).
+      const out = document.querySelector("#log");
+      const say = (line) => { out.textContent += line + "\n"; };
+      let failures = 0;
+      let checks = 0;
+      const check = (label, ok, detail = "") => {
+        checks++;
+        say(`  ${ok ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
+        if (!ok) failures++;
+      };
+      const fail = (error) => {
+        console.error("EMITTER-SEAT FAIL", error?.stack ?? error?.message ?? String(error));
+        globalThis.__EMITTER_SEAT_RESULT__ = {
+          pass: false, error: error?.message ?? String(error), text: out.textContent,
+        };
+      };
+      globalThis.addEventListener("error", (event) => fail(event.error ?? event.message));
+      globalThis.addEventListener("unhandledrejection", (event) => fail(event.reason));
+
+      try {
+        const THREE = await import("three/webgpu");
+        const TSL = await import("three/tsl");
+        const S = await import("/src/modules/gi/giScreen.js");
+        const { Fn, instanceIndex, instancedArray, ivec2, texture, uint, uniform } = TSL;
+
+        const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector("#view") });
+        await renderer.init();
+        const device = renderer.backend.device;
+        const validationErrors = [];
+        device.addEventListener?.("uncapturederror", (event) => {
+          validationErrors.push(event.error?.message ?? String(event.error));
+          console.error("WebGPU validation error:", validationErrors.at(-1));
+        });
+
+        const W = 64, H = 48;
+        const LIVE = 3;          // seats 0..2 live, seat 3 empty
+        const PHASE = 1;
+        const ISLAND = [10, 10]; // a pixel on its own plane
+        const EDGE = 32;         // the hard edge: x < EDGE is one side
+        const seatOf = (x, y, phase, n) => (((x + 2 * y + phase) & 3) % Math.max(1, n));
+
+        // ══ ARM 1: the lattice (CPU) ══════════════════════════════════════
+        say("── LATTICE: every 2×2 block and 3×3 window carries every live seat ──");
+        {
+          let bad2 = 0, bad3 = 0;
+          for (let n = 1; n <= 4; n++) for (let phase = 0; phase < 4; phase++) {
+            for (let y = 0; y + 1 < H; y++) for (let x = 0; x + 1 < W; x++) {
+              const seen = new Set();
+              for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) seen.add(seatOf(x + dx, y + dy, phase, n));
+              if (seen.size !== n) bad2++;
+            }
+            for (let y = 1; y + 1 < H; y++) for (let x = 1; x + 1 < W; x++) {
+              const seen = new Set();
+              for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) seen.add(seatOf(x + dx, y + dy, phase, n));
+              if (seen.size !== n) bad3++;
+            }
+          }
+          check("2×2 blocks complete for n = 1..4, phase 0..3", bad2 === 0, `${bad2} incomplete`);
+          check("3×3 windows complete for n = 1..4, phase 0..3", bad3 === 0, `${bad3} incomplete`);
+        }
+
+        // ══ THE SYNTHETIC GBUFFER ═════════════════════════════════════════
+        // Positions in texel units on the plane z = 0, normals +z; the island
+        // sits 50 units off the plane so every plane weight rejects it.
+        const pos = new Float32Array(W * H * 4);
+        const nrm = new Float32Array(W * H * 4);
+        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+          const o = (y * W + x) * 4;
+          const island = x === ISLAND[0] && y === ISLAND[1];
+          pos[o] = x + 0.5; pos[o + 1] = y + 0.5; pos[o + 2] = island ? 50 : 0; pos[o + 3] = 1;
+          nrm[o] = 0; nrm[o + 1] = 0; nrm[o + 2] = 1; nrm[o + 3] = 1;
+        }
+        const dataTex = (arr) => {
+          const t = new THREE.DataTexture(arr, W, H, THREE.RGBAFormat, THREE.FloatType);
+          t.needsUpdate = true;
+          return t;
+        };
+        const gbuffer = { position: dataTex(pos), normal: dataTex(nrm) };
+
+        // ══ THE FIELDS ════════════════════════════════════════════════════
+        // Shadow: ch0 a gentle sine, ch1 a ramp, ch2 a hard edge, ch3 empty (1).
+        // Width:  ch0 a half-plane of 0.2 (the mask semantics), ch1 a ramp,
+        //         ch2 lit everywhere (0), ch3 empty (0).
+        const shadowAt = (c, x, y) =>
+          c === 0 ? 0.5 + 0.4 * Math.sin(x / 16)
+          : c === 1 ? y / H
+          : c === 2 ? (x < EDGE ? 0 : 1)
+          : 1;
+        const widthAt = (c, x, y) =>
+          c === 0 ? (x < EDGE ? 0.2 : 0)
+          : c === 1 ? 0.05 + 0.01 * x
+          : 0;
+        const dense = new Float32Array(W * H * 4);
+        const sparse = new Float32Array(W * H * 4);
+        const distSparse = new Float32Array(W * H * 4);
+        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+          const o = (y * W + x) * 4;
+          const k = seatOf(x, y, PHASE, LIVE);
+          for (let c = 0; c < 4; c++) {
+            dense[o + c] = shadowAt(c, x, y);
+            const live = c < LIVE;
+            sparse[o + c] = c === k ? shadowAt(c, x, y) : live ? -1 : 1;
+            distSparse[o + c] = c === k ? widthAt(c, x, y) : live ? -1 : 0;
+          }
+        }
+        const rawDense = dataTex(dense);
+        const rawSparse = dataTex(sparse);
+        const distRaw = dataTex(distSparse);
+        // History = the dense field itself (a converged chain), positions = the gbuffer's.
+        const histShadow = dataTex(dense);
+        const histPos = dataTex(pos);
+
+        const storage = () => {
+          const t = new THREE.StorageTexture(W, H);
+          t.type = THREE.HalfFloatType;
+          return t;
+        };
+        const outDense = storage();
+        const outSparse = storage();
+        const outHist = storage();
+        const distFill = storage();
+        const distFillHist = storage();
+
+        // The identity reprojection: P.xy in texel units → NDC with the row
+        // flip the filter undoes (texture row 0 = NDC y +1).
+        const prevVP = new THREE.Matrix4().set(
+          2 / W, 0, 0, -1,
+          0, -2 / H, 0, 1,
+          0, 0, 0, 0,
+          0, 0, 0, 1,
+        );
+        const history = {
+          histShadow, histPos,
+          prevViewProj: uniform(prevVP),
+          weight: uniform(0.9),
+          validEps: 0.15,
+        };
+        const common = { gbuffer, width: W, height: H, resolveWidth: W, resolveHeight: H, planeEps: 0.1, softness: uniform(0.5) };
+        const passDense = S.createGiLightShadowFilterPass({ ...common, source: rawDense, target: outDense });
+        const passSparse = S.createGiLightShadowFilterPass({
+          ...common, source: rawSparse, target: outSparse, sparse: true, distSource: distRaw, distTarget: distFill,
+        });
+        const passHist = S.createGiLightShadowFilterPass({
+          ...common, source: rawSparse, target: outHist, sparse: true, history, distSource: distRaw, distTarget: distFillHist,
+        });
+
+        const dumpOf = (tex) => {
+          const dump = instancedArray(new Float32Array(W * H * 4), "float");
+          const read = texture(tex);
+          const pass = Fn(() => {
+            const i = instanceIndex.toVar();
+            const c = read.load(ivec2(i.mod(uint(W)).toInt(), i.div(uint(W)).toInt())).toVar();
+            const o = i.mul(4).toVar();
+            dump.element(o).assign(c.x);
+            dump.element(o.add(uint(1))).assign(c.y);
+            dump.element(o.add(uint(2))).assign(c.z);
+            dump.element(o.add(uint(3))).assign(c.w);
+          })().compute(W * H);
+          return { dump, pass };
+        };
+        const readBack = async (tex) => {
+          const { dump, pass } = dumpOf(tex);
+          await renderer.computeAsync(pass);
+          return new Float32Array(await renderer.getArrayBufferAsync(dump.value));
+        };
+
+        await renderer.computeAsync(passDense.compute);
+        await renderer.computeAsync(passSparse.compute);
+        await renderer.computeAsync(passHist.compute);
+        const D = await readBack(outDense);
+        const Sp = await readBack(outSparse);
+        const Hs = await readBack(outHist);
+        const F = await readBack(distFill);
+        const Fh = await readBack(distFillHist);
+        check("no WebGPU validation errors", validationErrors.length === 0, validationErrors[0] ?? "");
+
+        const F16 = 2e-3; // half-float storage tolerance at unit scale
+        const at = (arr, x, y, c) => arr[(y * W + x) * 4 + c];
+        const nearIsland = (x, y) => Math.abs(x - ISLAND[0]) <= 2 && Math.abs(y - ISLAND[1]) <= 2;
+        const interior = (x, y) => x >= 3 && x < W - 3 && y >= 3 && y < H - 3 && !nearIsland(x, y);
+        const offEdge = (x) => Math.abs(x - (EDGE - 0.5)) >= 2.5;
+
+        // ══ ARM 2: no sentinel leaks, empty seat exact ════════════════════
+        say("── LEAK: every output channel is a shadow value ──");
+        {
+          let leak = 0, empty = 0, leakH = 0;
+          for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) for (let c = 0; c < 4; c++) {
+            const v = at(Sp, x, y, c);
+            if (!(v >= -F16 && v <= 1 + F16)) leak++;
+            const vh = at(Hs, x, y, c);
+            if (!(vh >= -F16 && vh <= 1 + F16)) leakH++;
+            if (c === 3 && Math.abs(v - 1) > F16) empty++;
+          }
+          check("sparse output ∈ [0, 1] everywhere", leak === 0, `${leak} texel-channels outside`);
+          check("sparse+history output ∈ [0, 1] everywhere", leakH === 0, `${leakH} outside`);
+          check("empty seat (channel 3) stays exactly 1", empty === 0, `${empty} texels differ`);
+        }
+
+        // ══ ARM 3: sparse vs dense ════════════════════════════════════════
+        say("── RECONSTRUCTION: sparse vs dense over the interior ──");
+        let worstSmooth = 0;
+        {
+          let worstEdge = 0;
+          let n = 0;
+          for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+            if (!interior(x, y)) continue;
+            n++;
+            for (const c of [0, 1]) worstSmooth = Math.max(worstSmooth, Math.abs(at(Sp, x, y, c) - at(D, x, y, c)));
+            if (offEdge(x)) worstEdge = Math.max(worstEdge, Math.abs(at(Sp, x, y, 2) - at(D, x, y, 2)));
+          }
+          check(`smooth channels within 0.04 of the dense filter (${n} texels)`, worstSmooth <= 0.04, `worst ${worstSmooth.toFixed(4)}`);
+          check("hard edge exact away from the edge", worstEdge <= F16, `worst ${worstEdge.toFixed(4)}`);
+        }
+
+        // ══ ARM 4: the island ═════════════════════════════════════════════
+        say("── ISLAND: a pixel with no same-plane neighbour ──");
+        {
+          const [ix, iy] = ISLAND;
+          const k = seatOf(ix, iy, PHASE, LIVE);
+          const own = Math.abs(at(Sp, ix, iy, k) - shadowAt(k, ix, iy));
+          check(`own seat ${k} is its own sample`, own <= F16, `Δ ${own.toFixed(4)}`);
+          let others = 0, othersHist = 0;
+          for (let c = 0; c < LIVE; c++) {
+            if (c === k) continue;
+            others = Math.max(others, Math.abs(at(Sp, ix, iy, c) - 1));
+            othersHist = Math.max(othersHist, Math.abs(at(Hs, ix, iy, c) - shadowAt(c, ix, iy)));
+          }
+          check("unmarched seats hold 1 without history", others <= F16, `Δ ${others.toFixed(4)}`);
+          check("unmarched seats hold the validated HISTORY with one (clip must not crush it)", othersHist <= F16, `Δ ${othersHist.toFixed(4)}`);
+          const ownW = Math.abs(at(F, ix, iy, k) - widthAt(k, ix, iy));
+          let otherW = 0;
+          for (let c = 0; c < LIVE; c++) if (c !== k) otherW = Math.max(otherW, Math.abs(at(F, ix, iy, c)));
+          check("island width: own seat exact, the rest 0", ownW <= F16 && otherW <= F16, `own Δ ${ownW.toFixed(4)}, others ${otherW.toFixed(4)}`);
+        }
+
+        // ══ ARM 5: the width fill is NEAREST, never a mean ════════════════
+        say("── WIDTH: nearest valid tap, the mask semantics survive ──");
+        {
+          let notMask = 0, wrongSide = 0, rampWorst = 0, lit = 0, histDiff = 0;
+          for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+            if (nearIsland(x, y)) continue;
+            const v0 = at(F, x, y, 0);
+            if (Math.abs(v0) > F16 && Math.abs(v0 - 0.2) > F16) notMask++;
+            if (offEdge(x) && Math.abs(v0 - widthAt(0, x, y)) > F16) wrongSide++;
+            if (interior(x, y)) rampWorst = Math.max(rampWorst, Math.abs(at(F, x, y, 1) - widthAt(1, x, y)));
+            if (Math.abs(at(F, x, y, 2)) > F16) lit++;
+            for (let c = 0; c < 4; c++) histDiff = Math.max(histDiff, Math.abs(at(Fh, x, y, c) - at(F, x, y, c)));
+          }
+          check("half-plane width fills to exactly {0, 0.2}", notMask === 0, `${notMask} texels in between`);
+          check("half-plane width exact away from the edge", wrongSide === 0, `${wrongSide} wrong`);
+          check("ramp width within two texels of the ramp (0.02)", rampWorst <= 0.02 + F16, `worst ${rampWorst.toFixed(4)}`);
+          check("lit seat stays 0", lit === 0, `${lit} texels`);
+          check("the width fill ignores history", histDiff <= F16, `Δ ${histDiff.toFixed(4)}`);
+        }
+
+        // ══ ARM 6: the history blend ══════════════════════════════════════
+        say("── HISTORY: 0.9 of a converged history, 0.1 of the reconstruction ──");
+        let worstHist = 0;
+        {
+          for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+            if (!interior(x, y)) continue;
+            for (const c of [0, 1]) {
+              const expect = 0.1 * at(Sp, x, y, c) + 0.9 * shadowAt(c, x, y);
+              worstHist = Math.max(worstHist, Math.abs(at(Hs, x, y, c) - expect));
+            }
+          }
+          check("smooth channels blend the validated history at 0.9", worstHist <= 0.05, `worst ${worstHist.toFixed(4)}`);
+        }
+
+        say("");
+        say(`${checks} checks, ${failures} failed`);
+        globalThis.__EMITTER_SEAT_RESULT__ = {
+          pass: failures === 0, failures, checks, grid: `${W}×${H}`,
+          worstSmooth: worstSmooth.toFixed(4), worstHist: worstHist.toFixed(4), text: out.textContent,
+        };
+      } catch (error) {
+        fail(error);
+      }
+    </script>
+  </body>
+</html>

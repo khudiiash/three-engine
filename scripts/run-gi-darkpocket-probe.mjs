@@ -157,10 +157,13 @@ const report = await page.evaluate(async () => {
     tables.push(t);
   }
   const binCasc = bins?.cascades ?? [];
-  // payload is a FLOAT buffer, PAYLOAD_WORDS=4 per bin: [R,G,B,T], T<0 =
-  // UNKNOWN (srcMerge writes floats; the first run read it as u32 pairs and
-  // manufactured "known black" out of stride garbage).
-  const payload = bins?.payload?.value ? new Float32Array(await renderer.getArrayBufferAsync(bins.payload.value)) : null;
+  // payload is PACKED HALVES (plan §11.4 A1) — decode through the store's own
+  // codec: 4 channels per bin [R,G,B,T], T<0 = UNKNOWN. (Before the pack it
+  // was a float buffer; the first run of this probe read it as u32 pairs and
+  // manufactured "known black" out of stride garbage — same lesson.)
+  const payload = bins?.payload?.value && bins.decodePayload
+    ? bins.decodePayload(await renderer.getArrayBufferAsync(bins.payload.value))
+    : null;
 
   const inspect = (i) => {
     const out = {

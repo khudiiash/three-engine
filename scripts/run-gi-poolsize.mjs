@@ -62,7 +62,7 @@ await page.evaluateOnNewDocument((project, tier, ab) => {
   globalThis.__editorKeepRendering = true;
   globalThis.__giConfigOverride = {
     quality: tier,
-    resolveScale: tier === "ultra" ? 1 : 0.5,
+    resolveScale: tier === "ultra" ? Math.SQRT1_2 : 0.5,
     exactReflections: tier === "ultra",
   };
   if (ab) Object.assign(globalThis, ab);

@@ -255,6 +255,7 @@ export function MenuBar() {
       { label: "AmbientCG", action: () => openPanel("ambientcg") },
       { label: "Sketchfab", action: () => openPanel("sketchfab") },
       { label: "Poly Pizza", action: () => openPanel("polypizza") },
+      { label: "KayKit", action: () => openPanel("kaykit") },
       { label: "Fab", action: () => openPanel("fab") },
       { label: "itch.io", action: () => openPanel("itchio") },
       { label: "Audio Library", action: () => openPanel("audioLibrary") },

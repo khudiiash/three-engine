@@ -1,4 +1,5 @@
 // @ts-check
+import { releaseGiComputePipelineNode } from "./giComputePipelineCache.js";
 
 /**
  * Evicts a GI build's compute nodes from the RENDERER's caches.
@@ -141,7 +142,10 @@ export function releaseComputeNodes(renderer, nodes, harvest = null) {
       if (bindings?.has?.(node) === true && bindings.get(node)?.bindings !== undefined) {
         bindings.deleteForCompute(node);
       }
-      pipelines?.delete?.(node);
+      // Keep only the compiled GI pipeline/program when its WGSL is reusable.
+      // Bind groups and NodeManager state are still removed above/below, so no
+      // old storage buffer survives. Non-GI nodes retain Three's normal path.
+      if (!releaseGiComputePipelineNode(renderer, node)) pipelines?.delete?.(node);
       // LAST, and that is not cosmetic: `deleteForCompute` above falls back to
       // `nodes.getForCompute(node)` to find the bind groups when its own entry
       // has already gone. Dropping the builder state first would make that

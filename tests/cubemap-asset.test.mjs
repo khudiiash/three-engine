@@ -15,6 +15,7 @@ import {
   applySettingsToScene,
   mergeSettings,
 } from "../src/engine/sceneSettings.js";
+import { sceneSkyRadiance } from "../src/modules/gi/giConfig.js";
 import {
   ENVIRONMENT_EXTS,
   EQUIRECT_EXTS,
@@ -123,6 +124,55 @@ test("no cube map means the flat background color", () => {
   applySettingsToScene({ ...SCENE_SETTINGS_DEFAULTS, background: "#112233" }, scene, ambient(), null);
   assert.equal(scene.background.getHexString(), "112233");
   assert.equal(scene.environment, null);
+  // The colour is GI's sky too now, so the apply leaves the intensity scalar
+  // its fallback reads — the same knob the HDRI path uses.
+  assert.equal(scene.environmentIntensity, SCENE_SETTINGS_DEFAULTS.environment.intensity);
+});
+
+// ---------------------------------------------------------------------------
+// GI's sky: the environment texture, else the background colour
+//
+// `sceneSkyRadiance` is what a GI ray brings back when it escapes the scene.
+// Since 2026-08-30 the flat background colour is a sky, not just a backdrop —
+// and the "Use for lighting" toggle is what keeps a scene at exactly zero when
+// its author wants lamps only, which is how every GI fixture stays honest with
+// the "sky = 0 asserts no light from nothing" gates.
+// ---------------------------------------------------------------------------
+
+test("GI sky: an environment texture gives neutral radiance at the scene intensity", () => {
+  const scene = makeScene();
+  scene.environment = new THREE.Texture();
+  scene.environmentIntensity = 2;
+  const out = sceneSkyRadiance(scene, new THREE.Color());
+  assert.deepEqual([out.r, out.g, out.b], [2, 2, 2]);
+});
+
+test("GI sky: with no environment, the background colour lights with its chroma", () => {
+  const scene = makeScene();
+  scene.background = new THREE.Color("#ff0000"); // linear 1, 0, 0
+  scene.environmentIntensity = 0.5;
+  const out = sceneSkyRadiance(scene, new THREE.Color());
+  assert.deepEqual([out.r, out.g, out.b], [0.5, 0, 0]);
+});
+
+test("GI sky: the colour fallback is gated on environment.lighting", () => {
+  const scene = makeScene();
+  scene.background = new THREE.Color("#ff0000");
+  scene.environmentIntensity = 1;
+  const off = sceneSkyRadiance(scene, new THREE.Color(), { lighting: false });
+  assert.deepEqual([off.r, off.g, off.b], [0, 0, 0]);
+  const on = sceneSkyRadiance(scene, new THREE.Color(), { lighting: true });
+  assert.deepEqual([on.r, on.g, on.b], [1, 0, 0]);
+});
+
+test("GI sky: a texture background is not the colour sky", () => {
+  // An HDRI shown as sky with lighting deliberately off stays visible in the
+  // mirror term (visibility is not lighting), but the flat sky must not fire
+  // from it — the fallback is for the flat COLOUR only.
+  const scene = makeScene();
+  scene.background = new THREE.Texture();
+  const out = sceneSkyRadiance(scene, new THREE.Color(), { lighting: true });
+  assert.deepEqual([out.r, out.g, out.b], [0, 0, 0]);
 });
 
 test("a component-owned environment texture is never clobbered by a settings apply", () => {

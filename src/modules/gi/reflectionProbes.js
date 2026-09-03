@@ -1,5 +1,5 @@
 import * as THREE from "three/webgpu";
-import { float, mix, smoothstep, step, vec2, vec3, vec4 } from "three/tsl";
+import { Loop, float, mix, smoothstep, step, uint, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { octahedralUV } from "./srcOctahedral.js";
 
 /**
@@ -71,25 +71,66 @@ export function createReflectionProbeAtlas() {
 }
 
 /**
- * The per-slot uniforms materials AND the capture read. Two vec4s a slot:
- *   posFeather = (center.xyz, feather metres)
- *   halfActive = (half-extents.xyz, active 0/1)
- * GISystem owns one persistent array of these (its #reflProbeSlots) — the
- * material compiles against the uniform OBJECTS, so probe moves are uniform
- * writes, never rebuilds. Only probe EXISTENCE (0 ↔ >0) is structural.
+ * The per-slot data materials read — ONE uniform array per field, plus the
+ * live slot count, so the sampler below is a LOOP and not eight unrolled
+ * copies of itself.
+ *
+ * ⭐⭐ WHY (2026-09-02, the material wave): with the slots as sixteen scalar
+ * `uniform(Vector4)` nodes the sampler was unrolled once per slot, and every
+ * mirror-capable material fragment carried EIGHT copies of the box
+ * projection + two depth-parallax refinements + two atlas fetches — measured
+ * on the user's Level with the WGSL dumped from three's program cache:
+ * **327 kB with probes, 75 kB with `__giReflectionProbes = false`** (the
+ * exact-blend prefilter, the other suspect, was 7 kB). That 250 kB was the
+ * whole of the 13–39 s material wave, the ~100 ms TSL build of every
+ * material first seen on a camera turn, and the driver cache's miss rate.
+ * A uniform ARRAY is the same bytes to the GPU; the difference is that
+ * `element(i)` inside a `Loop` generates one body. Writers use `at(i)` and
+ * call `syncCount()` after a change; nothing about a probe short of its
+ * existence is a rebuild, exactly as before.
+ *
+ *   posFeather[i] = (center.xyz, feather metres)
+ *   halfActive[i] = (half-extents.xyz, active 0/1)
+ *   count         = one past the highest ACTIVE slot (the loop bound)
  */
 export function createReflectionProbeSlots() {
-  return Array.from({ length: MAX_REFLECTION_PROBES }, () => ({
-    posFeather: new THREE.Vector4(0, 0, 0, 0.5),
-    halfActive: new THREE.Vector4(0, 0, 0, 0),
-  }));
+  const posFeather = uniformArray(
+    Array.from({ length: MAX_REFLECTION_PROBES }, () => new THREE.Vector4(0, 0, 0, 0.5)),
+    "vec4",
+  );
+  const halfActive = uniformArray(
+    Array.from({ length: MAX_REFLECTION_PROBES }, () => new THREE.Vector4(0, 0, 0, 0)),
+    "vec4",
+  );
+  const count = uniform(0, "uint");
+  return {
+    posFeather,
+    halfActive,
+    count,
+    /** The two Vector4s of slot `i` — write them in place. */
+    at(i) {
+      return { posFeather: posFeather.array[i], halfActive: halfActive.array[i] };
+    },
+    /** Re-derive the loop bound from the active flags. Call after any write. */
+    syncCount() {
+      let n = 0;
+      for (let i = 0; i < MAX_REFLECTION_PROBES; i++) if (halfActive.array[i].w > 0) n = i + 1;
+      count.value = n;
+      return n;
+    },
+    /** Deactivate every slot (the reflections-off path). */
+    clear() {
+      for (let i = 0; i < MAX_REFLECTION_PROBES; i++) halfActive.array[i].w = 0;
+      count.value = 0;
+    },
+  };
 }
 
 /**
  * Sample the probe set at world point P along reflection dir R.
  *
- * `bundle` = { node, slots } — the atlas texture node plus the uniform slots
- * above (each entry { posFeather, halfActive } as TSL uniform nodes).
+ * `bundle` = { node, slots } — the atlas texture node plus the slot table
+ * from `createReflectionProbeSlots`.
  * Returns { rgb, weight }: the radiance (pre-multiplied by GI intensity at
  * capture time, matching reflectedOut/bvhOut's convention) and the feathered
  * coverage in [0,1] the caller mixes by.
@@ -103,10 +144,18 @@ export function createReflectionProbeSlots() {
  * Overlapping probes cross-fade by feathered containment; the weight sum also
  * hands the caller a smooth 0 at the boxes' edges, so probe reflections fade
  * into the glossy-field term instead of cutting.
+ *
+ * ONE LOOP BODY (see createReflectionProbeSlots): the slot count is a uniform
+ * bound, so an inactive slot costs nothing and a scene with one probe pays
+ * one iteration. Inside the body the discipline is the old one — pure
+ * dataflow, no gated sample (the 2026-08-01 codegen trap): a non-containing
+ * slot contributes through weight 0, and every fetch is `.level(0)`
+ * (textureSampleLevel, legal in any control flow).
  */
 export function sampleReflectionProbes(bundle, P, R, roughness) {
   const atlasW = REFL_PROBE_TILE * REFL_PROBE_LEVELS;
   const atlasH = REFL_PROBE_TILE * MAX_REFLECTION_PROBES;
+  const slots = bundle.slots;
   const sum = vec3(0).toVar();
   const wsum = float(0).toVar();
   // Fractional blur level from the roughness the BSDF shades with — the same
@@ -119,48 +168,40 @@ export function sampleReflectionProbes(bundle, P, R, roughness) {
     .toVar();
   const l0 = levelF.floor().min(REFL_PROBE_LEVELS - 2).toVar();
   const lt = levelF.sub(l0).clamp(0, 1).toVar();
-  // PURE DATAFLOW, deliberately — no `If`, no gated samples. The mirror
-  // block above this call site documents the codegen trap (2026-08-01:
-  // toVar-hoisted samples gated behind `If()` in this composite rendered
-  // BLACK). This function's own first version was If-gated, was rewritten
-  // after a black run, and the black went away — though that specific run
-  // was later found explainable by the empty-atlas compile race (see the
-  // gate's polled-sample note), so treat the 08-21 repro as UNVERIFIED and
-  // this shape as the safe idiom rather than a proven necessity. Every
-  // slot is computed and sampled unconditionally; an inactive or
-  // non-containing slot contributes through weight 0. The cost is
-  // 2×MAX_REFLECTION_PROBES small atlas fetches per reflective pixel.
-  for (let i = 0; i < MAX_REFLECTION_PROBES; i++) {
-    const slot = bundle.slots[i];
-    const pf = vec4(slot.posFeather);
-    const ha = vec4(slot.halfActive);
-    const center = pf.xyz;
-    const half = ha.xyz;
-    const local = vec3(P).sub(center);
+  // Ray/box exit sign along R — slot-independent, hoisted. step-derived
+  // (±1, never 0 — `sign(0)` would zero the divisor).
+  const sgn = vec3(
+    step(0, R.x).mul(2).sub(1),
+    step(0, R.y).mul(2).sub(1),
+    step(0, R.z).mul(2).sub(1),
+  ).toVar();
+  const rSafe = sgn.mul(vec3(R).abs().max(1e-5)).toVar();
+  const enable = globalThis.__giProbeDepthParallax !== false ? 1 : 0;
+  const Pv = vec3(P).toVar();
+  const Rv = vec3(R).toVar();
+  Loop({ start: uint(0), end: uint(slots.count), type: "uint", condition: "<" }, ({ i }) => {
+    const pf = vec4(slots.posFeather.element(i)).toVar();
+    const ha = vec4(slots.halfActive.element(i)).toVar();
+    const center = pf.xyz.toVar();
+    const half = ha.xyz.toVar();
+    const local = Pv.sub(center).toVar();
     // Feathered containment: distance to the nearest face, in metres, ramped
     // over the feather. Negative outside → clamp 0.
     const inset = half.sub(local.abs());
     const w = inset.x.min(inset.y).min(inset.z)
       .div(pf.w.max(1e-3)).clamp(0, 1)
-      .mul(ha.w);
-    // Ray/box exit along R. step-derived sign (±1, never 0 — `sign(0)` would
-    // zero the divisor); a degenerate axis falls out of the min() via a huge
-    // t rather than dividing by zero.
-    const sgn = vec3(
-      step(0, R.x).mul(2).sub(1),
-      step(0, R.y).mul(2).sub(1),
-      step(0, R.z).mul(2).sub(1),
-    );
-    const rSafe = sgn.mul(vec3(R).abs().max(1e-5));
+      .mul(ha.w).toVar();
+    // A degenerate axis falls out of the min() via a huge t rather than
+    // dividing by zero.
     const tExit = half.mul(sgn).sub(local).div(rSafe);
     const tHit = tExit.x.min(tExit.y).min(tExit.z).max(1e-3);
     // Direction from the capture point (the box centre) to the box hit —
     // the parallax correction itself. Division-guarded normalize: on an
     // inactive slot this vector is arbitrary, and a NaN here would poison
     // the sum THROUGH the zero weight (0 × NaN = NaN).
-    const dv = local.add(vec3(R).mul(tHit));
-    const dirP = dv.div(dv.length().max(1e-5));
-    const rowBase = i * REFL_PROBE_TILE;
+    const dv = local.add(Rv.mul(tHit));
+    const dirP = dv.div(dv.length().max(1e-5)).toVar();
+    const rowBase = float(i).mul(REFL_PROBE_TILE).toVar();
     // DEPTH-AWARE PARALLAX (§15 U4a, 2026-08-22). Box projection is exact
     // only for geometry ON the box faces — an interior partition captured by
     // a room-spanning probe gets relocated onto a box face and shows up as a
@@ -171,11 +212,7 @@ export function sampleReflectionProbes(bundle, P, R, roughness) {
     // the initial guess, read the stored depth there, land the world point
     // W0 the probe saw, project it onto the receiver's reflection ray for a
     // travel estimate s, and re-aim the lookup at the ray point P + R·s.
-    // One iteration — the box guess is already close for room-fitted boxes,
-    // and the correction is what moves interior geometry to where it is.
     // Miss texels store depth 0 → step() keeps pure box projection (env).
-    // Same pure-dataflow discipline as the rest of this function.
-    const enable = globalThis.__giProbeDepthParallax !== false ? 1 : 0;
     const refine = (dirIn) => {
       const uvI = octahedralUV(dirIn, REFL_PROBE_TILE);
       const uvDi = vec2(
@@ -185,11 +222,11 @@ export function sampleReflectionProbes(bundle, P, R, roughness) {
       const tI = float(bundle.node.sample(uvDi).level(0).w);
       const ok = step(0.05, tI).mul(enable);
       const Wi = center.add(dirIn.mul(tI));
-      const si = vec3(Wi).sub(P).dot(R).max(0.05);
-      const dci = vec3(P).add(vec3(R).mul(si)).sub(center);
+      const si = vec3(Wi).sub(Pv).dot(Rv).max(0.05);
+      const dci = Pv.add(Rv.mul(si)).sub(center);
       const dirCi = dci.div(dci.length().max(1e-5));
       const mixed = mix(dirIn, dirCi, ok);
-      return mixed.div(mixed.length().max(1e-5));
+      return mixed.div(mixed.length().max(1e-5)).toVar();
     };
     // TWO iterations: the first jumps from the box guess to the depth
     // field's neighbourhood, the second converges within it (measured on the
@@ -201,23 +238,17 @@ export function sampleReflectionProbes(bundle, P, R, roughness) {
     // Half-texel inset keeps the bilinear tap inside this tile — the atlas
     // packs levels side by side and probes row by row, and a tap that
     // crosses a seam blends another probe's world in.
-    const u = uvT.u.clamp(0.5, REFL_PROBE_TILE - 0.5);
-    const v = uvT.v.clamp(0.5, REFL_PROBE_TILE - 0.5);
-    const uvA = vec2(
-      u.add(l0.mul(REFL_PROBE_TILE)).div(atlasW),
-      v.add(rowBase).div(atlasH),
-    );
-    const uvB = vec2(
-      u.add(l0.add(1).mul(REFL_PROBE_TILE)).div(atlasW),
-      v.add(rowBase).div(atlasH),
-    );
+    const u = uvT.u.clamp(0.5, REFL_PROBE_TILE - 0.5).toVar();
+    const v = uvT.v.clamp(0.5, REFL_PROBE_TILE - 0.5).add(rowBase).div(atlasH).toVar();
+    const uvA = vec2(u.add(l0.mul(REFL_PROBE_TILE)).div(atlasW), v);
+    const uvB = vec2(u.add(l0.add(1).mul(REFL_PROBE_TILE)).div(atlasW), v);
     // `.level(0)` — textureSampleLevel: legal in any control flow, and the
     // atlas has no mips anyway (roughness blur is the LEVELS axis).
     const sA = vec3(bundle.node.sample(uvA).level(0));
     const sB = vec3(bundle.node.sample(uvB).level(0));
     sum.addAssign(mix(sA, sB, lt).mul(w));
     wsum.addAssign(w);
-  }
+  });
   return {
     rgb: sum.div(wsum.max(1e-4)),
     weight: wsum.clamp(0, 1),

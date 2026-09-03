@@ -1,6 +1,6 @@
 import * as THREE from "three/webgpu";
 import { Component } from "../../engine/components/Component.js";
-import { EDITOR_LAYER } from "../../engine/editorLayers.js";
+import { PHYSICS_DEBUG_LAYER } from "../../engine/editorLayers.js";
 import { physicsLayerNames } from "./layerConfig.js";
 
 const GIZMO_COLOR = 0x2d8bf0;
@@ -67,6 +67,7 @@ export class CharacterControllerComponent extends Component {
   ];
 
   onAttach() {
+    this._debugVisibleRequested ??= true;
     // Assigned by PhysicsSystem while playing; runtime methods no-op otherwise.
     this.body = null;
     this.collider = null;
@@ -92,6 +93,19 @@ export class CharacterControllerComponent extends Component {
     // build (Stop → Play). Rebuild the editor gizmo so it reflects edits now.
     this.#disposeGizmo();
     this.#buildGizmo();
+  }
+
+  onDisable() {
+    if (this.gizmo) this.gizmo.visible = false;
+  }
+
+  onEnable() {
+    if (this.gizmo) this.gizmo.visible = this._debugVisibleRequested;
+  }
+
+  setDebugVisible(visible) {
+    this._debugVisibleRequested = !!visible;
+    if (this.gizmo) this.gizmo.visible = this.enabled && this._debugVisibleRequested;
   }
 
   // ---- Script-facing API ----
@@ -182,7 +196,7 @@ export class CharacterControllerComponent extends Component {
     if (this.body) this.body.setTranslation({ x, y, z }, true);
   }
 
-  // ---- editor gizmo (capsule outline on the editor-only layer) ----
+  // ---- viewport gizmo (capsule outline on the physics-debug layer) ----
 
   #buildGizmo() {
     const { radius, height, offset } = this.props;
@@ -195,8 +209,10 @@ export class CharacterControllerComponent extends Component {
     // of drawing on top of every solid object in the scene — `depthTest: true`
     // (default) makes the wireframe a normal depth-tested overlay.
     this.gizmo.renderOrder = 1;
-    this.gizmo.layers.set(EDITOR_LAYER);
+    this.gizmo.visible = this.enabled && this._debugVisibleRequested;
+    this.gizmo.layers.set(PHYSICS_DEBUG_LAYER);
     this.gizmo.userData.engineOwned = true;
+    this.gizmo.userData.editorOnly = true;
     this.gizmo.raycast = () => {}; // never intercept viewport picking
     this.entity.object3D.add(this.gizmo);
   }

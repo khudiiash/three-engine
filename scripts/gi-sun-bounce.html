@@ -1,0 +1,459 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>html,body,canvas{margin:0;width:100%;height:100%;display:block;background:#111}</style>
+</head>
+<body>
+  <canvas id="view"></canvas>
+  <script type="module">
+    // ══ THE SUN-BOUNCE PROBE — IS BOUNCED SUNLIGHT THE RIGHT BRIGHTNESS? ═════
+    //
+    // Driven by scripts/run-gi-sun-bounce-probe.mjs. The user's report is
+    // "sun bounce looks too weak, it must bounce a lot more onto the scene
+    // carrying the wall albedo", made on Bistro with sky lighting OFF — so the
+    // question is specifically about the FIRST BOUNCE OF DIRECT SUN, with no
+    // ambient term to hide behind.
+    //
+    // ── WHY THIS SCENE ─────────────────────────────────────────────────────
+    //
+    // Three axis-aligned boxes: two parallel walls 3.5 m apart and a ground
+    // slab, sun at 45 degrees down the corridor. Wall A's inner face is lit
+    // ABOVE y = 2.555 and shadowed below it (wall B's top edge casts the line),
+    // so wall B — the receiver — is lit by nothing but bounce, off a source
+    // that is half in shadow. Small enough that the answer is a path-traced
+    // integral over three boxes (scripts/gi-sun-bounce-ref.mjs) rather than an
+    // opinion, and structured enough that "everything is lit" would score wrong.
+    //
+    // ── WHAT IT READS, AND WHY NOT THE SCREEN ──────────────────────────────
+    //
+    // `srcProbes.gather.gatherAt(point, normal).irradiance` — the same closure
+    // the resolve calls per pixel, asked directly for the points the reference
+    // path-traces. The `indirect` debug view was the obvious instrument and it
+    // is the wrong one: 8-bit sRGB, averaged over a screen band that mixes the
+    // wall, the floor and the shadow line, and it CLIPS — the no-shadow arm's
+    // true answer is 1.35 and the view reported 0.9995.
+    //
+    // ── AND THE VISIBILITY VERDICT BESIDE IT ───────────────────────────────
+    //
+    // The first suspect for a weak bounce is always "the sun shadow ray is
+    // occluding surfaces that can see the sun", so the probe measures that
+    // directly rather than inferring it: it traces rays with the shipping
+    // `createSrcSceneTrace`, runs the shipping `createSrcVisibility` from
+    // whatever the trace returned, and scores every verdict against the closed
+    // form. That population matters — evaluating visibility at ANALYTIC surface
+    // points scored 100% while the delivered irradiance was 32% low, and only
+    // the traced population can tell those apart.
+    //
+    // ⚠ RAYS BORN INSIDE SOLID GEOMETRY ARE EXCLUDED. Their hit is the inside
+    // of the far face, their face-forwarded normal points into the solid, and
+    // the shadow ray is then correctly blocked at exactly the wall's thickness.
+    // Counting them read 14.8% false-dark for a marcher that is actually right
+    // 99.3% of the time — the whole difference was the sampling.
+    //
+    // ── QUERY ARMS (every one is read at SHADER BUILD time) ────────────────
+    //
+    //   ?arm=base        shipping
+    //   ?arm=noshadow    __giSrcNoShadow — no visibility ray at all
+    //   ?arm=failopen    __giNoFailClosed — step exhaustion stops reporting a hit
+    //   ?arm=visocc      __giShadowRayHitMode=occupancy-legacy — the plain walk
+    //   ?sky=1           sky arm: sun off, white background at 0.1, which since
+    //                    2026-08-30 IS the sky (giConfig's sceneSkyRadiance)
+    //   ?settle=N        seconds before the last read (default 60); the probe
+    //                    reports the whole convergence ladder, not one number
+    //   ?quality=Q       low|medium|high|ultra
+    //   ?scene=plane     THE CALIBRATION ARM. One ground slab, nothing above it,
+    //                    camera looking straight down. A flat unoccluded surface
+    //                    under a uniform sky of radiance L receives E = pi*L
+    //                    EXACTLY — no form factor to argue about — so this is
+    //                    what turns the probe's readings from ratios into
+    //                    absolute irradiance. Run it with ?sky=1; it reads
+    //                    0.3138 against 0.31416, which is how we know a 0.72x
+    //                    elsewhere is the field and not the instrument.
+    //   ?alpha=A         pins __giSrcAlpha, the deposit accumulators' per-FRAME
+    //                    blend rate (shipping still-scene value 0.02 = a
+    //                    50-frame time constant). Separates "has not converged"
+    //                    from "converges to the wrong number".
+    const params = new URLSearchParams(location.search);
+    const arm = params.get("arm") ?? "base";
+    const skyArm = params.get("sky") === "1";
+    const settleSec = Number(params.get("settle") ?? 60);
+    const quality = params.get("quality") ?? "high";
+    const alpha = params.get("alpha");
+    const scene = params.get("scene") ?? "corridor";
+    // `?points=sky` swaps the bounce ladder for the OCCLUSION ladder — same
+    // corridor, same field, different question. See SKY_POINTS in
+    // scripts/gi-sun-bounce-ref.mjs for what it is asking and why.
+    const pointSet = params.get("points") ?? "bounce";
+    // `?cap=N` pins the PER-PROBE RAY CAP (srcConfig's `srcProbeRayCap`;
+    // 0 = uncapped). THE POINT IS THAT IT SHOULD CHANGE NOTHING: the bake
+    // normalises by weight, so spending more rays on a probe must buy less
+    // VARIANCE and not more ENERGY. The user's 2026-08-30 report — "when it
+    // just appears it is brighter, closer to what it should be, and gets
+    // darker with time" — is what a violation looks like on a live scene,
+    // because the light-track window lifts this cap to OFF on a change and
+    // drops it back when the window closes.
+    // Wall thickness in metres (default 0.5) — must equal the reference's
+    // WALL_T, which the runner passes through from the same env var.
+    const wallT = Math.max(0.05, Number(params.get("thick") ?? 0.5));
+    const rayCap = params.get("cap");
+    if (rayCap != null) globalThis.__giSrcProbeRayCap = Number(rayCap);
+    if (arm === "noshadow") globalThis.__giSrcNoShadow = true;
+    if (arm === "failopen") globalThis.__giNoFailClosed = true;
+    if (arm === "visocc") globalThis.__giShadowRayHitMode = "occupancy-legacy";
+    // `?arm=nosec` compiles the SECONDARY BOUNCE out (`__giSrcSecondary`). The
+    // reference is a 4-bounce path trace and its own header records that a
+    // single-bounce truth is ~20% low at this albedo — which is the size of the
+    // deficit the shipping arm reads. So the question this arm settles is
+    // whether the engine delivers more than one bounce AT ALL: if `base` and
+    // `nosec` agree, the secondary cache is contributing nothing and the
+    // "missing" light was never a transport bug.
+    if (arm === "nosec") globalThis.__giSrcSecondary = false;
+    if (alpha != null) globalThis.__giSrcAlpha = Number(alpha);
+
+    const W = 800, H = 600;
+    globalThis.__editorKeepRendering = true;
+    const { Engine, THREE, registerBuiltInComponents } = await import("/src/engine/index.js");
+    await import("/src/modules/index.js");
+    const { enableEngineModule } = await import("/src/engine/modules.js");
+    const { createSrcSceneTrace, createSrcVisibility, pickOccTrace,
+      SHADOW_LIFT_CELLS, SHADOW_SELF_BIAS_CELLS } = await import("/src/modules/gi/srcTrace.js");
+    const { MAX_MACRO_STEPS } = await import("/src/modules/gi/rayHit/RayHitPacking.js");
+    const TSL = await import("three/tsl");
+    const { Fn, instanceIndex, instancedArray, vec3, float, uint } = TSL;
+
+    // Geometry, shared by the scene build and the CPU scoring below — one
+    // source, so a wall that moves cannot move in only one of them.
+    const BOXES = scene === "plane"
+      ? [{ name: "ground", min: [-20, -0.4, -20], max: [20, 0, 20] }]
+      : [
+        // OUTWARD ONLY — the inner faces stay at ±1.75 so every probe point,
+        // the shadow line and the light are untouched. See WALL_T in
+        // scripts/gi-sun-bounce-ref.mjs for what this arm is asking.
+        { name: "wallA", min: [1.75, 0, -6], max: [1.75 + wallT, 6, 6] },
+        { name: "wallB", min: [-1.75 - wallT, 0, -6], max: [-1.75, 6, 6] },
+        { name: "ground", min: [-4, -0.2, -6], max: [4, 0, 6] },
+      ];
+
+    registerBuiltInComponents();
+    const engine = new Engine();
+    globalThis.__RIG_ENGINE__ = engine;
+    engine.setSize(W, H);
+    await engine.init(document.querySelector("#view"));
+    await engine.applySettings({
+      background: skyArm ? "#ffffff" : "#000000",
+      ambientColor: "#ffffff",
+      ambientIntensity: 0,
+      environment: { cubemap: "", background: true, lighting: skyArm, intensity: skyArm ? 0.1 : 0, rotation: 0, blur: 0 },
+      toneMapping: "linear",
+      exposure: 1,
+      shadows: true,
+    });
+
+    // 0x808080 sRGB = 0.216 linear, the albedo the reference uses.
+    const grey = new THREE.MeshStandardNodeMaterial({ color: 0x808080, roughness: 1 });
+    for (const b of BOXES) {
+      const size = b.max.map((v, i) => v - b.min[i]);
+      const m = new THREE.Mesh(new THREE.BoxGeometry(...size).toNonIndexed(), grey);
+      m.position.set(...b.max.map((v, i) => (v + b.min[i]) / 2));
+      m.updateMatrixWorld(true);
+      engine.scene.add(m);
+    }
+
+    await enableEngineModule(engine, "gi");
+    const gi = engine.createEntity({ name: "GI" });
+    gi.addComponent("global-illumination", { quality, ao: false, reflections: false });
+
+    // ⚠ THE PROBES ARE SCREEN-ANCHORED, SO THE CAMERA DECIDES WHERE `gatherAt`
+    // CAN ANSWER AT ALL. An earlier pose looked along the corridor and left
+    // wall A outside the frustum; that point then read a clean 0.0000 in every
+    // arm — no probes, not no light. This pose holds both walls and the floor
+    // in frame, which is a precondition of the measurement and not a preference.
+    const camera = new THREE.PerspectiveCamera(60, W / H, 0.1, 200);
+    if (scene === "plane") { camera.position.set(0, 6, 0.001); camera.lookAt(0, 0, 0); }
+    else { camera.position.set(0, 3, 10); camera.lookAt(0, 2.6, 0); }
+    camera.updateMatrixWorld(true);
+    engine.scene.add(camera);
+    engine.camera = camera;
+
+    if (!skyArm) {
+      const sunEnt = engine.createEntity({ name: "SunC" });
+      sunEnt.addComponent("light", { type: "directional", intensity: 10, color: "#ffffff", castShadow: false });
+      const travel = new THREE.Vector3(1, -1, 0).normalize();
+      sunEnt.object3D.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), travel);
+      sunEnt.object3D.updateMatrixWorld(true);
+    }
+
+    engine.start();
+
+    // FRAMES, not just seconds. Every temporal filter in the field accumulates
+    // per frame, and the arms do not run at the same frame rate — the shadowed
+    // arm compiles a whole extra marcher into the transport. "Converges slower"
+    // and "converges at the same rate on a slower clock" are different bugs.
+    let frames = 0;
+    engine.onPostRender(() => { frames++; });
+
+    const system = () => engine.modules.get("gi")?.system;
+    const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+    const deadline = performance.now() + 180000;
+    while (performance.now() < deadline) {
+      await settle(300);
+      if (system()?._fieldReadyOnce && system()?.state?.screen?.srcProbes?.gather?.gatherAt) break;
+    }
+
+    // Must match PROBE_POINTS in scripts/gi-sun-bounce-ref.mjs, in order.
+    const POINTS = scene === "plane" ? [
+      // One point, in the middle of a 40 m slab, so the hemisphere above it is
+      // open sky all the way to the horizon and E = pi*L with nothing else in it.
+      { name: "open ground (E = pi*L)", P: [0, 0.01, 0], n: [0, 1, 0] },
+    ] : pointSet === "lobe" ? (
+      // Must match LOBE_POINTS in scripts/gi-sun-bounce-ref.mjs — same point,
+      // same angles, same formula, so the two cannot drift.
+      [-70, -52.5, -35, -17.5, 0, 17.5, 35, 52.5, 70].map((deg) => {
+        const r = (deg * Math.PI) / 180;
+        return { name: `n ${deg}deg`, P: [-1.74, 2.2, 0], n: [Math.cos(r), Math.sin(r), 0] };
+      })
+    ) : pointSet === "sky" ? [
+      // Must match SKY_POINTS in scripts/gi-sun-bounce-ref.mjs, in order.
+      { name: "wallB top (open sky)", P: [-2.0, 6.01, 0], n: [0, 1, 0] },
+      { name: "corridor floor at wall", P: [-1.6, 0.01, 0], n: [0, 1, 0] },
+      { name: "wallB high (y 5.2)", P: [-1.74, 5.2, 0], n: [1, 0, 0] },
+      { name: "wallB mid (y 2.2)", P: [-1.74, 2.2, 0], n: [1, 0, 0] },
+      { name: "wallB low (y 0.3)", P: [-1.74, 0.3, 0], n: [1, 0, 0] },
+      { name: "corridor floor centre", P: [0, 0.01, 0], n: [0, 1, 0] },
+    ] : [
+      { name: "wallB mid (bounce only)", P: [-1.74, 2.2, 0], n: [1, 0, 0] },
+      { name: "wallB high", P: [-1.74, 5.0, 0], n: [1, 0, 0] },
+      { name: "wallB low", P: [-1.74, 0.8, 0], n: [1, 0, 0] },
+      { name: "corridor floor", P: [0, 0.01, 0], n: [0, 1, 0] },
+      { name: "wallA shadowed low", P: [1.74, 1.0, 0], n: [-1, 0, 0] },
+    ];
+
+    const out = {
+      arm: (skyArm ? `${arm}+sky` : arm) + (scene === "plane" ? "+plane" : "") +
+        (pointSet === "sky" ? "+occ" : "") +
+        (rayCap != null ? `+cap${rayCap}` : "") +
+        (wallT !== 0.5 ? `+t${wallT}` : "") +
+        (quality !== "high" ? `+${quality}` : "") + (alpha != null ? `+a${alpha}` : ""),
+      scene, settleSec, quality, alpha, points: [],
+    };
+
+    // ── the irradiance ladder ──────────────────────────────────────────────
+    try {
+      const gatherAt = system().state.screen.srcProbes.gather.gatherAt;
+      const NP = POINTS.length;
+      // Eight words in per point (xyz + pad, twice) so the buffer stays
+      // 16-byte aligned however the backend lays a float storage array out.
+      const inArr = new Float32Array(NP * 8);
+      POINTS.forEach((p, i) => { inArr.set(p.P, i * 8); inArr.set(p.n, i * 8 + 4); });
+      const pts = instancedArray(inArr, "float");
+      const res = instancedArray(new Float32Array(NP * 4), "float");
+      const kernel = Fn(() => {
+        const i = instanceIndex.toVar();
+        const b = i.mul(uint(8)).toVar();
+        const P = vec3(pts.element(b), pts.element(b.add(uint(1))), pts.element(b.add(uint(2)))).toVar();
+        const n = vec3(pts.element(b.add(uint(4))), pts.element(b.add(uint(5))), pts.element(b.add(uint(6)))).toVar();
+        const E = vec3(gatherAt(P, n).irradiance).toVar();
+        const o = i.mul(uint(4)).toVar();
+        res.element(o).assign(E.x);
+        res.element(o.add(uint(1))).assign(E.y);
+        res.element(o.add(uint(2))).assign(E.z);
+        // ⚠ PROOF OF LIFE. `getArrayBufferAsync` does NOT fence against the
+        // dispatch that filled the buffer: read back to back, four consecutive
+        // dispatches returned the PREVIOUS one's words. A read is only this
+        // dispatch's once the marker is there, and an all-zero buffer then
+        // means "never ran" rather than "every answer is zero" — which is
+        // exactly how the first version of this rig reported a working
+        // marcher as totally black.
+        res.element(o.add(uint(3))).assign(float(7.5));
+      })().compute(NP);
+
+      const marks = [];
+      for (let m = 5; m < settleSec; m *= 2) marks.push(m);
+      marks.push(settleSec);
+      let elapsed = 0;
+      for (const mark of marks) {
+        await settle(Math.max(0, mark - elapsed) * 1000);
+        elapsed = mark;
+        await engine.renderer.computeAsync(kernel);
+        let arr = null;
+        for (let attempt = 0; attempt < 60; attempt++) {
+          const a = new Float32Array(await engine.renderer.getArrayBufferAsync(res.value));
+          if (a[3] === 7.5) { arr = a; break; }
+          await settle(50);
+        }
+        if (!arr) { out.points.push({ t: mark, frames, error: "readback never settled" }); continue; }
+        out.points.push({
+          t: mark,
+          frames,
+          E: POINTS.map((p, i) => ({
+            name: p.name,
+            rgb: [+arr[i * 4].toFixed(4), +arr[i * 4 + 1].toFixed(4), +arr[i * 4 + 2].toFixed(4)],
+            lum: +(0.2126 * arr[i * 4] + 0.7152 * arr[i * 4 + 1] + 0.0722 * arr[i * 4 + 2]).toFixed(4),
+          })),
+        });
+        res.value.array[3] = 0;   // so the NEXT mark's settle test is honest
+      }
+    } catch (e) {
+      out.error = String((e && e.stack) || e);
+    }
+
+    // ── the visibility verdict, on the traced population ───────────────────
+    // Corridor only: the closed form below is wall B's shadow line, and a bare
+    // plane has nothing to occlude anything.
+    try {
+      if (scene === "plane") throw new Error("skipped: the plane arm has no shadow line");
+      const volume = system().state.volume;
+      const trace = createSrcSceneTrace(volume.occupancyField, volume.world, { rayHitMode: volume.rayHitMode });
+      const vis = createSrcVisibility(volume.occupancyField, volume.world, { rayHitMode: volume.rayHitMode });
+      const occTrace = pickOccTrace(volume.occupancyField, volume.rayHitMode);
+      const toLight = vec3(-Math.SQRT1_2, Math.SQRT1_2, 0);
+
+      const N = 16384;
+      // Sixteen words: hit xyz + (10 + hit), normal xyz + verdict, shadow t,
+      // shadow hit, exact hit xy, then the ray's ORIGIN — which is what lets
+      // rays born inside solid geometry be excluded rather than counted.
+      const res2 = instancedArray(new Float32Array(N * 16), "float");
+      const kernel2 = Fn(() => {
+        const i = instanceIndex.toVar();
+        // A cheap integer hash per lane. The origins only have to COVER the
+        // corridor: every sample is scored individually against the closed
+        // form, so the sampling distribution cancels out of the answer.
+        // `>>> 0` on the constant — JS multiplies into a double and TSL emits
+        // the literal verbatim, so k=2 produced `4493645014u` and the whole
+        // module failed to parse with "value cannot be represented as 'u32'".
+        const h = (k) => {
+          const x = i.mul(uint(0x9e3779b1)).add(uint((k * 0x85ebca6b) >>> 0)).toVar();
+          const y = x.bitXor(x.shiftRight(uint(16))).mul(uint(0x7feb352d)).toVar();
+          const z = y.bitXor(y.shiftRight(uint(15))).mul(uint(0x846ca68b)).toVar();
+          return float(z.bitXor(z.shiftRight(uint(16))).mod(uint(1 << 20))).div(float(1 << 20));
+        };
+        const o = vec3(h(1).mul(7.0).sub(3.5), h(2).mul(5.6).add(0.2), h(3).mul(11.0).sub(5.5)).toVar();
+        const ct = h(4).mul(2).sub(1).toVar();
+        const st = ct.mul(ct).oneMinus().max(0).sqrt().toVar();
+        const ph = h(5).mul(2 * Math.PI).toVar();
+        const d = vec3(st.mul(ph.cos()), ct, st.mul(ph.sin())).normalize().toVar();
+
+        const r = trace(o, d, float(40));
+        const P = vec3(r.position).toVar();
+        const n = vec3(r.normal).toVar();
+        const v = float(vis(P, n, toLight, null)).toVar();
+        // The same ray `createSrcVisibility` casts, re-cast for its `t`: the
+        // verdict alone cannot say WHERE the sun was blocked, and a fraction of
+        // a cell (the surface occluding itself on its own voxel staircase) and
+        // three and a half metres (a real occluder) are different bugs.
+        const lift = float(volume.world.minCell).mul(SHADOW_LIFT_CELLS).toVar();
+        const selfBias = float(volume.world.minCell).mul(SHADOW_SELF_BIAS_CELLS).toVar();
+        const sh = occTrace(P.add(n.mul(lift)), toLight, selfBias, vec3(volume.world.size).length(), {
+          steps: 64, macroSteps: MAX_MACRO_STEPS, dynamics: false,
+        });
+
+        const b = i.mul(uint(16)).toVar();
+        res2.element(b).assign(P.x);
+        res2.element(b.add(uint(1))).assign(P.y);
+        res2.element(b.add(uint(2))).assign(P.z);
+        res2.element(b.add(uint(3))).assign(float(r.hit).add(float(10)));
+        res2.element(b.add(uint(4))).assign(n.x);
+        res2.element(b.add(uint(5))).assign(n.y);
+        res2.element(b.add(uint(6))).assign(n.z);
+        res2.element(b.add(uint(7))).assign(v);
+        res2.element(b.add(uint(8))).assign(float(sh.t));
+        res2.element(b.add(uint(9))).assign(float(sh.hit));
+        res2.element(b.add(uint(10))).assign(o.x);
+        res2.element(b.add(uint(11))).assign(o.y);
+        res2.element(b.add(uint(12))).assign(o.z);
+      })().compute(N);
+
+      await engine.renderer.computeAsync(kernel2);
+      let arr = null;
+      for (let attempt = 0; attempt < 60; attempt++) {
+        const a = new Float32Array(await engine.renderer.getArrayBufferAsync(res2.value));
+        if (a[3] >= 9.9) { arr = a; break; }
+        await settle(50);
+      }
+      if (!arr) throw new Error("visibility readback never settled");
+
+      const cell = volume.world?.minCell?.value ?? 0.109375;
+      const L = [-Math.SQRT1_2, Math.SQRT1_2, 0];
+      // Closed form. A ray toward (-1,1,0)/root2 from (x,y) is blocked only by
+      // wall B, and only if it reaches wall B's x span at all — a point already
+      // left of the wall walks away from it. The ray gains one metre of y per
+      // metre of -x, so it crosses x = -1.75 at y + (x + 1.75).
+      const truthAt = (p) => (p.x <= -1.75 ? 1 : (p.y + (p.x + 1.75) > 6 ? 1 : 0));
+      const insideSolid = (q) => BOXES.some((bx) =>
+        q.every((c, k) => c > bx.min[k] - cell && c < bx.max[k] + cell));
+
+      let inside = 0, hits = 0, facing = 0, falseDark = 0, falseLit = 0, agree = 0;
+      const dist = [];
+      const byFace = new Map();
+      const samples = [];
+      for (let i = 0; i < N; i++) {
+        const b = i * 16;
+        if (arr[b + 3] < 10.5) continue;                 // 10 = miss, 11 = hit
+        if (insideSolid([arr[b + 10], arr[b + 11], arr[b + 12]])) { inside++; continue; }
+        hits++;
+        const p = { x: arr[b], y: arr[b + 1], z: arr[b + 2] };
+        const n = [arr[b + 4], arr[b + 5], arr[b + 6]];
+        const cos = n[0] * L[0] + n[1] * L[1] + n[2] * L[2];
+        if (!(cos > 0)) continue;                        // never casts a ray in the shading path either
+        facing++;
+        const t = truthAt(p);
+        const v = arr[b + 7] > 0.5 ? 1 : 0;
+        if (v === t) agree++;
+        else if (t === 1) {
+          falseDark++;
+          dist.push(arr[b + 8]);
+          if (samples.length < 12) {
+            const org = n.map((c, k) => p[["x", "y", "z"][k]] + c * SHADOW_LIFT_CELLS * cell);
+            samples.push({
+              P: [+p.x.toFixed(3), +p.y.toFixed(3), +p.z.toFixed(3)],
+              n: n.map((c) => +c.toFixed(2)),
+              t: +arr[b + 8].toFixed(3),
+              blockedAt: org.map((c, k) => +(c + L[k] * arr[b + 8]).toFixed(3)),
+            });
+          }
+        } else falseLit++;
+        const ax = Math.abs(n[0]) > Math.abs(n[1]) && Math.abs(n[0]) > Math.abs(n[2])
+          ? (n[0] > 0 ? "+x" : "-x")
+          : Math.abs(n[1]) > Math.abs(n[2]) ? (n[1] > 0 ? "+y" : "-y") : (n[2] > 0 ? "+z" : "-z");
+        const e = byFace.get(ax) ?? { face: ax, facing: 0, falseDark: 0, falseLit: 0 };
+        e.facing++; if (v !== t) { if (t === 1) e.falseDark++; else e.falseLit++; }
+        byFace.set(ax, e);
+      }
+      dist.sort((a, b2) => a - b2);
+      out.visibility = {
+        rays: N, originInsideSolid: inside, hits, sunFacing: facing,
+        agree: +(agree / Math.max(1, facing)).toFixed(4),
+        falseDark: +(falseDark / Math.max(1, facing)).toFixed(4),
+        falseLit: +(falseLit / Math.max(1, facing)).toFixed(4),
+        falseDarkMedianCells: dist.length ? +(dist[dist.length >> 1] / cell).toFixed(2) : null,
+        byFace: [...byFace.values()].map((e) => ({
+          face: e.face, facing: e.facing,
+          falseDark: +(e.falseDark / Math.max(1, e.facing)).toFixed(4),
+          falseLit: +(e.falseLit / Math.max(1, e.facing)).toFixed(4),
+        })),
+        samples,
+      };
+      out.minCell = cell;
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      if (msg.startsWith("skipped:")) out.visibilitySkipped = msg;
+      else out.visibilityError = String((e && e.stack) || e);
+    }
+
+    const st = await system().state.screen.srcProbes.readStats?.(engine.renderer).catch(() => null);
+    out.stats = st ? {
+      rays: st.rays?.rays, hits: st.rays?.hits, shadowRays: st.rays?.shadowRays,
+      unattributedRate: +(st.rays?.unattributedRate ?? 0).toFixed(3),
+      depMaxL: +((st.rays?.maxRadianceFraction ?? 0) * (Number(globalThis.__giSrcLmax) || 16)).toFixed(4),
+      meanKnownBins: +(st.tiles?.meanKnownBins ?? 0).toFixed(2),
+      knownFrac: +(st.tiles?.knownFrac ?? 0).toFixed(4),
+      mergeSky: st.merge?.sky, mergeBins: st.merge?.bins, orphans: st.merge?.orphans,
+    } : null;
+
+    globalThis.__RIG_RESULT__ = out;
+    console.log("RIG " + JSON.stringify(out));
+    globalThis.__RIG_DONE__ = true;
+  </script>
+</body>
+</html>

@@ -156,6 +156,10 @@ await page.evaluate(() => {
   const engine = api.entities.live("KT0sShKBX-")?.engine;
   globalThis.__savedEnv = engine.scene.environment;
   engine.scene.environment = null;
+  // The flat background colour is GI sky now (2026-08-30): this arm measures
+  // "no sky at all", so pin it black and restore it in the next arm.
+  globalThis.__savedBg = engine.scene.background?.isColor ? engine.scene.background.clone() : null;
+  if (engine.scene.background?.isColor) engine.scene.background.setRGB(0, 0, 0);
 });
 console.log(`  forced material update on ${await forceMaterialUpdate()} materials`);
 await wait(14000);
@@ -168,6 +172,7 @@ await page.evaluate(() => {
   const api = globalThis.__editorApi;
   const engine = api.entities.live("KT0sShKBX-")?.engine;
   engine.scene.environment = globalThis.__savedEnv;
+  if (globalThis.__savedBg) engine.scene.background.copy(globalThis.__savedBg);
   globalThis.__giKeepIBL = true;
 });
 console.log(`  forced material update on ${await forceMaterialUpdate()} materials`);

@@ -37,7 +37,7 @@
 // docs/GI_SRC_REBUILD_PLAN.md §4.3.
 
 import { If, float, select, vec3 } from "three/tsl";
-import { RayHitMode } from "./rayHit/RayHitConfig.js";
+import { RayHitMode, normalizeRayHitMode } from "./rayHit/RayHitConfig.js";
 import { MAX_MACRO_STEPS } from "./rayHit/RayHitPacking.js";
 
 /**
@@ -116,7 +116,8 @@ export function createSrcSceneTrace(occField, world, {
   const dynEnabled = !!(dyn?.enabled && dyn.surfaceAt);
   const reportObj = wantDynObj && dynEnabled && !skipMovers;
 
-  return (origin, dir, tMaxWorld) => {
+  // `tMinWorld` (§11.13, optional) — see createSrcBvhSceneTrace's note.
+  const traceFn = (origin, dir, tMaxWorld, _n = null, tMinWorld = null) => {
     const o = vec3(origin).toVar();
     const d = vec3(dir).toVar();
     // ── SELF-BIAS COMES FROM THE MEDIUM, NOT FROM PROBE SPACING (R2) ────────
@@ -125,12 +126,16 @@ export function createSrcSceneTrace(occField, world, {
     // because the occupancy voxel is what quantized the intersection; deriving
     // it from s0 would make the bias change when a user drags a probe-density
     // slider, which is how a spacing dial turns into a leak dial.
-    const tMin = float(world.minCell).mul(0.25).toVar();
+    const tMin = (tMinWorld != null
+      ? float(tMinWorld).max(float(world.minCell).mul(0.25))
+      : float(world.minCell).mul(0.25)).toVar();
     const r = trace(o, d, tMin, float(tMaxWorld), {
       steps,
       macroSteps: MAX_MACRO_STEPS,
       profile: true,
       dynObj: reportObj,
+      // §11.15: the ray excludes the proxy it was born in (see srcBvhTrace).
+      excludePoint: o,
       ...(skipMovers ? { dynamics: false } : {}),
     });
     // Lift along the normal by half a coarse cell. For a VOXEL-face hit this
@@ -155,6 +160,10 @@ export function createSrcSceneTrace(occField, world, {
       voxel: r.voxel != null ? vec3(r.voxel).toVar() : null,
     };
   };
+  // §11.13: see createSrcBvhSceneTrace — both marcher rungs return a voxel
+  // and report a mover only when asked.
+  traceFn.fields = ["hit", "t", "position", "exactPosition", "normal", ...(reportObj ? ["dynObj"] : []), "voxel"];
+  return traceFn;
 }
 
 /**
@@ -225,7 +234,24 @@ export function createSrcVisibility(occField, world, {
   steps = 64,
   rayHitMode = RayHitMode.HybridPlane,
 } = {}) {
-  const trace = pickOccTrace(occField, rayHitMode);
+  // `__giShadowRayHitMode` — the isolation hatch: run the VISIBILITY rays on a
+  // different trace implementation than the diffuse rays sharing the field,
+  // splitting "the hybrid accept logic" from "the voxel walk itself" without
+  // touching the diffuse transport. `normalizeRayHitMode` is the identity on a
+  // valid mode integer, so an unset hatch emits exactly what it always did.
+  //
+  // ⛔ **AND IT IS NOT WHERE THE SUN'S BOUNCE GOES.** This hatch was added
+  // 2026-08-30 on the theory that "the sun's transfer dies in these verdicts,
+  // ~85% falsely occluded". THAT IS REFUTED. `npm run probe:gi-sun-bounce`
+  // scores the shipping verdicts against a closed form on the population that
+  // actually shades — hits from `createSrcSceneTrace`, not analytic points —
+  // and this marcher agrees on **99.3%** of sun-facing hits with ZERO false-lit
+  // and the residual false-dark sitting on the shadow line itself. The 85%
+  // came from a probe that cast rays FROM INSIDE THE WALLS, where the verdict
+  // is correctly "occluded" and no probe can sit. The bounce deficit that
+  // remains (0.84x of a path-traced truth, 0.72x where a shadow boundary
+  // dominates the hemisphere) is downstream of here — plan §2.7.
+  const trace = pickOccTrace(occField, normalizeRayHitMode(globalThis.__giShadowRayHitMode ?? rayHitMode));
   // The whole-medium bound a directional source wants. `world.size` is a
   // uniform, so a refit (R11) moves it without a recompile.
   const diagonal = () => vec3(world.size).length();

@@ -50,12 +50,12 @@ export function physicsAvailable() {
   return !!getComponentClass("collider");
 }
 
-/** The collider spec a walkable piece gets. `mesh` (a trimesh built from the
+/** The collider spec a walkable piece gets. `concave` (a trimesh built from the
  *  rendered geometry at play start) rather than a box, because a stair and a
  *  wall with a door are not boxes — and because a trimesh re-derives itself
  *  when the piece is resized, so collision can never drift from the picture. */
 function colliderSpec() {
-  return { type: "collider", props: { shape: "mesh", friction: 0.6, restitution: 0 } };
+  return { type: "collider", props: { shape: "concave", friction: 0.6, restitution: 0 } };
 }
 
 /**

@@ -33,12 +33,14 @@ export class ObjModelComponent extends Component {
     textures: {}, // material slot -> texture filename (within the same folder)
     castShadow: true,
     receiveShadow: true,
+    collision: "auto",
   };
   static schema = [
     { key: "obj", label: "OBJ File", type: "asset", exts: ["obj"] },
     { key: "mtl", label: "MTL File", type: "asset", exts: ["mtl"] },
     { key: "castShadow", label: "Cast Shadow", type: "boolean" },
     { key: "receiveShadow", label: "Receive Shadow", type: "boolean" },
+    { key: "collision", label: "Default Collider", type: "select", options: ["auto", "none"] },
   ];
 
   onAttach() {
@@ -72,6 +74,7 @@ export class ObjModelComponent extends Component {
   }
 
   onPropChanged(key) {
+    if (key === "collision") return;
     if (key === "castShadow" || key === "receiveShadow") {
       if (this.root) {
         this.root.traverse((obj) => {

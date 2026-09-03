@@ -50,6 +50,7 @@ const polypizza = read("src/editor/polypizza.js");
 const ambientcg = read("src/editor/ambientcg.js");
 const polyhaven = read("src/editor/polyhaven.js");
 const fab = read("src/editor/fab.js");
+const kaykit = read("src/editor/kaykit.js");
 const previewSources = read("src/editor/previewSources.js");
 const rust = read("src-tauri/src/lib.rs");
 
@@ -59,6 +60,7 @@ const BROWSERS = [
   { panel: "ambientcg", component: "AmbientCGPanel", module: "ambientcg", menu: "AmbientCG" },
   { panel: "sketchfab", component: "SketchfabPanel", module: "sketchfab", menu: "Sketchfab" },
   { panel: "polypizza", component: "PolyPizzaPanel", module: "polypizza", menu: "Poly Pizza" },
+  { panel: "kaykit", component: "KayKitPanel", module: "kaykit", menu: "KayKit" },
   { panel: "fab", component: "FabPanel", module: "fab", menu: "Fab" },
   { panel: "itchio", component: "ItchioPanel", module: "itchio", menu: "itch.io" },
   { panel: "audioLibrary", component: "AudioLibraryPanel", module: "audio-library", menu: "Audio Library" },
@@ -148,7 +150,7 @@ console.log("\nlibrary — MCP coverage tracks the panels");
 check("every keyed browser is a library.* provider", () => {
   // itch.io and the audio library are the two exceptions with their own op
   // families; everything else must be reachable through library.search.
-  for (const id of ["polyhaven", "ambientcg", "sketchfab", "polypizza", "fab", "itchio"]) {
+  for (const id of ["polyhaven", "ambientcg", "sketchfab", "polypizza", "kaykit", "fab", "itchio"]) {
     assert.ok(
       new RegExp(`^\\s*${id}: \\{ module:`, "m").test(libraryOps),
       `${id} is not in library.js PROVIDERS — the panel would have no MCP equivalent`,
@@ -704,6 +706,73 @@ check("the ops surface whether a found listing can actually be imported", () => 
 });
 
 // ---------------------------------------------------------------------------
+console.log("\nlibrary — KayKit specifics");
+// ---------------------------------------------------------------------------
+
+check("KayKit needs no credential, anywhere", () => {
+  // The source is a public GitHub account whose API and raw file host are
+  // both anonymous, so a credential row would be a lie (same reasoning as
+  // Fab above, different mechanism — no Cloudflare, no proxy at all).
+  for (const fn of ["getSavedToken", "validateAndSaveToken"]) {
+    assert.ok(!new RegExp(`export (async )?function ${fn}|export const ${fn}`).test(kaykit),
+      `kaykit.js exports ${fn}`);
+  }
+  const providers = modulesPanel.match(/const CREDENTIAL_PROVIDERS = \{[\s\S]*?\n\};/)[0];
+  assert.ok(!/\bkaykit: \[/.test(providers), "kaykit must not have a credential row");
+  assert.ok(
+    /kaykit: \{ module: "kaykit", label: "KayKit", types: \["model"\], needsKey: false \}/.test(libraryOps),
+    "library.status must report kaykit as keyless",
+  );
+});
+
+check("only GLB files are listed, and the display name strips both suffixes", () => {
+  // Loose `.gltf` + `.bin` trios would need reassembly the other providers
+  // do in their zip paths; the same trees already carry self-contained GLBs.
+  // And Dungeon Remastered names them `.gltf.glb` — keeping the inner
+  // suffix fills the grid with "banner_blue.gltf"s.
+  assert.ok(
+    kaykit.includes('entry.type === "blob" && /\\.glb$/i.test(entry.path)'),
+    "the tree filter is not GLB-only",
+  );
+  // First `;` after the arrow — CRLF-tolerant, so the lazy scan cannot run
+  // past the statement on a checkout that normalizes line endings.
+  const name = kaykit.match(/const displayNameOf = \(path\) =>[\s\S]*?;/)?.[0] ?? "";
+  assert.ok(name.includes("/\\.gltf\\.glb$/i"), "the .gltf.glb double suffix is not stripped");
+  assert.ok(name.includes("/\\.glb$/i"), "the plain .glb suffix is not stripped");
+});
+
+check("character vs prop is a PATH decision, and it is the animated flag", () => {
+  // Both character repos keep rigged GLBs under Characters/ and accessories
+  // under Assets/, so the folder answers "animated" without a per-file API
+  // call — a character GLB carries its clips inside, a prop does not.
+  const item = kaykit.match(/\.map\(\(entry\) => \(\{[\s\S]*?\}\)\);/)?.[0] ?? "";
+  assert.ok(item.includes("kind: /\\/Characters\\//i.test(entry.path)"), "the Characters path split is missing");
+  assert.ok(item.includes("animated: /\\/Characters\\//i.test(entry.path)"),
+    "animated is not derived from the same path split");
+});
+
+check("the id carries everything import needs — repo AND path", () => {
+  // The trees API has no get-one-file endpoint, so an id of just the name
+  // cannot be re-found at import time. `<repo>:<path>` is stateless.
+  assert.ok(kaykit.includes("id: `${repoId}:${entry.path}`"), "ids are not <repo>:<path>");
+  assert.ok(/export async function resolveItem/.test(kaykit), "no resolver for import");
+  const branches = libraryOps.match(/if \(provider === "kaykit"\) \{/g) ?? [];
+  assert.equal(branches.length, 2, `expected search + import branches, found ${branches.length}`);
+  assert.ok(/resolveItem\(String\(id\)\)/.test(libraryOps), "the import branch does not resolve the id");
+});
+
+check("attribution is written, and records CC0 rather than a credit duty", () => {
+  assert.ok(/ATTRIBUTION\.md/.test(kaykit), "no attribution file on import");
+  const attribution = kaykit.match(/export function buildAttribution[\s\S]*?\n\}/)[0];
+  assert.ok(/CC0 1\.0 Universal/.test(attribution), "the licence is not stated");
+  // The file must say credit is OPTIONAL — a CC0 notice that reads like a
+  // CC-BY duty trains users to demand attribution everywhere.
+  assert.ok(/attribution required/.test(attribution) && /no/.test(attribution),
+    "CC0's no-credit-required is not spelled out");
+  assert.ok(/Kay Lousberg/.test(attribution), "the creator is not credited");
+});
+
+// ---------------------------------------------------------------------------
 console.log("\nlibrary — Sketchfab's normalised shape");
 // ---------------------------------------------------------------------------
 
@@ -794,7 +863,7 @@ check("every asset browser module is reachable through an op family", () => {
   // The standing rule: a feature is not done until an agent can drive it.
   // library.* covers five providers; audio-library has its own family.
   const covered = { polyhaven: "library", ambientcg: "library", sketchfab: "library",
-    polypizza: "library", fab: "library", itchio: "library", "audio-library": "audio.library" };
+    polypizza: "library", kaykit: "library", fab: "library", itchio: "library", "audio-library": "audio.library" };
   for (const browser of BROWSERS) {
     assert.ok(covered[browser.module], `${browser.module} has no op family`);
   }
@@ -923,6 +992,7 @@ check("every model browser shows something interactive, not a still", () => {
     ["PolyPizzaPanel", "src="],
     ["PolyHavenPanel", "src="],
     ["AmbientCGPanel", "src="],
+    ["KayKitPanel", "src="],
     ["SketchfabPanel", "embedUrl="],
     ["FabPanel", "embedUrl="],
   ]) {
@@ -983,7 +1053,10 @@ check("ambientCG builds its OBJ preview in memory and leaks no blob URLs", () =>
   assert.ok(/export const PREVIEW_MODEL_RES = \["LQ-1K-JPG"/.test(ambientcg), "no smallest-variant preference");
   assert.ok(/export function modelPreviewUrl/.test(ambientcg), "no preview archive resolver");
   assert.ok(/export async function loadObjArchivePreview/.test(previewSources), "no OBJ preview loader");
-  const fn = previewSources.match(/export async function loadObjArchivePreview[\s\S]*?\n\}\n/)[0];
+  // `\r?` — this file has been seen on disk with CRLF endings, and a
+  // line-ending-sensitive match here reported the loader as MISSING rather
+  // than the test as brittle.
+  const fn = previewSources.match(/export async function loadObjArchivePreview[\s\S]*?\r?\n\}\r?\n/)?.[0];
   assert.ok(/revokeObjectURL/.test(fn), "blob URLs are never revoked");
   assert.ok(/finally \{/.test(fn), "a failed texture load would leak every URL created before it");
   // MTLLoader resolves textures through the manager asynchronously, which would

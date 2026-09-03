@@ -271,17 +271,22 @@
           gpuProbes.push({ keyToBlock, blockToKey });
         }
 
-        /** Payload word offset of (cascade, block, morton). */
+        /** DECODED payload offset of (cascade, block, morton) — 4 channels per bin. */
         const slotOf = (c, block, m) =>
-          (bins.cascades[c].binBase + block * bins.cascades[c].bins + m) * D.PAYLOAD_WORDS;
+          (bins.cascades[c].binBase + block * bins.cascades[c].bins + m) * D.PAYLOAD_CHANNELS;
+        /** One binary16 ulp at `v` — what a value that crossed the packed payload may be off by. */
+        const ulp16 = (v) => D.payloadUlp(v);
 
         // Write a resolved field into the payload buffer. `fill(c, key, m)`
         // returns a bin or null; every bin the caller does not claim stays
         // UNKNOWN, which is also what [F] writes for an untouched block.
-        const payloadArray = bins.payload.value.array;
+        // The payload is PACKED HALVES (plan §11.4 A1): the field is authored
+        // decoded, 4 channels per bin, and encoded into the buffer's words once.
+        // k/256 and k/16 are exact halves, so the GPU reads exactly this field.
+        const payloadArray = new Float32Array(bins.binTotal * D.PAYLOAD_CHANNELS);
         const writeField = (fill) => {
           for (let i = 0; i < bins.binTotal; i++) {
-            const o = i * D.PAYLOAD_WORDS;
+            const o = i * D.PAYLOAD_CHANNELS;
             payloadArray[o] = 0;
             payloadArray[o + 1] = 0;
             payloadArray[o + 2] = 0;
@@ -301,6 +306,7 @@
               }
             }
           }
+          D.encodePayload(payloadArray, bins.payload.value.array);
           bins.payload.value.needsUpdate = true;
         };
 
@@ -310,7 +316,7 @@
         const before = Float32Array.from(payloadArray);
         for (const pass of merge.passes) await renderer.computeAsync(pass);
         const [after, cornerBlock, cornerWeight, mergeStats] = await Promise.all([
-          renderer.getArrayBufferAsync(bins.payload.value).then((b) => new Float32Array(b)),
+          renderer.getArrayBufferAsync(bins.payload.value).then((b) => D.decodePayload(new Uint32Array(b))),
           renderer.getArrayBufferAsync(merge.cornerBlock.value).then((b) => new Uint32Array(b)),
           renderer.getArrayBufferAsync(merge.cornerWeight.value).then((b) => new Float32Array(b)),
           merge.readStats(renderer),
@@ -437,7 +443,7 @@
         {
           const info = bins.cascades[TOP];
           for (let i = 0; i < info.bins * info.blockCapacity; i++) {
-            const o = (info.binBase + i) * D.PAYLOAD_WORDS;
+            const o = (info.binBase + i) * D.PAYLOAD_CHANNELS;
             const T = before[o + 3];
             if (T < 0) {
               if (after[o + 3] !== D.PAYLOAD_UNKNOWN) skyUnknownChanged++;
@@ -445,12 +451,13 @@
             }
             skyBins++;
             for (let ch = 0; ch < 3; ch++) {
-              if (after[o + ch] !== f32(before[o + ch] + T * SKY[ch])) skyWrong++;
+              const expect = f32(before[o + ch] + T * SKY[ch]);
+              if (Math.abs(after[o + ch] - expect) > ulp16(expect)) skyWrong++;
             }
             if (after[o + 3] !== 0) skyWrong++;
           }
         }
-        check("every known top-cascade bin is L + T·sky with T consumed", skyWrong === 0,
+        check("every known top-cascade bin is L + T·sky (to a half-ulp) with T consumed", skyWrong === 0,
           `${skyWrong} words wrong over ${skyBins} bins`);
         check("unknown top-cascade bins were left unknown", skyUnknownChanged === 0,
           `${skyUnknownChanged} changed`);
@@ -465,7 +472,16 @@
         // company in the last few ulps; everything else in this gate is exact.
         // The bound is relative-plus-absolute and the worst deviation is
         // reported, because a bound nobody measures is a bound nobody can tell
-        // has started to slip.
+        // has started to slip. Since §11.4 A1 every level's OUTPUT is rounded
+        // to a binary16 on its way into the packed payload, which the next
+        // level then reads — so one ulp of the value (`ulp16`, covering the
+        // implementation-defined rounding direction) sits on top of the f32
+        // term, and the worst deviation is reported in those ulps. The mirror
+        // merges the whole ladder in f64 with NO intermediate rounding, while
+        // the kernel rounds every level it writes and reads that rounded value
+        // one level down — so a c0 bin is `N − 0` roundings from the sky, a c1
+        // bin `N − 1`, and the allowance is one ulp PER LEVEL CROSSED (measured
+        // worst on the synthetic field: 2.34 ulps at c0, against this 4).
         const TOL = 2e-5;
         let mergedWrong = 0;
         let mergedChecked = 0;
@@ -488,14 +504,15 @@
               }
               mergedChecked++;
               let bad = false;
+              const levels = N - c;
               for (let ch = 0; ch < 3; ch++) {
                 const err = Math.abs(after[o + ch] - want.radiance[ch]);
-                worstErr = Math.max(worstErr, err);
-                if (err > TOL + TOL * Math.abs(want.radiance[ch])) bad = true;
+                worstErr = Math.max(worstErr, err / ulp16(want.radiance[ch]));
+                if (err > levels * ulp16(want.radiance[ch]) + TOL + TOL * Math.abs(want.radiance[ch])) bad = true;
               }
               const errT = Math.abs(gotT - want.transmittance);
-              worstErr = Math.max(worstErr, errT);
-              if (errT > TOL + TOL * Math.abs(want.transmittance)) bad = true;
+              worstErr = Math.max(worstErr, errT / ulp16(want.transmittance));
+              if (errT > levels * ulp16(want.transmittance) + TOL + TOL * Math.abs(want.transmittance)) bad = true;
               if (bad) {
                 mergedWrong++;
                 mergedWorst ??= `c${c} probe ${probe.key >>> 0} bin ${m}: ` +
@@ -509,8 +526,8 @@
           `${mergedWrong}/${mergedChecked} differ${mergedWorst ? ` — ${mergedWorst}` : ""}`);
         check("an UNKNOWN bin is still unknown after the merge", unknownWrong === 0,
           `${unknownWrong} unknown bins were written`);
-        say(`   worst deviation ${worstErr.toExponential(2)} against a ${TOL.toExponential(0)} ` +
-          "bound — f32 against the mirror's f64, in the two divisions the merge makes");
+        say(`   worst deviation ${worstErr.toFixed(3)} binary16 ulps against a one-ulp-per-level (${N} at c0) + ${TOL.toExponential(0)} ` +
+          "bound — the packed payload's rounding at every level crossed, plus f32 against the mirror's f64 in the two divisions the merge makes");
         check("the comparison was not vacuous", mergedChecked > 10000,
           `${mergedChecked} bins compared`);
 
@@ -552,7 +569,7 @@
                 let r = 0; let g = 0; let b = 0; let t = 0; let n = 0;
                 for (let j = 0; j < 4; j++) {
                   const op = (parentInfo.binBase + single * parentInfo.bins + firstChild + j)
-                    * D.PAYLOAD_WORDS;
+                    * D.PAYLOAD_CHANNELS;
                   if (after[op + 3] < 0) continue;
                   r += after[op]; g += after[op + 1]; b += after[op + 2]; t += after[op + 3];
                   n++;
@@ -566,7 +583,7 @@
               if (!right) continue;
               dirChecked++;
               const expect = before[o] + selfT * right.r;
-              if (Math.abs(after[o] - expect) > 1e-5 + 1e-5 * Math.abs(expect)) dirWrong++;
+              if (Math.abs(after[o] - expect) > ulp16(expect) + 1e-5 + 1e-5 * Math.abs(expect)) dirWrong++;
               if (wrong && Math.abs(wrong.r - right.r) > 1e-4) dirWouldDiffer++;
             }
           }
@@ -593,7 +610,7 @@
         for (let c = 0; c < N; c++) {
           const info = bins.cascades[c];
           for (let i = 0; i < info.bins * info.blockCapacity; i++) {
-            const o = (info.binBase + i) * D.PAYLOAD_WORDS;
+            const o = (info.binBase + i) * D.PAYLOAD_CHANNELS;
             if (before[o + 3] < 0) continue;
             touched++;
             if (after[o + 3] > before[o + 3] + 1e-6) tRose++;
@@ -656,7 +673,7 @@
                 if (!(w > 0) || pb === P.SLOT_EMPTY) continue;
                 for (let j = 0; j < 4; j++) {
                   const op = (parentInfo.binBase + pb * parentInfo.bins + m * 4 + j)
-                    * D.PAYLOAD_WORDS;
+                    * D.PAYLOAD_CHANNELS;
                   if (after[op + 3] >= 0) { any = true; break; }
                 }
               }
@@ -707,7 +724,7 @@
         // says the retired gather gate was written for.
         writeField(() => ({ radiance: [0, 0, 0], transmittance: 1 }));
         for (const pass of merge.passes) await renderer.computeAsync(pass);
-        const furnace = new Float32Array(await renderer.getArrayBufferAsync(bins.payload.value));
+        const furnace = D.decodePayload(new Uint32Array(await renderer.getArrayBufferAsync(bins.payload.value)));
         let furnaceLit = 0;
         let furnaceOrphan = 0;
         let furnaceWrong = 0;
@@ -723,15 +740,22 @@
                 continue;
               }
               furnaceLit++;
-              let err = Math.abs(T);
-              for (let ch = 0; ch < 3; ch++) err = Math.max(err, Math.abs(furnace[o + ch] - SKY[ch]));
+              // The sky is written into the payload once at the top, as a half,
+              // and every level below reproduces THAT value (the pre-average of
+              // four identical halves and the renormalized mean are both
+              // identities) — so the expectation is the half-rounded sky, to
+              // one ulp.
+              let err = Math.abs(T) / ulp16(1);
+              for (let ch = 0; ch < 3; ch++) {
+                err = Math.max(err, Math.abs(furnace[o + ch] - D.payloadQuantize(SKY[ch])) / ulp16(SKY[ch]));
+              }
               furnaceWorst = Math.max(furnaceWorst, err);
-              if (err > 1e-6) furnaceWrong++;
+              if (err > 1) furnaceWrong++;
             }
           }
         }
-        check("every merged bin returns exactly the sky, with T = 0", furnaceWrong === 0,
-          `${furnaceWrong}/${furnaceLit} bins wrong, worst error ${furnaceWorst.toExponential(2)}`);
+        check("every merged bin returns the sky (as a half, to one ulp), with T = 0", furnaceWrong === 0,
+          `${furnaceWrong}/${furnaceLit} bins wrong, worst error ${furnaceWorst.toFixed(3)} ulp`);
         check("the furnace lit essentially the whole field",
           furnaceLit > 0 && furnaceOrphan / (furnaceLit + furnaceOrphan) < 0.5,
           `${furnaceLit} lit, ${furnaceOrphan} orphaned (no parent probe at all)`);

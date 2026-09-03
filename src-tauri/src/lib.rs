@@ -1,11 +1,14 @@
 use serde::Serialize;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use tauri::Manager;
 
 mod agent;
 mod git;
+mod kimodo_ffi;
 mod mcp_clients;
 mod preview;
 mod pty;
@@ -17,6 +20,333 @@ mod watcher;
 struct BasisCompressionInfo {
     original: u64,
     compressed: u64,
+}
+
+/// kimodo.cpp text-to-motion, run through its `kmd-generate` CLI — the same
+/// command that repo's own demo server shells out to, so the editor's
+/// "Generate Animation…" exercises the pipeline its weights were shipped for.
+/// The front end retargets the returned f32 streams onto the entity's model
+/// (src/editor/kimodoRetarget.js); this command only runs the CLI and hands
+/// back where the raw streams landed.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateMotionInfo {
+    roots_path: String,
+    rots_path: String,
+    output_dir: String,
+    frames: u32,
+    /// "ffi" (in-process via kimodo.dll) or "cli" (kmd-generate child).
+    via: &'static str,
+}
+
+#[derive(Debug)]
+struct KimodoTool {
+    root: PathBuf,
+    exe_path: Option<PathBuf>,
+    dll_dirs: Vec<PathBuf>,
+    lib_dirs: Vec<PathBuf>,
+    motion_gguf: PathBuf,
+    text_bundle: PathBuf,
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|candidate| candidate == &path) {
+        paths.push(path);
+    }
+}
+
+fn add_kimodo_neighbours(paths: &mut Vec<PathBuf>, base: &Path) {
+    // Walk a few ancestors so a dev checkout works from either `engine/`,
+    // `engine/src-tauri/`, or a project nested below the two sibling repos.
+    for ancestor in base.ancestors().take(7) {
+        let own_name = ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if own_name.eq_ignore_ascii_case("kimodo") || own_name.eq_ignore_ascii_case("kimodo.cpp") {
+            push_unique(paths, ancestor.to_path_buf());
+        }
+        for relative in ["kimodo.cpp", "kimodo", "resources/kimodo"] {
+            push_unique(paths, ancestor.join(relative));
+        }
+    }
+}
+
+fn kimodo_candidates(project_root: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(dir) = std::env::var("KIMODO_DIR") {
+        push_unique(&mut candidates, PathBuf::from(dir));
+    }
+    if let Ok(dir) = std::env::var("LOCALAPPDATA") {
+        push_unique(&mut candidates, PathBuf::from(dir).join("Engine/kimodo"));
+    }
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+        push_unique(&mut candidates, PathBuf::from(dir).join("engine/kimodo"));
+    }
+
+    if !project_root.is_empty() {
+        add_kimodo_neighbours(&mut candidates, Path::new(project_root));
+    }
+    if let Ok(dir) = std::env::current_dir() {
+        add_kimodo_neighbours(&mut candidates, &dir);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            add_kimodo_neighbours(&mut candidates, dir);
+        }
+    }
+    // In development this is `<engine>/src-tauri`; unlike current_dir it is
+    // stable when Tauri or an IDE launches the binary from another folder.
+    add_kimodo_neighbours(&mut candidates, Path::new(env!("CARGO_MANIFEST_DIR")));
+    candidates
+}
+
+fn resolve_kimodo_tool(project_root: &str, motion_model: &str) -> Result<KimodoTool, String> {
+    let model_name = match motion_model {
+        "seed" => "kimodo-soma-seed-v1.1-f32.gguf",
+        "rp" | "" => "kimodo-soma-rp-v1.1-f32.gguf",
+        other => return Err(format!("unknown Kimodo motion model: {other}")),
+    };
+
+    for root in kimodo_candidates(project_root) {
+        let motion_gguf = root.join("models").join(model_name);
+        let text_bundle = root.join("generated/llm2vec-text-bundle");
+        if !motion_gguf.is_file() || !text_bundle.is_dir() {
+            continue;
+        }
+
+        let exe_names: &[&str] = if cfg!(windows) {
+            &[
+                "build/vs-dll/Release/kmd-generate.exe",
+                "build/vs/Release/kmd-generate.exe",
+                "build/Release/kmd-generate.exe",
+                "bin/kmd-generate.exe",
+            ]
+        } else {
+            &[
+                "build/release/kmd-generate",
+                "build/Release/kmd-generate",
+                "build/kmd-generate",
+                "bin/kmd-generate",
+            ]
+        };
+        let exe_path = exe_names
+            .iter()
+            .map(|path| root.join(path))
+            .find(|path| path.is_file());
+        let lib_dirs = [
+            root.join("build/vs-dll/Release"),
+            root.join("build/Release"),
+            root.join("lib"),
+        ]
+        .into_iter()
+        .filter(|dir| {
+            dir.join(if cfg!(windows) {
+                "kimodo.dll"
+            } else {
+                "libkimodo.so"
+            })
+            .is_file()
+        })
+        .collect::<Vec<_>>();
+        if exe_path.is_none() && lib_dirs.is_empty() {
+            continue;
+        }
+        let dll_dirs = [
+            root.join("build/vs-dll/bin/Release"),
+            root.join("build/vs/bin/Release"),
+            root.join("build/vs-dll/Release"),
+            root.join("build/vs/Release"),
+            root.join("bin"),
+        ]
+        .into_iter()
+        .filter(|dir| dir.is_dir())
+        .collect();
+        return Ok(KimodoTool {
+            root,
+            exe_path,
+            dll_dirs,
+            lib_dirs,
+            motion_gguf,
+            text_bundle,
+        });
+    }
+
+    Err(
+        "Kimodo is not installed. Put a complete kimodo.cpp checkout next to the editor or project; the editor will discover it automatically."
+            .to_string(),
+    )
+}
+
+/// kimodo.cpp text-to-motion, run through its `kmd-generate` CLI — the same
+/// command that repo's own demo server shells out to, so the editor's
+/// "Generate Animation…" exercises the pipeline its weights were shipped for.
+/// The front end retargets the returned f32 streams onto the entity's model
+/// (src/editor/kimodoRetarget.js); this command only runs the pipeline and
+/// hands back where the raw streams landed.
+///
+/// When the kimodo shared library is built (`lib_dirs` non-empty), generation
+/// runs IN-PROCESS through kimodo_ffi's dlopen of the stable C API — same
+/// model cached across calls — and the CLI spawn is the fallback when the
+/// library is missing or fails to load.
+/// Looks for a usable kimodo.cpp checkout without the user typing a path:
+/// env var first, then the project's siblings (the common layout — engine and
+/// kimodo.cpp checked out side by side), then the process' own directory's
+/// siblings. A candidate counts only when it can actually generate: a motion
+/// checkpoint and the text bundle are present.
+#[tauri::command]
+async fn probe_kimodo_tool(
+    project_root: String,
+    motion_model: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(resolve_kimodo_tool(&project_root, &motion_model)
+            .ok()
+            .map(|tool| tool.root.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn generate_motion(
+    project_root: String,
+    motion_model: String,
+    prompt: String,
+    frames: u32,
+    steps: u32,
+    seed: u64,
+) -> Result<GenerateMotionInfo, String> {
+    if !(2..=600).contains(&frames) {
+        return Err(format!("frames must be 2..600, got {frames}"));
+    }
+    if !(1..=150).contains(&steps) {
+        return Err(format!("steps must be 1..150, got {steps}"));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let tool = resolve_kimodo_tool(&project_root, &motion_model)?;
+        let motion_gguf = tool.motion_gguf.to_string_lossy().into_owned();
+        let text_bundle = tool.text_bundle.to_string_lossy().into_owned();
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default();
+        let out_dir = std::env::temp_dir().join(format!("kimodo-{stamp}"));
+        fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+        let prompt_path = out_dir.join("prompt.txt");
+        fs::write(&prompt_path, &prompt).map_err(|e| e.to_string())?;
+
+        // In-process first: kimodo.dll keeps its loaded model cached between
+        // generations, so after the first run this is diffusion time only.
+        let mut ffi_errors = Vec::new();
+        for lib_dir in &tool.lib_dirs {
+            let ggml_dir = lib_dir.parent().map(|p| p.join("bin/Release"));
+            match kimodo_ffi::generate(
+                lib_dir,
+                ggml_dir.as_deref(),
+                &motion_gguf,
+                &text_bundle,
+                &prompt,
+                frames,
+                steps,
+                seed,
+            ) {
+                Ok(motion) => {
+                    let roots_path = out_dir.join("root_positions.f32");
+                    let rots_path = out_dir.join("local_rotations_xyzw.f32");
+                    fs::write(&roots_path, &motion.roots).map_err(|e| e.to_string())?;
+                    fs::write(&rots_path, &motion.rots).map_err(|e| e.to_string())?;
+                    return Ok(GenerateMotionInfo {
+                        roots_path: roots_path.to_string_lossy().into_owned(),
+                        rots_path: rots_path.to_string_lossy().into_owned(),
+                        output_dir: out_dir.to_string_lossy().into_owned(),
+                        frames: motion.frames,
+                        via: "ffi",
+                    });
+                }
+                Err(e) => {
+                    ffi_errors.push(e.clone());
+                    eprintln!("kimodo FFI generation failed ({e}); falling back to the CLI");
+                }
+            }
+        }
+
+        // CLI fallback: the layout the kimodo.cpp repo's own build produces.
+        let exe_path = tool.exe_path.ok_or_else(|| {
+            if ffi_errors.is_empty() {
+                "Kimodo generation binary is missing from the discovered installation.".to_string()
+            } else {
+                format!("Kimodo could not start: {}", ffi_errors.join("; "))
+            }
+        })?;
+
+        let exe_command = exe_path.to_string_lossy().into_owned();
+        let mut cmd = agent::no_window_command(&exe_command);
+        // ggml's MSVC build splits its runtime DLLs into build/vs/bin/<cfg>
+        // while the exe lands in build/vs/<cfg> — neither is on this process'
+        // PATH. Prepend every directory the front end named (plus the exe's
+        // own) so the child can resolve ggml-base.dll & co.
+        if let Ok(existing) = std::env::var("PATH") {
+            let sep = if cfg!(windows) { ";" } else { ":" };
+            let mut prefixes = tool
+                .dll_dirs
+                .iter()
+                .map(|path| path.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(sep);
+            if let Some(parent) = exe_path.parent() {
+                prefixes = format!("{}{sep}{prefixes}", parent.display());
+            }
+            cmd.env("PATH", format!("{prefixes}{sep}{existing}"));
+        }
+        let args = [
+            motion_gguf.clone(),
+            text_bundle.clone(),
+            prompt_path.to_string_lossy().into_owned(),
+            frames.to_string(),
+            steps.to_string(),
+            seed.to_string(),
+            out_dir.to_string_lossy().into_owned(),
+        ];
+        let output = cmd
+            .args(&args)
+            .output()
+            .map_err(|e| format!("start {}: {e}", exe_path.display()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(format!(
+                "kmd-generate failed: {}{}",
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+
+        let roots_path = out_dir.join("root_positions.f32");
+        let rots_path = out_dir.join("local_rotations_xyzw.f32");
+        let roots_len = fs::metadata(&roots_path)
+            .map_err(|e| format!("no root stream: {e}"))?
+            .len();
+        let rots_len = fs::metadata(&rots_path)
+            .map_err(|e| format!("no rotation stream: {e}"))?
+            .len();
+        if roots_len == 0 || roots_len % 12 != 0 || rots_len % 16 != 0 {
+            return Err(format!(
+                "malformed generation output ({roots_len} / {rots_len} bytes)"
+            ));
+        }
+        let generated_frames = (roots_len / 12) as u32;
+        Ok(GenerateMotionInfo {
+            roots_path: roots_path.to_string_lossy().into_owned(),
+            rots_path: rots_path.to_string_lossy().into_owned(),
+            output_dir: out_dir.to_string_lossy().into_owned(),
+            frames: generated_frames,
+            via: "cli",
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Encodes a source image to a Basis Universal KTX2 derivative.
@@ -208,6 +538,60 @@ fn read_binary_file(path: String) -> Result<tauri::ipc::Response, String> {
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// Reads many authored binary assets in one native call.
+///
+/// A large imported scene can reference well over a thousand distinct `.geom`
+/// files. Calling `read_binary_file` for each one turns a fast sequential disk
+/// read into thousands of webview/native IPC round trips. This package keeps
+/// the request order, records missing files without failing the whole batch,
+/// and aligns every payload to four bytes so geometry typed arrays can view the
+/// returned IPC buffer directly.
+///
+/// Layout (little endian): `"BPK1"`, count, then count × (present, byteLength),
+/// followed by the four-byte-aligned file payloads in request order.
+#[tauri::command]
+fn read_binary_files(paths: Vec<String>) -> Result<tauri::ipc::Response, String> {
+    Ok(tauri::ipc::Response::new(pack_binary_files(&paths)?))
+}
+
+fn pack_binary_files(paths: &[String]) -> Result<Vec<u8>, String> {
+    const MAGIC: u32 = u32::from_le_bytes(*b"BPK1");
+    let count = u32::try_from(paths.len()).map_err(|_| "binary package has too many files")?;
+    let header_len = 8usize
+        .checked_add(
+            paths
+                .len()
+                .checked_mul(8)
+                .ok_or("binary package is too large")?,
+        )
+        .ok_or("binary package is too large")?;
+    let estimated_payload = paths
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .filter_map(|metadata| usize::try_from(metadata.len()).ok())
+        .fold(0usize, |total, len| total.saturating_add((len + 3) & !3));
+    let mut package = Vec::with_capacity(header_len.saturating_add(estimated_payload));
+    package.resize(header_len, 0);
+    package[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    package[4..8].copy_from_slice(&count.to_le_bytes());
+
+    for (index, path) in paths.iter().enumerate() {
+        let Ok(bytes) = fs::read(path) else { continue };
+        let Ok(length) = u32::try_from(bytes.len()) else {
+            continue;
+        };
+        let record = 8 + index * 8;
+        package[record..record + 4].copy_from_slice(&1u32.to_le_bytes());
+        package[record + 4..record + 8].copy_from_slice(&length.to_le_bytes());
+        package.extend_from_slice(&bytes);
+        while package.len() & 3 != 0 {
+            package.push(0);
+        }
+    }
+
+    Ok(package)
+}
+
 /// Reads only the beginning of a binary file. Importers use this to validate
 /// very large source assets before allocating/copying the complete payload.
 #[tauri::command]
@@ -311,7 +695,13 @@ fn stat_file(path: String) -> Result<f64, String> {
 
 /// Recursively copies `src` into `dst`, returning the number of files written.
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<u64> {
-    copy_dir_tracking(src, dst, "", &mut Vec::new(), &std::collections::HashSet::new())
+    copy_dir_tracking(
+        src,
+        dst,
+        "",
+        &mut Vec::new(),
+        &std::collections::HashSet::new(),
+    )
 }
 
 /// `copy_dir`, but records the destination-relative path of every file that
@@ -337,7 +727,11 @@ fn copy_dir_tracking(
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+        let rel = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
         let dest = dst.join(entry.file_name());
         if entry.file_type()?.is_dir() {
             copied += copy_dir_tracking(&entry.path(), &dest, &rel, changed, exclude)?;
@@ -378,9 +772,7 @@ fn copy_file_if_changed(src: &Path, dest: &Path) -> std::io::Result<bool> {
             return Ok(false);
         }
     }
-    replace_atomically(dest, |staging| {
-        fs::copy(src, staging).map(|_| ())
-    })?;
+    replace_atomically(dest, |staging| fs::copy(src, staging).map(|_| ()))?;
     Ok(true)
 }
 
@@ -530,7 +922,9 @@ fn player_checkout_root() -> Option<std::path::PathBuf> {
     ["..", "."]
         .iter()
         .map(Path::new)
-        .find(|root| root.join("vite.player.config.js").exists() && root.join("src/player").exists())
+        .find(|root| {
+            root.join("vite.player.config.js").exists() && root.join("src/player").exists()
+        })
         .and_then(|root| fs::canonicalize(root).ok())
 }
 
@@ -633,7 +1027,11 @@ async fn rebuild_player_template() -> Result<(), String> {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let detail = if stderr.trim().is_empty() { stdout } else { stderr };
+            let detail = if stderr.trim().is_empty() {
+                stdout
+            } else {
+                stderr
+            };
             let tail = detail
                 .lines()
                 .rev()
@@ -840,7 +1238,9 @@ fn rename_path(from: String, to: String) -> Result<(), String> {
         // Two steps: rename out to a name nothing holds, then into the target
         // spelling. The intermediate is a sibling so both halves stay on one
         // volume, and it carries a marker no real asset would.
-        let parent = src.parent().ok_or_else(|| "no parent directory".to_string())?;
+        let parent = src
+            .parent()
+            .ok_or_else(|| "no parent directory".to_string())?;
         let stem = src
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -946,6 +1346,193 @@ fn percent_decode(value: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|e| e.to_string())
 }
 
+fn decode_hex_exact(value: &str, expected_bytes: usize) -> Result<Vec<u8>, String> {
+    if value.len() != expected_bytes * 2 || !value.is_ascii() {
+        return Err(format!(
+            "expected {} hexadecimal characters, got {}",
+            expected_bytes * 2,
+            value.len()
+        ));
+    }
+    let bytes = value.as_bytes();
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err("artifact header contains a non-hexadecimal character".to_string()),
+    };
+    let mut out = Vec::with_capacity(expected_bytes);
+    for i in (0..bytes.len()).step_by(2) {
+        out.push((nibble(bytes[i])? << 4) | nibble(bytes[i + 1])?);
+    }
+    Ok(out)
+}
+
+fn crc32_bytes(bytes: &[u8]) -> u32 {
+    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut table = [0u32; 256];
+        for (n, entry) in table.iter_mut().enumerate() {
+            let mut c = n as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xedb88320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            *entry = c;
+        }
+        table
+    });
+    let mut crc = 0xffffffffu32;
+    for &byte in bytes {
+        crc = table[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xffffffff
+}
+
+fn fill_artifact_checksum(header: &mut [u8], payload: &[u8]) -> Result<(), String> {
+    const CRC_OFFSET: usize = 72;
+    const CRC_END: usize = CRC_OFFSET + 4;
+    let stored = header
+        .get(CRC_OFFSET..CRC_END)
+        .ok_or_else(|| "artifact header is too short for CRC32".to_string())?;
+    if stored == [0, 0, 0, 0] {
+        let crc = crc32_bytes(payload).to_le_bytes();
+        header[CRC_OFFSET..CRC_END].copy_from_slice(&crc);
+    }
+    Ok(())
+}
+
+static ATOMIC_BINARY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn unique_sibling(dest: &Path, kind: &str) -> PathBuf {
+    let sequence = ATOMIC_BINARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut name = dest
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("artifact"))
+        .to_os_string();
+    name.push(format!(".{kind}-{}-{sequence}", std::process::id()));
+    dest.with_file_name(name)
+}
+
+#[cfg(windows)]
+fn replace_staged_binary(staging: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    // ReplaceFileW is the Windows equivalent of Unix rename-over-existing: it
+    // swaps names atomically and can retain the old destination as a rollback
+    // file. For the first write there is no destination, so plain rename is
+    // already atomic. Handle a competing writer creating it between exists()
+    // and rename by falling through to ReplaceFileW.
+    if !dest.exists() {
+        match fs::rename(staging, dest) {
+            Ok(()) => return Ok(()),
+            Err(error) if !dest.exists() => return Err(error),
+            Err(_) => {}
+        }
+    }
+
+    let backup = unique_sibling(dest, "rollback");
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let dest_wide = wide(dest);
+    let staging_wide = wide(staging);
+    let backup_wide = wide(&backup);
+    let replaced = unsafe {
+        ReplaceFileW(
+            dest_wide.as_ptr(),
+            staging_wide.as_ptr(),
+            backup_wide.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced != 0 {
+        // The destination is committed. Failure to remove a rollback file is
+        // harmless; leaving a complete old cache is preferable to claiming
+        // the successful replacement failed and rebuilding it again.
+        let _ = fs::remove_file(&backup);
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    // ReplaceFileW promises to preserve the destination on failure. Be
+    // defensive if a filesystem/filter driver broke that promise: restore its
+    // backup before the command reports the failure.
+    if !dest.exists() && backup.exists() {
+        let _ = fs::rename(&backup, dest);
+    }
+    Err(error)
+}
+
+#[cfg(not(windows))]
+fn replace_staged_binary(staging: &Path, dest: &Path) -> std::io::Result<()> {
+    // POSIX rename replaces an existing regular file atomically.
+    fs::rename(staging, dest)
+}
+
+fn sync_parent_directory(_dest: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = _dest.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Writes a small metadata header and a potentially huge payload without ever
+/// joining them in memory. Staging is a unique sibling (same volume), flushed
+/// before the atomic name swap; every failure removes staging and leaves or
+/// restores the previous destination.
+fn write_binary_parts_atomic(dest: &Path, header: &[u8], payload: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let staging = loop {
+        let candidate = unique_sibling(dest, "tmp");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let written = (|| {
+                    file.write_all(header)?;
+                    file.write_all(payload)?;
+                    file.sync_all()
+                })();
+                if let Err(error) = written {
+                    drop(file);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(error);
+                }
+                drop(file);
+                break candidate;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    match replace_staged_binary(&staging, dest) {
+        Ok(()) => {
+            sync_parent_directory(dest)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&staging);
+            Err(error)
+        }
+    }
+}
+
 /// Writes raw bytes taken straight off the IPC channel.
 ///
 /// The sibling `write_binary_file` takes `contents: Vec<u8>`, which Tauri
@@ -975,6 +1562,34 @@ fn write_binary_file_raw(request: tauri::ipc::Request<'_>) -> Result<(), String>
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     fs::write(&path, contents).map_err(|e| e.to_string())
+}
+
+/// Atomic, no-full-copy writer for large derived artifacts. The payload stays
+/// in Tauri's raw request body; the fixed 128-byte codec header travels as hex
+/// in an IPC header and is written separately via write_all.
+#[tauri::command]
+fn write_binary_file_raw_atomic(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    const ARTIFACT_HEADER_BYTES: usize = 128;
+    let path = request
+        .headers()
+        .get("path")
+        .ok_or_else(|| "write_binary_file_raw_atomic: missing `path` header".to_string())?
+        .to_str()
+        .map_err(|e| e.to_string())?;
+    let path = percent_decode(path)?;
+    let encoded_header = request
+        .headers()
+        .get("artifact-header")
+        .ok_or_else(|| "write_binary_file_raw_atomic: missing `artifact-header`".to_string())?
+        .to_str()
+        .map_err(|e| e.to_string())?;
+    let mut header = decode_hex_exact(encoded_header, ARTIFACT_HEADER_BYTES)?;
+    let tauri::ipc::InvokeBody::Raw(payload) = request.body() else {
+        return Err("write_binary_file_raw_atomic: expected a raw byte body".to_string());
+    };
+    fill_artifact_checksum(&mut header, payload)?;
+    watcher::note_self_write(&path);
+    write_binary_parts_atomic(Path::new(&path), &header, payload).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1453,7 +2068,9 @@ async fn ai_chat(url: String, api_key: Option<String>, body: String) -> Result<S
             req = req.set("Authorization", &format!("Bearer {key}"));
         }
         match req.send_string(&body) {
-            Ok(resp) => resp.into_string().map_err(|e| format!("read response from {url}: {e}")),
+            Ok(resp) => resp
+                .into_string()
+                .map_err(|e| format!("read response from {url}: {e}")),
             Err(ureq::Error::Status(code, resp)) => {
                 let text = resp.into_string().unwrap_or_default();
                 Err(format!("{url} returned {code}: {text}"))
@@ -1468,8 +2085,9 @@ async fn ai_chat(url: String, api_key: Option<String>, body: String) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_dir_tracking, newest_player_source, percent_decode, player_checkout_root,
-        validate_browser_preview_url, write_if_different, zip_dir,
+        copy_dir_tracking, decode_hex_exact, fill_artifact_checksum, newest_player_source,
+        pack_binary_files, percent_decode, player_checkout_root, validate_browser_preview_url,
+        write_binary_parts_atomic, write_if_different, zip_dir,
     };
     use std::fs;
 
@@ -1490,7 +2108,10 @@ mod tests {
         let mut changed = Vec::new();
         copy_dir_tracking(&src, &dst, "", &mut changed, &Default::default()).unwrap();
         changed.sort();
-        assert_eq!(changed, vec!["_engine/player.js".to_string(), "index.html".to_string()]);
+        assert_eq!(
+            changed,
+            vec!["_engine/player.js".to_string(), "index.html".to_string()]
+        );
 
         // Second pass over an unchanged tree: nothing may report as changed.
         let mut second = Vec::new();
@@ -1505,13 +2126,22 @@ mod tests {
         let mut third = Vec::new();
         let generated = std::collections::HashSet::from(["index.html"]);
         copy_dir_tracking(&src, &dst, "", &mut third, &generated).unwrap();
-        assert!(third.is_empty(), "excluded template file was copied: {third:?}");
+        assert!(
+            third.is_empty(),
+            "excluded template file was copied: {third:?}"
+        );
         assert_eq!(fs::read(dst.join("index.html")).unwrap(), b"<themed>");
 
         let doc = dst.join("assets").join("m.mat");
         fs::create_dir_all(doc.parent().unwrap()).unwrap();
-        assert!(write_if_different(&doc, b"{\"a\":1}").unwrap(), "first write");
-        assert!(!write_if_different(&doc, b"{\"a\":1}").unwrap(), "identical re-emit");
+        assert!(
+            write_if_different(&doc, b"{\"a\":1}").unwrap(),
+            "first write"
+        );
+        assert!(
+            !write_if_different(&doc, b"{\"a\":1}").unwrap(),
+            "identical re-emit"
+        );
         assert!(write_if_different(&doc, b"{\"a\":2}").unwrap(), "real edit");
         assert_eq!(fs::read(&doc).unwrap(), b"{\"a\":2}");
 
@@ -1565,6 +2195,93 @@ mod tests {
     }
 
     #[test]
+    fn atomic_binary_parts_write_and_replace_without_joining() {
+        let base = std::env::temp_dir().join(format!(
+            "three-engine-atomic-binary-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let dest = base.join("Library/gi-static-bvh/v1/ab/cache.gbvh");
+        let header = vec![0x48; 128];
+        let first = vec![1u8, 2, 3, 4];
+        write_binary_parts_atomic(&dest, &header, &first).unwrap();
+        let mut expected = header.clone();
+        expected.extend_from_slice(&first);
+        assert_eq!(fs::read(&dest).unwrap(), expected);
+
+        // Exercises rename-over-existing on POSIX and ReplaceFileW + rollback
+        // backup on Windows. Only the destination may survive the commit.
+        let second_header = vec![0x4e; 128];
+        let second = vec![9u8, 8, 7, 6, 5];
+        write_binary_parts_atomic(&dest, &second_header, &second).unwrap();
+        let mut replaced = second_header;
+        replaced.extend_from_slice(&second);
+        assert_eq!(fs::read(&dest).unwrap(), replaced);
+        let siblings: Vec<_> = fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(siblings, vec![dest.file_name().unwrap().to_os_string()]);
+
+        assert_eq!(
+            decode_hex_exact(&"ab".repeat(128), 128).unwrap(),
+            vec![0xab; 128]
+        );
+        assert!(decode_hex_exact("zz", 1).is_err());
+        assert!(decode_hex_exact("00", 128).is_err());
+
+        // Standard CRC-32 check vector. A non-zero codec checksum is retained;
+        // only the production writer's zero sentinel is filled natively.
+        let mut checksum_header = vec![0u8; 128];
+        fill_artifact_checksum(&mut checksum_header, b"123456789").unwrap();
+        assert_eq!(
+            u32::from_le_bytes(checksum_header[72..76].try_into().unwrap()),
+            0xcbf43926
+        );
+        checksum_header[72..76].copy_from_slice(&0x12345678u32.to_le_bytes());
+        fill_artifact_checksum(&mut checksum_header, b"changed").unwrap();
+        assert_eq!(
+            u32::from_le_bytes(checksum_header[72..76].try_into().unwrap()),
+            0x12345678
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn binary_file_package_keeps_order_missing_entries_and_alignment() {
+        let base = std::env::temp_dir().join(format!(
+            "three-engine-bulk-read-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let first = base.join("first.geom");
+        let missing = base.join("missing.geom");
+        let last = base.join("last.mat");
+        fs::write(&first, [1u8, 2, 3]).unwrap();
+        fs::write(&last, [9u8, 8, 7, 6]).unwrap();
+        let paths = vec![
+            first.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+            last.to_string_lossy().into_owned(),
+        ];
+
+        let package = pack_binary_files(&paths).unwrap();
+        assert_eq!(&package[0..4], b"BPK1");
+        assert_eq!(u32::from_le_bytes(package[4..8].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(package[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(package[12..16].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(package[16..20].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(package[20..24].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(package[24..28].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(package[28..32].try_into().unwrap()), 4);
+        assert_eq!(&package[32..35], &[1, 2, 3]);
+        assert_eq!(package[35], 0);
+        assert_eq!(&package[36..40], &[9, 8, 7, 6]);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn browser_fallback_only_accepts_local_preview_urls() {
         assert!(validate_browser_preview_url("http://localhost:41234/").is_ok());
         assert!(validate_browser_preview_url("https://localhost:41234/").is_err());
@@ -1614,6 +2331,67 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // The ordinary config creates `main` before this hook, so normal
+            // dev/release launches take no new path. `tauri:inspect` overlays a
+            // create=false window and hands us a parent directory containing
+            // unpacked Chrome extensions. Wry installs each child folder via
+            // WebView2 Profile.AddBrowserExtension while constructing the view.
+            if app.get_webview_window("main").is_none() {
+                let config = app
+                    .config()
+                    .app
+                    .windows
+                    .iter()
+                    .find(|window| window.label == "main")
+                    .or_else(|| app.config().app.windows.first())
+                    .ok_or("application config has no main window")?;
+                let builder = tauri::WebviewWindowBuilder::from_config(app.handle(), config)?;
+
+                #[cfg(all(debug_assertions, target_os = "windows"))]
+                let builder = if config.browser_extensions_enabled {
+                    let path = std::env::var_os("THREE_ENGINE_WEBGPU_INSPECTOR_EXTENSIONS")
+                        .map(std::path::PathBuf::from)
+                        .ok_or(
+                            "WebGPU Inspector mode has no extension directory; start it with `npm run tauri:inspect`",
+                        )?;
+                    let has_manifest = path
+                        .read_dir()
+                        .map_err(|error| {
+                            format!(
+                                "cannot read WebGPU Inspector extension directory {}: {error}",
+                                path.display()
+                            )
+                        })?
+                        .filter_map(Result::ok)
+                        .any(|entry| entry.path().join("manifest.json").is_file());
+                    if !has_manifest {
+                        return Err(format!(
+                            "WebGPU Inspector extension directory {} contains no unpacked extension; run `npm run tauri:inspect:prepare` to repair it",
+                            path.display()
+                        )
+                        .into());
+                    }
+                    eprintln!("WebGPU Inspector extension enabled from {}", path.display());
+                    builder
+                        .browser_extensions_enabled(true)
+                        .extensions_path(path)
+                } else {
+                    builder
+                };
+
+                #[cfg(any(not(debug_assertions), not(target_os = "windows")))]
+                if config.browser_extensions_enabled {
+                    return Err(
+                        "WebGPU Inspector mode requires a Windows debug build using WebView2"
+                            .into(),
+                    );
+                }
+
+                builder.build()?;
+            }
+            Ok(())
+        })
         // Live PTY sessions for the terminal panel, keyed by panel id.
         .manage(pty::PtyState::default())
         // Headless one-shot AI runs, keyed by run id.
@@ -1630,6 +2408,7 @@ pub fn run() {
             load_scene,
             list_dir,
             read_binary_file,
+            read_binary_files,
             read_binary_file_head,
             file_size,
             read_text_file,
@@ -1657,7 +2436,10 @@ pub fn run() {
             scaffold_three_types,
             write_binary_file,
             write_binary_file_raw,
+            write_binary_file_raw_atomic,
             compress_texture_basis,
+            probe_kimodo_tool,
+            generate_motion,
             frontend_log,
             open_browser_url,
             fetch_text,

@@ -2,7 +2,7 @@
 import * as THREE from "three/webgpu";
 import { OCCLUDER_LAYER } from "./editorLayers.js";
 import { buildUberMaterial, slotSignature, uberIncompatibility } from "./uberMaterial.js";
-import { textureLoadsInFlight } from "./textureAsset.js";
+import { textureLoadProgressVersion, textureLoadsInFlight } from "./textureAsset.js";
 
 /**
  * Automatic static MERGING — the case instancing cannot reach.
@@ -843,8 +843,10 @@ export class MergeSystem {
         // one — Bistro's transcode tail runs 2+ minutes and releasing mid-tail
         // is the dribble this hold exists to stop. A broken asset leaves the
         // count frozen and the bound does its job.
-        if (pending !== this._lastPendingCount) {
+        const loadProgress = textureLoadProgressVersion();
+        if (pending !== this._lastPendingCount || loadProgress !== this._lastTextureLoadProgress) {
           this._lastPendingCount = pending;
+          this._lastTextureLoadProgress = loadProgress;
           this._deferHoldStart = now;
         }
         if (now - this._deferHoldStart < MAX_LOAD_DEFER_MS) {
@@ -864,6 +866,7 @@ export class MergeSystem {
         this._deferHoldStart = 0;
         this._deferExhaustedWarned = false;
         this._lastPendingCount = 0;
+        this._lastTextureLoadProgress = textureLoadProgressVersion();
       }
       if (ready !== this._lastPopulation) {
         this._lastPopulation = ready;

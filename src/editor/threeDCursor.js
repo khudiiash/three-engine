@@ -403,20 +403,16 @@ export function refreshCursor3D() {
     if (disc?.material) disc.material.color.setHex(tint);
     if (rim?.material) rim.material.color.setHex(tint);
   }
-  // The cursor is editor-only — it shares the EDITOR_LAYER with the rest
-  // of viewport.helpers, but the geometry editor's local proxy lives in
-  // its own scene which has no play-mode gate. Force the visibility off
-  // here so neither proxy leaks into the player render. The user's own
-  // visibility toggle is restored automatically when `engine.playing`
-  // flips back to false.
-  cursorObject.visible = state.visible && !engine.playing;
+  // Both proxies follow the active Layers profile. In Play that profile starts
+  // off, but explicitly enabling 3D Cursor makes the same aid visible there.
+  cursorObject.visible = state.visible;
   cursorObject.updateMatrixWorld(true);
   anchor.copy(cursorObject.position);
   for (const entry of additionalProxies) {
     if (!entry.object3D.parent) continue;
     const local = entry.localTransform();
     entry.object3D.position.copy(local);
-    entry.object3D.visible = state.visible && !engine.playing;
+    entry.object3D.visible = state.visible;
     entry.object3D.updateMatrixWorld(true);
     // Mirror the tint onto additional proxies (geometry editor) so the
     // local cursor reflects the selection state too.

@@ -52,18 +52,63 @@ use crate::share::command;
 /// `credential` (prints stored secrets to stdout), `daemon` (opens a server),
 /// and `filter-branch` (rewrites history in a way no button offers).
 const GIT_SUBCOMMANDS: &[&str] = &[
-    "add", "apply", "blame", "branch", "cat-file", "check-ignore", "checkout", "cherry-pick",
-    "clean", "clone", "commit", "config", "describe", "diff", "fetch", "for-each-ref", "init",
-    "lfs", "log", "ls-files", "ls-remote", "merge", "mv", "pull", "push", "rebase", "remote",
-    "reset", "restore", "rev-list", "rev-parse", "revert", "rm", "shortlog", "show", "stash",
-    "status", "switch", "symbolic-ref", "tag", "version",
+    "add",
+    "apply",
+    "blame",
+    "branch",
+    "cat-file",
+    "check-ignore",
+    "checkout",
+    "cherry-pick",
+    "clean",
+    "clone",
+    "commit",
+    "config",
+    "describe",
+    "diff",
+    "fetch",
+    "for-each-ref",
+    "init",
+    "lfs",
+    "log",
+    "ls-files",
+    "ls-remote",
+    "merge",
+    "mv",
+    "pull",
+    "push",
+    "rebase",
+    "remote",
+    "reset",
+    "restore",
+    "rev-list",
+    "rev-parse",
+    "revert",
+    "rm",
+    "shortlog",
+    "show",
+    "stash",
+    "status",
+    "switch",
+    "symbolic-ref",
+    "tag",
+    "version",
 ];
 
 /// `gh` subcommands. `api` is included deliberately — it is how the editor asks
 /// GitHub anything the typed commands do not cover (repository visibility, the
 /// signed-in user) without this module growing a REST client of its own.
 const GH_SUBCOMMANDS: &[&str] = &[
-    "api", "auth", "browse", "issue", "pr", "release", "repo", "status", "version", "--version",
+    "api",
+    "auth",
+    "browse",
+    "issue",
+    "pr",
+    "release",
+    "repo",
+    "status",
+    "version",
+    "--version",
 ];
 
 /// Options that make git run a program the caller names. Rejected before the
@@ -137,7 +182,11 @@ fn home() -> Option<PathBuf> {
 /// Codex CLIs.
 fn resolve(name: &str, extra: &[PathBuf]) -> Option<PathBuf> {
     let candidates: Vec<String> = if cfg!(windows) {
-        vec![format!("{name}.exe"), format!("{name}.cmd"), name.to_string()]
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            name.to_string(),
+        ]
     } else {
         vec![name.to_string()]
     };
@@ -543,8 +592,14 @@ pub async fn github_login(app: AppHandle) -> Result<ExecOutcome, String> {
         // depend on across versions.
         let mut readers = Vec::new();
         for pipe in [
-            child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
-            child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
         ]
         .into_iter()
         .flatten()

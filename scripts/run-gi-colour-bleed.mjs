@@ -43,14 +43,21 @@ const url = process.argv[2] ?? "http://localhost:5201/";
 const PROJECT = (process.env.PROJECT ?? "C:/Users/Khudiiash/Documents/GAME").replaceAll("\\", "/");
 const SETTLE = Number(process.env.SETTLE ?? 35000);
 const QUALITY = process.env.QUALITY ?? "medium";
+const GI_GLOBALS = process.env.GI_GLOBALS_JSON
+  ? JSON.parse(process.env.GI_GLOBALS_JSON)
+  : {};
+const SCENE = (process.env.SCENE ?? `${PROJECT}/main.scene`).replaceAll("\\", "/");
 const OUT = ".gi-shots/colour-bleed";
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 mkdirSync(OUT, { recursive: true });
 
-const POSE = {
+const DEFAULT_POSE = {
   position: [-12.180572876603646, 2.377470686992635, -0.8876293701536424],
   target: [5.121504134069502, 1.85371217060508, -1.7807895055111131],
 };
+// A focused scene can provide its saved camera without editing this Bistro
+// fixture. Kept as JSON so position and target remain one atomic input.
+const POSE = process.env.POSE_JSON ? JSON.parse(process.env.POSE_JSON) : DEFAULT_POSE;
 
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
@@ -78,12 +85,13 @@ page.on("pageerror", (e) => {
   if (!/save_scene|refusing write|rapier/.test(msg)) console.log(`  pageerror: ${msg.slice(0, 200)}`);
 });
 
-await page.evaluateOnNewDocument((project, quality) => {
+await page.evaluateOnNewDocument((project, quality, globals) => {
   localStorage.setItem("engine.projectRoot.v1", project);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
   globalThis.__editorKeepRendering = true;
   if (quality) globalThis.__giConfigOverride = { quality };
-}, PROJECT, QUALITY);
+  for (const [key, value] of Object.entries(globals)) globalThis[key] = value;
+}, PROJECT, QUALITY, GI_GLOBALS);
 
 console.log(`opening ${PROJECT} (read-only), quality ${QUALITY}`);
 await page.goto(url, { waitUntil: "load", timeout: 60000 });
@@ -93,13 +101,18 @@ await page.evaluate((project) => {
   const row = rows.find((r) => (r.getAttribute("title") ?? "").replaceAll("\\", "/") === project) ?? rows[0];
   row?.querySelector(".hub-recent-open-btn")?.click();
 }, PROJECT);
-
+await page.waitForFunction(() => !!globalThis.__editorApi, { timeout: 60000 });
+// A project remembers its last-open scene globally. Opening the project alone
+// can therefore measure a previous project's Sponza while confidently labeling
+// the result GAME; always name the requested scene before waiting for GI.
+built = false;
+const opened = await page.evaluate(async (scene) => globalThis.__editorApi.call("scene.open", { path: scene }), SCENE);
+if (opened?.ok === false) throw new Error(`scene.open ${SCENE}: ${opened.error}`);
 for (let i = 0; i < 300 && !built; i++) {
   await wait(1000);
   if (i % 20 === 19) console.log(`  waiting for the GI build… ${i + 1}s`);
 }
 if (!built) throw new Error("the GI build never completed");
-await page.waitForFunction(() => !!globalThis.__editorApi, { timeout: 60000 });
 
 await page.evaluate(async (p) => {
   await globalThis.__editorApi.call("viewport.setCamera", p);
@@ -208,11 +221,62 @@ const data = await page.evaluate(async () => {
     if (src?.deposit?.readStats) out.deposit = await src.deposit.readStats(engine.renderer);
   } catch (e) { out.errors.push(`deposit stats: ${e.message}`); }
 
+  // The hit list is the exact surface signal crossing [E] -> [J]. It already
+  // exists in the tail of the bin scratch store, so reading it here adds no GI
+  // resource or production instrumentation. Keep the values as native f32;
+  // RGBA8 would erase the small chromatic remainder this rig is looking for.
+  try {
+    if (src?.binStore?.scratch && src.binStore.hitCapacity > 0) {
+      const dep = await import("/src/modules/gi/srcDeposit.js");
+      const words = new Uint32Array(await engine.renderer.getArrayBufferAsync(src.binStore.scratch.value));
+      const count = Math.min(words[src.binStore.hitListBase] >>> 0, src.binStore.hitCapacity);
+      const bits = new ArrayBuffer(4), bv = new DataView(bits);
+      const asFloat = (u) => { bv.setUint32(0, u >>> 0, true); return bv.getFloat32(0, true); };
+      const ownerOf = (slotWord) => {
+        let owner = 0;
+        for (let c = 1; c < src.binStore.cascades.length; c++) {
+          if (slotWord >= src.binStore.cascades[c].binBase * dep.BIN_WORDS) owner = c;
+        }
+        return owner;
+      };
+      const all = [0, 1, 2, 3].map(() => ({ n: 0, red: 0, rho: [0, 0, 0], cos: 0 }));
+      const sunIdx = sys?.state?.sunSlot?.value ?? -1;
+      const sun = sys?.state?.lightSlots?.[sunIdx] ?? null;
+      const sv = sun?.vector?.value;
+      const sd = sv ? [sv.x ?? 0, sv.y ?? 0, sv.z ?? 0] : [0, 0, 0];
+      for (let i = 0; i < count; i++) {
+        const e = src.binStore.hitListBase + 1 + i * dep.SEC_HIT_WORDS;
+        const rho = [asFloat(words[e + dep.SEC_RHO]), asFloat(words[e + dep.SEC_RHO + 1]), asFloat(words[e + dep.SEC_RHO + 2])];
+        const n = [asFloat(words[e + dep.SEC_N]), asFloat(words[e + dep.SEC_N + 1]), asFloat(words[e + dep.SEC_N + 2])];
+        const owner = ownerOf(words[e + dep.SEC_SLOT] >>> 0);
+        const a = all[owner] ?? all[0];
+        a.n++;
+        a.rho[0] += rho[0]; a.rho[1] += rho[1]; a.rho[2] += rho[2];
+        const red = rho[0] > 0.08 && rho[0] > rho[1] * 1.8 && rho[0] > rho[2] * 1.8;
+        if (red) {
+          a.red++;
+          a.cos += Math.max(0, n[0] * sd[0] + n[1] * sd[1] + n[2] * sd[2]);
+        }
+      }
+      out.hitSignal = {
+        count,
+        sun: { index: sunIdx, direction: sd, color: sun?.color?.value ? [sun.color.value.r, sun.color.value.g, sun.color.value.b] : [0, 0, 0] },
+        cascades: all.map((a, cascade) => ({
+          cascade, n: a.n, red: a.red,
+          redPct: a.n ? 100 * a.red / a.n : 0,
+          meanRho: a.n ? a.rho.map((v) => v / a.n) : [0, 0, 0],
+          meanRedSunCos: a.red ? a.cos / a.red : 0,
+        })),
+      };
+    }
+  } catch (e) { out.errors.push(`native hit list: ${e.message}`); }
+
   // ── LINK 4: THE PROBES ──────────────────────────────────────────────────
   if (src?.store && src?.binStore) {
     const store = src.store, binStore = src.binStore;
     const table = new Uint32Array(await engine.renderer.getArrayBufferAsync(store.probeTable.value));
-    const payload = new Float32Array(await engine.renderer.getArrayBufferAsync(binStore.payload.value));
+    // Packed halves (plan §11.4 A1) — the store decodes to 4 channels per bin.
+    const payload = binStore.decodePayload(await engine.renderer.getArrayBufferAsync(binStore.payload.value));
     const PW = 8, P_FLAGS = 2, P_BLOCK = 7, ALIVE = 1, EMPTY = 0xffffffff;
     const probes = [];
     for (const c of store.cascades) {
@@ -242,7 +306,7 @@ const data = await page.evaluate(async () => {
           }
         }
         if (n === 0) continue;
-        probes.push([c.cascade, r / n, g / n, b / n, bestSat, ...(bestBin ?? [0, 0, 0]), table[base + 0]]);
+        probes.push([c.cascade, r / n, g / n, b / n, bestSat, ...(bestBin ?? [0, 0, 0]), table[base + 0], block]);
       }
     }
     out.probes = probes;
@@ -252,6 +316,149 @@ const data = await page.evaluate(async () => {
     out.spacing0 = src.spacing0 ?? null;
   } else {
     out.errors.push("no live SRC probe store");
+  }
+
+  // ── LINKS 5/6: THE ACTUAL SCREEN INTEGRAL ────────────────────────────────
+  // Probe-bin means are intentionally directionless; a receiver samples a
+  // cosine hemisphere, so read the real screen gather and the resolve target
+  // before concluding that a colourful field makes a colourful image.
+  try {
+    const unpad = (raw, w, h, comps, Ctor) => {
+      const rowBytes = w * comps * Ctor.BYTES_PER_ELEMENT;
+      const padded = Math.ceil(rowBytes / 256) * 256;
+      const srcBytes = new Uint8Array(raw.buffer ?? raw, raw.byteOffset ?? 0, raw.byteLength ?? raw.length);
+      const dst = new Uint8Array(rowBytes * h);
+      for (let y = 0; y < h; y++) {
+        const from = y * padded;
+        const available = Math.max(0, Math.min(rowBytes, srcBytes.length - from));
+        if (available > 0) dst.set(srcBytes.subarray(from, from + available), y * rowBytes);
+      }
+      return new Ctor(dst.buffer);
+    };
+    const f16 = (h) => {
+      const s = (h & 0x8000) ? -1 : 1;
+      const e = (h >> 10) & 0x1f;
+      const m = h & 0x3ff;
+      if (e === 0) return s * m * 2 ** -24;
+      if (e === 31) return m ? NaN : s * Infinity;
+      return s * (m + 1024) * 2 ** (e - 25);
+    };
+    const gposTex = sys?.state?.screen?.gbuffer?.position ?? null;
+    const gw = gposTex?.image?.width ?? 0;
+    const gh = gposTex?.image?.height ?? 0;
+    const gpos = gposTex && gw && gh
+      ? unpad(await engine.renderer.backend.copyTextureToBuffer(gposTex, 0, 0, gw, gh, 0), gw, gh, 4, Float32Array)
+      : null;
+    const finish = (a) => {
+      if (!a.n) return { n: 0, rgb: [0, 0, 0], sat: 0, meanSat: 0, rg: 0 };
+      const rgb = [a.r / a.n, a.g / a.n, a.b / a.n];
+      const mx = Math.max(...rgb);
+      return {
+        n: a.n,
+        rgb,
+        sat: mx > 1e-6 ? (mx - Math.min(...rgb)) / mx : 0,
+        meanSat: a.sat / a.n,
+        rg: rgb[1] > 1e-6 ? rgb[0] / rgb[1] : 0,
+      };
+    };
+    const add = (a, r, g, b) => {
+      const mx = Math.max(r, g, b);
+      a.r += r; a.g += g; a.b += b; a.n++;
+      a.sat += mx > 1e-6 ? (mx - Math.min(r, g, b)) / mx : 0;
+    };
+    const summarizeTexture = async (texture, label) => {
+      if (!texture) return null;
+      const w = texture.image?.width ?? texture.width ?? 0;
+      const h = texture.image?.height ?? texture.height ?? 0;
+      if (!w || !h) return null;
+      // Native rgba16f avoids the diagnostic blit's rgba8 clamp: this scene's
+      // sun drives the gather above 1, where clipping each channel made a red
+      // sample look white before the statistic ever saw it.
+      const raw = await engine.renderer.backend.copyTextureToBuffer(texture, 0, 0, w, h, 0);
+      const px = unpad(raw, w, h, 4, Uint16Array);
+      let r = 0, g = 0, b = 0, n = 0, satSum = 0, strong = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        if (!(f16(px[i + 3]) > 0)) continue;
+        const cr = f16(px[i]), cg = f16(px[i + 1]), cb = f16(px[i + 2]);
+        if (![cr, cg, cb].every(Number.isFinite)) continue;
+        const mx = Math.max(cr, cg, cb);
+        if (!(mx > 1e-5)) continue;
+        const s = (mx - Math.min(cr, cg, cb)) / mx;
+        r += cr; g += cg; b += cb; satSum += s; strong += s > 0.25 ? 1 : 0; n++;
+      }
+      const regions = {};
+      if (gpos) {
+        const accum = new Map();
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+          const gx = Math.min(gw - 1, Math.floor((x + 0.5) * gw / w));
+          const gy = Math.min(gh - 1, Math.floor((y + 0.5) * gh / h));
+          const go = (gy * gw + gx) * 4;
+          if (!(gpos[go + 3] > 0.5)) continue;
+          const p = [gpos[go], gpos[go + 1], gpos[go + 2]];
+          const o = (y * w + x) * 4;
+          if (!(f16(px[o + 3]) > 0)) continue;
+          const c = [f16(px[o]), f16(px[o + 1]), f16(px[o + 2])];
+          if (!c.every(Number.isFinite)) continue;
+          const names = [];
+          if (Math.abs(p[1]) < 0.08) {
+            names.push("floor:all");
+            if (p[2] < -2) names.push("floor:z<-2");
+            else if (p[2] < 0) names.push("floor:-2..0");
+            else if (p[2] < 1) names.push("floor:0..1");
+            else if (p[2] < 2.3) names.push("floor:1..2.3");
+            if (Math.abs(p[0]) < 1.5) names.push("floor:centre");
+            else names.push("floor:side");
+          }
+          if (Math.abs(p[2] - 1.7661) < 0.08) names.push("red:front");
+          if (Math.abs(p[2] - 0.3334) < 0.08) names.push("white:front");
+          for (const name of names) {
+            if (!accum.has(name)) accum.set(name, { r: 0, g: 0, b: 0, sat: 0, n: 0 });
+            add(accum.get(name), ...c);
+          }
+        }
+        for (const [name, a] of accum) regions[name] = finish(a);
+      }
+      return { label, size: [w, h], n, rgb: n ? [r / n, g / n, b / n] : [0, 0, 0], sat: n ? satSum / n : 0, strongPct: n ? 100 * strong / n : 0, regions };
+    };
+    // [H]'s native atlas. RGB is premultiplied by alpha coverage; recover E
+    // before computing chromaticity, and retain coverage separately so a
+    // sparse-red-vs-dense-neutral weighting bias is directly visible.
+    if (src?.tiles?.atlas) {
+      const tex = src.tiles.atlas;
+      const w = tex.image?.width ?? 0, h = tex.image?.height ?? 0;
+      const raw = await engine.renderer.backend.copyTextureToBuffer(tex, 0, 0, w, h, 0);
+      const px = unpad(raw, w, h, 4, Uint16Array);
+      const blocks = [];
+      const ts = src.tiles.tileSize, perRow = src.tiles.layout.perRow;
+      for (let block = 0; block < src.tiles.blocks; block++) {
+        const bx = (block % perRow) * ts, by = Math.floor(block / perRow) * ts;
+        let rr = 0, gg = 0, bb = 0, cov = 0, satSum = 0, n = 0;
+        for (let y = 0; y < ts; y++) for (let x = 0; x < ts; x++) {
+          const o = ((by + y) * w + bx + x) * 4;
+          const c = f16(px[o + 3]);
+          if (!(c > 1e-6)) continue;
+          const r = f16(px[o]) / c, g = f16(px[o + 1]) / c, b = f16(px[o + 2]) / c;
+          if (![r, g, b].every(Number.isFinite)) continue;
+          const mx = Math.max(r, g, b);
+          rr += r; gg += g; bb += b; cov += c; n++;
+          satSum += mx > 1e-6 ? (mx - Math.min(r, g, b)) / mx : 0;
+        }
+        if (n) blocks.push([block, rr / n, gg / n, bb / n, satSum / n, cov / n, n]);
+      }
+      out.tileBlocks = blocks;
+    }
+    const targets = sys?.state?.screen?.targets;
+    out.screenStages = [];
+    for (const [texture, label] of [
+      [src?.gather?.target, "5. screen gather (pre-resolve)"],
+      [targets?.irradianceRaw, "6. resolve raw (pre-temporal)"],
+      [targets?.irradiance, "7. resolved irradiance (material input)"],
+    ]) {
+      const stage = await summarizeTexture(texture, label);
+      if (stage) out.screenStages.push(stage);
+    }
+  } catch (e) {
+    out.errors.push(`screen stages: ${e.message}`);
   }
   return out;
 });
@@ -295,6 +502,18 @@ if (data.palette?.length) {
 if (data.probes?.length) {
   rows.push(summarize("4. probe MEAN over directions", data.probes.map((p) => sat(p[1], p[2], p[3]))));
   rows.push(summarize("4b. probe PEAK directional bin", data.probes.map((p) => p[4])));
+  // The screen integral reads the MERGED c0 tiles, while the aggregate above
+  // pools every cascade. A colourful coarse cascade beside a grey c0 can make
+  // "the probes carry colour" true while saying nothing about the field the
+  // screen actually samples. Keep the aggregate for historical comparisons,
+  // but split the same statistic by cascade so the hand-off and tile/gather
+  // hypotheses are distinguishable in one run.
+  const cascades = [...new Set(data.probes.map((p) => p[0]))].sort((a, b) => a - b);
+  for (const c of cascades) {
+    const probes = data.probes.filter((p) => p[0] === c);
+    rows.push(summarize(`4c. c${c} probe MEAN over directions`, probes.map((p) => sat(p[1], p[2], p[3]))));
+    rows.push(summarize(`4d. c${c} probe PEAK directional bin`, probes.map((p) => p[4])));
+  }
 }
 
 console.log("\nSATURATION = (max-min)/max on linear RGB. 0 = grey, 1 = fully saturated.\n");
@@ -304,6 +523,47 @@ for (const r of rows) {
     `  ${r.label.padEnd(48)}${String(r.n).padStart(6)}  ` +
     `${r.p50.toFixed(3)} ${r.p90.toFixed(3)} ${r.p99.toFixed(3)} ${r.max.toFixed(3)}  ${r.strongPct.toFixed(1)}%`,
   );
+}
+if (data.screenStages?.length) {
+  console.log("\nactual screen-integral stages (native linear rgba16f readback):");
+  for (const s of data.screenStages) {
+    console.log(
+      `  ${s.label.padEnd(42)} n=${String(s.n).padStart(4)}  ` +
+      `rgb ${s.rgb.map((v) => v.toFixed(3)).join("/")}  sat ${s.sat.toFixed(3)}  ` +
+      `>0.25 ${s.strongPct.toFixed(1)}%`,
+    );
+    for (const [name, q] of Object.entries(s.regions ?? {})) {
+      console.log(
+        `    ${name.padEnd(18)} n=${String(q.n).padStart(5)} ` +
+        `rgb ${q.rgb.map((v) => v.toFixed(3)).join("/")} R/G ${q.rg.toFixed(2)} ` +
+        `sat(mean) ${q.sat.toFixed(3)} mean(sat) ${q.meanSat.toFixed(3)}`,
+      );
+    }
+  }
+}
+if (data.hitSignal) {
+  console.log(`\nnative [E] -> [J] hit signal: ${data.hitSignal.count} hits; sun ${data.hitSignal.sun.index} ` +
+    `dir ${data.hitSignal.sun.direction.map((v) => v.toFixed(3)).join("/")}`);
+  for (const c of data.hitSignal.cascades) {
+    if (!c.n) continue;
+    console.log(
+      `  c${c.cascade}: ${c.n} hits, ${c.red} red (${c.redPct.toFixed(1)}%), ` +
+      `rho ${c.meanRho.map((v) => v.toFixed(3)).join("/")}, red sun cosine ${c.meanRedSunCos.toFixed(3)}`,
+    );
+  }
+}
+if (data.tileBlocks?.length) {
+  const agg = (list) => {
+    const a = { n: 0, r: 0, g: 0, b: 0, sat: 0, cov: 0 };
+    for (const q of list) { a.n++; a.r += q[1]; a.g += q[2]; a.b += q[3]; a.sat += q[4]; a.cov += q[5]; }
+    return a.n ? { n: a.n, rgb: [a.r / a.n, a.g / a.n, a.b / a.n], sat: a.sat / a.n, cov: a.cov / a.n } : null;
+  };
+  const all = agg(data.tileBlocks);
+  const red = agg(data.tileBlocks.filter((q) => q[1] > q[2] * 1.4 && q[1] > q[3] * 1.4));
+  console.log(`\nnative [H] c0 tile atlas (${data.tileBlocks.length} covered blocks): ` +
+    `rgb ${all.rgb.map((v) => v.toFixed(3)).join("/")} sat ${all.sat.toFixed(3)} coverage ${all.cov.toFixed(3)}`);
+  if (red) console.log(`  red-dominant blocks ${red.n}: rgb ${red.rgb.map((v) => v.toFixed(3)).join("/")} ` +
+    `sat ${red.sat.toFixed(3)} coverage ${red.cov.toFixed(3)}`);
 }
 
 // ── IS THE TINT THE RIGHT SIZE? THE SPATIAL TEST ───────────────────────────
@@ -398,8 +658,8 @@ if (data.probes?.length && data.reds?.length && data.anchor && data.spacing0) {
       `\n  SATURATION next to a red surface vs far from one: ${nearSat.toFixed(4)} vs ${farSat.toFixed(4)} (${ratio.toFixed(1)}×)\n` +
       `  R/G, for reference only (ill-conditioned on a near-grey mean): ` +
       `${(near.r / Math.max(near.g, 1e-9)).toFixed(4)} vs ${(far.r / Math.max(far.g, 1e-9)).toFixed(4)}\n` +
-      (ratio > 3
-        ? "  THE BLEED IS DELIVERED AND IT IS LOCAL. Coloured bounce falls off sharply with\n" +
+      (ratio > 1.5
+        ? `  THE BLEED IS DELIVERED AND IT IS LOCAL${ratio > 3 ? "." : ", BUT BROAD."} Coloured bounce falls off with\n` +
           "  distance from coloured geometry, which is what it should do — so every link from\n" +
           "  material to probe is working. Whether the ABSOLUTE magnitude matches a path\n" +
           "  tracer cannot be settled here: it needs the reference frame, measured with the\n" +
@@ -502,7 +762,9 @@ if (peak && pro && mat && peak.strongPct > Math.max(10, pro.strongPct * 2)) {
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 const file = path.join(OUT, `colour-bleed-${stamp}.json`);
 writeFileSync(file, JSON.stringify({
-  pose: POSE, quality: QUALITY, rows, deposit: data.deposit ?? null,
+  pose: POSE, quality: QUALITY, rows, screenStages: data.screenStages ?? null,
+  hitSignal: data.hitSignal ?? null, tileBlocks: data.tileBlocks ?? null,
+  deposit: data.deposit ?? null,
   errors: data.errors, giLines: giLines.slice(0, 60),
 }, null, 2));
 console.log(`\nwrote ${file}`);

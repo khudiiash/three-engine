@@ -14,19 +14,18 @@ import { OCCLUDER_LAYER, UI_LAYER } from "../editorLayers.js";
  * anything with real occluders that is the difference between drawing the level
  * and drawing the room.
  *
- * ## Why the decision comes back to the CPU
+ * ## WebGPU uses Three's native query API
  *
- * "GPU occlusion culling" in a GPU-driven renderer means the culling compute
- * shader writes an indirect draw buffer and the CPU never learns what was
- * culled. three submits every draw from JavaScript, so a decision that stays on
- * the GPU cannot remove a single draw call — the win would be zero. What the
- * GPU is genuinely good at here is producing the DEPTH, so it does that: a
- * low-resolution pass over the large occluders, read back asynchronously, and
- * reduced into a Hi-Z pyramid on the CPU (`occlusionMath.js`) where the test is
- * a handful of samples per object.
- *
- * The readback is a quarter of a megabyte and never awaited on the critical
- * path — the results land a frame or two later and are applied then.
+ * WebGPU marks the REAL drawable meshes with `object.occlusionTest` and reads
+ * them through `renderer.isOccluded`, exactly like Three's
+ * webgpu_occlusion example. The query therefore wraps the object's own draw:
+ * it tests against depth that existed BEFORE the object, rather than against
+ * depth the object wrote itself. A previous implementation drew a separate
+ * AABB after the scene; box-like meshes then occluded their own query because
+ * of equal-depth precision and disappeared at random. A unique always-occluded
+ * sentinel ties asynchronous results to the camera generation; a late
+ * old-camera result fails open instead of making geometry disappear.
+ * WebGL retains the depth/readback/CPU Hi-Z fallback below.
  *
  * ## Why the test uses the camera the depth was captured with
  *
@@ -106,6 +105,31 @@ export class OcclusionSystem {
     this.testedLastFrame = 0;
     this.culledLastFrame = 0;
     this._sphere = new THREE.Sphere();
+
+    // Native WebGPU query state. Queries are armed only until two fresh
+    // result sets arrive; a settled view pays no extra depth pass/readback and
+    // no permanent per-frame query cost.
+    this._nativeRenderer = null;
+    this._nativeView = new THREE.Matrix4();
+    this._nativeProjection = new THREE.Matrix4();
+    this._nativeHasView = false;
+    this._nativeStableFrames = 0;
+    this._nativeDirty = true;
+    this._nativeSettled = false;
+    this._nativeActive = false;
+    this._nativeGeneration = 0;
+    this._nativeRecords = [];
+    this._nativeHooks = new Map();
+    this._nativeSeenResults = null;
+    this._nativeResultWaves = 0;
+    this._nativeReady = null;
+    this._nativeRenderContext = null;
+    this._nativeOccludedStreak = new Map();
+    this._nativeQueryGroup = null;
+    this._nativeSentinel = null;
+    this._nativeQueryGeometry = null;
+    this._nativeQueryMaterial = null;
+    this._nativeSentinelMaterial = null;
   }
 
   /**
@@ -120,9 +144,14 @@ export class OcclusionSystem {
     if (Number.isFinite(minOccluderSize) && minOccluderSize !== this.minOccluderSize) {
       this.minOccluderSize = minOccluderSize;
       this._occluderDirty = true;
+      this._nativeDirty = true;
     }
     if (Number.isFinite(bias)) this.bias = bias;
-    if (cullShadowCasters !== undefined) this.cullShadowCasters = cullShadowCasters !== false;
+    if (cullShadowCasters !== undefined) {
+      const next = cullShadowCasters !== false;
+      if (next !== this.cullShadowCasters) this._nativeDirty = true;
+      this.cullShadowCasters = next;
+    }
   }
 
   setEnabled(value) {
@@ -131,8 +160,10 @@ export class OcclusionSystem {
     this.enabled = next;
     if (next) {
       this._occluderDirty = true;
+      this._nativeDirty = true;
       const invalidate = () => {
         this._occluderDirty = true;
+        this._nativeDirty = true;
       };
       this._unsubscribe = [
         this.engine.on("hierarchy-changed", invalidate),
@@ -155,13 +186,81 @@ export class OcclusionSystem {
    * that gets blamed on loading.
    */
   reset() {
-    for (const entity of this._hidden) entity._occluded = false;
+    this.#cancelNativeQueries();
+    for (const entity of this._hidden) this.#restoreEntity(entity);
     this._hidden.clear();
     for (const proxy of this._hiddenProxies) proxy.visible = true;
     this._hiddenProxies.clear();
     this.pyramid.clear();
     this.culledLastFrame = 0;
     this.testedLastFrame = 0;
+    this._nativeDirty = true;
+    this._nativeSettled = false;
+    this._nativeStableFrames = 0;
+  }
+
+  #usesNativeQueries() {
+    const renderer = this.engine.renderer;
+    return !!(
+      renderer?.backend?.isWebGPUBackend === true &&
+      typeof renderer.isOccluded === "function"
+    );
+  }
+
+  #cameraChanged(camera) {
+    camera.updateMatrixWorld();
+    const changed =
+      !this._nativeHasView ||
+      !matrixNear(this._nativeView, camera.matrixWorldInverse, 1e-4) ||
+      !matrixNear(this._nativeProjection, camera.projectionMatrix, 1e-7);
+    if (!changed) return false;
+    this._nativeView.copy(camera.matrixWorldInverse);
+    this._nativeProjection.copy(camera.projectionMatrix);
+    this._nativeHasView = true;
+    return true;
+  }
+
+  #restoreNativeVisibility() {
+    for (const entity of this._hidden) this.#restoreEntity(entity);
+    this._hidden.clear();
+    for (const proxy of this._hiddenProxies) proxy.visible = true;
+    this._hiddenProxies.clear();
+  }
+
+  #restoreEntity(entity) {
+    entity._occluded = false;
+    const modeFlag = this.engine.playing ? "enabledInGame" : "enabledInEditor";
+    const authored = entity[modeFlag] !== false;
+    const visible = authored && entity._lodHidden !== true;
+    entity.object3D.userData.cameraHidden = authored && !visible;
+    entity.object3D.visible = visible;
+  }
+
+  #cancelNativeQueries() {
+    for (const [object, state] of this._nativeHooks) {
+      object.occlusionTest = state.occlusionTest;
+      if (object.onBeforeRender === state.beforeWrapper) object.onBeforeRender = state.onBeforeRender;
+      if (object.onAfterRender === state.afterWrapper) object.onAfterRender = state.onAfterRender;
+    }
+    this._nativeHooks.clear();
+    this._nativeRecords.length = 0;
+    this._nativeActive = false;
+    this._nativeSeenResults = null;
+    this._nativeResultWaves = 0;
+    this._nativeReady = null;
+    this._nativeRenderContext = null;
+    this._nativeOccludedStreak.clear();
+    if (this._nativeQueryGroup?.parent) this._nativeQueryGroup.parent.remove(this._nativeQueryGroup);
+    this._nativeQueryGroup = null;
+    this._nativeSentinel = null;
+  }
+
+  #invalidateNative() {
+    this.#cancelNativeQueries();
+    this.#restoreNativeVisibility();
+    this._nativeSettled = false;
+    this.testedLastFrame = 0;
+    this.culledLastFrame = 0;
   }
 
   /* ---------------------------------------------------------------- render */
@@ -280,6 +379,279 @@ export class OcclusionSystem {
     this._occluders.length = 0;
   }
 
+  #collectNativeRecords(camera) {
+    const records = [];
+    const addRecord = (owner, root, allowEngineOwned = false) => {
+      if (!root?.visible) return;
+      const objects = [];
+      let protectedShadowCaster = false;
+      root.traverse((object) => {
+        if ((!object.isMesh && !object.isInstancedMesh) || object.visible === false) return;
+        if (!object.geometry || !object.material || (!allowEngineOwned && object.userData?.engineOwned)) return;
+        if (object.userData?.batchedInto || object.userData?.mergedInto) return;
+        if (!object.layers.test(camera.layers)) return;
+        // Hiding the owner hides every drawable below it. If even one of those
+        // draws is a protected shadow caster, excluding only that one from the
+        // query would still make it disappear when its siblings are occluded.
+        if (!this.cullShadowCasters && object.castShadow) protectedShadowCaster = true;
+        objects.push(object);
+      });
+      if (objects.length && !protectedShadowCaster) records.push({ owner, objects });
+    };
+
+    // Members draw through these proxies, so testing the hidden originals
+    // produces an impressive cull count without removing a single real draw.
+    for (const batch of this.engine.batching?.batches ?? []) {
+      addRecord({ type: "proxy", object: batch.mesh }, batch.mesh, true);
+    }
+    for (const group of this.engine.merging?.groups ?? []) {
+      addRecord({ type: "proxy", object: group.mesh }, group.mesh, true);
+    }
+
+    for (const entity of this.engine.entities.values()) {
+      if (entity._lodHidden === true || entity.object3D.visible === false) continue;
+      const mesh = entity.components?.get("mesh")?.mesh;
+      const model = entity.components?.get("model")?.root;
+      if (mesh?.userData?.batchedInto || mesh?.userData?.mergedInto) continue;
+      const root = mesh ?? model;
+      if (root) addRecord({ type: "entity", entity }, root);
+    }
+    return records;
+  }
+
+  #armNativeQueries(renderer, camera) {
+    this._nativeRecords = this.#collectNativeRecords(camera);
+    if (this._nativeRecords.length === 0) {
+      this._nativeSettled = true;
+      this.testedLastFrame = 0;
+      this.culledLastFrame = 0;
+      return;
+    }
+
+    this._nativeGeneration++;
+    this._nativeActive = true;
+    this._nativeSeenResults = null;
+    this._nativeResultWaves = 0;
+    this._nativeReady = null;
+
+    if (!this._nativeQueryGeometry) this._nativeQueryGeometry = new THREE.BoxGeometry(1, 1, 1);
+    if (!this._nativeQueryMaterial) {
+      const material = new THREE.MeshBasicNodeMaterial({ color: 0x000000 });
+      material.name = "Occlusion bounds query";
+      material.colorWrite = false;
+      material.depthWrite = false;
+      material.depthTest = true;
+      material.side = THREE.DoubleSide;
+      material.toneMapped = false;
+      this._nativeQueryMaterial = material;
+    }
+    if (!this._nativeSentinelMaterial) {
+      const material = this._nativeQueryMaterial.clone();
+      material.name = "Occlusion query sentinel";
+      material.depthFunc = THREE.NeverDepth;
+      this._nativeSentinelMaterial = material;
+    }
+
+    const queryGroup = new THREE.Group();
+    queryGroup.name = "Occlusion queries";
+    queryGroup.userData.engineOwned = true;
+    for (const record of this._nativeRecords) {
+      record.queryObjects = [];
+      for (const object of record.objects) {
+        // The native query must wrap the object's actual draw. A detached bounds
+        // proxy rendered later sees the object's own depth and can report it as
+        // its occluder, especially for walls and other box-like geometry.
+        if (!this._nativeHooks.has(object)) {
+          this._nativeHooks.set(object, {
+            onBeforeRender: object.onBeforeRender,
+            onAfterRender: object.onAfterRender,
+            occlusionTest: object.occlusionTest,
+          });
+          object.occlusionTest = true;
+        }
+        record.queryObjects.push(object);
+      }
+    }
+
+    // A unique, always-failing query identifies the result set belonging to
+    // THIS generation. Old-camera WeakSets cannot contain this object, so a
+    // delayed result can only keep everything visible; it can never hide it.
+    const sentinel = new THREE.Mesh(this._nativeQueryGeometry, this._nativeSentinelMaterial);
+    sentinel.name = "Occlusion result sentinel";
+    sentinel.userData.engineOwned = true;
+    sentinel.frustumCulled = false;
+    sentinel.renderOrder = Number.MAX_SAFE_INTEGER;
+    sentinel.layers.mask = camera.layers.mask;
+    sentinel.occlusionTest = true;
+    queryGroup.add(sentinel);
+    this._nativeQueryGroup = queryGroup;
+    this._nativeSentinel = sentinel;
+    this.engine.scene.add(queryGroup);
+
+    const system = this;
+    const onBeforeRender = sentinel.onBeforeRender;
+    const beforeWrapper = function (...args) {
+      onBeforeRender.apply(this, args);
+      system.#captureNativeContext(args[0]);
+    };
+    this._nativeHooks.set(sentinel, {
+      onBeforeRender,
+      onAfterRender: sentinel.onAfterRender,
+      occlusionTest: false,
+      beforeWrapper,
+    });
+    sentinel.onBeforeRender = beforeWrapper;
+  }
+
+  #captureNativeContext(renderer) {
+    if (!this._nativeActive) return;
+    this._nativeRenderContext = renderer?._currentRenderContext ?? null;
+  }
+
+  #beginNativeSubmission() {
+    if (!this._nativeActive || !this._nativeQueryGroup || !this._nativeSentinel) return;
+    for (const record of this._nativeRecords) {
+      for (const object of record.queryObjects) object.occlusionTest = true;
+    }
+    this._nativeSentinel.occlusionTest = true;
+    if (!this._nativeQueryGroup.parent) this.engine.scene.add(this._nativeQueryGroup);
+  }
+
+  #finishNativeSubmission() {
+    if (!this._nativeActive) return;
+    for (const record of this._nativeRecords) {
+      for (const object of record.queryObjects) object.occlusionTest = false;
+    }
+    if (this._nativeSentinel) this._nativeSentinel.occlusionTest = false;
+    this._nativeQueryGroup?.removeFromParent();
+  }
+
+  #pollNativeResults(renderer) {
+    if (!this._nativeActive || this._nativeReady) return;
+    const context = this._nativeRenderContext;
+    const results = context && renderer.backend?.get?.(context)?.occluded;
+    if (!results || results === this._nativeSeenResults) return;
+    // A set from a shadow/offscreen/older-generation context cannot contain
+    // this generation's unique sentinel. Ignore it without poisoning the
+    // fresh-result identity check.
+    if (results.has(this._nativeSentinel) !== true) return;
+    this._nativeSeenResults = results;
+    this._nativeResultWaves++;
+    const objectResults = new Map();
+    for (const record of this._nativeRecords) {
+      // An entity with multiple draws is hidden only if EVERY successfully
+      // queried draw is hidden. Missing/empty records fail open.
+      const queried = record.queryObjects ?? [];
+      const occluded = queried.length > 0 && queried.every((object) => results.has(object));
+      const streak = occluded ? (this._nativeOccludedStreak.get(record) ?? 0) + 1 : 0;
+      this._nativeOccludedStreak.set(record, streak);
+      objectResults.set(record, streak >= 2);
+    }
+    // One zero-sample result is too brittle around equal-depth edges. A draw
+    // disappears only after the same owner is absent in two independent main
+    // frame query sets; visible or missing results always fail open.
+    if (this._nativeResultWaves < 2) return;
+    this._nativeReady = { generation: this._nativeGeneration, objectResults };
+  }
+
+  #applyNativeResults() {
+    const ready = this._nativeReady;
+    if (!ready || ready.generation !== this._nativeGeneration) return false;
+    let tested = 0;
+    let culled = 0;
+    for (const record of this._nativeRecords) {
+      tested++;
+      const occluded = ready.objectResults.get(record) === true;
+      if (record.owner.type === "entity") {
+        const entity = record.owner.entity;
+        entity._occluded = occluded;
+        if (occluded) {
+          culled++;
+          this._hidden.add(entity);
+        } else {
+          this._hidden.delete(entity);
+        }
+      } else {
+        const proxy = record.owner.object;
+        proxy.visible = !occluded;
+        if (occluded) {
+          culled++;
+          this._hiddenProxies.add(proxy);
+        } else {
+          this._hiddenProxies.delete(proxy);
+        }
+      }
+    }
+    this.testedLastFrame = tested;
+    this.culledLastFrame = culled;
+    this.#cancelNativeQueries();
+    this._nativeSettled = true;
+    return true;
+  }
+
+  #applyNative() {
+    const renderer = this.engine.renderer;
+    const camera = this.engine.camera;
+    if (!renderer || !camera || !this.engine.rendererReady) return;
+    if (renderer !== this._nativeRenderer) {
+      this.#invalidateNative();
+      this._nativeRenderer = renderer;
+      this._nativeHasView = false;
+      this._nativeDirty = true;
+    }
+    const moved = this.#cameraChanged(camera);
+    if (moved || this._nativeDirty) {
+      // A stale hidden answer is never carried into another view. Restoring is
+      // deliberately immediate: ordinary depth still hides geometry behind
+      // the wall, while retaining it could make a newly exposed object vanish
+      // for the whole async query latency.
+      this.#invalidateNative();
+      this._nativeDirty = false;
+      this._nativeStableFrames = 0;
+      return;
+    }
+    this._nativeStableFrames++;
+    this.#pollNativeResults(renderer);
+    this.#applyNativeResults();
+  }
+
+  #prepareNativeRender(renderer, camera) {
+    // Querying while the view is changing would add bookkeeping to the exact
+    // frames that need responsiveness. Movement already restored everything;
+    // arm once the same view survives through a complete update.
+    if (this._nativeActive) {
+      this.#beginNativeSubmission();
+      return;
+    }
+    if (
+      this._nativeSettled ||
+      this._nativeStableFrames < 1
+    ) return;
+    this.#armNativeQueries(renderer, camera);
+  }
+
+  /**
+   * Arms native queries immediately before the engine's final scene render.
+   *
+   * This must not happen in `render()` below: that phase precedes GI,
+   * impostor and editor pre-renders. Leaving `occlusionTest` armed across
+   * those nested renders lets an offscreen camera/context answer a main-view
+   * visibility question, which presents as unrelated meshes disappearing.
+   */
+  prepareMainRender() {
+    if (!this.enabled || !this.#usesNativeQueries()) return;
+    const renderer = this.engine.renderer;
+    const camera = this.engine.camera;
+    if (!renderer || !camera || !this.engine.rendererReady) return;
+    this.#prepareNativeRender(renderer, camera);
+  }
+
+  /** Disarms native query state before any synchronous post-render can run. */
+  finishMainRender() {
+    if (!this.enabled || !this.#usesNativeQueries()) return;
+    this.#finishNativeSubmission();
+  }
+
   /**
    * Renders this frame's occluder depth and starts a readback. Called from the
    * engine's pre-render phase, after transforms are final.
@@ -289,6 +661,16 @@ export class OcclusionSystem {
     const renderer = this.engine.renderer;
     const camera = this.engine.camera;
     if (!renderer || !camera || !this.engine.rendererReady) return;
+    if (this.#usesNativeQueries()) {
+      // Native queries are armed by `prepareMainRender()`, after every nested
+      // pre-render has finished and immediately before the final scene pass.
+      return;
+    }
+    if (this._nativeRenderer) {
+      this.#invalidateNative();
+      this._nativeRenderer = null;
+      this._nativeHasView = false;
+    }
     if (this.pending) return; // one readback in flight; the next frame will do
     if (this._occluderDirty) this.refreshOccluders();
     if (this._occluders.length === 0) return;
@@ -382,7 +764,12 @@ export class OcclusionSystem {
    * that resolves visibility.
    */
   apply() {
-    if (!this.enabled || !this.pyramid.ready) return;
+    if (!this.enabled) return;
+    if (this.#usesNativeQueries()) {
+      this.#applyNative();
+      return;
+    }
+    if (!this.pyramid.ready) return;
     const view = this.captureView;
     const projection = this.captureProjection;
     let tested = 0;
@@ -436,6 +823,25 @@ export class OcclusionSystem {
       }
     }
 
+    // Static merge members are hidden originals just like batch members. The
+    // merged proxy is the draw that must disappear for culling to save work.
+    for (const group of this.engine.merging?.groups ?? []) {
+      const mesh = group.mesh;
+      if (!mesh.boundingSphere && !mesh.geometry?.boundingSphere) continue;
+      const sphere = mesh.boundingSphere ?? mesh.geometry.boundingSphere;
+      tested++;
+      const projected = projectSphere(sphere.center, sphere.radius, view, projection, this.bounds);
+      const occluded = projected && isOccluded(this.pyramid, this.bounds, this.bias);
+      if (occluded) {
+        culled++;
+        mesh.visible = false;
+        this._hiddenProxies.add(mesh);
+      } else if (this._hiddenProxies.has(mesh)) {
+        mesh.visible = true;
+        this._hiddenProxies.delete(mesh);
+      }
+    }
+
     this.testedLastFrame = tested;
     this.culledLastFrame = culled;
   }
@@ -450,7 +856,7 @@ export class OcclusionSystem {
     if (!mesh && !model) return false;
     // A batched member draws through its proxy no matter what its own
     // visibility says; the proxy is tested instead (see the header).
-    if (mesh?.userData.batchedInto) return false;
+    if (mesh?.userData.batchedInto || mesh?.userData.mergedInto) return false;
     if (!this.cullShadowCasters && mesh?.castShadow) return false;
     // An occluder can itself be occluded, but testing the wall you are standing
     // behind against the depth buffer it wrote is a coin flip against the bias.
@@ -466,6 +872,14 @@ export class OcclusionSystem {
       occluders: this._occluders.length,
       tested: this.testedLastFrame,
       culled: this.culledLastFrame,
+      nativeActive: this._nativeActive,
+      nativeQueries: this._nativeHooks.size,
+      nativeResultWaves: this._nativeResultWaves,
+      nativeReady: !!this._nativeReady,
+      nativeGeneration: this._nativeGeneration,
+      nativeStableFrames: this._nativeStableFrames,
+      nativeSettled: this._nativeSettled,
+      nativeHasContext: !!this._nativeRenderContext,
     };
   }
 
@@ -473,6 +887,12 @@ export class OcclusionSystem {
     this.setEnabled(false);
     this.material?.dispose();
     this.material = null;
+    this._nativeQueryGeometry?.dispose();
+    this._nativeQueryMaterial?.dispose();
+    this._nativeSentinelMaterial?.dispose();
+    this._nativeQueryGeometry = null;
+    this._nativeQueryMaterial = null;
+    this._nativeSentinelMaterial = null;
     this.#disposeTarget();
   }
 }
@@ -519,4 +939,13 @@ export function toPyramidRows(raw, width, height, webgl) {
     if (available > 0) out.set(raw.subarray(from, from + available), y * rowFloats);
   }
   return out;
+}
+
+function matrixNear(a, b, epsilon) {
+  const ae = a.elements;
+  const be = b.elements;
+  for (let i = 0; i < 16; i++) {
+    if (Math.abs(ae[i] - be[i]) > epsilon) return false;
+  }
+  return true;
 }

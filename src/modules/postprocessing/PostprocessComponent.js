@@ -2,7 +2,7 @@ import * as THREE from "three/webgpu";
 import * as TSL from "three/tsl";
 import { Component } from "../../engine/components/Component.js";
 import { ensureGodraysShadowMap, disposeGodraysShadowMap } from "./godraysShadow.js";
-import { EDITOR_LAYER, PP_OVERLAY_SEED_LAYER } from "../../engine/editorLayers.js";
+import { EDITOR_LAYER, PHYSICS_DEBUG_LAYER, PP_OVERLAY_SEED_LAYER } from "../../engine/editorLayers.js";
 import { resolveAssetUrl } from "../../engine/assetResolver.js";
 import { DEFAULT_POST_GRAPH, normalizePostAsset, normalizePostGraph } from "./postAsset.js";
 import {
@@ -550,6 +550,7 @@ export class PostprocessComponent extends Component {
     if (this.postprocessLayers && this.renderCamera) {
       this.postprocessLayers.mask = this.renderCamera.layers.mask;
       this.postprocessLayers.disable(EDITOR_LAYER);
+      this.postprocessLayers.disable(PHYSICS_DEBUG_LAYER);
     }
     this.pipeline.outputNode = this.outputNode;
     this.pipeline.render();
@@ -679,6 +680,7 @@ export class PostprocessComponent extends Component {
       this.postprocessLayers = new THREE.Layers();
       this.postprocessLayers.mask = this.renderCamera.layers.mask;
       this.postprocessLayers.disable(EDITOR_LAYER);
+      this.postprocessLayers.disable(PHYSICS_DEBUG_LAYER);
       this.scenePass.setLayers(this.postprocessLayers);
       // Attach a per-fragment view-space normal MRT to the scene pass.
       // SSGI consumes the normal via `getTextureNode('normal')` (an RGB
@@ -746,13 +748,12 @@ export class PostprocessComponent extends Component {
       // metalness/roughness are 0..1 scalars — 8-bit is plenty.
       const matTexture = needs.matParams ? this.scenePass.getTexture("matParams") : null;
       if (matTexture) matTexture.type = THREE.UnsignedByteType;
-      // ── EDITOR HELPER OVERLAY PASS (editor viewport only) ───────────────
-      // The scene pass strips EDITOR_LAYER so effects never see the grid or
-      // gizmos — which, before this pass existed, meant a PP-owned editor
-      // frame had NO editor aids at all ("no gizmos appear except the
-      // outline", 2026-08-13). They cannot be drawn after pipeline.render()
-      // (this file's header rule), so they render INSIDE the pipeline: a
-      // second scene pass over EDITOR_LAYER only, composited by
+      // ── VIEWPORT HELPER OVERLAY PASS ───────────────────────────────────
+      // The scene pass strips editor/debug layers so effects never process
+      // their lines. They cannot be drawn after pipeline.render() (this
+      // file's header rule), so enabled aids render INSIDE the pipeline: a
+      // second scene pass over EDITOR_LAYER and/or PHYSICS_DEBUG_LAYER,
+      // composited by
       // #applyEditorHelpers with a per-pixel depth test against the scene
       // pass. Gated on the editor's overlay registration — game builds never
       // register one, so shipped pipelines stay byte-identical.
@@ -761,6 +762,7 @@ export class PostprocessComponent extends Component {
         const overlayPass = TSL.pass(engine.scene, this.renderCamera, { samples: 1 });
         const overlayLayers = new THREE.Layers();
         overlayLayers.set(EDITOR_LAYER);
+        overlayLayers.enable(PHYSICS_DEBUG_LAYER);
         overlayLayers.enable(PP_OVERLAY_SEED_LAYER);
         overlayPass.setLayers(overlayLayers);
         // DEPTH SEED. On direct frames, helpers occlude by depth-TESTING the
@@ -786,11 +788,9 @@ export class PostprocessComponent extends Component {
         seedQuad.layers.set(PP_OVERLAY_SEED_LAYER);
         engine.scene.add(seedQuad);
         this._overlaySeedQuad = seedQuad;
-        // Editor helpers must NEVER reach play mode ("gizmos appear in play
-        // mode", the second live report): PassNode overrides camera.layers
-        // with the pass's own set, so the game camera would see EDITOR_LAYER
-        // regardless of its mask. Gate with a live uniform (composite → 0)
-        // AND skip the render entirely while playing.
+        // PassNode overrides camera.layers with the pass's own set, so mirror
+        // the active camera's layer mask every frame. Play starts with all
+        // aids off, but can explicitly enable any of them from Layers.
         this._overlayLiveU = TSL.uniform(1);
         // PassNode draws scene.background as a fullscreen pass that IGNORES
         // camera layers (the occlusion-culling depth trap, same class) and
@@ -801,9 +801,14 @@ export class PostprocessComponent extends Component {
         const originalUpdateBefore = overlayPass.updateBefore.bind(overlayPass);
         const clearColor = new THREE.Color();
         overlayPass.updateBefore = (frame) => {
-          const playing = !!engine.playing;
-          if (this._overlayLiveU) this._overlayLiveU.value = playing ? 0 : 1;
-          if (playing) return;
+          const editorVisible = !!this.renderCamera?.layers?.isEnabled?.(EDITOR_LAYER);
+          const physicsVisible = !!this.renderCamera?.layers?.isEnabled?.(PHYSICS_DEBUG_LAYER);
+          const live = editorVisible || physicsVisible;
+          if (this._overlayLiveU) this._overlayLiveU.value = live ? 1 : 0;
+          if (!live) return;
+          overlayLayers.set(PP_OVERLAY_SEED_LAYER);
+          if (editorVisible) overlayLayers.enable(EDITOR_LAYER);
+          if (physicsVisible) overlayLayers.enable(PHYSICS_DEBUG_LAYER);
           const scene = engine.scene;
           const renderer = engine.renderer;
           const bg = scene.background;

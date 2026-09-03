@@ -488,6 +488,42 @@ function EntityRefField({ descriptor, value, onCommit }) {
   );
 }
 
+/** Five-point radio rail used by discrete quality selectors such as GI terms. */
+function LevelPropField({ descriptor, value, onCommit, mixed = false }) {
+  const options = descriptor.options ?? [0, 0.25, 0.5, 0.75, 1];
+  const labels = descriptor.optionLabels ?? options.map((option) => option === 0 ? "Off" : String(option));
+  const numeric = Number(value);
+  const selected = mixed || !Number.isFinite(numeric)
+    ? -1
+    : options.reduce((best, option, index) =>
+        Math.abs(Number(option) - numeric) < Math.abs(Number(options[best]) - numeric) ? index : best, 0);
+  const progress = selected < 0 || options.length < 2 ? 0 : selected / (options.length - 1);
+  return (
+    <div
+      className={`level-field${mixed ? " mixed" : ""}`}
+      role="radiogroup"
+      aria-label={descriptor.label}
+      style={{ "--level-progress": `${progress * 100}%` }}
+    >
+      <span className="level-field-track" aria-hidden="true" />
+      {options.map((option, index) => (
+        <button
+          type="button"
+          role="radio"
+          aria-checked={selected === index}
+          aria-label={labels[index] ?? String(option)}
+          className={`level-field-step${index === 0 ? " off" : ""}${selected === index ? " selected" : ""}${selected >= index ? " filled" : ""}`}
+          key={option}
+          title={labels[index] ?? String(option)}
+          onClick={() => onCommit(option)}
+        >
+          <span className="level-field-dot" />
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /**
  * One typed property editor, chosen by `descriptor.type`.
  *
@@ -525,6 +561,8 @@ export function PropField({ descriptor, value, onCommit, mixed = false, mixedAxe
           onCommit={onCommit}
         />
       );
+    case "level":
+      return <LevelPropField descriptor={descriptor} value={value} mixed={mixed} onCommit={onCommit} />;
     case "color":
       return (
         <input

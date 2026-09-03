@@ -58,7 +58,12 @@ fn agent_and_retry_survive_a_burst() {
             Err(e) => failures.push(format!("#{i}: {e}")),
         }
     }
-    assert!(failures.is_empty(), "{} of 40 failed: {:?}", failures.len(), failures);
+    assert!(
+        failures.is_empty(),
+        "{} of 40 failed: {:?}",
+        failures.len(),
+        failures
+    );
 }
 
 #[test]

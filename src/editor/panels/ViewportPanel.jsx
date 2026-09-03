@@ -35,7 +35,7 @@ import {
   toggleBrowserPreview,
   toggleShareTunnel,
 } from "../browserPreview.js";
-import { DEBUG_LAYER, EDITOR_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
+import { DEBUG_LAYER, EDITOR_LAYER, PHYSICS_DEBUG_LAYER, UI_LAYER } from "../../engine/editorLayers.js";
 import { StatsOverlay } from "../overlays/StatsOverlay.jsx";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
@@ -177,6 +177,18 @@ const LAYER_TOGGLES = [
   { key: "virtualGeometry", label: "Virtual Geometry" },
 ];
 
+const EDIT_LAYER_DEFAULTS = {
+  gizmos: true,
+  cursor3D: true,
+  colliders: true,
+  grid: true,
+  stats: true,
+  debugDraw: true,
+  uiOverlay: false,
+  virtualGeometry: false,
+};
+const PLAY_LAYER_DEFAULTS = Object.fromEntries(LAYER_TOGGLES.map(({ key }) => [key, false]));
+
 // The renderer canvas and editor controls outlive the React panel so the
 // viewport can be closed/reopened without re-initializing WebGPU.
 const viewport = {
@@ -216,7 +228,9 @@ const viewport = {
   // Toggles from the Layers dropdown. Mirrored in React state; mutations
   // here apply live so a hot-reload of the panel keeps the current layer
   // set. Default to "all on" so the viewport starts in its full visual state.
-  layers: { gizmos: true, cursor3D: true, colliders: true, grid: true, stats: true, debugDraw: true, uiOverlay: false, virtualGeometry: false },
+  layers: { ...EDIT_LAYER_DEFAULTS },
+  editLayers: { ...EDIT_LAYER_DEFAULTS },
+  playLayers: { ...PLAY_LAYER_DEFAULTS },
   layersListeners: new Set(),
 };
 
@@ -262,6 +276,9 @@ async function ensureViewport() {
       // grid, selection box, frustum helper). Without this, those objects
       // wouldn't render even though they live in the scene tree.
       viewport.camera.layers.enable(EDITOR_LAYER);
+      // Collider overlays have their own bit so Play can opt into physics
+      // shapes without also revealing every editor-only helper.
+      viewport.camera.layers.enable(PHYSICS_DEBUG_LAYER);
       // ...and runtime debug drawing, which lives on its own layer so it can
       // also reach the Play/Game views that switch the editor layer off.
       viewport.camera.layers.enable(DEBUG_LAYER);
@@ -635,9 +652,9 @@ function setupGizmo(canvas) {
     const cursorSelected = state.ids?.some(isCursorSelectionId);
     setCursor3DSelected(cursorSelected);
     attachSelection(state.ids);
-    // Trimesh collider outlines are built for the selection only, so they
-    // have to be re-evaluated whenever it moves — not just when the layer
-    // toggle flips.
+    // Geometry-derived collider outlines are selection-scoped in Edit, so
+    // they have to be re-evaluated whenever selection moves — not just when
+    // the layer toggle flips. Play deliberately requests all of them.
     setCollidersVisible(viewport.layers.colliders);
   });
   engine.on("play-changed", () => attachSelection(useSelectionStore.getState().ids));
@@ -671,22 +688,27 @@ function findSceneCamera() {
 }
 
 /** Switches rendering between the editor's orbit camera and the scene's own
- * camera entity for Play mode, and hides editor-only helpers/gizmos so the
- * viewport shows what the game actually looks like. */
+ * camera entity. Play gets a separate, all-off debug-layer profile so its
+ * toggles never overwrite the author's Edit-mode choices. */
 function setupPlayCamera() {
   engine.on("play-changed", (playing) => {
-    if (viewport.helpers) viewport.helpers.visible = !playing;
+    if (playing) {
+      viewport.playLayers = { ...PLAY_LAYER_DEFAULTS };
+      viewport.layers = viewport.playLayers;
+    } else {
+      engine.camera?.layers.disable(PHYSICS_DEBUG_LAYER);
+      engine.camera?.layers.disable(EDITOR_LAYER);
+      viewport.layers = viewport.editLayers;
+    }
+    if (viewport.helpers) viewport.helpers.visible = true;
     if (viewport.cameraPreview) viewport.cameraPreview.setVisible(!playing);
-    // Gizmo + selection-outline visibility is owned by `applyLayerVisibility`
-    // — it AND-combines the user's Gizmo toggle with the editor-vs-play
-    // rule so flipping the dropdown takes effect both in and out of play.
-    applyLayerVisibility();
+    // Gizmo + selection-outline visibility is owned by `applyLayerVisibility`,
+    // so flipping the active profile's dropdown takes effect in either mode.
     // The 3D cursor's primary proxy lives under viewport.helpers so it's
     // already hidden when helpers go invisible — but its local proxy in
     // the geometry editor's detached scene does *not*. Force a refresh
     // so that one hides (or unhides) on the same frame as the play flip
     // instead of waiting for the next engine.onUpdate tick.
-    refreshCursor3D();
 
     if (playing) {
       const camEntity = findSceneCamera();
@@ -713,6 +735,9 @@ function setupPlayCamera() {
       viewport.camera.layers.enable(EDITOR_LAYER);
       viewport.orbit.enabled = true;
     }
+    applyLayerVisibility();
+    refreshCursor3D();
+    notifyLayersChanged();
     resizeActiveCamera();
   });
 }
@@ -828,7 +853,13 @@ function syncOrbitCamera(camera) {
 
 function useEditorCamera(camera) {
   viewport.camera = camera;
-  camera.layers.enable(EDITOR_LAYER);
+  if (viewport.layers.gizmos || viewport.layers.cursor3D || viewport.layers.grid || viewport.layers.virtualGeometry) {
+    camera.layers.enable(EDITOR_LAYER);
+  } else {
+    camera.layers.disable(EDITOR_LAYER);
+  }
+  if (viewport.layers.colliders) camera.layers.enable(PHYSICS_DEBUG_LAYER);
+  else camera.layers.disable(PHYSICS_DEBUG_LAYER);
   syncOrbitCamera(camera);
   if (viewport.gizmo) viewport.gizmo.camera = camera;
   if (!engine.playing) engine.camera = camera;
@@ -1100,7 +1131,9 @@ class CameraPreview {
 
     const hidden = hideEditorOnly(engine.scene);
     const prevEnabled = cam.layers.isEnabled(EDITOR_LAYER);
+    const physicsDebugEnabled = cam.layers.isEnabled(PHYSICS_DEBUG_LAYER);
     cam.layers.disable(EDITOR_LAYER);
+    cam.layers.disable(PHYSICS_DEBUG_LAYER);
     try {
       this.renderer.setViewport(x, y, w, h);
       this.renderer.setScissor(x, y, w, h);
@@ -1114,6 +1147,7 @@ class CameraPreview {
       this.renderer.autoClearColor = prevAutoClearColor;
       this.renderer.autoClearDepth = prevAutoClearDepth;
       if (prevEnabled) cam.layers.enable(EDITOR_LAYER);
+      if (physicsDebugEnabled) cam.layers.enable(PHYSICS_DEBUG_LAYER);
       restoreHidden(hidden);
       this.renderer.setScissorTest(prevScissorTest);
       this.renderer.setScissor(prevScissor);
@@ -1207,7 +1241,6 @@ function setupSelectionOutline() {
     });
   });
   engine.onPostRender(() => {
-    if (engine.playing) return;
     // A render override (PostprocessComponent) already composited the ring
     // inside its pipeline via engine.viewportOverlayNode.
     const overrideOwnsFrame = [...(engine.renderOverrides ?? [])].some((o) => o.ownsCamera?.(engine));
@@ -1276,25 +1309,26 @@ function rebuildGrid(editorSettings) {
 /**
  * Walks every entity in the scene and applies `visible` to the gizmo of its
  * physics-shape components (Collider + CharacterController). Both gizmos live
- * on EDITOR_LAYER and follow the same "Colliders" layer toggle so a
+ * on PHYSICS_DEBUG_LAYER and follow the same "Colliders" layer toggle so a
  * CharacterController entity — which owns its own capsule rather than a
  * separate Collider — respects the user's "show physics aids" preference
- * without needing its own menu entry. Components own the gizmo Object3D;
- * we only flip `visible` so toggling is instant and reversible.
+ * without needing its own menu entry. Components own their overlay Object3Ds
+ * and geometry-derived colliders allocate/dispose outlines on demand.
  */
 function setCollidersVisible(visible) {
-  // `mesh` colliders own no gizmo — the rendered mesh is their outline — so
-  // the toggle alone has nothing to show for them. They trace one on demand
-  // for the SELECTED entity instead, which is where "is there a collider on
-  // this, and does it cover the children?" is actually being asked. Hidden
-  // wholesale when the layer is off.
-  const selected = visible ? new Set(useSelectionStore.getState().ids) : null;
+  // Surface-derived colliders build a wire outline on demand. Edit mode keeps
+  // that expensive view selection-scoped; Play deliberately shows every
+  // collider so the toggle is useful as a whole-world physics diagnostic.
+  const showAllOutlines = visible && engine.playing;
+  const selected = visible && !showAllOutlines ? new Set(useSelectionStore.getState().ids) : null;
   for (const entity of engine.entities.values()) {
     const collider = entity.getComponent?.("collider");
-    if (collider?.gizmo) collider.gizmo.visible = visible;
-    collider?.setOutlineVisible?.(!!selected?.has(entity.id));
+    const outlineVisible = showAllOutlines || !!selected?.has(entity.id);
+    if (collider?.setDebugVisible) collider.setDebugVisible(visible, visible && outlineVisible);
+    else if (collider?.gizmo) collider.gizmo.visible = visible && collider.enabled;
     const character = entity.getComponent?.("charactercontroller");
-    if (character?.gizmo) character.gizmo.visible = visible;
+    if (character?.setDebugVisible) character.setDebugVisible(visible);
+    else if (character?.gizmo) character.gizmo.visible = visible && character.enabled;
   }
 }
 
@@ -1318,11 +1352,25 @@ function applyLayerVisibility() {
   // helper instead). Hide the standard transform helper in those cases so a
   // detached gizmo doesn't keep showing stale arrows on screen.
   const gizmoAttached = !!viewport.gizmo?.object;
-  if (gizmoHelper) gizmoHelper.visible = gizmos && !engine.playing && gizmoAttached;
-  setSelectionOutlineEnabled(gizmos && !engine.playing);
+  if (gizmoHelper) gizmoHelper.visible = gizmos && gizmoAttached;
+  if (viewport.cameraHelper) viewport.cameraHelper.visible = gizmos;
+  if (viewport.lightHelper) viewport.lightHelper.visible = gizmos;
+  for (const entity of engine.entities.values()) {
+    for (const type of ["camera", "virtualcamera"]) {
+      const component = entity.getComponent?.(type);
+      if (component?.model) component.model.visible = gizmos && component.enabled;
+    }
+  }
+  setSelectionOutlineEnabled(gizmos);
   if (viewport.grid) viewport.grid.visible = grid;
+  if (engine.camera) {
+    if (colliders) engine.camera.layers.enable(PHYSICS_DEBUG_LAYER);
+    else engine.camera.layers.disable(PHYSICS_DEBUG_LAYER);
+    if (gizmos || cursor3D || grid || virtualGeometry) engine.camera.layers.enable(EDITOR_LAYER);
+    else engine.camera.layers.disable(EDITOR_LAYER);
+  }
   setCollidersVisible(colliders);
-  setVirtualGeometryDebugVisible(virtualGeometry && !engine.playing);
+  setVirtualGeometryDebugVisible(virtualGeometry);
   // 3D cursor visibility also depends on the user's layer toggle. The
   // module's own `visible` flag stays the source of truth for the snap
   // menu helpers (which want to read "is the cursor visible right
@@ -1339,15 +1387,16 @@ function applyLayerVisibility() {
 onProjectSettingsApplied((settings) => {
   const incoming = settings?.editor?.layers;
   if (!incoming) return;
-  let next = viewport.layers;
+  let next = viewport.editLayers;
   for (const { key } of LAYER_TOGGLES) {
     if (key in incoming && incoming[key] !== next[key]) {
       next = { ...next, [key]: !!incoming[key] };
     }
   }
-  if (next === viewport.layers) return;
-  viewport.layers = next;
-  if (viewport.initPromise) {
+  if (next === viewport.editLayers) return;
+  viewport.editLayers = next;
+  if (!engine.playing) viewport.layers = next;
+  if (viewport.initPromise && !engine.playing) {
     applyLayerVisibility();
     notifyLayersChanged();
   }
@@ -1367,7 +1416,7 @@ function persistLayersNow() {
     .then(({ useProjectStore }) => {
       const current = getProjectSettings();
       return useProjectStore.getState().updateMeta({
-        settings: { ...current, editor: { ...current.editor, layers: { ...viewport.layers } } },
+        settings: { ...current, editor: { ...current.editor, layers: { ...viewport.editLayers } } },
       });
     })
     .catch((err) => console.warn(`Couldn't persist layers to project.json: ${err}`));
@@ -1382,14 +1431,17 @@ export function setLayerVisible(key, visible) {
   if (!(key in viewport.layers)) return;
   if (viewport.layers[key] === visible) return;
   viewport.layers = { ...viewport.layers, [key]: visible };
+  if (engine.playing) viewport.playLayers = viewport.layers;
+  else viewport.editLayers = viewport.layers;
   applyLayerVisibility();
   notifyLayersChanged();
-  persistLayersNow();
+  if (!engine.playing) persistLayersNow();
 }
 
 /** Subscribe to layer-toggle changes. Returns an unsubscribe. */
 export function subscribeLayers(fn) {
   viewport.layersListeners.add(fn);
+  fn({ ...viewport.layers });
   return () => viewport.layersListeners.delete(fn);
 }
 

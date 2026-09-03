@@ -328,7 +328,7 @@
           renderer.getArrayBufferAsync(frame.pixelProbe.value).then((b) => new Uint32Array(b)),
           renderer.getArrayBufferAsync(rayStore.pixelRayBase.value).then((b) => new Uint32Array(b)),
           renderer.getArrayBufferAsync(bins.scratch.value).then((b) => new Uint32Array(b)),
-          renderer.getArrayBufferAsync(bins.payload.value).then((b) => new Float32Array(b)),
+          renderer.getArrayBufferAsync(bins.payload.value).then((b) => D.decodePayload(new Uint32Array(b))),
           deposit.readStats(renderer),
         ]);
 
@@ -394,8 +394,8 @@
         // that has nothing to do with what is being tested. `buildProbes` is
         // re-run per call: `traceAndDeposit` fills `probe.bins` in place, so
         // reusing one build would accumulate two runs into one set of bins.
-        const runMirror = (gpuPixelRayBase) => {
-          const built = ref.buildProbes(cfg, mirrorPixels);
+        const runMirror = (gpuPixelRayBase, cfgUsed = cfg) => {
+          const built = ref.buildProbes(cfgUsed, mirrorPixels);
           const mirrorBases = new Int32Array(mirrorPixels.length);
           for (let j = 0; j < mirrorPixels.length; j++) {
             const b = gpuPixelRayBase[gpuIndexOf[j]];
@@ -404,13 +404,13 @@
           // The mirror's own `assignRays` still runs — the deposit needs nothing
           // from it, but running it and then OVERRIDING the bases is what makes
           // the substitution explicit rather than a missing call.
-          const mirrorRays = ref.assignRays(cfg, built);
+          const mirrorRays = ref.assignRays(cfgUsed, built);
           mirrorRays.pixelRayBase = mirrorBases;
 
           // THE MIRROR'S OWN LOOP, not a re-implementation of it. Everything the
           // arms below compare comes out of `probe.bins`, which is what
           // `traceAndDeposit` filled.
-          const s = ref.traceAndDeposit(cfg, built, mirrorPixels, mirrorRays, jsSceneTrace);
+          const s = ref.traceAndDeposit(cfgUsed, built, mirrorPixels, mirrorRays, jsSceneTrace);
           const agg = new Map();          // `${cascade}:${key}` -> totals
           const bin = new Map();          // `${cascade}:${key}:${morton}` -> totals
           for (let c = 0; c < cfgMod.CASCADE_COUNT; c++) {
@@ -432,7 +432,7 @@
               if (total.n > 0) agg.set(key, total);
             }
           }
-          return { agg, bin, traced: s.traced, hits: s.hits, deposits: s.deposits };
+          return { agg, bin, traced: s.traced, hits: s.hits, deposits: s.deposits, far: s.far, cappedMiss: s.cappedMiss, nearMiss: s.nearMiss };
         };
 
         // ── the GPU side, aggregated the same two ways ───────────────────
@@ -513,7 +513,7 @@
         // Payload coverage, over the WHOLE buffer — unsampled slots included,
         // because "an untouched bin resolves to unknown" is the claim.
         for (let i = 0; i < bins.binTotal; i++) {
-          const T = payloadRaw[i * D.PAYLOAD_WORDS + 3];
+          const T = payloadRaw[i * D.PAYLOAD_CHANNELS + 3];
           if (T === D.PAYLOAD_UNKNOWN) unknownBins++;
           else resolvedBins++;
         }
@@ -732,6 +732,92 @@
           binTies < 0.005,
           `${binMismatch}/${mBin.size} bins differ (${(binTies * 100).toFixed(3)}%) — ` +
           "the budget is 0.5%, and these are rays whose direction sits within an ulp of a bin edge");
+
+        // ══ ARM 3b: THE FAR DUTY (§11.13) ═══════════════════════════════
+        say("");
+        say("── FAR DUTY: half the rays stop at cascade 1's far bound, bit-exact against the mirror ──");
+        // Same store, same UNTOUCHED transport frame (the ray partition must
+        // not be re-drawn — see the compaction arm), a FRESH bin store so the
+        // classic accumulators above stay readable. The mirror draws the same
+        // lowbias32 over the same ray index and stamp, so per-probe totals
+        // must agree EXACTLY; the halves are statistical and only bounded.
+        {
+          const FAR_DUTY = 0.5;
+          const FAR_FROM = 2;
+          const FAR_STAMP = 7;
+          const binsFar = D.createSrcBinStore(store, { w0: cfgMod.W0 });
+          const depositFar = D.createSrcDepositFrame(store, binsFar, {
+            pixelProbe: frame.pixelProbe,
+            pixelRayBase: rayStore.pixelRayBase,
+            pixelCount: PIXELS,
+            raysPerPixel: RAYS_PER_PIXEL,
+            trace: synthTrace,
+            shadeHit,
+            readPixel, readNormal,
+            camera: vec3(cameraU),
+            spacing0: S0,
+            lmax: lmaxU,
+            jitterX: 0, jitterY: 0,
+            farDuty: uniform(FAR_DUTY),
+            farFrom: FAR_FROM,
+            // The need floor reads LIVE bin counts, which a single-frame mirror
+            // over empty bins cannot model (every bin is below any floor, so
+            // every ray would go far). Off here; the live editor's resolved-rate
+            // receipt is its instrument.
+            farNeed: 0,
+            frameStamp: uniform(FAR_STAMP, "uint"),
+          });
+          for (const pass of depositFar.passes) await renderer.computeAsync(pass);
+          const [scratchFar, statsFar] = await Promise.all([
+            renderer.getArrayBufferAsync(binsFar.scratch.value).then((b) => new Uint32Array(b)),
+            depositFar.readStats(renderer),
+          ]);
+          const cfgFar = ref.makeSrcConfig({
+            spacing0: S0, camera: CAM, anchor: ANCHOR, raysPerPixel: RAYS_PER_PIXEL,
+            cascadeCount: cfgMod.CASCADE_COUNT, maxLods: cfgMod.MAX_LODS,
+            farDuty: FAR_DUTY, farFrom: FAR_FROM, frameStamp: FAR_STAMP,
+          });
+          const mirrorFar = runMirror(pixelRayBase, cfgFar);
+          const gpuFar = aggregateGpu(store, binsFar, table, scratchFar);
+          let fMissing = 0, fWrong = 0, fWorst = null;
+          for (const [k, m] of mirrorFar.agg) {
+            const g = gpuFar.agg.get(k);
+            if (!g) { fMissing++; continue; }
+            if (g.n !== m.n || g.t !== m.t || g.r !== m.r || g.g !== m.g || g.b !== m.b) {
+              fWrong++;
+              fWorst ??= `${k}: gpu n/t ${g.n}/${g.t} rgb ${g.r}/${g.g}/${g.b} vs mirror ${m.n}/${m.t} ${m.r}/${m.g}/${m.b}`;
+            }
+          }
+          check("far duty: every probe's COUNT, T and RGB match the mirror exactly",
+            fMissing === 0 && fWrong === 0 && gpuFar.agg.size === mirrorFar.agg.size,
+            `${fMissing} missing, ${fWrong} wrong, gpu ${gpuFar.agg.size} vs mirror ${mirrorFar.agg.size} probes${fWorst ? ` — ${fWorst}` : ""}`);
+          check("far duty: the GPU and the mirror drew the same far rays",
+            statsFar.farRays === mirrorFar.far, `gpu ${statsFar.farRays} vs mirror ${mirrorFar.far}`);
+          check("far duty: the capped misses agree",
+            statsFar.cappedMisses === mirrorFar.cappedMiss, `gpu ${statsFar.cappedMisses} vs mirror ${mirrorFar.cappedMiss}`);
+          // Near first: only a ray that cleared cascades 0..1 draws the duty,
+          // so the half is of the NEAR MISSES, not of all rays.
+          const farOfMisses = mirrorFar.nearMiss > 0 ? statsFar.farRays / mirrorFar.nearMiss : 0;
+          check("far duty: about half of the rays that cleared the near cascades went far",
+            farOfMisses > 0.45 && farOfMisses < 0.55,
+            `${statsFar.farRays} of ${mirrorFar.nearMiss} near misses (${(farOfMisses * 100).toFixed(1)}%)`);
+          // Per-cascade deposit totals: the near cascades see every deposit
+          // they saw without the duty; the far ones about half.
+          const perCascade = (agg) => {
+            const out = new Array(cfgMod.CASCADE_COUNT).fill(0);
+            for (const [k, v] of agg) out[Number(k.split(":")[0])] += v.n;
+            return out;
+          };
+          const fullC = perCascade(gpu.agg);
+          const farC = perCascade(gpuFar.agg);
+          const nearSame = fullC.slice(0, FAR_FROM).every((v, c) => v === farC[c]);
+          const farRatios = fullC.slice(FAR_FROM).map((v, i) => v > 0 ? farC[FAR_FROM + i] / v : 1);
+          check("far duty: cascades below farFrom receive every deposit they did without it",
+            nearSame, `full ${fullC.join("/")} vs far ${farC.join("/")}`);
+          check("far duty: cascades at and above farFrom receive about half (0.4–0.6)",
+            farRatios.every((r) => r > 0.4 && r < 0.6), `ratios ${farRatios.map((r) => r.toFixed(3)).join("/")}`);
+          binsFar.dispose?.();
+        }
 
         // ══ ARM 4: the split rule ═══════════════════════════════════════
         say("");

@@ -9,6 +9,7 @@ import { polyhavenModule } from "./polyhaven/index.js";
 import { ambientcgModule } from "./ambientcg/index.js";
 import { sketchfabModule } from "./sketchfab/index.js";
 import { polypizzaModule } from "./polypizza/index.js";
+import { kaykitModule } from "./kaykit/index.js";
 import { fabModule } from "./fab/index.js";
 import { itchioModule } from "./itchio/index.js";
 import { giModule } from "./gi/index.js";
@@ -18,6 +19,7 @@ import { audioLibraryModule } from "./audio-library/index.js";
 import { audioEditorModule } from "./audio-editor/index.js";
 import { levelDesignModule } from "./level-design/index.js";
 import { characterControllerModule } from "./character-controller/index.js";
+import { kimodoModule } from "./kimodo/index.js";
 /**
  * Built-in module catalog. Importing this file registers every definition;
  * nothing runs until a host enables a module on an engine (editor: Modules
@@ -36,6 +38,7 @@ registerModuleDefinition(polyhavenModule);
 registerModuleDefinition(ambientcgModule);
 registerModuleDefinition(sketchfabModule);
 registerModuleDefinition(polypizzaModule);
+registerModuleDefinition(kaykitModule);
 registerModuleDefinition(fabModule);
 registerModuleDefinition(itchioModule);
 registerModuleDefinition(giModule);
@@ -45,5 +48,6 @@ registerModuleDefinition(audioLibraryModule);
 registerModuleDefinition(audioEditorModule);
 registerModuleDefinition(levelDesignModule);
 registerModuleDefinition(characterControllerModule);
+registerModuleDefinition(kimodoModule);
 
-export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, polypizzaModule, fabModule, itchioModule, giModule, navigationModule, textureEditorModule, audioLibraryModule, audioEditorModule, levelDesignModule, characterControllerModule };
+export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, polypizzaModule, kaykitModule, fabModule, itchioModule, giModule, navigationModule, textureEditorModule, audioLibraryModule, audioEditorModule, levelDesignModule, characterControllerModule, kimodoModule };

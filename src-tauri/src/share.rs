@@ -90,7 +90,11 @@ fn managed_binary_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_local_data_dir()
         .map_err(|e| format!("resolve app data dir: {e}"))?
         .join("bin");
-    Ok(dir.join(if cfg!(windows) { "cloudflared.exe" } else { "cloudflared" }))
+    Ok(dir.join(if cfg!(windows) {
+        "cloudflared.exe"
+    } else {
+        "cloudflared"
+    }))
 }
 
 fn path_binary_works() -> bool {
@@ -223,7 +227,10 @@ fn spawn_tunnel(binary: &Path, port: u16) -> Result<(String, Child), String> {
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
-            Err("Timed out waiting for the tunnel URL. Check the network connection and try again.".into())
+            Err(
+                "Timed out waiting for the tunnel URL. Check the network connection and try again."
+                    .into(),
+            )
         }
     }
 }

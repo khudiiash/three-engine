@@ -55,10 +55,15 @@ export class AnimationComponent extends Component {
     this.graph = null;
     this.mixer = null;
     this.runtime = null;
+    this.editorAudition = false;
+    this.pendingPreview = null;
     this.unsubUpdate = this.entity.engine.onUpdate((dt) => this.#tick(dt));
     // The model loads async — rebuild once its clips exist.
     this.unsubModel = this.entity.engine.on("model-loaded", (entity) => {
       if (entity === this.entity) this.#rebuild();
+    });
+    this.unsubPlay = this.entity.engine.on("play-changed", (playing) => {
+      if (playing) this.#cancelEditorAudition();
     });
     if (this.props.controller) this.#loadController(this.generation);
   }
@@ -67,11 +72,18 @@ export class AnimationComponent extends Component {
     this.generation = (this.generation ?? 0) + 1;
     this.unsubUpdate?.();
     this.unsubModel?.();
+    this.unsubPlay?.();
+    this.#cancelEditorAudition();
     this.#teardownRuntime();
   }
 
   onPropChanged(key) {
-    if (key === "playInEditor") return;
+    if (key === "playInEditor") {
+      if (!this.props.playInEditor) {
+        this.#cancelEditorAudition();
+      }
+      return;
+    }
     // Every other prop feeds the runtime's construction (root motion binds a
     // bone and caches a basis at build time), so they all rebuild it. The
     // controller is only re-fetched when its path changed.
@@ -139,7 +151,58 @@ export class AnimationComponent extends Component {
   }
 
   play(stateName, fade = 0.2, layer = 0) {
+    this.#cancelEditorAudition();
     this.runtime?.play(stateName, fade, layer);
+  }
+
+  /** Editor-only audition: transitions cannot immediately replace the state. */
+  previewState(stateName, fade = 0.15, layer = 0) {
+    // A new click replaces the previous audition, including restoring any
+    // upper layer whose authored blend weight we temporarily overrode.
+    this.#cancelEditorAudition();
+    // The editor may have suspended its render loop while the Animator owns
+    // focus. Emit even when another state was already being auditioned so a
+    // click always wakes the viewport and restarts the playhead immediately.
+    this.#setEditorAudition(true);
+    this.pendingPreview = {
+      stateName,
+      fade,
+      layer,
+      priorLayerWeight: layer === 0 ? 1 : this.runtime?.getLayerWeight(layer),
+    };
+    this.#applyPendingPreview();
+  }
+
+  /** Editor lifecycle hook: release a state audition and its render-loop pin. */
+  cancelEditorPreview() {
+    this.#cancelEditorAudition();
+  }
+
+  #setEditorAudition(enabled) {
+    this.editorAudition = enabled;
+    this.entity.engine.emit("animation-audition-changed", this, enabled);
+  }
+
+  #cancelEditorAudition() {
+    const pending = this.pendingPreview;
+    if (pending?.layer !== 0 && Number.isFinite(pending?.priorLayerWeight)) {
+      this.runtime?.setLayerWeight(pending.layer, pending.priorLayerWeight);
+    }
+    this.pendingPreview = null;
+    this.runtime?.cancelPreview();
+    this.#setEditorAudition(false);
+  }
+
+  #applyPendingPreview() {
+    if (!this.runtime || !this.pendingPreview) return;
+    const { stateName, fade, layer } = this.pendingPreview;
+    if (layer !== 0) {
+      if (!Number.isFinite(this.pendingPreview.priorLayerWeight)) {
+        this.pendingPreview.priorLayerWeight = this.runtime.getLayerWeight(layer);
+      }
+      this.runtime.setLayerWeight(layer, 1);
+    }
+    if (!this.runtime.preview(stateName, fade, layer)) this.#cancelEditorAudition();
   }
 
   /** Blend an override/additive layer in or out. Layer 0 is always full. */
@@ -204,6 +267,7 @@ export class AnimationComponent extends Component {
         bone: this.props.rootBone ?? "",
       },
     });
+    this.#applyPendingPreview();
     this._warnedNoRuntime = false; // runtime is live again; allow a fresh warning later
   }
 
@@ -229,12 +293,27 @@ export class AnimationComponent extends Component {
 
   #tick(dt) {
     if (!this.enabled) return;
-    if (!this.isInView()) return;
+    // An explicit Animator click is an audition command. Keep it advancing
+    // even if the viewport culler has not seen the freshly reloaded model yet.
+    if (!this.editorAudition && !this.isInView()) return;
     if (!this.runtime) return;
     const playing = this.entity.engine.playing;
-    if (!playing && !this.props.playInEditor) return;
+    if (!playing && !this.props.playInEditor && !this.editorAudition) return;
     const before = this.currentState;
     this.runtime.update(dt);
+    if (this.editorAudition && this.pendingPreview) {
+      const layer = this.runtime.layer(this.pendingPreview.layer);
+      const state = layer?.currentId ? layer.states.get(layer.currentId) : null;
+      if (
+        state?.state?.loop === false &&
+        state.entries.length > 0 &&
+        state.entries.every(({ action }) => !action.isRunning())
+      ) {
+        // A clamped one-shot has reached its last pose; release the pacing pin
+        // while leaving that pose visible until the next authored state/play.
+        this.#cancelEditorAudition();
+      }
+    }
     // The extractor always runs (it is what keeps the pose in place), but the
     // entity only MOVES while playing. Otherwise scrubbing a walk cycle in the
     // editor would quietly walk the entity across the level and save it there.

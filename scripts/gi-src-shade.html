@@ -251,7 +251,14 @@
          * Run the shader over the whole fixture and read the radiance back.
          * `visibility` and the shader options are the arm's to choose.
          */
-        const runGpu = async (options = {}, { normalSign = 1, albedo = null, unflag = false, half = null } = {}) => {
+        const runGpu = async (options = {}, {
+          normalSign = 1,
+          albedo = null,
+          unflag = false,
+          half = null,
+          sunGain = 1,
+          sunChromaGain = sunGain,
+        } = {}) => {
           const dst = instancedArray(new Float32Array(N_HITS * 4), "vec4");
           const kernel = Fn(() => {
             const i = instanceIndex.toVar();
@@ -287,7 +294,10 @@
               const attribute = S.createSrcHitAttribution({ surfaceAt: sa, count });
               const light = S.createSrcHitLighting(lighting);
               const a = attribute({}, dir);
-              const r = light(a.P, a.n, a.rho, a.emissive, a.emitter, i);
+              const r = light(
+                a.P, a.n, a.rho, a.emissive, a.emitter, i,
+                float(sunGain), float(sunChromaGain),
+              );
               dst.element(i).assign(vec4(
                 half === "transfer" ? r.sunTransfer
                   : half === "facing" ? vec3(r.sunFacing)
@@ -296,7 +306,10 @@
               ));
             } else {
               const shade = S.createSrcHitShader(shaderOptions);
-              dst.element(i).assign(vec4(shade({}, dir, i), 1));
+              dst.element(i).assign(vec4(
+                shade({}, dir, i, float(sunGain), float(sunChromaGain)),
+                1,
+              ));
             }
           })().compute(N_HITS);
           await renderer.computeAsync(kernel);
@@ -358,6 +371,31 @@
         const gpuPlain = await runGpu({ visibility: null });
         const cpuPlain = cpuShade({ visibility: null });
         compare("GPU hit shading matches the CPU reference, unshadowed", gpuPlain, cpuPlain.values, 2e-4);
+        const compensatedGain = 1.1664;
+        const gpuCompensated = await runGpu(
+          { visibility: null, sunCompensation: true },
+          { sunGain: compensatedGain },
+        );
+        const cpuCompensated = cpuShade({ visibility: null, sunGain: compensatedGain });
+        compare("analytic sun compensation matches the CPU mirror and leaves other sources alone",
+          gpuCompensated, cpuCompensated.values, 2e-4);
+        const compensatedChromaGain = 1.5;
+        const compensatedAlbedo = [0.8, 0.3, 0.3];
+        const gpuChromaCompensated = await runGpu(
+          { visibility: null, sunCompensation: true },
+          {
+            albedo: compensatedAlbedo,
+            sunGain: compensatedGain,
+            sunChromaGain: compensatedChromaGain,
+          },
+        );
+        const cpuChromaCompensated = cpuShade({
+          visibility: null,
+          sunGain: compensatedGain,
+          sunChromaGain: compensatedChromaGain,
+        }, { albedo: compensatedAlbedo });
+        compare("analytic sun chroma compensation matches the CPU mirror",
+          gpuChromaCompensated, cpuChromaCompensated.values, 2e-4);
         check(
           "the fixture is not trivially zero — something is actually being shaded",
           cpuPlain.values.filter((v) => luma(v) > 1e-6).length > N_HITS * 0.7,
@@ -415,6 +453,23 @@
           });
           compare("a directional LIGHT SLOT shades identically to the `sun` path",
             slotOnly, sunOnly, 2e-4);
+          const compensatedSlot = await runGpu({
+            visibility: null, sun: null, lights: sunAsSlot, maxRay: DIAG,
+            neeEmitters: false, sunCompensation: { slot: 0 },
+          }, {
+            albedo: compensatedAlbedo,
+            sunGain: compensatedGain,
+            sunChromaGain: compensatedChromaGain,
+          });
+          const compensatedSunOnly = await runGpu({
+            visibility: null, neeEmitters: false, sunCompensation: true,
+          }, {
+            albedo: compensatedAlbedo,
+            sunGain: compensatedGain,
+            sunChromaGain: compensatedChromaGain,
+          });
+          compare("the runtime-named directional slot gets the same bounded base/chroma gain as the sun bundle",
+            compensatedSlot, compensatedSunOnly, 2e-4);
           check("and the arm has a subject — the sun alone lights most of the fixture",
             sunOnly.filter((v) => luma(v) > 1e-6).length > N_HITS * 0.3,
             `${sunOnly.filter((v) => luma(v) > 1e-6).length}/${N_HITS} hits lit by the sun alone`);
@@ -428,6 +483,40 @@
           for (let i = 0; i < N_HITS; i++) if (relErr(luma(pointOnly[i]), luma(sunOnly[i])) > 0.01) differs++;
           check("a POINT slot does NOT — `kind` is read, not ignored",
             differs > N_HITS * 0.5, `${differs}/${N_HITS} hits differ`);
+
+          // Two slots plus visibility selects the GPU-rolled loop. Compare the
+          // response to changing ONLY the chroma gain against the one-slot
+          // straight path: an accidental gain on the point term cannot hide in
+          // the absolute sum because it appears in the rolled delta alone.
+          const alwaysLit = () => float(1);
+          const rolledPoint = {
+            ...asPoint[0],
+            color: uniform(new THREE.Color(0.4, 1.1, 0.7)),
+            active: 1,
+          };
+          const gainArgs = {
+            albedo: compensatedAlbedo,
+            sunGain: compensatedGain,
+          };
+          const straightBase = await runGpu({
+            visibility: alwaysLit, sun: null, lights: sunAsSlot, maxRay: DIAG,
+            neeEmitters: false, sunCompensation: { slot: 0 },
+          }, { ...gainArgs, sunChromaGain: compensatedGain });
+          const straightChroma = await runGpu({
+            visibility: alwaysLit, sun: null, lights: sunAsSlot, maxRay: DIAG,
+            neeEmitters: false, sunCompensation: { slot: 0 },
+          }, { ...gainArgs, sunChromaGain: compensatedChromaGain });
+          const rolledBase = await runGpu({
+            visibility: alwaysLit, sun: null, lights: [sunAsSlot[0], rolledPoint], maxRay: DIAG,
+            neeEmitters: false, sunCompensation: { slot: 0 },
+          }, { ...gainArgs, sunChromaGain: compensatedGain });
+          const rolledChroma = await runGpu({
+            visibility: alwaysLit, sun: null, lights: [sunAsSlot[0], rolledPoint], maxRay: DIAG,
+            neeEmitters: false, sunCompensation: { slot: 0 },
+          }, { ...gainArgs, sunChromaGain: compensatedChromaGain });
+          const delta = (a, b) => a.map((v, i) => v.map((x, k) => x - b[i][k]));
+          compare("the rolled multi-light path gains only its named directional slot",
+            delta(rolledChroma, rolledBase), delta(straightChroma, straightBase), 2e-4);
 
           // ══ §12.82: THE SUN SPLIT IS AN IDENTITY AT ITS OWN SUN ANGLE ═════
           //
@@ -650,7 +739,9 @@
           // and NOT for a coloured one. "Compare estimators in the quantity they
           // estimate" is why this fixture goes grey rather than why the bar goes
           // up.
-          const rhoGrey = ref.clampLoopAlbedo(GREY);
+          // Direct-light reflectance is physical 0..1. R4's 0.9 ceiling now
+          // applies only to the recursive atlas term, not to this NEE arm.
+          const rhoGrey = GREY.map((v) => Math.min(1, Math.max(0, v)));
           const exact = HITS.map((h) => {
             const n = ref.faceForward(h.normal, h.dir);
             const E = [0, 0, 0];
@@ -685,7 +776,7 @@
           // fixture's COLOURED albedo back and the luminance identity dies too.
           const coloured = await runGpu({ visibility: null, sun: null, neeSamples: 1 });
           const exactC = HITS.map((h, i) => {
-            const rho = ref.clampLoopAlbedo(h.albedo);
+            const rho = h.albedo.map((v) => Math.min(1, Math.max(0, v)));
             return [0, 1, 2].map((k) => rho[k] * exact[i][k] * Math.PI / (rhoGrey[k] * Math.PI));
           });
           let worstCol = 0;

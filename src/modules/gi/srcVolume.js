@@ -94,12 +94,25 @@ const SHADOW_MAX_LEVEL = OCC_LEVELS - 1;
  * the occupancy voxel would change the shadows and the distance source in the
  * same commit. Pass `res: null` for the voxel-derived variant (see
  * `capWorld` below), which is the intended end state and its own A/B.
+ *
+ * FIELD-LESS (plan §10 / §10.1, the BVH-only visibility structure): with
+ * neither `res` nor `occField` there is no lattice to derive a cell from, so
+ * the cell is a NOMINAL length scale — `minCell` in metres, uniform on every
+ * axis, 0.1 when nothing at all is given. It exists because every downstream
+ * bias uniform (lift, contact cut, step bounds, `capWorld`) is expressed in
+ * cell units and needs SOME scale; it is not a transport parameter. A refit in
+ * this mode moves `min`/`size` and leaves the nominal cell alone, which is the
+ * only honest answer when the cell never came from the bounds to begin with.
+ * The `res` and `occField` arms are untouched.
  */
-export function createSrcWorld(bounds, res, occField = null) {
+export function createSrcWorld(bounds, res = null, occField = null, { minCell: nominalCell = null } = {}) {
   const size = new THREE.Vector3().subVectors(bounds.max, bounds.min);
+  const nominal = Number.isFinite(nominalCell) && nominalCell > 0 ? nominalCell : 0.1;
   const cell = res
     ? new THREE.Vector3(size.x / res.x, size.y / res.y, size.z / res.z)
-    : occField?.voxel?.value?.clone() ?? new THREE.Vector3(1, 1, 1);
+    : occField
+      ? occField.voxel?.value?.clone() ?? new THREE.Vector3(1, 1, 1)
+      : new THREE.Vector3(nominal, nominal, nominal);
   const minCell = Math.min(cell.x, cell.y, cell.z);
   // REACH, and with `res: null` it stops being a magic 16.
   //
@@ -120,7 +133,10 @@ export function createSrcWorld(bounds, res, occField = null) {
     capWorld: uniform(capWorld),
     minCellValue: minCell,
     capWorldValue: capWorld,
-    /** In-place refit: same cell COUNT, rescaled cell world size (R11). */
+    /**
+     * In-place refit: same cell COUNT, rescaled cell world size (R11). The
+     * field-less arm falls through to `cell.clone()` — the nominal scale.
+     */
     refit(nextBounds) {
       const nextSize = new THREE.Vector3().subVectors(nextBounds.max, nextBounds.min);
       const nextCell = res
@@ -157,6 +173,7 @@ export function createSrcDistance(occField, world, {
   nearField = true,
   recordAware = true,
 } = {}) {
+  if (!occField) throw new Error("createSrcDistance: no occupancy field — there is no distance source to close over");
   const rec = recordAware && occField.hasSurfaceRecords === true &&
     globalThis.__giRayHitShadowRecords !== false;
   return (p, cap) => occField.freeRadiusAtWorld(p, maxLevel, nearField, cap, rec);
@@ -497,23 +514,42 @@ export function createSrcSoftShadowTrace(occField, world, {
  * `world` may be supplied by the caller. The A/B seam passes giField's own
  * bundle so the two arms share one set of tuned constants and differ ONLY in
  * the distance source; production builds let this construct its own.
+ *
+ * ══ FIELD-LESS MODE (plan §10 / §10.1) ════════════════════════════════════════
+ *
+ * `occField: null` with `bounds` (or a `world`) is the BVH-only build: the
+ * volume is bounds + a nominal cell (`minCell`, see `createSrcWorld`) and
+ * NOTHING else. The bundle keeps its shape so the 40-odd call sites need no
+ * branch of their own, and every member that would have closed over the field
+ * reports its absence the same way — `occupancyField: null`, `distance: null`,
+ * and the two shadow factories RETURN NULL rather than throwing, so a consumer
+ * feature-detects with `volume.createWidthProbe?.() ?? null` exactly as the
+ * emitter-record arm already does. `setBounds` still refits the world; the
+ * `occField?.refit()` it would have chained is simply not there. The one thing
+ * that still throws is having neither a field nor bounds, because that volume
+ * would have no size at all.
  */
 export function createSrcVolume({
-  occField,
+  occField = null,
   bounds = null,
   res = null,
   world = null,
   rayHitMode = undefined,
   recordAware = true,
+  minCell = null,
 } = {}) {
-  if (!occField) throw new Error("createSrcVolume: an occupancy field is required — it is the only distance source");
-  const w = world ?? createSrcWorld(bounds, res, occField);
+  if (!occField && !bounds && !world) {
+    throw new Error(
+      "createSrcVolume: an occupancy field or bounds is required — without a field the volume is bounds plus a nominal cell, and without bounds it has no size",
+    );
+  }
+  const w = world ?? createSrcWorld(bounds, res, occField, { minCell });
   // ONE distance closure per volume, shared by both factories. `sharedFn`
   // already gives one WGSL function per shader per variant, so this only makes
   // the two arms provably agree about `maxLevel`/`recordAware` — a mismatch
   // there would light one pixel against a sharper medium than the pixel beside
-  // it, which is the §6.6 lesson.
-  const distance = createSrcDistance(occField, w, { recordAware });
+  // it, which is the §6.6 lesson. Null without a field: there is no distance.
+  const distance = occField ? createSrcDistance(occField, w, { recordAware }) : null;
   return {
     world: w,
     occupancyField: occField,
@@ -574,11 +610,18 @@ export function createSrcVolume({
       this.capWorld = w.capWorldValue;
       occField?.refit();
     },
+    // NULL, NOT A THROW, without a field: both estimators are sphere traces
+    // over the occupancy oracle, and a volume with no oracle has no estimator
+    // to hand out. Callers feature-detect with `?.() ?? null`.
     createSoftShadowTrace: (lift, steps, name = undefined, stable = false) =>
-      createSrcSoftShadowTrace(occField, w, {
-        lift, steps, name: name ?? "srcShadowTrace", stable, distance,
-      }),
+      occField
+        ? createSrcSoftShadowTrace(occField, w, {
+          lift, steps, name: name ?? "srcShadowTrace", stable, distance,
+        })
+        : null,
     createWidthProbe: (name = undefined) =>
-      createSrcWidthProbe(occField, w, { name: name ?? "srcShadowWidthProbe", distance }),
+      occField
+        ? createSrcWidthProbe(occField, w, { name: name ?? "srcShadowWidthProbe", distance })
+        : null,
   };
 }

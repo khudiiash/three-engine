@@ -131,7 +131,7 @@ export function createReflectionProbeCapture({
                 : 16,
             }
           : { ...emitter, shadowSample: () => float(1) };
-        E.addAssign(emitterDirectAt(hitParams, hitP, nFace, shadePoint).irradiance);
+        E.addAssign(emitterDirectAt(hitParams, hitP, nFace, shadePoint, { rolled: globalThis.__giRolledDirect !== false }).irradiance);
       }
       if (lightSlots?.length) {
         // §18.16 — EXACT BVH VISIBILITY, the atlas twin of the hit shade's
@@ -173,7 +173,7 @@ export function createReflectionProbeCapture({
         // on purpose, "one formula, two consumers", and a cosine convention
         // that differed between them would put a probe capture and a traced
         // reflection of the SAME surface at different brightnesses.
-        E.addAssign(analyticDirectAt(lightSlots, hitP, nFace, lightShadowFn, true));
+        E.addAssign(analyticDirectAt(lightSlots, hitP, nFace, lightShadowFn, true, { rolled: globalThis.__giRolledDirect !== false }));
       }
       out.assign(vec3(hit.albedo).mul(E).mul(1 / Math.PI).mul(intensity));
       // The glossy chain's hue-preserving luminance cap, same default: a hot

@@ -74,6 +74,12 @@ export const PROJECT_SETTINGS_DEFAULTS = {
   physics: {
     layers: [...DEFAULT_PHYSICS_LAYERS],
     matrix: null,
+    // Generated default Colliders (every mesh gets one when physics is on)
+    // attach DISABLED unless this is on — a large scene cooks every mesh at
+    // load otherwise (Bistro: 1 fps). Read by PhysicsSystem via
+    // `engine.config.physicsAutoColliders`; shipped inside the build's
+    // physics blob.
+    autoCollidersEnabled: false,
   },
 };
 
@@ -157,6 +163,7 @@ export async function applyProjectSettings(settings = getProjectSettings()) {
   // the matrix into a world that is already running.
   const layerConfig = { names: settings.physics.layers, matrix: settings.physics.matrix };
   engine.config.physicsLayers = layerConfig;
+  engine.config.physicsAutoColliders = { startEnabled: settings.physics.autoCollidersEnabled === true };
   const { setPhysicsLayerConfig } = await import("../modules/physics-rapier/layerConfig.js");
   setPhysicsLayerConfig(layerConfig);
   engine.physics?.setLayers?.(layerConfig);

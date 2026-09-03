@@ -88,19 +88,20 @@
 // docs/GI_SRC_REBUILD_PLAN.md §4.2, §12.18.4-6, §12.18.7 unit 3, §12.19.5.
 
 import {
-  Fn,
-  If,
-  Return,
   atomicAdd,
   atomicStore,
   cos,
   equirectUV,
   float,
   floor,
-  instanceIndex,
+  Fn,
+  If,
   instancedArray,
+  instanceIndex,
   int,
   ivec3,
+  Return,
+  select,
   sin,
   uint,
   vec3,
@@ -118,7 +119,7 @@ import {
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
-import { PAYLOAD_WORDS } from "./srcDeposit.js";
+import { readPayload, readPayloadT, writePayload } from "./srcDeposit.js";
 import {
   FLAG_ALIVE,
   PROBE_BLOCK,
@@ -234,6 +235,7 @@ export function createSrcMergeFrame(store, bins, {
   skyEnv = null,
   w0 = W0,
   losOccupied = null,
+  losSegment = null,
 } = {}) {
   if (worldKeysEnabled() && !camera) {
     // Loud, at build, rather than a merge that silently interpolates over the
@@ -248,8 +250,18 @@ export function createSrcMergeFrame(store, bins, {
   // §15 U3b — build-time arm, same idiom as the gather's losArmed: the flag is
   // structural (it changes the WGSL), and an instance built without the
   // closure (every mirror-diff page) cannot arm regardless of the global.
-  const losArmed = mergeLosWeight() && !!losOccupied;
-  if (losArmed) console.info("[gi] merge: cross-wall LOS validity ARMED (U3b)");
+  // Section 10 (2026-09-02): in the BVH-only build the cross-wall test is one
+  // any-hit SEGMENT from the child probe to the parent corner (losSegment),
+  // cached per corner and recomputed only when that corner's parent block or
+  // the child key changes, so it costs rays only for fresh probes. It is ON
+  // by default there (the point-in-solid march stays the opt-in field arm).
+  // Measured need: with no test at all, an indoor child merged an outdoor
+  // parent through the wall and the top cascade composited the SKY into it
+  // (blue patches with the sky on, black with it off).
+  const losSegmentArmed = !!losSegment && globalThis.__giMergeLos !== false;
+  const losArmed = losSegmentArmed || (mergeLosWeight() && !!losOccupied);
+  if (losSegmentArmed) console.info("[gi] merge: cross-wall LOS validity ARMED (BVH segment, cached per corner)");
+  else if (losArmed) console.info("[gi] merge: cross-wall LOS validity ARMED (U3b)");
 
   // ── the corner records, indexed by BIN BLOCK ──────────────────────────────
   // Only cascades 0..N−2 have a parent to interpolate over, so the top cascade
@@ -266,6 +278,12 @@ export function createSrcMergeFrame(store, bins, {
   // never-written probe look like it interpolates over block 0 eight times.
   const cornerBlock = instancedArray(new Uint32Array(cornerSize).fill(SLOT_EMPTY), "uint");
   const cornerWeight = instancedArray(new Float32Array(cornerSize), "float");
+  // Per-corner cached visibility (-1 = not computed) and the child key it was
+  // computed for, so a reused slot never inherits a previous owner's answer.
+  // ONE buffer (the merge kernels sit at the 8-storage-buffer portable
+  // limit): two words per corner — [0] the child key the answer was computed
+  // for, [1] visibility as 0 / 1 / 0xffffffff (= not computed).
+  const cornerLosRec = losSegmentArmed ? instancedArray(new Uint32Array(cornerSize * 2).fill(0xffffffff), "uint") : null;
   // One slice per cascade — see MERGE_STRIDE's header for why the shared
   // buffer made the headline unattributable.
   const statWords = MERGE_STRIDE * N;
@@ -378,28 +396,6 @@ export function createSrcMergeFrame(store, bins, {
           .mul(dy ? t.y : float(1).sub(t.y))
           .mul(dz ? t.z : float(1).sub(t.z))
           .toVar();
-        if (losArmed) {
-          const cornerPos = originP.add(cell0.add(vec3(dx, dy, dz)).mul(sp)).toVar();
-          const seg = cornerPos.sub(position).toVar();
-          // Same two shoulders as the screen gather (srcMath's LOS_OCC_* and
-          // LOS_PATH_*) — if the two disagreed, the field's own tiles and the
-          // screen's read of them would disagree about which side of a wall a
-          // probe sits on, which is the exact confusion this unit removes.
-          const blocked = float(0).toVar();
-          for (const tf of losFractions) {
-            const x = position.add(seg.mul(tf));
-            const t = float(losOccupied(x)).sub(LOS_OCC_LO)
-              .div(LOS_OCC_HI - LOS_OCC_LO).clamp(0, 1).toVar();
-            blocked.addAssign(t.mul(t).mul(float(3).sub(t.mul(2))));
-          }
-          const bp = blocked.div(losFractions.length).sub(LOS_PATH_LO)
-            .div(LOS_PATH_HI - LOS_PATH_LO).clamp(0, 1).toVar();
-          const vis = float(1).sub(bp.mul(bp).mul(float(3).sub(bp.mul(2)))).toVar();
-          If(vis.lessThan(0.5), () => {
-            atomicAdd(stats.element(sw(c, MERGE_LOS)), uint(1));
-          });
-          weight.mulAssign(vis.max(1e-3));
-        }
         // `packProbeKey` returns KEY_EMPTY for a cell outside the ±256 key
         // window, and the WGSL find returns "absent" for key 0 by its first
         // line — so an out-of-window corner is a missing corner, with no extra
@@ -422,6 +418,51 @@ export function createSrcMergeFrame(store, bins, {
         If(parentBlock.notEqual(uint(SLOT_EMPTY)), () => {
           atomicAdd(stats.element(sw(c, MERGE_FOUND)), uint(1));
         });
+        if (losSegmentArmed) {
+          // One any-hit segment child -> corner, cached: a corner whose parent
+          // block and child key match the cache reuses its answer.
+          const cornerPos = originP.add(cell0.add(vec3(dx, dy, dz)).mul(sp)).toVar();
+          const slotIdx = record.add(uint(k)).toVar();
+          const recIdx = slotIdx.mul(uint(2)).toVar();
+          const prevBlock = cornerBlock.element(slotIdx).toVar();
+          const cachedKey = cornerLosRec.element(recIdx).toVar();
+          const cachedVis = cornerLosRec.element(recIdx.add(uint(1))).toVar();
+          const vis = float(1).toVar();
+          If(parentBlock.notEqual(uint(SLOT_EMPTY)), () => {
+            If(cachedVis.equal(uint(0xffffffff)).or(prevBlock.notEqual(parentBlock)).or(cachedKey.notEqual(key)), () => {
+              vis.assign(float(losSegment(position, cornerPos)));
+              cornerLosRec.element(recIdx).assign(key);
+              cornerLosRec.element(recIdx.add(uint(1))).assign(select(vis.greaterThan(0.5), uint(1), uint(0)));
+            }).Else(() => {
+              vis.assign(select(cachedVis.equal(uint(1)), float(1), float(0)));
+            });
+            If(vis.lessThan(0.5), () => {
+              atomicAdd(stats.element(sw(c, MERGE_LOS)), uint(1));
+            });
+            weight.mulAssign(vis.max(1e-3));
+          });
+        } else if (losArmed) {
+          const cornerPos = originP.add(cell0.add(vec3(dx, dy, dz)).mul(sp)).toVar();
+          const seg = cornerPos.sub(position).toVar();
+          // Same two shoulders as the screen gather (srcMath's LOS_OCC_* and
+          // LOS_PATH_*) — if the two disagreed, the field's own tiles and the
+          // screen's read of them would disagree about which side of a wall a
+          // probe sits on, which is the exact confusion this unit removes.
+          const blocked = float(0).toVar();
+          for (const tf of losFractions) {
+            const x = position.add(seg.mul(tf));
+            const t = float(losOccupied(x)).sub(LOS_OCC_LO)
+              .div(LOS_OCC_HI - LOS_OCC_LO).clamp(0, 1).toVar();
+            blocked.addAssign(t.mul(t).mul(float(3).sub(t.mul(2))));
+          }
+          const bp = blocked.div(losFractions.length).sub(LOS_PATH_LO)
+            .div(LOS_PATH_HI - LOS_PATH_LO).clamp(0, 1).toVar();
+          const vis = float(1).sub(bp.mul(bp).mul(float(3).sub(bp.mul(2)))).toVar();
+          If(vis.lessThan(0.5), () => {
+            atomicAdd(stats.element(sw(c, MERGE_LOS)), uint(1));
+          });
+          weight.mulAssign(vis.max(1e-3));
+        }
         cornerBlock.element(record.add(uint(k))).assign(parentBlock);
         cornerWeight.element(record.add(uint(k))).assign(weight);
       }
@@ -448,8 +489,8 @@ export function createSrcMergeFrame(store, bins, {
     const skyDirTable = skyEnv ? instancedArray(binDirTable(wTop), "vec4") : null;
     passes.push(Fn(() => {
       const i = instanceIndex.toVar();
-      const o = uint(info.binBase).add(i).mul(uint(PAYLOAD_WORDS)).toVar();
-      const T = payload.element(o.add(uint(3))).toVar();
+      const bin = uint(info.binBase).add(i).toVar();
+      const T = readPayloadT(payload, bin);
       If(T.lessThan(0), () => { Return(); });
       const S = vec3(sky).toVar();
       // §16 S1 — DIRECTIONAL SKY (2026-08-24, the user's "sky hdri acts
@@ -472,10 +513,8 @@ export function createSrcMergeFrame(store, bins, {
         ).toVar();
         S.assign(vec3(skyEnv.node.sample(equirectUV(rd)).level(0).xyz).mul(skyEnv.intensity));
       }
-      payload.element(o).assign(payload.element(o).add(T.mul(S.x)));
-      payload.element(o.add(uint(1))).assign(payload.element(o.add(uint(1))).add(T.mul(S.y)));
-      payload.element(o.add(uint(2))).assign(payload.element(o.add(uint(2))).add(T.mul(S.z)));
-      payload.element(o.add(uint(3))).assign(float(0));
+      const self = readPayload(payload, bin);
+      writePayload(payload, bin, self.L.add(S.mul(T)), float(0));
       atomicAdd(stats.element(sw(top, MERGE_SKY)), uint(1));
     })().compute(info.bins * info.blockCapacity));
   }
@@ -493,15 +532,21 @@ export function createSrcMergeFrame(store, bins, {
       const i = instanceIndex.toVar();
       const block = i.div(uint(nBins)).toVar();
       const m = i.mod(uint(nBins)).toVar();
-      const o = uint(info.binBase).add(block.mul(uint(nBins))).add(m)
-        .mul(uint(PAYLOAD_WORDS)).toVar();
+      // Dead block (srcProbes' live word): unowned, unread — skip before the
+      // payload fetch. Released-this-frame blocks resolved to UNKNOWN and
+      // fall out on `selfT < 0` below as they always did.
+      if (Number.isInteger(store?.blockLiveBase) && store?.freeStack) {
+        const live = store.freeStack.element(uint(store.blockLiveBase + info.blockBase).add(block));
+        If(live.equal(uint(0)), () => { Return(); });
+      }
+      const selfBin = uint(info.binBase).add(block.mul(uint(nBins))).add(m).toVar();
 
       // AN UNKNOWN SELF BIN STAYS UNKNOWN. It is not "no light" — no ray
       // sampled this direction, so there is nothing for the parent to shine
       // through. Merging a parent into it would invent an interval estimate
       // this probe never made, and at 0.78 rays per bin (§12.13.4) that
       // invention would be most of the buffer.
-      const selfT = payload.element(o.add(uint(3))).toVar();
+      const selfT = readPayloadT(payload, selfBin);
       If(selfT.lessThan(0), () => { Return(); });
       atomicAdd(stats.element(sw(c, MERGE_BINS)), uint(1));
 
@@ -536,19 +581,14 @@ export function createSrcMergeFrame(store, bins, {
           const pT = float(0).toVar();
           const known = float(0).toVar();
           for (let j = 0; j < 4; j++) {
-            const op = pBase.add(uint(j)).mul(uint(PAYLOAD_WORDS)).toVar();
-            const t = payload.element(op.add(uint(3))).toVar();
+            const parent = readPayload(payload, pBase.add(uint(j)));
             // UNKNOWN CHILDREN ARE SKIPPED and the average renormalizes over
             // what was found — the same "rejection weights are epsilons, never
             // zeros" rule the sparse gather below runs under. All four unknown
             // makes the whole corner absent, not black.
-            If(t.greaterThanEqual(0), () => {
-              pL.addAssign(vec3(
-                payload.element(op),
-                payload.element(op.add(uint(1))),
-                payload.element(op.add(uint(2))),
-              ));
-              pT.addAssign(t);
+            If(parent.T.greaterThanEqual(0), () => {
+              pL.addAssign(parent.L);
+              pT.addAssign(parent.T);
               known.addAssign(1);
             });
           }
@@ -570,16 +610,9 @@ export function createSrcMergeFrame(store, bins, {
         const invW = float(1).div(wsum).toVar();
         const parentL = acc.mul(invW).toVar();
         const parentT = accT.mul(invW).toVar();
-        const outL = vec3(
-          payload.element(o),
-          payload.element(o.add(uint(1))),
-          payload.element(o.add(uint(2))),
-        ).add(parentL.mul(selfT)).toVar();
+        const outL = readPayload(payload, selfBin).L.add(parentL.mul(selfT)).toVar();
         const outT = selfT.mul(parentT).toVar();
-        payload.element(o).assign(outL.x);
-        payload.element(o.add(uint(1))).assign(outL.y);
-        payload.element(o.add(uint(2))).assign(outL.z);
-        payload.element(o.add(uint(3))).assign(outT);
+        writePayload(payload, selfBin, outL, outT);
         atomicAdd(stats.element(sw(c, MERGE_MERGED)), uint(1));
         If(outT.equal(0), () => { atomicAdd(stats.element(sw(c, MERGE_OPAQUE)), uint(1)); });
       }).Else(() => {

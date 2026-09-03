@@ -80,6 +80,12 @@ export const useSceneStore = vmSingleton("sceneStore", () =>
         set({ scenePath });
       },
 
+      /** Updates scene chrome without rebuilding the O(N) entity mirror. The
+       * hierarchy transaction already published that mirror exactly once. */
+      setSceneMeta(sceneName, scenePath) {
+        set({ sceneName, scenePath });
+      },
+
       markDirty(dirty = true) {
         set({ dirty });
       },

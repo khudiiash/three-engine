@@ -91,17 +91,16 @@ fn was_self_write(path: &Path) -> bool {
 /// self-write filter that misses because of a capital drive letter is worse
 /// than no filter — it would look like random echo events.
 fn normalize(path: &Path) -> PathBuf {
-    PathBuf::from(
-        path.to_string_lossy()
-            .replace('\\', "/")
-            .to_lowercase(),
-    )
+    PathBuf::from(path.to_string_lossy().replace('\\', "/").to_lowercase())
 }
 
 fn is_ignored(path: &Path) -> bool {
     for component in path.components() {
         let name = component.as_os_str().to_string_lossy();
-        if IGNORED_DIRS.iter().any(|dir| name.eq_ignore_ascii_case(dir)) {
+        if IGNORED_DIRS
+            .iter()
+            .any(|dir| name.eq_ignore_ascii_case(dir))
+        {
             return true;
         }
         // Editors and exporters write to a temp file and rename. The temp file

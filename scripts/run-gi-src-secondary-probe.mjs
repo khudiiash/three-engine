@@ -259,7 +259,11 @@ const noise = Math.max(0.002, mA * 0.02);
 const tailContracts = iA[iA.length - 1] <= Math.max(noise, iA[iA.length - 2] * 1.0);
 check(tailContracts,
   `multibounce converges: tail increments ${iA.slice(-3).map((x) => x.toFixed(4)).join(" → ")} (noise floor ${noise.toFixed(4)})`);
-check(mA > mB * 1.08,
+// The analytic directional first-bounce compensation deliberately raises the
+// SINGLE-bounce denominator without scaling the recursive atlas term. A fixed
+// percentage therefore stopped expressing this claim; require a positive
+// increment comfortably above the measured image noise instead.
+check(mA - mB > Math.max(0.005, noise * 1.5),
   `the loop adds energy in a closed box: multibounce ${mA.toFixed(4)} vs single ${mB.toFixed(4)} (+${((mA / mB - 1) * 100).toFixed(1)}%)`);
 check(mA < mB * 10,
   `and R4 bounds it: ${(mA / mB).toFixed(2)}x is inside the 1/(1-0.9) = 10x hard ceiling`);

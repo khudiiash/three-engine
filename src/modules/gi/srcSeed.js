@@ -75,21 +75,21 @@
 // docs/GI_SRC_REBUILD_PLAN.md §12.59.1 (the verdict), §12.59.2 (this spec).
 
 import {
-  Fn,
-  If,
-  Loop,
-  Return,
   atomicAdd,
   atomicStore,
   float,
-  instanceIndex,
+  Fn,
+  If,
   instancedArray,
+  instanceIndex,
+  Loop,
+  Return,
   uint,
   vec3,
 } from "three/tsl";
 import { CASCADE_COUNT } from "./srcConfig.js";
 import {
-  BIN_B, BIN_COUNT, BIN_G, BIN_R, BIN_T, BIN_WORDS, DEPOSIT_SCALE, PAYLOAD_WORDS,
+  BIN_B, BIN_COUNT, BIN_G, BIN_R, BIN_T, BIN_WORDS, DEPOSIT_SCALE, readPayload,
 } from "./srcDeposit.js";
 import {
   FLAG_ALIVE,
@@ -127,7 +127,9 @@ export const SEED_SPATIAL = 4; // cold-column probes rescued by the LOD+1 spatia
 // could mean "nothing fresh at sample time" OR "fresh probes exist but the
 // seed cannot reach them" and the two have opposite fixes.
 export const SEED_NOBLOCK = 5;
-export const SEED_WORDS = 6;
+/** fresh probes whose parent (or spatial candidate) sits behind a wall — no prior taken (BVH segment test) */
+export const SEED_LOS = 6;
+export const SEED_WORDS = 7;
 
 /**
  * Bins per thread. Bin counts quadruple up the ladder (32 at c0, 512 at c2
@@ -164,7 +166,7 @@ const SEED_MAX_UNIT = 8;
  * @param {Node} options.seedRays  uniform: the prior's effective sample count,
  *   in rays. 0 zeroes every write (the in-page off arm).
  */
-export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null, spacing0 = null, maxLods = null, anchor = null } = {}) {
+export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null, spacing0 = null, maxLods = null, anchor = null, losSegment = null } = {}) {
   const { probeTable } = store;
   const { payload, scratch } = bins;
   const N = store.cascadeCount ?? CASCADE_COUNT;
@@ -264,6 +266,34 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
           parentUsable.assign(uint(1));
         });
       });
+      // Section 10 (2026-09-02): a parent behind a wall is no prior. The seed
+      // used to copy an OUTDOOR parent's merged bins (sky) into an INDOOR
+      // fresh probe — the blue patches (black with the sky off) on every
+      // surface the camera turned onto. One any-hit segment child -> parent
+      // (the merge's own test) declines the parent; the probe then converges
+      // from its own rays under the resolve's far-field fill.
+      const losGate = !!losSegment && spatial;
+      if (losGate) {
+        If(parentUsable.equal(uint(1)), () => {
+          const keyC = probeTable.element(w.add(uint(PROBE_KEY))).toVar();
+          const lodC = keyLod(keyC).toVar();
+          const sC = probeSpacing(c, lodC, spacing0).toVar();
+          const childPos = (worldKeys
+            ? vec3(keyWorldCell(keyC, camera, sC)).mul(sC)
+            : cellPosition(keyCell(keyC), latticeOrigin(anchor, sC), sC)).toVar();
+          const pkey = probeTable.element(parent.mul(uint(PROBE_WORDS)).add(uint(PROBE_KEY))).toVar();
+          const sP = probeSpacing(c + 1, keyLod(pkey), spacing0).toVar();
+          const parentPos = (worldKeys
+            ? vec3(keyWorldCell(pkey, camera, sP)).mul(sP)
+            : cellPosition(keyCell(pkey), latticeOrigin(anchor, sP), sP)).toVar();
+          If(float(losSegment(childPos, parentPos)).lessThan(0.5), () => {
+            parentUsable.assign(uint(0));
+            If(first, () => {
+              atomicAdd(stats.element(uint(SEED_LOS)), uint(1));
+            });
+          });
+        });
+      }
 
       // ── THE SPATIAL FALLBACK (header note above) ─────────────────────────
       // Only consulted when the cascade parent is unusable. The LOD+1 probe
@@ -301,6 +331,24 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
                 .and(spb.notEqual(uint(SLOT_EMPTY))), () => {
                 spBlock.assign(spb);
               });
+              if (losSegment) {
+                // The same wall test for the spatial candidate.
+                If(spBlock.notEqual(uint(SLOT_EMPTY)), () => {
+                  const childPos = (worldKeys
+                    ? vec3(keyWorldCell(key, camera, sL)).mul(sL)
+                    : cellPosition(keyCell(key), latticeOrigin(anchor, sL), sL)).toVar();
+                  const sP = sL.mul(2).toVar();
+                  const spPos = (worldKeys
+                    ? vec3(cellL1).mul(sP)
+                    : cellPosition(cellL1, latticeOrigin(anchor, sP), sP)).toVar();
+                  If(float(losSegment(childPos, spPos)).lessThan(0.5), () => {
+                    spBlock.assign(uint(SLOT_EMPTY));
+                    If(first, () => {
+                      atomicAdd(stats.element(uint(SEED_LOS)), uint(1));
+                    });
+                  });
+                });
+              }
             });
           });
         });
@@ -341,19 +389,10 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
         If(spBlock.notEqual(uint(SLOT_EMPTY)), () => {
           // SPATIAL source: same cascade, LOD+1 — SAME bin count and the SAME
           // direction convention, so bin m reads bin m, no 4→1.
-          const op = uint(info.binBase)
-            .add(spBlock.mul(uint(nBins)))
-            .add(m)
-            .mul(uint(PAYLOAD_WORDS))
-            .toVar();
-          const t = payload.element(op.add(uint(3))).toVar();
-          If(t.greaterThanEqual(0), () => {
-            pL.assign(vec3(
-              payload.element(op),
-              payload.element(op.add(uint(1))),
-              payload.element(op.add(uint(2))),
-            ));
-            pT.assign(t);
+          const source = readPayload(payload, uint(info.binBase).add(spBlock.mul(uint(nBins))).add(m));
+          If(source.T.greaterThanEqual(0), () => {
+            pL.assign(source.L);
+            pT.assign(source.T);
             known.assign(1);
           });
         }).Else(() => {
@@ -366,15 +405,10 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
             .add(m.mul(uint(4)))
             .toVar();
           for (let k = 0; k < 4; k++) {
-            const op = pBase.add(uint(k)).mul(uint(PAYLOAD_WORDS)).toVar();
-            const t = payload.element(op.add(uint(3))).toVar();
-            If(t.greaterThanEqual(0), () => {
-              pL.addAssign(vec3(
-                payload.element(op),
-                payload.element(op.add(uint(1))),
-                payload.element(op.add(uint(2))),
-              ));
-              pT.addAssign(t);
+            const parent = readPayload(payload, pBase.add(uint(k)));
+            If(parent.T.greaterThanEqual(0), () => {
+              pL.addAssign(parent.L);
+              pT.addAssign(parent.T);
               known.addAssign(1);
             });
           }
@@ -433,6 +467,7 @@ export function createSrcSeedFrame(store, bins, { lmax, seedRays, camera = null,
         bins: v[SEED_BINS] >>> 0,
         spatial: v[SEED_SPATIAL] >>> 0,
         noBlock: v[SEED_NOBLOCK] >>> 0,
+        los: v[SEED_LOS] >>> 0,
       };
     },
 

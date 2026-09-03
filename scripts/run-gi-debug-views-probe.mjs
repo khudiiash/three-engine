@@ -55,12 +55,15 @@
 // consecutive identical frames already differ, and a Δ near that floor means the
 // overlay contributed nothing visible.
 import puppeteer from "puppeteer-core";
-import sharp from "sharp";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const url = process.argv[2] ?? "http://localhost:5201/";
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
   headless: process.env.HEADED ? false : "new",
+  userDataDir: mkdtempSync(join(tmpdir(), "gi-debug-views-")),
   args: ["--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage"],
 });
 const page = await browser.newPage();
@@ -70,6 +73,7 @@ page.on("pageerror", (error) => errors.push(error.message));
 page.on("console", (message) => {
   const text = message.text();
   if (/GI-DV|\[gi\].*(rror|ailed)/.test(text)) console.log(`  ${text}`);
+  if (/\[gi\] debug view "path-tracer" failed/.test(text)) errors.push(text);
 });
 
 await page.goto(url, { waitUntil: "load", timeout: 30000 });
@@ -158,7 +162,7 @@ const canvasRect = await page.evaluate(() => {
 console.log(`live canvas: ${canvasRect.width}x${canvasRect.height} at ${canvasRect.x},${canvasRect.y}`);
 let failures = 0;
 
-async function shoot(mode) {
+async function shoot(mode, waitMs = 2500) {
   // Map mode → setter. Legacy volume views live on the global; the new
   // GI-term views live on the inspector prop. Either way the OTHER source is
   // cleared so the test name actually determines what drew.
@@ -172,7 +176,7 @@ async function shoot(mode) {
       globalThis.__setPropView(m);
     }
   }, mode);
-  await new Promise((resolve) => setTimeout(resolve, 2500));
+  await new Promise((resolve) => setTimeout(resolve, waitMs));
   // MECHANISM READOUT before the pixels: every failure this probe has actually
   // produced was the harness not reaching the views, and a coverage number
   // cannot tell that apart from a broken shader.
@@ -185,6 +189,14 @@ async function shoot(mode) {
       sdf: g?.sdfView ? { visible: g.sdfView.visible, inScene: !!g.sdfView.parent } : null,
       occ: g?.occView ? { visible: g.occView.visible, inScene: !!g.occView.parent } : null,
       debugView: g?.debugView ? { visible: g.debugView.visible, parent: g.debugView.parent?.type ?? null } : null,
+      pathTracer: system?.pathTracer
+        ? {
+            wanted: system.pathTracer.wanted,
+            active: system.pathTracer.active,
+            failed: system.pathTracer._failed === true,
+            error: system.pathTracer._lastError ?? null,
+          }
+        : null,
     };
   });
   const before = errors.length;
@@ -254,6 +266,10 @@ function diff(a, b, key = "px") {
 //   - `indirect`, `ao`, `reflections`: the new GI-term overlays, driven by
 //     `gi.setProp("debugView", mode)`. The global switch is OFF during these
 //     arms so the prop is the one source of truth being exercised.
+//   - `path-tracer`: the same inspector prop, but a live WebGPU path tracer
+//     rather than a term overlay. First enable lazy-loads the library; this
+//     arm waits longer so the import + BVH build can land. Offscreen capture
+//     will not show it (post-render blit); the live crop will.
 const off = await shoot("off");
 const off2 = await shoot("off");
 const occ = await shoot("occupancy");
@@ -261,13 +277,18 @@ const sdf = await shoot("sdf");
 const indirect = await shoot("indirect");
 const ao = await shoot("ao");
 const reflections = await shoot("reflections");
+const pathTracer = await shoot("path-tracer", 5000);
 const noise = { offscreen: diff(off2, off), live: diff(off2, off, "livePx") };
 console.log(`noise floor (off vs off): Δ offscreen=${noise.offscreen.toFixed(2)} live=${noise.live.toFixed(2)}`);
 
-for (const view of [occ, sdf, indirect, ao, reflections]) {
+for (const view of [occ, sdf, indirect, ao, reflections, pathTracer]) {
   const offscreen = diff(view, off);
   const liveDelta = diff(view, off, "livePx");
-  const clean = view.errors.length === 0;
+  let clean = view.errors.length === 0;
+  if (view.mode === "path-tracer" && !view.wiring.pathTracer?.active) {
+    clean = false;
+    view.errors.push("path tracer did not become active");
+  }
   if (!clean) failures++;
   // Above the noise floor by a clear margin = the overlay put pixels up.
   const readable = liveDelta > noise.live * 3 + 1;

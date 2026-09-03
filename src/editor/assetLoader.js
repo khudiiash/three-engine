@@ -151,7 +151,8 @@ export const withoutSidecars = (entries) =>
       // The audio editor's track stack, stored beside the sound it belongs to
       // (see audioFile.js). Same rationale as `.tex`.
       !entry.name.endsWith(".aud") &&
-      !entry.name.endsWith(".sdf"),
+      !entry.name.endsWith(".sdf") &&
+      !entry.name.endsWith(".gbvh"),
   );
 
 // esbuild-wasm's `initialize()` throws "Cannot call 'initialize' more than
@@ -215,6 +216,8 @@ export async function transpileScript(code) {
 const cache = vmSingleton("assetLoaderCache", () => ({
   /** @type {Map<string, string>} path -> object URL */
   blobUrls: new Map(),
+  /** @type {Map<string, Uint8Array>} path -> view into a shared native package */
+  binaryAssets: new Map(),
   // Downstream caches that also key on asset path — the engine's decoded-geometry
   // cache, the Assets panel, the frame pacer. Registered by their owners rather
   // than imported here on purpose: this module is pulled in by lightweight editor
@@ -222,7 +225,11 @@ const cache = vmSingleton("assetLoaderCache", () => ({
   /** @type {Set<(path: string) => void>} */
   listeners: new Set(),
 }));
+// A frontend hot update can reuse the pre-bulk-reader singleton created by an
+// older evaluation of this module. Upgrade that object in place.
+cache.binaryAssets ??= new Map();
 const blobUrlCache = cache.blobUrls;
+const binaryAssetCache = cache.binaryAssets;
 const invalidationListeners = cache.listeners;
 
 /** Subscribes `fn(path)` to every in-place asset overwrite. Returns an unsubscribe. */
@@ -236,6 +243,7 @@ export function invalidateBlobUrl(path) {
   const url = blobUrlCache.get(path);
   if (url) URL.revokeObjectURL(url);
   blobUrlCache.delete(path);
+  binaryAssetCache.delete(path);
   for (const fn of invalidationListeners) fn(path);
 }
 
@@ -350,6 +358,144 @@ export async function writeBinaryFile(path, bytes) {
   invalidateBlobUrl(path);
 }
 
+const bytesView = (value) => {
+  if (value instanceof Uint8Array) return value;
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return new Uint8Array(value);
+};
+
+/**
+ * Writes a fixed metadata header plus a large raw payload as one atomic file.
+ *
+ * The two views deliberately stay separate: joining them would allocate and
+ * copy Bistro's ~158 MB BVH on the JS heap. The native command writes both to
+ * a unique sibling temp, flushes it, then performs a platform-safe replace.
+ * There is intentionally NO legacy JSON fallback; expanding a payload this
+ * large into Array.from(...) is worse than treating persistence as unavailable.
+ */
+export async function writeAssetBinaryAtomic(path, header, payload) {
+  const headerBytes = bytesView(header);
+  const payloadBytes = bytesView(payload);
+  if (headerBytes.byteLength !== 128) {
+    throw new RangeError(`Atomic artifact header must be 128 bytes, got ${headerBytes.byteLength}`);
+  }
+  if (globalThis.__tauriShimInvoke) {
+    throw new Error("Atomic raw binary writes require the native Tauri command");
+  }
+  let encodedHeader = "";
+  for (const byte of headerBytes) encodedHeader += byte.toString(16).padStart(2, "0");
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("write_binary_file_raw_atomic", payloadBytes, {
+    headers: {
+      path: encodeURIComponent(path),
+      "artifact-header": encodedHeader,
+    },
+  });
+  invalidateBlobUrl(path);
+  return true;
+}
+
+/** Reads raw project bytes without a blob URL or JSON expansion. Derived-data
+ * consumers (notably GI's packed BVH cache) need ownership of the ArrayBuffer
+ * only until their GPU staging upload has been submitted. */
+export async function readAssetBinary(path) {
+  const cached = binaryAssetCache.get(path);
+  if (cached) return cached;
+  const { invoke } = await import("@tauri-apps/api/core");
+  try {
+    const bytes = await invoke("read_binary_file", { path });
+    if (bytes instanceof ArrayBuffer) return bytes;
+    if (ArrayBuffer.isView(bytes)) {
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    }
+    return new Uint8Array(bytes ?? []).buffer;
+  } catch {
+    return null;
+  }
+}
+
+const BINARY_PACKAGE_MAGIC = 0x314b5042; // "BPK1" in little endian
+let bulkReadSupported = true;
+
+function adoptBinaryPackage(paths, value) {
+  const bytes = bytesView(value);
+  if (bytes.byteLength < 8) throw new Error("truncated binary asset package");
+  const header = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (header.getUint32(0, true) !== BINARY_PACKAGE_MAGIC) throw new Error("invalid binary asset package");
+  const count = header.getUint32(4, true);
+  if (count !== paths.length || 8 + count * 8 > bytes.byteLength) {
+    throw new Error("binary asset package index does not match request");
+  }
+  let payload = 8 + count * 8;
+  for (let index = 0; index < count; index++) {
+    const record = 8 + index * 8;
+    const present = header.getUint32(record, true) !== 0;
+    const length = header.getUint32(record + 4, true);
+    if (payload + length > bytes.byteLength) throw new Error("truncated binary asset payload");
+    if (present) {
+      binaryAssetCache.set(
+        paths[index],
+        new Uint8Array(bytes.buffer, bytes.byteOffset + payload, length),
+      );
+    }
+    payload += (length + 3) & ~3;
+  }
+}
+
+async function preloadIndividually(paths, invoke) {
+  // Compatibility with an older native executable during frontend HMR. Keep
+  // enough reads in flight to hide IPC latency without flooding the bridge
+  // with Bistro's ~1,500 requests at once.
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(32, paths.length) }, async () => {
+    while (cursor < paths.length) {
+      const path = paths[cursor++];
+      try {
+        const value = await invoke("read_binary_file", { path });
+        binaryAssetCache.set(path, bytesView(value));
+      } catch {
+        // The component loader reports an authored missing asset in context.
+      }
+    }
+  });
+  await Promise.all(workers);
+}
+
+/**
+ * Preloads authored geometry, material, and texture bytes into one shared
+ * IPC-backed buffer. Source images and their optional Basis siblings travel in
+ * the same package so material loading does not resume per-file native IPC.
+ */
+export async function preloadAssetBinaries(paths) {
+  const candidates = [];
+  for (const path of paths ?? []) {
+    if (typeof path !== "string") continue;
+    if (/\.(?:geom|mat|basis|ktx2|png|jpe?g|webp)$/i.test(path)) candidates.push(path);
+    // Basis-enabled textures load the generated sibling first. Reading both
+    // variants in one native sweep is still vastly cheaper than hundreds of
+    // per-texture IPC calls, and guarantees the source fallback is resident.
+    if (/\.(?:png|jpe?g|webp)$/i.test(path)) candidates.push(`${path}.basis`);
+  }
+  const pending = [...new Set(candidates)].filter((path) => !binaryAssetCache.has(path));
+  if (!pending.length) return 0;
+  const { invoke } = await import("@tauri-apps/api/core");
+  if (bulkReadSupported) {
+    try {
+      adoptBinaryPackage(pending, await invoke("read_binary_files", { paths: pending }));
+      return pending.filter((path) => binaryAssetCache.has(path)).length;
+    } catch (error) {
+      const message = String(error?.message ?? error);
+      if (!/not (?:found|allowed)|unknown command|unhandled command|missing .*command/i.test(message)) throw error;
+      bulkReadSupported = false;
+      console.warn("read_binary_files unavailable; using concurrent individual asset reads until the Tauri app is rebuilt.");
+    }
+  }
+  await preloadIndividually(pending, invoke);
+  return pending.filter((path) => binaryAssetCache.has(path)).length;
+}
+
 /**
  * Reads a project file's bytes over Tauri and returns a cached blob: URL.
  * Only self-contained formats (.glb, plain images) are safe here — a blob
@@ -359,11 +505,15 @@ export async function writeBinaryFile(path, bytes) {
 export async function toBlobUrl(path) {
   const cached = blobUrlCache.get(path);
   if (cached) return cached;
-  const { invoke } = await import("@tauri-apps/api/core");
+  const packed = binaryAssetCache.get(path);
   // `read_binary_file` returns raw bytes over the IPC channel, so `invoke`
   // resolves to an ArrayBuffer here (not a number array) — feed it to the
   // Blob directly. See the Rust command for why this matters for big models.
-  const bytes = await invoke("read_binary_file", { path });
+  let bytes = packed;
+  if (!bytes) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    bytes = await invoke("read_binary_file", { path });
+  }
   const mime = MIME_BY_EXT[extOf(path)] ?? "application/octet-stream";
   const blob = new Blob([bytes], { type: mime });
   const url = URL.createObjectURL(blob);

@@ -566,7 +566,44 @@ export function gatherNormalWeightExp() {
   if (h === false) return 0;
   if (h === true) return 2;
   if (Number.isFinite(h)) return h > 0 ? h : 0;
-  return 0;
+  // ON by default since 2026-09-03 (it shipped opt-in). Without it a pixel on
+  // a facade interpolates the four trilinear corners INSIDE the building at
+  // full weight; with the sky off those probes are black, and the user's
+  // capture shows exactly that: soft probe-scale blobs over every facade and
+  // the street. `__giGatherNormalWeight = false` restores the flat trilinear.
+  return 2;
+}
+
+/**
+ * §10.6 (2026-09-03) — THE BEHIND-PLANE TOLERANCE IS A DEPTH IN METRES, NOT A
+ * FRACTION OF THE SPACING.
+ *
+ * The plane weight above fades a corner to its floor once it sits deeper than
+ * `0.35 · spacing` behind the shaded surface's tangent plane. At c0 that is
+ * 12 cm — a wall's thickness, the right scale. But the gather reads the
+ * COARSE shells at distance, and there the same fraction is 0.5 m at c2 and
+ * ~1 m at c3: deeper than any facade, so a pixel on a wall twenty metres
+ * away took the probes in the ROOM behind it at nearly full weight. On the
+ * exact BVH transport those probes are honestly dark (the room IS dark — no
+ * sky, no sun, the wall is real), and the user's captures show the result:
+ * soft blobs, 1–3 m across (the c2/c3 cell), black with the sky off and
+ * blue with it on, anchored to the surfaces the camera turns onto, on every
+ * facade, roof (attic probes) and the street (probes under the ground).
+ * The field build never showed them because its probes behind a wall were
+ * LIT — by the leak through the wall this transport closed.
+ *
+ * So the fade depth is `min(0.35 · spacing, this)`: unchanged at c0, a wall's
+ * thickness at every shell above it. Still a function of the signed plane
+ * distance alone, so a flat wall's corner weights stay constants (Q9c's
+ * lattice-silence argument is untouched). `__giGatherPlaneDepth` = metres;
+ * `false` = no cap (the 2026-09-02 behaviour). ONE reader, the CPU mirror
+ * reads it too.
+ */
+export function gatherPlaneDepth() {
+  const h = globalThis.__giGatherPlaneDepth;
+  if (h === false) return 1e6;
+  const v = Number(h);
+  return Number.isFinite(v) && v > 0 ? v : 0.15;
 }
 
 /**
@@ -1469,4 +1506,100 @@ export function tileCosineWeights(w, interior, sub = 4, border = 1) {
     for (let m = 0; m < nBins; m++) out[t * nBins + m] = inner[m * texels + src];
   }
   return out;
+}
+
+// ═══════════════════════════════════════════════ THE HALF-FLOAT PAYLOAD CODEC
+//
+// Plan §11.4 A1 (2026-09-03): the resolved payload — rgb + transmittance per
+// bin — is stored as four IEEE binary16 halves in two u32 words instead of
+// four f32 words. It is the second-largest allocation in the module (72 MB of
+// a 220 MB store on Bistro) and every screen-side consumer already reads it
+// through an rgba16f tile atlas, so nothing on the image path had more than
+// half precision to begin with. The kernels pack with WGSL's `pack2x16float`;
+// THIS is the CPU twin of that conversion, in pure JS because this file is the
+// bare-Node mirror and may not import `three` (DataUtils has the same tables).
+//
+// Round-to-nearest-even. WGSL leaves the narrowing rounding mode to the
+// implementation (RTNE or RTZ), so a gate that diffs a packed GPU word against
+// this encoder must allow ONE ulp of disagreement rather than assert the bit —
+// `halfUlp` below is that allowance, and it is deliberately the SAME function
+// every gate reaches for so the tolerance has one definition. MEASURED: the
+// NVIDIA/Dawn path rounds TOWARD ZERO (`test:gi-src-temporal` read a
+// pass-through transmittance of exactly 1 − 2^-11 where RTNE gives 1), so
+// the GPU's halves sit at or one ulp BELOW this encoder's, never above.
+
+const HALF_F32 = new Float32Array(1);
+const HALF_U32 = new Uint32Array(HALF_F32.buffer);
+
+/** f32 → binary16 bits (u16), round-to-nearest-even; overflow → ±inf. */
+export function floatToHalfBits(x) {
+  HALF_F32[0] = x;
+  const u = HALF_U32[0];
+  const sign = (u >>> 16) & 0x8000;
+  const exp = (u >>> 23) & 0xff;
+  let mant = u & 0x7fffff;
+  if (exp === 0xff) return sign | 0x7c00 | (mant ? 0x200 : 0);
+  const e = exp - 127 + 15;
+  if (e >= 0x1f) return sign | 0x7c00;
+  if (e <= 0) {
+    // Subnormal half (or underflow to zero): the value is `1.mant × 2^(e−15)`
+    // and the half's mantissa unit is 2^−24, so shift the 24-bit significand
+    // down by `14 − e` places with round-half-even on the dropped bits.
+    if (e < -10) return sign;
+    mant |= 0x800000;
+    const shift = 14 - e;
+    let h = mant >>> shift;
+    const rem = mant & ((1 << shift) - 1);
+    const half = 1 << (shift - 1);
+    if (rem > half || (rem === half && (h & 1))) h++;
+    return sign | h;
+  }
+  let h = sign | (e << 10) | (mant >>> 13);
+  const rem = mant & 0x1fff;
+  if (rem > 0x1000 || (rem === 0x1000 && (h & 1))) h++;
+  return h;
+}
+
+/** binary16 bits (u16) → f32. */
+export function halfBitsToFloat(h) {
+  const sign = (h & 0x8000) << 16;
+  const exp = (h >>> 10) & 0x1f;
+  const mant = h & 0x3ff;
+  if (exp === 0) {
+    if (mant === 0) { HALF_U32[0] = sign; return HALF_F32[0]; }
+    return (sign ? -1 : 1) * mant * 5.960464477539063e-8;
+  }
+  if (exp === 0x1f) { HALF_U32[0] = sign | 0x7f800000 | (mant << 13); return HALF_F32[0]; }
+  HALF_U32[0] = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+  return HALF_F32[0];
+}
+
+/** `x` rounded through binary16 — what the GPU's packed word decodes back to. */
+export function halfRound(x) {
+  return halfBitsToFloat(floatToHalfBits(x));
+}
+
+/** Two halves in one u32, `a` in the low 16 bits — WGSL `pack2x16float` order. */
+export function packHalf2(a, b) {
+  return (floatToHalfBits(a) | (floatToHalfBits(b) << 16)) >>> 0;
+}
+
+/** The inverse of `packHalf2` — `[low, high]`. */
+export function unpackHalf2(w) {
+  return [halfBitsToFloat(w & 0xffff), halfBitsToFloat(w >>> 16)];
+}
+
+/**
+ * One unit in the last place of binary16 at `x` — the gate tolerance for a
+ * value that crossed the packed payload. Normal halves carry a 10-bit
+ * mantissa, so an ulp is `2^(⌊log2|x|⌋ − 10)`; below the normal range it is the
+ * subnormal quantum 2^−24. Callers that compare a GPU word against a CPU value
+ * computed in f64 should allow `halfUlp(x)` (one ulp), which covers both the
+ * implementation-defined rounding direction and the f32-vs-f64 arithmetic
+ * that can move a value across a rounding boundary.
+ */
+export function halfUlp(x) {
+  const a = Math.abs(x);
+  if (!(a >= 6.103515625e-5)) return 5.960464477539063e-8;
+  return Math.pow(2, Math.floor(Math.log2(a)) - 10);
 }
