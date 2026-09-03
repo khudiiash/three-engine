@@ -4228,6 +4228,59 @@ front, sky intensity 0) and is arguably right; the hard seam and the
 silhouette fringes are not, and they survive `exactReflections: true`, so
 they are not the glossy field alone.
 
+### 11.20 THE MISSING COLOUR BLEED WAS THE FAR-FIELD BOX FEATHER (2026-09-03, night)
+
+**The complaint, twice: "almost no colour bleed".** Measured with
+`probe:gi-cornell-ref` at one pose against the in-editor path tracer: our
+whites carried **0.16 saturation against the tracer's 0.58**, the red wall
+arrived at 0.84x and the green wall at **0.58x** their true brightness, and
+the irradiance field itself read pale (indirect view, whites' sat 0.14).
+
+**The cause.** The §13 F3 far-field constant enters the resolve through
+`w = max(wBox, 1 - knownF)`. `wBox` exists because a DETAIL box is a small
+high-resolution volume inside a larger world and a pixel near its boundary
+has no field beyond it. The BVH-only build arms the same term with NO detail
+box: the volume is auto-fitted around the whole scene and the BVH answers
+everywhere, yet the feather is four probe spacings (~1.4 m) measured inward
+from a box that hugs a 5 m room by ~0.5 m. Every wall, the floor and the
+ceiling sat inside that band, so **up to ~70 % of their diffuse term was a
+flat warm-white scene-average constant** — and a constant carries the room's
+MEAN, which is precisely what a red-and-green room is not.
+
+**The fix (shipped, b697017):** `boxFeather` is false unless a detail box is
+actually armed. Large scenes are untouched (their box has a real outside);
+the never-black coverage fill is untouched everywhere.
+`__giFarFieldBoxFeather = true` restores the old behaviour.
+
+| arm (their Cornell, 30 s settle, vs the tracer) | whites' sat | lum ratio | red wall | green wall |
+|---|---|---|---|---|
+| before | 0.158 | 0.81x | 0.84x | 0.58x |
+| **after** | **0.419** | **1.19x** | **1.00x** | **0.95x** |
+| tracer | 0.577 | 1.00x | - | - |
+
+**Two refutations worth keeping.** (1) NOT A RAY BUDGET: a three-minute
+settle reads 0.170; stride 1 with the per-probe cap off (153 k rays a frame,
+10x the default) reads 0.173. Colour bleed was a BIAS, not a rate. (2) NOT
+the merge's "an unknown self bin stays unknown" rule:
+`__giMergeFillUnknown = true` lifts tile coverage from 57 % to 96 % and
+makes the image PALER (0.159 -> 0.141), because the parents it fills from are
+dimmer, not more coloured. A third change, `__giFarFieldCoverageRamp` (fill
+only where coverage is genuinely low), ships OPT-IN: it measured no
+difference either way once the box term was gone.
+
+**Residual, open:** 0.42 against the tracer's 0.58, and our whites 1.19x too
+bright. That is the tile's known-bin extrapolation (meanKnownBins 11.4 of a
+20.1-bin lobe) plus the loop's own gain (`bounceOverDirect` 1.09 where a
+0.73-albedo room converges near 2.7) — a smaller, separate deficit.
+
+**⛔ THE RIG LIED ONCE.** A dev flag persisted in `localStorage`
+(`gi.devFlags.v1`) booted one arm straight into the path-tracer view, and
+that arm's "GI" capture was the tracer's own noisy image — which "proved"
+that a 1.5 M ray ceiling restores the bleed (whites' sat 0.612, a perfect
+match to the tracer because it WAS the tracer). The rig now clears the dev
+flags on boot and asserts the debug view is off before it shoots. Blind
+statistics, one more time: the instrument must be shown to see its subject.
+
 ## 8. SOURCES
 
 Lumen SIGGRAPH 2022 (Wright et al.) · Lumen technical details / performance
