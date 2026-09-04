@@ -23,9 +23,17 @@ crate-type = ["cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# `image-png` decodes the PNG the screenshot hotkey hands to the clipboard
+# plugin (JsImage::Bytes → Image::from_bytes); without it the clipboard only
+# accepts raw RGBA, and every clipboard write would fail at runtime.
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+# Shift+Alt+S saves the screenshot and puts the saved file's PATH on the
+# clipboard — writeText, not writeImage, so no image decoding is involved.
+# The plugin rather than the webview's own clipboard API because that API is
+# unevenly implemented across WebView2/WKWebView/webkitgtk.
+tauri-plugin-clipboard-manager = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # kimodo.cpp text-to-motion loaded in-process: dlopen of the project's built

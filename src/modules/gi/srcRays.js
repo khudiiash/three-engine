@@ -78,6 +78,7 @@ import {
   CASCADE_COUNT,
   COLD_CAP_SHIFT,
   COLD_FILL_FRAMES,
+  STARVE_SHARE,
   SUM_SCALE,
   SURPRISE_CAP_MIN,
   SURPRISE_CAP_SHIFT,
@@ -104,6 +105,7 @@ import {
   PROBE_RAYS,
   PROBE_WORDS,
   PRIORITY_REP_PIXEL_BITS,
+  PRIORITY_REP_PIXEL_LIMIT,
   PRIORITY_REP_PIXEL_MASK,
   COUNTER_STARVED,
   SLOT_EMPTY,
@@ -125,7 +127,10 @@ export function createSrcRayStore(store, { pixelCount }) {
   const { probeTotal } = store;
   const rayCount = instancedArray(new Uint32Array(probeTotal), "uint").toAtomic();
   const rayCursor = instancedArray(new Uint32Array(probeTotal), "uint").toAtomic();
-  const rayTotal = instancedArray(new Uint32Array(1), "uint").toAtomic();
+  // Two words: [0] the frame's ticket dispenser / offset allocator, [1] the
+  // starvation floor's OWN dispenser (§11.31) — so a denied floor claim can
+  // never inflate the counter the pixel claims are measured against.
+  const rayTotal = instancedArray(new Uint32Array(2), "uint").toAtomic();
   const pixelRayBase = instancedArray(new Uint32Array(pixelCount).fill(SLOT_EMPTY), "uint");
   // ── THE WORKLIST (§12.44 — ray compaction) ────────────────────────────────
   // The pixels [D5] actually granted a slice this frame, DENSE. The deposit's
@@ -135,8 +140,10 @@ export function createSrcRayStore(store, { pixelCount }) {
   // bought almost no wall-clock (measured: 19 ms for 25k rays on the user's
   // editor — warp-density, not work). [E] reading this list traces at full
   // warp density; the trailing threads return in WHOLE warps, which is the
-  // cheap kind of idle. Capacity is `pixelCount` — winners are a subset of
-  // pixels in every path.
+  // cheap kind of idle. Capacity is `pixelCount`; priority admission caps the
+  // number of packets to that capacity too. In priority mode each word packs
+  // the 22-bit pixel and a 10-bit packet ordinal, so several packets from one
+  // representative retain distinct ray indices while sharing pixelRayBase.
   //
   // ⚠ ONE BUFFER — word 0 is the count, entries follow — NOT a count buffer
   // plus a list buffer. [E] sits at 7 of 8 storage buffers in the smoke's
@@ -163,7 +170,7 @@ export function createSrcRayStore(store, { pixelCount }) {
         .map((n) => n?.value).filter(Boolean);
     },
     pixelCount,
-    bytes: (probeTotal * 2 + 2 + pixelCount * 2) * 4,
+    bytes: (probeTotal * 2 + 3 + pixelCount * 2) * 4,
     dispose() {
       for (const b of [rayCount, rayCursor, rayTotal, pixelRayBase, rayWork]) {
         b?.value?.dispose?.();
@@ -306,6 +313,12 @@ export function createSrcRayFrame(
 ) {
   const { probeTable, probeTotal, cascades, freeStack } = store;
   const { rayCount, rayCursor, rayTotal, pixelRayBase, rayWork, pixelCount } = rays;
+  if (priority && pixelCount > PRIORITY_REP_PIXEL_LIMIT) {
+    throw new RangeError(`SRC packed ray worklist supports at most ${PRIORITY_REP_PIXEL_LIMIT} pixels`);
+  }
+  // A priority pixel may own several packets. The worklist still has one
+  // word per packet, so admission must also respect its allocated capacity.
+  const priorityCeiling = priority ? uint(priority.ceiling).min(uint(pixelCount * raysPerPixel)) : null;
   const N = store.cascadeCount ?? CASCADE_COUNT;
   const top = cascades[N - 1];
   if (surprise && !cap) {
@@ -391,6 +404,7 @@ export function createSrcRayFrame(
     probeTable.element(w.add(PROBE_RAYOFF)).assign(uint(SLOT_EMPTY));
     If(i.equal(uint(0)), () => {
       atomicStore(rayTotal.element(uint(0)), uint(0));
+      atomicStore(rayTotal.element(uint(1)), uint(0));
       atomicStore(rayWork.element(uint(0)), uint(0));
     });
   })().compute(probeTotal));
@@ -404,7 +418,12 @@ export function createSrcRayFrame(
     const c0 = cascades[0];
     const stampBase0 = store.blockStampBase + c0.blockBase;
     passes.push(Fn(() => {
-      const p = instanceIndex.add(uint(c0.probeBase)).toVar();
+      // §11.31: the walk order ROTATES with the frame, so when the floor's
+      // budget runs out before the starved probes do, the tail is a
+      // different tail next frame — no probe is denied by its slot index.
+      const rotated = instanceIndex.add(priority.frameStamp.mul(uint(1103)))
+        .mod(uint(c0.probeCapacity)).toVar();
+      const p = rotated.add(uint(c0.probeBase)).toVar();
       const w = p.mul(PROBE_WORDS).toVar();
       const rankedRep = atomicLoad(rayCursor.element(p)).toVar();
       probeTable.element(w.add(PROBE_HASH)).assign(uint(SLOT_EMPTY));
@@ -443,13 +462,27 @@ export function createSrcRayFrame(
         });
       }
       const wantPackets = starve
-        ? select(starved.equal(uint(1)), uint(starve.packets), uint(1)).toVar()
+        // 1023 plus the largest pixel id would equal SLOT_EMPTY in PROBE_HASH.
+        ? select(starved.equal(uint(1)), uint(starve.packets).clamp(uint(1), uint(1022)), uint(1)).toVar()
         : uint(1).toVar();
       const admit = starve ? cold.or(starved.equal(uint(1))) : cold;
       If(admit, () => {
         const want = wantPackets.mul(uint(raysPerPixel)).toVar();
+        // §11.31: a STARVED claim first passes the floor's own dispenser,
+        // bounded to STARVE_SHARE of the ceiling; only an accepted claim
+        // touches the shared counter. A cold (non-starved) claim is one
+        // packet and rides the shared counter as before.
+        const pass = uint(1).toVar();
+        if (starve) {
+          If(starved.equal(uint(1)), () => {
+            const share = uint(float(priorityCeiling).mul(STARVE_SHARE)).toVar();
+            const ticketS = atomicAdd(rayTotal.element(uint(1)), want).toVar();
+            If(ticketS.add(want).greaterThan(share), () => { pass.assign(uint(0)); });
+          });
+        }
+        If(pass.equal(uint(0)), () => { Return(); });
         const ticket = atomicAdd(rayTotal.element(uint(0)), want).toVar();
-        If(ticket.add(want).lessThanEqual(priority.ceiling), () => {
+        If(ticket.add(want).lessThanEqual(priorityCeiling), () => {
           atomicAdd(rayCount.element(p), want);
           // The packet count rides the free upper bits of the representative
           // word (pixel index < 2^22); [D1] masks it, the rep pass reads it.
@@ -478,12 +511,14 @@ export function createSrcRayFrame(
     if (priority) {
       // The representative already owns one budget ticket. If it also lies in
       // this frame's residue, do not count the same pixel twice.
-      const reserved = probeTable.element(
+      const reservation = probeTable.element(
         probe.mul(PROBE_WORDS).add(PROBE_HASH),
-      ).bitAnd(uint(PRIORITY_REP_PIXEL_MASK)).equal(i);
+      ).toVar();
+      const reserved = reservation.notEqual(uint(SLOT_EMPTY))
+        .and(reservation.bitAnd(uint(PRIORITY_REP_PIXEL_MASK)).equal(i));
       If(reserved, () => { Return(); });
       const ticket = atomicAdd(rayTotal.element(uint(0)), uint(raysPerPixel)).toVar();
-      If(ticket.add(uint(raysPerPixel)).greaterThan(priority.ceiling), () => { Return(); });
+      If(ticket.add(uint(raysPerPixel)).greaterThan(priorityCeiling), () => { Return(); });
       // Temporary admission marker, replaced by the real offset in [D5]. Only
       // this frame's residue is read, so stale entries remain irrelevant.
       pixelRayBase.element(i).assign(uint(0));
@@ -741,7 +776,7 @@ export function createSrcRayFrame(
   // reads: ray r of pixel p is global index `pixelRayBase[p] + r`. A pixel
   // whose probe is SLOT_EMPTY keeps SLOT_EMPTY here, which is how the trace
   // knows not to fire.
-  const claimPixel = (pixel, knownProbe = null) => {
+  const claimPixel = (pixel, knownProbe = null, packets = null) => {
     const i = uint(pixel).toVar();
     const probe = knownProbe ? uint(knownProbe).toVar() : pixelProbe.element(i).toVar();
     If(probe.equal(uint(SLOT_EMPTY)), () => {
@@ -753,7 +788,7 @@ export function createSrcRayFrame(
     // is the one place "this pixel fires this frame" is decided; a second
     // pass would be a second definition of the winner set, the exact
     // mismatch the transportPixel discipline exists to prevent.
-    if (!cap) {
+    if (!cap && !packets) {
       pixelRayBase.element(i).assign(atomicAdd(rayCursor.element(probe), uint(raysPerPixel)));
       atomicStore(rayWork.element(atomicAdd(rayWork.element(uint(0)), uint(1)).add(uint(1))), i);
       return;
@@ -774,13 +809,27 @@ export function createSrcRayFrame(
     // cursor pointed at.
     const w = probe.mul(PROBE_WORDS).toVar();
     const rayOff = probeTable.element(w.add(PROBE_RAYOFF)).toVar();
-    const off = atomicAdd(rayCursor.element(probe), uint(raysPerPixel)).toVar();
-    const denied = rayOff.equal(uint(SLOT_EMPTY)).or(
-      off.add(uint(raysPerPixel)).greaterThan(rayOff.add(probeTable.element(w.add(PROBE_RAYS)))),
-    ).toVar();
+    // Reserve the representative's entire contiguous range once. Repeating
+    // one-packet claims overwrote its shared pixelRayBase on every iteration:
+    // all accepted entries traced the final direction, and a final denial
+    // erased every earlier winner by writing SLOT_EMPTY over that base.
+    const requested = packets ? uint(packets) : uint(1);
+    const off = atomicAdd(rayCursor.element(probe), requested.mul(uint(raysPerPixel))).toVar();
+    const end = rayOff.add(probeTable.element(w.add(PROBE_RAYS))).toVar();
+    const accepted = (cap
+      ? requested.min(end.max(off).sub(off).div(uint(raysPerPixel)))
+      : requested).toVar();
+    const denied = rayOff.equal(uint(SLOT_EMPTY)).or(accepted.equal(uint(0))).toVar();
     pixelRayBase.element(i).assign(select(denied, uint(SLOT_EMPTY), off));
     If(denied.not(), () => {
-      atomicStore(rayWork.element(atomicAdd(rayWork.element(uint(0)), uint(1)).add(uint(1))), i);
+      if (packets) {
+        Loop({ start: uint(0), end: accepted, type: "uint", condition: "<" }, ({ i: packet }) => {
+          const entry = i.bitOr(packet.shiftLeft(uint(PRIORITY_REP_PIXEL_BITS)));
+          atomicStore(rayWork.element(atomicAdd(rayWork.element(uint(0)), uint(1)).add(uint(1))), entry);
+        });
+      } else {
+        atomicStore(rayWork.element(atomicAdd(rayWork.element(uint(0)), uint(1)).add(uint(1))), i);
+      }
     });
   };
   passes.push(Fn(() => {
@@ -798,12 +847,10 @@ export function createSrcRayFrame(
       const repWord = probeTable.element(probe.mul(PROBE_WORDS).add(PROBE_HASH)).toVar();
       If(repWord.equal(uint(SLOT_EMPTY)), () => { Return(); });
       const rep = repWord.bitAnd(uint(PRIORITY_REP_PIXEL_MASK)).toVar();
-      // §11.17: one claim per reserved packet — each claim takes the next
-      // raysPerPixel ray slots (distinct directions) from the same pixel.
+      // One base per representative; the worklist's upper bits distinguish
+      // its packets without another storage buffer in the tracing shader.
       const packets = repWord.shiftRight(uint(PRIORITY_REP_PIXEL_BITS)).max(uint(1)).toVar();
-      Loop({ start: uint(0), end: packets, type: "uint", condition: "<" }, () => {
-        claimPixel(rep, probe);
-      });
+      claimPixel(rep, probe, packets);
     })().compute(c0.probeCapacity));
   }
   // ⚠ `pixelRayBase` IS NO LONGER FULLY REWRITTEN EACH FRAME. With a strided
@@ -818,6 +865,7 @@ export function createSrcRayFrame(
   return {
     passes,
     raysPerPixel,
+    worklistPacked: !!priority,
 
     /** Total rays this frame — the top cascade's partition length. Async. */
     async readTotal(renderer) {

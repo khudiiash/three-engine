@@ -652,6 +652,77 @@
           `${gStats.meanCorners.toFixed(2)}/8 — at 1.0 this would be the old ` +
           "one-probe-per-pixel gather wearing a new name");
 
+        // A c1 atlas omits the near c0 interval. A surface-populated cache
+        // naturally has partial stencils, which must keep their fine answer.
+        say("");
+        say("-- COARSE FALLBACK: partial angular evidence is not a missing probe --");
+        const confidenceU = uniform(1);
+        const missingU = uniform(0, "uint");
+        const coarsePresentU = uniform(1, "uint");
+        const pointU = uniform(new THREE.Vector3(0.1, 0.125, 0.125));
+        const missingKeys = [
+          refMath.packProbeKey(0, 0, 1, 0, 0), refMath.packProbeKey(0, 0, 1, 1, 0),
+          refMath.packProbeKey(0, 0, 1, 0, 1), refMath.packProbeKey(0, 0, 1, 1, 1),
+        ];
+        const controlledGather = I.createSrcScreenGather(null, {
+          sampleTileRGBA: () => TSL.vec4(TSL.vec3(2, 0.5, 0.1).mul(confidenceU), confidenceU),
+        }, {
+          spacing0: 0.5, camera: vec3(0), anchor: vec3(0),
+          lookup: (key) => {
+            let missingX = key.equal(TSL.uint(missingKeys[0]));
+            for (const k of missingKeys.slice(1)) missingX = missingX.or(key.equal(TSL.uint(k)));
+            return TSL.select(missingU.equal(2).or(missingU.equal(1).and(missingX)),
+              TSL.uint(P.SLOT_EMPTY), TSL.uint(0));
+          },
+          coarse: {
+            cascade: 1,
+            lookup: () => TSL.select(coarsePresentU.equal(1), TSL.uint(0), TSL.uint(P.SLOT_EMPTY)),
+            tiles: { sampleTileRGBA: () => TSL.vec4(0, 0, 4, 1) },
+          },
+        });
+        const controlledOut = instancedArray(new Float32Array(4), "vec4");
+        const controlledPass = TSL.Fn(() => {
+          const r = controlledGather.gatherAt(vec3(pointU), vec3(0, 1, 0));
+          controlledOut.element(TSL.uint(0)).assign(TSL.vec4(r.irradiance, TSL.select(r.known, 1, 0)));
+        })().compute(1);
+        const controlledRead = async () => {
+          await renderer.computeAsync(controlledPass);
+          return new Float32Array(await renderer.getArrayBufferAsync(controlledOut.value));
+        };
+        for (const confidence of [1, 0.55, 0.1, 0.01]) {
+          confidenceU.value = confidence;
+          missingU.value = 0;
+          const v = await controlledRead();
+          check(`all fine corners preserve near bounce at confidence ${confidence}`,
+            [2, 0.5, 0.1].every((x, i) => Math.abs(v[i] - x) < 1e-4), `${Array.from(v).join(", ")}`);
+          missingU.value = 1;
+          const sparse = await controlledRead();
+          check(`a partial surface stencil preserves near bounce at confidence ${confidence}`,
+            [2, 0.5, 0.1].every((x, i) => Math.abs(sparse[i] - x) < 1e-4), `${Array.from(sparse).join(", ")}`);
+        }
+        // Cross the old 1% branch threshold: no jump on a coverage contour.
+        confidenceU.value = 1;
+        for (const x of [0.0049, 0.0051]) {
+          pointU.value.x = x;
+          const v = await controlledRead();
+          check(`partial fine coverage has no fallback contour at x=${x}`,
+            Math.abs(v[2] - 0.1) < 1e-4);
+        }
+        missingU.value = 0;
+        confidenceU.value = 0;
+        const unknown = await controlledRead();
+        check("fine probes with no known direction use coarse", unknown[2] === 4 && unknown[3] === 1);
+        missingU.value = 2;
+        const absent = await controlledRead();
+        check("no fine probes uses the coarse answer", absent[2] === 4 && absent[3] === 1);
+        coarsePresentU.value = 0;
+        const neither = await controlledRead();
+        check("both lattices absent remains explicitly unknown", Array.from(neither).every((x) => x === 0));
+        missingU.value = 0;
+        confidenceU.value = 0.1;
+        const fineOnly = await controlledRead();
+        check("missing coarse probes cannot darken a fine answer", Math.abs(fineOnly[0] - 2) < 1e-4);
+
         if (validationErrors.length) check("no WebGPU validation errors", false, validationErrors[0]);
 
         say("");

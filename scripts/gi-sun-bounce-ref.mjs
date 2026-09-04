@@ -19,6 +19,8 @@
 // truth would have shown a real engine as ~20% HOT and hidden that much of any
 // deficit. Depth 4 at rho 0.216 converges to well under a percent.
 
+import { readFileSync } from "node:fs";
+
 const RHO = 0.216;          // 0x808080 sRGB = 0.216 linear
 const SUN_I = 10;           // directional irradiance on a square-on surface
 const SUN_TRAVEL = [1 / Math.SQRT2, -1 / Math.SQRT2, 0];
@@ -135,12 +137,22 @@ export function irradianceAt(P, n, { samples = 200000, skyL = 0.1, withShadow = 
     s = (Math.imul(s ^ (s >>> 7), 0x297a2d39) ^ (s >>> 15)) >>> 0;
     return s / 4294967296;
   };
-  let accSun = 0, accSky = 0, escaped = 0;
+  // §11.28 HDRI arm: `skyL` may be a FUNCTION of the escape direction (a
+  // decoded environment map, `loadHdrSky`), so the truth carries the sky's
+  // angular distribution — a sunset HDRI puts most of its light at the
+  // horizon, exactly where an enclosure blocks it.
+  const skyAt = typeof skyL === "function" ? skyL : () => skyL;
+  let accSun = 0, accSky = 0, accSkyDirect = 0, escaped = 0;
   for (let i = 0; i < samples; i++) {
     let o = P, d = cosineDir(n, rnd), throughput = 1;
     for (let depth = 0; depth < DEPTH; depth++) {
       const h = trace(o, d);
-      if (!h) { if (depth === 0) escaped++; accSky += throughput * skyL; break; }
+      if (!h) {
+        const L = skyAt(d);
+        if (depth === 0) { escaped++; accSkyDirect += L; }
+        accSky += throughput * L;
+        break;
+      }
       const q = [o[0] + d[0] * h.t, o[1] + d[1] * h.t, o[2] + d[2] * h.t];
       const nq = normalAt(h.box, q);
       const cos = nq[0] * TOWARD_SUN[0] + nq[1] * TOWARD_SUN[1] + nq[2] * TOWARD_SUN[2];
@@ -156,8 +168,78 @@ export function irradianceAt(P, n, { samples = 200000, skyL = 0.1, withShadow = 
   return {
     sun: Math.PI * (accSun / samples),
     sky: Math.PI * (accSky / samples),
+    /** The sky seen DIRECTLY (depth 0) — what a no-bounce arm must reproduce. */
+    skyDirect: Math.PI * (accSkyDirect / samples),
     escape: escaped / samples,
   };
+}
+
+/**
+ * Decode a Radiance .hdr (RGBE, new-style RLE) into a luminance sampler over
+ * directions, using three's equirect convention (`equirectUV`: u = atan2(z, x)
+ * / 2π + ½, v = asin(y) / π + ½; row 0 of the file is v = 1, the zenith) and
+ * scaled by the scene's environment intensity. Returns `(dir) => radiance`.
+ */
+export function loadHdrSky(path, intensity = 1) {
+  const buf = readFileSync(path);
+  let i = buf.indexOf("\n\n") + 2;
+  const eol = buf.indexOf("\n", i);
+  const [, hStr, , wStr] = buf.slice(i, eol).toString().trim().split(/\s+/);
+  const H = Number(hStr);
+  const W = Number(wStr);
+  let pos = eol + 1;
+  const lum = new Float32Array(W * H);
+  const row = new Uint8Array(4 * W);
+  for (let y = 0; y < H; y++) {
+    if (buf[pos] === 2 && buf[pos + 1] === 2) {
+      pos += 4;
+      for (let ch = 0; ch < 4; ch++) {
+        let x = 0;
+        while (x < W) {
+          const c = buf[pos++];
+          if (c > 128) {
+            const n = c - 128;
+            const v = buf[pos++];
+            for (let k = 0; k < n; k++) row[(x + k) * 4 + ch] = v;
+            x += n;
+          } else {
+            for (let k = 0; k < c; k++) row[(x + k) * 4 + ch] = buf[pos + k];
+            pos += c;
+            x += c;
+          }
+        }
+      }
+    } else {
+      row.set(buf.subarray(pos, pos + 4 * W));
+      pos += 4 * W;
+    }
+    for (let x = 0; x < W; x++) {
+      const e = row[x * 4 + 3];
+      const scale = e > 0 ? 2 ** (e - 136) : 0;
+      lum[y * W + x] = (0.2126 * row[x * 4] + 0.7152 * row[x * 4 + 1] + 0.0722 * row[x * 4 + 2]) * scale;
+    }
+  }
+  const sky = (d) => {
+    const u = Math.atan2(d[2], d[0]) / (2 * Math.PI) + 0.5;
+    const v = Math.asin(Math.max(-1, Math.min(1, d[1]))) / Math.PI + 0.5;
+    const cx = ((Math.floor(u * W) % W) + W) % W;
+    const cy = Math.min(H - 1, Math.max(0, Math.floor((1 - v) * H)));
+    return lum[cy * W + cx] * intensity;
+  };
+  // The analytic open-sky irradiance for an up-facing point, for a receipt.
+  let eUp = 0;
+  for (let y = 0; y < H; y++) {
+    const theta = ((y + 0.5) / H) * Math.PI;
+    const dOmega = ((2 * Math.PI) / W) * (Math.PI / H) * Math.sin(theta);
+    const cos = Math.cos(theta);
+    if (cos <= 0) continue;
+    let rowSum = 0;
+    for (let x = 0; x < W; x++) rowSum += lum[y * W + x];
+    eUp += rowSum * cos * dOmega;
+  }
+  sky.irradianceUp = eUp * intensity;
+  sky.size = [W, H];
+  return sky;
 }
 
 /**

@@ -378,6 +378,34 @@ turning stays instant, because a mouse is an input and not a mass.
 `CharacterCamera.snap()` clears the lag after a teleport, and
 `CharacterController.warpTo()` calls it for you.
 
+**Look is device-aware in sign as well as rate**, because a mouse and a stick
+report different things. A mouse delta is a per-frame distance in screen
+pixels, where up is −y; a stick — gamepad or the on-screen joystick — is a
+held position, already "up = +1" like every vec2 in the engine (the dpad, the
+WASD composite and the virtual stick all agree; the gamepad DEVICE flips its
+raw screen-space axes once, in `GamepadDevice.poll`, so no binding or consumer
+ever has to). So the stick's rate is scaled by frame time and the mouse's is
+not — and the pitch sign is per-device. Negating both was what had the touch
+look stick pointing at the ground by default, with Invert Y as the only way to
+look up; the engine-side tell was that pushing a gamepad stick up walked the
+character backward.
+
+**Movement pace is constant by default: deflection steers, it does not
+throttle.** The controller normalizes the move vector above a dead zone (0.2 —
+sized to out-cover the gamepad device's per-axis 0.12, since a wobbly stick's
+diagonal can still read ~0.17), so a half-deflected stick walks at full speed
+and the animator's `Speed` parameter holds its stride instead of sagging
+toward idle as the thumb drifts back toward the centre. The `Analog Speed`
+attribute restores the proportional read for games that want a throttle.
+
+The wall cast also depends on an engine contract worth knowing: physics
+queries accept `[x, y, z] | Vector3` (engine.d.ts), and an implementation that
+indexes `origin[0]` feeds Rapier `undefined` for a Vector3 — no error, just a
+query that silently never hits, which is exactly how "Avoid Walls" shipped
+passing through walls (and the crouch ceiling check with it). Gated live by
+`npm run test:level` (`physics queries accept a THREE.Vector3`, `Avoid Walls
+pulls the third-person camera in front of a wall`).
+
 ⚠ **`setProp` from a script is an editor-facing write, not a per-frame one.**
 `Component.setProp` fires `"hierarchy-changed"` on every call, and the editor
 answers that by re-mirroring every entity in the scene for React — fine for an

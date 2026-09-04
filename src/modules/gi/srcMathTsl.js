@@ -80,7 +80,7 @@ import {
   R2_HALF_FX,
   worldKeysEnabled,
 } from "./srcMath.js";
-import { KEY_MAX_LODS, LOD_OVERLAP, MAX_LODS, R0_OVER_S0, GAMMA, lod0Reach } from "./srcConfig.js";
+import { KEY_MAX_LODS, LOD_OVERLAP, MAX_LODS, r0OverS0, GAMMA, lod0Reach } from "./srcConfig.js";
 
 const TAU = Math.PI * 2;
 
@@ -121,6 +121,44 @@ export function decodeDir(x, y) {
   const z = float(y).mul(2).sub(1).toVar();
   const r = sqrt(float(1).sub(z).mul(float(1).add(z)).max(0)).toVar();
   return vec3(r.mul(cos(phi)), r.mul(sin(phi)), z);
+}
+
+// ═══════════════════════════════════════ §11.28 THE RADIANCE CENTROID
+// TSL twins of `srcMath.js`'s `binFrame` / `encodeCentroidOffset` /
+// `decodeCentroidOffset` — the same helper-axis rule, the same signed-byte
+// quantisation (+128, so code 0 and 0x8080 both read as a zero offset).
+
+/** Rec. 709 luminance of a vec3 radiance node. */
+export function luminanceTsl(L) {
+  return vec3(L).dot(vec3(0.2126, 0.7152, 0.0722));
+}
+
+/** The tangent frame `{ e1, e2 }` at area centroid `c` (vec3 node). */
+export function binFrame(c) {
+  const cc = vec3(c).normalize().toVar();
+  const useX = cc.z.abs().greaterThan(0.9).toVar();
+  const a = select(useX, vec3(1, 0, 0), vec3(0, 0, 1)).toVar();
+  const e1 = a.cross(cc).normalize().toVar();
+  const e2 = cc.cross(e1).toVar();
+  return { e1, e2 };
+}
+
+/** World offset `o` (vec3 node) → 16-bit code in the frame of `c`. */
+export function encodeCentroidOffset(o, c) {
+  const { e1, e2 } = binFrame(c);
+  const a = vec3(o).dot(e1).clamp(-1, 1).mul(127).add(0.5).floor().toInt().add(int(128)).toVar();
+  const b = vec3(o).dot(e2).clamp(-1, 1).mul(127).add(0.5).floor().toInt().add(int(128)).toVar();
+  return a.toUint().bitOr(b.toUint().shiftLeft(uint(8))).toVar();
+}
+
+/** 16-bit code (uint node) → world offset in the frame of `c`; zero for code 0. */
+export function decodeCentroidOffset(code, c) {
+  const k = uint(code).toVar();
+  const a = k.bitAnd(uint(0xff)).toInt().sub(int(128)).toFloat().div(127).toVar();
+  const b = k.shiftRight(uint(8)).bitAnd(uint(0xff)).toInt().sub(int(128)).toFloat().div(127).toVar();
+  const { e1, e2 } = binFrame(c);
+  const o = e1.mul(a).add(e2.mul(b)).toVar();
+  return select(k.equal(uint(0)), vec3(0), o).toVar();
 }
 
 /** Unit direction → (x, y) ∈ [0,1)². Twin of `encodeDir`. */
@@ -612,7 +650,7 @@ export function lodBlend(lodF) {
  * than just comparing numbers.
  */
 export function intervalBoundary(cascade, lod, spacing0) {
-  const r0 = float(spacing0).mul(R0_OVER_S0).mul(float(lod).exp2());
+  const r0 = float(spacing0).mul(r0OverS0()).mul(float(lod).exp2());
   return r0.mul((Math.pow(GAMMA, cascade + 1) - 1) / (GAMMA - 1));
 }
 

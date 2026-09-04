@@ -17,6 +17,8 @@
 import { defineOp } from "../registry.js";
 import { readTexturePixelsGPU } from "../../../modules/gi/giScreen.js";
 import { engine } from "../../engineInstance.js";
+import { getViewportHandle } from "../../viewportHandle.js";
+import { constantColorOf, textureValueOf } from "../../../modules/gi/materialNodeBindings.js";
 import { auditDrawCalls } from "../../../engine/drawCallAudit.js";
 import { collectViewCullingStats } from "../../../engine/culling/viewCullingStats.js";
 
@@ -170,6 +172,39 @@ defineOp({
       if (resolveCompute) {
         passes.resolve = await timeOne(resolveCompute);
         if (typeof passes.resolve === "number") liveTotal += passes.resolve;
+      }
+      // §11.40: the emitter marcher's HELD cost — what a movers-only frame
+      // pays once the static visibility cache is full (stride S: one pixel
+      // in S re-marches the static world, the rest read the cache and
+      // re-test only the movers). The frame loop sets that stride only on
+      // movers-only frames, and the cache is invalid whenever the static
+      // key moved (it does, all through a boot), so this arm sets the
+      // stride, fills the cache through the write -> read snapshot, times
+      // the pair (the snapshot is ~0.02 ms) and restores the uniform. The
+      // bare `emitterShadowPass` above is the stride-1 cost: every pixel
+      // marches and stores.
+      const snapCompute = screen.emitterStaticSnapshotPass?.compute;
+      const emitterCompute = screen.emitterShadowPass?.compute;
+      const strideU = sys._giEmitterStaticStrideU;
+      if (snapCompute && emitterCompute && strideU && emittersLive) {
+        const prevStride = strideU.value;
+        const stride = sys.emitterStaticStride ?? 4;
+        strideU.value = stride;
+        try {
+          for (let i = 0; i < 2 * stride + 2; i++) {
+            renderer.compute(emitterCompute);
+            renderer.compute(snapCompute);
+          }
+          await renderer.resolveTimestampsAsync("compute");
+          for (let i = 0; i < K; i++) {
+            renderer.compute(emitterCompute);
+            renderer.compute(snapCompute);
+          }
+          const dur = await renderer.resolveTimestampsAsync("compute");
+          passes[`emitterShadowPass (movers-only: static cache, stride ${stride})`] = +((dur ?? 0) / K).toFixed(4);
+        } finally {
+          strideU.value = prevStride;
+        }
       }
 
       // Named, and sorted most-expensive-first: the point of this op is to
@@ -341,12 +376,28 @@ defineOp({
           // deposit's `readStats` is the one place these words are decoded;
           // this op only relays it.
           shadedHitsPerFrame: stats.rays?.shaded ?? 0,
+          // §11.44: tree-sample visibilities the per-probe cache answered vs marched.
+          visCachedPerFrame: stats.rays?.visCached ?? 0,
+          visMarchedPerFrame: stats.rays?.shadowRays ?? 0,
+          visNoBlockPerFrame: stats.rays?.visNoBlock ?? 0,
+          visNoRowPerFrame: stats.rays?.visNoRow ?? 0,
+          visFillingPerFrame: stats.rays?.visFilling ?? 0,
+          visFullPerFrame: stats.rays?.visFull ?? 0,
+          visCacheTable: stats.visCache ?? null,
+          visCacheShare: ((stats.rays?.visCached ?? 0) + (stats.rays?.shadowRays ?? 0)) > 0
+            ? +((stats.rays?.visCached ?? 0) / ((stats.rays?.visCached ?? 0) + (stats.rays?.shadowRays ?? 0))).toFixed(3)
+            : null,
           // The transport's fired count, kernel-tallied. Under the per-probe
           // ray cap this is the REAL total — the boot line's `rays/frame` is an
           // upper bound there, and dividing a deposit time by the bound would
           // overstate the kernel by exactly the cap's savings.
           raysPerFrame: stats.rays?.rays ?? 0,
           probeRayCap: screen.srcProbes.probeRayCap ?? null,
+          // §11.50's cap loop: what it fired, against what budget, how
+          // complete the field was, and which branch it took. Reading the cap
+          // alone cannot tell "converged, giving rays back" from "pinned at
+          // CAP_MAX and still short".
+          capLoop: globalThis.__giSrcTransport?.capLoop ?? null,
           // The bounce albedo the transport actually uses: the slot palette's
           // live mean (what an unattributed hit shades at, and the scale of
           // every attributed one), and the reflection atlas census — a
@@ -666,6 +717,11 @@ defineOp({
       cpuMs: +(r.workMs || r.frameMs).toFixed(2),
       gpuMs: +(r.gpuMs > 0 ? r.gpuMs : r.renderMs).toFixed(2),
       gpuMsIsReal: r.gpuMs > 0,
+      // §18: the frame's GPU time split — render (scene draw, GI prepass,
+      // shadows, post) vs compute (every GI chain). Read these DURING camera
+      // motion: the per-pass profiler cannot see a moving frame's dispatch set.
+      gpuRenderMs: +(r.gpuRenderMs ?? 0).toFixed(2),
+      gpuComputeMs: +(r.gpuComputeMs ?? 0).toFixed(2),
       renderScale: +r.renderScale.toFixed(3),
       drawCalls: r.drawCalls,
       triangles: r.triangles,
@@ -722,6 +778,42 @@ defineOp({
         moverOnlyFrames: engine.modules?.get?.("gi")?.system?._moverOnlyFrames ?? null,
         worldHz: engine.modules?.get?.("gi")?.system?._srcWorldHzLive ?? null,
         worldRested: engine.modules?.get?.("gi")?.system?._srcWorldRested ?? null,
+        // §11.34 converged idle: the world chain is asleep (zero dispatch)
+        // while `worldIdle` is true; `worldIdleReason` names the condition
+        // holding it awake otherwise ("2 of 3 lights movable", "not rested",
+        // "resting 1.2 s of 3", "inputs changed").
+        worldIdle: engine.modules?.get?.("gi")?.system?._worldIdle ?? null,
+        worldIdleFrames: engine.modules?.get?.("gi")?.system?._worldIdleFrames ?? null,
+        worldIdleReason: engine.modules?.get?.("gi")?.system?._worldIdleReason ?? null,
+        // §11.36: true on frames where the camera is moving but the world
+        // chain stayed at the rest cadence because every light is static.
+        worldMotionRest: engine.modules?.get?.("gi")?.system?._srcWorldMotionRest ?? null,
+        worldStaggered: engine.modules?.get?.("gi")?.system?._srcWorldStaggerCount ?? null,
+        // §11.45: true while the world chain dispatches in two halves — then
+        // a "world dispatch" is a SEGMENT, and two of them are one chain.
+        worldSplit: engine.modules?.get?.("gi")?.system?._srcWorldSplitOn ?? null,
+        // §11.44: what the per-frame light-tree refresh saw change (cumulative) and how often it invalidated the visibility cache.
+        lightTreeChanges: engine.modules?.get?.("gi")?.system?._lightTreeChangeTally ?? null,
+        // §11.36: the compute passes the previous frame actually dispatched,
+        // counted by name — multiply by profile.giPasses' per-pass ms for the
+        // moving frame's composition.
+        dispatchedLastFrame: (() => {
+          const log = engine.modules?.get?.("gi")?.system?._giDispatchedLastFrame;
+          if (!Array.isArray(log)) return null;
+          const byName = {};
+          for (const name of log) byName[name] = (byName[name] ?? 0) + 1;
+          return { count: log.length, byName };
+        })(),
+        // The transport's rest-drive terms (max of these is the drive; < 0.05
+        // rests): light motion α, the tracking window, the camera term, the
+        // boot hold, the light-surprise term. Rounded to 2 decimals.
+        restTerms: (() => {
+          const t = globalThis.__giSrcRestTermsLive;
+          if (!t) return null;
+          const out = {};
+          for (const [k, v] of Object.entries(t)) out[k] = Number.isFinite(v) ? +v.toFixed(2) : v;
+          return out;
+        })(),
         // 1 = the emitter shadow pass marches a checkerboard this frame (half
         // the pixels), 0 = full-pixel (movers-only frames), null = no chain.
         emitterChecker: engine.modules?.get?.("gi")?.system?._giEmitterCheckerU?.value ?? null,
@@ -1108,6 +1200,118 @@ defineOp({
 });
 
 defineOp({
+  name: "profile.lightResponse",
+  readOnly: true,
+  description:
+    "Measure how fast the GI FOLLOWS A LIGHT CHANGE: steps the scene's single directional light by `stepDeg` (about its parent's x, the way a day-cycle script does), records the GI irradiance as a 16x9 tile grid every frame, and reports how long the picture took to reach its new settled state (t50/t90, in frames and ms), whether the approach was monotone, and how big the change was. The sun is restored afterwards. THIS IS THE GATE THAT A STABILITY NUMBER CANNOT FAKE: a field that has stopped tracking the sun reads 0 flicker and never reaches t90. `changeOfBaseline` near 0 means the step did not reach the picture at all (blind); `fps` far below the viewport's means the GI tick was held and the field could not have advanced. Run profile.flicker and this together, always.",
+  params: {
+    stepDeg: { type: "number", default: 25, description: "How far to rotate the sun, in degrees (about its parent's x). 25 moves every shadow in a Sponza-class scene without turning the sun off." },
+    seconds: { type: "number", default: 8, description: "How long to record after arming (max 20). The step lands after `warmupFrames`." },
+    warmupFrames: { type: "number", default: 30, description: "Frames of baseline recorded before the step." },
+  },
+  async run({ stepDeg = 25, seconds = 8, warmupFrames = 30 }) {
+    const sys = engine?.modules?.get?.("gi")?.system;
+    if (!sys?.beginLightResponse) throw new Error("No GI system, or this build predates the light-response gate.");
+    const secs = Math.max(1, Math.min(20, Number(seconds) || 8));
+    const armed = sys.beginLightResponse({ stepDeg: Number(stepDeg) || 25, seconds: secs, warmupFrames: Math.max(1, Math.min(120, Math.round(warmupFrames))) });
+    const deadline = Date.now() + secs * 1000 + 4000;
+    while (!sys.lightResponseComplete() && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const w = await sys.readLightResponse();
+    if (w.targetSwapped) return { ...armed, ...w };
+    return {
+      ...armed,
+      ...w,
+      note:
+        (w.changeOfBaseline < 0.02
+          ? "WARNING: THE STEP DID NOT REACH THE PICTURE (settled vs baseline differ by <2%). Either the light did not move, or the GI does not carry it - t50/t90 mean nothing here. "
+          : `The step changed the settled picture by ${(w.changeOfBaseline * 100).toFixed(0)}%. `) +
+        (w.t90Frames < 0
+          ? `WARNING: NEVER REACHED 90% of the way to settled within ${w.frames - w.stepAt} frames (final error ${(w.errFinal * 100).toFixed(1)}% vs err0 ${(w.err0 * 100).toFixed(1)}%). This is what "lighting does not update" looks like. `
+          : `t50 ${w.t50Ms} ms, t90 ${w.t90Ms} ms after the step; ${(w.monotoneShare * 100).toFixed(0)}% of frames moved toward settled (100% = a clean ramp, <70% = an oscillating approach). `) +
+        `${w.frames} frames at ${w.fps} fps - compare against profile.frameStats; a much lower number means the GI tick was held. ` +
+        "`curve` is the distance from settled over the window, 24 points.",
+    };
+  },
+});
+
+defineOp({
+  name: "profile.flicker",
+  readOnly: true,
+  description:
+    "Measure GI FLICKER in the live session: arms a per-pixel accumulator over the GI irradiance target and, for a few seconds, counts how often each pixel's frame-to-frame luminance delta REVERSES SIGN, how big its biggest one-frame step was, and where on screen the churn is — with the field's own dials (alpha, stride root, screen history weight, camera-motion EMA, light-motion term, world update Hz) sampled on the same frames. Run it, then DO THE THING while it watches: walk, swing the camera into a new room, let the sun rotate. Reversals are the discriminator no magnitude statistic can replace — real light arriving, a sun setting or a wall being revealed all move a pixel MONOTONELY; only an estimator reverses. `stepP95OfMean` is the number to hold against the 'no pixel changes more than a few % per frame' bar. WARNING: absolute values are only comparable WITHIN one session (the same config has read a 3.7x spread across processes) — always compare two windows here, never one of these numbers against one in a document.",
+  params: {
+    seconds: {
+      type: "number",
+      default: 10,
+      description: "How long to watch, in seconds (max 60). The call returns when the window closes.",
+    },
+    warmupFrames: {
+      type: "number",
+      default: 30,
+      description:
+        "Frames spent seeding each pixel's previous luminance before counting starts. Counting from frame zero scores the seed itself as one huge delta on every pixel. Rarely worth changing.",
+    },
+    stillOnly: {
+      type: "boolean",
+      default: true,
+      description:
+        "Count only frames where the CAMERA DID NOT MOVE (it still seeds through motion). This counter is screen-space, so while the camera moves a pixel sweeps across unrelated surfaces and reverses from PARALLAX — measured: an orbit puts 100% of pixels over the churn threshold on a field that is behaving. Leaving this on measures the thing people actually report: arrive somewhere, hold still, and watch how long the field keeps rearranging. Set it false to count every frame when comparing two builds under the SAME motion.",
+    },
+  },
+  async run({ seconds = 10, warmupFrames = 30, stillOnly = true }) {
+    const sys = engine?.modules?.get?.("gi")?.system;
+    if (!sys?.beginFlickerWatch) {
+      throw new Error("No GI system, or this build predates the flicker watch.");
+    }
+    const secs = Math.max(1, Math.min(60, Number(seconds) || 10));
+    const armed = sys.beginFlickerWatch({
+      seconds: secs,
+      warmupFrames: Math.max(0, Math.min(120, Math.round(warmupFrames))),
+      stillOnly: stillOnly !== false,
+    });
+    const deadline = Date.now() + secs * 1000 + 4000;
+    while (!sys.flickerWatchComplete() && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const watch = await sys.readFlickerWatch();
+    if (watch.targetSwapped || watch.pipelinePending) return { ...armed, ...watch };
+    const g = watch.signals ?? {};
+    const dial = (name, v) => (v ? `${name} ${v.min}..${v.max}` : null);
+    return {
+      ...armed,
+      ...watch,
+      note:
+        (watch.frames === 0
+          ? (watch.movingFramesSkipped > 0
+            ? "NO STILL FRAMES — the camera moved for the ENTIRE window, and stillOnly counts only frames where it did not. Hold still for part of the window, or pass stillOnly:false. "
+            : "NO FRAMES COUNTED — the viewport was suspended for the whole window (unfocused with 'Freeze unfocused viewport' on, or a compile wave held the tick). Nothing here is a measurement. ")
+          : `${watch.frames} counted frames of ${watch.fps} fps over ${watch.resolution}` +
+            (watch.stillOnly ? ` (${watch.movingFramesSkipped} moving frames skipped — see stillOnly). ` : ". ") +
+            `${(watch.movedShare * 100).toFixed(0)}% of pixels moved at all; ` +
+            `${(watch.churnShare * 100).toFixed(1)}% reversed 3+ times (that share IS the boiling). ` +
+            `Reversals per pixel per frame ${watch.reversalsPerFrame}. ` +
+            `Biggest one-frame step ${watch.stepMaxOfMean}x the image mean, p95 ${watch.stepP95OfMean}x. `) +
+        (watch.frames && watch.movedShare === 0
+          ? "⚠ NOT ONE PIXEL MOVED. Either the scene really is frozen, or the accumulator's compute " +
+            "pipeline never landed (an async compute that has not compiled is a silent no-op) — run it " +
+            "again; the second window reuses nothing but the pipeline is warm by then. "
+          : "") +
+        "`tileReversalsPerFrame` is a 16x9 grid over the viewport (row 0 = top): it says WHERE. " +
+        (watch.frames
+          ? "Dials while it watched: " +
+            [dial("alpha", g.alpha), dial("root", g.root), dial("histWeight", g.histWeight),
+              dial("camMotion", g.cameraMotion), dial("lightMotion", g.lightMotion),
+              dial("worldHz", g.worldHz)].filter(Boolean).join(", ") +
+            ". `lightMotion` is in the light-track window's own threshold units (it arms at 0.5). "
+          : "") +
+        "COMPARE WINDOWS, NOT DOCUMENTS: this instrument's absolute scale does not survive a page reload.",
+    };
+  },
+});
+
+defineOp({
   name: "profile.spikeWatch",
   readOnly: true,
   description:
@@ -1159,6 +1363,214 @@ defineOp({
             (worst.subPhases?.length ? ` (inside it: ${worst.subPhases.slice(0, 3).map((p) => `${p.name} ${p.ms}ms`).join(", ")})` : "") + ". "
           : "No frame crossed the threshold — whatever the stutter is, it did not happen during this window, or it is not CPU-side. ") +
         "Phases that cost under 0.5 ms in a frame are omitted from that frame; sub-phases sum to LESS than their parent phase and the shortfall is unmarked time, not zero.",
+    };
+  },
+});
+
+/**
+ * §11.36 — THE ORBIT: the one instrument that reads a MOVING frame on the
+ * user's own scene. An MCP-driven orbit is a burst of jumps with the read
+ * landing after the stop (the two arms of the first Bistro A/B orbited
+ * different street segments and read nothing comparable). This spins the
+ * editor camera from INSIDE the page, every frame, for `seconds`, and reads
+ * the frame stats at the END of steady motion — with the world chain's real
+ * dispatch rate counted over the window, which is the receipt the rest and
+ * converged-motion cadences (§11.34, §11.36) need and `worldHz` (a target,
+ * not a count) cannot give.
+ */
+defineOp({
+  name: "profile.orbit",
+  readOnly: true,
+  description:
+    "Orbit the editor camera around its target for a few seconds FROM INSIDE THE PAGE (every frame, not a burst of jumps) and read the frame during steady motion: fps, the GPU render/compute split, how many WORLD-chain dispatches per second actually happened, how many frames the converged-motion cadence held, and the transport's rest-drive terms. The camera is restored afterwards. Use it for every under-motion A/B on a real scene; a parked read cannot see a moving frame and an MCP-driven orbit cannot read one steadily.",
+  params: {
+    seconds: { type: "number", default: 6, description: "How long to orbit (max 20)." },
+    degPerSec: { type: "number", default: 20, description: "Orbit rate about the target's vertical axis, degrees per second." },
+    phases: {
+      type: "boolean",
+      default: false,
+      description:
+        "Also capture the CPU phase breakdown (profile.cpuFrame's `phases`/`subPhases`) OVER THE MOVING FRAMES, as `cpuPhases`. A parked cpuFrame cannot see what motion adds.",
+    },
+    spikes: {
+      type: "boolean",
+      default: false,
+      description:
+        "Also run profile.spikeWatch OVER THE MOVING FRAMES (threshold `spikeThresholdMs`), as `spikes` — the frames that froze while the camera moved, each with its phase breakdown. Implies `phases`.",
+    },
+    spikeThresholdMs: { type: "number", default: 40, description: "Spike threshold for `spikes`, in ms." },
+  },
+  async run({ seconds = 6, degPerSec = 20, phases = false, spikes = false, spikeThresholdMs = 40 }) {
+    const viewport = getViewportHandle();
+    if (!viewport?.camera) throw new Error("No viewport is open.");
+    const stats = engine?.stats;
+    if (!stats?.sample) throw new Error("No engine stats.");
+    const sys = engine.modules?.get?.("gi")?.system ?? null;
+    const secs = Math.max(1, Math.min(20, Number(seconds) || 6));
+    const rate = Number(degPerSec) || 20;
+    const cam = viewport.camera;
+    const target = viewport.orbit?.target?.clone() ?? cam.position.clone().add(cam.getWorldDirection(new cam.position.constructor()).multiplyScalar(10));
+    const start = cam.position.clone();
+    const rel = start.clone().sub(target);
+    let frames = 0;
+    let worldDispatches = 0;
+    let motionRestFrames = 0;
+    let lastWorld = sys?._srcWorldLastDispatchFrame ?? null;
+    const chains0 = sys?._srcWorldChains ?? 0;
+    // Which GI passes actually dispatch while moving, per second — the
+    // moving GPU budget is these rates times profile.giPasses' per-dispatch
+    // ms, and a parked giPasses cannot see the cadence (held chains, the
+    // reflection stride, the world rate) that motion sets.
+    let lastLog = null;
+    const tally = new Map();
+    const groupOf = (name) => String(name).replace(/^src:/, "").replace(/#\d+$/, "");
+    const t0 = performance.now();
+    let cpuPhases = null;
+    await new Promise((resolve) => {
+      const step = () => {
+        const t = (performance.now() - t0) / 1000;
+        // Arm the phase capture once the motion is steady (the first half
+        // second is the EMA settling and the first world wake), and stop it
+        // with the orbit so the means are over moving frames only.
+        if ((phases || spikes) && cpuPhases === null && t >= 0.5 && stats.beginPhaseCapture) {
+          // The spike watch IS a phase capture with a per-frame ledger on top,
+          // so with `spikes` it serves both reads; its window closes with
+          // the orbit.
+          if (spikes && stats.beginSpikeWatch) {
+            stats.beginSpikeWatch({ seconds: Math.max(0.5, secs - 0.5), thresholdMs: Math.max(5, Number(spikeThresholdMs) || 40), keep: 30 });
+          } else {
+            stats.beginPhaseCapture(100_000);
+          }
+          cpuPhases = false;
+        }
+        if (t >= secs) return resolve();
+        const a = (rate * Math.PI / 180) * t;
+        const c = Math.cos(a), s = Math.sin(a);
+        cam.position.set(target.x + rel.x * c - rel.z * s, start.y, target.z + rel.x * s + rel.z * c);
+        if (viewport.orbit) { viewport.orbit.target.copy(target); viewport.orbit.update(); }
+        else cam.lookAt(target);
+        frames++;
+        const w = sys?._srcWorldLastDispatchFrame ?? null;
+        if (w != null && w !== lastWorld) { worldDispatches++; lastWorld = w; }
+        const log = sys?._giDispatchedLastFrame ?? null;
+        if (Array.isArray(log) && log !== lastLog) {
+          lastLog = log;
+          for (const n of log) { const g = groupOf(n); tally.set(g, (tally.get(g) ?? 0) + 1); }
+        }
+        if (sys?._srcWorldMotionRest === true) motionRestFrames++;
+        requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+    });
+    const r = stats.sample();
+    let spikeWatch = null;
+    if (cpuPhases === false && stats.endPhaseCapture) {
+      stats.endPhaseCapture();
+      cpuPhases = stats.readPhaseCapture();
+      if (spikes && stats.readSpikeWatch) spikeWatch = stats.readSpikeWatch();
+    }
+    const hold = sys ? {
+      worldHz: sys._srcWorldHzLive ?? null,
+      worldRested: sys._srcWorldRested ?? null,
+      worldMotionRest: sys._srcWorldMotionRest ?? null,
+      worldStaggered: sys._srcWorldStaggerCount ?? null,
+      worldSplit: sys._srcWorldSplitOn ?? null,
+      worldChainsPerSec: sys._srcWorldChains != null ? +(((sys._srcWorldChains - (chains0 ?? 0)) / secs).toFixed(1)) : null,
+      restTerms: globalThis.__giSrcRestTermsLive ?? null,
+    } : null;
+    // Restore the view.
+    cam.position.copy(start);
+    if (viewport.orbit) { viewport.orbit.target.copy(target); viewport.orbit.update(); }
+    else cam.lookAt(target);
+    return {
+      seconds: secs,
+      degPerSec: rate,
+      frames,
+      fps: +(frames / secs).toFixed(1),
+      fpsStats: Math.round(r.fps),
+      gpuMs: +(r.gpuMs > 0 ? r.gpuMs : r.renderMs).toFixed(2),
+      gpuRenderMs: +(r.gpuRenderMs ?? 0).toFixed(2),
+      gpuComputeMs: +(r.gpuComputeMs ?? 0).toFixed(2),
+      cpuMs: +(r.workMs || r.frameMs).toFixed(2),
+      worldDispatches,
+      worldDispatchesPerSec: +(worldDispatches / secs).toFixed(1),
+      motionRestFrames,
+      ...hold,
+      dispatchesPerSec: Object.fromEntries([...tally].sort((a, b) => b[1] - a[1]).map(([g, n]) => [g, +(n / secs).toFixed(1)])),
+      ...(cpuPhases ? { cpuPhases } : {}),
+      ...(spikeWatch ? { spikes: spikeWatch } : {}),
+      note:
+        "Read during steady motion (the EMA settles in ~0.5 s). `worldDispatchesPerSec` is the world chain's REAL rate over the window — 30 = every frame at 30 fps, ~15 = the rest cadence held under motion. `gpuComputeMs` is the GI chains; `gpuRenderMs` the raster.",
+    };
+  },
+});
+
+/**
+ * §11.39 — WHICH SURFACES ARE WHITE, AND WHY. A reflection hit is coloured by
+ * the per-slot palette (`resolveMaterialSurface`: constant colour × the map's
+ * mean, the map found on `.map` or inside `colorNode`) unless the slot has an
+ * atlas tile. A slot whose palette colour is near white is a white object in
+ * every reflection that lands on it. This lists them with the material facts
+ * that decide the colour, so "some meshes appear white in the reflections"
+ * becomes a list of names and one cause each.
+ */
+defineOp({
+  name: "profile.giSurfaces",
+  readOnly: true,
+  description:
+    "List the GI surface slots whose palette colour (what a reflection hit and a bounce read for that mesh) is near WHITE, with the material facts behind each: map present, map compressed (its mean comes from the GPU averager and is white until it lands), colour node present and whether a constant colour or a texture could be read out of it. Also the palette's luma histogram. Use it for 'some meshes appear white in the reflections'.",
+  params: {
+    minLuma: { type: "number", default: 0.85, description: "Report slots whose palette colour luma is at or above this (linear)." },
+    limit: { type: "number", default: 60, description: "Max rows." },
+  },
+  run({ minLuma = 0.85, limit = 60 } = {}) {
+    const sys = engine.modules?.get?.("gi")?.system ?? null;
+    const entries = sys?.state?.entries;
+    if (!Array.isArray(entries)) throw new Error("No GI state entries (GI not built yet).");
+    const hist = { "<0.2": 0, "0.2-0.5": 0, "0.5-0.85": 0, ">=0.85": 0 };
+    const rows = [];
+    const byMaterial = new Map();
+    for (const e of entries) {
+      const c = e?.surface?.color;
+      if (!c) continue;
+      const luma = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+      hist[luma < 0.2 ? "<0.2" : luma < 0.5 ? "0.2-0.5" : luma < 0.85 ? "0.5-0.85" : ">=0.85"]++;
+      if (luma < minLuma) continue;
+      const mesh = e.mesh;
+      const material = Array.isArray(mesh?.material) ? mesh.material[0] : mesh?.material;
+      const map = material?.map ?? null;
+      const graphTex = material?.colorNode ? textureValueOf(material.colorNode) : null;
+      const tex = map ?? graphTex;
+      const key = material?.uuid ?? "?";
+      const row = byMaterial.get(key);
+      if (row) { row.meshes++; continue; }
+      byMaterial.set(key, {
+        mesh: mesh?.name ?? "?",
+        meshes: 1,
+        material: material?.name || material?.type || "?",
+        materialType: material?.type ?? "?",
+        palette: { r: +c.r.toFixed(3), g: +c.g.toFixed(3), b: +c.b.toFixed(3), luma: +luma.toFixed(3) },
+        classicColor: material?.color ? { r: +material.color.r.toFixed(3), g: +material.color.g.toFixed(3), b: +material.color.b.toFixed(3) } : null,
+        hasMap: !!map,
+        graphTexture: !!graphTex,
+        textureName: tex?.name || tex?.source?.data?.src?.split?.("/")?.pop?.() || null,
+        textureCompressed: !!tex?.isCompressedTexture,
+        textureLoaded: !!(tex?.image && (tex.image.width > 0 || tex.isCompressedTexture)),
+        colorNode: material?.colorNode ? (material.colorNode.nodeType ?? material.colorNode.constructor?.name ?? "node") : null,
+        colorNodeConstant: material?.colorNode ? constantColorOf(material.colorNode) : null,
+        emissive: e.surface?.emissive ? +(0.2126 * e.surface.emissive.r + 0.7152 * e.surface.emissive.g + 0.0722 * e.surface.emissive.b).toFixed(3) : 0,
+        promoted: !!e.promoted,
+      });
+    }
+    for (const row of byMaterial.values()) rows.push(row);
+    rows.sort((a, b) => b.meshes - a.meshes);
+    return {
+      entries: entries.length,
+      lumaHistogram: hist,
+      whiteMaterials: rows.length,
+      rows: rows.slice(0, Math.max(1, Math.min(200, Math.round(limit)))),
+      note:
+        "A row is one MATERIAL (meshes = how many entries share it). `palette` is what reflections/bounce read. Likely causes: a compressed map whose GPU mean never landed (textureCompressed true, palette white), a colour node whose texture/constant could not be read (colorNode set, graphTexture false, colorNodeConstant null), or a genuinely white material.",
     };
   },
 });

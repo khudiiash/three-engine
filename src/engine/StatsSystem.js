@@ -108,6 +108,7 @@ export const PHASES = [
   "coreSystems",     // time, cameraImpulse, tweens, debug, decals, pool, paths
   "scripts",         // update + lateUpdate callbacks
   "audio",
+  "matrixWorld",     // the frame's ONE scene matrix walk (Engine #tick); the renders skip theirs
   "batching",        // BatchingSystem.sync
   "merging",         // MergeSystem.sync
   "impostors",
@@ -358,6 +359,7 @@ export class StatsSystem {
     this._spikeSubBase = new Map();
     this._spikeFrameStart = performance.now();
     this._spikeStart = this._spikeFrameStart;
+    this._gpuSeries = [];
   }
 
   /** True once the armed spike watch has run its full window. */
@@ -374,12 +376,24 @@ export class StatsSystem {
       .slice()
       .sort((a, b) => b.ms - a.ms)
       .slice(0, this._spikeKeep ?? 12);
+    const g = this._gpuSeries ?? [];
+    const gpuFrames = g.length
+      ? {
+          resolved: g.length,
+          meanMs: +(g.reduce((s, v) => s + v, 0) / g.length).toFixed(1),
+          maxMs: Math.max(...g),
+          over40: g.filter((v) => v >= 40).length,
+          under12: g.filter((v) => v < 12).length,
+          series: g.slice(-80),
+        }
+      : null;
     return {
       frames: this._spikeFrames ?? 0,
       thresholdMs: this._spikeThresholdMs ?? 0,
       spikeCount: this._spikes?.length ?? 0,
       worstMs: +(this._spikeWorstMs ?? 0).toFixed(1),
       spikes,
+      gpuFrames,
     };
   }
 
@@ -444,6 +458,27 @@ export class StatsSystem {
     }
     this._subName = name;
     this._subLast = now;
+  }
+
+  /**
+   * Stops an armed capture where it stands; `readPhaseCapture` then reports
+   * the frames collected so far. For a capture whose window is set by
+   * something other than a frame count (profile.orbit's motion window).
+   */
+  endPhaseCapture() {
+    if (!this._phaseArmed) return;
+    this.markSub(null);
+    this._phaseArmed = false;
+  }
+
+  /** The phase the tick is in right now, by name (for sub-marks that want a per-phase key). */
+  currentPhaseName() {
+    return this._phaseIndex >= 0 ? PHASES[this._phaseIndex] : "none";
+  }
+
+  /** The open sub-mark's name, or null — so a nested mark can put the outer one back. */
+  currentSubName() {
+    return this._subName ?? null;
   }
 
   /** True once the armed capture has collected every frame it asked for. */
@@ -530,9 +565,27 @@ export class StatsSystem {
    * smoothed (same EMA constant as FPS) because per-pass timestamps are
    * noisy frame-to-frame even on a static scene.
    */
-  recordGpuMs(ms) {
+  recordGpuMs(ms, renderMs = 0, computeMs = 0) {
+    // While a spike watch is armed keep the RAW per-resolve GPU time too: a
+    // frame the CPU phases cannot explain is the main thread waiting on the
+    // GPU, and only the unsmoothed series shows the alternation (one frame
+    // carrying every heavy GI chain, the next almost none).
+    if (this._spikeUntil) {
+      (this._gpuSeries ??= []).push(+ms.toFixed(1));
+      if (this._gpuSeries.length > 2000) this._gpuSeries.splice(0, 1000);
+    }
     const prev = this.readout.gpuMs;
     this.readout.gpuMs = prev === 0 ? ms : FPS_EMA_ALPHA * ms + (1 - FPS_EMA_ALPHA) * prev;
+    // §18: the same frame split into its RENDER half (scene draw, prepasses,
+    // post) and its COMPUTE half (the GI chains). `profile.giPasses` prices
+    // passes in isolation and cannot see what a MOVING frame dispatches;
+    // this split can, every frame.
+    const ema = (key, v) => {
+      const p = this.readout[key] ?? 0;
+      this.readout[key] = p === 0 ? v : FPS_EMA_ALPHA * v + (1 - FPS_EMA_ALPHA) * p;
+    };
+    ema("gpuRenderMs", renderMs);
+    ema("gpuComputeMs", computeMs);
   }
 
   /**

@@ -356,7 +356,7 @@
         const compare = (label, gpu, cpu, tol) => {
           let worst = 0;
           let worstAt = -1;
-          for (let i = 0; i < N_HITS; i++) {
+          for (let i = 0; i < gpu.length; i++) {
             for (let k = 0; k < 3; k++) {
               const e = relErr(gpu[i][k], cpu[i][k]);
               if (e > worst) { worst = e; worstAt = i; }
@@ -396,6 +396,74 @@
         }, { albedo: compensatedAlbedo });
         compare("analytic sun chroma compensation matches the CPU mirror",
           gpuChromaCompensated, cpuChromaCompensated.values, 2e-4);
+        // Exercise the owning-cascade gain selection in the REAL [J] pass.
+        // Calling createSrcHitShader with a hand-picked gain cannot catch a
+        // caller that starts c0 at 1 while the reconstruction requires 1.18.
+        {
+          const D = await import("/src/modules/gi/srcDeposit.js");
+          const J = await import("/src/modules/gi/srcSecondary.js");
+          const store = {
+            blockTotal: cfg.CASCADE_COUNT,
+            cascades: Array.from({ length: cfg.CASCADE_COUNT }, (_, cascade) => ({
+              cascade, blockCapacity: 1, blockBase: cascade,
+              probeBase: cascade, probeCapacity: 1,
+            })),
+          };
+          const albedos = [[0.8, 0.3, 0.3], [0.3, 0.3, 0.3]];
+          const capacity = cfg.CASCADE_COUNT * albedos.length;
+          const bins = D.createSrcBinStore(store, { secondaryCapacity: capacity });
+          const words = bins.scratch.value.array;
+          const floats = new Float32Array(words.buffer);
+          words[bins.hitListBase] = capacity;
+          const slots = [];
+          const expected = [];
+          for (const cascade of bins.cascades) {
+            for (let a = 0; a < albedos.length; a++) {
+              const index = cascade.cascade * albedos.length + a;
+              const entry = bins.hitListBase + 1 + index * D.SEC_HIT_WORDS;
+              const slot = (cascade.binBase + a) * cfg.BIN_WORDS;
+              words[entry + D.SEC_SLOT] = slot;
+              words[entry + D.SEC_RAY] = index;
+              floats.set([0, 1, 0], entry + D.SEC_N);
+              floats.set(albedos[a], entry + D.SEC_RHO);
+              floats[entry + D.SEC_EMITTER] = -1;
+              words[slot + D.BIN_COUNT] = D.DEPOSIT_SCALE;
+              slots.push(slot);
+              const cpu = ref.makeHitShader({
+                surfaceAt: () => ({
+                  position: [0, 0, 0], normal: [0, 1, 0],
+                  albedo: albedos[a], emissive: [0, 0, 0], emitter: -1,
+                }),
+                sun: { direction: [0, 1, 0], irradiance: [3, 3, 3] },
+                sunGain: cfg.sunBounceGainForCascade(cascade.cascade),
+                sunChromaGain: cfg.sunBounceChromaGainForCascade(cascade.cascade),
+              });
+              expected.push(cpu({}, [0, -1, 0], index));
+            }
+          }
+          const ceiling = 8;
+          const secondary = J.createSrcSecondaryFrame(store, bins, {
+            shade: S.createSrcHitLighting({
+              sun: { direction: vec3(0, 1, 0), irradiance: vec3(3) },
+              sunCompensation: true,
+              voxelSize: VOXEL,
+            }),
+            bounce: false, sunBounceCompensation: true, capacity,
+            spacing0: float(0.35), camera: vec3(0), anchor: vec3(0),
+            lmax: float(ceiling),
+          });
+          await renderer.computeAsync(secondary.pass);
+          const shadedWords = new Uint32Array(await renderer.getArrayBufferAsync(bins.scratch.value));
+          const actual = slots.map((slot) => [D.BIN_R, D.BIN_G, D.BIN_B]
+            .map((channel) => shadedWords[slot + channel] * ceiling / D.DEPOSIT_SCALE));
+          compare("[J] selects c0..c3 sunlight gains for colored and neutral surfaces",
+            actual, expected, 1e-3);
+          check("c0 restores chroma while preserving the neutral part",
+            actual[0][0] > actual[0][1] + 0.55 && Math.abs(actual[0][1] - actual[1][1]) < 1e-4,
+            `c0 colored ${actual[0].map((v) => v.toFixed(4))}; neutral ${actual[1].map((v) => v.toFixed(4))}`);
+          secondary.dispose();
+          bins.dispose();
+        }
         check(
           "the fixture is not trivially zero — something is actually being shaded",
           cpuPlain.values.filter((v) => luma(v) > 1e-6).length > N_HITS * 0.7,

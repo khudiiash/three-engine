@@ -35,14 +35,28 @@ import {
   lodShells,
   probeSpacing,
   MAX_LOOP_ALBEDO,
+  PARENT_FILL_CONFIDENCE,
+  confidenceArmed,
+  farPriorArmed,
+  centroidArmed,
+  inpaintArmed,
 } from "./srcConfig.js";
 import {
   KEY_EMPTY,
+  binAreaCentroid,
+  binAreaMean,
   binCosineWeights,
   binMorton,
+  binUnmorton,
+  centroidBlend,
+  decodeCentroidOffset,
+  encodeCentroidOffset,
+  luminanceOf,
+  octahedralDirection,
   cellPosition,
   dirToBin,
   hashKey,
+  inpaintBins,
   influxWordFor,
   keyWorldCell,
   latticeOriginCellFor,
@@ -50,6 +64,7 @@ import {
   nearestCell,
   octahedralBorderMap,
   gatherNormalWeightExp,
+  gatherPlaneFloor,
   gatherPlaneDepth,
   gatherNormalBias,
   gatherSmoothWeights,
@@ -129,7 +144,7 @@ export function latticeOrigin(cfg, cascade, lod) {
  * Identity under the anchor-relative keying, so every call site reads the
  * same either way.
  */
-function keyCellFor(cfg, cascade, lod, cx, cy, cz) {
+export function keyCellFor(cfg, cascade, lod, cx, cy, cz) {
   if (!worldKeysEnabled()) return [cx, cy, cz];
   const s = probeSpacing(cascade, lod, cfg.spacing0);
   const o = latticeOriginCellFor(cfg.anchor[0], cfg.anchor[1], cfg.anchor[2], s);
@@ -639,16 +654,25 @@ export function mergeCascades(cfg, built, resolved) {
     for (let m = 0; m < n; m++) {
       const self = resolved[top][i][m];
       if (!self) continue;
+      // §11.26: `cfg.farField` (radiance, [r,g,b]) is the prior of last resort;
+      // absent (every fixture) the twin shrinks toward nothing, like the GPU
+      // before the far-field texture is primed.
+      const far = farPriorArmed() && confidenceArmed() && Array.isArray(cfg.farField) ? cfg.farField : null;
+      const sc = far ? Math.min(1, Math.max(0, self.confidence ?? 1)) : 1;
+      const closed = [
+        self.radiance[0] + self.transmittance * cfg.sky[0],
+        self.radiance[1] + self.transmittance * cfg.sky[1],
+        self.radiance[2] + self.transmittance * cfg.sky[2],
+      ];
       out[m] = {
-        radiance: [
-          self.radiance[0] + self.transmittance * cfg.sky[0],
-          self.radiance[1] + self.transmittance * cfg.sky[1],
-          self.radiance[2] + self.transmittance * cfg.sky[2],
-        ],
+        radiance: far
+          ? [closed[0] * sc + far[0] * (1 - sc), closed[1] * sc + far[1] * (1 - sc), closed[2] * sc + far[2] * (1 - sc)]
+          : closed,
         // Transmittance is CONSUMED by the sky composite — nothing above the
         // last cascade can still be occluded, so leaving it non-zero would let
         // a caller composite the sky a second time.
         transmittance: 0,
+        confidence: self.confidence ?? 1,
       };
     }
     void probe;
@@ -667,6 +691,11 @@ export function mergeCascades(cfg, built, resolved) {
         probe.position[0], probe.position[1], probe.position[2],
         origin[0], origin[1], origin[2], s,
       );
+      // §11.28: the bin widths of the own and parent grids, for the centroid
+      // fallbacks (a bin carrying no centroid sits at its own centre).
+      const cenOn = centroidArmed();
+      const wOwn = binGridWidth(c, cfg.w0);
+      const wPar = binGridWidth(parentCascade, cfg.w0);
       for (let m = 0; m < n; m++) {
         const self = resolved[c][i][m];
         if (!self) continue;
@@ -684,6 +713,7 @@ export function mergeCascades(cfg, built, resolved) {
         // direction's radiance, which reads as a hue rotation that survives
         // every energy check. The furnace arm catches it only because a
         // furnace is direction-independent everywhere except at the seams.
+        const armed = confidenceArmed();
         const gathered = sparseGather(
           corners,
           (cx, cy, cz) => {
@@ -691,39 +721,89 @@ export function mergeCascades(cfg, built, resolved) {
               ...keyCellFor(cfg, parentCascade, probe.lod, cx, cy, cz));
             const slot = built.cascades[parentCascade].find(key);
             if (slot < 0) return null;
-            return preAverageChildBins(merged[parentCascade][slot], m);
+            return preAverageChildBins(merged[parentCascade][slot], m, cenOn ? wPar : null);
           },
           (acc, v, weight) => {
-            acc.r += v.radiance[0] * weight;
-            acc.g += v.radiance[1] * weight;
-            acc.b += v.radiance[2] * weight;
-            acc.t += v.transmittance * weight;
+            // §11.25: the corner's weight carries its confidence (srcMerge's
+            // `wc`); `acc.w` is the confidence-weighted total the GPU divides by.
+            const cc = armed ? (v.confidence ?? 1) : 1;
+            const w = weight * (armed ? Math.max(cc, 1e-4) : 1);
+            acc.r += v.radiance[0] * w;
+            acc.g += v.radiance[1] * w;
+            acc.b += v.radiance[2] * w;
+            acc.t += v.transmittance * w;
+            acc.c += cc * w;
+            acc.w += w;
+            if (cenOn && v.o) {
+              acc.mx += v.o[0] * w;
+              acc.my += v.o[1] * w;
+              acc.mz += v.o[2] * w;
+            }
             return acc;
           },
-          () => ({ r: 0, g: 0, b: 0, t: 0 }),
+          () => ({ r: 0, g: 0, b: 0, t: 0, c: 0, w: 0, mx: 0, my: 0, mz: 0 }),
         );
         if (!gathered) {
           // No parent probe existed. NOT a black vote — the bin keeps its own
           // interval and stays transparent above it, so temporal accumulation
           // can fill it in later frames. A fixed-radius fallback here is
           // exactly the cliff R1 forbids.
-          out[m] = { radiance: self.radiance.slice(), transmittance: self.transmittance };
+          // §11.26: shrunk toward the far-field mean by `1 − c` when a prior is
+          // supplied — the GPU's orphan branch, mirrored.
+          const far = farPriorArmed() && armed && Array.isArray(cfg.farField) ? cfg.farField : null;
+          if (far) {
+            const cc = Math.min(1, Math.max(0, self.confidence ?? 1));
+            out[m] = {
+              radiance: [
+                self.radiance[0] * cc + far[0] * (1 - cc),
+                self.radiance[1] * cc + far[1] * (1 - cc),
+                self.radiance[2] * cc + far[2] * (1 - cc),
+              ],
+              transmittance: self.transmittance * cc,
+              confidence: self.confidence ?? 1,
+            };
+          } else {
+            out[m] = { radiance: self.radiance.slice(), transmittance: self.transmittance, confidence: self.confidence ?? 1 };
+          }
           continue;
         }
-        const inv = 1 / gathered.weight;
+        const inv = 1 / gathered.value.w;
         const parentL = [
           gathered.value.r * inv,
           gathered.value.g * inv,
           gathered.value.b * inv,
         ];
         const parentT = gathered.value.t * inv;
+        const parentC = gathered.value.c * inv;
+        // §11.25: own interval shrunk toward "look through me" by confidence —
+        // `L' = c·L`, `T' = 1 − c + c·T` — then the parent composited through
+        // it, exactly as srcMerge's ladder does.
+        const sc = armed ? (self.confidence ?? 1) : 1;
+        const ownL = [self.radiance[0] * sc, self.radiance[1] * sc, self.radiance[2] * sc];
+        const ownT = 1 - sc + sc * self.transmittance;
+        // §11.28: the merged centroid offset — srcMerge's `oOut`, then the
+        // same signed-byte quantisation the GPU's payload applies (in the
+        // own bin's tangent frame), so the bake twins read the same offset.
+        let offset;
+        if (cenOn) {
+          const { i: bi, j: bj } = binUnmorton(m);
+          const centre = binAreaCentroid(bi, bj, wOwn);
+          const lumOut = Math.max(0, luminanceOf([
+            ownL[0] + ownT * parentL[0], ownL[1] + ownT * parentL[1], ownL[2] + ownT * parentL[2],
+          ]));
+          const k = lumOut > 0 ? (ownT * inv) / lumOut : 0;
+          const o = [gathered.value.mx * k, gathered.value.my * k, gathered.value.mz * k];
+          offset = decodeCentroidOffset(encodeCentroidOffset(o, centre), centre);
+        }
         out[m] = {
           radiance: [
-            self.radiance[0] + self.transmittance * parentL[0],
-            self.radiance[1] + self.transmittance * parentL[1],
-            self.radiance[2] + self.transmittance * parentL[2],
+            ownL[0] + ownT * parentL[0],
+            ownL[1] + ownT * parentL[1],
+            ownL[2] + ownT * parentL[2],
           ],
-          transmittance: self.transmittance * parentT,
+          transmittance: ownT * parentT,
+          confidence: armed ? Math.min(1, sc + (1 - sc) * parentC * PARENT_FILL_CONFIDENCE) : 1,
+          offset,
         };
       }
       return out;
@@ -748,9 +828,17 @@ function mortonToBinPair(m) {
  * consumes (paper §6). Exposed so the Phase-0 suite can check the 4→1
  * contiguity claim against `binMorton` directly.
  */
-export function preAverageChildBins(values, parentMorton) {
+export function preAverageChildBins(values, parentMorton, wParent = null) {
   const base = parentMorton * 4;
-  return preAverage([values[base], values[base + 1], values[base + 2], values[base + 3]]);
+  const kids = [values[base], values[base + 1], values[base + 2], values[base + 3]];
+  if (wParent == null) return preAverage(kids);
+  // §11.28: the four children's area mean vectors — the centres their
+  // offsets are relative to, and the sub-bin information itself.
+  const centres = kids.map((_, k) => {
+    const { i, j } = binUnmorton(base + k);
+    return binAreaMean(i, j, wParent);
+  });
+  return preAverage(kids, centres);
 }
 
 // ══════════════════════════════════════════════════════ [H] IRRADIANCE BAKE
@@ -844,13 +932,18 @@ export function bakeProbeIrradiance(cfg, built, merged, cascade = 0, interior = 
   const texels = interior * interior;
   const cosTable = binCosineWeights(w, interior);
   const sky = cfg.sky ?? [0, 0, 0];
+  // §11.28: the correction rides the bin's MEAN clamped cosine (the table's
+  // units) — see srcTiles' bake for why there is no solid-angle factor.
+  const cenOn = centroidArmed();
   const tiles = [];
   for (let i = 0; i < built.cascades[cascade].probes.length; i++) {
-    const values = merged[cascade][i];
+    // §11.27: the GPU inpaints the merged payload before the bake reads it.
+    const values = inpaintArmed() && confidenceArmed() ? inpaintBins(merged[cascade][i], w) : merged[cascade][i];
     const tile = new Float32Array(size * size * 3);
     for (let v = 0; v < interior; v++) {
       for (let u = 0; u < interior; u++) {
         const t = v * interior + u;
+        const nrm = cenOn ? octahedralDirection(u, v, interior) : null;
         let wr = 0;
         let sr = 0;
         let sg = 0;
@@ -858,9 +951,20 @@ export function bakeProbeIrradiance(cfg, built, merged, cascade = 0, interior = 
         for (let m = 0; m < nBins; m++) {
           const value = values[m];
           if (!value) continue; // unknown bin — excluded, never voted black
-          const cw = cosTable[m * texels + t];
-          if (!(cw > 0)) continue;
+          const cwRaw = cosTable[m * texels + t];
+          if (!(cwRaw > 0)) continue;
+          // §11.25: `cw · c` — the bin fades into the lobe with its confidence.
+          const cw = cwRaw * (confidenceArmed() ? Math.max(0, value.confidence ?? 1) : 1);
           wr += cw;
+          // §11.28: the cosine is spent at the bin's radiance centroid — the
+          // GPU bake's `wL`, same formula, same zero offset by default.
+          let wL = cw;
+          if (cenOn && value.offset) {
+            const o = value.offset;
+            const dO = nrm[0] * o[0] + nrm[1] * o[1] + nrm[2] * o[2];
+            const s = centroidBlend(cwRaw);
+            wL = Math.max(0, cwRaw + dO * s) * (confidenceArmed() ? Math.max(0, value.confidence ?? 1) : 1);
+          }
           // ── L + T·sky, AND IT IS CORRECT IN BOTH CASES IT CAN MEET ───────
           //
           // `mergeCascades` composites the sky ONCE at the top and multiplies
@@ -874,9 +978,9 @@ export function bakeProbeIrradiance(cfg, built, merged, cascade = 0, interior = 
           // on the smoke scene — not a rounding difference. Adding it changes
           // nothing for a fully merged field, which is why every existing
           // furnace arm is unaffected.
-          sr += (value.radiance[0] + value.transmittance * sky[0]) * cw;
-          sg += (value.radiance[1] + value.transmittance * sky[1]) * cw;
-          sb += (value.radiance[2] + value.transmittance * sky[2]) * cw;
+          sr += (value.radiance[0] + value.transmittance * sky[0]) * wL;
+          sg += (value.radiance[1] + value.transmittance * sky[1]) * wL;
+          sb += (value.radiance[2] + value.transmittance * sky[2]) * wL;
         }
         const o = ((v + 1) * size + (u + 1)) * 3;
         if (wr > 0) {
@@ -927,7 +1031,7 @@ export function bakeProbeCoverage(cfg, built, merged, cascade = 0, interior = IR
   const cosTable = binCosineWeights(w, interior);
   const tiles = [];
   for (let i = 0; i < built.cascades[cascade].probes.length; i++) {
-    const values = merged[cascade][i];
+    const values = inpaintArmed() && confidenceArmed() ? inpaintBins(merged[cascade][i], w) : merged[cascade][i];
     const tile = new Float32Array(size * size);
     for (let v = 0; v < interior; v++) {
       for (let u = 0; u < interior; u++) {
@@ -960,7 +1064,9 @@ export function bakeProbeCoverage(cfg, built, merged, cascade = 0, interior = IR
           const cw = cosTable[m * texels + t];
           if (!(cw > 0)) continue;
           all += cw;
-          if (values[m]) known += cw;
+          // §11.25: the confidence-weighted fraction, mirroring the GPU's
+          // `Σ cw·c / Σ cw`.
+          if (values[m]) known += cw * (confidenceArmed() ? Math.max(0, values[m].confidence ?? 1) : 1);
         }
         tile[(v + 1) * size + (u + 1)] = globalThis.__giTileCoverFraction === false
           ? (known > 0 ? 1 : 0)
@@ -1107,7 +1213,7 @@ export function gatherPixel(cfg, built, tiles, position, normal, interior = IRRA
         const pd = dx * normal[0] + dy * normal[1] + dz * normal[2];
         const t = Math.min(1, Math.max(0, pd / Math.min(0.35 * s, gatherPlaneDepth()) + 1));
         const oneSided = t * t * (3 - 2 * t);
-        c.weight *= Math.max(1e-3, nwExp === 1 ? oneSided : oneSided ** nwExp);
+        c.weight *= Math.max(gatherPlaneFloor(), nwExp === 1 ? oneSided : oneSided ** nwExp);
       }
     }
     const gathered = sparseGather(

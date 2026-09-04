@@ -176,6 +176,7 @@ import { chebyshev, lodAtDistance, packNormal } from "./srcMathTsl.js";
 import { SLOT_EMPTY } from "./srcProbes.js";
 import { createSrcScreenGather } from "./srcScreenGather.js";
 import { clampLoopAlbedo } from "./srcShade.js";
+import { MAX_LOOP_ALBEDO } from "./srcConfig.js";
 import { STAT_SEC_LOD_BASE, STAT_SEC_LOD_LEVELS, STAT_SEC_LOD_MOVER_ROW, STAT_SEC_LOD_WORDS } from "./srcDeposit.js";
 
 /**
@@ -222,6 +223,10 @@ import { STAT_SEC_LOD_BASE, STAT_SEC_LOD_LEVELS, STAT_SEC_LOD_MOVER_ROW, STAT_SE
 export function createSrcSecondaryFrame(store, bins, {
   shade = null,
   bounce = true,
+  // R4's in-loop albedo ceiling (srcShade's `clampLoopAlbedo`); the build
+  // passes `loopAlbedoCeiling()` so the `__giSrcLoopAlbedo` dial reaches the
+  // one clamp that governs the fixed point.
+  maxLoopAlbedo = MAX_LOOP_ALBEDO,
   tiles = null,
   lookup = null,
   spacing0,
@@ -314,8 +319,10 @@ export function createSrcSecondaryFrame(store, bins, {
     const n = vec3(word(SEC_N + 0), word(SEC_N + 1), word(SEC_N + 2)).toVar();
     const rho = vec3(word(SEC_RHO + 0), word(SEC_RHO + 1), word(SEC_RHO + 2)).toVar();
     // SEC_RHO keeps physical direct reflectance. Only feedback needs R4's
-    // strict <1 spectral-radius bound.
-    const rhoLoop = clampLoopAlbedo(rho).albedo;
+    // strict <1 spectral-radius bound. THIS is the clamp that sets the loop's
+    // gain — [E]'s copy only feeds a counter — so the ceiling dial
+    // (`__giSrcLoopAlbedo`, srcConfig's `loopAlbedoCeiling`) must land here.
+    const rhoLoop = clampLoopAlbedo(rho, maxLoopAlbedo).albedo;
     const slot = raw(SEC_SLOT).toVar();
     const Le = vec3(word(SEC_LE + 0), word(SEC_LE + 1), word(SEC_LE + 2)).toVar();
     const emitter = word(SEC_EMITTER).toVar();
@@ -337,7 +344,9 @@ export function createSrcSecondaryFrame(store, bins, {
     // only the named analytic sun slot sees them. `slot` is already the
     // destination bin's WORD address, so this needs no record word or binding.
     const sunGain = sunBounceCompensation ? float(1).toVar() : null;
-    const sunChromaGain = sunBounceCompensation ? float(1).toVar() : null;
+    const sunChromaGain = sunBounceCompensation
+      ? float(sunBounceChromaGainForCascade(0)).toVar()
+      : null;
     if (sunGain) {
       for (let c = 1; c < bins.cascades.length; c++) {
         const startWord = bins.cascades[c].binBase * BIN_WORDS;

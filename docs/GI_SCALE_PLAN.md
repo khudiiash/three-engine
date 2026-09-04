@@ -4281,6 +4281,691 @@ match to the tracer because it WAS the tracer). The rig now clears the dev
 flags on boot and asserts the debug view is off before it shoots. Blind
 statistics, one more time: the instrument must be shown to see its subject.
 
+### 11.21 THE FLICKER IS IN PLAY MODE, THE HARNESS COULD NEVER SEE IT, AND THE LIGHT-MOTION SIGNAL WAS NOT A RATE (2026-09-04)
+
+**The user, opening the session: "we need to stabilize gi lighting. It is very
+flickery… especially when camera looks at new surfaces or goes to new places,
+or when directional light rotates changing the lit areas."** Asked where they
+see it, they answered **"both, about equally"** — edit mode and play.
+
+**FIRST: EIGHT ARMS OF NULL, AND WHY.** `probe:gi-walk` gained `PARK=1` (the
+camera welded at the pivot — every arm this file ever ran MOVED the camera, so
+no run in its history could separate a field reacting badly to a moving LIGHT
+from one reacting badly to a moving CAMERA), `SUNROT=<deg/s>` and
+`GIVIEW=indirect`. Sponza at high, pools/quality/resolution matched to the
+user's live boot line, character hidden:
+
+| arm (parked camera) | maxStep | reversals | mean step on a reversal |
+|---|---|---|---|
+| sun STILL (control) | 0.0041 | — | 25 of 540 tiles move at all |
+| sun 7°/s, composited | 0.659 | 10.7 % | 0.0030 |
+| … `irrhist` (screen filter pinned 0.9) | 0.678 | — | — |
+| … `notrack` (tracking window off) | 0.667 | — | — |
+| … `noroot` / `sunsplit` / `nochecker` | 0.618 / 0.976 / 0.719 | 14.4 / 8.4 / 6.6 % | — |
+| sun 7°/s, **indirect buffer only** | 0.119 | **4.0 %** | **0.0009 (0.19 % of mean)** |
+| … `noroot` / `nofarduty` / `nosunmap` | 0.091 / 0.068 / 0.080 | 8.0 / 4.2 / 4.5 % | — |
+
+⭐ **TWO INSTRUMENT FAULTS FOUND EN ROUTE.** (1) Sponza's day cycle is
+`LightScript.ts`, a **plain `Script`, which only ticks in PLAY mode** — so every
+"live sun" arm ever run against Sponza measured a STATIONARY sun (`shadow
+0.000` for all 154 pinned frames). The Level's `Rotator.ts` is
+`@executeInEditMode` and does turn; the two scenes had silently disagreed about
+what "unpinned sun" means. Hence `SUNROT`, which drives the light off the wall
+clock at a stated rate. (2) At 7°/s a shadow edge cast by a column 10 m away
+sweeps 1.2 m/s ≈ 10 % of a tile per frame — **the composited image is dominated
+by real direct light**, which is the 0.15 baseline in every tile-step trace and
+buries the estimator. Hence `GIVIEW=indirect`, and hence the new REVERSAL
+statistic (share of consecutive signed tile deltas whose sign flips, and the
+mean step they carry): a sun setting, a wall being revealed and light arriving
+in a room are all MONOTONE; only an estimator reverses.
+
+On the indirect buffer the field tracks a 7°/s sun with **96 % of its change
+monotone and the reversing part at 0.19 % of the image mean**, and `checker`
+does not move off its static value. **There was nothing there to fix.** Three
+sessions have now hit this wall (§11.16 was the second). That is not bad luck.
+
+**SO THE INSTRUMENT MOVED INTO THE ENGINE: `profile.flicker`** (new,
+`giFlickerWatch.js` + GISystem's `beginFlickerWatch`/`readFlickerWatch`, op in
+`profile.js`, gate `smoke:gi-flicker-watch`). A per-pixel GPU accumulator over
+the irradiance target, every rendered frame, counting sign reversals and
+one-frame step amplitude, **with the field's own dials sampled on the same
+frames** — α, stride root, far duty, the screen history weight, camera-motion
+EMA, the light term in the tracking window's own threshold units, and world Hz.
+Every previous round of this investigation had the picture and the dials in
+separate runs and had to argue across the gap. Two guards it needs and has: a
+rebuild that swaps `_giTargets` stops the window and reports `targetSwapped`
+(an accumulator on a dead texture reports a flawless absence of flicker), and
+`stillOnly` (default) counts ONLY frames where the camera did not move —
+because the counter is screen-space and an orbit puts **100 % of pixels over
+the churn threshold by parallax alone**, measured, on a field that is behaving.
+
+**THE MEASUREMENT, IN THE USER'S OWN SESSION, SAME SCENE AND CAMERA:**
+
+| window (camera still) | rev/px/frame | pixels reversing 3+ | p95 step / mean |
+|---|---|---|---|
+| edit mode, parked | 0.0004 | 5.1 % | 0.025 |
+| edit mode, after a 12 m teleport | 0.0003 | 3.5 % | 0.023 |
+| **PLAY** #1 | **0.0181** | **99.6 %** | **3.70** |
+| **PLAY** #2 | 0.0071 | 77.6 % | 0.90 |
+
+**45–150× worse in play mode on identical geometry with the camera welded.**
+Edit mode is clean because `LightScript` does not tick there — a 12 m teleport
+into unseen geometry settles inside the 30-frame warmup.
+
+⭐⭐⭐ **CAUSE 1, FIXED: THE LIGHT-MOTION SIGNAL WAS A PER-FRAME DELTA, NOT A
+RATE.** GISystem measured light motion as the change in a light's matrix
+BETWEEN TWO RENDERED FRAMES and four consumers read the result as a velocity:
+the §12.38 α ramp, the §12.65 screen history weight (`0.9·(1−mLight)` — the
+image's only smoother), the shadow/emitter history weights (`0.94 − m·30`), and
+the §12.43 window's 0.5 arm threshold. A per-frame delta is `rate × frameTime`,
+and this renderer's frame time is not constant BY DESIGN (the world chain runs
+at 30/15 Hz under a renderer at 60–120). Live receipt, on a sun turning at a
+smooth sinusoidal rate: **`lightMotion` median 0.337, max 3.451 — an 11×
+spread**, straddling a threshold set at 0.5. §12.83 predicted this straddle
+exactly, simulated it at ±12 % jitter, priced it at ~1 % of frames and declined
+to spend a unit. The live dial says the window is open on **more than half** of
+the still frames, and `histWeight` — the only smoother — has **median 0**.
+
+Shipped: (a) the delta is normalised by real frame time and expressed in units
+of one 60 fps frame, so every constant keeps its calibration and all of them
+become frame-rate independent (`__giLightMotionRate = false` reverts);
+(b) peak-held with a 100 ms exponential release, because the matrix is written
+by a script whose tick is not the GI tick and the delta ALIASES — an average
+would lag a genuine step by its whole time constant, a peak hold only fills the
+zeros (`LIGHT_MOTION_RELEASE_MS`); (c) **§12.83's novelty gate, shipped as
+designed** — each term keeps a slow baseline and arms only on
+`max(threshold, NOVELTY × its own baseline)`, so a steadily rotating sun is
+never novel against itself while a sun that starts, a teleport or a toggle
+always is, per term so the sun cannot deafen the luminance channel
+(`TRACK_BASELINE_MS` 1000, `TRACK_NOVELTY` 2.5, `__giSrcTrackNovelty = false`);
+(d) the screen history weight is **slew-limited** (0.15/frame down, 0.06 up,
+scaled by real frame time, `__giIrrHistSlew = false`) — nothing that governs
+every pixel at once may move by 0.9 in one frame, and this also smooths the
+§11.8 swap-hold release that used to expose a cold store in one step.
+
+**RECEIPT.** `lightMotion` spread **0.086–3.451 (40×) → 0.439–1.012 (2.3×)** on
+the same sun. Picture, same conditions: rev/px/frame **0.0181 / 0.0071 →
+0.0039**, churn **99.6 / 77.6 % → 55.9 %**, p95 step **3.70 / 0.90 → 0.54×** the
+image mean. The A/B that isolated it first: `__giSrcMotionTrack = false` live in
+play, two matched pairs, **5.1× on reversals and 5.2× on the p95 step**. Gates
+`test:gi-src-temporal` and `test:gi-src-deposit` green.
+
+⛔ **AND ONE UNCONTROLLED INPUT CAUGHT ITSELF.** The first "base" repeat read
+0 reversals and `lightMotion 0..0` — **play mode had stopped between windows**
+(two assistant sessions share this editor and play mode is shared state). Every
+arm since is a `batch` of `[play.set, profile.flicker, play.get]` so the arm
+carries proof it ran in the regime it claims.
+
+⭐⭐⭐ **CAUSE 2, NAMED AND NOT FIXED: THE SUN IS STORED IN THE BINS.** With the
+window neutralised, the signal honest, **α pinned to the still rate (0.02) and
+the stride root at 0**, camera welded, play mode: **62.8 % of pixels still
+reverse 3+ times and the p95 one-frame step is 0.39× the image mean** — and the
+churn is slightly WORSE than at the moving α, not better. That is `srcDeposit`'s
+own §12.82 header, verbatim: *"No rate fixes a stored quantity whose TARGET
+moves every frame."* `BIN_R/G/B` hold accumulated radiance, radiance is a
+function of the sun angle, bins refresh at wildly uneven rates (§11.17: a far
+probe sees a bin every 11 frames), so at any instant the field is a patchwork of
+different sun angles — and that patchwork rearranges itself as the bins take
+turns refreshing. It is the same mechanism for "the camera looks at new
+surfaces": the newly visible bins were last refreshed at a different sun angle
+than their neighbours.
+
+**NEXT UNIT — THE SUN SPLIT'S DELIVERY.** §12.82 built the answer (`BIN_SR/SG/SB`
+cache the sun's TRANSFER, which a rotating sun does not change; `[F]` closes it
+against the CURRENT sun every frame; "a rotating sun then invalidates NOTHING")
+and it is opt-in because the bin-level delivery is short: it removes 46–57 % of
+the picture and returns 5–24 %. Two things have changed since that verdict.
+(1) The layout was cramped into 4 words because eleven words was 123 MB against
+a **128 MiB** storage-buffer binding limit — §11.4 A2 replaced that with a
+device-scaled ceiling, and this machine reports **1024 MB per binding**, so the
+six-word form §12.82 called "the obvious form" and rejected is now affordable.
+(2) The likely defect is named by its own comment: one packed normal per bin,
+last-write-wins, closed as `max(0, n·l)`, where a bin aggregates hits spanning
+many normals — the cosine of one representative normal is not the mean of the
+cosines, and the clamp makes the error one-sided. Storing the weighted normal
+as a VECTOR and closing with `max(0, sum·l)` moves the clamp outside the sum,
+which is the aggregation the estimator actually wants.
+
+### 11.22 THE SUN SPLIT SHIPS — THE VERDICT THAT KEPT IT OFF WAS STALE, AND A SPLIT SUN'S ROTATION MUST STOP DRIVING THE FIELD (2026-09-04)
+
+**§11.21 ended with the sun-in-the-bins half open and named the sun split as
+the answer, on the record that its delivery returned 11-41 % of what it
+removed. THAT RECORD PREDATED ITS OWN FIX.** The defect behind it — the decay
+pass round-tripping the packed normal through a `select`, which zeroed the
+word every frame — was found and fixed afterwards (srcDeposit's `BIN_SN` note
+carries it, and records the normal ratio going 9 % → 52-63 %), and nobody
+re-ran the delivery measurement. srcSystem still said "IT MUST STAY OFF UNTIL
+THE DELIVERY IS WHOLE".
+
+**RE-MEASURED** (`probe:gi-walk PARK=1 SUNROT=0`, Sponza, sun pinned, camera
+welded, character hidden, four arms in ONE run so the pose and the sun angle
+are shared):
+
+| arm | tail mean luma | vs base |
+|---|---|---|
+| `base` | 0.17939 | — |
+| `sunsplit` | 0.17308 | **96.5 %** |
+| `sunsplitflatcos` (cosine forced to 1) | 0.17408 | 97.0 % |
+| `sunsplitkeep` (sun in the bins AND closed) | 0.20360 | 113.5 % |
+
+⇒ the transfer removes 0.0305 and returns 0.0242 — **79 %**, for a picture at
+96.5 % of baseline. Ledger: **73.0 % of LIT bins carry a normal** (against the
+9 % the old verdict was measured at), 47 % of hits face the sun.
+
+⛔ **AND IT REFUTED THE FIX THIS SESSION WAS ABOUT TO BUILD.** The plan was to
+replace the single last-write-wins normal with a weighted normal VECTOR (the
+"obvious form" §12.82 rejected for want of binding bytes), on the theory that
+one representative normal cannot stand in for a bin aggregating many. But
+`sunsplitflatcos` — which forces the cosine to 1 and so removes the cached
+normal from the answer entirely — lands within **0.6 %** of the honest close.
+The cosine is not where the residual goes; the **27 % of lit bins carrying no
+normal at all**, whose sun is simply dropped, is. That is the honest remaining
+3.5 %, and it is not worth four more words a bin. Measure before rewriting.
+
+**SHIPPED:**
+- `sunSplitArmed()` is now `!== false` (default ON). `srcBinCeiling` already
+  divides by `BIN_WORDS`, so the nine-word layout costs a device bins rather
+  than failing: on a 1024 MB binding the ceiling stays pinned at
+  `BIN_CEILING_MAX` and nothing shrinks, on a portable 128 MiB one it is
+  ~6.7 M → ~3.7 M bins and §10.7's `noBlock` is the instrument that would say
+  so. Stated, not buried.
+- ⭐⭐⭐ **THE COUPLING, WHICH IS WHERE THE WIN ACTUALLY COMES FROM.** A cached
+  transfer is sun-independent by construction, so a turning sun stales no
+  stored word — and every mechanism that reacts to "the light is moving" by
+  FORGETTING FASTER is now spending variance to buy nothing. The light loop
+  keeps TWO tracks: `_giShadowLastMotion` (unchanged, all lights, drives the
+  shadow and emitter history — **visibility IS still staled by a moving sun**,
+  §12.82's own "what stays stale, named so it is not misread as fixed: V") and
+  `_giFieldLightMotion` (drops a split sun's ROTATION only; drives the α ramp
+  and the screen irradiance weight). Zeroing one number for both would have
+  smeared every shadow edge. Guarded to `dirCount === 1`, because the split
+  names ONE slot and this loop cannot tell which object owns it.
+  `__giSrcSunSplitCalm = false` reverts.
+
+**RECEIPT — `profile.flicker`, the user's live play session, camera still:**
+
+| | base #1 | base #2 | §11.21 signal fix | **+ split** |
+|---|---|---|---|---|
+| rev/px/frame | 0.0181 | 0.0071 | 0.0039 | **0.0010** |
+| pixels reversing 3+ | 99.6 % | 77.6 % | 55.9 % | **13.8 %** |
+| p95 one-frame step / mean | 3.70 | 0.90 | 0.54 | **0.317** |
+| pixels moving at all | 100 % | 100 % | 99 % | **47 %** |
+
+Dials: `lightMotion` **0.000 flat** while `lightMotionVisibility` reads
+0.002-1.041 — the sun is demonstrably turning and no longer stales the field;
+α back to 0.02, root 0, `histWeight` **0.9 flat**, the tracking window never
+arms. **121 fps in play, GPU 5.95 ms — no frame-rate cost.** Gates
+`test:gi-src-deposit/shade/merge/gather/probes/temporal` and
+`smoke:gi-flicker-watch` all green on the nine-word layout.
+
+⚠ **AND ONE NEAR-MISS WORTH KEEPING.** The first post-split window read churn
+**0.2 %** — a 500× win — at `fps 27.5` against a viewport doing 121. That
+number is `dispatched / seconds`, i.e. THE GI TICK'S OWN RATE, and it was low
+because the window straddled the tail of the boot's material wave, when the
+tick is held. A field that is not advancing is perfectly calm. The honest
+repeat, once `pendingMaterials` hit 0, reads 13.8 % at 109.9 fps. **Always read
+the watch's `fps` against `profile.frameStats` before believing a good number.**
+
+**WHAT IS LEFT.** Churn 13.8 % and a p95 step of 0.317× the mean are still over
+the "few % per frame" gate — but the tile map has changed CHARACTER: it was
+uniform across the whole viewport (0.034-0.098 everywhere) and is now flat
+0.0000-0.0005 over most of the image with a cluster at 0.0073-0.0132 in the
+bottom-left/centre. That is where the animated character stands, and §11.16
+already measured that every popping tile in a live Sponza sits on the figure.
+The residual is a MOVER problem, not a sun problem, and it is the next thread.
+
+### 11.23 ⛔⛔ §11.21 AND §11.22 ARE REVERTED TO OPT-IN. EVERY MEASUREMENT SCORED STABILITY, AND A FROZEN FIELD IS STABLE (2026-09-04)
+
+**The user, on the shipped build: "i don't know what you did, but it got a lot
+worse. Flickers a lot + when light moves, lighting does not update."**
+
+All five behaviour changes are back to opt-in and the working tree behaves
+exactly as it did before this session. `__giSrcSunSplit`, `__giSrcSunSplitCalm`,
+`__giLightMotionRate`, `__giSrcTrackNovelty`, `__giIrrHistSlew` — each now
+requires `=== true`. The instrument (`profile.flicker`) stays; it is the only
+thing here that earned its place.
+
+⭐⭐⭐ **THE METHOD FAILURE, WHICH IS THE ONLY PART WORTH KEEPING.** Three
+receipts were produced and all three were true:
+
+- delivery: 96.5 % of baseline luma, **sun PINNED**;
+- flicker: churn 99.6 % → 13.8 %, p95 one-frame step 3.70× → 0.317×;
+- performance: 121 fps in play, GPU 5.95 ms.
+
+Not one of them can tell **converged** from **frozen**. A reversal counter
+rewards a picture that never changes. A pinned-sun delivery arm cannot see
+tracking, by construction — it holds the sun still on purpose. And the dials
+that looked like proof of the mechanism (`lightMotion` 0.000 flat, α 0.02,
+root 0, `histWeight` 0.9 flat) are equally the signature of a field that has
+stopped responding. **Every instrument this session built or used measured the
+absence of change, and the defect shipped was an absence of change.**
+
+⛔ **THE MECHANISM, AND IT WAS IN §12.82's OWN CAVEAT.** The cached transfer is
+`ρ/π · V`. §12.82 names `V` explicitly — *"what stays stale, named so it is not
+misread as fixed: V"* — and this session read that, quoted it in §11.22, and
+then built `sunCalm` as if it did not apply. A rotating sun re-shadows the whole
+scene; the split makes the cosine and the irradiance free, it does **not** make
+the shadow free. Removing the sun from the radiance-staleness signal set the
+refresh of the one genuinely stale half to the STILL rate — so the GI's
+shadowing stopped following the sun. That is "when light moves, lighting does
+not update", exactly.
+
+⛔ **AND THE GUARD WAS WRONG INDEPENDENTLY.** `sunCalm` tested `sunSplitArmed()`,
+which is only the build FLAG. The split actually arms only when a directional
+slot was named AND the shading is split; on any build where those fail, the sun
+still accumulated into the bins while the field was told not to forget it.
+srcSystem now publishes `__giSrcSunSplitLive = !!sunClose` and the (opt-in)
+guard reads that.
+
+⚠ **THE OTHER HALF, "FLICKERS A LOT", IS PROBABLY THE RATE NORMALISATION AND IT
+IS NOT A BUG.** Making the light signal honest makes it ~1.8× larger at 120 fps
+than the per-frame delta it replaced, which drives α and the stride root
+HARDER. The measured dials say so: α median 0.05 → 0.078, root 0.367 → 0.700.
+More correct, more variance. A fix that makes a signal truthful still has to be
+re-tuned against what consumes it, and none of that was done.
+
+**THE GATE THAT MUST EXIST BEFORE ANY OF THIS SHIPS AGAIN:** a LIGHT-RESPONSE
+receipt — time for the picture to follow a moving sun, measured on the same
+window as the flicker number, so no "stability" win can be bought with lag.
+`probe:gi-src-converge` measures t90 for a light STEP; what is missing is the
+continuous case (a sun turning at a stated deg/s, and how far behind the GI
+runs). **No stability number from this module may be believed without one
+beside it.**
+
+### 11.24 THE CORRIDOR REPRO, AND IT IS NOT THE SUN (2026-09-04)
+
+**The user, handing over the reproduction: "move camera from main area to the
+side corridor - you will see all the flicker."** Driven from MCP on the
+REVERTED build, edit mode, teleport then hold, `profile.flicker` counting only
+still frames:
+
+| | main nave | side corridor |
+|---|---|---|
+| image mean luminance | 1.2958 | **0.0941** (13.8× darker) |
+| p95 one-frame step (absolute) | 0.0967 | 0.1201 |
+| **p95 step ÷ image mean** | 0.075 | **1.277** (17×) |
+| max step ÷ image mean | 5.46 | 8.99 |
+| reversals/px/frame | 0.0017 | 0.0008 |
+
+⭐ **THE ABSOLUTE NOISE IS THE SAME IN BOTH PLACES. THE CORRIDOR IS 14× DARKER,
+SO THE SAME WOBBLE IS 128 % OF EVERYTHING ON SCREEN.** That is
+`TEMPORAL_ALPHA_STILL`'s own note, which predicted this report in as many
+words: *"in darker areas it is very flickering AT REST — the dark pixels are
+where relative variance is largest, and the still floor is the variance dial"*.
+The churn is concentrated top-left (rows 0-2, cols 1-5 of the tile grid) — the
+vault and upper walls, the darkest, farthest surfaces in frame.
+
+**The ledger at that pose** (`__giProfileProbeRays`, `profile.giPasses`):
+`raysPerFrame` **14 278** against the harness's 124 075 at the same tier (the
+rest cadence and `probeRayCap` 8), 2351 VISIBLE c0 probes at **6.07 rays each**,
+`zeroRayShare` 0.066, `cascades[0].starved` 40. That is ~0.3 rays per bin per
+frame. Cascade 2's `orphanRate` is **0.563** and `losRate` 0.257.
+`secondary.byLod[0].meanIrradianceLuma` 0.0848.
+
+**So the corridor is the §11.17 STARVED PROBE, seen in the one place where the
+mean is small enough for its variance to be the picture** — not the day cycle,
+not the tracking window, not the sun in the bins. The whole of §11.21/§11.22
+chased a mechanism that is real and is not what the user is looking at.
+⚠ Note also `alphaLive` 0.0205 and `keepLive` 0.99933 at that pose: a single
+ray can move a bin by 2 %, so a step of 128 % of the image mean is NOT the bin
+blend — it is arriving through the merge (56 % orphans at c2), the gather's
+missing corners (`meanCorners` 4.95 of 8) or the tile coverage (12.7 %). That
+is the next thing to bisect, and it should be bisected before anything is
+changed.
+
+### 11.25 UNIT 1 — NO BIN IS EVER UNKNOWN: confidence replaces the membership switch (2026-09-04)
+
+**The user, after §11.23: "of course it is not a tuning. Start."**
+
+**THE GATE CAME FIRST.** `profile.lightResponse` (new; `giFlickerWatch.js`
+`createGiTileMeanRecorder`, GISystem `beginLightResponse/readLightResponse`,
+op in `profile.js`, arm 4 of `smoke:gi-flicker-watch`): steps the scene's one
+directional light 25° about its parent's x — what the day-cycle script writes
+— records the irradiance target as a 16×9 tile grid every frame, and scores
+the distance from the SETTLED picture per frame after the step: t50, t90,
+monotone share, and `changeOfBaseline` (a step that does not reach the
+picture is a blind run, and says so). One readback, no per-frame stall, the
+same `targetSwapped` guard as the flicker watch, and the sun is restored on
+read. §11.23's rule made concrete: **no stability number from this module is
+believed without this beside it.** The first live run crashed reading `.size`
+of an unallocated buffer — the kernel had never dispatched because `uint` was
+not imported and the async compute is a silent no-op; the readback is now
+guarded and reports `pipelinePending` rather than a clean number, and the
+smoke's arm 4 is what caught it.
+
+**BASELINE, live, the reverted build (every §11.21/§11.22 hatch opt-in):**
+
+| pose | flicker (still frames) | light response (25°) |
+|---|---|---|
+| main nave | 0.0058 rev/px/f · 16.1 % churn · p95 step 0.072× mean | change 100 %, **t50 2212 ms, t90 3581 ms**, 99 % monotone |
+| side corridor | 0.0008–0.0019 · 9.7–10.5 % · **p95 step 0.77–1.28× mean** | change 110 %, **t50 685 ms, t90 3122 ms**, 96 % monotone |
+
+⭐ **A finding the gate produced on its first honest run:** in the nave the
+picture does not move AT ALL for ~2.3 s after the step (the first seven
+points of `curve` read exactly 1.000), then converges in ~1.3 s. In the
+corridor — where the field was still settling from the camera move — it
+responds on the next frame (curve 1.25 → 0.92 → 0.65 …). A converged, IDLE
+field takes over two seconds to start responding to a light change; a busy
+one responds immediately. That is a pre-existing wake-up latency (the
+converged-idle sleep / rest cadence), it is a real part of "when light moves,
+lighting does not update", and it is NOT this unit's job — but it is now a
+number, and the number must not get worse.
+
+⚠ Ordering lesson from the baseline batch itself: a flicker window taken
+right after a `lightResponse` reads the field mid-transition from the sun's
+RESTORE (corridor: α 0.038–0.1, root 0.23–0.7, 25 % churn against 10 % in a
+clean window). Settle between them, or read the earlier clean windows.
+
+**THE CHANGE.** The resolved payload grows a third word (`PAYLOAD_WORDS` 3:
+rgb, T, then CONFIDENCE `c` + a spare half). srcDeposit's resolve writes
+`c = N / (N + CONFIDENCE_PRIOR_RAYS)`, N in rays of accumulated weight — the
+posterior weight of a bin's own measurement against K = 4 pseudo-rays of the
+prior; one ray is worth 1/5 of the answer, four rays half, and there is no
+count at which anything switches. Where it is spent:
+
+- **srcMerge [G.3]**: the bin's own interval is shrunk toward "empty near
+  interval, look through me" — `L' = c·L`, `T' = 1 − c + c·T` — and the
+  parent composited through `own'` exactly as before. The 4→1 pre-average
+  weights children by `c`; a corner's weight in the sparse gather carries its
+  confidence; the merged bin's confidence is `c + (1−c)·c_parent·0.5`
+  (`PARENT_FILL_CONFIDENCE`) so a parent-filled bin is present but never
+  dominates a neighbour that measured. An orphan (no parent at all) keeps its
+  own value unshrunk — shrinking toward "empty" with nothing to fill it is a
+  pure energy loss. The top cascade's sky composite carries `c` through.
+- **srcTiles**: each bin votes `cw · c`, so `cover = Σ cw·c / Σ cw` is the
+  confidence-weighted fraction of the lobe and a freshly-hit bin FADES into
+  the texel instead of flipping it to a one-ray radiance.
+- **CPU twins** (`resolveBin`, `preAverage`, `mergeCascades`,
+  `bakeProbeIrradiance`, `bakeProbeCoverage`) mirror each step; a fixture
+  without a confidence field votes at 1, and `encodePayload` writes 1 for a
+  known bin, so every existing gate fixture means what it meant.
+- `MIN_WEIGHT`'s retire stays (block reclaim needs it); the step it used to
+  produce is gone because a bin just above it now carries c ≈ 0.004.
+- `__giSrcConfidence = false` pins c ≡ 1 everywhere — bit-identical to the
+  previous estimator; the A/B arm and the hatch.
+- `decodePayload` keeps its 4-channel `[r,g,b,T]` (three scripts index it by
+  a literal stride of 4); `decodePayloadConfidence` is the new reader.
+
+Cost: one more u32 per bin in the payload (4.2 M bins → +17 MB; `srcBinCeiling`
+already divides by `PAYLOAD_WORDS`), one more packed load in the merge and
+the tiles.
+
+**THE RECEIPTS — the user's own corridor view** (`(-6, 1.25, 3.18) → (8, 1.25,
+3.18)`; "use current editor camera position, it is correctly inside the
+corridor" — the z = 5.4 pose this session had been using was not the
+corridor), three arms in ONE session, identical protocol per arm: rebuild on
+the arm → settle → teleport from the nave → the first 5 s still (`warmupFrames`
+2) → 4 s at rest → light step from idle.
+
+| arm | arrival: rev/px/f · churn · p95 step/mean · max | at rest | light step 25° from idle |
+|---|---|---|---|
+| old estimator (`__giSrcConfidence=false`) | 0.0016 · **12.9 %** · **0.41** · 7.3 | 0.0004 · 0.9 % · 0.135 · 2.17 | change 194 %, **t50 0.74 s, t90 2.8 s**, 96 % mono |
+| Unit 1, K = 4 | 0.0069 · **54.3 %** · **0.76** · 3.9 | 0.0004 · 0.7 % · 0.075 · 2.6 | (at z 5.4: t50 2.3 s, t90 4.9 s) |
+| **Unit 1, K = 16** | **0.0005 · 0.16 % · 0.12 · 2.7** | **0.000 · 0.0 % · 0.017 · 0.045** | change 52 %, **t50 2.4 s, t90 5.3 s**, 97 % mono |
+
+Energy at the view: old 0.166–0.169, K = 16 0.171–0.177 (+5 %).
+
+**And the nave, K = 16** (bright, well-sampled): at rest 0.0007 rev/px/f ·
+3.6 % churn · p95 step 0.070× mean (baseline 0.0017–0.0058 · 12–23 % ·
+0.067–0.075; K = 4 read 0.0002 · 0.6 % · 0.036 — calmer still, but K = 4 is what
+made the corridor arrival worse); light step from idle **t50 0.42 s / t90
+1.68 s**, 97 % monotone, no dead plateau (baseline 2.2 / 3.6 s with the 2.3 s
+plateau). Harness smoke on the on-disk build: t50 2.09 s / t90 3.48 s / 98 %
+(baseline 2.30 / 3.41 / 97 %) — unchanged there. All seven SRC gates green on
+K = 16.
+
+⭐⭐⭐ **K = 4 WAS WORSE AND THE GATE SAID SO ON THE FIRST RUN.** The whole
+point of the unit is that a fresh bin fades in instead of popping; at K = 4 a
+one-ray estimate is 20 % of the answer and a four-ray one is half, and in a
+dark corridor a four-ray mean is a coin toss — 100 % of pixels moving, 54 % of
+them reversing three or more times in five seconds. At K = 16 one ray is 6 %,
+the parent carries the first dozen frames, and the same arrival reads 0.16 %
+churn with a p95 step of 12 % of the image mean. That is "light arrives
+gradually" as a number, and it is 80× less churn than the estimator the user
+has been looking at. (`__giSrcConfidenceK` is the live dial; the constant is
+what ships.)
+
+⚠ **THE TRADE, STATED BEFORE IT IS NOTICED: LIGHT RESPONSE IN SPARSE REGIONS
+IS SLOWER.** At the corridor view a 25° step settles in t50 2.4 s / t90 5.3 s
+against the old 0.7 / 2.8 s — monotone (97 %), not frozen (the curve falls
+from the first sample), and the same step in the well-sampled nave got
+FASTER (K = 4: t50 2.2 → 0.5 s, t90 3.6 → 1.7 s, and the 2.3 s dead plateau
+gone). The mechanism is an interaction with the machinery Unit 3 exists to
+retire: a light change makes the field FORGET (§12.74's root, α to 0.1), the
+counts collapse to ~1/(1−keep) ≈ 8 rays, confidence collapses with them to
+~0.3, and sparse bins hand their vote to the coarse parent — which is the
+smooth branch rather than the fast one. Under the old estimator "forget fast"
+meant "the newest rays win", which was fast AND noisy. Confidence should be a
+function of evidence, not of the decayed weight the mean happens to use; that
+is Unit 3's first line. Until then the corridor is slower to follow the sun by
+~2 s and does not flicker; the user asked for exactly that order of priorities.
+
+⚠ Also measured en route: `changeOfBaseline` 194 % → 52 % at the same view —
+the settled corridor reacts less to a 25° sun step under Unit 1, i.e. sparse
+sun-driven contrast is partly averaged into the parent. Same mechanism, same
+owner.
+
+**Instrument notes from this unit:** (1) the bridge's 30 s call limit — a
+`batch` longer than that keeps running in the editor after the client gives
+up, and its `lightResponse` steps keep stepping the sun; windows go in ≤ 25 s
+batches. (2) `lightResponse` normalised by the SETTLED sum reported a 486 %
+change when the step turned the sun off the nave floor; it now divides by the
+brighter of settled and baseline (t50/t90 never depended on it).
+(3) `viewport.setFreezeWhenUnfocused(false)` is needed for any window the
+user is not looking at, and is restored after each batch.
+
+### 11.26 UNIT 1b/1c — COLD FIRST SIGHT: the orphan kept its coin toss, and the far-field fill read confidence as absence (2026-09-04)
+
+**The user, on Unit 1: "after it settled once, it seems to be stable on a
+revisit. Though the first time I see corridor - it flickers. When even just
+stepping back with the camera, the walls around that were not visible before
+start flickering a lot."**
+
+**Every "arrival" this project had ever measured was a REVISIT.** Probes are
+RETAINED for ≥ 1800 frames after leaving view and yield only under capacity
+pressure (65 536 c0 slots against ~4 k live: never), so a teleport back into a
+corridor seen earlier lands on warm probes with converged bins. §11.25's A/B
+at the user's view was a revisit. The user's complaint is the COLD case — a
+freshly minted column whose PARENT probes are just as new — and only a field
+that has never seen the place can produce it. Hence **`probe:gi-cold-arrival`**:
+the harness boots cold by construction, converges a START view, jumps straight
+to POSE, and counts the first five seconds' still frames; then a revisit for
+contrast, then `lightResponse`, then an energy ledger (`profile.giPasses`).
+
+**Cold arrival, harness, the user's view, first 5 s:**
+
+| | churn | p95 step / mean | max | at rest | meanLum at rest |
+|---|---|---|---|---|---|
+| old estimator | **61.7 %** | 2.67 | 13.1 | 0.16 %, still converging | 0.0442 |
+| Unit 1 (K = 16) | **2.6 %** | 2.97 | 4.8 | **0.00 %, 0 % of pixels moving** | **0.0043** |
+
+The flicker win is real and large. The second column is the flag: Unit 1's
+cold corridor settles **10× darker and perfectly static**, and its converged
+START view 32 % darker (0.060 vs 0.088). Live, at the user's far brighter sun
+angle, Unit 1 had read +1–5 % — this is a dark-regime effect.
+
+⚠ **AND THE REGIME WAS NOT UNDER CONTROL.** The next cold run, an hour later,
+read the START view at meanLum **1.14** and the corridor at 0.15 — the same
+scene file, a different sun. The editor autosaves every 10 s, so the user's
+own light drags reach the disk the harness reads, and two runs an hour apart
+measured two different suns. `probe:gi-cold-arrival` now PINS the sun
+(`SUNDEG=`, the parent's `rotation.x` the day-cycle script writes) and prints
+the direction it ran under either way; the dark-regime table above is the
+authored sun (straight down, corridors bounce-lit only), the bright one is the
+user's. Both regimes are real; a fix must hold in both.
+
+**THE BRIGHT REGIME (the user's saved sun, rotation (−92°, −3°, −17°)), cold
+arrival at the user's view, first 5 s, three arms in one chain:**
+
+| | churn | p95 step / mean | max | meanLum | then at rest |
+|---|---|---|---|---|---|
+| old estimator | 19.0 % | 0.70 | 8.3 | 0.138 | 2.2 % · 0.31 · 3.8 |
+| Unit 1 alone (`__giSrcFarPrior=false`) — the build the user looked at | **38.6 %** | 1.47 | 10.9 | 0.172 | 0.5 % · 0.13 · 3.5 |
+| **Unit 1 + 1b** | **2.6 %** | 0.69 | 8.7 | 0.154 | **0.04 % · 0.07 · 1.1** |
+
+⭐⭐⭐ **THAT MIDDLE ROW IS THE USER'S REPORT AS A NUMBER.** Unit 1 without a
+prior of last resort is WORSE than the old estimator on first sight — twice
+the churn — because the cold column's orphan bins kept the coin toss and now
+voted it at 20 % of a lobe that had nothing else. With the far-field prior the
+same arrival is 7× calmer than the old estimator and 50× calmer at rest. The
+warm-revisit rows (1.0 % / 5.1 % / 2.5 %) are the "stable on a revisit" the
+user reported, on all three arms.
+
+**1b — the cold column's orphan.** Unit 1's merge shrinks a low-confidence bin
+toward "look through me" and composites the parent — but a cold column has no
+parent corner, and the ORPHAN branch kept the bin's own value unshrunk: the
+one-ray coin toss, exactly on first sight, surviving because a warm revisit
+always has a parent. Now an orphan shrinks toward the far-field mean
+(`L' = c·L + (1−c)·F`, `T' = c·T`; texel 2 of `giFarFieldAvg` ÷ π, the
+conversion srcSeed's far prior makes; unprimed → previous behaviour), and the
+TOP cascade — which has nothing above it to look through — shrinks its sky
+composite the same way, so every level below reads a smooth parent. CPU twins
+mirror it via `cfg.farField` (absent in fixtures → identity).
+`__giSrcFarPrior = false` reverts.
+
+**1c — THE DARKENING, LOCATED BY READING THE CHAIN.** `srcTiles` stores
+`cover = Σ cw·c / Σ cw × maturity` in the atlas alpha; the screen gather's
+`covTotal` is that coverage; and giScreen's §13 F3 far-field fill weights the
+constant by **`wCov = 1 − knownF`**. `knownF` used to be the SAMPLED FRACTION
+(a bin in or out — ~0.58 on a converged lobe); §11.25 made it a CONFIDENCE,
+which is legitimately 0.1–0.3 for seconds in any sparse region while the
+estimate underneath is already the parent's real, dim light. The linear form
+then blended 70–90 % of a cold corridor into the flat far-field constant: dark
+(the scene's mean), STATIC (a constant does not move — the "0 % of pixels
+moving" reading), and "responding" to a sun step with t50 0.65 s only because
+the constant's EMA follows the sun. Same class as §11.20's box feather: a fill
+designed for ABSENCE reading a fraction as absence. Fix: the ramp form §11.20
+built and left opt-in — full at `knownF` 0, gone by 0.25 (about five rays of
+evidence at K = 16) — is now the default (`__giFarFieldCoverageRamp = false`
+restores linear). Under the old coverage §11.20 had measured the ramp as "no
+measurable difference", which is what makes the flip safe for the
+`__giSrcConfidence = false` path too.
+
+**Instrument notes.** (1) The flicker accumulator's readback now reports
+`pipelinePending` instead of crashing on `.size` of an unallocated buffer — a
+harness Chrome compiling on the same driver held the live editor's compile
+queue for the whole window (§11.7's "the harness shares the GPU" again).
+(2) A revisit measured right after a `lightResponse` reads the sun's RESTORE
+transient (both arms' first "warm revisit" numbers were 62 %/5 % churn against
+a real revisit's ~0); the probe now revisits BEFORE the light step. (3) An
+`editor.reload` discards unsaved scene changes; one of this session's reloads
+reported some and discarded them.
+
+**THE RECEIPT, 1b + 1c together** (`probe:gi-cold-arrival`, sun pinned, two
+pins run — (−92, 0, 0) and the user's (−92, −3, −16.9); their directions differ
+by 3° and the pictures agree to 5 %, so the earlier "dark regime" was NOT the
+parent's rotation and is not reproduced after 1c — kept as a flag, not a
+result):
+
+| cold arrival at the user's view, first 5 s | churn | p95 step / mean | max | meanLum | at rest (churn · p95) | warm revisit churn | sun step 25° |
+|---|---|---|---|---|---|---|---|
+| old estimator | 31.9–38.3 % | 0.66–0.88 | 6.8–9.3 | 0.136–0.138 | 1.1–1.3 % · 0.10–0.36 | 4.2–11.3 % | t50 0.6–0.8 s, t90 3.0–3.3 s, 97 % |
+| **Unit 1 + 1b + 1c** | **2.7–3.0 %** | 0.59–0.72 | 4.0–8.2 | **0.148–0.158** | **0.04 % · 0.07** | **0.2–0.6 %** | t50 1.2–1.3 s, t90 3.0–3.1 s, 98–99 % |
+
+Cold-arrival churn 12× lower, rest churn 30× lower, energy +7–16 % (brighter,
+not darker — the fill fix holds), t90 unchanged, t50 ~0.5 s slower, the
+approach more monotone. `smoke:gi-flicker-watch` green on the build (light
+arm t50 1.16 s / t90 3.57 s / 95 %). All five SRC gates green on 1b.
+
+### 11.27 "INSUFFICIENT BOUNCE AND AO" vs THE TRACER — the corner leak is an EXTRAPOLATION, and an unsampled direction now inherits its angular neighbours (2026-09-04)
+
+**The user, two captures of the upper gallery — the path tracer and ours: "I
+see insufficient bounce and AO. Can we do something about it?"** What the
+eye sees: the tracer is dark under the capitals, where the vault meets the
+walls, and at the corridor's far end, and carries a warm halo on the floor
+and vault around the sun patches; ours is bright in exactly those crevices,
+brighter at the far end, and darker around the patches.
+
+**FACTS FIRST.** (1) Every tier runs `w0 = 4` — 32 direction bins per c0
+probe, by design (`w0 = 8` collapsed Bistro's block pool); "ultra" buys
+spacing and rays, not directions. (2) The component's `bounce: 0.75` is a
+LEVEL label ("High"), not a multiplier — `_giBounceWeightU` is 0 or 1. Not a
+lever. (3) **The enclosure-leak ladder on the current build** (`probe:gi-sun-
+bounce -- base:sky:occ`, corridor + path-traced truth, `V` = ground-truth
+sky visibility):
+
+    open sky   V 1.000  0.89x       wall mid    V 0.181  1.36x
+    wall high  V 0.448  0.97x       wall low    V 0.110  1.53x
+    floor      V 0.305  1.07x       floor/wall  V 0.282  1.17x
+    → open 0.89x, enclosed 1.44x: 1.62x too much light per unit truth in the corners
+
+identical to the 08-30 reading (`gi-cascade-leaks-into-corners`: 0.92x /
+1.31–1.50x) with `knownFrac` **0.5126** and `meanKnownBins` 10.32 — the same
+four digits as then. Unit 1 changed nothing here, and that is expected: it
+changed how much a SAMPLED bin votes, not what an UNSAMPLED direction is
+worth, and half of every lobe is unsampled.
+
+**THE MECHANISM, WHICH THE CODE NAMES ITSELF.** `srcTiles`' bake: `E =
+π·Σ(L·W)/Σ(W)` over the sampled bins — *"renormalised over the KNOWN bins,
+which is unbiased only if those bins are a random subset of the lobe; they
+are not — they are the bins rays happened to reach."* An unsampled direction
+is worth the lobe's MEAN. In a corner the unsampled directions are the ones
+into the crevice, and the mean is the open directions' brightness: the corner
+is lit by light no ray measured. Beside a sun patch the same rule dilutes the
+patch's bins into the lobe mean: the halo is averaged away. One rule, both
+deficits. AO cannot fix it (§2.7d: "do not turn AO up" — GTAO owns the
+sub-lattice band; this is the cascade's half, and it is 1.4x bright BEFORE the
+AO multiply), and the far-field fill runs AFTER the AO multiply, deliberately
+("never re-crush a fallback"), so any share of a crevice pixel that the fill
+answers arrives un-occluded as well.
+
+**UNIT 1d — DIRECTIONAL INPAINTING.** The direction bins are a 2w×w equal-area
+grid (Morton-stored); every bin has eight angular neighbours (azimuth wraps,
+the pole rows clamp). A new pass after the merge ladder, for the two cascades
+the tiles bake: a bin with confidence below `INPAINT_LOW` (0.2 — under four
+rays at K = 16) takes the confidence-weighted mean of its CONFIDENT neighbours
+(diagonals at half weight), blended by `c / INPAINT_LOW`, and carries their
+confidence × `INPAINT_DISCOUNT` (0.5). The bake then extrapolates along the
+sphere's own structure — dark into a crevice, bright beside a patch — instead
+of from the lobe mean. Race-free by construction: a thread WRITES only bins
+below the threshold and READS only bins above it, which no thread writes. CPU
+twin `srcMath.inpaintBins` (the bake and coverage twins read it), so
+`test:gi-src-tiles`/`gather` diff like against like. `__giSrcInpaint = false`
+reverts. Cost: one pass over c0 + c1 bins (~280 k at the corridor pose), eight
+payload reads each.
+
+**THE GATES:** the ladder (enclosed/open → toward 1.0 with the open anchor
+still ~0.9), the five SRC gates, and — because this is a LOOK change —
+`profile.lightResponse` + `profile.flicker` at the user's view before it is
+called done.
+
+**⛔⛔ REFUTED BY ITS OWN GATE, THE SAME HOUR.** Ladder with 1d armed:
+
+    open sky   V 1.000  0.90x       wall mid    V 0.181  1.43x
+    wall high  V 0.448  1.00x       wall low    V 0.110  1.61x
+    floor      V 0.305  1.12x       floor/wall  V 0.282  1.19x
+    → open 0.90x, enclosed 1.52x (baseline 0.89x / 1.44x): slightly WORSE
+
+and `test:gi-src-merge` (9 875 unknown bins written — the merge gate requires
+an unknown bin to stay unknown), `tiles` (12 682/12 960 texels off the
+mirror) and `gather` red. Backed out to opt-in (`__giSrcInpaint = true`) the
+same hour, gates green again.
+
+⭐⭐ **WHY IT COULD NOT HAVE WORKED, SEEN AFTER THE FACT.** The angular
+neighbours of a crevice direction no ray reached are the directions rays DID
+reach — the ones that escaped the crevice — so "inherit your neighbours" is
+the lobe mean by another road, and the bright side of the blend at that. The
+leak is not an extrapolation RULE problem; it is that **an unsampled direction
+has no valid stand-in at all.** Half of every lobe (`knownFrac` 0.51, invariant
+across a 7x ray range — §2.7d) is unsampled because rays are born at PIXELS:
+a probe's directions are the directions its pixels' rays happened to take,
+and the directions into a crevice from a probe sitting on the wall beside it
+are exactly the ones a pixel-born cosine-ish ray does not take. **The fix is to
+sample them** — Unit 2, rays per probe over a full deterministic direction set,
+every bin refreshed every K frames — which takes `knownFrac` from 0.51 to ~1.0
+and removes the extrapolation entirely. The ladder is its gate: enclosed/open →
+~1.0 with the open anchor at ~0.9.
+
+⚠ Also visible in this run's t = 5 s column: every point reads 0.3141 — the
+§11.26 far-field prior at a cold boot is a flat constant for the first
+seconds, before the sampled bins take over (by 20 s the ladder is converged).
+Expected for 1b; noted so it is not read as a bug later.
+
+**Verdict for the user's two captures:** no knob, and not 1d. The corner
+brightness and the missing halo are the same unsampled-direction problem, and
+Unit 2 is the unit that addresses it. AO stays where §2.7d put it: GTAO owns
+the sub-lattice band and is not to be turned up to pay the transport's debt.
+
 ## 8. SOURCES
 
 Lumen SIGGRAPH 2022 (Wright et al.) · Lumen technical details / performance
@@ -4294,3 +4979,1764 @@ Split Radiance Cascades (arXiv 2607.20384) · Unity APV docs · web3dsurvey
 WebGPU limits/features · WebKit bugs 319770, 305727, 311598, 293626 ·
 three.js issues #28921, #29852, #30571, #32735 · toji.dev WebGPU device-loss
 best practices. Extracted texts: this session's scratchpad `pdf/*.txt`.
+
+### 11.28 THE 45° BIN LIES ABOUT WHERE THE SKY IS — two refutations, a numerical twin, and the radiance centroid (2026-09-04)
+
+**Before building Unit 2 (rays per probe) on §11.27's diagnosis, the
+diagnosis was put to two cheap tests on the enclosure ladder, and both
+refuted it.**
+
+**Instrument 1 — per-point coverage.** `gatherAt` now returns `coverage`
+(the fine lattice's coverage-weighted answer share, `covTotal`), the rig
+reads it per point beside the ratio (`cov`), and the runner prints it. This
+is the per-point twin of the `knownFrac` statistic §2.7d found blind:
+
+    wallB top (open)   0.91x  cov 0.030 (2/2)     wallB mid   1.36x  cov 0.878 (4/4)
+    floor at wall      1.19x  cov 0.896 (5/5)     wallB low   1.58x  cov 0.870 (5/5)
+    wallB high         1.03x  cov 0.881 (4/4)     floor ctr   1.07x  cov 0.896 (2/2)
+
+Every corridor point is 87–90 % sampled. A renormalisation over 88 % of the
+lobe cannot manufacture 1.44× — `E_k / (0.88·E_k + 0.12·E_m) = 1.44` needs a
+NEGATIVE `E_m`. ⛔ "Half the lobe is unsampled" (§2.7d, §11.27) is the
+hemisphere FOLD averaged over texels of every orientation (`knownFrac`'s
+denominator is the texel's lobe, and a wall probe's lobe texels facing
+away from the wall are legitimately empty) — geometry, not starvation, and
+not what the wall's own pixels read.
+
+**Instrument 2 — the interval dose-response.** `__giSrcR0OverS0` pins r₀/s₀
+at build (`srcConfig.r0OverS0()`, read by the interval ladder, the TSL
+boundary and the GTAO band; `?r0=N` / tag `r0N` on the rig). Longer
+intervals move the corridor's hits into FINER cells — at 8 the whole 3.5 m
+width sits in c0's 0.45 m cells — so a coarse-cascade PARALLAX leak must
+shrink with it:
+
+    r0/s0   boundaries (m)          open    enclosed
+    1.6     0.72 / 3.6 / 15 / 61    0.90x   1.44x
+    4       1.8 / 9 / 38 / 153      0.91x   1.46x
+    8       3.6 / 18 / 76 / 306     0.91x   1.47x
+
+It does not move. ⛔ Parallax is refuted. (A tier change cannot test this —
+cell and interval both scale with s₀, so the parallax ANGLE is tier-invariant,
+which is why §2.7d's "ultra leaks the same" said nothing either way.)
+
+**The sun-bounce ladder, same hour** (`probe:gi-sun-bounce -- base`, no sky):
+wallB mid **0.89×**, high 1.00×, low 0.92×, floor 1.01×, wallA shadowed low
+0.96× against the 4-bounce truth. ⭐ **Bounce in enclosure is accurate to
+~10 %. The 1.4–1.6× leak is the SKY term alone.**
+
+**THE NUMERICAL TWIN.** With sampling and parallax gone, what is left is the
+bake's own quadrature: `Σ_bins (L + T·sky)·cw` with ONE `T` per bin and the
+bin's WHOLE cosine mass `cw`. A 4 M-direction Monte Carlo of the corridor's
+sky visibility, binned exactly as `dirToBin` bins it (2w×w, z-pole), with the
+bin-mean `T` applied to the bin's cosine mass, against the exact integral:
+
+    point            V      w=4      w=8      w=16
+    wallB top     0.501   1.014x   1.007x   1.003x
+    floor at wall 0.288   1.001x   0.999x   1.000x
+    wallB high    0.395   1.037x   1.010x   1.001x
+    wallB mid     0.160   1.153x   1.054x   1.012x
+    wallB low     0.112   1.398x   1.116x   1.019x
+    floor centre  0.317   1.010x   1.024x   1.007x
+
+⭐⭐⭐ **THE w=4 COLUMN IS THE LADDER'S SHAPE, ROW FOR ROW** (measured 1.03 /
+1.36 / 1.58 for wall high/mid/low; the ~1.1× residual on top is the bounce
+share and run-to-run spread, which is ±0.04 on this rig). The mechanism: for a
+wall, the sky escapes only at the TOP of a 45° bin — at high elevation,
+where the wall's cosine is smallest — and the bin's mean transmittance spends
+the whole bin's cosine on it. For a floor the escaping directions carry the
+LARGEST cosine, and the same estimator is unbiased (the floor rows). It is
+worst exactly where the enclosure is tightest, because that is where the
+escape cone is a sliver at the top of a bin. `w0 = 8` would leave 1.12×; the
+block pool cannot afford it (§7 of `srcConfig`'s tier table); and the
+c1/c2/c3 bins — 22.5° / 11° / 5.6° — already KNOW where the sky is: the merge's
+4→1 pre-average throws it away.
+
+**THE UNIT: carry the radiance centroid down the ladder.** The payload's
+spare half (word 2, high 16 bits — `readPayload().cen`, `writePayload(…,
+cen)`, `decodePayloadCentroid`) carries the OFFSET of a bin's luminance
+centroid from its area centroid, two signed bytes in the bin's tangent frame
+(`binFrame`, `encodeCentroidOffset`/`decodeCentroidOffset`; code 0 and 0x8080
+both read as zero, so the resolve — which has no sub-bin information — writes
+nothing new). The merge's corner loop keeps two moments per corner: `pO`, the
+luminance-and-vote-weighted sum of each child's AREA MEAN VECTOR plus its own
+carried offset (where the radiance sits), and `pR`, the vote-weighted sum of
+the centres alone (where a uniform radiance would sit); the merged bin's
+offset is `ownT·(ΣpO − Σlum·pR)/lum(outL)`. The bake spends the cosine at the
+centroid: `wL = cw + (n̂·o)·s` — `cw` is the bin's MEAN clamped cosine, the
+table's units — with `s = clamp(cw / 0.25)` fading the correction out on a
+bin grazing the texel's horizon. Cosine is LINEAR in
+direction, so for a bin inside the hemisphere this is exact for any
+distribution of radiance inside the bin — and the top cascade's 5.6° centres
+reach c0 through the recursion. No new buffer, no new binding on [E], no
+knob; `__giSrcCentroid = false` reverts to the byte-identical previous bake.
+
+⭐⭐ **TWO CUTS DIED IN THE FURNACE GATE BEFORE THE OFFSET FORM, AND THE
+LESSON IS WORTH THE PARAGRAPH.** The first carried a unit DIRECTION (the
+centroid itself, octahedral 8+8) and corrected against `binDir`, the cell's
+centre: `test:gi-src-ref`'s furnace read `|E − π| = 24.8` — a grazing bin
+whose cosine mass is a hundredth of Ω took a correction of a tenth of Ω,
+because the merge's mean-of-unit-vectors for a UNIFORM field is not the cell
+centre (nor, after confidence weighting, any fixed reference). Swapping the
+reference for the area centroid left 4.45. Only an OFFSET is linear: the
+weighted mean of zero offsets is zero for any weights, at every level, so a
+uniform field is exactly uncorrected by construction — and a third cut that
+averaged the children's offsets alone was exactly zero EVERYWHERE (the top
+level has no offset to average), which the new merge-gate arm caught as
+"0/784128 bins carry a non-zero offset". The sub-bin information is the
+children's CENTRES; the offset is the luminance-weighted centre minus the
+vote-weighted one.
+
+⭐⭐ **AND A THIRD CUT DELIVERED 40 % OF ITSELF, WHICH THE LADDER CAUGHT AND
+THE GATES COULD NOT.** With the offsets carried, the ladder did not move
+(1.44× → 1.44×). Two instruments settled where the loss was: the rig's payload
+readback showed the merge WRITING offsets (c0: 20 994 of 26 528 bins, mean
+|o| 0.067), and a live strength uniform on the bake (`tiles.centroidStrength`,
+0/1 on the SAME converged field — no reboot, no run-to-run spread) showed the
+correction moving wall-low by only −5 %. A dump of the wall-low probe's chain
+(`out.chain`: its eight c0 corners' bins with L, T, c, n̂·o and their four c1
+children) re-baked through the mirror's formula reproduced the GPU's 0.95 —
+so the twins agreed and were both wrong: `binCosineWeights` stores a bin's
+MEAN clamped cosine (0..1), not its cosine MASS, and the correction carried a
+spurious `Ω = 4π/32` (0.39). The exact term is `cw + n̂·o`, no solid angle.
+The tiles gate passed with offsets in the field because both twins carried
+the same factor — a gate that diffs twins cannot see a shared unit error;
+only the ladder's truth could.
+
+**Gates:** `test:gi-src-ref` and `-math` (the furnace, the enclosure ladder,
+the open-arm furnace: all PASS); `test:gi-src-merge` with a new ARM 4b —
+every merged offset within two quanta of `mergeCascades` (worst 0.0079, one
+quantum; 97 380 of 784 128 bins carry a non-zero offset, so the arm is not
+vacuous); `-tiles`, `-gather`, `-temporal`, `-deposit` all PASS.
+
+**RECEIPTS.** In-situ on/off (the strength uniform, one converged field):
+
+    point            with bounce    without bounce (nosec)
+    wallB high         0.943           0.933
+    wallB mid          0.913           0.881
+    wallB low          0.885           0.835
+    floors, open       0.997–1.003     0.997–1.006
+
+The ladder, sky arm (60 s settle): open 0.90×, enclosed **1.44× → 1.33×**
+(wall low 1.52 → 1.38, mid 1.36 → 1.28, high 0.97 → 0.93). The `nosec` arm —
+the direct term alone, against the 4-bounce truth — reads wall low **1.01×**,
+mid 1.03×, floor at wall 1.04× (enclosed/open 1.14×, was 1.60×).
+
+**Where the residual is, by instrument.** A dump of the wall-low probe's
+bins (`out.chain`) re-baked against the corridor's exact per-bin sky
+visibility: the bins' sky transmittances are right to ~3 % (bins toward the
+corridor ENDS +5 % — a c2-cell parallax, the one leak the r₀ sweep could
+not see because those hits are 6 m away in every arm); the offsets recover
+85–95 % of the true offsets; the direct term lands at ~1.05×. What is left
+in the full arm is the HIT radiances — 1.2–1.5× at the most enclosed hit
+points (wall A's foot, the floor at the wall), i.e. the leak at those points
+compounding through [J]. With a 120 s settle (the bounce
+converging under the corrected tiles) the same arm reads open 0.91×, enclosed
+**1.24×** (wall low 1.29, mid 1.19, high 0.92, floor at wall 1.16), in-situ
+−13 % at wall low — the 60 s column was still descending.
+
+**Sponza receipts at the user's gallery view (env lighting OFF — the sky term
+is zero there, so this is a no-regression check, not the fix's arena):
+flicker 0.7 % churn, p95 step 0.028× mean, 0.0001 rev/px/frame at 95 fps;
+sun step t50 1.7 s, t90 4.0 s, 97 % monotone at 85 fps.**
+
+**Cost:** the merge reads the same four children it always read, plus a
+per-child frame (two cross products); the bake reads one more table per bin
+and a per-texel direction; no atomics, no bindings on the [E] kernel.
+
+⚠ **THE USER'S SPONZA REPORT IS NOT THIS UNIT.** Their scene has environment
+lighting OFF, so the sky term this unit corrects is zero there. The two code
+paths that can put light on a shadowed face there: the reflection chain's
+env-miss tap, which samples the BACKGROUND HDRI at intensity 1 whether or not
+lighting is on (`GISystem` `_giEnvMissIntensityU`: `bg ? 1`), and the
+far-field fill on low-coverage faces. Asked the user to toggle `reflections`
+off as the one-look split; untested at the time of writing.
+
+### 11.29 THE DIRECT-SKY TERM IS 1.55× IN A TIGHT ENCLOSURE UNDER ANY SKY — the HDRI arm, the direct-sky truth, and where the rest of the leak lives (2026-09-04, later)
+
+**The user, Bistro vs the tracer: "very blurry and flat, and AO is still too
+bad", then "even in places where there is normal AO, the final color looks
+very flat", then 10 fps (my ray-budget A/B — restored; 25 fps is the pose's
+own number).** Region means of their two captures at one pose, display space
+(≈ linear^0.45): sunlit cobbles **1.01×**, shadowed cobbles 1.10×, sunlit
+facade 1.25×, arch 1.29×, shadowed wall 1.34×, under the awning 1.36× —
+every shaded region ~1.9× in linear light, sun calibrated.
+
+**Ruled out at the user's pose by screenshots (permission given):** the
+far-field fill (off vs on: identical; `fillFrac` 0), reflections (off:
+identical), starvation as the cause of the flatness (ray cap off + 4.4× rays:
+`knownFrac` 0.15 → 0.40, picture barely moved), three's IBL (suppressed while
+GI is live), the HDRI's sun disc (4° elevation, 0–4 % of E). What the HDRI
+DOES have is a bright horizon: a vertical wall receives 0.7–1.1× the ground's
+sky irradiance, the zenith is dim.
+
+**Instrument: the corridor rig lit by the user's HDRI** (`?hdri=1` / tag
+`hdri`, `scripts/.gi-fixtures/industrial-sunset-2k.hdr` served by vite; the
+reference's `irradianceAt` takes `skyL` as a FUNCTION of direction —
+`loadHdrSky`, an RGBE decoder using three's `equirectUV` convention; and it
+now returns `skyDirect`, the sky seen at depth 0, which is what a `nosec` arm
+must reproduce). Analytic open-point E 1.3576 (×0.5), MC 1.368 ✓.
+
+    direct-only (nosec) vs skyDirect        V      flat sky   HDRI   HDRI r0=4  r0=8
+    wallB top (open)                      1.000    0.9x      0.95x  0.97x     0.97x
+    wallB high                            0.448    —         0.89x  0.94x     0.95x
+    floor at wall                         0.282    —         1.20x  1.17x     1.21x
+    wallB mid                             0.181    —         1.35x  1.32x     1.37x
+    wallB low                             0.110    1.6x*     1.55x  1.71x     1.71x
+    floor centre                          0.305    —         1.12x  1.10x     1.09x
+
+⭐⭐ **THE TWO SKIES AGREE.** (*) §11.28's flat-sky `nosec` arm read wall low
+**1.01× against the 4-BOUNCE truth** and I called the direct term fixed; read
+against its DIRECT truth (V·π·L = 0.0346) it is 0.0542 = **1.57×** — the
+"1.01" was a coincidence of a leaked direct term against a truth that
+includes bounce. With bounce on, the bounce part reads 1.0–1.15× under both
+skies (base − nosec against sky − skyDirect), so the enclosure leak IS the
+direct-sky term, and it is 1.55× at V 0.11 after the centroid (1.84× before).
+
+⛔ **Parallax refuted a second time, under the HDRI:** r₀/s₀ 4 and 8 read
+1.71× — WORSE, because pushing every hit into c0 puts all the visibility into
+one 45° own-transmittance with no sub-bin structure at all.
+
+**Where the residual lives, from the wall-low dump (§11.28's chain dump,
+re-baked):** the bins' T̄ are right to ~5 % (bins toward the corridor ends
++5 %); the bake at the +x texel is 1.07× after the units fix; the GATHER reads
+~1.12× the single-texel bake (the octahedral seam tap averages texels ±11°
+off +x, the corner blend, and the coarse-lattice fallback's 12 % from a 0.9 m
+cell that sits higher up the wall); and the merge's own formula carries a
+channel I can name: **the confidence look-through `T′ = 1 − c + c·T`** lets
+`1 − c` (≈ 5 % at c 0.95) of the parent through a bin that MEASURED T = 0, so
+a fully blocked direction leaks ≈ (1−c)·(parent's sky) at every level — at
+V 0.11, +10–20 % of the truth, weighted toward the sky's BRIGHT part under a
+horizon-lit HDRI (the blocked hemisphere of a wall is the bright one).
+**The A/B that named it (`nosec:hdri:noconf`, `__giSrcConfidence = false`, c ≡ 1):**
+wall low 1.55× → **1.19×**, mid 1.35× → 1.07×, floor at wall 1.20× → 1.08×,
+enclosed/open 1.53× → **1.11×**, and the open point 0.95× → 1.02× (the shrink
+was dimming it too). The §11.25 prior is the leak's home.
+
+**THE UNIT (§11.29): the prior must let go.** `c = N/(N+K)` keeps `K/(N+K)` of
+the prior forever. Now the prior's share collapses with evidence:
+`1 − c = K/(N+K) · e^{−N/F}`, F = `CONFIDENCE_FULL_RAYS` 64
+(`srcMath.confidenceOf`, the deposit's resolve is its f32 twin;
+`__giSrcConfidenceFull` moves F, 0 restores the plain form). c at 1 / 16 / 64 /
+150 / 300 rays: 0.07 / 0.61 / 0.93 / 0.991 / 0.9995 — the first twenty rays
+(the cold-arrival win of §11.26) are untouched to the first decimal; a
+converged bin is its own measurement. Gates: ref, math, deposit, temporal,
+merge all PASS.
+
+    direct-only vs skyDirect     V      §11.28    +§11.29    (noconf)
+    wallB top (open)           1.000    0.95x     1.00x      1.02x
+    wallB high                 0.448    0.89x     0.89x      0.90x
+    floor at wall              0.282    1.20x     1.12x      1.08x
+    wallB mid                  0.181    1.35x     1.17x      1.07x
+    wallB low                  0.110    1.55x     1.31x      1.19x
+    floor centre               0.305    1.12x     1.05x      1.05x
+    enclosed / open                     1.53x     1.24x      1.11x
+
+    with bounce (base:hdri) vs sky     §11.28    +§11.29
+    wallB mid / low                    1.27/1.40  1.12/1.20
+    enclosed / open                    1.40x      1.16x
+
+Coverage rose 0.88 → 0.92 (a fed bin now votes at ~1), the carried centroid
+offsets grew (c0 mean |o| 0.068 → 0.108 — less dilution by low-c votes) and
+the in-situ centroid correction with it (wall low 0.808). The 60 s column was
+still descending at wall low. The gap to `noconf` (1.31 vs 1.19) is what the
+prior still holds at 30–100 rays plus the vote weighting; Unit 3 (confidence
+from evidence, not a decayed weight) owns it.
+
+**Receipts on the user's Bistro (env lighting ON, their pose):** at rest 0.2 %
+churn, p95 step 0.055× mean, 1 % of pixels moving; sun step (9 % of the
+picture — a sky-dominated view) t50 2.0 s, t90 4.9 s, 95 % monotone. ⚠ Both at
+16–18 fps — the pose's own 25 fps is the next mandate (their words: "after
+we settle proper GI look, work on performance"); the 10 fps they saw was my
+ray-budget A/B (cap off, 4.4× rays: 115 ms of GI), restored.
+
+**Still open on Bistro, named and not touched:** starvation (`knownFrac`
+0.15, every c0 probe starved, 7 rays/probe/frame at rest — Unit 2); the
+reflection BVH seats the 128 largest of 487 eligible meshes and 359 props
+overflow into a path with 8 coverage slots — the user's "some meshes appear
+white in reflections" lives there; GTAO at one c0 interval (0.56 m at ultra)
+is a contact term and reads near-white in the `ao` view on this scene.
+
+⚠ Housekeeping from the screenshot session: the GI component's `debugView`
+was persisted as "path-tracer" by autosave when the editor dropped mid-run
+(the MCP screenshot cannot see the tracer's canvas — only puppeteer's
+`page.screenshot` can, per the Cornell rig's note); set back to "off" on
+reconnect. All live flags restored (`__giFarField`, `__giSrcProbeRayCap`,
+`__giSrcTransportRays` → null; `reflections` 1).
+
+**Bistro is this, amplified**: coverage 0.15 (so the coarse fallback and the
+extrapolation carry more of every pixel), a horizon-bright sky, and street
+canyons at V 0.2–0.5.
+
+### 11.30 THE RAY DISTRIBUTION, NOT THE TOTAL — cap 8 on every tier, 8 starvation packets (2026-09-04, evening)
+
+**The user, Bistro: "very blurry and flat"; then "10–11 fps … unplayable.
+After we settle proper GI look, work on performance."** The look and the
+frame turned out to be one dial.
+
+**The receipt that named it** (`profile.giPasses` at their pose, ultra,
+12.5 k visible c0 probes): `raysPerFrame` 89 k at the rest cadence, EVERY c0
+probe flagged starved, `knownFrac` **0.15** — a texel knew 3 of its 20 lobe
+bins, and the picture was those three bins extrapolated over the lobe (§2.7d's
+"biased subset", here at its worst). 89 k rays for 12.5 k probes would refresh
+every bin every few frames IF they were shared; born per pixel, the near
+probes took the ultra cap of 32 and the street took nothing. Lifting the cap
+and 4.4× the rays (§11.29's A/B) bought `knownFrac` 0.40 for 115 ms of GI —
+the total is not the lever.
+
+**The lever is §11.17's starvation floor.** `__giSrcStarvePackets` 2 → 8
+(live): `knownFrac` 0.15 → **0.80**, `meanKnownBins` 3.1 → 16.0, starved
+12 569 → 5 837, c0 orphans 11.6 → 3.5 %, LOS-suppressed 33 k → 2.5 k,
+unattributed 12 → 4.9 % — at 190 k rays (SRC chain 48 → 66 ms). Then the cap
+32 → 8 (`__giSrcProbeRayCap`, live) WITH the packets: `knownFrac` **0.80
+held at 30 k rays** — the SRC chain **48 → 19 ms** ([J] 25 → 7, deposit 15 →
+4.6), **25 → 35 fps** at the pose, and the shadowed street's gradient and
+contact darkening visible in the screenshot for the first time.
+
+    Bistro, user's pose            rays/frame  knownFrac  SRC ms   fps   t50/t90 sun step
+    before                            89 k       0.15      48      25    2.0 / 4.9 s
+    packets 8                        190 k       0.80      66       —
+    packets 8 + cap 8                 30 k       0.80      19      35    0.9 / 2.4 s, 99 % mono
+
+Flicker at rest unchanged (0.2 % churn, p95 0.083× — the user moved the
+camera during that window). The corridor rig with the same dials: sun-bounce
+ladder 0.99–1.11× (energy-neutral, §12.40.4's verdict again; the rig reads
+0.89–1.01 either way), HDRI 4-bounce enclosed/open 1.22× at 60 s with the
+column still descending (fewer rays converge slower — not less energy).
+`test:gi-src-rays` and `-deposit` PASS.
+
+**Shipped as tier defaults:** `probeRayCap` **8 on every tier** (was
+16/16/16/32 — the surplus it denies is the same surplus at any tier) and
+`STARVE_PACKETS` **8** (was 2). ⚠ A running editor does NOT pick up
+`srcConfig` constants on hot reload — clearing the live flags read the cap
+back as 16 on their session — so the user's session runs the same values as
+live overrides until their next editor start. ⚠ The starved count reads
+HIGHER under the cap (8 842) while coverage holds at 0.78–0.80: the flag
+measures evidence weight per probe, which the cap lowers on the fat probes;
+coverage is the number that matters.
+
+**What this is not.** Unit 2 (rays born per probe over a deterministic
+direction set) is still the design that removes the pixel-footprint skew at
+its root; this is that design's cheap 80 %: the floor already fires packets
+from a probe's representative pixel in successive ray slots, and the cap
+already denies the fat probes. Bistro's remaining look items: the direct-sky
+enclosure residual (§11.29, 1.31× at V 0.11), the 128-mesh reflection BVH cap
+(the white props), GTAO's contact-only reach.
+
+**Flicker A/B at one pose (the user's second Bistro pose), packets 8 both,
+`stillOnly`:** cap 32 — 0.63 % churn, 7 % of pixels moving, p95 step 0.105×
+mean, 19 fps; cap 8 — 0.08 % churn, 0.4 % moving, p95 0.12×, 35 fps. The cap
+does not cost stability (§12.40.4's α compensation holding), and the p95 band
+(0.10–0.12×) is this pose's, not the cap's.
+
+### 11.31 THE FLOOR DEADLOCKED A COLD FIELD — the starvation floor gets its own budget (2026-09-04, evening)
+
+**The user, after an editor restart on Bistro: "this is indirect, half of the
+screen is just grey, half is excessively white. Indirect got much worse."**
+`profile.giPasses`: 15 681 live c0 probes, **0 rays per frame**, 15 678
+starved, the deposit and [J] at 0.1 ms — a populated field with a dead
+transport, and the picture was the fallbacks of an empty field (the far
+constant's grey below, the sky-facing extrapolation above).
+
+**The mechanism, from `srcRays`' priority pass:** a starved probe claims
+`packets × raysPerPixel` tickets with `atomicAdd(rayTotal, want)` and is
+ACCEPTED only if `ticket + want ≤ ceiling` — but the add has already
+happened. With §11.30's 8 packets on a cold field (every visible probe
+starved after a restart), 15.7 k × 16 = 250 k tickets were requested against
+a 196 k rest ceiling; the denied claims inflated the counter past the ceiling
+and every pixel claim in [D1] behind them was refused. Zero rays → no
+evidence → every probe stays starved → zero rays: a fixed point. The old
+2 packets (50 k) could never reach it. (The first session's rebuild that
+preceded this — a pool grow after a §12.56 watchdog re-roll during the user's
+browser-preview build — retired the store and left it cold, which is when the
+floor's demand peaked.)
+
+**Fix:** `rayTotal` grows a second word — the floor's OWN dispenser, bounded
+to `STARVE_SHARE` (0.5) of the ceiling — and only an ACCEPTED floor claim
+touches the shared counter; the walk order rotates with the frame
+(`(index + frame·1103) mod capacity`) so the budget's tail is a different
+tail each frame. Cold (non-starved) one-packet claims ride the shared counter
+as before. `test:gi-src-rays` and `-deposit` PASS. ⚠ A kernel edit does not
+reach a running editor reliably (module duplication): the live receipt below
+was taken after the user's restart.
+
+### 11.32 STATIC DRAWS — the marker that kept every object on the per-frame path (2026-09-04, evening; OPT-IN, unmeasured)
+
+**The user, after the ray-distribution win: "after we settle proper GI look,
+work on performance."** `profile.cpuFrame` at their Bistro pose: **27.3 ms
+CPU**, of which `renderEncode` 15.4 ms (56 %) and `gi.gbufferPrepass` 5.8 ms —
+draw submission, 457 draws, ~35 µs each (the §bistro-cpu-is-draws finding).
+GPU 28 ms. Both halves need work for 60 fps; this unit is the CPU half.
+
+**Why bundles and `object.static` never paid** (memory
+`render-bundles-blocked-by-gi-marker`, now acted on): `#markObservedMaterial`
+stamps `giMonitorNode` on every lit material so three's
+`NodeMaterialObserver.hasNode` is true, which makes `needsRefresh()` return
+true for every object every frame BEFORE the static/bundle branch — so the
+per-object JS path (updateBefore / geometries / nodes / bindings) runs ~460×
+a frame whatever the scene does. Three's build installs no `getShadow`/`getAO`
+context (checked), and the GI module has no per-object node updates
+(checked), so the marker is the only thing in the way.
+
+**What the marker bought, replaced by construction (`__giStaticDraws = true`):**
+- GI's per-frame uniforms are in the shared render group (21 sites already;
+  `GICascadeLightNode.intensityUniform` moved there) — the first refreshed
+  object of each render uploads the shared buffer, every object reads it.
+- A target swap (resize / rebuild re-points the persistent texture nodes)
+  calls `#invalidateObservedMaterials`, which bumps every observed material's
+  version so its render objects rebuild their bindings ONCE — the event the
+  per-frame marker was standing in for.
+- `merging.js`' colour proxies declare `static` (they never move: world-space
+  vertices, rebuilt on any member change); `shadowMerge` already did.
+
+**To measure after a restart with the flag armed:** `profile.cpuFrame`
+`renderEncode` (expect several ms off), `profile.frameStats` fps; then
+`performance.renderBundles` on top (the GPU-side encode). **Correctness
+receipts required before default-on:** a viewport resize keeps GI lit (the
+invalidation), a GI quality change, a debug-view toggle, the flicker and
+light-response windows unchanged. ⚠ Uber-material proxies (colorNode of their
+own) stay on the refresh path by three's rule; unmerged meshes too (~200
+draws on this scene) — the next step there is the same `static` on meshes
+whose transform the editor has not touched, cleared by the transform tools.
+
+**The user's two mobility notes, for the record:** `giMobility` is a
+TRANSPORT tag (static BVH vs mover proxies) and does nothing for raster
+draws; a LIGHT mobility (static / movable) is the GPU-side twin of this
+unit — a scene whose lights are declared static never arms the light-track
+machinery and can run the transport at a converged cadence (the SRC chain's
+14–19 ms is rays that re-measure a field that is not changing). Queued.
+
+**§11.32, first live receipt (the user, moving the camera on the static path):
+"screenspace GI gets desynced from the viewport" — the lighting one frame
+behind the geometry.** Root cause, from the uniform list: `light.giViewProj`
+(the light node's per-frame view-projection for the GI screen lookup),
+`_giResolveCamU`, the shadow/emitter texel sizes, the toggles — 42 persistent
+GI uniforms — were plain `uniform()` calls, i.e. three's per-OBJECT group,
+so each lived in every render object's own buffer, and a `static` object
+never re-uploads that buffer: it projected into LAST frame's GI screen.
+GI has no per-object uniform at all; every one of them is a per-render
+value. All 42 now `.setGroup(renderGroup)` (one shared buffer, uploaded by
+the first refreshed object of each render, read by all) — which is also
+fewer uploads per frame with the marker on. Re-measure after a restart.
+
+### 11.33 "DESTROYED TEXTURE [output] USED IN A SUBMIT" — the g-buffer was per-build while a material bound it (2026-09-04, afternoon; SHIPPED, user-verified)
+
+**The report (the user):** "we quite often get this error when changing any
+scene or gi params: `[gpu] UNCAPTURED DEVICE ERROR: Destroyed texture
+[Texture "output"] used in a submit. — While calling Queue.Submit(
+CommandBuffer from CommandEncoder "renderContext_0")`."
+
+**Reproduced on demand:** `profile.giFlag` with any rebuild → a burst of the
+error on the MAIN pass (renderContext_0), two per frame, for ~13–30 frames,
+then silence (two bursts read: 26 and 60 errors). `output` is the GI
+G-BUFFER's position attachment (`createGiGBuffer`: `rt.textures[0].name =
+"output"`).
+
+**Root cause, three facts that were each true and together a bug:**
+1. `#buildScreenResolve` created a NEW g-buffer on every build and `#dispose`
+   destroyed the old one on the spot ("the gbuffer is per-build; the resolve
+   TARGETS are not — no material is bound to it").
+2. `_giShadowPosNode` (the shadowNode's tap validity, giLight's irradiance
+   bilateral) is a PERSISTENT texture node whose `.value` is re-pointed at
+   each build's g-buffer position — i.e. the g-buffer IS material-bound, and
+   has been since that node landed. Fact 1's premise had silently expired.
+3. Under §11.32 static draws a `static` object's bind groups are never
+   revisited, so after a rebuild they still held the destroyed view. (Under
+   the per-frame marker three re-created the disposed texture on the next
+   refresh — a garbage upload nobody noticed — which is why this never
+   printed before §11.32.) The burst ENDED when the compile wave happened to
+   recreate the render objects.
+
+**The fix (`GISystem.js`, `giScreen.js`):**
+- The g-buffer is SYSTEM-LIFETIME (`#persistentGbuffer`): created once,
+  resized in place, disposed only with the system. The rule it encodes: a
+  texture that materials bind is never per-build.
+- `gbuffer.setSize` bumps every attachment's `texture.version` from the one
+  `targetGeneration` counter. three's `RenderTarget.setSize` disposes the GPU
+  textures but leaves the version alone, and `Bindings._update` decides "same
+  texture" by version (`binding.generation` vs `textureData.generation`) — an
+  unbumped resize keeps the destroyed view in every bind group.
+- `#refreshRenderObjectsOnce(reason)` — ONE guaranteed refresh per render
+  object after any re-point: it resets every cached NodeBuilderState
+  observer's `renderObjects` WeakMap, so `firstInitialization()` (which
+  returns true BEFORE the static/bundle short-circuit) fires once per render
+  object on the next render. ⛔ `material.needsUpdate = true` (the §11.32
+  first cut) does NOT do this: with an unchanged cache key
+  `RenderObjects.get` only syncs the version — no binding update. Called at
+  every re-point: screen-resolve build, target resize, g-buffer resize, BVH
+  reflect target (resize + recreate), env-miss (on change), atlas rebuild,
+  the reflections toggle. Retired targets keep their 3-frame TTL, so the swap
+  and the refresh never race. `__giLogStaticDraws` prints each reset
+  ("172 observers reset (atlas-rebuilt)").
+
+**Receipts:** the same `profile.giFlag` rebuild on the restarted editor → 0
+errors (was 26–60 per rebuild); `smoke:gi-flicker-watch` PASS (light step
+t90 3.0 s, 95 % monotone); the user: "destroyed texture is fixed".
+
+**§11.32 measured on the same restart (no-marker boot, Bistro, parked):**
+`profile.cpuFrame` 18.0 ms total — renderEncode 6.1 ms @ 262 draws (~23
+µs/draw; the marker boot read ~15 ms @ 460 draws, ~33 µs/draw), preRender
+9.3 ms of which `gi.gbufferPrepass` 6.2 ms (unchanged: that pass is the scene
+walk, not the draws), merging 1.9 ms. `bound: "gpu"` — GPU 25.5 ms. So the
+CPU is no longer the wall at this pose; the frame is the GPU's. That reframes
+"no payoff from mobility / bundles": the only lever left with a payoff is
+GPU, and §11.34 is that lever.
+
+### 11.34 LIGHT MOBILITY → CONVERGED IDLE — the GPU payoff the mobility props never had (2026-09-04, afternoon; SHIPPED, default on, opt-out `__giWorldIdle = false`)
+
+**The user:** "I am not sure our gi mobility prop actually helps here anyhow,
+though it was added as gi optimization"; "those mobility props should be
+added to lights as well (where light changes or not)"; "continue on gi
+mobility and render bundles, we still don't have pay off from them".
+
+**Why there was no payoff, structurally.** Mesh `giMobility` decides how a
+MOVER is represented in the transport (static BVH vs exact proxies) — a
+quality/cost trade only when something moves, never a frame-time lever on a
+parked scene. Render bundles / `static` draws (§11.32) are a CPU lever, and on
+this restart the CPU is no longer the wall (§11.33: 18 ms CPU vs 25 ms GPU,
+`bound: "gpu"`). And the transport already DETECTS stillness on its own: the
+rest cadence (§12.61) halves the ray ceiling and runs the world chain at 15 Hz
+on alternate frames when the drive is ~0. What no detector can supply is
+PERMISSION TO STOP: a rest rate exists because the system cannot know the next
+frame will be as still as this one, so it keeps converging a field with
+nothing left to learn — measured `profile.giPasses` on the user's Bistro:
+the world chain is ~20 ms per dispatch (shade+bounce 9.7, deposit 4.7, tiles
+1.4, merge 1.3 …), i.e. ~10 ms of every rested frame.
+
+**The unit.** `LightComponent.mobility` = `"movable"` (default) | `"static"`
+(→ `light.userData.giMobility`, inspector select). `GISystem#worldIdleGate`:
+when EVERY light is static, the rest drive is < 0.05 and the static field-
+hash sections (lights / emitters / sky / knobs — NOT the movers' `dyn`
+section: a walking character must not keep the world awake, its GI rides the
+mover path) have held still for `GI_WORLD_IDLE_AFTER_MS` (3 s), the world
+chain is not dispatched at all. Any drive (a light drag, a camera move, the
+`profile.lightResponse` sun step), any static-input change, a rebuild or a
+compile wave wakes it on that frame — the wake path IS the ordinary rest →
+active transition. Receipts: `profile.frameStats.giHold.worldIdle /
+worldIdleFrames / worldIdleReason` ("1 of 1 lights movable", "not rested
+(drive 0.32)", "resting 1.2 s of 3", "inputs changed", "compile wave",
+"idle"). Harness hatch `__giLightsStatic = true` declares every light static
+(`smoke:gi-flicker-watch LIGHTS_STATIC=1`).
+
+**Receipts on the user's Bistro (parked, the user set the sun to static):**
+
+| | fps | gpuMs | worldIdleReason |
+|---|---|---|---|
+| idle OFF (`__giWorldIdle = false`) | 26 | 51.3 | off |
+| idle ON | 27–35 | 40.2–44.7 | idle (1263 frames) |
+
+−10 ms of GPU per rested frame, exactly the world chain's alternate-frame
+share. The remaining ~40 ms is the render side (main pass with the GI gather
+compiled into every material, the prepass, reflections) — §18's territory.
+
+**The smoke's first run FAILED its idle receipt ("resting 0.0 s of 3" with
+`rested true`)**: the hold timer was keyed on `worldRested`, which also
+excludes the compile wave, and on the smoke's Sponza the wave toggles for
+seconds after boot — the clock restarted every time. Fixed: the timer follows
+the DRIVE alone; a wave holds the sleep back ("compile wave") without
+resetting the clock. The wake receipt passed on that same run (0 idle frames
+after the 25° sun step, t90 3.4 s, 95 % monotone).
+
+**Not in this unit, named:** a static light's SHADOW MAP still re-renders for
+movers (UE-style cached static shadows are their own unit); the idle is
+parked-camera only — a moving camera through a converged static world still
+pays the full transport (the next step is a "converged motion" mode: rays for
+starved probes only, no decay, once every light is static).
+
+### 11.35 "THE AO IS BLURRY AND SHIT" — three blurs, and the AO moves to the viewport's resolution (2026-09-04, evening; SHIPPED for ultra/high, `__giAoFullRes = false` opts out)
+
+**The report (the user, Bistro AO debug view, 11 fps pose):** thin faint
+creases, everything soft. "fix our ao, it is blurry and shit".
+
+**Instrument first — the native texel dump.** A viewport screenshot resamples
+the AO buffer twice (debug view → canvas, capture → its own size) and always
+reads soft, so `probe:gi-gtao CAPTURE=1` now also writes `ao-texels-*.png`:
+one PNG pixel per AO texel. That picture said it plainly: the AO BUFFER was
+429×242 for an 858×484 rig viewport (1140×667 for the user's 1612×943 — the
+RESOLVE's resolution, half the viewport per axis on the user's editor because
+the frame governor's `giCostScale` halves the resolve's pixel budget), then
+filtered ±3 texels, then bilinearly reconstructed 2× inside the half-res
+irradiance. Three blurs stacked: ±6 viewport px of filter on a 2× upsample.
+
+**What does NOT work at half resolution (rig arms, all at 429×242):** no
+filter → the 4-phase radial strata print as diagonal dashes; 16 fixed steps
+without phase and without filter → concentric rings around every contact
+(the rings are the tap radii; at full res the reach in pixels doubles and the
+rings would need 32+ steps to hide); 8 steps with a ±1 filter → both. "No
+noise, no steps" cannot be bought at half resolution; the filter IS the
+noise budget, and the resolution is what sets its width in viewport pixels.
+
+**The unit.**
+1. The g-buffer prepass renders ONCE, at AO resolution: `gbufferFull` = the
+   drawing buffer (DRS divided out, like the resolve) capped at
+   `GI_AO_MAX_PIXELS` (2.1 MP, isotropic), on ultra/high only. The prepass's
+   CPU (the scene walk) does not depend on pixels; its raster does, mildly.
+2. `createGiGBufferDownsample` — a QuadMesh MRT pass that POINT-SAMPLES the
+   full g-buffer into the resolve-sized `gbuffer` every other consumer reads
+   (25 load sites in giScreen.js, srcSystem's probe population, the shadow
+   tap validity node). The chain is untouched and cannot tell the difference;
+   the probe's downsample check reads mean |ΔP| 0.000 m at the mapped texel
+   (2.8 m at its vertical mirror — the one silent failure mode, excluded).
+3. The GTAO pass reads the full g-buffer one-to-one; `projScale` is scaled
+   to the source grid (`srcH / height`) — ⚠ derived AFTER `_giAoProjU`'s
+   `??=`: `float(undefined)` is not a build error but a silent ZERO, and a
+   zero projScale clamps every reach to the STEPS×MIN_STEP floor (first run:
+   contact 23 % → 10 %, raw p05 0.83 → 0.95; the ordering fix restored 25 %).
+4. The term is applied IN THE MATERIAL: `GICascadeLightNode.giAoNode`, a
+   persistent TextureNode (a 1×1 white placeholder while a tier keeps the
+   resolve path), sampled bilinearly at the pixel's own GI screen UV and
+   multiplied into the deferred irradiance (diffuse indirect + emitter
+   direct; the sun's analytic term is untouched, as before);
+   `giAoActiveU` (render group) is the live `ao` toggle. `createGiResolve`
+   drops a `materialSide` AO slot, so the half-res irradiance no longer
+   carries it. Every re-point goes through `#refreshRenderObjectsOnce`
+   (§11.33). Medium/low keep the old path (their AO is coarser than the
+   resolve and needs the resolve's edge-aware 2×2 reconstruction).
+5. Presets: `giGtaoResolutionScale` ultra 1, high 0.75 — relative to the AO
+   g-buffer now; medium 0.8 / low 0.5 relative to the resolve, unchanged.
+
+**Receipts (rig, ultra):** AO buffer 606×342 over g-buffer 429×242, contact
+25.2 % darker (baseline 23.4 %), raw p05 0.836 (0.833), finite, 0 page
+errors, gtao group 0.254 ms (0.176 at half: ×1.44 for ×2 pixels). The
+native dump at 606×342 is visibly crisper than the 429×242 one; what blur
+remains is the ±3 filter at ONE viewport pixel per texel (was two).
+
+**Open, named:** the filter radius at full resolution (r2 leaves the phase
+dashes — a 2×2 phase layout with an exact [1,2,1]² kernel would remove them
+at ±1 px; queued); the cost on the user's viewport after a restart
+(`profile.giPasses` gtao + the prepass); the AO's REACH (one c0 interval,
+0.56 m at s0 0.35 — the tracer's broad darkening under the arches is the
+field's corner leak, §11.29's Unit 3, not this term's).
+
+**§11.34 addendum — the smoke's second failure and the final receipts.** With
+the timer fixed, `LIGHTS_STATIC=1` still read "inputs changed" on Sponza:
+the gate keyed its emitter inputs on the field hash's `emitters` SECTION,
+which mixes the SEAT slots — and seats rotate on the module's own cadence
+(§11.15), so with more lamps than seats the section ticked every rotation.
+The gate now keys on the scene's emissive SET (`_emitterCands`: mesh
+radiance + world position), which is what "an emitter changed" means.
+Receipts (`smoke:gi-flicker-watch LIGHTS_STATIC=1`, twice): parked →
+`worldIdle true` (100 / 151 frames, breakers lights 0 emitters 0 sky 0
+knobs 0, dyn ticking as it should); the 25° sun step → 0 idle frames since,
+t90 2.7–2.9 s, 95 % monotone. The default smoke (movable light) passes
+unchanged (parked 52 fps, t90 3.25 s) — the AO material node did not move
+the field. ⚠ Both static runs logged `[gpu] DEVICE LOST (destroyed)` — the
+timestamped run puts it at BOOT (13:24:12, twenty seconds before the field
+existed, on the hub → project → scene path), not in any arm; the smoke's
+summary counts it as a failure and is honest to do so, but it is the boot
+path's device rebuild, not this unit's.
+
+**§11.35 addendum — the user's verdict, and the reach.** After the restart
+the boot log read `AO … at 1612x943` (was 1140x667), and the user's answer
+was "looks the same as before, blurry, low radius" — the resolution was
+never the whole complaint. Live on Bistro, `__giGtaoIntervals = 4` (2.24 m)
+with `__giAoFilterRadius = 2`: "now its good". Both are the shipped defaults
+now (`giGtaoRadiusIntervals` 1 → 4, ultra `filterRadius` 3 → 2), the hatches
+are cleared. The one-interval "contact only" rule (2026-08-26) was set
+against a detached silhouette measured at HALF resolution with a ±3 texel
+filter — a 12-viewport-pixel smear of the contact ring; at the viewport's
+resolution with ±2 px the same reach is what the tracer's arches and eaves
+look like. Named and not done: a reach that follows the scene's probe
+spacing instead of a fixed interval count, and thin-occluder compensation
+if a prop grows a halo at four intervals on some other scene.
+Receipts on the shipped defaults: rig (ultra) contact 30.2 % darker, raw
+p05 0.653, downsample exact, gtao 0.36 ms; the user's Bistro at 1612×943:
+gtao group 2.62 ms (was 1.42 at half resolution and one interval) — and at
+that pose the frame's GPU is the emitter-shadow pass (8.7–11.4 ms) and the
+exact reflections (bvhReflect 10.3 + bvhHitShade 9.3), which is §18's list.
+
+### 11.36 THE MOVING FRAME — a per-frame GPU split, a dispatch tally, and "converged motion" (2026-09-04, evening; instrument SHIPPED, cadence OPT-IN `__giWorldMotionRest = true` pending the walk receipts)
+
+**Why.** Every §11.34 number was a parked number. The user's "10–11 fps,
+unplayable" pose is a MOVING camera, and `profile.giPasses` prices passes in
+isolation — it cannot say which of them a moving frame dispatches. Two
+instruments close that: `profile.frameStats.gpuRenderMs / gpuComputeMs`
+(the frame's two timestamp halves, EMA'd like `gpuMs`: render = scene draw,
+GI prepass, shadows, post; compute = every GI chain) and
+`giHold.dispatchedLastFrame` (the previous frame's GI dispatches counted by
+pass name — multiply by the profiler's per-pass ms for the composition).
+`giHold.restTerms` publishes the transport's rest-drive terms (mLight,
+mLightNoCam, tr, cam, boot, light), so "why is the chain not resting" is one
+read. The flicker smoke's swung arm now prints all three.
+
+**What the moving frame is (harness, editor concurrently loading the GPU):**
+
+| scene | swung fps | gpu | render | compute |
+|---|---|---|---|---|
+| Sponza (858×484) | 38 | 18.9 | 3.7 | 15.2 |
+| Level (858×484) | 28.7 | 16.6 | 0.5 | 16.0 |
+
+Under motion the frame is the GI COMPUTE, 80–96 % of it; the raster is
+noise on these scenes. On the user's Bistro the same orbit read 47 ms GPU
+(unclean — a harness boot shared the GPU; to be re-read after the restart).
+
+**Converged motion (`__giWorldMotionRest = true`, needs every light static):**
+the world chain's RATE ignores the camera — a moving camera reveals probes
+(the starvation floor of each dispatch feeds them) but does not change what
+a known probe must answer — while the ray ceiling still follows the camera
+(motionScale, camTerm) and the idle gate keeps the full drive (motion never
+sleeps). Two traps on the way, both measured: (1) the cadence keyed on the
+transport's published drive, and the camera enters that drive TWICE — as
+`camTerm` and, through the α settle floor, as `mLight` (0.38 during the
+Level orbit) — so excluding `camTerm` alone changed nothing; the no-camera
+drive uses `mLightNoCam` (α floored by the LIGHT settle only). (2) The idle
+gate's emitter inputs keyed on the seat slots (§11.34 addendum).
+
+**Receipts (Level, LIGHTS_STATIC=1, same harness, same editor load):**
+
+| arm | swung fps | gpu | compute | motionRest / worldHz | sun step t50 / t90 / monotone |
+|---|---|---|---|---|---|
+| base2 | 28.7 | 16.6 | 16.0 | false / 30 | 2.2 s / 4.5 s / 83 % |
+| rest2 | 33.5 | 14.5 | 14.0 | **true / 15** | 3.0 s / 4.3 s / 78 % |
+
++17 % fps under motion, −2 ms compute; the sun step still lifts the drive
+and wakes the chain (t90 unchanged). Less than the halved world chain
+predicts, which is the next question the dispatch tally answers: what else
+is in the 14 ms. Default-on waits on the walk-patches arrival receipts
+(`run-gi-walk-patches.mjs ARMS=lightsstatic,motionrest`).
+
+**§11.36 walk receipts (`run-gi-walk-patches.mjs`, Level, ultra, 2 legs,
+harness at ~15 fps under the editor's load):**
+
+| arm | err0 | settle95 | maxStep | rev | patch0 | ripple |
+|---|---|---|---|---|---|---|
+| lightsstatic | 0.0284 | 4046 ms | 0.0125 | 1.9 % | 0.80 | 0.025 |
+| motionrest | 0.0349 | 4043 ms | 0.0121 | 3.0 % | 0.79 | 0.027 |
+
+Arrival error +23 %, reversals 1.9 → 3.0 %, maxStep / settle / patch0
+unchanged. Not free, not large. DECISION: stays OPT-IN. The moving frame's
+compute is 14 ms on Level with the world chain at half rate, so the world
+chain is not where most of it is — the next read is `dispatchedLastFrame`
+under an orbit on the user's Bistro (after the restart that carries the
+tally), multiplied by `profile.giPasses`.
+
+**§11.36 on the user's Bistro (1612×943, ultra, after the restart that
+carries the instruments).** An MCP-driven orbit (16 camera steps over ~2 s,
+read at the end, EMA'd):
+
+| arm | fps | gpu | render | compute | read-frame dispatches |
+|---|---|---|---|---|---|
+| short burst, hatch on | 26 | 45.8 | 3.6 | 42.1 | 86 (world + emitter + hit chains) |
+| 16-step orbit, hatch on | 30 | 37.5 | 4.4 | 33.1 | 14 (a non-world frame) |
+| 16-step orbit, hatch off | 32 | 31.2 | 4.3 | 26.8 | 14 |
+
+THE FINDING THAT MATTERS: under motion the GPU frame is 90 % GI COMPUTE
+(33–42 ms) and 4 ms of render. The raster is not the problem on this
+scene; the world chain (~26 ms per dispatch: deposit 4.9, merge 4.8, shade
+4.1, tiles 3.1, deposit-resolve 1.8, decay 1.5, gather 1.3, populate/rays/
+seed 1.1) plus the emitter-shadow and reflection chains on their alternate
+frames are. THE A/B IS INCONCLUSIVE ON BISTRO: the two arms orbit different
+street segments, the EMA window straddles the stop, and a read cannot tell
+whether the rest cadence engaged during the motion (`worldMotionRest` is
+false by the time the read lands). The protocol needs a sustained orbit
+with a per-second world-dispatch counter; the harness Bistro boot does not
+fit the smoke's deadline. Hatch left OPT-IN, flag cleared.
+
+**Where the 60 fps has to come from (the arithmetic, not a plan):** 16.7 ms
+of GPU against 4 render + 33–42 compute. Halving the world chain's RATE
+under motion is worth ~13 ms at best; the remaining ~20 ms is the chains'
+per-dispatch cost: the capacity-proportional sweeps (merge / tiles / decay /
+deposit-resolve ≈ 11 ms) and the reflection + emitter-shadow chains (~10 ms
+per frame at half rate). Those are structural units — indirect dispatch
+over live counts (three exposes `dispatchWorkgroupsIndirect` through
+`IndirectStorageBufferAttribute`), a motion stride for the reflection
+prepass — or the HIGH tier (s0 0.45: ~40 % fewer probes) for scenes of this
+size.
+
+**§11.36 correction, before building "indirect dispatch over live counts":
+the premise is stale.** The capacity-proportional cost the 2026-08-15 memory
+measured predates the early-outs that shipped since — decay skips dead
+blocks (its own header: 13.3 → ~1.5 ms), the merge ladder and the orphan
+pass read `blockLive` and return, the tile bake reads it too. On Bistro the
+block pools are 45–66 % live, and the measured sweeps are LIVE-dominated:
+merge 4.8 ms ≈ 3.4 ns per live bin (eight corner reads each), tiles 3.1 ms
+over the live c0 texels' 32-bin reads, decay 1.5 ms ≈ the bandwidth of the
+live bins' seven words. A dead thread costs a launch and one cached load.
+Indirect dispatch over LIVE blocks is therefore worth ~1 ms per dispatch
+here (more on Level, where 92 % of the pool is dead — and there the sweeps
+are already small). NOT BUILT. The predicate that would pay is DIRTY —
+merge and bake only blocks whose bins changed this dispatch (deposit hits +
+parent propagation) — and the cheaper experiment before that machinery is a
+merge/tile STRIDE under the rest cadence. Both need the moving-frame receipt
+first: `profile.orbit` (an in-page orbit with a counted world dispatch rate)
+is the instrument, shipped in this commit.
+
+**§11.36 the Bistro receipt (`profile.orbit`, 6 s at 20°/s, the user's
+pose, after the restart that carries the op):**
+
+| arm | fps | gpu | render | compute | world dispatches/s | motionRest frames |
+|---|---|---|---|---|---|---|
+| default (cadence off) | 26 | 27.9 | 2.5 | 25.3 | 18.8 | 0 |
+| converged motion | 36 | 22.8 | 2.5 | 20.3 | 13.5 | 312 of 313 |
+
++38 % fps under motion, −5 ms of compute, the world chain at the rest rate
+for the whole orbit. SHIPPED DEFAULT-ON for scenes whose every light is
+static (`__giWorldMotionRest = false` opts out); the walk cost stands as
+measured on Level (err0 +23 %, reversals 1.9 → 3.0 %, maxStep/settle
+unchanged). Note the two fps columns: `fps` counts the op's own rAF ticks,
+`fpsStats` the frames the renderer presented — the engine skips rAFs it
+cannot pace, so the stats column is the honest one.
+
+### 11.37 THE MERGE/TILE STRIDE — refuted in one gate (2026-09-04, night)
+
+Skipping the merge ladder and the tile bake on odd world dispatches read
+well on the orbit (Bistro, converged motion on: compute 23.2 → 19.2 ms,
+36 → 37 fps — CPU-bound by then at 23.5 ms) and failed the one gate that
+matters: `profile.lightResponse` after the 25° sun step stayed at 1.0 for
+the whole window and never reached 90 % (t50/t90 −1, final error 60 %),
+where the same boot without the stride reads t50 2.9 s / t90 5.3 s / 95 %
+monotone / change 13 %. The ladder and the bake are not a detachable tail
+of the chain. The hatch is deleted. What the moving frame is made of after
+converged motion: compute ~23 ms, of which the world chain ~13 (at 14
+dispatches/s) and the screen chains ~10 (reflect + hit shade at half rate,
+emitter shadows at half rate, GTAO 2.6, resolve 1.8, gather 1.3). The
+parked-idle frame is ~26 ms of compute for the same screen chains — they
+are the next lever at rest AND in motion.
+
+### 11.38 THE EMITTER MARCH IS THE PRIMITIVE (2026-09-04, night; measured, not built)
+
+`__giHitEmitterShadows = false` (unshadowed emitter direct at reflection
+hits — the arm that "washed out" every mirror in §14, so never a shipping
+default) and `profile.giPasses` on the same boot: **bvhHitShade 9.3 → 0.57
+ms**. 94 % of the hit-shade pass is the emitter cone marches at hits. The
+emitter-shadow pass is the same primitive on the screen's own pixels — 8.3–
+11.4 ms per dispatch at 485×284 with one seat per pixel and the
+checkerboard, i.e. ~165 ns per any-hit march through the 1.62 M-triangle
+static shadow BVH8. Two dispatches of it per frame pair (half rate) put
+~9 ms of every rested AND every moving frame on this one march; nothing
+else in the screen chain is above 2.6 ms.
+
+The levers, in the order to measure them:
+1. The shadow BVH's SIZE — the emitter rays march the exact 1.62 M-tri
+   shadow BVH while the transport already traces a 1.19 M simplified one
+   (1 cm error); a shadow-only BVH at ~5 cm error (a few hundred k tris)
+   should halve the per-march cost, and penumbra from lamps a metre away
+   cannot see 5 cm.
+2. At reflection hits: one cheap any-hit ray per hit toward the brightest
+   admitted seat instead of the cone march per seat (the hit is already a
+   reconstruction the temporal chain smooths), or the hit shade at stride 4
+   under motion.
+3. The march length: `shadowRange` caps at 48 m on a 130 m scene; a luma-
+   scaled cap (a lamp that cannot deliver above the cutoff at distance d
+   need not be marched to d) bounds the average ray to a few metres.
+
+**§11.38 lever 1 measured — the coarser BVH does not exist through this
+simplifier.** `__giBvhSimplifyError = 0.05`, `__giBvhSimplifyRatio = 0.1`
+(live dials, staticBvhSimplify.js), boot build: the simplified set went
+1.19 M → 1.01 M triangles (2.40 M source; the 10 % floor was never reached
+— meshoptimizer with borders locked stalls at ~42 % on this geometry), and
+the shadow BVH 1.62 M → 1.44 M (the 98 mirror-visible meshes it keeps exact
+are 0.43 M of it). Per-pass: emitterShadowPass 8.3 → 7.8 ms, i.e. the
+march cost follows traversal depth and ray incoherence, not the triangle
+count. Flags cleared; a real shadow-only LOD would need decimation without
+the border lock, which is a crack, which is a leak. The remaining levers
+are the NUMBER of marches — one any-hit ray to the brightest admitted seat
+at a reflection hit instead of a cone per seat (hit shade 9.3 ms is 94 %
+those marches) — and the shadow buffer's scale under motion.
+
+**§11.38 levers 2–3 measured.** The BVH-arm emitter march is already ONE
+`traceStaticBvh` any-hit plus one mover trace per seat (and `emitterDirectAt`
+rolls the hit shade to one march per hit), so "one any-hit instead of a
+cone" is what runs today. The mover trace is a linear loop over every
+adopted object (`traceDynBody`, 27 bone capsules here) — exonerated:
+`__giSkinnedProxyCapsules = 2` (adopted movers 27 → 7) left
+emitterShadowPass at 8.7–10.2 ms and bvhHitShade at 6.6 ms. What remains
+is the static any-hit itself: ~60 ns per pixel-march at the full-pixel
+rest dispatch (138 k marches / 8.5 ms) against ~25 ns per transport ray —
+the emitter rays are LONG (to a lamp up to `shadowRange` 48 m away through
+the whole street), the probe rays mostly stop inside cascade 1. A march
+cap on the primary path is a leak through any wall past the cap, so that
+lever is closed for the primary emitter shadows (the hit shade's 16 m cap
+is the documented "bounded leak, reflections only").
+
+**The rest frame's real owner (parked, 43 fps, compute 26 ms with the
+world idle):** the animated character keeps `reflectHeldFrames` at 0 and
+every screen chain on the movers-only stride — emitter shadows, the
+reflection prepass and the hit shade re-run on the FULL screen every other
+frame for a mover that covers a few percent of it. A mover-restricted
+dispatch (early-out outside the movers' screen footprints) is the
+structural lever for the parked frame, but the footprint is not the
+mover's rect: its shadow lands elsewhere and its reflection lands on other
+surfaces, so the honest predicate is per pixel — "does this pixel's ray
+pass a mover's bounds" — which is the mover trace's own AABB test, hoisted
+before the static march. Queued, with that design.
+
+### 11.39 THE WHITE OBJECTS IN THE REFLECTIONS — the merged proxies' palette colour was white (2026-09-04, night; SHIPPED)
+
+**The report:** "some meshes still appear white in the reflections; we tried
+to fix it some time ago, but failed." The earlier attempt was
+`resolveMaterialAlbedo` (materialNodeBindings.js), written for exactly
+"consumers that inspect only the classic fields produced white reflection
+holes" — and it is not called by anything in the module.
+
+**The instrument that named them:** `profile.giSurfaces` (new op) walks
+`state.entries` and lists every slot whose PALETTE colour — what a
+reflection hit and a bounce read for that mesh — is near white, with the
+material facts behind it. On Bistro: 515 entries, luma histogram 289 /
+201 / 21 / 4, and the four white ones are:
+
+| mesh | material | why |
+|---|---|---|
+| Merged(3) | Uber(3) | colorNode is a `VarNode` (the per-vertex texture-array read), no `.map`, `.color` white |
+| Merged(6) | Uber(6) | same |
+| Merged(8) | Uber(8) | same |
+| (unnamed) | MeshPhysicalNodeMaterial | compressed map, palette white — the GPU mean never landed (the skinned mesh; not in the BVH, not the visible case) |
+
+The three uber groups are large merged batches, so a reflection landing
+on any of them read albedo 1 — and every bounce off them was white, which
+is a brightness error in the field as well as the mirror.
+
+**The fix.** `uberMaterial.js` stamps `material.userData.giMembers` (the
+member materials, by reference) on every uber it builds;
+`resolveMaterialSurface` (voxelizeOnce.js) returns the unweighted mean of
+the members' resolved colours and pre-multiplied emissives when that list
+is present (unweighted because an uber is cached per material SET and
+shared by every group with that set; a member whose compressed map is
+still pending re-resolves on the next scan, as before). The reflection
+atlas is untouched: an uber has no `.map`, so its slot reads the palette
+mean, which is now the members' mean rather than white.
+
+### 11.40 THE STATIC VISIBILITY CACHE — the emitter shadow pass stops re-marching a world that has not moved (2026-09-04, night; SHIPPED, default on; the held march halves)
+
+**The parked frame's owner (§11.38):** with an animated character every
+screen chain runs on the movers-only stride — the emitter shadow pass
+re-marched every pixel of the screen against the STATIC BVH every other
+frame, ~8.5 ms per dispatch on the user's Bistro, for a static answer that
+had not changed. The march is one static any-hit plus one mover trace per
+seat; the static any-hit is the ~60 ns, the mover trace is cheap (§11.38's
+capsule experiment).
+
+**The unit.** Three cache textures beside `emitterShadowRaw`
+(`createGiTargets`): per pixel and per seat the static-only visibility, the
+static blocker distance (−1 = none), and a stamp `generation·4096 +
+emitterId` (a float32 texture, exact). GISystem bumps the generation
+whenever the static g-buffer key moves and sets a refresh stride
+(`EMITTER_STATIC_STRIDE` 4) only on movers-only frames; a moving camera
+keeps stride 1, i.e. the old full march. The seat-rotating emitter pass
+hands `emitterSlotShadow` a per-seat cache accessor (`valid` = the stamp
+matches this generation AND this lamp; `march` = stride 1 or this pixel's
+turn; `store`), and `#buildEmitterRecordTrace`'s BVH arm consults it before
+the static any-hit: a valid, non-refresh entry is read back, anything else
+marches and stores. The MOVER trace runs every frame either way, so the
+character's shadow stays live at full rate — that is the whole point: the
+static world is cached, the movers are not. The stride keeps the
+area-sampled penumbra integrating (one pixel in four re-samples its jitter
+per held frame). `__giEmitterStaticCache = false` marches every pixel;
+`__giEmitterStaticStride` pins the stride.
+
+**The first build did not compile, and the harness could not tell.** The
+pass loaded the three cache textures through `texture()` nodes and stored
+to the same textures with `textureStore` in one kernel; WGSL binds a texture
+ONE way per kernel, so the store resolved against a `texture_2d<f32>`
+binding: `no matching call to 'textureStore(texture_2d<f32>, vec2<u32>,
+vec4<f32>)'`. Three logs it as an async pipeline failure and simply never
+dispatches the pass — the smoke that "passed" with it (parked 91 fps) was
+measuring a frame with NO emitter shadows at all. The fix is the idiom the
+shadow-history snapshots already use: a READ set and a WRITE set
+(`emitterStaticVis/T/Stamp` + `…Next`), the marcher loads the read set and
+stores the write set, and `createGiEmitterStaticSnapshotPass` copies write
+→ read right behind it in the emitter chain (0.01–0.02 ms; it rides every
+list the marcher rides: the queue, the idle path, the no-emitter skip set,
+the movers-only cadence skip, the cold-shadow set, the resize splice). The
+stamp is `(gen+1)·8192 + emitterId + 1` (never the fresh texture's 0; exact
+in f32 with `gen` wrapped at 1024).
+
+**Receipt (the user's Bistro, 1612×943, 4 emitters, emitter target 314×184,
+`profile.giPasses`):**
+
+| emitter shadow pass | ms / dispatch |
+|---|---|
+| stride 1 (every pixel marches + stores) | 1.93 |
+| movers-only arm: static cache, stride 4 | 1.01 |
+| write → read snapshot | 0.01 |
+
+The static any-hit was ~1.2 ms of the 1.9; the held frame keeps a quarter
+of it plus the per-pixel fixed cost (g-buffer loads, seat select, cache
+rows, penumbra). `profile.giPasses` now carries that arm by name
+("emitterShadowPass (movers-only: static cache, stride N)"): it sets the
+stride uniform, fills the cache through the snapshot, times the pair and
+restores — the frame loop only applies the stride on movers-only frames,
+and the cache is invalid all through a boot (the static key moves with
+every rebuild). ⚠ The scene's animated character had been removed between
+the two reloads (`adoptedMovers 0`, `moverOnlyFrames 0`), so the frame-loop
+path itself (a held static key with a live mover) has no receipt yet; with
+the character present the MOVER trace (27 bone capsules per seat) stays at
+full cost by design — the cache is the static world only. Sponza in the
+harness has the character but 0 emitters (the arm reports "NOT dispatched
+— 0 emitters"); Bistro in headless Chrome never produced a field in 900 s
+(`BOOT_DEADLINE_S` is now an env on the smoke) — the editor is the only
+place both exist.
+
+**What it does not cover yet:** the hit shade's emitter marches at
+reflection hits (the same closure, a different pixel — the cache accessor
+is per pass, and the hit shade does not pass one yet) and the reflection
+prepass. Both are the same pattern. The larger number on the same pose is
+elsewhere: at the parked pose after this reload the world chain is 33.8 ms
+per dispatch (shade + bounce 14.0, deposit trace 11.1 — the sun reads
+MOVABLE on this save, so §11.34's idle never engages), bvhReflect 19.5 ms
+and bvhHitShade 10.3 ms are held while parked and paid in full under
+motion — the under-motion frame at this pose is ~70 ms of compute.
+
+### 11.41 ONE MATRIX WALK PER FRAME — the frame walked the scene three times (2026-09-04, night; SHIPPED, default on; `__engineWalkPerRender = true` restores the old behaviour)
+
+**Where the moving frame's CPU went.** `profile.orbit` grew a `phases`
+option (the CPU phase capture armed 0.5 s into the orbit and stopped with
+it — a parked `profile.cpuFrame` cannot see what motion adds), and
+`merging.sync` grew two sub-marks. On the user's Bistro at the parked pose
+after the §11.40 reload, moving (20°/s orbit): CPU 22.4 ms against 17.0 ms
+of GPU — a CPU wall — of which `gi.gbufferPrepass` 6.4, `renderEncode` 8.6,
+`merging` 2.2. The merging sub-marks said the whole of merging was
+`scene.updateMatrixWorld()` (`merging.matrixWorld` 2.107 ms,
+`merging.watch` 0.097): three recomposes every `matrixAutoUpdate` object it
+visits whether or not anything moved, and the frame paid that walk THREE
+times — merging's motion watch, the GI g-buffer prepass render and the main
+render (three walks inside every `render()` while
+`scene.matrixWorldAutoUpdate` is true).
+
+**The unit (Engine `#tick`, `PHASE.matrixWorld`).** After scripts, physics
+and animation have written the frame's transforms and before batching /
+merging / the pre-render passes, the tick walks the scene ONCE
+(`#walkSceneOnce`) and switches the scene's `matrixWorldAutoUpdate` off; the
+renders inside the tick (the prepass, the main pass, a postprocess
+override) skip their walks; `#endWalkedFrame` puts the flag back at the
+tick's end (and on the suspended early return) so a render outside the
+tick — a thumbnail, a probe capture — still walks for itself. Merging's
+non-dirty path no longer walks (its rebuild path keeps its own explicit
+walk).
+
+**Receipts (user's Bistro, 1612×943, 357 draws, `profile.cpuFrame` /
+`profile.orbit phases`):**
+
+| | CPU ms | of which | fps |
+|---|---|---|---|
+| parked, before | 14.2 | renderEncode 7.5 · merging 2.27 | 38 (GPU-bound, 30 ms) |
+| parked, after | 11.8 | renderEncode 5.4 · matrixWorld 1.78 · merging 0.15 | — |
+| moving, before | 22.4 (phases 21.0) | prepass 6.4 · renderEncode 8.6 · merging 2.2 | 34.8 |
+| moving, after | 16.0 (phases 14.3) | prepass 2.5 · renderEncode 6.3 · matrixWorld 1.8 · merging 0.16 | 39.0 |
+
+−6.4 ms of CPU on the moving frame (three walks became one), −2.5 parked.
+Console clean after the reload. The moving frame is still CPU-bound (16.0
+vs 12.5 ms GPU); what is left of it, named: `renderEncode` 6.3 (357 draws
+plus three's render-list build), `gi.gbufferPrepass` 2.5 (a second
+render-list build and ~500 g-buffer draws), `gi.screenChain` 2.3 (84
+compute dispatches at ~27 µs each — the per-cascade loops of
+populate ×18 / rays ×21 / merge ×8 could be single dispatches), and the one
+walk itself at 1.8 (`matrixAutoUpdate = false` on static entities would
+skip the recompose, but every transform edit in the editor would then have
+to call `updateMatrix()` — not tonight). Parked, the frame is the GPU's:
+the world chain at rest (15 Hz, 33.8 ms per dispatch) because this save's
+sun reads MOVABLE (`worldIdleReason "1 of 1 lights movable"`) — §11.34's
+−10 ms is one inspector click away, and it is the user's click.
+
+### 11.42 WHERE THE MOVING FRAME GOES NOW — two instruments, one attribution, and the next unit sized (2026-09-04, late night; instruments SHIPPED, the unit PROPOSED)
+
+**Instruments.** (1) `render.project@<phase>` / `render.draw@<phase>` —
+sub-marks wrapped around three's `_renderScene` and `_renderObjects`
+(Engine `#installRenderMarks`, keyed by tick phase so the GI prepass under
+`preRender` and the main pass under `renderEncode` read apart). (2)
+`profile.orbit` returns `dispatchesPerSec` — every GI pass that actually
+dispatched while moving, per second, grouped (populate#k → populate) — so
+the moving GPU budget is rates × `profile.giPasses`' per-dispatch ms
+instead of a parked guess.
+
+**The moving frame (user's Bistro, 20°/s orbit, after §11.41):** 34.6 fps;
+CPU 14.5 ms = main draw loop 4.96 (359 draws, 13.8 µs each) + main
+render-list build 1.30 + prepass build 1.20 + prepass draws 1.10 +
+`gi.screenChain` 2.48 (84 dispatches) + the one walk 2.04 + ~1.4 other. GPU
+17.6 ms compute, and the tally says why: the world chain dispatches 20.6×/s
+(every 1.7 frames) at 34 ms per dispatch; the emitter chain, the hit shade
+and the reflection pass every other frame (17.3/s); the screen passes every
+frame. By share the world chain is ~⅔ of the moving GPU, and inside it
+`shade + bounce [J]` 11.9 ms and `deposit (trace + attribute)` 8.6 ms are
+the frame.
+
+**The prize, measured.** `__giSrcNoShadow = true` (the shade kernel's
+`visibility` closure removed; the light tree still samples, nothing marches)
+and a GI rebuild:
+
+| | shade + bounce [J] | world chain / dispatch | parked GPU | parked fps |
+|---|---|---|---|---|
+| marches on | 11.9 ms | 34.0 ms | 25.4 ms | 36 |
+| marches off | 0.48 ms | 18.9 ms | 12.1 ms | 69 |
+
+96 % of the world shade is ONE any-hit march per hit — the light-tree NEE
+sample's visibility to its chosen lamp (the sun rides the shadow map,
+`__giSunShadowMap`; movers are not in the world visibility,
+`__giSrcBvhShadowMovers`). 73 k hits × ~156 ns. It is the §11.40 primitive
+again — static surface, static lamp, an answer that does not change — and
+the per-frame re-march of it is the moving frame.
+
+**The next unit (proposed, not built): the per-probe direct cache.** The
+tiles pass already keeps, per probe, an OCTAHEDRAL map keyed by surface
+normal (`sampleTile(block, normal)`, 64 texels) of the outgoing radiance the
+hit shader reads for the bounce term [J]. Its sibling: a map of the lamps'
+DIRECT irradiance `E_emit(probe, normal octant)` with a sample count. At a
+hit on a static surface the shader finds the hit's c0 probe (one hash
+lookup, `meanProbeSteps` 1.04), reads the texel; converged (N ≥ K) → `E` is
+the texel and NOTHING marches; else it shades as today and folds the sample
+into the texel (running mean; a lost update between two hits in one
+dispatch only slows convergence). Fill rate: 73 k samples per dispatch over
+the visible probes' texels, converged in ~2 s at 20 dispatches/s; a camera
+entering new space marches only for the NEW probes. Invalidation is the
+lights/emitters field-hash generation, stamped per probe (a light drag
+returns the cost to today's for as long as it moves — so the
+`profile.lightResponse` gate is unchanged by construction — and the cache
+refills after). Resolution = the field's own (probe spacing); the bounce of
+lamp light cannot be finer than the probes that carry it. Memory: 16 texels
+per probe at RGBA16F (a 4×4 octant map is enough for an irradiance term)
+≈ 15 MB at today's pool. Expected: world chain 34 → ~19 ms per dispatch
+once converged; moving GPU 17.6 → ~10 ms, parked 25 → ~12 ms — 60 fps in
+BOTH states on this pose with the sun still movable, which is the mandate.
+The sun click (§11.34) then stacks on top for the parked state.
+
+**Not this unit:** the hit shade's own emitter marches at reflection hits
+(bvhHitShade 3.4 ms per dispatch here; §11.38 measured 94 % marches on a
+heavier pose) read the same cache at the reflection hit's probe — a second
+consumer, once the first ships.
+
+### 11.43 "FREQUENT MINI FREEZES WHILE MOVING" — the heavy chains shared a frame (2026-09-05, small hours; SHIPPED, default on; `__giWorldStagger = false` restores the collision)
+
+**The report (the user, sun now static):** "its 60+ fps when camera is
+static, but when moving, it is on 30 fps with frequent mini freezes".
+
+**The instrument had to move the camera itself.** Two manual
+`profile.spikeWatch` windows (20 s and 25 s) read 60 fps and 0–2 spikes —
+the camera was parked both times. `profile.orbit` grew `spikes: true`
+(the spike watch armed 0.5 s into the orbit, closed with it; implies the
+CPU phase capture) and the spike watch grew a RAW per-resolve GPU series
+(`gpuFrames`: mean, max, over40, under12, the last 80 values) — because a
+frame whose marked CPU phases sum to a third of its length is the main
+thread waiting on the GPU, and only the unsmoothed series shows what the
+GPU did frame by frame.
+
+**What it showed (15 s orbit at 25°/s, the user's Bistro, sun static, world
+in converged motion at 14.3 dispatches/s):** 41 frames ≥ 40 ms, worst 94.5,
+CPU phases explaining 25–30 ms of each; the GPU series alternating ~65 / ~6
+ms. The mechanism: under the motion half-rate the emitter, hit-shade and
+reflection chains all dispatch on `_frame % GI_MOVER_ONLY_STRIDE === 0`
+frames, and the world chain's due-ness is a wall-clock timer that lands on
+either parity — half the world ticks stacked their 34 ms on a frame already
+carrying ~30 ms of screen chains, and the next frame carried almost
+nothing. Same mean, twice the variance, and the variance is the freeze.
+
+**The unit.** A world tick that comes due on a heavy screen frame waits
+ONE frame — the next heavy frame is two away, so it never waits twice —
+and keeps its due-ness (`_srcWorldNextAt` put back to now).
+`_moverCadenceHalfRate` records whether the half-rate is on this frame;
+`frameStats.giHold.worldStaggered` / `profile.orbit.worldStaggered` count
+the deferrals.
+
+**A/B on ONE boot, the same orbit (`profile.orbit spikes:true`):**
+
+| | fps | spikes ≥ 40 ms / 15 s | worst frame | raw GPU max | GPU frames ≥ 40 ms | GPU mean |
+|---|---|---|---|---|---|---|
+| stagger off (`__giWorldStagger=false`) | 35.7 | 70 | 159.6 ms | 72.8 ms | 39 of 160 | 25.4 |
+| stagger on | 37.8 | 26 | 54.5 ms | 52.1 ms | 17 of 182 | 20.9 |
+
+**What is left, named.** The frames are now ~40 / ~18 ms instead of
+65 / 6: the world frame (34 + 6 of screen) is the heavy one. Two follow-ups:
+(a) the per-probe direct cache (§11.42) takes the world dispatch 34 → ~19
+ms and with it the heavy frame to ~25 — the mean AND the variance; (b) the
+world chain in two segments on consecutive frames (populate / rays /
+trace + attribute on one, decay / shade / resolve / merge / tiles on the
+next — the split point must keep the gather reading a fully resolved field
+in between, so decay moves behind the trace) would balance the two
+parities at ~26 / ~26. (a) is the one with a mean in it.
+
+### 11.44 THE WORLD VISIBILITY CACHE — the shade kernel stops re-marching a static lamp over a static surface (2026-09-05, small hours; SHIPPED, default on; `__giSrcVisCache = false` is the old kernel)
+
+**What it is.** §11.42 measured 96 % of `shade + bounce [J]` as ONE any-hit
+march per hit: the light-tree sample's visibility to the lamp it picked. The
+cache keeps that answer per WORLD CELL and per lamp: an open-addressing hash
+of cells (spacing `2·spacing0` = 0.7 m, capacity 2^18, the probe store's
+`hashFindWgsl` / `hashInsertWgsl` — exported for it — claim and find) with
+16 packed rows per cell of `(lamp << 16 | vis·255 << 8 | samples)`. A pick
+whose (cell, lamp) row holds K = 4 samples reads the mean and does NOT
+march; otherwise it marches and folds the sample in (running mean, last
+writer wins between two hits of one dispatch — a slower fill, never a
+wrong one); with 16 rows full, the least-sampled row is replaced. One
+sample in eight on a converged row still marches (a pure function of the
+ray index — deterministic, no boil) so a row keeps converging past K.
+Invalidation: a moving light (GISystem's `trackMotion` window) and a lamp
+that moved, appeared or was added (the light-tree refresh's pose rows —
+NOT a power change, which rebuilds the tree but cannot change visibility)
+arm `visCacheClearU` for the next 8 update ticks; the gated clear rides the
+world chain before the shade (`src:vis cache clear`, 0.006 ms when not
+armed). Movers are not in the world visibility (`__giSrcBvhShadowMovers`),
+so nothing about them is cached. Cell spacing and K are LIVE uniforms
+(`__giSrcVisCacheSpacing`, `__giSrcVisCacheK`; a spacing change clears).
+
+**Three things the receipts had to say before it worked.**
+1. **v1 keyed on the hit's c0 probe** — the counters said 65 % of samples
+   found NO probe under the hit (rays land where the camera has not put
+   probes) and 19 % found the 8 rows full. Hence the cell hash.
+2. **The per-frame counters are the last WORLD frame's** — under a parked
+   idle world they are stale, and `profile.giPasses`' own 40 dispatches do
+   not show in them. A readback of the whole row table (`visCacheTable`:
+   cells, rows, sample-count histogram) is what said the rows DO
+   accumulate (max 35 after 40 shades of one hit set) but 455 k rows against
+   192 k samples per dispatch fill one row every few dispatches — K = 8 at
+   0.35 m cells took seconds per row, and a moving camera never got there
+   (23 % served). 0.7 m cells and K = 4: 56.5 % served at steady state.
+3. **A first guess blamed the light-tree refresh** (it invalidates on every
+   rebuild) — a tally of its change reasons in `frameStats.giHold.
+   lightTreeChanges` read ONE refresh and ONE invalidation for the whole
+   boot. The guess was wrong; the tally is what said so.
+
+**Receipts (user's Bistro, sun static, 15 s orbit at 25°/s, `profile.orbit
+spikes:true`; the world in converged motion at 12–14 dispatches/s):**
+
+| arm | fps | GPU mean (raw) | frames ≥ 40 ms | spikes / 15 s | served |
+|---|---|---|---|---|---|
+| no cache, stagger on (§11.43) | 37.8 | 20.9 | 17 / 182 | 26 | — |
+| cache K=4, 0.7 m | 41.3 | 19.1 | 18 / 170 | 19 | 56.5 % |
+| cache K=2, 0.7 m | 39.3 | 24.0 | 19 / 151 | 24 | — |
+
+`profile.giPasses` after the K=4 orbit: `shade + bounce [J]` 10.25 ms for
+96 k hits (107 ns/hit against 175 before); 40 k samples served, 31 k
+marched, 11.7 k still filling. The light-response gate with the cache: step
+25°, change 18 %, t50 1.48 s, t90 4.3 s, 100 % monotone — the tracking
+window opened (`trackWindow max 1`), i.e. the clear fired by design and the
+field followed the sun as before. Console clean on every reload.
+
+**⚠ The orbit-to-orbit variance is the FIELD, not the cache.** Each orbit
+populates a wider ring: live probes 21 k → 102 k over the night, and the
+world chain's other passes grew with it (tiles 1.2 → 5.1 ms, merge 0.9 →
+4.2, deposit resolve 0.9 → 3.4, decay 0.7 → 2.3 per dispatch). The K=2 arm
+ran on the bigger field. A per-dispatch cost that scales with the live
+population is its own unit (retirement / the pool ladder), and it is why
+the moving GPU mean did not fall by the whole 11.9 → 0.48 the §11.42 prize
+promised — half the shade was won, the other passes grew underneath.
+
+**Left on the shade itself:** the cache path's own per-hit cost (a hash
+probe, a 16-row scan and a store, ×2 picks ≈ 50 ns/hit) is now a third of
+the kernel; 8 rows with the replacement policy, or a 2-word row (two lamps
+per word), would take most of it. And the hit shade's emitter marches at
+reflection hits (`bvhHitShade`) read the same table at the reflection hit's
+cell — the second consumer, not wired yet.
+
+### 11.45 THE WORLD CHAIN IN TWO HALVES — no frame carries the whole transport (2026-09-05; SHIPPED, default on; `__giWorldSplit = false` restores the single block)
+
+**Why the stagger was not enough.** §11.43 moved the world tick off the
+heavy screen frames; the moving frame then alternated ~40 / ~18 ms, because
+the world dispatch is ONE block of ~38 ms and a cadence can only make a
+block rarer, never smaller. The user's report — "60+ fps when the camera is
+static, 30 fps with frequent mini freezes when moving" — is that block.
+
+**The unit.** The chain splits at the deposit's TRACE + ATTRIBUTE
+(`#worldSegmentBoundary`, matched on the pass name, so a feature arm
+without that pass simply does not split):
+
+| | segment | passes |
+|---|---|---|
+| A | trace | populate, hashBlock, rays, decay, seed, trace + attribute |
+| B | resolve | vis-cache clear, shade + bounce [J], deposit resolve, merge, tiles |
+
+A runs when the chain is due (with §11.43's heavy-frame rule); B runs on
+the next frame that is not a heavy screen frame, regardless of the timer,
+and outranks starting another A. **The gap between them is safe because
+only the BINS are mid-update in it** — the probe payload and the tiles the
+gather reads are still last tick's fully resolved state, and nothing
+outside the chain reads bins. The split stands down while any pass is
+unbuilt or a compile wave is running (§11.7: the chain runs whole, or it
+kicks compiles — never with holes).
+
+**⚠ The first build halved the transport's rate.** `dispatchedPreviousFrame`
+— the rule that stops two dispatches landing on consecutive frames — counted
+segment B as a dispatch, so every pair cost two timer slots: chains 12.5 →
+6.3 per second and light-response t50 1.5 → 2.7 s. The rule is about how
+often a CHAIN STARTS, so it now reads the last chain start
+(`_srcWorldLastChainFrame`). ⛔ A cadence rule written for one dispatch per
+tick does not survive a tick becoming two; the light-response gate is what
+caught it, not the frame time — the frame time was BETTER while the field
+converged half as fast.
+
+**Receipts (user's Bistro, sun static, 15 s orbit at 25°/s,
+`profile.orbit spikes:true`; the RAW per-resolve GPU series is the honest
+one — an EMA cannot see a freeze):**
+
+| arm | fps | GPU mean | GPU max | frames ≥ 40 ms | spikes / 15 s |
+|---|---|---|---|---|---|
+| §11.43 stagger only | 37.8 | 20.9 | 52.1 | 17 / 182 | 26 |
+| + §11.44 vis cache | 41.3 | 19.1 | 50.2 | 18 / 170 | 19 |
+| + split (rate halved) | 43.1 | 15.7 | 37.3 | 0 / 203 | 22 |
+| + split, rate restored | 39.9 | 16.8 | 36.3 | **0 / 191** | **8** |
+
+Light response with the split: step 25°, change 34 %, t50 1.11 s, t90 3.42 s,
+99.7 % monotone (before the split, on the previous boot: t50 1.48 s, t90
+4.32 s, 100 %). `frameStats.giHold.worldSplit` says whether the halves are
+live; `profile.orbit` adds `worldChainsPerSec` because with the split a
+"world dispatch" is a SEGMENT and two of them are one chain. Console clean.
+
+**Where the moving frame stands now** (this pose, 40 fps): GPU 18.5 ms of
+compute against 20 ms of CPU — the CPU is the wall again, and it is
+`renderEncode` 8.3 (359 draws + three's render-list build), `preRender` 7.0
+(the GI prepass render + `gi.screenChain` 3.3), `matrixWorld` 2.4 and
+`shadowFreeze` 1.3. No GI pass owns a frame any more; the next unit is the
+draw submission, not the transport.
+
+### 11.46 "LOST ITS COLOUR AND ATMOSPHERE" + "RECTS ON ALL EDGES" — two look regressions, both from a cache answering where it had no right to (2026-09-05; SHIPPED)
+
+**The report (the user, Level scene, play mode):** "our gi lost its color and
+atmosphere somewhere along the edits" and, separately, "gtao has quite a huge
+radius, i kinda see rects on all edges and near the character's hands ... i
+guess we need it a bit smarter and depth corrected".
+
+**A. The colour: §11.44's visibility cache averaged across walls.** The row is
+keyed by CELL and lamp. A 0.7 m cell spans both sides of every wall, so the
+running mean of a lit face and a shadowed face is a HALF-LIT answer handed
+back to both: the lit side loses half its direct light, the shadowed side
+gains light it should not have, and the picture flattens and desaturates.
+A/B on the user's Level, same pose (`profile.giPasses`):
+
+| | cache on | cache off |
+|---|---|---|
+| direct luma at hits | 0.0149 | 0.0408 |
+| bounce / direct | 6.22 | 1.35 |
+| irradiance luma | 0.381 | 0.248 |
+| tiles meanLum / minLum | 0.443 / 0.012 | 0.239 / 0.039 |
+| far field, raw | 93, 92, 66 | 78, 66, 47 |
+
+Direct light 2.7× down, bounce up, the mean brighter, the floor of the
+histogram lifted, and the far field from warm (R−G 12) to neutral (R−G 1).
+That IS "flat, bright, no colour".
+
+**The fix: a cache may answer only where its samples AGREE.** The count is
+capped at 255, so one dissenting sample moves the stored byte off 255/0 and
+every pick in that cell marches for ever after. Cells that straddle a wall
+never converge and always pay their ray; open floor and deep shadow still
+serve. The saving is smaller and the answer is exact.
+
+⛔ **The lesson.** §11.44's own receipts (56 % served, 41.3 fps, spikes 19,
+light-response t90 3.4 s) were all TRUE and all blind to this: a shadow
+term averaged over a cell keeps every timing and stability property and
+loses the picture. Neither the frame time, the spike count nor the
+light-response gate can see a wash-out — `bounceOverDirect` and the far
+field's chroma can, and they are now the two numbers to read after any
+change to the transport's shadow term.
+
+**B. The rects: 4 taps spread over a quarter of the screen.** `MAX_REACH`
+bounded the AO RADIUS; nothing bounded the GAP BETWEEN TAPS. With 4 steps and
+a reach of 0.25 × frame height, consecutive taps land ~59 px apart near the
+camera — an occlusion estimate sampled every 59 px aliases the occluder's
+silhouette into rectangles, worst where geometry is CLOSEST (the character's
+hands). Half-resolution AO hid it behind the 2× upsample and the wider
+filter; §11.35 moved AO to full resolution, where nothing does.
+
+Two changes, both derived from depth rather than tuned:
+1. The reach is also bounded by what the tap count can resolve —
+   `STEPS × maxStepPix`, with `maxStepPix` a fraction of the buffer height
+   (1 %) so it is resolution-independent like `MAX_REACH`. Near the camera
+   this shortens the world radius, correctly: past that spacing the
+   estimator had no information there anyway. `__giGtaoMaxStepPx` pins it.
+2. The distance falloff now ramps against the radius ACTUALLY marched
+   (`Reff`, backed out of the clamped pixel reach) instead of the radius
+   that was asked for. Ramping against a radius the taps never reach left
+   the last tap at full weight — a hard cutoff at the end of the march,
+   which is the second half of the blocky edge.
+
+**C. BOTH SHADOW CACHES ARE NOW OPT-IN.** With the unanimity rule in place
+the user still reported "GI is still too flat", so the two units introduced
+this night that touch the shadow term — §11.44's world visibility cache
+(`__giSrcVisCache = true` to arm) and §11.40's per-pixel emitter static
+cache (`__giEmitterStaticCache = true`) — are OFF by default. The code and
+both fixes stay; what they lack is a LOOK receipt on the user's own scene,
+and the standing rule for this module is that opt-in state is re-flipped
+ONE AT A TIME with the user watching. Cost of the revert: ~3 fps of the
+orbit gain (41.3 → ~38) and ~1 ms on the emitter pass. The picture is worth
+more than either.
+
+**D. The reach clamp, twice.** The first build bounded the tap spacing at
+1 % of buffer height (9.4 px, reach 37.7 px), which put the effective radius
+at ~0.14 m three metres from the camera: "now there is almost no ao". The
+bound is not free to choose — the radial phase gives 4 offsets across
+neighbouring pixels, so spacing `s` interleaves to `s/4` of radial
+granularity and the ±2 px filter smooths about 5 px of it, i.e. `s ≤ ~20-24`
+px. Shipped at 2.5 % of height (23.6 px spacing, 94 px reach, ~0.35 m at
+three metres). The pre-§11.46 spacing was 59 px, four times what the filter
+can carry — which is why it printed rectangles. ⭐ The spacing and the
+filter width move together or not at all.
+
+**Still open, named:** the fine weave visible on flat walls in the user's AO
+debug capture is the 4-phase radial stratification showing through a ±2 px
+filter at full resolution (at half resolution the ±3 filter covered twice
+the screen distance). If it survives the reach fix, the filter's support —
+not the estimator — is what needs widening.
+
+### 11.47 THE LOOK REGRESSIONS, AND WHY SIX GREEN RECEIPTS DID NOT CATCH THEM (2026-09-05; EVERYTHING FROM §11.40–§11.45 IS OPT-IN AGAIN)
+
+**The user, in order:** "our gi lost its color and atmosphere somewhere along
+the edits" → "now there is almost no ao" → "i mean it looks flatter, colder,
+and fps is lower. Why the hack?" → "there are rects on the edges all over the
+place".
+
+**Two causes, neither of them in the GI transport.**
+
+1. **Flat and cold = A STALE SUN, from §11.41's single matrix walk.**
+   `LightComponent` re-aims the directional light AND rebuilds its CSM
+   frustums in an `onPreRender` callback — the phase that runs AFTER the
+   tick's one walk. With the scene's `matrixWorldAutoUpdate` switched off for
+   the tick's renders, nothing walked those changes, so every frame's shadow
+   map was rendered from LAST frame's light pose. Under a moving camera the
+   cascades never catch up: sun shadows wash out, the warm bounce that
+   depends on them goes with it, and the picture reads flat and cold.
+2. **Rects on every silhouette = §11.35's second g-buffer.** Full-resolution
+   AO means the resolve-sized g-buffer everything else reads is POINT-SAMPLED
+   down from it, at 1612/1140 = 1.41 — not integral. At a silhouette the
+   downsampled texel takes the foreground or the background surface in a
+   repeating pattern, the GI shades those pixels from the wrong surface, and
+   the result is bright dashes marching along every edge. Rendering the
+   g-buffer AT the resolve size rasterises the edge instead of resampling it.
+
+**⛔⛔ THE METHOD FAILURE, WHICH IS THE REAL ENTRY.** Six units shipped in one
+night, each with green receipts: frame time, spike counts, raw GPU series,
+`profile.lightResponse` t50/t90/monotone, `profile.flicker` churn. Every one
+of those numbers is blind to a wash-out, a stale sun and an edge artifact —
+a transport fed a stale light reports perfect stability, and a shadow term
+averaged across a wall keeps every timing property it had. **A perf unit that
+touches the shadow term, the light's transform, or the g-buffer's resolution
+is a LOOK change and needs a look receipt before it ships, not after.** The
+numbers that would have caught these: `secondary.byLod[].bounceOverDirect`
+(0.15–0.49 healthy, 6.2 = direct collapsed), `farField.rawRgb8` chroma, and
+the user's own eye on their own scene.
+
+**State now — every unit from tonight is OFF by default, arm with `= true`:**
+
+| hatch | what it was worth | why it is off |
+|---|---|---|
+| `__giSrcVisCache` (§11.44) | +3.5 fps orbit | averaged the shadow term across walls |
+| `__giEmitterStaticCache` (§11.40) | ~1 ms emitter pass | same class, unproven on the picture |
+| `__engineWalkOnce` (§11.41) | −6.4 ms CPU moving | stale sun (fix: walk the preRender movers too) |
+| `__giWorldSplit` (§11.45) | 0 frames ≥ 40 ms | halves the full-chain rate, 12.5 → 7.3/s |
+| `__giWorldStagger` (§11.43) | spikes 70 → 26 | defers world ticks; off while the look is judged |
+| `__giAoFullRes` (§11.35) | sharper AO | the 1.41 downsample dashes every silhouette |
+
+Kept on: the instrumentation (§11.42's render sub-marks, `profile.orbit`'s
+`phases`/`spikes`/`dispatchesPerSec`, the visibility-cache counters) and
+§11.46's AO tap-spacing bound, which can only reduce aliasing
+(`__giGtaoMaxStepPx = 42` restores the old unbounded reach).
+
+### 11.49 THE PER-PROBE RAY CAP IS A SHARE OF THE BUDGET, NOT A CONSTANT (2026-09-05; SHIPPED)
+
+**The user:** "why there is so little bounce so GI looks so flat and boring?"
+… "we need to adjust based on the scene, so we get optimal GI in any scene".
+
+**The constant was tuned on one scene and starved every smaller one.** The
+tier cap is 8 rays per probe per dispatch, measured on Bistro where ~14.8 k
+live c0 probes fill it and the frame fires ~93 k of its 393 k ray ceiling. The
+user's Level runs **2,188** live c0 probes, so 8 each is 16.7 k rays — **4 % of
+the ceiling** — while the merge reported **half those probes starved** and
+`tiles.knownFrac` sat at 0.55: 45 % of every probe's directions had no measured
+radiance and were filled from a neutral prior. A budget was being left unspent
+in exactly the scenes that most needed it.
+
+**The unit.** `cap = clamp(share × ceiling / liveC0, tierCap, CAP_MAX)` with
+`share = 0.25` and `CAP_MAX = 32`. The share is deliberately a quarter: on
+Bistro it evaluates to 6.6, the tier floor keeps the tuned 8, and §11.30's
+measured win (SRC 48 → 19 ms) is reproduced exactly; on a small scene it lifts
+toward 32 and spends the ceiling that was already paid for. `liveC0` comes from
+the `readStats` readback that already runs every 60 frames — the right
+timescale for a population that changes as the camera walks. The rest branch
+still halves, but it halves THE SCENE'S cap rather than the constant.
+`__giSrcCapBudgetShare = 0` restores the constant.
+
+**Receipts (user's Level, same pose, before → after):**
+
+| | before | after |
+|---|---|---|
+| probe ray cap | 8 | 16 (32 lifted, halved at rest) |
+| rays / frame | 16,738 | **29,386** |
+| c0 probes starved | 1,122 of 2,224 | **300 of 2,188** |
+| bounce / direct | 1.054 | **1.242** |
+| far-ray share | 42.5 % | **33 %** |
+| merge orphan rate (all) | 8.1 % | **4.5 %** |
+| c2 orphan rate | 18.4 % | **9.4 %** |
+| SRC chain GPU | 6.14 ms | 6.16 ms |
+
+Starvation down 73 %, rays up 76 %, a fifth more bounce per unit direct, a
+third fewer rays wasted on the far field — **at no measurable GPU cost**,
+because the extra rays ride passes that were already dispatched.
+
+**⛔ TWO BUGS FOUND ON THE WAY, both of the same shape.**
+1. `__giSrcProbeRayCap` was PINNED to 8 in the user's localStorage from an
+   earlier debugging session, and a pinned cap disables every lift path by
+   design. `__giSrcStarvePackets` was pinned to 4 against a shipped default of
+   8 — halving the §11.16 mechanism that fixes exactly this symptom. **A dev
+   flag left in localStorage is indistinguishable from a shipped default when
+   reading the picture.**
+2. The pin test was `Number.isFinite(Number(flag))`, and clearing a flag can
+   leave the property present as `null`: `Number(null)` is 0, which is finite,
+   so a CLEARED pin still read as pinned. Now requires a finite value > 0.
+
+### 11.51 THE DARK BANDS ON THE WALLS ARE THE GATHER'S PLANE WEIGHT, AND ITS FLOOR IS A DELETION (2026-09-05; SHIPPED, default on; `__giGatherPlaneFloor = 0` restores the old behaviour)
+
+The user, with their own beauty/path-tracer pair at one pose: *"most bounces seem
+to get lost, and we still have dark bands on the walls."* Two complaints, two
+different causes, and only one of them is fixed here.
+
+#### The bands
+
+`srcScreenGather`'s §13.7d plane weight fades a trilinear corner that sits behind
+the shaded surface's tangent plane, `weight *= smootherstep(pd/depth + 1)`, and
+floors the result at **1e-3**. That floor is not a weight, it is a DELETION, and
+the algebra says every behind-plane corner reaches it: the fade depth is
+`min(0.35·s, gatherPlaneDepth())` = **12 cm** at c0 while a cube corner sits up
+to `s·sqrt(3)` = **61 cm** behind the plane. So the stencil is never the trilinear
+eight; it is whatever subset happens to be in front — and THAT SUBSET CHANGES
+where a wall meets a floor or a ceiling. Which is exactly where the stripes are.
+
+- **The depth dial cannot reach this and a sweep of it measures nothing.**
+`min(0.35*s, depth)` is already 12 cm, so raising `__giGatherPlaneDepthLive` to
+1e6 changes no term. Measured, live, no rebuild, six arms 0.15 / 1e6 / 0.15 /
+1e6 / 0.03 / 0.15: top-strip ratio .649 .654 .655 .659 .660 .661 — a monotone
+convergence drift and nothing else. An hour went into that null before the
+algebra was read. **The floor, not the depth, is the whole knob.**
+
+THE RECEIPT (`scripts/gi-look-ab.mjs`, user's Level, one pinned pose; the metric
+is an edge strip's mean irradiance divided by the open wall's, so 1.0 = no stripe
+and the scene's ~2x boot spread divides out):
+
+| arm | top | bottom |
+|---|---|---|
+| plane weight ON, floor 1e-3 (before) | .516 .507 .392 .371 | .412 .420 .323 .297 |
+| plane weight OFF entirely | .880 .886 | .873 .880 |
+| **floor 0.2 (shipped)** | **.803 .746 .738** | **.748 .705 .702** |
+
+Bimodal, no overlap, four alternating rebuilds per pair. And the cost side is
+empty: with the weight fully OFF the frame mean moved < 2 %, the open wall's own
+value moved < 2 %, and **no enclosed region brightened** — pillar shadow side
+x0.97, pier side x0.99, arcade recess x1.00, ceiling x1.02. The leak this guard
+exists to stop did not return, so on this scene its entire measurable effect was
+the artifact.
+
+It still has to hold Bistro (§14 Q9's reason for defaulting it on: a facade pixel
+interpolating the four corners INSIDE the building, black with the sky off). A
+RATIO does that and a deletion is not needed for it — at floor 0.2 a front corner
+outvotes a behind one 5:1, which turns a black interior probe from "the answer"
+into a 17 % error, and the stencil can no longer collapse at a junction.
+
+- The old note at `gatherNormalWeightExp` predicted this artifact with the sign
+reversed — "BRIGHT BANDS at wall edges ... corners brighten, where reality darkens
+them" — and prescribed scaling by the kept-weight fraction instead of
+renormalizing. On this scene the strips are DARK and the open wall is right, so
+that fix would have deepened them. The note was written about the earlier
+direction-cosine form; the prescription did not survive the form change.
+
+#### The bounce deficit is ONE NUMBER, and it is not any of the four usual suspects
+
+The user's own pair: mean linear luma **0.0772 vs 0.2226**, i.e. **2.88x short**,
+with the sunlit patches matching 1:1 and the ratio growing to 4-5x on the floor
+and lower walls — the signature of missing higher-order transport, not of a
+missing first bounce or an exposure mismatch.
+
+**THE ROUND-TRIP GAIN.** The transport is a fixed point: hits deposit radiance
+`Ld + Lb`, the field integrates it back as irradiance `E`. In an enclosure at
+equilibrium `E = pi*(Ld + Lb)`, so
+`gain = meanIrradianceLuma / (pi * (meanDirectLuma + meanBounceLuma))`
+is what one bounce actually survives — and being a ratio of two numbers **from
+the same frame**, it is immune to the boot spread that makes every absolute
+reading here useless. Across 26 arms it reads **0.50-0.61**, dead stable. With
+`meanLoopAlbedoLuma` 0.687 the multi-bounce series converges to
+`1/(1 - 0.687*0.53)` = **1.57x** instead of `1/(1 - 0.687)` = **4.74x**.
+
+**3.0x missing, which is the user's 2.88x to within the measurement.** Every
+future energy unit should be scored on `gain`, and nothing that leaves it at 0.53
+can close this gap however good its other numbers look.
+
+REFUTED as the cause, each in a paired rebuild:
+- **merge orphans** — 24.7 % of bins orphan but `orphanLiveRate` is **0.000**:
+  every one is opaque (selfT = 0), byte-identical to a merge. The headline rate
+  has been quoted as a deficit before; it is not one.
+- **the merge's LOS** — `__giMergeLos = false` drops `losRate` .148 -> 0 and moves
+  the gain .533 vs .529 base. Nothing.
+- **`knownFrac`** — `__giMergeFillUnknown = true` lifts it .553 -> **.820**, a real
+  and large coverage win, and the gain does not move (.528 vs .529). It also
+  takes `orphanLiveRate` .000 -> **.321**: a filled bin is no longer "unknown", so
+  it enters the merge and can orphan LIVE. Coverage bought with long-range light.
+- **the far prior** — `__giSrcFarPrior = false` moves the gain .529 -> **.573**,
+  the only lever that moved: worth ~7 %, not 200 %.
+
+OPEN, and where the far prior's 7 % points: `createGiFarFieldAvgPass` publishes
+the screen gather's mean **irradiance** E, and its consumers (the merge's orphan
+branch, the fresh-probe seed) read `E/pi` as a **radiance**. That is the radiosity
+of an albedo-1 surface carrying NO DIRECT LIGHT. Measured here: prior 0.060
+against a true mean hit radiance of 0.117 — **the far field is half as bright as
+the world it stands for.** The number it should carry, `rho*E/pi` plus the mean
+direct radiance, is already tallied every frame by the secondary pass
+(`meanDirectLuma + meanBounceLuma`); wiring it GPU-side is the next unit.
+
+#### The rig, and why nothing measured before this session could be trusted
+
+- **A LIVE "PIN" THAT ONLY WRITES WHEN THE FLAG IS SET LATCHES FOR EVER.**
+  All four `__giGather*Live` dials read `if (Number.isFinite(pin)) uniform = pin`,
+  so DELETING the flag left the last pinned value in place and the arm called
+  "restore the default" re-measured the previous arm. This session lost three
+  arms to it (LOS pinned to 0, cleared, still 0) before the picture stopped
+  making sense. Fixed: a cleared pin now restores the build-time default through
+  the same shared reader the mirror uses. **An A/B rig that cannot return to its
+  own baseline is worse than none — it produces confident numbers.**
+- **The MCP CLI races the broker.** `client.connect` resolves when the stdio
+  server is up; the server then dials the broker and the broker then finds the
+  editor. A call landing in that gap fails with *"needs the engine editor to be
+  running and connected"*, which reads exactly like the editor being down. Every
+  spurious arm failure was this. `gi-look-ab.mjs` now polls `editor_status` first.
+- **The path-tracer debug view resets its accumulation when the camera is
+  touched.** The rig re-pinned the pose every 500 ms to fight pose drift, which
+  held the reference at ONE SAMPLE — a bright, band-free, shadowless room that is
+  extremely convincing and is not a reference. `--pin once`. (The same flat frame
+  appeared mid-rebuild and was briefly read as a 6x brightness win; it was the GI
+  being off.)
+- **The metric has to be a ratio.** `mid` (the open wall's own irradiance) read
+  .0100, .0128, .0134, .0205 across four captures of the SAME configuration — the
+  documented ~2x spread. The stripe ratio and the round-trip gain both normalize
+  it out and are stable to +-0.02.
+
+### 11.52 THE SKY WAS A POINT SAMPLE PER BIN, AND THE HDRI'S SUN NEVER ENTERED THE TRANSPORT (2026-09-05; SHIPPED, default on; `__giSkyBins = false` restores the per-bin texture tap)
+
+**The report.** The user's Level, their own beauty/path-tracer pair at one
+pose: "ours has a lot less light bounces", with a guess that the glossy
+floor was cutting the bounce. Measured on the pair (linear luma, regions):
+
+| region | ours | tracer | ratio |
+|---|---|---|---|
+| sun patches (green wall, left wall) | .544 / .504 | .571 / .642 | 1.05 / 1.27 |
+| ceiling (mid, left) | .070 / .089 | .218 / .295 | 3.1 / 3.3 |
+| left wall in shadow | .083 | .342 | 4.1 |
+| green wall in shadow | .015 | .055 | 3.6 |
+| floor mid | .060 | .195 | 3.2 |
+| whole frame | .097 | .223 | 2.3 |
+
+Direct matches; every indirect region is 3–4× dark. **The floor is not
+it**: its palette entry is albedo 1.0 (the graph's `#ffffff`), the mirror
+mask (`giNormal.w`) is never read by the SRC population, and `profile.giPasses`'
+per-hit ledger at this pose read gain 1.03 — the bounce loop was at its own
+equilibrium. Whatever was missing was INPUT to the loop, not transport.
+
+**The input.** `Belfast Farmhouse_2k.hdr`, environment intensity 1,
+lighting on. Read on the CPU (cv2): up-facing irradiance 4.39, of which
+**3.70 (84 %) is a sun** — 418 px above 50× the sky median, peak radiance
+179 830, elevation 21.7° — while the directional light sits at 61°. The
+tracer importance-samples that map; ours composited the sky per bin with
+`skyEnv.node.sample(equirectUV(rd)).level(0)`, one bilinear tap at the bin's
+centre direction, in BOTH sites (the merge's top-cascade close, srcMerge
+[G.2]; the tile bake's orphan/residual `T·sky`, srcTiles). A bin spans 4.5°
+(c3) to 36° (c0); a few-texel sun is never under a centre. **The point tap
+deleted 84 % of the environment's energy by construction**, and it did it
+silently because a uniform-sky furnace reads the same through any tap.
+
+**The unit.** `srcSkyBins.js`: integrate the equirect ONCE on the CPU into
+the kernels' own bin grid (`binDirTable`'s Morton order, the yaw baked in as
+the inverse of the kernels' `rd = R(rotY)·d`), every texel to exactly one
+bin with its solid angle, mean radiance per bin. Both sites read the table
+by the bin index they already have and keep the tap as the GPU-selected
+fallback (`ready = 0`: an image-backed or compressed source, every gate
+fixture, and the live switch). Widths come from one pass at the largest
+requested grid and aggregate exactly (a 2w×w cell is a k×k block of the
+finer grid). Half-float RGBE decodes through a LUT; texels pre-sum in
+blocks to ≤ 1024 columns (exact sums; only a block on a bin border lands
+whole in the bin of its centre — 0.35° against ≥ 4.5° bins). 2 M texels ≈
+15 ms, keyed on (texture, version, yaw), throttled to one run per 150 ms so
+a rotating map cannot pay it per frame.
+
+Gate: `npm run test:gi-sky-bins` (bare Node, 54 checks): the furnace (every
+bin reads a uniform map as itself, Σ Δω = 4π), one hot texel landing in ONE
+bin whose rotated centre points back at it (flipY both ways, three yaws),
+block pre-summing energy-exact, fine→coarse aggregation equal to direct,
+half decode, and the table manager's keying/throttle/late-width/fallback.
+`test:gi-src-merge` and `test:gi-src-tiles` stay green on the fallback path.
+
+**⛔ Two rig traps this unit paid for.**
+- **NO STORAGE BUFFER SURVIVES A GI TEARDOWN, so a kernel-bound buffer is
+  PER BUILD.** The dispose site retires the UNION of every storage attribute
+  the stale kernels bound (the harvest) and every owner-published list — there
+  is no keep set (its own comment: "nothing survives a teardown, so there is
+  no diff to take"). The first cut kept one table set for the life of the
+  system: unpublished, the first swap destroyed it while the new kernels
+  still bound it (`Invalid BindGroup "bindGroup_object" is invalid due to a
+  previous error`); published in `srcSystem`'s list — the "fix" — it was
+  retired on purpose (`[Buffer] used in submit while destroyed`). Both on
+  exactly the three sky-reading kernels, tiles `lit 0`, a white far field.
+  Shipped: the manager keeps the CPU integration; `beginBuild()` hands each
+  `createSrcProbeSystem` fresh attributes filled from it at once, published
+  through the build's own list so its teardown retires them; the last two
+  builds stay filled across the retire window.
+- **The intermittent dead boot (GI built against 0 placements) threw 400×/s
+  from `losSegment`**: `traceStaticBvh` returns null with no static BVH and
+  the seed's LOS closure read `.x` of it inside the compile wave. Guarded —
+  "no wall crossed" — so a dead boot degrades instead of storming; the race
+  itself (`black-boot-investigation`) is untouched.
+- **The console ring could not show the previous error.** ~700 identical
+  lines a second evicted the one line that named it within a second.
+  `consoleStore.push` now folds a repeat into its earlier entry (48-entry
+  window) with a count; `console.read` reports `count`, the panel shows ×N.
+
+**Receipt (same boot, same pose `6.107,1.315,−5.593 → 5.864,−0.456,7.305`,
+same population of 1 902 c0 probes, ray cap 32, each arm converged ≥ 75 s;
+`profile.giPasses` hit ledger, lod 0):**
+
+| arm | Ld | Lb | E at hits | atlas mean lum | atlas max bin | far field raw |
+|---|---|---|---|---|---|---|
+| tables OFF (`__giSkyBins = false`, the old point tap) | .0256 | .0320 | **.1339** | .182 | 3.2 | 34/42/28 |
+| tables ON (shipped) | .0256 | .0360 | **.1488** | .211 | **12.3** | 35/44/30 |
+
++11 % irradiance at the hits, +16 % on the atlas mean, and the brightest
+atlas bin goes 3.2 → 12.3: that is the HDRI's sun reaching a c0 orphan bin
+(36° at w=4 — predicted ≈ 9.5 from the map's 3.7 sr·luma over 0.39 sr).
+The boot receipt for the map: `[gi] sky: environment integrated per bin —
+2048×1024 half equirect → bin widths 4/8/32 in 273 ms [now ~50 ms]; up-facing
+irradiance luma 2.842, brightest bin 965.97`. (2.84, not the 4.39 the float
+file holds: the loaded texture is HALF and clips the sun at 65 504 — the
+tracer samples the same texture, so parity is unaffected.)
+
+**What it is not.** The user's pair is 3–4× on every indirect region; this
+unit is worth ~1.1× at this pose. The HDRI sun (elevation 21.7°) evidently
+does not reach this room through an opening that faces it, so its energy
+arrives only after bounces elsewhere. The remaining gap, from the same ledger:
+
+- **THE ROUND-TRIP GAIN IS A COVERAGE NUMBER.** `gain = E/(π·(Ld+Lb))` read
+  **1.03** on the earlier boot of this very pose (7 104 live c0 probes after
+  the user had walked the level — retention kept probes on surfaces now
+  behind the camera) and **0.74–0.77** on a fresh boot at the same pose
+  (1 902 probes, only the visible surfaces). Same code, same scene, same
+  camera. A hit on a surface no probe covers reads a poor field (the coarse
+  fallback / prior), so light that enters the loop off-screen — most of the
+  light in a level lit through openings — is under-returned by ~25 % PER
+  BOUNCE, which compounds: series 1/(1−.74·.74) = 2.2× against 1/(1−.74) =
+  3.8× for the same albedo. This is the §11.51 memory's "gain 0.53" in
+  another costume, and the doc's "36.4 % of secondary hits with no
+  fine-probe support" — `srcSecondaryReceivers.js` (opt-in) is the unit
+  aimed at it and its last receipt was inconclusive.
+- **THE LOOP ALBEDO CEILING** (`MAX_LOOP_ALBEDO` 0.9): every blockout wall
+  and the floor here are albedo 1.0 and the hit-weighted ρ_loop reads 0.7375
+  (whites capped to 0.9, the green wall, wood). `__giSrcLoopAlbedo` is the
+  build-time dial (0 < x ≤ 1); receipt below.
+
+**Loop-albedo receipt (`__giSrcLoopAlbedo`, same boot, same pose, 1 902 c0
+probes).** ⚠ The first cut of the dial only reached [E]'s attribution copy
+(a counter); `srcSecondary.js` clamps AGAIN and that clamp is the loop's
+gain — fixed, the dial now lands in [J] (`maxLoopAlbedo` option).
+
+| arm | ρ_loop (hit-weighted) | Ld | Lb | E at hits | atlas mean | far raw |
+|---|---|---|---|---|---|---|
+| 0.97 (boot build) | **.789** | .0264 | .0479 | **.187** | .260 | 44/54/37 |
+| 0.9 default (flag cleared → REBUILD) | **.743** | .0236 | .0300 | **.122** | .186 | 31/38/25 |
+
+The albedo half is clean (+7 % on ρ_loop, the whites 0.9 → 0.97). The
+energy half is NOT a clean pair: the rebuilt state differs from a boot
+build in more than the ceiling (c2 orphan rate .12 → .55, merge LOS
+suppressed 0 → 3 260, far-ray rate 34 → 45 %), so "+54 % E" overstates the
+ceiling — the series predicts ~+30 % at this ρ. Default stays 0.9; the dial
+is real now and the next arm must be boot-vs-boot or rebuild-vs-rebuild.
+⛔ A flag-triggered rebuild is not the same state as a boot build — read the
+merge block beside any two arms before calling them a pair.
+
+**Follow-up: "it looks even darker than before" (02:26 vs 01:20).** Measured
+0.72× whole frame, 0.52× ceiling, 0.49× floor, sun patches 0.84–0.92×. Not
+this unit: at that state, tables OFF/ON read E at hits .116/.130, atlas mean
+.166/.212, and the screen-mean irradiance texel equal within 3 %. The Sun had
+moved: the 01:20 boot's `§12.82 sun slot … dir 0.407,0.878,−0.252` is
+elevation 61°; every boot since reads `0.940,0.262,−0.220`, elevation 15°,
+which is exactly what the Sun entity's rotation `(−2.269, 1.222, 2.082)` gives
+— the scene autosaved between 01:19 and 01:29 during the floor experiments.
+A 15° sun puts roughly a third of the 61° sun's power through the level's
+openings, and its patches land elsewhere. ⛔ Read the sun-slot line and the
+camera beside any before/after pair.

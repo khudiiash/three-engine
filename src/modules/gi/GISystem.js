@@ -29,10 +29,10 @@
 import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, cos, float, fract, instancedArray, mix, normalWorld, positionGeometry, positionWorld, renderGroup, sRGBTransferEOTF, screenCoordinate, screenUV, select, sin, smoothstep, step, texture, uniform, uniformArray, vec2, vec3, vec4 } from "three/tsl";
 import { GI_BOOT_AMBIENT_MAX_TICKS, bootAmbientStep } from "./bootAmbient.js";
-import { GI_TERM_DEBUG_VIEWS, giDebugView, giGtaoRadiusIntervals, giGtaoResolutionScale, giGtaoSamplingPreset, resolveGiConfig, sceneSkyRadiance } from "./giConfig.js";
+import { GI_TERM_DEBUG_VIEWS, giDebugView, giEnvironmentLookupYaw, giGtaoRadiusIntervals, giGtaoResolutionScale, giGtaoSamplingPreset, resolveGiConfig, sceneSkyRadiance } from "./giConfig.js";
 import { giEmitterShadowSize } from "./giBudget.js";
-import { GI_WORLD_UPDATE_HZ, shouldDispatchGiWorld, stepGiWorldCadence, GI_WORLD_REST_HZ, GI_MOVER_ONLY_STRIDE } from "./giCadence.js";
-import { preloadStaticBvhSimplifier, simplifyStaticBvhIndex, transportKeepsExact } from "./staticBvhSimplify.js";
+import { GI_WORLD_UPDATE_HZ, shouldDispatchGiWorld, stepGiWorldCadence, GI_WORLD_REST_HZ, GI_MOVER_ONLY_STRIDE, GI_WORLD_IDLE_AFTER_MS } from "./giCadence.js";
+import { preloadStaticBvhSimplifier, simplifyStaticBvhIndex, transportKeepsExact, staticBvhSimplifyError, staticBvhSimplifyRatio } from "./staticBvhSimplify.js";
 import { canStartGiRebuild, giBroadReflectionReadinessNodes, giPropInvalidation, ownsGiCompileWave, settleGiResize } from "./giLifecycle.js";
 import {
   captureGiMaterialLightShape,
@@ -41,15 +41,21 @@ import {
 } from "./giMaterialLightLifecycle.js";
 import { GiPathTracerView } from "./giPathTracer.js";
 import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
-import { GI_WORLD_AO_VISIBILITY_POWER, blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiAoPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiFarFieldTexture, createGiGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiRtaoPass, createGiShadowClearPass, createGiTargets, createGiVxaoPass, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
+import { GI_WORLD_AO_VISIBILITY_POWER, blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiAoPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterStaticSnapshotPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiFarFieldTexture, createGiGBuffer, createGiGBufferDownsample, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiRtaoPass, createGiShadowClearPass, createGiTargets, createGiVxaoPass, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
 import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
 import { noteTextureAverage, pendingTextureAverages, resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
 import { createSrcDistanceView, createSrcOccupancyView } from "./srcDebugViews.js";
 import { SRC_POOL_FLOORS, createSrcProbeSystem, describeSrcProbeSystem, formatSrcProbeFrame, srcPoolCeilings, srcProbesEnabled, srcShadeEnabled } from "./srcSystem.js";
+import { createSkyBinTables, describeSkySource } from "./srcSkyBins.js";
 // §11.4 A3 — the per-cascade block vector from measured peak demand.
 import { blockVectorFromPeaks } from "./srcConfig.js";
-import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD, CASCADE_COUNT, R0_OVER_S0 as SRC_R0_OVER_S0, SRC_QUALITY, binCount, REST_TRANSPORT_FRACTION } from "./srcConfig.js";
+import {
+  createGiFlickerAccumulator, disposeGiFlickerAccumulator, readGiFlickerAccumulator,
+  createGiTileMeanRecorder, disposeGiTileMeanRecorder, readGiTileMeanRecorder,
+} from "./giFlickerWatch.js";
+import { sunSplitArmed } from "./srcConfig.js";
+import { ALPHA_MOTION_SAT, ALPHA_TRACK_HOLD_MS, ALPHA_TRACK_REARM_MS, ALPHA_TRACK_THRESHOLD, CASCADE_COUNT, LIGHT_MOTION_RELEASE_MS, TRACK_BASELINE_MS, TRACK_NOVELTY, r0OverS0 as srcR0OverS0, SRC_QUALITY, binCount, REST_TRANSPORT_FRACTION } from "./srcConfig.js";
 import { createSrcSurfaceAttribution } from "./srcSurface.js";
 import { createSrcBvhSurfaceAttribution } from "./srcBvhTrace.js";
 import { createSrcSlotPalette } from "./srcSlotPalette.js";
@@ -144,6 +150,21 @@ function withStaticBvhTimeout(promise) {
 // (see #retireTargets). Two would do — the third is slack for a frame that is
 // dropped or re-encoded.
 const RETIRED_TARGET_FRAMES = 3;
+/**
+ * §11.40 — on a movers-only frame, one pixel in this many re-marches the
+ * emitter shadow pass's STATIC world; the rest read the static visibility
+ * cache and re-test only the movers. `__giEmitterStaticCache = false` marches
+ * every pixel (the pre-§11.40 behaviour); `__giEmitterStaticStride` pins.
+ */
+const EMITTER_STATIC_STRIDE = 4;
+/**
+ * §11.35 — the AO g-buffer's pixel ceiling (the prepass renders at this
+ * resolution on ultra/high; the AO pass reads it one-to-one). 2.1 MP is a
+ * 1080p-class viewport at full resolution; a 4K viewport is brought down
+ * isotropically, exactly as `resolveMaxPixels` does for the resolve.
+ * `__giAoMaxPixels` overrides.
+ */
+const GI_AO_MAX_PIXELS = 2_100_000;
 /**
  * Frames a mover's occupancy slot stays DYNAMIC after its last transform
  * change before demoting back to STATIC (see occupancyField's split note).
@@ -594,6 +615,15 @@ const OCC_SLICE_ITEMS_MAX = 800_000;
 const OCC_SLICE_ITEMS_MIN = 16_384;
 const OCC_SLICE_TARGET_MS = 8;
 
+/**
+ * §11.36 — every GI compute dispatch of the CURRENT frame, by pass name,
+ * handed to `profile.frameStats.giHold.dispatchedLastFrame` at the next
+ * tick. The per-pass profiler prices passes in isolation; this says which of
+ * them a MOVING frame actually dispatched, so the two multiply into the
+ * frame's real compute composition.
+ */
+let giDispatchLog = [];
+
 function giCompute(renderer, nodes, { deferrable = false } = {}) {
   giDispatchDepth++;
   try {
@@ -614,6 +644,7 @@ function giCompute(renderer, nodes, { deferrable = false } = {}) {
       }
       const t0 = unbuilt ? performance.now() : 0;
       giCurrentComputeNode = node;
+      giDispatchLog.push(node.__giPassName ?? node.name ?? "?");
       try {
         // Published for the boot ledger's per-submit GPU clock (a probe reads
         // it at `queue.submit` time): which GI pass a submission belongs to.
@@ -2880,10 +2911,110 @@ export class GISystem {
     // "for SRC" would read zeros forever and the two memories would disagree
     // about whether the scene is moving.
     {
+      // ── ⭐⭐⭐ THE SIGNAL IS A RATE, NOT A PER-FRAME STEP (2026-09-04) ────
+      //
+      // Everything below measures `dirDelta` — how far the light's matrix
+      // moved BETWEEN TWO RENDERED FRAMES — and four consumers then read the
+      // result as "how fast is the light moving": the §12.38 α ramp, the
+      // §12.65 screen irradiance history weight (`0.9·(1−mLight)` — the
+      // image's only smoother), the shadow/emitter history weights
+      // (`0.94 − m·30`), and the §12.43 tracking window's arm threshold.
+      //
+      // A per-frame delta is not a rate. It is `rate × frameTime`, and this
+      // renderer's frame time is NOT CONSTANT BY DESIGN: the GI world chain
+      // runs at GI_WORLD_UPDATE_HZ (30, or 15 at rest) underneath a renderer
+      // presenting at 60–120, so a heavy world-dispatch frame and a light one
+      // alternate — §11.8 measured 63/27 ms on Bistro. A sun turning at a
+      // PERFECTLY CONSTANT rate therefore handed every consumer above a signal
+      // that alternated by 2× or more every frame, and they all pumped with
+      // it: the screen filter's weight swung between ~0.1 and ~0.6 at frame
+      // cadence (a time constant oscillating between ~1 and ~2.5 frames), and
+      // the window's fixed 0.5 threshold was crossed and re-crossed by frame
+      // pacing alone. §12.83 predicted exactly this straddle, simulated it at
+      // ±12 % jitter, priced it at ~1 % of frames and declined to spend a unit
+      // on it. The user's live console disagrees: consecutive 2 s tallies,
+      // `1 arms in 2.0s … open 50–59 % … armed by shadow, peak 0.57–1.50`.
+      // The jitter in that simulation was an order of magnitude short of a
+      // renderer whose own GI cadence alternates the frame time.
+      //
+      // So the delta is normalised by the ACTUAL frame time and expressed in
+      // units of ONE 60 fps FRAME. Every constant in this module keeps the
+      // calibration it was measured at (ALPHA_MOTION_SAT, the 0.5 arm
+      // threshold, the ×30 in the shadow weights) and all of them become
+      // frame-rate independent — at 30 fps the same sun used to read twice the
+      // motion and cost the scene half its shadow memory for nothing.
+      //
+      // ⚠ THE DT IS CLAMPED. A tab restore, a compile wave or the first frame
+      // after a rebuild hands over a multi-second gap; dividing by that turns a
+      // real light event into ZERO motion — the opposite failure and the harder
+      // one to see. 4–100 ms covers 10–250 fps and floors everything outside it.
+      //
+      // ⚠ AND IT IS PEAK-HELD WITH AN EXPONENTIAL RELEASE, NOT AVERAGED. The
+      // matrix is written by a script whose tick is not this loop's, so the
+      // delta also ALIASES — some frames read zero and the next reads two
+      // frames' worth. An EMA would smooth that and lag a genuine light STEP by
+      // its whole time constant; a peak hold passes a step in the frame it
+      // happens and only fills the zeros. `__giLightMotionRate = false` restores
+      // the raw per-frame delta.
+      const nowRt = performance.now();
+      const dtMs = Math.min(100, Math.max(4, nowRt - (this._giLightMotionAt ?? (nowRt - 1000 / 60))));
+      this._giLightMotionAt = nowRt;
+      this._giFrameDtMs = dtMs;
+      // ⛔ OPT-IN pending a light-RESPONSE gate (see srcConfig's sunSplitArmed):
+      // this makes the signal HONEST, which at 120 fps reads ~1.8× the old
+      // per-frame delta and therefore drives α and the stride root HARDER, not
+      // softer. That is correct and it is also a behaviour change nobody has
+      // yet measured against light responsiveness. `__giLightMotionRate = true`.
+      const rateOn = globalThis.__giLightMotionRate === true;
+      const dtScale = rateOn ? (1000 / 60) / dtMs : 1;
+      const release = rateOn ? Math.exp(-dtMs / LIGHT_MOTION_RELEASE_MS) : 0;
       let motion = 0;
+      let motionField = 0;
       let lumMotion = 0;
+      // ── ⭐⭐⭐ §11.21 — A SPLIT SUN'S ROTATION STALES NOTHING ───────────
+      //
+      // With §12.82 armed, a bin caches the sun's TRANSFER (albedo × visibility)
+      // and `[F]` closes it against the CURRENT sun every frame. The stored word
+      // is then sun-independent by construction, so a turning sun no longer
+      // makes one byte of the field wrong — and everything that reacts to
+      // "the light is moving" by FORGETTING FASTER is now spending variance to
+      // buy nothing. That reaction is not small: α 0.02 -> 0.1 and the stride
+      // root 0 -> 0.7 cut a probe's effective memory ~14×, at ~2 rays per bin
+      // per frame.
+      //
+      // ⚠ TWO TRACKS, NOT ONE, AND THE SPLIT IS LOAD-BEARING. What stays stale
+      // under a rotating sun is VISIBILITY (§12.82's own "what stays stale,
+      // named so it is not misread as fixed: V"), and `_giShadowLastMotion` is
+      // what shortens the shadow and emitter history. So the sun keeps driving
+      // THAT and stops driving the RADIANCE memory — `_giFieldLightMotion`,
+      // read by the α ramp and by the screen irradiance filter's weight.
+      // Zeroing one number for both would have smeared every shadow edge.
+      //
+      // ⚠ AND ONLY WITH EXACTLY ONE DIRECTIONAL LIGHT. The split names ONE
+      // slot (`lighting.sunSlot`); a second sun still accumulates into the bins
+      // and still stales them, and this loop cannot tell which object owns the
+      // named slot. One directional light is the case the split covers and the
+      // case every scene here has; anything else keeps the old behaviour rather
+      // than quietly under-reporting a light that really is invalidating the
+      // field. `__giSrcSunSplitCalm = false` reverts.
+      const lights = this._lightObjects ?? [];
+      let dirCount = 0;
+      for (const l of lights) if (l.isDirectionalLight) dirCount++;
+      // ⛔⛔ OPT-IN AND THE MOST WRONG OF THE FIVE. This is what produced "when
+      // light moves, lighting does not update": the cached transfer carries
+      // VISIBILITY, which a rotating sun invalidates completely, and that half
+      // refreshes only when new rays land in the bin. Removing the sun from the
+      // radiance-staleness signal set that refresh to the STILL rate — so the
+      // shadowing in the GI stopped following the sun at all.
+      // ⚠ AND THE GUARD WAS WRONG TOO: `sunSplitArmed()` is only the FLAG.
+      // The split actually arms only when a directional SLOT was named and the
+      // shading is split, so this could calm the field on a build where the sun
+      // was still accumulating into the bins. `__giSrcSunSplitLive` is what
+      // srcSystem publishes when `sunClose` really exists.
+      const sunCalm = globalThis.__giSrcSunSplitCalm === true
+        && sunSplitArmed() && globalThis.__giSrcSunSplitLive === true && dirCount === 1;
       this._giShadowLightPrev ??= new WeakMap();
-      for (const light of this._lightObjects ?? []) {
+      for (const light of lights) {
         const e = light.matrixWorld.elements;
         let prev = this._giShadowLightPrev.get(light);
         if (!prev) {
@@ -2918,7 +3049,12 @@ export class GISystem {
           // term for point/spot lights, where dollying genuinely changes the
           // field. A parked scene reads exactly zero either way (probe:
           // run-gi-light-jitter-probe.mjs).
-          motion = Math.max(motion, dirDelta + (light.isDirectionalLight ? 0 : posDelta * 0.05));
+          const term = dirDelta + (light.isDirectionalLight ? 0 : posDelta * 0.05);
+          motion = Math.max(motion, term);
+          // The radiance side drops a split sun's ROTATION only. Its luminance
+          // still counts (a dimming sun really does change every bin's value),
+          // and it rides `lumMotion`, which is a separate track already.
+          motionField = Math.max(motionField, sunCalm && light.isDirectionalLight ? 0 : term);
           lumMotion = Math.max(lumMotion,
             Math.abs(lum - prev.lum) / Math.max(prev.lum, lum, 1e-3));
         }
@@ -2927,13 +3063,20 @@ export class GISystem {
         prev.lum = lum;
         prev.seeded = true;
       }
-      this._giShadowLastMotion = motion;
+      // The rate, in radians per 60 fps frame, peak-held with a short release.
+      this._giShadowLastMotion = Math.max(motion * dtScale, (this._giShadowLastMotion ?? 0) * release);
+      // The RADIANCE-side twin (see `sunCalm` above): identical unless a split
+      // sun is turning, in which case its rotation is absent here and present
+      // above. Every consumer that asks "is my stored radiance stale?" reads
+      // this one; every consumer that asks "is my stored VISIBILITY stale?"
+      // reads the one above.
+      this._giFieldLightMotion = Math.max(motionField * dtScale, (this._giFieldLightMotion ?? 0) * release);
       // SEPARATE track, deliberately: `_giShadowLastMotion` also drives the
       // GI shadow pass's temporal weights, and the shadow factor is PURE
       // VISIBILITY — an intensity fade must not shorten shadow memory, only
       // SRC's radiance memory (the sceneMotion closure below is its one
       // consumer).
-      this._giLightLumMotion = lumMotion;
+      this._giLightLumMotion = Math.max(lumMotion * dtScale, (this._giLightLumMotion ?? 0) * release);
     }
     // ── §12.65: THE IRRADIANCE FILTER'S PER-FRAME INPUTS ─────────────────
     // MUST run ABOVE the shadow block: both consumers copy LAST frame's VP
@@ -2989,16 +3132,24 @@ export class GISystem {
       const camEma = this.#cameraMotionEma();
       const pin = Number(globalThis.__giIrrHistWeight);
       if (Number.isFinite(pin)) {
-        this._giIrrHistWeightU.value = Math.min(0.98, Math.max(0, pin));
+        // A pin is a pin: an A/B arm asked for this exact value, and a ramp
+        // toward it would make the first second of every arm a different
+        // experiment. Re-seed the limiter so releasing the pin ramps from
+        // where the pin left the picture rather than jumping.
+        this._giIrrHistApplied = Math.min(0.98, Math.max(0, pin));
+        this._giIrrHistWeightU.value = this._giIrrHistApplied;
       } else if (this._srcSwapHold) {
         // §11.7: a probe-store swap is in flight — keep the last picture (see
         // #rebuildSrcProbesForPools). Reprojection still moves it with the
         // camera; only disoccluded pixels see the cold store.
-        this._giIrrHistWeightU.value = 0.98;
+        this._giIrrHistWeightU.value = this.#slewIrrHistWeight(0.98);
         this._giIrrHistSettled = 0.98;
       } else {
+        // §11.21: radiance-side, for the same reason the α ramp's is — this
+        // weight is the SCREEN IRRADIANCE filter, and irradiance from a split
+        // sun is recomputed every frame rather than remembered.
         const mLight = Math.min(1, Math.max(
-          (this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT,
+          (this._giFieldLightMotion ?? this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT,
           this._giEmitterLastMotion ?? 0,
           (this._giLightLumMotion ?? 0) / ALPHA_MOTION_SAT,
         ));
@@ -3059,7 +3210,7 @@ export class GISystem {
         const camK = Number(globalThis.__giIrrHistCamMotion);
         const k = Number.isFinite(camK) ? Math.min(1, Math.max(0, camK)) : 0.5;
         const settled = windowOpen ? 0 : Math.max(base, 0.7 * fastField);
-        this._giIrrHistWeightU.value = settled * (1 - k * camEma);
+        this._giIrrHistWeightU.value = this.#slewIrrHistWeight(settled * (1 - k * camEma));
         // Published for the REFLECTION filter below, which must scale the
         // motion-free value rather than this one — see its own banner.
         this._giIrrHistSettled = settled;
@@ -3347,15 +3498,19 @@ export class GISystem {
           }
         }
         const source = env ?? bg ?? (bgc ? this._giFlatSkyTex : null);
-        this._giEnvMissNode.value = source ?? this._giEnvPlaceholder;
+        const missNext = source ?? this._giEnvPlaceholder;
+        if (this._giEnvMissNode.value !== missNext) {
+          this._giEnvMissNode.value = missNext;
+          this.#refreshRenderObjectsOnce("env-miss");
+        }
         this._giEnvMissIntensityU.value = this.config.reflections === false
           ? 0
           : env
             ? Math.max(0, scene.environmentIntensity ?? 1)
             : (bg || bgc) ? 1 : 0;
-        this._giEnvMissRotU.value = (env
+        this._giEnvMissRotU.value = giEnvironmentLookupYaw(env
           ? scene?.environmentRotation?.y
-          : scene?.backgroundRotation?.y) ?? 0;
+          : scene?.backgroundRotation?.y);
         // §16 S1 — the directional SKY intensity. ⚠ THIS IS THE ONLY SKY THE
         // TRANSPORT READS: the merge's top-cascade close and the tile bake
         // overwrite their flat `sky` term with the per-bin sample × this
@@ -3370,6 +3525,33 @@ export class GISystem {
           this._giSkyEnvIntensityU.value = env || (bgc && lighting)
             ? Math.max(0, scene.environmentIntensity ?? 1)
             : 0;
+        }
+        // §11.52 — the per-bin integrated sky follows the same source and
+        // yaw the tap uses. Keyed on (texture, version, yaw): a still scene
+        // costs a string compare per frame; a change costs one integration
+        // (~15 ms for a 2k map, throttled inside). An unreadable source
+        // hands the kernels back their texture tap via `ready = 0`.
+        // `__giSkyBins = false` is the LIVE A/B: the tables drop to `ready = 0`
+        // on the next poll and the kernels tap the texture again — no rebuild.
+        if (this._giSkyBinTables) {
+          const armed = globalThis.__giSkyBins !== false;
+          const ran = this._giSkyBinTables.update(
+            armed ? describeSkySource(source) : null,
+            this._giEnvMissRotU.value,
+            source ? `${source.uuid}:${source.version}` : null,
+          );
+          const receipt = ran ? this._giSkyBinTables.last : null;
+          // One line per integration, and only for a real panorama (the 1×1
+          // flat sky and the placeholder are not worth a log).
+          if (receipt && receipt.width > 1) {
+            console.info(
+              `[gi] sky: environment integrated per bin — ${receipt.width}×${receipt.height} ` +
+                `${receipt.half ? "half" : "float"} equirect → bin widths ${receipt.widths.join("/")} in ` +
+                `${receipt.ms.toFixed(1)} ms; up-facing irradiance luma ${receipt.upIrradianceLuma.toFixed(3)}, ` +
+                `brightest bin ${receipt.peakBinLuma.toFixed(2)} (a sun reads as one bin far above the rest; ` +
+                `the old per-bin point tap could not see it). \`__giSkyBins = false\` restores the tap.`,
+            );
+          }
         }
       }
       // The mirror-mask second pass is only worth its projection walk when
@@ -3422,6 +3604,22 @@ export class GISystem {
       this._gbufferStaticKey = gbufStaticKey;
       const moverOnly = gbufStaticHeld && !gbufHeld;
       this._moverOnlyFrames = moverOnly ? (this._moverOnlyFrames ?? 0) + 1 : 0;
+      // §11.40: the static visibility cache's generation moves with the
+      // static g-buffer key (every entry stamped under an older generation
+      // is stale and re-marches); the refresh stride engages on movers-only
+      // frames only — a moving camera marches every pixel, as before.
+      if (this._giEmitterStaticGenU) {
+        if (!gbufStaticHeld) this._giEmitterStaticGen = ((this._giEmitterStaticGen ?? 0) + 1) % 1024;
+        this._giEmitterStaticGenU.value = this._giEmitterStaticGen ?? 0;
+        const stridePin = Number(globalThis.__giEmitterStaticStride);
+        const stride = Number.isFinite(stridePin) && stridePin >= 1 ? Math.round(stridePin) : EMITTER_STATIC_STRIDE;
+        // ⛔ OPT-IN, NOT DEFAULT (§11.46) — the same rule as the world
+        // visibility cache: a cache that touches the shadow term is off
+        // until a look check says it is neutral. `__giEmitterStaticCache
+        // = true` arms it.
+        const cacheOn = globalThis.__giEmitterStaticCache === true;
+        this._giEmitterStaticStrideU.value = cacheOn && moverOnly ? stride : 1;
+      }
       // ── §11.9: FRAME TIME OUTRANKS CONVERGENCE WHILE THE CAMERA MOVES ──────
       //
       // The user's walking frame on Bistro: GPU 87 ms, 11 fps — the world
@@ -3442,8 +3640,10 @@ export class GISystem {
         : (Number.isFinite(Number(motionFloorRaw)) ? Math.min(1, Math.max(0.1, Number(motionFloorRaw))) : 0.35);
       state.screen?.srcProbes?.setMotionRayScale?.(1 - (1 - motionFloor) * camEma);
       const camHalfRate = camEma > 0.5 && globalThis.__giMotionHalfRate !== false;
-      this._moverCadenceSkip = (moverOnly || camHalfRate) &&
-        globalThis.__giMoverOnlyCadence !== false &&
+      // §11.43: the world stagger below reads which frames are the heavy
+      // screen-chain frames (the ones this cadence does NOT skip).
+      this._moverCadenceHalfRate = (moverOnly || camHalfRate) && globalThis.__giMoverOnlyCadence !== false;
+      this._moverCadenceSkip = this._moverCadenceHalfRate &&
         (this._frame % GI_MOVER_ONLY_STRIDE) !== 0;
       // The emitter shadow checkerboard stacks with nothing: off on movers-only
       // frames (the chain already runs every other frame there), and off under
@@ -3457,7 +3657,7 @@ export class GISystem {
         this._gbufferKey = gbufKey;
         this._gbufferMask = wantsMirrorMask;
         this._gbufferHeldFrames = 0;
-        this._gbufProxyStats = renderGiGBuffer(renderer, this.engine.scene, this.engine.camera, state.screen.gbuffer, {
+        this._gbufProxyStats = renderGiGBuffer(renderer, this.engine.scene, this.engine.camera, state.screen.gbufferFull ?? state.screen.gbuffer, {
           mirrorMask: wantsMirrorMask,
           // §18 G1. Read fresh every frame rather than cached: the merge
           // rebuilds on its own clock (streaming geometry, a caster that moved),
@@ -3465,6 +3665,8 @@ export class GISystem {
           // no longer exists — the whole street missing from GI's g-buffer.
           depthProxies: this.engine.shadowMerge?.gbufferGroups?.() ?? null,
         });
+        // §11.35: the chain's g-buffer is the point-sampled copy of the full one.
+        if (state.screen.gbufferFull && this._giGbufferDownsample) this._giGbufferDownsample.render(renderer);
       }
       // ── THE MASK-COVERAGE ASSERTION (§18, 2026-08-25) ────────────────────
       //
@@ -3775,9 +3977,28 @@ export class GISystem {
         const restDrive = Number.isFinite(restLive)
           ? Math.max(0, (restLive - REST_TRANSPORT_FRACTION) / Math.max(1e-6, 1 - REST_TRANSPORT_FRACTION))
           : 1;
-        const worldRested = restDrive < 0.05 && !this._compileWaveActive &&
+        // §11.36 CONVERGED MOTION (default on; `__giWorldMotionRest = false`
+        // opts out): with every light static, the camera term does not
+        // lift the world chain's RATE — the field is world-space and a known
+        // probe's answer does not change because the camera moved; only the
+        // arrivals need rays, and those ride the starvation floor of every
+        // dispatch. The ceiling still follows the camera (srcSystem). The
+        // idle gate below keeps the FULL drive, so motion never sleeps.
+        const noCamLive = Number(globalThis.__giSrcRestDriveNoCamLive);
+        const noCamDrive = Number.isFinite(noCamLive) ? noCamLive : restDrive;
+        // DEFAULT ON since the Bistro orbit receipt (§11.36): 26 → 36 fps under
+        // motion, compute 25.3 → 20.3 ms, world dispatches 18.8 → 13.5 /s; the
+        // walk cost on Level was err0 +23 %, reversals 1.9 → 3.0 %, no larger
+        // steps. `__giWorldMotionRest = false` opts out.
+        const motionRest = globalThis.__giWorldMotionRest !== false && this._giLightsAllStatic === true;
+        const cadenceDrive = motionRest ? Math.min(restDrive, noCamDrive) : restDrive;
+        const worldRested = cadenceDrive < 0.05 && !this._compileWaveActive &&
           globalThis.__giSrcWorldRestCadence !== false;
         this._srcWorldRested = worldRested;
+        this._srcWorldMotionRest = motionRest && worldRested && restDrive >= 0.05;
+        // §11.34: rested AND every light declared static AND the static
+        // inputs quiet for the hold → the world chain sleeps (see the gate).
+        const worldIdle = this.#worldIdleGate(worldRested, restDrive);
         const worldHz = Number.isFinite(forcedWorldHz) && forcedWorldHz >= 0
           ? forcedWorldHz
           : (worldRested ? GI_WORLD_REST_HZ : GI_WORLD_UPDATE_HZ);
@@ -3804,22 +4025,93 @@ export class GISystem {
         // resumes automatically.
         const frameGap = cadenceNow - (this._srcWorldFrameAt ?? cadenceNow);
         this._srcWorldFrameAt = cadenceNow;
-        const dispatchedPreviousFrame = this._srcWorldLastDispatchFrame === this._frame - 1;
+        // §11.45: the rule below is about how often a CHAIN starts, so it
+        // reads the last chain START. Counting segment B as "dispatched last
+        // frame" made every pair cost two timer slots and halved the
+        // transport's rate (light-response t50 1.5 → 2.7 s, measured).
+        const dispatchedPreviousFrame = (this._srcWorldLastChainFrame ?? this._srcWorldLastDispatchFrame) === this._frame - 1;
         // At rest the update is ALSO bounded to every other frame. The 30 Hz
         // cadence's slow-frame rule already alternated frames below 30 fps;
         // a 15 Hz period alone would be due on nearly every 60 ms frame and
         // run the world MORE often than before (measured: 23 → 16 fps on the
         // user's Bistro the first time this rest rate shipped).
-        const worldDue = this._compileWaveActive || (shouldDispatchGiWorld({
+        let worldDue = !worldIdle && (this._compileWaveActive || (shouldDispatchGiWorld({
           due: cadence.due,
           frameGapMs: frameGap,
           dispatchedPreviousFrame,
           hz: worldHz,
-        }) && !(worldRested && dispatchedPreviousFrame));
+        }) && !(worldRested && dispatchedPreviousFrame)));
+        // ── §11.43 THE STAGGER (2026-09-05) ─────────────────────────────────
+        // Under the motion / movers-only half-rate the emitter, hit-shade and
+        // reflection chains all dispatch on the SAME frames (`_frame %
+        // GI_MOVER_ONLY_STRIDE === 0`), and the world chain's due-ness is a
+        // wall-clock timer that lands on either parity. Half the world
+        // dispatches therefore stacked 34 ms on top of a ~30 ms frame — the
+        // "frequent mini freezes while moving" (spike watch: 41 frames ≥ 40
+        // ms in 15 s, worst 94 ms, CPU phases explaining a third of each).
+        // A world tick that comes due on a heavy frame waits ONE frame — the
+        // next heavy frame is two away, so it never waits twice — and keeps
+        // its due-ness (`nextAt` is put back to now). `__giWorldStagger =
+        // false` restores the collision for an A/B.
+        const heavyScreenFrame = this._moverCadenceHalfRate === true && this._moverCadenceSkip !== true;
+        if (worldDue && heavyScreenFrame && !this._compileWaveActive &&
+            this._srcWorldStaggered !== true && globalThis.__giWorldStagger === true) {
+          worldDue = false;
+          this._srcWorldStaggered = true;
+          this._srcWorldNextAt = cadenceNow;
+          this._srcWorldStaggerCount = (this._srcWorldStaggerCount ?? 0) + 1;
+        } else if (worldDue) {
+          this._srcWorldStaggered = false;
+        }
+        // ── §11.45 THE WORLD CHAIN IN TWO HALVES (2026-09-05) ───────────────
+        // After §11.43's stagger the moving frame still alternated ~40 / ~18
+        // ms: the world dispatch is ONE 38 ms block and no cadence can make
+        // it smaller, only rarer. The chain splits at the deposit's trace
+        // (see #worldSegmentBoundary): segment A traces and attributes into
+        // the bins, segment B shades, resolves, merges and bakes the tiles.
+        // A runs when the chain is due (with the stagger's heavy-frame
+        // rule); B runs on the next frame that is not a heavy screen frame,
+        // regardless of the timer — so a full chain still lands once per
+        // world period, but no single frame carries all of it. The gap is
+        // safe because only the BINS are mid-update in it (the payload and
+        // tiles the gather reads are last tick's). The split stands down
+        // while the chain has an unbuilt pass (§11.7: the chain runs whole
+        // or it kicks compiles) and during a compile wave.
+        // `__giWorldSplit = false` restores the single block.
+        // ⛔ OPT-IN (§11.47): splitting the chain halves the number of FULL
+        // chains per second (12.5 -> 7.3 measured), which is a convergence
+        // cost the user can see as flatness long before any gate reports it.
+        const segBoundary = globalThis.__giWorldSplit !== true || this._compileWaveActive
+          ? 0
+          : this.#worldSegmentBoundary(worldPasses);
+        const chainBuilt = segBoundary > 0 && segBoundary < worldPasses.length
+          && !worldPasses.some((node) => !giBuiltNodes.has(node) || giNodesPending([node]));
+        let worldSegment = 0;
+        if (chainBuilt) {
+          if (this._srcWorldSegBPending === true) {
+            // Finishing the tick already started outranks starting another.
+            worldDue = !heavyScreenFrame;
+            worldSegment = 2;
+          } else if (worldDue) {
+            worldSegment = 1;
+          }
+        } else {
+          this._srcWorldSegBPending = false;
+        }
         if (worldDue) {
+          const worldSlice = worldSegment === 1
+            ? worldPasses.slice(0, segBoundary)
+            : worldSegment === 2 ? worldPasses.slice(segBoundary) : worldPasses;
           const worldNow = chainHoldsWorld
-            ? worldPasses.filter((node) => giSafeDuringChain(node))
-            : worldPasses;
+            ? worldSlice.filter((node) => giSafeDuringChain(node))
+            : worldSlice;
+          // ⛔ §11.37 REFUTED (2026-09-04): a merge/tile STRIDE (skip the
+          // ladder and the bake on odd world dispatches, −4 ms of compute
+          // under motion) froze the picture — `profile.lightResponse` never
+          // reached 90 % in 6 s (curve flat at 1.0) where the same boot
+          // without it reads t90 5.3 s, 95 % monotone. The ladder and the
+          // bake are not a detachable tail of the chain. Deleted, not hatched:
+          // a hatch that freezes lighting is a trap.
           // ── §11.7: THE WORLD CHAIN IS ONE ALGORITHM, OR IT IS NOTHING ──────
           //
           // srcProbes' own header: "every gap between two passes is a barrier
@@ -3845,11 +4137,21 @@ export class GISystem {
             }
           }
           this._srcWorldLastDispatchFrame = this._frame;
+          if (worldSegment !== 2) this._srcWorldLastChainFrame = this._frame;
+          // §11.45: A leaves B owing; B clears the debt. A full chain is two
+          // dispatches, so `worldDispatchesPerSec` counts SEGMENTS while
+          // `worldSplit` is true.
+          if (worldSegment === 1) this._srcWorldSegBPending = true;
+          else if (worldSegment === 2) this._srcWorldSegBPending = false;
+          this._srcWorldSplitOn = worldSegment !== 0;
+          if (worldSegment === 2) this._srcWorldChains = (this._srcWorldChains ?? 0) + 1;
+          else if (worldSegment === 0) this._srcWorldChains = (this._srcWorldChains ?? 0) + 1;
         }
         giCompute(renderer, screenPasses, dispatchOptions);
         if (state.screen.ao?.enabled) {
           state.screen.ao.enabled.value = this.config.ao !== false
             && giNodesReady(state.screen.aoComputes) ? 1 : 0;
+          if (this._giAoActiveU) this._giAoActiveU.value = state.screen.ao.enabled.value;
         }
         if (this._giBounceWeightU) {
           this._giBounceWeightU.value = this.config.bounce === false ? 0 : 1;
@@ -4142,6 +4444,7 @@ export class GISystem {
     // trace it was filtering — on a scene logging "0 emitters".
     if (!(this._emitterInfos?.length > 0) && state.screen?.emitterShadowPass) {
       frameSkip.add(state.screen.emitterShadowPass.compute);
+      frameSkip.add(state.screen.emitterStaticSnapshotPass?.compute);
       frameSkip.add(state.screen.emitterShadowFilterPass?.compute);
       // The temporal pair is the same dead weight with zero emitters — and
       // more of it, since it is two more full-texture passes.
@@ -4519,6 +4822,7 @@ export class GISystem {
                     // pass at a time.
                     ...(state.screen.emitterTileCut ? [state.screen.emitterTileCut.compute] : []),
                     state.screen.emitterShadowPass.compute,
+                    ...(state.screen.emitterStaticSnapshotPass ? [state.screen.emitterStaticSnapshotPass.compute] : []),
                     state.screen.emitterShadowFilterPass.compute,
                     // The temporal pair rides the idle path too: skipping it
                     // would freeze the history at the last awake frame and then
@@ -4702,6 +5006,7 @@ export class GISystem {
           for (const node of [
             state.screen.emitterTileCut?.compute,
             emitterPassNode,
+            state.screen.emitterStaticSnapshotPass?.compute,
             state.screen.emitterShadowFilterPass?.compute,
             state.screen.emitterShadowHistoryPass?.compute,
             state.screen.emitterShadowPostPass?.compute,
@@ -4844,6 +5149,9 @@ export class GISystem {
     giSkippedComputes.clear();
 
     this._frame++;
+    // §11.36: hand last frame's dispatch list to the receipt, start a new one.
+    this._giDispatchedLastFrame = giDispatchLog;
+    giDispatchLog = [];
     if (globalThis.__giLogComposite && this._frame % 120 === 0) {
       const why = this._compositeWhy ?? { atlas: 0, occ: 0, first: 0 };
       console.log(
@@ -4869,6 +5177,351 @@ export class GISystem {
     // either gate would mean a scene that added a mesh with movers switched
     // off never got it into the exact-reflection BVH at all.
     this.#maybeResyncBvhScene(this.state);
+    // LAST in the tick, so it reads the irradiance THIS frame's chain wrote.
+    this.#stepFlickerWatch();
+    this.#stepLightResponse();
+  }
+
+  /**
+   * THE LIGHT-RESPONSE GATE (plan 11.23) - arm a window that STEPS the scene's
+   * sun by `stepDeg` after `warmupFrames` and records how the GI irradiance
+   * follows. The one receipt a stability number cannot fake: a frozen field
+   * reads 0 flicker and never reaches t90.
+   *
+   * Requires exactly one directional light - the op is a measurement of "the
+   * sun", and two suns would make the step ambiguous. The light's PARENT is
+   * rotated about x (what the project's own day-cycle script writes), on the
+   * Object3D only, and restored on read.
+   */
+  beginLightResponse({ stepDeg = 25, seconds = 8, warmupFrames = 30 } = {}) {
+    const renderer = this.engine?.renderer;
+    const irradiance = this._giTargets?.irradiance;
+    const size = this._giTargetSize;
+    if (!renderer || !irradiance || !size?.width) {
+      throw new Error("GI light response: no irradiance target - wait for `[gi] field ready`.");
+    }
+    const suns = (this._lightObjects ?? []).filter((l) => l.isDirectionalLight);
+    if (suns.length !== 1) {
+      throw new Error(`GI light response: needs exactly one directional light, found ${suns.length}.`);
+    }
+    this.#endLightResponse({ restore: true });
+    const pivot = suns[0].parent ?? suns[0];
+    const maxFrames = Math.min(4096, Math.round(Math.max(1, seconds) * 200) + Math.round(warmupFrames) + 8);
+    this._lightResp = {
+      rec: createGiTileMeanRecorder({ irradiance, width: size.width, height: size.height, maxFrames }),
+      renderer,
+      pivot,
+      savedX: pivot.rotation.x,
+      stepRad: ((Number(stepDeg) || 0) * Math.PI) / 180,
+      stepAt: Math.max(1, Math.round(warmupFrames)),
+      applied: false,
+      frame: 0,
+      until: performance.now() + Math.max(1, seconds) * 1000,
+      startedAt: performance.now(),
+      targetSwapped: false,
+      done: false,
+      signals: [],
+    };
+    return { resolution: `${size.width}x${size.height}`, stepDeg, seconds, warmupFrames };
+  }
+
+  lightResponseComplete() {
+    const w = this._lightResp;
+    return !w || w.done || performance.now() >= w.until || w.frame >= w.rec.maxFrames;
+  }
+
+  #stepLightResponse() {
+    const w = this._lightResp;
+    if (!w || w.done) return;
+    if (this._giTargets?.irradiance !== w.rec.texture) {
+      w.targetSwapped = true;
+      w.done = true;
+      return;
+    }
+    if (w.frame === w.stepAt && !w.applied) {
+      w.pivot.rotation.x += w.stepRad;
+      w.pivot.updateMatrixWorld(true);
+      w.applied = true;
+    }
+    w.rec.frameU.value = w.frame;
+    try {
+      w.renderer.compute(w.rec.kernel);
+    } catch (e) {
+      w.done = true;
+      w.error = String(e?.message ?? e).slice(0, 200);
+    }
+    if (w.frame >= w.stepAt && (w.frame - w.stepAt) % 4 === 0) {
+      w.signals.push({
+        alpha: Number(globalThis.__giSrcAlphaLive) || 0,
+        root: Number(globalThis.__giSrcMotionRootLive) || 0,
+        hist: Number(this._giIrrHistWeightU?.value ?? -1),
+        light: (Number(this._giFieldLightMotion ?? this._giShadowLastMotion) || 0) / ALPHA_MOTION_SAT,
+        track: Number(this._giTrackMotion) || 0,
+      });
+    }
+    w.frame++;
+    if (w.frame >= w.rec.maxFrames || performance.now() >= w.until) w.done = true;
+  }
+
+  #endLightResponse({ restore } = {}) {
+    const w = this._lightResp;
+    if (!w) return;
+    if (restore && w.applied && w.pivot) {
+      w.pivot.rotation.x = w.savedX;
+      w.pivot.updateMatrixWorld(true);
+    }
+    disposeGiTileMeanRecorder(w.rec);
+    this._lightResp = null;
+  }
+
+  async readLightResponse() {
+    const w = this._lightResp;
+    if (!w) throw new Error("GI light response: nothing armed.");
+    w.done = true;
+    // Restore the sun BEFORE the readback so the scene is not left stepped if
+    // the readback throws.
+    if (w.applied && w.pivot) {
+      w.pivot.rotation.x = w.savedX;
+      w.pivot.updateMatrixWorld(true);
+      w.applied = false;
+    }
+    if (w.targetSwapped) {
+      this.#endLightResponse();
+      return { targetSwapped: true, frames: w.frame, note: "A GI rebuild replaced the resolve target during the window; nothing here is a measurement." };
+    }
+    let stats;
+    try {
+      stats = await readGiTileMeanRecorder(w.renderer, w.rec, w.frame, w.stepAt);
+    } catch (e) {
+      this.#endLightResponse();
+      throw e;
+    }
+    if (stats.pipelinePending) {
+      this.#endLightResponse();
+      return {
+        ...stats, frames: w.frame, error: w.error ?? null,
+        note: "THE RECORDER KERNEL NEVER RAN: its compute pipeline had not landed by the end of the window " +
+          "(async compile still pending, or a shader error that makes it a silent no-op — check the console). " +
+          "Run it again; nothing here is a measurement.",
+      };
+    }
+    const span = (key) => {
+      const vs = w.signals.map((g) => g[key]).filter((v) => Number.isFinite(v));
+      if (!vs.length) return null;
+      const sorted = vs.slice().sort((a, b) => a - b);
+      return { min: +sorted[0].toFixed(3), med: +sorted[sorted.length >> 1].toFixed(3), max: +sorted[sorted.length - 1].toFixed(3) };
+    };
+    const seconds = (performance.now() - w.startedAt) / 1000;
+    const out = {
+      ...stats,
+      frames: w.frame,
+      seconds: +seconds.toFixed(1),
+      fps: +(w.frame / Math.max(0.001, seconds)).toFixed(1),
+      t50Ms: stats.t50Frames >= 0 ? +((stats.t50Frames / Math.max(1, w.frame)) * seconds * 1000).toFixed(0) : null,
+      t90Ms: stats.t90Frames >= 0 ? +((stats.t90Frames / Math.max(1, w.frame)) * seconds * 1000).toFixed(0) : null,
+      signals: { alpha: span("alpha"), root: span("root"), histWeight: span("hist"), lightMotion: span("light"), trackWindow: span("track") },
+      error: w.error ?? null,
+    };
+    this.#endLightResponse();
+    return out;
+  }
+
+  /**
+   * Arm the live flicker watch (see `giFlickerWatch.js` for why it exists and
+   * what the numbers mean). Returns what it bound, so a caller can say
+   * "measuring 1495x981 of giIrradiance" rather than "measuring".
+   *
+   * ⚠ The window does NOT start counting immediately: `warmupFrames` frames
+   * seed each pixel's previous luminance first. Counting from frame zero
+   * scores the seed itself as one enormous delta on every pixel.
+   */
+  beginFlickerWatch({ seconds = 10, warmupFrames = 20, stillOnly = true } = {}) {
+    const renderer = this.engine?.renderer;
+    const irradiance = this._giTargets?.irradiance;
+    const size = this._giTargetSize;
+    if (!renderer || !irradiance || !size?.width) {
+      throw new Error(
+        "GI flicker watch: no irradiance target — the field has not built yet " +
+        "(or this build has no screen resolve). Wait for `[gi] field ready`.",
+      );
+    }
+    this.#endFlickerWatch();
+    this._flicker = {
+      acc: createGiFlickerAccumulator({ irradiance, width: size.width, height: size.height }),
+      renderer,
+      until: performance.now() + Math.max(0.5, seconds) * 1000,
+      startedAt: performance.now(),
+      warmup: Math.max(0, Math.round(warmupFrames)),
+      frames: 0,
+      warmupSeen: 0,
+      dispatched: 0,
+      stillOnly: stillOnly !== false,
+      movingFrames: 0,
+      targetSwapped: false,
+      signals: [],
+      done: false,
+    };
+    return { resolution: `${size.width}x${size.height}`, seconds, warmupFrames };
+  }
+
+  /** True once the armed window has run out (or nothing is armed). */
+  flickerWatchComplete() {
+    const w = this._flicker;
+    return !w || w.done || performance.now() >= w.until;
+  }
+
+  /**
+   * One frame of the watch: dispatch the accumulator and take the machinery's
+   * dials on the SAME frame. Cheap by construction — one compute over the
+   * resolve and eight property reads; no readback until the window closes.
+   */
+  #stepFlickerWatch() {
+    const w = this._flicker;
+    if (!w || w.done) return;
+    // ⚠ THE BLIND-INSTRUMENT GUARD. A rebuild swaps `_giTargets`, and an
+    // accumulator still holding the old StorageTexture watches a surface
+    // nothing writes — which reads as a perfectly calm field. Stop counting
+    // and SAY SO rather than return a clean number from a dead texture.
+    if (this._giTargets?.irradiance !== w.acc.texture) {
+      w.targetSwapped = true;
+      w.done = true;
+      return;
+    }
+    // ── ⭐⭐ WHY THE DEFAULT SKIPS MOVING FRAMES ───────────────────────
+    //
+    // This counter is SCREEN-SPACE, and while the camera moves a pixel does
+    // not hold still over a surface — it sweeps across the scene, sampling
+    // unrelated brightnesses. Its luminance then reverses because of PARALLAX,
+    // which is not a defect and not something any GI change can fix. The smoke
+    // run measures it: an orbit puts 100 % of pixels in motion and 99.99 % over
+    // the churn threshold, on a field that is behaving.
+    //
+    // So by default the watch seeds through motion and COUNTS ONLY ON FRAMES
+    // WHERE THE CAMERA DID NOT MOVE. That is exactly the user's own complaint
+    // ("when the camera looks at new surfaces") reduced to a measurable event:
+    // arrive, hold, and watch how long the field keeps rearranging itself. It
+    // is the same discipline `probe:gi-walk` was built on — walk, STOP, then
+    // measure — and it means `frames` is the STILL frame count, not the window's.
+    //
+    // `stillOnly: false` counts every frame, which is what the eye actually
+    // integrates; use it to compare two builds under the same motion, never to
+    // ask whether a number is "good".
+    const camMoving = w.stillOnly && this._giCamMoving === true;
+    if (camMoving) w.movingFrames++;
+    if (w.warmupSeen < w.warmup || camMoving) {
+      if (!camMoving) w.warmupSeen++;
+      w.acc.armed.value = 0;
+    } else {
+      w.acc.armed.value = 1;
+      w.frames++;
+      // Sampled once per counted frame, downsampled on read. The picture and
+      // the dials have never been on one timeline in this investigation.
+      w.signals.push({
+        t: Math.round(performance.now() - w.startedAt),
+        alpha: Number(globalThis.__giSrcAlphaLive) || 0,
+        root: Number(globalThis.__giSrcMotionRootLive) || 0,
+        duty: Number(globalThis.__giSrcFarDutyLive) || 0,
+        hist: Number(this._giIrrHistWeightU?.value ?? -1),
+        cam: Number(this._giCamMotionEma) || 0,
+        // In the arm threshold's own units, so `0.6` on this line and the
+        // `light-track window ... peak 0.6` console line mean the same thing.
+        // The RADIANCE-side track (§11.21) — the one the α ramp, the screen
+        // filter and the arm decision all read. With the sun split armed a
+        // turning sun is absent from it by design; `lightVis` is the
+        // visibility-side twin that still carries it, so the two disagreeing
+        // is the receipt that the split is doing its job.
+        light: (Number(this._giFieldLightMotion ?? this._giShadowLastMotion) || 0) / ALPHA_MOTION_SAT,
+        lightVis: (Number(this._giShadowLastMotion) || 0) / ALPHA_MOTION_SAT,
+        track: Number(this._giTrackMotion) || 0,
+        hz: Number(this._srcWorldHzLive) || 0,
+      });
+    }
+    try {
+      w.renderer.compute(w.acc.kernel);
+      w.dispatched++;
+    } catch (e) {
+      w.done = true;
+      w.error = String(e?.message ?? e).slice(0, 200);
+    }
+    if (performance.now() >= w.until) w.done = true;
+  }
+
+  /** Free an armed or finished window's two per-pixel buffers. */
+  #endFlickerWatch() {
+    if (this._flicker) disposeGiFlickerAccumulator(this._flicker.acc);
+    this._flicker = null;
+  }
+
+  /**
+   * Read the window back, reduce it, and disarm. One readback; see
+   * `readGiFlickerAccumulator`.
+   */
+  async readFlickerWatch() {
+    const w = this._flicker;
+    if (!w) throw new Error("GI flicker watch: nothing armed — call beginFlickerWatch first.");
+    w.done = true;
+    if (w.targetSwapped) {
+      this.#endFlickerWatch();
+      return {
+        targetSwapped: true,
+        frames: w.frames,
+        note:
+          "A GI REBUILD REPLACED THE RESOLVE TARGET DURING THE WINDOW. Everything the " +
+          "accumulator saw after that would have come from a texture nothing writes, so the " +
+          "window was stopped instead of reporting a clean number. A rebuild is itself the " +
+          "biggest 'patches converging' event there is — check profile.frameStats' giRebuilds " +
+          "for its reason, then measure again once the scene is quiet.",
+      };
+    }
+    let stats;
+    try {
+      stats = await readGiFlickerAccumulator(w.renderer, w.acc, w.frames);
+    } catch (e) {
+      this.#endFlickerWatch();
+      throw e;
+    }
+    if (stats.pipelinePending) {
+      const frames = w.frames;
+      this.#endFlickerWatch();
+      return {
+        ...stats, frames, stillOnly: true, movingFramesSkipped: 0, seconds: 0, fps: 0, signals: {},
+        error: w.error ?? null,
+        note: "THE ACCUMULATOR KERNEL NEVER RAN: its compute pipeline had not landed by the end of the window " +
+          "(the driver's compile queue is busy — a harness Chrome on the same GPU, or the tail of a boot's material " +
+          "wave — or a shader error makes it a silent no-op; check the console). Run it again once the scene is quiet; " +
+          "nothing here is a measurement.",
+      };
+    }
+    // The dials, reduced: the range each one covered while the picture moved.
+    const span = (key) => {
+      const vs = w.signals.map((g) => g[key]).filter((v) => Number.isFinite(v));
+      if (!vs.length) return null;
+      const sorted = vs.slice().sort((a, b) => a - b);
+      return {
+        min: +sorted[0].toFixed(3),
+        med: +sorted[Math.floor(sorted.length / 2)].toFixed(3),
+        max: +sorted[sorted.length - 1].toFixed(3),
+      };
+    };
+    const signals = {
+      alpha: span("alpha"), root: span("root"), duty: span("duty"),
+      histWeight: span("hist"), cameraMotion: span("cam"),
+      lightMotion: span("light"), lightMotionVisibility: span("lightVis"),
+      trackWindow: span("track"), worldHz: span("hz"),
+    };
+    const seconds = (performance.now() - w.startedAt) / 1000;
+    const frames = w.frames;
+    this.#endFlickerWatch();
+    return {
+      ...stats,
+      frames,
+      stillOnly: w.stillOnly,
+      movingFramesSkipped: w.movingFrames,
+      seconds: +seconds.toFixed(1),
+      fps: +(w.dispatched / Math.max(0.001, seconds)).toFixed(1),
+      signals,
+      error: w.error ?? null,
+    };
   }
 
   /**
@@ -5504,7 +6157,7 @@ export class GISystem {
         // Nothing here needs a rebuild.
         if (!(this._emitterInfos?.length > 0)) {
           for (const name of [
-            "emitterShadowPass", "emitterShadowFilterPass",
+            "emitterShadowPass", "emitterStaticSnapshotPass", "emitterShadowFilterPass",
             "emitterShadowHistoryPass", "emitterShadowPostPass",
             "emitterShadowWidePass", "emitterShadowWidePass2",
           ]) {
@@ -6552,6 +7205,62 @@ export class GISystem {
    * the RECORD arm and the in-material sphere fallback are untouched and
    * report width 0, which the wide passes read as "nothing to blur".
    */
+  /**
+   * §11.40 — the emitter shadow pass's static visibility cache arguments:
+   * the three cache textures of this target set and the two uniforms
+   * (generation, stride) the tick drives. Only for the seat-rotating arm.
+   */
+  #emitterStaticCache(targets) {
+    if (!targets?.emitterStaticVis || !targets?.emitterStaticVisNext) return null;
+    return {
+      read: { vis: targets.emitterStaticVis, t: targets.emitterStaticT, stamp: targets.emitterStaticStamp },
+      write: { vis: targets.emitterStaticVisNext, t: targets.emitterStaticTNext, stamp: targets.emitterStaticStampNext },
+    };
+  }
+
+  /**
+   * §11.45 — where the world chain splits in two. Everything up to and
+   * including the deposit's TRACE + ATTRIBUTE writes the bins; everything
+   * after it (shade, resolve, merge, tiles) turns them into the field the
+   * gather reads. Between the two halves the PROBE PAYLOAD and the TILES are
+   * still last tick's fully resolved state — only the bins are mid-update,
+   * and nothing outside the chain reads bins — so a frame may land in the
+   * gap. Returns 0 when the boundary pass is not in this list (a feature
+   * arm that has no separate trace pass), which turns the split off.
+   */
+  #worldSegmentBoundary(worldPasses) {
+    for (let i = worldPasses.length - 1; i >= 0; i--) {
+      const name = worldPasses[i]?.__giPassName;
+      if (typeof name === "string" && name.startsWith("src:deposit (") && name.includes("trace + attribute")) {
+        return i + 1;
+      }
+    }
+    return 0;
+  }
+
+  /** §11.40 — the movers-only refresh stride the frame loop applies (`__giEmitterStaticStride` pins it). */
+  get emitterStaticStride() {
+    const pin = Number(globalThis.__giEmitterStaticStride);
+    return Number.isFinite(pin) && pin >= 1 ? Math.round(pin) : EMITTER_STATIC_STRIDE;
+  }
+
+  /** §11.40 — the write -> read copy that follows every dispatch of the marcher (null when the cache is not armed). */
+  #emitterStaticSnapshotPass(targets, seatRotate, width, height) {
+    const cache = seatRotate ? this.#emitterStaticCache(targets) : null;
+    return cache ? createGiEmitterStaticSnapshotPass({ cache, width, height }) : null;
+  }
+
+  #emitterStaticCacheArgs(targets, seatRotate) {
+    if (!seatRotate || !this.#emitterStaticCache(targets)) return {};
+    this._giEmitterStaticGenU ??= uniform(0, "uint").setGroup(renderGroup);
+    this._giEmitterStaticStrideU ??= uniform(1, "uint").setGroup(renderGroup);
+    return {
+      staticCache: this.#emitterStaticCache(targets),
+      staticGen: this._giEmitterStaticGenU,
+      staticStride: this._giEmitterStaticStrideU,
+    };
+  }
+
   #buildEmitterRecordTrace(volume, quality) {
     if (globalThis.__giEmitterRecordShadows === false) return null;
     const occ = volume.occupancyField;
@@ -6579,7 +7288,7 @@ export class GISystem {
     const macroSteps =
       Number(globalThis.__giDirectShadowSteps) ||
       ({ low: 48, medium: 64, high: 80, ultra: 96 }[quality] ?? 80);
-    const trace = (P, N, dir, maxT, k, cosRayNormal, dist = null, reff = null) => {
+    const trace = (P, N, dir, maxT, k, cosRayNormal, dist = null, reff = null, staticCache = null) => {
       // One return shape for the whole closure: with the analytic arm every
       // path returns vec2(visibility, width), and the arms that have no
       // blocker distance to report (record march, kind debug) report width 0.
@@ -6624,12 +7333,34 @@ export class GISystem {
           .div(float(cosRayNormal ?? 1).max(0.25))
           .toVar();
         const exactOrigin = vec3(P).add(vec3(N).mul(bias)).toVar();
-        const s = this._dynSet.traceStaticBvh(exactOrigin, dir, bias, tEnd);
+        // §11.40: the STATIC any-hit — the expensive march — goes through the
+        // caller's static visibility cache when it has one. A valid entry
+        // that is not this frame's refresh stride is read back (visibility,
+        // blocker t); anything else marches and stores. The mover trace
+        // below runs every frame either way — that is the whole point.
+        const sHit = float(0).toVar();
+        const sT = float(1e9).toVar();
+        const marchStatic = () => {
+          const s = this._dynSet.traceStaticBvh(exactOrigin, dir, bias, tEnd);
+          sHit.assign(select(s.x.greaterThanEqual(0), float(1), float(0)));
+          sT.assign(select(s.x.greaterThanEqual(0), s.x, float(1e9)));
+        };
+        if (staticCache) {
+          If(staticCache.valid.and(staticCache.march.not()), () => {
+            sHit.assign(float(1).sub(float(staticCache.vis)).clamp(0, 1));
+            sT.assign(select(float(staticCache.t).lessThan(0), float(1e9), float(staticCache.t)));
+          }).Else(() => {
+            marchStatic();
+            staticCache.store(float(1).sub(sHit), select(sHit.greaterThan(0.5), sT, float(-1)));
+          });
+        } else {
+          marchStatic();
+        }
         // §14 Q2: same self-exclusion as the light arm — see there.
         const dr = this._dynSet.trace(exactOrigin, dir, bias, tEnd, {
           excludePoint: globalThis.__giNoSelfPlaneExclusion === true ? null : P,
         });
-        const hit = s.x.greaterThanEqual(0).or(dr.hit.greaterThan(0.5)).toVar();
+        const hit = sHit.greaterThan(0.5).or(dr.hit.greaterThan(0.5)).toVar();
         if (analyticPen) {
           // BLOCKER DISTANCE, free: both arms already resolved a t, so the
           // nearer of the two live ones is the PCSS blocker. (`traceStaticBvh`
@@ -6638,7 +7369,7 @@ export class GISystem {
           // neighbourhood max search absorbs the resulting jitter, which is
           // bounded by the occluder's own thickness.)
           const far = float(1e9);
-          const tB = select(s.x.greaterThanEqual(0), s.x, far)
+          const tB = select(sHit.greaterThan(0.5), sT, far)
             .min(select(dr.hit.greaterThan(0.5), dr.t, far))
             .clamp(0, tEnd)
             .toVar();
@@ -6740,7 +7471,13 @@ export class GISystem {
     const { width, height } = this.#screenResolveSize();
     const { width: shadowW, height: shadowH } = this.#lightShadowSize({ width, height });
     try {
-      const gbuffer = createGiGBuffer(width, height);
+      // §11.33: SYSTEM-LIFETIME, like the resolve targets below — it is
+      // material-bound (`_giShadowPosNode`), see #persistentGbuffer.
+      const gbuffer = this.#persistentGbuffer(width, height);
+      // §11.35: the prepass renders at AO resolution; the chain reads the
+      // point-sampled copy (`gbuffer`), the AO pass the full one. Null when
+      // the two sizes coincide (medium/low, or a small viewport).
+      const gbufferFull = this.#persistentGbufferFull(this.#gbufferFullSize({ width, height }), { width, height });
       const { width: emitterW, height: emitterH } = this.#emitterShadowSize(shadowW, shadowH);
       if (!this._giTargets) {
         this._giTargets = createGiTargets(width, height, shadowW, shadowH, { emitterWidth: emitterW, emitterHeight: emitterH });
@@ -6772,7 +7509,7 @@ export class GISystem {
       // The shadowNode's tap offsets are SHADOW-CHANNEL texels (its own
       // resolution since the pass split); runs on every build (and
       // #syncScreenResolveSize covers the resize path).
-      (this._giLightShadowTexel ??= uniform(new THREE.Vector2())).value.set(1 / shadowW, 1 / shadowH);
+      (this._giLightShadowTexel ??= uniform(new THREE.Vector2()).setGroup(renderGroup)).value.set(1 / shadowW, 1 / shadowH);
       // The gbuffer POSITION feeds the shadowNode's tap validity (see
       // #acquireLightShadowNode). The gbuffer is per-build, so the persistent
       // node re-points here every time; a resize reuses the same render
@@ -6782,6 +7519,9 @@ export class GISystem {
       // EVERY screen-space GI term, not of the shadow feature).
       if (!this._giShadowPosNode) this._giShadowPosNode = texture(gbuffer.position);
       else this._giShadowPosNode.value = gbuffer.position;
+      // §11.33: a build is the event after which every static render object
+      // must refresh its bindings once (see #refreshRenderObjectsOnce).
+      this.#refreshRenderObjectsOnce("screen-resolve-built");
       const emitter = emitterSlots
         ? {
             emitterSlots,
@@ -6822,8 +7562,8 @@ export class GISystem {
         : null;
       this._giReflectionsEnabledU ??= uniform(
         this.config.reflections === false ? 0 : 1,
-      );
-      this._giBounceWeightU ??= uniform(this.config.bounce === false ? 0 : 1);
+      ).setGroup(renderGroup);
+      this._giBounceWeightU ??= uniform(this.config.bounce === false ? 0 : 1).setGroup(renderGroup);
       const inputs = {
         gather,
         normalOffset: light.normalOffset,
@@ -6858,7 +7598,7 @@ export class GISystem {
       // `cameraPosition = null` fallback and stopped flipping. Nothing shipped
       // with radiance off, so nothing shipped broken; the SRC deletion is what
       // makes `radiance` null for real (§12.8).
-      this._giResolveCamU ??= uniform(new THREE.Vector3());
+      this._giResolveCamU ??= uniform(new THREE.Vector3()).setGroup(renderGroup);
       inputs.cameraPosition = this._giResolveCamU;
       const radiance = radianceLookup ? { lookup: radianceLookup } : null;
       inputs.radiance = radiance;
@@ -7032,9 +7772,13 @@ export class GISystem {
           // The per-frame poll guards on _giEnvMissNode and writes ALL of
           // these — creating the node without its siblings would crash the
           // first tick after a build whose reflection block never ran.
-          this._giEnvMissIntensityU ??= uniform(0);
-          this._giEnvMissRotU ??= uniform(0);
-          this._giSkyEnvIntensityU ??= uniform(0);
+          this._giEnvMissIntensityU ??= uniform(0).setGroup(renderGroup);
+          this._giEnvMissRotU ??= uniform(0).setGroup(renderGroup);
+          this._giSkyEnvIntensityU ??= uniform(0).setGroup(renderGroup);
+          // §11.52 — the per-bin integrated sky tables (srcSkyBins.js). One
+          // manager for the life of the system; the kernels ask it for their
+          // bin widths at build and the env poll refills it on change.
+          this._giSkyBinTables ??= createSkyBinTables();
           // §11.16: the far-field texture exists BEFORE the SRC system so the
           // fresh-probe seed can bind it as its prior of last resort. The
           // passes that fill it are created further down, once the gather
@@ -7053,6 +7797,7 @@ export class GISystem {
               node: this._giEnvMissNode,
               intensity: this._giSkyEnvIntensityU,
               rotY: this._giEnvMissRotU,
+              tables: this._giSkyBinTables,
             },
             surfaces,
             bvhTrace: volume.bvhTransport && this._dynSet?.traceStaticBvhSlot ? { dyn: this._dynSet } : null,
@@ -7097,7 +7842,9 @@ export class GISystem {
               // retraction in srcConfig for why "any future" and not "the one
               // that shipped"). `mLight` is the clamped max, bit-identical to
               // the previous `Math.min(1, Math.max(...))`.
-              const rShadow = (this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT;
+              // §11.21: the RADIANCE-side track — a split sun's rotation is not in
+              // it, because it stales no stored word (see the light loop).
+              const rShadow = (this._giFieldLightMotion ?? this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT;
               const rEmitter = this._giEmitterLastMotion ?? 0;
               // Relative light-luminance delta (see the hoisted light
               // loop): same saturation constant as the other terms, so a
@@ -7129,7 +7876,44 @@ export class GISystem {
               // numbers that priced all of this. Sustained motion runs on
               // the m-driven α ramp at the tier cap; steps out of stillness
               // arm exactly as before.
-              const above = mLight >= ALPHA_TRACK_THRESHOLD;
+              // ── ⭐⭐⭐ §11.21 AND IT ARMS ON NOVELTY, NOT ON A LEVEL ───────
+              //
+              // §12.46 made the arm a RISING EDGE so a continuously moving light
+              // could not pin the window open. That instrument only works while
+              // the sustained signal sits CLEARLY above the threshold — then the
+              // edge never re-fires. A day cycle does not: it straddles. §12.83
+              // named this exactly, designed the fix below, simulated the
+              // straddle at ±12 % jitter, priced it at ~1 % of frames and left it
+              // unbuilt. `profile.flicker` measured the real thing in the user's
+              // play session: the window open on more than half the still frames,
+              // `lightMotion` spanning 0.086–3.45 around a 0.5 threshold on a sun
+              // turning at a smooth rate, and turning the window off cutting
+              // per-pixel reversals 5.1× and the p95 one-frame step 5.2×.
+              //
+              // So: a light EVENT is not "fast", it is FASTER THAN THIS LIGHT HAS
+              // BEEN. Each term carries its own slow baseline and must clear
+              // `max(threshold, NOVELTY × baseline)`. A steadily rotating sun is
+              // never novel against itself; a sun that starts, a teleport or a
+              // toggle always is. PER TERM, so the sun's raised shadow baseline
+              // cannot deafen the luminance term to a lamp.
+              // ⛔ OPT-IN, same reason: shutting this window is a RESPONSIVENESS
+              // trade and no gate here measures responsiveness.
+              const novelty = globalThis.__giSrcTrackNovelty === true;
+              const bl = (this._giTrackBaseline ??= { shadow: 0, emitter: 0, lum: 0, at: now });
+              const blDt = Math.min(500, Math.max(1, now - bl.at));
+              const blA = 1 - Math.exp(-blDt / TRACK_BASELINE_MS);
+              const novelEnough = (v, base) =>
+                v >= (novelty ? Math.max(ALPHA_TRACK_THRESHOLD, TRACK_NOVELTY * base) : ALPHA_TRACK_THRESHOLD);
+              // Compared BEFORE the baselines advance, so a term is never judged
+              // against a baseline it has already moved.
+              const above = novelEnough(rShadow, bl.shadow)
+                || novelEnough(rEmitter, bl.emitter)
+                || novelEnough(rLum, bl.lum);
+              // Fed the UNCLAMPED terms — see TRACK_NOVELTY's note.
+              bl.shadow += (rShadow - bl.shadow) * blA;
+              bl.emitter += (rEmitter - bl.emitter) * blA;
+              bl.lum += (rLum - bl.lum) * blA;
+              bl.at = now;
               const belowFor = now - (this._giMotionBelowSince ?? -1e9);
               const armed = above && (globalThis.__giSrcTrackLevelArm === true ||
                   (!this._giMotionAbovePrev && belowFor >= ALPHA_TRACK_REARM_MS));
@@ -7173,7 +7957,9 @@ export class GISystem {
                 if (armed) {
                   a.arms++;
                   const terms = [
-                    ["shadow", (this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT],
+                    // §11.21: the same RADIANCE-side track the arm decision used,
+                    // or the line would name "shadow" for a term the arm never saw.
+                    ["shadow", (this._giFieldLightMotion ?? this._giShadowLastMotion ?? 0) / ALPHA_MOTION_SAT],
                     ["emitter", this._giEmitterLastMotion ?? 0],
                     ["lightLum", (this._giLightLumMotion ?? 0) / ALPHA_MOTION_SAT],
                   ].sort((x, y) => y[1] - x[1]);
@@ -7453,6 +8239,7 @@ export class GISystem {
       const { aoPass, vxaoPass } = this.#armAoTerm({
         srcProbes,
         gbuffer,
+        gbufferFull,
         width,
         height,
         ao: inputs.ao,
@@ -7674,9 +8461,9 @@ export class GISystem {
               // The deforming-surface reject box — see
               // #syncDynamicSurfaceBounds for why this is bounds and not a
               // per-pixel mark.
-              dynMin: (this._giDynRejectMinU ??= uniform(new THREE.Vector3())),
-              dynMax: (this._giDynRejectMaxU ??= uniform(new THREE.Vector3())),
-              dynActive: (this._giDynRejectActiveU ??= uniform(0)),
+              dynMin: (this._giDynRejectMinU ??= uniform(new THREE.Vector3()).setGroup(renderGroup)),
+              dynMax: (this._giDynRejectMaxU ??= uniform(new THREE.Vector3()).setGroup(renderGroup)),
+              dynActive: (this._giDynRejectActiveU ??= uniform(0).setGroup(renderGroup)),
             },
           })
         : null;
@@ -7764,8 +8551,8 @@ export class GISystem {
       // passes; the bilateral's distance-robust eps needs them on every arm,
       // so they are created whenever any shadow filter will (the tick's
       // refresh is already gated on their existence, not on wideOn).
-      this._giShadowWideCamU ??= uniform(new THREE.Vector3());
-      this._giShadowWideProjU ??= uniform(1.2);
+      this._giShadowWideCamU ??= uniform(new THREE.Vector3()).setGroup(renderGroup);
+      this._giShadowWideProjU ??= uniform(1.2).setGroup(renderGroup);
       const lightShadowFilterPass = lightShadowPass
         ? createGiLightShadowFilterPass({
             gbuffer,
@@ -7782,7 +8569,7 @@ export class GISystem {
             projScale: this._giShadowWideProjU,
             // Angle-adaptive σ (see the filter's note) — synced per tick
             // from the sharpest claimed light in #syncLightShadowNodes.
-            softness: (this._giShadowSoftnessU ??= uniform(1)),
+            softness: (this._giShadowSoftnessU ??= uniform(1).setGroup(renderGroup)),
             history: analyticWidth ? null : {
               histShadow: targets.lightShadowHist,
               histPos: targets.lightShadowHistPos,
@@ -7943,7 +8730,11 @@ export class GISystem {
             tileCut: tileCutBundle,
             frame: emitterAreaSample ? this._giEmitterFrameU : null,
             checker: emitterAreaSample ? (this._giEmitterCheckerU ??= uniform(1, "uint").setGroup(renderGroup)) : null,
+            ...this.#emitterStaticCacheArgs(targets, emitterSeatRotate),
           })
+        : null;
+      const emitterStaticSnapshotPass = emitterShadowPass
+        ? this.#emitterStaticSnapshotPass(targets, emitterSeatRotate, emitterW, emitterH)
         : null;
       // EMITTER TEMPORAL ACCUMULATION (2026-08-07). This channel had the
       // spatial bilateral and nothing else — see `ensureEmitterTemporal` for why
@@ -8018,7 +8809,7 @@ export class GISystem {
       // before it is blurred, and any extra σ here is width the penumbra
       // model did not ask for — applied uniformly, i.e. exactly the flat
       // smear the width-probe arm needed and the analytic one does not.
-      this._giEmitterSoftnessU ??= uniform(0.5);
+      this._giEmitterSoftnessU ??= uniform(0.5).setGroup(renderGroup);
       this._giEmitterSoftnessU.value = Number.isFinite(Number(globalThis.__giEmitterFilterSoftness))
         ? Number(globalThis.__giEmitterFilterSoftness)
         : emitterWideOn ? 0.15 : 0.5;
@@ -8089,9 +8880,9 @@ export class GISystem {
       // the emitter raw is a hard binary hit, so nothing but the search
       // carries the penumbra to the LIT side of the silhouette.
       if (emitterWideOn) {
-        this._giShadowWideCamU ??= uniform(new THREE.Vector3());
-        this._giShadowWideProjU ??= uniform(1.2);
-        this._giEmitterSearchWorldU ??= uniform(0.5);
+        this._giShadowWideCamU ??= uniform(new THREE.Vector3()).setGroup(renderGroup);
+        this._giShadowWideProjU ??= uniform(1.2).setGroup(renderGroup);
+        this._giEmitterSearchWorldU ??= uniform(0.5).setGroup(renderGroup);
       }
       // BOTH INSTANCES NOW CARRY THE SAME RADIUS, at 1/√2 of the analytic width
       // each, so the pair composes to exactly that width instead of √2 × it
@@ -8136,6 +8927,9 @@ export class GISystem {
           })
         : null;
       light.giIrradianceNode = this._giIrradianceNode;
+      // §11.35: the material-side AO term (see #pointAoMaterialNode).
+      light.giAoNode = this._giAoMaterialNode ?? null;
+      light.giAoActiveU = this._giAoActiveU ?? null;
       light.giEmitterShadowNode = emitterSlots ? this._giEmitterShadowNode : null;
       // §12.70 W4b: under the tile cut the packed shadow channels are keyed
       // to each pixel's TILE list, not to the global seats these material
@@ -8160,8 +8954,8 @@ export class GISystem {
         return t;
       })();
       this._giEnvMissNode ??= texture(this._giEnvPlaceholder);
-      this._giEnvMissIntensityU ??= uniform(0);
-      this._giEnvMissRotU ??= uniform(0);
+      this._giEnvMissIntensityU ??= uniform(0).setGroup(renderGroup);
+      this._giEnvMissRotU ??= uniform(0).setGroup(renderGroup);
       light.giEnvMiss = {
         node: this._giEnvMissNode,
         intensity: this._giEnvMissIntensityU,
@@ -8187,7 +8981,7 @@ export class GISystem {
       // so NESTED renders (the planar reflector's mirrored pass) read each
       // point's OWN GI instead of stamping the main view's image across the
       // mirrored geometry (the "double reflection" ghost, 2026-08-22).
-      light.giViewProj = (this._giResolveVPU ??= uniform(new THREE.Matrix4()));
+      light.giViewProj = (this._giResolveVPU ??= uniform(new THREE.Matrix4()).setGroup(renderGroup));
       // Whether the CURRENT render is a nested view. renderGroup +
       // onRenderUpdate is the mechanism: re-evaluated per RENDER, so the
       // planar reflector flipping `globalThis.__giNestedRender` around its
@@ -8201,7 +8995,7 @@ export class GISystem {
       // The emitter pack is a SMALLER buffer (emitterShadowScale × shadow
       // size) — its bilateral taps need its own texel or they collapse onto
       // one texel and stop discriminating (see giLight's tap comment).
-      this._giEmitterShadowTexel ??= uniform(new THREE.Vector2());
+      this._giEmitterShadowTexel ??= uniform(new THREE.Vector2()).setGroup(renderGroup);
       this._giEmitterShadowTexel.value.set(1 / emitterW, 1 / emitterH);
       light.giEmitterShadowTexel = this._giEmitterShadowTexel;
       if (srcProbes) {
@@ -8214,7 +9008,7 @@ export class GISystem {
         this.engine.scene.add(srcProbes.gizmos.group);
         srcProbes.gizmos.setVisible(giDebugView() === "src-probes");
       }
-      return { gbuffer, srcProbes, resolve, bvhHitShade, bvhHitTemporal, irrTemporalPass, irrHistoryPass, aoPass, vxaoPass, aoComputes, reflectionComputes, glossyTemporal, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterTileCut, emitterTileCutBundle: tileCutBundle, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, emitterSeatRotate, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, giCostScale: this.engine?.giCostScale ?? 1, ...inputs };
+      return { gbuffer, gbufferFull, srcProbes, resolve, bvhHitShade, bvhHitTemporal, irrTemporalPass, irrHistoryPass, aoPass, vxaoPass, aoComputes, reflectionComputes, glossyTemporal, lightShadowPass, lightShadowFilterPass, lightShadowWidePass, lightShadowWidePass2, lightShadowHistoryPass, lightShadowPostPass, emitterShadowPass, emitterStaticSnapshotPass, emitterTileCut, emitterTileCutBundle: tileCutBundle, emitterShadowFilterPass, emitterShadowHistoryPass, emitterShadowPostPass, emitterShadowWidePass, emitterShadowWidePass2, emitterSeatRotate, targets, width, height, shadowWidth: shadowW, shadowHeight: shadowH, emitterShadowWidth: emitterW, emitterShadowHeight: emitterH, giCostScale: this.engine?.giCostScale ?? 1, ...inputs };
     } catch (error) {
       // Falling back to the in-material path keeps GI working (slowly) rather
       // than rendering an unlit scene.
@@ -8258,11 +9052,11 @@ export class GISystem {
         // the camera-motion-aware weight rather than the diffuse filter's
         // camera-blind one (which made rough reflections drag behind the
         // camera exactly like the exact ones).
-        weight: (this._giBvhHitHistWeightU ??= uniform(0.9)),
+        weight: (this._giBvhHitHistWeightU ??= uniform(0.9).setGroup(renderGroup)),
         validEps,
-        dynMin: (this._giDynRejectMinU ??= uniform(new THREE.Vector3())),
-        dynMax: (this._giDynRejectMaxU ??= uniform(new THREE.Vector3())),
-        dynActive: (this._giDynRejectActiveU ??= uniform(0)),
+        dynMin: (this._giDynRejectMinU ??= uniform(new THREE.Vector3()).setGroup(renderGroup)),
+        dynMax: (this._giDynRejectMaxU ??= uniform(new THREE.Vector3()).setGroup(renderGroup)),
+        dynActive: (this._giDynRejectActiveU ??= uniform(0).setGroup(renderGroup)),
       },
     });
     const snapshot = createGiLightShadowHistoryPass({
@@ -8324,11 +9118,11 @@ export class GISystem {
         // first visible once §17 R7a made the content worth looking at).
         // The tick drives this near zero while the camera moves and
         // recovers it over ~a third of a second at rest.
-        weight: (this._giBvhHitHistWeightU ??= uniform(0.9)),
+        weight: (this._giBvhHitHistWeightU ??= uniform(0.9).setGroup(renderGroup)),
         validEps,
-        dynMin: (this._giDynRejectMinU ??= uniform(new THREE.Vector3())),
-        dynMax: (this._giDynRejectMaxU ??= uniform(new THREE.Vector3())),
-        dynActive: (this._giDynRejectActiveU ??= uniform(0)),
+        dynMin: (this._giDynRejectMinU ??= uniform(new THREE.Vector3()).setGroup(renderGroup)),
+        dynMax: (this._giDynRejectMaxU ??= uniform(new THREE.Vector3()).setGroup(renderGroup)),
+        dynActive: (this._giDynRejectActiveU ??= uniform(0).setGroup(renderGroup)),
       },
       markerAlpha: true,
     });
@@ -8523,6 +9317,7 @@ export class GISystem {
     ({ aoPass: screen.aoPass, vxaoPass: screen.vxaoPass } = this.#armAoTerm({
       srcProbes,
       gbuffer: screen.gbuffer,
+      gbufferFull: screen.gbufferFull,
       width: screen.width,
       height: screen.height,
       ao: screen.ao,
@@ -8568,12 +9363,21 @@ export class GISystem {
    *    ONE ray's variance, and spending it on an estimator that has none just
    *    removes contact detail.
    */
-  #armGtaoPass({ srcProbes, gbuffer, width, height, ao, vxao, occupancy }) {
+  #armGtaoPass({ srcProbes, gbuffer, gbufferFull = null, width, height, ao, vxao, occupancy }) {
     if (!vxao || !srcProbes) {
       if (ao) ao.node = null;
       if (vxao) vxao.node = null;
+      this.#pointAoMaterialNode(null, "gtao-unarmed");
       return { aoPass: null, vxaoPass: null };
     }
+    // §11.35: the source g-buffer — the full-resolution one when the tier
+    // renders it (ultra/high), the resolve's otherwise. Everything below is
+    // in SOURCE pixels: the AO buffer size, the reach clamp, the filter's
+    // tolerance and `projScale` (pixels per world unit at unit depth is a
+    // property of the grid it is measured on).
+    const src = gbufferFull ?? gbuffer;
+    const srcW = gbufferFull ? gbufferFull.rt.width : width;
+    const srcH = gbufferFull ? gbufferFull.rt.height : height;
     // ONE ESTIMATOR. The `ao` slot stays null so the resolve's `min` cannot
     // compose two terms and make an isolated read of either impossible — the
     // instrument failure that cost two sessions in August.
@@ -8584,6 +9388,13 @@ export class GISystem {
     this._giAoProjU ??= uniform(1).setGroup(renderGroup);
     this._giAoCamRightU ??= uniform(new THREE.Vector3(1, 0, 0)).setGroup(renderGroup);
     this._giAoCamUpU ??= uniform(new THREE.Vector3(0, 1, 0)).setGroup(renderGroup);
+    // §11.35: `_giAoProjU` is pixels per world unit at unit depth on the
+    // RESOLVE grid (written in the tick from `screen.height`); the full
+    // g-buffer has srcH/height times as many. AFTER the `??=` above — a
+    // `float(undefined)` here is not a build error, it is a silent zero, and
+    // a zero projScale clamps every reach to the STEPS×MIN_STEP floor (the
+    // first full-res rig run: contact 23 % → 10 %).
+    const projScale = gbufferFull ? float(this._giAoProjU).mul(srcH / height) : this._giAoProjU;
 
     const s0 = Number(srcProbes.spacing0) > 0 ? Number(srcProbes.spacing0) : 0.35;
     // Contact AO only. Two c0 intervals measured 1.12 m on the controlled rig
@@ -8592,14 +9403,14 @@ export class GISystem {
     // drop, and leaves longer-range visibility to SRC rather than painting a
     // second shadow around it.
     const radiusIntervals = giGtaoRadiusIntervals(globalThis.__giGtaoIntervals);
-    const radius = s0 * SRC_R0_OVER_S0 * radiusIntervals;
+    const radius = s0 * srcR0OverS0() * radiusIntervals;
     // GTAO owns contacts. The optional occupancy diagnostic reaches two c0
     // intervals for off-screen walls/ceilings, derived from the live lattice
     // rather than frozen in metres. It is opt-in: SRC already carries
     // long-range blocker visibility, so composing this as a second default
     // visibility term both removes bounce energy and costs a world trace.
     const worldIntervals = Math.max(2, Math.min(12, Number(globalThis.__giWorldAoIntervals) || 2));
-    const worldRadius = s0 * SRC_R0_OVER_S0 * worldIntervals;
+    const worldRadius = s0 * srcR0OverS0() * worldIntervals;
     const worldSteps = Math.max(4, Math.min(12, Math.round(Number(globalThis.__giWorldAoSteps) || 6)));
     const filterEnabled = globalThis.__giAoFilter !== false;
     // One stratified cone is an estimator only after the spatial integral. Do
@@ -8621,8 +9432,8 @@ export class GISystem {
     // it across silhouettes -- a disproportionate loss for a cheap pass.
     // Medium retains most detail at 0.8; Low alone keeps the half-res path.
     const scale = giGtaoResolutionScale(tier, requestedScale);
-    const rtWidth = Math.max(16, Math.round(width * scale));
-    const rtHeight = Math.max(16, Math.round(height * scale));
+    const rtWidth = Math.max(16, Math.round(srcW * scale));
+    const rtHeight = Math.max(16, Math.round(srcH * scale));
 
     // Taps per pixel = slices x steps x 2. The ladder is a variance ladder,
     // not a brightness one (see 2. above).
@@ -8631,7 +9442,7 @@ export class GISystem {
     // spatial pattern between pixels.
     const preset = giGtaoSamplingPreset(tier);
     const slices = Math.max(1, Math.min(8, Math.round(Number(globalThis.__giGtaoSlices) || preset.slices)));
-    const steps = Math.max(1, Math.min(8, Math.round(Number(globalThis.__giGtaoSteps) || preset.steps)));
+    const steps = Math.max(1, Math.min(16, Math.round(Number(globalThis.__giGtaoSteps) || preset.steps)));
 
     const mkTex = (name) => {
       const t = new THREE.StorageTexture(rtWidth, rtHeight);
@@ -8644,15 +9455,15 @@ export class GISystem {
     };
     const rawTarget = mkTex("giGtaoRaw");
     const pass = createGiGtaoPass({
-      gbuffer,
+      gbuffer: src,
       width: rtWidth,
       height: rtHeight,
-      resolveWidth: width,
-      resolveHeight: height,
+      resolveWidth: srcW,
+      resolveHeight: srcH,
       cameraPosition: this._giResolveCamU,
       cameraRight: this._giAoCamRightU,
       cameraUp: this._giAoCamUpU,
-      projScale: this._giAoProjU,
+      projScale,
       strength: vxao.strength,
       radius: vxao.radius,
       traceConeAO,
@@ -8676,13 +9487,13 @@ export class GISystem {
         const tmp = mkTex("giGtaoBlurX");
         const out = mkTex("giGtao");
         const shared = {
-          gbuffer,
+          gbuffer: src,
           width: rtWidth,
           height: rtHeight,
-          resolveWidth: width,
-          resolveHeight: height,
+          resolveWidth: srcW,
+          resolveHeight: srcH,
           cameraPosition: this._giResolveCamU,
-          projScale: this._giAoProjU,
+          projScale,
         };
         // Ultra's stable radial strata need one complete ±3-pixel support to
         // disappear at silhouettes; r2 leaves the phase visible as fine edge
@@ -8720,6 +9531,13 @@ export class GISystem {
     srcProbes.passes.push(pass.compute);
     if (filtered) srcProbes.passes.push(...filtered.computes);
     srcProbes.passGroups?.push({ label: "gtao", count: filtered ? 3 : 1 });
+    // §11.35: at AO resolution the term is applied in the MATERIAL (giLight
+    // samples it bilinearly at the pixel's own GI screen UV); the resolve then
+    // gets no AO term (createGiResolve drops a `materialSide` slot). At the
+    // resolve's resolution the old path stays — the resolve's edge-aware 2×2
+    // reconstruction is what keeps a coarse AO from haloing.
+    vxao.materialSide = !!gbufferFull;
+    this.#pointAoMaterialNode(gbufferFull ? finalTarget : null, "gtao-armed");
     console.log(
       `[gi] AO: GTAO — ${slices} slices x ${steps} steps (${slices * steps * 2} taps/px) at ` +
         `${rtWidth}x${rtHeight} (scale ${scale.toFixed(2)}, ` +
@@ -8817,7 +9635,7 @@ export class GISystem {
     // term exists for. It also reads CRISPER, because a metre-scale AO is a
     // broad wash and a contact-scale one is an edge.
     const radiusIntervals = Math.max(0.5, Math.min(8, Number(globalThis.__giRtaoIntervals) || 2));
-    const radius = s0 * SRC_R0_OVER_S0 * radiusIntervals;
+    const radius = s0 * srcR0OverS0() * radiusIntervals;
     // `occupancy.voxel` is a UNIFORM NODE, not a vector — its `.x` is a swizzle
     // node, so reading it directly and handing it to Math.max yields NaN and a
     // bias of NaN silently makes every ray miss. The CPU-side value is on
@@ -9116,7 +9934,8 @@ export class GISystem {
     screen.giCostScale = giCostScale;
     screen.shadowWidth = shadowW;
     screen.shadowHeight = shadowH;
-    screen.gbuffer.setSize(width, height);
+    this.#persistentGbuffer(width, height);
+    screen.gbufferFull = this.#persistentGbufferFull(this.#gbufferFullSize({ width, height }), { width, height });
     // The probe population is one thread per gbuffer pixel and its dispatch
     // counts are baked into the compute nodes, so a resize rebuilds it. Returns
     // a NEW system and disposes the old one — the assignment is the point.
@@ -9131,6 +9950,10 @@ export class GISystem {
     screen.targets = createGiTargets(width, height, shadowW, shadowH, { emitterWidth: emitterW, emitterHeight: emitterH });
     screen.emitterShadowWidth = emitterW;
     screen.emitterShadowHeight = emitterH;
+    // §11.32: without the per-frame marker a static object's bindings would
+    // keep pointing at the OLD targets — invalidate every observed material
+    // once, here, where the swap happens.
+    this.#refreshRenderObjectsOnce("targets-resized");
     // Fresh targets are zero = fully occluded; fail OPEN until the marcher's
     // first dispatch lands (see #clearEmitterShadowTargets).
     this.#clearEmitterShadowTargets(screen.targets, emitterW, emitterH);
@@ -9198,6 +10021,7 @@ export class GISystem {
       this._giBvhReflectNode.value = this._giBvhTarget.bvhReflect;
       this._giBvhColorNode.value = this._giBvhTarget.bvhColor;
       this._giBvhRadianceNode.value = this._giBvhTarget.bvhRadiance;
+      this.#refreshRenderObjectsOnce("bvh-targets-resized");
       screen.bvhShade = {
         ...screen.bvhShade,
         hit: this._giBvhTarget.bvhReflect,
@@ -9317,6 +10141,7 @@ export class GISystem {
     ({ aoPass: screen.aoPass, vxaoPass: screen.vxaoPass } = this.#armAoTerm({
       srcProbes: screen.srcProbes,
       gbuffer: screen.gbuffer,
+      gbufferFull: screen.gbufferFull,
       width,
       height,
       ao: screen.ao,
@@ -9482,9 +10307,9 @@ export class GISystem {
           // ⚠ BOTH build sites must carry these or the resize/rebuild path
           // silently drops the reject and the ghost returns on a viewport
           // resize — the §12.65 "four dispatch paths" trap.
-          dynMin: (this._giDynRejectMinU ??= uniform(new THREE.Vector3())),
-          dynMax: (this._giDynRejectMaxU ??= uniform(new THREE.Vector3())),
-          dynActive: (this._giDynRejectActiveU ??= uniform(0)),
+          dynMin: (this._giDynRejectMinU ??= uniform(new THREE.Vector3()).setGroup(renderGroup)),
+          dynMax: (this._giDynRejectMaxU ??= uniform(new THREE.Vector3()).setGroup(renderGroup)),
+          dynActive: (this._giDynRejectActiveU ??= uniform(0).setGroup(renderGroup)),
         },
       });
       screen.irrHistoryPass = createGiLightShadowHistoryPass({
@@ -9535,6 +10360,7 @@ export class GISystem {
         // a resize); it rides here exactly as the first build sends it.
         frame: screen.emitterShadowHistoryPass ? (this._giEmitterFrameU ?? null) : null,
         checker: screen.emitterShadowHistoryPass ? (this._giEmitterCheckerU ?? null) : null,
+        ...this.#emitterStaticCacheArgs(screen.targets, !!screen.emitterSeatRotate),
         // §11.11: the build's decision is the durable record (the uniform
         // outlives a rebuild that turned rotation off).
         seatPhase: screen.emitterSeatRotate ? (this._giEmitterSeatU ?? null) : null,
@@ -9546,6 +10372,27 @@ export class GISystem {
       if (emitterIndexes[0] >= 0) state.queue[emitterIndexes[0]] = screen.emitterShadowPass.compute;
       if (emitterIndexes[1] >= 0) state.queueNoFeedback[emitterIndexes[1]] = screen.emitterShadowPass.compute;
       if (emitterIndexes[2] >= 0) state.queueFeedbackOnly[emitterIndexes[2]] = screen.emitterShadowPass.compute;
+    }
+    // §11.40: the static cache is sized to the emitter target too — a fresh
+    // (zeroed, i.e. invalid-stamped) pair and a fresh copy pass, spliced in place.
+    if (screen.emitterStaticSnapshotPass) {
+      const oldSnap = screen.emitterStaticSnapshotPass.compute;
+      const idx = [
+        state.queue.indexOf(oldSnap),
+        state.queueNoFeedback.indexOf(oldSnap),
+        state.queueFeedbackOnly?.indexOf(oldSnap) ?? -1,
+      ];
+      screen.emitterStaticSnapshotPass = this.#emitterStaticSnapshotPass(screen.targets, !!screen.emitterSeatRotate, emitterW, emitterH);
+      const next = screen.emitterStaticSnapshotPass?.compute;
+      if (next) {
+        if (idx[0] >= 0) state.queue[idx[0]] = next;
+        if (idx[1] >= 0) state.queueNoFeedback[idx[1]] = next;
+        if (idx[2] >= 0) state.queueFeedbackOnly[idx[2]] = next;
+      } else {
+        if (idx[0] >= 0) state.queue.splice(idx[0], 1);
+        if (idx[1] >= 0) state.queueNoFeedback.splice(idx[1], 1);
+        if (idx[2] >= 0) state.queueFeedbackOnly.splice(idx[2], 1);
+      }
     }
     // The emitter temporal trio is sized to the EMITTER target, so a resize has
     // to re-make it before the passes below bind it — same lazy contract the
@@ -9864,6 +10711,7 @@ export class GISystem {
         this._giBvhReflectNode.value = this._giBvhTarget.bvhReflect;
         this._giBvhColorNode.value = this._giBvhTarget.bvhColor;
         this._giBvhRadianceNode.value = this._giBvhTarget.bvhRadiance;
+        this.#refreshRenderObjectsOnce("bvh-targets-recreated");
       }
       const { compute } = createGiBvhReflect({
         gbuffer: screen.gbuffer,
@@ -10015,7 +10863,7 @@ export class GISystem {
    */
   #hitTermMask() {
     if (!Array.isArray(globalThis.__giHitTermMask)) return null;
-    return (this._giHitTermMaskU ??= uniform(new THREE.Vector4(1, 1, 1, 1)));
+    return (this._giHitTermMaskU ??= uniform(new THREE.Vector4(1, 1, 1, 1)).setGroup(renderGroup));
   }
 
   #ensureReflProbeState() {
@@ -10553,7 +11401,7 @@ export class GISystem {
     if (!stats?.meshes && !stats?.skippedNotReady) return;
     const line = `[gi] transport BVH: ${stats.meshes ?? 0} mesh(es) simplified ` +
       `${(stats.before ?? 0).toLocaleString()} -> ${(stats.after ?? 0).toLocaleString()} tris ` +
-      `(1 cm absolute error, borders locked, 25 % floor; ${stats.exact ?? 0} mirror-visible kept exact` +
+      `(${(staticBvhSimplifyError() * 100).toFixed(1)} cm absolute error, borders locked, ${Math.round(staticBvhSimplifyRatio() * 100)} % floor; ${stats.exact ?? 0} mirror-visible kept exact` +
       `${stats.skippedNotReady ? `; ${stats.skippedNotReady} skipped, simplifier not ready yet` : ""})`;
     if (this._transportSimplifyLogged !== line) {
       this._transportSimplifyLogged = line;
@@ -11001,7 +11849,10 @@ export class GISystem {
     state.texturedCount = built.texturedCount;
     state.atlasTexture = built.atlasTexture;
     state.atlasTextureNode ??= texture(built.atlasTexture);
-    state.atlasTextureNode.value = built.atlasTexture;
+    if (state.atlasTextureNode.value !== built.atlasTexture) {
+      state.atlasTextureNode.value = built.atlasTexture;
+      this.#refreshRenderObjectsOnce("atlas-rebuilt");
+    }
     // blitBvhAtlasTiles is duck-typed on exactly these three fields.
     state.pendingGpuTiles = built.pendingGpuTiles;
     console.log(
@@ -12480,6 +13331,8 @@ export class GISystem {
           }
         }
         const tree = treeEmitters.length ? buildLightTree(treeEmitters) : null;
+        // §11.44: lamp indices renumber with the tree — the visibility cache must not answer for them.
+        this.state?.screen?.srcProbes?.invalidateVisCache?.();
         if (tree) {
           // §12.70 W5: reserve for GROWTH, not for this pack. The region is
           // re-uploadable now (#refreshLightTree rebuilds it when an emitter
@@ -12540,7 +13393,7 @@ export class GISystem {
             };
             // The tile cut's per-record scan reads this LIVE (a uniform, not a
             // baked constant) — see #refreshLightTree.
-            this._lightTreeCountU ??= uniform(tree.emitterCount, "uint");
+            this._lightTreeCountU ??= uniform(tree.emitterCount, "uint").setGroup(renderGroup);
             this._lightTreeCountU.value = tree.emitterCount;
             // The §12.42 rule: a derived number nothing prints is a number
             // probes will guess. The W1 gate reads this to find the region.
@@ -12759,7 +13612,7 @@ export class GISystem {
     this._giNormalOffsetScale = offsetScale;
     this._giNormalOffsetFloor = offsetFloor;
     const cellMaxValue = Number(volume.world?.cellMax?.value) || 0;
-    this._giNormalOffsetU ??= uniform(0);
+    this._giNormalOffsetU ??= uniform(0).setGroup(renderGroup);
     this._giNormalOffsetU.value = Math.max(offsetFloor, cellMaxValue * offsetScale);
     light.normalOffset = this._giNormalOffsetU;
     // THE DIRECTIONAL RADIANCE LOOKUP WAS A CASCADE READER (createRadianceLookup,
@@ -12785,7 +13638,7 @@ export class GISystem {
     light.mirrorShadowFn = null;
     light.lightSlots = null;
     // Ray reach scales with the volume (clamped: step cap bounds cost).
-    this._giMirrorRangeU ??= uniform(24);
+    this._giMirrorRangeU ??= uniform(24).setGroup(renderGroup);
     this._giMirrorRangeU.value = Math.min(48, Math.max(8, diagU.value));
     light.mirrorRange = this._giMirrorRangeU;
     if (emitterSlots) {
@@ -12800,12 +13653,12 @@ export class GISystem {
       // lattice-phase moiré across floors the moment Emissive Shadows was
       // re-enabled on a real scene.
       light.shadowTraceFn = volume.createSoftShadowTrace(light.normalOffset, traceBudget.shadow, "giResolveShadowTrace", true);
-      this._giShadowMarginU ??= uniform(0.3);
+      this._giShadowMarginU ??= uniform(0.3).setGroup(renderGroup);
       this._giShadowMarginU.value = Math.max(0.2, cellMaxValue * 2.5);
       light.shadowMargin = this._giShadowMarginU;
       // Shadow reach must cover the whole volume: any receiver inside the
       // cap-but-unshadowed band takes emitter light THROUGH walls.
-      this._giShadowRangeU ??= uniform(48);
+      this._giShadowRangeU ??= uniform(48).setGroup(renderGroup);
       this._giShadowRangeU.value = Math.min(64, Math.max(12, diagU.value));
       light.shadowRange = this._giShadowRangeU;
       light.emitterSlots = emitterSlots;
@@ -12820,7 +13673,7 @@ export class GISystem {
     const ao = {
       strength: uniform(Math.min(1, Math.max(0, props.aoStrength ?? 0.6))),
       radius: uniform(Math.min(3, Math.max(0.1, props.aoRadius ?? 0.6))),
-      enabled: uniform(props.ao === false ? 0 : 1),
+      enabled: uniform(props.ao === false ? 0 : 1).setGroup(renderGroup),
     };
     // DEFERRED RESOLVE: evaluate the gather + emitter shadows once per screen
     // pixel instead of inside every material (see giScreen.js). This is what
@@ -12916,6 +13769,8 @@ export class GISystem {
         // is order-independent, but keeping the two arms identical is worth more
         // than the freedom.
         const emitterChain = [screen.emitterShadowPass.compute, screen.emitterShadowFilterPass.compute];
+        // §11.40: the static cache's write -> read copy rides right behind the marcher.
+        if (screen.emitterStaticSnapshotPass) emitterChain.splice(1, 0, screen.emitterStaticSnapshotPass.compute);
         // §12.70 W4b: the tile cut runs FIRST in the chain — consumerless
         // today, but the order is already the contract its consumers need.
         if (screen.emitterTileCut) emitterChain.unshift(screen.emitterTileCut.compute);
@@ -14113,6 +14968,7 @@ export class GISystem {
     ({ aoPass: screen.aoPass, vxaoPass: screen.vxaoPass } = this.#armAoTerm({
       srcProbes: screen.srcProbes,
       gbuffer: screen.gbuffer,
+      gbufferFull: screen.gbufferFull,
       width,
       height,
       ao: screen.ao,
@@ -14668,7 +15524,7 @@ export class GISystem {
     // sub-texel-thin banner edge — falls back to the MIN of the taps, dark
     // by policy. The position texture is NearestFilter, so tap validity is
     // per-texel exact, never interpolated across the very edges it guards.
-    const texel = (this._giLightShadowTexel ??= uniform(new THREE.Vector2(1 / 512, 1 / 512)));
+    const texel = (this._giLightShadowTexel ??= uniform(new THREE.Vector2(1 / 512, 1 / 512)).setGroup(renderGroup));
     // RESOLVE-CAMERA PROJECTION, NOT screenUV (2026-08-22, "shadows in the
     // mirror look very weird"): this branch compiles into every lit
     // material, and a planar reflector re-renders those materials from the
@@ -14682,7 +15538,7 @@ export class GISystem {
     // to screenUV in the main render and correct per WORLD POINT in nested
     // ones: main-view-visible points get their true shadow, everything else
     // rejects to the documented dark policy — stable, never a stamp.
-    const shadowVpU = (this._giResolveVPU ??= uniform(new THREE.Matrix4()));
+    const shadowVpU = (this._giResolveVPU ??= uniform(new THREE.Matrix4()).setGroup(renderGroup));
     const shadowUV = (() => {
       const clip = vec4(shadowVpU.mul(vec4(positionWorld, 1)));
       const w = clip.w.max(1e-4);
@@ -14745,8 +15601,8 @@ export class GISystem {
     // PLANE (in-plane taps pass at any radius; cross-silhouette taps fail),
     // plus a small 4-tap max blocker search so the penumbra extends OUTSIDE
     // the geometric shadow instead of clipping at its edge.
-    const spanU = (this._giShadowSpanU ??= uniform(1));
-    const fovScaleU = (this._giShadowFovScaleU ??= uniform(1.2));
+    const spanU = (this._giShadowSpanU ??= uniform(1).setGroup(renderGroup));
+    const fovScaleU = (this._giShadowFovScaleU ??= uniform(1.2).setGroup(renderGroup));
     const blurTan = uniform(0);
     let shadow = sharp;
     if (this._giLightShadowDistNode) {
@@ -14956,11 +15812,29 @@ export class GISystem {
     this._lightShadowNodes?.clear();
     state.volume?.dispose?.();
     state.bvhScene?.dispose?.();
-    // The gbuffer is per-build; the resolve TARGETS are not (see
-    // createGiTargets) — disposing them here would strand every material that
-    // is still bound to them. Same rule for the BVH reflect target
-    // (`_giBvhTarget`, see `#syncBvhScene`) — it is not touched here either.
-    state.screen?.gbuffer?.dispose?.();
+    // ⛔ THE GBUFFER IS NOT DISPOSED HERE ANY MORE (§11.33). It used to be
+    // per-build while the resolve TARGETS were system-lifetime, on the
+    // grounds that no material was bound to it — and then `_giShadowPosNode`
+    // (the shadowNode's tap validity, giLight's irradiance bilateral) bound
+    // its POSITION attachment into every lit material. Under the per-frame
+    // marker that was survivable (three re-created the disposed texture on
+    // the next refresh); under static draws (§11.32) a static object's bind
+    // group kept the destroyed view and every rebuild printed a burst of
+    // "Destroyed texture [output] used in a submit" on the main pass until
+    // the compile wave happened to recreate its render objects. A texture
+    // that materials bind is system-lifetime by rule: see #persistentGbuffer.
+    // Same rule for the BVH reflect target (`_giBvhTarget`, see
+    // `#syncBvhScene`) — it is not touched here either.
+    if (!preserveMaterialLight) {
+      this._giGbufferDownsample?.dispose?.();
+      this._giGbufferDownsample = null;
+      this._giGbufferFull?.dispose?.();
+      this._giGbufferFull = null;
+      this._giGbufferFullSize = null;
+      this._giGbuffer?.dispose?.();
+      this._giGbuffer = null;
+      this._giGbufferSize = null;
+    }
     // Per-build like the gbuffer it reads (the AO texture is only ever bound
     // by the resolve, which dies with the build).
     state.screen?.aoPass?.dispose?.();
@@ -15069,6 +15943,7 @@ export class GISystem {
     if (this._giBvhRadianceNode) {
       this._giBvhRadianceNode.value = active ? this._giBvhTarget?.bvhRadiance : off.black;
     }
+    this.#refreshRenderObjectsOnce(active ? "reflections-on" : "reflections-off");
     if (!active && this._reflProbeGpu) {
       this._reflProbeGpu.slots.clear();
     }
@@ -15110,6 +15985,7 @@ export class GISystem {
     // resolve runs every frame (even in idle sleep), so edits land next frame.
     if (state.screen?.ao) {
       state.screen.ao.enabled.value = cfg.ao === false ? 0 : 1;
+      if (this._giAoActiveU) this._giAoActiveU.value = state.screen.ao.enabled.value;
       state.screen.ao.strength.value = Math.min(1, Math.max(0, cfg.aoStrength ?? 0.6));
       state.screen.ao.radius.value = Math.min(3, Math.max(0.1, cfg.aoRadius ?? 0.6));
     }
@@ -15911,6 +16787,43 @@ export class GISystem {
    * a still image. Returning the cached value for the same frame keeps "once
    * per tick" true no matter how many callers appear later.
    */
+  /**
+   * ⭐⭐ §11.21 — THE IMAGE'S ONLY SMOOTHER MAY NOT STEP.
+   *
+   * `_giIrrHistWeightU` is the weight of the §12.65 screen irradiance temporal
+   * filter, and on the default build it is the only thing between the c0
+   * lattice's per-probe variance and the screen. Three of its inputs could move
+   * it discontinuously: `windowOpen ? 0` (a HARD zero the instant the tracking
+   * window arms, and a hard restore when it closes), the swap hold's 0.98 (and
+   * its release onto a cold store — §11.8's black patches), and `0.9·(1−mLight)`
+   * riding a signal that used to be a raw per-frame delta.
+   *
+   * A step in a smoothing weight is a step in the picture: the filter's time
+   * constant is `1/(1−w)`, so 0.9 → 0 in one frame takes a texel from a
+   * ten-frame average to a single raw sample between two presented images. The
+   * standing gate is "no pixel changes more than a few % per frame"; nothing
+   * that governs every pixel at once may be allowed to change by 0.9 in one.
+   *
+   * DOWN faster than UP, deliberately. A genuine light step wants history gone
+   * quickly (0.15/frame ≈ 6 frames, ~0.1 s at 60 fps — short enough that a
+   * toggle does not ghost); coming back only delays smoothing, so it takes the
+   * gentler ramp. Scaled by real frame time, for the same reason the light
+   * signal is. `__giIrrHistSlew = false` restores the instantaneous behaviour.
+   */
+  #slewIrrHistWeight(target) {
+    const t = Math.min(0.98, Math.max(0, Number(target) || 0));
+    // ⛔ OPT-IN (`__giIrrHistSlew = true`): a ramp on the smoother's weight is
+    // also a ramp on how fast history is thrown away when a light really changes.
+    if (globalThis.__giIrrHistSlew !== true) { this._giIrrHistApplied = t; return t; }
+    const prev = this._giIrrHistApplied;
+    if (!Number.isFinite(prev)) { this._giIrrHistApplied = t; return t; }
+    const frames = Math.min(4, Math.max(0.25, (this._giFrameDtMs ?? 1000 / 60) / (1000 / 60)));
+    const lim = (t < prev ? 0.15 : 0.06) * frames;
+    const next = prev + Math.max(-lim, Math.min(lim, t - prev));
+    this._giIrrHistApplied = next;
+    return next;
+  }
+
   #cameraMotionEma() {
     const scr = (this._giCamMotionScratch ??= {
       pos: new THREE.Vector3(), dir: new THREE.Vector3(), seeded: false, ema: 0, frame: -1,
@@ -16238,6 +17151,13 @@ export class GISystem {
     const STRIDE = 20;
     const cache = (this._lightTreePoseCache ??= new WeakMap());
     let changed = this._lightTreePoseCount !== meshes.length;
+    // §11.44: what invalidates the world visibility cache is a LAMP that
+    // moved, appeared or changed its emission — not the visibility flip the
+    // g-buffer swap gives a merged emissive every frame (which is what
+    // `changed` sees below, and what kept the cache at zero samples).
+    let lampsChanged = changed;
+    const tally = (this._lightTreeChangeTally ??= { refreshes: 0, count: 0, newMesh: 0, matrix: 0, emissive: 0, instances: 0, invalidations: 0 });
+    if (changed) tally.count++;
     this._lightTreePoseCount = meshes.length;
     for (const mesh of meshes) {
       let row = cache.get(mesh);
@@ -16246,27 +17166,36 @@ export class GISystem {
         row[19] = NaN;
         cache.set(mesh, row);
         changed = true;
+        lampsChanged = true;
+        tally.newMesh++;
       }
       const e = mesh.matrixWorld.elements;
+      let moved = false;
       for (let k = 0; k < 16; k++) {
-        if (Math.abs(row[k] - e[k]) > 1e-5) changed = true;
+        if (Math.abs(row[k] - e[k]) > 1e-5) moved = true;
         row[k] = e[k];
       }
+      if (moved) { changed = true; lampsChanged = true; tally.matrix++; }
       const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
       const emissive = material?.emissive;
       const gain = material?.emissiveIntensity ?? 1;
       const rgb = [(emissive?.r ?? 0) * gain, (emissive?.g ?? 0) * gain, (emissive?.b ?? 0) * gain];
+      // A power change never changes visibility: it rebuilds the tree
+      // but does not touch the cache.
+      let relit = false;
       for (let k = 0; k < 3; k++) {
-        if (Math.abs(row[16 + k] - rgb[k]) > 1e-6) changed = true;
+        if (Math.abs(row[16 + k] - rgb[k]) > 1e-6) relit = true;
         row[16 + k] = rgb[k];
       }
+      if (relit) { changed = true; tally.emissive++; }
       const instances = mesh.isInstancedMesh
         ? mesh.count * 4096 + (mesh.instanceMatrix?.version ?? 0)
         : (mesh.visible === false ? -1 : 1);
-      if (row[19] !== instances) changed = true;
+      if (row[19] !== instances) { changed = true; tally.instances++; }
       row[19] = instances;
     }
     if (!changed) return;
+    tally.refreshes++;
     try {
       const started = performance.now();
       const treeEmitters = collectEmitters(meshes, {
@@ -16274,6 +17203,7 @@ export class GISystem {
       });
       this.#recordEmitterAdmission(meshes, treeEmitters);
       const tree = treeEmitters.length ? buildLightTree(treeEmitters) : null;
+      if (lampsChanged) { tally.invalidations++; this.state?.screen?.srcProbes?.invalidateVisCache?.(); }
       this._lightTreeRefreshCost = performance.now() - started;
       this._lightTreeRefreshAt = performance.now();
       if (!tree) return;
@@ -16969,7 +17899,36 @@ export class GISystem {
    * ignore unknown props; `containsNode` only checks `.isNode`.
    */
   #markObservedMaterial(material) {
-    if (!material || material.giMonitorNode?.isNode) return;
+    if (!material) return;
+    // §11.32: every GI-lit material, so a target swap can invalidate them all
+    // once instead of relying on the per-frame marker below.
+    (this._giObservedMaterials ??= new Set()).add(material);
+    if (material.giMonitorNode?.isNode || material.__giObserved === true) return;
+    material.__giObserved = true;
+    // ══ §11.32 STATIC DRAWS — THE MARKER IS THE WHOLE COST ═══════════════════
+    //
+    // The marker below exists to make three's NodeMaterialObserver report
+    // `hasNode = true`, so that `needsRefresh()` returns true for EVERY object
+    // EVERY frame and a swapped GI target (resize, rebuild) is picked up by
+    // `bindings.updateForRender`. The price: `renderObject.object.static` and
+    // render bundles are unreachable for every lit material — three returns
+    // true on `hasNode` before it ever looks at them — and the per-object JS
+    // update path (updateBefore / geometries / nodes / bindings) runs ~460×
+    // per frame on Bistro: 15 ms of the 27 ms CPU frame is `renderEncode`.
+    //
+    // With `__giStaticDraws = true` (opt-in while it is measured) the marker
+    // is NOT set. What it bought is replaced by construction: GI's per-frame
+    // uniforms sit in the shared render group (uploaded by the first refreshed
+    // object of each render, read by all), GI has no per-object node updates,
+    // and every target swap / node re-point calls `#refreshRenderObjectsOnce`
+    // (§11.33), which makes three refresh each render object's bindings once.
+    // Merged proxies then declare `static`.
+    if (globalThis.__giStaticDraws === true) {
+      const originalKey = material.customProgramCacheKey.bind(material);
+      material.customProgramCacheKey = () => originalKey() + "|gi" + giRoughnessBucketOf(material);
+      material.needsUpdate = true;
+      return;
+    }
     // ONE SHARED marker instance for every material (§13.15.2). The observer
     // only needs SOME own property with `.isNode`; but `customProgramCacheKey`
     // walks own node properties and hashes each node's IDENTITY
@@ -16996,6 +17955,258 @@ export class GISystem {
     material.customProgramCacheKey = () => original() + "|gi" + giRoughnessBucketOf(material);
     // Recompile so the observer is rebuilt with hasNode = true.
     material.needsUpdate = true;
+  }
+
+  /**
+   * ══ §11.33 ONE GUARANTEED REFRESH PER RENDER OBJECT AFTER A RE-POINT ══════
+   *
+   * The event-driven replacement for the per-frame marker (§11.32). Under
+   * static draws three's NodeMaterialObserver answers `needsRefresh = false`
+   * for a `static` object, so its bind groups are never revisited — and a
+   * GI target swap (resize), a re-pointed texture node (BVH reflect target,
+   * env-miss, atlas, the reflections toggle) or a resized g-buffer leaves
+   * them holding a DESTROYED view: "Destroyed texture … used in a submit".
+   *
+   * ⛔ `material.needsUpdate = true` DOES NOT DO THIS. With an unchanged
+   * cache key `RenderObjects.get` only syncs `renderObject.version` — no
+   * binding update, no render-object rebuild (that was the first cut, and the
+   * error survived it). A changed cache key would do it, at the price of a
+   * NodeBuilder rebuild per material per event — the compile wave nobody
+   * wants on a window resize.
+   *
+   * What does do it, cheaply and exactly: the observer decides "first time I
+   * see this render object" from its own `renderObjects` WeakMap, and that
+   * branch (`firstInitialization`) returns true BEFORE the static/bundle
+   * short-circuit. Resetting the map on every cached NodeBuilderState makes
+   * the next render refresh each render object exactly once — updateBefore,
+   * geometry, nodes, bindings — and `Bindings._update` then sees the new
+   * texture object (or the bumped version) and rebuilds the bind group. The
+   * old targets are retired with a TTL (see #retireTargets), so the swap and
+   * the refresh never race. Every re-point site in this module calls it.
+   */
+  #refreshRenderObjectsOnce(reason) {
+    if (globalThis.__giStaticDraws !== true) return;   // the marker path refreshes every frame
+    const cache = this.engine?.renderer?._nodes?.nodeBuilderCache;
+    let n = 0;
+    if (cache && typeof cache.values === "function") {
+      for (const state of cache.values()) {
+        const observer = state?.observer;
+        if (observer && observer.renderObjects) { observer.renderObjects = new WeakMap(); n++; }
+      }
+    } else {
+      // A three without the cache (shape drift): fall back to the material
+      // version bump, which at least reaches objects whose cache key moves.
+      for (const m of this._giObservedMaterials ?? []) { if (m) { m.needsUpdate = true; n++; } }
+    }
+    if (globalThis.__giLogStaticDraws) console.log(`[gi] static draws: ${n} observers reset (${reason})`);
+  }
+
+  /**
+   * §11.33 — the g-buffer is SYSTEM-LIFETIME (created once, resized in
+   * place, disposed with the system), because its position attachment is
+   * bound into every lit material through `_giShadowPosNode`. A per-build
+   * g-buffer was the "Destroyed texture [output] used in a submit" burst on
+   * every scene/GI edit under static draws (see #dispose). A resize goes
+   * through the wrapper's `setSize`, which bumps the textures' versions so a
+   * binding can tell the resized texture from the one it holds, and then
+   * refreshes every render object once.
+   */
+  /**
+   * §11.35 — the AO g-buffer's size: the drawing buffer (DRS divided out, as
+   * the resolve does) under GI_AO_MAX_PIXELS, on the tiers that pay for it;
+   * the resolve's own size otherwise (then no second buffer exists at all).
+   */
+  #gbufferFullSize(resolve) {
+    // ⛔ OPT-IN (§11.47). A SECOND, larger g-buffer means the resolve-sized
+    // one every other consumer reads is POINT-SAMPLED down from it, and the
+    // ratio is not integral (1612/1140 = 1.41): at a silhouette the
+    // downsampled texel takes the foreground or the background surface in a
+    // repeating pattern, so the GI shades edge pixels from the wrong surface
+    // and prints bright dashes along every silhouette — the user's "rects on
+    // the edges all over the place". Rendering the g-buffer AT the resolve
+    // size rasterises those edges instead of resampling them. `__giAoFullRes
+    // = true` re-arms the sharper AO once the downsample is edge-aware.
+    if (globalThis.__giAoFullRes !== true) return { ...resolve };
+    const tier = aoQualityTierOf(this.config);
+    if (tier !== "ultra" && tier !== "high") return { ...resolve };
+    const renderer = this.engine.renderer;
+    if (!renderer) return { ...resolve };
+    const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+    const drs = globalThis.__giFollowDrs === true ? 1 : (this.engine?._drsScale || 1);
+    let width = Math.max(16, Math.round(size.x / drs));
+    let height = Math.max(16, Math.round(size.y / drs));
+    const budget = Number(globalThis.__giAoMaxPixels) || GI_AO_MAX_PIXELS;
+    const px = width * height;
+    if (px > budget) {
+      const s = Math.sqrt(budget / px);
+      width = Math.max(16, Math.round(width * s));
+      height = Math.max(16, Math.round(height * s));
+    }
+    // Never below the resolve — the chain's g-buffer is derived from this one.
+    if (width <= resolve.width || height <= resolve.height) return { ...resolve };
+    return { width: Math.min(4096, width), height: Math.min(4096, height) };
+  }
+
+  /**
+   * §11.35 — the full-resolution g-buffer (system-lifetime, like its resolve-
+   * sized twin) and the quad pass that point-samples it down into the twin.
+   * Returns null when the sizes coincide: then the prepass renders straight
+   * into the resolve g-buffer as it always did.
+   */
+  #persistentGbufferFull(full, resolve) {
+    const same = full.width === resolve.width && full.height === resolve.height;
+    if (same || !this._giGbuffer) {
+      this._giGbufferDownsample?.dispose?.();
+      this._giGbufferDownsample = null;
+      this._giGbufferFull?.dispose?.();
+      this._giGbufferFull = null;
+      this._giGbufferFullSize = null;
+      return null;
+    }
+    let gbuffer = this._giGbufferFull;
+    if (!gbuffer) {
+      gbuffer = this._giGbufferFull = createGiGBuffer(full.width, full.height);
+    } else if (this._giGbufferFullSize?.width !== full.width || this._giGbufferFullSize?.height !== full.height) {
+      gbuffer.setSize(full.width, full.height);
+      this.#refreshRenderObjectsOnce("gbuffer-full-resized");
+    }
+    this._giGbufferFullSize = { width: full.width, height: full.height };
+    if (this._giGbufferDownsample?.source !== gbuffer || this._giGbufferDownsample?.target !== this._giGbuffer) {
+      this._giGbufferDownsample?.dispose?.();
+      this._giGbufferDownsample = createGiGBufferDownsample({ source: gbuffer, target: this._giGbuffer });
+    } else {
+      this._giGbufferDownsample.setSize();
+    }
+    return gbuffer;
+  }
+
+  /**
+   * §11.35 — the material-facing AO node: ONE persistent TextureNode every
+   * lit material samples (giLight), pointed at the AO buffer when the term is
+   * material-side and at a 1×1 white texture otherwise — so the material
+   * graph is byte-identical across tiers, toggles and rebuilds, and a change
+   * is a re-point plus one binding refresh (§11.33), never a recompile.
+   */
+  #pointAoMaterialNode(tex, reason) {
+    if (!this._giAoPlaceholder) {
+      const white = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
+      white.name = "giAoWhite";
+      white.minFilter = THREE.LinearFilter;
+      white.magFilter = THREE.LinearFilter;
+      white.needsUpdate = true;
+      this._giAoPlaceholder = white;
+    }
+    this._giAoActiveU ??= uniform(this.config.ao === false ? 0 : 1).setGroup(renderGroup);
+    const next = tex ?? this._giAoPlaceholder;
+    if (!this._giAoMaterialNode) {
+      this._giAoMaterialNode = texture(next);
+      return;
+    }
+    if (this._giAoMaterialNode.value !== next) {
+      this._giAoMaterialNode.value = next;
+      this.#refreshRenderObjectsOnce(reason);
+    }
+  }
+
+  #persistentGbuffer(width, height) {
+    let gbuffer = this._giGbuffer;
+    if (!gbuffer) {
+      gbuffer = this._giGbuffer = createGiGBuffer(width, height);
+      this._giGbufferSize = { width, height };
+      return gbuffer;
+    }
+    const size = this._giGbufferSize;
+    if (size?.width !== width || size?.height !== height) {
+      gbuffer.setSize(width, height);
+      this._giGbufferSize = { width, height };
+      this.#refreshRenderObjectsOnce("gbuffer-resized");
+    }
+    return gbuffer;
+  }
+
+  /**
+   * ══ §11.34 CONVERGED IDLE — WHAT A STATIC LIGHT BUYS ══════════════════════
+   *
+   * The GI mobility properties never paid off as a frame-time lever, and the
+   * reason is structural: mesh mobility decides how a MOVER is represented
+   * (exact triangles vs voxels), which is a quality/cost trade only when
+   * something moves; and the transport already detects "nothing moved" on its
+   * own (the rest cadence: drive ~0 → half the rays at 15 Hz). What no
+   * detector can supply is PERMISSION TO STOP: a rest rate exists because the
+   * system cannot know that the next frame will be as still as this one, so it
+   * keeps converging a field that has nothing left to learn — ~20 ms of GPU
+   * every other frame on the user's Bistro, parked, for no change in the
+   * picture.
+   *
+   * A light declared `mobility: "static"` (LightComponent) is that permission.
+   * When every light in the scene is static, the rest drive is ~0 and the
+   * static inputs (lights / emitters / sky / knobs — the field-hash sections,
+   * MINUS the movers' section: a walking character must not keep the world
+   * awake, its GI rides the mover path) have held still for
+   * GI_WORLD_IDLE_AFTER_MS, the world chain is not dispatched. Zero rays,
+   * zero merge, zero tiles. Anything that lifts the drive — a light drag in
+   * the editor, a camera move, `profile.lightResponse`'s sun step — or moves
+   * a static input wakes it on that frame; the wake path IS the ordinary rest
+   * → active transition, so the light-response receipts are unchanged.
+   *
+   * Receipts: `profile.frameStats.giHold.worldIdle / worldIdleFrames /
+   * worldIdleReason` (the reason names exactly which condition is holding it
+   * awake, so "why is it still at 15 Hz" is one read). `__giWorldIdle = false`
+   * disables it for an A/B.
+   */
+  #worldIdleGate(worldRested, restDrive = 1) {
+    const now = globalThis.performance?.now?.() ?? Date.now();
+    // The hold timer follows the DRIVE alone: a compile wave (which
+    // `worldRested` also excludes) toggles for seconds after a boot and kept
+    // resetting it ("resting 0.0 s of 3" on the smoke's Sponza) — the wave
+    // holds the sleep back below, it does not restart the clock.
+    const restedForIdle = restDrive < 0.05 && globalThis.__giSrcWorldRestCadence !== false;
+    const lights = this._lightObjects ?? [];
+    let staticLights = 0;
+    // `__giLightsStatic = true` declares every light static (a harness A/B
+    // on a scene whose authored lights are movable — see smoke:gi-flicker-watch).
+    const declaredStatic = globalThis.__giLightsStatic === true;
+    for (const light of lights) if (declaredStatic || light?.userData?.giMobility === "static") staticLights++;
+    this._giLightsAllStatic = lights.length > 0 && staticLights === lights.length;
+    const sections = this._quietSections;
+    // The EMITTER inputs are the scene's emissive set (mesh, radiance, world
+    // position), NOT the field hash's `emitters` section: that one mixes the
+    // SEAT slots, and seats rotate on the module's own cadence (§11.15) —
+    // on the smoke's Sponza, with more lamps than seats, that section ticked
+    // every rotation and the gate read "inputs changed" forever.
+    let emitterKey = 0;
+    let k = 1;
+    for (const cand of this._emitterCands ?? []) {
+      const e = cand?.mesh?.matrixWorld?.elements;
+      if (!e) continue;
+      for (const v of [cand.r, cand.g, cand.b, e[12], e[13], e[14]]) {
+        k = (k * 1.6180339887) % 1024;
+        emitterKey += (Number(v) || 0) * (k + 1);
+      }
+    }
+    const inputs = sections ? `${sections.lights}|${emitterKey}|${sections.sky}|${sections.knobs}` : "";
+    if (inputs !== this._worldIdleInputsSeen) {
+      this._worldIdleInputsSeen = inputs;
+      this._worldIdleInputsAt = now;
+    }
+    if (!restedForIdle) this._worldRestedAt = Number.NaN;
+    else if (!Number.isFinite(this._worldRestedAt)) this._worldRestedAt = now;
+    const hold = GI_WORLD_IDLE_AFTER_MS;
+    let reason;
+    if (globalThis.__giWorldIdle === false) reason = "off (__giWorldIdle = false)";
+    else if (lights.length === 0) reason = "no lights";
+    else if (staticLights < lights.length) reason = `${lights.length - staticLights} of ${lights.length} lights movable`;
+    else if (!restedForIdle) reason = `not rested (drive ${restDrive.toFixed(2)})`;
+    else if (now - this._worldRestedAt < hold) reason = `resting ${((now - this._worldRestedAt) / 1000).toFixed(1)} s of ${hold / 1000}`;
+    else if (now - (this._worldIdleInputsAt ?? now) < hold) reason = "inputs changed";
+    else if (this._compileWaveActive) reason = "compile wave";
+    else if (!worldRested) reason = "not rested";
+    else reason = "idle";
+    const idle = reason === "idle";
+    this._worldIdle = idle;
+    this._worldIdleReason = reason;
+    this._worldIdleFrames = idle ? (this._worldIdleFrames ?? 0) + 1 : 0;
+    return idle;
   }
 
   #collectLightObjects() {

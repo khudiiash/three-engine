@@ -23,6 +23,11 @@ export function ConsolePanel() {
               {entry.time.toLocaleTimeString(undefined, { hour12: false })}
             </span>
             <span className="console-message">{entry.message}</span>
+            {entry.count > 1 && (
+              <span className="console-repeat" title="repeats folded into this entry" style={{ marginLeft: 8, opacity: 0.7, flexShrink: 0 }}>
+                ×{entry.count}
+              </span>
+            )}
           </div>
         ))}
       </div>

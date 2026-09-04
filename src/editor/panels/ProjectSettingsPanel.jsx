@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
-import { Save, X, RotateCcw, Crosshair } from "lucide-react";
+import { Save, X, RotateCcw, Crosshair, FolderOpen } from "lucide-react";
 import { Row, Toggle, Note, Section } from "./settingsUi.jsx";
 import { useProjectStore, basename } from "../store/projectStore.js";
 import { getProjectSettings, saveProjectSettings } from "../projectSettings.js";
 import { currentScenePath } from "../sceneIO.js";
-import { KEY_BINDING_ACTIONS, describeBinding } from "../keybindings.js";
+import { KEY_BINDING_ACTIONS, describeBinding, keyTokenFromEvent } from "../keybindings.js";
 import {
   isViewportFreezeEnabled,
   onViewportFreezeChanged,
@@ -104,7 +104,11 @@ function KeybindingInput({ value, defaultChord, onChange }) {
       if (e.shiftKey) tokens.push("Shift");
       if (e.altKey) tokens.push("Alt");
       if (e.metaKey) tokens.push("Meta");
-      tokens.push(e.key.length === 1 ? e.key.toUpperCase() : e.key);
+      // keyTokenFromEvent, not e.key: macOS folds Option into the key
+      // (Option+S reports "ß"), and a chord stored as "Alt+ß" would neither
+      // display nor match. The physical key keeps the chord portable.
+      const token = keyTokenFromEvent(e);
+      tokens.push(token.length === 1 ? token.toUpperCase() : token);
       const chord = tokens.join("+");
       setDraft(chord);
       onChange(chord);
@@ -330,7 +334,7 @@ export function ProjectSettingsPanel() {
     if (abs) setMain(projectRelative(rootPath, abs));
   };
 
-  const { editor, scripts, rendering, game, physics } = settings;
+  const { editor, scripts, rendering, game, physics, screenshot } = settings;
   const mainValue = normalizeMainPath(mainDirty ? mainDraft : mainScene);
   const mainMissing = !!mainValue && mainValid === false;
 
@@ -538,6 +542,59 @@ export function ProjectSettingsPanel() {
         >
           <Toggle checked={freezeUnfocused} onChange={setViewportFreezeEnabled} />
         </Row>
+      </Section>
+
+      <Section id="project.screenshot" title="Screenshot">
+        <Row
+          label="Destination folder"
+          wide
+          hint="Absolute folder the PNG is written to. Empty = the OS Downloads folder; in a plain browser the file goes through the browser's own download flow instead."
+        >
+          <input
+            className="text-field"
+            type="text"
+            value={screenshot.folder}
+            placeholder="Downloads"
+            onChange={(e) => patch("screenshot", { folder: e.target.value })}
+          />
+          <button
+            className="toolbar-btn icon-only"
+            title="Browse…"
+            onClick={async () => {
+              try {
+                const { open } = await import("@tauri-apps/plugin-dialog");
+                const dir = await open({ directory: true, title: "Screenshot folder" });
+                if (dir) patch("screenshot", { folder: dir });
+              } catch (err) {
+                console.warn(`Folder picker unavailable: ${err?.message ?? err}`);
+              }
+            }}
+          >
+            <FolderOpen size={13} />
+          </button>
+          <button
+            className="toolbar-btn icon-only"
+            title="Reset to Downloads"
+            disabled={!screenshot.folder}
+            onClick={() => patch("screenshot", { folder: "" })}
+          >
+            <X size={13} />
+          </button>
+        </Row>
+        <Row label="File name prefix" hint="Files are named <prefix>-<date>_<time>.png.">
+          <input
+            className="text-field"
+            type="text"
+            value={screenshot.prefix}
+            placeholder="screenshot"
+            onChange={(e) => patch("screenshot", { prefix: e.target.value })}
+          />
+        </Row>
+        <Note>
+          Captured with the “Screenshot viewport” binding under Keybindings — Shift+Alt+S by default
+          (Alt is the Option key on macOS). The shot is the frame exactly as displayed — debug views
+          and overlays included — and the saved file's path is copied to the clipboard.
+        </Note>
       </Section>
 
       <Section id="project.keybindings" title="Keybindings" defaultOpen={false}>

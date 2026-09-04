@@ -1123,6 +1123,21 @@ export class Engine extends EventEmitter {
       // Refresh instanced batches before any pre-render pass reads the
       // scene, so a GI/postprocess prepass and the main draw agree on what
       // is on screen.
+      // ── ONE MATRIX WALK PER FRAME (2026-09-04, plan §11.41) ──────────────
+      // `scene.updateMatrixWorld()` recomposes every auto-update object it
+      // visits whether or not anything moved — 2.1 ms on Bistro
+      // (profile.cpuFrame `merging.matrixWorld`) — and the frame paid it
+      // THREE times: merging's motion watch, the GI g-buffer prepass render
+      // and the main render (three walks the scene inside every `render()`
+      // while `scene.matrixWorldAutoUpdate` is true). Scripts, physics and
+      // animation have written this frame's transforms by now, so one walk
+      // here is the frame's truth; the renders inside this tick are told
+      // not to repeat it (#walkSceneOnce), and the flag goes back before the
+      // tick ends (#endWalkedFrame) so a render outside the tick — a
+      // thumbnail, a probe capture — still walks for itself.
+      this.stats.markPhase(PHASE.matrixWorld);
+      this.#installRenderMarks();
+      this.#walkSceneOnce();
       this.stats.markPhase(PHASE.batching);
       this.batching.sync();
       // After batching, and for the same reason batching runs before the
@@ -1161,6 +1176,7 @@ export class Engine extends EventEmitter {
       // rendering THIS frame — rendering now would sync-compile the whole
       // material wave in this frame, the exact freeze suspension prevents.
       if (this.renderSuspended) {
+        this.#endWalkedFrame();
         this.stats.recordSkippedFrame();
         // §18 W3: a tick without a draw is not a measurement. See governor.hold().
         this.frameGovernor.hold();
@@ -1228,6 +1244,7 @@ export class Engine extends EventEmitter {
         // Query flags are render-context state. Do not let a post-render
         // screenshot/debug/GI render consume them with another camera.
         this.occlusion.finishMainRender();
+        this.#endWalkedFrame();
       }
       const t1 = performance.now();
       this.stats.recordRenderMs(t1 - t0);
@@ -1293,7 +1310,13 @@ export class Engine extends EventEmitter {
         const duration =
           (typeof renderDuration === "number" ? renderDuration : 0) +
           (typeof computeDuration === "number" ? computeDuration : 0);
-        if (duration > 0) this.stats.recordGpuMs(duration);
+        if (duration > 0) {
+          this.stats.recordGpuMs(
+            duration,
+            typeof renderDuration === "number" ? renderDuration : 0,
+            typeof computeDuration === "number" ? computeDuration : 0,
+          );
+        }
       })
       .catch(() => {
         // Device loss can still reject a readback; keep it contained here.
@@ -1424,6 +1447,77 @@ export class Engine extends EventEmitter {
   }
 
   /** First override whose `ownsCamera()` returns true, or null. */
+  /**
+   * §11.42 — sub-marks INSIDE three's render, read by profile.cpuFrame /
+   * profile.orbit: `render.project@<phase>` is everything `_renderScene` does
+   * around the draw loop (the render-list build over every object, sorting,
+   * lights, background) and `render.draw@<phase>` is `_renderObjects` (the
+   * per-draw bindings/pipeline/encode loop). Keyed by tick phase so the GI
+   * g-buffer prepass (preRender) and the main pass (renderEncode) read
+   * apart. Installed once per renderer; costs two early-returning calls per
+   * render when no capture is armed.
+   */
+  #installRenderMarks() {
+    const renderer = this.renderer;
+    const stats = this.stats;
+    if (!renderer || renderer.__engineRenderMarks || !stats?.markSub) return;
+    const origScene = renderer._renderScene;
+    const origObjects = renderer._renderObjects;
+    if (typeof origScene !== "function" || typeof origObjects !== "function") return;
+    renderer.__engineRenderMarks = true;
+    renderer._renderScene = function (...args) {
+      const outer = stats.currentSubName();
+      stats.markSub(`render.project@${stats.currentPhaseName()}`);
+      try {
+        return origScene.apply(this, args);
+      } finally {
+        stats.markSub(outer);
+      }
+    };
+    renderer._renderObjects = function (...args) {
+      const outer = stats.currentSubName();
+      stats.markSub(`render.draw@${stats.currentPhaseName()}`);
+      try {
+        return origObjects.apply(this, args);
+      } finally {
+        stats.markSub(outer);
+      }
+    };
+  }
+
+  /**
+   * §11.41 — the frame's single scene matrix walk. Walks now, then switches
+   * the scene's `matrixWorldAutoUpdate` off so the renders inside this tick
+   * (the GI g-buffer prepass, the main pass) do not walk again;
+   * #endWalkedFrame puts the flag back. `__engineWalkPerRender = true`
+   * restores the per-render walks (the pre-§11.41 behaviour) for an A/B.
+   */
+  #walkSceneOnce() {
+    const scene = this.scene;
+    if (!scene) return;
+    scene.updateMatrixWorld();
+    // ⛔ OPT-IN (§11.47). Switching the scene's auto-update off for the tick's
+    // renders makes anything moved in the preRender phase a FRAME STALE, and
+    // `LightComponent` re-aims the directional light and rebuilds its CSM
+    // frustums in exactly that phase — so the sun's shadow was being rendered
+    // from last frame's pose every frame. That reads as flat, cold lighting
+    // and NO GI instrument can see it: the transport is fed a stale sun and
+    // reports healthy timings, healthy stability and a healthy light
+    // response. `__engineWalkOnce = true` re-arms the single walk (worth
+    // 6.4 ms of CPU under motion) once the preRender movers are walked too.
+    if (globalThis.__engineWalkOnce !== true) return;
+    this._walkedScene = scene;
+    this._walkedAutoUpdate = scene.matrixWorldAutoUpdate;
+    scene.matrixWorldAutoUpdate = false;
+  }
+
+  #endWalkedFrame() {
+    const scene = this._walkedScene;
+    if (!scene) return;
+    scene.matrixWorldAutoUpdate = this._walkedAutoUpdate ?? true;
+    this._walkedScene = null;
+  }
+
   #activeRenderOverride() {
     for (const o of this.renderOverrides) {
       if (o.ownsCamera?.(this)) return o;

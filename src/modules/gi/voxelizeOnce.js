@@ -190,10 +190,43 @@ function textureAverageColor(texture) {
  * editor swatch walks colorNode. Texture-driven color multiplies in the
  * texture's MEAN color (see textureAverageColor).
  */
-export function resolveMaterialSurface(materialInput, meshName = "") {
+export function resolveMaterialSurface(materialInput, meshName = "", depth = 0) {
   const material = Array.isArray(materialInput) ? materialInput[0] : materialInput;
   const white = { r: 1, g: 1, b: 1 };
   const black = { r: 0, g: 0, b: 0 };
+  // ── §11.39 A MERGED (UBER) MATERIAL IS THE MEAN OF ITS MEMBERS ──────────
+  //
+  // `uberMaterial.js` stamps the member materials on the proxy's material
+  // (`userData.giMembers`): its own colour node is a per-vertex texture-array
+  // read that `constantColorOf`/`textureValueOf` cannot see, and its `.color`
+  // is white — the "some meshes appear white in the reflections" of
+  // 2026-09-04, and a white bounce from every merged group before that.
+  // Unweighted mean over members (an uber is cached per MATERIAL SET, so a
+  // per-group area weight would be wrong for every other group sharing it);
+  // the emissive is averaged pre-multiplied by each member's intensity.
+  const members = material?.userData?.giMembers;
+  if (Array.isArray(members) && members.length > 0 && depth < 2) {
+    const color = { r: 0, g: 0, b: 0 };
+    const emissive = { r: 0, g: 0, b: 0 };
+    let n = 0;
+    for (const member of members) {
+      if (!member || member === material) continue;
+      const m = resolveMaterialSurface(member, meshName, depth + 1);
+      color.r += m.color.r; color.g += m.color.g; color.b += m.color.b;
+      const k = m.emissiveIntensity ?? 1;
+      emissive.r += (m.emissive?.r ?? 0) * k;
+      emissive.g += (m.emissive?.g ?? 0) * k;
+      emissive.b += (m.emissive?.b ?? 0) * k;
+      n++;
+    }
+    if (n > 0) {
+      return {
+        color: { r: color.r / n, g: color.g / n, b: color.b / n },
+        emissive: { r: emissive.r / n, g: emissive.g / n, b: emissive.b / n },
+        emissiveIntensity: 1,
+      };
+    }
+  }
   let color = constantColorOf(material?.colorNode) ?? material?.color ?? white;
   // A/B escape hatch, dev/harness only.
   const mapAverage = globalThis.__giNoTextureTint

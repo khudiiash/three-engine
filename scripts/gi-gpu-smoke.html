@@ -59,6 +59,13 @@
         globalThis.__giRayHitProfiling = true;
         globalThis.__giRayHitMode = rayHitMode;
         globalThis.__giRayHitSkipDistance = coarseSkip;
+        // Compile the bounded offscreen-receiver tail through the complete
+        // transport graph, not just its standalone snapshot shader.
+        if (new URLSearchParams(location.search).get("secondaryreceivers") === "1") {
+          globalThis.__giSrcSecondaryReceivers = true;
+        } else if (new URLSearchParams(location.search).get("secondaryreceivers") === "0") {
+          globalThis.__giSrcSecondaryReceivers = false;
+        }
         // World occupancy AO ships on. `?worldao=0` is its clean cross-boot A/B
         // opt-out; `?worldao=1` remains accepted explicitly for old commands.
         // The cone reads the existing occupancy allocation in the small GTAO
@@ -732,6 +739,28 @@
               console.log(`GI-SMOKE src poll: statRays=${s.rays?.rays ?? 0} worklist=${wc} rayTotal=${rt} suspended=${engine.renderSuspended}`);
             }
           }
+          if (src.secondaryReceivers || globalThis.__giSrcSecondaryReceivers === true) {
+            const receivers = src.secondaryReceivers;
+            const snapshotIndex = src.passes.findIndex((pass) => pass.__giPassName === "src:secondary receiver snapshot");
+            if (!receivers || snapshotIndex < 0 || snapshotIndex >= src.screenPassStart) {
+              throw new Error("secondary receiver arm: snapshot is absent or outside the transport cadence");
+            }
+            const T = await import("three/tsl");
+            const validity = T.instancedArray(new Uint32Array(receivers.capacity), "uint");
+            const read = T.Fn(() => {
+              validity.element(T.instanceIndex).assign(T.select(receivers.readPixel(T.instanceIndex).valid, T.uint(1), T.uint(0)));
+            })().compute(receivers.capacity);
+            const priorSync = engine.renderer.backend.__giSyncCompute;
+            engine.renderer.backend.__giSyncCompute = true;
+            try { await engine.renderer.computeAsync(read); }
+            finally { engine.renderer.backend.__giSyncCompute = priorSync; }
+            const values = new Uint32Array(await engine.renderer.getArrayBufferAsync(validity.value));
+            const valid = values.reduce((sum, value) => sum + value, 0);
+            if (!(valid > 0 && valid <= receivers.capacity)) {
+              throw new Error(`secondary receiver snapshot has ${valid}/${receivers.capacity} valid hits`);
+            }
+            console.log(`GI-SMOKE SECONDARY-RECEIVERS ${valid}/${receivers.capacity} valid; snapshot in transport cadence`);
+          }
           srcReport = {
             dispatches: src.passes.length,
             megabytes: +(s.bytes / 1048576).toFixed(2),
@@ -851,19 +880,28 @@
           // than a bake shortfall. Raw coverage reads 1.6% here and 93% of
           // claimed, and only the second is about [H].
           const owned = s.cascades[0].live * tl.texelsPerTile;
+          const processed = tl.lit + tl.empty;
           srcReport.tiles = {
             tiles: tl.tiles, texels: tl.texels, lit: tl.lit, empty: tl.empty, owned,
+            processed, skipped: tl.texels - processed,
             coverage: +(tl.coverage * 100).toFixed(2),
             claimed: owned > 0 ? +(100 * tl.lit / owned).toFixed(1) : 0,
             knownBins: +tl.meanKnownBins.toFixed(1), totalBins: tl.totalBins,
             minLum: +tl.minLum.toFixed(4), maxLum: +tl.maxLum.toFixed(4),
           };
-          // THE ACCOUNTING CLOSES: every texel took exactly one branch. Cheap,
-          // and it is the one thing here that cannot be true by accident.
-          if (tl.lit + tl.empty !== tl.texels) {
+          // The bake skips dead blocks before either counter increments;
+          // `texels` is the allocated capacity, not the visited population.
+          // Every live probe's whole tile must still be accounted for, and
+          // released blocks may bake once more to clear their old contents.
+          // The total must therefore cover the owned tiles, stay within the
+          // pool, and contain whole tiles even when individual tiles are only
+          // partially lit. This still catches missing or partial dispatches.
+          if (processed < owned || processed > tl.texels
+              || processed % tl.texelsPerTile !== 0) {
             throw new Error(
-              `src arm: the bake visited ${tl.texels} texels but accounted for ` +
-              `${tl.lit} + ${tl.empty} — a texel took neither branch`,
+              `src arm: the bake accounted for ${tl.lit} + ${tl.empty} = ${processed} ` +
+              `texels, expected whole ${tl.texelsPerTile}-texel tiles covering ` +
+              `${owned} owned texels within capacity ${tl.texels}`,
             );
           }
           // A CEILING, NOT AN EQUALITY, AND THE FIRST VERSION OF THIS ARM GOT IT
@@ -1011,6 +1049,27 @@
           // probe exists but whose range never arrived keeps SLOT_EMPTY and
           // simply does not fire, which is silent everywhere except here.
           if (rays.rays !== s.totalRays) {
+            const [workData, baseData, probeData] = await Promise.all([
+              engine.renderer.getArrayBufferAsync(src.rayStore.rayWork.value),
+              engine.renderer.getArrayBufferAsync(src.rayStore.pixelRayBase.value),
+              engine.renderer.getArrayBufferAsync(src.pixelProbe.value),
+            ]);
+            const work = new Uint32Array(workData), bases = new Uint32Array(baseData), probes = new Uint32Array(probeData);
+            let emptyBase = 0, emptyProbe = 0;
+            const { PRIORITY_REP_PIXEL_MASK } = await import("/src/modules/gi/srcProbes.js");
+            const uniquePixels = new Set(), uniquePackets = new Set(), missing = [];
+            for (let w = 1; w <= work[0]; w++) {
+              const pixel = src.rayFrame.worklistPacked ? work[w] & PRIORITY_REP_PIXEL_MASK : work[w];
+              uniquePixels.add(pixel); uniquePackets.add(work[w]);
+              if (bases[pixel] === 0xffffffff) { emptyBase++; if (missing.length < 20) missing.push(pixel); }
+              if (probes[pixel] === 0xffffffff) emptyProbe++;
+            }
+            console.log("GI-SMOKE RAY-MISMATCH", JSON.stringify({
+              total: s.totalRays, traced: rays.rays, live: s.cascades[0].live,
+              cap: src.probeRayCap, transport: globalThis.__giSrcTransportLive,
+              tiles: srcReport.tiles, work: work[0], emptyBase, emptyProbe,
+              uniquePixels: uniquePixels.size, uniquePackets: uniquePackets.size, missing,
+            }));
             throw new Error(
               `src arm: the budget and the tracer disagree — Alg. 3 allocated ${s.totalRays} rays, ` +
               `the marcher fired ${rays.rays}. Pixels are being dropped between the two.`,
@@ -1546,10 +1605,10 @@
         //
         // Both arms in ONE page and on one adapter, because a cross-page
         // comparison of this module has been wrong every time it was tried. The
-        // opt-out build comes from `setSize`, the only path that forwards every
-        // construction argument — it DISPOSES the live system, which is why
-        // this sits after every readback above and immediately before the
-        // result. No pipeline is created for the throwaway build: reading
+        // opt-out build comes from `setSize`, the path that forwards every
+        // construction argument. Force a pool growth because small resizes now
+        // update in place; defer disposal to retain the source for both A/Bs.
+        // No pipeline is created for the throwaway build: reading
         // `computeShader` builds the WGSL and nothing more.
         if (srcArm && srcReport) {
           const sp = state?.screen?.srcProbes;
@@ -1569,7 +1628,11 @@
             const withSecondary = wgslOf(sp.deposit.scatter).length;
             const jWith = wgslOf(sp.secondary.pass).length;
             globalThis.__giSrcSecondary = false;
-            const alt = sp.setSize(sp.width + 2, sp.height);
+            // Small resizes now reuse the existing system and cannot retake
+            // build-time hatches. Force a pool growth so this is a genuinely
+            // new graph, and defer disposal so both A/Bs retain the source.
+            const rebuildPools = { ...sp.poolConfig, c0Probes: sp.poolConfig.c0Probes * 2 };
+            const alt = sp.setSize(sp.width + 2, sp.height, rebuildPools, { deferDispose: true });
             const withoutSecondary = wgslOf(alt.deposit.scatter).length;
             const altPass = !!alt.secondary;
             const altBounce = !!alt.secondary?.bounce;
@@ -1597,7 +1660,10 @@
             if (altBounce) {
               throw new Error("the `__giSrcSecondary = false` rebuild kept the bounce — the hatch is not an opt-out");
             }
-            if (!(Math.abs(ratio - 1) < 0.005)) {
+            // The receiver path deliberately removes its sampled-texture
+            // branch when bounce is off. Only the ordinary split-shade graph
+            // promises identical deposit WGSL across this particular A/B.
+            if (!sp.secondaryReceivers && !(Math.abs(ratio - 1) < 0.005)) {
               throw new Error(
                 `the multibounce flag moved the deposit kernel by ${((ratio - 1) * 100).toFixed(2)}% ` +
                 `(${withSecondary} vs ${withoutSecondary} bytes) — since the shading split, [E] ` +
@@ -1627,7 +1693,7 @@
             // parallel, so what a boot waits on is the biggest one, and the
             // split only pays if `max([E], [J])` beats the un-split [E].
             globalThis.__giSrcSplitShade = false;
-            const uns = sp.setSize(sp.width + 4, sp.height);
+            const uns = sp.setSize(sp.width + 4, sp.height, rebuildPools, { deferDispose: true });
             const unsplitDeposit = wgslOf(uns.deposit.scatter).length;
             const unsplitJ = uns.secondary ? wgslOf(uns.secondary.pass).length : 0;
             const unsplitShades = !!uns.shading && !uns.shading.split;

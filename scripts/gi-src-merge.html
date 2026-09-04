@@ -315,8 +315,12 @@
         // rather than against the mirror (`preavg`, `monotone`, `unknown`).
         const before = Float32Array.from(payloadArray);
         for (const pass of merge.passes) await renderer.computeAsync(pass);
+        let rawWords = null;
         const [after, cornerBlock, cornerWeight, mergeStats] = await Promise.all([
-          renderer.getArrayBufferAsync(bins.payload.value).then((b) => D.decodePayload(new Uint32Array(b))),
+          renderer.getArrayBufferAsync(bins.payload.value).then((b) => {
+            rawWords = new Uint32Array(b);
+            return D.decodePayload(rawWords);
+          }),
           renderer.getArrayBufferAsync(merge.cornerBlock.value).then((b) => new Uint32Array(b)),
           renderer.getArrayBufferAsync(merge.cornerWeight.value).then((b) => new Float32Array(b)),
           merge.readStats(renderer),
@@ -464,6 +468,53 @@
         check("the kernel counted the same top-cascade bins", mergeStats.sky === skyBins,
           `stats ${mergeStats.sky} vs ${skyBins}`);
 
+        // A directional sky must rotate exactly like Three's background and
+        // the path tracer. A uniform furnace cannot detect an inverted yaw.
+        {
+          const { giEnvironmentLookupYaw } = await import("/src/modules/gi/giConfig.js");
+          const skyStore = P.createSrcProbeStore({ c0Probes: 1024, cascadeCount: 1, blockCapacity: [1] });
+          const skyBins = D.createSrcBinStore(skyStore, { w0: 4 });
+          const width = 64, height = 4;
+          const pixels = new Float32Array(width * height * 4);
+          for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+            const offset = (y * width + x) * 4;
+            pixels[offset + (x < width / 2 ? 0 : 1)] = 1;
+            pixels[offset + 3] = 1;
+          }
+          const panorama = new THREE.DataTexture(pixels, width, height, THREE.RGBAFormat, THREE.FloatType);
+          panorama.needsUpdate = true;
+          const rotation = uniform(0);
+          const directional = G.createSrcMergeFrame(skyStore, skyBins, {
+            spacing0: S0, anchor: vec3(0), camera: vec3(0), sky: vec3(0), w0: 4,
+            skyEnv: { node: TSL.texture(panorama), intensity: TSL.float(1), rotY: rotation },
+          });
+          const directions = refMath.binDirTable(4);
+          for (const degrees of [90, -90, 250]) {
+            const radians = degrees * Math.PI / 180;
+            rotation.value = giEnvironmentLookupYaw(radians);
+            const field = new Float32Array(skyBins.binTotal * D.PAYLOAD_CHANNELS);
+            for (let b = 0; b < skyBins.binTotal; b++) field[b * D.PAYLOAD_CHANNELS + 3] = 1;
+            D.encodePayload(field, skyBins.payload.value.array);
+            skyBins.payload.value.needsUpdate = true;
+            for (const pass of directional.passes) await renderer.computeAsync(pass);
+            const actual = D.decodePayload(await renderer.getArrayBufferAsync(skyBins.payload.value));
+            const inverse = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(0, radians, 0)).invert();
+            let wrong = 0;
+            for (let b = 0; b < skyBins.binTotal; b++) {
+              const direction = new THREE.Vector3().fromArray(directions, b * 4).applyMatrix4(inverse);
+              const u = Math.atan2(direction.z, direction.x) / (2 * Math.PI) + 0.5;
+              const expected = u < 0.5 ? [1, 0, 0] : [0, 1, 0];
+              for (let c = 0; c < 3; c++) if (Math.abs(actual[b * D.PAYLOAD_CHANNELS + c] - expected[c]) > 0.001) wrong++;
+            }
+            check(`directional GI sky at ${degrees} degrees matches Three's inverse environment rotation`,
+              wrong === 0, `${wrong} channels differ over ${skyBins.binTotal} directions`);
+          }
+          directional.dispose();
+          skyBins.dispose();
+          skyStore.dispose();
+          panorama.dispose();
+        }
+
         // ══ ARM 4: the merged field vs mergeCascades ════════════════════
         say("");
         say("── MERGED: every (cascade, probe, bin) against the mirror ──");
@@ -530,6 +581,55 @@
           "bound — the packed payload's rounding at every level crossed, plus f32 against the mirror's f64 in the two divisions the merge makes");
         check("the comparison was not vacuous", mergedChecked > 10000,
           `${mergedChecked} bins compared`);
+
+        // ══ ARM 4b (§11.28): the centroid offset the merge carries ═══════
+        say("");
+        say("── CENTROID: the merged bin's centroid offset against the mirror ──");
+        // Word 2's high half: the offset of the merged radiance's luminance
+        // centroid from the bin's area centroid, two signed bytes in the
+        // bin's tangent frame (0 and 0x8080 = zero). The twins quantise
+        // through the same code; f32 vs f64 can land one step (1/127) apart
+        // at a rounding boundary, so the bound is two steps.
+        {
+          const codes = D.decodePayloadCentroid(rawWords);
+          let n = 0;
+          let nonZero = 0;
+          let cenWrong = 0;
+          let worstErr = 0;
+          let cenWorst = null;
+          for (let c = 0; c < N; c++) {
+            const nb = cfgMod.binCount(c, W0);
+            const wG = cfgMod.binGridWidth(c, W0);
+            for (let i = 0; i < built.cascades[c].probes.length; i++) {
+              const probe = built.cascades[c].probes[i];
+              const block = gpuProbes[c].keyToBlock.get(probe.key >>> 0);
+              if (block === undefined) continue;
+              for (let m = 0; m < nb; m++) {
+                const want = mirror[c][i][m];
+                if (!want) continue;
+                const code = codes[bins.cascades[c].binBase + block * nb + m];
+                const { i: bi, j: bj } = refMath.binUnmorton(m);
+                const centre = refMath.binAreaCentroid(bi, bj, wG);
+                const got = refMath.decodeCentroidOffset(code, centre);
+                const exp = want.offset ?? [0, 0, 0];
+                if (code !== 0 && code !== 0x8080) nonZero++;
+                const err = Math.hypot(got[0] - exp[0], got[1] - exp[1], got[2] - exp[2]);
+                n++;
+                if (err > worstErr) {
+                  worstErr = err;
+                  cenWorst = `c${c} probe ${probe.key >>> 0} bin ${m}: gpu code 0x${code.toString(16)} vs mirror |o| ${Math.hypot(...exp).toFixed(4)} — ${err.toFixed(4)}`;
+                }
+                if (err > 2 / 127 + 1e-6) cenWrong++;
+              }
+            }
+          }
+          check("every merged centroid offset is within two quanta of the mirror's", cenWrong === 0,
+            `${cenWrong}/${n} differ${cenWorst ? ` — worst ${cenWorst}` : ""}`);
+          check("the centroid arm was not vacuous (bins carry a non-zero offset)",
+            cfgMod.centroidArmed() ? nonZero > 0 : nonZero === 0,
+            `${nonZero}/${n} bins carry a non-zero offset`);
+          say(`   worst offset deviation ${worstErr.toFixed(5)} over ${n} bins`);
+        }
 
         // ══ ARM 5: the 4→1 direction, without the mirror ════════════════
         say("");

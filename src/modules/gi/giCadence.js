@@ -4,6 +4,16 @@ export const GI_WORLD_UPDATE_HZ = 30;
  *  probe update runs at half rate. Movers alone do not lift it: their GI
  *  influence is low-frequency, and the screen passes keep their own cadence. */
 export const GI_WORLD_REST_HZ = 15;
+/** §11.34 CONVERGED IDLE: once every light is declared static (LightComponent
+ *  `mobility`), the transport's rest drive is ~0 AND the static inputs (lights,
+ *  emitters, sky, knobs — not the movers) have held still for this long, the
+ *  world chain is not dispatched at all. The rest cadence above still costs
+ *  ~20 ms of GPU every other frame on the user's Bistro for a field that has
+ *  nothing left to learn; the hold is what makes "converged" true by the time
+ *  the sleep begins (the rest rate's α 0.02 reaches steady state in ~2 s).
+ *  Any drive — a light drag, a camera move, a sky or emitter edit, a rebuild —
+ *  wakes it on the same frame. `__giWorldIdle = false` disables the sleep. */
+export const GI_WORLD_IDLE_AFTER_MS = 3000;
 /** Screen passes that shade the whole view (emitter shadows, the exact
  *  reflection prepass, the hit shade) run every Nth frame when ONLY movers
  *  changed under a parked camera (the static g-buffer key is held) — one

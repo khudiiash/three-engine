@@ -53,13 +53,16 @@ function pickCamera(which) {
 
 /**
  * Renders one frame at `width`x`height` and returns it as a PNG data URL.
+ * Exported for the Shift+Alt+S hotkey (viewportScreenshot.js), which wants
+ * the exact same pixels the `viewport.screenshot` op returns — one capture
+ * implementation, not two that drift.
  *
  * The camera's aspect is temporarily overridden to match the requested size and
  * restored afterwards; without that, a 512x512 request through a wide viewport
  * camera returns a horizontally squashed image that reads as a modelling error
  * rather than a framing artefact.
  */
-async function capture({ width, height, camera, includeGizmos }) {
+export async function captureViewportFrame({ width, height, camera, includeGizmos }) {
   const renderer = engine.renderer;
   if (!renderer) throw new Error("The renderer is not ready yet.");
 
@@ -143,7 +146,7 @@ defineOp({
   async run({ width = 720, height = 480, camera = "editor", includeGizmos = false }) {
     const w = Math.max(16, Math.min(MAX_DIM, Math.round(width)));
     const h = Math.max(16, Math.min(MAX_DIM, Math.round(height)));
-    const dataUrl = await capture({ width: w, height: h, camera: pickCamera(camera), includeGizmos });
+    const dataUrl = await captureViewportFrame({ width: w, height: h, camera: pickCamera(camera), includeGizmos });
     // `__image` is the convention the MCP server looks for to emit an image
     // content block instead of JSON text. See mcp/server.mjs.
     return {
@@ -362,6 +365,9 @@ defineOp({
       level: entry.level,
       message: entry.message,
       time: entry.time instanceof Date ? entry.time.toISOString() : String(entry.time),
+      // Repeats fold into their first occurrence (consoleStore.push); the
+      // count says how many times, the time is the LATEST repeat.
+      ...(entry.count > 1 ? { count: entry.count } : {}),
     }));
   },
 });

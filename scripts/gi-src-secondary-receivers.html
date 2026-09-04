@@ -1,0 +1,140 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>SRC secondary receivers</title></head>
+<body><canvas id="view" width="16" height="16"></canvas><pre id="log"></pre><script type="module">
+const say = (line) => { console.log(line); document.querySelector('#log').textContent += `${line}\n`; };
+try {
+  const THREE = await import('three/webgpu'), T = await import('three/tsl');
+  const P = await import('/src/modules/gi/srcProbes.js');
+  const R = await import('/src/modules/gi/srcRays.js');
+  const D = await import('/src/modules/gi/srcDeposit.js');
+  const J = await import('/src/modules/gi/srcSecondary.js');
+  const G = await import('/src/modules/gi/srcMerge.js');
+  const H = await import('/src/modules/gi/srcTiles.js');
+  const I = await import('/src/modules/gi/srcScreenGather.js');
+  const V = await import('/src/modules/gi/srcSecondaryReceivers.js');
+  const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector('#view') });
+  await renderer.init();
+  const errors = [];
+  renderer.backend.device.addEventListener('uncapturederror', (event) => errors.push(event.error.message));
+  if (renderer.backend.device.limits.maxStorageBuffersPerShaderStage !== 8) throw new Error('portable limit 8 required');
+  const results = [];
+  const check = (name, pass, data) => { results.push({ name, pass, data }); say(`${pass ? 'PASS' : 'FAIL'} ${name}: ${JSON.stringify(data)}`); };
+
+  // A synthetic transport graph isolates the missing domain from visibility:
+  // visible receiver A -> unseen diffuse receiver B -> emitter C. All trace,
+  // deposit, secondary shading, merge and tile passes are the real GPU code.
+  // Only the ray/scene intersection is analytic. B lies behind the camera.
+  const run = async (enabled) => {
+    const capacity = 16, pixels = 1 + capacity, rpp = 8, s0 = 0.35;
+    const store = P.createSrcProbeStore({ c0Probes: 1024, blockCapacity: [32, 32, 32, 32] });
+    const bins = D.createSrcBinStore(store, { secondaryCapacity: pixels * rpp, sunWords: false });
+    const receivers = V.createSrcSecondaryReceivers({ capacity });
+    const stamp = T.uniform(1, 'uint');
+    const camera = T.vec3(0, 0, -1), anchor = T.vec3(0);
+    const screen = () => ({ position: T.vec3(0), normal: T.vec3(0, 0, -1), valid: T.bool(true) });
+    const readPixel = receivers.composeReadPixel(screen, T.uint(1));
+    const rays = R.createSrcRayStore(store, { pixelCount: pixels });
+    const population = P.createSrcProbeFrame(store, { spacing0: s0, camera, anchor, pixelCount: pixels, readPixel, frameStamp: stamp });
+    const budget = R.createSrcRayFrame(store, rays, { pixelProbe: population.pixelProbe, raysPerPixel: rpp, activePixels: T.uint(pixels) });
+    const lookup = P.createSrcHashBlockFrame(store);
+    const tiles = H.createSrcTileAtlas(store, bins);
+    const secondary = J.createSrcSecondaryFrame(store, bins, {
+      capacity: pixels * rpp, shade: (_p, _n, _rho, le) => ({ L: le }),
+      tiles, lookup: lookup.lookup, spacing0: s0, camera, anchor, lmax: T.float(16),
+    });
+    const trace = (origin) => {
+      const fromB = origin.z.lessThan(-1);
+      const target = T.select(fromB, T.vec3(0, 0, -1.4), T.vec3(0, 0, -2)).toVar();
+      return { hit: T.float(1), t: target.sub(origin).length(), position: target, exactPosition: target, normal: T.select(fromB, T.vec3(0, 0, -1), T.vec3(0, 0, 1)) };
+    };
+    const deposit = D.createSrcDepositFrame(store, bins, {
+      pixelProbe: population.pixelProbe, pixelRayBase: rays.pixelRayBase, rayWork: rays.rayWork,
+      pixelCount: pixels, raysPerPixel: rpp, trace, readPixel, readNormal: (i) => readPixel(i).normal,
+      camera, spacing0: s0, lmax: T.float(16), jitterX: stamp, jitterY: stamp, keep: T.float(0),
+      frameStamp: stamp, secondary: { base: bins.hitListBase, capacity: pixels * rpp },
+      attribute: (hit) => {
+        const emitter = hit.position.z.greaterThan(-1.8);
+        return { P: hit.position, n: hit.normal, rho: T.select(emitter, T.vec3(0), T.vec3(0.8)), emissive: T.select(emitter, T.vec3(2), T.vec3(0)), emitter: T.float(-1) };
+      },
+    });
+    const merge = G.createSrcMergeFrame(store, bins, { spacing0: s0, anchor, camera, sky: T.vec3(0) });
+    const snapshot = receivers.createSnapshot(bins, stamp);
+    const gather = I.createSrcScreenGather(store, tiles, { lookup: lookup.lookup, spacing0: s0, camera, anchor });
+    const output = T.instancedArray(new Float32Array(8), 'vec4');
+    const sample = T.Fn(() => {
+      const a = gather.gatherAt(T.vec3(0), T.vec3(0, 0, -1));
+      const b = gather.gatherAt(T.vec3(0, 0, -2), T.vec3(0, 0, 1));
+      output.element(0).assign(T.vec4(a.irradiance, T.select(a.known, T.float(1), T.float(0))));
+      output.element(1).assign(T.vec4(b.irradiance, T.select(b.known, T.float(1), T.float(0))));
+    })().compute(1);
+    const rounds = [];
+    for (let f = 0; f < 7; f++) {
+      stamp.value = f + 1;
+      const passes = [...population.passes, lookup.pass, ...budget.passes, deposit.decay, deposit.scatter, secondary.pass, deposit.resolve, ...merge.passes, ...tiles.passes];
+      if (enabled) passes.push(snapshot);
+      for (const pass of passes) await renderer.computeAsync(pass);
+      await renderer.computeAsync(sample);
+      const values = new Float32Array(await renderer.getArrayBufferAsync(output.value));
+      rounds.push({ a: values[0], b: values[4], bKnown: values[7], rays: await budget.readTotal(renderer) });
+    }
+    return { rounds, receivers, bins, stamp, snapshot };
+  };
+  const off = await run(false), on = await run(true);
+  check('unseen receiver remains absent with screen-only transport', off.rounds.every((r) => r.bKnown === 0 && r.a === 0), off.rounds);
+  check('virtual receivers launch continuation rays and populate unseen irradiance', on.rounds.slice(2).every((r) => r.bKnown === 1 && r.b > 0.1), on.rounds);
+  check('higher-order energy returns in irradiance units without a gain', Math.abs(on.rounds.at(-1).a / (0.8 * 2 * Math.PI) - 1) < 0.01, on.rounds.at(-1));
+
+  // Snapshot validation: exact hit normals survive behind-camera replay;
+  // malformed coordinates, invalid normals, black and moving hits do not.
+  const records = [
+    { p: [9, 2, -3], n: [0, 0, -1], rho: 1, emitter: -1 },
+    { p: [1, 2, 3], n: [0, 0, 0], rho: 1, emitter: -1 },
+    { p: [NaN, 2, 3], n: [0, 1, 0], rho: 1, emitter: -1 },
+    { p: [1, 2, 3], n: [0, Infinity, 0], rho: 1, emitter: -1 },
+    { p: [1, 2, 3], n: [0, 1, 0], rho: 0, emitter: -1 },
+    { p: [1, 2, 3], n: [0, 1, 0], rho: 1, emitter: -2 },
+    { p: [Infinity, 2, 3], n: [0, 1, 0], rho: 1, emitter: -1 },
+    { p: [7, 4, 2], n: [0, -1, 0], rho: 1, emitter: -1 },
+  ];
+  const seedWords = new Uint32Array(1 + records.length * D.SEC_HIT_WORDS), seedFloats = new Float32Array(seedWords.buffer);
+  seedWords[0] = records.length;
+  records.forEach((record, i) => {
+    const base = 1 + i * D.SEC_HIT_WORDS;
+    seedFloats.set(record.p, base + D.SEC_P); seedFloats.set(record.n, base + D.SEC_N);
+    seedFloats.set([record.rho, record.rho, record.rho], base + D.SEC_RHO);
+    seedFloats[base + D.SEC_EMITTER] = record.emitter;
+  });
+  const seedInput = T.instancedArray(seedWords, 'uint');
+  const seed = T.Fn(() => { T.atomicStore(on.bins.scratch.element(T.uint(on.bins.hitListBase).add(T.instanceIndex)), seedInput.element(T.instanceIndex)); })().compute(seedWords.length);
+  const recordOutput = T.instancedArray(new Float32Array(on.receivers.capacity * 8), 'vec4');
+  const screenCount = T.uniform(1, 'uint');
+  const composed = on.receivers.composeReadPixel(() => ({ position: T.vec3(-9), normal: T.vec3(1, 0, 0), valid: T.bool(true) }), screenCount);
+  const sampleRecords = T.Fn(() => {
+    const pixel = composed(T.instanceIndex.add(screenCount));
+    recordOutput.element(T.instanceIndex.mul(2)).assign(T.vec4(pixel.position, T.select(pixel.valid, T.float(1), T.float(0))));
+    recordOutput.element(T.instanceIndex.mul(2).add(1)).assign(T.vec4(pixel.normal, 0));
+  })().compute(on.receivers.capacity);
+  await renderer.computeAsync(seed); await renderer.computeAsync(on.snapshot); await renderer.computeAsync(sampleRecords);
+  const recorded = new Float32Array(await renderer.getArrayBufferAsync(recordOutput.value));
+  check('snapshot rejects invalid, black and moving receivers', records.every((_record, i) => recorded[i * 8 + 3] === (i === 0 || i === 7 ? 1 : 0)), [...recorded]);
+  check('snapshot preserves the ray-facing normal behind camera', recorded[6] === -1 && recorded[7 * 8 + 5] === -1, [recorded[6], recorded[7 * 8 + 5]]);
+  screenCount.value = 5;
+  await renderer.computeAsync(sampleRecords);
+  const resized = new Float32Array(await renderer.getArrayBufferAsync(recordOutput.value));
+  check('resize moves virtual indices without changing their world records', resized.every((v, i) => v === recorded[i]), resized[0]);
+
+  // Clearing a shorter/empty list must clear validity in every old tail slot.
+  const empty = T.Fn(() => { T.atomicStore(on.bins.scratch.element(T.uint(on.bins.hitListBase)), T.uint(0)); })().compute(1);
+  const validity = T.instancedArray(new Float32Array(on.receivers.capacity), 'float');
+  const sampleValidity = T.Fn(() => {
+    validity.element(T.instanceIndex).assign(T.select(on.receivers.readPixel(T.instanceIndex).valid, T.float(1), T.float(0)));
+  })().compute(on.receivers.capacity);
+  await renderer.computeAsync(empty); await renderer.computeAsync(on.snapshot); await renderer.computeAsync(sampleValidity);
+  const valid = new Float32Array(await renderer.getArrayBufferAsync(validity.value));
+  check('empty next-frame list retires every old receiver', valid.every((v) => v === 0), [...valid]);
+  check('no WebGPU validation errors', errors.length === 0, errors);
+  globalThis.__GI_SECONDARY_RECEIVERS_RESULT__ = { pass: results.every((r) => r.pass), results };
+  say(`SECONDARY-RECEIVERS ${globalThis.__GI_SECONDARY_RECEIVERS_RESULT__.pass ? 'PASS' : 'FAIL'}`);
+} catch (error) {
+  say(error.stack || String(error)); globalThis.__GI_SECONDARY_RECEIVERS_RESULT__ = { pass: false, error: String(error) };
+}
+</script></body></html>

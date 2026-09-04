@@ -54,6 +54,17 @@ export default class CharacterController extends Script {
   @attribute({ type: "number", default: 2.2, min: 0, step: 0.1, label: "Crouch Speed" })
   crouchSpeed = 2.2;
 
+  /**
+   * ON: a stick's deflection is a throttle — halfway pushed walks at half
+   * speed. OFF (the default): deflection aims only, and any push past the
+   * dead zone walks at full speed. Off keeps the on-screen joystick playable:
+   * a thumb drifting to half deflection mid-strafe otherwise slows the
+   * character AND its animation stride at the same time. WASD is unaffected
+   * either way — keys are already full-length.
+   */
+  @attribute({ type: "boolean", default: false, label: "Analog Speed" })
+  analogSpeed = false;
+
   @attribute({ type: "number", default: 5.2, min: 0, step: 0.1, label: "Jump Speed" })
   jumpSpeed = 5.2;
 
@@ -209,6 +220,14 @@ export default class CharacterController extends Script {
       z = rz * sx + fz * sz;
     }
     const length = Math.hypot(x, z);
+    // Generous, because the gamepad device has already zeroed each axis
+    // within 0.12 — a wobbly stick's diagonal can still read ~0.17.
+    if (length < 0.2) return { x: 0, z: 0 };
+    // Constant pace unless Analog Speed is on: the stick aims, it does not
+    // throttle. The animator is fed Speed (m/s), so normalizing here is also
+    // what keeps the stride from sagging toward idle as the thumb wanders
+    // back toward the centre of the stick.
+    if (!this.analogSpeed) return { x: x / length, z: z / length };
     if (length > 1) {
       x /= length;
       z /= length;
@@ -595,7 +614,14 @@ export default class CharacterCamera extends Script {
     const stick = scheme === "Gamepad" || scheme === "Touch";
     const rate = stick ? ((this.stickSpeed * Math.PI) / 180) * dt : this.sensitivity * 0.01;
     this.yaw -= look.x * rate;
-    this.pitch += (this.invertY ? look.y : -look.y) * rate;
+    // A mouse delta is screen-space — up is NEGATIVE y — so looking up takes
+    // -y. A stick (gamepad or the on-screen joystick) already reads "up = +1",
+    // the engine's convention for every vec2, and must NOT be flipped: the
+    // single flip that used to be here is what made pushing the touch look
+    // stick up point the camera DOWN, with Invert Y as the only way to see
+    // the sky. invertY negates whichever device is in hand.
+    const flip = this.invertY ? -1 : 1;
+    this.pitch += (stick ? look.y : -look.y) * flip * rate;
     const min = (this.minPitch * Math.PI) / 180;
     const max = (this.maxPitch * Math.PI) / 180;
     this.pitch = Math.max(min, Math.min(max, this.pitch));

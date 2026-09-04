@@ -92,10 +92,12 @@ import {
   instanceIndex,
   instancedArray,
   ivec2,
+  select,
   sin,
   texture,
   textureStore,
   uint,
+  uniform,
   vec2,
   vec3,
   vec4,
@@ -105,8 +107,11 @@ import {
   IRRADIANCE_TILE_INTERIOR,
   W0,
   binGridWidth,
+  centroidArmed,
+  confidenceArmed,
 } from "./srcConfig.js";
-import { binDirTable, tileCosineWeights } from "./srcMath.js";
+import { binCentroidTable, binDirTable, tileCosineWeights, tileDirTable } from "./srcMath.js";
+import { decodeCentroidOffset } from "./srcMathTsl.js";
 import { octahedralUV } from "./srcOctahedral.js";
 import { readPayload } from "./srcDeposit.js";
 
@@ -247,7 +252,22 @@ export function createSrcTileAtlas(store, bins, {
   const skyNode = sky ? vec3(sky) : vec3(0);
   // §16 S1 — c0's bin-direction LUT for the directional orphan composite
   // (Morton order — binDirTable's header). Bound only when armed.
+  // §11.28: also the bake's own bin-centre LUT — the direction a bin's
+  // cosine is spent at when it carries no centroid — and the direction of
+  // every bordered texel, so the correction can take `n̂ · û`.
+  const cenOn = centroidArmed();
   const skyDirTable = skyEnv ? instancedArray(binDirTable(w), "vec4") : null;
+  // §11.52 — the per-bin integrated sky for the orphan composite; see
+  // srcMerge [G.2] and srcSkyBins.js. Same fallback rule: `ready` selects.
+  const skyBinTable = skyEnv?.tables ? skyEnv.tables.tableFor(w) : null;
+  const cenTable = cenOn ? instancedArray(binCentroidTable(w), "vec4") : null;
+  const texDirTable = cenOn ? instancedArray(tileDirTable(interior, border), "vec4") : null;
+  /**
+   * §11.28 INSTRUMENT: the correction's live strength (1 = on, 0 = the
+   * previous bake, on the SAME field). A uniform so a rig can read a point
+   * both ways on one converged field; not a quality property.
+   */
+  const cenStrength = uniform(1);
 
   // ── §16 D3 — PROBE MATURITY (2026-08-24) ──────────────────────────────────
   //
@@ -331,6 +351,7 @@ export function createSrcTileAtlas(store, bins, {
     /** Σ cosine weight over the WHOLE lobe — see `cover` below. */
     const wsumAll = float(0).toVar();
     const known = uint(0).toVar();
+    const nrm = cenOn ? vec3(texDirTable.element(t).xyz).toVar() : null;
 
     // A dynamic loop rather than a JS unroll: `nBins` is 32 at the shipping w₀
     // and 128 on the ultra tier, and 128 unrolled call sites is a compile-time
@@ -379,10 +400,46 @@ export function createSrcTileAtlas(store, bins, {
               d.y,
               d.z.mul(crS).sub(d.x.mul(srS)),
             ).toVar();
-            SB.assign(vec3(skyEnv.node.sample(equirectUV(rdS)).level(0).xyz).mul(skyEnv.intensity));
+            const tapS = vec3(skyEnv.node.sample(equirectUV(rdS)).level(0).xyz).toVar();
+            if (skyBinTable) {
+              tapS.assign(select(
+                skyBinTable.ready.greaterThan(0.5),
+                vec3(skyBinTable.node.element(m).xyz),
+                tapS,
+              ));
+            }
+            SB.assign(tapS.mul(skyEnv.intensity));
           }
-          acc.addAssign(bin.L.add(SB.mul(T)).mul(cw));
-          wsum.addAssign(cw);
+          // §11.25: each bin votes by `cw · c` — its cosine weight times its
+          // confidence — so a freshly-hit bin FADES into the lobe average as
+          // its evidence accumulates instead of flipping the texel to a
+          // one-ray radiance the frame it crosses the membership threshold.
+          // `cover` below is `Σ cw·c / Σ cw`: the confidence-weighted fraction
+          // of the lobe, which is what "how much does this texel know" means.
+          const cc = confidenceArmed() ? bin.c.max(0) : float(1);
+          // ── §11.28: THE COSINE IS SPENT WHERE THE RADIANCE IS ──────────
+          //
+          // `cw` is the bin's MEAN clamped cosine over its (equal-area) solid
+          // angle — `binCosineWeights`, 0..1, the same units in both twins.
+          // The bin's radiance is not spread over the bin: the merge carried
+          // the OFFSET `o` of its luminance centroid from the bin's area
+          // centroid, and cosine is linear in direction, so for a bin inside
+          // the hemisphere the exact weight is `cw + n̂·o` — NO solid-angle
+          // factor (the first cut multiplied by Ω = 4π/32 and delivered 40 %
+          // of the correction; the in-situ A/B and the mirror's re-bake of a
+          // dumped probe agreed on 0.95 where 0.8 was due). The identity for
+          // a bin carrying no offset (a uniform field, the resolve's own
+          // bins); fades out on a grazing bin (`centroidBlend`'s rule, one
+          // definition for both twins) where the linear form is no longer
+          // exact. The denominator keeps `cw` — coverage is unchanged.
+          let wL = cw;
+          if (cenOn) {
+            const o = decodeCentroidOffset(bin.cen, vec3(cenTable.element(m).xyz));
+            const s = cw.div(0.25).clamp(0, 1).toVar();
+            wL = cw.add(nrm.dot(o).mul(s).mul(cenStrength)).max(0).toVar();
+          }
+          acc.addAssign(bin.L.add(SB.mul(T)).mul(wL.mul(cc)));
+          wsum.addAssign(cw.mul(cc));
           known.addAssign(uint(1));
         });
       });
@@ -630,6 +687,8 @@ export function createSrcTileAtlas(store, bins, {
     blocks,
     nBins,
     stats,
+    /** §11.28: the correction's live strength uniform (instrument; 1 = on). */
+    centroidStrength: cenStrength,
     /**
      * The GPU buffers that die with this bake. Lookup tables (`cosTable`,
      * `skyDirTable`) are uploaded once and never rewritten, so they belong
@@ -637,7 +696,7 @@ export function createSrcTileAtlas(store, bins, {
      * them again. Walked by releaseCompute's `collectStateStorageAttributes`.
      */
     get storageAttributes() {
-      return [cosTable, stats, skyDirTable].map((n) => n?.value).filter(Boolean);
+      return [cosTable, stats, skyDirTable, cenTable, texDirTable].map((n) => n?.value).filter(Boolean);
     },
     // Half float is 8 bytes a texel at RGBA.
     bytes: layout.width * layout.height * 8 + table.length * 4 + TS_WORDS * 4,

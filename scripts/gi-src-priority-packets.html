@@ -1,0 +1,114 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>SRC priority packet regression</title></head>
+<body><canvas id="view" width="16" height="16"></canvas><pre id="log"></pre><script type="module">
+const say = (line) => { console.log(line); document.querySelector('#log').textContent += `${line}\n`; };
+try {
+  const THREE = await import('three/webgpu');
+  const T = await import('three/tsl');
+  const P = await import('/src/modules/gi/srcProbes.js');
+  const R = await import('/src/modules/gi/srcRays.js');
+  const D = await import('/src/modules/gi/srcDeposit.js');
+  const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector('#view') });
+  await renderer.init();
+  const device = renderer.backend.device, errors = [];
+  device.addEventListener('uncapturederror', (event) => errors.push(event.error.message));
+  if (device.limits.maxStorageBuffersPerShaderStage !== 8) throw new Error('portable limit 8 required');
+  const CAPACITY = 64, RPP = 2;
+  const store = P.createSrcProbeStore({ c0Probes: 1024, blockCapacity: [1, 1, 1, 1] });
+  const rays = R.createSrcRayStore(store, { pixelCount: CAPACITY });
+  const bins = D.createSrcBinStore(store, { sunWords: false });
+  const pixelProbe = T.instancedArray(new Uint32Array(CAPACITY), 'uint');
+  const cap = T.uniform(32, 'uint');
+  const frame = R.createSrcRayFrame(store, rays, {
+    pixelProbe, raysPerPixel: RPP, cap,
+    priority: { ceiling: T.uniform(CAPACITY * RPP, 'uint'), frameStamp: T.uniform(1, 'uint') },
+  });
+  // Seed the state immediately before D5: its upstream allocator has granted
+  // one probe a contiguous range and reserved several packets for pixel 0.
+  // Ordinary pixels claim first; the representative must keep each remaining
+  // packet's own R2 index, including when the cap denies its final packets.
+  const claimOrdinary = frame.passes.at(-2), claimRepresentative = frame.passes.at(-1);
+  const visits = T.instancedArray(new Uint32Array(CAPACITY * RPP), 'uint').toAtomic();
+  const allocatedU = T.uniform(0, 'uint');
+  const clearVisits = T.Fn(() => {
+    T.atomicStore(visits.element(T.instanceIndex), T.uint(0));
+    T.If(T.instanceIndex.equal(0), () => { T.atomicStore(rays.rayTotal.element(0), allocatedU); });
+  })().compute(CAPACITY * RPP);
+  const trace = (origin, direction, reach, n) => {
+    T.atomicAdd(visits.element(n), T.uint(1));
+    return { hit: T.float(0), t: T.float(-1), position: T.vec3(0), exactPosition: T.vec3(0), normal: T.vec3(0, 1, 0) };
+  };
+  const deposit = D.createSrcDepositFrame(store, bins, {
+    pixelProbe, pixelRayBase: rays.pixelRayBase, rayWork: rays.rayWork, rayWorkPacked: true,
+    pixelCount: CAPACITY, raysPerPixel: RPP, trace,
+    readPixel: (i) => ({ position: T.vec3(i.toFloat().mul(0.01), 0, 0), valid: T.uint(1).equal(1) }),
+    readNormal: () => T.vec3(0, 1, 0), camera: T.vec3(0), spacing0: 0.35,
+    lmax: 16, jitterX: T.uniform(0), jitterY: T.uniform(0), keep: T.uniform(0),
+  });
+  const cases = [
+    { name: 'eight accepted packets retain distinct directions', requested: 8, ordinary: 0, granted: 16 },
+    { name: 'late denial preserves two earlier packets', requested: 8, ordinary: 0, granted: 4 },
+    { name: 'ordinary and representative share the probe range', requested: 8, ordinary: 2, granted: 12 },
+    { name: 'following frame retires the old packet ordinals', requested: 1, ordinary: 1, granted: 4 },
+  ];
+  const results = [];
+  for (const test of cases) {
+    // Use the real count reset while leaving previous worklist tail entries
+    // intact: the smaller next frame must not execute those stale ordinals.
+    await renderer.computeAsync(frame.passes[0]);
+    const table = store.probeTable.value.array; table.fill(0);
+    for (let p = 0; p < store.probeTotal; p++) {
+      table[p * P.PROBE_WORDS + P.PROBE_HASH] = P.SLOT_EMPTY;
+      table[p * P.PROBE_WORDS + P.PROBE_RAYOFF] = P.SLOT_EMPTY;
+      table[p * P.PROBE_WORDS + P.PROBE_PARENT] = P.SLOT_EMPTY;
+    }
+    for (let c = 0; c < store.cascades.length; c++) {
+      const p = store.cascades[c].probeBase, at = p * P.PROBE_WORDS;
+      table[at + P.PROBE_FLAGS] = P.FLAG_ALIVE;
+      table[at + P.PROBE_BLOCK] = 0;
+      table[at + P.PROBE_RAYS] = test.granted;
+      table[at + P.PROBE_RAYOFF] = 0;
+      if (c + 1 < store.cascades.length) table[at + P.PROBE_PARENT] = store.cascades[c + 1].probeBase;
+    }
+    table[P.PROBE_HASH] = test.requested << P.PRIORITY_REP_PIXEL_BITS;
+    store.probeTable.value.needsUpdate = true;
+    rays.rayCursor.value.array.fill(0); rays.rayCursor.value.needsUpdate = true;
+    rays.rayTotal.value.array.set([test.granted, 0]); rays.rayTotal.value.needsUpdate = true;
+    rays.pixelRayBase.value.array.fill(P.SLOT_EMPTY);
+    pixelProbe.value.array.fill(P.SLOT_EMPTY);
+    pixelProbe.value.array[0] = 0;
+    for (let pixel = 1; pixel <= test.ordinary; pixel++) {
+      pixelProbe.value.array[pixel] = 0;
+      rays.pixelRayBase.value.array[pixel] = 0; // D1 admission marker.
+    }
+    rays.pixelRayBase.value.needsUpdate = true; pixelProbe.value.needsUpdate = true;
+    cap.value = test.granted;
+    allocatedU.value = test.granted;
+    await renderer.computeAsync(claimOrdinary);
+    await renderer.computeAsync(claimRepresentative);
+    await renderer.computeAsync(clearVisits);
+    for (const pass of deposit.passes) await renderer.computeAsync(pass);
+    const [workData, baseData, visitData, stats, allocated] = await Promise.all([
+      renderer.getArrayBufferAsync(rays.rayWork.value), renderer.getArrayBufferAsync(rays.pixelRayBase.value),
+      renderer.getArrayBufferAsync(visits.value), deposit.readStats(renderer), frame.readTotal(renderer),
+    ]);
+    const work = new Uint32Array(workData), bases = new Uint32Array(baseData), fired = new Uint32Array(visitData);
+    const indices = [];
+    for (let i = 1; i <= work[0]; i++) {
+      const pixel = work[i] & P.PRIORITY_REP_PIXEL_MASK, ordinal = work[i] >>> P.PRIORITY_REP_PIXEL_BITS;
+      for (let ray = 0; ray < RPP; ray++) indices.push(bases[pixel] + ordinal * RPP + ray);
+    }
+    const unique = new Set(indices);
+    const exactVisits = fired.every((count, ray) => count === (ray < allocated ? 1 : 0));
+    const pass = allocated === test.granted && stats.rays === allocated && work[0] * RPP === allocated
+      && unique.size === allocated && indices.every((n) => n >= 0 && n < allocated) && exactVisits;
+    results.push({ name: test.name, pass, allocated, traced: stats.rays, packets: work[0], unique: unique.size });
+    say(`${pass ? 'PASS' : 'FAIL'} ${test.name}: allocated=${allocated}, traced=${stats.rays}, unique=${unique.size}`);
+  }
+  await device.queue.onSubmittedWorkDone();
+  globalThis.__GI_PRIORITY_PACKETS_RESULT__ = { pass: results.every((r) => r.pass) && !errors.length, results, errors };
+  say(`GI-PRIORITY-PACKETS ${globalThis.__GI_PRIORITY_PACKETS_RESULT__.pass ? 'PASS' : 'FAIL'}`);
+} catch (error) {
+  globalThis.__GI_PRIORITY_PACKETS_RESULT__ = { pass: false, error: error.stack || String(error) };
+  say(`GI-PRIORITY-PACKETS FAIL ${error.stack || error}`);
+}
+</script></body></html>

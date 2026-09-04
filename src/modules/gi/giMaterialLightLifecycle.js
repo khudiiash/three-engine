@@ -12,6 +12,8 @@ const REF_FIELDS = [
   "giRadianceNode",
   "giPositionNode",
   "giScreenTexel",
+  "giAoNode",
+  "giAoActiveU",
   "giViewProj",
   "giNestedView",
   "giEmitterShadowTexel",

@@ -13,8 +13,10 @@ import {
  * User-rebindable editor actions. Each entry's `default` is the chord
  * shipped out-of-the-box; the project-settings store may override it
  * per-project. The dispatcher below knows which ones flip visibility —
- * non-rebindable shortcuts (Ctrl+S, Ctrl+O, Ctrl+P, etc.) intentionally
- * stay in EditorChrome.
+ * `editor.screenshot` is read with `getBinding` by EditorChrome instead,
+ * which dynamic-imports its runner so the capture machinery stays out of
+ * the boot chunk. Non-rebindable shortcuts (Ctrl+S, Ctrl+O, Ctrl+P,
+ * etc.) intentionally stay in EditorChrome.
  *
  * Chord grammar: "Ctrl+S", "Shift+H", "E", "Ctrl+Alt+K", "Cmd+Z" (Cmd
  * is an alias for Meta). Parsing/validation lives in `parseChord` and
@@ -43,6 +45,10 @@ export const KEY_BINDING_ACTIONS = {
   "game.toggleUnselected": {
     label: "Toggle all unselected (game)",
     default: "Shift+E",
+  },
+  "editor.screenshot": {
+    label: "Screenshot viewport",
+    default: "Shift+Alt+S",
   },
 };
 
@@ -135,14 +141,37 @@ export function normalizeChord(combo) {
 }
 
 /**
+ * The key token a KeyboardEvent should be matched or captured as. A plain
+ * alphanumeric `key` passes through; anything else falls back to the
+ * PHYSICAL key from `event.code` when that is a letter or digit.
+ *
+ * The fallback is what makes Alt-chords work at all on macOS: Option+Shift+S
+ * reports `key` "Í" (a layout-dependent composed character) but `code`
+ * "KeyS", so reading the code is what keeps the chord both captured and
+ * matched as "Shift+Alt+S" — and what lets a binding recorded on one layout
+ * fire on another. Everything else (named keys, punctuation) keeps `key`.
+ */
+export function keyTokenFromEvent(event) {
+  const key = (event.key || "").toLowerCase();
+  if (key.length === 1 && /[a-z0-9]/.test(key)) return key;
+  const code = event.code ?? "";
+  const letter = /^Key([A-Z])$/.exec(code);
+  if (letter) return letter[1].toLowerCase();
+  const digit = /^Digit(\d)$/.exec(code);
+  if (digit) return digit[1];
+  return key;
+}
+
+/**
  * True when `event` matches the supplied chord exactly — modifiers
- * compared as booleans (no folding), key compared case-insensitively,
- * auto-repeat rejected.
+ * compared as booleans (no folding), key compared case-insensitively
+ * through `keyTokenFromEvent` (so macOS Option chords match), auto-repeat
+ * rejected.
  */
 export function chordMatches(event, chord) {
   const parsed = parseChord(chord);
   if (!parsed || event.repeat) return false;
-  const key = (event.key || "").toLowerCase();
+  const key = keyTokenFromEvent(event);
   return (
     parsed.ctrl === !!event.ctrlKey &&
     parsed.meta === !!event.metaKey &&

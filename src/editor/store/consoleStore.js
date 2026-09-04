@@ -5,6 +5,8 @@ import { vmSingleton } from "../singleton.js";
 // counter would hand React duplicate keys for entries in one shared list.
 const ids = vmSingleton("consoleStoreIds", () => ({ next: 1 }));
 const MAX_ENTRIES = 500;
+/** How far back an identical message folds into its earlier entry. */
+const REPEAT_WINDOW = 48;
 
 export const useConsoleStore = vmSingleton("consoleStore", () => create((set) => ({
   entries: [],
@@ -16,6 +18,24 @@ export const useConsoleStore = vmSingleton("consoleStore", () => create((set) =>
 
   push(level, message) {
     set((state) => {
+      // A REPEAT COLLAPSES INTO ITS FIRST OCCURRENCE (2026-09-05). A WebGPU
+      // fault logs "invalid due to a PREVIOUS error" for every dispatch that
+      // touches the broken binding — ~700 lines a second across a few
+      // alternating texts — and the one line that named the previous error
+      // was pushed out of this 500-entry ring within a second of appearing.
+      // Bumping a count on the recent identical entry keeps the ring for the
+      // messages that differ, which is what a reader is looking for.
+      const recent = state.entries;
+      for (let i = recent.length - 1, stop = Math.max(0, recent.length - REPEAT_WINDOW); i >= stop; i--) {
+        const prior = recent[i];
+        if (prior.level !== level || prior.message !== message) continue;
+        const entries = recent.slice();
+        entries[i] = { ...prior, count: (prior.count ?? 1) + 1, time: new Date() };
+        return {
+          entries,
+          unreadErrors: level === "error" ? state.unreadErrors + 1 : state.unreadErrors,
+        };
+      }
       const entries = [...state.entries, { id: ids.next++, level, message, time: new Date() }];
       if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES);
       return {

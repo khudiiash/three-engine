@@ -17,6 +17,8 @@
 import {
   COLD_FILL_FRAMES,
   INFLUX_ONE,
+  INPAINT_DISCOUNT,
+  INPAINT_LOW,
   KEY_MAX_LODS,
   SUM_SCALE,
   SURPRISE_FLOOR,
@@ -26,6 +28,9 @@ import {
   SURPRISE_SHOT_K,
   SURPRISE_T0,
   SURPRISE_T1,
+  confidenceArmed,
+  confidenceFullRays,
+  confidencePriorRays,
 } from "./srcConfig.js";
 
 // ═══════════════════════════════════════════════ EQUAL-AREA CYLINDRICAL BINS
@@ -90,6 +95,169 @@ export function dirToBin(dx, dy, dz, w) {
 export function binDir(i, j, w) {
   const { x, y } = binCenterXY(i, j, w);
   return decodeDir(x, y);
+}
+
+// ═══════════════════════════════════════ §11.28 THE RADIANCE CENTROID
+//
+// A bin's payload carries, in its spare half, the OFFSET of the luminance-
+// weighted mean direction of its radiance from the bin's area centroid —
+// two signed bytes in the bin's tangent frame. An offset, not a direction,
+// for one reason that the first cut learned from the furnace gate: the merge
+// averages children with confidence weights, and the weighted mean of four
+// unit directions cannot equal any fixed reference — so a UNIFORM field
+// carried a spurious few-degree "centroid" that a grazing bin turned into a
+// 9× texel. An offset is linear: the weighted mean of zero offsets is zero,
+// at every level, for any weights. The resolve writes code 0 (no sub-bin
+// information = zero offset); the merge carries the children's offsets down.
+// The TSL twins in `srcMathTsl.js` are these functions step for step.
+
+export const CENTROID_NONE = 0;
+
+/**
+ * The tangent frame at a bin's area centroid `c`: `e1 = normalize(a × c)`,
+ * `e2 = c × e1`, with the helper axis `a` the world axis least aligned with
+ * `c` (z unless |c.z| > 0.9, then x) — the same branch in both twins.
+ */
+export function binFrame(cIn) {
+  const cl = Math.hypot(cIn[0], cIn[1], cIn[2]) || 1;
+  const c = [cIn[0] / cl, cIn[1] / cl, cIn[2] / cl];
+  const useX = Math.abs(c[2]) > 0.9;
+  const ax = useX ? 1 : 0;
+  const az = useX ? 0 : 1;
+  // e1 = a × c
+  let e1x = 0 * c[2] - az * c[1];
+  let e1y = az * c[0] - ax * c[2];
+  let e1z = ax * c[1] - 0 * c[0];
+  const l = Math.hypot(e1x, e1y, e1z) || 1;
+  e1x /= l; e1y /= l; e1z /= l;
+  // e2 = c × e1
+  const e2x = c[1] * e1z - c[2] * e1y;
+  const e2y = c[2] * e1x - c[0] * e1z;
+  const e2z = c[0] * e1y - c[1] * e1x;
+  return { e1: [e1x, e1y, e1z], e2: [e2x, e2y, e2z] };
+}
+
+/**
+ * World offset `o` → 16-bit code in the frame of area centroid `c`: two
+ * signed bytes (±127 over ±1), stored +128 so a zero offset is 0x8080 and the
+ * resolve's 0 also reads as zero. The component along `c` is dropped.
+ */
+export function encodeCentroidOffset(o, c) {
+  const { e1, e2 } = binFrame(c);
+  const a = o[0] * e1[0] + o[1] * e1[1] + o[2] * e1[2];
+  const b = o[0] * e2[0] + o[1] * e2[1] + o[2] * e2[2];
+  const qa = Math.floor(Math.min(1, Math.max(-1, a)) * 127 + 0.5) + 128;
+  const qb = Math.floor(Math.min(1, Math.max(-1, b)) * 127 + 0.5) + 128;
+  return (qa | (qb << 8)) >>> 0;
+}
+
+/** 16-bit code → world offset (a zero vector for code 0 and for 0x8080). */
+export function decodeCentroidOffset(code, c) {
+  if (code === 0) return [0, 0, 0];
+  const a = ((code & 0xff) - 128) / 127;
+  const b = (((code >>> 8) & 0xff) - 128) / 127;
+  const { e1, e2 } = binFrame(c);
+  return [e1[0] * a + e2[0] * b, e1[1] * a + e2[1] * b, e1[2] * a + e2[2] * b];
+}
+
+/** Rec. 709 luminance of an `[r, g, b]` radiance. */
+export function luminanceOf(L) {
+  return 0.2126 * L[0] + 0.7152 * L[1] + 0.0722 * L[2];
+}
+
+const areaCentroidCache = new Map();
+
+/**
+ * A bin's AREA CENTROID: the normalised mean direction over the bin's solid
+ * angle (8×8 sub-samples of the equal-area cell). This — not `binDir`, the
+ * cell's centre — is the direction a bin with NO sub-bin information falls
+ * back to, in the merge's moment and in the bake's correction alike, because
+ * it is what the merge's luminance-weighted mean of four uniform children
+ * converges to: with the centre as the reference, a uniform field carried a
+ * spurious few-degree correction that a grazing bin (cosine mass ≪ Ω) turned
+ * into a 9× texel. §11.28.
+ */
+export function binAreaCentroid(i, j, w) {
+  const m = binAreaMean(i, j, w);
+  const len = Math.hypot(m[0], m[1], m[2]) || 1;
+  return [m[0] / len, m[1] / len, m[2] / len];
+}
+
+/**
+ * A bin's area MEAN VECTOR — the unnormalised mean of the unit directions
+ * over its solid angle (length < 1; shorter for a wider bin). This is the
+ * quantity the moments are linear in: a parent's mean vector is exactly the
+ * mean of its four equal-area children's, which is what makes "uniform
+ * radiance → zero offset" exact at every level of the recursion.
+ */
+export function binAreaMean(i, j, w) {
+  const key = `${w}|${i}|${j}`;
+  const hit = areaCentroidCache.get(key);
+  if (hit) return hit;
+  const sub = 8;
+  let sx = 0;
+  let sy = 0;
+  let sz = 0;
+  for (let b = 0; b < sub; b++) {
+    for (let a = 0; a < sub; a++) {
+      const d = decodeDir((i + (a + 0.5) / sub) / (2 * w), (j + (b + 0.5) / sub) / w);
+      sx += d[0];
+      sy += d[1];
+      sz += d[2];
+    }
+  }
+  const inv = 1 / (sub * sub);
+  const out = [sx * inv, sy * inv, sz * inv];
+  areaCentroidCache.set(key, out);
+  return out;
+}
+
+/**
+ * `binAreaMean` for every bin of width `w`, Morton order, as a vec4 table —
+ * the merge's per-child centre and the frame's axis (normalised there).
+ */
+export function binCentroidTable(w) {
+  const nBins = 2 * w * w;
+  const table = new Float32Array(nBins * 4);
+  for (let m = 0; m < nBins; m++) {
+    const { i, j } = binUnmorton(m);
+    const d = binAreaMean(i, j, w);
+    table[m * 4] = d[0];
+    table[m * 4 + 1] = d[1];
+    table[m * 4 + 2] = d[2];
+  }
+  return table;
+}
+
+/**
+ * The share of the §11.28 correction a bin takes, from its MEAN clamped
+ * cosine `cw` (`binCosineWeights` — 0..1, NOT a solid-angle mass): full for
+ * a bin facing the texel, fading to nothing as the bin grazes the horizon
+ * (`cw < 0.25`), where the linear form is no longer exact and a step of
+ * quantisation would otherwise be a multiple of the bin's own weight. One
+ * definition for both twins.
+ */
+export function centroidBlend(cw) {
+  return Math.min(1, Math.max(0, cw / 0.25));
+}
+
+/**
+ * The unit direction of every texel of a BORDERED octahedral tile (border
+ * texels carry their wrapped interior texel's direction — the same map
+ * `tileCosineWeights` reads), as a vec4 table for the bake. §11.28.
+ */
+export function tileDirTable(interior, border = 1) {
+  const size = interior + 2 * border;
+  const map = octahedralBorderMap(interior, border);
+  const out = new Float32Array(size * size * 4);
+  for (let t = 0; t < size * size; t++) {
+    const src = map[t];
+    const d = octahedralDirection(src % interior, Math.floor(src / interior), interior);
+    out[t * 4] = d[0];
+    out[t * 4 + 1] = d[1];
+    out[t * 4 + 2] = d[2];
+  }
+  return out;
 }
 
 /**
@@ -607,6 +775,28 @@ export function gatherPlaneDepth() {
 }
 
 /**
+ * §11.51 (2026-09-05) — THE PLANE WEIGHT'S FLOOR, i.e. what a corner BEHIND
+ * the shaded surface still gets to say. Default 0.2; 0 is the pre-§11.51
+ * deletion (1e-3), which is what the user's "dark bands on the walls" was.
+ *
+ * ⚠ THE DEPTH DIAL CANNOT REACH THIS. `gatherPlaneDepth` enters as
+ * `min(0.35·s, depth)` — at c0 that is 12 cm no matter how large the dial is
+ * — while a cube corner sits up to `s·√3` = 61 cm behind the plane. So every
+ * behind-plane corner lands ON the floor, and the floor alone decides whether
+ * the weight is a preference or a deletion. Sweeping the depth measured
+ * nothing (0.15 / 1e6 / 0.03 / 0.15, live, no rebuild: top-strip ratio
+ * .649 → .661, a convergence drift) which is exactly what that algebra
+ * predicts; sweeping the FLOOR is the experiment that moves.
+ *
+ * ONE reader for both twins — `srcRef.js`'s CPU mirror and the GPU gather must
+ * agree or `test:gi-src-gather` calls an armed default a regression.
+ */
+export function gatherPlaneFloor() {
+  const v = Number(globalThis.__giGatherPlaneFloor);
+  return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.2;
+}
+
+/**
  * THE OCCUPANCY SHOULDER both LOS marches read through (2026-08-23).
  *
  * `occupancyAtWorld` returns TRILINEARLY FILTERED coverage, which is what
@@ -1108,10 +1298,26 @@ export function influxWordFor(capped, natural) {
  * cliff at the edge of every sparsely-sampled region. Returns null for
  * unknown so callers cannot accidentally treat it as data.
  */
+/**
+ * The confidence of a bin fed `n` rays of (decayed) evidence — ONE definition
+ * for both twins (srcDeposit's resolve is this, step for step, in f32):
+ * `c = N/(N+K)` (§11.25), its prior share collapsing as `e^{−N/F}` (§11.29).
+ */
+export function confidenceOf(n) {
+  const K = confidencePriorRays();
+  const F = confidenceFullRays();
+  const base = n / (n + K);
+  return F > 0 ? 1 - (1 - base) * Math.exp(-n / F) : base;
+}
+
 export function resolveBin(sumR, sumG, sumB, sumT, count) {
   if (!(count > 0)) return null;
   const inv = 1 / count;
-  return { radiance: [sumR * inv, sumG * inv, sumB * inv], transmittance: sumT * inv };
+  // §11.25 — CONFIDENCE, the CPU twin of srcDeposit's resolve: `count` here
+  // is in RAYS (one per deposit), the GPU's is `rays × DEPOSIT_SCALE`; both
+  // give `confidenceOf(N)`. `__giSrcConfidence = false` pins 1 — the old estimator.
+  const confidence = confidenceArmed() ? confidenceOf(count) : 1;
+  return { radiance: [sumR * inv, sumG * inv, sumB * inv], transmittance: sumT * inv, confidence };
 }
 
 /**
@@ -1123,23 +1329,109 @@ export function resolveBin(sumR, sumG, sumB, sumT, count) {
  * found — the same "rejection weights are epsilons, never zeros" rule the
  * sparse-trilinear gather runs under. All four unknown → unknown.
  */
-export function preAverage(children) {
+/**
+ * §11.27 — the CPU twin of srcMerge's inpaint pass, on one probe's merged bin
+ * array (`values[m]` = `{ radiance, transmittance, confidence }` or null, in
+ * Morton order at grid width `w`). Returns a NEW array; sources are read from
+ * the input only, exactly as the GPU reads only bins no thread writes.
+ */
+export function inpaintBins(values, w, low = INPAINT_LOW, discount = INPAINT_DISCOUNT) {
+  const n = values.length;
+  const out = values.slice();
+  const confOf = (v) => (v ? (v.confidence ?? 1) : 0);
+  for (let m = 0; m < n; m++) {
+    const own = values[m];
+    const c = confOf(own);
+    if (c >= low) continue;
+    const { i, j } = binUnmorton(m);
+    let r = 0, g = 0, b = 0, t = 0, cs = 0, ws = 0;
+    for (let dj = -1; dj <= 1; dj++) {
+      const jj = j + dj;
+      if (jj < 0 || jj >= w) continue;
+      for (let di = -1; di <= 1; di++) {
+        if (di === 0 && dj === 0) continue;
+        const ii = (i + di + 2 * w) % (2 * w);
+        const nb = values[binMorton(ii, jj)];
+        const cn = confOf(nb);
+        if (!nb || cn < low) continue;
+        const wt = cn * (di !== 0 && dj !== 0 ? 0.5 : 1);
+        r += nb.radiance[0] * wt; g += nb.radiance[1] * wt; b += nb.radiance[2] * wt;
+        t += nb.transmittance * wt; cs += cn * wt; ws += wt;
+      }
+    }
+    if (!(ws > 0)) continue;
+    const nr = r / ws, ng = g / ws, nbv = b / ws, nt = t / ws, nc = cs / ws;
+    const k = own ? c / low : 0;
+    out[m] = {
+      radiance: own ? [own.radiance[0] * k + nr * (1 - k), own.radiance[1] * k + ng * (1 - k), own.radiance[2] * k + nbv * (1 - k)] : [nr, ng, nbv],
+      transmittance: own ? own.transmittance * k + nt * (1 - k) : nt,
+      confidence: Math.max(c, nc * discount),
+      offset: own?.offset,
+    };
+  }
+  return out;
+}
+
+export function preAverage(children, centres = null) {
   let n = 0;
+  let wsum = 0;
+  let csum = 0;
   let r = 0;
   let g = 0;
   let b = 0;
   let t = 0;
-  for (const c of children) {
+  let mx = 0;
+  let my = 0;
+  let mz = 0;
+  let rx = 0;
+  let ry = 0;
+  let rz = 0;
+  let lumSum = 0;
+  // §11.25: children vote by CONFIDENCE (a fixture without one votes at 1).
+  // Mirrors srcMerge's 4→1 exactly: weight `max(c, 1e-4)`, corner confidence
+  // = mean `c` over the children that exist.
+  const armed = confidenceArmed();
+  for (let k = 0; k < children.length; k++) {
+    const c = children[k];
     if (!c) continue;
-    r += c.radiance[0];
-    g += c.radiance[1];
-    b += c.radiance[2];
-    t += c.transmittance;
+    const cj = armed ? Math.max(c.confidence ?? 1, 1e-4) : 1;
+    r += c.radiance[0] * cj;
+    g += c.radiance[1] * cj;
+    b += c.radiance[2] * cj;
+    t += c.transmittance * cj;
+    wsum += cj;
+    csum += armed ? (c.confidence ?? 1) : 1;
     n++;
+    // §11.28: the two moments srcMerge's corner loop keeps — `pO`, the
+    // luminance-and-vote-weighted sum of each child's centre-plus-offset
+    // (where the radiance sits), and `pR`, the vote-weighted sum of the
+    // centres alone (where a uniform radiance would sit). `centres` are the
+    // children's area MEAN vectors (unnormalised — linear in area).
+    if (centres) {
+      const o = c.offset ?? [0, 0, 0];
+      const lum = Math.max(0, luminanceOf(c.radiance));
+      const lw = lum * cj;
+      lumSum += lw;
+      mx += (centres[k][0] + o[0]) * lw;
+      my += (centres[k][1] + o[1]) * lw;
+      mz += (centres[k][2] + o[2]) * lw;
+      rx += centres[k][0] * cj;
+      ry += centres[k][1] * cj;
+      rz += centres[k][2] * cj;
+    }
   }
   if (n === 0) return null;
-  const inv = 1 / n;
-  return { radiance: [r * inv, g * inv, b * inv], transmittance: t * inv };
+  const inv = 1 / wsum;
+  const out = { radiance: [r * inv, g * inv, b * inv], transmittance: t * inv, confidence: csum / n };
+  // The corner's luminance-weighted OFFSET: `pO·inv − lum·(pR·inv)`, i.e.
+  // where the radiance sits minus where a uniform radiance of the same
+  // (confidence-averaged) luminance would sit — exactly zero for a uniform
+  // field under any weights, which the furnace gate enforces.
+  if (centres) {
+    const lumMean = lumSum * inv;
+    out.o = [mx * inv - lumMean * rx * inv, my * inv - lumMean * ry * inv, mz * inv - lumMean * rz * inv];
+  }
+  return out;
 }
 
 // ══════════════════════════════════════════════════ SPARSE TRILINEAR GATHER

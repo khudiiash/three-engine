@@ -47,7 +47,7 @@
 // bugs with different fixes. Pin `a0.2` to collapse the temporal constant and
 // see the plateau directly.
 import puppeteer from "puppeteer-core";
-import { LOBE_POINTS, SKY_POINTS, irradianceAt, PROBE_POINTS } from "./gi-sun-bounce-ref.mjs";
+import { LOBE_POINTS, SKY_POINTS, irradianceAt, PROBE_POINTS, loadHdrSky } from "./gi-sun-bounce-ref.mjs";
 
 const BASE = process.env.RIG_URL ?? "http://localhost:5231/scripts/gi-sun-bounce.html";
 const SETTLE = process.env.SETTLE ?? "60";
@@ -80,6 +80,12 @@ const lobeTruthOpen = wantsLobe
   ? LOBE_POINTS.map((p) => irradianceAt(p.P, p.n, { withShadow: false }))
   : null;
 const skyTruth = wantsOcc ? SKY_POINTS.map((p) => irradianceAt(p.P, p.n)) : null;
+// §11.28 HDRI arm: the same ladder under the user's sunset HDRI at intensity
+// 0.5 (the rig serves scripts/.gi-fixtures/industrial-sunset-2k.hdr).
+const wantsHdri = specs.some((sp) => sp.split(":").includes("hdri"));
+const hdrSky = wantsHdri ? loadHdrSky("scripts/.gi-fixtures/industrial-sunset-2k.hdr", 0.5) : null;
+const skyTruthHdri = wantsHdri ? SKY_POINTS.map((p) => irradianceAt(p.P, p.n, { skyL: hdrSky })) : null;
+if (hdrSky) console.log(`HDRI ${hdrSky.size.join("x")}: analytic E on an up-facing open point ${hdrSky.irradianceUp.toFixed(4)} (x0.5 applied)`);
 
 const pad = (s, w) => String(s).padEnd(w);
 let failures = 0;
@@ -89,6 +95,17 @@ for (const spec of specs) {
   const q = tags.find((t) => /^(low|medium|high|ultra)$/.test(t));
   const a = tags.find((t) => /^a[\d.]+$/.test(t));
   const cap = tags.find((t) => /^cap\d+$/.test(t));
+  const r0 = tags.find((t) => /^r0[\d.]+$/.test(t));
+  const noCen = tags.includes("nocen");
+  const noConf = tags.includes("noconf");
+  const isHdri = tags.includes("hdri");
+  // The truth this arm is read against: the HDRI ladder under the HDRI; a
+  // no-bounce arm (`nosec`) against the sky seen DIRECTLY, since its hits are
+  // black by construction.
+  const truthRow = (i) => {
+    const t = (isHdri ? skyTruthHdri : skyTruth)[i];
+    return arm === "nosec" ? t.skyDirect : t.sky;
+  };
   const isPlane = arm === "plane";
   // `occ` implies `sky`: the ladder measures how much of an AMBIENT source each
   // point can see, and with the sun arm there is no ambient source to occlude.
@@ -102,6 +119,10 @@ for (const spec of specs) {
     (q ? `&quality=${q}` : "") +
     (a ? `&alpha=${a.slice(1)}` : "") +
     (cap ? `&cap=${cap.slice(3)}` : "") +
+    (r0 ? `&r0=${r0.slice(2)}` : "") +
+    (noCen ? "&nocen=1" : "") +
+    (noConf ? "&noconf=1" : "") +
+    (isHdri ? "&hdri=1&sky=1&points=sky" : "") +
     (WALL_T ? `&thick=${WALL_T}` : "");
 
   const browser = await puppeteer.launch({
@@ -133,19 +154,45 @@ for (const spec of specs) {
   const isSky = tags.includes("sky");
   const isOpen = arm === "noshadow";
   console.log(`\n═══ ${out.arm} ═══  ${JSON.stringify(out.stats)}`);
+  if (out.centroid) console.log(`centroid offsets: ${out.centroid.map((x) => `c${x.c} ${x.nonZero}/${x.known} |o| ${x.meanAbs}`).join("   ")}`);
+  if (out.centroidError) console.log(`centroid: ERROR ${out.centroidError}`);
+  if (out.centroidT) console.log(`T>0 after merge: ${out.centroidT.map((x) => `c${x.c} ${x.tPositive}/${x.known}`).join("   ")}`);
+  if (out.chainError) console.log(`chain: ERROR ${out.chainError.slice(0, 300)}`);
+  if (out.chain) {
+    console.log("wall-low c0 corners (bins facing +x): m up cos L T c n·o | parent children [up L c n·o]");
+    for (const cr of out.chain) {
+      if (cr.missing || cr.noBlock) { console.log(`  corner ${cr.corner} w ${cr.w}: ${cr.missing ? "MISSING" : "no block"}`); continue; }
+      console.log(`  corner ${cr.corner} w ${cr.w} block ${cr.block}`);
+      if (cr.binsAll && cr.w > 0.5) console.log(`  BINSALL ${JSON.stringify(cr.binsAll)}`);
+      cr.bins.forEach((b, bi) => {
+        const kids = cr.parentBins?.[bi];
+        console.log(`    ${String(b.m).padStart(2)} up ${String(b.up).padStart(5)} cos ${b.cos} L ${b.L} T ${b.T} c ${b.c} n·o ${String(b.no).padStart(6)}` +
+          (kids ? ` | ${kids.map((k) => k ? `[${k.up} ${k.L} ${k.c} ${k.no}]` : "[-]").join(" ")}` : ""));
+      });
+    }
+  }
+  if (out.pointsNoCen) {
+    console.log("same field, centroid correction OFF (strength 0):");
+    out.pointsNoCen.forEach((p, i) => {
+      const on = out.points.at(-1)?.E?.[i]?.lum;
+      console.log(`  ${pad(p.name, 26)} off ${pad(p.lum, 9)} on ${pad(on ?? "-", 9)} on/off ${on != null && p.lum > 0 ? (on / p.lum).toFixed(3) : "-"}`);
+    });
+  }
+  if (out.stats?.mergeCascades) console.log(`merge per cascade: ${JSON.stringify(out.stats.mergeCascades)}`);
   console.log(`frames: ${out.points.map((m) => `${m.t}s=${m.frames}`).join("  ")}`);
   console.log(pad("point", 26) + pad("truth", 9) +
     out.points.map((m) => pad(`t=${m.t}s`, 9)).join("") + "ratio");
   // The calibration scene's truth is analytic and needs no path trace: a flat
   // unoccluded surface under a uniform sky of radiance L receives exactly pi*L.
   const rows = isPlane ? [{ name: "open ground (E = pi*L)" }]
-    : isOcc ? SKY_POINTS : isLobe ? LOBE_POINTS : PROBE_POINTS;
+    : (isOcc || isHdri) ? SKY_POINTS : isLobe ? LOBE_POINTS : PROBE_POINTS;
   rows.forEach((p, i) => {
     const t = isPlane ? Math.PI * 0.1
-      : isOcc ? skyTruth[i].sky
+      : (isOcc || isHdri) ? truthRow(i)
         : isLobe ? (isOpen ? lobeTruthOpen[i].sun : lobeTruth[i].sun)
           : isSky ? truth[i].shadowed.sky : (isOpen ? truth[i].open.sun : truth[i].shadowed.sun);
-    const last = out.points.at(-1)?.E?.[i]?.lum;
+    const lastE = out.points.at(-1)?.E?.[i];
+    const last = lastE?.lum;
     console.log(
       pad(p.name, 26) + pad(t.toFixed(4), 9) +
       out.points.map((m) => pad(m.E?.[i]?.lum ?? "-", 9)).join("") +
@@ -153,7 +200,10 @@ for (const spec of specs) {
       // The ground-truth AO factor beside the ratio, because the ratio is only
       // readable AGAINST it: 1.05x at V=0.95 is noise, 1.05x at V=0.08 is the
       // cascade putting an order of magnitude too much light in a corner.
-      (isOcc ? `   V ${skyTruth[i].escape.toFixed(3)}` : ""),
+      ((isOcc || isHdri) ? `   V ${(isHdri ? skyTruthHdri : skyTruth)[i].escape.toFixed(3)}` : "") +
+      // §11.28: the lobe share the probes sampled at this point, and the
+      // corners that existed/voted — per point, where `knownFrac` is blind.
+      (lastE?.cov != null ? `   cov ${lastE.cov.toFixed(3)} (${lastE.covered}/${lastE.corners})` : ""),
     );
   });
   if (isLobe) {
@@ -188,7 +238,7 @@ for (const spec of specs) {
           "  what a non-random known-bin subset looks like once you can see per-direction.");
     }
   }
-  if (isOcc) {
+  if (isOcc || isHdri) {
     // ⭐ THE SHAPE IS THE VERDICT, NOT ANY ONE RATIO. A gain error is flat in V
     // and cancels here; a transport/occlusion error is not, so print the trend
     // explicitly rather than leaving it to be eyeballed off six rows.
@@ -204,7 +254,7 @@ for (const spec of specs) {
       const e = out.points.at(-1)?.E?.[i]?.lum;
       if (e == null) return null;
       if (!(Number(e) > 0)) { dead.push(p.name); return null; }
-      return { v: skyTruth[i].escape, r: e / skyTruth[i].sky };
+      return { v: (isHdri ? skyTruthHdri : skyTruth)[i].escape, r: e / truthRow(i) };
     }).filter(Boolean);
     if (dead.length) {
       console.log(`

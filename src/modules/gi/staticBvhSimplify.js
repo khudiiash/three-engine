@@ -85,9 +85,27 @@ function triangleCountOf(positions, index) {
  * the simplifier is ready and the mesh qualifies, otherwise `index` itself.
  * `stats` (optional) accumulates { meshes, before, after, skippedNotReady }.
  */
+/**
+ * §11.38 — the live dials for the simplification A/B: `__giBvhSimplifyError`
+ * (metres of absolute error; the shipped 0.01) and `__giBvhSimplifyRatio`
+ * (the triangle floor as a fraction; the shipped 0.25). Read at build time;
+ * a GI rebuild re-simplifies (the cache keys on both), the disk artifact is
+ * keyed on the resulting index. The question they answer: the emitter
+ * marches cost ~165 ns each through the 1.62 M-triangle BVH8 — how much of
+ * that is triangle count.
+ */
+export function staticBvhSimplifyError() {
+  const v = Number(globalThis.__giBvhSimplifyError);
+  return Number.isFinite(v) && v > 0 ? v : STATIC_BVH_SIMPLIFY_ERROR_M;
+}
+export function staticBvhSimplifyRatio() {
+  const v = Number(globalThis.__giBvhSimplifyRatio);
+  return Number.isFinite(v) && v > 0 && v <= 1 ? v : STATIC_BVH_SIMPLIFY_RATIO;
+}
+
 export function simplifyStaticBvhIndex(geometryKey, positions, index, {
-  targetError = STATIC_BVH_SIMPLIFY_ERROR_M,
-  ratio = STATIC_BVH_SIMPLIFY_RATIO,
+  targetError = staticBvhSimplifyError(),
+  ratio = staticBvhSimplifyRatio(),
   minTriangles = STATIC_BVH_SIMPLIFY_MIN_TRIANGLES,
   stats = null,
 } = {}) {

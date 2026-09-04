@@ -306,6 +306,20 @@
             }
           }
           D.encodePayload(payloadArray, bins.payload.value.array);
+          // §11.28: the centroid OFFSET rides word 2's high half. `encodePayload`
+          // leaves it zero; a fill that returns `offset` gets its code OR'd in,
+          // so the bake reads exactly what the mirror's `value.offset` says.
+          for (const [key, block] of keyToBlock) {
+            for (let m = 0; m < NBINS; m++) {
+              const v = fill(key, m, block);
+              if (!v || !v.offset) continue;
+              const bin = refMath.mortonToBin(m);
+              const centre = refMath.binAreaMean(bin.i, bin.j, W);
+              const slot = (info.binBase + block * NBINS + m) * D.PAYLOAD_WORDS + 2;
+              bins.payload.value.array[slot] = (bins.payload.value.array[slot]
+                | (refMath.encodeCentroidOffset(v.offset, centre) << 16)) >>> 0;
+            }
+          }
           bins.payload.value.needsUpdate = true;
         };
         const bake = async () => {
@@ -353,6 +367,24 @@
             const bin = refMath.mortonToBin(m);
             if (refMath.binDir(bin.i, bin.j, W)[2] < 0.5) return null;
           }
+          // §11.28: half the bins carry a centroid offset — a deterministic
+          // tangent-plane vector of up to 0.4, quantised through the payload's
+          // own code so the mirror reads the bytes the GPU reads. With
+          // `__giSrcCentroid = false` the bake ignores them on both sides.
+          let offset;
+          if (cfgMod.centroidArmed() && ((h >>> 27) & 1)) {
+            const bin = refMath.mortonToBin(m);
+            const centre = refMath.binAreaMean(bin.i, bin.j, W);
+            const { e1, e2 } = refMath.binFrame(centre);
+            const ang = ((h >>> 5) & 1023) / 1024 * 2 * Math.PI;
+            const len = 0.05 + 0.35 * (((h >>> 15) & 255) / 255);
+            const raw = [
+              (e1[0] * Math.cos(ang) + e2[0] * Math.sin(ang)) * len,
+              (e1[1] * Math.cos(ang) + e2[1] * Math.sin(ang)) * len,
+              (e1[2] * Math.cos(ang) + e2[2] * Math.sin(ang)) * len,
+            ];
+            offset = refMath.decodeCentroidOffset(refMath.encodeCentroidOffset(raw, centre), centre);
+          }
           return {
             radiance: [
               ((h >>> 3) & 255) / 256,
@@ -360,6 +392,7 @@
               ((h >>> 19) & 255) / 256,
             ],
             transmittance: 0,
+            offset,
           };
         };
 

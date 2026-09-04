@@ -49,6 +49,15 @@ export class LightComponent extends Component {
     kind: "directional",
     color: "#ffffff",
     intensity: 1,
+    // MOBILITY (§11.34) — the same contract the mesh component carries for
+    // geometry, for light: "movable" (default — the GI transport keeps
+    // refreshing the field so a change lands within seconds) or "static" (the
+    // light does not change at runtime; once every light in the scene is
+    // static and nothing has changed for a few seconds the GI world transport
+    // goes to sleep — zero GPU — until an input actually moves. An editor
+    // drag of a static light still wakes it: the declaration is permission to
+    // idle, not a freeze).
+    mobility: "movable",
     distance: 0, // point/spot: 0 = infinite
     angle: 45, // spot cone angle, degrees
     decay: 2, // physical light decay (point/spot). 0 = classic inverse-square-free.
@@ -99,6 +108,7 @@ export class LightComponent extends Component {
     { key: "kind", label: "Type", type: "select", options: ["directional", "point", "spot", "ambient"] },
     { key: "color", label: "Color", type: "color" },
     { key: "intensity", label: "Intensity", type: "number", min: 0, step: 0.1 },
+    { key: "mobility", label: "Mobility", type: "select", options: ["movable", "static"] },
     { key: "distance", label: "Distance", type: "number", min: 0, step: 0.5, showIf: (p) => p.kind === "point" || p.kind === "spot" },
     { key: "decay", label: "Decay", type: "number", min: 0, max: 5, step: 0.1, showIf: (p) => p.kind === "point" || p.kind === "spot" },
     { key: "angle", label: "Angle°", type: "number", min: 1, max: 90, step: 1, showIf: (p) => p.kind === "spot" },
@@ -217,7 +227,7 @@ export class LightComponent extends Component {
     // Angular size is pure GI-contract data: nothing in three.js reads it, so
     // republishing userData IS the whole update. Rebuilding the light for a
     // slider drag would drop the compiled shadow branch for no reason.
-    if (key === "sourceAngle") {
+    if (key === "sourceAngle" || key === "mobility") {
       this.#publishGIShadowContract();
       return;
     }
@@ -374,6 +384,8 @@ export class LightComponent extends Component {
     // Authored as an angular DIAMETER in degrees (Blender's sun "Angle");
     // consumers want the half-angle in radians, so halve it here once.
     d.giSourceAngle = THREE.MathUtils.degToRad(Math.max(0, this.props.sourceAngle ?? 0.53)) / 2;
+    // §11.34: read per frame by GISystem's converged-idle gate.
+    d.giMobility = this.props.mobility === "static" ? "static" : "movable";
     // Point/spot sources have a world-space radius instead of an angular size,
     // and shadowRadius is the row the inspector already keeps visible for them.
     d.giSourceRadius = Math.max(0, this.props.shadowRadius ?? 0);

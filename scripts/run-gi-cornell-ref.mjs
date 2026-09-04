@@ -153,7 +153,11 @@ await wait(5000);
 // axis outside the opening, looking straight down -z.
 const SHIFT = (process.env.ROOT_SHIFT ?? "0,0,0").split(",").map(Number);
 const shifted = (p) => [p[0] + SHIFT[0], p[1] + SHIFT[1], p[2] + SHIFT[2]];
-const EYE = shifted([0.38, 2.74, 6.7]), TARGET = shifted([0.38, 2.74, -2.26]);
+// POSE='[ex,ey,ez, tx,ty,tz]' overrides the Cornell eye — the rig then runs
+// on ANY scene (SRC_SCENE) at that view; with GRID it needs no world regions.
+const POSE = process.env.POSE ? JSON.parse(process.env.POSE) : null;
+const EYE = POSE ? POSE.slice(0, 3) : shifted([0.38, 2.74, 6.7]);
+const TARGET = POSE ? POSE.slice(3, 6) : shifted([0.38, 2.74, -2.26]);
 // Headless is never focused: with the freeze on, the editor suspends its loop
 // the moment the GI queue stops pinning it — which is exactly when the tracer
 // takes over (GI skips its work while the tracer is active), so the tracer
@@ -342,6 +346,41 @@ function sample(img, fx, fy) {
 }
 const f = (v) => v.toFixed(3);
 const rows = [];
+// GRID=8x5 (2026-09-04): ours/tracer per CELL over the whole frame, in canvas
+// fractions both captures share — a regional map instead of hand-picked
+// points, for scenes the Cornell REGIONS list knows nothing about. Prints a
+// lum-ratio table (ours ÷ tracer; > 1 = we are too bright there, < 1 = too
+// dark) and the two saturation tables.
+const GRID = /^(\d+)x(\d+)$/.exec(process.env.GRID ?? "");
+if (GRID) {
+  const gx = Number(GRID[1]), gy = Number(GRID[2]);
+  const ratio = [], satA = [], satB = [], lumA = [], lumB = [];
+  for (let j = 0; j < gy; j++) {
+    const rr = [], sa = [], sb = [], la = [], lb = [];
+    for (let i = 0; i < gx; i++) {
+      const fx = (i + 0.5) / gx, fy = (j + 0.5) / gy;
+      const a = sample(giImg, fx, fy), b = sample(ptImg, fx, fy);
+      rr.push(a.lum / Math.max(1e-4, b.lum)); sa.push(a.sat); sb.push(b.sat); la.push(a.lum); lb.push(b.lum);
+      rows.push({ name: `cell ${i},${j}`, fx, fy, gi: a, pt: b, lumRatio: a.lum / Math.max(1e-4, b.lum) });
+    }
+    ratio.push(rr); satA.push(sa); satB.push(sb); lumA.push(la); lumB.push(lb);
+  }
+  const table = (name, m, digits = 2) => {
+    console.log(`  ${name} (rows top→bottom, cols left→right):`);
+    for (const r of m) console.log(`    ${r.map((v) => v.toFixed(digits).padStart(6)).join(" ")}`);
+  };
+  console.log(`
+[cornell-ref] ${TAG}: ${gx}x${gy} grid, ours ÷ tracer luminance (canvas ${rect.width}×${rect.height})`);
+  table("lum ratio ours/tracer", ratio);
+  table("ours lum", lumA, 3);
+  table("tracer lum", lumB, 3);
+  table("sat ours", satA);
+  table("sat tracer", satB);
+  const all = rows.map((r) => r.lumRatio).filter((v) => Number.isFinite(v));
+  const sorted = all.slice().sort((a, b) => a - b);
+  console.log(`  ratio p10/median/p90: ${f(sorted[Math.floor(sorted.length * 0.1)])} / ${f(sorted[sorted.length >> 1])} / ${f(sorted[Math.floor(sorted.length * 0.9)])}`);
+}
+if (!GRID)
 console.log(`\n[cornell-ref] ${TAG}: ours vs tracer (linear means; sat = (max−min)/max; canvas ${rect.width}×${rect.height})`);
 for (const [name, p0] of REGIONS) {
   const p = shifted(p0);

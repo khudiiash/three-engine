@@ -60,6 +60,18 @@
 //                  every leg swings the aim by ROTATE degrees about +Y over
 //                  WALKMS, continuing from the previous leg's heading. Same
 //                  pinned measurement afterwards; `dist` reads 0.
+//   PARK=1         the camera NEVER MOVES (sits at the PIVOT point, fixed aim).
+//                  With `SUNPIN=off HIDE=<character>` the pinned burst measures
+//                  a scene whose ONLY moving thing is the sun — the arm that
+//                  separates "the field reacts badly to a moving LIGHT" from
+//                  "…to a moving CAMERA". Every arm before it moved the camera.
+//   GIVIEW=indirect shoot the GI debug view (no direct sun, no hard shadows) —
+//                  the only way to see the ESTIMATOR while the sun moves.
+//   SUNROT=7       turn the sun at a CONSTANT 7 deg/s off the wall clock, from
+//                  the end of the convergence wait. Sponza's day cycle is a
+//                  plain Script and only ticks in PLAY mode, so without this
+//                  every "live sun" arm measured a STATIONARY sun (`shadow
+//                  0.000`). Pair with `SUNALIGN=0`.
 //   PNG=1          arrival / settled / error-heatmap per leg
 //   FLAGS='{...}'  extra page globals merged over the arm's (e.g. pinned pools:
 //                  {"__giSrcC0Probes":21875,"__giSrcBinBudget":2800000} skips the
@@ -85,6 +97,39 @@ const CFG = {
   // MIDDLE of a three-point path — the ends of a long-axis fallback path face
   // the scene's end walls (Sponza: a black wall a metre away, luma 0.005).
   rotatePivot: Number(process.env.PIVOT ?? 1),
+  // PARK=1: the camera never moves at all — it sits at the PIVOT point, aimed
+  // down the path, for the whole leg, and the pinned burst then measures a
+  // scene in which the ONLY thing that changed is the light. Every earlier arm
+  // moved the camera (a walk or a pan), so no run in this file's history could
+  // separate "the field reacts badly to a moving sun" from "the field reacts
+  // badly to a moving camera" — and the user reports both. Pair it with
+  // `SUNPIN=off HIDE=<character>`: sun turning, nothing else in the scene
+  // alive, camera welded. `dist` reads 0 and the walk loop just holds the pose
+  // for WALKMS so the timeline is identical to every other arm's.
+  park: process.env.PARK === "1",
+  // SUNROT=<deg/s>: turn the sun OURSELVES, at a stated rate, off the wall
+  // clock. ⭐⭐ THE REASON THIS EXISTS: the GAME project's day cycle on Sponza
+  // is `LightScript.ts`, a PLAIN Script — and a plain Script only ticks in
+  // PLAY mode, which this probe never enters. So every "live sun" arm ever run
+  // against Sponza measured a sun that WAS NOT MOVING: the first PARK control
+  // printed `shadow0.000 track0.00 hist0.90` for all 154 pinned frames. (The
+  // Level's day cycle is `Rotator.ts`, `@executeInEditMode`, which DOES turn —
+  // which is why the two scenes silently disagreed about what "unpinned sun"
+  // means.) The sun's angular VELOCITY is the independent variable of this
+  // whole experiment; it must not be a property of which scene got loaded.
+  // The spin starts AFTER the convergence wait, so every arm measures from the
+  // same angle rather than from wherever an adaptive settle happened to end.
+  sunRot: Number(process.env.SUNROT ?? 0),
+  // GIVIEW=indirect: shoot the GI DEBUG VIEW instead of the composited frame.
+  // ⭐⭐ WHY IT MATTERS FOR A MOVING SUN: the composite carries the DIRECT sun
+  // and its hard CSM shadows, and at 7 deg/s a shadow edge 10 m from a column
+  // sweeps 1.2 m/s -- ~10 % of a tile per frame, which IS the 0.15 baseline
+  // every tile-step trace in the 7 deg/s runs shows. That is REAL light doing
+  // exactly what it should, and it buries the thing under study. The indirect
+  // buffer has no direct term at all, so every remaining frame-to-frame change
+  // in it is the GI estimator. A GIVIEW run is only ever comparable with
+  // another GIVIEW run.
+  giView: process.env.GIVIEW ?? "",
   walkY: process.env.WALKY != null ? Number(process.env.WALKY) : null,
   hide: (process.env.HIDE ?? "").split(",").map((s) => s.trim()).filter(Boolean),
   telem: process.env.TELEM === "1",
@@ -209,6 +254,12 @@ const armGlobals = (armName) => ({
   // entirely: not a shipping candidate (it costs frame time at rest, and the
   // 60 fps rule outranks), but it says how much of the tail the budget owns.
   ...(arm === "norest" ? { __giSrcRestCadence: false } : {}),
+  // §11.36: every light declared static (the idle gate's harness hatch), and
+  // on top of it the converged-motion cadence — the world chain stays at
+  // the rest rate while the camera walks. The walk's arrival statistics
+  // (err0 / settle95 / maxStep / patch0) are the receipts that decide it.
+  ...(arm === "lightsstatic" ? { __giLightsStatic: true } : {}),
+  ...(arm === "motionrest" ? { __giLightsStatic: true, __giWorldMotionRest: true } : {}),
   // ── THE TWO FEEDBACK PATHS THAT CAN RING ───────────────────────────────
   // A sustained oscillation with a PINNED camera and a static scene is a loop
   // with too much gain, and there are only two candidates: multi-bounce (the
@@ -355,6 +406,46 @@ const armGlobals = (armName) => ({
   ...(arm === "motionsmooth" ? { __giSrcMotionRoot: false, __giIrrHistWeight: 0.9 } : {}),
   ...(arm === "noroot" ? { __giSrcMotionRoot: false } : {}),
   ...(arm === "irrhist" ? { __giIrrHistWeight: 0.9 } : {}),
+  // ⭐ §12.43/§12.83 THE LIGHT-TRACK WINDOW, OFF. An open window does three
+  // things at once — `_giIrrHistWeightU` hard-ZEROED (the image's only
+  // smoother, switched off in one frame), the field's stride root relaxed, and
+  // the per-probe ray cap lifted (a 3.8x deposit swing) — and it arms on a
+  // RISING EDGE of a per-frame light delta against a fixed 0.5 threshold. A
+  // sun sweeping through that threshold therefore square-waves all three.
+  // `base` vs `notrack` under `PARK=1 SUNPIN=off` is the arm that prices it.
+  ...(arm === "notrack" ? { __giSrcMotionTrack: false } : {}),
+  // ── THE SUN-ROTATION SUSPECT SET (2026-09-04, `PARK=1 SUNROT=7`) ────────
+  // The parked-camera/turning-sun burst reads maxStep 0.645 against a static
+  // control's 0.00409 — 158× — and `notrack` and `irrhist` BOTH reproduce it
+  // to within 5 %, so neither the §12.43 window nor the §12.65 screen filter
+  // is the source. These four split what is left, one term each:
+  //   nofarduty  §11.13 draws a PER-FRAME hash per ray to decide whether it
+  //              traces past cascade 1 (duty 0.5 in motion) — a stochastic
+  //              input on the ray side, which the no-noise gate forbids
+  //   nosunmap   §11.10 reads the sun at hits from the CSM depth texel; the
+  //              cascades re-fit as the sun turns, so a hit can flip
+  //              lit/shadowed on a texel boundary rather than on geometry
+  //   nochecker  §12.80/§12.85: half the light-shadow pixels are traced per
+  //              frame and the other half held — under a moving sun the held
+  //              half is one frame stale, in a checkerboard, every frame
+  //   sunsplit   §12.82: the sun currently ACCUMULATES INTO THE BINS and
+  //              stales with the day cycle, so every bin in the scene carries
+  //              a term that is wrong the moment the sun moves. Never once
+  //              measured on a parked camera with a turning sun — the case it
+  //              was built for; the runs that "refuted" it were camera walks.
+  // ⭐⭐ THE FIELD'S REACTION TO LIGHT MOTION, PINNED OFF. `__giSrcAlpha`
+  // outranks the §12.38 ramp outright (srcSystem's `readAlpha`), so
+  // `alphastill` makes a scene with a turning sun blend at the STILL rate
+  // (0.02/visit) instead of the moving one (0.10) — and `nomotion` adds the
+  // stride root and the tracking window to that. If those are quiet where
+  // `base` boils, the flicker is not a bug in any one term: it is the field
+  // DOING WHAT IT WAS TOLD, forgetting 14x faster on a ray budget that cannot
+  // refill what it threw away. The answer is then to make a rotating sun stop
+  // invalidating history (§12.82) rather than to tune the rate.
+  ...(arm === "alphastill" ? { __giSrcAlpha: 0.02 } : {}),
+  ...(arm === "nomotion" ? { __giSrcAlpha: 0.02, __giSrcMotionRoot: false, __giSrcMotionTrack: false } : {}),
+  ...(arm === "nofarduty" ? { __giSrcFarDuty: false } : {}),
+  ...(arm === "nosunmap" ? { __giSunShadowMap: false } : {}),
   // §12.90 — THE ADAPTIVE GATHER LATTICE, **DEFAULT ON since 2026-08-24**. The
   // census reads this scene's separators (46, area-weighted p10 = 0.250 m) and
   // picks s0 0.45 → 0.35 with β = 0.162 instead of taking the tier constant on
@@ -391,6 +482,8 @@ const KNOWN_ARMS = new Set([
   "sunsplit", "sunsplitflatcos", "sunsplitkeep", "sunsplitholdn",
   "nolightfill", "nosmooth", "motionsmooth", "noroot", "irrhist",
   "adapt", "noadapt", "adaptnoreach", "sixteenoff", "nocoverfrac",
+  "notrack", "nofarduty", "nosunmap", "alphastill", "nomotion",
+  "lightsstatic", "motionrest",
 ]);
 for (const armName of ARMS) {
   const normalized = armName.replace(/\d+$/, "");
@@ -793,6 +886,28 @@ async function runArm(arm) {
       }
       return t;
     };
+    // ⭐⭐ SIGNED per-tile delta. `tileDiff` takes |a−b| and therefore cannot
+    // tell a LIGHT THAT IS REALLY CHANGING from a field that is BOILING: a sun
+    // setting at 7°/s legitimately moves every tile every frame, and every
+    // magnitude statistic in this file scores that as a catastrophe. The
+    // user's own gate is the discriminator — "frame-to-frame deltas keep one
+    // SIGN while converging; alternating signs are noise" — so the burst also
+    // counts, per tile, how often the sign of the frame-to-frame delta FLIPS.
+    // A monotone sweep reverses ~0 % of frames; white noise reverses ~50 %.
+    const tileSigned = (a, b) => {
+      const t = new Float32Array(TX * TY);
+      for (let ty = 0; ty < TY; ty++) {
+        for (let tx = 0; tx < TX; tx++) {
+          let s = 0;
+          for (let y = 0; y < TILE; y++) {
+            const row = (ty * TILE + y) * CW + tx * TILE;
+            for (let x = 0; x < TILE; x++) s += a[row + x] - b[row + x];
+          }
+          t[ty * TX + tx] = s / (TILE * TILE);
+        }
+      }
+      return t;
+    };
     const mean = (a) => { let s = 0; for (const v of a) s += v; return s / a.length; };
     const std = (a) => { const m = mean(a); let s = 0; for (const v of a) s += (v - m) ** 2; return Math.sqrt(s / a.length); };
 
@@ -1135,6 +1250,40 @@ async function runArm(arm) {
       convergeMs = Math.round(performance.now() - t0);
     }
 
+    // ── SUNROT: the sun, turning at a rate we chose ──────────────────────
+    // GIVIEW: the debug view goes on AFTER the convergence wait, so convergence
+    // is still judged on the real picture.
+    if (cfg.giView) {
+      globalThis.__giDebugView = cfg.giView;
+      console.log(`[gi] [probe] GIVIEW: debug view "${cfg.giView}" -- the DIRECT term is not in these numbers`);
+      await sleep(1500);
+    }
+    let sunRotInfo = null;
+    if (cfg.sunRot) {
+      const targets = [];
+      engine.scene.traverse((o) => { if (o.isDirectionalLight) targets.push(o.parent ?? o); });
+      if (!targets.length) throw new Error("SUNROT: no directional light in the scene");
+      // Rotate the light's PARENT about x, which is what the project's own day
+      // cycle writes (`this.entity.rotation.x`). Driven off `performance.now()`
+      // rather than a per-frame increment so the ANGULAR RATE is constant no
+      // matter how the frame times fall — the point of the experiment is that
+      // a constant rate must produce a constant signal.
+      const radPerMs = (cfg.sunRot * Math.PI) / 180 / 1000;
+      const t0 = performance.now();
+      const base = targets.map((t) => t.rotation.x);
+      const spin = () => {
+        const a = (performance.now() - t0) * radPerMs;
+        for (let i = 0; i < targets.length; i++) {
+          targets[i].rotation.x = base[i] + a;
+          targets[i].updateMatrixWorld(true);
+        }
+        requestAnimationFrame(spin);
+      };
+      requestAnimationFrame(spin);
+      sunRotInfo = { degPerSec: cfg.sunRot, lights: targets.length };
+      console.log(`[gi] [probe] SUNROT: ${targets.length} light parent(s) turning ${cfg.sunRot} deg/s`);
+    }
+
     // ── ⭐⭐ THE FIFTH UNCONTROLLED INPUT: THE SUN'S **PHASE** ───────────────
     //
     // The four inputs §-10 closed all applied to the PINNED arms. The arm that
@@ -1200,10 +1349,11 @@ async function runArm(arm) {
       }
     };
 
-    const pivot = cfg.rotateDeg ? Math.min(path.length - 1, Math.max(0, Number(cfg.rotatePivot ?? 1))) : 0;
+    const inPlace = cfg.rotateDeg || cfg.park;
+    const pivot = inPlace ? Math.min(path.length - 1, Math.max(0, Number(cfg.rotatePivot ?? 1))) : 0;
     for (let leg = 0; leg < nLegs; leg++) {
-      const from = cfg.rotateDeg ? path[pivot].p : path[leg].p;
-      const to = cfg.rotateDeg ? path[pivot].p : path[leg + 1].p;
+      const from = inPlace ? path[pivot].p : path[leg].p;
+      const to = inPlace ? path[pivot].p : path[leg + 1].p;
       // EVERY LEG STARTS AT THE SAME POINT IN THE DAY. See `alignSun`.
       const sunAt = await alignSun();
       // WALK. Small steps at frame cadence — a single setCamera jump pays the
@@ -1223,7 +1373,16 @@ async function runArm(arm) {
       // would have aimed and each leg adds ROTATE degrees; `t` is the leg's
       // progress so the pan is continuous at frame cadence. `legAim` ignores
       // the extra argument.
-      const aim = cfg.rotateDeg
+      // PARK: one fixed aim, computed from the pivot's OUTGOING leg so
+      // `legAim` never sees `from === to` (the §-10 degenerate-target bug that
+      // voided every number this probe printed before 2026-08-23).
+      const aim = cfg.park
+        ? (() => {
+            const next = path[pivot + 1]?.p ?? path[pivot - 1].p;
+            const fixed = legAim(path[pivot].p, next)(path[pivot].p);
+            return () => fixed;
+          })()
+        : cfg.rotateDeg
         ? (() => {
             const next = path[pivot + 1]?.p ?? path[pivot - 1].p;
             const d0 = legAim(path[pivot].p, next)(path[pivot].p);
@@ -1358,6 +1517,45 @@ async function runArm(arm) {
       }
       let poppingTiles = 0;
       for (let k = 0; k < stepCountTile.length; k++) if (stepCountTile[k] >= 3) poppingTiles++;
+      // ⭐⭐ THE REVERSAL STATISTIC — the one number that separates "the light is
+      // really changing" from "the estimator is boiling". Per tile, over the
+      // burst: the share of consecutive signed deltas whose SIGN flipped, and
+      // the mean |delta| carried by those reversing frames (a reversal of
+      // 0.0001 is a rounding artefact; one of 0.3 is a visible pop). Tiles
+      // whose whole burst is quiet are excluded — a still tile's dither would
+      // otherwise report 50 % reversals and swamp the tiles that move.
+      let revRate = 0, revAmp = 0, revTiles = 0, revWorst = 0;
+      {
+        const REV_FLOOR = 0.002 * Math.max(1e-4, settledMean);
+        const prevSigned = [];
+        const signs = new Int8Array(TX * TY);
+        const flips = new Uint16Array(TX * TY);
+        const counts = new Uint16Array(TX * TY);
+        const amps = new Float32Array(TX * TY);
+        for (let i = 1; i < frames.length; i++) {
+          const d = tileSigned(frames[i], frames[i - 1]);
+          for (let k = 0; k < d.length; k++) {
+            const v = d[k];
+            if (Math.abs(v) < REV_FLOOR) continue;
+            const sgn = v > 0 ? 1 : -1;
+            if (signs[k] !== 0) {
+              counts[k]++;
+              if (sgn !== signs[k]) { flips[k]++; amps[k] += Math.abs(v); }
+            }
+            signs[k] = sgn;
+          }
+          prevSigned.length = 0;
+        }
+        for (let k = 0; k < counts.length; k++) {
+          if (counts[k] < 8) continue;
+          const r = flips[k] / counts[k];
+          revTiles++;
+          revRate += r;
+          revAmp += flips[k] ? amps[k] / flips[k] : 0;
+          if (r > revWorst) revWorst = r;
+        }
+        if (revTiles) { revRate /= revTiles; revAmp /= revTiles; }
+      }
       const stepHeat = cfg.png ? tileHeatmap(stepMaxTile, Math.max(1e-4, settledMean)) : null;
       // The signal trace: one line per ~12 frames plus the maxStep frame, so
       // a 2 s oscillation and a one-frame pop can both be read against the
@@ -1405,6 +1603,10 @@ async function runArm(arm) {
         signalTrace,
         stepHeat,
         poppingTiles,
+        revRate: +revRate.toFixed(3),
+        revAmp: +revAmp.toFixed(4),
+        revWorst: +revWorst.toFixed(3),
+        revTiles,
         tiles: TX * TY,
         err0: +err0.toFixed(5),
         errMid: +err[Math.floor(frames.length / 2)].toFixed(5),
@@ -1585,6 +1787,7 @@ for (const arm of ARMS) {
       console.log(`    ⭐ ripple ${l.ripple} (tail mean luma ${l.tailMean}) — 0 = the picture finally stops moving   |   ${l.fps} fps`);
       console.log(`    curve ${l.curve.join(" ")}`);
       if (l.poppingTiles != null) console.log(`    popping tiles (≥3 frames with a step > 10 % of the settled mean): ${l.poppingTiles} of ${l.tiles}`);
+      if (l.revRate != null) console.log(`    ⭐⭐ reversals ${(l.revRate * 100).toFixed(1)}% of frames (worst tile ${(l.revWorst * 100).toFixed(0)}%), mean |Δ| on a reversal ${l.revAmp} over ${l.revTiles} moving tiles — 0 % = a monotone sweep (real light), 50 % = white noise`);
       if (l.signalTrace) {
         console.log(`    signals (every 12th pinned frame):\n      ${l.signalTrace.lines.join("\n      ")}\n      ${l.signalTrace.step}`);
         console.log(`    tile-step per frame: ${l.signalTrace.trace.join(" ")}`);
@@ -1659,12 +1862,14 @@ if (results.length > 1) {
       maxStep: Math.max(...ls.map((l) => l.maxStep)),
       patch0: ls.reduce((s, l) => s + l.patch0, 0) / ls.length,
       ripple: ls.reduce((s, l) => s + (l.ripple ?? 0), 0) / ls.length,
+      revRate: ls.reduce((s, l) => s + (l.revRate ?? 0), 0) / ls.length,
+      revAmp: ls.reduce((s, l) => s + (l.revAmp ?? 0), 0) / ls.length,
       fps: ls.reduce((s, l) => s + (l.fps ?? 0), 0) / ls.length,
     };
   };
   for (const r of results) {
     const a = agg(r);
     if (!a) { console.log(`  ${r.arm}: no legs`); continue; }
-    console.log(`  ${r.arm.padEnd(12)} err0 ${a.err0.toFixed(5)}  settle95 ${Math.round(a.settle95)} ms  maxStep ${a.maxStep.toFixed(5)}  patch0 ${a.patch0.toFixed(2)}  ripple ${a.ripple.toFixed(3)}  ${a.fps.toFixed(1)} fps`);
+    console.log(`  ${r.arm.padEnd(12)} err0 ${a.err0.toFixed(5)}  settle95 ${Math.round(a.settle95)} ms  maxStep ${a.maxStep.toFixed(5)}  ⭐ rev ${(a.revRate * 100).toFixed(1)}% |Δ|${a.revAmp.toFixed(4)}  patch0 ${a.patch0.toFixed(2)}  ripple ${a.ripple.toFixed(3)}  ${a.fps.toFixed(1)} fps`);
   }
 }

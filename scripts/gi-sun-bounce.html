@@ -77,6 +77,10 @@
     const params = new URLSearchParams(location.search);
     const arm = params.get("arm") ?? "base";
     const skyArm = params.get("sky") === "1";
+    // `?hdri=1` (§11.28): the sky arm lit by the user's sunset HDRI (served
+    // from scripts/.gi-fixtures) at intensity 0.5 instead of the flat white —
+    // a horizon-bright sky, which is what Bistro is lit by.
+    const hdriArm = params.get("hdri") === "1";
     const settleSec = Number(params.get("settle") ?? 60);
     const quality = params.get("quality") ?? "high";
     const alpha = params.get("alpha");
@@ -97,6 +101,17 @@
     // WALL_T, which the runner passes through from the same env var.
     const wallT = Math.max(0.05, Number(params.get("thick") ?? 0.5));
     const rayCap = params.get("cap");
+    // `?r0=N` pins r0/s0 at build (srcConfig.r0OverS0) — §11.28's interval
+    // dose-response. Longer intervals move the corridor's hits into FINER
+    // cells; a leak that shrinks with it is coarse-cascade parallax.
+    const r0Dial = params.get("r0");
+    if (r0Dial != null) globalThis.__giSrcR0OverS0 = Number(r0Dial);
+    // `?nocen=1` — the §11.28 radiance-centroid correction OFF (the control arm).
+    const noCen = params.get("nocen") === "1";
+    if (noCen) globalThis.__giSrcCentroid = false;
+    // `?noconf=1` — §11.25 confidence OFF (c ≡ 1: no look-through, no far prior).
+    const noConf = params.get("noconf") === "1";
+    if (noConf) globalThis.__giSrcConfidence = false;
     if (rayCap != null) globalThis.__giSrcProbeRayCap = Number(rayCap);
     if (arm === "noshadow") globalThis.__giSrcNoShadow = true;
     if (arm === "failopen") globalThis.__giNoFailClosed = true;
@@ -144,7 +159,9 @@
       background: skyArm ? "#ffffff" : "#000000",
       ambientColor: "#ffffff",
       ambientIntensity: 0,
-      environment: { cubemap: "", background: true, lighting: skyArm, intensity: skyArm ? 0.1 : 0, rotation: 0, blur: 0 },
+      environment: hdriArm
+        ? { cubemap: "/scripts/.gi-fixtures/industrial-sunset-2k.hdr", background: true, lighting: true, intensity: 0.5, rotation: 0, blur: 0 }
+        : { cubemap: "", background: true, lighting: skyArm, intensity: skyArm ? 0.1 : 0, rotation: 0, blur: 0 },
       toneMapping: "linear",
       exposure: 1,
       shadows: true,
@@ -233,6 +250,10 @@
       arm: (skyArm ? `${arm}+sky` : arm) + (scene === "plane" ? "+plane" : "") +
         (pointSet === "sky" ? "+occ" : "") +
         (rayCap != null ? `+cap${rayCap}` : "") +
+        (r0Dial != null ? `+r0${r0Dial}` : "") +
+        (noCen ? "+nocen" : "") +
+        (noConf ? "+noconf" : "") +
+        (hdriArm ? "+hdri" : "") +
         (wallT !== 0.5 ? `+t${wallT}` : "") +
         (quality !== "high" ? `+${quality}` : "") + (alpha != null ? `+a${alpha}` : ""),
       scene, settleSec, quality, alpha, points: [],
@@ -247,14 +268,15 @@
       const inArr = new Float32Array(NP * 8);
       POINTS.forEach((p, i) => { inArr.set(p.P, i * 8); inArr.set(p.n, i * 8 + 4); });
       const pts = instancedArray(inArr, "float");
-      const res = instancedArray(new Float32Array(NP * 4), "float");
+      const res = instancedArray(new Float32Array(NP * 8), "float");
       const kernel = Fn(() => {
         const i = instanceIndex.toVar();
         const b = i.mul(uint(8)).toVar();
         const P = vec3(pts.element(b), pts.element(b.add(uint(1))), pts.element(b.add(uint(2)))).toVar();
         const n = vec3(pts.element(b.add(uint(4))), pts.element(b.add(uint(5))), pts.element(b.add(uint(6)))).toVar();
-        const E = vec3(gatherAt(P, n).irradiance).toVar();
-        const o = i.mul(uint(4)).toVar();
+        const g = gatherAt(P, n);
+        const E = vec3(g.irradiance).toVar();
+        const o = i.mul(uint(8)).toVar();
         res.element(o).assign(E.x);
         res.element(o.add(uint(1))).assign(E.y);
         res.element(o.add(uint(2))).assign(E.z);
@@ -266,6 +288,12 @@
         // exactly how the first version of this rig reported a working
         // marcher as totally black.
         res.element(o.add(uint(3))).assign(float(7.5));
+        // §11.28: what share of the lobe the probes SAMPLED, and how many of
+        // the eight corners existed / voted — the per-point twin of the blind
+        // `knownFrac` statistic.
+        res.element(o.add(uint(4))).assign(float(g.coverage));
+        res.element(o.add(uint(5))).assign(float(g.corners));
+        res.element(o.add(uint(6))).assign(float(g.covered));
       })().compute(NP);
 
       const marks = [];
@@ -288,11 +316,37 @@
           frames,
           E: POINTS.map((p, i) => ({
             name: p.name,
-            rgb: [+arr[i * 4].toFixed(4), +arr[i * 4 + 1].toFixed(4), +arr[i * 4 + 2].toFixed(4)],
-            lum: +(0.2126 * arr[i * 4] + 0.7152 * arr[i * 4 + 1] + 0.0722 * arr[i * 4 + 2]).toFixed(4),
+            rgb: [+arr[i * 8].toFixed(4), +arr[i * 8 + 1].toFixed(4), +arr[i * 8 + 2].toFixed(4)],
+            lum: +(0.2126 * arr[i * 8] + 0.7152 * arr[i * 8 + 1] + 0.0722 * arr[i * 8 + 2]).toFixed(4),
+            cov: +arr[i * 8 + 4].toFixed(3),
+            corners: arr[i * 8 + 5],
+            covered: arr[i * 8 + 6],
           })),
         });
         res.value.array[3] = 0;   // so the NEXT mark's settle test is honest
+      }
+      // §11.28 IN-SITU A/B: the same converged field, read again with the
+      // bake's centroid correction at strength 0 — no rebuild, no reboot, no
+      // run-to-run spread between the two readings.
+      const tilesObj = system().state.screen.srcProbes.tiles;
+      if (tilesObj?.centroidStrength) {
+        tilesObj.centroidStrength.value = 0;
+        await settle(3000);
+        await engine.renderer.computeAsync(kernel);
+        let arr2 = null;
+        for (let attempt = 0; attempt < 60; attempt++) {
+          const a = new Float32Array(await engine.renderer.getArrayBufferAsync(res.value));
+          if (a[3] === 7.5) { arr2 = a; break; }
+          await settle(50);
+        }
+        if (arr2) {
+          out.pointsNoCen = POINTS.map((p, i) => ({
+            name: p.name,
+            lum: +(0.2126 * arr2[i * 8] + 0.7152 * arr2[i * 8 + 1] + 0.0722 * arr2[i * 8 + 2]).toFixed(4),
+          }));
+        }
+        res.value.array[3] = 0;
+        tilesObj.centroidStrength.value = 1;
       }
     } catch (e) {
       out.error = String((e && e.stack) || e);
@@ -449,7 +503,142 @@
       meanKnownBins: +(st.tiles?.meanKnownBins ?? 0).toFixed(2),
       knownFrac: +(st.tiles?.knownFrac ?? 0).toFixed(4),
       mergeSky: st.merge?.sky, mergeBins: st.merge?.bins, orphans: st.merge?.orphans,
+      mergeCascades: st.merge?.cascades?.map((x) => ({
+        c: x.cascade ?? x.c, bins: x.bins, merged: x.merged, orphans: x.orphans, found: x.found, corners: x.meanCorners ?? x.corners,
+      })),
     } : null;
+
+    // §11.28 INSTRUMENT: did the merge actually write centroid offsets? Per
+    // cascade: known bins, bins carrying a non-zero offset, mean |offset|.
+    try {
+      const Dm = await import("/src/modules/gi/srcDeposit.js");
+      const binsObj = system().state.screen.srcProbes.binStore;
+      const words = new Uint32Array(await engine.renderer.getArrayBufferAsync(binsObj.payload.value));
+      const codes = Dm.decodePayloadCentroid(words);
+      const field = Dm.decodePayload(words);
+      out.centroid = binsObj.cascades.map((ci, c) => {
+        let known = 0, nz = 0, sum = 0;
+        for (let b = 0; b < ci.bins * ci.blockCapacity; b++) {
+          const slot = ci.binBase + b;
+          if (field[slot * 4 + 3] < 0) continue;
+          known++;
+          const code = codes[slot];
+          if (code !== 0 && code !== 0x8080) {
+            nz++;
+            const a = ((code & 0xff) - 128) / 127;
+            const bb = (((code >>> 8) & 0xff) - 128) / 127;
+            sum += Math.hypot(a, bb);
+          }
+        }
+        return { c, known, nonZero: nz, meanAbs: nz ? +(sum / nz).toFixed(4) : 0 };
+      });
+      // T after the merge: a merged c0 bin has T = 0; T > 0 below the top is
+      // an orphan (or a filled-unknown). Per cascade: bins with T > 0.
+      out.centroidT = binsObj.cascades.map((ci, c) => {
+        let known = 0, clear = 0;
+        for (let b = 0; b < ci.bins * ci.blockCapacity; b++) {
+          const slot = ci.binBase + b;
+          const T = field[slot * 4 + 3];
+          if (T < 0) continue;
+          known++;
+          if (T > 0) clear++;
+        }
+        return { c, known, tPositive: clear };
+      });
+    } catch (e) { out.centroidError = String((e && e.message) || e); }
+
+    // §11.28 CHAIN DUMP at the wall-low point: its eight c0 corners' bins
+    // facing +x (L, T, confidence, the offset's cosine component) and, for
+    // each, the four c1 children the merge pre-averaged.
+    try {
+      const Pm = await import("/src/modules/gi/srcProbes.js");
+      const Dm = await import("/src/modules/gi/srcDeposit.js");
+      const Rm = await import("/src/modules/gi/srcRef.js");
+      const Mm = await import("/src/modules/gi/srcMath.js");
+      const Cm = await import("/src/modules/gi/srcConfig.js");
+      const sp = system().state.screen.srcProbes;
+      const store = sp.store;
+      const binsObj = sp.binStore;
+      const anchor = sp.anchor;   // the live lattice anchor, a plain triple
+      const cfg = Rm.makeSrcConfig({
+        spacing0: sp.spacing0, camera: [camera.position.x, camera.position.y, camera.position.z],
+        anchor: [anchor[0], anchor[1], anchor[2]], cascadeCount: Cm.CASCADE_COUNT, maxLods: Cm.MAX_LODS,
+      });
+      const table = new Uint32Array(await engine.renderer.getArrayBufferAsync(store.probeTable.value));
+      const words = new Uint32Array(await engine.renderer.getArrayBufferAsync(binsObj.payload.value));
+      const field = Dm.decodePayload(words);
+      const conf = Dm.decodePayloadConfidence(words);
+      const codes = Dm.decodePayloadCentroid(words);
+      const maps = store.cascades.map((pc) => {
+        const mp = new Map();
+        for (let k = 0; k < pc.probeCapacity; k++) {
+          const w = (pc.probeBase + k) * Pm.PROBE_WORDS;
+          if ((table[w + Pm.PROBE_FLAGS] & Pm.FLAG_ALIVE) === 0) continue;
+          mp.set(table[w + Pm.PROBE_KEY] >>> 0, pc.probeBase + k);
+        }
+        return mp;
+      });
+      const P0 = [-1.74, 0.3, 0];
+      const nrm = [1, 0, 0];
+      const lod = 0;
+      const s = Cm.probeSpacing(0, lod, cfg.spacing0);
+      const origin = Rm.latticeOrigin(cfg, 0, lod);
+      const corners = Mm.trilinearCorners(P0[0], P0[1], P0[2], origin[0], origin[1], origin[2], s, Mm.gatherSmoothWeights());
+      const dot = (o) => +(o[0] * nrm[0] + o[1] * nrm[1] + o[2] * nrm[2]).toFixed(3);
+      const dump = [];
+      for (const c of corners) {
+        const key = Mm.packProbeKey(lod, false, ...Rm.keyCellFor(cfg, 0, lod, c.cx, c.cy, c.cz));
+        const pi = maps[0].get(key >>> 0);
+        if (pi == null) { dump.push({ corner: [c.cx, c.cy, c.cz], w: +c.weight.toFixed(3), missing: true }); continue; }
+        const w = pi * Pm.PROBE_WORDS;
+        const block = table[w + Pm.PROBE_BLOCK] >>> 0;
+        const parent = table[w + Pm.PROBE_PARENT] >>> 0;
+        if (block === Pm.SLOT_EMPTY) { dump.push({ corner: [c.cx, c.cy, c.cz], w: +c.weight.toFixed(3), noBlock: true }); continue; }
+        const ci = binsObj.cascades[0];
+        const bins = [];
+        for (let m = 0; m < ci.bins; m++) {
+          const slot = ci.binBase + block * ci.bins + m;
+          const T = field[slot * 4 + 3];
+          if (T < 0) continue;
+          const { i, j } = Mm.binUnmorton(m);
+          const ctr = Mm.binAreaCentroid(i, j, Cm.binGridWidth(0));
+          const cos = ctr[0] * nrm[0] + ctr[1] * nrm[1] + ctr[2] * nrm[2];
+          if (cos < 0.2) continue;
+          const o = Mm.decodeCentroidOffset(codes[slot], ctr);
+          bins.push({ m, up: +ctr[1].toFixed(2), cos: +cos.toFixed(2), L: +field[slot * 4].toFixed(4), T: +T.toFixed(3), c: +conf[slot].toFixed(2), no: dot(o) });
+        }
+        let parentBins = null;
+        if (parent !== Pm.SLOT_EMPTY) {
+          const wp = parent * Pm.PROBE_WORDS;
+          const pb = table[wp + Pm.PROBE_BLOCK] >>> 0;
+          const c1i = binsObj.cascades[1];
+          if (pb !== Pm.SLOT_EMPTY) {
+            parentBins = bins.map((b) => [0, 1, 2, 3].map((k) => {
+              const slot = c1i.binBase + pb * c1i.bins + 4 * b.m + k;
+              const T = field[slot * 4 + 3];
+              if (T < 0) return null;
+              const { i, j } = Mm.binUnmorton(4 * b.m + k);
+              const ctr = Mm.binAreaCentroid(i, j, Cm.binGridWidth(1));
+              const o = Mm.decodeCentroidOffset(codes[slot], ctr);
+              return { up: +ctr[1].toFixed(2), L: +field[slot * 4].toFixed(4), c: +conf[slot].toFixed(2), no: dot(o) };
+            }));
+          }
+        }
+        // every bin, fully decoded, for an offline re-bake (§11.28 bisect)
+        const binsAll = [];
+        for (let m = 0; m < ci.bins; m++) {
+          const slot = ci.binBase + block * ci.bins + m;
+          const T = field[slot * 4 + 3];
+          if (T < 0) { binsAll.push(null); continue; }
+          const { i, j } = Mm.binUnmorton(m);
+          const ctr = Mm.binAreaCentroid(i, j, Cm.binGridWidth(0));
+          const o = Mm.decodeCentroidOffset(codes[slot], ctr);
+          binsAll.push({ L: [field[slot * 4], field[slot * 4 + 1], field[slot * 4 + 2]], T, c: conf[slot], o, code: codes[slot] });
+        }
+        dump.push({ corner: [c.cx, c.cy, c.cz], w: +c.weight.toFixed(3), block, bins, parentBins, binsAll });
+      }
+      out.chain = dump;
+    } catch (e) { out.chainError = String((e && e.stack) || e); }
 
     globalThis.__RIG_RESULT__ = out;
     console.log("RIG " + JSON.stringify(out));

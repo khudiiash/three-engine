@@ -37,6 +37,15 @@ export const PROJECT_SETTINGS_DEFAULTS = {
     // or a build step churns thousands of files under the project root.
     watchProject: true,
   },
+  // The Shift+Alt+S viewport screenshot (viewportScreenshot.js). The chord
+  // itself lives in `editor.keybindings` ("editor.screenshot"); this section
+  // is where the file goes. Empty folder = the OS Downloads folder under
+  // Tauri (a plain browser has no filesystem, so there it degrades to the
+  // browser's own download flow).
+  screenshot: {
+    folder: "",
+    prefix: "screenshot",
+  },
   scripts: {
     hotReload: true,
     reloadIntervalMs: 750,
@@ -92,6 +101,7 @@ export function getProjectSettings() {
   const saved = useProjectStore.getState().projectMeta?.settings ?? {};
   return {
     editor: mergeSection(PROJECT_SETTINGS_DEFAULTS.editor, saved.editor),
+    screenshot: mergeSection(PROJECT_SETTINGS_DEFAULTS.screenshot, saved.screenshot),
     scripts: mergeSection(PROJECT_SETTINGS_DEFAULTS.scripts, saved.scripts),
     rendering: mergeSection(PROJECT_SETTINGS_DEFAULTS.rendering, saved.rendering),
     game: mergeSection(PROJECT_SETTINGS_DEFAULTS.game, saved.game),

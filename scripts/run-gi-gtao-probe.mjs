@@ -34,6 +34,46 @@
 //   WORLD=1                                    (opt-in occupancy diagnostic)
 import path from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { deflateSync } from "node:zlib";
+
+/**
+ * §11.35 THE NATIVE-RESOLUTION AO DUMP. A viewport screenshot resamples the
+ * AO buffer twice (the debug view onto the canvas, the capture onto its own
+ * size) and every resample reads as blur. This writes the AO texture's own
+ * texels, one PNG pixel per AO texel, 8-bit grey — the only honest picture
+ * of "is the AO blurry".
+ */
+function greyPng(width, height, bytes) {
+  const crcTable = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    crcTable[n] = c;
+  }
+  const crc = (buf) => {
+    let c = -1;
+    for (let i = 0; i < buf.length; i++) c = crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ -1) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const c = Buffer.alloc(4); c.writeUInt32BE(crc(td));
+    return Buffer.concat([len, td, c]);
+  };
+  const raw = Buffer.alloc((width + 1) * height);
+  for (let y = 0; y < height; y++) {
+    raw[y * (width + 1)] = 0;
+    for (let x = 0; x < width; x++) raw[y * (width + 1) + 1 + x] = bytes[y * width + x];
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; ihdr[9] = 0; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr), chunk("IDAT", deflateSync(raw)), chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
 import puppeteer from "puppeteer-core";
 import { installTauriShim } from "./lib/tauriShim.mjs";
 import { makeAoGlossyProject, POSE, SUBJECTS } from "./lib/makeAoGlossyProject.mjs";
@@ -78,19 +118,39 @@ page.on("pageerror", (e) => {
   const msg = e.message ?? String(e);
   if (!/save_scene/.test(msg)) { errors++; console.log(`  pageerror: ${msg.slice(0, 300)}`); }
 });
-await page.evaluateOnNewDocument((project, arm, world, profileFull, intervals, filterRadius) => {
+// §11.35 arms: GTAO_STEPS / GTAO_SLICES (the march), RADIAL_PHASE=0 (no
+// spatial radial phase — every pixel marches the same radii), AO_FILTER=0
+// (the separable filter off WITHOUT the debug channels, so the x channel is
+// the raw estimate and the capture shows it).
+const STEPS_ARM = Number(process.env.GTAO_STEPS);
+const SLICES_ARM = Number(process.env.GTAO_SLICES);
+const RADIAL_PHASE = process.env.RADIAL_PHASE !== "0";
+const AO_FILTER = process.env.AO_FILTER !== "0";
+await page.evaluateOnNewDocument((project, arm, world, profileFull, intervals, filterRadius, stepsArm, slicesArm, radialPhase, aoFilter, resolveScale) => {
   localStorage.setItem("engine.projectRoot.v1", project);
   localStorage.setItem("engine.recentProjects.v1", JSON.stringify([project]));
   globalThis.__editorKeepRendering = true;
   globalThis.__giConfigOverride = { exactReflections: false };
+  // RESOLVE_SCALE=<n> (§11.35): the whole screen chain at that fraction of the
+  // drawing buffer — the reference for "what would a full-resolution AO look
+  // like" before the AO is given its own resolution.
+  if (Number.isFinite(resolveScale) && resolveScale > 0) {
+    globalThis.__giConfigOverride.resolveScale = resolveScale;
+    globalThis.__giResolveMaxPixels = 16_000_000;
+  }
   if (arm === "raytraced") globalThis.__giAoRaytraced = true;
   if (arm === "legacy") globalThis.__giAoLegacy = true;
   if (world === "1") globalThis.__giWorldAo = true;
   if (profileFull) globalThis.__GI_PROFILE_FULL = true;
   if (Number.isFinite(intervals)) globalThis.__giGtaoIntervals = intervals;
   if (Number.isFinite(filterRadius)) globalThis.__giAoFilterRadius = filterRadius;
+  if (Number.isFinite(stepsArm) && stepsArm > 0) globalThis.__giGtaoSteps = stepsArm;
+  if (Number.isFinite(slicesArm) && slicesArm > 0) globalThis.__giGtaoSlices = slicesArm;
+  if (!radialPhase) globalThis.__giGtaoRadialPhase = false;
+  if (!aoFilter) globalThis.__giAoFilter = false;
   if (globalThis.__GTAO_DEBUG) globalThis.__giGtaoDebug = true;
-}, root, ARM, WORLD, process.env.PROFILE_FULL === "1", Number(process.env.GTAO_INTERVALS), Number(process.env.AO_FILTER_RADIUS));
+}, root, ARM, WORLD, process.env.PROFILE_FULL === "1", Number(process.env.GTAO_INTERVALS), Number(process.env.AO_FILTER_RADIUS),
+  STEPS_ARM, SLICES_ARM, RADIAL_PHASE, AO_FILTER, Number(process.env.RESOLVE_SCALE));
 if (process.env.THIN !== undefined) {
   await page.evaluateOnNewDocument((t) => { globalThis.__giGtaoThin = t; }, Number(process.env.THIN));
 }
@@ -220,8 +280,36 @@ const out = await page.evaluate(async ({ subjects }) => {
   const pos = unpad(await renderer.backend.copyTextureToBuffer(posTex, 0, 0, gw, gh, 0), gw, gh, 4, Float32Array);
   const sx = gw / vw, sy = gh / vh;
 
+  // §11.35 THE DOWNSAMPLE CHECK: the chain's g-buffer must be the point-
+  // sampled copy of the full one. Compare positions at the mapped coordinate
+  // and at its vertical mirror — a flip is the one silent way to get valid
+  // positions that pair every AO texel with the wrong surface.
+  let downsample = null;
+  if (screen.gbufferFull?.position && screen.gbufferFull.rt) {
+    const fw = screen.gbufferFull.rt.width, fh = screen.gbufferFull.rt.height;
+    const full = unpad(await renderer.backend.copyTextureToBuffer(screen.gbufferFull.position, 0, 0, fw, fh, 0), fw, fh, 4, Float32Array);
+    let direct = 0, flipped = 0, n = 0;
+    for (let y = 0; y < gh; y += 3) for (let x = 0; x < gw; x += 3) {
+      const o = (y * gw + x) * 4;
+      if (pos[o + 3] < 0.5) continue;
+      const fx = Math.min(fw - 1, Math.floor((x + 0.5) * fw / gw));
+      const fy = Math.min(fh - 1, Math.floor((y + 0.5) * fh / gh));
+      const d = (fy * fw + fx) * 4, m = ((fh - 1 - fy) * fw + fx) * 4;
+      if (full[d + 3] > 0.5) direct += Math.hypot(pos[o] - full[d], pos[o + 1] - full[d + 1], pos[o + 2] - full[d + 2]);
+      if (full[m + 3] > 0.5) flipped += Math.hypot(pos[o] - full[m], pos[o + 1] - full[m + 1], pos[o + 2] - full[m + 2]);
+      n++;
+    }
+    downsample = { full: [fw, fh], half: [gw, gh], samples: n, meanDeltaDirect: direct / Math.max(1, n), meanDeltaFlipped: flipped / Math.max(1, n) };
+  }
   const values = [];
   const gtaoValues = [];
+  // §11.35 THE OPEN-FLOOR SPREAD: AO over floor texels at least 1.2 m from
+  // the box and the sphere and 0.6 m from the walls — a region with no
+  // occluder inside the radius, where a correct estimator returns the SAME
+  // value at every texel. Any spread here is the estimator's own pattern
+  // (radial strata, angular stipple, filter residue): the "no noise, no
+  // steps" gate in one number, per pixel of the AO buffer, before upsampling.
+  const floorValues = [];
   let nonFinite = 0;
   const nearest = Object.fromEntries(Object.keys(subjects).map((k) => [k, { d: Infinity, v: null, dbg: null }]));
   for (let py = 0; py < vh; py++) {
@@ -236,6 +324,13 @@ const out = await page.evaluate(async ({ subjects }) => {
       values.push(v);
       const gv = f16(rawGtao[o]);
       if (Number.isFinite(gv)) gtaoValues.push(gv);
+      {
+        const X = pos[gi2], Y = pos[gi2 + 1], Z = pos[gi2 + 2];
+        const box = subjects.contact, sph = subjects.sphere;
+        const dBox = Math.hypot(X - box[0], Z - box[2]);
+        const dSph = Math.hypot(X - sph[0], Z - sph[2]);
+        if (Math.abs(Y) < 0.03 && dBox > 1.2 && dSph > 1.2 && Math.abs(X) < 2.4 && Math.abs(Z) < 2.4) floorValues.push(v);
+      }
       for (const [k, p] of Object.entries(subjects)) {
         const d = (pos[gi2] - p[0]) ** 2 + (pos[gi2 + 1] - p[1]) ** 2 + (pos[gi2 + 2] - p[2]) ** 2;
         if (d < nearest[k].d) {
@@ -254,10 +349,21 @@ const out = await page.evaluate(async ({ subjects }) => {
       ...extra,
     };
   };
+  // The AO texture's x channel, 8-bit, row order as stored — for the PNG dump.
+  const aoBytes = new Uint8Array(vw * vh);
+  for (let i = 0; i < vw * vh; i++) {
+    const v = f16(finalAo[i * 4]);
+    aoBytes[i] = Number.isFinite(v) ? Math.max(0, Math.min(255, Math.round(v * 255))) : 0;
+  }
   const stats = summarize(values, { nonFinite });
   const gtaoStats = summarize(gtaoValues);
+  const floorStats = summarize(floorValues);
+  if (floorValues.length > 1) {
+    const m = floorStats.mean;
+    floorStats.std = Math.sqrt(floorValues.reduce((a, x) => a + (x - m) * (x - m), 0) / (floorValues.length - 1));
+  }
   const points = Object.fromEntries(Object.entries(nearest).map(([k, n]) => [k, { ao: n.v, dist: Math.sqrt(n.d), dbg: n.dbg }]));
-  return { stats, gtaoStats, points, size: [vw, vh], gsize: [gw, gh] };
+  return { stats, gtaoStats, floorStats, points, size: [vw, vh], gsize: [gw, gh], aoBytes: Array.from(aoBytes), downsample };
 }, { subjects: SUBJECTS });
 
 if (out.error) { console.log(`FAIL — ${out.error}`); await browser.close(); process.exit(1); }
@@ -284,7 +390,13 @@ const f = (n) => (Number.isFinite(n) ? n.toFixed(3) : String(n));
 const s = out.stats;
 const gs = out.gtaoStats;
 console.log(`\nAO buffer ${out.size.join("x")} over gbuffer ${out.gsize.join("x")} — ${s.count} surface texels`);
+if (out.downsample) {
+  const d = out.downsample;
+  console.log(`  downsample ${d.full.join("x")} -> ${d.half.join("x")}: mean |dP| direct ${f(d.meanDeltaDirect)} m, flipped ${f(d.meanDeltaFlipped)} m over ${d.samples} texels ${d.meanDeltaDirect < 0.05 ? "PASS" : "FAIL"}`);
+}
 console.log(`  mean ${f(s.mean)}  min ${f(s.min)}  p05 ${f(s.p05)}  p50 ${f(s.p50)}  p95 ${f(s.p95)}  max ${f(s.max)}`);
+const fl = out.floorStats;
+console.log(`  open floor (${fl.count} texels, no occluder in reach): mean ${f(fl.mean)}  std ${f(fl.std)}  p05 ${f(fl.p05)}  p95 ${f(fl.p95)}  spread(p95-p05) ${f(fl.p95 - fl.p05)}`);
 for (const [k, v] of Object.entries(out.points)) {
   const d = process.env.GTAO_DEBUG === "1" && v.dbg
     ? `  | unoccluded-ref ${f(v.dbg[0])}  horizon-raise ${f(v.dbg[1])}  reach ${f(v.dbg[2])}px`
@@ -307,13 +419,28 @@ if (cost && Object.keys(cost).length) {
   if (cost.full) console.log(`PROFILE: ${JSON.stringify(cost.full)}`);
 }
 
+if (process.env.CAPTURE === "1" && out.aoBytes) {
+  const tag = [
+    `s${process.env.GTAO_STEPS ?? "d"}`, `k${process.env.GTAO_SLICES ?? "d"}`,
+    RADIAL_PHASE ? "ph" : "noph", AO_FILTER ? `f${process.env.AO_FILTER_RADIUS ?? "d"}` : "nof",
+    `rs${process.env.RESOLVE_SCALE ?? "d"}`,
+  ].join("-");
+  const name = `${root}/ao-texels-${QUALITY}-${tag}-${out.size.join("x")}.png`;
+  writeFileSync(name, greyPng(out.size[0], out.size[1], Uint8Array.from(out.aoBytes)));
+  console.log(`AO TEXELS: ${name}`);
+}
 if (process.env.CAPTURE === "1") {
   await page.evaluate(() => { globalThis.__giDebugView = "ao"; });
   await wait(1000);
   const shot = await page.evaluate(async () => (
     globalThis.__editorApi.call("viewport.screenshot", { width: 960, height: 640, includeGizmos: true })
   ));
-  const name = `${root}/gtao-${QUALITY}-world${WORLD}-r${process.env.GTAO_INTERVALS ?? "default"}.png`;
+  const tag = [
+    `s${process.env.GTAO_STEPS ?? "d"}`, `k${process.env.GTAO_SLICES ?? "d"}`,
+    RADIAL_PHASE ? "ph" : "noph", AO_FILTER ? `f${process.env.AO_FILTER_RADIUS ?? "d"}` : "nof",
+    `rs${process.env.RESOLVE_SCALE ?? "d"}`,
+  ].join("-");
+  const name = `${root}/gtao-${QUALITY}-world${WORLD}-r${process.env.GTAO_INTERVALS ?? "default"}-${tag}.png`;
   writeFileSync(name, Buffer.from(shot.__image.base64, "base64"));
   console.log(`CAPTURE: ${name}`);
 }

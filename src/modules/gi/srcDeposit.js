@@ -140,6 +140,7 @@ import {
   SURPRISE_ONE,
   W0,
   sunSplitArmed,
+  confidenceArmed, confidenceFullRays, confidencePriorRays,
   binCount,
   binGridWidth,
   sunBounceChromaGainForCascade,
@@ -158,6 +159,8 @@ import {
 } from "./srcMathTsl.js";
 import {
   INFLUX_ONE,
+  PRIORITY_REP_PIXEL_BITS,
+  PRIORITY_REP_PIXEL_MASK,
   PROBE_BLOCK,
   PROBE_PARENT,
   PROBE_WORDS,
@@ -293,12 +296,26 @@ export const PAYLOAD_UNKNOWN = -1;
 /** Word offset of bin `bin` in `payload`. */
 const payloadWord = (bin) => uint(bin).mul(uint(PAYLOAD_WORDS));
 
-/** `{ L: vec3, T: float }` of bin `bin` — two loads, both unpacked. */
+/**
+ * `{ L: vec3, T: float, c: float, cen: uint }` of bin `bin` — three loads,
+ * unpacked. `cen` is the §11.28 radiance-centroid code riding word 2's high
+ * half (0 = the bin's own centre).
+ */
 export function readPayload(payload, bin) {
   const o = payloadWord(bin).toVar();
   const rg = unpackHalf2x16(payload.element(o)).toVar();
   const bt = unpackHalf2x16(payload.element(o.add(uint(1)))).toVar();
-  return { L: vec3(rg.x, rg.y, bt.x).toVar(), T: bt.y.toVar() };
+  const w2 = payload.element(o.add(uint(2))).toVar();
+  const cs = unpackHalf2x16(w2).toVar();
+  return {
+    L: vec3(rg.x, rg.y, bt.x).toVar(), T: bt.y.toVar(), c: cs.x.toVar(),
+    cen: w2.shiftRight(uint(16)).toVar(),
+  };
+}
+
+/** Confidence alone — one load (§11.25). */
+export function readPayloadC(payload, bin) {
+  return unpackHalf2x16(payload.element(payloadWord(bin).add(uint(2)))).x.toVar();
 }
 
 /** Transmittance alone — one load, for the early-outs that never need L. */
@@ -306,17 +323,26 @@ export function readPayloadT(payload, bin) {
   return unpackHalf2x16(payload.element(payloadWord(bin).add(uint(1)))).y.toVar();
 }
 
-/** Store `L` (vec3) and `T` (float) into bin `bin`. */
-export function writePayload(payload, bin, L, T) {
+/**
+ * Store `L` (vec3), `T` (float), confidence `c` (float, default 1) and the
+ * §11.28 centroid code `cen` (uint, default 0 = the bin's centre) into bin
+ * `bin`. The code rides word 2's high half: `packHalf2x16(vec2(c, 0))` leaves
+ * that half zero, so the OR is exact and `readPayloadC` never sees it.
+ */
+export function writePayload(payload, bin, L, T, c = null, cen = null) {
   const o = payloadWord(bin).toVar();
   payload.element(o).assign(packHalf2x16(vec2(L.x, L.y)));
   payload.element(o.add(uint(1))).assign(packHalf2x16(vec2(L.z, T)));
+  const w2 = packHalf2x16(vec2(c == null ? float(1) : c, float(0)));
+  payload.element(o.add(uint(2))).assign(cen == null ? w2 : w2.bitOr(uint(cen).shiftLeft(uint(16))));
 }
 
-/** Mark bin `bin` UNKNOWN (T = −1; the blue channel is meaningless with it). */
+/** Mark bin `bin` UNKNOWN (T = −1, confidence 0; the blue channel is meaningless with it). */
 export function writePayloadUnknown(payload, bin) {
-  payload.element(payloadWord(bin).add(uint(1)))
+  const o = payloadWord(bin).toVar();
+  payload.element(o.add(uint(1)))
     .assign(packHalf2x16(vec2(float(0), float(PAYLOAD_UNKNOWN))));
+  payload.element(o.add(uint(2))).assign(uint(0));
 }
 
 /**
@@ -338,17 +364,47 @@ export function decodePayload(words) {
 }
 
 /**
+ * The confidence channel (§11.25), one float per bin, from a payload readback.
+ * Kept OUT of `decodePayload`'s `[r, g, b, T]` so every consumer that indexes
+ * that array by `PAYLOAD_CHANNELS` keeps working unchanged.
+ */
+export function decodePayloadConfidence(words) {
+  const src = words instanceof Uint32Array ? words : new Uint32Array(words);
+  const bins = Math.floor(src.length / PAYLOAD_WORDS);
+  const out = new Float32Array(bins);
+  for (let i = 0; i < bins; i++) out[i] = unpackHalf2(src[i * PAYLOAD_WORDS + 2])[0];
+  return out;
+}
+
+/**
+ * The §11.28 centroid codes, one per bin, from a payload readback (0 = the
+ * bin's centre; decode with `srcMath.decodeCentroid`).
+ */
+export function decodePayloadCentroid(words) {
+  const src = words instanceof Uint32Array ? words : new Uint32Array(words);
+  const bins = Math.floor(src.length / PAYLOAD_WORDS);
+  const out = new Uint16Array(bins);
+  for (let i = 0; i < bins; i++) out[i] = src[i * PAYLOAD_WORDS + 2] >>> 16;
+  return out;
+}
+
+/**
  * CPU twin of the pack: a `[r, g, b, T]`-per-bin field → packed words, into
  * `out` (a `Uint32Array` of `PAYLOAD_WORDS` per bin — `bins.payload.value.array`
- * for a gate that synthesizes its own field) or a fresh array.
+ * for a gate that synthesizes its own field) or a fresh array. `confidence`
+ * (one float per bin) is optional: a synthesized field without one encodes a
+ * known bin at confidence 1 and an unknown bin at 0 — exactly the previous
+ * estimator, so every existing fixture means what it meant.
  */
-export function encodePayload(field, out = null) {
+export function encodePayload(field, out = null, confidence = null) {
   const bins = Math.floor(field.length / PAYLOAD_CHANNELS);
   const dst = out ?? new Uint32Array(bins * PAYLOAD_WORDS);
   for (let i = 0; i < bins; i++) {
     const o = i * PAYLOAD_CHANNELS;
     dst[i * PAYLOAD_WORDS] = packHalf2(field[o], field[o + 1]);
     dst[i * PAYLOAD_WORDS + 1] = packHalf2(field[o + 2], field[o + 3]);
+    const c = confidence ? confidence[i] : (field[o + 3] >= 0 ? 1 : 0);
+    dst[i * PAYLOAD_WORDS + 2] = packHalf2(c, 0);
   }
   return dst;
 }
@@ -568,7 +624,13 @@ export const STAT_INSIDE_MOVER = STAT_SEC_LOD_BASE + STAT_SEC_LOD_WORDS * STAT_S
 // them reached the second-bounce list with the mover flag intact.
 export const STAT_MOVER_HITS = STAT_INSIDE_MOVER + 1;
 export const STAT_MOVER_RECORDS = STAT_INSIDE_MOVER + 2;
-export const STAT_WORDS = STAT_INSIDE_MOVER + 3;
+// §11.44: tree-sample visibilities answered by the per-probe cache (no march).
+export const STAT_VIS_CACHED = STAT_INSIDE_MOVER + 3;
+export const STAT_VIS_NOBLOCK = STAT_INSIDE_MOVER + 4;  // hit outside the populated c0 field
+export const STAT_VIS_NOROW = STAT_INSIDE_MOVER + 5;    // the block has 8 lamps cached already
+export const STAT_VIS_FILLING = STAT_INSIDE_MOVER + 6;  // row found, fewer than K samples
+export const STAT_VIS_FULL = STAT_INSIDE_MOVER + 7;     // the cell hash refused the insert (table full)
+export const STAT_WORDS = STAT_INSIDE_MOVER + 8;
 const T_FIXED = 1024;
 
 /**
@@ -594,6 +656,11 @@ export function createSrcShadeCounters(bins) {
     shaded: bump(STAT_SHADED),
     unattributed: bump(STAT_UNATTRIBUTED),
     shadowRays: bump(STAT_SHADOWRAYS),
+    visCached: bump(STAT_VIS_CACHED),
+    visNoBlock: bump(STAT_VIS_NOBLOCK),
+    visNoRow: bump(STAT_VIS_NOROW),
+    visFilling: bump(STAT_VIS_FILLING),
+    visFull: bump(STAT_VIS_FULL),
     emissiveHits: bump(STAT_EMISSIVE),
     emissiveZeroed: bump(STAT_EMIT_ZEROED),
     albedoClamped: bump(STAT_ALBEDO_CLAMPED),
@@ -849,6 +916,7 @@ export function createSrcDepositFrame(store, bins, {
   influxLift = null,
   surprise = null,
   rayWork = null,
+  rayWorkPacked = false,
   sunBounceCompensation = false,
   maxLods = MAX_LODS,
   stride = null,
@@ -1292,15 +1360,19 @@ export function createSrcDepositFrame(store, bins, {
   const compacted = !!rayWork;
   passes.push(Fn(() => {
     let i;
+    let packetOffset = null;
     if (compacted) {
       If(instanceIndex.greaterThanEqual(atomicLoad(rayWork.element(uint(0)))), () => { Return(); });
-      i = atomicLoad(rayWork.element(instanceIndex.add(uint(1)))).toVar();
+      const entry = atomicLoad(rayWork.element(instanceIndex.add(uint(1)))).toVar();
+      i = rayWorkPacked ? entry.bitAnd(uint(PRIORITY_REP_PIXEL_MASK)).toVar() : entry;
+      if (rayWorkPacked) packetOffset = entry.shiftRight(uint(PRIORITY_REP_PIXEL_BITS)).mul(uint(raysPerPixel)).toVar();
     } else {
       i = pixelOf(instanceIndex.toVar());
       if (outOfRange) If(outOfRange(i), () => { Return(); });
     }
     const base = pixelRayBase.element(i).toVar();
     If(base.equal(uint(SLOT_EMPTY)), () => { Return(); });
+    if (packetOffset) base.addAssign(packetOffset);
     const probe0 = pixelProbe.element(i).toVar();
     If(probe0.equal(uint(SLOT_EMPTY)), () => { Return(); });
 
@@ -1578,7 +1650,9 @@ export function createSrcDepositFrame(store, bins, {
       let lumaFx = null;
       if (!deferred) {
         const sunGain = sunBounceCompensation ? float(1).toVar() : null;
-        const sunChromaGain = sunBounceCompensation ? float(1).toVar() : null;
+        const sunChromaGain = sunBounceCompensation
+          ? float(sunBounceChromaGainForCascade(0)).toVar()
+          : null;
         if (sunGain) {
           for (let c = 1; c < N; c++) {
             const ownsCascade = own.greaterThanEqual(int(c));
@@ -1842,6 +1916,21 @@ export function createSrcDepositFrame(store, bins, {
       writePayloadUnknown(payload, i);
       Return();
     });
+    // §11.25 — CONFIDENCE, from the same count. `N` is rays of accumulated
+    // weight (count carries DEPOSIT_SCALE per ray); `c = N/(N+K)` is the
+    // posterior weight of the bin's own measurement against K pseudo-rays of
+    // the prior. No threshold anywhere: one ray is worth 1/(1+K), K rays half.
+    // `__giSrcConfidence = false` pins it to 1 — the previous estimator.
+    const rays = float(count).div(float(DEPOSIT_SCALE)).toVar();
+    // §11.29: the prior's share collapses with evidence — `srcMath.confidenceOf`
+    // is the twin; F = 0 restores the plain `N/(N+K)`.
+    const fullRays = confidenceFullRays();
+    const base = rays.div(rays.add(float(confidencePriorRays()))).toVar();
+    const conf = confidenceArmed()
+      ? (fullRays > 0
+        ? float(1).sub(float(1).sub(base).mul(rays.negate().div(float(fullRays)).exp())).toVar()
+        : base)
+      : float(1).toVar();
     const inv = float(1).div(float(count)).toVar();
     // `Lmax/count`, with NO `2^F` in it: radiance carries `2^F` per ray and
     // count now carries `2^F` per ray as well, so the two scales cancel exactly
@@ -1925,7 +2014,7 @@ export function createSrcDepositFrame(store, bins, {
       L.assign(L.min(vec3(float(lmax))));
     }
 
-    writePayload(payload, i, L, float(atomicLoad(scratch.element(b.add(uint(BIN_T))))).mul(inv));
+    writePayload(payload, i, L, float(atomicLoad(scratch.element(b.add(uint(BIN_T))))).mul(inv), conf);
   })().compute(binTotal));
 
   return {
@@ -1983,6 +2072,12 @@ export function createSrcDepositFrame(store, bins, {
         shaded,
         unattributed: v[STAT_UNATTRIBUTED] >>> 0,
         shadowRays: v[STAT_SHADOWRAYS] >>> 0,
+        // §11.44: tree-sample visibilities the per-probe cache answered.
+        visCached: v[STAT_VIS_CACHED] >>> 0,
+        visNoBlock: v[STAT_VIS_NOBLOCK] >>> 0,
+        visNoRow: v[STAT_VIS_NOROW] >>> 0,
+        visFilling: v[STAT_VIS_FILLING] >>> 0,
+        visFull: v[STAT_VIS_FULL] >>> 0,
         // §11.13: rays that traced their far intervals, and the share of all
         // rays they were. `farRate` 1 = no far duty in effect.
         farRays: v[STAT_FAR] >>> 0,

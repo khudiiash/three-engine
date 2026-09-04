@@ -99,6 +99,7 @@ import {
   instancedArray,
   instanceIndex,
   int,
+  ivec2,
   ivec3,
   Return,
   select,
@@ -106,20 +107,23 @@ import {
   uint,
   vec3,
 } from "three/tsl";
-import { CASCADE_COUNT, W0 } from "./srcConfig.js";
-import { LOS_OCC_HI, LOS_OCC_LO, LOS_PATH_HI, LOS_PATH_LO, binDirTable, mergeLosWeight, worldKeysEnabled } from "./srcMath.js";
+import { CASCADE_COUNT, INPAINT_DISCOUNT, INPAINT_LOW, PARENT_FILL_CONFIDENCE, W0, centroidArmed, confidenceArmed, farPriorArmed, inpaintArmed } from "./srcConfig.js";
+import { LOS_OCC_HI, LOS_OCC_LO, LOS_PATH_HI, LOS_PATH_LO, binCentroidTable, binDirTable, mergeLosWeight, worldKeysEnabled } from "./srcMath.js";
 import {
   cellPosition,
+  decodeCentroidOffset,
+  encodeCentroidOffset,
   keyCell,
   keyWorldCell,
   keyLod,
   keySecondary,
   latticeOrigin,
   latticeOriginCell,
+  luminanceTsl,
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
-import { readPayload, readPayloadT, writePayload } from "./srcDeposit.js";
+import { readPayload, readPayloadC, readPayloadT, writePayload } from "./srcDeposit.js";
 import {
   FLAG_ALIVE,
   PROBE_BLOCK,
@@ -233,6 +237,10 @@ export function createSrcMergeFrame(store, bins, {
   // compositing the flat mean; absent (every gate fixture), the flat `sky`
   // path compiles bit-identically to the pre-S1 build.
   skyEnv = null,
+  // §11.26 — `{ node }` of the 4×1 far-field texture (texel 2 = the screen
+  // gather's raw mean IRRADIANCE, alpha = primed). The prior of last resort
+  // for a bin with nothing to look through; null in every gate fixture.
+  farField = null,
   w0 = W0,
   losOccupied = null,
   losSegment = null,
@@ -307,6 +315,22 @@ export function createSrcMergeFrame(store, bins, {
       atomicStore(stats.element(i), uint(0));
     });
   })().compute(statWords));
+
+  // ── §11.26: THE PRIOR OF LAST RESORT ──────────────────────────────────────
+  //
+  // The far-field texture's texel 2 is the screen gather's raw mean
+  // irradiance (alpha ≥ 0.5 once primed); divided by π it is a radiance in
+  // the payload's units — the same conversion srcSeed's far prior makes. A
+  // bin that has NO parent to look through (an orphan, or the top cascade)
+  // shrinks toward it by `1 − c` instead of handing the tile its own one-ray
+  // coin toss. Unprimed (the first frames after a build) it shrinks toward
+  // nothing, i.e. the previous behaviour, so a cold boot cannot go black.
+  const farOn = !!farField?.node && farPriorArmed();
+  const farPrior = () => {
+    if (!farOn) return null;
+    const t = farField.node.load(ivec2(2, 0)).toVar();
+    return { L: t.xyz.div(Math.PI).toVar(), ready: t.w.greaterThan(0.5).toVar() };
+  };
 
   // ── [G.1] resolve each probe's 8 parent corners ───────────────────────────
   //
@@ -487,6 +511,10 @@ export function createSrcMergeFrame(store, bins, {
     // directional sky is armed, so an unarmed build binds nothing new.
     const wTop = Math.round(Math.sqrt(info.bins / 2));
     const skyDirTable = skyEnv ? instancedArray(binDirTable(wTop), "vec4") : null;
+    // §11.52 — the per-bin INTEGRATED sky (srcSkyBins.js): the mean radiance
+    // over the whole bin, not one tap at its centre. Selected on the GPU by
+    // its `ready` uniform so an unreadable source keeps the tap.
+    const skyBinTable = skyEnv?.tables ? skyEnv.tables.tableFor(wTop) : null;
     passes.push(Fn(() => {
       const i = instanceIndex.toVar();
       const bin = uint(info.binBase).add(i).toVar();
@@ -511,10 +539,33 @@ export function createSrcMergeFrame(store, bins, {
           d.y,
           d.z.mul(cr).sub(d.x.mul(sr)),
         ).toVar();
-        S.assign(vec3(skyEnv.node.sample(equirectUV(rd)).level(0).xyz).mul(skyEnv.intensity));
+        const tap = vec3(skyEnv.node.sample(equirectUV(rd)).level(0).xyz).toVar();
+        if (skyBinTable) {
+          // The table is exact over the bin's solid angle; the tap misses a
+          // few-texel sun entirely (84 % of the user's HDRI — the header of
+          // srcSkyBins.js). Rotation is baked into the table, so it is read
+          // by the UNROTATED bin index.
+          tap.assign(select(
+            skyBinTable.ready.greaterThan(0.5),
+            vec3(skyBinTable.node.element(m).xyz),
+            tap,
+          ));
+        }
+        S.assign(tap.mul(skyEnv.intensity));
       }
       const self = readPayload(payload, bin);
-      writePayload(payload, bin, self.L.add(S.mul(T)), float(0));
+      const closed = self.L.add(S.mul(T)).toVar();
+      // §11.26: the top cascade has nothing above it to look through, so its
+      // low-confidence bins shrink toward the far-field mean (a cold top bin
+      // used to be a one-ray value that every level below then composited).
+      const fp = farPrior();
+      if (fp && confidenceArmed()) {
+        const c = self.c.clamp(0, 1).toVar();
+        If(fp.ready, () => {
+          closed.assign(closed.mul(c).add(fp.L.mul(float(1).sub(c))));
+        });
+      }
+      writePayload(payload, bin, closed, float(0), self.c);
       atomicAdd(stats.element(sw(top, MERGE_SKY)), uint(1));
     })().compute(info.bins * info.blockCapacity));
   }
@@ -525,6 +576,12 @@ export function createSrcMergeFrame(store, bins, {
     const parentInfo = bins.cascades[c + 1];
     const nBins = info.bins;
     const recordBase = cornerCascades[c].base;
+    // §11.28: the bin-centre LUTs (Morton order) of the own and the parent
+    // level — the direction a bin's centroid falls back to when its code is
+    // 0 (the resolve writes 0; only a merged level carries a code).
+    const cenOn = centroidArmed();
+    const dirOwn = cenOn ? instancedArray(binCentroidTable(Math.round(Math.sqrt(nBins / 2))), "vec4") : null;
+    const dirPar = cenOn ? instancedArray(binCentroidTable(Math.round(Math.sqrt(parentInfo.bins / 2))), "vec4") : null;
 
     passes.push(Fn(() => {
       // One thread per (block, bin). `nBins` is a power of two at every
@@ -588,12 +645,32 @@ export function createSrcMergeFrame(store, bins, {
       }
       // The interval this bin contributes of its own: its measurement, or the
       // empty-near-segment stand-in when the fill is armed.
-      const ownT = fillUnknown ? select(unknown, float(1), selfT).toVar() : selfT;
+      //
+      // ── §11.25 — AND SHRUNK TOWARD THAT STAND-IN BY ITS CONFIDENCE ───────
+      //
+      // `c` is the bin's posterior weight on its own measurement (srcDeposit's
+      // resolve: `N/(N+K)`). A bin with one ray is 20 % its own answer and
+      // 80 % "no evidence of a near occluder — let the parent through"; a bin
+      // with many rays is its own answer. The parent composite below then does
+      // exactly what it always did, on `own'` instead of `own`. There is no
+      // count at which anything SWITCHES, which is the whole point: the
+      // membership threshold at `MIN_WEIGHT` handed a one-ray bin a FULL vote
+      // in the lobe, and in a dark corridor that vote is a 128 %-of-mean step.
+      // `__giSrcConfidence = false` pins c ≡ 1: the previous estimator, exactly.
+      const selfC = confidenceArmed() ? readPayloadC(payload, selfBin) : float(1).toVar();
+      const ownTRaw = fillUnknown ? select(unknown, float(1), selfT).toVar() : selfT;
+      const ownT = float(1).sub(selfC).add(selfC.mul(ownTRaw)).toVar();
 
       const record = uint(recordBase).add(block.mul(uint(MERGE_CORNERS))).toVar();
       const acc = vec3(0).toVar();
       const accT = float(0).toVar();
       const wsum = float(0).toVar();
+      const accC = float(0).toVar();
+      // §11.28: Σ corner-weight × the corner's two moments — where the
+      // radiance sits (`pO`) and where a uniform radiance would (`pR`,
+      // scaled by the corner's luminance); their difference is the offset.
+      const accO = vec3(0).toVar();
+      const accR = vec3(0).toVar();
 
       for (let k = 0; k < MERGE_CORNERS; k++) {
         const parentBlock = cornerBlock.element(record.add(uint(k))).toVar();
@@ -620,6 +697,16 @@ export function createSrcMergeFrame(store, bins, {
           const pL = vec3(0).toVar();
           const pT = float(0).toVar();
           const known = float(0).toVar();
+          // §11.25: the four children vote by CONFIDENCE, not by presence, so
+          // a corner's pre-average fades toward its well-sampled children as
+          // the sparse ones accumulate evidence, instead of snapping when one
+          // crosses the membership threshold. `pC` is the corner's own
+          // confidence (mean over the children that exist).
+          const pC = float(0).toVar();
+          const nC = float(0).toVar();
+          const pO = vec3(0).toVar();
+          const pR = vec3(0).toVar();
+          const pLum = float(0).toVar();
           for (let j = 0; j < 4; j++) {
             const parent = readPayload(payload, pBase.add(uint(j)));
             // UNKNOWN CHILDREN ARE SKIPPED and the average renormalizes over
@@ -627,16 +714,42 @@ export function createSrcMergeFrame(store, bins, {
             // zeros" rule the sparse gather below runs under. All four unknown
             // makes the whole corner absent, not black.
             If(parent.T.greaterThanEqual(0), () => {
-              pL.addAssign(parent.L);
-              pT.addAssign(parent.T);
-              known.addAssign(1);
+              const cj = confidenceArmed() ? parent.c.max(1e-4) : float(1);
+              pL.addAssign(parent.L.mul(cj));
+              pT.addAssign(parent.T.mul(cj));
+              known.addAssign(cj);
+              pC.addAssign(confidenceArmed() ? parent.c : float(1));
+              nC.addAssign(1);
+              // §11.28: where this child's radiance sits — its area mean
+              // vector plus its own carried offset (zero for code 0) —
+              // weighted by its luminance and its vote (`pO`), and where a
+              // uniform radiance would sit, weighted by the vote alone
+              // (`pR`). The FINER level's centres are what carry the
+              // sub-bin information down.
+              if (cenOn) {
+                const ctr = vec3(dirPar.element(m.mul(uint(4)).add(uint(j))).xyz).toVar();
+                const oj = decodeCentroidOffset(parent.cen, ctr);
+                const lw = luminanceTsl(parent.L).max(0).mul(cj).toVar();
+                pO.addAssign(ctr.add(oj).mul(lw));
+                pR.addAssign(ctr.mul(cj));
+                pLum.addAssign(lw);
+              }
             });
           }
           If(known.greaterThan(0), () => {
             const inv = float(1).div(known).toVar();
-            acc.addAssign(pL.mul(inv).mul(weight));
-            accT.addAssign(pT.mul(inv).mul(weight));
-            wsum.addAssign(weight);
+            const cornerC = pC.div(nC.max(1)).toVar();
+            // The corner's weight in the sparse gather carries its confidence
+            // too: a parent that knows little votes little.
+            const wc = weight.mul(confidenceArmed() ? cornerC.max(1e-4) : float(1)).toVar();
+            acc.addAssign(pL.mul(inv).mul(wc));
+            accT.addAssign(pT.mul(inv).mul(wc));
+            wsum.addAssign(wc);
+            accC.addAssign(cornerC.mul(wc));
+            if (cenOn) {
+              accO.addAssign(pO.mul(inv).mul(wc));
+              accR.addAssign(pR.mul(inv).mul(pLum.mul(inv)).mul(wc));
+            }
           });
         });
       }
@@ -650,12 +763,35 @@ export function createSrcMergeFrame(store, bins, {
         const invW = float(1).div(wsum).toVar();
         const parentL = acc.mul(invW).toVar();
         const parentT = accT.mul(invW).toVar();
-        const ownL = fillUnknown
-          ? select(unknown, vec3(0), readPayload(payload, selfBin).L).toVar()
-          : readPayload(payload, selfBin).L;
-        const outL = vec3(ownL).add(parentL.mul(ownT)).toVar();
+        const own = readPayload(payload, selfBin);
+        const ownLRaw = fillUnknown
+          ? select(unknown, vec3(0), own.L).toVar()
+          : own.L;
+        // §11.25: own radiance shrunk by confidence (the transmittance half was
+        // shrunk above); the parent shines through the rest.
+        const ownL = vec3(ownLRaw).mul(selfC).toVar();
+        const outL = ownL.add(parentL.mul(ownT)).toVar();
         const outT = ownT.mul(parentT).toVar();
-        writePayload(payload, selfBin, outL, outT);
+        // The merged bin's confidence: its own, plus the parent's for the share
+        // it delegated — DISCOUNTED, so a purely parent-filled bin is present in
+        // the lobe average but never dominates a neighbour that measured.
+        const parentC = accC.div(wsum.max(1e-6)).toVar();
+        const outC = confidenceArmed()
+          ? selfC.add(float(1).sub(selfC).mul(parentC).mul(float(PARENT_FILL_CONFIDENCE))).clamp(0, 1).toVar()
+          : float(1).toVar();
+        // §11.28: the merged bin's centroid offset — the own radiance sits
+        // at the own offset (zero: the resolve has no sub-bin information),
+        // the parent's arrives through the own transmittance at the parent's
+        // luminance-weighted offset; divided by the merged luminance it is
+        // the offset of the merged `L`. Zero luminance → zero offset.
+        let outCen = null;
+        if (cenOn) {
+          const lumOut = luminanceTsl(outL).max(0).toVar();
+          const oOut = accO.sub(accR).mul(invW).mul(ownT).div(lumOut.max(1e-12)).toVar();
+          const oSafe = select(lumOut.greaterThan(0), oOut, vec3(0)).toVar();
+          outCen = encodeCentroidOffset(oSafe, dirOwn.element(m).xyz);
+        }
+        writePayload(payload, selfBin, outL, outT, outC, outCen);
         atomicAdd(stats.element(sw(c, MERGE_MERGED)), uint(1));
         If(outT.equal(0), () => { atomicAdd(stats.element(sw(c, MERGE_OPAQUE)), uint(1)); });
       }).Else(() => {
@@ -664,7 +800,25 @@ export function createSrcMergeFrame(store, bins, {
         // can fill it in on a later frame and `srcGather`'s `L + T·sky` still
         // gives it the c0-only answer meanwhile. A fixed-radius fallback here
         // is precisely the cliff R1 forbids.
+        //
+        // §11.26 — BUT AN ORPHAN WITH LOW CONFIDENCE IS THE COLD-COLUMN CASE
+        // (a fresh probe whose parents were born the same frame), and keeping
+        // its own one-ray value unshrunk is exactly the coin toss Unit 1 was
+        // built to remove — it survived here because a warm revisit always
+        // has a parent. Shrink toward the far-field mean by `1 − c`: the
+        // transmittance shrinks with it, because the prior IS the radiance
+        // that would have arrived from beyond. `L + T·sky` downstream is
+        // unchanged in form.
         atomicAdd(stats.element(sw(c, MERGE_ORPHAN)), uint(1));
+        const fpo = farPrior();
+        if (fpo && confidenceArmed()) {
+          If(fpo.ready.and(unknown.not()), () => {
+            const own = readPayload(payload, selfBin);
+            const cc = own.c.clamp(0, 1).toVar();
+            const oneMinus = float(1).sub(cc).toVar();
+            writePayload(payload, selfBin, own.L.mul(cc).add(fpo.L.mul(oneMinus)), own.T.mul(cc), own.c, own.cen);
+          });
+        }
         // ⭐⭐ AND SPLIT IT BY WHETHER IT COST A PHOTON (2026-08-23).
         //
         // The headline "26% orphaning" says nothing about lost light on its own,
@@ -692,6 +846,93 @@ export function createSrcMergeFrame(store, bins, {
         });
       });
     })().compute(info.blockCapacity * nBins));
+  }
+
+  // ── §11.27 [G.4] DIRECTIONAL INPAINTING, cascades 0 and 1 (the two the
+  // tiles bake) ────────────────────────────────────────────────────────────
+  //
+  // After the ladder has merged a cascade, a bin whose confidence is below
+  // INPAINT_LOW takes the confidence-weighted mean of its confident angular
+  // neighbours on the 2w×w grid (i wraps in azimuth, j clamps at the poles;
+  // diagonals at half weight), blended by `c / INPAINT_LOW`, and carries
+  // their confidence × INPAINT_DISCOUNT. The tile bake then extrapolates
+  // along the sphere's own structure — dark into a crevice, bright beside a
+  // sun patch — instead of from the lobe mean, which is the enclosure leak's
+  // named cause. RACE-FREE BY CONSTRUCTION: a thread writes only bins with
+  // c < INPAINT_LOW and reads only bins with c >= INPAINT_LOW, which no
+  // thread writes. Mirrors srcMath's `inpaintBins` exactly.
+  if (inpaintArmed() && confidenceArmed()) {
+    for (let c = 0; c < Math.min(2, N); c++) {
+      const info = bins.cascades[c];
+      const nBins = info.bins;
+      const wGrid = Math.round(Math.sqrt(nBins / 2));
+      passes.push(Fn(() => {
+        const i = instanceIndex.toVar();
+        const block = i.div(uint(nBins)).toVar();
+        const m = i.mod(uint(nBins)).toVar();
+        if (Number.isInteger(store?.blockLiveBase) && store?.freeStack) {
+          const live = store.freeStack.element(uint(store.blockLiveBase + info.blockBase).add(block));
+          If(live.equal(uint(0)), () => { Return(); });
+        }
+        const base = uint(info.binBase).add(block.mul(uint(nBins))).toVar();
+        const selfBin = base.add(m).toVar();
+        const own = readPayload(payload, selfBin);
+        const ownKnown = own.T.greaterThanEqual(0).toVar();
+        const c = select(ownKnown, own.c.clamp(0, 1), float(0)).toVar();
+        If(c.greaterThanEqual(float(INPAINT_LOW)), () => { Return(); });
+        // Morton → (i, j) on the 2w×w grid, for a 4-bit-wide j (w ≤ 16).
+        const bi = uint(0).toVar();
+        const bj = uint(0).toVar();
+        for (let b = 0; b < 5; b++) {
+          bi.assign(bi.bitOr(m.shiftRight(uint(2 * b)).bitAnd(uint(1)).shiftLeft(uint(b))));
+          bj.assign(bj.bitOr(m.shiftRight(uint(2 * b + 1)).bitAnd(uint(1)).shiftLeft(uint(b))));
+        }
+        const acc = vec3(0).toVar();
+        const accT = float(0).toVar();
+        const accC = float(0).toVar();
+        const wsum = float(0).toVar();
+        for (let dj = -1; dj <= 1; dj++) {
+          for (let di = -1; di <= 1; di++) {
+            if (di === 0 && dj === 0) continue;
+            const jj = bj.toInt().add(int(dj)).toVar();
+            If(jj.greaterThanEqual(0).and(jj.lessThan(int(wGrid))), () => {
+              const ii = bi.toInt().add(int(di)).add(int(2 * wGrid)).mod(int(2 * wGrid)).toVar();
+              // (i, j) → Morton: interleave the low 5 bits.
+              const mm = uint(0).toVar();
+              for (let b = 0; b < 5; b++) {
+                mm.assign(mm.bitOr(ii.toUint().shiftRight(uint(b)).bitAnd(uint(1)).shiftLeft(uint(2 * b))));
+                mm.assign(mm.bitOr(jj.toUint().shiftRight(uint(b)).bitAnd(uint(1)).shiftLeft(uint(2 * b + 1))));
+              }
+              const nb = readPayload(payload, base.add(mm));
+              const cn = select(nb.T.greaterThanEqual(0), nb.c.clamp(0, 1), float(0)).toVar();
+              If(cn.greaterThanEqual(float(INPAINT_LOW)), () => {
+                const wt = cn.mul(float(di !== 0 && dj !== 0 ? 0.5 : 1)).toVar();
+                acc.addAssign(nb.L.mul(wt));
+                accT.addAssign(nb.T.mul(wt));
+                accC.addAssign(cn.mul(wt));
+                wsum.addAssign(wt);
+              });
+            });
+          }
+        }
+        If(wsum.greaterThan(0), () => {
+          const inv = float(1).div(wsum).toVar();
+          const nL = acc.mul(inv).toVar();
+          const nT = accT.mul(inv).toVar();
+          const nC = accC.mul(inv).toVar();
+          const k = select(ownKnown, c.div(float(INPAINT_LOW)), float(0)).toVar();
+          const ownL = select(ownKnown, own.L, vec3(0)).toVar();
+          const ownT = select(ownKnown, own.T, float(0)).toVar();
+          writePayload(
+            payload, selfBin,
+            ownL.mul(k).add(nL.mul(float(1).sub(k))),
+            ownT.mul(k).add(nT.mul(float(1).sub(k))),
+            c.max(nC.mul(float(INPAINT_DISCOUNT))),
+            own.cen,
+          );
+        });
+      })().compute(info.blockCapacity * nBins));
+    }
   }
 
   return {

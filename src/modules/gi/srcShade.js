@@ -543,6 +543,13 @@ export function createSrcHitLighting({
   // paid); every other slot, and that slot on a hit outside every cascade,
   // still traces. Null keeps the kernel byte-identical to before.
   sunShadow = null,
+  // §11.44: `{ buffer, rows, K, blockAt }` — per c0 block, `rows` packed
+  // words of (lamp << 16 | vis·255 << 8 | samples). A tree sample whose
+  // (block, lamp) row has K samples reads its mean visibility instead of
+  // marching; otherwise it marches and folds the sample in (last writer
+  // wins between two hits of one dispatch — a slower fill, never a wrong
+  // one). Null = every sample marches (the pre-§11.44 kernel).
+  visCache = null,
 } = {}) {
   if (voxelSize == null) {
     throw new Error(
@@ -909,6 +916,7 @@ export function createSrcHitLighting({
           dirTo: vec3(0, 1, 0).toVar(),
           maxT: float(0).toVar(),
           pdf: float(0).toVar(),
+          lamp: uint(0).toVar(),
         };
         If(float(idx).greaterThanEqual(0).and(float(pdf).greaterThan(0)), () => {
           const e = lightTree.evalAt(P, n, float(idx).toUint());
@@ -918,24 +926,108 @@ export function createSrcHitLighting({
           // subtracted here exactly as `emitterTermsAt` does for a slot.
           t.maxT.assign(e.maxT.sub(margin).max(0));
           t.pdf.assign(pdf);
+          t.lamp.assign(float(idx).toUint());
         });
         return t;
       });
+      // §11.44: the hit's c0 block, looked up ONCE per hit; the (block, lamp)
+      // rows below are the static world's answer to "does this lamp see
+      // this probe", and a static lamp over a static surface does not change.
+      const cacheOn = !!(visCache && visibility);
+      const cacheSlot = cacheOn ? int(visCache.slotAt(P, count)).toVar() : null;
+      const cacheRows = cacheOn ? uint(visCache.rows) : null;
+      // One sample in eight on a converged row still marches and folds in —
+      // a pure function of the ray index, so it never boils.
+      const cacheRefresh = cacheOn ? hashKey(uint(rayIndex).mul(uint(0x85eb))).bitAnd(uint(7)).equal(uint(0)) : null;
       Loop({ start: int(0), end: int(picks.length), type: "int", condition: "<" }, ({ i }) => {
         const Ei = vec3(0).toVar();
         const dirTo = vec3(0, 1, 0).toVar();
         const maxT = float(0).toVar();
         const w = float(0).toVar();
+        const lamp = uint(0).toVar();
         for (let k = 0; k < picks.length; k++) {
           const take = i.equal(int(k));
           Ei.assign(select(take, picks[k].E, Ei));
           dirTo.assign(select(take, picks[k].dirTo, dirTo));
           maxT.assign(select(take, picks[k].maxT, maxT));
           w.assign(select(take, picks[k].pdf, w));
+          lamp.assign(select(take, picks[k].lamp, lamp));
         }
         If(Ei.x.max(Ei.y).max(Ei.z).greaterThan(0).and(w.greaterThan(0)), () => {
-          const v = visibility ? float(visibility(P, n, dirTo, maxT)).toVar() : float(1).toVar();
-          if (count && visibility) count.shadowRays(1);
+          const v = float(1).toVar();
+          if (cacheOn) {
+            const found = int(-1).toVar();
+            const empty = int(-1).toVar();
+            // The least-sampled row is the one a new lamp replaces when the
+            // cell has no empty row: the lamps the tree picks often keep
+            // their converged rows, the rare ones churn.
+            const weakest = int(0).toVar();
+            const weakestCnt = uint(0xffff).toVar();
+            const cVis = float(0).toVar();
+            const cVisByte = uint(0).toVar();
+            const cCnt = uint(0).toVar();
+            const rowBase = uint(cacheSlot.max(int(0))).mul(cacheRows).toVar();
+            const inField = cacheSlot.greaterThanEqual(int(0));
+            If(inField, () => {
+              for (let j = 0; j < visCache.rows; j++) {
+                const word = visCache.rowsBuf.element(rowBase.add(uint(j))).toVar();
+                const cnt = word.bitAnd(uint(0xff)).toVar();
+                const hit = cnt.greaterThan(uint(0)).and(word.shiftRight(uint(16)).equal(lamp)).and(found.lessThan(int(0)));
+                If(hit, () => {
+                  found.assign(int(j));
+                  cVisByte.assign(word.shiftRight(uint(8)).bitAnd(uint(0xff)));
+                  cVis.assign(float(cVisByte).div(255));
+                  cCnt.assign(cnt);
+                });
+                If(cnt.equal(uint(0)).and(empty.lessThan(int(0))), () => { empty.assign(int(j)); });
+                If(cnt.lessThan(weakestCnt), () => { weakestCnt.assign(cnt); weakest.assign(int(j)); });
+              }
+            });
+            // ⭐ A CACHE MAY ANSWER ONLY WHERE ITS SAMPLES AGREE (§11.46).
+            // The row is keyed by CELL and lamp, and a 0.7 m cell spans both
+            // sides of every wall: the mean of a lit face and a shadowed face
+            // is a half-lit answer handed to BOTH. Measured on the user's
+            // Level with the mean served: direct luma at hits 0.041 → 0.015,
+            // bounce/direct 1.35 → 6.22, far field 78,66,47 → 93,92,66 — the
+            // picture flat, bright and desaturated ("lost its colour and
+            // atmosphere"). Unanimity is exact instead: the count is capped
+            // at 255, so ONE dissenting sample moves the stored byte off
+            // 255/0 and every pick in that cell marches for ever after. The
+            // saving stays where the answer is not in doubt — open floor,
+            // deep shadow — and every boundary cell pays the ray it needs.
+            const unanimous = cVisByte.equal(uint(255)).or(cVisByte.equal(uint(0)));
+            const cached = found.greaterThanEqual(int(0))
+              .and(cCnt.greaterThanEqual(uint(visCache.KU)))
+              .and(unanimous)
+              .and(cacheRefresh.not());
+            If(cached, () => {
+              v.assign(cVis);
+              if (count) count.visCached(1);
+            }).Else(() => {
+              // ⚠ the ONE visibility call site of this loop (the compile
+              // law the light loop above documents).
+              v.assign(float(visibility(P, n, dirTo, maxT)));
+              if (count) count.shadowRays(1);
+              const slot = select(found.greaterThanEqual(int(0)), found, select(empty.greaterThanEqual(int(0)), empty, weakest)).toVar();
+              if (count) {
+                If(inField.not(), () => { count.visNoBlock(1); });
+                If(inField.and(slot.lessThan(int(0))), () => { count.visNoRow(1); });
+                If(found.greaterThanEqual(int(0)), () => { count.visFilling(1); });
+              }
+              If(inField.and(slot.greaterThanEqual(int(0))), () => {
+                const known = found.greaterThanEqual(int(0));
+                const n1 = select(known, cCnt.add(uint(1)), uint(1)).toVar();
+                const mean = select(known, cVis.mul(float(cCnt)).add(v).div(float(n1)), v).clamp(0, 1).toVar();
+                const word = lamp.shiftLeft(uint(16))
+                  .bitOr(uint(mean.mul(255).add(0.5)).shiftLeft(uint(8)))
+                  .bitOr(n1.min(uint(255)));
+                visCache.rowsBuf.element(rowBase.add(uint(slot))).assign(word);
+              });
+            });
+          } else {
+            v.assign(visibility ? float(visibility(P, n, dirTo, maxT)) : float(1));
+            if (count && visibility) count.shadowRays(1);
+          }
           E.addAssign(Ei.mul(v).div(w));
         });
       });

@@ -24,7 +24,7 @@ import { toggle as togglePlay, togglePaused, stepFrame } from "./playMode.js";
 import { commandBus } from "./commands/CommandBus.js";
 import { getProjectSettings, applyProjectSettings } from "./projectSettings.js";
 import { keyScopeOwns } from "./keyScope.js";
-import { dispatchVisibilityKeyAction } from "./keybindings.js";
+import { chordMatches, dispatchVisibilityKeyAction, getBinding } from "./keybindings.js";
 import { dispatchTerrainKeyAction } from "./terrainBrush.js";
 import { useGeometryEditStore } from "./store/geometryEditStore.js";
 import { GlobalContextMenu } from "./nativeContextMenu.jsx";
@@ -195,6 +195,16 @@ export function EditorChrome() {
       // changed in Project Settings. Returns true on consume.
       if (dispatchVisibilityKeyAction(e)) {
         e.preventDefault();
+        return;
+      }
+      // Rebindable viewport screenshot (Shift+Alt+S by default; Alt = Option
+      // on macOS). Dynamic import: the capture path pulls the renderer ops
+      // chunk, which nothing on the boot path needs until the chord fires.
+      if (chordMatches(e, getBinding("editor.screenshot"))) {
+        e.preventDefault();
+        import("./viewportScreenshot.js")
+          .then((m) => m.saveViewportScreenshot())
+          .catch((err) => console.error(`Screenshot failed: ${err}`));
         return;
       }
       if (ctrl && e.key.toLowerCase() === "z") {

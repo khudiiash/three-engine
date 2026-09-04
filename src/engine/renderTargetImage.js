@@ -59,6 +59,10 @@ export async function readRenderTargetImage(renderer, target, width, height) {
  */
 export async function renderTargetToDataUrl(renderer, target, width, height) {
   const image = await readRenderTargetImage(renderer, target, width, height);
+  return imageDataToDataUrl(image, width, height);
+}
+
+export function imageDataToDataUrl(image, width, height) {
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -67,4 +71,83 @@ export async function renderTargetToDataUrl(renderer, target, width, height) {
   imageData.data.set(image);
   ctx.putImageData(imageData, 0, 0);
   return canvas.toDataURL("image/png");
+}
+
+/**
+ * Reads the canvas AS PRESENTED — the composited frame, every post-render
+ * overlay included. A fresh `renderer.render` into an offscreen target (see
+ * readRenderTargetImage) cannot see content that is blitted onto the canvas
+ * AFTER the main draw: the GI path-tracer debug view is exactly that, so a
+ * re-rendered screenshot of a scene showing it comes back without it. This
+ * copies what the user actually has on screen instead.
+ *
+ * ⚠ Call while a frame is being assembled — from a post-render callback.
+ * `getCurrentTexture()` outside the task that rendered the frame hands back a
+ * fresh texture nobody has drawn into, and the copy reads black.
+ *
+ * The copy is raw WebGPU rather than `renderer.copyFramebufferToTexture` for
+ * the same reason that function errors out here: the canvas is configured
+ * with the adapter's preferred format (bgra8unorm on most desktops) and three
+ * cannot CREATE a matching destination texture, so the pixels go to a staging
+ * buffer and the BGRA→RGBA swap happens on the CPU. WebGPU buffer copies are
+ * top-down — row 0 is the TOP, same contract as readRenderTargetImage.
+ *
+ * @param {any} renderer  A WebGPURenderer.
+ * @returns {Promise<{ data: Uint8Array, width: number, height: number }>}
+ *   Tightly packed RGBA, alpha forced opaque (the viewport fills the frame).
+ */
+export async function readLiveCanvasImage(renderer) {
+  const backend = renderer?.backend;
+  if (!backend?.isWebGPUBackend) {
+    throw new Error("Live-canvas capture needs the WebGPU backend.");
+  }
+  const canvas = renderer.domElement;
+  const width = canvas.width;
+  const height = canvas.height;
+  if (!(width > 0) || !(height > 0)) throw new Error("The canvas has no size to capture.");
+
+  const bgra = backend.utils.getPreferredCanvasFormat() === "bgra8unorm";
+  const rowBytes = width * 4;
+  // WebGPU buffer copies pad rows to 256 bytes — the same padding rule
+  // readRenderTargetImage handles for render-target readbacks.
+  const bytesPerRow = Math.ceil(rowBytes / 256) * 256;
+  const device = backend.device;
+  const mapRead = globalThis.GPUMapMode?.READ ?? 1;
+  const buffer = device.createBuffer({
+    size: bytesPerRow * height,
+    usage: globalThis.GPUBufferUsage.COPY_DST | globalThis.GPUBufferUsage.MAP_READ,
+  });
+  try {
+    const encoder = device.createCommandEncoder();
+    encoder.copyTextureToBuffer(
+      { texture: backend.context.getCurrentTexture() },
+      { buffer, bytesPerRow, rowsPerImage: height },
+      [width, height, 1],
+    );
+    device.queue.submit([encoder.finish()]);
+    await buffer.mapAsync(mapRead);
+    const raw = new Uint8Array(buffer.getMappedRange());
+    const out = new Uint8Array(rowBytes * height);
+    for (let y = 0; y < height; y++) {
+      const from = y * bytesPerRow;
+      const to = y * rowBytes;
+      for (let x = 0; x < width; x++) {
+        const s = from + x * 4;
+        const d = to + x * 4;
+        if (bgra) {
+          out[d] = raw[s + 2];
+          out[d + 1] = raw[s + 1];
+          out[d + 2] = raw[s];
+        } else {
+          out[d] = raw[s];
+          out[d + 1] = raw[s + 1];
+          out[d + 2] = raw[s + 2];
+        }
+        out[d + 3] = 255;
+      }
+    }
+    return { data: out, width, height };
+  } finally {
+    buffer.destroy();
+  }
 }

@@ -896,7 +896,11 @@ export class MergeSystem {
       return;
     }
     if (!this.groups.length) return;
-    this.engine.scene.updateMatrixWorld();
+    // No `scene.updateMatrixWorld()` here (plan §11.41): the phase still read
+    // 2.1 ms on a parked Bistro frame AFTER the amortisation below, and the
+    // sub-marks said all of it was that walk (`merging.matrixWorld` 2.107 ms,
+    // `merging.watch` 0.097). The engine tick walks the scene ONCE, right
+    // before this sync, so the matrices below are this frame's.
     // ── AMORTISED OVER WATCH_WINDOW_FRAMES ───────────────────────────────────
     //
     // Both watchers used to sweep EVERY group EVERY frame, on a scene that by
@@ -1638,6 +1642,11 @@ export class MergeSystem {
     proxy.renderOrder = template.renderOrder;
     proxy.layers.mask = (template.layers.mask >>> 0) & ~(1 << OCCLUDER_LAYER);
     proxy.matrixAutoUpdate = false;
+    // §11.32: a merged proxy never moves (its vertices are world-space and a
+    // member change rebuilds it), so it is the ideal `static` object — three
+    // skips its per-object refresh once GI stops stamping the marker
+    // (`__giStaticDraws`), which is where the per-draw CPU goes.
+    proxy.static = globalThis.__giStaticDraws === true;
     proxy.raycast = () => {};
     proxy.userData.batchProxy = true;
     proxy.userData.mergeProxy = true;
@@ -1777,6 +1786,7 @@ export class MergeSystem {
     proxy.receiveShadow = template.receiveShadow;
     proxy.renderOrder = template.renderOrder;
     proxy.layers.mask = (template.layers.mask >>> 0) & ~(1 << OCCLUDER_LAYER);
+    proxy.static = globalThis.__giStaticDraws === true;   // §11.32, see above
     // Vertices are already in world space, so the proxy must add no transform.
     proxy.matrixAutoUpdate = false;
     proxy.raycast = () => {};

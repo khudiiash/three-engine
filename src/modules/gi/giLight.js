@@ -30,6 +30,7 @@ import {
   normalWorld,
   positionWorld,
   reflect,
+  renderGroup,
   screenUV,
   select,
   sin,
@@ -1524,6 +1525,8 @@ export function emitterSlotShadow(params, slot, P, N, samplePoint, penumbraOut =
           ? params.recordShadowTrace(
               P, N, rayDir, maxT, k, cosTheta,
               rayDist, float(emitterAngularRadius(slot)).max(1e-3),
+              // §11.40: the caller's static visibility cache entry, or null.
+              params.staticCache ?? null,
             )
           : params.shadowTraceFn(
               samplePoint, rayDir, maxT, k, cosTheta,
@@ -1700,6 +1703,13 @@ export class GICascadeLight extends THREE.Light {
     this.giIrradianceNode = null;
     this.giEmitterShadowNode = null;
     this.giRadianceNode = null;
+    // §11.35: the AO term at AO resolution (ultra/high: the viewport's), a
+    // PERSISTENT TextureNode like the three above (a 1×1 white placeholder
+    // while the term rides the resolve instead), and its live enable uniform.
+    // Sampled bilinearly at the pixel's own GI screen UV and multiplied into
+    // the deferred irradiance — the sharp half of "the AO is blurry".
+    this.giAoNode = null;
+    this.giAoActiveU = null;
     // Set by GISystem after construction: (P, N) => vec3 irradiance.
     // Still used by the legacy in-material path (no gbuffer) and by the
     // resolve pass itself.
@@ -1788,8 +1798,11 @@ export class GICascadeLight extends THREE.Light {
     // wall time) and the per-mirror-pixel GPU cost — at high and below,
     // hits shade from the indirect field alone.
     this.hitLighting = true;
-    // Live-tunable without recompiles.
-    this.intensityUniform = uniform(1);
+    // Live-tunable without recompiles. In the RENDER group (§11.32): a
+    // uniform in the default object group lives in each object's own buffer,
+    // which a `static` object never re-uploads — the shared group's buffer is
+    // uploaded by the first refreshed object of the render and read by all.
+    this.intensityUniform = uniform(1).setGroup(renderGroup);
     this.normalOffset = 0.35;
   }
 }
@@ -2034,6 +2047,15 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
     const irradiance = deferred
       ? vec3(bilateral ? bilateral(light.giIrradianceNode, light.giScreenTexel, irrNestedFallback) : light.giIrradianceNode.sample(giUV)).toVar()
       : vec3(light.gatherFn(samplePoint, N, cameraPosition.sub(positionWorld).normalize())).mul(light.intensityUniform);
+    // §11.35: the AO term at its own resolution. It multiplies the WHOLE
+    // deferred irradiance (diffuse indirect + emitter direct, both screen-
+    // space terms of the same texel); the sun's analytic direct term below
+    // is untouched, as it was when the resolve applied AO.
+    if (deferred && light.giAoNode) {
+      const aoTex = vec4(light.giAoNode.sample(giUV)).x.clamp(0, 1);
+      const aoOn = light.giAoActiveU ? float(light.giAoActiveU).clamp(0, 1) : float(1);
+      irradiance.mulAssign(mix(float(1), aoTex, aoOn));
+    }
     builder.context.irradiance.addAssign(irradiance);
 
     // Promoted emissive emitters = analytic sphere area lights, evaluated

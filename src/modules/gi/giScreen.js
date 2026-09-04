@@ -46,6 +46,7 @@ import {
   ivec2,
   mix,
   mrt,
+  screenCoordinate,
   normalWorld,
   positionWorld,
   reflect,
@@ -150,7 +151,18 @@ export function createGiGBuffer(width, height) {
       return rt.textures[1];
     },
     setSize(w, h) {
+      if (rt.width === w && rt.height === h) return false;
       rt.setSize(w, h);
+      // §11.33: three's RenderTarget.setSize DISPOSES the GPU textures but
+      // leaves `texture.version` alone, and a bind group decides "still the
+      // same texture" by version (Bindings._update: `binding.generation` vs
+      // `textureData.generation`, which IS the version at creation). Without
+      // a bump every bind group that held the old view keeps it, and the next
+      // submit dies with "Destroyed texture [output] used in a submit". Same
+      // rule as createGiTargets' `targetGeneration` — one counter, so a
+      // resized texture can never collide with a fresh one.
+      for (const t of rt.textures) t.version = ++targetGeneration;
+      return true;
     },
     dispose() {
       rt.dispose();
@@ -403,6 +415,85 @@ export function renderGiGBuffer(renderer, scene, camera, gbuffer, { mirrorMask =
 }
 
 /**
+ * ══ §11.35 THE G-BUFFER DOWNSAMPLE — one prepass at AO resolution, the chain
+ * at resolve resolution ═══════════════════════════════════════════════════
+ *
+ * The AO term is the highest-frequency thing GI draws, and it was computed at
+ * the RESOLVE's resolution (half the viewport per axis at ultra on the user's
+ * editor) from a g-buffer rendered at that size, then filtered ±3 texels and
+ * upsampled 2×: "blurry" (the user, 2026-09-04; the native texel dump in
+ * `probe:gi-gtao CAPTURE=1` shows it without the viewport's own resampling).
+ * A sharp AO needs positions at the viewport's resolution. Rendering the
+ * g-buffer twice would double the prepass's CPU (the scene walk — ~6 ms on
+ * Bistro, §11.33), and re-pointing this file's 25 g-buffer readers at a finer
+ * texture is a chain-wide refactor. So: the prepass renders ONCE, at AO
+ * resolution (`gbufferFull`), and this quad pass POINT-SAMPLES it down into
+ * the resolve-sized g-buffer every other consumer already reads (`gbuffer`:
+ * same object, same size, same texel grid as the irradiance) — the chain
+ * cannot tell the difference, and only the AO pass reads the full one. A
+ * render through three's QuadMesh idiom, not a compute, so the half-res
+ * g-buffer stays the RenderTarget the rest of the module is built on.
+ */
+export function createGiGBufferDownsample({ source, target }) {
+  const positionNode = texture(source.position);
+  const normalNode = texture(source.normal);
+  const material = new THREE.MeshBasicNodeMaterial();
+  material.name = "GI gbuffer downsample";
+  // Unlit, like the prepass override (createGiGBuffer): `lights = true` would
+  // compile the scene's lights node — this module's own GI light included —
+  // into a pass whose colour is replaced by the MRT below.
+  material.lights = false;
+  material.depthTest = false;
+  material.depthWrite = false;
+  // x, y: source texels per target texel; z, w: the source's last texel.
+  const mapU = uniform(new THREE.Vector4(1, 1, 0, 0));
+  // `screenCoordinate` is the fragment's position in the TARGET (origin
+  // top-left, the texture's own row order), so a straight scale lands on the
+  // source texel that covers this target texel's centre — point sampled, as
+  // a half-res rasterisation would have been.
+  const srcCoord = ivec2(
+    screenCoordinate.x.mul(mapU.x).toInt().clamp(int(0), mapU.z.toInt()),
+    screenCoordinate.y.mul(mapU.y).toInt().clamp(int(0), mapU.w.toInt()),
+  );
+  const mrtNode = mrt({
+    output: positionNode.load(srcCoord),
+    giNormal: normalNode.load(srcCoord),
+  });
+  const quad = new THREE.QuadMesh(material);
+  const downsample = {
+    source,
+    target,
+    material,
+    setSize() {
+      const sw = source.rt.width, sh = source.rt.height;
+      const tw = target.rt.width, th = target.rt.height;
+      mapU.value.set(sw / tw, sh / th, Math.max(0, sw - 1), Math.max(0, sh - 1));
+    },
+    render(renderer) {
+      const previousTarget = renderer.getRenderTarget();
+      const previousMRT = renderer.getMRT();
+      const previousAutoClear = renderer.autoClear;
+      renderer.setRenderTarget(target.rt);
+      renderer.setMRT(mrtNode);
+      // Every target texel is written; a clear would only cost bandwidth.
+      renderer.autoClear = false;
+      try {
+        quad.render(renderer);
+      } finally {
+        renderer.setMRT(previousMRT);
+        renderer.setRenderTarget(previousTarget);
+        renderer.autoClear = previousAutoClear;
+      }
+    },
+    dispose() {
+      material.dispose();
+    },
+  };
+  downsample.setSize();
+  return downsample;
+}
+
+/**
  * §13 F3 — the far-field average: "what indirect light looks like around
  * here", reduced to ONE value the resolve can afford to read per pixel.
  *
@@ -600,6 +691,10 @@ export function createGiFarFieldAvgPass({ source, width, height, out }) {
  * box for free.
  */
 export function createGiResolve({ gbuffer, targets, width, height, gather = null, screenGather = null, screenRadiance = null, cameraPosition = null, normalOffset, intensity, emitter, radiance = null, ao = null, vxao = null, rawCopy = null, emitterTileCut = null, farField = null, bounceWeight = null, reflectionsEnabled = null }) {
+  // §11.35: an AO term computed at AO resolution is applied in the MATERIAL
+  // (giLight samples it at the pixel's own screen UV); folding it into the
+  // half-res irradiance here would put the last of the three blurs back.
+  if (vxao?.materialSide) vxao = null;
   // The TARGETS are owned by the caller and outlive every rebuild: materials
   // sample them through persistent texture nodes, so recreating them here
   // would silently leave already-compiled materials bound to dead textures.
@@ -872,9 +967,31 @@ export function createGiResolve({ gbuffer, targets, width, height, gather = null
         const covLow = Number.isFinite(Number(globalThis.__giFarFieldCoverageLow))
           ? Math.max(0, Number(globalThis.__giFarFieldCoverageLow))
           : 0.25;
+        // ── §11.26 (Unit 1c): THE RAMP IS THE DEFAULT NOW ────────────────────
+        //
+        // `knownF` used to be the SAMPLED FRACTION of a pixel's lobe (a bin was
+        // in or out), so `1 − knownF` was "the share of the lobe nobody has
+        // looked at" and filling that share with the far-field constant was
+        // defensible. §11.25 made coverage a CONFIDENCE (`Σ cw·c / Σ cw`), which
+        // is legitimately 0.1–0.3 for seconds in any sparse region — a fresh
+        // corridor, a dark vault — while the estimate underneath is already
+        // the parent's real, dim light. The linear form then blended 70–90 % of
+        // such pixels into the flat constant: measured on a cold Sponza
+        // corridor in the harness, meanLum 0.043 (old) → 0.0043 (Unit 1), STATIC
+        // (0 % of pixels moving at rest — a constant does not move), and
+        // "responding" to a sun step only because the constant's EMA follows
+        // the sun. Same class as §11.20's box feather: a fill designed for
+        // ABSENCE reading a fraction as absence.
+        //
+        // The ramp form fills only where there is almost NO information (full
+        // at knownF 0, gone by `covLow` 0.25 — about five rays of evidence at
+        // K = 16) and leaves a confident-but-not-certain pixel alone. Under the
+        // old coverage §11.20 measured it as "no measurable difference", which
+        // is why flipping the default is safe for `__giSrcConfidence = false`
+        // too. `__giFarFieldCoverageRamp = false` restores the linear fill.
         const wCov = farField.coverage === false
           ? float(0).toVar()
-          : globalThis.__giFarFieldCoverageRamp === true && covLow > 0
+          : globalThis.__giFarFieldCoverageRamp !== false && covLow > 0
             ? smoothstep(float(0), float(1), float(1).sub(knownF.div(float(covLow)).clamp(0, 1))).toVar()
             : float(1).sub(knownF).clamp(0, 1).toVar();
         const w = wBox.max(wCov).toVar();
@@ -2107,8 +2224,17 @@ export function createGiGtaoPass({
   const sx = resolveWidth / width;
   const sy = resolveHeight / height;
   const SLICES = Math.max(1, Math.min(8, Math.round(slices)));
-  const STEPS = Math.max(1, Math.min(8, Math.round(steps)));
+  const STEPS = Math.max(1, Math.min(16, Math.round(steps)));
   const HALF_PI = Math.PI / 2;
+  /**
+   * `__giGtaoRadialPhase = false` (§11.35 rig arm): NO spatial radial phase —
+   * every pixel marches the same STEPS radii. The phase exists so a 4-wide
+   * filter can average four radial strata; without the filter it prints as
+   * the diagonal dashes the user calls "blurry and noisy" once the filter is
+   * narrowed. The alternative it tests: enough steps per pixel that no
+   * filter is needed, at the AO buffer's own resolution.
+   */
+  const RADIAL_PHASE = globalThis.__giGtaoRadialPhase !== false;
   /** Where the distance falloff opens, as a fraction of the world radius. */
   const FALLOFF_FROM = 0.6;
   /**
@@ -2151,6 +2277,45 @@ export function createGiGtaoPass({
    */
   const MAX_REACH = 0.25;
   const maxPix = Math.max(4, Math.round(resolveHeight * MAX_REACH));
+  /**
+   * ⭐⭐ THE STEP-SPACING CEILING (§11.46) — an N-tap estimator may not be
+   * asked to cover an arbitrary screen distance.
+   *
+   * `MAX_REACH` above bounds the RADIUS; nothing bounded the GAP BETWEEN
+   * CONSECUTIVE TAPS. With 4 steps and a reach of a quarter of the frame
+   * height, taps land ~59 px apart near the camera, and an occlusion
+   * estimate sampled every 59 px is not measuring a horizon, it is
+   * aliasing one: the AO prints as rectangular blocks that follow the
+   * occluder's silhouette, worst where the geometry is CLOSEST (the user's
+   * report: "quite a huge radius, i kinda see rects on all edges and near
+   * the character's hands"). Half-resolution AO hid it — the 2x bilinear
+   * upsample and the wider filter smoothed the blocks away — and §11.35
+   * moved the AO to full resolution, where nothing does.
+   *
+   * So the reach is ALSO bounded by what the tap count can actually
+   * resolve: `STEPS x maxStepPix`, a fraction of the buffer height so it
+   * is resolution-independent like `MAX_REACH`. Near the camera this
+   * shortens the world radius — correctly, because past this point the
+   * estimator had no information there anyway. `__giGtaoMaxStepPx` pins the
+   * spacing; a huge value restores the pre-§11.46 reach for an A/B.
+   *
+   * ⭐ WHERE THE NUMBER COMES FROM — it is the filter's reach, not taste.
+   * The radial phase gives 4 distinct offsets across neighbouring pixels,
+   * so a spacing of `s` px interleaves to `s/4` px of radial granularity;
+   * the +-2 px filter can smooth about 5 px of it. Hence s <= ~4x5 = 20-24
+   * px, i.e. 2.5 % of a 943-px buffer. The first build used 1 % (9.4 px),
+   * which put the effective radius at ~0.14 m three metres from the camera
+   * — "now there is almost no ao" (the user). The pre-§11.46 reach was 59
+   * px of spacing, four times what the filter can carry, which is why it
+   * printed rectangles. Widening the FILTER is what buys a wider spacing;
+   * these two constants move together or not at all.
+   */
+  const MAX_STEP_FRAC = 0.025;
+  const maxStepPin = Number(globalThis.__giGtaoMaxStepPx);
+  const maxStepPix = Number.isFinite(maxStepPin) && maxStepPin > 0
+    ? maxStepPin
+    : Math.max(2, resolveHeight * MAX_STEP_FRAC);
+  const reachPix = Math.max(4, Math.min(maxPix, STEPS * maxStepPix));
   /**
    * ⭐⭐ THE MINIMUM STEP, IN GBUFFER TEXELS — the single number that decides
    * whether this estimator is correct or 45% too dark, measured.
@@ -2245,8 +2410,17 @@ export function createGiGtaoPass({
       // pressed against a wall (and a metre of AO covering a sixth of the
       // screen is not a look anyone asked for).
       const rPix = R.mul(float(projScale)).div(viewZ)
-        .clamp(float(STEPS * MIN_STEP), float(maxPix)).toVar();
+        .clamp(float(STEPS * MIN_STEP), float(Math.max(STEPS * MIN_STEP, reachPix))).toVar();
 
+      /**
+       * §11.46 — the world radius the march ACTUALLY covers, back out of the
+       * clamped pixel reach. The falloff below ramps occlusion to zero at the
+       * radius; ramping against a radius the taps never reach leaves the last
+       * tap at full weight, i.e. a HARD CUTOFF at the end of the march, which
+       * is the second half of the blocky edge. Never larger than the world
+       * radius that was asked for.
+       */
+      const Reff = rPix.mul(viewZ).div(float(projScale).max(1e-6)).min(R).max(1e-3).toVar();
       if (DEBUG) dbgReach.assign(rPix);
 
       // ── THE PATTERN: SPATIAL STRATA OR FULL PER-PIXEL QUADRATURE ────────
@@ -2282,7 +2456,7 @@ export function createGiGtaoPass({
       // copied into four detached, concentric bands. The stable four-stratum
       // pattern is filterable and never changes over time. Only the angular
       // pattern is fixed per Ultra pixel.
-      const stepNoise = offIdx.add(ign2).div(4).toVar();
+      const stepNoise = RADIAL_PHASE ? offIdx.add(ign2).div(4).toVar() : float(0.5).toVar();
 
       const visibility = float(0).toVar();
       Loop({ start: int(0), end: int(SLICES), type: "int", condition: "<" }, ({ i }) => {
@@ -2360,7 +2534,7 @@ export function createGiGtaoPass({
             // radius fades to the unoccluded horizon rather than being
             // dropped — a hard cutoff prints a ring wherever the reach lands
             // on a flat floor.
-            const w = R.sub(fLen).div(R.mul(1 - FALLOFF_FROM)).clamp(0, 1).toVar();
+            const w = Reff.sub(fLen).div(Reff.mul(1 - FALLOFF_FROM)).clamp(0, 1).toVar();
             // `tp.w` is the gbuffer's valid mask: the SKY is not an occluder,
             // and its "position" is whatever the clear left behind. The
             // length test is the belt to MIN_STEP's braces: a coincident tap
@@ -3180,6 +3354,13 @@ export function createGiLightShadowPass({ gbuffer, lightShadow, width, height, r
 export function createGiEmitterShadowPass({
   gbuffer, emitter, normalOffset, target, width, height, resolveWidth, resolveHeight,
   cameraPosition = null, distTarget = null, tileCut = null, frame = null, checker = null,
+  // §11.40: `{ read: { vis, t, stamp }, write: { vis, t, stamp } }` cache
+  // textures (createGiTargets; the pass loads `read` and stores `write`, a
+  // snapshot pass copies write -> read after it), the static generation
+  // uniform (uint, bumps when the static g-buffer key moves) and the refresh
+  // stride uniform (uint; 1 = march every pixel, S = one in S on movers-only
+  // frames). Only the seat-rotating arm consults the cache.
+  staticCache = null, staticGen = null, staticStride = null,
   // §11.11 (2026-09-03) ONE SEAT PER PIXEL PER FRAME. With a `seatPhase`
   // uniform (advanced by GISystem once per DISPATCH of this pass — not per
   // frame, or the movers-only stride-2 cadence would visit only two of the
@@ -3202,6 +3383,10 @@ export function createGiEmitterShadowPass({
   const normalNode = texture(gbuffer.normal);
   const sx = resolveWidth / width;
   const sy = resolveHeight / height;
+  const cacheOn = !!(staticCache?.read && staticCache?.write && staticGen && staticStride && seatPhase);
+  const cacheVisNode = cacheOn ? texture(staticCache.read.vis) : null;
+  const cacheTNode = cacheOn ? texture(staticCache.read.t) : null;
+  const cacheStampNode = cacheOn ? texture(staticCache.read.stamp) : null;
 
   const compute = Fn(() => {
     const px = instanceIndex.mod(widthU);
@@ -3248,6 +3433,11 @@ export function createGiEmitterShadowPass({
     const distVars = distTarget || widthPaint
       ? Array.from({ length: MAX_EMITTERS }, () => float(0).toVar())
       : null;
+    // §11.40: the pixel's cache rows, loaded once, written back once (the
+    // seat marched this frame replaces its own channel; the others ride).
+    const cVis = cacheOn ? vec4(cacheVisNode.load(coord)).toVar() : null;
+    const cT = cacheOn ? vec4(cacheTNode.load(coord)).toVar() : null;
+    const cStamp = cacheOn ? vec4(cacheStampNode.load(coord)).toVar() : null;
     If(g0.w.greaterThan(0.5), () => {
       const P = g0.xyz.toVar();
       const rawN = g1.xyz.normalize().toVar();
@@ -3357,8 +3547,36 @@ export function createGiEmitterShadowPass({
         const lane = px.add(py.mul(uint(2))).add(uint(seatPhase)).bitAnd(uint(3)).toInt().toVar();
         const k = lane.sub(lane.div(n).mul(n)).toVar();
         const pen = distVars ? float(0).toVar() : null;
+        // §11.40: the seat's cache entry, and whether this pixel re-marches
+        // the static world this frame (stride 1 = always; on movers-only
+        // frames one pixel in S, walking with the frame).
+        let cache = null;
+        if (cacheOn) {
+          const chan = (v4) => select(k.equal(int(0)), v4.x, select(k.equal(int(1)), v4.y, select(k.equal(int(2)), v4.z, v4.w)));
+          const idSel = tileIds
+            ? float(select(k.equal(int(0)), tileIds[0], select(k.equal(int(1)), tileIds[1], select(k.equal(int(2)), tileIds[2], tileIds[3]))).min(uint(4095)))
+            : k.toFloat();
+          // Never 0 (a fresh cache texture is all zeros and must read INVALID),
+          // exact in f32 for gen < 1024 (GISystem wraps it at 1024).
+          const stampWant = float(staticGen).add(1).mul(8192).add(idSel).add(1).toVar();
+          const strideU = uint(staticStride).max(uint(1)).toVar();
+          const phase = px.add(py.mul(uint(3))).add(frame ? uint(frame) : uint(0)).mod(strideU);
+          const setChan = (v4, value) => v4.assign(vec4(
+            select(k.equal(int(0)), value, v4.x),
+            select(k.equal(int(1)), value, v4.y),
+            select(k.equal(int(2)), value, v4.z),
+            select(k.equal(int(3)), value, v4.w),
+          ));
+          cache = {
+            valid: chan(cStamp).equal(stampWant),
+            vis: chan(cVis),
+            t: chan(cT),
+            march: strideU.equal(uint(1)).or(phase.equal(uint(0))),
+            store: (vis, t) => { setChan(cVis, vis); setChan(cT, t); setChan(cStamp, stampWant); },
+          };
+        }
         const s = float(
-          emitterSlotShadow(emitter, virtualSlot(k), P, N, samplePoint, pen, targetJitter),
+          emitterSlotShadow(cache ? { ...emitter, staticCache: cache } : emitter, virtualSlot(k), P, N, samplePoint, pen, targetJitter),
         ).toVar();
         for (let j = 0; j < slots.length; j++) {
           const take = k.equal(int(j));
@@ -3388,8 +3606,34 @@ export function createGiEmitterShadowPass({
     if (distTarget) {
       textureStore(distTarget, coord, vec4(distVars[0], distVars[1], distVars[2], distVars[3]));
     }
+    if (cacheOn) {
+      textureStore(staticCache.write.vis, coord, cVis);
+      textureStore(staticCache.write.t, coord, cT);
+      textureStore(staticCache.write.stamp, coord, cStamp);
+    }
   })().compute(width * height);
 
+  return { compute, widthU };
+}
+
+/**
+ * §11.40 — the static visibility cache's ping-pong: copies the marcher's
+ * WRITE set into the READ set it loads on its next dispatch. Runs right after
+ * createGiEmitterShadowPass in the emitter chain, every time it runs.
+ */
+export function createGiEmitterStaticSnapshotPass({ cache, width, height }) {
+  const widthU = uniform(width, "uint");
+  const visNode = texture(cache.write.vis);
+  const tNode = texture(cache.write.t);
+  const stampNode = texture(cache.write.stamp);
+  const compute = Fn(() => {
+    const px = instanceIndex.mod(widthU);
+    const py = instanceIndex.div(widthU);
+    const coord = ivec2(px.toInt(), py.toInt());
+    textureStore(cache.read.vis, coord, vec4(visNode.load(coord)));
+    textureStore(cache.read.t, coord, vec4(tNode.load(coord)));
+    textureStore(cache.read.stamp, coord, vec4(stampNode.load(coord)));
+  })().compute(width * height);
   return { compute, widthU };
 }
 
@@ -4554,7 +4798,53 @@ export function createGiIrradianceTemporalPass({
           }
         }
         const mean = m1.div(wsum).toVar();
-        const sigma = m2.div(wsum).sub(mean.mul(mean)).max(0).sqrt().mul(gamma).toVar();
+        // ⭐⭐⭐ §11.50 — THE CLIP BOX NEEDS A FLOOR, AND WITHOUT ONE THIS
+        // FILTER STOPS BEING TEMPORAL (2026-09-04).
+        //
+        // ⛔ THE BUG: `σ` is measured over a 3x3 of the RAW RESOLVE. On a flat
+        // wall the raw gather is SMOOTH — that is the entire point of an
+        // 8-corner trilinear gather — so σ → 0 and the box `mean ± γσ`
+        // collapses to the single value `mean`. The clamp is then not a guard
+        // at all: it is the assignment `history := local mean of this frame`,
+        // re-applied every frame. Three consequences, all of them what the
+        // user reported:
+        //
+        //   1. THE FILTER LOSES ITS MEMORY. `out = mix(raw, mean3x3(raw), w)`
+        //      carries nothing from before, so the accumulation this pass
+        //      exists for never happens — and at w = 0.9 the displayed value
+        //      is a repeatedly box-blurred raw, an IIR blur whose kernel
+        //      widens every frame.
+        //   2. IT LOCKS IN THE LOW SAMPLES. Where a probe cell's coverage hole
+        //      makes raw's local mean sit under the true irradiance, the clamp
+        //      pins history there and the next frame's box is built from the
+        //      pinned value. The picture darkens and stays dark — "our GI lost
+        //      its colour", "so little bounce".
+        //   3. IT PRINTS THE PROBE LATTICE. The plane-weighted moments cut the
+        //      3x3 at every depth discontinuity, so the box width is a
+        //      per-pixel function of local geometry AND of which probe cell
+        //      answered — hard-edged, cell-sized, exactly the "blocky
+        //      artifacts on the edges of walls".
+        //
+        // Proven in one build: `__giIrrPassthrough` (output forced to input,
+        // pass still dispatched) and `__giIrrTemporalClip = 0` produce the SAME
+        // bright, block-free picture, while every other arm — history weight
+        // pinned to 0, `__giIrrValidityHold = false`, the hit filter's weight
+        // pinned to 0 — leaves it dark and blocky. The clip is the only term
+        // that moves it.
+        //
+        // THE FIX is the one every TAA ships: a RELATIVE floor on the box
+        // half-width, so a smooth neighbourhood still lets history live within
+        // a band around the local mean. Relative because irradiance is HDR and
+        // has no natural scale — an absolute floor would be a guard at 0.01
+        // and none at 10. At a silhouette the guard is untouched in the way
+        // that matters: the far side of an edge differs by multiples, not by
+        // `CLIP_FLOOR`, so it is still pulled back.
+        // `__giIrrTemporalClipFloor` retunes it; 0 restores the collapsing box.
+        const floorPin = Number(globalThis.__giIrrTemporalClipFloor);
+        const clipFloor = Number.isFinite(floorPin) && floorPin >= 0 ? floorPin : 0.25;
+        const sigma = m2.div(wsum).sub(mean.mul(mean)).max(0).sqrt().mul(gamma)
+          .max(mean.abs().mul(clipFloor))
+          .toVar();
         const clamped = histSample.clamp(mean.sub(sigma), mean.add(sigma));
         // validityAlpha rule (b): never clip history against an unknown raw
         // centre — its statistics describe an absence, and the clamp would
@@ -4653,8 +4943,16 @@ export function createGiIrradianceTemporalPass({
         out.assign(mix(raw, histSample, valid.mul(float(history.weight))));
       }
     });
+    // §11.50 DIAGNOSTIC: `__giIrrPassthrough = true` stores the raw resolve and
+    // nothing else, with the pass still built, still dispatched and still
+    // paying its cost. `__giIrrTemporal = false` removes the whole chain —
+    // three targets, this pass, the history snapshot AND the glossy/hit
+    // temporal filters that share its uniforms — so a difference between those
+    // two arms is NOT attributable to this filter. This one is: same build,
+    // same bindings, same frame, output forced to the input.
     textureStore(target, coord,
-      markerAlpha ? vec4(out.xyz, raw.w)
+      globalThis.__giIrrPassthrough === true ? raw
+        : markerAlpha ? vec4(out.xyz, raw.w)
         : validityAlpha ? vec4(out.xyz, outKnown)
         : out);
   })().compute(width * height);
@@ -5126,6 +5424,48 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
   emitterShadowRaw.type = THREE.HalfFloatType;
   emitterShadowRaw.name = "giEmitterShadowRaw";
   emitterShadowRaw.version = version;
+  // ══ §11.40 THE STATIC VISIBILITY CACHE (emitter shadows) ═════════════════
+  //
+  // On a movers-only frame (static world and camera unchanged, a character
+  // animating) the emitter shadow pass re-marched the whole screen against
+  // the STATIC BVH every other frame — ~8.5 ms per dispatch on the user's
+  // Bistro, for a static answer that had not changed. These hold, per pixel
+  // and per seat: the static-only visibility, the static blocker distance
+  // (−1 = none) and a stamp `generation·4096 + emitterId` that says which
+  // static world and which lamp the entry answers for. The marcher
+  // (GISystem #buildEmitterRecordTrace) reads them on held frames and only
+  // re-tests the MOVERS; a stride of pixels still re-marches each frame so
+  // the area-sampled penumbra keeps integrating.
+  const emitterStaticVis = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  emitterStaticVis.type = THREE.HalfFloatType;
+  emitterStaticVis.name = "giEmitterStaticVis";
+  emitterStaticVis.version = version;
+  const emitterStaticT = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  emitterStaticT.type = THREE.HalfFloatType;
+  emitterStaticT.name = "giEmitterStaticT";
+  emitterStaticT.version = version;
+  // FLOAT, not half: the stamp is an integer up to 4096·4096 and must round-trip exactly.
+  const emitterStaticStamp = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  emitterStaticStamp.type = THREE.FloatType;
+  emitterStaticStamp.name = "giEmitterStaticStamp";
+  emitterStaticStamp.version = version;
+  // The marcher READS the trio above and WRITES this twin: one texture cannot
+  // be both a `texture_2d` load and a `textureStore` target in one kernel
+  // (the first build failed WGSL parsing on exactly that), so the pass
+  // ping-pongs through `createGiEmitterStaticSnapshotPass` (write -> read),
+  // the same idiom as the shadow history snapshots.
+  const emitterStaticVisNext = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  emitterStaticVisNext.type = THREE.HalfFloatType;
+  emitterStaticVisNext.name = "giEmitterStaticVisNext";
+  emitterStaticVisNext.version = version;
+  const emitterStaticTNext = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  emitterStaticTNext.type = THREE.HalfFloatType;
+  emitterStaticTNext.name = "giEmitterStaticTNext";
+  emitterStaticTNext.version = version;
+  const emitterStaticStampNext = new THREE.StorageTexture(emitterWidth, emitterHeight);
+  emitterStaticStampNext.type = THREE.FloatType;
+  emitterStaticStampNext.name = "giEmitterStaticStampNext";
+  emitterStaticStampNext.version = version;
   // ANALYTIC-PENUMBRA CHAIN (2026-08-13, plan §12.52.1 unit 2) — the emitter
   // twins of lightShadowMid/lightShadowWide/lightShadowDist. The marcher
   // stopped computing softness (the 12-tap free-radius width probe, whose
@@ -5218,6 +5558,12 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
     irradiance,
     emitterShadow,
     emitterShadowRaw,
+    emitterStaticVis,
+    emitterStaticT,
+    emitterStaticStamp,
+    emitterStaticVisNext,
+    emitterStaticTNext,
+    emitterStaticStampNext,
     emitterShadowDist,
     emitterShadowDistFill,
     emitterShadowMid,
@@ -5356,6 +5702,12 @@ export function createGiTargets(width, height, shadowWidth = width, shadowHeight
       this.irradianceHistPos?.dispose();
       emitterShadow.dispose();
       emitterShadowRaw.dispose();
+      emitterStaticVis.dispose();
+      emitterStaticT.dispose();
+      emitterStaticStamp.dispose();
+      emitterStaticVisNext.dispose();
+      emitterStaticTNext.dispose();
+      emitterStaticStampNext.dispose();
       emitterShadowDist.dispose();
       emitterShadowDistFill.dispose();
       emitterShadowMid.dispose();

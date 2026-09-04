@@ -109,7 +109,7 @@ import {
   packProbeKey,
   probeSpacing,
 } from "./srcMathTsl.js";
-import { LOS_OCC_HI, LOS_OCC_LO, LOS_PATH_HI, LOS_PATH_LO, gatherLosWeight, gatherNormalBias, gatherNormalWeightExp, gatherPlaneDepth, gatherSmoothWeights, worldKeysEnabled } from "./srcMath.js";
+import { LOS_OCC_HI, LOS_OCC_LO, LOS_PATH_HI, LOS_PATH_LO, gatherLosWeight, gatherNormalBias, gatherNormalWeightExp, gatherPlaneDepth, gatherPlaneFloor, gatherSmoothWeights, worldKeysEnabled } from "./srcMath.js";
 import { SLOT_EMPTY } from "./srcProbes.js";
 
 /** Gather telemetry — the same five failures `srcGather.js` learned to separate. */
@@ -207,10 +207,10 @@ export function createSrcScreenGather(store, tiles, {
   // and it lands on walls, roofs and street alike because it is a capacity
   // failure, not a geometric one.
   //
-  // c1 covers the same volume with an EIGHTH of the probes (6194 live of
-  // 16384 slots on the same frame), so it is never starved, and the merge has
-  // already pushed the whole cascade chain's answer into it. Falling back to
-  // it costs one 8-corner lookup on starved pixels only, and 2.8 MB of atlas.
+  // c1 covers the same volume with fewer probes, but its merged radiance
+  // starts AFTER the near c0 interval. It is an approximation for missing
+  // spatial corners, not a replacement for fine probes with partial angular
+  // evidence: those probes already include the near bounce.
   coarse = null,
   losOccupied = null,
   losWorld = null,
@@ -248,6 +248,22 @@ export function createSrcScreenGather(store, tiles, {
   }
   const nwExp = losArmed ? 0 : gatherNormalWeightExp();
   const normalWeight = nwExp > 0;
+  /**
+   * §11.51 — the plane weight's FLOOR: what a corner behind the shaded
+   * surface's tangent plane is still worth. See the long note at the
+   * `weight.mulAssign` site for the measurement. A ratio suppresses the
+   * through-wall vote; a deletion (the old 1e-3) also collapses the stencil
+   * at every wall/floor and wall/ceiling junction, which is the stripe.
+   */
+  const planeFloor = gatherPlaneFloor();
+  /**
+   * §11.50 — divide the shell's coverage by the weight it actually spent, so
+   * the coarse-fallback signal is a SHARE and not a sum. See the `covAcc` line
+   * at the end of `makeShell` for the artifact this removes. `false` restores
+   * the raw sum; on a build with neither the plane weight nor the LOS march
+   * the two are the same number, because bare trilinear sums to 1.
+   */
+  const covNormalize = globalThis.__giGatherCovNormalize !== false;
   // §13.9, shared with the CPU mirror through one reader.
   //
   // ⭐ AND IT IS A LIVE UNIFORM, NOT A BUILD CONSTANT (2026-08-23). Every
@@ -330,11 +346,8 @@ export function createSrcScreenGather(store, tiles, {
 
     const out = vec3(0).toVar();
     const shellTotal = float(0).toVar();
-    // §10.7 — COVERAGE, not "a shell answered": Σ over shells of the shell's
-    // own corner coverage (0..1) times its weight. `shellTotal` is the sum of
-    // shell WEIGHTS and is therefore ~1 the moment any corner votes, so it
-    // cannot say HOW WELL the fine lattice answered. This can, and it is the
-    // blend against the coarse arm below.
+    // Angular confidence, normalized against the geometry-weighted stencil.
+    // Keep this diagnostic separate from whether spatial corners exist.
     const covTotal = float(0).toVar();
     const cornersHit = uint(0).toVar();
     const cornersCovered = uint(0).toVar();
@@ -393,6 +406,15 @@ export function createSrcScreenGather(store, tiles, {
 
       const acc = vec3(0).toVar();
       const wsum = float(0).toVar();
+      // ⭐⭐ §11.50 — THE WEIGHT THIS SHELL INTENDED TO SPEND.
+      //
+      // `wsum` is `Σ w·a`: it carries the corner weights AND the coverage. As
+      // a renormalization denominator that is right, and the weights cancel.
+      // As the COVERAGE signal at the bottom of this function it is wrong the
+      // moment anything scales the weights, because `Σ w` is then no longer 1
+      // and the "coverage" it reports is really `Σ w·a / 1` — a coverage
+      // multiplied by however much weight survived. See the `covAcc` line.
+      const wtot = float(0).toVar();
       for (let k = 0; k < 8; k++) {
         const [dx, dy, dz] = CORNERS[k];
         const weight = (dx ? t.x : float(1).sub(t.x))
@@ -438,7 +460,34 @@ export function createSrcScreenGather(store, tiles, {
           const t = pd.div(s.mul(0.35).min(planeDepthU)).add(1).clamp(0, 1).toVar();
           const oneSided = t.mul(t).mul(float(3).sub(t.mul(2))).toVar();
           const shaped = nwExp === 1 ? oneSided : oneSided.pow(float(nwExp));
-          weight.mulAssign(shaped.max(1e-3));
+          // ── §11.51 — THE FLOOR IS THE WHOLE ARTIFACT (2026-09-05) ─────────
+          //
+          // At 1e-3 this is not a weight, it is a DELETION: the fade depth is
+          // `min(0.35·s, 0.15)` = 12 cm at c0 while a corner sits up to
+          // `s·√3` = 61 cm behind the plane, so essentially every behind-plane
+          // corner lands at the floor. The stencil is then not trilinear but
+          // whatever subset happens to be in front, and THAT subset changes
+          // where a wall meets a floor or a ceiling — which is exactly where
+          // the user sees the stripes.
+          //
+          // MEASURED, four alternating rebuilds at one pinned pose on their
+          // Level (`gi-look-ab.mjs`, edge strip ÷ open wall, 1.0 = no stripe):
+          //   floor 1e-3  top .516 .507   bottom .412 .420
+          //   weight off  top .880 .886   bottom .873 .880
+          // — bimodal, no overlap, while the frame mean and the open wall's
+          // own value moved < 2 % and NO enclosed region brightened (the leak
+          // the weight exists to stop did not return). So the guard's whole
+          // measurable effect at this pose was the artifact.
+          //
+          // The guard still has to hold Bistro (§14 Q9's reason for the
+          // default: a facade pixel interpolating the four corners INSIDE the
+          // building, black with the sky off). A RATIO does that; a deletion
+          // is not needed for it. At the default floor a front corner outvotes
+          // a behind one 5:1, which buries a black interior probe, and the
+          // stencil can no longer collapse at a junction.
+          //
+          // `__giGatherPlaneFloor` sweeps it; 0 restores the deletion exactly.
+          weight.mulAssign(shaped.max(planeFloor));
         }
         // ── §15 U3: THE PROBE MUST SEE THE POINT ───────────────────────────
         //
@@ -484,6 +533,11 @@ export function createSrcScreenGather(store, tiles, {
           // control: it prices the guard and its effect separately.
           weight.mulAssign(mix(float(1), vis.max(1e-3), losStrengthU));
         }
+        // Every corner, whether or not its probe exists and whether or not it
+        // knows anything: this is the DENOMINATOR of "how much of what I asked
+        // for came back", so a missing probe and an ignorant probe must both
+        // lower the ratio exactly as they lower `wsum`.
+        wtot.addAssign(weight);
         If(weight.greaterThan(0), () => {
           // `secondary` is 0: the multibounce cache is Phase 5's caller, not a
           // parameter here. Out-of-window cells pack to KEY_EMPTY and the WGSL
@@ -503,7 +557,9 @@ export function createSrcScreenGather(store, tiles, {
             // The corner EXISTS (above) vs the corner VOTES (here) — see
             // GG_COVERED's header for why the difference is the whole
             // block-vs-thin-lattice question.
-            If(tap.w.greaterThan(0), () => { cornersCovered.addAssign(uint(1)); });
+            If(tap.w.greaterThan(0), () => {
+              cornersCovered.addAssign(uint(1));
+            });
           });
         });
       }
@@ -516,10 +572,36 @@ export function createSrcScreenGather(store, tiles, {
         outAcc.addAssign(acc.div(wsum).mul(shellWeight));
         totalAcc.addAssign(shellWeight);
       });
-      // The coverage this shell actually found, weighted like its radiance.
-      // Outside the `If` on purpose: a shell with zero coverage must lower the
-      // fine lattice's confidence, which is the whole signal the fallback runs on.
-      if (covAcc) covAcc.addAssign(wsum.clamp(0, 1).mul(shellWeight));
+      // ── §11.50: THE COVERAGE IS A SHARE, NOT A SUM ────────────────────────
+      //
+      // This angular coverage previously drove the coarse fallback. It used
+      // to be `wsum` raw, which is only a coverage while `Σ w == 1` — true for
+      // bare trilinear (a partition of unity) and FALSE the moment §13.7d's
+      // plane weight (default on since 2026-09-03) or §15 U3's LOS march scales
+      // the corners. The plane weight floors every corner behind the shaded
+      // surface at 1e-3, so on a wall sitting at phase φ through its cell the
+      // surviving weight is ≈ φ and the shell reported coverage ≈ φ·a — a wall
+      // whose lattice phase put it near a cell plane reported "I know almost
+      // nothing" while its front probes knew everything, and the coarse shell
+      // took the pixel. The coarse shell's cells are 2–4× wider, so what the
+      // screen showed was the c1/c2 lattice: hard-edged rectangles on flat
+      // walls, worst where a wall's phase is small. Turning the plane weight
+      // off removed them (A/B, both arms freshly rebuilt) — which is what
+      // named that normalization defect. The fallback now uses spatial
+      // coverage separately; angular confidence must not replace valid c0.
+      //
+      // Dividing by the weight actually applied makes it a SHARE — "of the
+      // vote I cast, how much landed on measured radiance" — which is
+      // dimensionless, immune to any corner scaling, and identically the old
+      // value on the unarmed path where `Σ w == 1`.
+      //
+      // `__giGatherCovNormalize = false` restores the raw sum.
+      if (covAcc) {
+        covAcc.addAssign(
+          covNormalize ? wsum.div(wtot.max(1e-6)).clamp(0, 1).mul(shellWeight)
+            : wsum.clamp(0, 1).mul(shellWeight),
+        );
+      }
     };
 
     const shell = makeShell(0, lookup, tiles, out, shellTotal, covTotal);
@@ -539,18 +621,17 @@ export function createSrcScreenGather(store, tiles, {
 
     // ── §10.7: WHAT THE FINE LATTICE COULD NOT ANSWER, THE COARSE ONE DOES ──
     //
-    // `need` is 1 where c0 found no coverage at all and 0 where it answered
-    // fully, so the mix below is the IDENTITY on a healthy pixel — this arm
-    // cannot change a frame the fine lattice already covers, which is why it
-    // ships on rather than behind a quality knob. Guarded on `need` for cost
-    // the same way the second LOD shell is guarded on `blend`: a starved
-    // region is coherent across a warp, so the branch is nearly free where it
-    // is not taken.
+    // Only an entirely unanswered fine gather needs this approximation.
+    // Population inserts surface receivers, not a filled 3D volume: a flat
+    // wall naturally has just one populated plane of its eight-corner stencil.
+    // Sparse renormalization above already reconstructs that plane correctly.
+    // Neither missing corners nor angular confidence mean that c1 may replace
+    // this answer: c1 lacks L0 and T0 from L0 + T0 * mergedC1. On the Level,
+    // replacement introduced 50–83% jumps across otherwise smooth wall rows.
     if (coarseArmed) {
-      const need = float(1).sub(covTotal).clamp(0, 1).toVar();
       const outC = vec3(0).toVar();
       const shellTotalC = float(0).toVar();
-      If(need.greaterThan(0.01), () => {
+      If(shellTotal.equal(0), () => {
         const shellC = makeShell(
           coarse.cascade ?? 1, coarse.lookup, coarse.tiles, outC, shellTotalC, null,
         );
@@ -560,12 +641,7 @@ export function createSrcScreenGather(store, tiles, {
         });
         If(shellTotalC.greaterThan(0), () => {
           outC.assign(outC.div(shellTotalC));
-          // `covTotal` is the blend, NOT a select: at full fine coverage this
-          // returns `out` unchanged, at zero it returns the coarse answer, and
-          // in between it crossfades — so a pixel walking out of a starved
-          // patch has no edge to show. R1's "no binary anything", applied to a
-          // fallback.
-          out.assign(mix(outC, out, covTotal.clamp(0, 1)));
+          out.assign(outC);
           shellTotal.assign(shellTotal.max(shellTotalC));
         });
       });
@@ -575,7 +651,14 @@ export function createSrcScreenGather(store, tiles, {
     // not a measurement of darkness — and every consumer that renders it as
     // black is violating R1 at the display. The screen pass carries this in
     // the target's alpha so the temporal filter can hold history instead.
-    return { irradiance: out, corners: cornersHit, covered: cornersCovered, known: shellTotal.greaterThan(0) };
+    // `coverage` (§11.28): the fine lattice's coverage-weighted answer share,
+    // 0..1 — the fraction of this point's cosine lobe the gathered probes
+    // actually sampled. An INSTRUMENT output (the ladder rig reads it per
+    // point); the screen pass does not store it.
+    return {
+      irradiance: out, corners: cornersHit, covered: cornersCovered,
+      known: shellTotal.greaterThan(0), coverage: covTotal.clamp(0, 1),
+    };
   };
 
   // CLOSURE-ONLY, and the header's first section is the whole argument for it:
@@ -812,5 +895,25 @@ export function createSrcGlossyGather(gatherAt, { readPixel, width, height, came
       hist.dispose?.();
       histPos.dispose?.();
     },
+  };
+}
+
+/**
+ * §11.44 — the c0 BLOCK under a world position, by exactly the lattice walk
+ * `createSrcScreenGather`'s shells do (lod at the hit's distance, that lod's
+ * spacing and origin, the packed key, the hash → block word). The hit
+ * shader keys its per-probe visibility cache on it; SLOT_EMPTY when the hit
+ * is outside the populated field (then nothing is cached and it marches).
+ */
+export function createHitBlockAt({ lookup, spacing0, anchor, camera, maxLods }) {
+  return (P) => {
+    const lodF = lodAtDistance(chebyshev(P, camera), spacing0, maxLods).toVar();
+    const lod = int(lodF.floor()).clamp(0, maxLods - 1).toVar();
+    const s = probeSpacing(0, lod, spacing0).toVar();
+    const origin = latticeOrigin(anchor, s).toVar();
+    const cell0 = floor(P.sub(origin).div(s)).toVar();
+    const cell = ivec3(int(cell0.x), int(cell0.y), int(cell0.z)).toVar();
+    if (worldKeysEnabled()) cell.assign(cell.add(latticeOriginCell(anchor, s)));
+    return uint(lookup(packProbeKey(lod, uint(0), cell))).toVar();
   };
 }

@@ -478,14 +478,14 @@ console.log("third-person orbit");
  */
 const THREE = await import("three");
 
-const CharacterCamera = await (async () => {
+async function loadTemplate(source) {
   const { code } = await esbuild.transform(
     // The real import resolves through the script runtime's "engine" alias,
     // which does not exist out here. The two names it brings in are a base
     // class the runtime does not require (it injects the context properties on
     // any class) and a decorator that only records inspector metadata, so the
     // stubs below leave the behaviour untouched.
-    CHARACTER_CAMERA_SOURCE.replace(
+    source.replace(
       /^import \{[^}]*\} from "engine";/m,
       "class Script {}; const attribute = () => () => {};",
     ),
@@ -493,7 +493,10 @@ const CharacterCamera = await (async () => {
   );
   const loaded = await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`);
   return loaded.default;
-})();
+}
+
+const CharacterCamera = await loadTemplate(CHARACTER_CAMERA_SOURCE);
+const CharacterController = await loadTemplate(CHARACTER_CONTROLLER_SOURCE);
 
 /**
  * A camera script wired up the way the rig has it: the Camera object3D is a
@@ -745,6 +748,111 @@ check("a stick turns the same amount per second whatever the framerate", () => {
   const fast = at(144);
   assert.ok(Math.abs(slow.yaw - fast.yaw) < 1e-9, "stick yaw is framerate dependent");
   assert.ok(Math.abs(slow.pitch - fast.pitch) < 1e-9, "stick pitch is framerate dependent");
+});
+
+check("pushing a stick up looks UP — the mouse's screen-space flip is not for sticks", () => {
+  // The SIGN half of the rate fix. A mouse delta is screen-space (up = -y) and
+  // needs negating; a stick — gamepad or on-screen — is already y-up, the
+  // engine's convention for every vec2 (dpad, WASD composite, virtual stick).
+  // The single flip that shipped here made pushing the touch look stick up
+  // point the camera DOWN, with Invert Y as the only way to see the sky.
+  for (const scheme of ["Touch", "Gamepad"]) {
+    const camera = mountLook(scheme, { x: 0, y: 0.6 });
+    camera.readLook(1 / 60);
+    assert.ok(camera.pitch > 0, `${scheme}: stick up pitched to ${camera.pitch}, must look up`);
+  }
+  const mouse = mountLook("KeyboardMouse", { x: 0, y: -6 }); // a mouse dragged up
+  mouse.readLook(1 / 60);
+  assert.ok(mouse.pitch > 0, `mouse up pitched to ${mouse.pitch}, must look up`);
+});
+
+check("Invert Y flips whichever device is in hand", () => {
+  for (const [scheme, look] of [["Touch", { x: 0, y: 0.6 }], ["KeyboardMouse", { x: 0, y: -6 }]]) {
+    const camera = mountLook(scheme, look);
+    camera.invertY = true;
+    camera.readLook(1 / 60);
+    assert.ok(camera.pitch < 0, `${scheme}: Invert Y did not flip the pitch (${camera.pitch})`);
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+console.log("input devices");
+
+/*
+ * The engine's vec2 convention is "up = +1": the WASD composite adds
+ * `up - down`, the dpad returns +1 for dpadUp, the on-screen joystick
+ * negates screen Y before reporting. The Gamepad API hands sticks over
+ * screen-space (down = +1), so the DEVICE flips them — otherwise it is the
+ * one device reading the other way, pushing a stick up walks the character
+ * backward, and every vec2 consumer has to special-case its sign.
+ */
+const { GamepadDevice } = await import("../src/engine/input/devices/GamepadDevice.js");
+
+check("gamepad sticks read y-up, like the dpad and the on-screen joystick", () => {
+  const pads = [{ connected: true, buttons: [], axes: [0, -0.8, 0.5, -1] }]; // both sticks pushed UP, right also right
+  const real = navigator.getGamepads;
+  navigator.getGamepads = () => pads;
+  try {
+    const pad = new GamepadDevice(0);
+    pad.connected = true;
+    pad.poll();
+    const left = pad.readValue("gamepad/0/leftStick");
+    const right = pad.readValue("gamepad/0/rightStick");
+    assert.ok(left.y > 0.5, `left stick pushed up must read +y, got ${left.y}`);
+    assert.ok(
+      right.y > 0.5 && right.x >= 0.5,
+      `right stick pushed up-right must read (+x, +y), got (${right.x}, ${right.y})`,
+    );
+  } finally {
+    if (real) navigator.getGamepads = real;
+    else delete navigator.getGamepads;
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+console.log("movement input");
+
+/*
+ * Deflection is a direction dial, not a throttle. A half-deflected stick used
+ * to halve BOTH the walk speed and the animator's Speed parameter, so the
+ * character visibly sagged toward a trudge whenever the thumb drifted back
+ * toward the centre — reported as "he slows down and the animation slows
+ * down with the joystick distance".
+ */
+function mountController(move) {
+  const controller = new CharacterController();
+  controller.input = {
+    readValue: () => move,
+    getAction: () => ({ space: "camera" }), // the manager already rotated this into world XZ
+    isPressed: () => false,
+    wasPressedThisFrame: () => false,
+  };
+  return controller;
+}
+
+check("a half-deflected stick walks at FULL speed", () => {
+  const move = mountController({ x: 0.4, y: 0.2 }).readMove();
+  assert.ok(Math.abs(Math.hypot(move.x, move.z) - 1) < 1e-9, `deflection became pace (${Math.hypot(move.x, move.z)})`);
+  assert.ok(move.x > 0 && move.z > 0, "normalizing lost the direction");
+});
+
+check("inside the dead zone the character stands still", () => {
+  // The gamepad device zeroes each axis within 0.12, but a wobbly stick's
+  // diagonal can still read ~0.17 — the dead zone here has to out-size that,
+  // or drift becomes full-speed walking the moment deflection is normalized.
+  const move = mountController({ x: 0.12, y: 0.08 }).readMove();
+  assert.equal(move.x, 0);
+  assert.equal(move.z, 0);
+});
+
+check("Analog Speed restores the proportional read", () => {
+  const controller = mountController({ x: 0.4, y: 0.2 });
+  controller.analogSpeed = true;
+  const move = controller.readMove();
+  assert.ok(
+    Math.abs(Math.hypot(move.x, move.z) - Math.hypot(0.4, 0.2)) < 1e-9,
+    "the analog toggle must keep deflection as pace",
+  );
 });
 
 /**
@@ -1249,6 +1357,59 @@ await asyncCheck("a wall's doorway is a hole you can walk through", async () => 
     player.object3D.position.z > 2,
     `the character was stopped at z = ${player.object3D.position.z.toFixed(2)} — the doorway is solid`,
   );
+  engine.setPlaying(false);
+});
+
+await asyncCheck("physics queries accept a THREE.Vector3 like the typings promise", async () => {
+  // The camera's Avoid Walls cast and the controller's crouch ceiling check
+  // hand the query a Vector3. An implementation that reads origin[0] gets
+  // `undefined` for a Vector3 — no error, just NaN reaching Rapier and a
+  // query that silently NEVER hits, reported as "the camera goes through
+  // walls".
+  const engine = await makeEngine({ physics: true });
+  const wall = engine.createEntity({ name: "Wall" });
+  wall.object3D.position.set(0, 0, 4);
+  wall.addComponent("blockout", { shape: "wall", size: [8, 3, 0.3] });
+  wall.addComponent("collider", { shape: "concave" });
+
+  engine.setPlaying(true);
+  engine.physics.update(1 / 60);
+
+  const THREE = await import("three");
+  const eye = new THREE.Vector3(0, 1.5, 0); // mid-height of the 3 m wall
+  const ray = engine.physics.raycast(eye, [0, 0, 1], 20);
+  assert.ok(ray, "a raycast from a Vector3 origin hit nothing");
+  assert.ok(Math.abs(ray.distance - 3.85) < 0.05, `ray hit at ${ray.distance}, wall face at 3.85`);
+  const sweep = engine.physics.spherecast(eye, 0.25, [0, 0, 1], 20);
+  assert.ok(sweep, "a spherecast from a Vector3 origin hit nothing");
+  assert.ok(Math.abs(sweep.distance - 3.6) < 0.05, `sphere hit at ${sweep.distance}, expected 3.85 − 0.25 radius`);
+  engine.setPlaying(false);
+});
+
+await asyncCheck("Avoid Walls pulls the third-person camera in front of a wall", async () => {
+  // The template casts from its pivot — a Vector3 — so until the queries
+  // accepted one, avoidWalls read as "on" and did nothing. Character at the
+  // origin orbiting toward a wall 4 m away on +Z at Distance 4: the broken
+  // camera lands exactly on the wall's far face.
+  const engine = await makeEngine({ physics: true });
+  const wall = engine.createEntity({ name: "Wall" });
+  wall.object3D.position.set(0, 0, 4);
+  wall.addComponent("blockout", { shape: "wall", size: [8, 3, 0.3] });
+  wall.addComponent("collider", { shape: "concave" });
+
+  engine.setPlaying(true);
+  engine.physics.update(1 / 60);
+
+  const { camera, cameraObject } = mountCamera();
+  camera.avoidWalls = true;
+  camera.engine = { physics: engine.physics };
+  camera.yaw = 0; // orbit straight BEHIND the character, toward +Z and the wall
+  camera.pitch = 0;
+  camera.applyThirdPerson(1 / 60);
+
+  const z = cameraObject.getWorldPosition(new THREE.Vector3()).z;
+  assert.ok(camera.currentDistance < camera.distance, `the camera did not pull in (${camera.currentDistance})`);
+  assert.ok(z < 3.6, `the camera sits at z = ${z.toFixed(2)} — past the wall's near face at 3.85`);
   engine.setPlaying(false);
 });
 

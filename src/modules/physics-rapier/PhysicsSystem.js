@@ -16,6 +16,19 @@ const FIXED_DT = 1 / 60;
 const MAX_SUBSTEPS = 4;
 const DEG2RAD = Math.PI / 180;
 
+/**
+ * Query origins/directions are typed `[x, y, z] | Vector3` (engine.d.ts), but
+ * Rapier wants raw `{x, y, z}`. Indexing a THREE.Vector3 with `[0]` reads
+ * `undefined` — no error, just a query fed NaN that silently never hits —
+ * which is how the third-person camera's Avoid Walls cast and the crouch
+ * ceiling check (both handed a Vector3) passed through everything. Coerce
+ * both shapes here rather than making callers remember which is which.
+ */
+function xyz(v) {
+  if (v && typeof v.x === "number") return { x: v.x, y: v.y, z: v.z };
+  return { x: v?.[0] ?? 0, y: v?.[1] ?? 0, z: v?.[2] ?? 0 };
+}
+
 const _pos = new THREE.Vector3();
 const _quat = new THREE.Quaternion();
 const _scale = new THREE.Vector3();
@@ -611,12 +624,14 @@ export class PhysicsSystem {
     if (!this.world) return null;
     const desc = this.#shape(shape);
     if (!desc) return null;
-    const dir = _pos.set(direction[0], direction[1], direction[2]).normalize();
+    const o = xyz(origin);
+    const d = xyz(direction);
+    const dir = _pos.set(d.x, d.y, d.z).normalize();
     const rot = options.rotation
       ? { x: options.rotation[0], y: options.rotation[1], z: options.rotation[2], w: options.rotation[3] }
       : { x: 0, y: 0, z: 0, w: 1 };
     const hit = this.world.castShape(
-      { x: origin[0], y: origin[1], z: origin[2] },
+      { x: o.x, y: o.y, z: o.z },
       rot,
       { x: dir.x * maxDistance, y: dir.y * maxDistance, z: dir.z * maxDistance },
       desc,
@@ -667,8 +682,9 @@ export class PhysicsSystem {
       ? { x: options.rotation[0], y: options.rotation[1], z: options.rotation[2], w: options.rotation[3] }
       : { x: 0, y: 0, z: 0, w: 1 };
     const found = new Set();
+    const c = xyz(center);
     this.world.intersectionsWithShape(
-      { x: center[0], y: center[1], z: center[2] },
+      { x: c.x, y: c.y, z: c.z },
       rot,
       desc,
       (collider) => {
@@ -694,9 +710,11 @@ export class PhysicsSystem {
   }
 
   #ray(origin, direction) {
-    const dir = _pos.set(direction[0], direction[1], direction[2]).normalize();
+    const o = xyz(origin);
+    const d = xyz(direction);
+    const dir = _pos.set(d.x, d.y, d.z).normalize();
     return new this.RAPIER.Ray(
-      { x: origin[0], y: origin[1], z: origin[2] },
+      { x: o.x, y: o.y, z: o.z },
       { x: dir.x, y: dir.y, z: dir.z },
     );
   }

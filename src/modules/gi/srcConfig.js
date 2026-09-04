@@ -87,6 +87,19 @@ export const W0 = 4;
 export const R0_OVER_S0 = 1.6;
 
 /**
+ * §11.28 DIAGNOSTIC DIAL — `__giSrcR0OverS0` overrides r₀/s₀ at BUILD time
+ * (every consumer reads it while the field is built: the interval ladder, the
+ * TSL boundary, the GTAO band). It exists for ONE experiment: the enclosure
+ * ladder's dose-response against interval length, which separates a coarse-
+ * cascade PARALLAX leak (it shrinks as hits move into finer cells) from a
+ * direction-sampling leak (it does not). Not a quality property.
+ */
+export function r0OverS0() {
+  const f = Number(globalThis.__giSrcR0OverS0);
+  return Number.isFinite(f) && f > 0 ? f : R0_OVER_S0;
+}
+
+/**
  * Maximum LOD count. The 32-bit probe key spends 4 bits on LOD and stores
  * LOD+1 (so a packed key can never be zero — zero is the hashmap's EMPTY
  * sentinel), which leaves 15 usable LODs. The plan clamps selection to
@@ -233,6 +246,67 @@ export const TEMPORAL_ALPHA_STILL = 0.02;
  * ~5.3 cm/frame mover translation.
  */
 export const ALPHA_MOTION_SAT = (0.94 - 0.86) / 30;
+
+/**
+ * ⭐⭐⭐ THE LIGHT-MOTION SIGNAL'S RELEASE, AND WHY IT IS A PEAK HOLD
+ * (2026-09-04, §11.21).
+ *
+ * GISystem measures light motion as the change in a light's matrix between two
+ * RENDERED frames, then normalises it by the frame time (see that loop's
+ * banner). Normalising fixes the SCALE; it does not fix the GAPS. The matrix is
+ * written by a script whose tick is not the GI tick, so on some frames the
+ * delta is zero and on the next it is two frames' worth — and a zero frame is
+ * indistinguishable, to every consumer, from a light that stopped.
+ *
+ * Measured live in the user's own play session, on a sun turning at a smooth
+ * sinusoidal rate (`profile.flicker`'s `lightMotion` dial, in units of the
+ * tracking window's own 0.5 threshold): **median 0.337, maximum 3.451** — an
+ * 11× spread on a light whose angular velocity barely changes across the
+ * window. That spread is what walks the signal back and forth across the arm
+ * threshold, and §12.83's simulation of the same straddle assumed ±12 %.
+ *
+ * So the rate is peak-held with an exponential release: a genuine light STEP
+ * passes in the frame it happens (an average would lag it by a whole time
+ * constant — the thing §12.38.3 was built to stop), and the zeros between two
+ * script writes are filled instead of read as stillness. 100 ms is ~6 frames at
+ * 60 fps and ~12 at 120: long enough to bridge any plausible script cadence,
+ * short enough that a light which really stops is reported still within a tenth
+ * of a second. `__giLightMotionRate = false` restores the raw per-frame delta.
+ */
+export const LIGHT_MOTION_RELEASE_MS = 100;
+
+/**
+ * ⭐⭐ §11.21 THE NOVELTY GATE — §12.83'S DESIGN, SHIPPED.
+ *
+ * §12.83 wrote this mechanism out in full, then declined to build it: a
+ * simulation put the tracking window's straddle at ~1 % of frames, and "inert
+ * complexity in the arming path is how this window got two conflicting stories
+ * in the first place". The live measurement says otherwise. In the user's play
+ * session the window's own dial reads **median 0.517, open on more than half
+ * of the frames where the camera was not moving**, and turning the window off
+ * outright cut per-pixel reversals 5.1× and the p95 one-frame step 5.2×
+ * (`profile.flicker`, two matched pairs, plan §11.21).
+ *
+ * The argument §12.83 made is still exactly right, so it is the argument that
+ * ships: **a light EVENT is not "fast", it is FASTER THAN THIS LIGHT HAS
+ * BEEN.** Each term keeps a slow EMA of itself and arms only when it clears
+ * `max(ALPHA_TRACK_THRESHOLD, NOVELTY × its own baseline)`.
+ *
+ *   · a steadily rotating sun: term ≈ its own baseline ⇒ never novel ⇒ the
+ *     window stays shut, and responsiveness falls back to the m-driven α ramp,
+ *     which §12.46 said should own sustained motion all along;
+ *   · a sun that STARTS moving, a teleport, a scrub: baseline low ⇒ arms;
+ *   · a lamp toggling mid-day-cycle: the baselines are PER TERM, so the sun's
+ *     raised shadow baseline cannot deafen the luminance term. That is why it
+ *     is three baselines and not one.
+ *
+ * The EMA is fed the UNCLAMPED term — `mLight`'s clamp to 1 would saturate a
+ * rotating sun and a teleport to the same number, and a teleport during a day
+ * cycle would then not be novel either. `__giSrcTrackNovelty = false` restores
+ * the absolute-threshold-only arm.
+ */
+export const TRACK_BASELINE_MS = 1000;
+export const TRACK_NOVELTY = 2.5;
 
 /**
  * ══ THE REST CADENCE — FEWER RAYS WHEN NOTHING NEEDS THEM (§12.61) ══════════
@@ -563,6 +637,19 @@ export const PROBE_MAX_AGE = 60;
 export const MAX_LOOP_ALBEDO = 0.9;
 
 /**
+ * The ceiling the build actually uses: `__giSrcLoopAlbedo` (0 < x ≤ 1)
+ * overrides `MAX_LOOP_ALBEDO` at kernel build — an A/B dial for the
+ * near-white enclosure case (2026-09-05, the user's Level: every blockout
+ * wall and the floor are albedo 1.0, so 0.9 caps the room's series at 10×
+ * where the tracer's runs higher). Read at build, like the other hatches;
+ * `srcRef.js` keeps the constant, so the fixtures never see the dial.
+ */
+export function loopAlbedoCeiling() {
+  const v = Number(globalThis.__giSrcLoopAlbedo);
+  return Number.isFinite(v) && v > 0 && v <= 1 ? v : MAX_LOOP_ALBEDO;
+}
+
+/**
  * Quality tiers. Unlike the dense backend's tiers these scale s₀, rays/pixel,
  * secondary bounce and ray ceilings — NOT a world volume, because SRC has no
  * volume to scale. Memory is screen-proportional by construction (plan §4.2).
@@ -577,14 +664,28 @@ export const MAX_LOOP_ALBEDO = 0.9;
  * plus extra work. Ultra instead buys finer spatial probes, more transport
  * rays, and a looser per-probe cap without starving the proven pool.
  */
+/**
+ * ⭐⭐ §11.30 (2026-09-04) — `probeRayCap` 8 ON EVERY TIER and STARVE_PACKETS 8:
+ * the ray DISTRIBUTION is the lever, not the total. On the user's Bistro at
+ * ultra (12.5 k visible c0 probes, 89 k rays/frame at rest) every c0 probe
+ * was flagged starved and a texel knew 3 of its 20 lobe bins (`knownFrac`
+ * 0.15) — the near probes took the cap of 32, the street took nothing, and
+ * the picture was the extrapolation of three bins: "very blurry and flat".
+ * Raising the starvation floor's packets 2 → 8 alone took `knownFrac` to
+ * 0.80 at 190 k rays (+18 ms); lowering the cap 32 → 8 with it held 0.80 at
+ * **30 k rays** — the SRC chain 48 → 19 ms, 25 → 35 fps at that pose, flicker
+ * unchanged, sun-step t50 2.0 → 0.9 s. The corridor ladders read the cap as
+ * energy-neutral (sun bounce 0.99–1.11×, the §12.40.4 verdict again). One
+ * cap for all tiers: the surplus it denies is the same surplus everywhere.
+ */
 export const SRC_QUALITY = {
-  low: { spacing0: 0.8, raysPerPixel: 1, w0: 4, secondary: false, transportRays: 32_768, probeRayCap: 16 },
-  medium: { spacing0: 0.6, raysPerPixel: 1, w0: 4, secondary: true, transportRays: 65_536, probeRayCap: 16 },
-  high: { spacing0: 0.45, raysPerPixel: 2, w0: 4, secondary: true, transportRays: 131_072, probeRayCap: 16 },
+  low: { spacing0: 0.8, raysPerPixel: 1, w0: 4, secondary: false, transportRays: 32_768, probeRayCap: 8 },
+  medium: { spacing0: 0.6, raysPerPixel: 1, w0: 4, secondary: true, transportRays: 65_536, probeRayCap: 8 },
+  high: { spacing0: 0.45, raysPerPixel: 2, w0: 4, secondary: true, transportRays: 131_072, probeRayCap: 8 },
   // Keep the proven directional width. With the fixed raw-bin budget, w0=8
   // cuts Bistro's c0 block capacity from 21,875 to 5,468 (below its measured
   // 14,273 live probes), causing permanent noBlock checker/rectangle holes.
-  ultra: { spacing0: 0.35, raysPerPixel: 2, w0: 4, secondary: true, transportRays: 393_216, probeRayCap: 32 },
+  ultra: { spacing0: 0.35, raysPerPixel: 2, w0: 4, secondary: true, transportRays: 393_216, probeRayCap: 8 },
 };
 
 /**
@@ -808,7 +909,19 @@ export const COLD_FILL_FRAMES = 4;
  * (0 = off arm) and `__giSrcStarveRays` are the live dials;
  * `__giSrcStarve = false` removes the branch at build.
  */
-export const STARVE_PACKETS = 2;
+export const STARVE_PACKETS = 8;
+/**
+ * §11.31 — THE FLOOR'S SHARE OF THE CEILING. The starvation floor claims its
+ * packets from its OWN dispenser bounded to this fraction of the frame's ray
+ * ceiling, and the winners rotate per frame. Without the bound, 8 packets on
+ * a COLD field (every visible probe starved — 15.7 k on the user's Bistro
+ * after an editor restart) reserved 250 k rays against a 196 k ceiling, the
+ * DENIED claims still bumped the shared ticket counter, every pixel claim
+ * behind them was refused, and the transport ran at 0 rays/frame forever:
+ * a probe that gets no rays stays starved. The old 2 packets could not reach
+ * it (50 k); 8 can, so the floor is budgeted.
+ */
+export const STARVE_SHARE = 0.5;
 export const STARVE_RAYS = 2000;
 export const COLD_CAP_SHIFT = 2;
 /**
@@ -977,6 +1090,51 @@ export function binCount(cascade, w0 = W0) {
  * persists flags for.
  */
 export function sunSplitArmed() {
+  // ⭐⭐⭐ DEFAULT ON since 2026-09-04 (§11.21). It was opt-in because its
+  // bin-level delivery was short — srcSystem carried "removes 46-57 % of the
+  // picture, returns 5-24 %". THAT VERDICT WAS STALE: the defect behind it was
+  // the decay pass round-tripping the packed normal through a `select`, which
+  // zeroed the word every frame (srcDeposit's BIN_SN note carries the full
+  // story), and fixing that took the normal ratio 9 % -> 52-63 % without
+  // anybody re-running the delivery measurement.
+  //
+  // Re-measured on Sponza, sun pinned, camera parked, character hidden, four
+  // arms in one run (`probe:gi-walk PARK=1`): tail mean luma base 0.17939,
+  // split 0.17308 (96.5 %), `sunsplitkeep` 0.20360 — so the transfer returns
+  // 0.0242 of the 0.0305 it removes, 79 %, for a picture at 96.5 % of baseline
+  // rather than the 46-57 % loss on record. `sunsplitflatcos` (cosine forced
+  // to 1) read 0.17408, i.e. within 0.6 % of the honest close: the cached
+  // NORMAL is not where the residual goes — the 27 % of lit bins that carry no
+  // normal at all is.
+  //
+  // ⚠ THE PRICE, STATED: nine words per bin instead of five. `srcBinCeiling`
+  // already divides by `BIN_WORDS`, so a device scales its bin pool down
+  // instead of failing — but on a portable 128 MiB binding that is ~6.7 M bins
+  // to ~3.7 M, and §10.7's starvation (`noBlock`, the black patches) is what
+  // too few bins looks like. On a desktop reporting 1024 MB per binding the
+  // ceiling stays pinned at BIN_CEILING_MAX and nothing shrinks.
+  //
+  // ⛔⛔ **BACK TO OPT-IN, 2026-09-04, ON THE USER'S REPORT.** §11.22 shipped
+  // this default-on with a delivery receipt (96.5 % of baseline luma at a
+  // PINNED sun) and a flicker receipt (churn 99.6 % → 13.8 %). Both were true
+  // and both were beside the point: the user's next look was *"it got a lot
+  // worse. Flickers a lot + when light moves, lighting does not update."*
+  //
+  // ⭐ THE MISSING GATE, NAMED SO IT IS NOT MISSED AGAIN: every measurement
+  // this session scored STABILITY, and a field that has stopped tracking the
+  // sun is perfectly stable. `profile.flicker` cannot tell "converged" from
+  // "frozen", the pinned-sun delivery arm cannot see tracking at all, and the
+  // two together will happily certify a picture that never updates. A light
+  // change needs its own receipt — time for the picture to follow a moving sun
+  // — and until that exists, nothing here may ship on a stability number.
+  //
+  // The mechanism is §12.82's own caveat, which this session under-weighted:
+  // the cached transfer is `ρ/π · V`, and **V is VISIBILITY — it is not
+  // sun-independent**. A rotating sun re-shadows the whole scene, and that half
+  // only refreshes when new rays land in the bin. The split makes the COSINE
+  // and the irradiance free; it does not make the shadow free.
+  //
+  // `__giSrcSunSplit = true` arms it for measurement.
   return globalThis.__giSrcSunSplit === true;
 }
 
@@ -1028,13 +1186,174 @@ export const BIN_BUDGET = sunSplitArmed() ? 2_800_000 : 4_500_000;
 export const MIN_BLOCKS = 64;
 
 /**
- * Words per bin in the RESOLVED payload — two u32 of packed binary16 halves
- * (rgb + T), plan §11.4 A1. Owned here beside `BIN_WORDS` for the same reason
+ * Words per bin in the RESOLVED payload — three u32 of packed binary16 halves
+ * (rgb + T, then confidence + a spare half), plan §11.4 A1 + §11.25. Owned here beside `BIN_WORDS` for the same reason
  * that one is: it sizes a budget (`srcBinCeiling`), and a budget computed from
  * a layout it does not know about is the leak this file's header warns about.
  * `srcDeposit.js` re-exports it and owns the accessors.
  */
-export const PAYLOAD_WORDS = 2;
+export const PAYLOAD_WORDS = 3;
+
+/**
+ * ══ UNIT 1 — NO BIN IS EVER UNKNOWN (2026-09-04, plan §11.25) ═══════════════
+ *
+ * The resolved payload's third word carries CONFIDENCE: how much of a bin's
+ * value is its own measurement, as opposed to the prior it is shrunk toward.
+ *
+ *     c = N / (N + CONFIDENCE_PRIOR_RAYS)      N = rays of accumulated weight
+ *
+ * i.e. the posterior mean with K pseudo-observations of the prior — one ray
+ * is worth 1/(1+K) of the answer, K rays half of it, and there is no count at
+ * which anything SWITCHES. That is the whole point. The estimator this
+ * replaces had a binary threshold (`MIN_WEIGHT`, a sixty-fourth of a ray)
+ * below which a bin was UNKNOWN and above which it voted with FULL weight in
+ * the tile's lobe average — so a freshly-hit bin in a sparse lobe flipped its
+ * texel to a one-ray radiance in a single frame, and in a dark corridor that
+ * flip is 128 % of the image mean (§11.24: α 0.02 cannot produce a step that
+ * size; only a membership switch can).
+ *
+ * Where confidence is spent: the MERGE shrinks a low-confidence bin toward
+ * "empty near interval, look through me" (`L=0, T=1`) before compositing the
+ * parent, so the coarser cascade stands in until the fine one has evidence;
+ * the TILES weight each bin's vote by `cw·c` so a bin fades into the lobe as
+ * its evidence accumulates; and a parent-filled bin carries the parent's
+ * confidence discounted by `PARENT_FILL_CONFIDENCE`, so the fallback is
+ * present but never dominant.
+ *
+ * `__giSrcConfidence = false` pins c ≡ 1 for every known bin — bit-identical
+ * to the previous estimator, the A/B arm and the safety hatch.
+ */
+/**
+ * K = 16, measured (2026-09-04, the user's own corridor view, plan §11.25):
+ *
+ *   arrival, first 5 s      churn     p95 step / mean   max step
+ *   old estimator           12.9 %    0.41              7.3
+ *   K = 4                   54.3 %    0.76              3.9   ← WORSE
+ *   K = 16                   0.16 %   0.12              2.7
+ *   at rest afterwards       0.0 %    0.017             0.045 (old: 0.9 % / 0.135 / 2.17)
+ *
+ * A 1–4-ray mean in a dark corridor is a coin toss, and K = 4 let it vote
+ * 20–50 % of the lobe; at K = 16 one ray is 6 % and the parent carries the
+ * first dozen frames. The trade, measured by `profile.lightResponse` at the
+ * same view: a 25° sun step now settles in t50 2.4 s / t90 5.3 s (97 %
+ * monotone) against the old estimator's 0.7 / 2.8 s — because a light change
+ * makes the field FORGET (§12.74's root), the counts collapse, confidence
+ * collapses with them and sparse bins lean on the coarse parent, which is the
+ * smooth branch rather than the fast one. In the well-sampled nave the same
+ * step got FASTER (t90 3.6 → 1.7 s). Unit 3 owns that interaction.
+ */
+export const CONFIDENCE_PRIOR_RAYS = 16;
+export const PARENT_FILL_CONFIDENCE = 0.5;
+export function confidenceArmed() {
+  return globalThis.__giSrcConfidence !== false;
+}
+/**
+ * K, read at KERNEL BUILD (GPU) and at call time (twins): `__giSrcConfidenceK`
+ * overrides `CONFIDENCE_PRIOR_RAYS` so an A/B is a `profile.giFlag` rebuild
+ * (~75 s) rather than an editor reload. The first live A/B at the user's
+ * corridor view (§11.25) read K = 4 as WORSE on arrival — churn 12.9 % → 54.3 %,
+ * reversals 4× — because a 1–4-ray mean in a dark corridor is not an estimate,
+ * it is a coin toss, and 20–50 % of a coin toss in the lobe average is churn.
+ * Converged bins carry N ≈ 400 rays (keep 0.9993), so K only shapes the
+ * FADE-IN of fresh bins and cannot slow a converged bin's light response.
+ */
+/**
+ * §11.26 (Unit 1b) — a bin with NO parent to look through (an orphan, or any
+ * bin of the top cascade) is shrunk toward the far-field mean, the prior of
+ * last resort, instead of keeping its own unshrunk value. The user's "first
+ * time I see the corridor it flickers; a revisit is stable": a cold column's
+ * parents are as new as the child, so Unit 1's parent shrink had nothing to
+ * shrink toward and the orphan branch handed the tile a one-ray value.
+ * `__giSrcFarPrior = false` restores the orphan-keeps-own behaviour.
+ */
+/**
+ * §11.27 (Unit 1d) — directional inpainting of unsampled bins. A bin whose
+ * confidence is below INPAINT_LOW (fewer than ~4 rays at K = 16) takes the
+ * confidence-weighted mean of its angular neighbours on the 2w×w direction
+ * grid that ARE confident, blended by `c / INPAINT_LOW`, and carries their
+ * confidence × INPAINT_DISCOUNT. The tile bake then extrapolates along the
+ * sphere's own structure instead of from the lobe mean — dark into a crevice,
+ * bright beside a sun patch — which is the enclosure leak's named cause
+ * (`srcTiles`: "renormalised over the KNOWN bins, which is unbiased only if
+ * those bins are a random subset of the lobe; they are not").
+ * ⛔⛔ REFUTED THE SAME HOUR, BY THE GATE IT WAS BUILT FOR. Enclosure ladder:
+ * open 0.90x, enclosed **1.52x** (baseline 0.89x / 1.44x) — the leak got
+ * slightly WORSE, and `test:gi-src-merge`/`tiles`/`gather` went red (the pass
+ * writes bins the merge gate requires to stay unknown, and the GPU pass and
+ * the twin do not agree texel-for-texel). The angular neighbours of a crevice
+ * direction that no ray reached are the directions rays DID reach — the ones
+ * that escaped — so "inherit the neighbours" is the lobe mean by another road.
+ * An unsampled direction has no valid stand-in; it has to be SAMPLED (Unit 2:
+ * rays per probe over a full deterministic direction set, so `knownFrac`
+ * leaves 0.51). Kept OPT-IN as the record of the attempt:
+ * `__giSrcInpaint = true` arms it.
+ */
+export const INPAINT_LOW = 0.2;
+export const INPAINT_DISCOUNT = 0.5;
+export function inpaintArmed() {
+  return globalThis.__giSrcInpaint === true;
+}
+
+/**
+ * ══ §11.28 THE 45° BIN LIES ABOUT WHERE THE SKY IS — the radiance centroid ══
+ *
+ * The tile bake integrates `Σ (L + T·sky)·cw` with ONE value per bin and the
+ * bin's WHOLE cosine mass `cw`. Inside a 45° c0 bin the sky escapes only at
+ * the top of an enclosure — where a wall's cosine is smallest — so the bin's
+ * mean applied to the bin's mean cosine over-counts the sky exactly where the
+ * enclosure is tightest. The corridor ladder measured it as 1.44× too much
+ * light per unit truth in the corners (invariant to rays, to interval length
+ * and to coverage — §11.28 refuted all three); a numerical twin of the bake
+ * predicted its shape to the row (1.04× / 1.15× / 1.40× wall high/mid/low).
+ *
+ * The fix carries each bin's RADIANCE CENTROID — the luminance-weighted mean
+ * direction of what the bin holds — in the payload's spare half. The resolve
+ * writes "the bin's centre" (no sub-bin information); the merge's 4→1
+ * pre-average computes the centroid from its four FINER children, so a c0 bin
+ * inherits the top cascade's 5.6° knowledge of where the sky is; the bake then
+ * spends the bin's cosine at the centroid instead of at the centre. Cosine is
+ * LINEAR in direction, so for a bin inside the hemisphere this is exact for
+ * any distribution of radiance inside the bin. `__giSrcCentroid = false`
+ * reverts: the merge writes no centroid and the bake reads none.
+ */
+export function centroidArmed() {
+  return globalThis.__giSrcCentroid !== false;
+}
+
+export function farPriorArmed() {
+  return globalThis.__giSrcFarPrior !== false;
+}
+
+export function confidencePriorRays() {
+  const k = Number(globalThis.__giSrcConfidenceK);
+  return Number.isFinite(k) && k > 0 ? k : CONFIDENCE_PRIOR_RAYS;
+}
+
+/**
+ * ══ §11.29 THE PRIOR MUST LET GO — the confidence's evidence collapse ═══════
+ *
+ * `c = N/(N+K)` keeps `K/(N+K)` of the prior FOREVER: a bin fed 150 rays is
+ * still 10 % "look through me" in the merge (`T′ = 1 − c + c·T`), and in an
+ * enclosure the parent it looks through to is the SKY in a direction the bin
+ * MEASURED as blocked. That is an energy leak of `(1 − c)` × the blocked sky
+ * at the level where the blocking happens — at V 0.11 a third of the truth
+ * (the HDRI corridor ladder: wall low 1.55× with the prior, 1.19× with
+ * confidence off). The prior exists for the COLD bin (the first ~20 rays,
+ * §11.25's flicker win); nothing about it should survive real evidence.
+ *
+ * So the prior's weight collapses with evidence: `1 − c = K/(N+K) · e^{−N/F}`
+ * with F = CONFIDENCE_FULL_RAYS. At N = 1 that is 0.93 (was 0.94); at N = K
+ * 0.39 (was 0.5); at 64 rays 0.07 (was 0.2); at 200 rays 0.003 (was 0.07).
+ * The cold-arrival receipts (§11.26, N < 20) are untouched to the first
+ * decimal; a converged bin is its own measurement. `__giSrcConfidenceFull`
+ * moves F; 0 restores the plain `N/(N+K)`.
+ */
+export const CONFIDENCE_FULL_RAYS = 64;
+
+export function confidenceFullRays() {
+  const f = Number(globalThis.__giSrcConfidenceFull);
+  return Number.isFinite(f) && f >= 0 ? f : CONFIDENCE_FULL_RAYS;
+}
 
 /**
  * ══ §11.4 A2 — THE CEILING FOLLOWS THE DEVICE, AND BIN_BUDGET IS THE PORTABLE
@@ -1194,7 +1513,7 @@ export function probeSpacing(cascade, lod, spacing0) {
  * doubling of r₀.
  */
 export function intervalLength(cascade, lod, spacing0) {
-  const r0 = spacing0 * R0_OVER_S0 * (1 << lod);
+  const r0 = spacing0 * r0OverS0() * (1 << lod);
   return r0 * Math.pow(GAMMA, cascade);
 }
 
@@ -1208,7 +1527,7 @@ export function intervalLength(cascade, lod, spacing0) {
  * Phase-0 suite exists to prove there is neither.
  */
 export function intervalBoundaries(lod, spacing0, cascadeCount = CASCADE_COUNT) {
-  const r0 = spacing0 * R0_OVER_S0 * (1 << lod);
+  const r0 = spacing0 * r0OverS0() * (1 << lod);
   const out = new Array(cascadeCount);
   let acc = 0;
   for (let i = 0; i < cascadeCount; i++) {
@@ -1387,7 +1706,7 @@ export function describeSrcHierarchy(spacing0, w0 = W0, cascadeCount = CASCADE_C
     cascadeCount,
     w0,
     spacing0,
-    r0: spacing0 * R0_OVER_S0,
+    r0: spacing0 * r0OverS0(),
     reachLod0: cascadeReach(0, spacing0, cascadeCount),
     boundariesLod0: intervalBoundaries(0, spacing0, cascadeCount),
     cascades,

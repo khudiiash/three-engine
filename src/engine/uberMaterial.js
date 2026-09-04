@@ -520,6 +520,15 @@ export function buildUberMaterial(materials, template) {
 
   const material = new THREE.MeshPhysicalNodeMaterial();
   material.name = `Uber(${materials.length})`;
+  // §11.39 — THE MEMBERS, FOR GI. An uber material's colour lives in a
+  // per-vertex texture-array lookup (a VarNode), which no CPU inspector can
+  // reduce to a colour, and its classic `.color` is white — so GI's surface
+  // palette read every merged proxy as WHITE: white in every reflection that
+  // landed on a merged group, and a white BOUNCE from it. The member
+  // materials are the truth; GI's resolver averages them (voxelizeOnce.js
+  // `resolveMaterialSurface`). References, not copies: a member's compressed
+  // map resolves its mean later and the palette re-tints on the next scan.
+  material.userData.giMembers = materials.slice();
   material.side = template.side;
   material.transparent = template.transparent;
   material.opacity = template.opacity;

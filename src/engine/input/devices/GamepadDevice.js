@@ -7,7 +7,7 @@
  *   gamepad/<index>/buttonNorth   — Y / triangle
  *   gamepad/<index>/leftShoulder / rightShoulder
  *   gamepad/<index>/leftTrigger / rightTrigger   (0..1 scalar)
- *   gamepad/<index>/leftStick / rightStick       ({x, y} in -1..1)
+ *   gamepad/<index>/leftStick / rightStick       ({x, y} in -1..1, y-up)
  *   gamepad/<index>/dpad                          ({x, y} in -1..1, integer)
  *   gamepad/<index>/start / select / leftStickPress / rightStickPress
  *
@@ -106,7 +106,15 @@ export class GamepadDevice {
     this.axes.clear();
     pad.axes.forEach((v, i) => {
       const name = i === 0 ? "leftStickX" : i === 1 ? "leftStickY" : i === 2 ? "rightStickX" : i === 3 ? "rightStickY" : `axis${i}`;
-      this.axes.set(name, Math.abs(v) < DEADZONE ? 0 : v);
+      // The Gamepad API reports stick Y screen-space — down is +1. Every other
+      // vec2 in the engine reads "up = +1" (the WASD composite, the dpad, the
+      // on-screen joystick), so flip the two stick axes HERE, once, rather
+      // than at every binding and consumer. Unflipped, pushing a stick up
+      // walked the character backward — the on-screen joystick was already
+      // y-up, which is also what made stick-vs-mouse look need opposite
+      // signs in the camera template.
+      const y = i === 1 || i === 3 ? -v : v;
+      this.axes.set(name, Math.abs(y) < DEADZONE ? 0 : y);
     });
   }
 

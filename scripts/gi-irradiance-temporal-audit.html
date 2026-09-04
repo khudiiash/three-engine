@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>GI irradiance temporal arithmetic audit</title></head>
+<body><canvas id="view" width="16" height="16"></canvas><pre id="log"></pre>
+<script type="module">
+const say = (s) => { console.log(s); document.querySelector('#log').textContent += `${s}\n`; };
+try {
+  const THREE = await import('three/webgpu');
+  const TSL = await import('three/tsl');
+  const { createGiIrradianceTemporalPass } = await import('/src/modules/gi/giScreen.js');
+  const W = 8, H = 8;
+  const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector('#view') });
+  await renderer.init();
+  const device = renderer.backend.device;
+  const errors = [];
+  device.addEventListener('uncapturederror', (e) => errors.push(e.error.message));
+  if (device.limits.maxStorageBuffersPerShaderStage !== 8) throw new Error('Device must use portable storage-buffer limit 8');
+  const storage = (name) => {
+    const t = new THREE.StorageTexture(W, H); t.type = THREE.FloatType; t.format = THREE.RGBAFormat; t.name = name; return t;
+  };
+  const position = storage('auditPosition'), normal = storage('auditNormal');
+  const source = storage('auditRaw'), histPos = storage('auditHistPos'), histIrr = storage('auditHistIrr'), target = storage('auditTarget');
+  const rawArray = new Float32Array(W * H * 4), histArray = rawArray.slice();
+  const rawBuffer = TSL.instancedArray(rawArray, 'vec4'), histBuffer = TSL.instancedArray(histArray, 'vec4');
+  const validHistory = TSL.uniform(1);
+  const coord = () => TSL.ivec2(TSL.instanceIndex.mod(W).toInt(), TSL.instanceIndex.div(W).toInt());
+  const world = (c) => TSL.vec4(c.x.toFloat().add(0.5).div(W).mul(2).sub(1), TSL.float(1).sub(c.y.toFloat().add(0.5).div(H).mul(2)), 0, 1);
+  const fill = TSL.Fn(() => {
+    const c = coord();
+    TSL.textureStore(source, c, rawBuffer.element(TSL.instanceIndex));
+    TSL.textureStore(position, c, world(c));
+    TSL.textureStore(normal, c, TSL.vec4(0, 0, 1, 0));
+  })().compute(W * H);
+  const fillHistory = TSL.Fn(() => {
+    const c = coord();
+    TSL.textureStore(histIrr, c, histBuffer.element(TSL.instanceIndex));
+    TSL.textureStore(histPos, c, world(c).mul(validHistory));
+  })().compute(W * H);
+  const dump = TSL.instancedArray(new Float32Array(W * H * 4), 'vec4');
+  const resultTexture = TSL.texture(target);
+  const read = TSL.Fn(() => dump.element(TSL.instanceIndex).assign(resultTexture.load(coord())))().compute(W * H);
+  const results = [], shaders = {};
+  const cases = [
+    { name: 'weight-zero-clipped', weight: 0, gamma: 1.5, floor: 0.25 },
+    { name: 'invalid-history-clipped', weight: 0.9, gamma: 1.5, floor: 0.25, invalid: true },
+    { name: 'unclipped-exact-mix', weight: 0.9, gamma: 0, floor: 0 },
+    { name: 'variance-clipped-exact-mix', weight: 0.9, gamma: 1.5, floor: 0 },
+    { name: 'floor-clipped-exact-mix', weight: 0.9, gamma: 1.5, floor: 0.25 },
+    { name: 'constant-energy-clipped', weight: 0.9, gamma: 1.5, floor: 0.25, constant: true },
+    { name: 'weight-zero-marker-alpha', weight: 0, gamma: 1.5, floor: 0.25, marker: true },
+  ];
+  for (const test of cases) {
+    for (let i = 0; i < W * H; i++) {
+      const x = i % W, y = Math.floor(i / W);
+      rawArray.set(test.constant ? [0.3, 0.8, 0.15, 1] : [0.1 + 0.025 * x, 0.2 + 0.05 * y, 0.1 + ((x + y) % 3) * 0.02, 1], i * 4);
+      histArray.set(test.constant ? [0.3, 0.8, 0.15, 1] : [x % 2 ? 3 : 0.01, y % 2 ? 2 : 0.01, 0.9, 1], i * 4);
+    }
+    rawBuffer.value.needsUpdate = true; histBuffer.value.needsUpdate = true;
+    validHistory.value = test.invalid ? 0 : 1;
+    globalThis.__giIrrTemporalClip = test.gamma;
+    globalThis.__giIrrTemporalClipFloor = test.floor;
+    globalThis.__giIrrSpatialFallback = false;
+    const weight = TSL.uniform(test.weight);
+    const pass = createGiIrradianceTemporalPass({
+      gbuffer: { position, normal }, source, target, histIrr, histPos, width: W, height: H,
+      history: { prevViewProj: TSL.uniform(new THREE.Matrix4()), weight, validEps: 0.2 },
+      validityAlpha: !test.marker, markerAlpha: !!test.marker,
+    });
+    await renderer.computeAsync(fill); await renderer.computeAsync(fillHistory);
+    await renderer.computeAsync(pass.compute); await renderer.computeAsync(read);
+    shaders[test.name] = renderer._nodes.getForCompute(pass.compute).computeShader;
+    const got = new Float32Array(await renderer.getArrayBufferAsync(dump.value));
+    let maxError = 0, meanRaw = 0, meanGot = 0;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) for (let ch = 0; ch < 4; ch++) {
+      const i = (y * W + x) * 4 + ch;
+      let h = histArray[i];
+      if (test.gamma > 0) {
+        let m1 = 0, m2 = 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const nx = Math.max(0, Math.min(W - 1, x + dx)), ny = Math.max(0, Math.min(H - 1, y + dy));
+          const v = rawArray[(ny * W + nx) * 4 + ch]; m1 += v; m2 += v * v;
+        }
+        const mean = m1 / 9;
+        const halfWidth = Math.max(Math.sqrt(Math.max(0, m2 / 9 - mean * mean)) * test.gamma, Math.abs(mean) * test.floor);
+        h = Math.min(mean + halfWidth, Math.max(mean - halfWidth, h));
+      }
+      const w = test.invalid ? 0 : test.weight;
+      const expected = ch === 3 ? 1 : rawArray[i] * (1 - w) + h * w;
+      maxError = Math.max(maxError, Math.abs(got[i] - expected));
+      if (ch < 3) { meanRaw += rawArray[i] / (W * H * 3); meanGot += got[i] / (W * H * 3); }
+    }
+    const passOk = maxError < 2e-5;
+    results.push({ name: test.name, pass: passOk, maxError, meanRaw, meanGot });
+    say(`${passOk ? 'PASS' : 'FAIL'} ${test.name}: maxError=${maxError.toExponential(3)} raw=${meanRaw.toFixed(6)} out=${meanGot.toFixed(6)}`);
+  }
+  await device.queue.onSubmittedWorkDone();
+  globalThis.__GI_IRR_AUDIT_SHADERS__ = shaders;
+  globalThis.__GI_IRR_AUDIT_RESULT__ = { pass: results.every((r) => r.pass) && errors.length === 0, results, errors };
+  say(`GI-IRR-AUDIT ${globalThis.__GI_IRR_AUDIT_RESULT__.pass ? 'PASS' : 'FAIL'}`);
+} catch (e) {
+  globalThis.__GI_IRR_AUDIT_RESULT__ = { pass: false, error: e.stack || String(e) };
+  say(`GI-IRR-AUDIT FAIL ${e.stack || e}`);
+}
+</script></body></html>

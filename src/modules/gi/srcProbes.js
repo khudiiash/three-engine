@@ -310,7 +310,7 @@ export const COUNTER_STARVED = 10;
  * `h0` is `srcMathTsl.hashKey(key)` computed by the caller — see the header for
  * why the mix does not live in here.
  */
-const hashInsertWgsl = wgslFn(/* wgsl */ `
+export const hashInsertWgsl = wgslFn(/* wgsl */ `
 
 	fn srcHashInsert(
 		key: u32, h0: u32, base: u32, capacity: u32, maxSteps: u32,
@@ -356,7 +356,7 @@ const hashInsertWgsl = wgslFn(/* wgsl */ `
  * nothing would say so, which is why the clear-and-rebuild is a design rule
  * and not an implementation detail.
  */
-const hashFindWgsl = wgslFn(/* wgsl */ `
+export const hashFindWgsl = wgslFn(/* wgsl */ `
 
 	fn srcHashFind(
 		key: u32, h0: u32, base: u32, capacity: u32, maxSteps: u32,

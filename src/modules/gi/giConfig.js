@@ -151,7 +151,11 @@ function maxTier(...tiers) {
 export function giGtaoResolutionScale(quality, requested = Number.NaN) {
   const override = Number(requested);
   if (Number.isFinite(override)) return Math.min(1, Math.max(0.25, override));
-  return { low: 0.5, medium: 0.8, high: 1, ultra: 1 }[giQualityTier(quality)];
+  // §11.35: on ultra/high the scale is relative to the AO g-buffer — the
+  // VIEWPORT's resolution (capped at GI_AO_MAX_PIXELS) — since that is where
+  // the prepass renders on those tiers; medium/low keep the resolve's
+  // g-buffer as their source, so their scales are unchanged in pixels.
+  return { low: 0.5, medium: 0.8, high: 0.75, ultra: 1 }[giQualityTier(quality)];
 }
 
 /**
@@ -162,19 +166,34 @@ export function giGtaoResolutionScale(quality, requested = Number.NaN) {
  */
 export function giGtaoSamplingPreset(quality) {
   switch (giQualityTier(quality)) {
-    case "ultra": return { slices: 5, steps: 4, spatialJitter: false, filterRadius: 3 };
+    // §11.35: the filter is ±2 at the VIEWPORT's resolution now (the AO
+    // buffer is the viewport on ultra/high) — r3 was sized for a half-res
+    // buffer, where it was already a ±6 viewport-pixel blur.
+    case "ultra": return { slices: 5, steps: 4, spatialJitter: false, filterRadius: 2 };
     case "high": return { slices: 3, steps: 3, spatialJitter: true, filterRadius: 2 };
     case "medium": return { slices: 2, steps: 3, spatialJitter: true, filterRadius: 2 };
     default: return { slices: 2, steps: 2, spatialJitter: true, filterRadius: 2 };
   }
 }
 
-/** Contact-band reach in cascade-0 intervals. Longer-range visibility already
- * lives in SRC; the old default of two intervals measured 1.12 m and produced
- * a visibly detached duplicate silhouette around ordinary props. */
+/**
+ * AO reach in cascade-0 intervals — FOUR (2.24 m at s0 0.35), §11.35.
+ *
+ * The history, because this number has moved three times: two intervals
+ * (1.12 m) once read as a detached duplicate silhouette around props — at
+ * HALF resolution with a ±3 texel filter, i.e. a 12-viewport-pixel blur of
+ * the contact ring; it was cut to one interval (0.56 m, "contact only") on
+ * the argument that SRC carries the longer-range visibility. The user's
+ * verdict on Bistro against the path tracer: "blurry, low radius" — at
+ * Bistro's viewing distances one interval is a few pixels wide, and the
+ * arches, eaves and balconies that the tracer darkens over metres got
+ * nothing. With the AO at the viewport's resolution and a ±2 px filter,
+ * four intervals was judged "now its good" live on Bistro (2026-09-04).
+ * `__giGtaoIntervals` overrides for an A/B.
+ */
 export function giGtaoRadiusIntervals(requested = Number.NaN) {
   const value = Number(requested);
-  return Math.max(0.5, Math.min(8, Number.isFinite(value) && value > 0 ? value : 1));
+  return Math.max(0.5, Math.min(8, Number.isFinite(value) && value > 0 ? value : 4));
 }
 
 /**
@@ -526,6 +545,13 @@ export function sceneSkyRadiance(scene, out, envSettings = null) {
     return out.setRGB(background.r * intensity, background.g * intensity, background.b * intensity);
   }
   return out.setRGB(0, 0, 0);
+}
+
+/** World direction -> environment lookup uses the inverse of the sky's yaw.
+ * Three's background/IBL and the path tracer invert their rotation matrices;
+ * all GI sky, reflection-miss and probe-capture samplers share this angle. */
+export function giEnvironmentLookupYaw(rotationY = 0) {
+  return -(Number(rotationY) || 0);
 }
 
 /**
