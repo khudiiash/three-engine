@@ -4,7 +4,7 @@ import { waterCausticGainNode } from './waterCaustics.js';
 import { applyMediumSegment } from './waterMedium.js';
 import {
   Fn, cameraFar, cameraNear, cameraPosition, cameraProjectionMatrix, cameraProjectionMatrixInverse, cameraViewMatrix, cameraWorldMatrix, float, linearDepth, materialAttenuationColor, materialAttenuationDistance, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
-  mrt, positionViewDirection, positionWorld, reflector, refract, screenSize, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
+  mrt, pmremTexture, positionViewDirection, positionWorld, reflect, reflector, refract, screenSize, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
 } from 'three/tsl';
 import { seaFoamValueNode, waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
 import { seaLostSlopeVarianceNode, seaShadingSlopeNode } from './waterSpectrum.js';
@@ -46,6 +46,14 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
   // 1 while the scene has an environment: the mirror then renders without
   // its background and counts only where it saw geometry (see the hook).
   const envReflection = uniform(0);
+  // 1 while the material's own image-based lighting cannot see that
+  // environment — GI installs a black `scene.environmentNode` so its probes
+  // replace the IBL, and the water, which GI deliberately leaves out of its
+  // radiance block, then reflected NOTHING ("no sky reflection from the
+  // surface … looks cartoonish", user, 2026-09-07, GI on). The lid samples
+  // the environment texture itself along the true reflected ray then.
+  const skyTerm = uniform(0);
+  let skyNode = null;
   // ⚠ EVERY SLOT THIS TOUCHES IS CAPTURED, and every rebuild starts from the
   // capture rather than from what it built last time — `build()` re-runs on
   // each GI compile wave, and composing onto its own output would stack foam on
@@ -214,6 +222,8 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // environment there is no IBL, and the mirror keeps the background.
       const strip = sceneHasEnvironment(scene);
       envReflection.value = strip ? 1 : 0;
+      skyTerm.value = strip && scene.environmentNode && scene.environment?.isTexture ? 1 : 0;
+      if (skyNode && scene.environment?.isTexture && skyNode.value !== scene.environment) skyNode.value = scene.environment;
       if (strip) { scene.background = null; scene.backgroundNode = null; renderer.setClearColor(0x000000, 0); }
       try { return original(frame); } finally {
         if (strip) { scene.background = background; scene.backgroundNode = backgroundNode; renderer.setClearColor(clearColor, clearAlpha); }
@@ -313,7 +323,25 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     // without a background; see the hook). Without an environment the mirror
     // carries the background as it always did.
     const mirror = node.sample(uv).level(float(roughness).clamp(0, 1).mul(6));
-    const reflected = mirror.rgb.mul(mix(float(1), mirror.a.clamp(0, 1), envReflection)).mul(fresnel).mul(gain);
+    let reflected = mirror.rgb.mul(mix(float(1), mirror.a.clamp(0, 1), envReflection)).mul(fresnel).mul(gain);
+    // The environment along the reflected ray, prefiltered by the roughness
+    // the far field earns — only while the material's IBL is overridden
+    // (`skyTerm`; see the hook). `skyNode.value` follows the scene's texture.
+    const skyTexture = engine?.scene?.environment?.isTexture ? engine.scene.environment : null;
+    if (skyTexture) {
+      const lidNormalWorldR = modelNormalMatrix.mul(lidNormalLocal).normalize();
+      const R = reflect(cameraPosition.sub(positionWorld).normalize().negate(), lidNormalWorldR);
+      skyNode = pmremTexture(skyTexture, R, float(roughness).clamp(0, 1));
+      // The same reflectance the material's IBL would apply — Karis'
+      // analytic environment BRDF for water's F0 (0.02) — not the bare
+      // Fresnel: a rough far sea at grazing returns ~15 % of the sky, a calm
+      // one ~70 %, and with plain Fresnel the GI-mode sea read 108 % of its
+      // sky against 48 % with the IBL (harness, 2026-09-07).
+      const rr = vec4(-1, -.0275, -.572, .022).mul(float(roughness).clamp(0, 1)).add(vec4(1, .0425, 1.04, -.04));
+      const a004 = rr.x.mul(rr.x).min(cosV.mul(-9.28).exp2()).mul(rr.x).add(rr.y);
+      const envF = float(.02).mul(a004.mul(-1.04).add(rr.z)).add(a004.mul(1.04).add(rr.w));
+      reflected = reflected.add(skyNode.rgb.mul(envF).mul(skyTerm).mul(select(fromBelow, float(0), float(1))));
+    }
 
     let emissive = vec3(previous.emissiveNode ?? 0);
     if (u) {
@@ -502,7 +530,9 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       }
       // What three's `mix(diffuse, backdrop, transmission)` left of the
       // diffuse — the stylized, less-than-clear water — stays on the colour.
-      material.colorNode = mix(mix(baseColor, banded, u.stylized).mul(through.oneMinus()), vec3(1), foam);
+      // Foam is not a perfect white: sea foam reflects about three quarters of
+      // the light, and at 1 it clipped to a flat cut-out under a strong sun.
+      material.colorNode = mix(mix(baseColor, banded, u.stylized).mul(through.oneMinus()), vec3(.75), foam);
       emissive = emissive.add(refracted.mul(through).mul(foam.oneMinus()));
       emissive = emissive.add(reflected.mul(foam.oneMinus()));
       if (slot) emissive = emissive.add(waterSubsurfaceNode(u, slot).mul(foam.oneMinus()));

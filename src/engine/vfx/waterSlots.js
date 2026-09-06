@@ -186,6 +186,11 @@ function createSlot(index) {
       // and 6 cm beams a pool does, where the eye actually is, instead of one
       // 6 cm texel per 60 m. Consumers fade to a gain of 1 at its edge.
       causticCenter: uniform(new THREE.Vector2(0, 0)),
+      // The window's edge fade as a fraction of its half-size: a tenth for a
+      // window that IS the pool (caustics up to the walls), half for one cut
+      // out of a bigger body, where a hard-edged 16 m square of caustics
+      // around the eye read as "a small rect under the camera" (2026-09-07).
+      causticFade: uniform(.1),
       causticHalf: uniform(new THREE.Vector2(1, 1)),
     },
     // Bound once by every consumer; the sampler nodes are shared so a graph

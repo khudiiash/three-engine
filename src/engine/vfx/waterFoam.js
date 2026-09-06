@@ -256,8 +256,8 @@ function waterFoamBody(u, sceneDepth, spectrum) {
   const metres = positionWorld.sub(cameraPosition).length();
   const bubbleDetail = metres.smoothstep(15, 60).oneMinus(), streakDetail = metres.smoothstep(60, 240).oneMinus();
   const capSheet = sea.sub(bubbles.mul(.15).mul(bubbleDetail)).smoothstep(.55, .8);
-  const streaks = sea.mul(1.6).sub(mix(float(.45), streak, streakDetail)).div(.2).clamp(0, 1);
-  const capTexture = mix(float(.85), bubbles.smoothstep(.3, .7).mul(.7).add(.3), bubbleDetail);
+  const streaks = sea.mul(1.6).sub(mix(float(.45), streak, streakDetail)).div(.3).clamp(0, 1);
+  const capTexture = mix(float(.85), bubbles.mul(.4).add(.6), bubbleDetail);
   const near = capSheet.max(streaks.mul(.85)).mul(capTexture).clamp(0, 1);
   // Far: the mip-filtered coverage itself, as a tone.
   const far = sea.smoothstep(.15, .7).mul(.7);

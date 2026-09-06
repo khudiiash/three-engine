@@ -113,6 +113,9 @@ globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
      hdr.mapping = THREE.EquirectangularReflectionMapping;
      scene.background = hdr; scene.environment = hdr;
    }
+   // ?giEnv=1: what GI does to the scene — a black environment NODE so the
+   // materials' image-based lighting sees nothing while the texture stays.
+   if (argument('giEnv', '0') === '1') scene.environmentNode = vec3(0);
    const engine = { scene, renderer, camera: null, onUpdate: (fn) => { engine._tickers.push(fn); return () => {}; },
      _tickers: [], on: () => () => {}, off: () => {}, modules: { get: () => null }, waterSlots: null };
    const pool = waterSlotPool(engine);
@@ -290,6 +293,19 @@ globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
      let m = 0, m2 = 0, k = 0;
      for (let y = H * .5; y < H * .62; y++) for (let x = 0; x < W; x++) { const l = luma(horizon, ((y | 0) * W + (x | 0)) * 4); m += l; m2 += l * l; k++; }
      const sparkle = Math.sqrt(Math.max(0, m2 / k - (m / k) ** 2)) / Math.max(1, m / k);
+     // THE SKY IS REFLECTED: the water just under the horizon against the sky
+     // just over it. A sea that mirrors its sky reads most of that sky's luma
+     // at grazing angles; one whose sky term is missing (GI's black
+     // environment node, 2026-09-07) reads a fraction of it.
+     let skyL = 0, kk = 0; for (let y = H * .42; y < H * .48; y++) for (let x = 0; x < W; x++) { skyL += luma(horizon, ((y | 0) * W + (x | 0)) * 4); kk++; }
+     let seaL = 0, k2 = 0; for (let y = H * .51; y < H * .56; y++) for (let x = 0; x < W; x++) { seaL += luma(horizon, ((y | 0) * W + (x | 0)) * 4); k2++; }
+     const skyRatio = (seaL / k2) / Math.max(1, skyL / kk);
+     log(`ocean: sea under the horizon ${(seaL / k2).toFixed(1)} vs sky over it ${(skyL / kk).toFixed(1)} -> ${(skyRatio * 100).toFixed(0)}% (the sky is reflected)`);
+     // 48 % with the material's IBL, 34 % with GI's black node emulated here
+     // (the foam loses the sky's irradiance the harness has no GI to replace;
+     // the reflection itself matches — the same environment BRDF); 0 % is
+     // the failure this guards against.
+     if (!(skyRatio > .3)) throw new Error(`the sky is not reflected: the sea under the horizon reads ${(skyRatio * 100).toFixed(0)}% of the sky over it`);
      log(`ocean: whitecaps ${(white / n * 100).toFixed(1)}% of the water, green sheets ${(green / n * 100).toFixed(1)}%, horizon band luma spread ${(sparkle * 100).toFixed(1)}% of its mean`);
      if (!(white / n > .003 && white / n < .3)) throw new Error(`whitecaps: ${(white / n * 100).toFixed(1)}% (want 0.3–30 %)`);
      if (!(green / n < .03)) throw new Error(`green sheets: ${(green / n * 100).toFixed(1)}%`);

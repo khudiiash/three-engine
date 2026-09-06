@@ -173,7 +173,7 @@ export function waterCausticGainLocalNode(P, slot, level = 0, normal = null, { v
 function causticWindowUv(sample, s) {
   const rel = sample.sub(vec2(s.causticCenter)).div(vec2(s.causticHalf).mul(2)).toVar();
   const uv = rel.add(.5);
-  const edge = float(.5).sub(rel.abs().max(rel.abs().yx).x).mul(10).clamp(0, 1);
+  const edge = float(.5).sub(rel.abs().max(rel.abs().yx).x).div(s.causticFade).clamp(0, 1).smoothstep(0, 1);
   return { uv, edge };
 }
 
@@ -410,6 +410,8 @@ export function updateWaterSlot({ engine, slot, kernel, mesh, simulation, props 
   const wx = Math.min(s.half.value.x + reachX, CAUSTIC_WINDOW_METRES / 2 / Math.max(1e-4, axisX.length()));
   const wz = Math.min(s.half.value.z + reachZ, CAUSTIC_WINDOW_METRES / 2 / Math.max(1e-4, axisZ.length()));
   s.causticHalf.value.set(Math.max(1e-4, wx), Math.max(1e-4, wz));
+  const clipped = wx < s.half.value.x + reachX - 1e-6 || wz < s.half.value.z + reachZ - 1e-6;
+  s.causticFade.value = clipped ? .5 : .1;
   const eye = engine?.camera ? engine.camera.getWorldPosition(_eye).applyMatrix4(s.inverse.value) : _eye.set(0, 0, 0);
   const tx = 2 * wx / CAUSTIC_RESOLUTION, tz = 2 * wz / CAUSTIC_RESOLUTION;
   // (A window wider than the pool has nowhere to go: its centre is the pool's.)
