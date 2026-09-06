@@ -23,9 +23,16 @@ try {
  const adapter = await navigator.gpu.requestAdapter();
  const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
  const errors = []; device.addEventListener('uncapturederror', (e) => { errors.push(e.error.message); console.error('WebGPU validation', e.error.message); });
- const renderer = new THREE.WebGPURenderer({ device, antialias: false });
+ // ?msaa=1 renders the canvas multisampled, as the editor does — the shared
+ // viewport depth is then declared multisampled at build time, and any pass
+ // that draws the water into a 1-sample target binds a placeholder instead:
+ // the "Sample count (1) … multisampled: 1" failure. ?mirror=0 / ?shadow=0 /
+ // ?transmission=0 bisect which pass.
+ const arg = (k, d) => new URL(location.href).searchParams.get(k) ?? d;
+ const MSAA = arg('msaa', '0') === '1';
+ const renderer = new THREE.WebGPURenderer({ device, antialias: MSAA });
  await renderer.init(); renderer.setSize(256, 256);
- renderer.shadowMap.enabled = true;
+ renderer.shadowMap.enabled = arg('shadow', '1') !== '0';
  document.body.append(renderer.domElement);
  const scene = new THREE.Scene();
  scene.backgroundNode = mix(vec3(.62, .83, 1), vec3(.11, .37, .74), positionWorld.normalize().y.max(0).pow(.6));
@@ -44,20 +51,25 @@ try {
  const props = { resolution: 64, width: 1, height: 1, waterDepth: 1, waveHeight: .2, waveLength: 5, choppiness: 1, rippleStrength: 1,
    surfaceDetail: 2, caustics: true, causticIntensity: .5, color: '#268270', roughness: 0, deepColor: '#090b0b', saturation: .25, transmission: 1, foam: 1, foamThreshold: .5 };
  const authored = new THREE.MeshPhysicalNodeMaterial({ color: '#8fd8de', roughness: .12, metalness: 0, ior: 1.333,
-   transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+   transmission: arg('transmission', '1') === '0' ? 0 : .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
  const slot = pool.claim({});
  const sim = createGridSimulation('water', props, { material: authored, waterSlot: slot, anchorEngine: engine });
  holder.add(sim.mesh); sim.mesh.matrixAutoUpdate = false; sim.mesh.matrix.identity(); sim.mesh.matrixWorldNeedsUpdate = true;
  sim.mesh.receiveShadow = true; sim.mesh.castShadow = true;
  holder.updateMatrixWorld(true);
  installWaterMedium(engine); installWaterCausticLight(engine);
- installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
+ const look = installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
+ if (arg('mirror', '1') === '0') look.gain.value = 0;
+ sim.mesh.castShadow = arg('lidshadow', '0') === '1';
  const camera = new THREE.PerspectiveCamera(55, 1, .05, 200); engine.camera = camera;
  camera.position.set(-4, 3, 5); camera.lookAt(0, 0, 0); camera.updateMatrixWorld(true);
  sim.tick(renderer, 1 / 60);
  updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props });
  for (const fn of engine._tickers) fn();
- await renderer.renderAsync(scene, camera);
+ for (let i = 0; i < 6; i++) { sim.tick(renderer, 1 / 60); for (const fn of engine._tickers) fn(); await renderer.renderAsync(scene, camera); }
+ await device.queue.onSubmittedWorkDone();
+ log(`msaa ${MSAA} shadow ${arg('shadow', '1')} mirror ${arg('mirror', '1')} transmission ${arg('transmission', '1')} lidshadow ${arg('lidshadow', '0')} → ${errors.length} validation error(s)`);
+ for (const e of errors.slice(0, 3)) log('   ', String(e).slice(0, 160));
  const census = async (label, object) => {
    const { fragmentShader } = await renderer.debug.getShaderAsync(scene, camera, object);
    const bindings = [...fragmentShader.matchAll(/@binding\(\s*\d+\s*\)\s*@group\(\s*\d+\s*\)\s*var\s+(\w+)\s*:\s*(texture_[\w<>,\s]+)/g)]

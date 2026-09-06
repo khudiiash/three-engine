@@ -108,6 +108,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     waveScale: uniform(new THREE.Vector3(1, 1, 1)),
     rippleLimit: uniform(1), viscosity: uniform(.02), rippleSpeed: uniform(2), roughness: uniform(.12),
     foamDecay: uniform(.99), foamRate: uniform(.05), foamSpread: uniform(0),
+    // The lid's own half extents in local units (for the rim contact foam).
+    halfExtent: uniform(new THREE.Vector3(width / 2, 0, height / 2)),
   });
   const simulationWorld = uniform(new THREE.Matrix4()), simulationInverse = uniform(new THREE.Matrix4());
   const anchorRows = Array.from({length:MAX_CLOTH_ANCHORS},()=>new THREE.Vector4(0,0,0,-1));

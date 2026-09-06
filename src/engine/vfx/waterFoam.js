@@ -1,6 +1,6 @@
 import {
   Fn, attribute, cameraFar, cameraNear, cameraPosition, float, linearDepth, mix, positionLocal, positionWorld,
-  screenUV, select, texture, vec2, vec3, viewportDepthTexture,
+  screenUV, select, texture, vec2, vec3,
 } from "three/tsl";
 
 /**
@@ -136,21 +136,32 @@ function waterFoamBody(u, sceneDepth) {
 
   // The solver's own foam, and the contact term.
   const simulated = attribute("waterFoam", "float").clamp(0, 1);
-  // ⚠ THE SCENE DEPTH COMES FROM A TEXTURE THAT OWNS ITS RENDER TARGET when
-  // one is published (`engine.scenePass`, the post chain's 1-sample beauty
-  // pass): three's shared viewport depth is declared with the sample count
-  // of whichever target is current when the shader is BUILT, and a pipeline
-  // built against the MSAA canvas then fails to bind in the 1-sample pass
-  // the scene is actually rendered in. Without a published pass the shared
-  // one is right, because build and render share the canvas.
-  const depthNode = sceneDepth ? texture(sceneDepth, screenUV) : viewportDepthTexture();
-  const behind = linearDepth(depthNode).sub(linearDepth());
-  const metres = behind.mul(cameraFar.sub(cameraNear)).max(0);
   // The width itself is modulated, so the shoreline is ragged rather than a
   // uniform ring offset from the geometry.
   const ragged = fbm(p.mul(.7), clock, .7);
   const width = u.foamThreshold.max(.02).mul(ragged.mul(1.1).add(.45));
-  const contact = metres.smoothstep(width.mul(.15), width).oneMinus();
+  // ── CONTACT: SCENE DEPTH ONLY FROM A PASS THAT OWNS IT ─────────────────
+  //
+  // Whatever the water touches foams at the waterline. The general answer
+  // is the scene depth behind the fragment, but three's shared
+  // `viewportDepthTexture()` is declared with the sample count of whichever
+  // render target is current when the shader is BUILT (the MSAA canvas,
+  // during GI's compile wave) and then bound in whatever pass draws the
+  // water — a 1-sample one gets a 1×1 placeholder instead: "Sample count (1)
+  // … doesn't match expectation (multisampled: 1)" (live editor,
+  // 2026-09-06). So scene depth is read ONLY from a pass that owns its depth
+  // texture (`engine.scenePass`, the post chain's beauty pass — its sample
+  // count is a property of the texture). Without one, contact is the pool's
+  // own rim: the box's edges in world metres, which binds nothing at all.
+  const halfW = u.waveScale.x.mul(u.halfExtent.x), halfH = u.waveScale.z.mul(u.halfExtent.z);
+  const toRim = halfW.sub(p.x.abs()).min(halfH.sub(p.y.abs())).max(0);
+  const rimContact = toRim.smoothstep(width.mul(.15), width).oneMinus();
+  let contact = rimContact;
+  if (sceneDepth) {
+    const behind = linearDepth(texture(sceneDepth, screenUV)).sub(linearDepth());
+    const metres = behind.mul(cameraFar.sub(cameraNear)).max(0);
+    contact = metres.smoothstep(width.mul(.15), width).oneMinus().max(rimContact);
+  }
   const amount = simulated.max(contact.mul(.9)).toVar();
 
   // Patchiness: a slow, large fractal modulates the amount by ±25 % so the
