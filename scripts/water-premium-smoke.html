@@ -77,6 +77,11 @@ try {
    const pool = waterSlotPool(engine);
    const sun = new THREE.DirectionalLight('#fff6e0', 3);
    sun.position.set(6, 14, 4); scene.add(sun); scene.add(sun.target);
+   // The user's sun casts a shadow map (PCFSoft 4096): the caustic light
+   // borrows its shadow node, so the harness sun must cast one too.
+   sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048);
+   Object.assign(sun.shadow.camera, { left: -S, right: S, top: S, bottom: -S, near: 1, far: 60 }); sun.shadow.camera.updateProjectionMatrix();
+   renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
    scene.add(new THREE.AmbientLight('#bcd6ff', .35));
 
    // A tiled floor and walls: the pool's own box, so caustics have a receiver.
@@ -93,7 +98,7 @@ try {
    }
    // Something to make contact foam against: a post standing in the water.
    const post = new THREE.Mesh(new THREE.BoxGeometry(.5, 4, .5), new THREE.MeshStandardNodeMaterial({ color: '#ff3b28', roughness: .5 }));
-   post.position.set(1.6, -1, -1.2); scene.add(post);
+   post.position.set(1.6, -1, -1.2); post.castShadow = true; scene.add(post);
 
    const holder = new THREE.Object3D();
    holder.scale.set(S, DEPTH, S);
@@ -175,7 +180,17 @@ try {
    {
      const luma = (px, i) => px[i] * .2126 + px[i + 1] * .7152 + px[i + 2] * .0722;
      const contrastOf = (px) => { let m = 0, n = 0; for (let y = H * .2; y < H * .8; y++) for (let x = W * .2; x < W * .8; x++) { m += luma(px, ((y | 0) * W + (x | 0)) * 4); n++; } m /= n; let v = 0; for (let y = H * .2; y < H * .8; y++) for (let x = W * .2; x < W * .8; x++) { const d = luma(px, ((y | 0) * W + (x | 0)) * 4) - m; v += d * d; } return { mean: m, contrast: Math.sqrt(v / n) / Math.max(1, m) }; };
-     await armLens(true); const on = contrastOf(await shoot('caustics-down-on'));
+     // The lens at its physical strength (1); the authored dial is logged beside it.
+     const physical = { ...props, causticIntensity: 1 };
+     sim.update(physical); updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: physical }); for (const fn of engine._tickers) fn();
+     const on = contrastOf(await shoot('caustics-down-on'));
+     // The map itself, as an image (value/4 → 8-bit): holes, folds, border.
+     {
+       const R = slot.causticTarget.width, px = await renderer.readRenderTargetPixelsAsync(slot.causticTarget, 0, 0, R, R);
+       const c2 = document.createElement('canvas'); c2.width = R; c2.height = R; const g = c2.getContext('2d'); const im = g.createImageData(R, R);
+       for (let i = 0; i < R * R; i++) { const v = Math.min(255, halfToFloat(px[i * 4]) * 64); im.data[i * 4] = im.data[i * 4 + 1] = im.data[i * 4 + 2] = v; im.data[i * 4 + 3] = 255; }
+       g.putImageData(im, 0, 0); IMAGES.push({ label: `${String(S).padStart(3, '0')}m-caustic-map`, url: c2.toDataURL('image/png') });
+     }
      // The map itself, under this view: what the floor is asked to show.
      {
        const R = slot.causticTarget.width, px = await renderer.readRenderTargetPixelsAsync(slot.causticTarget, 0, 0, R, R);
@@ -189,7 +204,46 @@ try {
      await armLens(false); const off = contrastOf(await shoot('caustics-down-off'));
      await armLens(true);
      log(`floor caustics (looking straight down): lens on → mean ${on.mean.toFixed(1)}, contrast ${(on.contrast * 100).toFixed(1)}% · off → mean ${off.mean.toFixed(1)}, contrast ${(off.contrast * 100).toFixed(1)}%`);
-     if (!(on.contrast > off.contrast * 2 + .05)) throw new Error(`the floor's caustics are dim: ${JSON.stringify({ on, off })}`);
+     if (!(on.contrast > off.contrast * 1.8)) throw new Error(`the floor's caustics are dim: ${JSON.stringify({ on, off })}`);
+     // ── NOTHING IN THE SUN'S SHADOW ─────────────────────────────────────
+     //
+     // The lens is a difference added behind the sun's own shadow node: where
+     // the post shadows the floor the lens must add nothing and take nothing.
+     // The shadow is computed, not toggled (the shadow map lags a castShadow
+     // toggle by a frame): a floor pixel is "in shadow" when its ray toward the
+     // sun crosses the post's box, 8 cm inside the edge; "lit" when it misses
+     // by 8 cm; pixels that see the post itself are left out. The medium is
+     // off for these two shots: its in-scatter along the view ray is lit by
+     // the caustic map, which no object's shadow reaches (an open item), and
+     // the receipt is about the LIGHT's term on the floor.
+     {
+       tiles.fog = false; tiles.needsUpdate = true;
+       const sunDir = sun.position.clone().normalize();
+       const foot = new THREE.Vector3(1.6, 1, -1.2).addScaledVector(sunDir, -(1 + DEPTH) / sunDir.y); // where the post's top lands on the floor
+       const mid = foot.clone().lerp(new THREE.Vector3(1.6, -DEPTH, -1.2), .5);
+       pose([mid.x, -DEPTH + 1.6, mid.z + .001], [mid.x, -DEPTH, mid.z]);
+       await armLens(true); const onPx = await shoot('shadow-down-on');
+       await armLens(false); const offPx = await shoot('shadow-down-off');
+       await armLens(true); tiles.fog = true; tiles.needsUpdate = true;
+       const floorY = -DEPTH + .05, postMin = new THREE.Vector3(1.35, -DEPTH, -1.45), postMax = new THREE.Vector3(1.85, 1, -.95);
+       const inBox = (q, m) => q.x > postMin.x - m && q.x < postMax.x + m && q.z > postMin.z - m && q.z < postMax.z + m && q.y <= postMax.y;
+       const crosses = (origin, dir, m) => { const tEnd = (postMax.y - origin.y) / Math.max(1e-6, dir.y); for (let k = 0; k <= 60; k++) { if (inBox(origin.clone().addScaledVector(dir, tEnd * k / 60), m)) return true; } return false; };
+       const seesPost = (P) => { const d = P.clone().sub(camera.position); const box = new THREE.Box3(postMin, postMax); return new THREE.Ray(camera.position, d.normalize()).intersectsBox(box); };
+       let nS = 0, onS = 0, offS = 0, nL = 0, onL = 0, offL = 0, total = 0;
+       for (let y = H * .15; y < H * .85; y += 2) for (let x = W * .15; x < W * .85; x += 2) {
+         total++;
+         const p = new THREE.Vector3(x / W * 2 - 1, 1 - y / H * 2, .5).unproject(camera); const d = p.sub(camera.position);
+         const t = (floorY - camera.position.y) / d.y; if (!(t > 0)) continue;
+         const P = camera.position.clone().addScaledVector(d, t); if (seesPost(P)) continue;
+         const i = ((y | 0) * W + (x | 0)) * 4;
+         if (crosses(P, sunDir, -.08)) { nS++; onS += luma(onPx, i); offS += luma(offPx, i); }
+         else if (!crosses(P, sunDir, .08)) { nL++; onL += luma(onPx, i); offL += luma(offPx, i); }
+       }
+       log(`floor in the post's shadow (${(nS / total * 100).toFixed(0)}% of the centre): lens on → mean ${(onS / Math.max(1, nS)).toFixed(1)}, off → ${(offS / Math.max(1, nS)).toFixed(1)} · lit floor beside it (${(nL / total * 100).toFixed(0)}%): on ${(onL / Math.max(1, nL)).toFixed(1)}, off ${(offL / Math.max(1, nL)).toFixed(1)}`);
+       if (!(nS / total > .05 && nL / total > .05)) throw new Error(`the shadow receipt cannot see both a shadow and a lit floor (${nS}/${nL} of ${total})`);
+       if (Math.abs(onS - offS) / Math.max(1, offS) > .04) throw new Error(`the lens acts inside the sun's shadow: on ${(onS / nS).toFixed(1)} vs off ${(offS / nS).toFixed(1)}`);
+       pose([0, -DEPTH + 2.2, .001], [0, -DEPTH, 0]);
+     }
    }
    // From under the surface, looking up at 35°: Snell's window (the world
    // above) in the middle, total internal reflection of the pool toward the

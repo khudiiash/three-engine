@@ -45,9 +45,10 @@ const registered = new WeakSet();
 // map's own cap is MAX_FOCUS 5). This used to be 2.5, and with only the
 // positive half added on top of a full sun the network read as dim
 // ("caustics are way too dim, even when increased intensity", user,
-// 2026-09-06). Now the gain MULTIPLIES the sun (see `installSunGain`), so a
-// cell between filaments goes dark and a filament goes bright, the way the
-// reference pools do; the cap only bounds the map's noise.
+// 2026-09-06). Now the DIFFERENCE from the flat sun is added behind the sun's
+// own shadow (see WaterCausticLightNode), so a cell between filaments goes
+// dark and a filament goes bright, the way the reference pools do; the cap
+// only bounds the map's noise.
 const MAX_GAIN = 6;
 
 /**
@@ -248,18 +249,36 @@ export class WaterCausticLightNode extends THREE.AnalyticLightNode {
   static get type() { return 'WaterCausticLightNode'; }
   setup(builder) {
     if (!builder.context.irradiance || builder.object?.userData?.vfxSimulation === 'water') return;
-    // ── THE REFRACTED LENS IS NO LONGER ADDED HERE ──────────────────────
-    //
-    // It multiplies the sun's own light node (`installSunGain`): that is the
-    // whole lens, dark cells and bright filaments, behind the sun's shadow
-    // map. What this node still carries is the OTHER source — the mirrored
-    // sun on surfaces above the water — which no existing light provides.
     // Only the slots the medium compiled for (`pool.compileShape()`): a
     // rebuild of the fog node recompiles every material, and this setup runs
     // again with the new count.
     const pool = this.light.waterPool;
+    // ── THE SUN'S OWN SHADOW, BORROWED ──────────────────────────────────
+    //
+    // The lens is a MULTIPLIER on the sun: E·cos·shadow·gain. A light node
+    // can only add, and the difference E·cos·(gain − 1) is right only where
+    // the sun actually lands — in shadow it would subtract light that was
+    // never delivered. So the difference is multiplied by the sun's own
+    // shadow node: three keeps one light node per light (`_lightsNodeRef`),
+    // lights build in id order (the sun before this later light), and its
+    // `shadowNode` is the PCF visibility at this very fragment. With it the
+    // term is exact — dark cells and bright filaments, nothing in shadow. A
+    // sun that casts no shadow (or a receiver that takes none: three only
+    // builds the shadow node for `receiveShadow` objects) delivers E·cos
+    // everywhere, so the bare difference is exact there too. Only when the
+    // sun cannot be identified at all is the positive half the safe half.
+    // ⚠ A `colorNode` on the sun itself was tried first: three then silently
+    // drops THIS node's contribution (the mirrored sun vanished from the
+    // catcher — premium receipt 77.3 = 77.3, 2026-09-06).
+    const lightNodes = builder.lightsNode ? builder.getDataFromNode(builder.lightsNode)?.lightNodes : null;
+    const sunNode = (pool.sun && Array.isArray(lightNodes)) ? lightNodes.find((n) => n?.light && n.light === pool.sun) ?? null : null;
+    const shadow = sunNode ? (sunNode.shadowNode ?? float(1)) : null;
     for (const slot of pool.slots.slice(0, pool.compiled?.count ?? pool.compileShape().count)) {
       const s = slot.uniforms;
+      const gain = waterCausticGainNode(positionWorld, slot, normalWorldGeometry);
+      const cos = normalWorldGeometry.dot(s.toSunRefracted).max(0);
+      const excess = shadow ? gain.sub(1).mul(shadow) : gain.sub(1).max(0);
+      builder.context.irradiance.addAssign(s.radiance.mul(cos).mul(excess));
       // ⚠ THE GEOMETRIC NORMAL, NOT THE BUMP-MAPPED ONE. A caustic is a sheet
       // of light, smooth at the scale of a tile's grout; read against the
       // material's normal map, the add term jumped at every bevel a grazing
@@ -317,51 +336,6 @@ export function installWaterCausticLight(engine) {
 export function removeWaterCausticLight(engine) {
   engine._waterCausticLight?.removeFromParent();
   engine._waterCausticLight = null;
-  // …and the sun gets its own colour back.
-  engine.scene?.traverse?.((o) => { if (o.userData?.waterGain) releaseSunGain(engine, o); });
-}
-
-/**
- * ══ THE LENS MULTIPLIES THE SUN ═══════════════════════════════════════════
- *
- * three's `AnalyticLightNode` takes the light's colour from `light.colorNode`
- * when the light carries one — a per-fragment expression, multiplied by the
- * shadow map like any colour. So the water's refracted lens goes exactly
- * where a caustic belongs: on the sun itself. Underwater, a cell between
- * filaments receives less than the flat sun and a filament several times
- * more, energy-conserving on average; above water and in shadow, nothing
- * changes. One node per sun, rebuilt when the pool's compiled slot count
- * changes; the colour uniform tracks the light every frame.
- *
- * ⚠ A light node reads `light.colorNode` when a MATERIAL builds its lights,
- * so a sun hooked after the scene compiled needs one recompile — asked for
- * here, and only on the first hook or a slot-count change.
- */
-export function installSunGain(engine, sun, pool) {
-  const count = pool.compiled?.count ?? pool.compileShape().count;
-  let hook = sun.userData.waterGain;
-  // ⚠ Rebuild on the slot COUNT only. Keying on the pool object too rebuilt
-  // the hook — and asked every material to recompile — every frame in a
-  // harness whose engine stub hands out the pool anew: an endless wave.
-  if (!hook || hook.count !== count) {
-    if (hook) sun.colorNode = null;
-    const colour = uniform(new THREE.Color());
-    let gain = null;
-    for (const slot of pool.slots.slice(0, count)) {
-      const g = waterCausticGainNode(positionWorld, slot, normalWorldGeometry);
-      gain = gain ? gain.mul(g) : g;
-    }
-    sun.colorNode = colour.mul(gain);
-    hook = sun.userData.waterGain = { pool, count, colour };
-    engine.scene?.traverse?.((o) => { const m = o.material; if (!m) return; for (const material of Array.isArray(m) ? m : [m]) material.needsUpdate = true; });
-  }
-  hook.colour.value.copy(sun.color).multiplyScalar(sun.intensity);
-}
-export function releaseSunGain(engine, sun) {
-  if (!sun.userData.waterGain) return;
-  delete sun.userData.waterGain;
-  sun.colorNode = null;
-  engine.scene?.traverse?.((o) => { const m = o.material; if (!m) return; for (const material of Array.isArray(m) ? m : [m]) material.needsUpdate = true; });
 }
 
 /**
@@ -515,8 +489,8 @@ export function updateWaterSlot({ engine, slot, kernel, mesh, simulation, props 
   // exaggerated, both around the same neutral point.
   s.strength.value = Math.max(0, Math.min(3, Number(props.causticIntensity ?? 1)));
   s.radiance.value.copy(source.color).multiplyScalar(source.intensity);
-  // The refracted lens rides on the sun's own colour node.
-  installSunGain(engine, source, engine.waterSlots ?? waterSlotPool(engine));
+  // The caustic light borrows this sun's shadow node (WaterCausticLightNode).
+  (engine.waterSlots ?? waterSlotPool(engine)).sun = source;
 }
 
 /** Snell on the CPU, matching WGSL's `refract` including total internal

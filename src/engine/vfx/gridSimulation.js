@@ -1008,7 +1008,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   if(waterSurfaceTexture)mesh.userData.waterSurfaceTexture=waterSurfaceTexture;
   mesh.userData.noBatch = true;
   mesh.userData.noMerge = true;
-  mesh.frustumCulled = false; mesh.castShadow = true; mesh.receiveShadow = true;
+  // ⚠ A WATER LID NEVER CASTS A SHADOW-MAP SHADOW. It transmits 98 % of the
+  // sun; its "shadow" on the pool floor is the caustic gain (focus ×
+  // absorption). Cast as an opaque occluder it blacked out the floor under
+  // every pool, and the lens had nothing to modulate — "caustics are way too
+  // dim, even when increased intensity" (user, 2026-09-06; their Water had
+  // castShadow on). Cloth is opaque and casts.
+  mesh.frustumCulled = false; mesh.castShadow = kind !== "water"; mesh.receiveShadow = true;
   // The shell: a clear Fresnel interface and nothing else. Transmission 1 with
   // no thickness means it tints nothing — everything a viewer sees through the
   // side of the body has already been attenuated by the medium over the exact
@@ -1173,7 +1179,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     material.color.set(p.color ?? (kind === "cloth" ? "#c85c3c" : "#168aab"));
     u.color.value.copy(material.color);
     material.roughness = finite(p.roughness, kind === "cloth" ? .85 : .15, 0, 1);
-    mesh.castShadow = p.castShadow !== false; mesh.receiveShadow = p.receiveShadow !== false;
+    mesh.castShadow = kind !== "water" && p.castShadow !== false; mesh.receiveShadow = p.receiveShadow !== false;
     }
     updateBounds();
   };

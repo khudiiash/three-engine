@@ -149,6 +149,7 @@ export function waterSegmentNode(slot, { shapeClip = true } = {}) {
  * 4.76, and the dotted grain is gone from the image.
  */
 const SHAFT_TAPS = 24;
+const SUN_SCATTER_ALBEDO = .08;
 /** The mip the shafts read the caustic map at — 1024 >> 4 = 64 texels across
  *  the pool. A beam is a low-frequency thing; the filaments underneath it are
  *  what the taps could not resolve. */
@@ -220,7 +221,13 @@ function shaftNode(slot, segment, tau, sigma) {
   // 2026-09-06). One copy, one loop.
   Loop({ start: 0, end: SHAFT_TAPS }, ({ i }) => {
     const k = float(i).add(jitter).div(SHAFT_TAPS);
-    const beam = waterCausticGainLocalNode(segment.at(k), slot, mip).sub(1).max(0);
+    // The WHOLE beam, not its excess over the mean: with a map that adds onto
+    // black (mean one, cells below, filaments above) the excess averages to
+    // nothing along a ray, and the forward-scattered sun — the bright haze
+    // when looking up at it — vanished with it (harness: looking up 1.5
+    // against 112 before the map was corrected). The sun's in-scatter is the
+    // beam's own light times the phase; the lens shapes it.
+    const beam = waterCausticGainLocalNode(segment.at(k), slot, mip);
     const depth = mix(segment.near, segment.far, k);
     const reach = sigma.mul(depth).mul(slant).negate().exp();
     total.addAssign(tau.mul(k).negate().exp().mul(reach).mul(beam));
@@ -283,7 +290,18 @@ function applyMedium(rgb, slot, { shapeClip }) {
     If(s.strength.greaterThan(0), () => {
       // Scattered sunlight, tinted by the water it is travelling through. The
       // albedo is the water's own colour: a beam in green water is green.
-      const albedo = vec3(s.scatter).mul(4).clamp(0, 1);
+      // ── THE SUN'S IN-SCATTER, AT WATER'S OWN ALBEDO ────────────────────
+      //
+      // Clear water scatters a few percent of what it extinguishes
+      // (single-scatter albedo ~0.05–0.1; the rest is absorbed), so the sun's
+      // haze is `radiance × 0.08 × τ × phase × mean(beam)` along the ray: a
+      // blinding forward glow looking up at the sun, a faint one looking
+      // down. It used to take the water COLOUR ×4 as the albedo — near one,
+      // milk — which only stayed sane while the beam term averaged to zero;
+      // with the beam carried whole (the lens's mean is one) it washed a
+      // floor two metres down from 105 to 141 (harness, 2026-09-06). The
+      // beam's colour comes from σ per channel on its way down and back.
+      const albedo = float(SUN_SCATTER_ALBEDO);
       inScatter.addAssign(vec3(s.radiance).mul(albedo).mul(shaftNode(slot, segment, tau, sigma)).mul(tau.min(2)).mul(shaftPhase(slot)));
     });
     rgb.assign(rgb.mul(tau.negate().exp()).add(inScatter));

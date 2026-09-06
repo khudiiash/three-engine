@@ -1,6 +1,6 @@
 import { Object3D, Vector3 } from 'three/webgpu';
 import {
-  cameraPosition, cameraViewMatrix, float, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
+  cameraFar, cameraNear, cameraPosition, cameraViewMatrix, float, linearDepth, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
   positionViewDirection, reflector, refract, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4,
 } from 'three/tsl';
 import { waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
@@ -38,6 +38,7 @@ let reflecting = false;
 export function installWaterSurfaceLook({ engine, mesh, material, simulation = null, slot = null }) {
   const target = new Object3D(); target.rotation.x = -Math.PI / 2; mesh.add(target);
   const gain = uniform(1), distortion = uniform(.02);
+  const BLIND_REFRACTION_METRES = 1;
   // ⚠ EVERY SLOT THIS TOUCHES IS CAPTURED, and every rebuild starts from the
   // capture rather than from what it built last time — `build()` re-runs on
   // each GI compile wave, and composing onto its own output would stack foam on
@@ -264,7 +265,29 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       const tFloor = u.waterDepth.div(bent.y.negate().max(.05));
       const tX = u.halfExtent.x.sub(positionLocal.x.mul(bent.x.sign())).div(bent.x.abs().max(1e-4));
       const tZ = u.halfExtent.z.sub(positionLocal.z.mul(bent.z.sign())).div(bent.z.abs().max(1e-4));
-      const column = tFloor.min(tX).min(tZ).max(0).min(u.waterDepth.mul(3));
+      let column = tFloor.min(tX).min(tZ).max(0).min(u.waterDepth.mul(3));
+      // ── THE STRAW IN THE GLASS: THE OBJECT BEHIND THE PIXEL SETS THE COLUMN ─
+      //
+      // An object crossing the surface must appear BROKEN at the waterline: the
+      // offset is the water between the surface and the object — nothing at
+      // the waterline, the whole column at the floor. The floor/wall column
+      // cannot know a crate is there and sampled its submerged side metres
+      // away ("still wrong reflection from the red cube", user, 2026-09-06).
+      // With a published scene pass (the post chain's depth — the shared
+      // viewport depth is the one that broke pipelines), the column is the
+      // distance from this pixel to the opaque scene behind it, no more than
+      // the floor's. Without one, the floor/wall column stands.
+      const sceneDepth = engine?.scenePass?.getTexture?.("depth") ?? null;
+      if (sceneDepth) {
+        const behind = linearDepth(texture(sceneDepth, screenUV)).sub(linearDepth()).mul(cameraFar.sub(cameraNear)).max(0);
+        column = column.min(behind.div(u.waveScale.y));
+      } else {
+        // Blind (no scene pass): a crate a hand under the surface would be
+        // sampled where the floor's ray lands, metres away — the displaced
+        // dark copy beside the cube (user, 2026-09-06, twice). Capped at a
+        // metre of water: the floor still bends, an object stays near itself.
+        column = column.min(float(BLIND_REFRACTION_METRES).div(u.waveScale.y));
+      }
       // From BELOW the ray leaves into air at the surface: there is no column
       // beyond it (with the up-facing normal `refract` fails and the column
       // read five depths — the backdrop was sampled metres away, which is what
