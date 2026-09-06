@@ -214,7 +214,7 @@ export class GridSimulationComponent extends Component {
     mesh.matrixWorldNeedsUpdate = true;
     if (this.constructor.type === "water" && !Array.isArray(mesh.material)) {
       this.waterSurfaceLook ??= installWaterSurfaceLook({ engine: this.entity.engine, mesh, material: mesh.material,
-        simulation: this.simulation, slot: this.waterSlot });
+        simulation: this.simulation, slot: this.waterSlot, getSlot: () => this.waterSlot });
       this.waterSurfaceLook.update();
     }
     if (active) {

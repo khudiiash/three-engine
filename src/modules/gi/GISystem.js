@@ -42,7 +42,7 @@ import {
 } from "./giMaterialLightLifecycle.js";
 import { GiPathTracerView } from "./giPathTracer.js";
 import { SLOT_ATLAS_TILES, buildSlotAlbedoAtlas } from "./bvh/bvhScene.js";
-import { GI_WORLD_AO_VISIBILITY_POWER, blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiAoPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterStaticSnapshotPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiFarFieldTexture, createGiGBuffer, createGiGBufferDownsample, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiRtaoPass, createGiShadowClearPass, createGiTargets, createGiVxaoPass, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
+import { GI_WORLD_AO_VISIBILITY_POWER, blitBvhAtlasTiles, computeCompressedTextureAverage, createGiAoFilterPass, createGiAoPass, createGiBvhHitShade, createGiBvhReflect, createGiBvhTarget, giBvhReflectStride, createGiEmitterShadowPass, createGiEmitterStaticSnapshotPass, createGiEmitterTileCutPass, createGiFarFieldAvgPass, createGiFarFieldTexture, createGiGBuffer, createGiGBufferDownsample, renderWaterGBuffer, createGiGtaoPass, createGiIrradianceTemporalPass, createGiLightShadowFilterPass, createGiLightShadowHistoryPass, createGiLightShadowPass, createGiLightShadowWidePass, createGiResolve, createGiRtaoPass, createGiShadowClearPass, createGiTargets, createGiVxaoPass, readTexturePixelsGPU, renderGiGBuffer } from "./giScreen.js";
 import { createLightTreeEmitterImportance, createLightTreeRecordSlot } from "./lightTreeGpu.js";
 import { noteTextureAverage, pendingTextureAverages, resolveMaterialSurface, serializeMeshForBake } from "./voxelizeOnce.js";
 import { createSrcVolume } from "./srcVolume.js";
@@ -4320,6 +4320,7 @@ export class GISystem {
           this._bvhSceneStale ??= this._frame;
         }
       }
+      this.#tickWaterRefraction(renderer);
       // Reflection probes (§14 R-B): sync slot uniforms from the live
       // components, then dispatch at most ONE due capture (dirty first, else
       // round-robin refresh) — the amortization IS the cost model. The
@@ -7667,6 +7668,9 @@ export class GISystem {
             masked: this.#bvhMaskEnabled(),
           }
         : null;
+      // Water refraction (2026-09-06): what a hit shade needs, kept for the
+      // water's own trace+shade pair (built lazily in #tickWaterRefraction).
+      this._hitShadeInputs = { gather, cameraPosition: inputs.cameraPosition, normalOffset: light.normalOffset, intensity: light.intensityUniform, emitter, bounceWeight: this._giBounceWeightU, lightSlots, width, height };
       // ── SRC (plan §7 Phase 1-2) ───────────────────────────────────────────
       //
       // ON by default since Phase 5 (`__giSrcProbes = false` is the opt-out —
@@ -11315,6 +11319,99 @@ export class GISystem {
    * itself returns null then, and the prepass falls back at build time), or
    * there is no surface palette to shade hits from.
    */
+  /**
+   * ══ WATER REFRACTION THROUGH THE BVH (2026-09-06) ═════════════════════
+   *
+   * Screen-space refraction reads the framebuffer at a displaced pixel and
+   * can never show what stands behind an object crossing the surface; a
+   * crate's faces were painted onto the water around it in seven reports.
+   * The reference (jeantimex/webgpu-water) ray-traces its pool instead. Here
+   * the water renders its OWN gbuffer — the lid's world position and the
+   * refracted ray direction from the shaded wave normal — and the exact
+   * reflection pair traces and hit-shades those rays through the same static
+   * BVH8 + movers, at the resolve grid, with the caustic lens on the sun.
+   * The lid reads the radiance at its own pixel and applies the medium over
+   * the traced segment. `spec`: { mesh, material (the MRT material), layer,
+   * causticGain(point, normal) → node, radianceNode, hitNode } — the two
+   * texture nodes are the water's; their `.value` is swapped here.
+   */
+  registerWaterRefraction(spec) {
+    this._waterRefractions ??= new Set();
+    const w = { ...spec, gbuffer: null, hit: null, albedo: null, radiance: null, trace: null, shade: null, dynSet: null, inputs: null };
+    this._waterRefractions.add(w);
+    return w;
+  }
+  unregisterWaterRefraction(w) {
+    if (!this._waterRefractions?.delete(w)) return;
+    this.#disposeWaterRefraction(w);
+  }
+  #disposeWaterRefraction(w) {
+    const computes = [w.trace?.compute, w.shade?.compute].filter(Boolean);
+    if (computes.length) releaseComputeNodes(this.engine.renderer, computes);
+    w.trace = w.shade = null;
+    w.gbuffer?.dispose(); w.gbuffer = null;
+    for (const t of [w.hit, w.albedo, w.radiance]) t?.dispose();
+    w.hit = w.albedo = w.radiance = null;
+  }
+  #buildWaterRefraction(w, width, height) {
+    this.#disposeWaterRefraction(w);
+    const inputs = this._hitShadeInputs;
+    const light = this.state?.light ?? null;
+    const oneBvh = this.#oneBvhBundle();
+    if (!inputs || !oneBvh) return false;
+    w.gbuffer = createGiGBuffer(width, height);
+    const make = (name, filter) => { const t = new THREE.StorageTexture(width, height); t.type = THREE.HalfFloatType; t.minFilter = filter; t.magFilter = filter; t.name = name; return t; };
+    w.hit = make("waterRefractHit", THREE.NearestFilter);
+    w.albedo = make("waterRefractAlbedo", THREE.NearestFilter);
+    w.radiance = make("waterRefractRadiance", THREE.LinearFilter);
+    if (!this._bvhCameraPosition) this._bvhCameraPosition = uniform(new THREE.Vector3());
+    w.trace = createGiBvhReflect({
+      gbuffer: w.gbuffer, target: w.hit, colorTarget: w.albedo, width, height,
+      bvhScene: this.state?.bvhScene ?? null, cameraPosition: this._bvhCameraPosition,
+      normalOffset: light?.normalOffset ?? 0.02, maxDistance: Math.max(light?.mirrorRange ?? 24, 64),
+      mask: false, dyn: this._dynSet ?? null, strideDefault: 1, replicate: false, oneBvh, rayMode: 'given',
+    });
+    w.trace.compute.__giPassName = "waterRefractTrace";
+    w.shade = createGiBvhHitShade({
+      gbuffer: w.gbuffer,
+      bvhShade: { hit: w.hit, albedo: w.albedo, target: w.radiance, lightSlots: inputs.lightSlots, masked: false },
+      width, height, resolveWidth: width, resolveHeight: height,
+      gather: inputs.gather, cameraPosition: inputs.cameraPosition, normalOffset: inputs.normalOffset,
+      intensity: inputs.intensity, emitter: inputs.emitter, bounceWeight: inputs.bounceWeight,
+      rawCopy: null, sourceStride: 1,
+      probes: this.#reflectionProbesCapable() ? (({ node, slots }) => ({ node, slots }))(this.#ensureReflProbeState()) : null,
+      termMask: null, ...this.#hitShadowBundle(), shadowReach: this.#hitShadowReach(),
+      rayMode: 'given', causticGain: w.causticGain ?? null,
+    });
+    w.shade.compute.__giPassName = "waterRefractShade";
+    if (w.radianceNode) w.radianceNode.value = w.radiance;
+    if (w.hitNode) w.hitNode.value = w.hit;
+    w.dynSet = this._dynSet ?? null; w.inputs = inputs; w.hitShade = this.state?.screen?.bvhHitShade ?? null;
+    console.log(`[gi] water refraction: BVH trace + hit shade at ${width}×${height} for "${w.mesh?.name ?? 'water'}"`);
+    return true;
+  }
+  #tickWaterRefraction(renderer) {
+    if (!this._waterRefractions?.size || globalThis.__giWaterRefraction === false) return;
+    const inputs = this._hitShadeInputs;
+    const scene = this.engine.scene, camera = this.engine.camera;
+    if (!this.state?.screen || !inputs || !scene || !camera || this._compileWaveActive) return;
+    const width = inputs.width, height = inputs.height;
+    const dyn = this._dynSet ?? null;
+    for (const w of this._waterRefractions) {
+      if (!w.mesh?.visible || !w.material?.mrtNode) continue;
+      // Stale when anything the pair closed over was re-minted: the mover
+      // set, the resolve inputs, the resolve size — and GI's own hit shade,
+      // which the pool-swap and resize paths replace along with the gather
+      // closure it reads (a kernel holding the old one is the "Destroyed
+      // texture used in a submit" class).
+      const stale = !w.trace || w.dynSet !== dyn || w.inputs !== inputs || w.hitShade !== (this.state.screen.bvhHitShade ?? null) || w.gbuffer?.rt?.width !== width || w.gbuffer?.rt?.height !== height;
+      if (stale && !this.#buildWaterRefraction(w, width, height)) continue;
+      renderWaterGBuffer(renderer, scene, camera, { rt: w.gbuffer.rt, mrtNode: w.material.mrtNode, material: w.material, layer: w.layer });
+      camera.getWorldPosition(this._bvhCameraPosition.value);
+      giCompute(renderer, [w.trace.compute, w.shade.compute], { deferrable: true });
+    }
+  }
+
   #oneBvhBundle() {
     if (globalThis.__giOneBvhReflect === false) return null;
     const dyn = this._dynSet;
@@ -17868,7 +17965,8 @@ export class GISystem {
         // those into the static field would leave phantom cloth/water there.
         if (position && material && !material.transparent && !isVolume && !editorOnly && !object.userData.vfxSimulation && triCount <= MAX_TRIS_PER_MESH) {
           meshes.push(object);
-        } else if (triCount > MAX_TRIS_PER_MESH) {
+        } else if (triCount > MAX_TRIS_PER_MESH && !object.userData.vfxSimulation) {
+          // (a water lid is excluded by design, not by size — no warning)
           console.warn(`[gi] skipping "${object.name || "mesh"}" (${Math.round(triCount)} tris > cap)`);
         }
       }

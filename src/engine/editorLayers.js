@@ -247,3 +247,11 @@ export const GI_DEPTH_LAYER = 20;
  * authoring helpers. Exported games never enable it.
  */
 export const PHYSICS_DEBUG_LAYER = 19;
+
+/**
+ * The water lid alone, for the water's own refraction gbuffer (2026-09-06):
+ * GI renders this layer through the water's MRT material into a target whose
+ * "normal" attachment is the refracted ray, then traces it through the BVH.
+ * The lid stays on layer 0 for the main pass; its body shell is not here.
+ */
+export const WATER_REFRACTION_LAYER = 18;
