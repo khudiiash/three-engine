@@ -180,7 +180,10 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     filter with almost no red. The interface is clear now — Fresnel and the
     material's own attenuation only; the water's colour is the MEDIUM's
     absorption over the real path. Diagnose a dark ghost by its SIGN first.
-28. SCREEN-SPACE REFRACTION CANNOT BE SAVED BY A DEPTH TEST. The framebuffer
+28. (REVERTED 2026-09-06 evening — the pass rendered a wrong image in the
+    editor and the user asked for it to go; the surface reads the framebuffer
+    copy again and the crate copy is the OPEN item.) SCREEN-SPACE REFRACTION
+    CANNOT BE SAVED BY A DEPTH TEST. The framebuffer
     near a floating crate holds the crate's faces ABOVE the water, and a
     displaced sample reads them onto the surface around it however exact the
     ray ("the copy's still there, just fully bright red now" — the sixth
