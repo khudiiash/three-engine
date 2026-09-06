@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { float, mix, normalWorld, positionWorld, select, vec2, vec3, vec4 } from 'three/tsl';
+import { float, mix, normalWorldGeometry, positionWorld, select, vec2, vec3, vec4 } from 'three/tsl';
 import { CAUSTIC_RESOLUTION, CAUSTIC_WINDOW_METRES, waterSlotPool } from './waterSlots.js';
 import { waterInsideNode, waterRimDistanceNode } from './waterShape.js';
 
@@ -95,7 +95,12 @@ export function waterCausticGainLocalNode(P, slot, level = 0, normal = null) {
   // rim, through air — no lens, gain 1 — and reading the map for them found
   // its clipped border instead ("black stripes flickering on the pool walls").
   const origin = vec2(local.x.sub(s.flatRay.x.mul(d).div(rise)), local.z.sub(s.flatRay.z.mul(d).div(rise)));
-  const inside = waterInsideNode(vec4(s.shape), s.half, local)
+  // The receiver may sit ON the volume's boundary — a pool's wall and floor
+  // are what bound the water, and a strict inside test left them dry (the
+  // harness wall read no caustic at all). A margin of 2 % of the footprint.
+  const margin = s.half.x.max(s.half.z).mul(.02);
+  const inside = depth.greaterThan(0).and(depth.lessThan(s.half.y.add(margin)))
+    .and(waterRimDistanceNode(vec4(s.shape), s.half, local.x, local.z).greaterThan(margin.negate()))
     .and(waterRimDistanceNode(vec4(s.shape), s.half, origin.x, origin.y).greaterThan(0));
   const remaining = s.half.y.sub(d).max(0).div(rise);
   const sample = vec2(
@@ -214,20 +219,26 @@ export class WaterCausticLightNode extends THREE.AnalyticLightNode {
     if (!builder.context.irradiance || builder.object?.userData?.vfxSimulation === 'water') return;
     for (const slot of this.light.waterPool.slots) {
       const s = slot.uniforms;
-      const gain = waterCausticGainNode(positionWorld, slot, normalWorld);
+      // ⚠ THE GEOMETRIC NORMAL, NOT THE BUMP-MAPPED ONE. A caustic is a sheet
+      // of light, smooth at the scale of a tile's grout; read against the
+      // material's normal map, the add term jumped at every bevel a grazing
+      // beam met and the lens's turnover made the jumps flicker — evenly
+      // spaced dotted lines down the pool walls (user's scene, 2026-09-06).
+      // The material's own sun term keeps its bumps.
+      const gain = waterCausticGainNode(positionWorld, slot, normalWorldGeometry);
           // Underwater the incoming beam is the REFRACTED one, steeper than the
       // sun's own direction, so that is the cosine a caustic arrives with. The
       // term is zero outside the volume regardless (`gain - 1` is), so this
       // needs no branch. A DOWNWARD-facing surface still receives nothing, and
       // that is not a gap: no refracted sunbeam reaches the underside of
       // anything. Light there arrives by bounce, which is the GI path's job.
-  const cos = normalWorld.dot(s.toSunRefracted).max(0);
+  const cos = normalWorldGeometry.dot(s.toSunRefracted).max(0);
       builder.context.irradiance.addAssign(s.radiance.mul(cos).mul(gain.sub(1).max(0)));
       // ...and the same lens reflected upward, onto whatever overhangs the
       // water. A DOWNWARD-facing normal is the whole audience for this term:
       // `toSunMirror` points down, so every other surface in the scene gets a
       // cosine of zero and pays one clamped dot product for it.
-      const under = normalWorld.dot(s.toSunMirror).max(0);
+      const under = normalWorldGeometry.dot(s.toSunMirror).max(0);
       builder.context.irradiance.addAssign(
         s.radiance.mul(under).mul(s.reflectance).mul(waterCausticAboveNode(positionWorld, slot)));
     }
@@ -325,13 +336,26 @@ export function updateWaterSlot({ engine, slot, kernel, mesh, simulation, props 
   // Centre: the camera's local XZ, kept inside the pool so the window never
   // hangs over the rim, then rounded to a whole texel so a moving camera
   // slides the window in steps the pattern cannot see.
-  const wx = Math.min(s.half.value.x, CAUSTIC_WINDOW_METRES / 2 / Math.max(1e-4, axisX.length()));
-  const wz = Math.min(s.half.value.z, CAUSTIC_WINDOW_METRES / 2 / Math.max(1e-4, axisZ.length()));
+  // ── THE WINDOW REACHES PAST THE RIM BY THE BEAMS' LATERAL TRAVEL ─────────
+  //
+  // The map is in FLOOR parameterization: a beam entering near the up-sun
+  // rim lands OUTSIDE the footprint at floor depth — on the wall, in truth —
+  // and a window clamped to the footprint clipped every such beam, so pool
+  // walls read the map's border and never a caustic. The reach is the flat
+  // refracted ray's lateral travel over the full depth (last frame's ray; the
+  // sun does not move between two frames), plus a hair for the rim itself.
+  const f = s.flatRay.value, drop = Math.max(.05, -f.y);
+  const reachX = Math.abs(f.x) / drop * s.half.value.y + s.half.value.x * .02;
+  const reachZ = Math.abs(f.z) / drop * s.half.value.y + s.half.value.z * .02;
+  const wx = Math.min(s.half.value.x + reachX, CAUSTIC_WINDOW_METRES / 2 / Math.max(1e-4, axisX.length()));
+  const wz = Math.min(s.half.value.z + reachZ, CAUSTIC_WINDOW_METRES / 2 / Math.max(1e-4, axisZ.length()));
   s.causticHalf.value.set(Math.max(1e-4, wx), Math.max(1e-4, wz));
   const eye = engine?.camera ? engine.camera.getWorldPosition(_eye).applyMatrix4(s.inverse.value) : _eye.set(0, 0, 0);
   const tx = 2 * wx / CAUSTIC_RESOLUTION, tz = 2 * wz / CAUSTIC_RESOLUTION;
-  const cx = Math.max(-(s.half.value.x - wx), Math.min(s.half.value.x - wx, eye.x));
-  const cz = Math.max(-(s.half.value.z - wz), Math.min(s.half.value.z - wz, eye.z));
+  // (A window wider than the pool has nowhere to go: its centre is the pool's.)
+  const rangeX = Math.max(0, s.half.value.x + reachX - wx), rangeZ = Math.max(0, s.half.value.z + reachZ - wz);
+  const cx = Math.max(-rangeX, Math.min(rangeX, eye.x));
+  const cz = Math.max(-rangeZ, Math.min(rangeZ, eye.z));
   s.causticCenter.value.set(Math.round(cx / tx) * tx, Math.round(cz / tz) * tz);
   const absorption = Math.max(0, Number(simulation.uniforms.absorption.value ?? .2));
   s.absorption.value = absorption;
