@@ -65,6 +65,17 @@ export function seaSettings(props = {}, depthMetres = 20) {
   const waveHeight = finite(props.waveHeight, .15, 0, 20);
   const waveLength = finite(props.waveLength, 4, .1, 1000);
   const direction = finite(props.waveDirection, 0, -180, 180) * Math.PI / 180;
+  // ── A CONTAINER HAS NO DOWNWIND ────────────────────────────────────────
+  //
+  // "Why do the caustics shift so fast to the side as if water was flowing,
+  // yet it is a static pool" (user, 2026-09-06). A wind spectrum's every wave
+  // TRAVELS downwind at its phase speed (a 5 m wave at 2.8 m/s), so the lens
+  // it makes translates with it. In a pool the ripples reflect off the walls
+  // and opposite-going waves superpose into patterns that shimmer in place.
+  // `enclosed` (1 for a box or primitive source, 0 for a plane) blends the
+  // directional distribution toward isotropic — a little wind bias is kept.
+  const enclosed = finite(props.enclosed, 0, 0, 1);
+  const spreadBlend = 1 - .85 * enclosed;
   const octaves = finite(props.waveOctaves, 4, 1, 8);
   const gain = finite(props.waveGain, .5, .2, .9);
   const kp = 2 * Math.PI / waveLength;
@@ -84,8 +95,8 @@ export function seaSettings(props = {}, depthMetres = 20) {
     timeScale: finite(props.waveSpeed, 2, 0, 100),
     depth: Math.max(.05, Number(depthMetres) || 20),
     spectra: [
-      { scale: 1, angle: direction, spreadBlend: 1, swell: .3, gamma: 3.3 },
-      { scale: .3, angle: direction + 50 * Math.PI / 180, spreadBlend: 1, swell: 1, gamma: 3.3 },
+      { scale: 1, angle: direction, spreadBlend, swell: .3, gamma: 3.3 },
+      { scale: .3, angle: direction + 50 * Math.PI / 180, spreadBlend, swell: 1, gamma: 3.3 },
     ],
   };
 }

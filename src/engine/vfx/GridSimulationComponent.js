@@ -78,7 +78,10 @@ export class GridSimulationComponent extends Component {
   sourceProps(plane) {
     if (!plane) return {};
     const props = { width: plane.width, height: plane.height, ...(plane.depth != null ? { waterDepth: plane.depth } : null) };
-    if (this.constructor.type === "water") Object.assign(props, { shapeKind: plane.shape ?? "box", shapeRadius: plane.radius ?? plane.width / 2, shapeHeight: plane.fullHeight ?? plane.depth ?? undefined });
+    if (this.constructor.type === "water") Object.assign(props, { shapeKind: plane.shape ?? "box", shapeRadius: plane.radius ?? plane.width / 2, shapeHeight: plane.fullHeight ?? plane.depth ?? undefined,
+      // A box or primitive is a CONTAINER: its waves reflect off the walls
+      // (waterSpectrumCPU.js#seaSettings); a plane is open water.
+      enclosed: plane.box ? 1 : 0 });
     // ── WATER'S GRID FOLLOWS ITS WORLD SIZE ──────────────────────────────
     //
     // Cells at a fixed size in METRES (`waterAutoResolution`), so a 0.5 m

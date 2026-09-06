@@ -62,6 +62,10 @@ try {
    waveDirection: 0, choppiness: 1, rippleStrength: 1, surfaceDetail: 2, caustics: true, causticIntensity: .5,
    color: '#268270', roughness: 0, style: 'realistic', deepColor: '#090b0b', saturation: .25, transmission: 1,
    foam: Number(argument('foam', '1')), foamThreshold: .5 };
+ // Any wave/look field can be overridden from the URL (?waveHeight=.1&choppiness=0…) to
+ // reproduce a user's own pool.
+ for (const key of ['waveHeight', 'waveLength', 'choppiness', 'rippleStrength', 'surfaceDetail', 'causticIntensity', 'saturation', 'foamThreshold', 'waveOctaves', 'waveGain'])
+   if (argument(key, null) != null) USER[key] = Number(argument(key, '0'));
  const DEPTH = 3;
 
  for (const S of SCALES) {
@@ -95,7 +99,7 @@ try {
    holder.scale.set(S, DEPTH, S);
    scene.add(holder);
    const resolution = AUTO ? waterAutoResolution(S) : 128;
-   const props = { ...USER, resolution, width: 1, height: 1, waterDepth: SHAPE_HEIGHT * FILL, shapeKind: SHAPE, shapeRadius: .5, shapeHeight: SHAPE_HEIGHT };
+   const props = { ...USER, resolution, width: 1, height: 1, waterDepth: SHAPE_HEIGHT * FILL, shapeKind: SHAPE, shapeRadius: .5, shapeHeight: SHAPE_HEIGHT, enclosed: Number(argument('enclosed', '1')) };
    const authored = new THREE.MeshPhysicalNodeMaterial({ color: '#8fd8de', roughness: .12, metalness: 0, ior: 1.333,
      transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
    const slot = pool.claim({});
