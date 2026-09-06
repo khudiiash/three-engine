@@ -1199,6 +1199,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     get rippleCenter() { return u.rippleCenter.value; },
     /** The volume's shape (kind, radius, centerY, height) in local units — see waterVolume.js. */
     shape,
+    /** Every compute kernel by name, for the compile-timing smoke. */
+    kernels: { integrate, commit, injectWater, foamField, rippleWrite, surface, shift0: shiftKernels[0], shift1: shiftKernels[1], shift2: shiftKernels[2], shift3: shiftKernels[3] },
     /** The lid's layout: clipmap rings over a wide pool, or null for the flat grid. */
     clip: clip ? { levels: clipLevels, size: CLIP_SIZE, cell: clipCell, get center() { return u.clipCenter.value; } } : null,
     /** The sea as the CPU last saw it — `waterPhysics.js` floats bodies on this. */

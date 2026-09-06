@@ -8082,7 +8082,9 @@ export class GISystem {
                   // one node of it is built) until a scene has water; the slots
                   // themselves are engine-owned and outlive any water surface,
                   // so this list is read once per GI build and stays valid.
-                  caustics: this.engine?.waterSlots?.slots ?? [],
+                  // …and only the slots a pool has CLAIMED (at least one): each
+                  // slot is compiled into [J]'s hit shader and every material.
+                  caustics: (() => { const pool = this.engine?.waterSlots; return pool ? pool.slots.slice(0, pool.compileShape().count) : []; })(),
                   // §11.10: the sun's shadow map at hits (see the bundle).
                   sunShadow: lightSlots && globalThis.__giSunShadowMap !== false ? sunShadow : null,
                   emitters: emitterSlots ?? [],

@@ -1,0 +1,44 @@
+<!doctype html><html><head><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three/webgpu';
+import { createGridSimulation } from '/src/engine/vfx/gridSimulation.js';
+import { waterSlotPool } from '/src/engine/vfx/waterSlots.js';
+import { installWaterCausticLight, updateWaterSlot } from '/src/engine/vfx/waterCaustics.js';
+// ══ HOW LONG EACH WATER COMPUTE PIPELINE TAKES THE DRIVER TO CREATE ═════════
+//
+// "[gi] §12.56 WATCHDOG: compute pipeline "non-gi" pending 18.2s" and a
+// 98 s compile wave (user, 2026-09-06): one pathological kernel at the head
+// of the driver's queue stalls every pipeline behind it. Each water kernel is
+// dispatched ALONE here, so its wall time is its own compile.
+const log = (...a) => console.log('COMPILE:', ...a);
+const arg = (k, d) => new URL(location.href).searchParams.get(k) ?? d;
+try {
+ const adapter = await navigator.gpu.requestAdapter();
+ const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
+ const errors = []; device.addEventListener('uncapturederror', (e) => { errors.push(e.error.message); console.error('WebGPU validation', e.error.message); });
+ const renderer = new THREE.WebGPURenderer({ device, antialias: false }); await renderer.init(); renderer.setSize(64, 64);
+ const scene = new THREE.Scene();
+ const engine = { scene, renderer, camera: new THREE.PerspectiveCamera(), onUpdate: (fn) => { engine._tickers.push(fn); return () => {}; }, _tickers: [], on: () => () => {}, off: () => {}, modules: { get: () => null } };
+ const pool = waterSlotPool(engine);
+ const sun = new THREE.DirectionalLight('#fff', 3); sun.position.set(6, 14, 4); scene.add(sun); scene.add(sun.target);
+ const S = Number(arg('scale', '5')), holder = new THREE.Object3D(); holder.scale.set(S, 3, S); scene.add(holder);
+ const props = { resolution: 128, width: 1, height: 1, waterDepth: 1, waveHeight: .1, waveLength: 5, choppiness: 0, rippleStrength: .1, surfaceDetail: 2, caustics: true, causticIntensity: .5, foam: .2, enclosed: 1, shapeKind: arg('shape', 'box'), shapeRadius: .5, shapeHeight: 1 };
+ const authored = new THREE.MeshPhysicalNodeMaterial({ transmission: .9, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+ const slot = pool.claim({});
+ const sim = createGridSimulation('water', props, { material: authored, waterSlot: slot, anchorEngine: engine, worldScale: { x: S, z: S } });
+ holder.add(sim.mesh); holder.updateMatrixWorld(true);
+ installWaterCausticLight(engine);
+ const time = async (label, fn) => { const t0 = performance.now(); await fn(); await device.queue.onSubmittedWorkDone(); log(`${label.padEnd(28)} ${(performance.now() - t0).toFixed(0).padStart(6)} ms`); };
+ const k = sim.kernels ?? {};
+ await time('init', () => renderer.computeAsync(sim.init));
+ for (const [name, node] of Object.entries(k)) if (node) await time(name, () => renderer.computeAsync(node));
+ // the spectrum's passes, one cascade at a time
+ for (const [i, c] of (sim.spectrum?.cascades ?? []).entries()) for (const [name, node] of Object.entries(c.kernels ?? {})) if (node?.isNode || node?.computeNode) await time(`spectrum[${i}].${name}`, () => renderer.computeAsync(node));
+ // the slot kernel and the caustic pass (a draw)
+ for (const [i, node] of (sim.slotKernel?.compute ?? []).entries()) await time(`slotKernel[${i}]`, () => renderer.computeAsync(node));
+ await time('caustic pass (draw)', async () => { updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props }); sim.causticPass?.render(renderer); });
+ await time('one full tick', async () => { sim.tick(renderer, 1 / 60); });
+ log('validation', errors.length ? errors : 'clean');
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: errors.length === 0, images: [] };
+ console.log('WATER-COMPILE PASS');
+} catch (error) { console.error(error.stack); globalThis.__VFX_SMOKE_RESULT__ = { pass: false, error: String(error.stack), images: [] }; }
+</script></body></html>

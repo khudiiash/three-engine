@@ -137,6 +137,7 @@
     "smoke:water-premium": "node scripts/run-water-look.mjs artifacts/water-premium http://127.0.0.1:5307/scripts/water-premium-smoke.html",
     "smoke:water-spectrum": "node scripts/run-water-look.mjs artifacts/water-spectrum http://127.0.0.1:5307/scripts/water-spectrum-smoke.html",
     "smoke:water-rate": "node scripts/run-water-look.mjs artifacts/water-rate http://127.0.0.1:5307/scripts/water-caustic-rate-smoke.html",
+    "smoke:water-compile": "node scripts/run-vfx-gpu-smoke.mjs http://127.0.0.1:5307/scripts/water-compile-smoke.html",
     "smoke:water-saturation": "node scripts/run-water-look.mjs artifacts/water-saturation http://127.0.0.1:5307/scripts/water-saturation-smoke.html",
     "smoke:water-authoring": "node scripts/run-water-authoring-smoke.mjs",
     "smoke:water-appearance": "node scripts/run-water-appearance-smoke.mjs",
