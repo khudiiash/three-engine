@@ -57,7 +57,11 @@ try {
  holder.add(sim.mesh); sim.mesh.matrixAutoUpdate = false; sim.mesh.matrix.identity(); sim.mesh.matrixWorldNeedsUpdate = true;
  sim.mesh.receiveShadow = true; sim.mesh.castShadow = true;
  holder.updateMatrixWorld(true);
- installWaterMedium(engine); installWaterCausticLight(engine);
+ // Ablations for the per-material WGSL census: ?medium=0 (no fog node),
+ // ?causticlight=0 (no caustic light), ?shapeclip=0 (box-only medium clip).
+ if (arg('shapeclip', '1') === '0') globalThis.__waterShapeClip = false;
+ if (arg('medium', '1') !== '0') installWaterMedium(engine);
+ if (arg('causticlight', '1') !== '0') installWaterCausticLight(engine);
  const look = installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
  if (arg('mirror', '1') === '0') look.gain.value = 0;
  sim.mesh.castShadow = arg('lidshadow', '0') === '1';
@@ -72,6 +76,7 @@ try {
  for (const e of errors.slice(0, 3)) log('   ', String(e).slice(0, 160));
  const census = async (label, object) => {
    const { fragmentShader } = await renderer.debug.getShaderAsync(scene, camera, object);
+   log(`${label}: fragment WGSL ${(fragmentShader.length / 1024).toFixed(1)} kB`);
    const bindings = [...fragmentShader.matchAll(/@binding\(\s*\d+\s*\)\s*@group\(\s*\d+\s*\)\s*var\s+(\w+)\s*:\s*(texture_[\w<>,\s]+)/g)]
      .map((m) => `${m[1]} (${m[2].trim()})`);
    const sampled = bindings.filter((b) => !/texture_storage/.test(b));
@@ -81,6 +86,9 @@ try {
  };
  const lid = await census('LID  (water surface)', sim.mesh);
  const body = await census('BODY (water shell)', sim.skirtMesh);
+ // The floor: a plain lit material carrying the medium + the caustic light —
+ // what EVERY material in a scene with water pays to compile.
+ await census('FLOOR (a scene material)', floor);
  log('validation', errors.length ? errors : 'clean');
  globalThis.__VFX_SMOKE_RESULT__ = { pass: errors.length === 0 && lid <= 16 && body <= 16, images: [] };
  console.log(lid <= 16 && body <= 16 ? 'WATER-BINDINGS PASS' : 'WATER-BINDINGS FAIL');

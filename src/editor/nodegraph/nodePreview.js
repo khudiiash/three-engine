@@ -19,6 +19,7 @@ async function ensure() {
   renderer.setSize(SIZE, SIZE, false);
   await renderer.init();
   const material = new THREE.MeshBasicNodeMaterial();
+  material.fog = false;   // a preview sphere is never under water — it must not compile the medium
   const scene = new THREE.Scene();
   scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material));
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);

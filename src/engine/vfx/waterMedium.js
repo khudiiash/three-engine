@@ -1,5 +1,5 @@
 import * as THREE from "three/webgpu";
-import { Fn, If, cameraPosition, float, fract, interleavedGradientNoise, mix, output, positionWorld, screenCoordinate, select, uniform, vec2, vec3, vec4 } from "three/tsl";
+import { Fn, If, Loop, cameraPosition, float, fract, interleavedGradientNoise, mix, output, positionWorld, screenCoordinate, select, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { waterSlotPool } from "./waterSlots.js";
 import { waterCausticGainLocalNode } from "./waterCaustics.js";
 import { clipShapeNode } from "./waterShape.js";
@@ -78,8 +78,9 @@ export function waterSegmentNode(slot) {
   const t0 = float(0).toVar(), t1 = float(1).toVar();
   clipSlab(t0, t1, a.x, d.x, half.x.negate(), half.x);
   clipSlab(t0, t1, a.z, d.z, half.z.negate(), half.z);
-  // A solid of revolution: one exact quadric clip on top of the slabs.
-  clipShapeNode(vec4(s.shape), t0, t1, a, d);
+  // A solid of revolution: one exact quadric clip on top of the slabs
+  // (`__waterShapeClip = false` is the harness's ablation switch).
+  if (globalThis.__waterShapeClip !== false) clipShapeNode(vec4(s.shape), t0, t1, a, d);
   // THE TOP FACE IS THE WAVE, AND SAYING SO TAKES TWO PASSES. The entry point
   // is needed to sample the height and the height is needed to find the entry
   // point. Clip against the rest surface, sample there, clip again: one
@@ -211,13 +212,18 @@ function shaftNode(slot, segment, tau, sigma) {
   // `__waterShaftMip` is the harness's dial for the sweep in
   // scripts/water-premium-smoke.html; the shipped value is SHAFT_MIP.
   const mip = Number.isFinite(globalThis.__waterShaftMip) ? globalThis.__waterShaftMip : SHAFT_MIP;
-  for (let i = 0; i < SHAFT_TAPS; i++) {
+  // ⚠ A GPU LOOP, NOT A JS ONE. A JS `for` here unrolled 24 copies of the
+  // caustic lookup — per slot, into EVERY material in the scene (this node is
+  // `scene.fogNode`): a plain floor material compiled a 362 kB fragment shader
+  // and the editor froze 10–15 s on every material it minted (user,
+  // 2026-09-06). One copy, one loop.
+  Loop({ start: 0, end: SHAFT_TAPS }, ({ i }) => {
     const k = float(i).add(jitter).div(SHAFT_TAPS);
     const beam = waterCausticGainLocalNode(segment.at(k), slot, mip).sub(1).max(0);
     const depth = mix(segment.near, segment.far, k);
     const reach = sigma.mul(depth).mul(slant).negate().exp();
     total.addAssign(tau.mul(k).negate().exp().mul(reach).mul(beam));
-  }
+  });
   return total.div(SHAFT_TAPS);
 }
 

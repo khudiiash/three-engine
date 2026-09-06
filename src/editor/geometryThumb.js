@@ -63,6 +63,7 @@ async function ensure() {
     metalness: 0.08,
     side: THREE.DoubleSide,
   });
+  material.fog = false;   // a thumbnail is never under water — it must not compile the medium
   // Wider FOV reads better at thumbnail size than a telephoto fit.
   const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 100);
   const target = new THREE.RenderTarget(SIZE, SIZE, {
