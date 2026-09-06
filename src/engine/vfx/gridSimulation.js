@@ -1153,9 +1153,9 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     if (skirtMaterial) { skirtMaterial.color.copy(u.color.value); skirtMaterial.attenuationColor.copy(u.deepColor.value ?? skirtMaterial.attenuationColor); }
     u.deepColor.value.set(p.deepColor ?? "#063a52");
     if (ownsMaterial) {
-      const hadTransmission = material.transmission > 0;
-      material.transmission = u.transmission.value;
-      if (hadTransmission !== (material.transmission > 0)) material.needsUpdate = true;
+      // ⚠ NOT `material.transmission`: the surface look refracts for itself
+      // (`waterSurfaceLook.js`) and keeps three's transmission OFF — its ray
+      // is scaled per axis by the mesh. The dial lives in `u.transmission`.
       material.thickness = u.refraction.value;
       material.attenuationColor.copy(u.deepColor.value);
       material.attenuationDistance = u.absorption.value > 0 ? 1 / u.absorption.value : 1e6;

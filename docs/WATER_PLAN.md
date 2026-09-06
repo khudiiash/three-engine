@@ -163,6 +163,15 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
 25. The shadow map lags a `castShadow` toggle by a frame (one update per
     frame id per camera): a receipt that toggles a caster reads the previous
     state. Compute the shadow region from geometry instead.
+26. three's transmission scales its refracted ray PER AXIS by the mesh's
+    scale (`getVolumeTransmissionRay`: `normalize(r) · thickness ·
+    modelScale`). On a 5 × 3 × 5 pool the sideways travel is 5/3 of the
+    downward one, so every surface pixel read the framebuffer far beyond
+    where its ray lands — a crate at the waterline painted onto the water
+    beside it (four reports). The surface refracts for itself now: Snell in
+    world space, the column to the first wall/floor, the exit projected and
+    read from the same viewport copy, tinted colour × Beer over the column.
+    `material.transmission` stays 0 on a water lid.
 
 ## Open
 

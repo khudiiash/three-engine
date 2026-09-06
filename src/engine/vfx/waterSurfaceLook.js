@@ -1,7 +1,7 @@
 import { Object3D, Vector3 } from 'three/webgpu';
 import {
-  cameraFar, cameraNear, cameraPosition, cameraViewMatrix, float, linearDepth, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
-  positionViewDirection, reflector, refract, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4,
+  cameraFar, cameraNear, cameraPosition, cameraProjectionMatrix, cameraViewMatrix, float, linearDepth, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
+  positionViewDirection, positionWorld, reflector, refract, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportSharedTexture,
 } from 'three/tsl';
 import { waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
 import { seaShadingSlopeNode } from './waterSpectrum.js';
@@ -223,7 +223,6 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       const foam = mix(soft, soft.smoothstep(.28, .34), u.stylized).toVar();
       const baseColor = vec3(previous.colorNode ?? materialColor).toVar();
       const banded = baseColor.mul(4).add(.5).floor().div(4);
-      material.colorNode = mix(mix(baseColor, banded, u.stylized), vec3(1), foam);
       material.roughnessNode = mix(float(roughness), float(.85), foam);
       // ── ⛔ THE DIAL WAS BAKED INTO THE GRAPH AT BUILD TIME ────────────────
       //
@@ -237,62 +236,65 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // makes the control work on an AUTHORED material, which is every water in
       // practice — the fifth control to have had exactly this shape.
       const through = u.transmission;
-      material.transmissionNode = mix(float(through), float(0), foam);
-      // Refraction needs a THICKNESS: with zero, three's transmission is a
-      // perfectly clear window and the surface bends nothing at all. See
-      // `waterCaustics.js`'s `updateWaterSlot` for why this is a uniform in
-      // world metres divided by the mesh's own scale rather than the volume
-      // depth it used to be — the depth put the exit point metres away and
-      // sampled the shore, which is the ghost that got the mirror blamed.
-      // ── THE THICKNESS IS THE WATER COLUMN, ALONG THE REFRACTED RAY ─────
+      // ── THE WATER REFRACTS FOR ITSELF ────────────────────────────────────
       //
-      // "There is no water refraction currently" (user, 2026-09-06). A fixed
-      // 22 cm (`u.refraction`) displaced the floor by 22 cm × tan(slope): a
-      // few centimetres once the sea was capped at physical steepness, which
-      // is invisible on a floor 3 m down. Real refraction moves the floor by
-      // the whole column: the eye's ray bends at the surface and travels to
-      // the bottom, so the backdrop is read where THAT ray lands. The column
-      // is in the lid's LOCAL units (three scales it by the model), capped at
-      // three depths so a grazing ray does not read the far shore, and
-      // `transmission` still scales it — the dial that reads as "refraction".
-      const toEye = eyeLocal.sub(positionLocal).normalize();
-      const bent = refract(toEye.negate(), lidNormalLocal, float(1 / 1.333));
-      // ⚠ CLIPPED TO THE VOLUME. The bent ray ends at the first thing it meets
-      // — the floor OR a wall. Unclipped, a grazing ray's exit point landed
-      // outside the pool and three sampled the backdrop THERE: the sky drawn
-      // inside the water ("those incorrect reflections are back", user,
-      // 2026-09-06 — the same ghost the old depth thickness had made).
-      const tFloor = u.waterDepth.div(bent.y.negate().max(.05));
-      const tX = u.halfExtent.x.sub(positionLocal.x.mul(bent.x.sign())).div(bent.x.abs().max(1e-4));
-      const tZ = u.halfExtent.z.sub(positionLocal.z.mul(bent.z.sign())).div(bent.z.abs().max(1e-4));
-      let column = tFloor.min(tX).min(tZ).max(0).min(u.waterDepth.mul(3));
+      // three's transmission bends the ray and then multiplies it, per axis,
+      // by the mesh's scale (`getVolumeTransmissionRay`: `normalize(r) ·
+      // thickness · modelScale`). On a 5 × 3 × 5 pool the sideways travel is
+      // 5/3 of the downward one: every surface pixel read the framebuffer far
+      // beyond where its ray really lands, and a crate at the waterline was
+      // painted onto the water beside it — "this bug with red box reflection
+      // which is obviously incorrect" (user, 2026-09-06, the fourth report).
+      // So the surface does its own: Snell in WORLD space, the column to the
+      // first wall or the floor, the exit point projected and read from the
+      // same framebuffer copy three used, tinted the same way (the water's
+      // colour × Beer's law over the column, the authored attenuation). Only
+      // the geometry changed.
+      material.transmissionNode = null; material.transmission = 0; material.thicknessNode = null;
+      const toEyeWorld = cameraPosition.sub(positionWorld).normalize();
+      const lidNormalWorld = modelNormalMatrix.mul(lidNormalLocal).normalize();
+      // From BELOW the ray leaves into air: the normal faces the eye and eta
+      // inverts; beyond the critical angle `refract` is zero (total internal
+      // reflection — the mirror carries everything there).
+      const bentWorld = refract(toEyeWorld.negate(), select(fromBelow, lidNormalWorld.negate(), lidNormalWorld), select(fromBelow, float(1.333), float(1 / 1.333)));
+      // ⚠ CLIPPED TO THE VOLUME, in LOCAL extents but WORLD metres of travel:
+      // P + t·bentWorld ↔ P_local + t·(M⁻¹ bentWorld), same t. Unclipped, a
+      // grazing ray's exit point landed outside the pool and sampled the sky
+      // inside the water ("those incorrect reflections are back").
+      const bentLocal = modelWorldMatrixInverse.mul(vec4(bentWorld, 0)).xyz;
+      const tFloor = u.waterDepth.div(bentLocal.y.negate().max(1e-4));
+      const tX = u.halfExtent.x.sub(positionLocal.x.mul(bentLocal.x.sign())).div(bentLocal.x.abs().max(1e-5));
+      const tZ = u.halfExtent.z.sub(positionLocal.z.mul(bentLocal.z.sign())).div(bentLocal.z.abs().max(1e-5));
+      let column = tFloor.min(tX).min(tZ).max(0).min(u.waterDepth.mul(u.waveScale.y).mul(3));
       // ── THE STRAW IN THE GLASS: THE OBJECT BEHIND THE PIXEL SETS THE COLUMN ─
       //
       // An object crossing the surface must appear BROKEN at the waterline: the
       // offset is the water between the surface and the object — nothing at
-      // the waterline, the whole column at the floor. The floor/wall column
-      // cannot know a crate is there and sampled its submerged side metres
-      // away ("still wrong reflection from the red cube", user, 2026-09-06).
-      // With a published scene pass (the post chain's depth — the shared
-      // viewport depth is the one that broke pipelines), the column is the
-      // distance from this pixel to the opaque scene behind it, no more than
-      // the floor's. Without one, the floor/wall column stands.
+      // the waterline, the whole column at the floor. With a published scene
+      // pass (the post chain's depth — the shared viewport depth is the one
+      // that broke pipelines), the column is the distance from this pixel to
+      // the opaque scene behind it, no more than the floor's. Without one, a
+      // metre of water: the floor still bends, an object stays near itself.
       const sceneDepth = engine?.scenePass?.getTexture?.("depth") ?? null;
       if (sceneDepth) {
         const behind = linearDepth(texture(sceneDepth, screenUV)).sub(linearDepth()).mul(cameraFar.sub(cameraNear)).max(0);
-        column = column.min(behind.div(u.waveScale.y));
+        column = column.min(behind);
       } else {
-        // Blind (no scene pass): a crate a hand under the surface would be
-        // sampled where the floor's ray lands, metres away — the displaced
-        // dark copy beside the cube (user, 2026-09-06, twice). Capped at a
-        // metre of water: the floor still bends, an object stays near itself.
-        column = column.min(float(BLIND_REFRACTION_METRES).div(u.waveScale.y));
+        column = column.min(float(BLIND_REFRACTION_METRES));
       }
-      // From BELOW the ray leaves into air at the surface: there is no column
-      // beyond it (with the up-facing normal `refract` fails and the column
-      // read five depths — the backdrop was sampled metres away, which is what
-      // showed the floor's mirror in place of the sky).
-      material.thicknessNode = select(fromBelow, float(.01), column.mul(u.transmission));
+      // `transmission` still scales the travel — the dial that reads as
+      // "refraction". From below there is no column: the pixel behind.
+      const travel = select(fromBelow, float(0), column.mul(through));
+      const exit = positionWorld.add(bentWorld.mul(travel));
+      const clip = cameraProjectionMatrix.mul(cameraViewMatrix.mul(vec4(exit, 1)));
+      const ndc = clip.xy.div(clip.w).add(1).mul(.5);
+      const refractedUv = vec2(ndc.x, ndc.y.oneMinus()).clamp(.001, .999); // three's own transmission coords (webgpu)
+      const beer = vec3(u.deepColor).max(1e-4).pow(travel.mul(u.absorption));
+      const refracted = viewportSharedTexture(refractedUv).rgb.mul(baseColor).mul(beer).mul(fresnel.oneMinus());
+      // What three's `mix(diffuse, backdrop, transmission)` left of the
+      // diffuse — the stylized, less-than-clear water — stays on the colour.
+      material.colorNode = mix(mix(baseColor, banded, u.stylized).mul(through.oneMinus()), vec3(1), foam);
+      emissive = emissive.add(refracted.mul(through).mul(foam.oneMinus()));
       emissive = emissive.add(reflected.mul(foam.oneMinus()));
       if (slot) emissive = emissive.add(waterSubsurfaceNode(u, slot).mul(foam.oneMinus()));
     } else {
@@ -374,6 +376,7 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       material.emissiveNode = previous.emissiveNode; material.colorNode = previous.colorNode;
       material.roughnessNode = previous.roughnessNode; material.normalNode = previous.normalNode;
       material.transmissionNode = previous.transmissionNode; material.thicknessNode = previous.thicknessNode;
+      material.transmission = previous.transmission;
       if (previous.giWater === undefined) delete material.userData.giWater;
       else material.userData.giWater = previous.giWater;
       material.needsUpdate = true;
