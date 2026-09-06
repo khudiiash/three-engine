@@ -136,6 +136,11 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     freezes on every minted material. A GPU loop and `pool.compileShape()`
     (claimed slots, used shapes) bring it to 50 kB. Measure the floor's kB
     (bindings smoke) before adding anything to the medium.
+21. Reflected caustics leave AWAY from the sun; a receiver on the sun's side
+    is physically dark. A reflection focuses ~8× closer than a refraction,
+    so the reflected lens keeps the floor map's focus from D/8 up.
+22. The refraction column must end at the first wall, not at floor depth —
+    a grazing exit point outside the pool reads the sky inside the water.
 19. Caustic receivers: the window reaches past the rim by the beams' lateral
     travel; walls read the map at the grazing mip plus a defocus that grows
     with height above the floor; the caustic light's cosine is the geometric
