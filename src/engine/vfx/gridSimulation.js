@@ -3,7 +3,8 @@ import { Fn, If, float, int, instanceIndex, instancedArray, select, storage, uni
 import { MAX_CLOTH_ANCHORS, resolveClothAnchors } from "./clothAnchors.js";
 import { createWaterSpectrum, seaDisplacementAt, seaFoamNode, seaJacobianAt } from "./waterSpectrum.js";
 import { GRAVITY } from "./waterSpectrumCPU.js";
-import { WATER_CELL_METRES, waterAutoResolution } from "./waterVolume.js";
+import { WATER_CELL_METRES, waterAutoResolution, waterProfileRadius, waterVolumeShape } from "./waterVolume.js";
+import { waterProfileRadiusNode, waterRimDistanceNode } from "./waterShape.js";
 import { Vector2, Vector4 } from "three/webgpu";
 
 /**
@@ -98,6 +99,12 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const clipHalf = (CLIP_SIZE - 1) / 2;
   const clipCoarsest = { x: clipCell.x * 2 ** Math.max(0, clipLevels - 1), z: clipCell.z * 2 ** Math.max(0, clipLevels - 1) };
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  // ── THE SHAPE: a box, or a solid of revolution (see waterVolume.js) ───────
+  const shape = kind === "water" ? waterVolumeShape(props) : null;
+  const round = !!shape && shape.kind !== 0;
+  // A round shell follows its profile down in rings; a box has a top and a
+  // bottom ring and a floor quad, as it always had.
+  const SHELL_RINGS = round ? 12 : 2;
   // ── THE SEA IS A SEPARATE FIELD, TILING IN WORLD METRES ───────────────────
   //
   // The spectral cascades (`waterSpectrum.js`) do not know how big this box
@@ -132,8 +139,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // and lit a visible seam into all four corners of the body. Duplicated, each
   // wall is flat to its own normal and the corner is the hard edge it is.
   const ringLength = kind === "water" ? 4 * rimN : 0;
-  const WALL_TOP = count, WALL_BOTTOM = count + ringLength, FLOOR = count + ringLength * 2;
-  const total = kind === "water" ? FLOOR + 4 : count;
+  const WALL_TOP = count, WALL_BOTTOM = count + ringLength * (SHELL_RINGS - 1), FLOOR = count + ringLength * SHELL_RINGS;
+  const total = kind === "water" ? FLOOR + (round ? 1 : 4) : count;
   const ringCell = (k) => {
     const e = Math.floor(k / rimN), i = k % rimN;
     return e === 0 ? [i, 0] : e === 1 ? [rimN - 1, i] : e === 2 ? [rimN - 1 - i, rimN - 1] : [0, rimN - 1 - i];
@@ -185,6 +192,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     rippleSponge: uniform(new Vector4(0, 0, 0, 0)),
     // The clipmap's shared centre (local x, z), snapped to the coarsest cell.
     clipCenter: uniform(new Vector2(0, 0)),
+    // The volume's shape (kind, radius, centerY, height) — see waterShape.js.
+    shape: uniform(new Vector4(shape?.kind ?? 0, shape?.radius ?? .5, shape?.centerY ?? 0, shape?.height ?? 1)),
     waveOctaves: uniform(4), waveGain: uniform(.5), surfaceDetail: uniform(.6),
     choppiness: uniform(.35), rippleStrength: uniform(.25),
     color: uniform(new THREE.Color()), deepColor: uniform(new THREE.Color()), waterDepth: uniform(2), absorption: uniform(0), saturation: uniform(.35),
@@ -214,9 +223,21 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const index = instanceIndex.toInt();
   // Solver cell coordinates (w×w); the render mesh has its own below.
   const x = index.mod(w), y = index.div(w);
+  const gridRest = (ix, iy) => vec3(ix.toFloat().mul(dx).sub(width / 2), 0, iy.toFloat().mul(dy).sub(height / 2));
+  // A round lid: every grid point outside the cross-section is pulled radially
+  // onto its outline, so the lid's edge hugs the shape and the triangles
+  // beyond it collapse onto the rim.
+  const lidRadius = () => waterProfileRadiusNode(u.shape, float(0));
+  const lidClamp = (rest) => {
+    if (!round) return rest;
+    const rr = vec2(rest.x, rest.z).length();
+    const k = lidRadius().div(rr.max(1e-6)).min(1);
+    return vec3(rest.x.mul(k), rest.y, rest.z.mul(k));
+  };
+  const insideLid = (x, z) => waterRimDistanceNode(u.shape, u.halfExtent, x, z).greaterThan(0);
   const initial = (ix, iy) => kind === "cloth"
     ? vec3(ix.toFloat().mul(dx).sub(width / 2), float(height).sub(iy.toFloat().mul(dy)), 0)
-    : vec3(ix.toFloat().mul(dx).sub(width / 2), 0, iy.toFloat().mul(dy).sub(height / 2));
+    : lidClamp(gridRest(ix, iy));
   // A solver cell's rest position in LOCAL units: the window's centre plus
   // the cell's offset from the window's middle.
   const cellLocal = (ix, iy) => vec3(u.rippleCenter.x.add(ix.toFloat().sub((w - 1) / 2).mul(sx)), 0, u.rippleCenter.y.add(iy.toFloat().sub((w - 1) / 2).mul(sz)));
@@ -303,8 +324,12 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       const at = (ix, iy) => iy.mul(w).add(ix);
       const west = at(x.sub(1).max(0), y), east = at(x.add(1).min(w - 1), y);
       const north = at(x, y.sub(1).max(0)), south = at(x, y.add(1).min(w - 1));
-      const l = positions.element(west).y, r = positions.element(east).y;
-      const t = positions.element(north).y, b = positions.element(south).y;
+      // Beyond a round outline the neighbour is the wall: it holds this cell's
+      // own height, and no wave crosses it (a Neumann boundary, as the window
+      // edge and the box rim already are).
+      const wallOr = (ix, iy, value) => (round ? select(insideLid(cellLocal(ix, iy).x, cellLocal(ix, iy).z), value, p.y) : value);
+      const l = wallOr(x.sub(1), y, positions.element(west).y), r = wallOr(x.add(1), y, positions.element(east).y);
+      const t = wallOr(x, y.sub(1), positions.element(north).y), b = wallOr(x, y.add(1), positions.element(south).y);
       // ── CFL, WITH ACTUAL HEADROOM ───────────────────────────────────────
       //
       // The 2-D limit is on the SUM of the two axes' coefficients, and each is
@@ -355,9 +380,16 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // while a swell decayed. Diffusing the Verlet velocity multiplies exactly
       // that mode by (1 − 2ν) instead, and leaves a long wave alone because a
       // long wave's neighbours share its velocity.
+      // ⚠ THE WALL RULE APPLIES TO THE HISTORY TOO. The viscosity averages the
+      // neighbours' VELOCITIES, height minus history; a dry neighbour whose
+      // height reads as this cell's own (the wall) but whose history reads
+      // its zeroed value contributes height/4 as a "velocity" every substep —
+      // positive feedback that took a cylinder's whole field to the ripple
+      // limit within a splash (premium ?shape=cylinder, 2026-09-06).
+      const oldOr = (ix, iy, value) => (round ? select(insideLid(cellLocal(ix, iy).x, cellLocal(ix, iy).z), value, old.y) : value);
       const meanVelocity = l.add(r).add(t).add(b).mul(.25)
-        .sub(previous.element(west).y.add(previous.element(east).y)
-          .add(previous.element(north).y).add(previous.element(south).y).mul(.25));
+        .sub(oldOr(x.sub(1), y, previous.element(west).y).add(oldOr(x.add(1), y, previous.element(east).y))
+          .add(oldOr(x, y.sub(1), previous.element(north).y)).add(oldOr(x, y.add(1), previous.element(south).y)).mul(.25));
       const velocity = p.y.sub(old.y);
       next.y.assign(p.y.add(velocity.add(meanVelocity.sub(velocity).mul(u.viscosity)).mul(u.damping)));
       next.y.addAssign(l.add(r).sub(p.y.mul(2)).div(sx * sx).add(t.add(b).sub(p.y.mul(2)).div(sz * sz)).mul(speed.mul(speed)).mul(h * h));
@@ -426,6 +458,11 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const commit = Fn(() => {
     const next = scratch.element(index).toVar();
     if (kind === "water") next.y.assign(next.y.clamp(u.rippleLimit.negate(), u.rippleLimit));
+    if (round) {
+      const wet = select(insideLid(next.x, next.z), float(1), float(0));
+      next.y.mulAssign(wet); next.w.mulAssign(wet);
+      previous.element(index).y.mulAssign(wet);
+    }
     if (kind === "water" && windowed) {
       // The sponge: position AND history scaled together, so the amplitude
       // shrinks without a velocity kick (see `SPONGE_CELLS`).
@@ -564,6 +601,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const edgeHold = (p) => {
     const mx = float(Math.min(width, height) * .12).min(float(2).div(u.waveScale.x));
     const mz = float(Math.min(width, height) * .12).min(float(2).div(u.waveScale.z));
+    if (round) return waterRimDistanceNode(u.shape, u.halfExtent, p.x, p.z).div(mx.min(mz)).clamp(0, 1);
     return float(width / 2).sub(p.x.abs()).div(mx).clamp(0, 1).mul(float(height / 2).sub(p.z.abs()).div(mz).clamp(0, 1));
   };
   const seaAt = (p) => seaDisplacementAt(spectrum, vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z)), u.seaLod);
@@ -579,9 +617,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // ── CLIPMAP RINGS (see CLIP_ABOVE_METRES) ─────────────────────────────────
   const clipRest = (level, i, j) => {
     const cell = float(2).pow(level.toFloat());
-    return vec3(
+    return lidClamp(vec3(
       u.clipCenter.x.add(i.toFloat().sub(clipHalf).mul(cell).mul(clipCell.x)).clamp(-width / 2, width / 2), 0,
-      u.clipCenter.y.add(j.toFloat().sub(clipHalf).mul(cell).mul(clipCell.z)).clamp(-height / 2, height / 2));
+      u.clipCenter.y.add(j.toFloat().sub(clipHalf).mul(cell).mul(clipCell.z)).clamp(-height / 2, height / 2)));
+  };
+  const clipRestUnclamped = (level, i, j) => {
+    const cell = float(2).pow(level.toFloat());
+    return vec3(u.clipCenter.x.add(i.toFloat().sub(clipHalf).mul(cell).mul(clipCell.x)), 0, u.clipCenter.y.add(j.toFloat().sub(clipHalf).mul(cell).mul(clipCell.z)));
   };
   const clipPoint = (level, i, j) => {
     const lf = level.toFloat();
@@ -732,19 +774,45 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const skirtVertex = kind === "water" ? () => {
     const m = rimN - 1;
     const k = index.sub(count).toVar();
-    If(k.lessThan(ringLength * 2), () => {
-      const ring = k.mod(ringLength).toVar();
+    If(k.lessThan(ringLength * SHELL_RINGS), () => {
+      const ring = k.mod(ringLength).toVar(), j = k.div(ringLength).toVar();
       const edge = ring.div(rimN).toVar(), along = ring.mod(rimN).toVar();
       const ix = int(0).toVar(), iz = int(0).toVar(), outward = vec3(0).toVar();
       If(edge.equal(int(0)), () => { ix.assign(along); iz.assign(int(0)); outward.assign(vec3(0, 0, -1)); })
         .ElseIf(edge.equal(int(1)), () => { ix.assign(int(m)); iz.assign(along); outward.assign(vec3(1, 0, 0)); })
         .ElseIf(edge.equal(int(2)), () => { ix.assign(int(m).sub(along)); iz.assign(int(m)); outward.assign(vec3(0, 0, 1)); })
         .Else(() => { ix.assign(int(0)); iz.assign(int(m).sub(along)); outward.assign(vec3(-1, 0, 0)); });
+      if (round) {
+        // Ring j sits at its height on the profile, along the direction of
+        // the grid's rim point; ring 0 is the lid's own boundary vertex (the
+        // same rest, the same surface), so the shell meets the lid exactly.
+        const grid = clip ? clipRestUnclamped(int(clipLevels - 1), ix, iz) : gridRest(ix, iz);
+        const dir = vec2(grid.x, grid.z).normalize();
+        const yj = u.waterDepth.negate().mul(j.toFloat().div(SHELL_RINGS - 1));
+        const rho = waterProfileRadiusNode(u.shape, yj);
+        const slope = waterProfileRadiusNode(u.shape, yj.add(1e-3)).sub(waterProfileRadiusNode(u.shape, yj.sub(1e-3))).div(2e-3);
+        // ⚠ THE LID'S OWN EXPRESSION, bit for bit — `lidClamp(grid)` is what the
+        // lid vertex at this rim point computes; `dir · radius` is the same
+        // point in exact arithmetic and a few ulps off in float, which a wake
+        // piled against the wall turns into a millimetre seam.
+        const top = lidSurfaceAt(lidClamp(grid));
+        if (foamOut) foamOut.element(index).assign(float(0));
+        normals.element(index).assign(vec3(dir.x, slope.negate(), dir.y).normalize());
+        output.element(index).assign(select(j.equal(int(0)), top, vec3(dir.x.mul(rho), yj, dir.y.mul(rho))));
+        return;
+      }
       const rim = (clip ? clipPoint(int(clipLevels - 1), ix, iz) : surfacePosition(iz.mul(n).add(ix))).toVar();
       if(foamOut)foamOut.element(index).assign(float(0));
       normals.element(index).assign(outward);
       output.element(index).assign(vec3(rim.x, select(k.lessThan(ringLength), rim.y, u.waterDepth.negate()), rim.z));
     }).Else(() => {
+      if (round) {
+        // The one vertex the bottom fan closes on.
+        if (foamOut) foamOut.element(index).assign(float(0));
+        normals.element(index).assign(vec3(0, -1, 0));
+        output.element(index).assign(vec3(0, u.waterDepth.negate(), 0));
+        return;
+      }
       const corner = k.sub(ringLength * 2).toVar();
       if(foamOut)foamOut.element(index).assign(float(0));
       normals.element(index).assign(vec3(0, -1, 0));
@@ -783,7 +851,9 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // Keep an authored rest surface on the CPU for editor picking/bounds.
     // Render and shadow passes read the GPU-deformed attribute. Raycasts are
     // intentionally rest-surface approximations, not collision geometry.
-    positionAttribute.setXYZ(i, ix * dx - width / 2, kind === "cloth" ? height - iy * dy : 0, kind === "cloth" ? 0 : iy * dy - height / 2);
+    let px = ix * dx - width / 2, pz = iy * dy - height / 2;
+    if (round) { const k = Math.min(1, waterProfileRadius(shape, 0) / Math.max(1e-6, Math.hypot(px, pz))); px *= k; pz *= k; }
+    positionAttribute.setXYZ(i, px, kind === "cloth" ? height - iy * dy : 0, kind === "cloth" ? 0 : pz);
     normalAttribute.setXYZ(i, 0, kind === "water" ? 1 : 0, kind === "cloth" ? 1 : 0);
     if (ix < n - 1 && iy < n - 1) indices.push(i, i + n, i + 1, i + 1, i + n, i + n + 1);
   }
@@ -796,6 +866,21 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     for (let k = 0; k < ringLength; k++) {
       const [ix, iz] = ringCell(k), nrm = ringNormal(k);
       const [px, pz] = rimRest(ix, iz);
+      if (round) {
+        const len = Math.hypot(px, pz) || 1, ux = px / len, uz = pz / len;
+        for (let j = 0; j < SHELL_RINGS; j++) {
+          const py = -restDepth * j / (SHELL_RINGS - 1), rho = waterProfileRadius(shape, py);
+          const slot = WALL_TOP + j * ringLength;
+          positionAttribute.setXYZ(slot + k, ux * rho, py, uz * rho);
+          normalAttribute.setXYZ(slot + k, ux, 0, uz);
+          uv[(slot + k) * 2] = k / ringLength; uv[(slot + k) * 2 + 1] = 1 - j / (SHELL_RINGS - 1);
+          if (j === SHELL_RINGS - 1 || k % rimN === rimN - 1) continue;
+          const next = k + 1, TOP = slot, BOT = slot + ringLength;
+          indices.push(TOP + k, TOP + next, BOT + k, TOP + next, BOT + next, BOT + k);
+        }
+        if (k % rimN !== rimN - 1) indices.push(WALL_BOTTOM + k, WALL_BOTTOM + k + 1, FLOOR);
+        continue;
+      }
       for (const [slot, py] of [[WALL_TOP, 0], [WALL_BOTTOM, -restDepth]]) {
         positionAttribute.setXYZ(slot + k, px, py, pz);
         normalAttribute.setXYZ(slot + k, nrm[0], nrm[1], nrm[2]);
@@ -812,13 +897,17 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       const next = k + 1;
       indices.push(WALL_TOP + k, WALL_TOP + next, WALL_BOTTOM + k, WALL_TOP + next, WALL_BOTTOM + next, WALL_BOTTOM + k);
     }
-    const corners = [[-width / 2, -height / 2], [width / 2, -height / 2], [width / 2, height / 2], [-width / 2, height / 2]];
-    for (let c = 0; c < 4; c++) {
-      positionAttribute.setXYZ(FLOOR + c, corners[c][0], -restDepth, corners[c][1]);
-      normalAttribute.setXYZ(FLOOR + c, 0, -1, 0);
-      uv[(FLOOR + c) * 2] = c === 1 || c === 2 ? 1 : 0; uv[(FLOOR + c) * 2 + 1] = c >= 2 ? 1 : 0;
+    if (round) {
+      positionAttribute.setXYZ(FLOOR, 0, -restDepth, 0); normalAttribute.setXYZ(FLOOR, 0, -1, 0); uv[FLOOR * 2] = .5; uv[FLOOR * 2 + 1] = .5;
+    } else {
+      const corners = [[-width / 2, -height / 2], [width / 2, -height / 2], [width / 2, height / 2], [-width / 2, height / 2]];
+      for (let c = 0; c < 4; c++) {
+        positionAttribute.setXYZ(FLOOR + c, corners[c][0], -restDepth, corners[c][1]);
+        normalAttribute.setXYZ(FLOOR + c, 0, -1, 0);
+        uv[(FLOOR + c) * 2] = c === 1 || c === 2 ? 1 : 0; uv[(FLOOR + c) * 2 + 1] = c >= 2 ? 1 : 0;
+      }
+      indices.push(FLOOR, FLOOR + 1, FLOOR + 2, FLOOR, FLOOR + 2, FLOOR + 3);
     }
-    indices.push(FLOOR, FLOOR + 1, FLOOR + 2, FLOOR, FLOOR + 2, FLOOR + 3);
   }
   // ⚠ THE SHELL IS ITS OWN MESH, SHARING THE SAME VERTICES.
   //
@@ -1016,6 +1105,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const direction = finite(p.waveDirection, 0, -180, 180) * Math.PI / 180;
     u.waveCos.value = Math.cos(direction); u.waveSin.value = Math.sin(direction);
     u.waterDepth.value = finite(p.waterDepth, 2, 0, 100);
+    if (shape) { const s = waterVolumeShape(p); Object.assign(shape, s); u.shape.value.set(s.kind, s.radius, s.centerY, s.height); }
     // `absorption` is DERIVED now — see `waterSaturation`. The uniform stays
     // because it is what the shading graph, the caustic transmittance and the
     // medium all integrate over a path; the authored number is the end state.
@@ -1087,6 +1177,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     },
     /** The window's centre in local units (a Vector2: x, z). */
     get rippleCenter() { return u.rippleCenter.value; },
+    /** The volume's shape (kind, radius, centerY, height) in local units — see waterVolume.js. */
+    shape,
     /** The lid's layout: clipmap rings over a wide pool, or null for the flat grid. */
     clip: clip ? { levels: clipLevels, size: CLIP_SIZE, cell: clipCell, get center() { return u.clipCenter.value; } } : null,
     /** The sea as the CPU last saw it — `waterPhysics.js` floats bodies on this. */

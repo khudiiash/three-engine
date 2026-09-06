@@ -12,6 +12,9 @@ const _cameraWorld = new Vector3(), _waterInverse = new Matrix4();
 import { ParticleColliderField } from "../particleColliders.js";
 import { ClothMeshColliderField } from "../clothMeshColliders.js";
 
+/** The source primitives water can fill (the plane is the open-water case). */
+const WATER_SOLIDS = new Set(["box", "cylinder", "sphere", "cone", "capsule"]);
+
 export const gridSchema = [
   { key: "asset", label: "VFX asset", type: "asset", exts: ["vfx"] },
   { key: "resolution", label: "Grid resolution", type: "number", min: 4, max: 512, step: 1 },
@@ -50,11 +53,19 @@ export class GridSimulationComponent extends Component {
     if (!mesh || component.props.geometryAsset) return null;
     const kind = component.props.geometry;
     const geometry = mesh.geometry;
-    if (kind === "box" && this.constructor.type === "water") {
+    if (WATER_SOLIDS.has(kind) && this.constructor.type === "water") {
+      // ── ANY SOLID PRIMITIVE IS A CONTAINER ──────────────────────────────
+      //
+      // The water fills it to `fill` of its height; the lid is the
+      // cross-section there (waterVolume.js#waterVolumeShape). A box is the
+      // kind it always was, full by default.
       geometry.computeBoundingBox();
       const size = geometry.boundingBox.getSize(new Vector3());
       if (!(size.x > 0 && size.y > 0 && size.z > 0)) return null;
-      return { component, mesh, geometry, box: true, width: size.x, height: size.z, depth: size.y, center: geometry.boundingBox.getCenter(new Vector3()) };
+      const fill = Math.min(1, Math.max(.05, Number(this.props.fill ?? 1) || 1));
+      const params = geometry.parameters ?? {};
+      const radius = kind === "box" ? size.x / 2 : (params.radius ?? params.radiusBottom ?? params.radiusTop ?? size.x / 2);
+      return { component, mesh, geometry, box: true, shape: kind, radius, fullHeight: size.y, fill, width: size.x, height: size.z, depth: size.y * fill, center: geometry.boundingBox.getCenter(new Vector3()) };
     }
     if (kind !== "plane") return null;
     geometry.computeBoundingBox();
@@ -67,6 +78,7 @@ export class GridSimulationComponent extends Component {
   sourceProps(plane) {
     if (!plane) return {};
     const props = { width: plane.width, height: plane.height, ...(plane.depth != null ? { waterDepth: plane.depth } : null) };
+    if (this.constructor.type === "water") Object.assign(props, { shapeKind: plane.shape ?? "box", shapeRadius: plane.radius ?? plane.width / 2, shapeHeight: plane.fullHeight ?? plane.depth ?? undefined });
     // ── WATER'S GRID FOLLOWS ITS WORLD SIZE ──────────────────────────────
     //
     // Cells at a fixed size in METRES (`waterAutoResolution`), so a 0.5 m
@@ -191,7 +203,8 @@ export class GridSimulationComponent extends Component {
       // below it. A Plane is authored lying in XY, so it needs the +90° that
       // puts the grid in XZ; a BOX is already Y-up and instead needs its origin
       // lifted from the box centre to the box lid.
-      mesh.matrix.multiply(new Matrix4().makeTranslation(source.center.x, source.center.y + (source.box ? source.depth / 2 : 0), source.center.z));
+      // (A container filled to `fill`: the lid sits `depth` above its bottom.)
+      mesh.matrix.multiply(new Matrix4().makeTranslation(source.center.x, source.center.y + (source.box ? source.depth - (source.fullHeight ?? source.depth) / 2 : 0), source.center.z));
       if (!source.box) mesh.matrix.multiply(new Matrix4().makeRotationX(Math.PI / 2));
     } else mesh.matrix.multiply(new Matrix4().makeTranslation(source.center.x, source.center.y - source.height / 2, source.center.z));
     mesh.matrixAutoUpdate = false;
@@ -235,7 +248,7 @@ export class GridSimulationComponent extends Component {
     // (including a switch between the two, which mints a new geometry) falls
     // through to the rebuild below.
     const kind = component?.props.geometry;
-    const valid = mesh && !component.props.geometryAsset && (kind === "plane" || (kind === "box" && this.constructor.type === "water"));
+    const valid = mesh && !component.props.geometryAsset && (kind === "plane" || (WATER_SOLIDS.has(kind) && this.constructor.type === "water"));
     if ((!source && valid) || (source && (!valid || mesh !== source.mesh || mesh.geometry !== source.geometry || mesh.geometry.getAttribute("position")?.version !== this.sourceGeometryVersion || JSON.stringify(mesh.geometry.groups) !== this.sourceGroups))) {
       this.detachSimulation(); this.attachSimulation();
     } else if (source && this.constructor.type === "water" && this.simulation && this.gridOutgrown(source)) {
@@ -280,7 +293,7 @@ export class GridSimulationComponent extends Component {
     const previous = this.resolvedProps;
     this.resolveGraph();
     if (this.planeSource) this.resolvedProps = { ...this.resolvedProps, ...this.sourceProps(this.planeSource) };
-    if (!this.simulation || ["resolution", "width", "height", "sceneCollision"].some((field) => previous?.[field] !== this.resolvedProps[field])) { this.detachSimulation(); this.attachSimulation(); }
+    if (!this.simulation || ["resolution", "width", "height", "sceneCollision", "fill"].some((field) => previous?.[field] !== this.resolvedProps[field])) { this.detachSimulation(); this.attachSimulation(); }
     else {
       this.simulation.update(this.resolvedProps);
       if (previous?.amplitude !== this.resolvedProps.amplitude || previous?.pinning !== this.resolvedProps.pinning) this.restart();

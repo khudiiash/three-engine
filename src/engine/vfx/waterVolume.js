@@ -134,3 +134,42 @@ export function waterAutoResolution(worldSize) {
   if (!Number.isFinite(size) || size <= 0) return 128;
   return Math.min(WATER_MAX_RESOLUTION, Math.max(WATER_MIN_RESOLUTION, Math.round(size / WATER_CELL_METRES)));
 }
+
+/**
+ * ══ THE VOLUME IS A PRIMITIVE, NOT ALWAYS A BOX ════════════════════════════
+ *
+ * "Make it work for other primitive geometries like cylinder, sphere, cone"
+ * (user, 2026-09-06). The source mesh's primitive is the container; the water
+ * fills it to `fill` of its height, and the lid is the cross-section there.
+ * In the solver's local frame (origin ON the lid, water below):
+ *
+ *     kind      0 box · 1 cylinder · 2 sphere · 3 cone (apex +Y) · 4 capsule
+ *     radius    the primitive's own radius (a box: half its width)
+ *     centerY   where the primitive's centre sits: height/2 − depth (≤ 0 once
+ *               the water is at least half full)
+ *     height    the primitive's full height
+ *
+ * `waterProfileRadius(shape, y)` is the cross-section radius at a height —
+ * the whole shape, for everything that asks. `waterShape.js` is the same in TSL.
+ */
+export const WATER_SHAPES = { box: 0, cylinder: 1, sphere: 2, cone: 3, capsule: 4 };
+export function waterVolumeShape(props = {}) {
+  const kind = WATER_SHAPES[props.shapeKind] ?? 0;
+  const extent = waterVolumeExtent(props);
+  const radius = finite(props.shapeRadius, extent.halfX, 1e-4, 1e4);
+  const height = finite(props.shapeHeight, extent.depth, 1e-4, 1e4);
+  return { kind, radius, centerY: height / 2 - extent.depth, height };
+}
+export function waterProfileRadius(shape, y) {
+  const r = shape.radius, q = y - shape.centerY, h = Math.max(1e-4, shape.height);
+  switch (shape.kind) {
+    case 2: return Math.sqrt(Math.max(0, r * r - q * q));
+    case 3: return Math.max(0, r * (h / 2 - q) / h);
+    case 4: { const half = Math.max(0, h - 2 * r) / 2; const over = Math.max(0, Math.abs(q) - half); return Math.sqrt(Math.max(0, r * r - over * over)); }
+    default: return r;
+  }
+}
+/** Is local (x, z) inside the lid's outline? */
+export function waterInsideXZ(shape, extent, x, z) {
+  return shape.kind === 0 ? Math.abs(x) <= extent.halfX && Math.abs(z) <= extent.halfZ : Math.hypot(x, z) <= waterProfileRadius(shape, 0);
+}

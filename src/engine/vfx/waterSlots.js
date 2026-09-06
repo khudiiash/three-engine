@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import { Fn, dFdx, dFdy, float, instanceIndex, int, ivec2, refract, select, storageTexture, texture, uniform, uv as uvAttribute, varying, vec2, vec3, vec4 } from "three/tsl";
 import { seaDisplacementAt, seaSlopeAt } from "./waterSpectrum.js";
+import { waterRimDistanceNode } from "./waterShape.js";
 
 /** The ripple window's sample at a LOCAL point: (height, normal.x, normal.z,
  *  foam), zero outside the window. Shared by the slot kernel and the lens. */
@@ -140,6 +141,8 @@ function createSlot(index) {
       inverse: uniform(new THREE.Matrix4()),
       // (halfX, depth, halfZ), local units.
       half: uniform(new THREE.Vector3(1, 1, 1)),
+      // (kind, radius, centerY, height) — see waterShape.js.
+      shape: uniform(new THREE.Vector4(0, .5, 0, 1)),
       rise: uniform(1),
       sigma: uniform(new THREE.Vector3()),
       scatter: uniform(new THREE.Color(0, 0, 0)),
@@ -408,7 +411,10 @@ export function createWaterCausticPass({ slot, rippleTexture = null, rippleResol
   const oldPos = varying(reference, "waterCausticOld");
   // Draw in the WINDOW's own space: the map covers it exactly, so a landing
   // point maps straight to NDC and a beam landing outside it is clipped.
-  material.vertexNode = vec4(landed.x.sub(center.x).div(half2.x), landed.z.sub(center.y).div(half2.y).negate(), 0, 1);
+  // A beam that starts outside the lid's outline (a round pool's corners) is
+  // no beam: it leaves the ortho camera's depth range and is clipped.
+  const dry = waterRimDistanceNode(vec4(u.shape), half, rest.x, rest.z).lessThan(0);
+  material.vertexNode = vec4(landed.x.sub(center.x).div(half2.x), landed.z.sub(center.y).div(half2.y).negate(), select(dry, float(2), float(0)), 1);
   material.colorNode = Fn(() => {
     const oldArea = dFdx(oldPos).length().mul(dFdy(oldPos).length());
     const newArea = dFdx(newPos).length().mul(dFdy(newPos).length());

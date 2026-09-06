@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { float, mix, normalWorld, positionWorld, select, vec2, vec3, vec4 } from 'three/tsl';
 import { CAUSTIC_RESOLUTION, CAUSTIC_WINDOW_METRES, waterSlotPool } from './waterSlots.js';
+import { waterInsideNode, waterRimDistanceNode } from './waterShape.js';
 
 const registered = new WeakSet();
 
@@ -73,8 +74,7 @@ export function waterCausticGainLocalNode(P, slot, level = 0) {
   // and `d` below simply stops accumulating at the volume's own depth.
   const depth = local.y.negate().toVar();
   const d = depth.min(s.half.y).toVar();
-  const inside = local.x.abs().lessThan(s.half.x).and(local.z.abs().lessThan(s.half.z))
-    .and(depth.greaterThan(0));
+  const inside = waterInsideNode(vec4(s.shape), s.half, local);
   // The map is in FLOOR parameterization, so follow this point's own beam DOWN
   // to where the splat recorded it rather than walking back up to the surface.
   const rise = s.flatRay.y.negate().max(.05);
@@ -147,8 +147,7 @@ export function waterCausticAboveNode(P, slot) {
   const s = slot.uniforms;
   const local = s.inverse.mul(vec4(P, 1)).xyz.toVar();
   const height = local.y.toVar();
-  const inside = local.x.abs().lessThan(s.half.x).and(local.z.abs().lessThan(s.half.z))
-    .and(height.greaterThan(0));
+  const inside = waterRimDistanceNode(vec4(s.shape), s.half, local.x, local.z).greaterThan(0).and(height.greaterThan(0));
   // Back down the reflected beam to the surface it left.
   const ray = vec3(s.mirrorRay).toVar();            // LOCAL units, pointing down
   const climb = ray.y.negate().max(.05);
@@ -296,6 +295,7 @@ export function updateWaterSlot({ engine, slot, kernel, mesh, simulation, props 
   const scale = Math.max(1e-4, axisX.length(), axisY.length(), axisZ.length());
   simulation.uniforms.refraction.value = REFRACTION_METRES * (simulation.uniforms.transmission.value ?? 1) / scale;
   s.half.value.set(simulation.extent.halfX, Math.max(.01, simulation.extent.depth), simulation.extent.halfZ);
+  if (simulation.shape) s.shape.value.set(simulation.shape.kind, simulation.shape.radius, simulation.shape.centerY, simulation.shape.height);
   // ── THE CAUSTIC WINDOW FOLLOWS THE CAMERA, SNAPPED TO ITS TEXELS ────────
   //
   // Half-size: the pool, or `CAUSTIC_WINDOW_METRES` across, whichever is

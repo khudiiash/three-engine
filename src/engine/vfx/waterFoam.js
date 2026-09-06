@@ -2,6 +2,7 @@ import {
   Fn, attribute, cameraFar, cameraNear, cameraPosition, float, linearDepth, mix, positionLocal, positionWorld,
   screenUV, select, texture, vec2, vec3,
 } from "three/tsl";
+import { waterRimDistanceNode } from "./waterShape.js";
 
 /**
  * ══ WHAT A WATER SURFACE ADDS ON TOP OF BEING A MIRROR ═════════════════════
@@ -154,7 +155,10 @@ function waterFoamBody(u, sceneDepth) {
   // count is a property of the texture). Without one, contact is the pool's
   // own rim: the box's edges in world metres, which binds nothing at all.
   const halfW = u.waveScale.x.mul(u.halfExtent.x), halfH = u.waveScale.z.mul(u.halfExtent.z);
-  const toRim = halfW.sub(p.x.abs()).min(halfH.sub(p.y.abs())).max(0);
+  // Metres to the lid's outline: the box's rim, or a round pool's wall.
+  const boxRim = halfW.sub(p.x.abs()).min(halfH.sub(p.y.abs()));
+  const roundRim = waterRimDistanceNode(u.shape, u.halfExtent, p.x.div(u.waveScale.x), p.y.div(u.waveScale.z)).mul(u.waveScale.x.min(u.waveScale.z));
+  const toRim = select(u.shape.x.lessThan(.5), boxRim, roundRim).max(0);
   const rimContact = toRim.smoothstep(width.mul(.15), width).oneMinus();
   let contact = rimContact;
   if (sceneDepth) {

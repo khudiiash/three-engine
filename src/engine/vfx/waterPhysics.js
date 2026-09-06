@@ -1,6 +1,6 @@
 import { Quaternion, Vector3 } from 'three/webgpu';
 import { seaHeightAt } from './waterSpectrumCPU.js';
-import { waterSurfaceFrame, waterVolumeExtent } from './waterVolume.js';
+import { waterInsideXZ, waterSurfaceFrame, waterVolumeExtent, waterVolumeShape } from './waterVolume.js';
 
 /**
  * ══ WATER IS WATER, AND MOST OF THESE WERE NEVER SETTINGS ══════════════════
@@ -64,13 +64,13 @@ const finite=(v,d,min=0,max=1e6)=>Number.isFinite(Number(v))?Math.min(max,Math.m
 export function createWaterSurfaceQuery(mesh, props, time, sea = null) {
   const frame=waterSurfaceFrame(mesh);
   if(!frame.horizontal) return () => null;
-  const extent=waterVolumeExtent(props);
+  const extent=waterVolumeExtent(props), shape=waterVolumeShape(props);
   // One local unit of height is `rise` world metres of rise. A degenerate
   // (flattened) mesh has none, and then no depth is expressible.
   if(!(Math.abs(frame.rise)>1e-6)) return () => null;
   return (point) => {
   const world=new Vector3(point.x,point.y,point.z),local=world.clone().applyMatrix4(frame.inverse);
-  if(Math.abs(local.x)>extent.halfX || Math.abs(local.z)>extent.halfZ) return null;
+  if(!waterInsideXZ(shape,extent,local.x,local.z)) return null;
   const height=sea?.cascades?.length?seaHeightAt(sea.cascades,local.x*frame.scale.x,local.z*frame.scale.z)/frame.scale.y:0;
   const worldHeight=world.y+(height-local.y)*frame.rise;
   return {height:worldHeight,bottom:worldHeight-extent.depth*Math.abs(frame.rise),localX:local.x,localZ:local.z};

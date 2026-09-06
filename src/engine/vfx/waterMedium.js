@@ -2,6 +2,7 @@ import * as THREE from "three/webgpu";
 import { Fn, If, cameraPosition, float, fract, interleavedGradientNoise, mix, output, positionWorld, screenCoordinate, select, uniform, vec2, vec3, vec4 } from "three/tsl";
 import { waterSlotPool } from "./waterSlots.js";
 import { waterCausticGainLocalNode } from "./waterCaustics.js";
+import { clipShapeNode } from "./waterShape.js";
 
 /**
  * ══ UNDERWATER IS NOT A TOGGLE, IT IS A PATH LENGTH ════════════════════════
@@ -77,6 +78,8 @@ export function waterSegmentNode(slot) {
   const t0 = float(0).toVar(), t1 = float(1).toVar();
   clipSlab(t0, t1, a.x, d.x, half.x.negate(), half.x);
   clipSlab(t0, t1, a.z, d.z, half.z.negate(), half.z);
+  // A solid of revolution: one exact quadric clip on top of the slabs.
+  clipShapeNode(vec4(s.shape), t0, t1, a, d);
   // THE TOP FACE IS THE WAVE, AND SAYING SO TAKES TWO PASSES. The entry point
   // is needed to sample the height and the height is needed to find the entry
   // point. Clip against the rest surface, sample there, clip again: one

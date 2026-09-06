@@ -33,7 +33,7 @@ export function simulationNodeTypes(kind) {
       ] : [
         select("style", "Water style", "realistic", ["realistic", "stylized"]),
         { key: "deepColor", label: "Deep water color", type: "color", default: "#063a52" },
-        number("waterDepth", "Optical depth (metres)", 2, 0, 100), number("saturation", "Water saturation", .45, 0, 1, .01),
+        number("waterDepth", "Optical depth (metres)", 2, 0, 100), number("fill", "Fill level", 1, .05, 1, .01), number("saturation", "Water saturation", .45, 0, 1, .01),
         number("transmission", "Refraction / transmission", .75, 0, 1, .01),
         number("foam", "Foam", .5, 0, 1, .01), number("foamThreshold", "Foam contact width (m)", .15, 0, 3, .01),
       ]),
