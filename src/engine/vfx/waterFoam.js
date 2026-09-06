@@ -3,6 +3,7 @@ import {
   screenUV, select, texture, vec2, vec3,
 } from "three/tsl";
 import { waterRimDistanceNode } from "./waterShape.js";
+import { seaDisplacementAt, seaFoamNode, seaJacobianAt } from "./waterSpectrum.js";
 
 /**
  * ══ WHAT A WATER SURFACE ADDS ON TOP OF BEING A MIRROR ═════════════════════
@@ -123,20 +124,31 @@ const worldXZ = (u) => vec2(positionLocal.x.mul(u.waveScale.x), positionLocal.z.
  * generation threshold in the solver) and gates this on or off; it is not a
  * dimmer, because half-transparent foam is a grey wash and not less foam.
  */
-export function waterFoamNode(u, sceneDepth = null) {
+export function waterFoamNode(u, sceneDepth = null, spectrum = null) {
   // ⚠ WRAPPED IN `Fn`, AND IT HAS TO BE. `toVar()` and `addAssign` allocate on
   // the builder's STACK, and a node factory called straight from a material
   // build has no stack — "No stack defined for assign operation". Anything here
   // that declares a variable belongs inside one of these.
-  return Fn(() => waterFoamBody(u, sceneDepth))();
+  return Fn(() => waterFoamBody(u, sceneDepth, spectrum))();
 }
-function waterFoamBody(u, sceneDepth) {
+function waterFoamBody(u, sceneDepth, spectrum) {
   const p = worldXZ(u);
   const clock = waveClock(u);
   const drift = clock.mul(.5);
 
   // The solver's own foam, and the contact term.
-  const simulated = attribute("waterFoam", "float").clamp(0, 1);
+  // ── WHITECAPS, PER PIXEL ──────────────────────────────────────────────
+  //
+  // The field's foam arrives per VERTEX, and a clipmap ring's vertices are
+  // metres apart and sample the Jacobian at coarse mips, where its extremes
+  // average away — an ocean at full choppiness showed no whitecaps at all
+  // (the ocean arm, 2026-09-06). The fold is read here at the pixel from the
+  // same cascades the shading normal reads, band-limited by their own mips.
+  let simulated = attribute("waterFoam", "float").clamp(0, 1);
+  if (spectrum) {
+    const cross = seaDisplacementAt(spectrum, p).w;
+    simulated = simulated.max(seaFoamNode(seaJacobianAt(spectrum, p, cross), u.foam));
+  }
   // The width itself is modulated, so the shoreline is ragged rather than a
   // uniform ring offset from the geometry.
   const ragged = fbm(p.mul(.7), clock, .7);
@@ -224,10 +236,16 @@ export function waterSubsurfaceNode(u, slot) {
   const toEye = cameraPosition.sub(positionWorld).normalize();
   const toSun = vec3(slot.uniforms.toSun);
   const through = toEye.dot(toSun).negate().max(0).pow(3);
+  // ⚠ IN METRES. `positionLocal.y` is in the lid's local units and `range`
+  // in metres; on a lid scaled by three the crest term saturated and every
+  // swell became a hard-edged green sheet (the ocean arm, 2026-09-06). And
+  // only the top of a crest is thin enough to glow: the upper quarter,
+  // smoothly, at a fraction of the in-scatter colour.
   const range = u.waveHeight.add(u.amplitude).max(.001);
-  const crest = positionLocal.y.div(range).mul(.5).add(.5).clamp(0, 1).smoothstep(.35, 1);
+  const height = positionLocal.y.mul(u.waveScale.y);
+  const crest = height.div(range).mul(.5).add(.5).clamp(0, 1).smoothstep(.6, 1).pow(1.5);
   const tint = mix(vec3(u.color), vec3(1), .25);
-  return vec3(slot.uniforms.scatter).mul(tint).mul(through.mul(crest).mul(1.6));
+  return vec3(slot.uniforms.scatter).mul(tint).mul(through.mul(crest).mul(.7));
 }
 
 /** Kept for the surface smoke, which asserts crest foam exists at all. */

@@ -1,15 +1,15 @@
-import { DepthTexture, DoubleSide, MeshBasicNodeMaterial, Object3D, StorageTexture, Vector3 } from 'three/webgpu';
+import { Color, DepthTexture, DoubleSide, MeshBasicNodeMaterial, Object3D, StorageTexture, Vector3 } from 'three/webgpu';
 import { WATER_REFRACTION_LAYER } from '../editorLayers.js';
 import { waterCausticGainNode } from './waterCaustics.js';
 import { applyMediumSegment } from './waterMedium.js';
 import {
   Fn, cameraFar, cameraNear, cameraPosition, cameraProjectionMatrix, cameraProjectionMatrixInverse, cameraViewMatrix, cameraWorldMatrix, float, linearDepth, materialAttenuationColor, materialAttenuationDistance, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
-  mrt, positionViewDirection, positionWorld, reflector, refract, screenSize, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
+  mrt, pmremTexture, positionViewDirection, positionWorld, reflect, reflector, refract, screenSize, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
 } from 'three/tsl';
 import { waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
-import { seaShadingSlopeNode } from './waterSpectrum.js';
+import { seaLostSlopeVarianceNode, seaShadingSlopeNode } from './waterSpectrum.js';
 
-const _eye = new Vector3(), _origin = new Vector3(), _up = new Vector3();
+const _eye = new Vector3(), _origin = new Vector3(), _up = new Vector3(), _clearColor = new Color();
 /** Recursion guard: a mirror must not render itself. */
 let reflecting = false;
 
@@ -191,7 +191,15 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       globalThis.__giNestedRender = true;
       mesh.visible = false;
       for (const s of slots) s.uniforms.active.value = 0;
+      // ⚠ NO BACKGROUND IN THE MIRROR. The sky is read per pixel along the
+      // true reflected ray (`pmremTexture` below); the mirror is for what
+      // stands near the water, and its ALPHA says where it saw geometry.
+      const scene = frame.scene, renderer = frame.renderer;
+      const background = scene.background, backgroundNode = scene.backgroundNode;
+      const clearColor = renderer.getClearColor(_clearColor).clone(), clearAlpha = renderer.getClearAlpha();
+      scene.background = null; scene.backgroundNode = null; renderer.setClearColor(0x000000, 0);
       try { return original(frame); } finally {
+        scene.background = background; scene.backgroundNode = backgroundNode; renderer.setClearColor(clearColor, clearAlpha);
         reflecting = false;
         mesh.visible = body;
         for (let i = 0; i < slots.length; i++) slots[i].uniforms.active.value = armed[i];
@@ -261,19 +269,51 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     // The WATER's roughness, not the material's — see `gridSimulation`'s
     // update. An authored graph pins its own value and the component's control
     // would otherwise do nothing at all.
-    const roughness = u ? u.roughness : (previous.roughnessNode ?? float(material.roughness ?? .12));
+    const authoredRoughness = u ? u.roughness : (previous.roughnessNode ?? float(material.roughness ?? .12));
+    // ── THE FAR SEA IS ROUGH, NOT GLASS ───────────────────────────────────
+    //
+    // Where distance fades a cascade out of the shading normal, its slope
+    // variance becomes microfacet roughness (Beckmann m² = 2σ², GGX α ≈ m):
+    // the sparkle a pixel can no longer resolve as normals is the lobe it
+    // gets instead — the sun's glitter spreads into the broad highlight a real
+    // sea shows toward the horizon, and the mirror blurs with it.
+    const roughness = (u && simulation?.spectrum)
+      ? float(authoredRoughness).pow(4).add(seaLostSlopeVarianceNode(simulation.spectrum).mul(2)).max(0).pow(.25).clamp(0, 1)
+      : authoredRoughness;
     // The distortion belongs in ONE space: the wave normal against the same
     // surface's flat normal, both viewed from the camera, so it vanishes to
     // zero on flat water instead of drifting with where the camera points.
     const flatNormalView = transformDirection(cameraViewMatrix, modelNormalMatrix.mul(vec3(0, 1, 0)).normalize()).normalize();
     const uv = screenUV.flipX().add(normalView.sub(flatNormalView).xy.mul(distortion)).clamp(.001, .999);
-    const reflected = node.sample(uv).level(float(roughness).clamp(0, 1).mul(6)).rgb.mul(fresnel).mul(gain);
+    // ── THE SKY ALONG THE REFLECTED RAY, PER PIXEL ────────────────────────
+    //
+    // A planar mirror of a flat sky, bent by a two-percent distortion, is a
+    // sheet of glass: the swells' slopes could not show through it (the
+    // ocean arm, 2026-09-06). The demo samples its environment along each
+    // pixel's true reflected direction, and so does the sea now: the scene's
+    // environment (or its texture background), prefiltered by the roughness
+    // the far field earns. The mirror keeps what stands near the water —
+    // read where its alpha says it saw geometry, since it renders without a
+    // background — and the sky fills the rest, GI reflections on or off.
+    const sky = engine?.scene?.environment?.isTexture ? engine.scene.environment
+      : (engine?.scene?.background?.isTexture ? engine.scene.background : null);
+    const mirror = node.sample(uv).level(float(roughness).clamp(0, 1).mul(6));
+    let reflected;
+    if (sky) {
+      const lidNormalWorldR = modelNormalMatrix.mul(lidNormalLocal).normalize();
+      const toEyeR = cameraPosition.sub(positionWorld).normalize();
+      const R = reflect(toEyeR.negate(), lidNormalWorldR);
+      const env = pmremTexture(sky, R, float(roughness).clamp(0, 1)).rgb;
+      reflected = mix(env, mirror.rgb, mirror.a.clamp(0, 1).mul(gain)).mul(fresnel);
+    } else {
+      reflected = mirror.rgb.mul(fresnel).mul(gain);
+    }
 
     let emissive = vec3(previous.emissiveNode ?? 0);
     if (u) {
       // Foam is WHITE, ROUGH AND OPAQUE — a material, not a glow, and not a
       // mirror either.
-      const soft = waterFoamNode(u, engine?.scenePass?.getTexture?.("depth") ?? null).toVar();
+      const soft = waterFoamNode(u, engine?.scenePass?.getTexture?.("depth") ?? null, simulation?.spectrum ?? null).toVar();
       // ── ⛔ `style` EXISTED ONLY IN A MATERIAL NOBODY USES ─────────────────
       //
       // The banding and the hard foam edge that make "stylized" stylized were
@@ -463,7 +503,9 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     } else {
       emissive = emissive.add(reflected);
     }
-    material.emissiveNode = emissive;
+    // Harness probe: the foam value alone (`?foamDebug=1`).
+    if (globalThis.__waterFoamDebug && u) { material.emissiveNode = vec3(waterFoamNode(u, null, simulation?.spectrum ?? null)); material.colorNode = vec3(0); }
+    else material.emissiveNode = emissive;
     material.userData.giWater = true;
     material.needsUpdate = true;
     reportBindings();

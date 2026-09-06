@@ -36,6 +36,7 @@ export function simulationNodeTypes(kind) {
         number("waterDepth", "Optical depth (metres)", 2, 0, 100), number("fill", "Fill level", 1, .05, 1, .01), number("saturation", "Water saturation", .45, 0, 1, .01),
         number("transmission", "Refraction / transmission", .75, 0, 1, .01),
         number("foam", "Foam", .5, 0, 1, .01), number("foamThreshold", "Foam contact width (m)", .15, 0, 3, .01),
+        number("godRays", "God rays", 1, 0, 3, .01),
       ]),
     ] },
     output: { label: "Surface Output", category: "system", inputs: [input("sim", "simulation"), input("material", "surface")], outputs: [], params: [

@@ -64,14 +64,38 @@ try {
    foam: Number(argument('foam', '1')), foamThreshold: .5 };
  // Any wave/look field can be overridden from the URL (?waveHeight=.1&choppiness=0…) to
  // reproduce a user's own pool.
- for (const key of ['waveHeight', 'waveLength', 'choppiness', 'rippleStrength', 'surfaceDetail', 'causticIntensity', 'saturation', 'foamThreshold', 'waveOctaves', 'waveGain'])
+ for (const key of ['waveHeight', 'waveLength', 'choppiness', 'rippleStrength', 'surfaceDetail', 'causticIntensity', 'saturation', 'foamThreshold', 'waveOctaves', 'waveGain', 'roughness'])
    if (argument(key, null) != null) USER[key] = Number(argument(key, '0'));
- const DEPTH = 3;
+ // ?depth= for the ocean arm (60 m: no floor shows through the medium).
+ const DEPTH = Number(argument('depth', '3'));
+ globalThis.__waterFoamDebug = argument('foamDebug', '0') === '1';
 
  for (const S of SCALES) {
    const scene = new THREE.Scene();
-   scene.backgroundNode = mix(vec3(.62, .83, 1), vec3(.11, .37, .74), positionWorld.normalize().y.max(0).pow(.6));
-   scene.background = new THREE.Color('#7fb8f0');
+   // The sky as a TEXTURE — the gradient it always had, plus the sun's disc —
+   // so the water reflects it along each pixel's reflected ray (and the scene
+   // has an environment, as the editor's does).
+   {
+     const sw = 512, sh = 256, data = new Float32Array(sw * sh * 4);
+     const sunDir = new THREE.Vector3(6, 14, 4).normalize();
+     for (let j = 0; j < sh; j++) for (let i = 0; i < sw; i++) {
+       const phi = (i / sw) * Math.PI * 2, theta = (j / sh) * Math.PI;
+       // Row 0 is the BOTTOM of an equirect in three (v = 0 at −y): the zenith is the last row.
+       const dir = new THREE.Vector3(-Math.sin(theta) * Math.sin(phi), -Math.cos(theta), -Math.sin(theta) * Math.cos(phi));
+       const y = Math.max(0, dir.y), t = Math.pow(y, .6);
+       let r = .62 + (.11 - .62) * t, g = .83 + (.37 - .83) * t, b = 1 + (.74 - 1) * t;
+       if (dir.y < 0) { r = .22; g = .24; b = .26; }
+       const sun = Math.pow(Math.max(0, dir.dot(sunDir)), 3000) * 40;
+       const o = (j * sw + i) * 4; data[o] = r + sun; data[o + 1] = g + sun * .95; data[o + 2] = b + sun * .85; data[o + 3] = 1;
+     }
+     // Half floats: a 32-bit float texture is unfilterable in WebGPU.
+     const half = new Uint16Array(data.length); for (let i = 0; i < data.length; i++) half[i] = THREE.DataUtils.toHalfFloat(data[i]);
+     const skyTex = new THREE.DataTexture(half, sw, sh, THREE.RGBAFormat, THREE.HalfFloatType);
+     skyTex.mapping = THREE.EquirectangularReflectionMapping; skyTex.colorSpace = THREE.LinearSRGBColorSpace; skyTex.needsUpdate = true;
+     // Background only: as an ENVIRONMENT it would light the tiles by IBL and
+     // move every floor receipt (the editor's GI owns that light there).
+     scene.background = skyTex;
+   }
    const engine = { scene, renderer, camera: null, onUpdate: (fn) => { engine._tickers.push(fn); return () => {}; },
      _tickers: [], on: () => () => {}, off: () => {}, modules: { get: () => null }, waterSlots: null };
    const pool = waterSlotPool(engine);
@@ -164,9 +188,29 @@ try {
    // at the horizon over hundreds of metres — for the wave SHAPE and the
    // whitecaps. Pair with ?scales=500&waveHeight=1.2&waveLength=60&choppiness=1.
    if (argument('ocean', '0') === '1') {
-     pose([0, 6, S * .4], [0, 0, -S]); await shoot('ocean-horizon');
-     pose([0, 12, S * .3], [0, 0, -S * .2]); await shoot('ocean-high');
+     pose([0, 6, S * .4], [0, 0, -S]); const horizon = await shoot('ocean-horizon');
+     pose([0, 12, S * .3], [0, 0, -S * .2]); const high = await shoot('ocean-high');
      pose([0, 2.5, S * .35], [0, 1, -S * .1]); await shoot('ocean-low');
+     // ── THE OCEAN'S RECEIPTS ────────────────────────────────────────────
+     //
+     // Whitecaps: white pixels (bright, unsaturated) over the water in the
+     // high shot — a strong sea foams a few percent of its area, never none
+     // and never most. Sheets: green-dominant bright pixels, the crest
+     // scattering's failure mode. Sparkle: the horizon band's luma spread.
+     const luma = (px, i) => px[i] * .2126 + px[i + 1] * .7152 + px[i + 2] * .0722;
+     let white = 0, green = 0, n = 0;
+     for (let y = H * .5; y < H; y++) for (let x = 0; x < W; x++) {
+       const i = ((y | 0) * W + (x | 0)) * 4; const r = high[i], g = high[i + 1], b = high[i + 2]; const l = luma(high, i); n++;
+       const spread = Math.max(r, g, b) - Math.min(r, g, b);
+       if (l > 175 && spread < 40) white++;
+       if (l > 110 && g > 1.35 * Math.max(r, b)) green++;
+     }
+     let m = 0, m2 = 0, k = 0;
+     for (let y = H * .5; y < H * .62; y++) for (let x = 0; x < W; x++) { const l = luma(horizon, ((y | 0) * W + (x | 0)) * 4); m += l; m2 += l * l; k++; }
+     const sparkle = Math.sqrt(Math.max(0, m2 / k - (m / k) ** 2)) / Math.max(1, m / k);
+     log(`ocean: whitecaps ${(white / n * 100).toFixed(1)}% of the water, green sheets ${(green / n * 100).toFixed(1)}%, horizon band luma spread ${(sparkle * 100).toFixed(1)}% of its mean`);
+     if (!(white / n > .003 && white / n < .3)) throw new Error(`whitecaps: ${(white / n * 100).toFixed(1)}% (want 0.3–30 %)`);
+     if (!(green / n < .03)) throw new Error(`green sheets: ${(green / n * 100).toFixed(1)}%`);
      log('ocean shots done'); throw new Error('ocean: stop');
    }
    // ?crate=1: a red 1 m cube floating half-submerged (the user's crate), shot from

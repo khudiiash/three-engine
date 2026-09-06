@@ -1,7 +1,7 @@
 import * as THREE from "three/webgpu";
 import { Fn, If, float, int, instanceIndex, instancedArray, select, storage, uniform, uniformArray, vec2, vec3, vec4, mix, positionLocal, Loop, dot, normalMap, textureStore, texture, ivec2 } from "three/tsl";
 import { MAX_CLOTH_ANCHORS, resolveClothAnchors } from "./clothAnchors.js";
-import { createWaterSpectrum, seaDisplacementAt, seaFoamNode, seaJacobianAt } from "./waterSpectrum.js";
+import { createWaterSpectrum, seaDisplacementAt, seaFoamNode, seaJacobianAt, seaFoldNode } from "./waterSpectrum.js";
 import { GRAVITY } from "./waterSpectrumCPU.js";
 import { WATER_CELL_METRES, waterAutoResolution, waterProfileRadius, waterVolumeShape } from "./waterVolume.js";
 import { waterProfileRadiusNode, waterRimDistanceNode } from "./waterShape.js";
@@ -664,7 +664,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const world = vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z));
     const sea = seaDisplacementAt(spectrum, world, u.seaLodSolver).toVar();
     const jacobian = seaJacobianAt(spectrum, world, sea.w, u.seaLodSolver);
-    const jacobianFoam = seaFoamNode(jacobian, u.foam);
+    const jacobianFoam = seaFoldNode(jacobian).mul(u.foam.smoothstep(0, .2)); // the FOLD seeds the field; whitecaps are per pixel (waterFoam.js)
     const rise = u.waveScale.y;
     const rippleX = positions.element(east).y.sub(positions.element(west).y).div(2 * sx);
     const rippleZ = positions.element(south).y.sub(positions.element(north).y).div(2 * sz);
@@ -752,7 +752,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // steep rim) is the other half and lives in `positions.w`, spreading and
       // decaying as a field. `waterFoam.js` says what a value DRAWS.
       const jacobian = seaJacobianAt(spectrum, world, sea.w, u.seaLod);
-      const jacobianFoam = seaFoamNode(jacobian, u.foam);
+      const jacobianFoam = seaFoldNode(jacobian).mul(u.foam.smoothstep(0, .2)); // the FOLD seeds the field; whitecaps are per pixel (waterFoam.js)
       const rise = u.waveScale.y;
       const steepWorld = vec2(rippleX.mul(rise).div(u.waveScale.x), rippleZ.mul(rise).div(u.waveScale.z)).length();
       const churn = positions.element(index).y.sub(previous.element(index).y).mul(rise).div(h).abs();
@@ -1004,6 +1004,9 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const mesh = new THREE.Mesh(geometry, material);
   mesh.name = kind === "cloth" ? "Cloth" : "Water";
   mesh.userData.vfxSimulation = kind;
+  // The LID: the medium (scene.fogNode) treats it as the interface — no water
+  // path to it from above, the whole path from below (waterMedium.js).
+  if (kind === "water") mesh.userData.waterLid = true;
   mesh.userData.giGpuGrid = { positionAttribute, resolution: n };
   if(waterSurfaceTexture)mesh.userData.waterSurfaceTexture=waterSurfaceTexture;
   mesh.userData.noBatch = true;

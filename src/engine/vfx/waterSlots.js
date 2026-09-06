@@ -173,6 +173,8 @@ function createSlot(index) {
       radiance: uniform(new THREE.Color(0, 0, 0)),
       absorption: uniform(.2),
       strength: uniform(0),
+      // The god rays' own strength (`godRays`), apart from the caustics'.
+      shafts: uniform(1),
       active: uniform(0),
       // ── THE CAUSTIC WINDOW ──────────────────────────────────────────────
       //

@@ -281,8 +281,30 @@ function shaftNode(slot, segment, tau, sigma) {
  * zero for a ray running along a depth contour, and the `x/(1−e^−x)` form is
  * finite there, so the guard is on the division and not on the geometry.
  */
-function applyMedium(rgb, slot, { shapeClip }) {
-  applyMediumSegment(rgb, slot, waterSegmentNode(slot, { shapeClip }));
+function applyMedium(rgb, slot, { shapeClip, lid = false }) {
+  applyMediumSegment(rgb, slot, lid ? waterLidSegmentNode(slot) : waterSegmentNode(slot, { shapeClip }));
+}
+/**
+ * The segment for a fragment ON THE LID. `waterSegmentNode` clips the eye
+ * ray at the surface height sampled where the ray crosses the rest plane;
+ * on a metre of swell a trough fragment lies well below that, and metres of
+ * "water" were counted along a grazing ray to a point reached through air —
+ * every trough a hard-edged sheet of the scatter colour (the ocean arm,
+ * 2026-09-06). The lid IS the interface: no path from above, all of it from
+ * below.
+ */
+export function waterLidSegmentNode(slot) {
+  const s = slot.uniforms;
+  const a = s.inverse.mul(vec4(cameraPosition, 1)).xyz.toVar();
+  const b = s.inverse.mul(vec4(positionWorld, 1)).xyz.toVar();
+  const below = a.y.lessThan(0);
+  const span = positionWorld.sub(cameraPosition).length();
+  return {
+    length: select(below, span, float(0)),
+    near: a.y.negate().max(0).mul(s.rise),
+    far: float(0),
+    at: (k) => a.add(b.sub(a).mul(k)),
+  };
 }
 /**
  * The medium over an EXPLICIT segment — { near, far (depths below the
@@ -318,7 +340,7 @@ export function applyMediumSegment(rgb, slot, segment) {
       // because the beam term above averages to nearly nothing along a ray —
       // the floor keeps its brightness and the filaments read as rays.
       // The albedos live inside the beam (haze + shafts, see shaftNode).
-      inScatter.addAssign(vec3(s.radiance).mul(shaftNode(slot, segment, tau, sigma)).mul(tau.min(2)).mul(shaftPhase(slot)));
+      inScatter.addAssign(vec3(s.radiance).mul(shaftNode(slot, segment, tau, sigma)).mul(tau.min(2)).mul(shaftPhase(slot)).mul(s.shafts));
     });
     rgb.assign(rgb.mul(tau.negate().exp()).add(inScatter));
   });
@@ -358,10 +380,14 @@ export function installWaterMedium(engine) {
   let compiled = { count: 1, round: false };
   const build = (fog) => {
     compiled = pool.compileShape();
-    engine.scene.fogNode = Fn(() => {
+    // ⚠ `Fn((builder) => …)`: a body with one parameter and no inputs is
+    // handed the node builder, and the fog is built once per material — so
+    // the lid (`userData.waterLid`) gets its own segment rule.
+    engine.scene.fogNode = Fn((builder) => {
+      const lid = builder?.object?.userData?.waterLid === true;
       const rgb = output.rgb.toVar();
       sceneFog(rgb, fog, atmosphere);
-      for (const slot of pool.slots.slice(0, compiled.count)) applyMedium(rgb, slot, { shapeClip: compiled.round });
+      for (const slot of pool.slots.slice(0, compiled.count)) applyMedium(rgb, slot, { shapeClip: compiled.round, lid });
       return vec4(rgb, output.a);
     })();
     pool.compiled = compiled;

@@ -236,6 +236,39 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     13) is informational: with the waves at rest the term barely moves over
     0.2 s and a 3 % frame reads as 5×.
 
+32. THE OCEAN LOOK (2026-09-06, evening). Five things stood between the sea
+    and the Popov demo, none of them the spectrum: (a) whitecaps were gated
+    at J < 0.19 while the composed Jacobian at the folding limit never drops
+    below ~0.45 (p1 0.47, p5 0.60 — the same on a pond and an ocean, the
+    limit normalizes it): `seaFoamNode` opens at J < mix(0.45, 0.85, foam),
+    ramp 0.25; (b) foam per VERTEX cannot carry a whitecap on a clipmap ring
+    whose vertices are metres apart and whose Jacobian is a coarse mip: the
+    fold is read per PIXEL in `waterFoamNode` from the same cascades the
+    normal reads; (c) the persistent field must be seeded by the rare FOLD
+    only (`seaFoldNode`, J < 0.45) — the whitecap gate as a source turned a
+    pool into a 90 % sheet in a second; (d) the medium fogged the LID: the
+    eye ray clipped at the surface height where it crosses the rest plane,
+    so on a metre of swell a trough fragment counted metres of "water"
+    reached through air — every trough a hard sheet of the scatter colour;
+    the lid has its own segment (`waterLidSegmentNode`: none from above,
+    all from below, chosen per material by `builder.object.userData.waterLid`
+    inside the fog `Fn`); (e) a planar mirror of a flat sky bent by 2 % is
+    glass — the sky is now read per pixel along the true reflected ray
+    (`pmremTexture` of the scene environment or texture background,
+    prefiltered by roughness), the mirror rendered without a background so
+    its alpha says where it saw geometry. Plus: the variance a cascade loses
+    to distance becomes roughness (`seaLostSlopeVarianceNode`, Beckmann
+    m² = 2σ²) so the far sea sparkles instead of turning to glass; the crest
+    glow is in metres (`positionLocal.y × waveScale.y`) and only the top
+    quarter glows. Receipt: `?ocean=1&depth=10&roughness=.15` + ocean
+    settings — whitecaps 0.4 % (gate 0.3–30 %), green sheets 0 %.
+33. OPEN: a box water 30 m deep or more shows a flat 32 m rectangle where the
+    ripple window sits (fine at 10 m). Something in the window's lid path
+    scales with `waveScale.y`; an ocean is a plane or a box ≤ 10 m deep
+    until it is found.
+34. `godRays` (0–3, default 1) scales the shafts alone (`slot.uniforms.shafts`),
+    apart from `causticIntensity`.
+
 ## Open
 
 - The refraction pass is a second scene render per water surface per camera

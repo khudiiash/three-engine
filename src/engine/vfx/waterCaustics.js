@@ -496,6 +496,7 @@ export function updateWaterSlot({ engine, slot, kernel, mesh, simulation, props 
   // is exactly `focus*T` there. Below it the lens is damped and above it
   // exaggerated, both around the same neutral point.
   s.strength.value = Math.max(0, Math.min(3, Number(props.causticIntensity ?? 1)));
+  s.shafts.value = Math.max(0, Math.min(3, Number(props.godRays ?? 1)));
   s.radiance.value.copy(source.color).multiplyScalar(source.intensity);
   // The caustic light borrows this sun's shadow node (WaterCausticLightNode).
   (engine.waterSlots ?? waterSlotPool(engine)).sun = source;

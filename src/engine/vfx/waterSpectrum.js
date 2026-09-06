@@ -196,7 +196,10 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
   const derivatives = storageMap(size, { half: true, mips: true, layers: cascadeCount, name: "sea derivatives" });
 
   const cascades = Array.from({ length: cascadeCount }, (_, i) => {
-    const c = { dk: uniform(1), cutLow: uniform(0), cutHigh: uniform(9999), amplitude: uniform(0), invL: uniform(1), L: 1 };
+    const c = { dk: uniform(1), cutLow: uniform(0), cutHigh: uniform(9999), amplitude: uniform(0), invL: uniform(1), L: 1,
+      // This cascade's slope variance (both directions), for the roughness the
+      // shading normal must take on where distance fades the cascade out.
+      slopeVariance: uniform(0) };
     const h0k = storageMap(size, { name: `sea ${i} h0k` });
     const h0 = storageMap(size, { name: `sea ${i} h0` });
     const wavesData = storageMap(size, { name: `sea ${i} waves` });
@@ -276,6 +279,9 @@ export function createWaterSpectrum({ size = SEA_SIZE, cascadeCount = 3, seed = 
         const c = cascades[i].uniforms;
         c.L = band.L; c.invL.value = 1 / band.L; c.dk.value = 2 * Math.PI / band.L; c.cutLow.value = band.cutLow; c.cutHigh.value = band.cutHigh;
         c.amplitude.value = spectrum.amplitude;
+        // The x-slope moment of this band alone, doubled for both directions,
+        // at the realized amplitude.
+        c.slopeVariance.value = 2 * spectrumMoments(64, [band], settings).gradient * spectrum.amplitude * spectrum.amplitude;
       });
       dirty = true;
       return settings;
@@ -386,8 +392,28 @@ export function seaSlopeAt(spectrum, world, { lods = null, weights = null } = {}
  * foam field (gridSimulation), which is what gives a fold's foam its life
  * after the crest has moved on.
  */
+/**
+ * The FOLD itself — the rare event that seeds the persistent foam field
+ * (the memory: foam that trails a breaking crest for seconds). Independent
+ * of `foam`: at the folding limit the composed Jacobian's first percentile
+ * sits near 0.5 on a pond and on an ocean alike, so this opens on the
+ * steepest one or two percent of crests. The visible whitecaps are
+ * `seaFoamNode`, per pixel and instantaneous; feeding THAT to the field
+ * turned a pool into a 90 % sheet within a second (harness, 2026-09-06).
+ */
+export function seaFoldNode(jacobian) {
+  return float(.45).sub(jacobian).div(.15).clamp(0, 1);
+}
 export function seaFoamNode(jacobian, foam) {
-  return float(1).sub(jacobian).sub(mix(float(1.3), float(.6), foam)).div(.3).clamp(0, 1);
+  // ⚠ THE GATE IS ON J ITSELF. It used to open at 1 − J > mix(1.3, .6, foam),
+  // i.e. J < −0.3 … 0.4 — and at the ocean preset with full choppiness the
+  // composed Jacobian never drops below 0.2 (p1 0.52, p5 0.64, measured on
+  // the CPU model, 2026-09-06): whitecaps could not exist by construction.
+  // A whitecap is a crest steep enough to fold, and the folding limit keeps
+  // the sea just short of it, so the gate sits in the steep tail: `foam` 0
+  // opens at J < 0.45 (nothing at the limit), 1 at J < 0.85 (the steepest
+  // third), 0.7 — the ocean preset's crests — at J < 0.73.
+  return mix(float(.45), float(.85), foam).sub(jacobian).div(.25).clamp(0, 1);
 }
 /**
  * The per-pixel shading slope: every cascade with Babylon's distance fade
@@ -404,6 +430,22 @@ export function seaFoamNode(jacobian, foam) {
  * "the weight of the finest cascade" it scaled a cascade that, on a short
  * peak, carries nothing ("DEAD surfaceDetail", the property sweep, 2026-09-06).
  */
+/**
+ * The slope variance the shading normal has LOST to distance: each cascade
+ * fades out of `seaShadingSlopeNode` as its texels fall under a pixel, and
+ * the chop it carried must become ROUGHNESS or the far sea turns to glass —
+ * a flat mirror of a flat sky with no sparkle in it (the ocean arm,
+ * 2026-09-06). Toksvig's idea: variance that cannot be a normal is a lobe.
+ */
+export function seaLostSlopeVarianceNode(spectrum) {
+  const viewDist = positionWorld.sub(cameraPosition).length();
+  let lost = float(0);
+  for (const c of spectrum.cascades) {
+    const fade = float(1).div(c.uniforms.invL).mul(LOD_SCALE).div(viewDist.max(1e-3)).min(1);
+    lost = lost.add(fade.oneMinus().mul(c.uniforms.slopeVariance));
+  }
+  return lost;
+}
 export function seaShadingSlopeNode(spectrum, world, surfaceDetail, vertexLods = null) {
   const viewDist = positionWorld.sub(cameraPosition).length();
   let d = vec4(0);
