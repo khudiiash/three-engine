@@ -1,6 +1,6 @@
 import {
   Fn, attribute, cameraFar, cameraNear, cameraPosition, float, linearDepth, mix, positionLocal, positionWorld,
-  select, vec2, vec3, viewportDepthTexture,
+  screenUV, select, texture, vec2, vec3, viewportDepthTexture,
 } from "three/tsl";
 
 /**
@@ -122,21 +122,29 @@ const worldXZ = (u) => vec2(positionLocal.x.mul(u.waveScale.x), positionLocal.z.
  * generation threshold in the solver) and gates this on or off; it is not a
  * dimmer, because half-transparent foam is a grey wash and not less foam.
  */
-export function waterFoamNode(u) {
+export function waterFoamNode(u, sceneDepth = null) {
   // ⚠ WRAPPED IN `Fn`, AND IT HAS TO BE. `toVar()` and `addAssign` allocate on
   // the builder's STACK, and a node factory called straight from a material
   // build has no stack — "No stack defined for assign operation". Anything here
   // that declares a variable belongs inside one of these.
-  return Fn(() => waterFoamBody(u))();
+  return Fn(() => waterFoamBody(u, sceneDepth))();
 }
-function waterFoamBody(u) {
+function waterFoamBody(u, sceneDepth) {
   const p = worldXZ(u);
   const clock = waveClock(u);
   const drift = clock.mul(.5);
 
   // The solver's own foam, and the contact term.
   const simulated = attribute("waterFoam", "float").clamp(0, 1);
-  const behind = linearDepth(viewportDepthTexture()).sub(linearDepth());
+  // ⚠ THE SCENE DEPTH COMES FROM A TEXTURE THAT OWNS ITS RENDER TARGET when
+  // one is published (`engine.scenePass`, the post chain's 1-sample beauty
+  // pass): three's shared viewport depth is declared with the sample count
+  // of whichever target is current when the shader is BUILT, and a pipeline
+  // built against the MSAA canvas then fails to bind in the 1-sample pass
+  // the scene is actually rendered in. Without a published pass the shared
+  // one is right, because build and render share the canvas.
+  const depthNode = sceneDepth ? texture(sceneDepth, screenUV) : viewportDepthTexture();
+  const behind = linearDepth(depthNode).sub(linearDepth());
   const metres = behind.mul(cameraFar.sub(cameraNear)).max(0);
   // The width itself is modulated, so the shoreline is ragged rather than a
   // uniform ring offset from the geometry.

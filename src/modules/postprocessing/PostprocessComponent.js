@@ -306,6 +306,14 @@ export class PostprocessComponent extends Component {
     this.watchHandle = this.entity.engine.on?.("hierarchy-changed", () => this.#tryAttach());
   }
 
+  /** The engine's published scene pass, withdrawn when it was ours. */
+  #unpublishScenePass() {
+    const engine = this.entity?.engine;
+    if (!engine || engine.scenePass === undefined) return;
+    if (engine.scenePass === null) return;
+    if (this.scenePass === null && engine.scenePass) { engine.scenePass = null; engine.emit?.("scene-pass-changed", null); }
+  }
+
   onDetach() {
     // Before anything else: this owns a render target AND a per-frame pass, and
     // a pass that outlives its component renders into a disposed scene.
@@ -651,6 +659,7 @@ export class PostprocessComponent extends Component {
         console.warn(`PostprocessComponent: PassNode dispose failed: ${err?.message ?? err}`);
       }
       this.scenePass = null;
+      this.#unpublishScenePass();
     }
 
     // Build the PassNode once. PassNode owns its color + depth render
@@ -676,6 +685,20 @@ export class PostprocessComponent extends Component {
       // cameras still go through the renderer's default path) and produces
       // a standard `texture_depth_2d` that SSGINode's shader expects.
       this.scenePass = TSL.pass(engine.scene, this.renderCamera, { samples: 1 });
+      // ── PUBLISHED, BECAUSE THE WATER NEEDS A DEPTH THAT OWNS ITS SAMPLE COUNT
+      //
+      // three's shared `viewportDepthTexture()` is declared with the sample
+      // count of whatever render target is current when a shader is BUILT.
+      // GI's compile wave builds against the MSAA canvas; this pass renders
+      // the scene into a 1-sample target; the same pipeline then binds a
+      // 1×1 placeholder where its layout expects a multisampled depth:
+      // "Sample count (1) … doesn't match expectation (multisampled: 1)"
+      // (live editor, 2026-09-06). This pass's own depth texture carries its
+      // render target, so its sample count is a property of the texture and
+      // not of the moment. `engine.scenePass` is what a consumer reads;
+      // `scene-pass-changed` is when to rebuild.
+      engine.scenePass = this.scenePass;
+      engine.emit?.("scene-pass-changed", this.scenePass);
       this._passNeedsKey = needsKey;
       this.postprocessLayers = new THREE.Layers();
       this.postprocessLayers.mask = this.renderCamera.layers.mask;
@@ -1092,6 +1115,7 @@ export class PostprocessComponent extends Component {
       }
     }
     this.scenePass = null;
+    this.#unpublishScenePass();
     this.#disposeEditorOverlayPass();
     this._passNeedsKey = null;
     this.postprocessLayers = null;

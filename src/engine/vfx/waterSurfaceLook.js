@@ -174,7 +174,7 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     if (u) {
       // Foam is WHITE, ROUGH AND OPAQUE — a material, not a glow, and not a
       // mirror either.
-      const soft = waterFoamNode(u).toVar();
+      const soft = waterFoamNode(u, engine?.scenePass?.getTexture?.("depth") ?? null).toVar();
       // ── ⛔ `style` EXISTED ONLY IN A MATERIAL NOBODY USES ─────────────────
       //
       // The banding and the hard foam edge that make "stylized" stylized were
@@ -279,6 +279,9 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
 
   const onWave = () => { if (!disposed && ++rearms <= 8) queueMicrotask(() => { if (!disposed) build(); }); };
   engine?.on?.('gi-compile-wave-done', onWave);
+  // The scene pass is (re)created after the water more often than not.
+  const onPass = () => { if (!disposed) queueMicrotask(() => { if (!disposed) build(); }); };
+  engine?.on?.('scene-pass-changed', onPass);
   build(); update();
   return {
     update, gain, distortion,
@@ -288,6 +291,7 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       if (disposed) return; disposed = true;
       clearTimeout(reportTimer);
       engine?.off?.('gi-compile-wave-done', onWave);
+      engine?.off?.('scene-pass-changed', onPass);
       node?.dispose(); target.removeFromParent();
       material.emissiveNode = previous.emissiveNode; material.colorNode = previous.colorNode;
       material.roughnessNode = previous.roughnessNode; material.normalNode = previous.normalNode;
