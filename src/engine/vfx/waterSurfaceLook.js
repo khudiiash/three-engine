@@ -1,7 +1,7 @@
 import { DepthTexture, Object3D, Vector3 } from 'three/webgpu';
 import {
   cameraFar, cameraNear, cameraPosition, cameraProjectionMatrix, cameraProjectionMatrixInverse, cameraViewMatrix, cameraWorldMatrix, float, linearDepth, materialAttenuationColor, materialAttenuationDistance, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
-  positionViewDirection, positionWorld, reflector, refract, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
+  positionViewDirection, positionWorld, reflector, refract, screenSize, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
 } from 'three/tsl';
 import { waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
 import { seaShadingSlopeNode } from './waterSpectrum.js';
@@ -337,20 +337,32 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // `transmission` still scales the travel — the dial that reads as
       // "refraction". From below there is no column: the pixel behind.
       const travel = select(fromBelow, float(0), column.mul(through));
-      const exit = positionWorld.add(bentWorld.mul(travel));
-      const clip = cameraProjectionMatrix.mul(cameraViewMatrix.mul(vec4(exit, 1)));
-      const ndc = clip.xy.div(clip.w).add(1).mul(.5);
-      const refractedUv = vec2(ndc.x, ndc.y.oneMinus()).clamp(.001, .999);
+      const uvAt = (t) => {
+        const exit = positionWorld.add(bentWorld.mul(t));
+        const clip = cameraProjectionMatrix.mul(cameraViewMatrix.mul(vec4(exit, 1)));
+        const ndc = clip.xy.div(clip.w).add(1).mul(.5);
+        return vec2(ndc.x, ndc.y.oneMinus()).clamp(.001, .999);
+      };
       // ── NOTHING ABOVE THE WATER CAN BE SEEN THROUGH IT ─────────────────
       //
       // The framebuffer at the refracted pixel may hold an object standing
       // ABOVE the surface — a crate's faces, painted onto the water behind it
       // ("there are 2: one is correct, another is broken", user, 2026-09-06,
       // the seventh report). Unproject what is there: if it stands above the
-      // lid's plane it cannot be behind this pixel's ray, and the pixel reads
-      // straight through itself instead — the floor it covers, undisplaced.
-      const there = modelWorldMatrixInverse.mul(vec4(worldAt(refractedUv, viewportDepth.sample(refractedUv).x), 1)).xyz;
-      const sampleUv = select(there.y.greaterThan(.02), screenUV, refractedUv);
+      // lid's plane it cannot be behind this pixel's ray. Eroded by a texel at
+      // full travel: the colour copy is the RESOLVED image, the depth one
+      // sample of it, so a silhouette pixel passes with the object's colour
+      // bled into it — a one-pixel red fringe. And a refused ray does not
+      // drop to the pixel beneath it (that read as a flat hole with no waves
+      // in it): the travel shrinks in steps, so the wobble the surface's
+      // normal gives the ray survives next to the crate, only shorter.
+      const aboveAt = (uv) => modelWorldMatrixInverse.mul(vec4(worldAt(uv, viewportDepth.sample(uv).x), 1)).y.greaterThan(.002);
+      const texel = vec2(1.5).div(screenSize);
+      const uvFull = uvAt(travel), uvMid = uvAt(travel.mul(.35)), uvNear = uvAt(travel.mul(.1));
+      const blockedFull = aboveAt(uvFull)
+        .or(aboveAt(uvFull.add(vec2(texel.x, 0)))).or(aboveAt(uvFull.sub(vec2(texel.x, 0))))
+        .or(aboveAt(uvFull.add(vec2(0, texel.y)))).or(aboveAt(uvFull.sub(vec2(0, texel.y))));
+      const sampleUv = select(blockedFull, select(aboveAt(uvMid), select(aboveAt(uvNear), screenUV, uvNear), uvMid), uvFull);
       // ⚠ THE MATERIAL'S OWN ATTENUATION, exactly as three's `volumeAttenuation`
       // read it: colour^(travel / distance), none at an infinite distance. Every
       // water in practice wears the AUTHORED material, whose distance is
