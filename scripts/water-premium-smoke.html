@@ -195,12 +195,13 @@ try {
      const at = (idx) => [v[idx * 4], v[idx * 4 + 1], v[idx * 4 + 2]];
      let beyond = 0, onRim = 0;
      for (let i = 0; i < sim.count; i++) { const [x, , z] = at(i); const rr = Math.hypot(x, z); beyond = Math.max(beyond, rr - lidR); if (rr > lidR - 1e-4) onRim++; }
-     const rimN = sim.resolution;
+     // The rim ring is the flat grid's edge, or the clipmap's outer level.
+     const rimN = sim.clip ? sim.clip.size : sim.resolution, lidBase = sim.clip ? (sim.clip.levels - 1) * rimN * rimN : 0;
      let seam = 0, worstSeam = '';
      for (let k = 0; k < 4 * rimN; k++) {
        const e = Math.floor(k / rimN), t = k % rimN;
        const [ix, iz] = e === 0 ? [t, 0] : e === 1 ? [rimN - 1, t] : e === 2 ? [rimN - 1 - t, rimN - 1] : [0, rimN - 1 - t];
-       const lid = at(iz * rimN + ix), wall = at(sim.count + k);
+       const lid = at(lidBase + iz * rimN + ix), wall = at(sim.count + k);
        const gap = Math.hypot(lid[0] - wall[0], lid[1] - wall[1], lid[2] - wall[2]);
        if (gap > seam) { seam = gap; worstSeam = `k ${k} (${ix},${iz}) lid ${lid.map((x) => x.toFixed(5))} wall ${wall.map((x) => x.toFixed(5))}`; }
      }
@@ -215,7 +216,10 @@ try {
      // just inside it — the segment is the chord clipped to that span.
      const inset = S / 2 - .02;
      const probe = new THREE.Mesh(new THREE.PlaneGeometry(4 * S, 4 * S), new THREE.MeshBasicNodeMaterial());
-     probe.material.colorNode = Fn(() => waterCrossedLengthNode(slot).div(10).toVec3())();
+     // Painted as a fraction of the pool's width (a 100 m pool's chord would
+     // saturate a /10 encoding at 10 m).
+     const CHORD_SCALE = 2 * S;
+     probe.material.colorNode = Fn(() => waterCrossedLengthNode(slot).div(CHORD_SCALE).toVec3())();
      probe.material.fog = false;                 // the medium must not paint over its own reading
      probe.position.set(inset, yLocal * DEPTH, 0); probe.rotation.y = -Math.PI / 2; scene.add(probe);
      pose([-inset, yLocal * DEPTH, 0], [1, yLocal * DEPTH, 0]);
@@ -224,13 +228,13 @@ try {
      sim.mesh.visible = true;
      // The target is sRGB-encoded; the probe painted a LINEAR value.
      const decode = (v) => { const c = v / 255; return c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; };
-     const read = (u) => { const i = ((H >> 1) * W + Math.round(u * W)) * 4; return decode(px[i]) * 10; };
+     const read = (u) => { const i = ((H >> 1) * W + Math.round(u * W)) * 4; return decode(px[i]) * CHORD_SCALE; };
      const chord = (zOff) => Math.min(2 * inset, 2 * Math.sqrt(Math.max(0, (waterProfileRadius(shape, yLocal) * S) ** 2 - zOff ** 2)));
      // Pixel u ↔ the ray's z offset: the camera is 1.2 S back with a 55° fov; at the axis's distance the half-width is tan(27.5°)·1.2 S·aspect.
      const halfWide = Math.tan(55 / 2 * Math.PI / 180) * inset * (W / H);
      const readings = [0, .15, .3].map((f) => ({ z: f * halfWide, seen: read(.5 + f / 2), expect: chord(f * halfWide) }));
      log(`${SHAPE} chord through the axis: ` + readings.map((r) => `z ${r.z.toFixed(2)} m → ${r.seen.toFixed(2)} m seen, ${r.expect.toFixed(2)} m exact`).join(' · '));
-     for (const r of readings) if (!(Math.abs(r.seen - r.expect) < .05 * r.expect + .12)) throw new Error(`the medium's chord is wrong: ${r.seen} vs ${r.expect}`);
+     for (const r of readings) if (!(Math.abs(r.seen - r.expect) < .05 * r.expect + .012 * CHORD_SCALE)) throw new Error(`the medium's chord is wrong: ${r.seen} vs ${r.expect}`);
      log(`${SHAPE} chord: the medium's ray clip is exact`);
      scene.remove(probe);
      pose([-1.1 * S, .55 * S, 1.1 * S], [0, -.3, 0]);

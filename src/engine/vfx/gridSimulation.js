@@ -795,7 +795,10 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // lid vertex at this rim point computes; `dir · radius` is the same
         // point in exact arithmetic and a few ulps off in float, which a wake
         // piled against the wall turns into a millimetre seam.
-        const top = lidSurfaceAt(lidClamp(grid));
+        // (Over 64 m the lid is clipmap rings and its rim vertex is the outer
+        // level's `clipPoint` — the sea at that level's mip — so the shell
+        // must take exactly that, not the flat-grid expression.)
+        const top = clip ? clipPoint(int(clipLevels - 1), ix, iz) : lidSurfaceAt(lidClamp(grid));
         if (foamOut) foamOut.element(index).assign(float(0));
         normals.element(index).assign(vec3(dir.x, slope.negate(), dir.y).normalize());
         output.element(index).assign(select(j.equal(int(0)), top, vec3(dir.x.mul(rho), yj, dir.y.mul(rho))));
