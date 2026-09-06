@@ -32,7 +32,8 @@ export const MAX_WATER_SLOTS = 2;
 /** The caustic map's world footprint around the camera; see `causticCenter`. */
 export const CAUSTIC_WINDOW_METRES = 16;
 // The medium's copy of the surface: what the underwater view clips against.
-const SLOT_RESOLUTION = 512;
+// Same size as the caustic map, because they share one texture array.
+const SLOT_RESOLUTION = 1024;
 // The reference projects caustics at 1024 for a two-unit pool; the filaments
 // are only ever as thin as this map and as the lens feeding it. A 60 m lake
 // gets 6 cm texels here, which is about as fine as its lens can focus anyway.
@@ -80,15 +81,17 @@ const IOR = 1 / 1.333;
 /**
  * ⚠ THE DRAW TARGET HAS NO MIPS; THE ARRAY IT IS COPIED INTO HAS THEM.
  *
- * Every consumer binds ONE caustic array and ONE surface array for BOTH
- * slots (a slot is a layer), because a water's fragment stage was binding
- * the medium's four slot maps beside its own mirror, transmission target,
- * depth texture, shadow maps, GI and the sea's derivatives — and the sea's
- * arrival took it past the portable sixteen ("The number of sampled textures
- * (17) in the Fragment stage exceeds the maximum per-stage limit (16)", live
- * editor 2026-09-06). Two bindings where there were four. The rasterized
- * caustic draw still lands in a plain per-slot target and is copied into its
- * layer; three regenerates the array's mips after the copy.
+ * Every consumer binds ONE texture array for EVERY slot map — layer `index`
+ * is a slot's surface, layer `MAX_WATER_SLOTS + index` its caustic — because
+ * the medium (`scene.fogNode`) and the caustic light compile into every
+ * material in the project, and the editor's materials were already at the
+ * portable limit of sixteen sampled textures with GI's ten, the shadow map
+ * and the environment aboard: "The number of sampled textures (17) in the
+ * Fragment stage exceeds the maximum per-stage limit (16)" (live editor,
+ * 2026-09-06). Four bindings became two became one. The rasterized caustic
+ * draw still lands in a plain per-slot target and is copied into its layer;
+ * three regenerates the array's mips after the copy, and after the surface
+ * kernel's store.
  */
 function causticTarget(index) {
   const target = new THREE.RenderTarget(CAUSTIC_RESOLUTION, CAUSTIC_RESOLUTION, {
@@ -115,8 +118,10 @@ function createSlot(index) {
     index,
     owner: null,
     // (height, ripple normal x, ripple normal z, ripple height) in the water's
-    // local space — layer `index` of the pool's surface array, see below.
+    // local space — layer `index` of the pool's map array, see below.
     surface: null,
+    // The caustic lens is layer `MAX_WATER_SLOTS + index` of the same array.
+    causticLayer: MAX_WATER_SLOTS + index,
     // The caustic lens at the volume floor: drawn into this target (see
     // `createWaterCausticPass`) and copied into layer `index` of the array.
     causticTarget: causticTarget(index),
@@ -176,12 +181,12 @@ function createSlot(index) {
 export function waterSlotPool(engine) {
   if (engine.waterSlots) return engine.waterSlots;
   const slots = Array.from({ length: MAX_WATER_SLOTS }, (_, i) => createSlot(i));
-  const surfaces = storageArray(SLOT_RESOLUTION, MAX_WATER_SLOTS, { name: "Water slot surfaces" });
-  const caustics = storageArray(CAUSTIC_RESOLUTION, MAX_WATER_SLOTS, { mips: true, name: "Water slot caustics" });
-  // ONE node per array, shared by every slot: a consumer sampling both slots
-  // binds two textures, not four, and selects the slot as a layer.
-  const nodes = { surface: texture(surfaces), caustic: texture(caustics) };
-  for (const slot of slots) { slot.surface = surfaces; slot.caustic = caustics; slot.nodes = nodes; }
+  const maps = storageArray(CAUSTIC_RESOLUTION, 2 * MAX_WATER_SLOTS, { mips: true, name: "Water slot maps" });
+  // ONE node, shared by every slot and both maps: a consumer binds one
+  // texture however many slots it reads, and selects the map as a layer.
+  const node = texture(maps);
+  const nodes = { surface: node, caustic: node };
+  for (const slot of slots) { slot.surface = maps; slot.caustic = maps; slot.nodes = nodes; }
   engine.waterSlots = {
     slots,
     claim(owner) {
@@ -391,7 +396,7 @@ export function createWaterCausticPass({ slot, surfaceTexture, resolution, width
   const scene = new THREE.Scene();
   scene.add(mesh);
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-  const previousClear = new THREE.Color(), layer = new THREE.Vector3(0, 0, slot.index);
+  const previousClear = new THREE.Color(), layer = new THREE.Vector3(0, 0, slot.causticLayer);
   return {
     uniforms: c,
     /** One small draw per visible water surface, before the frame's own render. */

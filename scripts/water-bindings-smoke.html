@@ -1,0 +1,79 @@
+<!doctype html><html><head><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three/webgpu';
+import { mix, positionWorld, vec3 } from 'three/tsl';
+import { createGridSimulation } from '/src/engine/vfx/gridSimulation.js';
+import { waterSlotPool } from '/src/engine/vfx/waterSlots.js';
+import { installWaterSurfaceLook } from '/src/engine/vfx/waterSurfaceLook.js';
+import { installWaterMedium } from '/src/engine/vfx/waterMedium.js';
+import { installWaterCausticLight, updateWaterSlot } from '/src/engine/vfx/waterCaustics.js';
+
+/**
+ * ══ WHAT THE WATER'S FRAGMENT STAGE ACTUALLY BINDS ═════════════════════════
+ *
+ * "The number of sampled textures (17) in the Fragment stage exceeds the
+ * maximum per-stage limit (16)" (live editor, 2026-09-06) — a number no other
+ * harness can see, because the count depends on everything the editor adds
+ * to a material: the shadow map, the environment, GI. This page builds the
+ * water with a shadow-casting sun and an environment map and prints, for the
+ * lid and for the body shell, every texture binding the compiled fragment
+ * declares. A budget that is not printed is a budget that gets exceeded.
+ */
+const log = (...a) => console.log('BIND:', ...a);
+try {
+ const adapter = await navigator.gpu.requestAdapter();
+ const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
+ const errors = []; device.addEventListener('uncapturederror', (e) => { errors.push(e.error.message); console.error('WebGPU validation', e.error.message); });
+ const renderer = new THREE.WebGPURenderer({ device, antialias: false });
+ await renderer.init(); renderer.setSize(256, 256);
+ renderer.shadowMap.enabled = true;
+ document.body.append(renderer.domElement);
+ const scene = new THREE.Scene();
+ scene.backgroundNode = mix(vec3(.62, .83, 1), vec3(.11, .37, .74), positionWorld.normalize().y.max(0).pow(.6));
+ // An environment map, as the editor's scenes have.
+ const env = new THREE.DataTexture(new Float32Array(64 * 32 * 4).fill(.5), 64, 32, THREE.RGBAFormat, THREE.FloatType);
+ env.mapping = THREE.EquirectangularReflectionMapping; env.needsUpdate = true;
+ scene.environment = env;
+ const engine = { scene, renderer, camera: null, onUpdate: (fn) => { engine._tickers.push(fn); return () => {}; },
+   _tickers: [], on: () => () => {}, off: () => {}, modules: { get: () => null } };
+ const pool = waterSlotPool(engine);
+ const sun = new THREE.DirectionalLight('#fff6e0', 3);
+ sun.position.set(6, 9, 4); sun.castShadow = true; scene.add(sun); scene.add(sun.target);
+ const floor = new THREE.Mesh(new THREE.BoxGeometry(14, .1, 14), new THREE.MeshStandardNodeMaterial({ roughness: .9 }));
+ floor.position.y = -2; floor.receiveShadow = true; scene.add(floor);
+ const holder = new THREE.Object3D(); holder.scale.set(5, 3, 5); scene.add(holder);
+ const props = { resolution: 64, width: 1, height: 1, waterDepth: 1, waveHeight: .2, waveLength: 5, choppiness: 1, rippleStrength: 1,
+   surfaceDetail: 2, caustics: true, causticIntensity: .5, color: '#268270', roughness: 0, deepColor: '#090b0b', saturation: .25, transmission: 1, foam: 1, foamThreshold: .5 };
+ const authored = new THREE.MeshPhysicalNodeMaterial({ color: '#8fd8de', roughness: .12, metalness: 0, ior: 1.333,
+   transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+ const slot = pool.claim({});
+ const sim = createGridSimulation('water', props, { material: authored, waterSlot: slot, anchorEngine: engine });
+ holder.add(sim.mesh); sim.mesh.matrixAutoUpdate = false; sim.mesh.matrix.identity(); sim.mesh.matrixWorldNeedsUpdate = true;
+ sim.mesh.receiveShadow = true; sim.mesh.castShadow = true;
+ holder.updateMatrixWorld(true);
+ installWaterMedium(engine); installWaterCausticLight(engine);
+ installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
+ const camera = new THREE.PerspectiveCamera(55, 1, .05, 200); engine.camera = camera;
+ camera.position.set(-4, 3, 5); camera.lookAt(0, 0, 0); camera.updateMatrixWorld(true);
+ sim.tick(renderer, 1 / 60);
+ updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props });
+ for (const fn of engine._tickers) fn();
+ await renderer.renderAsync(scene, camera);
+ const census = async (label, object) => {
+   const { fragmentShader } = await renderer.debug.getShaderAsync(scene, camera, object);
+   const bindings = [...fragmentShader.matchAll(/@binding\(\s*\d+\s*\)\s*@group\(\s*\d+\s*\)\s*var\s+(\w+)\s*:\s*(texture_[\w<>,\s]+)/g)]
+     .map((m) => `${m[1]} (${m[2].trim()})`);
+   const sampled = bindings.filter((b) => !/texture_storage/.test(b));
+   log(`${label}: ${sampled.length} sampled textures in the fragment stage`);
+   for (const b of sampled) log('   ', b);
+   return sampled.length;
+ };
+ const lid = await census('LID  (water surface)', sim.mesh);
+ const body = await census('BODY (water shell)', sim.skirtMesh);
+ log('validation', errors.length ? errors : 'clean');
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: errors.length === 0 && lid <= 16 && body <= 16, images: [] };
+ console.log(lid <= 16 && body <= 16 ? 'WATER-BINDINGS PASS' : 'WATER-BINDINGS FAIL');
+} catch (error) {
+ console.error(error.stack);
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: false, error: String(error.stack), images: [] };
+}
+</script></body></html>

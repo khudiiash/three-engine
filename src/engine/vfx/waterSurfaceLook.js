@@ -223,6 +223,58 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     material.emissiveNode = emissive;
     material.userData.giWater = true;
     material.needsUpdate = true;
+    reportBindings();
+  };
+
+  /**
+   * ── A RECEIPT FOR THE ONE LIMIT NO HARNESS CAN SEE ────────────────────
+   *
+   * The water's fragment stage binds the medium's slot arrays, the depth
+   * texture, the mirror, the transmission target, the sea's derivatives —
+   * and, only in the editor, the shadow maps, the environment and GI. The
+   * portable limit is sixteen and the harness counts nine; the editor
+   * reported seventeen ("The number of sampled textures (17) in the Fragment
+   * stage exceeds the maximum per-stage limit (16)", 2026-09-06). So the
+   * compiled shader is asked, once per build, and the census goes to the
+   * console where `console_read` can see it — by TYPE, since the declarations
+   * are anonymous, which is enough to say what the editor adds.
+   */
+  let reportTimer = null;
+  const reportBindings = () => {
+    const renderer = engine?.renderer;
+    if (!renderer?.debug?.getShaderAsync || !engine?.scene || !engine?.camera) return;
+    clearTimeout(reportTimer);
+    reportTimer = setTimeout(async () => {
+      if (disposed) return;
+      // The water's own two, then every other material in the scene: the
+      // medium (`scene.fogNode`) and the caustic light compile into ALL of
+      // them, so a material that was one binding under the limit before the
+      // water arrived is the one that fails after — and three names the
+      // pipeline, not the material.
+      const seen = new Set();
+      const census = [["water lid", mesh], ["water body", mesh.children?.find?.((c) => c.userData?.vfxSimulation === "water")]];
+      engine.scene.traverse((o) => {
+        const m = Array.isArray(o.material) ? o.material[0] : o.material;
+        if (!o.isMesh || !m || o === mesh || o.parent === mesh || seen.has(m.uuid) || seen.size > 12) return;
+        if (!m.isNodeMaterial || m.userData?.engineOwned) return;
+        seen.add(m.uuid);
+        census.push([`${o.name || o.type} / ${m.name || m.type}`, o]);
+      });
+      for (const [label, object] of census) {
+        if (!object) continue;
+        try {
+          const { fragmentShader } = await renderer.debug.getShaderAsync(engine.scene, engine.camera, object);
+          const kinds = {};
+          for (const m of fragmentShader.matchAll(/@binding\(\s*\d+\s*\)\s*@group\(\s*\d+\s*\)\s*var\s+\w+\s*:\s*(texture_[\w]+)/g)) {
+            if (m[1].startsWith("texture_storage")) continue;
+            kinds[m[1]] = (kinds[m[1]] ?? 0) + 1;
+          }
+          const total = Object.values(kinds).reduce((a, b) => a + b, 0);
+          console.log(`[water] ${label}: fragment binds ${total} sampled textures (portable limit 16): ${
+            Object.entries(kinds).map(([k, n]) => `${n}× ${k}`).join(", ")}${total > 16 ? " ⛔ OVER THE LIMIT" : ""}`);
+        } catch (error) { console.log(`[water] ${label}: binding census failed: ${error?.message ?? error}`); }
+      }
+    }, 3000);
   };
 
   const onWave = () => { if (!disposed && ++rearms <= 8) queueMicrotask(() => { if (!disposed) build(); }); };
@@ -234,6 +286,7 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     get base() { return node?._reflectorBaseNode ?? null; },
     dispose() {
       if (disposed) return; disposed = true;
+      clearTimeout(reportTimer);
       engine?.off?.('gi-compile-wave-done', onWave);
       node?.dispose(); target.removeFromParent();
       material.emissiveNode = previous.emissiveNode; material.colorNode = previous.colorNode;

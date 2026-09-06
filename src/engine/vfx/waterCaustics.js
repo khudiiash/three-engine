@@ -87,7 +87,7 @@ export function waterCausticGainLocalNode(P, slot, level = 0) {
   // `level` is the mip the caller wants: 0 for a receiver, which needs every
   // filament, and a coarse one for the light shafts, which are integrating
   // along the beam and cannot afford the variance. See `causticTarget`.
-  const floorFocus = slot.nodes.caustic.sample(uv.clamp(.001, .999)).depth(slot.index).level(level).x;
+  const floorFocus = slot.nodes.caustic.sample(uv.clamp(.001, .999)).depth(slot.causticLayer).level(level).x;
   // The map is measured AT the floor. A receiver higher in the column has had
   // less distance over which to focus, so the compression is interpolated
   // toward 1 at the surface rather than stamped at full strength on everything
@@ -159,7 +159,7 @@ export function waterCausticAboveNode(P, slot) {
   const rise = s.flatRay.y.negate().max(.05);
   const reach = s.half.y.div(rise);
   const { uv, edge } = causticWindowUv(vec2(surfaceX.add(s.flatRay.x.mul(reach)), surfaceZ.add(s.flatRay.z.mul(reach))), s);
-  const focus = slot.nodes.caustic.sample(uv.clamp(.001, .999)).depth(slot.index).level(0).x;
+  const focus = slot.nodes.caustic.sample(uv.clamp(.001, .999)).depth(slot.causticLayer).level(0).x;
   // The pattern softens with distance from the surface, as a real one does —
   // over the volume's own depth, so it is scale-free like everything else here.
   const spread = height.div(s.half.y.max(.001)).clamp(0, 1);

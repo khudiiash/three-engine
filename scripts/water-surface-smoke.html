@@ -50,8 +50,11 @@ try{
   const s=[0,0,0],o=[0,0,0];
   for(const c of cpu.cascades){const d=sampleDisplacement(c.displacement,c.size,c.L,rx*ws.x,rz*ws.z);s[0]+=d[0];s[1]+=d[1];s[2]+=d[2];}
   for(const c of own.cascades){const d=sampleDisplacement(c.displacement,c.size,c.L,rx*ws.x,rz*ws.z);o[0]+=d[0];o[1]+=d[1];o[2]+=d[2];}
-  const e=[Math.abs(data[i]-(rx+s[0]/ws.x)),Math.abs(data[i+1]-s[1]/ws.y),Math.abs(data[i+2]-(rz+s[2]/ws.z))];
-  const eo=[Math.abs(data[i]-(rx+o[0]/ws.x)),Math.abs(data[i+1]-o[1]/ws.y),Math.abs(data[i+2]-(rz+o[2]/ws.z))];
+  // The solver holds the horizontal displacement to zero at the rim (gridSimulation's `edgeHold`).
+  const mx=Math.min(Math.min(p.width,p.height)*.12,2/ws.x),mz=Math.min(Math.min(p.width,p.height)*.12,2/ws.z);
+  const hold=Math.min(1,Math.max(0,(p.width/2-Math.abs(rx))/mx))*Math.min(1,Math.max(0,(p.height/2-Math.abs(rz))/mz));
+  const e=[Math.abs(data[i]-(rx+s[0]/ws.x*hold)),Math.abs(data[i+1]-s[1]/ws.y),Math.abs(data[i+2]-(rz+s[2]/ws.z*hold))];
+  const eo=[Math.abs(data[i]-(rx+o[0]/ws.x*hold)),Math.abs(data[i+1]-o[1]/ws.y),Math.abs(data[i+2]-(rz+o[2]/ws.z*hold))];
   for(let c=0;c<3;c++){errors3[c]=Math.max(errors3[c],e[c]);ownErrors[c]=Math.max(ownErrors[c],eo[c]);}
   const m=Math.max(...e);if(m>worst){worst=m;worstAt={ix,iz,gpu:[data[i],data[i+1],data[i+2]],cpu:[rx+s[0]/ws.x,s[1]/ws.y,rz+s[2]/ws.z],own:[rx+o[0]/ws.x,o[1]/ws.y,rz+o[2]/ws.z]};}}
  console.log('WATER: vertex vs CPU spec, max error per axis',JSON.stringify(errors3.map(v=>+v.toFixed(4))),'| vs GPU own maps',JSON.stringify(ownErrors.map(v=>+v.toFixed(4))));
@@ -80,7 +83,7 @@ try{
  // readback path.
  {
   const quad=new THREE.Mesh(new THREE.PlaneGeometry(2,2),new THREE.MeshBasicNodeMaterial());
-  quad.material.colorNode=texture(slot.caustic,uvNode()).depth(slot.index).mul(1/8);quad.material.fog=false;
+  quad.material.colorNode=texture(slot.caustic,uvNode()).depth(slot.causticLayer).mul(1/8);quad.material.fog=false;
   const flat=new THREE.Scene();flat.add(quad);
   const ortho=new THREE.OrthographicCamera(-1,1,1,-1,0,1);ortho.position.z=.5;
   renderer.setRenderTarget(target);await renderer.render(flat,ortho);

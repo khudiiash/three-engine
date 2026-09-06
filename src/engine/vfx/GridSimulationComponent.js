@@ -155,6 +155,9 @@ export class GridSimulationComponent extends Component {
       if (value.present) source.mesh.userData[key] = value.value;
       else delete source.mesh.userData[key];
     }
+    for (const { material, present, value } of this.sourceClaim.materials ?? []) {
+      if (present) material.userData.giWater = value; else delete material.userData.giWater;
+    }
     source.mesh.visible = this.sourceClaim.visible && source.component.enabled !== false && source.component.materialRenderable !== false;
     const claimedCollider = this.sourceClaim.collider;
     if (claimedCollider?.component.entity && claimedCollider.enabled) claimedCollider.component.setEnabled(true);
@@ -190,6 +193,19 @@ export class GridSimulationComponent extends Component {
     if (active) {
       if (!this.sourceClaim) this.sourceClaim = { visible: source.mesh.visible, tags: Object.fromEntries(["clothHidden", "noMerge", "noBatch"].map((key) => [key, { present: Object.hasOwn(source.mesh.userData, key), value: source.mesh.userData[key] }])) };
       source.mesh.userData.clothHidden = true; source.mesh.userData.noMerge = true; source.mesh.userData.noBatch = true;
+      // ── THE HIDDEN SOURCE MESH'S MATERIAL IS WATER TOO ──────────────────
+      //
+      // The entity's own box is never drawn once the solver replaces it, but
+      // GI still walks it and compiled its authored `Water.mat` with the full
+      // radiance block: seventeen sampled textures, a failed pipeline in the
+      // console for a mesh nobody sees, and 35 s of the compile wave spent on
+      // it ("renderPipeline_Water_147 … (17) … exceeds … (16)", 2026-09-06).
+      // `giWater` takes GI's early return; restored on release.
+      if (this.constructor.type === "water") {
+        this.sourceClaim.materials ??= [source.mesh.material].flat().filter(Boolean).map((material) =>
+          ({ material, present: Object.hasOwn(material.userData ?? {}, "giWater"), value: material.userData?.giWater }));
+        for (const { material } of this.sourceClaim.materials) { (material.userData ??= {}).giWater = true; }
+      }
       source.mesh.visible = false;
       if (this.constructor.type === "water") {
         const collider = this.entity.getComponent("collider");

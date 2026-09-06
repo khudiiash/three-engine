@@ -395,12 +395,28 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // horizontal displacement is real: a crest moves toward its own front, which
   // is what makes it sharp and a trough broad — a heightfield of sines cannot
   // do that, and it was most of why the old surface read as corrugated card.
+  //
+  // ── THE WALL IS A BOUNDARY: NO HORIZONTAL MOTION AT THE RIM ──────────────
+  //
+  // The sea's displacement is x, y AND z, and a rim vertex carried sideways
+  // takes the wall hanging from it along — the whole body sheared with the
+  // waves ("only the top surface should animate", user 2026-09-06). Water
+  // meeting a wall has no horizontal velocity, so the horizontal part fades
+  // to zero over a margin inside the edge (`edgeHold`); the height does not,
+  // which is the waterline the walls follow. Local units, per axis, because
+  // the box is anisotropic; capped at two metres so a lake's rim is not a
+  // seven-metre dead band.
+  const edgeHold = (p) => {
+    const mx = float(Math.min(width, height) * .12).min(float(2).div(u.waveScale.x));
+    const mz = float(Math.min(width, height) * .12).min(float(2).div(u.waveScale.z));
+    return float(width / 2).sub(p.x.abs()).div(mx).clamp(0, 1).mul(float(height / 2).sub(p.z.abs()).div(mz).clamp(0, 1));
+  };
   const seaAt = (p) => seaDisplacementAt(spectrum, vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z)), u.seaLod);
   const surfacePosition = (i) => {
     const p = positions.element(i).xyz;
     if (kind !== "water") return p;
-    const d = seaAt(p);
-    return vec3(p.x.add(d.x.div(u.waveScale.x)), p.y.add(d.y.div(u.waveScale.y)), p.z.add(d.z.div(u.waveScale.z)));
+    const d = seaAt(p), hold = edgeHold(p);
+    return vec3(p.x.add(d.x.div(u.waveScale.x).mul(hold)), p.y.add(d.y.div(u.waveScale.y)), p.z.add(d.z.div(u.waveScale.z).mul(hold)));
   };
   const heightfieldVertex = () => {
     const at = (ix, iy) => iy.mul(n).add(ix);
@@ -415,7 +431,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const p = positions.element(index).xyz.toVar();
     const world = vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z));
     const sea = seaDisplacementAt(spectrum, world, u.seaLod).toVar();
-    const point = vec3(p.x.add(sea.x.div(u.waveScale.x)), p.y.add(sea.y.div(u.waveScale.y)), p.z.add(sea.z.div(u.waveScale.z))).toVar();
+    const hold = edgeHold(p);
+    const point = vec3(p.x.add(sea.x.div(u.waveScale.x).mul(hold)), p.y.add(sea.y.div(u.waveScale.y)), p.z.add(sea.z.div(u.waveScale.z).mul(hold))).toVar();
     // The RIPPLE field's slope, local units, from the rest-spaced neighbours.
     // The mesh normal carries ONLY this: the sea's slope is added per pixel
     // from the derivative cascades (`waterSurfaceLook.js`), where it has a
