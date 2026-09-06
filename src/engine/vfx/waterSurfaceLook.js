@@ -1,6 +1,6 @@
-import { Object3D, Vector3 } from 'three/webgpu';
+import { DepthTexture, Object3D, Vector3 } from 'three/webgpu';
 import {
-  cameraFar, cameraNear, cameraPosition, cameraProjectionMatrix, cameraViewMatrix, float, linearDepth, materialAttenuationColor, materialAttenuationDistance, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
+  cameraFar, cameraNear, cameraPosition, cameraProjectionMatrix, cameraProjectionMatrixInverse, cameraViewMatrix, cameraWorldMatrix, float, linearDepth, materialAttenuationColor, materialAttenuationDistance, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
   positionViewDirection, positionWorld, reflector, refract, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
 } from 'three/tsl';
 import { waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
@@ -38,7 +38,6 @@ let reflecting = false;
 export function installWaterSurfaceLook({ engine, mesh, material, simulation = null, slot = null }) {
   const target = new Object3D(); target.rotation.x = -Math.PI / 2; mesh.add(target);
   const gain = uniform(1), distortion = uniform(.02);
-  const BLIND_REFRACTION_METRES = 1;
   // ⚠ EVERY SLOT THIS TOUCHES IS CAPTURED, and every rebuild starts from the
   // capture rather than from what it built last time — `build()` re-runs on
   // each GI compile wave, and composing onto its own output would stack foam on
@@ -51,6 +50,53 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     giWater: material.userData.giWater,
   };
   let node = null, disposed = false, rearms = 0;
+  // ── THE VIEWPORT'S DEPTH, COPIED BY THE WATER ITSELF ───────────────────
+  //
+  // three's `viewportDepthTexture` decides a depth texture's sample count from
+  // whatever render target is CURRENT when the shader is built or the texture
+  // first bound; a compile path with another target current (the census, a
+  // compile wave) then binds a single-sample 1×1 to a pipeline that declared
+  // a multisampled one ("Sample count (1) … doesn't match expectation"). A
+  // texture that carries a `renderTarget.samples` of its own is read from
+  // that instead, everywhere. So: one depth texture PER RENDER TARGET, pinned
+  // to that target's sample count at creation, chosen by `updateReference`
+  // for whichever target is current — at build, at bind, in every context —
+  // and filled by a copy before the lid draws in the main pass. A target the
+  // water never draws into keeps a 1×1 that is at least consistent.
+  const depthTextures = new Map();
+  // The target three is REALLY drawing into: a canvas with tone mapping or
+  // MSAA goes through the renderer's internal framebuffer target, while
+  // `getRenderTarget()` reads null and `currentSamples` 0 — exactly as
+  // `compileAsync` resolves it.
+  const effectiveTarget = (renderer) => {
+    const current = renderer.getRenderTarget();
+    if (current) return current;
+    if (renderer.needsFrameBufferTarget && typeof renderer._getFrameBufferTarget === 'function') return renderer._getFrameBufferTarget();
+    return renderer._outputRenderTarget ?? null;
+  };
+  const depthTextureFor = (renderer) => {
+    const current = effectiveTarget(renderer);
+    const key = current ?? renderer;
+    let depth = depthTextures.get(key);
+    if (!depth) {
+      depth = new DepthTexture(1, 1);
+      const source = current?.depthTexture;
+      if (source) { depth.type = source.type; depth.format = source.format; }
+      depth.renderTarget = { samples: Math.max(1, current ? (current.samples || 1) : (renderer.currentSamples || 1)) };
+      depthTextures.set(key, depth);
+    }
+    return depth;
+  };
+  const depthNode = texture(new DepthTexture(1, 1));
+  depthNode.updateReference = function (frame) { this.value = depthTextureFor(frame.renderer); return this.value; };
+  const copyViewportDepth = (frame) => {
+    const { renderer } = frame;
+    const current = effectiveTarget(renderer);
+    const depth = depthTextureFor(renderer);
+    const w = current ? current.width : renderer.domElement.width, h = current ? current.height : renderer.domElement.height;
+    if (depth.image.width !== w || depth.image.height !== h) { depth.image.width = w; depth.image.height = h; depth.needsUpdate = true; }
+    renderer.copyFramebufferToTexture(depth);
+  };
 
   /** Is the eye on the +Y side of the water's own surface plane? Scale-free. */
   const eyeAbove = (camera) => {
@@ -111,6 +157,8 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // reflective thing in the scene. Rotating the target by π mirrors about
       // the same plane with its normal turned around, and the oblique clip then
       // keeps the half the eye is actually in.
+      // The opaque scene's depth, before anything nested changes the context.
+      copyViewportDepth(frame);
       const above = eyeAbove(frame.camera);
       target.rotation.x = above ? -Math.PI / 2 : Math.PI / 2;
       target.updateMatrixWorld(true);
@@ -266,29 +314,43 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       const tX = u.halfExtent.x.sub(positionLocal.x.mul(bentLocal.x.sign())).div(bentLocal.x.abs().max(1e-5));
       const tZ = u.halfExtent.z.sub(positionLocal.z.mul(bentLocal.z.sign())).div(bentLocal.z.abs().max(1e-5));
       let column = tFloor.min(tX).min(tZ).max(0).min(u.waterDepth.mul(u.waveScale.y).mul(3));
+      // ── THE DEPTH BEHIND EVERY PIXEL, FROM THE VIEWPORT'S OWN DEPTH BUFFER ─
+      //
+      // The water copies the opaque depth before it draws (`copyViewportDepth`;
+      // multisampled on the editor's viewport, loaded per texel). One copy,
+      // sampled twice: at this pixel, for the column;
+      // at the refracted pixel, for what is there. A pixel's depth unprojects
+      // through the camera to a world point, and the lid's inverse says
+      // whether that point is under the water at all.
+      const viewportDepth = depthNode;
+      const worldAt = (uv, depth) => {
+        const h = cameraWorldMatrix.mul(cameraProjectionMatrixInverse.mul(vec4(uv.x.mul(2).sub(1), uv.y.oneMinus().mul(2).sub(1), depth, 1)));
+        return h.xyz.div(h.w);
+      };
       // ── THE STRAW IN THE GLASS: THE OBJECT BEHIND THE PIXEL SETS THE COLUMN ─
       //
       // An object crossing the surface must appear BROKEN at the waterline: the
       // offset is the water between the surface and the object — nothing at
-      // the waterline, the whole column at the floor. With a published scene
-      // pass (the post chain's depth — the shared viewport depth is the one
-      // that broke pipelines), the column is the distance from this pixel to
-      // the opaque scene behind it, no more than the floor's. Without one, a
-      // metre of water: the floor still bends, an object stays near itself.
-      const sceneDepth = engine?.scenePass?.getTexture?.("depth") ?? null;
-      if (sceneDepth) {
-        const behind = linearDepth(texture(sceneDepth, screenUV)).sub(linearDepth()).mul(cameraFar.sub(cameraNear)).max(0);
-        column = column.min(behind);
-      } else {
-        column = column.min(float(BLIND_REFRACTION_METRES));
-      }
+      // the waterline, the whole column at the floor.
+      const behind = worldAt(screenUV, viewportDepth.sample(screenUV).x).sub(positionWorld).length();
+      column = column.min(behind);
       // `transmission` still scales the travel — the dial that reads as
       // "refraction". From below there is no column: the pixel behind.
       const travel = select(fromBelow, float(0), column.mul(through));
       const exit = positionWorld.add(bentWorld.mul(travel));
       const clip = cameraProjectionMatrix.mul(cameraViewMatrix.mul(vec4(exit, 1)));
       const ndc = clip.xy.div(clip.w).add(1).mul(.5);
-      const refractedUv = vec2(ndc.x, ndc.y.oneMinus()).clamp(.001, .999); // three's own transmission coords (webgpu)
+      const refractedUv = vec2(ndc.x, ndc.y.oneMinus()).clamp(.001, .999);
+      // ── NOTHING ABOVE THE WATER CAN BE SEEN THROUGH IT ─────────────────
+      //
+      // The framebuffer at the refracted pixel may hold an object standing
+      // ABOVE the surface — a crate's faces, painted onto the water behind it
+      // ("there are 2: one is correct, another is broken", user, 2026-09-06,
+      // the seventh report). Unproject what is there: if it stands above the
+      // lid's plane it cannot be behind this pixel's ray, and the pixel reads
+      // straight through itself instead — the floor it covers, undisplaced.
+      const there = modelWorldMatrixInverse.mul(vec4(worldAt(refractedUv, viewportDepth.sample(refractedUv).x), 1)).xyz;
+      const sampleUv = select(there.y.greaterThan(.02), screenUV, refractedUv);
       // ⚠ THE MATERIAL'S OWN ATTENUATION, exactly as three's `volumeAttenuation`
       // read it: colour^(travel / distance), none at an infinite distance. Every
       // water in practice wears the AUTHORED material, whose distance is
@@ -298,7 +360,9 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // user, 2026-09-06). The depth of the water is the MEDIUM's job.
       const beer = select(materialAttenuationDistance.greaterThan(0),
         vec3(materialAttenuationColor).max(1e-4).log().mul(travel.div(materialAttenuationDistance)).exp(), vec3(1));
-      const refracted = viewportTexture(refractedUv).rgb.mul(baseColor).mul(beer).mul(fresnel.oneMinus());
+      // Tinted by the water's colour, as three's transmission tinted it: the
+      // look the user tuned.
+      const refracted = viewportTexture(sampleUv).rgb.mul(baseColor).mul(beer).mul(fresnel.oneMinus());
       // What three's `mix(diffuse, backdrop, transmission)` left of the
       // diffuse — the stylized, less-than-clear water — stays on the colour.
       material.colorNode = mix(mix(baseColor, banded, u.stylized).mul(through.oneMinus()), vec3(1), foam);
@@ -381,6 +445,7 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       engine?.off?.('gi-compile-wave-done', onWave);
       engine?.off?.('scene-pass-changed', onPass);
       node?.dispose(); target.removeFromParent();
+      for (const depth of depthTextures.values()) depth.dispose(); depthTextures.clear();
       material.emissiveNode = previous.emissiveNode; material.colorNode = previous.colorNode;
       material.roughnessNode = previous.roughnessNode; material.normalNode = previous.normalNode;
       material.transmissionNode = previous.transmissionNode; material.thicknessNode = previous.thicknessNode;
