@@ -670,7 +670,17 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const rippleZ = positions.element(south).y.sub(positions.element(north).y).div(2 * sz);
     const steepWorld = vec2(rippleX.mul(rise).div(u.waveScale.x), rippleZ.mul(rise).div(u.waveScale.z)).length();
     const churn = positions.element(index).y.sub(previous.element(index).y).mul(rise).div(h).abs();
-    const source = steepWorld.smoothstep(.35, .8).mul(.14).add(churn.smoothstep(.12, 1).mul(3.5)).add(jacobianFoam.mul(3));
+    // ── FOAM IS MADE BY BREAKING WATER, NOT BY MOTION ─────────────────────
+    //
+    // "Too much foam on interaction, even though I reduced foam to 0.2" (user,
+    // 2026-09-06, a pool white from rim to rim under a bobbing crate). The
+    // churn gate opened at 0.12 m/s — a centimetre ripple at 2 Hz — and the
+    // `foam` dial never touched it (it sets the wave-fold threshold only).
+    // Foam entrains air where water BREAKS: a crest steeper than ~25°, or
+    // water thrown upward at splash speed (half a metre a second and up). The
+    // whole interaction source now sits behind the dial, so 0.2 means a fifth
+    // of the foam a splash would make.
+    const source = u.foam.mul(steepWorld.smoothstep(.45, .9).mul(.5).add(churn.smoothstep(.5, 1.5).mul(3))).add(jacobianFoam.mul(3));
     const around = scratch.element(west).w.add(scratch.element(east).w).add(scratch.element(north).w).add(scratch.element(south).w).mul(.25);
     const spread = mix(positions.element(index).w, around, u.foamSpread);
     positions.element(index).w.assign(spread.mul(u.foamDecay).add(source.mul(u.foamRate)).clamp(0, 1));

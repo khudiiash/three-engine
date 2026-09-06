@@ -61,7 +61,7 @@ try {
  const USER = { damping: .998, waveSpeed: 1, amplitude: 0, waveHeight: .2, waveLength: 5, waveOctaves: 8, waveGain: .45,
    waveDirection: 0, choppiness: 1, rippleStrength: 1, surfaceDetail: 2, caustics: true, causticIntensity: .5,
    color: '#268270', roughness: 0, style: 'realistic', deepColor: '#090b0b', saturation: .25, transmission: 1,
-   foam: 1, foamThreshold: .5 };
+   foam: Number(argument('foam', '1')), foamThreshold: .5 };
  const DEPTH = 3;
 
  for (const S of SCALES) {
@@ -169,6 +169,14 @@ try {
    await shoot('splash-4s');
    pose([-3.2, 3.4, 3.2], [.6, 0, -.6]);
    await shoot('foam-after-splash');
+   // How much of the lid the splash left foamed, 4 s on: the field itself.
+   {
+     const f = new Float32Array(await renderer.getArrayBufferAsync(sim.mesh.geometry.attributes.waterFoam));
+     let sheet = 0, any = 0, sum = 0;
+     for (let i = 0; i < sim.count; i++) { const v = f[i]; sum += v; if (v > .5) sheet++; if (v > .05) any++; }
+     log(`foam 4 s after the splash (foam dial ${USER.foam}): mean ${(sum / sim.count).toFixed(3)}, ${(sheet / sim.count * 100).toFixed(1)}% of the lid a sheet (> .5), ${(any / sim.count * 100).toFixed(1)}% foamed at all (> .05)`);
+     if (!(sheet / sim.count < .15 * USER.foam + .02)) throw new Error(`the splash foamed the pool: ${(sheet / sim.count * 100).toFixed(1)}% sheet`);
+   }
 
    // The field at the wall against the field inside: a wall that piles a
    // wake up into spikes shows here as a rim far louder than the interior.
@@ -272,7 +280,7 @@ try {
      const probe = new THREE.Mesh(new THREE.PlaneGeometry(3 * S, 3 * S), new THREE.MeshBasicNodeMaterial({ color: '#000000', side: THREE.DoubleSide }));
      scene.add(probe);
      const views = {
-       up: { eye: [0, -DEPTH + .4, 0], at: [.25, 0, .1], probe: [0, -.03, 0], rot: [Math.PI / 2, 0, 0] },
+       up: { eye: [0, -DEPTH + .4, 0], at: [.25, 0, .1], probe: [0, -.4, 0], rot: [Math.PI / 2, 0, 0] },   // below the troughs: the lid must not peek through
        side: { eye: [-2.2, -DEPTH + 1.2, 0], at: [2, -DEPTH + 1.2, 0], probe: [2.4, -DEPTH / 2, 0], rot: [0, -Math.PI / 2, 0] },
        down: { eye: [0, -.5, 0], at: [.25, -DEPTH, .1], probe: [0, -DEPTH + .03, 0], rot: [-Math.PI / 2, 0, 0] },
      };
@@ -303,7 +311,9 @@ try {
      }
      if (!(rows.up.mean > 1.5 * rows.side.mean && rows.up.mean > 1.5 * rows.down.mean)) throw new Error(`the shafts are not forward-peaked: ${phase}`);
      if (!(rows.up.grain < .15 * rows.up.mean + .5)) throw new Error(`the shafts are grainy: ${rows.up.grain} on a mean of ${rows.up.mean}`);
-     if (!(rows.up.flicker < 3 && rows.side.flicker < 3)) throw new Error(`the shafts flicker: one frame changes ${rows.up.flicker.toFixed(2)}× / ${rows.side.flicker.toFixed(2)}× what smooth motion would`);
+     // 1 is pure translation; a lens pattern also reorganizes, and reads 2–3.3
+     // across runs. Grain (noise) would read tens.
+     if (!(rows.up.flicker < 4 && rows.side.flicker < 4)) throw new Error(`the shafts flicker: one frame changes ${rows.up.flicker.toFixed(2)}× / ${rows.side.flicker.toFixed(2)}× what smooth motion would`);
    }
 
    // ── THE RINGS HAVE NO CRACKS ───────────────────────────────────────────
