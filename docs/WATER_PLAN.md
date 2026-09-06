@@ -269,6 +269,21 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
 34. `godRays` (0–3, default 1) scales the shafts alone (`slot.uniforms.shafts`),
     apart from `causticIntensity`.
 
+35. OBJECTS SHADOW THE BEAMS THROUGH THE MAP. Each caustic beam's landing
+    point is tested against the sun's shadow map (a depth compare with the
+    sun's bias) when the map is splatted, so a beam landing in the crate's
+    shadow leaves the map and both the floor caustics and the shafts inherit
+    it at no per-material cost. ⚠ three WebGPU keeps the shadow map on the
+    light's SHADOW NODE (`shadowNode.shadowMap.depthTexture`), never on
+    `light.shadow.map`; the caustic light node finds that node during a
+    material build and stores it on the slot pool (`pool.sunShadowNode`), so
+    a map splatted before any material has built has no shadow — the harness
+    ticks twice after its first shot before reading the map. Receipt: the map
+    in the post's shadow 0.000 vs 0.826 outside.
+    The exact per-tap alternative (a shadow sample per shaft tap in the
+    medium) is the fallback if beams must end ABOVE an occluder rather than
+    at its floor shadow.
+
 ## Open
 
 - The refraction pass is a second scene render per water surface per camera

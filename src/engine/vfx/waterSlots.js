@@ -317,10 +317,21 @@ export function createWaterCausticPass({ slot, rippleTexture = null, rippleResol
   const n = CAUSTIC_GRID;
   const u = slot.uniforms;
   const ripple = rippleTexture && uniforms ? rippleSampler({ rippleTexture, rippleResolution, uniforms }) : null;
+  // ── THE SUN'S SHADOW, IN THE MAP ──────────────────────────────────────
+  //
+  // A beam that lands in an object's shadow is dropped here, so the floor's
+  // caustics and the shafts that read this map both inherit the crate's
+  // shadow at no per-material cost ("objects' shadows clip the god rays, as
+  // they should", user, 2026-09-06). One compare against the sun's own
+  // shadow map at the landing point; a 1×1 placeholder when there is none.
+  const shadowPlaceholder = new THREE.DepthTexture(1, 1); shadowPlaceholder.compareFunction = THREE.LessEqualCompare;
+  const shadowDepth = texture(shadowPlaceholder);
+  let shadowLogs = -1;
   const c = {
     normalMatrix: uniform(new THREE.Matrix3()),
     toLocal: uniform(new THREE.Matrix3()),
     sun: uniform(new THREE.Vector3(0, -1, 0)),
+    shadowOn: uniform(0), shadowMatrix: uniform(new THREE.Matrix4()), toWorld: uniform(new THREE.Matrix4()), shadowBias: uniform(0),
   };
   // One vertex per sample of the surface. PlaneGeometry's `uv` is exactly the
   // [0,1] parameterization this needs, and its own positions are never used -
@@ -434,7 +445,13 @@ export function createWaterCausticPass({ slot, rippleTexture = null, rippleResol
   material.colorNode = Fn(() => {
     const oldArea = dFdx(oldPos).length().mul(dFdy(oldPos).length());
     const newArea = dFdx(newPos).length().mul(dFdy(newPos).length());
-    return vec3(oldArea.div(newArea.max(1e-12)).clamp(0, MAX_FOCUS));
+    const focus = oldArea.div(newArea.max(1e-12)).clamp(0, MAX_FOCUS);
+    // The landing point in the sun's shadow map (three's coordinates: y down).
+    const world = c.toWorld.mul(vec4(newPos, 1)).xyz;
+    const sc = c.shadowMatrix.mul(vec4(world, 1));
+    const lit = shadowDepth.sample(vec2(sc.x, float(1).sub(sc.y))).compare(sc.z.add(c.shadowBias));
+    const visibility = select(c.shadowOn.greaterThan(.5), lit, float(1));
+    return vec3(focus.mul(visibility));
   })();
 
   const mesh = new THREE.Mesh(geometry, material);
@@ -446,8 +463,13 @@ export function createWaterCausticPass({ slot, rippleTexture = null, rippleResol
   return {
     uniforms: c,
     /** One small draw per visible water surface, before the frame's own render. */
-    render(renderer) {
+    render(renderer, { sun = null, shadowNode = null } = {}) {
       if (!renderer?.isWebGPURenderer) return;
+      const depth = sun?.castShadow ? (shadowNode?.shadowMap?.depthTexture ?? sun.shadow?.map?.depthTexture ?? null) : null;
+      if (depth && depth.compareFunction && sun.shadow.matrix) { c.shadowOn.value = 1; c.shadowMatrix.value.copy(sun.shadow.matrix); shadowDepth.value = depth; c.shadowBias.value = Number(sun.shadow.bias) || -.002; }
+      else { c.shadowOn.value = 0; shadowDepth.value = shadowPlaceholder; }
+      if (shadowLogs !== c.shadowOn.value) { shadowLogs = c.shadowOn.value; console.log(`[water] caustic beams: sun shadow ${c.shadowOn.value ? 'ON (beams landing in shadow leave the map)' : 'off (no shadow node yet)'}`); }
+      c.toWorld.value.copy(u.inverse.value).invert();
       if (uniforms && spectrum) {
         const ws = uniforms.waveScale.value;
         const spacing = Math.max(u.causticHalf.value.x * ws.x, u.causticHalf.value.y * ws.z) * 2 / (n - 1);

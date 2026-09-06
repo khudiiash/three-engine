@@ -69,6 +69,7 @@ try {
  // ?depth= for the ocean arm (60 m: no floor shows through the medium).
  const DEPTH = Number(argument('depth', '3'));
  globalThis.__waterFoamDebug = argument('foamDebug', '0') === '1';
+ globalThis.__waterSunProbe = argument('sunProbe', '0') === '1';
 
  for (const S of SCALES) {
    const scene = new THREE.Scene();
@@ -261,6 +262,10 @@ try {
      }
      // The map itself, under this view: what the floor is asked to show.
      {
+       // Two ticks first: the beam pass reads the sun's shadow map through the
+       // caustic light's node, which exists only once the materials have built
+       // (the first shot) — a map splatted during the warm-up predates it.
+       await run(2);
        const R = slot.causticTarget.width, px = await renderer.readRenderTargetPixelsAsync(slot.causticTarget, 0, 0, R, R);
        // Inside the lid's footprint only: the window reaches past the rim.
        const cc = slot.uniforms.causticCenter.value, ch = slot.uniforms.causticHalf.value, hh = slot.uniforms.half.value;
@@ -268,6 +273,24 @@ try {
        for (let i = 0; i < R * R; i += 7) { const tx = i % R, ty = (i / R) | 0; const lx = cc.x + (tx / R - .5) * 2 * ch.x, lz = cc.y + (ty / R - .5) * 2 * ch.y; if (Math.abs(lx) < hh.x * .9 && Math.abs(lz) < hh.z * .9) vals.push(halfToFloat(px[i * 4])); }
        vals.sort((a, b) => a - b); const q = (f) => vals[Math.floor(f * (vals.length - 1))];
        log(`caustic map focus: p1 ${q(.01).toFixed(2)} p10 ${q(.1).toFixed(2)} median ${q(.5).toFixed(2)} p90 ${q(.9).toFixed(2)} p99 ${q(.99).toFixed(2)} max ${q(1).toFixed(2)}`);
+       // ── THE MAP IN THE POST'S SHADOW ─────────────────────────────────
+       //
+       // Beams landing where the post shadows the floor are dropped from the
+       // map, so the floor's caustics and the shafts share the shadow.
+       {
+         const sunDir = sun.position.clone().normalize();
+         const inBox = (q, m) => q.x > 1.35 - m && q.x < 1.85 + m && q.z > -1.45 - m && q.z < -.95 + m && q.y <= 1;
+         const crosses = (origin, dir, m) => { const tEnd = (1 - origin.y) / Math.max(1e-6, dir.y); for (let k = 0; k <= 60; k++) if (inBox(origin.clone().addScaledVector(dir, tEnd * k / 60), m)) return true; return false; };
+         let inS = 0, nS = 0, outS = 0, nO = 0;
+         for (let i = 0; i < R * R; i += 5) {
+           const tx = i % R, ty = (i / R) | 0; const lx = cc.x + (tx / R - .5) * 2 * ch.x, lz = cc.y + (ty / R - .5) * 2 * ch.y;
+           if (!(Math.abs(lx) < hh.x * .9 && Math.abs(lz) < hh.z * .9)) continue;
+           const P = new THREE.Vector3(lx * S, -DEPTH, lz * S); const v = halfToFloat(px[i * 4]);
+           if (crosses(P, sunDir, -.1)) { inS += v; nS++; } else if (!crosses(P, sunDir, .15)) { outS += v; nO++; }
+         }
+         log(`caustic map in the post's shadow: mean ${(inS / Math.max(1, nS)).toFixed(3)} over ${nS} texels vs ${(outS / Math.max(1, nO)).toFixed(3)} outside`);
+         if (nS > 50 && !(inS / nS < .35 * (outS / nO))) throw new Error(`the post's shadow does not reach the caustic map: ${(inS / nS).toFixed(3)} vs ${(outS / nO).toFixed(3)}`);
+       }
      }
      await armLens(false); const off = contrastOf(await shoot('caustics-down-off'));
      await armLens(true);

@@ -1399,7 +1399,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       if (causticPass) {
         const nested = globalThis.__giNestedRender;
         globalThis.__giNestedRender = true;
-        try { causticPass.render(renderer); } finally { globalThis.__giNestedRender = nested; }
+        try { causticPass.render(renderer, { sun: anchorEngine?.waterSlots?.sun ?? null, shadowNode: anchorEngine?.waterSlots?.sunShadowNode ?? null }); } finally { globalThis.__giNestedRender = nested; }
       }
       // The sea advances before the surface reads it; the foam field and the
       // ripple texture follow the substeps and precede the render surface.

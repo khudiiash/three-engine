@@ -281,6 +281,11 @@ export class WaterCausticLightNode extends THREE.AnalyticLightNode {
     const lightNodes = builder.lightsNode ? builder.getDataFromNode(builder.lightsNode)?.lightNodes : null;
     const sunNode = (pool.sun && Array.isArray(lightNodes)) ? lightNodes.find((n) => n?.light && n.light === pool.sun) ?? null : null;
     const shadow = sunNode ? (sunNode.shadowNode ?? float(1)) : null;
+    // The sun's shadow map lives on this node (three WebGPU keeps it there,
+    // not on `light.shadow.map`); the caustic beam pass tests its landing
+    // points against it (waterSlots.js).
+    if (sunNode?.shadowNode) pool.sunShadowNode = sunNode.shadowNode;
+    if (globalThis.__waterSunProbe) console.log(`[water] caustic light setup: object ${builder.object?.name || builder.object?.type}, lightsNode ${!!builder.lightsNode}, nodes ${lightNodes?.length ?? -1}, poolSun ${!!pool.sun}, sunNode ${!!sunNode}, shadowNode ${sunNode?.shadowNode?.constructor?.name ?? 'null'}, stored ${!!pool.sunShadowNode}`);
     for (const slot of pool.slots.slice(0, pool.compiled?.count ?? pool.compileShape().count)) {
       const s = slot.uniforms;
       const gain = waterCausticGainNode(positionWorld, slot, normalWorldGeometry);
