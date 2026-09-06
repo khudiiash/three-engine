@@ -153,7 +153,8 @@ try {
    // not chains of dots. Grain = |pixel − its 4 neighbours| over the frame's
    // mean luma, and its change over one frame.
    {
-     pose([1.4, -1.4, 0], [2.6, -1.6, 0]);
+     // The wall FACING the sun (the sun stands at +x: the −x wall's inner face).
+     pose([-1.4, -1.4, 0], [-2.6, -1.6, 0]);
      const a = await shoot('wall-caustics'); await run(1); const b = await shoot('wall-caustics-1f');
      const luma = (px, i) => px[i] * .2126 + px[i + 1] * .7152 + px[i + 2] * .0722;
      let mean = 0, grain = 0, change = 0, n = 0;
@@ -162,7 +163,7 @@ try {
        const around = (luma(a, i - 4) + luma(a, i + 4) + luma(a, i - W * 4) + luma(a, i + W * 4)) / 4;
        mean += l; grain += Math.abs(l - around); change += Math.abs(l - luma(b, i)); n++;
      }
-     log(`wall caustics: grain ${(grain / mean * 100).toFixed(2)}% of the mean luma, one-frame change ${(change / mean * 100).toFixed(2)}%`);
+     log(`wall caustics: grain ${(grain / mean * 100).toFixed(2)}% of the mean luma, one-frame change ${(change / mean * 100).toFixed(2)}% (mean luma ${(mean / n).toFixed(1)})`);
      if (!(grain / mean < .03)) throw new Error(`the wall is dotted: grain ${(grain / mean * 100).toFixed(2)}%`);
    }
 
