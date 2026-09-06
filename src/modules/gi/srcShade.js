@@ -667,7 +667,7 @@ export function createSrcHitLighting({
     // One evaluation per hit, shared by every slot loop below: two texture
     // reads and no ray. Absent entirely when the scene has no water.
     const causticGain = caustics.length
-      ? caustics.reduce((product, slot) => (product ? product.mul(waterCausticGainNode(P, slot)) : waterCausticGainNode(P, slot)), null).toVar()
+      ? caustics.reduce((product, slot) => (product ? product.mul(waterCausticGainNode(P, slot, n)) : waterCausticGainNode(P, slot, n)), null).toVar()
       : null;
     // GI-only: the sun's own path DOWN through the water is absorbed. The
     // raster node cannot subtract (its term can only add); here the gain

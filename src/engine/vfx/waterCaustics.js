@@ -52,8 +52,8 @@ const MAX_GAIN = 2.5;
  * Pure texture reads and arithmetic — no derivatives — so this is callable from
  * a fragment shader AND from a GI compute kernel, which is the entire point.
  */
-export function waterCausticGainNode(P, slot) {
-  return waterCausticGainLocalNode(slot.uniforms.inverse.mul(vec4(P, 1)).xyz, slot);
+export function waterCausticGainNode(P, slot, normal = null) {
+  return waterCausticGainLocalNode(slot.uniforms.inverse.mul(vec4(P, 1)).xyz, slot, 0, normal);
 }
 
 /**
@@ -62,9 +62,21 @@ export function waterCausticGainNode(P, slot) {
  * world only to transform it straight back would be the whole cost of the
  * light shafts spent on nothing.
  */
-export function waterCausticGainLocalNode(P, slot, level = 0) {
+export function waterCausticGainLocalNode(P, slot, level = 0, normal = null) {
   const s = slot.uniforms;
   const local = vec3(P).toVar();
+  // ── A GRAZING BEAM'S FOOTPRINT IS STRETCHED, AND SO IS ITS READ ────────
+  //
+  // The map is measured on the floor, one texel per beam cell. A receiver
+  // the beam meets at an angle sees each cell stretched by 1/cos — a
+  // vertical wall under a high sun by five, ten times — and reading the
+  // map at its full resolution along that stretch turned every filament
+  // into a chain of dots that twinkled as the lens moved ("black stripes
+  // quickly flickering all over the pool walls", 2026-09-06, underwater).
+  // The mip for a stretch of 1/cos is log2(1/cos): the floor stays sharp,
+  // the wall reads the soft elongated bands a real pool wall shows.
+  const graze = normal ? vec3(normal).dot(vec3(s.toSunRefracted)).abs().max(.06) : null;
+  const lod = graze ? float(level).add(graze.reciprocal().log2().clamp(0, 4)) : float(level);
   // ⚠ NOT BOUNDED BELOW BY THE VOLUME FLOOR. It used to be, and that excluded
   // the single most important receiver there is: the floor of the pool sits
   // exactly ON the volume's bottom plane, so `depth < D` was a coin flip on the
@@ -94,7 +106,7 @@ export function waterCausticGainLocalNode(P, slot, level = 0) {
   // `level` is the mip the caller wants: 0 for a receiver, which needs every
   // filament, and a coarse one for the light shafts, which are integrating
   // along the beam and cannot afford the variance. See `causticTarget`.
-  const floorFocus = slot.nodes.caustic.sample(uv.clamp(.001, .999)).depth(slot.causticLayer).level(level).x;
+  const floorFocus = slot.nodes.caustic.sample(uv.clamp(.001, .999)).depth(slot.causticLayer).level(lod).x;
   // The map is measured AT the floor. A receiver higher in the column has had
   // less distance over which to focus, so the compression is interpolated
   // toward 1 at the surface rather than stamped at full strength on everything
@@ -202,7 +214,7 @@ export class WaterCausticLightNode extends THREE.AnalyticLightNode {
     if (!builder.context.irradiance || builder.object?.userData?.vfxSimulation === 'water') return;
     for (const slot of this.light.waterPool.slots) {
       const s = slot.uniforms;
-      const gain = waterCausticGainNode(positionWorld, slot);
+      const gain = waterCausticGainNode(positionWorld, slot, normalWorld);
           // Underwater the incoming beam is the REFRACTED one, steeper than the
       // sun's own direction, so that is the cosine a caustic arrives with. The
       // term is zero outside the volume regardless (`gain - 1` is), so this

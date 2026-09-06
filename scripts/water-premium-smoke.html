@@ -149,6 +149,22 @@ try {
    // horizon — the underside must not be a mirror of the floor everywhere.
    pose([0, -1.2, 0], [1.6, 0, 0]);
    await shoot('from-below');
+   // A pool WALL under water, a metre away: caustics on it must be soft bands,
+   // not chains of dots. Grain = |pixel − its 4 neighbours| over the frame's
+   // mean luma, and its change over one frame.
+   {
+     pose([1.4, -1.4, 0], [2.6, -1.6, 0]);
+     const a = await shoot('wall-caustics'); await run(1); const b = await shoot('wall-caustics-1f');
+     const luma = (px, i) => px[i] * .2126 + px[i + 1] * .7152 + px[i + 2] * .0722;
+     let mean = 0, grain = 0, change = 0, n = 0;
+     for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+       const i = (y * W + x) * 4, l = luma(a, i);
+       const around = (luma(a, i - 4) + luma(a, i + 4) + luma(a, i - W * 4) + luma(a, i + W * 4)) / 4;
+       mean += l; grain += Math.abs(l - around); change += Math.abs(l - luma(b, i)); n++;
+     }
+     log(`wall caustics: grain ${(grain / mean * 100).toFixed(2)}% of the mean luma, one-frame change ${(change / mean * 100).toFixed(2)}%`);
+     if (!(grain / mean < .03)) throw new Error(`the wall is dotted: grain ${(grain / mean * 100).toFixed(2)}%`);
+   }
 
    // ── THE SPLASH: a 0.5 m body arriving at 4 m/s, in the SAME place ──────
    //
