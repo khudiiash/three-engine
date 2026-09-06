@@ -164,6 +164,7 @@ import {
   SEC_RHO,
   SEC_SLOT,
   SEC_SUML,
+  SEC_DIR,
   STAT_CLAMPED,
   STAT_MAXL,
   STAT_SECONDARY,
@@ -316,6 +317,7 @@ export function createSrcSecondaryFrame(store, bins, {
     const raw = (w) => atomicLoad(scratch.element(e.add(uint(w))));
     const word = (w) => uintBitsToFloat(raw(w));
     const P = vec3(word(SEC_P + 0), word(SEC_P + 1), word(SEC_P + 2)).toVar();
+    const rayDir = vec3(word(SEC_DIR + 0), word(SEC_DIR + 1), word(SEC_DIR + 2)).toVar();
     const n = vec3(word(SEC_N + 0), word(SEC_N + 1), word(SEC_N + 2)).toVar();
     const rho = vec3(word(SEC_RHO + 0), word(SEC_RHO + 1), word(SEC_RHO + 2)).toVar();
     // SEC_RHO keeps physical direct reflectance. Only feedback needs R4's
@@ -363,7 +365,7 @@ export function createSrcSecondaryFrame(store, bins, {
         ));
       }
     }
-    const shaded = shade(P, n, rho, Le, emitter, rayIndex, sunGain, sunChromaGain);
+    const shaded = shade(P, n, rho, Le, emitter, rayIndex, sunGain, sunChromaGain, rayDir);
     const Ld = vec3(shaded.L).toVar();
     const sunTransfer = shaded.sunTransfer;
     const sunFacing = shaded.sunFacing;

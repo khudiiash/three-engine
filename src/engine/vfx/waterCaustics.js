@@ -304,6 +304,7 @@ export function updateWaterSlot({ engine, slot, kernel, mesh, simulation, props 
   const scale = Math.max(1e-4, axisX.length(), axisY.length(), axisZ.length());
   simulation.uniforms.refraction.value = REFRACTION_METRES * (simulation.uniforms.transmission.value ?? 1) / scale;
   s.half.value.set(simulation.extent.halfX, Math.max(.01, simulation.extent.depth), simulation.extent.halfZ);
+  s.up.value.set(0, 1, 0).transformDirection(mesh.matrixWorld);
   if (simulation.shape) s.shape.value.set(simulation.shape.kind, simulation.shape.radius, simulation.shape.centerY, simulation.shape.height);
   // ── THE CAUSTIC WINDOW FOLLOWS THE CAMERA, SNAPPED TO ITS TEXELS ────────
   //

@@ -1490,6 +1490,10 @@ export function createSrcProbeSystem({
         // (`waterSlots.js`), so water appearing, changing resolution or being
         // deleted moves uniforms and never rebuilds this kernel.
         caustics: lighting.caustics ?? [],
+        // Stage 3b: what a water surface mirrors — the sun-extracted sky bin
+        // tables (srcSkyBins.js), read by bin as the merge reads them.
+        skyEnv: skyEnvBuild,
+        skyBinWidth: binStore?.cascades?.[0]?.bins ? Math.round(Math.sqrt(binStore.cascades[0].bins / 2)) : 0,
         sun: lighting.sun ?? null,
         lights: lighting.lights ?? [],
         emitters: lighting.emitters ?? [],

@@ -150,6 +150,8 @@ function createSlot(index) {
       // receiver walks back up to find the cell its light came through.
       flatRay: uniform(new THREE.Vector3(0, -1, 0)),
       toSun: uniform(new THREE.Vector3(0, 1, 0)),
+      // The lid's normal in WORLD space (unit), for a ray's incidence on it.
+      up: uniform(new THREE.Vector3(0, 1, 0)),
       // Toward the sun as a SUBMERGED receiver sees it — bent toward the
       // vertical by Snell. A caustic is carried by the refracted beam, so this
       // is the direction its cosine belongs to; `toSun` is the dry one.

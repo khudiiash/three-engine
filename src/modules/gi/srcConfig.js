@@ -175,7 +175,10 @@ export const SECONDARY_LOD_OFFSET = 0;
  * `createSrcBinStore`), so a wider entry costs memory but never a binding: at
  * the high tier's 131,072-entry capacity, 6.29 MB → 8.39 MB.
  */
-export const SECONDARY_HIT_WORDS = 16;
+// 20 since Stage 3b (water): words 16–18 carry the ray's world direction, so
+// [J] can tell a hit seen THROUGH a water surface (Fresnel, absorption, the
+// sky's mirror) from one seen in air. Word 19 is padding.
+export const SECONDARY_HIT_WORDS = 20;
 
 /**
  * Temporal blend rate (plan §4.6), applied to the DEPOSIT ACCUMULATORS rather

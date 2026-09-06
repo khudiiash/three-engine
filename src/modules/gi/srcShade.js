@@ -89,9 +89,10 @@
 
 import { If, Loop, float, int, ivec2, mix, select, step, uint, vec3, vec4 } from "three/tsl";
 import { MAX_LOOP_ALBEDO } from "./srcConfig.js";
-import { hashKey } from "./srcMathTsl.js";
+import { binMorton, dirToBin, hashKey } from "./srcMathTsl.js";
 import { emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
 import { waterCausticAboveNode, waterCausticGainNode } from "../../engine/vfx/waterCaustics.js";
+import { waterInsideNode, waterRimDistanceNode } from "../../engine/vfx/waterShape.js";
 
 /**
  * How far below the mean importance a contributing emitter may be ranked before
@@ -565,6 +566,10 @@ export function createSrcHitLighting({
   lightTree = null,
   count = null,
   sunSplit = null,
+  // Stage 3b (water): the sky a water surface mirrors, as the sun-extracted
+  // bin tables at `skyBinWidth` (`srcSkyBins.js`); null when there is no sky.
+  skyEnv = null,
+  skyBinWidth = 0,
   sunCompensation = null,
   // §11.10 — the sun's SHADOW MAP at hits, GISystem's bundle: `{ slot, count,
   // reversed, matrices[4], biases, normalBiases, sizes, bind(c, texel) }`.
@@ -641,6 +646,7 @@ export function createSrcHitLighting({
     );
   }
   const splitting = splitBundle || splitSlot != null;
+  const skyTable = skyEnv?.tables?.tableFor && skyBinWidth > 0 ? skyEnv.tables.tableFor(skyBinWidth) : null;
 
   return (
     Pin,
@@ -651,6 +657,10 @@ export function createSrcHitLighting({
     rayIndex,
     sunGainIn = null,
     sunChromaGainIn = null,
+    // The ray's world direction, when the caller has it ([J] does since Stage
+    // 3b): what this hit is seen THROUGH. Null keeps the one-kernel form and
+    // `test:gi-src-shade`'s identity untouched.
+    dirIn = null,
   ) => {
     const P = vec3(Pin).toVar();
     const n = vec3(nIn).toVar();
@@ -659,8 +669,53 @@ export function createSrcHitLighting({
     const causticGain = caustics.length
       ? caustics.reduce((product, slot) => (product ? product.mul(waterCausticGainNode(P, slot)) : waterCausticGainNode(P, slot)), null).toVar()
       : null;
+    // GI-only: the sun's own path DOWN through the water is absorbed. The
+    // raster node cannot subtract (its term can only add); here the gain
+    // multiplies a VISIBILITY, where a factor below one is exactly right.
+    if (causticGain) for (const slot of caustics) {
+      const s = slot.uniforms;
+      const local = s.inverse.mul(vec4(P, 1)).xyz;
+      const wet = waterInsideNode(vec4(s.shape), s.half, local);
+      const sigma = float(s.sigma.x).add(s.sigma.y).add(s.sigma.z).div(3);
+      const slant = float(1).div(vec3(s.toSunRefracted).y.max(.25));
+      causticGain.mulAssign(select(wet, sigma.mul(local.y.negate().mul(s.rise)).mul(slant).negate().exp(), float(1)));
+    }
     const sunGain = sunGainIn == null ? float(1) : float(sunGainIn);
     const sunChromaGain = sunChromaGainIn == null ? sunGain : float(sunChromaGainIn);
+    // ── THE WATER SEEN THROUGH ITS SURFACE (Stage 3b, second half) ────────
+    //
+    // A ray that reached this hit by crossing a water surface brought back
+    // what a water surface hands on: the hit's light through the column it
+    // crossed, times (1 − F) — and the SKY's mirror, times F, at the flat
+    // surface (the waves' glint is the mirrored-sun term above; the sky's
+    // mirror is read from the sun-extracted bin tables, so no glint and no
+    // flicker enters a probe). Absent entirely without water or a direction.
+    const throughWater = caustics.length && dirIn ? vec3(1).toVar() : null;
+    const mirrorL = throughWater ? vec3(0).toVar() : null;
+    if (throughWater) for (const slot of caustics) {
+      const s = slot.uniforms;
+      const dir = vec3(dirIn).toVar();
+      const local = s.inverse.mul(vec4(P, 1)).xyz.toVar();
+      const dl = s.inverse.mul(vec4(dir, 0)).xyz.toVar();
+      If(local.y.lessThan(0).and(dl.y.lessThan(-1e-5)), () => {
+        // Back along the ray to the rest plane, in world metres (dir is unit).
+        const t = local.y.div(dl.y).toVar();
+        const cross = local.sub(dl.mul(t));
+        If(waterRimDistanceNode(vec4(s.shape), s.half, cross.x, cross.z).greaterThan(0), () => {
+          const up = vec3(s.up).toVar();
+          const cosI = dir.dot(up).negate().clamp(0, 1);
+          const F = float(.02).add(float(.98).mul(cosI.oneMinus().pow(5))).toVar();
+          throughWater.mulAssign(vec3(s.sigma).mul(t).negate().exp().mul(F.oneMinus()));
+          if (skyTable && skyEnv) {
+            const rd = dir.sub(up.mul(dir.dot(up).mul(2))).normalize();
+            const ij = dirToBin(rd, skyBinWidth);
+            const m = binMorton(ij.x, ij.y);
+            const tap = vec3(skyTable.node.element(m).xyz);
+            mirrorL.addAssign(select(skyTable.ready.greaterThan(.5), tap.mul(skyEnv.intensity), vec3(0)).mul(F));
+          }
+        });
+      });
+    }
 
     // ── E: irradiance arriving at the hit ───────────────────────────────────
     const E = vec3(0).toVar();
@@ -1150,11 +1205,15 @@ export function createSrcHitLighting({
     // SAME physical one the rest of the direct expression uses, so recombining the two
     // halves at the deposit's own sun angle is an algebraic identity — which is
     // what `createSrcHitShader` below does and what the gate asserts.
+    // Seen through water: the hit's light attenuated, plus the sky's mirror.
+    // The sun's transfer (re-evaluated by [F]) crosses the same column.
+    if (throughWater) out.assign(out.mul(throughWater).add(mirrorL));
+    const transfer = sunVis ? rho.mul(sunVis).mul(1 / Math.PI) : null;
     return {
       L: out,
       sunVis,
       sunFacing,
-      sunTransfer: sunVis ? rho.mul(sunVis).mul(1 / Math.PI).toVar() : null,
+      sunTransfer: transfer ? (throughWater ? transfer.mul(throughWater) : transfer).toVar() : null,
     };
   };
 }

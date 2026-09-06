@@ -455,6 +455,8 @@ export const SEC_RAY = 14;  // the ray's index in the global R2 sequence (a u32,
  * deposit and knows nothing about radiance.
  */
 export const SEC_SUML = 15;
+/** The ray's world direction (unit), for what the hit is seen THROUGH. */
+export const SEC_DIR = 16;
 export const SEC_HIT_WORDS = SECONDARY_HIT_WORDS;
 
 /** Diagnostic words — the `Lmax` decision's instrument, plus the ray tallies. */
@@ -1848,6 +1850,9 @@ export function createSrcDepositFrame(store, bins, {
             // from, so a float round-trip here would move the pick.
             put(SEC_RAY, n);
             put(SEC_SUML, sec.sumL);
+            put(SEC_DIR + 0, floatBitsToUint(dir.x));
+            put(SEC_DIR + 1, floatBitsToUint(dir.y));
+            put(SEC_DIR + 2, floatBitsToUint(dir.z));
             If(sec.emitter.lessThan(-1.5), () => { atomicAdd(stats.element(uint(STAT_MOVER_RECORDS)), uint(1)); });
           }).Else(() => {
             atomicAdd(stats.element(uint(STAT_SEC_OVERFLOW)), uint(1));
