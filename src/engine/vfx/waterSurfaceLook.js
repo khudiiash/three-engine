@@ -298,7 +298,16 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // user, 2026-09-06). The depth of the water is the MEDIUM's job.
       const beer = select(materialAttenuationDistance.greaterThan(0),
         vec3(materialAttenuationColor).max(1e-4).log().mul(travel.div(materialAttenuationDistance)).exp(), vec3(1));
-      const refracted = viewportTexture(refractedUv).rgb.mul(baseColor).mul(beer).mul(fresnel.oneMinus());
+      // ⚠ NOT TINTED BY THE WATER'S COLOUR. three's transmission multiplied the
+      // sample by the material's diffuse colour — a flat teal filter with
+      // almost no red in it, so a red crate's submerged half came through
+      // nearly black: the "incorrect reflection" hanging under the cube
+      // (user, 2026-09-06, five reports; it was never a reflection — a mirror
+      // can only add light, and the block was darker than the floor). Water is
+      // clear at its surface; its colour is absorption over DISTANCE, which
+      // the medium already applies per pixel along the real path. Only the
+      // interface's Fresnel and the material's own attenuation remain.
+      const refracted = viewportTexture(refractedUv).rgb.mul(beer).mul(fresnel.oneMinus());
       // What three's `mix(diffuse, backdrop, transmission)` left of the
       // diffuse — the stylized, less-than-clear water — stays on the colour.
       material.colorNode = mix(mix(baseColor, banded, u.stylized).mul(through.oneMinus()), vec3(1), foam);

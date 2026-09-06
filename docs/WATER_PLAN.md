@@ -172,6 +172,14 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     world space, the column to the first wall/floor, the exit projected and
     read from the same viewport copy, tinted colour × Beer over the column.
     `material.transmission` stays 0 on a water lid.
+27. The "incorrect reflection" under a floating red crate was never a
+    reflection — a mirror can only ADD light and the block was darker than
+    the floor. It was the crate's submerged half, seen through a surface that
+    multiplied everything by the material's diffuse colour (three's
+    transmission does: `transmittance = diffuseColor · Beer`), a flat teal
+    filter with almost no red. The interface is clear now — Fresnel and the
+    material's own attenuation only; the water's colour is the MEDIUM's
+    absorption over the real path. Diagnose a dark ghost by its SIGN first.
 
 ## Open
 
