@@ -55,6 +55,7 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
   };
   let node = null, disposed = false, rearms = 0;
   const refractionTargets = new WeakMap(), refractionCameras = new WeakMap();
+  let refractionRenders = 0;
   const refractionColour = texture(_placeholder.texture), refractionDepth = texture(_placeholder.depthTexture);
   const refractionInverseViewProjection = uniform(new Matrix4());
 
@@ -128,12 +129,24 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       globalThis.__giNestedRender = true;
       mesh.visible = false;
       try {
-        // The other half first, with the medium ARMED: what is seen through
+        // ⚠ THE MIRROR FIRST. A nested render rewrites the node frame's
+        // `camera`, `material` and `object` for every object it draws and
+        // never puts them back; the reflector reads `frame.camera` and hides
+        // `frame.material` for its own pass. Run after the refraction it
+        // mirrored the virtual camera's oblique projection and hid a random
+        // scene material — the surface turned into a pale sheet of sky with a
+        // second crate in it ("now its completely broken", user, 2026-09-06).
+        // The refraction pass restores the frame's fields itself as well.
+        let mirrored;
+        if (gain.value !== 0) {
+          for (const s of slots) s.uniforms.active.value = 0;
+          mirrored = original(frame);
+          for (let i = 0; i < slots.length; i++) slots[i].uniforms.active.value = armed[i];
+        }
+        // Then the other half, with the medium ARMED: what is seen through
         // the surface crosses the water.
         renderRefraction(frame, above);
-        if (gain.value === 0) return;
-        for (const s of slots) s.uniforms.active.value = 0;
-        return original(frame);
+        return mirrored;
       } finally {
         reflecting = false;
         mesh.visible = body;
@@ -167,7 +180,12 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       const { scene, camera, renderer } = frame;
       let rt = refractionTargets.get(camera), vc = refractionCameras.get(camera);
       if (!rt) { rt = new RenderTarget(1, 1, { type: HalfFloatType, depthTexture: new DepthTexture(1, 1) }); rt.texture.generateMipmaps = false; refractionTargets.set(camera, rt); }
-      if (!vc) { vc = camera.clone(); vc.matrixAutoUpdate = false; vc.matrixWorldAutoUpdate = false; refractionCameras.set(camera, vc); }
+      // ⚠ `clone(false)`: the editor camera carries children, and a deep clone
+      // would drag them along. And the LAYER MASK is copied per render, not
+      // once — the GI prepass restricts the camera's layers while it runs,
+      // and a clone taken then would draw only that layer for ever.
+      if (!vc) { vc = camera.clone(false); vc.matrixAutoUpdate = false; vc.matrixWorldAutoUpdate = false; refractionCameras.set(camera, vc); }
+      vc.layers.mask = camera.layers.mask;
       vc.coordinateSystem = camera.coordinateSystem; vc.near = camera.near; vc.far = camera.far;
       vc.matrixWorld.copy(camera.matrixWorld); vc.matrixWorldInverse.copy(camera.matrixWorldInverse);
       vc.projectionMatrix.copy(camera.projectionMatrix);
@@ -201,12 +219,27 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       renderer.setRenderTarget(rt);
       renderer.autoClear = true;
       const previousName = scene.name;
+      const frameCamera = frame.camera, frameMaterial = frame.material, frameObject = frame.object, frameScene = frame.scene;
       scene.name = (scene.name || 'Scene') + ' [ Water refraction ]';
+      // The counters reset at the start of every render (info.autoReset), so
+      // after the nested render they are the nested render's own.
+      const calls0 = renderer.info.render.calls, tris0 = renderer.info.render.triangles;
       try { renderer.render(scene, vc); } finally {
         scene.name = previousName;
         renderer.setMRT(currentMRT);
         renderer.setRenderTarget(current);
         renderer.autoClear = currentAutoClear;
+        frame.camera = frameCamera; frame.material = frameMaterial; frame.object = frameObject; frame.scene = frameScene;
+      }
+      const draws = renderer.info.autoReset ? renderer.info.render.calls : renderer.info.render.calls - calls0;
+      const tris = renderer.info.autoReset ? renderer.info.render.triangles : renderer.info.render.triangles - tris0;
+      // A receipt readable without a screenshot: the first renders and then
+      // one in three hundred (console_read); the third also reads the target
+      // back — its mean and a 3×3 grid of samples, top row first.
+      refractionRenders++;
+      if (refractionRenders <= 3 || refractionRenders % 900 === 0) {
+        const list = renderer._renderLists?.get?.(scene, vc);
+        console.log(`[water] refraction pass #${refractionRenders}: ${draws} draws, ${tris} tris, list ${list ? `${list.opaque?.length ?? '?'} opaque / ${list.transparent?.length ?? '?'} transparent` : 'n/a'}, ${w}×${h}, ${above ? 'eye above' : 'eye below'}, fog ${scene.fogNode ? 'armed' : 'none'}, main target ${current ? `${current.width}×${current.height} samples ${current.samples}` : 'canvas'}`);
       }
     };
 
@@ -375,10 +408,12 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // user, 2026-09-06). The depth of the water is the MEDIUM's job.
       const beer = select(materialAttenuationDistance.greaterThan(0),
         vec3(materialAttenuationColor).max(1e-4).log().mul(travel.div(materialAttenuationDistance)).exp(), vec3(1));
-      // Not tinted by the water's colour: the interface is clear, the medium
-      // colours the path (a flat teal filter made a red crate's submerged half
-      // near-black — the "incorrect reflection" of five reports).
-      const refracted = refractionColour.sample(refractedUv).rgb.mul(beer).mul(fresnel.oneMinus());
+      // TINTED BY THE WATER'S COLOUR, as three's transmission tinted it
+      // (transmittance = diffuseColor · Beer): that teal filter is the look the
+      // user tuned, and taking it away "destroyed the water tint" (user,
+      // 2026-09-06). A red object's submerged part reads dark through it — the
+      // price of the filter, and theirs to set with the colour control.
+      const refracted = refractionColour.sample(refractedUv).rgb.mul(baseColor).mul(beer).mul(fresnel.oneMinus());
       // What three's `mix(diffuse, backdrop, transmission)` left of the
       // diffuse — the stylized, less-than-clear water — stays on the colour.
       material.colorNode = mix(mix(baseColor, banded, u.stylized).mul(through.oneMinus()), vec3(1), foam);
