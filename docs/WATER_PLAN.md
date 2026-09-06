@@ -130,6 +130,12 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
 18. "Flickering stripes on the pool walls" underwater was the water body's
     side shell z-fighting the pool's walls; the shell carries a polygon
     offset now. Reproduce the user's SCENE before touching the effect.
+20. The fog node is in EVERY material: its size is the editor's responsiveness.
+    A floor material read 362 kB of fragment WGSL (24 shaft taps unrolled ×
+    2 slots + four primitives' clips ×2 + the caustic light ×2) — 10–15 s
+    freezes on every minted material. A GPU loop and `pool.compileShape()`
+    (claimed slots, used shapes) bring it to 50 kB. Measure the floor's kB
+    (bindings smoke) before adding anything to the medium.
 19. Caustic receivers: the window reaches past the rim by the beams' lateral
     travel; walls read the map at the grazing mip plus a defocus that grows
     with height above the floor; the caustic light's cosine is the geometric
