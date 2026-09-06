@@ -201,8 +201,18 @@ export function waterCausticAboveNode(P, slot) {
   const focus = slot.nodes.caustic.sample(uv.clamp(.001, .999)).depth(slot.causticLayer).level(0).x;
   // The pattern softens with distance from the surface, as a real one does —
   // over the volume's own depth, so it is scale-free like everything else here.
-  const spread = height.div(s.half.y.max(.001)).clamp(0, 1);
-  const lens = mix(focus, float(1), spread.smoothstep(0, 1.5));
+  // ── A WAVE'S REFLECTION FOCUSES EIGHT TIMES CLOSER THAN ITS REFRACTION ──
+  //
+  // The map is the refracted lens measured at the floor, a depth D down. A
+  // wave crest of curvature radius R focuses reflected light at R/2 and
+  // refracted light near 4R (n/(n−1) for water), so the reflected pattern
+  // reaches the floor map's sharpness at a height of about D/8 — and stays
+  // a caustic network above it, as any pool ceiling shows. It used to fade
+  // the pattern out over 1.5 depths ("reflected caustics … way too faint",
+  // user, 2026-09-06): at a catcher 2.4 m over a 3 m pool nine tenths of
+  // the contrast was gone. From 1 at the surface to the map's focus at D/8.
+  const spread = height.div(s.half.y.mul(.125).max(.001)).clamp(0, 1);
+  const lens = mix(float(1), focus, spread);
   return select(inside, lens.mul(s.strength).mul(edge).clamp(0, MAX_GAIN), float(0));
 }
 

@@ -342,6 +342,58 @@ try {
      if (!(rows.up.flicker < 4 && rows.side.flicker < 4)) throw new Error(`the shafts flicker: one frame changes ${rows.up.flicker.toFixed(2)}× / ${rows.side.flicker.toFixed(2)}× what smooth motion would`);
    }
 
+   // ── REFLECTED CAUSTICS ON A SURFACE ABOVE THE POOL ──────────────────────
+   //
+   // "Reflected caustics on the outside surfaces" (user, 2026-09-06). The sun
+   // stands at +x (+z): light reflected off the water leaves AWAY from it, up
+   // and toward −x, so the catcher — a white slab tilted to face the pool —
+   // hangs on the −x side. Its underside is in its own shadow; what it shows
+   // is the mirrored sun through the reflected lens, and nothing else. The
+   // receipt is the underside's contrast with the lens on against off.
+   if (S <= 20) {
+     const catcher = new THREE.Mesh(new THREE.BoxGeometry(3, .08, 4), new THREE.MeshStandardNodeMaterial({ color: '#ffffff', roughness: .9 }));
+     catcher.position.set(-2.6, 2.4, 0); catcher.rotation.z = Math.PI / 7; scene.add(catcher);
+     const lensOn = async (on) => { const p = { ...props, causticIntensity: on ? props.causticIntensity : 0 }; sim.update(p); updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); };
+     pose([.6, 1.4, 1.8], [-2.4, 2.2, 0]);
+     // (No ticks between arming and shooting: `step` re-arms the slot from the
+     // ORIGINAL props, which is what made the first version of this receipt
+     // read on = off while the picture showed the network.)
+     await lensOn(true); const on = await shoot('reflected-caustics');
+     await lensOn(false); const off = await shoot('reflected-caustics-off');
+     await lensOn(true);
+     const luma = (px, i) => px[i] * .2126 + px[i + 1] * .7152 + px[i + 2] * .0722;
+     const stats = (px) => { let m = 0, n = 0; for (let y = H * .15; y < H * .6; y++) for (let x = W * .1; x < W * .7; x++) { m += luma(px, ((y | 0) * W + (x | 0)) * 4); n++; } m /= n; let v = 0; for (let y = H * .15; y < H * .6; y++) for (let x = W * .1; x < W * .7; x++) { const d = luma(px, ((y | 0) * W + (x | 0)) * 4) - m; v += d * d; } return { mean: m, contrast: Math.sqrt(v / n) / Math.max(1, m) }; };
+     const a = stats(on), b = stats(off);
+     log(`reflected caustics on the catcher's underside: lens on → mean ${a.mean.toFixed(1)}, contrast ${(a.contrast * 100).toFixed(1)}% · off → mean ${b.mean.toFixed(1)}, contrast ${(b.contrast * 100).toFixed(1)}%`);
+     // The node itself, painted: the reflected lens, the mirrored-sun cosine and the surface point's inside test.
+     if (argument('probeAbove', '0') === '1') {
+       const { waterCausticAboveNode } = await import('/src/engine/vfx/waterCaustics.js');
+       const { positionWorld: PW, normalWorldGeometry: NG, vec3: V3, vec4: V4, select: SEL, float: F } = await import('three/tsl');
+       const { waterRimDistanceNode } = await import('/src/engine/vfx/waterShape.js');
+       const s2 = slot.uniforms;
+       const paint = (node) => { catcher.material = new THREE.MeshBasicNodeMaterial(); catcher.material.fog = false; catcher.material.colorNode = Fn(() => node)(); };
+       const read = async (label) => { const px = await shoot(`probe-${label}`); const st = stats(px); log(`   probe ${label}: mean ${st.mean.toFixed(2)} (8-bit sRGB)`); };
+       paint(waterCausticAboveNode(PW, slot).toVec3()); await read('lens');
+       paint(NG.dot(s2.toSunMirror).max(0).toVec3()); await read('under');
+       const local = s2.inverse.mul(V4(PW, 1)).xyz; const ray = V3(s2.mirrorRay); const climb = ray.y.negate().max(.05);
+       const sx = local.x.add(ray.x.mul(local.y).div(climb)), sz = local.z.add(ray.z.mul(local.y).div(climb));
+       paint(SEL(waterRimDistanceNode(V4(s2.shape), s2.half, sx, sz).greaterThan(0), F(1), F(0)).toVec3()); await read('inside');
+       paint(V3(s2.radiance).mul(s2.reflectance)); await read('radiance×reflectance');
+       paint(V3(s2.radiance).mul(NG.dot(s2.toSunMirror).max(0)).mul(s2.reflectance).mul(waterCausticAboveNode(PW, slot))); await read('the whole term');
+       // ...and the lit material at ten times the intensity.
+       catcher.material = new THREE.MeshStandardNodeMaterial({ color: '#ffffff', roughness: .9 });
+       { const p = { ...props, causticIntensity: 5 }; sim.update(p); updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: p }); for (const fn of engine._tickers) fn(); await run(2); }
+       await read('lit, intensity 5');
+       await lensOn(true);
+       log(`   uniforms: reflectance ${s2.reflectance.value.toFixed(4)} radiance ${s2.radiance.value.r.toFixed(2)} toSunMirror ${s2.toSunMirror.value.toArray().map((v) => v.toFixed(2))} mirrorRay ${s2.mirrorRay.value.toArray().map((v) => v.toFixed(3))} strength ${s2.strength.value}`);
+     }
+     // The mirrored sun at a 2 % Fresnel is a few percent of a lit slab's
+     // ambient; the network is what the eye sees (the picture), the mean is
+     // what the number can hold.
+     if (!(a.mean > b.mean * 1.04)) throw new Error(`the catcher shows no reflected caustic: ${JSON.stringify({ a, b })}`);
+     scene.remove(catcher);
+   }
+
    // ── THE RINGS HAVE NO CRACKS ───────────────────────────────────────────
    //
    // Every boundary vertex of level ℓ−1 must land on level ℓ's own surface:

@@ -256,7 +256,15 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // `transmission` still scales it — the dial that reads as "refraction".
       const toEye = eyeLocal.sub(positionLocal).normalize();
       const bent = refract(toEye.negate(), lidNormalLocal, float(1 / 1.333));
-      const column = u.waterDepth.div(bent.y.negate().max(.2)).min(u.waterDepth.mul(3));
+      // ⚠ CLIPPED TO THE VOLUME. The bent ray ends at the first thing it meets
+      // — the floor OR a wall. Unclipped, a grazing ray's exit point landed
+      // outside the pool and three sampled the backdrop THERE: the sky drawn
+      // inside the water ("those incorrect reflections are back", user,
+      // 2026-09-06 — the same ghost the old depth thickness had made).
+      const tFloor = u.waterDepth.div(bent.y.negate().max(.05));
+      const tX = u.halfExtent.x.sub(positionLocal.x.mul(bent.x.sign())).div(bent.x.abs().max(1e-4));
+      const tZ = u.halfExtent.z.sub(positionLocal.z.mul(bent.z.sign())).div(bent.z.abs().max(1e-4));
+      const column = tFloor.min(tX).min(tZ).max(0).min(u.waterDepth.mul(3));
       // From BELOW the ray leaves into air at the surface: there is no column
       // beyond it (with the up-facing normal `refract` fails and the column
       // read five depths — the backdrop was sampled metres away, which is what
