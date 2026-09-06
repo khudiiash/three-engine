@@ -124,6 +124,16 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     pool under a bobbing crate, and the `foam` dial did not reach it. Steep
     crests (> 25°) or splash speeds (> 0.5 m/s), scaled by the dial.
 16. The GI tests need `npx vite --port 5201`; the water smokes use 5307.
+17. A pool whose floor shows no caustic while a default sphere in it does is
+    a MATERIAL: `buildPbrGraph` made every map-based material without a
+    metalness map a metal (metalness 1 = no diffuse, no caustic, no bounce).
+18. "Flickering stripes on the pool walls" underwater was the water body's
+    side shell z-fighting the pool's walls; the shell carries a polygon
+    offset now. Reproduce the user's SCENE before touching the effect.
+19. Caustic receivers: the window reaches past the rim by the beams' lateral
+    travel; walls read the map at the grazing mip plus a defocus that grows
+    with height above the floor; the caustic light's cosine is the geometric
+    normal.
 
 ## Open
 
