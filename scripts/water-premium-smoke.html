@@ -88,7 +88,7 @@ try {
    const authored = new THREE.MeshPhysicalNodeMaterial({ color: '#8fd8de', roughness: .12, metalness: 0, ior: 1.333,
      transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
    const slot = pool.claim({});
-   const sim = createGridSimulation('water', props, { material: authored, waterSlot: slot, anchorEngine: engine });
+   const sim = createGridSimulation('water', props, { material: authored, waterSlot: slot, anchorEngine: engine, worldScale: { x: S, z: S } });
    holder.add(sim.mesh);
    sim.mesh.matrixAutoUpdate = false;
    sim.mesh.matrix.identity();                 // origin ON the lid, at world y = 0
@@ -97,7 +97,7 @@ try {
    installWaterMedium(engine);
    installWaterCausticLight(engine);
    installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
-   log(`pool ${S} m: resolution ${sim.resolution} (${(S / (sim.resolution - 1) * 100).toFixed(1)} cm cells)`);
+   log(`pool ${S} m: mesh ${sim.resolution} (${(S / (sim.resolution - 1) * 100).toFixed(1)} cm), ripple window ${sim.ripple.resolution} cells over ${(sim.ripple.windowWidth * S).toFixed(1)} m (${(sim.ripple.cellX * S * 100).toFixed(1)} cm cells${sim.ripple.windowed ? ', following the camera' : ''})`);
 
    const camera = new THREE.PerspectiveCamera(55, W / H, .05, 400);
    engine.camera = camera;

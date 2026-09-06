@@ -370,6 +370,7 @@ export function updateWaterSlot({ engine, slot, kernel, mesh, simulation, props 
   const downwelling = source.intensity * luma * Math.max(0, -ray.y);
   s.scatter.value.copy(scatterSource).multiplyScalar(downwelling / Math.PI);
   if (!visible) { s.strength.value = 0; s.radiance.value.setRGB(0, 0, 0); return; }
+  kernel?.update?.();
   for (const stage of [kernel, simulation.causticPass]) {
     if (!stage) continue;
     stage.uniforms.sun.value.copy(ray);

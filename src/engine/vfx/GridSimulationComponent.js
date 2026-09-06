@@ -77,6 +77,15 @@ export class GridSimulationComponent extends Component {
     if (this.constructor.type === "water") props.resolution = waterAutoResolution(this.worldFootprint(plane));
     return props;
   }
+  /** World metres per local unit along the lid's two axes. */
+  worldScaleOf(plane) {
+    const mesh = plane?.mesh; if (!mesh) return { x: 1, z: 1 };
+    mesh.updateWorldMatrix(true, false);
+    const sx = new Vector3().setFromMatrixColumn(mesh.matrixWorld, 0).length();
+    const sy = new Vector3().setFromMatrixColumn(mesh.matrixWorld, 1).length();
+    const sz = new Vector3().setFromMatrixColumn(mesh.matrixWorld, 2).length();
+    return { x: sx, z: plane.box ? sz : sy };
+  }
   /** The source mesh's footprint in world metres — the larger of its two
    *  horizontal extents, which is what sizes the grid. */
   worldFootprint(plane) {
@@ -113,7 +122,9 @@ export class GridSimulationComponent extends Component {
     if (this.constructor.type === "water") this.waterSlot = this.entity.engine.waterSlots?.claim(this) ?? null;
     // One sea model, sized to the tier the scene ships at.
     const quality = this.entity.engine?.project?.settings?.build?.quality ?? this.entity.engine?.projectSettings?.build?.quality ?? "high";
-    this.simulation = createGridSimulation(this.constructor.type, this.resolvedProps, { colliderField: this.colliderField, meshColliderField: this.meshColliderField, colliderEntityId: this.entity.id, material: plane ? this.sourceMaterial(plane.mesh.material) : undefined, sourceGeometry: plane?.geometry, anchorEngine: this.entity.engine, waterSlot: this.waterSlot, seaQuality: seaQuality(quality) });
+    // The ripple window is a size in METRES: hand the solver the box's scale.
+    const worldScale = this.constructor.type === "water" && plane ? this.worldScaleOf(plane) : null;
+    this.simulation = createGridSimulation(this.constructor.type, this.resolvedProps, { colliderField: this.colliderField, meshColliderField: this.meshColliderField, colliderEntityId: this.entity.id, material: plane ? this.sourceMaterial(plane.mesh.material) : undefined, sourceGeometry: plane?.geometry, anchorEngine: this.entity.engine, waterSlot: this.waterSlot, seaQuality: seaQuality(quality), worldScale });
     this.simulation.mesh.userData.entityId = this.entity.id;
     this.entity.object3D.add(this.simulation.mesh);
     this.syncAppearance();
@@ -330,6 +341,8 @@ export class GridSimulationComponent extends Component {
     if (!camera || !material || Array.isArray(material)) return;
     const extent = this.simulation.extent;
     const local = camera.getWorldPosition(_cameraWorld).applyMatrix4(_waterInverse.copy(this.simulation.mesh.matrixWorld).invert());
+    // The ripple window follows the eye (whole-cell steps; see gridSimulation).
+    this.simulation.followCamera?.(local.x, local.z);
     // The waves make "the eye is at the surface" a band, not a plane. Hold the
     // current answer until the eye is clear of the crests either way.
     const swell = Math.max(1e-3, (this.simulation.uniforms.waveHeight.value + this.simulation.uniforms.amplitude.value) * 1.5);

@@ -1,7 +1,7 @@
 import { Object3D, Vector3 } from 'three/webgpu';
 import {
   cameraViewMatrix, float, materialColor, mix, modelNormalMatrix, normalLocal, normalView, positionLocal,
-  positionViewDirection, reflector, screenUV, transformDirection, transformNormalToView, uniform, vec2, vec3,
+  positionViewDirection, reflector, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4,
 } from 'three/tsl';
 import { waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
 import { seaShadingSlopeNode } from './waterSpectrum.js';
@@ -151,7 +151,17 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // reads as cel-shaded largely by not having it.
       const world = vec2(positionLocal.x.mul(u.waveScale.x), positionLocal.z.mul(u.waveScale.z));
       const slope = seaShadingSlopeNode(simulation.spectrum, world, u.surfaceDetail, u.seaLod).mul(mix(float(1), float(.12), u.stylized));
-      const local = vec2(slope.x.mul(u.waveScale.x).div(u.waveScale.y), slope.y.mul(u.waveScale.z).div(u.waveScale.y));
+      let local = vec2(slope.x.mul(u.waveScale.x).div(u.waveScale.y), slope.y.mul(u.waveScale.z).div(u.waveScale.y));
+      // ...and the ripple WINDOW's slope, per pixel too, so a splash reads on
+      // a mesh whose vertices are a metre apart (the mesh normal is flat).
+      if (simulation.rippleTexture) {
+        const w = simulation.ripple.resolution;
+        const t = vec2(positionLocal.x.sub(u.rippleCenter.x).div(u.rippleHalf.x.mul(2)).add(.5), positionLocal.z.sub(u.rippleCenter.y).div(u.rippleHalf.y.mul(2)).add(.5));
+        const inside = t.x.greaterThan(.5 / w).and(t.x.lessThan(1 - .5 / w)).and(t.y.greaterThan(.5 / w)).and(t.y.lessThan(1 - .5 / w));
+        const r = select(inside, texture(simulation.rippleTexture, t), vec4(0));
+        const ny = float(1).sub(r.y.mul(r.y)).sub(r.z.mul(r.z)).max(1e-3).sqrt();
+        local = local.add(vec2(r.y.negate().div(ny), r.z.negate().div(ny)));
+      }
       const perturbed = normalLocal.add(vec3(local.x.negate().mul(normalLocal.y), 0, local.y.negate().mul(normalLocal.y))).normalize();
       material.normalNode = transformNormalToView(perturbed);
     }

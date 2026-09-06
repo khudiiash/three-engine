@@ -1,6 +1,17 @@
 import * as THREE from "three/webgpu";
-import { Fn, dFdx, dFdy, float, instanceIndex, int, ivec2, refract, storageTexture, texture, uniform, uv as uvAttribute, varying, vec2, vec3, vec4 } from "three/tsl";
+import { Fn, dFdx, dFdy, float, instanceIndex, int, ivec2, refract, select, storageTexture, texture, uniform, uv as uvAttribute, varying, vec2, vec3, vec4 } from "three/tsl";
 import { seaDisplacementAt, seaSlopeAt } from "./waterSpectrum.js";
+
+/** The ripple window's sample at a LOCAL point: (height, normal.x, normal.z,
+ *  foam), zero outside the window. Shared by the slot kernel and the lens. */
+function rippleSampler({ rippleTexture, rippleResolution: w, uniforms: u }) {
+  const uv = (local) => vec2(local.x.sub(u.rippleCenter.x).div(u.rippleHalf.x.mul(2)).add(.5), local.z.sub(u.rippleCenter.y).div(u.rippleHalf.y.mul(2)).add(.5));
+  const inside = (t) => t.x.greaterThan(.5 / w).and(t.x.lessThan(1 - .5 / w)).and(t.y.greaterThan(.5 / w)).and(t.y.lessThan(1 - .5 / w));
+  return {
+    at: (local) => { const t = uv(local); return select(inside(t), texture(rippleTexture, t).level(0), vec4(0)); },
+    atOffset: (local, dx, dy) => { const t = uv(local).add(vec2(dx / w, dy / w)); return select(inside(t), texture(rippleTexture, t).level(0), vec4(0)); },
+  };
+}
 
 /**
  * ══ THE WATER SLOT POOL — WHY THE BINDINGS ARE ENGINE-OWNED ════════════════
@@ -217,25 +228,40 @@ export function waterSlotPool(engine) {
  * The solver resample: one stable 256^2 copy of the wave surface for the medium
  * to read. The caustic half of the slot is a DRAW, not a dispatch — see below.
  */
-export function createWaterSlotKernel({ slot, surfaceTexture, resolution }) {
-  const n = resolution;
+/**
+ * The medium's surface map, COMPOSED per slot texel over the whole pool: the
+ * sea's height from the cascades (at the mip that matches a slot texel) plus
+ * the ripple window's height where the texel is inside it, with the ripple
+ * normal's x/z and the ripple height beside it for the caustic lens.
+ */
+export function createWaterSlotKernel({ slot, rippleTexture, rippleResolution, width, height, uniforms, spectrum }) {
   const c = {
     normalMatrix: uniform(new THREE.Matrix3()),
     toLocal: uniform(new THREE.Matrix3()),
     sun: uniform(new THREE.Vector3(0, -1, 0)),
+    seaLod: [uniform(0), uniform(0), uniform(0)],
   };
-  // Map uv to the solver texture's uv. Texel (x,y) of an n x n surface texture
-  // is grid VERTEX (x,y), so the vertices span [0.5/n, (n-0.5)/n] and a naive
-  // `uv` would sample half a cell off at both rims.
-  const toSource = (at) => at.mul((n - 1) / n).add(.5 / n);
+  const ripple = rippleSampler({ rippleTexture, rippleResolution, uniforms });
   const resolve = Fn(() => {
     const i = instanceIndex.toInt().toVar();
     const px = i.mod(SLOT_RESOLUTION).toVar(), py = i.div(SLOT_RESOLUTION).toVar();
-    const at = vec2(px.toFloat().add(.5).div(SLOT_RESOLUTION), py.toFloat().add(.5).div(SLOT_RESOLUTION));
-    storageTexture(slot.surface).depth(int(slot.index)).store(ivec2(px, py), texture(surfaceTexture, toSource(at)).level(0));
+    const local = vec3(px.toFloat().add(.5).div(SLOT_RESOLUTION).sub(.5).mul(width), 0, py.toFloat().add(.5).div(SLOT_RESOLUTION).sub(.5).mul(height));
+    const world = vec2(local.x.mul(uniforms.waveScale.x), local.z.mul(uniforms.waveScale.z));
+    const sea = spectrum ? seaDisplacementAt(spectrum, world, c.seaLod) : vec4(0);
+    const r = ripple.at(local);
+    storageTexture(slot.surface).depth(int(slot.index)).store(ivec2(px, py), vec4(r.x.add(sea.y.div(uniforms.waveScale.y)), r.y, r.z, r.x));
   })().compute(SLOT_RESOLUTION * SLOT_RESOLUTION);
   resolve.__giPassName = "waterSlotSurface";
-  return { compute: [resolve], uniforms: c, toSource };
+  return {
+    compute: [resolve], uniforms: c,
+    /** Per frame: the mip whose texel is no finer than a slot texel. */
+    update() {
+      if (!spectrum) return;
+      const ws = uniforms.waveScale.value;
+      const texel = Math.max(width * ws.x, height * ws.z) / SLOT_RESOLUTION;
+      spectrum.cascades.forEach((casc, i) => { c.seaLod[i].value = Math.max(0, Math.log2(Math.max(1, texel / (casc.L / spectrum.size)))); });
+    },
+  };
 }
 
 /**
@@ -268,15 +294,15 @@ export function createWaterSlotKernel({ slot, surfaceTexture, resolution }) {
  * THE MAP IS IN FLOOR PARAMETERIZATION - a receiver samples where its own beam
  * LANDS, not where it entered. See `waterCausticGainNode`.
  */
-export function createWaterCausticPass({ slot, surfaceTexture, resolution, width, height, uniforms = null, spectrum = null }) {
+export function createWaterCausticPass({ slot, rippleTexture = null, rippleResolution = 1, width, height, uniforms = null, spectrum = null }) {
   const n = CAUSTIC_GRID;
   const u = slot.uniforms;
+  const ripple = rippleTexture && uniforms ? rippleSampler({ rippleTexture, rippleResolution, uniforms }) : null;
   const c = {
     normalMatrix: uniform(new THREE.Matrix3()),
     toLocal: uniform(new THREE.Matrix3()),
     sun: uniform(new THREE.Vector3(0, -1, 0)),
   };
-  const toSource = (at) => at.mul((resolution - 1) / resolution).add(.5 / resolution);
   // One vertex per sample of the surface. PlaneGeometry's `uv` is exactly the
   // [0,1] parameterization this needs, and its own positions are never used -
   // `vertexNode` replaces them outright.
@@ -287,13 +313,11 @@ export function createWaterCausticPass({ slot, surfaceTexture, resolution, width
   });
 
   const at = uvAttribute();
-  const texel = 1 / resolution;
-  // The vertex's place in the SOLVER's uv is where the window puts it, not
-  // where the plane's own uv does: the window is a sub-rectangle of the pool.
   const center = vec2(u.causticCenter), half2 = vec2(u.causticHalf);
-  const windowUv = vec2(center.x.div(width), center.y.div(height)).add(.5)
-    .add(at.sub(.5).mul(vec2(half2.x.mul(2 / width), half2.y.mul(2 / height))));
-  const sampleAt = (dx, dy) => texture(surfaceTexture, toSource(windowUv.add(vec2(dx * texel, dy * texel)))).level(0);
+  // The beam's rest position in LOCAL units — the caustic window's cell.
+  const restXZ = vec3(center.x.add(at.x.sub(.5).mul(half2.x.mul(2))), 0, center.y.add(at.y.sub(.5).mul(half2.y.mul(2))));
+  // The ripple window sampled there (zero outside it), with offsets in ripple cells.
+  const sampleAt = (dx, dy) => (ripple ? ripple.atOffset(restXZ, dx, dy) : vec4(0));
   const info = sampleAt(0, 0);
   /**
    * ⭐ **THE LENS READS A LOW-PASSED NORMAL, AND THAT IS NOT A CHEAT.**
@@ -322,7 +346,7 @@ export function createWaterCausticPass({ slot, surfaceTexture, resolution, width
     .div(6);
   const lensNormal = vec3(lensXZ.x, float(1).sub(lensXZ.dot(lensXZ)).max(0).sqrt(), lensXZ.y);
   const half = vec3(u.half);
-  const rest = vec3(center.x.add(at.x.sub(.5).mul(half2.x.mul(2))), 0, center.y.add(at.y.sub(.5).mul(half2.y.mul(2))));
+  const rest = restXZ;
   // Where this sample's beam lands, and where it WOULD have landed through a
   // flat surface. The ratio of those two footprints is the whole effect.
   // ⭐ BENT BY THE FINE DETAIL TOO, not only by the grid. See

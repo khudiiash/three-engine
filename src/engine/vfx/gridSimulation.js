@@ -1,8 +1,28 @@
 import * as THREE from "three/webgpu";
-import { Fn, If, float, int, instanceIndex, instancedArray, select, storage, uniform, uniformArray, vec2, vec3, vec4, mix, positionLocal, Loop, dot, normalMap, textureStore, ivec2 } from "three/tsl";
+import { Fn, If, float, int, instanceIndex, instancedArray, select, storage, uniform, uniformArray, vec2, vec3, vec4, mix, positionLocal, Loop, dot, normalMap, textureStore, texture, ivec2 } from "three/tsl";
 import { MAX_CLOTH_ANCHORS, resolveClothAnchors } from "./clothAnchors.js";
 import { createWaterSpectrum, seaDisplacementAt, seaFoamNode, seaJacobianAt } from "./waterSpectrum.js";
 import { GRAVITY } from "./waterSpectrumCPU.js";
+import { waterAutoResolution } from "./waterVolume.js";
+import { Vector2 } from "three/webgpu";
+
+/**
+ * ══ THE RIPPLE WINDOW ══════════════════════════════════════════════════════
+ *
+ * "Impact from object hitting the water looks quite good, but only at
+ * specific scale … we need to adjust our water to any scale" (user,
+ * 2026-09-06). The interactive ripple solver is a heightfield of fixed cell
+ * COUNT, so its cell SIZE grew with the box: 4 cm on a 5 m pool, 47 cm on a
+ * 60 m lake, a metre on a sea — and a half-metre body's splash is a dozen
+ * cells in the first and none in the last. The sea (the spectral cascades)
+ * already tiles in metres; the ripples now do too: the solver covers a
+ * window of `RIPPLE_WINDOW_METRES` around the camera, or the whole pool when
+ * that is smaller, at the same cells a pool has. The window follows the
+ * camera in whole-cell steps (the field is shifted, not resampled), and the
+ * render mesh — which covers the whole pool — samples the window as a
+ * texture, zero outside it. A wake far from the eye is a wake nobody sees.
+ */
+export const RIPPLE_WINDOW_METRES = 32;
 import { waterExtinction, waterSaturation } from "./waterVolume.js";
 import { releaseComputeNodes, releaseStorageAttributes } from "../../modules/gi/releaseCompute.js";
 import { projectClothMeshContact, projectClothClosedContact } from "./clothMeshContact.js";
@@ -24,9 +44,22 @@ export function gridConfig(props = {}) {
  * uses the damped wave equation, not a volumetric liquid solver. All neighbor
  * reads are from a separate buffer: no cross-workgroup read/write races.
  * Largest compute graph binds four storage buffers, within portable WebGPU. */
-export function createGridSimulation(kind, props = {}, { colliderField = null, meshColliderField = null, colliderEntityId = null, material: sourceMaterial = null, sourceGeometry = null, anchorEngine = null, waterSlot = null, spectrum: givenSpectrum = null, seaQuality = null } = {}) {
+export function createGridSimulation(kind, props = {}, { colliderField = null, meshColliderField = null, colliderEntityId = null, material: sourceMaterial = null, sourceGeometry = null, anchorEngine = null, waterSlot = null, spectrum: givenSpectrum = null, seaQuality = null, worldScale = null } = {}) {
   if (kind === "cloth" && !sourceMaterial) throw new Error("Cloth requires the existing plane material.");
   const { resolution: n, width, height } = gridConfig(props);
+  // ── THE SOLVER'S OWN GRID: A WINDOW IN METRES ─────────────────────────────
+  //
+  // `n` is the RENDER mesh over the whole pool. The ripple solver runs on `w`
+  // cells over a window of `RIPPLE_WINDOW_METRES` — the whole pool when the
+  // pool is smaller — so its cells are the same size at any scale. `worldScale`
+  // (metres per local unit) is what makes the window a size in metres; a
+  // harness that passes none gets the whole pool, as before.
+  const scaleX = Math.max(1e-4, worldScale?.x ?? 1), scaleZ = Math.max(1e-4, worldScale?.z ?? 1);
+  const windowed = kind === "water" && !!worldScale;
+  const winW = windowed ? Math.min(width, RIPPLE_WINDOW_METRES / scaleX) : width;
+  const winH = windowed ? Math.min(height, RIPPLE_WINDOW_METRES / scaleZ) : height;
+  const w = kind === "water" ? (windowed ? waterAutoResolution(Math.max(winW * scaleX, winH * scaleZ)) : n) : n;
+  const wCount = w * w, sx = winW / (w - 1), sz = winH / (w - 1);
   // ── THE SEA IS A SEPARATE FIELD, TILING IN WORLD METRES ───────────────────
   //
   // The spectral cascades (`waterSpectrum.js`) do not know how big this box
@@ -65,9 +98,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const e = Math.floor(k / n);
     return e === 0 ? [0, 0, -1] : e === 1 ? [1, 0, 0] : e === 2 ? [0, 0, 1] : [-1, 0, 0];
   };
-  const positions = instancedArray(count, "vec4");
-  const previous = instancedArray(count, "vec4");
-  const scratch = instancedArray(count, "vec4");
+  const positions = instancedArray(wCount, "vec4");
+  const previous = instancedArray(wCount, "vec4");
+  const scratch = instancedArray(wCount, "vec4");
+  // The window's field as a texture: (height, normal.x, normal.z, foam) per
+  // cell, for the render mesh, the fragment, the medium and the caustic lens.
+  const rippleTexture = kind === "water" ? new THREE.StorageTexture(w, w) : null;
+  if (rippleTexture) { rippleTexture.type = THREE.HalfFloatType; rippleTexture.format = THREE.RGBAFormat; rippleTexture.minFilter = rippleTexture.magFilter = THREE.LinearFilter; rippleTexture.wrapS = rippleTexture.wrapT = THREE.ClampToEdgeWrapping; rippleTexture.name = "Water ripple window"; }
   // ── FOAM IS SIMULATED, NOT STAMPED ────────────────────────────────────────
   //
   // A shading-time foam mask can only ever describe the surface AT THIS INSTANT,
@@ -86,15 +123,20 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const normals = storage(normalAttribute, "vec3", total);
   const positionAttribute = new THREE.StorageBufferAttribute(total, 3);
   const output = storage(positionAttribute, "vec3", total);
-  const waterSurfaceTexture=kind === "water" ? new THREE.StorageTexture(n,n) : null;
-  if(waterSurfaceTexture){waterSurfaceTexture.type=THREE.HalfFloatType;waterSurfaceTexture.format=THREE.RGBAFormat;waterSurfaceTexture.minFilter=THREE.LinearFilter;waterSurfaceTexture.magFilter=THREE.LinearFilter;}
+  const waterSurfaceTexture = rippleTexture;
   const u = { damping: uniform(.99), gravity: uniform(9.81), wind: uniform(1), stiffness: uniform(.9), speed: uniform(2), amplitude: uniform(.3) };
   Object.assign(u, {
     shear: uniform(1), bend: uniform(.1), gust: uniform(0), gustFrequency: uniform(1), simTime: uniform(0), pin: uniform(0),
     waveHeight: uniform(0), waveLength: uniform(4), waveCos: uniform(1), waveSin: uniform(0),
     // Per-cascade mip the surface kernel reads the sea at — the level whose
-    // texel is no finer than this grid's cell. See `tick`.
+    // texel is no finer than this grid's cell (render mesh / solver). See `tick`.
     seaLod: [uniform(0), uniform(0), uniform(0)],
+    seaLodSolver: [uniform(0), uniform(0), uniform(0)],
+    // The ripple window in LOCAL units: its centre and half extent (half the
+    // texture's span, so uv = (local − centre) / (2·half) + ½).
+    rippleCenter: uniform(new Vector2(0, 0)),
+    rippleHalf: uniform(new Vector2(w * sx / 2, w * sz / 2)),
+    rippleShift: uniform(new Vector2(0, 0)),
     waveOctaves: uniform(4), waveGain: uniform(.5), surfaceDetail: uniform(.6),
     choppiness: uniform(.35), rippleStrength: uniform(.25),
     color: uniform(new THREE.Color()), deepColor: uniform(new THREE.Color()), waterDepth: uniform(2), absorption: uniform(0), saturation: uniform(.35),
@@ -122,10 +164,22 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   const collisionInverse = colliderField ? simulationInverse : null;
   const h = 1 / 120;
   const index = instanceIndex.toInt();
-  const x = index.mod(n), y = index.div(n);
+  // Solver cell coordinates (w×w); the render mesh has its own below.
+  const x = index.mod(w), y = index.div(w);
   const initial = (ix, iy) => kind === "cloth"
     ? vec3(ix.toFloat().mul(dx).sub(width / 2), float(height).sub(iy.toFloat().mul(dy)), 0)
     : vec3(ix.toFloat().mul(dx).sub(width / 2), 0, iy.toFloat().mul(dy).sub(height / 2));
+  // A solver cell's rest position in LOCAL units: the window's centre plus
+  // the cell's offset from the window's middle.
+  const cellLocal = (ix, iy) => vec3(u.rippleCenter.x.add(ix.toFloat().sub((w - 1) / 2).mul(sx)), 0, u.rippleCenter.y.add(iy.toFloat().sub((w - 1) / 2).mul(sz)));
+  // Where a LOCAL point falls in the ripple texture, and whether it is inside.
+  const rippleUv = (local) => vec2(local.x.sub(u.rippleCenter.x).div(u.rippleHalf.x.mul(2)).add(.5), local.z.sub(u.rippleCenter.y).div(u.rippleHalf.y.mul(2)).add(.5));
+  const rippleInside = (uv) => uv.x.greaterThan(.5 / w).and(uv.x.lessThan(1 - .5 / w)).and(uv.y.greaterThan(.5 / w)).and(uv.y.lessThan(1 - .5 / w));
+  const rippleAt = (local) => {
+    if (!rippleTexture) return vec4(0);
+    const uv = rippleUv(local);
+    return select(rippleInside(uv), texture(rippleTexture, uv).level(0), vec4(0));
+  };
   const pinned = () => u.pin.equal(0).and(y.equal(0))
     .or(u.pin.equal(1).and(y.equal(0)).and(x.equal(0).or(x.equal(n - 1))))
     .or(u.pin.equal(2).and(x.equal(0)))
@@ -137,15 +191,32 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     });
   };
   const init = Fn(() => {
-    const p = initial(x, y).toVar();
+    const p = (kind === "water" ? cellLocal(x, y) : initial(x, y)).toVar();
     if (kind === "water") {
-      const radius = x.toFloat().sub((n - 1) / 2).div(n * .1).pow(2).add(y.toFloat().sub((n - 1) / 2).div(n * .1).pow(2));
+      const radius = x.toFloat().sub((w - 1) / 2).div(w * .1).pow(2).add(y.toFloat().sub((w - 1) / 2).div(w * .1).pow(2));
       p.y.assign(radius.negate().exp().mul(u.amplitude));
     }
     positions.element(index).assign(vec4(p, 0));
     previous.element(index).assign(vec4(p, 0));
     scratch.element(index).assign(vec4(p, 0));
-  })().compute(count);
+  })().compute(wCount);
+  // ── THE WINDOW MOVES IN WHOLE CELLS, AND THE FIELD MOVES WITH IT ───────────
+  //
+  // `rippleShift` is the step in cells. Each cell takes the height, velocity
+  // history and foam of the cell that held its new position, or nothing at
+  // the window's new edge; every cell's rest position is rewritten for the
+  // new centre. Two dispatches per buffer (through `scratch`), only on the
+  // frames the camera crosses a cell.
+  const shiftFrom = (source) => Fn(() => {
+    const di = u.rippleShift.x.toInt(), dj = u.rippleShift.y.toInt();
+    const sxi = x.add(di), syi = y.add(dj);
+    const valid = sxi.greaterThanEqual(0).and(sxi.lessThan(w)).and(syi.greaterThanEqual(0)).and(syi.lessThan(w));
+    const src = source.element(syi.clamp(0, w - 1).mul(w).add(sxi.clamp(0, w - 1)));
+    const rest = cellLocal(x, y);
+    scratch.element(index).assign(vec4(rest.x, select(valid, src.y, float(0)), rest.z, select(valid, src.w, float(0))));
+  })().compute(wCount);
+  const shiftInto = (target) => Fn(() => { target.element(index).assign(scratch.element(index)); })().compute(wCount);
+  const shiftKernels = kind === "water" ? [shiftFrom(positions), shiftInto(positions), shiftFrom(previous), shiftInto(previous)] : [];
   const integrate = Fn(() => {
     const p = positions.element(index).xyz.toVar();
     const old = previous.element(index).xyz;
@@ -158,9 +229,9 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       If(pinned(), () => { next.assign(initial(x, y)); });
       applyEntityAnchor(next);
     } else {
-      const at = (ix, iy) => iy.mul(n).add(ix);
-      const west = at(x.sub(1).max(0), y), east = at(x.add(1).min(n - 1), y);
-      const north = at(x, y.sub(1).max(0)), south = at(x, y.add(1).min(n - 1));
+      const at = (ix, iy) => iy.mul(w).add(ix);
+      const west = at(x.sub(1).max(0), y), east = at(x.add(1).min(w - 1), y);
+      const north = at(x, y.sub(1).max(0)), south = at(x, y.add(1).min(w - 1));
       const l = positions.element(west).y, r = positions.element(east).y;
       const t = positions.element(north).y, b = positions.element(south).y;
       // ── CFL, WITH ACTUAL HEADROOM ───────────────────────────────────────
@@ -191,7 +262,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // physics. `rippleSpeed` is published from the swell's own phase speed
       // (`gridSimulation`'s tick), so a ripple and a swell crest cross the pool
       // together and read as one water.
-      const speed = u.rippleSpeed.min(.5 * Math.min(dx, dy) / h);
+      const speed = u.rippleSpeed.min(.5 * Math.min(sx, sz) / h);
       // ── VISCOSITY: WHY "IT NEVER CALMS DOWN" SURVIVED THREE FIXES ────────
       //
       // `u.damping` scales VELOCITY, so it removes every wavelength at the same
@@ -218,13 +289,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
           .add(previous.element(north).y).add(previous.element(south).y).mul(.25));
       const velocity = p.y.sub(old.y);
       next.y.assign(p.y.add(velocity.add(meanVelocity.sub(velocity).mul(u.viscosity)).mul(u.damping)));
-      next.y.addAssign(l.add(r).sub(p.y.mul(2)).div(dx * dx).add(t.add(b).sub(p.y.mul(2)).div(dy * dy)).mul(speed.mul(speed)).mul(h * h));
+      next.y.addAssign(l.add(r).sub(p.y.mul(2)).div(sx * sx).add(t.add(b).sub(p.y.mul(2)).div(sz * sz)).mul(speed.mul(speed)).mul(h * h));
       next.x.assign(p.x); next.z.assign(p.z);
       // Foam is generated in the SURFACE kernel, not here — see `heightfieldVertex`.
     }
     previous.element(index).assign(vec4(p, 0));
     scratch.element(index).assign(vec4(next, positions.element(index).w));
-  })().compute(count);
+  })().compute(wCount);
   // ── A BODY DISPLACES WATER; IT DOES NOT PUMP IT ───────────────────────────
   //
   // The profile is a near-flat-topped bump, `exp(-(1.5t)^6)`, taken from the
@@ -253,7 +324,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     });
     positions.element(index).y.addAssign(displacement);
     previous.element(index).y.addAssign(displacement);
-  })().compute(count) : null;
+  })().compute(wCount) : null;
   const constrain = (source, target) => Fn(() => {
     const p = source.element(index).xyz.toVar();
     const correction = vec3(0).toVar();
@@ -285,7 +356,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     const next = scratch.element(index).toVar();
     if (kind === "water") next.y.assign(next.y.clamp(u.rippleLimit.negate(), u.rippleLimit));
     positions.element(index).assign(next);
-  })().compute(count);
+  })().compute(wCount);
   // Final authoritative pins also run when dt is zero: editor gizmo motion
   // updates the attachment immediately, and collision cannot dislodge it.
   const pinEntities = kind === "cloth" ? Fn(()=>{
@@ -414,38 +485,77 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     return float(width / 2).sub(p.x.abs()).div(mx).clamp(0, 1).mul(float(height / 2).sub(p.z.abs()).div(mz).clamp(0, 1));
   };
   const seaAt = (p) => seaDisplacementAt(spectrum, vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z)), u.seaLod);
+  // Render vertex coordinates (n×n) and the rest of a render vertex.
+  const rx = index.mod(n), ry = index.div(n);
+  const restOf = (i) => initial(i.mod(n), i.div(n));
   const surfacePosition = (i) => {
-    const p = positions.element(i).xyz;
-    if (kind !== "water") return p;
+    if (kind !== "water") return positions.element(i).xyz;
+    const p = restOf(i);
     const d = seaAt(p), hold = edgeHold(p);
-    return vec3(p.x.add(d.x.div(u.waveScale.x).mul(hold)), p.y.add(d.y.div(u.waveScale.y)), p.z.add(d.z.div(u.waveScale.z).mul(hold)));
+    const ripple = rippleAt(p);
+    return vec3(p.x.add(d.x.div(u.waveScale.x).mul(hold)), ripple.x.add(d.y.div(u.waveScale.y)), p.z.add(d.z.div(u.waveScale.z).mul(hold)));
   };
+  // ── THE FOAM FIELD LIVES ON THE SOLVER'S CELLS ─────────────────────────────
+  //
+  // Once per tick, after the substeps: the field's sources (the ripple's own
+  // steepness and churn, the sea's folds at the cell's world position),
+  // spread toward the neighbours and the 3.5 s decay. Reads the neighbours'
+  // foam from `scratch.w` — which `integrate` copied from `positions.w` and
+  // nothing in this dispatch writes — and its own from `positions.w`.
+  const foamField = kind === "water" ? Fn(() => {
+    const at = (ix, iy) => iy.mul(w).add(ix);
+    const west = at(x.sub(1).max(0), y), east = at(x.add(1).min(w - 1), y);
+    const north = at(x, y.sub(1).max(0)), south = at(x, y.add(1).min(w - 1));
+    const p = positions.element(index).xyz;
+    const world = vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z));
+    const sea = seaDisplacementAt(spectrum, world, u.seaLodSolver).toVar();
+    const jacobian = seaJacobianAt(spectrum, world, sea.w, u.seaLodSolver);
+    const jacobianFoam = seaFoamNode(jacobian, u.foam);
+    const rise = u.waveScale.y;
+    const rippleX = positions.element(east).y.sub(positions.element(west).y).div(2 * sx);
+    const rippleZ = positions.element(south).y.sub(positions.element(north).y).div(2 * sz);
+    const steepWorld = vec2(rippleX.mul(rise).div(u.waveScale.x), rippleZ.mul(rise).div(u.waveScale.z)).length();
+    const churn = positions.element(index).y.sub(previous.element(index).y).mul(rise).div(h).abs();
+    const source = steepWorld.smoothstep(.35, .8).mul(.14).add(churn.smoothstep(.12, 1).mul(3.5)).add(jacobianFoam.mul(3));
+    const around = scratch.element(west).w.add(scratch.element(east).w).add(scratch.element(north).w).add(scratch.element(south).w).mul(.25);
+    const spread = mix(positions.element(index).w, around, u.foamSpread);
+    positions.element(index).w.assign(spread.mul(u.foamDecay).add(source.mul(u.foamRate)).clamp(0, 1));
+  })().compute(wCount) : null;
+  // The window as a texture: height, the ripple normal's x and z, foam.
+  const rippleWrite = kind === "water" ? Fn(() => {
+    const at = (ix, iy) => iy.mul(w).add(ix);
+    const west = at(x.sub(1).max(0), y), east = at(x.add(1).min(w - 1), y);
+    const north = at(x, y.sub(1).max(0)), south = at(x, y.add(1).min(w - 1));
+    const rippleX = positions.element(east).y.sub(positions.element(west).y).div(2 * sx);
+    const rippleZ = positions.element(south).y.sub(positions.element(north).y).div(2 * sz);
+    const nrm = vec3(rippleX.negate(), 1, rippleZ.negate()).normalize();
+    textureStore(rippleTexture, ivec2(x, y), vec4(positions.element(index).y, nrm.x, nrm.z, positions.element(index).w));
+  })().compute(wCount) : null;
   const heightfieldVertex = () => {
-    const at = (ix, iy) => iy.mul(n).add(ix);
-    const west = at(x.sub(1).max(0), y), east = at(x.add(1).min(n - 1), y);
-    const north = at(x, y.sub(1).max(0)), south = at(x, y.add(1).min(n - 1));
     if (kind !== "water") {
+      const at = (ix, iy) => iy.mul(n).add(ix);
+      const west = at(x.sub(1).max(0), y), east = at(x.add(1).min(n - 1), y);
+      const north = at(x, y.sub(1).max(0)), south = at(x, y.add(1).min(n - 1));
       const l = positions.element(west).xyz, r = positions.element(east).xyz, t = positions.element(north).xyz, b = positions.element(south).xyz;
       normals.element(index).assign(r.sub(l).cross(t.sub(b)).normalize());
       output.element(index).assign(positions.element(index).xyz);
       return;
     }
-    const p = positions.element(index).xyz.toVar();
+    // A render vertex: its rest, the sea there, and the window's ripple there.
+    const p = initial(rx, ry).toVar();
     const world = vec2(p.x.mul(u.waveScale.x), p.z.mul(u.waveScale.z));
     const sea = seaDisplacementAt(spectrum, world, u.seaLod).toVar();
     const hold = edgeHold(p);
-    const point = vec3(p.x.add(sea.x.div(u.waveScale.x).mul(hold)), p.y.add(sea.y.div(u.waveScale.y)), p.z.add(sea.z.div(u.waveScale.z).mul(hold))).toVar();
-    // The RIPPLE field's slope, local units, from the rest-spaced neighbours.
-    // The mesh normal carries ONLY this: the sea's slope is added per pixel
-    // from the derivative cascades (`waterSurfaceLook.js`), where it has a
-    // mip chain and cannot alias, and the caustic lens adds it at its own
-    // beam spacing (`waterSlots.js`). One field, read at three resolutions.
-    const rippleX = positions.element(east).y.sub(positions.element(west).y).div(2 * dx);
-    const rippleZ = positions.element(south).y.sub(positions.element(north).y).div(2 * dy);
-    const rippleNormal = vec3(rippleX.negate(), 1, rippleZ.negate()).normalize();
-    normals.element(index).assign(rippleNormal);
+    const ripple = rippleAt(p).toVar();
+    const point = vec3(p.x.add(sea.x.div(u.waveScale.x).mul(hold)), ripple.x.add(sea.y.div(u.waveScale.y)), p.z.add(sea.z.div(u.waveScale.z).mul(hold))).toVar();
+    // ⭐ THE MESH NORMAL IS FLAT. Both slopes — the window's ripples and the
+    // sea's cascades — are composed per PIXEL from textures
+    // (`waterSurfaceLook.js`), so a splash reads the same on a 4 cm mesh and
+    // on a 40 cm one; the geometry only has to be displaced.
+    normals.element(index).assign(vec3(0, 1, 0));
     output.element(index).assign(point);
-    if (foamOut) {
+    if (foamOut) foamOut.element(index).assign(ripple.w);
+    if (false) {
       // ── FOAM IS MEASURED AGAINST THE FIELD'S OWN STEEPNESS ───────────────
       //
       // ⛔ AND IT HAS TO BE MEASURED HERE, NOT IN THE INTEGRATOR. The
@@ -500,12 +610,6 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       positions.element(index).w.assign(carried);
       foamOut.element(index).assign(carried);
     }
-    // The slot's copy of the surface: the FULL height (the medium clips its
-    // rays against it), the RIPPLE normal's x and z (the caustic lens adds
-    // the sea and rebuilds y) and the ripple's own height (the caustic beam
-    // starts from the sea's smooth displacement plus this — see
-    // `waterSlots.js` for why it must not start from the bilinear height).
-    if (waterSurfaceTexture) textureStore(waterSurfaceTexture, ivec2(x, y), vec4(point.y, rippleNormal.x, rippleNormal.z, p.y));
   };
   // The skirt's own vertices. Reads only `positions` (committed by the previous
   // dispatch) and the depth uniform, so nothing here races the solver.
@@ -697,12 +801,13 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   // AFTER `surface` has written it, so it is a dispatch of its own and never a
   // stage of that kernel.
   const slotKernel = kind === "water" && waterSlot
-    ? createWaterSlotKernel({ slot: waterSlot, surfaceTexture: waterSurfaceTexture, resolution: n })
+    ? createWaterSlotKernel({ slot: waterSlot, rippleTexture, rippleResolution: w, width, height, uniforms: u, spectrum, edgeHold })
     : null;
   // The caustic half is a DRAW, not a dispatch — see `createWaterCausticPass`.
   const causticPass = kind === "water" && waterSlot
-    ? createWaterCausticPass({ slot: waterSlot, surfaceTexture: waterSurfaceTexture, resolution: n, width, height, uniforms: u, spectrum })
+    ? createWaterCausticPass({ slot: waterSlot, rippleTexture, rippleResolution: w, width, height, uniforms: u, spectrum })
     : null;
+  let pendingShift = null;
   const steps = kind === "cloth" ? [integrate, solveA, solveB, solveA, solveB, solveA, solveB, solveA, solveB, commit] : [integrate, commit];
   if (collide) steps.push(collide);
   if (collideEdges) steps.push(collideEdges, commit, collideEdges, commit, collide);
@@ -819,7 +924,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
     // pool's sixteen cells are 9 cm, which would have capped every splash the
     // finer grid was bought to show. Half the depth is a bound a diverged field
     // still cannot pass, and one no real splash reaches.
-    u.rippleLimit.value = Math.max(u.amplitude.value * 1.5, 16 * Math.max(dx, dy), .5 * u.waterDepth.value, .02);
+    u.rippleLimit.value = Math.max(u.amplitude.value * 1.5, 16 * Math.max(sx, sz), .5 * u.waterDepth.value, .02);
     if (ownsMaterial) {
     material.color.set(p.color ?? (kind === "cloth" ? "#c85c3c" : "#168aab"));
     u.color.value.copy(material.color);
@@ -830,7 +935,23 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
   };
   update(props);
   const simulation = { mesh, skirtMesh, skirtMaterial, positions, count, resolution: n, vertexCount: total, init, surface, steps, uniforms: u,waterSurfaceTexture,slotKernel,causticPass,
-    spectrum,
+    spectrum, rippleTexture,
+    /** The solver's grid and its window, in local units. */
+    ripple: { resolution: w, cellX: sx, cellZ: sz, windowWidth: winW, windowHeight: winH, windowed },
+    /**
+     * Keep the ripple window on the eye. `x`/`z` are the camera in LOCAL
+     * units; the centre is clamped inside the pool and snapped to whole
+     * cells, and a change queues the field shift for the next tick.
+     */
+    followCamera(x, z) {
+      if (!windowed) return;
+      const cx = Math.max(-(width / 2 - winW / 2), Math.min(width / 2 - winW / 2, Number(x) || 0));
+      const cz = Math.max(-(height / 2 - winH / 2), Math.min(height / 2 - winH / 2, Number(z) || 0));
+      const di = Math.round((cx - u.rippleCenter.value.x) / sx), dj = Math.round((cz - u.rippleCenter.value.y) / sz);
+      if (!di && !dj) return;
+      u.rippleCenter.value.x += di * sx; u.rippleCenter.value.y += dj * sz;
+      pendingShift = { x: (pendingShift?.x ?? 0) + di, y: (pendingShift?.y ?? 0) + dj };
+    },
     /** The sea as the CPU last saw it — `waterPhysics.js` floats bodies on this. */
     get seaSample() { return seaSample; },
     /** Harness aid: force every cascade to mip 0 for a bit-level parity check. */
@@ -869,7 +990,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       // which lets a well-resolved footprint be as deep as it is wide — what
       // the reference's sphere does — while a footprint two or three cells
       // across still gets the gentle old bound, for the same reason it did.
-      const cell = Math.max(dx, dy);
+      const cell = Math.max(sx, sz);
       const span = Math.max(2.5 * cell, radius);
       // ── THE SLOPE CAP IS A WORLD QUANTITY, AND IT WAS MIXING AXES ────────
       //
@@ -921,7 +1042,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // the caustics it feeds turn to noise. The grid's own cell size is the
         // floor, so asking for finer detail gives the finest detail this
         // resolution HAS rather than a broken version of what was asked for.
-        const cell = Math.max(dx * u.waveScale.value.x, dy * u.waveScale.value.z);
+        const cell = Math.max(sx * u.waveScale.value.x, sz * u.waveScale.value.z);          // the solver's
+        const vertexCell = Math.max(dx * u.waveScale.value.x, dy * u.waveScale.value.z);    // the render mesh's
         // The ripple solver runs at the swell's PHYSICAL phase speed — the
         // deep-water c = sqrt(g·λp/2π) of the peak wave, times the authored
         // time scale — so a wake and a crest cross the pool together. Local
@@ -934,7 +1056,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         // grid's cell, so a coarse mesh over a big lake samples a smooth sea
         // instead of aliasing the capillary cascade into spikes.
         if (spectrum) spectrum.cascades.forEach((c, i) => {
-          u.seaLod[i].value = simulation.seaLodOverride ?? Math.max(0, Math.log2(Math.max(1, cell / (c.L / spectrum.size))));
+          u.seaLod[i].value = simulation.seaLodOverride ?? Math.max(0, Math.log2(Math.max(1, vertexCell / (c.L / spectrum.size))));
+          u.seaLodSolver[i].value = simulation.seaLodOverride ?? Math.max(0, Math.log2(Math.max(1, cell / (c.L / spectrum.size))));
         });
         // The box's depth in metres reaches the spectrum (the TMA shallow-water
         // correction); re-realize it when that has really changed.
@@ -960,7 +1083,8 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         u.collisionSkip.value = colliderField.entityIndices?.get(colliderEntityId) ?? -1;
         if (meshColliderField) { meshColliderField.refresh(); u.meshCollisionSkip.value = meshColliderField.entityIndices?.get(colliderEntityId) ?? -1; }
       }
-      if (!initialized) { queue.push(init); initialized = true; }
+      if (!initialized) { queue.push(init); initialized = true; pendingShift = null; }
+      if (pendingShift) { u.rippleShift.value.set(pendingShift.x, pendingShift.y); queue.push(...shiftKernels); pendingShift = null; }
       if(injectWater) {
         impulseCount.value=pendingImpulses.length;
         for(let i=0;i<pendingImpulses.length;i++)impulseRows[i].fromArray(pendingImpulses[i]);
@@ -989,8 +1113,10 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
         globalThis.__giNestedRender = true;
         try { causticPass.render(renderer); } finally { globalThis.__giNestedRender = nested; }
       }
-      // The sea advances before the surface reads it.
+      // The sea advances before the surface reads it; the foam field and the
+      // ripple texture follow the substeps and precede the render surface.
       if (spectrum) queue.push(...spectrum.passes(delta, elapsed));
+      if (foamField) queue.push(foamField, rippleWrite);
       queue.push(surface);
       if (slotKernel) queue.push(...slotKernel.compute);
       renderer.compute(queue);
@@ -1010,7 +1136,7 @@ export function createGridSimulation(kind, props = {}, { colliderField = null, m
       mesh.removeFromParent(); if (ownsMaterial) material.dispose();
       skirtMesh?.removeFromParent(); skirtMaterial?.dispose(); skirtGeometry?.dispose();
       causticPass?.dispose();
-      releaseComputeNodes(renderer, [init, integrate, solveA, solveB, commit, surface, collide, collideEdges, pinEntities,injectWater,...(slotKernel?.compute ?? [])].filter(Boolean));
+      releaseComputeNodes(renderer, [init, integrate, solveA, solveB, commit, surface, collide, collideEdges, pinEntities,injectWater, foamField, rippleWrite, ...shiftKernels, ...(slotKernel?.compute ?? [])].filter(Boolean));
       geometry.dispose();
       waterSurfaceTexture?.dispose();
 
