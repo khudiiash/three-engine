@@ -237,6 +237,7 @@ export function MenuBar() {
       { separator: true },
       { label: "Shader Graph", action: () => openPanel("shaderGraph") },
       { label: "Particles", action: () => openPanel("particles") },
+      { label: "VFX", action: () => openPanel("vfx") },
       { label: "Animator", action: () => openPanel("animator") },
       { label: "Timeline", action: () => openPanel("timeline") },
       { label: "Post Process", action: () => openPanel("postprocess") },

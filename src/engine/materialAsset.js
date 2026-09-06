@@ -1,3 +1,4 @@
+import { builtinMaterialDefinition } from "./builtinMaterials.js";
 import { vmState, vmRecord } from "./vmState.js";
 import * as THREE from "three/webgpu";
 
@@ -693,6 +694,8 @@ export async function loadMaterialAsset(path) {
     cache.set(key, entry);
     entry.promise = (async () => {
       try {
+        const builtin = builtinMaterialDefinition(path);
+        if (builtin) { applyMaterialDef(entry, { ...MATERIAL_DEFAULTS, ...builtin }); entry.material.name = builtin.name; return; }
         const bytes = await loadAssetBinary(path);
         if (!(bytes instanceof ArrayBuffer) && !ArrayBuffer.isView(bytes)) throw new Error("asset bytes unavailable");
         const def = JSON.parse(new TextDecoder().decode(bytes));

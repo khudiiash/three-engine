@@ -1,0 +1,73 @@
+<!doctype html><html><body><script type="module">
+import * as THREE from 'three/webgpu';
+import { Fn, instanceIndex, texture } from 'three/tsl';
+import { ParticleComponent } from '/src/engine/components/ParticleComponent.js';
+import { GICascadeLight, registerGILight } from '/src/modules/gi/giLight.js';
+import { createReflectionProbeSlots } from '/src/modules/gi/reflectionProbes.js';
+const check = (ok, message) => { if (!ok) throw new Error(message); console.log('PARTICLE-GI:', message); };
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
+  const errors = []; device.addEventListener('uncapturederror', e => errors.push(e.error.message));
+  const renderer = new THREE.WebGPURenderer({ device }); await renderer.init(); renderer.setSize(64, 64);
+  registerGILight(renderer);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, 1, .1, 100);
+  const slots = createReflectionProbeSlots(); slots.at(0).halfActive.set(3, 3, 3, 1); slots.syncCount();
+  const solid = (r, g, b) => { const t = new THREE.DataTexture(new Float32Array([r, g, b, 0]), 1, 1, THREE.RGBAFormat, THREE.FloatType); t.needsUpdate = true; return t; };
+  const probeTexture = solid(0, .7, 0), deferredTexture = solid(20, 0, 0);
+  const gi = new GICascadeLight();
+  gi.giIrradianceNode = texture(deferredTexture); // Decoy: the opaque wall is bright red.
+  gi.giProbes = { node: texture(probeTexture), slots }; scene.add(gi);
+  const graph = { nodes: [
+    { id: 'position', type: 'vec3', props: { value: [0, 0, 0] } },
+    { id: 'velocity', type: 'vec3', props: { value: [0, 0, 0] } },
+    { id: 'color', type: 'color', props: { value: '#ffffff' } },
+    { id: 'size', type: 'float', props: { value: 1.5 } },
+    { id: 'opacity', type: 'float', props: { value: 1 } },
+    { id: 'system', type: 'system', props: { capacity: 1, lifetime: 10, sizeJitter: 0, lit: true, additive: false, giEmission: true, giEmissionStrength: 2 } },
+  ], edges: ['position', 'velocity', 'color', 'size', 'opacity'].map(id => ({ source: id, sourceHandle: 'out', target: 'system', targetHandle: id })) };
+  let updateCallback;
+  const entity = { id: 'probe-particle', object3D: new THREE.Group(), engine: { renderer, deltaTime: 0, onUpdate: (fn) => { updateCallback = fn; return () => {}; } } };
+  scene.add(entity.object3D);
+  const component = new ParticleComponent({ graph }); component.entity = entity; component.onAttach();
+  for (let i = 0; i < 100 && !component.compiled; i++) await new Promise(r => setTimeout(r, 10));
+  check(!!component.compiled, 'production lit particle compiled');
+  const sub = component.subsystems[0]; await renderer.computeAsync(sub.initCompute);
+  await renderer.computeAsync(Fn(() => sub.ages.element(instanceIndex).assign(1))().compute(1));
+  const target = new THREE.RenderTarget(64, 64);
+  const sample = async (x) => {
+    entity.object3D.position.x = x; camera.position.set(x, 0, 3); camera.lookAt(x, 0, 0);
+    renderer.setRenderTarget(target); renderer.render(scene, camera);
+    const data = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 64, 64);
+    const offset = (32 * 64 + 32) * 4; return Array.from(data.slice(offset, offset + 3));
+  };
+  const inside = await sample(0), outside = await sample(10);
+  check(inside[1] > 30 && inside[1] > inside[0] * 3, 'particle receives green world-probe GI, not red screen-space wall: ' + inside);
+  check(outside.every(v => v < 3), 'same screen pixel outside probe coverage is dark: ' + outside);
+  gi.intensityUniform.value = 0;
+  const off = await sample(0); check(off.every(v => v < 3), 'GI intensity zero removes particle indirect lighting: ' + off);
+  const provider = [...entity.engine.giEmitters][0];
+  sub.initialized = true;
+  const publishAtAge = async (age) => {
+    await renderer.computeAsync(Fn(() => sub.ages.element(instanceIndex).assign(age))().compute(1));
+    updateCallback();
+    for (let i = 0; i < 100 && sub.lightRig.readPending; i++) await new Promise(r => setTimeout(r, 10));
+    check(!sub.lightRig.readPending, 'GI sample readback completed');
+    return provider();
+  };
+  check(await publishAtAge(-1) === null, 'unborn particles emit no GI');
+  const emitted = await publishAtAge(1);
+  check(Math.abs(emitted.r - 2) < .001, 'live particles publish authored GI power: ' + emitted.r);
+  const hotGraph = structuredClone(graph); hotGraph.nodes.find(n => n.id === 'system').props.giEmissionStrength = 5;
+  component.setProp('graph', hotGraph);
+  check(component.subsystems[0] === sub, 'GI power edit preserves existing particle buffers');
+  const hotEmission = await publishAtAge(1);
+  check(Math.abs(hotEmission.r - 5) < .001, 'GI power updates from live props: ' + hotEmission.r);
+  component.setEnabled(false);
+  check(provider() === null, 'disabled particles stop emitting GI immediately');
+  check(errors.length === 0, 'portable eight-storage-buffer device has no validation errors: ' + errors.join('; '));
+  renderer.setRenderTarget(null); component.onDetach(); target.dispose(); probeTexture.dispose(); deferredTexture.dispose(); renderer.dispose();
+  globalThis.__VFX_SMOKE_RESULT__ = { pass: true, inside, outside, off }; console.log('PARTICLE-GI-RECEIVER PASS');
+} catch (error) { console.error(error); globalThis.__VFX_SMOKE_RESULT__ = { pass: false, error: error.stack }; }
+</script></body></html>

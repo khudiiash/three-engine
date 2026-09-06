@@ -1,6 +1,7 @@
 import { ensureEngine } from "./engineInstance.js";
+import { isBuiltinMaterial } from "../engine/builtinMaterials.js";
 import { createAssetNames, basename } from "./build/assetNames.js";
-import { rewriteComponentAssets, DOCUMENT_KINDS, extOf, ASSET_EXTENSIONS } from "./build/assetRefs.js";
+import { rewriteComponentAssets, rewriteVfxGraphAssets, DOCUMENT_KINDS, extOf, ASSET_EXTENSIONS } from "./build/assetRefs.js";
 import { BUILD_DEFAULTS, resolveBuildScenes, normalizeRelPath, toProjectRelative } from "./build/buildSettings.js";
 import { themePlayerHtml, injectLivePreviewClient, PREVIEW_REVISION_PATH } from "./build/playerHtml.js";
 import { desktopScaffoldFiles } from "./build/desktopScaffold.js";
@@ -199,6 +200,7 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
   const audioSidecarPaths = new Set(); // .audio JSON, copied with path rewrites
   const timelinePaths = new Set(); // .timeline files ship with rewritten clip paths
   const atlasPaths = new Set(); // .atlas files ship with a rewritten image path
+  const vfxPaths = new Set(); // .vfx graphs ship with rewritten mesh/texture paths
   // Saved scenes deliberately use project-relative paths so projects remain
   // portable. Runtime asset loading resolves those paths against `root`; the
   // exporter must do the same before handing sources to native filesystem IPC.
@@ -234,10 +236,12 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
     timeline: timelinePaths,
     audio: audioSidecarPaths,
     script: scriptPaths,
+    vfx: vfxPaths,
   };
   /** Claim one asset path by value, routing documents to their re-emit bucket
    *  exactly as `rewriteComponentAssets` does internally. */
   const rewriteAssetValue = (value) => {
+    if (isBuiltinMaterial(value)) return value;
     const kind = DOCUMENT_KINDS[extOf(value)];
     if (!kind) return claim(value);
     documentBuckets[kind]?.add(sourcePath(value));
@@ -400,6 +404,17 @@ async function runExport({ outDir: presetOut, onProgress = noop, buildOverride =
         files.push([claimDoc(src, (name) => name.replace(/\.ts$/i, ".js")), code]);
       } catch (err) {
         warnings.push(`Skipped script ${src}: ${err?.message ?? err}`);
+      }
+    }
+    for (const src of vfxPaths) {
+      onProgress({ phase: "assets", message: `Reading VFX ${basename(src)}...` });
+      try {
+        const { parseVfxAsset } = await import("../engine/vfx/vfxAsset.js");
+        const doc = parseVfxAsset(JSON.parse(await readRequiredText(src, "VFX")));
+        rewriteVfxGraphAssets(doc.graph, rewriteAssetValue);
+        files.push([claimDoc(src), JSON.stringify(doc)]);
+      } catch (err) {
+        warnings.push(`Skipped VFX ${src}: ${err?.message ?? err}`);
       }
     }
     for (const src of materialPaths) {

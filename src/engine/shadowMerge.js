@@ -429,6 +429,8 @@ export class ShadowMergeSystem {
       // its own, correct, shadow every frame.
       if (this._movers.has(object)) return;
       if (object.isSkinnedMesh || object.morphTargetInfluences?.length) return;
+      // GPU surface positions differ from the CPU rest mesh used by merging.
+      if (object.userData?.vfxSimulation) return;
       if (object.isInstancedMesh || object.isBatchedMesh) return;
       if (((object.layers.mask >>> 0) & SKIP_LAYERS) !== 0) return;
       const material = Array.isArray(object.material) ? object.material[0] : object.material;

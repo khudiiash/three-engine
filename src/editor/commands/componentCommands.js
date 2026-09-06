@@ -1,5 +1,6 @@
 import { engine } from "../engineInstance.js";
 import { getComponentClass } from "../../engine/index.js";
+import { createSimulationGraph, setSimulationGraphProp } from "../../engine/vfx/simulationGraph.js";
 
 const AUTO_COLLIDER_SOURCE_TYPES = ["mesh", "model", "objModel", "splineMesh"];
 
@@ -63,6 +64,19 @@ export class SetComponentPropCommand {
     this.value = value;
     this.oldValue = engine.getEntity(entityId)?.getComponent(type)?.props[key];
     this.label = label ?? `Set ${key}`;
+    if (type === "cloth" || type === "water") {
+      const component = engine.getEntity(entityId)?.getComponent(type);
+      const graph = component?.props.graph;
+      if (key === "graph") {
+        // Undo the first graph edit to the old flat settings, not their newly
+        // resolved mirrors (which graph application updates for the inspector).
+        this.oldValue = graph ?? createSimulationGraph(type, component?.props);
+      } else if (key !== "asset" && !component?.props.asset && graph && component.constructor.schema.some((field) => field.key === key)) {
+        this.key = "graph";
+        this.oldValue = graph;
+        this.value = setSimulationGraphProp(type, graph, key, value);
+      }
+    }
   }
 
   do() {

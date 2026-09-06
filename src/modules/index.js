@@ -20,6 +20,10 @@ import { audioEditorModule } from "./audio-editor/index.js";
 import { levelDesignModule } from "./level-design/index.js";
 import { characterControllerModule } from "./character-controller/index.js";
 import { kimodoModule } from "./kimodo/index.js";
+import { vfxModule } from "./vfx/index.js";
+import { clothModule } from "./cloth/index.js";
+import { waterModule } from "./water/index.js";
+import { particlesModule } from "./particles/index.js";
 /**
  * Built-in module catalog. Importing this file registers every definition;
  * nothing runs until a host enables a module on an engine (editor: Modules
@@ -49,5 +53,11 @@ registerModuleDefinition(audioEditorModule);
 registerModuleDefinition(levelDesignModule);
 registerModuleDefinition(characterControllerModule);
 registerModuleDefinition(kimodoModule);
+registerModuleDefinition(vfxModule);
+registerModuleDefinition(clothModule);
+registerModuleDefinition(waterModule);
+registerModuleDefinition(particlesModule);
+
+export { vfxModule, clothModule, waterModule, particlesModule };
 
 export { physicsRapierModule, dracoModule, basisModule, terrainModule, virtualGeometryModule, postprocessingModule, polyhavenModule, ambientcgModule, sketchfabModule, polypizzaModule, kaykitModule, fabModule, itchioModule, giModule, navigationModule, textureEditorModule, audioLibraryModule, audioEditorModule, levelDesignModule, characterControllerModule, kimodoModule };

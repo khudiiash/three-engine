@@ -1,0 +1,124 @@
+<!doctype html><html><head><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three/webgpu';
+import { createGridSimulation } from '/src/engine/vfx/gridSimulation.js';
+import { waterSlotPool } from '/src/engine/vfx/waterSlots.js';
+import { installWaterCausticLight, updateWaterSlot } from '/src/engine/vfx/waterCaustics.js';
+
+/**
+ * ══ HOW FAST DOES THE CAUSTIC PATTERN CHANGE, AND SHOULD IT? ═══════════════
+ *
+ * "The caustics along with god rays are still quite crazy. Can we update them
+ * slower and smoother? They don't match the surface speed" (user, 2026-09-06).
+ *
+ * That is a comparison between two rates, so it needs both of them in the same
+ * units. The measure is DECORRELATION: how much the caustic map changes over a
+ * tenth of a second, divided by how much structure it has in the first place.
+ * Dimensionless, so a bright map and a dim one are comparable, and directly
+ * readable — 0.10 means a tenth of the pattern turned over in that tenth of a
+ * second.
+ *
+ * The reference rate is the same measurement with `surfaceDetail` at zero: then
+ * the lens is nothing but the solver's own surface, so its rate IS the surface's
+ * rate, in the same units, from the same instrument. The ratio between the two
+ * is the user's complaint as a number.
+ */
+const log = (...a) => console.log('RATE:', ...a);
+try {
+ const adapter = await navigator.gpu.requestAdapter();
+ const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
+ const errors = []; device.addEventListener('uncapturederror', (e) => { errors.push(e.error.message); console.error('WebGPU validation', e.error.message); });
+ const renderer = new THREE.WebGPURenderer({ device, antialias: false });
+ await renderer.init(); renderer.setSize(64, 64);
+ document.body.append(renderer.domElement);
+
+ const scene = new THREE.Scene();
+ const engine = { scene, renderer, camera: null, onUpdate: (fn) => { engine._tickers.push(fn); return () => {}; },
+   _tickers: [], on: () => () => {}, off: () => {}, modules: { get: () => null } };
+ const pool = waterSlotPool(engine);
+ const sun = new THREE.DirectionalLight('#fff6e0', 3);
+ sun.position.set(6, 9, 4); scene.add(sun); scene.add(sun.target);
+
+ const holder = new THREE.Object3D();
+ holder.position.set(-0.088, -0.4385, 1.5571);
+ holder.scale.set(9.6999, 1.94, 9.6999);
+ scene.add(holder);
+ const BASE = { resolution: 128, width: 1, height: 1, waterDepth: 1, damping: .998,
+   waveSpeed: 1, amplitude: 0, waveHeight: .1, waveLength: 2, waveOctaves: 8, waveGain: .5,
+   waveDirection: 0, choppiness: 1, rippleStrength: 1, surfaceDetail: 1.15,
+   caustics: true, causticIntensity: 1, color: '#4c9db8', roughness: .5, style: 'realistic',
+   deepColor: '#05231f', saturation: .5, transmission: 1, foam: .2, foamThreshold: .5 };
+ let current = { ...BASE };
+ const authored = new THREE.MeshPhysicalNodeMaterial({ color: '#8fd8de', roughness: .12, metalness: 0,
+   ior: 1.333, transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+ const slot = pool.claim({});
+ const sim = createGridSimulation('water', current, { material: authored, waterSlot: slot, anchorEngine: engine });
+ holder.add(sim.mesh);
+ sim.mesh.matrixAutoUpdate = false;
+ sim.mesh.matrix.identity().multiply(new THREE.Matrix4().makeTranslation(0, .5, 0));
+ sim.mesh.matrixWorldNeedsUpdate = true;
+ holder.updateMatrixWorld(true);
+ installWaterCausticLight(engine);
+
+ const step = async () => {
+   sim.tick(renderer, 1 / 60);
+   updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: current });
+   for (const fn of engine._tickers) fn();
+   await device.queue.onSubmittedWorkDone();
+ };
+ const run = async (n) => { for (let i = 0; i < n; i++) await step(); };
+ const arm = async (patch) => { current = { ...BASE, ...patch }; sim.update(current); sim.restart(); await run(60); };
+
+ const target = slot.causticTarget;
+ const R = target.width;
+ const readLens = async () => {
+   const px = await renderer.readRenderTargetPixelsAsync(target, 0, 0, R, R);
+   // Channel 0 is the focus term (see createWaterCausticPass); one plane is
+   // enough and keeps the readback honest about what is actually sampled.
+   const out = new Float32Array(R * R);
+   for (let i = 0; i < R * R; i++) out[i] = px[i * 4];
+   return out;
+ };
+ const contrast = (a) => {
+   let mean = 0; for (const v of a) mean += v; mean /= a.length;
+   let dev = 0; for (const v of a) dev += Math.abs(v - mean);
+   return dev / a.length;
+ };
+ const change = (a, b) => { let d = 0; for (let i = 0; i < a.length; i++) d += Math.abs(a[i] - b[i]); return d / a.length; };
+
+ const GAP = 6;                                     // 0.1 s at 60 Hz
+ /** Fraction of the lens's own structure that turns over in a tenth of a second. */
+ const decorrelation = async (patch) => {
+   await arm(patch);
+   const a = await readLens();
+   await run(GAP);
+   const b = await readLens();
+   return { rate: change(a, b) / Math.max(1e-6, contrast(a)), contrast: contrast(a) };
+ };
+
+ const rows = [];
+ for (const [label, patch] of [
+   ['surface only (surfaceDetail 0)', { surfaceDetail: 0 }],
+   ['as authored (surfaceDetail 1.15)', {}],
+   ['surface only, waves 4x faster', { surfaceDetail: 0, waveSpeed: 4 }],
+   ['as authored, waves 4x faster', { waveSpeed: 4 }],
+   ['surface only, waves STOPPED', { surfaceDetail: 0, waveSpeed: 0 }],
+   ['as authored, waves STOPPED', { waveSpeed: 0 }],
+ ]) {
+   const { rate, contrast: c } = await decorrelation(patch);
+   rows.push([label, rate]);
+   log(`${label.padEnd(34)} turns over ${(rate * 100).toFixed(1)}% per 0.1 s (lens contrast ${c.toFixed(3)})`);
+ }
+ const surface = rows[0][1], authored2 = rows[1][1];
+ log(`⭐ the detail makes the lens change ${(authored2 / Math.max(1e-6, surface)).toFixed(2)}x faster than the surface it is supposed to be made of`);
+ const stoppedSurface = rows[4][1], stoppedAuthored = rows[5][1];
+ log(`⭐ with the waves STOPPED the surface lens turns over ${(stoppedSurface * 100).toFixed(1)}% and the authored one ${
+   (stoppedAuthored * 100).toFixed(1)}% — anything above zero here is motion the wave speed does not control`);
+
+ log('validation', errors.length ? errors : 'clean');
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: errors.length === 0, images: [] };
+ console.log('WATER-CAUSTIC-RATE PASS');
+} catch (error) {
+ console.error(error.stack);
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: false, error: String(error.stack), images: [] };
+}
+</script></body></html>

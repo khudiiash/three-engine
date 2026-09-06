@@ -25,7 +25,7 @@ function snapshot(nodes, edges) {
       id: n.id,
       type: n.type,
       position: { ...n.position },
-      data: { nodeType: n.data.nodeType, props: { ...n.data.props } },
+      data: { ...(n.data.persisted ? { persisted: structuredClone(n.data.persisted) } : {}), nodeType: n.data.nodeType, props: { ...n.data.props } },
       ...(n.parentId ? { parentId: n.parentId } : {}),
       ...(n.style ? { style: { ...n.style } } : {}),
       ...(n.width != null ? { width: n.width } : {}),

@@ -321,6 +321,7 @@ export function languageForPath(path) {
     case "anim":
     case "timeline":
     case "post":
+    case "vfx":
     case "atlas":
     case "cubemap":
     case "meta":

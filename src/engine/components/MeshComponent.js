@@ -251,7 +251,7 @@ export class MeshComponent extends Component {
    */
   #applyVisibility() {
     if (!this.mesh) return;
-    if (this.mesh.userData.mergedInto || this.mesh.userData.batchedInto) return;
+    if (this.mesh.userData.mergedInto || this.mesh.userData.batchedInto || this.mesh.userData.clothHidden) return;
     this.mesh.visible = this.enabled && this.materialRenderable !== false;
   }
 

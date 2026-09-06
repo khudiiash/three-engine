@@ -1,3 +1,4 @@
+import { installFramebufferCopyFormats } from "./renderTargetImage.js";
 import * as THREE from "three/webgpu";
 import { installAsyncRenderPipelines } from "./asyncRenderPipelines.js";
 
@@ -654,6 +655,7 @@ export class Engine extends EventEmitter {
     // Sub-LSB dither on the output transform — without it every smooth GI
     // gradient bands into hard-edged contour rings on the 8-bit canvas.
     installOutputDither(this.renderer);
+    installFramebufferCopyFormats(this.renderer);
         applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
         // Lazy-loaded SSGI/SSR addon handles from the previous renderer are
         // renderer-agnostic factories in r185, but invalidating them on a
@@ -861,6 +863,7 @@ export class Engine extends EventEmitter {
     // Sub-LSB dither on the output transform — without it every smooth GI
     // gradient bands into hard-edged contour rings on the 8-bit canvas.
     installOutputDither(this.renderer);
+    installFramebufferCopyFormats(this.renderer);
     // Renderer-side settings (tone mapping, shadows) couldn't apply earlier.
     applySettingsToScene(this.settings, this.scene, this.ambientLight, this.renderer);
     this.rendererReady = true;

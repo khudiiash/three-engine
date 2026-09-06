@@ -118,6 +118,7 @@ import {
   Fn, If, Loop, float, floatBitsToUint, instanceIndex, instancedArray, int,
   select, uint, uintBitsToFloat, uniform, uniformArray, vec2, vec3, vec4, wgslFn,
 } from "three/tsl";
+import { createGpuGridBvh } from "./gpuGridBvh.js";
 import { sharedFn } from "./giFn.js";
 import { resolveMaterialSurface } from "./voxelizeOnce.js";
 import { octDecodeTSL, octEncodeTSL } from "./rayHit/rayHitTSL.js";
@@ -2360,41 +2361,55 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
 
       let geoBlock = null;
       if (shape.type === "mesh") {
-        const srcPos = mesh.geometry.attributes.position;
-        const geoKey = `${mesh.geometry.id}:${srcPos.version ?? 0}`;
-        geoBlock = geoBlocks.get(geoKey);
-        if (!geoBlock) {
-          const packed = buildBvhWords(mesh.geometry, arity);
-          if (!packed) return false;
-          if (nextWord + packed.words.length > capacityWords) {
-            set.stats.overflowRejected++;
-            if (globalThis.__giDynObjectsDebug) {
-              console.warn(`[gi] dynamic-objects: BVH pool full (${nextWord}+${packed.words.length} > ${capacityWords}) — "${mesh.name}" stays voxelized`);
-            }
-            return false;
+        if (shape.gpuGrid) {
+          const grid = shape.gpuGrid;
+          const geoKey = `gpu-grid:${mesh.geometry.id}`;
+          geoBlock = geoBlocks.get(geoKey);
+          if (!geoBlock) {
+            const gpu = createGpuGridBvh({ bits, absStart: baseWord + nextWord, positionAttribute: grid.positionAttribute, resolution: grid.resolution, arity });
+            if (nextWord + gpu.wordCount > capacityWords) { set.stats.overflowRejected++; return false; }
+            geoBlock = { rel: nextWord, nodeWords: gpu.nodeWords, words: gpu.wordCount, refs: 0, uploaded: false, gpu };
+            nextWord += gpu.wordCount;
+            set.stats.poolWordsUsed = nextWord - HEADER_WORDS;
+            geoBlocks.set(geoKey, geoBlock);
           }
-          geoBlock = {
-            key: geoKey,
-            rel: nextWord,
-            nodeWords: packed.nodeWords,
-            words: packed.words.length,
-            refs: 0,
-            uploaded: false,
-          };
-          nextWord += packed.words.length;
-          set.stats.poolWordsUsed = nextWord - HEADER_WORDS;
-          geoBlocks.set(geoKey, geoBlock);
-          // One-shot staging copy. The staging buffer uploads its INITIAL
-          // content (the only upload semantics that need no update-path
-          // trust), the compute copies it into the bits region, then both
-          // are dropped.
-          const staging = instancedArray(packed.words, "uint");
-          const absStart = baseWord + geoBlock.rel;
-          const copy = Fn(() => {
-            bits.element(uint(absStart).add(instanceIndex)).assign(staging.element(instanceIndex));
-          })().compute(packed.words.length);
-          pendingComputes.push({ compute: copy, block: geoBlock });
-          set.stats.meshUploadsQueued++;
+        } else {
+          const srcPos = mesh.geometry.attributes.position;
+          const geoKey = `${mesh.geometry.id}:${srcPos.version ?? 0}`;
+          geoBlock = geoBlocks.get(geoKey);
+          if (!geoBlock) {
+            const packed = buildBvhWords(mesh.geometry, arity);
+            if (!packed) return false;
+            if (nextWord + packed.words.length > capacityWords) {
+              set.stats.overflowRejected++;
+              if (globalThis.__giDynObjectsDebug) {
+                console.warn(`[gi] dynamic-objects: BVH pool full (${nextWord}+${packed.words.length} > ${capacityWords}) — "${mesh.name}" stays voxelized`);
+              }
+              return false;
+            }
+            geoBlock = {
+              key: geoKey,
+              rel: nextWord,
+              nodeWords: packed.nodeWords,
+              words: packed.words.length,
+              refs: 0,
+              uploaded: false,
+            };
+            nextWord += packed.words.length;
+            set.stats.poolWordsUsed = nextWord - HEADER_WORDS;
+            geoBlocks.set(geoKey, geoBlock);
+            // One-shot staging copy. The staging buffer uploads its INITIAL
+            // content (the only upload semantics that need no update-path
+            // trust), the compute copies it into the bits region, then both
+            // are dropped.
+            const staging = instancedArray(packed.words, "uint");
+            const absStart = baseWord + geoBlock.rel;
+            const copy = Fn(() => {
+              bits.element(uint(absStart).add(instanceIndex)).assign(staging.element(instanceIndex));
+            })().compute(packed.words.length);
+            pendingComputes.push({ compute: copy, block: geoBlock });
+            set.stats.meshUploadsQueued++;
+          }
         }
         geoBlock.refs++;
       }
@@ -2405,6 +2420,7 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
         center: shape.center.clone(),
         halfExtents: shape.halfExtents.clone(),
         geoBlock,
+        gpuGrid: shape.gpuGrid ?? null,
         // Optional per-proxy albedo (linear RGB), overriding the material
         // resolver in `writeSurface`. Skinned bone proxies use it: their
         // material's BASE colour is usually white (the character's colour
@@ -2487,7 +2503,13 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
       for (const entry of entries.values()) {
         const i = entry.index;
         const M = worldMatrixOf(entry);
-        const moved = !entry.prev.equals(M);
+        if (entry.gpuGrid) {
+          const sphere = entry.mesh.geometry.boundingSphere;
+          const extent = sphere ? sphere.radius + sphere.center.length() : 1;
+          entry.halfExtents.setScalar(extent);
+          wm(i, 16, extent); wm(i, 17, extent); wm(i, 18, extent);
+        }
+        const moved = !!entry.gpuGrid || !entry.prev.equals(M);
         if (!moved) entry.restFrames = (entry.restFrames ?? 0) + 1;
         if (moved) {
           entry.restFrames = 0;
@@ -2590,12 +2612,17 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
      * The caller reports back which ones actually ran via confirmDispatch —
      * skipped-pipeline frames just retry next tick.
      */
+    gpuGridComputes() { return [...geoBlocks.values()].flatMap(block => block.gpu?.computes ?? []); },
+
     pendingDispatch() {
       if (!enabled) return [];
       const out = [];
       if (headerDirty && headerCompute) out.push(headerCompute);
       for (const r of regionUploaders) if (r.handle.dirty) out.push(r.compute);
       for (const p of pendingComputes) out.push(p.compute);
+      for (const entry of entries.values()) {
+        if (entry.geoBlock?.gpu) out.push(...entry.geoBlock.gpu.computes);
+      }
       return out;
     },
 
@@ -2612,8 +2639,16 @@ export function createDynamicObjectSet({ bits, baseWord, capacityWords, maxObjec
           pendingComputes.splice(i, 1);
         }
       }
+      let gridsReady = true;
+      for (const entry of entries.values()) {
+        const block = entry.geoBlock;
+        if (!block?.gpu) continue;
+        const ready = block.gpu.computes.every(compute => !skipped.has(compute));
+        if (ready) block.uploaded = true;
+        else gridsReady = false;
+      }
       // Header is only truly live once geometry states are also published.
-      return !headerDirty && pendingComputes.length === 0;
+      return gridsReady && !headerDirty && pendingComputes.length === 0;
     },
 
     // ═════════════════════════════════════════════════ GPU: trace closures

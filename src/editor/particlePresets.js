@@ -217,8 +217,8 @@ export const PARTICLE_PRESETS = {
   //   castShadow           → the particles darken geometry below them.
   //                          Measured at Δ75/255 on a white floor — the same as
   //                          a solid mesh (scripts/run-particle-lighting.mjs).
-  //   lightCount           → the ONLY way particles push light back INTO the
-  //                          scene and into GI: a few real PointLights follow
+  //   giEmission           → the cloud injects light through a GI emitter slot.
+  //   lightCount           → optional real PointLights follow
   //                          clusters of live particles, and GI consumes scene
   //                          lights. Keep the count low; each one is a real
   //                          light with real cost.
@@ -490,3 +490,11 @@ export const PARTICLE_PRESETS = {
     ],
   },
 };
+
+// Dedicated GI variant keeps the original point-light presets useful in
+// scenes without GI, and gives authors a ready-to-use effect with no proxy
+// lights. All nodes are independent so editing it cannot mutate Fire.
+PARTICLE_PRESETS["GI Fire"] = structuredClone(PARTICLE_PRESETS.Fire);
+for (const node of PARTICLE_PRESETS["GI Fire"].nodes) {
+  if (node.type === "system") Object.assign(node.props, { lightCount: 0, giEmission: true, giEmissionStrength: 8 });
+}

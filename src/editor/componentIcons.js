@@ -81,6 +81,9 @@ const ICONS = {
   impulsesource: [Waves, RENDER],
   postprocess: [Sparkles, RENDER],
   particles: [Wand2, RENDER],
+  vfx: [Sparkles, RENDER],
+  cloth: [Wind, RENDER],
+  water: [Waves, RENDER],
   line: [Spline, RENDER],
   trail: [Wind, RENDER],
   decal: [Stamp, RENDER],
@@ -141,7 +144,7 @@ export function componentIcon(type) {
  */
 export const COMPONENT_GROUPS = [
   { label: "Rendering", types: ["mesh", "model", "skinnedmesh", "objModel", "instancer", "geometryModifiers", "lod", "impostor"] },
-  { label: "Effects", types: ["particles", "line", "trail", "decal"] },
+  { label: "Effects", types: ["vfx", "particles", "cloth", "water", "line", "trail", "decal"] },
   { label: "Camera", types: ["camera", "postprocess"] },
   { label: "Lighting", types: ["light", "environment", "global-illumination", "reflection-probe"] },
   { label: "Physics", types: ["rigidbody", "collider", "charactercontroller"] },

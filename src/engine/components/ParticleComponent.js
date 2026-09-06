@@ -31,6 +31,7 @@ import {
 } from "../particleGraph.js";
 import { ParticleColliderField } from "../particleColliders.js";
 import { registerGiEmitter } from "../giEmitters.js";
+import { bindVfxAsset, vfxRuntimeGraph } from "../vfx/vfxAsset.js";
 
 const MAX_CAPACITY = 200_000;
 const GRID_SLOTS = 4;
@@ -91,22 +92,25 @@ function hashCell(coord) {
 export class ParticleComponent extends Component {
   static type = "particles";
   static label = "Particles";
-  static defaults = { graph: null };
+  static defaults = { asset: "", graph: null };
   // The node editor (Window → Particles) is the real UI; nothing to inspect here.
-  static schema = [];
+  static schema = [{ key: "asset", label: "Particle graph", type: "asset", exts: ["vfx"] }];
+
+  get effectiveGraph() {
+    return this._vfxAssetGraph ?? this.props.graph ?? (this.props.startColor !== undefined ? legacyPropsToGraph(this.props) : DEFAULT_PARTICLE_GRAPH);
+  }
 
   onAttach() {
+    bindVfxAsset(this, () => this.#applyGraph());
     this.generation = (this.generation ?? 0) + 1;
     this.subsystems = [];
     this.compiled = null;
     this.graphSignature = null;
-    let graph = this.props.graph;
-    if (!graph && this.props.startColor !== undefined) graph = legacyPropsToGraph(this.props);
-    if (!graph) graph = DEFAULT_PARTICLE_GRAPH;
-    this.#build(graph, this.generation);
+    this.#build(this.effectiveGraph, this.generation);
   }
 
   async #build(graph, generation) {
+    graph = vfxRuntimeGraph(graph);
     let compiled;
     try {
       compiled = await compileParticleGraph(graph, { entity: this.entity });
@@ -372,6 +376,8 @@ export class ParticleComponent extends Component {
       : this.#buildSpriteRenderer(sys, s, capacity, renderCtx);
 
     object.userData.entityId = this.entity.id;
+    object.userData.giParticlePositions = positions;
+    object.userData.giParticleCapacity = capacity;
     this.entity.object3D.add(object);
     object.visible = this._enabled;
 
@@ -384,7 +390,7 @@ export class ParticleComponent extends Component {
     // simply parks its slot at radius 0.
     let unregisterGiEmitter = null;
     if (lightRig?.giEmission) {
-      unregisterGiEmitter = registerGiEmitter(this.entity.engine, () => lightRig.giShape);
+      unregisterGiEmitter = registerGiEmitter(this.entity.engine, () => this.enabled ? lightRig.giShape : null);
     }
 
     return {
@@ -445,6 +451,9 @@ export class ParticleComponent extends Component {
       depthWrite: false,
       blending: s.additive ? THREE.AdditiveBlending : THREE.NormalBlending,
     });
+    // Transparent particles are absent from GI's opaque gbuffer. Sample the
+    // world-space probe field rather than the wall behind their screen pixel.
+    material.userData.giParticle = true;
     // Default shadow rendering culls front faces; a single-sided billboard
     // quad would never reach the shadow map. Render both sides there.
     material.shadowSide = THREE.DoubleSide;
@@ -566,7 +575,8 @@ export class ParticleComponent extends Component {
         rand: (k) => hash(indexF.add(k * 1013)),
       };
       const rgb = vec3(sys.color(ctx));
-      const alpha = (sys.opacity ? sys.opacity(ctx) : ctx.life01.oneMinus()).clamp(0, 1);
+      const alpha = (sys.opacity ? sys.opacity(ctx) : ctx.life01.oneMinus()).clamp(0, 1)
+        .mul(age.greaterThanEqual(0).toFloat());
       sampleBuffer.element(instanceIndex.mul(2)).assign(vec4(ctx.position, alpha));
       sampleBuffer.element(instanceIndex.mul(2).add(1)).assign(vec4(rgb, 0));
     })().compute(samples);
@@ -590,7 +600,6 @@ export class ParticleComponent extends Component {
       lights,
       readPending: false,
       giEmission,
-      giStrength: Math.max(0, s.giEmissionStrength ?? 1),
       // Published to the GI module's per-frame emitter slot. Null until the
       // first readback lands, and back to null whenever the cloud has no live
       // particles — a slot showing a stale sphere would keep lighting the room
@@ -695,7 +704,9 @@ export class ParticleComponent extends Component {
             object.getWorldScale(_giScale);
             _giCenter.applyMatrix4(object.matrixWorld);
             const scale = Math.max(Math.abs(_giScale.x), Math.abs(_giScale.y), Math.abs(_giScale.z));
-            const k = rig.giStrength * inv;
+            // Read live props: GI power is a hot uniform-style edit and does
+            // not rebuild the sample rig when the slider changes.
+            const k = Math.max(0, s.giEmissionStrength ?? 1) * inv;
             rig.giShape = {
               center: _giCenter.clone(),
               // A zero-radius emitter contributes nothing, and a cloud of
@@ -739,6 +750,11 @@ export class ParticleComponent extends Component {
   }
 
   onDetach() {
+    this._unbindVfxAsset?.(); this._unbindVfxAsset = null;
+    this.#disposeRuntime();
+  }
+
+  #disposeRuntime() {
     this.generation = (this.generation ?? 0) + 1; // cancels in-flight builds
     this.unsubUpdate?.();
     this.unsubUpdate = null;
@@ -762,16 +778,18 @@ export class ParticleComponent extends Component {
   }
 
   onPropChanged(key) {
-    // Value-only graph edits (slider drags in the node editor) go straight
-    // into the compiled uniforms — no TSL recompile, no pipeline rebuild.
-    if (key === "graph" && this.compiled && this.props.graph) {
-      if (particleGraphSignature(this.props.graph) === this.graphSignature) {
-        this.compiled.updateParams(this.props.graph);
-        return;
-      }
+    if (key === "asset") { this.onDetach(); this.onAttach(); return; }
+    this.#applyGraph();
+  }
+
+  #applyGraph() {
+    const graph = vfxRuntimeGraph(this.effectiveGraph);
+    if (this.compiled && graph && particleGraphSignature(graph) === this.graphSignature) {
+      this.compiled.updateParams(graph);
+      return;
     }
-    this.onDetach();
-    this.onAttach();
+    this.#disposeRuntime();
+    this.#build(graph, this.generation);
   }
 
   onDisable() {
@@ -797,6 +815,7 @@ export class ParticleComponent extends Component {
 
   #tick() {
     if (!this.enabled) return;
+    if (this.paused) return;
     if (!this.isInView()) return;
     const renderer = this.entity.engine.renderer;
     if (!renderer) return;
@@ -817,7 +836,7 @@ export class ParticleComponent extends Component {
     queue.length = 0;
     // Game time, so pause/slow-mo reach the GPU sim. Clamped: the first frame
     // after a stall would otherwise teleport every particle along its velocity.
-    const simDt = Math.min(this.entity.engine.deltaTime ?? 0, 0.1);
+    const simDt = Math.min((this.entity.engine.deltaTime ?? 0) * Math.max(0, this.simulationTimeScale ?? 1), 0.1);
     for (const sub of this.subsystems ?? []) {
       if (!sub.updateCompute) continue;
       if (sub.simDelta) sub.simDelta.value = simDt;

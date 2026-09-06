@@ -1,0 +1,47 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Water pool showcase</title><style>body{margin:0;background:#101923}canvas{display:block}</style></head><body><canvas id="view"></canvas><script type="module">
+const assert=(value,message)=>{if(!value)throw new Error(message);};
+try{
+ globalThis.__engineLimitsCap={maxStorageBuffersPerShaderStage:8};
+ const{Engine,THREE,registerBuiltInComponents}=await import('/src/engine/index.js');await import('/src/modules/index.js');const{enableEngineModule}=await import('/src/engine/modules.js');
+ const{WATER_MATERIAL_PATH}=await import('/src/engine/builtinMaterials.js');const{loadMaterialAsset}=await import('/src/engine/materialAsset.js');
+ registerBuiltInComponents();const engine=new Engine();engine.setSize(960,720);await engine.init(document.querySelector('#view'));globalThis.__waterShowcaseEngine=engine;
+ await enableEngineModule(engine,'water');
+ const renderer=engine.renderer,errors=[];renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+ assert(renderer.backend.device.limits.maxStorageBuffersPerShaderStage===8,'Portable storage budget');
+ const tile=document.createElement('canvas');tile.width=tile.height=128;const ctx=tile.getContext('2d');ctx.fillStyle='#add9e4';ctx.fillRect(0,0,128,128);ctx.fillStyle='#79b5cc';ctx.fillRect(0,0,64,64);ctx.fillRect(64,64,64,64);ctx.strokeStyle='#ffffff';ctx.lineWidth=3;for(let n=0;n<=128;n+=64){ctx.beginPath();ctx.moveTo(n,0);ctx.lineTo(n,128);ctx.stroke();ctx.beginPath();ctx.moveTo(0,n);ctx.lineTo(128,n);ctx.stroke();}
+ const texture=new THREE.CanvasTexture(tile);texture.colorSpace=THREE.SRGBColorSpace;texture.wrapS=texture.wrapT=THREE.RepeatWrapping;texture.repeat.set(5,5);
+ const poolMaterial=new THREE.MeshStandardNodeMaterial({map:texture,roughness:.6});
+ function box(size,position,material){const mesh=new THREE.Mesh(new THREE.BoxGeometry(...size),material);mesh.position.fromArray(position);mesh.receiveShadow=true;mesh.castShadow=true;engine.scene.add(mesh);return mesh;}
+ box([6.6,.2,6.6],[0,-1.6,0],poolMaterial);
+ for(const x of [-3.25,3.25])box([.2,1.7,6.6],[x,-.65,0],poolMaterial);
+ for(const z of [-3.25,3.25])box([6.6,1.7,.2],[0,-.65,z],poolMaterial);
+ const coping=new THREE.MeshStandardNodeMaterial({color:'#d6c6ac',roughness:.7});
+ for(const x of [-3.4,3.4])box([.5,.2,7.2],[x,.25,0],coping);
+ for(const z of [-3.4,3.4])box([6.4,.2,.5],[0,.25,z],coping);
+ box([30,.3,30],[0,-1.9,0],new THREE.MeshStandardNodeMaterial({color:'#8b9690',roughness:.9}));
+ const submerged=new THREE.Mesh(new THREE.SphereGeometry(.6,32,24),new THREE.MeshStandardNodeMaterial({color:'#df6a28',roughness:.3}));submerged.position.set(-1,-.9,.3);engine.scene.add(submerged);
+ box([.8,.8,.8],[1.1,-1.1,-.3],new THREE.MeshStandardNodeMaterial({color:'#f0e0bb',roughness:.5}));
+ const redSphere=new THREE.Mesh(new THREE.SphereGeometry(.6,32,24),new THREE.MeshStandardNodeMaterial({color:'#b83c35',roughness:.15}));redSphere.position.set(-1.6,.5,.9);engine.scene.add(redSphere);
+ box([.6,1.8,.6],[1.7,1.1,-3.7],new THREE.MeshStandardNodeMaterial({color:'#e0b24d',roughness:.3}));
+ // A BOX OF WATER, filling the pool the tiles describe: lid at y=0, floor at
+ // y=-1.5 on the pool's own floor, walls just inside the tiled ones. The box IS
+ // the volume — depth and footprint are its geometry, not authored numbers.
+ const entity=engine.createEntity({name:'Water'});entity.object3D.position.set(0,-.75,0);
+ const mesh=entity.addComponent('mesh',{geometry:'box',material:WATER_MATERIAL_PATH,collision:'none',castShadow:false});await mesh.whenReady();await loadMaterialAsset(WATER_MATERIAL_PATH);
+ mesh.mesh.geometry.dispose();mesh.mesh.geometry=new THREE.BoxGeometry(6.4,1.5,6.4);
+ const water=entity.addComponent('water',{resolution:64,amplitude:0,waveHeight:.12,waveLength:.6,choppiness:.35,rippleStrength:.2,caustics:true});
+ const sun=new THREE.DirectionalLight(0xffffff,3);sun.position.set(-3,7,5);sun.castShadow=true;sun.shadow.mapSize.set(1024,1024);sun.shadow.camera.left=-6;sun.shadow.camera.right=6;sun.shadow.camera.top=6;sun.shadow.camera.bottom=-6;engine.scene.add(sun);
+ engine.scene.add(new THREE.HemisphereLight(0xbcdfff,0x4c544a,1.2));engine.scene.background=new THREE.Color('#b9d8e8');
+ const camera=new THREE.PerspectiveCamera(48,960/720,.1,100);camera.position.set(7,5.7,8);camera.lookAt(0,-.3,0);engine.camera=camera;engine.scene.add(camera);engine.start();
+ // Three poses through ONE volume: outside it, ON its surface, and inside it.
+ // Nothing is toggled between them — the medium is a path length, so the
+ // waterline in pose 2 is simply where each ray first crosses the wave.
+ const POSES=[[[0,1.5,5.4],[0,.1,-1.2]],[[0,.02,2.9],[0,.02,-3.4]],[[0,-.62,2.3],[-.6,-1.1,-3.4]]];
+ globalThis.__waterShowcasePose=async(index)=>{const[eye,at]=POSES[index];camera.position.fromArray(eye);camera.lookAt(...at);camera.updateMatrixWorld(true);await new Promise(r=>setTimeout(r,1200));};
+ await new Promise(resolve=>setTimeout(resolve,7000));assert(!errors.length,errors.join('\n'));
+ assert(water.simulation.mesh.material!==mesh.mesh.material,'Reflection nodes belong to water instance');assert((water.simulation.mesh.material.transmissionNode?.value??water.simulation.mesh.material.transmission)>0,'Default Water refracts submerged geometry');
+ assert(water.waterSlot&&engine._waterCausticLight,'Caustics affect nearby receivers');
+ assert(engine.scene.fogNode,'A water volume installs the underwater medium');
+ globalThis.__WATER_SHOWCASE_RESULT__={pass:true,storageLimit:8,transmission:water.simulation.mesh.material.transmissionNode?.value??water.simulation.mesh.material.transmission};console.log('WATER-SHOWCASE PASS',JSON.stringify(__WATER_SHOWCASE_RESULT__));
+}catch(error){console.error('WATER-SHOWCASE FAIL',error.stack??error);globalThis.__WATER_SHOWCASE_RESULT__={pass:false,error:String(error.stack??error)};}
+</script></body></html>

@@ -29,7 +29,13 @@ export function graphToFlow(graph, { knownType } = {}) {
       id: n.id,
       type: n.type === FRAME_TYPE || n.type === REROUTE_TYPE ? n.type : "graphNode",
       position: n.position ?? { x: 0, y: 0 },
-      data: { nodeType: n.type, props: n.props ?? {} },
+      data: {
+        nodeType: n.type,
+        // Keep node annotations and VFX enable state through ordinary edits.
+        // __enabled is an authoring field, serialized back beside props below.
+        persisted: { ...n },
+        props: { ...n.props, ...(Object.hasOwn(n, "enabled") ? { __enabled: n.enabled } : {}) },
+      },
       // Frames sit behind everything and must not swallow clicks meant for the
       // nodes drawn on top of them.
       ...(n.type === FRAME_TYPE
@@ -56,7 +62,10 @@ export function flowToGraph(nodes, edges) {
         props.width = Math.round(n.width ?? n.style?.width ?? 320);
         props.height = Math.round(n.height ?? n.style?.height ?? 200);
       }
-      return { id: n.id, type: n.data.nodeType, props, position: n.position };
+      const enabled = props.__enabled;
+      delete props.__enabled;
+      return { ...n.data.persisted, id: n.id, type: n.data.nodeType, props, position: n.position,
+        ...(enabled !== undefined ? { enabled } : {}) };
     }),
     edges: edges.map((e) => ({
       id: e.id,

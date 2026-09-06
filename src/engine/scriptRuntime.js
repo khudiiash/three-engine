@@ -55,6 +55,11 @@ const PROXY_LOADERS = {
   three: () => import("./scriptRuntime/threeRuntime.js"),
   "three/webgpu": () => import("./scriptRuntime/threeRuntime.js"),
   "three/tsl": () => import("./scriptRuntime/tslRuntime.js"),
+  // One addon, not a prefix: each addon is its own module and needs its own
+  // resolvable URL. Blob scripts cannot import `three/addons/*` otherwise —
+  // see the note on `linkEngineImports`. Add further addons the same way.
+  "three/addons/controls/OrbitControls.js": () =>
+    import("./scriptRuntime/orbitControlsRuntime.js"),
 };
 
 /**
@@ -161,11 +166,13 @@ const matcherFor = (specifier) =>
  *   "three"        → the full three/webgpu surface (same instance as the engine)
  *   "three/webgpu" → ditto
  *   "three/tsl"    → the full TSL surface (same instance as the engine)
+ *   "three/addons/controls/OrbitControls.js" → OrbitControls (same class as the editor)
  *
- * Anything else is left alone. Note that `"three/addons/*"` is NOT rewritten:
- * each addon is its own module and would need its own resolvable URL, so an
- * addon import still fails at load time with the browser's own "failed to
- * resolve module specifier" error rather than silently yielding `undefined`.
+ * Anything else is left alone. Other `"three/addons/*"` imports are NOT
+ * rewritten: each addon is its own module and would need its own resolvable
+ * URL, so an unlisted addon still fails at load time with the browser's own
+ * "failed to resolve module specifier" error rather than silently yielding
+ * `undefined`.
  */
 export async function linkEngineImports(code) {
   const urls = await resolveRuntimeUrls();

@@ -180,6 +180,7 @@ function collectSourceMeshes(root, {
 
   root.traverse((child) => {
     if (!child.isMesh || !child.geometry?.attributes?.position) return;
+    if (child.userData.vfxSimulation) return;
     if (child.layers.mask === 1 << EDITOR_LAYER) return;
     // This must apply even when ownerEntityId is null: an ancestor/implicit
     // automatic cook must never absorb a skinned descendant's bind pose.
@@ -341,7 +342,7 @@ export function scaleCollisionMesh(mesh, scale) {
  * primitive colliders: mesh/convex shapes already carry vertex offsets and
  * applying this to them would shift the collider twice.
  */
-export function collisionGeometryBounds(root) {
+export function collisionGeometryBounds(root, { ownerEntityId = null } = {}) {
   root.updateWorldMatrix(true, false);
   const invRoot = new THREE.Matrix4().copy(root.matrixWorld).invert();
   const local = new THREE.Matrix4();
@@ -351,7 +352,8 @@ export function collisionGeometryBounds(root) {
 
   root.traverse((child) => {
     if (!child.isMesh || !child.geometry?.attributes?.position) return;
-    if (child.layers.mask === 1 << EDITOR_LAYER || child.userData.engineOwned) return;
+    if (child.layers.mask === 1 << EDITOR_LAYER || child.userData.engineOwned || child.userData.vfxSimulation) return;
+    if (ownerEntityId != null && child.userData.entityId !== ownerEntityId) return;
     child.geometry.computeBoundingBox();
     if (!child.geometry.boundingBox || child.geometry.boundingBox.isEmpty()) return;
     child.updateWorldMatrix(true, false);

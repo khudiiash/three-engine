@@ -1,0 +1,128 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Cloth concave collider GPU smoke</title></head><body><canvas id="view"></canvas><script type="module">
+const assert=(value,message)=>{if(!value)throw new Error(message);};
+try {
+  globalThis.__engineLimitsCap={maxStorageBuffersPerShaderStage:8};
+  const {Engine,THREE,registerBuiltInComponents}=await import('/src/engine/index.js');
+  await import('/src/modules/index.js');
+  const {enableEngineModule}=await import('/src/engine/modules.js');
+  registerBuiltInComponents();
+  const engine=new Engine();engine.setSize(320,240);await engine.init(document.querySelector('#view'));
+  for(const module of ['physics-rapier','cloth'])await enableEngineModule(engine,module);
+  const renderer=engine.renderer,errors=[];renderer.backend.trackTimestamp=false;
+  assert(renderer.backend.isWebGPUBackend,'Real WebGPU is required');
+  globalThis.__clothShaders=[];const createShaderModule=renderer.backend.device.createShaderModule.bind(renderer.backend.device);renderer.backend.device.createShaderModule=(descriptor)=>{if(descriptor.code?.includes('@compute'))globalThis.__clothShaders.push(descriptor.code);return createShaderModule(descriptor);};
+  assert(renderer.backend.device.limits.maxStorageBuffersPerShaderStage===8,'Portable eight-storage-buffer device');
+  renderer.backend.device.addEventListener('uncapturederror',(event)=>errors.push(event.error.message));
+  const floor=engine.createEntity({name:'Concave floor with real opening'});
+  floor.object3D.position.set(5,.5,-3);floor.object3D.rotation.y=.55;floor.object3D.scale.set(1.2,1,.8);
+  const floorMesh=floor.addComponent('mesh',{geometry:'plane'});await new Promise((resolve)=>requestAnimationFrame(resolve));
+  const geometry=new THREE.BufferGeometry(),vertices=[],indices=[];
+  for(const [left,right] of [[-3,-1],[1,3]]){const base=vertices.length/3;vertices.push(left,0,-2,left,0,2,right,0,-2,right,0,2);indices.push(base,base+1,base+2,base+2,base+1,base+3);}
+  geometry.setAttribute('position',new THREE.Float32BufferAttribute(vertices,3));geometry.setIndex(indices);geometry.computeVertexNormals();
+  floorMesh.mesh.geometry=geometry;
+  floor.addComponent('collider',{shape:'concave'});
+  floor.object3D.updateWorldMatrix(true,false);
+  const startAbove=(x)=>floor.object3D.localToWorld(new THREE.Vector3(x,2,0));
+  const gapStart=startAbove(0),solidStart=startAbove(2),floorY=floor.object3D.position.y;
+  const entity=engine.createEntity({name:'Horizontal cloth above concave geometry'});
+  entity.object3D.rotation.x=-Math.PI/2;entity.object3D.position.copy(gapStart);
+  const plane=entity.addComponent('mesh',{geometry:'plane'});await new Promise((resolve)=>requestAnimationFrame(resolve));
+  plane.mesh.geometry=new THREE.PlaneGeometry(.35,.35,7,7);
+  const cloth=entity.addComponent('cloth',{resolution:8,pinning:'none',wind:0,gust:0,gravity:9.81,sceneCollision:true,collisionRadius:.03});
+  assert(cloth.simulation,'A real plane modifier must initialize');
+  await new Promise((resolve)=>requestAnimationFrame(resolve));
+  const sim=cloth.simulation;
+  async function fall(position){
+    entity.object3D.position.copy(position);sim.restart();
+    for(let i=0;i<300;i++)sim.tick(renderer,1/120);
+    const data=new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));
+    sim.mesh.updateWorldMatrix(true,false);let minimum=Infinity,maximum=-Infinity;
+    for(let i=0;i<sim.count;i++){const p=new THREE.Vector3(data[i*4],data[i*4+1],data[i*4+2]).applyMatrix4(sim.mesh.matrixWorld);assert(Number.isFinite(p.y),'Finite GPU cloth position');minimum=Math.min(minimum,p.y);maximum=Math.max(maximum,p.y);}
+    return {minimum,maximum};
+  }
+  const opening=await fall(gapStart);
+  assert(opening.maximum<floorY-1,'Cloth passes through concave opening instead of colliding with its bounding box: '+JSON.stringify(opening));
+  const solid=await fall(solidStart);
+  assert(solid.minimum>=floorY+.02&&solid.maximum<floorY+.09,'Cloth contacts actual transformed concave triangles: '+JSON.stringify(solid));
+  const translation=solidStart.clone().sub(gapStart);floor.object3D.position.add(translation);
+  const movedOpening=await fall(solidStart);
+  assert(movedOpening.maximum<floorY-1,'Moving concave geometry moves its opening under the stationary cloth: '+JSON.stringify(movedOpening));
+  floor.object3D.position.sub(translation);
+  const restoredSolid=await fall(solidStart);
+  assert(restoredSolid.minimum>=floorY+.02&&restoredSolid.maximum<floorY+.09,'Moving concave triangles back restores contact: '+JSON.stringify(restoredSolid));
+  const highStart=solidStart.clone();highStart.y+=3;sim.update({...cloth.resolvedProps,gravity:100});
+  const fast=await fall(highStart);assert(fast.minimum>=floorY+.02&&fast.maximum<floorY+.09,'Fast cloth sweep catches thin concave triangles: '+JSON.stringify(fast));
+  floor.removeComponent('collider');floorMesh.mesh.geometry=new THREE.BoxGeometry(4,.5,4);floor.addComponent('collider',{shape:'concave'});
+  entity.object3D.position.copy(floor.object3D.localToWorld(new THREE.Vector3(0,.1,0)));
+  sim.update({...cloth.resolvedProps,gravity:0,wind:0,gust:0});sim.restart();
+  for(let i=0;i<4;i++)sim.tick(renderer,1/120);
+  const closedData=new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));
+  sim.mesh.updateWorldMatrix(true,false,true);floor.object3D.updateWorldMatrix(true,false,true);
+  const inverseFloor=floor.object3D.matrixWorld.clone().invert();let closedInside=0;
+  for(let i=0;i<sim.count;i++){const p=new THREE.Vector3(closedData[i*4],closedData[i*4+1],closedData[i*4+2]).applyMatrix4(sim.mesh.matrixWorld).applyMatrix4(inverseFloor);if(Math.abs(p.x)<2-.005&&Math.abs(p.y)<.25-.005&&Math.abs(p.z)<2-.005)closedInside++;}
+  const closedDiagnostic=cloth.meshColliderField.diagnostics.find((row)=>row.entityId===floor.id);
+  assert(closedDiagnostic?.closed===true,'Concave box must be certified as a closed shell: '+JSON.stringify({closedDiagnostic,closedInside}));
+  assert(closedInside===0,'Initially overlapping unpinned cloth recovers outside closed concave box: '+closedInside);
+  engine.destroyEntity(entity);engine.destroyEntity(floor);
+  let actual=null;
+  const actualPath=new URLSearchParams(location.search).get('actual');
+  if(actualPath){
+    const spec=await (await fetch(actualPath)).json();
+    const {decodeGeometryAsset,geometryFromAsset}=await import('/src/engine/geometryAsset.js');
+    const asset=geometryFromAsset(decodeGeometryAsset(await (await fetch(actualPath.replace(/\.json$/,'.geom'))).arrayBuffer()));
+    let parent=null,first=null;
+    for(const row of spec.chain){const e=engine.createEntity({name:row.name});if(parent)e.setParent(parent);e.object3D.position.fromArray(row.transform.position);e.object3D.rotation.fromArray(row.transform.rotation);e.object3D.scale.fromArray(row.transform.scale);first??=e;parent=e;}
+    const actualMesh=parent.addComponent('mesh',{geometry:'box'});await new Promise((resolve)=>requestAnimationFrame(resolve));actualMesh.mesh.geometry=asset;
+    const colProps=spec.chain.at(-1).components.find((c)=>c.type==='collider').props;
+    const actualCollider=parent.getComponent('collider')??parent.addComponent('collider',colProps);for(const[key,value]of Object.entries(colProps))actualCollider.setProp(key,value);
+    first.object3D.updateWorldMatrix(true,true,true);
+    const actualBounds=new THREE.Box3().setFromObject(actualMesh.mesh);
+    assert(actualBounds.min.distanceTo(new THREE.Vector3(...spec.expectedBounds.min))<.001&&actualBounds.max.distanceTo(new THREE.Vector3(...spec.expectedBounds.max))<.001,'User mesh hierarchy matches measured live world bounds');
+    const ce=engine.createEntity({name:'User cloth exact reproduction'});
+    ce.object3D.position.fromArray(spec.cloth.transform.position);ce.object3D.rotation.fromArray(spec.cloth.transform.rotation);ce.object3D.scale.fromArray(spec.cloth.transform.scale);
+    const cp=ce.addComponent('mesh',{geometry:'plane'});await new Promise((resolve)=>requestAnimationFrame(resolve));cp.mesh.material=new THREE.MeshStandardNodeMaterial({color:'#ff6644',side:THREE.DoubleSide});
+    const cc=ce.addComponent('cloth',spec.cloth.components.find((c)=>c.type==='cloth').props);
+    actualMesh.mesh.updateWorldMatrix(true,false,true);
+    const sourcePositions=asset.getAttribute('position'),sourceIndices=asset.getIndex(),worldTriangles=[];
+    for(let i=0;i<sourceIndices.count;i+=3)worldTriangles.push(new THREE.Triangle(...[0,1,2].map((axis)=>new THREE.Vector3().fromBufferAttribute(sourcePositions,sourceIndices.getX(i+axis)).applyMatrix4(actualMesh.mesh.matrixWorld))));
+    const edgeCounts=new Map(),vertexKey=(v)=>[v.x,v.y,v.z].map((x)=>Math.round(x*1e5)).join(',');
+    for(const triangle of worldTriangles){const keys=[triangle.a,triangle.b,triangle.c].map(vertexKey);for(let i=0;i<3;i++){const edge=[keys[i],keys[(i+1)%3]].sort().join('|');edgeCounts.set(edge,(edgeCounts.get(edge)??0)+1);}}
+    const topology={triangles:worldTriangles.length,boundaryEdges:[...edgeCounts.values()].filter((n)=>n===1).length,nonManifoldEdges:[...edgeCounts.values()].filter((n)=>n>2).length};
+    console.log('USER-CONCAVE TOPOLOGY',JSON.stringify(topology));
+
+    const rayDirection=new THREE.Vector3(.431,.719,.547).normalize(),ray=new THREE.Ray(),closest=new THREE.Vector3(),hit=new THREE.Vector3();
+    // Parity is diagnostic for open assets; only segment/triangle intersections gate slicing.
+    function penetration(data){
+      cc.simulation.mesh.updateWorldMatrix(true,false,true);let inside=0,contacts=0,maxDepth=0;
+      for(let i=cc.simulation.resolution;i<cc.simulation.count;i++){
+        const point=new THREE.Vector3(data[i*4],data[i*4+1],data[i*4+2]).applyMatrix4(cc.simulation.mesh.matrixWorld);ray.set(point,rayDirection);let distance=Infinity;const hits=[];
+        for(const triangle of worldTriangles){triangle.closestPointToPoint(point,closest);distance=Math.min(distance,point.distanceTo(closest));if(ray.intersectTriangle(triangle.a,triangle.b,triangle.c,false,hit)){const t=point.distanceTo(hit);if(t>1e-5&&!hits.some((other)=>Math.abs(other-t)<1e-5))hits.push(t);}}
+        if(distance<.06)contacts++;if(hits.length%2===1&&distance>.005){inside++;maxDepth=Math.max(maxDepth,distance);}
+      }
+      let crossingEdges=0;const crossingRows=new Set();const size=cc.simulation.resolution,points=[];
+      for(let i=0;i<cc.simulation.count;i++)points.push(new THREE.Vector3(data[i*4],data[i*4+1],data[i*4+2]).applyMatrix4(cc.simulation.mesh.matrixWorld));
+      for(let row=0;row<size;row++)for(let col=0;col<size;col++){const from=row*size+col;for(const to of [col+1<size?from+1:-1,row+1<size?from+size:-1,row+1<size&&col>0?from+size-1:-1]){if(to<0||to<size)continue;const length=points[from].distanceTo(points[to]);if(length<.01)continue;ray.set(points[from],points[to].clone().sub(points[from]).normalize());if(worldTriangles.some((triangle)=>{if(!ray.intersectTriangle(triangle.a,triangle.b,triangle.c,false,hit))return false;const t=points[from].distanceTo(hit);return t>.005&&t<length-.005;})){crossingEdges++;crossingRows.add(row);}}}
+      return {inside,contacts,maxDepth,crossingEdges,crossingRows:[...crossingRows]};
+    }
+    const readActual=async()=>new Float32Array(await renderer.getArrayBufferAsync(cc.simulation.positions.value));
+    const sampleTimes=[];
+    async function captureActual(enabled){actualCollider.setEnabled(enabled);cc.simulation.restart();cc.simulation.tick(renderer,0);if(enabled)sampleTimes.push({seconds:0,...penetration(await readActual())});for(let i=0;i<1200;i++){cc.simulation.tick(renderer,1/120);if(enabled&&(i===599||i===1199))sampleTimes.push({seconds:(i+1)/120,...penetration(await readActual())});}return readActual();}
+    const absent=await captureActual(false),present=await captureActual(true);
+    console.log('USER-CONCAVE PENETRATION',JSON.stringify(sampleTimes));
+    let difference=0;for(let i=0;i<present.length;i++)difference+=Math.abs(present[i]-absent[i]);
+    assert(present.every(Number.isFinite),'Actual user cloth remains finite');
+    assert(difference>.01,'Actual user concave collider changes the intersecting cloth simulation: '+difference);
+    const triangles=cc.meshColliderField.triangleCount;assert(triangles>0,'Actual user concave triangles enter GPU collision field');
+    engine.setSize(960,720);
+    const camera=new THREE.PerspectiveCamera(50,960/720,.1,100);camera.position.set(-2.996467838282299,9.402428441760014,-16.886405804793796);camera.rotation.set(-2.778491546887967,-.2180719991161474,-3.059576292776324);
+    engine.scene.add(new THREE.HemisphereLight(0xffffff,0x555555,3));engine.scene.background=new THREE.Color('#202329');renderer.render(engine.scene,camera);
+    assert(sampleTimes.slice(1).every((sample)=>sample.crossingEdges===0),'Free cloth edges do not slice through user concave triangles under sustained wind: '+JSON.stringify(sampleTimes));
+    actual={triangles,difference,vertices:cc.simulation.count,sampleTimes,topology};
+    console.log('USER-CONCAVE REPRO',JSON.stringify(actual));
+  }
+  await renderer.backend.device.queue.onSubmittedWorkDone();assert(errors.length===0,errors.join('\n'));
+  const result={pass:true,opening,solid,movedOpening,restoredSolid,storageLimit:8,fast,closedInside,actual};
+  if(!actual)renderer.dispose();
+  console.log('VFX-CONCAVE PASS',JSON.stringify(result));globalThis.__VFX_CONCAVE_RESULT__=result;
+} catch(error){console.error('VFX-CONCAVE FAIL',error);globalThis.__VFX_CONCAVE_RESULT__={pass:false,error:error.stack??String(error)};}
+</script></body></html>

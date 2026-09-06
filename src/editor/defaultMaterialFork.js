@@ -30,6 +30,7 @@ export async function createDefaultMaterialFork({
   rootPath,
   entityName,
   graph,
+  definition = MATERIAL_DEFAULTS,
   listDirectory,
   saveFile,
 }) {
@@ -42,7 +43,7 @@ export async function createDefaultMaterialFork({
     // The project's materials folder is intentionally created on first use.
   }
   const path = `${directory}/${uniqueMaterialName(entityName, entries)}`;
-  const def = { ...MATERIAL_DEFAULTS, shaderGraph: graph };
+  const def = { ...MATERIAL_DEFAULTS, ...definition, shaderGraph: graph };
   await saveFile(path, JSON.stringify(def, null, 2));
   return path;
 }

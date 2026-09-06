@@ -58,18 +58,19 @@ export function createReflectionProbeCapture({
   const shadows = globalThis.__giProbeShadows !== false;
   const historyNode = history ? texture(history) : null;
 
-  const compute = Fn(() => {
-    const i = instanceIndex.toVar();
-    const coord = ivec2(i.mod(uint(REFL_PROBE_TILE)).toInt(), i.div(uint(REFL_PROBE_TILE)).toInt());
-    // JITTERED octahedral decode + EMA over rounds (2026-08-21, "still
-    // shitty": a FLAT mirror magnifies per-texel shading variance — cone
-    // shadow estimates, single gather samples, hit/miss alternation at
-    // skylight rims — into a screen-wide stipple). Each capture round
-    // offsets every ray sub-texel (a CPU-fed R2 point via `jitterU`) and
-    // blends into the previous round through `alphaU` — supersampling paid
-    // across the rounds the probe was already re-capturing anyway. The
-    // decode is octahedralDirection's fold verbatim with the jitter
-    // replacing its fixed +0.5 texel centre.
+  // Trace geometry separately from field/direct hit shading. Geometry's five
+  // read buffers plus SRC and visibility exceeded WebGPU's portable limit.
+  // Texture handoff keeps both passes bounded without changing the formula.
+  const hitTargets = scratch.userData.probeHitTargets ??= (() => {
+    const targets = [THREE.FloatType, THREE.HalfFloatType, THREE.HalfFloatType].map((type) => {
+      const t = new THREE.StorageTexture(REFL_PROBE_TILE, REFL_PROBE_TILE);
+      t.type = type; return t;
+    });
+    scratch.addEventListener("dispose", () => targets.forEach((target) => target.dispose()));
+    return targets;
+  })();
+  const hitNodes = hitTargets.map((target) => texture(target));
+  const rayAt = (coord) => {
     const fx = float(coord.x).add(jitterU.x).div(REFL_PROBE_TILE).mul(2).sub(1).toVar();
     const fy = float(coord.y).add(jitterU.y).div(REFL_PROBE_TILE).mul(2).sub(1).toVar();
     const nz = float(1).sub(fx.abs()).sub(fy.abs()).toVar();
@@ -77,6 +78,21 @@ export function createReflectionProbeCapture({
     const sxs = step(0, fx).mul(2).sub(1);
     const sys = step(0, fy).mul(2).sub(1);
     const dir = vec3(fx.sub(sxs.mul(fold)), fy.sub(sys.mul(fold)), nz).normalize().toVar();
+    return dir;
+  };
+  const traceCompute = Fn(() => {
+    const i = instanceIndex.toVar();
+    const coord = ivec2(i.mod(uint(REFL_PROBE_TILE)).toInt(), i.div(uint(REFL_PROBE_TILE)).toInt());
+    const dir = rayAt(coord);
+    const hit = bvhScene.firstHit(vec3(centerU), dir, float(maxDistU));
+    textureStore(hitTargets[0], coord, vec4(vec3(centerU).add(dir.mul(hit.t)), hit.t));
+    textureStore(hitTargets[1], coord, vec4(hit.normal, 0));
+    textureStore(hitTargets[2], coord, vec4(hit.albedo, 0));
+  })().compute(REFL_PROBE_TILE * REFL_PROBE_TILE);
+  const compute = Fn(() => {
+    const i = instanceIndex.toVar();
+    const coord = ivec2(i.mod(uint(REFL_PROBE_TILE)).toInt(), i.div(uint(REFL_PROBE_TILE)).toInt());
+    const dir = rayAt(coord);
     const origin = vec3(centerU).toVar();
     const out = vec3(0).toVar();
     // DEPTH-IN-ALPHA (§15 U4a, 2026-08-22): the trace already knows how far
@@ -86,10 +102,11 @@ export function createReflectionProbeCapture({
     // box faces — the user's "phantom wall"). Miss stays 0 = "no depth", the
     // sampler falls back to pure box projection there (env texels).
     const tOut = float(0).toVar();
-    const hit = bvhScene.firstHit(origin, dir, float(maxDistU));
+    const packedHit = hitNodes[0].load(coord).toVar();
+    const hit = { t: packedHit.w, normal: hitNodes[1].load(coord).xyz, albedo: hitNodes[2].load(coord).xyz };
     If(hit.t.greaterThanEqual(0), () => {
       tOut.assign(hit.t.max(1e-3));
-      const hitP = origin.add(dir.mul(hit.t)).toVar();
+      const hitP = packedHit.xyz.toVar();
       // The hit's face normal, flipped toward the incoming ray — same
       // convention (and same reason) as the resolve's bvhShade branch: a
       // back-facing gather samples the field on the far side of the wall.
@@ -217,7 +234,7 @@ export function createReflectionProbeCapture({
     textureStore(scratch, coord, vec4(out, tOut));
   })().compute(REFL_PROBE_TILE * REFL_PROBE_TILE);
 
-  return { compute, cap: capU };
+  return { compute, traceCompute, cap: capU };
 }
 
 /**

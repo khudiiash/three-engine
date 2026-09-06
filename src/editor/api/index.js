@@ -55,6 +55,7 @@ import "./ops/events.js";
 import "./ops/post.js";
 import "./ops/level.js";
 import "./ops/character.js";
+import "./ops/vfx.js";
 
 /** Runs an op synchronously, asserting it isn't one of the async ones. Used by
  *  the sync accessors below, where returning a promise would be a footgun. */

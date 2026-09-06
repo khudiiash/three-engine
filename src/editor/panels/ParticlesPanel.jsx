@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Check, RotateCcw, Sparkles, Zap } from "lucide-react";
+import { Check, Plus, RotateCcw, Sparkles, Zap, Save, FilePlus2 } from "lucide-react";
 import { ReactFlowProvider } from "@xyflow/react";
 import { useSelectionStore } from "../store/selectionStore.js";
 import { useSceneStore } from "../store/sceneStore.js";
@@ -8,14 +8,24 @@ import { commandBus } from "../commands/CommandBus.js";
 import { AddComponentCommand, SetComponentPropCommand } from "../commands/componentCommands.js";
 import {
   P_NODE_TYPES,
+  particleInputDescriptor,
   nodeDefaults,
   compileParticleGraph,
-  particleGraphSignature,
   DEFAULT_PARTICLE_GRAPH,
+  legacyPropsToGraph,
 } from "../../engine/particleGraph.js";
 import { PARTICLE_PRESETS } from "../particlePresets.js";
 import { GraphEditor } from "../nodegraph/GraphEditor.jsx";
 import { stripHelpers } from "../nodegraph/graphUtils.js";
+
+import { getComponentClass } from "../../engine/components/registry.js";
+import { setModuleEnabled, useModulesStore } from "../modules.js";
+
+import { AssetField } from "../fields/AssetField.jsx";
+import { useProjectStore, basename } from "../store/projectStore.js";
+import { createVfxDocument, readVfxDocument, writeVfxDocument } from "../vfxAssets.js";
+import { subscribeVfxAsset } from "../../engine/vfx/vfxAsset.js";
+import "./VfxGraph.css";
 
 const CATEGORY_LABELS = {
   emitter: "Emitters",
@@ -25,6 +35,7 @@ const CATEGORY_LABELS = {
   noise: "Noise",
   force: "Forces",
   system: "System",
+  simulation: "Simulation",
 };
 
 /**
@@ -33,24 +44,26 @@ const CATEGORY_LABELS = {
  * (`category`, `{key,label,type}` ports, params-only editing) — this is the
  * translation layer, so the compiler never has to care how the editor draws.
  */
-const particleRegistry = {
+function makeRegistry(kind) {
+const types = P_NODE_TYPES;
+return {
   describe(type) {
-    const meta = P_NODE_TYPES[type];
+    const meta = types[type];
     if (!meta) return null;
     return {
       label: meta.label,
       // The System node is the graph's terminus; it borrows the "output"
       // category colour so it reads like one at a glance.
       cat: meta.category === "system" ? "output" : meta.category,
-      inputs: (meta.inputs ?? []).map((i) => ({ key: i.key, label: i.label, type: i.type ?? "any" })),
+      inputs: (meta.inputs ?? []).map((input) => particleInputDescriptor(type, input)),
       outputs: (meta.outputs ?? []).map((o) => ({ key: o.key, label: o.label, type: o.type ?? "any" })),
-      params: meta.params ?? [],
+      params: [{ key: "__enabled", label: "Enabled", type: "boolean", default: true }, ...(meta.params ?? [])],
       // Particle values are per-particle GPU state; there is nothing a
       // fullscreen-quad thumbnail could meaningfully show.
       noPreview: true,
     };
   },
-  items: Object.entries(P_NODE_TYPES).map(([type, meta]) => ({
+  items: Object.entries(types).filter(([type]) => kind === "particles" || type !== "output").map(([type, meta]) => ({
     type,
     label: meta.label,
     cat: meta.category,
@@ -59,7 +72,7 @@ const particleRegistry = {
     outputTypes: (meta.outputs ?? []).map((o) => o.type ?? "any"),
   })),
   defaults: nodeDefaults,
-  protectedTypes: [],
+  protectedTypes: kind === "particles" ? [] : ["output"],
   /**
    * A graph needs at least one System node to compile. Multiple System nodes
    * (multi-emitter graphs) can be freely added and removed otherwise, so this
@@ -76,15 +89,48 @@ const particleRegistry = {
     return blocked;
   },
 };
+}
 
-function ParticleGraphEditor({ entityId, initialGraph }) {
+function ParticleGraphEditor({ entityId, kind, committedGraph, document, docPath, onOpenDoc }) {
+  const initialGraph = useRef(committedGraph).current;
+  const registry = useMemo(() => makeRegistry(kind), [kind]);
+  const committedRef = useRef(committedGraph);
+  const revisionRef = useRef(0);
+  const mountedRef = useRef(true);
+  const [revision, setRevision] = useState(0);
+  const [error, setError] = useState("");
   const editorRef = useRef(null);
   const graphRef = useRef(initialGraph);
   const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
+  dirtyRef.current = dirty;
   const [presetOpen, setPresetOpen] = useState(false);
+  const [saveAsOpen, setSaveAsOpen] = useState(false);
+  const [fileName, setFileName] = useState("NewEffect.vfx");
+  const [saving, setSaving] = useState(false);
+  const folder = useProjectStore((state) => state.currentPath);
+  const validate = useCallback(async (graph) => {
+    if (kind === "particles") await compileParticleGraph(stripHelpers(graph));
+
+  }, [kind]);
+  const saveAs = async () => {
+    setSaving(true); setError("");
+    try {
+      const graph = graphRef.current;
+      const savingRevision = revisionRef.current;
+      await validate(graph);
+      if (!mountedRef.current || savingRevision !== revisionRef.current) return;
+      const path = await createVfxDocument(fileName, { ...document, version: 1, kind, graph });
+      if (!mountedRef.current) return;
+      if (savingRevision !== revisionRef.current) { setError(`Saved ${basename(path)}. Your newer edits remain here; save again to include them.`); return; }
+      setSaveAsOpen(false);
+      onOpenDoc(path);
+    } catch (failure) { if (mountedRef.current) setError(failure.message); }
+    finally { if (mountedRef.current) setSaving(false); }
+  };
   const [autosave, setAutosave] = useState(() => {
     try {
-      return localStorage.getItem("engine.autosave.particles") === "1";
+      return localStorage.getItem(`engine.autosave.${kind}`) === "1";
     } catch {
       return false;
     }
@@ -94,41 +140,57 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
     setAutosave((cur) => {
       const next = !cur;
       try {
-        localStorage.setItem("engine.autosave.particles", next ? "1" : "0");
+        localStorage.setItem(`engine.autosave.${kind}`, next ? "1" : "0");
       } catch {}
       return next;
     });
   };
 
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+  useEffect(() => {
+    if (committedRef.current === committedGraph) return;
+    committedRef.current = committedGraph;
+    if (JSON.stringify(committedGraph) === JSON.stringify(graphRef.current)) return;
+    if (docPath && dirtyRef.current) {
+      setError("This asset changed elsewhere. Your draft is preserved; Save replaces the file with your draft.");
+      return;
+    }
+    graphRef.current = committedGraph;
+    revisionRef.current++;
+    editorRef.current?.load(committedGraph);
+    setDirty(false);
+    setError("");
+  }, [committedGraph, docPath]);
+
   const onChange = useCallback((graph, meta) => {
-    graphRef.current = graph;
+    revisionRef.current++;
+    setRevision(revisionRef.current);
+    setError("");
+    graphRef.current = { ...graphRef.current, ...graph };
     // A load (initial or preset) is not a user edit; marking it dirty would
     // arm autosave the instant the panel opens.
     if (meta?.reason !== "load") setDirty(true);
   }, []);
 
   const apply = useCallback(async () => {
-    // Frames and reroute pins are authoring aids — the compiler never sees
-    // them, but they stay in the graph that gets saved so the layout survives.
-    const graph = stripHelpers(graphRef.current);
-    // Value-only edits (same structural signature as the committed graph) are
-    // applied live via uniforms in the component — skip the redundant
-    // validation compile so slider drags stay cheap.
-    const committed = engine.getEntity(entityId)?.getComponent?.("particles")?.props?.graph;
-    if (!committed || particleGraphSignature(committed) !== particleGraphSignature(graph)) {
-      try {
-        await compileParticleGraph(graph); // validate before committing
-      } catch (err) {
-        console.error(`Particle graph error: ${err.message ?? err}`);
-        return;
-      }
+    const fullGraph = graphRef.current;
+    const applyingRevision = revisionRef.current;
+    const graph = stripHelpers(fullGraph);
+    try {
+      const component = engine.getEntity(entityId)?.getComponent(kind);
+      if (!docPath && !component) throw new Error(`${kind} component no longer exists.`);
+      await validate(graph);
+      if (!mountedRef.current || applyingRevision !== revisionRef.current) return;
+      if (docPath) await writeVfxDocument(docPath, { ...document, version: 1, kind, graph: fullGraph });
+      else commandBus.execute(new SetComponentPropCommand(entityId, kind, "graph", fullGraph));
+      if (!mountedRef.current || applyingRevision !== revisionRef.current) return;
+      committedRef.current = fullGraph;
+      setDirty(false);
+      setError("");
+    } catch (failure) {
+      if (mountedRef.current) setError(failure.message ?? String(failure));
     }
-    // The FULL graph (helpers included) is what gets stored, so reopening the
-    // editor restores comments and reroutes; ParticleComponent tolerates the
-    // extra nodes because nothing in a compiled branch reaches them.
-    commandBus.execute(new SetComponentPropCommand(entityId, "particles", "graph", graphRef.current));
-    setDirty(false);
-  }, [entityId]);
+  }, [entityId, kind, docPath, document, validate]);
 
   // Autosave: when enabled, commit every change. Debounced so transient
   // mutations (dragging a node fires a change per intermediate position)
@@ -137,13 +199,13 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
     if (!autosave || !dirty) return;
     const id = setTimeout(apply, 150);
     return () => clearTimeout(id);
-  }, [autosave, dirty, apply]);
+  }, [autosave, dirty, revision, apply]);
 
-  const restart = () => engine.getEntity(entityId)?.getComponent("particles")?.restart();
+  const restart = () => engine.getEntity(entityId)?.getComponent(kind)?.restart?.();
 
   const toolbar = (
     <>
-      <div className="dropdown-wrap">
+      {kind === "particles" && <div className="dropdown-wrap">
         <button className="toolbar-btn" onClick={() => setPresetOpen((v) => !v)}>
           <Sparkles size={13} />
           Presets
@@ -170,8 +232,8 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
             </div>
           </>
         )}
-      </div>
-      <button className="toolbar-btn icon-only" title="Restart simulation" onClick={restart}>
+      </div>}
+      <button className="toolbar-btn icon-only" disabled={!entityId} title="Restart simulation" onClick={restart}>
         <RotateCcw size={14} />
       </button>
       <button
@@ -183,57 +245,96 @@ function ParticleGraphEditor({ entityId, initialGraph }) {
       </button>
       <button className="toolbar-btn" disabled={!dirty || autosave} onClick={apply}>
         <Check size={13} />
-        Apply{dirty ? " •" : ""}
+        {docPath ? "Save" : "Apply"}{dirty ? " •" : ""}
       </button>
+      <div className="dropdown-wrap">
+        <button className="toolbar-btn" disabled={!folder} onClick={() => setSaveAsOpen((value) => !value)}><FilePlus2 size={13} />Save As</button>
+        {saveAsOpen && <><div className="dropdown-overlay" onClick={() => setSaveAsOpen(false)} /><div className="dropdown-menu save-as-menu">
+          <div className="node-palette-group">Save particle graph as</div>
+          <input autoFocus aria-label="VFX asset filename" className="text-field" value={fileName} onChange={(event) => setFileName(event.target.value)} onKeyDown={(event) => { event.stopPropagation(); if (event.key === "Enter") saveAs(); if (event.key === "Escape") setSaveAsOpen(false); }} />
+          <div title={folder}>in {basename(folder ?? "")}</div>
+          <button className="toolbar-btn" disabled={saving || !fileName.trim()} onClick={saveAs}><Save size={13} />{saving ? "Saving..." : "Create"}</button>
+        </div></>}
+      </div>
     </>
   );
 
   return (
+    <div className="vfx-graph-workspace" data-vfx-kind={kind} data-vfx-document={docPath ?? ""}>
+    {error && <div className="vfx-error" role="alert">{error}</div>}
     <GraphEditor
       ref={editorRef}
-      kind="particles"
-      registry={particleRegistry}
+      kind={kind}
+      registry={registry}
       initialGraph={initialGraph}
       onChange={onChange}
       toolbar={toolbar}
-      hint="Wire emitters and forces into the Particle System node · right-click the canvas or drop a wire on it to add nodes · double-click a wire to delete it (Alt+double-click for a reroute pin) · Ctrl+Z undoes"
+      hint={kind === "particles" ? "Wire emitters and forces into the Particle System node · right-click to add nodes · double-click a wire to delete it · Ctrl+Z undoes" : "Connect Grid to Solver, then Solver and Material to Surface Output · right-click to add values and math · Apply commits changes"}
     />
+    </div>
   );
 }
 
 export function ParticlesPanel() {
-  const selectedId = useSelectionStore((s) => s.ids[0] ?? null);
-  const entity = useSceneStore((s) => (selectedId ? s.entities[selectedId] : null));
-  const graph = entity?.components?.particles?.graph;
-  const hasParticles = !!entity?.components?.particles;
-  // Frozen at mount: the editor owns its working copy from here, and letting a
-  // committed-graph identity change flow back in would reload the canvas (and
-  // lose selection/undo) on every Apply.
-  const initialGraph = useMemo(() => graph ?? DEFAULT_PARTICLE_GRAPH, [entity?.id]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  if (!entity) {
-    return <div className="shader-graph-panel empty">Select an entity to edit its particle system.</div>;
-  }
-
-  if (!hasParticles) {
-    return (
-      <div className="shader-graph-panel empty">
-        <div>
-          <div style={{ marginBottom: 10 }}>“{entity.name}” has no Particles component.</div>
-          <button
-            className="toolbar-btn"
-            onClick={() => commandBus.execute(new AddComponentCommand(entity.id, "particles"))}
-          >
-            Add Particles Component
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <ReactFlowProvider>
-      <ParticleGraphEditor key={entity.id} entityId={entity.id} initialGraph={initialGraph} />
-    </ReactFlowProvider>
-  );
+  const selectedId = useSelectionStore((state) => state.ids[0] ?? null);
+  const selectedAsset = useSelectionStore((state) => state.assetPath);
+  const entity = useSceneStore((state) => selectedId ? state.entities[selectedId] : null);
+  const enabledModules = useModulesStore((state) => state.enabled);
+  const kind = "particles";
+  const [error, setError] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [loaded, setLoaded] = useState(null);
+  const props = entity?.components?.[kind];
+  const browsedPath = selectedAsset && /\.vfx$/i.test(selectedAsset) ? selectedAsset : "";
+  const docPath = browsedPath || props?.asset || "";
+  const document = loaded?.path === docPath ? loaded.document : null;
+  const activeKind = browsedPath ? document?.kind ?? kind : kind;
+  useEffect(() => {
+    setError("");
+    if (!docPath) { setLoaded(null); return; }
+    let live = true, published = false;
+    const accept = (doc) => {
+      if (!live) return;
+      if (doc.kind !== kind) { setLoaded(null); setError(`This is a ${doc.kind} asset; choose a ${kind} asset.`); return; }
+      setLoaded({ path: docPath, document: doc }); setError("");
+    };
+    const unsubscribe = subscribeVfxAsset(docPath, (doc) => { published = true; accept(doc); });
+    readVfxDocument(docPath).then((doc) => { if (!published) accept(doc); }).catch((failure) => { if (live && !published) { setLoaded(null); setError(failure.message); } });
+    return () => { live = false; unsubscribe(); };
+  }, [docPath, browsedPath, kind]);
+  const graph = useMemo(() => {
+    if (docPath) return document?.graph ?? null;
+    if (!props) return null;
+    if (props.graph) return props.graph;
+    return props.startColor !== undefined ? legacyPropsToGraph(props) : DEFAULT_PARTICLE_GRAPH;
+  }, [kind, props, docPath, document]);
+  useEffect(() => { setError(""); }, [selectedId]);
+  const openDoc = async (path) => {
+    try {
+      if (path) {
+        const doc = await readVfxDocument(path);
+        if (doc.kind !== kind) throw new Error(`Choose a ${kind} asset; this file contains ${doc.kind}.`);
+      }
+      if (entity && props) commandBus.execute(new SetComponentPropCommand(entity.id, kind, "asset", path));
+      else useSelectionStore.getState().selectAsset(path);
+      setError("");
+    } catch (failure) { setError(failure.message); }
+  };
+  const add = async () => {
+    const entityId = entity.id;
+    setAdding(true); setError("");
+    try {
+      if (!enabledModules.includes("particles")) await setModuleEnabled("particles", true);
+      if (!getComponentClass(kind)) throw new Error(`${kind} simulation is not available.`);
+      if (engine.getEntity(entityId) && !engine.getEntity(entityId).getComponent(kind)) commandBus.execute(new AddComponentCommand(entityId, kind));
+    } catch (failure) { setError(failure.message); } finally { setAdding(false); }
+  };
+  return <div className="vfx-panel">
+    <div className="vfx-asset-slot" data-vfx-asset-slot><span>Graph</span><AssetField descriptor={{ exts: ["vfx"], emptyLabel: "Embedded" }} value={docPath} onCommit={openDoc} /></div>
+    {error && <div className="vfx-error" role="alert">{error}</div>}
+    {graph ? <ReactFlowProvider key={docPath || `${entity.id}:${kind}`}><ParticleGraphEditor entityId={entity?.id} kind={activeKind} committedGraph={graph} document={document} docPath={docPath} onOpenDoc={openDoc} /></ReactFlowProvider>
+      : docPath ? <div className="vfx-empty">{error ? "Unable to open particle graph." : "Loading particle graph..."}</div>
+      : !entity ? <div className="vfx-empty"><Sparkles size={24} /><strong>Particles</strong><p>Select an entity with particles or open a particle graph asset.</p></div>
+      : <div className="vfx-empty"><Sparkles size={24} /><strong>Build a particle effect</strong><p>Create on "{entity.name}", then edit its graph.</p><button className="toolbar-btn" disabled={adding} onClick={add}><Plus size={13} />{adding ? "Adding..." : "Add Particles"}</button></div>}
+  </div>;
 }

@@ -1,0 +1,181 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>VFX simulation smoke</title></head><body><canvas id="view"></canvas><script type="module">
+import * as THREE from 'three/webgpu';
+import { createGridSimulation as createRawGridSimulation } from '/src/engine/vfx/gridSimulation.js';
+import { ParticleColliderField } from '/src/engine/particleColliders.js';
+const authoredClothMaterials = [];
+const createGridSimulation = (kind, props, options = {}) => {
+  if (kind === 'cloth' && !options.material) {
+    const material = new THREE.MeshStandardNodeMaterial({ color: '#c85c3c', roughness: .8, side: THREE.DoubleSide });
+    authoredClothMaterials.push(material); options = { ...options, material };
+  }
+  return createRawGridSimulation(kind, props, options);
+};
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+try {
+  const renderer = new THREE.WebGPURenderer({ canvas: document.querySelector('canvas') });
+  renderer.setSize(320, 240); await renderer.init();
+  assert(renderer.backend.isWebGPUBackend, 'Real WebGPU required');
+  assert(renderer.backend.device.limits.maxStorageBuffersPerShaderStage === 8, 'Portable eight-buffer device required');
+  const errors = [];
+  renderer.backend.device.addEventListener('uncapturederror', event => errors.push(event.error.message));
+  const scene = new THREE.Scene(); scene.background = new THREE.Color('#181824');
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 2));
+  const sun = new THREE.DirectionalLight(0xffffff, 3); sun.position.set(4, 8, 5); sun.castShadow = true; scene.add(sun);
+  renderer.shadowMap.enabled = true;
+  const camera = new THREE.PerspectiveCamera(50, 320 / 240, .1, 100); camera.position.set(6, 6, 10); camera.lookAt(0, 1, 0);
+  const target = new THREE.RenderTarget(320, 240);
+  renderer.setRenderTarget(target); renderer.render(scene, camera);
+  const background = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 320, 240);
+  const results = [];
+  for (const kind of ['cloth', 'water']) {
+    const sim = createGridSimulation(kind, { resolution: 16, width: 4, height: 4, wind: 8, amplitude: .6 });
+    scene.add(sim.mesh);
+    sim.tick(renderer, 0); renderer.render(scene, camera);
+    const before = new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));
+    const normals = new Float32Array(await renderer.getArrayBufferAsync(sim.mesh.geometry.getAttribute('normal')));
+    const axis = kind === 'cloth' ? 2 : 1;
+    const normalStride = normals.length / sim.count; // WebGPU pads vec3 storage to vec4.
+    for (let i = 0; i < sim.count; i++) assert(normals[i * normalStride + axis] > .5, kind + ' normals agree with front-face winding');
+    for (let i = 0; i < 120; i++) sim.tick(renderer, 1 / 120);
+    renderer.render(scene, camera);
+    const frame = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 320, 240);
+    let visiblePixels = 0;
+    for (let i = 0; i < frame.length; i += 4) if (Math.abs(frame[i] - background[i]) + Math.abs(frame[i + 1] - background[i + 1]) + Math.abs(frame[i + 2] - background[i + 2]) > 20) visiblePixels++;
+    assert(visiblePixels > 100, kind + ' draws a visible lit surface');
+    const after = new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));
+    assert(after.every(Number.isFinite), kind + ' finite positions');
+    assert(Math.max(...after.map(Math.abs)) < 12, kind + ' stays bounded');
+    let motion = 0;
+    for (let i = 0; i < after.length; i++) motion += Math.abs(after[i] - before[i]);
+    assert(motion > .1, kind + ' GPU simulation moves');
+    if (kind === 'cloth') for (let i = 0; i < 16 * 4; i++) assert(Math.abs(after[i] - before[i]) < .00001, 'cloth top row pinned');
+    sim.restart(); sim.tick(renderer, 0);
+    const reset = new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));
+    assert(reset.every((v, i) => Math.abs(v - before[i]) < .00001), kind + ' restart deterministic');
+    const attributes = renderer.info.memoryMap.size;
+    sim.dispose(renderer);
+    assert(!sim.mesh.parent, kind + ' removed from scene');
+    assert(renderer.info.memoryMap.size < attributes, kind + ' releases GPU allocations');
+    // Rebuild after disposal catches destroyed shared bindings/pipelines.
+    const rebuilt = createGridSimulation(kind, { resolution: 8 }); scene.add(rebuilt.mesh);
+    rebuilt.tick(renderer, 1 / 60); renderer.render(scene, camera); rebuilt.dispose(renderer);
+    results.push({ kind, motion, visiblePixels });
+  }
+  // Alternate cloth attachment patterns and driven water must execute on the GPU,
+  // including authored plane materials, optical-depth coloring and both foam styles.
+  for (const pinning of ['topCorners', 'left', 'leftCorners', 'none']) {
+    const sim = createGridSimulation('cloth', { resolution: 8, pinning, gust: 10, bend: .3, shear: .5 });
+    scene.add(sim.mesh); sim.tick(renderer, 0);
+    const before = new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));
+    for (let i = 0; i < 40; i++) sim.tick(renderer, 1 / 120);
+    renderer.render(scene, camera);
+    const after = new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));
+    const pins = pinning === 'topCorners' ? [0, 7] : pinning === 'leftCorners' ? [0, 56] : pinning === 'left' ? Array.from({ length: 8 }, (_, i) => i * 8) : [];
+    for (const index of pins) for (let axis = 0; axis < 3; axis++) assert(Math.abs(after[index * 4 + axis] - before[index * 4 + axis]) < .00001, pinning + ' selected pin remains fixed');
+    if (pinning === 'none') assert(after[1] < before[1] - .1, 'Unpinned cloth falls');
+    assert(after.every(Number.isFinite), pinning + ' remains finite');
+    sim.dispose(renderer);
+  }
+  const windy = createGridSimulation('cloth', {resolution:8,pinning:'top',wind:8,gust:0,sceneCollision:false});
+  scene.add(windy.mesh); for(let i=0;i<3600;i++) windy.tick(renderer,1/120);
+  const windyBefore=new Float32Array(await renderer.getArrayBufferAsync(windy.positions.value));
+  for(let i=0;i<120;i++) windy.tick(renderer,1/120);
+  const windyAfter=new Float32Array(await renderer.getArrayBufferAsync(windy.positions.value));
+  let lateWindMotion=0;for(let i=0;i<windyAfter.length;i++) lateWindMotion+=Math.abs(windyAfter[i]-windyBefore[i]);
+  assert(lateWindMotion>.01,'Nonzero wind keeps cloth moving after settling, gust zero: '+lateWindMotion);
+  results.push({kind:'cloth-sustained-wind',lateWindMotion});windy.dispose(renderer);
+  const horizontal = createGridSimulation('cloth', {resolution:8,pinning:'none',wind:0,gust:0});
+  horizontal.mesh.rotation.x=-Math.PI/2;horizontal.mesh.position.y=2;scene.add(horizontal.mesh);
+  horizontal.tick(renderer,0);const horizontalBefore=new Float32Array(await renderer.getArrayBufferAsync(horizontal.positions.value));
+  for(let i=0;i<120;i++)horizontal.tick(renderer,1/120);
+  const horizontalAfter=new Float32Array(await renderer.getArrayBufferAsync(horizontal.positions.value));horizontal.mesh.updateWorldMatrix(true,false);
+  const beforeWorld=new THREE.Vector3(...horizontalBefore.slice(0,3)).applyMatrix4(horizontal.mesh.matrixWorld);
+  const afterWorld=new THREE.Vector3(...horizontalAfter.slice(0,3)).applyMatrix4(horizontal.mesh.matrixWorld);
+  assert(afterWorld.y<beforeWorld.y-.5&&Math.abs(afterWorld.x-beforeWorld.x)<.01&&Math.abs(afterWorld.z-beforeWorld.z)<.01,'Rotated horizontal cloth falls world-down, not along its local plane');
+  results.push({kind:'cloth-world-gravity',worldDrop:beforeWorld.y-afterWorld.y});horizontal.dispose(renderer);
+  const floorObject = new THREE.Object3D(); floorObject.position.y = -.5;
+  const floorCollider = { object3D: floorObject, getComponent: () => ({ enabled: true, props: { shape: 'box', size: [20, 1, 20] } }) };
+  const colliderField = new ParticleColliderField({ entities: new Map([['floor', floorCollider]]) }); colliderField.addUser();
+  const fallingCloth = createGridSimulation('cloth', { resolution: 8, pinning: 'none', wind: 0, gust: 0, damping: 1, collisionRadius: .03 }, { colliderField });
+  fallingCloth.mesh.position.set(1, 1, 0); fallingCloth.mesh.rotation.y = .4; scene.add(fallingCloth.mesh);
+  for (let i = 0; i < 240; i++) fallingCloth.tick(renderer, 1 / 120);
+  renderer.render(scene, camera);
+  const contacted = new Float32Array(await renderer.getArrayBufferAsync(fallingCloth.positions.value));
+  let minimumWorldY = Infinity;
+  for (let i = 0; i < fallingCloth.count; i++) minimumWorldY = Math.min(minimumWorldY, contacted[i * 4 + 1] + 1);
+  assert(minimumWorldY >= .025 && minimumWorldY < .08, 'Unpinned cloth contacts scene floor in world space: ' + minimumWorldY);
+  assert(contacted.every(Number.isFinite), 'Cloth collision stays finite');
+  results.push({ kind: 'cloth-collision', minimumWorldY });
+  fallingCloth.dispose(renderer); colliderField.removeUser(); colliderField.dispose();
+  const ocean = createGridSimulation('water', { resolution: 16, amplitude: 0, waveHeight: .35, waveLength: 3, waveDirection: 35, absorption: .7, waterDepth: 3, foam: .8, foamThreshold: .03 });
+  scene.add(ocean.mesh); ocean.tick(renderer, 0); renderer.render(scene, camera);
+  const waveBefore = new Float32Array(await renderer.getArrayBufferAsync(ocean.mesh.geometry.getAttribute('position')));
+  for (let i = 0; i < 60; i++) ocean.tick(renderer, 1 / 120);
+  renderer.render(scene, camera);
+  const waveAfter = new Float32Array(await renderer.getArrayBufferAsync(ocean.mesh.geometry.getAttribute('position')));
+  assert(waveAfter.every(Number.isFinite), 'Driven water finite');
+  assert(waveAfter.some((v, i) => Math.abs(v - waveBefore[i]) > .01), 'Continuous water waves move with no initial ripple');
+  const realistic = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 320, 240);
+  ocean.update({ amplitude: 0, waveHeight: .35, absorption: .7, waterDepth: 3, foam: .8, foamThreshold: .03, style: 'stylized' });
+  renderer.render(scene, camera);
+  const stylized = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 320, 240);
+  assert(stylized.some((v, i) => Math.abs(v - realistic[i]) > 3), 'Stylized material changes actual pixels');
+  ocean.dispose(renderer);
+  const checkerData = new Uint8Array(8 * 8 * 4);
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+    const i = (y * 8 + x) * 4, red = (x + y) % 2 === 0;
+    checkerData.set(red ? [255, 0, 0, 255] : [0, 255, 0, 255], i);
+  }
+  const checker = new THREE.DataTexture(checkerData, 8, 8); checker.colorSpace = THREE.SRGBColorSpace; checker.needsUpdate = true;
+  const seabed = new THREE.Mesh(new THREE.PlaneGeometry(4, 4), new THREE.MeshBasicNodeMaterial({ map: checker }));
+  seabed.rotation.x = -Math.PI / 2; seabed.position.y = -1; scene.add(seabed);
+  camera.position.set(0, 7, 2); camera.lookAt(0, 0, 0);
+  const refractive = createGridSimulation('water', { resolution: 16, color: '#ffffff', waveHeight: .15, amplitude: 0, roughness: .02, waterDepth: 1, absorption: 0, transmission: 1 });
+  scene.add(refractive.mesh); refractive.tick(renderer, 0); renderer.render(scene, camera);
+  const transmitted = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 320, 240);
+  const chromaticPixels = (frame) => { let count = 0; for (let i = 0; i < frame.length; i += 4) if (Math.abs(frame[i] - frame[i + 1]) > 80 && Math.max(frame[i], frame[i + 1]) > frame[i + 2] + 60) count++; return count; };
+  const transmittedPixels = chromaticPixels(transmitted);
+  refractive.update({ color: '#ffffff', waveHeight: .15, amplitude: 0, roughness: .02, waterDepth: 1, absorption: 0, transmission: 0 });
+  renderer.render(scene, camera);
+  const opaquePixels = chromaticPixels(await renderer.readRenderTargetPixelsAsync(target, 0, 0, 320, 240));
+  assert(transmittedPixels > opaquePixels + 100, 'Physical water transmits submerged checker pixels: ' + JSON.stringify({ transmittedPixels, opaquePixels }));
+  results.push({ kind: 'water-refraction', transmittedPixels, opaquePixels });
+  refractive.dispose(renderer); scene.remove(seabed); seabed.geometry.dispose(); seabed.material.dispose();
+  const authored = new THREE.MeshPhysicalNodeMaterial({ map: checker, color: '#ffffff', roughness: .6, sheen: .8, side: THREE.DoubleSide });
+  let materialDisposals = 0; authored.addEventListener('dispose', () => materialDisposals++);
+  const sourcePlane = new THREE.Mesh(new THREE.PlaneGeometry(4, 4, 7, 7), authored); sourcePlane.position.y = 2;
+  scene.add(sourcePlane); camera.position.set(0, 2, 8); camera.lookAt(0, 2, 0);
+  renderer.render(scene, camera);
+  const planeFrame = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 320, 240);
+  sourcePlane.visible = false;
+  const fabric = createGridSimulation('cloth', { resolution: 8, width: 4, height: 4, wind: 0, castShadow: sourcePlane.castShadow, receiveShadow: sourcePlane.receiveShadow }, { material: sourcePlane.material });
+  fabric.mesh.castShadow=sourcePlane.castShadow;fabric.mesh.receiveShadow=sourcePlane.receiveShadow;
+  scene.add(fabric.mesh); fabric.tick(renderer, 0); renderer.render(scene, camera);
+  assert(fabric.mesh.material === sourcePlane.material, 'Cloth borrows the exact authored plane material');
+  const sourceUvs = sourcePlane.geometry.getAttribute('uv').array, clothUvs = fabric.mesh.geometry.getAttribute('uv').array;
+  assert(sourceUvs.length === clothUvs.length && sourceUvs.every((v, i) => Math.abs(v - clothUvs[i]) < .000001), 'Cloth preserves plane UV layout and orientation');
+  const clothFrame = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 320, 240);
+  assert(chromaticPixels(clothFrame) > 100, 'Authored plane texture remains visible on cloth');
+  let matchingPixels = 0;
+  for(let i=0;i<clothFrame.length;i+=4) if(Math.abs(clothFrame[i]-planeFrame[i])+Math.abs(clothFrame[i+1]-planeFrame[i+1])+Math.abs(clothFrame[i+2]-planeFrame[i+2]) < 8) matchingPixels++;
+  assert(matchingPixels > 320*240*.98, 'Rest cloth preserves the source plane texture picture');
+  sourcePlane.material.color.set('#0044ff'); renderer.render(scene, camera);
+  const recolored = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 320, 240);
+  let recoloredPixels = 0; for(let i=0;i<clothFrame.length;i+=4) if(Math.abs(recolored[i]-clothFrame[i])+Math.abs(recolored[i+1]-clothFrame[i+1])+Math.abs(recolored[i+2]-clothFrame[i+2]) > 30) recoloredPixels++;
+  assert(recoloredPixels > 100, 'Editing plane material color changes actual cloth pixels');
+  fabric.dispose(renderer); assert(materialDisposals === 0, 'Removing cloth never disposes the plane material');
+  sourcePlane.visible = true; renderer.render(scene, camera);
+  assert(materialDisposals === 0, 'Authored plane remains renderable after cloth removal');
+  results.push({kind:'cloth-plane-material', matchingPixels, recoloredPixels});
+  scene.remove(sourcePlane); sourcePlane.geometry.dispose(); authored.dispose(); checker.dispose();
+  for(const material of authoredClothMaterials) material.dispose();
+  await renderer.backend.device.queue.onSubmittedWorkDone();
+  assert(errors.length === 0, errors.join('\n'));
+  renderer.setRenderTarget(null); target.dispose(); renderer.dispose();
+  console.log('VFX-SIMULATION PASS', JSON.stringify(results));
+  globalThis.__VFX_SIMULATION_RESULT__ = { pass: true, results };
+} catch (error) {
+  console.error('VFX-SIMULATION FAIL', error.stack ?? error);
+  globalThis.__VFX_SIMULATION_RESULT__ = { pass: false, error: String(error.stack ?? error) };
+}
+</script></body></html>

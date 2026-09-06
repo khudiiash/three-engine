@@ -88,6 +88,9 @@ test("every System node's inputs are reachable (no orphaned branches)", () => {
 });
 
 test("scene-integration presets actually enable the integration", () => {
+  const giFire = PARTICLE_PRESETS["GI Fire"];
+  assert.ok(giFire.nodes.filter(n => n.type === "system").every(n => n.props.giEmission && n.props.lightCount === 0));
+  assert.notEqual(giFire.nodes[0], PARTICLE_PRESETS.Fire.nodes[0], "GI preset edits must not mutate the original fire");
   // The whole point of these presets: particles that read as part of the lit
   // scene. If someone edits the defaults back off, this catches it.
   const integrated = {

@@ -4,6 +4,7 @@ import { instantiatePrefabNode } from "./prefab/expand.js";
 import { instanceNodeOf } from "./prefab/sync.js";
 import { SCENE_SETTINGS_DEFAULTS } from "./sceneSettings.js";
 import { waitForTextureAssets } from "./textureAsset.js";
+import { migrateLegacySurfaceModules } from "./vfx/legacyModules.js";
 
 export const SCENE_VERSION = 1;
 
@@ -102,6 +103,7 @@ export async function reconcileScene(engine, json, { resetStatefulComponents = t
   if (json.version !== SCENE_VERSION) {
     throw new Error(`Unsupported scene version ${json.version}`);
   }
+  await migrateLegacySurfaceModules(engine, json);
   engine.sceneName = json.name ?? "Untitled";
   await engine.applySettings(json.settings ?? structuredClone(SCENE_SETTINGS_DEFAULTS));
   for (const def of json.prefabs ?? []) {
@@ -271,6 +273,7 @@ export async function deserializeScene(engine, json) {
   if (json.version !== SCENE_VERSION) {
     throw new Error(`Unsupported scene version ${json.version}`);
   }
+  await migrateLegacySurfaceModules(engine, json);
   // Hold the complete clear -> settings -> instantiate -> authored asset wave
   // in one transaction. Previously `clear()` published an empty hierarchy,
   // then each async MeshComponent swapped its box/white placeholders while the

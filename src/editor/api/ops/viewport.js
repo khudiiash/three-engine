@@ -24,7 +24,7 @@ import { defineOp } from "../registry.js";
 import { engine } from "../../engineInstance.js";
 import { getViewportHandle } from "../../viewportHandle.js";
 import { EDITOR_LAYER, PHYSICS_DEBUG_LAYER } from "../../../engine/editorLayers.js";
-import { renderTargetToDataUrl } from "../../../engine/renderTargetImage.js";
+import { renderTargetToDataUrl, matchCaptureTargetFormat } from "../../../engine/renderTargetImage.js";
 import { useConsoleStore } from "../../store/consoleStore.js";
 import { isViewportFreezeEnabled, setViewportFreezeEnabled } from "../../viewportFreeze.js";
 import { renderSelectionOutline } from "../../selectionOutline.js";
@@ -70,6 +70,8 @@ export async function captureViewportFrame({ width, height, camera, includeGizmo
     type: THREE.UnsignedByteType,
     colorSpace: THREE.SRGBColorSpace,
   });
+
+  matchCaptureTargetFormat(renderer, target);
 
   const prevAspect = camera.aspect;
   const prevTarget = renderer.getRenderTarget();

@@ -1537,11 +1537,68 @@ declare module "engine" {
 
   /** `entity.getComponent("particles")`. Emission/shape/color-over-life are graph-driven via `props`. */
   export interface ParticleComponent extends ComponentBase<{
+    asset: string;
     graph: unknown;
   }> {
     /** Resets the simulation (clears all live particles and restarts emission). */
     restart(): void;
   }
+
+  export interface EffectTimeline {
+    version: 1; duration: number; loop: boolean; elements: EffectElement[];
+  }
+  export interface EffectElement {
+    id: string; kind: "sprite" | "ring" | "mesh" | "ribbon" | "light" | "particles" | "group";
+    name: string; enabled: boolean; parent: string; start: number; duration: number;
+    x: number; y: number; z: number; rotationX: number; rotationY: number; rotationZ: number;
+    scale: number; opacity: number; intensity: number; color: string;
+    texture: string; asset?: string; graph?: unknown; geometry: string; blend: "additive" | "normal";
+    lit: boolean; roughness: number; castShadow: boolean; receiveShadow: boolean;
+    width: number; arc: number; billboard: boolean; columns: number; rows: number; fps: number;
+    points?: number[][];
+    keys: Partial<Record<"x" | "y" | "z" | "rotationX" | "rotationY" | "rotationZ" | "scale" | "opacity" | "intensity", {time: number; value: number; interpolation?: "linear" | "smooth" | "step"}[]>>;
+  }
+  /** Transient layered effect director. Requires the separate vfx module. */
+  export interface VfxComponent extends ComponentBase<{timeline: EffectTimeline | null; playOnStart: boolean; speed: number}, {finished: Record<string, never>}> {
+    readonly time: number; readonly state: "stopped" | "playing" | "paused";
+    play(from?: number): void; pause(): void; resume(): void; stop(): void;
+    /** Poses layers; GPU particle elements restart rather than resimulate history. */
+    seek(time: number): void;
+  }
+  export interface ClothAnchor {
+    /** Entity id of the moving attachment target. Missing targets release the point. */
+    entityId: string;
+    /** Normalized source-grid point: [0,0] top-left, [1,1] bottom-right. */
+    uv: [number, number];
+    /** Offset in the target entity's local coordinates. */
+    offset?: [number, number, number];
+    enabled?: boolean;
+  }
+  /** Deforms an existing plane mesh using its material. Requires cloth and a plane MeshComponent. */
+  export interface ClothComponent extends ComponentBase<{
+    asset: string;
+    graph: unknown;
+    resolution: number; damping: number;
+    /** Up to 32 attachments; later entries win if they map to the same vertex. */
+    anchors: ClothAnchor[];
+    gravity: number; wind: number; stiffness: number;
+    shear: number; bend: number; gust: number; gustFrequency: number;
+    pinning: "top" | "topCorners" | "left" | "leftCorners" | "none";
+    fabric: "cotton" | "silk" | "canvas";
+    sceneCollision: boolean; collisionRadius: number; friction: number;
+  }> { restart(): void; }
+
+  /** GPU surface waves. Requires water; heightfield without buoyancy or volume flow. */
+  export interface WaterComponent extends ComponentBase<{
+    asset: string;
+    graph: unknown;
+    resolution: number; width: number; height: number; damping: number;
+    waveSpeed: number; amplitude: number;
+    waveHeight: number; waveLength: number; waveDirection: number;
+    style: "realistic" | "stylized"; deepColor: string; waterDepth: number;
+    absorption: number; transmission: number; foam: number; foamThreshold: number;
+    color: string; roughness: number; castShadow: boolean; receiveShadow: boolean;
+  }> { restart(): void; }
 
   /**
    * `entity.getComponent("rigidbody")`. Physics body driven by the Rapier world
@@ -2040,6 +2097,9 @@ declare module "engine" {
     sound: SoundComponent;
     instancer: InstancerComponent;
     particles: ParticleComponent;
+    vfx: VfxComponent;
+    cloth: ClothComponent;
+    water: WaterComponent;
     line: LineRendererComponent;
     trail: TrailRendererComponent;
     decal: DecalComponent;
@@ -3547,7 +3607,7 @@ declare module "engine" {
    * Schema for an `@attribute`-decorated field. The editor reads this off the
    * loaded class (`static attributes`) and renders an Inspector field of the
    * matching kind (`number` / `text` / `boolean` / `select` / `vec3` /
-   * `prefab` / `asset`).
+   * `prefab` / `asset` / `entity`).
    *
    * Constraints on `min`/`max`/`step` only apply to numeric fields. The
    * `options` array supplies values for `select` fields. A `prefab` field
@@ -3565,9 +3625,14 @@ declare module "engine" {
    *     // yourself via the "three" escape hatch) when you actually need it.
    *     const material = await this.engine.assets.material(this.glowMaterial);
    *   }
+   *
+   * An `entity` field renders the scene-entity picker and holds the entity
+   * id string (empty = none). Resolve it with `this.engine.getEntity(id)`:
+   *
+   *   @attribute({ type: "entity" }) target = "";
    */
   export interface AttributeOptions {
-    type?: "number" | "text" | "boolean" | "select" | "vec3" | "prefab" | "asset";
+    type?: "number" | "text" | "boolean" | "select" | "vec3" | "prefab" | "asset" | "entity";
     default?: unknown;
     min?: number;
     max?: number;

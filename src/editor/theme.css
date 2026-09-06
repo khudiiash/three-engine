@@ -3314,6 +3314,101 @@ body.macro-active .viewport-canvas {
   overflow: hidden;
 }
 
+/* ---------- Folding an inspector section (SectionFoldHeader) ----------
+   The header is TWO hit targets, not the single `.section-header.toggle`
+   button the Settings and Modules panels use, because a component header
+   already carries the view-only / enable / remove cluster on its right and a
+   button cannot nest another one. Both of them have to end up invisible as
+   buttons: a bare `<button>` inside the header arrives with the UA's own font,
+   background and border, which is what made the row read as two grey chips
+   sitting on the title. */
+.section-collapse {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 17px;
+  height: 17px;
+  /* Pulls the chevron into the section's left padding so the TITLES of a
+     folding section and a plain one still share a left edge — otherwise every
+     component title steps 17px right of "Transform" and the column reads as
+     ragged. */
+  margin-left: -4px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  opacity: 0.5;
+  cursor: pointer;
+  transition: background-color 0.12s var(--ease), opacity 0.12s var(--ease);
+}
+.section-collapse:hover {
+  opacity: 1;
+  background: var(--fill-1);
+}
+.section-collapse:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 1px;
+}
+
+/* The title is the section's big click target. `font: inherit` is the whole
+   point — it takes .section-header's 11px uppercase 600, which a UA button
+   would otherwise replace with 13px sentence-case. */
+.section-title-hit {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.12s var(--ease);
+}
+.section-title-hit:hover {
+  color: var(--text);
+}
+.section-title-hit:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Right when folded, down when open — the same rotation .section-header.toggle
+   uses, so a chevron means one thing everywhere in the editor. */
+.section-header .section-collapse .section-chevron {
+  transform: rotate(90deg);
+}
+.section-header.collapsed .section-collapse .section-chevron {
+  transform: rotate(0deg);
+}
+
+/* A folded section is a single row: the header's 9px gap exists to separate a
+   title from the fields under it, and there are none. Its own padding tightens
+   too, so a stack of folded components reads as a compact list rather than as
+   full-height sections that happen to be empty. */
+.section-header.collapsed {
+  margin-bottom: 0;
+}
+.inspector-section.collapsed {
+  padding-top: 7px;
+  padding-bottom: 7px;
+}
+/* The panel defers offscreen sections behind a 180px size guess. A folded
+   section is ~31px, so keeping the guess would make the scrollbar describe a
+   document several times taller than the one on screen — the same argument
+   .settings-panel makes for turning it off entirely. */
+.inspector-panel > .inspector-section.collapsed {
+  content-visibility: visible;
+  contain-intrinsic-block-size: auto;
+}
+
 /* Sub-header inside an inspector section — smaller / less prominent than
    .section-header (which is reserved for the section's title row). */
 .inspector-subheader {

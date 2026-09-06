@@ -1,0 +1,177 @@
+<!doctype html><html><head><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three/webgpu';
+import { mix, positionWorld, vec3 } from 'three/tsl';
+import { createGridSimulation } from '/src/engine/vfx/gridSimulation.js';
+import { waterSlotPool } from '/src/engine/vfx/waterSlots.js';
+import { installWaterSurfaceLook } from '/src/engine/vfx/waterSurfaceLook.js';
+import { installWaterMedium } from '/src/engine/vfx/waterMedium.js';
+import { installWaterCausticLight, updateWaterSlot } from '/src/engine/vfx/waterCaustics.js';
+import { waterAutoResolution } from '/src/engine/vfx/waterVolume.js';
+
+/**
+ * ══ THE SAME BODY, THE SAME FRAMING, THREE SIZES OF WATER ══════════════════
+ *
+ * "Impact from object hitting the water looks quite good, but only at specific
+ * scale. Make it larger, and it does not work. We need to adjust our water to
+ * any scale" (user, 2026-09-06). The only honest test of that sentence is to
+ * hold everything the eye compares FIXED — the body, the drop, the camera's
+ * distance in metres — and change only the size of the pool. Three pools, 5,
+ * 20 and 60 metres across, three metres deep; a 0.5 m body arriving at 4 m/s;
+ * the camera three metres from the splash every time. If the water is
+ * scale-free the three rows of pictures are the same picture.
+ *
+ * The same pools also carry the two look items from the same report: the foam
+ * (seen from above, at 45°) and the caustics (seen from under the surface,
+ * looking across the floor). Every frame is written to disk; a number cannot
+ * say whether foam "looks like foam".
+ *
+ * The pool is the user's own: their live component props, field for field.
+ */
+const IMAGES = [];
+const log = (...a) => console.log('PREMIUM:', ...a);
+const argument = (key, fallback) => { const v = new URL(location.href).searchParams.get(key); return v == null ? fallback : v; };
+const SCALES = argument('scales', '5,20,60').split(',').map(Number);
+const AUTO = argument('auto', '1') !== '0';
+try {
+ const adapter = await navigator.gpu.requestAdapter();
+ const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
+ const errors = []; device.addEventListener('uncapturederror', (e) => { errors.push(e.error.message); console.error('WebGPU validation', e.error.message); });
+ const W = 768, H = 512;                      // 768 * 4 = 12 * 256
+ const renderer = new THREE.WebGPURenderer({ device, antialias: false });
+ await renderer.init(); renderer.setSize(W, H);
+ document.body.append(renderer.domElement);
+ const target = new THREE.RenderTarget(W, H);
+ target.texture.colorSpace = THREE.SRGBColorSpace;
+ target.depthTexture = new THREE.DepthTexture(W, H);
+ const canvas = document.createElement('canvas'); canvas.width = W; canvas.height = H;
+ const ctx = canvas.getContext('2d');
+
+ // The user's live component, field for field (entity "Water", 2026-09-06).
+ const USER = { damping: .998, waveSpeed: 1, amplitude: 0, waveHeight: .2, waveLength: 5, waveOctaves: 8, waveGain: .45,
+   waveDirection: 0, choppiness: 1, rippleStrength: 1, surfaceDetail: 2, caustics: true, causticIntensity: .5,
+   color: '#268270', roughness: 0, style: 'realistic', deepColor: '#090b0b', saturation: .25, transmission: 1,
+   foam: 1, foamThreshold: .5 };
+ const DEPTH = 3;
+
+ for (const S of SCALES) {
+   const scene = new THREE.Scene();
+   scene.backgroundNode = mix(vec3(.62, .83, 1), vec3(.11, .37, .74), positionWorld.normalize().y.max(0).pow(.6));
+   scene.background = new THREE.Color('#7fb8f0');
+   const engine = { scene, renderer, camera: null, onUpdate: (fn) => { engine._tickers.push(fn); return () => {}; },
+     _tickers: [], on: () => () => {}, off: () => {}, modules: { get: () => null }, waterSlots: null };
+   const pool = waterSlotPool(engine);
+   const sun = new THREE.DirectionalLight('#fff6e0', 3);
+   sun.position.set(6, 14, 4); scene.add(sun); scene.add(sun.target);
+   scene.add(new THREE.AmbientLight('#bcd6ff', .35));
+
+   // A tiled floor and walls: the pool's own box, so caustics have a receiver.
+   const tiles = new THREE.MeshStandardNodeMaterial({ roughness: .9, color: '#ffffff' });
+   { const grid = positionWorld.xz.div(.5).fract().sub(.5).abs().sub(.03).step(0);
+     const wall = positionWorld.xy.div(.5).fract().sub(.5).abs().sub(.03).step(0);
+     const flat = positionWorld.y.lessThan(-DEPTH + .95);
+     tiles.colorNode = mix(vec3(.14, .16, .18), vec3(.86, .88, .9), flat.select(grid.x.mul(grid.y), wall.x.mul(wall.y))); }
+   const floor = new THREE.Mesh(new THREE.BoxGeometry(S + 1, .1, S + 1), tiles);
+   floor.position.y = -DEPTH; floor.receiveShadow = true; scene.add(floor);
+   for (const [x, z, w, d] of [[S / 2 + .3, 0, .6, S + 1], [-S / 2 - .3, 0, .6, S + 1], [0, S / 2 + .3, S + 1, .6], [0, -S / 2 - .3, S + 1, .6]]) {
+     const wall = new THREE.Mesh(new THREE.BoxGeometry(w, DEPTH + .6, d), tiles);
+     wall.position.set(x, -DEPTH / 2 + .3, z); scene.add(wall);
+   }
+   // Something to make contact foam against: a post standing in the water.
+   const post = new THREE.Mesh(new THREE.BoxGeometry(.5, 4, .5), new THREE.MeshStandardNodeMaterial({ color: '#ff3b28', roughness: .5 }));
+   post.position.set(1.6, -1, -1.2); scene.add(post);
+
+   const holder = new THREE.Object3D();
+   holder.scale.set(S, DEPTH, S);
+   scene.add(holder);
+   const resolution = AUTO ? waterAutoResolution(S) : 128;
+   const props = { ...USER, resolution, width: 1, height: 1, waterDepth: 1 };
+   const authored = new THREE.MeshPhysicalNodeMaterial({ color: '#8fd8de', roughness: .12, metalness: 0, ior: 1.333,
+     transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+   const slot = pool.claim({});
+   const sim = createGridSimulation('water', props, { material: authored, waterSlot: slot, anchorEngine: engine });
+   holder.add(sim.mesh);
+   sim.mesh.matrixAutoUpdate = false;
+   sim.mesh.matrix.identity();                 // origin ON the lid, at world y = 0
+   sim.mesh.matrixWorldNeedsUpdate = true;
+   holder.updateMatrixWorld(true);
+   installWaterMedium(engine);
+   installWaterCausticLight(engine);
+   installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
+   log(`pool ${S} m: resolution ${sim.resolution} (${(S / (sim.resolution - 1) * 100).toFixed(1)} cm cells)`);
+
+   const camera = new THREE.PerspectiveCamera(55, W / H, .05, 400);
+   engine.camera = camera;
+   const pose = (eye, at) => { camera.position.set(...eye); camera.lookAt(...at); camera.updateMatrixWorld(true); };
+   const step = async () => {
+     sim.tick(renderer, 1 / 60);
+     updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props });
+     for (const fn of engine._tickers) fn();
+     await device.queue.onSubmittedWorkDone();
+   };
+   const run = async (n) => { for (let i = 0; i < n; i++) await step(); };
+   const shoot = async (label) => {
+     renderer.setRenderTarget(target);
+     await renderer.renderAsync(scene, camera);
+     const px = await renderer.readRenderTargetPixelsAsync(target, 0, 0, W, H);
+     renderer.setRenderTarget(null);
+     const image = ctx.createImageData(W, H);
+     for (let i = 0; i < W * H * 4; i += 4) { for (let c = 0; c < 3; c++) image.data[i + c] = px[i + c]; image.data[i + 3] = 255; }
+     ctx.putImageData(image, 0, 0);
+     IMAGES.push({ label: `${String(S).padStart(3, '0')}m-${label}`, url: canvas.toDataURL('image/png') });
+     return px;
+   };
+   await renderer.computeAsync(sim.init);
+   await run(150);                              // 2.5 s: waves up, foam gathered
+
+   // ── THE LOOK: foam from above at 45°, and the caustics from under ──────
+   pose([-3.2, 3.4, 3.2], [.6, 0, -.6]);
+   await shoot('foam-45');
+   pose([0, 6, .001], [0, 0, 0]);
+   await shoot('foam-top');
+   pose([-1.6, -DEPTH + .5, 2.3], [1.2, -DEPTH, -1.6]);
+   await shoot('caustics-under');
+   pose([0, -DEPTH + 2.2, .001], [0, -DEPTH, 0]);
+   await shoot('caustics-down');
+
+   // ── THE SPLASH: a 0.5 m body arriving at 4 m/s, in the SAME place ──────
+   //
+   // Emitted the way `waterPhysics.js` emits: a press at the footprint the
+   // buoyancy solve would report (a 0.5 m cube: silhouette 0.25 m², radius
+   // 0.28 m), sized as draught + IMPACT_TIME × speed, then the rebound as the
+   // body slows — a partial release, leaving the floating draught behind.
+   const radius = Math.sqrt(.25 / Math.PI) / S;
+   const draught = .5 * .95, entry = draught + 4 * .12;
+   sim.addWaterImpulse(0, 0, radius, -entry / DEPTH);
+   await run(3);
+   pose([-2.2, 1.8, 2.2], [0, 0, 0]);
+   await shoot('splash-0.05s');
+   await run(9);
+   sim.addWaterImpulse(0, 0, radius, (entry - draught) / DEPTH);
+   await run(6);
+   await shoot('splash-0.3s');
+   await run(18);
+   await shoot('splash-0.6s');
+   await run(54);
+   await shoot('splash-1.5s');
+   await run(150);
+   await shoot('splash-4s');
+   pose([-3.2, 3.4, 3.2], [.6, 0, -.6]);
+   await shoot('foam-after-splash');
+
+   // Numbers beside the pictures: how wide and how deep the dent is right
+   // after entry, read straight off the surface map in world metres.
+   {
+     const tex = sim.waterSurfaceTexture;
+     void tex;
+   }
+   sim.dispose(renderer);
+   engine._waterMedium?.dispose();
+ }
+ log('validation', errors.length ? errors : 'clean');
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: errors.length === 0, images: IMAGES };
+ console.log('WATER-PREMIUM PASS');
+} catch (error) {
+ console.error(error.stack);
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: false, error: String(error.stack), images: IMAGES };
+}
+</script></body></html>

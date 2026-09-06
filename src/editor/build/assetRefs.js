@@ -24,11 +24,14 @@
 
 /** Document formats the exporter re-emits (with inner paths rewritten) rather
  *  than copies. The value names the collection bucket in `exportGame`. */
+import { isBuiltinMaterial } from "../../engine/builtinMaterials.js";
+
 export const DOCUMENT_KINDS = {
   mat: "material",
   atlas: "atlas",
   timeline: "timeline",
   audio: "audio",
+  vfx: "vfx",
 };
 
 export const extOf = (path) => {
@@ -51,7 +54,7 @@ export const extOf = (path) => {
  * author's scripts is at fault.
  */
 export const ASSET_EXTENSIONS = new Set([
-  "mat", "atlas", "timeline", "audio", "cubemap", "geom", "anim", "post",
+  "mat", "atlas", "timeline", "audio", "cubemap", "geom", "anim", "post", "vfx",
   "glb", "gltf",
   "png", "jpg", "jpeg", "webp", "basis", "ktx2", "hdr", "exr",
   "ogg", "oga", "wav", "mp3", "flac", "m4a", "opus",
@@ -60,6 +63,17 @@ export const ASSET_EXTENSIONS = new Set([
 
 export const looksLikeAssetPath = (value) =>
   typeof value === "string" && value !== "" && ASSET_EXTENSIONS.has(extOf(value));
+
+/** VFX assets and legacy inline graphs share the same nested asset fields. */
+export function rewriteVfxGraphAssets(graph, rewrite) {
+  for (const node of graph?.nodes ?? []) {
+    for (const key of ["path", "texture", "geometry"]) {
+      const value = node.props?.[key];
+      if (looksLikeAssetPath(value)) node.props[key] = rewrite(value);
+    }
+  }
+  return graph;
+}
 
 /** `.ts` authoring sources ship transpiled. */
 const scriptRename = (name) => name.replace(/\.ts$/i, ".js");
@@ -117,6 +131,7 @@ export function rewriteComponentAssets(
 
   const rewrite = (value) => {
     if (typeof value !== "string" || !value) return value;
+    if (isBuiltinMaterial(value)) return value;
     const kind = DOCUMENT_KINDS[extOf(value)];
     if (!kind) return claim(value);
     add(kind, value);
@@ -127,6 +142,15 @@ export function rewriteComponentAssets(
     if (field?.type !== "asset") continue;
     const value = props[field.key];
     if (typeof value === "string" && value) props[field.key] = rewrite(value);
+  }
+
+  if (["particles", "cloth", "water"].includes(component.type)) rewriteVfxGraphAssets(props.graph, rewrite);
+  if (component.type === "vfx") {
+    for (const element of props.timeline?.elements ?? []) {
+      if (element.texture) element.texture = rewrite(element.texture);
+      if (element.asset) element.asset = rewrite(element.asset);
+      rewriteVfxGraphAssets(element.graph, rewrite);
+    }
   }
 
   // Per-material overrides on an imported model are a name -> path map, not a

@@ -22,6 +22,7 @@ const AssetsPanel = lazy(() => import("./panels/AssetsPanel.jsx").then((m) => ({
 const ConsolePanel = lazy(() => import("./panels/ConsolePanel.jsx").then((m) => ({ default: m.ConsolePanel })));
 const ConsoleTab = lazy(() => import("./panels/ConsoleTab.jsx").then((m) => ({ default: m.ConsoleTab })));
 const ShaderGraphPanel = lazy(() => import("./panels/ShaderGraphPanel.jsx").then((m) => ({ default: m.ShaderGraphPanel })));
+const VfxTimelinePanel = lazy(() => import("./panels/VfxTimelinePanel.jsx").then((m) => ({ default: m.VfxTimelinePanel })));
 const ParticlesPanel = lazy(() => import("./panels/ParticlesPanel.jsx").then((m) => ({ default: m.ParticlesPanel })));
 const AnimatorPanel = lazy(() => import("./panels/AnimatorPanel.jsx").then((m) => ({ default: m.AnimatorPanel })));
 const TimelinePanel = lazy(() => import("./panels/TimelinePanel.jsx").then((m) => ({ default: m.TimelinePanel })));
@@ -75,6 +76,7 @@ const panelComponents = {
   console: withPanelSuspense(ConsolePanel),
   shaderGraph: withPanelSuspense(ShaderGraphPanel),
   particles: withPanelSuspense(ParticlesPanel),
+  vfx: withPanelSuspense(VfxTimelinePanel),
   animator: withPanelSuspense(AnimatorPanel),
   timeline: withPanelSuspense(TimelinePanel),
   sceneSettings: withPanelSuspense(SceneSettingsPanel),
@@ -132,6 +134,7 @@ export const PANEL_SPECS = {
   // Node editors dock with Assets (the full-width strip under the viewport),
   // NOT with the Inspector: the Inspector column is ~320px, and a graph fitted
   // into 320px renders every node as an unreadable postage stamp.
+  vfx: { title: "VFX", position: { referencePanel: "assets", direction: "within" } },
   particles: { title: "Particles", position: { referencePanel: "assets", direction: "within" } },
   animator: { title: "Animator", position: { referencePanel: "assets", direction: "within" } },
   // Same reasoning as the node editors: a dope sheet is a wide, short surface —

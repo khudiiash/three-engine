@@ -56,6 +56,9 @@ export default class Player extends Script {
   @attribute({ type: "vec3", default: [0, 0, 0] })
   target: [number, number, number] = [0, 0, 0];
 
+  @attribute({ type: "entity" })
+  follow = "";
+
   private velocity = new this.THREE.Vector3();
   private _offMove: (() => void) | null = null;
   private _offFire: (() => void) | null = null;

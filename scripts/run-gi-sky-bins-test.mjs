@@ -19,7 +19,8 @@
 //   · half floats must decode (the RGBE loader's default type).
 
 import {
-  aggregateBins, binCentreOf, binMeanTable, createSkyBinTables, integrateEquirectBins,
+  aggregateBins, binCentreOf, binMeanTable, createSkyBinTables, describeSun, integrateEquirectBins,
+  skyLumaCeiling,
 } from "../src/modules/gi/srcSkyBins.js";
 import { binMorton, dirToBin } from "../src/modules/gi/srcMath.js";
 
@@ -212,6 +213,103 @@ for (const value of [0.25, 1, 4, 1024, 65504]) {
   check("manager: only the last two builds are kept", mgr.builds === 2);
   // `needsUpdate` is a setter that bumps `version`; the upload path keys on it.
   check("manager: the GPU node sees the same array and was marked for upload", t4b.node.value.array === t4b.array && t4b.node.value.version > 0, `version ${t4b.node.value.version}`);
+}
+
+// ── G. §11.53: THE SUN IS NOT SKY ──────────────────────────────────────────
+//
+// A uniform sky with one hot spot above the horizon. The ceiling must sit
+// above the sky and below the spot; the excess must be exactly the spot's
+// energy above the ceiling, point back at it in the WORLD frame (the yaw
+// undone), and the extracted table must be the furnace again except for the
+// spot's own bin, which reads the CEILING there (a clamped texel is not a
+// hole). A wide bright region is sky, not a sun; aggregation carries the
+// per-bin excess; the manager extracts by default and keeps on the hatch.
+{
+  const W = 256, H = 128;
+  const setTexel = (src, fileRow, col, v) => {
+    const o = (fileRow * W + col) * 4;
+    src.data[o] = v; src.data[o + 1] = v; src.data[o + 2] = v;
+  };
+  for (const { yaw, flipY } of [{ yaw: 0, flipY: true }, { yaw: 1.1, flipY: true }, { yaw: -2.2, flipY: false }]) {
+    const src = uniformSource(W, H, [1, 1, 1], { flipY });
+    const col = 200, gpuRow = 100;                                 // elevation +50.6°
+    setTexel(src, flipY ? H - 1 - gpuRow : gpuRow, col, 1e4);
+    const { ceiling, percentileLuma } = skyLumaCeiling(src, { stride: 1 });
+    const tag = `sun yaw=${yaw} flipY=${flipY}`;
+    check(`${tag}: the ceiling sits between the sky and the spot`, ceiling > 1 && ceiling < 1e4 && near(percentileLuma, 1, 0.02), `ceiling ${ceiling.toFixed(3)}, p99.9 ${percentileLuma.toFixed(4)}`);
+    const bins = integrateEquirectBins(src, { yaw, w: 32, maxColumns: W, ceiling });
+    const sun = describeSun(bins);
+    const el = ((gpuRow + 0.5) / H - 0.5) * Math.PI;
+    const dOmega = (2 * Math.PI / W) * (Math.PI / H) * Math.cos(el);
+    check(`${tag}: the excess is the spot's energy above the ceiling`, near(sun.energy, (1e4 - ceiling) * dOmega, 1e-3) && sun.texels === 1, `${sun.energy.toExponential(4)} vs ${((1e4 - ceiling) * dOmega).toExponential(4)}, texels ${sun.texels}`);
+    const dWorld = rotateInverse(texelDirection(col, gpuRow, W, H), yaw);
+    check(`${tag}: its direction is the spot's, in the world frame`, angleBetween(sun.dir, dWorld) < 1, `${angleBetween(sun.dir, dWorld).toFixed(2)}°`);
+    check(`${tag}: elevation reads the spot's`, near(sun.elevationDeg, el * 180 / Math.PI, 0.02), `${sun.elevationDeg.toFixed(2)}° vs ${(el * 180 / Math.PI).toFixed(2)}°`);
+    check(`${tag}: present (share ≥ 2 %)`, sun.present && sun.share > 0.02, `share ${(sun.share * 100).toFixed(1)} %`);
+    const kept = binMeanTable(bins);
+    const extracted = binMeanTable(bins, null, { sun: "extract" });
+    let hot = -1;
+    for (let m = 0; m < 2 * 32 * 32; m++) if (bins.sun.binOmega[m] > 0) hot = m;
+    let worst = 0;
+    for (let m = 0; m < 2 * 32 * 32; m++) {
+      if (m === hot) continue;
+      worst = Math.max(worst, Math.abs(extracted[m * 4] - 1), Math.abs(extracted[m * 4 + 1] - 1), Math.abs(extracted[m * 4 + 2] - 1));
+    }
+    const hotExpect = (bins.omega[hot] - dOmega + ceiling * dOmega) / bins.omega[hot];
+    check(`${tag}: the extracted table is the furnace again`, hot >= 0 && worst < 1e-5, `worst |Δ| ${worst.toExponential(2)}`);
+    check(`${tag}: the spot's bin reads the ceiling, not a hole`, near(extracted[hot * 4], hotExpect, 1e-3), `${extracted[hot * 4].toFixed(4)} vs ${hotExpect.toFixed(4)}`);
+    check(`${tag}: the kept table still carries the spot`, kept[hot * 4] > 10 * extracted[hot * 4], `${kept[hot * 4].toFixed(2)} vs ${extracted[hot * 4].toFixed(4)}`);
+  }
+  {
+    // A cloud bank: a 21-row band at 10× the sky is 5 % of the sphere — sky.
+    const src = uniformSource(W, H, [1, 1, 1], { flipY: true });
+    for (let fr = 17; fr <= 37; fr++) for (let x = 0; x < W; x++) setTexel(src, fr, x, 10);
+    const { ceiling } = skyLumaCeiling(src, { stride: 1 });
+    check("cloud bank: the ceiling clears a wide bright region", ceiling > 10, `ceiling ${ceiling.toFixed(2)}`);
+    const bins = integrateEquirectBins(src, { w: 32, maxColumns: W, ceiling });
+    const sun = describeSun(bins);
+    check("cloud bank: nothing is a sun", !sun.present && sun.energy === 0, `share ${sun.share}, energy ${sun.energy}`);
+    const table = binMeanTable(bins, null, { sun: "extract" });
+    let peak = 0;
+    for (let m = 0; m < 2 * 32 * 32; m++) peak = Math.max(peak, table[m * 4]);
+    check("cloud bank: the extracted table is the whole map", near(peak, 10, 1e-5), `peak ${peak.toFixed(4)}`);
+  }
+  {
+    // Aggregation carries the per-bin excess exactly.
+    const src = uniformSource(W, H, [1, 1, 1], { flipY: true });
+    setTexel(src, 30, 100, 5e3);
+    const { ceiling } = skyLumaCeiling(src, { stride: 1 });
+    const fine = integrateEquirectBins(src, { yaw: 0.5, w: 32, maxColumns: W, ceiling });
+    const agg = aggregateBins(fine, 4);
+    const direct = integrateEquirectBins(src, { yaw: 0.5, w: 4, maxColumns: W, ceiling });
+    let worst = 0;
+    for (let m = 0; m < 32; m++) {
+      worst = Math.max(worst, Math.abs(agg.sun.sum[m * 3] - direct.sun.sum[m * 3]), Math.abs(agg.sun.binOmega[m] - direct.sun.binOmega[m]));
+    }
+    check("aggregate carries the sun's per-bin excess", worst < 1e-6 && agg.sun.energy === fine.sun.energy && agg.eUp === fine.eUp, `worst |Δ| ${worst.toExponential(2)}`);
+  }
+  {
+    // The manager: extract by default, keep on the hatch, and the receipt names it.
+    let clock = 0;
+    const mgr = createSkyBinTables({ minIntervalMs: 100, maxColumns: 256, now: () => clock });
+    const t4 = mgr.beginBuild().tableFor(4);
+    const src = uniformSource(W, H, [1, 1, 1], { flipY: true });
+    setTexel(src, 30, 100, 1e4);
+    mgr.update(src, 0, "sun:1");
+    const first = mgr.last;
+    check("manager: a sunny map fills in extract mode", mgr.mode === "extract" && first.sun.extracted && first.sun.present, `mode ${mgr.mode}`);
+    let peak = 0;
+    for (let m = 0; m < 32; m++) peak = Math.max(peak, t4.array[m * 4]);
+    check("manager: the extracted table's brightest bin is the sky", peak < 1.5, `peak ${peak.toFixed(3)}`);
+    check("manager: the receipt's peak is the table's", near(first.peakBinLuma, peak, 1e-3), `${first.peakBinLuma.toFixed(4)} vs ${peak.toFixed(4)}`);
+    check("manager: sky irradiance = whole − sun when extracted", near(first.skyUpIrradianceLuma, first.upIrradianceLuma - first.sun.upIrradiance, 1e-6) && first.sun.upIrradiance > 0);
+    clock += 200;
+    const ran = mgr.update(src, 0, "sun:1", { extractSun: false });
+    check("manager: the hatch off re-integrates and keeps the sun", ran && mgr.mode === "keep" && !mgr.last.sun.extracted && mgr.last.sun.present && mgr.runs === 2, `mode ${mgr.mode}, runs ${mgr.runs}`);
+    let peak2 = 0;
+    for (let m = 0; m < 32; m++) peak2 = Math.max(peak2, t4.array[m * 4]);
+    check("manager: the kept table carries the spot", peak2 > 10 * peak && near(mgr.last.skyUpIrradianceLuma, mgr.last.upIrradianceLuma, 1e-9), `peak ${peak2.toFixed(3)} vs ${peak.toFixed(3)}`);
+  }
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

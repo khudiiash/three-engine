@@ -1,0 +1,79 @@
+<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><style>body{margin:0;background:#102029}canvas{display:block}</style><canvas id="view"></canvas><script type="module">
+const assert=(ok,message)=>{if(!ok)throw new Error(message);};
+try {
+ globalThis.__engineLimitsCap={maxStorageBuffersPerShaderStage:8};globalThis.__giSrcProbes=true;
+ const {Engine,THREE,registerBuiltInComponents}=await import('/src/engine/index.js');await import('/src/modules/index.js');
+ const {enableEngineModule}=await import('/src/engine/modules.js');
+ registerBuiltInComponents();const engine=new Engine();globalThis.__WATER_APPEARANCE_ENGINE__=engine;engine.setSize(640,480);await engine.init(document.querySelector('canvas'));
+ const renderer=engine.renderer,errors=[];renderer.backend.device.addEventListener('uncapturederror',e=>{errors.push(e.error.message);console.error('WebGPU validation:',e.error.message);});
+ await enableEngineModule(engine,'water');await enableEngineModule(engine,'gi');
+ const scene=engine.scene;scene.background=new THREE.Color('#a8c8d4');
+ const camera=new THREE.PerspectiveCamera(48,640/480,.1,70);camera.position.set(7,5.3,9);camera.lookAt(0,-.3,0);engine.camera=camera;
+ const sun=new THREE.DirectionalLight('#fff4dc',3);sun.position.set(-3,8,4);scene.add(sun);
+ const cube=(name,x,y,z,w,h,d,color,roughness=.8)=>{
+  const mesh=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),new THREE.MeshStandardNodeMaterial({color,roughness}));mesh.name=name;mesh.position.set(x,y,z);scene.add(mesh);return mesh;
+ };
+ for(let x=0;x<8;x++)for(let z=0;z<6;z++)cube('Pool tile',x-3.5,-1.65,z-2.5,.985,.1,.985,(x+z)%2?'#c2d9cf':'#709997');
+ cube('Back pool wall',0,-.8,-3.2,8.4,1.8,.3,'#c5bda6');cube('Left pool wall',-4.2,-.8,0,.3,1.8,6.7,'#c5bda6');
+ cube('Right pool rim',4.2,-.3,0,.3,2.8,6.7,'#c5bda6');
+ const reflectedPillar=cube('Reflected red pillar',0,1.25,-3.15,1.15,2.5,.65,'#ee3a1f',.2);
+ const submerged=new THREE.Mesh(new THREE.SphereGeometry(.55,24,16),new THREE.MeshStandardNodeMaterial({color:'#f4cc65',roughness:.3}));submerged.position.set(1,-.85,.8);scene.add(submerged);
+ const entity=engine.createEntity({name:'Water'});entity.object3D.rotation.x=-Math.PI/2;
+ const mesh=entity.addComponent('mesh',{geometry:'plane',material:'builtin:Water.mat',collision:'none',castShadow:false});
+ await new Promise(r=>setTimeout(r,100));mesh.mesh.geometry=new THREE.PlaneGeometry(8,6);
+ const water=entity.addComponent('water',{resolution:96,amplitude:0,waveHeight:.08,waveLength:2.2,waveSpeed:.8,waterDepth:1.6});
+ const gi=engine.createEntity({name:'GI'}).addComponent('global-illumination',{quality:'medium',bounce:1,ao:.4,reflections:1});
+ engine.start();const deadline=performance.now()+70000;let settled=0;
+ while(performance.now()<deadline){await new Promise(r=>setTimeout(r,100));const sys=engine.modules.get('gi').system;if(sys?._fieldReadyOnce&&!engine.renderSuspended&&water.simulation?.mesh.material.userData.giWater)settled++;if(settled>=30)break;assert(!errors.length,errors.join('\n'));}
+ assert(settled>=30,'Water GI startup settles');engine.stop();
+ const material=water.simulation.mesh.material;
+ assert(material!==mesh.mesh.material,'Runtime water material must be isolated from editable source');
+ assert(material.userData.giWater&&material.userData.planarReflection,'Water has forward GI and scene reflection');
+ // ⚠ THE MEDIUM IS A CONFOUND FOR THE REFLECTION MEASUREMENTS. A water VOLUME
+ // absorbs what is seen through it, so the refracted half of every water pixel
+ // now swings toward the water colour — which is the point of the feature and
+ // is measured on its own in `water-surface-smoke.html`. Here it would swamp a
+ // red→green reflection delta, so the column is held open while the reflection
+ // is measured and restored before the GI reception checks. The engine has been
+ // stopped, so nothing re-publishes the slot behind this.
+ const slot=engine.waterSlots.slots.find(s=>s.owner===water);
+ assert(slot,'the water surface claimed an engine slot');
+ assert(engine.scene.fogNode,'a water volume installs the underwater medium');
+ slot.uniforms.active.value=0;
+ const target=new THREE.RenderTarget(640,480);
+ target.texture.internalFormat=navigator.gpu.getPreferredCanvasFormat();
+ async function capture(){renderer.setRenderTarget(target);for(let i=0;i<6;i++){renderer.render(scene,camera);await new Promise(r=>setTimeout(r,50));}const bytes=await renderer.readRenderTargetPixelsAsync(target,0,0,640,480);renderer.setRenderTarget(null);return bytes;}
+ const on=await capture();gi.props.reflections=0;const off=await capture();gi.props.reflections=1;
+ let reflectionPixels=0,reflectionEnergy=0;
+ for(let y=210;y<450;y++)for(let x=130;x<540;x++){const i=(y*640+x)*4;const delta=Math.abs(on[i]-off[i])+Math.abs(on[i+1]-off[i+1])+Math.abs(on[i+2]-off[i+2]);if(delta>3)reflectionPixels++;reflectionEnergy+=delta;}
+ assert(reflectionPixels>100&&reflectionEnergy>1000,'Visible water scene reflections respond to GI reflection toggle '+JSON.stringify({reflectionPixels,reflectionEnergy}));
+ // Recolor only the reflected object while GI history is held fixed. Exclude
+ // its entire directly projected box: changed pixels must be its reflection.
+ const box=new THREE.Box3().setFromObject(reflectedPillar),bounds=[Infinity,Infinity,-Infinity,-Infinity];
+ for(const x of [box.min.x,box.max.x])for(const y of [box.min.y,box.max.y])for(const z of [box.min.z,box.max.z]){
+  const p=new THREE.Vector3(x,y,z).project(camera),px=(p.x*.5+.5)*640,py=(.5-p.y*.5)*480;
+  bounds[0]=Math.min(bounds[0],px-4);bounds[1]=Math.min(bounds[1],py-4);bounds[2]=Math.max(bounds[2],px+4);bounds[3]=Math.max(bounds[3],py+4);
+ }
+ reflectedPillar.material.color.set('#12ef3a');const green=await capture();let objectReflectionPixels=0;
+ for(let y=100;y<450;y++)for(let x=80;x<570;x++){
+  if(x>=bounds[0]&&x<=bounds[2]&&y>=bounds[1]&&y<=bounds[3])continue;
+  const i=(y*640+x)*4;if(on[i]-green[i]+green[i+1]-on[i+1]>3)objectReflectionPixels++;
+ }
+ assert(objectReflectionPixels>30,'Reflected object color reaches water beyond its direct image '+objectReflectionPixels);
+ reflectedPillar.material.color.set('#ee3a1f');
+ slot.uniforms.active.value=1;
+ // Hold geometry/materials fixed: isolate active SRC reception from direct sun.
+ const light=engine.modules.get('gi').system.state.light;
+ const direct=sun.intensity;sun.intensity=0;gi.props.reflections=0;
+ const hidden=[];scene.traverse(object=>{if(object.isMesh&&object!==water.simulation.mesh&&object.visible){hidden.push(object);object.visible=false;}});
+ const withGI=await capture();light.removeFromParent();const withoutGI=await capture();scene.add(light);
+ let giEnergy=0;for(let i=0;i<withGI.length;i+=4)giEnergy+=Math.max(0,withGI[i]+withGI[i+1]+withGI[i+2]-withoutGI[i]-withoutGI[i+1]-withoutGI[i+2]);
+ hidden.forEach(object=>object.visible=true);sun.intensity=direct;gi.props.reflections=1;
+ const vf=engine.modules.get('gi').system._vfxIrradianceField;
+ console.log('WATER GI',JSON.stringify({giEnergy,reflectionPixels,objectReflectionPixels,fieldMin:vf?.min?.value.toArray(),fieldSpan:vf?.span?.value.toArray(),ready:vf?.ready?.value}));
+ renderer.setRenderTarget(null);renderer.render(scene,camera);
+ assert(giEnergy>100,'Active SRC contributes to isolated water');
+ await renderer.backend.device.queue.onSubmittedWorkDone();assert(!errors.length,errors.join('\n'));
+ globalThis.__GI_SMOKE_RESULT__={pass:true,reflectionPixels,reflectionEnergy,objectReflectionPixels,giEnergy};console.log('GI-SMOKE PASS water appearance',JSON.stringify(__GI_SMOKE_RESULT__));
+}catch(error){console.error(error.stack??error);globalThis.__GI_SMOKE_RESULT__={pass:false,error:String(error.stack??error)};}
+</script>

@@ -113,6 +113,7 @@ const TYPE_LABELS = {
   anim: "Animator",
   timeline: "Timeline",
   post: "Post Process Graph",
+  vfx: "Simulation Graph",
   atlas: "Sprite Atlas",
   prefab: "Prefab",
   entity: "Prefab (legacy)",
@@ -168,7 +169,7 @@ const ACTION_ICONS = {
 };
 
 /** Assets stored as JSON, which can therefore be shown (and hand-edited) raw. */
-const JSON_SOURCE_EXTS = ["mat", "scene", "prefab", "entity", "anim", "timeline", "post", "atlas", "cubemap", "audio"];
+const JSON_SOURCE_EXTS = ["mat", "scene", "prefab", "entity", "anim", "timeline", "post", "vfx", "atlas", "cubemap", "audio"];
 
 /**
  * Extensions with a dedicated section above. Anything else falls through to

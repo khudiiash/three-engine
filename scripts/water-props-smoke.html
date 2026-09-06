@@ -1,0 +1,263 @@
+<!doctype html><html><head><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three/webgpu';
+import { mix, positionWorld, vec3 } from 'three/tsl';
+import { createGridSimulation } from '/src/engine/vfx/gridSimulation.js';
+import { waterSlotPool } from '/src/engine/vfx/waterSlots.js';
+import { installWaterSurfaceLook } from '/src/engine/vfx/waterSurfaceLook.js';
+import { installWaterMedium } from '/src/engine/vfx/waterMedium.js';
+import { installWaterCausticLight, updateWaterSlot } from '/src/engine/vfx/waterCaustics.js';
+
+/**
+ * ══ EVERY WATER CONTROL, AND WHETHER IT DOES ANYTHING ══════════════════════
+ *
+ * "If we give the user a configurable property, upon changing it, we should
+ * immediately see the difference. Otherwise, what's the point?" (user,
+ * 2026-09-06) — after colour, saturation, foam, roughness, caustic intensity
+ * and transmission had each, separately, turned out to be implemented only in
+ * a code path no real scene takes. Six of the same bug found six times by a
+ * person looking at a screen is a missing test, not six mistakes.
+ *
+ * So: set each control to one end of its range, render; set it to the other,
+ * render; and measure whether the image moved.
+ *
+ * ⚠ **THE WATER IS ANIMATED, WHICH MAKES THE NAIVE A/B USELESS.** Two renders
+ * of the same scene differ anyway, because the waves moved between them.
+ *
+ * ⛔ AND SCORING AGAINST "THE SAME SCENE A MOMENT LATER" IS NOT ENOUGH EITHER.
+ * That was the second version, and it called `amplitude` dead while its own two
+ * captures show a two-metre spike standing in the middle of the pool: seeding
+ * the field is a discontinuity, so the arm that has just been re-seeded is
+ * violently settling and "a moment later" moves MORE than the dial does. A
+ * control has to be the same measurement, not merely a nearby one.
+ *
+ * So the solver is RESTARTED before every arm and each runs the same number of
+ * ticks. The simulation is deterministic, so two arms at the same age differ
+ * only by the property under test — and the control arm, which is the same
+ * settings run twice, reads ~0 and says so. If it ever stops reading ~0, every
+ * verdict on this page is void and that line is the one to look at.
+ *
+ * Two camera poses, because a surface property and a volume property are not
+ * visible from the same place, and the score is whichever sees it more.
+ */
+const IMAGES = [];
+const log = (...a) => console.log('PROP:', ...a);
+try {
+ const adapter = await navigator.gpu.requestAdapter();
+ const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
+ const errors = []; device.addEventListener('uncapturederror', (e) => { errors.push(e.error.message); console.error('WebGPU validation', e.error.message); });
+ const W = 640, H = 448;                       // 640 * 4 = 10 * 256
+ const renderer = new THREE.WebGPURenderer({ device, antialias: false });
+ await renderer.init(); renderer.setSize(W, H);
+ document.body.append(renderer.domElement);
+ const target = new THREE.RenderTarget(W, H);
+ target.texture.colorSpace = THREE.SRGBColorSpace;
+ target.depthTexture = new THREE.DepthTexture(W, H);
+
+ const scene = new THREE.Scene();
+ scene.backgroundNode = mix(vec3(.62, .83, 1), vec3(.11, .37, .74), positionWorld.normalize().y.max(0).pow(.6));
+ scene.background = new THREE.Color('#7fb8f0');
+ const engine = { scene, renderer, camera: null, onUpdate: (fn) => { engine._tickers.push(fn); return () => {}; },
+   _tickers: [], on: () => () => {}, off: () => {}, modules: { get: () => null } };
+ const pool = waterSlotPool(engine);
+
+ const sun = new THREE.DirectionalLight('#fff6e0', 3);
+ sun.position.set(6, 9, 4); scene.add(sun); scene.add(sun.target);
+ scene.add(new THREE.AmbientLight('#bcd6ff', .35));
+
+ // A checkered bed, so caustics and the medium both have something to act on.
+ const bed = new THREE.MeshStandardNodeMaterial({ roughness: .9 });
+ { const grid = positionWorld.xz.div(1.2).fract().sub(.5).abs().sub(.02).step(0);
+   bed.colorNode = mix(vec3(.08, .09, .10), vec3(.88, .90, .92), grid.x.mul(grid.y)); }
+ const floor = new THREE.Mesh(new THREE.BoxGeometry(14, .1, 14), bed);
+ floor.position.set(-.088, -1.856, 1.557); scene.add(floor);
+ // Something above the water to reflect, so `roughness` has a subject.
+ const post = new THREE.Mesh(new THREE.BoxGeometry(.6, 2.4, .6),
+   new THREE.MeshStandardNodeMaterial({ color: '#ff3b28', roughness: .5 }));
+ post.position.set(2.6, 1.2, -1.4); scene.add(post);
+ // ⭐ A SHORE, WITHOUT WHICH CONTACT FOAM HAS NOWHERE TO EXIST. The first
+ // version of this page had a flat bed 2.4 m down and a vertical post, so the
+ // scene behind every water pixel was 3+ metres away and the contact term could
+ // only ever fire in a ten-pixel sliver at the post's waterline — which reads
+ // as `foamThreshold` being dead when it is the SCENE that is wrong. Real water
+ // foams at a shore because the bed RISES THROUGH the surface, and a test for
+ // shoreline foam needs a shoreline.
+ const beach = new THREE.Mesh(new THREE.BoxGeometry(12, .3, 6), bed);
+ beach.position.set(-.088, -.62, -1.6); beach.rotation.x = -.45; scene.add(beach);
+
+ // The reported pool, transform for transform (see water-saturation-smoke.html).
+ const holder = new THREE.Object3D();
+ holder.position.set(-0.088, -0.4385, 1.5571);
+ holder.scale.set(9.6999, 1.94, 9.6999);
+ scene.add(holder);
+ const BASE = { resolution: 128, width: 1, height: 1, waterDepth: 1, damping: .998,
+   waveSpeed: 1, amplitude: 0, waveHeight: .1, waveLength: 2, waveOctaves: 8, waveGain: .5,
+   waveDirection: 0, choppiness: 1, rippleStrength: 1, surfaceDetail: 1.15,
+   caustics: true, causticIntensity: 1, color: '#4c9db8', roughness: .5, style: 'realistic',
+   deepColor: '#05231f', saturation: .5, transmission: 1, foam: .2, foamThreshold: .5 };
+ let current = { ...BASE };
+ const authored = new THREE.MeshPhysicalNodeMaterial({ color: '#8fd8de', roughness: .12, metalness: 0,
+   ior: 1.333, transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+ const slot = pool.claim({});
+ const sim = createGridSimulation('water', current, { material: authored, waterSlot: slot, anchorEngine: engine });
+ holder.add(sim.mesh);
+ sim.mesh.matrixAutoUpdate = false;
+ sim.mesh.matrix.identity().multiply(new THREE.Matrix4().makeTranslation(0, .5, 0));
+ sim.mesh.matrixWorldNeedsUpdate = true;
+ holder.updateMatrixWorld(true);
+ installWaterMedium(engine);
+ installWaterCausticLight(engine);
+ installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
+
+ const camera = new THREE.PerspectiveCamera(55, W / H, .05, 200);
+ engine.camera = camera;
+ const POSES = {
+   // Looking down THROUGH the surface at the bed: the volume's own controls.
+   above: { eye: [-.1, 2.6, 8.4], at: [-.1, -1.2, 1.4] },
+   // Standing in it, looking along the surface: the surface's controls.
+   under: { eye: [0, -.35, 4.6], at: [.4, .1, -2] },
+ };
+ const pose = (name) => { const p = POSES[name];
+   camera.position.set(...p.eye); camera.lookAt(...p.at); camera.updateMatrixWorld(true); };
+
+ // ⚠ `updateWaterSlot` reads the props it is HANDED, not the simulation's — so
+ // `caustics: false` only reaches the slot if the live object is passed here.
+ const step = async () => {
+   sim.tick(renderer, 1 / 60);
+   updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props: current });
+   for (const fn of engine._tickers) fn();
+   await device.queue.onSubmittedWorkDone();
+ };
+ const apply = (patch) => { current = { ...BASE, ...patch }; sim.update(current); };
+ const run = async (n) => { for (let i = 0; i < n; i++) await step(); };
+ /** Same settings, same age, every time: `restart` zeroes the clock and the
+  *  next tick re-seeds the field from `amplitude`. */
+ const arm = async (patch) => { apply(patch); sim.restart(); await run(K); };
+
+ const canvas = document.createElement('canvas'); canvas.width = W; canvas.height = H;
+ const ctx = canvas.getContext('2d');
+ const shoot = async (label, keep) => {
+   renderer.setRenderTarget(target);
+   await renderer.renderAsync(scene, camera);
+   const px = await renderer.readRenderTargetPixelsAsync(target, 0, 0, W, H);
+   renderer.setRenderTarget(null);
+   if (keep) {
+     const image = ctx.createImageData(W, H);
+     for (let i = 0; i < W * H * 4; i += 4) { for (let c = 0; c < 3; c++) image.data[i + c] = px[i + c]; image.data[i + 3] = 255; }
+     ctx.putImageData(image, 0, 0);
+     IMAGES.push({ label, url: canvas.toDataURL('image/png') });
+   }
+   return px;
+ };
+ /**
+  * ⛔ **A FRAME MEAN CANNOT SEE A LOCAL CHANGE, AND MOST OF THESE ARE LOCAL.**
+  * The first version of this scored only the mean absolute difference and
+  * called `amplitude` dead — while the capture it took shows a two-metre spike
+  * standing in the middle of the pool. A change confined to a tenth of the
+  * frame is divided by the whole frame; the drift, which is everywhere, is not.
+  * Foam went the same way: real, sparse, and averaged into nothing.
+  *
+  * So both. SHARE — the fraction of pixels that moved at all — is what sees a
+  * spike, a foam patch or a caustic filament; MEAN is what sees a tint that
+  * shifts everything slightly. A control is alive if it beats its own control
+  * on EITHER, because those are two different ways of being visible.
+  */
+ const diff = (a, b) => {
+   let sum = 0, moved = 0;
+   const luma = (px, i) => px[i] * .2126 + px[i + 1] * .7152 + px[i + 2] * .0722;
+   for (let i = 0; i < W * H * 4; i += 4) {
+     sum += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+     if (Math.abs(luma(a, i) - luma(b, i)) > 10) moved++;
+   }
+   return { mean: sum / (W * H * 3), share: moved / (W * H) };
+ };
+
+ const K = 45;                       // ticks each arm runs — 0.75 s, long enough
+                                     // for waves to build and foam to gather
+ await renderer.computeAsync(sim.init);
+ await run(60);
+ log('warm');
+
+ // key, low, high
+ const SWEEP = [
+   ['waveHeight', 0, .35], ['waveLength', .6, 6], ['waveSpeed', 0, 8],
+   ['waveOctaves', 1, 8], ['waveGain', .2, .9], ['waveDirection', 0, 90],
+   ['choppiness', 0, 1], ['rippleStrength', 0, 2], ['surfaceDetail', 0, 2],
+   ['amplitude', 0, 1.2],
+   ['caustics', false, true], ['causticIntensity', 0, 3],
+   ['color', '#0a2e12', '#e8f0a0'], ['deepColor', '#2b0505', '#f0f0ff'],
+   ['roughness', 0, 1], ['style', 'realistic', 'stylized'],
+   ['saturation', .05, .95], ['transmission', 0, 1],
+   ['foam', 0, 1], ['foamThreshold', .02, 2],
+ ];
+
+ const verdicts = [];
+ for (const [key, low, high] of SWEEP) {
+   const scores = {};
+   for (const name of ['above', 'under']) {
+     pose(name);
+     await arm({ [key]: low });
+     const a = await shoot(`${key}-${name}-low`, name === 'above');
+     await arm({ [key]: low });                       // the same run, twice
+     const control = await shoot(null, false);
+     await arm({ [key]: high });
+     const b = await shoot(`${key}-${name}-high`, name === 'above');
+     const drift = diff(a, control), effect = diff(control, b);
+     scores[name] = { drift, effect,
+       // DEAD means: changing the control moved the image no more than simply
+       // waiting did. The margins are deliberately generous — this test is here
+       // to catch controls that do NOTHING, not to grade how strong they are.
+       byMean: effect.mean > drift.mean * 1.6 + .25,
+       byShare: effect.share > drift.share * 1.6 + .004 };
+   }
+   // The pose that sees it best is the one that counts: a volume control is
+   // invisible from above the waterline and a surface one from under it.
+   const alive = ['above', 'under'].some((n) => scores[n].byMean || scores[n].byShare);
+   const best = scores.above.byMean || scores.above.byShare ? 'above' : 'under';
+   const { drift, effect } = scores[best];
+   verdicts.push({ key, alive, pose: best, drift: Math.max(scores.above.drift.mean, scores.under.drift.mean) });
+   log(`${alive ? 'LIVE' : '⛔ DEAD'}  ${key.padEnd(16)} ${String(low).padEnd(11)}→ ${String(high).padEnd(11)} moved ${
+     effect.mean.toFixed(2)} over ${(effect.share * 100).toFixed(1)}% of pixels (drifting alone: ${
+     drift.mean.toFixed(2)} over ${(drift.share * 100).toFixed(1)}%) [${best}]`);
+ }
+ // ── CAN THE CONTACT-FOAM TERM SEE ANYTHING? ──────────────────────────────
+ // `foamThreshold` scores a BIT-IDENTICAL zero, and the only thing it feeds is
+ // the contact width, so either the depth behind the surface is being read or
+ // it is not. Draw it: metres of scene behind each water pixel, 0-3 m as black
+ // to white. A working read shows the post's waterline dark and the open water
+ // bright; a broken one is flat.
+ {
+   const { linearDepth: ld, viewportDepthTexture: vdt, cameraFar: cf, cameraNear: cn, float: f, vec3: v3 } = await import('three/tsl');
+   pose('above');
+   await arm({});
+   const material = sim.mesh.material;
+   const keptColor = material.colorNode, keptTransmission = material.transmissionNode;
+   const behind = ld(vdt()).sub(ld()).mul(cf.sub(cn)).max(0);
+   material.colorNode = v3(behind.div(3).clamp(0, 1));
+   material.transmissionNode = f(0);
+   material.needsUpdate = true;
+   const px = await shoot('debug-depth-behind', true);
+   let lo = 255, hi = 0, sum = 0, n = 0;
+   for (let y = Math.round(H * .25); y < Math.round(H * .6); y++) for (let x = 40; x < W - 40; x++) {
+     const g = px[(y * W + x) * 4]; lo = Math.min(lo, g); hi = Math.max(hi, g); sum += g; n++;
+   }
+   log(`depth behind the surface: min ${lo}, max ${hi}, mean ${(sum / n).toFixed(1)} of 255 — ${
+     hi - lo > 12 ? 'the read WORKS (it varies with what is behind)' : '⛔ FLAT: the depth read gives the same value everywhere, so contact foam can never fire'}`);
+   material.colorNode = keptColor; material.transmissionNode = keptTransmission;
+   material.needsUpdate = true;
+ }
+
+ apply({});
+ const worstDrift = Math.max(...verdicts.map((v) => v.drift));
+ log(`control arms (same settings run twice) differed by at most ${worstDrift.toFixed(3)} — ${
+   worstDrift < .5 ? 'the solver is deterministic and every verdict above is sound' : '⛔ NOT DETERMINISTIC: the verdicts above are void'}`);
+
+ const dead = verdicts.filter((v) => !v.alive).map((v) => v.key);
+ log(dead.length ? `⛔ ${dead.length} CONTROL(S) DO NOTHING: ${dead.join(', ')}` : `all ${verdicts.length} controls move the image`);
+ log('validation', errors.length ? errors : 'clean');
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: errors.length === 0 && dead.length === 0, images: IMAGES, dead };
+ console.log(dead.length ? 'WATER-PROPS FAIL' : 'WATER-PROPS PASS');
+} catch (error) {
+ console.error(error.stack);
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: false, error: String(error.stack), images: IMAGES };
+}
+</script></body></html>

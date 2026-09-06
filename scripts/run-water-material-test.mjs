@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import * as TSL from 'three/tsl';
+import { MeshPhysicalNodeMaterial } from 'three/webgpu';
+import { builtinMaterialDefinition, WATER_MATERIAL_PATH } from '../src/engine/builtinMaterials.js';
+import { compileShaderGraph, generateTslCode } from '../src/engine/tslGraph.js';
+const definition=builtinMaterialDefinition(WATER_MATERIAL_PATH);
+assert.equal(definition.name,'Water');assert.equal(definition.pipeline.transparent,true);
+const compiled=await compileShaderGraph(definition.shaderGraph);
+assert.ok(compiled.mutations.colorNode);assert.equal(compiled.mutations.transmissionNode.value,.8);
+const code=generateTslCode(definition.shaderGraph);
+const names=code.match(/import \{ ([^}]+) \} from/)[1].split(',').map(s=>s.trim());
+const body=code.replace(/^import[^\n]+\n/,'');
+const material=new MeshPhysicalNodeMaterial();
+new Function(...names,'material',body)(...names.map(name=>TSL[name]),material);
+assert.ok(material.colorNode);assert.ok(code.includes('mx_noise_float'));assert.ok(code.includes('mul(.12)'));assert.ok(code.includes('smoothstep(.1,.7'));
+const second=builtinMaterialDefinition(WATER_MATERIAL_PATH);definition.shaderGraph.nodes[0].props.shallow='#ff0000';
+assert.equal(second.shaderGraph.nodes[0].props.shallow,'#64cbd0');
+console.log('WATER-MATERIAL PASS compiled + generated editable shading, immutable default');

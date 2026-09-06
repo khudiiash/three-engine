@@ -1,0 +1,13 @@
+.vfx-panel{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--bg-panel,#202124);color:var(--text,#ddd);font-size:12px;overflow:hidden}
+.vfx-kind-tabs{display:flex;gap:4px;padding:8px;border-bottom:1px solid var(--border,#37383c);flex-wrap:wrap;flex-shrink:0}
+.vfx-kind-tabs button{display:flex;align-items:center;gap:6px;border:1px solid transparent;background:transparent;color:var(--text-muted,#a2a5ac);border-radius:5px;padding:6px 10px;cursor:pointer;font:inherit}
+.vfx-kind-tabs button.active{color:#d2bbff;background:#7760a72b;border-color:#7760a75c}
+.vfx-live-dot{width:5px;height:5px;background:#b49be6;border-radius:50%}
+.vfx-graph-workspace{display:flex;flex:1;flex-direction:column;min-height:0;min-width:0;overflow:hidden}
+.vfx-graph-workspace>.shader-graph-panel{flex:1;min-height:0}
+.vfx-empty{display:flex;flex:1;align-items:center;justify-content:center;flex-direction:column;gap:10px;padding:25px;text-align:center}
+.vfx-empty p{color:var(--text-muted,#999);margin:0 0 6px;line-height:1.5}
+.vfx-error{color:#ffc4bd;background:#733d3d40;border:1px solid #733d3d;padding:8px;margin:6px;border-radius:4px;flex-shrink:0}
+
+.vfx-asset-slot{display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid var(--border,#37383c);flex-shrink:0}
+.vfx-asset-slot>.asset-field{flex:1;min-width:0}

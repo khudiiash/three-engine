@@ -140,6 +140,7 @@ export function computeEntityBoundingSphere(entity, out) {
   }
   const instancerComp = entity.getComponent?.("instancer");
   if (instancerComp?.instancedMesh) meshes.push(instancerComp.instancedMesh);
+  collectSimulationMeshes(entity, meshes);
   // Child entities — a parent's viewOnly gates children too. We don't
   // recurse infinitely: a child ViewOnly component would have its own
   // bounding sphere and own decision, which is fine — the worst case is
@@ -216,7 +217,15 @@ function collectMeshes(entity, meshes, depth) {
   }
   const instancerComp = entity.getComponent?.("instancer");
   if (instancerComp?.instancedMesh) meshes.push(instancerComp.instancedMesh);
+  collectSimulationMeshes(entity, meshes);
   for (const child of entity.children) collectMeshes(child, meshes, depth - 1);
+}
+
+function collectSimulationMeshes(entity, meshes) {
+  for (const type of ["cloth", "water"]) {
+    const mesh = entity.getComponent?.(type)?.simulation?.mesh;
+    if (mesh) meshes.push(mesh);
+  }
 }
 
 /**
@@ -291,6 +300,12 @@ export function getEntityBoundingSphere(entity, out) {
     entity.getComponent?.("skinnedmesh")?.mesh?.geometry ??
     entity.getComponent?.("instancer")?.instancedMesh?.geometry;
   h = ((h ^ (ownGeometry?.id ?? 0)) * 16777619) >>> 0;
+  // Grid dimension/resolution edits replace GPU geometry without moving the
+  // entity. Include both solvers even when a regular mesh shares the entity.
+  for (const type of ["cloth", "water"]) {
+    const geometry = entity.getComponent?.(type)?.simulation?.mesh?.geometry;
+    h = ((h ^ (geometry?.id ?? 0)) * 16777619) >>> 0;
+  }
   h = ((h ^ (entity.children?.length ?? 0)) * 16777619) >>> 0;
   let node = entity;
   while (node) {

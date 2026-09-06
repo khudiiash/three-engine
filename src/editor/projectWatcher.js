@@ -91,6 +91,11 @@ export async function refreshAssetFromDisk(path) {
       invalidateAtlasAsset(path);
       return;
     }
+    if (ext === "vfx") {
+      const { readVfxDocument, publishVfxDocument } = await import("./vfxAssets.js");
+      await publishVfxDocument(path, await readVfxDocument(path));
+      return;
+    }
     if (ext === "post") {
       // A post graph has no shared cache to drop — each component that points
       // at one holds its own parsed copy, so the reload is a push to them

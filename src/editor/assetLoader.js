@@ -37,6 +37,7 @@ export const GEOMETRY_EXTENSIONS = ["geom"];
 // Post-process graphs (`.post`) — the node graph a camera's Postprocess
 // component renders through. See src/modules/postprocessing/postAsset.js.
 export const POST_EXTENSIONS = ["post"];
+export const VFX_EXTENSIONS = ["vfx"];
 // Sprite atlases (`.atlas`) — regions, pivots, nine-slice borders and sprite
 // animations over an ordinary image. See src/engine/sprite/atlasAsset.js.
 export const ATLAS_EXTENSIONS = ["atlas"];

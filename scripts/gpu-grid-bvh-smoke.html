@@ -1,0 +1,49 @@
+<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><canvas id="view"></canvas><script type="module">
+import * as THREE from 'three/webgpu';
+import { Fn, instanceIndex, instancedArray, storage, uniform, vec3 } from 'three/tsl';
+import { createGpuGridBvh, GPU_GRID_BVH_WORDS } from '/src/modules/gi/gpuGridBvh.js';
+const assert=(ok,message)=>{if(!ok)throw new Error(message);};
+try {
+  const renderer=new THREE.WebGPURenderer({canvas:document.querySelector('canvas')});await renderer.init();
+  const errors=[];renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+  for(const arity of [4,8])for(const n of [4,32]) {
+    const attribute=new THREE.StorageBufferAttribute(n*n,3);attribute.array.fill(-999);
+    const source=storage(attribute,'vec3',n*n), bits=instancedArray(GPU_GRID_BVH_WORDS+16,'uint');
+    const shift=uniform(0),i=instanceIndex.toInt();
+    const seed=Fn(()=>source.element(i).assign(vec3(i.mod(n).toFloat(),i.div(n).toFloat(),i.toFloat().mul(.1).sin().mul(2).add(shift))))().compute(n*n);
+    const packed=createGpuGridBvh({bits,absStart:16,positionAttribute:attribute,resolution:n,arity});
+    for(const move of [0,3]) {
+      shift.value=move;
+      await renderer.computeAsync([seed,packed.compute]);
+      const raw=await renderer.getArrayBufferAsync(bits.value),words=new Uint32Array(raw),floats=new Float32Array(raw);
+      assert(words.slice(0,16).every(v=>v===0),'Pool prefix overwritten');
+      for(let tri=0;tri<128;tri++) {
+        const cell=Math.floor(tri/2),x=cell%8,y=Math.floor(cell/8);
+        const coords=tri%2?[[x+1,y],[x,y+1],[x+1,y+1]]:[[x,y],[x,y+1],[x+1,y]];
+        const child=Math.floor(tri/(128/arity));
+        const ref=words[16+(arity===8?4:0)+child];assert((ref>>>24&127)===128/arity && (ref&0xffffff)===child*128/arity,'Invalid leaf reference '+arity+'/'+n+'/'+tri+': '+ref+' words '+Array.from(words.slice(16,48)).join(','));
+        let low,high;
+        if(arity===4){low=Array.from(floats.slice(16+4+child*6,16+7+child*6));high=Array.from(floats.slice(16+7+child*6,16+10+child*6));}
+        else {
+          const e=words[19],step=[0,8,16].map(s=>2**(((e>>>s)&255)-128));
+          const a=words[16+12+child*2],b=words[16+13+child*2];
+          low=[a&255,a>>>8&255,a>>>16&255].map((v,j)=>floats[16+j]+v*step[j]);
+          high=[a>>>24,b&255,b>>>8&255].map((v,j)=>floats[16+j]+v*step[j]);
+        }
+        for(let vertex=0;vertex<3;vertex++) {
+          const [sx,sy]=coords[vertex].map(v=>Math.floor((v*(n-1)+4)/8));
+          const expected=[sx,sy,Math.sin((sy*n+sx)*.1)*2+move];
+          for(let axis=0;axis<3;axis++) {
+            const value=floats[16+28+tri*9+vertex*3+axis];
+            assert(Math.abs(value-expected[axis])<.00005,`GPU source mismatch ${arity}/${n}/${tri}: ${value} vs ${expected[axis]}`);
+            assert(value>=low[axis]-.00001&&value<=high[axis]+.00001,'Child bound excludes its deformed triangle');
+          }
+        }
+      }
+    }
+  }
+  await renderer.backend.device.queue.onSubmittedWorkDone();assert(!errors.length,errors.join('\n'));
+  globalThis.__GI_SMOKE_RESULT__={pass:true};console.log('GI-SMOKE PASS gpu-grid-bvh: both arities, low/high resolution, moving GPU source, conservative bounds');renderer.dispose();
+}catch(error){console.error(error);globalThis.__GI_SMOKE_RESULT__={pass:false,error:String(error)};}
+</script>
+

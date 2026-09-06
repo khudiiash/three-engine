@@ -47,6 +47,7 @@ const EDITOR_LABEL = {
   anim: "Animator",
   timeline: "Timeline",
   post: "Post Process",
+  vfx: "Simulation Graph",
   atlas: "Atlas Editor",
   geom: "Geometry Editor",
   prefab: "Prefab Mode",

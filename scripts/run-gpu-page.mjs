@@ -10,6 +10,7 @@ if (!url) {
 const executablePath = process.env.CHROME_PATH ?? "C:/Program Files/Google/Chrome/Application/chrome.exe";
 const browser = await puppeteer.launch({
   executablePath,
+  userDataDir: process.env.GPU_SMOKE_PROFILE,
   headless: process.env.HEADED ? false : "new",
   args: [
     "--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage",

@@ -1,0 +1,106 @@
+<!doctype html><html><head><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three/webgpu';
+import {createGridSimulation} from '/src/engine/vfx/gridSimulation.js';
+import {waterSlotPool} from '/src/engine/vfx/waterSlots.js';
+import {installWaterSurfaceLook} from '/src/engine/vfx/waterSurfaceLook.js';
+const check=(ok,label)=>{if(!ok)throw new Error(label);console.log('REFLECT:',label);};
+try{
+ // ══ WHERE DOES THE REFLECTION LAND? ═══════════════════════════════════════
+ //
+ // A flat water plane reflects a point at (x, y, z) to exactly (x, 2h-y, z);
+ // project that through the same camera and you have the pixel the reflection
+ // must occupy. Everything else is here to isolate that one pixel: an emissive
+ // marker so it is findable, and an A/B against the marker hidden so what is
+ // measured is the reflection and not the sky.
+ //
+ // ⚠ THIS FILE WAS DELETED ONCE, when the planar mirror was removed on the
+ // theory that it was drawing the broken reflections in the scene. It was not —
+ // three's screen-space TRANSMISSION was — and the mirror came back. The test
+ // came back with it, because the hazard it pins is real and recurring.
+ const adapter=await navigator.gpu.requestAdapter();
+ const device=await adapter.requestDevice({requiredLimits:{maxStorageBuffersPerShaderStage:8}});
+ const errors=[];device.addEventListener('uncapturederror',e=>{errors.push(e.error.message);console.error('WebGPU validation',e.error.message);});
+ const SIZE=512;
+ const renderer=new THREE.WebGPURenderer({device});await renderer.init();renderer.setSize(SIZE,SIZE);
+ document.body.append(renderer.domElement);
+ const target=new THREE.RenderTarget(SIZE,SIZE);
+
+ const measure=async({label,scale,waveHeight,marker:MARKER,eye,look,tolerance,prime=null})=>{
+  const scene=new THREE.Scene();scene.background=new THREE.Color('#05070a');
+  const engine={scene,renderer,camera:null,onUpdate:()=>()=>{},on:()=>{},off:()=>{},modules:{get:()=>null}};
+  const pool=waterSlotPool(engine);const slot=pool.claim({});
+  const props={resolution:64,width:1,height:1,waterDepth:1,amplitude:0,waveHeight,waveLength:2,waveSpeed:2,roughness:0,saturation:.2,transmission:0,surfaceDetail:0};
+  const sim=createGridSimulation('water',props,{waterSlot:slot});
+  const holder=new THREE.Object3D();holder.scale.copy(scale);holder.add(sim.mesh);scene.add(holder);
+  holder.updateMatrixWorld(true);
+  sim.mesh.material.roughness=0;sim.mesh.material.metalness=0;
+  const look2=installWaterSurfaceLook({engine,mesh:sim.mesh,material:sim.mesh.material,simulation:sim,slot});
+  const marker=new THREE.Mesh(new THREE.SphereGeometry(scale.x*.05,32,24),
+    new THREE.MeshStandardNodeMaterial({color:'#000000',emissive:new THREE.Color('#ff2010'),emissiveIntensity:8,roughness:1}));
+  marker.position.copy(MARKER);scene.add(marker);
+  scene.add(new THREE.AmbientLight('#ffffff',.15));
+  const camera=new THREE.PerspectiveCamera(50,1,.1,scale.x*40);
+  camera.position.copy(eye);camera.lookAt(look);camera.updateMatrixWorld(true);
+  engine.camera=camera;
+  // ⭐ A DECOY CAMERA RENDERED FIRST. three updates a `bounces:false` reflector
+  // ONCE PER FRAME, for whichever render draws water first — and this engine
+  // renders the scene more than once (GI probe captures, a second viewport,
+  // screenshots). Whatever the mirror was built for, the main view samples: it
+  // then slides and turns under the scene as the view moves, which is what
+  // "they rotate completely incorrectly" was. Only a PER-RENDER update survives
+  // this; reverting to `bounces: false` fails here by 80 px.
+  let primeCamera=null;
+  if(prime){
+   primeCamera=new THREE.PerspectiveCamera(70,1,.1,scale.x*40);
+   primeCamera.position.copy(prime.eye);primeCamera.lookAt(prime.look);primeCamera.updateMatrixWorld(true);
+  }
+  const tick=async()=>{sim.tick(renderer,1/60);await device.queue.onSubmittedWorkDone();};
+  await renderer.computeAsync(sim.init);for(let i=0;i<8;i++)await tick();
+  const shoot=async(visible)=>{marker.visible=visible;renderer.setRenderTarget(target);
+   if(primeCamera)await renderer.render(scene,primeCamera);
+   await renderer.render(scene,camera);
+   const px=await renderer.readRenderTargetPixelsAsync(target,0,0,SIZE,SIZE);renderer.setRenderTarget(null);return px;};
+  const on=await shoot(true),off=await shoot(false);
+  const box=new THREE.Box3().setFromObject(marker),bounds=[Infinity,Infinity,-Infinity,-Infinity];
+  for(const x of [box.min.x,box.max.x])for(const y of [box.min.y,box.max.y])for(const z of [box.min.z,box.max.z]){
+   const q=new THREE.Vector3(x,y,z).project(camera);
+   const px=(q.x*.5+.5)*SIZE,py=(.5-q.y*.5)*SIZE;
+   bounds[0]=Math.min(bounds[0],px-8);bounds[1]=Math.min(bounds[1],py-8);
+   bounds[2]=Math.max(bounds[2],px+8);bounds[3]=Math.max(bounds[3],py+8);
+  }
+  let sx=0,sy=0,weight=0,brightest=0;
+  for(let row=0;row<SIZE;row++)for(let col=0;col<SIZE;col++){
+   if(col>=bounds[0]&&col<=bounds[2]&&row>=bounds[1]&&row<=bounds[3])continue;
+   const i=(row*SIZE+col)*4;
+   const red=(on[i]-off[i])-Math.max(0,(on[i+2]-off[i+2]));
+   if(red>18){sx+=col*red;sy+=row*red;weight+=red;brightest=Math.max(brightest,red);}
+  }
+  check(weight>0,label+': the marker reflects at all '+brightest);
+  const found={x:sx/weight,y:sy/weight};
+  const h=sim.mesh.getWorldPosition(new THREE.Vector3()).y;
+  const image=new THREE.Vector3(MARKER.x,2*h-MARKER.y,MARKER.z).project(camera);
+  const expected={x:(image.x*.5+.5)*SIZE,y:(.5-image.y*.5)*SIZE};
+  const flipped={x:SIZE-expected.x,y:expected.y};
+  const error=Math.hypot(found.x-expected.x,found.y-expected.y);
+  const flippedError=Math.hypot(found.x-flipped.x,found.y-flipped.y);
+  console.log('REFLECT: '+label+' '+JSON.stringify({found:{x:+found.x.toFixed(1),y:+found.y.toFixed(1)},
+    expected:{x:+expected.x.toFixed(1),y:+expected.y.toFixed(1)},error:+error.toFixed(1),flippedError:+flippedError.toFixed(1)}));
+  check(error<flippedError,label+': not left-right mirrored ('+error.toFixed(1)+' vs '+flippedError.toFixed(1)+' px)');
+  check(error<tolerance,label+': lands where a mirror puts it — '+error.toFixed(1)+' px, tolerance '+tolerance);
+  look2.dispose();sim.dispose(renderer);
+  pool.release(owner=>owner);slot.owner=null;
+ };
+
+ await measure({label:'unit pond, flat',scale:new THREE.Vector3(12,3,12),waveHeight:0,
+  marker:new THREE.Vector3(-2.4,1.9,-1.3),eye:new THREE.Vector3(1.1,2.2,7.5),look:new THREE.Vector3(0,-.2,-1),tolerance:SIZE*.06});
+ await measure({label:'40x10x40 box, waves, high object',scale:new THREE.Vector3(40,10,40),waveHeight:.06,
+  marker:new THREE.Vector3(-6,9,-4),eye:new THREE.Vector3(5,14,26),look:new THREE.Vector3(-2,1,-4),tolerance:SIZE*.08});
+ await measure({label:'a second camera rendered first must not steal the mirror',scale:new THREE.Vector3(40,10,40),waveHeight:.06,
+  marker:new THREE.Vector3(-6,9,-4),eye:new THREE.Vector3(5,14,26),look:new THREE.Vector3(-2,1,-4),tolerance:SIZE*.08,
+  prime:{eye:new THREE.Vector3(-30,30,-30),look:new THREE.Vector3(0,0,0)}});
+
+ check(!errors.length,'the portable eight-storage device reported nothing');
+ target.dispose();
+ globalThis.__VFX_SMOKE_RESULT__={pass:true};console.log('WATER-REFLECTION PASS');
+}catch(error){console.error(error.stack);globalThis.__VFX_SMOKE_RESULT__={pass:false,error:String(error.stack)};}
+</script></body></html>

@@ -248,6 +248,15 @@ check("moving a RECEIVER does not redraw — the map did not change", () => {
 
 // ---- when it must give up ---------------------------------------------------
 
+check("GPU cloth and water keep shadow maps updating", () => {
+  for (const kind of ["cloth", "water"]) {
+    const { engine, light, meshes } = makeScene();
+    meshes[0].userData.vfxSimulation = kind;
+    for (let i = 0; i < 5; i++) step(engine);
+    assert.equal(light.shadow.autoUpdate, true, `${kind} deforms without CPU transform changes`);
+  }
+});
+
 check("a SKINNED mesh anywhere disables freezing entirely", () => {
   // ⚠ Skinning deforms in the VERTEX SHADER: the silhouette changes while every
   // property this walk can read stays identical. A transform fingerprint is

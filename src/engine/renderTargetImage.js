@@ -24,6 +24,41 @@
  * wants the opposite row order and should flip this, not re-derive it.
  */
 
+/** Three can initialize a viewport texture before the copy knows its render
+ * target. Its normal update early-out then keeps the canvas format in an HDR
+ * or RGBA attachment. Repair only that mismatch, before binding/copying it. */
+export function installFramebufferCopyFormats(renderer) {
+  if (!renderer.backend?.isWebGPUBackend || renderer.__framebufferFormatsInstalled) return;
+  renderer.__framebufferFormatsInstalled = true;
+  const copy = renderer.copyFramebufferToTexture;
+  renderer.copyFramebufferToTexture = function(texture, ...args) {
+    if (!texture.isDepthTexture) {
+      const context = this._currentRenderContext;
+      const target = context?.renderTarget ?? this.getRenderTarget?.();
+      const color = context?.textures?.[0] ?? target?.texture;
+      const format = (color && this.backend.get(color)?.texture?.format)
+        ?? (target ? this.backend.utils.getCurrentColorFormat(target) : this.backend.utils.getPreferredCanvasFormat());
+      const allocated = this.backend.get(texture)?.texture?.format;
+      if (format && (texture.internalFormat !== format || (allocated && allocated !== format))) {
+        texture.internalFormat = format;
+        texture.needsUpdate = true;
+      }
+    }
+    return copy.call(this, texture, ...args);
+  };
+}
+
+/** Match a screenshot attachment to the live canvas's framebuffer-copy format.
+ * Water/transmission nodes can reuse a FramebufferTexture allocated on-screen.
+ * WebGL keeps its normal texture formats and bottom-up readback contract. */
+export function matchCaptureTargetFormat(renderer, target) {
+  if (renderer.backend?.isWebGPUBackend) {
+    const format = renderer.backend.utils?.getPreferredCanvasFormat?.();
+    if (format === "bgra8unorm" || format === "rgba8unorm") target.texture.internalFormat = format;
+  }
+  return target;
+}
+
 /**
  * @param {any} renderer  A WebGPURenderer (either backend).
  * @param {any} target    The RenderTarget to read.
@@ -47,6 +82,14 @@ export async function readRenderTargetImage(renderer, target, width, height) {
     // (height-1)*paddedRow + rowBytes — so clamp rather than over-read.
     const available = Math.max(0, Math.min(rowBytes, raw.length - from));
     if (available > 0) out.set(raw.subarray(from, from + available), y * rowBytes);
+  }
+  // Canvas-compatible WebGPU captures can be BGRA. Padding/orientation are
+  // unchanged, but ImageData always expects RGBA (including its alpha byte).
+  const format = target.texture?.internalFormat ?? (target.texture && renderer.backend?.get?.(target.texture)?.texture?.format);
+  if (!webgl && format?.startsWith("bgra8")) {
+    for (let i = 0; i < out.length; i += 4) {
+      const red = out[i + 2]; out[i + 2] = out[i]; out[i] = red;
+    }
   }
   return out;
 }

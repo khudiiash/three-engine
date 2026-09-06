@@ -1,3 +1,4 @@
+import { isBuiltinMaterial, WATER_MATERIAL_PATH } from "../../engine/builtinMaterials.js";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, Search } from "lucide-react";
 import { useProjectStore } from "../store/projectStore.js";
@@ -128,12 +129,12 @@ export function AssetField({ descriptor, value, onCommit }) {
   const browse = async () => {
     // Clicking a filled slot also points the Assets panel at the file, so
     // "which material is this?" is answered without leaving the inspector.
-    if (value) revealAssetInPanel(value).catch(() => {});
+    if (value && !isBuiltinMaterial(value)) revealAssetInPanel(value).catch(() => {});
     setOpen(true);
     setOptions(null);
     setQuery("");
     const root = useProjectStore.getState().rootPath;
-    setOptions(await listProjectAssets(root, exts));
+    setOptions([...(exts.includes("mat") ? [WATER_MATERIAL_PATH] : []), ...await listProjectAssets(root, exts)]);
   };
 
   // Left-click has to stay the picker (that's what the field is for), so
@@ -187,7 +188,7 @@ export function AssetField({ descriptor, value, onCommit }) {
         onContextMenu={openMenu}
       >
         {showThumb && <OptionThumb path={value} />}
-        <span className="asset-field-name">{value ? fileName(value) : emptyLabel}</span>
+        <span className="asset-field-name">{value ? (isBuiltinMaterial(value) ? "Water" : fileName(value)) : emptyLabel}</span>
         <span className="asset-field-caret">
           <ChevronDown size={12} />
         </span>
@@ -241,7 +242,7 @@ export function AssetField({ descriptor, value, onCommit }) {
                 }}
               >
                 <OptionThumb path={path} />
-                <span className="asset-option-name">{fileName(path)}</span>
+                <span className="asset-option-name">{(isBuiltinMaterial(path) ? "Water (built-in)" : fileName(path))}</span>
                 <span className="asset-option-path">{relativeToRoot(path)}</span>
               </button>
             ))}
@@ -251,7 +252,7 @@ export function AssetField({ descriptor, value, onCommit }) {
           </div>
         </PopoverMenu>
       )}
-      {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={closeMenu} />}
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={isBuiltinMaterial(value) ? menuItems.filter(item => !["Show in Assets Panel", "Select Asset"].includes(item.label)) : menuItems} onClose={closeMenu} />}
     </div>
   );
 }

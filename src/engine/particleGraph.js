@@ -59,6 +59,23 @@ const pv3 = (key, label) => port(key, label, "vec3");
 const pf = (key, label) => port(key, label, "float");
 const pcol = (key, label) => port(key, label, "color");
 
+/** Socket constants are stored separately from node parameters. Missing values
+ * keep the historical contextual fallback (age, position, random velocity). */
+export const particleInputKey = (key) => `__input_${key}`;
+export function particleInputDescriptor(type, input) {
+  const staticDefaults = {
+    add: { a: 0, b: 0 }, multiply: { a: 1, b: 1 }, mix: { a: 0, b: 1 },
+    normalizeV: { v: [0, 1, 0] }, lengthV: { v: [0, 0, 0] },
+    combine: { x: 0, y: 0, z: 0 },
+    system: { position: [0, 0, 0], size: 0.1, color: "#ffcc66", force: [0, 0, 0], opacity: 1 },
+  };
+  const value = staticDefaults[type]?.[input.key];
+  const dynamic = value === undefined || (type === "system" && ["force", "opacity"].includes(input.key));
+  const seed = value ?? (input.type === "vec3" ? [0, 0, 0] : input.type === "color" ? "#ffffff" : 0);
+  return { ...input, propKey: particleInputKey(input.key), editable: true, widget: input.type === "any" ? "float" : input.type,
+    default: seed, autoLabel: dynamic ? (input.key === "p" || type === "split" ? "Particle position" : type === "sine" ? "Time" : type === "system" ? "Automatic" : "Lifetime") : undefined };
+}
+
 /** Emitters all expose the same two typed outputs. */
 const EMIT_OUT = (dirLabel = "dir") => [pv3("pos", "pos"), pv3("dir", dirLabel)];
 
@@ -445,33 +462,53 @@ function loadParticleGeometry(path) {
 // ---------------------------------------------------------------------------
 
 /**
- * Compiles a particle graph. Async part (mesh sampling, textures) happens
- * here; the returned builders are synchronous and safe inside Fn() bodies.
- *
- * A graph may contain several System nodes — each becomes one independent
- * entry in the returned `systems` array, its upstream nodes traced in
- * isolation from any other System node's inputs.
- *
- * Returns { systems: [{
- *   id: system node id,
- *   system: merged System-node params,
- *   spriteTexture: THREE.Texture | null,
- *   customGeometry: THREE.BufferGeometry | null,
- *   spawnPosition(ctx), spawnVelocity(ctx), force(ctx) | null,
- *   size(ctx), color(ctx), opacity(ctx) | null,
- * }] }
- * where ctx = { key, cache: Map, index, position, velocity, age, life01, rand(k) }.
- *
- * `opts.entity`, when given, lets `emitSelf` nodes sample the entity's own
- * MeshComponent geometry.
+ * Resolve the enabled module stack without changing its serialized graph.
+ * Older graphs omit `enabled`, which continues to mean enabled.
+ */
+export function activeParticleGraph(graph) {
+  const nodes = graph?.nodes ?? [];
+  const edges = graph?.edges ?? [];
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  // Only type-preserving operators can be bypassed. A disabled leaf removes
+  // its effective connection, letting each consumer supply its own neutral
+  // default (multiply = 1, add = 0, system size = 0.1, etc.). Keep the saved
+  // graph untouched so toggling a module back on restores every connection.
+  const bypassInput = { add: "a", multiply: "a", mix: "a", remap: "v", sine: "t", normalizeV: "v" };
+  const resolve = (edge, seen = new Set()) => {
+    const source = byId.get(edge.source);
+    if (!source || seen.has(source.id)) return null;
+    if (source.enabled !== false) return edge;
+    seen.add(source.id);
+    const key = bypassInput[source.type];
+    const upstream = key && edges.find((candidate) => candidate.target === source.id && candidate.targetHandle === key);
+    if (!upstream) return null;
+    const resolved = resolve(upstream, seen);
+    return resolved ? { ...edge, source: resolved.source, sourceHandle: resolved.sourceHandle ?? "out" } : null;
+  };
+  return {
+    ...graph,
+    nodes: nodes.filter((node) => node.enabled !== false),
+    edges: edges.filter((edge) => byId.get(edge.target)?.enabled !== false && byId.has(edge.target))
+      .map((edge) => resolve(edge)).filter(Boolean),
+  };
+}
+
+/**
+ * Compile each enabled System into independent spawn/update/render TSL builders.
+ * Async mesh sampling and texture loading finish before the builders are used
+ * inside Fn(). `opts.entity` supplies the mesh for emitSelf surface sampling.
+ * Builders receive { key, cache, index, position, velocity, age, life01, rand }.
  */
 export async function compileParticleGraph(graph, opts = {}) {
-  const nodes = graph?.nodes ?? [];
+  if (!(graph?.nodes ?? []).some((node) => node.type === "system")) {
+    throw new Error("Particle graph needs at least one Particle System node");
+  }
+  const activeGraph = activeParticleGraph(graph);
+  const nodes = activeGraph.nodes;
   const sysNodes = nodes.filter((n) => n.type === "system");
-  if (!sysNodes.length) throw new Error("Particle graph needs at least one Particle System node");
 
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
-  const edges = graph.edges ?? [];
+  const edges = activeGraph.edges;
 
   // Async prep: mesh surface samples become storage buffers, shared by id
   // across however many System branches reference them.
@@ -538,7 +575,12 @@ export async function compileParticleGraph(graph, opts = {}) {
 
   function input(nodeId, key, ctx, fallback) {
     const edge = inputEdge(nodeId, key);
-    return edge ? build(edge.source, edge.sourceHandle ?? "out", ctx) : fallback;
+    if (edge) return build(edge.source, edge.sourceHandle ?? "out", ctx);
+    const node = nodeById.get(nodeId);
+    const slot = particleInputKey(key), value = node?.props?.[slot];
+    if (value === undefined || value === null) return fallback;
+    const kind = Array.isArray(value) ? "vec3" : typeof value === "string" ? "color" : "float";
+    return regUniform(nodeId, slot, node.props, kind, (props) => props[slot]);
   }
 
   function build(id, out, ctx) {
@@ -770,10 +812,10 @@ export async function compileParticleGraph(graph, opts = {}) {
       customGeometry,
       spawnPosition: root("position", () => vec3(0)),
       spawnVelocity: root("velocity", (ctx) => unitSphere(ctx.rand(1), ctx.rand(2)).mul(1.5)),
-      force: wired("force") ? root("force") : null,
+      force: wired("force") || sysNode.props?.[particleInputKey("force")] != null ? root("force") : null,
       size: root("size", () => float(0.1)),
       color: root("color", () => vec3(1, 0.8, 0.4)),
-      opacity: wired("opacity") ? root("opacity") : null,
+      opacity: wired("opacity") || sysNode.props?.[particleInputKey("opacity")] != null ? root("opacity") : null,
       // Soft-circle fade fallback is applied by the component when opacity is unwired.
     });
   }
@@ -815,11 +857,15 @@ export function particleGraphSignature(graph) {
       const meta = P_NODE_TYPES[n.type];
       const P = { ...nodeDefaults(n.type), ...n.props };
       const structural = {};
+      for (const input of meta?.inputs ?? []) {
+        const value = P[particleInputKey(input.key)];
+        structural[particleInputKey(input.key)] = value == null ? "auto" : Array.isArray(value) ? "vec3" : typeof value;
+      }
       for (const p of meta?.params ?? []) {
         const hot = HOT_PARAM_TYPES.has(p.type) && !STRUCTURAL_NUMERIC[n.type]?.has(p.key);
         if (!hot) structural[p.key] = P[p.key];
       }
-      return `${n.id}:${n.type}:${JSON.stringify(structural)}`;
+      return `${n.id}:${n.type}:${n.enabled !== false}:${JSON.stringify(structural)}`;
     })
     .sort();
   const edges = (graph?.edges ?? [])

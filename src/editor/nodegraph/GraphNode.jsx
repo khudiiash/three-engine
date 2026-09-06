@@ -227,6 +227,8 @@ function GraphNodeInner({ id, data, selected }) {
 
           {inputs.map((spec) => {
             const isWired = wired?.has(spec.key) ?? false;
+            const propKey = spec.propKey ?? spec.key;
+            const automatic = spec.autoLabel && props[propKey] == null;
             return (
               <div className="shader-node-row" key={spec.key} data-wired={isWired || undefined}>
                 <Handle
@@ -240,16 +242,18 @@ function GraphNodeInner({ id, data, selected }) {
                 {/* An input's inline editor disappears the moment it's wired:
                     the value would be ignored, and leaving a live-looking
                     control that does nothing is worse than showing none. */}
-                {spec.editable && !isWired && (
+                {spec.editable && !isWired && automatic && <button className="toolbar-btn nodrag nopan" title="Use a constant value instead" onClick={() => set(propKey, structuredClone(spec.default), false)}>{spec.autoLabel}</button>}
+                {spec.editable && !isWired && !automatic && (
                   // `widget` overrides `type` for rendering: a socket typed
                   // `any` can still need a colour picker, and the shader
                   // registry infers that from the input's default value.
                   <Widget
                     spec={{ ...spec, type: spec.widget ?? spec.type }}
-                    value={props[spec.key]}
-                    onChange={(v, g) => set(spec.key, v, g)}
+                    value={props[propKey]}
+                    onChange={(v, g) => set(propKey, v, g)}
                   />
                 )}
+                {spec.editable && !isWired && !automatic && spec.autoLabel && <button className="toolbar-btn icon-only nodrag nopan" title="Restore automatic input" onClick={() => set(propKey, null, false)}>?</button>}
               </div>
             );
           })}

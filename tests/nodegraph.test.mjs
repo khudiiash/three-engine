@@ -43,6 +43,26 @@ test("graphToFlow/flowToGraph round-trips nodes, edges and positions", () => {
   assert.equal(back.edges[0].targetHandle, "x");
 });
 
+test("disabled VFX nodes keep enable state and annotations through edits, undo and paste", () => {
+  const graph = { nodes: [{ id: "force", type: "gravity", enabled: false, label: "Optional gravity", props: { strength: 2 }, position: { x: 0, y: 0 } }], edges: [] };
+  const flow = graphToFlow(graph);
+  const history = createGraphHistory();
+  history.reset(flow.nodes, flow.edges);
+  const changed = flow.nodes.map((node) => ({ ...node, data: { ...node.data, props: { ...node.data.props, __enabled: true } } }));
+  history.push(changed, flow.edges);
+  const enabled = flowToGraph(changed, flow.edges).nodes[0];
+  assert.equal(enabled.enabled, true);
+  assert.equal(enabled.props.__enabled, undefined);
+  const undone = history.undo();
+  assert.deepEqual(flowToGraph(undone.nodes, undone.edges).nodes, graph.nodes);
+  copySelection("particles", flow.nodes.map((node) => ({ ...node, selected: true })), []);
+  const pasted = pasteClipboard("particles");
+  const copy = flowToGraph(pasted.nodes, pasted.edges).nodes[0];
+  assert.equal(copy.enabled, false);
+  assert.equal(copy.label, "Optional gravity");
+  assert.notEqual(copy.id, "force");
+});
+
 test("graphToFlow drops nodes whose type the registry no longer knows", () => {
   const graph = {
     nodes: [

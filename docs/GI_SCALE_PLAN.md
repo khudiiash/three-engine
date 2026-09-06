@@ -6740,3 +6740,121 @@ which is exactly what the Sun entity's rotation `(−2.269, 1.222, 2.082)` gives
 A 15° sun puts roughly a third of the 61° sun's power through the level's
 openings, and its patches land elsewhere. ⛔ Read the sun-slot line and the
 camera beside any before/after pair.
+
+
+### 11.53 THE SUN IS NOT SKY — the HDRI's sun rode the exact bin tables into the probes as shadowless blotches (2026-09-05; SHIPPED, default on; `__giSkySunExtract = false` keeps the sun in the bins)
+
+**The report.** Bistro, `Belfast Farmhouse_2k.hdr`, environment intensity
+1: "when sky lighting is on, we get wrong lighting all over the scene …
+without sky light, everything looks great", with three screenshots — grey
+cloud-shaped patches at probe spacing on every facade, brightest on the
+building fronts, an alley reading flat and muddy. The user turned lighting
+OFF and saved.
+
+**The cause is §11.52's own success.** The exact per-bin integration did
+what it promised: the map's sun reached the transport. The boot line read
+`up-facing irradiance luma 2.840, brightest bin 959.84` — one 4.5° bin at
+960 against a sky whose p99.9 luma is 2.7. Read on the CPU through the same
+half-float texture the scene loads (`scripts` scratch, RGBELoader, exact
+Δω):
+
+| map | E_up | of which sun | sun width | elevation / azimuth | facade facing it: sun vs rest |
+|---|---|---|---|---|---|
+| Belfast Farmhouse (this scene) | 2.86 | **2.15 (75 %)** | 2.4° | 21.5° / 36.2° | **5.5 vs 1.1** |
+| Kloofendal 43d Clear | 4.57 | 3.29 (72 %) | 2.0° | 43.0° / 36.2° | 4.5 vs 2.5 |
+| Industrial Sunset (pure sky) | 2.73 | 0.007 (0.3 %) | — | — | 0.13 vs 3.0 |
+| Dikhololo Night | 0.34 | 0.001 (0.3 %) | — | — | — |
+
+The scene's REAL sun is the directional light: luma 10 at elevation 47°
+(`§12.82 sun slot … dir 0.017,0.731,0.682`), 6.8 on a facade that faces
+it, delivered with an 8000 px shadow map. The HDRI's sun is a SECOND sun
+at 80 % of that strength, at another azimuth, with no shadow map at all:
+it is composited as `mean bin radiance × T`, and `T` for that one bin is
+the transmittance a probe estimated from a few rays (cap 8/frame,
+confidence K = 16). A 2.4° source inside a 4.5°–36° bin is exactly the
+thing a bin cannot carry — the bin's radiance is right on average and
+wrong everywhere in particular, and the error is the probe lattice itself:
+grey patches at 2–3 m on every wall that sees the spot. §11.52's receipt
+(+11 % E at hits on the Level) was mostly this sun, delivered this way.
+
+**The unit (srcSkyBins.js §11.53).** A sun is a delta light; the sky term
+carries the sky. The integration now finds the map's sun and books it apart:
+- **Ceiling**: `8 × the solid-angle-weighted p99.9 luma`
+  (`skyLumaCeiling`, a log histogram over every 2nd row/column). Rank-based
+  on purpose — the map's MEAN is 84 % sun and says nothing; its p99.9 is the
+  brightest cloud, which a sun clears by 2–5 orders of magnitude. Measured
+  at 2×…64× p99.9 the extracted share is flat (84.1 → 83.2 % on Belfast,
+  76.9 → 75.6 % on Kloofendal) and the sunless maps lose 0.4 → 0.0 %; 8×
+  is the middle of that plateau.
+- **Per-texel excess** above the ceiling (chroma kept) is summed per bin
+  beside the sky (`sun.sum`, `sun.binOmega`), with its energy, up-facing
+  irradiance, texel count and energy-weighted direction in the WORLD frame
+  (the yaw undone). `sum` stays the whole map, so every §11.52 check holds;
+  `aggregateBins` carries the excess exactly; `binMeanTable(bins, out,
+  { sun: "extract" })` subtracts it — the bin keeps its full solid angle, a
+  clamped texel reads as the CEILING, not as a hole.
+- **Decision** (`describeSun`, the manager): extract when the excess is
+  ≥ 2 % of the map's up-facing irradiance (`SUN_MIN_SHARE`); below that the
+  tables are the whole map bit for bit. The hatch is part of the table key,
+  so `profile.giFlag __giSkySunExtract false` re-integrates live, no rebuild.
+- **Receipt** (two boot lines): `up-facing irradiance luma 2.863 (sky 0.713
+  + sun 2.150), brightest bin 9.21` and `the environment carries a SUN — 75 %
+  of its up-facing irradiance in a 2.4°-wide spot at elevation 21.5°,
+  azimuth 36.2° … EXTRACTED … the sun is a Sun light's job — yours points
+  from elevation 47.0°, azimuth …° (aim it at 21.5°/36.2° to match the
+  HDRI's shadows)`; with no active directional light the line says to add
+  one from that direction. Brightest fine bin 959.84 → 9.21 (Belfast),
+  794.55 → 8.04 (Kloofendal); the sunless maps read the same as before.
+- **Cost**: 66 ms for the 2k map on the first integration (30 ms on a
+  sunless one; the histogram is a second pass), once per environment change,
+  throttled 150 ms. Nothing on the GPU changed — the kernels read the same
+  table.
+
+Gate: `npm run test:gi-sky-bins` — 92 checks (54 before): the ceiling sits
+between a uniform sky and a hot spot; the excess is exactly the spot's
+energy above the ceiling and points back at the texel in the world frame
+(three yaws, flipY both ways); the extracted table is the furnace again
+except the spot's bin, which reads the ceiling; a 21-row cloud bank at 10×
+is sky (nothing extracted, table = whole map); aggregation carries the
+excess; the manager extracts by default, keeps on the hatch, and its
+receipt's peak is the table's.
+
+**What it does not do, on purpose.**
+- It does not DELIVER the HDRI's sun. The sun is the scene's directional
+  light (raster direct + shadow map + the SRC's sun slot); a scene with a
+  sunny HDRI and no Sun light gets a clean overcast sky and a log line with
+  the direction to add one. Auto-creating a light is a scene edit, not a GI
+  decision.
+- The env-on-miss term and the reflection capture still sample the raw
+  map — a mirror shows the disc; that is visibility, not lighting.
+- ⚠ The path tracer still importance-samples the RAW map, so a GI-vs-tracer
+  pair with lighting ON now differs by the HDRI's sun (sharp in the tracer,
+  absent in ours). §11.52's Level gap is partly that sun. The honest pair
+  hands the tracer the same clamped environment — a follow-up unit in
+  giPathTracer's `updateEnvironment` (swap `scene.environment` for the
+  clamped copy around the sync), not done here.
+
+**Live receipt (Bistro, the user's saved pose, `scripts/gi-look-ab.mjs`,
+20 s settle per arm, flag flipped live — no rebuild).** Boot lines after
+the reload: `up-facing irradiance luma 2.863 (sky 0.713 + sun 2.150),
+brightest bin 9.21` and `the environment carries a SUN — 75 % … 2.4°-wide
+spot at elevation 21.5°, azimuth 36.2° … EXTRACTED … yours points from
+elevation 85.9°, azimuth 76.0°`. Arms `__giSkySunExtract` false → default:
+
+| | sun kept | extracted |
+|---|---|---|
+| tile atlas maxLum | **85.53** | **2.84** |
+| tile atlas meanLum | 0.293 | 0.234 |
+| frame mean luma (linear) | 0.1640 | 0.1633 |
+| pixels where the arms differ by > 0.02 | 1.0 % | — |
+| band-pass std (6–48 px) of the difference, where the sun term landed / elsewhere | 0.0085 / 0.0003 | — |
+
+At this pose (camera at 6 m looking down a street canyon) the 21.5° sun
+reaches almost nothing on screen — the user's blotches were on UPPER
+facades facing azimuth 36°, which this pose does not frame — so the
+frame-mean pair is a null by construction, not evidence either way. What
+the pair does show: where the term lands it is PATCHY (28× the band-pass
+energy of the rest of the frame at 6–48 px, band/low ratio 1.5 at 12–96
+px — the probe lattice, not a gradient), and the atlas's peak is the
+extracted sun. Cost after the stride-4 ceiling and its per-texture cache:
+~18 + 3 ms warm on a 2k map (55–65 ms on the first, JIT-cold call).

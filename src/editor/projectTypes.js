@@ -142,7 +142,13 @@ async function scaffoldThreeTypes(invoke, engineTypesDir) {
  * we can't parse (comments, trailing commas — both legal in tsconfig, neither
  * legal in JSON) is left entirely alone rather than reformatted.
  */
-const REQUIRED_PATHS = { editor: ["./engine-types/editor.d.ts"] };
+const REQUIRED_PATHS = {
+  editor: ["./engine-types/editor.d.ts"],
+  three: ["./engine-types/three/build/three.module.d.ts"],
+  "three/webgpu": ["./engine-types/three/build/three.webgpu.d.ts"],
+  "three/tsl": ["./engine-types/three/build/three.tsl.d.ts"],
+  "three/addons/*": ["./engine-types/three/examples/jsm/*"],
+};
 
 async function addMissingPaths(invoke, configPath) {
   let parsed;

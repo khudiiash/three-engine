@@ -15,7 +15,10 @@ export class RigidbodyComponent extends Component {
   static tags = ["physics", "play-mode", "3d"];
   static defaults = {
     bodyType: "dynamic",
+    massMode: "mass",
     mass: 1,
+    // g/cm³ — water is 1. See `bodyDensitySI`. Oak floats, this does not quite.
+    density: 1.2,
     linearDamping: 0,
     angularDamping: 0.05,
     gravityScale: 1,
@@ -26,7 +29,23 @@ export class RigidbodyComponent extends Component {
   };
   static schema = [
     { key: "bodyType", label: "Type", type: "select", options: ["dynamic", "kinematic", "fixed"] },
-    { key: "mass", label: "Mass", type: "number", min: 0.001, step: 0.1, showIf: (p) => p.bodyType === "dynamic" },
+    // ── MASS OR DENSITY, AND WHY DENSITY EARNS A PLACE ──────────────────────
+    //
+    // An absolute mass is a property of ONE size. Scale a 4 m crate to 13 m and
+    // the mass that floated it is 35x too small; every resize silently makes the
+    // object a balloon, which is the single most confusing thing about
+    // buoyancy — "still not floating" on a 63 m^3 crate authored at 15 kg
+    // (user, 2026-09-05), where floating half-submerged wanted 31,500 kg.
+    //
+    // Density is scale-free and is what an author actually means: 500 kg/m^3 is
+    // wood and floats half out of the water at ANY size, 2400 is concrete and
+    // sinks. Rapier computes the mass from the collider's own volume, so this
+    // is its native path rather than arithmetic done here.
+    { key: "massMode", label: "Mass from", type: "select", options: ["mass", "density"], showIf: (p) => p.bodyType === "dynamic" },
+    { key: "mass", label: "Mass (kg)", type: "number", min: 0.001, step: 0.1, showIf: (p) => p.bodyType === "dynamic" && (p.massMode ?? "mass") === "mass" },
+    // Water is 1, oak 0.7, aluminium 2.7, steel 7.8 — so "does it float?" is
+    // just "is this under 1?". The engine converts to SI for Rapier.
+    { key: "density", label: "Density", type: "number", min: 0.001, step: .05, showIf: (p) => p.bodyType === "dynamic" && p.massMode === "density" },
     { key: "linearDamping", label: "Lin. Damping", type: "number", min: 0, step: 0.05, showIf: (p) => p.bodyType === "dynamic" },
     { key: "angularDamping", label: "Ang. Damping", type: "number", min: 0, step: 0.05, showIf: (p) => p.bodyType === "dynamic" },
     { key: "gravityScale", label: "Gravity Scale", type: "number", step: 0.1, showIf: (p) => p.bodyType === "dynamic" },

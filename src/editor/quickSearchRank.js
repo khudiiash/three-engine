@@ -30,8 +30,10 @@ export function normalizeSearch(value) {
     .toLowerCase();
 }
 
-/** Ordering nudge between kinds when scores are otherwise level. */
-export const TYPE_WEIGHT = { entity: 0, asset: 1, panel: 2, setting: 3 };
+/** Ordering nudge between kinds when scores are otherwise level. `recent` is
+ *  the "Recent searches" row Quick Search prepends to an empty query — it never
+ *  competes with a real result, so it sorts before every kind. */
+export const TYPE_WEIGHT = { recent: -1, entity: 0, asset: 1, panel: 2, setting: 3 };
 
 /** Shorter than this, a punctuation-stripped query is too generic to fall back
  *  on: "io" would compact-match half the project. */

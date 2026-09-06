@@ -10,7 +10,8 @@ import { defineOp } from "../registry.js";
 import { engine } from "../../engineInstance.js";
 import { commandBus, useHistoryStore } from "../../commands/CommandBus.js";
 import { useSelectionStore } from "../../store/selectionStore.js";
-import { matchTier, candidateFromLive } from "../../hierarchySearch.js";
+import { candidateFromLive, matchCandidate, scopePool } from "../../hierarchySearch.js";
+import { parseQuery } from "../../queryLang.js";
 import { selectInScreenRect, viewportPixelSize } from "../../selectionRect.js";
 import { useSceneStore } from "../../store/sceneStore.js";
 import { useProjectStore } from "../../store/projectStore.js";
@@ -55,13 +56,13 @@ defineOp({
 defineOp({
   name: "selection.selectMatching",
   description:
-    "Select every entity matching a Hierarchy search query — the agent's version of 'search, then Ctrl+A'. Same ranking as the panel's filter box: entity name first, then component type, then tags; a `tag:` prefix searches tags only. Pair it with component.setProp to change one property on hundreds of entities. Returns ids, not full descriptions, because a scene-wide match can be thousands of entities.",
+    "Select every entity matching a Hierarchy search query — the agent's version of 'search, then Ctrl+A'. Ranking matches the panel's filter box exactly, because this op and that box are the two callers of the same matcher: tier 0-1 name, 2-3 component type, 4 tag (a `tag:` prefix searches tags ONLY), 5 = matched through its filters alone with no name/component/tag text pointing at it. Plain text is a substring of any of those, same as it has always been. The query language adds structure. NAME: `Lamp...` starts with, `...Box` ends with, `\"red lamp\"` quotes a name with spaces. FILTERS: `?prop=value` joined by `&` — `Lamp?enabled=true&collider.shape=convex`. A filter needs NO `?` when it stands alone: `mesh.castShadow=true` and `collider.shape=convex` are filters, not text. A filter with no value is an EXISTENCE test: `M...?cloth` is 'starts with M and has a cloth component', `?!collider` is 'has no collider'. SCOPE: a standalone `>` (spaces on both sides, so `light.intensity>1` stays a comparison) searches INSIDE what its left side matched — `Mesh > light` is every light descended from something named Mesh, `mesh.castShadow=true > light` every light under a shadow-casting mesh, and it chains (`A > B > C`). Only the right-hand matches are returned. Property paths are `component.prop` (or a bare top-level field: name, tag, enabled, enabledInGame, childCount). `enabled` is the EDITOR-enabled flag (the hierarchy's eye icon); use `enabledInGame` for the play-time one. Multiple whitespace-separated terms AND together. Pair it with component.setProp to change one property on hundreds of entities. Returns ids, not full descriptions, because a scene-wide match can be thousands of entities.",
   params: {
     query: {
       type: "string",
       required: true,
       description:
-        "What to match: a name fragment ('crate'), a component type ('mesh', 'light'), or 'tag:enemy' for tags only.",
+        "What to match: a name fragment ('crate'), a component type ('mesh', 'light'), 'tag:enemy' for tags only, a prefixed/suffixed name ('Lamp...', '...Box'), a bare filter ('mesh.castShadow=true', 'collider.shape=convex'), `?`-filters joined by `&` ('Lamp?enabled=true&collider.shape=convex'), an existence test ('M...?cloth', '?!collider'), and/or a `>` scope ('Mesh > light'). Property paths are `component.prop` (or a bare top-level field: name, tag, enabled, enabledInGame, childCount).",
     },
     mode: {
       type: "string",
@@ -79,12 +80,38 @@ defineOp({
     const q = query.trim().toLowerCase();
     if (!q) throw new Error("selection.selectMatching: query is empty");
 
-    // Ranked exactly like the panel, then flattened to ids. The tier survives
-    // as far as the sort so `limit` keeps the BEST matches rather than
-    // whichever ones the entity map happened to yield first.
+    // Parsed once, ranked exactly like the panel (same matcher, same tiers),
+    // then flattened to ids. The tier survives as far as the sort so `limit`
+    // keeps the BEST matches rather than whichever ones the entity map
+    // happened to yield first.
+    const parsed = parseQuery(query);
+    // `Mesh > light` narrows to descendants before anything is ranked. The
+    // walk is hierarchySearch's, not a second copy of it — the panel and this
+    // op have to agree about what "inside" means as much as about what
+    // "matches" means. The candidate cache exists because scopePool visits
+    // every entity once per scope stage and the target pass visits them again.
+    const candidates = new Map();
+    const candidateOf = (id) => {
+      let candidate = candidates.get(id);
+      if (candidate === undefined) {
+        const entity = engine.entities.get(id);
+        candidate = entity ? candidateFromLive(entity) : null;
+        candidates.set(id, candidate);
+      }
+      return candidate;
+    };
+    const pool = parsed.scopes.length
+      ? scopePool(
+          parsed,
+          [...engine.entities.keys()],
+          candidateOf,
+          (id) => (engine.entities.get(id)?.children ?? []).map((child) => child.id),
+        )
+      : null;
     const ranked = [];
     for (const entity of engine.entities.values()) {
-      const tier = matchTier(candidateFromLive(entity), q);
+      if (pool && !pool.has(entity.id)) continue;
+      const tier = matchCandidate(candidateOf(entity.id), parsed);
       if (tier !== Infinity) ranked.push({ id: entity.id, name: entity.name, tier });
     }
     ranked.sort((a, b) => a.tier - b.tier || a.name.localeCompare(b.name));

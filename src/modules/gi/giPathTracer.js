@@ -113,6 +113,8 @@ function shouldPark(object) {
   if (object.isInstancedMesh && !(object.count > 0)) return true;
   if (object.isBatchedMesh && !(object.instanceCount > 0)) return true;
   const data = object.userData ?? {};
+  // CPU BVH construction cannot read the GPU-deformed simulation surface.
+  if (data.vfxSimulation || data.clothHidden) return true;
   // Merge proxies (especially the uber table) shade from colorNode array
   // textures the path tracer cannot sample. Trace the hidden members instead.
   if (data.__giDebug || data.mergeProxy || data.editorOnly) return true;

@@ -3,6 +3,16 @@ import { create } from "zustand";
 import { ensureEngine } from "../engineInstance.js";
 import { vmSingleton, oncePerVm } from "../singleton.js";
 
+/**
+ * The plain-data row shape the hierarchy renders (and hierarchySearch matches
+ * against). The two enabled flags are mirrored so a structured search can
+ * filter on them (`?enabled=true` = the row's eye icon, `enabledInGame` = the
+ * play-time one). Both are set through commands that emit "hierarchy-changed"
+ * and therefore land here via refresh() — but a DIRECT write to the entity's
+ * flag bypasses refresh() and will lag in the mirror until the next refresh,
+ * so the search box can briefly disagree with the engine about a flag nobody
+ * changed through a command.
+ */
 function mirrorEntity(entity) {
   return {
     id: entity.id,
@@ -14,6 +24,8 @@ function mirrorEntity(entity) {
     components: Object.fromEntries(
       [...entity.components.values()].map((c) => [c.type, { ...c.props }]),
     ),
+    enabledInEditor: entity.enabledInEditor !== false,
+    enabledInGame: entity.enabledInGame !== false,
   };
 }
 

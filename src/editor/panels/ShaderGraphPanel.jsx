@@ -1,3 +1,4 @@
+import { isBuiltinMaterial } from "../../engine/builtinMaterials.js";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Code, Box } from "lucide-react";
 import { ReactFlowProvider } from "@xyflow/react";
@@ -375,7 +376,7 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
     // Never compile edits into the shared Default material. Its first change
     // is persisted as a new asset below; this editor then adopts that asset in
     // place and follows the normal live-compile path from the next tick on.
-    if (!loadedRef.current || !material || !path) return;
+    if (!loadedRef.current || !material || !path || isBuiltinMaterial(path)) return;
     // ...and never compile a starting-point graph into a material that never
     // had one. Reading a .mat must not change how it looks.
     if (!authoredRef.current && !touchedRef.current) return;
@@ -444,20 +445,21 @@ function ShaderGraphEditor({ matPath, defaultEntity, onFork }) {
       const graph = graphRef.current;
       try {
         const { invoke } = await import("@tauri-apps/api/core");
-        if (!path) {
+        if (!path || isBuiltinMaterial(path)) {
           const liveMesh = engine.getEntity(defaultEntity?.id)?.getComponent("mesh");
           // The debounce can overlap an assignment from another editor action.
           // Fork only if Material 1 is still the Default material.
-          if (!liveMesh || liveMesh.props.material) return;
+          if (!liveMesh || (liveMesh.props.material && liveMesh.props.material !== path)) return;
           const project = useProjectStore.getState();
           const forkPath = await createDefaultMaterialFork({
             rootPath: project.rootPath,
             entityName: engine.getEntity(defaultEntity.id)?.name ?? defaultEntity.name,
             graph,
+            definition: path ? getMaterialDef(path) : MATERIAL_DEFAULTS,
             listDirectory: (dir) => invoke("list_dir", { path: dir }),
             saveFile: (file, contents) => invoke("save_scene", { path: file, contents }),
           });
-          if (liveMesh.props.material) return;
+          if (liveMesh.props.material && liveMesh.props.material !== path) return;
           // Switch this editor onto the new asset BEFORE the scene change comes
           // back as a prop, and tell the panel to keep its React key — between
           // them, the fork happens without unmounting the graph, so the edit
@@ -534,7 +536,7 @@ export function ShaderGraphPanel() {
   const entity = useSceneStore((s) => (selectedId ? s.entities[selectedId] : null));
   const matPath = assetPath?.toLowerCase().endsWith(".mat") ? assetPath : entity?.components?.mesh?.material || null;
   const defaultEntity =
-    !assetPath && entity?.components?.mesh && !entity.components.mesh.material
+    !assetPath && entity?.components?.mesh && (!entity.components.mesh.material || isBuiltinMaterial(entity.components.mesh.material))
       ? { id: entity.id, name: entity.name }
       : null;
 

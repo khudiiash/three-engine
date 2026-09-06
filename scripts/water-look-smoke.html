@@ -1,0 +1,367 @@
+<!doctype html><html><head><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three/webgpu';
+import { color, mix, positionWorld, vec3 } from 'three/tsl';
+import {createGridSimulation} from '/src/engine/vfx/gridSimulation.js';
+import {waterSlotPool} from '/src/engine/vfx/waterSlots.js';
+import {installWaterSurfaceLook} from '/src/engine/vfx/waterSurfaceLook.js';
+import {installWaterMedium} from '/src/engine/vfx/waterMedium.js';
+import {installWaterCausticLight, updateWaterSlot} from '/src/engine/vfx/waterCaustics.js';
+
+/**
+ * ══ THE USER'S OWN POOL, RENDERED WHERE I CAN LOOK AT IT ═══════════════════
+ *
+ * There was a `water-reflection-smoke.html` beside this that measured where a
+ * planar reflection landed. Both it and the reflector it tested are gone: the
+ * engine's own traced reflections were already correct and the second mirror on
+ * top of them was the thing that looked wrong (see `waterSurfaceLook.js`). This
+ * page remains because the rest of the water's look still needs eyes on it.
+ *
+ * So this one is the scene from the report, transform for transform: a Box
+ * water 40 x 10 x 40 whose lid sits at y = 8.06, a 5 m cube, a floor at the
+ * volume's bottom, sun and sky. It renders PNGs rather than statistics.
+ */
+const IMAGES = [];
+const log = (...a) => console.log('LOOK:', ...a);
+try {
+ const adapter = await navigator.gpu.requestAdapter();
+ const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
+ const errors = []; device.addEventListener('uncapturederror', e => { errors.push(e.error.message); console.error('WebGPU validation', e.error.message); });
+ // ⚠ WIDTH IS A MULTIPLE OF 64. A WebGPU readback pads every row to 256 bytes,
+ // so at 900 px (3600 B/row) the rows walk sideways and the capture comes back
+ // as venetian blinds. 896 * 4 = 3584 = 14 * 256.
+ const W = 896, H = 560;
+ const renderer = new THREE.WebGPURenderer({ device, antialias: false });
+ await renderer.init(); renderer.setSize(W, H);
+ document.body.append(renderer.domElement);
+ const target = new THREE.RenderTarget(W, H);
+ target.texture.colorSpace = THREE.SRGBColorSpace;
+ target.depthTexture = new THREE.DepthTexture(W, H);
+
+ const scene = new THREE.Scene();
+ // A sky that is recognisable in a reflection: a bright band near the horizon
+ // and a deep blue overhead, so "is the sky in there" is answerable by eye.
+ scene.backgroundNode = mix(color('#9fd4ff'), color('#1b5fbe'), positionWorld.normalize().y.max(0).pow(.6));
+ scene.background = new THREE.Color('#7fb8f0');
+ const engine = { scene, renderer, camera: null, onUpdate: (fn) => { engine._tickers.push(fn); return () => {}; }, _tickers: [], on: () => () => {}, off: () => {}, modules: { get: () => null } };
+ const pool = waterSlotPool(engine);
+
+ const sun = new THREE.DirectionalLight('#fff6e0', 3);
+ sun.position.set(24, 30, 14); sun.castShadow = true;
+ sun.shadow.mapSize.set(1024, 1024);
+ Object.assign(sun.shadow.camera, { left: -30, right: 30, top: 30, bottom: -30, near: .5, far: 120 });
+ scene.add(sun); scene.add(sun.target);
+ scene.add(new THREE.AmbientLight('#bcd6ff', .35));
+
+ // The pool floor, exactly where the user's `Base` is.
+ const tiles = new THREE.MeshStandardNodeMaterial({ roughness: .9 });
+ { const { positionWorld: pw, vec3: v3, mix: mx, float: f } = await import('three/tsl');
+   const grid = pw.xz.div(2.5).fract().sub(.5).abs().sub(.02).step(0);
+   tiles.colorNode = mx(v3(.16, .18, .2), v3(.82, .84, .86), grid.x.mul(grid.y)); }
+ const floor = new THREE.Mesh(new THREE.BoxGeometry(40, .1, 40), tiles);
+ floor.position.y = -2; floor.receiveShadow = true; scene.add(floor);
+ // Something bright and unmistakable to look for in the mirror.
+ const cube = new THREE.Mesh(new THREE.BoxGeometry(5, 5, 5), new THREE.MeshStandardNodeMaterial({ color: '#ff3b28', roughness: .6 }));
+ cube.position.set(-5.6, 12.5, -7.3); cube.castShadow = true; scene.add(cube);
+ const post = new THREE.Mesh(new THREE.BoxGeometry(1.2, 9, 1.2), new THREE.MeshStandardNodeMaterial({ color: '#22ff5a', roughness: .6 }));
+ post.position.set(9, 12.5, 6); post.castShadow = true; scene.add(post);
+ // Depth markers for the saturation sweep, built HERE with everything else:
+ // built later they compiled after ~100 renders and were never fogged at all,
+ // which is a lifecycle question and not a question about the medium.
+ const depths = [1.5, 4, 6.5, 9];
+ const surfaceY = 3.056076523902334 + 5;
+ const markers = depths.map((d, i) => {
+   const m = new THREE.Mesh(new THREE.SphereGeometry(1.6, 32, 24),
+     new THREE.MeshStandardNodeMaterial({ color: '#ffffff', roughness: .85 }));
+   m.position.set((i - 1.5) * 10, surfaceY - d, 0);
+   scene.add(m);
+   return m;
+ });
+
+ // ── THE WATER, AS THE COMPONENT ASSEMBLES IT ─────────────────────────────
+ const holder = new THREE.Object3D();
+ holder.position.set(0, 3.056076523902334, 0); holder.scale.set(40, 10, 40);
+ scene.add(holder);
+ // The reported component's own settings, field for field (2026-09-05).
+ const props = { resolution: 128, width: 1, height: 1, waterDepth: 1, damping: .998, waveSpeed: 2, amplitude: 0,
+   waveHeight: .35, waveLength: 4, waveDirection: 45, choppiness: 1, rippleStrength: .6, caustics: true, causticIntensity: 1,
+   color: '#168aab', roughness: .12, style: 'realistic', deepColor: '#063a52', saturation: .45, transmission: .9,
+   foam: .8, foamThreshold: .5 };
+ // `builtin:Water.mat`, property for property (builtinMaterials.js).
+ const authored = new THREE.MeshPhysicalNodeMaterial({ color: '#8fd8de', roughness: .12, metalness: 0, ior: 1.333,
+   transmission: .9, thickness: 0, opacity: 1, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+ const slot = pool.claim({});
+ const sim = createGridSimulation('water', props, { material: authored, waterSlot: slot, anchorEngine: engine });
+ holder.add(sim.mesh);
+ sim.mesh.matrixAutoUpdate = false;
+ sim.mesh.matrix.identity().multiply(new THREE.Matrix4().makeTranslation(0, .5, 0));
+ sim.mesh.matrixWorldNeedsUpdate = true;
+ holder.updateMatrixWorld(true);
+ sim.mesh.castShadow = false;
+ installWaterMedium(engine);
+ installWaterCausticLight(engine);
+
+ let look = installWaterSurfaceLook({ engine, mesh: sim.mesh, material: sim.mesh.material, simulation: sim, slot });
+
+ const camera = new THREE.PerspectiveCamera(60, W / H, .1, 600);
+ engine.camera = camera;
+ const pose = (eye, look) => { camera.position.set(...eye); camera.lookAt(...look); camera.updateMatrixWorld(true); };
+
+ const step = async () => {
+   sim.tick(renderer, 1 / 60);
+   updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props });
+   for (const fn of engine._tickers) fn();
+   await device.queue.onSubmittedWorkDone();
+ };
+ await renderer.computeAsync(sim.init);
+ for (let i = 0; i < 90; i++) await step();
+
+ const SHOTS = new Map();
+ const canvas = document.createElement('canvas'); canvas.width = W; canvas.height = H;
+ const ctx = canvas.getContext('2d');
+ const shoot = async (label) => {
+   await step();
+   renderer.setRenderTarget(target);
+   await renderer.renderAsync(scene, camera);
+   const px = await renderer.readRenderTargetPixelsAsync(target, 0, 0, W, H);
+   renderer.setRenderTarget(null);
+   const image = ctx.createImageData(W, H);
+   for (let i = 0; i < W * H * 4; i += 4) {
+     for (let c = 0; c < 3; c++) image.data[i + c] = px[i + c];
+     image.data[i + 3] = 255;
+   }
+   ctx.putImageData(image, 0, 0);
+   IMAGES.push({ label, url: canvas.toDataURL('image/png') });
+   SHOTS.set(label, new Uint8Array(px.buffer ? px.slice(0) : px));
+   log('shot', label);
+   return px;
+ };
+ const diff = (a, b, label, scale = 8) => {
+   const x = SHOTS.get(a), y = SHOTS.get(b);
+   if (!x || !y) return;
+   const image = ctx.createImageData(W, H);
+   let sum = 0, peak = 0, hit = 0;
+   for (let i = 0; i < W * H * 4; i += 4) {
+     let d = 0;
+     for (let c = 0; c < 3; c++) { const v = Math.abs(x[i + c] - y[i + c]); d = Math.max(d, v); image.data[i + c] = Math.min(255, v * scale); }
+     image.data[i + 3] = 255;
+     sum += d; peak = Math.max(peak, d); if (d > 3) hit++;
+   }
+   ctx.putImageData(image, 0, 0);
+   IMAGES.push({ label, url: canvas.toDataURL('image/png') });
+   log('diff', label, JSON.stringify({ mean: +(sum / (W * H)).toFixed(2), peak, changedPixels: hit, share: +(hit / (W * H)).toFixed(3) }));
+ };
+
+ // ── WHAT IS ACTUALLY IN THE MIRROR? ─────────────────────────────────────
+ // The one question the pixel diff cannot answer: is the reflection empty, or
+ // is it full and being swallowed downstream?
+ const blitScene = new THREE.Scene();
+ const blitMaterial = new THREE.MeshBasicNodeMaterial({ depthTest: false, depthWrite: false, fog: false });
+ const blitMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), blitMaterial);
+ blitMesh.frustumCulled = false; blitScene.add(blitMesh);
+ const blitCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+ const dumpTexture = async (tex, label, scale = 1) => {
+   const { texture: textureNode, screenUV } = await import('three/tsl');
+   blitMaterial.colorNode = textureNode(tex, screenUV.flipY()).mul(scale);
+   blitMaterial.needsUpdate = true;
+   renderer.setRenderTarget(target);
+   await renderer.renderAsync(blitScene, blitCamera);
+   const px = await renderer.readRenderTargetPixelsAsync(target, 0, 0, W, H);
+   renderer.setRenderTarget(null);
+   const image = ctx.createImageData(W, H);
+   for (let i = 0; i < W * H * 4; i += 4) { for (let c = 0; c < 3; c++) image.data[i + c] = px[i + c]; image.data[i + 3] = 255; }
+   ctx.putImageData(image, 0, 0);
+   IMAGES.push({ label, url: canvas.toDataURL('image/png') });
+   log('dumped', label, tex?.image?.width + 'x' + tex?.image?.height);
+ };
+
+ // ── THE THREE POSES FROM THE REPORT ──────────────────────────────────────
+ const POSES = [
+   ['low-across', [-34, 11, -30], [-2, 9, -2]],          // shallow, from beside the pool
+   ['from-above', [-34, 26, -26], [-4, 9, -6]],           // the pose I screenshotted
+   ['under-side', [-38, 6.4, -18], [-6, 9.4, -4]],        // eye BELOW the waterline, outside the box
+   ['into-pool', [-16, 18, -16], [2, 0, 2]],              // steep, to judge the floor and its caustics
+   // The report's own pose: eye a metre over the waterline, bright object
+   // beyond the far rim — where "there are 2 reflections" was seen.
+   ['waterline', [-30, 9.2, -24], [-4, 11, -6]],
+ ];
+ for (const [label, eye, look] of POSES) { pose(eye, look); await shoot(`refl-on-${label}`); }
+ // The mirror pass's own output, for the pose that matters.
+ pose(...POSES[1].slice(1)); await shoot('mirror-pose');
+ const mirrorTarget = [...(reflection.base?.renderTargets?.values() ?? [])][0] ?? null;
+ log('mirror targets', reflection.base?.renderTargets?.size ?? 0, 'hasOutput', reflection.base?.hasOutput);
+ if (mirrorTarget) await dumpTexture(mirrorTarget.texture, 'mirror-target');
+
+ // The same frames with the reflection gone: whatever differs IS the reflection.
+ look.dispose(); look = null;
+ for (const [label, eye, look] of POSES) { pose(eye, look); await shoot(`refl-off-${label}`); }
+
+ // How much light does the reflection actually put on the water?
+ for (const [label] of POSES) diff(`refl-on-${label}`, `refl-off-${label}`, `diff-${label}`);
+
+ // ══ THE SATURATION DIAL, SWEPT ═══════════════════════════════════════════
+ //
+ // "For deep water, the further down the object is, the more it dissolves into
+ // it. For 0 value, we get crystal clear water, everything is visible regardless
+ // of depth. At value 1, we can't see through it at all" (user, 2026-09-05).
+ //
+ // Four identical white markers at 1.5, 4, 6.5 and 9 m below the surface, seen
+ // from straight above. The score is DISSOLVE: how much each marker's own pixels
+ // move away from what they look like with the water switched off entirely,
+ // as a fraction of the full distance to the water around them.
+ //
+ // ⛔ THE FIRST VERSION OF THIS SCORED |marker − water beside| AND WAS USELESS.
+ // In clear water the "water beside" is a caustic-lit tile floor, which is about
+ // as bright as a white sphere, so a perfectly visible marker scored near ZERO
+ // and the dial appeared to run backwards. Judge the marker against ITSELF with
+ // no water, never against whatever happens to be next to it.
+ pose([0, 34, 0.001], [0, 0, 0]);
+ const boxes = markers.map((m) => {
+   const q = m.position.clone().project(camera);
+   return { cx: Math.round((q.x * .5 + .5) * W), cy: Math.round((.5 - q.y * .5) * H) };
+ });
+ const sample = (px, cx, cy, r) => {
+   const out = [0, 0, 0];
+   let n = 0;
+   for (let y = cy - r; y <= cy + r; y++) for (let x = cx - r; x <= cx + r; x++) {
+     if (x < 0 || y < 0 || x >= W || y >= H) continue;
+     const i = (y * W + x) * 4;
+     for (let c = 0; c < 3; c++) out[c] += px[i + c];
+     n++;
+   }
+   return n ? out.map((v) => v / n) : out;
+ };
+ const distance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+ // The baseline: the same frame with no water in it at all.
+ sim.mesh.visible = false; slot.uniforms.active.value = 0;
+ for (let i = 0; i < 2; i++) await step();
+ const dryPixels = await shoot('saturation-none');
+ const dry = boxes.map(({ cx, cy }) => sample(dryPixels, cx, cy, 8));
+ sim.mesh.visible = true;
+
+ const readings = [];
+ for (const saturation of [0, .3, .6, 1]) {
+   sim.update({ ...props, saturation });
+   for (let i = 0; i < 4; i++) await step();
+   const px = await shoot(`saturation-${String(saturation).replace('.', 'p')}`);
+   // ⭐ VISIBILITY, NOT "DISSOLVE FROM DRY". How far the marker stands out from
+   // the water immediately around it, in the SAME frame — which is what "can I
+   // still see it" means. Normalizing against the dry frame instead measures
+   // how much the water darkened everything, and reads backwards.
+   // ⭐ THE MARKER AGAINST ITSELF, WITH NO BACKGROUND IN THE ANSWER. Every
+   // metric that involved "the water beside it" was confounded: in clear water
+   // that neighbour is a caustic-lit white tile floor, so a perfectly visible
+   // white sphere scored as invisible and the dial appeared to run backwards
+   // twice. This is pure attenuation — the marker's own brightness as a share
+   // of what it is with no water at all — and it can only fall.
+   const kept = boxes.map(({ cx, cy }, i) => {
+     const wet = sample(px, cx, cy, 8);
+     const luma = (c) => c[0] * .2126 + c[1] * .7152 + c[2] * .0722;
+     return +(luma(wet) / Math.max(1, luma(dry[i]))).toFixed(2);
+   });
+   readings.push([saturation, kept]);
+   // Is the coefficient even there, and does the FLOOR — a fragment the same
+   // rays cross more water to reach — respond when the markers do not?
+   const sg = slot.uniforms.sigma.value;
+   const floorNow = sample(px, Math.round(W * .5), Math.round(H * .78), 10);
+   log('  sigma/world-metre', JSON.stringify([sg.x, sg.y, sg.z].map((v) => +v.toFixed(3))),
+       'absorption/local', +slot.uniforms.absorption.value.toFixed(2),
+       'bare floor rgb', JSON.stringify(floorNow.map((v) => Math.round(v))),
+       'marker rgb', JSON.stringify(boxes.map(({ cx, cy }) => sample(px, cx, cy, 8).map((v) => Math.round(v)))));
+   log('saturation', saturation, 'marker BRIGHTNESS KEPT (1 = as if no water, 0 = gone)',
+     JSON.stringify(Object.fromEntries(depths.map((d, i) => [`${d}m`, kept[i]]))));
+ }
+ sim.update(props);
+
+ // ⛔ IS THE MEDIUM MISSING, OR IS THE LID HIDING IT? Same saturation, same
+ // markers, but the water SURFACE not drawn while the medium stays armed. If
+ // the markers go dark here and not through the lid, the medium is fine and
+ // three's screen-space transmission sample is what is bypassing it.
+ {
+   sim.update({ ...props, saturation: 1 });
+   for (let i = 0; i < 3; i++) await step();
+   sim.mesh.visible = false;                 // the surface only; the volume stays
+   slot.uniforms.active.value = 1;           // ...and updateWaterSlot is not run
+   const px = await (async () => {
+     renderer.setRenderTarget(target);
+     await renderer.renderAsync(scene, camera);
+     const p2 = await renderer.readRenderTargetPixelsAsync(target, 0, 0, W, H);
+     renderer.setRenderTarget(null);
+     const image = ctx.createImageData(W, H);
+     for (let i = 0; i < W * H * 4; i += 4) { for (let c = 0; c < 3; c++) image.data[i + c] = p2[i + c]; image.data[i + 3] = 255; }
+     ctx.putImageData(image, 0, 0);
+     IMAGES.push({ label: 'medium-without-lid', url: canvas.toDataURL('image/png') });
+     return p2;
+   })();
+   const luma = (c) => c[0] * .2126 + c[1] * .7152 + c[2] * .0722;
+   const kept = boxes.map(({ cx, cy }, i) => +(luma(sample(px, cx, cy, 8)) / Math.max(1, luma(dry[i]))).toFixed(2));
+   log('MEDIUM WITHOUT THE LID at saturation 1, brightness kept', JSON.stringify(Object.fromEntries(depths.map((d, i) => [`${d}m`, kept[i]]))));
+   sim.mesh.visible = true;
+   sim.update(props);
+   for (let i = 0; i < 2; i++) await step();
+ }
+
+ // The two claims, as one line each.
+ {
+   for (const [sat, kept] of readings) {
+     const monotone = kept.every((v, i) => i === 0 || v <= kept[i - 1] + .06);
+     log(`saturation ${sat}: deeper is dimmer = ${monotone}`, JSON.stringify(kept));
+   }
+ }
+
+ // ⛔ IS THE TINT THE MEDIUM, OR THE SURFACE'S OWN COLOUR? three's transmission
+ // MULTIPLIES the transmitted radiance by the material's base colour, so
+ // `Water.mat`'s #438d9c is a fixed 0.055x filter on red regardless of how much
+ // water the ray crossed — exactly the job the medium exists to do, done twice
+ // and done wrong. One capture with a white lid answers it.
+ {
+   const authoredColour = authored.color.clone();
+   authored.color.setRGB(1, 1, 1);
+   sim.update({ ...props, saturation: 0 });
+   for (let i = 0; i < 3; i++) await step();
+   await shoot('saturation-0-white-lid');
+   authored.color.copy(authoredColour);
+   sim.update(props);
+ }
+
+ // ── WHAT DOES THE MEDIUM THINK IS BEHIND WATER? ──────────────────────────
+ // The dial visibly moves the pool floor and visibly does NOT move a sphere
+ // hanging in the same column. Rather than reason about that, draw the one
+ // quantity the whole medium is built on: metres of water between the eye and
+ // this fragment, 0 = black, 30 m = white.
+ {
+   const { Fn: fn, vec4: v4, vec3: v3 } = await import('three/tsl');
+   const { waterSegmentNode } = await import('/src/engine/vfx/waterMedium.js');
+   // R = crossed length / 40 m, G = near depth / 20 m, B = far depth / 20 m,
+   // written LINEARLY (the target is sRGB, so decode on the way out).
+   // R = crossed length / 40 m, G = near depth / 20 m, B = far depth / 20 m.
+   // This is the medium's whole geometry, drawn where it can be read off.
+   scene.fogNode = fn(() => {
+     const seg = waterSegmentNode(slot);
+     return v4(seg.length.div(40), seg.near.div(20), seg.far.div(20), 1);
+   })();
+   scene.traverse((o) => { for (const m of [o.material].flat()) if (m) m.needsUpdate = true; });
+   sim.mesh.visible = false;
+   const px = await shoot('debug-segment');
+   const decode = (v) => { const c = v / 255; return c <= .04045 ? c / 12.92 : Math.pow((c + .055) / 1.055, 2.4); };
+   const read = (cx, cy, label) => {
+     const c = sample(px, cx, cy, 4);
+     log(`  segment @ ${label}: length ${(decode(c[0]) * 40).toFixed(2)} m, depth near ${(decode(c[1]) * 20).toFixed(2)} m far ${(decode(c[2]) * 20).toFixed(2)} m`);
+   };
+   const decode = (v) => { const c = v / 255; return c <= .04045 ? c / 12.92 : Math.pow((c + .055) / 1.055, 2.4); };
+   const read = (cx, cy, label) => {
+     const c = sample(px, cx, cy, 4);
+     log(`  segment @ ${label}: length ${(decode(c[0]) * 40).toFixed(2)} m, depth near ${(decode(c[1]) * 20).toFixed(2)} m far ${(decode(c[2]) * 20).toFixed(2)} m`);
+   };
+   boxes.forEach(({ cx, cy }, i) => read(cx, cy, `marker at ${depths[i]} m`));
+   read(Math.round(W * .5), Math.round(H * .78), 'bare floor (expect ~10 m)');
+   sim.mesh.visible = true;
+ }
+ log('validation', errors.length ? errors : 'clean');
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: errors.length === 0, images: IMAGES };
+ console.log('WATER-LOOK PASS');
+} catch (error) {
+ console.error(error.stack);
+ globalThis.__VFX_SMOKE_RESULT__ = { pass: false, error: String(error.stack), images: IMAGES };
+}
+</script></body></html>

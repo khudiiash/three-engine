@@ -91,6 +91,7 @@ import { If, Loop, float, int, ivec2, mix, select, step, uint, vec3, vec4 } from
 import { MAX_LOOP_ALBEDO } from "./srcConfig.js";
 import { hashKey } from "./srcMathTsl.js";
 import { emitterSlotFactor, emitterSurfaceT } from "./giLight.js";
+import { waterCausticGainNode } from "../../engine/vfx/waterCaustics.js";
 
 /**
  * How far below the mean importance a contributing emitter may be ranked before
@@ -244,6 +245,11 @@ function lightTermsAt(slot, P, n, margin, maxRay) {
     E: vec3(slot.color).mul(atten).mul(cos).mul(active).toVar(),
     dirTo,
     cos,
+    // A UNIFORM, not a build-time fact (R11 — adding a light must never
+    // recompile). The water caustic lens is a property of a DISTANT source
+    // refracting through a surface above the hit, so only a directional slot
+    // may take it, and which slot that is can change without a rebuild.
+    isDir,
     // A directional source has no distance, so its shadow ray runs the whole
     // medium. `kind` is a UNIFORM, so this cannot be a build-time choice between
     // a number and `null` — it has to be a node either way, and the volume
@@ -522,6 +528,30 @@ export function createSrcHitAttribution({
  *   form the gate diffs against `srcRef.js`.
  */
 export function createSrcHitLighting({
+  /**
+   * ── §11.54: WATER CAUSTICS ARE A VISIBILITY, AND THAT IS WHY THEY BOUNCE ──
+   *
+   * Engine-owned water slots (`waterSlots.js`). Each contributes a MULTIPLIER
+   * on light arriving from a distant source — `focus × transmittance`, exactly
+   * 1 outside its volume — and it is applied to the slot's VISIBILITY rather
+   * than to its irradiance. That placement is the whole trick:
+   *
+   *   · with the §12.82 sun split ARMED (the default), the irradiance is not
+   *     stored at all — `sunVis` is, and it is re-closed against the current
+   *     sun at [F]. A caustic folded into the irradiance would be thrown away
+   *     every frame; folded into the visibility it rides in the cached TRANSFER
+   *     and survives the close.
+   *   · with the split off it lands in `E` at the hit, same as any shadow term.
+   *
+   * In both arms the probes therefore see a caustic-lit floor and BOUNCE it,
+   * which is what "water must reflect light caustics onto objects" asks for and
+   * what the old fragment-only `dFdx` estimator could not do from a kernel.
+   *
+   * The gain is bounded (≤ 4) because the deposit clamps a stored transfer into
+   * [0,1]: a clipped highlight is the right failure, a firefly in a LIGHT is a
+   * firefly in every bounce that light ever takes.
+   */
+  caustics = [],
   sun = null,
   lights = [],
   emitters = [],
@@ -624,6 +654,11 @@ export function createSrcHitLighting({
   ) => {
     const P = vec3(Pin).toVar();
     const n = vec3(nIn).toVar();
+    // One evaluation per hit, shared by every slot loop below: two texture
+    // reads and no ray. Absent entirely when the scene has no water.
+    const causticGain = caustics.length
+      ? caustics.reduce((product, slot) => (product ? product.mul(waterCausticGainNode(P, slot)) : waterCausticGainNode(P, slot)), null).toVar()
+      : null;
     const sunGain = sunGainIn == null ? float(1) : float(sunGainIn);
     const sunChromaGain = sunChromaGainIn == null ? sunGain : float(sunChromaGainIn);
 
@@ -678,6 +713,7 @@ export function createSrcHitLighting({
         const v = visibility ? float(visibility(P, n, l, null)).toVar() : float(1).toVar();
         // Only when a ray was cast — see the NEE site's note.
         if (count && visibility) count.shadowRays(1);
+        if (causticGain) v.mulAssign(causticGain);
         // Split: the ray still fires (visibility is the one term that cannot be
         // made analytic) but its product is not folded into E.
         if (splitBundle) { sunVis.assign(v); sunFacing.assign(1); }
@@ -820,6 +856,7 @@ export function createSrcHitLighting({
         for (const [k, t] of terms.entries()) {
           If(t.E.x.max(t.E.y).max(t.E.z).greaterThan(0), () => {
             const v = visibility ? slotVisibility(k, t.dirTo, t.maxT) : float(1).toVar();
+            if (causticGain) v.mulAssign(mix(float(1), causticGain, t.isDir));
             const mine = isSplit(k);
             const raw = t.E.mul(v).toVar();
             const included = mine && !splitKeep ? select(mine, float(0), float(1)) : float(1);
@@ -850,14 +887,17 @@ export function createSrcHitLighting({
           const Ei = vec3(0).toVar();
           const dirTo = vec3(0, 1, 0).toVar();
           const maxT = float(0).toVar();
+          const isDir = causticGain ? float(0).toVar() : null;
           for (let k = 0; k < terms.length; k++) {
             const take = i.equal(int(k));
             Ei.assign(select(take, terms[k].E, Ei));
             dirTo.assign(select(take, terms[k].dirTo, dirTo));
             maxT.assign(select(take, terms[k].maxT, maxT));
+            if (isDir) isDir.assign(select(take, terms[k].isDir, isDir));
           }
           If(Ei.x.max(Ei.y).max(Ei.z).greaterThan(0), () => {
             const v = slotVisibility(i, dirTo, maxT);
+            if (causticGain) v.mulAssign(mix(float(1), causticGain, isDir));
             const mine = isSplit(i);
             const raw = Ei.mul(v).toVar();
             const included = mine && !splitKeep ? select(mine, float(0), float(1)) : float(1);

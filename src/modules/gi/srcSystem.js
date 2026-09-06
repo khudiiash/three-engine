@@ -1486,6 +1486,10 @@ export function createSrcProbeSystem({
   // in WHICH KERNEL compiles it.
   const lightingOptions = srcSurfaceAt
     ? {
+        // §11.54 — the engine's water slots. Stable, engine-owned bindings
+        // (`waterSlots.js`), so water appearing, changing resolution or being
+        // deleted moves uniforms and never rebuilds this kernel.
+        caustics: lighting.caustics ?? [],
         sun: lighting.sun ?? null,
         lights: lighting.lights ?? [],
         emitters: lighting.emitters ?? [],

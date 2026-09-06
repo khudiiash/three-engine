@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readRenderTargetImage } from "../src/engine/renderTargetImage.js";
+import { readRenderTargetImage, matchCaptureTargetFormat, installFramebufferCopyFormats } from "../src/engine/renderTargetImage.js";
 
 /**
  * The two backend conventions for reading a render target back
@@ -71,4 +71,32 @@ test("a truncated buffer yields black rather than reading past the end", async (
   assert.equal(image.length, ROW_BYTES * HEIGHT);
   assert.deepEqual([...image.subarray(0, ROW_BYTES)], new Array(ROW_BYTES).fill(1));
   assert.deepEqual([...image.subarray(3 * ROW_BYTES)], new Array(ROW_BYTES).fill(0));
+});
+
+
+test("WebGPU canvas-compatible BGRA capture unpads and swaps red/blue without changing alpha", async () => {
+  const raw = new Uint8Array(256 + 4);
+  raw.set([20, 30, 200, 128], 0); raw.set([210, 40, 10, 64], 256);
+  const renderer = fakeRenderer({ isWebGPUBackend:true, utils:{getPreferredCanvasFormat:()=>"bgra8unorm"} }, raw);
+  const target = matchCaptureTargetFormat(renderer, {texture:{}});
+  assert.equal(target.texture.internalFormat,"bgra8unorm");
+  assert.deepEqual([...await readRenderTargetImage(renderer,target,1,2)],[200,30,20,128,10,40,210,64]);
+});
+
+test("capture format matching preserves WebGL and RGBA readback", async () => {
+  const target = {texture:{}};
+  const renderer=fakeRenderer({isWebGLBackend:true,utils:{getPreferredCanvasFormat:()=>"bgra8unorm"}},new Uint8Array([1,2,3,255]));
+  matchCaptureTargetFormat(renderer,target);assert.equal(target.texture.internalFormat,undefined);
+  assert.deepEqual([...await readRenderTargetImage(renderer,target,1,1)],[1,2,3,255]);
+});
+
+test("framebuffer copies reallocate only on context format changes and preserve depth", () => {
+  let format="bgra8unorm",copies=0,updates=0;
+  const renderer={backend:{isWebGPUBackend:true,get:()=>({}),utils:{getPreferredCanvasFormat:()=>format}},getRenderTarget:()=>null,copyFramebufferToTexture:()=>++copies};
+  const texture={set needsUpdate(v){if(v)updates++;}};
+  installFramebufferCopyFormats(renderer);installFramebufferCopyFormats(renderer);
+  renderer.copyFramebufferToTexture(texture);renderer.copyFramebufferToTexture(texture);
+  assert.equal(updates,1);assert.equal(copies,2);
+  format="rgba16float";renderer.copyFramebufferToTexture(texture);assert.equal(texture.internalFormat,"rgba16float");assert.equal(updates,2);
+  renderer.copyFramebufferToTexture({isDepthTexture:true});assert.equal(updates,2);assert.equal(copies,4);
 });

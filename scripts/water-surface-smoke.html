@@ -1,0 +1,240 @@
+<!doctype html><html><head><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three/webgpu';
+import {Fn,texture,uv as uvNode} from 'three/tsl';
+import {createGridSimulation} from '/src/engine/vfx/gridSimulation.js';
+import {waterWaveHeight} from '/src/engine/vfx/waterWaves.js';
+import {waterSlotPool} from '/src/engine/vfx/waterSlots.js';
+import {installWaterCausticLight,updateWaterSlot} from '/src/engine/vfx/waterCaustics.js';
+import {installWaterMedium,waterCrossedLengthNode} from '/src/engine/vfx/waterMedium.js';
+const check=(ok,label)=>{if(!ok)throw new Error(label);console.log('WATER:',label);};
+try{
+ const adapter=await navigator.gpu.requestAdapter(),device=await adapter.requestDevice({requiredLimits:{maxStorageBuffersPerShaderStage:8}}),errors=[];
+ device.addEventListener('uncapturederror',e=>{errors.push(e.error.message);console.error('WebGPU validation',e.error.message);});
+ const renderer=new THREE.WebGPURenderer({device});await renderer.init();renderer.setSize(256,256);document.body.append(renderer.domElement);
+ const scene=new THREE.Scene(),updates=[];
+ const engine={scene,renderer,onUpdate:fn=>{updates.push(fn);return()=>{};}};
+ scene.background=new THREE.Color('#000000');
+ const p={resolution:48,width:8,height:8,amplitude:0,waveHeight:.3,waveLength:3.7,waveDirection:23,waveSpeed:2.3,choppiness:.55,rippleStrength:.5,waterDepth:3,absorption:.15,causticIntensity:1.2};
+ // The engine-owned slot pool: claimed BEFORE the solver, because the solver
+ // builds the kernel that writes into it.
+ const pool=waterSlotPool(engine);engine.waterSlots=pool;
+ const owner={};const slot=pool.claim(owner);check(!!slot,'water slot claimed from the engine pool');
+ const sim=createGridSimulation('water',p,{waterSlot:slot});scene.add(sim.mesh);
+ installWaterCausticLight(engine);
+ installWaterMedium(engine);
+ const floor=new THREE.Mesh(new THREE.PlaneGeometry(10,10),new THREE.MeshStandardNodeMaterial({color:'#777777',roughness:1}));
+ floor.rotation.x=-Math.PI/2;floor.position.y=-3;scene.add(floor);
+ const sun=new THREE.DirectionalLight('#ffffff',2);sun.position.set(-1,5,2);scene.add(sun);scene.add(new THREE.AmbientLight('#ffffff',.1));
+ const camera=new THREE.PerspectiveCamera(48,1,.1,30);camera.position.set(0,8,6);camera.lookAt(0,-3,0);
+ const target=new THREE.RenderTarget(256,256);
+ const tick=async(dt)=>{sim.mesh.visible=true;sim.tick(renderer,dt);await device.queue.onSubmittedWorkDone();
+  updateWaterSlot({engine,slot,kernel:sim.slotKernel,mesh:sim.mesh,simulation:sim,props:p});for(const fn of updates)fn();};
+ await renderer.computeAsync(sim.init);for(let i=0;i<4;i++)await tick(1/60);
+
+ // ── THE VOLUME ────────────────────────────────────────────────────────────
+ const data=new Float32Array(await renderer.getArrayBufferAsync(sim.mesh.geometry.attributes.position));
+ const ws=sim.uniforms.waveScale.value;
+ // Both live clamps, exactly as `waterPhysics.js` reads them: the base
+ // wavelength's Nyquist clamp AND the per-band cutoff.
+ const live={...p,waveLength:sim.uniforms.waveLength.value,waveCutoff:sim.uniforms.waveCutoff.value};
+ let error=0;for(let i=0;i<sim.count*4;i+=4)error=Math.max(error,Math.abs(data[i+1]-waterWaveHeight(data[i]*ws.x,data[i+2]*ws.z,sim.uniforms.simTime.value,live)/ws.y));
+ check(error<.00002,'GPU waves match CPU buoyancy query '+error);
+ check(sim.vertexCount>sim.count,'the water body carries skirt vertices '+sim.vertexCount);
+ let deepest=0,rimMatches=0;
+ for(let i=sim.count*4;i<sim.vertexCount*4;i+=4)deepest=Math.min(deepest,data[i+1]);
+ check(Math.abs(deepest+p.waterDepth)<1e-3,'the skirt reaches the volume floor '+deepest);
+ // The wall's top ring must be the surface's own rim, to the last bit, or the
+ // body cracks open along its edge.
+ const n=sim.resolution,ring=4*n,base=sim.count*4;
+ for(let k=0;k<ring;k++){const e=Math.floor(k/n),i=k%n;
+  const [ix,iz]=e===0?[i,0]:e===1?[n-1,i]:e===2?[n-1-i,n-1]:[0,n-1-i];
+  const g=(iz*sim.resolution+ix)*4,w=base+k*4;
+  if(Math.abs(data[g]-data[w])<1e-5&&Math.abs(data[g+1]-data[w+1])<1e-5&&Math.abs(data[g+2]-data[w+2])<1e-5)rimMatches++;}
+ check(rimMatches===ring,'every wall vertex sits exactly on the surface rim '+rimMatches+'/'+ring);
+
+ // ── THE CAUSTIC MAP ITSELF ────────────────────────────────────────────────
+ // A caustic is a CONTRAST, and every pixel argument about it is indirect. Read
+ // the map: a flat surface sums to exactly 1.0 by construction, so the mean is
+ // the conservation check and the max is whether there are filaments in it at
+ // all. Rendered through an ortho quad because a StorageTexture has no direct
+ // readback path.
+ {
+  const quad=new THREE.Mesh(new THREE.PlaneGeometry(2,2),new THREE.MeshBasicNodeMaterial());
+  quad.material.colorNode=texture(slot.caustic,uvNode()).mul(1/8);quad.material.fog=false;
+  const flat=new THREE.Scene();flat.add(quad);
+  const ortho=new THREE.OrthographicCamera(-1,1,1,-1,0,1);ortho.position.z=.5;
+  renderer.setRenderTarget(target);await renderer.render(flat,ortho);
+  const px=await renderer.readRenderTargetPixelsAsync(target,0,0,256,256);renderer.setRenderTarget(null);
+  let sum=0,max=0,lit=0;for(let i=0;i<px.length;i+=4){const v=px[i];sum+=v;max=Math.max(max,v);if(v>0)lit++;}
+  const mean=sum/(px.length/4);
+  console.log('WATER: caustic map '+JSON.stringify({mean:+mean.toFixed(1),max,litShare:+(lit/(px.length/4)).toFixed(3)}));
+  check(lit>px.length/4*.5,'the map is filled, not sparse '+lit);
+  check(max>mean*2.2,'and it has filaments in it, not a wash '+JSON.stringify({mean:+mean.toFixed(1),max}));
+  flat.remove(quad);quad.geometry.dispose();quad.material.dispose();
+ }
+
+ // ── CAUSTICS, AND THE MAP THEY NOW COME FROM ──────────────────────────────
+ const light=engine._waterCausticLight;
+ const capture=async(enabled)=>{light.visible=enabled;sim.mesh.visible=false;renderer.setRenderTarget(target);await renderer.render(scene,camera);return renderer.readRenderTargetPixelsAsync(target,0,0,256,256);};
+ const base0=await capture(false),first=await capture(true);let bright=0,energy=0;
+ for(let i=0;i<first.length;i+=4){const d=first[i]+first[i+1]+first[i+2]-base0[i]-base0[i+1]-base0[i+2];if(d>5)bright++;energy+=Math.max(0,d);}
+ check(bright>300&&energy>3000,'refracted caustics light actual floor '+JSON.stringify({bright,energy}));
+ for(let i=0;i<36;i++)await tick(1/60);
+ const later=await capture(true);let changed=0;for(let i=0;i<later.length;i+=4)if(Math.abs(later[i]-first[i])>5)changed++;
+ check(changed>300,'caustic pattern moves with simulated normals '+changed);
+ sun.intensity=0;await tick(0);
+ const noLightOn=await capture(true),noLightOff=await capture(false);let darkDifference=0;
+ for(let i=0;i<noLightOn.length;i++)darkDifference=Math.max(darkDifference,Math.abs(noLightOn[i]-noLightOff[i]));
+ check(darkDifference<=1,'no light means no caustics');
+ sun.intensity=2;await tick(0);light.visible=true;
+
+ // ── THE MEDIUM: A PATH LENGTH, NOT A TOGGLE ───────────────────────────────
+ //
+ // ⚠ THE A/B IS THE MEDIUM, NOT THE CAMERA. Two camera positions frame
+ // different geometry, so comparing their luma measures the framing and not the
+ // water — the first version of this check failed backwards for exactly that
+ // reason, and a medium is perfectly entitled to make a dark thing BRIGHTER
+ // (haze over a dark floor is the standard case). Hold the view still, toggle
+ // the slot, and measure WHERE the difference lands.
+ //
+ // The water SURFACE is hidden for these shots on purpose. The medium is a
+ // property of the volume, not of the mesh that bounds it, and hiding the lid
+ // is what proves that the receivers themselves are being attenuated rather
+ // than being viewed through a tinted pane of glass.
+ const shoot=async(place,on,lid=false)=>{sim.mesh.visible=lid;slot.uniforms.active.value=on?1:0;place();camera.updateMatrixWorld(true);
+  renderer.setRenderTarget(target);await renderer.render(scene,camera);
+  const px=await renderer.readRenderTargetPixelsAsync(target,0,0,256,256);slot.uniforms.active.value=1;return px;};
+ const block=(px,x0,x1,y0,y1,c=-1)=>{let sum=0,n=0;for(let row=y0;row<y1;row++)for(let col=x0;col<x1;col++){const i=(row*256+col)*4;
+  sum+=c<0?px[i]+px[i+1]+px[i+2]:px[i+c];n++;}return sum/n;};
+ // PER CHANNEL, deliberately. A luma difference can be near zero while the hue
+ // swings from grey to cyan — the medium replaces a lit floor with water colour
+ // of almost the same brightness — and measuring luma read that as "no effect".
+ const delta=(a,b,x0,x1,y0,y1)=>[0,1,2].reduce((sum,c)=>sum+Math.abs(block(a,x0,x1,y0,y1,c)-block(b,x0,x1,y0,y1,c)),0);
+ // A wide floor under a narrower pool, seen from straight above: the middle of
+ // the frame is floor UNDER the water, the corners are the same floor beside
+ // it. One medium, two answers, in one image.
+ floor.geometry.dispose();floor.geometry=new THREE.PlaneGeometry(24,24);
+ const overhead=()=>{camera.position.set(0,14,.01);camera.lookAt(0,-3,0);};
+ const wetTop=await shoot(overhead,true),dryTop=await shoot(overhead,false);
+ const through=delta(wetTop,dryTop,108,148,108,148),beside=delta(wetTop,dryTop,10,40,10,40);
+ check(beside<1.5,'floor BESIDE the pool is untouched by the medium '+beside);
+ check(through>beside*8+20,'floor UNDER the pool is not '+JSON.stringify({through,beside}));
+ // HALF IN, HALF OUT — MEASURED ON THE QUANTITY THAT PRODUCES IT.
+ //
+ // An image test here has to argue from pixels about a number it cannot see,
+ // and the water colour is close enough in luma to a lit surface that the
+ // argument is weak in both directions (a luma A/B on this scene read "no
+ // effect" while the effect was total). The property the user actually asked
+ // for is about the COLUMN: from an eye just under a flat surface, one frame
+ // must contain both "no water in the way" for rays leaving upward through the
+ // surface and "the whole room's worth" for rays going down. Render that number
+ // directly and the claim is unambiguous.
+ //
+ // ⚠ THE SURFACE IS FLATTENED FOR THIS ONE MEASUREMENT. With waves on, "the eye
+ // is 0.3 m under" is not a fact about the scene — it depends on whether the eye
+ // sits under a crest or in a trough, and an earlier version of this check read
+ // a trough and concluded the medium was broken. The wobble is real and wanted;
+ // it just cannot also be the ruler.
+ // ⚠ AND ROW 0 IS THE TOP OF THE IMAGE (WebGPU readback order, not WebGL's).
+ sim.update({...p,waveHeight:0});sim.restart();await tick(0);await tick(1/60);
+ const probe=new THREE.Mesh(new THREE.PlaneGeometry(16,12),new THREE.MeshBasicNodeMaterial());
+ // `.assign`/`If` need a function scope, exactly as they do in the fog node.
+ probe.material.colorNode=Fn(()=>waterCrossedLengthNode(slot).div(10).toVec3())();
+ probe.material.fog=false;probe.position.set(0,-.3,-3.9);scene.add(probe);
+ sim.mesh.visible=false;slot.uniforms.active.value=1;
+ camera.position.set(0,-.3,3.2);camera.lookAt(0,-.3,-4);camera.updateMatrixWorld(true);
+ renderer.setRenderTarget(target);await renderer.render(scene,camera);
+ const len=await renderer.readRenderTargetPixelsAsync(target,0,0,256,256);
+ const metres=(y0,y1)=>block(len,120,136,y0,y1,0)/255*10;
+ const up=metres(8,40),down=metres(180,248);
+ check(up<1.2,'rays leaving upward through the surface cross almost no water '+up.toFixed(2)+' m');
+ check(down>5,'rays going down cross the room '+down.toFixed(2)+' m');
+ check(down>up*4,'ONE frame, both answers — this is what a toggle cannot do '+JSON.stringify({up:+up.toFixed(2),down:+down.toFixed(2)}));
+ // And the boundary is where the eye is, not where a flag is: lift the eye
+ // clear of the surface and the upward rays are unchanged while the downward
+ // ones lose exactly the sub-surface part of their path.
+ camera.position.set(0,.6,3.2);camera.lookAt(0,.6,-4);camera.updateMatrixWorld(true);
+ await renderer.render(scene,camera);
+ const dry=await renderer.readRenderTargetPixelsAsync(target,0,0,256,256);
+ const dryUp=block(dry,120,136,8,40,0)/255*10;
+ check(dryUp<.05,'an eye above the surface crosses no water looking up '+dryUp.toFixed(3)+' m');
+ scene.remove(probe);probe.geometry.dispose();probe.material.dispose();
+ sim.update(p);sim.restart();await tick(0);
+ renderer.setRenderTarget(null);
+ camera.position.set(0,8,6);camera.lookAt(0,-3,0);sim.mesh.visible=true;
+
+ // ── OWNERSHIP AND THE PORTABLE DEVICE ─────────────────────────────────────
+ const borrowed=new THREE.MeshPhysicalNodeMaterial({color:'#c01234',roughness:.7,transmission:.2});
+ const reused=createGridSimulation('water',{...p,color:'#ffffff',transmission:1},{material:borrowed});
+ check(reused.mesh.material===borrowed&&borrowed.color.getHexString()==='c01234'&&borrowed.transmission===.2,'authored water material preserved');
+ let disposed=false;borrowed.addEventListener('dispose',()=>disposed=true);reused.dispose(renderer);
+ check(!disposed,'supplied material ownership preserved');borrowed.dispose();
+
+ // ── WAKES ─────────────────────────────────────────────────────────────────
+ sim.update({...p,waveHeight:0});sim.restart();await tick(0);sim.addWaterImpulse(0,0,.8,.3);await tick(0);
+ let wake=new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));
+ const max=Math.max(...Array.from({length:sim.count},(_,i)=>Math.abs(wake[i*4+1])));
+ check(max>.1,'body displacement injects heightfield wake '+max);
+ const wakeBefore=wake.slice();for(let i=0;i<15;i++)await tick(1/60);
+ wake=new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));
+ let evolved=0;for(let i=0;i<wake.length;i+=4)evolved+=Math.abs(wake[i+1]-wakeBefore[i+1]);
+ check(evolved>1,'wake propagates through GPU solver '+evolved);
+
+ // ── THE FIELD MUST CALM DOWN ──────────────────────────────────────────────
+ // An explicit wave solver that gains energy does not fail quietly: it fills
+ // the pool with grid-scale spikes ("energy grows infinitely", user 09-05). Hit
+ // it hard, then let it run, and require the peak to FALL.
+ {
+  const peak=async()=>{const buf=new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));
+   let m=0;for(let i=0;i<sim.count;i++)m=Math.max(m,Math.abs(buf[i*4+1]));return m;};
+  sim.update({...p,waveHeight:0});sim.restart();await tick(0);
+  for(let i=0;i<6;i++){sim.addWaterImpulse(0,0,.9,.5);sim.addWaterImpulse(1.5,-1.2,.9,-.5);await tick(1/60);}
+  const struck=await peak();
+  for(let i=0;i<200;i++)await tick(1/60);
+  const settling=await peak();
+  for(let i=0;i<200;i++)await tick(1/60);
+  const settled=await peak();
+  check(Number.isFinite(struck)&&struck>.01,'the strike registers '+struck.toFixed(4));
+  check(settling<struck*1.05&&settled<settling*1.05,
+   'and the field DECAYS instead of winding up '+JSON.stringify({struck:+struck.toFixed(4),settling:+settling.toFixed(4),settled:+settled.toFixed(4)}));
+  check(settled<sim.uniforms.rippleLimit.value*1.001,'and never passes its hard bound '+settled.toFixed(4));
+  sim.update(p);sim.restart();await tick(0);
+ }
+
+ // ── A RESTING BODY MUST NOT WIND THE POOL UP ──────────────────────────────
+ // The exact emission pattern `WaterPhysics` produces for a body FLOATING AT
+ // REST: its footprint jitters by a fraction of a cell and its draught breathes,
+ // because the buoyancy solve never puts it perfectly still. Each such step
+ // emits a release/press pair at slightly different places — net volume zero,
+ // net ENERGY positive — and that is what "the whole pool starts going crazy,
+ // energy grows infinitely" is (user, 2026-09-05). Run it long and require the
+ // field to be no worse at the end than in the middle.
+ {
+  const peak=async()=>{const buf=new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));
+   let m=0;for(let i=0;i<sim.count;i++)m=Math.max(m,Math.abs(buf[i*4+1]));return m;};
+  sim.update({...p,waveHeight:0});sim.restart();await tick(0);
+  let prev=null;
+  const emit=(x,z,radius,depth)=>{
+   const moved=prev?Math.hypot(x-prev.x,z-prev.z):Infinity;
+   const changed=prev?Math.abs(depth-prev.depth):Infinity;
+   if(moved>radius*.05||changed>Math.abs(depth)*.02){
+    if(prev)sim.addWaterImpulse(prev.x,prev.z,prev.radius,prev.depth);
+    sim.addWaterImpulse(x,z,radius,-depth);
+    prev={x,z,radius,depth};
+   }
+  };
+  const settleFor=async(steps)=>{for(let i=0;i<steps;i++){const t=i/60;
+   emit(Math.sin(t*7.3)*.03,Math.cos(t*5.1)*.03,.8,.3+Math.sin(t*9.7)*.02);await tick(1/60);}};
+  await settleFor(400);const early=await peak();
+  await settleFor(400);const middle=await peak();
+  await settleFor(400);const late=await peak();
+  console.log('WATER: resting-body pump '+JSON.stringify({early:+early.toFixed(4),middle:+middle.toFixed(4),late:+late.toFixed(4),bound:+sim.uniforms.rippleLimit.value.toFixed(4)}));
+  check(late<Math.max(early,middle)*1.15,'a resting body does not wind the pool up '+JSON.stringify({early:+early.toFixed(4),middle:+middle.toFixed(4),late:+late.toFixed(4)}));
+  sim.update(p);sim.restart();await tick(0);
+ }
+
+ check(!errors.length,'portable eight-storage device has no errors');
+ sim.dispose(renderer);target.dispose();
+ globalThis.__VFX_SMOKE_RESULT__={pass:true};console.log('WATER-SURFACE PASS');
+}catch(error){console.error(error.stack);globalThis.__VFX_SMOKE_RESULT__={pass:false,error:String(error.stack)};}
+</script></body></html>

@@ -1,0 +1,29 @@
+<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><canvas></canvas><script type="module">
+try {
+ const THREE=await import('three/webgpu');
+ const {viewportSharedTexture,screenUV}=await import('three/tsl');
+ const {matchCaptureTargetFormat,readRenderTargetImage,installFramebufferCopyFormats}=await import('/src/engine/renderTargetImage.js');
+ const renderer=new THREE.WebGPURenderer({canvas:document.querySelector('canvas')});await renderer.init();installFramebufferCopyFormats(renderer);renderer.setSize(128,64);
+ const scene=new THREE.Scene(),camera=new THREE.OrthographicCamera(-1,1,1,-1,.1,10);camera.position.z=2;
+ for(const [x,color] of [[-.5,0xff0000],[.5,0x0000ff]]) {
+   const mesh=new THREE.Mesh(new THREE.PlaneGeometry(1,2),new THREE.MeshBasicNodeMaterial({color}));mesh.position.x=x;scene.add(mesh);
+ }
+ const material=new THREE.MeshBasicNodeMaterial({transparent:true});material.colorNode=viewportSharedTexture(screenUV).rgb;
+ const overlay=new THREE.Mesh(new THREE.PlaneGeometry(2,2),material);overlay.position.z=.1;overlay.renderOrder=10;scene.add(overlay);
+ await renderer.compileAsync(scene,camera);renderer.render(scene,camera);
+ const target=matchCaptureTargetFormat(renderer,new THREE.RenderTarget(65,33,{colorSpace:THREE.SRGBColorSpace}));
+ renderer.setRenderTarget(target);await renderer.compileAsync(scene,camera);renderer.render(scene,camera);
+ const pixels=await readRenderTargetImage(renderer,target,65,33);let red=0,blue=0;
+ for(let y=0;y<33;y++)for(let x=0;x<65;x++) {const i=(y*65+x)*4;if(pixels[i]>240&&pixels[i+2]<10&&x<32)red++;if(pixels[i+2]>240&&pixels[i]<10&&x>32)blue++;}
+ if(red<900||blue<900)throw new Error(`Capture colors incorrect red=${red}, blue=${blue}`);
+ const hdr=new THREE.RenderTarget(65,33,{type:THREE.HalfFloatType});renderer.setRenderTarget(hdr);await renderer.compileAsync(scene,camera);renderer.render(scene,camera);
+ const hdrPixels=await renderer.readRenderTargetPixelsAsync(hdr,0,0,65,33);
+ const rowWords=Math.ceil(65*8/256)*256/2;
+ const left=16*rowWords+16*4,right=16*rowWords+48*4;
+ const value=i=>THREE.DataUtils.fromHalfFloat(hdrPixels[i]);
+ if(value(left)<.9||value(left+2)>.1||value(right+2)<.9||value(right)>.1)throw new Error('HDR viewport copy colors incorrect');
+ renderer.setRenderTarget(null);renderer.render(scene,camera);
+ await renderer.backend.device.queue.onSubmittedWorkDone();target.dispose();hdr.dispose();renderer.dispose();
+ globalThis.__GI_SMOKE_RESULT__={pass:true,red,blue};console.log('GI-SMOKE PASS viewport framebuffer capture',JSON.stringify({red,blue}));
+} catch(error){globalThis.__GI_SMOKE_RESULT__={pass:false,error:String(error.stack??error)};console.error('GI-SMOKE FAIL',error.stack??error);}
+</script>

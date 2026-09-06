@@ -405,6 +405,16 @@ function remapCollidingIds(engine, entities) {
       const schema = getComponentClass?.(comp.type)?.schema ?? [];
       let props = comp.props;
       for (const field of schema) {
+        if(field?.type === "clothAnchors") {
+          const anchors=props?.[field.key];
+          if(!Array.isArray(anchors))continue;
+          const next=anchors.map(anchor=>idMap.has(anchor?.entityId)?{...anchor,entityId:idMap.get(anchor.entityId)}:anchor);
+          if(next.some((anchor,i)=>anchor!==anchors[i])) {
+            if(props===comp.props)props={...props};
+            props[field.key]=next;
+          }
+          continue;
+        }
         if (field?.type === "entityMap") {
           // A map whose VALUES are entity ids (a timeline director's track
           // bindings). Same problem as a plain entity field, one level down —

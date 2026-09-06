@@ -1,3 +1,4 @@
+import { createVfxIrradianceField } from "./vfxIrradiance.js";
 // GISystem — engine runtime for the Radiance Cascades GI module.
 //
 // VOXEL-FREE ARCHITECTURE: per-mesh SDFs are the sole authored scene
@@ -2149,6 +2150,7 @@ export class GISystem {
         // only this walk had one of them.
         const hiddenButPresent =
           child.userData.batchedInto || child.userData.mergedInto || child.userData.cameraHidden;
+        if (child.userData.clothHidden) return;
         if (child.visible === false && !hiddenButPresent) return;
         const skip =
           !child.isMesh ||
@@ -2376,6 +2378,8 @@ export class GISystem {
     }
     this.pathTracer?.dispose();
     this.#dispose();
+    this._vfxIrradianceField?.dispose();
+    this._vfxIrradianceField = null;
     // Quality rebuilds use private #dispose and may opportunistically reuse
     // the active upload's immutable static-BVH words. Public disposal ends
     // that session; even the weak lookup/key should disappear with it.
@@ -3539,18 +3543,57 @@ export class GISystem {
             armed ? describeSkySource(source) : null,
             this._giEnvMissRotU.value,
             source ? `${source.uuid}:${source.version}` : null,
+            // §11.53: the HDRI's sun is not sky — srcSkyBins.js's header. Read
+            // per poll and part of the table key, so the hatch flips live.
+            { extractSun: globalThis.__giSkySunExtract !== false },
           );
           const receipt = ran ? this._giSkyBinTables.last : null;
           // One line per integration, and only for a real panorama (the 1×1
           // flat sky and the placeholder are not worth a log).
           if (receipt && receipt.width > 1) {
+            const sun = receipt.sun;
             console.info(
               `[gi] sky: environment integrated per bin — ${receipt.width}×${receipt.height} ` +
                 `${receipt.half ? "half" : "float"} equirect → bin widths ${receipt.widths.join("/")} in ` +
-                `${receipt.ms.toFixed(1)} ms; up-facing irradiance luma ${receipt.upIrradianceLuma.toFixed(3)}, ` +
-                `brightest bin ${receipt.peakBinLuma.toFixed(2)} (a sun reads as one bin far above the rest; ` +
-                `the old per-bin point tap could not see it). \`__giSkyBins = false\` restores the tap.`,
+                `${receipt.ms.toFixed(1)} ms; up-facing irradiance luma ${receipt.upIrradianceLuma.toFixed(3)}` +
+                (sun?.present
+                  ? ` (sky ${receipt.skyUpIrradianceLuma.toFixed(3)} + sun ${sun.upIrradiance.toFixed(3)})`
+                  : "") +
+                `, brightest bin ${receipt.peakBinLuma.toFixed(2)}. \`__giSkyBins = false\` restores the per-bin texture tap.`,
             );
+            if (sun?.present) {
+              // §11.53 — where the map's sun is, and who delivers it now.
+              const suns = (this._lightObjects ?? []).filter(
+                (l) => l?.isDirectionalLight && l.visible !== false && (l.intensity ?? 0) > 0,
+              );
+              const aimOf = (l) => {
+                l.updateWorldMatrix(true, false);
+                l.target?.updateWorldMatrix?.(true, false);
+                const from = new THREE.Vector3().setFromMatrixPosition(l.matrixWorld);
+                const to = l.target ? new THREE.Vector3().setFromMatrixPosition(l.target.matrixWorld) : new THREE.Vector3();
+                const d = from.sub(to);
+                if (d.lengthSq() < 1e-8) d.set(0, 1, 0);
+                d.normalize();
+                return `elevation ${((Math.asin(Math.max(-1, Math.min(1, d.y))) * 180) / Math.PI).toFixed(1)}°, ` +
+                  `azimuth ${((Math.atan2(d.z, d.x) * 180) / Math.PI).toFixed(1)}°`;
+              };
+              const where = `elevation ${sun.elevationDeg.toFixed(1)}°, azimuth ${sun.azimuthDeg.toFixed(1)}°`;
+              console.info(
+                `[gi] sky: the environment carries a SUN — ${(sun.share * 100).toFixed(0)} % of its up-facing ` +
+                  `irradiance in a ${(2 * sun.radiusDeg).toFixed(1)}°-wide spot at ${where} (radiance above ` +
+                  `${sun.ceiling.toFixed(1)} = 8 × the map's p99.9 luma). ` +
+                  (sun.extracted
+                    ? "EXTRACTED from the diffuse sky: a spot that narrow cannot ride a 4.5°–36° bin — it composited as " +
+                      "shadowless blotches of per-probe transmittance on every surface facing it. The sky term carries " +
+                      "the rest; the sun is a Sun light's job — " +
+                      (suns.length
+                        ? `${suns.length === 1 ? "yours points from" : `${suns.length} directional lights, the first from`} ` +
+                          `${aimOf(suns[0])} (aim it at ${where} to match the HDRI's shadows). `
+                        : `there is no active directional light: add a Sun light from ${where} to put it back. `) +
+                      "`__giSkySunExtract = false` keeps it in the bins."
+                    : "KEPT in the bins (`__giSkySunExtract = false` is set) — expect shadowless blotches on surfaces facing it."),
+              );
+            }
           }
         }
       }
@@ -4330,7 +4373,7 @@ export class GISystem {
               // for real instead of thinking this skip was a finished round.
             } else {
               due.rec.rounds = round + 1;
-              giCompute(renderer, [armed.capture.compute, armed.blur.compute]);
+              giCompute(renderer, [armed.capture.traceCompute, armed.capture.compute, armed.blur.compute]);
               due.rec.dirty = false;
               due.rec.capturedAt = this._frame;
             }
@@ -5135,6 +5178,10 @@ export class GISystem {
         );
         this._srcSwapHold = null;
       }
+    }
+    if (this._vfxGatherCompute && this._vfxIrradianceField?.updateBounds(this.engine.scene, renderer)) {
+      giCompute(renderer, this._vfxGatherCompute, { deferrable: true });
+      if (giBuiltNodes.has(this._vfxGatherCompute) && !giNodesPending([this._vfxGatherCompute]) && !giSkippedComputes.has(this._vfxGatherCompute)) this._vfxIrradianceField.ready.value = 1;
     }
     if (!this._firstGatherLogged) {
       const gatherNode = this.state?.screen?.srcProbes?.gather?.compute ?? null;
@@ -8030,6 +8077,12 @@ export class GISystem {
                   // Null when there are no slots at all, so the split cannot
                   // arm against an empty array and silently match slot −1.
                   sunSlot: lightSlots ? sunSlot : null,
+                  // §11.54: the water caustic lens, as a multiplier on every
+                  // DIRECTIONAL slot's visibility at a hit. Empty (and then not
+                  // one node of it is built) until a scene has water; the slots
+                  // themselves are engine-owned and outlive any water surface,
+                  // so this list is read once per GI build and stays valid.
+                  caustics: this.engine?.waterSlots?.slots ?? [],
                   // §11.10: the sun's shadow map at hits (see the bundle).
                   sunShadow: lightSlots && globalThis.__giSunShadowMap !== false ? sunShadow : null,
                   emitters: emitterSlots ?? [],
@@ -8085,6 +8138,7 @@ export class GISystem {
       inputs.gather = srcProbes?.gather
         ? (point, normal) => srcProbes.gather.gatherAt(point, normal).irradiance
         : null;
+      this.#bindVfxGather(light, srcProbes?.gather?.gatherAt ?? null);
       // ── §13 F3: THE FAR-FIELD FALLBACK (only when the detail box is armed) ─
       // Small scenes never set `_detailExtent`, so they compile no term and
       // build bit-identical (F1 gate a). `__giFarField = false` is the kill
@@ -10075,6 +10129,7 @@ export class GISystem {
     screen.gather = screen.srcProbes?.gather
       ? (point, normal) => screen.srcProbes.gather.gatherAt(point, normal).irradiance
       : null;
+    this.#bindVfxGather(state.light, screen.srcProbes?.gather?.gatherAt ?? null);
     // §12.71b v2: the glossy input re-derives from the srcProbes the resize
     // just rebuilt, for exactly the reason the two lines above do — a stale
     // texture node points at a disposed target.
@@ -10949,6 +11004,7 @@ export class GISystem {
       // cone marcher and is routinely a boot's slowest single compile
       // (11.6 s / 159 kB WGSL on the gate rig) — it must never read
       // "gi:unnamed" in the slowest-pipeline ledger.
+      capture.traceCompute.__giPassName = "reflProbeTrace";
       capture.compute.__giPassName = "reflProbeCapture";
       blur.compute.__giPassName = "reflProbeBlur";
       screen.reflProbes = {
@@ -14909,6 +14965,7 @@ export class GISystem {
     screen.gather = screen.srcProbes?.gather
       ? (point, normal) => screen.srcProbes.gather.gatherAt(point, normal).irradiance
       : null;
+    this.#bindVfxGather(state.light, screen.srcProbes?.gather?.gatherAt ?? null);
     // §12.71b v2: same re-derive as the resize path — the glossy chain's
     // textures died with the old srcProbes.
     screen.screenRadiance = screen.srcProbes?.glossy?.node ?? null;
@@ -15794,6 +15851,11 @@ export class GISystem {
 
   #dispose({ preserveMaterialLight = false } = {}) {
     const state = this.state;
+    releaseComputeNodes(this.engine.renderer, this._dynSet?.gpuGridComputes?.() ?? []);
+    if (this._vfxGatherCompute) releaseComputeNodes(this.engine.renderer, [this._vfxGatherCompute]);
+    this._vfxGatherCompute = null;
+    this._vfxGatherAt = null;
+    if (this._vfxIrradianceField) this._vfxIrradianceField.ready.value = 0;
     // A pending candidate belongs to exactly one state generation.
     this._pendingResolveResize = null;
     if (!state) return null;
@@ -17608,6 +17670,23 @@ export class GISystem {
   // -------------------------------------------------------------------------
   // Scene collection
 
+  #bindVfxGather(light, gatherAt) {
+    if (!light || this._vfxGatherAt === gatherAt) return;
+    this._vfxGatherAt = gatherAt;
+    if (this._vfxGatherCompute) releaseComputeNodes(this.engine.renderer, [this._vfxGatherCompute]);
+    const field = this._vfxIrradianceField ??= createVfxIrradianceField();
+    field.ready.value = 0;
+    this._vfxGatherCompute = gatherAt ? field.build(gatherAt) : null;
+    const receiver = gatherAt ? field.sample : null;
+    const changed = light.vfxIrradiance !== receiver;
+    light.vfxIrradiance = receiver;
+    if (changed) this.engine.scene.traverse((object) => {
+      for (const material of Array.isArray(object.material) ? object.material : [object.material]) {
+        if (material?.userData?.giParticle || material?.userData?.giWater) material.needsUpdate = true;
+      }
+    });
+  }
+
   #collectMeshes() {
     const meshes = [];
     // Per-bucket material tally (see giRoughnessBucketOf): logged at build so
@@ -17630,6 +17709,9 @@ export class GISystem {
       // `cameraHidden` = hidden by LOD/occlusion only (see Engine's visibility
       // resolve): the mesh is still part of the world, so it must stay in the
       // field or the GI mesh set becomes a function of the camera.
+      // Cloth replaces this source with a GPU-deformed surface. Camera/merge
+      // ownership must never reintroduce its undeformed plane into static GI.
+      if (object.userData.clothHidden) return;
       if (object.visible === false && !object.userData.batchedInto && !object.userData.cameraHidden) return;
       // InstancedMesh IS collected now — it contributes one atlas instance
       // slot per live instance, all sharing a single baked tile (see
@@ -17769,7 +17851,7 @@ export class GISystem {
           // only: a rigid mover is either adopted as an exact dynamic object
           // or re-voxelized, and both keep a coherent surface the position
           // guard can already validate.
-          if (object.isSkinnedMesh || object.morphTargetInfluences?.length) {
+          if (object.isSkinnedMesh || object.morphTargetInfluences?.length || object.userData.vfxSimulation) {
             object.layers.enable(GI_DYNAMIC_LAYER);
             dynamicSurfaces.push(object);
           } else {
@@ -17780,7 +17862,9 @@ export class GISystem {
         // baking it into the SDF field would make a fog box shadow the room
         // like a solid crate.
         const isVolume = material?.isVolumeNodeMaterial || material?.userData?.isVolumeMaterial;
-        if (position && material && !material.transparent && !isVolume && !editorOnly && triCount <= MAX_TRIS_PER_MESH) {
+        // GPU surface solvers keep CPU vertices at rest for picking. Baking
+        // those into the static field would leave phantom cloth/water there.
+        if (position && material && !material.transparent && !isVolume && !editorOnly && !object.userData.vfxSimulation && triCount <= MAX_TRIS_PER_MESH) {
           meshes.push(object);
         } else if (triCount > MAX_TRIS_PER_MESH) {
           console.warn(`[gi] skipping "${object.name || "mesh"}" (${Math.round(triCount)} tris > cap)`);
@@ -18953,6 +19037,7 @@ export class GISystem {
     // capsules each via `__giSkinnedProxyCapsules`, not a broken header.
     let proxySlots = 0;
     for (const g of this.#skinnedProxyGroups()?.values() ?? []) proxySlots += g.segments.length;
+    proxySlots += (this._dynamicSurfaces ?? []).filter(mesh => mesh.userData?.giGpuGrid && mesh.userData.vfxSimulation === "cloth").length;
     const dynMaxObjects = Number(globalThis.__giMaxDynamicObjects) ||
       Math.min(64, ({ low: 16, medium: 16, high: 24, ultra: 32 }[quality] ?? 16) + proxySlots);
     const dynWords = dynObjectsOn ? dynHeaderWords(dynMaxObjects) + dynPoolWords : 0;
@@ -19907,6 +19992,28 @@ export class GISystem {
    * async-compile reality the spawn-blink guard documents), and the deferred
    * voxel-slot parking that makes adoption a one-frame voxel→exact swap.
    */
+  #refreshGpuGridContributors(dyn) {
+    const wanted = new Set();
+    this.engine.scene?.traverseVisible(mesh => {
+      const grid = mesh.userData?.giGpuGrid;
+      if (!mesh.isMesh || !grid || mesh.userData.vfxSimulation !== "cloth") return;
+      const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+      if (!material || material.transparent) return;
+      const key = `gpu-cloth:${mesh.uuid}`;
+      wanted.add(key);
+      if (dyn.has(key)) return;
+      const sphere = mesh.geometry.boundingSphere;
+      const extent = sphere ? sphere.radius + sphere.center.length() : 1;
+      const shape = { type: "mesh", center: new THREE.Vector3(), halfExtents: new THREE.Vector3().setScalar(extent), gpuGrid: grid };
+      if (!dyn.adopt(key, mesh, null, shape)) {
+        mesh.userData.giContributorError = "Cloth GI dynamic geometry budget exhausted.";
+      } else delete mesh.userData.giContributorError;
+    });
+    const stale = [];
+    dyn.forEachEntry(entry => { if (entry.gpuGrid && !wanted.has(entry.key)) stale.push(entry.key); });
+    for (const key of stale) dyn.release(key);
+  }
+
   #refreshDynamicObjects(renderer, state) {
     const dyn = this._dynSet;
     if (!dyn?.enabled) return;
@@ -19915,6 +20022,7 @@ export class GISystem {
     // guard below is what actually protects it — this ordering just keeps the
     // adopt/release bookkeeping in one place per frame).
     this.#refreshSkinnedProxies(dyn, state?.volume?.occupancyField);
+    this.#refreshGpuGridContributors(dyn);
     // LIVE TAG FLIPS (the Mesh component's "GI Dynamic" dropdown → the mesh's
     // userData): an adopted mover whose tag no longer matches its
     // representation releases its exact slot. "voxel" returns it to the voxel
@@ -19940,7 +20048,7 @@ export class GISystem {
         // adopt/release ping-pong on the most expensive object in the scene.
         // A tag opt-out ("static" / "voxel") is honoured by the proxy refresh
         // itself, so nothing is lost by skipping here.
-        if (entry.matrixOf) return;
+        if (entry.matrixOf || entry.gpuGrid) return;
         // Two axes, two release reasons: MOBILITY flipped to static (or the
         // mover rested out of an "auto" adoption), or the TRACE representation
         // no longer matches what the entry was adopted as.

@@ -1,0 +1,38 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three/webgpu';
+import {Entity} from '/src/engine/Entity.js';
+import {ClothComponent} from '/src/engine/components/ClothComponent.js';
+const check=(ok,message)=>{if(!ok)throw new Error(message);console.log('CLOTH-ANCHORS:',message);};
+try {
+ const adapter=await navigator.gpu.requestAdapter(),device=await adapter.requestDevice({requiredLimits:{maxStorageBuffersPerShaderStage:8}}),errors=[];
+ device.addEventListener('uncapturederror',e=>{errors.push(e.error.message);console.error('WebGPU validation:',e.error.message);});
+ const renderer=new THREE.WebGPURenderer({device});await renderer.init();renderer.setSize(128,128);document.body.append(renderer.domElement);
+ const engine={renderer,entities:new Map(),onUpdate:()=>()=>{},on:()=>()=>{},emit:()=>{},deltaTime:1/60};
+ const entity=new Entity(engine,{id:'cloth'}),target=new Entity(engine,{id:'anchor'});engine.entities.set(entity.id,entity);engine.entities.set(target.id,target);
+ const targetParent=new THREE.Group();targetParent.position.set(2,1,-1);targetParent.rotation.y=.4;targetParent.scale.set(1.5,2,.7);targetParent.add(target.object3D);
+ target.object3D.position.set(.2,.5,.3);target.object3D.rotation.z=.3;
+ entity.object3D.position.set(-1,2,0);entity.object3D.rotation.z=.2;entity.object3D.scale.set(1.2,.8,1.5);
+ const source=new THREE.Mesh(new THREE.PlaneGeometry(2,2),new THREE.MeshStandardNodeMaterial({side:THREE.DoubleSide}));source.position.set(.1,.2,.3);entity.object3D.add(source);
+ entity.components.set('mesh',{mesh:source,props:{geometry:'plane'},enabled:true});
+ const anchors=[{entityId:target.id,uv:[1,1],offset:[.5,.2,-.1]},{entityId:target.id,uv:[0,0],offset:[-.5,.2,-.1]}];
+ const cloth=new ClothComponent({resolution:8,anchors,pinning:'top',gravity:9.81,wind:2,sceneCollision:true});cloth.entity=entity;entity.components.set('cloth',cloth);cloth.onAttach();
+ const sim=cloth.simulation;await renderer.computeAsync(sim.init);
+ const sample=async(dt)=>{sim.tick(renderer,dt);await device.queue.onSubmittedWorkDone();return new Float32Array(await renderer.getArrayBufferAsync(sim.positions.value));};
+ const expectAnchor=(data,anchor)=>{
+  const vertex=Math.round(anchor.uv[1]*7)*8+Math.round(anchor.uv[0]*7);
+  const actual=new THREE.Vector3().fromArray(data,vertex*4).applyMatrix4(sim.mesh.matrixWorld);
+  target.object3D.updateWorldMatrix(true,false,true);
+  const expected=new THREE.Vector3(...anchor.offset).applyMatrix4(target.object3D.matrixWorld);
+  check(actual.distanceTo(expected)<.0001,`vertex ${vertex} follows target world offset (${actual.distanceTo(expected)})`);
+ };
+ let data=await sample(1/60);anchors.forEach(a=>expectAnchor(data,a));
+ targetParent.position.x+=1.7;target.object3D.rotation.x=.5;
+ for(let i=0;i<12;i++)data=await sample(1/60);anchors.forEach(a=>expectAnchor(data,a));
+ check(Math.abs(data[4*3+1]-2)<.0001,'preset top pin retained beside entity anchors');
+ targetParent.position.y+=.4;data=await sample(0);anchors.forEach(a=>expectAnchor(data,a));
+ const before=data[63*4+1];engine.entities.delete(target.id);data=await sample(1/60);check(Math.abs(data[63*4+1]-before)>.000001,'deleted target releases its vertex');
+ engine.entities.set(target.id,target);cloth.props.anchors=[];cloth.onPropChanged('anchors');data=await sample(1/60);check(cloth.simulation===sim,'anchor edit does not restart/reallocate solver');
+ await device.queue.onSubmittedWorkDone();check(!errors.length,'portable eight-storage device has no GPU errors');cloth.onDetach();
+ console.log('CLOTH-ANCHORS PASS');globalThis.__VFX_SMOKE_RESULT__={pass:true};
+}catch(error){console.error(error.stack);globalThis.__VFX_SMOKE_RESULT__={pass:false,error:String(error.stack)};}
+</script></body></html>

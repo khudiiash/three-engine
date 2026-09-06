@@ -6,6 +6,8 @@ import {
   Controls,
   MiniMap,
   addEdge,
+  applyNodeChanges,
+  applyEdgeChanges,
   useNodesState,
   useEdgesState,
   useReactFlow,
@@ -82,8 +84,8 @@ export const GraphEditor = forwardRef(function GraphEditor(
   },
   ref,
 ) {
-  const [nodes, setNodes, onNodesChange] = useNodesState([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [nodes, setNodes] = useNodesState([]);
+  const [edges, setEdges] = useEdgesState([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [canvasMenu, setCanvasMenu] = useState(null);
   const [nodeMenu, setNodeMenu] = useState(null);
@@ -132,6 +134,7 @@ export const GraphEditor = forwardRef(function GraphEditor(
   /** Commits a graph mutation: updates state, records history, notifies. */
   const commit = useCallback(
     (nextNodes, nextEdges, meta = {}) => {
+      live.current = { nodes: nextNodes, edges: nextEdges };
       setNodes(nextNodes);
       setEdges(nextEdges);
       history.push(nextNodes, nextEdges, meta.gesture ? `${meta.nodeId ?? ""}:${meta.param ?? ""}` : null);
@@ -144,6 +147,7 @@ export const GraphEditor = forwardRef(function GraphEditor(
   const load = useCallback(
     (graph, { record = false } = {}) => {
       const flow = graphToFlow(graph, { knownType: (t) => !!registry.describe(t) });
+      live.current = flow;
       setNodes(flow.nodes);
       setEdges(flow.edges);
       if (record) {
@@ -435,32 +439,30 @@ export const GraphEditor = forwardRef(function GraphEditor(
 
       const structural = allowed.some((c) => c.type === "remove" || c.type === "add");
       const moved = allowed.some((c) => c.type === "position" && c.dragging === false);
-      onNodesChange(allowed);
+      const applied = applyNodeChanges(allowed, current);
+      live.current = { ...live.current, nodes: applied };
+      setNodes(applied);
       if (!structural && !moved) return;
-      // React Flow applies changes asynchronously relative to us, so recompute
-      // the post-change list here rather than reading stale state.
-      setNodes((applied) => {
-        history.push(applied, live.current.edges, null);
-        setHistoryTick((t) => t + 1);
-        emit(applied, live.current.edges, { kind: structural ? "structure" : "position" });
-        return applied;
-      });
+      // Notify from the event handler, never a React state updater: updater
+      // functions can run during render, when the parent cannot be updated.
+      history.push(applied, live.current.edges, null);
+      setHistoryTick((t) => t + 1);
+      emit(applied, live.current.edges, { kind: structural ? "structure" : "position" });
     },
-    [onNodesChange, setNodes, registry, history, emit],
+    [setNodes, registry, history, emit],
   );
 
   const guardedEdgesChange = useCallback(
     (changes) => {
-      onEdgesChange(changes);
+      const applied = applyEdgeChanges(changes, live.current.edges);
+      live.current = { ...live.current, edges: applied };
+      setEdges(applied);
       if (!changes.some((c) => c.type === "remove")) return;
-      setEdges((applied) => {
-        history.push(live.current.nodes, applied, null);
-        setHistoryTick((t) => t + 1);
-        emit(live.current.nodes, applied, { kind: "structure", reason: "disconnect" });
-        return applied;
-      });
+      history.push(live.current.nodes, applied, null);
+      setHistoryTick((t) => t + 1);
+      emit(live.current.nodes, applied, { kind: "structure", reason: "disconnect" });
     },
-    [onEdgesChange, setEdges, history, emit],
+    [setEdges, history, emit],
   );
 
   // --- frames carry their contents ----------------------------------------
@@ -481,12 +483,12 @@ export const GraphEditor = forwardRef(function GraphEditor(
       const dx = node.position.x - drag.origin.x;
       const dy = node.position.y - drag.origin.y;
       const byId = new Map(drag.contained.map((c) => [c.id, c]));
-      setNodes((nds) =>
-        nds.map((n) => {
+      const next = live.current.nodes.map((n) => {
           const c = byId.get(n.id);
           return c ? { ...n, position: { x: c.position.x + dx, y: c.position.y + dy } } : n;
-        }),
-      );
+        });
+      live.current = { ...live.current, nodes: next };
+      setNodes(next);
     },
     [setNodes],
   );
@@ -564,6 +566,7 @@ export const GraphEditor = forwardRef(function GraphEditor(
   const applyRestored = useCallback(
     (state) => {
       if (!state) return;
+      live.current = { nodes: state.nodes, edges: state.edges };
       setNodes(state.nodes);
       setEdges(state.edges);
       setHistoryTick((t) => t + 1);

@@ -263,6 +263,21 @@ check("a light's shadow camera is taken OUT of three's mask-inheritance branch",
 
 // ---- what it must NOT absorb ------------------------------------------------
 
+check("GPU cloth and water keep their deforming shadow casters", () => {
+  const { engine } = makeScene({ count: 4 });
+  const effects = ["cloth", "water"].map((kind) => {
+    const mesh = makeMesh(0);
+    mesh.userData.vfxSimulation = kind;
+    engine.scene.add(mesh);
+    return mesh;
+  });
+  step(engine);
+  for (const mesh of effects) {
+    assert.equal(mesh.castShadow, true);
+    assert.equal(mesh.userData.shadowMergedInto, undefined, "CPU rest positions cannot replace GPU deformation");
+  }
+});
+
 check("a SKINNED caster is left alone", () => {
   const { engine } = makeScene({ count: 4 });
   const skinned = new THREE.SkinnedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial());

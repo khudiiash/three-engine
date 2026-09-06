@@ -1,10 +1,15 @@
+import { WATER_MATERIAL_PATH } from "../../engine/builtinMaterials.js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Plus, Trash2, Box, Video, Lightbulb, Sparkles, FileCode2, Package, Circle, ChevronRight, Monitor, Type, Image as ImageIcon, MousePointerClick, Rows3, ScrollText, Square, Eye, EyeOff, Play, Pause, Mountain, Spline, Search, X, ListChecks, Crosshair, Building2, PersonStanding } from "lucide-react";
 import { useSceneStore } from "../store/sceneStore.js";
 import { useSelectionStore, selectedIdSet } from "../store/selectionStore.js";
-import { buildSearchIndex, sortMatchIds } from "../hierarchySearch.js";
+import { buildSearchIndex, sortMatchIds, highlightFor } from "../hierarchySearch.js";
+import { parseQuery } from "../queryLang.js";
+// Written by the shared search-recents store; the hierarchy, the asset panel
+// and Ctrl+F all record into the same list.
+import { noteSearch } from "../searchRecents.js";
 import { chordOf, ownsKeyboard } from "../keyScope.js";
-import { useModulesStore } from "../modules.js";
+import { useModulesStore, setModuleEnabled } from "../modules.js";
 import { commandBus } from "../commands/CommandBus.js";
 import {
   BatchCommand,
@@ -95,6 +100,15 @@ const COMMON_PRESETS = [
   // remember which component makes it emit" — an emitter is a thing you place,
   // not a behaviour you bolt on. The component's own defaults drive the graph.
   { label: "Particles", Icon: Sparkles, color: "#b784f5", spec: { name: "Particles", components: [{ type: "particles", props: {} }] } },
+  { label: "VFX", Icon: Sparkles, color: "#c596f5", spec: { name: "VFX", components: [{ type: "vfx", props: {} }] } },
+  { label: "Cloth", Icon: Square, color: "#d799cd", spec: { name: "Cloth", components: [{ type: "mesh", props: { geometry: "plane" } }, { type: "cloth", props: { gust: 3, pinning: "topCorners", fabric: "cotton" } }] } },
+  // WATER IS A VOLUME, SO IT IS CREATED AS A BOX. The box IS the body of water:
+  // its lid carries the wave heightfield, its sides and floor are the water
+  // itself, and a camera crossing any of them is underwater by construction
+  // rather than by a screen-space toggle. A Plane still works and still means
+  // "surface plus `waterDepth` below it" — every existing water scene is
+  // unchanged — but a new one starts as the thing you can swim in.
+  { label: "Water", Icon: Box, color: "#69b9ed", spec: { name: "Water", transform: { scale: [8, 2, 8] }, components: [{ type: "mesh", props: { geometry: "box", material: WATER_MATERIAL_PATH, collision: "none", castShadow: false } }, { type: "water", props: { amplitude: 0, waveHeight: .15, waveLength: .5, choppiness: .35, rippleStrength: .25 } }] } },
   // A path is a placeable object, not a behaviour bolted onto an empty — the
   // same argument as Particles. Roads, patrol routes and camera rails all
   // start here and differ only in what you point at it afterwards.
@@ -513,11 +527,16 @@ function collectDescendants(id, entities) {
  * `<mark>` so the matched fragment pops visually. The original casing of
  * `name` is preserved in the output. Empty query renders the plain name.
  *
+ * `query` is the highlight text hierarchySearch.highlightFor computed for the
+ * whole query at panel level — the raw string for a plain query, the first
+ * term's name text for a structured one, and "" when the name had nothing to
+ * do with the match.
+ *
  * Only used inside a match row — it's the "this is why this row matched"
- * signal. Tiers 2/3 (component-name matches) don't substring-highlight
- * the entity name (the match was on a component type, not on the name),
- * so the highlight is suppressed for those tiers to avoid confusing the
- * user into thinking the name contained the query.
+ * signal. Tiers 2/3 (component-name matches), tier 5 (filter-only matches)
+ * and `tag:` matches don't substring-highlight the entity name (the match
+ * was not on the name), so the highlight is suppressed for those tiers to
+ * avoid confusing the user into thinking the name contained the query.
  */
 function HighlightedName({ name, query, tier }) {
   if (!query || tier == null || tier >= 2) {
@@ -780,7 +799,7 @@ function EntityRow({
   draggingIds,
   onRowPointerDown,
   searchMatches,
-  searchQuery,
+  searchHighlight,
   onPickSearchResult,
 }) {
   const entity = useSceneStore((s) => s.entities[id]);
@@ -897,7 +916,7 @@ function EntityRow({
           <>
             <EntityIcon components={entity.components} />
             <span className={`entity-name ${prefab.kind ? `prefab-${prefab.kind}` : ""}`}>
-              <HighlightedName name={entity.name} query={searchQuery} tier={searchMatch?.tier ?? null} />
+              <HighlightedName name={entity.name} query={searchHighlight} tier={searchMatch?.tier ?? null} />
             </span>
             {prefab.kind === "root" && (
               <span
@@ -939,7 +958,7 @@ function EntityRow({
             draggingIds={draggingIds}
             onRowPointerDown={onRowPointerDown}
             searchMatches={searchMatches}
-            searchQuery={searchQuery}
+            searchHighlight={searchHighlight}
             onPickSearchResult={onPickSearchResult}
           />
         ))}
@@ -1368,6 +1387,47 @@ export function HierarchyPanel() {
   // anything that isn't a match, so the user's saved `collapsedIds` is
   // simply ignored. Clearing the search restores the exact prior state.
 
+  // What a row should `<mark>` in its name. Computed ONCE here, not per row:
+  // it is the same string for every hit, and it is "" whenever the query
+  // matched on something other than the name (a filter-only term, a `tag:`
+  // term, a component type), where highlighting a fragment of the name would
+  // invent a reason for the match.
+  const searchHighlight = useMemo(
+    () => highlightFor(parseQuery(searchQuery), searchQuery.trim()),
+    [searchQuery],
+  );
+
+  // A query becomes a "recent" on Enter, or after 900 ms of not typing —
+  // recording every keystroke would fill the list with the half-typed
+  // fragments of every query that ever crossed the box. The timer lives in a
+  // ref because it is reset on the keystroke path, and the effect's cleanup is
+  // what clears it on unmount, on Escape, and before the next character starts
+  // its own countdown.
+  const searchNoteTimerRef = useRef(null);
+  const searchQueryRef = useRef(searchQuery);
+  searchQueryRef.current = searchQuery;
+  const noteCurrentSearch = useCallback(() => {
+    const q = searchQueryRef.current.trim();
+    if (q) noteSearch(q);
+  }, []);
+  const cancelPendingSearchNote = useCallback(() => {
+    if (searchNoteTimerRef.current) {
+      clearTimeout(searchNoteTimerRef.current);
+      searchNoteTimerRef.current = null;
+    }
+  }, []);
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      cancelPendingSearchNote();
+      return undefined;
+    }
+    searchNoteTimerRef.current = setTimeout(() => {
+      searchNoteTimerRef.current = null;
+      noteCurrentSearch();
+    }, 900);
+    return cancelPendingSearchNote;
+  }, [searchQuery, noteCurrentSearch, cancelPendingSearchNote]);
+
   // Sorted match ids for the "X results" pill. Tier-0/1 (name) first, then
   // tier-2/3 (component), with name as the stable tiebreaker.
   const sortedMatchIds = useMemo(() => sortMatchIds(searchMatches, entities), [searchMatches, entities]);
@@ -1531,6 +1591,11 @@ export function HierarchyPanel() {
     const selected = useSelectionStore.getState().ids;
     const parentId = selected.length === 1 ? selected[0] : null;
     let prepared = spec;
+    const simulation = spec.components?.find((component) => ["particles", "cloth", "water", "vfx"].includes(component.type));
+    if (simulation) {
+      try { await setModuleEnabled(simulation.type, true); }
+      catch (error) { console.error(`Could not enable ${simulation.type}: ${error.message}`); return; }
+    }
     // A character is a rig plus two script FILES, so it cannot be expressed as
     // a spec — creating it writes the scripts (or reuses the ones already in
     // the project) and builds the entity itself.
@@ -1573,13 +1638,14 @@ export function HierarchyPanel() {
     // "Add Mesh at Cursor" behavior. Parent override still wins: when the
     // user explicitly adds inside a selected entity that entity owns the
     // transform, so we keep the default origin in that branch.
-    if (!parentId && !spec.transform) {
+    if (!parentId && !spec.transform?.position) {
       prepared = {
         ...prepared,
         transform: {
           position: getCursor3DPosition().toArray(),
           rotation: [0, 0, 0],
           scale: [1, 1, 1],
+          ...prepared.transform,
         },
       };
     }
@@ -1673,13 +1739,14 @@ export function HierarchyPanel() {
             ref={searchInputRef}
             className="hierarchy-search-input"
             type="text"
-            placeholder="Search name, component, tag:…"
-            title="Search by name or component type. Prefix with tag: to search tags only. Ctrl+Shift+A selects every result."
+            placeholder="Search…  Lamp...  mesh.castShadow=true  Mesh > light"
+            title={"Search by name, component type or tag.\nName:    Lamp (contains) \u00b7 Lamp... (starts with) \u00b7 ...Box (ends with) \u00b7 \"red lamp\" (quote spaces)\nFilter:  mesh.castShadow=true \u00b7 collider.shape=convex \u00b7 light.intensity>1 \u00b7 enabled=false\n         Lamp?enabled=true&light.intensity>1 combines a name with filters\nHas:     M...?cloth (has a cloth component) \u00b7 ?collider \u00b7 ?!sound (has none)\nInside:  Mesh > light (lights under something named Mesh) \u00b7 chains: A > B > C\n         the > needs spaces \u2014 light.intensity>1 is a comparison\nCtrl+Shift+A selects every result."}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Escape" && searchQuery) {
                 e.stopPropagation();
+                cancelPendingSearchNote();
                 setSearchQuery("");
                 return;
               }
@@ -1701,11 +1768,15 @@ export function HierarchyPanel() {
                 moveCursor(1);
                 return;
               }
-              // Enter on a non-empty query jumps straight to the top match:
+              // Enter commits the query to recents whether or not it matched
+              // anything, then — on a hit — jumps straight to the top match:
               // clear the search, uncollapse the path to that entity, and
               // select it. Mirrors double-click but keeps the keyboard flow
               // for "type → Enter → land" without a mouse.
-              if (e.key === "Enter" && sortedMatchIds.length > 0) {
+              if (e.key === "Enter") {
+                cancelPendingSearchNote();
+                noteCurrentSearch();
+                if (sortedMatchIds.length === 0) return;
                 e.preventDefault();
                 e.stopPropagation();
                 revealEntity(sortedMatchIds[0]);
@@ -1803,7 +1874,7 @@ export function HierarchyPanel() {
             draggingIds={draggingIds}
             onRowPointerDown={onRowPointerDown}
             searchMatches={searchMatches}
-            searchQuery={searchQuery}
+            searchHighlight={searchHighlight}
             onPickSearchResult={revealEntity}
           />
         ))}

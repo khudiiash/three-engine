@@ -1,0 +1,111 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>VFX active GI smoke</title></head><body><canvas id="view"></canvas><script type="module">
+const assert = (value, message) => { if (!value) throw new Error(message); };
+try {
+  globalThis.__editorKeepRendering = true;
+  globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 };
+  globalThis.__giSrcProbes = true;
+  const { Engine, THREE, registerBuiltInComponents } = await import('/src/engine/index.js');
+  await import('/src/modules/index.js');
+  const { enableEngineModule } = await import('/src/engine/modules.js');
+  const { DEFAULT_PARTICLE_GRAPH } = await import('/src/engine/particleGraph.js');
+  const { GI_DYNAMIC_LAYER } = await import('/src/engine/editorLayers.js');
+  registerBuiltInComponents();
+  const engine = new Engine(); globalThis.__VFX_GI_ENGINE__ = engine;
+  engine.setSize(320, 240); await engine.init(document.querySelector('#view'));
+  const renderer = engine.renderer;
+  assert(renderer.backend.isWebGPUBackend, 'real WebGPU required');
+  assert(renderer.backend.device.limits.maxStorageBuffersPerShaderStage === 8, 'portable storage limit');
+  const errors = [];
+  const device = renderer.backend.device;
+  const sourceOf = new WeakMap();
+  const createShader = device.createShaderModule.bind(device);
+  device.createShaderModule = (descriptor) => { const module = createShader(descriptor); sourceOf.set(module, descriptor.code); return module; };
+  const createPipeline = device.createComputePipelineAsync.bind(device);
+  device.createComputePipelineAsync = (descriptor) => {
+    const source = sourceOf.get(descriptor.compute.module) ?? '';
+    const bindings = source.split('\n').filter(line => line.includes('var<storage'));
+    if (bindings.length > 8) console.error('OVER-BUDGET KERNEL', bindings.join('\n'), source.slice(-2500));
+    return createPipeline(descriptor);
+  };
+  renderer.backend.device.addEventListener('uncapturederror', event => { errors.push(event.error.message); console.error('WebGPU validation error:', event.error.message); });
+  await enableEngineModule(engine, 'gi');
+  for (const id of ['vfx', 'cloth', 'water']) await enableEngineModule(engine, id);
+  const floor = new THREE.Mesh(new THREE.BoxGeometry(8, .2, 8), new THREE.MeshStandardNodeMaterial({ color: '#777777', roughness: 1 }));
+  floor.position.y = -.3; engine.scene.add(floor);
+  const wall = new THREE.Mesh(new THREE.BoxGeometry(8, 3, .2), new THREE.MeshStandardNodeMaterial({ color: '#ffffff', roughness: 1 }));
+  wall.position.set(0, 1, -1.5); engine.scene.add(wall);
+  engine.scene.background = new THREE.Color('#ffffff');
+  engine.scene.environmentIntensity = 2;
+  const camera = new THREE.PerspectiveCamera(50, 320 / 240, .1, 40);
+  camera.position.set(0, 2.6, 6); camera.lookAt(0, .5, 0); engine.camera = camera; engine.scene.add(camera);
+  const graph = structuredClone(DEFAULT_PARTICLE_GRAPH);
+  graph.nodes.find(n => n.id === 'sys').props = { capacity: 128, lifetime: 2, lit: true, additive: false, size: .4 };
+  graph.nodes.find(n => n.id === 'emit').props.radius = .8;
+  graph.nodes.find(n => n.id === 'speed').props.value = 0;
+  graph.nodes.find(n => n.id === 'grav').enabled = false;
+  const particles = engine.createEntity({ name: 'GI particles' }).addComponent('particles', { graph });
+  particles.entity.object3D.position.set(0, .8, 0);
+  const clothEntity = engine.createEntity({ name: 'GI cloth' });
+  const clothPlane = clothEntity.addComponent('mesh', { geometry: 'plane' });
+  clothPlane.mesh.geometry = new THREE.PlaneGeometry(1.4, 1.5);
+  const cloth = clothEntity.addComponent('cloth', { resolution: 8, wind: 0 });
+  cloth.entity.object3D.position.set(-1.8, .75, 0);
+  const waterEntity = engine.createEntity({ name: 'GI water' });
+  waterEntity.object3D.rotation.x = -Math.PI / 2;
+  waterEntity.object3D.position.x = 1.8;
+  const waterPlane = waterEntity.addComponent('mesh', { geometry: 'plane', material: 'builtin:Water.mat', collision: 'none' });
+  waterPlane.mesh.geometry = new THREE.PlaneGeometry(1.4, 2);
+  const water = waterEntity.addComponent('water', { resolution: 8, amplitude: .1 });
+  const level = Number(new URLSearchParams(location.search).get('level') ?? .25);
+  engine.createEntity({ name: 'Active SRC' }).addComponent('global-illumination', { bounce: level, ao: level, reflections: level });
+  engine.start();
+  const deadline = performance.now() + 60000;
+  let readyFrames = 0;
+  while (performance.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 250));
+    const system = engine.modules.get('gi').system;
+    if (system?.state?.light?.vfxIrradiance && system._fieldReadyOnce && !engine.renderSuspended && particles.subsystems?.[0]?.initialized) readyFrames++;
+    if (readyFrames >= 24) break;
+    assert(!errors.length, errors.join('\n'));
+  }
+  const system = engine.modules.get('gi').system;
+  assert(readyFrames >= 24, 'active SRC and particles settle');
+  assert(system.state.light.vfxIrradiance, 'particles bind the active SRC world gather without Reflection Probe entities');
+  assert(!(system._reflProbes?.size > 0), 'fixture has no hand-authored reflection probes');
+  assert(cloth.simulation.mesh.layers.isEnabled(GI_DYNAMIC_LAYER) && water.simulation.mesh.layers.isEnabled(GI_DYNAMIC_LAYER), 'GPU surfaces reject stale temporal GI');
+  engine.stop();
+  const light = system.state.light;
+  const target = new THREE.RenderTarget(320, 240);
+  // Water scene-color capture was allocated by the live canvas pass. Match
+  // its backend format when testing the same material into this target.
+  target.texture.internalFormat = navigator.gpu.getPreferredCanvasFormat();
+  floor.visible = false; wall.visible = false; engine.scene.background = new THREE.Color('#000000');
+  const receivers = { particles: particles.subsystems[0].object, cloth: cloth.simulation.mesh, water: water.simulation.mesh };
+  for (const mesh of Object.values(receivers)) { mesh.visible = false; mesh.material.envMapIntensity = 0; }
+  const results = {};
+  renderer.setRenderTarget(target);
+  for (const [kind, mesh] of Object.entries(receivers)) {
+    mesh.visible = true;
+    light.removeFromParent(); await renderer.compileAsync(engine.scene, camera); renderer.render(engine.scene, camera);
+    const off = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 320, 240);
+    engine.scene.add(light); await renderer.compileAsync(engine.scene, camera); renderer.render(engine.scene, camera);
+    const on = await renderer.readRenderTargetPixelsAsync(target, 0, 0, 320, 240);
+    let lit = 0, energy = 0;
+    for (let i = 0; i < on.length; i += 4) {
+      const delta = on[i] + on[i + 1] + on[i + 2] - off[i] - off[i + 1] - off[i + 2];
+      if (delta > (kind === "water" ? 0 : 3)) lit++; energy += Math.max(0, delta);
+    }
+    results[kind] = { lit, energy };
+    assert(lit > 10 && energy > 100, `${kind} receives active GI: ${JSON.stringify(results[kind])}`);
+    mesh.visible = false;
+  }
+  await renderer.backend.device.queue.onSubmittedWorkDone();
+  assert(!errors.length, errors.join('\n'));
+  renderer.setRenderTarget(null); target.dispose();
+  globalThis.__GI_SMOKE_RESULT__ = { pass: true, results, storageLimit: 8 };
+  console.log('GI-SMOKE PASS VFX active SRC', JSON.stringify(results));
+} catch (error) {
+  console.error('GI-SMOKE FAIL', error.stack ?? error);
+  globalThis.__GI_SMOKE_RESULT__ = { pass: false, error: String(error.stack ?? error) };
+}
+</script></body></html>

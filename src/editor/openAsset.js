@@ -1,3 +1,4 @@
+import { isBuiltinMaterial } from "../engine/builtinMaterials.js";
 import {
   extOf,
   ATLAS_EXTENSIONS,
@@ -10,6 +11,7 @@ import {
   TIMELINE_EXTENSIONS,
   GEOMETRY_EXTENSIONS,
   POST_EXTENSIONS,
+  VFX_EXTENSIONS,
   AUDIO_EXTENSIONS,
 } from "./assetLoader.js";
 import { useProjectStore, basename } from "./store/projectStore.js";
@@ -68,6 +70,7 @@ export function hasAssetEditor(path) {
     ANIMATOR_EXTENSIONS.includes(ext) ||
     TIMELINE_EXTENSIONS.includes(ext) ||
     POST_EXTENSIONS.includes(ext) ||
+    VFX_EXTENSIONS.includes(ext) ||
     ENVIRONMENT_EXTENSIONS.includes(ext) ||
     MATERIAL_EXTENSIONS.includes(ext) ||
     GEOMETRY_EXTENSIONS.includes(ext) ||
@@ -99,6 +102,12 @@ export function openAssetPath(path, { isDir = false } = {}) {
   } else if (TIMELINE_EXTENSIONS.includes(ext)) {
     useSelectionStore.getState().selectAsset(path);
     import("./EditorShell.jsx").then((m) => m.openPanel("timeline"));
+  } else if (VFX_EXTENSIONS.includes(ext)) {
+    useSelectionStore.getState().selectAsset(path);
+    Promise.all([import("./vfxAssets.js"), import("./EditorShell.jsx")]).then(async ([assets, shell]) => {
+      const doc = await assets.readVfxDocument(path);
+      shell.openPanel(doc.kind === "particles" ? "particles" : "inspector");
+    }).catch((error) => console.error(`Could not open particle graph: ${error.message}`));
   } else if (POST_EXTENSIONS.includes(ext)) {
     // The Post Process panel edits whichever `.post` is selected, exactly as
     // the Timeline panel follows the selected `.timeline`.
@@ -114,7 +123,7 @@ export function openAssetPath(path, { isDir = false } = {}) {
     import("./EditorShell.jsx").then((m) => m.openPanel("inspector"));
   } else if (MATERIAL_EXTENSIONS.includes(ext)) {
     // A material *is* its shader graph — that's the only editor for it.
-    useSelectionStore.getState().selectAsset(path);
+    if (!isBuiltinMaterial(path)) useSelectionStore.getState().selectAsset(path);
     import("./EditorShell.jsx").then((m) => m.openPanel("shaderGraph"));
   } else if (ATLAS_EXTENSIONS.includes(ext)) {
     // A sprite atlas opens the same panel, in its Atlas mode.

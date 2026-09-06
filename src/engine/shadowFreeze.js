@@ -80,7 +80,7 @@ function fingerprintCasters(scene) {
   };
   scene.traverse((object) => {
     if (dynamic || !object.isMesh) return;
-    if (object.isSkinnedMesh || object.morphTargetInfluences?.length) {
+    if (object.isSkinnedMesh || object.morphTargetInfluences?.length || object.userData?.vfxSimulation) {
       dynamic = true;
       return;
     }
@@ -130,7 +130,7 @@ function sceneHasDeformingCaster(scene) {
     // ⚠ Deliberately NOT gated on `castShadow`, to match `fingerprintCasters`
     // exactly. Diverging here would make the fast path answer a different
     // question from the slow one, which is how a cache becomes a bug.
-    if (object.isSkinnedMesh || object.morphTargetInfluences?.length) found = true;
+    if (object.isSkinnedMesh || object.morphTargetInfluences?.length || object.userData?.vfxSimulation) found = true;
   });
   return found;
 }

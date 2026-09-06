@@ -321,6 +321,24 @@ export const NODE_TYPES = {
   rgbToHsv: fn1("RGB to HSV", "mx_rgbtohsv", "color", "color"),
 
   // --- utility ---
+  waterColor: {
+    label: "Water Color", cat: "color", out: "color",
+    inputs: [i("shallow", "color", "#64cbd0"), i("deep", "color", "#075779"), i("opticalDepth", "float", 1.2), i("absorption", "float", .45), i("foamHeight", "float", .07), i("foamAmount", "float", .35)],
+    build: ({ ins }) => {
+      const noise = TSL.mx_noise_float(TSL.positionLocal.mul(24)).mul(.5).add(.5).clamp(0, 1);
+      const angle = TSL.normalView.dot(TSL.positionViewDirection).abs().max(.35);
+      const depth = TSL.float(1).sub(ins.opticalDepth.max(0).mul(ins.absorption.max(0)).div(angle).negate().exp()).add(noise.sub(.5).mul(.12)).clamp(0, 1);
+      const foam = TSL.smoothstep(ins.foamHeight, ins.foamHeight.add(.08), TSL.positionLocal.y).mul(ins.foamAmount.clamp(0, 1)).mul(TSL.smoothstep(.1, .7, noise));
+      return TSL.mix(TSL.mix(ins.shallow, ins.deep, depth), TSL.vec3(.82, .96, .93), foam);
+    },
+    gen: ({ args, use }) => {
+      const noise = `${use("mx_noise_float")}(${use("positionLocal", true)}.mul(24)).mul(.5).add(.5).clamp(0,1)`;
+      const angle = `${use("normalView", true)}.dot(${use("positionViewDirection", true)}).abs().max(.35)`;
+      const depth = `${use("float")}(1).sub(${use("float")}(${args.opticalDepth}).max(0).mul(${use("float")}(${args.absorption}).max(0)).div(${angle}).negate().exp()).add((${noise}).sub(.5).mul(.12)).clamp(0,1)`;
+      const foam = `${use("smoothstep")}(${args.foamHeight},${use("float")}(${args.foamHeight}).add(.08),${use("positionLocal", true)}.y).mul(${use("float")}(${args.foamAmount}).clamp(0,1)).mul(${use("smoothstep")}(.1,.7,${noise}))`;
+      return `${use("mix")}(${use("mix")}(${args.shallow},${args.deep},${depth}),${use("vec3")}(.82,.96,.93),${foam})`;
+    },
+  },
   fresnel: {
     label: "Fresnel", cat: "utility", inputs: [i("power", "float", 3)], out: "float",
     build: ({ ins }) => TSL.pow(TSL.oneMinus(TSL.saturate(TSL.dot(TSL.normalView, TSL.positionViewDirection))), ins.power),

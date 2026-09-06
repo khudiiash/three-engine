@@ -29,14 +29,20 @@
 //      same as every working run-gi-rc-*.mjs.
 import puppeteer from "puppeteer-core";
 import sharp from "sharp";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const url = process.argv[2] ?? "http://localhost:5201/";
+const profile = await mkdtemp(join(tmpdir(), "engine-particle-gi-"));
 const browser = await puppeteer.launch({
+  userDataDir: profile,
   executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
   headless: process.env.HEADED ? false : "new",
   args: ["--enable-unsafe-webgpu", "--enable-features=WebGPU", "--no-sandbox", "--disable-dev-shm-usage"],
 });
 const page = await browser.newPage();
+await page.evaluateOnNewDocument(() => { globalThis.__engineLimitsCap = { maxStorageBuffersPerShaderStage: 8 }; globalThis.__editorKeepRendering = true; });
 await page.setViewport({ width: 1280, height: 860 });
 
 const errors = [];
@@ -265,4 +271,5 @@ const failed = results.filter((r) => !r.ok);
 console.log(`\nPGI ${failed.length ? "FAIL" : "PASS"} — ${results.length - failed.length}/${results.length}`);
 if (giLog.length) console.log(`gi: ${giLog.slice(-3).join("\n    ")}`);
 await browser.close();
+await rm(profile, { recursive: true, force: true });
 process.exit(failed.length ? 1 : 0);

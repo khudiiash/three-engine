@@ -27,7 +27,7 @@ export function copySelection(kind, nodes, edges, { protectedTypes = [] } = {}) 
       id: n.id,
       type: n.type,
       position: { ...n.position },
-      data: { nodeType: n.data.nodeType, props: structuredClone(n.data.props ?? {}) },
+      data: { ...(n.data.persisted ? { persisted: structuredClone(n.data.persisted) } : {}), nodeType: n.data.nodeType, props: structuredClone(n.data.props ?? {}) },
       ...(n.style ? { style: { ...n.style } } : {}),
       ...(n.width != null ? { width: n.width } : {}),
       ...(n.height != null ? { height: n.height } : {}),
@@ -76,7 +76,7 @@ export function pasteClipboard(kind, { at = null, offset = 28 } = {}) {
       // whole block, and so a second paste replaces rather than accumulates.
       selected: true,
       position: { x: n.position.x + dx, y: n.position.y + dy },
-      data: { nodeType: n.data.nodeType, props: structuredClone(n.data.props ?? {}) },
+      data: { ...(n.data.persisted ? { persisted: structuredClone(n.data.persisted) } : {}), nodeType: n.data.nodeType, props: structuredClone(n.data.props ?? {}) },
     };
   });
   const edges = buffer.edges.map((e) => ({

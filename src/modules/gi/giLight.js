@@ -1861,6 +1861,36 @@ export class GICascadeLightNode extends THREE.AnalyticLightNode {
     const facing = step(0, normalWorld.dot(cameraPosition.sub(positionWorld))).mul(2).sub(1);
     const N = normalWorld.mul(facing);
     const samplePoint = positionWorld.add(N.mul(light.normalOffset));
+    // Transparent particles do not write the opaque gbuffer. Its deferred
+    // irradiance/AO belongs to the wall behind them, even when sampled at the
+    // same screen coordinate. A directional world-space cache samples the
+    // active SRC field in compute; optional reflection probes are a fallback.
+    // Texture reads only: keep per-particle state out of GI storage budgets.
+    if (builder.material?.userData?.giParticle || builder.material?.userData?.giWater) {
+      if (light.vfxIrradiance) {
+        builder.context.irradiance.addAssign(light.vfxIrradiance(samplePoint, N).mul(light.intensityUniform));
+      } else if (light.giProbes) {
+        const probe = sampleReflectionProbes(light.giProbes, positionWorld, N, float(1));
+        builder.context.irradiance.addAssign(vec3(probe.rgb).mul(Math.PI).mul(probe.weight).mul(light.intensityUniform));
+      }
+      // ⛔⛔ WATER MUST RETURN HERE TOO, AND THE REASON IS A HARD LIMIT.
+      //
+      // Letting water fall through to the radiance block below gives it the
+      // traced reflection it wants — and binds every texture that block needs
+      // on top of the ones the water material already has: the medium's two
+      // surface maps, its two caustic maps, the depth texture the foam reads,
+      // and the shader graph's own. That came to **17 sampled textures in the
+      // fragment stage against a portable limit of 16**, so the Water pipeline
+      // failed to create at all and the surface vanished from the scene:
+      //
+      //   "The number of sampled textures (17) in the Fragment stage exceeds
+      //    the maximum per-stage limit (16)" → renderPipeline_Water_167 invalid
+      //
+      // A water reflection has to come from somewhere that is not a per-material
+      // texture binding — the screen-space pass, or a slot the water already
+      // holds — and until it does, this early return is load-bearing.
+      return;
+    }
     // DEFERRED PATH (the normal one — see giScreen.js): the gather and the
     // emitter shadow traces already ran once per screen pixel, so a material
     // reads the answer instead of recomputing it. This is what keeps material

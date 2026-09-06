@@ -1,3 +1,4 @@
+import { isBuiltinMaterial } from "../../engine/builtinMaterials.js";
 // NOTE: strict type-checking intentionally not enabled here — ~25 pre-existing
 // errors unrelated to events (JSX field prop-shape mismatches, missing
 // Entity/Engine properties like tags/viewOnly/virtualCameras), a follow-up.
@@ -47,6 +48,7 @@ import { AssetInspector } from "./AssetInspector.jsx";
 import { useAssetDrop } from "../assetDrag.js";
 import { getEditorCameraView } from "./ViewportPanel.jsx";
 import { useModulesStore } from "../modules.js";
+import { setTypesCollapsed, useComponentCollapsed } from "../inspectorPrefs.js";
 import { usePrefabStore } from "../store/prefabStore.js";
 import { prefabRegistry, diffInstance, getPrefabRoot } from "../../engine/index.js";
 import { applyPrefab, revertPrefab, unpackPrefab, openPrefabMode, createVariantFromInstance } from "../prefab.js";
@@ -269,8 +271,45 @@ let transformClipboard = null;
 
 const IDENTITY_TRANSFORM = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
 
+/**
+ * The fold header every inspector section shares — Transform, a component, and
+ * a multi-selection component all render this one.
+ *
+ * It is two hit targets rather than one big `<button>` (the idiom
+ * `.section-header.toggle` uses in the Settings and Modules panels) for a
+ * mechanical reason: a component header already carries the view-only / enable
+ * / remove cluster on its right, and a button cannot nest another one. So the
+ * chevron and the title are each their own button and `children` — the action
+ * cluster — stays outside both, keeping its own clicks.
+ *
+ * The chevron points right when folded and turns down when open, which is the
+ * same `.section-chevron` rotation the rest of the editor uses.
+ */
+function SectionFoldHeader({ collapsed, onToggle, title, children }) {
+  return (
+    <div className={`section-header${collapsed ? " collapsed" : ""}`}>
+      <button
+        type="button"
+        className="section-collapse"
+        onClick={onToggle}
+        aria-expanded={!collapsed}
+        title={collapsed ? "Expand section" : "Collapse section"}
+      >
+        <ChevronRight size={12} className="section-chevron" />
+      </button>
+      <button type="button" className="section-title-hit" onClick={onToggle} aria-expanded={!collapsed}>
+        <span className="section-title">{title}</span>
+      </button>
+      {children}
+    </div>
+  );
+}
+
 function TransformSection({ entity }) {
   const { position, rotation, scale } = entity.transform;
+  // Fold state is per COMPONENT TYPE, shared by every entity carrying one —
+  // inspectorPrefs.js explains why it is deliberately not per-entity.
+  const [collapsed, toggleCollapsed] = useComponentCollapsed("transform");
   const rotationDeg = rotation.map((r) => r * RAD2DEG);
   const lockNonRotation = isDirectionalLightEntity(entity);
   const [uniform, toggleUniform] = useUniformScale();
@@ -298,25 +337,29 @@ function TransformSection({ entity }) {
   ];
 
   return (
-    <div className="inspector-section" onContextMenu={openMenu}>
+    <div className={`inspector-section${collapsed ? " collapsed" : ""}`} onContextMenu={openMenu}>
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={closeMenu} />}
-      <div className="section-header">Transform</div>
-      {!lockNonRotation && (
-        <Vector3Row label="Position" values={position} onCommit={(v) => commit({ position: v })} />
-      )}
-      <Vector3Row
-        label="Rotation"
-        values={rotationDeg}
-        step={1}
-        onCommit={(v) => commit({ rotation: v.map((d) => d * DEG2RAD) })}
-      />
-      {!lockNonRotation && (
-        <ScaleRow
-          values={scale}
-          locked={uniform}
-          onToggleLock={toggleUniform}
-          onCommit={(v) => commit({ scale: v })}
-        />
+      <SectionFoldHeader collapsed={collapsed} onToggle={toggleCollapsed} title="Transform" />
+      {!collapsed && (
+        <>
+          {!lockNonRotation && (
+            <Vector3Row label="Position" values={position} onCommit={(v) => commit({ position: v })} />
+          )}
+          <Vector3Row
+            label="Rotation"
+            values={rotationDeg}
+            step={1}
+            onCommit={(v) => commit({ rotation: v.map((d) => d * DEG2RAD) })}
+          />
+          {!lockNonRotation && (
+            <ScaleRow
+              values={scale}
+              locked={uniform}
+              onToggleLock={toggleUniform}
+              onCommit={(v) => commit({ scale: v })}
+            />
+          )}
+        </>
       )}
     </div>
   );
@@ -532,8 +575,32 @@ function LevelPropField({ descriptor, value, onCommit, mixed = false }) {
  * selects identically to the generic field list rather than growing a second,
  * slightly-different set.
  */
+function ClothAnchorsField({value,onCommit}) {
+  const anchors=Array.isArray(value)?value:[];
+  const patch=(index,change)=>onCommit(anchors.map((anchor,i)=>i===index?{...anchor,...change}:anchor));
+  return <div className="cloth-anchors-field" style={{display:"grid",gap:8,minWidth:0}}>
+    <small>Grid U/V: 0,0 top-left; 1,1 bottom-right. Offsets follow the target.</small>
+    {anchors.map((anchor,index)=><div key={index} data-cloth-anchor={index} style={{display:"grid",gap:5,padding:6,border:"1px solid var(--border)"}}>
+      <div style={{display:"flex",alignItems:"center",gap:6}}>
+        <input type="checkbox" aria-label={`Enable anchor ${index+1}`} checked={anchor.enabled!==false} onChange={e=>patch(index,{enabled:e.target.checked})}/>
+        <span style={{flex:1}}>Anchor {index+1}</span>
+        <button type="button" title="Remove anchor" onClick={()=>onCommit(anchors.filter((_,i)=>i!==index))}><X size={12}/></button>
+      </div>
+      <EntityRefField descriptor={{}} value={anchor.entityId??""} onCommit={entityId=>patch(index,{entityId})}/>
+      <div style={{display:"grid",gridTemplateColumns:"20px 1fr 20px 1fr",alignItems:"center",gap:4}}>
+        <span>U</span><NumberField value={anchor.uv?.[0]??0} min={0} max={1} step={.01} onCommit={v=>patch(index,{uv:[v,anchor.uv?.[1]??0]})}/>
+        <span>V</span><NumberField value={anchor.uv?.[1]??0} min={0} max={1} step={.01} onCommit={v=>patch(index,{uv:[anchor.uv?.[0]??0,v]})}/>
+      </div>
+      <small>Target local offset</small><Vec3PropField value={anchor.offset??[0,0,0]} onCommit={offset=>patch(index,{offset})}/>
+    </div>)}
+    <button type="button" disabled={anchors.length>=32} onClick={()=>onCommit([...anchors,{entityId:"",uv:[anchors.length%2,0],offset:[0,0,0],enabled:true}])}>Add anchor ({anchors.length}/32)</button>
+  </div>;
+}
+
 export function PropField({ descriptor, value, onCommit, mixed = false, mixedAxes = [] }) {
   switch (descriptor.type) {
+    case "clothAnchors":
+      return <ClothAnchorsField value={mixed?[]:value} onCommit={onCommit}/>;
     case "asset":
       return <AssetField descriptor={descriptor} value={mixed ? "" : value} onCommit={onCommit} />;
     // A prefab reference: an asset picker pinned to prefab files. The value is
@@ -1252,6 +1319,7 @@ function MaterialSlotsSection({ entityId, props }) {
           )}
         </div>
       ))}
+      {isBuiltinMaterial(props.material) && <button className="toolbar-btn subtle wide" data-water-material-edit onClick={() => openPanel("shaderGraph")} title="Your first edit creates a material copy in the project">Edit Water material</button>}
       {count < MATERIAL_SLOT_KEYS.length && (
         <button
           className="toolbar-btn subtle wide"
@@ -1744,8 +1812,20 @@ function AdvancedFieldsSection({ children }) {
   );
 }
 
+/**
+ * Every section the inspector is currently showing for `entityId` — the
+ * transform row plus each component on it. Read at action time rather than at
+ * mount, so the menu describes the entity as it is when it was right-clicked.
+ */
+function allInspectorTypes(entityId) {
+  return ["transform", ...Object.keys(useSceneStore.getState().entities[entityId]?.components ?? {})];
+}
+
 function ComponentSection({ entityId, type, props }) {
   const cls = getComponentClass(type);
+  // Fold state is per COMPONENT TYPE, shared by every entity carrying one —
+  // inspectorPrefs.js explains why it is deliberately not per-entity.
+  const [collapsed, toggleCollapsed] = useComponentCollapsed(type);
   // Mirror the live `enabled` flag into local state so the eye icon
   // reflects the engine's current decision (the scene mirror doesn't
   // refresh on every component prop change without a re-render trigger).
@@ -1803,6 +1883,16 @@ function ComponentSection({ entityId, type, props }) {
     },
     { separator: true },
     {
+      // Computed now, not at mount — see allInspectorTypes.
+      label: "Collapse All Sections",
+      action: () => setTypesCollapsed(allInspectorTypes(entityId), true),
+    },
+    {
+      label: "Expand All Sections",
+      action: () => setTypesCollapsed(allInspectorTypes(entityId), false),
+    },
+    { separator: true },
+    {
       label: "Remove Component",
       danger: true,
       action: () => commandBus.execute(new RemoveComponentCommand(entityId, type)),
@@ -1834,13 +1924,13 @@ function ComponentSection({ entityId, type, props }) {
 
   const { Icon, color } = componentIcon(type);
   return (
-    <div className={`inspector-section ${enabled ? "" : "disabled"}`} onContextMenu={openMenu}>
+    <div className={`inspector-section ${enabled ? "" : "disabled"}${collapsed ? " collapsed" : ""}`} onContextMenu={openMenu}>
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={closeMenu} />}
-      <div className="section-header">
-        <span className="section-title">
-          <Icon size={13} style={{ color }} />
-          {cls.label}
-        </span>
+      <SectionFoldHeader
+        collapsed={collapsed}
+        onToggle={toggleCollapsed}
+        title={<><Icon size={13} style={{ color }} />{cls.label}</>}
+      >
         <span className="section-actions">
           <button
             className={`icon-btn ${viewOnly ? "active-toggle" : ""}`}
@@ -1870,193 +1960,203 @@ function ComponentSection({ entityId, type, props }) {
             <X size={12} />
           </button>
         </span>
-      </div>
-      {(() => {
-        const visible = cls.schema.filter((descriptor) => {
-          if (descriptor.hidden) return false;
-          if (descriptor.showIf && !descriptor.showIf(props)) return false;
-          // Mesh materials render through MaterialSlotsSection below, which owns
-          // the whole slot list (add / remove / renumber) rather than one row.
-          if (type === "mesh" && descriptor.key === "material") return false;
-          // The tip bone gets a dropdown of the rig's actual bones instead of a
-          // text field — typing "mixamorig:LeftFoot" from memory is a coin flip.
-          if (type === "ik" && descriptor.key === "tipBone") return false;
-          return true;
-        });
-        const renderField = (descriptor) => (
-          <div className="field-row" key={descriptor.key}>
-            <span className="field-label">{descriptor.label}</span>
-            <PropField
-              descriptor={descriptor}
-              value={props[descriptor.key]}
-              onCommit={(v) => {
-                if (type === "mesh" && descriptor.key === "geometry" && props.geometryAsset) {
-                  commandBus.execute(new BatchCommand([
-                    new SetComponentPropCommand(entityId, type, "geometryAsset", ""),
-                    new SetComponentPropCommand(entityId, type, descriptor.key, v),
-                  ], "Use primitive geometry"));
-                  return;
-                }
-                // A schema field may declare `flipsToCustom: "otherKey"` so
-                // editing it also flips a sibling preset selector to
-                // "custom" in the SAME undo step (e.g. GI's advanced fields
-                // flip `quality`) — skipped once the preset already reads
-                // "custom" so repeated edits don't keep rewriting it.
-                if (descriptor.flipsToCustom && props[descriptor.flipsToCustom] !== "custom") {
-                  commandBus.execute(new BatchCommand([
-                    new SetComponentPropCommand(entityId, type, descriptor.key, v),
-                    new SetComponentPropCommand(entityId, type, descriptor.flipsToCustom, "custom"),
-                  ], `Set ${descriptor.label}`));
-                  return;
-                }
-                commandBus.execute(new SetComponentPropCommand(entityId, type, descriptor.key, v));
-              }}
-            />
-          </div>
-        );
-        const advanced = visible.filter((descriptor) => descriptor.advanced);
-        return (
-          <>
-            {visible.filter((descriptor) => !descriptor.advanced).map(renderField)}
-            {advanced.length > 0 && (
-              <AdvancedFieldsSection>{advanced.map(renderField)}</AdvancedFieldsSection>
-            )}
-          </>
-        );
-      })()}
-      {type === "uielement" && <UiElementSection entityId={entityId} props={props} />}
-      {type === "script" && <ScriptsSection entityId={entityId} props={props} />}
-      {type === "events" && <EventBindingsSection entityId={entityId} props={props} />}
-      {/* Any component declaring an `actions` prop gets an editor for it — the
-          UI button's onClick/onFocus/... lists today, whatever grows one next
-          without a change here. */}
-      <ActionListSections entityId={entityId} componentType={type} props={props} />
-      {type === "geometryModifiers" && <GeometryModifiersSection entityId={entityId} props={props} />}
-      {type === "mesh" && (
+      </SectionFoldHeader>
+      {!collapsed && (
         <>
-          <MaterialSlotsSection entityId={entityId} props={props} />
+        {(() => {
+          const visible = cls.schema.filter((descriptor) => {
+            if (descriptor.hidden) return false;
+            if (descriptor.showIf && !descriptor.showIf(props)) return false;
+            // Mesh materials render through MaterialSlotsSection below, which owns
+            // the whole slot list (add / remove / renumber) rather than one row.
+            if (type === "mesh" && descriptor.key === "material") return false;
+            // The tip bone gets a dropdown of the rig's actual bones instead of a
+            // text field — typing "mixamorig:LeftFoot" from memory is a coin flip.
+            if (type === "ik" && descriptor.key === "tipBone") return false;
+            return true;
+          });
+          const renderField = (descriptor) => (
+            <div className="field-row" key={descriptor.key}>
+              <span className="field-label">{descriptor.label}</span>
+              <PropField
+                descriptor={descriptor}
+                value={props[descriptor.key]}
+                onCommit={(v) => {
+                  if (type === "mesh" && descriptor.key === "geometry" && props.geometryAsset) {
+                    commandBus.execute(new BatchCommand([
+                      new SetComponentPropCommand(entityId, type, "geometryAsset", ""),
+                      new SetComponentPropCommand(entityId, type, descriptor.key, v),
+                    ], "Use primitive geometry"));
+                    return;
+                  }
+                  // A schema field may declare `flipsToCustom: "otherKey"` so
+                  // editing it also flips a sibling preset selector to
+                  // "custom" in the SAME undo step (e.g. GI's advanced fields
+                  // flip `quality`) — skipped once the preset already reads
+                  // "custom" so repeated edits don't keep rewriting it.
+                  if (descriptor.flipsToCustom && props[descriptor.flipsToCustom] !== "custom") {
+                    commandBus.execute(new BatchCommand([
+                      new SetComponentPropCommand(entityId, type, descriptor.key, v),
+                      new SetComponentPropCommand(entityId, type, descriptor.flipsToCustom, "custom"),
+                    ], `Set ${descriptor.label}`));
+                    return;
+                  }
+                  commandBus.execute(new SetComponentPropCommand(entityId, type, descriptor.key, v));
+                }}
+              />
+            </div>
+          );
+          const advanced = visible.filter((descriptor) => descriptor.advanced);
+          return (
+            <>
+              {visible.filter((descriptor) => !descriptor.advanced).map(renderField)}
+              {advanced.length > 0 && (
+                <AdvancedFieldsSection>{advanced.map(renderField)}</AdvancedFieldsSection>
+              )}
+            </>
+          );
+        })()}
+        {type === "cloth" && (() => {
+          const cloth = engine.getEntity(entityId)?.getComponent("cloth");
+          const mesh = engine.getEntity(entityId)?.getComponent("mesh");
+          const message = cloth?.surfaceError || cloth?.meshColliderField?.error || (!mesh?.mesh || mesh.props.geometry !== "plane" || mesh.props.geometryAsset ? "Cloth requires a plane mesh" : "");
+          return message ? <div className="asset-hint" role="status">{message}</div> : null;
+        })()}
+        {type === "uielement" && <UiElementSection entityId={entityId} props={props} />}
+        {type === "script" && <ScriptsSection entityId={entityId} props={props} />}
+        {type === "events" && <EventBindingsSection entityId={entityId} props={props} />}
+        {/* Any component declaring an `actions` prop gets an editor for it — the
+            UI button's onClick/onFocus/... lists today, whatever grows one next
+            without a change here. */}
+        <ActionListSections entityId={entityId} componentType={type} props={props} />
+        {type === "geometryModifiers" && <GeometryModifiersSection entityId={entityId} props={props} />}
+        {type === "mesh" && (
+          <>
+            <MaterialSlotsSection entityId={entityId} props={props} />
+            <EditorActionRow
+              actions={[
+                {
+                  label: "Edit Geometry",
+                  hint: "edit this mesh in place, in the viewport",
+                  Icon: Pencil,
+                  color: "#4fd475",
+                  onClick: () => {
+                    useGeometryEditStore.getState().enter(entityId);
+                    openPanel("viewport");
+                  },
+                },
+                {
+                  label: "Geometry Editor",
+                  hint: "open the full geometry editor panel",
+                  Icon: PanelsTopLeft,
+                  color: "#4da3ff",
+                  onClick: () => openPanel("geometryEditor"),
+                },
+                {
+                  label: "Shader Graph",
+                  hint: "edit this mesh's material graph",
+                  Icon: Waypoints,
+                  color: "#b784f5",
+                  onClick: () => openPanel("shaderGraph"),
+                },
+              ]}
+            />
+            <ApplyTransformSection entityId={entityId} />
+          </>
+        )}
+        {type === "camera" && (
+          <CameraFollowSection entityId={entityId} props={props} />
+        )}
+        {type === "instancer" && props.scatterShape === "onMesh" && (
+          <InstancerSurfaceSection entityId={entityId} props={props} />
+        )}
+        {type === "camera" && (
           <EditorActionRow
             actions={[
               {
-                label: "Edit Geometry",
-                hint: "edit this mesh in place, in the viewport",
-                Icon: Pencil,
-                color: "#4fd475",
+                label: "Adjust to View",
+                hint: "copy the editor viewport's pose onto this camera",
+                Icon: Crosshair,
+                color: "#4da3ff",
                 onClick: () => {
-                  useGeometryEditStore.getState().enter(entityId);
-                  openPanel("viewport");
+                  const view = getEditorCameraView();
+                  if (!view) return;
+                  const entity = engine.getEntity(entityId);
+                  const before = entity?.getTransform();
+                  if (!before) return;
+                  commandBus.execute(
+                    new SetTransformCommand(entityId, {
+                      position: view.position,
+                      rotation: view.rotation,
+                      scale: before.scale,
+                    }, before),
+                  );
                 },
               },
+              ...(engine.getEntity(entityId)?.getComponent?.("postprocess")
+                ? [{
+                    label: "Post Process",
+                    hint: "open the post-process graph for this camera",
+                    Icon: Sparkles,
+                    color: "#b784f5",
+                    onClick: () => openPanel("postprocess"),
+                  }]
+                : []),
+            ]}
+          />
+        )}
+        {["particles", "vfx"].includes(type) && (
+          <EditorActionRow
+            actions={[
               {
-                label: "Geometry Editor",
-                hint: "open the full geometry editor panel",
-                Icon: PanelsTopLeft,
-                color: "#4da3ff",
-                onClick: () => openPanel("geometryEditor"),
-              },
-              {
-                label: "Shader Graph",
-                hint: "edit this mesh's material graph",
+                label: type === "particles" ? "Particles Editor" : "VFX Timeline",
+                hint: type === "particles" ? "edit particle nodes and socket values" : "arrange the timing of child effects",
                 Icon: Waypoints,
                 color: "#b784f5",
-                onClick: () => openPanel("shaderGraph"),
+                onClick: () => openPanel(type === "particles" ? "particles" : "vfx"),
               },
             ]}
           />
-          <ApplyTransformSection entityId={entityId} />
-        </>
-      )}
-      {type === "camera" && (
-        <CameraFollowSection entityId={entityId} props={props} />
-      )}
-      {type === "instancer" && props.scatterShape === "onMesh" && (
-        <InstancerSurfaceSection entityId={entityId} props={props} />
-      )}
-      {type === "camera" && (
-        <EditorActionRow
-          actions={[
-            {
-              label: "Adjust to View",
-              hint: "copy the editor viewport's pose onto this camera",
-              Icon: Crosshair,
-              color: "#4da3ff",
-              onClick: () => {
-                const view = getEditorCameraView();
-                if (!view) return;
-                const entity = engine.getEntity(entityId);
-                const before = entity?.getTransform();
-                if (!before) return;
-                commandBus.execute(
-                  new SetTransformCommand(entityId, {
-                    position: view.position,
-                    rotation: view.rotation,
-                    scale: before.scale,
-                  }, before),
-                );
+        )}
+        {type === "animation" && props.controller && (
+          <EditorActionRow
+            actions={[
+              {
+                label: "Animator",
+                hint: "edit this controller's state machine",
+                Icon: Layers2,
+                color: "#4fd475",
+                onClick: () => openPanel("animator"),
               },
-            },
-            ...(engine.getEntity(entityId)?.getComponent?.("postprocess")
-              ? [{
-                  label: "Post Process",
-                  hint: "open the post-process graph for this camera",
-                  Icon: Sparkles,
-                  color: "#b784f5",
-                  onClick: () => openPanel("postprocess"),
-                }]
-              : []),
-          ]}
-        />
-      )}
-      {type === "particles" && (
-        <EditorActionRow
-          actions={[
-            {
-              label: "Particle Editor",
-              hint: "edit this emitter's node graph",
-              Icon: Waypoints,
-              color: "#b784f5",
-              onClick: () => openPanel("particles"),
-            },
-          ]}
-        />
-      )}
-      {type === "animation" && props.controller && (
-        <EditorActionRow
-          actions={[
-            {
-              label: "Animator",
-              hint: "edit this controller's state machine",
-              Icon: Layers2,
-              color: "#4fd475",
-              onClick: () => openPanel("animator"),
-            },
-          ]}
-        />
-      )}
-      {type === "ik" && <IKBoneField entityId={entityId} props={props} />}
-      {type === "vcam" && <VirtualCameraActions entityId={entityId} />}
-      {type === "navmesh" && <NavMeshActions entityId={entityId} />}
-      {type === "impulsesource" && <ImpulseSourceActions entityId={entityId} />}
-      {type === "sound" && <SoundSection entityId={entityId} props={props} />}
-      {type === "listener" && <ListenerSection entityId={entityId} />}
-      {type === "timeline" && <TimelineSection entityId={entityId} props={props} />}
-      {type === "line" && <LinePointsSection entityId={entityId} props={props} />}
-      {type === "trail" && <TrailSection entityId={entityId} />}
-      {type === "decal" && <DecalSection entityId={entityId} />}
-      {type === "lod" && <LodSection entityId={entityId} props={props} />}
-      {type === "impostor" && <ImpostorSection entityId={entityId} />}
-      {type === "spline" && <SplineSection entityId={entityId} props={props} />}
-      {type === "splineMesh" && <SplineMeshSection entityId={entityId} />}
-      {type === "splineFollower" && <SplineFollowerSection entityId={entityId} />}
-      {type === "terrain" && <TerrainSection entityId={entityId} props={props} />}
-      {type === "level" && <LevelSection entityId={entityId} />}
-      {type === "blockout" && <BlockoutSection entityId={entityId} props={props} />}
-      {type === "collider" && props.shape === "heightfield" && !engine.getEntity(entityId)?.getComponent("terrain") && (
-        <div className="field-row">
-          <span className="field-label" style={{ opacity: 0.6 }}>
-            Requires a Terrain component on this entity
-          </span>
-        </div>
+            ]}
+          />
+        )}
+        {type === "ik" && <IKBoneField entityId={entityId} props={props} />}
+        {type === "vcam" && <VirtualCameraActions entityId={entityId} />}
+        {type === "navmesh" && <NavMeshActions entityId={entityId} />}
+        {type === "impulsesource" && <ImpulseSourceActions entityId={entityId} />}
+        {type === "sound" && <SoundSection entityId={entityId} props={props} />}
+        {type === "listener" && <ListenerSection entityId={entityId} />}
+        {type === "timeline" && <TimelineSection entityId={entityId} props={props} />}
+        {type === "line" && <LinePointsSection entityId={entityId} props={props} />}
+        {type === "trail" && <TrailSection entityId={entityId} />}
+        {type === "decal" && <DecalSection entityId={entityId} />}
+        {type === "lod" && <LodSection entityId={entityId} props={props} />}
+        {type === "impostor" && <ImpostorSection entityId={entityId} />}
+        {type === "spline" && <SplineSection entityId={entityId} props={props} />}
+        {type === "splineMesh" && <SplineMeshSection entityId={entityId} />}
+        {type === "splineFollower" && <SplineFollowerSection entityId={entityId} />}
+        {type === "terrain" && <TerrainSection entityId={entityId} props={props} />}
+        {type === "level" && <LevelSection entityId={entityId} />}
+        {type === "blockout" && <BlockoutSection entityId={entityId} props={props} />}
+        {type === "collider" && props.shape === "heightfield" && !engine.getEntity(entityId)?.getComponent("terrain") && (
+          <div className="field-row">
+            <span className="field-label" style={{ opacity: 0.6 }}>
+              Requires a Terrain component on this entity
+            </span>
+          </div>
+        )}
+        </>
       )}
     </div>
   );
@@ -2146,6 +2246,9 @@ function MultiScriptAttributeFields({ entities }) {
 
 function MultiComponentSection({ entities, type }) {
   const cls = getComponentClass(type);
+  // Fold state is per COMPONENT TYPE, shared by every entity carrying one —
+  // inspectorPrefs.js explains why it is deliberately not per-entity.
+  const [collapsed, toggleCollapsed] = useComponentCollapsed(type);
   const [, force] = useState(0);
   const entityIds = entities.map((entity) => entity.id);
   const propsList = entities.map((entity) => entity.components[type]);
@@ -2189,12 +2292,12 @@ function MultiComponentSection({ entities, type }) {
   const viewOnlyMixed = !viewOnlyValues.every((value) => value === viewOnlyValues[0]);
   const { Icon, color } = componentIcon(type);
   return (
-    <div className={`inspector-section ${!enabledMixed && !enabledValues[0] ? "disabled" : ""}`}>
-      <div className="section-header">
-        <span className="section-title">
-          <Icon size={13} style={{ color }} />
-          {cls.label}
-        </span>
+    <div className={`inspector-section ${!enabledMixed && !enabledValues[0] ? "disabled" : ""}${collapsed ? " collapsed" : ""}`}>
+      <SectionFoldHeader
+        collapsed={collapsed}
+        onToggle={toggleCollapsed}
+        title={<><Icon size={13} style={{ color }} />{cls.label}</>}
+      >
         <span className="section-actions">
           <button
             className={`icon-btn ${!viewOnlyMixed && viewOnlyValues[0] ? "active-toggle" : ""}`}
@@ -2214,65 +2317,69 @@ function MultiComponentSection({ entities, type }) {
             <X size={12} />
           </button>
         </span>
-      </div>
-      {(() => {
-        const visible = cls.schema.filter((descriptor) => {
-          if (descriptor.hidden) return false;
-          if (descriptor.showIf && !propsList.every((props) => descriptor.showIf(props))) return false;
-          return true;
-        });
-        const renderField = (descriptor) => {
-          const values = propsList.map((props) => props[descriptor.key]);
-          const mixed = !values.every((value) => valuesEqual(value, values[0]));
-          const mixedAxes = descriptor.type === "vec3" || descriptor.type === "vec2"
-            ? [0, 1, 2].map((axis) => !values.every((value) => value?.[axis] === values[0]?.[axis]))
-            : [];
+      </SectionFoldHeader>
+      {!collapsed && (
+        <>
+        {(() => {
+          const visible = cls.schema.filter((descriptor) => {
+            if (descriptor.hidden) return false;
+            if (descriptor.showIf && !propsList.every((props) => descriptor.showIf(props))) return false;
+            return true;
+          });
+          const renderField = (descriptor) => {
+            const values = propsList.map((props) => props[descriptor.key]);
+            const mixed = !values.every((value) => valuesEqual(value, values[0]));
+            const mixedAxes = descriptor.type === "vec3" || descriptor.type === "vec2"
+              ? [0, 1, 2].map((axis) => !values.every((value) => value?.[axis] === values[0]?.[axis]))
+              : [];
+            return (
+              <div className="field-row" key={descriptor.key}>
+                <span className="field-label">{descriptor.label}</span>
+                <PropField
+                  descriptor={descriptor}
+                  value={values[0]}
+                  mixed={mixed}
+                  mixedAxes={mixedAxes}
+                  onCommit={(value, changedAxis) => {
+                    const commands = [];
+                    for (const entity of entities) {
+                      const props = entity.components[type];
+                      if (type === "mesh" && descriptor.key === "geometry" && props.geometryAsset) {
+                        commands.push(new SetComponentPropCommand(entity.id, type, "geometryAsset", ""));
+                      }
+                      let entityValue = value;
+                      if ((descriptor.type === "vec3" || descriptor.type === "vec2") && Number.isInteger(changedAxis)) {
+                        entityValue = [...(props[descriptor.key] ?? [0, 0, 0])];
+                        entityValue[changedAxis] = value[changedAxis];
+                      }
+                      commands.push(new SetComponentPropCommand(entity.id, type, descriptor.key, entityValue));
+                      // See the single-entity ComponentSection for what
+                      // `flipsToCustom` means — applied per-entity here so a
+                      // mixed selection still gets one undo step overall.
+                      if (descriptor.flipsToCustom && props[descriptor.flipsToCustom] !== "custom") {
+                        commands.push(new SetComponentPropCommand(entity.id, type, descriptor.flipsToCustom, "custom"));
+                      }
+                    }
+                    commandBus.execute(new BatchCommand(commands, `Set ${descriptor.label} on ${entities.length} entities`));
+                  }}
+                />
+              </div>
+            );
+          };
+          const advanced = visible.filter((descriptor) => descriptor.advanced);
           return (
-            <div className="field-row" key={descriptor.key}>
-              <span className="field-label">{descriptor.label}</span>
-              <PropField
-                descriptor={descriptor}
-                value={values[0]}
-                mixed={mixed}
-                mixedAxes={mixedAxes}
-                onCommit={(value, changedAxis) => {
-                  const commands = [];
-                  for (const entity of entities) {
-                    const props = entity.components[type];
-                    if (type === "mesh" && descriptor.key === "geometry" && props.geometryAsset) {
-                      commands.push(new SetComponentPropCommand(entity.id, type, "geometryAsset", ""));
-                    }
-                    let entityValue = value;
-                    if ((descriptor.type === "vec3" || descriptor.type === "vec2") && Number.isInteger(changedAxis)) {
-                      entityValue = [...(props[descriptor.key] ?? [0, 0, 0])];
-                      entityValue[changedAxis] = value[changedAxis];
-                    }
-                    commands.push(new SetComponentPropCommand(entity.id, type, descriptor.key, entityValue));
-                    // See the single-entity ComponentSection for what
-                    // `flipsToCustom` means — applied per-entity here so a
-                    // mixed selection still gets one undo step overall.
-                    if (descriptor.flipsToCustom && props[descriptor.flipsToCustom] !== "custom") {
-                      commands.push(new SetComponentPropCommand(entity.id, type, descriptor.flipsToCustom, "custom"));
-                    }
-                  }
-                  commandBus.execute(new BatchCommand(commands, `Set ${descriptor.label} on ${entities.length} entities`));
-                }}
-              />
-            </div>
+            <>
+              {visible.filter((descriptor) => !descriptor.advanced).map(renderField)}
+              {advanced.length > 0 && (
+                <AdvancedFieldsSection>{advanced.map(renderField)}</AdvancedFieldsSection>
+              )}
+            </>
           );
-        };
-        const advanced = visible.filter((descriptor) => descriptor.advanced);
-        return (
-          <>
-            {visible.filter((descriptor) => !descriptor.advanced).map(renderField)}
-            {advanced.length > 0 && (
-              <AdvancedFieldsSection>{advanced.map(renderField)}</AdvancedFieldsSection>
-            )}
-          </>
-        );
-      })()}
-      {type === "script" && <MultiScriptAttributeFields entities={entities} />}
-      <div className="asset-hint">Editing shared values on {entities.length} selected entities.</div>
+        })()}
+        {type === "script" && <MultiScriptAttributeFields entities={entities} />}
+        <div className="asset-hint">Editing shared values on {entities.length} selected entities.</div>
+        </>
+      )}
     </div>
   );
 }

@@ -63,6 +63,7 @@ import { Script, attribute, autobind, math, Vector3, Quaternion, MathUtils, Sphe
 import * as THREE from "three";
 import { InstancedMesh, MeshStandardNodeMaterial, BoxGeometry, AnimationMixer } from "three/webgpu";
 import { Fn, uniform, vec3 } from "three/tsl";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 @autobind
 export default class Turret extends Script {
@@ -116,6 +117,7 @@ export default class Turret extends Script {
         nodeMaterial: typeof MeshStandardNodeMaterial,
         boxGeometry: typeof BoxGeometry,
         animationMixer: typeof AnimationMixer,
+        orbitControls: typeof OrbitControls,
         // Namespace idiom via bare "three".
         nsInstancedMesh: typeof THREE.InstancedMesh,
         nsTextureLoader: typeof THREE.TextureLoader,
@@ -226,6 +228,11 @@ check(
   out.urls.three === out.urls["three/webgpu"],
   `${out.urls.three} vs ${out.urls["three/webgpu"]}`,
 );
+check(
+  "OrbitControls addon specifier is rewritten",
+  !!out.urls["three/addons/controls/OrbitControls.js"],
+  Object.keys(out.urls).join(", "),
+);
 
 // --- "engine" math surface --------------------------------------------------
 check("Vector3 is a real class with real methods", out.engineMath.vector3 === Math.sqrt(14), `length()=${out.engineMath.vector3}`);
@@ -263,6 +270,7 @@ for (const [name, key] of [
   ["AnimationMixer", "animationMixer"],
   ["THREE.InstancedMesh (namespace idiom)", "nsInstancedMesh"],
   ["THREE.TextureLoader (namespace idiom)", "nsTextureLoader"],
+  ["OrbitControls (three/addons)", "orbitControls"],
 ]) {
   check(`${name} resolves from a user script`, out.surface[key] === "function", `typeof = ${out.surface[key]}`);
 }

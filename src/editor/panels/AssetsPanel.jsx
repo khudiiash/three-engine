@@ -58,6 +58,9 @@ import {
 } from "../assetLoader.js";
 import { MATERIAL_DEFAULTS } from "../../engine/materialAsset.js";
 import { createDefaultTimeline } from "../../engine/timeline/timelineAsset.js";
+import { createVfxDocument } from "../vfxAssets.js";
+import { DEFAULT_PARTICLE_GRAPH } from "../../engine/particleGraph.js";
+import { createVfxAsset } from "../../engine/vfx/vfxAsset.js";
 import { createPostGraph, serializePostAsset } from "../../modules/postprocessing/postAsset.js";
 import {
   CUBEMAP_DEFAULTS,
@@ -83,6 +86,10 @@ import {
   formatDate,
 } from "../assetOps.js";
 import { ASSET_TYPES, assetType, filterEntries } from "../assetFilter.js";
+import { parseQuery as parseQueryLang } from "../queryLang.js";
+import { queryNeeds } from "../queryEvalAsset.js";
+import { ensureAssetMeta, getAssetMeta, useAssetMetaStore } from "../assetMetaIndex.js";
+import { noteSearch } from "./../searchRecents.js";
 import { loadAssetFlags, setAssetFlags, useAssetFlagsStore } from "../assetFlags.js";
 import { collectUsedAssets } from "../assetUsage.js";
 import { samePath, useAssetRevealStore } from "../assetReveal.js";
@@ -119,6 +126,7 @@ const ICON_BY_EXT = {
   geom: Shapes,
   timeline: Film,
   post: Aperture,
+  vfx: Workflow,
   ttf: Type,
   otf: Type,
   woff: Type,
@@ -144,6 +152,7 @@ const TYPE_LABEL = {
   geom: "Geometry",
   timeline: "Timeline",
   post: "Post Process Graph",
+  vfx: "Simulation Graph",
   ttf: "Font",
   otf: "Font",
   woff: "Font",
@@ -783,6 +792,7 @@ function AssetContextMenu({ menu, close, setRenamingPath, selectedEntries, onRes
         { label: "New Animator", action: createAnimator },
         { label: "New Timeline", action: createSequence },
         { label: "New Post Process Graph", action: createPostFx },
+        { label: "New Particle Graph", action: () => createVfxDocument("NewParticles.vfx", createVfxAsset("particles", DEFAULT_PARTICLE_GRAPH)) },
         { separator: true },
         { label: "Refresh", action: () => useProjectStore.getState().refresh() },
       ];
@@ -982,10 +992,21 @@ export function AssetsPanel() {
     [projectEntries],
   );
   const pool = recursive ? projectAssets : folderEntries;
+  // Widths and roughnesses arrive in batches after the search starts; the bump
+  // is what re-runs the filter so results refill as each batch lands.
+  const metaVersion = useAssetMetaStore((s) => s.version);
   const visible = useMemo(
-    () => (searching ? filterEntries(pool, { typeId, query, usedPaths: usedOnly ? usedPaths : null }) : pool),
+    () =>
+      searching
+        ? filterEntries(pool, {
+            typeId,
+            query,
+            usedPaths: usedOnly ? usedPaths : null,
+            getMeta: getAssetMeta,
+          })
+        : pool,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pool, searching, typeId, query, usedOnly, usedPaths, flagVersion],
+    [pool, searching, typeId, query, usedOnly, usedPaths, flagVersion, metaVersion],
   );
   const selectedEntries = useMemo(
     () => visible.filter((e) => assetPaths.includes(e.path)),
@@ -1032,6 +1053,10 @@ export function AssetsPanel() {
       .then((all) => {
         if (!live) return;
         setProjectEntries(all);
+        // A query already typed when the scan lands needs its probes kicked
+        // once the subtree exists. Keystrokes after this are the next
+        // effect's job; `queryRef` is why neither reads a stale closure.
+        ensureQueryMeta(all);
         return loadAssetFlags(all);
       })
       .catch((err) => console.warn(`Asset scan failed: ${err}`))
@@ -1040,6 +1065,51 @@ export function AssetsPanel() {
       live = false;
     };
   }, [searching, currentPath, rootPath, changeCounter]);
+
+  // Structured queries read files (a texture head for width, a `.mat` for
+  // roughness), so they are warmed ONCE per pause in typing — never per
+  // keystroke — and only for the files the query can actually ask about
+  // (queryNeeds). Bumps to metaVersion refill the grid as batches land.
+  //
+  // The ticket is AudioLibraryPanel's idiom: a slower earlier probe run must
+  // not outlive a newer query, so every kick invalidates the previous one.
+  const metaTicketRef = useRef(0);
+  const queryRef = useRef("");
+  queryRef.current = query;
+  const ensureQueryMeta = (list) => {
+    const needs = queryNeeds(parseQueryLang(queryRef.current));
+    if (!needs.dims && !needs.material) return;
+    ensureAssetMeta(list, needs, ++metaTicketRef.current).catch(() => {});
+  };
+  useEffect(() => {
+    if (!recursive || !projectAssets?.length) return;
+    const handle = setTimeout(() => ensureQueryMeta(projectAssets), 300);
+    return () => clearTimeout(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recursive, projectAssets, query]);
+
+  // A query becomes a "recent" after 900 ms of not typing, or on Enter — the
+  // same rule the Hierarchy box uses, and into the SAME list, so a query typed
+  // here comes back under Ctrl+F. Recording per keystroke would fill the list
+  // with the half-typed fragments of every query that ever crossed the box.
+  const noteQueryTimerRef = useRef(null);
+  const cancelPendingQueryNote = () => {
+    if (noteQueryTimerRef.current) {
+      clearTimeout(noteQueryTimerRef.current);
+      noteQueryTimerRef.current = null;
+    }
+  };
+  useEffect(() => {
+    if (!query.trim()) return undefined;
+    noteQueryTimerRef.current = setTimeout(() => {
+      noteQueryTimerRef.current = null;
+      noteSearch(queryRef.current);
+    }, 900);
+    return () => {
+      if (noteQueryTimerRef.current) clearTimeout(noteQueryTimerRef.current);
+      noteQueryTimerRef.current = null;
+    };
+  }, [query]);
 
   // The pool belongs to the folder it was scanned from. Keeping it across a
   // navigation would show the previous folder's hits under the new folder's
@@ -1319,17 +1389,26 @@ export function AssetsPanel() {
           <input
             className="assets-search-input"
             type="text"
-            placeholder="Search assets… (tag:name to match tags)"
+            placeholder="Search assets…  texture?width>1920  tag:wall"
+            title={"Search by name, or with the query language.\nName:   rock \u00b7 wall... (starts with) \u00b7 ..._diffuse (ends with) \u00b7 \"red brick\" (quote spaces)\nKind:   texture \u00b7 material \u00b7 model \u00b7 audio \u00b7 script \u00b7 prefab \u00b7 scene \u00b7 font \u00b7 folder\nFilter: texture?width>1920 \u00b7 material?roughness=0 \u00b7 size>1000 \u00b7 ext=png\nTags:   tag:wall \u00b7 ?tag=wall\nTerms separated by spaces AND together."}
             value={query}
             spellCheck={false}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
               e.stopPropagation();
-              if (e.key === "Escape" && query) setQuery("");
+              if (e.key === "Escape" && query) {
+                cancelPendingQueryNote();
+                setQuery("");
+                return;
+              }
+              if (e.key === "Enter" && query.trim()) {
+                cancelPendingQueryNote();
+                noteSearch(query);
+              }
             }}
           />
           {query && (
-            <button className="assets-search-clear" title="Clear search" onClick={() => setQuery("")}>
+            <button className="assets-search-clear" title="Clear search" onClick={() => { cancelPendingQueryNote(); setQuery(""); }}>
               <X size={11} />
             </button>
           )}

@@ -1,0 +1,68 @@
+<!doctype html><html><body><script type="module">
+import * as THREE from 'three/webgpu';
+import { Fn, instanceIndex } from 'three/tsl';
+import { ParticleComponent } from '/src/engine/components/ParticleComponent.js';
+const check = (ok, message) => { if (!ok) throw new Error(message); console.log('VFX:', message); };
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: 8 } });
+  const gpuErrors = [];
+  device.addEventListener('uncapturederror', event => gpuErrors.push(event.error.message));
+  const renderer = new THREE.WebGPURenderer({ device, antialias: false });
+  await renderer.init(); renderer.setSize(128, 128); renderer.shadowMap.enabled = true;
+  document.body.append(renderer.domElement);
+  const scene = new THREE.Scene();
+  const engine = { renderer, entities: new Map(), onUpdate: () => () => {} };
+  const entity = { id: 'vfx-smoke', engine, object3D: new THREE.Group() };
+  scene.add(entity.object3D);
+  const collider = { object3D: new THREE.Group(), getComponent: () => ({ enabled: true, props: { shape: 'box', size: [10, 1, 10] } }) };
+  engine.entities.set('floor', collider);
+  const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100); camera.position.set(0, 3, 6); camera.lookAt(0, 1, 0);
+  const sun = new THREE.DirectionalLight(0xffffff, 5); sun.position.set(3, 5, 3); sun.castShadow = true; scene.add(sun);
+  const wire = (source, targetHandle) => ({ source, sourceHandle: 'out', target: 'system', targetHandle });
+  const graph = {
+    nodes: [
+      { id: 'position', type: 'vec3', props: { value: [0, 1, 0] } },
+      { id: 'velocity', type: 'vec3', props: { value: [0, 0, 0] } },
+      { id: 'gravity', type: 'gravity', props: { vector: [0, -10, 0] } },
+      { id: 'system', type: 'system', props: { capacity: 32, lifetime: 10, lifetimeJitter: 0, geometryType: 'sphere', additive: false, lit: true, castShadow: true, receiveShadow: true, sceneCollision: true, selfCollision: true, lightCount: 2 } },
+    ], edges: [wire('position', 'position'), wire('velocity', 'velocity'), wire('gravity', 'force')],
+  };
+  const component = new ParticleComponent({ graph }); component.entity = entity;
+  const built = async () => { for (let i = 0; i < 100 && !component.compiled; i++) await new Promise(r => setTimeout(r, 10)); check(!!component.compiled, 'component compiled'); };
+  component.onAttach(); await built();
+  const simulate = async () => {
+    const sub = component.subsystems[0];
+    sub.colliderField?.refresh(); sub.simDelta.value = 0.1;
+    await renderer.computeAsync(sub.initCompute);
+    await renderer.computeAsync(Fn(() => sub.ages.element(instanceIndex).assign(1))().compute(32));
+    // Exercise every composed pass together with scene and self collision,
+    // and the lighting readback. Only update is repeated for the physical
+    // measurement so coincident fixture particles don't repel each other.
+    await renderer.computeAsync([sub.clearCompute, sub.scatterCompute, sub.resolveCompute, sub.lightRig.sampleCompute]);
+    for (let i = 0; i < 5; i++) await renderer.computeAsync(sub.updateCompute);
+    await renderer.renderAsync(scene, camera);
+    const positions = new Float32Array(await renderer.getArrayBufferAsync(sub.positions.value));
+    return positions[1];
+  };
+  const falling = await simulate();
+  check(falling >= 0.59 && falling < 0.9, 'gravity moves particles and box collider prevents penetration: ' + falling);
+  const noCollider = structuredClone(graph); noCollider.nodes.find(n => n.id === 'system').props.sceneCollision = false;
+  component.props.graph = noCollider; component.onPropChanged('graph'); await built();
+  const unblocked = await simulate();
+  check(unblocked < 0, 'collision control falls through the floor: ' + unblocked);
+  const toggled = structuredClone(graph); toggled.nodes.find(n => n.id === 'gravity').enabled = false;
+  component.props.graph = toggled; component.onPropChanged('graph'); await built();
+  const stationary = await simulate();
+  check(Math.abs(stationary - 1) < 0.001, 'disabled gravity restores stationary particles: ' + stationary);
+  check(component.subsystems[0].material.isMeshStandardNodeMaterial && component.subsystems[0].object.castShadow && component.subsystems[0].object.receiveShadow, 'lit/shadow material pipelines rendered');
+  toggled.nodes.find(n => n.id === 'system').enabled = false;
+  component.onPropChanged('graph'); await built();
+  check(component.subsystems.length === 0, 'disabled system removes rendering and compute');
+  await device.queue.onSubmittedWorkDone();
+  check(gpuErrors.length === 0, 'portable eight-buffer device has no validation errors: ' + gpuErrors.join('; '));
+  component.onDetach(); renderer.dispose();
+  globalThis.__VFX_SMOKE_RESULT__ = { pass: true, falling, stationary };
+  console.log('VFX-SMOKE PASS');
+} catch (error) { console.error(error); globalThis.__VFX_SMOKE_RESULT__ = { pass: false, error: error.stack }; }
+</script></body></html>

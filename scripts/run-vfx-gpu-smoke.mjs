@@ -1,0 +1,19 @@
+import puppeteer from 'puppeteer-core';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+const profile = await mkdtemp(join(tmpdir(), 'engine-vfx-smoke-'));
+let browser;
+try {
+  browser = await puppeteer.launch({ executablePath: process.env.CHROME_PATH ?? 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: 'new', userDataDir: profile, args: ['--enable-unsafe-webgpu', '--enable-features=WebGPU', '--no-sandbox'] });
+  const page = await browser.newPage(); const errors = [];
+  page.on('console', message => { console.log(message.text()); if (/validation|invalid ComputePipeline|exceeds the maximum/i.test(message.text()) && !message.text().includes('no validation errors')) errors.push(message.text()); });
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto(process.argv[2] ?? 'http://localhost:5287/scripts/vfx-gpu-smoke.html');
+  await page.waitForFunction(() => globalThis.__VFX_SMOKE_RESULT__, { timeout: 70000 });
+  const result = await page.evaluate(() => globalThis.__VFX_SMOKE_RESULT__);
+  if (!result.pass || errors.length) throw new Error(JSON.stringify({ result, errors }));
+} finally {
+  await browser?.close();
+  await rm(profile, { recursive: true, force: true });
+}
