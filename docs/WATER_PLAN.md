@@ -117,6 +117,9 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     to 1, and refuse a receiver whose beam entered outside the lid.
 13. "Change over 0.2 s" measures MOTION; flicker is one frame's change against a
     twelfth of it.
+14. Refraction thickness must be the WATER COLUMN along the bent ray: a fixed
+    22 cm on a physically capped sea moved the floor by centimetres — "no
+    water refraction".
 
 ## Open
 
