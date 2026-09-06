@@ -70,7 +70,7 @@ export function waterCausticGainNode(P, slot, normal = null) {
  * world only to transform it straight back would be the whole cost of the
  * light shafts spent on nothing.
  */
-export function waterCausticGainLocalNode(P, slot, level = 0, normal = null) {
+export function waterCausticGainLocalNode(P, slot, level = 0, normal = null, { volume = false } = {}) {
   const s = slot.uniforms;
   const local = vec3(P).toVar();
   // ── A GRAZING BEAM'S FOOTPRINT IS STRETCHED, AND SO IS ITS READ ────────
@@ -94,7 +94,14 @@ export function waterCausticGainLocalNode(P, slot, level = 0, normal = null) {
   // that grows with the distance above the floor — four levels at the
   // surface, none at the floor — on top of the grazing-angle level.
   const depthFor = vec3(P).y.negate().min(s.half.y);
-  const defocus = float(1).sub(depthFor.div(s.half.y.max(.001))).clamp(0, 1).mul(4);
+  // ⚠ The defocus (four levels at the surface, none at the floor) and the
+  // fade to one at the surface are for RECEIVERS — a wall near the waterline
+  // reads a lens that has not focused yet. The medium's taps are the beam
+  // itself: the surface's lensing runs the whole column and converges toward
+  // the floor, so a volume tap keeps the map's structure, only softened
+  // toward the surface ("god rays practically absent", user, 2026-09-06 —
+  // the receivers' defocus had flattened every tap above the floor).
+  const defocus = volume ? float(0) : float(1).sub(depthFor.div(s.half.y.max(.001))).clamp(0, 1).mul(4);
   const lod = (graze ? float(level).add(graze.reciprocal().log2().clamp(0, 4)) : float(level)).add(defocus);
   // ⚠ NOT BOUNDED BELOW BY THE VOLUME FLOOR. It used to be, and that excluded
   // the single most important receiver there is: the floor of the pool sits
@@ -138,7 +145,8 @@ export function waterCausticGainLocalNode(P, slot, level = 0, normal = null) {
   // less distance over which to focus, so the compression is interpolated
   // toward 1 at the surface rather than stamped at full strength on everything
   // submerged. Linear in depth is the first-order truth for a thin lens.
-  const focus = mix(float(1), floorFocus, d.div(s.half.y.max(.001)).clamp(0, 1));
+  const convergence = d.div(s.half.y.max(.001)).clamp(0, 1);
+  const focus = mix(float(1), floorFocus, volume ? convergence.mul(.6).add(.4) : convergence);
   // ⛔ NO TRANSMITTANCE HERE. It used to multiply the focus by `exp(-d·σ)`,
   // which reads as physics and is a category error in this node: the term below
   // can only ADD (see `WaterCausticLightNode`), so an attenuation folded into

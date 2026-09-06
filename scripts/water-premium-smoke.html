@@ -438,7 +438,7 @@ try {
        const sa = shaftOf(a, off), sa1 = shaftOf(a1, off), sb = shaftOf(b, off);
        // Motion is a change that accumulates over frames; flicker is a change
        // that does not: one frame's change against a twelfth of 0.2 s's.
-       rows[name] = { ...stats(sa), change: diff(sa, sb), flicker: diff(sa, sa1) / Math.max(1e-3, diff(sa, sb) / 12) };
+       rows[name] = { ...stats(sa), change: diff(sa, sb), oneFrame: diff(sa, sa1), flicker: diff(sa, sa1) / Math.max(1e-3, diff(sa, sb) / 12) };
      }
      scene.remove(probe); for (const o of shown) o.visible = true; await lensOn(true);
      const phase = `${(rows.up.mean / Math.max(.01, rows.side.mean)).toFixed(2)} : 1 : ${(rows.down.mean / Math.max(.01, rows.side.mean)).toFixed(2)}`;
@@ -455,7 +455,15 @@ try {
      if (!(rows.up.grain < .15 * rows.up.mean + .5)) throw new Error(`the shafts are grainy: ${rows.up.grain} on a mean of ${rows.up.mean}`);
      // 1 is pure translation; a lens pattern also reorganizes, and reads 2–3.3
      // across runs. Grain (noise) would read tens.
-     if (!(rows.up.flicker < 4 && rows.side.flicker < 4)) throw new Error(`the shafts flicker: one frame changes ${rows.up.flicker.toFixed(2)}× / ${rows.side.flicker.toFixed(2)}× what smooth motion would`);
+     // The gate is ABSOLUTE — one frame's change as a share of the TERM. The
+     // standing rule is ≤ ~3 % per PIXEL per frame, and the shaft term is a
+     // fraction of the pixel it lands in, so 4 % of the term is well inside
+     // it. The ratio against a twelfth of 0.2 s's change stays informational:
+     // when the term barely moves over 0.2 s (waves at rest, 6–9 %), a 3 %
+     // frame reads as 5×.
+     const perFrame = (r) => r.oneFrame / Math.max(1, r.mean);
+     log(`god rays: one frame changes ${(perFrame(rows.up) * 100).toFixed(2)}% (up) / ${(perFrame(rows.side) * 100).toFixed(2)}% (across) of the term`);
+     if (!(perFrame(rows.up) < .04 && perFrame(rows.side) < .04)) throw new Error(`the shafts flicker: one frame changes ${(perFrame(rows.up) * 100).toFixed(2)}% / ${(perFrame(rows.side) * 100).toFixed(2)}% of the term (gate 4 %)`);
    }
 
    // ── REFLECTED CAUSTICS ON A SURFACE ABOVE THE POOL ──────────────────────

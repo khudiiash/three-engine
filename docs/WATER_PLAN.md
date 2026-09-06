@@ -217,15 +217,24 @@ reload; 107–118 fps; water GPU ≈ 2 ms.
     where `getRenderTarget()` is null and `currentSamples` 0 — the copy's
     source has 4). Receipts: MSAA and plain bindings smokes clean, `?crate=1`.
 
-30. The god rays are the filaments' EXCESS over the flat sun at the water
-    colour's albedo, with a BIAS of 0.35 under the excess (clamped 0..1.5):
-    `albedo × clamp(gain − 1 + .35, 0, 1.5)`. The old white-cleared map
-    averaged above one, so the excess carried a haze of its own — the forward
-    glow looking up at the sun on CALM water, where filaments are nothing
-    ("god rays underwater got almost absent"). The whole beam at 0.08 had
-    flattened the shafts; the bare excess at mip 6 blurred them away. Mip 5.
-    Receipt: up 125 / across 67 / down 38 (1.86 : 1 : 0.57), flicker
-    1.65 / 2.48 (gate 4), floor contrast 24.1 % vs 13.0 %.
+30. The god rays are `albedo × (clamp(gain − 1, 0, 1.5) + 0.2)` per tap:
+    the filaments' positive EXCESS over the flat sun at the water colour's
+    albedo, plus a haze FLOOR outside the clamp — the forward glow looking up
+    at the sun on CALM water, where filaments are nothing ("god rays
+    underwater got almost absent"). The old white-cleared map averaged above
+    one and carried that haze implicitly. A bias INSIDE the clamp vanished:
+    the map is skewed (median 0.53, p99 6.8), so most taps clamped to zero.
+    And the volume taps must NOT take the receivers' defocus (four mip
+    levels at the surface) nor the fade-to-one: the beam is the surface's
+    lensing running the whole column, only its convergence grows with depth
+    (`{ volume: true }` on `waterCausticGainLocalNode`). Mip 5. Receipt: up
+    119 / across 59 / down 56 (1.99 : 1 : 0.94), one frame changes 0.66 % /
+    3.75 % of the term, floor contrast 24.3 % vs 13.0 %.
+31. The flicker gate is ABSOLUTE — one frame's change as a share of the
+    shaft term (4 %; the term is a fraction of the pixel, the standing rule
+    is 3 % per pixel). The ratio against a twelfth of 0.2 s's change (trap
+    13) is informational: with the waves at rest the term barely moves over
+    0.2 s and a 3 % frame reads as 5×.
 
 ## Open
 

@@ -209,7 +209,7 @@ const shaftPhase = (slot) => {
  *  the excess carried a haze of its own — the forward glow looking up at the
  *  sun on CALM water, where the filaments' excess alone is nothing ("god rays
  *  underwater got almost absent", user, 2026-09-06). */
-const SUN_HAZE_EXCESS = .35;
+const SUN_HAZE_EXCESS = .2;
 function shaftNode(slot, segment, tau, sigma) {
   const jitter = fract(interleavedGradientNoise(screenCoordinate));
   const total = vec3(0).toVar();
@@ -236,10 +236,14 @@ function shaftNode(slot, segment, tau, sigma) {
     // filaments' light above the flat sun, and only that reads as a ray.
     // Carrying the whole beam at a tenth of the albedo flattened them to a
     // haze — "our underwater godrays got broken" (user, 2026-09-06).
-    const gain = waterCausticGainLocalNode(segment.at(k), slot, mip);
+    const gain = waterCausticGainLocalNode(segment.at(k), slot, mip, null, { volume: true });
     // The excess is clamped: a filament at the map's cap (5) is a one-frame
     // spike along a ray, and the shafts flickered at 4.3× smooth motion.
-    const beam = shaftAlbedo.mul(gain.sub(1).add(SUN_HAZE_EXCESS).clamp(0, 1.5));
+    // The haze OUTSIDE the clamp: the map is skewed (most cells below one, a
+    // few filaments far above), so a bias inside the clamp vanished into the
+    // dark cells and the forward glow with it. A true floor plus the
+    // positive excess keeps both.
+    const beam = shaftAlbedo.mul(gain.sub(1).clamp(0, 1.5).add(SUN_HAZE_EXCESS));
     const depth = mix(segment.near, segment.far, k);
     const reach = sigma.mul(depth).mul(slant).negate().exp();
     total.addAssign(tau.mul(k).negate().exp().mul(reach).mul(beam));
