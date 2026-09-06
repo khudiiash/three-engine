@@ -1,5 +1,5 @@
 import {
-  Fn, attribute, cameraFar, cameraNear, cameraPosition, float, linearDepth, mix, positionLocal, positionWorld,
+  Fn, attribute, cameraFar, cameraNear, cameraPosition, float, linearDepth, mix, normalWorld, positionLocal, positionWorld,
   screenUV, select, texture, vec2, vec3,
 } from "three/tsl";
 import { waterRimDistanceNode } from "./waterShape.js";
@@ -251,16 +251,19 @@ function waterFoamBody(u, sceneDepth, spectrum) {
   // reversed-edge form is undefined in GLSL and not worth a doubt in WGSL.)
   const wind = vec2(u.waveCos, u.waveSin);
   const along = p.dot(wind), across = p.y.mul(wind.x).sub(p.x.mul(wind.y));
-  const streak = fbm(vec2(along.mul(.3), across.mul(1.3)), clock, .5);
+  const streak = fbm(vec2(along.mul(.18), across.mul(1.6)), clock, .5);
   const bubbles = fbm(p.mul(4.5), clock, 1.6);
   const metres = positionWorld.sub(cameraPosition).length();
   const bubbleDetail = metres.smoothstep(15, 60).oneMinus(), streakDetail = metres.smoothstep(60, 240).oneMinus();
-  const capSheet = sea.sub(bubbles.mul(.15).mul(bubbleDetail)).smoothstep(.55, .8);
-  const streaks = sea.mul(1.6).sub(mix(float(.45), streak, streakDetail)).div(.3).clamp(0, 1);
-  const capTexture = mix(float(.85), bubbles.mul(.4).add(.6), bubbleDetail);
-  const near = capSheet.max(streaks.mul(.85)).mul(capTexture).clamp(0, 1);
+  // Against the real thing (a storm sea beside ours, user 2026-09-07): foam
+  // is SPARSE — a sheet only where a crest has just broken, thin streaks
+  // drawn along the crests behind it, holes in both — never patches.
+  const capSheet = sea.sub(bubbles.mul(.25).mul(bubbleDetail)).smoothstep(.7, .95);
+  const streaks = sea.mul(1.3).sub(mix(float(.5), streak, streakDetail)).div(.25).clamp(0, 1);
+  const capTexture = mix(float(.8), bubbles.mul(.7).add(.35), bubbleDetail);
+  const near = capSheet.max(streaks.mul(.8)).mul(capTexture).clamp(0, 1);
   // Far: the mip-filtered coverage itself, as a tone.
-  const far = sea.smoothstep(.15, .7).mul(.7);
+  const far = sea.smoothstep(.2, .8).mul(.6);
   const whitecap = mix(near, far, metres.smoothstep(60, 240));
   return wake.max(whitecap).mul(u.foam.smoothstep(0, .15));
 }
@@ -282,20 +285,40 @@ export function seaFoamValueNode(u, spectrum) {
     return seaFoamWindowNode(spectrum, p).max(seaFoamNode(seaJacobianAt(spectrum, p, cross), u.foam));
   })();
 }
+/** Where on its wave a point sits: 0 in the trough, 1 on the crest — IN
+ *  METRES (a lid's local units times its scale against the authored heights;
+ *  on a lid scaled by three the raw ratio saturated and every swell became a
+ *  hard-edged green sheet, 2026-09-06). Only a sea with real waves has thin
+ *  crests: the term fades in between 10 and 50 cm of wave height, so a pool's
+ *  ripples never turn green. */
+function crestNode(u) {
+  const range = u.waveHeight.add(u.amplitude).max(.001);
+  const height = positionLocal.y.mul(u.waveScale.y);
+  return height.div(range).mul(.5).add(.5).clamp(0, 1).mul(range.smoothstep(.1, .5));
+}
+/**
+ * ⭐ THE COLOUR GRADIENT ON THE WATER ITSELF. Thin water at a crest absorbs
+ * less and scatters more toward the eye than the deep body in a trough — the
+ * real sea is lighter and greener along its crests ("you see color gradients
+ * on the water itself, subsurface scattering, which we lack", user,
+ * 2026-09-07). A multiplier on the transmitted radiance: ×1 in the trough,
+ * brighter and toward green at the crest.
+ */
+export function waterCrestGradientNode(u) {
+  return mix(vec3(1), vec3(.8, 1.4, 1.25), crestNode(u).smoothstep(.35, 1));
+}
 export function waterSubsurfaceNode(u, slot) {
   const toEye = cameraPosition.sub(positionWorld).normalize();
   const toSun = vec3(slot.uniforms.toSun);
-  const through = toEye.dot(toSun).negate().max(0).pow(3);
-  // ⚠ IN METRES. `positionLocal.y` is in the lid's local units and `range`
-  // in metres; on a lid scaled by three the crest term saturated and every
-  // swell became a hard-edged green sheet (the ocean arm, 2026-09-06). And
-  // only the top of a crest is thin enough to glow: the upper quarter,
-  // smoothly, at a fraction of the in-scatter colour.
-  const range = u.waveHeight.add(u.amplitude).max(.001);
-  const height = positionLocal.y.mul(u.waveScale.y);
-  const crest = height.div(range).mul(.5).add(.5).clamp(0, 1).smoothstep(.6, 1).pow(1.5);
-  const tint = mix(vec3(u.color), vec3(1), .25);
-  return vec3(slot.uniforms.scatter).mul(tint).mul(through.mul(crest).mul(.7));
+  // Light that entered the far side of a crest and scatters out toward the
+  // eye — strongest looking toward the sun through the wave (the demo's
+  // distorted back-light), never quite absent — in the colour thin water
+  // hands on: the in-scatter colour pushed toward a bright teal, not the
+  // body's own dark blue, which glowed invisibly against itself.
+  const backlit = toEye.dot(toSun.negate().add(normalWorld.mul(.3)).normalize()).max(0).pow(4);
+  const crest = crestNode(u).smoothstep(.5, 1).pow(1.5);
+  const tint = vec3(.5, 1.7, 1.3);
+  return vec3(slot.uniforms.scatter).mul(tint).mul(crest).mul(backlit.mul(1.2).add(.25));
 }
 
 /** Kept for the surface smoke, which asserts crest foam exists at all. */

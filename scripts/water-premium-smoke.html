@@ -10,6 +10,7 @@ import { waterAutoResolution } from '/src/engine/vfx/waterVolume.js';
 import { halfToFloat } from '/src/engine/vfx/waterSpectrumCPU.js';
 import { waterCrossedLengthNode } from '/src/engine/vfx/waterMedium.js';
 import { waterProfileRadius } from '/src/engine/vfx/waterVolume.js';
+import { queryWaterSurface } from '/src/engine/vfx/waterPhysics.js';
 import { Fn, pass } from 'three/tsl';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 
@@ -177,7 +178,16 @@ globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
    // A zero-length tick applies the follow (window shifts, ring centre) before
    // the shot, as the component's per-frame follow does; the sea does not advance.
    const POSE_TICK = argument('poseTick', '1') !== '0';
-   const pose = (eye, at) => { camera.position.set(...eye); camera.lookAt(...at); camera.updateMatrixWorld(true); sim.followCamera(eye[0] / S, eye[2] / S); if (POSE_TICK) sim.tick(renderer, 0); };
+   // The surface under the eye (the sea's CPU copy; the rest plane until it
+   // lands) decides above/below, as the component does — see `eyeBelow`.
+   const surfaceAt = (x, z) => queryWaterSurface(sim.mesh, props, sim.uniforms?.simTime?.value ?? 0, { x, y: 0, z }, sim.seaSample ?? null)?.height ?? 0;
+   const pose = (eye, at) => {
+     camera.position.set(...eye); camera.lookAt(...at); camera.updateMatrixWorld(true);
+     sim.followCamera(eye[0] / S, eye[2] / S);
+     const below = eye[1] < surfaceAt(eye[0], eye[2]);
+     sim.eyeBelow = below; if (slot.uniforms.eyeBelow) slot.uniforms.eyeBelow.value = below ? 1 : 0;
+     if (POSE_TICK) sim.tick(renderer, 0);
+   };
    const step = async () => {
      sim.tick(renderer, 1 / 60);
      updateWaterSlot({ engine, slot, kernel: sim.slotKernel, mesh: sim.mesh, simulation: sim, props });
@@ -218,7 +228,22 @@ globalThis.__waterSeaMips = argument('seaMips', '1') !== '0';
      pose([0, 2.5, S * .35], [0, 1, -S * .1]); await shoot('ocean-low');
      // The eye a metre over the water, as a swimmer or a deck sees it: the
      // GEOMETRY's waves, which a higher eye lets the shading normal fake.
-     pose([0, 1.2, S * .35], [0, .9, -S * .1]); await shoot('ocean-eye');
+     pose([0, 1.2, S * .35], [0, .9, -S * .1]); const eyeShot = await shoot('ocean-eye');
+     // ── THE EYE ON THE WATERLINE ───────────────────────────────────────
+     // The lowest surface point near the pose, and the eye 15 cm over it —
+     // in a trough, in the AIR, below the rest plane. The sky must stay
+     // the sky and the far surface must not be fogged: the rest plane once
+     // called this eye "under water" (2026-09-07).
+     {
+       let lowX = 0, lowZ = S * .35, low = Infinity;
+       for (let dz = -12; dz <= 12; dz += 1.5) for (let dx = -12; dx <= 12; dx += 1.5) { const h = surfaceAt(dx, S * .35 + dz); if (h < low) { low = h; lowX = dx; lowZ = S * .35 + dz; } }
+       pose([lowX, low + .15, lowZ], [lowX, low + .1, lowZ - S * .1]); const trough = await shoot('ocean-trough');
+       const lumaOf = (px, i) => px[i] * .2126 + px[i + 1] * .7152 + px[i + 2] * .0722;
+       const band = (px, y0, y1) => { let m = 0, k = 0; for (let y = y0; y < y1; y++) for (let x = 0; x < W; x++) { m += lumaOf(px, ((y | 0) * W + (x | 0)) * 4); k++; } return m / k; };
+       const skyHigh = band(eyeShot, H * .2, H * .4), skyTrough = band(trough, H * .2, H * .4);
+       log(`ocean: eye in a trough ${(low).toFixed(2)} m (surface under it), 15 cm up: sky band ${skyTrough.toFixed(1)} vs ${skyHigh.toFixed(1)} from 1.2 m; rest plane would have called it under water: ${low + .15 < 0}`);
+       if (!(skyTrough > skyHigh * .8)) throw new Error(`the sky is fogged from a trough: ${skyTrough.toFixed(1)} vs ${skyHigh.toFixed(1)}`);
+     }
      // ── THE GEOMETRY'S WAVES, IN METRES ─────────────────────────────────
      // The lid's vertices, read back: the RMS and the peak of their height
      // within 80 m of the eye and over the whole lid. The sea's σ is

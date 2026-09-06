@@ -297,7 +297,10 @@ export function waterLidSegmentNode(slot) {
   const s = slot.uniforms;
   const a = s.inverse.mul(vec4(cameraPosition, 1)).xyz.toVar();
   const b = s.inverse.mul(vec4(positionWorld, 1)).xyz.toVar();
-  const below = a.y.lessThan(0);
+  // The eye's state (the surface under the eye, decided on the CPU with a
+  // hysteresis — see the slot's `eyeBelow`), not `a.y < 0`: from a trough
+  // the rest plane fogged every lid pixel to the horizon (2026-09-07).
+  const below = s.eyeBelow.greaterThan(.5);
   const span = positionWorld.sub(cameraPosition).length();
   return {
     length: select(below, span, float(0)),

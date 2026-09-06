@@ -356,17 +356,38 @@ export class GridSimulationComponent extends Component {
     const camera = this.entity?.engine?.camera;
     if (!camera || !material || Array.isArray(material)) return;
     const extent = this.simulation.extent;
-    const local = camera.getWorldPosition(_cameraWorld).applyMatrix4(_waterInverse.copy(this.simulation.mesh.matrixWorld).invert());
+    const eyeWorld = camera.getWorldPosition(_cameraWorld);
+    const eyeWorldY = eyeWorld.y, eyeWorldX = eyeWorld.x, eyeWorldZ = eyeWorld.z;
+    const local = eyeWorld.applyMatrix4(_waterInverse.copy(this.simulation.mesh.matrixWorld).invert());
     // The ripple window follows the eye (whole-cell steps; see gridSimulation).
     this.simulation.followCamera?.(local.x, local.z);
-    // The waves make "the eye is at the surface" a band, not a plane. Hold the
-    // current answer until the eye is clear of the crests either way.
+    // ── ABOVE OR BELOW: THE SURFACE UNDER THE EYE, NOT THE REST PLANE ────
+    //
+    // The sea's CPU copy (the buoyancy query) says how high the water is at
+    // the eye's own XZ; the eye is above when it is above THAT, with a
+    // hysteresis of a few centimetres so bobbing on the waterline does not
+    // flip the lid's side (pipeline state) every frame. The old answer was a
+    // band of ±1.5 × the wave height around the rest plane — on a metre of
+    // swell an eye in a trough stayed "under water" and one on a crest "in
+    // the air" for metres: fog painted over the far surface, total-internal-
+    // reflection white on the near slopes ("depth issues under grazing
+    // angles", user, 2026-09-07). Without a CPU copy yet, the band stands.
     const swell = Math.max(1e-3, (this.simulation.uniforms.waveHeight.value + this.simulation.uniforms.amplitude.value) * 1.5);
-    const above = this._waterAbove === false ? local.y > swell : local.y > -swell;
+    const surface = this.getSurfaceHeight?.(eyeWorldX, eyeWorldZ);
+    let above;
+    if (Number.isFinite(surface)) {
+      const band = Math.max(.03, swell * .04);
+      above = this._waterAbove === false ? eyeWorldY > surface + band : eyeWorldY > surface - band;
+    } else {
+      above = this._waterAbove === false ? local.y > swell : local.y > -swell;
+    }
     const margin = (this._waterInside ? .5 : -.02) * Math.max(.001, Math.min(extent.halfX, extent.halfZ) * .05);
     const inside = Math.abs(local.x) < extent.halfX + margin && Math.abs(local.z) < extent.halfZ + margin
       && local.y < margin && local.y > -extent.depth - margin;
     this._waterAbove = above; this._waterInside = inside;
+    // Published for the mirror (waterSurfaceLook) and the medium (the slot).
+    this.simulation.eyeBelow = !above;
+    if (this.waterSlot?.uniforms?.eyeBelow) this.waterSlot.uniforms.eyeBelow.value = above ? 0 : 1;
     const lidSide = above ? FrontSide : BackSide;
     const shellSide = inside ? BackSide : FrontSide;
     for (const [target, side] of [[material, lidSide], [this.simulation.skirtMaterial, shellSide]]) {

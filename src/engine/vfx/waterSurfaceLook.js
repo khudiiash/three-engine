@@ -3,10 +3,10 @@ import { WATER_REFRACTION_LAYER } from '../editorLayers.js';
 import { waterCausticGainNode } from './waterCaustics.js';
 import { applyMediumSegment } from './waterMedium.js';
 import {
-  Fn, cameraFar, cameraNear, cameraPosition, cameraProjectionMatrix, cameraProjectionMatrixInverse, cameraViewMatrix, cameraWorldMatrix, float, linearDepth, materialAttenuationColor, materialAttenuationDistance, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
+  Fn, cameraFar, cameraNear, cameraPosition, cameraProjectionMatrix, cameraProjectionMatrixInverse, cameraViewMatrix, cameraWorldMatrix, float, frontFacing, linearDepth, materialAttenuationColor, materialAttenuationDistance, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
   mrt, pmremTexture, positionViewDirection, positionWorld, reflect, reflector, refract, screenSize, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
 } from 'three/tsl';
-import { seaFoamValueNode, waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
+import { seaFoamValueNode, waterCrestGradientNode, waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
 import { seaLostSlopeVarianceNode, seaShadingSlopeNode } from './waterSpectrum.js';
 
 const _eye = new Vector3(), _origin = new Vector3(), _up = new Vector3(), _clearColor = new Color();
@@ -131,6 +131,9 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
 
   /** Is the eye on the +Y side of the water's own surface plane? Scale-free. */
   const eyeAbove = (camera) => {
+    // The component's answer — the surface under the eye, with hysteresis —
+    // when there is one; the rest plane otherwise (a harness without one).
+    if (typeof simulation?.eyeBelow === "boolean") return !simulation.eyeBelow;
     if (!camera) return true;
     mesh.updateWorldMatrix(true, false);
     mesh.getWorldPosition(_origin);
@@ -282,8 +285,14 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
     // gets out and the underside is a perfect mirror of the pool — total
     // internal reflection — and inside that cone, Snell's window, the world
     // above shows through at the air-side transmittance of the exit angle.
-    const eyeLocal = modelWorldMatrixInverse.mul(vec4(cameraPosition, 1)).xyz;
-    const fromBelow = eyeLocal.y.lessThan(0);
+    // ⚠ PER FRAGMENT, from the face the eye actually sees — a back face is
+    // a piece of surface the eye is under, whatever the rest plane says. The
+    // eye's height against the rest plane switched the WHOLE lid to the
+    // water-side Fresnel from a trough: total-internal-reflection white on
+    // every near slope ("depth issues under grazing angles", 2026-09-07).
+    // The component culls the side the state does not need; a double-sided
+    // lid (the harness) gets both, each with its own physics.
+    const fromBelow = frontFacing.not();
     const cosV = normalView.dot(positionViewDirection).abs().clamp(0, 1);
     const airFresnel = cosV.oneMinus().pow(5).mul(.97963).add(.02037);
     const sin2t = float(1.333 * 1.333).mul(cosV.mul(cosV).oneMinus());
@@ -533,7 +542,9 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       // Foam is not a perfect white: sea foam reflects about three quarters of
       // the light, and at 1 it clipped to a flat cut-out under a strong sun.
       material.colorNode = mix(mix(baseColor, banded, u.stylized).mul(through.oneMinus()), vec3(.75), foam);
-      emissive = emissive.add(refracted.mul(through).mul(foam.oneMinus()));
+      // The transmitted light, lighter and greener along the crests (thin
+      // water), the body's colour in the troughs — see waterCrestGradientNode.
+      emissive = emissive.add(refracted.mul(waterCrestGradientNode(u)).mul(through).mul(foam.oneMinus()));
       emissive = emissive.add(reflected.mul(foam.oneMinus()));
       if (slot) emissive = emissive.add(waterSubsurfaceNode(u, slot).mul(foam.oneMinus()));
     } else {

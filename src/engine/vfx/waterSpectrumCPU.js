@@ -52,7 +52,7 @@ export const SEA_STATES = Object.freeze({
   // extinction that swallows any floor. So this preset alone also writes
   // the look; pool/pond/lake leave colour and clarity to the author.
   ocean: { waveHeight: 1, waveLength: 24, choppiness: 1, rippleStrength: 1, waveOctaves: 8, waveGain: .6, waveSpeed: 1,
-    surfaceDetail: 1.2, foam: .3, foamThreshold: .3, roughness: .12,
+    surfaceDetail: 1.2, foam: .25, foamThreshold: .3, roughness: .12,
     color: "#0d4f8a", deepColor: "#04213a", saturation: .75, transmission: 1 },
 });
 

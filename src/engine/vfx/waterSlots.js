@@ -191,6 +191,14 @@ function createSlot(index) {
       // out of a bigger body, where a hard-edged 16 m square of caustics
       // around the eye read as "a small rect under the camera" (2026-09-07).
       causticFade: uniform(.1),
+      // 1 while the eye is UNDER the surface — the real, displaced surface at
+      // the eye's own XZ (the component decides it from the sea's CPU copy,
+      // with a hysteresis of centimetres), not the rest plane. On a metre of
+      // swell the rest plane put an eye in a trough "under water" and one on
+      // a crest "in the air": fog over the far surface, total-internal-
+      // reflection white on the near slopes ("depth issues under grazing
+      // angles", user, 2026-09-07). The lid's medium segment reads this.
+      eyeBelow: uniform(0),
       causticHalf: uniform(new THREE.Vector2(1, 1)),
     },
     // Bound once by every consumer; the sampler nodes are shared so a graph
