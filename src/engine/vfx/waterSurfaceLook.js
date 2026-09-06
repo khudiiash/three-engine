@@ -1,7 +1,7 @@
 import { Object3D, Vector3 } from 'three/webgpu';
 import {
   cameraFar, cameraNear, cameraPosition, cameraProjectionMatrix, cameraViewMatrix, float, linearDepth, materialColor, mix, modelNormalMatrix, modelWorldMatrixInverse, normalLocal, normalView, positionLocal,
-  positionViewDirection, positionWorld, reflector, refract, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportSharedTexture,
+  positionViewDirection, positionWorld, reflector, refract, screenUV, select, texture, transformDirection, transformNormalToView, uniform, vec2, vec3, vec4, viewportTexture,
 } from 'three/tsl';
 import { waterFoamNode, waterSubsurfaceNode } from './waterFoam.js';
 import { seaShadingSlopeNode } from './waterSpectrum.js';
@@ -290,7 +290,13 @@ export function installWaterSurfaceLook({ engine, mesh, material, simulation = n
       const ndc = clip.xy.div(clip.w).add(1).mul(.5);
       const refractedUv = vec2(ndc.x, ndc.y.oneMinus()).clamp(.001, .999); // three's own transmission coords (webgpu)
       const beer = vec3(u.deepColor).max(1e-4).pow(travel.mul(u.absorption));
-      const refracted = viewportSharedTexture(refractedUv).rgb.mul(baseColor).mul(beer).mul(fresnel.oneMinus());
+      // ⚠ `viewportTexture`, NOT `viewportSharedTexture`: the shared copy is ONE
+      // texture for every render target, and the editor draws the lid into an
+      // rgba16float pass after something else sized it bgra8unorm —
+      // "copyFramebufferToTexture: Source and destination formats do not
+      // match" (editor, 2026-09-06). The per-node copy keeps one texture per
+      // target, which is what three's own transmission relied on.
+      const refracted = viewportTexture(refractedUv).rgb.mul(baseColor).mul(beer).mul(fresnel.oneMinus());
       // What three's `mix(diffuse, backdrop, transmission)` left of the
       // diffuse — the stylized, less-than-clear water — stays on the colour.
       material.colorNode = mix(mix(baseColor, banded, u.stylized).mul(through.oneMinus()), vec3(1), foam);
